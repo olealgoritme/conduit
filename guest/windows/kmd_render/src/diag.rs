@@ -56,6 +56,17 @@ pub fn level() -> u32 {
     level
 }
 
+/// Forget the cached `DiagLevel` and read it again, mirroring the value in force (`DiagLvl`,
+/// written on every read, 0 included). StartDevice: the static outlives a `pnputil
+/// /restart-device` (the image is not reloaded), so without this a changed `DiagLevel` needed a
+/// reboot. PASSIVE_LEVEL.
+pub fn reread_level() -> u32 {
+    DIAG_LEVEL.store(u32::MAX, Ordering::Relaxed);
+    let level = level();
+    record_named_bytes(b"DiagLvl", level);
+    level
+}
+
 /// `RTL_REGISTRY_SERVICES` — Path is relative to
 /// `\Registry\Machine\System\CurrentControlSet\Services`.
 const RTL_REGISTRY_SERVICES: u32 = 1;

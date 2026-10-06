@@ -77,7 +77,14 @@ pub fn mode_if_read() -> Option<u32> {
     }
 }
 
-/// The knob, read once per boot. PASSIVE: the registry read is not callable above it.
+/// Forget the cached mode and read the knob again, mirroring it (`NvDupMode`). StartDevice: the
+/// static outlives a `pnputil /restart-device`. PASSIVE.
+pub(crate) fn reread_mode() -> u32 {
+    read_mode()
+}
+
+/// The knob, read once per StartDevice (and at the first forward after one). PASSIVE: the
+/// registry read is not callable above it.
 fn mode(_passive: PassiveLevel) -> u32 {
     let m = MODE.load(Ordering::Relaxed);
     if m != MODE_UNREAD {
@@ -97,6 +104,8 @@ fn read_mode() -> u32 {
         _ => MODE_ENFORCE,
     };
     MODE.store(m, Ordering::Relaxed);
+    // Mirrored on EVERY read, so the value in force is the registry's and never a previous run's.
+    crate::diag::record_named_bytes(b"NvDupMode", m);
     m
 }
 

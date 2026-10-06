@@ -95,6 +95,9 @@ pub(crate) fn init_from_registry() {
         0,
     ));
     SYNC_MS.store(ms, Ordering::Relaxed);
+    // The value in force, mirrored at every transport init (the counters' own mirror is gated on
+    // a Render having been seen, so a knob set back to 0 left the previous value showing).
+    crate::diag::record_named_bytes(b"FlGSyncEff", ms);
     // A restart (`pnputil /restart-device`) must not inherit queued-fence slots of the
     // previous transport: those fences will never retire.
     note_abandon();
