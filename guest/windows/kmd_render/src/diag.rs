@@ -652,9 +652,22 @@ pub mod knobs {
     /// (`virtio::rm_present`, `docs/kmd-rm-client.md` section 13).
     /// 4 = 3 plus each ring surface imported as a foreign resource under the KMD's own
     /// owner (the resource id a WDDM allocation adopts, `docs/kmd-rm-client.md` section
-    /// 14). Read once per transport generation. Values above 4 count as 4 (before level 3
+    /// 14).
+    /// 5 = no ring: the VidPn primary itself is allocated from RM SYSTEM memory (Venus is
+    /// the fallback for it), mapped by the host into the window dxgkrnl's CPU aperture
+    /// uses, and flipped with the KMD's own `ScanoutFlip` (section 15).
+    /// Read once per transport generation. Values above 5 count as 5 (before level 3
     /// existed, 3 and more counted as 2: a service key left at 3 turns the ring on).
     pub const KMD_RM_CLIENT: KnobName = KnobName::new(b"KmdRmClient");
+    /// `KmdRmSysCache` (default 0). With `KmdRmClient` = 5: what the RM system-memory
+    /// primary is made of (read at the service's bring-up; `docs/kmd-rm-client.md` 15.5).
+    /// 0 or 1 = WRITE-COMBINED memory (the default: every view of it agrees with dxgkrnl's
+    /// write-combined mapping of the primary, so there is no alias; 1 is the same, spelled
+    /// out). 2 = cached memory AND the `Cached` flag on the primary (an opt-in experiment:
+    /// dxgkrnl may refuse it). 3 = cached memory under dxgkrnl's write-combined view, a
+    /// write-back / write-combined ALIAS of the same pages (an opt-in, counted `RmSysAlias`).
+    /// Any other value is the default: an unknown value never picks an alias.
+    pub const KMD_RM_SYS_CACHE: KnobName = KnobName::new(b"KmdRmSysCache");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present

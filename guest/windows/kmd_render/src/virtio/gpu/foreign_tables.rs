@@ -284,6 +284,21 @@ impl VirtioGpu {
         self.foreign.get(resource_id).map(|e| (e.layout, e.size))
     }
 
+    /// Mark `resource_id` (made by the KMD's own RM client, not yet adopted) as RM
+    /// system memory: the one foreign resource the host maps into the window on
+    /// `RESOURCE_MAP_BLOB`. `false` if it is not the KMD's own un-adopted import.
+    pub fn foreign_mark_sysmem(&mut self, resource_id: u32) -> bool {
+        self.foreign
+            .mark_sysmem(resource_id, DeviceOwner::KMD_RM.raw() as u64)
+    }
+
+    /// `(DRM file handle, GEM handle, layout, size)` of an adopted RM system-memory
+    /// allocation, for the KMD's own flip of it (`ScanoutFlip` names the file and the
+    /// GEM). `None` for everything else.
+    pub fn foreign_sysmem_source(&self, resource_id: u32) -> Option<(u32, u32, fr::Layout, u64)> {
+        self.foreign.sysmem_source(resource_id)
+    }
+
     /// Count a request refused before it reached any table.
     pub fn foreign_note_refusal(&mut self, kind: RefusalKind) {
         self.foreign.note_refusal(kind);

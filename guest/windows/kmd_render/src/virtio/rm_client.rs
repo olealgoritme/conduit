@@ -28,6 +28,10 @@
 //! holds a LEASE (`lease_slot`, `end_lease`): `retire_begin` and `cleanup` wait for it
 //! before they unmap, so a view never goes away under a write.
 //!
+//! LEVEL 5 (`sysmem`, `sysmem_flip`, children of this module). No ring and no client steps on the
+//! worker: the VidPn primary is allocated from RM SYSTEM memory on the creator's thread (its own RM
+//! client, see `sysmem.rs`) and flipped as it is (`sysmem_flip.rs`); the worker only flips.
+//!
 //! LOCKING. `CLIENT` is a LEAF spinlock holding plain data (`rm_client::Client`):
 //! never held across a host round trip, a wait, an allocation or another lock; every
 //! step copies what it needs out under the lock, does its I/O with no lock held, and
@@ -54,8 +58,14 @@ use helios_kmd_logic::foreign_scanout::SetError;
 use helios_kmd_logic::rm_client::{
     self as rc, Action, Client, Fail, FailKind, Out, Step, Want, MAX_DRI,
 };
+use helios_kmd_logic::sweep_budget::SweepBudget;
 use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
 use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
+
+// Level 5 (`KmdRmClient` = 5): the KMD's own allocations from RM system memory. Children of
+// this module because they drive the same `Io` and bring-up steps, which stay private.
+pub(crate) mod sysmem;
+pub(crate) mod sysmem_flip;
 
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -82,17 +92,24 @@ static CLIENT: SpinLock<Client> = SpinLock::new(Client::new());
 
 /// `KNOB_LEVEL` before the knob has been read for this transport generation.
 const KNOB_UNREAD: u32 = u32::MAX;
-/// The `KmdRmClient` knob (0 to 4), or [`KNOB_UNREAD`]: read once per transport
+/// The `KmdRmClient` knob (0 to 5), or [`KNOB_UNREAD`]: read once per transport
 /// generation (so `reg add` + `pnputil /restart-device` applies it), by resetting it to
 /// unread in [`forget`], which `retire_transport` runs for every transport it drops.
 /// With the knob at 0 (the default) [`service`] is this one atomic load and nothing
 /// else: no virtio lock, no registry read.
 static KNOB_LEVEL: AtomicU32 = AtomicU32::new(KNOB_UNREAD);
 
-/// Whether the ring level (3) is in force this generation: one relaxed load.
+/// Whether the ring level (3 or 4) is in force this generation: one relaxed load. Level 5
+/// does not run the ring (its allocations are flipped as they are).
 pub(super) fn ring_level_on() -> bool {
     let level = KNOB_LEVEL.load(Ordering::Relaxed);
-    level != KNOB_UNREAD && level >= 3
+    level != KNOB_UNREAD && (3..=4).contains(&level)
+}
+
+/// Whether the RM system-memory level (5) is in force this generation: one relaxed load.
+fn sysmem_level_on() -> bool {
+    let level = KNOB_LEVEL.load(Ordering::Relaxed);
+    level != KNOB_UNREAD && level >= helios_kmd_logic::rm_sysmem::LEVEL
 }
 
 /// Counters, mirrored by [`publish_counters`] (names at most 14 characters).
@@ -141,6 +158,11 @@ pub(crate) fn publish_counters() {
     // registry keeps what it has.
     if level != KNOB_UNREAD {
         rec(b"RmKnob", level);
+    }
+    // Level 5 runs no ring client: its own counters only.
+    if level == helios_kmd_logic::rm_sysmem::LEVEL {
+        sysmem::publish_counters();
+        return;
     }
     rec(b"RmStatus", RM_STATUS.load(Ordering::Relaxed));
     rec(b"RmStep", RM_LAST_STEP.load(Ordering::Relaxed));
@@ -194,7 +216,8 @@ fn knob_level() -> u32 {
 /// per transport generation that needs it.
 #[inline(never)]
 fn read_knob() -> u32 {
-    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0).min(4);
+    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0)
+        .min(helios_kmd_logic::rm_sysmem::LEVEL);
     KNOB_LEVEL.store(v, Ordering::Relaxed);
     // Nothing is written for the default (off): the registry stays as it was.
     if v != 0 {
@@ -211,6 +234,12 @@ fn read_knob() -> u32 {
 pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     let level = knob_level();
     if level == 0 {
+        return;
+    }
+    // Level 5 has no ring and no client steps on the worker (its service runs on the
+    // creator's thread); the worker only flips what the screen shows.
+    if level >= helios_kmd_logic::rm_sysmem::LEVEL {
+        sysmem_flip::service(passive, adapter);
         return;
     }
     // No transport: nothing to do, and `retire_transport` already forgot the client.
@@ -248,6 +277,7 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         passive,
         adapter,
         epoch,
+        limit: None,
     };
     // Level 3: the presenter first, so a ring about to be torn down (a new extent) is
     // withdrawn from scanout before the steps close the GEM under it.
@@ -447,6 +477,7 @@ pub(crate) fn forget() {
     VIEW_LEASED.store(0, Ordering::Release);
     unmap_views(&views);
     rm_present::reset();
+    sysmem::forget();
     // The next transport generation reads the knob again (once).
     KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }
@@ -567,13 +598,46 @@ struct Io<'a> {
     passive: PassiveLevel,
     adapter: &'a AdapterContext,
     epoch: u64,
+    /// A deadline shared by every message this `Io` sends (level 5's creation and its undo,
+    /// `sysmem`): each waits at most what is left of it, and none is sent once it is spent.
+    /// `None` (the ring client): every message has [`TIMEOUT_MS`] to itself.
+    limit: Option<SweepBudget>,
 }
 
 impl Io<'_> {
+    /// The same I/O under another deadline (the undo of a creation whose own is spent).
+    fn with_limit(&self, limit: Option<SweepBudget>) -> Io<'_> {
+        Io {
+            passive: self.passive,
+            adapter: self.adapter,
+            epoch: self.epoch,
+            limit,
+        }
+    }
+
+    /// How long the next message may wait: [`TIMEOUT_MS`], or what is left of the deadline
+    /// (at most [`TIMEOUT_MS`]); `None` once a deadline is spent.
+    fn message_timeout_ms(&self) -> Option<u64> {
+        match &self.limit {
+            None => Some(TIMEOUT_MS),
+            Some(b) => b.call_timeout_ms(crate::adapter::foreign_scanout::now_100ns()),
+        }
+    }
+
+    /// Whether a deadline was set and is spent.
+    fn limit_spent(&self) -> bool {
+        self.limit
+            .is_some_and(|b| b.expired(crate::adapter::foreign_scanout::now_100ns()))
+    }
+
     /// Forward one host message as the KMD's owner and return the reply length. A reply
     /// from a different transport generation than the client's is a failure: the
-    /// handles it names are not this client's any more.
+    /// handles it names are not this client's any more. With the deadline spent nothing is
+    /// sent (a `Transport` failure, code 0xE1).
     fn send(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, Fail> {
+        let Some(timeout_ms) = self.message_timeout_ms() else {
+            return Err(Fail::new(FailKind::Transport, 0xE1));
+        };
         let mut seen = None;
         let n = nvrm::forward(
             self.passive,
@@ -581,7 +645,7 @@ impl Io<'_> {
             KMD,
             req,
             resp,
-            TIMEOUT_MS,
+            timeout_ms,
             0,
             0,
             &mut seen,

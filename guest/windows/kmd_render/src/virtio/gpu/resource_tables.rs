@@ -289,8 +289,9 @@ impl VirtioGpu {
     /// while stale clients unwind) and also names the KMD-owned slots as
     /// `Exactly(None)`.
     pub fn blob_map_begin(&mut self, owner: OwnerFilter, resource_id: u32) -> BlobMapBegin {
-        // A foreign resource has no CPU view, whoever asks and whatever the path.
-        if self.foreign.contains(resource_id) {
+        // A foreign resource has no CPU view, whoever asks and whatever the path: except the
+        // KMD's own RM system memory (`KmdRmClient` = 5), which the host maps like a blob.
+        if self.foreign.contains(resource_id) && !self.foreign.cpu_mappable(resource_id) {
             crate::virtio::foreign::MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         }
@@ -416,7 +417,7 @@ impl VirtioGpu {
     /// blob content is intrinsic to the host memory object, so a remap is
     /// content-preserving. Any-owner resolve (kernel path, like the executor).
     pub fn blob_remap_begin(&mut self, resource_id: u32, offset: u64) -> BlobRemapBegin {
-        if self.foreign.contains(resource_id) {
+        if self.foreign.contains(resource_id) && !self.foreign.cpu_mappable(resource_id) {
             crate::virtio::foreign::MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
             return BlobRemapBegin::Failed(VirtioError::DeviceError);
         }

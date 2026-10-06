@@ -2,7 +2,10 @@
 
 Status: slice 1 written on `kmd/rm-client` against `044b242` (KMD 22.22.309); slice 2
 (sections 12 to 14: the decision on CPU access, the source priority stack, the level 3 ring and
-presenter, the KMD as the creator of foreign resources) on `kmd/rm-client-s2` against `bd5bef6`. **Never built, never run**: the KMD cannot
+presenter, the KMD as the creator of foreign resources) on `kmd/rm-client-s2` against `bd5bef6`; section 15
+(the primary from RM system memory, `KmdRmClient` = 5) on `kmd/rm-sysmem-primary`, merged onto the v315 line (flush gate, scanout
+release event) on `kmd/rm-sysmem-primary-merged` with its cache default and release seam decided (15.5, 15.7, 15.15).
+**Never built, never run**: the KMD cannot
 be compiled where this was written. The pure logic is host-tested
 (`cargo test` in `guest/windows/kmd_logic`, 38 tests in `rm_client`); the I/O file was
 type-checked against a shim that copies the signatures of the code it calls, and read by
@@ -41,8 +44,9 @@ one atomic load per HPD worker pass (no lock) and one registry read of the knob 
 | 2 | 1, plus the kernel view of the surface, the test picture, one flip |
 | 3 | (slice 2, section 13) a ring of two surfaces with their views, and the composited desktop shown through it by the presenter, with Venus as the fallback |
 | 4 | (section 14) 3, plus each ring surface imported as a foreign resource under the KMD's own owner (the resid a WDDM allocation adopts) |
+| 5 | (section 15) no ring: the VidPn primary itself from RM SYSTEM memory (write-combined by default, Venus as the fallback), mapped by the host into the CPU aperture's window and flipped with the KMD's own `ScanoutFlip` |
 
-Values above 4 count as 4. The knob is read once per transport generation (so `reg add` +
+Values above 5 count as 5. The knob is read once per transport generation (so `reg add` +
 `pnputil /restart-device` applies it): one atomic holds the level, `u32::MAX` meaning unread, and
 `retire_transport` (through `forget`) resets it to unread. At level 0 `service` returns on that one
 load, before it asks for the virtio lock.
@@ -963,6 +967,8 @@ counters count these resources too (`FgImp`, `FgLive`, `FgRel`).
 
 ### 14.2 Not built: the allocation arms (what needs deciding or building, in order)
 
+(Level 5, section 15, builds the primary's arm from system memory and Option B for it; the rest of this list still holds for the other kinds.)
+
 None of the KMD's allocations is RM-backed today (section 12: the CPU-written ones cannot be, until the pool
 of 12.3 (c); the GPU-only ones need an RM surface made on demand). The foreign resid is the easy half; the
 hooks are:
@@ -996,7 +1002,7 @@ hooks are:
    for the destroy (a reference count on the table entry; the host import holds its own reference to the
    memory, so freeing the RM memory first is safe for the host but not for a consumer's RM import of it).
 
-### 14.3 Not built: Option B, the present hook points (design only)
+### 14.3 Option B, the present hook points (design; built for the primary by level 5, section 15.7)
 
 Nothing in `display.rs` or `adapter/scanout.rs` is edited. Where the flip lane plugs in:
 
@@ -1033,3 +1039,587 @@ transport's sweep reclaims the host side). `release_all` is the same, and is ski
 is stopping. The allocation arms (14.2) run on the creator's thread, not the worker. Not covered by
 the bound: the host's own answer to a command that did arrive late (a created resource whose reply was
 lost): it is reclaimed with the context it was created in.
+
+## 15. The primary from RM system memory (`KmdRmClient` = 5, design "A'")
+
+Status: written on `kmd/rm-sysmem-primary` against the v314 line (`70b79dd`), merged onto the v315 line
+(`50d0698`: the flush gate `HEFL`, the scanout release event with its release book, `SCANOUT_STATUS` and
+the ring waits, S4 fences, S6 sharing, `RM_RESOURCE_IMPORT`, the RM client levels 3 and 4) on
+`kmd/rm-sysmem-primary-merged`. Three things the merge settled: **the cache default is write-combined
+memory with no alias** (15.5), the level 5 flip is the level 3 presenter with a ring of one and **never
+waits for a release** while the **close of a replaced primary's GEM does** (15.7), and the composition with
+user sources, the S4 queue and levels 3 and 4 is written down as a state machine (15.15). **Never built,
+never run**; the pure logic is host-tested (`kmd_logic::rm_sysmem`, 30 tests, plus 2 in
+`foreign_resource`), the I/O files were type-checked against a harness generated from the real module
+declarations (15.12). Host side: `feat/rm-export-map-blob` (`1ac5414`), unit-tested, not yet run in a guest.
+
+The idea. Every earlier level left the VidPn primary a Venus blob (host-allocated memory the viewer reads
+through a GPU copy into the adapter's LINEAR image) and put RM in front of scanout only. Level 5 makes the
+primary itself RM memory: `NV01_MEMORY_SYSTEM` allocated by the KMD's own RM client, exported to a GEM,
+created as a foreign (RM-export) Venus resource, adopted by the WDDM allocation, mapped by the host into the
+window dxgkrnl's CPU aperture uses (so GDI writes, the paging copies and the GDI executor reach it exactly as
+they reach a Venus blob), and shown by the KMD's own `ScanoutFlip`. The display engine cannot scan out system
+memory, so the viewer's compositor SAMPLES it: one GPU copy there, no CPU copy here. "Just a blob created by
+RM instead of Venus"; nothing else of the aperture / paging / GDI path changes.
+
+| `KmdRmClient` | does |
+|---|---|
+| 0-4 | unchanged (sections 1, 13, 14); the ring client and presenter run at 3 and 4 only |
+| **5** | no ring client, no presenter. The primary (`KmdLinearPrimary`) is allocated from RM system memory when it can be, from Venus when it cannot; an RM primary is flipped as it is |
+
+Sub-knob `KmdRmSysCache` (read at the service's bring-up; 15.5): **0 or absent: write-combined memory, no
+alias (the default)**; 1 the same, spelled out; 2 cached memory plus the `Cached` flag on the primary (opt-in
+experiment); 3 cached memory under dxgkrnl's write-combined view, a write-back / write-combined alias
+(opt-in). Any other value is the default: an unknown value never picks an alias. Values of `KmdRmClient`
+above 5 count as 5. With the knob below 5 the primary's creation, its flip and its teardown are the v315
+paths (15.15 lists every hook and what it does with the knob off).
+
+**A stale value of 5 or more selects level 5 now.** Before level 5 existed the driver clamped the knob to
+level 4, so a box that once had `KmdRmClient` set to 5, 9 or 99 (a typo, an experiment, a key left from a
+test) ran level 4. On this build the same key switches the box's desktop primary to RM system memory and
+its flip. Look at the key before the first run on any box that has been used for RM experiments (hardware
+checklist step 0, 15.13).
+
+### 15.1 The host contract this is written against (`feat/rm-export-map-blob`)
+
+* **Create**: `RESOURCE_CREATE_BLOB`, `blob_mem` `0x80000001` (RM_EXPORT), `blob_flags` `USE_MAPPABLE`. The
+  KMD's own creation sends it (`sysmem::import_resource`); the user-mode `IMPORT_RM` ABI sends 0 and cannot ask
+  for it. The backend answers `EOPNOTSUPP` for `USE_MAPPABLE` on vidmem or on memory it did not see allocated.
+* **What decides "system"**: only what RM writes back at allocation (`attr` `0x2a800000` cached sysmem,
+  `0x4a800000` write-combined sysmem, `0x11000000` vidmem), tracked through export and GEM import. So the
+  allocation is `NV_ESC_RM_ALLOC` (NVOS64) of class `NV01_MEMORY_SYSTEM` (0x3e), as `crm_alloc` sends it, never
+  `VID_HEAP_CONTROL`, and the export and the GEM import go through the backend (`FORWARD`), as slice 1 does.
+* **Map**: `RESOURCE_MAP_BLOB` at a page-aligned offset inside the window, length = size rounded to pages,
+  placed exactly like a HOST3D blob (so `blob_map_begin` / `blob_remap_begin` apply). One mapping at a time per
+  blob. `map_info`: CACHED for cached sysmem, WC for write-combined, UNCACHED otherwise.
+* **Unmap** removes the guest view and the range reads ZEROS afterwards (QEMU swaps in fresh anonymous
+  memory): never unmap while anything may still read it. UNREF unmaps first.
+* **Coherence**: cached sysmem is GPU-snooped; the guest needs no cache maintenance, only to finish its writes
+  before a flip (`sfence` for write-combined stores).
+* **Measured by the host**: cached reads about 28 GB/s, write-combined reads about 75 MB/s, write-combined
+  writes about 28 MB/s. Cached would be the fast choice and is an opt-in only: it puts a write-back alias
+  next to dxgkrnl's write-combined view of the same pages (15.5).
+
+### 15.2 Which allocations (decided: the primary only)
+
+`rm_sysmem::route(level, kind)`; the table is a tested function:
+
+| kind | at level 5 | why |
+|---|---|---|
+| `KmdLinearPrimary` | **RM system memory** | CPU-written by GDI, the memory the screen shows |
+| `KmdStandardBuffer { primary: false }` (shadow, staging, GDI staging, the external Present buffer) | Venus (`PresentBuffer`) | not simple. DWM opens it as Venus memory by identity (`venus_memory_id`, `memory_type_index`), and the Present-buffer ABI (`allocate_present_buffer_blob`, `register_present_buffer` / `unregister_present_buffer`, `authorize_present_buffer_open`, the `PresentLinearBuffer` system-backing mirror) is Venus-specific. The only reason to move them is the host's cached map, which the primary needs more |
+| `KmdStandardBuffer { primary: true }` | Venus (`OddPrimary`) | the ABI-defensive arm classification never produces |
+| `KmdOptimalGdiTexture` | Venus (`NotCpuWritten`) | a tiled, GPU-only image; system memory is for CPU-written bytes. Vidmem (14.2) remains the answer for it |
+| adopted UMD resources, raw blobs, tracking | Venus (`NotKmdOwned`) | not the KMD's |
+
+Opening the standard buffers later is a change to `route` plus an arm that does the present-buffer
+registration; the creation, the table, the map and the teardown are kind-agnostic (they take a layout).
+
+### 15.3 Decision: create synchronously in `create_one`, not through a worker mailbox
+
+`DxgkDdiCreateAllocation` runs at PASSIVE on the caller's thread. Chosen: **synchronous, on that thread.**
+
+* The primary arm already creates its Venus blob synchronously there (`with_venus_client`, host round trips with
+  a 30 s bound). An RM creation is about ten host messages (alloc, open the export file, export, GEM import,
+  close it, create the resource and attach it, map, unmap) of a few milliseconds each, plus eleven once per transport
+  generation for the bring-up. Each message is bounded by `TIMEOUT_MS` (2.5 s), the whole forward part of a
+  creation by ONE 6 s deadline on the interrupt-time clock (`rm_sysmem::CREATE_BUDGET_MS`; `Slow`): the wait
+  for another thread's bring-up, the bring-up itself and every step after it share it, and each message waits
+  at most what is left of it (none is sent once it is spent). The undo of a failed creation has its own 3 s
+  (`UNDO_BUDGET_MS`), so a creation that ran out of time can still give back what it made; a failed creation
+  is therefore over in about 9 s.
+* A mailbox to the HPD worker has a dependency edge the synchronous call does not: `create_one` would wait on a
+  thread that itself calls dxgkrnl (`DxgkCbIndicateChildStatus`, the VidPn programming) and may be blocked on a
+  lock dxgkrnl holds while it calls CreateAllocation. A creation that waits only on the control queue, as the
+  Venus arm does, cannot take part in that cycle.
+* The ring client's state has exactly one mutator (the worker), which is why 14.2 wanted a mailbox. The service
+  does not share it: it has its OWN RM client (own control, GPU and DRM files, own `hRoot`; three handles of the
+  KMD owner's 128), so there is nothing to serialise but the bring-up. Creations run concurrently, each on a
+  reserved table slot; only the first one brings the client up while the others `sleep_ms` for it until their
+  own 6 s deadline (the wait is a deadline, not a count of sleeps: a `sleep_ms(1)` lasts a timer tick, about
+  15.6 ms, so a count of 5000 of them was 78 s on dxgkrnl's thread).
+* Cost: a creation holds its thread for the host round trips, with no lock held (`STATE` is a leaf spinlock
+  taken for table moves only; nothing is held across a message). It takes no dxgkrnl lock of its own and is
+  never called under the scanout lifecycle lock.
+
+The ring client's `Client` machine is reused for the eleven bring-up steps (driven to `bring_up_done()` on the
+creator's thread and then dropped; only the four handles are kept), so no bring-up logic is duplicated.
+
+### 15.4 The sequence, and what each stage undoes
+
+`RmSysStage` is written BEFORE each stage so a hang names itself. Failure in any stage undoes the stages before
+it in this order: the export file, the Venus resource, the GEM, the memory; a step that fails is counted
+(`RmSysSoft`) and left to the transport sweep (`RmSysLeak`). The undo runs on its own 3 s allowance, not on
+what is left of the creation's.
+
+**The slot's RM handle.** The memory's RM handle is `H_BASE + slot`. If the undo cannot make sure RM freed the
+memory (the `RM_FREE` failed, or the `RM_ALLOC` timed out or its reply was unreadable, so the host may have
+allocated it, and the free was not answered either: `rm_sysmem::mem_may_be_live`), the slot is not freed:
+`Svc::abort_leaked` counts the strike and leaves it `Closing` (quarantined) for the rest of the transport
+generation, the way a destroy whose free failed does (15.9). A creation that took the slot again would
+`RM_ALLOC` the same handle, be refused as a duplicate, and three of those would end the generation's
+allocations. An `RM_FREE` that RM answers with `NV_ERR_OBJECT_NOT_FOUND` settles it (nothing is there).
+
+| stage | what | on failure |
+|---|---|---|
+| 1 admit | route, display half, transport, Venus context, layout; a slot (or the bring-up duty) | Venus, no strike for a policy refusal |
+| 2 bring-up | the ring client's eleven steps (`OpenCtl` .. `OpenDrm`) | the files opened are closed; **Dead for the generation** |
+| 3 alloc | `RM_ALLOC` `NV01_MEMORY_SYSTEM` (params: `rm_sysmem::params`, `attr` `0x5a000000` write-combined, the default, / `0x3a000000` cached, opt-in; RM writes them back as `0x4a800000` / `0x2a800000`, the host's decision values; `attr2` 1, size, alignment 4096, width/height/pitch 0 as `rm_sysmem_flip.c`) | strike |
+| 4-7 | export file, `EXPORT_OBJECT_TO_FD`, `GEM_IMPORT_NVKMS` (pitch layout), close the export file | strike; undo |
+| 8 import | `RESOURCE_CREATE_BLOB` `RM_EXPORT` + `USE_MAPPABLE` under `DeviceOwner::KMD_RM` and the KMD's Venus context; the foreign record | strike; undo |
+| 9 mark | `foreign_mark_sysmem`: the record may now be mapped | strike; undo |
+| 10 trial | map the blob once (KMD window partition), read `map_info`, unmap | strike; undo. Host cannot map, or `map_info` is not the attribute the memory was made with (`RmSysMis`, for the default write-combined memory too): Venus. An unmap the host did not confirm ends the creation with the blob still recorded as mapped and its window range still taken; the undo's blob release (which sees `mapped`) unmaps again and only then returns the range, so no later map can overlap a range the host still has mapped |
+| 11 adopt | `adopt_for_allocation` (declares foreign, DEVICE ownership, the layout repeated): the WDDM allocation owns the resource | strike; undo |
+
+Three strikes in a row (a success clears them) stop NEW allocations for the generation (`NoNew`); the live ones,
+the client and the flip source stay: their GEMs, memory and the screen depend on them.
+
+**Sizing, and the padded-versus-recorded lesson.** RM system memory is page-granular. The size asked is
+`cross_adapter_pitch(width) * height` rounded to a page (1920x1080: pitch 7680, 8,294,400 bytes; 5120x1440:
+29,491,200); RM's answer for `size` is adopted if it holds the request (`adopt_size`), rounded to a page, and
+THAT number is what the foreign record, the blob table, `CreatedBacking::blob_size` (`HostAuthoritative`),
+`ap.size`, VidMm's `info.Size` and the aperture check all see (one value, one rounding), so the aperture page
+count, `blob_map_begin`'s map length and the paging clamp agree by construction. VidMm sizing a virtual
+transfer larger than what was recorded (measured 0x1E10000 against 0x1C20000 for a 5120x1440 Venus primary)
+is cut by `clamp_range` against the recorded size exactly as today (test
+`vidmm_sees_the_recorded_size_and_the_padding_is_cut`). The layout recorded is XRGB8888 (DXGI 88, the primary's
+format; 87 and 28 map to ARGB / ABGR), `MOD_LINEAR`, stride = the pitch, offset 0.
+
+### 15.5 Decision: the cache attribute, and the alias
+
+dxgkrnl maps a CpuVisible allocation's aperture write-combined unless the allocation carries `Cached`, and
+the 36th session found it rejects `Cached` together with the primary. So the primary's own CPU view stays
+write-combined whatever memory sits behind it. Cached memory behind that view is a mixed-attribute ALIAS of
+the same physical pages: architecturally invalid, never measured on this stack, and the lead engineer's
+decision is that it is **not shipped blind**. The default therefore makes no alias; the cached variants are
+opt-ins for the run that measures them.
+
+| `KmdRmSysCache` | RM is asked for | host `map_info` must say | dxgkrnl's view | alias | `RmSysCache` / `RmSysAlias` |
+|---|---|---|---|---|---|
+| **0 or absent (default)**, 1 | write-combined sysmem, `attr` `0x5a000000` (RM writes back `0x4a800000`) | WC (3) | write-combined (no `Cached` flag) | **no** | 3 / 0 |
+| 2 (opt-in) | cached sysmem, `attr` `0x3a000000` (`0x2a800000`) | cached (1) | write-back, asked with the `Cached` flag; if dxgkrnl refuses the primary the creation fails (Code 43 class), if `AllocCached=0` takes the flag away it is value 3 | no (yes with `AllocCached=0`, counted) | 1 / 0 |
+| 3 (opt-in) | cached sysmem | cached (1) | write-combined | **yes**, counted | 1 / 1 |
+
+* **Default: write-combined memory.** Every view of it agrees: the host maps it write-combined (it reports
+  `map_info` WC for coherency 2), the KMD's own kernel maps (paging copies, the GDI executor) follow the host's
+  `map_info` through `map_cache_to_mm` (write-combined), dxgkrnl's aperture view is write-combined. It is parity
+  with today's primary mapping, whose aperture view is write-combined too (GDI reads of it were already
+  write-combined). The cost is the measured write-combined speed: reads about 75 MB/s, writes about 28 MB/s.
+* The RM request is what decides "write-combined": `rm_sysmem::params` puts coherency 2 (`NVOS32_ATTR_COHERENCY_WRITE_COMBINE`)
+  in bits 31:29 of `attr` and PCI in bits 26:25, so RM answers `0x4a800000`, the value the host's `RmPlacement`
+  maps to `MAP_CACHE_WC`; the cached request (coherency 1) is answered `0x2a800000`. Tests pin both words, the bit
+  positions the host decodes, and that only value 2 and 3 ever send the cached one.
+* **The trial map's safety check applies to the default**: the memory is made with the attribute the knob
+  chose, the trial map reads the host's `map_info`, and a host that reports anything else (cached or uncached
+  for the write-combined memory the default asked for, as for a cached request) is refused: the allocation is
+  given up and Venus makes the primary (`RmSysMis`, `Why::Cache` 19). Tested for every knob value
+  (`the_trial_check_guards_the_default_and_every_opt_in`).
+* Value 2 sets the `Cached` flag only on a primary this service made (`primary_cached_flag(resource_id)` asks the
+  service's table), never on a UMD-adopted foreign primary.
+* Before a flip the worker issues `sfence` (this core's write-combined buffers; dxgkrnl's WC stores from other
+  cores drain on their own and the viewer samples on its own schedule: a stale frame, not corruption). With the
+  write-combined default this is the common case, not the exception.
+* What the hardware run decides (15.13 steps 2 and 7): that the default works and shows (no alias, so nothing
+  to compare it with), and then whether the CPU read speed of value 3 (and 2) is worth the alias: stale lines
+  or tearing in a window drag with value 3 against a clean picture with the default is the answer. On a KVM host
+  without non-coherent DMA the guest PAT is ignored (IPAT) and the alias would be inert; on a host that honours it
+  it is invalid and the symptom is stale lines.
+
+### 15.6 `MAP_BLOB` for sysmem foreign records, and the paths that use it
+
+Today every `MAP_BLOB` of a foreign resource is refused (`blob_map_begin`, `blob_remap_begin`,
+`FgMapRf`). Now `ForeignTable::cpu_mappable(resid)` (the record's `sysmem` bit, set only by the KMD's own
+service between import and adoption: `mark_sysmem` requires the creator to be `KMD_RM` and the resource not yet
+adopted) lifts the refusal for that one record; vidmem, user-imported and every other foreign resource keep it.
+User-mode escapes cannot reach it (they filter on a device owner; an adopted slot's owner is `None`).
+
+Item 4, the paths that map or copy through the aperture mapping, read for WC or Venus assumptions:
+
+* `DxgkDdiMapCpuHostAperture` (`ddi/cpu_host_aperture.rs`): `map_blob_at` -> `blob_remap_begin` -> the same
+  `RESOURCE_MAP_BLOB` at dxgkrnl's offset; the size check uses `alloc.size` (the recorded size, 15.4).
+  `bar_eligible` is true (`HostAuthoritative`). The existing mapping at another offset is unmapped first
+  (the content is the host memory's, so a remap preserves it; the zeros the host leaves behind are in a
+  range nothing maps afterwards).
+* `BuildPagingBuffer` content ops (`bar_virtual_transfer`, `bar_transfer`, `bar_fill`) all go through
+  `with_blob_bytes`: `map_blob_prepare(Any)` plus `MmMapIoSpace` with the cache type of the host's `map_info`
+  (`map_cache_to_mm(prep.map_cache)`), never a fixed one. Nothing assumes WC. The system side is the ordinary
+  RAM MDL (`MmCached`), unrelated to the blob. The allocation's `system_backing_policy` is `None` (the
+  Present-buffer mirror and its page leases are not involved).
+* The GDI executor resolves the blob by resource id with `OwnerFilter::Any` (the adopted slot is KMD-owned):
+  works as for a Venus blob. The escape `MAP_BLOB` (a UMD mapping it) is owner-scoped and stays refused.
+* Nothing in the aperture / paging / GDI code calls a Venus operation on the primary (`venus_image_id` and
+  `venus_memory_id` are 0; destroy skips `destroy_image` / `free_memory_blob`, which are gated on them).
+
+### 15.7 Option B: the flip from the foreign record (`virtio/rm_client/sysmem_flip.rs`)
+
+Hook points (14.3's table, as built):
+
+| where | what |
+|---|---|
+| `program_vidpn_source_inner`, after the extent check | `sysmem_flip::program(resid, address, w, h)`. An allocation whose record is an adopted RM sysmem record (and the level is 5): no `ScanoutTarget`, no `SET_SCANOUT_BLOB`, no GPU copy, no dedicated image. It records the target (resid, DRM file, GEM, layout), stores `active_scanout_*`, publishes the displayed primary (`publish_bound_primary`, as a bind does), ends the leases (`Cancelled`: nothing reads this memory through a lease; the flip is not one), updates a registered resident source's layout in place, raises the frame edge and returns `Programmed`. `host_bound_scanout_resource` is NOT set: a Venus flush of it would be refused loudly (`RfUnb`) instead of being sent for a resource with no scanout. Any other allocation: `NotOurs` and the Venus path below runs unchanged, after `other_source` forgets a previous RM target (the worker then withdraws the resident source, and the desktop flush returns) |
+| `rm_client::service` (HPD worker), level 5 | `sysmem_flip::service`: the level 3 presenter's state machine with a ring of ONE (`Presenter::new(1)`; "copy" is nothing, the memory is the primary): register the resident source (`foreign_scanout_resident_set`, owner `KMD_RM`, the service's DRM file), flip the GEM on a frame edge (`present_within`, 1 s, direct) paced to 60 Hz, re-flip on a resume edge, withdraw when no target. The presenter's inputs come from `rm_sysmem::flip_inputs`: a ring of one never asks the release book (below) |
+| the suppression gate (unchanged) | the desktop flush the arbiter withholds is a frame edge (`note_frame_edge`), exactly as at level 3; the refresh machinery reaches the gate because `active_scanout_resource` names the RM primary |
+| `release_allocation_resource` (via `sysmem::released`) | the target is forgotten first (`target_gone`), so no flip names a GEM about to be closed; then GEM close, `RM_FREE` |
+
+Priority, preemption, restore: the resident source of the arbiter, unchanged (13.2). A user source preempts it
+at once; its end resumes the RM primary with a re-flip (never a Venus flush: there is no Venus image to flush).
+A resume needs no copy: the memory is live, so the desktop-changed flag a parked level 3 source keeps
+(`note_desktop_changed`, ring levels only) is not needed and not raised at level 5. Three consecutive failures (a refused flip, a refused registration, eight yielded flips with no user
+source) withdraw the source and, unlike level 3, **start over five seconds later** (`RmSysGaveUp`): a primary with
+no Venus image has no desktop for Venus to show, so withdrawing for good would only freeze the screen. The five
+seconds are a gate at the top of the worker's pass (`RESTART_AT`, `rm_sysmem::restart_pause`): a reset presenter
+registers at its very next look, and every desktop frame edge wakes the worker, so without the gate the
+register, flip, fail, withdraw cycle would run on every edge. During the pause nothing is registered or flipped
+(the edges stay owed; a primary programmed meanwhile is shown when the pause ends).
+The S4 fence queue is not involved: a resident flip is sent direct and never queues behind fenced presents
+(13.12 states why); `present_within` is the same call.
+
+**The release seam (decided; wired in one place).** The host's `ScanoutReleased` (`foreign-scanout.md`, "Buffer release", has the book's
+rules) says a replaced buffer is no longer read. Level 5 flips are entered in the same book as every other flip
+(`present_within` mints and `send` marks them), and two questions follow.
+
+* **Does a flip wait for a release? No, never, and it cannot be made to.** The buffer a level 5 flip shows is
+  either the one already on the scanout (a re-flip, the whole life of a ring of one) or ANOTHER primary (a mode
+  change). The book never releases the buffer on the scanout ("the buffer on the scanout is never released; a
+  buffer flipped again is released again later"): a re-flip supersedes the older flips of the same buffer, but its
+  own `seq` stays live for as long as it is shown, so a wait for it would last its 500 ms limit on every frame for
+  nothing. And the flip of another primary is exactly what makes the host release the previous one: a wait
+  before it could only wait for its own effect. The presenter agrees: `Presenter::back_wait_seq` is `None` for a
+  one-surface ring, and the driver passes `release_tracked = false` (`rm_sysmem::flip_inputs`), so even a real
+  "not released" answer could not hold a frame. Tested with a presenter that is given the worst answers
+  (`a_ring_of_one_never_waits_for_a_release_that_cannot_come`, 50 consecutive re-flips).
+* **Does anything wait? Yes: giving the memory back.** `sysmem::released` (DestroyAllocation, or the last close
+  of a destroyed-while-open allocation) closes the GEM and frees the RM memory. A primary the screen has MOVED
+  OFF (the host was told to show another buffer after it) is closed only once the host released it, so a viewer
+  that still samples it is not left with memory RM took back. `FlipLog` (`rm_sysmem`) remembers the newest flip's
+  GEM and the buffer that flip replaced, with the time the replacing flip was taken; `close_gate` is the level 3
+  ring's rule (`scanout_release::ring_wait`): held until `ScanoutReleased` retires the replaced buffer's last
+  `seq` (`is_done`), at most **500 ms from the replacing flip** (the host overrules a client that holds it after
+  500 ms; `RmSysRelTmo` counts the close that went ahead at the limit), polled every 2 ms by `wait_released`
+  (the interrupt side wakes the HPD worker, not this thread), ended at once by StopDevice. It waits for
+  NOTHING when the GEM is the buffer on the scanout (never released: the log says it is current), was never
+  flipped, is older than the one replaced buffer the log keeps, or the host's releases are not tracked
+  (`is_done` is true then). A user source that replaced our buffer on the host is not in the log: the close then
+  does not wait (as before this change). The host resource is already unreferenced when `released` runs and the
+  host's own dma-buf reference keeps the pages valid; the wait only orders the GEM close and RM free after the
+  viewer's release. Cost: a DestroyAllocation of a replaced primary can take up to 500 ms on dxgkrnl's thread when
+  the viewer sits on it; the common case is none (the release arrives milliseconds after the replacing flip).
+
+The flip's own bookkeeping: `LAST_SEQ` / `RmSysSeq` is the last flip the host took; `RmSysRelWait` counts closes
+that waited. Tests: `a_reflipped_buffer_is_never_something_a_close_waits_for`,
+`a_replaced_primary_is_waited_for_until_the_host_releases_it_or_the_limit`,
+`the_log_follows_a_buffer_that_comes_back_and_forgets_a_closed_one`,
+`the_book_agrees_with_the_log_on_what_can_be_waited_for` (the real `ReleaseBook`).
+
+### 15.8 What reaches the screen, and what does not (read this before the first run)
+
+* GDI writes into the primary reach the viewer through flips on frame edges. Frame edges come from the same
+  refresh requests the Venus path uses (present markers, completions); a pure CPU write with no kernel
+  notification at all is not seen by the KMD on either path. If the viewer re-samples the attached buffer
+  without being told, nothing more is needed; if it does not, the edge-driven flip is the damage signal
+  (checklist step 7).
+* **DWM's composition into this primary** (the UMD's windowed present blits into the primary by identity)
+  rides the host's Venus import of an RM-export resource. The identity record of a STANDARD allocation cannot
+  carry the FOREIGN flag today (only DEVICE_MEMORY does), so a UMD opening it sees plain Venus memory with
+  `memory_type_index` 0. Whether that import works is the host's and the UMD's; **unverified**, and the
+  likeliest first failure of a DWM session at level 5. Without DWM (safe mode, the logon screen's GDI) the path
+  is complete.
+* There is no Venus fallback for an RM primary that exists: its Venus image is `0`, so the primary-to-LINEAR GPU
+  copy cannot run. A primary that cannot be flipped stays on its last frame. The fallback is TOTAL for
+  allocations that are not yet made (every failure of 15.4 gives Venus) and for the next primary after a
+  failure; making an existing RM primary fall back (a CPU copy of the sysmem into the dedicated LINEAR image,
+  or recreating the allocation) is not built (15.14, question 3).
+* The create-time layout trailer needs 128 bytes of private data and a standard allocation has 96
+  (`GetStandardAllocationDriverData`): the adoption is told room exists (the KMD is the creator, there is no
+  creator to promise a trailer to) and `write_foreign_layout_trailer` writes it only where there is room
+  (`FgOpNoRm` counts the opens that find none). Openers read the layout from the meta (stride, extent).
+
+### 15.9 Failure and fallback matrix
+
+| where | failure | effect | fallback |
+|---|---|---|---|
+| knob 0..4 | none | the v315 behaviour: `create_one`'s arm one atomic load (`route` says `KnobOff`), `release_allocation_resource` one, the two display hooks one each; byte for byte what the tip does otherwise (15.15) | Venus (as before) |
+| route / display half / transport / context / layout | refused | `RmSysVenus`, `RmSysWhy`; no strike | Venus |
+| bring-up | any message fails | files closed; service **Dead** for the generation (`RmSysFail` stage 2) | Venus for every allocation of the generation |
+| bring-up by another thread | not finished by this creation's 6 s deadline | `BringUpBusy` | Venus for this one |
+| alloc / export / import / trial / adopt | any | undone (15.4); one strike; `RmSysFail` stage and kind | Venus for this one; three strikes in a row: no new RM allocations this generation (`NoNew`) |
+| creation slower than 6 s (the deadline covers the wait for a bring-up, the bring-up and the steps) | `Slow` | as a failure; the undo has its own 3 s | Venus |
+| the undo cannot confirm the memory's `RM_FREE` (or an `RM_ALLOC` that timed out is not known to be absent) | `RmSysLeak`; the slot stays `Closing` | strike; the slot and its RM handle are not reused this generation | Venus for this one |
+| the trial's unmap is not confirmed | `RmSysSoft`, `RmSysTrialF` | the blob stays recorded as mapped; the undo unmaps and then frees the window range | Venus for this one |
+| host map_info is not the requested attribute | refused (`RmSysMis`) | undone, strike | Venus |
+| table full (32 live) | `TableFull` | no strike | Venus |
+| flip refused / times out | counted (`RmSysFlipFail`) | paced retry 100 ms; three in a row: withdraw, restart in 5 s | the screen keeps its last frame meanwhile |
+| a user source takes scanout 0 | `NoSource` | yielded, parked; resumes by re-flip | n/a |
+| the shown allocation is destroyed | `target_gone` | resident source withdrawn by the worker (the arbiter owes the desktop a flush), GEM closed, memory freed | the next primary |
+| a Venus source is programmed | `other_source` | the target is forgotten, the resident source withdrawn | Venus desktop flush |
+| destroy of a primary the screen moved off, the host has not released it | `RmSysRelWait` +1; the close is held, polled every 2 ms (15.7) | released by the host: closed at once; 500 ms after the replacing flip: closed anyway (`RmSysRelTmo`); StopDevice: closed at once | n/a |
+| destroy of the shown primary, one never flipped, releases not tracked | no wait | closed at once (the host never releases the buffer on the scanout) | n/a |
+| destroy: GEM close or free fails | counted (`RmSysSoft`, `RmSysLeak`) | the transport sweep closes the KMD owner's files (the control file's close frees the RM client) | n/a |
+| transport reset / StopDevice | `forget` | table, target, presenter cleared; the sweep closed the host side; a stale allocation's destroy is skipped by `is_current_generation` | next generation starts cold |
+| **mid-session death of the service** | bring-up cannot die later (it is a one-shot); a creation failing leaves the live allocations alone | nothing already made is torn down: its GEM, memory and flip source stay valid; only NEW allocations go to Venus | decided: never close handles under live allocations |
+
+### 15.10 Locking, IRQL, lifetime
+
+* `STATE` (service) and `TARGET`, `PRES`, `FLIPS` (flip) are leaf spinlocks over plain data, never held across a host
+  message, a wait, an allocation, a registry write or another lock, and not nested. `LIVE` mirrors the
+  live count so every Venus allocation's destroy costs one load.
+* Creation: PASSIVE on dxgkrnl's thread; no lock held; it takes no dxgkrnl lock and the scanout lifecycle lock is
+  never held when it runs (create_one does not take it; `destroy_allocation_ctx` calls `released` after its
+  lifecycle section ended). The programming hook runs under the lifecycle lock but sends nothing and takes no
+  `STATE` lock across I/O; the flips are the worker's, with no lock.
+* Order on destroy: `retire_scanout_allocation` (clears `active_scanout_*` if it names it) -> host resource
+  unref (`release_allocation_resource`) -> `target_gone` -> GEM close -> `RM_FREE`. A last close that releases a
+  destroyed-while-open allocation takes the same path, so the RM objects outlive every opener.
+* A flip racing a destroy: the flip re-reads the live slot before it sends; a flip already on its way when the
+  GEM is closed is refused by the host and counted (one failed flip, never a strike by itself).
+* Stack: every message step is `#[inline(never)]` with its buffers (the ring client's rule); the chain is
+  `create_one` -> `build_backing` -> `try_create_primary` -> `create_primary` -> `build` -> `build_steps` -> a step.
+  `tools/kmd-frame-sizes.ps1` must be run on a build.
+
+### 15.11 Counters (`RmSys*`, REG_DWORD, written once the service was asked for something; at level 5 `RmKnob` is 5)
+
+| value | what | healthy |
+|---|---|---|
+| `RmSysTry` / `RmSysOk` / `RmSysVenus` | creations asked / made / given to Venus | 1 / 1 / 0 per primary |
+| `RmSysWhy` | the last reason for Venus (`Why::code`: 1 knob, 2 present buffer, 3 not CPU-written, 4 not KMD's, 5 odd primary, 6 no display, 7 no transport, 8 no context, 9 format, 10 extent, 11 size, 12 dead, 13 no-new, 14 bring-up busy, 15 table full, 16 bring-up, 17 alloc, 18 import, 19 cache, 20 trial, 21 adopt, 22 slow) | 0 |
+| `RmSysStage` | the stage started last (1 admit, 2 bring-up, 3 alloc, 4 open export, 5 export, 6 GEM import, 7 close export, 8 import, 9 mark, 10 trial, 11 adopt, 20 GEM close, 21 free, 22 undo, 23 waiting for a release before the GEM close) | any |
+| `RmSysFail` | `stage << 24 \| kind << 16 \| code` of the last failure (kinds as `RmFail`) | 0 |
+| `RmSysState` | `phase << 28 \| strikes << 24 \| live` (phase 0 cold, 1 bringing up, 2 up, 3 no-new, 4 dead) | `0x2000_0001` with the primary alive |
+| `RmSysLive` / `RmSysFreed` | allocations alive / released | 1 / 0 |
+| `RmSysBring` | bring-ups done | 1 per generation |
+| `RmSysMs` / `RmSysMsMax` | last / longest creation, ms | a few tens (bring-up included) |
+| `RmSysTrial` / `RmSysTrialF` | trial maps that worked / failed | 1 / 0 |
+| `RmSysCache` | the last `map_info` nibble (1 cached, 2 uncached, 3 WC) | 3 by default (write-combined memory); 1 with `KmdRmSysCache` = 2 or 3 |
+| `RmSysMis` / `RmSysAlias` | creations refused for the wrong attribute / whose memory and dxgkrnl's view differ | 0 / 0 by default (no alias); `RmSysAlias` 1 only with `KmdRmSysCache` = 3 (or 2 when the `Cached` flag was not applied) |
+| `RmSysSoft` / `RmSysLeak` | undo steps that failed / allocations left to the sweep | 0 / 0 |
+| `RmSysRelWait` / `RmSysRelTmo` | GEM closes that waited for the host's release of a replaced primary / that went ahead at the 500 ms limit | 0 or small / 0 |
+| `RmSysProg` / `RmSysProgBad` | primaries programmed / refused (a layout that is not the mode's) | grows / 0 |
+| `RmSysRegs` / `RmSysWithdrawn` / `RmSysGaveUp` | registrations / withdrawals / giving-ups | 1 / 0 / 0 |
+| `RmSysFrames` / `RmSysReflips` / `RmSysYielded` / `RmSysFlipFail` | flips for an edge / for a resume / that found the source yielded / refused | grows / small / small / 0 |
+| `RmSysPres` / `RmSysSeq` | the presenter word (bit 0 registered, bit 1 gave up, bits 8.. failures) / the last flip's `seq` | 1 / grows |
+
+`FgMapRf` must stay 0 for the primary (the map is no longer refused for it); `FsSupp` grows with the withheld
+flushes; `RfUnb` is expected to count only if a Venus flush of the RM primary is ever attempted.
+
+### 15.12 Verified here, and not
+
+Verified on the host (`cargo test` in `guest/windows/kmd_logic`, 707 tests; in `guest/windows/protocol`, 29):
+which kinds go to RM; sizes and the page-granular rule against the aperture count and the paging clamp; the RM
+parameter block byte for byte (`attr` words against `nvos.h` 610.57.04's bit positions, `0x3a000000` /
+`0x5a000000`, and the written-back `0x2a800000` / `0x4a800000` the host decides from); RM's rounded answer; the
+cache policy for every knob value (the default is write-combined with no alias; only the opt-in values alias; an
+unknown value is the default) and the host-nibble check against every knob value; the service state machine
+(bring-up once, waiters, dead for a generation, three strikes, the bounded table, slot reuse only after free,
+generation reset, stale commit and free ignored; a slot whose memory may still be live is quarantined, never
+found, taken or reused, strikes count, a new generation cleans it; what a failed `RM_ALLOC` / `RM_FREE` leaves
+open, by failure kind); the creation's and the undo's budgets (6 s and 3 s, per-message caps, a wait on the deadline
+ends on time whatever a sleep costs); the target book; the flip against the REAL arbiter (register,
+flip, 60 Hz pacing, a user source preempting and the resume, a new primary updating the resident layout in place,
+the shown primary going, three refused flips, and the five-second restart pause: a gate on the clock that holds back
+hundreds of frame-edge wakes and opens at the restart time) with the presenter inputs the driver passes (`flip_inputs`, the v315
+`release_tracked` / `back_released` fields); a ring of one never held by a release; the release seam against the
+REAL `ReleaseBook`; the record's `sysmem` bit (only the KMD's un-adopted import can be marked; an adopted
+unmarked record is never a source).
+
+Type-checked (`cargo check`, no codegen) against a harness generated from the REAL module declarations: module
+visibility from the real `mod` lines (never typed by hand), signatures cut from the real sources, and the files
+under test included unchanged: `rm_client.rs` (as a directory module over its real children), `rm_client/sysmem.rs`,
+`rm_client/sysmem_flip.rs`, `rm_present.rs`, `rm_foreign.rs`, `virtio/foreign_scanout.rs`,
+`virtio/scanout_release.rs`, `adapter/foreign_scanout.rs`. A deliberately wrong path is rejected by it (checked).
+Every `crate::` / `super::` path of those files and of `create_allocation.rs`, `display.rs`, `ctrl.rs`,
+`foreign_tables.rs` and `resource_tables.rs` was resolved against the real `mod` lines and item visibilities
+(0 problems). The edits to the large existing files are small hooks, read against the real definitions; they
+are not compiled. The v315 line itself did not compile before this merge: its protocol crate carries a
+compile-time assertion that named the wrong bit for `HELIOS_NVRM_CAP_SCANOUT_RELEASE` (fixed in this branch,
+`>> 35`; `cargo test` in `protocol` now passes). **Not verified by anything**: that `kmd_render` compiles; every
+host reaction (`USE_MAPPABLE` create, map and unmap, `map_info`, the GEM import of system memory, the flip of
+it, the compositor's sampling, `ScanoutReleased` for a level 5 flip); IRQL behaviour; dxgkrnl's reaction to an
+adopted standard allocation; DWM's import (15.8); the 500 ms close wait on dxgkrnl's thread; the opt-in cached
+variants (15.5). Also not run: the wiring of the deadline into the messages (`Io::limit`, the budgeted unmap in the
+trial), the quarantine call on a failed creation, and the restart gate in the worker's pass (type-checked and read
+only; their pure decisions are the tested part).
+
+### 15.13 Hardware checklist, in order
+
+Stop at the first step that fails. Prerequisites: the host with `feat/rm-export-map-blob` (and the 4 GiB window), a
+viewer connected, section 9 step 2's list, **levels 2 and 3 working** (they prove the RM client, the export, the
+GEM import and `ScanoutFlip` from a KMD owner on this VM), and `tools/kmd-frame-sizes.ps1` passing. Nothing
+here sets `KmdRmSysCache` before step 7: steps 1 to 6 run on the default, write-combined memory with no alias.
+
+0. **Check the key first.** Read `KmdRmClient` (and `KmdRmSysCache`) on the box before installing this build.
+   A stale value of 5 or more (an old experiment, a typo, 99) used to clamp to level 4 and now selects level 5:
+   the box's desktop primary moves to RM memory and its flip on the first boot of the new driver. On a box that
+   is not meant to run level 5, delete the value or set it to the level wanted; on a box that is, the value
+   is step 2's, set deliberately. The build's identity is 22.22.317.0, so an installed 316 or older is replaced
+   (the INF `DriverVer` and the image's `FILEVERSION` come from `driver-version.env`).
+
+1. **Knob absent**: nothing changes; no `Rm*` value; frame sizes pass.
+2. **`KmdRmClient=5`, restart the device, no DWM yet** (or boot to the logon screen). This is also the cache
+   check of the default: write-combined, no alias. Expect `RmSysTry=1`, `RmSysOk=1`, `RmSysVenus=0`,
+   `RmSysState=0x20000001`, `RmSysFail=0`, `RmSysTrial=1`, **`RmSysCache=3`, `RmSysAlias=0`, `RmSysMis=0`**;
+   host log: RM_ALLOC class 0x3e with `attr` 0x5a000000, RM_CONTROL 0x3d05, a DRM ioctl 0xC0206441,
+   `RESOURCE_CREATE_BLOB` 0x80000001 with `USE_MAPPABLE`, a map and an unmap. `RmSysFail` names the stage (15.11)
+   and kind. `RmSysVenus` with `RmSysWhy` 20 or 19 means the host cannot map it or reports another attribute
+   than write-combined (`RmSysCache` says which): the host's answer.
+3. **The primary maps**: `ChMn` (aperture maps) grows, `ChEm=0`, `ChEp=0`, `FgMapRf=0`; `RmSysLive=1`.
+4. **It is shown**: `RmSysProg>=1`, `RmSysRegs=1`, `RmSysFrames>=1`, `RmSysFlipFail=0`; the host log shows a
+   `ScanoutFlip` for the KMD's DRM handle; the logon screen / desktop is visible through the viewer. Black:
+   compare with level 2's probe (a probe that shows means the flip path is right and the content is the
+   question).
+5. **GDI updates show**: move a window under GDI; `RmSysFrames` grows with `FsSupp`; the picture follows. If
+   the viewer shows the first frame only, the edges are not reaching the gate (`SaCnt`, `RfCnt`) or the viewer
+   needs the flip as the damage signal and the edges are the limit.
+6. **Baseline CPU speed of the default**: time a read of the primary through GDI (a full-screen `BitBlt` /
+   `GetDIBits` from the screen DC, 20 repetitions) and a full-screen GDI fill; note both. They are the numbers
+   step 7 is compared with (the host measured write-combined reads at about 75 MB/s).
+7. **The opt-in cached variants, only now that the default picture is proven.** `KmdRmSysCache=3`, restart the
+   device: expect `RmSysCache=1`, `RmSysAlias=1`; compare the step 6 read speed, and look for stale lines or
+   tearing in a window drag (the alias's symptom). Then `KmdRmSysCache=2`: `RmSysAlias=0` if dxgkrnl took the
+   `Cached` flag (the 36th session saw it rejected: watch `StdType` / Code 43 class failures at the primary's
+   creation, and `AllocCached=0` turns it into value 3). Put the knob back to absent afterwards. The default
+   changes only on this evidence.
+8. **Preemption**: `crm_scanout_smoke` / an NVK scanout app: `FsSet`+1, `RmSysYielded`, the app's frames show;
+   on release `RmSysReflips`+1 and the desktop is back with no Venus flush (`FsRest` unchanged).
+9. **Mode change**: a new primary is created (`RmSysOk`+1), programmed (`RmSysProg`+1), the old destroyed
+   (`RmSysFreed`+1, `RmSysLive` back to 1), no shear (`RmSysProgBad=0`). With the host's release events on
+   (`RelRecv` grows) the old primary's close may have waited: `RmSysRelWait` 0 or 1, `RmSysRelTmo=0`; a
+   `RmSysRelTmo` is the viewer sitting on a replaced buffer for 500 ms.
+10. **Fallback**: with the host's map disabled (or `RmSysCache` forced wrong), `RmSysVenus` grows with `RmSysWhy`
+    set and the desktop is the Venus desktop; after three such creations `RmSysState` shows `no-new`.
+11. **Teardown**: stop the device with the primary shown, and while a creation is in flight: no bugcheck,
+    `RmSysLeak=0` after a normal destroy, the sweep closes the rest; `FgLive` returns to 0.
+    **Time bounds** (not run): with the host's reply to the bring-up held back, a creation ends with `RmSysWhy`
+    `BringUp`/`Slow` within about 6 s plus the undo's 3 s (`RmSysMsMax`), and a second creation made meanwhile
+    ends at its own 6 s with `BringUpBusy`, not after a minute; with the host's `RESOURCE_UNMAP_BLOB` refused,
+    `RmSysTrialF` grows, the creation goes to Venus, and a later map of another primary does not overlap the
+    first one's range.
+12. **DWM** (15.8): a session with DWM: whether the windowed present reaches the primary is the host's and
+    the UMD's; `RmSysFlipFail`, `Pb*` / `Vk*` counters and the host log say where it stops.
+13. **Soak**: ten minutes of window dragging with `RmSysFlipFail=0`, `RmSysGaveUp=0`, `RmSysSoft=0`,
+    `RmSysRelTmo=0`. Then the give-up path: with the host refusing `ScanoutFlip`, `RmSysGaveUp` grows by one
+    per five seconds (three failed flips each, 100 ms apart), not per frame edge.
+
+### 15.14 Open questions
+
+1. **The alias** (15.5): the default avoids it. Whether dxgkrnl's write-combined view of cached memory is
+   harmless on this stack, and whether the CPU read speed it buys is worth the risk, is what step 7 of 15.13
+   measures; until then the cached variants stay opt-in.
+2. **Whether the viewer needs a flip per change** or samples the attached buffer continuously: decides if the
+   edge-driven flips are the damage signal or merely harmless.
+3. **An existing RM primary has no Venus fallback** (15.8). The seam is `program`'s `Retry` / the presenter's
+   restart; the candidates are a CPU copy sysmem -> the dedicated LINEAR image (the default sysmem is write-combined: reads
+   are slow, about 75 MB/s; this wants a cached opt-in, 15.5) through the existing bind and flush, or asking dxgkrnl to recreate the primary.
+4. **DWM into an RM primary** (15.8): the host's Venus import of RM-export memory by resource id, the
+   STANDARD identity not carrying the FOREIGN flag, `memory_type_index` 0.
+5. **The standard buffers** (15.2): worth moving once 1 and 4 are answered; the cost is the Present-buffer
+   registration in an RM arm.
+6. **The release event** (15.7, 15.15): decided: the flip never waits, the close of a replaced primary does. Open: whether
+   the host really sends `ScanoutReleased` for a level 5 flip's replaced buffer on this viewer (checklist step 9),
+   and whether a user source that replaced our buffer should enter the flip log (today the close then does not wait).
+7. **Host size rounding**: RM may report a larger `size` than asked (the spike asked 64 KiB multiples); the KMD
+   adopts it, and the host's "size <= object" check is then against the adopted value.
+
+### 15.15 The merged state machine: level 5 on the v315 line
+
+Level 5 was built against v314 and meets, in this merge, four things built apart from it: the scanout release
+event and its book (`virtio/scanout_release.rs`, `kmd_logic::scanout_release`), user sources with the S4 fence
+queue (13.12), the RM client levels 3 and 4, and the foreign-resource table of S6 / `RM_RESOURCE_IMPORT`. This
+section is the contract between them, in the shape of 13.12.
+
+**Who runs what.**
+
+| actor | thread / IRQL | touches |
+|---|---|---|
+| `CreateAllocation` of the primary | dxgkrnl's thread, PASSIVE, no lock | `sysmem::try_create_primary`: `STATE` (leaf), the service's own RM client, the foreign table, the Venus window |
+| `SetVidPnSourceAddress` (the display hook) | PASSIVE, under the scanout lifecycle lock | `sysmem_flip::program`: `TARGET` (leaf), `active_scanout_*`, the leases; sends nothing, waits for nothing |
+| `DestroyAllocation` / the last close | PASSIVE, no lock | `release_allocation_resource` -> `sysmem::released`: `target_gone`, then `wait_released` (reads the release book, sleeps 2 ms steps, at most 500 ms from the replacing flip), GEM close, `RM_FREE` |
+| user `SET` / `PRESENT` / `RELEASE`, `Close` | the app's escape, PASSIVE | the arbiter `STATE`, the fence queue, the pump: unchanged by level 5 |
+| fence fired, `ScanoutReleased` | DPC | the fence table; the release book (`BOOK`, leaf), which wakes the HPD worker for a KMD-owner flip (a level 5 worker pass then finds nothing owed) |
+| the refresh gate (`foreign_scanout_suppresses`) | PASSIVE under `scanout_mutex` | raises `FRAME_EDGE` when the resident source is on screen (the withheld desktop flush IS the frame edge) |
+| lapse poll, the pump, `rm_client::service` | HPD worker, PASSIVE, in that order | at level 5 `service` goes to `sysmem_flip::service` and nothing else of the ring client runs |
+
+Locks: `STATE` (service), `TARGET`, `PRES`, `FLIPS` are leaf spinlocks over plain data, never held across a host
+message, a wait or another lock, and never nested. The release book's `BOOK` is a leaf too; `wait_released` takes it
+(through `is_done`) for one read at a time and holds nothing while it sleeps. The v315 order `virtio_lock` ->
+`BOOK` (the DPC) is untouched. `program` runs under the lifecycle lock and takes only leaves.
+
+**Levels 3 / 4 against 5: who claims what.** `KmdRmClient` is read once per transport generation
+(`KNOB_LEVEL`, reset by `forget`), so within a generation exactly one of two worlds exists:
+
+| | levels 1 to 4 | level 5 |
+|---|---|---|
+| RM client | the ring client `CLIENT`, driven by the HPD worker's steps (11 bring-up steps, surfaces, views) | the service's OWN client (`sysmem::STATE`), brought up once on the creator's thread; `rm_client::service` returns before it would step `CLIENT`, so `CLIENT` stays `Cold` |
+| KMD owner's handles (`DeviceOwner::KMD_RM`, 128) | the ring client's | three of the service's plus one transient export file per creation; the two sets never coexist |
+| foreign records of the KMD owner | level 4's ring surfaces | the primary's sysmem record (`sysmem` bit) |
+| worker passes | `rm_present::service` (twice a pass) and the client's steps | `sysmem_flip::service` (one call) |
+| shared statics | `FRAME_EDGE`, `RESUME_EDGE`, `WAKE_AT` (`rm_present`) | the same three, through `take_edges` / `set_wake_at` / `clear_wake_at`; `PRESENTER` is not used |
+| counters | `Rm*`, `RmP*` | `RmKnob`=5 and `RmSys*` (`publish_counters` returns after them) |
+| `ring_level_on` | true at 3 and 4 only | false: the ring's desktop-changed flag is not raised (a resume needs no frame, the memory is live) |
+| a value above 5 | counts as 5 (before this branch, above 4 counted as 4: a service key left at 5 or more now selects level 5) | |
+
+A knob change takes effect with the next transport generation (`reg add` + `pnputil /restart-device`). `forget`
+(from `retire_transport`) clears both worlds (`CLIENT`, `rm_present::reset`, `sysmem::forget`, which resets the
+service, the target, the presenter and the flip log), so a generation that changes level starts cold and no
+state of the other level survives.
+
+**The state of the screen's source at level 5.** The arbiter's `State` and the resident registration are 13.12's;
+level 5 adds the target (which RM primary is shown), the presenter of one surface, and the flip log.
+
+```text
+               program(RM primary)               worker: Register, first flip
+ Venus desktop ───────────────────► target set ───────────────────────────────► Active(resident)
+      ▲                                                                           │      ▲
+      │  program(Venus allocation) / the shown primary destroyed /                │      │ the user source ends:
+      │  three refused flips: worker Withdraw, the arbiter owes one               │      │ resume_owed -> RESUME_EDGE
+      │  Venus desktop flush                                                      │      │ -> Reflip{0}, the SAME GEM
+      └───────────────────────────────────────────────────────────────────────────┤      │
+                                                         user SET (Preempted)     ▼      │
+                                                                              Active(user)
+     any state ── transport reset ──► forgotten (service, target, presenter, flip log, release book, arbiter)
+```
+
+**What each event does** (`flip` = `present_within(KMD_RM, drm, gem)`, direct, never queued behind fenced presents):
+
+| event | arbiter | release book / flip log | screen |
+|---|---|---|---|
+| first RM primary programmed | resident registered by the worker | flip entered and marked sent; log: current = (gem, seq) | the primary, by flip |
+| desktop refresh withheld by the gate (frame edge) | unchanged | a re-flip of the SAME buffer: the older flips of it are superseded (done; the book wakes the HPD worker for it, and the pass finds nothing owed), the newest stays live for as long as it is shown; log: current's seq moves. **No wait** | re-flip, paced to 60 Hz |
+| new primary programmed (mode change) | resident layout updated in place (generation kept) | flip of ANOTHER buffer: the old buffer's newest flip starts ageing and awaits `ScanoutReleased`; log: previous = (old gem, its seq, now), current = new. **No wait** | the new primary |
+| the replaced primary destroyed | unchanged | `close_wait(old)` = Replaced: `wait_released` holds the GEM close until the book says done or 500 ms after the replacing flip (`RmSysRelWait` / `RmSysRelTmo`), then GEM close, RM free; log forgets it | unchanged |
+| the shown primary destroyed | worker withdraws (target gone first); the arbiter owes one Venus desktop flush | `close_wait` = Free: no wait (the shown buffer is never released); the book's entry for the closed GEM is left to age | the Venus desktop (when a Venus primary exists) |
+| a Venus allocation programmed | worker withdraws (`other_source`) | log untouched | Venus path, byte for byte v315 |
+| user `SET` (Preempted) | resident parked | nothing | the app; the presenter sees no foreground and idles; a flip in flight mints no flip (`NoSource` = yielded) |
+| user `PRESENT` / `RM_FENCE` | S4 queue of the user's entries (8 deep, unchanged) | user flips entered in the book as in v315; the host's release of OUR buffer, replaced by theirs, is matched by (handle, gem) | the app |
+| user source ends | `take_resume_owed()` true: `RESUME_EDGE` | our re-flip: the same buffer again, so the log is unchanged | the primary: **a re-flip, not a Venus flush and no copy**; `FsRest` unchanged |
+| three refused flips (`RmSysGaveUp`) | resident withdrawn | log untouched | stays on the last frame; the presenter starts over 5 s later (no Venus image to fall back to) |
+| transport reset | everything forgotten | `scanout_release::reset()` (tracking off until `StartDevice`), `sysmem::forget()` | cold start |
+
+The composition rules, stated so a review can check them: a user source always wins scanout 0 and level 5 never
+sends while one holds it; the S4 queue holds only user entries (the pump drops entries of a dead generation), so a
+level 5 flip never queues and never waits behind a fence; the resume is a re-flip of the shown primary and needs
+no copy and no Venus flush; the flip never waits for a release (a ring of one has nothing to wait for), the GEM
+close of a replaced primary waits at most 500 ms; the primary's foreign record is mappable only because the KMD's
+own service marked it `sysmem` between import and adoption (a user-mode `IMPORT_RM` or `RM_RESOURCE_IMPORT`
+creates records with the bit off and no escape can set it), so S6 sharing and the user imports of v315 are
+unchanged.
+
+**With `KmdRmClient` below 5 the primary's creation, flip and teardown are the v315 paths.** Every hook level 5
+adds, read as a diff against the v315 tip (`50d0698`), and what it does with the knob off:
+
+| file | the hook | knob < 5 |
+|---|---|---|
+| `ddi/create_allocation.rs`, `build_backing`, `KmdLinearPrimary` arm | `if let Some(rm) = sysmem::try_create_primary(..) { return Ok(..) }` before the unchanged Venus `match` | `route(level, ..)` answers `KnobOff` and the call returns `None` before anything is counted or sent: one `knob_level()` (an atomic load; the first call of a transport generation does the registry read the HPD worker makes anyway) |
+| `ddi/create_allocation.rs`, `create_one`, the `Cached` flag | `adapter.alloc_cached() && (placement.cached \|\| rm_primary_cached)` | `rm_primary_cached` needs an adopted primary AND a live slot of the service: false, so the condition is v315's `alloc_cached() && placement.cached` |
+| `ddi/display.rs`, `program_vidpn_source_inner`, after the extent check | `sysmem_flip::program(..)`; `NotOurs` -> `other_source(..)` | both return at their first line on `!sysmem_level_on()` (one relaxed load); the match falls through to the v315 code, which is unchanged |
+| `virtio/ctrl.rs`, `release_allocation_resource` | `sysmem::released(..)` at the end | returns on `LIVE == 0` (one relaxed load) |
+| `virtio/gpu/resource_tables.rs`, `blob_map_begin` / `blob_remap_begin` | `foreign.contains(id) && !foreign.cpu_mappable(id)` | `cpu_mappable` is the record's `sysmem` bit, which only the service sets: false for every record, so the refusal is v315's |
+| `kmd_logic/foreign_resource.rs` | `Entry::sysmem`, set to `false` by the one constructor; `mark_sysmem`, `cpu_mappable`, `sysmem_source` | never set |
+| `virtio/rm_client.rs` | `ring_level_on` is `3..=4` (was `>= 3`, with the knob capped at 4: the same set); `read_knob` caps at 5 (was 4); `service`: level 5 goes to `sysmem_flip::service`; `publish_counters`: level 5 prints its own; `forget`: `sysmem::forget()` | levels 0 to 4 behave as before; only a value of 5 or more (not 4) changes meaning |
+| `virtio/rm_present.rs` | `take_edges`, `set_wake_at`, `clear_wake_at` | new functions, no existing line changed |
+| `diag.rs` | the `KmdRmSysCache` knob name and the `KmdRmClient` comment | none |
+
+**What is deliberately not shared.** Level 5 does not use the level 3 presenter's release waits
+(`back_released`, `RelRWaits`): their only caller is the ring. It does not queue behind the S4 fences. It does not
+touch `host_bound_scanout_resource`: a Venus flush of the RM primary is refused loudly (`RfUnb`) rather than sent
+for a resource with no scanout, which is also why the suppression gate (checked before that refusal) is what keeps
+the desktop flush away while the resident source is on screen.

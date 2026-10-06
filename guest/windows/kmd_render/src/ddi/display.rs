@@ -2411,6 +2411,29 @@ unsafe fn program_vidpn_source_inner(
     if width != mode_w || height != mode_h {
         return Err(ScanoutReject::Extent);
     }
+    // `KmdRmClient` = 5 (Option B, `docs/kmd-rm-client.md` 14.3 / 15.6): an allocation that
+    // adopted the KMD's own RM system memory is shown by a flip of its GEM from the foreign
+    // record: no SET_SCANOUT_BLOB, no GPU copy, no dedicated image. Every other allocation
+    // (and every allocation with the knob below 5, after one relaxed load) takes the Venus
+    // path below, unchanged; a Venus source also withdraws a resident RM source.
+    {
+        use crate::virtio::rm_client::sysmem_flip::{self as rm_flip, Programmed};
+        match rm_flip::program(
+            adapter,
+            source.resource_id,
+            source.primary_address,
+            width,
+            height,
+        ) {
+            Programmed::NotOurs => rm_flip::other_source(adapter),
+            Programmed::Ok => {
+                trace.target_resource = source.resource_id;
+                return Ok(ScanoutOutcome::Programmed);
+            }
+            Programmed::BadLayout => return Err(ScanoutReject::Layout),
+            Programmed::Retry => return Err(ScanoutReject::SetFailed),
+        }
+    }
     // A UMD-created exact pPrimaryDesc may already have the proven scan-out
     // shape: DMA_BUF-exportable, dedicated device-local memory, and validated
     // extent/metadata. It may be the current plain OPTIMAL export; QEMU validates
