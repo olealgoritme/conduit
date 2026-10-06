@@ -521,6 +521,45 @@ pub(crate) unsafe fn set_runtime_error(h: Hdevice, hr: i32) {
     }
 }
 
+/// Whether the device behind `h` is removed: the KMD went away under this
+/// process since the device was created (the shared loss epoch,
+/// `device_loss.rs`), or DXVK saw `VK_ERROR_DEVICE_LOST`
+/// (`GetDeviceRemovedReason` is not S_OK).
+pub(crate) unsafe fn device_removed(h: Hdevice) -> bool {
+    let Some(dev) = helios_device(h) else {
+        return false;
+    };
+    if dev.loss.kmd_lost() {
+        return true;
+    }
+    dev.dxvk
+        .d3d11_device()
+        .is_some_and(|device| device.GetDeviceRemovedReason().is_err())
+}
+
+/// If the device behind `h` is removed, tell the runtime
+/// (`pfnSetErrorCb(D3DDDIERR_DEVICEREMOVED)`) and return `true`: the caller
+/// then does no work and, for the DXGI DDIs, returns
+/// `D3DDDIERR_DEVICEREMOVED`. The runtime turns that into
+/// `DXGI_ERROR_DEVICE_REMOVED` for the API call, which is what makes DWM drop
+/// the device and create a new one on the restarted adapter instead of
+/// presenting into a lost renderer forever.
+pub(crate) unsafe fn report_if_removed(h: Hdevice, site: &str) -> bool {
+    if !device_removed(h) {
+        return false;
+    }
+    if let Some(dev) = helios_device(h) {
+        if dev.loss.first_report() {
+            log_error!(
+                "device removed (KMD gone: {}) at {site}: reporting D3DDDIERR_DEVICEREMOVED to the runtime",
+                dev.loss.kmd_lost()
+            );
+        }
+    }
+    set_runtime_error(h, crate::hr::D3DDDIERR_DEVICEREMOVED);
+    true
+}
+
 /// The D3D11 context this handle records on, borrowed: the bridge's immediate
 /// context for a device handle, the DC's own DXVK deferred COM context for a
 /// deferred-context handle. Every context forwarder resolves through this, so

@@ -460,6 +460,7 @@ unsafe extern "system" fn create_device(
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),
                 negotiated,
+                loss: crate::device_loss::LossWatch::new(),
             },
         );
     }

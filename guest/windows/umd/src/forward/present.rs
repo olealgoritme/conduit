@@ -1691,6 +1691,9 @@ unsafe fn dxgi_present_impl(
     // DXGI_DDI_HDEVICE is a UINT_PTR carrying the driver device handle, the same
     // private pointer stored in D3D10DDI_HDEVICE.pDrvPrivate.
     let h = dxgi_device_handle(a.hDevice);
+    if report_if_removed(h, "Present") {
+        return crate::hr::D3DDDIERR_DEVICEREMOVED;
+    }
     let context = d3d11_context(h);
     let src_h = dxgi_resource_handle(a.hSurfaceToPresent);
     let dst_h = dxgi_resource_handle(a.hDstResource);
@@ -2383,6 +2386,9 @@ pub(crate) unsafe extern "system" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -
     }
     let a = &*arg;
     let h = dxgi_device_handle(a.hDevice);
+    if report_if_removed(h, "Blt") {
+        return crate::hr::D3DDDIERR_DEVICEREMOVED;
+    }
     let Some(context) = d3d11_context(h) else {
         return 0;
     };
@@ -2495,6 +2501,9 @@ pub(crate) unsafe extern "system" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1)
     }
     let a = &*arg;
     let h = dxgi_device_handle(a.hDevice);
+    if report_if_removed(h, "Blt1") {
+        return crate::hr::D3DDDIERR_DEVICEREMOVED;
+    }
     let Some(context) = d3d11_context(h) else {
         return 0;
     };
@@ -2767,6 +2776,9 @@ pub(crate) unsafe extern "system" fn dxgi_present_mpo(
         return E_INVALIDARG;
     }
     let a = &*arg;
+    if report_if_removed(dxgi_device_handle(a.hDevice), "PresentMultiplaneOverlay") {
+        return crate::hr::D3DDDIERR_DEVICEREMOVED;
+    }
     if a.PresentPlaneCount == 0 || a.pPresentPlanes.is_null() {
         probe_early_refusal(PresentBoundaryEntry::Mpo, "no MPO planes");
         log_error!("DXGI PresentMultiplaneOverlay: no present planes");
@@ -2931,6 +2943,9 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
         );
         log_error!("DXGI Present1: no source surfaces");
         return E_INVALIDARG;
+    }
+    if report_if_removed(dxgi_device_handle(a.hDevice), "Present1") {
+        return crate::hr::D3DDDIERR_DEVICEREMOVED;
     }
 
     if a.SurfacesToPresent == 1 {
