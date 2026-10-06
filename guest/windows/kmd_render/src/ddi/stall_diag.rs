@@ -22,7 +22,9 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use helios_kmd_logic::stall_diag::{self as sd, DeferDecision, PendInput, PendState, WdAction};
+use helios_kmd_logic::stall_diag::{
+    self as sd, DeferDecision, DeferState, PendInput, PendState, WdAction,
+};
 
 use crate::adapter::{gate_active, AdapterContext};
 
@@ -216,22 +218,21 @@ static DEFER_HANDLE: AtomicUsize = AtomicUsize::new(0);
 static DEFER_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 
 /// Charge one Deferred attempt against `handle`'s budget (`DeferBudget`; a different handle
-/// starts a fresh one). With the knob at 0 (the default) it touches nothing and answers
-/// `Again`: today's behaviour. On `Exhausted` the state is forgotten.
+/// starts a fresh one: `kmd_logic::stall_diag::DeferState`). With the knob at 0 (the default) it
+/// touches nothing and answers `Again`: today's behaviour. On `Exhausted` the state is
+/// forgotten. The count is of CONSECUTIVE Deferred outcomes: every other outcome of the deferred
+/// wrapper clears it ([`clear_defer_state`], from `clear_retry_state` and from the retryable
+/// refusal arm).
 pub(crate) fn defer_note(handle: usize) -> DeferDecision {
     let budget = DEFER_BUDGET.load(Ordering::Relaxed);
-    if budget == 0 {
-        return DeferDecision::Again;
+    let (state, decision) = DeferState {
+        handle: DEFER_HANDLE.load(Ordering::Relaxed),
+        attempts: DEFER_ATTEMPTS.load(Ordering::Relaxed),
     }
-    let attempts = sd::defer_attempts(
-        DEFER_HANDLE.swap(handle, Ordering::Relaxed),
-        DEFER_ATTEMPTS.load(Ordering::Relaxed),
-        handle,
-    );
-    let decision = sd::defer_decide(attempts, budget);
-    match decision {
-        DeferDecision::Again => DEFER_ATTEMPTS.store(attempts, Ordering::Relaxed),
-        DeferDecision::Exhausted => clear_defer_state(),
+    .note(handle, budget);
+    if budget != 0 {
+        DEFER_HANDLE.store(state.handle, Ordering::Relaxed);
+        DEFER_ATTEMPTS.store(state.attempts, Ordering::Relaxed);
     }
     decision
 }

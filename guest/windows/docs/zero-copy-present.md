@@ -1275,7 +1275,9 @@ Both are read at every StartDevice (`reg add` + `pnputil /restart-device` applie
 boundary" or "the publication is busy" or "the host SET timed out": the exact handle is re-armed and the gate stays
 raised, and the vsync DPC wakes the worker again (one attempt per tick, more when completions also wake it). With a
 budget, the attempt that exceeds it (the same convention as `SCANOUT_RETRY_BUDGET`: `attempts > budget`, a different
-handle restarts the count, a programmed or failed primary forgets it) does what the refusal retry's `GaveUp` does:
+handle restarts the count, and ANY other outcome of the deferred wrapper forgets it: a programmed or failed primary,
+a copy queued, a superseded handle, a retryable refusal whether re-armed or given up; the count is of CONSECUTIVE Deferred
+outcomes of one handle, so a later Deferred of the same handle never continues an old count; `kmd_logic::DeferState`) does what the refusal retry's `GaveUp` does:
 releases the leases, publishes the flip's address KEPT (any class, Venus included, `FkDefBud`), and lowers the gate
 instead of re-arming. Clamped to 16..4 000 000 when nonzero; 240 is about four seconds at 60 Hz.
 
@@ -1368,7 +1370,8 @@ interval, never earlier; once per flip word; again for a newer stuck flip; a str
 a recorded flip; idle never fires; never a flip older than one already done, across the 24-bit wrap too; a publication completes
 the newest recorded flip only when it names its address); the flip word (round trip, never 0, 40-bit limit, 24-bit sequence wrap); ticks from
 milliseconds (rounded up, never earlier, zero = off); the Deferred budget (0 unlimited, exactly `budget` attempts, a new
-handle restarts it); the knob clamps; the site ids (dense, unique); the counter names (at most 14 characters, unique, no
+handle restarts it, and an outcome in between that is not a Deferred ends the count; the clear on each non-Deferred arm
+is wiring in `display.rs`, read and type-checked, not host-run); the knob clamps; the site ids (dense, unique); the counter names (at most 14 characters, unique, no
 collision with any other literal in `kmd_render` or quoted name in `kmd_logic`, no 14-character truncation onto one, the
 writer file spells exactly the list, histogram and `Vp<hex>` ring stems excluded). Type-checked: the whole `kmd_render`
 against the stub harness, the error set IDENTICAL to the base (v321), with five injected errors (one per touched file

@@ -2476,6 +2476,10 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
         Err(reject) => {
             reject.report();
             if reject.retryable() {
+                // A refusal is not a Deferred outcome: the `DeferBudget` count is of consecutive
+                // Deferred outcomes, so the one in progress (if any) ends here, whether the
+                // refusal is re-armed or given up.
+                crate::ddi::stall_diag::clear_defer_state();
                 match note_retry_attempt(h_alloc) {
                     RetryDecision::Again => {
                         // Re-arm the exact handle only while the slot is empty.

@@ -472,6 +472,41 @@ pub const fn defer_decide(attempts: u32, budget: u32) -> DeferDecision {
     }
 }
 
+/// The Deferred budget's whole state: the handle being deferred and how many consecutive
+/// Deferred outcomes it has had. `EMPTY` (also `default()`) is "no count in progress".
+///
+/// The driver keeps these two words in atomics (`ddi/stall_diag.rs`) and calls [`Self::note`]
+/// for every Deferred outcome and clears the state at EVERY other outcome of the deferred
+/// wrapper (programmed, copy queued, superseded, a retryable refusal re-armed or given up, a
+/// permanent reject): the count is of CONSECUTIVE Deferred outcomes of one handle, so a later
+/// Deferred of the same handle never continues an old count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeferState {
+    pub handle: usize,
+    pub attempts: u32,
+}
+
+impl DeferState {
+    /// No count in progress.
+    pub const EMPTY: Self = Self {
+        handle: 0,
+        attempts: 0,
+    };
+
+    /// One more Deferred outcome for `handle` under `budget`. `budget` 0 (unlimited) touches
+    /// nothing. A different handle starts at 1; an `Exhausted` answer forgets the state.
+    pub const fn note(self, handle: usize, budget: u32) -> (Self, DeferDecision) {
+        if budget == 0 {
+            return (self, DeferDecision::Again);
+        }
+        let attempts = defer_attempts(self.handle, self.attempts, handle);
+        match defer_decide(attempts, budget) {
+            DeferDecision::Again => (Self { handle, attempts }, DeferDecision::Again),
+            DeferDecision::Exhausted => (Self::EMPTY, DeferDecision::Exhausted),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -977,6 +1012,87 @@ mod tests {
             }
         }
         assert_eq!(again, budget);
+    }
+
+    /// What the deferred wrapper does with the state, as a model: Deferred notes it, every
+    /// other outcome clears it.
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Deferred(usize),
+        /// Programmed, copy queued, superseded, a retryable refusal (re-armed or given up), a
+        /// permanent reject: anything but Deferred.
+        Other,
+    }
+
+    fn drive(budget: u32, outcomes: &[Outcome]) -> Vec<DeferDecision> {
+        let mut st = DeferState::EMPTY;
+        let mut out = Vec::new();
+        for o in outcomes {
+            match *o {
+                Outcome::Deferred(h) => {
+                    let (n, d) = st.note(h, budget);
+                    st = n;
+                    out.push(d);
+                }
+                Outcome::Other => st = DeferState::EMPTY,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_later_deferred_of_the_same_handle_does_not_continue_an_old_count() {
+        let budget = 20;
+        // 15 Deferred, a refusal in between (re-armed or given up), 15 more: no exhaustion; with
+        // the count continuing it would have run out at the 21st.
+        let mut seq = std::vec::Vec::new();
+        seq.extend(std::iter::repeat(Outcome::Deferred(7)).take(15));
+        seq.push(Outcome::Other);
+        seq.extend(std::iter::repeat(Outcome::Deferred(7)).take(15));
+        assert!(drive(budget, &seq)
+            .iter()
+            .all(|d| *d == DeferDecision::Again));
+        // Without the clear (the bug the follow-up fixes) the same sequence exhausts.
+        let mut st = DeferState::EMPTY;
+        let mut exhausted = false;
+        for _ in 0..30 {
+            let (n, d) = st.note(7, budget);
+            st = n;
+            exhausted |= d == DeferDecision::Exhausted;
+        }
+        assert!(exhausted);
+        // Consecutive Deferred of one handle exhaust after exactly the budget.
+        let run = drive(budget, &std::vec![Outcome::Deferred(7); 25]);
+        assert_eq!(
+            run.iter().filter(|d| **d == DeferDecision::Again).count(),
+            20
+        );
+        assert_eq!(run[20], DeferDecision::Exhausted);
+        // ... and after exhaustion the state is empty: the next Deferred starts from 1.
+        assert_eq!(run[21], DeferDecision::Again);
+    }
+
+    #[test]
+    fn a_handle_change_restarts_the_count_and_the_old_one_does_not_come_back() {
+        let budget = 16;
+        let mut seq = std::vec::Vec::new();
+        seq.extend(std::iter::repeat(Outcome::Deferred(1)).take(10));
+        seq.extend(std::iter::repeat(Outcome::Deferred(2)).take(10));
+        // Back to handle 1: 10 more. Neither handle ever has 16 in a row.
+        seq.extend(std::iter::repeat(Outcome::Deferred(1)).take(10));
+        assert!(drive(budget, &seq)
+            .iter()
+            .all(|d| *d == DeferDecision::Again));
+    }
+
+    #[test]
+    fn budget_zero_never_changes_the_state() {
+        let st = DeferState {
+            handle: 9,
+            attempts: 5,
+        };
+        assert_eq!(st.note(9, 0), (st, DeferDecision::Again));
+        assert_eq!(st.note(3, 0), (st, DeferDecision::Again));
     }
 
     // ---- sites and counter names ---------------------------------------------------------
