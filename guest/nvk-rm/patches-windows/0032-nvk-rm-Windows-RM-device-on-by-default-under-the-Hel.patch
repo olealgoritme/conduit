@@ -1,0 +1,215 @@
+From b579d269260c6022aa4c5e66ee48776708468101 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:33:12 +0200
+Subject: [PATCH 32/34] nvk/rm: Windows: RM device on by default under the
+ Helios ICD policy; librmclient32.dll
+
+NVK on Windows is now also reached through the Vulkan loader (the Helios
+adapter registers it as its Vulkan driver) and by Zink, not only by the
+Helios D3D UMD, which sets NVK_RM=1 itself. On Windows the RM device can
+only be the Helios adapter's, so NVK_RM defaults to on there (NVK_RM=0
+still turns it off); Linux keeps the opt-in.
+
+The device is hidden from processes the Helios ICD policy sends to Venus,
+the same decision the D3D UMD makes (bridge_icd_backend.cpp):
+
+  HELIOS_ICD=venus|nvk              forces either way
+  HKLM\SOFTWARE\Helios!Icd=venus    every process on Venus
+  NvkAllowList                      ';'-separated executables kept on NVK
+  NvkDenyList                       replaces the built-in deny-list (the
+                                    UMD's: DWM, the shell, browsers, ...)
+
+so one registry value moves D3D, OpenGL (Zink) and Vulkan apps between NVK
+and Venus, the loader hands a denied process Venus, and a Vulkan instance
+in DWM (DXVK on Venus) never opens an RM client. The decision is made once
+per process and exported as nvk_helios_process_allowed() for Zink, which
+loads NVK without the loader.
+
+A 32-bit build looks for librmclient32.dll first, so the 32-bit and 64-bit
+NVK and librmclient can share one directory (the driver store, where file
+names must be unique).
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |   7 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  | 116 ++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |   9 ++
+ 3 files changed, 132 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 25b7b8e..16078c9 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -97,6 +97,13 @@ struct nvkmd_rm_lib {
+ /* Returns NULL if librmclient cannot be loaded */
+ const struct nvkmd_rm_lib *nvkmd_rm_lib_get(void);
+ 
++#ifdef _WIN32
++/* Whether the Helios ICD policy (HELIOS_ICD, HKLM\SOFTWARE\Helios Icd,
++ * NvkDenyList, NvkAllowList) gives this process NVK rather than Venus.
++ */
++bool nvkmd_rm_helios_allows_nvk(void);
++#endif
++
+ /* Turns a librmclient return value into a VkResult, logging failures */
+ VkResult nvkmd_rm_result(const struct nvkmd_rm_lib *lib,
+                          struct vk_object_base *log_obj,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index 9a745b0..8e3ff28 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -36,12 +36,128 @@ static struct nvkmd_rm_lib rm_lib;
+ static bool rm_lib_ok;
+ static util_once_flag rm_lib_once = UTIL_ONCE_FLAG_INIT;
+ 
++#ifdef _WIN32
++static bool
++helios_reg_sz(const char *name, char *out, DWORD cap)
++{
++   out[0] = 0;
++   DWORD size = cap;
++   return RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", name,
++                       RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, out,
++                       &size) == ERROR_SUCCESS && out[0];
++}
++
++static bool
++helios_list_has(const char *list, const char *exe)
++{
++   const size_t len = strlen(exe);
++   const char *p = list;
++   while (*p) {
++      while (*p == ';' || *p == ' ' || *p == '\t')
++         p++;
++      const char *start = p;
++      while (*p && *p != ';')
++         p++;
++      const char *end = p;
++      while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
++         end--;
++      if ((size_t)(end - start) == len && _strnicmp(start, exe, len) == 0)
++         return true;
++   }
++   return false;
++}
++
++/* Executables that stay on Venus unless NvkDenyList replaces this list or
++ * NvkAllowList takes a name out of it: the Helios D3D UMD's built-in list
++ * (bridge_icd_backend.cpp).  Vulkan instances in these processes (DXVK on
++ * Venus inside DWM, for one) then never open an RM client.
++ */
++static const char *const helios_builtin_deny[] = {
++   "dwm.exe", "explorer.exe", "csrss.exe", "winlogon.exe", "logonui.exe",
++   "consent.exe", "fontdrvhost.exe", "sihost.exe", "dllhost.exe",
++   "searchhost.exe", "searchapp.exe", "startmenuexperiencehost.exe",
++   "shellexperiencehost.exe", "shellhost.exe", "textinputhost.exe",
++   "lockapp.exe", "applicationframehost.exe", "systemsettings.exe",
++   "runtimebroker.exe", "widgets.exe", "widgetservice.exe",
++   "phoneexperiencehost.exe", "crossdeviceresume.exe", "taskmgr.exe",
++   "mmc.exe", "rdpclip.exe", "msedge.exe", "msedgewebview2.exe",
++   "chrome.exe", "firefox.exe", "brave.exe", "opera.exe", "teams.exe",
++   "ms-teams.exe", "discord.exe", "slack.exe", "spotify.exe", "code.exe",
++   "obs64.exe", "obs32.exe", "vlc.exe", "mpc-hc64.exe", "mpc-be64.exe",
++   "video.ui.exe", "microsoft.photos.exe", "photos.exe",
++   "steamwebhelper.exe", "epicwebhelper.exe",
++   "cefsharp.browsersubprocess.exe", "nvidia share.exe",
++};
++
++/* The same decision as the Helios D3D UMD: a process the policy sends to
++ * Venus does not see the RM device, so the Vulkan loader hands it Venus.
++ */
++static bool
++helios_decide(void)
++{
++   const char *forced = os_get_option("HELIOS_ICD");
++   if (forced != NULL && _stricmp(forced, "venus") == 0)
++      return false;
++   if (forced != NULL && _stricmp(forced, "nvk") == 0)
++      return true;
++
++   char value[4096];
++   if (helios_reg_sz("Icd", value, sizeof(value)) && _stricmp(value, "venus") == 0)
++      return false;
++
++   char path[MAX_PATH] = {0};
++   GetModuleFileNameA(NULL, path, MAX_PATH);
++   const char *exe = strrchr(path, '\\');
++   exe = exe ? exe + 1 : path;
++   if (helios_reg_sz("NvkAllowList", value, sizeof(value)) &&
++       helios_list_has(value, exe))
++      return true;
++   if (helios_reg_sz("NvkDenyList", value, sizeof(value)))
++      return !helios_list_has(value, exe);
++   for (unsigned i = 0; i < ARRAY_SIZE(helios_builtin_deny); i++) {
++      if (_stricmp(helios_builtin_deny[i], exe) == 0)
++         return false;
++   }
++   return true;
++}
++
++static bool helios_allowed;
++static util_once_flag helios_once = UTIL_ONCE_FLAG_INIT;
++
++static void
++helios_decide_once(void)
++{
++   helios_allowed = helios_decide();
++}
++
++bool
++nvkmd_rm_helios_allows_nvk(void)
++{
++   util_call_once(&helios_once, helios_decide_once);
++   return helios_allowed;
++}
++
++/* For Zink, which loads NVK directly and keeps the Vulkan loader for a
++ * process the policy sends to Venus.
++ */
++__declspec(dllexport) int nvk_helios_process_allowed(void);
++__declspec(dllexport) int
++nvk_helios_process_allowed(void)
++{
++   return nvkmd_rm_helios_allows_nvk();
++}
++#endif
++
+ /*
+  * Shared library loading: dlopen() on Unix, LoadLibrary() on Windows.
+  */
+ #ifdef _WIN32
+ 
+ static const char *const default_lib_names[] = {
++#ifndef _WIN64
++   /* 32-bit and 64-bit builds can share one directory (the driver store) */
++   "librmclient32.dll",
++#endif
+    "librmclient.dll",   /* what MinGW/meson name it */
+    "rmclient.dll",
+ };
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 80c7485..a174a21 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -458,11 +458,20 @@ nvkmd_rm_enumerate_pdevs(struct vk_object_base *log_obj,
+    const uint32_t max_pdevs = *pdev_count;
+    *pdev_count = 0;
+ 
++#ifdef _WIN32
++   /* On Windows the RM device is the Helios adapter's and nothing else
++    * exposes it: on unless NVK_RM=0 or the Helios policy sends this process
++    * to Venus.
++    */
++   if (!debug_get_bool_option("NVK_RM", true) || !nvkmd_rm_helios_allows_nvk())
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++#else
+    /* Opt-in: on a machine with NVIDIA's own driver stack this would expose
+     * the same GPU twice.
+     */
+    if (!debug_get_bool_option("NVK_RM", false))
+       return VK_ERROR_INCOMPATIBLE_DRIVER;
++#endif
+ 
+    const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
+    if (lib == NULL) {
+-- 
+2.43.0
+

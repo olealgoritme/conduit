@@ -1,0 +1,126 @@
+From 8ee7bb39843ccb336340be76a4f58a5bf76dfc06 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:57:12 +0200
+Subject: [PATCH 33/34] nvk: tiled shadows for linear swapchain images
+
+A linear image NVK renders to needs a tiled shadow when another
+attachment is tiled (depth is never linear) or its layout is not aligned
+for linear rendering. The shadow layout was only set up for images with
+the DRM_FORMAT_MOD_LINEAR modifier. On Windows there are no modifiers and
+the Win32 WSI makes its swapchain images VK_IMAGE_TILING_LINEAR, so an app
+that renders to the swapchain image with a depth buffer (vkcube, every
+Zink default framebuffer) allocated a zero-sized shadow: RM refused it
+(NV_ERR_INVALID_ARGUMENT) and vkEndCommandBuffer returned
+VK_ERROR_OUT_OF_DEVICE_MEMORY.
+
+Set up the shadow layout for TILING_LINEAR images with color-attachment
+usage as well; only swapchain images can be those, since linear tiling
+advertises no color-attachment support. The memory is still allocated
+only when rendering needs it.
+---
+ src/nouveau/vulkan/nvk_image.c | 88 +++++++++++++++++++---------------
+ 1 file changed, 49 insertions(+), 39 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 7be53ec..44c2c56 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -979,46 +979,56 @@ nvk_image_init(struct nvk_device *dev,
+          }
+          assert(image->vk.drm_format_mod != DRM_FORMAT_MOD_INVALID);
+       }
++   }
+ 
+-      if (image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR) {
+-         for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+-            VkFormat format = ycbcr_info ?
+-               ycbcr_info->planes[plane].format : image->vk.format;
+-            const uint8_t width_scale = ycbcr_info ?
+-               ycbcr_info->planes[plane].denominator_scales[0] : 1;
+-            const uint8_t height_scale = ycbcr_info ?
+-               ycbcr_info->planes[plane].denominator_scales[1] : 1;
+-
+-            struct nil_image_init_info tiled_shadow_nil_info = {
+-               .dim = vk_image_type_to_nil_dim(image->vk.image_type),
+-               .format = nil_format(nvk_format_to_pipe_format(format)),
+-               .modifier = DRM_FORMAT_MOD_INVALID,
+-               .extent_px = {
+-                  .width = image->vk.extent.width / width_scale,
+-                  .height = image->vk.extent.height / height_scale,
+-                  .depth = image->vk.extent.depth,
+-                  .array_len = image->vk.array_layers,
+-               },
+-               .levels = image->vk.mip_levels,
+-               .samples = image->vk.samples,
+-               .usage = usage & ~NIL_IMAGE_USAGE_LINEAR_BIT,
+-            };
+-
+-            bool ok = nil_image_init(&pdev->info,
+-                                     &image->linear_tiled_shadows[plane].nil,
+-                                     &tiled_shadow_nil_info);
+-            if (!ok)
+-               return vk_errorf(dev, VK_ERROR_UNKNOWN,
+-                                "Invalid image creation parameters");
+-
+-            /* These are always allocated by the driver so the offset
+-             * doesn't matter.
+-             */
+-            image->linear_tiled_shadows[plane].plane_offset_B = 0;
+-            image->linear_tiled_shadows[plane].plane_align_B =
+-               MAX2(image->linear_tiled_shadows[plane].nil.align_B,
+-                    pdev->nvkmd->bind_align_B);
+-         }
++   /* A linear image NVK renders to needs a tiled shadow whenever another
++    * attachment is tiled (depth is never linear) or its layout is not
++    * aligned for linear rendering.  Linear VK_IMAGE_TILING_LINEAR images
++    * are never color attachments, except swapchain images: on Windows the
++    * WSI makes them linear (there are no DRM modifiers), and an app that
++    * renders to the swapchain image with a depth buffer (vkcube, Zink's
++    * default framebuffer) needs the shadow.
++    */
++   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ||
++       (image->vk.tiling == VK_IMAGE_TILING_LINEAR &&
++        (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) {
++      for (uint8_t plane = 0; plane < image->plane_count; plane++) {
++         VkFormat format = ycbcr_info ?
++            ycbcr_info->planes[plane].format : image->vk.format;
++         const uint8_t width_scale = ycbcr_info ?
++            ycbcr_info->planes[plane].denominator_scales[0] : 1;
++         const uint8_t height_scale = ycbcr_info ?
++            ycbcr_info->planes[plane].denominator_scales[1] : 1;
++
++         struct nil_image_init_info tiled_shadow_nil_info = {
++            .dim = vk_image_type_to_nil_dim(image->vk.image_type),
++            .format = nil_format(nvk_format_to_pipe_format(format)),
++            .modifier = DRM_FORMAT_MOD_INVALID,
++            .extent_px = {
++               .width = image->vk.extent.width / width_scale,
++               .height = image->vk.extent.height / height_scale,
++               .depth = image->vk.extent.depth,
++               .array_len = image->vk.array_layers,
++            },
++            .levels = image->vk.mip_levels,
++            .samples = image->vk.samples,
++            .usage = usage & ~NIL_IMAGE_USAGE_LINEAR_BIT,
++         };
++
++         bool ok = nil_image_init(&pdev->info,
++                                  &image->linear_tiled_shadows[plane].nil,
++                                  &tiled_shadow_nil_info);
++         if (!ok)
++            return vk_errorf(dev, VK_ERROR_UNKNOWN,
++                             "Invalid image creation parameters");
++
++         /* These are always allocated by the driver so the offset
++          * doesn't matter.
++          */
++         image->linear_tiled_shadows[plane].plane_offset_B = 0;
++         image->linear_tiled_shadows[plane].plane_align_B =
++            MAX2(image->linear_tiled_shadows[plane].nil.align_B,
++                 pdev->nvkmd->bind_align_B);
+       }
+    }
+ 
+-- 
+2.43.0
+

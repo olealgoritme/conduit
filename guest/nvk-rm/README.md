@@ -99,6 +99,9 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 27 | `nvk/rm: let the GPU cache coherent host-visible system memory in L2` | host-visible system memory mapped GPU-cacheable, L2 sysmem invalidate at the start of every submit (`NVK_RM_SYSMEM_CACHED=0` off). Generic RM code (Linux series: patch 15 on perf/nvk-rm-efficiency) |
 | 28 | `nvk/rm: compressible VRAM for images on GB20x` | `has_compression`: dedicated image memory allocated COMPR_ANY and mapped with the compressible GMK kind (`NVK_RM_COMPRESSION=0` off). Generic RM code (Linux: patch 16) |
 | 29 | `nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` | `has_zcull_info` (`NVK_RM_ZCULL=0` off). Generic RM code (Linux: patch 17) |
+| 32 | `nvk/rm: Windows: RM device on by default under the Helios ICD policy; librmclient32.dll` | Windows only: `NVK_RM` defaults to on (`NVK_RM=0` off). The Helios ICD policy of the D3D UMD (`HELIOS_ICD`, `HKLM\SOFTWARE\Helios` `Icd` / `NvkDenyList` / `NvkAllowList`, the UMD's built-in deny-list) hides the device from processes sent to Venus, so the loader hands them Venus; exported as `nvk_helios_process_allowed()`. A 32-bit build loads `librmclient32.dll` first (one driver-store directory for both architectures) |
+| 33 | `nvk: tiled shadows for linear swapchain images` | the Win32 WSI's swapchain images are `TILING_LINEAR`; rendering to one with a depth buffer (vkcube, Zink) needs NVK's tiled shadow, whose layout was only set up for `DRM_FORMAT_MOD_LINEAR` images (zero-sized shadow, `NV_ERR_INVALID_ARGUMENT`, `vkEndCommandBuffer` = `VK_ERROR_OUT_OF_DEVICE_MEMORY`) |
+| 34 | `zink: load a Vulkan ICD directly on Windows (NVK on RM for the Helios adapter)` | Zink (Mesa's gallium WGL ICD, `GL=1` builds) loads NVK itself: `ZINK_VULKAN_ICD`, `NvkIcdPath`/`NvkIcdPath32`, NVK next to the WGL DLL, `%ProgramFiles%\Helios\nvk`; the loader for processes the Helios policy sends to Venus. See "OpenGL on NVK: Zink" below |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
@@ -483,6 +486,42 @@ The GPU was busy all the time either way, but at higher power: it was
 stalled on PCIe reads of DXVK's dynamic buffers in system memory, not
 computing. (The "off" rows are faster than the 62 fps in the table above
 because KMD 22.22.309/310 and the backend got faster in between.)
+
+### OpenGL on NVK: Zink (patches 32-34, 2026-10-06, `win11`, KMD 22.22.311.0)
+
+`GL=1 guest/nvk-rm/build-windows.sh` also builds Zink as Mesa's gallium WGL
+ICD (`libgallium_wgl.dll`) and Mesa's `opengl32.dll`, from the same tree as
+NVK (`-Dgallium-drivers=zink -Dopengl=true`; it builds with MinGW as is).
+Zink loads NVK directly (patch 34), so the Vulkan loader and the Venus ICD
+are not involved. Installed through the driver package
+(`feat/helios-nvk-package`), the adapter's `OpenGLDriverName` points at the
+WGL DLL in the driver store, next to NVK.
+
+`windows/wgl_test.c` (built by `windows/build-tests.sh`) checks a frame
+with glReadPixels, runs a GL 4.3 compute shader over 64 Ki values and spins
+glxgears' gears with swap interval 0. App-local `opengl32.dll` +
+`libgallium_wgl.dll` + `vulkan_nouveau.dll` + `librmclient.dll`, run in the
+desktop session (scheduled task, `/it`):
+
+| | renderer | readback | compute | gears 1280x720 |
+|---|---|---|---|---|
+| 64-bit, NVK | `zink Vulkan 1.4(NVIDIA GeForce RTX 5090 (NVK GB202) (MESA_NVK))`, GL 4.6 compat | pass | pass | 406-447 fps |
+| 32-bit (WoW64), NVK | same | pass | pass | 440 fps |
+| 64-bit, `ZINK_VULKAN_ICD=loader` (Venus) | `zink Vulkan 1.4(Virtio-GPU Venus (NVIDIA GeForce RTX 5090) (NVIDIA_PROPRIETARY))` | pass | pass | 353 fps |
+
+The gears are present-bound either way: NVK's Helios scanout flip is
+refused with EBUSY while DWM owns the scanout ("frames dropped"), and with
+`NVK_HELIOS_WSI=0` (GDI, a CPU copy per present) the rate is the same,
+408 fps. Without patch 33 the first frame failed: Zink renders its default
+framebuffer, a linear swapchain image, with a depth buffer.
+
+The same build registered as a Vulkan ICD (a manifest next to
+`vulkan_nouveau.dll` under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`, for
+the test only) is what an ordinary app sees through the system loader
+(`windows/vk_loader_list.c`, desktop session): NVK first, with the Helios
+adapter's LUID (librmclient with `crm_win_adapter_luid`), Venus second;
+the first discrete GPU, NVK, creates a device and completes a submit. With
+`HELIOS_ICD=venus` NVK enumerates nothing and the app gets Venus.
 
 ## Running (in a guest)
 
