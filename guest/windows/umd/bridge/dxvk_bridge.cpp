@@ -12,6 +12,7 @@
 #include <sddl.h>
 
 #include <cstddef>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -461,11 +462,13 @@ namespace {
 
 // ---- Cross-process hand-off ledger (docs/shared-surfaces.md section 4) -----
 //
-// One shared table per Windows session ("Local\\HeliosHandoffLedger2"), used by
+// One shared table per Windows session ("Local\\HeliosHandoffLedger3"), used by
 // every process with the Helios UMD. At a hand-off (a flush of a device that
 // holds cross-process shared resources) the releaser writes, for each of those
 // resources keyed by its KMD resource id, "device record d (generation g),
-// point p"; a fence worker of the releaser's DXVK device stores
+// point p" in that device's entry of the slot (a slot keeps one entry per
+// publishing device, so the reader's own publication never hides the
+// releaser's); a fence worker of the releaser's DXVK device stores
 // `completed = p` into record d when the GPU finished everything recorded
 // before the hand-off. Any first access of a shared image in a reader's
 // command list samples the slot and its submission worker waits until record
@@ -479,11 +482,12 @@ namespace {
 // gone. Slots and records whose processes died are swept when the table runs
 // low. Counters in the header: slots and records in use, fallbacks, sweeps.
 namespace helios_handoff {
-  constexpr std::uint32_t kMagic   = 0x324C4448u; // 'HDL2'
+  constexpr std::uint32_t kMagic   = 0x334C4448u; // 'HDL3'
   constexpr std::uint32_t kDevices = 4096u;
   constexpr std::uint32_t kSlots   = 32768u;
   constexpr std::uint32_t kProbe   = 64u;
   constexpr std::uint32_t kPids    = 4u;
+  constexpr std::uint32_t kEntries = 4u; // publishing devices per resource
   constexpr std::uint32_t kTombstone = 0xFFFFFFFFu;
   // packed = device (12 bits) << 52 | generation (12 bits) << 40 | point (40 bits)
   constexpr std::uint64_t kPointMask = (1ull << 40) - 1ull;
@@ -497,8 +501,9 @@ namespace helios_handoff {
   struct Slot {
     std::atomic<std::uint32_t> key;
     std::atomic<std::uint32_t> extra_holders; // holders beyond `pids`
-    std::atomic<std::uint64_t> packed;
     std::atomic<std::uint32_t> pids[kPids];
+    std::atomic<std::uint64_t> points[kEntries]; // packed, one per publishing device
+    std::uint64_t reserved;
   };
   struct Table {
     std::atomic<std::uint32_t> magic;
@@ -512,7 +517,7 @@ namespace helios_handoff {
     Device devices[kDevices];
     Slot slots[kSlots];
   };
-  static_assert(sizeof(Device) == 16 && sizeof(Slot) == 32, "ledger layout");
+  static_assert(sizeof(Device) == 16 && sizeof(Slot) == 64, "ledger layout");
 
   inline std::uint64_t pack(std::uint32_t dev, std::uint32_t gen, std::uint64_t point) {
     return (std::uint64_t(dev) << 52) | (std::uint64_t(gen & kGenMask) << 40) | (point & kPointMask);
@@ -527,7 +532,7 @@ namespace helios_handoff {
             L"D:(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;AC)S:(ML;;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr))
         sa.lpSecurityDescriptor = sd;
       HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.lpSecurityDescriptor ? &sa : nullptr,
-        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger2");
+        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger3");
       if (sd)
         LocalFree(sd);
       if (!mapping)
@@ -552,6 +557,26 @@ namespace helios_handoff {
       return !(v && v[0] == '0');
     }();
     return on;
+  }
+
+  bool trace() {
+    static const bool on = []() {
+      const char* v = std::getenv("HELIOS_HANDOFF_TRACE");
+      return v && v[0] == '1';
+    }();
+    return on;
+  }
+
+  void trace_line(const char* fmt, ...) {
+    static std::atomic<std::uint32_t> s_lines{0};
+    if (!trace() || s_lines.fetch_add(1) >= 2000)
+      return;
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    umd_log(msg);
   }
 
   bool process_alive(std::uint32_t pid) {
@@ -639,7 +664,8 @@ namespace helios_handoff {
           return &s;
         if (k == 0 || k == kTombstone) {
           if (s.key.compare_exchange_strong(k, key)) {
-            s.packed.store(0, std::memory_order_release);
+            for (auto& e : s.points)
+              e.store(0, std::memory_order_release);
             s.extra_holders.store(0);
             for (auto& p : s.pids)
               p.store(0);
@@ -669,7 +695,8 @@ namespace helios_handoff {
       return;
     std::uint32_t k = key;
     if (s.key.compare_exchange_strong(k, kTombstone)) {
-      s.packed.store(0, std::memory_order_release);
+      for (auto& e : s.points)
+        e.store(0, std::memory_order_release);
       t->slots_in_use.fetch_sub(1);
     }
   }
@@ -753,29 +780,71 @@ namespace helios_handoff {
     }
   }
 
+  // ---- publishing: this device's entry of a slot
+
+  // An entry is free for a new device when it is empty, its record moved on
+  // (generation) or its point completed.
+  bool entry_done(Table* t, std::uint64_t packed) {
+    if (!packed)
+      return true;
+    const std::uint32_t d = std::uint32_t(packed >> 52);
+    if (d >= kDevices)
+      return true;
+    const Device& dev = t->devices[d];
+    return (dev.gen.load(std::memory_order_acquire) & kGenMask) != (std::uint32_t(packed >> 40) & kGenMask)
+        || dev.completed.load(std::memory_order_acquire) >= (packed & kPointMask);
+  }
+
+  // false: no entry could take it (more than kEntries devices with pending
+  // points on one resource); counted as a fallback by the caller.
+  bool publish_point(Table* t, Slot& s, std::uint64_t packed) {
+    constexpr std::uint64_t kDeviceGen = ~kPointMask;
+    for (auto& e : s.points) {
+      std::uint64_t cur = e.load(std::memory_order_acquire);
+      if (cur && (cur & kDeviceGen) == (packed & kDeviceGen)) {
+        while ((cur & kDeviceGen) == (packed & kDeviceGen) && (cur & kPointMask) < (packed & kPointMask)
+            && !e.compare_exchange_weak(cur, packed, std::memory_order_acq_rel)) { }
+        return true;
+      }
+    }
+    for (auto& e : s.points) {
+      std::uint64_t cur = e.load(std::memory_order_acquire);
+      if (entry_done(t, cur) && e.compare_exchange_strong(cur, packed, std::memory_order_acq_rel))
+        return true;
+    }
+    return false;
+  }
+
   // ---- dxvk_helios_backend.h hooks
 
-  std::uint64_t sample(std::uint32_t key) {
+  std::uint32_t sample_all(std::uint32_t key, std::uint64_t* out, std::uint32_t max) {
     Table* t = table();
     if (!t || !key)
       return 0;
     Slot* s = find(t, key);
-    if (!s)
+    if (!s) {
+      trace_line("handoff trace: sample key %u: no slot", key);
       return 0;
-    const std::uint64_t packed = s->packed.load(std::memory_order_acquire);
-    const std::uint32_t d = std::uint32_t(packed >> 52);
-    const std::uint32_t gen = std::uint32_t(packed >> 40) & kGenMask;
-    const std::uint64_t point = packed & kPointMask;
-    if (!point || d >= kDevices)
-      return 0;
-    const Device& dev = t->devices[d];
-    if ((dev.gen.load(std::memory_order_acquire) & kGenMask) != gen)
-      return 0; // the publishing device is gone (it went idle first)
-    if (dev.pid.load(std::memory_order_relaxed) == GetCurrentProcessId())
-      return 0; // our own hand-off: same-process order is DXVK's
-    if (dev.completed.load(std::memory_order_acquire) >= point)
-      return 0;
-    return packed;
+    }
+    const std::uint32_t me = GetCurrentProcessId();
+    std::uint32_t n = 0;
+    for (auto& e : s->points) {
+      const std::uint64_t packed = e.load(std::memory_order_acquire);
+      if (!packed || entry_done(t, packed))
+        continue;
+      const std::uint32_t d = std::uint32_t(packed >> 52);
+      if (t->devices[d].pid.load(std::memory_order_relaxed) == me)
+        continue; // our own hand-off: same-process order is DXVK's
+      if (n < max)
+        out[n++] = packed;
+    }
+    trace_line("handoff trace: sample key %u: %u pending point(s) of other processes", key, n);
+    return n;
+  }
+
+  std::uint64_t sample(std::uint32_t key) {
+    std::uint64_t point = 0;
+    return sample_all(key, &point, 1) ? point : 0;
   }
 
   bool wait(std::uint32_t, std::uint64_t packed, std::uint64_t timeout_ns) {
@@ -808,7 +877,7 @@ namespace helios_handoff {
     }
   }
 
-  const dxvk::HeliosHandoffHooks kHooks = { &sample, &wait };
+  const dxvk::HeliosHandoffHooks kHooks = { &sample, &wait, &sample_all };
 
   void install_hooks_once() {
     static const bool done = []() {
@@ -861,6 +930,8 @@ void HeliosDxvkDevice::handoff_register(std::size_t d3d11_resource_ptr) const no
     helios_handoff::install_hooks_once();
     const std::uint32_t key = handoff_key(*impl, d3d11_resource_ptr);
     helios_handoff::hold(key);
+    helios_handoff::trace_line("handoff trace: register resource %p key %u",
+                               reinterpret_cast<void*>(d3d11_resource_ptr), key);
     return key != 0;
   });
 }
@@ -922,11 +993,12 @@ std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
         helios_handoff::hold(key);
         slot = helios_handoff::find(table, key);
       }
-      if (!slot) {
+      if (!slot || !helios_handoff::publish_point(table, *slot, packed)) {
         overflow = true;
         continue;
       }
-      slot->packed.store(packed, std::memory_order_release);
+      helios_handoff::trace_line("handoff trace: publish key %u point %llu record %u", key,
+                                 static_cast<unsigned long long>(point), impl->handoff_device);
       published++;
     }
     impl->flush_gate_seq = immediate->HeliosSignalFlushPoint(impl->handoff_fence, point);
