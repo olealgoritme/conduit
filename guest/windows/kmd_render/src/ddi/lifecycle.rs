@@ -638,7 +638,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // The DDI failure rings, the sticky first-fatal record and the paging/lock records
         // (`ddi::device_lost`): written BEFORE the flush below, so a stop that follows an
         // adapter-wide device loss leaves them on disk. PASSIVE.
-        crate::ddi::device_lost::publish();
+        crate::ddi::device_lost::publish_block(crate::ddi::device_lost::Trigger::Stop);
         // The first stage reaches the disk before anything that could bugcheck.
         let flush = crate::diag::read_config_dword(crate::diag::knobs::STOP_FLUSH, 1) != 0;
         if flush {

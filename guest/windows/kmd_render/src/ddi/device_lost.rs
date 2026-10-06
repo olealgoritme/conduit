@@ -13,9 +13,13 @@
 //!
 //! IRQL. Everything that records is atomics and a clock read, legal at any IRQL (the wrapped
 //! DDIs include `SetVidPnSourceAddress` at DIRQL, the submit DDIs at DISPATCH). The registry is
-//! written only by [`publish`], at PASSIVE: from `stall_diag::publish_counters` (the periodic
-//! mirror, the stuck-only escape publisher and the StartDevice zero write), from
-//! `DestroyDevice` / `StopDevice` through [`publish_if_dirty`], and nowhere else.
+//! written only by [`publish_block`], at PASSIVE, and EVERY call site names its [`Trigger`]
+//! there: `stall_diag::publish_counters` (the periodic mirror, the stuck-only escape publisher
+//! and the StartDevice zero write: `Periodic`), `StopDevice` (`Stop`), and the `DestroyDevice`
+//! wrapper (`Teardown`). The block is about 75 values and up to 96 ring entries, so the trigger
+//! decides whether it is worth writing: a teardown DDI writes it only for a suspect, fatal or
+//! slow event (`serious_dirty`), never because an expected refusal moved a ring. One function,
+//! so the publisher can be redirected to another thread by changing only [`publish_block`].
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -306,9 +310,38 @@ pub(crate) fn venus_held_ms() -> u32 {
     ((now_100ns().saturating_sub(at) / UNITS_PER_MS).min(u32::MAX as u64) as u32).max(1)
 }
 
-/// [`publish`] when something moved since the last one. PASSIVE. Cheap when nothing did.
-pub(crate) fn publish_if_dirty() {
-    if dirty() {
+/// Why the block is being written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Trigger {
+    /// The periodic mirror (`stall_diag::publish_counters`, StartDevice's zero write, the escape
+    /// thread's stuck-only publisher): written when something moved, or when the last write is
+    /// 30 s old, so the worker's `REFRESH_POST` step does not carry the block every time.
+    Periodic,
+    /// A teardown DDI that ran at PASSIVE (`DestroyDevice`): only for a suspect, fatal or slow event.
+    Teardown,
+    /// `StopDevice`, before its first hive flush: always.
+    Stop,
+}
+
+/// Interrupt time (ms) of the last [`publish`] (0 = never).
+static PUBLISHED_AT: AtomicU32 = AtomicU32::new(0);
+/// A periodic write is due after this long without one.
+const PERIODIC_MAX_AGE_MS: u32 = 30_000;
+
+/// THE call site of [`publish`]: write the block if `why` says it is worth it. PASSIVE.
+pub(crate) fn publish_block(why: Trigger) {
+    let due = match why {
+        Trigger::Stop => true,
+        Trigger::Teardown => serious_dirty(),
+        Trigger::Periodic => {
+            dirty() || {
+                let last = PUBLISHED_AT.load(Ordering::Relaxed);
+                let now = ms_from_100ns(now_100ns());
+                last == 0 || now.wrapping_sub(last) >= PERIODIC_MAX_AGE_MS
+            }
+        }
+    };
+    if due {
         publish();
     }
 }
@@ -357,12 +390,13 @@ const COUNT_NAMES: [(&[u8], u32); 12] = [
 
 /// Mirror the whole block to the service key. PASSIVE_LEVEL only (every write is a synchronous
 /// `RtlWriteRegistryValue`): about 60 values and, when a ring moved, up to 96 more.
-pub(crate) fn publish() {
+fn publish() {
     use crate::diag::record_named_bytes as rec;
     let first_publish = PUBLISHED_ONCE.swap(1, Ordering::Relaxed) == 0;
     PUBLISHED_SIG.store(signature(), Ordering::Relaxed);
     PUBLISHED_SERIOUS.store(serious_signature(), Ordering::Relaxed);
     let now_ms = ms_from_100ns(now_100ns());
+    PUBLISHED_AT.store(now_ms.max(1), Ordering::Relaxed);
     rec(b"DdiPubT", now_ms);
 
     // 1. The sticky first-fatal record.

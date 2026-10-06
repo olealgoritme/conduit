@@ -893,7 +893,7 @@ pub(crate) fn publish_counters() {
     publish_long_events();
     // The DDI failure rings, the sticky first-fatal record, the paging and lock records: the
     // adapter-wide device-removed instrument (`ddi::device_lost`).
-    crate::ddi::device_lost::publish();
+    crate::ddi::device_lost::publish_block(crate::ddi::device_lost::Trigger::Periodic);
     rec(b"StartN", START_N.load(Ordering::Relaxed));
     rec(b"StartT", START_T.load(Ordering::Relaxed));
     rec(b"FlipWd", WD_COUNT.load(Ordering::Relaxed));

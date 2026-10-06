@@ -34,7 +34,9 @@ macro_rules! traced {
             status
         }
     };
-    // PASSIVE-only teardown DDIs: mirror the block when a ring moved.
+    // The PASSIVE teardown DDI: the block is written only for a suspect, fatal or slow event
+    // (`device_lost::Trigger::Teardown`), AFTER the duration is taken, so a slow DestroyDevice
+    // is already in `Dz*` when the block is written and the write cannot hide it.
     ($name:ident, $id:expr, $target:path, ($($arg:ident : $ty:ty),*), $hint:expr, publish) => {
         #[inline(never)]
         pub unsafe extern "C" fn $name($($arg: $ty),*) -> NTSTATUS {
@@ -42,8 +44,8 @@ macro_rules! traced {
             // SAFETY: as above.
             let status = unsafe { $target($($arg),*) };
             dlost::leave($id, started, status, $hint);
-            // These two DDIs are documented PASSIVE_LEVEL.
-            dlost::publish_if_dirty();
+            // Documented PASSIVE_LEVEL.
+            dlost::publish_block(dlost::Trigger::Teardown);
             status
         }
     };
@@ -77,8 +79,7 @@ traced!(
     ddi::STOP_DEVICE,
     crate::ddi::dxgkddi_stop_device,
     (miniport_device_context: *mut c_void),
-    0,
-    publish
+    0
 );
 traced!(
     remove_device,
