@@ -807,6 +807,7 @@ unsafe fn note_nvk_keyed_resource(
     h_resource: ddi::D3D10DDI_HRESOURCE,
     misc: u32,
     bind: u32,
+    created: bool,
 ) {
     if misc & DDI_MISC_SHARED_FLAG == 0
         || bind & DDI_BIND_PRESENT_FLAG != 0
@@ -819,8 +820,8 @@ unsafe fn note_nvk_keyed_resource(
     };
     let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
     let key = h_resource.pDrvPrivate as usize;
-    if !list.contains(&key) {
-        list.push(key);
+    if !list.iter().any(|&(k, _)| k == key) {
+        list.push((key, created));
         log_error!(
             "DDI NVK shared resource hDrv=0x{key:x}: flushes now wait for the GPU ({} live)",
             list.len()
@@ -839,7 +840,7 @@ pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D1
         return;
     }
     let key = h_resource.pDrvPrivate as usize;
-    list.retain(|&k| k != key);
+    list.retain(|&(k, _)| k != key);
 }
 
 pub(crate) unsafe extern "system" fn create_resource(
@@ -850,7 +851,7 @@ pub(crate) unsafe extern "system" fn create_resource(
 ) {
     create_resource_inner(h, arg, h_resource, h_rt);
     if !arg.is_null() {
-        note_nvk_keyed_resource(h, h_resource, (*arg).MiscFlags, (*arg).BindFlags);
+        note_nvk_keyed_resource(h, h_resource, (*arg).MiscFlags, (*arg).BindFlags, true);
     }
 }
 
@@ -1517,7 +1518,7 @@ pub(crate) unsafe extern "system" fn open_resource(
     // An opened resource is shared by definition; the creator's bind flags
     // travel in the meta trailer.
     let bind = open_resource_inner(h, arg, h_resource, h_rt);
-    note_nvk_keyed_resource(h, h_resource, DDI_MISC_SHARED_FLAG, bind);
+    note_nvk_keyed_resource(h, h_resource, DDI_MISC_SHARED_FLAG, bind, false);
 }
 
 /// Returns the creator's DDI bind flags (0 when the open failed early).

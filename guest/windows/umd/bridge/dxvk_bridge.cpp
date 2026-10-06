@@ -690,6 +690,8 @@ namespace {
 }
 
 std::int32_t HeliosDxvkDevice::flush_gate_point(std::uint32_t mode,
+                                                const std::size_t* resources,
+                                                std::uint32_t resource_count,
                                                 std::uint32_t* ctx_id,
                                                 std::uint32_t* value32,
                                                 std::uint64_t* cookie,
@@ -721,7 +723,54 @@ std::int32_t HeliosDxvkDevice::flush_gate_point(std::uint32_t mode,
         // recording stay in one order with publish_present_order.
         value = ++impl->present_value;
         streamFence = impl->present_fence;
-        impl->flush_gate_seq = immediate->HeliosSignalFlushPoint(streamFence, value);
+        // The shared allocations this point is published on (each with an
+        // operation the signal's command list retains), so an importer's
+        // read waits for this point (flush-gate.md section 9).
+        std::vector<dxvk::Rc<dxvk::HeliosProducerBinding>> producers;
+        std::vector<dxvk::Rc<dxvk::HeliosProducerOperation>> operations;
+        for (std::uint32_t i = 0; resources && i < resource_count; i++) {
+          auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(resources[i]));
+          if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+            continue;
+          auto producer = texture->GetImage()->storage()->heliosProducer();
+          if (producer == nullptr)
+            continue;
+          bool known = false;
+          for (const auto& p : producers)
+            known |= p.ptr() == producer.ptr();
+          if (known)
+            continue;
+          producers.push_back(producer);
+          operations.push_back(new dxvk::HeliosProducerOperation(producer));
+        }
+        impl->flush_gate_seq = operations.empty()
+          ? immediate->HeliosSignalFlushPoint(streamFence, value)
+          : immediate->HeliosSignalFlushPointTracked(streamFence, value, operations);
+        static std::atomic<std::uint64_t> s_published{0}, s_publishFailed{0};
+        for (const auto& producer : producers) {
+          std::uint64_t epoch = 0;
+          if (producer->publish(streamFence->handle(), value, &epoch)) {
+            s_published.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            producer->abort();
+            const auto n = s_publishFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n % 1024u) == 0) {
+              char msg[128];
+              std::snprintf(msg, sizeof(msg), "flush-gate: publishing point %llu failed (x%llu)",
+                static_cast<unsigned long long>(value), static_cast<unsigned long long>(n));
+              umd_log(msg);
+            }
+          }
+        }
+        const auto published = s_published.load(std::memory_order_relaxed);
+        if (!producers.empty() && (published <= 4 || (published % 4096u) == 0)) {
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+            "flush-gate: point %llu published on %zu shared allocation(s) (%llu so far)",
+            static_cast<unsigned long long>(value), producers.size(),
+            static_cast<unsigned long long>(published));
+          umd_log(msg);
+        }
       }
       *ctx_id = impl->venus_ctx_id;
       *value32 = std::uint32_t(value);
