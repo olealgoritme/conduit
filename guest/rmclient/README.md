@@ -174,6 +174,22 @@ over them, GPU-maps and unmaps it, checks the CPU's pattern survived, and
 frees it, at 2 MiB and at 512 MiB (past what a direct page-run table holds on
 Windows, where the KMD pins the range).
 
+`tests/crm_import_smoke.c` (Windows only; exits 77 elsewhere) exercises the Helios
+KMD's `HELIOS_ESCAPE_FOREIGN_RESOURCE` verb, which turns RM memory into a Venus
+resource id. It first asks `QUERY_CAPS` and prints SKIP, exit 0, when the KMD has no
+such verb or the host does not serve the import yet (`CAP_RM_IMPORT` clear), so it
+is safe to run before the host half is installed. Otherwise it allocates pitch-linear
+vidmem, exports it into a GEM object on a DRM render node (as `crm_scanout_smoke`),
+creates a Venus context, sends `IMPORT_RM` with its layout and expects `ST_OK` and
+a resource id, releases it with `RELEASE_BLOB` (a second release must fail), then
+sends six deliberate mistakes and checks the status and `out_host_errno` of each
+(unknown GEM: `ST_NOT_OWNED`/ENOENT; oversize: `ST_BAD_RANGE`/ERANGE; a non-DRI
+channel: `ST_NOT_OWNED`; a foreign context: `ST_BAD_CONTEXT`; no layout flag and a
+bad modifier: `ST_BAD_RANGE`). It prints `IMPORT SMOKE PASSED`, or the first failing
+step, and exits nonzero on failure. The verbs go out through `crm_win_escape_raw`,
+which sends any non-NVRM Helios escape on the same D3DKMT device as the RM handles;
+the ABI comes from the KMD's own `guest/windows/protocol/include/helios_foreign.h`.
+
 ## Status
 
 Tested in the `lab` guest (RTX 5090, GB20x, host driver 610.57.04):
