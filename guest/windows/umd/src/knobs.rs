@@ -360,6 +360,34 @@ pub(crate) fn umd_deferred_diagnostics() -> bool {
 /// presents), 2 = always the WDDM present (DWM composes).
 pub(crate) static NVK_PRESENT: DwordKnob = DwordKnob::new(c"NvkPresent", 0);
 
+/// `NvkScanoutComposeEvery`: how often a frame that NVK already showed on
+/// scanout 0 also goes through the WDDM present (`pfnPresentCb`) to DWM.
+/// 0 (default) = only the first frame; N = the first and every Nth after it;
+/// 1 = every frame (the behaviour before this knob).
+///
+/// For a blt-model swapchain (`DXGI_SWAP_EFFECT_DISCARD`, windowed: Heaven)
+/// that present is a Blt into DWM's GDI redirection surface: the KMD copies
+/// the frame on the host, waits for the copy on the presenting thread and
+/// mirrors it into the surface's system pages, and dxgkrnl copies it again
+/// through GDI (`DxgkEngBltViaGDI`). Measured 2026-10-06 (Heaven 1600x900,
+/// xperf): about a fifth of the render thread, which made it CPU-bound at
+/// ~170-200 fps against 357 for app-local DXVK, which never presents through
+/// DXGI. DWM's copy is not shown anyway while the app owns scanout 0.
+pub(crate) static NVK_SCANOUT_COMPOSE_EVERY: DwordKnob =
+    DwordKnob::new(c"NvkScanoutComposeEvery", 0);
+
+/// `NvkScanoutComposeEvery`, or `HELIOS_NVK_SCANOUT_COMPOSE_EVERY` from the
+/// process environment.
+pub(crate) fn nvk_scanout_compose_every() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_NVK_SCANOUT_COMPOSE_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| NVK_SCANOUT_COMPOSE_EVERY.get())
+    })
+}
+
 /// `NvkPlaceholderAllocations`: 1 = never ask NVK for resource ids; every
 /// WDDM-backed texture gets a KMD placeholder (A/B and fallback lever).
 pub(crate) static NVK_PLACEHOLDER_ALLOCATIONS: BoolKnob =

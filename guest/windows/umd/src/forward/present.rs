@@ -1380,7 +1380,7 @@ const HELIOS_ICD_CAP_PRESENT_FENCE_KMD: u32 = 1 << 6;
 unsafe fn nvk_present_frame(
     h: Hdevice,
     shown: ddi::D3D10DDI_HRESOURCE,
-) -> Result<PresentStreamCorrelation, i32> {
+) -> Result<NvkFrame, i32> {
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
     };
@@ -1409,7 +1409,7 @@ unsafe fn nvk_present_frame(
         }
         if scanout {
             let Some(src) = load_resource(shown) else {
-                return Ok(PresentStreamCorrelation::default());
+                return Ok(NvkFrame::default());
             };
             match dev.dxvk.nvk_scanout_present_fenced(&src) {
                 Some(true) => {
@@ -1421,11 +1421,11 @@ unsafe fn nvk_present_frame(
                             NVK_FENCED_FAILURES.load(Ordering::Relaxed)
                         );
                     }
-                    return Ok(PresentStreamCorrelation::default());
+                    return Ok(NvkFrame::on_scanout());
                 }
                 Some(false) => {
                     NVK_FENCED_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    return Ok(PresentStreamCorrelation::default());
+                    return Ok(NvkFrame::default());
                 }
                 // No RM fences after all: the CPU wait below.
                 None => {}
@@ -1435,10 +1435,13 @@ unsafe fn nvk_present_frame(
             if n == 1 || n % 4096 == 0 {
                 log_error!("NVK present: {n} WDDM presents carry an RM fence (value {value})");
             }
-            return Ok(PresentStreamCorrelation {
-                rm_fence_handle: fence,
-                rm_fence_value: value,
-                ..PresentStreamCorrelation::default()
+            return Ok(NvkFrame {
+                correlation: PresentStreamCorrelation {
+                    rm_fence_handle: fence,
+                    rm_fence_value: value,
+                    ..PresentStreamCorrelation::default()
+                },
+                on_scanout: false,
             });
         }
     }
@@ -1466,6 +1469,7 @@ unsafe fn nvk_present_frame(
                     log_error!("NVK present: {n} frames on scanout 0 (failures {})",
                         NVK_SCANOUT_FAILURES.load(Ordering::Relaxed));
                 }
+                return Ok(NvkFrame::on_scanout());
             } else {
                 NVK_SCANOUT_FAILURES.fetch_add(1, Ordering::Relaxed);
             }
@@ -1476,7 +1480,59 @@ unsafe fn nvk_present_frame(
             log_error!("NVK present: {n} frames composed by DWM from foreign resource ids");
         }
     }
-    Ok(PresentStreamCorrelation::default())
+    Ok(NvkFrame::default())
+}
+
+/// What `nvk_present_frame` did with a frame: the marker the WDDM present
+/// carries, and whether NVK already put the frame on scanout 0.
+#[derive(Clone, Copy, Default)]
+struct NvkFrame {
+    correlation: PresentStreamCorrelation,
+    on_scanout: bool,
+}
+
+impl NvkFrame {
+    fn on_scanout() -> Self {
+        Self {
+            correlation: PresentStreamCorrelation::default(),
+            on_scanout: true,
+        }
+    }
+}
+
+static NVK_SCANOUT_FRAMES: AtomicUsize = AtomicUsize::new(0);
+static NVK_SCANOUT_COMPOSED: AtomicUsize = AtomicUsize::new(0);
+
+/// Does a frame NVK already showed on scanout 0 also go through the WDDM
+/// present to DWM (`NvkScanoutComposeEvery`)? The first frame always does, so
+/// DXGI and DWM see the swapchain present once. Also logs the frame rate every
+/// 1024 scanout frames: with the WDDM present skipped, ETW-based tools
+/// (PresentMon) no longer see the frames, so this line is the frame clock.
+fn nvk_scanout_compose(frame: NvkFrame) -> bool {
+    if !frame.on_scanout {
+        return true;
+    }
+    let n = NVK_SCANOUT_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let every = crate::knobs::nvk_scanout_compose_every() as usize;
+    let compose = n == 0 || (every != 0 && n % every == 0);
+    if compose {
+        NVK_SCANOUT_COMPOSED.fetch_add(1, Ordering::Relaxed);
+    }
+    if (n + 1) % 1024 == 0 {
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let now = std::time::Instant::now();
+        let last = lock_ignore_poison(&LAST).replace(now);
+        if let Some(last) = last {
+            let fps = 1024.0 / now.duration_since(last).as_secs_f64().max(1e-9);
+            log_error!(
+                "NVK scanout: {} frames, {} also sent to DWM (NvkScanoutComposeEvery={every}), \
+                 {fps:.1} fps over the last 1024",
+                n + 1,
+                NVK_SCANOUT_COMPOSED.load(Ordering::Relaxed)
+            );
+        }
+    }
+    compose
 }
 
 /// An RM fence a WDDM present was to carry is still ours when
@@ -1523,10 +1579,14 @@ unsafe fn nvk_present_impl(
         context.Flush();
         flush_gate(h, &context);
     }
-    let correlation = match nvk_present_frame(h, shown) {
-        Ok(c) => c,
+    let frame = match nvk_present_frame(h, shown) {
+        Ok(f) => f,
         Err(hr) => return hr,
     };
+    if !nvk_scanout_compose(frame) {
+        return 0;
+    }
+    let correlation = frame.correlation;
     let result = finish_present(
         h,
         src_h,
@@ -2885,7 +2945,8 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
     let mut nvk_correlation = PresentStreamCorrelation::default();
     if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
         match nvk_present_frame(h, src_h) {
-            Ok(c) => nvk_correlation = c,
+            Ok(frame) if !nvk_scanout_compose(frame) => return 0,
+            Ok(frame) => nvk_correlation = frame.correlation,
             Err(hr) => return hr,
         }
     } else {
