@@ -237,6 +237,7 @@ mod tests {
             offset: 0,
             fourcc: FOURCC_XRGB8888,
             modifier: 0x0300_0000_0060_6015,
+            plane1: None,
         }
     }
 

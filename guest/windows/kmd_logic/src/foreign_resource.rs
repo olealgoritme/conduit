@@ -93,6 +93,23 @@ pub const MAX_FOREIGN_OPEN_ROWS: usize = 2048;
 
 const PAGE: u64 = 4096;
 
+/// Private-data bytes that hold the version-1 layout trailer (96 + 32) and the
+/// version-2 trailer with plane 1 after it (128 + 16). Copies of
+/// `helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES` /
+/// `_WITH_PLANES_BYTES`, pinned by `kmd_render`.
+pub const PRIVATE_WITH_LAYOUT_BYTES: usize = 128;
+pub const PRIVATE_WITH_PLANES_BYTES: usize = 144;
+
+/// Private-data bytes the KMD's trailer write needs for `layout`: 128 for a
+/// one-plane record (version 1, as always), 144 for a two-plane one (version 2).
+pub const fn trailer_bytes(layout: &Layout) -> usize {
+    if layout.plane1.is_some() {
+        PRIVATE_WITH_PLANES_BYTES
+    } else {
+        PRIVATE_WITH_LAYOUT_BYTES
+    }
+}
+
 /// The `RESOURCE_CREATE_BLOB.blob_id` that names the host object to import:
 /// the backend handle of the DRM file in the high half, the GEM handle that
 /// file's `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY` returned in the low half.
@@ -106,6 +123,10 @@ pub const fn foreign_blob_id(rm_handle: u32, gem_handle: u32) -> u64 {
 /// `IMPORT_RM.flags` bit: the request carries a layout tail
 /// (`HeliosForeignImportRmLayout`). Mandatory: see [`validate_request`].
 pub const FLAG_LAYOUT: u32 = 1 << 0;
+/// `IMPORT_RM.flags` bit: plane 1 of a two-plane format follows the layout
+/// (`HeliosForeignImportRmPlanes`, 120 bytes). Only with [`FLAG_LAYOUT`]; set iff
+/// the request's layout carries `plane1` (`docs/shared-formats.md`).
+pub const FLAG_PLANE1: u32 = 1 << 1;
 
 // ---------------------------------------------------------------------------
 // Surface layout
@@ -118,19 +139,151 @@ pub const FLAG_LAYOUT: u32 = 1 << 0;
 // chose instead of inferring it from the size, which is wrong for heights that
 // are a whole number of blocks.
 //
-// The rules mirror `foreign_scanout::Layout::validate` (branch
-// `kmd/foreign-scanout`, 66c714f): the same four 32-bit RGB formats, the same
-// stride bound. Differences, on purpose: the extent floor is 1 (a foreign
-// resource is any adopted allocation, not only a mode-sized scanout image) and
-// the modifier set is closed to what the host's NVIDIA Vulkan driver was shown to
-// import with the exact layout (host spike c6fab91): LINEAR and the NVIDIA
-// block-linear family NVK builds for B8G8R8A8 / R8G8B8A8.
+// The rules mirror `foreign_scanout::Layout::validate` for the four 32-bit RGB
+// formats (branch `kmd/foreign-scanout`, 66c714f): the same stride bound.
+// Differences, on purpose: the extent floor is 1 (a foreign resource is any
+// adopted allocation, not only a mode-sized scanout image) and the modifier set
+// is closed to what the host's NVIDIA Vulkan driver was shown to import with the
+// exact layout (host spike c6fab91): LINEAR and the NVIDIA block-linear family
+// NVK builds for B8G8R8A8 / R8G8B8A8.
+//
+// Shared formats (`docs/shared-formats.md`): the record also takes the other
+// formats Windows shares between processes ([`share_format`]): 8/16/64 bpp
+// single-plane ones, YUYV, and the two-plane 4:2:0 NV12 / P010 / P016 with a
+// second plane ([`Plane`]). The table is a copy of `helios_protocol::share_format`
+// (this crate has no dependency edge to the protocol crate); `kmd_render` pins
+// the two together with a const assertion over every fourcc, so a drift fails
+// the driver build.
 
-/// `DRM_FORMAT_*` accepted: the four 32-bit RGB formats.
+/// `DRM_FORMAT_*` accepted: the four 32-bit RGB formats first.
 pub const FOURCC_XRGB8888: u32 = 0x3432_5258;
 pub const FOURCC_ARGB8888: u32 = 0x3432_5241;
 pub const FOURCC_XBGR8888: u32 = 0x3432_4258;
 pub const FOURCC_ABGR8888: u32 = 0x3432_4241;
+/// Then the shared formats beyond them.
+pub const FOURCC_R8: u32 = 0x2020_3852;
+pub const FOURCC_GR88: u32 = 0x3838_5247;
+pub const FOURCC_R16: u32 = 0x2036_3152;
+pub const FOURCC_GR1616: u32 = 0x3233_5247;
+pub const FOURCC_RGB565: u32 = 0x3631_4752;
+pub const FOURCC_ARGB1555: u32 = 0x3531_5241;
+pub const FOURCC_ARGB4444: u32 = 0x3231_5241;
+pub const FOURCC_ABGR2101010: u32 = 0x3033_4241;
+pub const FOURCC_ABGR16161616F: u32 = 0x4834_4241;
+pub const FOURCC_ABGR16161616: u32 = 0x3834_4241;
+pub const FOURCC_YUYV: u32 = 0x5659_5559;
+pub const FOURCC_NV12: u32 = 0x3231_564E;
+pub const FOURCC_P010: u32 = 0x3031_3050;
+pub const FOURCC_P016: u32 = 0x3631_3050;
+
+/// How a shared format lays out its bytes: a copy of
+/// `helios_protocol::ShareFormat` (same fields, same meaning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShareFormat {
+    /// 1, or 2 for the 4:2:0 formats (plane 1: interleaved chroma at half width
+    /// and half height).
+    pub planes: u32,
+    /// Bytes of one texel of plane 0 (YUYV: of one two-pixel group).
+    pub bpp0: u32,
+    /// Bytes of one texel of plane 1 (a chroma pair), 0 for one plane.
+    pub bpp1: u32,
+    /// Plane 0 texels per row = `ceil(width / hdiv0)` (2 for YUYV, else 1).
+    pub hdiv0: u32,
+    /// `width` must be even (4:2:2 and 4:2:0).
+    pub even_width: bool,
+    /// `height` must be even (4:2:0).
+    pub even_height: bool,
+}
+
+impl ShareFormat {
+    const fn one(bpp: u32) -> Self {
+        Self {
+            planes: 1,
+            bpp0: bpp,
+            bpp1: 0,
+            hdiv0: 1,
+            even_width: false,
+            even_height: false,
+        }
+    }
+
+    const fn yuv420(bpp0: u32) -> Self {
+        Self {
+            planes: 2,
+            bpp0,
+            bpp1: bpp0 * 2,
+            hdiv0: 1,
+            even_width: true,
+            even_height: true,
+        }
+    }
+
+    /// Bytes of one row of plane `plane` of a `width`-pixel image, unpadded.
+    pub const fn row_bytes(&self, plane: u32, width: u32) -> u64 {
+        if plane == 0 {
+            (width.div_ceil(self.hdiv0) as u64) * self.bpp0 as u64
+        } else {
+            (width.div_ceil(2) as u64) * self.bpp1 as u64
+        }
+    }
+
+    /// Rows of plane `plane` of a `height`-row image.
+    pub const fn rows(&self, plane: u32, height: u32) -> u32 {
+        if plane == 0 {
+            height
+        } else {
+            height.div_ceil(2)
+        }
+    }
+
+    /// The alignment a plane's stride must have: its texel size, at most 4.
+    pub const fn stride_align(&self, plane: u32) -> u32 {
+        let bpp = if plane == 0 { self.bpp0 } else { self.bpp1 };
+        if bpp > 4 {
+            4
+        } else {
+            bpp
+        }
+    }
+}
+
+/// The layout facts of `fourcc`, or `None` for a format a foreign resource may
+/// not hold. Mirrors `helios_protocol::share_format` exactly.
+pub const fn share_format(fourcc: u32) -> Option<ShareFormat> {
+    Some(match fourcc {
+        FOURCC_XRGB8888 | FOURCC_ARGB8888 | FOURCC_XBGR8888 | FOURCC_ABGR8888 => {
+            ShareFormat::one(4)
+        }
+        FOURCC_R8 => ShareFormat::one(1),
+        FOURCC_GR88 | FOURCC_R16 | FOURCC_RGB565 | FOURCC_ARGB1555 | FOURCC_ARGB4444 => {
+            ShareFormat::one(2)
+        }
+        FOURCC_GR1616 | FOURCC_ABGR2101010 => ShareFormat::one(4),
+        FOURCC_ABGR16161616F | FOURCC_ABGR16161616 => ShareFormat::one(8),
+        FOURCC_YUYV => ShareFormat {
+            planes: 1,
+            bpp0: 4,
+            bpp1: 0,
+            hdiv0: 2,
+            even_width: true,
+            even_height: false,
+        },
+        FOURCC_NV12 => ShareFormat::yuv420(1),
+        FOURCC_P010 | FOURCC_P016 => ShareFormat::yuv420(2),
+        _ => return None,
+    })
+}
+
+/// One of the four 32-bit RGB formats: the only ones the KMD's scanout, flip,
+/// copy and blit consumers carry. Every consumer that reads a record's pixels
+/// refuses anything else (`Layout::is_rgb32`).
+pub const fn is_rgb32_fourcc(fourcc: u32) -> bool {
+    matches!(
+        fourcc,
+        FOURCC_XRGB8888 | FOURCC_ARGB8888 | FOURCC_XBGR8888 | FOURCC_ABGR8888
+    )
+}
+
 /// `DRM_FORMAT_MOD_LINEAR`.
 pub const MOD_LINEAR: u64 = 0;
 /// `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c=0, s=1, g=2, k=0x06, h=0)`: the
@@ -145,9 +298,24 @@ pub const MIN_DIM: u32 = 1;
 pub const MAX_DIM: u32 = 16_384;
 pub const MAX_STRIDE: u32 = 1 << 20;
 
+/// Plane 1 of a two-plane format (NV12 / P010 / P016): the interleaved chroma
+/// at `ceil(w/2) x ceil(h/2)` texel pairs. Its own modifier, because NVK picks the
+/// block height per plane extent (`docs/shared-formats.md` 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plane {
+    /// Plane 1 pitch in bytes.
+    pub stride: u32,
+    /// Plane 1 offset in bytes from the start of the object; at or past the end
+    /// of plane 0 ([`Layout::validate`]).
+    pub offset: u32,
+    /// `DRM_FORMAT_MOD_*` of plane 1: LINEAR iff plane 0 is, else the same
+    /// block-linear family (its `h` may differ).
+    pub modifier: u64,
+}
+
 /// The picture inside a foreign resource: everything a scanout flip or an
-/// importer needs besides which object it is. Plane 0 only (all accepted formats
-/// are single plane).
+/// importer needs besides which object it is. Plane 0 in the fields, plane 1 (the
+/// two-plane formats only) in [`Layout::plane1`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub width: u32,
@@ -159,20 +327,59 @@ pub struct Layout {
     pub fourcc: u32,
     /// `DRM_FORMAT_MOD_*`: [`MOD_LINEAR`] or `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`.
     pub modifier: u64,
+    /// Plane 1 of a two-plane format; `Some` iff the format has two planes.
+    pub plane1: Option<Plane>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayoutError {
-    /// Width or height outside `MIN_DIM..=MAX_DIM`.
+    /// Width or height outside `MIN_DIM..=MAX_DIM`, or odd where the format
+    /// needs it even (YUYV width, NV12 / P010 / P016 width and height).
     Dimensions,
-    /// A fourcc this KMD does not forward.
+    /// A fourcc this KMD does not forward ([`share_format`] has no row for it).
     Format,
-    /// Stride under `width * 4`, not a multiple of 4, or over [`MAX_STRIDE`].
+    /// A plane's stride under its row bytes, off its alignment, or over
+    /// [`MAX_STRIDE`].
     Stride,
-    /// Not LINEAR and not `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`, `h <= 5`.
+    /// Not LINEAR and not `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`, `h <= 5`; or plane 1
+    /// LINEAR with plane 0 block-linear (or the other way round).
     Modifier,
-    /// The layout needs more bytes than the resource has.
+    /// The layout needs more bytes than the resource has, or plane 1 starts
+    /// before plane 0 ends.
     TooLarge,
+    /// `plane1` is present on a one-plane format, or absent on a two-plane one.
+    Planes,
+}
+
+/// `h` of an NVIDIA block-linear modifier, or `None` for LINEAR and for a
+/// modifier outside the accepted family.
+const fn block_log2(modifier: u64) -> Option<u32> {
+    if modifier >= MOD_NVIDIA_BLOCK_LINEAR_BASE
+        && modifier <= MOD_NVIDIA_BLOCK_LINEAR_BASE + MAX_BLOCK_HEIGHT_LOG2 as u64
+    {
+        Some((modifier - MOD_NVIDIA_BLOCK_LINEAR_BASE) as u32)
+    } else {
+        None
+    }
+}
+
+/// A modifier a plane may carry: LINEAR or the block-linear family.
+const fn modifier_ok(modifier: u64) -> bool {
+    modifier == MOD_LINEAR || block_log2(modifier).is_some()
+}
+
+/// `offset + stride * rows`, `rows` rounded up to the plane's block when it is
+/// block-linear. Saturating, so even an unvalidated layout (a `u32::MAX` stride
+/// and height) yields a large bound and never wraps.
+const fn plane_min_bytes(offset: u32, stride: u32, rows: u64, modifier: u64) -> u64 {
+    let rows = match block_log2(modifier) {
+        None => rows,
+        Some(h) => {
+            let block = GOB_ROWS << h;
+            (rows + block - 1) / block * block
+        }
+    };
+    (offset as u64).saturating_add((stride as u64).saturating_mul(rows))
 }
 
 impl Layout {
@@ -184,53 +391,101 @@ impl Layout {
         {
             return Err(LayoutError::Dimensions);
         }
-        if !matches!(
-            self.fourcc,
-            FOURCC_XRGB8888 | FOURCC_ARGB8888 | FOURCC_XBGR8888 | FOURCC_ABGR8888
-        ) {
+        let Some(f) = share_format(self.fourcc) else {
             return Err(LayoutError::Format);
+        };
+        if self.plane1.is_some() != (f.planes == 2) {
+            return Err(LayoutError::Planes);
         }
-        if (self.stride as u64) < (self.width as u64) * 4
+        if (f.even_width && self.width % 2 != 0) || (f.even_height && self.height % 2 != 0) {
+            return Err(LayoutError::Dimensions);
+        }
+        if (self.stride as u64) < f.row_bytes(0, self.width)
             || self.stride > MAX_STRIDE
-            || self.stride % 4 != 0
+            || self.stride % f.stride_align(0) != 0
         {
             return Err(LayoutError::Stride);
         }
-        if self.modifier != MOD_LINEAR && self.block_height_log2().is_none() {
+        if !modifier_ok(self.modifier) {
             return Err(LayoutError::Modifier);
+        }
+        if let Some(p) = self.plane1 {
+            if (p.stride as u64) < f.row_bytes(1, self.width)
+                || p.stride > MAX_STRIDE
+                || p.stride % f.stride_align(1) != 0
+            {
+                return Err(LayoutError::Stride);
+            }
+            // LINEAR planes stay LINEAR together; block-linear ones may differ in `h`.
+            if !modifier_ok(p.modifier)
+                || (p.modifier == MOD_LINEAR) != (self.modifier == MOD_LINEAR)
+            {
+                return Err(LayoutError::Modifier);
+            }
+            // Plane 1 starts at or after the end of plane 0.
+            if (p.offset as u64) < self.plane0_min_bytes() {
+                return Err(LayoutError::TooLarge);
+            }
         }
         Ok(())
     }
 
-    /// `h` of an NVIDIA block-linear modifier, or `None` for LINEAR and for a
-    /// modifier outside the accepted family.
+    /// `h` of plane 0's NVIDIA block-linear modifier, or `None` for LINEAR and
+    /// for a modifier outside the accepted family.
     pub const fn block_height_log2(&self) -> Option<u32> {
-        let m = self.modifier;
-        if m >= MOD_NVIDIA_BLOCK_LINEAR_BASE
-            && m <= MOD_NVIDIA_BLOCK_LINEAR_BASE + MAX_BLOCK_HEIGHT_LOG2 as u64
-        {
-            Some((m - MOD_NVIDIA_BLOCK_LINEAR_BASE) as u32)
+        block_log2(self.modifier)
+    }
+
+    /// Number of planes the record carries (1 or 2).
+    pub const fn plane_count(&self) -> u32 {
+        if self.plane1.is_some() {
+            2
         } else {
-            None
+            1
+        }
+    }
+
+    /// One of the four 32-bit RGB formats, one plane: the only record the
+    /// scanout, flip, copy and blit consumers read. They test this (or their own
+    /// narrower fourcc match) before they trust the stride as "width * 4".
+    pub const fn is_rgb32(&self) -> bool {
+        self.plane1.is_none() && is_rgb32_fourcc(self.fourcc)
+    }
+
+    /// A LOWER BOUND on the bytes plane 0 occupies from the start of the object:
+    /// `offset + stride * rows`, `rows` being `height` for LINEAR and `height`
+    /// rounded up to the block for block-linear.
+    pub const fn plane0_min_bytes(&self) -> u64 {
+        plane_min_bytes(self.offset, self.stride, self.height as u64, self.modifier)
+    }
+
+    /// The same bound for plane 1 (`ceil(height / 2)` rows, rounded to plane 1's
+    /// own block when it is block-linear), `None` for a one-plane record.
+    pub const fn plane1_min_bytes(&self) -> Option<u64> {
+        match self.plane1 {
+            None => None,
+            Some(p) => Some(plane_min_bytes(
+                p.offset,
+                p.stride,
+                (self.height as u64 + 1) / 2,
+                p.modifier,
+            )),
         }
     }
 
     /// A LOWER BOUND on the bytes the image occupies from the start of the
-    /// object: `offset + stride * rows`, `rows` being `height` for LINEAR and
-    /// `height` rounded up to the block for block-linear. It is a bound and not
-    /// the exact size: RM rounds allocations up (a 1080p linear image is
-    /// 0x7e9000 in a 0x7f0000 object), so the check is `min_bytes() <= size`,
-    /// never equality. Meaningful for a validated layout (no overflow: every
-    /// factor is bounded).
+    /// object: the larger of the planes' bounds ([`Self::plane0_min_bytes`],
+    /// [`Self::plane1_min_bytes`]). It is a bound and not the exact size: RM
+    /// rounds allocations up (a 1080p linear image is 0x7e9000 in a 0x7f0000
+    /// object), so the check is `min_bytes() <= size`, never equality. Meaningful
+    /// for a validated layout (no overflow: every factor is bounded); saturating
+    /// for any other.
     pub const fn min_bytes(&self) -> u64 {
-        let rows = match self.block_height_log2() {
-            None => self.height as u64,
-            Some(h) => {
-                let block = GOB_ROWS << h;
-                ((self.height as u64) + block - 1) / block * block
-            }
-        };
-        self.offset as u64 + (self.stride as u64) * rows
+        let p0 = self.plane0_min_bytes();
+        match self.plane1_min_bytes() {
+            Some(p1) if p1 > p0 => p1,
+            _ => p0,
+        }
     }
 
     /// The layout is valid and fits an object of `size` bytes.
@@ -250,13 +505,16 @@ impl Layout {
 pub enum RequestError {
     /// `ctx_id`, `rm_handle` or `gem_handle` is 0 (none of them can be).
     ZeroId,
-    /// `flags` has a bit this KMD does not know.
+    /// `flags` has a bit this KMD does not know, or [`FLAG_PLANE1`] disagrees with
+    /// the decoded layout (the flag set with no plane tail, or a tail with the
+    /// flag clear).
     Flags,
     /// `size` is 0 or not a whole number of pages.
     Size,
     /// `size` is over [`MAX_FOREIGN_RESOURCE_BYTES`].
     TooLarge,
-    /// No layout was supplied ([`FLAG_LAYOUT`] clear). Not optional.
+    /// No layout was supplied ([`FLAG_LAYOUT`] clear, which includes
+    /// [`FLAG_PLANE1`] alone). Not optional.
     LayoutRequired,
     /// The layout is invalid, or does not fit `size`.
     Layout(LayoutError),
@@ -267,7 +525,8 @@ pub enum RequestError {
 /// Returns the layout to record.
 ///
 /// `layout` is what the escape layer decoded from the tail when
-/// [`FLAG_LAYOUT`] is set, else `None`.
+/// [`FLAG_LAYOUT`] is set (with `plane1` from the 16-byte plane tail when
+/// [`FLAG_PLANE1`] is also set), else `None`.
 pub fn validate_request(
     ctx_id: u32,
     rm_handle: u32,
@@ -279,7 +538,7 @@ pub fn validate_request(
     if ctx_id == 0 || rm_handle == 0 || gem_handle == 0 {
         return Err(RequestError::ZeroId);
     }
-    if flags & !FLAG_LAYOUT != 0 {
+    if flags & !(FLAG_LAYOUT | FLAG_PLANE1) != 0 {
         return Err(RequestError::Flags);
     }
     if size == 0 || size % PAGE != 0 {
@@ -288,10 +547,18 @@ pub fn validate_request(
     if size > MAX_FOREIGN_RESOURCE_BYTES {
         return Err(RequestError::TooLarge);
     }
+    // `FLAG_PLANE1` without `FLAG_LAYOUT` has no layout to hang a plane on.
     let layout = match layout {
         Some(l) if flags & FLAG_LAYOUT != 0 => l,
         _ => return Err(RequestError::LayoutRequired),
     };
+    // The flag says whether the request carried the plane tail, and the escape
+    // layer decoded `plane1` from exactly that tail: the two must agree. (A
+    // two-plane fourcc without the flag, or a one-plane one with it, is then
+    // `Layout(Planes)` from the check below.)
+    if (flags & FLAG_PLANE1 != 0) != layout.plane1.is_some() {
+        return Err(RequestError::Flags);
+    }
     layout.validate_for(size).map_err(RequestError::Layout)?;
     Ok(layout)
 }
@@ -455,6 +722,30 @@ pub struct Counters {
     /// Of those, attempts by a caller that is neither the creating device nor
     /// a process holding an open of the resource ([`AttachOutcome`]).
     pub attached_unsanctioned: u32,
+    // ---- shared formats (`docs/shared-formats.md`) ------------------------------------
+    /// Imports of a one-plane record outside the four 32-bit RGB formats
+    /// (`FgImpFmt`). Included in [`Counters::imported`].
+    pub imported_format: u32,
+    /// Imports of a two-plane record (`FgImp2P`). Included in [`Counters::imported`].
+    pub imported_planes: u32,
+    /// Adoptions of a two-plane record by a WDDM allocation (`FgAdo2P`). Included in
+    /// [`Counters::adopted`].
+    pub adopted_planes: u32,
+    /// Requests refused for a fourcc outside [`share_format`] (`FgRefFmt`). Included in
+    /// [`Counters::refused_request`].
+    pub refused_format: u32,
+    /// Requests refused because the plane tail and the format disagree: a plane on a
+    /// one-plane format, none on a two-plane one, or [`FLAG_PLANE1`] against the tail
+    /// (`FgRefPln`). Included in [`Counters::refused_request`].
+    pub refused_planes: u32,
+    /// Requests for a shared format beyond the four 32-bit ones refused for their
+    /// geometry, stride, modifier or size (`FgRefNewG`). Included in
+    /// [`Counters::refused_request`].
+    pub refused_new_geometry: u32,
+    /// Adoptions of a two-plane record refused for want of the 144-byte private data
+    /// (`FgAdoNoPln`, [`AdoptRefusal::NoPlaneRoom`]). Included in
+    /// [`Counters::refused_adopt`].
+    pub refused_no_plane_room: u32,
 }
 
 impl Counters {
@@ -499,6 +790,9 @@ pub struct AdoptRequest {
     /// The allocation's private-data buffer can take the layout trailer the KMD
     /// writes back for openers.
     pub trailer_room: bool,
+    /// The buffer can also take plane 1 after it (at least
+    /// [`PRIVATE_WITH_PLANES_BYTES`] bytes): required to adopt a two-plane record.
+    pub plane_room: bool,
 }
 
 /// What a foreign adoption yields.
@@ -535,6 +829,7 @@ impl AdoptRefusal {
             Self::GeometryMismatch => 9,
             Self::LayoutMismatch => 10,
             Self::ClaimTooLarge => 11,
+            Self::NoPlaneRoom => 12,
         }
     }
 }
@@ -565,6 +860,9 @@ pub enum AdoptRefusal {
     LayoutMismatch,
     /// `claimed_alloc_size` is over the recorded size.
     ClaimTooLarge,
+    /// The record has two planes and the private data cannot take the version-2
+    /// trailer (under [`PRIVATE_WITH_PLANES_BYTES`]).
+    NoPlaneRoom,
 }
 
 /// One process's opens of one adopted allocation.
@@ -793,6 +1091,11 @@ impl ForeignTable {
             file_closed: false,
         });
         self.counters.imported = self.counters.imported.saturating_add(1);
+        if layout.plane1.is_some() {
+            self.counters.imported_planes = self.counters.imported_planes.saturating_add(1);
+        } else if !is_rgb32_fourcc(layout.fourcc) {
+            self.counters.imported_format = self.counters.imported_format.saturating_add(1);
+        }
         let live = self.entries.len() as u32;
         if live > self.counters.live_high_water {
             self.counters.live_high_water = live;
@@ -817,6 +1120,9 @@ impl ForeignTable {
             Some(e) => {
                 e.creator = None;
                 self.counters.adopted = self.counters.adopted.saturating_add(1);
+                if e.layout.plane1.is_some() {
+                    self.counters.adopted_planes = self.counters.adopted_planes.saturating_add(1);
+                }
                 true
             }
             None => false,
@@ -922,7 +1228,7 @@ impl ForeignTable {
     /// record, creator None ........................... AlreadyAdopted
     /// ctx != record ctx / ctx not creator's .......... ContextMismatch / ContextGone
     /// slot not creator's ............................. SlotNotCreators
-    /// no room / geometry / format differ ............. NoTrailerRoom / GeometryMismatch / LayoutMismatch
+    /// no room / geometry / format differ ............. NoTrailerRoom / NoPlaneRoom / GeometryMismatch / LayoutMismatch
     /// claim over recorded size ....................... ClaimTooLarge
     /// otherwise ...................................... creator := None; Foreign(..)
     /// ```
@@ -957,6 +1263,8 @@ impl ForeignTable {
             Some(AdoptRefusal::SlotNotCreators)
         } else if !req.trailer_room {
             Some(AdoptRefusal::NoTrailerRoom)
+        } else if e.layout.plane1.is_some() && !req.plane_room {
+            Some(AdoptRefusal::NoPlaneRoom)
         } else if req.width != e.layout.width
             || req.height != e.layout.height
             || req.pitch != e.layout.stride
@@ -986,6 +1294,10 @@ impl ForeignTable {
 
     fn refuse_adopt(&mut self, r: AdoptRefusal) -> AdoptRefusal {
         self.counters.refused_adopt = self.counters.refused_adopt.saturating_add(1);
+        if r == AdoptRefusal::NoPlaneRoom {
+            self.counters.refused_no_plane_room =
+                self.counters.refused_no_plane_room.saturating_add(1);
+        }
         r
     }
 
@@ -1162,6 +1474,35 @@ impl ForeignTable {
         }
     }
 
+    /// Count an import request [`validate_request`] refused: [`RefusalKind::BadRequest`],
+    /// plus the shared-format reasons. `layout` is the decoded layout the request
+    /// carried, if any (`None` when it carried none).
+    pub fn note_request_refusal(&mut self, why: RequestError, layout: Option<&Layout>) {
+        self.note_refusal(RefusalKind::BadRequest);
+        let c = &mut self.counters;
+        match why {
+            RequestError::Layout(LayoutError::Format) => {
+                c.refused_format = c.refused_format.saturating_add(1);
+            }
+            RequestError::Layout(LayoutError::Planes) => {
+                c.refused_planes = c.refused_planes.saturating_add(1);
+            }
+            // The flag and the tail disagree (the escape layer builds both from the one
+            // request, so this is a caller that set a plane tail without the flag bit's
+            // meaning): a plane problem, not an unknown bit.
+            RequestError::Flags if layout.is_some_and(|l| l.plane1.is_some()) => {
+                c.refused_planes = c.refused_planes.saturating_add(1);
+            }
+            RequestError::Layout(_) => {
+                // A known shared format beyond the 32-bit four whose geometry was refused.
+                if layout.is_some_and(|l| share_format(l.fourcc).is_some() && !l.is_rgb32()) {
+                    c.refused_new_geometry = c.refused_new_geometry.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Count a request that never produced a reservation or a resource.
     pub fn note_refusal(&mut self, kind: RefusalKind) {
         let c = match kind {
@@ -1210,6 +1551,7 @@ mod tests {
             offset: 0,
             fourcc: FOURCC_XRGB8888,
             modifier: MOD_LINEAR,
+            plane1: None,
         }
     }
 
@@ -1240,12 +1582,13 @@ mod tests {
             validate_request(1, 2, 0, FLAG_LAYOUT, 8 * MIB, Some(lay())),
             Err(RequestError::ZeroId)
         );
-        // An unknown flag bit is refused, with or without the layout bit.
+        // An unknown flag bit is refused, with or without the layout bit. (Bit 1 is
+        // `FLAG_PLANE1` now; its own rules are in the `shared_formats` tests.)
         assert_eq!(
-            validate(FLAG_LAYOUT | 2, 8 * MIB, Some(lay())),
+            validate(FLAG_LAYOUT | 4, 8 * MIB, Some(lay())),
             Err(RequestError::Flags)
         );
-        assert_eq!(validate(2, 8 * MIB, None), Err(RequestError::Flags));
+        assert_eq!(validate(4, 8 * MIB, None), Err(RequestError::Flags));
         assert_eq!(
             validate(FLAG_LAYOUT, 0, Some(lay())),
             Err(RequestError::Size)
@@ -1294,8 +1637,10 @@ mod tests {
         ] {
             assert_eq!(Layout { fourcc: f, ..lay() }.validate(), Ok(()));
         }
-        // 'RG16' (RGB565), 'AB4H', 0: not forwarded.
-        for f in [0x3631_4752, 0x4834_4241, 0] {
+        // 'BG24' (BGR888), 'XR30' (XRGB2101010), 0: real or empty fourccs that are
+        // not shared, so not forwarded. (RGB565 and the fp16 formats were here before
+        // the shared formats; they are accepted now, see `shared_formats`.)
+        for f in [0x3432_4742, 0x3033_5258, 0] {
             assert_eq!(
                 Layout { fourcc: f, ..lay() }.validate(),
                 Err(LayoutError::Format)
@@ -1733,6 +2078,7 @@ mod tests {
             claimed_alloc_size: 0,
             supplied_layout: None,
             trailer_room: true,
+            plane_room: true,
         }
     }
 
@@ -2384,5 +2730,1578 @@ mod tests {
         assert!(adopt(&mut t, &req()).is_ok());
         assert_eq!(t.sysmem_source(50), None);
         assert!(!t.cpu_mappable(50));
+    }
+}
+
+/// The shared formats (`docs/shared-formats.md`): one test per rule of section 5.
+#[cfg(test)]
+mod shared_format_tests {
+    extern crate std;
+    use super::*;
+    use std::vec::Vec;
+
+    const MIB: u64 = 1 << 20;
+    const BL: u64 = MOD_NVIDIA_BLOCK_LINEAR_BASE;
+
+    /// (fourcc, name, bytes per texel of plane 0, texel columns per pixel divisor)
+    /// for every one-plane format of the table, the four 32-bit RGB ones first.
+    const ONE_PLANE: [(u32, &str, u32, u32); 15] = [
+        (FOURCC_XRGB8888, "XRGB8888", 4, 1),
+        (FOURCC_ARGB8888, "ARGB8888", 4, 1),
+        (FOURCC_XBGR8888, "XBGR8888", 4, 1),
+        (FOURCC_ABGR8888, "ABGR8888", 4, 1),
+        (FOURCC_R8, "R8", 1, 1),
+        (FOURCC_GR88, "GR88", 2, 1),
+        (FOURCC_R16, "R16", 2, 1),
+        (FOURCC_GR1616, "GR1616", 4, 1),
+        (FOURCC_RGB565, "RGB565", 2, 1),
+        (FOURCC_ARGB1555, "ARGB1555", 2, 1),
+        (FOURCC_ARGB4444, "ARGB4444", 2, 1),
+        (FOURCC_ABGR2101010, "ABGR2101010", 4, 1),
+        (FOURCC_ABGR16161616F, "ABGR16161616F", 8, 1),
+        (FOURCC_ABGR16161616, "ABGR16161616", 8, 1),
+        (FOURCC_YUYV, "YUYV", 4, 2),
+    ];
+    /// (fourcc, name, bytes per texel of plane 0); plane 1 is twice that.
+    const TWO_PLANE: [(u32, &str, u32); 3] = [
+        (FOURCC_NV12, "NV12", 1),
+        (FOURCC_P010, "P010", 2),
+        (FOURCC_P016, "P016", 2),
+    ];
+    /// Fourccs that are real DRM formats nobody shares here, and zero.
+    const UNSHARED: [u32; 6] = [
+        0,
+        0x3432_4742,     // 'BG24' BGR888
+        0x3033_5258,     // 'XR30' XRGB2101010
+        0x3231_5659,     // 'YV12' (three planes)
+        0x3231_564e + 1, // not a fourcc at all
+        u32::MAX,
+    ];
+
+    fn rup(x: u64, to: u64) -> u64 {
+        x.div_ceil(to) * to
+    }
+
+    fn row0(bpp: u32, hdiv: u32, w: u32) -> u32 {
+        (w.div_ceil(hdiv) * bpp) as u32
+    }
+
+    fn one(fourcc: u32, w: u32, h: u32, stride: u32) -> Layout {
+        Layout {
+            width: w,
+            height: h,
+            stride,
+            offset: 0,
+            fourcc,
+            modifier: MOD_LINEAR,
+            plane1: None,
+        }
+    }
+
+    /// A two-plane layout packed back to back, LINEAR, plane 1 at plane 0's end.
+    fn two(fourcc: u32, w: u32, h: u32) -> Layout {
+        let (_, _, bpp) = *TWO_PLANE.iter().find(|t| t.0 == fourcc).unwrap();
+        let s0 = w * bpp;
+        let s1 = w.div_ceil(2) * bpp * 2;
+        Layout {
+            width: w,
+            height: h,
+            stride: s0,
+            offset: 0,
+            fourcc,
+            modifier: MOD_LINEAR,
+            plane1: Some(Plane {
+                stride: s1,
+                offset: s0 * h,
+                modifier: MOD_LINEAR,
+            }),
+        }
+    }
+
+    /// `l` with plane 1 given block-linear moduli `h0`/`h1`, offset kept past plane 0.
+    fn two_bl(fourcc: u32, w: u32, h: u32, h0: u64, h1: u64) -> Layout {
+        let mut l = two(fourcc, w, h);
+        l.modifier = BL | h0;
+        let off = l.plane0_min_bytes();
+        let p = l.plane1.as_mut().unwrap();
+        p.modifier = BL | h1;
+        p.offset = off as u32;
+        l
+    }
+
+    // ---- the table -----------------------------------------------------------------
+
+    #[test]
+    fn the_table_is_the_documented_one() {
+        // fourcc, planes, bpp0, bpp1, hdiv0, even width, even height: section 2 of the doc.
+        let rows: [(u32, (u32, u32, u32, u32, bool, bool)); 18] = [
+            (0x3432_5258, (1, 4, 0, 1, false, false)),
+            (0x3432_5241, (1, 4, 0, 1, false, false)),
+            (0x3432_4258, (1, 4, 0, 1, false, false)),
+            (0x3432_4241, (1, 4, 0, 1, false, false)),
+            (0x2020_3852, (1, 1, 0, 1, false, false)),
+            (0x3838_5247, (1, 2, 0, 1, false, false)),
+            (0x2036_3152, (1, 2, 0, 1, false, false)),
+            (0x3233_5247, (1, 4, 0, 1, false, false)),
+            (0x3631_4752, (1, 2, 0, 1, false, false)),
+            (0x3531_5241, (1, 2, 0, 1, false, false)),
+            (0x3231_5241, (1, 2, 0, 1, false, false)),
+            (0x3033_4241, (1, 4, 0, 1, false, false)),
+            (0x4834_4241, (1, 8, 0, 1, false, false)),
+            (0x3834_4241, (1, 8, 0, 1, false, false)),
+            (0x5659_5559, (1, 4, 0, 2, true, false)),
+            (0x3231_564E, (2, 1, 2, 1, true, true)),
+            (0x3031_3050, (2, 2, 4, 1, true, true)),
+            (0x3631_3050, (2, 2, 4, 1, true, true)),
+        ];
+        for (fourcc, (planes, bpp0, bpp1, hdiv0, ew, eh)) in rows {
+            let f = share_format(fourcc).unwrap_or_else(|| panic!("{fourcc:#x} missing"));
+            assert_eq!(
+                (
+                    f.planes,
+                    f.bpp0,
+                    f.bpp1,
+                    f.hdiv0,
+                    f.even_width,
+                    f.even_height
+                ),
+                (planes, bpp0, bpp1, hdiv0, ew, eh),
+                "{fourcc:#x}"
+            );
+        }
+        // The constants spell the DRM fourccs.
+        let cc = |s: &[u8; 4]| u32::from_le_bytes(*s);
+        assert_eq!(FOURCC_R8, cc(b"R8  "));
+        assert_eq!(FOURCC_GR88, cc(b"GR88"));
+        assert_eq!(FOURCC_R16, cc(b"R16 "));
+        assert_eq!(FOURCC_GR1616, cc(b"GR32"));
+        assert_eq!(FOURCC_RGB565, cc(b"RG16"));
+        assert_eq!(FOURCC_ARGB1555, cc(b"AR15"));
+        assert_eq!(FOURCC_ARGB4444, cc(b"AR12"));
+        assert_eq!(FOURCC_ABGR2101010, cc(b"AB30"));
+        assert_eq!(FOURCC_ABGR16161616F, cc(b"AB4H"));
+        assert_eq!(FOURCC_ABGR16161616, cc(b"AB48"));
+        assert_eq!(FOURCC_YUYV, cc(b"YUYV"));
+        assert_eq!(FOURCC_NV12, cc(b"NV12"));
+        assert_eq!(FOURCC_P010, cc(b"P010"));
+        assert_eq!(FOURCC_P016, cc(b"P016"));
+        // Nothing else is in it, and the unshared ones have no row.
+        for f in UNSHARED {
+            assert_eq!(share_format(f), None, "{f:#x}");
+        }
+        let known = ONE_PLANE.len() + TWO_PLANE.len();
+        assert_eq!(known, rows.len());
+        // The two lists above cover exactly the table.
+        let mut seen: Vec<u32> = ONE_PLANE.iter().map(|t| t.0).collect();
+        seen.extend(TWO_PLANE.iter().map(|t| t.0));
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), known);
+        for (f, _) in rows {
+            assert!(seen.contains(&f));
+        }
+    }
+
+    #[test]
+    fn share_format_helpers_follow_the_doc() {
+        let yuyv = share_format(FOURCC_YUYV).unwrap();
+        assert_eq!(yuyv.row_bytes(0, 1920), 3840); // ceil(w/2) * 4
+        assert_eq!(yuyv.row_bytes(0, 2), 4);
+        let nv = share_format(FOURCC_NV12).unwrap();
+        assert_eq!(nv.row_bytes(0, 1920), 1920);
+        assert_eq!(nv.row_bytes(1, 1920), 1920); // 960 chroma pairs of 2 bytes
+        assert_eq!(nv.rows(1, 1080), 540);
+        assert_eq!(nv.rows(1, 1), 1); // ceil
+        assert_eq!((nv.stride_align(0), nv.stride_align(1)), (1, 2));
+        let p = share_format(FOURCC_P010).unwrap();
+        assert_eq!(p.row_bytes(1, 1920), 3840);
+        assert_eq!((p.stride_align(0), p.stride_align(1)), (2, 4));
+        // The alignment never exceeds 4, whatever the texel size.
+        for f in [FOURCC_ABGR16161616F, FOURCC_ABGR16161616] {
+            assert_eq!(share_format(f).unwrap().stride_align(0), 4);
+        }
+        assert_eq!(share_format(FOURCC_R8).unwrap().stride_align(0), 1);
+        assert!(is_rgb32_fourcc(FOURCC_XRGB8888) && !is_rgb32_fourcc(FOURCC_R8));
+        assert!(!is_rgb32_fourcc(0));
+    }
+
+    // ---- one-plane formats -------------------------------------------------------
+
+    #[test]
+    fn every_one_plane_format_is_valid_tight_padded_and_at_its_limits() {
+        for (f, name, bpp, hdiv) in ONE_PLANE {
+            let dims: &[(u32, u32)] = if hdiv == 2 {
+                &[(2, 1), (2, 2), (64, 63), (1920, 1080), (16384, 16384)]
+            } else {
+                &[
+                    (1, 1),
+                    (3, 5),
+                    (64, 64),
+                    (1919, 1079),
+                    (1920, 1080),
+                    (16384, 16384),
+                ]
+            };
+            for &(w, h) in dims {
+                let row = row0(bpp, hdiv, w);
+                let l = one(f, w, h, row);
+                assert_eq!(l.validate(), Ok(()), "{name} {w}x{h}");
+                assert_eq!(l.min_bytes(), u64::from(row) * u64::from(h), "{name}");
+                assert_eq!(l.validate_for(l.min_bytes()), Ok(()), "{name}");
+                assert_eq!(
+                    l.validate_for(l.min_bytes() - 1),
+                    Err(LayoutError::TooLarge),
+                    "{name}"
+                );
+                // Padding past the row, at the format's alignment, is fine.
+                let align = bpp.min(4);
+                let padded = one(f, w, h, row + 64 * align);
+                if padded.stride <= MAX_STRIDE {
+                    assert_eq!(padded.validate(), Ok(()), "{name} padded");
+                }
+                // An offset moves the bound.
+                let moved = Layout {
+                    offset: 0x1000,
+                    ..l
+                };
+                assert_eq!(moved.min_bytes(), l.min_bytes() + 0x1000);
+            }
+        }
+    }
+
+    #[test]
+    fn one_plane_stride_rules_per_format() {
+        for (f, name, bpp, hdiv) in ONE_PLANE {
+            let w = if hdiv == 2 { 1920 } else { 1919 };
+            let row = row0(bpp, hdiv, w);
+            let align = bpp.min(4);
+            // One byte under the row, or one alignment under it.
+            assert_eq!(
+                one(f, w, 8, row - 1).validate(),
+                Err(LayoutError::Stride),
+                "{name} under"
+            );
+            assert_eq!(
+                one(f, w, 8, row - align).validate(),
+                Err(LayoutError::Stride),
+                "{name} under by one unit"
+            );
+            // Off the alignment (only formats with texels over a byte have one). The row
+            // itself is on it, so row + 1 is off it.
+            if align > 1 {
+                assert_eq!(
+                    one(f, w, 8, row + 1).validate(),
+                    Err(LayoutError::Stride),
+                    "{name} misaligned"
+                );
+                assert_eq!(
+                    one(f, w, 8, row + align - 1).validate(),
+                    Err(LayoutError::Stride),
+                    "{name} misaligned by align-1"
+                );
+            } else {
+                assert_eq!(
+                    one(f, w, 8, row + 1).validate(),
+                    Ok(()),
+                    "{name} byte stride"
+                );
+            }
+            // The cap is on the stride, not the row.
+            let big = MAX_STRIDE; // a multiple of every alignment
+            assert_eq!(one(f, 64, 8, big).validate(), Ok(()), "{name} at cap");
+            assert_eq!(
+                one(f, 64, 8, big + align).validate(),
+                Err(LayoutError::Stride),
+                "{name} over cap"
+            );
+            assert_eq!(
+                one(f, 64, 8, u32::MAX - (u32::MAX % align)).validate(),
+                Err(LayoutError::Stride),
+                "{name} u32 max"
+            );
+            assert_eq!(
+                one(f, 64, 8, 0).validate(),
+                Err(LayoutError::Stride),
+                "{name} 0"
+            );
+        }
+    }
+
+    #[test]
+    fn the_documented_strides_of_the_doc_examples() {
+        // R8 1920x1080: a stride of 1920 is enough (1-byte texels, no alignment).
+        assert_eq!(one(FOURCC_R8, 1920, 1080, 1920).validate(), Ok(()));
+        assert_eq!(
+            one(FOURCC_R8, 1920, 1080, 1919).validate(),
+            Err(LayoutError::Stride)
+        );
+        assert_eq!(one(FOURCC_R8, 1920, 1080, 1921).validate(), Ok(()));
+        // fp16 stride 8 * w.
+        assert_eq!(
+            one(FOURCC_ABGR16161616F, 1920, 1080, 8 * 1920).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            one(FOURCC_ABGR16161616F, 1920, 1080, 8 * 1920 - 4).validate(),
+            Err(LayoutError::Stride)
+        );
+        // The 32 bpp ones keep their `width * 4`, multiple of 4.
+        assert_eq!(one(FOURCC_ARGB8888, 1920, 1080, 7680).validate(), Ok(()));
+        assert_eq!(
+            one(FOURCC_ARGB8888, 1920, 1080, 7676).validate(),
+            Err(LayoutError::Stride)
+        );
+        // YUYV row is ceil(w/2) * 4.
+        assert_eq!(one(FOURCC_YUYV, 1920, 1080, 3840).validate(), Ok(()));
+        assert_eq!(
+            one(FOURCC_YUYV, 1920, 1080, 3836).validate(),
+            Err(LayoutError::Stride)
+        );
+    }
+
+    #[test]
+    fn extent_rules_per_format() {
+        for (f, name, bpp, hdiv) in ONE_PLANE {
+            let ok = |w: u32, h: u32| one(f, w, h, row0(bpp, hdiv, w.max(2)).max(1));
+            // Zero and over-limit extents, both axes.
+            assert_eq!(
+                Layout {
+                    width: 0,
+                    ..ok(2, 2)
+                }
+                .validate(),
+                Err(LayoutError::Dimensions),
+                "{name}"
+            );
+            assert_eq!(
+                Layout {
+                    height: 0,
+                    ..ok(2, 2)
+                }
+                .validate(),
+                Err(LayoutError::Dimensions),
+                "{name}"
+            );
+            assert_eq!(
+                Layout {
+                    width: MAX_DIM + 1,
+                    stride: MAX_STRIDE,
+                    ..ok(2, 2)
+                }
+                .validate(),
+                Err(LayoutError::Dimensions),
+                "{name}"
+            );
+            assert_eq!(
+                Layout {
+                    height: MAX_DIM + 1,
+                    ..ok(2, 2)
+                }
+                .validate(),
+                Err(LayoutError::Dimensions),
+                "{name}"
+            );
+            assert_eq!(
+                Layout {
+                    width: u32::MAX,
+                    height: u32::MAX,
+                    ..ok(2, 2)
+                }
+                .validate(),
+                Err(LayoutError::Dimensions),
+                "{name}"
+            );
+            // Odd width is refused only where the format subsamples horizontally
+            // (YUYV); odd height by none of the one-plane formats.
+            let odd_w = one(f, 3, 2, row0(bpp, hdiv, 3));
+            if hdiv == 2 {
+                assert_eq!(
+                    odd_w.validate(),
+                    Err(LayoutError::Dimensions),
+                    "{name} odd w"
+                );
+            } else {
+                assert_eq!(odd_w.validate(), Ok(()), "{name} odd w");
+            }
+            assert_eq!(
+                one(f, 4, 3, row0(bpp, hdiv, 4)).validate(),
+                Ok(()),
+                "{name} odd h"
+            );
+            // Exactly the limits are in.
+            assert_eq!(
+                one(f, MAX_DIM, MAX_DIM, row0(bpp, hdiv, MAX_DIM)).validate(),
+                Ok(()),
+                "{name} 16384"
+            );
+            assert_eq!(
+                one(f, 2, 1, row0(bpp, hdiv, 2)).validate(),
+                Ok(()),
+                "{name} 2x1"
+            );
+        }
+    }
+
+    #[test]
+    fn one_plane_formats_refuse_a_plane_1() {
+        // Spec test: a plane tail on a one-plane fourcc is `Planes`, and it is checked
+        // before the plane's own fields (a plane that would be valid on NV12).
+        let p = Plane {
+            stride: 4096,
+            offset: 0x100_0000,
+            modifier: MOD_LINEAR,
+        };
+        for (f, name, bpp, hdiv) in ONE_PLANE {
+            let l = Layout {
+                plane1: Some(p),
+                ..one(f, 64, 64, row0(bpp, hdiv, 64))
+            };
+            assert_eq!(l.validate(), Err(LayoutError::Planes), "{name}");
+            assert_eq!(l.validate_for(u64::MAX), Err(LayoutError::Planes), "{name}");
+        }
+    }
+
+    // ---- block-linear, one plane ---------------------------------------------------
+
+    #[test]
+    fn block_linear_heights_round_rows_to_the_block_for_every_format() {
+        for (f, name, bpp, hdiv) in ONE_PLANE {
+            for &(w, h) in &[(64u32, 1080u32), (128, 1), (130, 257), (128, 8), (128, 256)] {
+                let w = if hdiv == 2 { w & !1 } else { w };
+                let row = row0(bpp, hdiv, w);
+                for hh in 0..=5u64 {
+                    let l = Layout {
+                        modifier: BL | hh,
+                        ..one(f, w, h, row)
+                    };
+                    assert_eq!(l.validate(), Ok(()), "{name} h{hh}");
+                    assert_eq!(l.block_height_log2(), Some(hh as u32));
+                    let block = 8u64 << hh;
+                    let want = u64::from(row) * rup(u64::from(h), block);
+                    assert_eq!(l.min_bytes(), want, "{name} {w}x{h} h{hh}");
+                    assert_eq!(l.validate_for(want), Ok(()));
+                    assert_eq!(l.validate_for(want - 1), Err(LayoutError::TooLarge));
+                }
+                // h = 6 and the neighbours of the family are refused.
+                for m in [BL | 6, BL - 1, BL + 6, 1, 0x0100_0000_0000_0001, u64::MAX] {
+                    assert_eq!(
+                        Layout {
+                            modifier: m,
+                            ..one(f, w, h, row)
+                        }
+                        .validate(),
+                        Err(LayoutError::Modifier),
+                        "{name} {m:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r8_1080p_linear_and_block_linear() {
+        // The doc's first spec test: A8_UNORM shell surfaces.
+        let lin = one(FOURCC_R8, 1920, 1080, 1920);
+        assert_eq!(lin.min_bytes(), 1920 * 1080);
+        assert_eq!(
+            validate_request(1, 2, 3, FLAG_LAYOUT, 4 * MIB, Some(lin)),
+            Ok(lin)
+        );
+        // 2_073_600 bytes is not a page multiple: 0x1fb000 is the first page multiple
+        // that holds it, and RM (64 KiB granularity) would hand 0x200000.
+        assert_eq!(
+            validate_request(1, 2, 3, FLAG_LAYOUT, 0x1f_a000, Some(lin)),
+            Err(RequestError::Layout(LayoutError::TooLarge)),
+            "0x1fa000 is under 2073600"
+        );
+        for size in [0x1f_b000, 0x20_0000] {
+            assert_eq!(
+                validate_request(1, 2, 3, FLAG_LAYOUT, size, Some(lin)),
+                Ok(lin)
+            );
+        }
+        for hh in 0..=5u64 {
+            let bl = Layout {
+                modifier: BL | hh,
+                ..lin
+            };
+            let rows = rup(1080, 8 << hh);
+            assert_eq!(bl.min_bytes(), 1920 * rows);
+            let size = rup(bl.min_bytes(), 0x1_0000);
+            assert_eq!(
+                validate_request(1, 2, 3, FLAG_LAYOUT, size, Some(bl)),
+                Ok(bl)
+            );
+        }
+    }
+
+    // ---- two-plane formats ---------------------------------------------------------
+
+    #[test]
+    fn nv12_1080p_plane_1_at_the_end_of_plane_0() {
+        let l = two(FOURCC_NV12, 1920, 1080);
+        let p1 = l.plane1.unwrap();
+        assert_eq!((l.stride, p1.stride), (1920, 1920));
+        assert_eq!(p1.offset as u64, l.plane0_min_bytes());
+        assert_eq!(p1.offset, 1920 * 1080);
+        assert_eq!(l.plane0_min_bytes(), 2_073_600);
+        assert_eq!(l.plane1_min_bytes(), Some(2_073_600 + 1920 * 540));
+        assert_eq!(l.min_bytes(), 3_110_400);
+        assert_eq!(l.plane_count(), 2);
+        assert!(!l.is_rgb32());
+        assert_eq!(l.validate(), Ok(()));
+        assert_eq!(l.validate_for(3_110_400), Ok(()));
+        assert_eq!(l.validate_for(3_110_399), Err(LayoutError::TooLarge));
+        // Plane 0's bound alone is not enough: plane 1 is past it.
+        assert_eq!(l.validate_for(2_073_600), Err(LayoutError::TooLarge));
+        // Through the request, with the flag.
+        assert_eq!(
+            validate_request(1, 2, 3, FLAG_LAYOUT | FLAG_PLANE1, 0x2f_8000, Some(l)),
+            Ok(l)
+        );
+        assert_eq!(
+            validate_request(1, 2, 3, FLAG_LAYOUT | FLAG_PLANE1, 0x2f_7000, Some(l)),
+            Err(RequestError::Layout(LayoutError::TooLarge))
+        );
+    }
+
+    #[test]
+    fn p010_and_p016_1080p() {
+        for f in [FOURCC_P010, FOURCC_P016] {
+            let l = two(f, 1920, 1080);
+            let p1 = l.plane1.unwrap();
+            assert_eq!((l.stride, p1.stride), (3840, 3840));
+            assert_eq!(l.min_bytes(), 3840 * 1080 + 3840 * 540);
+            assert_eq!(l.validate(), Ok(()));
+            assert_eq!(l.validate_for(l.min_bytes()), Ok(()));
+            assert_eq!(
+                l.validate_for(l.min_bytes() - 1),
+                Err(LayoutError::TooLarge)
+            );
+        }
+    }
+
+    #[test]
+    fn two_plane_formats_across_extents() {
+        for (f, name, _) in TWO_PLANE {
+            for &(w, h) in &[
+                (2u32, 2u32),
+                (2, 4),
+                (4, 2),
+                (64, 64),
+                (1280, 720),
+                (3840, 2160),
+                (16384, 16384),
+            ] {
+                let l = two(f, w, h);
+                assert_eq!(l.validate(), Ok(()), "{name} {w}x{h}");
+                let p1 = l.plane1.unwrap();
+                let sh = share_format(f).unwrap();
+                assert_eq!(u64::from(l.stride), sh.row_bytes(0, w));
+                assert_eq!(u64::from(p1.stride), sh.row_bytes(1, w));
+                assert_eq!(
+                    l.min_bytes(),
+                    u64::from(l.stride) * u64::from(h)
+                        + u64::from(p1.stride) * u64::from(sh.rows(1, h)),
+                    "{name} {w}x{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_plane_extent_must_be_even_on_both_axes() {
+        for (f, name, _) in TWO_PLANE {
+            let good = two(f, 64, 64);
+            for (w, h) in [(63u32, 64u32), (64, 63), (63, 63), (1, 1), (1, 2), (2, 1)] {
+                let l = Layout {
+                    width: w,
+                    height: h,
+                    ..good
+                };
+                assert_eq!(l.validate(), Err(LayoutError::Dimensions), "{name} {w}x{h}");
+            }
+            for (w, h) in [(0u32, 64u32), (64, 0), (MAX_DIM + 1, 64), (64, MAX_DIM + 1)] {
+                let l = Layout {
+                    width: w,
+                    height: h,
+                    ..good
+                };
+                assert_eq!(l.validate(), Err(LayoutError::Dimensions), "{name} {w}x{h}");
+            }
+        }
+        // Plane 1's chroma extent is ceil(w/2) x ceil(h/2): an even 2x2 has 1x1 chroma.
+        let l = two(FOURCC_NV12, 2, 2);
+        assert_eq!(l.plane1.unwrap().stride, 2);
+        assert_eq!(l.plane1_min_bytes(), Some(4 + 2));
+    }
+
+    #[test]
+    fn plane_presence_must_match_the_format() {
+        // Spec: NV12 without plane 1, and each one-plane format with one.
+        for (f, name, _) in TWO_PLANE {
+            let l = Layout {
+                plane1: None,
+                ..two(f, 64, 64)
+            };
+            assert_eq!(l.validate(), Err(LayoutError::Planes), "{name}");
+            assert_eq!(l.validate_for(u64::MAX), Err(LayoutError::Planes), "{name}");
+        }
+        // Order of the checks: the extent and the fourcc first.
+        let nv_no_plane = Layout {
+            plane1: None,
+            width: 0,
+            ..two(FOURCC_NV12, 64, 64)
+        };
+        assert_eq!(nv_no_plane.validate(), Err(LayoutError::Dimensions));
+        let unknown_with_plane = Layout {
+            fourcc: 0,
+            ..two(FOURCC_NV12, 64, 64)
+        };
+        assert_eq!(unknown_with_plane.validate(), Err(LayoutError::Format));
+        // `Planes` before the even-extent rule: an odd NV12 with no plane is Planes.
+        let odd_no_plane = Layout {
+            plane1: None,
+            width: 63,
+            ..two(FOURCC_NV12, 64, 64)
+        };
+        assert_eq!(odd_no_plane.validate(), Err(LayoutError::Planes));
+    }
+
+    #[test]
+    fn plane_1_stride_rules() {
+        for (f, name, bpp) in TWO_PLANE {
+            let good = two(f, 1920, 1080);
+            let row1 = 960 * bpp * 2;
+            let align1 = (bpp * 2).min(4);
+            let with = |stride: u32| {
+                let mut l = good;
+                l.plane1.as_mut().unwrap().stride = stride;
+                l
+            };
+            assert_eq!(with(row1).validate(), Ok(()), "{name}");
+            assert_eq!(
+                with(row1 + align1 * 100).validate(),
+                Ok(()),
+                "{name} padded"
+            );
+            assert_eq!(
+                with(row1 - 1).validate(),
+                Err(LayoutError::Stride),
+                "{name}"
+            );
+            assert_eq!(
+                with(row1 - align1).validate(),
+                Err(LayoutError::Stride),
+                "{name}"
+            );
+            assert_eq!(
+                with(row1 + 1).validate(),
+                Err(LayoutError::Stride),
+                "{name} misaligned"
+            );
+            assert_eq!(with(0).validate(), Err(LayoutError::Stride), "{name}");
+            assert_eq!(
+                with(MAX_STRIDE + align1).validate(),
+                Err(LayoutError::Stride),
+                "{name}"
+            );
+            assert_eq!(
+                with(u32::MAX).validate(),
+                Err(LayoutError::Stride),
+                "{name}"
+            );
+            // Plane 0's stride rule is its own: NV12 bytes need no alignment.
+            let p0 = |stride: u32| Layout { stride, ..good };
+            assert_eq!(
+                p0(good.stride - 1).validate(),
+                Err(LayoutError::Stride),
+                "{name} p0"
+            );
+        }
+        // NV12 plane 0 may be padded by one byte; plane 1 may not (2-byte texels).
+        let nv = two(FOURCC_NV12, 1920, 1080);
+        let mut padded0 = Layout { stride: 1921, ..nv };
+        padded0.plane1.as_mut().unwrap().offset = 1921 * 1080;
+        assert_eq!(padded0.validate(), Ok(()));
+        let mut odd_p1 = nv;
+        odd_p1.plane1.as_mut().unwrap().stride = 1921;
+        assert_eq!(odd_p1.validate(), Err(LayoutError::Stride));
+        // P010 plane 1 has 4-byte texels: 3842 is off the alignment.
+        let mut p010 = two(FOURCC_P010, 1920, 1080);
+        p010.plane1.as_mut().unwrap().stride = 3842;
+        assert_eq!(p010.validate(), Err(LayoutError::Stride));
+    }
+
+    #[test]
+    fn plane_modifiers_linear_together_and_h_may_differ() {
+        for (f, name, _) in TWO_PLANE {
+            // Every h0 / h1 pair of the family is valid, plane 1 placed past plane 0.
+            for h0 in 0..=5u64 {
+                for h1 in 0..=5u64 {
+                    let l = two_bl(f, 1920, 1080, h0, h1);
+                    assert_eq!(l.validate(), Ok(()), "{name} {h0}/{h1}");
+                    let want0 = u64::from(l.stride) * rup(1080, 8 << h0);
+                    assert_eq!(l.plane0_min_bytes(), want0);
+                    let p1 = l.plane1.unwrap();
+                    assert_eq!(p1.offset as u64, want0);
+                    assert_eq!(
+                        l.plane1_min_bytes(),
+                        Some(want0 + u64::from(p1.stride) * rup(540, 8 << h1)),
+                        "{name} {h0}/{h1}"
+                    );
+                    assert_eq!(l.min_bytes(), l.plane1_min_bytes().unwrap());
+                }
+            }
+            // Mixed LINEAR / block-linear, both ways, is refused.
+            let mut lin0 = two(f, 1920, 1080);
+            lin0.plane1.as_mut().unwrap().modifier = BL | 2;
+            assert_eq!(
+                lin0.validate(),
+                Err(LayoutError::Modifier),
+                "{name} lin0/bl1"
+            );
+            let mut bl0 = two_bl(f, 1920, 1080, 3, 3);
+            bl0.plane1.as_mut().unwrap().modifier = MOD_LINEAR;
+            assert_eq!(
+                bl0.validate(),
+                Err(LayoutError::Modifier),
+                "{name} bl0/lin1"
+            );
+            // Plane 1's modifier is held to the family like plane 0's.
+            for m in [BL | 6, BL - 1, 1, 0x0100_0000_0000_0001, u64::MAX] {
+                let mut l = two_bl(f, 1920, 1080, 2, 2);
+                l.plane1.as_mut().unwrap().modifier = m;
+                assert_eq!(l.validate(), Err(LayoutError::Modifier), "{name} p1 {m:#x}");
+                let mut l = two(f, 1920, 1080);
+                l.modifier = m;
+                l.plane1.as_mut().unwrap().modifier = m;
+                assert_eq!(l.validate(), Err(LayoutError::Modifier), "{name} p0 {m:#x}");
+            }
+        }
+        // 1080p NV12 with the heights NVK would pick: 1080 rows in 128-row blocks,
+        // 540 chroma rows in 64-row blocks.
+        let l = two_bl(FOURCC_NV12, 1920, 1080, 4, 3);
+        assert_eq!(l.plane0_min_bytes(), 1920 * 1152);
+        assert_eq!(l.plane1_min_bytes(), Some(1920 * 1152 + 1920 * 576));
+    }
+
+    #[test]
+    fn plane_1_may_not_overlap_plane_0() {
+        for (f, name, _) in TWO_PLANE {
+            let good = two(f, 1920, 1080);
+            let end0 = good.plane0_min_bytes();
+            let at = |off: u64| {
+                let mut l = good;
+                l.plane1.as_mut().unwrap().offset = off as u32;
+                l
+            };
+            // Spec: overlap refused; the boundary and anything past it is fine.
+            assert_eq!(at(end0).validate(), Ok(()), "{name}");
+            assert_eq!(at(end0 + 1).validate(), Ok(()), "{name}");
+            assert_eq!(at(end0 + 0x1_0000).validate(), Ok(()), "{name}");
+            assert_eq!(
+                at(end0 - 1).validate(),
+                Err(LayoutError::TooLarge),
+                "{name}"
+            );
+            assert_eq!(at(0).validate(), Err(LayoutError::TooLarge), "{name}");
+            assert_eq!(
+                at(0).validate_for(u64::MAX),
+                Err(LayoutError::TooLarge),
+                "{name}"
+            );
+            // A request with the overlap is refused as a layout fault.
+            assert_eq!(
+                validate_request(
+                    1,
+                    2,
+                    3,
+                    FLAG_LAYOUT | FLAG_PLANE1,
+                    64 * MIB,
+                    Some(at(end0 - 1))
+                ),
+                Err(RequestError::Layout(LayoutError::TooLarge)),
+                "{name}"
+            );
+            // Plane 0's own offset moves its end: plane 1 at the old end now overlaps.
+            let mut shifted = good;
+            shifted.offset = 0x4000;
+            assert_eq!(
+                shifted.validate(),
+                Err(LayoutError::TooLarge),
+                "{name} shifted"
+            );
+            shifted.plane1.as_mut().unwrap().offset = (end0 + 0x4000) as u32;
+            assert_eq!(shifted.validate(), Ok(()), "{name} shifted, moved");
+            // Block-linear rounding counts: plane 0's end is the rounded one.
+            let bl = two_bl(f, 1920, 1080, 5, 0);
+            let rounded_end = u64::from(bl.stride) * 1280;
+            let mut under = bl;
+            under.plane1.as_mut().unwrap().offset = (rounded_end - 1) as u32;
+            assert_eq!(
+                under.validate(),
+                Err(LayoutError::TooLarge),
+                "{name} bl overlap"
+            );
+            let mut exact = bl;
+            exact.plane1.as_mut().unwrap().offset = rounded_end as u32;
+            assert_eq!(exact.validate(), Ok(()), "{name} bl boundary");
+            // Plane 1's offset past the object is `TooLarge` through the size.
+            let far = at(0x4000_0000);
+            assert_eq!(far.validate(), Ok(()));
+            assert_eq!(
+                far.validate_for(MIB * 8),
+                Err(LayoutError::TooLarge),
+                "{name} far"
+            );
+        }
+    }
+
+    // ---- requests, flags ---------------------------------------------------------
+
+    #[test]
+    fn the_request_flags_and_the_plane_tail_must_agree() {
+        let nv = two(FOURCC_NV12, 1920, 1080);
+        let one_plane = lay1();
+        let size = 8 * MIB;
+        let v = |flags: u32, layout: Option<Layout>| validate_request(1, 2, 3, flags, size, layout);
+        let both = FLAG_LAYOUT | FLAG_PLANE1;
+        // NV12 with the flag and the tail.
+        assert_eq!(v(both, Some(nv)), Ok(nv));
+        // NV12 without the flag: the decoded layout has no tail, so it is the format
+        // that is wrong.
+        let nv_no_tail = Layout { plane1: None, ..nv };
+        assert_eq!(
+            v(FLAG_LAYOUT, Some(nv_no_tail)),
+            Err(RequestError::Layout(LayoutError::Planes))
+        );
+        // The flag with no tail, and a tail with no flag, disagree.
+        assert_eq!(v(both, Some(nv_no_tail)), Err(RequestError::Flags));
+        assert_eq!(v(FLAG_LAYOUT, Some(nv)), Err(RequestError::Flags));
+        // Spec: PLANE1 flag with a one-plane fourcc refused (the escape layer decoded the
+        // tail, as the flag says it is there).
+        let one_with_tail = Layout {
+            plane1: nv.plane1,
+            ..one_plane
+        };
+        assert_eq!(
+            v(both, Some(one_with_tail)),
+            Err(RequestError::Layout(LayoutError::Planes))
+        );
+        // PLANE1 without LAYOUT has no layout at all.
+        assert_eq!(v(FLAG_PLANE1, None), Err(RequestError::LayoutRequired));
+        assert_eq!(v(FLAG_PLANE1, Some(nv)), Err(RequestError::LayoutRequired));
+        // Unknown bits stay unknown, with or without PLANE1.
+        assert_eq!(v(both | 4, Some(nv)), Err(RequestError::Flags));
+        assert_eq!(v(FLAG_PLANE1 | 4, None), Err(RequestError::Flags));
+        assert_eq!(v(1 << 31, None), Err(RequestError::Flags));
+        assert_eq!(
+            v(FLAG_LAYOUT | 1 << 2, Some(one_plane)),
+            Err(RequestError::Flags)
+        );
+        // The one-plane record with its flags: unchanged.
+        assert_eq!(v(FLAG_LAYOUT, Some(one_plane)), Ok(one_plane));
+        assert_eq!(v(0, Some(one_plane)), Err(RequestError::LayoutRequired));
+        // The size rules still come first.
+        assert_eq!(
+            validate_request(1, 2, 3, both, 0, Some(nv)),
+            Err(RequestError::Size)
+        );
+        assert_eq!(
+            validate_request(1, 2, 3, both, MAX_FOREIGN_RESOURCE_BYTES + PAGE, Some(nv)),
+            Err(RequestError::TooLarge)
+        );
+        // The flag value is the one the protocol pins in kmd_render.
+        assert_eq!(FLAG_PLANE1, 2);
+    }
+
+    fn lay1() -> Layout {
+        one(FOURCC_XRGB8888, 1920, 1080, 7680)
+    }
+
+    #[test]
+    fn plane_1_modifier_mismatch_is_refused_through_the_request_too() {
+        let mut nv = two_bl(FOURCC_NV12, 1920, 1080, 4, 3);
+        nv.plane1.as_mut().unwrap().modifier = MOD_LINEAR;
+        assert_eq!(
+            validate_request(1, 2, 3, FLAG_LAYOUT | FLAG_PLANE1, 16 * MIB, Some(nv)),
+            Err(RequestError::Layout(LayoutError::Modifier))
+        );
+    }
+
+    // ---- hostile values ----------------------------------------------------------
+
+    #[test]
+    fn hostile_values_cannot_overflow_or_panic() {
+        // stride * rows in u64: u32::MAX * (u32::MAX rounded up to a block) wraps without
+        // saturation. `min_bytes` is called on unvalidated layouts by tests and tracing.
+        let huge = Layout {
+            width: u32::MAX,
+            height: u32::MAX,
+            stride: u32::MAX,
+            offset: u32::MAX,
+            fourcc: FOURCC_NV12,
+            modifier: BL | 5,
+            plane1: Some(Plane {
+                stride: u32::MAX,
+                offset: u32::MAX,
+                modifier: BL | 5,
+            }),
+        };
+        assert_eq!(huge.min_bytes(), u64::MAX);
+        assert_eq!(huge.plane0_min_bytes(), u64::MAX);
+        // (2^32 - 1) + (2^32 - 1) * 2^31: half the chroma rows, no saturation needed.
+        assert_eq!(
+            huge.plane1_min_bytes(),
+            Some(u64::from(u32::MAX) + u64::from(u32::MAX) * (1 << 31))
+        );
+        assert_eq!(huge.validate(), Err(LayoutError::Dimensions));
+        assert_eq!(huge.validate_for(u64::MAX), Err(LayoutError::Dimensions));
+        // The same in every format, linear and block-linear, with an in-range extent but
+        // hostile strides and offsets: an error, never a panic.
+        for fourcc in ONE_PLANE
+            .iter()
+            .map(|t| t.0)
+            .chain(TWO_PLANE.iter().map(|t| t.0))
+        {
+            for modifier in [MOD_LINEAR, BL, BL | 5, u64::MAX] {
+                for stride in [0, 1, 3, MAX_STRIDE, MAX_STRIDE + 1, u32::MAX] {
+                    for offset in [0, 1, u32::MAX] {
+                        for plane1 in [
+                            None,
+                            Some(Plane {
+                                stride,
+                                offset,
+                                modifier,
+                            }),
+                            Some(Plane {
+                                stride: u32::MAX,
+                                offset: u32::MAX,
+                                modifier: u64::MAX,
+                            }),
+                        ] {
+                            let l = Layout {
+                                width: 16384,
+                                height: 16384,
+                                stride,
+                                offset,
+                                fourcc,
+                                modifier,
+                                plane1,
+                            };
+                            let _ = l.min_bytes();
+                            let _ = l.validate();
+                            let _ = l.validate_for(u64::MAX);
+                            let _ = l.validate_for(0);
+                            let _ = validate_request(
+                                1,
+                                2,
+                                3,
+                                FLAG_LAYOUT | FLAG_PLANE1,
+                                MAX_FOREIGN_RESOURCE_BYTES,
+                                Some(l),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // u32 extents with a valid-looking stride: the dimension check is first.
+        for (w, h) in [
+            (0, 0),
+            (u32::MAX, 1),
+            (1, u32::MAX),
+            (MAX_DIM + 1, MAX_DIM + 1),
+        ] {
+            for fourcc in [FOURCC_R8, FOURCC_NV12, FOURCC_YUYV, FOURCC_XRGB8888, 0] {
+                let l = Layout {
+                    width: w,
+                    height: h,
+                    ..one(fourcc, 1, 1, 4096)
+                };
+                assert_eq!(l.validate(), Err(LayoutError::Dimensions));
+            }
+        }
+        // A 16384 x 16384 fp16 image needs 2 GiB: refused against any size the
+        // import takes (1 GiB at most), by its bound and not by wrapping.
+        let fp16 = one(FOURCC_ABGR16161616F, 16384, 16384, 8 * 16384);
+        assert_eq!(fp16.min_bytes(), 2 << 30);
+        assert_eq!(
+            validate_request(1, 2, 3, FLAG_LAYOUT, MAX_FOREIGN_RESOURCE_BYTES, Some(fp16)),
+            Err(RequestError::Layout(LayoutError::TooLarge))
+        );
+        // 16384 x 16384 formats that do fit 1 GiB.
+        for (l, why) in [
+            (one(FOURCC_R8, 16384, 16384, 16384), "R8"),
+            (one(FOURCC_RGB565, 16384, 16384, 2 * 16384), "RGB565"),
+            (two(FOURCC_NV12, 16384, 16384), "NV12"),
+            (two(FOURCC_P016, 16384, 16384), "P016"),
+        ] {
+            let planes = if l.plane1.is_some() { FLAG_PLANE1 } else { 0 };
+            let size = rup(l.min_bytes(), PAGE);
+            assert!(size <= MAX_FOREIGN_RESOURCE_BYTES, "{why}");
+            assert_eq!(
+                validate_request(1, 2, 3, FLAG_LAYOUT | planes, size, Some(l)),
+                Ok(l),
+                "{why}"
+            );
+        }
+        // The bound of any validated layout stays far from u64 overflow: the largest
+        // stride, the tallest block-linear extent, the largest offsets.
+        let max = Layout {
+            width: MAX_DIM,
+            height: MAX_DIM,
+            stride: MAX_STRIDE,
+            offset: u32::MAX,
+            fourcc: FOURCC_ABGR16161616,
+            modifier: BL | 5,
+            plane1: None,
+        };
+        assert_eq!(max.validate(), Ok(()));
+        assert!(max.min_bytes() < 1 << 40);
+        // An offset of u32::MAX is a valid number, and an impossible fit.
+        assert_eq!(
+            max.validate_for(MAX_FOREIGN_RESOURCE_BYTES),
+            Err(LayoutError::TooLarge)
+        );
+    }
+
+    // ---- the 32 bpp behaviour is unchanged -------------------------------------------
+
+    /// The validation of `foreign_resource` before the shared formats, verbatim (only the
+    /// new field is absent), as the reference the four 32 bpp formats must keep matching.
+    fn old_validate(
+        width: u32,
+        height: u32,
+        stride: u32,
+        fourcc: u32,
+        modifier: u64,
+    ) -> Result<(), LayoutError> {
+        if width < MIN_DIM || width > MAX_DIM || height < MIN_DIM || height > MAX_DIM {
+            return Err(LayoutError::Dimensions);
+        }
+        if !matches!(
+            fourcc,
+            FOURCC_XRGB8888 | FOURCC_ARGB8888 | FOURCC_XBGR8888 | FOURCC_ABGR8888
+        ) {
+            return Err(LayoutError::Format);
+        }
+        let block = modifier >= BL && modifier <= BL + 5;
+        if (stride as u64) < (width as u64) * 4 || stride > MAX_STRIDE || stride % 4 != 0 {
+            return Err(LayoutError::Stride);
+        }
+        if modifier != MOD_LINEAR && !block {
+            return Err(LayoutError::Modifier);
+        }
+        Ok(())
+    }
+
+    fn old_min_bytes(height: u32, stride: u32, offset: u32, modifier: u64) -> u64 {
+        let rows = if modifier >= BL && modifier <= BL + 5 {
+            let b = GOB_ROWS << (modifier - BL);
+            ((height as u64) + b - 1) / b * b
+        } else {
+            height as u64
+        };
+        offset as u64 + (stride as u64) * rows
+    }
+
+    #[test]
+    fn the_four_32_bpp_formats_behave_exactly_as_before() {
+        let dims = [
+            0,
+            1,
+            2,
+            3,
+            15,
+            16,
+            63,
+            64,
+            1080,
+            1919,
+            1920,
+            4096,
+            16383,
+            16384,
+            16385,
+            u32::MAX,
+        ];
+        let strides = [
+            0,
+            1,
+            3,
+            4,
+            8,
+            60,
+            252,
+            256,
+            7676,
+            7679,
+            7680,
+            7681,
+            7682,
+            8192,
+            65536,
+            65540,
+            MAX_STRIDE - 4,
+            MAX_STRIDE,
+            MAX_STRIDE + 4,
+            u32::MAX - 3,
+            u32::MAX,
+        ];
+        let mods = [
+            MOD_LINEAR,
+            BL,
+            BL | 1,
+            BL | 3,
+            BL | 5,
+            BL | 6,
+            BL - 1,
+            1,
+            0x0100_0000_0000_0001,
+            u64::MAX,
+        ];
+        let fourccs = [
+            FOURCC_XRGB8888,
+            FOURCC_ARGB8888,
+            FOURCC_XBGR8888,
+            FOURCC_ABGR8888,
+        ];
+        let mut checked = 0u64;
+        for &f in &fourccs {
+            for &w in &dims {
+                for &h in &dims {
+                    for &stride in &strides {
+                        for &m in &mods {
+                            let l = Layout {
+                                width: w,
+                                height: h,
+                                stride,
+                                offset: 0x1000,
+                                fourcc: f,
+                                modifier: m,
+                                plane1: None,
+                            };
+                            assert_eq!(
+                                l.validate(),
+                                old_validate(w, h, stride, f, m),
+                                "{f:#x} {w}x{h} stride {stride} mod {m:#x}"
+                            );
+                            if l.validate().is_ok() {
+                                assert_eq!(l.min_bytes(), old_min_bytes(h, stride, 0x1000, m));
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100_000);
+        // And through the request, the old flag rules (bit 1 is the only one that moved).
+        let l = lay1();
+        assert_eq!(
+            validate_request(1, 2, 3, FLAG_LAYOUT, 8 * MIB, Some(l)),
+            Ok(l)
+        );
+        assert_eq!(
+            validate_request(1, 2, 3, 0, 8 * MIB, Some(l)),
+            Err(RequestError::LayoutRequired)
+        );
+    }
+
+    #[test]
+    fn only_the_four_are_rgb32() {
+        for (f, name, _, _) in ONE_PLANE {
+            let l = one(f, 64, 64, 64 * 8);
+            assert_eq!(
+                l.is_rgb32(),
+                ONE_PLANE[..4].iter().any(|t| t.0 == f),
+                "{name}"
+            );
+        }
+        for (f, name, _) in TWO_PLANE {
+            assert!(!two(f, 64, 64).is_rgb32(), "{name}");
+        }
+        // A 32 bpp fourcc carrying a plane is not rgb32 whatever else it is.
+        let l = Layout {
+            plane1: two(FOURCC_NV12, 64, 64).plane1,
+            ..lay1()
+        };
+        assert!(!l.is_rgb32());
+        assert_eq!(l.plane_count(), 2);
+        assert_eq!(lay1().plane_count(), 1);
+    }
+
+    // ---- the table: counters, adoption ---------------------------------------------
+
+    fn table() -> ForeignTable {
+        ForeignTable::with_limits(Limits {
+            total: 16,
+            per_owner: 16,
+            bytes_per_owner: 1 << 32,
+        })
+    }
+
+    fn import(t: &mut ForeignTable, id: u32, l: Layout, size: u64) {
+        let r = t.reserve(1, size).unwrap();
+        t.commit(r, id, 7, 3, id, l).unwrap();
+    }
+
+    fn adopt_req(l: &Layout, plane_room: bool) -> AdoptRequest {
+        AdoptRequest {
+            declares_foreign: true,
+            take_ownership: true,
+            ctx_id: 7,
+            width: l.width,
+            height: l.height,
+            pitch: l.stride,
+            plane_offset: u64::from(l.offset),
+            claimed_alloc_size: 0,
+            supplied_layout: None,
+            trailer_room: true,
+            plane_room,
+        }
+    }
+
+    #[test]
+    fn imports_and_adoptions_of_the_new_formats_are_counted() {
+        let mut t = table();
+        let nv = two(FOURCC_NV12, 1920, 1080);
+        let r8 = one(FOURCC_R8, 1920, 1080, 1920);
+        let rgb = lay1();
+        import(&mut t, 10, nv, 4 * MIB);
+        import(&mut t, 11, r8, 4 * MIB);
+        import(&mut t, 12, rgb, 8 * MIB);
+        let c = t.counters();
+        assert_eq!(
+            (c.imported, c.imported_planes, c.imported_format),
+            (3, 1, 1)
+        );
+        // Adoption of a two-plane record counts; the others do not.
+        for (id, l) in [(10, nv), (11, r8), (12, rgb)] {
+            let plan = t
+                .adopt_for_allocation(id, &adopt_req(&l, true), true, true)
+                .unwrap();
+            assert_eq!(
+                plan,
+                AdoptPlan::Foreign(Adopted {
+                    size: t.get(id).unwrap().size,
+                    layout: l
+                })
+            );
+        }
+        let c = t.counters();
+        assert_eq!((c.adopted, c.adopted_planes), (3, 1));
+        assert_eq!(c.refused(), 0);
+    }
+
+    #[test]
+    fn a_two_plane_record_needs_the_144_byte_private_data() {
+        let mut t = table();
+        let nv = two(FOURCC_NV12, 1920, 1080);
+        import(&mut t, 10, nv, 4 * MIB);
+        // Spec: a 2-plane record with only the 128-byte buffer is refused, counted, and
+        // changes nothing (a later adoption with room still works).
+        assert_eq!(
+            t.adopt_for_allocation(10, &adopt_req(&nv, false), true, true),
+            Err(AdoptRefusal::NoPlaneRoom)
+        );
+        let c = t.counters();
+        assert_eq!(
+            (c.refused_adopt, c.refused_no_plane_room, c.adopted_planes),
+            (1, 1, 0)
+        );
+        assert_eq!(c.refused(), 1);
+        assert!(t.get(10).unwrap().creator.is_some());
+        // No trailer room at all is the older refusal, not this one.
+        let mut none = adopt_req(&nv, false);
+        none.trailer_room = false;
+        assert_eq!(
+            t.adopt_for_allocation(10, &none, true, true),
+            Err(AdoptRefusal::NoTrailerRoom)
+        );
+        assert_eq!(t.counters().refused_no_plane_room, 1);
+        assert!(t
+            .adopt_for_allocation(10, &adopt_req(&nv, true), true, true)
+            .is_ok());
+        assert_eq!(AdoptRefusal::NoPlaneRoom.code(), 12);
+        // A one-plane record never needs it.
+        import(&mut t, 11, lay1(), 8 * MIB);
+        assert!(t
+            .adopt_for_allocation(11, &adopt_req(&lay1(), false), true, true)
+            .is_ok());
+        // The trailer sizes.
+        assert_eq!(trailer_bytes(&lay1()), 128);
+        assert_eq!(trailer_bytes(&nv), 144);
+        assert_eq!(trailer_bytes(&one(FOURCC_R8, 64, 64, 64)), 128);
+    }
+
+    #[test]
+    fn the_supplied_trailer_must_repeat_plane_1_too() {
+        let mut t = table();
+        let nv = two(FOURCC_NV12, 1920, 1080);
+        import(&mut t, 10, nv, 4 * MIB);
+        let mut req = adopt_req(&nv, true);
+        // A supplied record that drops plane 1, or changes any of its fields.
+        req.supplied_layout = Some(Layout { plane1: None, ..nv });
+        assert_eq!(
+            t.adopt_for_allocation(10, &req, true, true),
+            Err(AdoptRefusal::LayoutMismatch)
+        );
+        let edits: [fn(&mut Plane); 3] =
+            [|p| p.stride += 2, |p| p.offset += 4096, |p| p.modifier = BL];
+        for edit in edits {
+            let mut l = nv;
+            edit(l.plane1.as_mut().unwrap());
+            req.supplied_layout = Some(l);
+            assert_eq!(
+                t.adopt_for_allocation(10, &req, true, true),
+                Err(AdoptRefusal::LayoutMismatch)
+            );
+        }
+        // The geometry words are plane 0's: a plane 1 stride in `pitch` is a mismatch.
+        let mut bad = adopt_req(&nv, true);
+        bad.pitch = nv.plane1.unwrap().stride + 2;
+        assert_eq!(
+            t.adopt_for_allocation(10, &bad, true, true),
+            Err(AdoptRefusal::GeometryMismatch)
+        );
+        let mut bad = adopt_req(&nv, true);
+        bad.plane_offset = u64::from(nv.plane1.unwrap().offset);
+        assert_eq!(
+            t.adopt_for_allocation(10, &bad, true, true),
+            Err(AdoptRefusal::GeometryMismatch)
+        );
+        // The exact record, supplied, adopts.
+        req.supplied_layout = Some(nv);
+        assert!(t.adopt_for_allocation(10, &req, true, true).is_ok());
+    }
+
+    #[test]
+    fn open_and_flip_record_carry_plane_1() {
+        let mut t = table();
+        let nv = two_bl(FOURCC_NV12, 1920, 1080, 4, 3);
+        import(&mut t, 10, nv, 4 * MIB);
+        t.adopt_for_allocation(10, &adopt_req(&nv, true), true, true)
+            .unwrap();
+        // An opener is handed the recorded layout, plane 1 included, never the creator's.
+        match t.open(10, 99) {
+            OpenOutcome::Opened(a) => assert_eq!(a.layout, nv),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(t.flip_record(10).unwrap().layout, nv);
+        assert_eq!(t.layout(10), Some(nv));
+    }
+
+    #[test]
+    fn request_refusals_are_counted_by_reason() {
+        let mut t = table();
+        let nv = two(FOURCC_NV12, 1920, 1080);
+        let flags = FLAG_LAYOUT | FLAG_PLANE1;
+        let refuse = |t: &mut ForeignTable, flags: u32, size: u64, l: Option<Layout>| {
+            let e = validate_request(1, 2, 3, flags, size, l).unwrap_err();
+            t.note_request_refusal(e, l.as_ref());
+            e
+        };
+        // An unknown fourcc.
+        refuse(
+            &mut t,
+            FLAG_LAYOUT,
+            8 * MIB,
+            Some(one(0x3432_4742, 64, 64, 256)),
+        );
+        // Plane tail against the format: both ways.
+        refuse(
+            &mut t,
+            FLAG_LAYOUT,
+            8 * MIB,
+            Some(Layout { plane1: None, ..nv }),
+        );
+        refuse(
+            &mut t,
+            flags,
+            8 * MIB,
+            Some(Layout {
+                plane1: nv.plane1,
+                ..lay1()
+            }),
+        );
+        // Geometry of a new format: odd extent, stride, size, modifier, overlap.
+        refuse(&mut t, flags, 8 * MIB, Some(Layout { width: 63, ..nv }));
+        refuse(
+            &mut t,
+            FLAG_LAYOUT,
+            8 * MIB,
+            Some(one(FOURCC_R8, 64, 64, 63)),
+        );
+        refuse(&mut t, flags, PAGE, Some(nv));
+        refuse(
+            &mut t,
+            FLAG_LAYOUT,
+            8 * MIB,
+            Some(Layout {
+                modifier: BL | 6,
+                ..one(FOURCC_R16, 64, 64, 128)
+            }),
+        );
+        // The 32 bpp ones are not "new": their geometry refusals count as requests only.
+        refuse(
+            &mut t,
+            FLAG_LAYOUT,
+            8 * MIB,
+            Some(Layout {
+                stride: 4,
+                ..lay1()
+            }),
+        );
+        // Requests that never reached the layout, or carried none.
+        refuse(&mut t, FLAG_LAYOUT | 4, 8 * MIB, Some(lay1()));
+        refuse(&mut t, FLAG_LAYOUT, 0, Some(lay1()));
+        refuse(&mut t, 0, 8 * MIB, None);
+        let c = t.counters();
+        assert_eq!(c.refused_request, 11);
+        assert_eq!(c.refused_format, 1);
+        assert_eq!(c.refused_planes, 2);
+        assert_eq!(c.refused_new_geometry, 4);
+        // All of them are requests refused, and `refused` still sums once.
+        assert_eq!(c.refused(), 11);
+    }
+
+    // ---- the overlay: never advertised ---------------------------------------------
+
+    /// The KMD advertises no overlay planes, which is the whole reason NV12 is never
+    /// scanned out (`docs/shared-formats.md`): dxgkrnl only hands a YUV surface to the
+    /// display hardware through a multi-plane-overlay present, and the KMD neither
+    /// reports `SupportMultiPlaneOverlay` in its caps nor registers the MPO3 DDI
+    /// interface. A static check of the driver's source: no executable line outside the
+    /// one refusal (`ddi/present_packet.rs`, which names the flag only to REFUSE an MPO
+    /// present) mentions a multi-plane-overlay capability, DDI or interface.
+    #[test]
+    fn the_kmd_never_advertises_overlay_planes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
+        if !root.exists() {
+            return; // a copy of this crate without its sibling: nothing to scan
+        }
+        const FORBIDDEN: [&str; 7] = [
+            "SupportMultiPlaneOverlay",
+            "MultiPlaneOverlaySupport",
+            "SetVidPnSourceAddressWithMultiPlaneOverlay",
+            "CheckMultiPlaneOverlay",
+            "MaxOverlay",
+            "MPO3",
+            "Mpo3",
+        ];
+        let mut stack = std::vec![root];
+        let mut checked = 0;
+        let mut allowed_mentions = 0;
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                checked += 1;
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                let text = std::fs::read_to_string(&p).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue; // prose: the doc comments explain why there is none
+                    }
+                    for tok in FORBIDDEN {
+                        assert!(
+                            !code.contains(tok),
+                            "{}:{} names `{tok}`: the KMD must not advertise overlay planes",
+                            p.display(),
+                            n + 1
+                        );
+                    }
+                    // `MultiPlaneOverlay` as a word is allowed in exactly one file, where it
+                    // is the refused arm of the present payload.
+                    if code.contains("MultiPlaneOverlay") || code.contains("MultiplaneOverlay") {
+                        assert_eq!(
+                            name, "present_packet.rs",
+                            "{}:{}: only the present packet may name a multi-plane overlay (to refuse it)",
+                            p.display(),
+                            n + 1
+                        );
+                        allowed_mentions += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 20);
+        // The refusal is there: the payload arm exists (`PresentPayload::MultiPlaneOverlay`),
+        // and it never produces an allocation list.
+        assert!(allowed_mentions >= 1);
+    }
+}
+
+/// Fixtures the other consumers' refusal tests share: the shared formats beyond the four
+/// 32-bit RGB ones, and a valid record for each.
+#[cfg(test)]
+pub(crate) mod test_formats {
+    use super::*;
+
+    /// Every fourcc of [`share_format`] that is not one of the four 32 bpp RGB formats.
+    pub(crate) const BEYOND_RGB32: [u32; 14] = [
+        FOURCC_R8,
+        FOURCC_GR88,
+        FOURCC_R16,
+        FOURCC_GR1616,
+        FOURCC_RGB565,
+        FOURCC_ARGB1555,
+        FOURCC_ARGB4444,
+        FOURCC_ABGR2101010,
+        FOURCC_ABGR16161616F,
+        FOURCC_ABGR16161616,
+        FOURCC_YUYV,
+        FOURCC_NV12,
+        FOURCC_P010,
+        FOURCC_P016,
+    ];
+
+    /// A valid record of `fourcc` (tightly packed; plane 1 right after plane 0 for the
+    /// two-plane formats) with plane 0 carrying `modifier` (plane 1 the same `h`).
+    pub(crate) fn valid_layout(fourcc: u32, w: u32, h: u32, modifier: u64) -> Layout {
+        let f = share_format(fourcc).unwrap();
+        let stride = f.row_bytes(0, w) as u32;
+        let mut l = Layout {
+            width: w,
+            height: h,
+            stride,
+            offset: 0,
+            fourcc,
+            modifier,
+            plane1: None,
+        };
+        if f.planes == 2 {
+            l.plane1 = Some(Plane {
+                stride: f.row_bytes(1, w) as u32,
+                offset: l.plane0_min_bytes() as u32,
+                modifier,
+            });
+        }
+        assert_eq!(l.validate(), Ok(()), "fixture {fourcc:#x} {w}x{h}");
+        l
+    }
+
+    /// The shared test fixtures are themselves valid, cover the table, and are not rgb32.
+    #[test]
+    fn the_fixtures_are_valid_and_not_rgb32() {
+        assert_eq!(BEYOND_RGB32.len() + 4, 18);
+        for f in BEYOND_RGB32 {
+            for m in [MOD_LINEAR, MOD_NVIDIA_BLOCK_LINEAR_BASE | 4] {
+                let l = valid_layout(f, 1920, 1080, m);
+                assert!(!l.is_rgb32());
+                assert_eq!(l.plane_count(), share_format(f).unwrap().planes);
+                assert!(l.validate_for(l.min_bytes()).is_ok());
+            }
+        }
     }
 }

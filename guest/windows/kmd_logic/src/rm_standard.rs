@@ -227,6 +227,7 @@ impl StdLayout {
             offset: 0,
             fourcc: self.fourcc,
             modifier: MOD_LINEAR,
+            plane1: None,
         };
         l.validate_for(size).ok().map(|()| l)
     }

@@ -1295,3 +1295,19 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod shared_format_refusals {
+    use super::*;
+    use crate::foreign_resource::test_formats::BEYOND_RGB32;
+
+    #[test]
+    fn the_blit_order_is_known_only_for_the_four_32_bpp_formats() {
+        for f in BEYOND_RGB32 {
+            assert_eq!(order_for_fourcc(f), None, "{f:#x}");
+        }
+        assert_eq!(order_for_fourcc(0), None);
+        assert_eq!(order_for_fourcc(FOURCC_XRGB8888), Some(Order::Bgra));
+        assert_eq!(order_for_fourcc(FOURCC_ABGR8888), Some(Order::Rgba));
+    }
+}

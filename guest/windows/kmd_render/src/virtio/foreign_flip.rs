@@ -53,9 +53,16 @@ const KMD: DeviceOwner = DeviceOwner::KMD_RM;
 
 /// Acts performed per worker pass (a registration is followed by the first flip).
 const ACTS_PER_PASS: usize = 3;
-/// How long the host gets to take one flip (the worker flips every frame and StopDevice
-/// joins it for a bounded time, as the level 5 flip).
-const FLIP_TIMEOUT_MS: u64 = 1_000;
+/// How long the host gets to take one flip. The worker flips every frame, StopDevice joins it for
+/// a bounded time, and the SAME worker drains `pending_vidpn_allocation` (every later flip's
+/// address publication) BEFORE it runs this service, so a slow or silent host used to delay every
+/// later publication by up to a second per attempt (it was 1 000 ms, as the level 5 presenter's
+/// own, which is untouched). A few frame periods now (`flip_completion::WORKER_FLIP_TIMEOUT_MS`,
+/// host-tested bounds); the failure accounting is exactly as it was (a timeout is `Failed`, three
+/// in a row give up for five seconds), and every refusal that follows completes its flip as a
+/// kept picture (`flip_completion`), so a spurious timeout costs a stale picture, not a held flip.
+/// Publication itself never waits for the host: `take` publishes at programming.
+const FLIP_TIMEOUT_MS: u64 = helios_kmd_logic::flip_completion::WORKER_FLIP_TIMEOUT_MS;
 /// Consecutive flips that found the source yielded before it counts as a failure.
 const MAX_YIELDS: u32 = 8;
 
@@ -92,7 +99,7 @@ static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 // allocation: `publish_counters`). `FfProg` allocations taken, of which `FfSame` the same
 // one again, `FfMoved` another of the same device, `FfReowned` of another device; `FfNoRec`
 // programmed with no foreign record (a plain Venus allocation or a placeholder); `FfRef` refused to
-// Venus, `FfWhy` the last reason (`Why::code`), `FfRef01`..`FfRef14` per reason; `FfRegs`
+// Venus, `FfWhy` the last reason (`Why::code`), `FfRef01`..`FfRef15` per reason; `FfRegs`
 // registrations, `FfRegFail` refused registrations, `FfWithdrawn` withdrawals, `FfGaveUp` giving-ups, `FfFrames` flips for an edge,
 // `FfReflips` flips for a resume, `FfYielded` flips that found the source yielded,
 // `FfFlipFail` flips refused, `FfStale` flips refused because the importer's file is no longer
@@ -121,6 +128,7 @@ static REFUSED_BY: [AtomicU32; Why::COUNT] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
+    AtomicU32::new(0),
 ];
 static REGS: AtomicU32 = AtomicU32::new(0);
 static REG_FAIL: AtomicU32 = AtomicU32::new(0);
@@ -135,6 +143,10 @@ static GONE: AtomicU32 = AtomicU32::new(0);
 static POISONED: AtomicU32 = AtomicU32::new(0);
 static EDGES: AtomicU32 = AtomicU32::new(0);
 static PRES_WORD: AtomicU32 = AtomicU32::new(0);
+/// The `Ff*` block owes the service key one full write (zeros included) for this transport
+/// generation: set by [`forget`], taken by [`publish_counters`]. A value left in the registry by
+/// a previous run is then never read as live, whether or not this generation sees a flip.
+static MIRROR_PENDING: AtomicU32 = AtomicU32::new(1);
 
 /// Mirror the counters to the service key. PASSIVE only. Nothing is written until the knob
 /// was on and an allocation was seen, so a box with the knob off gets no new value.
@@ -144,8 +156,15 @@ pub(crate) fn publish_counters() {
         | NO_REC.load(Ordering::Relaxed)
         | REFUSED.load(Ordering::Relaxed)
         | POISONED.load(Ordering::Relaxed);
-    if seen == 0 {
+    // Once per generation the whole block is written even when nothing was seen (zeros), so a
+    // block from an earlier run cannot be read as this one's. The knob is read (and mirrored)
+    // first if this generation has not yet.
+    let owed = MIRROR_PENDING.swap(0, Ordering::AcqRel) != 0;
+    if seen == 0 && !owed {
         return;
+    }
+    if owed {
+        let _ = knob_on();
     }
     rec(b"FfKnob", KNOB.load(Ordering::Relaxed).min(0xFF));
     rec(b"FfProg", PROG.load(Ordering::Relaxed));
@@ -197,10 +216,10 @@ fn knob_on() -> bool {
 fn read_knob() -> u32 {
     let v = crate::diag::read_config_dword(crate::diag::knobs::FOREIGN_FLIP, 0);
     KNOB.store(v, Ordering::Relaxed);
-    // Nothing is written for the default (off): the service key stays as it was.
-    if v != 0 {
-        crate::diag::record_named_bytes(b"FfKnob", v.min(0xFF));
-    }
+    // Mirrored on EVERY read, 0 included: "nothing is written for the default" left FfKnob = 1 in
+    // the registry after the knob was set back to 0 and the device restarted (tester evidence),
+    // and the whole `Ff*` block with it.
+    crate::diag::record_named_bytes(b"FfKnob", v.min(0xFF));
     v
 }
 
@@ -226,6 +245,18 @@ pub(crate) fn forget() {
     FAIL_UNTIL.store(0, Ordering::Release);
     LAST_SEQ.store(0, Ordering::Relaxed);
     KNOB.store(KNOB_UNREAD, Ordering::Relaxed);
+    // The counters are this generation's: zero them, and owe the service key the zero block.
+    for c in [
+        &PROG, &SAME, &MOVED, &REOWNED, &NO_REC, &REFUSED, &WHY, &REGS, &REG_FAIL, &WITHDRAWN,
+        &GAVE_UP, &FRAMES, &REFLIPS, &YIELDED, &FLIP_FAIL, &STALE, &GONE, &POISONED, &EDGES,
+        &PRES_WORD, &YIELDS,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+    for c in &REFUSED_BY {
+        c.store(0, Ordering::Relaxed);
+    }
+    MIRROR_PENDING.store(1, Ordering::Release);
 }
 
 /// Whether this arm's allocation is what the screen shows: the level 5 service leaves the

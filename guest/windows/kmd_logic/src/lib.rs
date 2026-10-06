@@ -27,6 +27,7 @@ pub mod nvrm_fence;
 pub mod nvrm_views;
 pub mod foreign_copy;
 pub mod foreign_errno;
+pub mod flip_completion;
 pub mod foreign_flip;
 pub mod foreign_resource;
 pub mod foreign_scanout;
@@ -47,6 +48,7 @@ pub mod rm_fence_present;
 pub mod present_foreign;
 pub mod msi;
 pub mod paging;
+pub mod shared_placeholder;
 pub mod sweep_budget;
 pub mod vsync_rate;
 

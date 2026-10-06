@@ -21,6 +21,9 @@ use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDestinationDesc};
 use crate::virtio::VirtioError;
+use helios_kmd_logic::flip_completion::{
+    self, KeepWhy, Outcome as FlipOutcome, Publish as FlipPublish, Source as FlipSource,
+};
 use helios_kmd_logic::present_foreign::{site, Arm as PresentArm, FlipRoute, Refusal};
 use helios_kmd_logic::rm_refresh::Edge;
 use helios_kmd_logic::scanout_worker_bind::{
@@ -535,20 +538,17 @@ unsafe fn dxgkddi_present_inner(
 
             let (Some(adapter), Some(source), Some(destination)) = (adapter, src_info, dst_info)
             else {
-                // A foreign source with a destination handle that resolves to nothing: no
-                // destination to write, so the Present is a counted success. An unresolved
-                // SOURCE (or adapter) is not skipped.
-                if adapter.is_some()
-                    && dst_info.is_none()
-                    && crate::ddi::present_foreign::skip(
-                        PresentArm::Blt,
-                        Refusal::BltNoDestination,
-                        adapter,
-                        src_info.as_ref(),
-                        None,
-                    )
-                    .is_some()
-                {
+                // The adapter, the source or the destination did not resolve (or a `ColorFill`, which
+                // has no source): a counted success on every transport, not a failed Present. See
+                // `helios_kmd_logic::present_foreign::decide_unresolved` and
+                // `docs/zero-copy-present.md` 12.7. The failure below is what a Blt that reaches it
+                // would have returned; the decision makes it unreachable for a Blt.
+                if crate::ddi::present_foreign::unresolved_skip(
+                    adapter,
+                    present_flags & (1 << 1) != 0,
+                    (src_handle, src_info.is_some()),
+                    (dst_handle, dst_info.is_some()),
+                ) {
                     return unsafe {
                         present_blt_skipped(
                             args,
@@ -560,28 +560,6 @@ unsafe fn dxgkddi_present_inner(
                             dst_info,
                         )
                     };
-                }
-                // An unresolved source or destination handle while the transport holds a
-                // foreign record (or `ForeignFlip` is on) is a lost picture, not a failed
-                // Present; a Venus-only session keeps failing below.
-                if let Some(adapter) = adapter {
-                    if crate::ddi::present_foreign::unresolved_skip(
-                        adapter,
-                        src_info.as_ref(),
-                        dst_info.as_ref(),
-                    ) {
-                        return unsafe {
-                            present_blt_skipped(
-                                args,
-                                present_allocations,
-                                patch_capacity.take(),
-                                present_stream_boundary,
-                                Some(adapter),
-                                src_info,
-                                dst_info,
-                            )
-                        };
-                    }
                 }
                 crate::diag::record_named_on_change(b"PBCpy", 0xE1, &PB_CPY_LAST);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
@@ -1070,6 +1048,40 @@ unsafe fn dxgkddi_present_inner(
         // private-data snapshot captured by OpenAllocation. In particular, do
         // not let the UMD command payload independently select a resource.
         let Some(source) = src_info else {
+            // A HOST-LESS SHARED PLACEHOLDER (the KMD's own record from its open: no identity, the
+            // placeholder's shape) has no identity to resolve and no host resource, but DWM can
+            // flip it and the flip must COMPLETE (`helios_kmd_logic::flip_completion`, Hollow):
+            // failing it here left the chain held. The MMIO contract only needs the Present to
+            // succeed (`SetVidPnSourceAddress` follows with the global handle, resource id 0, which
+            // the worker completes as a kept picture); the DMA contract writes a keep record for
+            // the address the allocation list assigned.
+            if unsafe {
+                crate::ddi::create_allocation::present_alloc_is_placeholder(adapter, src_handle)
+            } {
+                if args.pDmaBuffer.is_null() {
+                    crate::ddi::flip_keep::note_placeholder_flip();
+                    crate::diag::record_named_bytes(b"PBMmio", 1);
+                    crate::ddi::scanout_trace::note_present_mmio_flip();
+                    args.MultipassOffset = 0;
+                    PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
+                    return STATUS_SUCCESS;
+                }
+                if let Some(flip_source) = present_allocations.source() {
+                    crate::ddi::flip_keep::note_placeholder_flip();
+                    return unsafe {
+                        present_flip_kept(
+                            args,
+                            present_allocations,
+                            flip_source.physical_address(),
+                            present_stream_boundary,
+                            present_arm,
+                            adapter,
+                            src_info,
+                            dst_info,
+                        )
+                    };
+                }
+            }
             crate::diag::record_named_bytes(b"PBFlip", 0xE1);
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return crate::ddi::present_foreign::invalid(site::FLIP_NO_SOURCE);
@@ -1171,14 +1183,35 @@ unsafe fn dxgkddi_present_inner(
         // picture and the flip's DMA fence retires normally. An ordinary allocation that is not
         // registered still fails (`PBFlip` 0xE6).
         let route = crate::ddi::present_foreign::flip_route(adapter, registered.is_some(), &source);
+        // FLIP COMPLETION (`helios_kmd_logic::flip_completion`, `docs/zero-copy-present.md`). A
+        // flip this Present answers without arming anything (the counted skip of a foreign
+        // allocation, or the failure of a HOLLOW one: no resource id, or a non-direct allocation
+        // the scan-out copy can never take) must still COMPLETE toward dxgkrnl, and only a
+        // CRTC_VSYNC carrying the flip's address retires it. A keep record in the flip slot makes
+        // `arm_dma_flip` publish that address at submit. An ordinary Venus allocation that is not
+        // registered still fails below, as it always did.
+        let keep_flip = match route {
+            FlipRoute::Skip { .. } => true,
+            FlipRoute::Fail => {
+                flip_completion::classify(&flip_completion::SourceFacts {
+                    resource_id: source.resource_id,
+                    foreign: false,
+                    direct_scanout: source.direct_scanout,
+                    width: source.width,
+                    height: source.height,
+                    venus_identity: source.venus_alloc_size != 0,
+                }) == FlipSource::Hollow
+            }
+            FlipRoute::Arm { .. } => false,
+        };
         let flip_allocation = match (route, registered) {
             (FlipRoute::Arm { .. }, Some(handle)) => handle,
-            (FlipRoute::Skip { .. }, _) => {
+            _ if keep_flip => {
                 return unsafe {
-                    present_complete(
+                    present_flip_kept(
                         args,
                         present_allocations,
-                        None,
+                        flip_source.physical_address(),
                         present_stream_boundary,
                         present_arm,
                         adapter,
@@ -1253,6 +1286,67 @@ unsafe fn dxgkddi_present_inner(
             dst_info,
         )
     }
+}
+
+/// A DMA flip this Present completes without arming any programming: write the KEEP record for
+/// `physical_address` (`arm_dma_flip` publishes it as a kept picture at submit), then the shared
+/// completion.
+///
+/// STALE REPLAY. dxgkrnl recycles DMA private-data buffers. If the completion FAILS after the
+/// record was written (patch capacity, stream boundary), dxgkrnl retries or abandons this Present
+/// and the buffer may be handed to a later submission with the record still in it, which would
+/// publish an old flip's address as kept for a flip it does not belong to. So every failing return
+/// zeroes the slot (`clear_keep`); a success leaves it for `take_keep`, which consumes it.
+///
+/// # Safety
+/// As [`present_complete`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn present_flip_kept(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    physical_address: u64,
+    present_stream_boundary: Option<u64>,
+    arm: PresentArm,
+    adapter: Option<&AdapterContext>,
+    src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+) -> NTSTATUS {
+    let written = unsafe {
+        crate::ddi::present_packet::PresentFlipPrivate::write_keep(
+            args.pDmaBufferPrivateData,
+            args.DmaBufferPrivateDataSize,
+            physical_address,
+        )
+    }
+    .is_ok();
+    if written {
+        crate::ddi::flip_keep::note_dma_record();
+    } else {
+        // The private buffer is smaller than the record (never with the size requested at
+        // CreateContext): the flip then completes as it did before.
+        crate::diag::record_named_bytes(b"PBFlip", 0xE5);
+    }
+    let status = unsafe {
+        present_complete(
+            args,
+            present_allocations,
+            None,
+            present_stream_boundary,
+            arm,
+            adapter,
+            src_info,
+            dst_info,
+        )
+    };
+    if written && status != STATUS_SUCCESS {
+        unsafe {
+            crate::ddi::present_packet::PresentFlipPrivate::clear_keep(
+                args.pDmaBufferPrivateData,
+                args.DmaBufferPrivateDataSize,
+            )
+        };
+    }
+    status
 }
 
 /// The shared completion of a Present: the patch-location references, the DMA marker and the
@@ -1453,7 +1547,27 @@ unsafe fn present_blt_to_rm_primary(
         }
     };
     let Some(source) = source else {
-        // Unreadable: no allocation behind the source handle.
+        // Nothing readable behind the source handle (no source at all for a `ColorFill`): a
+        // counted success, with a marker that names no pending work, as a skipped legacy Blt.
+        let src_handle = present_allocations
+            .source()
+            .map(|allocation| allocation.handle())
+            .unwrap_or(core::ptr::null_mut());
+        if crate::ddi::present_foreign::unresolved_skip(
+            Some(adapter),
+            unsafe { args.Flags.__bindgen_anon_1.Value } & (1 << 1) != 0,
+            (src_handle, false),
+            (core::ptr::null_mut(), true),
+        ) {
+            let _ = unsafe {
+                PresentSubmissionPrivate::merge_fence(
+                    args.pDmaBufferPrivateData,
+                    args.DmaBufferPrivateDataSize,
+                    0,
+                )
+            };
+            return Ok(capacity);
+        }
         crate::diag::record_named_on_change(b"PBCpy", 0xE1, &PB_CPY_LAST);
         PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
         return Err(crate::ddi::present_foreign::invalid(site::RM_BLT_NO_SOURCE));
@@ -1840,6 +1954,16 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         )
     } {
         crate::ddi::scanout_trace::note_ddi_pair_failed();
+        // The handle pairs with no allocation of the live transport generation (stale, foreign,
+        // null): not a Venus allocation of this host, nothing will ever bind it, and the only
+        // thing left to complete is the flip's address (an atomic store, legal at the DIRQL this
+        // DDI can run at; nothing is published for a zero address). The status is unchanged.
+        let _ = crate::ddi::flip_keep::keep(
+            adapter,
+            primary_address,
+            KeepWhy::Unresolved,
+            crate::ddi::flip_keep::Lane::Ddi,
+        );
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -2361,6 +2485,16 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
                     // must not retain programming ownership indefinitely.
                     RetryDecision::GaveUp => {
                         release_leases_for_reject(adapter);
+                        // A foreign primary's flip still completes (kept picture): before this
+                        // exit it was held forever and the compositor blocked behind it. A
+                        // Venus allocation keeps the old address, as it always did.
+                        unsafe {
+                            complete_foreign_flip_of(
+                                adapter,
+                                h_alloc,
+                                reject.flip_outcome(false),
+                            )
+                        };
                         if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
                             interval.retain_for_retry();
                         }
@@ -2371,6 +2505,9 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
                 // programming ownership for nothing.
                 clear_retry_state();
                 release_leases_for_reject(adapter);
+                // Same completion for a foreign primary (an extent that is not the mode's, a
+                // layout or format the host cannot take): kept picture, nothing for Venus.
+                unsafe { complete_foreign_flip_of(adapter, h_alloc, reject.flip_outcome(false)) };
                 if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
                     interval.retain_for_retry();
                 }
@@ -2536,6 +2673,81 @@ impl ScanoutReject {
             | Self::ProducerAbandoned => false,
         }
     }
+
+    /// What this refusal is to the flip-completion rule (`helios_kmd_logic::flip_completion`).
+    /// `retry_left`: the caller will program the same handle again, so a retryable refusal is not
+    /// the end of the flip yet; without a retry (the inline wrapper, or a spent budget) it is.
+    fn flip_outcome(self, retry_left: bool) -> FlipOutcome {
+        if self.retryable() {
+            return if retry_left {
+                FlipOutcome::CopyFailed
+            } else {
+                FlipOutcome::GaveUp
+            };
+        }
+        match self {
+            Self::Extent => FlipOutcome::Extent,
+            // `BadAlloc` included: the wrapper only gets to act on it when the handle still
+            // resolves (an allocation with no resource id, the shared placeholder).
+            _ => FlipOutcome::Rejected,
+        }
+    }
+}
+
+/// Complete the flip of a foreign or hollow primary the programming could not show: publish its
+/// address as a kept picture (the screen keeps what it showed) when
+/// `helios_kmd_logic::flip_completion::decide` says so. Returns whether it did. A Venus
+/// allocation always answers `false` (nothing changes for it). PASSIVE_LEVEL (the registry mirror
+/// of the first and every 64th), under the scanout lifecycle lock like every caller.
+///
+/// `venus_can_bind`: the Venus path after a `ForeignFlip` decline can still succeed
+/// (`flip_completion::venus_can_bind`: `ForeignCopy` on for a foreign allocation, or a
+/// direct-scanout allocation that binds its own resource).
+fn complete_foreign_flip(
+    adapter: &AdapterContext,
+    source: FlipSource,
+    address: u64,
+    venus_can_bind: bool,
+    outcome: FlipOutcome,
+) -> bool {
+    if flip_completion::decide(source, venus_can_bind, outcome) != FlipPublish::Kept {
+        return false;
+    }
+    let Some(why) = KeepWhy::of(outcome) else {
+        return false;
+    };
+    crate::ddi::flip_keep::keep_passive(adapter, address, why, crate::ddi::flip_keep::Lane::Worker);
+    true
+}
+
+/// [`complete_foreign_flip`] for a refusal that left [`program_vidpn_source`] by its `Err` exit:
+/// the wrapper resolves the handle again (it holds the scanout lifecycle lock, so the handle is
+/// the one the programming just used) to learn whether the source is foreign and which address
+/// Windows paired with it. A handle that does not resolve publishes nothing.
+///
+/// # Safety
+/// `h_alloc` is the exact allocation handle Windows published, as for [`program_vidpn_source`].
+unsafe fn complete_foreign_flip_of(
+    adapter: &AdapterContext,
+    h_alloc: HANDLE,
+    outcome: FlipOutcome,
+) -> bool {
+    // Not `scanout_alloc_info`: that refuses an allocation with no resource id, which is exactly
+    // the hollow one whose flip must complete.
+    let Some((source, address)) =
+        (unsafe { crate::ddi::create_allocation::flip_completion_info(adapter, h_alloc) })
+    else {
+        return false;
+    };
+    complete_foreign_flip(
+        adapter,
+        source,
+        address,
+        // A refusal that reached an `Err` exit is past the decline point: nothing "may still
+        // bind" any more, so the knob is irrelevant to these outcomes (they never consult it).
+        false,
+        outcome,
+    )
 }
 
 /// Retry attempts allowed for one primary before its programming interval is
@@ -2731,6 +2943,9 @@ unsafe fn apply_vidpn_source_address_locked(
             // Nothing was deferred, so there is nothing to re-arm.
             reject.report();
             release_leases_for_reject(adapter);
+            // No retry here, so every refusal is the end of this flip: a foreign primary completes
+            // it as a kept picture (the status below is unchanged), a Venus allocation does not.
+            unsafe { complete_foreign_flip_of(adapter, h_alloc, reject.flip_outcome(false)) };
             if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
                 interval.retain_for_retry();
             }
@@ -2908,15 +3123,53 @@ unsafe fn program_vidpn_source_inner(
     // counted (`FfRef<NN>`) and the Venus path below runs.
     {
         use crate::virtio::foreign_flip::{self as ffl, Programmed as FfProgrammed};
-        match ffl::program(
+        let arm = ffl::program(
             adapter,
             source.resource_id,
             source.primary_address,
             width,
             height,
             source.direct_scanout,
-        ) {
-            FfProgrammed::NotOurs | FfProgrammed::Refused => ffl::other_source(adapter),
+        );
+        match arm {
+            FfProgrammed::NotOurs | FfProgrammed::Refused => {
+                // FLIP COMPLETION (`helios_kmd_logic::flip_completion`, `docs/zero-copy-present.md`).
+                // A foreign or hollow primary the arm did not take has nowhere else to be shown
+                // when the Venus path cannot bind it (a foreign one with `ForeignCopy` off: the
+                // host refuses the plain OPTIMAL import; a hollow one never; neither a
+                // direct-scanout allocation, which binds its own resource): the copy below could
+                // only fail four times and give up, and no exit of it completed the flip, so
+                // dxgkrnl held it and DWM blocked (measured: T3, one no-record flip after four
+                // shown). Complete it HERE as a kept picture instead and skip the copy. A Venus
+                // allocation answers `Source::Venus`, so it falls through to the path below
+                // unchanged.
+                let outcome = if matches!(arm, FfProgrammed::Refused) {
+                    FlipOutcome::Refused
+                } else {
+                    FlipOutcome::NotOurs
+                };
+                let venus_can_bind = flip_completion::venus_can_bind(
+                    source.flip_source,
+                    adapter.knobs().foreign_copy,
+                    source.direct_scanout,
+                );
+                if complete_foreign_flip(
+                    adapter,
+                    source.flip_source,
+                    source.primary_address,
+                    venus_can_bind,
+                    outcome,
+                ) {
+                    // A KEPT picture keeps the screen's source too: a foreign allocation this arm
+                    // shows stays shown (the arm withdraws it itself when its file or device
+                    // goes, or when it gives up), instead of being forgotten for a flip that
+                    // could not replace it.
+                    release_leases_for_reject(adapter);
+                    return Ok(ScanoutOutcome::Programmed);
+                }
+                // Not completed here: the Venus path below takes the screen, so this arm lets go.
+                ffl::other_source(adapter);
+            }
             FfProgrammed::Ok => {
                 trace.target_resource = source.resource_id;
                 return Ok(ScanoutOutcome::Programmed);

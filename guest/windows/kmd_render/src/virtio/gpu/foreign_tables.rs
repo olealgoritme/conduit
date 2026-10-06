@@ -299,12 +299,6 @@ impl VirtioGpu {
         self.foreign.sysmem_source(resource_id)
     }
 
-    /// Entries in the foreign table (adopted ones included): whether the transport holds any
-    /// foreign resource at all. `Present` reads it only at a refusal.
-    pub fn foreign_live(&self) -> usize {
-        self.foreign.live()
-    }
-
     /// What the KMD's foreign flip decides on for `resource_id`'s record (importer, DRM
     /// file and GEM, layout, life), or `None` for an id with no record.
     pub fn foreign_flip_record(&self, resource_id: u32) -> Option<fr::FlipRecord> {
@@ -325,6 +319,17 @@ impl VirtioGpu {
     /// Count a request refused before it reached any table.
     pub fn foreign_note_refusal(&mut self, kind: RefusalKind) {
         self.foreign.note_refusal(kind);
+    }
+
+    /// Count an `IMPORT_RM` request `validate_request` refused: a bad request, and which
+    /// shared-format reason (`ForeignTable::note_request_refusal`). `layout` is the decoded
+    /// layout the request carried, if any.
+    pub fn foreign_note_request_refusal(
+        &mut self,
+        why: fr::RequestError,
+        layout: Option<&fr::Layout>,
+    ) {
+        self.foreign.note_request_refusal(why, layout);
     }
 
     /// Limits, occupancy and counters; `owner` is the caller, whose own count

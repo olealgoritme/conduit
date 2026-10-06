@@ -255,6 +255,7 @@ pub fn foreign_layout(l: &SysLayout, size: u64) -> Option<FrLayout> {
         offset: 0,
         fourcc: l.fourcc,
         modifier: MOD_LINEAR,
+        plane1: None,
     };
     fl.validate_for(size).ok().map(|()| fl)
 }
@@ -2194,5 +2195,25 @@ mod tests {
             seq - 2,
             "the shown flip (still live) holds the floor below itself"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_format_refusals {
+    use super::*;
+
+    #[test]
+    fn the_level_5_primary_names_only_its_three_dxgi_formats() {
+        // The DXGI formats the shared-format table maps to fourccs beyond 32 bpp RGB
+        // (A8 65, R8 61, R8G8 49, R16 56, R16G16 35, B5G6R5 85, B5G5R5A1 86, B4G4R4A4 115,
+        // R10G10B10A2 24, R16G16B16A16 10 and 11, NV12 103, P010 104, P016 105, YUY2 107):
+        // none is a primary the KMD makes.
+        for dxgi in [
+            65, 61, 49, 56, 35, 85, 86, 115, 24, 10, 11, 103, 104, 105, 107, 0,
+        ] {
+            assert_eq!(fourcc_for_dxgi(dxgi), None, "{dxgi}");
+            assert_eq!(layout(1920, 1080, dxgi), Err(LayoutError::Format), "{dxgi}");
+        }
+        assert!(layout(1920, 1080, 87).is_ok());
     }
 }

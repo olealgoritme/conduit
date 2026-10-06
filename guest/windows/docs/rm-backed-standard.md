@@ -12,6 +12,16 @@ branch `s6-order2`); treat those as secondary evidence. "Unknown" is said where 
 refer to `kmd-rm-client.md`; `shared-foreign-surfaces.md`, `zero-copy-present.md` and `nvrm-escape.md` are in this
 directory.
 
+> **Status: PARKED (measured census).** A fresh Venus DWM restart reopened every window in 44 s with 125
+> OpenResource calls, all kind=1 DEVICE_MEMORY (UMD-made, about 15 processes, Venus ctxs 3-111); DWM opened NO
+> KMD-made STANDARD (kind=2) allocation in the T1 or T2 runs. The mem_type=0 opens seen earlier were NVK apps'
+> foreign ids. Mix: about 45 A8_UNORM (atlases and masks, 32x32 to 1024x1024), about 55 B8G8R8A8 (64x32 to
+> 1952x1088, one 5152x1440), about 25 R8G8B8A8 from two Chromium/Electron-style processes; pitches 256-aligned;
+> nearly all opens happen at DWM start, a few per minute in steady state. RM-backed GDI redirection is therefore
+> not on DWM's critical path: what matters for the NVK desktop is the shell processes moving to NVK with A8
+> resource ids (v321 shared formats) and the existing 32 bpp ids. Nothing below is scheduled; it stays as the
+> design to pick up if a census on another workload shows KMD-made STANDARD opens.
+
 ## 0. The answer in ten lines
 
 1. What DWM on NVK cannot open today is the CPU-visible KMD standard buffer (shadow, staging, every GDI surface type
@@ -469,8 +479,22 @@ needed by it except the shared opener work.
 4. Stride: may the KMD author 128-aligned pitches for these standard surfaces, or must NVK / DXVK pass an explicit
    stride? (The 256 rule is D3D12's cross-adapter requirement; `CrossAdaptCaps` is declared for IddCx and BLT-model
    redirection.)
+   **Answered (NVK side, format agent): author 128-byte-aligned pitches** (`align(width*bpp, 128)`, 3200 for 800 px
+   BGRA) for RM-backed STANDARD surfaces. That equals NVK's own LINEAR stride, avoids the render workarounds NVK
+   applies below 128 and lets an NVK LINEAR image built from the description match the record without an explicit
+   layout. An imported LINEAR rowPitch that is a multiple of 32 B is accepted, with the plane offset at plane
+   alignment; 64-aligned imports too but forces the workaround. The KMD therefore uses `PITCH_ALIGN_NVK_DEFAULT`
+   (128) for these surfaces, not the 256 cross-adapter rule.
 5. Can NVK on Windows create a LINEAR image with an explicit row pitch (`VK_EXT_image_drm_format_modifier` is not
    advertised there)? Who changes `nvkmd_rm_mem_import_resource` for system memory?
+   **Answered (NVK side): not today.** NVK does not expose `VK_EXT_image_drm_format_modifier` on Windows (gated on
+   `has_alloc_tiled = NVKMD_RM_WITH_DRM`, false in the Windows RM build); the import path rebuilds the image from the
+   D3D description (DXVK, OPTIMAL, block-linear) and only checks modifier, pitch and offset against the KMD record.
+   A KMD-authored LINEAR surface with a foreign pitch therefore cannot be opened yet. Needed on the NVK side:
+   (a) advertise the modifier extension on Windows (LINEAR plus GB20x block-linear), (b) DXVK creates foreign
+   LINEAR or KMD-made surfaces with DRM_FORMAT_MODIFIER tiling and an explicit layout from the trailer, (c) the
+   import check compares against the explicit layout. This gates stage S-B (RM-backed standard surfaces) and the
+   LINEAR part of S-A.
 6. Does the UMD derive "foreign" from the STANDARD identity bit (no KMD change), or should the KMD report 128 bytes?
    Is the size-query phase of `GetStandardAllocationDriverData` given the union data?
 7. For BLT-model producers on NVK: is the KMD's foreign copy (`ForeignCopy`) going to be on, or does the NVK UMD blit
