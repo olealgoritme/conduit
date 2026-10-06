@@ -436,6 +436,28 @@ All `MAX_*` values are read from the code. "Per process" really means per device
 | `HELIOS_NVRM_SCANOUT_FLIP_BYTES` / `MSG_HEADER_BYTES` | 64 / 16 | protocol | |
 | `DEVICE_TYPE_DRI_FIRST` | 512 | `virtio/nvrm.rs` | first DRM-node `device_type` (`512 + minor`); 255 control, GPU minors, 256 UVM, 257 UVM tools |
 
+**Nothing assumes a 4 GiB window.** The host sizes region 1 (the RM window) to the GPU's BAR1
+(`--window-mib`: 32 GiB with ReBAR, 128 GiB on a 96 GB card). Every byte count, offset and
+region length in the KMD is `u64`: the shared-memory capability is read as a 64-bit
+`virtio_pci_cap64` (`pci_caps.rs`), the host's `MmapResp` offset and size as two dwords each,
+`MMAP`/`MUNMAP` and the per-device quota in `u64`. The two places that turn the host's
+`offset` into a physical address (`nvrm_mmap`, the KMD's own client `kernel_map`) go through
+`helios_kmd_logic::window_units::place`: page aligned, inside the region, and no intermediate
+sum can wrap or leave the signed `PHYSICAL_ADDRESS` (a host that names a wrapping span is
+refused `BAD_RANGE`). The registry counters publish MiB through `window_units::mib_u32`
+(exact to 4 PiB, saturating beyond: `NvWinMb`, `NvAptMb`, `NvMapMb`). The window is never
+mapped into kernel address space as one range (no `MmMapIoSpace` of 32 GiB): each `MMAP`
+builds an MDL of PFNs over its own span (`blob_map::map_io_pages_to_user_prot`, 8 bytes of
+non-paged pool per 4 KiB page, so 2 KiB per MiB mapped; a full 32 GiB window is 64 MiB of
+MDLs, 128 GiB is 256 MiB), and nothing scans or keeps a bitmap of the window (the KMD does
+not place mappings in region 1: the host's extent allocator does, `host/.../shm.rs`). The
+KMD's own `window: WindowAllocator` belongs to region 3 (Venus host-visible blobs) and is a
+`u64` bump allocator plus a coalescing free list of at most 1024 ranges. What the guest OS
+must provide is a BAR big enough for all three regions (above-4G decoding in the VM
+firmware): the KMD reads the BAR base from config space and does not depend on the resource
+list. Tests: `kmd_logic/src/window_units.rs` (32, 64 and 128 GiB windows, offsets past 4 GiB,
+wrapping spans).
+
 What is owned, and what is checked:
 
 - **Handles**: `nvrm_handles` (owner, handle, device_type, latch); `Open` handles and, as
