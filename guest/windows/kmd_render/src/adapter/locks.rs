@@ -244,12 +244,9 @@ impl AdapterContext {
         // an infinite Executive/KernelMode wait at PASSIVE_LEVEL. The
         // SynchronizationEvent auto-clears on a satisfied wait (mutex acquire).
         let _ = unsafe {
-            KeWaitForSingleObject(
+            crate::sync::wait_logged(
                 self.venus_mutex.get() as PVOID,
-                0, // Executive
-                0, // KernelMode
-                0, // non-alertable
-                core::ptr::null_mut(),
+                helios_kmd_logic::stall_diag::lock::VENUS,
             )
         };
         crate::ddi::device_lost::venus_acquired(wait_started);
@@ -276,12 +273,9 @@ impl AdapterContext {
         // SAFETY: initialized in place by `init_kernel_events`; all callers are
         // PASSIVE-level display worker or allocation-lifecycle paths.
         let _ = unsafe {
-            KeWaitForSingleObject(
+            crate::sync::wait_logged(
                 self.scanout_mutex.get() as PVOID,
-                0, // Executive
-                0, // KernelMode
-                0, // non-alertable
-                core::ptr::null_mut(),
+                helios_kmd_logic::stall_diag::lock::SCANOUT,
             )
         };
         // `ScLkN` / `ScLkAcqT` / `ScLkRelT` (`ddi::stall_diag`): when the mutex was last taken

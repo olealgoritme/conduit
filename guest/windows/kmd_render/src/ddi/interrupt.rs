@@ -480,6 +480,8 @@ pub unsafe extern "C" fn dxgkddi_control_interrupt(
         adapter
             .vsync_enabled
             .store((enable != 0) as u32, Ordering::Release);
+        // `VsCiT`, `VsCiSt`: atomics only (DIRQL).
+        crate::ddi::stall_diag::note_control_vsync(enable != 0);
         return STATUS_SUCCESS;
     }
     STATUS_NOT_IMPLEMENTED
