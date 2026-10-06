@@ -840,9 +840,11 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     crate::diag::record_named_bytes(b"VpDmpT", dump_ms);
     // The timer's own tick count and those with the delivery gate closed, on the same dump
     // as `VpVsN` (`VpVsN` = `VsTickN` - `VsOffN`): see `ddi::stall_diag`.
-    crate::ddi::stall_diag::publish_vsync_ticks();
-    // The worker's wakes, waits and signals by cause (`HpdWk*`, `HpdTm*`, `HpdSg*`).
-    crate::ddi::stall_diag::publish_hpd_wake();
+    // The whole stall block with it (it includes the two mirrors that used to be written here
+    // alone): until v328 `HpdSite` / `HpdLoopT` / `StallT` were only ever refreshed by the `Nv*`
+    // mirror and a stuck-worker escape, so a dump read after an idle spell showed a worker frozen
+    // at the site of the last such write.
+    crate::ddi::stall_diag::publish_counters();
     crate::diag::record_named_bytes(b"VsMinGap", adapter.vsync_min_gap_published());
     crate::diag::record_named_bytes(b"VsFast", adapter.vsync_fast.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"VpVsEn", adapter.vsync_enabled.load(Ordering::Relaxed));

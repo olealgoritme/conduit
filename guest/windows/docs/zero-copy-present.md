@@ -1506,3 +1506,114 @@ the mode is 5120x1440@240 (Display settings and `SetDisplayConfig` query), DWM p
 is 4 within a second, `HpdLoopN` rises on a desktop that changes, `VsTickN` rises (the heartbeat runs), `HpdN` is 1 (per
 generation now). Run it with the NVK spin app running in at least two of the five, and once with `VsPowerMode` 1 and
 `VsWatchdog` 2 to see whether the v326 behaviour is what breaks it (it should be run last, after the defaults pass).
+
+## 16. Incident: "DWM stalled, HPD worker frozen at site 11" and a guest that would not shut down (v327)
+
+### 16.1 Symptom
+
+KMD 327.1, no device restart since boot. Two registry dumps 10 s apart (uptime 1121046 / 1131578 ms) read
+`HpdLoopT` = `HpdSiteT` = `HpdPhaseT` = `ScLkAcqT` = `ScLkRelT` = 824616, `HpdSite` 11 (`nvrm_publish_service`),
+`StallT` 824619, `HpdPassMaxUs` 30011, `VpPend` 0 then 2562804832. A later checked restart (`shutdown /s`) left the guest
+unresponsive (SSH timed out at the banner, the VM "running" with an idle CPU) until it was powered off from the host.
+
+### 16.2 What the counters actually say (read this before the hypotheses)
+
+1. **The worker was not blocked.** `HpdSite`, `HpdLoopN`, `HpdLoopT`, `ScLk*` are written ONLY by
+   `stall_diag::publish_counters`, and that ran last at `StallT` 824619, from the worker itself, three
+   milliseconds after it entered site 11 (the `Nv*` mirror calls it). Nobody refreshed it afterwards: the escape
+   thread refreshes it only while the worker "looks stuck", and an idle worker (asleep in `WAIT`, nothing pending) never
+   does. The `HpdSite` 11 / `HpdLoopT` 824616 pair is a snapshot of a worker that then went to sleep.
+   The live values of the same dump say so: `HpdWait` 0 (an infinite wait, `hpd_wake::wait_us`), `HpdWkEvt` 106648 ->
+   106772 (the worker woke 124 times in between), `HpdBusyUs` +10 ms, and `VpDmpT` 1129213 (the worker ran the periodic
+   dump right after the heartbeat's tick at 1129212). The worker enters `site::WAIT` (1) before every sleep, so a
+   sleeping worker never leaves 11 in the LIVE atomics.
+2. **`HpdPassMaxUs` 30011 is microseconds**: the longest pass was 30 ms (a pass that ran the ~8 ms `Vp*` dump plus
+   work), not 30 s. There is no 30 s timeout in the evidence.
+3. **`VpPend` 2562804832 is not garbage.** `scanout_trace::dump` writes `pending_vidpn_allocation as u32`: the
+   low 32 bits of the 64-bit allocation handle dxgkrnl passed to `SetVidPnSourceAddress` (the `Vp*D` ring holds
+   the same family of values, `PrCreateLo` 2562808192). 0 = nothing deferred (the first read, a dump from 824566, stale);
+   nonzero = a deferred programming waiting for the worker (the second read, taken right after the display woke).
+   `VpGate` 0 -> 1 is the programming gate raised for it.
+4. **Dump 1 was a stale dump.** Its `VpDmpT` is 824566, its `VsTickT` 640239: it is the registry as the last
+   dump left it, 300 s old. Dump 2 is the first fresh one (`VpDmpT` 1129213).
+5. **The heartbeat stopped at 640 s by a power call.** `VsArmN` 1, `VsDisN` 1, `VsCanN` 1, `PwrN` 1, `PwrUid` 0
+   (a child), `PwrD3N` 1, `VpVsEn` 0 (dxgkrnl disabled CRTC_VSYNC): the monitor child went to D3 (most likely the display
+   idle timeout, about ten minutes after boot) and `VsPowerMode` 0 (KMD 325 semantics) quiesced the heartbeat for
+   it. `FlipPubT` 625804 is the last flip the display retired before that. At 1129 s a D0 call (`PwrN` 2, `VsArmN` 2)
+   re-armed it and `VpEnt` / `VpPrgN` / `FlipPub` moved again, DWM with them.
+
+So the DWM "stall" is the display asleep (nothing asks for vsync, DWM presents nothing), and a user NVK scan-out source
+(`FsLastP` 824582, `FsEndBy` 5 = process exit at 824796) kept the screen alive through the foreign scanout while
+Windows believed the monitor off. It is not a worker deadlock.
+
+### 16.3 Ranked hypotheses, with what each predicts
+
+| rank | hypothesis | predicts | verdict |
+| --- | --- | --- | --- |
+| 1 | the monitor child's D3 (display idle timeout) with the heartbeat quiesced; the worker idle | `PwrChSt` 0, `VsCiSt` 0, `VsTickT` frozen, `HpdWait` 0, `HpdWkEvt` nearly still, `VpPend` set when the display wakes | matches every live value. Not a KMD defect by itself. |
+| 2 | stale snapshot misread (the worker "stuck at 11") | `StallT` older than `VpDmpT` | proved above; fixed by v328 (the block is written by every dump and by the escape thread when 5 s old) |
+| 3 | worker blocked in a registry write at site 11 | `HpdSite` 11 AND `StallT` / `HpdWkEvt` frozen, the escape publication firing (it fires when the worker looks stuck) | refuted: `HpdWkEvt` moves, `HpdWait` is 0, no escape publication. Still a latent risk (a registry write can block behind a hive flush), see 16.6 |
+| 4 | lock inversion worker / owner-death thread (`DestroyDevice`) | the scanout mutex held (`ScLkN` != `ScLkRelN`) | refuted for this run: `ScLkN` = `ScLkRelN` and the worker woke afterwards |
+| 5 | an infinite wait ending at a 30 s timeout | `HpdPassMaxUs` of 30 s | refuted (30 ms) |
+
+### 16.4 The guest that would not shut down
+
+NOT explained by the evidence: no dump exists from the wedge, and no stop-progress counter existed. What the audit
+of the paths a graceful shutdown takes (SetPowerState D3, StopDevice, RemoveDevice) found:
+
+* `quiesce_vsync` on a heartbeat that is already disarmed returns at the first `swap` (`kobj.rs` `disarm_vsync`); no wait.
+* `ExCancelTimer` does not wait for a callback; `ExDeleteTimer(cancel, wait)` is only in `Drop` (RemoveDevice), and a
+  disarmed heartbeat has no callback in flight. The embedded-timer fallback's `KeFlushQueuedDpcs` is used only when
+  `ExAllocateTimer` failed.
+* `stop_hpd` sets `hpd_stop` and THEN signals `hpd_event` (`kobj.rs` `stop_hpd`), so an idle worker with an infinite
+  wait wakes and exits; the joins are bounded (5 s on the exit event, 5 s on the thread), and a leak latch protects
+  RemoveDevice.
+* The host round trips of the stop are bounded by one `SweepBudget` plus one in-flight command (30 s,
+  `SYNC_ROUNDTRIP_TIMEOUT_MS`).
+* Three waits are INFINITE by design (they are mutexes): the venus mutex (`acquire_venus_mutex`, also taken by
+  `set_venus_client(None)` in StopDevice), the scanout mutex (`with_scanout_lifecycle`, taken by the display DDIs, the
+  worker, DestroyAllocation ...) and the content mutex (`PassiveMutex`). They are events, not owner-tracked mutexes: a
+  holder that never releases (a thread parked in a host round trip behind a stopped host, a path that forgot to
+  release, or a recursive take) blocks every later taker, including a power or stop path, with no timer to end it
+  and an idle CPU. These are the candidates for a wedge of this shape.
+
+Nothing found proves a defect there, so v328 makes the next one nameable instead of changing the locking.
+
+### 16.5 v328: what changed (diagnosis only; defaults and behaviour are v327's)
+
+* **No default changes.** `VsPowerMode` stays 0, `VsWatchdog` 0, `VsIdleWake` 0. Reason: in this incident dxgkrnl
+  itself had disabled CRTC_VSYNC (`VpVsEn` 0) for the sleeping display, so a heartbeat kept alive by `VsPowerMode` 1
+  would tick with the delivery gate closed (`VsOffN`) and deliver nothing; DWM waits for the display, not for the
+  heartbeat. `VsPowerMode` 1 is also the v326 behaviour whose restart mode loss (section 15) is unexplained. Test the
+  restart with `VsPowerMode` 1 on v328 before making it a default.
+* **The stall block is never a stale snapshot for long.** `scanout_trace::dump` now calls `stall_diag::publish_counters`
+  (the whole block, the two mirrors it wrote alone included), and the escape thread publishes the block when
+  it is 5 s old even if the worker does not look stuck (`escape_publish_due`, host-tested), at most twice a second.
+  Read the age as `VpDmpT - StallT` (`snapshot_is_stale`).
+* **The display's power history is visible**: `PwrT`, `PwrAdSt`, `PwrChSt` (1 D0, 0 not D0, 0xFF no call yet),
+  `VsCiT`, `VsCiSt` (the last `ControlInterrupt(CRTC_VSYNC)`), and `PwrStg` (1 entered, 3 done: a power call that never
+  reached 3 hung inside).
+* **The infinite mutex waits are sliced, not bounded** (`sync::wait_logged`): 5 s slices, each expiry counted
+  (`LkWaitN`, `LkWaitWh` 1 venus / 2 scanout / 3 content, `LkWaitT`, `LkWaitMs`) and the wait goes on, so mutual exclusion
+  is never given up and nothing can proceed unlocked; a holder that never lets go shows in the next dump.
+* **Stop progress**: `StopSub` / `StopSubT` (`stall_diag::stop_sub`, 17 steps of StopDevice, 20-22 for RemoveDevice),
+  written to the registry BEFORE each step. `StopStg` / `StopMs` (stages 1-10) are unchanged. After a wedge the next
+  boot's service key holds the last step entered: read `StopSub`, `StopSubT`, `PwrStg`, `PwrChSt`.
+
+### 16.6 Not done, and why
+
+The proposed move of every registry publication off the HPD worker onto a dedicated publisher thread is NOT in
+v328: the evidence refutes a blocked worker, and a new system thread with its own start, stop and join (and a
+stuck-registry deadlock of its own at StopDevice) cannot be built or run here. The worker's registry writes remain
+(`HpdDumpUs` / `HpdDumpN` = 8 ms per dump); `HpdPassMaxUs` is the number to watch (30 ms in this run). If a future
+dump shows `HpdSite` 11 or 12 with a LIVE `StallT` (`StallT` within a second of `VpDmpT`) and `HpdLoopT` frozen, the
+worker is blocked in a registry write and the publisher thread becomes the fix.
+
+### 16.7 Counters to read after a wedge or a stall
+
+`VpDmpT` and `StallT` (age of the block), `HpdWait` (0 = infinite), `HpdWkEvt` (moving = alive), `PwrChSt` / `PwrAdSt` /
+`PwrT`, `VsCiSt` / `VsCiT`, `VsArmN` / `VsDisN`, `VsTickT`, `LkWaitN` / `LkWaitWh` / `LkWaitMs`, `StopSub` / `StopSubT`,
+`StopStg` / `StopMs`, `PwrStg`.
+
+Tester: set the display idle timeout to 0 (`powercfg /x monitor-timeout-ac 0` and `-dc 0`) in the test image, or wake the
+display with input, before a user NVK run; the sleeping display is the reason DWM "stalled".

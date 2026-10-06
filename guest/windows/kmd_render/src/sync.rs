@@ -48,6 +48,33 @@ use wdk_sys::{KIRQL, KMUTANT, KSPIN_LOCK, PVOID};
 
 use crate::irql::PassiveLevel;
 
+/// `STATUS_TIMEOUT`.
+const STATUS_TIMEOUT: i32 = 0x0000_0102;
+
+/// An infinite, non-alertable, KernelMode wait on `object` that is made of 5 s slices: each slice
+/// that expires is counted (`LkWaitN`, `LkWaitWh` = `which`, `LkWaitMs`, `ddi::stall_diag`) and
+/// the wait goes on, so the semantics are an infinite wait's exactly (mutual exclusion is never
+/// given up) and a holder that never lets go shows in the next stall dump instead of nowhere.
+/// Returns the status of the satisfying wait.
+///
+/// # Safety
+/// `object` is an initialized dispatcher object that outlives the wait; PASSIVE_LEVEL.
+pub(crate) unsafe fn wait_logged(object: PVOID, which: u32) -> i32 {
+    let mut slices = 0u32;
+    loop {
+        // SAFETY: an all-zero LARGE_INTEGER is a valid plain integer union.
+        let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        timeout.QuadPart = helios_kmd_logic::stall_diag::LONG_WAIT_SLICE_100NS;
+        // SAFETY: per the fn contract.
+        let status = unsafe { KeWaitForSingleObject(object, 0, 0, 0, &mut timeout) };
+        if status != STATUS_TIMEOUT {
+            return status;
+        }
+        slices = slices.saturating_add(1);
+        crate::ddi::stall_diag::note_long_wait(which, slices);
+    }
+}
+
 /// A stable, fallibly-created atomic shared owner.
 ///
 /// Stable `Arc::new` routes allocation failure through the kernel panic handler,
@@ -165,12 +192,9 @@ impl PassiveMutex {
         // Executive=0, KernelMode=0, Alertable=FALSE and NULL timeout form a
         // legal indefinite PASSIVE_LEVEL wait.
         let status = unsafe {
-            KeWaitForSingleObject(
+            wait_logged(
                 self.raw.get().cast::<core::ffi::c_void>() as PVOID,
-                0,
-                0,
-                0,
-                core::ptr::null_mut(),
+                helios_kmd_logic::stall_diag::lock::CONTENT,
             )
         };
         (status >= 0).then_some(PassiveMutexGuard {

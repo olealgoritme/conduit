@@ -145,7 +145,21 @@ pub mod site {
 ///   exhausted; `VsRevN`: heartbeats the watchdog found dead and re-armed.
 /// * `PwrN`, `PwrUid`, `PwrD3N`: `DxgkDdiSetPowerState` calls, the last one's `DeviceUid`
 ///   (0xFFFFFFFF = the adapter), and those that were not D0.
-pub const COUNTERS: [&str; 74] = [
+/// * `PwrT`: interrupt time (ms) of the last `DxgkDdiSetPowerState`; `PwrAdSt`, `PwrChSt`: the
+///   adapter's and the monitor child's last state (1 = D0, 0 = not D0, 0xFF = no call yet);
+///   `PwrStg`: how far the last power call got (1 entered, 3 done).
+///   `VsCiT`, `VsCiSt`: time and argument (1 enable, 0 disable) of the last
+///   `ControlInterrupt(CRTC_VSYNC)`. A child at 0 with `VsCiSt` 0 is the monitor asleep: DWM
+///   presents nothing, no vsync is wanted and the worker idles; that is not a stall.
+/// * `LkWaitN`, `LkWaitWh`, `LkWaitT`, `LkWaitMs`: waits on the venus mutex (1), the scanout mutex
+///   (2) or the content mutex (3) that outlived one 5 s slice (they still wait, unchanged):
+///   count, which one last, when, and the longest wait seen so far, ms. All 0 on a healthy run.
+/// * `StopSub`, `StopSubT`: the finest step `DxgkDdiStopDevice` / `RemoveDevice` reached
+///   ([`stop_sub`]) and when; written BEFORE the step runs, so a hang names the step it is in.
+/// * Every value of the block written by `publish_counters` (`HpdLoopN`, `HpdSite`, `StallT` ...)
+///   is a SNAPSHOT as of `StallT`; only what the periodic dump writes itself (`VpDmpT`, `VsTickT`,
+///   `HpdWk*`, `HpdWait`, ...) is live as of `VpDmpT`. See [`snapshot_is_stale`].
+pub const COUNTERS: [&str; 86] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -225,6 +239,21 @@ pub const COUNTERS: [&str; 74] = [
     "ModeStgT",
     "ModeN",
     "ModeSt",
+    // v328 (docs/zero-copy-present.md, "The v327 incident"): the display's power history, which
+    // counters of the block are snapshots, the waits that outlived their slice, and how far a
+    // power transition or a stop got.
+    "PwrT",
+    "PwrAdSt",
+    "PwrChSt",
+    "VsCiT",
+    "VsCiSt",
+    "LkWaitN",
+    "LkWaitWh",
+    "LkWaitT",
+    "LkWaitMs",
+    "StopSub",
+    "StopSubT",
+    "PwrStg",
 ];
 
 // ---- the scanout mutex -----------------------------------------------------------------------
@@ -296,6 +325,75 @@ pub const fn worker_looks_stuck(i: StuckInput) -> bool {
         return true;
     }
     i.work_pending && age_ms(i.now, i.loop_t) > STUCK_LOOP_MS
+}
+
+/// The stall block is refreshed from the escape thread at least this often (ms) even when the
+/// worker does not look stuck, so a reader never meets a snapshot older than this plus one escape.
+pub const STALE_PUBLISH_MS: u32 = 5_000;
+/// The least gap between two escape-thread publications.
+pub const ESCAPE_PUBLISH_MS: u32 = 500;
+
+/// Whether the escape thread writes the stall block now: never twice within
+/// [`ESCAPE_PUBLISH_MS`] (`last_escape`, 0 = never), and then either the worker looks stuck or
+/// the block's last write by anyone (`last_publish`, `StallT`; 0 = never) is at least
+/// [`STALE_PUBLISH_MS`] old. The second arm keeps `HpdSite` / `HpdLoopT` of an idle worker from
+/// being read as live (the v327 incident: `HpdSite` 11 and `HpdLoopT` frozen at a snapshot
+/// taken by the worker itself, the worker asleep for the next 300 s).
+pub const fn escape_publish_due(stuck: bool, now: u32, last_escape: u32, last_publish: u32) -> bool {
+    if last_escape != 0 && age_ms(now, last_escape) < ESCAPE_PUBLISH_MS {
+        return false;
+    }
+    stuck || last_publish == 0 || age_ms(now, last_publish) >= STALE_PUBLISH_MS
+}
+
+/// Whether `HpdLoopT` / `HpdSite` must be read as a snapshot: the block's `StallT` is older than
+/// the live source of the same read (`VpDmpT` or `VsTickT`, `reading_ms`) by more than
+/// [`STALE_PUBLISH_MS`].
+pub const fn snapshot_is_stale(stall_t: u32, reading_ms: u32) -> bool {
+    reading_ms.wrapping_sub(stall_t) as i32 > STALE_PUBLISH_MS as i32
+}
+
+/// A wait that used to be infinite is made of slices this long (100 ns, relative); after each
+/// slice that expired the waiter counts it and waits again, so the semantics are unchanged and a
+/// holder that never lets go becomes visible (`LkWait*`) instead of silent.
+pub const LONG_WAIT_SLICE_100NS: i64 = -50_000_000;
+/// The same slice in milliseconds, for the `LkWaitMs` arithmetic.
+pub const LONG_WAIT_SLICE_MS: u32 = 5_000;
+
+/// Which lock a long wait was on (`LkWaitWh`).
+pub mod lock {
+    pub const VENUS: u32 = 1;
+    pub const SCANOUT: u32 = 2;
+    pub const CONTENT: u32 = 3;
+}
+
+/// The wait time after `slices` expired slices, ms, saturating.
+pub const fn long_wait_ms(slices: u32) -> u32 {
+    slices.saturating_mul(LONG_WAIT_SLICE_MS)
+}
+
+/// Finest steps of `DxgkDdiStopDevice` and `RemoveDevice` (`StopSub`), entered in this order.
+pub mod stop_sub {
+    pub const ENTER: u32 = 1;
+    pub const FLUSH_FIRST: u32 = 2;
+    pub const ISR_CLEARED: u32 = 3;
+    pub const VSYNC_STOP: u32 = 4;
+    pub const HPD_STOP: u32 = 5;
+    pub const HPD_STOPPED: u32 = 6;
+    pub const FINAL_PUBLISH: u32 = 7;
+    pub const RESET_PUBLICATION: u32 = 8;
+    pub const VENUS_CLIENT_DROP: u32 = 9;
+    pub const BLOB_SWEEP: u32 = 10;
+    pub const CTX_DESTROY: u32 = 11;
+    pub const REAP_PARKED: u32 = 12;
+    pub const HOST_SWEEP: u32 = 13;
+    pub const RETIRE_TRANSPORT: u32 = 14;
+    pub const SYSTEM_BACKINGS: u32 = 15;
+    pub const FLUSH_LAST: u32 = 16;
+    pub const DONE: u32 = 17;
+    pub const REMOVE_ENTER: u32 = 20;
+    pub const REMOVE_DROP: u32 = 21;
+    pub const REMOVE_DONE: u32 = 22;
 }
 
 // ---- knobs ---------------------------------------------------------------------------------
@@ -1346,6 +1444,48 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn escape_publish_is_rate_limited_and_refreshes_a_stale_block() {
+        assert!(escape_publish_due(true, 10_000, 0, 9_999));
+        assert!(!escape_publish_due(true, 10_000, 9_800, 9_999));
+        assert!(escape_publish_due(true, 10_000, 9_400, 9_999));
+        assert!(!escape_publish_due(false, 10_000, 0, 9_000));
+        assert!(escape_publish_due(false, 10_000, 0, 5_000));
+        assert!(!escape_publish_due(false, 10_000, 9_800, 5_000));
+        assert!(escape_publish_due(false, 10_000, 0, 0));
+        // The incident: a block written at 824619, an escape at 1129213.
+        assert!(escape_publish_due(false, 1_129_213, 0, 824_619));
+        assert!(snapshot_is_stale(824_619, 1_129_213));
+        assert!(!snapshot_is_stale(1_129_000, 1_129_213));
+        // A stamp ahead of the reading is never stale.
+        assert!(!snapshot_is_stale(1_129_300, 1_129_213));
+        // Wrapping clock.
+        assert!(escape_publish_due(false, 3, 0, u32::MAX - 9_000));
+        assert!(!escape_publish_due(false, 3, 0, u32::MAX - 100));
+    }
+
+    #[test]
+    fn long_wait_slices() {
+        assert_eq!(LONG_WAIT_SLICE_100NS, -(LONG_WAIT_SLICE_MS as i64) * 10_000);
+        assert_eq!(long_wait_ms(0), 0);
+        assert_eq!(long_wait_ms(3), 15_000);
+        assert_eq!(long_wait_ms(u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn stop_sub_steps_are_distinct_and_ordered() {
+        use stop_sub::*;
+        let seq = [
+            ENTER, FLUSH_FIRST, ISR_CLEARED, VSYNC_STOP, HPD_STOP, HPD_STOPPED, FINAL_PUBLISH,
+            RESET_PUBLICATION, VENUS_CLIENT_DROP, BLOB_SWEEP, CTX_DESTROY, REAP_PARKED,
+            HOST_SWEEP, RETIRE_TRANSPORT, SYSTEM_BACKINGS, FLUSH_LAST, DONE,
+        ];
+        for w in seq.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+        assert!(REMOVE_ENTER > DONE && REMOVE_DROP > REMOVE_ENTER && REMOVE_DONE > REMOVE_DROP);
     }
 
     #[test]
