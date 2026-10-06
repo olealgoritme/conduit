@@ -633,10 +633,19 @@ impl VirtioGpu {
         Some((s.owner, s.handle, s.device_type))
     }
 
-    /// Latch an `EventReady` for `handle` (see `NvrmHandleSlot::ready_latched`).
-    /// `false` if no process has it open.
-    pub(super) fn latch_nvrm_ready(&mut self, handle: u32) -> bool {
-        match self.nvrm_handles.iter_mut().find(|s| s.handle == handle) {
+    /// The table index of `handle` (any owner), for the DPC that serves one `EventReady`: ONE
+    /// scan under the virtio lock, shared by [`Self::fence_note_fired_at`] and
+    /// [`Self::latch_nvrm_ready_at`] (it used to be two per event, up to a ring's worth of
+    /// events per drain, over a table that can now hold 16384 entries). Valid until the table
+    /// changes: the caller holds the lock and changes nothing in between.
+    pub(super) fn nvrm_handle_index(&self, handle: u32) -> Option<usize> {
+        self.nvrm_handles.iter().position(|s| s.handle == handle)
+    }
+
+    /// Latch an `EventReady` for the handle at `idx` (see `NvrmHandleSlot::ready_latched`).
+    /// `false` if no process has it open (`idx` is `None`).
+    pub(super) fn latch_nvrm_ready_at(&mut self, idx: Option<usize>) -> bool {
+        match idx.and_then(|i| self.nvrm_handles.get_mut(i)) {
             Some(s) => {
                 s.ready_latched = true;
                 true
@@ -723,11 +732,10 @@ impl VirtioGpu {
     /// An `EventReady{handle, status}` for a fence: record that it fired (the first
     /// one only; see `FenceMeta::set_fired`). The caller routes by what it was
     /// attached to.
-    pub(super) fn fence_note_fired(&mut self, handle: u32, status: i32) -> FenceFire {
-        match self
-            .nvrm_handles
-            .iter_mut()
-            .find(|s| s.handle == handle && is_fence_type(s.device_type))
+    pub(super) fn fence_note_fired_at(&mut self, idx: Option<usize>, status: i32) -> FenceFire {
+        match idx
+            .and_then(|i| self.nvrm_handles.get_mut(i))
+            .filter(|s| is_fence_type(s.device_type))
         {
             None => FenceFire::NotFence,
             Some(s) => {

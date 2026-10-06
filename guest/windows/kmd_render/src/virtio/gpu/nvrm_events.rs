@@ -464,7 +464,9 @@ impl VirtioGpu {
         // first one also routes to what the fence was attached to
         // (`docs/rm-fence-marker.md`): both are flag writes under this lock.
         let mut wake_worker = false;
-        match self.fence_note_fired(handle, status) {
+        // One scan of the handle table for the whole event (the DPC, under the virtio lock).
+        let idx = self.nvrm_handle_index(handle);
+        match self.fence_note_fired_at(idx, status) {
             FenceFire::NotFence => {}
             FenceFire::Repeat => {
                 NVRM_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
@@ -493,7 +495,7 @@ impl VirtioGpu {
         });
         if woke != 0 {
             NVRM_EV_SIGNALS.fetch_add(woke as u32, Ordering::Relaxed);
-        } else if self.latch_nvrm_ready(handle) {
+        } else if self.latch_nvrm_ready_at(idx) {
             NVRM_EV_LATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             match self.note_nvrm_fence_ready(handle, status) {
