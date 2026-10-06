@@ -328,3 +328,18 @@ Run each step only in a quiet window agreed with the install agent. Always end w
   logs to `umd-<pid>-<creation time>.log` (Rust `umd_common::log` and the D3D11 bridge agree on the
   name).
 * The backend logs no `ScanoutFlip` lines at its current level (lines 3194843 to 3197753).
+
+### T4 / T4b (2026-10-06 12:45 and 12:47, 22.22.323.1 with bc785b2; `ForeignFlip=1`, `DwmIcd=nvk`)
+
+* **DWM on NVK no longer stalls.** It flips continuously at about 2.5 flips/s over 38 s:
+  `FfProg` 40 to 116, `FfFrames` 74 to 219, `VpFlip` 486 to 581.
+* That rate fits a serialised 250 ms ForeignFlip host round trip (at most 4/s), so pacing is the next
+  KMD item.
+* Every logged present source has a foreign id: the three 5120x1440 primaries rotate, plus a
+  1024x1024 non-primary surface at start. No present was made from a KMD placeholder.
+* `FfRef`, `FfFlipFail`, `FfStale`, `FfGaveUp` and `PBRet` are all 0.
+* `FkKeep` and the `Fk*` family stay 0: every flip went through ForeignFlip, so the kept-picture path
+  was not exercised.
+* `FfNoRec` rises only while DWM runs on Venus.
+* Mirrors: `VsCnt`/`VsCntT` frozen; `ScVs` flat while `VpVsN` advances.
+* Reverts clean; no crash.
