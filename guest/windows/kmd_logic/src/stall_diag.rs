@@ -183,7 +183,7 @@ pub mod site {
 ///   `VsWdSCbI`, `VsWdSCbO`, `VsWdSSyT`: what it saw the last time it acted (when, armed, the
 ///   reference and deadline in ms, the silence, the callback counts, when the last synchronized
 ///   call began).
-pub const COUNTERS: [&str; 123] = [
+pub const COUNTERS: [&str; 129] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -319,6 +319,16 @@ pub const COUNTERS: [&str; 123] = [
     "VsWdSCbO",
     "VsWdSSyT",
     "VsWdTmEff",
+    // Flip retirement across a device restart (`restart_flip`, docs/zero-copy-present.md "DWM
+    // after a device restart"): the programming state found at the two edges, the heartbeat's
+    // address at StopDevice entry and at StartDevice exit, the newest address dxgkrnl issued,
+    // their high bytes, and the worker wake StartDevice owed.
+    "ScRestPend",
+    "ScRestAdr0",
+    "ScRestAddr",
+    "ScRestIss",
+    "ScRestHi",
+    "ScRestSig",
 ];
 
 // ---- the scanout mutex -----------------------------------------------------------------------

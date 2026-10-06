@@ -311,12 +311,17 @@ pub const WORKER_FLIP_TIMEOUT_MS: u64 = 250;
 /// per reason. `FkDefBud` and `FkVenus` are NOT flip completions: they count the two opt-in
 /// diagnostic exits of `stall_diag` (a Deferred programming past its `DeferBudget` published
 /// kept, and a Venus GaveUp / permanent reject published kept under `FlipWdogMs`); neither is in
-/// `FkKeep` or `FkWhy`.
-pub const COUNTERS: [&str; 18] = [
+/// `FkKeep` or `FkWhy`. `FkGen` and `FkStale` (`restart_flip`) are subsets: `FkGen` the unpaired
+/// `SetVidPnSourceAddress` handles (`FkDdi`) that were allocations of an OLDER transport
+/// generation; `FkStale` the flips the worker completed kept because its source was dead (a
+/// handle that no longer resolves, an abandoned producer), any allocation class; both ARE in
+/// `FkKeep` (`FkStale` through the `Unresolved` / `Rejected` reasons it is counted under).
+pub const COUNTERS: [&str; 20] = [
     "FkKeep", "FkWhy", "FkWorker", "FkDma", "FkAsync", "FkDdi", "FkDmaRec", "FkPhFlip", "FkKeep01",
     "FkKeep02",
     "FkKeep03", "FkKeep04", "FkKeep05", "FkKeep06", "FkKeep07", "FkKeep08",
     "FkDefBud", "FkVenus",
+    "FkGen", "FkStale",
 ];
 
 /// Name of the per-reason counter: `FkKeep01` .. `FkKeep08`.

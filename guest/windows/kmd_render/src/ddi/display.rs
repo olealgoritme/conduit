@@ -1964,6 +1964,12 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
             KeepWhy::Unresolved,
             crate::ddi::flip_keep::Lane::Ddi,
         );
+        // `FkGen`: the handle is one of ours from an OLDER transport generation (a flip naming an
+        // allocation that survived a device restart in dxgkrnl's tables), told apart from null and
+        // foreign ones. Atomics only: this DDI can run at DIRQL.
+        if unsafe { crate::ddi::create_allocation::alloc_is_stale_generation(adapter, h_alloc) } {
+            crate::ddi::flip_keep::note_stale_generation_ddi();
+        }
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -2548,6 +2554,10 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
                 let completed = unsafe {
                     complete_foreign_flip_of(adapter, h_alloc, reject.flip_outcome(false))
                 };
+                // A flip with no live source (handle gone or of another generation, producer
+                // abandoned) completes whatever its class: nothing can ever bind it.
+                let completed = completed
+                    || unsafe { complete_dead_source(adapter, h_alloc, reject, completed) };
                 // `FlipWdogMs` only: a Venus flip leaves here too (`FkVenus`).
                 unsafe { keep_venus_exit_under_watchdog(adapter, h_alloc, completed) };
                 if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
@@ -2792,6 +2802,40 @@ unsafe fn complete_foreign_flip_of(
     )
 }
 
+/// A flip whose programming had NO LIVE SOURCE completes as a kept picture whatever the allocation
+/// class (`helios_kmd_logic::restart_flip`): the handle no longer resolves (destroyed, or an
+/// allocation of another transport generation: `scanout_alloc_info` answered `None`) or the
+/// producer / host resource is gone (`ProducerAbandoned`). Nothing can ever bind such a flip, and
+/// `flip_completion::decide` answers `None` for a Venus source, so before this dxgkrnl waited for
+/// it for ever and, with a flip queue depth of 1, issued no later flip. `completed`: a foreign or
+/// hollow completion already published. Returns whether this published. PASSIVE, under the scanout
+/// lifecycle lock; the status returned to dxgkrnl is unchanged.
+///
+/// # Safety
+/// `h_alloc` is the exact allocation handle Windows published, as for [`program_vidpn_source`].
+unsafe fn complete_dead_source(
+    adapter: &AdapterContext,
+    h_alloc: HANDLE,
+    reject: ScanoutReject,
+    completed: bool,
+) -> bool {
+    use helios_kmd_logic::restart_flip::{worker_dead_exit, DeadKind};
+    if completed {
+        return false;
+    }
+    let (kind, why) = match reject {
+        ScanoutReject::BadAlloc => (DeadKind::NoSuchAllocation, KeepWhy::Unresolved),
+        ScanoutReject::ProducerAbandoned => (DeadKind::ProducerAbandoned, KeepWhy::Rejected),
+        _ => return false,
+    };
+    let allocation = unsafe { crate::ddi::create_allocation::flip_completion_info(adapter, h_alloc) }
+        .map(|(_, address)| address);
+    match worker_dead_exit(kind, allocation, crate::ddi::stall_diag::last_issued_address()) {
+        Some(address) => crate::ddi::flip_keep::keep_dead_source(adapter, address, why),
+        None => false,
+    }
+}
+
 /// A Deferred programming spent its `DeferBudget`: publish the flip's address kept, for any class
 /// of allocation (`FkDefBud`). A handle that no longer resolves publishes nothing.
 ///
@@ -3028,7 +3072,10 @@ unsafe fn apply_vidpn_source_address_locked(
             release_leases_for_reject(adapter);
             // No retry here, so every refusal is the end of this flip: a foreign primary completes
             // it as a kept picture (the status below is unchanged), a Venus allocation does not.
-            unsafe { complete_foreign_flip_of(adapter, h_alloc, reject.flip_outcome(false)) };
+            let completed = unsafe {
+                complete_foreign_flip_of(adapter, h_alloc, reject.flip_outcome(false))
+            };
+            unsafe { complete_dead_source(adapter, h_alloc, reject, completed) };
             if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
                 interval.retain_for_retry();
             }

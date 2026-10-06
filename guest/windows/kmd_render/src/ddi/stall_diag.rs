@@ -283,6 +283,11 @@ static FLIP_PUB_T: AtomicU32 = AtomicU32::new(0);
 /// word instead, so an OLDER flip's address is never fired for this one (`FlipWdBig`).
 pub(crate) fn note_flip_issued(address: u64) {
     let seq = FLIP_ISS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    // The newest address dxgkrnl issued, for the restart seed (`restart_flip::seed_address`).
+    // Never zeroed by a generation, and a zero address (nothing assigned) never replaces it.
+    if address != 0 {
+        LAST_ISSUED.store(address, Ordering::Release);
+    }
     match sd::pack_flip(seq, address) {
         Some(word) => FLIP_WORD.store(word, Ordering::Release),
         None => {
@@ -314,6 +319,17 @@ pub(crate) fn note_published(address: u64) {
 /// The newest issued flip as one packed word (`stall_diag::pack_flip`: its number and address),
 /// and the number of the newest flip that is DONE (published by anyone, the watchdog included).
 static FLIP_WORD: AtomicU64 = AtomicU64::new(0);
+/// The newest address dxgkrnl ever issued in a flip (`SetVidPnSourceAddress`, or a DMA flip
+/// record), full width. Process-lifetime: [`start_generation`] deliberately leaves it alone,
+/// because dxgkrnl's own flip queue survives a device restart and a flip it issued before the
+/// stop may be the one it still waits to see retired. Read by `reset_display_publication_state`
+/// to seed the heartbeat's address and by the worker's dead-source exit.
+static LAST_ISSUED: AtomicU64 = AtomicU64::new(0);
+
+/// The newest address dxgkrnl issued in a flip, 0 if it never did. Atomics only, any IRQL.
+pub(crate) fn last_issued_address() -> u64 {
+    LAST_ISSUED.load(Ordering::Acquire)
+}
 static DONE_SEQ: AtomicU32 = AtomicU32::new(0);
 /// The vsync DPC's state between ticks (`stall_diag::PendState`): the consecutive-pending run
 /// (`VsPendN`), its maximum (`VsPendMax`), the no-publication clock and the `FlipPub` last seen.
@@ -982,6 +998,70 @@ pub(crate) fn note_start_entry(adapter: &AdapterContext, hpd_indicates: u32) {
     ENT_HPD_TH.store(u32::from(adapter.hpd_worker_registered()), Ordering::Relaxed);
     ENT_HPD_N.store(hpd_indicates, Ordering::Relaxed);
     ENT_VS_TK.store(VS_TICKS.load(Ordering::Relaxed), Ordering::Relaxed);
+    // The programming state this StartDevice inherited (the stop's reset already cleared it, so
+    // anything here is a start with no stop before it) and the address the heartbeat carries.
+    REST_PEND_START.store(adapter.restart_programming_flags(), Ordering::Relaxed);
+    REST_ISS.store(last_issued_address(), Ordering::Relaxed);
+}
+
+/// Flip retirement across a restart (`restart_flip`): the programming state at StopDevice and at
+/// StartDevice entry, the heartbeat's address at StopDevice entry and at StartDevice exit, the
+/// newest address dxgkrnl issued, and the worker wake StartDevice owed. NOT zeroed by
+/// [`start_generation`]: they describe the restart itself and are written around it.
+static REST_PEND_STOP: AtomicU32 = AtomicU32::new(0);
+static REST_PEND_START: AtomicU32 = AtomicU32::new(0);
+static REST_ADDR_STOP: AtomicU64 = AtomicU64::new(0);
+static REST_ADDR_EXIT: AtomicU64 = AtomicU64::new(0);
+static REST_ISS: AtomicU64 = AtomicU64::new(0);
+static REST_SIG: AtomicU32 = AtomicU32::new(0);
+
+/// StopDevice, after the worker and the heartbeat were stopped and BEFORE the display state is
+/// reset: what was pending, and the address the heartbeat was carrying. PASSIVE.
+pub(crate) fn note_stop_entry(adapter: &AdapterContext) {
+    REST_PEND_STOP.store(adapter.restart_programming_flags(), Ordering::Relaxed);
+    REST_ADDR_STOP.store(
+        adapter.last_primary_address.load(Ordering::Acquire),
+        Ordering::Relaxed,
+    );
+}
+
+/// StartDevice, last: the heartbeat's address now (the restart seed), and the one worker wake a
+/// programming that survived (or was raised while this start ran) is owed. Writes the `ScRest*`
+/// block. PASSIVE.
+pub(crate) fn note_restart_exit(adapter: &AdapterContext) {
+    let flags = adapter.restart_programming_flags();
+    REST_ADDR_EXIT.store(
+        adapter.last_primary_address.load(Ordering::Acquire),
+        Ordering::Relaxed,
+    );
+    if helios_kmd_logic::restart_flip::needs_worker_signal(flags & 1 != 0, flags & 2 != 0) {
+        REST_SIG.fetch_add(1, Ordering::Relaxed);
+        adapter.signal_hpd();
+    }
+    publish_restart();
+}
+
+/// The `ScRest*` block (PASSIVE).
+pub(crate) fn publish_restart() {
+    use crate::diag::record_named_bytes as rec;
+    let stop = REST_ADDR_STOP.load(Ordering::Relaxed);
+    let iss = REST_ISS.load(Ordering::Relaxed);
+    let exit = REST_ADDR_EXIT.load(Ordering::Relaxed);
+    rec(
+        b"ScRestPend",
+        helios_kmd_logic::restart_flip::pending_breadcrumb(
+            REST_PEND_STOP.load(Ordering::Relaxed),
+            REST_PEND_START.load(Ordering::Relaxed),
+        ),
+    );
+    rec(b"ScRestAdr0", stop as u32);
+    rec(b"ScRestAddr", exit as u32);
+    rec(b"ScRestIss", iss as u32);
+    rec(
+        b"ScRestHi",
+        helios_kmd_logic::restart_flip::high_bytes(stop, iss, exit),
+    );
+    rec(b"ScRestSig", REST_SIG.load(Ordering::Relaxed));
 }
 
 /// The HPD worker's phase this generation (1 thread entered, 2 StartDevice's return seen, 3 first
@@ -1066,6 +1146,7 @@ fn publish_breadcrumbs() {
     rec(b"HpdPhaseT", HPD_PHASE_T.load(Ordering::Relaxed));
     rec(b"HpdFirstT", HPD_FIRST_T.load(Ordering::Relaxed));
     publish_mode();
+    publish_restart();
 }
 
 /// A new generation (StartDevice): zero every counter of this module (never the knobs, and not
