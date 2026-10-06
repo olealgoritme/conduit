@@ -621,6 +621,40 @@ unsafe fn open_allocation_context<'a>(h: HANDLE) -> Option<&'a OpenAllocationCon
     Some(unsafe { &*p })
 }
 
+/// Why `present_alloc_info(adapter, h)` is `None` (or that it is not): the same steps, side-effect
+/// free (no `OaBadH` / `PgStale` count: the resolution that failed already counted). Called only
+/// at a Present refusal, to name the cause in `PrUnrWhy`.
+///
+/// # Safety
+/// As [`present_alloc_info`].
+pub(crate) unsafe fn present_alloc_cause(
+    adapter: Option<&AdapterContext>,
+    h: HANDLE,
+) -> helios_kmd_logic::present_foreign::HandleCause {
+    use helios_kmd_logic::present_foreign::HandleCause as C;
+    if h.is_null() {
+        return C::Null;
+    }
+    let p = h as *const OpenAllocationContext;
+    if !p.is_aligned() {
+        return C::NotOurs;
+    }
+    // SAFETY: as `open_allocation_context`: only the magic is read, through a raw unaligned read.
+    let magic = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*p).magic)) };
+    if magic != OPEN_ALLOCATION_CTX_MAGIC {
+        return C::NotOurs;
+    }
+    // SAFETY: the magic matched, so this is one of our contexts.
+    let open = unsafe { &*p };
+    if adapter.is_some_and(|a| !a.is_current_generation(open.serial)) {
+        return C::StaleGeneration;
+    }
+    if open.present.is_none() {
+        return C::NoIdentity;
+    }
+    C::Resolved
+}
+
 /// Non-null open-allocation handles that failed alignment or the magic check.
 ///
 /// Must read 0: every handle reaching here came from our own

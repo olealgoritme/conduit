@@ -119,9 +119,12 @@ pub enum Refusal {
     /// direct-scan-out table (the table was full, or it was created before the knob was read),
     /// so there is no global handle to hand to the programming path.
     FlipUnregistered = 14,
-    /// Blt: a source or destination handle resolves to no allocation, while the transport holds
-    /// a live foreign record or `ForeignFlip` is on (see [`decide_unresolved`]).
+    /// Blt: the adapter, the source or the destination handle resolves to nothing (see
+    /// [`decide_unresolved`]). Unconditional: it is not about a foreign allocation.
     Unresolved = 15,
+    /// Blt with `ColorFill` and no source allocation: a fill has no source. The driver writes no
+    /// content for it (a no-op, as `docs/kmd-rm-client.md` 15.16 has always said).
+    ColorFill = 16,
 }
 
 impl Refusal {
@@ -139,7 +142,7 @@ impl Refusal {
             | Refusal::FlipNotScanout => Roles::Source,
             Refusal::BltBegin => Roles::Destination,
             Refusal::FlipUnregistered => Roles::Source,
-            Refusal::Unresolved => Roles::Either,
+            Refusal::Unresolved | Refusal::ColorFill => Roles::Either,
             Refusal::BltFormat
             | Refusal::BltDescriptor
             | Refusal::BltExtent
@@ -158,7 +161,7 @@ impl Refusal {
             Refusal::FlipNotScanout | Refusal::FlipUnregistered => matches!(arm, Arm::FlipDma),
             Refusal::TailBoundary => true,
             // Decided by `decide_unresolved`, which has no foreign facts to read.
-            Refusal::Unresolved => false,
+            Refusal::Unresolved | Refusal::ColorFill => false,
             _ => matches!(arm, Arm::Blt),
         }
     }
@@ -204,12 +207,16 @@ pub struct Why {
     pub source: bool,
     /// The destination was foreign (Blt only).
     pub destination: bool,
+    /// [`Refusal::Unresolved`] only: the context's adapter did not resolve. For that refusal
+    /// `source` / `destination` mean UNRESOLVED, not foreign.
+    pub adapter: bool,
 }
 
 impl Why {
-    /// `arm << 12 | (destination << 9 | source << 8) | refusal`.
+    /// `arm << 12 | adapter << 10 | destination << 9 | source << 8 | refusal`.
     pub const fn code(&self) -> u32 {
         (self.arm.code() << 12)
+            | ((self.adapter as u32) << 10)
             | ((self.destination as u32) << 9)
             | ((self.source as u32) << 8)
             | self.refusal.code()
@@ -266,42 +273,70 @@ pub const fn decide(
             refusal,
             source: src,
             destination: dst,
+            adapter: false,
         },
         effect: refusal.effect(),
     }
 }
 
-/// What a Present's unresolved handle does (`PBCpy` 0xE1, `PBRetSite` 4 / 5).
+/// Why a handle resolved to no allocation (`PrUnrWhy`), from `present_alloc_info`'s steps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandleCause {
+    /// It resolved.
+    Resolved = 0,
+    /// The list slot holds a NULL `hDeviceSpecificAllocation`: the entry is not part of this
+    /// operation (a `ColorFill` has no source; a Blt may name no destination).
+    Null = 1,
+    /// Not aligned for, or without the magic of, an `OpenAllocationContext` (counted `OaBadH`):
+    /// a handle this driver did not mint, or one that was closed.
+    NotOurs = 2,
+    /// The open belongs to an older transport generation (counted `PgStale` style,
+    /// `STALE_ALLOC_REFUSED`): a device restart left it behind.
+    StaleGeneration = 3,
+    /// An open context of ours that recorded no identity (the private data had none of the two
+    /// layouts), so `present` is `None`.
+    NoIdentity = 4,
+}
+
+/// `PrUnrWhy`: `source << 0 | destination << 4 | adapter_unresolved << 8`.
+pub const fn pack_causes(
+    adapter_unresolved: bool,
+    source: HandleCause,
+    destination: HandleCause,
+) -> u32 {
+    (source as u32) | ((destination as u32) << 4) | ((adapter_unresolved as u32) << 8)
+}
+
+/// What a Blt does when it cannot resolve what it is to copy (`PBCpy` 0xE1, `PBRetSite` 3, 4, 5).
 ///
-/// A Blt whose source or destination handle resolves to no allocation cannot say whether it was a
-/// foreign one (the open context is gone, or never was ours). That is a failed Present for a
-/// Venus-only session, which keeps failing exactly as before. While the transport holds a live
-/// foreign record, or `ForeignFlip` is on, the unresolved handle is most plausibly a foreign
-/// swap-chain buffer the KMD cannot name any more, and the Blt is a counted success that leaves
-/// the destination as it was (a lost picture instead of a failed Present, which dxgkrnl turns
-/// into a device error for DWM).
-///
-/// `source_resolved` / `destination_resolved`: the handle resolved to an allocation. The Why's
-/// `source` / `destination` bits name the UNRESOLVED side(s) here, not a foreign one.
+/// It succeeds without copying, on EVERY transport (Venus-only included): the Present arrives from
+/// dxgkrnl with entries this driver cannot name, and failing it is a device error for DWM, while the
+/// cost of skipping is one frame's picture. Observed (T2): a Venus-only DWM restart hit this site on
+/// its first presents. `Refusal::Unresolved` names which of adapter / source / destination did not
+/// resolve; a `ColorFill` Blt (no source by definition) with a resolved destination is
+/// `Refusal::ColorFill`, a no-op. A Blt whose three resolve is not this refusal.
 pub const fn decide_unresolved(
     arm: Arm,
+    adapter_resolved: bool,
     source_resolved: bool,
     destination_resolved: bool,
-    foreign_live: bool,
-    foreign_flip_knob: bool,
+    color_fill: bool,
 ) -> Verdict {
-    if !matches!(arm, Arm::Blt) || (source_resolved && destination_resolved) {
+    if !matches!(arm, Arm::Blt) || (adapter_resolved && source_resolved && destination_resolved) {
         return Verdict::Proceed;
     }
-    if !foreign_live && !foreign_flip_knob {
-        return Verdict::Proceed;
-    }
+    let fill_only = color_fill && adapter_resolved && destination_resolved;
     Verdict::Skip {
         why: Why {
             arm,
-            refusal: Refusal::Unresolved,
-            source: !source_resolved,
+            refusal: if fill_only {
+                Refusal::ColorFill
+            } else {
+                Refusal::Unresolved
+            },
+            source: !fill_only && !source_resolved,
             destination: !destination_resolved,
+            adapter: !adapter_resolved,
         },
         effect: Effect::LeaveDestination,
     }
@@ -461,7 +496,7 @@ mod tests {
         identity_foreign: true,
         table_record: false,
     };
-    const ALL: [Refusal; 15] = [
+    const ALL: [Refusal; 16] = [
         Refusal::BltNoDestination,
         Refusal::BltFormat,
         Refusal::BltSourceKind,
@@ -477,6 +512,7 @@ mod tests {
         Refusal::TailBoundary,
         Refusal::FlipUnregistered,
         Refusal::Unresolved,
+        Refusal::ColorFill,
     ];
     const ARMS: [Arm; 3] = [Arm::Blt, Arm::FlipMmio, Arm::FlipDma];
 
@@ -802,52 +838,68 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_handles_skip_only_with_foreign_activity() {
-        // Both resolved: not this refusal.
-        for live in [false, true] {
-            for knob in [false, true] {
-                assert_eq!(
-                    decide_unresolved(Arm::Blt, true, true, live, knob),
-                    Verdict::Proceed
-                );
-            }
-        }
-        // Venus-only operation keeps failing.
-        for (s, d) in [(false, true), (true, false), (false, false)] {
+    fn unresolved_handles_skip_on_every_transport() {
+        // All three resolved: not this refusal.
+        for fill in [false, true] {
             assert_eq!(
-                decide_unresolved(Arm::Blt, s, d, false, false),
+                decide_unresolved(Arm::Blt, true, true, true, fill),
                 Verdict::Proceed
             );
         }
-        // A live foreign record or the knob turns it into a skip, naming the unresolved side.
-        for (live, knob) in [(true, false), (false, true), (true, true)] {
-            let Verdict::Skip { why, effect } =
-                decide_unresolved(Arm::Blt, false, true, live, knob)
-            else {
-                panic!("not skipped")
+        // Any unresolved side skips, with no foreign record or knob involved (T2: a Venus-only
+        // DWM restart).
+        for (a, s, d) in [
+            (true, false, true),
+            (true, true, false),
+            (true, false, false),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let Verdict::Skip { why, effect } = decide_unresolved(Arm::Blt, a, s, d, false) else {
+                panic!("not skipped {a} {s} {d}")
             };
-            assert!(why.source && !why.destination);
             assert_eq!(why.refusal, Refusal::Unresolved);
+            assert_eq!((why.adapter, why.source, why.destination), (!a, !s, !d));
             assert_eq!(effect, Effect::LeaveDestination);
-            assert_eq!(why.code(), (1 << 12) | (1 << 8) | 15);
-            let Verdict::Skip { why, .. } = decide_unresolved(Arm::Blt, true, false, live, knob)
-            else {
-                panic!("not skipped")
-            };
-            assert!(!why.source && why.destination);
-            let Verdict::Skip { why, .. } = decide_unresolved(Arm::Blt, false, false, live, knob)
-            else {
-                panic!("not skipped")
-            };
-            assert!(why.source && why.destination);
         }
+        let Verdict::Skip { why, .. } = decide_unresolved(Arm::Blt, true, false, true, false)
+        else {
+            panic!()
+        };
+        assert_eq!(why.code(), (1 << 12) | (1 << 8) | 15);
+        let Verdict::Skip { why, .. } = decide_unresolved(Arm::Blt, false, true, true, false)
+        else {
+            panic!()
+        };
+        assert_eq!(why.code(), (1 << 12) | (1 << 10) | 15);
+        // A fill has no source: a no-op of its own reason, naming nothing unresolved.
+        let Verdict::Skip { why, .. } = decide_unresolved(Arm::Blt, true, false, true, true) else {
+            panic!()
+        };
+        assert_eq!(why.refusal, Refusal::ColorFill);
+        assert_eq!(why.code(), (1 << 12) | 16);
+        // A fill whose destination is also unresolved is an unresolved handle.
+        let Verdict::Skip { why, .. } = decide_unresolved(Arm::Blt, true, false, false, true)
+        else {
+            panic!()
+        };
+        assert_eq!(why.refusal, Refusal::Unresolved);
         // Flips are not covered.
         for arm in [Arm::FlipMmio, Arm::FlipDma] {
             assert_eq!(
-                decide_unresolved(arm, false, true, true, true),
+                decide_unresolved(arm, false, false, false, false),
                 Verdict::Proceed
             );
         }
+    }
+
+    #[test]
+    fn causes_pack_into_one_word() {
+        use HandleCause::*;
+        assert_eq!(pack_causes(false, Resolved, Resolved), 0);
+        assert_eq!(pack_causes(false, Null, Resolved), 1);
+        assert_eq!(pack_causes(false, Resolved, StaleGeneration), 0x30);
+        assert_eq!(pack_causes(true, NoIdentity, NotOurs), 0x124);
     }
 
     #[test]

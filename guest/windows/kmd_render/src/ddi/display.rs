@@ -525,20 +525,17 @@ unsafe fn dxgkddi_present_inner(
 
             let (Some(adapter), Some(source), Some(destination)) = (adapter, src_info, dst_info)
             else {
-                // A foreign source with a destination handle that resolves to nothing: no
-                // destination to write, so the Present is a counted success. An unresolved
-                // SOURCE (or adapter) is not skipped.
-                if adapter.is_some()
-                    && dst_info.is_none()
-                    && crate::ddi::present_foreign::skip(
-                        PresentArm::Blt,
-                        Refusal::BltNoDestination,
-                        adapter,
-                        src_info.as_ref(),
-                        None,
-                    )
-                    .is_some()
-                {
+                // The adapter, the source or the destination did not resolve (or a `ColorFill`, which
+                // has no source): a counted success on every transport, not a failed Present. See
+                // `helios_kmd_logic::present_foreign::decide_unresolved` and
+                // `docs/zero-copy-present.md` 12.7. The failure below is what a Blt that reaches it
+                // would have returned; the decision makes it unreachable for a Blt.
+                if crate::ddi::present_foreign::unresolved_skip(
+                    adapter,
+                    present_flags & (1 << 1) != 0,
+                    (src_handle, src_info.is_some()),
+                    (dst_handle, dst_info.is_some()),
+                ) {
                     return unsafe {
                         present_blt_skipped(
                             args,
@@ -550,28 +547,6 @@ unsafe fn dxgkddi_present_inner(
                             dst_info,
                         )
                     };
-                }
-                // An unresolved source or destination handle while the transport holds a
-                // foreign record (or `ForeignFlip` is on) is a lost picture, not a failed
-                // Present; a Venus-only session keeps failing below.
-                if let Some(adapter) = adapter {
-                    if crate::ddi::present_foreign::unresolved_skip(
-                        adapter,
-                        src_info.as_ref(),
-                        dst_info.as_ref(),
-                    ) {
-                        return unsafe {
-                            present_blt_skipped(
-                                args,
-                                present_allocations,
-                                patch_capacity.take(),
-                                present_stream_boundary,
-                                Some(adapter),
-                                src_info,
-                                dst_info,
-                            )
-                        };
-                    }
                 }
                 crate::diag::record_named_bytes(b"PBCpy", 0xE1);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
@@ -1437,7 +1412,27 @@ unsafe fn present_blt_to_rm_primary(
         }
     };
     let Some(source) = source else {
-        // Unreadable: no allocation behind the source handle.
+        // Nothing readable behind the source handle (no source at all for a `ColorFill`): a
+        // counted success, with a marker that names no pending work, as a skipped legacy Blt.
+        let src_handle = present_allocations
+            .source()
+            .map(|allocation| allocation.handle())
+            .unwrap_or(core::ptr::null_mut());
+        if crate::ddi::present_foreign::unresolved_skip(
+            Some(adapter),
+            unsafe { args.Flags.__bindgen_anon_1.Value } & (1 << 1) != 0,
+            (src_handle, false),
+            (core::ptr::null_mut(), true),
+        ) {
+            let _ = unsafe {
+                PresentSubmissionPrivate::merge_fence(
+                    args.pDmaBufferPrivateData,
+                    args.DmaBufferPrivateDataSize,
+                    0,
+                )
+            };
+            return Ok(capacity);
+        }
         crate::diag::record_named_bytes(b"PBCpy", 0xE1);
         PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
         return Err(crate::ddi::present_foreign::invalid(site::RM_BLT_NO_SOURCE));
