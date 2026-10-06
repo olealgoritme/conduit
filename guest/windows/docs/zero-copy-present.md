@@ -1388,3 +1388,121 @@ legitimately exceeds a budget (why it defaults to off).
 
 Risks: the kept address (14.3); `DeferBudget` abandons a programming whose host SET may still land; the watchdog and the
 direct exits only exist while the knob is set, and a run with it set is no longer a baseline.
+
+## 15. Incident: display mode lost after a device restart (v326, hotfix v327)
+
+### 15.1 Symptom
+
+KMD 326.1, 5120x1440@240. The live install was fine; `pnputil /restart-device` with `ForeignFlip=0` and an NVK spin app
+running was fine; the next restart with `ForeignFlip=1` left "Conduit Helios" with NO current mode. Windows' only active
+path was a 1280x800 fallback on another adapter LUID, `SetDisplayConfig` with our path failed with error 87, DWM presented
+nothing (black), a further restart with `ForeignFlip=0` did not help. The monitor child "Generic Monitor (Conduit)" was
+present and OK. A full VM restart brought the mode back (v326, same image): so the failure is in the device-restart path
+(StopDevice -> StartDevice on a process-lifetime image whose statics survive), and the Windows side kept the bad topology
+until the VM restarted.
+
+Counters after the failing start: `InitStg` 7 (the transport came up; 7 is the last stage), `StVio` 0, `PwrN` 1 / `PwrD3N` 1 /
+`PwrUid` 0 (one `DxgkDdiSetPowerState` call since StartDevice: the monitor CHILD, uid 0, going to D3; no D0 and no adapter
+call), `HpdN` 1, `HpdLoopN` 0, `VsTickN` 0.
+
+### 15.2 What the v325 -> v326 diff can and cannot have done
+
+v326 touched NOTHING of the mode-set path (`ddi/display.rs`, `ddi/vidpn.rs`, `ddi/child.rs`, the EDID and mode adoption in
+`resolve_scanout_mode` are byte-identical to v325), nor `StartDevice` except the new stall-diagnosis block that
+`start_generation` zeroes and writes (about 35 more registry values). It changed four things that run around a restart:
+
+1. `DxgkDdiSetPowerState`: only the ADAPTER (uid 0xFFFFFFFF) leaving D0 quiesces the vsync heartbeat; the monitor child's D3
+   no longer does (`hpd_wake::power_vsync`, `ddi/lifecycle.rs`). In v325 any non-D0 state of any uid quiesced.
+2. A heartbeat watchdog (`AdapterContext::vsync_watch`, called from every HPD worker pass and from every escape) that revives
+   an armed-but-silent heartbeat and, new, ARMS one that is disarmed when `ADAPTER_D0 && vsync_enabled` (the "Resume" branch,
+   PASSIVE callers, so it can run on the escape thread concurrently with StartDevice and StopDevice).
+3. The HPD worker's wait gains a 250 ms idle tick while the heartbeat is armed (an event-only worker became a 4 Hz one).
+4. New statics (`ADAPTER_D0`, `VS_REF_AT`, `VS_TICK_AT`, the wake and dump statics, `HELD_AT`, `LAST_FLIP_AT`, ...); all but
+   `VS_REF_AT` were already zeroed at StartDevice (`start_generation`, `foreign_flip::forget`, `scanout_trace::reset`).
+   `HPD_INDICATE_COUNT` (`HpdN`) and `HPD_START_EDGE_TIMEOUTS` are older and were never reset: `HpdN` is a count since the
+   image was loaded, not since this start.
+
+### 15.3 Ranked hypotheses (the root cause is NOT proven; no run of the failing state exists with the v327 breadcrumbs)
+
+1. **Windows' CCD database kept a topology chosen in a bad first mode set, and the restarts replayed it** (most consistent
+   with "a full VM restart fixes it, three restarts did not"). The KMD's part would be whatever made that first mode set
+   fail. Evidence for: v326 does not alter any DDI that builds or validates the VidPn; error 87 from `SetDisplayConfig`
+   with the persisted path means the persisted source/target mode was not in the cofunctional set we enumerate right then,
+   or the target was not usable; the monitor child itself is fine. Counters: `PwrN` 1 with uid 0 D3 says Windows powered the
+   monitor child down after start (no active path to power). Not supported or refuted: `InitStg` 7 / `StVio` 0 (the
+   transport and the host mode were fine).
+2. **The heartbeat did not run after the restart, and v326's new behaviour is what left it so** (`VsTickN` 0). With
+   `display_half` the heartbeat is armed by `start_vsync` inside StartDevice and the worker's wait then has the 250 ms
+   tick, so `HpdLoopN` would be at least 1 within a second; `HpdLoopN` 0 AND `VsTickN` 0 together mean either the heartbeat
+   was never armed (or was disarmed before the worker's first wait) or the worker never reached its first wait. Paths in
+   v326 that disarm or leave it disarmed: the watchdog's Resume branch racing StartDevice (it can arm from the escape thread
+   after `vsync_enabled = 1` and before `arm_vsync`, which is harmless) and the adapter-D3 / child-D3 split (`PwrD3N` 1,
+   uid 0: v326 LEAVES the heartbeat running on the child's D3, v325 quiesced it). Honest status: reading the code, a
+   deterministic disarm after StartDevice was not found; this hypothesis rests on `HpdLoopN` 0 + `VsTickN` 0 and needs
+   `VsArmN`, `VsDisN`, `VsCanN`, `VsEarlyN`, `VsExhN`, `VsRevN`, `StartN`, `HpdSite`, `HpdSiteT` (not in the report).
+3. **The worker never completed its first pass** (`HpdN` 1, `HpdLoopN` 0). `HpdN` is incremented AFTER `DxgkCbIndicateChildStatus`
+   returns and is NOT reset per generation: with the image kept across restarts, 1 means no worker after the first start has
+   returned from an indication (a worker stuck in the first indication, or `dxgkrnl_opt()` None, or the image was reloaded).
+   If dxgkrnl blocked the indication (it holds the VidPn / child lock while it commits the topology with the child at D3),
+   neither the worker nor the mode would move. v326 did not change the indication, but it did change what the worker does
+   around it (the `retire_wanted` swap and `vsync_watch` now run at the top of every pass, before the first drain).
+4. **A stale static or knob inherited from the previous generation** (the coordinator's list: `ADAPTER_D0`, `VS_REF_AT`, held
+   wake, repeat gate, dump pacing). Read against the code, every one of these is zeroed at StartDevice except `VS_REF_AT`
+   (now also zeroed) and `HpdN` (now zeroed). `ADAPTER_D0` is set to 1 in `start_generation`, which runs before
+   `start_vsync`, so a D3-at-stop cannot make the Resume branch refuse to arm. No v326 value is written to the service key
+   and read back as a knob (the `FfRepeatMs` gate is read from the key but only ever written by the operator). Least likely.
+5. **`ForeignFlip=1` at StartDevice.** The only things it changes at start are `read_knob` (window and repeat gate) in
+   `start_generation_mirrors` and the arm's registration; `forget()` now also drops a held repeat, which is atomics only. No
+   interaction with the mode set was found. It is the trigger the tester had, not a cause that code reading supports.
+
+Which counters support which: 1 `PwrN`/`PwrUid` (child D3), `InitStg`, `StVio`; 2 `VsTickN`, `HpdLoopN`, `PwrD3N`; 3 `HpdN`,
+`HpdLoopN`; 4 none (the dump shows them at zero); 5 none.
+
+### 15.4 The hotfix (v327): the v326 behaviour changes behind knobs that default to v325
+
+All read at every StartDevice from the service key (DWORD), mirrored with the value in force:
+
+| knob | default | meaning | mirror |
+| --- | --- | --- | --- |
+| `VsPowerMode` | 0 | 0 = v325: ANY non-D0 `DxgkDdiSetPowerState` of ANY uid quiesces the heartbeat; 1 = v326: adapter only | `VsPwrEff` |
+| `VsWatchdog` | 0 | 0 = off (v325); 1 = revive an armed-but-silent heartbeat; 2 = also re-arm a quiesced one while the adapter is in D0 (v326) | `VsWdgEff` |
+| `VsIdleWake` | 0 | 1 = the worker wakes 4 times a second while the heartbeat is armed (v326); needs `VsWatchdog` above 0 | `VsIdlEff` |
+
+With the defaults the vsync/power/wait behaviour is v325's: the HPD worker waits exactly as it did (infinite when nothing is
+due), nothing arms the heartbeat but StartDevice and a D0 call, and a child's D3 stops it. Kept from v326 because they are
+not on the restart/mode-set path and not implicated: `FfRepeatMs` gating, the dump pacing, the stale held wake fix, the
+signal-by-cause counters, the coalesced windowed-Blt signal, the new counters. Statics: `VS_REF_AT` and `HpdN` /
+`HpdStTo` are zeroed at StartDevice (`HpdN` is now per generation).
+
+Breadcrumbs added so the next failure names its cause (service key, written at StartDevice and mirrored with the rest):
+`EntD0`, `EntRef`, `EntArm`, `EntVsEn`, `EntHpdTh`, `EntHpdN`, `EntVsTk` (what the PREVIOUS generation left in the statics and
+on the adapter, taken at StartDevice entry before anything is zeroed); `HpdPhase` / `HpdPhaseT` / `HpdFirstT` (worker phase:
+1 thread entered, 2 StartDevice's return seen, 3 first indication returned, 4 first loop reached; time of the first loop);
+`ModeStg` / `ModeStgT` / `ModeN` / `ModeSt` (the last mode-set DDI: 1 QueryChildRelations, 2 QueryChildStatus, 3
+IsSupportedVidPn, 4 RecommendFunctionalVidPn, 5 EnumVidPnCofuncModality (with its status), 7 CommitVidPn entered, 8
+CommitVidPn returned (with its status); how many entered). Existing: `StartStg` (4 = StartDevice returned), `InitStg`.
+The pure decisions are `hpd_wake::power_vsync_mode`, `vsync_watch_level`, `idle_watch`, `clamp_*` (host-tested).
+
+### 15.5 Recovery when the mode is lost
+
+1. Full VM restart (the one thing known to work); if the mode is still wrong after it, continue.
+2. Windows Display settings / `Win+P`: choose "PC screen only", then "Extend" (or `displayswitch.exe /internal` then
+   `/extend`), then pick 5120x1440@240 in Advanced display.
+3. Remove the display adapter and rescan (keeps the driver package): `pnputil /remove-device <instance id of Conduit Helios>`
+   then `pnputil /scan-devices`; or Device Manager, uninstall the device WITHOUT ticking "delete the driver", then Scan for
+   hardware changes. Then reboot.
+4. Reset the CCD database: export `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration` and
+   `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Connectivity` (`reg export`), then delete the subkeys of
+   `Configuration` and of `Connectivity` (keep the keys themselves; the subkeys are named by monitor / adapter IDs, such as
+   `CND...` and `...` entries) and reboot. Windows recreates them from the EDID and the driver's mode set at boot. Only the
+   Conduit/Helios subkeys need to go if other displays matter (they name the Helios monitor id and the adapter LUID).
+5. If the mode is lost again with the v327 breadcrumbs: dump the whole service key before touching anything and read
+   `EntD0`..`EntVsTk`, `HpdPhase`, `ModeStg`/`ModeSt`, `VsArmN`/`VsDisN`/`VsEarlyN`, `StartN`, `StartStg`, `DspMd`, `VpCM`.
+
+### 15.6 Regression checklist (the acceptance test of v327)
+
+Restart the device 5 times, alternating `ForeignFlip` 0 / 1 (`reg add` the knob, `pnputil /restart-device`), and after EACH:
+the mode is 5120x1440@240 (Display settings and `SetDisplayConfig` query), DWM presents, `StartN` moved by 1, `HpdPhase`
+is 4 within a second, `HpdLoopN` rises on a desktop that changes, `VsTickN` rises (the heartbeat runs), `HpdN` is 1 (per
+generation now). Run it with the NVK spin app running in at least two of the five, and once with `VsPowerMode` 1 and
+`VsWatchdog` 2 to see whether the v326 behaviour is what breaks it (it should be run last, after the defaults pass).

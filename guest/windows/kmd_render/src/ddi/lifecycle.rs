@@ -285,6 +285,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         .start_complete
         .store(0, core::sync::atomic::Ordering::Release);
 
+    // v327 breadcrumbs: what the previous generation left in the statics and on the adapter, taken
+    // BEFORE anything of this generation zeroes it (`EntD0`, `EntArm`, `EntVsEn`, `EntHpdTh`,
+    // `EntHpdN`, `EntVsTk`, `EntRef`), then the per-generation reset of the worker's own statics.
+    crate::ddi::stall_diag::note_start_entry(adapter, crate::ddi::hpd::indicate_count());
+    crate::ddi::hpd::reset_for_start();
+
     // NOT copied here. `dxgkrnl_interface` is 576 bytes and this function's
     // stack frame is shared with `VirtioGpu::init`'s 3.0 KB one on a 24 KB
     // kernel stack — see `StartedState::boxed`. The pointer is carried to the
@@ -892,7 +898,13 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
     // should be running.
     let d0 = device_power_state == _DEVICE_POWER_STATE::PowerDeviceD0;
     crate::ddi::stall_diag::note_power(device_uid, d0);
-    match helios_kmd_logic::hpd_wake::power_vsync(device_uid, d0, adapter.display_half()) {
+    // v327: `VsPowerMode` 0 (the default) is KMD 325: any non-D0 state of any uid quiesces.
+    match helios_kmd_logic::hpd_wake::power_vsync_mode(
+        crate::ddi::stall_diag::vs_power_mode(),
+        device_uid,
+        d0,
+        adapter.display_half(),
+    ) {
         helios_kmd_logic::hpd_wake::PowerVsync::Resume => {
             // SAFETY: the context is the final boxed adapter (dxgkrnl holds it
             // as the miniport device context) and dxgkrnl was saved at
