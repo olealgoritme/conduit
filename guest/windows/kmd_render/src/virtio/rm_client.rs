@@ -58,6 +58,7 @@ use helios_kmd_logic::foreign_scanout::SetError;
 use helios_kmd_logic::rm_client::{
     self as rc, Action, Client, Fail, FailKind, Out, Step, Want, MAX_DRI,
 };
+use helios_kmd_logic::sweep_budget::SweepBudget;
 use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
 use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
 
@@ -276,6 +277,7 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         passive,
         adapter,
         epoch,
+        limit: None,
     };
     // Level 3: the presenter first, so a ring about to be torn down (a new extent) is
     // withdrawn from scanout before the steps close the GEM under it.
@@ -596,13 +598,46 @@ struct Io<'a> {
     passive: PassiveLevel,
     adapter: &'a AdapterContext,
     epoch: u64,
+    /// A deadline shared by every message this `Io` sends (level 5's creation and its undo,
+    /// `sysmem`): each waits at most what is left of it, and none is sent once it is spent.
+    /// `None` (the ring client): every message has [`TIMEOUT_MS`] to itself.
+    limit: Option<SweepBudget>,
 }
 
 impl Io<'_> {
+    /// The same I/O under another deadline (the undo of a creation whose own is spent).
+    fn with_limit(&self, limit: Option<SweepBudget>) -> Io<'_> {
+        Io {
+            passive: self.passive,
+            adapter: self.adapter,
+            epoch: self.epoch,
+            limit,
+        }
+    }
+
+    /// How long the next message may wait: [`TIMEOUT_MS`], or what is left of the deadline
+    /// (at most [`TIMEOUT_MS`]); `None` once a deadline is spent.
+    fn message_timeout_ms(&self) -> Option<u64> {
+        match &self.limit {
+            None => Some(TIMEOUT_MS),
+            Some(b) => b.call_timeout_ms(crate::adapter::foreign_scanout::now_100ns()),
+        }
+    }
+
+    /// Whether a deadline was set and is spent.
+    fn limit_spent(&self) -> bool {
+        self.limit
+            .is_some_and(|b| b.expired(crate::adapter::foreign_scanout::now_100ns()))
+    }
+
     /// Forward one host message as the KMD's owner and return the reply length. A reply
     /// from a different transport generation than the client's is a failure: the
-    /// handles it names are not this client's any more.
+    /// handles it names are not this client's any more. With the deadline spent nothing is
+    /// sent (a `Transport` failure, code 0xE1).
     fn send(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, Fail> {
+        let Some(timeout_ms) = self.message_timeout_ms() else {
+            return Err(Fail::new(FailKind::Transport, 0xE1));
+        };
         let mut seen = None;
         let n = nvrm::forward(
             self.passive,
@@ -610,7 +645,7 @@ impl Io<'_> {
             KMD,
             req,
             resp,
-            TIMEOUT_MS,
+            timeout_ms,
             0,
             0,
             &mut seen,

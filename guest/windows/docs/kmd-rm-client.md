@@ -1074,6 +1074,12 @@ experiment); 3 cached memory under dxgkrnl's write-combined view, a write-back /
 above 5 count as 5. With the knob below 5 the primary's creation, its flip and its teardown are the v315
 paths (15.15 lists every hook and what it does with the knob off).
 
+**A stale value of 5 or more selects level 5 now.** Before level 5 existed the driver clamped the knob to
+level 4, so a box that once had `KmdRmClient` set to 5, 9 or 99 (a typo, an experiment, a key left from a
+test) ran level 4. On this build the same key switches the box's desktop primary to RM system memory and
+its flip. Look at the key before the first run on any box that has been used for RM experiments (hardware
+checklist step 0, 15.13).
+
 ### 15.1 The host contract this is written against (`feat/rm-export-map-blob`)
 
 * **Create**: `RESOURCE_CREATE_BLOB`, `blob_mem` `0x80000001` (RM_EXPORT), `blob_flags` `USE_MAPPABLE`. The
@@ -1116,8 +1122,12 @@ registration; the creation, the table, the map and the teardown are kind-agnosti
 * The primary arm already creates its Venus blob synchronously there (`with_venus_client`, host round trips with
   a 30 s bound). An RM creation is about ten host messages (alloc, open the export file, export, GEM import,
   close it, create the resource and attach it, map, unmap) of a few milliseconds each, plus eleven once per transport
-  generation for the bring-up. Each message is bounded by `TIMEOUT_MS` (2.5 s), the whole creation by 6 s
-  (`Slow`).
+  generation for the bring-up. Each message is bounded by `TIMEOUT_MS` (2.5 s), the whole forward part of a
+  creation by ONE 6 s deadline on the interrupt-time clock (`rm_sysmem::CREATE_BUDGET_MS`; `Slow`): the wait
+  for another thread's bring-up, the bring-up itself and every step after it share it, and each message waits
+  at most what is left of it (none is sent once it is spent). The undo of a failed creation has its own 3 s
+  (`UNDO_BUDGET_MS`), so a creation that ran out of time can still give back what it made; a failed creation
+  is therefore over in about 9 s.
 * A mailbox to the HPD worker has a dependency edge the synchronous call does not: `create_one` would wait on a
   thread that itself calls dxgkrnl (`DxgkCbIndicateChildStatus`, the VidPn programming) and may be blocked on a
   lock dxgkrnl holds while it calls CreateAllocation. A creation that waits only on the control queue, as the
@@ -1125,7 +1135,9 @@ registration; the creation, the table, the map and the teardown are kind-agnosti
 * The ring client's state has exactly one mutator (the worker), which is why 14.2 wanted a mailbox. The service
   does not share it: it has its OWN RM client (own control, GPU and DRM files, own `hRoot`; three handles of the
   KMD owner's 128), so there is nothing to serialise but the bring-up. Creations run concurrently, each on a
-  reserved table slot; only the first one brings the client up while the others `sleep_ms` (at most 5 s) for it.
+  reserved table slot; only the first one brings the client up while the others `sleep_ms` for it until their
+  own 6 s deadline (the wait is a deadline, not a count of sleeps: a `sleep_ms(1)` lasts a timer tick, about
+  15.6 ms, so a count of 5000 of them was 78 s on dxgkrnl's thread).
 * Cost: a creation holds its thread for the host round trips, with no lock held (`STATE` is a leaf spinlock
   taken for table moves only; nothing is held across a message). It takes no dxgkrnl lock of its own and is
   never called under the scanout lifecycle lock.
@@ -1137,7 +1149,16 @@ creator's thread and then dropped; only the four handles are kept), so no bring-
 
 `RmSysStage` is written BEFORE each stage so a hang names itself. Failure in any stage undoes the stages before
 it in this order: the export file, the Venus resource, the GEM, the memory; a step that fails is counted
-(`RmSysSoft`) and left to the transport sweep (`RmSysLeak`).
+(`RmSysSoft`) and left to the transport sweep (`RmSysLeak`). The undo runs on its own 3 s allowance, not on
+what is left of the creation's.
+
+**The slot's RM handle.** The memory's RM handle is `H_BASE + slot`. If the undo cannot make sure RM freed the
+memory (the `RM_FREE` failed, or the `RM_ALLOC` timed out or its reply was unreadable, so the host may have
+allocated it, and the free was not answered either: `rm_sysmem::mem_may_be_live`), the slot is not freed:
+`Svc::abort_leaked` counts the strike and leaves it `Closing` (quarantined) for the rest of the transport
+generation, the way a destroy whose free failed does (15.9). A creation that took the slot again would
+`RM_ALLOC` the same handle, be refused as a duplicate, and three of those would end the generation's
+allocations. An `RM_FREE` that RM answers with `NV_ERR_OBJECT_NOT_FOUND` settles it (nothing is there).
 
 | stage | what | on failure |
 |---|---|---|
@@ -1147,7 +1168,7 @@ it in this order: the export file, the Venus resource, the GEM, the memory; a st
 | 4-7 | export file, `EXPORT_OBJECT_TO_FD`, `GEM_IMPORT_NVKMS` (pitch layout), close the export file | strike; undo |
 | 8 import | `RESOURCE_CREATE_BLOB` `RM_EXPORT` + `USE_MAPPABLE` under `DeviceOwner::KMD_RM` and the KMD's Venus context; the foreign record | strike; undo |
 | 9 mark | `foreign_mark_sysmem`: the record may now be mapped | strike; undo |
-| 10 trial | map the blob once (KMD window partition), read `map_info`, unmap | strike; undo. Host cannot map, or `map_info` is not the attribute the memory was made with (`RmSysMis`, for the default write-combined memory too): Venus |
+| 10 trial | map the blob once (KMD window partition), read `map_info`, unmap | strike; undo. Host cannot map, or `map_info` is not the attribute the memory was made with (`RmSysMis`, for the default write-combined memory too): Venus. An unmap the host did not confirm ends the creation with the blob still recorded as mapped and its window range still taken; the undo's blob release (which sees `mapped`) unmaps again and only then returns the range, so no later map can overlap a range the host still has mapped |
 | 11 adopt | `adopt_for_allocation` (declares foreign, DEVICE ownership, the layout repeated): the WDDM allocation owns the resource | strike; undo |
 
 Three strikes in a row (a success clears them) stop NEW allocations for the generation (`NoNew`); the live ones,
@@ -1245,7 +1266,11 @@ at once; its end resumes the RM primary with a re-flip (never a Venus flush: the
 A resume needs no copy: the memory is live, so the desktop-changed flag a parked level 3 source keeps
 (`note_desktop_changed`, ring levels only) is not needed and not raised at level 5. Three consecutive failures (a refused flip, a refused registration, eight yielded flips with no user
 source) withdraw the source and, unlike level 3, **start over five seconds later** (`RmSysGaveUp`): a primary with
-no Venus image has no desktop for Venus to show, so withdrawing for good would only freeze the screen.
+no Venus image has no desktop for Venus to show, so withdrawing for good would only freeze the screen. The five
+seconds are a gate at the top of the worker's pass (`RESTART_AT`, `rm_sysmem::restart_pause`): a reset presenter
+registers at its very next look, and every desktop frame edge wakes the worker, so without the gate the
+register, flip, fail, withdraw cycle would run on every edge. During the pause nothing is registered or flipped
+(the edges stay owed; a primary programmed meanwhile is shown when the pause ends).
 The S4 fence queue is not involved: a resident flip is sent direct and never queues behind fenced presents
 (13.12 states why); `present_within` is the same call.
 
@@ -1316,9 +1341,11 @@ that waited. Tests: `a_reflipped_buffer_is_never_something_a_close_waits_for`,
 | knob 0..4 | none | the v315 behaviour: `create_one`'s arm one atomic load (`route` says `KnobOff`), `release_allocation_resource` one, the two display hooks one each; byte for byte what the tip does otherwise (15.15) | Venus (as before) |
 | route / display half / transport / context / layout | refused | `RmSysVenus`, `RmSysWhy`; no strike | Venus |
 | bring-up | any message fails | files closed; service **Dead** for the generation (`RmSysFail` stage 2) | Venus for every allocation of the generation |
-| bring-up by another thread | not finished in 5 s | `BringUpBusy` | Venus for this one |
+| bring-up by another thread | not finished by this creation's 6 s deadline | `BringUpBusy` | Venus for this one |
 | alloc / export / import / trial / adopt | any | undone (15.4); one strike; `RmSysFail` stage and kind | Venus for this one; three strikes in a row: no new RM allocations this generation (`NoNew`) |
-| creation slower than 6 s | `Slow` | as a failure | Venus |
+| creation slower than 6 s (the deadline covers the wait for a bring-up, the bring-up and the steps) | `Slow` | as a failure; the undo has its own 3 s | Venus |
+| the undo cannot confirm the memory's `RM_FREE` (or an `RM_ALLOC` that timed out is not known to be absent) | `RmSysLeak`; the slot stays `Closing` | strike; the slot and its RM handle are not reused this generation | Venus for this one |
+| the trial's unmap is not confirmed | `RmSysSoft`, `RmSysTrialF` | the blob stays recorded as mapped; the undo unmaps and then frees the window range | Venus for this one |
 | host map_info is not the requested attribute | refused (`RmSysMis`) | undone, strike | Venus |
 | table full (32 live) | `TableFull` | no strike | Venus |
 | flip refused / times out | counted (`RmSysFlipFail`) | paced retry 100 ms; three in a row: withdraw, restart in 5 s | the screen keeps its last frame meanwhile |
@@ -1376,16 +1403,20 @@ flushes; `RfUnb` is expected to count only if a Venus flush of the RM primary is
 
 ### 15.12 Verified here, and not
 
-Verified on the host (`cargo test` in `guest/windows/kmd_logic`, 693 tests; in `guest/windows/protocol`, 29):
+Verified on the host (`cargo test` in `guest/windows/kmd_logic`, 707 tests; in `guest/windows/protocol`, 29):
 which kinds go to RM; sizes and the page-granular rule against the aperture count and the paging clamp; the RM
 parameter block byte for byte (`attr` words against `nvos.h` 610.57.04's bit positions, `0x3a000000` /
 `0x5a000000`, and the written-back `0x2a800000` / `0x4a800000` the host decides from); RM's rounded answer; the
 cache policy for every knob value (the default is write-combined with no alias; only the opt-in values alias; an
 unknown value is the default) and the host-nibble check against every knob value; the service state machine
 (bring-up once, waiters, dead for a generation, three strikes, the bounded table, slot reuse only after free,
-generation reset, stale commit and free ignored); the target book; the flip against the REAL arbiter (register,
+generation reset, stale commit and free ignored; a slot whose memory may still be live is quarantined, never
+found, taken or reused, strikes count, a new generation cleans it; what a failed `RM_ALLOC` / `RM_FREE` leaves
+open, by failure kind); the creation's and the undo's budgets (6 s and 3 s, per-message caps, a wait on the deadline
+ends on time whatever a sleep costs); the target book; the flip against the REAL arbiter (register,
 flip, 60 Hz pacing, a user source preempting and the resume, a new primary updating the resident layout in place,
-the shown primary going, three refused flips) with the presenter inputs the driver passes (`flip_inputs`, the v315
+the shown primary going, three refused flips, and the five-second restart pause: a gate on the clock that holds back
+hundreds of frame-edge wakes and opens at the restart time) with the presenter inputs the driver passes (`flip_inputs`, the v315
 `release_tracked` / `back_released` fields); a ring of one never held by a release; the release seam against the
 REAL `ReleaseBook`; the record's `sysmem` bit (only the KMD's un-adopted import can be marked; an adopted
 unmarked record is never a source).
@@ -1404,7 +1435,9 @@ compile-time assertion that named the wrong bit for `HELIOS_NVRM_CAP_SCANOUT_REL
 host reaction (`USE_MAPPABLE` create, map and unmap, `map_info`, the GEM import of system memory, the flip of
 it, the compositor's sampling, `ScanoutReleased` for a level 5 flip); IRQL behaviour; dxgkrnl's reaction to an
 adopted standard allocation; DWM's import (15.8); the 500 ms close wait on dxgkrnl's thread; the opt-in cached
-variants (15.5).
+variants (15.5). Also not run: the wiring of the deadline into the messages (`Io::limit`, the budgeted unmap in the
+trial), the quarantine call on a failed creation, and the restart gate in the worker's pass (type-checked and read
+only; their pure decisions are the tested part).
 
 ### 15.13 Hardware checklist, in order
 
@@ -1412,6 +1445,13 @@ Stop at the first step that fails. Prerequisites: the host with `feat/rm-export-
 viewer connected, section 9 step 2's list, **levels 2 and 3 working** (they prove the RM client, the export, the
 GEM import and `ScanoutFlip` from a KMD owner on this VM), and `tools/kmd-frame-sizes.ps1` passing. Nothing
 here sets `KmdRmSysCache` before step 7: steps 1 to 6 run on the default, write-combined memory with no alias.
+
+0. **Check the key first.** Read `KmdRmClient` (and `KmdRmSysCache`) on the box before installing this build.
+   A stale value of 5 or more (an old experiment, a typo, 99) used to clamp to level 4 and now selects level 5:
+   the box's desktop primary moves to RM memory and its flip on the first boot of the new driver. On a box that
+   is not meant to run level 5, delete the value or set it to the level wanted; on a box that is, the value
+   is step 2's, set deliberately. The build's identity is 22.22.317.0, so an installed 316 or older is replaced
+   (the INF `DriverVer` and the image's `FILEVERSION` come from `driver-version.env`).
 
 1. **Knob absent**: nothing changes; no `Rm*` value; frame sizes pass.
 2. **`KmdRmClient=5`, restart the device, no DWM yet** (or boot to the logon screen). This is also the cache
@@ -1448,10 +1488,16 @@ here sets `KmdRmSysCache` before step 7: steps 1 to 6 run on the default, write-
     set and the desktop is the Venus desktop; after three such creations `RmSysState` shows `no-new`.
 11. **Teardown**: stop the device with the primary shown, and while a creation is in flight: no bugcheck,
     `RmSysLeak=0` after a normal destroy, the sweep closes the rest; `FgLive` returns to 0.
+    **Time bounds** (not run): with the host's reply to the bring-up held back, a creation ends with `RmSysWhy`
+    `BringUp`/`Slow` within about 6 s plus the undo's 3 s (`RmSysMsMax`), and a second creation made meanwhile
+    ends at its own 6 s with `BringUpBusy`, not after a minute; with the host's `RESOURCE_UNMAP_BLOB` refused,
+    `RmSysTrialF` grows, the creation goes to Venus, and a later map of another primary does not overlap the
+    first one's range.
 12. **DWM** (15.8): a session with DWM: whether the windowed present reaches the primary is the host's and
     the UMD's; `RmSysFlipFail`, `Pb*` / `Vk*` counters and the host log say where it stops.
 13. **Soak**: ten minutes of window dragging with `RmSysFlipFail=0`, `RmSysGaveUp=0`, `RmSysSoft=0`,
-    `RmSysRelTmo=0`.
+    `RmSysRelTmo=0`. Then the give-up path: with the host refusing `ScanoutFlip`, `RmSysGaveUp` grows by one
+    per five seconds (three failed flips each, 100 ms apart), not per frame edge.
 
 ### 15.14 Open questions
 

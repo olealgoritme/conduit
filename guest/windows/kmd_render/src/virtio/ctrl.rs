@@ -1468,6 +1468,19 @@ pub fn resource_unmap_blob(
     resource_unmap_blob_within(passive, adapter, resource_id, SYNC_ROUNDTRIP_TIMEOUT_MS)
 }
 
+/// [`resource_unmap_blob`] under a [`SweepBudget`]: with it spent nothing is sent (`Timeout`).
+pub fn resource_unmap_blob_budgeted(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    budget: &SweepBudget,
+) -> Result<(), VirtioError> {
+    match sweep_timeout_ms(Some(budget)) {
+        Some(timeout_ms) => resource_unmap_blob_within(passive, adapter, resource_id, timeout_ms),
+        None => Err(VirtioError::Timeout),
+    }
+}
+
 fn resource_unmap_blob_within(
     passive: PassiveLevel,
     adapter: &AdapterContext,

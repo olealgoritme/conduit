@@ -24,16 +24,27 @@
 //!    with), then lets the WDDM allocation ADOPT the resource.
 //!
 //! Any failure undoes what was made, counts a strike, and the caller allocates from Venus
-//! as it always did. DestroyAllocation reaches [`released`] through
-//! `ctrl::release_allocation_resource` (the one place both release triggers meet): it
-//! closes the GEM and frees the RM memory, in that order, after the host resource is gone.
+//! as it always did.
+//!
+//! TIME. The creation runs on dxgkrnl's CreateAllocation thread, so everything that waits is
+//! bounded by a deadline on the interrupt-time clock, never by a count of sleeps (a
+//! `sleep_ms(1)` lasts a timer tick, about 15.6 ms): ONE [`rs::CREATE_BUDGET_MS`] (6 s)
+//! deadline covers the wait for another thread's bring-up, the bring-up, and every step
+//! after it (each message waits at most what is left, [`TIMEOUT_MS`] at most, and none is
+//! sent once it is spent: `Why::Slow`). The undo of a failed creation has its own
+//! [`rs::UNDO_BUDGET_MS`] (3 s), so a creation that ran out of time can still give back
+//! what it made; a failed creation is therefore over in about 9 s.
+//!
+//! DestroyAllocation reaches [`released`] through `ctrl::release_allocation_resource` (the
+//! one place both release triggers meet): it closes the GEM and frees the RM memory, in
+//! that order, after the host resource is gone.
 //!
 //! LOCKING. `STATE` is a LEAF spinlock over plain data: never held across a host round
 //! trip, a wait, an allocation or another lock; every step copies what it needs out and
 //! reports back. Creations run concurrently (each owns a reserved slot); only the bring-up
-//! is exclusive, and the others wait for it with `sleep_ms` (bounded). Nothing here is
-//! called with the scanout lifecycle lock held, so it cannot invert with the programming
-//! path (`sysmem_flip::program` takes no lock of this file across I/O either).
+//! is exclusive, and the others wait for it with `sleep_ms`, on the creation's own deadline.
+//! Nothing here is called with the scanout lifecycle lock held, so it cannot invert with the
+//! programming path (`sysmem_flip::program` takes no lock of this file across I/O either).
 
 use super::{Io, REPLY_MAX, TIMEOUT_MS};
 use crate::adapter::AdapterContext;
@@ -48,7 +59,7 @@ use helios_kmd_logic::foreign_resource::{
 };
 use helios_kmd_logic::rm_client::{self as rc, Action, Client, Fail, FailKind, Want};
 use helios_kmd_logic::rm_sysmem::{
-    self as rs, Admit, Cache, CloseWait, Kind, PrimaryCache, Svc, Why,
+    self as rs, Admit, AllocOutcome, Cache, CloseWait, FreeOutcome, Kind, PrimaryCache, Svc, Why,
 };
 use helios_kmd_logic::scanout_release::Wait;
 use helios_kmd_logic::sweep_budget::{SweepBudget, UNITS_PER_MS};
@@ -61,11 +72,6 @@ const _: () = assert!(rs::MAP_CACHE_CACHED == helios_protocol::VIRTIO_GPU_MAP_CA
 const _: () = assert!(rs::MAP_CACHE_UNCACHED == helios_protocol::VIRTIO_GPU_MAP_CACHE_UNCACHED);
 const _: () = assert!(rs::MAP_CACHE_WC == helios_protocol::VIRTIO_GPU_MAP_CACHE_WC);
 
-/// How long the whole creation may take before it is given up (Venus): the trial map, the
-/// import and the RM messages each also have their own bound ([`TIMEOUT_MS`]).
-const CREATE_BUDGET_MS: u64 = 6_000;
-/// How long a creation waits for another thread's bring-up.
-const BRING_UP_WAIT_MS: u32 = 5_000;
 /// Longest bring-up: eleven steps plus slack.
 const BRING_UP_STEPS: usize = 16;
 
@@ -224,8 +230,16 @@ fn now() -> u64 {
     crate::adapter::foreign_scanout::now_100ns()
 }
 
-fn budget(total_ms: u64, per_command_ms: u64) -> SweepBudget {
-    SweepBudget::new(now(), total_ms.saturating_mul(UNITS_PER_MS), per_command_ms)
+/// The deadline the step in progress shares with the rest of its creation (the undo and the
+/// failed-commit cleanup take their own).
+fn step_budget(io: &Io<'_>) -> SweepBudget {
+    io.limit
+        .unwrap_or_else(|| rs::create_budget(now(), TIMEOUT_MS))
+}
+
+/// The undo's own allowance, starting now.
+fn undo_budget() -> SweepBudget {
+    rs::undo_budget(now(), TIMEOUT_MS)
 }
 
 // ---- the entry --------------------------------------------------------------------
@@ -308,17 +322,28 @@ fn create_primary(
         return Err(Why::NoContext);
     }
     let lay = rs::layout(width, height, dxgi).map_err(|e| e.why())?;
+    // One deadline for the whole forward part, the wait for another thread's bring-up
+    // and the bring-up included.
     let io = Io {
         passive,
         adapter,
         epoch,
+        limit: Some(rs::create_budget(now(), TIMEOUT_MS)),
     };
     let slot = admit(&io)?;
     // From here the slot is ours: every exit commits it or aborts it.
     match build(&io, ctx, slot, &lay) {
         Ok(created) => Ok(created),
-        Err(why) => {
-            STATE.lock().svc.abort(slot);
+        Err((why, memory_may_be_live)) => {
+            {
+                let mut g = STATE.lock();
+                if memory_may_be_live {
+                    // RM may still hold the slot's handle: nothing may take the slot again.
+                    g.svc.abort_leaked(slot);
+                } else {
+                    g.svc.abort(slot);
+                }
+            }
             mirror_live();
             Err(why)
         }
@@ -326,20 +351,19 @@ fn create_primary(
 }
 
 /// Take a slot: bring the client up first if this is the first creation of the generation,
-/// wait (bounded) for another thread's bring-up.
+/// wait for another thread's bring-up until the creation's deadline.
 fn admit(io: &Io<'_>) -> Result<usize, Why> {
-    let mut waited = 0u32;
     loop {
         let a = STATE.lock().svc.admit(io.epoch);
         match a {
             Admit::Go(slot) => return Ok(slot),
             Admit::Refuse(why) => return Err(why),
             Admit::Wait => {
-                if waited >= BRING_UP_WAIT_MS {
+                // The deadline is the clock's: a sleep lasts a timer tick, not a millisecond.
+                if io.limit_spent() {
                     return Err(Why::BringUpBusy);
                 }
                 ctrl::sleep_ms(io.passive, 1);
-                waited += 1;
             }
             Admit::BringUp => {
                 note_stage(stage::BRING_UP);
@@ -396,12 +420,14 @@ fn bring_up(io: &Io<'_>) -> Result<Handles, Fail> {
             break;
         }
     }
+    // The files a failed bring-up opened are closed on the undo's allowance: the deadline
+    // may be what ended it.
     if let Some(f) = c.failure() {
-        close_all(io, &mut c);
+        close_all(&io.with_limit(Some(undo_budget())), &mut c);
         return Err(f.fail);
     }
     if !c.bring_up_done() {
-        close_all(io, &mut c);
+        close_all(&io.with_limit(Some(undo_budget())), &mut c);
         return Err(Fail::new(FailKind::Parse, 0xfc));
     }
     Ok(Handles {
@@ -431,22 +457,24 @@ fn close_all(io: &Io<'_>, c: &mut Client) {
 /// What a creation has made so far (so an undo knows what to give back).
 #[derive(Clone, Copy, Default)]
 struct Made {
-    mem: bool,
+    /// What is known of the memory's `RM_ALLOC`: made, refused, or asked and not answered.
+    mem: AllocOutcome,
     export_ch: u32,
     gem: u32,
     resource: u32,
 }
 
+/// `Err((why, memory_may_be_live))`: whether the undo could not make sure RM freed the memory,
+/// so the slot's handle may still be RM's ([`rs::mem_may_be_live`]).
 #[inline(never)]
-fn build(io: &Io<'_>, ctx: u32, slot: usize, lay: &rs::SysLayout) -> Result<Created, Why> {
+fn build(io: &Io<'_>, ctx: u32, slot: usize, lay: &rs::SysLayout) -> Result<Created, (Why, bool)> {
     let (h, cache) = {
         let g = STATE.lock();
         (g.h, g.cache.sysmem())
     };
     let alias = STATE.lock().cache.aliases(adapter_alloc_cached(io.adapter));
-    let started = now();
     let mut made = Made::default();
-    let r = build_steps(io, ctx, slot, lay, &h, cache, &mut made, started);
+    let r = build_steps(io, ctx, slot, lay, &h, cache, &mut made);
     match r {
         Ok(c) => {
             if alias {
@@ -459,8 +487,8 @@ fn build(io: &Io<'_>, ctx: u32, slot: usize, lay: &rs::SysLayout) -> Result<Crea
             SYS_FAIL.store(word, Ordering::Relaxed);
             crate::diag::record_named_bytes(b"RmSysFail", word);
             note_stage(stage::UNDO);
-            undo(io, ctx, &h, slot, &made);
-            Err(why)
+            let live = undo(io, ctx, &h, slot, &made);
+            Err((why, live))
         }
     }
 }
@@ -484,10 +512,10 @@ fn build_steps(
     h: &Handles,
     cache: Cache,
     made: &mut Made,
-    started: u64,
 ) -> Result<Created, StepErr> {
+    // The creation's deadline (admit and bring-up have used part of it).
     let late = |st: u32| -> Result<(), StepErr> {
-        if now().wrapping_sub(started) > CREATE_BUDGET_MS * UNITS_PER_MS {
+        if io.limit_spent() {
             Err(err(Why::Slow, st, Fail::new(FailKind::Transport, 1)))
         } else {
             Ok(())
@@ -495,11 +523,22 @@ fn build_steps(
     };
     let mem = Svc::handle(slot);
 
-    // 3. the memory
+    // 3. the memory. With the deadline spent nothing is sent: the request that is never
+    // sent leaves no object, and the undo has nothing to free.
+    late(stage::ALLOC)?;
     note_stage(stage::ALLOC);
-    let reported =
-        alloc_sys(io, h, mem, cache, lay.size).map_err(|f| err(Why::Alloc, stage::ALLOC, f))?;
-    made.mem = true;
+    let reported = match alloc_sys(io, h, mem, cache, lay.size) {
+        Ok(reported) => {
+            made.mem = AllocOutcome::Made;
+            reported
+        }
+        Err(f) => {
+            // A timeout or an unreadable reply: the host may have allocated it all the
+            // same, and the undo must find out (or quarantine the slot).
+            made.mem = AllocOutcome::after_failure(f.kind);
+            return Err(err(Why::Alloc, stage::ALLOC, f));
+        }
+    };
     let size = rs::adopt_size(lay.size, reported)
         .map_err(|w| err(w, stage::ALLOC, Fail::new(FailKind::Layout, 0x30)))?;
     let fl = rs::foreign_layout(lay, size)
@@ -603,41 +642,54 @@ fn build_steps(
 /// Give back what a failed creation made, in the order that keeps every reference valid:
 /// the export file, the Venus resource (it names the GEM), the GEM, the memory. A step
 /// that fails is counted, never retried; what could not be closed is left to the
-/// transport's sweep (it closes the whole KMD owner).
+/// transport's sweep (it closes the whole KMD owner). It runs on its own allowance
+/// ([`rs::UNDO_BUDGET_MS`]), not on what is left of the creation's.
+///
+/// Returns whether RM may still hold the memory's object ([`rs::mem_may_be_live`]): the free
+/// failed, or the allocation's answer never came and the free was not answered either. The
+/// caller must then keep the slot, and with it the RM handle `Svc::handle(slot)`, out of
+/// circulation (`Svc::abort_leaked`): the next creation on that number would be refused as
+/// a duplicate.
 #[inline(never)]
-fn undo(io: &Io<'_>, ctx: u32, h: &Handles, slot: usize, made: &Made) {
+fn undo(io: &Io<'_>, ctx: u32, h: &Handles, slot: usize, made: &Made) -> bool {
+    let b = undo_budget();
+    let uio = io.with_limit(Some(b));
     let mut leaked = false;
-    if made.export_ch != 0 && !io.close_file(made.export_ch) {
+    if made.export_ch != 0 && !uio.close_file(made.export_ch) {
         SYS_SOFT.fetch_add(1, Ordering::Relaxed);
         leaked = true;
     }
-    if made.resource != 0 {
-        let b = budget(TIMEOUT_MS, TIMEOUT_MS);
-        if ctrl::release_blob_for_owner_within(
-            io.passive,
-            io.adapter,
+    if made.resource != 0
+        && ctrl::release_blob_for_owner_within(
+            uio.passive,
+            uio.adapter,
             KMD,
             ctx,
             made.resource,
             Some(&b),
         )
         .is_err()
-        {
-            SYS_SOFT.fetch_add(1, Ordering::Relaxed);
-            leaked = true;
-        }
-    }
-    if made.gem != 0 && gem_close(io, h, made.gem).is_err() {
+    {
         SYS_SOFT.fetch_add(1, Ordering::Relaxed);
         leaked = true;
     }
-    if made.mem && free_sys(io, h, Svc::handle(slot)).is_err() {
+    if made.gem != 0 && gem_close(&uio, h, made.gem).is_err() {
+        SYS_SOFT.fetch_add(1, Ordering::Relaxed);
+        leaked = true;
+    }
+    let free = if made.mem == AllocOutcome::NotMade {
+        FreeOutcome::NotSent
+    } else {
+        FreeOutcome::of(free_sys(&uio, h, Svc::handle(slot)))
+    };
+    if free == FreeOutcome::Failed {
         SYS_SOFT.fetch_add(1, Ordering::Relaxed);
         leaked = true;
     }
     if leaked {
         SYS_LEAK.fetch_add(1, Ordering::Relaxed);
     }
+    rs::mem_may_be_live(made.mem, free)
 }
 
 // ---- the RM messages ----------------------------------------------------------------
@@ -757,7 +809,7 @@ fn import_resource(
     size: u64,
 ) -> Result<u32, Fail> {
     let adapter = io.adapter;
-    let b = budget(TIMEOUT_MS, TIMEOUT_MS);
+    let b = step_budget(io);
     if !crate::virtio::foreign::rm_import_served(adapter) {
         return Err(Fail::new(FailKind::Refused, 0x41));
     }
@@ -806,14 +858,16 @@ fn import_resource(
         Ok(ForeignCommit::Recorded) => Ok(resource),
         _ => {
             // Teardown (or a closed DRM file) raced the round trip: the resource exists
-            // host side with no record; release it through the ordinary path.
+            // host side with no record; release it through the ordinary path, on the
+            // undo's allowance (the creation's may be spent).
+            let ub = undo_budget();
             let _ = ctrl::release_blob_for_owner_within(
                 io.passive,
                 adapter,
                 KMD,
                 ctx,
                 resource,
-                Some(&b),
+                Some(&ub),
             );
             Err(Fail::new(FailKind::Refused, 0x47))
         }
@@ -828,10 +882,16 @@ fn import_resource(
 ///
 /// The unmap is safe: nothing else knows the resource yet, so nothing can read the range
 /// (the host swaps in zeros when it unmaps).
+///
+/// A range is returned to the window only once the host confirmed the unmap. If the unmap
+/// fails the host may still have the range mapped, and a map that reused it would overlap:
+/// the failure ends the creation with the blob still recorded as mapped, and the undo's
+/// `release_blob_for_owner_within` (which sees `mapped`) unmaps again and only then frees the
+/// range.
 #[inline(never)]
 fn trial_map(io: &Io<'_>, resource: u32, made: Cache) -> Result<(), (Why, Fail)> {
     let adapter = io.adapter;
-    let b = budget(TIMEOUT_MS, TIMEOUT_MS);
+    let b = step_budget(io);
     let prep = match ctrl::map_blob_prepare_within(
         io.passive,
         adapter,
@@ -847,16 +907,19 @@ fn trial_map(io: &Io<'_>, resource: u32, made: Cache) -> Result<(), (Why, Fail)>
     };
     SYS_CACHE.store(prep.map_cache, Ordering::Relaxed);
     // Unmap first, judge after: the mapping must not stay behind a refusal.
-    let unmapped = ctrl::resource_unmap_blob(io.passive, adapter, resource).is_ok();
+    let unmapped = ctrl::resource_unmap_blob_budgeted(io.passive, adapter, resource, &b).is_ok();
+    if !unmapped {
+        // Not confirmed: neither the mapped flag nor the window range is touched here.
+        SYS_SOFT.fetch_add(1, Ordering::Relaxed);
+        SYS_TRIAL_FAIL.fetch_add(1, Ordering::Relaxed);
+        return Err((Why::Trial, Fail::new(FailKind::Host, 0x51)));
+    }
     let _ = adapter.with_virtio(|v| {
         v.blob_note_unmapped(resource);
         if let Some(w) = v.host_visible() {
             v.free_window_range_pub(prep.gpa.wrapping_sub(w.base), prep.size);
         }
     });
-    if !unmapped {
-        SYS_SOFT.fetch_add(1, Ordering::Relaxed);
-    }
     if !rs::host_cache_ok(made, prep.map_cache) {
         SYS_MIS.fetch_add(1, Ordering::Relaxed);
         return Err((Why::Cache, Fail::new(FailKind::Layout, prep.map_cache)));
@@ -900,6 +963,7 @@ pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource
             passive,
             adapter,
             epoch: t.epoch,
+            limit: None,
         };
         let mut leaked = false;
         // A primary the screen has moved off is closed once the host released it (the

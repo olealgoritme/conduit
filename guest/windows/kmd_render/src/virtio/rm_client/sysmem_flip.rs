@@ -28,6 +28,14 @@
 //! `sysmem::released` holds the GEM close of a REPLACED primary until the host released it,
 //! for at most 500 ms from the replacing flip (`rm_sysmem::close_gate`).
 //!
+//! GIVING UP. Three failures in a row (a refused registration or flip, eight yielded flips)
+//! withdraw the source and reset the presenter, and `RESTART_AT` is set five seconds ahead:
+//! until then [`service`] returns at its first line (and asks for a wake at that time), whatever
+//! wakes the worker. The gate is needed because a reset presenter registers at its very next
+//! look, and every desktop frame edge wakes the worker; the decision is
+//! `rm_sysmem::restart_pause`. So a host that hangs or refuses costs the worker three flips
+//! (1 s each at most, 100 ms apart) per five seconds, not a loop.
+//!
 //! LOCKING. `TARGET`, `PRES` and `FLIPS` are leaf spinlocks over plain data, never held across
 //! I/O or another lock and never held together. Everything that sends runs with no lock.
 
@@ -49,8 +57,6 @@ const ACTS_PER_PASS: usize = 3;
 /// How long the host gets to take one flip (the worker flips every frame and StopDevice
 /// joins it for a bounded time, as `rm_present`).
 const FLIP_TIMEOUT_MS: u64 = 1_000;
-/// How long after the presenter gave up (three failed attempts in a row) it starts over: 5 s.
-const RESTART_AFTER_GIVING_UP_100NS: u64 = 50_000_000;
 /// Consecutive flips that found the source yielded before it counts as a failure.
 const MAX_YIELDS: u32 = 8;
 
@@ -65,6 +71,11 @@ static PRES: SpinLock<PState> = SpinLock::new(PState {
 });
 static TARGET: SpinLock<TargetBook> = SpinLock::new(TargetBook::new());
 static YIELDS: AtomicU32 = AtomicU32::new(0);
+/// When the presenter that gave up starts over (interrupt time, 100 ns; 0 = it is not
+/// waiting). A freshly reset presenter registers at its very next look, and every desktop
+/// frame edge wakes the worker, so the pause is this gate at the top of [`service`]
+/// (`rs::restart_pause`), not the presenter's.
+static RESTART_AT: AtomicU64 = AtomicU64::new(0);
 /// What the host was last told to show and the buffer that replaced (the release seam: a
 /// leaf spinlock over plain data, held for a few stores, never across I/O).
 static FLIPS: SpinLock<FlipLog> = SpinLock::new(FlipLog::new());
@@ -121,6 +132,7 @@ pub(super) fn reset() {
         g.p.reset();
     }
     YIELDS.store(0, Ordering::Relaxed);
+    RESTART_AT.store(0, Ordering::Release);
     LAST_SEQ.store(0, Ordering::Relaxed);
     FLIPS.lock().clear();
     rm_present::clear_wake_at();
@@ -241,6 +253,14 @@ pub(super) fn target_gone(adapter: &AdapterContext, resource_id: u32) {
 /// worker). With nothing shown and nothing registered it is two lock holds.
 #[inline(never)]
 pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
+    // A presenter that gave up waits out its pause whatever wakes the worker (frame edges
+    // come at the display's rate): nothing is registered or flipped, the edges stay
+    // owed, and the next wake is the end of the pause.
+    let restart_at = RESTART_AT.load(Ordering::Acquire);
+    if let Some(wake) = rs::restart_pause(restart_at, now()) {
+        rm_present::set_wake_at(wake);
+        return;
+    }
     let Ok(epoch) = adapter.with_virtio(|v| v.nvrm_epoch()) else {
         return;
     };
@@ -285,7 +305,9 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
             PRES.lock().p.reset();
             SYS_GAVE_UP.fetch_add(1, Ordering::Relaxed);
             crate::diag::record_named_bytes(b"RmSysGaveUp", SYS_GAVE_UP.load(Ordering::Relaxed));
-            rm_present::set_wake_at(now().saturating_add(RESTART_AFTER_GIVING_UP_100NS));
+            let at = now().saturating_add(rs::RESTART_AFTER_GIVING_UP_100NS);
+            RESTART_AT.store(at, Ordering::Release);
+            rm_present::set_wake_at(at);
             return;
         }
         match act {

@@ -28,9 +28,10 @@ use crate::foreign_resource::{
     MAX_FOREIGN_RESOURCE_BYTES, MOD_LINEAR,
 };
 use crate::foreign_scanout::{Layout as FlipLayout, MAX_DIM, MAX_STRIDE, MIN_DIM};
-use crate::rm_client::{MAX_SURFACE_BYTES, MEM_ALLOC_BYTES};
+use crate::rm_client::{Fail, FailKind, MAX_SURFACE_BYTES, MEM_ALLOC_BYTES};
 use crate::rm_present::Inputs;
 use crate::scanout_release::{ring_wait, Wait};
+use crate::sweep_budget::{SweepBudget, UNITS_PER_MS};
 
 /// The `KmdRmClient` value that turns this on.
 pub const LEVEL: u32 = 5;
@@ -598,15 +599,49 @@ impl Svc {
     /// The creation in `slot` failed and was undone: a strike; the last one stops new
     /// allocations for the generation.
     pub fn abort(&mut self, slot: usize) {
+        self.abort_slot(slot, false);
+    }
+
+    /// The creation in `slot` failed and the undo could not make sure RM freed its memory
+    /// ([`mem_may_be_live`]): the same strike, but the slot is NOT free. Its RM handle
+    /// ([`Svc::handle`]) may still be RM's, and a creation that took the slot again would
+    /// `RM_ALLOC` the same number and be refused as a duplicate (three of those end the
+    /// generation's allocations). The slot stays `Closing`, the state of a destroyed
+    /// allocation whose free failed (`sysmem::released`): nothing takes it and nothing finds
+    /// it, and the generation's end (the transport sweep closes the client, which frees the
+    /// memory) resets the table.
+    pub fn abort_leaked(&mut self, slot: usize) {
+        self.abort_slot(slot, true);
+    }
+
+    fn abort_slot(&mut self, slot: usize, quarantine: bool) {
         if let Some(s) = self.slots.get_mut(slot) {
             if s.state == SlotState::Building {
-                *s = Slot::FREE;
+                *s = if quarantine {
+                    Slot {
+                        state: SlotState::Closing,
+                        resid: 0,
+                        gem: 0,
+                        epoch: s.epoch,
+                    }
+                } else {
+                    Slot::FREE
+                };
                 self.strikes = self.strikes.saturating_add(1);
                 if self.strikes >= MAX_STRIKES && self.phase == Phase::Up {
                     self.phase = Phase::NoNew;
                 }
             }
         }
+    }
+
+    /// Slots a failed creation left quarantined (taken, nothing live in them): for the
+    /// counters and the tests.
+    pub fn quarantined(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.state == SlotState::Closing && s.resid == 0)
+            .count()
     }
 
     /// A creation that did not fail in the service (a Venus fallback for another
@@ -651,6 +686,122 @@ impl Svc {
 impl Default for Svc {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---- how long a creation may take -----------------------------------------------------------
+
+/// The whole forward part of one creation: the wait for another thread's bring-up, the
+/// bring-up itself (eleven messages), the memory, the import, the trial map and the adopt.
+/// One monotonic deadline (`now_100ns`, interrupt time) for all of it: a count of sleeps is
+/// not a bound (`sleep_ms(1)` lasts a timer tick, about 15.6 ms), and eleven messages of
+/// 2.5 s each are not one.
+pub const CREATE_BUDGET_MS: u64 = 6_000;
+/// What the undo of a failed creation may spend, on its own allowance: the create budget may
+/// be the very thing that ran out (`Why::Slow`), and an undo that could send nothing would
+/// leave everything the creation made to the transport sweep. The worst case of a creation
+/// that fails is therefore [`CREATE_BUDGET_MS`] + this.
+pub const UNDO_BUDGET_MS: u64 = 3_000;
+
+/// The create budget starting at `now` (interrupt time, 100 ns), no message waiting longer
+/// than `call_cap_ms`.
+pub const fn create_budget(now: u64, call_cap_ms: u64) -> SweepBudget {
+    SweepBudget::new(now, CREATE_BUDGET_MS * UNITS_PER_MS, call_cap_ms)
+}
+
+/// The undo budget starting at `now`.
+pub const fn undo_budget(now: u64, call_cap_ms: u64) -> SweepBudget {
+    SweepBudget::new(now, UNDO_BUDGET_MS * UNITS_PER_MS, call_cap_ms)
+}
+
+// ---- a failed creation and the RM handle of its slot ------------------------------------------
+
+/// `NV_ERR_OBJECT_NOT_FOUND`: what `RM_FREE` answers for a handle RM does not hold.
+pub const NV_ERR_OBJECT_NOT_FOUND: u32 = 0x57;
+
+/// What is known of the `RM_ALLOC` of a creation's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AllocOutcome {
+    /// Nothing was sent, or RM (or the host, or the KMD's own policy) refused it: no object.
+    #[default]
+    NotMade,
+    /// RM said yes.
+    Made,
+    /// The request may have reached RM and the answer did not come back (a timeout, a
+    /// transport error, a reply that cannot be read): the object may exist.
+    Unknown,
+}
+
+impl AllocOutcome {
+    /// What a failed `alloc_sys` leaves open, by how it failed. A `Transport` failure or an
+    /// unreadable reply came after the request was sent (the host may have allocated);
+    /// `Refused` (the KMD's own policy), `Host`, `Rm`, `Layout`, `Os` and `Busy` are either
+    /// an answer that says no or a failure before anything was sent.
+    pub const fn after_failure(kind: FailKind) -> Self {
+        match kind {
+            FailKind::Transport | FailKind::Parse => AllocOutcome::Unknown,
+            FailKind::Refused
+            | FailKind::Host
+            | FailKind::Rm
+            | FailKind::Layout
+            | FailKind::Os
+            | FailKind::Busy => AllocOutcome::NotMade,
+        }
+    }
+}
+
+/// What the undo's `RM_FREE` of the memory came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeOutcome {
+    /// Not sent (there was nothing to free).
+    NotSent,
+    Freed,
+    /// RM answered that it holds no such object.
+    NotFound,
+    /// Refused, timed out or not sent for want of budget: unknown.
+    Failed,
+}
+
+impl FreeOutcome {
+    pub fn of(r: Result<(), Fail>) -> Self {
+        match r {
+            Ok(()) => FreeOutcome::Freed,
+            Err(f) if f.kind == FailKind::Rm && f.code == NV_ERR_OBJECT_NOT_FOUND => {
+                FreeOutcome::NotFound
+            }
+            Err(_) => FreeOutcome::Failed,
+        }
+    }
+}
+
+/// Whether RM may still hold the object of the slot's handle after a creation's undo. If so
+/// the slot must not be reused ([`Svc::abort_leaked`]). Only an answer settles it: RM freed
+/// it, or RM says it never had it. No attempt at all (nothing was allocated, or the request
+/// was refused) is settled too; a free that failed is not, whatever the allocation said.
+pub const fn mem_may_be_live(alloc: AllocOutcome, free: FreeOutcome) -> bool {
+    match (alloc, free) {
+        (AllocOutcome::NotMade, _) => false,
+        (_, FreeOutcome::Freed | FreeOutcome::NotFound) => false,
+        (_, FreeOutcome::NotSent | FreeOutcome::Failed) => true,
+    }
+}
+
+// ---- the presenter's restart --------------------------------------------------------------
+
+/// How long after the flip service gave up (three failed attempts in a row) it starts over:
+/// 5 s.
+pub const RESTART_AFTER_GIVING_UP_100NS: u64 = 50_000_000;
+
+/// The time the worker must sleep until, while a presenter that gave up waits to start over
+/// (`restart_at` is that moment, 0 for none), or `None` once it is due. A reset presenter
+/// does not wait by itself: its first `decide` is `Act::Register` at once (`retry_at` is 0),
+/// so without this gate every desktop frame edge would restart register, flip, fail,
+/// withdraw (each failed flip holding the worker for the flip's timeout).
+pub const fn restart_pause(restart_at: u64, now: u64) -> Option<u64> {
+    if restart_at != 0 && now < restart_at {
+        Some(restart_at)
+    } else {
+        None
     }
 }
 
@@ -1283,6 +1434,202 @@ mod tests {
         assert!(!s.sync_epoch(2));
     }
 
+    // ---- a failed creation and the slot's RM handle ---------------------------------
+
+    #[test]
+    fn a_creation_whose_memory_may_be_live_keeps_its_slot_and_its_handle() {
+        let mut s = up(1);
+        let Admit::Go(a) = s.admit(1) else { panic!() };
+        s.abort_leaked(a);
+        assert_eq!(s.strikes(), 1, "a strike like any failed creation");
+        assert_eq!(s.quarantined(), 1);
+        assert_eq!(s.live(), 0, "nothing is live in it");
+        // The next creation gets ANOTHER slot, hence another RM handle: the quarantined
+        // one's number is still RM's.
+        let Admit::Go(b) = s.admit(1) else { panic!() };
+        assert_ne!(a, b);
+        assert_ne!(Svc::handle(a), Svc::handle(b));
+        // A cleanly undone slot, in contrast, is the first one taken again.
+        s.abort(b);
+        assert_eq!(s.admit(1), Admit::Go(b));
+        assert_eq!(s.quarantined(), 1);
+    }
+
+    #[test]
+    fn a_quarantined_slot_is_never_found_or_taken_by_a_release() {
+        let mut s = up(1);
+        let Admit::Go(a) = s.admit(1) else { panic!() };
+        s.abort_leaked(a);
+        assert_eq!(s.find(0), None);
+        assert_eq!(s.take(0), None);
+        // The slot is not the table's to free by a stray call either: it is Closing, and
+        // the one way out is the generation's end.
+        s.freed(a);
+        assert_eq!(s.live(), 0);
+    }
+
+    #[test]
+    fn repeated_leaks_end_the_generations_allocations_and_a_new_generation_cleans_up() {
+        let mut s = up(1);
+        for _ in 0..MAX_STRIKES {
+            let Admit::Go(i) = s.admit(1) else { panic!() };
+            s.abort_leaked(i);
+        }
+        assert_eq!(s.phase(), Phase::NoNew);
+        assert_eq!(s.quarantined(), MAX_STRIKES as usize);
+        assert_eq!(s.admit(1), Admit::Refuse(Why::NoNew));
+        // A new generation: the sweep closed the client, so the table is clean.
+        assert_eq!(s.admit(2), Admit::BringUp);
+        s.bring_up_done(true);
+        assert_eq!(s.quarantined(), 0);
+        assert_eq!(s.admit(2), Admit::Go(0));
+    }
+
+    #[test]
+    fn a_success_clears_the_strikes_a_leak_made() {
+        let mut s = up(1);
+        let Admit::Go(a) = s.admit(1) else { panic!() };
+        s.abort_leaked(a);
+        let Admit::Go(b) = s.admit(1) else { panic!() };
+        s.commit(b, 9, 90);
+        assert_eq!(s.strikes(), 0);
+        assert_eq!(s.quarantined(), 1);
+    }
+
+    #[test]
+    fn aborting_a_slot_that_is_not_building_changes_nothing() {
+        let mut s = up(1);
+        let Admit::Go(a) = s.admit(1) else { panic!() };
+        s.commit(a, 9, 90);
+        s.abort_leaked(a);
+        s.abort(a);
+        assert_eq!(s.strikes(), 0);
+        assert_eq!(s.find(9), Some((a, 90, 1)));
+    }
+
+    #[test]
+    fn memory_is_taken_for_live_unless_an_answer_says_otherwise() {
+        use AllocOutcome::*;
+        use FreeOutcome::*;
+        // Never made (refused, or never sent): no handle in use, whatever the free says.
+        for f in [NotSent, Freed, NotFound, Failed] {
+            assert!(!mem_may_be_live(NotMade, f));
+        }
+        for a in [Made, Unknown] {
+            assert!(!mem_may_be_live(a, Freed));
+            assert!(!mem_may_be_live(a, NotFound), "RM says it holds nothing");
+            assert!(
+                mem_may_be_live(a, Failed),
+                "the free failed: RM may hold it"
+            );
+            assert!(mem_may_be_live(a, NotSent));
+        }
+    }
+
+    #[test]
+    fn what_a_failed_alloc_leaves_open_follows_how_it_failed() {
+        use AllocOutcome::*;
+        // The reply never came (timeout) or cannot be read: the host may have allocated.
+        assert_eq!(AllocOutcome::after_failure(FailKind::Transport), Unknown);
+        assert_eq!(AllocOutcome::after_failure(FailKind::Parse), Unknown);
+        // An answer that says no, or a refusal before anything was sent.
+        for k in [
+            FailKind::Refused,
+            FailKind::Host,
+            FailKind::Rm,
+            FailKind::Layout,
+            FailKind::Os,
+            FailKind::Busy,
+        ] {
+            assert_eq!(AllocOutcome::after_failure(k), NotMade);
+        }
+    }
+
+    #[test]
+    fn a_free_that_rm_answers_not_found_is_settled_and_any_other_failure_is_not() {
+        assert_eq!(FreeOutcome::of(Ok(())), FreeOutcome::Freed);
+        assert_eq!(
+            FreeOutcome::of(Err(Fail::new(FailKind::Rm, NV_ERR_OBJECT_NOT_FOUND))),
+            FreeOutcome::NotFound
+        );
+        // Another RM status (the object is busy), a host errno, a timeout: unknown.
+        for f in [
+            Fail::new(FailKind::Rm, 0x1f),
+            Fail::new(FailKind::Host, NV_ERR_OBJECT_NOT_FOUND),
+            Fail::new(FailKind::Transport, 1),
+        ] {
+            assert_eq!(FreeOutcome::of(Err(f)), FreeOutcome::Failed);
+        }
+        // A creation whose alloc timed out and whose free timed out too: quarantined.
+        let a = AllocOutcome::after_failure(FailKind::Transport);
+        assert!(mem_may_be_live(
+            a,
+            FreeOutcome::of(Err(Fail::new(FailKind::Transport, 1)))
+        ));
+        // ... and one whose alloc timed out but whose free is answered "not found".
+        assert!(!mem_may_be_live(
+            a,
+            FreeOutcome::of(Err(Fail::new(FailKind::Rm, NV_ERR_OBJECT_NOT_FOUND)))
+        ));
+    }
+
+    // ---- how long a creation may take -----------------------------------------------
+
+    const CAP: u64 = 2_500;
+
+    #[test]
+    fn the_create_budget_is_six_seconds_in_all_and_no_message_outlives_it() {
+        let t = 7_000_000_000u64;
+        let b = create_budget(t, CAP);
+        assert_eq!(CREATE_BUDGET_MS, 6_000);
+        assert_eq!(
+            b.call_timeout_ms(t),
+            Some(CAP),
+            "a message gets its own cap"
+        );
+        assert_eq!(b.call_timeout_ms(t + 3_500 * MS), Some(CAP));
+        // What is left bounds the last ones.
+        assert_eq!(b.call_timeout_ms(t + 5_000 * MS), Some(1_000));
+        assert_eq!(b.call_timeout_ms(t + 5_999 * MS + 1), Some(1));
+        assert!(!b.expired(t + 5_999 * MS));
+        assert!(b.expired(t + 6_000 * MS));
+        assert_eq!(b.call_timeout_ms(t + 6_000 * MS), None);
+        assert_eq!(b.call_timeout_ms(t + 9_000 * MS), None);
+    }
+
+    /// The old wait counted 5000 sleeps of "1 ms"; a sleep lasts a timer tick (15.6 ms), so
+    /// it ran for 78 s. A wait on the deadline ends within a tick of it.
+    #[test]
+    fn a_wait_on_the_deadline_ends_on_time_whatever_a_sleep_costs() {
+        const TICK: u64 = 156_000; // 15.6 ms in 100 ns
+        let t = 1_000_000u64;
+        let b = create_budget(t, CAP);
+        let mut now = t;
+        let mut sleeps = 0u32;
+        while !b.expired(now) {
+            now += TICK;
+            sleeps += 1;
+        }
+        let spent_ms = (now - t) / MS;
+        assert!((6_000..6_000 + 16).contains(&spent_ms), "{spent_ms}");
+        assert!(sleeps < 400, "{sleeps} sleeps, not 5000");
+    }
+
+    #[test]
+    fn the_undo_has_its_own_allowance_and_a_spent_create_budget_does_not_starve_it() {
+        let t = 5_000_000u64;
+        let c = create_budget(t, CAP);
+        let spent_at = t + 6_000 * MS;
+        assert!(c.expired(spent_at));
+        let u = undo_budget(spent_at, CAP);
+        assert_eq!(UNDO_BUDGET_MS, 3_000);
+        assert_eq!(u.call_timeout_ms(spent_at), Some(CAP));
+        assert_eq!(u.call_timeout_ms(spent_at + 2_500 * MS), Some(500));
+        assert_eq!(u.call_timeout_ms(spent_at + 3_000 * MS), None);
+        // The worst case of a failed creation is the two allowances.
+        assert_eq!(CREATE_BUDGET_MS + UNDO_BUDGET_MS, 9_000);
+    }
+
     // ---- what the screen shows ----------------------------------------------------
 
     fn target(resid: u32, gem: u32) -> Target {
@@ -1498,6 +1845,64 @@ mod tests {
         assert!(m.p.gave_up());
         assert!(m.arb.resident().is_none());
         assert_eq!(m.flips, [10]);
+    }
+
+    /// The flip service's restart: a presenter that gave up is reset (a fresh one registers at
+    /// the very next look) and the wake-ups go on (every desktop frame edge), so the pause is
+    /// the caller's gate, [`restart_pause`], and the presenter is not asked during it.
+    #[test]
+    fn a_presenter_that_gave_up_starts_over_only_after_five_seconds() {
+        let mut m = Model::new();
+        m.tgt = Some(target(1, 10));
+        m.run(true, false);
+        m.refuse_flips = true;
+        for _ in 0..4 {
+            m.now += 200 * MS;
+            m.run(true, false);
+        }
+        assert!(m.p.gave_up());
+        assert!(m.arb.resident().is_none(), "withdrawn");
+        // What the service does: reset the presenter, remember the restart time.
+        m.p.reset();
+        let restart_at = m.now + RESTART_AFTER_GIVING_UP_100NS;
+        m.refuse_flips = false;
+        let flips = m.flips.len();
+        let mut wakes = 0u32;
+        loop {
+            m.now += 16 * MS;
+            if restart_pause(restart_at, m.now).is_none() {
+                break;
+            }
+            wakes += 1;
+            assert_eq!(m.flips.len(), flips, "nothing is flipped during the pause");
+            assert!(m.arb.resident().is_none(), "nor registered");
+        }
+        assert!(wakes > 300, "{wakes} frame-edge wakes were held back");
+        assert!(m.now >= restart_at && m.now < restart_at + 16 * MS);
+        m.run(true, false);
+        assert!(m.p.registered(), "after the pause it registers again");
+        assert_eq!(m.flips.len(), flips + 1, "and flips the primary");
+    }
+
+    #[test]
+    fn the_restart_pause_is_a_gate_on_the_clock() {
+        assert_eq!(restart_pause(0, 123), None, "none pending");
+        let at = 1_000 + RESTART_AFTER_GIVING_UP_100NS;
+        assert_eq!(restart_pause(at, 1_000), Some(at));
+        assert_eq!(restart_pause(at, at - 1), Some(at));
+        assert_eq!(restart_pause(at, at), None, "due exactly at the time");
+        assert_eq!(restart_pause(at, at + 1), None);
+        assert_eq!(RESTART_AFTER_GIVING_UP_100NS, 5_000 * MS);
+    }
+
+    /// Without the gate a reset presenter registers at once: what the pause is for.
+    #[test]
+    fn a_reset_presenter_registers_at_once_so_the_gate_is_the_callers() {
+        let mut m = Model::new();
+        m.tgt = Some(target(1, 10));
+        m.run(true, false);
+        m.p.reset();
+        assert_eq!(m.step(true, false), Act::Register);
     }
 
     // ---- the release seam ---------------------------------------------------------------
