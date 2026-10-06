@@ -249,6 +249,9 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
         cmd.arg("--venus")
             .arg("--venus-renderer")
             .arg(rt.venus_sock());
+        if crate::config::venus_guest_blobs() {
+            cmd.arg("--venus-guest-blobs");
+        }
     }
     // conduit-vmm is given the same number (vm::vmm_config).
     cmd.arg("--window-mib").arg(p.window_mib.to_string());

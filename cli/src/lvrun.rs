@@ -632,6 +632,9 @@ pub fn backend_exec(name: &str) -> Result<()> {
         .arg(crate::trace::socket(name));
     if let Some(s) = &venus_sock {
         cmd.arg("--venus").arg("--venus-renderer").arg(s);
+        if config::venus_guest_blobs() {
+            cmd.arg("--venus-guest-blobs");
+        }
     }
     // Unset or `auto`: the backend's own `auto` (the GPU's BAR1). QEMU asks
     // the backend for the size (GET_SHMEM_CONFIG), so there is nothing else
