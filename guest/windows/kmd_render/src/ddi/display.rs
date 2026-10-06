@@ -1768,6 +1768,7 @@ pub unsafe extern "C" fn dxgkddi_is_supported_vidpn(
     is_supported: INOUT_PDXGKARG_ISSUPPORTEDVIDPN,
 ) -> NTSTATUS {
     crate::diag::record(0x1300_0004);
+    crate::ddi::stall_diag::mode_step(3);
     if !is_supported.is_null() {
         crate::diag::record(
             0x1312_0000 | unsafe { ((*is_supported).hDesiredVidPn as usize as u32) & 0xFFFF },
@@ -1804,6 +1805,7 @@ pub unsafe extern "C" fn dxgkddi_recommend_functional_vidpn(
     _recommend: IN_CONST_PDXGKARG_RECOMMENDFUNCTIONALVIDPN_CONST,
 ) -> NTSTATUS {
     crate::diag::record(0x1300_0005);
+    crate::ddi::stall_diag::mode_step(4);
     if !unsafe { display_half_on(_adapter) } {
         return STATUS_NOT_SUPPORTED;
     }
@@ -1817,6 +1819,7 @@ pub unsafe extern "C" fn dxgkddi_enum_vidpn_cofunc_modality(
     enum_modality: IN_CONST_PDXGKARG_ENUMVIDPNCOFUNCMODALITY_CONST,
 ) -> NTSTATUS {
     crate::diag::record(0x1300_0006);
+    crate::ddi::stall_diag::mode_step(5);
     if !enum_modality.is_null() {
         crate::diag::record(
             0x1313_0000 | unsafe { (*enum_modality).EnumPivotType as u32 & 0xFFFF },
@@ -1827,7 +1830,10 @@ pub unsafe extern "C" fn dxgkddi_enum_vidpn_cofunc_modality(
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };
-    unsafe { crate::ddi::vidpn::enum_cofunc_modality(adapter, enum_modality) }
+    let status = unsafe { crate::ddi::vidpn::enum_cofunc_modality(adapter, enum_modality) };
+    crate::ddi::stall_diag::mode_result(5, status);
+    crate::ddi::stall_diag::publish_mode();
+    status
 }
 
 pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
@@ -1851,6 +1857,8 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
     commit: IN_CONST_PDXGKARG_COMMITVIDPN_CONST,
 ) -> NTSTATUS {
     crate::diag::record(0x1300_0008);
+    crate::ddi::stall_diag::mode_step(7);
+    crate::ddi::stall_diag::publish_mode();
     if !commit.is_null() {
         crate::diag::record(0x1315_0000 | unsafe { (*commit).AffectedVidPnSourceId & 0xFFFF });
         crate::diag::record(0x1316_0000 | unsafe { (*commit).Flags.PathPoweredOff() & 0xFFFF });
@@ -1871,9 +1879,12 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
     // `return SUCCESS` that never checks the pin is exactly viogpu3d's "commit but
     // light nothing" failure). Scanout itself is issued from SetVidPnSourceAddress.
     let adapter = unsafe { &*p };
-    crate::ddi::vidpn::legalize_vidpn(unsafe {
+    let status = crate::ddi::vidpn::legalize_vidpn(unsafe {
         crate::ddi::vidpn::commit_vidpn(adapter, commit as *const DXGKARG_COMMITVIDPN)
-    })
+    });
+    crate::ddi::stall_diag::mode_result(8, status);
+    crate::ddi::stall_diag::publish_mode();
+    status
 }
 
 pub unsafe extern "C" fn dxgkddi_update_active_vidpn_present_path(

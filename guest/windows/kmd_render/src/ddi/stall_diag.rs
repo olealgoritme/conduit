@@ -291,6 +291,26 @@ static WD_BIG: AtomicU32 = AtomicU32::new(0);
 /// `FlipWdogMs` in force (clamped; 0 = off) and `DeferBudget` in force (clamped; 0 = unlimited).
 static WDOG_MS: AtomicU32 = AtomicU32::new(0);
 static DEFER_BUDGET: AtomicU32 = AtomicU32::new(0);
+/// `VsPowerMode`, `VsWatchdog`, `VsIdleWake` in force (v327; 0 = the KMD 325 behaviour). Read at
+/// every StartDevice by [`reread_knobs`], never zeroed by [`start_generation`].
+static VS_POWER_MODE: AtomicU32 = AtomicU32::new(0);
+static VS_WATCHDOG: AtomicU32 = AtomicU32::new(0);
+static VS_IDLE_WAKE: AtomicU32 = AtomicU32::new(0);
+
+/// `VsPowerMode` in force (0 = any non-D0 call quiesces, 1 = adapter only).
+pub(crate) fn vs_power_mode() -> u32 {
+    VS_POWER_MODE.load(Ordering::Relaxed)
+}
+
+/// `VsWatchdog` in force (0 off, 1 revive, 2 revive and resume).
+pub(crate) fn vs_watchdog() -> u32 {
+    VS_WATCHDOG.load(Ordering::Relaxed)
+}
+
+/// `VsIdleWake` in force (1 = the worker's 4 Hz idle wake).
+pub(crate) fn vs_idle_wake() -> u32 {
+    VS_IDLE_WAKE.load(Ordering::Relaxed)
+}
 
 /// One vsync tick of bookkeeping (`VsPendN`, its maximum) and, with `FlipWdogMs` set, the
 /// watchdog. Called from the vsync DPC (`adapter/kobj.rs`, DISPATCH, atomics only). The tick is
@@ -536,6 +556,119 @@ pub(crate) fn reread_knobs() {
     DEFER_BUDGET.store(budget, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"FlWdMsEff", wdog);
     crate::diag::record_named_bytes(b"DefBudEff", budget);
+    let pm = hpd_wake::clamp_power_mode(crate::diag::read_config_dword(
+        crate::diag::knobs::VS_POWER_MODE,
+        0,
+    ));
+    let wd = hpd_wake::clamp_watchdog(crate::diag::read_config_dword(
+        crate::diag::knobs::VS_WATCHDOG,
+        0,
+    ));
+    let idle = hpd_wake::clamp_idle_wake(crate::diag::read_config_dword(
+        crate::diag::knobs::VS_IDLE_WAKE,
+        0,
+    ));
+    VS_POWER_MODE.store(pm, Ordering::Relaxed);
+    VS_WATCHDOG.store(wd, Ordering::Relaxed);
+    VS_IDLE_WAKE.store(idle, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"VsPwrEff", pm);
+    crate::diag::record_named_bytes(b"VsWdgEff", wd);
+    crate::diag::record_named_bytes(b"VsIdlEff", idle);
+}
+
+// ---- v327 breadcrumbs: what the previous generation left, where the worker and the mode set are
+
+/// What the statics and the adapter held at the ENTRY of this StartDevice (before anything of the
+/// new generation ran): the previous generation's `ADAPTER_D0`, the watchdog reference, whether
+/// the heartbeat was armed, the delivery gate, whether a worker thread was registered, the
+/// previous `HpdN` and the previous heartbeat tick count. Written once per StartDevice
+/// ([`note_start_entry`]), never zeroed: it names the state a failed restart inherited.
+static ENT_D0: AtomicU32 = AtomicU32::new(0);
+static ENT_REF: AtomicU32 = AtomicU32::new(0);
+static ENT_ARM: AtomicU32 = AtomicU32::new(0);
+static ENT_VS_EN: AtomicU32 = AtomicU32::new(0);
+static ENT_HPD_TH: AtomicU32 = AtomicU32::new(0);
+static ENT_HPD_N: AtomicU32 = AtomicU32::new(0);
+static ENT_VS_TK: AtomicU32 = AtomicU32::new(0);
+
+/// StartDevice entry, PASSIVE, BEFORE [`start_generation`] zeroes anything.
+pub(crate) fn note_start_entry(adapter: &AdapterContext, hpd_indicates: u32) {
+    ENT_D0.store(ADAPTER_D0.load(Ordering::Relaxed), Ordering::Relaxed);
+    ENT_REF.store(
+        helios_kmd_logic::vsync_rate::ms_from_100ns(VS_REF_AT.load(Ordering::Relaxed)),
+        Ordering::Relaxed,
+    );
+    ENT_ARM.store(adapter.vsync_armed.load(Ordering::Relaxed), Ordering::Relaxed);
+    ENT_VS_EN.store(adapter.vsync_enabled.load(Ordering::Relaxed), Ordering::Relaxed);
+    ENT_HPD_TH.store(u32::from(adapter.hpd_worker_registered()), Ordering::Relaxed);
+    ENT_HPD_N.store(hpd_indicates, Ordering::Relaxed);
+    ENT_VS_TK.store(VS_TICKS.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// The HPD worker's phase this generation (1 thread entered, 2 StartDevice's return seen, 3 first
+/// indication done, 4 first loop reached) and when the first loop ran. Atomics only; zeroed by
+/// [`start_generation`].
+static HPD_PHASE: AtomicU32 = AtomicU32::new(0);
+static HPD_PHASE_T: AtomicU32 = AtomicU32::new(0);
+static HPD_FIRST_T: AtomicU32 = AtomicU32::new(0);
+
+/// The worker reached `phase`.
+pub(crate) fn hpd_phase(phase: u32) {
+    let now = AdapterContext::interrupt_time_ms();
+    HPD_PHASE.store(phase, Ordering::Relaxed);
+    HPD_PHASE_T.store(now, Ordering::Relaxed);
+    if phase >= 4 && HPD_FIRST_T.load(Ordering::Relaxed) == 0 {
+        HPD_FIRST_T.store(now.max(1), Ordering::Relaxed);
+    }
+}
+
+/// The mode-set path of this generation: the last display DDI entered (`mode_step`), when, how
+/// many were entered, and the status the last one that returns one gave (`mode_result`).
+/// Steps: 1 QueryChildRelations, 2 QueryChildStatus, 3 IsSupportedVidPn, 4 RecommendFunctionalVidPn,
+/// 5 EnumVidPnCofuncModality, 6 SetVidPnSourceVisibility, 7 CommitVidPn entered, 8 CommitVidPn
+/// returned, 9 UpdateActiveVidPnPresentPath, 10 ControlInterrupt(CRTC_VSYNC, enable).
+static MODE_STG: AtomicU32 = AtomicU32::new(0);
+static MODE_T: AtomicU32 = AtomicU32::new(0);
+static MODE_N: AtomicU32 = AtomicU32::new(0);
+static MODE_ST: AtomicU32 = AtomicU32::new(0);
+
+/// A mode-set DDI was entered (any IRQL: atomics only). The registry mirror is [`publish_mode`].
+pub(crate) fn mode_step(step: u32) {
+    MODE_STG.store(step, Ordering::Relaxed);
+    MODE_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    MODE_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A mode-set DDI returned `status` (atomics only).
+pub(crate) fn mode_result(step: u32, status: i32) {
+    MODE_STG.store(step, Ordering::Relaxed);
+    MODE_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    MODE_ST.store(status as u32, Ordering::Relaxed);
+}
+
+/// Write the mode-set breadcrumbs to the service key. PASSIVE only (the mode-set DDIs are).
+pub(crate) fn publish_mode() {
+    use crate::diag::record_named_bytes as rec;
+    rec(b"ModeStg", MODE_STG.load(Ordering::Relaxed));
+    rec(b"ModeStgT", MODE_T.load(Ordering::Relaxed));
+    rec(b"ModeN", MODE_N.load(Ordering::Relaxed));
+    rec(b"ModeSt", MODE_ST.load(Ordering::Relaxed));
+}
+
+/// The entry snapshot, the worker's phase and the mode-set breadcrumbs, mirrored with the rest.
+fn publish_breadcrumbs() {
+    use crate::diag::record_named_bytes as rec;
+    rec(b"EntD0", ENT_D0.load(Ordering::Relaxed));
+    rec(b"EntRef", ENT_REF.load(Ordering::Relaxed));
+    rec(b"EntArm", ENT_ARM.load(Ordering::Relaxed));
+    rec(b"EntVsEn", ENT_VS_EN.load(Ordering::Relaxed));
+    rec(b"EntHpdTh", ENT_HPD_TH.load(Ordering::Relaxed));
+    rec(b"EntHpdN", ENT_HPD_N.load(Ordering::Relaxed));
+    rec(b"EntVsTk", ENT_VS_TK.load(Ordering::Relaxed));
+    rec(b"HpdPhase", HPD_PHASE.load(Ordering::Relaxed));
+    rec(b"HpdPhaseT", HPD_PHASE_T.load(Ordering::Relaxed));
+    rec(b"HpdFirstT", HPD_FIRST_T.load(Ordering::Relaxed));
+    publish_mode();
 }
 
 /// A new generation (StartDevice): zero every counter of this module (never the knobs, and not
@@ -591,9 +724,19 @@ pub(crate) fn start_generation() {
         &PWR_N,
         &PWR_UID,
         &PWR_D3_N,
+        &HPD_PHASE,
+        &HPD_PHASE_T,
+        &HPD_FIRST_T,
+        &MODE_STG,
+        &MODE_T,
+        &MODE_N,
+        &MODE_ST,
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    // Every v326 static that outlives a StopDevice starts the generation in its initial state: the
+    // watchdog's reference (the heartbeat is armed again after this, which sets it).
+    VS_REF_AT.store(0, Ordering::Relaxed);
     for c in &SIGNALS {
         c.store(0, Ordering::Relaxed);
     }
@@ -631,6 +774,7 @@ pub(crate) fn publish_counters() {
     // `VsTickN` / `VsOffN` and the rest of the heartbeat's life, then the worker's wakes.
     publish_vsync_ticks();
     publish_hpd_wake();
+    publish_breadcrumbs();
     rec(b"StartN", START_N.load(Ordering::Relaxed));
     rec(b"StartT", START_T.load(Ordering::Relaxed));
     rec(b"FlipWd", WD_COUNT.load(Ordering::Relaxed));

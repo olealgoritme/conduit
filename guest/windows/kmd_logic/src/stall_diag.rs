@@ -145,7 +145,7 @@ pub mod site {
 ///   exhausted; `VsRevN`: heartbeats the watchdog found dead and re-armed.
 /// * `PwrN`, `PwrUid`, `PwrD3N`: `DxgkDdiSetPowerState` calls, the last one's `DeviceUid`
 ///   (0xFFFFFFFF = the adapter), and those that were not D0.
-pub const COUNTERS: [&str; 57] = [
+pub const COUNTERS: [&str; 74] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -205,6 +205,26 @@ pub const COUNTERS: [&str; 57] = [
     "PwrN",
     "PwrUid",
     "PwrD3N",
+    // v327 (docs/zero-copy-present.md, the "mode lost after a device restart" incident): the
+    // knobs in force, what the previous generation left at StartDevice entry, the worker's phase
+    // and the mode-set path's last step.
+    "VsPwrEff",
+    "VsWdgEff",
+    "VsIdlEff",
+    "EntD0",
+    "EntRef",
+    "EntArm",
+    "EntVsEn",
+    "EntHpdTh",
+    "EntHpdN",
+    "EntVsTk",
+    "HpdPhase",
+    "HpdPhaseT",
+    "HpdFirstT",
+    "ModeStg",
+    "ModeStgT",
+    "ModeN",
+    "ModeSt",
 ];
 
 // ---- the scanout mutex -----------------------------------------------------------------------
