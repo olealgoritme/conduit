@@ -1,4 +1,4 @@
-From ec293255d39307e394e27a7733c8c8719d8fdd78 Mon Sep 17 00:00:00 2001
+From 380ca1edf767d38d5e3a59d7f6c5a1e07e3e9be7 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 04:48:06 +0200
 Subject: [PATCH] nvk/rm, wsi: presents retire on RM fences, no CPU wait (S4)
@@ -651,7 +651,7 @@ index e17e7a8..ef9691f 100644
     LOAD(alloc_pages,  "crm_alloc_pages",  false);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
 new file mode 100644
-index 0000000..2e28402
+index 0000000..ed4c9cf
 --- /dev/null
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
 @@ -0,0 +1,582 @@
@@ -1149,7 +1149,7 @@ index 0000000..2e28402
 +   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
 +   struct nvkmd_rm_rmfence *rf = dev->rmfence;
 +
-+   VkResult result = nvkmd_rm_mem_export_scanout(_mem, log_obj);
++   VkResult result = nvkmd_rm_mem_export_scanout(_mem, log_obj, modifier);
 +   if (result != VK_SUCCESS || rf == NULL) {
 +      /* Nothing will wait on it: the work is done before the caller learns */
 +      nvkmd_rm_rmfence_wait(&dev->base, fence, UINT64_MAX);
