@@ -135,6 +135,13 @@ impl NvrmPin {
             npages,
         }
     }
+
+    /// A `FORWARD` has claimed this pin's table, so the host (and through it the
+    /// GPU) may hold an alias of its pages until it closes the RM files involved.
+    /// A pin nothing claimed was never described to the host.
+    pub fn host_may_alias(&self) -> bool {
+        self.used
+    }
 }
 
 /// What `commit_nvrm_fence` did.
@@ -378,6 +385,7 @@ impl VirtioGpu {
         // Re-checked here under the same hold as the push (the pre-check in
         // `nvrm_map_bytes_room` ran before the host round trip).
         if !self.nvrm_map_bytes_room(owner, uvm, size) {
+            crate::virtio::nvrm::NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let mine = self.nvrm_maps.iter().filter(|s| s.owner == owner).count();

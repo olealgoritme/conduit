@@ -185,6 +185,30 @@ fn stop_stage(entry_100ns: u64, stage: u32) {
     );
 }
 
+/// Give the time since `from_100ns` back to `budget`: it was spent on something
+/// that is not a host command (a worker join, a hive flush).
+fn stop_credit(
+    budget: helios_kmd_logic::sweep_budget::SweepBudget,
+    from_100ns: u64,
+) -> helios_kmd_logic::sweep_budget::SweepBudget {
+    budget.credit(crate::adapter::foreign_scanout::now_100ns().saturating_sub(from_100ns))
+}
+
+/// Flush the service key (when `flush`) so the stage just recorded survives a
+/// bugcheck, and credit the flush time back to the budget.
+fn stop_flush(
+    passive: crate::irql::PassiveLevel,
+    flush: bool,
+    budget: helios_kmd_logic::sweep_budget::SweepBudget,
+) -> helios_kmd_logic::sweep_budget::SweepBudget {
+    if !flush {
+        return budget;
+    }
+    let from = crate::adapter::foreign_scanout::now_100ns();
+    crate::diag::flush_service_key(passive);
+    stop_credit(budget, from)
+}
+
 /// `DxgkDdiStartDevice` — bring the adapter online.
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
@@ -538,18 +562,27 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // DXGKDDI_STOP_DEVICE); the teardown below unrefs blobs and destroys the
         // venus context, both control round-trips against the still-live device.
         let passive_stop = unsafe { crate::irql::PassiveLevel::assume() };
-        // ONE budget for every host round trip below: after it is spent the sweeps
-        // only drop table entries and send nothing (the transport reset that
-        // follows reclaims the host side), so StopDevice is bounded by it plus
-        // one in-flight command, whatever the host does.
-        let entry = crate::adapter::foreign_scanout::now_100ns();
-        let budget = helios_kmd_logic::sweep_budget::SweepBudget::stop(entry);
-        stop_stage(entry, 1);
+        // Stage 1 is recorded with a clock of its own: the budget below must not
+        // start until the flush after it has finished.
+        stop_stage(crate::adapter::foreign_scanout::now_100ns(), 1);
         // The first stage reaches the disk before anything that could bugcheck.
         let flush = crate::diag::read_config_dword(crate::diag::knobs::STOP_FLUSH, 1) != 0;
         if flush {
+            // The flush covers the whole SYSTEM hive, which is dirty during a driver
+            // install: it can take hundreds of milliseconds and blocks other
+            // registry writers. It runs BEFORE the budget exists so that time is not
+            // taken from the host round trips.
             crate::diag::flush_service_key(passive_stop);
         }
+        // ONE budget for every host round trip below: after it is spent the sweeps
+        // only drop table entries and send nothing (the transport reset that
+        // follows reclaims the host side), so StopDevice is bounded by it plus
+        // one in-flight command, whatever the host does. Time spent on things that
+        // are not host commands (the later hive flushes, the worker joins) is
+        // credited back (`stop_credit`), because a budget eaten by a join leaves
+        // every handle unsent, and unsent handles leak their pins.
+        let entry = crate::adapter::foreign_scanout::now_100ns();
+        let mut budget = helios_kmd_logic::sweep_budget::SweepBudget::stop(entry);
         // Stop the ISR from touching the (about-to-be-reset) device first.
         //
         // ⚠ ASYMMETRY, recorded rather than changed (k-ctrlsubmit-12): this
@@ -576,8 +609,15 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // teardown (both idempotent; no-ops when the render-only surface never
         // started them). stop_hpd blocks until the worker exits so it can't touch
         // the (about-to-be-torn-down) context.
+        //
+        // The HPD join is bounded (5 s on the exit event, 5 s on the thread; see
+        // `stop_hpd`) and sits OUTSIDE the host-command budget: the worker can be
+        // inside a synchronous host round trip, which waits up to 30 s on its own.
+        // Its time is credited back so a slow join does not starve the sweeps.
+        let joined_from = crate::adapter::foreign_scanout::now_100ns();
         adapter.stop_vsync();
         adapter.stop_hpd();
+        budget = stop_credit(budget, joined_from);
         stop_stage(entry, 4);
         // The HPD worker did the `Nv*` registry mirror and is gone: leave the
         // registry with the final counts (PASSIVE, StopDevice).
@@ -607,6 +647,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
             );
             crate::diag::record_named_bytes(b"StopBlobs", blobs);
             stop_stage(entry, 5);
+            budget = stop_flush(passive_stop, flush, budget);
             let _ = crate::virtio::ctrl::ctx_destroy_kmd(
                 passive_stop,
                 adapter,
@@ -615,6 +656,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
             );
         } else {
             stop_stage(entry, 5);
+            budget = stop_flush(passive_stop, flush, budget);
         }
         stop_stage(entry, 6);
         // Free any parked completed entries at PASSIVE before the transport
@@ -631,6 +673,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         let swept = crate::virtio::nvrm::close_all_on_host(passive_stop, adapter, &budget);
         crate::diag::record_named_bytes(b"StopSwept", swept);
         stop_stage(entry, 8);
+        budget = stop_flush(passive_stop, flush, budget);
 
         // Tear down the virtio transport. `retire_transport` first tells the host
         // to close every RM handle of every owner (the transport is still alive,
@@ -662,6 +705,10 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         crate::diag::record_named_bytes(
             b"NvUnpin",
             crate::virtio::nvrm::NVRM_UNPINS.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"NvPinLeak",
+            crate::virtio::nvrm::NVRM_PIN_LEAKS.load(core::sync::atomic::Ordering::Relaxed),
         );
 
         // Drop the whole transport generation in one store — `bar_segment` and
