@@ -1829,3 +1829,37 @@ unchanged GEM (the host's account is code, not a run); the timing of the tail ag
 heartbeat's cost; the compile of the three hooks in `display.rs`, `build_paging_buffer.rs` and `create_allocation.rs`
 (read against the real definitions; the files `sysmem_flip.rs`, `rm_present.rs` and the rest of 15.12's list were
 type-checked in the generated harness); that the STANDARD identity's new bit is ignored by the shipped UMD.
+
+### 15.17 The CPU-copy fallback for a Blt into the level 5 RM primary (NOT BUILT: design notes only)
+
+Status: **unfinished. No code was written for this on `kmd/level5-blt-cpu`.** The work stopped after reading
+15.1 to 15.16 and starting on `ddi/display.rs` (`dxgkddi_present_inner`, the Blt arm near the
+`Edge::PresentBlt` hook). Nothing here was compiled, host-tested or run. Open point 3 of 15.14 and "Not done"
+item 3 of 15.16 still stand: at level 5 a Present Blt whose destination is the RM primary still fails with
+`STATUS_DEVICE_NOT_READY` (`begin_present_buffer_write_legacy` answers `NotFound`).
+
+The intended design (none of it verified):
+
+1. Source is a Venus-backed image: reuse the existing GPU copy of the source into the adapter's LINEAR
+   host-visible image (`prepare_optimal_scanout_copy` / `PreparedImageCopy`), wait for its completion as the
+   existing arm does, then copy the destination rect(s) row by row from that image's guest mapping into the RM
+   primary's own CPU mapping (the host's `map_info` cache type through `map_cache_to_mm`, never another
+   attribute), `sfence`, then `primary_changed(.., Edge::PresentBlt, resid)` once per Present.
+2. Source is a CPU-visible allocation (GDI): copy directly, rect by rect.
+3. Never fail the Present: on an internal failure count `RmSysBltSkip` and return success (a visual glitch),
+   unless the source is unreadable.
+4. Cost: limit the copy to the Present's dst rect(s). Counters `RmSysBltCpu`, `RmSysBltBytes` (MiB),
+   `RmSysBltUs`, `RmSysBltMaxUs`, `RmSysBltSkip` through `publish_nvrm_counters` (names of 14 characters or
+   fewer). At the host-measured write-combined speeds (writes about 28 MB/s, reads about 75 MB/s) a full
+   5120x1440 frame (29,491,200 bytes) is on the order of 0.4 s to read from a write-combined source mapping and
+   1 s to write; the rect limit is what makes it bearable.
+5. PASSIVE, no spinlock across the GPU wait or the row copy, the Venus lock order (scanout mutex, Venus,
+   virtio) unchanged.
+6. Pure parts (clip and clamp rects to the primary size and pitch, the row-copy plan, byte accounting, empty
+   rects, zero `SubRectCnt` meaning the full rect, 5120x1440 pitch 20480) belong in `kmd_logic` with host
+   tests: not written.
+7. The Venus path stays byte-identical for every destination that is not the RM primary: trivially true,
+   since nothing was changed.
+
+Not done, all of it: the source-kind mapping, the arms, the counters, the `kmd_logic` module and its tests, the
+harness type-check and the protocol test run.
