@@ -1460,6 +1460,128 @@ fn resource_create_blob_errno_within(
     Ok(resource_id)
 }
 
+/// What a refused guest-blob create answered (`create_guest_blob`).
+#[derive(Clone, Copy)]
+pub(crate) enum GuestBlobCreateError {
+    /// The host answered `resp_type` with `errno` in the response header.
+    Host { resp_type: u32, errno: u32 },
+    /// The command was not sent (no transport, no memory for the request, a full queue).
+    Transport,
+    /// The command may have reached the host and got no answer in time (a timeout, an
+    /// abandoned wait): the host may still create the blob over the pages.
+    Unanswered,
+    /// The live-resource table is full.
+    NoSlot,
+}
+
+/// `RESOURCE_CREATE_BLOB` of a GUEST blob over the page runs `entries` (`nr_entries`
+/// `virtio_gpu_mem_entry`s, already encoded, following the 56-byte create in the same request),
+/// `size` bytes (their sum), in Venus context `ctx_id`. Every field the host defines comes from
+/// `helios_kmd_logic::guest_blob::contract`. No `CTX_ATTACH_RESOURCE` follows: the host
+/// attaches a guest blob to `hdr.ctx_id` itself. The resource is committed to the live-resource
+/// table, so [`release_guest_blob_within`] can claim it exactly once. Waits at most
+/// `timeout_ms` for the answer (`helios_kmd_logic::guest_blob::deadline::CREATE_MS`). PASSIVE
+/// only.
+pub(crate) fn create_guest_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    entries: &[u8],
+    nr_entries: u32,
+    size: u64,
+    timeout_ms: u64,
+) -> Result<u32, GuestBlobCreateError> {
+    use helios_kmd_logic::guest_blob::contract as gb;
+    if entries.is_empty() || size == 0 || ctx_id == 0 {
+        return Err(GuestBlobCreateError::Transport);
+    }
+    let reserved = adapter
+        .with_virtio(|v| v.reserve_resource_slot())
+        .map_err(|_| GuestBlobCreateError::Transport)?;
+    if !reserved {
+        return Err(GuestBlobCreateError::NoSlot);
+    }
+    let resource_id = match adapter.with_virtio(|v| v.alloc_resource_id()) {
+        Ok(id) => id,
+        Err(_) => {
+            let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
+            return Err(GuestBlobCreateError::Transport);
+        }
+    };
+    let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    cmd.hdr.ctx_id = ctx_id;
+    cmd.resource_id = resource_id;
+    cmd.blob_mem = gb::BLOB_MEM;
+    cmd.blob_flags = gb::BLOB_FLAGS;
+    cmd.nr_entries = nr_entries;
+    cmd.blob_id = gb::BLOB_ID;
+    cmd.size = size;
+    const _: () = assert!(
+        size_of::<VirtioGpuResourceCreateBlob>()
+            == helios_kmd_logic::guest_blob::contract::CREATE_BYTES
+    );
+    let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+    let sent = ctrl_roundtrip(
+        passive,
+        adapter,
+        bytes_of(&cmd),
+        Some(entries),
+        &mut resp,
+        timeout_ms,
+        None,
+    );
+    let outcome = match sent {
+        Ok(()) => {
+            let t = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+            if resp_is_ok(t) {
+                Ok(())
+            } else {
+                Err(GuestBlobCreateError::Host {
+                    resp_type: t,
+                    errno: helios_kmd_logic::foreign_errno::from_resp_hdr(&resp),
+                })
+            }
+        }
+        // Never enqueued: nothing reached the host.
+        Err(VirtioError::QueueFull | VirtioError::OutOfMemory) => {
+            Err(GuestBlobCreateError::Transport)
+        }
+        // A timeout (the wait was abandoned, the command stays queued) or an abandon at
+        // teardown: the host may still run it. The caller keeps the pages pinned.
+        Err(_) => Err(GuestBlobCreateError::Unanswered),
+    };
+    if let Err(e) = outcome {
+        // A refused create made nothing on the host; an unanswered one is reclaimed by the
+        // transport reset that ends the generation (its pages stay pinned until then).
+        let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
+        return Err(e);
+    }
+    let _ = adapter.with_virtio(|v| v.commit_resource(resource_id));
+    Ok(resource_id)
+}
+
+/// `RESOURCE_UNREF` of a guest blob made by [`create_guest_blob`], once (the live-resource
+/// entry is the guard), waiting at most `timeout_ms` for the answer
+/// (`helios_kmd_logic::guest_blob::deadline::UNREF_MS`). After a successful return the host
+/// holds no mapping or pin of its pages. `Ok` also when another path already claimed it; an
+/// unanswered UNREF is NOT retried (the claim is spent): its pages stay pinned until the
+/// generation ends. PASSIVE only.
+pub(crate) fn release_guest_blob_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
+    let first = adapter
+        .with_virtio(|v| v.take_live_resource(resource_id))
+        .map_err(|_| VirtioError::DeviceError)?;
+    if !first {
+        return Ok(());
+    }
+    resource_unref_within(passive, adapter, resource_id, timeout_ms)
+}
+
 /// `HELIOS_ESCAPE_ALLOC_BLOB` — create a HOST3D blob (create + attach) and
 /// record it in the blob table. Returns the resource id.
 pub fn alloc_blob(
@@ -2603,7 +2725,10 @@ pub fn wait_fence(
                 Ok(FenceWaitPrep::Invalid) => return WaitFenceOutcome::Invalid,
                 Ok(FenceWaitPrep::TableFull) => {
                     full_retries += 1;
-                    if full_retries > 1_000 {
+                    // A `GuestBlob` bounded section (the drain of a retire) gives up at its
+                    // deadline instead of after up to ~16 s; nothing else changes (escapes and
+                    // unscoped threads never see `bounded_spent`).
+                    if full_retries > 1_000 || crate::ddi::escape_wait::bounded_spent() {
                         // NOT FENCE_WAIT_TIMEOUTS: the host may be perfectly
                         // healthy and all MAX_FENCE_WAITERS slots simply occupied.
                         // The outcome stays TimedOut so the ICD is untouched; only

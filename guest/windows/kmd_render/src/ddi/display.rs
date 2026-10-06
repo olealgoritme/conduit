@@ -811,6 +811,27 @@ unsafe fn dxgkddi_present_inner(
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(site::BLT_EXTENT);
             }
+            // `GuestBlob` (default 0: one relaxed load): a standard-buffer destination whose system
+            // backing is fully leased gets (lazily) a guest blob over those pages, which the copy
+            // below then writes instead of the Venus blob. A WindowedBlt snapshot never does.
+            if matches!(destination_desc, PresentDestinationDesc::StandardBuffer(_))
+                && snapshot_source.is_none()
+            {
+                // SAFETY: DxgkDdiPresent is PASSIVE_LEVEL (see the BLT arm below).
+                let passive = unsafe { crate::irql::PassiveLevel::assume() };
+                crate::ddi::guest_blob::prepare(
+                    passive,
+                    adapter,
+                    destination.resource_id,
+                    destination.pitch,
+                    destination.height,
+                    destination.venus_alloc_size,
+                    present_context
+                        .as_ref()
+                        .and_then(ContextHandleRef::creator_process)
+                        .unwrap_or(0),
+                );
+            }
             // The entry decision, once, before either path below and after every precondition:
             // whether `BltAsync` / `BltNoMirror` act on this Blt, and if neither does, why
             // (`BltEntryWhy`, `BltNoEntry*`). Pure: `helios_kmd_logic::blt_async::entry`.
@@ -986,11 +1007,13 @@ unsafe fn dxgkddi_present_inner(
                         );
                     }
                 }
+                // May copy into the destination's guest buffer (`GuestBlob`): `guest_hit` says
+                // whether it did, decided under the Venus mutex with the copy.
                 let copy = adapter.with_venus_client(passive, |client| {
-                    client.submit_present_blt(adapter, source_desc, destination_desc)
+                    client.submit_present_blt_guest(adapter, source_desc, destination_desc)
                 });
-                let gpu_fence = match copy {
-                    Ok(Ok(fence)) => fence,
+                let (gpu_fence, guest_hit) = match copy {
+                    Ok(Ok(submitted)) => submitted,
                     Ok(Err(VirtioError::OutOfMemory | VirtioError::QueueFull)) => {
                         if let Some(resource_id) = destination_buffer {
                             let _ = adapter.with_virtio(|v| {
@@ -1083,13 +1106,22 @@ unsafe fn dxgkddi_present_inner(
                         );
                     }
                 }
-                let mirror_ok = if destination_buffer.is_some() && skip_mirror {
-                    // `BltNoMirror`: DWM reads the GPU copy. The system pages VidMm may hold for
-                    // the destination are now older than the blob: marked invalid, so a page-in
-                    // does not copy them back over it and a later eviction pulls from the blob.
-                    crate::ddi::blt_async::note_mirror_skipped();
-                    crate::ddi::blt_async::mark_stale(adapter, destination.resource_id);
-                    crate::diag::record_named_bytes(b"PBSyCp", 3);
+                // `GuestBlob` wins over `BltNoMirror`: a copy into the guest buffer wrote the
+                // system pages themselves, so nothing is mirrored and nothing is stale.
+                let effect = helios_kmd_logic::guest_blob::present_effect(guest_hit, skip_mirror);
+                let mirror_ok = if destination_buffer.is_some() && !effect.mirror {
+                    if effect.mark_stale {
+                        // `BltNoMirror`: DWM reads the GPU copy. The system pages VidMm may hold
+                        // for the destination are now older than the blob: marked invalid, so a
+                        // page-in does not copy them back over it and a later eviction pulls
+                        // from the blob.
+                        crate::ddi::blt_async::note_mirror_skipped();
+                        crate::ddi::blt_async::mark_stale(adapter, destination.resource_id);
+                        crate::diag::record_named_bytes(b"PBSyCp", 3);
+                    } else {
+                        // 4: the copy went into the guest buffer over the leased pages.
+                        crate::diag::record_named_bytes(b"PBSyCp", 4);
+                    }
                     true
                 } else if destination_buffer.is_some() {
                     let mirror_started = crate::ddi::blt_async::now_100ns();
@@ -1852,10 +1884,54 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 .with_virtio(|v| v.take_ready_windowed_blt())
                 .ok()
                 .flatten();
-            request.map(|request| {
+            request.map(|mut request| {
+                // `GuestBlob`: a copy prepared into a guest buffer that is no longer its
+                // destination's copy target (retired by a paging operation since the Present)
+                // is prepared again into the destination's current target, and the request's
+                // mirror flag follows the new target, so the frame still lands (in the Venus
+                // blob, mirrored into the pages unless `BltNoMirror`). `None` (one bool test)
+                // for every copy not prepared for a guest buffer.
+                let mut retarget_failed = None;
+                if let Some(again) =
+                    client.retarget_prepared_present_blt(adapter, request.source, request.prepared)
+                {
+                    crate::ddi::guest_blob::note_lost();
+                    match again {
+                        Ok(prepared) => {
+                            // Mirrored unless it went into a guest buffer or `BltNoMirror` is on.
+                            let no_mirror = !helios_kmd_logic::guest_blob::present_effect(
+                                prepared.guest_target(),
+                                crate::ddi::blt_async::no_mirror_on(),
+                            )
+                            .mirror;
+                            let updated = adapter
+                                .with_virtio(|v| {
+                                    v.retarget_windowed_blt(
+                                        request.token,
+                                        request.stream_boundary,
+                                        prepared,
+                                        no_mirror,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if updated {
+                                request.prepared = prepared;
+                                request.no_mirror = no_mirror;
+                            } else {
+                                retarget_failed = Some(VirtioError::DeviceError);
+                            }
+                        }
+                        Err(error) => retarget_failed = Some(error),
+                    }
+                }
                 // `BltNoMirror`: from this submission the system pages VidMm may hold for the
-                // destination are older than its blob and nothing will mirror them.
-                if request.async_blt && request.no_mirror {
+                // destination are older than its blob and nothing will mirror them. Not for a
+                // copy into a guest buffer (`GuestBlob`): it writes those pages themselves.
+                if retarget_failed.is_none()
+                    && request.async_blt
+                    && request.no_mirror
+                    && !request.prepared.guest_target()
+                {
                     crate::ddi::blt_async::mark_stale(adapter, request.destination_resource_id);
                     crate::ddi::blt_async::note_mirror_skipped();
                 }
@@ -1868,12 +1944,15 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                         }
                         PresentDestinationDesc::OptimalImage(_) => None,
                     },
-                    client.submit_prepared_present_blt(
-                        adapter,
-                        request.prepared,
-                        request.token,
-                        request.stream_boundary,
-                    ),
+                    match retarget_failed {
+                        Some(error) => Err(error),
+                        None => client.submit_prepared_present_blt(
+                            adapter,
+                            request.prepared,
+                            request.token,
+                            request.stream_boundary,
+                        ),
+                    },
                 )
             })
         });

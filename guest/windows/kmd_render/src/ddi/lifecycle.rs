@@ -231,6 +231,8 @@ fn start_generation_mirrors() {
     crate::ddi::onscanout::reset_for_start();
     // `BltAsync` / `BltNoMirror` (default 0): the knobs read again and mirrored, counters zeroed.
     crate::ddi::blt_async::reset_for_start();
+    // `GuestBlob` (default 0): the knob read again and mirrored (`GbKnob`), counters zeroed.
+    crate::ddi::guest_blob::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();
@@ -439,13 +441,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // reset does not make it drop them, and unlocking a pinned page the host
     // still holds is unsafe), and the old transport's user views are marked stale
     // (a stop that ran first has already done both, and this finds no transport).
-    crate::virtio::nvrm::retire_transport(
-        passive,
-        adapter,
-        &helios_kmd_logic::sweep_budget::SweepBudget::live(
-            crate::adapter::foreign_scanout::now_100ns(),
-        ),
+    let live_budget = helios_kmd_logic::sweep_budget::SweepBudget::live(
+        crate::adapter::foreign_scanout::now_100ns(),
     );
+    // `GuestBlob`: live guest blobs of the old generation are retired while it still answers,
+    // before its reset and before `reset_system_backings` below unlocks their pages (a stop
+    // that ran first has retired them already; one spinlock lookup then, and with the knob 0).
+    crate::ddi::guest_blob::retire_all_for_stop(passive, adapter, &live_budget);
+    crate::virtio::nvrm::retire_transport(passive, adapter, &live_budget);
     start_generation_mirrors();
     // Whatever the previous generation recorded against its resource ids (system
     // backing leases, "system copy invalid" marks) is meaningless now: ids restart
@@ -804,6 +807,13 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // readable and the transport is up (section 25: the host keeps it across a device reset).
         stop_unbind_scanout(passive_stop, adapter, &budget);
         adapter.reset_display_publication_state();
+
+        // `GuestBlob`: retire every live guest blob (drain its copies, release its Venus
+        // objects, UNREF it) while the Venus client and the transport still answer, under the
+        // same budget; only then may the generation reset below unlock its pages. The HPD
+        // worker is joined, so no deferred copy can be submitted into one any more. One
+        // spinlock lookup when there is none (always, with `GuestBlob` 0).
+        crate::ddi::guest_blob::retire_all_for_stop(passive_stop, adapter, &budget);
 
         // Tear down the venus client + page-table blob + context BEFORE dropping
         // the transport (the unref/detach/destroy commands need the live device).
