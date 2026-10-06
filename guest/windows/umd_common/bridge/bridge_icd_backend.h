@@ -10,6 +10,11 @@
 //
 //  1. `HELIOS_ICD` in the process environment: `venus` or `nvk` (tests, and a
 //     per-launch override; it skips the deny-list).
+//  1b. dwm.exe only: `HKLM\SOFTWARE\Helios!DwmIcd` (REG_SZ) `nvk` puts DWM on
+//     NVK past `Icd` and the deny-lists, unless the crash-loop guard says DWM
+//     already started on NVK `DwmNvkMaxStarts` (default 2) times in the last
+//     `DwmNvkGuardSeconds` (default 600); `venus` or absent changes nothing
+//     (docs/dwm-on-nvk.md).
 //  2. `HKLM\SOFTWARE\Helios!Icd` (REG_SZ): `venus` turns NVK off everywhere;
 //     `nvk` or absent selects the global mode below.
 //  3. The deny-list. `HKLM\SOFTWARE\Helios!NvkDenyList` (REG_SZ, executable
@@ -63,6 +68,9 @@ struct IcdBackendChoice {
 
 /// The process's choice. Thread-safe; computed on first call.
 const IcdBackendChoice& icd_backend_choice();
+
+/// This process is dwm.exe (the executable name the choice matched).
+bool is_dwm_process();
 
 /// The backend device creation should use now: the choice, unless NVK has
 /// failed in this process.

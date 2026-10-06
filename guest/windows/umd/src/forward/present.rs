@@ -1387,7 +1387,11 @@ unsafe fn nvk_present_frame(
     if let Some(context) = d3d11_context(h) {
         context.Flush();
     }
+    // DWM itself never takes scanout 0 through NVK's own source (a level-2
+    // user source would hide its flips from dxgkrnl's flip queue and present
+    // statistics): every DWM frame is a WDDM flip (docs/dwm-on-nvk.md).
     let scanout = match crate::knobs::nvk_present_mode() {
+        _ if crate::knobs::is_dwm_process() => false,
         1 => true,
         2 => false,
         _ => !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1),

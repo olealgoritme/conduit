@@ -393,6 +393,19 @@ pub(crate) fn nvk_scanout_compose_every() -> u32 {
 pub(crate) static NVK_PLACEHOLDER_ALLOCATIONS: BoolKnob =
     BoolKnob::new(c"NvkPlaceholderAllocations", false);
 
+/// This process is dwm.exe. DWM on NVK (`DwmIcd=nvk`, docs/dwm-on-nvk.md)
+/// presents only through the WDDM flip: its frames are the desktop, and the
+/// KMD flips its swap-chain buffers (their foreign resource ids) itself.
+pub(crate) fn is_dwm_process() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("dwm.exe")))
+            .unwrap_or(false)
+    })
+}
+
 /// `NvkPresent`, or `HELIOS_NVK_PRESENT` from the process environment (tests:
 /// one process, no registry write).
 pub(crate) fn nvk_present_mode() -> u32 {

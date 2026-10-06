@@ -1629,6 +1629,7 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint32_t foreign_offset) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
+  bool nvk_blank = false;
   if (impl->backend != helios_bridge::IcdBackend::Venus) {
     // NVK opens another NVK process's surface (a foreign resource: the KMD's
     // layout trailer) by resource id (shared-surfaces.md, NVK patch 0031,
@@ -1638,7 +1639,15 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     const bool nvk_can_open = foreign
       && (impl->icd.caps & HELIOS_ICD_CAP_SHARED_IMPORT) != 0
       && !scanout_linear && !linear_scanout_target && !source_image_create_info;
-    if (!nvk_can_open) {
+    // DWM on NVK (DwmIcd=nvk, docs/dwm-on-nvk.md): a failed open of a window's
+    // surface takes DWM down (dwmcore 0x8898008d), and every Venus app's and
+    // every KMD-made (GDI, cursor) surface is one NVK cannot import yet. DWM
+    // gets a blank texture of the same size instead: that window composes
+    // black, the desktop stays up. Any other NVK process still sees the open
+    // fail.
+    if (!nvk_can_open && helios_bridge::is_dwm_process()) {
+      nvk_blank = true;
+    } else if (!nvk_can_open) {
       static std::atomic<std::uint32_t> s_nvkOpen{0};
       const std::uint32_t n = s_nvkOpen.fetch_add(1, std::memory_order_relaxed) + 1;
       if (n <= 8 || (n % 512u) == 0) {
@@ -1673,8 +1682,8 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       // Hand back an ordinary blank texture of the same size instead: the
       // window composes black, and the NVK app shows its frames on scanout 0
       // as designed (NvkPresent auto picks scanout without ForeignImport).
-      if (foreign && impl->backend == helios_bridge::IcdBackend::Venus
-          && !dxvk::heliosForeignImport()) {
+      if (nvk_blank || (foreign && impl->backend == helios_bridge::IcdBackend::Venus
+          && !dxvk::heliosForeignImport())) {
         D3D11_TEXTURE2D_DESC td = { };
         td.Width = width;
         td.Height = height;
@@ -1696,10 +1705,12 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
         static std::atomic<std::uint32_t> s_placeholders{0};
         const std::uint32_t n = s_placeholders.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 8 || (n % 512u) == 0) {
-          char msg[200];
+          char msg[240];
           std::snprintf(msg, sizeof(msg),
-            "OpenDdiTexture2D foreign res_id=%u %ux%u with ForeignImport off: blank placeholder hr=0x%08lx (x%u)",
-            renderer_resource_id, width, height, static_cast<unsigned long>(phr), n);
+            nvk_blank
+              ? "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d) on NVK DWM, not importable: blank placeholder hr=0x%08lx (x%u)"
+              : "OpenDdiTexture2D foreign res_id=%u %ux%u (foreign=%d) with ForeignImport off: blank placeholder hr=0x%08lx (x%u)",
+            renderer_resource_id, width, height, int(foreign), static_cast<unsigned long>(phr), n);
           umd_log(msg);
         }
         return (SUCCEEDED(phr) && res) ? reinterpret_cast<std::size_t>(res) : std::size_t(0);
@@ -3013,6 +3024,58 @@ namespace {
 
 }  // namespace
 
+namespace {
+
+// NVK's device bring-up (instance, physical device, the device and its first
+// internal shaders through NAK) needs far more stack than a Venus one: frames
+// of 17 to 43 KiB in vulkan_nouveau and the UMD, more than 128 KiB in all.
+// DWM creates its device on "DWM LPC Port Thread", whose stack is 128 KiB:
+// DWM on NVK died there with STATUS_STACK_OVERFLOW (docs/dwm-on-nvk.md, T1).
+// So a creation on a thread with less than kNvkCreateStack of stack runs on a
+// helper thread with that much, and the caller waits for it.
+constexpr SIZE_T kNvkCreateStack = SIZE_T(8) << 20;
+
+template <typename F>
+struct StackJob {
+  F* fn;
+  std::unique_ptr<HeliosDxvkDevice> out;
+  static DWORD WINAPI run(LPVOID p) {
+    auto* j = static_cast<StackJob*>(p);
+    j->out = (*j->fn)();
+    return 0;
+  }
+};
+
+template <typename F>
+std::unique_ptr<HeliosDxvkDevice> run_with_stack(F&& fn) {
+  ULONG_PTR low = 0, high = 0;
+  GetCurrentThreadStackLimits(&low, &high);
+  if (high - low >= kNvkCreateStack)
+    return fn();
+  using Fn = std::remove_reference_t<F>;
+  StackJob<Fn> job{&fn, nullptr};
+  HANDLE t = CreateThread(nullptr, kNvkCreateStack, &StackJob<Fn>::run, &job,
+                          STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+  if (!t) {
+    umd_log("NVK device creation: no helper thread, creating on the caller's stack");
+    return fn();
+  }
+  static std::atomic<std::uint32_t> s_logs{0};
+  if (s_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+                  "NVK device creation on a helper thread (caller's stack %llu KiB < %llu KiB)",
+                  static_cast<unsigned long long>((high - low) >> 10),
+                  static_cast<unsigned long long>(kNvkCreateStack >> 10));
+    umd_log(msg);
+  }
+  WaitForSingleObject(t, INFINITE);
+  CloseHandle(t);
+  return std::move(job.out);
+}
+
+}  // namespace
+
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high,
@@ -3027,14 +3090,16 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
 
   if (backend == helios_bridge::IcdBackend::NvkRm) {
     configure_dxvk_env_once(backend);
-    auto nvk = bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
-        "helios_dxvk_create_device(nvk)", nullptr,
-        [&]() -> std::unique_ptr<HeliosDxvkDevice> {
-        auto out = std::make_unique<HeliosDxvkDevice>();
-        out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
-        if (!create_on_backend(*out->impl, backend, luid_low, luid_high))
-          return nullptr;
-        return out;
+    auto nvk = run_with_stack([&]() -> std::unique_ptr<HeliosDxvkDevice> {
+      return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
+          "helios_dxvk_create_device(nvk)", nullptr,
+          [&]() -> std::unique_ptr<HeliosDxvkDevice> {
+          auto out = std::make_unique<HeliosDxvkDevice>();
+          out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
+          if (!create_on_backend(*out->impl, backend, luid_low, luid_high))
+            return nullptr;
+          return out;
+      });
     });
     if (nvk)
       return nvk;
