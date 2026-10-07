@@ -81,6 +81,15 @@ const VRAM_MIB: &[(u16, u64)] = &[
     (0x2805, 16384), // RTX 4060 Ti 16 GB
     (0x2808, 8192),  // RTX 4060
     (0x2882, 8192),  // RTX 4060
+    // RTX 50 (Blackwell). Left out: 5060 Ti (8 or 16 GB), the GB203 5070 and
+    // the GB205 5060 (not sure of their size), and the 5090 D V2.
+    (0x2b85, 32768), // RTX 5090
+    (0x2b87, 32768), // RTX 5090 D
+    (0x2c02, 16384), // RTX 5080
+    (0x2c05, 16384), // RTX 5070 Ti
+    (0x2f04, 12288), // RTX 5070
+    (0x2d05, 8192),  // RTX 5060
+    (0x2d83, 8192),  // RTX 5050
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
