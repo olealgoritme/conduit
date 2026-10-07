@@ -6,6 +6,7 @@
 // driver the host is running.
 
 pub mod v535_129_03;
+pub mod v565_57_01;
 pub mod v580_178_04;
 pub mod v595_71_05;
 pub mod v610_57_04;
@@ -65,6 +66,10 @@ static PROFILES: &[Profile] = &[
         table: v535_129_03::table,
     },
     Profile {
+        version: DriverVersion::new(565, 57, 1),
+        table: v565_57_01::table,
+    },
+    Profile {
         version: DriverVersion::new(580, 178, 4),
         table: v580_178_04::table,
     },
@@ -120,15 +125,25 @@ mod tests {
 
     #[test]
     fn version_between_profiles_selects_the_lower_one() {
-        // 570.x sits between the 535 and 580 profiles.
-        let t = table_for(DriverVersion::new(570, 86, 15)).expect("falls back to 535");
-        assert!(std::ptr::eq(t, v535_129_03::table()));
+        // 570.x sits between the 565.57.01 and 580 profiles.
+        let t = table_for(DriverVersion::new(570, 86, 15)).expect("falls back to 565.57.01");
+        assert!(std::ptr::eq(t, v565_57_01::table()));
     }
 
     #[test]
     fn version_above_every_profile_selects_the_highest() {
         let t = table_for(DriverVersion::new(610, 43, 2)).expect("falls back to 595");
         assert!(std::ptr::eq(t, v595_71_05::table()));
+    }
+
+    #[test]
+    fn the_565_77_release_uses_the_565_57_01_profile() {
+        // gVisor's nvproxy has 565.57.01 and no 565.77; open-gpu-kernel-modules
+        // differs between the two in no escape struct or ioctl number, so
+        // 565.77 selects 565.57.01 by range. The 535 profile it would otherwise
+        // get has a 40-byte UNMAP_MEMORY_DMA and no WAIT_OPEN_COMPLETE.
+        let t = table_for(DriverVersion::new(565, 77, 0)).expect("565.77 has a profile");
+        assert!(std::ptr::eq(t, v565_57_01::table()));
     }
 
     #[test]

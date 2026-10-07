@@ -26,6 +26,7 @@
 //! for, and is forwarded as it always was.
 
 pub mod v535_129_03;
+pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
 pub mod v595_71_05;
@@ -138,6 +139,10 @@ static PROFILES: &[Profile] = &[
     Profile {
         version: DriverVersion::new(535, 129, 3),
         table: || v535_129_03::TABLE,
+    },
+    Profile {
+        version: DriverVersion::new(565, 77, 0),
+        table: || v565_77_00::TABLE,
     },
     Profile {
         version: DriverVersion::new(580, 178, 4),
