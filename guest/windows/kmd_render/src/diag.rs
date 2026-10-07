@@ -1367,6 +1367,24 @@ pub mod knobs {
     pub const MSI_STARTING: KnobName = KnobName::new(b"MsiStarting");
     /// `MsiBreaker` (default 0). How many times the breaker tripped (a count the driver keeps).
     pub const MSI_BREAKER: KnobName = KnobName::new(b"MsiBreaker");
+    /// `MsiStartingVer` (default 0). The build tag (`msi::build_tag`) of the image that set
+    /// `MsiStarting`; 0 = an image older than the tag. Only a marker of the running build trips
+    /// the breaker: a driver update consumes the old build's marker (`MsiMarkerOld`).
+    pub const MSI_STARTING_VER: KnobName = KnobName::new(b"MsiStartingVer");
+    /// `MsiLatchVer` (default 0). The build tag of the image that wrote `MsiLatch`; 0 = written
+    /// by hand (or by an image older than the tag), honoured. Another build's latch is stale:
+    /// cleared at `AddDevice` (`MsiLatchOld`).
+    pub const MSI_LATCH_VER: KnobName = KnobName::new(b"MsiLatchVer");
+    /// `MsiLatchWhy` (default 0). Why the KMD latched (`msi::latch_why`, 1 to 4); 0 / absent on
+    /// an operator's latch. Read at `AddDevice`: an untagged latch WITH a KMD reason was written
+    /// by an image older than the build tag and is set aside (`MsiLatchLegacy=1`).
+    pub const MSI_LATCH_WHY: KnobName = KnobName::new(b"MsiLatchWhy");
+    /// `MsiMarkerOld` (default 0). How many markers of another build `AddDevice` consumed
+    /// without tripping the breaker (a count the driver keeps).
+    pub const MSI_MARKER_OLD: KnobName = KnobName::new(b"MsiMarkerOld");
+    /// `MsiLatchOld` (default 0). How many latches of another build `AddDevice` set aside (a
+    /// count the driver keeps).
+    pub const MSI_LATCH_OLD: KnobName = KnobName::new(b"MsiLatchOld");
 
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.

@@ -216,6 +216,16 @@ fn give_up_on_vectors(passive: PassiveLevel, va: usize, why: u32, queues: &[u16]
 
 // ── Policy at AddDevice: what the device key should ask PnP for ──────────────
 
+/// This image's build tag (`msi::build_tag`: the build and revision of `HELIOS_KMD_VERSION`),
+/// written next to the breaker's marker (`MsiStartingVer`) and the latch (`MsiLatchVer`) so the
+/// next `AddDevice` can tell a fault of THIS build from one of the build a driver update
+/// replaced. Evaluated at compile time from the same file the INF `DriverVer` and the image
+/// `FILEVERSION` are rendered from; a malformed version fails the build.
+const BUILD_TAG: u32 = match msi::build_tag(include_str!("../../driver-version.env")) {
+    Some(tag) => tag,
+    None => panic!("kmd_render/driver-version.env: no usable HELIOS_KMD_VERSION"),
+};
+
 /// `Interrupt Management\MessageSignaledInterruptProperties`, relative to the device key.
 const MSI_SUBKEY: &[u8] = b"Interrupt Management\\MessageSignaledInterruptProperties";
 static MSI_SUBKEY_W: [u16; MSI_SUBKEY.len()] =
@@ -241,13 +251,54 @@ static MSI_SUPPORTED_W: [u16; MSI_SUPPORTED.len()] =
 pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
     use crate::diag::{knobs, read_config_dword, record_named_bytes as rec};
     let mode = Mode::from_knob(read_config_dword(knobs::MSI_MODE, 0));
-    let mut latched = read_config_dword(knobs::MSI_LATCH, 0) != 0;
+    // The latch belongs to the build that wrote it (`MsiLatchVer`; none = the operator's).
+    // Another build's latch is stale: this build gets one fresh attempt at MSI-X.
+    let latch = read_config_dword(knobs::MSI_LATCH, 0) != 0;
+    let latch_build = read_config_dword(knobs::MSI_LATCH_VER, 0);
+    let latch_why = read_config_dword(knobs::MSI_LATCH_WHY, 0);
+    let verdict = msi::latch_verdict(latch, latch_why, latch_build, BUILD_TAG);
+    if verdict.set_aside() {
+        // An untagged latch with a KMD reason came from an image older than the tag (Legacy);
+        // a tagged one from another build (Stale).
+        rec(
+            b"MsiLatchLegacy",
+            u32::from(verdict == msi::LatchVerdict::Legacy),
+        );
+        rec(b"MsiLatch", 0);
+        rec(b"MsiLatchWhy", 0);
+        rec(b"MsiLatchVer", 0);
+        rec(
+            b"MsiLatchOld",
+            read_config_dword(knobs::MSI_LATCH_OLD, 0).saturating_add(1),
+        );
+    } else {
+        // The latch was cleared by writing 0: drop its tag and its reason, so a later hand-set 1
+        // is the operator's.
+        if msi::latch_tag_orphaned(latch, latch_build) {
+            rec(b"MsiLatchVer", 0);
+        }
+        if msi::latch_why_orphaned(latch, latch_why) {
+            rec(b"MsiLatchWhy", 0);
+        }
+    }
+    let mut latched = verdict.latched();
     // The boot-loop breaker: a message-mode start that never became healthy left its marker.
-    // The marker is consumed here whatever the mode; `MsiMode=3` ignores it, the rest latch INTx.
+    // The marker is consumed here whatever the mode or the build that set it; only a marker of
+    // THIS build trips the breaker (`msi::marker_verdict`), `MsiMode=3` ignores it.
     let marker = read_config_dword(knobs::MSI_STARTING, 0) != 0;
-    if marker {
-        rec(b"MsiStarting", 0);
-        if msi::breaker_trips(mode, true) {
+    let marker_build = read_config_dword(knobs::MSI_STARTING_VER, 0);
+    match msi::marker_verdict(mode, marker, marker_build, BUILD_TAG) {
+        msi::MarkerVerdict::Absent => {}
+        msi::MarkerVerdict::Ignored => rec(b"MsiStarting", 0),
+        msi::MarkerVerdict::Stale => {
+            rec(b"MsiStarting", 0);
+            rec(
+                b"MsiMarkerOld",
+                read_config_dword(knobs::MSI_MARKER_OLD, 0).saturating_add(1),
+            );
+        }
+        msi::MarkerVerdict::Trip => {
+            rec(b"MsiStarting", 0);
             rec(
                 b"MsiBreaker",
                 read_config_dword(knobs::MSI_BREAKER, 0).saturating_add(1),
@@ -273,14 +324,31 @@ pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
     rec(b"MsiKeyWr", status as u32);
 }
 
-/// Ask for INTx at the next start (PASSIVE): the latch `AddDevice` reads. `why` is one of
-/// `msi::latch_why`. FLUSHED to disk: the faults it records are the ones that end in a hang or
-/// a bugcheck, and a latch the lazy writer had not written would be lost with them. Written
+/// Ask for INTx at the next start (PASSIVE): the latch `AddDevice` reads, tagged with this
+/// build (`MsiLatchVer`: another build treats it as stale, `msi::latch_verdict`). `why` is one
+/// of `msi::latch_why`. FLUSHED to disk: the faults it records are the ones that end in a hang
+/// or a bugcheck, and a latch the lazy writer had not written would be lost with them. Written
 /// without a guard against repeats: callers are once per start.
-pub(crate) fn latch_intx(passive: PassiveLevel, why: u32) {
+///
+/// Not while the device is stopping (`msi::latch_allowed`, the flag `ddi::escape_wait` raises at
+/// StopDevice / RemoveDevice entry): a run-time verdict then is ignored and counted
+/// (`MsiLatchStop`, `MsiLatchStopW`). The breaker is exempt (it runs at AddDevice, where a
+/// same-image restart still has the previous RemoveDevice's flag up). Returns whether it wrote.
+pub(crate) fn latch_intx(passive: PassiveLevel, why: u32) -> bool {
+    if !msi::latch_allowed(why, crate::ddi::escape_wait::stopping()) {
+        crate::diag::record_named_bytes(
+            b"MsiLatchStop",
+            LATCH_STOP.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+        );
+        crate::diag::record_named_bytes(b"MsiLatchStopW", why);
+        return false;
+    }
+    // The tag first: a latch is never on disk with another build's tag next to it.
+    crate::diag::record_named_bytes(b"MsiLatchVer", BUILD_TAG);
     crate::diag::record_named_bytes(b"MsiLatch", 1);
     crate::diag::record_named_bytes(b"MsiLatchWhy", why);
     crate::diag::flush_service_key(passive);
+    true
 }
 
 // ── Counting: interrupts and DPCs by vector (DIRQL / DISPATCH, atomics only) ──
@@ -376,9 +444,26 @@ static RESCUES: AtomicU32 = AtomicU32::new(0);
 /// `msi::Health::code` now / of the end-of-start verdict.
 static HEALTH: AtomicU32 = AtomicU32::new(0);
 static START_VERDICT: AtomicU32 = AtomicU32::new(0);
-/// Silent rescues in a row, and the message total at the last rescue (or when armed).
+/// The run-time judge's state (`msi::SilenceState`), written only by the holder of
+/// `JUDGE_LOCK`: the total at the last observation, when it was last seen to move, when the last
+/// piece of silence evidence was counted, and the pieces in a row (`MsiStreak`).
+static JUDGE_LOCK: AtomicU32 = AtomicU32::new(0);
+static SIL_TOTAL: AtomicU32 = AtomicU32::new(0);
+static SIL_MOVE_AT: AtomicU64 = AtomicU64::new(0);
+static SIL_EVID_AT: AtomicU64 = AtomicU64::new(0);
 static STREAK: AtomicU32 = AtomicU32::new(0);
+/// The message total when health was last judged (a rescue, or arming): `msi::reassess`
+/// withdraws a suspect or convicted state once the total moves past it.
 static INTS_PREV: AtomicU32 = AtomicU32::new(0);
+/// Counted pieces of silence evidence this start (`MsiSilent`), rescues that were not evidence
+/// because the total had moved less than `SILENCE_MIN` ago (`MsiTooRecent`) or that merged into
+/// a piece already counted (`MsiMerged`, including a rescue that found the judge busy), the
+/// quiet age at the last counted piece (`MsiQuietMs`), and withdrawn convictions (`MsiWithdraw`).
+static SILENT_N: AtomicU32 = AtomicU32::new(0);
+static TOO_RECENT_N: AtomicU32 = AtomicU32::new(0);
+static MERGED_N: AtomicU32 = AtomicU32::new(0);
+static QUIET_MS: AtomicU32 = AtomicU32::new(0);
+static WITHDRAWN_N: AtomicU32 = AtomicU32::new(0);
 /// Set when `StartDevice` has finished: rescues before that prove nothing (whether dxgkrnl
 /// delivers interrupts to a device that is still starting is not assumed).
 static ARMED: AtomicU32 = AtomicU32::new(0);
@@ -394,6 +479,8 @@ static LATCHED: AtomicU32 = AtomicU32::new(0);
 static POLL_ONLY: AtomicU32 = AtomicU32::new(0);
 /// The `MsiStarting` marker is set in the registry for this start.
 static STARTING: AtomicU32 = AtomicU32::new(0);
+/// Latches ignored because the device was stopping (`MsiLatchStop`), since the image loaded.
+static LATCH_STOP: AtomicU32 = AtomicU32::new(0);
 /// Interrupt time (100 ns) when run-time judging was armed; 0 = not armed.
 static ARMED_AT: AtomicU64 = AtomicU64::new(0);
 /// The latch was written by the run-time verdict of this start.
@@ -422,6 +509,11 @@ pub(crate) fn begin_start(passive: PassiveLevel, granted: u32) {
         &RESCUES,
         &POLL_N,
         &POLL_ONLY,
+        &SILENT_N,
+        &TOO_RECENT_N,
+        &MERGED_N,
+        &QUIET_MS,
+        &WITHDRAWN_N,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -430,6 +522,8 @@ pub(crate) fn begin_start(passive: PassiveLevel, granted: u32) {
     STARTING.store(0, Ordering::Relaxed);
     if granted != 0 {
         STARTING.store(1, Ordering::Release);
+        // The tag first: a marker is never on disk with another build's tag next to it.
+        crate::diag::record_named_bytes(b"MsiStartingVer", BUILD_TAG);
         crate::diag::record_named_bytes(b"MsiStarting", 1);
         crate::diag::flush_service_key(passive);
     }
@@ -482,12 +576,19 @@ pub(crate) fn finish_start(adapter: &AdapterContext) {
     if msi::polling_wanted(LATCHED.load(Ordering::Relaxed) != 0, verdict) {
         POLL.store(1, Ordering::Release);
     }
-    INTS_PREV.store(ints_total(), Ordering::Relaxed);
-    STREAK.store(0, Ordering::Relaxed);
-    ARMED_AT.store(
-        crate::adapter::foreign_scanout::now_100ns().max(1),
-        Ordering::Relaxed,
-    );
+    let armed_at = crate::adapter::foreign_scanout::now_100ns().max(1);
+    let total = ints_total();
+    INTS_PREV.store(total, Ordering::Relaxed);
+    // Holders keep the judge for a few loads and stores, never across a wait: spin for it.
+    while JUDGE_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    store_silence(msi::SilenceState::armed(total, armed_at));
+    JUDGE_LOCK.store(0, Ordering::Release);
+    ARMED_AT.store(armed_at, Ordering::Relaxed);
     ARMED.store(1, Ordering::Release);
     // Zeros and the verdict into the registry now, so it shows this start immediately rather
     // than the last one's numbers until the first periodic mirror.
@@ -495,13 +596,37 @@ pub(crate) fn finish_start(adapter: &AdapterContext) {
 }
 
 /// Clear the `MsiStarting` marker once the start proved healthy (`msi::marker_may_clear`:
-/// armed, not convicted, an interrupt arrived, and 3 s old, or `stopping` cleanly). PASSIVE;
-/// one load when the marker is not set. Called from the HPD worker's pass, the periodic mirror
-/// and StopDevice. The clear is not flushed: losing it costs one false trip of the breaker,
-/// which is the safe direction.
+/// armed, not convicted, an interrupt arrived, and 3 s old). PASSIVE; one load when the marker
+/// is not set. Called from the HPD worker's pass and the periodic mirror. This clear is lazy
+/// (not flushed): the image keeps running, the lazy writer catches up, and losing it to a crash
+/// costs one false trip of this build's breaker, which is the safe direction. StopDevice uses
+/// [`service_stop`], which flushes.
 pub(crate) fn service(stopping: bool) {
+    let _ = clear_marker(stopping);
+}
+
+/// StopDevice's clear of the marker (PASSIVE): UNCONDITIONAL whenever this start set one
+/// (`msi::marker_may_clear` with `stopping`: a clean stop proves the start did not hang or die,
+/// whether or not judging was armed, interrupts arrived, 3 s passed or delivery was convicted;
+/// a conviction is the run-time latch's business). The service key is then FLUSHED, so the
+/// clear is on disk before the image can be
+/// unloaded (a driver update), the machine rebooted or powered off. The clear of a clean stop
+/// must not depend on the lazy writer, nor on `StopFlush` and the later stop stages (the stage-5
+/// flush that would also cover it is skipped with `StopFlush=0`, and a stop that dies before it
+/// would lose the clear). One load and no flush when there was no marker to clear (every INTx
+/// start). Returns whether it flushed, so StopDevice can credit the time to its budget.
+pub(crate) fn service_stop(passive: PassiveLevel) -> bool {
+    if clear_marker(true) {
+        crate::diag::flush_service_key(passive);
+        return true;
+    }
+    false
+}
+
+/// Clear the marker if `msi::marker_may_clear` allows it; true when this call cleared it.
+fn clear_marker(stopping: bool) -> bool {
     if STARTING.load(Ordering::Relaxed) == 0 {
-        return;
+        return false;
     }
     let convicted = HEALTH.load(Ordering::Relaxed) == Health::Broken.code();
     if msi::marker_may_clear(
@@ -513,52 +638,146 @@ pub(crate) fn service(stopping: bool) {
     ) && STARTING.swap(0, Ordering::AcqRel) != 0
     {
         crate::diag::record_named_bytes(b"MsiStarting", 0);
+        return true;
     }
+    false
 }
 
 /// A waiter's polling drain found a completion after its wait slice timed out (PASSIVE).
 ///
-/// In message mode, after `StartDevice`: judge it (`msi::rescue_step`: enough silent ones in a
-/// row convict delivery), turn the polling safety net on at the first doubt, and queue the DPC
-/// so the event queue and the fences are drained too (the rescuer drained the control ring
-/// only). A conviction latches INTx for the next start. The device keeps working meanwhile.
+/// In message mode, after `StartDevice`, not stopping: judge it (`msi::judge_rescue`: evidence of
+/// silence only when the interrupt total of every vector has stood still for
+/// `msi::SILENCE_MIN_100NS`, rescues closer than `msi::RESCUE_SPACING_100NS` are one piece, and
+/// `msi::SILENT_RESCUES_BROKEN` pieces in a row convict), turn the polling safety net on at the
+/// first counted piece, and queue the DPC so the event queue and the fences are drained too (the
+/// rescuer drained the control ring only). A conviction latches INTx for the next start; the
+/// device keeps working meanwhile, and `reassess_health` withdraws both if interrupts flow again.
+///
+/// The judge was `rescue_step` on the totals of two consecutive rescues, with no notion of time:
+/// several waiters whose slices ran out together (a host stall under load, NVK torn down by a
+/// DWM kill) each drained, each found something, and each counted a "silent" rescue
+/// microseconds after the last, so three of them convicted a device taking thousands of
+/// interrupts a second (2026-10-07: `MsiHealth=3`, `MsiLatchWhy=1` next to 240 k interrupts).
 #[inline(never)]
 pub(crate) fn note_rescue(passive: PassiveLevel, adapter: &AdapterContext) {
     RESCUES.fetch_add(1, Ordering::Relaxed);
-    if adapter.msi_state.load(Ordering::Acquire) == 0 || ARMED.load(Ordering::Acquire) == 0 {
+    let message_mode = adapter.msi_state.load(Ordering::Acquire) != 0;
+    let armed = ARMED.load(Ordering::Acquire) != 0;
+    if !msi::rescue_judged(message_mode, armed, crate::ddi::escape_wait::stopping()) {
+        // A stopping device's waits time out by design: not judged (no streak, no health, no
+        // latch). An armed message-mode rescue still queues the DPC, as before, so the event
+        // queue and the fences drain.
+        if message_mode && armed {
+            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        }
         return;
     }
-    let now = ints_total();
-    let prev = INTS_PREV.swap(now, Ordering::Relaxed);
-    let step = msi::rescue_step(STREAK.load(Ordering::Relaxed), prev, now);
-    STREAK.store(step.streak, Ordering::Relaxed);
-    // A conviction is not undone by a later interrupt: `Broken` is sticky until the next start.
-    if HEALTH.load(Ordering::Relaxed) != Health::Broken.code() {
-        HEALTH.store(step.health.code(), Ordering::Relaxed);
+    // One judge at a time. A rescue that finds it busy is simultaneous with the one being
+    // judged: the same piece of evidence (rule of `RESCUE_SPACING`).
+    if JUDGE_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        MERGED_N.fetch_add(1, Ordering::Relaxed);
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        return;
     }
-    if msi::polling_wanted(false, step.health) {
-        POLL.store(1, Ordering::Release);
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let total = ints_total();
+    let judged = msi::judge_rescue(load_silence(), total, now);
+    store_silence(judged.state);
+    JUDGE_LOCK.store(0, Ordering::Release);
+    match judged.evidence {
+        msi::Evidence::Moved => {
+            INTS_PREV.store(total, Ordering::Relaxed);
+        }
+        msi::Evidence::TooRecent => {
+            TOO_RECENT_N.fetch_add(1, Ordering::Relaxed);
+        }
+        msi::Evidence::Merged => {
+            MERGED_N.fetch_add(1, Ordering::Relaxed);
+        }
+        msi::Evidence::Counted => {
+            INTS_PREV.store(total, Ordering::Relaxed);
+            SILENT_N.fetch_add(1, Ordering::Relaxed);
+            let ms = judged.state.quiet_for(now) / 10_000;
+            QUIET_MS.store(ms.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        }
     }
-    if msi::should_latch(step.health) && RUNTIME_LATCHED.swap(1, Ordering::Relaxed) == 0 {
-        latch_intx(passive, msi::latch_why::SILENT);
+    if let Some(health) = judged.health {
+        // `Broken` stays until `reassess_health` sees interrupts flow again.
+        if HEALTH.load(Ordering::Relaxed) != Health::Broken.code() {
+            HEALTH.store(health.code(), Ordering::Relaxed);
+        }
+        if msi::polling_wanted(false, health) {
+            POLL.store(1, Ordering::Release);
+        }
+        if msi::should_latch(health)
+            && RUNTIME_LATCHED.load(Ordering::Relaxed) == 0
+            && latch_intx(passive, msi::latch_why::SILENT)
+        {
+            RUNTIME_LATCHED.store(1, Ordering::Relaxed);
+        }
     }
     crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
 }
 
-/// Clear a suspect state once interrupts have flowed since it was raised (`msi::reassess`), and
-/// with it the polling safety net unless the latch holds it on. PASSIVE: from the periodic
-/// mirror, so an end-of-start "no interrupts yet" does not leave the net on for the whole run.
+/// The judge's state (`JUDGE_LOCK` held).
+fn load_silence() -> msi::SilenceState {
+    msi::SilenceState {
+        last_total: SIL_TOTAL.load(Ordering::Relaxed),
+        last_move_at: SIL_MOVE_AT.load(Ordering::Relaxed),
+        last_evidence_at: SIL_EVID_AT.load(Ordering::Relaxed),
+        streak: STREAK.load(Ordering::Relaxed),
+    }
+}
+
+fn store_silence(s: msi::SilenceState) {
+    SIL_TOTAL.store(s.last_total, Ordering::Relaxed);
+    SIL_MOVE_AT.store(s.last_move_at, Ordering::Relaxed);
+    SIL_EVID_AT.store(s.last_evidence_at, Ordering::Relaxed);
+    STREAK.store(s.streak, Ordering::Relaxed);
+}
+
+/// PASSIVE, from the periodic mirror (and through it StopDevice's final publish): feed the
+/// judge's movement tracker (`SilenceState::observe`, so a rescue after a quiet mirror pass sees
+/// the right silence age), then withdraw a suspect state OR a conviction once interrupts have
+/// flowed since it was raised (`msi::reassess`), with the polling safety net (unless a start
+/// latch holds it on) and the `SILENT` latch this start wrote (`msi::withdraw_silent_latch`;
+/// lazily written: losing the withdrawal costs one INTx start, the safe direction). The marker
+/// can then be cleared by the running path again.
 fn reassess_health() {
     if ARMED.load(Ordering::Acquire) == 0 {
         return;
     }
+    let total = ints_total();
+    if JUDGE_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        let now = crate::adapter::foreign_scanout::now_100ns();
+        store_silence(load_silence().observe(total, now));
+        JUDGE_LOCK.store(0, Ordering::Release);
+    }
     let health = Health::from_code(HEALTH.load(Ordering::Relaxed));
-    let next = msi::reassess(health, INTS_PREV.load(Ordering::Relaxed), ints_total());
+    let next = msi::reassess(health, INTS_PREV.load(Ordering::Relaxed), total);
     if next != health {
         HEALTH.store(next.code(), Ordering::Relaxed);
-        STREAK.store(0, Ordering::Relaxed);
-        if LATCHED.load(Ordering::Relaxed) == 0 {
+        INTS_PREV.store(total, Ordering::Relaxed);
+        if LATCHED.load(Ordering::Relaxed) == 0 && POLL_ONLY.load(Ordering::Relaxed) == 0 {
             POLL.store(0, Ordering::Release);
+        }
+        if msi::withdraw_silent_latch(
+            RUNTIME_LATCHED.load(Ordering::Relaxed) != 0,
+            LATCHED.load(Ordering::Relaxed) != 0,
+            health,
+            next,
+        ) && RUNTIME_LATCHED.swap(0, Ordering::Relaxed) != 0
+        {
+            crate::diag::record_named_bytes(b"MsiLatch", 0);
+            crate::diag::record_named_bytes(b"MsiLatchWhy", 0);
+            crate::diag::record_named_bytes(b"MsiLatchVer", 0);
+            WITHDRAWN_N.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -601,7 +820,12 @@ pub(crate) fn publish_counters() {
     rec(b"IntxMiss", INTX_MISS.load(Ordering::Relaxed));
     rec(b"MsiIdle", MSI_IDLE.load(Ordering::Relaxed));
     rec(b"IrqRescue", RESCUES.load(Ordering::Relaxed));
-    rec(b"MsiSilent", STREAK.load(Ordering::Relaxed));
+    rec(b"MsiSilent", SILENT_N.load(Ordering::Relaxed));
+    rec(b"MsiStreak", STREAK.load(Ordering::Relaxed));
+    rec(b"MsiTooRecent", TOO_RECENT_N.load(Ordering::Relaxed));
+    rec(b"MsiMerged", MERGED_N.load(Ordering::Relaxed));
+    rec(b"MsiQuietMs", QUIET_MS.load(Ordering::Relaxed));
+    rec(b"MsiWithdraw", WITHDRAWN_N.load(Ordering::Relaxed));
     rec(b"MsiHealth", HEALTH.load(Ordering::Relaxed));
     rec(b"MsiStart", START_VERDICT.load(Ordering::Relaxed));
     rec(b"MsiPoll", POLL.load(Ordering::Relaxed));
