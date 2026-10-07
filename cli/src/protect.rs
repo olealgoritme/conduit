@@ -23,17 +23,64 @@ const HOST_RESERVE_MIB: u64 = 3072;
 /// Ambiguous ids (RTX 4060 Ti 8/16 GiB, laptop parts) are left out on purpose:
 /// a wrong size would set a cap that protects nothing.
 const VRAM_MIB: &[(u16, u64)] = &[
+    // RTX 20 (Turing)
+    (0x1e03, 12288), // RTX 2080 Ti 12 GB
+    (0x1e04, 11264), // RTX 2080 Ti
+    (0x1e07, 11264), // RTX 2080 Ti Rev. A
+    (0x1e81, 8192),  // RTX 2080 SUPER
+    (0x1e82, 8192),  // RTX 2080
+    (0x1e87, 8192),  // RTX 2080 Rev. A
+    (0x1e84, 8192),  // RTX 2070 SUPER
+    (0x1ec2, 8192),  // RTX 2070 SUPER
+    (0x1ec7, 8192),  // RTX 2070 SUPER
+    (0x1f02, 8192),  // RTX 2070
+    (0x1f07, 8192),  // RTX 2070 Rev. A
+    (0x1f06, 8192),  // RTX 2060 SUPER
+    (0x1f42, 8192),  // RTX 2060 SUPER
+    (0x1f47, 8192),  // RTX 2060 SUPER
+    (0x1f03, 12288), // RTX 2060 12 GB
+    (0x1e89, 6144),  // RTX 2060
+    (0x1f08, 6144),  // RTX 2060 Rev. A
+    // RTX 30 (Ampere)
+    (0x2203, 24576), // RTX 3090 Ti
     (0x2204, 24576), // RTX 3090
+    (0x2205, 20480), // RTX 3080 Ti 20 GB
     (0x2206, 10240), // RTX 3080 10 GB
     (0x2208, 12288), // RTX 3080 Ti
+    (0x220a, 12288), // RTX 3080 12 GB
+    (0x2207, 8192),  // RTX 3070 Ti
+    (0x2482, 8192),  // RTX 3070 Ti
+    (0x248c, 8192),  // RTX 3070 Ti
     (0x2484, 8192),  // RTX 3070
+    (0x248d, 8192),  // RTX 3070
+    (0x2488, 8192),  // RTX 3070 Lite Hash Rate
+    (0x24c8, 8192),  // RTX 3070 GDDR6X
+    (0x2414, 8192),  // RTX 3060 Ti
+    (0x2486, 8192),  // RTX 3060 Ti
+    (0x248e, 8192),  // RTX 3060 Ti
+    (0x2489, 8192),  // RTX 3060 Ti Lite Hash Rate
+    (0x24c9, 8192),  // RTX 3060 Ti GDDR6X
+    (0x24c7, 8192),  // RTX 3060 8 GB
+    (0x2503, 12288), // RTX 3060
+    (0x2504, 12288), // RTX 3060 Lite Hash Rate
+    (0x2509, 12288), // RTX 3060 12 GB Rev. 2
+    (0x2582, 8192),  // RTX 3050 8 GB
+    (0x2583, 4096),  // RTX 3050 4 GB
+    (0x2584, 6144),  // RTX 3050 6 GB
+    // RTX 40 (Ada)
     (0x2684, 24576), // RTX 4090
+    (0x2685, 24576), // RTX 4090 D
     (0x2704, 16384), // RTX 4080
+    (0x2702, 16384), // RTX 4080 SUPER
+    (0x2703, 16384), // RTX 4080 SUPER
     (0x2705, 16384), // RTX 4070 Ti SUPER
     (0x2782, 12288), // RTX 4070 Ti
     (0x2783, 12288), // RTX 4070 SUPER
     (0x2786, 12288), // RTX 4070
-    (0x2702, 16384), // RTX 4080 SUPER
+    (0x2709, 12288), // RTX 4070 (AD103)
+    (0x2805, 16384), // RTX 4060 Ti 16 GB
+    (0x2808, 8192),  // RTX 4060
+    (0x2882, 8192),  // RTX 4060
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +282,15 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    #[test]
+    fn every_device_id_is_listed_once() {
+        let mut ids: Vec<u16> = VRAM_MIB.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        let n = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "a device id is in VRAM_MIB twice");
     }
 
     #[test]
