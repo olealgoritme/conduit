@@ -1793,7 +1793,11 @@ const NVRM_OPS_IMPLEMENTED: u64 = (1 << HELIOS_NVRM_OP_QUERY_CAPS)
     // Op 13 and its capability bit 36: the RM window report (always answerable: with the
     // transport down it reports a window of 0 bytes).
     | (1 << helios_protocol::HELIOS_NVRM_OP_WINDOW_INFO)
-    | helios_protocol::HELIOS_NVRM_CAP_WINDOW_INFO;
+    | helios_protocol::HELIOS_NVRM_CAP_WINDOW_INFO
+    // Capability bit 37: the KMD parses the copy-engine Present record ('HEF3') behind a
+    // marker's RM fence tail (`ddi/ce_record.rs`). Always set: the record is only an input, and
+    // whether a Present takes the copy-engine route is decided per frame, not by this bit.
+    | helios_protocol::HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3;
 /// The event ops, reported (`QUERY_CAPS.supported_ops`) only while events are
 /// usable on this device; see `virtio::gpu::nvrm_events`.
 const NVRM_EVENT_OPS: u64 =

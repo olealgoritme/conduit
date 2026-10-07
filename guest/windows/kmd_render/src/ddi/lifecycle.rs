@@ -235,6 +235,8 @@ fn start_generation_mirrors() {
     crate::ddi::guest_blob::reset_for_start();
     // `RmCopyEngine` (default 0): the knob read again and mirrored (`CeKnob`), counters zeroed.
     crate::virtio::rm_client::ce_channel::reset_for_start();
+    // The copy-engine Present record (M3c-0): `CeRec*` zeroed.
+    crate::ddi::ce_record::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();

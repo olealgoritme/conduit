@@ -1888,8 +1888,16 @@ mod tests {
                     }
                     checked += 1;
                     let text = std::fs::read_to_string(&p).unwrap();
-                    assert!(!text.contains("b\"Ce"), "{s} spells a Ce counter name");
                     assert!(!text.contains("b\"RmCopyEngine\""), "{s} spells the knob name");
+                    // The record's writer (M3c-0) spells only its own list, which
+                    // `ce_record`'s exact-list test checks; none of these names.
+                    if crate::ce_record::WRITERS.iter().any(|w| s.ends_with(w)) {
+                        for n in COUNTERS {
+                            assert!(!text.contains(&std::format!("b\"{n}\"")), "{s} spells {n}");
+                        }
+                        continue;
+                    }
+                    assert!(!text.contains("b\"Ce"), "{s} spells a Ce counter name");
                 }
             }
         }

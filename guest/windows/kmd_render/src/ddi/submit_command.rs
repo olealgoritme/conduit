@@ -318,6 +318,9 @@ pub(crate) fn publish_nvrm_counters() {
     crate::ddi::blt_async::publish_counters();
     // The guest-memory blob Blt destination (`GuestBlob`): `Gb*`, written once an event happened.
     crate::ddi::guest_blob::publish_counters();
+    // The copy-engine Present record behind a fenced marker (M3c-0): `CeRec*`, written once a
+    // fenced marker was seen.
+    crate::ddi::ce_record::publish_counters();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();
@@ -2312,8 +2315,24 @@ pub unsafe extern "C" fn dxgkddi_render(
                     })
                 } else if let Some(tail) = fence_tail {
                     if stream_tail_zero {
-                        creator
-                            .and_then(|process| attach_or_take_fence_tail(adapter, process, &tail))
+                        let marker = creator
+                            .and_then(|process| attach_or_take_fence_tail(adapter, process, &tail));
+                        if let Some(context) = context.as_ref() {
+                            // The copy-engine record behind the tail (168-byte form, M3c-0):
+                            // parsed, counted, stashed beside the fence; it changes nothing above.
+                            // SAFETY: `cmd_len` bytes are readable at `pCommand`.
+                            unsafe {
+                                crate::ddi::ce_record::note_render(
+                                    context,
+                                    args.pCommand as *const u8,
+                                    cmd_len,
+                                    helios_protocol::HELIOS_RM_FENCE_TAIL_V3_HERF_OFFSET,
+                                    &tail,
+                                    marker.as_ref().map(|m| m.rm_boundary),
+                                )
+                            };
+                        }
+                        marker
                     } else {
                         // A partial stream tail beside a fence: not a marker, but
                         // the handle is still the KMD's.
@@ -2504,9 +2523,25 @@ pub unsafe extern "C" fn dxgkddi_render(
                                 && private.present_value == 0
                                 && private.present_cookie == 0;
                             if stream_tail_zero {
-                                creator.and_then(|process| {
+                                let marker = creator.and_then(|process| {
                                     attach_or_take_fence_tail(adapter, process, &tail)
-                                })
+                                });
+                                if let Some(context) = context.as_ref() {
+                                    // The copy-engine record behind the tail (192-byte form,
+                                    // M3c-0): parsed, counted, stashed beside the fence.
+                                    // SAFETY: `cmd_len` bytes are readable at `pCommand`.
+                                    unsafe {
+                                        crate::ddi::ce_record::note_render(
+                                            context,
+                                            args.pCommand as *const u8,
+                                            cmd_len,
+                                            helios_protocol::HELIOS_RM_FENCE_TAIL_V3_HEPR_OFFSET,
+                                            &tail,
+                                            marker.as_ref().map(|m| m.rm_boundary),
+                                        )
+                                    };
+                                }
+                                marker
                             } else {
                                 crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
                                 take_fence_tail(adapter, creator, &tail);
