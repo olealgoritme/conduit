@@ -203,6 +203,7 @@ backend.cpus 0-7,16-23`. Both apply when the VM's backend next starts.
 | `fused-submit` | backend, conduit-venus (`FEATURE_SUBMIT_FENCED` bit 3, IPC op 15) | a fenced `SUBMIT_3D` is one renderer call, `submit_fenced`, instead of `submit` and `create_fence`: one round trip less while the queue thread waits (about 33 µs) |
 | `direct-fences` | conduit-venus `--direct-fences`, backend | conduit-venus sends each fence from the virglrenderer thread that retires it, under one send lock with the serve loop, instead of through the serve loop. The backend's renderer reader returns the chains itself, through `Renderer::set_fence_hook`, when the backend lock is free, and otherwise leaves them to the fence pump as before. Two hops fewer on the way back |
 | `event-batch` | backend | the event thread signals once per pass and sweeps with one `poll` over all descriptors |
+| `fence-spin` (named only, not in `all`) | conduit-venus `--fence-spin-us 150`, virglrenderer patch 0004 | vkr's fence threads poll around a fence's expected completion (phase 3) |
 | `backend.cpus` | backend and conduit-venus `--cpus` | every thread of both stays on the given CPUs (the host's CCD, away from the vCPUs) |
 
 `direct-fences` without the backend lock: the queue thread holds the lock
@@ -284,6 +285,74 @@ Reading:
 - Recommendation: make `quiet-held`, `fused-submit` and `direct-fences` the
   default once a soak is clean. Re-measure `backend.cpus` with MSI-X before
   recommending it. `event-batch` matters for the NVK event path, not this one.
+
+## Phase 3: observing the fence sooner
+
+The frame stage tracer (driver 346.1, windowed Heaven) puts 119 µs p50
+(488 p99) between "vkr's submit done" and "fence signalled" once the GPU copy
+time (timestamps, 234 µs) is subtracted. The question was whether
+conduit-venus or virglrenderer could learn of the fence sooner than NVIDIA's
+`vkWaitForFences` tells it.
+
+`host/latency/fencewake.c` measures it without a guest. The GPU writes a
+marker into host memory right after the copy, a thread spinning on that
+memory notes when it lands, and the waiter's return time minus the marker's
+is the wake latency. Same 5.76 MB copy into host memory, 300-400 copies per
+row. The VM's desktop was running on the same GPU.
+
+| wait method | queue family | submit → GPU done, p50 / p90 µs | GPU done → waiter returns, p50 / p90 / p99 µs |
+|---|---|---|---|
+| `vkWaitForFences` (what vkr does) | 0 | 316 / 408 | 14.7 / 20.2 / 55.8 |
+| `vkGetFenceStatus` loop | 0 | 316 / 357 | 1.6 / 2.7 / 12.0 |
+| sync file (exported fence), `poll` | 0 | 316 / 335 | 18.2 / 27.8 / 514 |
+| timeline semaphore, `vkWaitSemaphores` | 0 | 314 / 371 | 14.5 / 20.8 / 46.6 |
+| sleep to the expected end, then poll (`hybrid`) | 0 | 312 / 323 | 1.8 / 12.0 / 15.8 |
+| `vkWaitForFences` | 1 (copy engine) | 221 / 230 | 13.2 / 18.8 / 548 |
+| `vkWaitForFences` | 2 (compute) | 305 / 398 | 15.8 / 20.7 / 644 |
+| sleep to the expected end, then poll (`hybrid`) | 1 | 221 / 223 | 1.0 / 1.2 / 5.1 |
+
+The GPU copy itself took 221-224 µs on families 0 and 2 and 205 µs on
+family 1.
+
+- **The wake is about 13-15 µs, not 119.** NVIDIA's wait blocks in `poll` on
+  its device file and is woken from its interrupt handler on CPU 0. In the
+  live trace, the NVIDIA interrupt to the vkr-queue thread running was
+  16-23 µs p50. A sync file (worse tails) or a timeline semaphore (the same)
+  does not beat it. Only polling does: 1-2 µs.
+- **The rest of the 119 µs is the copy waiting to start.** On the graphics
+  engine (families 0 and 2), submit → GPU done exceeds the copy by about
+  90 µs even with the host otherwise idle. On the copy engine (family 1) it
+  exceeds it by 16 µs. Under Heaven the wait for a graphics-engine timeslice
+  grows (the 2.3 ms against 0.3 ms microbenchmark above). The fix for that
+  part is the KMD's copy on a transfer-only queue, not a faster fence wait.
+- C-states play no part: holding `/dev/cpu_dma_latency` at 0 moved the
+  `vkWaitForFences` wake from 13.2 to 11.4 µs p50 and did not change the
+  tails.
+
+**Fence spin** (`patches/0004-vkr-queue-fence-spin.patch`, off by default):
+vkr's sync thread sleeps until 30 µs before the fence's expected completion
+(the second shortest of its queue's last 16 queued-to-signalled times), then
+polls `vkGetFenceStatus` for at most `CONDUIT_VKR_FENCE_SPIN_US`
+microseconds, then waits in the driver as before. It is set by
+`conduit-venus --fence-spin-us N` and by `conduit config set backend.latency
+<list>,fence-spin` (150 µs; not part of `all`). The patch applies after
+0001-0002 and after 0003.
+
+Measured through a private conduit-venus with the guest-blob example
+(family 1, 300 copies, two alternations each):
+
+| | wall p50 µs | wall p90 µs | `poll` calls by the sync thread |
+|---|---|---|---|
+| off | 298.8, 297.9 | 398.8, 400.1 | 470, 458 |
+| fence spin 150 µs | 294.4, 297.2 | 389.0, 376.6 | 27, 30 |
+
+The spin engages (the sync thread's blocking `poll` calls drop by 94%), yet
+the end-to-end gain is small: 1-4 µs p50 and
+10-24 µs p90. The other hops after the sync thread dominate (the proxy
+thread, conduit-venus, the backend: 25-41 µs with the options above). It
+costs 30-90 µs of CPU time per fence, about 1-2% of a core at 250 fences a
+second. Verdict: worth a row in the next guest A/B, but not a default. The
+copy-engine queue is the lever for this stage.
 
 ## Reproducing
 
