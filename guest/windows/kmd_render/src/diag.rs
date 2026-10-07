@@ -1107,6 +1107,13 @@ pub mod knobs {
     /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
     /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
+    /// `IndepFlip` (default 0): independent flip, stage S-1 (`docs/independent-flip.md` section
+    /// 11, `helios_kmd_logic::independent_flip::Mode`). 0 off; 1 advertise `SupportDirectFlip`,
+    /// the aperture `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip` (OR'd into what
+    /// `DirectFlipCaps` / `FlipCapsX` ask for) and count every flip's verdict (`Idf*`); 2 as 1,
+    /// and a DMA-buffer flip of an unregistered Venus allocation completes as a kept picture
+    /// instead of failing (`PBFlip` 0xE6). Read with the other adapter knobs; mirrored as `IdfKnob`.
+    pub const INDEP_FLIP: KnobName = KnobName::new(b"IndepFlip");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,
