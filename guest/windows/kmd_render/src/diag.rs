@@ -678,7 +678,7 @@ impl CounterBlock {
 const SERVICE_KEY_PATH: &[u8] =
     b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\helios_kmd_render";
 
-const fn widen<const N: usize>(ascii: &[u8]) -> [u16; N] {
+pub(crate) const fn widen<const N: usize>(ascii: &[u8]) -> [u16; N] {
     let mut out = [0u16; N];
     let mut i = 0;
     while i < N {
@@ -722,12 +722,107 @@ extern "system" {
         object_attributes: *mut NtObjectAttributes,
     ) -> i32;
     fn ZwFlushKey(key_handle: *mut core::ffi::c_void) -> i32;
+    fn ZwSetValueKey(
+        key_handle: *mut core::ffi::c_void,
+        value_name: *mut NtUnicodeString,
+        title_index: u32,
+        value_type: u32,
+        data: *mut core::ffi::c_void,
+        data_size: u32,
+    ) -> i32;
+    fn IoOpenDeviceRegistryKey(
+        physical_device_object: *mut core::ffi::c_void,
+        device_registry_key_type: u32,
+        desired_access: u32,
+        device_registry_key: *mut *mut core::ffi::c_void,
+    ) -> i32;
 }
 
 /// `OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE`.
 const OBJ_KEY_ATTRIBUTES: u32 = 0x40 | 0x200;
 /// `KEY_QUERY_VALUE`. `ZwFlushKey` needs no particular access to the handle.
 const KEY_QUERY_VALUE: u32 = 0x1;
+
+/// `PLUGPLAY_REGKEY_DEVICE`: the device's hardware key (`Enum\...\Device Parameters`),
+/// the key `HKR` of an INF `.HW` section writes to and PnP reads `MSISupported` from.
+/// (`PLUGPLAY_REGKEY_DRIVER` is 2: the software key under the class.)
+const PLUGPLAY_REGKEY_DEVICE: u32 = 1;
+/// `KEY_ALL_ACCESS`.
+const KEY_ALL_ACCESS: u32 = 0x000F_003F;
+/// `KEY_SET_VALUE`.
+const KEY_SET_VALUE: u32 = 0x2;
+
+/// Write one `REG_DWORD` under a subkey of a device's hardware key. Returns the NTSTATUS of
+/// the step that failed, or 0. `subkey` and `value_name` are UTF-16 WITHOUT a terminator; the
+/// subkey must already exist (the INF creates the ones the driver uses).
+///
+/// For PnP policy values that are read when the device is next started (`Interrupt
+/// Management\MessageSignaledInterruptProperties\MSISupported`): writing one here changes
+/// the NEXT start, and the current one only if PnP has not read it yet. PASSIVE_LEVEL, from a
+/// DDI that is handed the PDO (`DxgkDdiAddDevice`).
+pub(crate) fn write_device_key_dword(
+    _passive: crate::irql::PassiveLevel,
+    pdo: *mut core::ffi::c_void,
+    subkey: &[u16],
+    value_name: &[u16],
+    value: u32,
+) -> i32 {
+    let mut device_key: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: PASSIVE_LEVEL (the token); `pdo` is the physical device object dxgkrnl handed
+    // to AddDevice; the out-handle is a live local. The handle, if returned, is closed below.
+    let opened = unsafe {
+        IoOpenDeviceRegistryKey(pdo, PLUGPLAY_REGKEY_DEVICE, KEY_ALL_ACCESS, &mut device_key)
+    };
+    if opened < 0 || device_key.is_null() {
+        return if opened < 0 { opened } else { -1 };
+    }
+    let sub_bytes = (subkey.len() * 2) as u16;
+    let mut sub_name = NtUnicodeString {
+        length: sub_bytes,
+        maximum_length: sub_bytes,
+        buffer: subkey.as_ptr() as *mut u16,
+    };
+    let mut attributes = NtObjectAttributes {
+        length: core::mem::size_of::<NtObjectAttributes>() as u32,
+        root_directory: device_key,
+        object_name: &mut sub_name,
+        attributes: OBJ_KEY_ATTRIBUTES,
+        security_descriptor: core::ptr::null_mut(),
+        security_quality_of_service: core::ptr::null_mut(),
+    };
+    let mut sub: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: as above; `attributes` and the name it points to outlive the call, and
+    // `subkey` is the caller's slice.
+    let mut status = unsafe { ZwOpenKey(&mut sub, KEY_SET_VALUE, &mut attributes) };
+    if status >= 0 && !sub.is_null() {
+        let value_bytes = (value_name.len() * 2) as u16;
+        let mut name = NtUnicodeString {
+            length: value_bytes,
+            maximum_length: value_bytes,
+            buffer: value_name.as_ptr() as *mut u16,
+        };
+        let mut data = value;
+        // SAFETY: `sub` is the subkey just opened with KEY_SET_VALUE; `name` and `data`
+        // are live locals the call copies before returning.
+        status = unsafe {
+            ZwSetValueKey(
+                sub,
+                &mut name,
+                0,
+                REG_DWORD,
+                (&mut data as *mut u32).cast(),
+                4,
+            )
+        };
+        // SAFETY: closes the handle opened above.
+        let _ = unsafe { wdk_sys::ntddk::ZwClose(sub as wdk_sys::HANDLE) };
+    } else if status >= 0 {
+        status = -1;
+    }
+    // SAFETY: closes the handle IoOpenDeviceRegistryKey returned.
+    let _ = unsafe { wdk_sys::ntddk::ZwClose(device_key as wdk_sys::HANDLE) };
+    status
+}
 
 /// Force the service key (and so every breadcrumb written to it) to disk.
 ///
@@ -1245,12 +1340,33 @@ pub mod knobs {
     /// messages). 1 forces ONE shared message 0 for every queue even when more
     /// were granted: the same-boot A/B between per-queue and shared vectors.
     ///
-    /// This is NOT a switch back to INTx. Whether the OS hands the driver
-    /// messages or the INTx line is decided by PnP before `StartDevice` from the
-    /// device key's `MSISupported`; see `docs/msi-interrupts.md` for the one
-    /// `reg add` that forces INTx. Snapshotted at transport init, so
+    /// This is NOT a switch back to INTx (its default 0 keeps meaning per-source
+    /// vectors, as it always did). Whether the OS hands the driver messages or the
+    /// INTx line is decided by PnP before `StartDevice` from the device key's
+    /// `MSISupported`; the switch for that is `MsiMode` below (see
+    /// `docs/msi-interrupts.md`). Snapshotted at transport init, so
     /// `pnputil /restart-device` applies it without a reboot.
     pub const MSI_VECTORS: KnobName = KnobName::new(b"MsiVectors");
+
+    /// `MsiMode` (default 0 = auto). Which interrupt mode the driver asks PnP for
+    /// (`docs/msi-interrupts.md`): 0 = follow the INF / the device key as it stands (INTx in
+    /// this package; a latch lowers it); 1 = INTx always; 2 = MSI-X (raises the key to 1), but
+    /// the boot-loop breaker and the latch still win; 3 = MSI-X with no breaker and no latch
+    /// (debugging). Realised by `AddDevice` writing the device key's `MSISupported`, so the
+    /// FIRST restart after a change writes the key and a SECOND restart (or a reboot) applies
+    /// it; the driver follows whatever PnP actually granted either way. Mirrored as
+    /// `MsiModeEff`. Never written by the driver.
+    pub const MSI_MODE: KnobName = KnobName::new(b"MsiMode");
+    /// `MsiLatch` (default 0). Set to 1 by the driver when message delivery was convicted,
+    /// vector set-up failed, or the breaker tripped: the next `AddDevice` then asks PnP for
+    /// INTx. An operator clears it (0) to retry MSI-X, or sets it to 1 to rehearse the fallback.
+    pub const MSI_LATCH: KnobName = KnobName::new(b"MsiLatch");
+    /// `MsiStarting` (default 0). The boot-loop breaker's marker: a start that got messages
+    /// sets it (flushed to disk) and clears it once interrupts arrive; `AddDevice` finding it
+    /// set means the previous start never became healthy.
+    pub const MSI_STARTING: KnobName = KnobName::new(b"MsiStarting");
+    /// `MsiBreaker` (default 0). How many times the breaker tripped (a count the driver keeps).
+    pub const MSI_BREAKER: KnobName = KnobName::new(b"MsiBreaker");
 
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.

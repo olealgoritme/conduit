@@ -162,6 +162,27 @@ mod tests {
     }
 
     #[test]
+    fn every_geforce_generation_from_turing_on_is_covered() {
+        // 3D: TURING_A, AMPERE_B (GA10x), ADA_A, BLACKWELL_B (GB20x).
+        for c in [0xc597, 0xc797, 0xc997, 0xce97] {
+            assert_eq!(Caps::for_class(c), Some(GRAPHICS), "{c:#x}");
+        }
+        // NVENC and NVDEC of TU10x, GA10x, AD10x, GB20x.
+        for c in [0xc4b7, 0xc4b0, 0xc7b7, 0xc7b0, 0xc9b7, 0xc9b0, 0xcfb0] {
+            assert_eq!(Caps::for_class(c), Some(VIDEO), "{c:#x}");
+        }
+        // Compute, copy, GPFIFO and usermode classes need no capability.
+        for c in [
+            0xc5c0, 0xc7c0, 0xc9c0, 0xcec0, 0xc5b5, 0xc7b5, 0xcab5, 0xc46f, 0xc56f, 0xca6f,
+        ] {
+            assert_eq!(Caps::for_class(c), None, "{c:#x}");
+        }
+        for c in [0xc461, 0xc561, 0xc761] {
+            assert_eq!(Caps::for_class(c), None, "{c:#x}");
+        }
+    }
+
+    #[test]
     fn no_class_is_in_both_lists() {
         for c in THREE_D_CLASSES {
             assert!(!VIDEO_CLASSES.contains(c), "{c:#x}");

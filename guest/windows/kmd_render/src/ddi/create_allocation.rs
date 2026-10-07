@@ -2321,9 +2321,24 @@ unsafe fn destroy_allocation_ctx(
         drop(ctx);
         return;
     }
+    // An allocation that carries the id of the adapter-owned LINEAR scanout target is an IMPORTER
+    // of it (see `adapter_owned_scanout` below): it neither owns the resource nor the host scanout
+    // binding it feeds. DWM creates and destroys several of these across a restart; the destroy
+    // of a dead generation's must not unbind the screen the next one is about to flip to.
+    let retire_id = helios_kmd_logic::dwm_restart::importer_retire_id(
+        ctx.resource_id,
+        adapter.dedicated_scanout_resource.load(Ordering::Acquire),
+    );
+    let importer_of_scanout = retire_id == 0 && ctx.resource_id != 0;
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
-    // this resource id to a handle whose Box is about to be dropped.
-    unregister_scanout_allocation(ctx.resource_id);
+    // this resource id to a handle whose Box is about to be dropped. An importer withdraws only
+    // the registrations that name ITS handle, never the one an owner of the same id holds.
+    if importer_of_scanout {
+        unregister_scanout_allocation_handle(allocation_handle);
+        crate::ddi::dwm_restart::note_importer_destroyed();
+    } else {
+        unregister_scanout_allocation(ctx.resource_id);
+    }
     // The system-backing entry is removed on EVERY teardown exit, including the
     // scanout-retire failure below.
     //
@@ -2355,7 +2370,13 @@ unsafe fn destroy_allocation_ctx(
     // resource, Venus image, or cached copy can be torn down. If QEMU cannot
     // confirm resource_id=0 scanout disable, retain every host object until
     // device teardown rather than leave scanout 0 pointing at an unref'd blob.
-    if !adapter.retire_scanout_allocation(passive, allocation_handle, ctx.resource_id) {
+    //
+    // An importer of the adapter-owned scanout target retires by HANDLE only (resource id 0: a
+    // deferred `SetVidPnSourceAddress` that names it is cancelled, nothing else is touched). The
+    // resource id is the one the host scanout is bound to: retiring it here sent
+    // `SET_SCANOUT_BLOB(0)` for a live desktop, cleared `active_scanout_resource` and left no bind
+    // until dxgkrnl's next `SetVidPnSourceAddress` (`DwImpDest` counts the skips).
+    if !adapter.retire_scanout_allocation(passive, allocation_handle, retire_id) {
         drop(ctx);
         return;
     }
@@ -3958,6 +3979,12 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         let resource_id = ident.map(|d| d.resource_id).unwrap_or(0);
         let mut host_less_placeholder = false;
         if ident.is_none() {
+            // `DwOpNoId` / `DwOpNoIdSz`: the private data sizes dxgkrnl handed this open (a
+            // present of it later reads "no identity", `PrUnrWhy` cause 4).
+            crate::ddi::dwm_restart::note_open_no_identity(
+                info.PrivateDriverDataSize as u32,
+                args.PrivateDriverSize as u32,
+            );
             // A shared placeholder (or any allocation with no identity) opens with no
             // identity: counted, never resolved to a resource.
             host_less_placeholder = unsafe {
@@ -3981,6 +4008,9 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 Ok(false) => {
                     crate::diag::record(0x0C02_00E4);
                     crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
+                    // `DwOpFail` / `DwOpFailId`: a (new) DWM that cannot open what a client
+                    // shares fails here, and is otherwise only a ring record.
+                    crate::ddi::dwm_restart::note_open_refused(adapter, resource_id);
                     record_alloc_event(resource_id, 0xDEAD, 0xDEAD, 0, true);
                     unsafe { unwind_opens(adapter, args, i) };
                     return STATUS_INVALID_PARAMETER;

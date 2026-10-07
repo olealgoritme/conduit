@@ -32,12 +32,13 @@ static int step(const char *what, int r)
 static const char *arch_name(uint32_t a)
 {
     switch (a) {
-    case 0x160: return "Turing (TU100)";
-    case 0x170: return "Ampere (GA100)";
-    case 0x190: return "Ada (AD100)";
+    /* NV2080_CTRL_MC_ARCHITECTURE_*: one value per family, GeForce parts included. */
+    case 0x160: return "Turing (TU10x, RTX 20)";
+    case 0x170: return "Ampere (GA10x, RTX 30)";
+    case 0x190: return "Ada (AD10x, RTX 40)";
     case 0x180: return "Hopper (GH100)";
-    case 0x1A0: return "Blackwell (GB100)";
-    case 0x1B0: return "Blackwell (GB200)";
+    case 0x1A0: return "Blackwell (GB10x)";
+    case 0x1B0: return "Blackwell (GB20x, RTX 50)";
     case 0x1C0: return "Rubin (GR100)";
     default:    return "?";
     }
