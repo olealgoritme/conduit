@@ -34,9 +34,10 @@ ForeignCopy=1`, MSI-X in the guest, about 220 fps.
 - Host-side fixes, each behind an option, off by default: no empty interrupt
   after holding a fenced chain, one renderer round trip per fenced submit
   instead of two, two thread hops fewer on the fence's way back, a batched and
-  cheaper event thread, and CPU placement. Measured: host round trip 454 →
-  410 µs p50, fence return path 57.5 → 25.4 µs, queue thread per fenced submit
-  89 → 37 µs ("Before and after").
+  cheaper event thread, and CPU placement. Measured with MSI-X: host round
+  trip 441.5 → 398.0 µs p50, fence return path 45.0 → 20.9 µs, queue thread
+  per fenced submit 83 → 37 µs, event-thread interrupts 10,051 → 1,245 a
+  second ("Before and after").
 - C-states do not show on this path. Every wakeup on it landed on a CPU that
   was already awake, and wake to run took 2-3 µs.
 
@@ -259,6 +260,26 @@ light captures, µs, p50 / p99):
 | empty MSI after holding a chain | 2456 of 2514 | 82 of 2591 | 93 of 2767 |
 | event-thread MSIs per second | 10,051 | 1,386 | 1,405 |
 
+Two more MSI-X rows: D `all` plus `backend.cpus 0-3,16-19` (half the host's
+CCD, leaving QEMU's emulator CPUs partly free), and E `all,fence-spin`
+(unpinned, so compare it with B). Light captures, µs, p50 / p99:
+
+| stage | B all | D all + cpus 0-3,16-19 | E all + fence spin |
+|---|---|---|---|
+| dispatch → timeline written | 394.4 / 707.3 | 375.3 / 718.1 | 374.2 / 741.4 |
+| timeline → MSI (fence return path) | 33.6 / 63.3 | 20.9 / 42.9 | 41.4 / 64.5 |
+| **dispatch → MSI (host round trip)** | 429.4 / 748.5 | **398.0 / 739.0** | 418.5 / 790.0 |
+| queue thread busy per fenced submit (full, p50) | 58 | 37 | 54 |
+
+- Row D is the best row: 441.5 → 398.0 µs p50 (−43.5 µs, −10%) against MSI-X
+  row A, with the fence return path at 20.9 µs instead of 45.0. Half the CCD
+  is enough for the backend and conduit-venus.
+- Fence spin (E) brings the timeline write 20 µs earlier than B and the round
+  trip 11 µs earlier at p50, but its p99 is 42 µs worse. Its fence return path
+  is also slower, perhaps because the polling threads compete with the other
+  hops on unpinned CPUs. It stays opt-in. If it is tried again, combine it
+  with `backend.cpus` so the polling stays off the vCPUs.
+
 With MSI-X the pinning has no tail cost (row C has the lowest p99), so the
 INTx tail in row C above came from QEMU's main loop sharing those CPUs. The
 remaining 82-93 interrupts from the queue thread within 30 µs of holding a
@@ -305,8 +326,8 @@ Reading:
 - Recommendation: make `quiet-held`, `fused-submit`, `direct-fences` and
   `event-batch` the default once a soak is clean. `event-batch` cuts the
   event thread's interrupts sevenfold with MSI-X. Also recommend
-  `backend.cpus` on the host's CCD with MSI-X. Under INTx it competes with
-  QEMU's main loop.
+  `backend.cpus` with MSI-X, on part of the host's CCD (row D: `0-3,16-19`).
+  Under INTx it competes with QEMU's main loop. `fence-spin` stays opt-in.
 
 ## Phase 3: observing the fence sooner
 
