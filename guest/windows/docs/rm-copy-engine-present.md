@@ -801,12 +801,12 @@ How the KMD learns the value advanced, two ways, both reading the CPU mapping of
 Naming: the knob is `RmCopyEngine` (section 6 and 9 called it `BltRmCe`; the M3 knob list uses the longer, unambiguous
 name, still within 14 characters).
 
-## 12. The NVK and UMD side (as built)
+## 14. The NVK and UMD side (as built)
 
 The producer half of 10.2. Nothing here changes what the KMD does with a Present: an older KMD reads the
 first 48 / 96 bytes as before, and the record only reaches a KMD that says it reads it.
 
-### 12.1 NVK: `queue_rm_fence_v3` (`patches-windows/0053`)
+### 14.1 NVK: `queue_rm_fence_v3` (`patches-windows/0053`)
 
 `helios_icd_interface.h` version 6 appends one entry and two structs:
 
@@ -849,7 +849,7 @@ How each value is found (the table of 10.2, as implemented):
   picks `GENERIC_MEMORY` (0x06) for every uncompressed GB20x image and the modifier family names 0x06, so
   today it never fires. If it ever did, the KMD would map the source with a kind other than NVK's.
 
-### 12.2 UMD: the 168-byte `HERF` and the 192-byte `HEPR`
+### 14.2 UMD: the 168-byte `HERF` and the 192-byte `HEPR`
 
 - **Capability.** `HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3` = `QUERY_CAPS.supported_ops` bit 37 (Rust
   `protocol/src/rm_fence_v3.rs`, C `helios_rm_fence.h` and `rmclient/src/helios_nvrm_escape.h`). This is the
@@ -878,7 +878,7 @@ How each value is found (the table of 10.2, as implemented):
   `copy-engine record not sent: <why>` (first 8, then every 4096th), `NVK described no copy source`, and
   the record / without / refused counts on the every-4096th `WDDM presents carry an RM fence` line.
 
-### 12.3 Tests and what is unverified
+### 14.3 Tests and what is unverified
 
 - Host: the protocol crate (`cargo test` in `guest/windows/protocol`): the carriers place the record where
   the KMD reads it, the ICD struct mirror, the capability bit is free, and `producer_record`'s refusals. The
