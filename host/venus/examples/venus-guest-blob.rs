@@ -18,6 +18,25 @@
 //! buffer, free the memory, unref.
 //!
 //!   cargo run --example venus-guest-blob -- /tmp/venus.sock
+//!
+//! Benchmark knobs (environment), for the copy's bandwidth into guest RAM:
+//!
+//! * `GB_PAGES=4k|thp|hugetlb`: how the stand-in guest RAM is backed. `4k`
+//!   madvises the memfd mapping `MADV_NOHUGEPAGE`, `thp` `MADV_HUGEPAGE`
+//!   (shmem THP, as `shmem_enabled` allows), `hugetlb` makes it with
+//!   `MFD_HUGETLB` (needs reserved huge pages). Each prefaults the memory
+//!   through the example's own mapping before the import. Unset: neither,
+//!   no prefault (the pages are faulted by the import).
+//! * `GB_ORDER=scattered|contiguous`: the frame's page order in the memfd
+//!   (default scattered, pairs of pages in reverse order).
+//! * `GB_QF=N`: queue family of the copy (default 0, the family the KMD
+//!   uses). Another family gets its own queue beside family 0's; the source
+//!   is cleared once on family 0 (concurrent sharing) and every frame is a
+//!   copy alone, checked against that one colour.
+//! * `GB_ITER=N`: frames (default 100).
+//! * `GB_LOAD=SECONDS`: no copy benchmark; keep the graphics engine busy for
+//!   that long with large image clears on family 0 (a GPU load to run beside
+//!   another instance).
 
 #![allow(dead_code)]
 
@@ -33,6 +52,7 @@ const SHAREABLE: u32 = 2;
 const CMD_CREATE_INSTANCE: i32 = 0;
 const CMD_ENUMERATE_PHYSICAL_DEVICES: i32 = 2;
 const CMD_GET_PHYSICAL_DEVICE_PROPERTIES: i32 = 6;
+const CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES: i32 = 7;
 const CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES: i32 = 8;
 const CMD_CREATE_DEVICE: i32 = 11;
 const CMD_QUEUE_SUBMIT: i32 = 18;
@@ -135,6 +155,9 @@ const ID_DST_MEM: u64 = 43;
 const ID_POOL: u64 = 50;
 const ID_CMD: u64 = 51;
 const ID_FENCE: u64 = 52;
+const ID_QUEUE0: u64 = 53;
+const ID_POOL0: u64 = 54;
+const ID_CMD0: u64 = 55;
 
 const QUEUE_RING: u32 = 1;
 
@@ -199,12 +222,13 @@ impl Enc {
     fn image_barrier(
         &mut self,
         image: u64,
+        cmd: u64,
         (src_stage, dst_stage): (u32, u32),
         (src_access, dst_access): (u32, u32),
         (old, new): (u32, u32),
         (src_qf, dst_qf): (u32, u32),
     ) -> &mut Self {
-        self.cmd(CMD_CMD_PIPELINE_BARRIER, 0).u64(ID_CMD).u32(src_stage).u32(dst_stage).u32(0);
+        self.cmd(CMD_CMD_PIPELINE_BARRIER, 0).u64(cmd).u32(src_stage).u32(dst_stage).u32(0);
         self.u32(0).arr(0);
         self.u32(0).arr(0);
         self.u32(1).arr(1).st(ST_IMAGE_MEMORY_BARRIER);
@@ -293,13 +317,22 @@ fn mmap(fd: i32, size: usize) -> Option<*mut u8> {
 const W: u32 = 1600;
 const H: u32 = 900;
 const PAGE: u64 = 4096;
-const ITER: u32 = 100;
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 
 /// Page i of the frame lives at memfd page `ram_page(i)`: pairs of pages in
 /// reverse order, from 16 MiB on, so no two neighbours are contiguous.
 fn ram_page(i: u64, pages: u64) -> u64 {
+    if std::env::var("GB_ORDER").as_deref() == Ok("contiguous") {
+        return 4096 + i;
+    }
     let pairs = pages.div_ceil(2);
     4096 + (pairs - 1 - i / 2) * 2 + i % 2
+}
+
+fn pct(v: &[u64], p: f64) -> f64 {
+    v[((v.len() as f64 * p) as usize).min(v.len() - 1)] as f64 / 1e3
 }
 
 fn main() {
@@ -309,8 +342,13 @@ fn main() {
     // The "VM's RAM": a sealed memfd, as QEMU's memory-backend-memfd makes it.
     let ram_len = 64u64 << 20;
     // SAFETY: plain syscalls on a fresh descriptor.
+    let pages_mode = std::env::var("GB_PAGES").unwrap_or_default();
+    let qf = env_u32("GB_QF", 0);
+    let iter = env_u32("GB_ITER", 100);
+    let load_secs = env_u32("GB_LOAD", 0);
+    let hugetlb = if pages_mode == "hugetlb" { libc::MFD_HUGETLB } else { 0 };
     let ram = unsafe {
-        let fd = libc::memfd_create(c"guest-ram".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING);
+        let fd = libc::memfd_create(c"guest-ram".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | hugetlb);
         assert!(fd >= 0);
         let fd = OwnedFd::from_raw_fd(fd);
         assert_eq!(libc::ftruncate(fd.as_raw_fd(), ram_len as i64), 0);
@@ -318,6 +356,24 @@ fn main() {
         fd
     };
     let view = mmap(ram.as_raw_fd(), ram_len as usize).expect("mmap guest RAM");
+    if !pages_mode.is_empty() {
+        let advice = match pages_mode.as_str() {
+            "4k" => libc::MADV_NOHUGEPAGE,
+            "thp" => libc::MADV_HUGEPAGE,
+            _ => 0,
+        };
+        // SAFETY: advice on, then writes to, our own mapping of the memfd.
+        unsafe {
+            if advice != 0 {
+                assert_eq!(libc::madvise(view.cast(), ram_len as usize, advice), 0, "madvise");
+            }
+            std::ptr::write_bytes(view, 0, ram_len as usize);
+        }
+        let smaps = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        let line = smaps.lines().find(|l| l.starts_with("ShmemPmdMapped")).unwrap_or("ShmemPmdMapped: ?");
+        println!("guest RAM: GB_PAGES={pages_mode}, {line}");
+    }
+    println!("GB_ORDER={}, GB_QF={qf}", std::env::var("GB_ORDER").unwrap_or("scattered".into()));
     let runs: Vec<PageRun> = (0..pages).map(|i| PageRun { offset: ram_page(i, pages) * PAGE, len: PAGE }).collect();
 
     let mut c = IpcClient::connect(path.as_ref()).expect("connect");
@@ -368,10 +424,31 @@ fn main() {
     let type_flags: Vec<u32> = (0..ntypes).map(|i| u32_at(&r, 24 + i * 8)).collect();
 
     let mut e = Enc::default();
+    e.cmd(CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES, GENERATE_REPLY).u64(phys).ptr().u32(16).arr(16);
+    let r = v.run(&e);
+    let nfam = (u32_at(&r, 12) as usize).min(16);
+    for i in 0..nfam {
+        let o = 24 + i * 24;
+        println!(
+            "  queue family {i}: flags {:#x} count {} timestampValidBits {}",
+            u32_at(&r, o),
+            u32_at(&r, o + 4),
+            u32_at(&r, o + 8)
+        );
+    }
+
+    let mut e = Enc::default();
     e.cmd(CMD_CREATE_DEVICE, GENERATE_REPLY).u64(phys);
     e.ptr().st(ST_DEVICE_CREATE_INFO).u32(0);
-    e.u32(1).arr(1).st(ST_DEVICE_QUEUE_CREATE_INFO);
-    e.u32(0).u32(0).u32(1).arr(1).f32(1.0);
+    if qf == 0 {
+        e.u32(1).arr(1).st(ST_DEVICE_QUEUE_CREATE_INFO);
+        e.u32(0).u32(0).u32(1).arr(1).f32(1.0);
+    } else {
+        e.u32(2).arr(2).st(ST_DEVICE_QUEUE_CREATE_INFO);
+        e.u32(0).u32(0).u32(1).arr(1).f32(1.0);
+        e.st(ST_DEVICE_QUEUE_CREATE_INFO);
+        e.u32(0).u32(qf).u32(1).arr(1).f32(1.0);
+    }
     e.u32(0).arr(0);
     e.u32(0).arr(0);
     e.null();
@@ -382,8 +459,16 @@ fn main() {
     e.cmd(CMD_GET_DEVICE_QUEUE_2, 0).u64(ID_DEVICE);
     e.ptr().i32(ST_DEVICE_QUEUE_INFO_2);
     e.ptr().st(ST_DEVICE_QUEUE_TIMELINE_INFO_MESA).u32(QUEUE_RING);
-    e.u32(0).u32(0).u32(0);
+    e.u32(0).u32(qf).u32(0);
     e.ptr().u64(ID_QUEUE);
+    if qf != 0 {
+        // Family 0's queue, for the one-off clear, on ring 2.
+        e.cmd(CMD_GET_DEVICE_QUEUE_2, 0).u64(ID_DEVICE);
+        e.ptr().i32(ST_DEVICE_QUEUE_INFO_2);
+        e.ptr().st(ST_DEVICE_QUEUE_TIMELINE_INFO_MESA).u32(2);
+        e.u32(0).u32(0).u32(0);
+        e.ptr().u64(ID_QUEUE0);
+    }
     e.cmd(CMD_CREATE_FENCE, GENERATE_REPLY).u64(ID_DEVICE);
     e.ptr().st(ST_FENCE_CREATE_INFO).u32(0);
     e.null().ptr().u64(ID_FENCE);
@@ -443,7 +528,13 @@ fn main() {
     e.cmd(CMD_CREATE_IMAGE, GENERATE_REPLY).u64(ID_DEVICE);
     e.ptr().st(ST_IMAGE_CREATE_INFO);
     e.u32(0).u32(1).u32(FORMAT_B8G8R8A8_UNORM).u32(W).u32(H).u32(1).u32(1).u32(1).u32(1);
-    e.u32(TILING_OPTIMAL).u32(0x1 | 0x2).u32(0).u32(0).arr(0).u32(LAYOUT_UNDEFINED);
+    e.u32(TILING_OPTIMAL).u32(0x1 | 0x2);
+    if qf == 0 {
+        e.u32(0).u32(0).arr(0);
+    } else {
+        e.u32(1 /* CONCURRENT */).u32(2).arr(2).u32(0).u32(qf);
+    }
+    e.u32(LAYOUT_UNDEFINED);
     e.null().ptr().u64(ID_SRC);
     v.call("vkCreateImage(OPTIMAL source)", CMD_CREATE_IMAGE, &e);
     let mut e = Enc::default();
@@ -464,85 +555,165 @@ fn main() {
 
     let mut e = Enc::default();
     e.cmd(CMD_CREATE_QUERY_POOL, GENERATE_REPLY).u64(ID_DEVICE);
-    e.ptr().st(ST_QUERY_POOL_CREATE_INFO).u32(0).u32(QUERY_TYPE_TIMESTAMP).u32(2).u32(0);
+    e.ptr().st(ST_QUERY_POOL_CREATE_INFO).u32(0).u32(QUERY_TYPE_TIMESTAMP).u32(2 * (iter + 1)).u32(0);
     e.null().ptr().u64(ID_QP);
     v.call("vkCreateQueryPool", CMD_CREATE_QUERY_POOL, &e);
-    let mut e = Enc::default();
-    e.cmd(CMD_CREATE_COMMAND_POOL, GENERATE_REPLY).u64(ID_DEVICE);
-    e.ptr().st(ST_COMMAND_POOL_CREATE_INFO).u32(0x2 /* RESET_COMMAND_BUFFER */).u32(0);
-    e.null().ptr().u64(ID_POOL);
-    v.call("vkCreateCommandPool", CMD_CREATE_COMMAND_POOL, &e);
-    let mut e = Enc::default();
-    e.cmd(CMD_ALLOCATE_COMMAND_BUFFERS, GENERATE_REPLY).u64(ID_DEVICE);
-    e.ptr().st(ST_COMMAND_BUFFER_ALLOCATE_INFO).u64(ID_POOL).u32(0).u32(1);
-    e.arr(1).u64(ID_CMD);
-    v.call("vkAllocateCommandBuffers", CMD_ALLOCATE_COMMAND_BUFFERS, &e);
-
-    let mut gpu_ns = Vec::new();
-    let mut bad_total = 0u64;
-    let mut checked = 0;
-    for frame in 1..=ITER {
-        // Clear the image to a colour that names the frame, copy it into the
-        // guest blob between two timestamps, hand the bytes to the host.
+    let pools: &[(u64, u64, u32)] =
+        if qf == 0 { &[(ID_POOL, ID_CMD, 0)] } else { &[(ID_POOL, ID_CMD, qf), (ID_POOL0, ID_CMD0, 0)] };
+    for &(pool, cmd, fam) in pools {
         let mut e = Enc::default();
-        e.cmd(CMD_BEGIN_COMMAND_BUFFER, 0).u64(ID_CMD);
-        e.ptr().st(ST_COMMAND_BUFFER_BEGIN_INFO).u32(1).null();
+        e.cmd(CMD_CREATE_COMMAND_POOL, GENERATE_REPLY).u64(ID_DEVICE);
+        e.ptr().st(ST_COMMAND_POOL_CREATE_INFO).u32(0x2 /* RESET_COMMAND_BUFFER */).u32(fam);
+        e.null().ptr().u64(pool);
+        v.call("vkCreateCommandPool", CMD_CREATE_COMMAND_POOL, &e);
+        let mut e = Enc::default();
+        e.cmd(CMD_ALLOCATE_COMMAND_BUFFERS, GENERATE_REPLY).u64(ID_DEVICE);
+        e.ptr().st(ST_COMMAND_BUFFER_ALLOCATE_INFO).u64(pool).u32(0).u32(1);
+        e.arr(1).u64(cmd);
+        v.call("vkAllocateCommandBuffers", CMD_ALLOCATE_COMMAND_BUFFERS, &e);
+    }
+    // Family 0's queue and command buffer, and the ring its fences go on.
+    let (q0, cmd0, ring0) = if qf == 0 { (ID_QUEUE, ID_CMD, QUEUE_RING) } else { (ID_QUEUE0, ID_CMD0, 2) };
+
+    // Submit `cmd` on `queue`, wait for it on `ring`.
+    let submit = |v: &mut Venus, queue: u64, cmd: u64, ring: u32| {
+        let mut e = Enc::default();
+        e.cmd(CMD_RESET_FENCES, GENERATE_REPLY).u64(ID_DEVICE).u32(1).arr(1).u64(ID_FENCE);
+        v.call_quiet("vkResetFences", CMD_RESET_FENCES, &e);
+        let mut e = Enc::default();
+        e.cmd(CMD_QUEUE_SUBMIT, GENERATE_REPLY).u64(queue);
+        e.u32(1).arr(1).st(ST_SUBMIT_INFO);
+        e.u32(0).arr(0).arr(0);
+        e.u32(1).arr(1).u64(cmd);
+        e.u32(0).arr(0);
+        e.u64(ID_FENCE);
+        v.call_quiet("vkQueueSubmit", CMD_QUEUE_SUBMIT, &e);
+        v.fence += 1;
+        let f = v.fence;
+        v.c.create_fence(1, ring, f).expect("create_fence on the queue ring");
+        assert!(v.wait_fence(f, Duration::from_secs(30)), "queue ring fence");
+    };
+    let clear = |e: &mut Enc, cmd: u64, tag: u32| {
+        e.cmd(CMD_CMD_CLEAR_COLOR_IMAGE, 0).u64(cmd).u64(ID_SRC).u32(LAYOUT_TRANSFER_DST);
+        // VkClearColorValue: tag 0 (float32[4]), R G B A.
+        e.ptr().u32(0).arr(4).f32(tag as f32 / 255.0).f32(0x5a as f32 / 255.0).f32(0xa5 as f32 / 255.0).f32(1.0);
+        e.u32(1).arr(1).color_range();
+    };
+
+    // Setup on family 0: reset every query; with another copy family, clear
+    // the source once and leave it in TRANSFER_SRC.
+    const FIXED_TAG: u32 = 0x77;
+    let mut e = Enc::default();
+    e.cmd(CMD_BEGIN_COMMAND_BUFFER, 0).u64(cmd0);
+    e.ptr().st(ST_COMMAND_BUFFER_BEGIN_INFO).u32(1).null();
+    e.cmd(CMD_CMD_RESET_QUERY_POOL, 0).u64(cmd0).u64(ID_QP).u32(0).u32(2 * (iter + 1));
+    if qf != 0 || load_secs > 0 {
         e.image_barrier(
             ID_SRC,
+            cmd0,
             (STAGE_TOP_OF_PIPE, STAGE_TRANSFER),
             (0, ACCESS_TRANSFER_WRITE),
             (LAYOUT_UNDEFINED, LAYOUT_TRANSFER_DST),
             (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED),
         );
-        e.cmd(CMD_CMD_CLEAR_COLOR_IMAGE, 0).u64(ID_CMD).u64(ID_SRC).u32(LAYOUT_TRANSFER_DST);
-        // VkClearColorValue: tag 0 (float32[4]), R G B A.
-        e.ptr().u32(0).arr(4).f32(frame as f32 / 255.0).f32(0x5a as f32 / 255.0).f32(0xa5 as f32 / 255.0).f32(1.0);
-        e.u32(1).arr(1).color_range();
-        e.image_barrier(
-            ID_SRC,
-            (STAGE_TRANSFER, STAGE_TRANSFER),
-            (ACCESS_TRANSFER_WRITE, ACCESS_TRANSFER_READ),
-            (LAYOUT_TRANSFER_DST, LAYOUT_TRANSFER_SRC),
-            (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED),
+        clear(&mut e, cmd0, FIXED_TAG);
+        if load_secs == 0 {
+            e.image_barrier(
+                ID_SRC,
+                cmd0,
+                (STAGE_TRANSFER, STAGE_TRANSFER),
+                (ACCESS_TRANSFER_WRITE, ACCESS_TRANSFER_READ),
+                (LAYOUT_TRANSFER_DST, LAYOUT_TRANSFER_SRC),
+                (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED),
+            );
+        }
+    }
+    e.cmd(CMD_END_COMMAND_BUFFER, GENERATE_REPLY).u64(cmd0);
+    v.call_quiet("setup vkEndCommandBuffer", CMD_END_COMMAND_BUFFER, &e);
+    submit(&mut v, q0, cmd0, ring0);
+
+    if load_secs > 0 {
+        // A GPU load: batches of 1000 full clears on family 0 until time is up.
+        let mut e = Enc::default();
+        e.cmd(CMD_BEGIN_COMMAND_BUFFER, 0).u64(cmd0);
+        e.ptr().st(ST_COMMAND_BUFFER_BEGIN_INFO).u32(0).null();
+        for k in 0..1000 {
+            clear(&mut e, cmd0, k & 0xff);
+        }
+        e.cmd(CMD_END_COMMAND_BUFFER, GENERATE_REPLY).u64(cmd0);
+        v.call_quiet("load vkEndCommandBuffer", CMD_END_COMMAND_BUFFER, &e);
+        let t = Instant::now();
+        let mut n = 0u32;
+        while t.elapsed() < Duration::from_secs(load_secs as u64) {
+            submit(&mut v, q0, cmd0, ring0);
+            n += 1;
+        }
+        println!(
+            "LOAD {n} batches of 1000 clears in {:?} ({:.2} ms per batch)",
+            t.elapsed(),
+            t.elapsed().as_secs_f64() * 1e3 / n as f64
         );
-        e.cmd(CMD_CMD_RESET_QUERY_POOL, 0).u64(ID_CMD).u64(ID_QP).u32(0).u32(2);
-        e.cmd(CMD_CMD_WRITE_TIMESTAMP, 0).u64(ID_CMD).u32(STAGE_TRANSFER).u64(ID_QP).u32(0);
+        std::process::exit(0);
+    }
+
+    let mut gpu_ns = Vec::new();
+    // Host wall time of a frame's copy: reset fence, vkQueueSubmit, ring
+    // fence, until the fence signal reaches this process.
+    let mut wall_ns = Vec::new();
+    let mut bad_total = 0u64;
+    let mut checked = 0;
+    for frame in 1..=iter {
+        // Clear the image to a colour that names the frame (family 0 only),
+        // copy it into the guest blob between two timestamps, hand the bytes
+        // to the host.
+        let tag = if qf == 0 { frame } else { FIXED_TAG };
+        let mut e = Enc::default();
+        e.cmd(CMD_BEGIN_COMMAND_BUFFER, 0).u64(ID_CMD);
+        e.ptr().st(ST_COMMAND_BUFFER_BEGIN_INFO).u32(1).null();
+        if qf == 0 {
+            e.image_barrier(
+                ID_SRC,
+                ID_CMD,
+                (STAGE_TOP_OF_PIPE, STAGE_TRANSFER),
+                (0, ACCESS_TRANSFER_WRITE),
+                (LAYOUT_UNDEFINED, LAYOUT_TRANSFER_DST),
+                (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED),
+            );
+            clear(&mut e, ID_CMD, tag);
+            e.image_barrier(
+                ID_SRC,
+                ID_CMD,
+                (STAGE_TRANSFER, STAGE_TRANSFER),
+                (ACCESS_TRANSFER_WRITE, ACCESS_TRANSFER_READ),
+                (LAYOUT_TRANSFER_DST, LAYOUT_TRANSFER_SRC),
+                (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED),
+            );
+        }
+        e.cmd(CMD_CMD_WRITE_TIMESTAMP, 0).u64(ID_CMD).u32(STAGE_TRANSFER).u64(ID_QP).u32(2 * frame);
         e.cmd(CMD_CMD_COPY_IMAGE_TO_BUFFER, 0).u64(ID_CMD).u64(ID_SRC).u32(LAYOUT_TRANSFER_SRC).u64(ID_BUF);
         e.u32(1).arr(1).u64(0).u32(W).u32(H).color_layers().i32(0).i32(0).i32(0).u32(W).u32(H).u32(1);
-        e.cmd(CMD_CMD_WRITE_TIMESTAMP, 0).u64(ID_CMD).u32(STAGE_TRANSFER).u64(ID_QP).u32(1);
+        e.cmd(CMD_CMD_WRITE_TIMESTAMP, 0).u64(ID_CMD).u32(STAGE_TRANSFER).u64(ID_QP).u32(2 * frame + 1);
         e.cmd(CMD_CMD_PIPELINE_BARRIER, 0).u64(ID_CMD).u32(STAGE_TRANSFER).u32(STAGE_HOST).u32(0);
         e.u32(1).arr(1).st(ST_MEMORY_BARRIER).u32(ACCESS_TRANSFER_WRITE).u32(ACCESS_HOST_READ);
         e.u32(0).arr(0);
         e.u32(0).arr(0);
         e.cmd(CMD_END_COMMAND_BUFFER, GENERATE_REPLY).u64(ID_CMD);
         v.call_quiet("record + vkEndCommandBuffer", CMD_END_COMMAND_BUFFER, &e);
+        let t_submit = Instant::now();
+        submit(&mut v, ID_QUEUE, ID_CMD, QUEUE_RING);
+        let wall = t_submit.elapsed().as_nanos() as u64;
 
         let mut e = Enc::default();
-        e.cmd(CMD_RESET_FENCES, GENERATE_REPLY).u64(ID_DEVICE).u32(1).arr(1).u64(ID_FENCE);
-        v.call_quiet("vkResetFences", CMD_RESET_FENCES, &e);
-        let mut e = Enc::default();
-        e.cmd(CMD_QUEUE_SUBMIT, GENERATE_REPLY).u64(ID_QUEUE);
-        e.u32(1).arr(1).st(ST_SUBMIT_INFO);
-        e.u32(0).arr(0).arr(0);
-        e.u32(1).arr(1).u64(ID_CMD);
-        e.u32(0).arr(0);
-        e.u64(ID_FENCE);
-        v.call_quiet("vkQueueSubmit", CMD_QUEUE_SUBMIT, &e);
-        v.fence += 1;
-        let f = v.fence;
-        v.c.create_fence(1, QUEUE_RING, f).expect("create_fence on the queue ring");
-        assert!(v.wait_fence(f, Duration::from_secs(10)), "queue ring fence");
-
-        let mut e = Enc::default();
-        e.cmd(CMD_GET_QUERY_POOL_RESULTS, GENERATE_REPLY).u64(ID_DEVICE).u64(ID_QP).u32(0).u32(2);
+        e.cmd(CMD_GET_QUERY_POOL_RESULTS, GENERATE_REPLY).u64(ID_DEVICE).u64(ID_QP).u32(2 * frame).u32(2);
         e.u64(16).arr(16).u64(8).u32(0x1 | 0x2 /* 64_BIT | WAIT */);
         let r = v.call_quiet("vkGetQueryPoolResults", CMD_GET_QUERY_POOL_RESULTS, &e);
         let (t0, t1) = (u64_at(&r, 16), u64_at(&r, 24));
         if frame > 5 {
             gpu_ns.push(t1.saturating_sub(t0));
+            wall_ns.push(wall);
         }
 
-        if frame == 1 || frame % 16 == 0 || frame == ITER {
+        if frame == 1 || frame % 16 == 0 || frame == iter {
             // What the guest reads: its pages, in its order.
             let mut bad = 0u64;
             for i in 0..pages {
@@ -552,7 +723,7 @@ fn main() {
                 for o in (0..n).step_by(4) {
                     // SAFETY: inside the guest RAM mapping.
                     let px = unsafe { std::ptr::read_volatile(view.add((page + o) as usize).cast::<u32>()) };
-                    let want = 0xff00_0000 | ((frame & 0xff) << 16) | (0x5a << 8) | 0xa5;
+                    let want = 0xff00_0000 | ((tag & 0xff) << 16) | (0x5a << 8) | 0xa5;
                     if px != want {
                         if bad_total + bad < 3 {
                             println!("  frame {frame}: page {i} +{o}: {px:#010x}, want {want:#010x}");
@@ -566,11 +737,24 @@ fn main() {
         }
     }
     gpu_ns.sort_unstable();
+    wall_ns.sort_unstable();
     let avg = gpu_ns.iter().sum::<u64>() as f64 / gpu_ns.len() as f64 / 1e6;
     println!(
         "RESULT guest blob via Venus: gpu copy 1600x900 BGRA avg {avg:.3} ms (min {:.3}, max {:.3}), {checked} frames checked, {bad_total} bad px",
         gpu_ns[0] as f64 / 1e6,
         gpu_ns[gpu_ns.len() - 1] as f64 / 1e6
+    );
+    let p50 = pct(&gpu_ns, 0.5);
+    println!(
+        "BENCH pages={} order={} qf={qf} n={} p50_us={p50:.1} p90_us={:.1} min_us={:.1} gbps_p50={:.2} wall_p50_us={:.1} wall_p90_us={:.1}",
+        if pages_mode.is_empty() { "default" } else { pages_mode.as_str() },
+        std::env::var("GB_ORDER").unwrap_or("scattered".into()),
+        gpu_ns.len(),
+        pct(&gpu_ns, 0.9),
+        gpu_ns[0] as f64 / 1e3,
+        (W as f64 * H as f64 * 4.0) / (p50 * 1e3),
+        pct(&wall_ns, 0.5),
+        pct(&wall_ns, 0.9)
     );
 
     // Teardown in the contract's order: buffer, memory, then the resource.

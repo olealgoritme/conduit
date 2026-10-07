@@ -644,6 +644,24 @@ pairing and `conduit-venus` translates. With the hook null (stage timing off)
 vkr takes its unmodified path. The guest-visible protocol is unchanged: stage
 timing uses the fence ids and flip `seq`s already on the wire.
 
+**Latency options** (on by default; `conduit config set backend.latency off`
+or a list to change that,
+[research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
+`fused-submit`: a fenced `SUBMIT_3D` is one call, `Renderer::submit_fenced`
+(IPC op `SUBMIT_FENCED` (15), sent only to a server with `FEATURE_SUBMIT_FENCED` (bit 3),
+which every server from this release on adds itself), instead of `SUBMIT`
+and `CREATE_FENCE`, each waiting for its reply. `direct-fences`:
+`conduit-venus --direct-fences` sends each `FENCES` message from the
+virglrenderer thread that retired the fence, under the same send lock as the
+serve loop's replies, so the fragments of a message never interleave. The
+backend's reader thread then returns the signalled chains itself when the
+backend lock is free (`Renderer::set_fence_hook`), and otherwise leaves them
+to the fence pump; it asks the renderer nothing from there (the stage pull
+stays with the pump and the queue thread). Stage stamps are the same on
+this path: `venus signal` in the callback, `venus push` after the send. A fence can now reach the backend before the reply to
+its `CREATE_FENCE`. It is taken only under the backend lock, which the queue
+thread holds until it has recorded the chain.
+
 One `conduit-venus` per VM: `conduit up/view --venus` (and the libvirt
 backend unit) starts it before the backend, on `venus.sock` in the VM's run
 directory, logging to `logs/venus.log`; it serves that one backend and exits

@@ -6,6 +6,15 @@
 //!
 //! Sandboxed (src/sandbox.rs) before the first request is read; `--no-sandbox`
 //! runs without Landlock and seccomp, for debugging only.
+//!
+//! Latency options (docs/research/host-roundtrip-latency.md): direct fences,
+//! on by default (`--no-direct-fences` turns them off), send each signalled
+//! fence to the backend from the virglrenderer thread that retires it,
+//! instead of through the serve loop;
+//! `--cpus LIST` (e.g. `0-7,16-23`) keeps every thread of the process on
+//! those CPUs; `--fence-spin-us N` has vkr's fence threads poll for at most
+//! N us around a fence's expected completion instead of only sleeping in the
+//! driver's wait (patches/0004-vkr-queue-fence-spin.patch).
 
 use conduit_venus::ipc::{IpcServer, listen_accept_one};
 use conduit_venus::sandbox::{self, Sandbox};
@@ -14,7 +23,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: conduit-venus --socket PATH [--vm NAME] [--no-sandbox]");
+    eprintln!(
+        "usage: conduit-venus --socket PATH [--vm NAME] [--no-sandbox] [--no-direct-fences] [--cpus LIST] [--fence-spin-us N]"
+    );
     eprintln!("       conduit-venus --sandbox-selftest [--vm NAME]");
     ExitCode::from(2)
 }
@@ -29,6 +40,9 @@ fn main() -> ExitCode {
     let mut vm: Option<String> = None;
     let mut no_sandbox = false;
     let mut selftest = false;
+    let mut direct_fences = true;
+    let mut cpus: Option<String> = None;
+    let mut fence_spin_us: Option<u32> = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         match a.to_str() {
@@ -36,6 +50,13 @@ fn main() -> ExitCode {
             Some("--vm") => vm = args.next().and_then(|v| v.into_string().ok()),
             Some("--no-sandbox") => no_sandbox = true,
             Some("--sandbox-selftest") => selftest = true,
+            Some("--direct-fences") => direct_fences = true,
+            Some("--no-direct-fences") => direct_fences = false,
+            Some("--cpus") => cpus = args.next().and_then(|v| v.into_string().ok()),
+            Some("--fence-spin-us") => match args.next().and_then(|v| v.into_string().ok()?.parse().ok()) {
+                Some(n) if n <= 2000 => fence_spin_us = Some(n),
+                _ => return usage(),
+            },
             Some("-h" | "--help") => {
                 usage();
                 return ExitCode::SUCCESS;
@@ -51,6 +72,21 @@ fn main() -> ExitCode {
         None if selftest => PathBuf::from("venus.sock"),
         None => return usage(),
     };
+
+    // Before any thread exists, so every thread virglrenderer and the driver
+    // start inherits it.
+    if let Some(list) = &cpus {
+        match conduit_venus::affinity::pin_process(list) {
+            Ok(n) => eprintln!("conduit-venus: pinned to CPUs {list} ({n} CPUs)"),
+            Err(e) => return fail(format_args!("--cpus {list}: {e}")),
+        }
+    }
+
+    if let Some(n) = fence_spin_us {
+        // SAFETY: no other thread exists yet; virglrenderer reads it later.
+        unsafe { std::env::set_var("CONDUIT_VKR_FENCE_SPIN_US", n.to_string()) };
+        eprintln!("conduit-venus: fence spin {n} us");
+    }
 
     let nofile = sandbox::raise_nofile();
     eprintln!("conduit-venus: open file limit {nofile}");
@@ -125,7 +161,7 @@ fn main() -> ExitCode {
             Err(e) => return fail(e),
         }
     }
-    match IpcServer::new(sock, Box::new(renderer)).serve() {
+    match IpcServer::new(sock, Box::new(renderer)).direct_fences(direct_fences).serve() {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => fail(e),
     }
