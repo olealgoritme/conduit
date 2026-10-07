@@ -50,6 +50,9 @@ BUNDLE_QEMU=${BUNDLE_QEMU:-1}
 QEMU_BUILD_SCRIPT=${QEMU_BUILD_SCRIPT:-$ROOT/host/qemu/build-qemu.sh}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 
+# shellcheck source=common/icons.sh
+. "$PKG/common/icons.sh"
+
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -333,6 +336,7 @@ cmd_stage() {
     install -d "$STAGE$LINK_DIR" "$STAGE$share/applications" "$STAGE/etc/apparmor.d/abstractions"
     ln -sfn "$PREFIX/bin/conduit" "$STAGE$LINK_DIR/conduit"
     install -m0644 "$PKG/common/conduit.desktop" "$STAGE$share/applications/conduit.desktop"
+    install_icons "$STAGE${share%/share}"
     install -m0644 "$PKG/common/apparmor/conduit" "$STAGE/etc/apparmor.d/abstractions/conduit"
 }
 
@@ -483,6 +487,7 @@ cmd_package() {
         local t="$DIST/tarball/conduit"
         rm -rf "$DIST/tarball"; install -d "$t/root"
         cp -a "$STAGE$PREFIX" "$t/root/"
+        install_icons "$t/root/conduit"     # install.sh puts them under /usr/local/share/icons
         install -m0755 "$PKG/tarball/install.sh" "$PKG/tarball/uninstall.sh" "$t/"
         install -m0755 "$PKG/tarball/uninstall.sh" "$t/root/conduit/uninstall.sh"
         echo "$v" > "$t/VERSION"

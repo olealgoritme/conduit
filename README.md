@@ -1,3 +1,5 @@
+<img src="packaging/common/icons/conduit.svg" width="96" align="right" alt="Conduit logo">
+
 # Conduit
 
 **Share your NVIDIA GPU with a virtual machine, and see its desktop on yours, at full speed.**

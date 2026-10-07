@@ -238,6 +238,9 @@
           };
         } ''
         mkdir -p $out/bin $out/share/applications
+        # The app icon set (Icon=conduit): the same installer the packages use.
+        . ${./packaging/common/icons.sh}
+        ICON_SRC=${./packaging/common/icons} install_icons $out
         ln -s ${backend}/bin/conduit-backend $out/bin/conduit-backend
         ln -s ${backend}/bin/conduit-userspace $out/bin/conduit-userspace
         ln -s ${vmm}/bin/conduit-vmm         $out/bin/conduit-vmm

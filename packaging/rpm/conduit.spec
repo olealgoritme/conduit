@@ -86,6 +86,7 @@ fi
 /opt/conduit
 %{_bindir}/conduit
 %{_datadir}/applications/conduit.desktop
+%{_datadir}/icons/hicolor/*/apps/conduit.*
 %config(noreplace) %{_sysconfdir}/apparmor.d/abstractions/conduit
 
 %changelog
