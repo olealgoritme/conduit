@@ -23,8 +23,8 @@ QP=$(pgrep -f "qemu-system-x86_64.*guest=$vm" | head -1)
 [ -n "$BP" ] && [ -n "$VP" ] && [ -n "$QP" ] || { echo "backend, conduit-venus or QEMU for $vm not running" >&2; exit 1; }
 B=$(readlink -f /proc/$BP/exe 2>/dev/null || sudo readlink -f /proc/$BP/exe)
 V=$(readlink -f /proc/$VP/exe 2>/dev/null || sudo readlink -f /proc/$VP/exe)
-L=$(sudo awk '/libvirglrenderer/ {print $6; exit}' /proc/$VP/maps)
-sym() { nm "$1" | awk -v s="$2" '$3 ~ s {print $3; exit}'; }
+L=$(sudo awk '!f && /libvirglrenderer/ {print $6; f = 1}' /proc/$VP/maps)
+sym() { nm "$1" | awk -v s="$2" '!f && $3 ~ s {print $3; f = 1}'; }
 DISP=$(sym "$B" '^_ZN6device5venus5Venus8dispatch17')
 SUB=$(sym "$B" 'IpcClient.*Renderer.*6submit17')
 SF=$(sym "$B" 'IpcClient.*Renderer.*13submit_fenced17')
