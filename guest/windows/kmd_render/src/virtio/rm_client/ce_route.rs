@@ -139,6 +139,25 @@ pub(crate) fn prep_producer(
     r
 }
 
+/// The record's producer VAs when both dups are cached under the client table's current
+/// generation (no RM call; `ce_dup::cached_producer`). The caller holds the channel's I/O
+/// ([`try_io`]). Spinlock only.
+pub(crate) fn cached_producer(rec: &StashedCeRecord) -> Option<Producer> {
+    let gen = chan_view().gen?;
+    ce_dup::cached_producer(rec, gen, crate::virtio::nvrm_harden::client_generation())
+}
+
+/// Take the channel's RM I/O without waiting (`ce_channel::try_io`): while held, no dup is made,
+/// remade or given back. `false`: another thread has it.
+pub(crate) fn try_io() -> bool {
+    ch::try_io()
+}
+
+/// Give back what [`try_io`] took.
+pub(crate) fn end_io() {
+    ch::end_io();
+}
+
 /// Why [`create_dst`] made no descriptor.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DstFail {
@@ -280,18 +299,18 @@ pub(crate) fn free_dst(
     ok
 }
 
-/// `IO_BUSY`, waiting at most `ms` in 1 ms sleeps.
+/// `IO_BUSY`, waiting at most `ms` of interrupt time (each sleep rounds up to the timer
+/// quantum, so the clock, not a count of sleeps, ends the wait).
 fn take_io(passive: PassiveLevel, ms: u64) -> bool {
-    let mut waited = 0;
+    let end = cr::deadline(ch::now_100ns(), ms);
     loop {
         if ch::try_io() {
             return true;
         }
-        if waited >= ms {
+        if cr::expired(ch::now_100ns(), end) {
             return false;
         }
         crate::virtio::ctrl::sleep_ms(passive, 1);
-        waited += 1;
     }
 }
 

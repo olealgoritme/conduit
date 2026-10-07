@@ -1791,6 +1791,8 @@ pub fn close_all_on_host(
         .with_virtio(|v| !v.transport_failed())
         .unwrap_or(false);
     if !alive {
+        // Nothing was confirmed closed: the KMD's own pins (the copy-engine route's) stay locked.
+        LAST_SWEEP_LEAK.store(1, Ordering::Relaxed);
         return 0;
     }
     let mut sending = true;
@@ -1871,6 +1873,12 @@ pub fn close_all_on_host(
     }
     // Every file is closed (or forgotten), and the host frees a client with its file.
     harden::forget_all(adapter);
+    // The KMD's own registrations (the copy-engine route's destination descriptors, in the
+    // channel's client) follow the same fate at `rm_client::forget`.
+    // Sticky until read: an idempotent second sweep (nothing left to close) must not clear it.
+    if tally.pin_fate() == PinFate::Leak {
+        LAST_SWEEP_LEAK.store(1, Ordering::Relaxed);
+    }
     // Last: the pins. Unlocked only if the host confirmed every close above; if
     // sending stopped early they stay locked (leaked, `NvPinLeak`), because the
     // host keeps its RM files across a device reset and the GPU may still write
@@ -1887,6 +1895,20 @@ pub fn close_all_on_host(
         release_or_leak_pin(pin, fate);
     }
     closed
+}
+
+/// 1 once a transport sweep of this generation left a close unconfirmed (or found the transport
+/// failed); taken (and cleared) by `rm_client::forget` for the pins the KMD's own client
+/// registered.
+static LAST_SWEEP_LEAK: AtomicU32 = AtomicU32::new(0);
+
+/// The fate of the KMD's own registered pins after the transport sweep (`rm_client::forget`).
+pub(crate) fn last_sweep_fate() -> PinFate {
+    if LAST_SWEEP_LEAK.swap(0, Ordering::Relaxed) != 0 {
+        PinFate::Leak
+    } else {
+        PinFate::Unlock
+    }
 }
 
 /// Drop the live transport (if there is one) the safe way: tell the host to let go

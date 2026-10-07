@@ -1233,6 +1233,11 @@ pub mod knobs {
     /// production copy. Read at StartDevice in shadow mode only; mirrored as `CeShadowEach`.
     /// `docs/rm-copy-engine-present.md` section 14.
     pub const CE_SHADOW_EVERY: KnobName = KnobName::new(b"CeShadowEvery");
+    /// `CeRtDirect` (default 0): with `RmCopyEngine` = 1, submit a routed copy at its Present (the
+    /// GPU acquire on the record's value waits for the producer) instead of when the HPD worker
+    /// sees the producer's boundary ready. Read at StartDevice with the route on; mirrored as
+    /// `CeRtDirKnob`. `docs/rm-copy-engine-present.md` section 15.13.
+    pub const CE_RT_DIRECT: KnobName = KnobName::new(b"CeRtDirect");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");

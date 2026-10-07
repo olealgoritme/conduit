@@ -2152,6 +2152,12 @@ mod tests {
         // counter (`ce_shadow::EVERY_KNOB`).
         let knob = std::format!("KnobName::new(b\"{}\")", crate::ce_shadow::EVERY_KNOB);
         assert!(diag.contains(&knob));
-        assert!(!diag.replace(&knob, "").contains("b\"Ce"), "diag.rs spells a Ce counter name");
+        // So is the route's direct-submission knob (M3c-2, `ce_route::DIRECT_KNOB`).
+        let direct = std::format!("KnobName::new(b\"{}\")", crate::ce_route::DIRECT_KNOB);
+        assert!(diag.contains(&direct));
+        assert!(
+            !diag.replace(&knob, "").replace(&direct, "").contains("b\"Ce"),
+            "diag.rs spells a Ce counter name"
+        );
     }
 }

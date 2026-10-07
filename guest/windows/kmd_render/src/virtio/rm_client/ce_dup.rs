@@ -122,6 +122,48 @@ pub(crate) fn dup_map_record(
     Ok(Producer { sem_va, src_va })
 }
 
+/// The record's producer VAs if BOTH its dups are cached under the client table's generation
+/// `gen` (a pure lookup: no RM call, nothing made or given back), else `None`. The copy-engine
+/// route's direct submission at the Present (`CeRtDirect`), which must not do RM I/O; the caller
+/// holds the channel's `IO_BUSY`, so no slot is remade or given back meanwhile. Spinlock only.
+pub(crate) fn cached_producer(rec: &StashedCeRecord, gen: Gen, client_gen: u64) -> Option<Producer> {
+    let r = rec.record;
+    let (sem, src) = (r.semaphore, r.source);
+    let plan = cp::source_plan(gen, &source_desc(rec)).ok()?;
+    let sem_len = cd::semaphore_map_len(sem.offset)?;
+    let src_len = cd::source_map_len(src.size)?;
+    let mut c = CACHE.lock();
+    c.set_generation(client_gen);
+    let hit = |c: &mut cd::Cache, key: Key| match c.plan(&key) {
+        Plan::Hit(e) => Some(e.va),
+        Plan::Make { .. } => None,
+    };
+    let sem_map = hit(
+        &mut *c,
+        Key {
+            client: sem.h_client,
+            memory: sem.h_memory,
+            what: What::Semaphore,
+            kind: None,
+            len: sem_len,
+        },
+    )?;
+    let src_map = hit(
+        &mut *c,
+        Key {
+            client: src.h_client,
+            memory: src.h_memory,
+            what: What::Source,
+            kind: plan.page_kind,
+            len: src_len,
+        },
+    )?;
+    Some(Producer {
+        sem_va: sem_map.checked_add(sem.offset)?,
+        src_va: src_map.checked_add(plan.offset)?,
+    })
+}
+
 /// The record's image as `ce_present::source_plan` reads it.
 pub(crate) fn source_desc(rec: &StashedCeRecord) -> cp::SourceDesc {
     let src = rec.record.source;
@@ -180,7 +222,14 @@ pub(crate) fn is_cached(client: u32, memory: u32) -> bool {
 /// The mapping of `key`: the cached one, or a new dup + map in the slot the table picks (an
 /// evicted slot is given back first: its handles and window are reused).
 fn slot_for(io: &Io<'_>, h: &Handles, key: Key) -> Result<u64, Fail> {
-    let plan = CACHE.lock().plan(&key);
+    // A dup made before the client table last changed is never reused (`Cache::set_generation`):
+    // the number may name another process's client by now.
+    let gen = crate::virtio::nvrm_harden::client_generation();
+    let plan = {
+        let mut c = CACHE.lock();
+        c.set_generation(gen);
+        c.plan(&key)
+    };
     let slot = match plan {
         Plan::Hit(e) => return Ok(e.va),
         Plan::Make { slot, evict } => {
