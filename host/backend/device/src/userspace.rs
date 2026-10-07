@@ -893,9 +893,7 @@ pub fn soname(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Entry, FileKind, Resolved, loaded_driver_version, staged_driver_version,
-    };
+    use super::{Entry, FileKind, Resolved, loaded_driver_version, staged_driver_version};
     use std::collections::BTreeSet as TestSet;
 
     fn resolved(host_name: &str) -> Resolved {
@@ -979,10 +977,7 @@ mod tests {
             dotted_number("libcuda.so.595.99.02", 1),
             Some("595.99.02".into())
         );
-        assert_eq!(
-            dotted_number("libcuda.so.565.77", 1),
-            Some("565.77".into())
-        );
+        assert_eq!(dotted_number("libcuda.so.565.77", 1), Some("565.77".into()));
         assert_eq!(dotted_number("libcuda.so.1", 1), None);
     }
 

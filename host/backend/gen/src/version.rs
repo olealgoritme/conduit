@@ -78,14 +78,21 @@ pub struct ProcVersion {
 /// out of it. `gen/fixtures/proc_version.tsv` holds the lines this is tested
 /// on, and the guest module's C reader is tested on the same file.
 pub fn parse_proc_version(text: &str) -> Option<ProcVersion> {
-    let line = text
-        .lines()
-        .find_map(|l| l.strip_prefix("NVRM version:"))?;
+    let line = text.lines().find_map(|l| l.strip_prefix("NVRM version:"))?;
     let w: Vec<&str> = line.split_whitespace().collect();
     // [NVIDIA UNIX <arch> Kernel Module <version>] or
     // [NVIDIA UNIX Open Kernel Module for <arch> <version>]
     let (open, at) = match w.as_slice() {
-        ["NVIDIA", "UNIX", "Open", "Kernel", "Module", "for", _arch, ..] => (true, 7),
+        [
+            "NVIDIA",
+            "UNIX",
+            "Open",
+            "Kernel",
+            "Module",
+            "for",
+            _arch,
+            ..,
+        ] => (true, 7),
         ["NVIDIA", "UNIX", arch, "Kernel", "Module", ..] if *arch != "Open" => (false, 5),
         _ => return None,
     };
