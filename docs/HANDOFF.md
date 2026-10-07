@@ -12,6 +12,40 @@ next KMD steps) in
 [kmd-handoff-2026-10.md](../guest/windows/docs/kmd-handoff-2026-10.md); the test scripts in
 [guest/windows/ci/vmtest](../guest/windows/ci/vmtest/README.md).
 
+## State on 2026-10-07 evening (read this first)
+
+All work since the repo was recreated is on draft PRs; nothing below is on main
+yet. Driver packages are built from `build/driver-<ver>` branches that merge
+the PRs (tested: 344.1 … 349.1); the host build is `build/host-latency-stages`.
+Measure per stage (µs), not fps: `guest/windows/ci/vmtest/stages.sh` (PR #4).
+
+| PR | What | Hardware result |
+|---|---|---|
+| #1 | MSI-X, multi-GPU groundwork, DWM-restart census, RM transport fixes | works (344.1) |
+| #2 | **Copy-engine windowed Present on the KMD's own RM channel** (lane B) | smoke: copy 203 µs @28 GB/s, GPU acquire 219 µs p50 under Heaven, block-linear source + R/B remap at 100 % speed, 0 bad words; KMD channel self-test PASS (255 µs); records 28k/0 bad |
+| #3 | Independent flip (`IndepFlip`, UMD pacing fix) | full-screen flip model: 240 fps, OVERLAY, zero copies |
+| #4 | Frame stage timing (guest KMD + backend + venus, Perfetto) | joined per-frame tables |
+| #5 | Host round-trip fixes (quiet-held, fused-submit, direct-fences, event-batch; default on) | host 441.5 → 398 µs p50 with `backend.cpus 0-3,16-19` (MSI-X) |
+| #6 | NVK ZCULL for DXVK depth + reverse Z | host GPU time equals NVIDIA (0.109 vs 0.102, 0.070 vs 0.071 ms) |
+| #7 | `CopyQueue` (transfer queue / HIGH priority) | Heaven RGBA→BGRA copies need a blit → 100 % fallback; HIGH refused; superseded by #2's remap |
+| #8 | MSI-X breaker/latch tagged per build, false-conviction fix | survives driver updates and load |
+| #9 | NVK `queue_rm_fence_v3` + UMD HEF3 record (lane B) | record test PASS |
+| #10 | vsync_snap test fix (ready) | test-only |
+| #11 | Display submit staging pool + per-stage timers | submit→kick 121.7 → 21.1 µs p50 |
+
+Windowed Heaven D3D11 1600x900, per frame, p50 (349.1, MSI-X, pool on):
+producer wait (defer→submit) ~650 µs · GPU copy 234 µs (PCIe x8 write bound,
+fixed) · graphics-engine wait before the copy ~120 µs · submit→kick 21 µs ·
+IPC hops ~40 µs · irq→ISR 7 µs · total present→done ~1180 µs.
+
+Next (in progress): M3c-1 shadow mode (`RmCopyEngine=3`: dup NVK's semaphore
+and source per Present, CE copy into scratch, compare with production) and
+the doorbell rung after the virtio lock is released (#11); then M3c-2, the
+route (`RmCopyEngine=1`) with the presenting-process check on the record's
+clients (the record is app-written; refuse when unsure), Venus fallback,
+3 strikes. That removes the serial producer-wait → host-copy chain. After it:
+flip model for windowed games (MPO), Venus removal.
+
 ## Goal and the bar
 
 - The whole Windows 11 desktop and every app and game (D3D11, D3D12, OpenGL,
