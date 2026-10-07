@@ -14,6 +14,7 @@ mod mode;
 mod net;
 mod paths;
 mod power;
+mod protect;
 mod qemu;
 mod run;
 mod scope;

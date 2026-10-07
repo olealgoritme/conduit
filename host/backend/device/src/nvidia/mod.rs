@@ -362,6 +362,8 @@ pub struct NvidiaBackend {
     /// `crate::vram`. `Vram::new(None)` is no limit, which is what a VMM that
     /// never sets one gets.
     vram: crate::vram::Vram,
+    /// Ceilings on the timeouts a guest may forward (bounds.rs).
+    bounds: bounds::Bounds,
     /// Venus (docs/VENUS.md), with `--venus` only. `None`: `GpuCmd` is
     /// refused as an unknown message is.
     #[cfg(feature = "venus")]
@@ -384,20 +386,9 @@ struct LiveMap {
     length: u64,
 }
 
-/// `NvKmsIoctlCommand::NVKMS_IOCTL_REGISTER_SURFACE`, the one that names the
-/// memory it registers by a file descriptor. Its enum index moves between
-/// releases (nvkms-api.h): 16 in 535, 17 from 580 through 610, 16 again in
-/// 615. Read with the wrong index, the fd goes to the host untranslated, NVKMS
-/// fails the call (-EPERM) and NVIDIA's EGL crashes importing a dma-buf.
-fn nvkms_register_surface(v: Option<abi::version::DriverVersion>) -> u32 {
-    use abi::version::DriverVersion as V;
-    match v {
-        Some(v) if v >= V::new(580, 0, 0) && v < V::new(615, 0, 0) => 17,
-        _ => 16,
-    }
-}
-/// `NVKMS_IOCTL_QUERY_DISP`. Third in the enum since NVKMS's first release;
-/// the commands that moved (see above) all come after it.
+/// `NVKMS_IOCTL_QUERY_DISP`'s number, for tests that build one. The backend
+/// itself takes it from `abi::nvkms`.
+#[cfg(test)]
 const NVKMS_QUERY_DISP: u32 = 2;
 /// `sizeof(struct NvKmsQueryDispRequest)`: a device handle and a disp handle.
 /// The reply follows it and is the part whose size varies between releases.
@@ -438,6 +429,7 @@ impl NvidiaBackend {
             caps: crate::caps::Caps::DEFAULT,
             caps_refused: std::collections::BTreeMap::new(),
             vram: crate::vram::Vram::new(None),
+            bounds: bounds::Bounds::NORMAL,
             rmallow: None,
             uvm: None,
             osdesc: None,
@@ -531,6 +523,16 @@ impl NvidiaBackend {
         }
         self.vram = crate::vram::Vram::new(mib);
         Ok(())
+    }
+
+    /// Safe mode: the blocking timeouts a guest may forward shrink to
+    /// [`bounds::Bounds::SAFE`]. The caller also sets a video-memory limit.
+    pub fn set_safe_mode(&mut self, on: bool) {
+        self.bounds = if on {
+            bounds::Bounds::SAFE
+        } else {
+            bounds::Bounds::NORMAL
+        };
     }
 
     /// The budget this backend enforces, in MiB; 0 when there is none.
@@ -639,6 +641,7 @@ impl NvidiaBackend {
             .filter(|v| abi::uvm::select(*v).is_some_and(|s| s.exact))
             .filter(|v| abi::vidmem::select(*v).is_some_and(|s| s.exact))
             .filter(|v| abi::devinfo::select(*v).is_some_and(|s| s.exact))
+            .filter(|v| abi::nvkms::select(*v).is_some())
             .collect()
     }
 
@@ -672,6 +675,11 @@ impl NvidiaBackend {
         }
         if self.devinfo.is_some_and(|s| !s.exact) {
             out.push("GET_DEV_INFO layout");
+        }
+        // No nearest-older fallback: with no table of its own a release is
+        // served only ALLOC/FREE_DEVICE through NVKMS.
+        if self.driver.is_some_and(|v| abi::nvkms::select(v).is_none()) {
+            out.push("NVKMS command table");
         }
         out
     }
@@ -1130,6 +1138,7 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 }
 
 mod aperture;
+mod bounds;
 mod clipboard;
 mod fence;
 mod files;

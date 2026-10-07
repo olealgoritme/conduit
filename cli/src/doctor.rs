@@ -100,6 +100,144 @@ fn in_group(g: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The lines about this GPU's role on the host and whether a guest can be
+/// given its driver files: the display, BAR1, GSP firmware, the staged share.
+fn gpu_host_lines(r: &mut Report) {
+    if let Some(card) = crate::protect::nvidia_card(Path::new("/sys/class/drm")) {
+        if card.drives_display() {
+            let shown: Vec<&str> = card
+                .connectors
+                .iter()
+                .filter(|c| c.connected)
+                .map(|c| {
+                    c.name
+                        .trim_start_matches(|ch: char| ch != '-')
+                        .trim_start_matches('-')
+                })
+                .collect();
+            let cap = crate::protect::vram_limit_mib(
+                Path::new("/sys/class/drm"),
+                crate::config::vram_limit_mib(),
+            );
+            r.line(
+                Level::Warn,
+                "Display GPU",
+                &format!(
+                    "the NVIDIA GPU has a monitor connected ({}{}); a guest shares its memory with your desktop",
+                    shown.join(", "),
+                    if card.display_active() { ", in use" } else { "" }
+                ),
+                &format!(
+                    "{}\nFor a first run set CONDUIT_SAFE_MODE=1 (or: conduit config set gpu.safe_mode true):\na 2 GiB video-memory cap and 1 s limits on blocking GPU calls.",
+                    match cap {
+                        Some(m) => format!("Guests are capped at {m} MiB of video memory (conduit config set gpu.vram_limit_mib N|off to change)."),
+                        None => "No video-memory cap is set (gpu.vram_limit_mib is off): a guest can fill the card your desktop runs on.\nSet one: conduit config set gpu.vram_limit_mib auto".to_string(),
+                    }
+                ),
+            );
+        } else {
+            r.line(
+                Level::Ok,
+                "Display GPU",
+                "no monitor is connected to the NVIDIA GPU",
+                "",
+            );
+        }
+        match card.bar1_mib() {
+            Some(256) => r.line(
+                Level::Warn,
+                "BAR1",
+                "256 MiB (Resizable BAR is off): guest mappings of GPU memory go through a small window",
+                "Turn on Above 4G Decoding and Resizable BAR in the firmware settings for large guest workloads.",
+            ),
+            Some(m) => r.line(Level::Ok, "BAR1", &format!("{m} MiB"), ""),
+            None => {}
+        }
+    }
+    if std::fs::read_to_string("/proc/driver/nvidia/params").is_ok_and(|p| gpu_firmware_off(&p)) {
+        r.line(
+            Level::Warn,
+            "GPU firmware",
+            "NVreg_EnableGpuFirmware=0: the driver runs without the GSP firmware",
+            "Conduit's forwarding rules assume GSP firmware (the default on current GPUs). Remove\nthe NVreg_EnableGpuFirmware=0 module option.",
+        );
+    }
+    match crate::paths::Tool::Userspace.find() {
+        None => r.line(
+            Level::Warn,
+            "Driver files",
+            "conduit-userspace not found, so the files a guest needs were not checked",
+            "Reinstall the conduit package (in a source checkout: cargo build --release in host/backend)",
+        ),
+        Some(tool) => {
+            let out = std::process::Command::new(tool)
+                .args(["--caps", "graphics,video,utility,compute"])
+                .output();
+            let (lvl, detail, fix) = match out {
+                Ok(o) => staging_verdict(
+                    o.status.success(),
+                    &String::from_utf8_lossy(&o.stdout),
+                    &String::from_utf8_lossy(&o.stderr),
+                ),
+                Err(e) => (Level::Warn, format!("could not run conduit-userspace: {e}"), String::new()),
+            };
+            r.line(lvl, "Driver files", &detail, &fix);
+        }
+    }
+}
+
+/// Whether `/proc/driver/nvidia/params` shows GPU firmware switched off.
+fn gpu_firmware_off(params: &str) -> bool {
+    params.lines().any(|l| {
+        l.split_once(':')
+            .is_some_and(|(k, v)| k.trim() == "EnableGpuFirmware" && v.trim() == "0")
+    })
+}
+
+/// What `conduit-userspace` (plan only) says about staging the driver files:
+/// a failure when it cannot plan, a warning naming the files that are listed
+/// but not installed.
+fn staging_verdict(ok: bool, stdout: &str, stderr: &str) -> (Level, String, String) {
+    if !ok {
+        let why = stderr.lines().last().unwrap_or("").trim().to_string();
+        return (
+            Level::Fail,
+            format!("the driver files for a guest cannot be listed: {why}"),
+            "A VM cannot start without them. Install the driver's userspace packages for the\nloaded kernel module (same version), then run conduit doctor again.".into(),
+        );
+    }
+    let mut missing = Vec::new();
+    let mut in_missing = false;
+    for l in stdout.lines() {
+        if l.contains("listed but not installed") {
+            in_missing = true;
+        } else if in_missing && l.starts_with("  ") {
+            missing.push(l.trim().to_string());
+        } else {
+            in_missing = false;
+        }
+    }
+    let wanted = stdout
+        .lines()
+        .find(|l| l.contains("wanted here"))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if missing.is_empty() {
+        (
+            Level::Ok,
+            format!("ready to stage ({wanted})"),
+            String::new(),
+        )
+    } else {
+        (
+            Level::Warn,
+            format!("{wanted}; not installed here: {}", missing.join(", ")),
+            "Guests lack these. Install the matching driver packages if you need that feature\n(video decode, Wayland EGL...).".into(),
+        )
+    }
+}
+
 pub fn run() -> i32 {
     let mut r = Report { fails: 0, warns: 0 };
     println!("Checking this computer for Conduit…\n");
@@ -144,6 +282,10 @@ pub fn run() -> i32 {
             "/dev/nvidia-uvm is missing (CUDA in VMs will not work)",
             "Load it once: sudo modprobe nvidia-uvm   (or run nvidia-smi once)",
         );
+    }
+
+    if host::driver().is_some() {
+        gpu_host_lines(&mut r);
     }
 
     // Desktop
@@ -652,6 +794,36 @@ pub fn run_vm(name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firmware_off_is_read_from_the_params_file() {
+        assert!(gpu_firmware_off(
+            "ModifyDeviceFiles: 1\nEnableGpuFirmware: 0\n"
+        ));
+        assert!(!gpu_firmware_off("EnableGpuFirmware: 18\n"));
+        assert!(!gpu_firmware_off("EnableGpuFirmwareLogs: 0\n"));
+        assert!(!gpu_firmware_off(""));
+    }
+
+    #[test]
+    fn staging_verdict_fails_without_a_plan_and_names_what_is_missing() {
+        let (l, d, _) = staging_verdict(false, "", "Error: no driver manifest\n");
+        assert_eq!(l, Level::Fail);
+        assert!(d.contains("no driver manifest"), "{d}");
+        let ok = "40 entries in the file list, 38 wanted here, 500.0 MiB\n\n2 listed but not installed on this host:\n  libvdpau_nvidia.so.565.77 (lib)\n  10_nvidia_wayland.json (json)\n\nNothing written.\n";
+        let (l, d, _) = staging_verdict(true, ok, "");
+        assert_eq!(l, Level::Warn);
+        assert!(
+            d.contains("libvdpau_nvidia.so.565.77 (lib), 10_nvidia_wayland.json (json)"),
+            "{d}"
+        );
+        let (l, _, _) = staging_verdict(
+            true,
+            "40 entries in the file list, 40 wanted here, 1 MiB\n",
+            "",
+        );
+        assert_eq!(l, Level::Ok);
+    }
 
     fn drv(version: &str, open: bool) -> host::Driver {
         host::Driver {

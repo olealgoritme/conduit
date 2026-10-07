@@ -11,7 +11,7 @@
 # `conduit doctor`; tests in cli/ and the backend check it against both.
 set -eu
 GEN=${1:-$(dirname "$0")/../host/backend/gen/src}
-TABLES="rmctrl rmallow uvm vidmem devinfo"
+TABLES="rmctrl rmallow uvm vidmem devinfo nvkms"
 
 releases() {
     for f in "$GEN/$1"/v*_*_*.rs; do

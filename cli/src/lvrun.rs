@@ -636,6 +636,7 @@ pub fn backend_exec(name: &str) -> Result<()> {
             cmd.arg("--venus-guest-blobs");
         }
     }
+    crate::protect::apply(&mut cmd);
     // Unset or `auto`: the backend's own `auto` (the GPU's BAR1). QEMU asks
     // the backend for the size (GET_SHMEM_CONFIG), so there is nothing else
     // to tell, and the guest driver reads it from the device.

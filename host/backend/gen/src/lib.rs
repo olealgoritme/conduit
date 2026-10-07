@@ -8,6 +8,7 @@ pub mod devinfo;
 pub mod fixtures;
 pub mod ioctl;
 pub mod names;
+pub mod nvkms;
 pub mod osdesc;
 pub mod rmallow;
 pub mod rmctrl;

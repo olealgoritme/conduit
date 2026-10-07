@@ -11,7 +11,7 @@ Two sources, two kinds of table (see host/backend/gen/README.md):
       -> nvabi_gen.py      -> gen/src/versions/vX.rs
   open-gpu-kernel-modules release tags
       -> rmctrl_extract.py -> gen/src/rmctrl/vX.rs and guest/linux/rmctrl/vX.h
-      -> rmallow/uvm/osdesc/vidmem/devinfo_extract.py -> gen/src/<table>/vX.rs
+      -> rmallow/uvm/osdesc/vidmem/devinfo/nvkms_extract.py -> gen/src/<table>/vX.rs
       -> devinfo_extract.py --lang c -> guest/linux/devinfo/vX.h
       -> nvgpu_gen.py (newest release only) -> guest/linux/gen/
 
@@ -43,6 +43,7 @@ OGKM_TABLES = [
     ("osdesc", "osdesc_extract.py"),
     ("vidmem", "vidmem_extract.py"),
     ("devinfo", "devinfo_extract.py"),
+    ("nvkms", "nvkms_extract.py"),
 ]
 
 Version = tuple[int, int, int]
