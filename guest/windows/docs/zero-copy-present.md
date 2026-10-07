@@ -1797,7 +1797,7 @@ None of these is applied in this change; `HpdLongSite`, `HpdStep100N`, `VsGapFlg
 
 For the independent-flip probe S-0a of `independent-flip.md` (branch `kmd/independent-flip-design`): no rebuild per matrix
 row, and a read of the flip flags the driver ignores. Header facts are from WDK 10.0.26100.0, `d3dkmddi.h` under
-`/home/user/.local/share/conduit-dev/wdk-10.0.26100.0/` (not copied into the repo).
+`~/.local/share/conduit-dev/wdk-10.0.26100.0/` (not copied into the repo).
 
 ### 18.1 FlipCapsX: raw DXGK_FLIPCAPS bits OR'd into the reported word
 
