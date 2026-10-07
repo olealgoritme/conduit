@@ -1419,6 +1419,14 @@ pub const COUNTERS: &[&str] = &[
     "GdiDevN",
     "GdiCtxN",
     "GdiCtxFl",
+    // SubmitCommand on a GDI context: submissions, private records decoded, jobs claimed by
+    // context instead, the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16),
+    // SubmitCommand's UMD prefix size.
+    "GdiSubN",
+    "GdiPrvOk",
+    "GdiCtxClm",
+    "GdiPrvSz",
+    "GdiPrvUmd",
 ];
 
 #[cfg(test)]

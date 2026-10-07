@@ -1446,6 +1446,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         unsafe {
             gdi_job_seq(
                 adapter,
+                submit.hContext,
                 submit.pDmaBufferPrivateData,
                 submit.DmaBufferPrivateDataSize,
                 submit.DmaBufferUmdPrivateDataSize,
@@ -1529,7 +1530,13 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     // SAFETY: dxgkrnl's private range; the helper checks null and size.
     let gdi_seq = if !is_paging && crate::ddi::gdi_accel::on() {
         unsafe {
-            gdi_job_seq(adapter, submit.pDmaBufferPrivateData, submit.DmaBufferPrivateDataSize, 0)
+            gdi_job_seq(
+                adapter,
+                submit.__bindgen_anon_1.hContext,
+                submit.pDmaBufferPrivateData,
+                submit.DmaBufferPrivateDataSize,
+                0,
+            )
         }
     } else {
         None
@@ -1546,25 +1553,44 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     STATUS_SUCCESS
 }
 
-/// `GdiAccel`: the job a RenderKm buffer names in its private data (`gdi_accel::Private`, at
-/// the start of the KMD's half), admitted to the executor; `Some(seq)` gates the fence.
+/// `GdiAccel`: the job a RenderKm/RenderGdi buffer names in its private data
+/// (`gdi_accel::Private`, at the start of the KMD's half, or at 0), admitted to the executor;
+/// `Some(seq)` gates the fence. A submission on a GDI context without the record claims that
+/// context's oldest unclaimed job (`gdi_exec::oldest_unclaimed`).
 ///
 /// # Safety
 /// `data` is dxgkrnl's private data of `size` bytes, the KMD's half starting at `umd`.
-unsafe fn gdi_job_seq(adapter: &AdapterContext, data: *mut c_void, size: u32, umd: u32) -> Option<u64> {
-    if data.is_null() || size < umd {
-        return None;
+unsafe fn gdi_job_seq(
+    adapter: &AdapterContext,
+    h_context: HANDLE,
+    data: *mut c_void,
+    size: u32,
+    umd: u32,
+) -> Option<u64> {
+    use helios_kmd_logic::gdi_accel::{Private, PRIVATE_BYTES};
+    let gdi_ctx = crate::ddi::gdi_accel::is_gdi_context(h_context as usize);
+    let mut job = None;
+    // A UMD-written private prefix is never read as a GDI record (a user process could otherwise
+    // claim a GDI job): only the KMD's half, and offset 0 only on a GDI context.
+    if !data.is_null() && (gdi_ctx || umd == 0) {
+        for off in if gdi_ctx { [umd, 0] } else { [umd, umd] } {
+            if job.is_none() && size >= off && (size - off) as usize >= PRIVATE_BYTES {
+                // SAFETY: `[off, off + PRIVATE_BYTES)` lies inside the runtime's private range.
+                let bytes = unsafe { core::slice::from_raw_parts((data as *const u8).add(off as usize), PRIVATE_BYTES) };
+                job = Private::decode(bytes).map(|p| p.job);
+            }
+        }
     }
-    let len = (size - umd) as usize;
-    if len < helios_kmd_logic::gdi_accel::PRIVATE_BYTES {
-        return None;
+    let decoded = job.is_some();
+    let mut claimed = false;
+    if job.is_none() && gdi_ctx {
+        job = crate::ddi::gdi_exec::oldest_unclaimed(h_context as usize);
+        claimed = job.is_some();
     }
-    // SAFETY: `[umd, size)` of the runtime's private range is readable.
-    let bytes = unsafe {
-        core::slice::from_raw_parts((data as *const u8).add(umd as usize), helios_kmd_logic::gdi_accel::PRIVATE_BYTES)
-    };
-    let private = helios_kmd_logic::gdi_accel::Private::decode(bytes)?;
-    crate::ddi::gdi_exec::admit(adapter, private.job)
+    if gdi_ctx || decoded {
+        crate::ddi::gdi_accel::note_submit(size, umd, decoded, claimed);
+    }
+    crate::ddi::gdi_exec::admit(adapter, job?)
 }
 
 /// Cumulative count of pending WDDM fences discarded by a scheduler epoch —

@@ -48,6 +48,44 @@ static RG_IN: AtomicU32 = AtomicU32::new(0);
 static DEV_N: AtomicU32 = AtomicU32::new(0);
 static CTX_N: AtomicU32 = AtomicU32::new(0);
 static CTX_FLAGS: AtomicU32 = AtomicU32::new(0);
+/// Submissions on a GDI context (knob on), private records decoded there, jobs claimed by context
+/// instead (record missing), and the private sizes seen: RenderGdi/RenderKm's in the low 16 bits,
+/// SubmitCommand's in the high 16; SubmitCommand's UMD prefix size.
+static SUB_N: AtomicU32 = AtomicU32::new(0);
+static PRV_OK: AtomicU32 = AtomicU32::new(0);
+static CTX_CLAIM: AtomicU32 = AtomicU32::new(0);
+static PRV_SZ: AtomicU32 = AtomicU32::new(0);
+static PRV_UMD: AtomicU32 = AtomicU32::new(0);
+
+/// The GDI contexts alive (their `hContext` values), for SubmitCommand's by-context claim.
+const GDI_CTX_SLOTS: usize = 32;
+static GDI_CTX: [core::sync::atomic::AtomicUsize; GDI_CTX_SLOTS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; GDI_CTX_SLOTS];
+
+/// Is `h` a live GDI context. Lock-free, any IRQL.
+pub(crate) fn is_gdi_context(h: usize) -> bool {
+    h != 0 && GDI_CTX.iter().any(|s| s.load(Ordering::Acquire) == h)
+}
+
+/// DestroyContext: forget `h`. Atomics only.
+pub(crate) fn forget_context(h: usize) {
+    for s in GDI_CTX.iter() {
+        let _ = s.compare_exchange(h, 0, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
+/// SubmitCommand census (any IRQL; atomics).
+pub(crate) fn note_submit(private_size: u32, umd: u32, decoded: bool, claimed: bool) {
+    SUB_N.fetch_add(1, Ordering::Relaxed);
+    PRV_SZ.store((PRV_SZ.load(Ordering::Relaxed) & 0xffff) | (private_size.min(0xffff) << 16), Ordering::Relaxed);
+    PRV_UMD.store(umd, Ordering::Relaxed);
+    if decoded {
+        PRV_OK.fetch_add(1, Ordering::Relaxed);
+    }
+    if claimed {
+        CTX_CLAIM.fetch_add(1, Ordering::Relaxed);
+    }
+}
 static ROP_MASK: AtomicU32 = AtomicU32::new(0);
 pub(crate) static DROP: AtomicU32 = AtomicU32::new(0);
 pub(crate) static WHY: AtomicU32 = AtomicU32::new(0);
@@ -68,7 +106,10 @@ pub(crate) fn reported_caps(knob: u32) -> u32 {
 /// and with the knob on write the mirrors. With the knob off nothing is written.
 pub(crate) fn note_start(knob: u32) {
     let caps = ga::resolve_caps(knob);
-    for c in [&CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN] {
+    for c in [
+        &CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN, &SUB_N,
+        &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD,
+    ] {
         c.store(0, Ordering::Relaxed);
     }
     CAPS.store(caps.reported, Ordering::Relaxed);
@@ -105,6 +146,11 @@ pub(crate) fn publish_counters() {
     w(b"GdiDevN", DEV_N.load(Ordering::Relaxed));
     w(b"GdiCtxN", CTX_N.load(Ordering::Relaxed));
     w(b"GdiCtxFl", CTX_FLAGS.load(Ordering::Relaxed));
+    w(b"GdiSubN", SUB_N.load(Ordering::Relaxed));
+    w(b"GdiPrvOk", PRV_OK.load(Ordering::Relaxed));
+    w(b"GdiCtxClm", CTX_CLAIM.load(Ordering::Relaxed));
+    w(b"GdiPrvSz", PRV_SZ.load(Ordering::Relaxed));
+    w(b"GdiPrvUmd", PRV_UMD.load(Ordering::Relaxed));
     crate::ddi::gdi_exec::publish_counters();
 }
 
@@ -121,10 +167,15 @@ pub(crate) fn note_create_device(flags: u32) {
 
 /// `DxgkDdiCreateContext` (PASSIVE): `flags` is `DXGK_CREATECONTEXTFLAGS.Value`. Bit 1
 /// `GdiContext` (bit 2 `VirtualAddressing`: such a context gets `DxgkDdiRenderGdi`, not RenderKm).
-pub(crate) fn note_create_context(flags: u32) {
+pub(crate) fn note_create_context(flags: u32, h: usize) {
     if flags & 2 != 0 {
         CTX_N.fetch_add(1, Ordering::Relaxed);
         CTX_FLAGS.store(flags, Ordering::Relaxed);
+        for s in GDI_CTX.iter() {
+            if s.compare_exchange(0, h, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                break;
+            }
+        }
         if on() {
             crate::diag::record_named_bytes(b"GdiCtxN", CTX_N.load(Ordering::Relaxed));
             crate::diag::record_named_bytes(b"GdiCtxFl", flags);
@@ -403,7 +454,7 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
         0
     } else {
         let n_ops = ops.len() as u32;
-        let id = gx::commit(ops);
+        let id = gx::commit(ops, h_context as usize);
         if id == 0 {
             DROP.fetch_add(n_ops, Ordering::Relaxed);
             note_why(ga::Why::CpuFailed);
@@ -411,6 +462,7 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
         id
     };
     let rec = ga::Private { job }.encode();
+    PRV_SZ.store((PRV_SZ.load(Ordering::Relaxed) & !0xffff) | private_size.min(0xffff), Ordering::Relaxed);
     if !p_private.is_null() {
         let size = private_size as usize;
         // SAFETY: dxgkrnl's private data of `size` writable bytes.
