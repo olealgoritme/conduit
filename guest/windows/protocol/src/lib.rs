@@ -30,6 +30,7 @@ pub mod nvrm_scanout;
 pub mod onscanout;
 pub mod producer;
 pub mod rm_fence;
+pub mod rm_fence_v3;
 pub mod virtio_gpu;
 pub mod wddm;
 
@@ -43,5 +44,6 @@ pub use nvrm_scanout::*;
 pub use onscanout::*;
 pub use producer::*;
 pub use rm_fence::*;
+pub use rm_fence_v3::*;
 pub use virtio_gpu::*;
 pub use wddm::*;

@@ -31,6 +31,7 @@
 #ifndef HELIOS_ICD_INTERFACE_H
 #define HELIOS_ICD_INTERFACE_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 
@@ -40,8 +41,9 @@ extern "C" {
 
 #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
 /* The export keeps its name; version 3 only appends entries (and caps 4..6),
- * version 4 appends memory_res_plane1 (and cap 8). */
-#define HELIOS_ICD_INTERFACE_VERSION 5u
+ * version 4 appends memory_res_plane1 (and cap 8), version 5 scanout_frame,
+ * version 6 queue_rm_fence_v3. */
+#define HELIOS_ICD_INTERFACE_VERSION 6u
 
 enum helios_icd_backend {
    HELIOS_ICD_BACKEND_VENUS = 1,
@@ -162,6 +164,52 @@ struct helios_icd_plane {
    uint32_t offset;   /* bytes from the start of the object */
 };
 
+/* ---- queue_rm_fence_v3 (version 6) ---------------------------------------
+ * What the KMD's copy-engine route needs for a composed (windowed Blt)
+ * Present: where the producer's timeline semaphore lives and which value the
+ * frame's work releases, and the presented image's RM memory and layout
+ * (guest/windows/docs/rm-copy-engine-present.md, sections 10 and 12). The
+ * same bytes as HeliosRmSemaphoreLoc / HeliosRmCopySource of
+ * protocol/include/helios_rm_fence.h (the 'HEF3' record behind a present
+ * marker's fence tail); the UMD wraps them in that record. Handles are RM
+ * handles of the ICD's own RM client. */
+struct helios_icd_rm_semaphore {
+   uint32_t h_client; /* the RM client the semaphore memory belongs to */
+   uint32_t h_memory; /* the memory behind the timeline's semaphore surface */
+   uint64_t offset;   /* bytes to the 64-bit value; 8-aligned */
+   uint64_t value;    /* the value the frame's work releases (the fence's) */
+};
+struct helios_icd_rm_source {
+   uint32_t h_client; /* the RM client the image memory belongs to */
+   uint32_t h_memory; /* the image's dedicated memory */
+   uint64_t offset;   /* plane 0 offset, bytes */
+   uint64_t size;     /* bytes of the memory object */
+   uint64_t modifier; /* DRM_FORMAT_MOD_* (LINEAR or the GB20x family | h) */
+   uint32_t pitch;    /* row pitch, bytes */
+   uint32_t width;
+   uint32_t height;
+   uint32_t fourcc;   /* DRM_FORMAT_*, one plane */
+   uint32_t flags;    /* 0 (a compressed image gets no record at all) */
+   uint32_t reserved; /* 0 */
+};
+struct helios_icd_rm_copy {
+   struct helios_icd_rm_semaphore semaphore;
+   struct helios_icd_rm_source source;
+};
+#if defined(__cplusplus)
+static_assert(sizeof(helios_icd_rm_semaphore) == 24, "rm semaphore");
+static_assert(sizeof(helios_icd_rm_source) == 56, "rm source");
+static_assert(offsetof(helios_icd_rm_source, pitch) == 32, "rm source pitch");
+static_assert(sizeof(helios_icd_rm_copy) == 80, "rm copy");
+static_assert(offsetof(helios_icd_rm_copy, source) == 24, "rm copy source");
+#else
+_Static_assert(sizeof(struct helios_icd_rm_semaphore) == 24, "rm semaphore");
+_Static_assert(sizeof(struct helios_icd_rm_source) == 56, "rm source");
+_Static_assert(offsetof(struct helios_icd_rm_source, pitch) == 32, "rm source pitch");
+_Static_assert(sizeof(struct helios_icd_rm_copy) == 80, "rm copy");
+_Static_assert(offsetof(struct helios_icd_rm_copy, source) == 24, "rm copy source");
+#endif
+
 struct helios_icd_api {
    uint32_t version; /* HELIOS_ICD_INTERFACE_VERSION */
    uint32_t size;    /* sizeof(struct helios_icd_api) the ICD filled */
@@ -249,6 +297,27 @@ struct helios_icd_api {
     * was minted by a live KMD source. */
    VkResult (*scanout_frame)(VkDevice device, VkDeviceMemory memory,
                              uint64_t *sequence, uint32_t *generation);
+
+   /* ---- version 6 (size covers it; NULL = not supported) ----------------
+    * queue_rm_fence, plus what a copy engine needs to copy `image` (bound
+    * at offset 0 of its dedicated `memory`) once the fence's value landed:
+    * *copy (struct above). The same rules as queue_rm_fence for the queue
+    * and the fence:
+    *   VK_SUCCESS     *fence_handle is the caller's, *copy filled
+    *                  (copy->semaphore.value == *value);
+    *   VK_INCOMPLETE  *fence_handle is the caller's, *copy all zero: the
+    *                  image cannot be described (not a dedicated one-plane
+    *                  2D image of a shared format, compressed, a layout
+    *                  helios_icd_layout cannot express); send the fence
+    *                  without the record;
+    *   an error       no fence (VK_ERROR_FEATURE_NOT_PRESENT: no RM fences
+    *                  here, wait on the CPU as before).
+    * `value` may be NULL. The record is a hint for the KMD's copy-engine
+    * route; whether the KMD reads it is the UMD's business (QueryCaps). */
+   VkResult (*queue_rm_fence_v3)(VkDevice device, VkQueue queue,
+                                 VkDeviceMemory memory, VkImage image,
+                                 uint32_t *fence_handle, uint64_t *value,
+                                 struct helios_icd_rm_copy *copy);
 };
 
 typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);

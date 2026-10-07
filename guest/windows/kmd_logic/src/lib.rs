@@ -62,6 +62,7 @@ pub mod onscanout;
 pub mod blt_async;
 pub mod guest_blob;
 pub mod copy_queue;
+pub mod ce_present;
 pub mod msi;
 pub mod paging;
 pub mod shared_placeholder;
