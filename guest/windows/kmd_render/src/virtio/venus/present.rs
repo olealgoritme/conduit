@@ -341,6 +341,20 @@ impl PreparedPresentBltSubmission {
     pub(crate) fn guest_target(&self) -> bool {
         self.guest
     }
+
+    /// A submission with NO recorded command (`RedirVram`, docs/vram-redirection.md 5.3: the copy
+    /// engine is the only copy of a Blt into a VRAM surface Venus could not import). Its
+    /// validation always fails (no cache entry has this command or destination 0), so a fallback
+    /// submit is refused and the request terminalizes as failed: the destination keeps its
+    /// previous frame and the Present's fence retires.
+    pub(crate) fn none(destination: PresentDestinationDesc) -> Option<Self> {
+        Some(Self {
+            command_buffer_id: VkCommandBufferId::from_raw(u64::MAX)?,
+            destination,
+            cache_destination: 0,
+            guest: false,
+        })
+    }
 }
 
 impl PreparedPresentBlt {

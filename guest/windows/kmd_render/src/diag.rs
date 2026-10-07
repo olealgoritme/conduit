@@ -1136,6 +1136,10 @@ pub mod knobs {
     /// the other `AdapterKnobs` at AddAdapter and StartDevice; mirrored as `VmCapsXEff` and
     /// `VmCapsRep` at every start.
     pub const VIDMM_CAPS_EXTRA: KnobName = KnobName::new(b"VidMmCapsX");
+    /// GPU-only GDI surfaces from RM video memory, the redirected Blt into them on the copy
+    /// engine, CPU readers and writers through a bounce buffer (default 0 = off; 1 = on).
+    /// `helios_kmd_logic::rm_vidmem`, `docs/vram-redirection.md` 5.3-5.6. Read at StartDevice.
+    pub const REDIR_VRAM: KnobName = KnobName::new(b"RedirVram");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,

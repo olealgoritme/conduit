@@ -933,6 +933,121 @@ pub(crate) unsafe fn mirror_present_system_backing(
     Some(ok)
 }
 
+/// `RedirVram` (docs/vram-redirection.md 5.6): copy `out.len()` bytes from offset `offset` of the
+/// KMD standard buffer `resource_id`'s AUTHORITATIVE CPU view into `out`: the system pages VidMm
+/// holds while it has leases that are current (the system copy is not marked invalid), the Venus
+/// blob otherwise. Under the content transaction (no paging operation changes the leases
+/// meanwhile). `false`: the view could not be read whole (partial leases, a map failure).
+/// PASSIVE, no lock held.
+pub(crate) fn read_standard_buffer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    offset: u64,
+    out: &mut [u8],
+) -> bool {
+    let Some(guard) = adapter.system_backings.serialize(passive) else {
+        return false;
+    };
+    let want_end = offset.saturating_add(out.len() as u64);
+    if !guard.system_copy_invalid(resource_id) {
+        if let Some(snapshot) = guard.snapshot(resource_id) {
+            let Some(reader) = snapshot.reader() else {
+                return false;
+            };
+            let mut runs = alloc::vec::Vec::new();
+            let mut vas = alloc::vec::Vec::new();
+            if !reader.runs(&mut runs, &mut vas) {
+                return false;
+            }
+            let mut covered = 0u64;
+            for (&(run_off, run_len), &va) in runs.iter().zip(vas.iter()) {
+                let start = run_off.max(offset);
+                let end = run_off.saturating_add(run_len).min(want_end);
+                if start >= end {
+                    continue;
+                }
+                // SAFETY: `[start, end)` lies inside this lease (`run_off..run_off + run_len`,
+                // mapped at `va` while `reader` lives) and inside `out` (`offset..want_end`).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        va.add((start - run_off) as usize),
+                        out.as_mut_ptr().add((start - offset) as usize),
+                        (end - start) as usize,
+                    );
+                }
+                covered += end - start;
+            }
+            return covered == out.len() as u64;
+        }
+    }
+    let mut ok = false;
+    // SAFETY: PASSIVE; the content transaction is held for the whole copy.
+    let mapped = unsafe {
+        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
+            if want_end <= len {
+                // SAFETY: `[offset, want_end)` is inside the mapped blob (`len` bytes).
+                core::ptr::copy_nonoverlapping(blob.add(offset as usize), out.as_mut_ptr(), out.len());
+                ok = true;
+            }
+        })
+    };
+    mapped && ok
+}
+
+/// `RedirVram` (docs/vram-redirection.md 5.6): write `rows` rows of `row_bytes` bytes (packed in
+/// `data`) at `offset` with stride `pitch` into the KMD standard buffer `resource_id`: into its
+/// Venus blob, then, when VidMm holds it in system pages, the same byte range mirrored into those
+/// pages (the order of the Present's CPU mirror, `mirror_present_system_backing`). Under the content
+/// transaction. PASSIVE, no lock held.
+pub(crate) fn write_standard_buffer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    offset: u64,
+    pitch: u32,
+    row_bytes: u32,
+    rows: u32,
+    data: &[u8],
+) -> bool {
+    let pitch64 = u64::from(pitch);
+    let row = u64::from(row_bytes);
+    if rows == 0 || row > pitch64 || (data.len() as u64) < row * u64::from(rows) {
+        return false;
+    }
+    let span = pitch64 * u64::from(rows - 1) + row;
+    let Some(end) = offset.checked_add(span) else {
+        return false;
+    };
+    let Some(guard) = adapter.system_backings.serialize(passive) else {
+        return false;
+    };
+    let snapshot = guard.snapshot(resource_id);
+    let mut ok = false;
+    // SAFETY: PASSIVE; the content transaction is held for the whole copy.
+    let mapped = unsafe {
+        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
+            if end > len {
+                return;
+            }
+            for y in 0..u64::from(rows) {
+                // SAFETY: row `y` ends at or before `end <= len`; `data` holds `rows` packed rows.
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr().add((y * row) as usize),
+                    blob.add((offset + y * pitch64) as usize),
+                    row as usize,
+                );
+            }
+            ok = match &snapshot {
+                // SAFETY: the leases stay alive through `snapshot`, the guard excludes paging.
+                Some(s) => s.copy_blob_range(blob, len, offset, span),
+                None => true,
+            };
+        })
+    };
+    mapped && ok
+}
+
 /// WDDM 2.x `VIRTUAL_TRANSFER` for a Helios blob allocation.
 ///
 /// The allocation handle, direction, VAs, size, and the leaf PTEs resolving the
