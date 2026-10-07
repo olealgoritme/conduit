@@ -1160,6 +1160,7 @@ full zero block once per generation even if nothing is ever seen.
 | `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
 | `SubmitPool`, `SubStageClk` (24.14) | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `SubPoolOn`, `SubClkOn` (every start) |
+| `SubKickUnlock` (24.14.10) | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` (`KickState`) | `SubKickUnl` (every init; 1 only with the doorbell located) |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `VsPowerMode`, `VsWatchdog`, `VsIdleWake`, `VsWdTimer` (15.4, 19.3) | StartDevice (`stall_diag::reread_knobs`) | static | `VsPwrEff`, `VsWdgEff`, `VsIdlEff`, `VsWdTmEff` (every start, 0 included) |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
@@ -3622,6 +3623,80 @@ for the clock's own cost inside the lock.
   generation (its notify BAR mapping) alive across the release against a concurrent StopDevice, so it is a separate, reviewed
   change, not part of this one. Expected after it: both the flip and the Blt pay their own kick (about 18 us) and never each
   other's.
+
+#### 24.14.10 The doorbell after the lock (`SubKickUnlock`)
+
+24.14.9 read the flip's regression as a wait on `virtio_lock` while another submitter rang its doorbell. `PciTransport::notify`
+makes three MMIO accesses, each a VM exit: it writes `queue_select` and reads `queue_notify_off` in the shared common
+configuration, then writes the notify register. Because of those first two accesses it may only run under the lock. The doorbell
+is now rung after the release, in the one place every display submitter and the pipelined flip share
+(`ctrl::display_enqueue`, deciding through `VirtioGpu::publish_then_notify`). It is a single MMIO write to the control queue's
+notify register, which is located once at transport init (`gpu/mod.rs` `locate_ctrl_doorbell`: the NOTIFY_CFG and COMMON_CFG
+capabilities, mapped with their own lengths so the MMIO cache returns the transport's own mappings). The pure rules and
+their model tests are in `kmd_logic::kick_defer`.
+
+**The ordering, for one submit that rings late.**
+
+1. Descriptors and the avail ring slot are written under `virtio_lock`.
+2. The avail index is stored with Release.
+3. A **full fence** follows, then the suppression check (`VIRTQ_USED_F_NO_NOTIFY` or the event index), still under the lock.
+   This is virtio 1.x 2.7.13.3 and Linux `virtqueue_kick_prepare`. Release/Acquire does not order a store before a later
+   load. Without the fence, the check could read a stale "do not notify" from before the index store, and the wake of a
+   device that had just re-enabled notifications and found the old index would be lost.
+4. If a notify is owed, the guard's pending count is incremented (`kick_defer::begin`) and the hold's owed slot is set.
+5. The lock is released.
+6. The guard is checked (`may_ring`). The doorbell is written, or the kick is dropped if the transport is closing.
+7. The pending count is decremented (`end`), strictly after the write.
+
+**Two submitters.** Notifications carry no payload for a split ring, so a doorbell after the last publish covers every
+earlier one. If A and B both owe a ring, either may ring first. Each ring comes after its own publish, and the later ring
+comes after both publishes. A hold that publishes twice owes one ring. The model test explores every interleaving of two
+submitters with the device's "enable notifications, then re-check" loop and finds no lost wake. The same model with the check
+moved before the index store, which is what a missing fence permits, does lose one. That proves the model can see the bug.
+
+**Teardown.** `VirtioGpu::drop` first closes the guard (`close`). Then it waits, bounded (spins, then up to 8 sleeps of about
+16 ms), for the pending count to drain. Only then does it reset the device and free the state. A late kick that finds the
+guard closed is dropped (`SubKickDrop`): the device is reset next and nothing published will be answered. If a kicker
+stalls past the budget, the state is leaked rather than freed (`SubKickLeak`). The kicker's `end` then touches live memory,
+and its doorbell is a write to the transport's notify register. That register stays mapped until driver unload (BAR
+mappings are cached for the driver's lifetime, see `Drop`), so a late write reaches a reset queue, which ignores it.
+
+**Unchanged.** Every staging-buffer lifetime rule (24.14.3), the per-path counters, and every other `with_virtio` caller:
+those never arm the late ring, so they ring under the lock as before. With the knob at 0 the old block runs exactly, without
+the new fence. That pre-existing missing fence is also present in the locked path; this change does not touch it, so that
+0 stays the old behaviour.
+
+**Knob.** `SubKickUnlock` (REG_DWORD, default 1; `diag::knobs::SUBMIT_KICK_UNLOCK`; the requested `SubKickUnlocked` is 15 bytes
+and would not survive the 14-byte lookup buffer). It is read at every transport init and mirrored as `SubKickUnl`, which is
+1 only when the doorbell was also located; otherwise the setting in force is "locked".
+
+**Counters** (`kmd_logic::kick_defer::COUNTERS`, written by `virtio/ctrl.rs` at most once a second after a late ring):
+
+* `SubKickLate`: doorbells rung after the release.
+* `SubKickDrop`: kicks dropped by a closing transport.
+* `SubKickGap`: microseconds in all from the publish to the doorbell write (rest of the hold, release, ring; only with
+  `SubStageClk` 1).
+* `SubKickWait` / `SubKickLeak`: teardowns that waited for a pending kick / that gave up waiting and leaked the state. These
+  are written on the next late ring after the restart.
+
+**What to read on hardware** (Heaven windowed; `SubKickUnlock=0` first, then 1, same boot):
+
+* `SubKickUnl` is 1, and `SubKickLate` grows with `SubNWin + SubNBlt + SubNScan + SubNPres + SubFN` (minus suppressed
+  notifies). `SubKickDrop` and `SubKickLeak` stay 0 outside a restart.
+* `SubWKick / SubWN` and `SubFKick / SubFN` drop from about 18 us to the cost of one MMIO write (one exit, expected about a
+  third of the old cost), and that time is now spent outside the lock.
+* `SubFLock / SubFN` falls to about 0-2 us, because nobody holds the lock across a doorbell any more. `SubWLock` falls the
+  same way.
+* In the joined table, the flip's submit -> kick returns to about 20 us or less, and the windowed Blt's falls below its 21 us.
+* `SubKickGap / SubKickLate` is a few us (the tail of the hold plus the release). If it grows to tens of us, the submitter is
+  being preempted between the release and the ring.
+* With `SubKickUnlock=0` every number is as in 24.14.9.
+
+**Risks.** The doorbell location duplicates `pci_caps.rs`'s capability walk inside `gpu/mod.rs`, so this change stays in the
+transport. Move it into `pci_caps.rs` after the merge. If the doorbell cannot be located exactly, the knob degrades to the
+locked path and `SubKickUnl` reads 0. A late doorbell can reach the device after a later submitter's locked doorbell, which
+is harmless (an extra notify). Teardown can wait up to about 130 ms if a kicker is preempted inside its window, and is
+otherwise unchanged.
 
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
