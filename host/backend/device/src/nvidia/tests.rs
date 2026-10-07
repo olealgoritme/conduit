@@ -57,6 +57,25 @@ mod abi_tests {
         assert!(b.abi.is_some(), "580.178.04 must select a profile");
     }
 
+    /// The closed 565.77 module answers CHECK_VERSION_STR with "565.77", two
+    /// parts. It must still select every table, each its own.
+    #[test]
+    fn learns_a_two_part_release_and_every_table_is_its_own() {
+        let mut b = backend();
+        let mut reply = vec![0u8; 72];
+        reply[4] = 1;
+        reply[8..14].copy_from_slice(b"565.77");
+        b.learn_driver_version(&reply);
+        assert_eq!(b.driver, Some(abi::version::DriverVersion::new(565, 77, 0)));
+        assert!(b.abi.is_some());
+        assert!(b.inexact_tables().is_empty(), "{:?}", b.inexact_tables());
+        assert!(b.osdesc.is_some());
+        assert!(
+            NvidiaBackend::accepted_releases()
+                .contains(&abi::version::DriverVersion::new(565, 77, 0))
+        );
+    }
+
     /// The property the tables exist for: an escape nobody described does not
     /// reach the host driver. This is the check that was a log line until the
     /// question was asked in public.

@@ -80,9 +80,14 @@ pub const LOADED_VERSION_PATH: &str = "/proc/driver/nvidia/version";
 /// to stage one for a guest.
 pub fn loaded_driver_version(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    // Deliberately not anchored to "NVRM version:" -- the line has been
+    // The NVRM line first, where a two-part release (`565.77`) is a version:
+    // the GCC line under it has a three-part number that would win otherwise.
+    // Failing that, any line with a three-part number -- the line has been
     // reworded across releases, while the dotted version on it has not.
-    text.lines().find_map(version_in)
+    text.lines()
+        .find(|l| l.contains("NVRM"))
+        .and_then(|l| dotted_number(l, 1))
+        .or_else(|| text.lines().find_map(version_in))
 }
 
 /// The driver version the resolved files belong to, taken from the library
@@ -98,7 +103,7 @@ pub fn staged_driver_version(found: &[Resolved]) -> Option<String> {
         if let Some(v) = r
             .host_path
             .file_name()
-            .and_then(|n| version_in(&n.to_string_lossy()))
+            .and_then(|n| dotted_number(&n.to_string_lossy(), 1))
         {
             *counts.entry(v).or_default() += 1;
         }
@@ -115,6 +120,14 @@ pub fn staged_driver_version(found: &[Resolved]) -> Option<String> {
 /// is digits. Written out rather than pulled from a regex crate: this crate
 /// carries no such dependency, and the shape is fixed.
 fn version_in(s: &str) -> Option<String> {
+    dotted_number(s, 2)
+}
+
+/// The first dotted number in `s` with at least `min_dots` dots, every
+/// component digits. One dot is a two-part release (`565.77`); a file named
+/// for it (`libcuda.so.565.77`) is the only place a staged share shows its
+/// version.
+fn dotted_number(s: &str, min_dots: usize) -> Option<String> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -134,7 +147,7 @@ fn version_in(s: &str) -> Option<String> {
             }
             i += 1;
         }
-        if dots >= 2 {
+        if dots >= min_dots {
             return Some(s[start..i].to_string());
         }
         while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -823,6 +836,27 @@ mod tests {
         );
         assert_eq!(version_in("libcuda.so.595.99.02"), Some("595.99.02".into()));
         assert_eq!(version_in("no digits here"), None);
+    }
+
+    #[test]
+    fn a_two_part_release_is_the_loaded_and_the_staged_version() {
+        let dir = std::env::temp_dir().join(format!("nvgpu-ver2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("version");
+        std::fs::write(
+            &p,
+            "NVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77  Wed Oct 23 12:00:00 UTC 2024\n\
+             GCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n",
+        )
+        .unwrap();
+        assert_eq!(loaded_driver_version(&p).as_deref(), Some("565.77"));
+        std::fs::remove_dir_all(&dir).ok();
+        let found = [
+            resolved("libcuda.so.565.77"),
+            resolved("libnvidia-eglcore.so.565.77"),
+            resolved("libnvidia-egl-wayland.so.1.1.21"),
+        ];
+        assert_eq!(staged_driver_version(&found).as_deref(), Some("565.77"));
     }
 
     #[test]

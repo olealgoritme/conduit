@@ -15,7 +15,8 @@ use std::path::Path;
 /// Where a loaded NVIDIA kernel module publishes itself.
 pub const PROC_NVIDIA: &str = "/proc/driver/nvidia";
 
-/// The loaded driver's version, e.g. `615.71.09`.
+/// The loaded driver's version, e.g. `615.71.09` or, for a release NVIDIA
+/// numbers with two parts, `565.77`.
 ///
 /// Returns `None` when no NVIDIA module is loaded, which is a normal state for
 /// a host that has not yet had one inserted -- not an error to propagate.
@@ -24,13 +25,15 @@ pub fn driver_version(root: &Path) -> Option<String> {
     // "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09 ..."
     // Matched by shape rather than by position: the words around it differ
     // between the open and proprietary modules, and have changed before.
-    text.split_whitespace()
+    // Only the NVRM line: the GCC line under it carries a dotted number too,
+    // and a two-part release would otherwise lose to it.
+    let line = text.lines().find(|l| l.starts_with("NVRM version:"))?;
+    line.split_whitespace()
         .find(|w| {
-            let mut parts = w.split('.');
-            let ok = |p: Option<&str>| {
-                p.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            };
-            ok(parts.next()) && ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+            let n = w.split('.').count();
+            (2..=3).contains(&n)
+                && w.split('.')
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
         })
         .map(str::to_string)
 }
@@ -119,6 +122,17 @@ mod tests {
             "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.178.04  Tue Jul  7 12:18:12 UTC 2026\n",
         )]);
         assert_eq!(driver_version(f.path()).as_deref(), Some("580.178.04"));
+    }
+
+    /// The closed 565.77 module: a two-part release, and a GCC line under it
+    /// whose three-part number must not be taken for the driver.
+    #[test]
+    fn reads_a_two_part_release() {
+        let f = Fixture::new(&[(
+            "version",
+            "NVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77  Wed Oct 23 12:00:00 UTC 2024\nGCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n",
+        )]);
+        assert_eq!(driver_version(f.path()).as_deref(), Some("565.77"));
     }
 
     #[test]
