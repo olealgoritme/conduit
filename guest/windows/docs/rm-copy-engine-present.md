@@ -807,6 +807,12 @@ How the KMD learns the value advanced, two ways, both reading the CPU mapping of
    dup'd a pitch source of its own process).
 7. Compressed sources (GB20x compressible kinds): refused by the route (`source_plan`) until a tool proves them.
 8. The doorbell store from kernel mode through window region 1 (the tool stored from user mode).
+9. The copy engine's REMAP unit (`SET_REMAP_CONST_A/B`, `SET_REMAP_COMPONENTS`, `LAUNCH_DMA.REMAP_ENABLE`;
+   `ce_present::Remap`, section 12). The fields are identical in Mesa's `clcab5.h`, Mesa's `clc7b5.h` and the 610.57.04
+   `clc7b5.h`; the 610.57.04 `clcab5.h` omits them, so 0xcab5 rests on Mesa's header alone. Ada (0xc7b5) is UNVERIFIED on
+   hardware (no Ada GPU has run the tool), not because its header differs. Also unverified on both: REMAP together with a
+   block-linear source (the open question of 12.3), and which byte of `SET_REMAP_CONST_A` a 1-byte component takes (the
+   route sends 0xffffffff, so every byte is 0xff either way).
 
 ### 11.8 Work list
 

@@ -7,9 +7,14 @@
 //!
 //! * [`Gen`], [`Push`] and the emitters: the per-Present push buffer. Host-class semaphore ACQUIRE
 //!   of the producer's value, the copy engine's copy (pitch-linear or block-linear source,
-//!   pitch-linear destination), host-class RELEASE of the KMD's completion value, optional
+//!   pitch-linear destination; [`copy`] also writes a block-linear destination, which the tool's
+//!   round trip uses), host-class RELEASE of the KMD's completion value, optional
 //!   `NON_STALL_INTERRUPT`. The pitch-linear words are the ones `crm_ce_copy_smoke` PASSed with on
 //!   a GB202 (tests `*_reproduces_the_tool_*`); the block-linear words are host-tested only.
+//! * [`Remap`], [`remap_for`]: format conversion inside the copy with the copy engine's REMAP
+//!   unit (the windowed source is RGBA, the Blt destination BGRA: `rm-copy-engine-present.md` 12).
+//!   Host-tested only; whether REMAP works with a block-linear source is the open question the
+//!   tool's `--remap swap-rb --bl-src-only` answers.
 //! * [`gp_entry`], [`Ring`], [`Token`], the USERD and doorbell offsets: submission.
 //! * [`source_plan`]: is the producer's image a source this route copies (reusing the foreign
 //!   layout rules of [`crate::foreign_resource::Layout`], the KMD's one modifier decoder).
@@ -29,6 +34,8 @@
 //! | `LAUNCH_DMA` `DATA_TRANSFER_TYPE` 1:0, `FLUSH_ENABLE` 2, `SEMAPHORE_TYPE` 4:3, `SRC/DST_MEMORY_LAYOUT` 7/8 (`BLOCKLINEAR` 0, `PITCH` 1), `MULTI_LINE_ENABLE` 9 | | the same three | |
 //! | CE `SET_SRC_BLOCK_SIZE` 0x728 (`WIDTH` 3:0, `HEIGHT` 7:4, `DEPTH` 11:8, `GOB_HEIGHT` 15:12 = `FERMI_8` 1), `SET_SRC_WIDTH/HEIGHT/DEPTH/LAYER` 0x72c..0x738, `SRC_ORIGIN_X/Y` 0x744/0x748 | | `clc7b5.h` both, Mesa `clcab5.h` | 0xcab5 against 610.57.04 (its `clcab5.h` omits them) |
 //! | `SET_SRC_BLOCK_SIZE.KIND_BPP` 17:16 (`BL_32` 0, `BL_8` 1, `BL_16` 2) | | Mesa `clcab5.h` only | 610.57.04; 0xc7b5 has no such field |
+//! | CE `SET_DST_BLOCK_SIZE` 0x70c (fields as the source's), `SET_DST_WIDTH/HEIGHT/DEPTH/LAYER` 0x710..0x71c, `DST_ORIGIN_X/Y` 0x74c/0x750 | | as the source's | as the source's |
+//! | CE `SET_REMAP_CONST_A/B` 0x700/0x704, `SET_REMAP_COMPONENTS` 0x708 (`DST_X` 2:0, `DST_Y` 6:4, `DST_Z` 10:8, `DST_W` 14:12: `SRC_X..SRC_W` 0..3, `CONST_A` 4, `CONST_B` 5, `NO_WRITE` 6; `COMPONENT_SIZE` 17:16, `NUM_SRC_COMPONENTS` 21:20, `NUM_DST_COMPONENTS` 25:24, each `n - 1`), `LAUNCH_DMA.REMAP_ENABLE` 10 | | `clc7b5.h` (Mesa and 610.57.04), Mesa `clcab5.h` | 0xcab5 against 610.57.04 (its `clcab5.h` omits them); hardware on both |
 //! | GPFIFO entry `GET` 31:2, `GET_HI` 7:0, `LENGTH` 30:10 | | `clc56f.h` both, `clca6f.h` both | |
 //! | USERD `GP_GET` 0x88, `GP_PUT` 0x8c; doorbell `NOTIFY_CHANNEL_PENDING` 0x90 | | nvk-rm patch 0002, `clc361.h` | |
 //! | work-submit token: runlist 22:16, channel id 11:0 | | 610.57.04 `dev_vm.h` (GB202), `dev_ctrl.h` (GA100) | |
@@ -38,14 +45,24 @@
 //! `gob_height = FERMI_8` and on 0xcab5 `kind_bpp`; `SET_SRC_WIDTH = pitch` in bytes (the copy
 //! hardware has no tile width), `SET_SRC_HEIGHT = image height`, `DEPTH = 1`, `LAYER = 0`;
 //! `SRC_ORIGIN_X` in bytes, `SRC_ORIGIN_Y` in rows; `PITCH_IN = pitch`; `LINE_LENGTH_IN` the copied
-//! row bytes and `LINE_COUNT` the copied rows; `LAUNCH_DMA.SRC_MEMORY_LAYOUT = BLOCKLINEAR`.
+//! row bytes and `LINE_COUNT` the copied rows; `LAUNCH_DMA.SRC_MEMORY_LAYOUT = BLOCKLINEAR`. A
+//! block-linear destination is the same with the `DST` methods.
+//!
+//! With the REMAP unit on, NVK's `nouveau_copy_rect` switches the X units from bytes to elements
+//! (one element = `NUM_SRC_COMPONENTS * COMPONENT_SIZE` bytes, 4 here): `LINE_LENGTH_IN`,
+//! `SET_SRC/DST_WIDTH` and `SRC/DST_ORIGIN_X` are in pixels; `PITCH_IN/OUT` stay in bytes, Y in
+//! rows. [`copy`] does the same, and emits `SET_REMAP_COMPONENTS` (with the two constants in front
+//! only when a component selects one) before the offsets, as NVK does.
 //!
 //! **Block-linear is not claimed to work.** Beyond the words, the source must be mapped in the
 //! KMD's VA space with the page kind its modifier names ([`SourcePlan::page_kind`], 0x06): a
 //! mapping of another kind reads scrambled pixels with no error (`rm-copy-engine-present.md` 10.3,
 //! M1b and M3c).
 
-use crate::foreign_resource::{Layout, MOD_LINEAR};
+use crate::foreign_resource::{
+    Layout, FOURCC_ABGR8888, FOURCC_ARGB8888, FOURCC_XRGB8888, MOD_LINEAR,
+};
+use crate::rm_blt::{order_for_fourcc, swizzle, Swizzle};
 
 // ── classes ──────────────────────────────────────────────────────────────────────────────────
 
@@ -116,8 +133,12 @@ pub const SEM_RELEASE_TIMESTAMP_EN: u32 = 1 << 25;
 pub const CE_SET_SEMAPHORE_A: u32 = 0x0240;
 pub const CE_LAUNCH_DMA: u32 = 0x0300;
 pub const CE_OFFSET_IN_UPPER: u32 = 0x0400;
+pub const CE_SET_REMAP_CONST_A: u32 = 0x0700;
+pub const CE_SET_REMAP_COMPONENTS: u32 = 0x0708;
+pub const CE_SET_DST_BLOCK_SIZE: u32 = 0x070c;
 pub const CE_SET_SRC_BLOCK_SIZE: u32 = 0x0728;
 pub const CE_SRC_ORIGIN_X: u32 = 0x0744;
+pub const CE_DST_ORIGIN_X: u32 = 0x074c;
 
 pub const LAUNCH_TRANSFER_NONE: u32 = 0;
 pub const LAUNCH_TRANSFER_NON_PIPELINED: u32 = 2;
@@ -128,6 +149,8 @@ pub const LAUNCH_SRC_PITCH: u32 = 1 << 7;
 /// `DST_MEMORY_LAYOUT_PITCH`; 0 is `BLOCKLINEAR`.
 pub const LAUNCH_DST_PITCH: u32 = 1 << 8;
 pub const LAUNCH_MULTI_LINE: u32 = 1 << 9;
+/// `REMAP_ENABLE`: the copy goes through `SET_REMAP_COMPONENTS` (and its X units are elements).
+pub const LAUNCH_REMAP_ENABLE: u32 = 1 << 10;
 
 /// `SET_SRC_BLOCK_SIZE.GOB_HEIGHT_FERMI_8` at 15:12.
 pub const BLOCK_SIZE_GOB_HEIGHT_FERMI_8: u32 = 1 << 12;
@@ -293,9 +316,9 @@ pub fn ce_stamp(p: &mut Push<'_>, s: CeStamp) -> Result<(), PushError> {
     )
 }
 
-/// How the copy reads its source.
+/// How the copy reads its source or writes its destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SourceLayout {
+pub enum SurfaceLayout {
     /// Pitch-linear rows `pitch` bytes apart.
     Pitch,
     /// 2D block-linear: GOBs of 64 bytes x 8 rows, blocks of `1 << block_height_log2` GOBs.
@@ -304,32 +327,39 @@ pub enum SourceLayout {
         block_height_log2: u32,
         /// Bytes of one element (4 for the 32 bpp formats); picks `KIND_BPP` on 0xcab5.
         element_bytes: u32,
-        /// Rows of the whole image (`SET_SRC_HEIGHT`).
+        /// Rows of the whole image (`SET_SRC_HEIGHT` / `SET_DST_HEIGHT`).
         image_height: u32,
-        /// First copied column, in bytes (`SRC_ORIGIN_X`).
+        /// First copied column, in bytes (`SRC_ORIGIN_X` / `DST_ORIGIN_X`; emitted in elements
+        /// when the copy remaps).
         origin_x_bytes: u32,
-        /// First copied row (`SRC_ORIGIN_Y`).
+        /// First copied row (`SRC_ORIGIN_Y` / `DST_ORIGIN_Y`).
         origin_y: u32,
     },
 }
 
-/// One rectangle into a pitch-linear destination.
+/// One rectangle from the source into the destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CopyRect {
     /// Pitch-linear: the first copied byte. Block-linear: the image's base (the origin selects
     /// the rectangle).
     pub src_va: u64,
-    /// The first destination byte.
+    /// Pitch-linear: the first destination byte. Block-linear: the image's base.
     pub dst_va: u64,
     /// Source row pitch in bytes (`PITCH_IN`; for block-linear also `SET_SRC_WIDTH`).
     pub src_pitch: u32,
-    /// Destination row pitch in bytes (`PITCH_OUT`).
+    /// Destination row pitch in bytes (`PITCH_OUT`; for block-linear also `SET_DST_WIDTH`).
     pub dst_pitch: u32,
-    /// Bytes per copied row (`LINE_LENGTH_IN`).
+    /// Bytes per copied row (`LINE_LENGTH_IN`; emitted in elements when the copy remaps).
     pub line_bytes: u32,
     /// Copied rows (`LINE_COUNT`).
     pub lines: u32,
-    pub layout: SourceLayout,
+    /// The source's layout.
+    pub layout: SurfaceLayout,
+    /// The destination's layout ([`SurfaceLayout::Pitch`] for every Present; block-linear is the
+    /// tool's round trip).
+    pub dst_layout: SurfaceLayout,
+    /// The component remap of the copy ([`remap_for`]).
+    pub remap: Remap,
     /// The copy's own semaphore release with timestamp (the tool's T1); `None` in production.
     pub stamp: Option<CeStamp>,
 }
@@ -343,7 +373,7 @@ const fn kind_bpp(element_bytes: u32) -> Option<u32> {
     }
 }
 
-/// The `SET_SRC_BLOCK_SIZE` word.
+/// The `SET_SRC_BLOCK_SIZE` word (`SET_DST_BLOCK_SIZE` has the same fields).
 pub const fn src_block_size(gen: Gen, block_height_log2: u32, element_bytes: u32) -> Option<u32> {
     if block_height_log2 > 5 {
         return None;
@@ -361,43 +391,104 @@ pub const fn src_block_size(gen: Gen, block_height_log2: u32, element_bytes: u32
     }
 }
 
+/// One side of the copy against its pitch; `remap`: the X units are elements of
+/// [`REMAP_ELEMENT_BYTES`], so every X quantity must be whole elements.
+fn check_side(
+    gen: Gen,
+    layout: SurfaceLayout,
+    pitch: u32,
+    c: &CopyRect,
+    remap: bool,
+) -> Result<(), PushError> {
+    if c.line_bytes > pitch || (remap && pitch % REMAP_ELEMENT_BYTES != 0) {
+        return Err(PushError::Shape);
+    }
+    if let SurfaceLayout::BlockLinear {
+        block_height_log2,
+        element_bytes,
+        image_height,
+        origin_x_bytes,
+        origin_y,
+    } = layout
+    {
+        if src_block_size(gen, block_height_log2, element_bytes).is_none()
+            || pitch % 64 != 0
+            || origin_x_bytes as u64 + c.line_bytes as u64 > pitch as u64
+            || origin_y as u64 + c.lines as u64 > image_height as u64
+            || (remap
+                && (element_bytes != REMAP_ELEMENT_BYTES
+                    || origin_x_bytes % REMAP_ELEMENT_BYTES != 0))
+        {
+            return Err(PushError::Shape);
+        }
+    }
+    Ok(())
+}
+
 fn check_copy(gen: Gen, c: &CopyRect) -> Result<(), PushError> {
     va_ok(c.src_va)?;
     va_ok(c.dst_va)?;
-    if c.lines == 0 || c.line_bytes == 0 || c.line_bytes > c.dst_pitch {
+    let remap = c.remap.selector().is_some();
+    if c.lines == 0 || c.line_bytes == 0 || (remap && c.line_bytes % REMAP_ELEMENT_BYTES != 0) {
         return Err(PushError::Shape);
     }
-    match c.layout {
-        SourceLayout::Pitch => {
-            if c.line_bytes > c.src_pitch {
-                return Err(PushError::Shape);
-            }
-        }
-        SourceLayout::BlockLinear {
+    check_side(gen, c.layout, c.src_pitch, c, remap)?;
+    check_side(gen, c.dst_layout, c.dst_pitch, c, remap)
+}
+
+/// X in the copy's units: bytes, or elements when the copy remaps.
+const fn x_units(bytes: u32, remap: bool) -> u32 {
+    if remap {
+        bytes / REMAP_ELEMENT_BYTES
+    } else {
+        bytes
+    }
+}
+
+/// The block-linear state of one side (`block` = `CE_SET_SRC_BLOCK_SIZE` or
+/// `CE_SET_DST_BLOCK_SIZE`, `origin` the matching `*_ORIGIN_X`); returns the `LAUNCH_DMA` layout
+/// bit (`pitch_bit` for pitch-linear, 0 for block-linear).
+fn surface_state(
+    p: &mut Push<'_>,
+    gen: Gen,
+    layout: SurfaceLayout,
+    pitch: u32,
+    remap: bool,
+    (block, origin, pitch_bit): (u32, u32, u32),
+) -> Result<u32, PushError> {
+    match layout {
+        SurfaceLayout::Pitch => Ok(pitch_bit),
+        SurfaceLayout::BlockLinear {
             block_height_log2,
             element_bytes,
             image_height,
             origin_x_bytes,
             origin_y,
         } => {
-            if src_block_size(gen, block_height_log2, element_bytes).is_none()
-                || c.src_pitch % 64 != 0
-                || origin_x_bytes as u64 + c.line_bytes as u64 > c.src_pitch as u64
-                || origin_y as u64 + c.lines as u64 > image_height as u64
-            {
-                return Err(PushError::Shape);
-            }
+            let word = src_block_size(gen, block_height_log2, element_bytes).ok_or(PushError::Shape)?;
+            p.method(SUBC_CE, block, &[word, x_units(pitch, remap), image_height, 1, 0])?;
+            p.method(SUBC_CE, origin, &[x_units(origin_x_bytes, remap), origin_y])?;
+            Ok(0)
         }
     }
-    Ok(())
 }
 
-/// The copy: offsets, pitches and extent, the block-linear source state when it applies, and
-/// `LAUNCH_DMA` (non-pipelined, flushed, virtual addresses, multi-line).
+/// The copy: the remap state when it applies, offsets, pitches and extent, the block-linear
+/// source and destination state when they apply, and `LAUNCH_DMA` (non-pipelined, flushed,
+/// virtual addresses, multi-line, `REMAP_ENABLE` when remapping).
 pub fn copy(p: &mut Push<'_>, gen: Gen, c: &CopyRect) -> Result<(), PushError> {
     check_copy(gen, c)?;
     if let Some(s) = c.stamp {
         ce_semaphore_address(p, s)?;
+    }
+    let selector = c.remap.selector();
+    let remap = selector.is_some();
+    if let Some(s) = selector {
+        if s.uses_consts() {
+            p.method(SUBC_CE, CE_SET_REMAP_CONST_A, &[s.const_a, s.const_b, s.components_word()])?;
+        } else {
+            p.method(SUBC_CE, CE_SET_REMAP_COMPONENTS, &[s.components_word()])?;
+        }
     }
     p.method(
         SUBC_CE,
@@ -409,29 +500,26 @@ pub fn copy(p: &mut Push<'_>, gen: Gen, c: &CopyRect) -> Result<(), PushError> {
             lo(c.dst_va),
             c.src_pitch,
             c.dst_pitch,
-            c.line_bytes,
+            x_units(c.line_bytes, remap),
             c.lines,
         ],
     )?;
-    let src_layout = match c.layout {
-        SourceLayout::Pitch => LAUNCH_SRC_PITCH,
-        SourceLayout::BlockLinear {
-            block_height_log2,
-            element_bytes,
-            image_height,
-            origin_x_bytes,
-            origin_y,
-        } => {
-            let block = src_block_size(gen, block_height_log2, element_bytes).ok_or(PushError::Shape)?;
-            p.method(
-                SUBC_CE,
-                CE_SET_SRC_BLOCK_SIZE,
-                &[block, c.src_pitch, image_height, 1, 0],
-            )?;
-            p.method(SUBC_CE, CE_SRC_ORIGIN_X, &[origin_x_bytes, origin_y])?;
-            0
-        }
-    };
+    let src_layout = surface_state(
+        p,
+        gen,
+        c.layout,
+        c.src_pitch,
+        remap,
+        (CE_SET_SRC_BLOCK_SIZE, CE_SRC_ORIGIN_X, LAUNCH_SRC_PITCH),
+    )?;
+    let dst_layout = surface_state(
+        p,
+        gen,
+        c.dst_layout,
+        c.dst_pitch,
+        remap,
+        (CE_SET_DST_BLOCK_SIZE, CE_DST_ORIGIN_X, LAUNCH_DST_PITCH),
+    )?;
     let semaphore = if c.stamp.is_some() { LAUNCH_SEMAPHORE_WITH_TIMESTAMP } else { 0 };
     p.method(
         SUBC_CE,
@@ -440,14 +528,15 @@ pub fn copy(p: &mut Push<'_>, gen: Gen, c: &CopyRect) -> Result<(), PushError> {
             | LAUNCH_FLUSH_ENABLE
             | semaphore
             | src_layout
-            | LAUNCH_DST_PITCH
-            | LAUNCH_MULTI_LINE],
+            | dst_layout
+            | LAUNCH_MULTI_LINE
+            | if remap { LAUNCH_REMAP_ENABLE } else { 0 }],
     )
 }
 
 /// The production push of one Present: acquire the producer's value, copy, release the KMD's
 /// completion value with WFI (the WFI waits for the copy engine), `NON_STALL_INTERRUPT` when
-/// the completion is evented.
+/// the completion is evented. The destination is pitch-linear (a Blt destination's pages).
 pub fn present_push(
     p: &mut Push<'_>,
     gen: Gen,
@@ -455,7 +544,7 @@ pub fn present_push(
     c: &CopyRect,
     done: Release,
 ) -> Result<(), PushError> {
-    if !done.wfi {
+    if !done.wfi || c.dst_layout != SurfaceLayout::Pitch {
         // Without the WFI the release may land before the copy finished.
         return Err(PushError::Shape);
     }
@@ -464,9 +553,176 @@ pub fn present_push(
     release(p, done)
 }
 
-/// The dwords of the largest push [`present_push`] writes (block-linear, interrupt): 6 + 9 + 6 + 3
-/// + 2 + 6 + 2. A 512-byte slot (128 dwords) holds it with room.
-pub const PRESENT_PUSH_MAX_DWORDS: usize = 34;
+/// The dwords of the largest push [`present_push`] writes (block-linear source, a remap with
+/// constants, interrupt): 6 + 4 + 9 + 6 + 3 + 2 + 6 + 2. A 512-byte slot (128 dwords) holds it
+/// with room.
+pub const PRESENT_PUSH_MAX_DWORDS: usize = 38;
+
+// ── format conversion: the copy engine's REMAP unit ──────────────────────────────────────────
+
+/// Bytes of one element when the copy remaps: 4 components of 1 byte (`COMPONENT_SIZE_ONE`,
+/// `NUM_SRC/DST_COMPONENTS_FOUR`), one 32-bit pixel.
+pub const REMAP_ELEMENT_BYTES: u32 = 4;
+
+/// What one destination component takes (`SET_REMAP_COMPONENTS_DST_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Component {
+    SrcX = 0,
+    SrcY = 1,
+    SrcZ = 2,
+    SrcW = 3,
+    /// `SET_REMAP_CONST_A`.
+    ConstA = 4,
+    /// `SET_REMAP_CONST_B`.
+    ConstB = 5,
+    /// The destination byte is left as it is.
+    NoWrite = 6,
+}
+
+/// A general 4-component selector over 1-byte components of a 32-bit pixel. Component X is the
+/// pixel's byte 0, W byte 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selector {
+    /// What destination X, Y, Z, W take.
+    pub dst: [Component; 4],
+    /// `SET_REMAP_CONST_A/B`, sent only when a component selects one. All four bytes carry the
+    /// constant byte, so the value does not depend on which byte the 1-byte component size takes.
+    pub const_a: u32,
+    pub const_b: u32,
+}
+
+/// `COMPONENT_SIZE_ONE` (0) at 17:16, `NUM_SRC_COMPONENTS_FOUR` (3) at 21:20,
+/// `NUM_DST_COMPONENTS_FOUR` (3) at 25:24.
+const REMAP_SIZES: u32 = (3 << 20) | (3 << 24);
+
+/// An opaque alpha byte (`CONST_A`) for an `X` source into an `A` destination.
+pub const ALPHA_ONE: u32 = 0xffff_ffff;
+
+impl Selector {
+    pub const IDENTITY: Selector = Selector {
+        dst: [Component::SrcX, Component::SrcY, Component::SrcZ, Component::SrcW],
+        const_a: 0,
+        const_b: 0,
+    };
+    /// RGBA <-> BGRA: bytes 0 and 2 exchanged.
+    pub const SWAP_RB: Selector = Selector {
+        dst: [Component::SrcZ, Component::SrcY, Component::SrcX, Component::SrcW],
+        const_a: 0,
+        const_b: 0,
+    };
+
+    /// The same with destination W from `CONST_A` = [`ALPHA_ONE`].
+    pub const fn with_alpha_one(self) -> Selector {
+        Selector {
+            dst: [self.dst[0], self.dst[1], self.dst[2], Component::ConstA],
+            const_a: ALPHA_ONE,
+            const_b: self.const_b,
+        }
+    }
+
+    /// The `SET_REMAP_COMPONENTS` word.
+    pub const fn components_word(&self) -> u32 {
+        (self.dst[0] as u32)
+            | (self.dst[1] as u32) << 4
+            | (self.dst[2] as u32) << 8
+            | (self.dst[3] as u32) << 12
+            | REMAP_SIZES
+    }
+
+    /// Does any component select `CONST_A` or `CONST_B`.
+    pub const fn uses_consts(&self) -> bool {
+        let mut i = 0;
+        while i < 4 {
+            if matches!(self.dst[i], Component::ConstA | Component::ConstB) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+/// The component remap of a copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remap {
+    /// A byte copy (`REMAP_ENABLE` off; the words of every test before M1c).
+    None,
+    /// [`Selector::SWAP_RB`]: RGBA <-> BGRA, the windowed Present's case.
+    SwapRb,
+    /// Any other selector.
+    Select(Selector),
+}
+
+/// `SET_REMAP_COMPONENTS` of [`Remap::SwapRb`].
+pub const SWAP_RB_COMPONENTS: u32 = 0x0330_3012;
+
+impl Remap {
+    /// The selector the copy programs; `None` for a byte copy.
+    pub const fn selector(self) -> Option<Selector> {
+        match self {
+            Remap::None => None,
+            Remap::SwapRb => Some(Selector::SWAP_RB),
+            Remap::Select(s) => Some(s),
+        }
+    }
+}
+
+/// Why [`remap_for`] refused a pair. `code` is stable (appended, never renumbered).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unsupported {
+    /// The source is not one of the four 32-bit 8-bit-per-channel RGB formats.
+    SourceFormat = 1,
+    /// The destination is not one of them.
+    DestinationFormat = 2,
+}
+
+impl Unsupported {
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// The route's reason: the Present takes the Venus copy.
+    pub const fn why(self) -> Why {
+        Why::FormatUnsupported
+    }
+}
+
+const fn has_alpha(fourcc: u32) -> bool {
+    matches!(fourcc, FOURCC_ARGB8888 | FOURCC_ABGR8888)
+}
+
+/// The remap that turns the source format into the destination's, both as `DRM_FORMAT_*`
+/// (`AB24` `ABGR8888` and `XB24` `XBGR8888` are bytes R G B A|X; `AR24` `ARGB8888` and `XR24`
+/// `XRGB8888` are bytes B G R A|X). The same byte order is a byte copy, the other order
+/// [`Remap::SwapRb`]; an `X` source into an `A` destination also sets the alpha byte to 0xff
+/// (`CONST_A`), since its fourth byte is undefined. Anything else is refused.
+pub const fn remap_for(src_fourcc: u32, dst_fourcc: u32) -> Result<Remap, Unsupported> {
+    let Some(from) = order_for_fourcc(src_fourcc) else {
+        return Err(Unsupported::SourceFormat);
+    };
+    let Some(to) = order_for_fourcc(dst_fourcc) else {
+        return Err(Unsupported::DestinationFormat);
+    };
+    let fill_alpha = !has_alpha(src_fourcc) && has_alpha(dst_fourcc);
+    Ok(match (swizzle(from, to), fill_alpha) {
+        (Swizzle::None, false) => Remap::None,
+        (Swizzle::SwapRb, false) => Remap::SwapRb,
+        (Swizzle::None, true) => Remap::Select(Selector::IDENTITY.with_alpha_one()),
+        (Swizzle::SwapRb, true) => Remap::Select(Selector::SWAP_RB.with_alpha_one()),
+    })
+}
+
+/// The `DRM_FORMAT_*` of a Blt destination's DXGI format: 87/91 `B8G8R8A8` -> `ARGB8888`, 88/93
+/// `B8G8R8X8` -> `XRGB8888`, 28/29 `R8G8B8A8` -> `ABGR8888` (the `_SRGB` twins are the same bytes);
+/// `None` for the rest.
+pub const fn dst_fourcc_for_dxgi(dxgi: u32) -> Option<u32> {
+    match dxgi {
+        87 | 91 => Some(FOURCC_ARGB8888),
+        88 | 93 => Some(FOURCC_XRGB8888),
+        28 | 29 => Some(FOURCC_ABGR8888),
+        _ => None,
+    }
+}
 
 // ── submission ───────────────────────────────────────────────────────────────────────────────
 
@@ -655,7 +911,7 @@ pub struct SourceDesc {
 /// What [`source_plan`] decided about a source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourcePlan {
-    pub layout: SourceLayout,
+    pub layout: SurfaceLayout,
     /// The page kind the KMD must map the source with: the modifier's `k` field for block-linear
     /// (0x06 for every family NVK emits), `None` for LINEAR (the default kind of the mapping).
     pub page_kind: Option<u32>,
@@ -697,7 +953,7 @@ pub fn source_plan(gen: Gen, s: &SourceDesc) -> Result<SourcePlan, Why> {
     let line_bytes = s.width * 4;
     if s.modifier == MOD_LINEAR {
         return Ok(SourcePlan {
-            layout: SourceLayout::Pitch,
+            layout: SurfaceLayout::Pitch,
             page_kind: None,
             line_bytes,
             offset: s.offset,
@@ -710,7 +966,7 @@ pub fn source_plan(gen: Gen, s: &SourceDesc) -> Result<SourcePlan, Why> {
         return Err(Why::SourceUnsupported);
     }
     Ok(SourcePlan {
-        layout: SourceLayout::BlockLinear {
+        layout: SurfaceLayout::BlockLinear {
             block_height_log2: h,
             element_bytes: 4,
             image_height: s.height,
@@ -726,7 +982,7 @@ pub fn source_plan(gen: Gen, s: &SourceDesc) -> Result<SourcePlan, Why> {
 // ── decisions and the per-destination route ──────────────────────────────────────────────────
 
 /// Why a Present takes the Venus copy (or a destination stops using this route). `code` is what
-/// `CeWhy` holds, `bit` what `CeMask` collects. Codes 1 to 6 and 10 are decisions; 7 to 9 are
+/// `CeWhy` holds, `bit` what `CeMask` collects. Codes 1 to 6, 10 and 13 are decisions; 7 to 9 are
 /// failures, each a strike ([`Why::strikes`]). New codes are appended, never renumbered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
@@ -755,6 +1011,8 @@ pub enum Why {
     StruckOut = 11,
     /// A timed-out copy may still write the destination: no new copy until it completes.
     Poisoned = 12,
+    /// The source and destination formats are not a pair [`remap_for`] converts.
+    FormatUnsupported = 13,
 }
 
 impl Why {
@@ -1200,7 +1458,9 @@ mod tests {
                     dst_pitch: 6400,
                     line_bytes: 6400,
                     lines: 900,
-                    layout: SourceLayout::Pitch,
+                    layout: SurfaceLayout::Pitch,
+                    dst_layout: SurfaceLayout::Pitch,
+                    remap: Remap::None,
                     stamp: Some(CeStamp { va: v.stamps + 16, payload: 1 }),
                 },
             )?;
@@ -1263,7 +1523,9 @@ mod tests {
                 dst_pitch: 6400,
                 line_bytes: 6400,
                 lines: 900,
-                layout: SourceLayout::Pitch,
+                layout: SurfaceLayout::Pitch,
+                dst_layout: SurfaceLayout::Pitch,
+                remap: Remap::None,
                 stamp: None,
             },
             Release { va: v.completion, value: 7, wfi: true, timestamp: false, interrupt: true },
@@ -1292,13 +1554,15 @@ mod tests {
             dst_pitch: 6400,
             line_bytes: 6400,
             lines: 900,
-            layout: SourceLayout::BlockLinear {
+            layout: SurfaceLayout::BlockLinear {
                 block_height_log2: 4,
                 element_bytes: 4,
                 image_height: 900,
                 origin_x_bytes: 0,
                 origin_y: 0,
             },
+            dst_layout: SurfaceLayout::Pitch,
+            remap: Remap::None,
             stamp: None,
         }
     }
@@ -1317,7 +1581,7 @@ mod tests {
                 Release { va: v.completion, value: 9, wfi: true, timestamp: false, interrupt: true },
             )
             .unwrap();
-            assert_eq!(p.len(), PRESENT_PUSH_MAX_DWORDS);
+            assert_eq!(p.len(), 34);
             assert_eq!(
                 p.words(),
                 [
@@ -1351,7 +1615,7 @@ mod tests {
     #[test]
     fn a_sub_rectangle_of_a_block_linear_source() {
         let mut c = heaven_bl_copy();
-        c.layout = SourceLayout::BlockLinear {
+        c.layout = SurfaceLayout::BlockLinear {
             block_height_log2: 4,
             element_bytes: 4,
             image_height: 900,
@@ -1367,7 +1631,7 @@ mod tests {
         c.lines = 801;
         assert_eq!(copy(&mut Push::new(&mut [0; 64]), Gen::Gb202, &c), Err(PushError::Shape));
         c.lines = 200;
-        c.layout = SourceLayout::BlockLinear {
+        c.layout = SurfaceLayout::BlockLinear {
             block_height_log2: 4,
             element_bytes: 4,
             image_height: 900,
@@ -1398,7 +1662,7 @@ mod tests {
         c.src_pitch = 6400 + 32; // not whole GOBs
         assert_eq!(copy(&mut p, Gen::Gb202, &c), Err(PushError::Shape));
         let mut c = base;
-        c.layout = SourceLayout::Pitch;
+        c.layout = SurfaceLayout::Pitch;
         c.src_pitch = 6396;
         assert_eq!(copy(&mut p, Gen::Gb202, &c), Err(PushError::Shape));
         assert!(p.is_empty());
@@ -1457,6 +1721,348 @@ mod tests {
         assert_eq!(Gen::from_classes(0xca6f, 0xc7b5), None);
         assert_eq!(Gen::Gb202.classes().usermode, 0xc761);
         assert_eq!(Gen::Ada.classes().usermode, 0xc561);
+    }
+
+    // ── the REMAP unit (M1c) ─────────────────────────────────────────────────────────────────
+    //
+    // Expected words derived from Mesa's clcab5.h / clc7b5.h (the 610.57.04 clc7b5.h agrees):
+    // * `SET_REMAP_COMPONENTS` 0x708: header `mthd(4, 0x708, 1)` = 0x200181c2. SwapRb: DST_X =
+    //   SRC_Z (2), DST_Y = SRC_Y (1) << 4, DST_Z = SRC_X (0) << 8, DST_W = SRC_W (3) << 12,
+    //   COMPONENT_SIZE_ONE (0) << 16, NUM_SRC_COMPONENTS_FOUR (3) << 20, NUM_DST_COMPONENTS_FOUR
+    //   (3) << 24 = 0x03303012.
+    // * With a constant: `mthd(4, 0x700, 3)` = 0x200381c0, CONST_A, CONST_B, the components.
+    // * `LAUNCH_DMA.REMAP_ENABLE` bit 10 = 0x400.
+    // * `SET_DST_BLOCK_SIZE` 0x70c count 5 = 0x200581c3; `DST_ORIGIN_X` 0x74c count 2 = 0x200281d3.
+    // * With the remap on, `LINE_LENGTH_IN`, `SET_*_WIDTH` and `*_ORIGIN_X` are elements: 6400 bytes
+    //   are 1600 pixels.
+
+    fn heaven_swap_rb() -> CopyRect {
+        let mut c = heaven_bl_copy();
+        c.remap = Remap::SwapRb;
+        c
+    }
+
+    #[test]
+    fn remap_component_words() {
+        assert_eq!(Selector::SWAP_RB.components_word(), SWAP_RB_COMPONENTS);
+        assert_eq!(SWAP_RB_COMPONENTS, 0x0330_3012);
+        assert_eq!(Selector::IDENTITY.components_word(), 0x0330_3210);
+        assert_eq!(Selector::SWAP_RB.with_alpha_one().components_word(), 0x0330_4012);
+        assert_eq!(Selector::IDENTITY.with_alpha_one().components_word(), 0x0330_4210);
+        assert!(!Selector::SWAP_RB.uses_consts());
+        assert!(Selector::SWAP_RB.with_alpha_one().uses_consts());
+        let b = Selector {
+            dst: [Component::ConstB, Component::NoWrite, Component::SrcW, Component::SrcX],
+            const_a: 0,
+            const_b: 7,
+        };
+        assert_eq!(b.components_word(), 0x0330_0365);
+        assert!(b.uses_consts());
+        assert_eq!(Remap::None.selector(), None);
+        assert_eq!(Remap::SwapRb.selector(), Some(Selector::SWAP_RB));
+        assert_eq!(method(4, 0x708, 1), 0x2001_81c2);
+        assert_eq!(method(4, 0x700, 3), 0x2003_81c0);
+        assert_eq!(method(4, 0x70c, 5), 0x2005_81c3);
+        assert_eq!(method(4, 0x74c, 2), 0x2002_81d3);
+    }
+
+    #[test]
+    fn remap_for_the_rgb32_pairs() {
+        use crate::foreign_resource::{FOURCC_XBGR8888, FOURCC_XRGB8888};
+        const AB: u32 = FOURCC_ABGR8888;
+        const AR: u32 = FOURCC_ARGB8888;
+        const XB: u32 = FOURCC_XBGR8888;
+        const XR: u32 = FOURCC_XRGB8888;
+        let swap_a = Remap::Select(Selector::SWAP_RB.with_alpha_one());
+        let same_a = Remap::Select(Selector::IDENTITY.with_alpha_one());
+        let table = [
+            // Heaven's windowed source into DWM's redirection surface.
+            (AB, AR, Remap::SwapRb),
+            (AR, AB, Remap::SwapRb),
+            (AB, XR, Remap::SwapRb),
+            (AR, XB, Remap::SwapRb),
+            (XB, XR, Remap::SwapRb),
+            (XR, XB, Remap::SwapRb),
+            (XB, AR, swap_a),
+            (XR, AB, swap_a),
+            (AB, AB, Remap::None),
+            (AR, AR, Remap::None),
+            (XB, XB, Remap::None),
+            (XR, XR, Remap::None),
+            (AB, XB, Remap::None),
+            (AR, XR, Remap::None),
+            (XB, AB, same_a),
+            (XR, AR, same_a),
+        ];
+        for (s, d, want) in table {
+            assert_eq!(remap_for(s, d), Ok(want), "{s:#x} -> {d:#x}");
+        }
+        use crate::foreign_resource::{FOURCC_ABGR2101010, FOURCC_ABGR16161616F, FOURCC_R8};
+        assert_eq!(remap_for(FOURCC_R8, AR), Err(Unsupported::SourceFormat));
+        assert_eq!(remap_for(FOURCC_ABGR2101010, AR), Err(Unsupported::SourceFormat));
+        assert_eq!(remap_for(AB, FOURCC_ABGR16161616F), Err(Unsupported::DestinationFormat));
+        assert_eq!(remap_for(0, 0), Err(Unsupported::SourceFormat));
+        assert_eq!(Unsupported::SourceFormat.code(), 1);
+        assert_eq!(Unsupported::DestinationFormat.code(), 2);
+        assert_eq!(Unsupported::DestinationFormat.why(), Why::FormatUnsupported);
+        // The DXGI formats of a Blt destination.
+        assert_eq!(dst_fourcc_for_dxgi(87), Some(AR));
+        assert_eq!(dst_fourcc_for_dxgi(91), Some(AR));
+        assert_eq!(dst_fourcc_for_dxgi(88), Some(XR));
+        assert_eq!(dst_fourcc_for_dxgi(93), Some(XR));
+        assert_eq!(dst_fourcc_for_dxgi(28), Some(AB));
+        assert_eq!(dst_fourcc_for_dxgi(29), Some(AB));
+        assert_eq!(dst_fourcc_for_dxgi(24), None);
+        // The measured case: AB24 into DXGI 87.
+        assert_eq!(remap_for(heaven_source().fourcc, dst_fourcc_for_dxgi(87).unwrap()), Ok(Remap::SwapRb));
+    }
+
+    /// Block-linear -> pitch with SwapRb: Heaven's source into the BGRA destination.
+    #[test]
+    fn swap_rb_block_linear_to_pitch_words() {
+        let v = tool_vas();
+        for gen in [Gen::Gb202, Gen::Ada] {
+            let mut buf = [0u32; PRESENT_PUSH_MAX_DWORDS];
+            let mut p = Push::new(&mut buf);
+            present_push(
+                &mut p,
+                gen,
+                Acquire { va: v.timeline, value: 5 },
+                &heaven_swap_rb(),
+                Release { va: v.completion, value: 9, wfi: true, timestamp: false, interrupt: true },
+            )
+            .unwrap();
+            assert_eq!(
+                p.words(),
+                [
+                    0x2005_0017, 0x0040_0000, 0x20, 5, 0, 0x0100_1002,
+                    // SET_REMAP_COMPONENTS: DST_X = SRC_Z, DST_Z = SRC_X, 1-byte, 4 + 4
+                    0x2001_81c2, 0x0330_3012,
+                    // LINE_LENGTH_IN 1600 pixels (6400 bytes); the pitches stay bytes
+                    0x2008_8100, 0x20, 0x0080_0000, 0x20, 0x0100_0000, 6400, 6400, 1600, 900,
+                    // SET_SRC_BLOCK_SIZE, SET_SRC_WIDTH 1600 elements, HEIGHT, DEPTH, LAYER
+                    0x2005_81ca, 0x1040, 1600, 900, 1, 0,
+                    0x2002_81d1, 0, 0,
+                    // LAUNCH_DMA 0x306 | REMAP_ENABLE
+                    0x2001_80c0, 0x706,
+                    0x2005_0017, 0x01c0_0000, 0x20, 9, 0, 0x0110_0001,
+                    0x2001_0008, 0,
+                ]
+            );
+        }
+    }
+
+    /// Pitch -> pitch with SwapRb: the tool's ready-round copy with `--remap swap-rb`.
+    #[test]
+    fn swap_rb_pitch_to_pitch_words_reproduce_the_tool() {
+        let v = tool_vas();
+        for gen in [Gen::Gb202, Gen::Ada] {
+            let words = build(|p| {
+                ce_stamp(p, CeStamp { va: v.stamps, payload: 1 })?;
+                copy(
+                    p,
+                    gen,
+                    &CopyRect {
+                        src_va: v.source,
+                        dst_va: v.destination,
+                        src_pitch: 6400,
+                        dst_pitch: 6400,
+                        line_bytes: 6400,
+                        lines: 900,
+                        layout: SurfaceLayout::Pitch,
+                        dst_layout: SurfaceLayout::Pitch,
+                        remap: Remap::SwapRb,
+                        stamp: Some(CeStamp { va: v.stamps + 16, payload: 1 }),
+                    },
+                )
+            });
+            assert_eq!(
+                words,
+                [
+                    0x2003_8090, 0x20, 0x0180_0000, 1,
+                    0x2001_80c0, 0x14,
+                    0x2003_8090, 0x20, 0x0180_0010, 1,
+                    0x2001_81c2, 0x0330_3012,
+                    0x2008_8100, 0x20, 0x0080_0000, 0x20, 0x0100_0000, 6400, 6400, 1600, 900,
+                    // 0x396 | REMAP_ENABLE
+                    0x2001_80c0, 0x796,
+                ]
+            );
+        }
+    }
+
+    /// Pitch -> block-linear, without and with SwapRb (the tool's round trip writes the image so).
+    #[test]
+    fn pitch_to_block_linear_words() {
+        let v = tool_vas();
+        let bl = SurfaceLayout::BlockLinear {
+            block_height_log2: 4,
+            element_bytes: 4,
+            image_height: 900,
+            origin_x_bytes: 0,
+            origin_y: 0,
+        };
+        let rect = |remap| CopyRect {
+            src_va: v.source,
+            dst_va: v.destination,
+            src_pitch: 6400,
+            dst_pitch: 6400,
+            line_bytes: 6400,
+            lines: 900,
+            layout: SurfaceLayout::Pitch,
+            dst_layout: bl,
+            remap,
+            stamp: None,
+        };
+        for gen in [Gen::Gb202, Gen::Ada] {
+            let off = build(|p| copy(p, gen, &rect(Remap::None)));
+            assert_eq!(
+                off,
+                [
+                    0x2008_8100, 0x20, 0x0080_0000, 0x20, 0x0100_0000, 6400, 6400, 6400, 900,
+                    // SET_DST_BLOCK_SIZE, DST_WIDTH = pitch bytes, HEIGHT, DEPTH, LAYER
+                    0x2005_81c3, 0x1040, 6400, 900, 1, 0,
+                    0x2002_81d3, 0, 0,
+                    // NON_PIPELINED | FLUSH | SRC_PITCH | MULTI_LINE (DST BLOCKLINEAR)
+                    0x2001_80c0, 0x286,
+                ]
+            );
+            let on = build(|p| copy(p, gen, &rect(Remap::SwapRb)));
+            assert_eq!(
+                on,
+                [
+                    0x2001_81c2, 0x0330_3012,
+                    0x2008_8100, 0x20, 0x0080_0000, 0x20, 0x0100_0000, 6400, 6400, 1600, 900,
+                    0x2005_81c3, 0x1040, 1600, 900, 1, 0,
+                    0x2002_81d3, 0, 0,
+                    0x2001_80c0, 0x686,
+                ]
+            );
+        }
+        // A block-linear destination is not a Present.
+        let mut buf = [0u32; 64];
+        assert_eq!(
+            present_push(
+                &mut Push::new(&mut buf),
+                Gen::Gb202,
+                Acquire { va: v.timeline, value: 1 },
+                &rect(Remap::None),
+                Release { va: v.completion, value: 1, wfi: true, timestamp: false, interrupt: false },
+            ),
+            Err(PushError::Shape)
+        );
+    }
+
+    #[test]
+    fn the_largest_present_push_fits_the_bound() {
+        let v = tool_vas();
+        let mut c = heaven_bl_copy();
+        c.remap = Remap::Select(Selector::SWAP_RB.with_alpha_one());
+        let mut buf = [0u32; PRESENT_PUSH_MAX_DWORDS];
+        let mut p = Push::new(&mut buf);
+        present_push(
+            &mut p,
+            Gen::Gb202,
+            Acquire { va: v.timeline, value: 1 },
+            &c,
+            Release { va: v.completion, value: 2, wfi: true, timestamp: false, interrupt: true },
+        )
+        .unwrap();
+        assert_eq!(p.len(), PRESENT_PUSH_MAX_DWORDS);
+        // SET_REMAP_CONST_A, CONST_B, COMPONENTS in one header.
+        assert_eq!(&p.words()[6..10], &[0x2003_81c0, ALPHA_ONE, 0, 0x0330_4012]);
+        // One dword short: refused.
+        let mut small = [0u32; PRESENT_PUSH_MAX_DWORDS - 1];
+        let mut p = Push::new(&mut small);
+        assert_eq!(
+            present_push(
+                &mut p,
+                Gen::Gb202,
+                Acquire { va: v.timeline, value: 1 },
+                &c,
+                Release { va: v.completion, value: 2, wfi: true, timestamp: false, interrupt: true },
+            ),
+            Err(PushError::Full)
+        );
+    }
+
+    #[test]
+    fn a_remapped_sub_rectangle_is_in_elements() {
+        let mut c = heaven_swap_rb();
+        c.layout = SurfaceLayout::BlockLinear {
+            block_height_log2: 4,
+            element_bytes: 4,
+            image_height: 900,
+            origin_x_bytes: 400,
+            origin_y: 100,
+        };
+        c.line_bytes = 800;
+        c.lines = 200;
+        let words = build(|p| copy(p, Gen::Gb202, &c));
+        assert_eq!(&words[0..2], &[0x2001_81c2, SWAP_RB_COMPONENTS]);
+        assert_eq!(&words[2..11], &[0x2008_8100, 0x20, 0x0080_0000, 0x20, 0x0100_0000, 6400, 6400, 200, 200]);
+        assert_eq!(&words[11..17], &[0x2005_81ca, 0x1040, 1600, 900, 1, 0]);
+        assert_eq!(&words[17..20], &[0x2002_81d1, 100, 100]);
+    }
+
+    #[test]
+    fn a_remap_needs_whole_pixels() {
+        let base = heaven_swap_rb();
+        let mut buf = [0xdead_beefu32; 64];
+        let mut p = Push::new(&mut buf);
+        let mut c = base;
+        c.line_bytes = 6398;
+        assert_eq!(copy(&mut p, Gen::Gb202, &c), Err(PushError::Shape));
+        let mut c = base;
+        c.layout = SurfaceLayout::BlockLinear {
+            block_height_log2: 4,
+            element_bytes: 4,
+            image_height: 900,
+            origin_x_bytes: 402,
+            origin_y: 0,
+        };
+        c.line_bytes = 800;
+        assert_eq!(copy(&mut p, Gen::Gb202, &c), Err(PushError::Shape));
+        // A 16 bpp block-linear image is not 4 one-byte components.
+        let mut c = base;
+        c.layout = SurfaceLayout::BlockLinear {
+            block_height_log2: 4,
+            element_bytes: 2,
+            image_height: 900,
+            origin_x_bytes: 0,
+            origin_y: 0,
+        };
+        assert_eq!(copy(&mut p, Gen::Gb202, &c), Err(PushError::Shape));
+        // A pitch-linear destination pitch that is not whole pixels.
+        let mut c = base;
+        c.dst_pitch = 6402;
+        assert_eq!(copy(&mut p, Gen::Gb202, &c), Err(PushError::Shape));
+        // The same shapes without the remap are byte copies and pass.
+        let mut c = base;
+        c.remap = Remap::None;
+        c.dst_pitch = 6402;
+        assert_eq!(copy(&mut p, Gen::Gb202, &c), Ok(()));
+        assert_eq!(p.len(), 9 + 6 + 3 + 2);
+    }
+
+    #[test]
+    fn a_block_linear_destination_is_checked_like_a_source() {
+        let mut c = heaven_bl_copy();
+        c.layout = SurfaceLayout::Pitch;
+        c.dst_layout = SurfaceLayout::BlockLinear {
+            block_height_log2: 4,
+            element_bytes: 4,
+            image_height: 900,
+            origin_x_bytes: 0,
+            origin_y: 0,
+        };
+        assert_eq!(copy(&mut Push::new(&mut [0; 64]), Gen::Gb202, &c), Ok(()));
+        let mut d = c;
+        d.dst_pitch = 6400 + 32;
+        assert_eq!(copy(&mut Push::new(&mut [0; 64]), Gen::Gb202, &d), Err(PushError::Shape));
+        let mut d = c;
+        d.lines = 901;
+        assert_eq!(copy(&mut Push::new(&mut [0; 64]), Gen::Gb202, &d), Err(PushError::Shape));
     }
 
     // ── GPFIFO, ring, token ──────────────────────────────────────────────────────────────────
@@ -1548,7 +2154,7 @@ mod tests {
         let plan = source_plan(Gen::Gb202, &heaven_source()).unwrap();
         assert_eq!(
             plan.layout,
-            SourceLayout::BlockLinear {
+            SurfaceLayout::BlockLinear {
                 block_height_log2: 4,
                 element_bytes: 4,
                 image_height: 900,
@@ -1568,7 +2174,7 @@ mod tests {
         s.modifier = 0;
         s.size = 5_760_000;
         let plan = source_plan(Gen::Ada, &s).unwrap();
-        assert_eq!(plan.layout, SourceLayout::Pitch);
+        assert_eq!(plan.layout, SurfaceLayout::Pitch);
         assert_eq!(plan.page_kind, None);
         // Block-linear needs the whole blocks.
         let mut s = heaven_source();
@@ -1603,6 +2209,8 @@ mod tests {
             line_bytes: plan.line_bytes,
             lines: 900,
             layout: plan.layout,
+            dst_layout: SurfaceLayout::Pitch,
+            remap: Remap::None,
             stamp: None,
         };
         assert_eq!(c, heaven_bl_copy());
@@ -1785,6 +2393,7 @@ mod tests {
             Why::RingFull,
             Why::StruckOut,
             Why::Poisoned,
+            Why::FormatUnsupported,
         ];
         let mut mask = 0u32;
         for (i, w) in all.iter().enumerate() {
