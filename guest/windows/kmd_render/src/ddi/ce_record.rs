@@ -85,13 +85,28 @@ unsafe fn read_record(command: *const u8, cmd_len: usize, offset: usize) -> Tail
     }
 }
 
-/// TODO(M3c): the `h_client` rule. A record's `semaphore.h_client` and `source.h_client` must be
-/// RM clients the PRESENTING process created itself (the `NvDupHarden` rule). The KMD records
-/// clients per NVRM owner (`nvrm_clients::ClientTable`, keyed by the escape device), not per
-/// process, and keeps no owner-to-process map, so this cannot be answered yet and says
-/// [`ClientCheck::Unknown`]. M3c answers it before it dups anything the record names.
-fn record_client_owned_by_presenter(_process: usize, _h_client: u32) -> ClientCheck {
-    ClientCheck::Unknown
+/// The `h_client` rule (M3c-2): a record's `semaphore.h_client` and `source.h_client` must be RM
+/// clients the PRESENTING process created itself. What is compared: `process`, the
+/// `hKmdProcess` token of the D3DKMT device that owns the presenting context
+/// (`ContextHandleRef::creator_process`), against the token the KMD recorded with `h_client`
+/// when it forwarded the `NV_ESC_RM_ALLOC` of that client's root object: the escape's own device
+/// (`DeviceHandleRef::creator_process` of `hDevice`, `ddi/escape.rs`), stored in the client table
+/// beside the owner (`nvrm_clients::ClientTable::process_of`). One process has one
+/// `hKmdProcess` for all its devices (the token the present-stream registration already uses
+/// to tie the ICD's device to the runtime's), and a client leaves the table with its free, its
+/// file's close, its device's destruction and the transport, so a token of a dead process names
+/// no client. `Unknown` (refused by the route) whenever the table cannot say: hardening off
+/// (`NvDupHarden` 0 records nothing), a full table, no presenter, no transport. Spinlock only.
+pub(crate) fn record_client_owned_by_presenter(
+    adapter: &crate::adapter::AdapterContext,
+    process: usize,
+    h_client: u32,
+) -> ClientCheck {
+    let recorded = adapter
+        .with_virtio(|v| v.nvrm_client_process(h_client))
+        .ok()
+        .flatten();
+    cr::client_check(process, recorded)
 }
 
 /// A `HERF` / `HEPR` Render whose RM fence `tail` went to `attach_or_take_fence_tail`: read the
@@ -145,14 +160,9 @@ pub(crate) unsafe fn note_render(
                 crate::diag::record_named_qword(b"CeRecMod", record.source.modifier);
                 MODIFIER_WRITTEN.store(record.source.modifier, Ordering::Relaxed);
             }
-            let process = context.creator_process().unwrap_or(0);
-            for h_client in [record.semaphore.h_client, record.source.h_client] {
-                match record_client_owned_by_presenter(process, h_client) {
-                    ClientCheck::Owned | ClientCheck::Unknown => {}
-                    // M3c: count a mismatch here (`CeRecClient`); it never refuses the Present.
-                    ClientCheck::NotOwned => {}
-                }
-            }
+            // The `h_client` rule is the route's (`record_client_owned_by_presenter`, at the
+            // Present that would use the record, `ddi/ce_present_route.rs`): the stash keeps
+            // what the producer sent, and nothing acts on it before that check.
             record
         }),
     };

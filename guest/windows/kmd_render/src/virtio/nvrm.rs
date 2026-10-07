@@ -254,11 +254,16 @@ fn owned(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) -> bool {
 /// `epoch` is set to the device generation as of the first transport lock this
 /// call took (an `Ioctl` folds the read into its ownership check, so the hot path
 /// pays no lock for it); it stays `None` when the call was refused before any.
+///
+/// `process` is the `hKmdProcess` token of `owner`'s device (0 for the KMD's own client, or
+/// when unknown): an RM client this call allocates is recorded with it, which the
+/// copy-engine Present route's `h_client` rule reads (`ClientTable::process_of`).
 #[allow(clippy::too_many_arguments)]
 pub fn forward(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     owner: DeviceOwner,
+    process: usize,
     req: &[u8],
     resp: &mut [u8],
     timeout_ms: u64,
@@ -437,7 +442,7 @@ pub fn forward(
                     return Err(Refusal::Transport(e));
                 }
             };
-            harden::after_reply(adapter, owner, handle, hmode, reserved, req, resp, n);
+            harden::after_reply(adapter, owner, process, handle, hmode, reserved, req, resp, n);
             after_ioctl(adapter, owner, req, resp, n);
             Ok(n)
         }

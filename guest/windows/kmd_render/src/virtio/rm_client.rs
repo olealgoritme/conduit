@@ -663,6 +663,7 @@ impl Io<'_> {
             self.passive,
             self.adapter,
             KMD,
+            0,
             req,
             resp,
             timeout_ms,

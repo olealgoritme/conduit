@@ -124,13 +124,36 @@ pub const fn publish_bad_now(n: u32, mask_before: u32, why: Why) -> bool {
 }
 
 /// Whether a record's `h_client` is a client the PRESENTING process created (the `NvDupHarden`
-/// rule). The KMD records RM clients per NVRM owner (an escape device), not per process, so in
-/// this build the answer is always [`ClientCheck::Unknown`] (`kmd_render`'s hook says so).
+/// rule; [`client_check`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientCheck {
     Owned,
     NotOwned,
     Unknown,
+}
+
+/// One record client against the presenter (M3c-2). `presenter` is the `hKmdProcess` token of
+/// the D3DKMT device that owns the presenting context (`ContextHandleRef::creator_process`);
+/// `recorded` is the token the KMD stored with `client` when it forwarded the `NV_ESC_RM_ALLOC`
+/// of the client's root object for an escape device of that process
+/// (`nvrm_clients::ClientTable::process_of`). Owned only when both are known, nonzero and equal;
+/// anything the KMD cannot attribute is `Unknown`, which the route refuses like `NotOwned`.
+pub const fn client_check(presenter: usize, recorded: Option<usize>) -> ClientCheck {
+    match recorded {
+        _ if presenter == 0 => ClientCheck::Unknown,
+        None | Some(0) => ClientCheck::Unknown,
+        Some(p) if p == presenter => ClientCheck::Owned,
+        Some(_) => ClientCheck::NotOwned,
+    }
+}
+
+/// Both record clients: `Owned` only when both are, `NotOwned` when either is not.
+pub const fn both_owned(semaphore: ClientCheck, source: ClientCheck) -> ClientCheck {
+    match (semaphore, source) {
+        (ClientCheck::Owned, ClientCheck::Owned) => ClientCheck::Owned,
+        (ClientCheck::NotOwned, _) | (_, ClientCheck::NotOwned) => ClientCheck::NotOwned,
+        _ => ClientCheck::Unknown,
+    }
 }
 
 /// The counters M3c-0 writes, all in `kmd_render/src/ddi/ce_record.rs`. At most 14 characters,
@@ -236,6 +259,30 @@ mod tests {
         assert_eq!(available(96, 96), Some(0));
         assert_eq!(available(192, 96), Some(96));
         assert_eq!(available(256, 96), Some(160));
+    }
+
+    #[test]
+    fn the_client_rule_compares_process_tokens() {
+        assert_eq!(client_check(0x100, Some(0x100)), ClientCheck::Owned);
+        assert_eq!(client_check(0x100, Some(0x200)), ClientCheck::NotOwned);
+        assert_eq!(client_check(0x100, None), ClientCheck::Unknown);
+        assert_eq!(client_check(0x100, Some(0)), ClientCheck::Unknown);
+        assert_eq!(client_check(0, Some(0)), ClientCheck::Unknown);
+        assert_eq!(client_check(0, Some(0x100)), ClientCheck::Unknown);
+        let all = [ClientCheck::Owned, ClientCheck::NotOwned, ClientCheck::Unknown];
+        for a in all {
+            for b in all {
+                let r = both_owned(a, b);
+                let want = if a == ClientCheck::Owned && b == ClientCheck::Owned {
+                    ClientCheck::Owned
+                } else if a == ClientCheck::NotOwned || b == ClientCheck::NotOwned {
+                    ClientCheck::NotOwned
+                } else {
+                    ClientCheck::Unknown
+                };
+                assert_eq!(r, want, "{a:?} {b:?}");
+            }
+        }
     }
 
     #[test]

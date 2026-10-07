@@ -176,11 +176,13 @@ pub fn begin(
 }
 
 /// The host answered `req` with `n` bytes in `resp`. `handle` is the file the request
-/// went through. `reserved` is what [`begin`] returned.
+/// went through. `reserved` is what [`begin`] returned. `process` is the `hKmdProcess` token
+/// of `owner`'s device (0: unknown), recorded with a client this reply made.
 #[allow(clippy::too_many_arguments)]
 pub fn after_reply(
     adapter: &AdapterContext,
     owner: DeviceOwner,
+    process: usize,
     handle: u32,
     mode: u32,
     reserved: bool,
@@ -194,7 +196,7 @@ pub fn after_reply(
     if nvrm_clients::root_alloc(req) {
         let client = nvrm_clients::client_from_reply(req, resp, n);
         let outcome = adapter.with_virtio(|v| match client {
-            Some(c) => Some(v.commit_nvrm_client(owner, handle, c, reserved)),
+            Some(c) => Some(v.commit_nvrm_client(owner, process, handle, c, reserved)),
             None => {
                 if reserved {
                     v.cancel_nvrm_client(owner);
