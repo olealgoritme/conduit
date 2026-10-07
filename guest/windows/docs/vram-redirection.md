@@ -566,7 +566,7 @@ other value: 0, as before.
 | piece | file | what |
 |---|---|---|
 | pure rules | `kmd_logic/src/gdi_accel.rs` | caps; the `DXGK_RENDERKM_COMMAND` reader (x64 offsets checked against a C compile of the header's declarations; refusals `Bad`: size, opcode, sub-rects, trailer); `plan` (engine and `Why`); the CE words of a fill (`SET_REMAP_CONST_A/B/COMPONENTS` = `CONST_A` x4, `COMPONENT_SIZE_FOUR`, one component; `LAUNCH_DMA` with `REMAP_ENABLE`, pitch, multi-line, non-pipelined) and of a rectangle copy (`ce_present::copy`, `Remap::None`); the CPU reference executor (ROP3, the named ROPs, AlphaBlend premultiplied `AC_SRC_OVER`, TransparentBlt, StretchBlt with the truncate mapping and mirroring, ClearTypeBlend with and without the gamma table); the private record `"HGDA"`; the timeline |
-| caps and RenderKm | `kmd_render/src/ddi/gdi_accel.rs` | `reported_caps` (query_adapter_info), `note_start` (AdapterKnobs at StartDevice), `render_km`: parse, resolve each allocation index through `present_alloc_info` and classify it (VRAM: `vidmem::lookup`; System: a `PitchedStandardBuffer`; else Unreachable), plan, materialise and clip sub-rectangles (inline from the command buffer, or copied from dxgkrnl's kernel pointer), patch list, clear the private data and write the job id, 16-byte DMA marker |
+| caps, RenderKm and RenderGdi | `kmd_render/src/ddi/gdi_accel.rs` | `reported_caps` (query_adapter_info), `note_start` (AdapterKnobs at StartDevice), `note_create_device`/`note_create_context` (census), `render_km` and `render_gdi` (GpuMmu adapters get RenderGdi), both into `translate`: parse, resolve each allocation index through `present_alloc_info` and classify it (VRAM: `vidmem::lookup`; System: a `PitchedStandardBuffer`; else Unreachable), plan, materialise and clip sub-rectangles (inline from the command buffer, or copied from dxgkrnl's kernel pointer), patch list, clear the private data and write the job id, 16-byte DMA marker |
 | executor | `kmd_render/src/ddi/gdi_exec.rs` | job table (`commit`, orphans above 256 unclaimed), `admit` at SubmitCommand, `seq_ready` for the fence, `service` on the HPD worker, `discharge_all` at StopDevice |
 | seam | `kmd_render/src/ddi/gdi_ce_glue.rs` | the only calls into the V2-V5 modules (section 8): `vidmem::lookup`, `ce_vram::{ce_surface, wait, transfer}`, `ce_channel::submit_build`, `read/write_standard_buffer`; a busy channel retried 4 x 1 ms |
 | fence gate | `virtio/gpu/mod.rs` | `WddmPending::gdi_seq`: the immediate-signal path and the FIFO head both wait for `seq_ready`; not rebasable |
@@ -608,10 +608,20 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiUs`, `GdiUsMax` | executor time per job (sum, max, µs) |
 | `GdiCls` | surface classes seen: destination bit 0 VRAM, 1 standard buffer, 2 unreachable; sources the same at bits 4-6 |
 | `GdiDstRes`, `GdiDstWH` | last destination's resource id and `w << 16 \| h` |
+| `GdiRkIn`, `GdiRgIn` | entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing |
+| `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
 
 ### 10.6 Unverified, and known limits
+
+* **G0 on hardware (356.1, 5120x1440):** Windows accepts the caps (adapter OK, `StdNGdiTex` 18 /
+  `StdOGdiTex` 38, `StdNGdiStgCpu` 5, `StdNGdiStg` 1, `StdNGdiLut` 1) but `GdiCmdN` stayed 0: RenderKm
+  was never called. The reason: on a GPU-virtual-addressing adapter (this one reports GpuMmu) dxgkrnl's
+  `ADAPTER_RENDER::DdiRenderGdi` calls `DxgkDdiRenderGdi` (`DXGKARG_RENDERGDI`: the same
+  `DXGK_RENDERKM_COMMAND` stream, no patch lists, the DMA buffer's GPU VA), not RenderKm; the KMD's
+  RenderGdi was still the pass-through. Both entry points now share the translation (`render_km`,
+  `render_gdi` -> `translate`), and `GdiRgIn`/`GdiRkIn`/`GdiCtxN`/`GdiCtxFl` show which one runs.
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.
