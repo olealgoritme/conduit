@@ -621,6 +621,14 @@ fn every_screen() -> Vec<(&'static str, App, &'static str, &'static str)> {
     v.push(("guide", a, "This computer", "Enter done / close"));
     let mut a = app();
     a.screen = Screen::ChooseGuest;
+    a.key(Key::Enter);
+    a.dialog = Some(Dialog::Input {
+        field: Field::VmName,
+        buf: "ubuntu".into(),
+    });
+    v.push(("input", a, "Steps", "Enter save"));
+    let mut a = app();
+    a.screen = Screen::ChooseGuest;
     v.push(("choose-guest", a, "Choose a guest", "↑↓ choose"));
     let mut a = app();
     a.screen = Screen::ChooseGuest;

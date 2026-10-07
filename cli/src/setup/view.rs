@@ -97,7 +97,7 @@ fn hints(app: &App) -> Vec<Hint> {
     match (&app.dialog, app.screen) {
         (Some(Dialog::Confirm { .. }), _) => vec![h("Enter", "run it"), h("Esc", "cancel")],
         (Some(Dialog::Guide { .. }), _) => vec![h("Enter", "done / close"), h("Esc", "close")],
-        (Some(Dialog::Input { .. }), _) => vec![h("type", "then Enter"), h("Esc", "cancel")],
+        (Some(Dialog::Input { .. }), _) => vec![h("Enter", "save"), h("Esc", "cancel")],
         (_, Screen::Welcome) => vec![h("Enter", "begin"), h("q", "quit")],
         (_, Screen::HostCheck) => vec![
             h("↑↓", "choose"),
@@ -217,7 +217,7 @@ pub fn draw_with(f: &mut Frame, app: &App, t: &Theme) {
         Screen::Done => page(f, body, "Done. Now test in stages", &staged_text(), t),
     }
     if let Some(d) = &app.dialog {
-        draw_dialog(f, d, col, t);
+        draw_dialog(f, d, hints(app), col, t);
     }
 }
 
@@ -580,10 +580,11 @@ fn draw_output(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     );
 }
 
-fn draw_dialog(f: &mut Frame, d: &Dialog, col: Rect, t: &Theme) {
+/// `keys` are the footer's hints, repeated inside the dialog.
+fn draw_dialog(f: &mut Frame, d: &Dialog, keys: Vec<Hint>, col: Rect, t: &Theme) {
     let w = col.width.saturating_sub(8).min(76);
     let tw = w.saturating_sub(4) as usize;
-    let (title, mut lines, keys): (String, Vec<Line>, Vec<Hint>) = match d {
+    let (title, mut lines): (String, Vec<Line>) = match d {
         Dialog::Confirm { cmd, needs_sudo } => {
             let mut v: Vec<Line> = wrap(&format!("$ {}", command_line(cmd, *needs_sudo)), tw)
                 .into_iter()
@@ -600,16 +601,11 @@ fn draw_dialog(f: &mut Frame, d: &Dialog, col: Rect, t: &Theme) {
                     .map(|l| Line::styled(l, t.warn)),
                 );
             }
-            (
-                "Run this command?".into(),
-                v,
-                vec![h("Enter", "run it"), h("Esc", "cancel")],
-            )
+            ("Run this command?".into(), v)
         }
         Dialog::Guide { title, text } => (
             title.clone(),
             wrap(text, tw).into_iter().map(Line::raw).collect(),
-            vec![h("Enter", "done / close"), h("Esc", "close")],
         ),
         Dialog::Input { field, buf } => (
             field.label().to_string(),
@@ -617,7 +613,6 @@ fn draw_dialog(f: &mut Frame, d: &Dialog, col: Rect, t: &Theme) {
                 Span::styled("> ", t.key),
                 Span::styled(format!("{buf}_"), t.strong),
             ])],
-            vec![h("Enter", "save"), h("Esc", "cancel")],
         ),
     };
     lines.push(Line::raw(""));
