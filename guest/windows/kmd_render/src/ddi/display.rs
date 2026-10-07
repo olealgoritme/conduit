@@ -491,6 +491,11 @@ unsafe fn dxgkddi_present_inner(
                     _ => 0,
                 };
                 crate::diag::record_named_bytes(b"PBdtrk", code);
+                // Whether VidMm holds the destination in system memory at this Present (it has
+                // system-backing leases): the KMD's view of the redirection surface's segment
+                // (`docs/vram-redirection.md` 5.2). 1 = system-resident, 0 = segment 2 or untracked.
+                let sys = adapter.is_some_and(|adapter| adapter.system_backings.is_backed(d.resource_id));
+                crate::diag::record_named_bytes(b"PBdSys", u32::from(sys));
             } else {
                 crate::diag::record_named_bytes(b"PBdst", 0);
             }
