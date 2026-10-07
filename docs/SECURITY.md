@@ -61,7 +61,10 @@ None of this can be switched off from the command line.
   buffer sharing needs reaches the host display driver: device alloc/free and
   the five surface commands (register, unregister, grant, acquire, release).
   Everything that would act on the host's displays (modesets, flips, LUTs,
-  vblank control) is refused; vblank semaphore setup is answered locally. The
+  vblank control) is refused; vblank semaphore setup is answered locally.
+  Which command numbers those are comes from a generated table per driver
+  release (`host/backend/gen/src/nvkms/`), never from arithmetic on one
+  number; a release without its table is served only device alloc/free. The
   guest sees its GPU as one with no displays: the disp query is answered
   locally with no connectors and no monitors, so nothing about the host's
   monitors is sent to the guest and the per-connector and per-monitor
@@ -75,7 +78,17 @@ None of this can be switched off from the command line.
 - **Anything outside `--caps`.** No CUDA (`nvidia-uvm`) without `compute`, no
   encoders without `video`, no 3D without `graphics`.
 - **VRAM past `--vram-limit-mib`.** Allocations over the limit fail, and the
-  guest sees the limit as the card's memory size.
+  guest sees the limit as the card's memory size. When the NVIDIA card has a
+  monitor connected, `conduit` passes a limit by default (the smaller of half
+  the card's memory and its memory minus 3 GiB; 4 GiB when the card's memory
+  size is not known), so a guest cannot fill the memory the desktop needs.
+  `gpu.vram_limit_mib` (`auto`, `off` or MiB) overrides it.
+- **Blocking calls.** Two guest-supplied waits are bounded before they reach
+  the driver, because RM holds a GPU lock while it waits: the timeout of
+  `NV_ESC_RM_IDLE_CHANNELS` and of `SEMSURF_FENCE_CREATE` (10 s).
+- **Safe mode.** `CONDUIT_SAFE_MODE=1` (or `conduit config set gpu.safe_mode
+  true`) tightens both: a 2 GiB video-memory limit and 1 s on those waits.
+  It is meant for the first run on a new GPU or driver.
 
 The backend counts refusals and logs the totals when the VM exits
 (`conduit logs NAME`).

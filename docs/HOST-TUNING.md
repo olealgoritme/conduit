@@ -113,6 +113,18 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   and the same for `system.slice`), or at boot with `isolcpus=`/`nohz_full=`.
 - **CPU governor**: `performance` avoids clock ramp-up latency.
 
+## GPU memory: Resizable BAR and the video-memory limit
+
+- **BAR1.** Without Resizable BAR a GeForce exposes 256 MiB of its memory
+  to the CPU, and every guest mapping of GPU memory goes through that window,
+  shared with the host desktop. Turn on Above 4G Decoding and Resizable BAR in
+  the firmware settings for large guest workloads. `conduit doctor` prints the
+  size.
+- **Sharing the card with your desktop.** When the card has a monitor
+  connected, guests get a default video-memory limit so the compositor keeps
+  room (`gpu.vram_limit_mib`, [SECURITY.md](SECURITY.md)). Check it with
+  `conduit doctor`; `off` removes it on a headless or dedicated card.
+
 ## Measuring
 
 Before trusting a benchmark difference, run it at least three times on a

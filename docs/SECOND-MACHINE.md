@@ -9,12 +9,21 @@ status, first-hour plan for an RTX 4070) first. Background: [WINDOWS.md](WINDOWS
 
 ## 1. Host driver
 
-- NVIDIA **open** kernel modules, a release Conduit has RM ABI tables for:
-  580.178.04, 595.71.05, 595.104.02, 610.57.04 or 615.71.09
-  (`host/backend/gen/src/osdesc/`). The RM protocol (ioctl and control
-  layouts) changes between driver versions, and the backend forwards the
-  guest's RM calls only for a version it has tables for. A newer driver needs
-  its tables generated first (`host/backend/gen`, `.github/workflows/abi.yml`).
+- A driver release Conduit has ABI tables for: 535.129.03, 565.77, 580.178.04,
+  595.71.05, 595.104.02, 610.57.04 or 615.71.09 (`conduit doctor` lists
+  them). It is developed on the NVIDIA **open** kernel modules, 580 or newer;
+  the closed modules and older branches with tables are accepted with a
+  warning and are untested. The RM protocol (ioctl and control layouts)
+  changes between driver versions, and the backend forwards the guest's calls
+  only for a version it has tables for. A release without them is refused.
+  Its tables are generated offline, with no GPU
+  (`.github/scripts/abi_update.py`, `host/backend/gen/README.md`): rmctrl,
+  rmallow, uvm, vidmem, osdesc, devinfo, nvkms and the escape sizes. Two
+  lists are still edited by hand for a new release: the `PROFILES` of
+  `abi::devinfo` and the includes in `guest/linux/nvgpu_devinfo.h`.
+- On a GPU that also drives your monitor, `conduit doctor` prints the video
+  memory limit guests get and the card's BAR1 size; set
+  `CONDUIT_SAFE_MODE=1` for the first run ([SECURITY.md](SECURITY.md)).
 - The NVIDIA Vulkan driver of the same release (`conduit-venus` uses it for
   the Venus fallback).
 - KVM (`ls /dev/kvm`), a Wayland desktop, `virt-manager`/libvirt for the VM.
