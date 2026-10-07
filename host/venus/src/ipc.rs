@@ -25,14 +25,16 @@
 //! thread, so a message's fragments are never interleaved with another's.
 //! All integers are little-endian.
 
-use crate::{Blob, CapsetInfo, Dmabuf, Error, Renderer, Result, ScanoutLayout, Signalled};
+use crate::{
+    Blob, CapsetInfo, Dmabuf, Error, FenceHook, FenceSink, FencedError, Renderer, Result, ScanoutLayout, Signalled,
+};
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 /// Payload bytes per fragment. Well under the default send buffer, which
@@ -69,6 +71,17 @@ mod op {
     /// RAM file as the request's fd. Sent only to a server whose features
     /// carry `FEATURE_IMPORT_GUEST_PAGES`.
     pub const IMPORT_GUEST_PAGES: u32 = 13;
+    /// `{on u32}`: stage stamps on (1) or off (0); the reply is every stamp
+    /// since the last `STAGES` as a `stage` dump. Sent only to a server
+    /// whose features carry `FEATURE_STAGE_TRACE`.
+    pub const STAGES: u32 = 14;
+    /// `{ctx u32, ring u32, fence_id u64, commands}`: `SUBMIT` and then, if
+    /// it went through, `CREATE_FENCE`, in one round trip. `ERR` is the
+    /// submit's error (no fence was asked for); `OK` with an empty body is
+    /// both done; `OK` with `{1 u32, error}` is a submit that went through
+    /// and a fence that did not. Sent only to a server whose features carry
+    /// `FEATURE_SUBMIT_FENCED`.
+    pub const SUBMIT_FENCED: u32 = 15;
 
     /// `CAPSET_INFO` with this index asks for [`Renderer::features`]: the
     /// reply's first word is the bits. A server from before features passes
@@ -433,6 +446,9 @@ struct Shared {
     fences: Mutex<Vec<Signalled>>,
     event: OwnedFd,
     dead: AtomicBool,
+    /// [`Renderer::set_fence_hook`]: run by the reader after it queued
+    /// fences, before (or instead of) waking `event`.
+    hook: OnceLock<FenceHook>,
 }
 
 /// The backend's [`Renderer`]: forwards every call to `conduit-venus`.
@@ -459,8 +475,12 @@ impl IpcClient {
     /// Wrap a connected `SOCK_SEQPACKET` socket.
     pub fn new(sock: OwnedFd) -> io::Result<Self> {
         let sock = Arc::new(sock);
-        let shared =
-            Arc::new(Shared { fences: Mutex::new(Vec::new()), event: eventfd()?, dead: AtomicBool::new(false) });
+        let shared = Arc::new(Shared {
+            fences: Mutex::new(Vec::new()),
+            event: eventfd()?,
+            dead: AtomicBool::new(false),
+            hook: OnceLock::new(),
+        });
         let (tx, replies) = channel();
         let reader = {
             let (sock, shared) = (sock.clone(), shared.clone());
@@ -512,7 +532,11 @@ fn read_loop(sock: &OwnedFd, shared: &Shared, tx: Sender<Reply>) {
         if m.kind == op::FENCES {
             let Ok(f) = decode_fences(&m.body) else { break };
             shared.fences.lock().unwrap_or_else(|p| p.into_inner()).extend(f);
-            eventfd_signal(shared.event.as_fd());
+            // The hook takes them here, on this thread, when it can: one
+            // thread hop fewer than waking whoever polls the eventfd.
+            if !shared.hook.get().is_some_and(|h| h()) {
+                eventfd_signal(shared.event.as_fd());
+            }
         } else if tx.send(Ok(m)).is_err() {
             break;
         }
@@ -593,6 +617,35 @@ impl Renderer for IpcClient {
     fn create_fence(&mut self, ctx_id: u32, ring_idx: u32, fence_id: u64) -> Result<()> {
         self.call(op::CREATE_FENCE, &W::default().u32(ctx_id).u32(ring_idx).u64(fence_id).0)?;
         Ok(())
+    }
+
+    fn submit_fenced(
+        &mut self,
+        ctx_id: u32,
+        commands: &[u8],
+        ring_idx: u32,
+        fence_id: u64,
+    ) -> std::result::Result<(), FencedError> {
+        if self.features() & crate::FEATURE_SUBMIT_FENCED == 0 {
+            self.submit(ctx_id, commands).map_err(FencedError::Submit)?;
+            return self.create_fence(ctx_id, ring_idx, fence_id).map_err(FencedError::Fence);
+        }
+        let body = W::default().u32(ctx_id).u32(ring_idx).u64(fence_id).bytes(commands).0;
+        let m = self.call(op::SUBMIT_FENCED, &body).map_err(FencedError::Submit)?;
+        if m.body.is_empty() {
+            return Ok(());
+        }
+        let mut r = R(&m.body);
+        match r.u32() {
+            Ok(1) => Err(FencedError::Fence(decode_err(r.rest()))),
+            _ => Err(FencedError::Fence(proto("venus ipc: bad fenced-submit reply"))),
+        }
+    }
+
+    fn set_fence_hook(&mut self, hook: FenceHook) -> bool {
+        // Fences queued before the hook was set still have their eventfd
+        // wakeup; only later ones go through the hook.
+        self.shared.hook.set(hook).is_ok()
     }
 
     fn fence_fd(&self) -> BorrowedFd<'_> {
@@ -676,19 +729,57 @@ impl Renderer for IpcClient {
         self.call_fd(op::IMPORT_GUEST_PAGES, &w.0, Some(ram))?;
         Ok(())
     }
+
+    fn stages(&mut self, on: bool) -> Result<Vec<crate::stage::Rec>> {
+        if self.features() & crate::FEATURE_STAGE_TRACE == 0 {
+            return Err(Error::Refused("the renderer does not stamp stages".into()));
+        }
+        let m = self.call(op::STAGES, &W::default().u32(on as u32).0)?;
+        crate::stage::decode_dump(&m.body).map(|(r, _)| r).ok_or_else(|| proto("bad stage dump"))
+    }
 }
 
 // -------------------------------------------------------------------- server
 
 /// The renderer side: serves one backend connection with any [`Renderer`].
 pub struct IpcServer {
-    sock: OwnedFd,
+    sock: Arc<OwnedFd>,
     renderer: Box<dyn Renderer>,
+    /// Held for the whole of every message sent: with direct fences
+    /// ([`IpcServer::direct_fences`]) the renderer's fence threads send too,
+    /// and a message's fragments must not interleave with another's.
+    send_lock: Arc<Mutex<()>>,
+    direct_fences: bool,
+}
+
+/// Stage timing: the fences just sent to the backend (`R_PUSH`), from the
+/// serve loop or, with direct fences, from the thread that retired them.
+fn stamp_pushed(f: &[Signalled]) {
+    if crate::stage::on() {
+        let now = crate::stage::now_ns();
+        for s in f {
+            crate::stage::stamp(crate::stage::Rec::fence(crate::stage::R_PUSH, s.ctx_id, s.ring_idx, s.fence_id, now));
+        }
+    }
 }
 
 impl IpcServer {
     pub fn new(sock: OwnedFd, renderer: Box<dyn Renderer>) -> Self {
-        Self { sock, renderer }
+        Self { sock: Arc::new(sock), renderer, send_lock: Arc::new(Mutex::new(())), direct_fences: false }
+    }
+
+    /// Have the renderer send each signalled fence to the backend from the
+    /// thread that retires it ([`Renderer::set_fence_sink`]) instead of
+    /// queueing it for this thread's poll loop: one thread hop fewer per
+    /// fence. A renderer that cannot keeps the queue.
+    pub fn direct_fences(mut self, yes: bool) -> Self {
+        self.direct_fences = yes;
+        self
+    }
+
+    fn send(&self, kind: u32, body: &[u8], fd: Option<BorrowedFd<'_>>) -> io::Result<()> {
+        let _g = self.send_lock.lock().unwrap_or_else(|p| p.into_inner());
+        send_msg(self.sock.as_fd(), kind, body, fd)
     }
 
     /// Serve until the backend hangs up (`Ok`) or breaks the protocol.
@@ -696,6 +787,19 @@ impl IpcServer {
     /// Single-threaded: requests and fence forwarding share one poll loop, so
     /// replies and `FENCES` messages are never interleaved mid-fragment.
     pub fn serve(mut self) -> io::Result<Self> {
+        if self.direct_fences {
+            let (sock, lock) = (self.sock.clone(), self.send_lock.clone());
+            let sink: FenceSink = Box::new(move |s: Signalled| {
+                let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                // A failed send is a backend that hung up, which the serve
+                // loop finds out on its next receive.
+                if send_msg(sock.as_fd(), op::FENCES, &encode_fences(&[s]), None).is_ok() {
+                    stamp_pushed(&[s]);
+                }
+            });
+            let direct = self.renderer.set_fence_sink(sink);
+            eprintln!("conduit-venus: direct fences {}", if direct { "on" } else { "not supported by this renderer" });
+        }
         let mut buf = Vec::new();
         loop {
             let mut pfd = [
@@ -735,13 +839,15 @@ impl IpcServer {
         if f.is_empty() {
             return Ok(());
         }
-        send_msg(self.sock.as_fd(), op::FENCES, &encode_fences(&f), None)
+        self.send(op::FENCES, &encode_fences(&f), None)?;
+        stamp_pushed(&f);
+        Ok(())
     }
 
     fn reply(&self, r: Result<Vec<u8>>, fd: Option<BorrowedFd<'_>>) -> io::Result<()> {
         match r {
-            Ok(body) => send_msg(self.sock.as_fd(), op::OK, &body, fd),
-            Err(e) => send_msg(self.sock.as_fd(), op::ERR, &encode_err(&e), None),
+            Ok(body) => self.send(op::OK, &body, fd),
+            Err(e) => self.send(op::ERR, &encode_err(&e), None),
         }
     }
 
@@ -753,7 +859,8 @@ impl IpcServer {
             op::CAPSET_INFO => {
                 let index = r.u32().map_err(|_| bad())?;
                 if index == op::FEATURES_PROBE {
-                    let f = rd.features();
+                    // SUBMIT_FENCED is this server's, served for any renderer.
+                    let f = rd.features() | crate::FEATURE_SUBMIT_FENCED;
                     return self.reply(Ok(W::default().u32(f).0), None);
                 }
                 let res = rd.capset_info(index).map(|c| W::default().u32(c.id).u32(c.max_version).u32(c.max_size).0);
@@ -826,6 +933,20 @@ impl IpcServer {
                 }
                 let res = rd.import_guest_pages(res, m.fds[0].as_fd(), &runs).map(|()| Vec::new());
                 self.reply(res, None)
+            }
+            op::STAGES => {
+                let on = r.u32().map_err(|_| bad())? != 0;
+                let res = rd.stages(on).map(|recs| crate::stage::encode_dump(&recs, 0));
+                self.reply(res, None)
+            }
+            op::SUBMIT_FENCED => {
+                let mut f = || -> Result<_> { Ok((r.u32()?, r.u32()?, r.u64()?)) };
+                let (ctx, ring, id) = f().map_err(|_| bad())?;
+                match rd.submit_fenced(ctx, r.rest(), ring, id) {
+                    Ok(()) => self.reply(Ok(Vec::new()), None),
+                    Err(FencedError::Submit(e)) => self.reply(Err(e), None),
+                    Err(FencedError::Fence(e)) => self.reply(Ok(W::default().u32(1).bytes(&encode_err(&e)).0), None),
+                }
             }
             op::CREATE_FENCE => {
                 let mut f = || -> Result<_> { Ok((r.u32()?, r.u32()?, r.u64()?)) };
@@ -913,6 +1034,25 @@ mod tests {
         assert!(matches!(c.capset_info(1), Err(Error::Refused(s)) if s == "capset index"));
         assert_eq!(c.capset(CAPSET_VENUS, 0).unwrap(), vec![0; 160]);
         assert!(matches!(c.capset(1, 0), Err(Error::Refused(s)) if s == "capset id"));
+    }
+
+    #[test]
+    fn stage_stamps_cross_the_socket() {
+        let (mut c, s) = pair();
+        assert!(c.stages(true).unwrap().is_empty());
+        c.ctx_create(1, CAPSET_VENUS, b"dwm.exe").unwrap();
+        c.create_fence(1, 1, 0x1_0000_0077).unwrap();
+        let recs = c.stages(false).unwrap();
+        assert_eq!(recs.len(), 1);
+        let r = recs[0];
+        assert_eq!(
+            (r.stage, r.kind, r.ctx, r.ring, r.id),
+            (crate::stage::R_FENCE, crate::stage::KIND_FENCE, 1, 1, 0x1_0000_0077)
+        );
+        c.create_fence(1, 1, 0x78).unwrap();
+        assert!(c.stages(false).unwrap().is_empty(), "off: nothing stamped");
+        drop(c);
+        s.join().unwrap();
     }
 
     #[test]
@@ -1353,7 +1493,10 @@ mod tests {
     #[test]
     fn dmabuf_import_carries_the_descriptor() {
         let (mut c, log, server) = importer_pair(true);
-        assert_eq!(c.features(), crate::FEATURE_IMPORT_DMABUF | crate::FEATURE_IMPORT_GUEST_PAGES);
+        assert_eq!(
+            c.features(),
+            crate::FEATURE_IMPORT_DMABUF | crate::FEATURE_IMPORT_GUEST_PAGES | crate::FEATURE_SUBMIT_FENCED
+        );
         let buf = crate::mock::memfd(1 << 16).unwrap();
         c.import_dmabuf(7, buf.as_fd(), 1 << 16).unwrap();
         // The renderer got the very file, not a copy of its bytes.
@@ -1370,7 +1513,8 @@ mod tests {
     #[test]
     fn a_renderer_without_the_feature_is_never_sent_the_op() {
         let (mut c, log, server) = importer_pair(false);
-        assert_eq!(c.features(), 0);
+        // The server's own op only.
+        assert_eq!(c.features(), crate::FEATURE_SUBMIT_FENCED);
         let buf = crate::mock::memfd(4096).unwrap();
         assert!(matches!(c.import_dmabuf(1, buf.as_fd(), 4096), Err(Error::Refused(_))));
         assert!(log.lock().unwrap().is_empty());
@@ -1401,6 +1545,145 @@ mod tests {
         assert_eq!(c.features(), 0);
         assert_eq!(c.features(), 0, "asked once, remembered");
         assert_eq!(c.capset_info(0).unwrap().id, CAPSET_VENUS);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_fenced_submit_is_one_message_and_its_fence_signals() {
+        let (mut c, server) = pair();
+        assert_ne!(c.features() & crate::FEATURE_SUBMIT_FENCED, 0);
+        c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
+        c.submit_fenced(1, &[1, 2, 3, 4], 2, 77).unwrap();
+        assert!(readable(c.fence_fd(), 1000));
+        assert_eq!(c.signalled().unwrap(), vec![Signalled { ctx_id: 1, ring_idx: 2, fence_id: 77 }]);
+        // A submit on an unknown context fails as a submit: no fence asked.
+        assert!(matches!(c.submit_fenced(9, &[0; 4], 0, 78), Err(FencedError::Submit(Error::NoContext(9)))));
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_fence_hook_takes_fences_on_the_reader_thread() {
+        let (mut c, server) = pair();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        assert!(c.set_fence_hook(Box::new(move || {
+            h.fetch_add(1, Ordering::SeqCst);
+            true
+        })));
+        c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
+        c.submit(1, &[0; 4]).unwrap();
+        c.create_fence(1, 0, 5).unwrap();
+        let t0 = std::time::Instant::now();
+        while hits.load(Ordering::SeqCst) == 0 && t0.elapsed() < std::time::Duration::from_secs(1) {
+            std::thread::yield_now();
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Taken by the hook: the eventfd was not woken, the queue still holds
+        // the fence for whoever the hook asks to drain it.
+        assert!(!readable(c.fence_fd(), 0));
+        assert_eq!(c.signalled().unwrap(), vec![Signalled { ctx_id: 1, ring_idx: 0, fence_id: 5 }]);
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_hook_that_declines_leaves_the_eventfd_wakeup() {
+        let (mut c, server) = pair();
+        assert!(c.set_fence_hook(Box::new(|| false)));
+        c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
+        c.create_fence(1, 0, 6).unwrap();
+        assert!(readable(c.fence_fd(), 1000));
+        assert_eq!(c.signalled().unwrap(), vec![Signalled { ctx_id: 1, ring_idx: 0, fence_id: 6 }]);
+        drop(c);
+        server.join().unwrap();
+    }
+
+    /// A renderer that sends fences through a sink from its own thread, the
+    /// way `Virgl` does with direct fences, while the serve loop answers.
+    #[test]
+    fn direct_fences_do_not_interleave_with_large_replies() {
+        struct Direct {
+            inner: Mock,
+            sink: Arc<Mutex<Option<crate::FenceSink>>>,
+        }
+        impl Renderer for Direct {
+            fn capset_info(&mut self, i: u32) -> Result<CapsetInfo> {
+                self.inner.capset_info(i)
+            }
+            fn capset(&mut self, _: u32, _: u32) -> Result<Vec<u8>> {
+                // Large enough for several fragments.
+                Ok(vec![0xab; 5 * FRAG + 3])
+            }
+            fn ctx_create(&mut self, c: u32, s: u32, n: &[u8]) -> Result<()> {
+                self.inner.ctx_create(c, s, n)
+            }
+            fn ctx_destroy(&mut self, c: u32) {
+                self.inner.ctx_destroy(c)
+            }
+            fn ctx_attach(&mut self, c: u32, r: u32) -> Result<()> {
+                self.inner.ctx_attach(c, r)
+            }
+            fn ctx_detach(&mut self, c: u32, r: u32) {
+                self.inner.ctx_detach(c, r)
+            }
+            fn submit(&mut self, c: u32, cmd: &[u8]) -> Result<()> {
+                self.inner.submit(c, cmd)
+            }
+            fn create_blob(&mut self, c: u32, r: u32, b: u64, s: u64, f: u32) -> Result<Blob> {
+                self.inner.create_blob(c, r, b, s, f)
+            }
+            fn unref(&mut self, r: u32) {
+                self.inner.unref(r)
+            }
+            fn create_fence(&mut self, c: u32, r: u32, f: u64) -> Result<()> {
+                // Signalled from another thread, as a sync thread would.
+                let sink = self.sink.clone();
+                std::thread::spawn(move || {
+                    if let Some(s) = sink.lock().unwrap().as_ref() {
+                        s(Signalled { ctx_id: c, ring_idx: r, fence_id: f });
+                    }
+                });
+                Ok(())
+            }
+            fn fence_fd(&self) -> BorrowedFd<'_> {
+                self.inner.fence_fd()
+            }
+            fn signalled(&mut self) -> Result<Vec<Signalled>> {
+                Ok(Vec::new())
+            }
+            fn export_scanout(&mut self, r: u32, l: ScanoutLayout) -> Result<Dmabuf> {
+                self.inner.export_scanout(r, l)
+            }
+            fn set_fence_sink(&mut self, sink: crate::FenceSink) -> bool {
+                *self.sink.lock().unwrap() = Some(sink);
+                true
+            }
+        }
+        let (a, b) = socketpair().unwrap();
+        let server = std::thread::spawn(move || {
+            let r = Direct { inner: Mock::new(), sink: Arc::new(Mutex::new(None)) };
+            IpcServer::new(b, Box::new(r)).direct_fences(true).serve().unwrap();
+        });
+        let mut c = IpcClient::new(a).unwrap();
+        c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
+        let mut want = Vec::new();
+        for i in 0..200u64 {
+            c.create_fence(1, 0, i).unwrap();
+            want.push(i);
+            // Large replies while fences fly from the other threads.
+            assert_eq!(c.capset(CAPSET_VENUS, 0).unwrap().len(), 5 * FRAG + 3);
+        }
+        let mut got = Vec::new();
+        let t0 = std::time::Instant::now();
+        while got.len() < want.len() && t0.elapsed() < std::time::Duration::from_secs(5) {
+            if readable(c.fence_fd(), 100) {
+                got.extend(c.signalled().unwrap().into_iter().map(|s| s.fence_id));
+            }
+        }
+        got.sort_unstable();
+        assert_eq!(got, want);
+        drop(c);
         server.join().unwrap();
     }
 }

@@ -874,6 +874,7 @@ M3c's: the channel's state is one leaf spinlock of its own (`STATE` in `ce_chann
 | 0 (default), and any value not listed | nothing |
 | 1 | reserved for the Present route (M3c); nothing in M3b |
 | 2 | the self-test (11.10), once per transport generation, from the HPD worker |
+| 3 | the shadow mode of M3c-1 (section 14): sampled Presents copied again by the channel and compared with the production copy |
 
 What runs at 0: StartDevice reads the knob and writes `CeKnob` = 0 (the read and mirror every per-generation knob does); the HPD
 worker pays one relaxed load per pass (`ce_channel::service`); StopDevice and StartDevice pay one relaxed load
@@ -919,9 +920,9 @@ the error notifier through the kernel views and advances `ce_present::Ring`; a s
 | VA space | `FERMI_VASPACE_A` index `GPU_DEVICE` | the same |
 | generation | `--gen` | `GET_CLASSLIST_V2` (nvk-rm 0003's way) |
 | engine | the first async CE | the first async CE with `SYSMEM_WRITE` and not `SHARED`, then one with `SYSMEM_WRITE`, then the tool's rule (7.2) |
-| GPFIFO and push slots | an OS descriptor over process pages | RM system memory, write-combined, CPU view through the RM window (`MmMapIoSpace` write-combined), GPU-mapped snooped with 4 KiB pages |
+| GPFIFO and push slots | an OS descriptor over process pages | RM system memory, cached as the tool's (`RmCeCache` 1: write-combined), CPU view through the RM window armed on a fresh CONTROL file (`MmMapIoSpace` cached, or write-combined with the knob), GPU-mapped snooped with 4 KiB pages |
 | completion value | its own 4 KiB of RM system memory | a page of the ring allocation |
-| error notifier and USERD | 8 KiB RM system memory, cached | 8 KiB RM system memory, write-combined (every view agrees with the host's: no alias, `kmd-rm-client.md` 15.5) |
+| error notifier and USERD | 8 KiB RM system memory, cached | the same (the channel's private memory has no dxgkrnl view, so the level-5 alias concern of `kmd-rm-client.md` 15.5 does not apply) |
 | doorbell | the usermode object, `crm_map_memory` through the subdevice, a user-mode store | the same object and the same messages (`RM_MAP_MEMORY` on the subdevice armed on a fresh GPU file, the host's `Mmap`), then `MmMapIoSpace` UNCACHED of that range of the RM window, and the store from kernel mode: item 8 of 11.7, settled by a self-test PASS |
 | GPU VAs | packed from 0x20_0000_0000, 2 MiB apart | fixed 64 MiB windows from 0x20_0000_0000 (ring, self-test source, destination), RM's choice if the fixed range is refused, below 2^40 checked |
 | GPU timestamps, `--fence` | yes | none: the self-test's times are CPU times (`KeQueryInterruptTimePrecise`), spinning up to 20 ms then 1 ms sleeps |
@@ -938,7 +939,7 @@ the error notifier through the kernel views and advances `ce_present::Ring`; a s
 
 Once per transport generation, from the HPD worker at PASSIVE (the first pass with the RM transport up and a VidPn primary
 bound), never inside a DDI: bring the channel up; allocate a source and a destination (5763072 B each) of RM system memory
-in the channel's client (write-combined, CPU views, GPU mappings); fill the source with a salted position-dependent pattern;
+in the channel's client (cached by default, CPU views, GPU mappings); fill the source with a salted position-dependent pattern;
 copy 1600x900x4 pitch-linear twice with `ce_present::present_push`:
 1. **ready**: the producer value is set before the kick. `CeSelfUs` = kick to completion seen.
 2. **wait**: the push acquires a value the producer does not have; the worker sleeps 2 ms (a timer tick), checks the completion
@@ -972,10 +973,10 @@ back to its value without the knob), then set the knob back to 0 and restart.
 | `CeSelfUs` | about the tool's ready doorbell-to-done (below 400 us: the copy is about 200 to 350 us) | |
 | `CeSelfWaitUs` | below 50 us plus the copy | |
 | `CeSelfPages` | 1407 | |
-| `CeSelfMs` | hundreds of ms (the fill and the compares at write-combined speed) | |
+| `CeSelfMs` | tens of ms cached; hundreds with `RmCeCache` 1 (the fill and the compares at write-combined speed) | |
 | `CeChTry` / `CeChUp` / `CeChDown` | 1 / 1 / 1 per generation | |
 | `CeChStage` | 20 (the last stage started) | the stage that hung or failed |
-| `CeChFail` | 0 | `stage << 24 \| kind << 16 \| code`; kinds as `RmFail` (`kmd-rm-client.md` 3); Transport codes 0xE1 budget spent, 0xE2 StopDevice, 0xE3 the first push never landed (the doorbell from kernel mode is the first suspect); Layout 0x60 no known class set, 0x61 no async copy engine, 0x68 a GPU VA at or above 2^40; Rm with `CeNotify` set: the error notifier |
+| `CeChFail` | 0 | example: 0x0804001F = stage 8 (`CtlMap`), kind 4 (RM), code 0x1F `NV_ERR_INVALID_ARGUMENT` (11.11). `stage << 24 \| kind << 16 \| code`; kinds as `RmFail` (`kmd-rm-client.md` 3); Transport codes 0xE1 budget spent, 0xE2 StopDevice, 0xE3 the first push never landed (the doorbell from kernel mode is the first suspect); Layout 0x60 no known class set, 0x61 no async copy engine, 0x68 a GPU VA at or above 2^40; Rm with `CeNotify` set: the error notifier |
 | `CeChSoft` | **0** | undo steps RM or the host did not confirm |
 | `CeRmErr` / `CeChanFail` / `CeNotify` | 0 / 0 / 0 | a refused caps query adds 1 to `CeRmErr` and is harmless |
 | `CeChan` / `CeChState` | 0 / 0 (torn down, cold, no strikes) | `CeChState` = `phase << 28 \| strikes << 24 \| made bits` |
@@ -983,11 +984,53 @@ back to its value without the knob), then set the knob back to 0 and restart.
 | `CeEngine` / `CeCaps` | a `COPYn` type (0x09..0x12, 0x34..0x3d) / its caps, `SYSMEM_WRITE` (0x08) set, `GRCE` (0x01) clear | |
 | `CeToken` / `CeRunlist` | the token / its runlist (bits 22:16): not GR's (the tool prints both) | |
 | `CeSubmit` | 3 (the first push and the two copies) | |
+| `CeCache` | 0 (cached; 1 with `RmCeCache` = 1) | |
+| `CeRmCall` / `CeRmStat` / `CeMapNode` | 0 / 0 / 0 | the last failing call (11.11) |
 | `CeChMs` | tens of ms | |
 
 A PASS settles items 3 (no `NON_STALL_INTERRUPT` is used), 5 (does not arise) and 8 (the kernel-mode doorbell) of 11.7 for
-the KMD client, and that a write-combined RM system-memory ring, USERD and notifier work for a CE channel. It says nothing
+the KMD client, and that an RM system-memory ring, USERD and notifier (of the kind `CeCache` names) work for a CE channel. It says nothing
 about block-linear sources, dups of NVK's memory or the destination descriptors (M3c).
+
+### 11.11 The 348.1 failure: system memory mapped on the wrong kind of file (fixed)
+
+The first hardware run (348.1, 1920x1080@240, `RmCopyEngine` = 2) stopped at stage 8: `CeChStage` = 8 (`CtlMap`),
+`CeChFail` = 0x0804001F (stage 8, kind 4 = RM status, code 0x1F = `NV_ERR_INVALID_ARGUMENT`), `CeSelfTest` = 0xE1,
+`CeSelfWhy` = 0x1F, `CeRmErr` = 1, `CeChState` = 0x51000000 (cool-down, one strike). Stages 1 to 7 passed, among them the
+doorbell's CPU view (stage 6).
+
+Cause, in the KMD: `cpu_map` armed EVERY CPU view on a fresh GPU file (the minor, tied with `REGISTER_FD`), the way
+`rm_client.rs`'s level 2 maps VIDEO memory. RM maps system memory only on a control file: librmclient's `map_node_hint`
+(`guest/rmclient/src/rmclient.c`) sends `NV01_MEMORY_SYSTEM` and OS descriptors to the control node, and
+`win_map_memory` (`transport_windows.c`) opens a fresh control file (no `REGISTER_FD`) for them; a map on the wrong kind
+is answered `NV_ERR_INVALID_ARGUMENT` ("wrong channel kind, RM already undid its side"), after which librmclient retries
+once on the other kind. The doorbell (BAR memory) is mapped on a GPU file, which is why stage 6 passed. The host passes
+`RM_MAP_MEMORY` through as it is (`host/backend/device/src/nvidia/rm_fd.rs` `dispatch_map_memory`: the embedded file
+handle translated, the status returned unchanged), and serves a write-combined mapping of system memory for a user client
+(the DWM/NVK log): the cache attribute was not the cause. The NVOS33 block matched librmclient's (`rc::nvos33_with_fd`:
+hClient 0, hDevice 4 = the device, hMemory 8, offset 16, length 24, flags 44 = 0, fd 48).
+
+Fix: `rm_ce_channel::MapNode` picks the kind by class (system memory and OS descriptors: a fresh control file, no
+`REGISTER_FD`; anything else: a GPU file with `REGISTER_FD`), and `cpu_map` retries once on the other kind after RM's
+`INVALID_ARGUMENT`, as librmclient does. The kernel view is placed in the region of the map file's device type (the RM
+window for both). Every stage that maps system memory had the same fault: stage 8 (`CtlMap`), stage 10 (`RingMap`) and the
+self-test's source and destination views (stage 0xE2 / 0xE3 of `CeSelfTest`); allocations (stages 7 and 9, the self-test's
+buffers), GPU mappings (stage 11) and the channel objects (12 to 19) never take a map file and were not affected.
+
+Also changed with it:
+- **`RmCeCache`** (service-key REG_DWORD, read at StartDevice when `RmCopyEngine` is nonzero, mirrored as `CeCache`): 0
+  (default) the channel's own RM system memory is CACHED, as the tool allocates it (`NVOS32_ATTR_COHERENCY_CACHED`), and its
+  kernel views are `MmCached`; 1 write-combined memory and `MmWriteCombined` views (M3b's first choice), for an A/B. The
+  doorbell stays uncached.
+- **The failing call is named**: `CeRmCall` = `esc << 24 | what` (`esc` 0x2b ALLOC with the class, 0x2a CONTROL with the
+  command's low 24 bits, 0x29 FREE, 0x4e MAP_MEMORY, 0x4f UNMAP_MEMORY, 0x57 / 0x58 MAP / UNMAP_MEMORY_DMA with the object
+  handle's low 24 bits; 0xf1 the `Open` of a map file with its device type, 0xf2 the host's `Mmap`, 0xf3 `MmMapIoSpace`),
+  `CeRmStat` = RM's status (or `0x8000_0000 | kind << 16 | code`), `CeMapNode` = `node << 28 | map file handle` of a failed CPU
+  view (node 1 control file, 2 GPU file). The 348.1 failure would have read `CeRmCall` 0x4e4d3003, `CeRmStat` 0x1F,
+  `CeMapNode` 0x2000_00xx.
+
+The next run reads as 11.10 says for a PASS, with `CeCache` = 0 and `CeRmCall` / `CeRmStat` / `CeMapNode` = 0; then once with
+`RmCeCache` = 1 for the A/B (`CeSelfUs`, `CeSelfWaitUs`, `CeSelfMs`).
 
 ## 12. Format conversion with the CE remap unit (M1c)
 
@@ -1088,3 +1131,308 @@ Pass criteria:
 A PASS settles the remap's methods and fields on 0xcab5 against Mesa's header (11.7 item 9) and the open question for the
 tool's own block-linear image. As with M1b, the round trip goes through one mapping, so the match with NVK's own layout and
 kind is still M3c's check (10.3). Ada (0xc7b5) stays unverified until an Ada GPU runs the tool.
+
+## 13. M3c-0 as built: the KMD parses the record and advertises it
+
+The first step of M3c: the KMD reads the `'HEF3'` record (10) behind a present marker's RM fence tail, counts it, keeps
+it beside the fence, and advertises that it does. No route uses it yet: nothing reads the kept record, and every
+Present is copied as before. Built, host-tested where pure, type-checked against the stub WDK, never compiled against
+the real WDK and never run.
+
+The producer side is the NVK/UMD branch `feat/rm-copy-engine-present-nvk` (its doc section "The NVK and UMD side",
+numbered 12 there, needs a new number when the branches meet). This branch carries that branch's protocol files
+unchanged (`protocol/src/rm_fence_v3.rs`, `protocol/include/helios_rm_fence.h`, `protocol/include/helios_icd_interface.h`,
+`rmclient/src/helios_nvrm_escape.h`), so the two merge without conflicts. Those files bring
+`HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3`, the 168-byte `HeliosPresentRefreshCmdRmCopy`, the 192-byte
+`HeliosPresentRenderCmdRmCopy` and `producer_record`.
+
+### 13.1 Where the marker is accepted and where the record is read
+
+Both carriers arrive in `DxgkDdiRender` (`kmd_render/src/ddi/submit_command.rs`); `DxgkDdiPresent` never sees command
+bytes. The KMD already accepted a longer command before this change, so no check was relaxed:
+- the only length refusal is `cmd_len > DmaSize` (the runtime grows the DMA buffer and retries). The command is copied
+  whole into the DMA buffer;
+- `HERF`: decoded when `cmd_len >= 16`, with the first 32 bytes copied into a local. The fence tail is read at 32 when
+  `cmd_len >= 48`, and the on-scanout slot at 48..72 (`onscanout::note_render`). That slot is zero in the 168-byte form
+  and parses as "no tag". Nothing past 72 was read;
+- `HEPR`: decoded when `cmd_len` covers the 48-byte prefix, with the first 80 bytes copied into a local. The fence tail
+  is read at 80 when `FLAG_RM_FENCE` is set and `cmd_len >= 96`. Nothing past 96 was read.
+
+An older KMD therefore reads a 168- or 192-byte command as the 48- or 96-byte one, as `rm_fence_v3.rs` states.
+
+The record is read in exactly one place per carrier: the arm where the fence tail goes to `attach_or_take_fence_tail`
+(a fence tail and an all-zero stream tail). `ddi/ce_record.rs::note_render` then does the following:
+1. It returns at once unless the tail is a FENCE tail (`HeliosRmFenceTail::is_fence`).
+2. It copies at most 96 bytes, once, from offset 72 (`HERF`) or 96 (`HEPR`) into a local and runs the protocol's parser
+   on them. A short tail goes through `HeliosRmFenceTailV3::parse`. A full one goes through `validate`, with the
+   command's remaining length as the bound for `bytes`, so a later, longer revision is accepted and its extra bytes are
+   ignored.
+3. It requires `matches_fence` against the tail just read (`semaphore.value == rm_fence_value`).
+4. It counts the outcome (13.2) and stashes a valid record on the context as `StashedCeRecord { boundary, record }`.
+   The slot is `ContextContext::ce_record`: plain data under a leaf spinlock with a lock-free flag, like the on-scanout
+   tag. `boundary` is what `rm_gate_attach` returned for the record's own fence, and a fence that was not attached
+   stashes nothing. Each fenced Render replaces the stash, so a record lives until the next fenced Render of the
+   context. `take_ce_record(boundary)` has no caller yet; it hands the record only to the Present whose stashed marker
+   is `StashedMarker::Resolved` with the same boundary.
+
+The record never changes the fence. It is parsed after the attach, and the attach, the marker stash and the scanout
+refresh run exactly as before. A refused record is counted and never fails the Render.
+
+**The `h_client` rule is not checked yet.** Both `h_client`s must be RM clients that the presenting process created
+(the `NvDupHarden` rule). The KMD records RM clients per NVRM owner (`nvrm_clients::ClientTable`, keyed by the escape
+device), not per process, and keeps no map from owner to process. The hook is `record_client_owned_by_presenter`. It
+returns `ClientCheck::Unknown` today and carries a TODO for M3c, which must answer it before it dups anything the record
+names. M3c-1's shadow mode dups on `Unknown` and counts it (`CeRecClient`, 14.4); the route of M3c-2 must not.
+
+What runs when no record is present:
+- a Render without a FENCE tail (Venus stream markers, `HE12`, `HEFL`, every other command): nothing new;
+- a FENCE tail in the 48- or 96-byte form: after the unchanged attach, one `is_fence` test, `available = 0` (nothing is
+  copied), one relaxed `fetch_add` (`CeRecNoCopy`, with a registry write on the first and every 256th) and one relaxed
+  load of the stash flag;
+- `DxgkDdiPresent`, SubmitCommand, the DMA buffer and the private record: unchanged.
+
+### 13.2 Counters and the capability
+
+The counters are listed in `kmd_logic::ce_record::COUNTERS` and written only by `ddi/ce_record.rs`. An exact-list test
+checks that file and checks that no other file spells the names; `rm_ce_channel`'s name scan admits that one file. The
+values live in atomics in the Render DDI. The registry is written at PASSIVE only: from the Render DDI on the first
+event, on a new refusal reason, and on every 64th refusal or 256th record, and otherwise from `publish_nvrm_counters`
+(the throttled block). All of them are zeroed at StartDevice.
+
+| value | meaning |
+|---|---|
+| `CeRecSeen` | records that passed `validate` and `matches_fence` (kept beside the fence when it was attached) |
+| `CeRecBad` | records refused |
+| `CeRecWhy` | the last refusal. 1..14 are the protocol's `TailV3Error` in declaration order (`BadMagic`, `Short`, `Version`, `Flags`, `Incomplete`, `Reserved`, `Handle`, `SemaphoreOffset`, `Value`, `Dimensions`, `Format`, `Pitch`, `Modifier`, `Size`); 15 means the semaphore value is not the fence's |
+| `CeRecMask` | every refusal seen, bit `code - 1` |
+| `CeRecNoCopy` | FENCE tails without a record (the 48- and 96-byte forms) |
+| `CeRecLast` | `semaphore.h_client` of the latest kept record (REG_DWORD) |
+| `CeRecMod` | `source.modifier` of the latest kept record (REG_QWORD) |
+
+The route's planned `CeTail*` names in `ce_present::COUNTERS` stay unwritten; M3c decides whether it still needs them
+beside these.
+
+`QUERY_CAPS.supported_ops` bit 37 (`HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3`) is part of `NVRM_OPS_IMPLEMENTED`
+(`ddi/escape.rs`). This build always sets it, whatever `RmCopyEngine` says: the record is an input, and the route
+decision stays per frame. A `kmd_logic::ce_record` test pins the bit in the protocol's Rust and C sources and in that
+mask.
+
+### 13.3 Hardware procedure (main session)
+
+Builds: this KMD, plus the UMD and the NVK series of `feat/rm-copy-engine-present-nvk`. The NVK series must include
+`patches-windows/0053` (`helios_icd_interface` version 6, `queue_rm_fence_v3`), and the D3D11 UMD runs with
+`NvkRmCopyRecord` = 1 (the default). The composed RM-fence path must be on, which it is by default (`NvkRmFence`,
+`NvkRmFencePresent`). `RmCopyEngine` stays 0: M3c-0 does not need it, and nothing reads the record anyway.
+
+1. Install the KMD and the UMD/NVK builds, restart the device, and wait for the desktop.
+2. Run a windowed (composed) DXVK-on-NVK app (Heaven windowed at 1600x900) for about a minute.
+3. Read `reg query HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render` twice, about 10 s apart, and read the UMD
+   log.
+
+Expected:
+
+| what | expected | if not |
+|---|---|---|
+| bit 37 | the UMD logs `NVK present: copy-engine record: semaphore 0x<client>/0x<memory>+<offset> value <v>, source ...` once. The UMD sends the record only after it reads bit 37 in its cached `QUERY_CAPS` | `copy-engine record not sent: <why>` gives the UMD's reason. No line at all: bit 37 was not seen, `NvkRmCopyRecord` is 0, or NVK lacks `queue_rm_fence_v3` |
+| `CeRecSeen` | grows between the two reads, about one per composed frame, in step with `RmGAtt` | 0 while `CeRecNoCopy` grows: the UMD sends the 48- or 96-byte forms |
+| `CeRecBad` / `CeRecWhy` / `CeRecMask` | 0 / 0 / 0 | the producer and the KMD disagree on a rule. The UMD's `producer_record` applies the same checks, so any value is a bug; `CeRecWhy` names the rule |
+| `CeRecNoCopy` | 0, or small (frames whose image NVK could not describe, `VK_INCOMPLETE`) | |
+| `CeRecLast` | the NVK device's root client, equal to the `semaphore 0x<client>` of the UMD's log line | |
+| `CeRecMod` | 0x0300000000606014 for Heaven's block-linear source (10.3), 0 for a LINEAR one | another value: compare it with the UMD log's `modifier` |
+| the desktop and the app | frames on screen, everything else as without the record | |
+
+A PASS shows that the record arrives intact and that the KMD reads it. It says nothing about the copy itself (M3c).
+
+## 14. M3c-1 shadow mode as built (`RmCopyEngine` = 3)
+
+The second step of M3c: before the copy-engine route owns any Present, the KMD runs the copy-engine copy of a REAL Present's
+source into a scratch buffer and compares it with what the production (Venus) copy wrote into that Present's destination. That
+proves the source layout, the page kind of the mapping (10.3, 11.7 item 1), the remap (12.3, 11.7 item 9) and the acquire
+against real NVK images, with the production copy as the reference. Nothing the Present path does changes: the shadow copy
+writes only the KMD's own scratch. Built, host-tested where pure, type-checked against the stub WDK, never compiled against the
+real WDK and never run.
+
+| file | what |
+|---|---|
+| `kmd_logic/src/ce_dup.rs` | the dup + map cache's rules: the bounded LRU table (`Cache`: 4 images, 2 timelines), each slot's fixed handles and 64 MiB VA window, the map flags and their fallback (`map_tries`), the mapping lengths, `CeDup*` / `CeMap*` |
+| `kmd_logic/src/ce_shadow.rs` | the shadow's rules: the sampling (`capture`), `Skip` and the strikes, the lease coverage and row gathering, the comparison (`Tally`, `Verdict`: equal pixels, R/B-swapped pixels, the bins, the first difference), `CeShadow*` |
+| `kmd_logic/src/rm_ce_channel.rs` | `Mode::Shadow` (3), `nvos55` (`NV_ESC_RM_DUP_OBJECT`), `nvos46_kind` (`kindOverride` at 40), the big-page and kind-override flags, `H_SCRATCH*`, `H_DUP_BASE`, `VA_SCRATCH`, `VA_DUP_BASE` |
+| `kmd_render/src/virtio/rm_client/ce_dup.rs` | `dup_map_record`, `release_all`, `is_cached`: the I/O of the cache (the interface M3c-2 uses too) |
+| `kmd_render/src/virtio/rm_client/ce_shadow.rs` | `note_present` (the Present's hook), `service` (the worker), the scratch, the compare, the counters |
+| `kmd_render/src/virtio/rm_client/ce_channel.rs` | the worker's dispatch for knob 3, `gpu_map_with` (flags and kind), the teardown order of the new objects, `try_io` / `end_io` |
+| `kmd_render/src/adapter/backing.rs`, `sync.rs` | `try_serialize` (a zero-timeout `PassiveMutex::try_lock`), `SystemBackingSnapshot::reader` (a read-only pin of a destination's leases) |
+| `kmd_render/src/virtio/gpu/mod.rs` | `present_buffer_settled`: no KMD writer, no mirror, no queued copy owns the buffer |
+| `kmd_render/src/ddi/display.rs` | two calls of `note_present`: at the end of the legacy Blt arm (the copy waited for and mirrored) and where a `BltAsync` arm hands its copy off |
+| `kmd_render/src/ddi/ce_record.rs`, `diag.rs` | `CeRecClient`; the knob `CeShadowEvery` |
+
+### 14.1 What one shadow does
+
+1. **Sample** (`note_present`, the Present DDI, PASSIVE). A Blt into a KMD standard-buffer destination whose production copy is
+   settled (legacy arm) or handed off (`BltAsync` DIRECT or DEFERRED: the copy owns the destination until it is done) counts
+   `CeShadowSeen`. One in `CeShadowEvery` (default 64; 0 is 64; at most 65536) becomes the sample, when no other sample is
+   pending or in flight: the Present's record, taken from its context's stash for the Present's own boundary
+   (`take_ce_record`), and its destination (resource id, extent, pitch, DXGI format). A later Present to the SAME destination
+   before the worker took the sample replaces its record (a newer frame), so a settled destination holds the sample's frame
+   or a newer one. A sampled Present without a record is `Skip::NoRecord`. The worker is woken (`signal_hpd`).
+2. **Settle and pin** (`service`, the HPD worker, PASSIVE). Each pass: a sample older than `EXPIRE_MS` (500 ms) is dropped
+   (`Expired`); otherwise, holding the channel's `IO_BUSY`, the worker TRIES the content transaction and, under it, asks the
+   transport whether the destination is live and settled (`present_buffer_settled`). Busy or not settled: retried next pass.
+   Settled: a destination without a full system backing, or whose system copy is marked stale (`BltNoMirror`), is
+   `NoDestination`; otherwise its leases are pinned (`reader`) and the transaction ends.
+3. **Dup, map, scratch** (no lock held, a 2 s bounded section). The channel comes up if it is not (11.9, its own deadline);
+   `ce_dup::dup_map_record` (14.2); a scratch of `round_up_page(pitch * height)` bytes in the channel's client (RM system memory
+   of `RmCeCache`'s attribute, a CPU view, a GPU mapping at `VA_SCRATCH`), kept for the next sample and grown when needed.
+4. **Copy.** The scratch is filled with `POISON` (0x5a5aa5a5), then one push: host `SEM_EXECUTE` acquire of the record's
+   `semaphore.value` at the dup's VA + `semaphore.offset`; the copy of `source_plan`'s layout (block-linear with the modifier's
+   block height for Heaven) from the image's VA + `source.offset` into the scratch at the DESTINATION's pitch, `line_bytes =
+   width * 4`, `height` lines, `remap_for(source.fourcc, dst_fourcc_for_dxgi(destination format))` (Heaven: `SwapRb`); a WFI
+   release of the completion value. Polled for `COPY_DEADLINE_MS` (100 ms): 2 ms of spinning, then 1 ms sleeps. The producer's
+   value was reached before the production copy ran, so the acquire holds for no time.
+5. **Compare.** Row by row: the destination row gathered from its leases (a row may cross leases), the scratch row read through
+   its view, each pixel compared under the destination format's mask (an X format's fourth byte is undefined), and also after
+   exchanging bytes 0 and 2 of the scratch pixel. Then the transport is asked again whether the destination is still settled,
+   and whether a Present to it arrived meanwhile (`DST_GEN`): either is a race (`CeShadowRace`).
+
+The extent must match (`source.width/height` = the destination's), the pair must be one `remap_for` converts, and
+`source_plan` must accept the source; otherwise `Unsupported`.
+
+### 14.2 The RM calls of the dup and the map
+
+All from the KMD's own channel client (`h.root`), on its control file, PASSIVE, no lock held, each counted in `CeRmCall` /
+`CeRmStat` when it fails (11.11), per producer object ONCE (cached):
+
+| call | block | for |
+|---|---|---|
+| `NV_ESC_RM_DUP_OBJECT` (0x34) | `NVOS55 {hClient = h.root, hParent = the device, hObject = H_DUP_BASE + 2 slot, hClientSrc = record h_client, hObjectSrc = record h_memory, flags 0}` | the semaphore memory, the image |
+| `NV_ESC_RM_ALLOC` of `NV50_MEMORY_VIRTUAL` | the slot's fixed 64 MiB window (`VA_DUP_BASE + slot * 64 MiB`), RM's choice if refused | both |
+| `NV_ESC_RM_MAP_MEMORY_DMA` (0x57) | semaphore: `PAGE_SIZE_4KB | CACHE_SNOOP_ENABLE`, the page(s) holding `offset + 8`; image: the whole object (at most 64 MiB), `PAGE_SIZE_BIG | PAGE_KIND_OVERRIDE` with `kindOverride` = the modifier's `k` (0x06), and on an RM refusal `PAGE_SIZE_4KB | CACHE_SNOOP_ENABLE | PAGE_KIND_OVERRIDE` with the same kind; a pitch-linear image without the override | both |
+| `RM_ALLOC` `NV01_MEMORY_SYSTEM`, `RM_MAP_MEMORY` on a fresh control file + the host's `Mmap` + `MmMapIoSpace`, `NV50_MEMORY_VIRTUAL` + `MAP_MEMORY_DMA` | 11.9's helpers | the scratch |
+| a CPU view of the dup'd semaphore memory (as the scratch's) | only after a copy did not complete | `CeShadowSem` |
+
+The dup's class is not part of `NVOS55` (librmclient's `crm_dup_object` takes one only for its own bookkeeping): the KMD never
+names it, so it works for system and video memory alike. The cross-client dup goes through `nvrm::forward` as the KMD's owner,
+which `NvDupHarden` never judges (`nvrm_harden::mode_for`), and the host passes it through (`vidmem.rs` only notes a confirmed
+one). A refusal therefore comes from RM: `CeDupStat` holds its `NV_STATUS` (or `0x8000_0000 | kind << 16 | code` for a
+transport or host refusal); `CeRmCall` is `0x34 << 24 | the object's low 24 bits`.
+
+Calls the KMD does NOT make, and why: no `NV_SEMAPHORE_SURFACE` and no `BIND_CHANNEL` (the acquire is a host-method semaphore
+read of plain memory, as the tool's); no OS descriptor over the destination's pages (M3c-2's work: the shadow's destination is
+its own RM memory); no `UNMAP` of the image before an eviction other than the LRU's.
+
+Teardown: `release_all` gives the slots back youngest first (`UNMAP_MEMORY_DMA`, the free of the virtual allocation, the free
+of the dup), the scratch likewise (its CPU view, its GPU mapping, its memory). `ce_channel::undo_all` runs both BEFORE the
+channel group when the GPU is idle (the reverse of their making), right AFTER the group's free when a copy may still run (a
+stuck acquire: the group's free stops the channel), and once more before the client's files close (a no-op when empty). With
+StopDevice's flag up or the budget spent nothing is sent (kernel views are still unmapped) and the client's close takes the
+rest. `drop_views` / `forget` unmap the scratch's kernel view and forget the table at a transport loss.
+
+### 14.3 Locking, IRQL, the Present path
+
+- **With `RmCopyEngine` 0, 1 or 2**: `note_present` is one relaxed load; the worker's dispatch never reaches the shadow; the
+  record stash is never taken; nothing is allocated, sent or written to the registry. StartDevice reads nothing new unless the
+  knob is nonzero (the `CeDup*` zeros are written for any nonzero knob, `CeShadowEvery` is read only at 3).
+- **The Present path in shadow mode**: the `SAMPLE` leaf spinlock (twice), for a sampled Present the context's `ce_record` leaf
+  spinlock (`take_ce_record`, after `SAMPLE` was released) and a `KeSetEvent`. It never waits for the shadow.
+- **The worker**, in this order: the channel's `IO_BUSY` (compare-exchange, never waited for) -> the content transaction
+  (`try_serialize`, a zero-timeout wait: never waited for) -> the virtio spinlock inside it (content -> Venus -> virtio is the
+  documented order, 24.12.4 of `zero-copy-present.md`); both released before any RM message. Then, without either: the
+  channel's `STATE`, `ce_dup`'s `CACHE`, `SCRATCH` (leaf spinlocks over plain data, never held across I/O), and the virtio
+  spinlock once more for the race check. No Venus mutex, no scanout lock. Registry writes only from the worker (PASSIVE).
+- **Reading the destination without the transaction**: the reader keeps the leases locked and mapped, so the read is
+  memory-safe. A later Present's copy into the same pages may overlap it: detected (`CeShadowRace`), not prevented. Holding the
+  transaction for the compare (a few ms of 5.76 MB) would make that Present's mirror wait, which the shadow must never do.
+  A pinned reader delays the unlock of pages a concurrent eviction replaced by the length of one compare.
+- **Bounds**: the RM messages of an attempt share a 2 s deadline in a bounded section (`escape_wait::begin_bounded`); the copy
+  100 ms; the sample 500 ms; the channel's first bring-up its 6 s (11.9). StopDevice joins the worker first; the shadow's
+  objects go in the channel's teardown on the stop budget.
+- **Strikes**: `DupRefused`, `MapFailed`, `NotReached`, `Channel`, `Scratch` are strikes; three disable the mode for the
+  transport generation (`CeShadowStrk`), and the channel is torn down then. A `NotReached` or `Channel` skip tears the channel
+  down at once (the next sample brings it up again, under the channel's own strikes and cool-down).
+
+### 14.4 The `h_client` rule and its security consequence
+
+The record's two `h_client`s must be RM clients the presenting process created (the `NvDupHarden` rule, 2.3). The KMD keeps RM
+clients per NVRM owner, not per process, so `record_client_owned_by_presenter` still answers `Unknown` (13.1). The shadow mode
+ACCEPTS `Unknown` and counts each such record once (`CeRecClient`, a `ce_record` counter, so it reads as "records used on
+trust"); with any other knob value nothing is counted.
+
+Consequence, while the knob is 3: a process that sends a well-formed record naming another process's client and memory makes
+the KMD dup that memory into its own client and copy it into the KMD's scratch. Nothing of it reaches any process (the scratch
+is the KMD's, only counters come out), but the dup keeps the other process's memory alive on the host until the cache evicts
+it, and the copy reads it. That is acceptable for a diagnostic knob that is off by default and set only on a test machine; it is
+NOT acceptable for the route. **M3c-2 (`RmCopyEngine` = 1) must not call `dup_map_record` before the hook answers `Owned` for
+both clients** (and must refuse `NotOwned`).
+
+### 14.5 Counters
+
+`CeDup*` / `CeMap*` (`kmd_logic::ce_dup::COUNTERS`, written by `ce_dup.rs`), `CeShadow*` (`kmd_logic::ce_shadow::COUNTERS`,
+written by `ce_shadow.rs`), `CeRecClient` (`ce_record`). Exact-list scans check each list against its writer. Atomics; the
+registry is written by the worker after each attempt and by the channel's publish.
+
+| value | meaning |
+|---|---|
+| `CeShadowEach` | the sampling period in force |
+| `CeShadowSeen` | Presents seen in shadow mode (the two hook sites) |
+| `CeShadowN` | samples the worker took out (attempted) |
+| `CeShadowOk` / `CeShadowBad` | compares with every pixel equal / with a difference |
+| `CeShadowPct` | percent of equal pixels of the last compare (rounded down) |
+| `CeShadowRow` | `row << 16 | x` of the last compare's first differing pixel |
+| `CeShadowP100` / `P99` / `P90` / `PLow` | compares by percent of equal pixels: all, >= 99, >= 90, < 90 |
+| `CeShadowSwp` / `CeShadowSwPct` | compares whose scratch is the destination with R and B exchanged (>= 99 % equal after the exchange, more than without it) / the percent equal after the exchange in the last compare |
+| `CeShadowRace` | compares during which the destination was presented again or stopped being settled |
+| `CeShadowSkip` / `CeShadowWhy` / `CeShadowMask` | samples not compared / the last reason / every reason (bit `code - 1`): 1 no record, 2 no destination, 3 busy, 4 dup refused, 5 map failed, 6 not reached (copy not done in 100 ms), 7 unsupported, 8 channel, 9 expired, 10 disabled, 11 scratch |
+| `CeShadowUs` / `CeShadowDupUs` / `CeShadowCmpUs` | microseconds of the last attempt: kick to completion seen / dup + map (near 0 when cached) / the compare |
+| `CeShadowSem` | the producer's semaphore value (low 32 bits) read through the KMD's dup after a copy did not complete; 0xffffffff when it could not be read |
+| `CeShadowStrk` | strikes this generation |
+| `CeDupN` / `CeDupOk` / `CeDupFail` / `CeDupStat` | dups sent / confirmed / refused / the last refusal's status |
+| `CeMapOk` / `CeMapFail` / `CeMapStat` / `CeMapFlags` | GPU maps of a dup made / refused after the fallback / the last refusal's status / `kind << 24 | flags` of the last image mapping (0x06080200: big pages with kind 0x06; 0x06080110: the system-memory fallback) |
+| `CeDupLive` / `CeDupFree` / `CeDupEvict` | live slots (`semaphores << 8 | images`) / slots given back / evictions |
+| `CeRecClient` | records the shadow used although the `h_client` rule was not answered |
+
+### 14.6 Hardware procedure (main session)
+
+Builds: this KMD plus the UMD and NVK series of 13.3 (the record must arrive: `CeRecSeen` grows). The knob is read at
+StartDevice, so restart after every change.
+
+```
+reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v RmCopyEngine /t REG_DWORD /d 3 /f
+reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v CeShadowEvery /t REG_DWORD /d 64 /f
+pnputil /restart-device "<the Helios display adapter's instance id>"
+:: wait for the desktop; run Heaven windowed at 1600x900 for about a minute; then, twice about 10 s apart:
+reg query HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render
+```
+
+Then `RmCopyEngine` back to 0 and restart. Read: `CeKnob` (3), `CeRecSeen`, `CeRecClient`, every `CeShadow*`, `CeDup*`,
+`CeMap*`, the channel's `CeChUp`, `CeChFail`, `CeChSoft`, `CeRmCall`, `CeRmStat`, `CeNotify`, `CeEngine`, and the desktop and the
+app (frames on screen, nothing else changes). A minute of Heaven at about 60 to 200 frames per second gives about 50 to 190
+samples.
+
+### 14.7 What each outcome means
+
+| reading | meaning | next |
+|---|---|---|
+| `CeShadowOk` grows, `CeShadowP100` = `CeShadowOk`, `CeShadowBad` 0 or only with `CeShadowRace` | the copy-engine route reproduces the production copy bit for bit: layout, page kind, remap and acquire are right for real NVK images | M3c-2 |
+| `CeShadowBad` grows in `P99`/`P90` with `CeShadowRace` near it, `CeShadowRow` varying | the frames differ in a few rows: the app rendered the next frame into the source while the copies ran (single-buffer reuse), or a later Present overlapped the compare. Not a bug of the route | none; lower `CeShadowEvery` for more samples |
+| `CeShadowPLow` with `CeShadowPct` near 0 and `CeShadowSwp` 0, `CeShadowRow` 0 (first pixel) | the copy reads the wrong bytes: the block-linear layout (block height, `KIND_BPP`) or the page kind of the mapping is wrong for NVK's image (10.3). A `CeMapFlags` of 0x06080110 says the image was mapped as system memory | compare with `CeRecMod`; try another kind (a code change in `map_tries`) |
+| `CeShadowSwp` grows, `CeShadowSwPct` about 100 | the remap ran in the wrong direction (or where none was due) | check `remap_for` against the formats (`CeRecMod`, the destination's `PBdFmt`) |
+| scratch still `POISON` (`CeShadowPct` 0, `CeShadowRow` 0, not swapped) with `CeShadowUs` small | the copy completed without writing the scratch | the push words of the destination (`ce_present::copy`) |
+| `CeShadowWhy` 4, `CeDupFail` > 0 | the cross-client dup is refused by RM; `CeDupStat` is RM's `NV_STATUS` as it is (look it up in `nvstatuscodes.h`); a value with bit 31 set is a transport or host refusal (`kind << 16 | code`, kinds as `RmFail`) | the dup path (parent, client handle translation) |
+| `CeShadowWhy` 5, `CeMapFail` > 0 | the GPU map of a dup failed both ways; `CeMapStat` says why | the map flags or the kind |
+| `CeShadowWhy` 6 | the copy did not complete in 100 ms: `CeShadowSem` below the record's value means the acquire waits on the right memory for a value it does not have (a wrong `semaphore.offset` or value); a value that is nonsense means the wrong address; `CeNotify` nonzero means an RC error | the record's semaphore fields, or the channel |
+| `CeShadowWhy` 8 | the channel: `CeChFail` / `CeChStage` (11.10) | 11.10, 11.11 |
+| `CeShadowWhy` 2 | the destination has no full, valid system backing (BAR-resident, or `BltNoMirror` marked it stale) | expected for some destinations; none compared means the shadow cannot see this workload's destinations |
+| `CeShadowWhy` 1 or 9 only | no record on the sampled Presents, or the destination never settled in 500 ms | the UMD's record (13.3), or the worker's wakes |
+| `CeShadowStrk` 3 | the mode stopped for this generation; `CeShadowMask` says which failures | the first failure's reading above |
+
+### 14.8 Unverified
+
+1. Everything here on hardware: nothing has run.
+2. The cross-client dup of NVK's memory from the KMD's own client (11.7 item 6), and its map with big pages and kind 0x06.
+3. That a dup'd system-memory semaphore read by the host semaphore acquire sees NVK's 3D channel's release (coherent, snooped).
+4. That `present_buffer_settled` at the two hook sites means "this Present's production copy is in the pages" for every arm:
+   the legacy arm (waited and mirrored before the hook), DIRECT (owned by the copy from the enqueue), DEFERRED (queued before
+   the hook). A destination the GuestBlob copy writes directly has no mirror; its system pages are the copy's target.
+5. `try_lock` by a zero-timeout `KeWaitForSingleObject` on a `KMUTEX` returning `STATUS_SUCCESS` exactly when acquired.
+6. The compare's cost through the scratch's CPU view: cached by default; with `RmCeCache` 1 (write-combined) reads are slow
+   (expect `CeShadowCmpUs` in the hundreds of ms).
+7. A destination whose format is an X format with a source that has alpha: the fourth byte is masked out of the compare.

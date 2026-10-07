@@ -76,6 +76,10 @@ pub const CTRL_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX: u32 = 0xc36f_010a;
 /// allowlist-gated on the host (plain passthrough).
 pub const ESC_RM_MAP_MEMORY_DMA: u32 = 0x57;
 pub const ESC_RM_UNMAP_MEMORY_DMA: u32 = 0x58;
+/// `NV_ESC_RM_DUP_OBJECT` (`nv_ioctl_defs.h`, librmclient's `crm_dup_object`): another client's
+/// object as a new handle of this one. A plain passthrough on the host (its VRAM ledger only
+/// notes a confirmed one, `vidmem.rs`); the KMD's own owner is never judged by `NvDupHarden`.
+pub const ESC_RM_DUP_OBJECT: u32 = 0x34;
 
 pub const CLASSLIST_BYTES: usize = 804;
 pub const CLASSLIST_MAX: usize = 200;
@@ -97,6 +101,12 @@ pub const NVOS46_DMA_OFFSET_AT: usize = 48;
 pub const NVOS46_STATUS_AT: usize = 56;
 pub const NVOS47_BYTES: usize = 48;
 pub const NVOS47_STATUS_AT: usize = 40;
+/// `NVOS46_PARAMETERS.kindOverride` (after `flags` 32 and `flags2` 36).
+pub const NVOS46_KIND_AT: usize = 40;
+/// `NVOS55_PARAMETERS` (`hClient`, `hParent`, `hObject`, `hClientSrc`, `hObjectSrc`, `flags`,
+/// `status`): 28 bytes, the status last.
+pub const NVOS55_BYTES: usize = 28;
+pub const NVOS55_STATUS_AT: usize = 24;
 
 const _: () = assert!(NV0080_ALLOC_BYTES == 56 && MEM_ALLOC_BYTES == 128);
 
@@ -430,6 +440,34 @@ pub fn map_dma_va(reply_data: &[u8]) -> Option<u64> {
     get64(reply_data, NVOS46_DMA_OFFSET_AT)
 }
 
+/// `NVOS46_FLAGS_PAGE_SIZE_BIG` (11:8 = 2): big pages, as nvk-rm 0005 maps an image in video
+/// memory.
+pub const MAP_FLAGS_PAGE_SIZE_BIG: u32 = 2 << 8;
+/// `NVOS46_FLAGS_PAGE_KIND_OVERRIDE` (19:19): the mapping's PTE kind is `kindOverride` (nvk-rm
+/// 0027; the tool's `gpu_map_kind`).
+pub const MAP_FLAGS_KIND_OVERRIDE: u32 = 1 << 19;
+
+/// [`nvos46`] with a PTE kind: `kindOverride` = `kind`, and the caller sets
+/// [`MAP_FLAGS_KIND_OVERRIDE`] in `m.flags` (librmclient's `crm_map_dma2` with a kind).
+pub fn nvos46_kind(m: &DmaMap, kind: u32) -> [u8; NVOS46_BYTES] {
+    let mut a = nvos46(m);
+    put32(&mut a, NVOS46_KIND_AT, kind);
+    a
+}
+
+/// `NVOS55_PARAMETERS` as `crm_dup_object` fills it: the object `object_src` of client
+/// `client_src` becomes `h_new` of this client (`root`) under `parent`, `flags` 0. RM answers
+/// the status at [`NVOS55_STATUS_AT`]; the class is not part of the message.
+pub fn nvos55(root: u32, parent: u32, h_new: u32, client_src: u32, object_src: u32) -> [u8; NVOS55_BYTES] {
+    let mut a = [0u8; NVOS55_BYTES];
+    put32(&mut a, 0, root);
+    put32(&mut a, 4, parent);
+    put32(&mut a, 8, h_new);
+    put32(&mut a, 12, client_src);
+    put32(&mut a, 16, object_src);
+    a
+}
+
 /// `NVOS47_PARAMETERS` as `rm_unmap_dma` fills it: the whole mapping at `va`.
 pub fn nvos47(m: &DmaMap, va: u64) -> [u8; NVOS47_BYTES] {
     let mut a = [0u8; NVOS47_BYTES];
@@ -481,7 +519,13 @@ pub const VA_RING: u64 = VA_BASE;
 pub const VA_SELF_SRC: u64 = VA_BASE + VA_WINDOW;
 pub const VA_SELF_DST: u64 = VA_BASE + 2 * VA_WINDOW;
 
+/// The shadow mode's scratch destination (`RmCopyEngine` = 3, `ce_shadow`), and the first of the
+/// windows of the producer's dup'd memory (`ce_dup`: one window per cache slot).
+pub const VA_SCRATCH: u64 = VA_BASE + 3 * VA_WINDOW;
+pub const VA_DUP_BASE: u64 = VA_BASE + 4 * VA_WINDOW;
+
 const _: () = assert!(VA_SELF_DST + VA_WINDOW <= cp::MAX_VA);
+const _: () = assert!(VA_DUP_BASE + 16 * VA_WINDOW <= cp::MAX_VA);
 
 /// GPU VA of push slot `index` of a ring mapped at `ring_va`.
 pub const fn slot_va(ring_va: u64, index: u32) -> u64 {
@@ -509,6 +553,12 @@ pub const H_SELF_SRC: u32 = H_BASE + 0x10;
 pub const H_SELF_SRC_VIRT: u32 = H_BASE + 0x11;
 pub const H_SELF_DST: u32 = H_BASE + 0x12;
 pub const H_SELF_DST_VIRT: u32 = H_BASE + 0x13;
+/// The shadow mode's scratch destination and its virtual allocation.
+pub const H_SCRATCH: u32 = H_BASE + 0x18;
+pub const H_SCRATCH_VIRT: u32 = H_BASE + 0x19;
+/// The dup'd memory of the producer (`ce_dup`): slot `i` is `H_DUP_BASE + 2 i` (the dup) and
+/// `+ 1` (its virtual allocation), at most 16 slots.
+pub const H_DUP_BASE: u32 = H_BASE + 0x20;
 
 // ── the bring-up ─────────────────────────────────────────────────────────────────────────────
 
@@ -970,6 +1020,112 @@ impl Svc {
     }
 }
 
+// ── CPU views: which map channel, which cache attribute ──────────────────────────────────────
+
+/// The kind of file a CPU view's `RM_MAP_MEMORY` is armed on (librmclient's `map_node_hint`,
+/// `transport_windows.c` `win_map_memory`): system memory maps on a fresh CONTROL file (device
+/// type 255, no `REGISTER_FD`), BAR memory (video memory, the usermode doorbell) on a fresh GPU
+/// file (the minor, tied to the control file with `REGISTER_FD`). The wrong kind is RM's
+/// `NV_ERR_INVALID_ARGUMENT`, after which librmclient tries the other kind once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapNode {
+    Ctl,
+    Gpu,
+}
+
+impl MapNode {
+    /// The kind for memory of `class`.
+    pub const fn for_class(class: u32) -> MapNode {
+        match class {
+            NV01_MEMORY_SYSTEM | NV01_MEMORY_SYSTEM_OS_DESCRIPTOR => MapNode::Ctl,
+            _ => MapNode::Gpu,
+        }
+    }
+
+    pub const fn other(self) -> MapNode {
+        match self {
+            MapNode::Ctl => MapNode::Gpu,
+            MapNode::Gpu => MapNode::Ctl,
+        }
+    }
+}
+
+/// `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`.
+pub const NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: u32 = 0x71;
+/// `NV_ERR_INVALID_ARGUMENT`: what RM answers a map armed on the wrong kind of file.
+pub const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
+
+/// May a failed `RM_MAP_MEMORY` be retried on the other kind of file (once)?
+pub fn retry_other_node(f: Fail, already_retried: bool) -> bool {
+    !already_retried && f.kind == FailKind::Rm && f.code == NV_ERR_INVALID_ARGUMENT
+}
+
+/// `RmCeCache`: what the channel's own RM system memory (control, ring, the self-test's buffers)
+/// is made of. 0 (default, and any other value): cached, as the tool allocates it
+/// (`NVOS32_ATTR_COHERENCY_CACHED`); 1: write-combined (M3b's first choice, for an A/B). Private
+/// channel memory has no dxgkrnl view, so the level-5 alias concern does not apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheMode {
+    Cached,
+    WriteCombine,
+}
+
+impl CacheMode {
+    pub const fn from_knob(v: u32) -> CacheMode {
+        match v {
+            1 => CacheMode::WriteCombine,
+            _ => CacheMode::Cached,
+        }
+    }
+
+    /// What RM is asked for.
+    pub const fn sysmem(self) -> crate::rm_sysmem::Cache {
+        match self {
+            CacheMode::Cached => crate::rm_sysmem::Cache::Cached,
+            CacheMode::WriteCombine => crate::rm_sysmem::Cache::WriteCombine,
+        }
+    }
+
+    /// `CeCache`: the value in force.
+    pub const fn word(self) -> u32 {
+        match self {
+            CacheMode::Cached => 0,
+            CacheMode::WriteCombine => 1,
+        }
+    }
+}
+
+// ── the failing RM call ──────────────────────────────────────────────────────────────────────
+
+/// `CeRmCall`: the last failing RM call of the channel, `esc << 24 | what & 0xff_ffff`. `esc` is
+/// the escape number (`0x2b` ALLOC, `0x2a` CONTROL, `0x29` FREE, `0x4e` MAP_MEMORY, `0x4f`
+/// UNMAP_MEMORY, `0x57` / `0x58` MAP / UNMAP_MEMORY_DMA); `what` the class for an ALLOC, the
+/// command's low 24 bits for a CONTROL (`0x2080_0170` -> `0x80_0170`), the object handle's low 24
+/// bits for the others (`0x4b4d_3003` -> `0x4d_3003`).
+pub const fn rm_call_word(esc: u32, what: u32) -> u32 {
+    ((esc & 0xff) << 24) | (what & 0x00ff_ffff)
+}
+
+/// `CeRmStat` (and `CeSelfWhy`): RM's `NV_STATUS` as it is; any other failure as
+/// `0x8000_0000 | kind << 16 | code & 0xffff`.
+pub fn fail_word(f: Fail) -> u32 {
+    if f.kind == FailKind::Rm {
+        f.code
+    } else {
+        0x8000_0000 | ((f.kind as u32) << 16) | (f.code & 0xffff)
+    }
+}
+
+/// `CeMapNode` of a failed CPU view: `node << 28 | map_ch & 0x0fff_ffff` (node 1 control file,
+/// 2 GPU file), so a dump names the file the map was armed on.
+pub const fn map_node_word(node: MapNode, map_ch: u32) -> u32 {
+    let n = match node {
+        MapNode::Ctl => 1,
+        MapNode::Gpu => 2,
+    };
+    (n << 28) | (map_ch & 0x0fff_ffff)
+}
+
 // ── the knob ─────────────────────────────────────────────────────────────────────────────────
 
 /// `RmCopyEngine` (`ce_present::KNOB`).
@@ -984,12 +1140,17 @@ pub enum Mode {
     Route,
     /// 2: the hardware self-test, once per transport generation, from the HPD worker.
     SelfTest,
+    /// 3: the shadow mode (M3c-1, `ce_shadow`): for a sample of real Presents the HPD worker
+    /// copies the Present's source with the channel into a scratch buffer and compares it with
+    /// what the production (Venus) copy wrote. The Present path itself is unchanged.
+    Shadow,
 }
 
 pub const fn mode(knob: u32) -> Mode {
     match knob {
         1 => Mode::Route,
         2 => Mode::SelfTest,
+        3 => Mode::Shadow,
         _ => Mode::Off,
     }
 }
@@ -1000,6 +1161,7 @@ pub const fn knob_in_force(knob: u32) -> u32 {
         Mode::Off => 0,
         Mode::Route => 1,
         Mode::SelfTest => 2,
+        Mode::Shadow => 3,
     }
 }
 
@@ -1030,7 +1192,7 @@ pub const fn chan_word(phase: Phase) -> u32 {
 /// pass, `0xE0 + stage` on failure ([`Stage`]), with `CeSelfWhy` the RM status of the failing
 /// call when there was one ([`why_word`]).
 pub mod selftest {
-    use super::{Fail, FailKind};
+    use super::Fail;
     use crate::ce_present::{CopyRect, Remap, SurfaceLayout};
 
     pub const WIDTH: u32 = 1600;
@@ -1095,11 +1257,7 @@ pub mod selftest {
     /// `0x8000_0000 | kind << 16 | code & 0xffff`; 0 for a failure that had no call (a mismatch,
     /// a timeout).
     pub fn why_word(f: Option<Fail>) -> u32 {
-        match f {
-            None => 0,
-            Some(f) if f.kind == FailKind::Rm => f.code,
-            Some(f) => 0x8000_0000 | ((f.kind as u32) << 16) | (f.code & 0xffff),
-        }
+        f.map_or(0, super::fail_word)
     }
 
     /// The source's word `i` (the tool's position-dependent pattern, with a per-run salt so a
@@ -1217,6 +1375,13 @@ pub const COUNTERS: &[&str] = &[
     "CeSelfWaitUs",
     "CeSelfPages",
     "CeSelfMs",
+    // The channel memory's cache attribute in force (`RmCeCache`: 0 cached, 1 write-combined);
+    // the last failing RM call (`rm_call_word`), its status (`fail_word`) and, for a CPU view, the
+    // file it was armed on (`map_node_word`).
+    "CeCache",
+    "CeRmCall",
+    "CeRmStat",
+    "CeMapNode",
 ];
 
 /// `CeGen`.
@@ -1382,6 +1547,35 @@ mod tests {
     }
 
     #[test]
+    fn the_dup_and_the_kind_map_are_librmclients_blocks() {
+        // `crm_dup_object(c, dev, &h, client_src, object_src, class, 0)`: NVOS55, 28 bytes.
+        let d = nvos55(ROOT, crate::rm_client::H_DEVICE, 0x4b4d_3020, 0xc1d0_9d92, 0x5c00_0079);
+        assert_eq!(d.len(), 28);
+        assert_eq!(
+            sparse(&d),
+            [
+                (0, 0x42), (2, 0xd0), (3, 0xc1),
+                (4, 0x01), (6, 0x4d), (7, 0x4b),
+                (8, 0x20), (9, 0x30), (10, 0x4d), (11, 0x4b),
+                (12, 0x92), (13, 0x9d), (14, 0xd0), (15, 0xc1),
+                (16, 0x79), (19, 0x5c),
+            ]
+        );
+        assert_eq!((ESC_RM_DUP_OBJECT, NVOS55_STATUS_AT), (0x34, 24));
+        // `crm_map_dma2(..., flags = BIG | KIND_OVERRIDE, kind = 6)`: kindOverride at 40.
+        let mut m = ring_map();
+        m.flags = MAP_FLAGS_PAGE_SIZE_BIG | MAP_FLAGS_KIND_OVERRIDE;
+        let b = nvos46_kind(&m, 0x06);
+        assert_eq!(get32(&b, 32), Some(0x0008_0200));
+        assert_eq!(get32(&b, 36), Some(0));
+        assert_eq!(get32(&b, NVOS46_KIND_AT), Some(6));
+        // Everything else as the kind-less block.
+        let mut plain = nvos46(&m);
+        plain[NVOS46_KIND_AT] = 6;
+        assert_eq!(b, plain);
+    }
+
+    #[test]
     fn controls_and_sizes_are_the_allowlists() {
         // `v610_57_04.rs` rows 143, 268, 470, 638, 646, 730, 731 and the class rows.
         assert_eq!((CTRL_GET_CLASSLIST_V2, CLASSLIST_BYTES), (0x0080_0292, 804));
@@ -1535,7 +1729,8 @@ mod tests {
     fn handles_are_distinct_and_outside_the_other_namespaces() {
         let hs = [
             H_VASPACE, H_USERMODE, H_CTL, H_RING, H_RING_VIRT, H_TSG, H_CTXSHARE, H_CHANNEL, H_CE,
-            H_SELF_SRC, H_SELF_SRC_VIRT, H_SELF_DST, H_SELF_DST_VIRT,
+            H_SELF_SRC, H_SELF_SRC_VIRT, H_SELF_DST, H_SELF_DST_VIRT, H_SCRATCH, H_SCRATCH_VIRT,
+            H_DUP_BASE, H_DUP_BASE + 31,
         ];
         let mut v = hs.to_vec();
         v.sort();
@@ -1704,6 +1899,46 @@ mod tests {
         assert_eq!(UNDO_BUDGET_MS, 3_000);
     }
 
+    // ── CPU views and the failing call ───────────────────────────────────────────────────────
+
+    #[test]
+    fn system_memory_maps_on_a_control_file_bar_memory_on_a_gpu_file() {
+        assert_eq!(MapNode::for_class(NV01_MEMORY_SYSTEM), MapNode::Ctl);
+        assert_eq!(MapNode::for_class(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR), MapNode::Ctl);
+        assert_eq!(MapNode::for_class(0xc761), MapNode::Gpu, "the usermode doorbell");
+        assert_eq!(MapNode::for_class(crate::rm_client::NV01_MEMORY_LOCAL_USER), MapNode::Gpu);
+        assert_eq!(MapNode::Ctl.other(), MapNode::Gpu);
+        // Only RM's INVALID_ARGUMENT, and only once, moves to the other kind.
+        assert!(retry_other_node(Fail::new(FailKind::Rm, 0x1f), false));
+        assert!(!retry_other_node(Fail::new(FailKind::Rm, 0x1f), true));
+        assert!(!retry_other_node(Fail::new(FailKind::Rm, 0x56), false));
+        assert!(!retry_other_node(Fail::new(FailKind::Transport, 0x1f), false));
+    }
+
+    #[test]
+    fn the_cache_knob_defaults_to_cached_like_the_tool() {
+        assert_eq!(CacheMode::from_knob(0), CacheMode::Cached);
+        assert_eq!(CacheMode::from_knob(1), CacheMode::WriteCombine);
+        assert_eq!(CacheMode::from_knob(7), CacheMode::Cached);
+        assert_eq!(CacheMode::Cached.sysmem(), crate::rm_sysmem::Cache::Cached);
+        // PCI, cached, any physicality: the tool's location and coherency.
+        assert_eq!(CacheMode::Cached.sysmem().attr(), 0x3a00_0000);
+        assert_eq!((CacheMode::Cached.word(), CacheMode::WriteCombine.word()), (0, 1));
+    }
+
+    #[test]
+    fn the_failing_call_words() {
+        // The 348.1 failure: RM_MAP_MEMORY of the control memory, INVALID_ARGUMENT.
+        assert_eq!(rm_call_word(0x4e, H_CTL), 0x4e4d_3003);
+        assert_eq!(rm_call_word(0x2b, KEPLER_CHANNEL_GROUP_A), 0x2b00_a06c);
+        assert_eq!(rm_call_word(0x2a, CTRL_GET_ENGINES_V2), 0x2a80_0170);
+        assert_eq!(fail_word(Fail::new(FailKind::Rm, 0x1f)), 0x1f);
+        assert_eq!(fail_word(Fail::new(FailKind::Host, 22)), 0x8003_0016);
+        assert_eq!(map_node_word(MapNode::Gpu, 0x123), 0x2000_0123);
+        assert_eq!(map_node_word(MapNode::Ctl, 0x123), 0x1000_0123);
+        assert_eq!(pack_failure(Stage::CtlMap as u8, Fail::new(FailKind::Rm, 0x1f)), 0x0804_001f);
+    }
+
     // ── the knob ──────────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1711,9 +1946,11 @@ mod tests {
         assert_eq!(mode(0), Mode::Off);
         assert_eq!(mode(1), Mode::Route);
         assert_eq!(mode(2), Mode::SelfTest);
-        assert_eq!(mode(3), Mode::Off, "an unknown value does nothing");
+        assert_eq!(mode(3), Mode::Shadow);
+        assert_eq!(mode(4), Mode::Off, "an unknown value does nothing");
         assert_eq!(knob_in_force(7), 0);
         assert_eq!(knob_in_force(2), 2);
+        assert_eq!(knob_in_force(3), 3);
         assert_eq!(KNOB, "RmCopyEngine");
     }
 
@@ -1888,14 +2125,31 @@ mod tests {
                     }
                     checked += 1;
                     let text = std::fs::read_to_string(&p).unwrap();
-                    assert!(!text.contains("b\"Ce"), "{s} spells a Ce counter name");
                     assert!(!text.contains("b\"RmCopyEngine\""), "{s} spells the knob name");
+                    // The record's writer (M3c-0) spells only its own list, which
+                    // `ce_record`'s exact-list test checks; none of these names.
+                    // So do the dup cache's and the shadow mode's (M3c-1).
+                    let mut other_writers = crate::ce_record::WRITERS
+                        .iter()
+                        .chain(crate::ce_dup::WRITERS.iter())
+                        .chain(crate::ce_shadow::WRITERS.iter());
+                    if other_writers.any(|w| s.ends_with(w)) {
+                        for n in COUNTERS {
+                            assert!(!text.contains(&std::format!("b\"{n}\"")), "{s} spells {n}");
+                        }
+                        continue;
+                    }
+                    assert!(!text.contains("b\"Ce"), "{s} spells a Ce counter name");
                 }
             }
         }
         assert!(checked > 20);
         let diag = std::fs::read_to_string(render.join("diag.rs")).unwrap();
         assert!(diag.contains("KnobName::new(b\"RmCopyEngine\")"));
-        assert!(!diag.contains("b\"Ce"), "diag.rs spells a Ce counter name");
+        // The shadow mode's knob (M3c-1) is the one `Ce` name diag.rs may spell: a knob, not a
+        // counter (`ce_shadow::EVERY_KNOB`).
+        let knob = std::format!("KnobName::new(b\"{}\")", crate::ce_shadow::EVERY_KNOB);
+        assert!(diag.contains(&knob));
+        assert!(!diag.replace(&knob, "").contains("b\"Ce"), "diag.rs spells a Ce counter name");
     }
 }

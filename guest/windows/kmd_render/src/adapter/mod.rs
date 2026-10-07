@@ -32,7 +32,9 @@ mod scanout;
 mod segments;
 mod tracking;
 
-pub(crate) use backing::{SystemBackingGuard, SystemBackingTable, MAX_SYSTEM_BACKING_RANGES};
+pub(crate) use backing::{
+    SystemBackingGuard, SystemBackingReader, SystemBackingTable, MAX_SYSTEM_BACKING_RANGES,
+};
 pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard, WITH_VIRTIO_TORN};
 pub(crate) use read_ledger::{
     dump_counters as read_ledger_dump_counters, reset_counters as read_ledger_reset_counters,
@@ -187,11 +189,17 @@ pub(crate) struct AdapterKnobs {
     /// surface; see the `SupportDirectFlip` comment in `query_driver_caps`).
     /// Nonzero restores the legacy bring-up advertisement, in BOTH the adapter
     /// cap and the aperture segment flags, which is the point of reading it once.
+    /// Also set by a nonzero `IndepFlip` (the value here is the advertisement, not the raw knob).
     pub direct_flip: bool,
-    /// `FlipCapsX` (default 0), raw: the bits OR'd into the reported `DXGK_FLIPCAPS`. Never
+    /// `FlipCapsX` (default 0), with `IndepFlip`'s `FlipIndependent | DdiPresentForIFlip` OR'd in
+    /// when that is on: the bits OR'd into the reported `DXGK_FLIPCAPS`. Never
     /// used unfiltered; [`Self::flip_caps`] applies the accepted-bit mask. Read here, once per
     /// StartDevice, so the caps query reports what the `FlipCapsXEff`/`FlipCapsRep` mirrors say.
     pub flip_caps_x: u32,
+    /// `IndepFlip` (default 0), raw. Its caps are already folded into [`Self::direct_flip`] and
+    /// [`Self::flip_caps_x`] by [`Self::read`] (`helios_kmd_logic::independent_flip::advertise`),
+    /// so the caps and segment writers need not know it; [`Self::indep_flip_mode`] is the census.
+    pub indep_flip: u32,
     /// `CrossAdaptCaps` (default 0). Nonzero advertises
     /// `DXGK_VIDMMCAPS.CrossAdapterResource` (tier-1 cross-adapter copy support).
     /// The compile-time `DECLARE_CROSS_ADAPTER_RESOURCE` this used to be OR'd
@@ -256,6 +264,7 @@ impl AdapterKnobs {
         display_half: true,
         direct_flip: false,
         flip_caps_x: 0,
+        indep_flip: 0,
         cross_adapter: false,
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
@@ -273,6 +282,15 @@ impl AdapterKnobs {
     /// `pnputil /restart-device` still picks up a change with no reboot.
     pub fn read() -> Self {
         use crate::diag::{knobs, read_config_dword};
+        use helios_kmd_logic::independent_flip as idf;
+        // `IndepFlip` ORs its caps into what `DirectFlipCaps` and `FlipCapsX` ask for; with it at
+        // 0 (the default) both are exactly the raw values, as before.
+        let indep_flip = read_config_dword(knobs::INDEP_FLIP, 0);
+        let advertised = idf::advertise(
+            idf::Mode::from_knob(indep_flip),
+            read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
+            read_config_dword(knobs::FLIP_CAPS_EXTRA, 0),
+        );
         Self {
             alloc_cached: read_config_dword(knobs::ALLOC_CACHED, 1) != 0,
             // 2026-09-06, completed matching GT1 runs on .269 with this enabled:
@@ -288,14 +306,20 @@ impl AdapterKnobs {
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
             foreign_copy: read_config_dword(knobs::FOREIGN_COPY, 0) != 0,
             display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
-            direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
-            flip_caps_x: read_config_dword(knobs::FLIP_CAPS_EXTRA, 0),
+            direct_flip: advertised.direct_flip,
+            flip_caps_x: advertised.flip_caps_x,
+            indep_flip,
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
             vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
         }
+    }
+
+    /// The independent-flip mode this snapshot runs (`IndepFlip`).
+    pub fn indep_flip_mode(&self) -> helios_kmd_logic::independent_flip::Mode {
+        helios_kmd_logic::independent_flip::Mode::from_knob(self.indep_flip)
     }
 
     /// The `DXGK_DRIVERCAPS.FlipCaps` word this snapshot reports, and what of `FlipCapsX` it kept.

@@ -6,6 +6,7 @@
 // real host file descriptors for `/dev/nvidia*` and dispatches messages
 // received from the guest driver over virtqueues.
 
+pub mod affinity;
 pub mod caps;
 #[cfg(feature = "vhost-user")]
 pub mod chain;
@@ -24,6 +25,7 @@ pub mod sandbox;
 pub mod scanout_release;
 pub mod shm;
 pub mod shm_regions;
+pub mod stage;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod userspace;

@@ -25,6 +25,8 @@ else
   SRC="$KW"
 fi
 cp -r "$SRC/kmd_render/src" "$K/kmd_render/src"
+# `virtio/msi.rs` reads the build tag from it with `include_str!`.
+cp "$KW/kmd_render/driver-version.env" "$K/kmd_render/driver-version.env"
 cp -r "$SRC/kmd_logic" "$K/kmd_logic"
 cp -r "$SRC/protocol" "$K/protocol"
 rm -rf "$K/kmd_logic/target" "$K/protocol/target"

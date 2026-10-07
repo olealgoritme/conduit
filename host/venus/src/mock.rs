@@ -17,6 +17,10 @@ pub struct Mock {
     pub guest: HashMap<u32, Vec<PageRun>>,
     pending: Vec<Signalled>,
     event: Option<OwnedFd>,
+    /// Stage stamps on ([`Renderer::stages`]): each fence asked for is
+    /// stamped `R_FENCE` with its id and handed over by the next call.
+    pub stage_on: bool,
+    stamps: Vec<stage::Rec>,
 }
 
 impl Mock {
@@ -102,7 +106,14 @@ impl Renderer for Mock {
     }
     fn create_fence(&mut self, ctx_id: u32, ring_idx: u32, fence_id: u64) -> Result<()> {
         self.pending.push(Signalled { ctx_id, ring_idx, fence_id });
+        if self.stage_on {
+            self.stamps.push(stage::Rec::fence(stage::R_FENCE, ctx_id, ring_idx, fence_id, stage::now_ns()));
+        }
         Ok(())
+    }
+    fn stages(&mut self, on: bool) -> Result<Vec<stage::Rec>> {
+        self.stage_on = on;
+        Ok(std::mem::take(&mut self.stamps))
     }
     fn fence_fd(&self) -> BorrowedFd<'_> {
         self.event.as_ref().expect("Mock::new").as_fd()
@@ -111,7 +122,7 @@ impl Renderer for Mock {
         Ok(std::mem::take(&mut self.pending))
     }
     fn features(&mut self) -> u32 {
-        FEATURE_IMPORT_DMABUF | FEATURE_IMPORT_GUEST_PAGES
+        FEATURE_IMPORT_DMABUF | FEATURE_IMPORT_GUEST_PAGES | FEATURE_STAGE_TRACE
     }
     /// Checks the runs as the real renderer does, against the file's size,
     /// and maps nothing.

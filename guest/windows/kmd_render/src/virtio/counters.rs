@@ -52,6 +52,12 @@ pub static TRANSPORT_GONE_AT_WAIT: AtomicU32 = AtomicU32::new(0);
 /// Used-ring completions whose token matched no in-flight entry (ring state
 /// corrupt → transport latches failed).
 pub static DRAIN_BAD_TOKEN: AtomicU32 = AtomicU32::new(0);
+/// Entries taken off a used ring by any drain (the control queue's `drain_used`,
+/// the event queue's `drain_nvrm_events`), whoever ran it: the DPC, a waiter's
+/// polling drain, the worker. Not a published counter: the message-interrupt
+/// health logic (`virtio::msi`) reads it before and after a drain to tell whether
+/// the drain found work, and the DPC to tell whether it was a spurious wake.
+pub static RING_POPS: AtomicU32 = AtomicU32::new(0);
 /// Enqueue attempts refused because the queue/parked tables were full.
 pub static QUEUE_FULL_RETRIES: AtomicU32 = AtomicU32::new(0);
 /// WDDM pending-fence FIFO overflows (degraded to immediate completion).

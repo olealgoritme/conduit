@@ -74,6 +74,8 @@ const RTL_REGISTRY_SERVICES: u32 = 1;
 const REG_DWORD: u32 = 4;
 /// `REG_QWORD`.
 const REG_QWORD: u32 = 11;
+/// `REG_BINARY`.
+const REG_BINARY: u32 = 3;
 /// Cap on breadcrumbs so a chatty steady state can't grow the key unbounded.
 const MAX_STEPS: u32 = 3000;
 
@@ -141,6 +143,35 @@ fn record_named_q(name: &[u16], mut value: u64) {
             REG_QWORD,
             (&mut value as *mut u64).cast::<core::ffi::c_void>(),
             8,
+        );
+    }
+}
+
+/// A `REG_BINARY` value of `data.len()` bytes (`StgRing`, `ddi::stage_trace`). Not part of the
+/// mirror's changed-only cache. PASSIVE_LEVEL only.
+pub fn record_named_binary(name: &[u8], data: &[u8]) {
+    let mut buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        buf[i] = name[i] as u16;
+        i += 1;
+    }
+    buf[n] = 0;
+    let Ok(len) = u32::try_from(data.len()) else {
+        return;
+    };
+    // SAFETY: PASSIVE_LEVEL (see module note). `buf` is a NUL-terminated UTF-16 value name;
+    // ValueData points to `len` readable bytes that RtlWriteRegistryValue copies before
+    // returning (it does not write through the pointer).
+    unsafe {
+        let _ = RtlWriteRegistryValue(
+            RTL_REGISTRY_SERVICES,
+            SERVICE_NAME.as_ptr(),
+            buf.as_ptr(),
+            REG_BINARY,
+            data.as_ptr() as *mut core::ffi::c_void,
+            len,
         );
     }
 }
@@ -647,7 +678,7 @@ impl CounterBlock {
 const SERVICE_KEY_PATH: &[u8] =
     b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\helios_kmd_render";
 
-const fn widen<const N: usize>(ascii: &[u8]) -> [u16; N] {
+pub(crate) const fn widen<const N: usize>(ascii: &[u8]) -> [u16; N] {
     let mut out = [0u16; N];
     let mut i = 0;
     while i < N {
@@ -691,12 +722,107 @@ extern "system" {
         object_attributes: *mut NtObjectAttributes,
     ) -> i32;
     fn ZwFlushKey(key_handle: *mut core::ffi::c_void) -> i32;
+    fn ZwSetValueKey(
+        key_handle: *mut core::ffi::c_void,
+        value_name: *mut NtUnicodeString,
+        title_index: u32,
+        value_type: u32,
+        data: *mut core::ffi::c_void,
+        data_size: u32,
+    ) -> i32;
+    fn IoOpenDeviceRegistryKey(
+        physical_device_object: *mut core::ffi::c_void,
+        device_registry_key_type: u32,
+        desired_access: u32,
+        device_registry_key: *mut *mut core::ffi::c_void,
+    ) -> i32;
 }
 
 /// `OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE`.
 const OBJ_KEY_ATTRIBUTES: u32 = 0x40 | 0x200;
 /// `KEY_QUERY_VALUE`. `ZwFlushKey` needs no particular access to the handle.
 const KEY_QUERY_VALUE: u32 = 0x1;
+
+/// `PLUGPLAY_REGKEY_DEVICE`: the device's hardware key (`Enum\...\Device Parameters`),
+/// the key `HKR` of an INF `.HW` section writes to and PnP reads `MSISupported` from.
+/// (`PLUGPLAY_REGKEY_DRIVER` is 2: the software key under the class.)
+const PLUGPLAY_REGKEY_DEVICE: u32 = 1;
+/// `KEY_ALL_ACCESS`.
+const KEY_ALL_ACCESS: u32 = 0x000F_003F;
+/// `KEY_SET_VALUE`.
+const KEY_SET_VALUE: u32 = 0x2;
+
+/// Write one `REG_DWORD` under a subkey of a device's hardware key. Returns the NTSTATUS of
+/// the step that failed, or 0. `subkey` and `value_name` are UTF-16 WITHOUT a terminator; the
+/// subkey must already exist (the INF creates the ones the driver uses).
+///
+/// For PnP policy values that are read when the device is next started (`Interrupt
+/// Management\MessageSignaledInterruptProperties\MSISupported`): writing one here changes
+/// the NEXT start, and the current one only if PnP has not read it yet. PASSIVE_LEVEL, from a
+/// DDI that is handed the PDO (`DxgkDdiAddDevice`).
+pub(crate) fn write_device_key_dword(
+    _passive: crate::irql::PassiveLevel,
+    pdo: *mut core::ffi::c_void,
+    subkey: &[u16],
+    value_name: &[u16],
+    value: u32,
+) -> i32 {
+    let mut device_key: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: PASSIVE_LEVEL (the token); `pdo` is the physical device object dxgkrnl handed
+    // to AddDevice; the out-handle is a live local. The handle, if returned, is closed below.
+    let opened = unsafe {
+        IoOpenDeviceRegistryKey(pdo, PLUGPLAY_REGKEY_DEVICE, KEY_ALL_ACCESS, &mut device_key)
+    };
+    if opened < 0 || device_key.is_null() {
+        return if opened < 0 { opened } else { -1 };
+    }
+    let sub_bytes = (subkey.len() * 2) as u16;
+    let mut sub_name = NtUnicodeString {
+        length: sub_bytes,
+        maximum_length: sub_bytes,
+        buffer: subkey.as_ptr() as *mut u16,
+    };
+    let mut attributes = NtObjectAttributes {
+        length: core::mem::size_of::<NtObjectAttributes>() as u32,
+        root_directory: device_key,
+        object_name: &mut sub_name,
+        attributes: OBJ_KEY_ATTRIBUTES,
+        security_descriptor: core::ptr::null_mut(),
+        security_quality_of_service: core::ptr::null_mut(),
+    };
+    let mut sub: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: as above; `attributes` and the name it points to outlive the call, and
+    // `subkey` is the caller's slice.
+    let mut status = unsafe { ZwOpenKey(&mut sub, KEY_SET_VALUE, &mut attributes) };
+    if status >= 0 && !sub.is_null() {
+        let value_bytes = (value_name.len() * 2) as u16;
+        let mut name = NtUnicodeString {
+            length: value_bytes,
+            maximum_length: value_bytes,
+            buffer: value_name.as_ptr() as *mut u16,
+        };
+        let mut data = value;
+        // SAFETY: `sub` is the subkey just opened with KEY_SET_VALUE; `name` and `data`
+        // are live locals the call copies before returning.
+        status = unsafe {
+            ZwSetValueKey(
+                sub,
+                &mut name,
+                0,
+                REG_DWORD,
+                (&mut data as *mut u32).cast(),
+                4,
+            )
+        };
+        // SAFETY: closes the handle opened above.
+        let _ = unsafe { wdk_sys::ntddk::ZwClose(sub as wdk_sys::HANDLE) };
+    } else if status >= 0 {
+        status = -1;
+    }
+    // SAFETY: closes the handle IoOpenDeviceRegistryKey returned.
+    let _ = unsafe { wdk_sys::ntddk::ZwClose(device_key as wdk_sys::HANDLE) };
+    status
+}
 
 /// Force the service key (and so every breadcrumb written to it) to disk.
 ///
@@ -1084,10 +1210,29 @@ pub mod knobs {
     pub const GUEST_BLOB: KnobName = KnobName::new(b"GuestBlob");
     /// `RmCopyEngine` (default 0 = nothing happens: no allocation, no RM message). 1: reserved for
     /// the windowed Present copy on the KMD's own copy-engine channel (M3c; nothing yet). 2: the
-    /// channel's hardware self-test, once per transport generation, from the HPD worker. Any other
-    /// value is 0. Read at every StartDevice; mirrored as `CeKnob`.
+    /// channel's hardware self-test, once per transport generation, from the HPD worker. 3: the
+    /// shadow mode (M3c-1): a sample of real Presents copied again by the channel into a scratch
+    /// buffer and compared with the production copy. Any other value is 0. Read at every
+    /// StartDevice; mirrored as `CeKnob`.
     /// `docs/rm-copy-engine-present.md` section 11.
     pub const RM_COPY_ENGINE: KnobName = KnobName::new(b"RmCopyEngine");
+    /// `RmCeCache` (default 0 = cached, as the copy-engine tool allocates it). 1: the channel's own
+    /// RM system memory (control, ring, the self-test's buffers) write-combined, for an A/B. Read at
+    /// StartDevice when `RmCopyEngine` is nonzero; mirrored as `CeCache`.
+    pub const RM_CE_CACHE: KnobName = KnobName::new(b"RmCeCache");
+    /// `CeShadowEvery` (default 0 = 64): with `RmCopyEngine` = 3 (the shadow mode, M3c-1), one in
+    /// how many Presents is copied again by the copy-engine channel and compared with the
+    /// production copy. Read at StartDevice in shadow mode only; mirrored as `CeShadowEach`.
+    /// `docs/rm-copy-engine-present.md` section 14.
+    pub const CE_SHADOW_EVERY: KnobName = KnobName::new(b"CeShadowEvery");
+    /// `CopyQueue` (default 0 = the previous behaviour: one queue, family 0). 1: the KMD's Venus
+    /// device also gets a queue on a transfer-only family (chosen from the queue family
+    /// properties, bound to ring 2), and the windowed Present copies a transfer queue can run (a
+    /// plain image-to-buffer copy into a standard buffer or its guest blob, foreign sources
+    /// included) go there instead of waiting for graphics-engine timeslices. 2: as 1, and the
+    /// family-0 queue (format conversions, image destinations) at high global priority. Read at
+    /// every StartDevice (device creation); mirrored as `CqKnob`. `docs/zero-copy-present.md` 24.13.
+    pub const COPY_QUEUE: KnobName = KnobName::new(b"CopyQueue");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
@@ -1113,6 +1258,13 @@ pub mod knobs {
     /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
     /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
+    /// `IndepFlip` (default 0): independent flip, stage S-1 (`docs/independent-flip.md` section
+    /// 11, `helios_kmd_logic::independent_flip::Mode`). 0 off; 1 advertise `SupportDirectFlip`,
+    /// the aperture `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip` (OR'd into what
+    /// `DirectFlipCaps` / `FlipCapsX` ask for) and count every flip's verdict (`Idf*`); 2 as 1,
+    /// and a DMA-buffer flip of an unregistered Venus allocation completes as a kept picture
+    /// instead of failing (`PBFlip` 0xE6). Read with the other adapter knobs; mirrored as `IdfKnob`.
+    pub const INDEP_FLIP: KnobName = KnobName::new(b"IndepFlip");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,
@@ -1182,6 +1334,11 @@ pub mod knobs {
     /// `VsLate*`): atomics in the DDI and the tick, mirrored once a second. Read at every
     /// StartDevice.
     pub const FLIP_LAT: KnobName = KnobName::new(b"FlipLat");
+    /// `StageTrace` (default 0 = off): per-frame stage timestamps of the windowed Present copy
+    /// and the `ForeignFlip` path into a ring the registry mirror publishes as the REG_BINARY
+    /// `StgRing` (`ddi::stage_trace`, `docs/TRACING.md` "Frame stage timing"). Off, every stamp
+    /// site is one relaxed load. Read at every StartDevice; mirrored as `StgOn`.
+    pub const STAGE_TRACE: KnobName = KnobName::new(b"StageTrace");
     /// `OutputTech` (default 1): the connector type the virtual monitor's child
     /// device reports to Windows. 1 = DisplayPort (external), 2 = HDMI, 3 = DVI,
     /// 4 = internal, 0 = HD15 (analog VGA, the historical value). Anything else
@@ -1215,12 +1372,51 @@ pub mod knobs {
     /// messages). 1 forces ONE shared message 0 for every queue even when more
     /// were granted: the same-boot A/B between per-queue and shared vectors.
     ///
-    /// This is NOT a switch back to INTx. Whether the OS hands the driver
-    /// messages or the INTx line is decided by PnP before `StartDevice` from the
-    /// device key's `MSISupported`; see `docs/msi-interrupts.md` for the one
-    /// `reg add` that forces INTx. Snapshotted at transport init, so
+    /// This is NOT a switch back to INTx (its default 0 keeps meaning per-source
+    /// vectors, as it always did). Whether the OS hands the driver messages or the
+    /// INTx line is decided by PnP before `StartDevice` from the device key's
+    /// `MSISupported`; the switch for that is `MsiMode` below (see
+    /// `docs/msi-interrupts.md`). Snapshotted at transport init, so
     /// `pnputil /restart-device` applies it without a reboot.
     pub const MSI_VECTORS: KnobName = KnobName::new(b"MsiVectors");
+
+    /// `MsiMode` (default 0 = auto). Which interrupt mode the driver asks PnP for
+    /// (`docs/msi-interrupts.md`): 0 = follow the INF / the device key as it stands (INTx in
+    /// this package; a latch lowers it); 1 = INTx always; 2 = MSI-X (raises the key to 1), but
+    /// the boot-loop breaker and the latch still win; 3 = MSI-X with no breaker and no latch
+    /// (debugging). Realised by `AddDevice` writing the device key's `MSISupported`, so the
+    /// FIRST restart after a change writes the key and a SECOND restart (or a reboot) applies
+    /// it; the driver follows whatever PnP actually granted either way. Mirrored as
+    /// `MsiModeEff`. Never written by the driver.
+    pub const MSI_MODE: KnobName = KnobName::new(b"MsiMode");
+    /// `MsiLatch` (default 0). Set to 1 by the driver when message delivery was convicted,
+    /// vector set-up failed, or the breaker tripped: the next `AddDevice` then asks PnP for
+    /// INTx. An operator clears it (0) to retry MSI-X, or sets it to 1 to rehearse the fallback.
+    pub const MSI_LATCH: KnobName = KnobName::new(b"MsiLatch");
+    /// `MsiStarting` (default 0). The boot-loop breaker's marker: a start that got messages
+    /// sets it (flushed to disk) and clears it once interrupts arrive; `AddDevice` finding it
+    /// set means the previous start never became healthy.
+    pub const MSI_STARTING: KnobName = KnobName::new(b"MsiStarting");
+    /// `MsiBreaker` (default 0). How many times the breaker tripped (a count the driver keeps).
+    pub const MSI_BREAKER: KnobName = KnobName::new(b"MsiBreaker");
+    /// `MsiStartingVer` (default 0). The build tag (`msi::build_tag`) of the image that set
+    /// `MsiStarting`; 0 = an image older than the tag. Only a marker of the running build trips
+    /// the breaker: a driver update consumes the old build's marker (`MsiMarkerOld`).
+    pub const MSI_STARTING_VER: KnobName = KnobName::new(b"MsiStartingVer");
+    /// `MsiLatchVer` (default 0). The build tag of the image that wrote `MsiLatch`; 0 = written
+    /// by hand (or by an image older than the tag), honoured. Another build's latch is stale:
+    /// cleared at `AddDevice` (`MsiLatchOld`).
+    pub const MSI_LATCH_VER: KnobName = KnobName::new(b"MsiLatchVer");
+    /// `MsiLatchWhy` (default 0). Why the KMD latched (`msi::latch_why`, 1 to 4); 0 / absent on
+    /// an operator's latch. Read at `AddDevice`: an untagged latch WITH a KMD reason was written
+    /// by an image older than the build tag and is set aside (`MsiLatchLegacy=1`).
+    pub const MSI_LATCH_WHY: KnobName = KnobName::new(b"MsiLatchWhy");
+    /// `MsiMarkerOld` (default 0). How many markers of another build `AddDevice` consumed
+    /// without tripping the breaker (a count the driver keeps).
+    pub const MSI_MARKER_OLD: KnobName = KnobName::new(b"MsiMarkerOld");
+    /// `MsiLatchOld` (default 0). How many latches of another build `AddDevice` set aside (a
+    /// count the driver keeps).
+    pub const MSI_LATCH_OLD: KnobName = KnobName::new(b"MsiLatchOld");
 
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.
