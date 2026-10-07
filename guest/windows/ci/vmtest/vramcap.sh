@@ -9,24 +9,23 @@
 set -u
 L=${1:?label}; S=${2:-3}; shift; [ $# -gt 0 ] && shift
 V=${VMTEST_DIR:-$HOME/.cache/conduit-vmtest}; T=$V/t
+D=$(cd "$(dirname "$0")" && pwd); R=$(cd "$D/../../../.." && pwd)
 CFG=${WIN_SSH_CONFIG:-$T/sshcfg}; HOSTA=${WIN_SCP_HOST:-win11g}
+# Commands as arrays (`timeout` runs programs, not shell functions). DRY=1 prints them instead.
 if [ -f "$CFG" ]; then
-  gssh() { ssh -F "$CFG" "$HOSTA" "$@"; }
-  gget() { scp -O -q -F "$CFG" "$HOSTA:$1" "$2"; }
-  gput() { scp -O -q -F "$CFG" "$1" "$HOSTA:$2"; }
+  SSH=(ssh -F "$CFG" "$HOSTA"); SCP=(scp -O -q -F "$CFG"); RH="$HOSTA"
 else
   H="${WIN_SSH:?set WIN_SSH_CONFIG + WIN_SCP_HOST, or WIN_SSH=user@127.0.0.1 (the guest account)}"
-  gssh() { ssh -p 2222 "$H" "$@"; }
-  gget() { scp -O -q -P 2222 "$H:$1" "$2"; }
-  gput() { scp -O -q -P 2222 "$1" "$H:$2"; }
+  SSH=(ssh -p 2222 "$H"); SCP=(scp -O -q -P 2222); RH="$H"
 fi
-D=$(cd "$(dirname "$0")" && pwd); R=$(cd "$D/../../../.." && pwd)
+run() { if [ "${DRY:-0}" = 1 ]; then printf '%q ' "$@"; echo; else "$@"; fi; }
 O=$V/win/vram-$L-$(date +%H%M%S); mkdir -p "$O"
-if [ "${HEAVEN:-0}" = 1 ]; then bash "$D/hvwin.sh" direct3d11 "" ; sleep 25; fi
-gput "$D/vram-etw.ps1" "C:/Users/Public/t/vram-etw.ps1" || { echo "upload failed (config $CFG, host $HOSTA)"; exit 1; }
-timeout 900 gssh "powershell -ExecutionPolicy Bypass -File C:\\Users\\Public\\t\\vram-etw.ps1 -Seconds $S $*" | tr -d '\r' | tee "$O/guest.txt"
+if [ "${HEAVEN:-0}" = 1 ] && [ "${DRY:-0}" != 1 ]; then bash "$D/hvwin.sh" direct3d11 "" ; sleep 25; fi
+run "${SCP[@]}" "$D/vram-etw.ps1" "$RH:C:/Users/Public/t/vram-etw.ps1" || { echo "upload failed (config $CFG, host $RH)"; exit 1; }
+run timeout 900 "${SSH[@]}" "powershell -ExecutionPolicy Bypass -File C:\\Users\\Public\\t\\vram-etw.ps1 -Seconds $S $*" | tr -d '\r' | tee "$O/guest.txt"
 for f in vram.xml.zip vram.etl dxgkrnl-manifest.xml dxgi-manifest.xml processes.txt kmd-before.txt kmd-after.txt capture.txt segments.txt vram.wprp; do
-  gget "C:/Users/Public/t/vram/$f" "$O/" 2>/dev/null || echo "missing $f"
+  run "${SCP[@]}" "$RH:C:/Users/Public/t/vram/$f" "$O/" 2>/dev/null || echo "missing $f"
 done
+[ "${DRY:-0}" = 1 ] && exit 0
 python3 "$R/guest/windows/tools/vram_redirection_report.py" "$O" --process "${PROC:-Heaven.exe}" --csv "$O/frames.csv" | tee "$O/report.txt"
 echo "saved $O"
