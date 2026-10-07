@@ -1071,3 +1071,32 @@ What gates it, and what the driver can do:
   (11.2).
 * The UMD's `CheckDirectFlipSupport` answer may also feed the upgrade decision (the knob's commit message says "may"); row C with a
   blt-model app (`d3d11_triangle helios blt`) under the script answers whether `DirectFlipSupport=1` changes the reason list.
+
+### 11.6 First hardware result, and the pacing fix
+
+Package 22.22.345.1, 1920x1080@240, `d3d11_iflip.exe 20` (borderless, interval 1):
+
+| row | kmt DIRECTFLIP / INDEPENDENTFLIP | `FlipCapsRep` | DXGI mode | fps | KMD |
+|---|---|---|---|---|---|
+| A (`IndepFlip=0`) | 0 / 0 | 0x2 | COMPOSED 18 | 240 | `Idf*` 0 |
+| C (`IndepFlip=1`, `DirectFlipSupport=1`) | 1 / 1 | 0x32 | NONE 10 | **2758** | `IdfSeen` 295, `IdfDirFor` 293, `IdfArmMmio` 295, `IdfSpaTrans` 2, `IdfKeep` 0 |
+| F (`IndepFlip=2`) | 1 / 1 | 0x32 | NONE 8 | 1930 | as C, `IdfEnfKeep` 0 |
+
+dxgkrnl derives both answers from our caps, and DXGI leaves composition. The pacing was wrong, and the cause is in the UMD, not in the
+KMD's flip completion. With independent flip, DXGI creates the borderless chain's buffers from a `pPrimaryDesc`, so the NVK present path
+(`nvk_present_frame`, default `NvkPresent=0`) took its rule for primaries: show the frame through NVK's own scan-out source (the user
+`SCANOUT_PRESENT` source, the fullscreen-exclusive path) and return without calling `pfnPresentCb`. The exception is the first frame
+(`NvkScanoutComposeEvery` 0 at the WDDM 1.3 DDI level). So dxgkrnl never saw the application's presents: no flip queue, no vblank
+throttle, an unpaced 2758 fps. The 295 flips the KMD counted are DWM's and that one frame, and `IdfSpaTrans` 2 is the one promotion
+transition.
+
+Fix (commit "umd: with independent flip, NVK primaries take the WDDM flip"): when dxgkrnl reports `KMTQAITYPE_INDEPENDENTFLIP_SUPPORT`
+for the adapter (only with `IndepFlip` set), a primary source takes the WDDM present like any composed frame. dxgkrnl then flips the
+application's own buffer (the MMIO flip; the KMD shows it through `ForeignFlip`, zero-copy) or DWM composes it, and the flip retires on
+the vsync heartbeat. `NvkPresent=1` still forces the old scan-out path, and `NvkPresent=2` forces the WDDM present for every frame (the
+same result without the new build). The UMD log says `NVK present: primary source #0 takes the WDDM flip`.
+
+Re-run C. Expect fps at about 240 and DXGI mode NONE. On the KMD side, `IdfArmMmio`, `IdfSeen` and `IdfDirFor` should rise by about 240
+per second (about 4800 in 20 s), `VpEnt` likewise, with `FfProg` and `FfFrames` rising at that rate, `FfReowned` +2 per promotion round
+trip, `IdfSpaTrans` / `IdfSpaExcl` nonzero, `IdfKeep` 0 and `FkKeep*` 0. `FfRttUsMax` should stay below about 4 ms at 240 Hz. If the rate
+caps at about 120, check `FfAsyncWin` (4.4). The UMD log should no longer show `NVK present: N frames on scanout 0`.
