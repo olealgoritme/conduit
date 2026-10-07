@@ -1402,6 +1402,11 @@ pub const COUNTERS: &[&str] = &[
     "GdiUs",
     "GdiUsMax",
     "GdiRects",
+    // Census: the classes of the surfaces seen (destination bit 0 VRAM, 1 system, 2 unreachable;
+    // sources the same at 4..6), and the last destination's resource id and size (w << 16 | h).
+    "GdiCls",
+    "GdiDstRes",
+    "GdiDstWH",
 ];
 
 #[cfg(test)]

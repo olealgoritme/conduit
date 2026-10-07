@@ -2671,6 +2671,12 @@ pub unsafe extern "C" fn dxgkddi_render_km(
     if args.pDmaBuffer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    // `GdiAccel` = 1: the GDI command buffer is translated (`ddi/gdi_accel.rs`). Off: one
+    // relaxed load and the pass-through below, unchanged.
+    if crate::ddi::gdi_accel::on() {
+        // SAFETY: dxgkrnl's context handle and arguments for this PASSIVE call.
+        return unsafe { crate::ddi::gdi_accel::render_km(_h_context, args) };
+    }
     let cmd_len = args.CommandLength as usize;
     let dma_cap = args.DmaSize as usize;
     // Ask the runtime to grow the DMA buffer if the command does not fit, rather

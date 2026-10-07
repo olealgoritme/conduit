@@ -334,8 +334,10 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     }
 
     // No GDI hardware acceleration (see the note above): every documented
-    // DXGK_PRESENTATIONCAPS bit stays clear.
-    let presentation_caps: UINT = 0;
+    // DXGK_PRESENTATIONCAPS bit stays clear — unless `GdiAccel` = 1, the copy-engine
+    // GDI acceleration experiment (`ddi/gdi_accel.rs`, docs/vram-redirection.md 9),
+    // which reports `helios_kmd_logic::gdi_accel::ACCEL_CAPS`. Absent knob: 0, as before.
+    let presentation_caps: UINT = crate::ddi::gdi_accel::reported_caps(knobs.gdi_accel);
     // BOTH MMIO flip capabilities, and the second one is a FIX, measured
     // 2026-07-29 (KMD 22.22.197.0).
     //

@@ -235,6 +235,9 @@ pub(crate) struct AdapterKnobs {
     /// clean. Out-of-range values are refused into `VidVBad` and fall back to
     /// the legacy topology rather than silently collapsing.
     pub vidmm_vram_mb: u32,
+    /// `GdiAccel` (default 0), raw: 1 reports GDI hardware acceleration (`ddi/gdi_accel.rs`).
+    /// Read here so the AddAdapter-time caps query and the StartDevice latch agree.
+    pub gdi_accel: u32,
 }
 
 impl AdapterKnobs {
@@ -263,6 +266,7 @@ impl AdapterKnobs {
         bar_seg_base_mb: 0,
         bar_seg_mode: 10,
         vidmm_vram_mb: VIDMM_VRAM_MB_AUTO,
+        gdi_accel: 0,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -297,6 +301,7 @@ impl AdapterKnobs {
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
             vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
+            gdi_accel: read_config_dword(knobs::GDI_ACCEL, 0),
         }
     }
 
@@ -327,6 +332,8 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"FlipCapsXEff", flip.effective);
         crate::diag::record_named_bytes(b"FlipCapsXMsk", flip.dropped);
         crate::diag::record_named_bytes(b"FlipCapsRep", flip.reported);
+        // GDI acceleration: latch the knob for RenderKm and write its mirrors (knob on only).
+        crate::ddi::gdi_accel::note_start(knobs.gdi_accel);
         // VidVram is recorded after StartDevice resolves the absent-value
         // sentinel from the virtio host-visible capability.
         crate::diag::record_named_bytes(b"VidVBad", 0);
