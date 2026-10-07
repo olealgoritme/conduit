@@ -55,7 +55,7 @@ RTX 5090.
 |---|---|
 | Host | Linux, x86-64, with KVM (`ls /dev/kvm` works) |
 | GPU | NVIDIA, Turing (RTX 20xx) or newer |
-| Host driver | NVIDIA **open** kernel modules, 580 or newer, a release Conduit has ABI tables for (580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09) |
+| Host driver | A release Conduit has ABI tables for (535.129.03, 565.77, 580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09; `conduit doctor` lists them). Tested with the **open** kernel modules, 580 or newer; the closed modules and older branches are accepted when the release has tables, with a warning that they are untested |
 | Desktop | Any Wayland desktop (GNOME, KDE, Hyprland, Sway, …) |
 | VM | Linux, kernel 6.4 or newer: Ubuntu 24.04 recommended (`conduit create`); `conduit attach` also sets up Debian and Arch-based VMs (Arch, Omarchy, EndeavourOS, Manjaro). Windows 11: experimental ([docs/WINDOWS.md](docs/WINDOWS.md)) |
 
