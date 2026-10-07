@@ -182,6 +182,7 @@ Canonical branch: `nvk-rm/integration`.
 | `0031` | S6 shared surfaces (in progress) |
 | `0051` | UBO descriptors not promoted to bound cbufs on Windows (Heaven GPU time per draw 2.7 -> 0.7 µs) |
 | `0052` | the Helios holder context renewed after a KMD restart |
+| `patches-common/0008` | ZCULL for DXVK depth buffers (storage with `TRANSFER_DST`, reset after transfers) and reverse Z (per-image ZCULL direction); host: overdraw over depth-loading passes 0.162 -> 0.109 ms (NVIDIA 0.102), reverse Z 0.141 -> 0.070 ms (NVIDIA 0.071); guest Heaven A/B pending |
 | `patches-windows-dxvk/0001–0004` | i686 build fix, no present-wait advertised, R/B in the GDI path, wait knobs |
 
 ## How changes get tested

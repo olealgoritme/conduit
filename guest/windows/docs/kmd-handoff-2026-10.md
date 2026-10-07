@@ -143,3 +143,43 @@ make the agent verify the log; registry knob and counter names are truncated at 
 PASSIVE only; DIRQL and DISPATCH code uses atomics only; `KeGetCurrentThread`, `KeGetCurrentProcessorNumber`, `KeMemoryBarrier` and the
 `Interlocked*` family are inline-only in the WDK and fail at link time (use `PsGetCurrentThread` and Rust atomics); no AI attribution
 anywhere (commit messages, docs, code comments).
+
+## 10. Per-frame stage timing (`StageTrace`)
+
+Counters say how often and how long on average; `StageTrace` follows each frame. With the knob on (REG_DWORD `StageTrace` = 1, read
+at StartDevice; default 0, where every stamp site is one relaxed load) the KMD stamps the stages below into a lock-free ring of 8192
+slots (atomics only, any IRQL) and the registry mirror's pass writes the whole ring, at most twice a second, as the REG_BINARY value
+`StgRing` in the service key. `StgOn` is the knob in force, `StgHead` the low 32 bits of the records ever written, `StgPubN` the
+snapshots written. The host collector (`docs/TRACING.md` "Frame stage timing") reads `StgRing` over SSH, joins it with the backend's
+and the renderer's stamps by the id the wire already carries and prints the per-stage budget. The layout and the stage numbers are
+`kmd_logic/src/stage_trace.rs` (host-tested against the host decoder's layout); the statics and the publish are
+`kmd_render/src/ddi/stage_trace.rs`. Times are interrupt time (`KeQueryInterruptTimePrecise`, 100 ns).
+
+Windowed Present copy (kind 1), id = the low 32 bits of the copy's WIRE fence id (the ring-1 `SUBMIT_3D`'s `ctrl_hdr.fence_id`):
+
+| stage | where |
+|---|---|
+| 1 present | `DxgkDdiPresent` entry (`ddi/display.rs` `dxgkddi_present`, passed down as `present_t_100ns`); stamped under the fence by `ddi/blt_async.rs` `direct` (BltAsync direct), `display.rs` `service_windowed_blt` (queued copies, from `WindowedBltPending::t_present`) and the legacy arm after `submit_present_blt_guest` |
+| 2 defer | `WindowedBltPending::t_queue`, BltAsync deferred copies only; stamped in `service_windowed_blt` |
+| 3 submit | taken just before the `ctrl::submit_venus_async_*` call in `virtio/venus/present.rs` (`submit_present_blt_to`, `submit_prepared_present_blt_direct`, `submit_prepared_present_blt`), so the host cannot see the descriptor earlier (the collector's clock correlation relies on it) |
+| 4 isr | the last interrupt the ISR claimed (`ddi/interrupt.rs`), if it lies between the copy's submission and its completion (`stage_trace::isr_for`); the legacy arm has no submission time and gets none |
+| 5 done | the used-ring drain's `AsyncVenus` arm (`virtio/gpu/mod.rs`) for a ring-1 Present copy: a direct BltAsync copy, a queued (WindowedBlt) copy or a legacy copy with a destination buffer |
+
+Not stamped: 6 notify (the DMA completion reported to dxgkrnl). The WDDM FIFO entry (`WddmPending`) carries the Present's watermark and
+WindowedBlt token, not the copy's wire fence, so tying `signal_dma_completed` to the frame id needs a field threaded through
+`note_wddm_submission`; left for a later change. Until then dxgkrnl's side is read from a DxgKrnl ETW capture.
+
+ForeignFlip (kind 2), id = the low 32 bits of `ScanoutFlip::seq`:
+
+| stage | where |
+|---|---|
+| 16 flip ddi | `flip_lat`'s `PROG_T` (the `SetVidPnSourceAddress` entry of the picture last programmed; needs `FlipLat` 1, the default): stamped in `virtio/foreign_flip.rs` `flip_async` (pipelined) and, for the synchronous flip, handed over through `stage_trace::set_flip_ddi` and stamped in `virtio/foreign_scanout.rs` `present_within` |
+| 17 flip submit | taken just before the message reaches the ring: `foreign_scanout.rs` `send` (synchronous) and `present_submit` (pipelined) |
+| 18 flip isr | the last claimed interrupt between submission and answer (as stage 4) |
+| 19 flip ack | synchronous: the round trip returned; pipelined: the used-ring drain wrote the acknowledgement word (`virtio/gpu/mod.rs`, `RawAsync`). The drain knows only the flip's tag, the low 30 bits of `seq`, so a pipelined ack carries those (the same as the low 32 until `seq` passes 2^30) |
+
+Not stamped: 20 flip retire (the vsync tick that carried the address). `flip_lat` matches ticks by address, and the address is not
+tied to the `seq` on the flip path today; the retire latency stays in `FlipLat*`.
+
+Cost with the knob on: a `fetch_add` and four atomic stores per stamp, and one 196 640-byte registry write per publish (at most twice a
+second, on the mirror thread).

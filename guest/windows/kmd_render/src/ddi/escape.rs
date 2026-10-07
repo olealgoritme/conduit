@@ -1927,6 +1927,19 @@ fn nvrm_publish_counters_if_due(adapter: &AdapterContext) {
     }
 }
 
+/// Ask for the `Nv*` registry mirror (and everything `publish_nvrm_counters` writes) without a
+/// session-shaping change behind it: the worker does it within 250 ms. One load when one is
+/// already wanted; legal at DISPATCH (an atomic and `KeSetEvent(Wait = FALSE)`).
+pub(super) fn request_nvrm_publish(adapter: &AdapterContext) {
+    use core::sync::atomic::Ordering;
+    if NVRM_PUBLISH_WANTED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    if NVRM_PUBLISH_WANTED.swap(1, Ordering::AcqRel) == 0 {
+        adapter.signal_hpd();
+    }
+}
+
 /// Whether a mirror was asked for and has not happened yet. The HPD worker
 /// bounds its sleep while this holds, so the trailing state of a burst is
 /// published even if no further escape arrives.
