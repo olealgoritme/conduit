@@ -1100,3 +1100,18 @@ Re-run C. Expect fps at about 240 and DXGI mode NONE. On the KMD side, `IdfArmMm
 per second (about 4800 in 20 s), `VpEnt` likewise, with `FfProg` and `FfFrames` rising at that rate, `FfReowned` +2 per promotion round
 trip, `IdfSpaTrans` / `IdfSpaExcl` nonzero, `IdfKeep` 0 and `FkKeep*` 0. `FfRttUsMax` should stay below about 4 ms at 240 Hz. If the rate
 caps at about 120, check `FfAsyncWin` (4.4). The UMD log should no longer show `NVK present: N frames on scanout 0`.
+
+Re-run of C with `NvkPresent=2` (the same routing as the fix, on the 345.1 UMD): **paced and promoted**. 4803 frames in 20.0 s
+(240.1 fps), DXGI mode OVERLAY 18 (COMPOSED 0). `IdfSeen` 5059, `IdfDirFor` 5057, `IdfArmMmio` 5059, `IdfKeep` 0. `VpEnt` 5059, `VpPres`
+6015, `VpFlip` = `VpMmio` 5053, `FfProg` 5057, `FfFrames` 5050, `FfReowned` 1, `FfRttUsMax` 2429 us, `FkKeep` 0, `IdfSpaTrans` 2,
+`IdfPrRedir` 957.
+
+* The DXGI mode reads OVERLAY, not NONE. With kmt MPO = 0 there is no overlay plane, so DXGI evidently reports a promoted chain as
+  OVERLAY [M]. The unpaced run's NONE was the user-source state, which dxgkrnl never saw. PresentMon's PresentMode column remains the
+  authority.
+* `IdfPrRedir` 957 and `VpPres` - `VpFlip` = 962: the `RedirectedFlip` presents are, by the arithmetic, non-Flip presents. The KMD's arm
+  choice is `Flags` bit 2, so they take the Blt arm. Reading: with `DdiPresentForIFlip`, dxgkrnl calls `DxgkDdiPresent` for a candidate
+  present that it redirects to DWM (composed) instead of flipping. 957 is about 4 s at 240 Hz, consistent with a composed phase before
+  promotion. To confirm: the flag histogram `FlR<n>` / `FlC<n>` (a word with 0x2000 set and 0x4 clear, count about 957), `FiR<n>` /
+  `FiC<n>`, `VpBlt`, and `IdfPrRedir` read at about 5 s and again at the end (a start-up burst vs. a steady trickle). A steady trickle
+  would mean partial demotions, and `IdfSpaTrans` / `FfReowned` would rise with it.
