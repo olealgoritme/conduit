@@ -244,6 +244,22 @@ Full captures (every probe; each probe adds a little to every row), µs, p50:
 | NVIDIA interrupt → vkr-queue running | 18.5 | 16.1 | 23.2 |
 | `signal_used_queue` → QEMU raises INTx, p50 / p99 | 13.2 / 270 | 13.2 / 996 | 11.5 / 1582 |
 
+Guest side, same rows (the KMD's `BltAsyncLat` histogram over about 11 s,
+submit to completion DPC; driver 346.1, INTx):
+
+| | A off | B all | C all + cpus |
+|---|---|---|---|
+| copies < 500 µs | 0.3 % | 1.1 % | 5.2 % |
+| copies 0.5-1 ms | 99.1 % | 98.0 % | 94.5 % |
+| copies > 1 ms | 0.6 % | 0.9 % | 0.3 % |
+| producer deferral (`BltDeferUs / BltAsyncDefer`) | 753 µs | 654 µs | 767 µs |
+
+The guest's histogram has 250 µs buckets, so a 44 µs gain shows only as
+copies crossing the 500 µs edge: 7 → 27 → 135 of about 2450. Copies take
+about 500-550 µs in the guest against about 410-450 µs host dispatch to
+interrupt. The difference is the guest's submit, its kick, and the INTx
+interrupt through to the DPC.
+
 Reading:
 
 - The options cut the host's own part of the round trip:
