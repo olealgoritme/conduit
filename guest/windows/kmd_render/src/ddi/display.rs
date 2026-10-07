@@ -2274,10 +2274,21 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_position(
     }
     // SetPointerPosition's legal set does NOT include STATUS_NOT_SUPPORTED — an
     // illegal return here is logged as a driver bug during the modeset (AzureTriage,
-    // 36th session). With the display half up, accept the (software-cursor) position
-    // as a no-op; render-only never receives this call.
+    // 36th session). With the display half up the hardware cursor takes it
+    // (`ddi::hw_cursor`; a no-op that succeeds when no pointer was reported, the
+    // software cursor); render-only never receives this call.
     if unsafe { display_half_on(_adapter) } {
-        STATUS_SUCCESS
+        if position.is_null() {
+            return STATUS_SUCCESS;
+        }
+        // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
+        // valid for the call, at PASSIVE.
+        unsafe {
+            crate::ddi::hw_cursor::set_pointer_position(
+                &*(_adapter as *const AdapterContext),
+                &*position,
+            )
+        }
     } else {
         STATUS_NOT_SUPPORTED
     }
@@ -2291,10 +2302,19 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_shape(
     if !shape.is_null() {
         crate::diag::record(0x1311_0000 | unsafe { (*shape).VidPnSourceId & 0xFFFF });
     }
-    // As with SetPointerPosition: NOT_SUPPORTED is illegal for this DDI. Accept as a
-    // no-op with the display half up (the OS software-composes the cursor).
+    // As with SetPointerPosition: NOT_SUPPORTED is illegal for this DDI. With the display
+    // half up the hardware cursor takes it (`ddi::hw_cursor`): success when the host shows the
+    // shape, STATUS_UNSUCCESSFUL when dxgkrnl must draw it in software, and the old no-op
+    // success when no pointer was reported.
     if unsafe { display_half_on(_adapter) } {
-        STATUS_SUCCESS
+        if shape.is_null() {
+            return STATUS_SUCCESS;
+        }
+        // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
+        // valid for the call, at PASSIVE.
+        unsafe {
+            crate::ddi::hw_cursor::set_pointer_shape(&*(_adapter as *const AdapterContext), &*shape)
+        }
     } else {
         STATUS_NOT_SUPPORTED
     }

@@ -73,6 +73,7 @@ pub mod ce_shadow;
 pub mod ce_route;
 pub mod gdi_accel;
 pub mod copy_queue;
+pub mod hw_cursor;
 pub mod msi;
 pub mod paging;
 pub mod shared_placeholder;
