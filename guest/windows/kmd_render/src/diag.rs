@@ -1396,6 +1396,10 @@ pub mod knobs {
     /// by hand (or by an image older than the tag), honoured. Another build's latch is stale:
     /// cleared at `AddDevice` (`MsiLatchOld`).
     pub const MSI_LATCH_VER: KnobName = KnobName::new(b"MsiLatchVer");
+    /// `MsiLatchWhy` (default 0). Why the KMD latched (`msi::latch_why`, 1 to 4); 0 / absent on
+    /// an operator's latch. Read at `AddDevice`: an untagged latch WITH a KMD reason was written
+    /// by an image older than the build tag and is set aside (`MsiLatchLegacy=1`).
+    pub const MSI_LATCH_WHY: KnobName = KnobName::new(b"MsiLatchWhy");
     /// `MsiMarkerOld` (default 0). How many markers of another build `AddDevice` consumed
     /// without tripping the breaker (a count the driver keeps).
     pub const MSI_MARKER_OLD: KnobName = KnobName::new(b"MsiMarkerOld");

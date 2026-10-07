@@ -255,8 +255,15 @@ pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
     // Another build's latch is stale: this build gets one fresh attempt at MSI-X.
     let latch = read_config_dword(knobs::MSI_LATCH, 0) != 0;
     let latch_build = read_config_dword(knobs::MSI_LATCH_VER, 0);
-    let verdict = msi::latch_verdict(latch, latch_build, BUILD_TAG);
-    if verdict == msi::LatchVerdict::Stale {
+    let latch_why = read_config_dword(knobs::MSI_LATCH_WHY, 0);
+    let verdict = msi::latch_verdict(latch, latch_why, latch_build, BUILD_TAG);
+    if verdict.set_aside() {
+        // An untagged latch with a KMD reason came from an image older than the tag (Legacy);
+        // a tagged one from another build (Stale).
+        rec(
+            b"MsiLatchLegacy",
+            u32::from(verdict == msi::LatchVerdict::Legacy),
+        );
         rec(b"MsiLatch", 0);
         rec(b"MsiLatchWhy", 0);
         rec(b"MsiLatchVer", 0);
@@ -264,9 +271,15 @@ pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
             b"MsiLatchOld",
             read_config_dword(knobs::MSI_LATCH_OLD, 0).saturating_add(1),
         );
-    } else if msi::latch_tag_orphaned(latch, latch_build) {
-        // The latch was cleared by writing 0: drop its tag, so a later hand-set 1 is the operator's.
-        rec(b"MsiLatchVer", 0);
+    } else {
+        // The latch was cleared by writing 0: drop its tag and its reason, so a later hand-set 1
+        // is the operator's.
+        if msi::latch_tag_orphaned(latch, latch_build) {
+            rec(b"MsiLatchVer", 0);
+        }
+        if msi::latch_why_orphaned(latch, latch_why) {
+            rec(b"MsiLatchWhy", 0);
+        }
     }
     let mut latched = verdict.latched();
     // The boot-loop breaker: a message-mode start that never became healthy left its marker.

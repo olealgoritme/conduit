@@ -245,13 +245,22 @@ the middle of whatever it was doing, and the latch was a verdict on the old code
   vectors, unmapped cfg, the breaker) writes `MsiLatchVer` = the tag, `MsiLatch=1`,
   `MsiLatchWhy`, and flushes. `AddDevice` (`msi::latch_verdict`, BEFORE the marker):
 
-  | `MsiLatch` | `MsiLatchVer` | Verdict | Latched for `key_action` | What `AddDevice` does |
-  | --- | --- | --- | --- | --- |
-  | 0 / absent | absent / 0 | Clear | no | nothing |
-  | 0 | a tag | Clear | no | `MsiLatchVer=0` (an operator wrote 0 instead of deleting: a later hand-set 1 is then the operator's) |
-  | 1 | absent / 0 | Operator | YES | nothing: an operator's (or a pre-tag image's) latch is honoured as before |
-  | 1 | the running build's tag | Held | YES | nothing |
-  | 1 | another build's tag | Stale | no | `MsiLatch=0`, `MsiLatchWhy=0`, `MsiLatchVer=0`, `MsiLatchOld` + 1 |
+  | `MsiLatch` | `MsiLatchVer` | `MsiLatchWhy` | Verdict | Latched for `key_action` | What `AddDevice` does |
+  | --- | --- | --- | --- | --- | --- |
+  | 0 / absent | absent / 0 | absent / 0 | Clear | no | nothing |
+  | 0 | a tag, or a reason left | any | Clear | no | `MsiLatchVer=0` and `MsiLatchWhy=0` (an operator wrote 0 instead of deleting: a later hand-set 1 is then the operator's) |
+  | 1 | absent / 0 | absent / 0 / not 1-4 | Operator | YES | nothing: the operator's latch is honoured |
+  | 1 | absent / 0 | 1, 2, 3 or 4 (a KMD reason) | Legacy | no | written by an image older than the tag (346.1 and before): `MsiLatch=0`, `MsiLatchWhy=0`, `MsiLatchVer=0`, `MsiLatchOld` + 1, `MsiLatchLegacy=1` |
+  | 1 | the running build's tag | any | Held | YES | nothing |
+  | 1 | another build's tag | any | Stale | no | `MsiLatch=0`, `MsiLatchWhy=0`, `MsiLatchVer=0`, `MsiLatchOld` + 1, `MsiLatchLegacy=0` |
+
+  The Legacy row exists because a pre-tag build wrote its latches without a tag (hardware,
+  346.1 -> 347.1: `MsiLatch=1`, `MsiLatchWhy=4`, no `MsiLatchVer`, honoured as the operator's,
+  INTx before and after the update): every install coming from such a build would have stayed on
+  INTx. The decision is the same for every `MsiMode`; what the key then asks for is
+  `key_action` (mode 1 INTx, mode 3 MSI-X, modes 0 and 2 follow the latch). An operator who wants
+  a PERMANENT INTx uses `MsiMode=1`, which is not a latch and survives every update; a hand-set
+  `MsiLatch=1` must carry no `MsiLatchWhy` (or 0) and no `MsiLatchVer`.
 
   The breaker runs after the latch verdict, so a Trip in the same `AddDevice` latches again,
   with the running build's tag.
@@ -326,12 +335,16 @@ tags read as hex, e.g. `0x15a0001` for 346.1).
 3. After the install's restart (or the reboot): expect `MsiBreaker` unchanged, `MsiLatch=0`,
    `MsiWant=1`, `MsiModeEff=2`. If N predates the tag, or N's marker was still set when N+1's
    `AddDevice` ran: `MsiMarkerOld` + 1 (otherwise unchanged, since N's stop cleared it).
-   If N had latched: `MsiLatchOld` + 1 and `MsiLatch=0`. `MsiGrant`: 3 if the `AddDevice`
+   If N had latched: `MsiLatchOld` + 1 and `MsiLatch=0`, with `MsiLatchLegacy=0` when N
+   tagged its latch and `MsiLatchLegacy=1` when N is a pre-tag build (346.1 and before: the
+   latch had `MsiLatchWhy` 1-4 and no `MsiLatchVer`). `MsiGrant`: 3 if the `AddDevice`
    write was in time, else 0 (the INF rewrote `MSISupported=0` and the KMD's write of 1 applies
    at the next start, "Can the KMD change it for the start in progress?").
 4. One more `pnputil /restart-device` (or a reboot): `MsiGrant=3`, `MsiInts > 0`,
    `IntxInts=0`, `MsiStartingVer` = N+1's tag, `MsiStarting` back to 0 a few seconds after the
-   start, `MsiBreaker`, `MsiMarkerOld`, `MsiLatchOld` unchanged from step 3.
+   start, `MsiBreaker`, `MsiMarkerOld`, `MsiLatchOld` unchanged from step 3. From a pre-tag
+   build that had latched (the 346.1 -> 347.1 case): step 3 reads `MsiLatchOld` + 1,
+   `MsiLatchLegacy=1`, `MsiLatch=0`, `MsiWant=1`; step 4 reads `MsiGrant=3`.
 5. A same-build loop still latches (rehearsal): set the marker WITH the running tag,
    `reg add ... /v MsiStartingVer /t REG_DWORD /d <tag of N+1> /f` and
    `reg add ... /v MsiStarting /t REG_DWORD /d 1 /f`, restart: `MsiBreaker` + 1, `MsiLatch=1`,
@@ -339,11 +352,12 @@ tags read as hex, e.g. `0x15a0001` for 346.1).
    deleted: `MsiMarkerOld` + 1 and no trip.
 6. Back out: `reg delete ... /v MsiLatch /f` (and two restarts), or revert the snapshot.
 
-Operator actions: to FORCE INTx across updates, `MsiMode=1` (or `MsiLatch=1` with no
-`MsiLatchVer`: `reg delete ... /v MsiLatchVer /f` then `reg add ... /v MsiLatch /t REG_DWORD /d 1 /f`;
-a hand-set latch is never set aside by a newer build). To CLEAR a latch, delete `MsiLatch` (or
-write 0; `AddDevice` then drops the stale tag). To disable the breaker while debugging,
-`MsiMode=3`.
+Operator actions: to FORCE INTx permanently, across updates, `MsiMode=1` (not a latch). A
+hand-set latch also works: `reg delete ... /v MsiLatchVer /f`, `reg delete ... /v MsiLatchWhy /f`,
+then `reg add ... /v MsiLatch /t REG_DWORD /d 1 /f` (with no tag and no reason no build sets it
+aside; with a leftover `MsiLatchWhy` 1-4 it reads as a pre-tag KMD latch and is set aside). To
+CLEAR a latch, delete `MsiLatch` (or write 0; `AddDevice` then drops the leftover tag and
+reason). To disable the breaker while debugging, `MsiMode=3`.
 
 #### Test procedure: plain restarts of the same build
 
@@ -504,8 +518,9 @@ itself is unchanged code with counters added, and its first test is a boot with
 | Knob (service key `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, DWORD) | Values | Applies |
 | --- | --- | --- |
 | `MsiMode` (default 0) | 0 = auto: follow the INF / the device key as it stands (INTx in this package); a latch lowers it. 1 = INTx always. 2 = MSI-X opt-in: raises the key to 1, but the latch and the breaker still win. 3 = MSI-X with no breaker and no latch (debugging only). Unknown values are 0. Never written by the driver; mirrored as `MsiModeEff`. | `AddDevice` writes the device key from it: the first restart after a change writes, a second restart or a reboot applies. Survives driver updates. Going back to 0 leaves the key where the forcing put it. |
-| `MsiLatch` (default 0) | 1 = a start convicted message delivery, could not set vectors up, or the breaker tripped: the next `AddDevice` asks for INTx. The driver sets it (`MsiLatchWhy`: 1 silent rescues, 2 vectors refused, 3 common cfg unmapped, 4 breaker) together with `MsiLatchVer`; a latch of ANOTHER build is stale and cleared at `AddDevice`. Clear it by deleting it (or 0) once the cause is fixed (mode 2 does not clear it); set it to 1 with no `MsiLatchVer` to force or rehearse the fallback (honoured by every build). | `AddDevice`. |
-| `MsiLatchVer` (default absent) | The build tag of the image that wrote the latch; absent = the operator's latch. Written by the driver; delete it when setting `MsiLatch` by hand. | `AddDevice`. |
+| `MsiLatch` (default 0) | 1 = a start convicted message delivery, could not set vectors up, or the breaker tripped: the next `AddDevice` asks for INTx. The driver sets it (`MsiLatchWhy`: 1 silent rescues, 2 vectors refused, 3 common cfg unmapped, 4 breaker) together with `MsiLatchVer`; a latch of ANOTHER build is stale and cleared at `AddDevice`. Clear it by deleting it (or 0) once the cause is fixed (mode 2 does not clear it); set it to 1 with no `MsiLatchVer` and no `MsiLatchWhy` to force or rehearse the fallback (honoured by every build); an untagged latch WITH a reason 1-4 was written by a pre-tag image and is set aside (`MsiLatchLegacy=1`). A permanent INTx is `MsiMode=1`. | `AddDevice`. |
+| `MsiLatchVer` (default absent) | The build tag of the image that wrote the latch; absent with no reason = the operator's latch. Written by the driver; delete it (and `MsiLatchWhy`) when setting `MsiLatch` by hand. | `AddDevice`. |
+| `MsiLatchLegacy` | Written when a latch is set aside: 1 = it was untagged with a KMD reason (a pre-tag image), 0 = it carried another build's tag. | Written at `AddDevice`. |
 | `MsiStarting` (default 0) | The breaker's marker (below). The driver sets and clears it; do not set it by hand except to rehearse the breaker (with `MsiStartingVer` = the running build's tag, or it is stale). | `AddDevice`. |
 | `MsiStartingVer` (default absent) | The build tag of the image that set the marker. Written by the driver. | `AddDevice`. |
 | `MsiBreaker` (default 0) | How many times the breaker tripped (the driver's count). | Read at `AddDevice`. |
@@ -576,12 +591,14 @@ steps when it does not. In order of how much still works:
 
 1. `reg add "HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render" /v MsiMode /t REG_DWORD /d 1 /f`
    then `pnputil /restart-device` (twice if the first restart still comes up on
-   messages: the first writes the key, the second applies it). Also
-   `reg delete ... /v MsiLatchVer /f` and `reg add ... /v MsiLatch /t REG_DWORD /d 1 /f` if you
-   want the latch to hold it (a latch without `MsiLatchVer` is the operator's: no build sets it
-   aside, while a latch the KMD wrote holds only for the build that wrote it).
+   messages: the first writes the key, the second applies it). `MsiMode=1` alone is permanent
+   (it is not a latch). A hand-set latch on top: `reg delete ... /v MsiLatchVer /f`,
+   `reg delete ... /v MsiLatchWhy /f` and `reg add ... /v MsiLatch /t REG_DWORD /d 1 /f` (a latch
+   with no tag and no reason is the operator's: no build sets it aside, while a latch the KMD
+   wrote holds only for the build that wrote it).
    A breaker trip or a latch that came from a driver UPDATE (`MsiLatchVer` = the old build's
-   tag) needs nothing: the new build sets it aside at its `AddDevice` (`MsiLatchOld`).
+   tag, or no tag with `MsiLatchWhy` 1-4 from a pre-tag build) needs nothing: the new build sets
+   it aside at its `AddDevice` (`MsiLatchOld`, `MsiLatchLegacy`).
 2. If the device is up but slow or stalled: read `MsiHealth` / `MsiLatch` /
    `MsiPollOnly`; the safety net and the latch are automatic.
 
