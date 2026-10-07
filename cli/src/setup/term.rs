@@ -1,7 +1,7 @@
 //! The terminal side: raw mode behind a guard, the key loop, and running the
 //! commands the state machine asks for with their output streamed back.
 
-use super::{effective_argv, plan, view, Action, App, Env, Key};
+use super::{effective_argv, layout, plan, view, Action, App, Env, Key};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
@@ -184,7 +184,9 @@ fn interactive(env: Env) -> Result<()> {
         if matches!(action, Action::None) && event::poll(Duration::from_millis(50))? {
             if let Event::Key(k) = event::read()? {
                 if let Some(key) = map_key(k) {
-                    action = app.key(key);
+                    if layout::key_allowed(term.size()?, key) {
+                        action = app.key(key);
+                    }
                 }
             }
         }

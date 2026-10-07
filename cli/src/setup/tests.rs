@@ -536,13 +536,22 @@ fn the_plan_has_every_section_and_commands_only_on_debian() {
 
 // ------------------------------------------------------------ rendering
 
-fn dump(app: &App, w: u16, h: u16) -> String {
-    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-    t.draw(|f| view::draw(f, app)).unwrap();
-    let buf = t.backend().buffer();
-    (0..h)
+use super::layout::{MAX_W, MIN_H, MIN_W};
+use super::theme::Theme;
+use ratatui::buffer::Buffer;
+use ratatui::style::{Color, Modifier};
+
+fn buffer(app: &App, w: u16, h: u16, t: &Theme) -> Buffer {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| view::draw_with(f, app, t)).unwrap();
+    term.backend().buffer().clone()
+}
+
+fn text(buf: &Buffer) -> String {
+    let a = buf.area;
+    (0..a.height)
         .map(|y| {
-            (0..w)
+            (0..a.width)
                 .map(|x| buf[(x, y)].symbol())
                 .collect::<String>()
                 .trim_end()
@@ -552,14 +561,195 @@ fn dump(app: &App, w: u16, h: u16) -> String {
         .join("\n")
 }
 
+fn dump(app: &App, w: u16, h: u16) -> String {
+    text(&buffer(app, w, h, &Theme::color()))
+}
+
+fn last_row(s: &str) -> &str {
+    s.lines().last().unwrap_or("")
+}
+
+/// A host with `n` extra passing checks, for scrolling.
+fn long_host(n: usize) -> App {
+    let mut a = app();
+    at_host(&mut a);
+    for i in 0..n {
+        a.host.push(Row {
+            step: Step::new(
+                &format!("extra-{i}"),
+                &format!("Extra check {i}"),
+                "",
+                |_| CheckResult::Done("fine".into()),
+                None,
+                Verify::Recheck,
+            ),
+            status: CheckResult::Done(format!("fine number {i}")),
+        });
+    }
+    a
+}
+
+/// Every screen and overlay, with the name of the step the header marks and
+/// the first key the footer must show.
+fn every_screen() -> Vec<(&'static str, App, &'static str, &'static str)> {
+    let mut v = Vec::new();
+    v.push(("welcome", app(), "Welcome", "Enter begin"));
+    let mut a = app();
+    at_host(&mut a);
+    a.key(Key::Down);
+    v.push(("this-computer", a, "This computer", "↑↓ choose"));
+    let mut a = app();
+    at_host(&mut a);
+    a.key(Key::Down);
+    a.key(Key::Enter);
+    v.push(("confirm", a, "This computer", "Enter run it"));
+    let mut a = app();
+    at_host(&mut a);
+    a.key(Key::Down);
+    a.key(Key::Enter);
+    a.key(Key::Enter);
+    for i in 0..40 {
+        a.push_line(format!("Reading package lists... {i}"));
+    }
+    a.run_finished(100);
+    v.push(("output-failed", a, "This computer", "any key close"));
+    let mut a = app();
+    at_host(&mut a);
+    a.key(Key::Down);
+    a.key(Key::Down);
+    a.key(Key::Enter);
+    v.push(("guide", a, "This computer", "Enter done / close"));
+    let mut a = app();
+    a.screen = Screen::ChooseGuest;
+    v.push(("choose-guest", a, "Choose a guest", "↑↓ choose"));
+    let mut a = app();
+    a.screen = Screen::ChooseGuest;
+    a.key(Key::Enter);
+    v.push(("steps", a, "Steps", "↑↓ choose"));
+    let mut a = app();
+    a.screen = Screen::FirstRun;
+    v.push(("first-run", a, "First run", "Enter next"));
+    let mut a = app();
+    a.screen = Screen::Done;
+    v.push(("done", a, "Done", "Enter/q quit"));
+    v.push((
+        "this-computer-long",
+        long_host(32),
+        "This computer",
+        "↑↓ choose",
+    ));
+    v
+}
+
+const SIZES: [(u16, u16); 3] = [(80, 24), (120, 40), (200, 75)];
+
+#[test]
+fn every_screen_has_the_progress_header_the_footer_and_a_bounded_column() {
+    for (name, a, step, key) in every_screen() {
+        for (w, h) in SIZES {
+            let s = dump(&a, w, h);
+            let rows: Vec<&str> = s.lines().collect();
+            assert_eq!(rows.len(), h as usize, "{name} {w}x{h}");
+            assert!(
+                rows[0].contains(&format!("● {step}")) && rows[0].contains(" ─ "),
+                "{name} {w}x{h}: header\n{s}"
+            );
+            assert!(last_row(&s).contains(key), "{name} {w}x{h}: footer\n{s}");
+            let x0 = (w - w.min(MAX_W)) / 2;
+            for (y, r) in rows.iter().enumerate() {
+                let cols: Vec<usize> = r
+                    .chars()
+                    .enumerate()
+                    .filter(|(_, c)| *c != ' ')
+                    .map(|(i, _)| i)
+                    .collect();
+                if let (Some(&first), Some(&last)) = (cols.first(), cols.last()) {
+                    assert!(
+                        first >= x0 as usize && last < (x0 + MAX_W) as usize,
+                        "{name} {w}x{h}: row {y} outside the column: {r}"
+                    );
+                }
+            }
+            if matches!(
+                name,
+                "this-computer" | "choose-guest" | "steps" | "this-computer-long"
+            ) {
+                assert!(s.contains("▶ "), "{name} {w}x{h}: selection marker\n{s}");
+            }
+        }
+    }
+}
+
+/// The owner's 200x75 screenshot showed no key hints: they were there, but
+/// faint (SGR 2) and nothing else. The keys are now the accent colour and
+/// bold, never faint, on the last row.
+#[test]
+fn footer_keys_are_on_the_last_row_in_the_key_style_not_faint() {
+    for (w, h) in SIZES {
+        let buf = buffer(&app(), w, h, &Theme::color());
+        let s = text(&buf);
+        let y = h - 1;
+        let row = s.lines().nth(y as usize).unwrap();
+        let x = row.find("Enter").expect("hint on the last row") as u16;
+        let cell = &buf[(x, y)];
+        assert_eq!(cell.fg, Color::Cyan, "{w}x{h}");
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert!(!cell.modifier.contains(Modifier::DIM));
+        let action = &buf[(x + 6, y)];
+        assert!(
+            !action.modifier.contains(Modifier::DIM),
+            "{w}x{h}: action faint"
+        );
+    }
+}
+
+#[test]
+fn a_resize_lays_the_frame_out_again() {
+    let a = app();
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| view::draw_with(f, &a, &Theme::color()))
+        .unwrap();
+    assert!(last_row(&text(term.backend().buffer())).contains("Enter begin"));
+    term.backend_mut().resize(200, 75);
+    term.draw(|f| view::draw_with(f, &a, &Theme::color()))
+        .unwrap();
+    let s = text(term.backend().buffer());
+    assert_eq!(s.lines().count(), 75);
+    assert!(last_row(&s).contains("Enter begin"), "{s}");
+    assert!(!s.lines().nth(23).unwrap().contains("Enter begin"));
+    term.backend_mut().resize(60, 15);
+    term.draw(|f| view::draw_with(f, &a, &Theme::color()))
+        .unwrap();
+    assert!(text(term.backend().buffer()).contains("Terminal too small"));
+}
+
 #[test]
 fn render_welcome() {
-    let s = dump(&app(), 90, 14);
+    let s = dump(&app(), 80, 24);
     println!("{s}");
-    assert!(s.contains("conduit setup") && s.contains("Welcome to Conduit"));
-    assert!(s.contains("Conduit shares your NVIDIA graphics card"));
-    assert!(s.contains("guest is the recommended first one"));
-    assert!(s.contains("Enter: start"));
+    assert!(s.contains("conduit setup") || s.contains("● Welcome"));
+    assert!(s.contains("Welcome to Conduit"));
+    assert!(s.contains("┏━╸┏━┓┏┓╻"));
+    assert!(s.contains("Conduit shares your NVIDIA graphics"));
+    assert!(s.contains("Ubuntu is fully automatic"));
+    assert!(s.contains("What happens next") && s.contains("3  First run, safely"));
+    assert!(s.contains("Press Enter to begin"));
+    assert!(last_row(&s).contains("Enter begin   q quit"));
+}
+
+#[test]
+fn welcome_is_centred_on_a_large_terminal() {
+    let s = dump(&app(), 200, 75);
+    println!("{s}");
+    let rows: Vec<&str> = s.lines().collect();
+    let y = rows
+        .iter()
+        .position(|r| r.contains("Welcome to Conduit"))
+        .unwrap();
+    assert!((25..45).contains(&y), "row {y}");
+    let x = rows[y].find("Welcome to Conduit").unwrap();
+    assert!((55..80).contains(&x), "col {x}");
+    assert!(rows[0].contains("conduit setup"));
 }
 
 #[test]
@@ -567,12 +757,38 @@ fn render_step_list_with_a_failing_step() {
     let mut a = app();
     at_host(&mut a);
     a.key(Key::Down);
-    let s = dump(&a, 100, 24);
+    let s = dump(&a, 80, 24);
     println!("{s}");
-    assert!(s.contains("[  ok  ] KVM: available"));
-    assert!(s.contains("[ TODO ] Tools: missing: ip, curl"));
-    assert!(s.contains("[ TODO ] NVIDIA driver: not loaded"));
-    assert!(s.contains("Enter: run  sudo apt-get install -y"));
+    assert!(s.contains("[ ok ] KVM"));
+    assert!(s.contains("▶ [TODO] Tools") && s.contains("missing: ip, curl"));
+    assert!(s.contains("[TODO] NVIDIA driver") && s.contains("not loaded"));
+    assert!(s.contains("Enter run this command:"));
+    assert!(s.contains("$ sudo apt-get install -y"));
+    assert!(s.contains("2 done · 0 warn · 2 to do"));
+}
+
+#[test]
+fn long_lists_scroll_and_keep_the_selection_visible() {
+    let mut a = long_host(32);
+    let n = a.host.len();
+    for (target, up) in [
+        (0, false),
+        (20, false),
+        (n - 1, false),
+        (10, true),
+        (0, true),
+    ] {
+        while a.cursor != target {
+            a.key(if up { Key::Up } else { Key::Down });
+        }
+        let s = dump(&a, 80, 24);
+        let title = &a.host[target].step.title;
+        assert!(
+            s.lines()
+                .any(|l| l.contains("▶ ") && l.contains(title.as_str())),
+            "{target}: {title}\n{s}"
+        );
+    }
 }
 
 #[test]
@@ -584,9 +800,10 @@ fn render_confirm_dialog_shows_the_exact_command() {
     let s = dump(&a, 100, 24);
     println!("{s}");
     assert!(s.contains("Run this command?"));
-    assert!(s.contains("sudo apt-get install -y iproute2 iptables openssh-client curl"));
+    assert!(s.contains("$ sudo apt-get install -y iproute2 iptables openssh-client curl"));
     assert!(s.contains("sudo asks for your password"));
-    assert!(s.contains("Enter: run it   Esc: cancel"));
+    assert!(s.contains("Enter run it   Esc cancel"));
+    assert!(last_row(&s).contains("Enter run it   Esc cancel"));
 }
 
 #[test]
@@ -597,18 +814,22 @@ fn render_running_output_and_exit_code() {
     a.key(Key::Enter);
     a.key(Key::Enter);
     a.push_line("Reading package lists...".into());
-    assert!(dump(&a, 100, 30).contains("running: sudo apt-get install"));
-    a.run_finished(100);
     let s = dump(&a, 100, 30);
-    println!("{s}");
-    assert!(s.contains("FAILED, exit code 100") && s.contains("Reading package lists..."));
+    assert!(s.contains("running: sudo apt-get install"));
+    assert!(last_row(&s).contains("Esc stop the command"));
+    a.run_finished(100);
+    for (w, h) in SIZES {
+        let s = dump(&a, w, h);
+        println!("{s}");
+        assert!(s.contains("FAILED, exit code 100") && s.contains("Reading package lists..."));
+    }
 }
 
 #[test]
 fn render_guest_choice_and_done() {
     let mut a = app();
     a.screen = Screen::ChooseGuest;
-    let s = dump(&a, 100, 16);
+    let s = dump(&a, 100, 24);
     println!("{s}");
     assert!(s.contains("Ubuntu 24.04 (automatic)   (recommended)"));
     assert!(s.contains("Windows 11 (experimental)"));
@@ -619,12 +840,65 @@ fn render_guest_choice_and_done() {
 }
 
 #[test]
-fn small_terminals_do_not_panic() {
+fn small_terminals_say_so_and_do_not_panic() {
     let mut a = app();
     at_host(&mut a);
+    a.key(Key::Down);
     a.key(Key::Enter);
-    for (w, h) in [(10, 3), (40, 8), (1, 1), (200, 60)] {
+    for (w, h) in [
+        (10, 3),
+        (40, 8),
+        (1, 1),
+        (0, 0),
+        (79, 24),
+        (80, 23),
+        (200, 60),
+    ] {
         dump(&a, w, h);
+    }
+    let s = dump(&a, 60, 15);
+    println!("{s}");
+    assert!(s.contains("Terminal too small"));
+    assert!(s.contains(&format!("{MIN_W}x{MIN_H}")) && s.contains("Ctrl-C"));
+    assert!(dump(&a, 80, 24).contains("Run this command?"));
+}
+
+#[test]
+fn no_color_keeps_the_selection_but_drops_every_colour() {
+    let mut a = app();
+    at_host(&mut a);
+    a.key(Key::Down);
+    let buf = buffer(&a, 120, 40, &Theme::plain());
+    assert!(buf
+        .content()
+        .iter()
+        .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+    let s = text(&buf);
+    let (y, row) = s
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("▶ [TODO] Tools"))
+        .unwrap();
+    let x = row.find("[TODO]").unwrap();
+    let x = row[..x].chars().count() as u16;
+    assert!(buf[(x, y as u16)].modifier.contains(Modifier::REVERSED));
+}
+
+/// Not a check: writes every screen at every size as text, for review.
+/// `CONDUIT_DUMP_DIR=dir cargo test -p conduit write_render_dumps -- --ignored`
+#[test]
+#[ignore]
+fn write_render_dumps() {
+    let dir = std::path::PathBuf::from(std::env::var("CONDUIT_DUMP_DIR").unwrap());
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, a, _, _) in every_screen() {
+        for (w, h) in SIZES.iter().copied().chain([(60, 15)]) {
+            std::fs::write(
+                dir.join(format!("{name}-{w}x{h}.txt")),
+                dump(&a, w, h) + "\n",
+            )
+            .unwrap();
+        }
     }
 }
 
@@ -636,6 +910,8 @@ fn links_are_one_table_and_nothing_else_spells_a_url() {
         "hostfix.rs",
         "plan.rs",
         "view.rs",
+        "layout.rs",
+        "theme.rs",
         "term.rs",
         "env.rs",
         "domain.rs",

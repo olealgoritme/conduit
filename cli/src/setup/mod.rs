@@ -11,10 +11,12 @@ pub mod data;
 pub mod domain;
 pub mod env;
 pub mod hostfix;
+pub mod layout;
 pub mod nfpm;
 pub mod plan;
 pub mod recipes;
 pub mod term;
+pub mod theme;
 pub mod view;
 
 use crate::doctor::Level;
