@@ -597,6 +597,66 @@ pub const SETTLE_SPIN_US: u64 = 750;
 /// The worker's wait while copies are in flight or jobs need preparing (relative, 100 ns).
 pub const POLL_DUE_100NS: i64 = -5_000;
 
+/// The whole of one paging-path hook (a lease change or a destroy, content transaction held on
+/// VidMm's paging thread): the drain, the wait for the channel's I/O and the free together, by the
+/// interrupt-time clock. Each phase is also capped by its own bound above.
+pub const LEASE_HOOK_MS: u64 = 1_000;
+
+/// 100 ns units per millisecond (interrupt time).
+pub const UNITS_PER_MS: u64 = 10_000;
+
+/// The interrupt-time deadline `ms` from `now` (100 ns units), saturated.
+pub const fn deadline(now: u64, ms: u64) -> u64 {
+    now.saturating_add(ms.saturating_mul(UNITS_PER_MS))
+}
+
+/// Whether `end` has passed at `now`.
+pub const fn expired(now: u64, end: u64) -> bool {
+    now >= end
+}
+
+/// Whole milliseconds left until `end` at `now`, rounded up (0 once it passed). A bounded wait
+/// sleeps, then reads the clock again: a `sleep_ms(1)` that rounds up to the timer quantum
+/// (about 15.6 ms) overshoots the deadline by at most one quantum, never multiplies it.
+pub const fn left_ms(now: u64, end: u64) -> u64 {
+    if now >= end {
+        0
+    } else {
+        (end - now).div_ceil(UNITS_PER_MS)
+    }
+}
+
+/// The earlier of two deadlines.
+pub const fn earlier(a: u64, b: u64) -> u64 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Why a submitted copy was discharged, for what it charges its destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Discharge {
+    /// Its own deadline passed: the head of the channel (a producer whose semaphore never
+    /// reached the record's value, or a hung copy). Strike and poison its destination.
+    Own,
+    /// Queued behind another destination's stalled copy, or in flight when the channel broke:
+    /// no strike, no poison. Its pages stay pinned until the generation ends (RM may not have
+    /// cancelled the copy), under a fresh descriptor the destination may route again.
+    Bystander,
+}
+
+impl Discharge {
+    /// `(strike, poison)` for the destination.
+    pub const fn charges(self) -> (bool, bool) {
+        match self {
+            Discharge::Own => (true, true),
+            Discharge::Bystander => (false, false),
+        }
+    }
+}
+
 /// Microseconds from `t0` to `t1` (interrupt time, 100 ns), saturated to `u32`.
 pub const fn us(t0: u64, t1: u64) -> u32 {
     let d = t1.saturating_sub(t0) / 10;
@@ -624,8 +684,9 @@ pub const COUNTERS: &[&str] = &[
     "CeRtDispFall",
     "CeRtClient",
     // Strikes against destinations, destinations struck out, route strikes, route off for the
-    // generation, poisoned destinations, destinations whose pages stay pinned, discharged
-    // (timed-out) Presents, lazy bring-ups asked for.
+    // generation, poisoned destinations, destinations whose pages stay pinned, Presents
+    // discharged at their own deadline, Presents discharged as bystanders of a channel failure,
+    // lazy bring-ups asked for.
     "CeRtStrike",
     "CeRtStruck",
     "CeRtChStrike",
@@ -633,6 +694,7 @@ pub const COUNTERS: &[&str] = &[
     "CeRtPoison",
     "CeRtLeak",
     "CeRtTimeout",
+    "CeRtChFail",
     "CeRtUp",
     // In flight now and the most at once.
     "CeRtInfl",
@@ -1003,6 +1065,42 @@ mod tests {
         assert!(c.strike());
         assert!(c.off());
         assert_eq!(c.strikes(), 3);
+    }
+
+    #[test]
+    fn deadlines_are_clock_time() {
+        let now = 1_000_000;
+        let end = deadline(now, 250);
+        assert_eq!(end, now + 250 * UNITS_PER_MS);
+        assert!(!expired(now, end));
+        assert_eq!(left_ms(now, end), 250);
+        // A partial millisecond rounds up; a passed deadline leaves 0.
+        assert_eq!(left_ms(end - 1, end), 1);
+        assert_eq!(left_ms(end, end), 0);
+        assert!(expired(end, end));
+        assert_eq!(left_ms(end + 5, end), 0);
+        assert_eq!(deadline(u64::MAX - 3, 10), u64::MAX);
+        assert_eq!(earlier(5, 7), 5);
+        assert_eq!(earlier(7, 5), 5);
+        // A loop that sleeps a 15.6 ms quantum per turn and re-reads the clock ends within one
+        // quantum of the deadline, however many turns a counted loop would have made.
+        let quantum = 156_000u64;
+        let mut t = now;
+        let mut turns = 0;
+        while !expired(t, end) {
+            t += quantum;
+            turns += 1;
+        }
+        assert!(t - end < quantum);
+        assert_eq!(turns, 17);
+        // The paging hook's phases fit its whole bound.
+        assert!(DRAIN_MS + IO_WAIT_MS <= LEASE_HOOK_MS);
+    }
+
+    #[test]
+    fn a_bystander_is_never_charged() {
+        assert_eq!(Discharge::Own.charges(), (true, true));
+        assert_eq!(Discharge::Bystander.charges(), (false, false));
     }
 
     #[test]

@@ -66,6 +66,10 @@ static OFF: AtomicU32 = AtomicU32::new(0);
 static POISON: AtomicU32 = AtomicU32::new(0);
 static LEAK: AtomicU32 = AtomicU32::new(0);
 static TIMEOUT: AtomicU32 = AtomicU32::new(0);
+static CH_FAIL: AtomicU32 = AtomicU32::new(0);
+/// A copy hit its own deadline and marked the channel broken: the teardown that follows is that
+/// copy's route strike (charged once, there).
+static TIMED_OUT: AtomicU32 = AtomicU32::new(0);
 static UP: AtomicU32 = AtomicU32::new(0);
 static INFL: AtomicU32 = AtomicU32::new(0);
 static PEAK: AtomicU32 = AtomicU32::new(0);
@@ -109,7 +113,7 @@ fn on() -> bool {
 pub(crate) fn reset_for_start() {
     for c in [
         &SEEN, &ROUTED, &DONE, &FALL, &WHY, &MASK, &DISP_FALL, &CLIENT, &STRIKE, &STRUCK,
-        &CH_STRIKE, &OFF, &POISON, &LEAK, &TIMEOUT, &UP, &INFL, &PEAK, &DEC_US, &DUP_US, &SUB_US,
+        &CH_STRIKE, &OFF, &POISON, &LEAK, &TIMEOUT, &CH_FAIL, &TIMED_OUT, &UP, &INFL, &PEAK, &DEC_US, &DUP_US, &SUB_US,
         &DONE_US, &DONE_MAX, &POLL_US, &DST_NEW, &DST_DROP, &DST_LIVE, &RUNS,
     ] {
         c.store(0, Ordering::Relaxed);
@@ -145,6 +149,7 @@ fn write_counters() {
     rec(b"CeRtPoison", POISON.load(Ordering::Relaxed));
     rec(b"CeRtLeak", LEAK.load(Ordering::Relaxed));
     rec(b"CeRtTimeout", TIMEOUT.load(Ordering::Relaxed));
+    rec(b"CeRtChFail", CH_FAIL.load(Ordering::Relaxed));
     rec(b"CeRtUp", UP.load(Ordering::Relaxed));
     rec(b"CeRtInfl", INFL.load(Ordering::Relaxed));
     rec(b"CeRtPeak", PEAK.load(Ordering::Relaxed));
@@ -173,6 +178,14 @@ fn fall(why: Why) {
     }
 }
 
+/// A queued request fell back at its dispatch (the worker submits its Venus copy).
+fn fall_at_dispatch(why: Why) {
+    fall(why);
+    if !(why.at_dispatch() || why == Why::Stale) {
+        DISP_FALL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn infl_add() {
     let now = INFL.fetch_add(1, Ordering::Relaxed).saturating_add(1);
     PEAK.fetch_max(now, Ordering::Relaxed);
@@ -188,6 +201,9 @@ fn infl_sub() {
 #[derive(Clone, Copy)]
 struct Payload {
     rec: StashedCeRecord,
+    /// The presenting process (`hKmdProcess`): the `h_client` rule is checked again with it
+    /// immediately before the worker dups what the record names.
+    presenter: usize,
     plan: SourcePlan,
     remap: cp::Remap,
     dst_pitch: u32,
@@ -199,6 +215,13 @@ struct Payload {
 struct DstEntry {
     dst: Dst,
     pin: Option<GuestPin>,
+    /// Pins of descriptors whose copies were discharged as bystanders of a channel failure: RM
+    /// may not have cancelled those copies, so the pages stay locked until the generation ends
+    /// (`forget`), while the destination may get a fresh descriptor (`pin`).
+    orphan: Option<GuestPin>,
+    /// The destination was destroyed while another thread was freeing its descriptor
+    /// (`Draining`): `finish_free` removes the record, and only after that free answered.
+    gone: bool,
     /// `[0, cover)`: `pitch * height` rounded up to pages (`guest_blob::cover_len`).
     cover: u64,
 }
@@ -382,6 +405,8 @@ fn ensure_dst(g: &mut State, dst: DstInfo) -> bool {
     g.dsts[slot] = Some(DstEntry {
         dst: Dst::new(dst.resource_id, slot as u8),
         pin: None,
+        orphan: None,
+        gone: false,
         cover,
     });
     true
@@ -455,6 +480,7 @@ fn decide_present(
     Ok((
         Payload {
             rec,
+            presenter,
             plan,
             remap,
             dst_pitch: dst.pitch,
@@ -573,7 +599,7 @@ pub(crate) fn dispatch(adapter: &AdapterContext, token: u64, boundary: u64) -> b
             let _ = g.jobs.remove(token, boundary);
             refresh_active(&g);
             drop(g);
-            fall(why);
+            fall_at_dispatch(why);
             return false;
         }
     };
@@ -619,7 +645,7 @@ pub(crate) fn dispatch(adapter: &AdapterContext, token: u64, boundary: u64) -> b
             let _ = g.jobs.remove(token, boundary);
             refresh_active(&g);
             drop(g);
-            fall(Why::Submit);
+            fall_at_dispatch(Why::Submit);
             false
         }
     }
@@ -706,8 +732,10 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
                     for (i, slot) in g.dsts.iter_mut().enumerate() {
                         let Some(e) = slot.as_mut() else { continue };
                         if e.dst.route.poll(completed, now_ms) == cp::Poll::TimedOut {
+                            // Its own deadline (`Discharge::Own`): `Route::poll` struck and
+                            // poisoned it; never the route again, the pages stay pinned for the
+                            // generation. The copies queued behind it are bystanders.
                             timed[i] = e.dst.resource_id;
-                            // Never the route again; the pages stay pinned for the generation.
                             e.dst.desc = Desc::Leaked;
                             POISON.fetch_add(1, Ordering::Relaxed);
                             LEAK.fetch_add(1, Ordering::Relaxed);
@@ -725,8 +753,8 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
                     }
                 }
                 None => {
-                    // No channel: nothing will ever complete what was submitted. Its
-                    // destinations may still be written by a copy RM did not cancel: poisoned.
+                    // No channel: nothing will ever complete what was submitted. Bystanders of
+                    // the channel's end: their pages stay pinned (orphaned), no strike.
                     while let Some(job) =
                         g.jobs.take_first(|j| matches!(j.state, JobState::Submitted { .. }))
                     {
@@ -734,12 +762,18 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
                             done[n] = (job.token, job.boundary, false, t_submit);
                             n += 1;
                         }
-                        poison_leak(&mut g, job.dst, 0);
+                        bystander(&mut g, job.dst);
+                        // No channel: its client, and the descriptor in it, are gone with it.
+                        if let Some(e) = g.dst(job.dst) {
+                            if matches!(e.dst.desc, Desc::Ready { .. }) {
+                                e.dst.desc = Desc::Absent;
+                                let _ = DST_LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                    v.checked_sub(1)
+                                });
+                            }
+                        }
                     }
                 }
-            }
-            if timed_out_any {
-                strike_route(&mut g);
             }
             g.jobs.in_flight() != 0
         };
@@ -750,11 +784,16 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
                 DONE.fetch_add(1, Ordering::Relaxed);
                 let us = add_us(&DONE_US, t_submit);
                 DONE_MAX.fetch_max(us, Ordering::Relaxed);
-            } else {
+            } else if progress.is_some() {
                 TIMEOUT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                CH_FAIL.fetch_add(1, Ordering::Relaxed);
             }
         }
         if timed_out_any {
+            // The channel may be stuck on that copy: torn down by the next pass, whose teardown
+            // charges the one route strike of this stall.
+            TIMED_OUT.store(1, Ordering::Relaxed);
             rio::mark_broken();
         }
         if !spin || !more || progress.is_none() || now_100ns() >= spin_until {
@@ -771,17 +810,20 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
 /// (the next Present that finds it down asks for a bring-up again, until three route strikes).
 #[inline(never)]
 fn fail_channel(passive: PassiveLevel, adapter: &AdapterContext) {
-    let completed = rio::poll().map_or(0, |(c, _)| c);
+    // A last observation of the ring (a set notifier is counted there).
+    let _ = rio::poll();
     let mut discharged: [(u64, u64); cr::MAX_JOBS] = [(0, 0); cr::MAX_JOBS];
     let mut n = 0usize;
     {
         let mut g = STATE.lock();
-        let mut any = false;
+        let mut any = TIMED_OUT.swap(0, Ordering::Relaxed) != 0;
         while let Some(job) = g.jobs.take_first(|j| matches!(j.state, JobState::Submitted { .. })) {
             discharged[n] = (job.token, job.boundary);
             n += 1;
             any = true;
-            poison_leak(&mut g, job.dst, completed);
+            // Queued behind a stalled copy, or in flight when the channel failed: a bystander
+            // (`Discharge::Bystander`), never charged for another destination's stall.
+            bystander(&mut g, job.dst);
         }
         // The dups go with the teardown: no queued job may use what was prepared for it (its
         // dispatch takes the Venus copy).
@@ -797,7 +839,7 @@ fn fail_channel(passive: PassiveLevel, adapter: &AdapterContext) {
     for &(token, boundary) in discharged.iter().take(n) {
         let _ = adapter.with_virtio(|v| v.complete_ce_blt(adapter, token, boundary, false));
         infl_sub();
-        TIMEOUT.fetch_add(1, Ordering::Relaxed);
+        CH_FAIL.fetch_add(1, Ordering::Relaxed);
     }
     free_all_descriptors(passive, adapter, 0);
     if rio::teardown_channel(passive, adapter) {
@@ -810,16 +852,29 @@ fn fail_channel(passive: PassiveLevel, adapter: &AdapterContext) {
     }
 }
 
-/// A copy into `dst` was in flight when its channel failed: poisoned (a strike), and never routed
-/// again (its pages stay pinned until the generation ends: RM may not have cancelled the copy).
-fn poison_leak(g: &mut State, dst: u32, completed: u64) {
-    if let Some(e) = g.dst(dst) {
-        e.dst.route.on_channel_failed(completed);
-        e.dst.desc = Desc::Leaked;
-        POISON.fetch_add(1, Ordering::Relaxed);
-        LEAK.fetch_add(1, Ordering::Relaxed);
-        STRIKE.fetch_add(1, Ordering::Relaxed);
+/// A copy into `dst` was discharged as a BYSTANDER of a channel failure (`Discharge::Bystander`):
+/// no strike, no poison. RM may not have cancelled the copy, so the pin of the descriptor it
+/// targets is orphaned (kept until the generation ends, `forget`), and the destination's ring
+/// values are forgotten so its descriptor is freed now and a fresh one may be made over the same
+/// (still locked) pages once a channel is up again.
+fn bystander(g: &mut State, dst: u32) {
+    debug_assert_eq!(cr::Discharge::Bystander.charges(), (false, false));
+    let Some(e) = g.dst(dst) else {
+        return;
+    };
+    if e.dst.desc == Desc::Leaked {
+        return;
     }
+    if let Some(pin) = e.pin.take() {
+        if e.orphan.is_none() {
+            e.orphan = Some(pin);
+        } else {
+            // Two failures under one destination in a generation: never unlock either.
+            core::mem::forget(pin);
+        }
+    }
+    e.dst.route.on_channel_gone();
+    LEAK.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Free every destination descriptor that nothing can still write (the others are leaked: their
@@ -841,7 +896,7 @@ fn free_all_descriptors(passive: PassiveLevel, adapter: &AdapterContext, wait_io
             match (plan, e.dst.desc) {
                 (RetirePlan::Free, Desc::Ready { va, len }) => {
                     e.dst.desc = Desc::Draining;
-                    Some((e.dst.slot, va, len))
+                    Some((e.dst.slot, va, len, e.dst.resource_id))
                 }
                 // A `Draining` one belongs to the paging thread retiring it.
                 (RetirePlan::Wait(_) | RetirePlan::Leak, Desc::Ready { .. }) => {
@@ -852,19 +907,25 @@ fn free_all_descriptors(passive: PassiveLevel, adapter: &AdapterContext, wait_io
                 _ => None,
             }
         };
-        if let Some((slot, va, len)) = plan {
+        if let Some((slot, va, len, resource_id)) = plan {
             let freed = rio::free_dst(passive, adapter, slot, va, len, wait_io_ms, cr::FREE_MS);
-            finish_free(i, freed);
+            finish_free(i, resource_id, freed);
         }
     }
 }
 
-/// The free of slot index `i`'s descriptor answered `freed`: `Absent` and unpinned, or leaked.
-fn finish_free(i: usize, freed: bool) {
-    let pin = {
+/// The free of `resource_id`'s descriptor (slot index `i`, which a `Draining` record keeps:
+/// nothing else removes or reuses it) answered `freed`: `Absent` and unpinned, or leaked. A record
+/// whose destination was destroyed meanwhile (`gone`) is removed here, after the free answered;
+/// a leaked one stays, pin and all, until the generation ends.
+fn finish_free(i: usize, resource_id: u32, freed: bool) {
+    let released = {
         let mut g = STATE.lock();
         let Some(e) = g.dsts[i].as_mut() else { return };
-        if freed {
+        if e.dst.resource_id != resource_id {
+            return;
+        }
+        let pin = if freed {
             e.dst.desc = Desc::Absent;
             DST_DROP.fetch_add(1, Ordering::Relaxed);
             let _ = DST_LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
@@ -873,10 +934,14 @@ fn finish_free(i: usize, freed: bool) {
             e.dst.desc = Desc::Leaked;
             LEAK.fetch_add(1, Ordering::Relaxed);
             None
-        }
+        };
+        let remove = e.gone && e.dst.desc == Desc::Absent && e.orphan.is_none();
+        let record = if remove { g.dsts[i].take() } else { None };
+        refresh_active(&g);
+        (pin, record)
     };
     // PASSIVE, outside the spinlock: may release the last owner of a lease.
-    drop(pin);
+    drop(released);
 }
 
 /// Remove the queued jobs whose WindowedBlt request is gone (cancelled with its resource, its
@@ -917,9 +982,11 @@ fn prepare(passive: PassiveLevel, adapter: &AdapterContext) {
     for _ in 0..cr::MAX_JOBS {
         let next = {
             let g = STATE.lock();
-            g.jobs.first_pending().map(|j| (j.token, j.boundary, j.dst, j.payload.rec))
+            g.jobs
+                .first_pending()
+                .map(|j| (j.token, j.boundary, j.dst, j.payload.rec, j.payload.presenter))
         };
-        let Some((token, boundary, dst, rec)) = next else {
+        let Some((token, boundary, dst, rec, presenter)) = next else {
             return;
         };
         let t0 = now_100ns();
@@ -930,6 +997,9 @@ fn prepare(passive: PassiveLevel, adapter: &AdapterContext) {
                 return;
             }
             Err(why) => Prep::Failed(why),
+            // The `h_client` rule once more, immediately before the dup: a client freed (and its
+            // number re-minted for another process) since the Present is refused here.
+            Ok(()) if !clients_still_owned(adapter, &rec, presenter) => Prep::Failed(Why::Client),
             Ok(()) => match rio::prep_producer(passive, adapter, &rec) {
                 Ok(p) => Prep::Ready {
                     sem_va: p.sem_va,
@@ -952,6 +1022,23 @@ fn prepare(passive: PassiveLevel, adapter: &AdapterContext) {
             j.prep = prep;
         }
     }
+}
+
+/// Whether both record clients still belong to `presenter` (`ce_record::client_check` against
+/// the client table now).
+fn clients_still_owned(adapter: &AdapterContext, rec: &StashedCeRecord, presenter: usize) -> bool {
+    helios_kmd_logic::ce_record::both_owned(
+        crate::ddi::ce_record::record_client_owned_by_presenter(
+            adapter,
+            presenter,
+            rec.record.semaphore.h_client,
+        ),
+        crate::ddi::ce_record::record_client_owned_by_presenter(
+            adapter,
+            presenter,
+            rec.record.source.h_client,
+        ),
+    ) == ClientCheck::Owned
 }
 
 /// Make `resource_id`'s descriptor if it has none: under the content transaction (so no lease
@@ -979,7 +1066,8 @@ fn ensure_descriptor(
         }
         e.dst.admits()?;
     }
-    let Some(guard) = adapter.system_backings.serialize(passive) else {
+    // Never wait on the worker: a paging operation may hold the transaction for its whole bound.
+    let Some(guard) = adapter.system_backings.try_serialize(passive) else {
         return Err(Why::NotReady);
     };
     let r = create_descriptor(passive, adapter, &guard, resource_id);
@@ -1146,9 +1234,12 @@ pub(crate) fn before_lease_change(
             _ => return,
         }
     };
+    // Interrupt-time deadlines: the whole hook, and the drain inside it. Each sleep rounds up to
+    // the timer quantum, so the clock (not a count of sleeps) ends every wait.
     let t0 = now_100ns();
+    let hook_end = cr::deadline(t0, cr::LEASE_HOOK_MS);
+    let drain_end = cr::earlier(cr::deadline(t0, cr::DRAIN_MS), hook_end);
     let mut drained = false;
-    let mut waited = 0u64;
     loop {
         match rio::poll() {
             Some((completed, 0)) if completed >= target => {
@@ -1159,23 +1250,37 @@ pub(crate) fn before_lease_change(
             // A broken or vanished channel: nothing says the copy stopped.
             _ => break,
         }
-        if waited >= cr::DRAIN_MS {
+        if cr::expired(now_100ns(), drain_end) {
             break;
         }
         crate::virtio::ctrl::sleep_ms(passive, 1);
-        waited += 1;
     }
     if drained {
         // Terminalize what completed now (the worker would on its next pass): a destroy that
         // follows finds the request's copy ring-complete instead of retaining the allocation.
         settle(passive, adapter, false);
     }
+    // What is left of the hook's bound for the wait for the channel's I/O and the free; none
+    // left: leaked (pinned until the generation ends), never a longer stall of the paging thread.
+    let left = cr::left_ms(now_100ns(), hook_end);
     let freed = drained
-        && rio::free_dst(passive, adapter, slot, va, len, cr::IO_WAIT_MS, cr::FREE_MS);
-    finish_free(index, freed);
+        && left != 0
+        && rio::free_dst(
+            passive,
+            adapter,
+            slot,
+            va,
+            len,
+            left.min(cr::IO_WAIT_MS),
+            left.min(u64::from(cr::FREE_MS)) as u32,
+        );
+    finish_free(index, resource_id, freed);
     if !freed {
+        // Drained too late or not freed: leaked (`finish_free`), and a strike.
         if let Some(e) = STATE.lock().dsts[index].as_mut() {
-            e.dst.route.on_failure(cp::Why::Timeout);
+            if e.dst.resource_id == resource_id {
+                e.dst.route.on_failure(cp::Why::Timeout);
+            }
         }
     }
     let _ = add_us(&POLL_US, t0);
@@ -1196,16 +1301,30 @@ pub(crate) fn destination_gone(
     before_lease_change(passive, adapter, guard, resource_id);
     let removed = {
         let mut g = STATE.lock();
+        let submitted = g.jobs.submitted_for(resource_id);
         let taken = match g.dst_index(resource_id) {
-            // A leaked record keeps its pin; a submitted copy would have leaked it.
-            Some(i)
-                if g.dsts[i].as_ref().is_some_and(|e| {
-                    e.dst.desc != Desc::Leaked && !g.jobs.submitted_for(resource_id)
-                }) =>
-            {
-                g.dsts[i].take()
+            Some(i) => {
+                let e = g.dsts[i].as_mut();
+                match e {
+                    // Another thread is freeing its descriptor: `finish_free` removes it once
+                    // that free answered (the pin drops only there).
+                    Some(e) if e.dst.desc == Desc::Draining => {
+                        e.gone = true;
+                        None
+                    }
+                    // A leaked record, an orphaned pin, a copy still submitted: stays until
+                    // the generation ends.
+                    Some(e)
+                        if e.dst.desc == Desc::Leaked || e.orphan.is_some() || submitted =>
+                    {
+                        e.gone = true;
+                        None
+                    }
+                    Some(_) => g.dsts[i].take(),
+                    None => None,
+                }
             }
-            _ => None,
+            None => None,
         };
         refresh_active(&g);
         taken
@@ -1237,10 +1356,14 @@ pub(crate) fn retire_for_stop(
     rio::release_producers(passive, adapter, *budget, cr::IO_WAIT_MS);
 }
 
-/// The transport is gone (`rm_client::forget`, after the device reset): no copy can write any
-/// page any more and nothing on the host names them, so every pin goes; the jobs died with the
-/// WindowedBlt FIFO. PASSIVE, no lock held.
-pub(crate) fn forget() {
+/// The transport is gone (`rm_client::forget`, after the device reset); the jobs died with the
+/// WindowedBlt FIFO. `fate` is the transport sweep's (`nvrm::close_all_on_host`, as for user
+/// pins): with every close confirmed the host let go of the channel's client and every
+/// descriptor in it, so every pin goes. With any close unconfirmed the host may keep the client's
+/// file across the reset and the GPU may still write pages it registered: the pin of every
+/// destination a descriptor may name (ready, being made, draining, leaked) and every orphaned pin
+/// is leaked on purpose (never unlock pages a GPU may still write). PASSIVE, no lock held.
+pub(crate) fn forget(fate: helios_kmd_logic::sweep_budget::PinFate) {
     WANT_UP.store(0, Ordering::Relaxed);
     if ACTIVE.load(Ordering::Acquire) == 0 {
         return;
@@ -1259,8 +1382,22 @@ pub(crate) fn forget() {
             }
             g.dsts[i].take()
         };
+        let Some(mut e) = taken else { continue };
+        // The route's pins are always described to the host (a registration carried them).
+        if fate.action(true) == helios_kmd_logic::sweep_budget::PinAction::Leak {
+            let named = !matches!(e.dst.desc, Desc::Absent | Desc::Uncovered);
+            if named {
+                if let Some(pin) = e.pin.take() {
+                    core::mem::forget(pin);
+                    LEAK.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if let Some(pin) = e.orphan.take() {
+                core::mem::forget(pin);
+            }
+        }
         // PASSIVE, outside the spinlock: may release the last owner of a lease.
-        drop(taken);
+        drop(e);
     }
     for _ in 0..n_jobs {
         infl_sub();

@@ -180,7 +180,14 @@ pub(crate) fn is_cached(client: u32, memory: u32) -> bool {
 /// The mapping of `key`: the cached one, or a new dup + map in the slot the table picks (an
 /// evicted slot is given back first: its handles and window are reused).
 fn slot_for(io: &Io<'_>, h: &Handles, key: Key) -> Result<u64, Fail> {
-    let plan = CACHE.lock().plan(&key);
+    // A dup made before the client table last changed is never reused (`Cache::set_generation`):
+    // the number may name another process's client by now.
+    let gen = crate::virtio::nvrm_harden::client_generation();
+    let plan = {
+        let mut c = CACHE.lock();
+        c.set_generation(gen);
+        c.plan(&key)
+    };
     let slot = match plan {
         Plan::Hit(e) => return Ok(e.va),
         Plan::Make { slot, evict } => {

@@ -280,18 +280,18 @@ pub(crate) fn free_dst(
     ok
 }
 
-/// `IO_BUSY`, waiting at most `ms` in 1 ms sleeps.
+/// `IO_BUSY`, waiting at most `ms` of interrupt time (each sleep rounds up to the timer
+/// quantum, so the clock, not a count of sleeps, ends the wait).
 fn take_io(passive: PassiveLevel, ms: u64) -> bool {
-    let mut waited = 0;
+    let end = cr::deadline(ch::now_100ns(), ms);
     loop {
         if ch::try_io() {
             return true;
         }
-        if waited >= ms {
+        if cr::expired(ch::now_100ns(), end) {
             return false;
         }
         crate::virtio::ctrl::sleep_ms(passive, 1);
-        waited += 1;
     }
 }
 
