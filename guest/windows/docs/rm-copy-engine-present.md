@@ -3,8 +3,9 @@
 Status: sections 0 to 9 are the research (M0) and the M1 tool, which PASSed on a GB202 (async CE, acquire held, verify ok).
 M3a, the host-testable half of the KMD route, is
 sections 10 and 11 (`protocol/src/rm_fence_v3.rs`, `kmd_logic/src/ce_present.rs`). M3b, the KMD's own copy-engine
-channel and its hardware self-test (`RmCopyEngine` = 2), is built and has not run yet (11.9, 11.10); the Present route
-(M3c) is not built. M1b, the tool's block-linear round trip, ran on hardware and PASSed (10.4); M1c, the RGBA -> BGRA
+channel and its hardware self-test (`RmCopyEngine` = 2), is built (11.9, 11.10); M3c-0, the record's parse, is built
+(13); M3c-2, the Present route (`RmCopyEngine` = 1), is built, stub-checked only and has not run (15); its producer dup
+(`ce_dup.rs`) is a stub until the M3c-1 branch's real module is merged. M1b, the tool's block-linear round trip, ran on hardware and PASSed (10.4); M1c, the RGBA -> BGRA
 conversion inside the copy with the CE remap unit (section 12), also PASSed on hardware, including a block-linear source.
 Every claim cites the file or patch it comes
 from; "unknown" marks what nobody has run, with what would settle it. Host driver release assumed: 610.57.04 (the release
@@ -872,7 +873,7 @@ M3c's: the channel's state is one leaf spinlock of its own (`STATE` in `ce_chann
 | value | does |
 |---|---|
 | 0 (default), and any value not listed | nothing |
-| 1 | reserved for the Present route (M3c); nothing in M3b |
+| 1 | the Present route (M3c-2, section 15); nothing in M3b |
 | 2 | the self-test (11.10), once per transport generation, from the HPD worker |
 | 3 | the shadow mode of M3c-1 (section 14): sampled Presents copied again by the channel and compared with the production copy |
 
@@ -1178,11 +1179,11 @@ The record is read in exactly one place per carrier: the arm where the fence tai
 The record never changes the fence. It is parsed after the attach, and the attach, the marker stash and the scanout
 refresh run exactly as before. A refused record is counted and never fails the Render.
 
-**The `h_client` rule is not checked yet.** Both `h_client`s must be RM clients that the presenting process created
-(the `NvDupHarden` rule). The KMD records RM clients per NVRM owner (`nvrm_clients::ClientTable`, keyed by the escape
-device), not per process, and keeps no map from owner to process. The hook is `record_client_owned_by_presenter`. It
-returns `ClientCheck::Unknown` today and carries a TODO for M3c, which must answer it before it dups anything the record
-names. M3c-1's shadow mode dups on `Unknown` and counts it (`CeRecClient`, 14.4); the route of M3c-2 must not.
+**The `h_client` rule** (both `h_client`s must be RM clients the presenting process created) is checked by the route
+at the Present that would use the record, not here: `record_client_owned_by_presenter` (15.3). The stash keeps what
+the producer sent, and nothing acts on it before that check.
+
+The shadow mode (M3c-1, `RmCopyEngine` = 3) dups what a record names WITHOUT that check and counts every record it uses on trust (`CeRecClient`, 14.4); it is diagnostic only.
 
 What runs when no record is present:
 - a Render without a FENCE tail (Venus stream markers, `HE12`, `HEFL`, every other command): nothing new;
@@ -1436,3 +1437,434 @@ samples.
 6. The compare's cost through the scratch's CPU view: cached by default; with `RmCeCache` 1 (write-combined) reads are slow
    (expect `CeShadowCmpUs` in the hundreds of ms).
 7. A destination whose format is an X format with a source that has alpha: the fourth byte is masked out of the compare.
+
+## 15. M3c-2 as built: the Present route (`RmCopyEngine` = 1)
+
+Built, host-tested where pure (`kmd_logic/src/ce_route.rs`, the client table's process tag), type-checked against the
+stub WDK, never compiled against the real WDK and never run. The producer's dup and GPU mapping
+(`virtio/rm_client/ce_dup.rs`) is a STUB on this branch that answers "not implemented" (`Layout` 0x7E): until the
+M3c-1 branch's real module replaces it, every routed Present falls back at its dispatch (`CeRtWhy` 19) and the route
+exercises only its decision, its queueing, its destination descriptors and its fallbacks. With the knob at anything but 1
+(0, 2 the self-test, 3 the shadow mode of M3c-1) the Present path is the one it was: every entry point is one relaxed
+load. Section 14 is left for M3c-1.
+
+### 15.1 What happens to a windowed Blt
+
+The route rides the `BltAsync` DEFERRED machinery (`zero-copy-present.md` 24.3) instead of building a second one, so the
+ordering, ownership, ledger and fence rules of a deferred copy hold for it unchanged:
+
+1. **Present** (`ddi/display.rs`, Blt arm, `entry.async_enter` branch, before `blt_async::try_async`):
+   `ce_present_route::try_route` takes the record stashed for THIS Present's fence (`take_ce_record(boundary)`: the
+   boundary `rm_gate_attach` returned for the record's own fence, so an older record never pairs with a newer Present),
+   decides (15.2), and if routed queues the request exactly as `blt_async::deferred` does: the Venus copy is PREPARED
+   (`prepare_present_blt_guest`: it is the fallback), `queue_async_blt` queues the WindowedBlt request under the
+   producer's boundary, a JOB keyed by `(token, boundary)` is recorded in the route's table, the token is merged into the
+   Present's private record, `present_complete` merges the boundary, and the DDI returns without waiting (`PBCpy` 5).
+2. **Worker, before the dispatch** (`ddi/hpd.rs` -> `ce_present_route::service`): the lazy channel bring-up a Present
+   asked for (never inside a DDI), the completions, a broken channel's teardown, and the PREPARATION of each queued job:
+   the destination's OS descriptor (15.4) and the producer's dup and mapping (`ce_dup::dup_map_record`).
+3. **Dispatch** (`service_windowed_blt`, its rules unchanged: admitted by SubmitCommand, the producer's boundary ready,
+   the destination writable and taken as `KmdWriter`): `ce_present_route::dispatch` submits the copy-engine push
+   (`ce_present::present_push`: ACQUIRE the record's semaphore value at `Producer.sem_va`, copy
+   `Producer.src_va + SourcePlan::offset` (pitch or block-linear per the record, remap per `remap_for`) into the
+   descriptor's VA, RELEASE the next completion value with WFI) through `ce_channel::submit` (plain stores; the doorbell is
+   a plain store). Anything missing (job, preparation, descriptor, channel) or a refused submit: the request's own Venus
+   copy runs, as it would have without the route (`CeRtDispFall`).
+4. **Completion** (polled: `ce_present_route::settle`, from the worker's pass and a spin of at most 750 us right after a
+   dispatch; the worker's wait is 0.5 ms while copies are in flight): `completed >= value` (`ce_present::retire`) ->
+   `VirtioGpu::complete_ce_blt` = the request's ring completion with the mirror forced OFF: the destination goes back to
+   `ExternalReady`, the source's ledger ticket retires, the Level 5 edge is raised, the token terminalizes, and the
+   Present's DMA fence (which waits for that terminal and for the producer's boundary, `note_wddm_submission`) retires.
+
+Why the dispatch waits for the producer's boundary although the push acquires: a copy submitted before the producer
+finished would hold the CE channel on an acquire that a killed producer never satisfies, and every destination's copies
+would queue behind it. With the dispatch after the boundary the acquire is already satisfied (it stays in the push as the
+GPU-side ordering), and the measured deferred wait is the producer itself, not the worker hop (24.11.5). What the route
+saves is the Venus ring-1 round trip (0.5 to 1 ms, `BltAsyncLat`) and its host hops, replaced by the CE copy (0.2 to
+0.35 ms) and a poll. Dispatching before the boundary is the follow-up once a stuck acquire can be released.
+
+### 15.2 The decision (`ce_route::decide`, in this order; `CeRtWhy` codes)
+
+Consulted only for a Blt the `BltAsync` entry admitted (`BltAsync` 1, `ForeignCopy` 1, a foreign source, a KMD standard
+buffer, no snapshot) with `RmCopyEngine` 1. The first refusal wins; the Present continues into `try_async` exactly as
+without the route.
+
+| # | condition | refused as |
+|---|---|---|
+| 1 | the Present carries an RM-fence boundary | 1 `NoBoundary` |
+| 2 | a valid record is stashed for that boundary | 2 `NoRecord` |
+| 3 | both record clients are the presenter's (15.3) | 3 `Client` (also `CeRtClient`) |
+| 4 | the route is not off (three route strikes, or the channel service struck out) | 5 `RouteOff` |
+| 5 | the channel is up (else a bring-up is asked of the worker, `CeRtUp`) | 4 `ChannelDown` |
+| 6 | `source_plan` accepts the record's source; `remap_for(source fourcc, destination DXGI)`; the record's size is the destination's and a row fits its pitch | 6 `Source`, 7 `Format`, 8 `Extent` |
+| 7 | the destination: a standard buffer with leased system backing whose `round_up(pitch * height)` fits a 64 MiB window; its system copy not marked invalid; no other process has it open; no guest blob | 9 `Destination`, 10 `Stale`, 11 `Foreign`, 12 `GuestBlob` |
+| 8 | the destination's record: not struck out (3 strikes), not poisoned or leaked, not found uncovered, not being retired | 13 `Struck`, 14 `Poisoned`, 15 `Uncovered`, 23 `Retiring` |
+| 9 | the job table (16) and the destination table (8) have room | 16 `Full` |
+| 10 | the request is queued and its token merged | 17 `Queue` |
+
+Dispatch-time fallbacks (the queued request's Venus copy runs): 18 `NotReady` (the preparation was not done in time),
+19 `Dup`, 20 `Desc`, 21 `Submit`, 22 `ChannelLost`, 23 `Retiring`, and 10 `Stale` (a mark that arrived after the
+Present). 19, 20 and a refused submit other than a full ring are strikes against the destination. The rule is tested over
+its whole input space against an independent statement of it (`ce_route` tests).
+
+### 15.3 The `h_client` rule
+
+Compared: the presenting context's process token, `ContextHandleRef::creator_process` (the `hKmdProcess` dxgkrnl gave the
+D3DKMT device that owns the context, `DXGKARG_CREATEDEVICE`), against the process token recorded with each record client
+(`ce_record::client_check`; both must be `Owned`, `ce_record::both_owned`).
+
+Captured: `HELIOS_ESCAPE_NVRM` takes `hKmdProcess` of the escaping device (`DeviceHandleRef::creator_process` of
+`hDevice`, as `PRODUCER`, `PRESENT_STREAM` and `ATTACH_RESOURCE` already do) and passes it through `nvrm::forward` to the
+`NvDupHarden` bookkeeping: the reply of a forwarded `NV_ESC_RM_ALLOC` of a root class records the client RM minted with
+its owner (the escape device), its file and now its process (`ClientTable::commit_in`, read by `process_of`). One process
+has one `hKmdProcess` for all its devices: the NVK ICD's escape device and the D3D runtime's device that presents share it
+(the present-stream registration already relies on exactly this edge). A client leaves the table with its free, its
+file's close, its device's destruction and the transport, so the token of a process that is gone names no client; RM never
+has two live clients of one number (a re-minted number evicts the stale entry, process included).
+
+`Unknown` is refused like `NotOwned` (`CeRtClient`): hardening off (`NvDupHarden` 0 records nothing, so the route then
+refuses every Present: run it with the default 2 or with 1), a full client table, a client of the KMD's own, a device
+without a process token.
+
+The rule is checked TWICE: at the Present, and again on the worker immediately before `ce_dup::dup_map_record`
+(`prepare`, with the presenter kept in the job): a client freed since the Present is refused there (dispatch-time 3,
+`CeRtClient`, `CeRtDispFall`). The dup cache never reuses a dup across a change of the client table: every commit or
+forget of a client (a root allocation's reply, a client free, a file's close, a device's destruction, the transport's
+sweep) bumps a generation (`nvrm_harden::client_generation`), and a cache entry made under an older generation is never
+a hit (`ce_dup::Cache::set_generation`: it is re-made in its own slot, its objects given back first). A re-minted client
+number or a memory handle a process reused at the same size therefore always gets a fresh `RM_DUP_OBJECT`, which RM
+resolves against the client as it is now. Residual window: a client freed and its number re-minted for another process
+between the worker's second check and RM's execution of the dup (one forwarded message).
+
+### 15.4 The destination: an OS descriptor over the lease pages
+
+- **Rule with `GuestBlob`.** A destination uses one of the two, never both at once: the route refuses a destination with a
+  live guest blob (12 `GuestBlob`), and `guest_blob::prepare` makes no guest blob for a destination the route holds
+  (`ce_present_route::holds`: a descriptor made, being made, drained or leaked). The fallback of a routed Present is the
+  request's prepared Venus copy, i.e. exactly what the destination would have used without the route: the Venus blob with
+  the worker's CPU mirror (or `BltNoMirror`'s stale mark). Run the route with `GuestBlob` 0; with both on, the first to
+  claim a destination keeps it until its leases change or it is destroyed.
+- **Create** (the worker, lazily, for the first routed Present's job): under the content transaction
+  (`system_backings.serialize`) re-check the stale mark and the guest blob, snapshot the leases, build the page runs of
+  `[0, round_up(pitch * height))` with `guest_blob::build_runs` (whole pages of one lease each, else `Uncovered`), pin
+  exactly those leases (`GuestPin`), then, under the channel's `IO_BUSY`, register them: `NV_ESC_RM_ALLOC_MEMORY`
+  (`NVOS02` + fd -1, class 0x71, librmclient's flags) on the channel client's GPU file, handle `H_BASE + 0x80 + 2 * slot`,
+  with the page-run table appended as the deep block by `nvrm::forward_kmd_registration` (the same table and the same
+  splice a user PIN carries: `nvrm::page_run_table` is the PIN's `build_table` factored out, the escape path byte for byte
+  as before); then `NV50_MEMORY_VIRTUAL` + `MAP_MEMORY_DMA` snooped with 4 KiB pages at the slot's 64 MiB window from
+  `VA_BASE + 32 * VA_WINDOW` (`ce_channel::gpu_map`). RM's refusal frees what was made and unpins; a timeout (the host may
+  hold it) keeps the pin (`Leaked`).
+- **Retire** (`guest_blob::before_lease_change` and `destination_gone` call the route FIRST, content transaction held):
+  (1) the descriptor leaves `Ready` (no new copy: a queued job falls back at its dispatch); (2) wait until the channel's
+  completion value reaches the destination's last submitted value, then terminalize what completed; (3) under `IO_BUSY`
+  `UNMAP_MEMORY_DMA`, free the virtual allocation, free the descriptor; (4) only after both frees were confirmed, drop
+  the pin (PASSIVE, outside the spinlock), so the lease change may unlock the pages. Every wait is an interrupt-time
+  DEADLINE (`ce_route::deadline` / `expired` / `left_ms`): the whole hook at most `LEASE_HOOK_MS` (1 s), the drain at
+  most 250 ms of it, the wait for `IO_BUSY` at most 250 ms and the free at most what is left; a `sleep_ms(1)` rounds up
+  to the timer quantum (about 15.6 ms), so each wait sleeps and then reads the clock again, overshooting by at most one
+  quantum (the first version counted sleeps: "250 ms" could be about 3.9 s, on VidMm's paging thread with the content
+  transaction held). A drain or a free that does not complete in time: the destination is `Leaked` (pinned until the
+  transport generation ends, never routed again, a strike). A destination found uncovered is looked at again after the
+  change. The worker never waits for the content transaction (`try_serialize`: busy is `NotReady`, tried again next
+  pass).
+- **Destroy while a free is in flight.** `destination_gone` never removes a record another thread is freeing
+  (`Draining`, the worker's `free_all_descriptors`): it marks it `gone`, and `finish_free` (matched by resource id, the
+  slot is not reused while `Draining`) removes it once that free answered, so the pin drops only after the host free was
+  confirmed (or the record stays leaked). A leaked record, one with an orphaned pin or with a copy still submitted stays,
+  pin and all, until the generation ends.
+- **Channel teardown** (it broke, or StopDevice): the descriptors nothing can write are freed first, the producer dups
+  next (`ce_dup::release_all`), then the channel (`ce_channel::teardown` / `retire_for_stop`); the destinations' ring values
+  are forgotten (`Route::on_channel_gone`, strikes kept). **Generation end** (`rm_client::forget`, after the device reset)
+  follows the transport sweep's `PinFate`, exactly as the user pins do (`nvrm::close_all_on_host`; the KMD's client files
+  are closed by the same sweep): every close confirmed, every pin goes; any close unconfirmed (or the transport already
+  failed), the pin of every destination a descriptor may name (ready, being made, draining, leaked) and every orphaned pin
+  is leaked on purpose (`core::mem::forget`): the host keeps its RM files across a device reset and a GPU copy stuck at
+  StopDevice (whose teardown gave up) may still write pages it registered. Locked pages leak; DMA into reused RAM would
+  corrupt. The fate is sticky until `forget` reads it, so StopDevice's second, idempotent sweep cannot clear it.
+
+**Can a destination with a descriptor be evicted blob-to-system, or paged in over newer pages?** No, by the paging
+path's construction (`build_paging_buffer.rs`): system-backing leases are CREATED by a LOCAL_TO_SYSTEM transfer (the blob
+copied into VidMm's system pages, `replace_range`) and REMOVED by the SYSTEM_TO_LOCAL page-in (`remove_range`, both
+`bar_virtual_transfer_inner` and `bar_transfer`). A descriptor exists only while leases cover the whole destination, so
+only while it is system-resident: the blob is then not authoritative and the next transfer is a page-in, which copies the
+PAGES (holding the CE frames) into the blob. The route's retire runs before that transfer (`before_lease_change`, both
+directions), so the copy the page-in makes is the newest frame, and nothing marks anything. A LOCAL_TO_SYSTEM of a
+system-resident range does not occur (VidMm evicts from a segment), and if a partial transfer ever changed part of the
+leases, the descriptor is retired first and the next create finds the destination uncovered. The one mark that could
+make a page-in skip the pages (`system_copy_invalid`) is set by a skipped LOCAL_TO_SYSTEM (not possible while
+system-resident) or by a `BltNoMirror` Venus copy into the blob (which then holds the newest frame itself); the route
+refuses a marked destination at the Present and at the dispatch. No code change was needed.
+
+### 15.5 Completion, the fence, and why dxgkrnl cannot hang on it
+
+The Present's DMA fence waits for the request's terminal token (and the producer's boundary), the plumbing a deferred
+`BltAsync` copy uses. The terminal comes from exactly one of: the CE completion (`completed >= value`, written by the GPU's
+release after the copy's WFI), a dispatch-time fallback (the Venus copy's own ring completion), or a discharge.
+
+- Every submitted copy has a deadline: `COMPLETE_MS` (100 ms, `TIMEOUT_AFTER_PRODUCER_MS`) from its dispatch, which is
+  when the producer was already done. Past it the copy is DISCHARGED: its terminal with a failure (the destination is
+  handed back, the fence retires), the destination is poisoned and leaked (pinned for the generation, never routed
+  again), the channel is marked broken (it may be stuck on that copy) and torn down by the next pass, a route strike.
+- A broken channel (error notifier) or a channel that vanished: every submitted copy is discharged at once, its
+  destination poisoned and leaked.
+- The worker polls every 0.5 ms (rounded to the timer) while copies are in flight; a wedged worker is bounded by the
+  existing `WddmHeadMs` rebase, as for any deferred copy.
+- The pixels of a discharged frame are NOT guaranteed: the Present completes late (at most 100 ms) with the destination's
+  previous content, and a copy that lands after the discharge writes that frame late (a one-frame glitch, never a memory
+  fault: the pages stay pinned). The next Present of that destination takes the Venus copy.
+- No mirror, no stale mark: the copy engine wrote the very pages the destination's CPU view (DWM) reads; the Venus blob is
+  older than the pages from then on, which is the guest blob's invariant (a page-in copies pages to blob; a marked
+  destination is refused).
+
+### 15.6 Failure matrix (what the Present does)
+
+| where | what | the Present |
+|---|---|---|
+| decision | any refusal of 15.2 | continues into `try_async` unchanged (DIRECT, DEFERRED or legacy), counted |
+| queue | prepare, queue or token merge refused | the same; nothing queued is left behind (a queued request whose token is refused is cancelled) |
+| queue | the job table filled between the decision and the queue | the request is a plain deferred Venus copy (`CeRtWhy` 16) |
+| preparation | descriptor: uncovered, stale, guest blob | the job falls back at dispatch; uncovered sticks until a lease change |
+| preparation | descriptor: RM refused | falls back, a strike, nothing left pinned |
+| preparation | descriptor: timeout | falls back, the pages stay pinned for the generation (`CeRtLeak`) |
+| preparation | dup or map refused (the stub always) | falls back, a strike; three strikes: the destination is struck out |
+| dispatch | not prepared, channel down, retiring, marked stale | the request's Venus copy |
+| dispatch | ring full | the Venus copy, no strike |
+| dispatch | another submit refusal | the Venus copy, a strike |
+| completion | done | the fence retires on the terminal |
+| completion | 100 ms past the dispatch (its OWN deadline: the channel's head) | discharged (`CeRtTimeout`): the fence retires, previous content, its destination struck, poisoned and leaked; the channel is marked broken and torn down by the next pass, ONE route strike |
+| completion | queued behind that copy, or in flight when the channel broke or vanished | discharged as a BYSTANDER (`CeRtChFail`): the fence retires, previous content, no strike and no poison; the descriptor's pin is orphaned (pages locked until the generation ends), the descriptor freed, a fresh one made when a channel is up again |
+| DoS (accepted, bounded) | a producer names a semaphore value it never releases (its own other memory: the record must match the fence's value, not its address) | its copy holds the single channel until its 100 ms deadline: every destination's copies queued behind it wait (bystanders, uncharged); the attacker's destination is struck and poisoned at once; three such stalls in a generation turn the route off (`CeRtOff`) and every app falls back to the Venus copy. Bounded: at most 3 x 100 ms of delayed Presents per generation, never a hang |
+| route | three route strikes | 5 `RouteOff` for the generation (`CeRtOff` 1) |
+| paging, destroy | a copy in flight | drained up to 250 ms (clock), the whole hook within 1 s, then freed and unpinned; else leaked |
+| destroy | the worker is freeing the descriptor (`Draining`) | marked `gone`; removed by `finish_free` after the free answered |
+| worker | the content transaction is held (paging) | `try_serialize` fails: the job stays pending, its dispatch falls back meanwhile |
+| StopDevice | live descriptors | freed on the stop budget before the channel; the rest follow the sweep's `PinFate` at the generation end (leaked when any close was unconfirmed) |
+
+### 15.7 Locking and IRQL
+
+- `ce_present_route::STATE`: a leaf spinlock over plain data (jobs, destinations, route strikes). Order: `STATE` -> the
+  channel's `STATE` (submit, poll) -> nothing. No allocation, wait, RM message or virtio lock under it; pins dropped only
+  outside it, at PASSIVE.
+- Present (PASSIVE): the decision takes the virtio lock (the client table, the foreign opens) and `STATE` separately; the
+  queue takes scanout -> Venus -> virtio as `blt_async::deferred`.
+- Dispatch: under the scanout lifecycle and the Venus mutex (the worker's dispatch), spinlocks only.
+- Completion: `STATE`, then (released) the virtio lock (`complete_ce_blt`, a ring completion's code, DISPATCH-legal).
+- RM I/O (bring-up, dup, descriptor create and free, teardown): PASSIVE, no spinlock, one thread at a time under the
+  channel's `IO_BUSY` (never waited for on the worker; at most 250 ms of interrupt time on the paging path); order
+  content transaction -> `IO_BUSY` -> virtio. Each in an `escape_wait` bounded section (`PREP_MS` 2 s, `FREE_MS` 1 s,
+  the bring-up's 6 s); the paging hooks' whole bound is `LEASE_HOOK_MS` (1 s, clock).
+- The worker takes the content transaction only with `try_serialize` (never waits behind a paging operation).
+- The client table's generation (`nvrm_harden`, an atomic) is bumped under no lock of the route; the dup cache reads it
+  under its own leaf spinlock.
+
+### 15.8 Knobs
+
+`RmCopyEngine` = 1 (read at StartDevice, `CeKnob`). The route also needs `BltAsync` = 1 and `ForeignCopy` = 1 (it lives in
+their branch) and `NvDupHarden` 2 or 1 (the `h_client` rule), and should run with `GuestBlob` 0 and `BltNoMirror` 0 (a
+stale mark refuses the route). `RmCeCache` as in 11.11. No new knob.
+
+### 15.9 Counters (`ce_route::COUNTERS`, written only by `ddi/ce_present_route.rs`, mirrored with the NVRM block)
+
+| counter | meaning |
+|---|---|
+| `CeRtSeen` | Presents that reached the decision |
+| `CeRtRouted` | queued for the copy engine (jobs recorded) |
+| `CeRtDone` | completed by the copy engine (terminal with success) |
+| `CeRtFall` / `CeRtWhy` / `CeRtMask` | fallbacks (decision and dispatch), the last reason, every reason (bit `code - 1`) |
+| `CeRtDispFall` | of them, at the dispatch (the queued request's Venus copy ran) |
+| `CeRtClient` | refusals by the `h_client` rule |
+| `CeRtStrike` / `CeRtStruck` | strikes against destinations / destinations struck out |
+| `CeRtChStrike` / `CeRtOff` | route strikes / the route off for the generation |
+| `CeRtPoison` / `CeRtLeak` | destinations poisoned / pins kept for the generation (leaked destinations, orphaned bystander pins, pins leaked at `forget` by an unconfirmed sweep) |
+| `CeRtTimeout` / `CeRtChFail` | Presents discharged at their OWN deadline (the channel's head: a producer that never signalled, or a hung copy) / discharged as bystanders of a channel failure (never charged to their destination) |
+| `CeRtUp` | bring-ups asked for by a Present |
+| `CeRtInfl` / `CeRtPeak` | copies in flight now / the most at once |
+| `CeRtDecUs` | microseconds in the decision (sum; per Present: `/ CeRtSeen`) |
+| `CeRtDupUs` | in the preparation, dup/map and descriptor (sum) |
+| `CeRtSubUs` | in the submit (sum; per copy: `/ (CeRtDone + CeRtTimeout)`) |
+| `CeRtDoneUs` / `CeRtDoneMax` | dispatch (producer satisfied) to completion seen (sum / max; per copy `/ CeRtDone`) |
+| `CeRtPollUs` | in the completion polls and drains (sum) |
+| `CeRtDstNew` / `CeRtDstDrop` / `CeRtDstLive` / `CeRtRuns` | descriptors created / freed / live / page runs of the last one |
+| `CeRtDirKnob` / `CeRtDir` / `CeRtDirNo` / `CeRtDirWhy` / `CeRtDirUs` / `CeRtLag` | `CeRtDirect` (15.13) |
+
+The CE copies also feed `BltAsyncLat0..7` and `BltAsyncInfl` (they are deferred asynchronous Blts); a discharge counts in
+`BltAsyncFail`.
+
+### 15.10 Where the code is
+
+`kmd_logic/src/ce_route.rs` (the decision, the destination record and its retire order, the jobs, the route strikes, the
+NVOS02 block, the slots, the deadlines, the names; tests), `kmd_logic/src/ce_record.rs` (`client_check`, `both_owned`),
+`kmd_logic/src/nvrm_clients.rs` (`commit_in`, `process_of`), `ce_present::Route::on_channel_gone`;
+`kmd_render/src/ddi/ce_present_route.rs` (Present, dispatch, worker, hooks, counters);
+`kmd_render/src/virtio/rm_client/ce_route.rs` (bring-up, the dup call, the descriptor, the submit and poll doors, the
+teardown); `virtio/rm_client/ce_dup.rs` (STUB). Hooks: `ddi/display.rs` (Present, dispatch), `ddi/hpd.rs` (service,
+settle, wait), `ddi/guest_blob.rs` (prepare, lease change, destroy), `ddi/lifecycle.rs`, `ddi/submit_command.rs`
+(publish), `virtio/gpu/blt_async.rs` (`complete_ce_blt`, `ce_blt_request`), `virtio/nvrm.rs` (`page_run_table`,
+`forward_kmd_registration`, the process argument), `virtio/nvrm_harden.rs`, `virtio/gpu/nvrm_tables.rs`, `ddi/escape.rs`,
+`ddi/ce_record.rs` (`record_client_owned_by_presenter`), `virtio/rm_client.rs` (the modules, `forget`),
+`virtio/rm_client/ce_channel.rs` (`knob_mode`, `try_io` / `end_io`, `route_view`, `mark_broken`), `adapter/mod.rs`
+(`GuestPin`).
+
+### 15.11 Hardware procedure (main session)
+
+Builds: this KMD (with the real `ce_dup.rs` of M3c-1 merged; without it every routed Present falls back at its dispatch,
+which is itself a useful first run, below), the UMD and the NVK series of 13.3 (the record must arrive: `CeRecSeen` grows).
+
+1. **Shadow first** (M3c-1's procedure, `RmCopyEngine` = 3): the dup, the mapping and the copy checked against the Venus
+   copy without owning the Present. Go on only if that is clean.
+2. Set the knobs and restart the device:
+   ```
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v RmCopyEngine /t REG_DWORD /d 1 /f
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v BltAsync /t REG_DWORD /d 1 /f
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v ForeignCopy /t REG_DWORD /d 1 /f
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v GuestBlob /t REG_DWORD /d 0 /f
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v BltNoMirror /t REG_DWORD /d 0 /f
+   pnputil /restart-device "<the Helios display adapter's instance id>"
+   ```
+   (`NvDupHarden` absent = 2.) Lowest mode first (1920x1080 at 60 Hz).
+3. Heaven windowed at 1600x900 (composed, NVK DWM) for about a minute; read the service key twice, 10 s apart.
+4. Restart with `RmCopyEngine` 0 and repeat 3: the A/B.
+
+Expected with the real dup (GB202):
+
+| value | expected | if not |
+|---|---|---|
+| `CeKnob` | 1 | no restart since `reg add` |
+| `CeRtSeen` | about the composed Presents (`BltEntryOk`) | 0: the branch is not entered (`BltEntry*`, 24.11) |
+| `CeRtRouted` | close to `CeRtSeen` after the first frames | `CeRtWhy` names the refusal |
+| `CeRtDone` | close to `CeRtRouted` | `CeRtDispFall` with `CeRtWhy` 18 to 23 |
+| `CeRtFall` | the first few Presents (4 `ChannelDown` while the channel comes up, 18 `NotReady` once), then flat | 3: the `h_client` rule (`NvDupHarden`, `NvCliRec`); 12: `GuestBlob` on; 10: `BltNoMirror` on |
+| `CeRtStrike` / `CeRtTimeout` / `CeRtLeak` / `CeRtOff` | 0 / 0 / 0 / 0 | the failure matrix's row |
+| `CeRtDstNew` / `CeRtDstLive` | the number of window destinations (1 for Heaven) | 0 with `CeRtWhy` 20: RM refused the descriptor |
+| `CeRtRuns` | the descriptor's page runs (1 when VidMm's pages are contiguous, at most 1407 for 1600x900) | |
+| `CeRtInfl` / `CeRtPeak` | 0 at idle / 1 (one copy per destination at a time) | |
+| `CeChan` / `CeChanFail` / `CeNotify` | 1 / 0 / 0 | the channel broke: 11.10's table (`CeRmCall` / `CeRmStat` name a failed map) |
+| `BltAsyncFail` / `BltSrcBusy` | 0 / 0 | |
+| the window | live, no tearing, colours right (an RGBA source into a BGRA destination: the remap) | R and B swapped: the remap; scrambled: the source mapping's kind (10.3) |
+
+Stage table (divide the sums): the decision `CeRtDecUs / CeRtSeen` (a few us); the preparation `CeRtDupUs / CeRtRouted`
+(the first frame of a destination pays the descriptor and the dup, the rest the cached dup); the submit
+`CeRtSubUs / CeRtDone` (a few us: no RM call); dispatch to done `CeRtDoneUs / CeRtDone` (expected 0.2 to 0.4 ms plus the
+poll's granularity; `CeRtDoneMax` below 2 ms) against the A/B run's `BltAsyncLat0..7` (the Venus ring-1 copy, 0.5 to 1 ms
+in 24.11.5) and `BltDeferUs / BltAsyncDefer` (the producer wait, the same in both runs); `CeRtPollUs` is the worker's cost
+of polling. PresentMon `msBetweenPresents` and fps against the A/B run.
+
+Without the real dup (this branch alone): `CeRtRouted` grows for the first three frames of a destination, each falls back
+at its dispatch with `CeRtWhy` 19, `CeRtStrike` 3 and `CeRtStruck` 1, then every Present is refused with 13 `Struck`;
+`CeRtDstNew` 1 and `CeRtRuns` show that RM accepted the OS descriptor over the lease pages (the first hardware check of
+a KMD-owned registration). The window stays live (the Venus copy).
+
+### 15.12 Unverified, and known limits
+
+- Everything on hardware. In particular: that RM accepts a KMD-owned OS descriptor registered through `ALLOC_MEMORY` with
+  the KMD's own page-run block (the escape path for user pins is proven by `crm_pin_smoke`, the KMD-owned one is not), that
+  the CE writes it coherently for DWM's CPU view (3, 11.7), the remap with a block-linear source (12.3), the source
+  mapping's kind (10.3), and the real `ce_dup`.
+- The poll's latency: the worker's 0.5 ms wait rounds to the timer resolution; the spin after a dispatch covers a copy
+  that completes within 750 us. The event route (4.3 option B) is the follow-up.
+- A source destroyed while its copy is in flight (about 0.3 ms): the allocation's teardown finds the request dispatched
+  and retains the allocation (as for any dispatched request) until the context's teardown.
+- A gate that fired with an error status still releases the dispatch: the acquire may then hold the channel until the
+  100 ms deadline discharges the copy and tears the channel down.
+- One copy per destination at a time (the `KmdWriter` exclusivity of the deferred route), as with the Venus copy.
+- The `h_client` rule cannot see a client re-minted for another process between the worker's second check and RM's
+  execution of the dup (15.3).
+- A timed-out head is blamed as the producer's fault; whether its semaphore never reached the value or the channel hung
+  is not told apart (reading the producer's value would need an RM call in the poll). Either way only that destination
+  is charged.
+- A Venus fallback with `BltNoMirror` 1 between two copy-engine frames marks the destination stale; the next Present is
+  refused (10 `Stale`) but a copy-engine frame already queued behind it is refused only at its dispatch.
+
+### 15.13 Direct submission at the Present (`CeRtDirect`)
+
+First hardware run of the route (352.1, Heaven windowed 1600x900): `CeRtSeen` 16404, `CeRtRouted` 16403, `CeRtDone`
+16403, one fallback (`CeRtWhy` 4, the first Present), every strike, timeout, leak, poison and off counter 0,
+`CeRtDoneUs / CeRtDone` 220 us (max 931), `BltAsyncLat` below 250 us for 94% of the copies (the Venus baseline 250 us
+to 4 ms), PresentMon `msInPresentAPI` p50 2.01 -> 1.61 ms. `BltDeferUs / CeRtRouted` was 511 us: the deferred wait,
+from the Present to the worker's dispatch once it sees the producer's boundary ready.
+
+`CeRtDirect` = 1 (service-key REG_DWORD, default 0, read at StartDevice only with `RmCopyEngine` 1, mirrored as
+`CeRtDirKnob`; anything else is 0) submits a routed copy at its own Present instead. The push already ACQUIREs the
+record's value (`ACQ_STRICT_GEQ`), so the GPU, not the worker, waits for the producer (M1: acquire held 1253/1253).
+
+**Where it is submitted: the Present DDI.** `DxgkDdiPresent` runs at PASSIVE and holds no lock where the route has
+queued the request and merged its token; the submit is spinlocks and plain stores (the push into the slot, the GPFIFO
+entry, `GP_PUT`, the doorbell): a few microseconds, bounded, never a wait (`CeRtDirUs` measures it). The worker is
+signalled at once to poll the copy.
+
+**When (all of them, else the request stays the deferred one: `CeRtDirNo`, `CeRtDirWhy`):** the route decision admitted
+the Present (15.2, unchanged); the channel is up and the destination's system copy not marked stale (7 `NotUp`); the
+channel has NO copy in flight (1 `ChannelBusy`: a direct copy never queues behind another destination's copy, and only
+one direct copy can hold the channel at a time); the destination's descriptor is made (2 `NotPrepared`); both producer
+dups are cached under the client table's current generation, a pure lookup (3 `NotCached`: making a dup is RM I/O,
+the worker's); the channel's I/O is free (`try_io`, 4 `IoBusy`: while held no dup is remade or given back under the
+cached VAs); and, in ONE critical section of the transport lock (`VirtioGpu::ce_direct_dispatch`), the request is the
+only one pending for the destination and the destination is taken as `KmdWriter` without waiting (the worker's
+`try_begin_present_buffer_write`) (5 `DstBusy`), then the push is submitted (6 `Submit` gives the writer back). A
+submitted request is marked dispatched and admitted (SubmitCommand's later admission skips it; a copy that completes
+before SubmitCommand leaves its terminal, which the DMA fence then finds ready). Lock order: virtio -> the route's
+`STATE` -> the channel's `STATE`, nothing the other way round.
+
+**The deadline starts when the CPU sees the producer finish, not at the submit.** A copy waiting on its acquire waits for
+the producer, which may legitimately take long (a heavy frame). The worker checks the boundary of every direct copy it
+has not yet seen finish (`VirtioGpu::ce_boundary_seen`: ready, or the stream is dead) on every pass while copies are in
+flight, and the first observation starts the copy's `COMPLETE_MS` (100 ms) clock (`ce_route::route_fire_ms`). Unseen,
+nothing runs until `DIRECT_CAP_MS` (7 s) after the submit, longer than the RM gate's own expiry (`RmGateMs`, 6 s by
+default, after which the boundary is declared ready and the normal deadline runs): the cap only acts with `RmGateMs` 0
+or a gate that never fires, and then discharges the copy exactly as a timeout (the fence retires, the destination is
+struck, poisoned and leaked, the channel torn down so the acquire cannot hold the GPU, one route strike).
+
+**Head of line.** The channel runs in order: anything submitted behind a direct copy waits for its acquire. Bounded to
+nothing for other destinations: a direct submit needs an empty channel, and while a direct copy's producer has not been
+seen finishing, the worker's deferred dispatch of ANOTHER destination falls back to its Venus copy (`CeRtWhy` 24
+`Blocked`) rather than queue behind it. The same destination cannot have a second copy in flight (`KmdWriter`). If the
+direct head is discharged (its own deadline or the cap), every copy behind it is a bystander of the channel's teardown,
+each settled exactly once (`Jobs::take_settled` then `take_first` remove what they return; tests).
+
+**Which frame it reads.** The acquire is on THIS Present's own record value (`take_ce_record(boundary)` pairs the record
+with this Present's fence; `matches_fence` makes the record's value the fence's). On one producer timeline the values a
+queue releases only grow, so `current >= value` holds exactly once frame `value`'s work finished (a later frame's higher
+value implies it); an older frame's lower value is released already and never hangs (`ce_route::acquire_releases`).
+What GEQ cannot prevent is the source-reuse hazard of every asynchronous copy (24.10.3): if the app renders the NEXT
+frame into the same image before this copy ran, the copy reads the newer pixels. The read-ledger claim and the
+swap-chain depth bound it exactly as for the deferred copy; the direct copy usually runs EARLIER (right when the
+producer releases) than a deferred one, which narrows that window.
+
+**What the destination sees.** `KmdWriter` is taken at the Present and held while the GPU waits for the producer
+(longer than with the deferred dispatch, which takes it once the producer finished): a Venus consumer claim of the
+destination waits that long; an NVK DWM reads the pages without a claim. The DMA fence still waits for the producer's
+boundary and the copy's terminal, unchanged.
+
+**The expected gain, honestly.** `BltDeferUs` is mostly the PRODUCER'S OWN GPU time, which no design removes: the copy
+cannot start before the frame is rendered. What direct submission removes is the CPU lag between the producer finishing
+and the copy starting: the RM fence's `EventReady` to the DPC, the worker's wake (rounded to the timer) and its dispatch.
+Expect `CeRtLag / CeRtDir` (the CPU lag from seeing the producer finish to seeing the copy done) well below the deferred
+path's dispatch-to-done, often 0 when the copy finished before the CPU even saw the boundary, and the present-to-fence
+retire shorter by roughly the worker hop (a fraction of the 511 us, not all of it).
+
+**Counters** (`ce_route::COUNTERS`): `CeRtDirKnob` (in force), `CeRtDir` (submitted at the Present), `CeRtDirNo` /
+`CeRtDirWhy` (not, and the last `DirNo` code above), `CeRtDirUs` (microseconds of those submits, sum), `CeRtLag` (sum,
+us). `CeRtDoneUs` of a direct copy runs from its submit, so it includes the producer's time: compare `CeRtLag`, not
+`CeRtDoneUs`, between the two modes.
+
+| where | what | the Present |
+|---|---|---|
+| Present | any `DirNo` condition | queued deferred as with `CeRtDirect` 0 |
+| Present | submit refused after the writer was taken | writer given back, queued deferred (6) |
+| worker | the producer is slow (a heavy frame) | the copy waits on the GPU, no clock runs; other destinations' deferred dispatches take the Venus copy (24 `Blocked`) |
+| worker | the boundary is seen | the 100 ms deadline starts; done: the fence retires on the terminal |
+| worker | unseen for 7 s (gate never fired, `RmGateMs` 0) | discharged as its own failure; the channel torn down; bystanders behind it settled once, uncharged |
+| channel | breaks under a direct copy | as 15.6 |
+
+**Hardware A/B (same boot, `pnputil /restart-device` between):** the knobs of 15.11 with `RmCopyEngine` 1, then
+`reg add ... /v CeRtDirect /t REG_DWORD /d 1 /f`, restart, Heaven windowed 1600x900 for a minute, read the key twice;
+`CeRtDirect` 0, restart, the same. Expected with 1: `CeRtDirKnob` 1; `CeRtDir` close to `CeRtRouted` (a few
+`CeRtDirNo`: the first frames 2 or 3 while the descriptor and dups are made, 1 when two Presents overlap); `BltDeferUs`
+grows only for the deferred remainder (per routed copy close to 0: `BltDeferUs / (CeRtRouted - CeRtDir)` stays what it
+was, `BltDeferUs / CeRtRouted` falls); `CeRtDirUs / CeRtDir` a few us; `CeRtLag / CeRtDir` well below the run with 0's
+`CeRtDoneUs / CeRtDone` (220 us); every strike, timeout, leak, poison and off counter 0; PresentMon `msBetweenPresents`
+and the present-to-fence retire (`PBFnc` latency in the stage trace) equal or shorter. A rising `CeRtWhy` 24 says
+another window was held back while a direct copy waited.
+
+Unverified: everything on hardware; that GSP schedules other runlists while the CE channel's acquire waits
+(`ACQUIRE_SWITCH_TSG` is set); the admission order when a direct copy completes before SubmitCommand admits its request.

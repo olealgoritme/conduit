@@ -77,6 +77,8 @@ pub(crate) mod ce_dup;
 // M3c-1: the shadow mode (`RmCopyEngine` = 3): sampled Presents copied again by the channel and
 // compared with the production copy.
 pub(crate) mod ce_shadow;
+// `RmCopyEngine` = 1 (M3c-2): the Present route's RM I/O.
+pub(crate) mod ce_route;
 
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -504,6 +506,9 @@ pub(crate) fn forget() {
     rm_present::reset();
     sysmem::forget();
     ce_channel::forget();
+    // The copy-engine route's destinations: the transport was reset, so nothing on the host
+    // names their pages any more; every pin goes (one load when there is none).
+    crate::ddi::ce_present_route::forget(super::nvrm::last_sweep_fate());
     // The next transport generation reads the knob again (once).
     KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }
@@ -669,6 +674,7 @@ impl Io<'_> {
             self.passive,
             self.adapter,
             KMD,
+            0,
             req,
             resp,
             timeout_ms,

@@ -477,16 +477,25 @@ impl VirtioGpu {
         self.nvrm_clients.cancel(owner.raw());
     }
 
-    /// Record the client RM made for `owner` through file `via`; `reserved` consumes the
-    /// promise [`Self::reserve_nvrm_client`] made.
+    /// Record the client RM made for `owner` (whose device belongs to `process`, its
+    /// `hKmdProcess` token; 0 when unknown) through file `via`; `reserved` consumes the promise
+    /// [`Self::reserve_nvrm_client`] made.
     pub fn commit_nvrm_client(
         &mut self,
         owner: DeviceOwner,
+        process: usize,
         via: u32,
         client: u32,
         reserved: bool,
     ) -> Commit {
-        self.nvrm_clients.commit(owner.raw(), via, client, reserved)
+        self.nvrm_clients
+            .commit_in(owner.raw(), process, via, client, reserved)
+    }
+
+    /// The process (`hKmdProcess` token) RM client `client` was made for, if the table knows
+    /// it (`ClientTable::process_of`). The copy-engine Present route's `h_client` rule.
+    pub fn nvrm_client_process(&self, client: u32) -> Option<usize> {
+        self.nvrm_clients.process_of(client)
     }
 
     /// Forget one client of `owner` (its free went through). `false`: not its client.

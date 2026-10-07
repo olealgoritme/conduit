@@ -36,6 +36,21 @@ use crate::irql::PassiveLevel;
 use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::nvrm_clients::{self, Cause, Commit, Verdict};
 
+/// Bumped by every change of the client table that records or forgets a client (a commit, a
+/// free, a file's close, an owner's teardown, the transport). The copy-engine dup cache
+/// (`rm_client::ce_dup`) reuses a dup only within one generation, so a client number freed and
+/// re-minted for another process, or a reused memory handle, never reaches a stale dup.
+static CLIENT_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// The client table's generation (see `CLIENT_GEN`). One relaxed load.
+pub(crate) fn client_generation() -> u64 {
+    CLIENT_GEN.load(core::sync::atomic::Ordering::Acquire)
+}
+
+fn bump_generation() {
+    CLIENT_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
 /// `NvDupHarden` = 0: no tracking, no checks.
 pub const MODE_OFF: u32 = 0;
 /// `NvDupHarden` = 1: refuse.
@@ -176,11 +191,13 @@ pub fn begin(
 }
 
 /// The host answered `req` with `n` bytes in `resp`. `handle` is the file the request
-/// went through. `reserved` is what [`begin`] returned.
+/// went through. `reserved` is what [`begin`] returned. `process` is the `hKmdProcess` token
+/// of `owner`'s device (0: unknown), recorded with a client this reply made.
 #[allow(clippy::too_many_arguments)]
 pub fn after_reply(
     adapter: &AdapterContext,
     owner: DeviceOwner,
+    process: usize,
     handle: u32,
     mode: u32,
     reserved: bool,
@@ -194,7 +211,7 @@ pub fn after_reply(
     if nvrm_clients::root_alloc(req) {
         let client = nvrm_clients::client_from_reply(req, resp, n);
         let outcome = adapter.with_virtio(|v| match client {
-            Some(c) => Some(v.commit_nvrm_client(owner, handle, c, reserved)),
+            Some(c) => Some(v.commit_nvrm_client(owner, process, handle, c, reserved)),
             None => {
                 if reserved {
                     v.cancel_nvrm_client(owner);
@@ -204,8 +221,11 @@ pub fn after_reply(
         });
         match outcome {
             Ok(Some(Commit::Recorded)) | Ok(Some(Commit::Evicted)) => {
+                bump_generation();
                 NVRM_CLIENTS_RECORDED.fetch_add(1, Ordering::Relaxed);
             }
+            // A known client whose process changed became unknown: a change too.
+            Ok(Some(Commit::Known)) => bump_generation(),
             Ok(Some(Commit::Refused)) => {
                 NVRM_CLIENTS_FULL.fetch_add(1, Ordering::Relaxed);
             }
@@ -244,6 +264,7 @@ pub fn after_failed(
 }
 
 fn forget_client(adapter: &AdapterContext, owner: DeviceOwner, client: u32) {
+    bump_generation();
     if adapter
         .with_virtio(|v| v.forget_nvrm_client(owner, client))
         .unwrap_or(false)
@@ -254,6 +275,7 @@ fn forget_client(adapter: &AdapterContext, owner: DeviceOwner, client: u32) {
 
 /// `Close` of backend file `handle` of `owner`: the host closes the clients made through it.
 pub fn forget_via(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) {
+    bump_generation();
     let n = adapter
         .with_virtio(|v| v.forget_nvrm_clients_via(owner, handle))
         .unwrap_or(0);
@@ -264,6 +286,7 @@ pub fn forget_via(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) {
 
 /// `owner`'s device is being destroyed: every client it was given goes.
 pub fn forget_owner(adapter: &AdapterContext, owner: DeviceOwner) {
+    bump_generation();
     let n = adapter
         .with_virtio(|v| v.forget_nvrm_clients_for_owner(owner))
         .unwrap_or(0);
@@ -274,6 +297,7 @@ pub fn forget_owner(adapter: &AdapterContext, owner: DeviceOwner) {
 
 /// The transport's handles were all closed (or are being dropped): no client survives.
 pub fn forget_all(adapter: &AdapterContext) {
+    bump_generation();
     let n = adapter.with_virtio(|v| v.clear_nvrm_clients()).unwrap_or(0);
     if n != 0 {
         NVRM_CLIENTS_DROPPED.fetch_add(n, Ordering::Relaxed);

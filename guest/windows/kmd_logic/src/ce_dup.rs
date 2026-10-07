@@ -81,6 +81,8 @@ pub struct Entry {
     made: u64,
     /// Last use (eviction takes the least recent).
     used: u64,
+    /// The client-table generation the dup was made under ([`Cache::set_generation`]).
+    gen: u64,
 }
 
 /// The slots of one kind: sources first, then semaphores.
@@ -120,6 +122,11 @@ pub enum Plan {
 pub struct Cache {
     slots: [Option<Entry>; SLOTS],
     tick: u64,
+    /// The KMD's RM-client table generation (`nvrm_harden::client_generation`): bumped by every
+    /// change that records or forgets a client. An entry made under an older one is never a hit
+    /// (the number it names may have been freed and re-minted for another process, or the
+    /// process may reuse the memory handle): it is re-made, its objects given back first.
+    gen: u64,
 }
 
 impl Default for Cache {
@@ -130,7 +137,12 @@ impl Default for Cache {
 
 impl Cache {
     pub const fn new() -> Self {
-        Self { slots: [None; SLOTS], tick: 0 }
+        Self { slots: [None; SLOTS], tick: 0, gen: 0 }
+    }
+
+    /// The client table's generation now. Entries of an older one stop being hits.
+    pub fn set_generation(&mut self, gen: u64) {
+        self.gen = gen;
     }
 
     fn next_tick(&mut self) -> u64 {
@@ -147,8 +159,9 @@ impl Cache {
         let mut free = None;
         let mut oldest: Option<(usize, u64)> = None;
         for i in lo..hi {
+            let gen = self.gen;
             match &mut self.slots[i] {
-                Some(e) if e.key == *key => {
+                Some(e) if e.key == *key && e.gen == gen => {
                     e.used = now;
                     return Plan::Hit(*e);
                 }
@@ -175,7 +188,7 @@ impl Cache {
     pub fn insert(&mut self, slot: u8, key: Key, va: u64, map_flags: u32) {
         let now = self.next_tick();
         if let Some(s) = self.slots.get_mut(slot as usize) {
-            *s = Some(Entry { key, slot, va, map_flags, made: now, used: now });
+            *s = Some(Entry { key, slot, va, map_flags, made: now, used: now, gen: self.gen });
         }
     }
 
@@ -450,6 +463,34 @@ mod tests {
         assert_ne!(handles(0).0, cc::H_SCRATCH);
         assert_eq!(slot_range(What::Source), (0, 4));
         assert_eq!(slot_range(What::Semaphore), (4, 6));
+    }
+
+    /// A change of the client table (a client recorded or forgotten anywhere) ends every hit:
+    /// the stale entry is re-made in its own slot, its objects given back first, so a re-minted
+    /// client number or a reused memory handle never reaches the old dup.
+    #[test]
+    fn a_new_client_generation_ends_every_hit() {
+        let k = |m: u32, what| Key { client: 0xc1, memory: m, what, kind: None, len: 4096 };
+        let mut c = Cache::new();
+        c.set_generation(7);
+        let a = k(1, What::Source);
+        let Plan::Make { slot, evict: None } = c.plan(&a) else { panic!() };
+        c.insert(slot, a, slot_va(slot), 0);
+        assert!(matches!(c.plan(&a), Plan::Hit(_)));
+        c.set_generation(8);
+        let Plan::Make { slot: again, evict: Some(old) } = c.plan(&a) else {
+            panic!("a stale entry was a hit")
+        };
+        assert_eq!((again, old.key), (slot, a));
+        c.insert(again, a, slot_va(again), 0);
+        assert!(matches!(c.plan(&a), Plan::Hit(_)));
+        // Every role and slot alike.
+        let s = k(2, What::Semaphore);
+        let Plan::Make { slot, .. } = c.plan(&s) else { panic!() };
+        c.insert(slot, s, slot_va(slot), 0);
+        c.set_generation(9);
+        assert!(!matches!(c.plan(&s), Plan::Hit(_)));
+        assert!(!matches!(c.plan(&a), Plan::Hit(_)));
     }
 
     #[test]

@@ -1099,6 +1099,11 @@ pub mod knobs {
     /// production copy. Read at StartDevice in shadow mode only; mirrored as `CeShadowEach`.
     /// `docs/rm-copy-engine-present.md` section 14.
     pub const CE_SHADOW_EVERY: KnobName = KnobName::new(b"CeShadowEvery");
+    /// `CeRtDirect` (default 0): with `RmCopyEngine` = 1, submit a routed copy at its Present (the
+    /// GPU acquire on the record's value waits for the producer) instead of when the HPD worker
+    /// sees the producer's boundary ready. Read at StartDevice with the route on; mirrored as
+    /// `CeRtDirKnob`. `docs/rm-copy-engine-present.md` section 15.13.
+    pub const CE_RT_DIRECT: KnobName = KnobName::new(b"CeRtDirect");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
@@ -1243,6 +1248,28 @@ pub mod knobs {
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.
     pub const SUBMIT_SPACE_WAKE: KnobName = KnobName::new(b"SubSpaceWake");
+    /// `SubmitPool` (default 1 = ON). The KMD display submitters (scan-out copy, Present Blt,
+    /// `BltAsync` direct, deferred windowed Blt) take their two staged DMA buffers (SUBMIT_3D
+    /// meta, Venus stream) from the transport's bounded DMA pool, in the same lock hold as the
+    /// reap, instead of two `MmAllocateContiguousMemory` calls per submit. A miss falls back to
+    /// a fresh allocation. 0 restores allocate-per-submit exactly: the same-boot A/B. Read at
+    /// every StartDevice, mirrored as `SubPoolOn`. `docs/zero-copy-present.md` 24.14.
+    pub const SUBMIT_POOL: KnobName = KnobName::new(b"SubmitPool");
+    /// `SubStageClk` (default 1 = ON). The stage clock of the display submitters and of the
+    /// pipelined foreign flip (`Sub*`, `SubW*`, `SubF*`): 0 reads no interrupt time on any submit
+    /// path (four of the reads sit inside the `virtio_lock` hold) and leaves only the counts, the
+    /// A/B that tells the clock's own cost from what it measures. Read at every StartDevice,
+    /// mirrored as `SubClkOn`. `docs/zero-copy-present.md` 24.14.
+    pub const SUBMIT_STAGE_CLOCK: KnobName = KnobName::new(b"SubStageClk");
+    /// `SubKickUnlock` (default 1 = ON). The display submitters and the pipelined foreign flip
+    /// ring the control queue's doorbell AFTER releasing `virtio_lock` (one MMIO write to the
+    /// notify register located at transport init) instead of inside it (`PciTransport::notify`:
+    /// three MMIO accesses, each a VM exit, under the lock every other submitter spins on). 0 =
+    /// the previous behaviour exactly. Read at every transport init (StartDevice), mirrored as
+    /// `SubKickUnl` (1 only when the doorbell was located). The requested name
+    /// `SubKickUnlocked` is 15 bytes and would not fit the lookup buffer.
+    /// `docs/zero-copy-present.md` 24.14.10.
+    pub const SUBMIT_KICK_UNLOCK: KnobName = KnobName::new(b"SubKickUnlock");
     /// `WddmHoldMs` (default 0 = OFF, and OFF is the only shipping value).
     ///
     /// # THE KNOB IS THE EXPERIMENT (UV1, `docs/dx12/KMD_IMPACT.md` §14a.1)
