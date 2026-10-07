@@ -584,6 +584,10 @@ pub struct SyncWaitBlock {
 /// completion, and therefore the only one on which a [`ScanoutNotify`] may be
 /// honoured. Ring 0 retires at host DECODE, which is too early to publish pixels.
 pub(crate) const SCANOUT_RING_IDX: u32 = 1;
+// The main queue's ring in `helios_kmd_logic::copy_queue` is this ring, and the transfer queue's
+// (`CopyQueue`) is a different one.
+const _: () = assert!(SCANOUT_RING_IDX == helios_kmd_logic::copy_queue::MAIN_RING_IDX);
+const _: () = assert!(SCANOUT_RING_IDX != helios_kmd_logic::copy_queue::COPY_RING_IDX);
 
 #[derive(Clone, Copy)]
 pub struct ScanoutNotify {
@@ -4482,6 +4486,7 @@ impl VirtioGpu {
         venus_len: usize,
         token: u64,
         stream_boundary: u64,
+        ring_idx: u32,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
         let known = self.windowed_blt.pending.iter().any(|request| {
             request.token == token
@@ -4492,9 +4497,11 @@ impl VirtioGpu {
         if !known {
             return Err((meta, venus, VirtioError::DeviceError));
         }
+        // `ring_idx`: the ring of the copy's queue (1, or the `CopyQueue` transfer ring); the
+        // retire below is matched by token, not by ring.
         self.enqueue_submit_inner(
             ctx_id,
-            SCANOUT_RING_IDX,
+            ring_idx,
             meta,
             venus,
             venus_len,

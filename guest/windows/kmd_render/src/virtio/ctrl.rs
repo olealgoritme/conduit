@@ -2533,6 +2533,11 @@ pub fn submit_venus_async_scanout(
 
 /// Nonblocking KMD Present-BLT submission.
 ///
+/// `ring_idx` is the ring of the queue the copy's command buffer is submitted to: 1 (family 0,
+/// every copy before `CopyQueue`) or `copy_queue::COPY_RING_IDX` (the transfer queue). The
+/// host's wire fence for a ring is an empty submit on that ring's queue, so only the copy's own
+/// ring orders the fence after it; retirement is per command, so nothing else changes.
+///
 /// Like the scanout copy path, ring_idx=1 makes used-ring retirement represent
 /// GPU completion. Unlike scanout, an ordinary app/DWM BLT must not mark the
 /// physical scanout dirty or wake the display refresh worker. Every tagged
@@ -2545,7 +2550,11 @@ pub fn submit_venus_async_present(
     ctx_id: u32,
     stream: &[u8],
     present_buffer_write: Option<u32>,
+    ring_idx: u32,
 ) -> Result<u64, VirtioError> {
+    if ring_idx == 0 {
+        return Err(VirtioError::DeviceError);
+    }
     let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
 
     // Ring 1 WITHOUT a notify, which is the whole difference from the scanout
@@ -2557,19 +2566,13 @@ pub fn submit_venus_async_present(
         match present_buffer_write {
             Some(resource_id) => v.enqueue_async_submit_present_buffer(
                 ctx_id,
-                crate::virtio::gpu::SCANOUT_RING_IDX,
+                ring_idx,
                 meta,
                 venus,
                 venus_len,
                 resource_id,
             ),
-            None => v.enqueue_async_submit(
-                ctx_id,
-                crate::virtio::gpu::SCANOUT_RING_IDX,
-                meta,
-                venus,
-                venus_len,
-            ),
+            None => v.enqueue_async_submit(ctx_id, ring_idx, meta, venus, venus_len),
         }
     }))
 }
@@ -2598,11 +2601,24 @@ pub fn submit_venus_async_blt(
     stream: &[u8],
     resource_id: u32,
     source_id: u32,
+    ring_idx: u32,
 ) -> Result<BltSubmit, VirtioError> {
+    if ring_idx == 0 {
+        return Err(VirtioError::DeviceError);
+    }
     let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
     let queued = adapter.with_virtio(move |v| {
         v.drain_used();
-        v.enqueue_async_submit_blt(adapter, ctx_id, meta, venus, venus_len, resource_id, source_id)
+        v.enqueue_async_submit_blt(
+            adapter,
+            ctx_id,
+            meta,
+            venus,
+            venus_len,
+            resource_id,
+            source_id,
+            ring_idx,
+        )
     });
     match queued {
         Ok(Ok(crate::virtio::gpu::BltEnq::Fence(fence_id))) => Ok(BltSubmit::Fence(fence_id)),
@@ -2682,7 +2698,11 @@ pub fn submit_venus_async_windowed_blt(
     stream: &[u8],
     token: u64,
     stream_boundary: u64,
+    ring_idx: u32,
 ) -> Result<u64, VirtioError> {
+    if ring_idx == 0 {
+        return Err(VirtioError::DeviceError);
+    }
     let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
     display_submit_outcome(adapter.with_virtio(move |v| {
         v.drain_used();
@@ -2694,6 +2714,7 @@ pub fn submit_venus_async_windowed_blt(
             venus_len,
             token,
             stream_boundary,
+            ring_idx,
         )
     }))
 }
