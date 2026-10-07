@@ -70,15 +70,21 @@ pub enum Knob {
     Main,
     /// 1: a transfer-only queue when the device has a transfer-only family.
     Transfer,
+    /// 2: as 1, and the family-0 queue (which runs every copy a transfer queue cannot: format
+    /// conversions, image destinations, scan-out copies) is created with
+    /// `VK_QUEUE_GLOBAL_PRIORITY_HIGH` (`VK_KHR_global_priority`). A converting copy needs
+    /// `vkCmdBlitImage`, so it cannot leave the graphics engine; what it can do is wait less
+    /// behind the game's channel there (`docs/zero-copy-present.md` 24.13.8).
+    TransferPriority,
 }
 
 impl Knob {
-    /// 1 is the transfer queue; every other value is the default.
+    /// 1 and 2 as above; every other value is the default.
     pub const fn from_raw(raw: u32) -> Self {
-        if raw == 1 {
-            Self::Transfer
-        } else {
-            Self::Main
+        match raw {
+            1 => Self::Transfer,
+            2 => Self::TransferPriority,
+            _ => Self::Main,
         }
     }
 
@@ -86,9 +92,29 @@ impl Knob {
         match self {
             Self::Main => 0,
             Self::Transfer => 1,
+            Self::TransferPriority => 2,
         }
     }
+
+    /// The transfer queue is wanted (1 and 2).
+    pub const fn transfer(self) -> bool {
+        !matches!(self, Self::Main)
+    }
+
+    /// The family-0 queue is wanted at high global priority (2).
+    pub const fn priority(self) -> bool {
+        matches!(self, Self::TransferPriority)
+    }
 }
+
+/// `VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR` (same value as the EXT name).
+pub const ST_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO: i32 = 1_000_174_000;
+/// `VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR`. Not `REALTIME`: that needs host privileges the sandboxed
+/// renderer does not have (`VK_ERROR_NOT_PERMITTED`), and the device ladder would only fall back.
+pub const GLOBAL_PRIORITY_HIGH: u32 = 512;
+/// The device extension the priority struct needs (Venus extension 189; the host renderer
+/// allows it, `vkr_common.c`).
+pub const EXT_GLOBAL_PRIORITY: &[u8] = b"VK_KHR_global_priority\0";
 
 /// One `VkQueueFamilyProperties`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,38 +205,49 @@ impl Device {
 }
 
 /// One `vkCreateDevice` attempt: the extension tier of the existing ladder (0 export trio plus
-/// modifier, 1 export trio, 2 none) and whether the transfer queue is asked for.
+/// modifier, 1 export trio, 2 none), whether the transfer queue is asked for, and whether the
+/// family-0 queue is asked for at high global priority (with `EXT_GLOBAL_PRIORITY`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attempt {
     pub tier: u32,
     pub transfer: bool,
+    pub priority: bool,
 }
 
 /// The last tier of the extension ladder.
 pub const LAST_TIER: u32 = 2;
 
-/// The first attempt: the ladder's start tier, with the transfer queue when one was chosen.
-pub const fn first_attempt(start_tier: u32, transfer: bool) -> Attempt {
+/// The first attempt: the ladder's start tier, with the transfer queue when one was chosen and
+/// the priority when the knob asks for it.
+pub const fn first_attempt(start_tier: u32, transfer: bool, priority: bool) -> Attempt {
     Attempt {
         tier: start_tier,
         transfer,
+        priority,
     }
 }
 
-/// The attempt after a refused one. With the transfer queue the whole ladder is walked first;
-/// when even its last tier is refused, the ladder starts again from `start_tier` WITHOUT it,
-/// which is exactly the sequence of devices a `CopyQueue` 0 boot tries. `None`: bring-up fails,
-/// as it did before.
+/// The attempt after a refused one. The whole extension ladder is walked with what was asked
+/// for; when even its last tier is refused, it starts again from `start_tier` without the
+/// priority, then without the transfer queue too: the last walk is exactly the sequence of
+/// devices a `CopyQueue` 0 boot tries. `None`: bring-up fails, as it did before.
 pub const fn next_attempt(refused: Attempt, start_tier: u32) -> Option<Attempt> {
     if refused.tier < LAST_TIER {
         Some(Attempt {
             tier: refused.tier + 1,
+            ..refused
+        })
+    } else if refused.priority {
+        Some(Attempt {
+            tier: start_tier,
             transfer: refused.transfer,
+            priority: false,
         })
     } else if refused.transfer {
         Some(Attempt {
             tier: start_tier,
             transfer: false,
+            priority: false,
         })
     } else {
         None
@@ -315,7 +352,7 @@ pub struct CopyShape {
 /// get it, why. Decided once per cache record (the record's command buffer is allocated from a
 /// pool of that family and is only ever submitted to that family's queue).
 pub fn route(knob: Knob, device: Device, copy: CopyShape) -> (Route, Option<Why>) {
-    if knob == Knob::Main {
+    if !knob.transfer() {
         return (Route::Main, None);
     }
     let why = if !device.copy_ready() {
@@ -407,6 +444,9 @@ pub const COUNTERS: &[&str] = &[
     "CqGran",
     "CqReady",
     "CqDevFall",
+    // `CopyQueue` 2: the family-0 queue has high global priority / the device refused it.
+    "CqPrio",
+    "CqPrioFall",
     // Per copy: submissions on each family, copies the knob wanted on the transfer queue that ran
     // on family 0, the last and every reason, queue-switch waits and those that timed out.
     "CqMain",
@@ -495,13 +535,20 @@ mod tests {
     fn knob_values() {
         assert_eq!(Knob::from_raw(0), Knob::Main);
         assert_eq!(Knob::from_raw(1), Knob::Transfer);
-        assert_eq!(Knob::from_raw(2), Knob::Main);
+        assert_eq!(Knob::from_raw(2), Knob::TransferPriority);
+        assert_eq!(Knob::from_raw(3), Knob::Main);
         assert_eq!(Knob::from_raw(u32::MAX), Knob::Main);
-        assert_eq!(Knob::Transfer.raw(), 1);
+        for k in [Knob::Main, Knob::Transfer, Knob::TransferPriority] {
+            assert_eq!(Knob::from_raw(k.raw()), k);
+        }
+        assert!(!Knob::Main.transfer() && !Knob::Main.priority());
+        assert!(Knob::Transfer.transfer() && !Knob::Transfer.priority());
+        assert!(Knob::TransferPriority.transfer() && Knob::TransferPriority.priority());
+        assert_eq!(EXT_GLOBAL_PRIORITY.last(), Some(&0));
     }
 
-    fn walk(start: u32, transfer: bool) -> Vec<Attempt> {
-        let mut out = std::vec![first_attempt(start, transfer)];
+    fn walk(start: u32, transfer: bool, priority: bool) -> Vec<Attempt> {
+        let mut out = std::vec![first_attempt(start, transfer, priority)];
         while let Some(n) = next_attempt(*out.last().unwrap(), start) {
             out.push(n);
             assert!(out.len() < 16);
@@ -512,17 +559,17 @@ mod tests {
     #[test]
     fn the_ladder_without_the_queue_is_the_old_one() {
         for start in 0..=LAST_TIER {
-            let a = walk(start, false);
+            let a = walk(start, false, false);
             let tiers: Vec<u32> = a.iter().map(|a| a.tier).collect();
             let want: Vec<u32> = (start..=LAST_TIER).collect();
             assert_eq!(tiers, want);
-            assert!(a.iter().all(|a| !a.transfer));
+            assert!(a.iter().all(|a| !a.transfer && !a.priority));
         }
     }
 
     #[test]
     fn the_ladder_with_the_queue_falls_back_to_the_old_one() {
-        let a = walk(0, true);
+        let a = walk(0, true, false);
         let want = [
             (0, true),
             (1, true),
@@ -533,9 +580,36 @@ mod tests {
         ];
         let got: Vec<(u32, bool)> = a.iter().map(|a| (a.tier, a.transfer)).collect();
         assert_eq!(got, want);
-        let a = walk(1, true);
+        let a = walk(1, true, false);
         let got: Vec<(u32, bool)> = a.iter().map(|a| (a.tier, a.transfer)).collect();
         assert_eq!(got, [(1, true), (2, true), (1, false), (2, false)]);
+        assert!(a.iter().all(|a| !a.priority));
+    }
+
+    #[test]
+    fn the_priority_goes_first_then_the_queue_then_the_old_ladder() {
+        let triple = |a: &Attempt| (a.tier, a.transfer, a.priority);
+        let got: Vec<(u32, bool, bool)> = walk(1, true, true).iter().map(triple).collect();
+        let want = [
+            (1, true, true),
+            (2, true, true),
+            (1, true, false),
+            (2, true, false),
+            (1, false, false),
+            (2, false, false),
+        ];
+        assert_eq!(got, want);
+        // Priority without a transfer family: the priority walk, then the old one.
+        let got: Vec<(u32, bool, bool)> = walk(0, false, true).iter().map(triple).collect();
+        let want = [
+            (0, false, true),
+            (1, false, true),
+            (2, false, true),
+            (0, false, false),
+            (1, false, false),
+            (2, false, false),
+        ];
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -603,6 +677,19 @@ mod tests {
             route(Knob::Transfer, READY, plain()),
             (Route::Transfer, None)
         );
+        // The priority changes the device, not the routes.
+        let blit = CopyShape {
+            blit: true,
+            ..plain()
+        };
+        for c in [plain(), blit] {
+            for device in [READY, Device::MAIN_ONLY] {
+                assert_eq!(
+                    route(Knob::TransferPriority, device, c),
+                    route(Knob::Transfer, device, c)
+                );
+            }
+        }
     }
 
     #[test]

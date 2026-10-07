@@ -413,15 +413,15 @@ impl VenusInstance {
         // ── 6b. `CopyQueue` 1 only: the transfer-only family, from the host's list ──
         // With the knob 0 (the default) nothing is asked and the device below is the one it was.
         let knob = crate::ddi::copy_queue::knob();
-        let (families, choice) = if knob == helios_kmd_logic::copy_queue::Knob::Transfer {
+        let (families, choice) = if knob.transfer() {
             self.query_transfer_family(adapter)
         } else {
             (0, None)
         };
 
         // ── 7. vkCreateDevice — family 0 (priority 1.0), plus the transfer family ──
-        let (device_id, modifier_import_device, transfer_granted) =
-            self.create_device_with_ext_ladder(adapter, choice)?;
+        let (device_id, modifier_import_device, transfer_granted, priority_granted) =
+            self.create_device_with_ext_ladder(adapter, choice, knob.priority())?;
         diag(0x0009);
 
         let queue_id = self.get_device_queue(
@@ -457,6 +457,8 @@ impl VenusInstance {
             choice,
             copy_queue.is_some(),
             choice.is_some() && !transfer_granted,
+            priority_granted,
+            knob.priority() && !priority_granted,
         );
 
         Ok(VenusClient {
@@ -570,12 +572,18 @@ impl VenusInstance {
     /// of that family, and when even the last tier is refused the ladder runs again from its
     /// start WITHOUT it, i.e. exactly the devices a `CopyQueue` 0 boot tries
     /// (`copy_queue::next_attempt`). The third value says whether the device has the queue.
+    ///
+    /// `CopyQueue` 2 (`priority`): every attempt also enables `VK_KHR_global_priority` and gives
+    /// the family-0 queue `VkDeviceQueueGlobalPriorityCreateInfoKHR { HIGH }`; refused at every
+    /// tier, the walk repeats without it before it drops the transfer queue. The fourth value
+    /// says whether the device has the priority.
     #[inline(never)]
     pub(super) fn create_device_with_ext_ladder(
         &mut self,
         adapter: &AdapterContext,
         transfer: Option<helios_kmd_logic::copy_queue::Choice>,
-    ) -> Result<(VkDeviceId, bool, bool), VirtioError> {
+        priority: bool,
+    ) -> Result<(VkDeviceId, bool, bool, bool), VirtioError> {
         const EXT_EXPORT: [&[u8]; 3] = [
             b"VK_KHR_external_memory\0",
             b"VK_KHR_external_memory_fd\0",
@@ -632,7 +640,7 @@ impl VenusInstance {
         let start_tier: u32 =
             helios_kmd_logic::foreign_copy::ladder_start_tier(want_scanout_exts, want_modifier);
         let mut attempt =
-            helios_kmd_logic::copy_queue::first_attempt(start_tier, transfer.is_some());
+            helios_kmd_logic::copy_queue::first_attempt(start_tier, transfer.is_some(), priority);
         loop {
             let ext_tier = attempt.tier;
             let transfer_family = match (attempt.transfer, transfer) {
@@ -643,6 +651,17 @@ impl VenusInstance {
                 0 => &EXT_EXPORT_MODIFIER,
                 1 => &EXT_EXPORT,
                 _ => &[],
+            };
+            // `CopyQueue` 2: the tier's extensions plus `VK_KHR_global_priority` (the largest
+            // set, tier 0 with two queue infos and the priority struct, is about 390 bytes of
+            // the writer's 512).
+            let prio_ext = helios_kmd_logic::copy_queue::EXT_GLOBAL_PRIORITY;
+            let mut with_prio: [&[u8]; 5] = [prio_ext; 5];
+            let exts: &[&[u8]] = if attempt.priority {
+                with_prio[..exts.len()].copy_from_slice(exts);
+                &with_prio[..exts.len() + 1]
+            } else {
+                exts
             };
             // A FRESH handle per attempt. Reusing one across tiers would make a
             // retry collide with the host's record of the failed device.
@@ -660,7 +679,15 @@ impl VenusInstance {
             w.u64(u64::from(queue_infos)); // array_size for pQueueCreateInfos
                                            // VkDeviceQueueCreateInfo[0]:
             w.i32(ST_DEVICE_QUEUE_CREATE_INFO); // sType
-            w.u64(0); // pNext NULL
+            if attempt.priority {
+                // pNext: VkDeviceQueueGlobalPriorityCreateInfoKHR { HIGH }, nothing after it.
+                w.count(true);
+                w.i32(helios_kmd_logic::copy_queue::ST_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO);
+                w.u64(0); // its pNext NULL
+                w.u32(helios_kmd_logic::copy_queue::GLOBAL_PRIORITY_HIGH);
+            } else {
+                w.u64(0); // pNext NULL
+            }
             w.u32(0); // flags
             w.u32(0); // queueFamilyIndex
             w.u32(1); // queueCount
@@ -713,7 +740,12 @@ impl VenusInstance {
                 crate::diag::record_named_bytes(b"SdgDevX", ext_tier);
                 // 1 = the foreign copy path exists on this device.
                 crate::diag::record_named_bytes(b"FcDevX", (ext_tier == 0) as u32);
-                return Ok((device_id, ext_tier == 0, transfer_family.is_some()));
+                return Ok((
+                    device_id,
+                    ext_tier == 0,
+                    transfer_family.is_some(),
+                    attempt.priority,
+                ));
             }
             // Record the VkResult that knocked this tier down before stepping.
             crate::diag::record_named_bytes(b"SdgDevR", result as u32);

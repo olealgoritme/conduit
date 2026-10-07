@@ -12,7 +12,9 @@
 //! the host reported; 0 when the knob was 0 and nothing was asked), `CqFam` (the transfer family
 //! chosen, `0xFFFFFFFF` none), `CqGran` (its `minImageTransferGranularity`, one byte per axis),
 //! `CqReady` (1: the device has the transfer queue and its ring), `CqDevFall` (1: `vkCreateDevice`
-//! refused the two-queue device and the old one-queue device was made). Per copy, atomics written
+//! refused the two-queue device and the old one-queue device was made), `CqPrio` (1: the family-0
+//! queue was created at high global priority, `CopyQueue` 2), `CqPrioFall` (1: 2 was asked and
+//! the device refused the priority at every tier). Per copy, atomics written
 //! to the registry by [`publish_counters`] from `publish_nvrm_counters` once the knob is on:
 //! `CqMain` / `CqXfer` (Present copies submitted on family 0 / on the transfer family), `CqFall`
 //! (of `CqMain`, copies the knob wanted on the transfer queue), `CqWhy` / `CqMask` (last reason /
@@ -67,10 +69,19 @@ pub(crate) fn reset_for_start() {
     rec(b"CqGran", 0);
     rec(b"CqReady", 0);
     rec(b"CqDevFall", 0);
+    rec(b"CqPrio", 0);
+    rec(b"CqPrioFall", 0);
 }
 
 /// What the Venus bring-up found and made. PASSIVE (StartDevice).
-pub(crate) fn note_bringup(families: u32, choice: Option<Choice>, ready: bool, dev_fall: bool) {
+pub(crate) fn note_bringup(
+    families: u32,
+    choice: Option<Choice>,
+    ready: bool,
+    dev_fall: bool,
+    priority: bool,
+    priority_fall: bool,
+) {
     use crate::diag::record_named_bytes as rec;
     rec(b"CqFamN", families);
     rec(b"CqFam", choice.map_or(cq::NO_FAMILY, |c| c.index));
@@ -80,6 +91,8 @@ pub(crate) fn note_bringup(families: u32, choice: Option<Choice>, ready: bool, d
     );
     rec(b"CqReady", ready as u32);
     rec(b"CqDevFall", dev_fall as u32);
+    rec(b"CqPrio", priority as u32);
+    rec(b"CqPrioFall", priority_fall as u32);
 }
 
 /// One Present copy submitted on `route`; `why` is set when the knob wanted the transfer queue
@@ -107,7 +120,7 @@ pub(crate) fn note_switch(timed_out: bool) {
 /// Mirror the per-copy counters to the service key. PASSIVE only. Nothing with the knob at 0 (the
 /// bring-up block, `CqKnob` included, is written at StartDevice either way).
 pub(crate) fn publish_counters() {
-    if KNOB.load(Ordering::Relaxed) != Knob::Transfer.raw() {
+    if !Knob::from_raw(KNOB.load(Ordering::Relaxed)).transfer() {
         return;
     }
     let events = MAIN.load(Ordering::Relaxed) | XFER.load(Ordering::Relaxed);

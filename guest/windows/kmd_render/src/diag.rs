@@ -1086,8 +1086,9 @@ pub mod knobs {
     /// device also gets a queue on a transfer-only family (chosen from the queue family
     /// properties, bound to ring 2), and the windowed Present copies a transfer queue can run (a
     /// plain image-to-buffer copy into a standard buffer or its guest blob, foreign sources
-    /// included) go there instead of waiting for graphics-engine timeslices. Read at every
-    /// StartDevice (device creation); mirrored as `CqKnob`. `docs/zero-copy-present.md` 24.13.
+    /// included) go there instead of waiting for graphics-engine timeslices. 2: as 1, and the
+    /// family-0 queue (format conversions, image destinations) at high global priority. Read at
+    /// every StartDevice (device creation); mirrored as `CqKnob`. `docs/zero-copy-present.md` 24.13.
     pub const COPY_QUEUE: KnobName = KnobName::new(b"CopyQueue");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
