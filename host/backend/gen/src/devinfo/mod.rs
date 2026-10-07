@@ -349,7 +349,7 @@ mod tests {
     fn encoding_never_writes_past_the_callers_buffer() {
         let d = DevInfo::from_wire([1, 2, 3, 4, 5, 6, 7, 8, 9]);
         // A canary-bordered buffer the size of the 565 struct.
-        let mut buf = vec![0xAAu8; 32 + 8];
+        let mut buf = [0xAAu8; 32 + 8];
         v565_77_00::LAYOUT.encode(&d, &mut buf[..32]);
         assert!(buf[32..].iter().all(|&b| b == 0xAA), "wrote past 32 bytes");
         // And what it wrote reads back.
@@ -360,7 +360,7 @@ mod tests {
 
         // The newest layout into a buffer too small for its last words: those
         // are dropped whole.
-        let mut small = vec![0xAAu8; 30];
+        let mut small = [0xAAu8; 30];
         v580_178_04::LAYOUT.encode(&d, &mut small);
         assert_eq!(small.len(), 30);
         assert_eq!(&small[24..28], &7u32.to_le_bytes());

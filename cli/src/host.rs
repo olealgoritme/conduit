@@ -79,7 +79,7 @@ pub fn supported_drivers() -> (Vec<String>, &'static str) {
 
 /// The table directories the backend's exact-table check reads
 /// (`NvidiaBackend::inexact_tables`); a release needs its own file in each.
-pub const EXACT_TABLES: &[&str] = &["rmctrl", "rmallow", "uvm", "vidmem"];
+pub const EXACT_TABLES: &[&str] = &["rmctrl", "rmallow", "uvm", "vidmem", "devinfo"];
 
 /// Releases with a table of their own in every one of [`EXACT_TABLES`]
 /// under `gen_src` (host/backend/gen/src), ascending.
