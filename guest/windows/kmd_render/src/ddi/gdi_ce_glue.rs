@@ -14,6 +14,32 @@ use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 use crate::virtio::rm_client::{ce_channel, ce_route, ce_vram, vidmem};
 
+/// The copy-engine channel's state for GDI acceleration: 0 up, 1 cold (a bring-up may be asked
+/// for), 2 disabled for the generation, 3 broken (waiting for its teardown), 4 another phase
+/// (coming up, cooling down). Spinlock only.
+pub(crate) fn channel_state() -> u32 {
+    let v = ce_route::chan_view();
+    if v.up {
+        0
+    } else if v.may_bring_up {
+        1
+    } else if v.disabled {
+        2
+    } else if v.broken {
+        3
+    } else {
+        4
+    }
+}
+
+/// Bring the channel up (`ce_route::bring_up`: the route's own bring-up, bounded by the channel's
+/// 6 s budget, never waiting for its I/O). HPD worker only. Until now only a routed Present asked
+/// for it, so a desktop with no windowed NVK Present left the channel cold and every GDI
+/// operation on a VRAM surface failed (358.1). Whether it is up afterwards.
+pub(crate) fn bring_up(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
+    ce_route::bring_up(passive, adapter)
+}
+
 /// How often a call that found the channel's I/O held by another thread tries again (1 ms apart).
 const BUSY_TRIES: u32 = 4;
 

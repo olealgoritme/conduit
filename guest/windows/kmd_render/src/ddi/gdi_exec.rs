@@ -53,6 +53,11 @@ static RECTS: AtomicU32 = AtomicU32::new(0);
 static CLS: AtomicU32 = AtomicU32::new(0);
 static DST_RES: AtomicU32 = AtomicU32::new(0);
 static DST_WH: AtomicU32 = AtomicU32::new(0);
+/// Channel bring-ups the executor asked for, and why the last copy-engine attempt failed (1
+/// channel not up, 2 the destination's mapping, 3 the source's mapping, 4 the submission, 5 the
+/// wait; 16 + `channel_state` when the channel could not be brought up).
+static CH_UP: AtomicU32 = AtomicU32::new(0);
+static CE_WHY: AtomicU32 = AtomicU32::new(0);
 
 /// The timeline's completed watermark, for [`seq_ready`].
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -98,7 +103,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 pub(crate) fn reset_for_start(_on: bool) {
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -129,6 +134,31 @@ pub(crate) fn publish_counters() {
     w(b"GdiCls", CLS.load(Ordering::Relaxed));
     w(b"GdiDstRes", DST_RES.load(Ordering::Relaxed));
     w(b"GdiDstWH", DST_WH.load(Ordering::Relaxed));
+    w(b"GdiChUp", CH_UP.load(Ordering::Relaxed));
+    w(b"GdiCeWhy", CE_WHY.load(Ordering::Relaxed));
+}
+
+/// The channel up for a job that needs it (a VRAM surface on either side): bring it up when it is
+/// cold. HPD worker only.
+fn ensure_channel(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
+    match glue::channel_state() {
+        0 => true,
+        1 => {
+            CH_UP.fetch_add(1, Ordering::Relaxed);
+            glue::bring_up(passive, adapter) || {
+                CE_WHY.store(16 + glue::channel_state(), Ordering::Relaxed);
+                false
+            }
+        }
+        s => {
+            CE_WHY.store(16 + s, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn needs_channel(op: &Op) -> bool {
+    [op.dst, op.srcs[0], op.srcs[1]].iter().flatten().any(|s| s.class == SurfaceClass::Vram)
 }
 
 fn class_bit(c: SurfaceClass) -> u32 {
@@ -278,8 +308,11 @@ fn now_100ns() -> u64 {
     crate::ddi::blt_async::now_100ns()
 }
 
-/// Jobs executed per worker pass before it yields (and re-signals itself).
+/// Jobs executed per worker pass before it yields (and re-signals itself), and the time after
+/// which a pass yields early: the worker also serves flips and Present copies, so one GDI burst
+/// must not hold it for long (one job is still atomic).
 const JOBS_PER_PASS: usize = 32;
+const PASS_BUDGET_100NS: u64 = 20_000;
 
 /// The HPD worker (PASSIVE): execute admitted jobs in sequence order. With the knob off, or
 /// nothing admitted: one relaxed load.
@@ -288,6 +321,8 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         return;
     }
     let mut ran = 0usize;
+    let pass_t0 = now_100ns();
+    let mut channel: Option<bool> = None;
     loop {
         // Take the next sequence's commands out, leaving its entry (a replay still waits on it).
         let taken = {
@@ -317,6 +352,9 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         };
         let t0 = now_100ns();
         for op in &ops {
+            if channel.is_none() && needs_channel(op) {
+                channel = Some(ensure_channel(passive, adapter));
+            }
             execute(passive, adapter, op);
         }
         let us = (now_100ns().wrapping_sub(t0) / 10).min(u64::from(u32::MAX)) as u32;
@@ -333,7 +371,7 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         DONE.fetch_add(1, Ordering::Relaxed);
         crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
         ran += 1;
-        if ran >= JOBS_PER_PASS {
+        if ran >= JOBS_PER_PASS || now_100ns().wrapping_sub(pass_t0) >= PASS_BUDGET_100NS {
             adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::OTHER);
             break;
         }
@@ -383,7 +421,12 @@ fn run_ce(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
     let Some(dst) = op.dst else {
         return false;
     };
+    if glue::channel_state() != 0 {
+        CE_WHY.store(1, Ordering::Relaxed);
+        return false;
+    }
     let Some(dv) = glue::ce_surface(passive, adapter, dst.resource_id) else {
+        CE_WHY.store(2, Ordering::Relaxed);
         return false;
     };
     let mut last = None;
@@ -398,7 +441,10 @@ fn run_ce(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
                     }
                     cp::release(p, done)
                 });
-                let Some(v) = v else { return false };
+                let Some(v) = v else {
+                    CE_WHY.store(4, Ordering::Relaxed);
+                    return false;
+                };
                 CE_SUB.fetch_add(1, Ordering::Relaxed);
                 last = Some(v);
             }
@@ -408,6 +454,7 @@ fn run_ce(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
                 return false;
             };
             let Some(sv) = glue::ce_surface(passive, adapter, src.resource_id) else {
+                CE_WHY.store(3, Ordering::Relaxed);
                 return false;
             };
             let per = ga::rects_per_push(glue::SLOT_DWORDS, 0, ga::COPY_RECT_DWORDS).max(1);
@@ -419,7 +466,10 @@ fn run_ce(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
                     }
                     cp::release(p, done)
                 });
-                let Some(v) = v else { return false };
+                let Some(v) = v else {
+                    CE_WHY.store(4, Ordering::Relaxed);
+                    return false;
+                };
                 CE_SUB.fetch_add(1, Ordering::Relaxed);
                 last = Some(v);
             }
@@ -432,6 +482,7 @@ fn run_ce(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
             if glue::wait(passive, v, ga::CE_DEADLINE_MS) {
                 true
             } else {
+                CE_WHY.store(5, Ordering::Relaxed);
                 // The copies may still land; the CPU redo writes the same pixels.
                 false
             }

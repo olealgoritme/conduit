@@ -1427,6 +1427,11 @@ pub const COUNTERS: &[&str] = &[
     "GdiCtxClm",
     "GdiPrvSz",
     "GdiPrvUmd",
+    // Copy-engine channel bring-ups the executor asked for; why the last copy-engine attempt
+    // failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + the channel
+    // state when it could not be brought up: 17 cold, 18 disabled, 19 broken, 20 other).
+    "GdiChUp",
+    "GdiCeWhy",
 ];
 
 #[cfg(test)]

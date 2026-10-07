@@ -620,6 +620,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiDstRes`, `GdiDstWH` | last destination's resource id and `w << 16 \| h` |
 | `GdiRkIn`, `GdiRgIn` | entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing |
 | `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, jobs claimed by context because the record was missing, the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
+| `GdiChUp`, `GdiCeWhy` | channel bring-ups the executor asked for; why the last CE attempt failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + channel state when it could not come up: 17 cold, 18 disabled, 19 broken, 20 other) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
@@ -643,6 +644,17 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   operations on it are dropped). Since 358.1 a submission on a GDI context reads the record at the KMD's
   half and at 0, and without one claims the context's oldest unclaimed job; `GdiSubN`/`GdiPrvOk`/
   `GdiCtxClm`/`GdiPrvSz` say which path admitted it.
+* **G1 on hardware (358.1):** admission works only through the by-context claim (`GdiPrvOk` 0,
+  `GdiCtxClm` 116, `GdiPrvSz` 112/0: the submission's private data carries no record, size 0), the
+  executor ran every job (`GdiJobN` = `GdiDone` 116), DWM imported the VRAM textures (`FgRiOk` 175), but
+  272 of 274 commands were dropped with `GdiWhy` 12 (CPU failed) after `GdiMask` 0x1144 (bits 2 blend,
+  6 standard-buffer surface, 8 CE failed, 12 CPU failed) and `GdiCeSub` 0. Cause: the copy-engine
+  channel was never brought up. Only a routed windowed Present asked for it, so `ce_vram::ce_surface`
+  and `ce_vram::transfer` answered "no channel" for every VRAM surface, on the CE and on the CPU path
+  alike. Since 359.1 the executor brings the channel up itself (`ce_route::bring_up`) for a job with a
+  VRAM surface (`GdiChUp`), names a failed CE attempt in `GdiCeWhy`, and yields the worker after 2 ms
+  of GDI work per pass (`GdiUsMax` 12 ms was one pass of many jobs; a single large CPU operation is
+  still one unit). GDI acceleration with `RedirVram` therefore needs `RmCopyEngine=1`.
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.
