@@ -1124,6 +1124,13 @@ pub mod knobs {
     /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
     /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
+    /// `DXGK_VIDMMCAPS` extra bits (default 0 = the driver's own word). A raw mask OR'd into
+    /// `MemoryManagementCaps`; only bit 9 `NonCpuVisiblePrimary` (0x200) is accepted
+    /// (`helios_kmd_logic::vidmm_caps`), the rest is dropped and reported in `VmCapsXMsk`. The
+    /// GPU-memory redirection experiment, stage V1 (`docs/vram-redirection.md` 5.2). Read with
+    /// the other `AdapterKnobs` at AddAdapter and StartDevice; mirrored as `VmCapsXEff` and
+    /// `VmCapsRep` at every start.
+    pub const VIDMM_CAPS_EXTRA: KnobName = KnobName::new(b"VidMmCapsX");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,
