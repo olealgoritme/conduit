@@ -209,6 +209,9 @@ impl Venus {
                 link.disable();
             }
         }
+        if self.cursor == Some(id) {
+            self.hide_cursor(env.display);
+        }
         // A release still owed for it names an id the guest may reuse.
         if let Some(link) = env.display {
             link.forget_resource(id);
