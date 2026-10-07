@@ -1238,6 +1238,15 @@ pub mod knobs {
     /// A/B that tells the clock's own cost from what it measures. Read at every StartDevice,
     /// mirrored as `SubClkOn`. `docs/zero-copy-present.md` 24.14.
     pub const SUBMIT_STAGE_CLOCK: KnobName = KnobName::new(b"SubStageClk");
+    /// `SubKickUnlock` (default 1 = ON). The display submitters and the pipelined foreign flip
+    /// ring the control queue's doorbell AFTER releasing `virtio_lock` (one MMIO write to the
+    /// notify register located at transport init) instead of inside it (`PciTransport::notify`:
+    /// three MMIO accesses, each a VM exit, under the lock every other submitter spins on). 0 =
+    /// the previous behaviour exactly. Read at every transport init (StartDevice), mirrored as
+    /// `SubKickUnl` (1 only when the doorbell was located). The requested name
+    /// `SubKickUnlocked` is 15 bytes and would not fit the lookup buffer.
+    /// `docs/zero-copy-present.md` 24.14.10.
+    pub const SUBMIT_KICK_UNLOCK: KnobName = KnobName::new(b"SubKickUnlock");
     /// `WddmHoldMs` (default 0 = OFF, and OFF is the only shipping value).
     ///
     /// # THE KNOB IS THE EXPERIMENT (UV1, `docs/dx12/KMD_IMPACT.md` §14a.1)

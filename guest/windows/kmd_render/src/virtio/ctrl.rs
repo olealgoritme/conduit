@@ -789,7 +789,7 @@ pub fn raw_submit_async(
     submit_stage::lap(clock, Stage::Copy);
     let wake = NonNull::new(adapter.hpd_event.get()).ok_or(VirtioError::DeviceError)?;
     let cell = NonNull::from(cell);
-    let queued = display_enqueue(adapter, Path::Flip, clock, move |v| {
+    let queued = display_enqueue(passive, adapter, Path::Flip, clock, move |v| {
         v.enqueue_raw_async(meta, req_len, resp_len, cell, tag, wake)
     });
     match queued {
@@ -2544,35 +2544,81 @@ fn stage_display_submit(
 /// what the enqueue may depend on in the same hold: free descriptors (the display paths do not
 /// retry a QueueFull), and the destination ownership a retired Blt released (`BltEnq::Busy`
 /// otherwise) or the windowed-Blt FIFO state. `SubDrainHit` counts the second case; docs 24.14.
+///
+/// THE LATE DOORBELL (`SubKickUnlock`, docs 24.14.10) lives here, for all five callers: the
+/// hold arms it, the enqueue's `publish_then_notify` decides (after a full fence) whether a
+/// notify is owed and takes a pending count instead of ringing, the hold takes the
+/// [`super::gpu::KickTicket`], and it is rung only after `with_virtio` has released the lock.
+/// `Stage::Kick` is then the unlocked doorbell, timed outside the lock.
 fn display_enqueue<R>(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     path: Path,
     clock: &mut Clock,
     enqueue: impl FnOnce(&mut super::gpu::VirtioGpu) -> R,
 ) -> Result<R, NotStarted> {
     let timing = submit_stage::timing();
-    adapter.with_virtio(move |v| {
-        submit_stage::lap(clock, Stage::Lock);
+    let held = &mut *clock;
+    let queued = adapter.with_virtio(move |v| {
+        submit_stage::lap(held, Stage::Lock);
         if v.used_pending() {
             submit_stage::note_drain_hit(path);
         }
         v.drain_used();
-        submit_stage::lap(clock, Stage::Drain);
+        submit_stage::lap(held, Stage::Drain);
         if timing {
             v.arm_kick_timer();
         }
+        v.arm_late_kick();
         let result = enqueue(v);
-        submit_stage::lap(clock, Stage::Enq);
+        // Taken in the SAME hold that armed it: nothing else can see it armed.
+        let late = v.take_late_kick();
+        submit_stage::lap(held, Stage::Enq);
         if timing {
             if let Some(kick) = v.take_kick_timer() {
-                clock.carve(Stage::Enq, Stage::Kick, u64::from(kick.ticks));
+                held.carve(Stage::Enq, Stage::Kick, u64::from(kick.ticks));
                 if !kick.notified {
                     submit_stage::note_no_kick(path);
                 }
             }
         }
+        (result, late)
+    });
+    // `virtio_lock` is released: ring the owed doorbell now.
+    queued.map(|(result, late)| {
+        if let Some(ticket) = late {
+            ticket.ring();
+            submit_stage::lap(clock, Stage::Kick);
+            publish_kick_counters(passive);
+        }
         result
     })
+}
+
+/// Last mirror of the late-doorbell counters, 100 ns.
+static KICK_MIRROR_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Mirror the late-doorbell counters (`helios_kmd_logic::kick_defer::COUNTERS`), at most once a
+/// second, from a submitter that just rang one. PASSIVE (registry writes).
+fn publish_kick_counters(_passive: PassiveLevel) {
+    use super::gpu::{
+        KICK_DROPPED, KICK_GAP_TICKS, KICK_LATE, KICK_TEARDOWN_LEAKS, KICK_TEARDOWN_WAITS,
+    };
+    use crate::diag::record_named_bytes as rec;
+    let now = submit_stage::now_100ns();
+    let last = KICK_MIRROR_AT.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 10_000_000 {
+        return;
+    }
+    KICK_MIRROR_AT.store(now, Ordering::Relaxed);
+    rec(b"SubKickLate", KICK_LATE.load(Ordering::Relaxed));
+    rec(b"SubKickDrop", KICK_DROPPED.load(Ordering::Relaxed));
+    rec(
+        b"SubKickGap",
+        helios_kmd_logic::submit_stage::ticks_to_us(KICK_GAP_TICKS.load(Ordering::Relaxed)),
+    );
+    rec(b"SubKickWait", KICK_TEARDOWN_WAITS.load(Ordering::Relaxed));
+    rec(b"SubKickLeak", KICK_TEARDOWN_LEAKS.load(Ordering::Relaxed));
 }
 
 /// The outcome mapping both display submitters share: a transport-gone outer
@@ -2617,7 +2663,7 @@ pub fn submit_venus_async_scanout(
         // to attach it, so it necessarily lands on the ring the drain honours.
         let notify = adapter.scanout_notify(primary_address, ticket, keep_on_failure);
 
-        display_submit_outcome(display_enqueue(adapter, Path::Scanout, clock, move |v| {
+        display_submit_outcome(display_enqueue(passive, adapter, Path::Scanout, clock, move |v| {
             v.enqueue_scanout_submit(ctx_id, meta, venus, venus_len, notify)
         }))
     })
@@ -2645,7 +2691,7 @@ pub fn submit_venus_async_present(
         // path above: used-ring retirement still represents GPU completion, but an
         // ordinary app/DWM BLT must not mark the physical scanout dirty or wake the
         // display refresh worker.
-        display_submit_outcome(display_enqueue(adapter, Path::Present, clock, move |v| {
+        display_submit_outcome(display_enqueue(passive, adapter, Path::Present, clock, move |v| {
             match present_buffer_write {
                 Some(resource_id) => v.enqueue_async_submit_present_buffer(
                     ctx_id,
@@ -2694,7 +2740,7 @@ pub fn submit_venus_async_blt(
 ) -> Result<BltSubmit, VirtioError> {
     measured(Path::Blt, |clock| {
         let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
-        let queued = display_enqueue(adapter, Path::Blt, clock, move |v| {
+        let queued = display_enqueue(passive, adapter, Path::Blt, clock, move |v| {
             v.enqueue_async_submit_blt(
                 adapter,
                 ctx_id,
@@ -2787,7 +2833,7 @@ pub fn submit_venus_async_windowed_blt(
 ) -> Result<u64, VirtioError> {
     measured(Path::Windowed, |clock| {
         let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
-        display_submit_outcome(display_enqueue(adapter, Path::Windowed, clock, move |v| {
+        display_submit_outcome(display_enqueue(passive, adapter, Path::Windowed, clock, move |v| {
             v.enqueue_async_submit_windowed_blt(
                 adapter,
                 ctx_id,
