@@ -297,6 +297,19 @@ only (exit 77 elsewhere) and about 700 lines of C. Base files: `crm_semsurf_smok
 style), `crm_pin_smoke.c` (OS descriptor over `crm_alloc_pages`), `crm_smoke.c` 164-191 (usermode map through the subdevice),
 `crm_share_smoke.c` (cross-client dup). The channel sequence is ported from patch 0006/0008/0035 (section 1.1).
 
+**As built** (`guest/rmclient/tests/crm_ce_copy_smoke.c`; run lines, output and what to send back in
+`crm_ce_copy_smoke.md` next to it). Where it differs from the plan below:
+- It builds and runs on Linux too. Only `--fence` (doorbell to RM fence event) is Windows-only.
+- The CE method defines are copied into the test, each cited to its header. No Mesa include path is needed.
+- GPU time: CE semaphore releases with timestamp before and after the copy (`copy_us`), instead of a host release
+  timestamp.
+- The completion value is in RM system memory. A semaphore surface goes over it only with `--fence`. The timestamps and the
+  probe are in OS-descriptor pages.
+- The producer value is a CPU store by default (`--release semsurf` uses `SET_VALUE`).
+- The ring has 128 entries. Every channel uses the device's VA space (`--vas new` tries a new one) at fixed VAs below 2^40.
+- Not built: the block-linear source (`bl`) and a compressed source (unknown 1 of section 6). Both still need a later tool.
+- Added: `--engine`, `--contend`, `--delay`/`--duration` (section 7) and the `precondition:` line (section 8).
+
 Structure (two clients in one process, so the cross-client route of 2.3 is exercised):
 1. `producer` client: device, subdevice, 4 KiB `NV01_MEMORY_SYSTEM` (CPU-mapped) plus an `NV_SEMAPHORE_SURFACE` over it, the
    "producer timeline", and a 1600x900 BGRA source as `NV01_MEMORY_LOCAL_USER`, filled with a pattern through a BAR1
@@ -346,10 +359,10 @@ Run (main session; copy both files into the guest's public tools folder; `$WIN_S
 
 ```sh
 scp -P 2222 build-win/crm_ce_copy_smoke.exe build-win/librmclient.dll "$WIN_SSH:C:/Users/Public/t/"
-ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe 200'
+ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe --iterations 200'
 ```
 
-Expected output (format of the sibling smokes):
+Expected output as planned (the built tool prints a stage table instead; see `crm_ce_copy_smoke.md`):
 
 ```
 [ ok ] producer client: semaphore surface + 1600x900 source (pitch)
@@ -499,7 +512,22 @@ The ~150 us of host hops (the ~105 us CPU overhead plus the wake and delivery ar
 The ~345 us of transfer stays unless the copy gets faster on an idle async CE. `copy_us` against `copy_us_contended` shows
 how much PCIe contention costs.
 
-## 8. Milestones
+## 8. Precondition for M2: how guest RAM is backed
+
+The destination is guest RAM, so the copy's cost depends on how the host backs those pages:
+- At the time of writing, guest RAM is memfd/shmem with transparent huge pages in `within_size` mode, not reserved
+  hugepages.
+- `nr_hugepages=8192` (2 MiB pages) is staged for the next host reboot. No 1 GiB pages are configured.
+- The GPU reaches guest RAM through the host IOMMU/driver mapping of those pages. The OS descriptor's runs become one
+  stitched host alias that RM pins (section 3).
+
+Every M2 result records this backing state next to its numbers: THP shmem or reserved 2 MiB hugepages, and the
+`nr_hugepages` in effect. The tool prints `precondition: copy_bytes=<n> pages=<n>` (the 4 KiB pages the destination
+touches; 1407 for 1600x900) so that the page count is on record with each run. If the per-page cost looks high (`copy_us`
+well above 5.76 MB at the CE's bandwidth), a later A/B with reserved 2 MiB hugepages separates the page-mapping cost from the
+transfer.
+
+## 9. Milestones
 
 - **M0**: this document.
 - **M1**: `crm_ce_copy_smoke.c` plus the meson entry (section 5), and a test request to the main session with the exact build and
