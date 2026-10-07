@@ -1286,6 +1286,13 @@ pub mod knobs {
     /// (every shape then fails over to the software cursor on a host without it). Read with the
     /// other adapter knobs (a change applies at the next StartDevice); mirrored as `CurKnob`.
     pub const HW_CURSOR: KnobName = KnobName::new(b"HwCursor");
+    /// `GdiAccel` (default 0 = no GDI hardware acceleration: `PresentationCaps` 0, the word since
+    /// 22.22.180.0). 1: report `helios_kmd_logic::gdi_accel::ACCEL_CAPS`
+    /// (`SupportKernelModeCommandBuffer` with the `NoSameBitmap*` declines) and translate
+    /// `DxgkDdiRenderKm` command buffers (`ddi/gdi_accel.rs`). Any other value is 0. Read with the
+    /// other caps knobs at AddAdapter and StartDevice; mirrored as `GdiKnob`/`GdiCaps`.
+    /// `docs/vram-redirection.md` section 9.
+    pub const GDI_ACCEL: KnobName = KnobName::new(b"GdiAccel");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,
