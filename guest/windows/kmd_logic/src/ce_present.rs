@@ -1288,14 +1288,17 @@ pub const fn retire(value: u64, completed: u64, timed_out: bool) -> Retire {
 
 // ── names ────────────────────────────────────────────────────────────────────────────────────
 
-/// The knob (`HKR\Parameters`, `diag.rs` `KnobName`): 0 off (default), 1 on.
+/// The knob (`HKR\Parameters`, `diag.rs` `KnobName`): 0 off (default), 1 the Present route
+/// (M3c), 2 the channel's hardware self-test (M3b, `rm_ce_channel::Mode`).
 pub const KNOB: &str = "RmCopyEngine";
 pub const KNOB_DEFAULT: u32 = 0;
 
 /// The counters the route will write (M3b/M3c, `kmd_render`). At most 14 characters, prefix `Ce`,
-/// unique across `kmd_render` and `kmd_logic`. No I/O file writes them yet, so the tests below
-/// check that NONE of them is spelled in `kmd_render` today; the M3c commit that adds the writer
-/// replaces that test with the exact-list check `guest_blob.rs` has.
+/// unique across `kmd_render` and `kmd_logic`. M3b writes the channel's five
+/// (`CeKnob`, `CeChan`, `CeRunlist`, `CeRmErr`, `CeChanFail`; `rm_ce_channel::COUNTERS` is the
+/// exact list of M3b's writers, checked there); the tests below check that the others (the
+/// Present route's) are not spelled in `kmd_render` yet. The M3c commit that adds their writer
+/// replaces that with the exact-list check.
 pub const COUNTERS: &[&str] = &[
     // The knob in force; the channel's state (0 none, 1 alive, 2 dead) and its runlist.
     "CeKnob",
@@ -2440,14 +2443,21 @@ mod tests {
         None
     }
 
-    /// No I/O writes these yet (M3a). Until the M3c writer exists, `kmd_render` must not spell any
-    /// of them, nor the knob, so the names are still free when it does; the M3c commit replaces
-    /// this with the exact-list check of `guest_blob.rs` against the writer file.
+    /// M3b writes the channel's names (`rm_ce_channel::COUNTERS`, whose exact-list test checks the
+    /// writer files and the knob's one spelling in `diag.rs`). The Present route's names (M3c) are
+    /// not written yet: `kmd_render` must not spell any of them, so they are still free when the
+    /// M3c writer comes, and that commit replaces this with the exact-list check against it.
     #[test]
-    fn the_names_are_free_in_kmd_render() {
+    fn the_route_names_are_still_free_in_kmd_render() {
         let Some(render) = render_src() else {
             return;
         };
+        let route: std::vec::Vec<&str> = COUNTERS
+            .iter()
+            .copied()
+            .filter(|n| !crate::rm_ce_channel::COUNTERS.contains(n))
+            .collect();
+        assert_eq!(route.len(), COUNTERS.len() - 5);
         let mut stack = std::vec![render];
         let mut checked = 0;
         while let Some(dir) = stack.pop() {
@@ -2458,11 +2468,10 @@ mod tests {
                 } else if p.extension().is_some_and(|x| x == "rs") {
                     checked += 1;
                     let text = std::fs::read_to_string(&p).unwrap();
-                    for n in COUNTERS {
+                    for n in &route {
                         let lit = std::format!("b\"{n}\"");
                         assert!(!text.contains(&lit), "{} already spells {n}", p.display());
                     }
-                    assert!(!text.contains("b\"RmCopyEngine\""), "{} spells the knob", p.display());
                 }
             }
         }

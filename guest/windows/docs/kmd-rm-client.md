@@ -51,6 +51,11 @@ Values above 5 count as 5. The knob is read once per transport generation (so `r
 `retire_transport` (through `forget`) resets it to unread. At level 0 `service` returns on that one
 load, before it asks for the virtio lock.
 
+The KMD's own copy-engine channel (`RmCopyEngine`, independent of `KmdRmClient`) is a second client of the same kind: it
+drives the same `Io` and the same bring-up machine (with the device allocated with the copy-engine tool's parameters), from
+`virtio/rm_client/ce_channel.rs`, and its hardware self-test is `ce_selftest.rs`. What it builds, its budgets, counters and
+test procedure: `rm-copy-engine-present.md` 11.9 and 11.10.
+
 ## 2. Architecture
 
 ```

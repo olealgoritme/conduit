@@ -233,6 +233,8 @@ fn start_generation_mirrors() {
     crate::ddi::blt_async::reset_for_start();
     // `GuestBlob` (default 0): the knob read again and mirrored (`GbKnob`), counters zeroed.
     crate::ddi::guest_blob::reset_for_start();
+    // `RmCopyEngine` (default 0): the knob read again and mirrored (`CeKnob`), counters zeroed.
+    crate::virtio::rm_client::ce_channel::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();
@@ -448,6 +450,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // before its reset and before `reset_system_backings` below unlocks their pages (a stop
     // that ran first has retired them already; one spinlock lookup then, and with the knob 0).
     crate::ddi::guest_blob::retire_all_for_stop(passive, adapter, &live_budget);
+    // `RmCopyEngine`: a copy-engine channel of the old generation is freed while it still answers
+    // (one load when there is none: always, with the knob at 0).
+    crate::virtio::rm_client::ce_channel::retire_for_stop(passive, adapter, &live_budget);
     crate::virtio::nvrm::retire_transport(passive, adapter, &live_budget);
     start_generation_mirrors();
     // Whatever the previous generation recorded against its resource ids (system
@@ -814,6 +819,10 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // worker is joined, so no deferred copy can be submitted into one any more. One
         // spinlock lookup when there is none (always, with `GuestBlob` 0).
         crate::ddi::guest_blob::retire_all_for_stop(passive_stop, adapter, &budget);
+        // `RmCopyEngine`: the copy-engine channel (schedule off, the channel group, its memory, the
+        // doorbell, the VA space, the client) is freed before the transport reset, on the same
+        // budget; the worker that could use it is joined. One load when there is none.
+        crate::virtio::rm_client::ce_channel::retire_for_stop(passive_stop, adapter, &budget);
 
         // Tear down the venus client + page-table blob + context BEFORE dropping
         // the transport (the unref/detach/destroy commands need the live device).

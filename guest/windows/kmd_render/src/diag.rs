@@ -1082,6 +1082,12 @@ pub mod knobs {
     /// does nothing. Read at every StartDevice; mirrored as `GbKnob`.
     /// `docs/zero-copy-present.md` section 24.12.
     pub const GUEST_BLOB: KnobName = KnobName::new(b"GuestBlob");
+    /// `RmCopyEngine` (default 0 = nothing happens: no allocation, no RM message). 1: reserved for
+    /// the windowed Present copy on the KMD's own copy-engine channel (M3c; nothing yet). 2: the
+    /// channel's hardware self-test, once per transport generation, from the HPD worker. Any other
+    /// value is 0. Read at every StartDevice; mirrored as `CeKnob`.
+    /// `docs/rm-copy-engine-present.md` section 11.
+    pub const RM_COPY_ENGINE: KnobName = KnobName::new(b"RmCopyEngine");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
