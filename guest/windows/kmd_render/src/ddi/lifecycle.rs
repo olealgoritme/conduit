@@ -245,6 +245,7 @@ fn start_generation_mirrors() {
     // The flip retire measurement and the announce knobs (`FlipLat`, `FlipAnnounce`,
     // `FlipEarlyWake`), read and zeroed before the block above is first written.
     crate::ddi::flip_lat::start_generation();
+    crate::ddi::stage_trace::start_generation();
     crate::ddi::flip_announce::start_generation();
     crate::ddi::stall_diag::start_generation();
 }

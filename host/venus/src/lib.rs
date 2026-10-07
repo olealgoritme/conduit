@@ -12,6 +12,7 @@ pub mod ipc;
 pub mod latency;
 pub mod mock;
 pub mod sandbox;
+pub mod stage;
 #[cfg(feature = "renderer")]
 pub mod virgl;
 
@@ -97,6 +98,10 @@ pub const FEATURE_IMPORT_DMABUF: u32 = 1 << 0;
 /// ([`Renderer::import_guest_pages`]) that Venus contexts import with
 /// `VK_EXT_external_memory_host` (docs/VENUS.md "Guest-memory blobs").
 pub const FEATURE_IMPORT_GUEST_PAGES: u32 = 1 << 1;
+
+/// [`Renderer::features`]: the renderer stamps frame stages and hands them
+/// over with [`Renderer::stages`] (docs/TRACING.md "Frame stage timing").
+pub const FEATURE_STAGE_TRACE: u32 = 1 << 2;
 
 /// [`Renderer::features`]: a submit and the fence after it travel as one
 /// call ([`Renderer::submit_fenced`]), one round trip instead of two. The
@@ -238,5 +243,13 @@ pub trait Renderer: Send {
     fn import_guest_pages(&mut self, res_id: u32, ram: BorrowedFd<'_>, runs: &[PageRun]) -> Result<()> {
         let _ = (res_id, ram, runs);
         Err(Error::Refused("this renderer cannot import guest pages".into()))
+    }
+
+    /// Turn the renderer's stage stamps on or off ([`stage`]) and take
+    /// every stamp it made since the last call. Only with
+    /// [`FEATURE_STAGE_TRACE`].
+    fn stages(&mut self, on: bool) -> Result<Vec<stage::Rec>> {
+        let _ = on;
+        Err(Error::Refused("this renderer does not stamp stages".into()))
     }
 }

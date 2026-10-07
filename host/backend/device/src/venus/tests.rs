@@ -151,6 +151,10 @@ impl Renderer for Shared {
     fn features(&mut self) -> u32 {
         self.mock.lock().unwrap().features()
     }
+    fn stages(&mut self, on: bool) -> conduit_venus::Result<Vec<conduit_venus::stage::Rec>> {
+        self.check()?;
+        self.mock.lock().unwrap().stages(on)
+    }
     fn import_dmabuf(
         &mut self,
         res_id: u32,
@@ -959,6 +963,55 @@ fn fences_release_by_timeline() {
     m.hdr = fenced(CMD_RESOURCE_MAP_BLOB, 0, 4);
     assert_eq!(t.send(&m.to_bytes()).0.ty, RESP_OK_MAP_INFO);
     assert_eq!(t.venus.held(), 0);
+}
+
+/// Stage timing follows a fenced copy by its fence through the backend and
+/// the renderer, and asks nothing of the renderer while off.
+#[test]
+fn a_fenced_copy_is_stamped_by_its_fence() {
+    use conduit_venus::stage::*;
+    let _one = crate::stage::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut t = Rig::new();
+    t.ctx(77);
+    crate::stage::set_on(true);
+    t.completions(); // the renderer is told
+    let id = 0xC0FF_EE00_0000_0001u64;
+    let h = CtrlHdr {
+        ty: CMD_SUBMIT_3D,
+        flags: FLAG_FENCE | FLAG_INFO_RING_IDX,
+        fence_id: id,
+        ctx_id: 77,
+        ring_idx: 1,
+        padding: [0; 3],
+    };
+    assert!(matches!(
+        t.send_with(&submit_cmd(h, b""), None),
+        Outcome::Held(_)
+    ));
+    let done = t.completions();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].fence, (77, 1, id));
+    crate::stage::set_on(false);
+    t.completions(); // told off: its last stamps come back
+    let (recs, _) = decode_dump(&crate::stage::dump()).unwrap();
+    let mine: Vec<&Rec> = recs.iter().filter(|r| r.id == id && r.ctx == 77).collect();
+    for s in [H_DECODED, H_SUBMITTED, H_FENCE_ASKED, H_SIGNALLED, R_FENCE] {
+        assert!(
+            mine.iter()
+                .any(|r| r.stage == s && r.ring == 1 && r.kind == KIND_FENCE),
+            "{}",
+            name(s)
+        );
+    }
+    let at = |s: u8| mine.iter().find(|r| r.stage == s).unwrap().ts_ns;
+    assert!(at(H_DECODED) <= at(H_SUBMITTED) && at(H_SUBMITTED) <= at(H_FENCE_ASKED));
+    assert!(at(H_FENCE_ASKED) <= at(H_SIGNALLED));
+    assert!(
+        !t.r.mock.lock().unwrap().stage_on,
+        "the renderer was told off"
+    );
 }
 
 /// Fence ids are the guest's and need not increase: a signal completes its

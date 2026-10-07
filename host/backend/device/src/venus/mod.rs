@@ -164,9 +164,23 @@ pub struct Venus {
     /// Whether a renderer descriptor is a dma-buf (`rm::is_dmabuf`); a
     /// stand-in in tests, whose mock renderer hands out memfds.
     is_dmabuf: fn(BorrowedFd<'_>) -> bool,
+    /// Stage timing on the renderer's side (`Venus::pull_stages`).
+    stages: RendererStages,
     /// `--latency fused-submit` ([`Venus::set_fused_submit`]).
     fused_submit: bool,
 }
+
+/// The renderer's half of stage timing: whether it can stamp, whether it
+/// was told to, and when its stamps were last collected.
+#[derive(Default)]
+struct RendererStages {
+    can: bool,
+    told_on: bool,
+    pulled: Option<std::time::Instant>,
+}
+
+/// How often the renderer's stamps are collected while stage timing is on.
+const STAGE_PULL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl Venus {
     /// A Venus device over `renderer`, with a region 3 of `hostmem_len` bytes
@@ -186,6 +200,10 @@ impl Venus {
         });
         let mut renderer = renderer;
         let rm_import = renderer.features() & conduit_venus::FEATURE_IMPORT_DMABUF != 0;
+        let stages = RendererStages {
+            can: renderer.features() & conduit_venus::FEATURE_STAGE_TRACE != 0,
+            ..Default::default()
+        };
         if rm_import {
             log::info!("venus: the renderer imports dma-bufs; RM-export blobs are served");
         }
@@ -207,6 +225,7 @@ impl Venus {
             lost: false,
             lose_pending: false,
             counts: BTreeMap::new(),
+            stages,
             fused_submit: false,
         }
     }
@@ -272,6 +291,19 @@ impl Venus {
     /// device is released through `env` as on any other loss, and the held
     /// chains come back `RESP_ERR_UNSPEC`.
     pub fn completions(&mut self, env: Env<'_>) -> Vec<Completion> {
+        self.completions_with(env, true)
+    }
+
+    /// [`Venus::completions`] without asking the renderer anything: what
+    /// the renderer connection's own reader thread runs (`--latency
+    /// direct-fences`). A renderer call from there would wait for a reply
+    /// only that thread can deliver, so the stage pull is left to the
+    /// fence pump and the queue thread.
+    pub fn completions_no_call(&mut self, env: Env<'_>) -> Vec<Completion> {
+        self.completions_with(env, false)
+    }
+
+    fn completions_with(&mut self, env: Env<'_>, may_call: bool) -> Vec<Completion> {
         if !self.lost {
             match self.renderer.signalled() {
                 Ok(signalled) => {
@@ -289,7 +321,44 @@ impl Venus {
             }
         }
         self.fences.flush_latency();
+        if may_call {
+            self.pull_stages();
+        }
         self.fences.take_ready()
+    }
+
+    /// Keep the renderer's stage timing in step with the backend's and bring
+    /// its stamps into the backend's ring (docs/TRACING.md "Frame stage
+    /// timing"). Called with every completion pass, which the fence pump
+    /// makes at least every 100 ms; asks the renderer at most every
+    /// [`STAGE_PULL`] while on, and once more when turned off. Nothing at all
+    /// while stage timing is off and the renderer was never told otherwise.
+    fn pull_stages(&mut self) {
+        let on = crate::stage::on();
+        let st = &mut self.stages;
+        if !st.can || self.lost || (!on && !st.told_on) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if on
+            && st.told_on
+            && st
+                .pulled
+                .is_some_and(|t| now.duration_since(t) < STAGE_PULL)
+        {
+            return;
+        }
+        match self.renderer.stages(on) {
+            Ok(recs) => {
+                conduit_venus::stage::absorb(&recs);
+                st.told_on = on;
+                st.pulled = Some(now);
+            }
+            Err(e) => {
+                log::warn!("venus: renderer stage timing: {e}; not asking again");
+                st.can = false;
+            }
+        }
     }
 
     /// The renderer is gone for good: everything was released, and every
@@ -309,13 +378,20 @@ impl Venus {
             return Outcome::Done(transport_err(resp, libc::EINVAL));
         };
         self.refusal_errno = None;
+        // Stage timing (docs/TRACING.md): a fenced command is a frame's
+        // copy, followed by its fence.
+        let decoded_ns = if crate::stage::on() && hdr.fenced() {
+            crate::stage::now_ns()
+        } else {
+            0
+        };
         if self.fused_submit
             && !self.lost
             && hdr.ty == CMD_SUBMIT_3D
             && hdr.fenced()
             && hdr.ring() < MAX_RINGS
         {
-            return self.submit_fenced(&hdr, payload, resp, env);
+            return self.submit_fenced(&hdr, payload, resp, env, decoded_ns);
         }
         let answer = if self.lost {
             Err(RESP_ERR_UNSPEC)
@@ -330,6 +406,11 @@ impl Venus {
             Err(RESP_ERR_INVALID_PARAMETER)
         } else {
             self.serve(&hdr, payload, env)
+        };
+        let served_ns = if decoded_ns != 0 {
+            crate::stage::now_ns()
+        } else {
+            0
         };
         if let Err(e) = answer {
             self.count(err_name(e));
@@ -357,7 +438,12 @@ impl Venus {
                     .renderer
                     .create_fence(hdr.ctx_id, hdr.ring(), hdr.fence_id)
                 {
-                    Ok(()) => Outcome::Held(self.fences.hold(&hdr)),
+                    Ok(()) => {
+                        if decoded_ns != 0 {
+                            stamp_held(&hdr, decoded_ns, served_ns);
+                        }
+                        Outcome::Held(self.fences.hold(&hdr))
+                    }
                     Err(e) => {
                         log::warn!(
                             "venus: fence {} on ctx {} ring {}: {e}",
@@ -388,7 +474,14 @@ impl Venus {
     /// A fenced `SUBMIT_3D` with `fused-submit`: the same checks and answers
     /// as `serve` and the fence step of `dispatch`, but the submit and the
     /// fence reach the renderer as one call.
-    fn submit_fenced(&mut self, hdr: &CtrlHdr, b: &[u8], resp: &mut [u8], env: Env<'_>) -> Outcome {
+    fn submit_fenced(
+        &mut self,
+        hdr: &CtrlHdr,
+        b: &[u8],
+        resp: &mut [u8],
+        env: Env<'_>,
+        decoded_ns: u64,
+    ) -> Outcome {
         let checked = match Submit3d::from_bytes(b) {
             Some(s) if b.len() == Submit3d::LEN + s.size as usize => {
                 if self.contexts.contains(&hdr.ctx_id) {
@@ -429,6 +522,10 @@ impl Venus {
                     hdr.ctx_id,
                     b.len()
                 );
+                // One call: submitted and fence asked are the same moment.
+                if decoded_ns != 0 {
+                    stamp_held(hdr, decoded_ns, crate::stage::now_ns());
+                }
                 Outcome::Held(self.fences.hold(hdr))
             }
             Err(conduit_venus::FencedError::Submit(e)) => {
@@ -684,6 +781,28 @@ impl Venus {
     fn count(&mut self, what: &'static str) {
         *self.counts.entry(what).or_insert(0) += 1;
     }
+}
+
+/// The backend's stages of a fenced command up to holding it: the kick that
+/// brought it, decoded, handed to the renderer, fence asked for (now).
+fn stamp_held(hdr: &CtrlHdr, decoded_ns: u64, served_ns: u64) {
+    use conduit_venus::stage::{H_DECODED, H_FENCE_ASKED, H_KICK, H_SUBMITTED, Rec};
+    let (ctx, ring, id) = (hdr.ctx_id, hdr.ring(), hdr.fence_id);
+    let kick = crate::stage::last_kick();
+    if kick != 0 && kick <= decoded_ns {
+        crate::stage::stamp(Rec::fence(H_KICK, ctx, ring, id, kick));
+    }
+    crate::stage::stamp(Rec::fence(H_DECODED, ctx, ring, id, decoded_ns));
+    if hdr.ty == CMD_SUBMIT_3D {
+        crate::stage::stamp(Rec::fence(H_SUBMITTED, ctx, ring, id, served_ns));
+    }
+    crate::stage::stamp(Rec::fence(
+        H_FENCE_ASKED,
+        ctx,
+        ring,
+        id,
+        crate::stage::now_ns(),
+    ));
 }
 
 fn err_name(e: u32) -> &'static str {

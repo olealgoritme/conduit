@@ -1099,6 +1099,16 @@ fn event_pump(
     }
 }
 
+/// The `seq` of a `ScanoutFlip` request (`MsgHeader` then the flip), for
+/// stage timing; `None` for any other message.
+fn flip_seq(req: &[u8]) -> Option<u64> {
+    let hdr = size_of::<protocol::messages::MsgHeader>();
+    if req.get(..4)? != (MsgType::ScanoutFlip as u32).to_le_bytes() {
+        return None;
+    }
+    protocol::messages::ScanoutFlip::from_bytes(req.get(hdr..)?).map(|f| f.seq)
+}
+
 /// Return held chains whose fences have signalled: write each response and
 /// put the chain on the used ring. Returns whether any was.
 #[cfg(feature = "venus")]
@@ -1134,7 +1144,7 @@ fn fence_hook(
                 if n.venus_lost() {
                     return false;
                 }
-                n.venus_completions()
+                n.venus_completions_no_call()
             }
             Err(_) => return false,
         };
@@ -1157,6 +1167,8 @@ fn return_chains(
     }
     let mut chains = held.lock().expect("held chains");
     let mut any = false;
+    let staged = device::stage::on();
+    let mut used: Vec<(u32, u32, u64)> = Vec::new();
     for c in done {
         let Some(chain) = chains.remove(&c.token) else {
             continue; // its queue was reset meanwhile
@@ -1170,11 +1182,34 @@ fn return_chains(
             log::warn!("venus: returning chain {}: {e}", chain.head);
             continue;
         }
+        if staged {
+            let (ctx, ring, id) = c.fence;
+            device::stage::stamp(device::stage::Rec::fence(
+                device::stage::H_USED,
+                ctx,
+                ring,
+                id,
+                device::stage::now_ns(),
+            ));
+            used.push(c.fence);
+        }
         any = true;
     }
     drop(chains);
     if any {
         let _ = vring.signal_used_queue();
+    }
+    if !used.is_empty() {
+        let now = device::stage::now_ns();
+        for (ctx, ring, id) in used {
+            device::stage::stamp(device::stage::Rec::fence(
+                device::stage::H_IRQ,
+                ctx,
+                ring,
+                id,
+                now,
+            ));
+        }
     }
     any
 }
@@ -1285,6 +1320,10 @@ struct NvGpuBackend {
     /// and two more locks of the backend.
     #[cfg(feature = "venus")]
     gpu_cmd_seen: bool,
+    /// Stage timing: `ScanoutFlip`s put on the used ring by this drain, by
+    /// `seq`, stamped `H_IRQ` once the guest has been notified. Empty while
+    /// stage timing is off.
+    flips_used: Vec<u64>,
     /// `--latency`.
     latency: Latency,
     /// Venus, with `--venus`: the size of region 3 (0 without), and the
@@ -1411,6 +1450,7 @@ impl NvGpuBackend {
             watch_dirty: true,
             #[cfg(feature = "venus")]
             gpu_cmd_seen: false,
+            flips_used: Vec::new(),
             latency: Latency::default(),
             #[cfg(feature = "venus")]
             venus: VenusChains::default(),
@@ -1702,6 +1742,12 @@ impl NvGpuBackend {
             vring
                 .add_used(head, written as u32)
                 .map_err(|e| std::io::Error::other(format!("add_used: {e}")))?;
+            if device::stage::on()
+                && let Some(seq) = flip_seq(&self.req)
+            {
+                device::stage::flip(device::stage::H_USED, seq);
+                self.flips_used.push(seq);
+            }
             #[cfg(feature = "trace")]
             if TRACE && let Some(mut r) = record {
                 r.reply_ns = device::trace::now_ns().saturating_sub(t_recv);
@@ -1877,6 +1923,7 @@ impl VhostUserBackendMut for NvGpuBackend {
             .memory();
 
         let vring = &vrings[device_event as usize];
+        device::stage::kick();
         let mut used = false;
         if self.event_idx {
             // With EVENT_IDX the guest suppresses notifications, so re-arm and
@@ -1903,6 +1950,9 @@ impl VhostUserBackendMut for NvGpuBackend {
             vring
                 .signal_used_queue()
                 .map_err(|e| std::io::Error::other(format!("signal used queue: {e}")))?;
+        }
+        for seq in self.flips_used.drain(..) {
+            device::stage::flip(device::stage::H_IRQ, seq);
         }
         Ok(())
     }
@@ -2253,6 +2303,11 @@ fn main() -> anyhow::Result<()> {
     nvgpu.latency = args.latency;
     log::info!("latency options: {:?}", args.latency);
     let backend = Arc::new(RwLock::new(nvgpu));
+    // Frame stage stamps from the start (docs/TRACING.md "Frame stage
+    // timing"); `stages on` on the trace socket otherwise.
+    if device::stage::init_from_env() {
+        log::info!("stage timing on (CONDUIT_STAGE_TRACE)");
+    }
     #[cfg(feature = "trace")]
     {
         if let Some(v) = host::driver_version(&args.proc_nvidia)
@@ -2318,6 +2373,23 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flip_request_gives_its_seq() {
+        let f = protocol::messages::ScanoutFlip {
+            seq: 0x1234_5678_9abc,
+            ..Default::default()
+        };
+        let mut req = Vec::new();
+        for v in [MsgType::ScanoutFlip as u32, 0, 0, 0] {
+            req.extend_from_slice(&v.to_le_bytes());
+        }
+        req.extend_from_slice(&f.to_bytes());
+        assert_eq!(flip_seq(&req), Some(0x1234_5678_9abc));
+        assert_eq!(flip_seq(&req[..40]), None, "short");
+        req[0] = MsgType::GpuCmd as u8;
+        assert_eq!(flip_seq(&req), None, "another message");
+    }
 
     /// The guest takes input once it has posted event-queue buffers (the
     /// Linux guest, at probe), never while the queue is not running (the

@@ -71,6 +71,10 @@ mod op {
     /// RAM file as the request's fd. Sent only to a server whose features
     /// carry `FEATURE_IMPORT_GUEST_PAGES`.
     pub const IMPORT_GUEST_PAGES: u32 = 13;
+    /// `{on u32}`: stage stamps on (1) or off (0); the reply is every stamp
+    /// since the last `STAGES` as a `stage` dump. Sent only to a server
+    /// whose features carry `FEATURE_STAGE_TRACE`.
+    pub const STAGES: u32 = 14;
     /// `{ctx u32, ring u32, fence_id u64, commands}`: `SUBMIT` and then, if
     /// it went through, `CREATE_FENCE`, in one round trip. `ERR` is the
     /// submit's error (no fence was asked for); `OK` with an empty body is
@@ -725,6 +729,14 @@ impl Renderer for IpcClient {
         self.call_fd(op::IMPORT_GUEST_PAGES, &w.0, Some(ram))?;
         Ok(())
     }
+
+    fn stages(&mut self, on: bool) -> Result<Vec<crate::stage::Rec>> {
+        if self.features() & crate::FEATURE_STAGE_TRACE == 0 {
+            return Err(Error::Refused("the renderer does not stamp stages".into()));
+        }
+        let m = self.call(op::STAGES, &W::default().u32(on as u32).0)?;
+        crate::stage::decode_dump(&m.body).map(|(r, _)| r).ok_or_else(|| proto("bad stage dump"))
+    }
 }
 
 // -------------------------------------------------------------------- server
@@ -738,6 +750,17 @@ pub struct IpcServer {
     /// and a message's fragments must not interleave with another's.
     send_lock: Arc<Mutex<()>>,
     direct_fences: bool,
+}
+
+/// Stage timing: the fences just sent to the backend (`R_PUSH`), from the
+/// serve loop or, with direct fences, from the thread that retired them.
+fn stamp_pushed(f: &[Signalled]) {
+    if crate::stage::on() {
+        let now = crate::stage::now_ns();
+        for s in f {
+            crate::stage::stamp(crate::stage::Rec::fence(crate::stage::R_PUSH, s.ctx_id, s.ring_idx, s.fence_id, now));
+        }
+    }
 }
 
 impl IpcServer {
@@ -770,7 +793,9 @@ impl IpcServer {
                 let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
                 // A failed send is a backend that hung up, which the serve
                 // loop finds out on its next receive.
-                let _ = send_msg(sock.as_fd(), op::FENCES, &encode_fences(&[s]), None);
+                if send_msg(sock.as_fd(), op::FENCES, &encode_fences(&[s]), None).is_ok() {
+                    stamp_pushed(&[s]);
+                }
             });
             let direct = self.renderer.set_fence_sink(sink);
             eprintln!("conduit-venus: direct fences {}", if direct { "on" } else { "not supported by this renderer" });
@@ -814,7 +839,9 @@ impl IpcServer {
         if f.is_empty() {
             return Ok(());
         }
-        self.send(op::FENCES, &encode_fences(&f), None)
+        self.send(op::FENCES, &encode_fences(&f), None)?;
+        stamp_pushed(&f);
+        Ok(())
     }
 
     fn reply(&self, r: Result<Vec<u8>>, fd: Option<BorrowedFd<'_>>) -> io::Result<()> {
@@ -905,6 +932,11 @@ impl IpcServer {
                     return Err(bad());
                 }
                 let res = rd.import_guest_pages(res, m.fds[0].as_fd(), &runs).map(|()| Vec::new());
+                self.reply(res, None)
+            }
+            op::STAGES => {
+                let on = r.u32().map_err(|_| bad())? != 0;
+                let res = rd.stages(on).map(|recs| crate::stage::encode_dump(&recs, 0));
                 self.reply(res, None)
             }
             op::SUBMIT_FENCED => {
@@ -1002,6 +1034,25 @@ mod tests {
         assert!(matches!(c.capset_info(1), Err(Error::Refused(s)) if s == "capset index"));
         assert_eq!(c.capset(CAPSET_VENUS, 0).unwrap(), vec![0; 160]);
         assert!(matches!(c.capset(1, 0), Err(Error::Refused(s)) if s == "capset id"));
+    }
+
+    #[test]
+    fn stage_stamps_cross_the_socket() {
+        let (mut c, s) = pair();
+        assert!(c.stages(true).unwrap().is_empty());
+        c.ctx_create(1, CAPSET_VENUS, b"dwm.exe").unwrap();
+        c.create_fence(1, 1, 0x1_0000_0077).unwrap();
+        let recs = c.stages(false).unwrap();
+        assert_eq!(recs.len(), 1);
+        let r = recs[0];
+        assert_eq!(
+            (r.stage, r.kind, r.ctx, r.ring, r.id),
+            (crate::stage::R_FENCE, crate::stage::KIND_FENCE, 1, 1, 0x1_0000_0077)
+        );
+        c.create_fence(1, 1, 0x78).unwrap();
+        assert!(c.stages(false).unwrap().is_empty(), "off: nothing stamped");
+        drop(c);
+        s.join().unwrap();
     }
 
     #[test]
