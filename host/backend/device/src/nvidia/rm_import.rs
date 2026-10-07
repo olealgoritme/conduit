@@ -446,10 +446,12 @@ impl NvidiaBackend {
                 let Ok(fd) = self.handles.get_raw(owner as u64) else {
                     return;
                 };
-                let Some(devinfo) = self.start.devinfo else {
-                    return;
-                };
-                tiling_of(&*self.host, fd, &devinfo.layout).and_then(|t| modifier_for(layout, t))
+                // No layout for this release (never an older one's): the node
+                // is not asked, and the surface has no known modifier.
+                self.start
+                    .devinfo
+                    .and_then(|l| tiling_of(&*self.host, fd, &l))
+                    .and_then(|t| modifier_for(layout, t))
             }
         };
         log::debug!(
@@ -803,6 +805,26 @@ mod tests {
         );
         assert!(calls.lock().unwrap().contains(&get_dev_info_cmd(32)));
         assert!(!calls.lock().unwrap().contains(&get_dev_info_cmd(36)));
+    }
+
+    /// A host release with no GET_DEV_INFO table (580.65.06, started under
+    /// `--allow-nearest-abi`) is never asked with a layout it does not have:
+    /// not 565.77's 32 bytes, not the newest 36. The import still succeeds
+    /// and the surface simply has no known modifier.
+    #[test]
+    fn a_release_without_a_devinfo_table_is_not_asked_and_has_no_modifier() {
+        let v = abi::version::DriverVersion::new(580, 65, 6);
+        // The host would answer in 36 bytes, which the backend must not ask.
+        let (mut be, dri, ctl, calls) = drm_backend_on(v, &GB202_575, 1 << 20);
+        assert!(be.start.devinfo.is_none());
+        import_layout(&mut be, dri, ctl, NVKMS_LAYOUT_BLOCK_LINEAR, 5);
+        assert!(
+            calls.lock().unwrap().iter().all(|c| c & 0xffff != 0x6443),
+            "GET_DEV_INFO reached the host: {:x?}",
+            calls.lock().unwrap()
+        );
+        assert_eq!(be.rm_layouts.get(dri as u32, GEM_HANDLE), Some(None));
+        assert_eq!(be.rm_layouts.get(dri as u32, GEM_HANDLE).flatten(), None);
     }
 
     /// An answered RM call as `note_rm_placement` sees it: the request

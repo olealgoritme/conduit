@@ -215,8 +215,10 @@ pub(super) struct StartSettings {
     pub(super) vidmem: Option<abi::vidmem::Selected>,
     /// Where the host release keeps each field of `DRM_NVIDIA_GET_DEV_INFO`,
     /// and so which size of the ioctl to ask the host's nodes. `None` until
-    /// the release is known. See [`abi::devinfo`].
-    pub(super) devinfo: Option<abi::devinfo::Selected>,
+    /// the release is known, and for a release with no table of its own: that
+    /// one is never guessed (no nearest-older layout), so the host's nodes
+    /// are not asked and no render node is offered. See [`abi::devinfo`].
+    pub(super) devinfo: Option<abi::devinfo::Layout>,
     /// Ceilings on the timeouts a guest may forward (bounds.rs).
     pub(super) bounds: bounds::Bounds,
     /// The video-memory limit in MiB, `None` for none: the number
@@ -626,11 +628,16 @@ impl NvidiaBackend {
         self.start.vidmem = abi::vidmem::select(v);
         // And what the host's DRM nodes answer GET_DEV_INFO with: its size is
         // in the ioctl number, so asking with the wrong one reads the wrong
-        // words, or none.
-        let Some(devinfo) = abi::devinfo::select(v) else {
-            return Err(format!("host driver {v} has no GET_DEV_INFO layout"));
-        };
-        self.start.devinfo = Some(devinfo);
+        // words, or none. The layout is not monotonic across releases, so a
+        // release without its own table has none -- never an older one's --
+        // and starts only under `--allow-nearest-abi`, with its nodes unasked.
+        self.start.devinfo = abi::devinfo::select(v);
+        if self.start.devinfo.is_none() {
+            log::warn!(
+                "host driver {v} has no GET_DEV_INFO layout table; the host's DRM nodes are not \
+                 asked what they are and no render node is offered to the guest"
+            );
+        }
         log::info!(
             "host driver {v}: {} RM controls carry a pointer RM dereferences",
             sel.table.len()
@@ -664,7 +671,7 @@ impl NvidiaBackend {
             .filter(|v| abi::rmallow::select(*v).is_some_and(|s| s.exact))
             .filter(|v| abi::uvm::select(*v).is_some_and(|s| s.exact))
             .filter(|v| abi::vidmem::select(*v).is_some_and(|s| s.exact))
-            .filter(|v| abi::devinfo::select(*v).is_some_and(|s| s.exact))
+            .filter(|v| abi::devinfo::select(*v).is_some())
             .filter(|v| abi::nvkms::select(*v).is_some())
             .collect()
     }
@@ -697,11 +704,17 @@ impl NvidiaBackend {
         if self.start.vidmem.is_some_and(|s| !s.exact) {
             out.push("video-memory table");
         }
-        if self.start.devinfo.is_some_and(|s| !s.exact) {
+        // Two tables have no nearest-older fallback, because their layouts
+        // are not monotonic across releases: GET_DEV_INFO (a release without
+        // its table gets no render node) and NVKMS (it is served only
+        // ALLOC/FREE_DEVICE).
+        if self
+            .start
+            .driver
+            .is_some_and(|v| abi::devinfo::select(v).is_none())
+        {
             out.push("GET_DEV_INFO layout");
         }
-        // No nearest-older fallback: with no table of its own a release is
-        // served only ALLOC/FREE_DEVICE through NVKMS.
         if self
             .start
             .driver
