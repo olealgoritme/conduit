@@ -37,8 +37,10 @@ Caller thread, in order:
 
 Completion side (interrupt CPU), after the device writes the used ring:
 
-* ISR at DIRQL: read of the virtio ISR-status register (MMIO, a VM exit) and
-  the level-triggered INTx EOI (the device is INTx, `MSISupported=0`); queue DPC.
+* ISR at DIRQL: on INTx (`MSISupported=0`, or the fallback), a read of the virtio
+  ISR-status register (MMIO, a VM exit) and the level-triggered INTx EOI; with
+  `MSISupported=1` (the opt-in, message mode, `docs/msi-interrupts.md`) neither: the ISR
+  counts the vector and queues the DPC.
 * DPC: `DxgkCbNotifyDpc`, then `drain_used_and_complete`: the FIRST `with_virtio`
   drains and wakes the waiter (copies the reply into the waiter's `Vec` at
   DISPATCH under the lock, `KeSetEvent`, parks the entry); then about seven more
@@ -177,11 +179,10 @@ items" 5-10 us, of which the DPC lock consolidation below is NOT included).
 
 ## 6. NOT implemented (risky blind), best expected gain first
 
-1. **MSI-X for the control queue** (est. 3-8 us per call; assigned to another
-   agent, out of this change's scope): the ISR's
-   ISR-status read and the level-triggered EOI are two exits per completion on
-   INTx. Needs a config vector on the transport, an INF `MSISupported` change,
-   and a device that offers it; a wrong guess is no interrupts at all.
+1. **MSI-X for the control queue**: DONE as an opt-in (`MsiMode=2`; INF `MSISupported=0`, INTx
+   fallback and counters; `docs/msi-interrupts.md`). Not verified on hardware: the
+   per-call gain (est. 20-35 us from the host side) is measured by `NvRttMeanUs` and
+   the `NvRttB*` histogram, A/B against `MsiMode=1`.
 2. **Lean DPC for Raw completions** (est. 2-5 us on the completion side, and
    less `virtio_lock` contention with the waiter's next call): the DPC takes the
    lock 6-8 times (`interrupt.rs::drain_used_and_complete`) and the first hold

@@ -2855,6 +2855,7 @@ impl VirtioGpu {
             let queues = [CTRL_QUEUE, nvrm_events::EVENT_QUEUE];
             let live = if nvrm_event_ring.is_some() { 2 } else { 1 };
             match super::msi::program_vectors(
+                passive,
                 &DxgkConfigAccess::new(dxgkrnl),
                 msi_granted,
                 &queues[..live],
@@ -4927,6 +4928,7 @@ impl VirtioGpu {
                 return;
             };
             self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
+            RING_POPS.fetch_add(1, Ordering::Relaxed);
             let mut entry = self.inflight.swap_remove(idx);
             // As in `latch_failed_and_fail_inflight`: take the ownership token
             // out before the `match entry.kind` moves the other fields, so the

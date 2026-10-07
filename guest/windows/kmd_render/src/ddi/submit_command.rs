@@ -330,6 +330,13 @@ pub(crate) fn publish_nvrm_counters() {
     // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a
     // deliberate negative test means a process names something that is not its own.
     crate::virtio::nvrm_harden::publish_counters();
+    // Interrupts by vector (`MsiInts` is their sum: 0 on the INTx path, the one number that says
+    // whether MSI is actually delivering), DPCs by vector, the INTx counts, delivery health and
+    // the polling safety net (`virtio::msi`, `docs/msi-interrupts.md`).
+    crate::virtio::msi::publish_counters();
+    // Round trip of forwarded RM calls: count, min / mean / max and a histogram (`NvRtt*`), the
+    // number that compares MSI-X with INTx per call.
+    crate::virtio::nvrm::publish_rtt_counters();
     // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
     // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
     // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that
@@ -743,12 +750,8 @@ pub fn diag_dump_engine_atomics() {
     crate::diag::record(
         0x0F0E_0000 | (super::interrupt::CONTROL_INT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
     );
-    // Interrupts taken in message mode (0 on the INTx path): the one number that
-    // says whether MSI is actually delivering.
-    crate::diag::record_named_bytes(
-        b"MsiInts",
-        super::interrupt::MSI_INT_COUNT.load(Ordering::Relaxed),
-    );
+    // (`MsiInts` and the other interrupt counters moved to `publish_nvrm_counters`, the
+    // periodic mirror: this dump runs only at DestroyDevice.)
     crate::diag::record(0x0F0F_0000 | (DMA_NOTIFY_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F10_0000 | (DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F11_0000 | (DMA_SYNC_STATUS_LOW.load(Ordering::Relaxed) & 0xFFFF));
