@@ -1,7 +1,8 @@
 # Independent flip (direct flip) of flip-model swap chains: KMD design
 
-Status: DESIGN ONLY. Nothing in `kmd_render` changes with this document. The one piece of code that accompanies
-it, `kmd_logic/src/independent_flip.rs` (the decision table of section 6, 16 host tests), is **not wired**.
+Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; the rest is design. The decision table of
+section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
+failure.
 Written against v327 (`225ce42`, branch `kmd/independent-flip-design`). Line numbers are that commit's.
 **Re-verified (second pass) against the WDK 10.0.26100 miniport headers**: section 1 names them `[HK]`, section 10 holds
 the header facts, and several first-pass statements changed (most importantly `DXGK_FLIPCAPS.FlipIndependent`, which the
@@ -956,3 +957,117 @@ claim in `wddm_surface.rs` rests on the measured `E_NOTIMPL` at 3.2 alone.
   created with `DXGK_ALLOCATIONINFOFLAGS2.NotifyEviction` / `NotifyIoMmuUnmap` (`:3861-3862`, `:4854-4876`). For a GpuMmu (WDDMv2) driver such
   as this one the operations dxgkrnl sends are the `>= WDDM2_0` set (`VIRTUAL_TRANSFER`, `VIRTUAL_FILL`, page-table, `NOTIFY_RESIDENCY`,
   `MAP/UNMAP_APERTURE_SEGMENT`); which of them represent eviction in practice is dxgkrnl's, not a named operation.
+p='independent-flip.md'
+s=open(p).read()
+old=s[s.index('Status: DESIGN ONLY.'):s.index('Written against v327')]
+new='''Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; the rest is design. The decision table of
+section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
+failure.
+'''
+s=s.replace(old,new)
+s=s.rstrip()+'\n'+open('/dev/stdin').read()
+open(p,'w').write(s)
+
+## 11. Stage S-1 as built (`IndepFlip`), the test recipe, and the flip-model upgrade route
+
+Branch `feat/independent-flip`. Main already had the S-0a instruments (`FlipCapsX` as an OR mask, the `IdfSpa*` / `IdfPr*` flag
+counters, `zero-copy-present.md` section 18) and the UMD's `DirectFlipSupport` knob (`docs/WINDOWS.md`). This stage bundles the caps
+into one knob and wires the decision table.
+
+### 11.1 What `IndepFlip` does
+
+| value | caps | census | flip paths |
+|---|---|---|---|
+| 0 (default, absent) | as `DirectFlipCaps` / `FlipCapsX` say, unchanged | off | unchanged |
+| 1 | `SupportDirectFlip` = 1, aperture segment `DirectFlip` = 1, `FlipCaps` OR `FlipIndependent \| DdiPresentForIFlip` (`FlipCapsRep` 0x32) | every flip judged and counted | unchanged |
+| 2 | as 1 | as 1 | a DMA-buffer flip of a Venus allocation that is not in the direct-scan-out table completes as a kept picture instead of failing (`PBFlip` 0xE6, now `IdfEnfKeep`) |
+| other | as 1 | as 1 | unchanged (a typo never enforces) |
+
+* The caps are folded in `AdapterKnobs::read` (`independent_flip::advertise`): the knob ORs into what `DirectFlipCaps` and `FlipCapsX`
+  ask for, so the caps query, the segment descriptors and the `FlipCapsXEff` / `FlipCapsRep` mirrors all report the same thing, and
+  `FlipImmediateMmIo` stays impossible. `FlipImmediateOnHSync` is not added (unmeasured; `FlipCapsX=0x40` still adds it).
+* The census (`kmd_render/src/ddi/indep_flip.rs`) counts each flip once: in the flip worker for every MMIO flip and every armed DMA flip
+  (`worker_pre`, before any arm; a foreign source is finished when `ForeignFlip` or the level-5 arm answered), and in `DxgkDdiPresent`
+  for a DMA flip answered without arming (`count_dma_unarmed`). Owner life, a user scan-out source and the failing pause are judged
+  inside `ForeignFlip`; the census reports those refusals as `IdfRef13` (`ForeignOther`), with the reason in `FfRef*`.
+* `MISC_PRIMARY` is now kept on the allocation context (`primary_tagged`), read only by the census: `IdfUntagged` counts direct flips of
+  sources the UMD did not create from a `pPrimaryDesc` (question 2.4).
+* `SCANOUT_ALLOCS` grows from 32 to 64 slots (2.8), whatever the knob.
+* Not in this stage: `IdfNeedPrim`, `IdfHoldRel`, `IdfSwitch` (names reserved), MPO (S-5: a smaller-than-output window cannot be
+  promoted to "Hardware: Independent Flip" without overlay planes, so the test window covers the output), a hardware pointer (4.5), the
+  D3D12 `pfnCheckDirectFlipSupport` slot (2.3; the D3D11 one has the `DirectFlipSupport` knob).
+
+Counters (event-gated; the whole block is written as zeros at every StartDevice, then from the periodic `scanout_trace` dump when a count
+moved): `IdfKnob` (mode in force 0/1/2), `IdfSeen`, `IdfDirect` = `IdfDirFor` + `IdfDirVen`, `IdfCopy`, `IdfKeep`, `IdfWhy` (last reason),
+`IdfRef01`..`IdfRef13` (6.2 codes), `IdfArmMmio` (`SetVidPnSourceAddress` calls), `IdfArmDma`, `IdfUntagged`, `IdfEnfKeep`.
+`IdfSeen` can differ from the sum of verdicts by level-5 retries (counted when retried) and from `IdfArm*` by flips whose handle did not
+resolve.
+
+### 11.2 The test app
+
+`guest/windows/tools/d3d11_iflip.cpp` (mingw build line in its header): a `FLIP_DISCARD` D3D11 swap chain, by default in a **borderless
+window covering the output at its current mode** (the only windowed shape eligible without MPO: extent must equal the mode, 2.2), 2
+buffers, interval 1, cursor hidden over the window (a software cursor is drawn by DWM, 4.5). Options: `window` (1280x720 decorated, the
+negative control), `interval0` (the DMA-buffer contract), `tearing`, `cursor`, `rgba`, `buffers=N`, `adapter=N`. It logs dxgkrnl's derived
+answers (`KMTQAITYPE` 19, 28, 20, 39 for the adapter), then every second the fps and the DXGI presentation mode from
+`IDXGISwapChainMedia::GetFrameStatisticsMedia` (`COMPOSED`, `NONE` = not composed, `OVERLAY` = an MPO plane [M]), and a final `RESULT` line.
+
+### 11.3 Recipe (main runs it; lowest mode first)
+
+Per row: set the service values, reboot (dxgkrnl derives the user-mode answers when the adapter is created), check `IdfKnob` and
+`FlipCapsRep`, run the app for 20 s under PresentMon (`--process_name d3d11_iflip.exe`), then read the counters.
+
+| row | `IndepFlip` | `HKLM\SOFTWARE\Helios` `DirectFlipSupport` | run | expect |
+|---|---|---|---|---|
+| A | 0 | 0 | `d3d11_iflip.exe 20` | `Composed: Flip`, `RESULT ... COMPOSED`, kmt 19/28 = 0, `IdfKnob` 0 |
+| B | 1 | 0 | same | kmt answers show what our caps buy; `IdfSeen` ~ DWM's flips (`IdfDirFor` with DWM on NVK); still composed if the UMD is the gate |
+| C | 1 | 1 | same | the promotion row. UMD log: `CheckDirectFlipSupport ... -> yes`. PresentMon `Hardware: Independent Flip`, DXGI mode `NONE`, `IdfPrRedir` / `IdfSpaExcl` / `IdfSpaTrans` rising, `IdfSeen` rising with the app's rate, `FfReowned` +2 per promotion round trip |
+| D | 1 | 1 | `d3d11_iflip.exe 20 window` | negative control: composed |
+| E | 1 | 1 | `d3d11_iflip.exe 20 interval0` | DMA contract: `IdfArmDma` rising; `IdfRef06` (`NotRegistered`) and `PBFlip` 0xE6 if the app's buffers are not direct primaries |
+| F | 2 | 1 | as E | `IdfEnfKeep` replaces 0xE6 (screen keeps a picture instead of the Present failing) |
+| G | 1 | 1 | as C with `cursor` | does a visible software cursor block or break promotion (4.5) |
+
+Read with every row: `IdfKnob`, `IdfSeen`, `IdfDirect`, `IdfDirFor`, `IdfDirVen`, `IdfCopy`, `IdfKeep`, `IdfWhy`, `IdfRef01..13`, `IdfArmMmio`,
+`IdfArmDma`, `IdfUntagged`, `IdfEnfKeep`; the S-0a flags `IdfSpaTrans`, `IdfSpaExcl`, `IdfSpaMove`, `IdfPrRedir`; and `FlipCapsRep`, `PBFlip`,
+`FkKeep*`, `FfProg`, `FfReowned`, `ScAlcFul`. UMD log: `CheckDirectFlipSupport` answers and `primary_desc=` on the app's buffers
+(2.4: `true` means the app's buffers are primaries, and with format 87 they are `MISC_DIRECT_SCANOUT` and take the direct bind).
+
+Reading the outcome: promotion with `IdfDirect` rising is the goal. Promotion with `IdfKeep` rising means the app's frames are not shown
+(`IdfWhy` names why). No promotion with C's UMD answer `yes`: the next suspects are the pointer (row G vs C), the app's buffers not being
+primaries (`primary_desc=false`, `IdfUntagged`), and what kmt 28 reports. Safety: `FlipIndependent` may change how DWM's own flips arrive;
+watch `PBFlip` and `FkKeep*` on the first boot with it; recovery is `IndepFlip=0` and a reboot (the knob is the whole surface).
+
+### 11.4 Why it matters
+
+A composed windowed frame costs a copy of the frame (5.8 MB at the measured size, about 345 us of GPU/PCIe time on the host) into the
+redirection surface before DWM can use it, and no host tuning removes it. A promoted chain is scanned out from the application's own
+buffer: the copy and DWM's composition of that window disappear.
+
+### 11.5 The flip-model upgrade of blt-model games (`REASON_NONGAME`), re-checked
+
+Heaven presents blt-model (one buffer, `DXGI_SWAP_EFFECT_DISCARD`); independent flip needs a flip-model chain, so for such games the
+route is Windows' swap-effect upgrade ("optimizations for windowed games"): DXGI silently creates a flip-model chain for a D3D10/11
+blt-model one. What was measured (`kmd-handoff-2026-10.md` section 2): DXGI's `DXGI_ETW_SWAPCHAIN_CREATE` event carries
+`WINDOWEDSWAPEFFECTUPGRADE_REASON_NONGAME` for Heaven; the per-app `UserGpuPreferences` value upgraded `d3d11_triangle` some of the time
+and never Heaven; the `FlipCapsX` rows changed nothing.
+
+What gates it, and what the driver can do:
+
+* **The game classification is a user-mode OS policy keyed on the process, not on the adapter.** [M] DXGI asks the system's game
+  detection (the same one Game Bar uses; its per-user store is `HKCU\System\GameConfigStore`, and Game Bar's "Remember this is a game"
+  adds an executable to it) whether the process is a game. Nothing in the KMD caps or the UMD DDI is an input to that answer, so **the
+  driver cannot influence `REASON_NONGAME`**. The user-side levers to test: Game Bar's "Remember this is a game" with Heaven focused, then
+  the per-app `SwapEffectUpgradeEnable=1;` value, then re-run the capture.
+* **The other reasons are listed by DXGI's own manifest**, which no doc on disk has: `ci/vmtest/swapeffect-upgrade.ps1 -ListOnly` prints
+  every `WINDOWEDSWAPEFFECTUPGRADE_REASON_*` the provider defines. Any of them that name a driver property are the ones the driver can
+  act on. The single-buffer and `ALLOW_MODE_SWITCH` properties of Heaven's chain are app-side (`d3d11_triangle` options `modeswitch`,
+  `rgba` reproduce them).
+* `-Exe <path> -PerApp` runs a program under the capture with the per-app opt-in and prints the reasons and swap effects it hit.
+* "Some of the time" for `d3d11_triangle` suggests a second, transient gate (for example a reason tied to the window or output at
+  creation time, like the separate "Failed to find an output for the swapchain" message). The script's per-run reason histogram separates
+  the two.
+* Even when it works, an upgraded 1280x720 or 1600x900 window is `Composed: Flip`, not independent flip. That still removes the blt into
+  the redirection surface, because DWM composes from the app's buffer. Independent flip additionally needs the window to cover the output
+  (11.2).
+* The UMD's `CheckDirectFlipSupport` answer may also feed the upgrade decision (the knob's commit message says "may"); row C with a
+  blt-model app (`d3d11_triangle helios blt`) under the script answers whether `DirectFlipSupport=1` changes the reason list.
