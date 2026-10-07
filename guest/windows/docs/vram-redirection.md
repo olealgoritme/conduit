@@ -496,3 +496,145 @@ Other drivers: [VirtualBox VBoxMPWddm.cpp](https://github.com/VirtualBox/virtual
 [WSL dxgkrnl](https://github.com/microsoft/WSL2-Linux-Kernel/tree/linux-msft-wsl-6.18.y/drivers/hv/dxgkrnl).
 ETW layouts: [Windows 11 26H1 DxgKrnl manifest (Windows10EtwEvents)](https://github.com/jdu2600/Windows10EtwEvents/blob/master/manifest/Microsoft-Windows-DxgKrnl.tsv);
 PresentMon's present-mode rules: [PresentMonTraceConsumer.cpp](https://github.com/GameTechDev/PresentMon/blob/main/PresentData/PresentMonTraceConsumer.cpp).
+
+## 10. Fallback A as built: GDI acceleration on the copy engine (`GdiAccel`, default 0)
+
+Status: G0 (caps + RenderKm census) and G1 (executor + fence gate) built on
+`feat/vram-redirection-gdi-accel`, host-tested where pure (`kmd_logic::gdi_accel`, 17 tests), type-checked
+against the stub WDK, never compiled against the real WDK and never run. V1 was negative on hardware
+(`PBdStd` 3, `StdNGdiTex` 0 with `VidMmCapsX=0x200`), so this is the main path to a GPU-resident
+redirection surface.
+
+### 10.1 What Windows requires (research)
+
+| item | mandatory? | source |
+|---|---|---|
+| `DXGK_PRESENTATIONCAPS.SupportKernelModeCommandBuffer` | the opt-in; "a required feature starting with WDDM 1.1" for full-graphics and render-only drivers in Microsoft's feature-caps table (certification), but not enforced at load: this KMD loads with it clear (22.22.180.0 A/B) | [GDI Hardware Acceleration](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gdi-hardware-acceleration), [WDDM driver and feature caps](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/wddm-driver-and-feature-caps), [DXGK_PRESENTATIONCAPS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_presentationcaps) |
+| a cache-coherent aperture segment | precondition ("report this support only if the cache-coherent GPU aperture segment exists"); segment 1 is one | same |
+| `DxgkDdiCreateAllocation`, `DxgkDdiGetStandardAllocationDriverData` (GDI surface types `TEXTURE`, `STAGING_CPUVISIBLE`, `STAGING`, `LOOKUPTABLE`, `EXISTINGSYSMEM`; Pitch returned for the CPU-visible ones) | mandatory | [Setting the Size and Pitch](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/setting-the-size-and-pitch-of-the-memory-allocation), [D3DKMDT_GDISURFACETYPE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ne-d3dkmdt-_d3dkmdt_gdisurfacetype) |
+| `DxgkDdiRenderKm` in `DRIVER_INITIALIZATION_DATA`; the GDI device/context (`GdiDevice`, `GdiContext` flags) | mandatory | [Initialization and DMA Buffer Creation](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/initialization-and-dma-buffer-creation), [DxgkDdiRenderKm](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_renderkm) |
+| translate the WHOLE command buffer: BitBlt (1), ColorFill (2), AlphaBlend (3), StretchBlt (4), TransparentBlt (6), ClearTypeBlend (7); Escape (5) ignored | mandatory: the return codes have no per-operation decline | [Specifying GDI Hardware-Accelerated Rendering Operations](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/specifying-gdi-hardware-accelerated-rendering-operations), the `DXGK_GDIARG_*` pages |
+| the output patch-location list with every allocation reference | mandatory | DxgkDdiRenderKm remarks |
+| `NoSameBitmap*`, `NoSameBitmapOverlapped*`, `NoScreenToScreenBlt`, `NoOverlapScreenBlt` | optional declines (dxgkrnl "will not request") | DXGK_PRESENTATIONCAPS |
+| `SupportAllBltRops`, `SupportMirrorStretchBlt`, `SupportMonoStretchBltModes` | optional; clear = CDD sends only the named ROPs, no mirror, no BLACKONWHITE/WHITEONBLACK | same, `DXGK_GDIARG_BITBLT`, `DXGK_GDIARG_STRETCHBLT` |
+| `AlignmentShift` (>= 2), `MaxTextureWidthShift`/`HeightShift` | required fields | DXGK_PRESENTATIONCAPS |
+| present CDD operations into DWM's UMD-created textures | implied by GDI acceleration (`DriverSupportsCddDwmInterop` is then ignored) | DXGK_PRESENTATIONCAPS |
+
+Public drivers: none implements RenderKm. VirtualBox's WDDM driver reports `NoScreenToScreenBlt |
+NoOverlapScreenBlt | AlignmentShift 2 | MaxTexture*Shift 2` without `SupportKernelModeCommandBuffer` and
+leaves its GDI surface case commented out
+([VBoxMPWddm.cpp](https://github.com/VirtualBox/virtualbox/blob/main/src/VBox/Additions/win/Graphics/Video/mp/wddm/VBoxMPWddm.cpp));
+viogpu3d registers no RenderKm and reports `PresentationCaps` 0
+([viogpu_adapter.cpp](https://github.com/max8rr8/kvm-guest-drivers-windows/blob/viogpu3d/viogpu/viogpu3d/viogpu_adapter.cpp));
+Microsoft's render-only sample driver sets it FALSE and stubs RenderKm
+([graphics-driver-samples, RosKmd](https://github.com/microsoft/graphics-driver-samples)); the KMDOD sample
+is display-only. The operation semantics this executor implements come from the Learn pages alone
+(the formulas of `DXGK_GDIARG_ALPHABLEND`, `_TRANSPARENTBLT`, `_STRETCHBLT`, `_CLEARTYPEBLEND`,
+`_BITBLT`). The fill words follow Mesa NVK's `nvk_cmd_fill_memory_ce` (remap `CONST_A`,
+[nvk_cmd_copy.c](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/nouveau/vulkan/nvk_cmd_copy.c)).
+PresentMon's "Composed: Copy with GPU GDI" is a Blt with `bRedirectedPresent` 0 followed by
+PresentHistory model `REDIRECTED_BLT`, independent of these caps
+([PresentMonTraceConsumer.cpp](https://github.com/GameTechDev/PresentMon/blob/main/PresentData/PresentMonTraceConsumer.cpp)).
+
+### 10.2 The caps word
+
+`GdiAccel=1` reports `0x0A06C8FC` (`kmd_logic::gdi_accel::ACCEL_CAPS`; bit positions from the C bitfield
+order of WDK 10.0.26100.0 `d3dkmddi.h`, NOT the Learn page's "Nth bit" sentences, which are wrong after the
+4-bit `AlignmentShift`): `SupportKernelModeCommandBuffer` (bit 2), `NoSameBitmapAlphaBlend`,
+`NoSameBitmapStretchBlt`, `NoSameBitmapTransparentBlt`, `NoSameBitmapOverlappedAlphaBlend`,
+`NoSameBitmapOverlappedStretchBlt` (3-7), `AlignmentShift` 2 (10-13), `MaxTextureWidthShift` and
+`MaxTextureHeightShift` 3 = 16384 (14-16, 17-19), `NoSameBitmapOverlappedBitBlt` (25: a scroll goes back to
+CDD; a disjoint copy inside one surface stays ours), `NoTempSurfaceForClearTypeBlend` (27). Clear:
+`SupportAllBltRops`, mirror, mono modes, `NoScreenToScreenBlt`/`NoOverlapScreenBlt` (the Present path is
+unchanged), the reserved bits. `GdiAccel=2` reports only `DriverSupportsCddDwmInterop` (0x100) and
+`GdiAccel=3` only `SupportSoftwareDeviceBitmaps` (0x10000000): one-bit experiments without GDI
+acceleration (RenderKm stays the pass-through; `GdiKnob`/`GdiCaps` mirror the word). Knob absent or any
+other value: 0, as before.
+
+### 10.3 The pieces
+
+| piece | file | what |
+|---|---|---|
+| pure rules | `kmd_logic/src/gdi_accel.rs` | caps; the `DXGK_RENDERKM_COMMAND` reader (x64 offsets checked against a C compile of the header's declarations; refusals `Bad`: size, opcode, sub-rects, trailer); `plan` (engine and `Why`); the CE words of a fill (`SET_REMAP_CONST_A/B/COMPONENTS` = `CONST_A` x4, `COMPONENT_SIZE_FOUR`, one component; `LAUNCH_DMA` with `REMAP_ENABLE`, pitch, multi-line, non-pipelined) and of a rectangle copy (`ce_present::copy`, `Remap::None`); the CPU reference executor (ROP3, the named ROPs, AlphaBlend premultiplied `AC_SRC_OVER`, TransparentBlt, StretchBlt with the truncate mapping and mirroring, ClearTypeBlend with and without the gamma table); the private record `"HGDA"`; the timeline |
+| caps and RenderKm | `kmd_render/src/ddi/gdi_accel.rs` | `reported_caps` (query_adapter_info), `note_start` (AdapterKnobs at StartDevice), `render_km`: parse, resolve each allocation index through `present_alloc_info` and classify it (VRAM: `vidmem::lookup`; System: a `PitchedStandardBuffer`; else Unreachable), plan, materialise and clip sub-rectangles (inline from the command buffer, or copied from dxgkrnl's kernel pointer), patch list, clear the private data and write the job id, 16-byte DMA marker |
+| executor | `kmd_render/src/ddi/gdi_exec.rs` | job table (`commit`, orphans above 256 unclaimed), `admit` at SubmitCommand, `seq_ready` for the fence, `service` on the HPD worker, `discharge_all` at StopDevice |
+| seam | `kmd_render/src/ddi/gdi_ce_glue.rs` | the only calls into the V2-V5 modules (section 8): `vidmem::lookup`, `ce_vram::{ce_surface, wait, transfer}`, `ce_channel::submit_build`, `read/write_standard_buffer`; a busy channel retried 4 x 1 ms |
+| fence gate | `virtio/gpu/mod.rs` | `WddmPending::gdi_seq`: the immediate-signal path and the FIFO head both wait for `seq_ready`; not rebasable |
+| hooks | `submit_command.rs` (RenderKm body, both SubmitCommand entry points), `hpd.rs`, `lifecycle.rs`, `query_adapter_info.rs`, `adapter/mod.rs`, `diag.rs` | one relaxed load each with the knob off |
+
+### 10.4 A GDI command's path
+
+1. CDD -> `DxgkDdiRenderKm` (PASSIVE): the buffer becomes job N (commands, surfaces, engine, clipped
+   sub-rectangles); `pDmaBufferPrivateData[0..16]` = `"HGDA"`, version 1, N (the rest of the 112 bytes
+   zeroed: a recycled buffer's stale `"HPBL"` Present prefix would otherwise gate this fence on an old copy).
+2. `DxgkDdiSubmitCommand` (DISPATCH): `admit(N)`: first time, the next sequence S and a worker wake; a
+   preempted replay, the same S; N already executed and gone, no wait. The WDDM entry carries `gdi_seq` S.
+3. HPD worker: jobs in S order. Engine `Ce` (SRCCOPY BitBlt, PATCOPY ColorFill, every surface VRAM): one
+   push per 10-11 rectangles through `submit_build`, waited at most 100 ms. Engine `Cpu` (everything else,
+   or a CE failure): the bounding window of the sub-rectangles read from each surface (VRAM through the
+   bounce buffer, a standard buffer through its authoritative CPU view at the command's pitch for
+   `STAGING_CPUVISIBLE`), the reference executor over each sub-rectangle, the destination window written
+   back (`write_standard_buffer` updates the blob and the system pages VidMm holds). Then the watermark
+   moves to S and a completion DPC retires the fence.
+
+Every admitted job completes (CE failure -> CPU; CPU failure -> dropped, counted; StopDevice discharges),
+so a GDI fence cannot block the adapter-global FIFO forever.
+
+### 10.5 Counters (`gdi_accel::COUNTERS`, written only by `gdi_accel.rs` and `gdi_exec.rs`)
+
+| counter | meaning |
+|---|---|
+| `GdiKnob`, `GdiCaps` | knob in force, the PresentationCaps word reported |
+| `GdiCmdN`, `GdiOpN` | RenderKm calls, commands parsed |
+| `GdiBad`, `GdiBadWhy` | refused command buffers (parsing stopped there), last `Bad` code (1 size, 2 opcode, 3 sub-rects, 4 trailer) |
+| `GdiOpMask` | opcodes seen, bit = opcode (2 BitBlt, 4 ColorFill, 8 AlphaBlend, 16 StretchBlt, 32 Escape, 64 TransparentBlt, 128 ClearType) |
+| `GdiRopMask` | ROPs seen: BitBlt bit = rop (1 SRCCOPY .. 5 ROP3), ColorFill bit = 8 + rop (1 PATCOPY .. 7 ROP3) |
+| `GdiBltN`, `GdiFillN` | commands executed on the copy engine |
+| `GdiFall` | commands executed on the CPU |
+| `GdiDrop` | commands not executed |
+| `GdiWhy`, `GdiMask` | last reason off the copy engine, every reason seen (`1 << code`): 1 ROP, 2 blend, 3 stretch, 4 transparent, 5 ClearType, 6 a system surface, 7 overlap, 8 CE failed (redone on the CPU), 9 unreachable surface, 10 bad index, 11 out of bounds, 12 CPU failed, 13 timeout |
+| `GdiJobN`, `GdiAgain`, `GdiDone`, `GdiOrph` | jobs admitted, replays, executed, unclaimed jobs dropped |
+| `GdiCeSub`, `GdiRects` | CE pushes, sub-rectangles parsed |
+| `GdiUs`, `GdiUsMax` | executor time per job (sum, max, µs) |
+| `GdiCls` | surface classes seen: destination bit 0 VRAM, 1 standard buffer, 2 unreachable; sources the same at bits 4-6 |
+| `GdiDstRes`, `GdiDstWH` | last destination's resource id and `w << 16 \| h` |
+
+Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
+
+### 10.6 Unverified, and known limits
+
+* Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
+  advertises it late (no other public driver does) is the first thing G0's census answers.
+* `NumSubRects` 0 is taken as "the destination rectangle alone" (not documented); an external `pSubRects`
+  (outside the command buffer) is read as a kernel pointer (documented as needing no try/except).
+* The `Rop3` field is read as its low byte.
+* Without `RedirVram` a GDI `TEXTURE` is a Venus image: Unreachable, every command on it dropped. G1 needs
+  `RedirVram=1` (and the copy-engine channel up) for windows to draw.
+* `EXISTINGSYSMEM` surfaces wrap user memory Windows hands to CreateAllocation; today's
+  `GetStandardAllocationDriverData` backs every non-TEXTURE GDI surface with a KMD standard buffer, so its
+  content is not the user's pages (counted as a standard buffer, executed on the wrong bytes). To fix in
+  the allocation arm (owned by the V2 branch) if the census shows Windows using it.
+* The CPU path is synchronous on the HPD worker (bounded by the bounce transfer's 250 ms per surface) and
+  reads whole bounding windows; a GDI-heavy desktop costs worker time the Present path shares.
+* ClearType's gamma row is read from the `LOOKUPTABLE` surface at `Gamma * pitch` (8 bpp, 512 entries);
+  if that surface is not a standard buffer the blend runs without gamma.
+
+### 10.7 Test recipe (main session)
+
+G0 rows (census only; with the G1 build the same counters plus execution):
+
+1. `reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v GdiAccel /t REG_DWORD /d 1 /f`;
+   for G1 also the 7b knobs (`RedirVram=1`, `RmCopyEngine=1`, `CeRtDirect=1`, `ForeignCopy=1`, `BltAsync=1`,
+   `DwmIcd=nvk`). Reboot (the caps are read at AddAdapter), or `pnputil /restart-device` then DWM and the
+   shell.
+2. Code 0? `GdiKnob` 1, `GdiCaps` 0x0A06C8FC.
+3. Before and after Explorer, Notepad, windowed Heaven (10 s): `StdNGdiTex`, `StdOGdiTex`, `StdOpenPid`,
+   `PBdStd` (4 = GDI surface), `PBdGdi` (1 = TEXTURE), `RvTry`/`RvOk`, the `Gdi*` row.
+4. Screenshot (`shot.ps1`). G0: content wrong or stale is expected. G1: windows drawn; `GdiDrop` flat,
+   `GdiBltN`/`GdiFillN` growing, `GdiFall` for blends and text.
+5. Heaven: PresentMon `msInPresentAPI`, ETW capture `hv-gdi` (no Lock on the redirection surface).
+6. Off row: knob removed, reboot: `GdiKnob` absent or 0, `PresentationCaps` 0 in the 0x01D1 record.
+
+What each G0 outcome means: `GdiCmdN` 0 and `StdNGdiTex` 0 -> Windows ignores the cap here (then 5.5);
+`StdNGdiTex` > 0 and `PBdStd` 4 for Heaven -> the redirection surface is GPU-only, G1 with `RedirVram` is
+the path; adapter fails to start or a bugcheck in RenderKm -> the counters and the code to the lane.

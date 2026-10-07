@@ -1,23 +1,21 @@
 //! GDI hardware acceleration limited to what the KMD executes (`GdiAccel`, lane F fallback A):
 //! the I/O half of the caps and of `DxgkDdiRenderKm`. The pure rules are
 //! `helios_kmd_logic::gdi_accel`; the executor is `ddi/gdi_exec.rs`; the design, the sources and
-//! the hardware procedure are `docs/vram-redirection.md` section 9.
+//! the hardware procedure are `docs/vram-redirection.md` section 10.
 //!
 //! KNOB. `GdiAccel` (read with the other caps knobs at AddAdapter and StartDevice, `AdapterKnobs`).
 //! Anything but 1: the reported `PresentationCaps` word is 0 exactly as before, `on()` is one
 //! relaxed load that answers false, `DxgkDdiRenderKm` keeps its pass-through body, nothing is
 //! counted or written.
 //!
-//! WITH THE KNOB AT 1 (stage G0, this commit): the caps word of `gdi_accel::ACCEL_CAPS` is
-//! reported, so Windows may move GDI redirection to GDI `TEXTURE` surfaces and send GDI operations
-//! as kernel-mode command buffers. Every `DxgkDdiRenderKm` buffer is parsed, each command's
-//! surfaces are resolved through the allocation list and classified (VRAM / system pages /
-//! unreachable), the engine the executor would pick is decided and counted, the referenced
-//! allocations are put in the output patch list, and a 16-byte marker is the DMA buffer. The
-//! commands are NOT executed yet (`GdiDrop`): G0 answers "does Windows accept GDI acceleration on
-//! this adapter, which surfaces does it create and which operations does it send", it does not
-//! draw. Expect wrong or stale window content with the knob on; recovery is the knob removed and
-//! `pnputil /restart-device`.
+//! WITH THE KNOB AT 1: the caps word of `gdi_accel::ACCEL_CAPS` is reported, so Windows may move
+//! GDI redirection to GDI `TEXTURE` surfaces and send GDI operations as kernel-mode command
+//! buffers. Every `DxgkDdiRenderKm` buffer is parsed, each command's surfaces are resolved through
+//! the allocation list and classified (VRAM with `RedirVram`, a KMD standard buffer reachable by
+//! the CPU, or unreachable), the engine is planned, the sub-rectangles are materialised, and the
+//! whole buffer becomes one job of `ddi/gdi_exec.rs`, named in the DMA buffer's private data; the
+//! referenced allocations go into the output patch list and a 16-byte marker is the DMA buffer.
+//! SubmitCommand admits the job and gates the fence on it; the HPD worker executes it.
 //!
 //! IRQL. `DxgkDdiRenderKm` is PASSIVE (WDK), so the registry mirrors may be written from it
 //! (throttled); nothing here is touched at DISPATCH.
@@ -70,6 +68,10 @@ pub(crate) fn note_start(knob: u32) {
     crate::ddi::gdi_exec::reset_for_start(caps.on);
     if caps.on {
         publish_counters();
+    } else if caps.reported != 0 {
+        // A one-bit experiment (knob 2 or 3): only the word is mirrored.
+        crate::diag::record_named_bytes(b"GdiKnob", knob);
+        crate::diag::record_named_bytes(b"GdiCaps", caps.reported);
     }
 }
 

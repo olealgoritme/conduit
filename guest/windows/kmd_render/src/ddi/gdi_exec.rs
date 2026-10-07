@@ -1,6 +1,6 @@
 //! The executor of GDI acceleration (`GdiAccel` = 1, stage G1): the job table RenderKm fills, the
 //! admission at SubmitCommand, the gate on the WDDM fence, and the execution on the HPD worker.
-//! Pure rules: `helios_kmd_logic::gdi_accel`; design: `docs/vram-redirection.md` section 9.
+//! Pure rules: `helios_kmd_logic::gdi_accel`; design: `docs/vram-redirection.md` section 10.
 //!
 //! LIFE OF A JOB.
 //! 1. `DxgkDdiRenderKm` (PASSIVE) parses the command buffer and [`commit`]s a job: its commands

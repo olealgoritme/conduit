@@ -1132,9 +1132,11 @@ pub mod knobs {
     /// `GdiAccel` (default 0 = no GDI hardware acceleration: `PresentationCaps` 0, the word since
     /// 22.22.180.0). 1: report `helios_kmd_logic::gdi_accel::ACCEL_CAPS`
     /// (`SupportKernelModeCommandBuffer` with the `NoSameBitmap*` declines) and translate
-    /// `DxgkDdiRenderKm` command buffers (`ddi/gdi_accel.rs`). Any other value is 0. Read with the
+    /// `DxgkDdiRenderKm` command buffers (`ddi/gdi_accel.rs`). 2: only `DriverSupportsCddDwmInterop`
+    /// (0x100), 3: only `SupportSoftwareDeviceBitmaps` (0x10000000), one-bit experiments without
+    /// GDI acceleration. Any other value is 0. Read with the
     /// other caps knobs at AddAdapter and StartDevice; mirrored as `GdiKnob`/`GdiCaps`.
-    /// `docs/vram-redirection.md` section 9.
+    /// `docs/vram-redirection.md` section 10.
     pub const GDI_ACCEL: KnobName = KnobName::new(b"GdiAccel");
     /// `DXGK_VIDMMCAPS` extra bits (default 0 = the driver's own word). A raw mask OR'd into
     /// `MemoryManagementCaps`; only bit 9 `NonCpuVisiblePrimary` (0x200) is accepted

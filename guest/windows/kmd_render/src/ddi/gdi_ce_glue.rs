@@ -1,6 +1,6 @@
 //! The one seam between GDI acceleration (`ddi/gdi_accel.rs`, `ddi/gdi_exec.rs`) and the modules
 //! of the redirection lane it executes on (boundary agreed with the V2-V5 work, recorded in
-//! `docs/vram-redirection.md` 8 and 9): the RM video-memory surfaces and their copy-engine
+//! `docs/vram-redirection.md` 8 and 10): the RM video-memory surfaces and their copy-engine
 //! mappings (`virtio/rm_client/{vidmem,ce_vram}.rs`, `RedirVram`), the generic submission on the
 //! KMD's copy-engine channel (`ce_channel::submit_build`), and the CPU view of a KMD standard
 //! buffer (`build_paging_buffer::{read,write}_standard_buffer`). Every function here is a thin
