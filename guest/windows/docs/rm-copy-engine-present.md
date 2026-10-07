@@ -3,7 +3,8 @@
 Status: sections 0 to 9 are the research (M0) and the M1 tool, which PASSed on a GB202 (async CE, acquire held, verify ok).
 M3a, the host-testable half of the KMD route, is
 sections 10 and 11 (`protocol/src/rm_fence_v3.rs`, `kmd_logic/src/ce_present.rs`); no `kmd_render` code exists yet. M1b, the
-tool's block-linear round trip, is built and has not run yet (10.4). Every claim cites the file or patch it comes
+tool's block-linear round trip, is built and has not run yet (10.4). M1c, the RGBA -> BGRA conversion inside the copy with the
+CE remap unit, is section 12: built in the builder and the tool, not run yet. Every claim cites the file or patch it comes
 from; "unknown" marks what nobody has run, with what would settle it. Host driver release assumed: 610.57.04 (the release
 the host backend runs, `host/backend/gen/src/rmallow/v610_57_04.rs`). GPU: RTX 5090 (GB202) unless Ada is named.
 
@@ -846,3 +847,103 @@ How the KMD learns the value advanced, two ways, both reading the CPU mapping of
 
 Naming: the knob is `RmCopyEngine` (section 6 and 9 called it `BltRmCe`; the M3 knob list uses the longer, unambiguous
 name, still within 14 characters).
+
+## 12. Format conversion with the CE remap unit (M1c)
+
+### 12.1 The formats
+
+Heaven's windowed source is RGBA: fourcc `AB24` (`DRM_FORMAT_ABGR8888`, bytes R G B A), DXGI format 28 `R8G8B8A8_UNORM`,
+block-linear modifier 0x0300000000606014 (10.3). The redirection surface DWM reads, the Blt destination, is BGRA: `AR24`
+(`DRM_FORMAT_ARGB8888`, bytes B G R A), DXGI 87 `B8G8R8A8_UNORM`. Every windowed Present therefore exchanges bytes 0 and 2 of
+every pixel. A Vulkan transfer command (`vkCmdCopyImage`, `vkCmdCopyImageToBuffer`) copies bytes and cannot do it, so the
+Venus route falls back to the graphics engine for every one of these copies. The copy engine can do it inside the copy: its
+REMAP unit picks each destination component from a source component or a constant.
+
+### 12.2 The remap table and the decision
+
+The unit (Mesa's `clcab5.h` and `clc7b5.h`, the 610.57.04 `clc7b5.h`; the 610.57.04 `clcab5.h` omits it, 11.7 item 9):
+- `SET_REMAP_COMPONENTS` 0x708: `DST_X` 2:0, `DST_Y` 6:4, `DST_Z` 10:8, `DST_W` 14:12, each `SRC_X..SRC_W` (0..3),
+  `CONST_A` (4), `CONST_B` (5) or `NO_WRITE` (6); `COMPONENT_SIZE` 17:16, `NUM_SRC_COMPONENTS` 21:20 and
+  `NUM_DST_COMPONENTS` 25:24, each `n - 1`.
+- `SET_REMAP_CONST_A/B` 0x700/0x704, sent only when a component selects one.
+- `LAUNCH_DMA.REMAP_ENABLE` (bit 10).
+
+With 1-byte components, 4 in and 4 out, component X is byte 0 of the pixel and W byte 3. When the remap is on, the X
+quantities of the copy are counted in elements (4 bytes here) instead of bytes: `LINE_LENGTH_IN`, `SET_SRC/DST_WIDTH`,
+`SRC/DST_ORIGIN_X`. The pitches stay bytes and Y stays rows. NVK's `nouveau_copy_rect` does the same (`src_bw = 1` with a
+remap), and both `ce_present::copy` and the tool follow it.
+
+| source -> destination | remap | `SET_REMAP_COMPONENTS` |
+|---|---|---|
+| `AB24` -> `AR24` or `XR24`, `AR24` -> `AB24` or `XB24` | `SwapRb`: `DST_X = SRC_Z`, `DST_Z = SRC_X`, Y and W identity | 0x03303012 |
+| `XB24` -> `XR24`, `XR24` -> `XB24` | `SwapRb` | 0x03303012 |
+| `XB24` -> `AR24`, `XR24` -> `AB24` | `SwapRb` with `DST_W = CONST_A` = 0xffffffff (the X byte is undefined) | 0x03304012, `CONST_A/B` first |
+| the same byte order, A or X -> X, or A -> A | `None` (`REMAP_ENABLE` off, a byte copy) | |
+| `XB24` -> `AB24`, `XR24` -> `AR24` | identity with `DST_W = CONST_A` | 0x03304210, `CONST_A/B` first |
+| anything else | refused: `Unsupported::SourceFormat` (1) or `DestinationFormat` (2), `Why::FormatUnsupported` (13) | |
+
+The decision is pure: `ce_present::remap_for(src_fourcc, dst_fourcc) -> Result<Remap, Unsupported>`. The byte orders
+come from `rm_blt::order_for_fourcc` and `swizzle`, the KMD's existing CPU-copy rules, so the two routes cannot disagree.
+`dst_fourcc_for_dxgi` maps a Blt destination's DXGI format (87/91 -> `AR24`, 88/93 -> `XR24`, 28/29 -> `AB24`). `Remap` is
+`None`, `SwapRb` or `Select(Selector)`, a general selector with the two constants. In M3c the Present arm calls `remap_for`
+with the record's `source.fourcc` and the destination's format and sets `CopyRect::remap`; a refusal becomes
+`Facts::source = Err(Why::FormatUnsupported)`, and the Present takes the Venus copy. The largest Present push grows to 38
+dwords (`PRESENT_PUSH_MAX_DWORDS`). `CONST_A` is 0xffffffff because the headers do not say which byte of the 32-bit constant
+a 1-byte component takes; with every byte 0xff the answer does not matter.
+
+### 12.3 The open question: REMAP with a block-linear source
+
+Heaven's copy is a block-linear source into a pitch destination with the remap on. The headers do not say whether the remap
+unit works together with block-linear source addressing on 0xcab5, and nothing here has run the combination. NVK's
+`nvk_cmd_copy.c` is evidence that it does: it enables the remap on every image copy (`nouveau_copy_remap_format`, an identity
+selector with one 4-byte component for a 32 bpp format) and uses 1-byte components for the depth/stencil aspect copies
+(`nvk_remap_insert_aspect` / `nvk_remap_extract_aspect`), block-linear images included. But NVK runs those on the graphics
+engine's CE of its 3D channel, never with an R/B exchange of 1-byte components on an async CE, so the combination stays
+open until the tool has run it. The tool makes
+it a run line of its own (`crm_ce_copy_smoke --bl-src-only`): the pitch pattern goes into the block-linear image WITHOUT the
+remap (the M1b words), then the image comes back into the pitch destination WITH the remap, and the CPU checks that the
+destination is the swapped pattern. A refusal (an RC error on the tool's channel) or a hang (no completion within
+`--timeout-ms`) therefore belongs to that combination alone. The tool prints the error notifier and whether the middle
+release landed (which copy it stopped in), then tears the channel down with the bounded waits it already has.
+
+### 12.4 The fallback designs, if the combination is refused
+
+Not decided in code; the hardware result chooses. The numbers come from the same matrix run (12.5).
+- **A. A second pass.** Copy the block-linear source into a pitch-linear scratch in video memory without the remap (the M1b
+  `bl_to_pitch` words, into video memory instead of guest RAM), then copy the scratch into the destination with the remap
+  (pitch -> pitch, the `pitch_to_pitch_on` combination), in the same push with a host release with WFI between them. Cost:
+  one more 5.76 MB video-memory-to-video-memory copy per frame, about `remap_off_pitch_to_bl_us` (the tool's pitch -> BL copy
+  also reads and writes video memory), and a scratch of `pitch * height` bytes (5.76 MB) per channel, enough because the
+  channel serializes its frames. Expected total: `remap_off_pitch_to_bl_us + remap_on_pitch_to_pitch_us` per frame, against
+  one copy today; the extra pass stays in video memory, and the guest-RAM write over PCIe (the ~0.2 ms) is unchanged. The push
+  grows by about 24 dwords (to about 62, still one 512-byte slot).
+- **B. The remap while writing the block-linear image.** If the remap works when the block-linear side is the destination
+  (`bl_dst_remap`), a copy that WRITES the image can swap. The KMD route writes no block-linear image (NVK's 3D engine
+  renders it), so B moves the swap to the producer: NVK presents a BGRA image (a swapchain format or its own blit into one),
+  or a producer-side CE copy writes the image with the remap. Cost: no extra pass on the KMD's channel, the same ~0.2 ms
+  copy; the work is an NVK change, outside the KMD.
+- If neither works, the route takes the Venus copy for every RGBA source (`Why::FormatUnsupported`), as today.
+
+### 12.5 What the tool measures, and the pass criteria
+
+`crm_ce_copy_smoke` (`guest/rmclient/tests/crm_ce_copy_smoke.md`, "Format conversion with the remap unit"):
+- `--remap swap-rb`: the measured loop of run 1 with the measured copies remapped; `remap_verify` and a
+  `remap_gbps path=pitch_to_pitch on=` line to compare with `copy_gbps_p50` of the same run line without the option.
+- `--bl-roundtrip --remap swap-rb`: the matrix. Every combination runs all its rounds before the next: `pitch_to_pitch_off`,
+  `pitch_to_pitch_on`, `bl_off` (pitch -> BL -> pitch), `bl_dst_remap` (fallback B's write side), `bl_src_remap` (the open
+  question, last). It prints the GPU time of every copy as six stage rows (`remap_off_*` and `remap_on_*` for
+  `pitch_to_pitch`, `pitch_to_bl`, `bl_to_pitch`), one `remap_gbps path=... off=... on=... on_vs_off=...%` line per path,
+  `remap_accepted:` with `yes`, `NO` or `not-run` per combination, `remap_verify`, and the first 8 mismatches per
+  combination. The sizes are Heaven's: 1600x900 and the block-linear image of modifier 0x0300000000606014.
+- `--bl-src-only`: `bl_src_remap` alone (12.3).
+
+Pass criteria:
+- every combination accepted and `remap_verify=ok` (the destination is the pattern with bytes 0 and 2 exchanged, 0 bad
+  words);
+- the remap costs at most about 10% of the throughput: `on_vs_off` at 90% or more on every path;
+- pitch -> pitch into guest RAM near the M1 rate, about 28 GB/s (5.76 MB in about 0.2 ms);
+- the error notifier 0 and nothing left tracked (as M1).
+
+A PASS settles the remap's methods and fields on 0xcab5 against Mesa's header (11.7 item 9) and the open question for the
+tool's own block-linear image. As with M1b, the round trip goes through one mapping, so the match with NVK's own layout and
+kind is still M3c's check (10.3). Ada (0xc7b5) stays unverified until an Ada GPU runs the tool.
