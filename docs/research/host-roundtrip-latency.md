@@ -245,6 +245,26 @@ Full captures (every probe; each probe adds a little to every row), µs, p50:
 | NVIDIA interrupt → vkr-queue running | 18.5 | 16.1 | 23.2 |
 | `signal_used_queue` → QEMU raises INTx, p50 / p99 | 13.2 / 270 | 13.2 / 996 | 11.5 / 1582 |
 
+With MSI-X (driver with the MSI-X breaker fix, the same load; rows A-C;
+light captures, µs, p50 / p99):
+
+| stage | A off | B all | C all + cpus |
+|---|---|---|---|
+| timeline → `write_context_fence` | 13.6 / 23.2 | 14.0 / 26.9 | 10.1 / 25.1 |
+| `write_context_fence` → MSI | 31.8 / 52.2 | 18.3 / 39.3 | 11.6 / 31.7 |
+| **timeline → MSI (fence return path)** | **45.0 / 68.9** | **33.6 / 63.3** | **24.5 / 54.2** |
+| **dispatch → MSI (host round trip)** | **441.5 / 769.8** | **429.4 / 748.5** | **412.2 / 729.9** |
+| queue thread busy per fenced submit (full capture, p50) | 83 | 58 | 39 |
+| copy submitted → NVIDIA interrupt (GPU, full capture, p50) | 329 | 329 | 328 |
+| empty MSI after holding a chain | 2456 of 2514 | 82 of 2591 | 93 of 2767 |
+| event-thread MSIs per second | 10,051 | 1,386 | 1,405 |
+
+With MSI-X the pinning has no tail cost (row C has the lowest p99), so the
+INTx tail in row C above came from QEMU's main loop sharing those CPUs. The
+remaining 82-93 interrupts from the queue thread within 30 µs of holding a
+chain are probably drains that also answered another request (not checked
+per kick).
+
 Guest side, same rows (the KMD's `BltAsyncLat` histogram over about 11 s,
 submit to completion DPC; driver 346.1, INTx):
 
@@ -282,9 +302,11 @@ Reading:
   interrupt is an irqfd write from the backend thread and QEMU's main loop
   is not on the path. Under INTx, keep `backend.cpus` off QEMU's emulator
   CPUs, or leave it unset.
-- Recommendation: make `quiet-held`, `fused-submit` and `direct-fences` the
-  default once a soak is clean. Re-measure `backend.cpus` with MSI-X before
-  recommending it. `event-batch` matters for the NVK event path, not this one.
+- Recommendation: make `quiet-held`, `fused-submit`, `direct-fences` and
+  `event-batch` the default once a soak is clean. `event-batch` cuts the
+  event thread's interrupts sevenfold with MSI-X. Also recommend
+  `backend.cpus` on the host's CCD with MSI-X. Under INTx it competes with
+  QEMU's main loop.
 
 ## Phase 3: observing the fence sooner
 
