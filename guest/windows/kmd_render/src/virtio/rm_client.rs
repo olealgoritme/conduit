@@ -68,8 +68,9 @@ pub(crate) mod sysmem;
 pub(crate) mod sysmem_blt;
 pub(crate) mod sysmem_flip;
 // `RmCopyEngine`: the KMD's own copy-engine channel (its own RM client, driven by the same `Io`)
-// (the hardware self-test follows). Independent of `KmdRmClient`.
+// and its hardware self-test. Independent of `KmdRmClient`.
 pub(crate) mod ce_channel;
+pub(crate) mod ce_selftest;
 
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;

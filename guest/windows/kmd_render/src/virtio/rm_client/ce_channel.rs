@@ -290,8 +290,9 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         return;
     }
     SELF_DONE.store(1, Ordering::Relaxed);
-    // One bring-up and teardown of the channel (the self-test's copies come with `ce_selftest`).
-    let _ = ensure_up(passive, adapter, epoch);
+    super::ce_selftest::run(passive, adapter, epoch);
+    // M3b: the channel is not kept after its self-test (its teardown is part of what the
+    // self-test proves); M3c keeps it for the Present route.
     teardown(passive, adapter, budget_ms(cc::UNDO_BUDGET_MS));
     IO_BUSY.store(0, Ordering::Release);
     publish_counters();
