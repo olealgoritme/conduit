@@ -25,6 +25,16 @@ const KEYS: &[(&str, &[&str], &str)] = &[
         "serve guest-memory blobs to Venus guests (the Windows KMD's windowed Present writes guest pages directly), from the next backend start (default false)",
     ),
     (
+        "gpu.vram_limit_mib",
+        &["auto", "off"],
+        "MiB of video memory a guest may hold, or off, from the next backend start (default auto: a cap when the NVIDIA card drives a monitor; also any number of MiB)",
+    ),
+    (
+        "gpu.safe_mode",
+        &["true", "false"],
+        "start backends in safe mode (CONDUIT_SAFE_MODE=1): small video-memory cap and 1 s blocking timeouts, from the next backend start (default false)",
+    ),
+    (
         "gpu.window_mib",
         &[
             "auto", "1024", "2048", "4096", "8192", "16384", "32768", "65536", "131072", "262144",
@@ -67,10 +77,19 @@ fn key(k: &str) -> Result<&'static (&'static str, &'static [&'static str], &'sta
 
 pub fn set(k: &str, v: &str) -> Result<()> {
     let (name, values, _) = key(k)?;
-    if !values.contains(&v) {
+    let number = *name == "gpu.vram_limit_mib" && v.parse::<u64>().is_ok_and(|n| n >= 1);
+    if !values.contains(&v) && !number {
         return Err(oops(
             format!("\"{v}\" is not a value for {name}"),
-            format!("Use one of: {}", values.join(", ")),
+            format!(
+                "Use one of: {}{}",
+                values.join(", "),
+                if *name == "gpu.vram_limit_mib" {
+                    ", or a number of MiB"
+                } else {
+                    ""
+                }
+            ),
         ));
     }
     let mut m = load();
@@ -129,6 +148,42 @@ pub fn venus_guest_blobs() -> bool {
         .unwrap_or(false)
 }
 
+/// `gpu.vram_limit_mib`: how the backend's video-memory cap is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VramSetting {
+    /// A default when the card drives a monitor (protect.rs).
+    Auto,
+    /// No cap.
+    Off,
+    Mib(u64),
+}
+
+pub fn vram_limit_mib() -> VramSetting {
+    vram_setting_of(&load())
+}
+
+fn vram_setting_of(m: &Map<String, Value>) -> VramSetting {
+    match m.get("gpu.vram_limit_mib").and_then(Value::as_str) {
+        Some("off") => VramSetting::Off,
+        Some(s) => s
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .map_or(VramSetting::Auto, VramSetting::Mib),
+        None => VramSetting::Auto,
+    }
+}
+
+/// Safe mode for every backend this CLI starts: `gpu.safe_mode`, or
+/// `CONDUIT_SAFE_MODE=1` in the environment of the command.
+pub fn safe_mode() -> bool {
+    std::env::var("CONDUIT_SAFE_MODE").as_deref() == Ok("1")
+        || load()
+            .get("gpu.safe_mode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
 /// `gpu.window_mib` as a number; `None` for `auto` (unset, or set to auto).
 /// The backend gets it as `--window-mib` and conduit-vmm as
 /// `gpu-forward.window-mib`, which must agree, so `auto` is resolved once per
@@ -152,6 +207,22 @@ mod tests {
         assert!(key("view.close_stops_vm").is_ok());
         assert!(key("view.nope").is_err());
         assert!(key("gpu.window_mib").is_ok());
+    }
+
+    #[test]
+    fn vram_limit_setting_reads_auto_off_and_numbers() {
+        let mut m = Map::new();
+        assert_eq!(vram_setting_of(&m), VramSetting::Auto);
+        for (v, want) in [
+            ("auto", VramSetting::Auto),
+            ("off", VramSetting::Off),
+            ("4096", VramSetting::Mib(4096)),
+            ("0", VramSetting::Auto),
+            ("lots", VramSetting::Auto),
+        ] {
+            m.insert("gpu.vram_limit_mib".into(), Value::String(v.into()));
+            assert_eq!(vram_setting_of(&m), want, "{v}");
+        }
     }
 
     #[test]
