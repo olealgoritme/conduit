@@ -8,7 +8,7 @@
 //!
 //! 1. bring the channel up ([`ce::ensure_up`]);
 //! 2. a source and a destination of 1600x900x4 bytes in the KMD client's own RM system memory
-//!    (`NV01_MEMORY_SYSTEM`, write-combined: the sysmem service's kind), each with a CPU view
+//!    (`NV01_MEMORY_SYSTEM`, cached by default, `RmCeCache` 1 write-combined), each with a CPU view
 //!    through the RM window and a GPU mapping in the channel's VA space;
 //! 3. the source filled with a position-dependent, salted pattern;
 //! 4. the **ready** copy: the producer value set first, then the push; kick to completion seen is
@@ -175,7 +175,8 @@ fn in_time(io: &Io<'_>) -> Result<(), StageErr> {
 fn make(io: &Io<'_>, h: &Handles, b: &mut Buf, virt: u32, va: u64, size: u64) -> Result<(), Fail> {
     ce::alloc_sys(io, h, b.mem, size).inspect_err(|_| ce::note_rm_error())?;
     b.allocated = true;
-    b.cpu = ce::cpu_map(io, h, rc_device(), b.mem, size, ce::WC).inspect_err(|_| ce::note_rm_error())?;
+    b.cpu = ce::cpu_map(io, h, rc_device(), b.mem, ce::SYSMEM, size, ce::sysmem_view_cache())
+        .inspect_err(|_| ce::note_rm_error())?;
     b.gpu = Some(ce::gpu_map(io, h, virt, b.mem, va, size).inspect_err(|_| ce::note_rm_error())?);
     Ok(())
 }

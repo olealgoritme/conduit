@@ -919,9 +919,9 @@ the error notifier through the kernel views and advances `ce_present::Ring`; a s
 | VA space | `FERMI_VASPACE_A` index `GPU_DEVICE` | the same |
 | generation | `--gen` | `GET_CLASSLIST_V2` (nvk-rm 0003's way) |
 | engine | the first async CE | the first async CE with `SYSMEM_WRITE` and not `SHARED`, then one with `SYSMEM_WRITE`, then the tool's rule (7.2) |
-| GPFIFO and push slots | an OS descriptor over process pages | RM system memory, write-combined, CPU view through the RM window (`MmMapIoSpace` write-combined), GPU-mapped snooped with 4 KiB pages |
+| GPFIFO and push slots | an OS descriptor over process pages | RM system memory, cached as the tool's (`RmCeCache` 1: write-combined), CPU view through the RM window armed on a fresh CONTROL file (`MmMapIoSpace` cached, or write-combined with the knob), GPU-mapped snooped with 4 KiB pages |
 | completion value | its own 4 KiB of RM system memory | a page of the ring allocation |
-| error notifier and USERD | 8 KiB RM system memory, cached | 8 KiB RM system memory, write-combined (every view agrees with the host's: no alias, `kmd-rm-client.md` 15.5) |
+| error notifier and USERD | 8 KiB RM system memory, cached | the same (the channel's private memory has no dxgkrnl view, so the level-5 alias concern of `kmd-rm-client.md` 15.5 does not apply) |
 | doorbell | the usermode object, `crm_map_memory` through the subdevice, a user-mode store | the same object and the same messages (`RM_MAP_MEMORY` on the subdevice armed on a fresh GPU file, the host's `Mmap`), then `MmMapIoSpace` UNCACHED of that range of the RM window, and the store from kernel mode: item 8 of 11.7, settled by a self-test PASS |
 | GPU VAs | packed from 0x20_0000_0000, 2 MiB apart | fixed 64 MiB windows from 0x20_0000_0000 (ring, self-test source, destination), RM's choice if the fixed range is refused, below 2^40 checked |
 | GPU timestamps, `--fence` | yes | none: the self-test's times are CPU times (`KeQueryInterruptTimePrecise`), spinning up to 20 ms then 1 ms sleeps |
@@ -938,7 +938,7 @@ the error notifier through the kernel views and advances `ce_present::Ring`; a s
 
 Once per transport generation, from the HPD worker at PASSIVE (the first pass with the RM transport up and a VidPn primary
 bound), never inside a DDI: bring the channel up; allocate a source and a destination (5763072 B each) of RM system memory
-in the channel's client (write-combined, CPU views, GPU mappings); fill the source with a salted position-dependent pattern;
+in the channel's client (cached by default, CPU views, GPU mappings); fill the source with a salted position-dependent pattern;
 copy 1600x900x4 pitch-linear twice with `ce_present::present_push`:
 1. **ready**: the producer value is set before the kick. `CeSelfUs` = kick to completion seen.
 2. **wait**: the push acquires a value the producer does not have; the worker sleeps 2 ms (a timer tick), checks the completion
@@ -972,10 +972,10 @@ back to its value without the knob), then set the knob back to 0 and restart.
 | `CeSelfUs` | about the tool's ready doorbell-to-done (below 400 us: the copy is about 200 to 350 us) | |
 | `CeSelfWaitUs` | below 50 us plus the copy | |
 | `CeSelfPages` | 1407 | |
-| `CeSelfMs` | hundreds of ms (the fill and the compares at write-combined speed) | |
+| `CeSelfMs` | tens of ms cached; hundreds with `RmCeCache` 1 (the fill and the compares at write-combined speed) | |
 | `CeChTry` / `CeChUp` / `CeChDown` | 1 / 1 / 1 per generation | |
 | `CeChStage` | 20 (the last stage started) | the stage that hung or failed |
-| `CeChFail` | 0 | `stage << 24 \| kind << 16 \| code`; kinds as `RmFail` (`kmd-rm-client.md` 3); Transport codes 0xE1 budget spent, 0xE2 StopDevice, 0xE3 the first push never landed (the doorbell from kernel mode is the first suspect); Layout 0x60 no known class set, 0x61 no async copy engine, 0x68 a GPU VA at or above 2^40; Rm with `CeNotify` set: the error notifier |
+| `CeChFail` | 0 | example: 0x0804001F = stage 8 (`CtlMap`), kind 4 (RM), code 0x1F `NV_ERR_INVALID_ARGUMENT` (11.11). `stage << 24 \| kind << 16 \| code`; kinds as `RmFail` (`kmd-rm-client.md` 3); Transport codes 0xE1 budget spent, 0xE2 StopDevice, 0xE3 the first push never landed (the doorbell from kernel mode is the first suspect); Layout 0x60 no known class set, 0x61 no async copy engine, 0x68 a GPU VA at or above 2^40; Rm with `CeNotify` set: the error notifier |
 | `CeChSoft` | **0** | undo steps RM or the host did not confirm |
 | `CeRmErr` / `CeChanFail` / `CeNotify` | 0 / 0 / 0 | a refused caps query adds 1 to `CeRmErr` and is harmless |
 | `CeChan` / `CeChState` | 0 / 0 (torn down, cold, no strikes) | `CeChState` = `phase << 28 \| strikes << 24 \| made bits` |
@@ -983,11 +983,53 @@ back to its value without the knob), then set the knob back to 0 and restart.
 | `CeEngine` / `CeCaps` | a `COPYn` type (0x09..0x12, 0x34..0x3d) / its caps, `SYSMEM_WRITE` (0x08) set, `GRCE` (0x01) clear | |
 | `CeToken` / `CeRunlist` | the token / its runlist (bits 22:16): not GR's (the tool prints both) | |
 | `CeSubmit` | 3 (the first push and the two copies) | |
+| `CeCache` | 0 (cached; 1 with `RmCeCache` = 1) | |
+| `CeRmCall` / `CeRmStat` / `CeMapNode` | 0 / 0 / 0 | the last failing call (11.11) |
 | `CeChMs` | tens of ms | |
 
 A PASS settles items 3 (no `NON_STALL_INTERRUPT` is used), 5 (does not arise) and 8 (the kernel-mode doorbell) of 11.7 for
-the KMD client, and that a write-combined RM system-memory ring, USERD and notifier work for a CE channel. It says nothing
+the KMD client, and that an RM system-memory ring, USERD and notifier (of the kind `CeCache` names) work for a CE channel. It says nothing
 about block-linear sources, dups of NVK's memory or the destination descriptors (M3c).
+
+### 11.11 The 348.1 failure: system memory mapped on the wrong kind of file (fixed)
+
+The first hardware run (348.1, 1920x1080@240, `RmCopyEngine` = 2) stopped at stage 8: `CeChStage` = 8 (`CtlMap`),
+`CeChFail` = 0x0804001F (stage 8, kind 4 = RM status, code 0x1F = `NV_ERR_INVALID_ARGUMENT`), `CeSelfTest` = 0xE1,
+`CeSelfWhy` = 0x1F, `CeRmErr` = 1, `CeChState` = 0x51000000 (cool-down, one strike). Stages 1 to 7 passed, among them the
+doorbell's CPU view (stage 6).
+
+Cause, in the KMD: `cpu_map` armed EVERY CPU view on a fresh GPU file (the minor, tied with `REGISTER_FD`), the way
+`rm_client.rs`'s level 2 maps VIDEO memory. RM maps system memory only on a control file: librmclient's `map_node_hint`
+(`guest/rmclient/src/rmclient.c`) sends `NV01_MEMORY_SYSTEM` and OS descriptors to the control node, and
+`win_map_memory` (`transport_windows.c`) opens a fresh control file (no `REGISTER_FD`) for them; a map on the wrong kind
+is answered `NV_ERR_INVALID_ARGUMENT` ("wrong channel kind, RM already undid its side"), after which librmclient retries
+once on the other kind. The doorbell (BAR memory) is mapped on a GPU file, which is why stage 6 passed. The host passes
+`RM_MAP_MEMORY` through as it is (`host/backend/device/src/nvidia/rm_fd.rs` `dispatch_map_memory`: the embedded file
+handle translated, the status returned unchanged), and serves a write-combined mapping of system memory for a user client
+(the DWM/NVK log): the cache attribute was not the cause. The NVOS33 block matched librmclient's (`rc::nvos33_with_fd`:
+hClient 0, hDevice 4 = the device, hMemory 8, offset 16, length 24, flags 44 = 0, fd 48).
+
+Fix: `rm_ce_channel::MapNode` picks the kind by class (system memory and OS descriptors: a fresh control file, no
+`REGISTER_FD`; anything else: a GPU file with `REGISTER_FD`), and `cpu_map` retries once on the other kind after RM's
+`INVALID_ARGUMENT`, as librmclient does. The kernel view is placed in the region of the map file's device type (the RM
+window for both). Every stage that maps system memory had the same fault: stage 8 (`CtlMap`), stage 10 (`RingMap`) and the
+self-test's source and destination views (stage 0xE2 / 0xE3 of `CeSelfTest`); allocations (stages 7 and 9, the self-test's
+buffers), GPU mappings (stage 11) and the channel objects (12 to 19) never take a map file and were not affected.
+
+Also changed with it:
+- **`RmCeCache`** (service-key REG_DWORD, read at StartDevice when `RmCopyEngine` is nonzero, mirrored as `CeCache`): 0
+  (default) the channel's own RM system memory is CACHED, as the tool allocates it (`NVOS32_ATTR_COHERENCY_CACHED`), and its
+  kernel views are `MmCached`; 1 write-combined memory and `MmWriteCombined` views (M3b's first choice), for an A/B. The
+  doorbell stays uncached.
+- **The failing call is named**: `CeRmCall` = `esc << 24 | what` (`esc` 0x2b ALLOC with the class, 0x2a CONTROL with the
+  command's low 24 bits, 0x29 FREE, 0x4e MAP_MEMORY, 0x4f UNMAP_MEMORY, 0x57 / 0x58 MAP / UNMAP_MEMORY_DMA with the object
+  handle's low 24 bits; 0xf1 the `Open` of a map file with its device type, 0xf2 the host's `Mmap`, 0xf3 `MmMapIoSpace`),
+  `CeRmStat` = RM's status (or `0x8000_0000 | kind << 16 | code`), `CeMapNode` = `node << 28 | map file handle` of a failed CPU
+  view (node 1 control file, 2 GPU file). The 348.1 failure would have read `CeRmCall` 0x4e4d3003, `CeRmStat` 0x1F,
+  `CeMapNode` 0x2000_00xx.
+
+The next run reads as 11.10 says for a PASS, with `CeCache` = 0 and `CeRmCall` / `CeRmStat` / `CeMapNode` = 0; then once with
+`RmCeCache` = 1 for the A/B (`CeSelfUs`, `CeSelfWaitUs`, `CeSelfMs`).
 
 ## 12. Format conversion with the CE remap unit (M1c)
 

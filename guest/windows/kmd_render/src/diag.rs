@@ -1088,6 +1088,10 @@ pub mod knobs {
     /// value is 0. Read at every StartDevice; mirrored as `CeKnob`.
     /// `docs/rm-copy-engine-present.md` section 11.
     pub const RM_COPY_ENGINE: KnobName = KnobName::new(b"RmCopyEngine");
+    /// `RmCeCache` (default 0 = cached, as the copy-engine tool allocates it). 1: the channel's own
+    /// RM system memory (control, ring, the self-test's buffers) write-combined, for an A/B. Read at
+    /// StartDevice when `RmCopyEngine` is nonzero; mirrored as `CeCache`.
+    pub const RM_CE_CACHE: KnobName = KnobName::new(b"RmCeCache");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
