@@ -623,6 +623,21 @@ not know (an unknown op ends the connection). Both
 sides use the `conduit_venus::Renderer` trait (`host/venus/src/lib.rs`): the
 backend through the IPC client, tests through `conduit_venus::mock::Mock`.
 
+**Latency options** (off by default; `conduit config set backend.latency`,
+[research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
+`fused-submit`: a fenced `SUBMIT_3D` is one call, `Renderer::submit_fenced`
+(IPC op `SUBMIT_FENCED`, sent only to a server with `FEATURE_SUBMIT_FENCED`,
+which every server from this release on adds itself), instead of `SUBMIT`
+and `CREATE_FENCE`, each waiting for its reply. `direct-fences`:
+`conduit-venus --direct-fences` sends each `FENCES` message from the
+virglrenderer thread that retired the fence, under the same send lock as the
+serve loop's replies, so the fragments of a message never interleave. The
+backend's reader thread then returns the signalled chains itself when the
+backend lock is free (`Renderer::set_fence_hook`), and otherwise leaves them
+to the fence pump. A fence can now reach the backend before the reply to
+its `CREATE_FENCE`. It is taken only under the backend lock, which the queue
+thread holds until it has recorded the chain.
+
 One `conduit-venus` per VM: `conduit up/view --venus` (and the libvirt
 backend unit) starts it before the backend, on `venus.sock` in the VM's run
 directory, logging to `logs/venus.log`; it serves that one backend and exits

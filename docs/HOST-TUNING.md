@@ -111,6 +111,11 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   For a hard split, isolate the guest's cores with systemd
   (`systemctl set-property --runtime user.slice AllowedCPUs=0-7,16-23`,
   and the same for `system.slice`), or at boot with `isolcpus=`/`nohz_full=`.
+- **Keep the backend and conduit-venus off the guest's cores**:
+  `conduit config set backend.cpus 0-7,16-23` (the host's CCD; applies at the
+  next backend start). Unpinned, their threads wake mostly on the guest's
+  idle CPUs and preempt a vCPU there
+  ([research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
 - **CPU governor**: `performance` avoids clock ramp-up latency.
 
 ## GPU memory: Resizable BAR and the video-memory limit
