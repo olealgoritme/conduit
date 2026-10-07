@@ -69,6 +69,7 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 5 | `nvk, nvk/rm: let the GPU cache descriptor pools and tables on RM` | new `NVKMD_MEM_GPU_READ_ONLY`, set on descriptor pools and the image/sampler tables; the RM backend maps it GPU-cacheable (it was uncached system memory, so every descriptor set bound was a cbuf fetched across PCIe). RM-specific in effect, generic in form; nouveau ignores the flag |
 | 6 | `nvk: bind vertex and index buffers with plain methods on Turing+` | no `NVK_MME_BIND_VB/IB` for CPU-recorded binds, and the range already bound is skipped |
 | 7 | `nvk: keep what changes per draw in one hardware root table bank` | changing a second 256-byte root table bank between draws costs ~5 ns; the dynamic-offset dword of the dynamic buffer descriptors moves into bank 0 with the draw parameters and `sets[0..3]`. **API-visible**: `NVK_MAX_DYNAMIC_BUFFERS` 64 -> 32, i.e. 16 dynamic UBOs + 16 dynamic SSBOs per layout (NVIDIA: 15 + 16) |
+| 8 | `nvk: ZCULL for DXVK depth buffers and reverse Z` | ZCULL storage also for depth images with `TRANSFER_DST` (DXVK sets it on every D3D11 depth texture; `EXCLUSIVE` sharing only), reset to a conservative state by an empty render pass after a copy, blit or resolve writes them or another queue hands them over; `SET_ZCULL_DIR_FORMAT` per image (GREATER when the first application render pass clears below 0.5, LESS otherwise, never changed afterwards) instead of always LESS. See "GPU time against NVIDIA in D3D11-through-DXVK shapes" |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
@@ -111,6 +112,60 @@ and repeats a direct draw right after each indirect one (dropping one
 invalidation in the driver changes its hash); `dynidx` indexes dynamic UBO
 arrays in two sets at run time; `descupd` rewrites a descriptor set between
 submits. dEQP-VK is not installed on the host and was not run.
+
+### GPU time against NVIDIA in D3D11-through-DXVK shapes (patch 8)
+
+Measured on the host (RTX 5090, no VM): NVK built from the Windows stack
+(`patches/0001-0013` + `patches-windows/*` + `patches-common/*`) for Linux
+and run with `NVK_RM=1 NVK_UBO_DESC_CBUF=0` (what Windows runs) against
+NVIDIA 610.57.04 on the same GPU, `vk_perf_bench`, GPU timestamps, median
+of 11, 2560x1440.
+
+Every older `vk_perf_bench` category is within ±10% of NVIDIA. The
+gaps appear only in the shapes D3D11 takes through DXVK, which the new
+tests cover:
+
+| test | NVK before | NVK with patch 8 | NVIDIA |
+|---|---|---|---|
+| `zpass`, DXVK depth usage: 32 front-to-back layers over 8 render passes that load depth | 0.162 ms | 0.109 ms | 0.102 ms |
+| same over 2 passes | 0.111 ms | 0.078 ms | 0.079 ms |
+| `zrev`: the 32 layers in one pass with reverse Z (clear 0, GEQUAL) | 0.141 ms | 0.070 ms | 0.071 ms |
+| `cb`: 20000 draws, each a new descriptor-buffer offset, 3 VS + 1 PS cbuffer | 0.144 ms | unchanged | 0.088 ms |
+| `cb`: pixel shader with 256 cbuffer reads, 4 fullscreen passes | 0.991 ms | unchanged | 1.565 ms |
+
+1. **ZCULL storage.** DXVK gives every D3D11 depth texture
+   `TRANSFER_DST`, and NVK allocated ZCULL storage only for images written
+   by nothing but depth attachments. ZCULL then worked only in render
+   passes that clear depth. DXVK ends a render pass at every barrier,
+   resolve or render target change, so most passes load depth.
+2. **ZCULL direction.** `SET_ZCULL_DIR_FORMAT` was always LESS, so ZCULL
+   never culled with reverse Z. Stored ZCULL has to be loaded with the
+   direction it was stored with, so patch 8 fixes the direction per image
+   at its first application render pass. `vkCmdClearDepthStencilImage`
+   does not count, because DXVK clears every new depth image to 0.0 that
+   way.
+3. **Per-draw cbuffer switch** (not fixed, about 10 µs per frame at
+   Heaven's draw counts). The push stream per draw is already minimal
+   (one root table dword and the draw), so the remaining cost is the
+   shader's bindless cbuf loads. Bound cbufs (`NVK_UBO_DESC_CBUF=1`) cost
+   10 ms here, because the MME reads each descriptor from memory. That is
+   why patch 0051 turned them off on Windows.
+
+Correctness: `vk_perf_bench -t zcoh` writes a depth image outside a render
+pass and then checks that a later pass is not culled by stale ZCULL. It
+covers a copy from a buffer, a copy from an image, a blit and
+`vkCmdClearDepthStencilImage`, in both directions, plus three
+direction-choice cases. With patch 8 all 11 cases pass. With the reset after
+transfers left out, the copy cases draw nothing, which shows the test
+catches stale ZCULL. The image hashes of `ubo,desc,rebind,vbib,dynidx,descupd,params,verify,cb`
+are identical before and after. `vk_summary`, `vk_offscreen_test`,
+`vk_compute_test`, `vk_bl_readback`, `vk_bar_test` and `vk_coherence_test`
+pass. No Xid was logged.
+
+Known bad on RM: upstream Mesa MR !44088 (ZCULL save and restore through
+MME DMEM, which includes !44203 and !44414), cherry-picked onto this stack,
+raises Xid 13 `DATA_RAM_ACCESS_OUT_OF_BOUNDS` (ESR 0x404490) in the first
+render pass with ZCULL. Patch 8 uses no MME and no DMEM.
 
 ## Build
 
