@@ -58,6 +58,7 @@ rawtracepoint:sched_switch {
 }
 tracepoint:power:cpu_idle { @cst[args.cpu_id] = args.state == 4294967295 ? 0 : args.state + 1; }
 tracepoint:kvm:kvm_msi_set_irq /pid == $BP/ { printf("MSI %llu %d %llu\n", nsecs, tid, args.address); }
+tracepoint:kvm:kvm_set_irq /pid == $QP && tid == $QP && args.level == 1/ { printf("IRQ %llu %d %u\n", nsecs, tid, args.gsi); }
 BT
 [ -n "$NVIRQ" ] && echo "tracepoint:irq:irq_handler_entry /$NVIRQ/ { printf(\"NI %llu %d %d\n\", nsecs, tid, cpu); }"
 up uprobe "$B" "$DISP" "$BP" '$h = arg1; printf("D0 %llu %d %u %u %llu %u %u\n", nsecs, tid, *(uint32*)$h, *(uint32*)($h+4), *(uint64*)($h+8), *(uint32*)($h+16), *(uint8*)($h+20));'

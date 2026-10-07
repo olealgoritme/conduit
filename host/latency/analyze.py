@@ -107,6 +107,14 @@ def main():
         # the thread that returned it (the pump, the renderer reader, or the
         # queue thread right after a dispatch that delivered).
         msi = ix.next("MSI", wf[0], lambda e: e[1] in deliverers or not deliverers)
+        # INTx instead of MSI-X: the backend's signal reaches QEMU's main
+        # loop, which raises the line.
+        if not msi:
+            u0 = ix.next("U0", wf[0], lambda e: e[1] in deliverers or not deliverers)
+            irq = u0 and ix.next("IRQ", u0[0])
+            if irq:
+                add("16b signal_used_queue -> QEMU raises INTx", u0[0], irq[0])
+                msi = irq
         kick = before(wk_ts.get(tid, []), ts, 2_000_000)
         run = before(rn.get(tid, []), ts, 2_000_000)
         add("01 queue thread woken -> Venus::dispatch", kick, ts)
