@@ -28,6 +28,19 @@ pub fn driver() -> Option<Driver> {
     parse_driver(&std::fs::read_to_string("/proc/driver/nvidia/version").ok()?)
 }
 
+/// "565.77" and "565.77.00" are one release: a missing patch is 0, as in the
+/// backend's `DriverVersion::parse` and the table file names (`v565_77_00`).
+pub fn same_release(a: &str, b: &str) -> bool {
+    fn key(v: &str) -> Vec<u64> {
+        let mut k = version_key(v);
+        while k.len() < 3 {
+            k.push(0);
+        }
+        k
+    }
+    key(a) == key(b)
+}
+
 pub fn major(v: &str) -> u32 {
     v.split('.')
         .next()
@@ -95,6 +108,7 @@ fn version_key(v: &str) -> Vec<u64> {
 
 const BUILT_IN: &[&str] = &[
     "535.129.03",
+    "565.77.00",
     "580.178.04",
     "595.71.05",
     "595.104.02",
@@ -144,6 +158,7 @@ mod tests {
         let tree = tree_releases(&gen);
         assert!(tree.iter().any(|v| v == "595.104.02"), "{tree:?}");
         assert!(tree.iter().any(|v| v == "615.71.09"), "{tree:?}");
+        assert!(tree.iter().any(|v| v == "565.77.00"), "{tree:?}");
         let out = std::process::Command::new(root.join("packaging/supported-drivers.sh"))
             .arg(&gen)
             .output()
@@ -176,8 +191,26 @@ mod tests {
                 open: false
             })
         );
+        // The closed 565.77 module: two-part version, and the GCC line's
+        // three-part number is not the driver's.
+        let c = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77  Wed Oct 23 12:00:00 UTC 2024\nGCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n";
+        assert_eq!(
+            parse_driver(c),
+            Some(Driver {
+                version: "565.77".into(),
+                open: false
+            })
+        );
         assert_eq!(parse_driver("garbage"), None);
         assert_eq!(major("610.57.04"), 610);
+    }
+
+    #[test]
+    fn a_missing_patch_is_zero() {
+        assert!(same_release("565.77", "565.77.00"));
+        assert!(same_release("580.178.04", "580.178.4"));
+        assert!(!same_release("565.77", "565.77.01"));
+        assert!(!same_release("565.77", "565.57.01"));
     }
 
     #[test]

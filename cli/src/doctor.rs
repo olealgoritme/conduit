@@ -6,10 +6,57 @@ use crate::sys;
 use crate::ui;
 use std::path::Path;
 
+#[derive(Debug, PartialEq)]
 enum Level {
     Ok,
     Warn,
     Fail,
+}
+
+/// What the kernel-module line says about a loaded driver.
+///
+/// Support is decided by the exact-release tables (`known`): a release with
+/// them is one the backend starts on. The open modules and the 580 floor are
+/// what Conduit was built and tested on, so for a release that has tables a
+/// closed module or a branch older than 580 is a warning that it is untested;
+/// a release without tables stays a failure.
+fn module_verdict(d: &host::Driver, known: bool) -> (Level, String, &'static str) {
+    let old = host::major(&d.version) < 580;
+    if known {
+        let what = match (d.open, old) {
+            (true, false) => {
+                return (
+                    Level::Ok,
+                    format!("{} (open kernel modules)", d.version),
+                    "",
+                )
+            }
+            (false, false) => "the closed kernel modules",
+            (true, true) => "a branch older than 580",
+            (false, true) => "the closed kernel modules and a branch older than 580",
+        };
+        return (
+            Level::Warn,
+            format!("{} uses {what}; Conduit has tables for this release but is untested with it", d.version),
+            "Conduit is developed and tested on the OPEN kernel modules, version 580 or newer\n(Ubuntu: nvidia-driver-580-open). This setup may work; if it does not, switch to that.",
+        );
+    }
+    if !d.open {
+        (Level::Fail, format!("{} uses the closed kernel modules", d.version),
+            "Conduit needs the OPEN kernel modules. On Ubuntu install the -open package\n(e.g. nvidia-driver-580-open) and restart.")
+    } else if old {
+        (
+            Level::Fail,
+            format!("{} is too old", d.version),
+            "Update to version 580 or newer (open kernel modules), then restart.",
+        )
+    } else {
+        (
+            Level::Ok,
+            format!("{} (open kernel modules)", d.version),
+            "",
+        )
+    }
 }
 
 struct Report {
@@ -74,16 +121,10 @@ pub fn run() -> i32 {
         None => r.line(Level::Fail, "NVIDIA driver", "not loaded",
             "Install NVIDIA's driver with the OPEN kernel modules, version 580 or newer\n(Ubuntu: sudo apt install nvidia-driver-580-open), then restart."),
         Some(d) => {
-            if !d.open {
-                r.line(Level::Fail, "NVIDIA driver", &format!("{} uses the closed kernel modules", d.version),
-                    "Conduit needs the OPEN kernel modules. On Ubuntu install the -open package\n(e.g. nvidia-driver-580-open) and restart.");
-            } else if host::major(&d.version) < 580 {
-                r.line(Level::Fail, "NVIDIA driver", &format!("{} is too old", d.version),
-                    "Update to version 580 or newer (open kernel modules), then restart.");
-            } else {
-                r.line(Level::Ok, "NVIDIA driver", &format!("{} (open kernel modules)", d.version), "");
-            }
-            if supported.iter().any(|v| v == &d.version) {
+            let known = supported.iter().any(|v| host::same_release(v, &d.version));
+            let (lvl, detail, fix) = module_verdict(&d, known);
+            r.line(lvl, "NVIDIA driver", &detail, fix);
+            if known {
                 r.line(Level::Ok, "Driver support", &format!("Conduit knows driver {}", d.version), "");
             } else {
                 r.line(Level::Fail, "Driver support", &format!("driver {} is not one Conduit supports yet ({from}: {})", d.version, supported.join(", ")),
@@ -605,5 +646,57 @@ pub fn run_vm(name: &str) -> i32 {
     } else {
         println!("{name}: {} problem(s); fix the FAIL lines first.", r.fails);
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drv(version: &str, open: bool) -> host::Driver {
+        host::Driver {
+            version: version.into(),
+            open,
+        }
+    }
+
+    #[test]
+    fn open_580_or_newer_is_ok_either_way() {
+        assert_eq!(module_verdict(&drv("615.71.09", true), true).0, Level::Ok);
+        assert_eq!(module_verdict(&drv("615.71.09", true), false).0, Level::Ok);
+    }
+
+    /// The host this was written for: closed 565.77, which has tables.
+    #[test]
+    fn closed_or_old_with_tables_is_a_warning_that_says_untested() {
+        for (d, what) in [
+            (
+                drv("565.77", false),
+                "closed kernel modules and a branch older than 580",
+            ),
+            (drv("595.104.02", false), "the closed kernel modules"),
+            (drv("535.129.03", true), "a branch older than 580"),
+        ] {
+            let (lvl, detail, fix) = module_verdict(&d, true);
+            assert_eq!(lvl, Level::Warn, "{}", d.version);
+            assert!(
+                detail.contains(what) && detail.contains("untested"),
+                "{detail}"
+            );
+            assert!(!fix.is_empty());
+        }
+    }
+
+    #[test]
+    fn closed_or_old_without_tables_still_fails() {
+        assert_eq!(module_verdict(&drv("565.78", false), false).0, Level::Fail);
+        assert_eq!(
+            module_verdict(&drv("595.104.02", false), false).0,
+            Level::Fail
+        );
+        assert_eq!(
+            module_verdict(&drv("550.54.14", true), false).0,
+            Level::Fail
+        );
     }
 }
