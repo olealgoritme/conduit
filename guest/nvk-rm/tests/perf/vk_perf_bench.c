@@ -13,6 +13,12 @@
  * in them (e.g. with NVK_DEBUG=push_dump); BENCH_NSETS=n cycles "set
  * switch" through n sets.  Tests params, dynidx and descupd only print
  * hashes, to compare drivers or driver changes bit for bit.
+ *
+ * D3D11-through-DXVK shapes: zpass (depth loaded by later render passes),
+ * zrev (reverse Z), cb (cbuffers as UBOs in a descriptor buffer, per pixel
+ * and per draw), and zcoh (ZCULL stays correct after transfers write a
+ * depth image; prints ok/FAIL).  BENCH_DEPTH_DXVK=1 gives the depth images
+ * DXVK's usage (TRANSFER_DST, SAMPLED).
  */
 #include <vulkan/vulkan.h>
 
@@ -26,6 +32,9 @@
 
 #include "shaders/alu_frag.h"
 #include "shaders/blend_frag.h"
+#include "shaders/cbcol_frag.h"
+#include "shaders/cbps_frag.h"
+#include "shaders/cbvs_vert.h"
 #include "shaders/color_frag.h"
 #include "shaders/colortex_frag.h"
 #include "shaders/copy_comp.h"
@@ -132,8 +141,13 @@ make_buffer(struct buf *b, VkDeviceSize size, VkBufferUsageFlags usage,
       b->buf = VK_NULL_HANDLE;
       return false;
    }
+   VkMemoryAllocateFlagsInfo mafi = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+   };
    VkMemoryAllocateInfo mai = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) ? &mafi : NULL,
       .allocationSize = req.size,
       .memoryTypeIndex = mt,
    };
@@ -231,6 +245,8 @@ struct gfx_desc {
    VkFormat color;
    bool blend, depth, mesh_vb, patch3;
    VkPrimitiveTopology topo;
+   VkPipelineCreateFlags flags;
+   VkCompareOp cmp; /* LESS_OR_EQUAL if 0 (NEVER) */
 };
 
 static VkPipeline
@@ -285,7 +301,7 @@ make_gfx(const struct gfx_desc *d)
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
       .depthTestEnable = d->depth,
       .depthWriteEnable = d->depth,
-      .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
+      .depthCompareOp = d->cmp ? d->cmp : VK_COMPARE_OP_LESS_OR_EQUAL,
    };
    VkPipelineColorBlendAttachmentState cba = {
       .blendEnable = d->blend,
@@ -310,6 +326,7 @@ make_gfx(const struct gfx_desc *d)
    VkGraphicsPipelineCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
       .pNext = &ri,
+      .flags = d->flags,
       .stageCount = n, .pStages = st,
       .pVertexInputState = &vi,
       .pInputAssemblyState = &ia,
@@ -450,6 +467,22 @@ static VkSampler sampler;
 static VkShaderModule m_trivs, m_tritcs, m_trites, m_fsqz, m_fsq, m_alu, m_tex, m_blend, m_ubo, m_color, m_colortex,
    m_mesh, m_meshubo, m_tvs, m_tcs, m_tes, m_copy;
 
+/* The depth images' usage.  BENCH_DEPTH_DXVK=1: the usage DXVK gives every
+ * D3D11 depth texture (transfer source and destination, sampled) */
+static VkImageUsageFlags
+depth_usage_flags(void)
+{
+   VkImageUsageFlags u = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   if (getenv("BENCH_DEPTH_DXVK"))
+      u |= VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+   return u;
+}
+
+/* begin_render() loads depth instead of clearing it */
+static bool depth_load;
+static float depth_clear = 1.0f;
+
 static void
 begin_render(VkCommandBuffer cmd, struct img *color, bool clear, bool use_depth)
 {
@@ -464,9 +497,9 @@ begin_render(VkCommandBuffer cmd, struct img *color, bool clear, bool use_depth)
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
       .imageView = depth.view,
       .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .loadOp = depth_load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR,
       .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-      .clearValue.depthStencil = { 1.0f, 0 },
+      .clearValue.depthStencil = { depth_clear, 0 },
    };
    VkRenderingInfo ri = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -1034,6 +1067,475 @@ test_zcull(VkPipeline p, bool front_to_back)
    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
 }
 
+/* The same front-to-back overdraw split over npasses render passes that
+ * load depth (as D3D11 through DXVK renders: a pass ends at every barrier,
+ * resolve or render target change, and later passes load the depth buffer).
+ * The first pass clears.  A barrier between passes, as DXVK emits. */
+static void
+test_zcull_passes(VkPipeline p, int npasses)
+{
+   VkCommandBuffer cmd = begin_cmd();
+   ts_begin(cmd);
+   uint32_t off = 0;
+   for (int pass = 0; pass < npasses; pass++) {
+      depth_load = pass > 0;
+      begin_render(cmd, &rt8, pass == 0, true);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0,
+                              1, &set_default, 1, &off);
+      for (int i = pass * 32 / npasses; i < (pass + 1) * 32 / npasses; i++) {
+         float pc[4] = { 0.5f, 16, 0.1f + i * 0.025f, 0 };
+         vkCmdPushConstants(cmd, pl_gfx, VK_SHADER_STAGE_ALL, 0, 16, pc);
+         vkCmdDraw(cmd, 3, 1, 0, 0);
+      }
+      vkCmdEndRendering(cmd);
+      if (pass + 1 < npasses)
+         barrier_all(cmd);
+   }
+   depth_load = false;
+   ts_end(cmd);
+   double cpu, gpu = time_cmd(cmd, &cpu);
+   char name[64];
+   snprintf(name, sizeof(name), "depth f2b, %d passes (load)", npasses);
+   report(name, "Gpix/s", (double)W * H * 32, gpu, cpu);
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+}
+
+/* Reverse Z (clear 0, GREATER_OR_EQUAL), as many D3D11 engines render:
+ * the front-to-back overdraw of test_zcull with depth flipped. */
+static void
+test_zcull_reverse(VkPipeline p)
+{
+   /* Its own depth image: a driver may pick the ZCULL direction per image
+    * from the first clear, and the other tests clear to 1.0 */
+   struct img zr, saved = depth;
+   make_image(&zr, VK_FORMAT_D32_SFLOAT, W, H, depth_usage_flags(),
+              VK_IMAGE_ASPECT_DEPTH_BIT);
+   VkCommandBuffer c0 = begin_cmd();
+   image_layout(c0, zr.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+   CHECK(vkEndCommandBuffer(c0));
+   submit_wait(c0);
+   vkFreeCommandBuffers(dev, cpool, 1, &c0);
+   depth = zr;
+
+   VkCommandBuffer cmd = begin_cmd();
+   ts_begin(cmd);
+   depth_clear = 0.0f;
+   begin_render(cmd, &rt8, true, true);
+   depth_clear = 1.0f;
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   uint32_t off = 0;
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0, 1,
+                           &set_default, 1, &off);
+   for (int i = 0; i < 32; i++) {
+      float pc[4] = { 0.5f, 16, 0.9f - i * 0.025f, 0 };
+      vkCmdPushConstants(cmd, pl_gfx, VK_SHADER_STAGE_ALL, 0, 16, pc);
+      vkCmdDraw(cmd, 3, 1, 0, 0);
+   }
+   vkCmdEndRendering(cmd);
+   ts_end(cmd);
+   double cpu, gpu = time_cmd(cmd, &cpu);
+   report("depth f2b, reverse Z", "Gpix/s", (double)W * H * 32, gpu, cpu);
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+   depth = saved;
+   vkDestroyImageView(dev, zr.view, NULL);
+   vkDestroyImage(dev, zr.img, NULL);
+   vkFreeMemory(dev, zr.mem, NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* D3D11 through DXVK: cbuffers are plain UBOs in a descriptor buffer
+ * (VK_EXT_descriptor_buffer), several per stage, and a draw that changes
+ * any binding points the set at a new region of the descriptor buffer. */
+
+static bool has_descriptor_buffer;
+static PFN_vkGetDescriptorSetLayoutSizeEXT pGetDescriptorSetLayoutSizeEXT;
+static PFN_vkGetDescriptorSetLayoutBindingOffsetEXT pGetDescriptorSetLayoutBindingOffsetEXT;
+static PFN_vkGetDescriptorEXT pGetDescriptorEXT;
+static PFN_vkCmdBindDescriptorBuffersEXT pCmdBindDescriptorBuffersEXT;
+static PFN_vkCmdSetDescriptorBufferOffsetsEXT pCmdSetDescriptorBufferOffsetsEXT;
+
+#define DB_NBIND 4
+#define DB_NSETS 256
+#define DB_CB_SIZE 512 /* bytes per cbuffer: 32 vec4 */
+
+static VkDescriptorSetLayout dsl_db;
+static VkPipelineLayout pl_db;
+static struct buf db_desc, db_cb;
+static VkDeviceSize db_set_size;
+
+static VkDeviceAddress
+buf_addr(const struct buf *b)
+{
+   VkBufferDeviceAddressInfo ai = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b->buf,
+   };
+   return vkGetBufferDeviceAddress(dev, &ai);
+}
+
+static void
+db_setup(void)
+{
+#define GPA(n) p##n = (PFN_vk##n)vkGetDeviceProcAddr(dev, "vk" #n)
+   GPA(GetDescriptorSetLayoutSizeEXT);
+   GPA(GetDescriptorSetLayoutBindingOffsetEXT);
+   GPA(GetDescriptorEXT);
+   GPA(CmdBindDescriptorBuffersEXT);
+   GPA(CmdSetDescriptorBufferOffsetsEXT);
+#undef GPA
+   VkDescriptorSetLayoutBinding b[DB_NBIND];
+   for (int i = 0; i < DB_NBIND; i++)
+      b[i] = (VkDescriptorSetLayoutBinding){
+         .binding = i, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+      };
+   VkDescriptorSetLayoutCreateInfo lci = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT,
+      .bindingCount = DB_NBIND, .pBindings = b,
+   };
+   CHECK(vkCreateDescriptorSetLayout(dev, &lci, NULL, &dsl_db));
+   VkPipelineLayoutCreateInfo plci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 1, .pSetLayouts = &dsl_db,
+   };
+   CHECK(vkCreatePipelineLayout(dev, &plci, NULL, &pl_db));
+
+   VkPhysicalDeviceDescriptorBufferPropertiesEXT dbp = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT,
+   };
+   VkPhysicalDeviceProperties2 p2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dbp,
+   };
+   vkGetPhysicalDeviceProperties2(pdev, &p2);
+   pGetDescriptorSetLayoutSizeEXT(dev, dsl_db, &db_set_size);
+   VkDeviceSize a = dbp.descriptorBufferOffsetAlignment;
+   db_set_size = (db_set_size + a - 1) / a * a;
+
+   /* The cbuffers in host-visible VRAM (where DXVK puts constant buffers),
+    * else VRAM; the descriptor buffer host-visible, as DXVK allocates it */
+   VkBufferUsageFlags cbu = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+   VkDeviceSize cb_size = (VkDeviceSize)DB_NSETS * DB_NBIND * DB_CB_SIZE;
+   if (!make_buffer(&db_cb, cb_size, cbu, PL_DEVICE_HOST))
+      CHECK(make_buffer(&db_cb, cb_size, cbu, PL_HOST) ? VK_SUCCESS : VK_ERROR_UNKNOWN);
+   float *f = db_cb.map;
+   for (size_t i = 0; i < cb_size / 4; i++) {
+      /* identity-ish matrices and multipliers near 1 */
+      size_t v = i % (DB_CB_SIZE / 4);
+      f[i] = (v < 16 && v % 5 == 0) ? 1.0f : (v < 16 ? 0.0f :
+             0.9f + 0.0001f * (float)((i * 7) % 1000));
+   }
+   VkBufferUsageFlags du = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+   CHECK(make_buffer(&db_desc, db_set_size * DB_NSETS, du, PL_HOST) ?
+         VK_SUCCESS : VK_ERROR_UNKNOWN);
+   VkDeviceAddress cba = buf_addr(&db_cb);
+   for (int set = 0; set < DB_NSETS; set++) {
+      for (int i = 0; i < DB_NBIND; i++) {
+         VkDeviceSize off;
+         pGetDescriptorSetLayoutBindingOffsetEXT(dev, dsl_db, i, &off);
+         VkDescriptorAddressInfoEXT ai = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+            .address = cba + ((VkDeviceSize)set * DB_NBIND + i) * DB_CB_SIZE,
+            .range = DB_CB_SIZE,
+         };
+         VkDescriptorGetInfoEXT gi = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .data.pUniformBuffer = &ai,
+         };
+         pGetDescriptorEXT(dev, &gi, dbp.uniformBufferDescriptorSize,
+                           (char *)db_desc.map + set * db_set_size + off);
+      }
+   }
+}
+
+static void
+db_bind(VkCommandBuffer cmd)
+{
+   VkDescriptorBufferBindingInfoEXT bi = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT,
+      .address = buf_addr(&db_desc),
+      .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT,
+   };
+   pCmdBindDescriptorBuffersEXT(cmd, 1, &bi);
+}
+
+static void
+db_set(VkCommandBuffer cmd, int set)
+{
+   uint32_t idx = 0;
+   VkDeviceSize off = (VkDeviceSize)set * db_set_size;
+   pCmdSetDescriptorBufferOffsetsEXT(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                     pl_db, 0, 1, &idx, &off);
+}
+
+/* Pixel shader cost of cbuffer reads: 4 fullscreen passes, 128 vec4 FMAs
+ * per pixel with both operands from cbuffers */
+static void
+test_cb_ps(VkPipeline p)
+{
+   VkCommandBuffer cmd = begin_cmd();
+   ts_begin(cmd);
+   begin_render(cmd, &rt8, true, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   db_bind(cmd);
+   db_set(cmd, 0);
+   for (int i = 0; i < 4; i++)
+      vkCmdDraw(cmd, 3, 1, 0, 0);
+   vkCmdEndRendering(cmd);
+   ts_end(cmd);
+   double cpu, gpu = time_cmd(cmd, &cpu);
+   report("cbuf PS 256 reads x4", "Gpix/s", (double)W * H * 4, gpu, cpu);
+   if (getenv("BENCH_HASH"))
+      printf("  hash %016llx\n", (unsigned long long)
+             image_hash(&rt8, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 4));
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+}
+
+/* Small draws, each pointing the set at another descriptor buffer region:
+ * three cbuffers in the VS, one in the PS */
+static void
+test_cb_draws(VkPipeline p, int nd)
+{
+   VkCommandBuffer cmd = begin_cmd();
+   ts_begin(cmd);
+   begin_render(cmd, &rt8, true, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   db_bind(cmd);
+   for (int i = 0; i < nd; i++) {
+      db_set(cmd, i % DB_NSETS);
+      vkCmdDraw(cmd, 4, 1, 0, 0);
+   }
+   vkCmdEndRendering(cmd);
+   ts_end(cmd);
+   double cpu, gpu = time_cmd(cmd, &cpu);
+   report("cbuf draws, set per draw", "Mdraws/s", nd, gpu, cpu);
+   if (getenv("BENCH_HASH"))
+      printf("  hash %016llx\n", (unsigned long long)
+             image_hash(&rt8, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 4));
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+}
+
+/* ZCULL coherence: a depth image with the usage DXVK gives it (transfer
+ * destination) is cleared to c0 in a render pass (ZCULL stored), then
+ * written outside a render pass (a copy from a buffer, a copy from another
+ * depth image, a blit, or vkCmdClearDepthStencilImage) to d1, then loaded
+ * in a render pass that draws a fullscreen layer at zt which passes the
+ * depth test against d1 everywhere.  Stale ZCULL (still c0) culls it.
+ * Prints the number of pixels drawn out of W*H. */
+static uint64_t
+count_nonzero_rgba8(struct img *im)
+{
+   struct buf b;
+   make_buffer(&b, (VkDeviceSize)W * H * 4, 0, PL_HOST);
+   VkCommandBuffer c = begin_cmd();
+   image_layout(c, im->img, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+   VkBufferImageCopy r = {
+      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      .imageExtent = { W, H, 1 },
+   };
+   vkCmdCopyImageToBuffer(c, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          b.buf, 1, &r);
+   image_layout(c, im->img, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+   barrier_all(c);
+   CHECK(vkEndCommandBuffer(c));
+   submit_wait(c);
+   vkFreeCommandBuffers(dev, cpool, 1, &c);
+   uint64_t n = 0;
+   const uint32_t *px = b.map;
+   for (uint64_t i = 0; i < (uint64_t)W * H; i++)
+      n += px[i] != 0;
+   free_buffer(&b);
+   return n;
+}
+
+enum zwrite { ZW_COPY_BUF, ZW_COPY_IMG, ZW_BLIT, ZW_CLEAR_IMG, ZW_COUNT };
+static const char *zw_name[] = { "copy buffer->image", "copy image->image",
+                                 "blit", "clear image" };
+
+static void
+test_zcull_coherence(VkPipeline p_le, VkPipeline p_ge)
+{
+   VkImageUsageFlags u = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT;
+   struct img zd, zsrc, saved = depth;
+   make_image(&zd, VK_FORMAT_D32_SFLOAT, W, H, u, VK_IMAGE_ASPECT_DEPTH_BIT);
+   make_image(&zsrc, VK_FORMAT_D32_SFLOAT, W, H, u, VK_IMAGE_ASPECT_DEPTH_BIT);
+   struct buf zb;
+   make_buffer(&zb, (VkDeviceSize)W * H * 4, 0, PL_HOST);
+   int bad_total = 0;
+   for (int ge = 0; ge < 2; ge++) {
+      /* LEQUAL: cleared to 0.5, written to 1.0, layer at 0.7.
+       * GEQUAL: cleared to 0.5, written to 0.0, layer at 0.3. */
+      const float c0 = 0.5f, d1 = ge ? 0.0f : 1.0f, zt = ge ? 0.3f : 0.7f;
+      float *f = zb.map;
+      for (uint64_t i = 0; i < (uint64_t)W * H; i++)
+         f[i] = d1;
+      for (int w = 0; w < ZW_COUNT; w++) {
+         VkCommandBuffer c = begin_cmd();
+         VkImageSubresourceRange dr = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+         VkImageSubresourceLayers dl = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+         /* zsrc = d1 */
+         image_layout(c, zsrc.img, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+         VkClearDepthStencilValue cv = { d1, 0 };
+         vkCmdClearDepthStencilImage(c, zsrc.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     &cv, 1, &dr);
+         image_layout(c, zsrc.img, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+         /* zd = c0 through a render pass (ZCULL cleared and stored) */
+         image_layout(c, zd.img, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+         depth = zd;
+         depth_clear = c0;
+         begin_render(c, &rt8, true, true);
+         vkCmdEndRendering(c);
+         image_layout(c, zd.img, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+         /* zd = d1 outside a render pass */
+         switch (w) {
+         case ZW_COPY_BUF: {
+            VkBufferImageCopy r = { .imageSubresource = dl, .imageExtent = { W, H, 1 } };
+            vkCmdCopyBufferToImage(c, zb.buf, zd.img,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+            break;
+         }
+         case ZW_COPY_IMG: {
+            VkImageCopy r = { .srcSubresource = dl, .dstSubresource = dl,
+                              .extent = { W, H, 1 } };
+            vkCmdCopyImage(c, zsrc.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           zd.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+            break;
+         }
+         case ZW_BLIT: {
+            VkImageBlit r = { .srcSubresource = dl, .dstSubresource = dl,
+                              .srcOffsets = { { 0, 0, 0 }, { W, H, 1 } },
+                              .dstOffsets = { { 0, 0, 0 }, { W, H, 1 } } };
+            vkCmdBlitImage(c, zsrc.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           zd.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r,
+                           VK_FILTER_NEAREST);
+            break;
+         }
+         case ZW_CLEAR_IMG:
+            vkCmdClearDepthStencilImage(c, zd.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                        &cv, 1, &dr);
+            break;
+         }
+         image_layout(c, zd.img, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+         /* load zd, draw the layer at zt */
+         depth_load = true;
+         begin_render(c, &rt8, true, true);
+         depth_load = false;
+         depth_clear = 1.0f;
+         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, ge ? p_ge : p_le);
+         float pc[4] = { 0, 0, zt, 0 };
+         vkCmdPushConstants(c, pl_gfx, VK_SHADER_STAGE_ALL, 0, 16, pc);
+         vkCmdDraw(c, 3, 1, 0, 0);
+         vkCmdEndRendering(c);
+         barrier_all(c);
+         CHECK(vkEndCommandBuffer(c));
+         submit_wait(c);
+         vkFreeCommandBuffers(dev, cpool, 1, &c);
+         depth = saved;
+         uint64_t n = count_nonzero_rgba8(&rt8);
+         bool ok = n == (uint64_t)W * H;
+         bad_total += !ok;
+         printf("zcull coherence %-6s %-20s %s (%llu of %u pixels drawn)\n",
+                ge ? "GEQUAL" : "LEQUAL", zw_name[w], ok ? "ok" : "FAIL",
+                (unsigned long long)n, W * H);
+      }
+   }
+   /* Direction cases, each on a fresh image (ZCULL storage, TRANSFER_DST):
+    * 0: DXVK's first use: vkCmdClearDepthStencilImage to 0.0, then a pass
+    *    loads it and draws at 0.3 GEQUAL (passes everywhere)
+    * 1: application clear to 0.0 (reverse Z), a layer at 0.2 GEQUAL, then
+    *    a pass loads it and draws at 0.1 LEQUAL (passes: 0.1 <= 0.2)
+    * 2: application clear to 1.0, a layer at 0.8 LEQUAL, then a pass loads
+    *    it and draws at 0.9 GEQUAL (passes: 0.9 >= 0.8) */
+   for (int k = 0; k < 3; k++) {
+      struct img zk;
+      make_image(&zk, VK_FORMAT_D32_SFLOAT, W, H, u, VK_IMAGE_ASPECT_DEPTH_BIT);
+      VkCommandBuffer c = begin_cmd();
+      depth = zk;
+      VkPipeline last;
+      float zl;
+      if (k == 0) {
+         VkImageSubresourceRange dr = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+         image_layout(c, zk.img, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+         VkClearDepthStencilValue cv = { 0.0f, 0 };
+         vkCmdClearDepthStencilImage(c, zk.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     &cv, 1, &dr);
+         image_layout(c, zk.img, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+         last = p_ge;
+         zl = 0.3f;
+      } else {
+         image_layout(c, zk.img, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+         depth_clear = k == 1 ? 0.0f : 1.0f;
+         begin_render(c, &rt8, true, true);
+         depth_clear = 1.0f;
+         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, k == 1 ? p_ge : p_le);
+         float pc0[4] = { 0, 0, k == 1 ? 0.2f : 0.8f, 0 };
+         vkCmdPushConstants(c, pl_gfx, VK_SHADER_STAGE_ALL, 0, 16, pc0);
+         vkCmdDraw(c, 3, 1, 0, 0);
+         vkCmdEndRendering(c);
+         barrier_all(c);
+         last = k == 1 ? p_le : p_ge;
+         zl = k == 1 ? 0.1f : 0.9f;
+      }
+      depth_load = true;
+      begin_render(c, &rt8, true, true);
+      depth_load = false;
+      vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, last);
+      float pc[4] = { 0, 0, zl, 0 };
+      vkCmdPushConstants(c, pl_gfx, VK_SHADER_STAGE_ALL, 0, 16, pc);
+      vkCmdDraw(c, 3, 1, 0, 0);
+      vkCmdEndRendering(c);
+      barrier_all(c);
+      CHECK(vkEndCommandBuffer(c));
+      submit_wait(c);
+      vkFreeCommandBuffers(dev, cpool, 1, &c);
+      depth = saved;
+      uint64_t n = count_nonzero_rgba8(&rt8);
+      bool ok = n == (uint64_t)W * H;
+      bad_total += !ok;
+      static const char *kn[] = { "clear image 0, load GEQUAL",
+                                  "reverse Z, load LEQUAL",
+                                  "forward Z, load GEQUAL" };
+      printf("zcull coherence %-34s %s (%llu of %u pixels drawn)\n", kn[k],
+             ok ? "ok" : "FAIL", (unsigned long long)n, W * H);
+      vkDestroyImageView(dev, zk.view, NULL);
+      vkDestroyImage(dev, zk.img, NULL);
+      vkFreeMemory(dev, zk.mem, NULL);
+   }
+   printf("zcull coherence: %s\n", bad_total ? "FAIL" : "ok");
+   free_buffer(&zb);
+   vkDestroyImageView(dev, zd.view, NULL);
+   vkDestroyImage(dev, zd.img, NULL);
+   vkFreeMemory(dev, zd.mem, NULL);
+   vkDestroyImageView(dev, zsrc.view, NULL);
+   vkDestroyImage(dev, zsrc.img, NULL);
+   vkFreeMemory(dev, zsrc.mem, NULL);
+}
+
 /* Displacement-mapped terrain: triangle patches, distance-based levels
  * from a UBO in the TCS, three texture fetches in the TES; ndraws draws
  * of grid x grid cells with their own dynamic UBO each. */
@@ -1539,11 +2041,23 @@ main(int argc, char **argv)
    CHECK(vkEnumerateDeviceExtensionProperties(pdev, NULL, &next, NULL));
    VkExtensionProperties *exts = calloc(next, sizeof(*exts));
    CHECK(vkEnumerateDeviceExtensionProperties(pdev, NULL, &next, exts));
-   for (uint32_t i = 0; i < next; i++)
+   for (uint32_t i = 0; i < next; i++) {
       if (!strcmp(exts[i].extensionName, VK_EXT_MULTI_DRAW_EXTENSION_NAME))
          has_multi_draw = true;
+      if (!strcmp(exts[i].extensionName, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME))
+         has_descriptor_buffer = true;
+   }
    free(exts);
-   const char *dev_exts[] = { VK_EXT_MULTI_DRAW_EXTENSION_NAME };
+   const char *dev_exts[2];
+   uint32_t ndev_exts = 0;
+   if (has_multi_draw)
+      dev_exts[ndev_exts++] = VK_EXT_MULTI_DRAW_EXTENSION_NAME;
+   if (has_descriptor_buffer)
+      dev_exts[ndev_exts++] = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
+   VkPhysicalDeviceDescriptorBufferFeaturesEXT fdb = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
+      .descriptorBuffer = VK_TRUE,
+   };
    VkPhysicalDeviceMultiDrawFeaturesEXT fmd = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT,
       .multiDraw = VK_TRUE,
@@ -1553,11 +2067,18 @@ main(int argc, char **argv)
       .pNext = has_multi_draw ? &fmd : NULL,
       .shaderDrawParameters = VK_TRUE,
    };
+   fdb.pNext = &f11;
+   VkPhysicalDeviceVulkan12Features f12 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+      .pNext = has_descriptor_buffer ? (void *)&fdb : (void *)&f11,
+      .bufferDeviceAddress = VK_TRUE,
+   };
    VkPhysicalDeviceVulkan13Features f13 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
       .pNext = &f11,
       .dynamicRendering = VK_TRUE,
    };
+   f13.pNext = &f12;
    VkPhysicalDeviceFeatures2 f2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13,
       .features.tessellationShader = VK_TRUE,
@@ -1567,7 +2088,7 @@ main(int argc, char **argv)
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .pNext = &f2,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
-      .enabledExtensionCount = has_multi_draw ? 1 : 0,
+      .enabledExtensionCount = ndev_exts,
       .ppEnabledExtensionNames = dev_exts,
    };
    CHECK(vkCreateDevice(pdev, &dci, NULL, &dev));
@@ -1632,9 +2153,8 @@ main(int argc, char **argv)
               VK_IMAGE_ASPECT_COLOR_BIT);
    make_image(&rt16, VK_FORMAT_R16G16B16A16_SFLOAT, W, H, rt_usage,
               VK_IMAGE_ASPECT_COLOR_BIT);
-   make_image(&depth, VK_FORMAT_D32_SFLOAT, W, H,
-              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-              VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+   make_image(&depth, VK_FORMAT_D32_SFLOAT, W, H, depth_usage_flags(),
+              VK_IMAGE_ASPECT_DEPTH_BIT);
    make_image(&tex, VK_FORMAT_R8G8B8A8_UNORM, TEX_DIM, TEX_DIM,
               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
               VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1743,6 +2263,28 @@ main(int argc, char **argv)
    VkPipeline p_copy;
    CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &p_copy));
 
+   VkPipeline p_cbps = VK_NULL_HANDLE, p_cbdraw = VK_NULL_HANDLE;
+   if (has_descriptor_buffer) {
+      db_setup();
+      p_cbps = make_gfx(&(struct gfx_desc){ .layout = pl_db, .vs = m_fsq,
+         .fs = SHADER(spv_cbps_frag), .color = VK_FORMAT_R8G8B8A8_UNORM,
+         .topo = TL, .flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT });
+      p_cbdraw = make_gfx(&(struct gfx_desc){ .layout = pl_db,
+         .vs = SHADER(spv_cbvs_vert), .fs = SHADER(spv_cbcol_frag),
+         .color = VK_FORMAT_R8G8B8A8_UNORM,
+         .topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+         .flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT });
+   }
+   VkPipeline p_aluz_rev = make_gfx(&(struct gfx_desc){ .vs = m_fsqz, .fs = m_alu,
+      .color = VK_FORMAT_R8G8B8A8_UNORM, .depth = true, .topo = TL,
+      .cmp = VK_COMPARE_OP_GREATER_OR_EQUAL });
+
+   VkPipeline p_zle = make_gfx(&(struct gfx_desc){ .vs = m_fsqz, .fs = m_blend,
+      .color = VK_FORMAT_R8G8B8A8_UNORM, .depth = true, .topo = TL });
+   VkPipeline p_zge = make_gfx(&(struct gfx_desc){ .vs = m_fsqz, .fs = m_blend,
+      .color = VK_FORMAT_R8G8B8A8_UNORM, .depth = true, .topo = TL,
+      .cmp = VK_COMPARE_OP_GREATER_OR_EQUAL });
+
    const double px = (double)W * H;
    if (want(tests, "alu")) {
       float pc[4] = { 0.5f, 64, 0, 0 };
@@ -1763,6 +2305,12 @@ main(int argc, char **argv)
       test_zcull(p_aluz, true);
       test_zcull(p_aluz, false);
    }
+   if (want(tests, "zpass")) {
+      test_zcull_passes(p_aluz, 2);
+      test_zcull_passes(p_aluz, 8);
+   }
+   if (want(tests, "zrev"))
+      test_zcull_reverse(p_aluz_rev);
    if (want(tests, "clear"))
       test_clear();
    /* BENCH_NDRAWS: fewer draws, e.g. for NVK_DEBUG=push_dump */
@@ -1798,6 +2346,10 @@ main(int argc, char **argv)
       test_tess_terrain(p_tess2, 16, 64, 4);
       test_tess_terrain(p_tess2, 16, 8, 500);
    }
+   if (want(tests, "cb") && has_descriptor_buffer) {
+      test_cb_ps(p_cbps);
+      test_cb_draws(p_cbdraw, nd);
+   }
    if (want(tests, "copy")) {
       test_copy(p_copy, 256ull << 20, PL_DEVICE, 4);
       test_copy(p_copy, 64ull << 20, PL_HOST, 1);
@@ -1810,6 +2362,8 @@ main(int argc, char **argv)
       test_descupd(p_ubotex);
    if (want(tests, "params"))
       test_params(p_params);
+   if (want(tests, "zcoh"))
+      test_zcull_coherence(p_zle, p_zge);
    if (want(tests, "verify"))
       test_verify(p_tex, p_blend, p_tess);
    if (want(tests, "coh"))

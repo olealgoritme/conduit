@@ -210,6 +210,42 @@ layout(std430, set = 0, binding = 1) writeonly buffer B { vec4 b[]; };
 void main() { uint i = gl_GlobalInvocationID.x; b[i] = a[i] * 1.0001; }
 """
 
+# D3D11 through DXVK: every cbuffer is a plain UBO in a descriptor buffer
+# (no dynamic offsets), several per stage.  cbps reads 32 vec4 at static
+# offsets from two cbuffers per pixel, as material and light constants are
+# read; cbvs transforms by matrices from three cbuffers.
+S["cbps.frag"] = """#version 450
+layout(set = 0, binding = 0) uniform CB0 { vec4 c[32]; } cb0;
+layout(set = 0, binding = 1) uniform CB1 { vec4 c[32]; } cb1;
+layout(location = 0) out vec4 o;
+void main() {
+   vec4 a = vec4(gl_FragCoord.xy * 0.001, 0.5, 1.0);
+   for (int r = 0; r < 4; r++) {
+      for (int i = 0; i < 32; i++)
+         a = fract(a * cb0.c[i] + cb1.c[i]);
+   }
+   o = a;
+}
+"""
+S["cbvs.vert"] = """#version 450
+layout(set = 0, binding = 0) uniform CB0 { mat4 world; vec4 tint; } cb0;
+layout(set = 0, binding = 1) uniform CB1 { mat4 view; mat4 proj; } cb1;
+layout(set = 0, binding = 2) uniform CB2 { vec4 off; vec4 scale; } cb2;
+layout(location = 0) out vec4 col;
+void main() {
+   vec2 p = vec2(float(gl_VertexIndex & 1), float(gl_VertexIndex >> 1)) * 0.02;
+   vec4 w = cb0.world * vec4(p * cb2.scale.xy + cb2.off.xy, 0.0, 1.0);
+   gl_Position = cb1.proj * (cb1.view * w);
+   col = cb0.tint;
+}
+"""
+S["cbcol.frag"] = """#version 450
+layout(set = 0, binding = 3) uniform CB3 { vec4 c; } cb3;
+layout(location = 0) in vec4 col;
+layout(location = 0) out vec4 o;
+void main() { o = col * cb3.c; }
+"""
+
 out = os.path.join(here, "shaders")
 os.makedirs(out, exist_ok=True)
 for name, src in S.items():
