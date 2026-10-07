@@ -292,7 +292,16 @@ the staging surface exists "when a direct bitblt to the primary surface is not p
 and the redirection surface that a direct Blt can target is the GPU `TEXTURE` GDI surface, which CDD
 uses with GDI hardware acceleration (`SupportKernelModeCommandBuffer`,
 [GDI hardware acceleration](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gdi-hardware-acceleration)).
-That is the one documented switch left.
+That is the one documented switch left. Microsoft's feature-caps table lists GDI hardware
+acceleration as mandatory for full-graphics and render-only WDDM 1.2+ drivers
+([WDDM driver and feature caps](https://github.com/MicrosoftDocs/windows-driver-docs/blob/staging/windows-driver-docs-pr/display/wddm-driver-and-feature-caps.md)),
+so bare-metal vendor drivers set it and their redirection bitmaps are GDI `TEXTURE` surfaces. Two
+`DXGK_PRESENTATIONCAPS` bits are still untested middle steps: `DriverSupportsCddDwmInterop` ("does not
+support HW GDI acceleration but supports Cdd-Dwm interop") and `SupportSoftwareDeviceBitmaps`
+(`TEXTURE_CPUVISIBLE` redirection bitmaps: CPU visible, so most likely still locked). They belong in the
+fallback-A branch's `PresentationCaps` hook. The non-driver alternative, Windows' flip-model upgrade of
+windowed games (`SwapEffectUpgradeEnable`), was tried before and is gated by DXGI's game classification
+(`docs/HANDOFF.md`, "Tried").
 
 Expected outcomes and what each means:
 
@@ -399,6 +408,7 @@ next window creation, counted), or `RedirVram` simply requires `DwmIcd=nvk`.
 | multi-monitor | redirection surfaces of windows spanning outputs | unchanged: one surface per window, the output does not matter |
 | DWM restart | DWM's imports die with it; the allocation is the app's | the foreign record's lifetime rules (`shared-foreign-surfaces.md` 3, 6.1) already cover an opener's death |
 | device restart / TDR | RM objects of the generation go | `rm_client::forget` sweep; allocations re-created by dxgkrnl after the reset; `RedirVram` refuses until the client is up |
+| GDI `EXISTINGSYSMEM` surfaces under GDI acceleration | the KMD backs them with its own standard buffer instead of the caller's pages, so GDI operations would read and write the wrong bytes | if the census (`StdNGdiSys`) shows them once `GdiAccel` is on: back them with the caller's pages (the allocation arm, this branch) |
 | security | a GPU-only window surface reachable by `RM_DUP_OBJECT` | `NvDupHarden` (the route's `h_client` rule applies to the producer side; the destination is KMD-owned and never handed out as an RM handle, only as a resid to authorized openers) |
 
 ### 5.9 V2-V5 as built (`RedirVram`, default 0)
