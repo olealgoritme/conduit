@@ -3,7 +3,7 @@
 use crate::paths;
 use std::path::Path;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Driver {
     pub version: String,
     pub open: bool,

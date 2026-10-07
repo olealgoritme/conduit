@@ -63,8 +63,10 @@ RTX 5090.
 
 1. **Download** the package for your Linux from the
    **[latest release](https://github.com/olealgoritme/conduit/releases/latest)** and install it (table below).
-2. **Check your computer:** `conduit doctor`. Every line should say `ok`;
-   if not, it tells you what to fix.
+2. **Check your computer:** `conduit doctor`. A line marked `FAIL` needs fixing
+   (it says how); `warn` lines are expected with a closed or older NVIDIA driver
+   and mean Conduit starts in safe mode. First time? `conduit setup` walks you
+   through all of this, up to a first working VM.
 3. **Make a VM:** `conduit create myvm` (downloads Ubuntu, installs a GNOME
    desktop and the GPU driver; takes a few minutes).
 4. **Open it:** `conduit view myvm`. A window with the VM's desktop appears.

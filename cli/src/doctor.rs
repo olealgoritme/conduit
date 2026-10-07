@@ -6,8 +6,8 @@ use crate::sys;
 use crate::ui;
 use std::path::Path;
 
-#[derive(Debug, PartialEq)]
-enum Level {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Level {
     Ok,
     Warn,
     Fail,
@@ -107,30 +107,101 @@ fn safe_mode_text(
     }
 }
 
+/// The Debian/Ubuntu packages behind the tools the `Tools` check looks for.
+pub const TOOL_PACKAGES_APT: &[&str] = &[
+    "iproute2",
+    "iptables",
+    "openssh-client",
+    "curl",
+    "e2fsprogs",
+    "xz-utils",
+    "coreutils",
+];
+
+/// One finding of a check: what `conduit doctor` prints, and what `conduit
+/// setup` turns into steps. `id` is a stable key (the title as a slug, or an
+/// explicit one where one title covers causes with different fixes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Check {
+    pub id: String,
+    pub level: Level,
+    pub title: String,
+    pub detail: String,
+    /// How to fix it, in plain words; lines separated by `\n`.
+    pub hint: String,
+}
+
+/// "NVIDIA driver" -> "nvidia-driver".
+fn slug(title: &str) -> String {
+    let mut out = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// The one printer: `[ tag ] title: detail`, then the hint of anything not ok.
+pub fn render_check(c: &Check) -> String {
+    let tag = match c.level {
+        Level::Ok => "  ok  ",
+        Level::Warn => " warn ",
+        Level::Fail => " FAIL ",
+    };
+    let mut s = format!("[{tag}] {}: {}\n", c.title, c.detail);
+    if !c.hint.is_empty() && c.level != Level::Ok {
+        for l in c.hint.lines() {
+            s.push_str(&format!("         {l}\n"));
+        }
+    }
+    s
+}
+
+pub fn count(checks: &[Check], level: Level) -> usize {
+    checks.iter().filter(|c| c.level == level).count()
+}
+
+/// Collects checks; with `stream` each is printed as it is made.
 struct Report {
-    fails: usize,
-    warns: usize,
+    checks: Vec<Check>,
+    stream: bool,
 }
 
 impl Report {
-    fn line(&mut self, lvl: Level, what: &str, detail: &str, fix: &str) {
-        let tag = match lvl {
-            Level::Ok => "  ok  ",
-            Level::Warn => {
-                self.warns += 1;
-                " warn "
-            }
-            Level::Fail => {
-                self.fails += 1;
-                " FAIL "
-            }
-        };
-        println!("[{tag}] {what}: {detail}");
-        if !fix.is_empty() && !matches!(lvl, Level::Ok) {
-            for l in fix.lines() {
-                println!("         {l}");
-            }
+    fn new(stream: bool) -> Report {
+        Report {
+            checks: Vec::new(),
+            stream,
         }
+    }
+
+    fn line(&mut self, lvl: Level, what: &str, detail: &str, fix: &str) {
+        self.line_id(&slug(what), lvl, what, detail, fix);
+    }
+
+    fn line_id(&mut self, id: &str, level: Level, title: &str, detail: &str, hint: &str) {
+        let c = Check {
+            id: id.into(),
+            level,
+            title: title.into(),
+            detail: detail.into(),
+            hint: hint.into(),
+        };
+        if self.stream {
+            print!("{}", render_check(&c));
+        }
+        self.checks.push(c);
+    }
+
+    fn fails(&self) -> usize {
+        count(&self.checks, Level::Fail)
+    }
+
+    fn warns(&self) -> usize {
+        count(&self.checks, Level::Warn)
     }
 }
 
@@ -289,16 +360,20 @@ fn staging_verdict(ok: bool, stdout: &str, stderr: &str) -> (Level, String, Stri
     }
 }
 
-pub fn run() -> i32 {
-    let mut r = Report { fails: 0, warns: 0 };
-    println!("Checking this computer for Conduit…\n");
+/// Every host check, in the order `conduit doctor` prints them.
+pub fn host_checks() -> Vec<Check> {
+    let mut r = Report::new(false);
+    collect_host(&mut r);
+    r.checks
+}
 
+fn collect_host(r: &mut Report) {
     // KVM
     if !Path::new("/dev/kvm").exists() {
         r.line(Level::Fail, "KVM", "not available (/dev/kvm is missing)",
             "Turn on virtualization in your BIOS/UEFI settings (called VT-x, VT-d, AMD-V or SVM),\nthen restart. If it is on, load the module: sudo modprobe kvm_intel  (or kvm_amd)");
     } else if !can_open_rw("/dev/kvm") {
-        r.line(Level::Fail, "KVM", "present, but you may not use it",
+        r.line_id("kvm-access", Level::Fail, "KVM", "present, but you may not use it",
             &format!("Add yourself to the kvm group, then log out and back in:\n  sudo usermod -aG kvm {}", paths::username()));
     } else {
         r.line(Level::Ok, "KVM", "available", "");
@@ -337,7 +412,7 @@ pub fn run() -> i32 {
     }
 
     if host::driver().is_some() {
-        gpu_host_lines(&mut r);
+        gpu_host_lines(r);
     }
 
     // Desktop
@@ -413,8 +488,12 @@ pub fn run() -> i32 {
     if missing.is_empty() {
         r.line(Level::Ok, "Tools", "network and disk tools present", "");
     } else {
-        r.line(Level::Fail, "Tools", &format!("missing: {}", missing.join(", ")),
-            "Ubuntu: sudo apt install iproute2 iptables openssh-client curl e2fsprogs xz-utils coreutils");
+        r.line(
+            Level::Fail,
+            "Tools",
+            &format!("missing: {}", missing.join(", ")),
+            &format!("Ubuntu: sudo apt install {}", TOOL_PACKAGES_APT.join(" ")),
+        );
     }
 
     // Conduit's own parts
@@ -422,19 +501,19 @@ pub fn run() -> i32 {
     let qemu = Tool::BundledQemu.find();
     match (&qemu, crate::qemu::virtiofsd(), Tool::Vmm.find()) {
         (Some(q), Some(_), _) => r.line(Level::Ok, "VM runner", &format!("QEMU {}", q.display()), ""),
-        (Some(_), None, _) => r.line(Level::Fail, "VM runner", "QEMU found, but virtiofsd is missing",
+        (Some(_), None, _) => r.line_id("virtiofsd", Level::Fail, "VM runner", "QEMU found, but virtiofsd is missing",
             "Ubuntu/Debian: sudo apt install virtiofsd   Fedora: sudo dnf install virtiofsd"),
         (None, _, Some(v)) => r.line(Level::Warn, "VM runner",
             &format!("bundled QEMU missing; only the built-in runner ({})", v.display()),
             "The built-in runner has no sound and cannot boot a VM's own (stock) kernel. Reinstall the conduit package, or build host/qemu."),
-        (None, _, None) => r.line(Level::Fail, "VM runner", "neither the bundled QEMU nor the built-in runner was found",
+        (None, _, None) => r.line_id("conduit-part", Level::Fail, "VM runner", "neither the bundled QEMU nor the built-in runner was found",
             "Reinstall the conduit package. In a source checkout: host/qemu/build-qemu.sh"),
     }
 
     for t in [Tool::Backend, Tool::Viewer, Tool::GuestDeb, Tool::Userspace] {
         match t.find() {
             Some(p) => r.line(Level::Ok, t.label(), &p.display().to_string(), ""),
-            None => r.line(Level::Fail, t.label(), "not found",
+            None => r.line_id("conduit-part", Level::Fail, t.label(), "not found",
                 &format!("Reinstall the conduit package. In a source checkout, build it first.\n(looked in {} and the source checkout; or point to it with {}=/path)", paths::prefix().display(), t.env_var())),
         }
     }
@@ -516,19 +595,22 @@ pub fn run() -> i32 {
             "Run: virsh -c qemu:///session list   to see why",
         );
     }
+}
 
+pub fn run() -> i32 {
+    let mut r = Report::new(true);
+    println!("Checking this computer for Conduit…\n");
+    collect_host(&mut r);
     println!();
-    if r.fails == 0 && r.warns == 0 {
+    let (fails, warns) = (r.fails(), r.warns());
+    if fails == 0 && warns == 0 {
         println!("All good. Next: conduit create myvm");
-    } else if r.fails == 0 {
-        println!("Ready, with {} warning(s) above.", r.warns);
+    } else if fails == 0 {
+        println!("Ready, with {warns} warning(s) above.");
     } else {
-        println!(
-            "{} problem(s) to fix first; see the lines marked FAIL.",
-            r.fails
-        );
+        println!("{fails} problem(s) to fix first; see the lines marked FAIL.");
     }
-    if r.fails > 0 {
+    if fails > 0 {
         1
     } else {
         0
@@ -539,7 +621,7 @@ pub fn run() -> i32 {
 pub fn run_vm(name: &str) -> i32 {
     use crate::units;
     use crate::virt::{self, Kind, Link};
-    let mut r = Report { fails: 0, warns: 0 };
+    let mut r = Report::new(true);
     println!("Checking the VM {name}…\n");
     let cfg = crate::vm::VmConfig::load(name).ok();
     let link = Link::load(name);
@@ -616,7 +698,7 @@ pub fn run_vm(name: &str) -> i32 {
             "",
         );
         println!("\n(`conduit libvirt enable {name}` makes it a virt-manager VM)");
-        return if r.fails > 0 { 1 } else { 0 };
+        return if r.fails() > 0 { 1 } else { 0 };
     };
     let v = link.virsh();
     if let Err(e) = v.reachable() {
@@ -827,10 +909,10 @@ pub fn run_vm(name: &str) -> i32 {
         }
     }
     println!();
-    if r.fails == 0 {
+    if r.fails() == 0 {
         println!(
             "{name}: the chain looks complete{}.",
-            if r.warns > 0 {
+            if r.warns() > 0 {
                 " (see the warnings)"
             } else {
                 ""
@@ -838,7 +920,10 @@ pub fn run_vm(name: &str) -> i32 {
         );
         0
     } else {
-        println!("{name}: {} problem(s); fix the FAIL lines first.", r.fails);
+        println!(
+            "{name}: {} problem(s); fix the FAIL lines first.",
+            r.fails()
+        );
         1
     }
 }
@@ -846,6 +931,70 @@ pub fn run_vm(name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chk(id: &str, level: Level, title: &str, detail: &str, hint: &str) -> Check {
+        Check {
+            id: id.into(),
+            level,
+            title: title.into(),
+            detail: detail.into(),
+            hint: hint.into(),
+        }
+    }
+
+    /// The text `conduit doctor` has always printed for these lines.
+    #[test]
+    fn printer_output_is_the_established_text() {
+        let checks = [
+            chk("kvm", Level::Ok, "KVM", "available", ""),
+            chk(
+                "sudo",
+                Level::Warn,
+                "sudo",
+                "may not be allowed",
+                "Ask an administrator\nto add you.",
+            ),
+            chk(
+                "tools",
+                Level::Fail,
+                "Tools",
+                "missing: ip",
+                "Ubuntu: sudo apt install iproute2",
+            ),
+            chk(
+                "x",
+                Level::Ok,
+                "Safe mode",
+                "off",
+                "a hint that is never shown for ok",
+            ),
+        ];
+        let text: String = checks.iter().map(render_check).collect();
+        assert_eq!(
+            text,
+            "[  ok  ] KVM: available\n\
+             [ warn ] sudo: may not be allowed\n         Ask an administrator\n         to add you.\n\
+             [ FAIL ] Tools: missing: ip\n         Ubuntu: sudo apt install iproute2\n\
+             [  ok  ] Safe mode: off\n"
+        );
+        assert_eq!(
+            (count(&checks, Level::Warn), count(&checks, Level::Fail)),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn ids_are_slugs_of_titles_unless_given() {
+        assert_eq!(slug("NVIDIA driver"), "nvidia-driver");
+        assert_eq!(slug("Driver support"), "driver-support");
+        assert_eq!(slug("Conduit's QEMU"), "conduit-s-qemu");
+        let mut r = Report::new(false);
+        r.line(Level::Ok, "KVM", "available", "");
+        r.line_id("kvm-access", Level::Fail, "KVM", "x", "y");
+        let ids: Vec<&str> = r.checks.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["kvm", "kvm-access"]);
+        assert_eq!((r.fails(), r.warns()), (1, 0));
+    }
 
     #[test]
     fn firmware_off_is_read_from_the_params_file() {

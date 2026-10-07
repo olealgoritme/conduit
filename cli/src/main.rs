@@ -18,6 +18,7 @@ mod protect;
 mod qemu;
 mod run;
 mod scope;
+mod setup;
 mod stream;
 mod sys;
 mod trace;
@@ -37,7 +38,7 @@ use std::path::PathBuf;
     name = "conduit",
     version,
     about = "Share your NVIDIA GPU with a Linux VM and see its desktop in a window",
-    after_help = "Start here:\n  conduit doctor        check this computer\n  conduit create myvm   make a ready-to-use Ubuntu VM\n  conduit view myvm     open it in a window (closing the window shuts it down)"
+    after_help = "Start here:\n  conduit setup         guided first run (checks, fixes, first VM)\n  conduit doctor        check this computer\n  conduit create myvm   make a ready-to-use Ubuntu VM\n  conduit view myvm     open it in a window (closing the window shuts it down)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -53,6 +54,28 @@ struct Cli {
     /// (conduit-backend --venus, docs/VENUS.md)
     #[arg(long, global = true)]
     venus: bool,
+}
+
+/// The commands `conduit setup` shows and runs; usable on their own.
+#[derive(Subcommand)]
+enum SetupAction {
+    /// Define a libvirt VM (qemu:///session) for installing a guest from an ISO; does not start it
+    Define {
+        name: String,
+        /// The installer image
+        #[arg(long, value_name = "FILE")]
+        iso: PathBuf,
+        /// Memory for the VM
+        #[arg(long, default_value = "8G")]
+        ram: String,
+        #[arg(long, default_value_t = 4)]
+        cpus: u32,
+        /// Maximum disk size (a sparse qcow2 file)
+        #[arg(long, default_value = "64G")]
+        size: String,
+    },
+    /// Download nfpm, check it against the release's checksums.txt, install it to ~/.local/bin
+    FetchNfpm,
 }
 
 #[derive(Subcommand)]
@@ -324,6 +347,15 @@ enum Cmd {
     /// Check this computer and explain how to fix problems (with NAME: also
     /// that VM's whole chain: libvirt domain, sockets, backend, guest driver)
     Doctor { name: Option<String> },
+    /// Guided first run: checks this computer, fixes what is missing (every
+    /// command shown first) and walks you to a first working VM
+    Setup {
+        /// Print the whole plan as text and exit (also what happens without a terminal)
+        #[arg(long)]
+        plan: bool,
+        #[command(subcommand)]
+        action: Option<SetupAction>,
+    },
     /// (internal) viewer direct-mode hook for Hyprland
     #[command(hide = true)]
     HyprHook {
@@ -674,6 +706,23 @@ fn main() {
                 "e.g. conduit config set view.close_stops_vm false",
             )),
         },
+        Cmd::Setup { plan, action: None } => setup::term::run(plan),
+        Cmd::Setup {
+            action:
+                Some(SetupAction::Define {
+                    name,
+                    iso,
+                    ram,
+                    cpus,
+                    size,
+                }),
+            ..
+        } => ui::parse_size(&ram, 'M')
+            .and_then(|b| setup::domain::define(&name, &iso, b >> 20, cpus, &size)),
+        Cmd::Setup {
+            action: Some(SetupAction::FetchNfpm),
+            ..
+        } => setup::nfpm::fetch(),
         Cmd::Doctor { name: None } => std::process::exit(doctor::run()),
         Cmd::Doctor { name: Some(n) } => std::process::exit(doctor::run_vm(&n)),
         Cmd::Backend { name } => lvrun::backend_exec(&name),

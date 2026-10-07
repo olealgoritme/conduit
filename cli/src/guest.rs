@@ -271,7 +271,12 @@ pub fn osinfo_is_windows(r: &Value) -> bool {
 
 /// Does the running VM answer on the QEMU guest agent channel?
 pub fn agent_ready(link: &Link) -> bool {
-    agent(link, json!({"execute": "guest-ping"}), 5).is_ok()
+    agent_ping(&link.virsh(), &link.domain)
+}
+
+/// Does a running domain answer on the guest agent channel?
+pub fn agent_ping(v: &Virsh, dom: &str) -> bool {
+    agent_on(v, dom, json!({"execute": "guest-ping"}), 5).is_ok()
 }
 
 fn upload(link: &Link, src: &Path, dst: &str) -> Result<()> {
