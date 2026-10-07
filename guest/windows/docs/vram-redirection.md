@@ -292,7 +292,16 @@ the staging surface exists "when a direct bitblt to the primary surface is not p
 and the redirection surface that a direct Blt can target is the GPU `TEXTURE` GDI surface, which CDD
 uses with GDI hardware acceleration (`SupportKernelModeCommandBuffer`,
 [GDI hardware acceleration](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gdi-hardware-acceleration)).
-That is the one documented switch left.
+That is the one documented switch left. Microsoft's feature-caps table lists GDI hardware
+acceleration as mandatory for full-graphics and render-only WDDM 1.2+ drivers
+([WDDM driver and feature caps](https://github.com/MicrosoftDocs/windows-driver-docs/blob/staging/windows-driver-docs-pr/display/wddm-driver-and-feature-caps.md)),
+so bare-metal vendor drivers set it and their redirection bitmaps are GDI `TEXTURE` surfaces. Two
+`DXGK_PRESENTATIONCAPS` bits are still untested middle steps: `DriverSupportsCddDwmInterop` ("does not
+support HW GDI acceleration but supports Cdd-Dwm interop") and `SupportSoftwareDeviceBitmaps`
+(`TEXTURE_CPUVISIBLE` redirection bitmaps: CPU visible, so most likely still locked). They belong in the
+fallback-A branch's `PresentationCaps` hook. The non-driver alternative, Windows' flip-model upgrade of
+windowed games (`SwapEffectUpgradeEnable`), was tried before and is gated by DXGI's game classification
+(`docs/HANDOFF.md`, "Tried").
 
 Expected outcomes and what each means:
 
