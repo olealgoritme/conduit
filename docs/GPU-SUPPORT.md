@@ -60,6 +60,39 @@ possible with the current stack).
 | Guest shared-memory BAR (64 GiB, QEMU) | expected | expected | expected | works | Not GPU-dependent: `cli/src/qemu.rs:147`, `docs/examples/win11.xml:71` |
 | Venus host renderer (NVIDIA Vulkan) | expected | expected | expected | works | Conduit's virglrenderer patches use `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`, `VK_EXT_external_memory_host`, exposed by NVIDIA's Linux driver on every Turing+ GPU (dma-buf and modifiers since 515.43.04, external_memory_host since 440.66.17); they are hidden without `nvidia-drm modeset=1` and render-node access. No per-generation differences documented **(check `vulkaninfo` on the 4070)** |
 
+### Escape sizes, per driver release
+
+The NVIDIA userspace in a Linux guest is the host's, so the sizes of its
+`NV_ESC_*` parameter blocks are the host release's, not the guest module's.
+RM's `rm_ioctl` takes an escape at the sizes of the structs it knows and
+answers anything else `NV_ERR_INVALID_ARGUMENT`; the guest module and the
+backend apply the same list. It is generated (`host/backend/gen/nvabi_gen.py`,
+`IoctlEntry` in `abi::versions`), the backend checks every call against it and
+sends it to the guest in the last section of GET_SYS_FILES, and
+`nvgpu_ioctl_fd` answers `EINVAL` to a size outside it. A backend that sends no
+list leaves the check to the backend. The rows are in
+`host/backend/gen/fixtures/escape_sizes.tsv`, which a test keeps equal to the
+tables and `guest/linux/test/escape_test.c` applies. The sizes that differ:
+
+| Escape | 535.129.03 | 565.57.01 (also 565.77) | 580.178.04 | 595.71.05 | 610.57.04 (also 615.71.09) |
+|---|---|---|---|---|---|
+| `RM_ALLOC` (0x2b) | 32 or 48 | 32 or 48 | 32 or 48 | 32 or 48 | 32 or 48 |
+| `RM_MAP_MEMORY_DMA` (0x57) | 56 | 56 | 64 | 64 | 64 |
+| `RM_UNMAP_MEMORY_DMA` (0x58) | 40 | 48 | 48 | 48 | 48 |
+| `EXPORT_TO_DMABUF_FD` (0xd9) | 2600 | 2600 | 2608 | 2608 | 2608 |
+| `WAIT_OPEN_COMPLETE` (0xda) | not taken | 8 | 8 | 8 | 8 |
+
+Every other escape has one size in all five tables (`RM_CONTROL` 32,
+`RM_FREE` 16, `RM_ALLOC_MEMORY` 56, `RM_VID_HEAP_CONTROL` 184,
+`GET_EVENT_DATA` 16, ...), and `CARD_INFO`, `ATTACH_GPUS_TO_FD` and `NUMA_INFO`
+take any length. `RM_ALLOC` is NVOS21 (32 bytes) or NVOS64 (48): the first five
+fields agree, then NVOS21 has `paramsSize` at 24 and status at 28, NVOS64 has
+`pRightsRequested` at 24, `paramsSize` at 32 and status at 40. 565.77's
+userspace sends the 32-byte form for `NV01_ROOT`, so `nvidia-smi` in a guest
+needs it. The 565.77 sizes were checked against the 565.77 open modules'
+headers (NVOS21 32, NVOS64 48, NVOS46 56, NVOS47 48, NVOS54 32). **Not run
+against a live 565.77 guest after this change.**
+
 ### Guest RM client (librmclient) and Linux guest
 
 | Requirement | RTX 20 | RTX 30 | RTX 40 | RTX 50 | Evidence |
