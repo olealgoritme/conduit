@@ -63,6 +63,7 @@
 #include "nvgpu_devinfo.h"
 #include "nvgpu_rmctrl.h"
 #include "nvgpu_version.h"
+#include "nvgpu_escape.h"
 
 /*
  * module_kset lives in kernel/module/sysfs.c and is NOT exported to modules,
@@ -792,6 +793,14 @@ struct nvgpu_device {
     u32 params_size;
   } alloc_sizes[NVGPU_MAX_ALLOC_SIZES];
   int num_alloc_sizes;
+
+  /*
+   * The sizes the host release's kernel module takes for each escape. Empty
+   * until GET_SYS_FILES answers, and against a backend too old to send it:
+   * nothing is then refused here, and the backend's own check stands.
+   */
+  struct nvgpu_escape_size escape_sizes[NVGPU_MAX_ESCAPE_SIZES];
+  int num_escape_sizes;
 
   /*
    * The UVM calls the host release takes: the whole ioctl number, the size of
@@ -2619,7 +2628,9 @@ static u32 nvgpu_host_alloc_param_size(struct nvgpu_device *dev, u32 hClass) {
 }
 
 /*
- * nvgpu_ioctl_rm_alloc — NV_ESC_RM_ALLOC, same pattern via NVOS64_PARAMETERS.
+ * nvgpu_ioctl_rm_alloc — NV_ESC_RM_ALLOC, same pattern via NVOS64_PARAMETERS
+ * or, for the older form userspace still sends, NVOS21_PARAMETERS. RM takes
+ * either by the size in the ioctl number; see nvgpu_alloc_layout().
  *
  * Subtlety: when paramsSize == 0 but pAllocParms != NULL, the host RM
  * driver determines size from hClass.  We must look up the size ourselves
@@ -2627,7 +2638,8 @@ static u32 nvgpu_host_alloc_param_size(struct nvgpu_device *dev, u32 hClass) {
  */
 static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
                                  void __user *uarg, unsigned int sz) {
-  struct NVOS64_PARAMETERS params;
+  struct NVOS64_PARAMETERS params = {};
+  const struct nvgpu_alloc_layout *layout = nvgpu_alloc_layout(sz);
   void __user *user_alloc;
   u32 nested_size;
   void *req_buf = NULL, *resp_buf = NULL, *nested;
@@ -2635,14 +2647,16 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
 
-  if (sz < sizeof(params))
+  /* Neither size is not a call RM answers; it is not forwarded either. */
+  if (!layout)
     return -EINVAL;
 
-  if (copy_from_user(&params, uarg, sizeof(params)))
+  /* The first five fields are the same in both; what follows is the layout's. */
+  if (copy_from_user(&params, uarg, layout->size))
     return -EFAULT;
 
   user_alloc = (void __user *)(unsigned long)le64_to_cpu(params.pAllocParms);
-  nested_size = le32_to_cpu(params.paramsSize);
+  nested_size = nvgpu_le32_at(&params, layout->params_size_at);
 
   /*
    * When paramsSize == 0 but pAllocParms is non-NULL,
@@ -2660,8 +2674,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   if (nested_size > 1024 * 1024)
     return -EINVAL;
 
-  req_total = sizeof(*req) + sizeof(params) + nested_size;
-  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
+  req_total = sizeof(*req) + layout->size + nested_size;
+  resp_max = sizeof(struct nvgpu_ioctl_resp) + layout->size + nested_size;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
   resp_buf = kmalloc(resp_max, GFP_KERNEL);
@@ -2676,16 +2690,16 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   req->hdr.status = 0;
   req->hdr.padding = 0;
   req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sizeof(params));
-  req->nested_offset = cpu_to_le32(sizeof(params));
+  req->data_len = cpu_to_le32(layout->size);
+  req->nested_offset = cpu_to_le32(layout->size);
   req->nested_len = cpu_to_le32(nested_size);
   req->deep_ptr_offset = 0;
   req->deep_len = 0;
 
-  memcpy(req_buf + sizeof(*req), &params, sizeof(params));
+  memcpy(req_buf + sizeof(*req), &params, layout->size);
 
   if (user_alloc && nested_size > 0) {
-    nested = req_buf + sizeof(*req) + sizeof(params);
+    nested = req_buf + sizeof(*req) + layout->size;
     if (copy_from_user(nested, user_alloc, nested_size)) {
       ret = -EFAULT;
       goto out;
@@ -2706,10 +2720,10 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
 
       if (route) {
         ret = nvgpu_ioctl_register_memory(
-            nfd, cmd, uarg, sz, route, &params, sizeof(params), nested,
+            nfd, cmd, uarg, sz, route, &params, layout->size, nested,
             nested_size, le32_to_cpu(params.hRoot),
             /* the allocation routes report the handle as hObjectNew */
-            0xffffffffu, offsetof(struct NVOS64_PARAMETERS, status));
+            0xffffffffu, layout->status_at);
         goto out;
       }
     }
@@ -2765,14 +2779,14 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
-  if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
+  if (copy_to_user(uarg, resp_buf + sizeof(*resp), layout->size)) {
     ret = -EFAULT;
     goto out;
   }
 
   if (user_alloc && le32_to_cpu(resp->nested_len) > 0) {
     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
-    if (copy_to_user(user_alloc, resp_buf + sizeof(*resp) + sizeof(params),
+    if (copy_to_user(user_alloc, resp_buf + sizeof(*resp) + layout->size,
                      copy_back))
       ret = -EFAULT;
   }
@@ -3473,6 +3487,20 @@ static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
    * that encodes parameters via _IOC_NR only with no struct). */
   if (sz > 65536)
     return -EINVAL;
+
+  /*
+   * RM's own rule: the escape takes the sizes the host release says, and
+   * anything else is invalid before any handler reads a field of it. See
+   * nvgpu_escape.h.
+   */
+  if (_IOC_TYPE(cmd) == 'F' &&
+      !nvgpu_escape_size_ok(nfd->dev->escape_sizes, nfd->dev->num_escape_sizes,
+                            nr, sz)) {
+    dev_dbg(&nfd->dev->vdev->dev,
+            "conduit-gpu: escape 0x%02x does not take %u bytes on this host\n",
+            nr, sz);
+    return -EINVAL;
+  }
 
   /*
    * Memory named by a CPU address, before anything else looks at the block.
@@ -6260,14 +6288,14 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     int i;
 
     if (p + sizeof(w) > end)
-      goto out;
+      goto escape_sizes;
 
     memcpy(&raw, p, sizeof(__le32));
     if (le32_to_cpu(raw) != NVGPU_OSDESC_MAGIC) {
       dev_info(&dev->vdev->dev,
                "conduit-gpu: backend says nothing about registering memory "
                "by address; such calls will be refused\n");
-      goto out;
+      goto escape_sizes;
     }
     for (i = 0; i < (int)ARRAY_SIZE(w); i++) {
       memcpy(&raw, p + i * 4, sizeof(__le32));
@@ -6323,6 +6351,69 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
                "conduit-gpu: memory may be registered by address, class "
                "0x%04x\n",
                dev->osdesc.class_id);
+  }
+
+escape_sizes:
+  /* ── Section 6: the escape sizes the host release takes ───────── */
+  /*
+   * Magic-guarded like the ones before it, and last so that a module from
+   * before it reads every section it knows and stops. Reached when section 5
+   * is absent too: its magic is looked for where the stream stands. Without
+   * this section no size is refused here and the backend's own check stands,
+   * which is what it was before.
+   */
+  {
+    __le32 raw;
+    u32 magic, count, i;
+
+    if (p + 8 > end)
+      goto out;
+
+    memcpy(&raw, p, sizeof(__le32));
+    magic = le32_to_cpu(raw);
+    if (magic != NVGPU_ESCAPE_SIZE_MAGIC) {
+      dev_info(&dev->vdev->dev,
+               "conduit-gpu: backend sent no escape sizes; the backend "
+               "alone checks them\n");
+    } else {
+      memcpy(&raw, p + 4, sizeof(__le32));
+      count = le32_to_cpu(raw);
+      p += 8;
+
+      /*
+       * Only a whole list is a rule. Keeping the first N of a longer one
+       * would refuse a size the release takes, so a list too long for this
+       * module is dropped and p still moves past it.
+       */
+      dev->num_escape_sizes = 0;
+      for (i = 0; i < count; i++) {
+        if (p + 8 > end) {
+          dev_warn(&dev->vdev->dev,
+                   "conduit-gpu: escape sizes truncated at entry %u; "
+                   "checking none\n", i);
+          dev->num_escape_sizes = 0;
+          goto out;
+        }
+        if (i < NVGPU_MAX_ESCAPE_SIZES) {
+          memcpy(&raw, p, sizeof(__le32));
+          dev->escape_sizes[i].escape = le32_to_cpu(raw);
+          memcpy(&raw, p + 4, sizeof(__le32));
+          dev->escape_sizes[i].size = le32_to_cpu(raw);
+        }
+        p += 8;
+      }
+      if (count > NVGPU_MAX_ESCAPE_SIZES) {
+        dev_warn(&dev->vdev->dev,
+                 "conduit-gpu: backend sent %u escape sizes, more than the "
+                 "%u this module holds; checking none\n",
+                 count, (u32)NVGPU_MAX_ESCAPE_SIZES);
+      } else {
+        dev->num_escape_sizes = count;
+        dev_info(&dev->vdev->dev,
+                 "conduit-gpu: the host release takes %u escape size(s)\n",
+                 count);
+      }
+    }
   }
 
 out:

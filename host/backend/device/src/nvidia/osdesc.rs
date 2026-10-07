@@ -102,7 +102,7 @@ impl NvidiaBackend {
             Registration::Alloc => Shape {
                 route: d.alloc,
                 params_at: data_len,
-                status_at: NVOS64_STATUS,
+                status_at: alloc_status_at(data_len).unwrap_or(NVOS64_STATUS),
                 hmemory_at: 8,
             },
             Registration::AllocMemory => Shape {

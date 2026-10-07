@@ -61,6 +61,7 @@ impl NvidiaBackend {
         class: u32,
         bit: u32,
         param_in: &[u8],
+        block: usize,
         resp_buf: &mut [u8],
     ) -> usize {
         const NV_ERR_INVALID_CLASS: u32 = 0x22;
@@ -71,10 +72,10 @@ impl NvidiaBackend {
         };
         self.refuse_for_caps(format!("RM_ALLOC class {class:#06x}"), needs);
         let mut out = param_in.to_vec();
-        if out.len() < NVOS64_STATUS + 4 {
+        let Some(at) = alloc_status_at(block) else {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
-        }
-        out[NVOS64_STATUS..NVOS64_STATUS + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
+        };
+        out[at..at + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &out)
     }
 
@@ -195,15 +196,16 @@ impl NvidiaBackend {
         class: u32,
         why: String,
         param_in: &[u8],
+        block: usize,
         resp_buf: &mut [u8],
     ) -> usize {
         const NV_ERR_INVALID_CLASS: u32 = 0x22;
         self.note_allow_refusal(format!("RM_ALLOC class {class:#06x}"), why);
         let mut out = param_in.to_vec();
-        if out.len() < NVOS64_STATUS + 4 {
+        let Some(at) = alloc_status_at(block) else {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
-        }
-        out[NVOS64_STATUS..NVOS64_STATUS + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
+        };
+        out[at..at + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &out)
     }
 
@@ -232,7 +234,7 @@ impl NvidiaBackend {
         };
         match entry.param_size {
             None => AbiCheck::VariableLength,
-            Some(expected) if expected == param_size => AbiCheck::Ok,
+            Some(_) if entry.accepts(param_size) => AbiCheck::Ok,
             Some(expected) => AbiCheck::SizeMismatch {
                 expected,
                 actual: param_size,
@@ -780,7 +782,14 @@ impl NvidiaBackend {
                     if let Some(bit) = crate::caps::Caps::for_class(class)
                         && !self.start.caps.has(bit)
                     {
-                        return self.refuse_alloc_class(cookie, class, bit, param_in, resp_buf);
+                        return self.refuse_alloc_class(
+                            cookie,
+                            class,
+                            bit,
+                            param_in,
+                            ireq.data_len as usize,
+                            resp_buf,
+                        );
                     }
                     // The cap is a decision somebody made; this is RM's. Both
                     // have to pass. The allocation parameters are the nested
@@ -788,7 +797,14 @@ impl NvidiaBackend {
                     // one level further in: a pointer inside those parameters.
                     let have = ireq.nested_len as usize;
                     if let Some(why) = self.rm_class_refusal(class, have) {
-                        return self.refuse_alloc(cookie, class, why, param_in, resp_buf);
+                        return self.refuse_alloc(
+                            cookie,
+                            class,
+                            why,
+                            param_in,
+                            ireq.data_len as usize,
+                            resp_buf,
+                        );
                     }
                     // RM marks this class non-privileged, so the allowlist
                     // above lets it through: RM is right, for a caller whose
@@ -807,8 +823,15 @@ impl NvidiaBackend {
                         );
                     }
                 }
+                // The block is whichever of the two sizes the caller sent; RM
+                // took it by that size and so does the host driver.
+                let outer = if ireq.data_len as usize == NVOS21_SIZE {
+                    NVOS21_SIZE
+                } else {
+                    NVOS64_SIZE
+                };
                 self.dispatch_nested(
-                    cookie, host_fd, request, param_in, resp_buf, 48, 16, 32, deep_in, None,
+                    cookie, host_fd, request, param_in, resp_buf, outer, 16, 32, deep_in, None,
                 )
             }
 

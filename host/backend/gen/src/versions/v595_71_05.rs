@@ -26,150 +26,175 @@ pub fn table() -> &'static [IoctlEntry] {
         IoctlEntry {
             escape: NV_ESC_RM_ALLOC_MEMORY,
             param_size: Some(56),
+            also: &[],
             kind: IoctlKind::FdCarrying,
         },
         // NVOS00_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_FREE,
             param_size: Some(16),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // NVOS54_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_CONTROL,
             param_size: Some(32),
+            also: &[],
             kind: IoctlKind::RmControl,
         },
         // NVOS64_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_ALLOC,
             param_size: Some(48),
+            also: &[32],
             kind: IoctlKind::RmAlloc,
         },
         // NVOS55_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_DUP_OBJECT,
             param_size: Some(28),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // NVOS57_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_SHARE,
             param_size: Some(24),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // NVOS30_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_IDLE_CHANNELS,
             param_size: Some(56),
+            also: &[],
             kind: IoctlKind::IdleChannels,
         },
         // NVOS32_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_VID_HEAP_CONTROL,
             param_size: Some(184),
+            also: &[],
             kind: IoctlKind::VidHeapControl,
         },
         // IoctlNVOS33ParametersWithFD
         IoctlEntry {
             escape: NV_ESC_RM_MAP_MEMORY,
             param_size: Some(56),
+            also: &[],
             kind: IoctlKind::Mapping,
         },
         // NVOS34_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_UNMAP_MEMORY,
             param_size: Some(32),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // NVOS41_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_GET_EVENT_DATA,
             param_size: Some(16),
+            also: &[],
             kind: IoctlKind::EventData,
         },
         // NVOS39_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_ALLOC_CONTEXT_DMA2,
             param_size: Some(56),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // NVOS46_PARAMETERS_V580
         IoctlEntry {
             escape: NV_ESC_RM_MAP_MEMORY_DMA,
             param_size: Some(64),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // NVOS47_PARAMETERS_V550
         IoctlEntry {
             escape: NV_ESC_RM_UNMAP_MEMORY_DMA,
             param_size: Some(48),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // NVOS56_PARAMETERS
         IoctlEntry {
             escape: NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO,
             param_size: Some(40),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // IoctlCardInfo array, variable length
         IoctlEntry {
             escape: NV_ESC_CARD_INFO,
             param_size: None,
+            also: &[],
             kind: IoctlKind::Bytes,
         },
         // IoctlRegisterFD
         IoctlEntry {
             escape: NV_ESC_REGISTER_FD,
             param_size: Some(4),
+            also: &[],
             kind: IoctlKind::FdCarrying,
         },
         // IoctlAllocOSEvent
         IoctlEntry {
             escape: NV_ESC_ALLOC_OS_EVENT,
             param_size: Some(16),
+            also: &[],
             kind: IoctlKind::FdCarrying,
         },
         // IoctlFreeOSEvent
         IoctlEntry {
             escape: NV_ESC_FREE_OS_EVENT,
             param_size: Some(16),
+            also: &[],
             kind: IoctlKind::FdCarrying,
         },
         // RMAPIVersion
         IoctlEntry {
             escape: NV_ESC_CHECK_VERSION_STR,
             param_size: Some(72),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // variable length
         IoctlEntry {
             escape: NV_ESC_ATTACH_GPUS_TO_FD,
             param_size: None,
+            also: &[],
             kind: IoctlKind::Bytes,
         },
         // IoctlSysParams
         IoctlEntry {
             escape: NV_ESC_SYS_PARAMS,
             param_size: Some(8),
+            also: &[],
             kind: IoctlKind::Simple,
         },
         // variable length
         IoctlEntry {
             escape: NV_ESC_NUMA_INFO,
             param_size: None,
+            also: &[],
             kind: IoctlKind::Bytes,
         },
         // IoctlExportToDMABufFD_V580
         IoctlEntry {
             escape: NV_ESC_EXPORT_TO_DMABUF_FD,
             param_size: Some(2608),
+            also: &[],
             kind: IoctlKind::FdCarrying,
         },
         // IoctlWaitOpenComplete
         IoctlEntry {
             escape: NV_ESC_WAIT_OPEN_COMPLETE,
             param_size: Some(8),
+            also: &[],
             kind: IoctlKind::Simple,
         },
     ];

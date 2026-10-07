@@ -26,3 +26,4 @@ host/viewer/test-overlay
 guest/linux/test/pcimap_test
 guest/linux/test/devinfo_test
 guest/linux/test/version_test
+guest/linux/test/escape_test

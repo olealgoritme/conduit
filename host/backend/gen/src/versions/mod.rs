@@ -50,7 +50,22 @@ pub struct IoctlEntry {
     /// `sizeof` the parameter struct for this driver version, or `None` when
     /// the ioctl is variable length.
     pub param_size: Option<u32>,
+    /// Further sizes this release's kernel module takes for the same escape.
+    /// Only `NV_ESC_RM_ALLOC` has one (NVOS21, 32 bytes, beside NVOS64's 48);
+    /// see `ALSO_ACCEPTS` in `nvabi_gen.py`.
+    pub also: &'static [u32],
     pub kind: IoctlKind,
+}
+
+impl IoctlEntry {
+    /// Whether the kernel module of this release takes `size` bytes here.
+    /// A variable-length escape takes any.
+    pub fn accepts(&self, size: u32) -> bool {
+        match self.param_size {
+            None => true,
+            Some(own) => own == size || self.also.contains(&size),
+        }
+    }
 }
 
 /// A supported driver version and the table it selects.
@@ -158,5 +173,52 @@ mod tests {
         let mut sorted = vs.clone();
         sorted.sort();
         assert_eq!(vs, sorted, "PROFILES must stay in ascending order");
+    }
+
+    /// Escape x release -> accepted sizes, one row each, as the table says.
+    fn sizes_tsv() -> String {
+        let mut out = String::from("release\tescape\tname\tsizes\n");
+        for p in PROFILES {
+            for e in (p.table)() {
+                let sizes = match e.param_size {
+                    None => "any".to_string(),
+                    Some(own) => std::iter::once(own)
+                        .chain(e.also.iter().copied())
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                };
+                let name = crate::names::escape(e.escape).unwrap_or("?");
+                out += &format!("{}\t{:#04x}\t{name}\t{sizes}\n", p.version, e.escape);
+            }
+        }
+        out
+    }
+
+    /// The fixture the guest's C test (`guest/linux/test/escape_test.c`) reads:
+    /// the same table the backend checks calls against and sends the guest.
+    /// Regenerate with `UPDATE_FIXTURES=1 cargo test -p abi escape_size`.
+    #[test]
+    fn the_escape_size_fixture_is_the_tables() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/escape_sizes.tsv");
+        let now = sizes_tsv();
+        if std::env::var_os("UPDATE_FIXTURES").is_some() {
+            std::fs::write(path, &now).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(path).expect("fixtures/escape_sizes.tsv"),
+            now,
+            "stale: run UPDATE_FIXTURES=1 cargo test -p abi escape_size"
+        );
+    }
+
+    /// RM_ALLOC takes NVOS21 (32) and NVOS64 (48) in every release.
+    #[test]
+    fn rm_alloc_takes_both_its_sizes_in_every_release() {
+        for p in PROFILES {
+            let e = lookup((p.table)(), crate::ioctl::NV_ESC_RM_ALLOC).unwrap();
+            assert!(e.accepts(32) && e.accepts(48), "{}", p.version);
+            assert!(!e.accepts(40) && !e.accepts(0), "{}", p.version);
+        }
     }
 }

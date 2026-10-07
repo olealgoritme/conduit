@@ -305,12 +305,16 @@ impl NvidiaBackend {
         };
         let p = &mut self.rm_placements;
         match req.cmd & 0xFF {
-            // NVOS64: hRoot, hObjectParent, hObjectNew, hClass, pAllocParms,
-            // pRightsRequested, paramsSize, flags, status at 40.
+            // hRoot, hObjectParent, hObjectNew, hClass, pAllocParms, and then,
+            // by size, NVOS64's rights, paramsSize, flags and status at 40 or
+            // NVOS21's paramsSize and status at 28.
             ESC_RM_ALLOC => {
-                let (Some(client), Some(object), Some(class), Some(status)) =
-                    (w(top, 0), w(top, 8), w(top, 12), w(top, 40))
-                else {
+                let (Some(client), Some(object), Some(class), Some(status)) = (
+                    w(top, 0),
+                    w(top, 8),
+                    w(top, 12),
+                    alloc_status_at(data_len).and_then(|at| w(top, at)),
+                ) else {
                     return;
                 };
                 if status != 0 || !PLACED_CLASSES.contains(&class) {

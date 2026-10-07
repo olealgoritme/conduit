@@ -841,6 +841,51 @@ mod tests {
         assert!(buf.iter().all(|b| *b == 0), "something was written anyway");
     }
 
+    /// The guest refuses a size by this list, so the list has to be the one
+    /// the backend itself checks calls against, entry for entry -- including
+    /// the second size of RM_ALLOC and the escapes of any length.
+    #[test]
+    fn the_guest_is_told_the_sizes_the_backend_checks_against() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(565, 77, 0))
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = be.write_escape_size_section(&mut buf);
+        let word = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), NvidiaBackend::ESCAPE_SIZE_MAGIC);
+        let count = word(1) as usize;
+        assert_eq!(n, 8 + count * 8);
+        let sent: Vec<(u32, u32)> = (0..count)
+            .map(|i| (word(2 + 2 * i), word(3 + 2 * i)))
+            .collect();
+
+        // Whatever the section says, check_abi says the same, in both
+        // directions, for every size up to a page.
+        for e in be.start.abi.unwrap() {
+            for size in 0..4200u32 {
+                let in_list = sent.iter().any(|(esc, s)| {
+                    *esc == e.escape && (*s == size || *s == NvidiaBackend::ESCAPE_SIZE_ANY)
+                });
+                assert_eq!(
+                    in_list,
+                    !matches!(be.check_abi(e.escape, size), AbiCheck::SizeMismatch { .. }),
+                    "escape {:#x} at {size}",
+                    e.escape
+                );
+            }
+        }
+        assert!(sent.contains(&(abi::ioctl::NV_ESC_RM_ALLOC, 32)));
+        assert!(sent.contains(&(abi::ioctl::NV_ESC_RM_ALLOC, 48)));
+        assert!(sent.contains(&(abi::ioctl::NV_ESC_CARD_INFO, NvidiaBackend::ESCAPE_SIZE_ANY)));
+    }
+
+    #[test]
+    fn a_backend_with_no_release_sends_no_escape_sizes() {
+        let be = NvidiaBackend::for_test();
+        let mut buf = vec![0u8; 4096];
+        assert_eq!(be.write_escape_size_section(&mut buf), 0);
+    }
+
     /// A class RM does not let an unprivileged caller allocate.
     #[test]
     fn a_class_rm_does_not_export_never_reaches_the_host() {
@@ -3026,6 +3071,113 @@ mod tests {
         assert!(be.set_vram_limit_mib(None).is_ok());
         be.set_host_driver_version(v615()).unwrap();
         assert!(be.set_vram_limit_mib(Some(100)).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // NV_ESC_RM_ALLOC in its older, 32-byte form (NVOS21_PARAMETERS)
+    // -----------------------------------------------------------------------
+
+    const BODY: usize = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+
+    fn word(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    /// What reached the host: the request and the parameter block, as RM would
+    /// have been handed them. Writes `answer` into the block's status field.
+    #[derive(Clone, Default)]
+    struct StatusHost(std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>, u32);
+
+    impl HostDriver for StatusHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.0.lock().unwrap().push((request, arg.to_vec()));
+            // NVOS21: status at 28; NVOS64: at 40.
+            let at = if arg.len() == 32 { 28 } else { 40 };
+            arg[at..at + 4].copy_from_slice(&self.1.to_le_bytes());
+            Ok(())
+        }
+    }
+
+    fn nvos21_root_alloc() -> Vec<u8> {
+        // hRoot, hObjectParent, hObjectNew, hClass = NV01_ROOT_CLIENT,
+        // pAllocParms = NULL, paramsSize = a marker no one may disturb, status.
+        let mut p = vec![0u8; 32];
+        p[12..16].copy_from_slice(&0x41u32.to_le_bytes());
+        p[24..28].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        p
+    }
+
+    /// 565.77's libnvidia-ml opens its client with a 32-byte RM_ALLOC, which
+    /// RM takes (`rm_ioctl` accepts both sizes). The backend answered EINVAL
+    /// before the host was asked, and NVML reported the GPU as blocked.
+    #[test]
+    fn a_32_byte_rm_alloc_reaches_the_host_as_32_bytes_and_answers_in_place() {
+        let host = StatusHost(Default::default(), 0);
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(565, 77, 0))
+            .expect("565.77 has tables");
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos21_root_alloc()),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl succeeds");
+        let seen = host.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one host call");
+        assert_eq!(
+            seen[0].0,
+            abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_ALLOC, 32),
+            "with the size the caller used"
+        );
+        assert_eq!(seen[0].1.len(), 32);
+        assert_eq!(
+            word(&seen[0].1, 24),
+            0xdead_beef,
+            "offset 24 is paramsSize in NVOS21, not pRightsRequested; it is not cleared"
+        );
+        assert_eq!(
+            word(&resp[BODY..], 28),
+            0,
+            "RM's answer comes back at NVOS21.status"
+        );
+    }
+
+    /// The status of a refused 32-byte allocation is NVOS21's own.
+    #[test]
+    fn a_refused_32_byte_alloc_is_answered_at_nvos21_status() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_caps(crate::caps::Caps::parse("graphics,compute").unwrap());
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+
+        let mut nvos21 = vec![0u8; 32];
+        nvos21[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes()); // Ampere NVENC
+        // With allocation parameters behind it, as a real one has: the block
+        // is 32 bytes and the message is longer.
+        let resp = send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos21, 24);
+
+        assert_eq!(word(&resp[BODY..], 28), 0x22, "NV_ERR_INVALID_CLASS");
+    }
+
+    /// Only the two sizes RM takes are ABI; a 40-byte block is neither.
+    #[test]
+    fn an_rm_alloc_of_neither_size_is_refused_for_every_release() {
+        for v in abi::versions::supported_versions() {
+            let mut be = NvidiaBackend::for_test();
+            be.set_host_driver_version(v).unwrap();
+            for (size, ok) in [(32u32, true), (48, true), (40, false), (44, false)] {
+                assert_eq!(
+                    be.check_abi(abi::ioctl::NV_ESC_RM_ALLOC, size) == AbiCheck::Ok,
+                    ok,
+                    "{v}: RM_ALLOC at {size} bytes"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "trace")]

@@ -199,6 +199,8 @@ impl NvidiaBackend {
             off += self.write_alloc_size_section(&mut resp_buf[off..]);
             off += self.write_uvm_section(&mut resp_buf[off..]);
             off += self.write_osdesc_section(&mut resp_buf[off..]);
+            // Last, so a guest from before it reads what it knew and stops.
+            off += self.write_escape_size_section(&mut resp_buf[off..]);
         }
         off
     }
@@ -253,6 +255,56 @@ impl NvidiaBackend {
             "GET_SYS_FILES: RM's allocation sizes for {} class(es)",
             with_params.len()
         );
+        off
+    }
+
+    /// Magic word opening the escape-size section.
+    pub(super) const ESCAPE_SIZE_MAGIC: u32 = 0x4e56_4553; // "NVES"
+    /// A record's size for an escape RM takes at any length.
+    pub(super) const ESCAPE_SIZE_ANY: u32 = u32::MAX;
+
+    /// The sizes the host release's kernel module takes for each escape.
+    ///
+    /// The one rule for what size an `NV_ESC_*` call may have, written once
+    /// by `gen/nvabi_gen.py` and read by both halves: the backend checks every
+    /// call against it (`check_abi`), and the guest answers a size outside it
+    /// with EINVAL before the call goes anywhere. Before this the guest carried a
+    /// size literal per handler, written from one release's userspace -- it
+    /// refused the 32-byte `NV_ESC_RM_ALLOC` that 565.77's userspace sends
+    /// because it knew only the 48 of 610.
+    ///
+    /// Records are `{escape, size}`, one per accepted size; an escape RM takes
+    /// at any length has one record with [`Self::ESCAPE_SIZE_ANY`].
+    pub(super) fn write_escape_size_section(&self, buf: &mut [u8]) -> usize {
+        let Some(table) = self.start.abi else {
+            return 0;
+        };
+        let mut rows: Vec<(u32, u32)> = Vec::new();
+        for e in table {
+            match e.param_size {
+                None => rows.push((e.escape, Self::ESCAPE_SIZE_ANY)),
+                Some(own) => {
+                    rows.push((e.escape, own));
+                    rows.extend(e.also.iter().map(|s| (e.escape, *s)));
+                }
+            }
+        }
+        if buf.len() < 8 + rows.len() * 8 {
+            log::warn!("no room for the escape-size section; the guest will not check sizes");
+            return 0;
+        }
+        let mut off = 0;
+        for v in [Self::ESCAPE_SIZE_MAGIC, rows.len() as u32] {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            off += 4;
+        }
+        for (escape, size) in &rows {
+            for v in [*escape, *size] {
+                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                off += 4;
+            }
+        }
+        log::info!("GET_SYS_FILES: {} escape size(s)", rows.len());
         off
     }
 
@@ -506,8 +558,8 @@ impl NvidiaBackend {
                     );
                     continue;
                 };
-                let dev_info = host_dev_info(&format!("/dev/dri/{name}"), &layout)
-                    .unwrap_or_else(|| {
+                let dev_info =
+                    host_dev_info(&format!("/dev/dri/{name}"), &layout).unwrap_or_else(|| {
                         // The node did not answer (logged above). Same shape
                         // the guest used to invent, so a refusal is no worse
                         // than the old behaviour.
@@ -589,12 +641,8 @@ mod dri_tests {
         let v565 = abi::devinfo::select(abi::version::DriverVersion::new(565, 77, 0)).unwrap();
         let v615 = abi::devinfo::select(abi::version::DriverVersion::new(615, 71, 9)).unwrap();
         // The same card, as each release's nvidia-drm would answer for it.
-        let from_565 = v565
-            .decode(&le(&[0x200, 1, 1, 6, 2, 1, 1, 1]))
-            .unwrap();
-        let from_615 = v615
-            .decode(&le(&[0x200, 0, 1, 1, 6, 2, 1, 1, 1]))
-            .unwrap();
+        let from_565 = v565.decode(&le(&[0x200, 1, 1, 6, 2, 1, 1, 1])).unwrap();
+        let from_615 = v615.decode(&le(&[0x200, 0, 1, 1, 6, 2, 1, 1, 1])).unwrap();
         assert_eq!(from_565, from_615);
 
         let dev = |dev_info| DriDevice {
