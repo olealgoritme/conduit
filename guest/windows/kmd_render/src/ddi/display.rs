@@ -200,7 +200,7 @@ pub unsafe extern "C" fn dxgkddi_present(
     // the output pointer names a live local. DXGKDDI_PRESENT itself is PASSIVE.
     let start_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
     crate::ddi::present_foreign::begin_call();
-    let status = unsafe { dxgkddi_present_inner(h_context, present) };
+    let status = unsafe { dxgkddi_present_inner(h_context, present, start_100ns) };
     // `DwPrN` / `DwPrFail`: Presents since the last device died (atomics).
     crate::ddi::dwm_restart::note_present(status == STATUS_SUCCESS);
     // Fixed-name telemetry survives the steady-state registry ring flood and
@@ -242,9 +242,12 @@ pub unsafe extern "C" fn dxgkddi_present(
     status
 }
 
+/// `present_t_100ns`: the exported DDI's entry time (interrupt time), the `StageTrace` G_PRESENT
+/// stamp of a Blt copy.
 unsafe fn dxgkddi_present_inner(
     h_context: IN_CONST_HANDLE,
     present: INOUT_PDXGKARG_PRESENT,
+    present_t_100ns: u64,
 ) -> NTSTATUS {
     PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
     if present.is_null() {
@@ -882,6 +885,7 @@ unsafe fn dxgkddi_present_inner(
                                 destination_desc,
                                 prepared,
                                 boundary,
+                                present_t_100ns,
                             )
                         })
                         .unwrap_or(Err(VirtioError::DeviceError))
@@ -957,6 +961,7 @@ unsafe fn dxgkddi_present_inner(
                             source_desc,
                             destination_desc,
                             present_stream_boundary,
+                            present_t_100ns,
                         )
                     } {
                         Ok(crate::ddi::blt_async::Taken::Legacy) => {}
@@ -1048,6 +1053,13 @@ unsafe fn dxgkddi_present_inner(
                         );
                     }
                 };
+                // `StageTrace`: this Present's entry, under the copy's wire fence.
+                crate::ddi::stage_trace::stamp(
+                    helios_kmd_logic::stage_trace::G_PRESENT,
+                    helios_kmd_logic::stage_trace::KIND_FENCE,
+                    gpu_fence,
+                    present_t_100ns,
+                );
                 crate::diag::record_named_on_change(
                     b"PBConv",
                     u32::from(source_dxgi_format != destination_dxgi_format),
@@ -1987,6 +1999,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 (
                     request.token,
                     request.stream_boundary,
+                    (request.t_present, request.t_queue),
                     match request.destination {
                         PresentDestinationDesc::StandardBuffer(destination) => {
                             Some(destination.resource_id())
@@ -2005,17 +2018,35 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 )
             })
         });
-        if let Ok(Some((token, boundary, destination_buffer, result))) = submit {
+        if let Ok(Some((token, boundary, (t_present, t_queue), destination_buffer, result))) =
+            submit
+        {
             match result {
-                Ok(fence) => crate::ddi::scanout_timeline::note(
-                    crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
-                    crate::ddi::scanout_timeline::flag::SUCCESS,
-                    0,
-                    boundary,
-                    token,
-                    fence as u32,
-                    0,
-                ),
+                Ok(fence) => {
+                    // `StageTrace`: the Present's entry and its queueing, under the copy's wire
+                    // fence (G_SUBMIT was stamped by the submission; a time of 0 is not stamped).
+                    crate::ddi::stage_trace::stamp(
+                        helios_kmd_logic::stage_trace::G_PRESENT,
+                        helios_kmd_logic::stage_trace::KIND_FENCE,
+                        fence,
+                        t_present,
+                    );
+                    crate::ddi::stage_trace::stamp(
+                        helios_kmd_logic::stage_trace::G_DEFER,
+                        helios_kmd_logic::stage_trace::KIND_FENCE,
+                        fence,
+                        t_queue,
+                    );
+                    crate::ddi::scanout_timeline::note(
+                        crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
+                        crate::ddi::scanout_timeline::flag::SUCCESS,
+                        0,
+                        boundary,
+                        token,
+                        fence as u32,
+                        0,
+                    )
+                }
                 Err(_) => {
                     let _ = adapter.with_virtio(|v| {
                         if let Some(resource_id) = destination_buffer {

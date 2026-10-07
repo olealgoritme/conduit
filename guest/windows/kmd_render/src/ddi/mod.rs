@@ -45,6 +45,7 @@ mod scheduler;
 pub(crate) mod segment_table;
 pub(crate) mod shared_placeholder;
 pub(crate) mod stall_diag;
+pub(crate) mod stage_trace;
 pub(crate) mod std_census;
 pub(crate) mod submit_command;
 pub(crate) mod traced;

@@ -261,6 +261,9 @@ open a Unix socket can use it:
 | `stream json` | the header line, then JSON Lines until you disconnect |
 | `status` | one line: on/off, the file's state, readers, records written and dropped |
 | `file on` / `file off` | resume / pause the `--trace` file |
+| `stages on` / `stages off` | frame stage timing on / off (below); `ok` |
+| `stages status` | `stages on` or `stages off` |
+| `stages dump` | every stage stamp since the last dump, as a binary dump (below), then the connection closes |
 
 ```sh
 { echo 'stream json'; sleep infinity; } | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/conduit/myvm/trace.sock
@@ -268,3 +271,200 @@ open a Unix socket can use it:
 
 A reader that stops reading for a second is disconnected so it cannot stall
 the others.
+
+## Frame stage timing
+
+The request trace above sees the RM side. A Windows guest's frames take a
+different road: the windowed (blit-model) Present is a copy the guest driver
+submits as a fenced Venus `SUBMIT_3D`, and the desktop's flip is a
+`ScanoutFlip`. Frame stage timing follows every one of them from the guest
+driver's DDI to the interrupt that tells it the work is done, stamping the
+time at each stage on both sides, and prints where the frame time goes:
+
+```sh
+conduit trace win11 stages --duration 10                 # host side only
+guest/windows/ci/vmtest/stages.sh win11 10               # host and guest driver, over SSH
+conduit trace win11 stages --guest-cmd CMD --save DIR --perfetto run.json
+conduit trace stages DIR [--perfetto run.json] [--etw dxgkrnl.csv]   # again, from a saved collection
+```
+
+Frames per second is only the final sanity number; this table is the budget
+behind it.
+
+### What identifies a frame
+
+Nothing new travels on the wire. A copy is identified by its fence, which the
+guest driver puts in the `SUBMIT_3D`'s `ctrl_hdr` (`fence_id`, on ring 1) and
+the host echoes; a flip by `ScanoutFlip::seq`. The guest driver draws its
+fence ids from one counter for every context, so the id is unique for the
+whole guest. The collector joins on the low 32 bits of both (what the guest
+driver's ring keeps).
+
+### The stages
+
+| side | stage | when |
+|---|---|---|
+| guest driver | kmd present | `DxgkDdiPresent` entered for the Blt |
+| | kmd defer | the copy queued for the driver's worker: the producer's GPU work was not done (BltAsync deferred copies only) |
+| | kmd submit | just before the copy's descriptor is put on the ring (so the host cannot see it earlier) |
+| backend | backend kick | the control queue's kick handled (the last one before the command was decoded) |
+| | backend decoded | the command taken off the ring and parsed |
+| renderer | venus recv | `conduit-venus` received the Venus command stream |
+| | venus submitted | `virgl_renderer_submit_cmd` returned (the stream is queued to virglrenderer's render server thread) |
+| backend | backend submitted | the renderer's `SUBMIT` reply arrived |
+| renderer | venus fence | `CREATE_FENCE` received |
+| backend | backend fence | the renderer's `CREATE_FENCE` reply arrived; the chain is held |
+| vkr | vkr submit, vkr submit done | the render server called and returned from `vkQueueSubmit` for the stream's last submit (concurrent with the two rows above, so shown as their own rows) |
+| | vkr fence | vkr submitted the ring's sync fence (after decoding the stream) |
+| | gpu | the GPU time of that submit, from timestamp queries vkr wraps around it |
+| | vkr fence done | vkr's sync thread saw the sync fence signalled |
+| renderer | venus signal | virglrenderer's fence callback ran |
+| | venus push | the signal sent to the backend |
+| backend | backend signalled | the signal reached the backend |
+| | backend used | the chain put on the used ring |
+| | backend irq | the guest notified (`signal_used_queue` returned: the call eventfd written, which KVM injects as the interrupt; with `EVENT_IDX` the write can be skipped when the guest asked for no interrupt) |
+| guest driver | kmd isr | the last interrupt the driver took before it found the completion |
+| | kmd done | the completion found in the used ring |
+
+A flip: kmd flip ddi (`SetVidPnSourceAddress` entered), kmd flip submit,
+backend kick, backend decoded, backend display (handed to the viewer), backend
+used, backend irq, kmd flip isr, kmd flip ack.
+
+Not instrumented yet: the Present's DMA completion reported to dxgkrnl (the
+driver's WDDM completion entry does not carry the copy's fence id) and the
+vsync tick that retires a flip (matched by address, not by `seq`); see
+`guest/windows/docs/kmd-handoff-2026-10.md` section 10. The viewer's own
+presentation of a flip is outside the backend and not stamped.
+
+### Turning it on
+
+The host side costs nothing until asked for: `conduit trace NAME stages`
+sends `stages on` to the backend's trace socket, the backend tells
+`conduit-venus` (and through a hook, its virglrenderer) at its next fence
+completion, and `stages off` at the end turns both off again. To stamp from
+the start, set `CONDUIT_STAGE_TRACE=1` in the environment of the backend and
+`conduit-venus` (as `CONDUIT_TRACE` above). It needs a backend built with
+Venus (every package is) and a `conduit-venus` with `FEATURE_STAGE_TRACE`;
+the vkr stages and the GPU time need virglrenderer with
+`host/venus/patches/0003-vkr-stage-timing.patch` (a virglrenderer without it
+still works, without those rows).
+
+The guest side is the guest driver's `StageTrace` knob (REG_DWORD 1 in the
+`helios_kmd_render` service key, read at StartDevice: restart the device after
+setting it). The driver then publishes its ring as the REG_BINARY value
+`StgRing`, at most twice a second, and `--guest-cmd` is any command that
+prints it, e.g. `ssh GUEST reg query
+HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v StgRing`
+(`stages.sh` uses `WIN_SSH`). The collector runs it every second.
+
+### Reading the table
+
+```text
+clock: guest->host offset 4999999988968 ns, error bound +-41.4 us (from 1600 frames), drift 0.39 ppm
+records: host 8800 (0 lost), guest 3600 (0 lost); frames: 800 joined, 0 host only, 0 guest only
+
+(a) windowed copy: 400 frame(s), frame interval 4400.0 us (227.3 fps)
+stage                                                       n   mean us       p50       p99  % frame
+kmd present -> kmd defer                                  400      24.9      24.8      29.9      0.6
+kmd defer -> kmd submit                                   400     585.2     585.5     589.9     13.3
+kmd submit -> backend kick                                400      56.1      56.0      61.3      1.3
+...
+backend fence -> vkr fence                                400     305.2     305.2     309.9      6.9
+vkr fence -> vkr fence done                               400     254.7     254.2     259.8      5.8
+...
+backend irq -> kmd isr                                    400      18.6      18.5      23.7      0.4
+kmd isr -> kmd done                                       400      25.1      25.0      29.9      0.6
+  (venus recv -> vkr submit (render server pickup + decode))  400  150.0  150.0  150.0  3.4
+  (vkr submit -> vkr submit done (vkQueueSubmit call))    400      10.0      10.0      10.0      0.2
+  (gpu copy (timestamps))                                 400     200.0     200.0     200.0      4.5
+  (vkr submit done -> fence done, minus gpu (queue/fence wake))  400  260.1  260.1  278.4  5.9
+total (first -> last)                                     400    1460.6    1460.5    1492.4     33.2
+unattributed                                                     2939.4                         66.8
+```
+
+(Numbers from a synthetic collection.) Each plain row is the interval between
+two consecutive stages of one frame, in the order above; a stage that was not
+stamped for a frame merges its two intervals into one row (`kmd submit ->
+backend decoded`). The plain rows add up to `total`, the first stamp to the
+last. Rows in brackets break a stretch down and are not part of the sum: the
+render server's pickup and decode of the stream, the `vkQueueSubmit` call, the
+GPU's own time for the copy and what is left of the submit-to-fence-seen span
+once that is taken away (queueing behind other work, and the sync thread's
+wake-up). `% frame` is the mean against the frame interval (the mean time
+between consecutive frames' first stamps); `unattributed` is the frame
+interval minus `total`: the part of each frame interval the pipeline does not
+cover (the application's own CPU time, waits in dxgkrnl before the DDI).
+Percentiles are nearest-rank. An interval that came out negative (possible
+only across the guest/host boundary, within the clock error) counts as 0 and
+is reported as "out of order".
+
+`frames: joined` have stamps from both sides; `host only` have none from the
+guest (without guest data every ring-1 fence counts as a copy, which then
+includes other contexts' ring-1 work; with it, only the ids the guest driver
+stamped as copies are taken); `guest only` were never seen by the host in the
+window. `lost` counts stamps a ring
+overwrote before they were read (host: 65536 stamps; guest: 8192, about 3 s at
+240 frames per second, read every second).
+
+### Clock correlation
+
+The guest's stamps are interrupt time (100 ns), the host's
+`CLOCK_MONOTONIC`. The offset comes from the frames themselves: the host
+cannot decode a descriptor before the guest stamped `kmd submit` (taken
+before the descriptor is visible), and the guest cannot find a completion
+before the host put it on the used ring. So for every frame
+
+```text
+offset <= backend decoded - kmd submit        offset >= backend used - kmd done
+```
+
+(and the same with the flip's stages). The tightest of each over a window is
+an interval the true offset lies in; the estimate is its middle and the error
+bound half its width, typically the shortest guest-to-host and host-to-guest
+hop seen (tens of microseconds). It is computed per second, interpolated
+between seconds, so a drift between the two clocks (printed in ppm) is
+followed; a window without both kinds of bound borrows from its neighbours.
+No extra message, no protocol field, no kvmclock reading: any collection with
+guest stamps carries its own correlation. Without guest data the table is
+host stages only.
+
+### Perfetto
+
+`--perfetto FILE` writes the same joined frames as Chrome trace-event JSON
+(open it in ui.perfetto.dev or chrome://tracing): one track per side (guest
+KMD, host backend, conduit-venus/virglrenderer, host GPU, interrupt delivery,
+and dxgkrnl when an ETW export is given), one slice per stage per frame, and
+flow arrows linking each frame's slices across the tracks. The GPU slice has
+the measured duration but is placed to end at `vkr fence done`, which is an
+upper bound for its end (the GPU clock is not correlated).
+
+`--etw FILE` adds dxgkrnl's view from a DxgKrnl ETW capture, converted to CSV
+with the header `ts_100ns,event,pid,tid[,detail]` in guest interrupt time:
+events 41/42 (`VIDMM_BEGINCPUACCESS_WAIT`) and 178/180 (the Blt packet) are
+paired into slices, anything else is an instant. Raw ETL files are not read.
+
+### Stage dump format
+
+`stages dump` and the renderer's `STAGES` reply: a 24-byte header, then
+32-byte records, little-endian (`host/venus/src/stage.rs`, shared by the
+backend, `conduit-venus` and the CLI).
+
+```text
+header:  0 magic "CDTSTGH1"   8 records u32   12 record length u32 (32)   16 records lost u64
+record:  0 ts_ns u64 (CLOCK_MONOTONIC)   8 id u64 (fence id or flip seq)   16 ctx_id u32
+        20 ring u8   21 stage u8   22 kind u8 (1 copy, 2 flip)   23 0   24 aux u64 (gpu: duration ns)
+```
+
+The guest driver's `StgRing` layout is in the same file (`stage::guest`).
+`--save DIR` keeps `host.bin` (one dump) and `guest-NNN.bin` (each snapshot as
+read).
+
+### Overhead
+
+Off (the default), each stamp site is one relaxed atomic load: no clock read,
+no store, and virglrenderer runs its unmodified path (the hook pointer is
+null). On, a stamp is two vDSO clock reads at most and five atomic stores into
+a lock-free ring; vkr adds two prerecorded command buffers (a timestamp each)
+to the last submit before each ring fence and reads two query results when
+it retires; the backend collects the renderer's stamps over its socket every
+50 ms; the guest driver writes a 196 KB registry value twice a second.

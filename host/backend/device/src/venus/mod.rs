@@ -164,7 +164,21 @@ pub struct Venus {
     /// Whether a renderer descriptor is a dma-buf (`rm::is_dmabuf`); a
     /// stand-in in tests, whose mock renderer hands out memfds.
     is_dmabuf: fn(BorrowedFd<'_>) -> bool,
+    /// Stage timing on the renderer's side (`Venus::pull_stages`).
+    stages: RendererStages,
 }
+
+/// The renderer's half of stage timing: whether it can stamp, whether it
+/// was told to, and when its stamps were last collected.
+#[derive(Default)]
+struct RendererStages {
+    can: bool,
+    told_on: bool,
+    pulled: Option<std::time::Instant>,
+}
+
+/// How often the renderer's stamps are collected while stage timing is on.
+const STAGE_PULL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl Venus {
     /// A Venus device over `renderer`, with a region 3 of `hostmem_len` bytes
@@ -184,6 +198,10 @@ impl Venus {
         });
         let mut renderer = renderer;
         let rm_import = renderer.features() & conduit_venus::FEATURE_IMPORT_DMABUF != 0;
+        let stages = RendererStages {
+            can: renderer.features() & conduit_venus::FEATURE_STAGE_TRACE != 0,
+            ..Default::default()
+        };
         if rm_import {
             log::info!("venus: the renderer imports dma-bufs; RM-export blobs are served");
         }
@@ -205,6 +223,7 @@ impl Venus {
             lost: false,
             lose_pending: false,
             counts: BTreeMap::new(),
+            stages,
         }
     }
 
@@ -274,7 +293,42 @@ impl Venus {
             }
         }
         self.fences.flush_latency();
+        self.pull_stages();
         self.fences.take_ready()
+    }
+
+    /// Keep the renderer's stage timing in step with the backend's and bring
+    /// its stamps into the backend's ring (docs/TRACING.md "Frame stage
+    /// timing"). Called with every completion pass, which the fence pump
+    /// makes at least every 100 ms; asks the renderer at most every
+    /// [`STAGE_PULL`] while on, and once more when turned off. Nothing at all
+    /// while stage timing is off and the renderer was never told otherwise.
+    fn pull_stages(&mut self) {
+        let on = crate::stage::on();
+        let st = &mut self.stages;
+        if !st.can || self.lost || (!on && !st.told_on) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if on
+            && st.told_on
+            && st
+                .pulled
+                .is_some_and(|t| now.duration_since(t) < STAGE_PULL)
+        {
+            return;
+        }
+        match self.renderer.stages(on) {
+            Ok(recs) => {
+                conduit_venus::stage::absorb(&recs);
+                st.told_on = on;
+                st.pulled = Some(now);
+            }
+            Err(e) => {
+                log::warn!("venus: renderer stage timing: {e}; not asking again");
+                st.can = false;
+            }
+        }
     }
 
     /// The renderer is gone for good: everything was released, and every
@@ -294,6 +348,13 @@ impl Venus {
             return Outcome::Done(transport_err(resp, libc::EINVAL));
         };
         self.refusal_errno = None;
+        // Stage timing (docs/TRACING.md): a fenced command is a frame's
+        // copy, followed by its fence.
+        let decoded_ns = if crate::stage::on() && hdr.fenced() {
+            crate::stage::now_ns()
+        } else {
+            0
+        };
         let answer = if self.lost {
             Err(RESP_ERR_UNSPEC)
         } else if hdr.fenced() && hdr.ring() >= MAX_RINGS {
@@ -307,6 +368,11 @@ impl Venus {
             Err(RESP_ERR_INVALID_PARAMETER)
         } else {
             self.serve(&hdr, payload, env)
+        };
+        let served_ns = if decoded_ns != 0 {
+            crate::stage::now_ns()
+        } else {
+            0
         };
         if let Err(e) = answer {
             self.count(err_name(e));
@@ -334,7 +400,12 @@ impl Venus {
                     .renderer
                     .create_fence(hdr.ctx_id, hdr.ring(), hdr.fence_id)
                 {
-                    Ok(()) => Outcome::Held(self.fences.hold(&hdr)),
+                    Ok(()) => {
+                        if decoded_ns != 0 {
+                            stamp_held(&hdr, decoded_ns, served_ns);
+                        }
+                        Outcome::Held(self.fences.hold(&hdr))
+                    }
                     Err(e) => {
                         log::warn!(
                             "venus: fence {} on ctx {} ring {}: {e}",
@@ -595,6 +666,28 @@ impl Venus {
     fn count(&mut self, what: &'static str) {
         *self.counts.entry(what).or_insert(0) += 1;
     }
+}
+
+/// The backend's stages of a fenced command up to holding it: the kick that
+/// brought it, decoded, handed to the renderer, fence asked for (now).
+fn stamp_held(hdr: &CtrlHdr, decoded_ns: u64, served_ns: u64) {
+    use conduit_venus::stage::{H_DECODED, H_FENCE_ASKED, H_KICK, H_SUBMITTED, Rec};
+    let (ctx, ring, id) = (hdr.ctx_id, hdr.ring(), hdr.fence_id);
+    let kick = crate::stage::last_kick();
+    if kick != 0 && kick <= decoded_ns {
+        crate::stage::stamp(Rec::fence(H_KICK, ctx, ring, id, kick));
+    }
+    crate::stage::stamp(Rec::fence(H_DECODED, ctx, ring, id, decoded_ns));
+    if hdr.ty == CMD_SUBMIT_3D {
+        crate::stage::stamp(Rec::fence(H_SUBMITTED, ctx, ring, id, served_ns));
+    }
+    crate::stage::stamp(Rec::fence(
+        H_FENCE_ASKED,
+        ctx,
+        ring,
+        id,
+        crate::stage::now_ns(),
+    ));
 }
 
 fn err_name(e: u32) -> &'static str {

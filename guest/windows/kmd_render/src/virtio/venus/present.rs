@@ -1469,6 +1469,8 @@ impl VenusClient {
             PresentDestinationDesc::StandardBuffer(destination) => Some(destination.resource_id),
             PresentDestinationDesc::OptimalImage(_) => None,
         };
+        // `StageTrace` (G_SUBMIT): taken before the descriptor can reach the host; 0 when off.
+        let t_submit = crate::ddi::stage_trace::now_if_on();
         let fence_id = ctrl::submit_venus_async_present(
             self.passive(),
             adapter,
@@ -1476,6 +1478,12 @@ impl VenusClient {
             submit.as_slice()?,
             present_buffer_write,
         )?;
+        crate::ddi::stage_trace::stamp(
+            helios_kmd_logic::stage_trace::G_SUBMIT,
+            helios_kmd_logic::stage_trace::KIND_FENCE,
+            fence_id,
+            t_submit,
+        );
         self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
         Ok((fence_id, prepared.guest))
     }
@@ -1500,6 +1508,8 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         };
         let submit = self.encode_command_buffer_submit(prepared.command_buffer_id);
+        // `StageTrace` (G_SUBMIT): taken before the descriptor can reach the host; 0 when off.
+        let t_submit = crate::ddi::stage_trace::now_if_on();
         let outcome = ctrl::submit_venus_async_blt(
             self.passive(),
             adapter,
@@ -1509,6 +1519,12 @@ impl VenusClient {
             source.resource_id(),
         )?;
         if let ctrl::BltSubmit::Fence(fence_id) = outcome {
+            crate::ddi::stage_trace::stamp(
+                helios_kmd_logic::stage_trace::G_SUBMIT,
+                helios_kmd_logic::stage_trace::KIND_FENCE,
+                fence_id,
+                t_submit,
+            );
             self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
         }
         Ok(outcome)
@@ -1606,6 +1622,8 @@ impl VenusClient {
         let blt_index = self.validate_prepared_present_blt(prepared)?;
         let command_buffer_id = prepared.command_buffer_id;
         let submit = self.encode_command_buffer_submit(command_buffer_id);
+        // `StageTrace` (G_SUBMIT): taken before the descriptor can reach the host; 0 when off.
+        let t_submit = crate::ddi::stage_trace::now_if_on();
         let fence_id = ctrl::submit_venus_async_windowed_blt(
             self.passive(),
             adapter,
@@ -1614,6 +1632,12 @@ impl VenusClient {
             token,
             stream_boundary,
         )?;
+        crate::ddi::stage_trace::stamp(
+            helios_kmd_logic::stage_trace::G_SUBMIT,
+            helios_kmd_logic::stage_trace::KIND_FENCE,
+            fence_id,
+            t_submit,
+        );
         self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
         Ok(fence_id)
     }

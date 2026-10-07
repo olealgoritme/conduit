@@ -24,6 +24,7 @@ pub mod sandbox;
 pub mod scanout_release;
 pub mod shm;
 pub mod shm_regions;
+pub mod stage;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod userspace;

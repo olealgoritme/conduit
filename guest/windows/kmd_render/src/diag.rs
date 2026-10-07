@@ -74,6 +74,8 @@ const RTL_REGISTRY_SERVICES: u32 = 1;
 const REG_DWORD: u32 = 4;
 /// `REG_QWORD`.
 const REG_QWORD: u32 = 11;
+/// `REG_BINARY`.
+const REG_BINARY: u32 = 3;
 /// Cap on breadcrumbs so a chatty steady state can't grow the key unbounded.
 const MAX_STEPS: u32 = 3000;
 
@@ -141,6 +143,35 @@ fn record_named_q(name: &[u16], mut value: u64) {
             REG_QWORD,
             (&mut value as *mut u64).cast::<core::ffi::c_void>(),
             8,
+        );
+    }
+}
+
+/// A `REG_BINARY` value of `data.len()` bytes (`StgRing`, `ddi::stage_trace`). Not part of the
+/// mirror's changed-only cache. PASSIVE_LEVEL only.
+pub fn record_named_binary(name: &[u8], data: &[u8]) {
+    let mut buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        buf[i] = name[i] as u16;
+        i += 1;
+    }
+    buf[n] = 0;
+    let Ok(len) = u32::try_from(data.len()) else {
+        return;
+    };
+    // SAFETY: PASSIVE_LEVEL (see module note). `buf` is a NUL-terminated UTF-16 value name;
+    // ValueData points to `len` readable bytes that RtlWriteRegistryValue copies before
+    // returning (it does not write through the pointer).
+    unsafe {
+        let _ = RtlWriteRegistryValue(
+            RTL_REGISTRY_SERVICES,
+            SERVICE_NAME.as_ptr(),
+            buf.as_ptr(),
+            REG_BINARY,
+            data.as_ptr() as *mut core::ffi::c_void,
+            len,
         );
     }
 }
@@ -1278,6 +1309,11 @@ pub mod knobs {
     /// `VsLate*`): atomics in the DDI and the tick, mirrored once a second. Read at every
     /// StartDevice.
     pub const FLIP_LAT: KnobName = KnobName::new(b"FlipLat");
+    /// `StageTrace` (default 0 = off): per-frame stage timestamps of the windowed Present copy
+    /// and the `ForeignFlip` path into a ring the registry mirror publishes as the REG_BINARY
+    /// `StgRing` (`ddi::stage_trace`, `docs/TRACING.md` "Frame stage timing"). Off, every stamp
+    /// site is one relaxed load. Read at every StartDevice; mirrored as `StgOn`.
+    pub const STAGE_TRACE: KnobName = KnobName::new(b"StageTrace");
     /// `OutputTech` (default 1): the connector type the virtual monitor's child
     /// device reports to Windows. 1 = DisplayPort (external), 2 = HDMI, 3 = DVI,
     /// 4 = internal, 0 = HD15 (analog VGA, the historical value). Anything else
