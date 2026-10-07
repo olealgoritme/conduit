@@ -129,7 +129,14 @@ pub(crate) fn reset_for_start() {
     CACHE.store(cache.word(), Ordering::Relaxed);
     if v != 0 {
         crate::diag::record_named_bytes(b"CeCache", cache.word());
+        // The dup cache's counters (M3c-1): only when the channel can run at all.
+        super::ce_dup::reset_for_start();
     }
+}
+
+/// `RmCopyEngine` is 3 (the shadow mode, M3c-1): one relaxed load.
+pub(crate) fn shadow_mode() -> bool {
+    cc::mode(KNOB.load(Ordering::Relaxed)) == cc::Mode::Shadow
 }
 
 /// The cache attribute of the channel's own RM system memory in force.
@@ -153,7 +160,7 @@ const CALL_KERNEL_MAP: u32 = 0xf3;
 
 /// A call of the channel failed: name it (`CeRmCall`, `CeRmStat`) so a dump says which, without
 /// the backend log. Atomics only.
-fn note_call(esc: u32, what: u32, f: Fail) {
+pub(super) fn note_call(esc: u32, what: u32, f: Fail) {
     RM_CALL.store(cc::rm_call_word(esc, what), Ordering::Relaxed);
     RM_STAT.store(cc::fail_word(f), Ordering::Relaxed);
 }
@@ -206,6 +213,7 @@ pub(crate) fn publish_counters() {
     rec(b"CeRmCall", RM_CALL.load(Ordering::Relaxed));
     rec(b"CeRmStat", RM_STAT.load(Ordering::Relaxed));
     rec(b"CeMapNode", MAP_NODE.load(Ordering::Relaxed));
+    super::ce_dup::publish_counters();
 }
 
 /// The stage about to run, written BEFORE it runs (a hang names itself).
@@ -241,7 +249,7 @@ pub(super) fn budget_ms(ms: u64) -> SweepBudget {
 
 /// What the channel keeps of its RM client.
 #[derive(Clone, Copy, Default)]
-pub(super) struct Handles {
+pub(crate) struct Handles {
     pub ctl: u32,
     pub gpu: u32,
     pub drm: u32,
@@ -894,6 +902,11 @@ pub(super) fn handles() -> Option<Handles> {
     STATE.lock().parts.map(|p| p.h)
 }
 
+/// The channel's class generation (`None`: no channel).
+pub(super) fn gen() -> Option<Gen> {
+    STATE.lock().parts.and_then(|p| p.gen)
+}
+
 fn notifier_status(p: &Parts) -> u16 {
     if p.ctl.va == 0 {
         return 0;
@@ -970,6 +983,11 @@ pub(super) fn teardown(passive: PassiveLevel, adapter: &AdapterContext, limit: S
 /// the client's close (or the transport sweep). With StopDevice's flag up or the deadline spent
 /// no message is sent, but every kernel view is still unmapped.
 fn undo_all(io: &Io<'_>, p: &mut Parts, ring: &mut cp::Ring) {
+    // Whether the GPU is done with everything submitted. The producer's memory dup'd for the
+    // copies (`ce_dup`, M3c-1) was made after the channel, so it goes first when the GPU is idle;
+    // when it is not (a copy stuck on a producer's value the KMD cannot release) it goes right
+    // after the channel group, whose free stops the channel.
+    let mut idle = true;
     if p.made.contains(Made::SCHEDULED) && p.ring.va != 0 {
         // Nothing may hold the GPU on an acquire, and nothing in flight may still write memory
         // that is about to go: release the producer far ahead, wait (bounded) for the last value.
@@ -983,7 +1001,12 @@ fn undo_all(io: &Io<'_>, p: &mut Parts, ring: &mut cp::Ring) {
         let deadline = now_100ns() + wait_ms * UNITS_PER_MS;
         if ring.in_flight() != 0 && !wait_value(io.passive, p, ring.submitted(), deadline) {
             CH_SOFT.fetch_add(1, Ordering::Relaxed);
+            idle = false;
         }
+    }
+    let h = p.h;
+    if idle {
+        super::ce_dup::release_all(io, &h);
     }
     while let Some(u) = cc::next_undo(p.made) {
         let send = !io.stopping() && !io.limit_spent();
@@ -992,7 +1015,13 @@ fn undo_all(io: &Io<'_>, p: &mut Parts, ring: &mut cp::Ring) {
             CH_SOFT.fetch_add(1, Ordering::Relaxed);
         }
         p.made = p.made.without(u.undoes());
+        if matches!(u, Undo::FreeTsg) {
+            super::ce_dup::release_all(io, &h);
+        }
     }
+    // Whatever is left (no channel group was made): before the client's files close (a no-op
+    // when the cache is empty). A closed client takes the rest with it.
+    super::ce_dup::release_all(io, &h);
 }
 
 /// One undo step; `send = false` sends nothing (the kernel view is still unmapped). Whether it
@@ -1094,6 +1123,8 @@ pub(crate) fn drop_views() {
 #[inline(never)]
 pub(crate) fn forget() {
     drop_views();
+    // The dup cache names objects of the client the sweep closed.
+    super::ce_dup::forget();
     {
         let mut g = STATE.lock();
         g.svc.reset();
@@ -1219,6 +1250,24 @@ pub(super) fn gpu_map(
     va: u64,
     len: u64,
 ) -> Result<GpuMap, Fail> {
+    gpu_map_with(io, h, virt, mem, va, len, cc::MAP_FLAGS_SYSMEM, None)
+}
+
+/// [`gpu_map`] with the `NVOS46` flags and, when `kind` is `Some`, the PTE kind
+/// (`kindOverride`; the caller sets `MAP_FLAGS_KIND_OVERRIDE` in `flags`): the dup'd producer
+/// memory of M3c-1 (`ce_dup`).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(super) fn gpu_map_with(
+    io: &Io<'_>,
+    h: &Handles,
+    virt: u32,
+    mem: u32,
+    va: u64,
+    len: u64,
+    flags: u32,
+    kind: Option<u32>,
+) -> Result<GpuMap, Fail> {
     let fixed = cc::virtual_params(h.root, cc::H_VASPACE, Some(va), len);
     match alloc(io, h, rc::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &fixed) {
         Ok(()) => {}
@@ -1234,9 +1283,9 @@ pub(super) fn gpu_map(
         h_dma: virt,
         h_memory: mem,
         length: len,
-        flags: cc::MAP_FLAGS_SYSMEM,
+        flags,
     };
-    let mapped = noted(map_dma(io, h, &m), cc::ESC_RM_MAP_MEMORY_DMA, mem);
+    let mapped = noted(map_dma(io, h, &m, kind), cc::ESC_RM_MAP_MEMORY_DMA, mem);
     let got = match mapped {
         Ok(got) => got,
         Err(f) => {
@@ -1260,8 +1309,11 @@ pub(super) fn gpu_map(
 }
 
 #[inline(never)]
-fn map_dma(io: &Io<'_>, h: &Handles, m: &cc::DmaMap) -> Result<u64, Fail> {
-    let block = cc::nvos46(m);
+fn map_dma(io: &Io<'_>, h: &Handles, m: &cc::DmaMap, kind: Option<u32>) -> Result<u64, Fail> {
+    let block = match kind {
+        Some(k) => cc::nvos46_kind(m, k),
+        None => cc::nvos46(m),
+    };
     let mut resp = [0u8; super::REPLY_MAX];
     let n = io.exchange(
         h.ctl,
