@@ -1685,6 +1685,7 @@ stale mark refuses the route). `RmCeCache` as in 11.11. No new knob.
 | `CeRtDoneUs` / `CeRtDoneMax` | dispatch (producer satisfied) to completion seen (sum / max; per copy `/ CeRtDone`) |
 | `CeRtPollUs` | in the completion polls and drains (sum) |
 | `CeRtDstNew` / `CeRtDstDrop` / `CeRtDstLive` / `CeRtRuns` | descriptors created / freed / live / page runs of the last one |
+| `CeRtDirKnob` / `CeRtDir` / `CeRtDirNo` / `CeRtDirWhy` / `CeRtDirUs` / `CeRtLag` | `CeRtDirect` (15.13) |
 
 The CE copies also feed `BltAsyncLat0..7` and `BltAsyncInfl` (they are deferred asynchronous Blts); a discharge counts in
 `BltAsyncFail`.
@@ -1773,3 +1774,97 @@ a KMD-owned registration). The window stays live (the Venus copy).
   is charged.
 - A Venus fallback with `BltNoMirror` 1 between two copy-engine frames marks the destination stale; the next Present is
   refused (10 `Stale`) but a copy-engine frame already queued behind it is refused only at its dispatch.
+
+### 15.13 Direct submission at the Present (`CeRtDirect`)
+
+First hardware run of the route (352.1, Heaven windowed 1600x900): `CeRtSeen` 16404, `CeRtRouted` 16403, `CeRtDone`
+16403, one fallback (`CeRtWhy` 4, the first Present), every strike, timeout, leak, poison and off counter 0,
+`CeRtDoneUs / CeRtDone` 220 us (max 931), `BltAsyncLat` below 250 us for 94% of the copies (the Venus baseline 250 us
+to 4 ms), PresentMon `msInPresentAPI` p50 2.01 -> 1.61 ms. `BltDeferUs / CeRtRouted` was 511 us: the deferred wait,
+from the Present to the worker's dispatch once it sees the producer's boundary ready.
+
+`CeRtDirect` = 1 (service-key REG_DWORD, default 0, read at StartDevice only with `RmCopyEngine` 1, mirrored as
+`CeRtDirKnob`; anything else is 0) submits a routed copy at its own Present instead. The push already ACQUIREs the
+record's value (`ACQ_STRICT_GEQ`), so the GPU, not the worker, waits for the producer (M1: acquire held 1253/1253).
+
+**Where it is submitted: the Present DDI.** `DxgkDdiPresent` runs at PASSIVE and holds no lock where the route has
+queued the request and merged its token; the submit is spinlocks and plain stores (the push into the slot, the GPFIFO
+entry, `GP_PUT`, the doorbell): a few microseconds, bounded, never a wait (`CeRtDirUs` measures it). The worker is
+signalled at once to poll the copy.
+
+**When (all of them, else the request stays the deferred one: `CeRtDirNo`, `CeRtDirWhy`):** the route decision admitted
+the Present (15.2, unchanged); the channel is up and the destination's system copy not marked stale (7 `NotUp`); the
+channel has NO copy in flight (1 `ChannelBusy`: a direct copy never queues behind another destination's copy, and only
+one direct copy can hold the channel at a time); the destination's descriptor is made (2 `NotPrepared`); both producer
+dups are cached under the client table's current generation, a pure lookup (3 `NotCached`: making a dup is RM I/O,
+the worker's); the channel's I/O is free (`try_io`, 4 `IoBusy`: while held no dup is remade or given back under the
+cached VAs); and, in ONE critical section of the transport lock (`VirtioGpu::ce_direct_dispatch`), the request is the
+only one pending for the destination and the destination is taken as `KmdWriter` without waiting (the worker's
+`try_begin_present_buffer_write`) (5 `DstBusy`), then the push is submitted (6 `Submit` gives the writer back). A
+submitted request is marked dispatched and admitted (SubmitCommand's later admission skips it; a copy that completes
+before SubmitCommand leaves its terminal, which the DMA fence then finds ready). Lock order: virtio -> the route's
+`STATE` -> the channel's `STATE`, nothing the other way round.
+
+**The deadline starts when the CPU sees the producer finish, not at the submit.** A copy waiting on its acquire waits for
+the producer, which may legitimately take long (a heavy frame). The worker checks the boundary of every direct copy it
+has not yet seen finish (`VirtioGpu::ce_boundary_seen`: ready, or the stream is dead) on every pass while copies are in
+flight, and the first observation starts the copy's `COMPLETE_MS` (100 ms) clock (`ce_route::route_fire_ms`). Unseen,
+nothing runs until `DIRECT_CAP_MS` (7 s) after the submit, longer than the RM gate's own expiry (`RmGateMs`, 6 s by
+default, after which the boundary is declared ready and the normal deadline runs): the cap only acts with `RmGateMs` 0
+or a gate that never fires, and then discharges the copy exactly as a timeout (the fence retires, the destination is
+struck, poisoned and leaked, the channel torn down so the acquire cannot hold the GPU, one route strike).
+
+**Head of line.** The channel runs in order: anything submitted behind a direct copy waits for its acquire. Bounded to
+nothing for other destinations: a direct submit needs an empty channel, and while a direct copy's producer has not been
+seen finishing, the worker's deferred dispatch of ANOTHER destination falls back to its Venus copy (`CeRtWhy` 24
+`Blocked`) rather than queue behind it. The same destination cannot have a second copy in flight (`KmdWriter`). If the
+direct head is discharged (its own deadline or the cap), every copy behind it is a bystander of the channel's teardown,
+each settled exactly once (`Jobs::take_settled` then `take_first` remove what they return; tests).
+
+**Which frame it reads.** The acquire is on THIS Present's own record value (`take_ce_record(boundary)` pairs the record
+with this Present's fence; `matches_fence` makes the record's value the fence's). On one producer timeline the values a
+queue releases only grow, so `current >= value` holds exactly once frame `value`'s work finished (a later frame's higher
+value implies it); an older frame's lower value is released already and never hangs (`ce_route::acquire_releases`).
+What GEQ cannot prevent is the source-reuse hazard of every asynchronous copy (24.10.3): if the app renders the NEXT
+frame into the same image before this copy ran, the copy reads the newer pixels. The read-ledger claim and the
+swap-chain depth bound it exactly as for the deferred copy; the direct copy usually runs EARLIER (right when the
+producer releases) than a deferred one, which narrows that window.
+
+**What the destination sees.** `KmdWriter` is taken at the Present and held while the GPU waits for the producer
+(longer than with the deferred dispatch, which takes it once the producer finished): a Venus consumer claim of the
+destination waits that long; an NVK DWM reads the pages without a claim. The DMA fence still waits for the producer's
+boundary and the copy's terminal, unchanged.
+
+**The expected gain, honestly.** `BltDeferUs` is mostly the PRODUCER'S OWN GPU time, which no design removes: the copy
+cannot start before the frame is rendered. What direct submission removes is the CPU lag between the producer finishing
+and the copy starting: the RM fence's `EventReady` to the DPC, the worker's wake (rounded to the timer) and its dispatch.
+Expect `CeRtLag / CeRtDir` (the CPU lag from seeing the producer finish to seeing the copy done) well below the deferred
+path's dispatch-to-done, often 0 when the copy finished before the CPU even saw the boundary, and the present-to-fence
+retire shorter by roughly the worker hop (a fraction of the 511 us, not all of it).
+
+**Counters** (`ce_route::COUNTERS`): `CeRtDirKnob` (in force), `CeRtDir` (submitted at the Present), `CeRtDirNo` /
+`CeRtDirWhy` (not, and the last `DirNo` code above), `CeRtDirUs` (microseconds of those submits, sum), `CeRtLag` (sum,
+us). `CeRtDoneUs` of a direct copy runs from its submit, so it includes the producer's time: compare `CeRtLag`, not
+`CeRtDoneUs`, between the two modes.
+
+| where | what | the Present |
+|---|---|---|
+| Present | any `DirNo` condition | queued deferred as with `CeRtDirect` 0 |
+| Present | submit refused after the writer was taken | writer given back, queued deferred (6) |
+| worker | the producer is slow (a heavy frame) | the copy waits on the GPU, no clock runs; other destinations' deferred dispatches take the Venus copy (24 `Blocked`) |
+| worker | the boundary is seen | the 100 ms deadline starts; done: the fence retires on the terminal |
+| worker | unseen for 7 s (gate never fired, `RmGateMs` 0) | discharged as its own failure; the channel torn down; bystanders behind it settled once, uncharged |
+| channel | breaks under a direct copy | as 15.6 |
+
+**Hardware A/B (same boot, `pnputil /restart-device` between):** the knobs of 15.11 with `RmCopyEngine` 1, then
+`reg add ... /v CeRtDirect /t REG_DWORD /d 1 /f`, restart, Heaven windowed 1600x900 for a minute, read the key twice;
+`CeRtDirect` 0, restart, the same. Expected with 1: `CeRtDirKnob` 1; `CeRtDir` close to `CeRtRouted` (a few
+`CeRtDirNo`: the first frames 2 or 3 while the descriptor and dups are made, 1 when two Presents overlap); `BltDeferUs`
+grows only for the deferred remainder (per routed copy close to 0: `BltDeferUs / (CeRtRouted - CeRtDir)` stays what it
+was, `BltDeferUs / CeRtRouted` falls); `CeRtDirUs / CeRtDir` a few us; `CeRtLag / CeRtDir` well below the run with 0's
+`CeRtDoneUs / CeRtDone` (220 us); every strike, timeout, leak, poison and off counter 0; PresentMon `msBetweenPresents`
+and the present-to-fence retire (`PBFnc` latency in the stage trace) equal or shorter. A rising `CeRtWhy` 24 says
+another window was held back while a direct copy waited.
+
+Unverified: everything on hardware; that GSP schedules other runlists while the CE channel's acquire waits
+(`ACQUIRE_SWITCH_TSG` is set); the admission order when a direct copy completes before SubmitCommand admits its request.
