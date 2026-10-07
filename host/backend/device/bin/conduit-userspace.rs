@@ -18,8 +18,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use device::userspace::{
-    Capability, DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH, load_manifest,
-    loaded_driver_version, resolve, retarget, soname, staged_driver_version,
+    Capability, DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH, builtin_entries,
+    load_manifest, loaded_driver_version, resolve, retarget, soname, staged_driver_version,
 };
 use std::path::{Path, PathBuf};
 
@@ -103,8 +103,32 @@ fn main() -> Result<()> {
         .map(|c| capability(c))
         .collect::<Result<Vec<_>>>()?;
 
-    let entries = load_manifest(&args.manifest)?;
     let search: Vec<PathBuf> = DEFAULT_SEARCH_PATHS.iter().map(PathBuf::from).collect();
+    let loaded_version = loaded_driver_version(Path::new(LOADED_VERSION_PATH));
+
+    // A driver that ships no manifest is described by the built-in list for
+    // exactly the version that will be staged; no manifest build is guessed
+    // at and retargeted. A manifest that exists is used as before.
+    let (entries, builtin_version) = if args.manifest.exists() {
+        (load_manifest(&args.manifest)?, None)
+    } else {
+        let v = args
+            .driver_version
+            .clone()
+            .or_else(|| loaded_version.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no driver manifest at {} and no loaded NVIDIA module to name a version; \
+                     pass --driver-version",
+                    args.manifest.display()
+                )
+            })?;
+        println!(
+            "no driver manifest at {}; using the built-in file list for driver {v}",
+            args.manifest.display()
+        );
+        (builtin_entries(&v, &search), Some(v))
+    };
     let (found, missing) = resolve(&entries, &caps, &search);
 
     let bytes: u64 = found
@@ -114,7 +138,7 @@ fn main() -> Result<()> {
         .sum();
 
     println!(
-        "{} entries in the manifest, {} wanted here, {:.1} MiB",
+        "{} entries in the file list, {} wanted here, {:.1} MiB",
         entries.len(),
         found.len(),
         bytes as f64 / (1024.0 * 1024.0)
@@ -144,8 +168,9 @@ fn main() -> Result<()> {
     // is loaded, and on a host with two driver userspaces it is wrong about
     // that. So take the build from the module itself and retarget onto it --
     // no operator judgement, which is the point: in production nobody is here.
-    let manifest_version = staged_driver_version(&found);
-    let loaded_version = loaded_driver_version(Path::new(LOADED_VERSION_PATH));
+    let manifest_version = builtin_version
+        .clone()
+        .or_else(|| staged_driver_version(&found));
     let target = args
         .driver_version
         .clone()
