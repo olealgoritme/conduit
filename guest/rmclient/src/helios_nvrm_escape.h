@@ -228,6 +228,11 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmMunmap, mapping_id) == 40, "munmap.
 #define HELIOS_NVRM_WINDOW_FLAG_OWNER_LIMIT (1u << 0)
 /* flags bit 1: the window can grow while the guest runs. Always 0 today. */
 #define HELIOS_NVRM_WINDOW_FLAG_CAN_GROW (1u << 1)
+
+/* QUERY_CAPS.supported_ops bit 37: the KMD reads the copy-engine Present record ('HEF3',
+ * protocol/include/helios_rm_fence.h, docs/rm-copy-engine-present.md 10 and 12) behind a
+ * present marker's RM fence tail. The UMD sends the 168-byte HERF / 192-byte HEPR only then. */
+#define HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3 (1ull << 37)
 /* flags bit 2: owner_limit_bytes is a ceiling on window_used_bytes (every process's maps
  * together; the dynamic policy), so the room left is owner_limit_bytes - window_used_bytes.
  * Clear: a ceiling on owner_used_bytes alone (the legacy quota): room = owner_limit_bytes -

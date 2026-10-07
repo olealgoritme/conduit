@@ -95,6 +95,98 @@ pub const HELIOS_RM_COPY_MAX_DIM: u32 = 16_384;
 /// Largest source pitch in bytes (the foreign layout's bound).
 pub const HELIOS_RM_COPY_MAX_PITCH: u32 = 1 << 20;
 
+/// `HeliosNvrmQueryCaps.supported_ops` bit 37: the KMD reads the record (it parses it beside the
+/// fence tail and may take the copy-engine route). A UMD sends the 168-byte `HERF` / 192-byte
+/// `HEPR` only with it; without it the record would be ignored anyway (an older KMD reads the
+/// first 48 / 96 bytes), so the bit only saves the work of filling it. Set by the KMD whatever
+/// its `RmCopyEngine` knob says: whether a Present is copied on the copy engine is the KMD's
+/// decision per frame, the record is only the input to it.
+pub const HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3: u64 = 1 << 37;
+
+/// A complete 168-byte `HERF` with the record: the 72-byte on-scanout form (fence tail at 32, the
+/// on-scanout slot at 48, ALL ZERO) and the record at [`HELIOS_RM_FENCE_TAIL_V3_HERF_OFFSET`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosPresentRefreshCmdRmCopy {
+    pub base: crate::onscanout::HeliosPresentRefreshCmdOnScanout,
+    pub record: HeliosRmFenceTailV3,
+}
+
+/// A complete 192-byte `HEPR` with the record at [`HELIOS_RM_FENCE_TAIL_V3_HEPR_OFFSET`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosPresentRenderCmdRmCopy {
+    pub base: crate::rm_fence::HeliosPresentRenderCmdFence,
+    pub record: HeliosRmFenceTailV3,
+}
+
+impl HeliosPresentRefreshCmdRmCopy {
+    /// `refresh` and `fence` with the record; the on-scanout slot stays zero (an on-scanout frame
+    /// is never copied, so the two never meet).
+    pub fn new(
+        refresh: crate::wddm::HeliosPresentRefreshCmd,
+        fence: HeliosRmFenceTail,
+        record: HeliosRmFenceTailV3,
+    ) -> Self {
+        let mut base = crate::onscanout::HeliosPresentRefreshCmdOnScanout::zeroed();
+        base.base.base = refresh;
+        base.base.fence = fence;
+        Self { base, record }
+    }
+}
+
+impl HeliosPresentRenderCmdRmCopy {
+    /// The 96-byte fence form with the record.
+    pub const fn new(
+        base: crate::rm_fence::HeliosPresentRenderCmdFence,
+        record: HeliosRmFenceTailV3,
+    ) -> Self {
+        Self { base, record }
+    }
+}
+
+/// Bytes of the ICD's `struct helios_icd_rm_copy` (`helios_icd_interface.h`, version 6,
+/// `queue_rm_fence_v3`): a [`HeliosRmSemaphoreLoc`] then a [`HeliosRmCopySource`], the same bytes.
+pub const HELIOS_ICD_RM_COPY_BYTES: usize = 80;
+
+/// Why a producer does not send the record it was given (the fence goes without it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProducerRecordError {
+    /// The fence tail is not a FENCE tail: the record only travels behind one.
+    NotAFence,
+    /// The ICD described nothing (all-zero copy: `VK_INCOMPLETE`).
+    Empty,
+    /// The semaphore value is not the fence's `rm_fence_value`.
+    ValueMismatch,
+    /// A rule of [`HeliosRmFenceTailV3::validate`] the KMD would refuse it for.
+    Invalid(TailV3Error),
+}
+
+/// The record a producer sends behind `fence`, from the ICD's `helios_icd_rm_copy` bytes, checked
+/// with every rule the KMD applies ([`HeliosRmFenceTailV3::validate`] and
+/// [`HeliosRmFenceTailV3::matches_fence`]), so a record the KMD would refuse is never sent.
+pub fn producer_record(
+    icd_copy: &[u8; HELIOS_ICD_RM_COPY_BYTES],
+    fence: &HeliosRmFenceTail,
+) -> Result<HeliosRmFenceTailV3, ProducerRecordError> {
+    if !fence.is_fence() {
+        return Err(ProducerRecordError::NotAFence);
+    }
+    if icd_copy.iter().all(|b| *b == 0) {
+        return Err(ProducerRecordError::Empty);
+    }
+    let semaphore: HeliosRmSemaphoreLoc = bytemuck::pod_read_unaligned(&icd_copy[..24]);
+    let source: HeliosRmCopySource = bytemuck::pod_read_unaligned(&icd_copy[24..]);
+    let record = HeliosRmFenceTailV3::new(semaphore, source);
+    record
+        .validate(HELIOS_RM_FENCE_TAIL_V3_BYTES)
+        .map_err(ProducerRecordError::Invalid)?;
+    if !record.matches_fence(fence) {
+        return Err(ProducerRecordError::ValueMismatch);
+    }
+    Ok(record)
+}
+
 /// Where the producer's 64-bit timeline semaphore lives. 24 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -361,6 +453,19 @@ impl HeliosRmFenceTailV3 {
         }
     }
 }
+
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(size_of::<HeliosPresentRefreshCmdRmCopy>() == 168);
+    assert!(
+        offset_of!(HeliosPresentRefreshCmdRmCopy, record) == HELIOS_RM_FENCE_TAIL_V3_HERF_OFFSET
+    );
+    assert!(size_of::<HeliosPresentRenderCmdRmCopy>() == 192);
+    assert!(
+        offset_of!(HeliosPresentRenderCmdRmCopy, record) == HELIOS_RM_FENCE_TAIL_V3_HEPR_OFFSET
+    );
+    assert!(HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3 >> 37 == 1);
+};
 
 const _: () = {
     use core::mem::{offset_of, size_of};
@@ -773,6 +878,7 @@ mod tests {
                 crate::rm_fence::HELIOS_PRESENT_PRIVATE_FLAG_RM_FENCE as u64,
             ),
             ("HELIOS_D3D12_SUBMIT_VERSION_V4", crate::rm_fence::HELIOS_D3D12_SUBMIT_VERSION_V4 as u64),
+            ("HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3", HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3),
         ] {
             assert_eq!(c_define(name), v, "{name}");
         }
@@ -793,5 +899,194 @@ mod tests {
             offset_of!(HeliosRmFenceTailV3, semaphore),
         );
         pinned("offsetof(struct HeliosRmFenceTailV3, source)", offset_of!(HeliosRmFenceTailV3, source));
+    }
+
+    // ── the carriers with the record, and the ICD's mirror (helios_icd_interface.h) ──────────
+
+    #[test]
+    fn the_rm_copy_carriers_place_the_record_where_the_kmd_reads_it() {
+        use crate::rm_fence::HeliosPresentRenderCmdFence;
+        let fence = HeliosRmFenceTail {
+            rm_fence_handle: 9,
+            flags: HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
+            rm_fence_value: 1234,
+        };
+        let mut refresh = crate::wddm::HeliosPresentRefreshCmd::zeroed();
+        refresh.magic = crate::wddm::HELIOS_PRESENT_REFRESH_MAGIC;
+        refresh.version = crate::wddm::HELIOS_PRESENT_REFRESH_VERSION;
+        let herf = HeliosPresentRefreshCmdRmCopy::new(refresh, fence, heaven());
+        let cmd = bytemuck::bytes_of(&herf);
+        assert_eq!(cmd.len(), 168);
+        assert_eq!(&cmd[..32], bytemuck::bytes_of(&refresh));
+        assert_eq!(&cmd[32..48], bytemuck::bytes_of(&fence));
+        assert!(cmd[48..72].iter().all(|b| *b == 0), "the on-scanout slot stays zero");
+        match HeliosRmFenceTailV3::parse(&cmd[HELIOS_RM_FENCE_TAIL_V3_HERF_OFFSET..]) {
+            TailV3::Record(r) => {
+                assert_eq!(r, heaven());
+                assert!(r.matches_fence(&fence));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let mut hepr = HeliosPresentRenderCmdFence::zeroed();
+        hepr.fence = fence;
+        let cmd = HeliosPresentRenderCmdRmCopy::new(hepr, heaven());
+        let cmd = bytemuck::bytes_of(&cmd);
+        assert_eq!(cmd.len(), 192);
+        assert_eq!(&cmd[80..96], bytemuck::bytes_of(&fence));
+        assert!(matches!(
+            HeliosRmFenceTailV3::parse(&cmd[HELIOS_RM_FENCE_TAIL_V3_HEPR_OFFSET..]),
+            TailV3::Record(r) if r == heaven()
+        ));
+    }
+
+    #[test]
+    fn the_capability_is_a_free_capability_bit() {
+        assert_eq!(HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3.count_ones(), 1);
+        assert!(HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3 >= 1 << 32);
+        for c in [
+            crate::HELIOS_NVRM_CAP_SCANOUT_FENCE,
+            crate::HELIOS_NVRM_CAP_PRESENT_FENCE,
+            crate::HELIOS_NVRM_CAP_FLUSH_GATE,
+            crate::HELIOS_NVRM_CAP_SCANOUT_RELEASE,
+            crate::HELIOS_NVRM_CAP_WINDOW_INFO,
+        ] {
+            assert_eq!(c & HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3, 0);
+        }
+    }
+
+    const ICD_HEADER: &str = include_str!("../include/helios_icd_interface.h");
+
+    /// The member names of `struct name { ... }` in helios_icd_interface.h, in order.
+    fn icd_fields(name: &str) -> Vec<std::string::String> {
+        let start = ICD_HEADER
+            .find(&std::format!("struct {name} {{"))
+            .unwrap_or_else(|| panic!("struct {name} is not in helios_icd_interface.h"));
+        let body = &ICD_HEADER[start..];
+        let body = &body[body.find('{').unwrap() + 1..body.find("};").unwrap()];
+        body.lines()
+            .map(|l| l.split("/*").next().unwrap().trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let decl = l.trim_end_matches(';');
+                std::string::String::from(decl.rsplit(' ').next().unwrap())
+            })
+            .collect()
+    }
+
+    /// The ICD's `queue_rm_fence_v3` fills `struct helios_icd_rm_copy`, and the UMD reads those
+    /// 80 bytes as `HeliosRmSemaphoreLoc` + `HeliosRmCopySource`: same members, same order, same
+    /// sizes (the header's own static asserts pin the C side).
+    #[test]
+    fn the_icd_copy_struct_is_the_record_s_semaphore_and_source() {
+        assert_eq!(
+            icd_fields("helios_icd_rm_semaphore"),
+            ["h_client", "h_memory", "offset", "value"]
+        );
+        assert_eq!(
+            icd_fields("helios_icd_rm_source"),
+            [
+                "h_client", "h_memory", "offset", "size", "modifier", "pitch", "width", "height",
+                "fourcc", "flags", "reserved"
+            ]
+        );
+        assert_eq!(icd_fields("helios_icd_rm_copy"), ["semaphore", "source"]);
+        for (needle, rust) in [
+            (
+                "sizeof(struct helios_icd_rm_semaphore) == ",
+                core::mem::size_of::<HeliosRmSemaphoreLoc>(),
+            ),
+            ("sizeof(struct helios_icd_rm_source) == ", core::mem::size_of::<HeliosRmCopySource>()),
+            (
+                "offsetof(struct helios_icd_rm_source, pitch) == ",
+                core::mem::offset_of!(HeliosRmCopySource, pitch),
+            ),
+            (
+                "sizeof(struct helios_icd_rm_copy) == ",
+                core::mem::size_of::<HeliosRmSemaphoreLoc>()
+                    + core::mem::size_of::<HeliosRmCopySource>(),
+            ),
+            (
+                "offsetof(struct helios_icd_rm_copy, source) == ",
+                core::mem::size_of::<HeliosRmSemaphoreLoc>(),
+            ),
+        ] {
+            let c: Vec<u64> = ICD_HEADER
+                .lines()
+                .filter_map(|l| l.trim_start().strip_prefix("_Static_assert("))
+                .filter_map(|l| l.strip_prefix(needle))
+                .map(|rest| rest.split(',').next().unwrap().trim().parse().unwrap())
+                .collect();
+            assert_eq!(c, [rust as u64], "{needle}");
+        }
+        // The interface version that appended queue_rm_fence_v3.
+        assert!(ICD_HEADER.contains("#define HELIOS_ICD_INTERFACE_VERSION 6u"));
+        assert!(ICD_HEADER.contains("(*queue_rm_fence_v3)"));
+    }
+
+    fn icd_copy(r: &HeliosRmFenceTailV3) -> [u8; HELIOS_ICD_RM_COPY_BYTES] {
+        let mut b = [0u8; HELIOS_ICD_RM_COPY_BYTES];
+        b[..24].copy_from_slice(bytemuck::bytes_of(&r.semaphore));
+        b[24..].copy_from_slice(bytemuck::bytes_of(&r.source));
+        b
+    }
+
+    #[test]
+    fn a_producer_sends_only_what_the_kmd_would_take() {
+        let fence = HeliosRmFenceTail {
+            rm_fence_handle: 7,
+            flags: HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
+            rm_fence_value: 1234,
+        };
+        // The ICD's bytes become the record unchanged, magic/version/flags/bytes added.
+        let r = producer_record(&icd_copy(&heaven()), &fence).unwrap();
+        assert_eq!(r, heaven());
+        assert_eq!(HeliosRmFenceTailV3::parse(bytemuck::bytes_of(&r)), TailV3::Record(heaven()));
+
+        // VK_INCOMPLETE: nothing described.
+        assert_eq!(
+            producer_record(&[0; HELIOS_ICD_RM_COPY_BYTES], &fence),
+            Err(ProducerRecordError::Empty)
+        );
+        // Only behind a FENCE tail.
+        let complete = HeliosRmFenceTail { flags: 0, ..fence };
+        assert_eq!(
+            producer_record(&icd_copy(&heaven()), &complete),
+            Err(ProducerRecordError::NotAFence)
+        );
+        // The value the copy engine acquires on is the fence's.
+        let other = HeliosRmFenceTail { rm_fence_value: 1235, ..fence };
+        assert_eq!(
+            producer_record(&icd_copy(&heaven()), &other),
+            Err(ProducerRecordError::ValueMismatch)
+        );
+        // A layout the KMD refuses is not sent: compressed, past its memory, a foreign modifier.
+        let mut bad = heaven();
+        bad.source.flags = HELIOS_RM_COPY_SOURCE_FLAG_COMPRESSED;
+        // A known flag: the KMD decides (its route refuses a compressed source).
+        assert_eq!(producer_record(&icd_copy(&bad), &fence), Ok(bad));
+        bad.source.flags = 1 << 5;
+        assert_eq!(
+            producer_record(&icd_copy(&bad), &fence),
+            Err(ProducerRecordError::Invalid(TailV3Error::Flags))
+        );
+        let mut bad = heaven();
+        bad.source.size = 6_400 * 1_023;
+        assert_eq!(
+            producer_record(&icd_copy(&bad), &fence),
+            Err(ProducerRecordError::Invalid(TailV3Error::Size))
+        );
+        let mut bad = heaven();
+        bad.source.modifier = MOD_NVIDIA_BL_GB20X_8BPP | 4;
+        assert_eq!(
+            producer_record(&icd_copy(&bad), &fence),
+            Err(ProducerRecordError::Invalid(TailV3Error::Modifier))
+        );
+        let mut bad = heaven();
+        bad.semaphore.offset = 4;
+        assert_eq!(
+            producer_record(&icd_copy(&bad), &fence),
+            Err(ProducerRecordError::Invalid(TailV3Error::SemaphoreOffset))
+        );
     }
 }
