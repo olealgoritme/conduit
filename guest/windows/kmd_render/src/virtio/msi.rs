@@ -216,6 +216,16 @@ fn give_up_on_vectors(passive: PassiveLevel, va: usize, why: u32, queues: &[u16]
 
 // ── Policy at AddDevice: what the device key should ask PnP for ──────────────
 
+/// This image's build tag (`msi::build_tag`: the build and revision of `HELIOS_KMD_VERSION`),
+/// written next to the breaker's marker (`MsiStartingVer`) and the latch (`MsiLatchVer`) so the
+/// next `AddDevice` can tell a fault of THIS build from one of the build a driver update
+/// replaced. Evaluated at compile time from the same file the INF `DriverVer` and the image
+/// `FILEVERSION` are rendered from; a malformed version fails the build.
+const BUILD_TAG: u32 = match msi::build_tag(include_str!("../../driver-version.env")) {
+    Some(tag) => tag,
+    None => panic!("kmd_render/driver-version.env: no usable HELIOS_KMD_VERSION"),
+};
+
 /// `Interrupt Management\MessageSignaledInterruptProperties`, relative to the device key.
 const MSI_SUBKEY: &[u8] = b"Interrupt Management\\MessageSignaledInterruptProperties";
 static MSI_SUBKEY_W: [u16; MSI_SUBKEY.len()] =
@@ -241,13 +251,41 @@ static MSI_SUPPORTED_W: [u16; MSI_SUPPORTED.len()] =
 pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
     use crate::diag::{knobs, read_config_dword, record_named_bytes as rec};
     let mode = Mode::from_knob(read_config_dword(knobs::MSI_MODE, 0));
-    let mut latched = read_config_dword(knobs::MSI_LATCH, 0) != 0;
+    // The latch belongs to the build that wrote it (`MsiLatchVer`; none = the operator's).
+    // Another build's latch is stale: this build gets one fresh attempt at MSI-X.
+    let latch = read_config_dword(knobs::MSI_LATCH, 0) != 0;
+    let latch_build = read_config_dword(knobs::MSI_LATCH_VER, 0);
+    let verdict = msi::latch_verdict(latch, latch_build, BUILD_TAG);
+    if verdict == msi::LatchVerdict::Stale {
+        rec(b"MsiLatch", 0);
+        rec(b"MsiLatchWhy", 0);
+        rec(b"MsiLatchVer", 0);
+        rec(
+            b"MsiLatchOld",
+            read_config_dword(knobs::MSI_LATCH_OLD, 0).saturating_add(1),
+        );
+    } else if msi::latch_tag_orphaned(latch, latch_build) {
+        // The latch was cleared by writing 0: drop its tag, so a later hand-set 1 is the operator's.
+        rec(b"MsiLatchVer", 0);
+    }
+    let mut latched = verdict.latched();
     // The boot-loop breaker: a message-mode start that never became healthy left its marker.
-    // The marker is consumed here whatever the mode; `MsiMode=3` ignores it, the rest latch INTx.
+    // The marker is consumed here whatever the mode or the build that set it; only a marker of
+    // THIS build trips the breaker (`msi::marker_verdict`), `MsiMode=3` ignores it.
     let marker = read_config_dword(knobs::MSI_STARTING, 0) != 0;
-    if marker {
-        rec(b"MsiStarting", 0);
-        if msi::breaker_trips(mode, true) {
+    let marker_build = read_config_dword(knobs::MSI_STARTING_VER, 0);
+    match msi::marker_verdict(mode, marker, marker_build, BUILD_TAG) {
+        msi::MarkerVerdict::Absent => {}
+        msi::MarkerVerdict::Ignored => rec(b"MsiStarting", 0),
+        msi::MarkerVerdict::Stale => {
+            rec(b"MsiStarting", 0);
+            rec(
+                b"MsiMarkerOld",
+                read_config_dword(knobs::MSI_MARKER_OLD, 0).saturating_add(1),
+            );
+        }
+        msi::MarkerVerdict::Trip => {
+            rec(b"MsiStarting", 0);
             rec(
                 b"MsiBreaker",
                 read_config_dword(knobs::MSI_BREAKER, 0).saturating_add(1),
@@ -273,11 +311,14 @@ pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
     rec(b"MsiKeyWr", status as u32);
 }
 
-/// Ask for INTx at the next start (PASSIVE): the latch `AddDevice` reads. `why` is one of
-/// `msi::latch_why`. FLUSHED to disk: the faults it records are the ones that end in a hang or
-/// a bugcheck, and a latch the lazy writer had not written would be lost with them. Written
+/// Ask for INTx at the next start (PASSIVE): the latch `AddDevice` reads, tagged with this
+/// build (`MsiLatchVer`: another build treats it as stale, `msi::latch_verdict`). `why` is one
+/// of `msi::latch_why`. FLUSHED to disk: the faults it records are the ones that end in a hang
+/// or a bugcheck, and a latch the lazy writer had not written would be lost with them. Written
 /// without a guard against repeats: callers are once per start.
 pub(crate) fn latch_intx(passive: PassiveLevel, why: u32) {
+    // The tag first: a latch is never on disk with another build's tag next to it.
+    crate::diag::record_named_bytes(b"MsiLatchVer", BUILD_TAG);
     crate::diag::record_named_bytes(b"MsiLatch", 1);
     crate::diag::record_named_bytes(b"MsiLatchWhy", why);
     crate::diag::flush_service_key(passive);
@@ -430,6 +471,8 @@ pub(crate) fn begin_start(passive: PassiveLevel, granted: u32) {
     STARTING.store(0, Ordering::Relaxed);
     if granted != 0 {
         STARTING.store(1, Ordering::Release);
+        // The tag first: a marker is never on disk with another build's tag next to it.
+        crate::diag::record_named_bytes(b"MsiStartingVer", BUILD_TAG);
         crate::diag::record_named_bytes(b"MsiStarting", 1);
         crate::diag::flush_service_key(passive);
     }
@@ -495,13 +538,34 @@ pub(crate) fn finish_start(adapter: &AdapterContext) {
 }
 
 /// Clear the `MsiStarting` marker once the start proved healthy (`msi::marker_may_clear`:
-/// armed, not convicted, an interrupt arrived, and 3 s old, or `stopping` cleanly). PASSIVE;
-/// one load when the marker is not set. Called from the HPD worker's pass, the periodic mirror
-/// and StopDevice. The clear is not flushed: losing it costs one false trip of the breaker,
-/// which is the safe direction.
+/// armed, not convicted, an interrupt arrived, and 3 s old). PASSIVE; one load when the marker
+/// is not set. Called from the HPD worker's pass and the periodic mirror. This clear is lazy
+/// (not flushed): the image keeps running, the lazy writer catches up, and losing it to a crash
+/// costs one false trip of this build's breaker, which is the safe direction. StopDevice uses
+/// [`service_stop`], which flushes.
 pub(crate) fn service(stopping: bool) {
+    let _ = clear_marker(stopping);
+}
+
+/// StopDevice's clear of the marker (PASSIVE): as [`service`] with `stopping`, and when it
+/// cleared the marker the service key is FLUSHED, so the clear is on disk before the image can be
+/// unloaded (a driver update), the machine rebooted or powered off. The clear of a clean stop
+/// must not depend on the lazy writer, nor on `StopFlush` and the later stop stages (the stage-5
+/// flush that would also cover it is skipped with `StopFlush=0`, and a stop that dies before it
+/// would lose the clear). One load and no flush when there was no marker to clear (every INTx
+/// start). Returns whether it flushed, so StopDevice can credit the time to its budget.
+pub(crate) fn service_stop(passive: PassiveLevel) -> bool {
+    if clear_marker(true) {
+        crate::diag::flush_service_key(passive);
+        return true;
+    }
+    false
+}
+
+/// Clear the marker if `msi::marker_may_clear` allows it; true when this call cleared it.
+fn clear_marker(stopping: bool) -> bool {
     if STARTING.load(Ordering::Relaxed) == 0 {
-        return;
+        return false;
     }
     let convicted = HEALTH.load(Ordering::Relaxed) == Health::Broken.code();
     if msi::marker_may_clear(
@@ -513,7 +577,9 @@ pub(crate) fn service(stopping: bool) {
     ) && STARTING.swap(0, Ordering::AcqRel) != 0
     {
         crate::diag::record_named_bytes(b"MsiStarting", 0);
+        return true;
     }
+    false
 }
 
 /// A waiter's polling drain found a completion after its wait slice timed out (PASSIVE).

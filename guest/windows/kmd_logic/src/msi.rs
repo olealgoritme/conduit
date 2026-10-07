@@ -443,6 +443,153 @@ pub const fn marker_may_clear(
         && (stopping || now.saturating_sub(armed_at) >= MARKER_CLEAR_AFTER_100NS)
 }
 
+// ── Which build: the marker and the latch belong to the image that wrote them ──
+
+/// The running KMD's build tag (`MsiStartingVer`, `MsiLatchVer`) from the text of
+/// `kmd_render/driver-version.env` (`HELIOS_KMD_VERSION=a.b.c.d`): `c << 16 | d`, the build and
+/// revision components (`22.22.346.1` is `0x015A_0001`). The leading `a.b` is the fixed WDDM
+/// prefix and is not part of it. Never 0: 0 is what an ABSENT value reads as (a marker or latch
+/// written by an image older than the tag, or by hand). `None` when the text has no well-formed
+/// version, or it would encode as 0; the driver evaluates this in a `const`, so either is a
+/// build failure, not a wrong tag.
+pub const fn build_tag(env: &str) -> Option<u32> {
+    const KEY: &[u8] = b"HELIOS_KMD_VERSION=";
+    let b = env.as_bytes();
+    let mut i = 0;
+    // Find the key at the start of a line.
+    let start = loop {
+        if i + KEY.len() > b.len() {
+            return None;
+        }
+        if i == 0 || b[i - 1] == b'\n' {
+            let mut k = 0;
+            while k < KEY.len() && b[i + k] == KEY[k] {
+                k += 1;
+            }
+            if k == KEY.len() {
+                break i + k;
+            }
+        }
+        i += 1;
+    };
+    // Four decimal components, each a u16, separated by dots, ending the line.
+    let mut parts = [0u32; 4];
+    let mut n = 0;
+    let mut digits = 0;
+    let mut j = start;
+    while j < b.len() && !matches!(b[j], b'\n' | b'\r' | b' ' | b'\t') {
+        let c = b[j];
+        if c == b'.' {
+            if digits == 0 || n == 3 {
+                return None;
+            }
+            n += 1;
+            digits = 0;
+        } else if c.is_ascii_digit() {
+            parts[n] = parts[n] * 10 + (c - b'0') as u32;
+            digits += 1;
+            if parts[n] > 0xFFFF {
+                return None;
+            }
+        } else {
+            return None;
+        }
+        j += 1;
+    }
+    if n != 3 || digits == 0 {
+        return None;
+    }
+    let tag = parts[2] << 16 | parts[3];
+    if tag == 0 {
+        None
+    } else {
+        Some(tag)
+    }
+}
+
+/// What `AddDevice` does with the breaker's `MsiStarting` marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerVerdict {
+    /// No marker: nothing to do.
+    Absent,
+    /// `MsiMode=3`: consumed, the breaker is off (as [`breaker_trips`] always said).
+    Ignored,
+    /// Set by a DIFFERENT build, or with no build tag (an older image): consumed without a trip
+    /// and counted (`MsiMarkerOld`). That start's health says nothing about this build; a driver
+    /// update stops the old image in the middle of whatever it was doing.
+    Stale,
+    /// Set by THIS build: a message-mode start of this build never became healthy. The breaker
+    /// trips (`MsiLatch=1`, `MsiLatchWhy=4`).
+    Trip,
+}
+
+/// The marker decision: `marker` is `MsiStarting != 0`, `marker_build` is `MsiStartingVer` (0 =
+/// absent), `running` is [`build_tag`] of this image. `MsiMode=3` ignores the marker whatever
+/// build set it; otherwise only a marker of the running build trips the breaker.
+pub const fn marker_verdict(
+    mode: Mode,
+    marker: bool,
+    marker_build: u32,
+    running: u32,
+) -> MarkerVerdict {
+    if !marker {
+        MarkerVerdict::Absent
+    } else if !breaker_trips(mode, true) {
+        MarkerVerdict::Ignored
+    } else if marker_build == 0 || marker_build != running {
+        MarkerVerdict::Stale
+    } else {
+        MarkerVerdict::Trip
+    }
+}
+
+/// What `AddDevice` does with the INTx latch `MsiLatch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatchVerdict {
+    /// Not latched.
+    Clear,
+    /// Latched by THIS build (`MsiLatchVer` = the running tag): honoured.
+    Held,
+    /// Latched with no build tag: written by the operator (or an image older than the tag).
+    /// Honoured: an operator's `MsiLatch=1` keeps working, and deleting `MsiLatch` (or writing
+    /// 0) is how an operator clears any latch.
+    Operator,
+    /// Latched by a DIFFERENT build: stale. Ignored for this start's decision, cleared
+    /// (`MsiLatch`, `MsiLatchWhy`, `MsiLatchVer` to 0) and counted (`MsiLatchOld`). A new build
+    /// gets one fresh attempt at MSI-X; the breaker and the latch protect against a fault of
+    /// THAT build.
+    Stale,
+}
+
+impl LatchVerdict {
+    /// Whether INTx is latched for [`key_action`].
+    pub const fn latched(self) -> bool {
+        matches!(self, LatchVerdict::Held | LatchVerdict::Operator)
+    }
+}
+
+/// The latch decision: `latch` is `MsiLatch != 0`, `latch_build` is `MsiLatchVer` (0 = absent),
+/// `running` is [`build_tag`] of this image.
+pub const fn latch_verdict(latch: bool, latch_build: u32, running: u32) -> LatchVerdict {
+    if !latch {
+        LatchVerdict::Clear
+    } else if latch_build == 0 {
+        LatchVerdict::Operator
+    } else if latch_build == running {
+        LatchVerdict::Held
+    } else {
+        LatchVerdict::Stale
+    }
+}
+
+/// Whether `AddDevice` should zero a leftover `MsiLatchVer`: the latch is clear (an operator
+/// wrote `MsiLatch=0` instead of deleting it) but a build tag is still there. Without this, an
+/// operator who later sets `MsiLatch=1` by hand under a newer build would have it read as a
+/// stale latch of the old build and ignored.
+pub const fn latch_tag_orphaned(latch: bool, latch_build: u32) -> bool {
+    !latch && latch_build != 0
+}
+
 // ── Counting: per-vector interrupts and DPCs ─────────────────────────────────
 
 /// Messages counted by their own slot (`MsiV0`..`MsiV3`); a higher one shares
@@ -602,7 +749,7 @@ pub mod latch_why {
 /// `kmd_render/src/virtio/msi.rs` only. `MsiMode` and `MsiVectors` are knobs the
 /// operator writes and are not listed; `MsiLatch` is both: the KMD writes 1, an
 /// operator may write either. At most 14 characters each.
-pub const COUNTERS: [&str; 36] = [
+pub const COUNTERS: [&str; 40] = [
     // The set-up breadcrumbs.
     "MsiCap",
     "MsiList",
@@ -646,6 +793,12 @@ pub const COUNTERS: [&str; 36] = [
     // The boot-loop breaker: the marker a message-mode start sets, how often it tripped.
     "MsiStarting",
     "MsiBreaker",
+    // Which build wrote the marker and the latch (`build_tag`), and how often AddDevice found
+    // one written by another build (or by an image without the tag) and set it aside.
+    "MsiStartingVer",
+    "MsiLatchVer",
+    "MsiMarkerOld",
+    "MsiLatchOld",
 ];
 
 #[cfg(test)]
@@ -959,6 +1112,155 @@ mod tests {
         assert!(!marker_may_clear(armed, 0, 1, false, false));
     }
 
+    // ── the build a marker or latch belongs to ───────────────────────────────
+
+    const THIS: u32 = 0x015A_0001; // 22.22.346.1
+    const OLDER: u32 = 0x0159_0001; // 22.22.345.1
+
+    #[test]
+    fn build_tag_is_build_and_revision() {
+        assert_eq!(build_tag("HELIOS_KMD_VERSION=22.22.346.1\n"), Some(THIS));
+        assert_eq!(build_tag("HELIOS_KMD_VERSION=22.22.345.1"), Some(OLDER));
+        assert_eq!(
+            build_tag("# a comment naming HELIOS_KMD_VERSION=1.2.3.4\r\nHELIOS_KMD_VERSION=22.22.343.2\r\n"),
+            Some(343 << 16 | 2)
+        );
+        assert_eq!(
+            build_tag("HELIOS_KMD_VERSION=22.22.65535.65535"),
+            Some(u32::MAX)
+        );
+        // Trailing blanks end the value (the metadata reader trims lines).
+        assert_eq!(build_tag("HELIOS_KMD_VERSION=22.22.346.1 \n"), Some(THIS));
+        // Not well formed, or a tag that would read as "absent": no tag (a build failure).
+        for bad in [
+            "",
+            "HELIOS_KMD_VERSION=",
+            "HELIOS_KMD_VERSION=22.22.346",
+            "HELIOS_KMD_VERSION=22.22.346.1.0",
+            "HELIOS_KMD_VERSION=22.22..1",
+            "HELIOS_KMD_VERSION=22.22.65536.1",
+            "HELIOS_KMD_VERSION=22.22.0.0",
+            "XHELIOS_KMD_VERSION=22.22.346.1",
+            "# HELIOS_KMD_VERSION=22.22.346.1",
+        ] {
+            assert_eq!(build_tag(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn build_tag_of_the_real_version_file() {
+        // The driver evaluates the same function on the same file in a `const`.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("../kmd_render/driver-version.env");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            assert!(
+                std::env::var_os("HELIOS_REQUIRE_NAME_SCAN").is_none(),
+                "{} is missing",
+                path.display()
+            );
+            return;
+        };
+        let tag = build_tag(&text).expect("driver-version.env has no usable build tag");
+        assert_ne!(tag, 0);
+    }
+
+    #[test]
+    fn marker_verdict_table() {
+        for mode in [Mode::Auto, Mode::ForceIntx, Mode::ForceMsi] {
+            // No marker.
+            assert_eq!(
+                marker_verdict(mode, false, THIS, THIS),
+                MarkerVerdict::Absent
+            );
+            assert_eq!(marker_verdict(mode, false, 0, THIS), MarkerVerdict::Absent);
+            // Set by this build: a boot loop of this build. The breaker trips.
+            assert_eq!(marker_verdict(mode, true, THIS, THIS), MarkerVerdict::Trip);
+            // Set by another build (a driver update stopped it), or by an image without the tag.
+            assert_eq!(
+                marker_verdict(mode, true, OLDER, THIS),
+                MarkerVerdict::Stale
+            );
+            assert_eq!(
+                marker_verdict(mode, true, THIS, OLDER),
+                MarkerVerdict::Stale
+            );
+            assert_eq!(marker_verdict(mode, true, 0, THIS), MarkerVerdict::Stale);
+        }
+        // The debugging mode ignores the marker whatever build set it.
+        for build in [0, OLDER, THIS] {
+            assert_eq!(
+                marker_verdict(Mode::ForceMsiNoBreaker, true, build, THIS),
+                MarkerVerdict::Ignored
+            );
+        }
+        assert_eq!(
+            marker_verdict(Mode::ForceMsiNoBreaker, false, THIS, THIS),
+            MarkerVerdict::Absent
+        );
+        // Only a trip is a breaker trip, and it agrees with `breaker_trips` on it.
+        for mode in [
+            Mode::Auto,
+            Mode::ForceIntx,
+            Mode::ForceMsi,
+            Mode::ForceMsiNoBreaker,
+        ] {
+            for (marker, build) in [(false, 0), (true, 0), (true, OLDER), (true, THIS)] {
+                let v = marker_verdict(mode, marker, build, THIS);
+                if v == MarkerVerdict::Trip {
+                    assert!(breaker_trips(mode, marker));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn latch_verdict_table() {
+        assert_eq!(latch_verdict(false, 0, THIS), LatchVerdict::Clear);
+        assert_eq!(latch_verdict(false, OLDER, THIS), LatchVerdict::Clear);
+        // This build's latch holds.
+        assert_eq!(latch_verdict(true, THIS, THIS), LatchVerdict::Held);
+        // No tag: the operator's (or an old image's) latch holds.
+        assert_eq!(latch_verdict(true, 0, THIS), LatchVerdict::Operator);
+        // Another build's latch is stale.
+        assert_eq!(latch_verdict(true, OLDER, THIS), LatchVerdict::Stale);
+        assert!(LatchVerdict::Held.latched());
+        assert!(LatchVerdict::Operator.latched());
+        assert!(!LatchVerdict::Stale.latched());
+        assert!(!LatchVerdict::Clear.latched());
+        // An operator who wrote 0 instead of deleting leaves a tag that is zeroed, so a later
+        // hand-set 1 reads as the operator's.
+        assert!(latch_tag_orphaned(false, OLDER));
+        assert!(!latch_tag_orphaned(false, 0));
+        assert!(!latch_tag_orphaned(true, OLDER));
+        assert!(!latch_tag_orphaned(true, THIS));
+    }
+
+    #[test]
+    fn a_package_update_over_a_running_msi_device_keeps_msi() {
+        // The hardware case (2026-10-07): the old build's start left its marker (or its latch),
+        // the new build's AddDevice must still ask for MSI-X under the opt-in.
+        let marker = marker_verdict(Mode::ForceMsi, true, OLDER, THIS);
+        assert_eq!(marker, MarkerVerdict::Stale);
+        let latch = latch_verdict(true, OLDER, THIS);
+        let latched = latch.latched() || marker == MarkerVerdict::Trip;
+        assert_eq!(key_action(Mode::ForceMsi, latched), KeyAction::SetMsi);
+        // A marker of an image that predates the tag is stale too.
+        assert_eq!(
+            marker_verdict(Mode::ForceMsi, true, 0, THIS),
+            MarkerVerdict::Stale
+        );
+        // A boot loop of THIS build still latches INTx, and the latch it writes holds.
+        let marker = marker_verdict(Mode::ForceMsi, true, THIS, THIS);
+        assert_eq!(marker, MarkerVerdict::Trip);
+        assert_eq!(key_action(Mode::ForceMsi, true), KeyAction::SetIntx);
+        assert!(latch_verdict(true, THIS, THIS).latched());
+        // An operator's latch (no tag) still forces INTx under the opt-in.
+        assert_eq!(
+            key_action(Mode::ForceMsi, latch_verdict(true, 0, THIS).latched()),
+            KeyAction::SetIntx
+        );
+    }
+
     #[test]
     fn the_polling_only_state_is_message_mode_with_nothing_to_route() {
         let st = polling_only_state();
@@ -1211,7 +1513,16 @@ mod tests {
                         } else {
                             // These are also read as knobs, declared with the others in diag.rs.
                             name == "msi.rs"
-                                || (["MsiLatch", "MsiStarting", "MsiBreaker"].contains(mine)
+                                || ([
+                                    "MsiLatch",
+                                    "MsiStarting",
+                                    "MsiBreaker",
+                                    "MsiStartingVer",
+                                    "MsiLatchVer",
+                                    "MsiMarkerOld",
+                                    "MsiLatchOld",
+                                ]
+                                .contains(mine)
                                     && name == "diag.rs")
                         };
                         assert!(ok, "{mine} is also spelled in {}", file.display());

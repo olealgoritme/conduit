@@ -805,9 +805,13 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         budget = stop_credit(budget, joined_from);
         stop_stage(entry, 4);
         // A clean stop of a start that saw interrupts is a healthy one: the boot-loop breaker's
-        // marker goes (`virtio::msi::service`).
-        crate::virtio::msi::service(true);
-        // The HPD worker did the `Nv*` registry mirror and is gone: leave the
+        // marker goes, flushed to disk before the image can be unloaded or the machine rebooted
+        // (`virtio::msi::service_stop`).
+        // The flush (only when a marker was cleared) is credited back like the HPD join.
+        let marker_from = crate::adapter::foreign_scanout::now_100ns();
+        if crate::virtio::msi::service_stop(passive_stop) {
+            budget = stop_credit(budget, marker_from);
+        }        // The HPD worker did the `Nv*` registry mirror and is gone: leave the
         // registry with the final counts (PASSIVE, StopDevice).
         crate::ddi::stall_diag::stop_sub(ss::FINAL_PUBLISH);
         crate::ddi::publish_nvrm_counters();
