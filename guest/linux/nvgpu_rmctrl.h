@@ -27,6 +27,8 @@
 #include <linux/kernel.h>
 #include <linux/types.h>
 
+#include "nvgpu_version.h"
+
 /* How a pointer's element count is found. */
 enum nvgpu_rmctrl_count {
 	NVGPU_RMCTRL_FIXED,   /* a constant from RM's own call site */
@@ -112,11 +114,10 @@ static inline const struct nvgpu_rmctrl_table *
 nvgpu_rmctrl_table_for(const char *version)
 {
 	const struct nvgpu_rmctrl_table *best = NULL;
-	unsigned int maj, min, pat = 0;
+	u32 maj, min, pat;
 	int i;
 
-	/* "565.77" is a release too: two parts, patch 0. */
-	if (!version || sscanf(version, "%u.%u.%u", &maj, &min, &pat) < 2)
+	if (!nvgpu_parse_version(version, &maj, &min, &pat))
 		return NULL;
 
 	for (i = 0; i < (int)ARRAY_SIZE(nvgpu_rmctrl_tables); i++) {
