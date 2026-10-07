@@ -241,6 +241,9 @@ fn start_generation_mirrors() {
     crate::virtio::submit_stage::reset_for_start();
     // The copy-engine Present route (M3c-2): `CeRt*` zeroed (written only with the knob at 1).
     crate::ddi::ce_present_route::reset_for_start();
+    // `RedirVram` (docs/vram-redirection.md): the knob and the counters of the VRAM service.
+    crate::virtio::rm_client::vidmem::reset_for_start();
+    crate::ddi::vram_redirect::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();

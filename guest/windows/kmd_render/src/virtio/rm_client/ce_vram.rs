@@ -1,0 +1,536 @@
+//! The KMD's RM video-memory objects in the copy-engine channel (`RedirVram`, stages V2-V5 of
+//! `docs/vram-redirection.md`): the shared seam for the redirected Blt (the route writes a
+//! VRAM destination), the copy-only GDI acceleration (fallback A: copies between VRAM surfaces and
+//! CPU-visible ones) and the CPU readers and writers of a GPU-only surface.
+//!
+//! * [`ce_surface`] / [`ce_surface_cached`]: an object of the allocation service (`vidmem.rs`),
+//!   named by its host resource id, dup'd into the channel's client (`NV_ESC_RM_DUP_OBJECT` from
+//!   the service's client) and GPU-mapped at a fixed 64 MiB window (big pages, the memory's own
+//!   pitch kind; system-memory flags if RM refuses big pages). Cached per resource id
+//!   (`rm_vidmem::MapBook`), never per RM handle: the service reuses a slot's handle after a free.
+//!   A destroyed object's mapping goes stale at once ([`object_gone`]) and is given back by the
+//!   next caller that holds the channel's I/O.
+//! * [`copy`]: a VRAM-to-VRAM copy between two mapped objects (`rm_vidmem::vram_copy`), with no
+//!   producer to wait for (`ce_channel::submit_copy`); the completion value, [`wait`] for it.
+//! * [`transfer`]: CPU bytes to or from a rectangle of an object through the bounce buffer (RM
+//!   system memory of the channel's client, CPU-mapped cached, GPU-mapped snooped): the upload of
+//!   GDI's CPU-written staging into the GPU-only surface, and the readback for PrintWindow,
+//!   capture and a CPU-visible copy. Synchronous and bounded ([`XFER_MS`]).
+//!
+//! I/O. Every RM message runs at PASSIVE with the channel's `IO_BUSY` held ([`ce_channel::try_io`]:
+//! never waited for; busy is `ce_route::BUSY`, try again). The submit and the poll are spinlocks
+//! and plain stores. The channel's teardown gives everything back ([`release_all`], before the
+//! client's files close); the transport's end forgets it ([`forget`]).
+//!
+//! LOCKING. `BOOK` is a leaf spinlock over plain data; no I/O under it.
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use super::ce_channel::{self as ce, CpuView, GpuMap, Handles};
+use super::Io;
+use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
+use crate::sync::SpinLock;
+use helios_kmd_logic::ce_present::Remap;
+use helios_kmd_logic::rm_ce_channel as cc;
+use helios_kmd_logic::rm_client::{self as rc, Fail, FailKind};
+use helios_kmd_logic::rm_vidmem::{self as rv, Dir, MapBook, MapPlan, Mapped, Rect, Surface};
+use helios_kmd_logic::sweep_budget::UNITS_PER_MS;
+
+/// Not an object of the VRAM service (no RM call was made).
+pub(crate) const NOT_VRAM: Fail = Fail::new(FailKind::Refused, 0xE6);
+/// The object does not fit a window, or a rectangle is outside it.
+pub(crate) const BAD_SHAPE: Fail = Fail::new(FailKind::Layout, 0xE7);
+/// A copy did not complete in time (the channel is marked broken).
+pub(crate) const TIMEOUT: Fail = Fail::new(FailKind::Transport, 0xE8);
+/// The channel refused the submit (ring full, no channel, a push it would not build).
+pub(crate) const SUBMIT: Fail = Fail::new(FailKind::Transport, 0xE9);
+
+/// The longest synchronous transfer or copy wait.
+pub(crate) const XFER_MS: u64 = 250;
+/// The I/O allowance of one call (dups, maps, the bounce's allocation).
+const IO_MS: u64 = 2_000;
+
+/// A VRAM object as the copy engine sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CeSurface {
+    /// GPU VA in the channel's address space of byte 0.
+    pub va: u64,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    /// Changes whenever the channel's mappings were given back or forgotten: re-resolve then.
+    pub chan_gen: u64,
+}
+
+impl CeSurface {
+    pub(crate) const fn surface(&self) -> Surface {
+        Surface {
+            va: self.va,
+            pitch: self.pitch,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Bounce {
+    cpu: CpuView,
+    gpu: GpuMap,
+    len: u64,
+}
+
+struct Book {
+    maps: MapBook,
+    bounce: Option<Bounce>,
+}
+
+static BOOK: SpinLock<Book> = SpinLock::new(Book {
+    maps: MapBook::new(),
+    bounce: None,
+});
+static CHAN_GEN: AtomicU64 = AtomicU64::new(1);
+/// Nonzero while any mapping or the bounce exists (the teardown hooks' fast exit).
+static ANY: AtomicU32 = AtomicU32::new(0);
+
+static MAP_OK: AtomicU32 = AtomicU32::new(0);
+static MAP_FAIL: AtomicU32 = AtomicU32::new(0);
+static MAP_STAT: AtomicU32 = AtomicU32::new(0);
+static MAP_GIVE: AtomicU32 = AtomicU32::new(0);
+static XFER: AtomicU32 = AtomicU32::new(0);
+static XFER_FAIL: AtomicU32 = AtomicU32::new(0);
+static XFER_WHY: AtomicU32 = AtomicU32::new(0);
+static XFER_US: AtomicU32 = AtomicU32::new(0);
+static XFER_MAX: AtomicU32 = AtomicU32::new(0);
+static COPY: AtomicU32 = AtomicU32::new(0);
+static COPY_FAIL: AtomicU32 = AtomicU32::new(0);
+
+fn now() -> u64 {
+    ce::now_100ns()
+}
+
+fn us_since(t0: u64) -> u32 {
+    (now().wrapping_sub(t0) / 10).min(u64::from(u32::MAX)) as u32
+}
+
+fn refresh_any(b: &Book) {
+    let any = b.maps.live() != 0 || b.bounce.is_some() || b.maps.has_stale();
+    ANY.store(u32::from(any), Ordering::Release);
+}
+
+/// The channel's generation of mappings (see [`CeSurface::chan_gen`]).
+pub(crate) fn chan_gen() -> u64 {
+    CHAN_GEN.load(Ordering::Acquire)
+}
+
+fn epoch(adapter: &AdapterContext) -> Option<u64> {
+    adapter
+        .with_virtio(|v| v.nvrm_epoch())
+        .ok()
+        .filter(|e| *e != 0)
+}
+
+/// Run `f` with the channel's I/O held and an `Io` on the channel's client. `BUSY` when another
+/// thread has it, `NO_CHANNEL` when the channel is not up.
+fn with_io<T>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    f: impl FnOnce(&Io<'_>, &Handles) -> Result<T, Fail>,
+) -> Result<T, Fail> {
+    let view = super::ce_route::chan_view();
+    let (true, Some(h), Some(epoch)) = (view.up, ce::handles(), epoch(adapter)) else {
+        return Err(super::ce_route::NO_CHANNEL);
+    };
+    if !ce::try_io() {
+        return Err(super::ce_route::BUSY);
+    }
+    let r = {
+        let _bounded = crate::ddi::escape_wait::begin_bounded(IO_MS as u32);
+        let io = Io {
+            passive,
+            adapter,
+            epoch,
+            limit: Some(ce::budget_ms(IO_MS)),
+        };
+        give_back_stale(&io, &h);
+        f(&io, &h)
+    };
+    ce::end_io();
+    r
+}
+
+/// `resource_id` as a copy-engine surface, mapped on demand. PASSIVE, no lock held; the caller
+/// must NOT hold the channel's I/O (this takes it, without waiting).
+pub(crate) fn ce_surface(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Result<CeSurface, Fail> {
+    if let Some(s) = ce_surface_cached(resource_id) {
+        return Ok(s);
+    }
+    super::vidmem::lookup(resource_id).ok_or(NOT_VRAM)?;
+    with_io(passive, adapter, |io, h| map_locked(io, h, resource_id))
+}
+
+/// `resource_id`'s mapping if it exists now (no RM call). Spinlock only, any IRQL up to DISPATCH.
+pub(crate) fn ce_surface_cached(resource_id: u32) -> Option<CeSurface> {
+    let obj = super::vidmem::lookup(resource_id)?;
+    let m = BOOK.lock().maps.find(resource_id)?;
+    Some(surface_of(&obj, &m))
+}
+
+fn surface_of(obj: &super::vidmem::VramObject, m: &Mapped) -> CeSurface {
+    CeSurface {
+        va: m.va,
+        pitch: obj.pitch,
+        width: obj.width,
+        height: obj.height,
+        fourcc: obj.fourcc,
+        chan_gen: chan_gen(),
+    }
+}
+
+/// The mapping of `resource_id`, made if needed. The caller holds the channel's I/O.
+fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, Fail> {
+    let obj = super::vidmem::lookup(resource_id).ok_or(NOT_VRAM)?;
+    let len = rv::map_len(obj.size).ok_or(BAD_SHAPE)?;
+    let plan = BOOK.lock().maps.plan(resource_id);
+    let slot = match plan {
+        MapPlan::Hit(m) => return Ok(surface_of(&obj, &m)),
+        MapPlan::Make { slot, evict } => {
+            if let Some(old) = evict {
+                BOOK.lock().maps.remove(old.slot);
+                give_back(io, h, &old);
+            }
+            slot
+        }
+    };
+    let (h_dup, h_virt) = rv::map_handles(slot);
+    if let Err(f) = dup(io, h, h_dup, obj.client, obj.memory) {
+        MAP_FAIL.fetch_add(1, Ordering::Relaxed);
+        MAP_STAT.store(cc::fail_word(f), Ordering::Relaxed);
+        ce::note_rm_error();
+        return Err(f);
+    }
+    let va = rv::map_va(slot);
+    let mut mapped = ce::gpu_map_with(io, h, h_virt, h_dup, va, len, rv::map_flags_first(), None);
+    if let Err(f) = mapped {
+        if f.kind == FailKind::Rm {
+            mapped = ce::gpu_map_with(io, h, h_virt, h_dup, va, len, rv::map_flags_second(), None);
+        }
+    }
+    match mapped {
+        Ok(g) => {
+            MAP_OK.fetch_add(1, Ordering::Relaxed);
+            let mut b = BOOK.lock();
+            b.maps.insert(slot, resource_id, g.va, len);
+            refresh_any(&b);
+            let m = b.maps.find(resource_id).ok_or(BAD_SHAPE)?;
+            Ok(surface_of(&obj, &m))
+        }
+        Err(f) => {
+            MAP_FAIL.fetch_add(1, Ordering::Relaxed);
+            MAP_STAT.store(cc::fail_word(f), Ordering::Relaxed);
+            ce::note_rm_error();
+            if ce::rm_free(io, h, rc::H_DEVICE, h_dup).is_err() {
+                ce::note_soft();
+            }
+            Err(f)
+        }
+    }
+}
+
+/// `NV_ESC_RM_DUP_OBJECT` of `object` of `client` as `h_new` under the channel's device.
+fn dup(io: &Io<'_>, h: &Handles, h_new: u32, client: u32, object: u32) -> Result<(), Fail> {
+    let block = cc::nvos55(h.root, rc::H_DEVICE, h_new, client, object);
+    let mut resp = [0u8; super::REPLY_MAX];
+    let n = io.exchange(
+        h.ctl,
+        rc::nv_cmd(cc::ESC_RM_DUP_OBJECT, cc::NVOS55_BYTES as u32),
+        &block,
+        &[],
+        &mut resp,
+    )?;
+    rc::rm_reply(
+        resp.get(..n).ok_or(Fail::new(FailKind::Parse, 0x74))?,
+        cc::NVOS55_STATUS_AT,
+    )
+    .map(|_| ())
+    .map_err(Fail::from)
+}
+
+/// Give one mapping back: its GPU mapping, then the dup.
+fn give_back(io: &Io<'_>, h: &Handles, m: &Mapped) {
+    MAP_GIVE.fetch_add(1, Ordering::Relaxed);
+    if io.stopping() || io.limit_spent() {
+        return;
+    }
+    let (h_dup, h_virt) = rv::map_handles(m.slot);
+    let g = GpuMap {
+        virt: h_virt,
+        mem: h_dup,
+        va: m.va,
+        len: m.len,
+    };
+    let mut ok = ce::gpu_unmap(io, h, &g);
+    ok &= ce::rm_free(io, h, rc::H_DEVICE, h_dup).is_ok();
+    if !ok {
+        ce::note_soft();
+    }
+}
+
+fn give_back_stale(io: &Io<'_>, h: &Handles) {
+    if ANY.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    loop {
+        let Some(m) = BOOK.lock().maps.take_stale() else {
+            break;
+        };
+        give_back(io, h, &m);
+    }
+    let b = BOOK.lock();
+    refresh_any(&b);
+}
+
+/// The allocation behind `resource_id` is being destroyed (`vidmem::released`): its mapping is
+/// never used again and goes back at the next pass that holds the channel's I/O. Spinlock only.
+pub(crate) fn object_gone(resource_id: u32) {
+    let mut b = BOOK.lock();
+    if b.maps.mark_stale(resource_id) {
+        ANY.store(1, Ordering::Release);
+    }
+}
+
+/// Poll the channel until its completion reaches `value`, at most `max_ms` (spinning first, then
+/// in ticks). `false`: not in time, or the channel failed.
+pub(crate) fn wait(passive: PassiveLevel, value: u64, max_ms: u64) -> bool {
+    let start = now();
+    let deadline = start + max_ms * UNITS_PER_MS;
+    loop {
+        let Some(p) = ce::poll() else {
+            return false;
+        };
+        if p.notifier != 0 {
+            return false;
+        }
+        if p.completed >= value {
+            return true;
+        }
+        let t = now();
+        if t >= deadline {
+            return false;
+        }
+        if t < start + ce::SPIN_100NS {
+            core::hint::spin_loop();
+        } else {
+            crate::virtio::ctrl::sleep_ms(passive, 1);
+        }
+    }
+}
+
+/// A VRAM-to-VRAM copy of `src_rect` of `src` to `(dst_x, dst_y)` of `dst` (both mapped: resolve
+/// them with [`ce_surface`] first), submitted now with no producer to wait for. The completion
+/// value ([`wait`]). Spinlocks only.
+pub(crate) fn copy(
+    src: &CeSurface,
+    src_rect: Rect,
+    dst: &CeSurface,
+    dst_x: u32,
+    dst_y: u32,
+    remap: Remap,
+) -> Result<u64, Fail> {
+    let c = rv::vram_copy(&src.surface(), src_rect, &dst.surface(), dst_x, dst_y, remap)
+        .map_err(|_| BAD_SHAPE)?;
+    match ce::submit_copy(&c) {
+        Ok(v) => {
+            COPY.fetch_add(1, Ordering::Relaxed);
+            Ok(v)
+        }
+        Err(_) => {
+            COPY_FAIL.fetch_add(1, Ordering::Relaxed);
+            Err(SUBMIT)
+        }
+    }
+}
+
+/// CPU bytes to (`Upload`) or from (`Readback`) `rect` of `resource_id`, through the bounce
+/// buffer. `bytes` holds the rectangle's rows `row_pitch` bytes apart (at least `width * 4` each).
+/// Synchronous: the copy is submitted and waited for (at most [`XFER_MS`]). PASSIVE, no lock held,
+/// the caller does not hold the channel's I/O.
+pub(crate) fn transfer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    rect: Rect,
+    dir: Dir,
+    bytes: &mut [u8],
+    row_pitch: usize,
+) -> Result<(), Fail> {
+    let t0 = now();
+    let r = with_io(passive, adapter, |io, h| {
+        let s = map_locked(io, h, resource_id)?;
+        let packed = rv::bounce_surface(rect).map_err(|_| BAD_SHAPE)?;
+        let row = packed.pitch as usize;
+        let rows = packed.height as usize;
+        if row_pitch < row || bytes.len() < row_pitch * (rows - 1) + row {
+            return Err(BAD_SHAPE);
+        }
+        let need = rv::bounce_bytes(rect).map_err(|_| BAD_SHAPE)?;
+        let b = bounce(io, h, need)?;
+        let copy = rv::bounce_copy(&s.surface(), rect, dir).map_err(|_| BAD_SHAPE)?;
+        if dir == Dir::Upload {
+            for y in 0..rows {
+                // SAFETY: the bounce view holds `need >= row * rows` bytes (checked by
+                // `bounce`), mapped until `release_all`; `bytes` holds row `y` (checked above).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr().add(y * row_pitch),
+                        (b.cpu.va as *mut u8).add(y * row),
+                        row,
+                    );
+                }
+            }
+            ce::full_barrier();
+        }
+        let value = ce::submit_copy(&copy).map_err(|_| SUBMIT)?;
+        if !wait(io.passive, value, XFER_MS) {
+            super::ce_route::mark_broken();
+            return Err(TIMEOUT);
+        }
+        if dir == Dir::Readback {
+            ce::full_barrier();
+            for y in 0..rows {
+                // SAFETY: as above, the other way round.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (b.cpu.va as *const u8).add(y * row),
+                        bytes.as_mut_ptr().add(y * row_pitch),
+                        row,
+                    );
+                }
+            }
+        }
+        Ok(())
+    });
+    let us = us_since(t0);
+    XFER_US.store(us, Ordering::Relaxed);
+    XFER_MAX.fetch_max(us, Ordering::Relaxed);
+    match &r {
+        Ok(()) => {
+            XFER.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(f) => {
+            XFER_FAIL.fetch_add(1, Ordering::Relaxed);
+            XFER_WHY.store(cc::fail_word(*f), Ordering::Relaxed);
+        }
+    }
+    r
+}
+
+/// The bounce buffer, at least `need` bytes (kept between calls; a larger request replaces it).
+/// The caller holds the channel's I/O and nothing is in flight on the old one (transfers wait).
+fn bounce(io: &Io<'_>, h: &Handles, need: u64) -> Result<Bounce, Fail> {
+    if let Some(b) = BOOK.lock().bounce {
+        if b.len >= need {
+            return Ok(b);
+        }
+    }
+    if let Some(mut old) = BOOK.lock().bounce.take() {
+        free_bounce(io, h, &mut old);
+    }
+    let len = need;
+    ce::alloc_sys(io, h, rv::H_BOUNCE, len).inspect_err(|_| ce::note_rm_error())?;
+    let cpu = match ce::cpu_map(io, h, rc::H_DEVICE, rv::H_BOUNCE, ce::SYSMEM, len, ce::sysmem_view_cache()) {
+        Ok(v) => v,
+        Err(f) => {
+            let _ = ce::rm_free(io, h, rc::H_DEVICE, rv::H_BOUNCE);
+            return Err(f);
+        }
+    };
+    let gpu = match ce::gpu_map(io, h, rv::H_BOUNCE_VIRT, rv::H_BOUNCE, rv::BOUNCE_VA, len) {
+        Ok(g) => g,
+        Err(f) => {
+            let mut cpu = cpu;
+            let _ = ce::cpu_unmap(io, h, &mut cpu, true);
+            let _ = ce::rm_free(io, h, rc::H_DEVICE, rv::H_BOUNCE);
+            return Err(f);
+        }
+    };
+    let b = Bounce { cpu, gpu, len };
+    let mut book = BOOK.lock();
+    book.bounce = Some(b);
+    ANY.store(1, Ordering::Release);
+    Ok(b)
+}
+
+fn free_bounce(io: &Io<'_>, h: &Handles, b: &mut Bounce) {
+    let send = !io.stopping() && !io.limit_spent();
+    let mut ok = ce::cpu_unmap(io, h, &mut b.cpu, send);
+    if send {
+        ok &= ce::gpu_unmap(io, h, &b.gpu);
+        ok &= ce::rm_free(io, h, rc::H_DEVICE, rv::H_BOUNCE).is_ok();
+    }
+    if !ok {
+        ce::note_soft();
+    }
+}
+
+/// The channel's teardown (the GPU idle, before the client's files close): give every mapping and
+/// the bounce back. The caller holds the channel's I/O. One relaxed load when there is nothing.
+pub(super) fn release_all(io: &Io<'_>, h: &Handles) {
+    if ANY.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    loop {
+        let Some(m) = BOOK.lock().maps.take_any() else {
+            break;
+        };
+        give_back(io, h, &m);
+    }
+    if let Some(mut b) = BOOK.lock().bounce.take() {
+        free_bounce(io, h, &mut b);
+    }
+    ANY.store(0, Ordering::Release);
+    CHAN_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The transport is about to be retired (`ce_channel::drop_views`): the bounce's kernel view is
+/// unmapped, nothing sent.
+pub(super) fn drop_views() {
+    if let Some(b) = BOOK.lock().bounce.take() {
+        ce::kernel_unmap(b.cpu.va, b.cpu.len);
+    }
+}
+
+/// The transport is gone (`ce_channel::forget`): the sweep closed the client and everything in it.
+pub(super) fn forget() {
+    let mut b = BOOK.lock();
+    b.maps.clear();
+    if b.bounce.take().is_some() {
+        ce::note_soft();
+    }
+    ANY.store(0, Ordering::Release);
+    CHAN_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Mirror the counters (PASSIVE); with the service's block.
+pub(crate) fn publish_counters() {
+    use crate::diag::record_named_bytes as rec;
+    let live = BOOK.lock().maps.live();
+    rec(b"RvMapOk", MAP_OK.load(Ordering::Relaxed));
+    rec(b"RvMapFail", MAP_FAIL.load(Ordering::Relaxed));
+    rec(b"RvMapStat", MAP_STAT.load(Ordering::Relaxed));
+    rec(b"RvMapLive", live);
+    rec(b"RvMapGive", MAP_GIVE.load(Ordering::Relaxed));
+    rec(b"RvXfer", XFER.load(Ordering::Relaxed));
+    rec(b"RvXferFail", XFER_FAIL.load(Ordering::Relaxed));
+    rec(b"RvXferWhy", XFER_WHY.load(Ordering::Relaxed));
+    rec(b"RvXferUs", XFER_US.load(Ordering::Relaxed));
+    rec(b"RvXferMax", XFER_MAX.load(Ordering::Relaxed));
+    rec(b"RvCopy", COPY.load(Ordering::Relaxed));
+    rec(b"RvCopyFail", COPY_FAIL.load(Ordering::Relaxed));
+}

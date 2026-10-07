@@ -265,7 +265,13 @@ impl VirtioGpu {
             || !self.present_stream_boundary_live(stream_boundary)
             || source.resource_id() == 0
             || source.resource_id() == destination.resource_id()
-            || !matches!(destination, PresentDestinationDesc::StandardBuffer(_))
+            || !(matches!(destination, PresentDestinationDesc::StandardBuffer(_))
+                // `RedirVram` (docs/vram-redirection.md 5.3): an image destination only when it is a
+                // KMD RM video-memory surface, whose copy the copy-engine route takes. The
+                // dispatch takes no Present-buffer ownership for an image, and its ring completion
+                // terminalizes at once (`complete_windowed_blt_ring`).
+                || (matches!(destination, PresentDestinationDesc::OptimalImage(_))
+                    && crate::virtio::rm_client::vidmem::lookup(destination.resource_id()).is_some()))
         {
             return Err(VirtioError::DeviceError);
         }

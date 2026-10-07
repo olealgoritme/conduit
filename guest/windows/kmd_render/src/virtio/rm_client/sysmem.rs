@@ -77,15 +77,15 @@ const BRING_UP_STEPS: usize = 16;
 
 /// What the service keeps of its RM client after bring-up.
 #[derive(Clone, Copy)]
-struct Handles {
-    ctl: u32,
-    gpu: u32,
-    drm: u32,
-    root: u32,
+pub(super) struct Handles {
+    pub(super) ctl: u32,
+    pub(super) gpu: u32,
+    pub(super) drm: u32,
+    pub(super) root: u32,
 }
 
 impl Handles {
-    const NONE: Handles = Handles {
+    pub(super) const NONE: Handles = Handles {
         ctl: 0,
         gpu: 0,
         drm: 0,
@@ -234,13 +234,13 @@ fn now() -> u64 {
 
 /// The deadline the step in progress shares with the rest of its creation (the undo and the
 /// failed-commit cleanup take their own).
-fn step_budget(io: &Io<'_>) -> SweepBudget {
+pub(super) fn step_budget(io: &Io<'_>) -> SweepBudget {
     io.limit
         .unwrap_or_else(|| rs::create_budget(now(), TIMEOUT_MS))
 }
 
 /// The undo's own allowance, starting now.
-fn undo_budget() -> SweepBudget {
+pub(super) fn undo_budget() -> SweepBudget {
     rs::undo_budget(now(), TIMEOUT_MS)
 }
 
@@ -401,7 +401,7 @@ fn admit(io: &Io<'_>) -> Result<usize, Why> {
 /// failure closes what was opened (nothing depends on it yet) and is the end of the service
 /// for the generation.
 #[inline(never)]
-fn bring_up(io: &Io<'_>) -> Result<Handles, Fail> {
+pub(super) fn bring_up(io: &Io<'_>) -> Result<Handles, Fail> {
     let mut c = Client::new();
     c.sync_epoch(io.epoch);
     // A surface extent only so the machine leaves `Cold`; its surface steps are never run.
@@ -702,7 +702,7 @@ fn undo(io: &Io<'_>, ctx: u32, h: &Handles, slot: usize, made: &Made) -> bool {
 
 // ---- the RM messages ----------------------------------------------------------------
 
-fn reply_fail(e: rc::ReplyError, code: u32) -> Fail {
+pub(super) fn reply_fail(e: rc::ReplyError, code: u32) -> Fail {
     match e {
         rc::ReplyError::Host(s) => Fail::new(FailKind::Host, s.unsigned_abs()),
         rc::ReplyError::Short => Fail::new(FailKind::Parse, code),
@@ -730,7 +730,7 @@ fn alloc_sys(io: &Io<'_>, h: &Handles, mem: u32, cache: Cache, size: u64) -> Res
 }
 
 #[inline(never)]
-fn export(io: &Io<'_>, h: &Handles, mem: u32, export_ch: u32) -> Result<(), Fail> {
+pub(super) fn export(io: &Io<'_>, h: &Handles, mem: u32, export_ch: u32) -> Result<(), Fail> {
     let params = rc::export_params(rc::H_DEVICE, mem, export_ch);
     let block = rc::nvos54(
         h.root,
@@ -755,7 +755,7 @@ fn export(io: &Io<'_>, h: &Handles, mem: u32, export_ch: u32) -> Result<(), Fail
 }
 
 #[inline(never)]
-fn gem_import(io: &Io<'_>, h: &Handles, size: u64, export_ch: u32) -> Result<u32, Fail> {
+pub(super) fn gem_import(io: &Io<'_>, h: &Handles, size: u64, export_ch: u32) -> Result<u32, Fail> {
     let data = rc::gem_import_params(size);
     let nested = rc::nvkms_import_params(export_ch);
     let mut resp = [0u8; REPLY_MAX];
@@ -772,7 +772,7 @@ fn gem_import(io: &Io<'_>, h: &Handles, size: u64, export_ch: u32) -> Result<u32
 }
 
 #[inline(never)]
-fn gem_close(io: &Io<'_>, h: &Handles, gem: u32) -> Result<(), Fail> {
+pub(super) fn gem_close(io: &Io<'_>, h: &Handles, gem: u32) -> Result<(), Fail> {
     let data = rc::gem_close_params(gem);
     let mut resp = [0u8; REPLY_MAX];
     let n = io.exchange(h.drm, rc::DRM_IOCTL_GEM_CLOSE, &data, &[], &mut resp)?;
@@ -782,7 +782,7 @@ fn gem_close(io: &Io<'_>, h: &Handles, gem: u32) -> Result<(), Fail> {
 }
 
 #[inline(never)]
-fn free_sys(io: &Io<'_>, h: &Handles, mem: u32) -> Result<(), Fail> {
+pub(super) fn free_sys(io: &Io<'_>, h: &Handles, mem: u32) -> Result<(), Fail> {
     let block = rc::nvos00(h.root, rc::H_DEVICE, mem);
     let mut resp = [0u8; REPLY_MAX];
     let n = io.exchange(
@@ -816,6 +816,22 @@ fn import_resource(
     fl: &FrLayout,
     size: u64,
 ) -> Result<u32, Fail> {
+    import_resource_flags(io, ctx, drm, gem, fl, size, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE)
+}
+
+/// [`import_resource`] with the blob flags chosen by the caller: `USE_MAPPABLE` for system
+/// memory (level 5), none for video memory (`vidmem`: the backend refuses `USE_MAPPABLE` for
+/// memory it did not see allocated as system memory).
+#[inline(never)]
+pub(super) fn import_resource_flags(
+    io: &Io<'_>,
+    ctx: u32,
+    drm: u32,
+    gem: u32,
+    fl: &FrLayout,
+    size: u64,
+    blob_flags: u32,
+) -> Result<u32, Fail> {
     let adapter = io.adapter;
     let b = step_budget(io);
     if !crate::virtio::foreign::rm_import_served(adapter) {
@@ -841,7 +857,7 @@ fn import_resource(
         adapter,
         ctx,
         HELIOS_BLOB_MEM_RM_EXPORT,
-        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+        blob_flags,
         foreign_blob_id(drm, gem),
         size,
         Some(KMD),

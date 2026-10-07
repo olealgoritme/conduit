@@ -336,6 +336,7 @@ pub(crate) fn release_producers(
         limit: Some(budget),
     };
     ce_dup::release_all(&io, &h);
+    super::ce_vram::release_all(&io, &h);
     ch::end_io();
 }
 
@@ -350,6 +351,7 @@ pub(crate) fn teardown_channel(passive: PassiveLevel, adapter: &AdapterContext) 
     if let (Some(h), Some(epoch)) = (ch::handles(), epoch(adapter)) {
         let io = io(passive, adapter, epoch, cc::UNDO_BUDGET_MS);
         ce_dup::release_all(&io, &h);
+    super::ce_vram::release_all(&io, &h);
     }
     ch::teardown(passive, adapter, ch::budget_ms(cc::UNDO_BUDGET_MS));
     ch::end_io();

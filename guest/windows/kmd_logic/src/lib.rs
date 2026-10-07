@@ -33,6 +33,8 @@ pub mod foreign_copy;
 pub mod foreign_errno;
 pub mod flip_completion;
 pub mod flip_flags;
+pub mod vidmm_caps;
+pub mod rm_vidmem;
 pub mod flip_pipeline;
 pub mod flip_retire;
 pub mod foreign_flip;

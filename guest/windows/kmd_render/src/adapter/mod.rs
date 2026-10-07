@@ -200,6 +200,10 @@ pub(crate) struct AdapterKnobs {
     /// with was a `const false` and went with T6/R905; this knob is now the only
     /// way to set the bit.
     pub cross_adapter: bool,
+    /// `VidMmCapsX` (default 0), raw: extra `DXGK_VIDMMCAPS` bits. Never used unfiltered;
+    /// [`Self::vidmm_caps`] applies the accepted-bit mask (stage V1 of the GPU-memory
+    /// redirection, `docs/vram-redirection.md` 5.2).
+    pub vidmm_caps_x: u32,
     /// `BarSegFlags` (default 0x1C = CacheCoherent | SupportsCpuHostAperture |
     /// SupportsCachedCpuHostAperture). The BAR descriptor's flag word.
     pub bar_seg_flags: u32,
@@ -262,6 +266,7 @@ impl AdapterKnobs {
         direct_flip: false,
         flip_caps_x: 0,
         cross_adapter: false,
+        vidmm_caps_x: 0,
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
         bar_seg_mode: 10,
@@ -297,6 +302,7 @@ impl AdapterKnobs {
             direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
             flip_caps_x: read_config_dword(knobs::FLIP_CAPS_EXTRA, 0),
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
+            vidmm_caps_x: read_config_dword(knobs::VIDMM_CAPS_EXTRA, 0),
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
@@ -308,6 +314,12 @@ impl AdapterKnobs {
     /// The `DXGK_DRIVERCAPS.FlipCaps` word this snapshot reports, and what of `FlipCapsX` it kept.
     pub fn flip_caps(&self) -> helios_kmd_logic::flip_flags::FlipCaps {
         helios_kmd_logic::flip_flags::resolve_flip_caps(self.flip_caps_x)
+    }
+
+    /// The `DXGK_DRIVERCAPS.MemoryManagementCaps` word this snapshot reports, given the word the
+    /// caps query built from everything else (`base`), and what of `VidMmCapsX` it kept.
+    pub fn vidmm_caps(&self, base: u32) -> helios_kmd_logic::vidmm_caps::VidMmCaps {
+        helios_kmd_logic::vidmm_caps::resolve_vidmm_caps(base, self.vidmm_caps_x)
     }
 
     /// [`Self::read`] plus the fixed-name breadcrumbs that mirror the knobs.
@@ -334,6 +346,11 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"FlipCapsRep", flip.reported);
         // GDI acceleration: latch the knob for RenderKm and write its mirrors (knob on only).
         crate::ddi::gdi_accel::note_start(knobs.gdi_accel);
+        // The extra VidMm caps this start accepts (the reported word itself is mirrored by the
+        // caps query, which owns the base word: `VmCapsRep`).
+        let vm = knobs.vidmm_caps(0);
+        crate::diag::record_named_bytes(b"VmCapsXEff", vm.effective);
+        crate::diag::record_named_bytes(b"VmCapsXMsk", vm.dropped);
         // VidVram is recorded after StartDevice resolves the absent-value
         // sentinel from the virtio host-visible capability.
         crate::diag::record_named_bytes(b"VidVBad", 0);
