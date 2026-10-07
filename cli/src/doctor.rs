@@ -21,30 +21,20 @@ enum Level {
 /// closed module or a branch older than 580 is a warning that it is untested;
 /// a release without tables stays a failure.
 fn module_verdict(d: &host::Driver, known: bool) -> (Level, String, &'static str) {
-    let old = host::major(&d.version) < 580;
     if known {
-        let what = match (d.open, old) {
-            (true, false) => {
-                return (
-                    Level::Ok,
-                    format!("{} (open kernel modules)", d.version),
-                    "",
-                )
-            }
-            (false, false) => "the closed kernel modules",
-            (true, true) => "a branch older than 580",
-            (false, true) => "the closed kernel modules and a branch older than 580",
+        return match host::untested_because(d) {
+            None => (Level::Ok, format!("{} (open kernel modules)", d.version), ""),
+            Some(what) => (
+                Level::Warn,
+                format!("{} uses {what}; Conduit has tables for this release but is untested with it", d.version),
+                "Conduit is developed and tested on the OPEN kernel modules, version 580 or newer\n(Ubuntu: nvidia-driver-580-open). This setup may work; if it does not, switch to that.",
+            ),
         };
-        return (
-            Level::Warn,
-            format!("{} uses {what}; Conduit has tables for this release but is untested with it", d.version),
-            "Conduit is developed and tested on the OPEN kernel modules, version 580 or newer\n(Ubuntu: nvidia-driver-580-open). This setup may work; if it does not, switch to that.",
-        );
     }
     if !d.open {
         (Level::Fail, format!("{} uses the closed kernel modules", d.version),
             "Conduit needs the OPEN kernel modules. On Ubuntu install the -open package\n(e.g. nvidia-driver-580-open) and restart.")
-    } else if old {
+    } else if host::major(&d.version) < 580 {
         (
             Level::Fail,
             format!("{} is too old", d.version),
@@ -56,6 +46,49 @@ fn module_verdict(d: &host::Driver, known: bool) -> (Level, String, &'static str
             format!("{} (open kernel modules)", d.version),
             "",
         )
+    }
+}
+
+/// The Safe mode line: whether the backend starts in safe mode and why, from
+/// the environment, `gpu.safe_mode` and the driver (protect.rs decides).
+fn safe_mode_report(d: &host::Driver) -> String {
+    safe_mode_text(
+        std::env::var("CONDUIT_SAFE_MODE").ok().as_deref(),
+        crate::config::safe_setting(),
+        d,
+    )
+}
+
+fn safe_mode_text(
+    env: Option<&str>,
+    setting: crate::config::SafeSetting,
+    d: &host::Driver,
+) -> String {
+    use crate::config::SafeSetting::*;
+    let on = crate::protect::safe_mode(env, setting, crate::protect::protection(Some(d)));
+    let how = match (env, setting) {
+        (Some("1" | "0"), _) => "CONDUIT_SAFE_MODE is set in this shell".to_string(),
+        (_, On) => "gpu.safe_mode is true".to_string(),
+        (_, Off) => "gpu.safe_mode is false".to_string(),
+        (_, Auto) => match host::untested_because(d) {
+            Some(what) => format!("{} ({what}) is untested", d.version),
+            None => format!(
+                "{} on the open kernel modules is what Conduit is tested on",
+                d.version
+            ),
+        },
+    };
+    let reason = if matches!((env, setting), (Some("1" | "0"), _) | (_, On) | (_, Off)) {
+        how
+    } else {
+        format!("because {how}")
+    };
+    if on {
+        format!(
+            "ON, {reason}: a 2 GiB video-memory cap and 1 s limits on blocking GPU calls\n         `conduit config set gpu.safe_mode false` turns it off"
+        )
+    } else {
+        format!("off, {reason}\n         `conduit config set gpu.safe_mode true` turns it on")
     }
 }
 
@@ -115,10 +148,8 @@ fn gpu_host_lines(r: &mut Report) {
                         .trim_start_matches('-')
                 })
                 .collect();
-            let cap = crate::protect::vram_limit_mib(
-                Path::new("/sys/class/drm"),
-                crate::config::vram_limit_mib(),
-            );
+            let plan = crate::protect::Plan::current();
+            let cap = plan.vram_limit_mib;
             r.line(
                 Level::Warn,
                 "Display GPU",
@@ -128,10 +159,15 @@ fn gpu_host_lines(r: &mut Report) {
                     if card.display_active() { ", in use" } else { "" }
                 ),
                 &format!(
-                    "{}\nFor a first run set CONDUIT_SAFE_MODE=1 (or: conduit config set gpu.safe_mode true):\na 2 GiB video-memory cap and 1 s limits on blocking GPU calls.",
+                    "{}\n{}",
                     match cap {
                         Some(m) => format!("Guests are capped at {m} MiB of video memory (conduit config set gpu.vram_limit_mib N|off to change)."),
-                        None => "No video-memory cap is set (gpu.vram_limit_mib is off): a guest can fill the card your desktop runs on.\nSet one: conduit config set gpu.vram_limit_mib auto".to_string(),
+                        None => "No video-memory cap is set: a guest can fill the card your desktop runs on.\nSet one: conduit config set gpu.vram_limit_mib auto  (or a number of MiB)".to_string(),
+                    },
+                    if plan.safe_mode {
+                        "Safe mode is on (see the Safe mode line)."
+                    } else {
+                        "For a first run: conduit config set gpu.safe_mode true (a 2 GiB cap and 1 s limits on blocking GPU calls)."
                     }
                 ),
             );
@@ -262,6 +298,7 @@ pub fn run() -> i32 {
             let known = supported.iter().any(|v| host::same_release(v, &d.version));
             let (lvl, detail, fix) = module_verdict(&d, known);
             r.line(lvl, "NVIDIA driver", &detail, fix);
+            r.line(Level::Ok, "Safe mode", &safe_mode_report(&d), "");
             if known {
                 r.line(Level::Ok, "Driver support", &format!("Conduit knows driver {}", d.version), "");
             } else {
@@ -857,6 +894,25 @@ mod tests {
             );
             assert!(!fix.is_empty());
         }
+    }
+
+    #[test]
+    fn safe_mode_line_says_whether_and_why() {
+        use crate::config::SafeSetting::*;
+        let closed = safe_mode_text(None, Auto, &drv("565.77", false));
+        assert!(
+            closed.starts_with("ON, because 565.77 (the closed kernel modules"),
+            "{closed}"
+        );
+        assert!(closed.contains("gpu.safe_mode false"));
+        let proven = safe_mode_text(None, Auto, &drv("610.57.04", true));
+        assert!(proven.starts_with("off, because 610.57.04"), "{proven}");
+        assert!(safe_mode_text(None, On, &drv("610.57.04", true))
+            .starts_with("ON, gpu.safe_mode is true"));
+        assert!(safe_mode_text(None, Off, &drv("565.77", false))
+            .starts_with("off, gpu.safe_mode is false"));
+        assert!(safe_mode_text(Some("1"), Auto, &drv("610.57.04", true))
+            .starts_with("ON, CONDUIT_SAFE_MODE"));
     }
 
     #[test]

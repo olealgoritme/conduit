@@ -41,6 +41,19 @@ pub fn same_release(a: &str, b: &str) -> bool {
     key(a) == key(b)
 }
 
+/// Why a loaded driver is outside what Conduit was built and tested on: the
+/// open kernel modules, release 580 or newer. `None` is the proven setup.
+/// The one rule behind `conduit doctor`'s module line and every protection
+/// that is on by default (protect.rs).
+pub fn untested_because(d: &Driver) -> Option<&'static str> {
+    match (d.open, major(&d.version) < 580) {
+        (true, false) => None,
+        (false, false) => Some("the closed kernel modules"),
+        (true, true) => Some("a branch older than 580"),
+        (false, true) => Some("the closed kernel modules and a branch older than 580"),
+    }
+}
+
 pub fn major(v: &str) -> u32 {
     v.split('.')
         .next()

@@ -3,8 +3,14 @@
 //! A guest's video memory comes out of the same card as the host's own. When
 //! that card also drives a monitor, a guest that fills it leaves the desktop's
 //! next allocation to fail, and the compositor with it. So the backend gets a
-//! video-memory cap by default whenever the NVIDIA card has a connected display,
-//! unless the owner said otherwise (`gpu.vram_limit_mib`).
+//! video-memory cap when safe mode is on and the NVIDIA card has a connected
+//! display, unless the owner said otherwise (`gpu.vram_limit_mib`).
+//!
+//! One rule decides what is on by default: [`protection`], from the loaded
+//! driver. The setup Conduit was built and tested on (open kernel modules,
+//! release 580 or newer) is `Proven` and runs exactly as it always did; any
+//! other is `Untested` and starts in safe mode. `gpu.safe_mode` and
+//! `gpu.vram_limit_mib` override it either way.
 //!
 //! Everything here reads sysfs and procfs only. Opening `/dev/nvidia*` to ask
 //! the driver for its memory size would itself be a GPU call, on the very card
@@ -207,31 +213,104 @@ pub fn default_limit_mib(total: Option<u64>) -> u64 {
     }
 }
 
-/// `--vram-limit-mib` for the backend: the setting, or under `auto` the
-/// default when the card drives a display (nothing when it does not, or when
-/// there is no NVIDIA card to ask).
-pub fn vram_limit_mib(drm_root: &Path, setting: crate::config::VramSetting) -> Option<u64> {
+/// How much Conduit has been proven on the loaded driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    /// Open kernel modules, release 580 or newer: nothing changes.
+    Proven,
+    /// Anything else, or no driver to ask: safe mode is on unless switched off.
+    Untested,
+}
+
+pub fn protection(d: Option<&crate::host::Driver>) -> Protection {
+    match d {
+        Some(d) if crate::host::untested_because(d).is_none() => Protection::Proven,
+        _ => Protection::Untested,
+    }
+}
+
+/// Whether safe mode is on, and why. `env` is `CONDUIT_SAFE_MODE` (`1` on, `0`
+/// off); then the setting; then `auto`, which follows the driver.
+pub fn safe_mode(
+    env: Option<&str>,
+    setting: crate::config::SafeSetting,
+    protection: Protection,
+) -> bool {
+    use crate::config::SafeSetting::*;
+    match (env, setting) {
+        (Some("1"), _) => true,
+        (Some("0"), _) => false,
+        (_, On) => true,
+        (_, Off) => false,
+        (_, Auto) => protection == Protection::Untested,
+    }
+}
+
+/// `--vram-limit-mib` for the backend. A number is the owner's, `off` is none;
+/// `auto` is the default cap when the card drives a display; unset is that
+/// same cap only while safe mode is on. Nothing when there is no display to
+/// protect or no NVIDIA card to ask.
+pub fn vram_limit_mib(
+    drm_root: &Path,
+    setting: crate::config::VramSetting,
+    safe_mode: bool,
+) -> Option<u64> {
     use crate::config::VramSetting::*;
+    let display_default = || {
+        let card = nvidia_card(drm_root)?;
+        card.drives_display()
+            .then(|| default_limit_mib(card.total_vram_mib()))
+    };
     match setting {
         Off => None,
         Mib(n) => Some(n),
-        Auto => {
-            let card = nvidia_card(drm_root)?;
-            card.drives_display()
-                .then(|| default_limit_mib(card.total_vram_mib()))
+        Auto => display_default(),
+        Default => safe_mode.then(display_default).flatten(),
+    }
+}
+
+/// What a backend start gets: the flag and the environment.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub vram_limit_mib: Option<u64>,
+    pub safe_mode: bool,
+}
+
+impl Plan {
+    /// Read from this computer: the loaded driver, the settings, sysfs.
+    pub fn current() -> Plan {
+        let safe_mode = safe_mode(
+            std::env::var("CONDUIT_SAFE_MODE").ok().as_deref(),
+            crate::config::safe_setting(),
+            protection(crate::host::driver().as_ref()),
+        );
+        Plan {
+            vram_limit_mib: vram_limit_mib(
+                Path::new("/sys/class/drm"),
+                crate::config::vram_limit_mib(),
+                safe_mode,
+            ),
+            safe_mode,
+        }
+    }
+
+    pub fn apply(&self, cmd: &mut std::process::Command) {
+        if let Some(mib) = self.vram_limit_mib {
+            cmd.arg("--vram-limit-mib").arg(mib.to_string());
+        }
+        if self.safe_mode {
+            cmd.env("CONDUIT_SAFE_MODE", "1");
+        } else {
+            // The backend reads this variable; an inherited `1` must not
+            // switch on what the settings turned off.
+            cmd.env_remove("CONDUIT_SAFE_MODE");
         }
     }
 }
 
 /// The flags and environment every backend start gets.
 pub fn apply(cmd: &mut std::process::Command) {
-    if let Some(mib) = vram_limit_mib(Path::new("/sys/class/drm"), crate::config::vram_limit_mib())
-    {
-        cmd.arg("--vram-limit-mib").arg(mib.to_string());
-    }
-    if crate::config::safe_mode() {
-        cmd.env("CONDUIT_SAFE_MODE", "1");
-    }
+    Plan::current().apply(cmd);
 }
 
 #[cfg(test)]
@@ -326,31 +405,37 @@ mod tests {
         assert!(!card.display_active());
         assert_eq!(card.total_vram_mib(), Some(12288));
         assert_eq!(card.bar1_mib(), Some(256));
-        assert_eq!(vram_limit_mib(&t.0, VramSetting::Auto), Some(6144));
+        assert_eq!(vram_limit_mib(&t.0, VramSetting::Auto, false), Some(6144));
     }
 
     #[test]
     fn a_headless_card_is_not_capped_by_default() {
         let t = drm("0x2783", &[("DP-1", "disconnected", "disabled")]);
         assert!(!nvidia_card(&t.0).unwrap().drives_display());
-        assert_eq!(vram_limit_mib(&t.0, VramSetting::Auto), None);
+        assert_eq!(vram_limit_mib(&t.0, VramSetting::Auto, false), None);
     }
 
     #[test]
     fn the_setting_overrides_the_default_either_way() {
         let t = drm("0x2783", &[("DP-2", "connected", "enabled")]);
         assert!(nvidia_card(&t.0).unwrap().display_active());
-        assert_eq!(vram_limit_mib(&t.0, VramSetting::Off), None);
-        assert_eq!(vram_limit_mib(&t.0, VramSetting::Mib(2000)), Some(2000));
+        assert_eq!(vram_limit_mib(&t.0, VramSetting::Off, true), None);
+        assert_eq!(
+            vram_limit_mib(&t.0, VramSetting::Mib(2000), false),
+            Some(2000)
+        );
         let bare = drm("0x2783", &[]);
-        assert_eq!(vram_limit_mib(&bare.0, VramSetting::Mib(2000)), Some(2000));
+        assert_eq!(
+            vram_limit_mib(&bare.0, VramSetting::Mib(2000), false),
+            Some(2000)
+        );
     }
 
     #[test]
     fn an_unknown_card_on_a_display_gets_the_fixed_cap() {
         let t = drm("0x9999", &[("DP-1", "connected", "enabled")]);
         assert_eq!(
-            vram_limit_mib(&t.0, VramSetting::Auto),
+            vram_limit_mib(&t.0, VramSetting::Auto, false),
             Some(UNKNOWN_CARD_MIB)
         );
     }
@@ -358,6 +443,124 @@ mod tests {
     #[test]
     fn no_nvidia_card_means_nothing_to_cap() {
         let t = tempdir::T::new();
-        assert_eq!(vram_limit_mib(&t.0, VramSetting::Auto), None);
+        assert_eq!(vram_limit_mib(&t.0, VramSetting::Auto, false), None);
+    }
+
+    // The single rule: what a start passes to the backend, per driver.
+
+    fn drv(version: &str, open: bool) -> crate::host::Driver {
+        crate::host::Driver {
+            version: version.into(),
+            open,
+        }
+    }
+
+    /// The Plan a start gets: the owner's settings, the loaded driver and a
+    /// display card (RTX 4070 SUPER) with a connected monitor.
+    fn plan_for(
+        d: &crate::host::Driver,
+        vram: VramSetting,
+        safe: crate::config::SafeSetting,
+        env: Option<&str>,
+    ) -> Plan {
+        let t = drm("0x2783", &[("DP-2", "connected", "enabled")]);
+        let safe_mode = safe_mode(env, safe, protection(Some(d)));
+        Plan {
+            vram_limit_mib: vram_limit_mib(&t.0, vram, safe_mode),
+            safe_mode,
+        }
+    }
+
+    fn command_line(p: &Plan) -> (Vec<String>, Option<String>, bool) {
+        let mut cmd = std::process::Command::new("conduit-backend");
+        cmd.env("CONDUIT_SAFE_MODE", "inherited");
+        p.apply(&mut cmd);
+        let args = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let env = cmd.get_envs().find(|(k, _)| *k == "CONDUIT_SAFE_MODE");
+        let set = env
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        (args, set, env.is_some_and(|(_, v)| v.is_none()))
+    }
+
+    use crate::config::SafeSetting;
+
+    #[test]
+    fn the_proven_setup_with_a_monitor_and_no_settings_gets_nothing() {
+        for d in [drv("610.57.04", true), drv("580.65.06", true)] {
+            assert_eq!(protection(Some(&d)), Protection::Proven);
+            let p = plan_for(&d, VramSetting::Default, SafeSetting::Auto, None);
+            assert_eq!(
+                p,
+                Plan {
+                    vram_limit_mib: None,
+                    safe_mode: false
+                }
+            );
+            let (args, set, removed) = command_line(&p);
+            assert!(args.is_empty(), "{args:?}");
+            assert_eq!(set, None);
+            assert!(
+                removed,
+                "no inherited CONDUIT_SAFE_MODE reaches the backend"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_565_77_with_a_monitor_gets_safe_mode_and_the_display_cap() {
+        for d in [
+            drv("565.77", false),
+            drv("595.104.02", false),
+            drv("535.1", true),
+        ] {
+            assert_eq!(protection(Some(&d)), Protection::Untested);
+            let p = plan_for(&d, VramSetting::Default, SafeSetting::Auto, None);
+            assert_eq!(
+                p,
+                Plan {
+                    vram_limit_mib: Some(6144),
+                    safe_mode: true
+                }
+            );
+            let (args, set, _) = command_line(&p);
+            assert_eq!(args, ["--vram-limit-mib", "6144"]);
+            assert_eq!(set.as_deref(), Some("1"));
+        }
+        assert_eq!(protection(None), Protection::Untested);
+    }
+
+    #[test]
+    fn explicit_settings_win_over_auto_both_ways() {
+        let proven = drv("610.57.04", true);
+        let closed = drv("565.77", false);
+        // Forced on for the proven driver.
+        let p = plan_for(&proven, VramSetting::Default, SafeSetting::On, None);
+        assert_eq!((p.safe_mode, p.vram_limit_mib), (true, Some(6144)));
+        // Forced off for the untested one: nothing reaches the backend.
+        let p = plan_for(&closed, VramSetting::Default, SafeSetting::Off, None);
+        assert_eq!((p.safe_mode, p.vram_limit_mib), (false, None));
+        // The environment is an explicit setting too.
+        assert!(plan_for(&proven, VramSetting::Default, SafeSetting::Auto, Some("1")).safe_mode);
+        assert!(!plan_for(&closed, VramSetting::Default, SafeSetting::Auto, Some("0")).safe_mode);
+        // A number or `auto` caps even a proven driver; `off` removes the
+        // cap even on an untested one while safe mode stays on.
+        let p = plan_for(&proven, VramSetting::Mib(3000), SafeSetting::Auto, None);
+        assert_eq!((p.safe_mode, p.vram_limit_mib), (false, Some(3000)));
+        let p = plan_for(&proven, VramSetting::Auto, SafeSetting::Auto, None);
+        assert_eq!((p.safe_mode, p.vram_limit_mib), (false, Some(6144)));
+        let p = plan_for(&closed, VramSetting::Off, SafeSetting::Auto, None);
+        assert_eq!((p.safe_mode, p.vram_limit_mib), (true, None));
+        let (_, set, _) = command_line(&p);
+        assert_eq!(set.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_headless_untested_card_is_in_safe_mode_without_a_cap_flag() {
+        let t = drm("0x2783", &[("DP-1", "disconnected", "disabled")]);
+        assert_eq!(vram_limit_mib(&t.0, VramSetting::Default, true), None);
     }
 }
