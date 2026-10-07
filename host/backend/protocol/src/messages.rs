@@ -456,6 +456,14 @@ pub const NVGPU_CFG_RM_RESOURCE_IMPORT: u32 = 1 << 14;
 /// [`NVGPU_F_SCANOUT_RELEASE`]).
 pub const NVGPU_CFG_GUEST_BLOB: u32 = 1 << 16;
 
+/// Device config `features` bit, only together with [`NVGPU_CFG_VENUS`] and
+/// [`NVGPU_CFG_CURSOR`]: the backend serves
+/// [`crate::venus::CMD_SET_CURSOR_BLOB`], a Windows guest's hardware cursor
+/// as a Venus blob (docs/SCANOUT.md "Hardware cursor, Windows guests").
+/// Set whenever Venus and the cursor plane both are. Bit 17 is kept for the
+/// proposed host vblank feature.
+pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
+
 /// A **virtio device feature** the guest acks (like [`NVGPU_CFG_TAKES_INPUT`],
 /// not a config `features` bit; config bit 15 stays unused): the guest wants
 /// `ScanoutReleased` events. The backend offers it in its device features
@@ -1244,6 +1252,8 @@ mod tests {
         assert_eq!(MsgType::RmResourceImport as u32, 31);
         assert_eq!(MsgType::from_u32(32), None);
         assert_eq!(NVGPU_CFG_RM_RESOURCE_IMPORT, 1 << 14);
+        // Bit 17 is the proposed host vblank feature's.
+        assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
         let r = RmResourceImport {
             owner_handle: 9,
             resource_id: 50,

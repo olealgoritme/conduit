@@ -224,6 +224,16 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         caps_offset!(ApertureSegmentCommitLimit),
         aperture_segment_commit_limit,
     );
+    // The hardware cursor (`HwCursor`, `ddi::hw_cursor`): a 256x256 monochrome / color /
+    // masked-color pointer when the knob and the host allow it, else none (zeros: dxgkrnl
+    // draws a software cursor, which independent flip loses).
+    if crate::ddi::hw_cursor::advertised(adapter) {
+        let max_pointer: UINT = helios_kmd_logic::hw_cursor::MAX_DIM;
+        out.set(caps_offset!(MaxPointerWidth), max_pointer);
+        out.set(caps_offset!(MaxPointerHeight), max_pointer);
+        let pointer_caps: UINT = helios_kmd_logic::hw_cursor::POINTER_CAPS;
+        out.set(caps_offset!(PointerCaps), pointer_caps);
+    }
     // Not a legacy VGA device.
     let support_non_vga: BOOLEAN = 1;
     out.set(caps_offset!(SupportNonVGA), support_non_vga);

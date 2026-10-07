@@ -632,6 +632,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // `IndepFlip` (independent flip, stage S-1): the mode this generation counts under, and the
     // `Idf*` block zeroed (`IdfKnob` written, 0 included).
     crate::ddi::indep_flip::reset_for_start(&knobs);
+    // `HwCursor`: the caps this generation reports, the `Cur*` block zeroed, the cursor image of
+    // the last generation forgotten (its id may name another resource now).
+    crate::ddi::hw_cursor::reset_for_start(adapter, &knobs);
 
     // The scan-out mode and its EDID, resolved BEFORE publication because
     // `StartedState` is published exactly once. In its own transient frame: the

@@ -1551,6 +1551,7 @@ fn scanout_modifier_reaches_the_viewer() {
     assert_eq!(t.venus.scanout_modifier(), Some(0x0300_0000_0060_6010));
 }
 
+mod cursor;
 mod guest;
 mod rm;
 

@@ -2322,6 +2322,13 @@ impl DisplayLink {
         }
     }
 
+    /// The kept cursor (tests): whether it has an image, and the update.
+    #[cfg(test)]
+    pub(crate) fn kept_cursor_for_test(&self) -> Option<(bool, CursorUpdate)> {
+        let st = self.state.lock().unwrap();
+        st.cursor.as_ref().map(|c| (c.fd.is_some(), c.c))
+    }
+
     /// HELLO on the first client (tests).
     #[cfg(test)]
     pub(crate) fn hello(&self, caps: u32) {

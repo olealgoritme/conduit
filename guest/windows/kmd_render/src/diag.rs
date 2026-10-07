@@ -1277,6 +1277,15 @@ pub mod knobs {
     /// the other `AdapterKnobs` at AddAdapter and StartDevice; mirrored as `VmCapsXEff` and
     /// `VmCapsRep` at every start.
     pub const VIDMM_CAPS_EXTRA: KnobName = KnobName::new(b"VidMmCapsX");
+    /// `HwCursor` (default 1): the hardware cursor (`docs/independent-flip.md` section 12,
+    /// `helios_kmd_logic::hw_cursor`). 1 reports a 256x256 monochrome / color / masked-color
+    /// pointer in `DXGK_DRIVERCAPS` when the host serves it (`NVGPU_CFG_VENUS_CURSOR`), and
+    /// `SetPointerShape` / `SetPointerPosition` drive the host pointer's image; dxgkrnl then
+    /// draws no software cursor, which independent flip needs (DWM, which would draw it, is out
+    /// of the path). 0 is the software cursor as before. 2 advertises whatever the host says
+    /// (every shape then fails over to the software cursor on a host without it). Read with the
+    /// other adapter knobs (a change applies at the next StartDevice); mirrored as `CurKnob`.
+    pub const HW_CURSOR: KnobName = KnobName::new(b"HwCursor");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,

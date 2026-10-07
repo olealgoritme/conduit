@@ -104,6 +104,17 @@ pub(super) struct Export {
     dmabuf: conduit_venus::Dmabuf,
 }
 
+impl Export {
+    pub(super) fn new(layout: ScanoutLayout, dmabuf: conduit_venus::Dmabuf) -> Self {
+        Self { layout, dmabuf }
+    }
+
+    /// The exported memory, whatever layout it was exported with.
+    pub(super) fn fd(&self) -> std::os::fd::RawFd {
+        self.dmabuf.fd.as_raw_fd()
+    }
+}
+
 impl Venus {
     pub(super) fn set_scanout_blob(&mut self, s: &SetScanoutBlob, env: Env<'_>) -> Answer {
         if s.scanout_id != 0 {

@@ -128,6 +128,7 @@ spell opens a new window. An idle guest logs nothing
 | `RESOURCE_UNREF` | unmapped if mapped, then freed |
 | `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset, and its modifier: an RM-export blob's own, else the one its blob's size implies (below); resource 0 turns the scanout off (`ScanoutDisable` to the viewer); a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER`, a scanout other than 0 `RESP_ERR_INVALID_SCANOUT_ID` |
 | `RESOURCE_FLUSH` | renderer exports the scanout resource as a dma-buf with the guest's layout (cached per resource and layout), sent to the viewer as a frame; an RM-export blob is sent as the dma-buf the backend already holds |
+| `SET_CURSOR_BLOB` (`0x0380`, Conduit) | only with `NVGPU_CFG_VENUS_CURSOR`: a rectangle of a blob as the host pointer's image, or hidden (docs/SCANOUT.md "Hardware cursor, Windows guests"); the blob is exported once |
 
 **EDID.** `GET_EDID` (`0x010a`: header, `scanout_id`, padding) is answered
 with `RESP_OK_EDID` (`0x1104`): header, `size` = 256, padding, then

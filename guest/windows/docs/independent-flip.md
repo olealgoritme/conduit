@@ -442,7 +442,11 @@ A flip retires when a `CRTC_VSYNC` reports its address. Per tick (4.17 ms at 240
 * The watchdogs (`VsWatchdog`, `FlipWdogMs`, `DeferBudget`; `zero-copy-present.md` 14, 15.4) are the safety nets for a dead
   heartbeat and a stuck flip; they stay as they are.
 
-### 4.5 Cursor and overlay interplay  [open]
+### 4.5 Cursor and overlay interplay  [pointer: answered, section 12]
+
+Measured since: promoted, the pointer is gone (Heaven at 5120x1440@240 through independent flip, `IdfDirFor` 172362): dxgkrnl
+promotes without a hardware pointer and nothing draws the software one. The hardware cursor (`HwCursor`) is section 12. The
+analysis as first written:
 
 * **Pointer.** The KMD reports no hardware pointer and accepts `SetPointerShape` / `SetPointerPosition` as no-ops with the
   comment "the OS software-composes the cursor" (`display.rs:1720-1753`). A software cursor is drawn by DWM into the frame DWM
@@ -994,7 +998,8 @@ into one knob and wires the decision table.
   sources the UMD did not create from a `pPrimaryDesc` (question 2.4).
 * `SCANOUT_ALLOCS` grows from 32 to 64 slots (2.8), whatever the knob.
 * Not in this stage: `IdfNeedPrim`, `IdfHoldRel`, `IdfSwitch` (names reserved), MPO (S-5: a smaller-than-output window cannot be
-  promoted to "Hardware: Independent Flip" without overlay planes, so the test window covers the output), a hardware pointer (4.5), the
+  promoted to "Hardware: Independent Flip" without overlay planes, so the test window covers the output), a hardware pointer (4.5; now
+  section 12, `HwCursor`), the
   D3D12 `pfnCheckDirectFlipSupport` slot (2.3; the D3D11 one has the `DirectFlipSupport` knob).
 
 Counters (event-gated; the whole block is written as zeros at every StartDevice, then from the periodic `scanout_trace` dump when a count
@@ -1115,3 +1120,94 @@ Re-run of C with `NvkPresent=2` (the same routing as the fix, on the 345.1 UMD):
   promotion. To confirm: the flag histogram `FlR<n>` / `FlC<n>` (a word with 0x2000 set and 0x4 clear, count about 957), `FiR<n>` /
   `FiC<n>`, `VpBlt`, and `IdfPrRedir` read at about 5 s and again at the end (a start-up burst vs. a steady trickle). A steady trickle
   would mean partial demotions, and `IdfSpaTrans` / `FfReowned` would rise with it.
+
+## 12. The hardware cursor (`HwCursor`)
+
+Branch `feat/indepflip-hw-cursor`. The hardware result that asked for it: with `IndepFlip=1` and `DirectFlipSupport=1`, full-screen
+Heaven at 5120x1440@240 ran 300-400 fps through independent flip (`IdfDirFor` 172362 direct flips of the application's own buffer,
+`IdfKeep` 0), and the mouse cursor disappeared. Without a hardware pointer dxgkrnl has DWM draw the cursor into the frames DWM
+composes (4.5); promoted, DWM composes nothing, and the cursor goes with it. The fix is a hardware pointer: the cursor stops being
+part of any frame.
+
+### 12.1 What it does
+
+* **Caps.** `DXGK_DRIVERCAPS.MaxPointerWidth` / `MaxPointerHeight` 256 and `PointerCaps` = `Monochrome | Color | MaskedColor` (7),
+  when `helios_kmd_logic::hw_cursor::advertise` says so: the knob is not 0, the display half is on, and the host advertises
+  `NVGPU_CFG_CURSOR | NVGPU_CFG_VENUS | NVGPU_CFG_VENUS_CURSOR` (bits 9, 10, 18). Otherwise the caps are zeros, as before, and
+  dxgkrnl keeps the software cursor.
+* **The image.** One KMD-owned linear Venus image, 256 x 512 B8G8R8A8, host-visible (`allocate_linear_scanout_image_blob`, the
+  allocation every Venus primary uses, so its dma-buf export is the proven one), made on the first shape of a transport generation.
+  Two 256x256 slots: a new shape is written into the slot not on screen, so the host never reads a half-written cursor.
+* **`DxgkDdiSetPointerShape`** (PASSIVE): `hw_cursor::validate` (exactly one kind, 1..256 square, pitch, hotspot inside, source
+  0), the conversion to premultiplied ARGB row by row into the slot through a transient `MmMapIoSpace` of the mapped blob, then
+  `HELIOS_CMD_SET_CURSOR_BLOB` (0x0380, a Conduit extension of the virtio-gpu control queue: blob, rectangle, stride, offset, hotspot,
+  visibility) when the cursor is visible. Conversions: color is per-pixel alpha, premultiplied unless already premultiplied (no
+  channel above its alpha); masked color is alpha 0 = opaque colour, alpha 0xFF = XOR (black XOR is transparent); monochrome is
+  AND/XOR, 0/0 black, 0/1 white, 1/0 transparent, 1/1 invert. An ARGB plane cannot invert, so an inverting pixel is drawn black
+  with a white outline on its transparent neighbours (the text I-beam stays visible on dark and light backgrounds).
+* **`DxgkDdiSetPointerPosition`** (PASSIVE, up to the mouse rate): one spinlock and a compare, unless `Flags.Visible` changed;
+  then the image is shown or hidden on the host. **The position never travels**: the host pointer is the cursor (the viewer sets
+  the image as its `wl_pointer` cursor over the guest), so it moves at host rate with no guest latency. X and Y ride along on
+  each command, informational.
+* **Failure is the software cursor.** A shape the host cannot take, an image that cannot be made or mapped, a host command that
+  fails: `SetPointerShape` answers `STATUS_UNSUCCESSFUL`, and dxgkrnl draws that shape in software, as before (the host image is
+  hidden first, so two cursors never show). A host that refuses the command (`RESP_ERR_*`: an old backend under `HwCursor=2`) is not
+  asked again in that generation (`CurHostErr`). `SetPointerPosition` always succeeds (failure is not in its legal set).
+* **Host side** (`docs/SCANOUT.md` "Hardware cursor, Windows guests"): the backend exports the blob once, as a scanout, and hands
+  the rectangle to the display link exactly as a Linux guest's `CursorUpdate`: `CMD_CURSOR` with the dma-buf to every client that
+  takes cursors. The viewer and the stream host already draw it; nothing changed there.
+
+### 12.2 Transitions
+
+| transition | what keeps the cursor right |
+|---|---|
+| composed ↔ independent flip (promotion, demotion, `IdfSpaTrans`) | nothing to do: the cursor is in no frame, so it is the same in both. With `HwCursor=0` the cursor is lost while promoted (the bug) |
+| mode change (CommitVidPn, `EV_MODE_HINT` re-mode) | the image does not depend on the mode, and the host keeps showing it; dxgkrnl is expected to re-apply the pointer after a mode set [M] (row H3 checks). The viewer draws it at the picture's scale |
+| DWM restart | dxgkrnl owns the pointer, not DWM; DWM's restart re-sets the shape at most. A shape it cannot show goes to the software cursor, as before |
+| device restart (`pnputil /restart-device`, TDR) | per generation: `reset_for_start` forgets the image (its resource id may name another resource in the next generation), the host hides the cursor when the transport resets (`Venus::release`), dxgkrnl sets the shape again and the first shape makes a new image |
+| host refused / old backend | the caps carry no pointer without `NVGPU_CFG_VENUS_CURSOR` (default knob); with `HwCursor=2` every shape fails over to software |
+| viewer reconnect, `conduit view` started later | the backend keeps the last cursor and re-sends it to a client that connects (as for Linux guests) |
+| grab (CTRL+ALT+G, relative pointer) | the viewer hides the host pointer, and with it the guest's image: no cursor under grab (as for a Linux guest's cursor plane; games draw their own). `HwCursor=0` keeps the old guest-drawn cursor for desktop use under grab |
+| multi-monitor | one VidPN source; a shape or position for another source is refused (shape) or ignored (position) |
+| boot console shown | the backend does not send the guest's cursor over the console |
+
+### 12.3 Knob and counters
+
+`HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, `HwCursor` (REG_DWORD), read with the other adapter knobs at StartDevice:
+
+| value | effect |
+|---|---|
+| absent, 1 | hardware cursor when the host advertises it (default) |
+| 0 | software cursor, exactly as before (the A/B and the off switch) |
+| 2 | caps reported whatever the host says (bring-up; on an old host every shape fails over to software, `CurHostErr` 1) |
+
+Counters (event-gated like `Idf*`: zeros at every StartDevice, then from the periodic dump when one moved): `CurKnob` (the knob),
+`CurCaps` (1 when the caps report the pointer), `CurShapeN` / `CurPosN` (SetPointerShape / SetPointerPosition calls; `CurPosN` is
+published with the next other change), `CurShow` / `CurHide` (show / hide commands the host took), `CurFmt` (last shape: 1 mono, 2
+color, 4 masked color, +0x100 premultiplied by the KMD), `CurSize` (`width << 16 | height`), `CurRefuse` (shapes left to the
+software cursor), `CurWhy` (last reason: 1 flags, 2 size, 3 pitch, 4 hotspot, 5 no pixels, 6 source, 7 host, 8 image), `CurHostErr`
+(host commands that failed), `CurXor` (inverting pixels in the last shape). Host: the backend logs `venus: the guest's hardware
+cursor is served (CMD_SET_CURSOR_BLOB)` at start and counts `set_cursor_blob=N` in its teardown `venus: ... command(s)` line.
+
+### 12.4 Recipe (main runs it; lowest mode first)
+
+Needs the backend and the KMD of this branch (`NVGPU_CFG_VENUS_CURSOR` is new; with an older backend the default knob reports no
+pointer and nothing changes). Per row: set the values, reboot (or `pnputil /restart-device`), check `CurKnob` / `CurCaps`, run,
+read the counters.
+
+| row | `HwCursor` | `IndepFlip` / `DirectFlipSupport` | run | expect |
+|---|---|---|---|---|
+| H0 | 0 | 0 / 0 | desktop, move the mouse, hover a text field and a window edge | today's behaviour: `CurCaps` 0, `Cur*` 0, cursor drawn by DWM |
+| H1 | absent | 0 / 0 | same | `CurCaps` 1, `CurShapeN` >= 1 and rising with each new shape (arrow, I-beam, resize), `CurShow` >= 1, `CurRefuse` 0, `CurHostErr` 0, `CurFmt` 2 or 4 (Windows' cursors), `CurXor` > 0 on the I-beam if it inverts. Cursor visible and tracking with no lag; the I-beam black with a white outline |
+| H2 | absent | 1 / 1 | `d3d11_iflip.exe 20 cursor` at 1920x1080@240, then Heaven full-screen at 5120x1440@240 | promotion as 11.6 (`IdfDirFor` rising, `IdfKeep` 0) **and the cursor visible** over the promoted window; `CurHide` / `CurShow` move only when an application hides or shows the cursor; fps as without the cursor (the cursor costs no frame work) |
+| H3 | absent | 1 / 1 | as H2, then Alt+Tab out and back (demote, promote), change the mode (viewer fullscreen toggle), `taskkill /f /im dwm.exe`, `pnputil /restart-device` | cursor present after each; after the restart `CurShapeN` restarts from 0 and rises again; no two cursors at any time |
+| H4 | 2 | 0 / 0 | on an old backend (no `NVGPU_CFG_VENUS_CURSOR`) | `CurCaps` 1, `CurHostErr` 1, `CurRefuse` = `CurShapeN`, `CurWhy` 7: the software cursor, visible |
+
+**Screenshot check.** An in-guest screenshot (`ci/vmtest/shot.ps1`, `CopyFromScreen`) never contains the cursor, hardware or not,
+so it checks only the picture. The cursor check is on the host: with the pointer over the guest window, `grim -c` (cursor included)
+of the output; the guest's arrow must be in the shot at the pointer, at the guest picture's scale, and in H2 over the promoted
+Heaven frame. Read `CurSize` / `CurFmt` with it: a 32x32 color arrow is `CurSize` 0x200020, `CurFmt` 0x102 (straight alpha,
+premultiplied by the KMD) or 2.
+
+Safety: the knob is the whole surface (`HwCursor=0` and a restart restore the software cursor). A host that stops answering costs
+at most 500 ms per pointer command before that shape falls back to software.

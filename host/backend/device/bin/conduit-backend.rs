@@ -1292,6 +1292,12 @@ impl NvGpuBackend {
         if guest_blobs && venus.enable_guest_blobs() {
             self.config.set_guest_blob();
         }
+        // A Windows guest's hardware cursor rides the cursor plane's path.
+        if { self.config.features } & protocol::messages::NVGPU_CFG_CURSOR != 0
+            && venus.enable_cursor()
+        {
+            self.config.set_venus_cursor();
+        }
         self.nvidia.lock().expect("backend mutex").set_venus(venus);
         self.venus.hostmem_len = hostmem_len;
     }
