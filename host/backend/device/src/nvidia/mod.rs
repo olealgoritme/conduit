@@ -121,8 +121,9 @@ struct DriDevice {
     /// Which GPU slot it belongs to. The guest matches this against the GPU's
     /// minor to decide which card the node hangs off; it is ours, not NVIDIA's.
     slot_index: u32,
-    /// `DRM_NVIDIA_GET_DEV_INFO` as the host's own node answers it, passed
-    /// through rather than reconstructed.
+    /// `DRM_NVIDIA_GET_DEV_INFO` as the host's own node answers it, decoded
+    /// once ([`abi::devinfo::Layout::decode`]) and passed through rather than
+    /// reconstructed.
     ///
     /// The guest used to answer this ioctl from constants -- gpu_id from the
     /// slot index, and page kind 6 / generation 2 / sector layout 1 under a
@@ -133,25 +134,15 @@ struct DriDevice {
     /// false. The tiling fields were right for the two cards they name and
     /// silently wrong elsewhere, which is the kind of wrong that produces a
     /// scrambled frame rather than an error.
-    dev_info: [u32; NV_DEV_INFO_WORDS],
+    dev_info: abi::devinfo::DevInfo,
 }
 
-/// `struct drm_nvidia_get_dev_info_params` is nine `u32`s. Carried as words
-/// because nothing here needs to interpret them -- only the guest does.
-const NV_DEV_INFO_WORDS: usize = 9;
-
-/// `_IOWR('d', DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO, params)`, i.e.
-/// direction read|write, 36 bytes, type 'd', nr 0x43.
-// `libc::Ioctl` is `c_ulong` on glibc and `c_int` on musl; the bit pattern is
-// what the kernel reads either way.
-const DRM_IOCTL_NVIDIA_GET_DEV_INFO: libc::Ioctl = 0xC024_6443_u32 as libc::Ioctl;
-
-/// Ask a host render node what it is.
+/// Ask a host render node what it is, in the host release's own layout.
 ///
 /// `None` when the node cannot be opened or refuses the ioctl, which leaves
 /// the guest on its own constants -- wrong, but no worse than before, and
 /// said out loud rather than discovered later in a frame.
-fn host_dev_info(path: &str) -> Option<[u32; NV_DEV_INFO_WORDS]> {
+fn host_dev_info(path: &str, layout: &abi::devinfo::Layout) -> Option<abi::devinfo::DevInfo> {
     let c_path = CString::new(path).ok()?;
     // SAFETY: a NUL-terminated path, and the fd is closed below.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
@@ -162,12 +153,12 @@ fn host_dev_info(path: &str) -> Option<[u32; NV_DEV_INFO_WORDS]> {
         );
         return None;
     }
-    let mut params = [0u32; NV_DEV_INFO_WORDS];
-    // SAFETY: `params` is exactly the 36 bytes the ioctl's size field declares.
+    let mut params = vec![0u8; layout.size];
+    // SAFETY: `params` is exactly the bytes the ioctl's size field declares.
     let rc = unsafe {
         libc::ioctl(
             fd,
-            DRM_IOCTL_NVIDIA_GET_DEV_INFO,
+            layout.ioctl() as libc::Ioctl,
             params.as_mut_ptr() as *mut libc::c_void,
         )
     };
@@ -178,7 +169,7 @@ fn host_dev_info(path: &str) -> Option<[u32; NV_DEV_INFO_WORDS]> {
         log::warn!("{path}: GET_DEV_INFO refused ({err})");
         return None;
     }
-    Some(params)
+    layout.decode(&params)
 }
 
 // ============================================================
@@ -232,6 +223,10 @@ pub struct NvidiaBackend {
     /// Where an allocation's size is and what tells the guest how much video
     /// memory there is, for this release. See `vidmem.rs`.
     vidmem: Option<abi::vidmem::Selected>,
+    /// Where the host release keeps each field of `DRM_NVIDIA_GET_DEV_INFO`,
+    /// and so which size of the ioctl to ask the host's nodes. `None` until
+    /// the release is known. See [`abi::devinfo`].
+    devinfo: Option<abi::devinfo::Selected>,
     /// NVOS32 FREE calls seen. Not charged back, because the table has no
     /// layout for them; reported so a workload that uses them is noticed.
     vidmem_untracked_frees: u64,
@@ -447,6 +442,7 @@ impl NvidiaBackend {
             uvm: None,
             osdesc: None,
             vidmem: None,
+            devinfo: None,
             vidmem_untracked_frees: 0,
             guest_ram: None,
             registrations: std::collections::HashMap::new(),
@@ -602,6 +598,13 @@ impl NvidiaBackend {
         };
         self.osdesc = Some(osdesc);
         self.vidmem = abi::vidmem::select(v);
+        // And what the host's DRM nodes answer GET_DEV_INFO with: its size is
+        // in the ioctl number, so asking with the wrong one reads the wrong
+        // words, or none.
+        let Some(devinfo) = abi::devinfo::select(v) else {
+            return Err(format!("host driver {v} has no GET_DEV_INFO layout"));
+        };
+        self.devinfo = Some(devinfo);
         log::info!(
             "host driver {v}: {} RM controls carry a pointer RM dereferences",
             sel.table.len()
@@ -635,6 +638,7 @@ impl NvidiaBackend {
             .filter(|v| abi::rmallow::select(*v).is_some_and(|s| s.exact))
             .filter(|v| abi::uvm::select(*v).is_some_and(|s| s.exact))
             .filter(|v| abi::vidmem::select(*v).is_some_and(|s| s.exact))
+            .filter(|v| abi::devinfo::select(*v).is_some_and(|s| s.exact))
             .collect()
     }
 
@@ -665,6 +669,9 @@ impl NvidiaBackend {
         }
         if self.vidmem.is_some_and(|s| !s.exact) {
             out.push("video-memory table");
+        }
+        if self.devinfo.is_some_and(|s| !s.exact) {
+            out.push("GET_DEV_INFO layout");
         }
         out
     }
@@ -992,6 +999,7 @@ impl NvidiaBackend {
         self.uvm = old.uvm.take();
         self.osdesc = old.osdesc.take();
         self.vidmem = old.vidmem.take();
+        self.devinfo = old.devinfo;
         self.vram = crate::vram::Vram::new(old.vram.limit().map(|b| b >> 20));
         #[cfg(feature = "venus")]
         {

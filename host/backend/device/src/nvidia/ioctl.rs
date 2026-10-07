@@ -39,6 +39,7 @@ impl NvidiaBackend {
         self.uvm = abi::uvm::select(v);
         self.osdesc = abi::osdesc::select(v);
         self.vidmem = abi::vidmem::select(v);
+        self.devinfo = abi::devinfo::select(v);
         match self.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
             None => log::warn!(

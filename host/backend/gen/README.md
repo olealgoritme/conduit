@@ -15,6 +15,7 @@ and checked in.
 | `uvm_extract.py` | open-gpu-kernel-modules | `src/uvm/` |
 | `osdesc_extract.py` | open-gpu-kernel-modules | `src/osdesc/` |
 | `vidmem_extract.py` | open-gpu-kernel-modules | `src/vidmem/` (`--vram-limit-mib`) |
+| `devinfo_extract.py` | open-gpu-kernel-modules (`nvidia-drm` ioctl header) | `src/devinfo/`, `guest/linux/devinfo/` (`--lang c`) |
 | `nvgpu_gen.py` | open-gpu-kernel-modules | `guest/linux/gen/` |
 | `names_extract.py` | open-gpu-kernel-modules (several releases), `drm.h` | `src/names/table.rs` (names in traces) |
 

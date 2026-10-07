@@ -101,4 +101,5 @@ jobs:
           add-paths: |
             host/backend/gen/src/**
             guest/linux/rmctrl/**
+            guest/linux/devinfo/**
             guest/linux/gen/**

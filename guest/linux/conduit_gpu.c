@@ -60,6 +60,7 @@
 #include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
 #include "nvgpu_pcimap.h"
+#include "nvgpu_devinfo.h"
 #include "nvgpu_rmctrl.h"
 
 /*
@@ -566,10 +567,8 @@ static int nvgpu_poll_spin_us;
 module_param_named(poll_spin_us, nvgpu_poll_spin_us, int, 0644);
 MODULE_PARM_DESC(poll_spin_us, "microseconds to spin before sleeping for an event");
 
-/* struct drm_nvidia_get_dev_info_params is nine u32s. */
-#define NVGPU_DEV_INFO_WORDS 9
-/* name_len, major, minor, slot_index, then the dev_info words. */
-#define NVGPU_DRI_RECORD_BYTES (16 + 4 * NVGPU_DEV_INFO_WORDS)
+/* name_len, major, minor, slot_index, then the dev_info record. */
+#define NVGPU_DRI_RECORD_BYTES (16 + NVGPU_DI_WIRE_BYTES)
 
 struct nvgpu_dri_dev {
   char name[32];
@@ -578,11 +577,12 @@ struct nvgpu_dri_dev {
   /* Which GPU slot this node hangs off. Ours, not NVIDIA's -- it is matched
    * against the GPU's minor, and is not the gpu_id GET_DEV_INFO reports. */
   u32 slot_index;
-  /* GET_DEV_INFO as the host's own node answered it. Passed through rather
-   * than reconstructed here: the gpu_id in it is what the ICD matches a DRM
-   * node to an RM device by, and the page-kind and sector-layout fields are
-   * per-architecture and were previously hardcoded for Ampere. */
-  u32 dev_info[NVGPU_DEV_INFO_WORDS];
+  /* GET_DEV_INFO as the host's own node answered it, decoded by the backend
+   * into named fields. Passed through rather than reconstructed here: the
+   * gpu_id in it is what the ICD matches a DRM node to an RM device by, and
+   * the page-kind and sector-layout fields are per-architecture. It is not
+   * the layout of any release; the caller's own is chosen when it asks. */
+  struct nvgpu_devinfo dev_info;
   struct cdev cdev;
   /* The registered DRM device, which owns the node and its sysfs tree. */
   struct drm_device *drm;
@@ -1168,7 +1168,8 @@ static bool nvgpu_fence_host_signalled(struct nvgpu_device *dev, u32 handle,
 /* Whether this node serves explicit sync: the backend relays fences and the
  * host's own node has semaphore surfaces (its GET_DEV_INFO supports_semsurf). */
 static bool nvgpu_dri_fences(const struct nvgpu_dri_dev *dri) {
-  return nvgpu_explicit_sync && dri->dev->fences && dri->dev_info[8];
+  return nvgpu_explicit_sync && dri->dev->fences &&
+         dri->dev_info.v[NVGPU_DI_SUPPORTS_SEMSURF];
 }
 
 /*
@@ -1187,18 +1188,6 @@ struct nvgpu_drm_version {
   size_t desc_len;
   char __user *desc;
 };
-
-struct drm_nvidia_get_dev_info_params {
-  __u32 gpu_id;
-  __u32 mig_device;
-  __u32 primary_index;
-  __u32 supports_alloc;
-  __u32 generic_page_kind;
-  __u32 page_kind_generation;
-  __u32 sector_layout;
-  __u32 supports_sync_fd;
-  __u32 supports_semsurf;
-} __packed;
 
 /*
  * nvgpu_drm_handle_ioctl — handle all DRM-layer ioctls on our /dev/dri/..
@@ -1264,27 +1253,26 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      * that used to be here reported gpu_id 0 where the host says 0x100, and a
      * page kind correct only on the two architectures the comment named.
      */
-    u32 info[NVGPU_DEV_INFO_WORDS];
+    struct nvgpu_devinfo info = dri->dev_info;
+    const struct nvgpu_devinfo_layout *layout;
+    u8 out[NVGPU_DI_WIRE_BYTES];
     bool fences;
 
-    BUILD_BUG_ON(sizeof(struct drm_nvidia_get_dev_info_params) !=
-                 NVGPU_DEV_INFO_WORDS * sizeof(u32));
-
-    memcpy(info, dri->dev_info, sizeof(info));
-
     /*
-     * The ICD's idea of this struct's size, against ours. A newer driver can
-     * grow it, and this handler answers the user pointer directly rather than
-     * through drm_ioctl's buffer -- so a larger struct is filled to 36 bytes
-     * and the rest is left as whatever the caller had there. The ICD then
-     * reads rubbish for the fields it added, and the symptom is not an error:
-     * it is a device that associates with no DRM node at all.
+     * The struct is the caller's release's, and its ioctl number says how big
+     * that is: 20, 32 or 36 bytes, each a different layout (nvgpu_devinfo.h).
+     * This handler answers the user pointer directly rather than through
+     * drm_ioctl's buffer, so a layout bigger than the caller's would write
+     * past its struct, and one of the wrong shape would hand it every field
+     * a word off. A size no release has is refused rather than guessed at.
      */
-    if (_IOC_SIZE(cmd) != sizeof(info))
+    layout = nvgpu_devinfo_layout_for_size(_IOC_SIZE(cmd));
+    if (!layout || layout->size > sizeof(out)) {
       dev_warn(&nfd->dev->vdev->dev,
-               "conduit-gpu: GET_DEV_INFO size mismatch: caller wants %u "
-               "bytes, this build answers %zu\n",
-               _IOC_SIZE(cmd), sizeof(info));
+               "conduit-gpu: GET_DEV_INFO: no release has a %u-byte struct\n",
+               _IOC_SIZE(cmd));
+      return -EINVAL;
+    }
 
     /*
      * The three capability bits are the host's answer about the host's node,
@@ -1312,9 +1300,9 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      */
     /* The fence ioctls need a drm_file, which the fallback cdev lacks. */
     fences = file && nvgpu_dri_fences(dri);
-    info[3] = nvgpu_claim_alloc;            /* supports_alloc */
-    info[7] = nvgpu_claim_sync_fd || fences; /* supports_sync_fd */
-    info[8] = fences;                        /* supports_semsurf */
+    info.v[NVGPU_DI_SUPPORTS_ALLOC] = nvgpu_claim_alloc;
+    info.v[NVGPU_DI_SUPPORTS_SYNC_FD] = nvgpu_claim_sync_fd || fences;
+    info.v[NVGPU_DI_SUPPORTS_SEMSURF] = fences;
 
     /*
      * primary_index is the number of the DRM node this device is, and it has
@@ -1336,9 +1324,11 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      * and nothing presented.
      */
     if (file && file->minor && file->minor->dev && file->minor->dev->primary)
-      info[2] = file->minor->dev->primary->index;
+      info.v[NVGPU_DI_PRIMARY_INDEX] = file->minor->dev->primary->index;
 
-    if (copy_to_user(uarg, info, sizeof(info)))
+    memset(out, 0, sizeof(out));
+    nvgpu_devinfo_encode(layout, &info, out, layout->size);
+    if (copy_to_user(uarg, out, layout->size))
       return -EFAULT;
     return 0;
   }
@@ -5711,7 +5701,8 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
     dev_info(&dev->vdev->dev,
              "conduit-gpu: registered render node for %s, host (%u:%u) "
              "gpu_id=0x%x\n",
-             dri->name, dri->major, dri->minor, dri->dev_info[0]);
+             dri->name, dri->major, dri->minor,
+             dri->dev_info.v[NVGPU_DI_GPU_ID]);
   }
 
   return 0;
@@ -6072,7 +6063,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     for (i = 0; i < num_dri; i++) {
       __le32 raw_name_len, raw_major, raw_minor, raw_slot, raw_info;
       u32 name_len, major, minor, slot_index, nl;
-      u32 info[NVGPU_DEV_INFO_WORDS];
+      struct nvgpu_devinfo info;
       int idx, w;
 
       /* name_len + major + minor + slot_index, then the dev_info words */
@@ -6090,9 +6081,9 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       major = le32_to_cpu(raw_major);
       minor = le32_to_cpu(raw_minor);
       slot_index = le32_to_cpu(raw_slot);
-      for (w = 0; w < NVGPU_DEV_INFO_WORDS; w++) {
+      for (w = 0; w < NVGPU_DI_FIELDS; w++) {
         memcpy(&raw_info, p + 16 + 4 * w, sizeof(__le32));
-        info[w] = le32_to_cpu(raw_info);
+        info.v[w] = le32_to_cpu(raw_info);
       }
       p += NVGPU_DRI_RECORD_BYTES;
 
@@ -6109,14 +6100,16 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       dev->dri_devs[idx].major = major;
       dev->dri_devs[idx].minor = minor;
       dev->dri_devs[idx].slot_index = slot_index;
-      memcpy(dev->dri_devs[idx].dev_info, info, sizeof(info));
+      dev->dri_devs[idx].dev_info = info;
       dev->num_dri_devs++;
 
       dev_info(&dev->vdev->dev,
                "conduit-gpu: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
                "page kind %u/%u, sector layout %u\n",
-               dev->dri_devs[idx].name, major, minor, slot_index, info[0],
-               info[4], info[5], info[6]);
+               dev->dri_devs[idx].name, major, minor, slot_index,
+               info.v[NVGPU_DI_GPU_ID], info.v[NVGPU_DI_GENERIC_PAGE_KIND],
+               info.v[NVGPU_DI_PAGE_KIND_GENERATION],
+               info.v[NVGPU_DI_SECTOR_LAYOUT]);
       p += name_len;
     }
   }

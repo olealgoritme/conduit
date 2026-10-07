@@ -187,7 +187,7 @@ impl NvidiaBackend {
 
         // GET_SYS_FILES carries a second section the file stream does not
         // announce: a u32 count of DRI devices, then that many records of
-        // {name_len, major, minor, slot_index, dev_info[9]} and the name. Omitting it does not
+        // {name_len, major, minor, slot_index, dev_info record} and the name. Omitting it does not
         // fail cleanly -- the driver reads whatever bytes follow the
         // terminator as the count, which is why a run with no second section
         // still logged "no DRI devices reported by VMM" and looked correct.
@@ -411,8 +411,9 @@ impl NvidiaBackend {
 
     /// The DRI section of a `GetSysFiles` response.
     ///
-    /// A count, then one `{name_len, major, minor, slot_index, dev_info[9]}`
-    /// record and name per device. The guest uses these to register render nodes at the host's own
+    /// A count, then one `{name_len, major, minor, slot_index, dev_info}`
+    /// record and name per device. `dev_info` is [`abi::devinfo::DevInfo::to_wire`]:
+    /// the same words in the same order whatever the host release. The guest uses these to register render nodes at the host's own
     /// major and minor and to build the sysfs tree beneath them.
     ///
     /// This is not decoration for a headless guest. NVIDIA's Vulkan and EGL
@@ -436,31 +437,7 @@ impl NvidiaBackend {
         *self.dri_given.borrow_mut() = Some(devices.clone());
         log::info!("GET_SYS_FILES: {} DRI device(s)", devices.len());
 
-        if buf.len() < 4 {
-            return 0;
-        }
-        let mut off = 0;
-        buf[off..off + 4].copy_from_slice(&(devices.len() as u32).to_le_bytes());
-        off += 4;
-
-        for d in &devices {
-            // name_len, major, minor, slot_index, then the nine dev_info words.
-            let need = 16 + 4 * NV_DEV_INFO_WORDS + d.name.len();
-            if off + need > buf.len() {
-                log::warn!("DRI section truncated at {}", d.name);
-                break;
-            }
-            for v in [d.name.len() as u32, d.major, d.minor, d.slot_index]
-                .into_iter()
-                .chain(d.dev_info)
-            {
-                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-                off += 4;
-            }
-            buf[off..off + d.name.len()].copy_from_slice(d.name.as_bytes());
-            off += d.name.len();
-        }
-        off
+        encode_dri_devices(&devices, buf)
     }
 
     /// The render nodes the host's GPUs own.
@@ -474,6 +451,7 @@ impl NvidiaBackend {
     /// device forwards compute and render; handing one out would be a
     /// different kind of access than the guest asked for.
     pub(super) fn dri_devices(&self) -> Vec<DriDevice> {
+        let layout = self.devinfo.map(|s| s.layout);
         let mut out = Vec::new();
         for (index, slot) in crate::host::gpu_slots(std::path::Path::new(FileTree::Proc.root()))
             .iter()
@@ -514,25 +492,30 @@ impl NvidiaBackend {
                     log::warn!("DRI node {name}: cannot read {text:?} as major:minor");
                     continue;
                 };
-                let dev_info = host_dev_info(&format!("/dev/dri/{name}")).unwrap_or_else(|| {
-                    // Same shape the guest used to invent, so a refusal is no
-                    // worse than the old behaviour -- but it is logged above.
-                    let mut fallback = [0u32; NV_DEV_INFO_WORDS];
-                    fallback[3] = 1; // supports_alloc
-                    fallback[4] = 6; // generic_page_kind
-                    fallback[5] = 2; // page_kind_generation
-                    fallback[6] = 1; // sector_layout
-                    fallback[7] = 1; // supports_sync_fd
-                    fallback[8] = 1; // supports_semsurf
-                    fallback
-                });
+                let dev_info = layout
+                    .and_then(|l| host_dev_info(&format!("/dev/dri/{name}"), &l))
+                    .unwrap_or_else(|| {
+                        // Same shape the guest used to invent, so a refusal is
+                        // no worse than the old behaviour -- but it is logged
+                        // above (or the release has no layout, which the
+                        // backend refuses to start on).
+                        abi::devinfo::DevInfo {
+                            supports_alloc: 1,
+                            generic_page_kind: 6,
+                            page_kind_generation: 2,
+                            sector_layout: 1,
+                            supports_sync_fd: 1,
+                            supports_semsurf: 1,
+                            ..Default::default()
+                        }
+                    });
                 log::info!(
                     "DRI {name} at {major}:{minor} on {addr} (slot {index}, \
                      nvidia gpu_id {:#x}, page kind {}/{}, sector layout {})",
-                    dev_info[0],
-                    dev_info[4],
-                    dev_info[5],
-                    dev_info[6],
+                    dev_info.gpu_id,
+                    dev_info.generic_page_kind,
+                    dev_info.page_kind_generation,
+                    dev_info.sector_layout,
                 );
                 out.push(DriDevice {
                     name,
@@ -544,5 +527,96 @@ impl NvidiaBackend {
             }
         }
         out
+    }
+}
+
+/// The DRI section's bytes: a count, then per device `{name_len, major, minor,
+/// slot_index, dev_info}` and the name. `dev_info` is
+/// [`abi::devinfo::DevInfo::to_wire`], one word per field in one order,
+/// whatever the host release's own struct looks like.
+pub(super) fn encode_dri_devices(devices: &[DriDevice], buf: &mut [u8]) -> usize {
+    if buf.len() < 4 {
+        return 0;
+    }
+    let mut off = 0;
+    buf[off..off + 4].copy_from_slice(&(devices.len() as u32).to_le_bytes());
+    off += 4;
+
+    for d in devices {
+        // name_len, major, minor, slot_index, then the dev_info record.
+        let need = 16 + 4 * abi::devinfo::FIELDS + d.name.len();
+        if off + need > buf.len() {
+            log::warn!("DRI section truncated at {}", d.name);
+            break;
+        }
+        for v in [d.name.len() as u32, d.major, d.minor, d.slot_index]
+            .into_iter()
+            .chain(d.dev_info.to_wire())
+        {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            off += 4;
+        }
+        buf[off..off + d.name.len()].copy_from_slice(d.name.as_bytes());
+        off += d.name.len();
+    }
+    off
+}
+
+#[cfg(test)]
+mod dri_tests {
+    use super::*;
+
+    fn le(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// The guest reads the record by position, so a 565.77 host (eight words,
+    /// no `mig_device`) must reach it in the same nine slots a 615 host's does.
+    #[test]
+    fn the_record_is_in_one_order_whatever_the_host_release() {
+        let v565 = abi::devinfo::select(abi::version::DriverVersion::new(565, 77, 0)).unwrap();
+        let v615 = abi::devinfo::select(abi::version::DriverVersion::new(615, 71, 9)).unwrap();
+        // The same card, as each release's nvidia-drm would answer for it.
+        let from_565 = v565
+            .layout
+            .decode(&le(&[0x200, 1, 1, 6, 2, 1, 1, 1]))
+            .unwrap();
+        let from_615 = v615
+            .layout
+            .decode(&le(&[0x200, 0, 1, 1, 6, 2, 1, 1, 1]))
+            .unwrap();
+        assert_eq!(from_565, from_615);
+
+        let dev = |dev_info| DriDevice {
+            name: "renderD128".into(),
+            major: 226,
+            minor: 128,
+            slot_index: 0,
+            dev_info,
+        };
+        let (mut a, mut b) = (vec![0u8; 256], vec![0u8; 256]);
+        let n = encode_dri_devices(&[dev(from_565)], &mut a);
+        assert_eq!(n, 4 + 16 + 36 + "renderD128".len());
+        assert_eq!(encode_dri_devices(&[dev(from_615)], &mut b), n);
+        assert_eq!(a, b);
+        // gpu_id, mig_device, primary_index, supports_alloc, then the tiling.
+        let words: Vec<u32> = a[20..56]
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, [0x200, 0, 1, 1, 6, 2, 1, 1, 1]);
+    }
+
+    #[test]
+    fn a_section_that_does_not_fit_is_cut_between_records() {
+        let d = DriDevice {
+            name: "renderD128".into(),
+            major: 226,
+            minor: 128,
+            slot_index: 0,
+            dev_info: Default::default(),
+        };
+        let mut buf = vec![0u8; 4 + 16 + 36 + 9];
+        assert_eq!(encode_dri_devices(&[d], &mut buf), 4);
     }
 }
