@@ -943,6 +943,45 @@ unsafe fn dxgkddi_present_inner(
                 // copies it; `BltAsync` takes such a Blt out of this arm altogether.
                 let skip_mirror = entry.no_mirror;
                 if entry.async_enter {
+                    // `RmCopyEngine` 1 (M3c-2, one relaxed load otherwise): the copy-engine route
+                    // queues the copy as a deferred one whose dispatch the copy engine takes
+                    // (`ddi/ce_present_route.rs`); `None` leaves this Blt exactly as before.
+                    // SAFETY: as `try_async` below.
+                    if let Some(token) = unsafe {
+                        crate::ddi::ce_present_route::try_route(
+                            passive,
+                            adapter,
+                            args,
+                            present_context.as_ref(),
+                            source_desc,
+                            destination_desc,
+                            crate::ddi::ce_present_route::DstInfo {
+                                resource_id: destination.resource_id,
+                                width: destination.width,
+                                height: destination.height,
+                                pitch: destination.pitch,
+                                dxgi_format: destination_dxgi_format,
+                                alloc_size: destination.venus_alloc_size,
+                            },
+                            present_stream_boundary,
+                        )
+                    } {
+                        // 5: queued for the copy engine (its Venus copy is the fallback).
+                        crate::diag::record_named_bytes(b"PBCpy", 5);
+                        crate::diag::record_named_bytes(b"PBFnc", token as u32);
+                        return unsafe {
+                            present_complete(
+                                args,
+                                present_allocations,
+                                patch_capacity.take(),
+                                present_stream_boundary,
+                                present_arm,
+                                Some(adapter),
+                                src_info,
+                                dst_info,
+                            )
+                        };
+                    }
                     // SAFETY: `args` is dxgkrnl's present struct for this call (PASSIVE_LEVEL)
                     // and the capacity of its private data was validated above.
                     match unsafe {
@@ -1885,6 +1924,17 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 .ok()
                 .flatten();
             request.map(|mut request| {
+                // `RmCopyEngine` 1 (M3c-2, one relaxed load otherwise): the copy engine takes the
+                // copy when the request is one of its jobs and the job is ready; its completion
+                // terminalizes the token (`ddi/ce_present_route.rs`). Otherwise the request's
+                // Venus copy below, unchanged.
+                if crate::ddi::ce_present_route::dispatch(
+                    adapter,
+                    request.token,
+                    request.stream_boundary,
+                ) {
+                    return (request.token, request.stream_boundary, None, Ok(0));
+                }
                 // `GuestBlob`: a copy prepared into a guest buffer that is no longer its
                 // destination's copy target (retired by a paging operation since the Present)
                 // is prepared again into the destination's current target, and the request's

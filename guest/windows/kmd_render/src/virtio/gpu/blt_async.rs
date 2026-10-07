@@ -407,6 +407,39 @@ impl VirtioGpu {
         }
     }
 
+    /// The copy-engine Present route (`RmCopyEngine` 1, `ddi/ce_present_route.rs`): whether the
+    /// request `(token, stream_boundary)` still exists, and if so whether the worker dispatched
+    /// it. Spinlock only.
+    pub(crate) fn ce_blt_request(&self, token: u64, stream_boundary: u64) -> Option<bool> {
+        self.windowed_blt
+            .pending
+            .iter()
+            .find(|request| request.token == token && request.stream_boundary == stream_boundary)
+            .map(|request| request.dispatched)
+    }
+
+    /// The copy-engine route's completion of the dispatched request `(token, stream_boundary)`:
+    /// the copy engine wrote the destination's own pages (or, `ok` false, the copy was discharged
+    /// after its deadline). The request's ring completion with the mirror forced OFF whatever its
+    /// Venus fallback would have needed: the destination goes back to its readers at once, the
+    /// source's ledger ticket retires, the Level 5 edge is raised, the token terminalizes (the
+    /// Present's DMA fence waits for exactly that), and nothing is marked stale. Spinlock only.
+    pub(crate) fn complete_ce_blt(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+        token: u64,
+        stream_boundary: u64,
+        ok: bool,
+    ) {
+        let Some(request) = self.windowed_blt.pending.iter_mut().find(|request| {
+            request.token == token && request.stream_boundary == stream_boundary && request.dispatched
+        }) else {
+            return;
+        };
+        request.no_mirror = true;
+        self.complete_windowed_blt_ring(adapter, token, stream_boundary, ok);
+    }
+
     /// A request left `pending` (terminal, cancelled or abandoned).
     pub(super) fn blt_async_gone(&self, request: &WindowedBltPending) {
         if request.async_blt {

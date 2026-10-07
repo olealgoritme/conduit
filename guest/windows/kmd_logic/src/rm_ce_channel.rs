@@ -2040,7 +2040,10 @@ mod tests {
                     assert!(!text.contains("b\"RmCopyEngine\""), "{s} spells the knob name");
                     // The record's writer (M3c-0) spells only its own list, which
                     // `ce_record`'s exact-list test checks; none of these names.
-                    if crate::ce_record::WRITERS.iter().any(|w| s.ends_with(w)) {
+                    // So does the Present route's writer (M3c-2, `ce_route`'s exact-list test).
+                    if crate::ce_record::WRITERS.iter().any(|w| s.ends_with(w))
+                        || crate::ce_route::WRITERS.iter().any(|w| s.ends_with(w))
+                    {
                         for n in COUNTERS {
                             assert!(!text.contains(&std::format!("b\"{n}\"")), "{s} spells {n}");
                         }

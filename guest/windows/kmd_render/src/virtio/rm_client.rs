@@ -71,6 +71,10 @@ pub(crate) mod sysmem_flip;
 // and its hardware self-test. Independent of `KmdRmClient`.
 pub(crate) mod ce_channel;
 pub(crate) mod ce_selftest;
+// `RmCopyEngine` = 1 (M3c-2): the Present route's RM I/O, and the producer's dup and GPU mapping
+// (`ce_dup`, a stub here; the shadow mode's real module replaces it with the same surface).
+pub(crate) mod ce_dup;
+pub(crate) mod ce_route;
 
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -498,6 +502,9 @@ pub(crate) fn forget() {
     rm_present::reset();
     sysmem::forget();
     ce_channel::forget();
+    // The copy-engine route's destinations: the transport was reset, so nothing on the host
+    // names their pages any more; every pin goes (one load when there is none).
+    crate::ddi::ce_present_route::forget();
     // The next transport generation reads the knob again (once).
     KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }
