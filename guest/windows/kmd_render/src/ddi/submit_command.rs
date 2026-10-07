@@ -327,7 +327,7 @@ pub(crate) fn publish_nvrm_counters() {
     // The copy-engine Present record behind a fenced marker (M3c-0): `CeRec*`, written once a
     // fenced marker was seen.
     crate::ddi::ce_record::publish_counters();
-    // The display submit stages (`Sub*`, docs 24.13), written once a display submit was measured.
+    // The display submit stages (`Sub*`, docs 24.14), written once a display submit was measured.
     crate::virtio::submit_stage::publish_counters();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.

@@ -1160,7 +1160,8 @@ full zero block once per generation even if nothing is ever seen.
 | `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
 | `MsiMode`, `MsiLatch` | AddDevice (`virtio::msi::apply_key_policy`; `MsiLatch` also at transport up) | not cached | `MsiModeEff`, `MsiWant`, `MsiKeyWr` (the device-key write), `MsiLatch` (0 or 1) |
-| `SubmitPool` (24.14) | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `SubPoolOn` (every start) |
+| `SubmitPool`, `SubStageClk` (24.14) | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `SubPoolOn`, `SubClkOn` (every start) |
+| `SubKickUnlock` (24.14.10) | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` (`KickState`) | `SubKickUnl` (every init; 1 only with the doorbell located) |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `VsPowerMode`, `VsWatchdog`, `VsIdleWake`, `VsWdTimer` (15.4, 19.3) | StartDevice (`stall_diag::reread_knobs`) | static | `VsPwrEff`, `VsWdgEff`, `VsIdlEff`, `VsWdTmEff` (every start, 0 included) |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
@@ -3648,6 +3649,7 @@ the mirror thread's cadence and zeroed at every start). The stages are, in order
 | Drain | `SubDrain` | `drain_used` before the enqueue |
 | Enq | `SubEnq` | the enqueue: descriptors, avail-ring publish, in-flight record, minus the notify |
 | Kick | `SubKick` | `transport.notify` (the doorbell, a VM exit), timed inside `publish_then_notify` by a timer the display submitter arms in its own lock hold (`KickTimer`; every other enqueue pays one `armed` test) |
+| Prep | `SubPrep` | work of the submit before its staging: the foreign flip's mint and request build (24.14.9); 0 on the display paths |
 
 Also written: `SubTotal` / `SubTotMax` (whole submit, total and longest, us), `SubN` (submits measured, every call),
 `SubAllocN` (fresh allocations), `SubPoolHit` (buffers taken from the pool), `SubNoKick` (enqueues whose notify the device
@@ -3730,7 +3732,7 @@ Run `SubmitPool=0` and then `SubmitPool=1` in the same boot, and compare per sub
 
 #### 24.14.8 Where the code is, verified and not
 
-* Pure: `kmd_logic/src/submit_stage.rs` (`Clock`, `KickTimer`, `plan`, `fresh_count`, `COUNTERS`, the name scans; 12 tests).
+* Pure: `kmd_logic/src/submit_stage.rs` (`Clock`, `KickTimer`, `plan`, `fresh_count`, `COUNTERS`, `TABLE_NAMES`, the name scans; 13 tests).
 * I/O: `kmd_render/src/virtio/submit_stage.rs` (atomics, publication, knob mirror). `virtio/ctrl.rs`: `stage_display_submit`
   (the pool), `measured`, `display_enqueue` (the drain, enqueue and kick timing). `virtio/gpu/mod.rs`: `publish_then_notify`
   (kick timer), `used_pending`. The knob is in `diag.rs` and `adapter/mod.rs` (`AdapterKnobs::submit_pool`).
@@ -3738,6 +3740,142 @@ Run `SubmitPool=0` and then `SubmitPool=1` in the same boot, and compare per sub
   with no new error against the base (a deliberate error planted in each edited file was reported).
 * NOT verified: anything on hardware. In particular, the size of each stage, and that the pool hit rate stays high under the
   escape path's load.
+
+#### 24.14.9 First hardware run (349.1), and the foreign flip
+
+The pool did what it was meant to do. Submit -> kick for the windowed Blt copy fell from 121.7 us to 21.1 us, and `SubAlloc`
+per submit fell from 96 us to 0.03 us. `SubKick` per submit is about 18.6 us, so the doorbell is now almost all of what is
+left. In the same run, the foreign flip's KMD submit -> backend kick rose from about 20 us to about 36 us. The flips (about
+2739 per Heaven run) were not instrumented, because they do not go through the display submitters.
+
+**The flip's submit path.** `foreign_flip::flip_async` (`virtio/foreign_flip.rs:1332`) calls
+`foreign_scanout::present_submit` (`virtio/foreign_scanout.rs:277`: mint, release-book entry, request build), which calls
+`ctrl::raw_submit_async` (`virtio/ctrl.rs:758`). That function does one `with_virtio` hold for `begin_parked_reap` and
+`take_dma_buffer(req + 32)`, then the PASSIVE reap, then a pool miss's allocation, then one `with_virtio` hold for `drain_used`
+and `enqueue_raw_async`. The enqueue ends in `publish_then_notify` (`virtio/gpu/mod.rs:3339`), which rings the doorbell under
+`virtio_lock`. The flip's buffer goes straight back to the pool in the drain's `RawAsync` arm (`virtio/gpu/mod.rs:5033`).
+
+**Why the pool change could slow it (by reading).**
+
+* **It does not starve the flip of buffers.** The flip shares the pool, but it returns its buffer at its own completion, and
+  the display paths return theirs through the reap. The pool hit rate of the display paths is about 100 %.
+* **A larger pooled buffer costs nothing.** It is not zeroed, and the descriptor names only the request length.
+* **The take+reap hold did not grow materially.** The display path's take hold is `begin_parked_reap` plus two best-fit takes.
+  Each take stops at the first page-sized buffer, and the pool is full of them, so the hold is about the old reap's own begin
+  hold. The recycle and finish holds are unchanged. So shortening the take (moving it outside the lock, or a free list per
+  class) would not buy the flip's 16 us, and I did not do it.
+* **The doorbell inside `virtio_lock` is the likely cause.** It costs about 18.6 us (a VM exit), and every submitter rings it
+  while holding `virtio_lock`. Before the pool, the Blt submit spent about 95 us allocating outside the lock, and its short
+  locked enqueue+kick happened at some other moment. Now the whole Blt submit is about 21 us. Its locked kick lands in the same
+  short window after a frame in which the HPD worker submits the flip, so a flip that meets it spins on `virtio_lock` for up to
+  one kick, about 18 us. That is the size of the regression. The instrumentation itself is the other candidate: five
+  interrupt-time reads inside the hold (the `Lock`, `Drain` and `Enq` laps, and the two kick stamps). `SubClock` says what one
+  read costs.
+
+**Instrumented now.** The flip runs under the same stage clock (`Path::Flip`). `Prep` is the mint and the request build, and
+the staging and the enqueue hold are timed as for the display paths. It is NOT in the aggregate `Sub*` totals, which remain the
+four display submitters' totals and are comparable with 349.1. It has its own table, and the windowed Blt gets one too
+(`kmd_logic::submit_stage::TABLE_NAMES`, written by `virtio/submit_stage.rs`, covered by the same name scans):
+
+| Row | Names (total us unless noted) |
+|---|---|
+| windowed Blt | `SubWPrep` `SubWReap` `SubWTake` `SubWAlloc` `SubWLock` `SubWDrain` `SubWEnq` `SubWKick` `SubWTot` `SubWTotMax` `SubWN` (count) |
+| foreign flip | `SubFPrep` `SubFReap` `SubFTake` `SubFAlloc` `SubFLock` `SubFDrain` `SubFEnq` `SubFKick` `SubFTot` `SubFTotMax` `SubFN` (count) |
+
+The aggregate gained `SubPrep` (0 on the display paths).
+
+**New knob, `SubStageClk`** (default 1; `diag::knobs::SUBMIT_STAGE_CLOCK`, mirrored as `SubClkOn`). With 0, no interrupt time
+is read on any submit path, and only the counts run (`SubN`, `SubWN`, `SubFN`, `SubAllocN`, `SubPoolHit`). This is the A/B
+for the clock's own cost inside the lock.
+
+**What to read next (divide each total by its row's `N`).**
+
+* `SubWTot / SubWN` should be about 21 us, with `SubWKick` about 18.6 us and `SubWAlloc` about 0. This confirms 349.1 for the
+  windowed path alone.
+* `SubFTot / SubFN` should be about 36 us. If the lock-wait hypothesis holds, `SubFLock / SubFN` is about 15 us, `SubFKick /
+  SubFN` about 18 us, and `SubFTake + SubFReap + SubFAlloc` under 2 us in all (the pool is not the cause). A large `SubFTake`
+  or `SubFAlloc` would point at the pool after all. A large `SubFPrep` points at the mint, which this change did not touch.
+* `SubClock / (SubN + SubFN)` is the cost of one pair of reads. If it is more than about 0.5 us, rerun with `SubStageClk=0`.
+  If the flip's submit -> kick in the joined table then returns to about 20 us, the regression was the clock.
+* **If `SubFLock` carries it, the fix is the doorbell outside the lock**, split the way Linux splits kick-prepare and notify:
+  decide `should_notify` under the lock and ring after the release. That fix needs a reference that keeps the transport
+  generation (its notify BAR mapping) alive across the release against a concurrent StopDevice, so it is a separate, reviewed
+  change, not part of this one. Expected after it: both the flip and the Blt pay their own kick (about 18 us) and never each
+  other's.
+
+#### 24.14.10 The doorbell after the lock (`SubKickUnlock`)
+
+24.14.9 read the flip's regression as a wait on `virtio_lock` while another submitter rang its doorbell. `PciTransport::notify`
+makes three MMIO accesses, each a VM exit: it writes `queue_select` and reads `queue_notify_off` in the shared common
+configuration, then writes the notify register. Because of those first two accesses it may only run under the lock. The doorbell
+is now rung after the release, in the one place every display submitter and the pipelined flip share
+(`ctrl::display_enqueue`, deciding through `VirtioGpu::publish_then_notify`). It is a single MMIO write to the control queue's
+notify register, which is located once at transport init (`gpu/mod.rs` `locate_ctrl_doorbell`: the NOTIFY_CFG and COMMON_CFG
+capabilities, mapped with their own lengths so the MMIO cache returns the transport's own mappings). The pure rules and
+their model tests are in `kmd_logic::kick_defer`.
+
+**The ordering, for one submit that rings late.**
+
+1. Descriptors and the avail ring slot are written under `virtio_lock`.
+2. The avail index is stored with Release.
+3. A **full fence** follows, then the suppression check (`VIRTQ_USED_F_NO_NOTIFY` or the event index), still under the lock.
+   This is virtio 1.x 2.7.13.3 and Linux `virtqueue_kick_prepare`. Release/Acquire does not order a store before a later
+   load. Without the fence, the check could read a stale "do not notify" from before the index store, and the wake of a
+   device that had just re-enabled notifications and found the old index would be lost.
+4. If a notify is owed, the guard's pending count is incremented (`kick_defer::begin`) and the hold's owed slot is set.
+5. The lock is released.
+6. The guard is checked (`may_ring`). The doorbell is written, or the kick is dropped if the transport is closing.
+7. The pending count is decremented (`end`), strictly after the write.
+
+**Two submitters.** Notifications carry no payload for a split ring, so a doorbell after the last publish covers every
+earlier one. If A and B both owe a ring, either may ring first. Each ring comes after its own publish, and the later ring
+comes after both publishes. A hold that publishes twice owes one ring. The model test explores every interleaving of two
+submitters with the device's "enable notifications, then re-check" loop and finds no lost wake. The same model with the check
+moved before the index store, which is what a missing fence permits, does lose one. That proves the model can see the bug.
+
+**Teardown.** `VirtioGpu::drop` first closes the guard (`close`). Then it waits, bounded (spins, then up to 8 sleeps of about
+16 ms), for the pending count to drain. Only then does it reset the device and free the state. A late kick that finds the
+guard closed is dropped (`SubKickDrop`): the device is reset next and nothing published will be answered. If a kicker
+stalls past the budget, the state is leaked rather than freed (`SubKickLeak`). The kicker's `end` then touches live memory,
+and its doorbell is a write to the transport's notify register. That register stays mapped until driver unload (BAR
+mappings are cached for the driver's lifetime, see `Drop`), so a late write reaches a reset queue, which ignores it.
+
+**Unchanged.** Every staging-buffer lifetime rule (24.14.3), the per-path counters, and every other `with_virtio` caller:
+those never arm the late ring, so they ring under the lock as before. With the knob at 0 the old block runs exactly, without
+the new fence. That pre-existing missing fence is also present in the locked path; this change does not touch it, so that
+0 stays the old behaviour.
+
+**Knob.** `SubKickUnlock` (REG_DWORD, default 1; `diag::knobs::SUBMIT_KICK_UNLOCK`; the requested `SubKickUnlocked` is 15 bytes
+and would not survive the 14-byte lookup buffer). It is read at every transport init and mirrored as `SubKickUnl`, which is
+1 only when the doorbell was also located; otherwise the setting in force is "locked".
+
+**Counters** (`kmd_logic::kick_defer::COUNTERS`, written by `virtio/ctrl.rs` at most once a second after a late ring):
+
+* `SubKickLate`: doorbells rung after the release.
+* `SubKickDrop`: kicks dropped by a closing transport.
+* `SubKickGap`: microseconds in all from the publish to the doorbell write (rest of the hold, release, ring; only with
+  `SubStageClk` 1).
+* `SubKickWait` / `SubKickLeak`: teardowns that waited for a pending kick / that gave up waiting and leaked the state. These
+  are written on the next late ring after the restart.
+
+**What to read on hardware** (Heaven windowed; `SubKickUnlock=0` first, then 1, same boot):
+
+* `SubKickUnl` is 1, and `SubKickLate` grows with `SubNWin + SubNBlt + SubNScan + SubNPres + SubFN` (minus suppressed
+  notifies). `SubKickDrop` and `SubKickLeak` stay 0 outside a restart.
+* `SubWKick / SubWN` and `SubFKick / SubFN` drop from about 18 us to the cost of one MMIO write (one exit, expected about a
+  third of the old cost), and that time is now spent outside the lock.
+* `SubFLock / SubFN` falls to about 0-2 us, because nobody holds the lock across a doorbell any more. `SubWLock` falls the
+  same way.
+* In the joined table, the flip's submit -> kick returns to about 20 us or less, and the windowed Blt's falls below its 21 us.
+* `SubKickGap / SubKickLate` is a few us (the tail of the hold plus the release). If it grows to tens of us, the submitter is
+  being preempted between the release and the ring.
+* With `SubKickUnlock=0` every number is as in 24.14.9.
+
+**Risks.** The doorbell location duplicates `pci_caps.rs`'s capability walk inside `gpu/mod.rs`, so this change stays in the
+transport. Move it into `pci_caps.rs` after the merge. If the doorbell cannot be located exactly, the knob degrades to the
+locked path and `SubKickUnl` reads 0. A late doorbell can reach the device after a later submitter's locked doorbell, which
+is harmless (an extra notify). Teardown can wait up to about 130 ms if a kicker is preempted inside its window, and is
+otherwise unchanged.
 
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
