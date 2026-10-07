@@ -1159,6 +1159,7 @@ full zero block once per generation even if nothing is ever seen.
 | `DmaGpuFence`, `PresentWmk`, `WddmHoldMs`, `WddmHeadMs` | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` fields / statics | `DmaGfEff`, `PrWmkEff`, `WdHoldEff`, `WdHeadEff` (new) |
 | `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
+| `MsiMode`, `MsiLatch` | AddDevice (`virtio::msi::apply_key_policy`; `MsiLatch` also at transport up) | not cached | `MsiModeEff`, `MsiWant`, `MsiKeyWr` (the device-key write), `MsiLatch` (0 or 1) |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `VsPowerMode`, `VsWatchdog`, `VsIdleWake`, `VsWdTimer` (15.4, 19.3) | StartDevice (`stall_diag::reread_knobs`) | static | `VsPwrEff`, `VsWdgEff`, `VsIdlEff`, `VsWdTmEff` (every start, 0 included) |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
@@ -3749,3 +3750,149 @@ StopDevice disable does not lengthen a restart (it is bounded by the StopDevice 
 anything on hardware. Two statements elsewhere are wrong across an image reload: the doc comment of
 `reset_display_publication_state` and the row "TRANSPORT_SERIAL, NEXT_WIRE_FENCE_BASE: monotonic, KEPT" of section 20.4. Both restart at
 zero with the image, which the salt now covers.
+
+## 26. DWM restart and stale Explorer
+
+Symptom (win11 tester): after `dwm.exe` is killed and restarts (the DWM device is destroyed and a new one created),
+Explorer does not repaint: the taskbar clock stays frozen and the desktop icons are missing until `explorer.exe` is
+restarted. Question: can the KMD's handling of a DWM device teardown and recreate leave Explorer's redirected surfaces
+stale or unpresented?
+
+Status: STATIC analysis only; no hardware run, no WDK build. Nothing below is a measured cause. This change ships
+(a) a ranked list of hypotheses with the counter signature each would leave (26.2), (b) the `Dw*` breadcrumb block that
+settles them on the next run (26.4), (c) one fix of a defect that is certain against the code's own stated invariant but is
+not proven to be the cause (26.3, hypothesis 3), (d) the checklist (26.6).
+
+### 26.1 What a DWM device teardown does in the KMD, and what it clears
+
+`DxgkDdiDestroyDevice` (`device.rs` `dxgkddi_destroy_device`) runs for the killed DWM's device, after dxgkrnl closed its
+opens and destroyed its allocations and contexts. In order: end a foreign scanout source the device held
+(`foreign_scanout_owner_exit`: the `ForeignFlip` records, the shown target, the scanout-release book; `ForeignFlip` and the
+foreign scanout are off or absent in a Venus-only run); drain the user mappings; the read-ledger event registrations; the
+producer bindings; purge the present-stream slots of the owner (`purge_present_streams_for_owner`); release the blobs the
+device owned (`release_blobs_for_owner`); `CTX_DESTROY` every Venus context it owned (`destroy_contexts_for_owner`); close
+its NVRM handles; free the `DeviceContext` box.
+
+`DeviceOwner` is the address of that box, so a new DWM device can get the same token. Audited table by table: every
+structure keyed by the token is cleared before the box is freed (present-stream slots keep no owner once `closing`; rm gates
+are keyed by process and purged at `DestroyProcess`; the present-buffer and foreign-open tables are released at
+`CloseAllocation`), so the aliasing is not a mechanism (`DwReuse` counts it anyway, 26.4). `CommitVidPn`,
+`SetVidPnSourceVisibility` and `UpdateActiveVidPnPresentPath` hold no scanout state (`ddi/display.rs`). A destroyed primary
+cancels a deferred `pending_vidpn_allocation` handle and lowers its programming gate under the scanout lock
+(`retire_scanout_allocation_locked`, `adapter/scanout.rs`, `VpCncl`), so neither is left raised or stale. `CrossAdaptCaps`
+is a knob snapshotted at AddAdapter and constant across a restart (`ddi/query_adapter_info.rs`, the comment at 638): it can
+only explain a Blt-model swap chain that never calls `DxgkDdiPresent`, not a restart-specific freeze.
+
+### 26.2 Ranked hypotheses
+
+| # | hypothesis | verdict | where | what the counters show |
+|---|---|---|---|---|
+| 1 | The dead DWM left a present buffer pinned. A buffer the DWM claimed for read stays `Consumer(boundary)` until its stream slot retires; a slot with claimed or in-flight work only goes `closing` at `DestroyDevice` and is finalized by `finalize_closed_present_streams_for_context` only after a SUCCESSFUL host `CTX_DESTROY`. A timeout or error skips the finalize and nothing retries (the context is already out of the table). The buffer is then busy for every writer, and `take_ready_windowed_blt` returns `None` for a busy head destination while keeping FIFO ownership, so one pinned destination holds every windowed Blt of every process (Explorer's included) until the 64-entry token table is full | POSSIBLE; needs a slow or failed `CTX_DESTROY` while DWM had work in flight | `virtio/ctrl.rs` `ctx_destroy_within`, `destroy_contexts_for_owner`; `virtio/gpu/mod.rs` `close_present_stream_slot`, `finalize_closed_present_streams_for_context`, `try_begin_present_buffer_write`, `take_ready_windowed_blt`; the legacy arm `virtio/ctrl.rs` `begin_present_buffer_write_legacy` (about 5 s, then `STATUS_DEVICE_NOT_READY`, site 25 for an ordinary allocation) | `DwCtxFail` > 0; `DwPsClose` > 0 and `DwPbCons` > 0 that do not fall in the follow-ups; `DwPbConsDd` > 0 (claimed through a dead stream: never writable); `DwWbHead` 3, 4 or 5; `DwWedge` nibbles repeating 1, 2 or 3; `DwWrBusy` / `DwRdBusy` rising; legacy arm: `PBRet` 0xC00000A3, `PBRetSite` 25, `PBOwn` 0xE1; two-phase arm: `PBCpy` stays 2, `PBRet` stays 0 until `DwWbPend` reaches 64, then site 24 |
+| 2 | A skip that succeeds hides the damage: an unresolved Blt handle (`PrUnres`) or a `ColorFill` with no source (`PrColFill`) completes without writing the destination, dxgkrnl and DWM believe it was updated, nothing is re-sent. A handle that never resolves (an open of an older generation, or one that recorded no identity) leaves its surface stale for good | LIKELY to exist (T2 saw `PBCpy` 225 on a restarted DWM's first presents); unproven as THE cause | `ddi/display.rs` Blt arm and `present_blt_skipped`; `ddi/present_foreign.rs` `unresolved_skip`; `ddi/create_allocation.rs` `present_alloc_cause`, `read_alloc_identity` | `DwPrUnr` / `DwPrCol` rising; `DwUnrSrc` / `DwUnrDst` name the cause per side (byte 0 null, 1 not ours (`OaBadH`), 2 older generation (`PgStale`), 3 no identity; `DwOpNoId` / `DwOpNoIdSz` say whether opens recorded none); `DwRunMax` large with `DwPrOk` 0 or flat = a surface that never gets a copy; `DwOkMs` = how long until the first copy |
+| 3 | Destroying a WDDM allocation that only IMPORTS the adapter-owned LINEAR scanout target (a DWM generation that is gone) retired its resource id from the host scanout: `SET_SCANOUT_BLOB(0)`, `active_scanout_resource` and the refresh state cleared, leases ended, no bind until dxgkrnl's next `SetVidPnSourceAddress`. The code says an importer must not do that (`forget_primary_scanout` and `destroy_allocation_ctx` comments) and guarded the other steps, not this one | CERTAIN defect against the stated invariant; effect on Explorer UNPROVEN (a flip-model DWM rebinds at its first flip; a Blt-model one does not flip); FIXED here (26.3) | `ddi/create_allocation.rs` `destroy_allocation_ctx`; `adapter/scanout.rs` `retire_scanout_allocation_locked`; `ddi/hpd.rs` `ScanoutRefreshQueue::Unavailable` (drops the dirty bit) | before the fix: `ScRet` equal to `CpRid` right after the kill, `DwActRes` 0, `DwRfPost` flat, `DwUnavPost` rising (`ScUnav` is only mirrored after a Queued refresh, so it was invisible in exactly this state); after: `DwImpDest` > 0 with `DwActRes` still `CpRid` |
+| 4 | The new DWM cannot open what a client shares: `OpenAllocation`'s liveness gate (C1) refuses an identified allocation whose resource is no longer alive (`STATUS_INVALID_PARAMETER`); a blob swept as the dead device's, with another context still attached through `ATTACH_RESOURCE`, would do it | POSSIBLE, narrow (adopted allocation blobs are re-owned to the KMD and are safe) | `ddi/create_allocation.rs` `dxgkddi_open_allocation` (the gate near 3985); `virtio/ctrl.rs` blob sweep | `DwOpFail` > 0 with `DwOpFailId` (the ring record `0x0C02_00E4` had no named counter) |
+| 5 | The new DWM's first flips are refused or never retire: `SetVidPnSourceAddress` returns `STATUS_INVALID_PARAMETER` when the handle pairs with nothing (a NULL or stale handle from win32k's GDI fallback primary is not understood) | UNVERIFIED, low (the kept address, `FkDdi`, completes the flip) | `ddi/display.rs` `dxgkddi_set_vidpn_source_address` | `DwFlipBad` > 0, `DwFlipN` flat, `FkDdi`, `FkWhy`, `VpPrF`, `FlipIss` against `FlipPub` |
+| 6 | Not the KMD: Explorer's DirectComposition / XAML surfaces are not presented through `DxgkDdiPresent` at all (composition swap chains are a kernel redirect), and the shell's own recovery from a DWM restart is what fails | PLAUSIBLE; only the counters can clear this driver | none | `DwPrN` and `PBcall` flat while the clock should tick, with the census clear, `DwCtxFail` 0 and `DwOpFail` 0: the KMD is not in the path; compare with a WARP or bare-metal run of the same kill |
+| 7 | Ruled out by reading: `CrossAdaptCaps` (constant across a restart), `CommitVidPn` / `SetVidPnSourceVisibility` (no state), owner-token aliasing (every table cleared), the gate or the pending handle left raised (cancelled under the scanout lock), `ForeignFlip` / foreign scanout (default off; `owner_exit` ends the source and drops the shown target), the read ledger (a slot of a retired resource is re-issued on its next use) | | | |
+
+What is NOT known and decides between 1, 2 and 6: whether Explorer's updates reach `DxgkDdiPresent` after the restart, and by which arm
+(legacy Blt, two-phase windowed snapshot, neither). `DwPrN`, `DwPrOk`, `DwPrSkip` and `PBCpy` answer it.
+
+### 26.3 What changed in behaviour
+
+One change. `destroy_allocation_ctx` computes `retire_id = helios_kmd_logic::dwm_restart::importer_retire_id(resource_id,
+dedicated_scanout_resource)`: `0` for an allocation that carries the adapter-owned scanout target's id, the resource id for
+every other allocation (so every non-importer destroy is byte-identical to v325). `retire_scanout_allocation` then retires
+that importer by HANDLE only (it still cancels a deferred `SetVidPnSourceAddress` naming it and lowers the gate, and touches
+no host state), and the registration it withdraws is looked up by handle, not by id, so it cannot remove the registration an
+owner of the same id holds. `DwImpDest` counts the skips. The host keeps showing the last frame until the next bind instead
+of going blank; the host resource and image were already kept (`CpKeep`). Host test:
+`dwm_restart::tests::an_importer_of_the_scanout_target_retires_by_handle_only`.
+
+Not changed, deliberately: a retry of `CTX_DESTROY` for closing stream slots (hypothesis 1). The slots are fail-closed on
+purpose (a consumer may still be reading the buffer on the host), and a retry queue is a new lifecycle that should be built only
+if `DwCtxFail` proves the failure happens. `ColorFill` is still a no-op (implementing it needs the colour, the sub-rectangles
+and a host or CPU write of the destination: new host-visible behaviour, not a blind change).
+
+### 26.4 The `Dw*` block
+
+Names are the single table in `helios_kmd_logic::dwm_restart` (`NAMES`; a host test pins at most 14 characters, unique,
+`Dw` prefix; a scan of every `b"..."` literal in `kmd_render` and `kmd_logic` found none of them in use). The words are
+atomics (the flip word at DIRQL, the Present words at PASSIVE); the registry is written only at PASSIVE, and only words that
+changed since the last mirror. K = cumulative since StartDevice, W = WINDOW (zeroed at the ENTRY of every `DestroyDevice`;
+read right after the restart with no other GPU process starting or stopping: `DwDevDel` says if another device died), L = the
+last value.
+
+Mirror points: the end of `DestroyDevice`; the HPD worker (three follow-up censuses about 2 s apart, and whenever an event asks
+for a mirror through `request_publish`, the same worker pass as the `Nv*` mirror, within 250 ms); `publish_nvrm_counters`; and
+a zero block at StartDevice.
+
+| word | kind | meaning |
+|---|---|---|
+| `DwDevNew`, `DwDevDel` | K | `CreateDevice` / `DestroyDevice` calls |
+| `DwReuse` | K | a device created at the address of one of the last four destroyed (owner-token aliasing evidence) |
+| `DwDelMs`, `DwDelMsMax` | L, K | the last and the longest `DestroyDevice`, ms (the blob and context sweeps are host round trips of up to 30 s) |
+| `DwDelBlob`, `DwDelCtx`, `DwDelStrm` | L | blobs, contexts and present streams the last destroy reclaimed or purged |
+| `DwCtxFail` | K | `CTX_DESTROY` round trips that did not confirm (hypothesis 1: the slots stay `closing`) |
+| `DwCtxFin` | K | closing stream slots finalized by a successful `CTX_DESTROY` |
+| `DwImpDest` | K | importers of the scanout target destroyed with the host unbind skipped (hypothesis 3) |
+| `DwPbExt`, `DwPbCons`, `DwPbConsDd`, `DwPbWr` | L | census: present buffers idle / claimed by a consumer / of those through a stream that is not live / held by the KMD writer or mirror |
+| `DwPsLive`, `DwPsClose` | L | present-stream slots live / closing |
+| `DwWbPend`, `DwWbReady` | L | windowed Blt requests pending / READY queue length |
+| `DwWbHead` | L | why the READY head does not go: 0 empty, 1 stale token, 2 not admitted, 3 boundary pending (stream live), 4 boundary dead, 5 destination busy, 6 ready (the next pass dispatches it) |
+| `DwWedge` | W | the verdicts of the last four censuses, one nibble each, newest low: 0 clear, 1 a buffer claimed through a dead stream, 2 closing stream slots, 3 head blocked (3, 4 or 5 above), 4 a buffer held by the KMD. Transient states read the same in the first census; a wedge repeats in the follow-ups |
+| `DwCenN` | W | censuses taken since the destroy (1 at the end of it, up to 4) |
+| `DwPrN`, `DwPrFail` | W | `DxgkDdiPresent` calls / failures |
+| `DwPrOk`, `DwPrSkip`, `DwPrUnr`, `DwPrCol` | W | Blts copied or queued / completed without a copy, any reason / of those an unresolved handle / of those a no-source `ColorFill` |
+| `DwOkMs`, `DwUnrMs`, `DwFlipMs` | W | ms from the destroy to the first copied Blt / unresolved Blt / flip, PLUS ONE (0 = it did not happen) |
+| `DwRunNow`, `DwRunMax` | W | Blts skipped in a row right now / the longest run with no copy between |
+| `DwUnrSrc`, `DwUnrDst` | W | unresolved SOURCE / DESTINATION causes, a saturating byte each: byte 0 null slot, 1 not ours, 2 older generation, 3 no identity |
+| `DwUnrAdp` | W | Blts whose adapter did not resolve |
+| `DwFlipN`, `DwFlipBad` | W | `SetVidPnSourceAddress` calls / those refused for a handle that pairs with nothing |
+| `DwOpFail`, `DwOpFailId` | W | `OpenAllocation` refusals by the liveness gate, and the last resource id |
+| `DwOpNoId`, `DwOpNoIdSz` | W | opens that recorded no identity, and the private data sizes of the last (`entry \| call << 16`) |
+| `DwActRes` | L | the resource bound to the host scanout at the end of the destroy (0 = nothing bound) |
+| `DwRfPost`, `DwUnavPost` | derived | refreshes queued / refreshes dropped for an unbound scanout since the destroy (as fresh as the worker's last pass) |
+| `DwWrBusy`, `DwRdBusy`, `DwSyncRej`, `DwRdClaim` | K | `PRESENT_BUFFER_WRITE_BUSY`, `_READ_BUSY`, `_SYNC_REJECTS`, `_READ_CLAIMS`, which existed and were never mirrored |
+
+### 26.5 Reading it
+
+| pattern after the kill and restart | means |
+|---|---|
+| `DwCtxFail` > 0, `DwWedge` low nibbles 1 or 2 in two follow-ups, `DwPbConsDd` or `DwPsClose` > 0, `DwWbHead` 3 to 5 | hypothesis 1: a pin the dead DWM left. Next: a retry of the unconfirmed `CTX_DESTROY` for closing slots, with a deadline |
+| `DwPrSkip` and `DwRunMax` large, `DwPrOk` 0 or `DwOkMs` 0, `DwUnrSrc` / `DwUnrDst` byte 3 or 2 | hypothesis 2 with cause "no identity" or "older generation": opens that cannot resolve. Read `DwOpNoIdSz`; check `OaBadH` and `PgStale` |
+| `DwPrSkip` = `DwPrCol`, `DwPrUnr` 0 | hypothesis 2, ColorFill only: a fill that matters is dropped; implement it |
+| `DwImpDest` > 0, `DwActRes` still `CpRid`, `DwRfPost` rising | hypothesis 3 happened and the fix held: the screen did not go blank |
+| `DwOpFail` > 0 | hypothesis 4: the new DWM cannot open a shared surface; `DwOpFailId` names the resource, compare with `DwDelBlob` |
+| `DwFlipBad` > 0, or `DwFlipN` 0 after `DwDevDel` | hypothesis 5 |
+| `DwPrN` flat for the whole freeze, census clear, `DwOpFail` 0, `DwCtxFail` 0 | hypothesis 6: the KMD is not in Explorer's path; run the same kill on WARP |
+| `DwReuse` 1 | the new device got the old token; with every other word clear it is a coincidence to rule out, not a cause |
+
+### 26.6 Hardware checklist, in order
+
+1. Win11 tester, Venus defaults (every knob off), the driver of this change. Boot, log in, let Explorer settle. Note `HELIOS_KMD_VERSION`.
+2. Read the service key once as the baseline: `DwDevNew`, `DwDevDel`, `DwCtxFail`, `DwImpDest`, `PrUnres`, `PrUnrWhy`, `PrColFill`, `PrFgSkip`, `PBRet`, `PBRetSite`, `PBCpy`, `PBcall`, `CpRid`, `ScRid`, `ScUnav`, `RfCnt`, `VpSA`, `FlipIss`, `FlipPub`.
+3. Kill `dwm.exe`, start nothing else, wait until the desktop is back (the clock frozen, the icons missing).
+4. Read after 5 s, then after 15 s (the follow-up censuses are at about 2, 4 and 6 s after the destroy; later changes mirror on events). Record every `Dw*` word and the set of step 2.
+5. Compare against 26.5. Write down `DwDelMs` (a long destroy is a long sweep) and `DwCenN`.
+6. Restart `explorer.exe` and read again: if Explorer recovers and every `Dw*` word stays as it was, the KMD held nothing for Explorer (hypothesis 6).
+7. Repeat once with a Vulkan app running through the kill and once with nothing, so a Venus-in-flight DWM (hypothesis 1) and an idle one are told apart.
+8. Report the counters, not the screen.
+
+### 26.7 Verified, and not
+
+Verified (host tests, `kmd_logic`): the name table (at most 14 characters, unique, `Dw` prefix, `ALL` in order); the destroyed-address
+ring (a reuse is counted once; the oldest of four is forgotten); the millisecond helpers (saturating, a zero means "never", the marker is
+plus one); the packed histogram (a saturating byte per cause, out of range ignored); `importer_retire_id`; the head blocker
+(the dispatch order of `take_ready_windowed_blt`, codes pinned); the census verdict and its history; the follow-up schedule.
+Type-checked: the whole `kmd_render` against the stub harness, with an injected error in the new file and in the touched
+`gpu/mod.rs` both reported, and the error set equal to the base (v325) apart from the counts of the stub's missing bindgen fields at the new use sites.
+
+NOT verified: anything on hardware; the WDK build; that dxgkrnl closes the dead DWM's opens before `DestroyDevice` on every path;
+whether the importer of the scanout target exists on the tester's DWM at all (`DwImpDest` says); what Explorer's updates call.
+
+Risks: `begin_destroy` zeroes the window for EVERY device that dies, so a short-lived GPU process exiting between the kill and the
+read resets it (`DwDevDel` shows it); the mirror at the end of `DestroyDevice` is a few dozen registry writes in a PASSIVE DDI that
+already does host round trips; the follow-ups keep the HPD worker waking every 250 ms for about six seconds after a destroy; the importer fix
+leaves the host scanout showing the old frame instead of blanking, which is the intended change but a visible one where a dead
+generation's destroy used to blank the screen for a moment.

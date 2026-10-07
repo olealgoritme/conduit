@@ -66,7 +66,7 @@ use super::gpu::{
     OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
     CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_CALLS, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT,
     FENCE_WAIT_TABLE_FULL,
-    FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
+    FENCE_WAIT_TIMEOUTS, RING_POPS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -224,7 +224,7 @@ pub(crate) fn sleep_ms(_passive: PassiveLevel, ms: u64) {
 /// 15.6 ms-granularity slice on the rare poll-hit, and correctness owns that
 /// trade.
 fn wait_block(
-    _passive: PassiveLevel,
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     block: &WaitBlockRef<'_>,
     total_ms: u64,
@@ -263,8 +263,21 @@ fn wait_block(
             return true;
         }
         bounded.expired(this_slice);
-        // Interrupt-loss tolerance: drain whatever completed.
-        let _ = adapter.with_virtio(|v| v.drain_used());
+        // Interrupt-loss tolerance: drain whatever completed. A drain that TOOK something is a
+        // "rescue": the completion was there and no interrupt (yet) had run the DPC for it. The
+        // count is taken inside the lock hold, so a pop by the DPC on another CPU is not
+        // mistaken for ours. In message mode a run of rescues with no interrupt between them
+        // is how a delivery that does not work is found (`virtio::msi::note_rescue`).
+        let rescued = adapter
+            .with_virtio(|v| {
+                let before = RING_POPS.load(Ordering::Relaxed);
+                v.drain_used();
+                RING_POPS.load(Ordering::Relaxed) != before
+            })
+            .unwrap_or(false);
+        if rescued {
+            super::msi::note_rescue(passive, adapter);
+        }
     }
 }
 
@@ -982,10 +995,15 @@ pub fn ctx_destroy_within(
                 })
                 .unwrap_or(0)
         });
+        crate::ddi::dwm_restart::note_streams_finalized(finalized);
         if finalized != 0 {
             crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
             adapter.signal_hpd();
         }
+    } else {
+        // The host did not confirm: the stream slots this context closed stay `closing`, and the
+        // consumer claims they carry stay pinned (nothing retries). `DwCtxFail`, and the census.
+        crate::ddi::dwm_restart::note_ctx_destroy_failed();
     }
     result
 }
@@ -1035,10 +1053,14 @@ pub fn destroy_contexts_for_owner(
                     })
                     .unwrap_or(0)
             });
+            crate::ddi::dwm_restart::note_streams_finalized(finalized);
             if finalized != 0 {
                 crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
                 adapter.signal_hpd();
             }
+        } else {
+            // As in `ctx_destroy_within`: unconfirmed, nothing retries.
+            crate::ddi::dwm_restart::note_ctx_destroy_failed();
         }
         destroyed += 1;
     }

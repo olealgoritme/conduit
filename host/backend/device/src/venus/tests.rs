@@ -151,6 +151,10 @@ impl Renderer for Shared {
     fn features(&mut self) -> u32 {
         self.mock.lock().unwrap().features()
     }
+    fn stages(&mut self, on: bool) -> conduit_venus::Result<Vec<conduit_venus::stage::Rec>> {
+        self.check()?;
+        self.mock.lock().unwrap().stages(on)
+    }
     fn import_dmabuf(
         &mut self,
         res_id: u32,
@@ -961,6 +965,55 @@ fn fences_release_by_timeline() {
     assert_eq!(t.venus.held(), 0);
 }
 
+/// Stage timing follows a fenced copy by its fence through the backend and
+/// the renderer, and asks nothing of the renderer while off.
+#[test]
+fn a_fenced_copy_is_stamped_by_its_fence() {
+    use conduit_venus::stage::*;
+    let _one = crate::stage::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut t = Rig::new();
+    t.ctx(77);
+    crate::stage::set_on(true);
+    t.completions(); // the renderer is told
+    let id = 0xC0FF_EE00_0000_0001u64;
+    let h = CtrlHdr {
+        ty: CMD_SUBMIT_3D,
+        flags: FLAG_FENCE | FLAG_INFO_RING_IDX,
+        fence_id: id,
+        ctx_id: 77,
+        ring_idx: 1,
+        padding: [0; 3],
+    };
+    assert!(matches!(
+        t.send_with(&submit_cmd(h, b""), None),
+        Outcome::Held(_)
+    ));
+    let done = t.completions();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].fence, (77, 1, id));
+    crate::stage::set_on(false);
+    t.completions(); // told off: its last stamps come back
+    let (recs, _) = decode_dump(&crate::stage::dump()).unwrap();
+    let mine: Vec<&Rec> = recs.iter().filter(|r| r.id == id && r.ctx == 77).collect();
+    for s in [H_DECODED, H_SUBMITTED, H_FENCE_ASKED, H_SIGNALLED, R_FENCE] {
+        assert!(
+            mine.iter()
+                .any(|r| r.stage == s && r.ring == 1 && r.kind == KIND_FENCE),
+            "{}",
+            name(s)
+        );
+    }
+    let at = |s: u8| mine.iter().find(|r| r.stage == s).unwrap().ts_ns;
+    assert!(at(H_DECODED) <= at(H_SUBMITTED) && at(H_SUBMITTED) <= at(H_FENCE_ASKED));
+    assert!(at(H_FENCE_ASKED) <= at(H_SIGNALLED));
+    assert!(
+        !t.r.mock.lock().unwrap().stage_on,
+        "the renderer was told off"
+    );
+}
+
 /// Fence ids are the guest's and need not increase: a signal completes its
 /// timeline in submission order up to the first held command with that id.
 #[test]
@@ -1530,4 +1583,51 @@ fn a_reset_turns_the_scanout_off_and_late_flushes_show_nothing() {
     assert_eq!(t.blob(1, 11, 1280 * 720 * 4), RESP_OK_NODATA);
     assert_eq!(t.send_on(&flush_cmd(11), Some(&link)).0.ty, RESP_OK_NODATA);
     assert_eq!(link.stats.sent.load(Relaxed), 1, "nothing shown");
+}
+
+/// `--latency fused-submit`: a fenced submit is held and signals exactly as
+/// without it; its refusals are the same answers.
+#[test]
+fn fused_submit_holds_and_refuses_like_two_calls() {
+    let mut t = Rig::new();
+    t.venus.set_fused_submit(true);
+    t.ctx(1);
+    t.r.hold_fences();
+    let Outcome::Held(token) = t.send_with(&submit_cmd(fenced(CMD_SUBMIT_3D, 1, 9), b"abcd"), None)
+    else {
+        panic!("a fenced submit must be held");
+    };
+    assert_eq!(
+        t.r.mock.lock().unwrap().submitted,
+        vec![(1, b"abcd".to_vec())]
+    );
+    assert!(t.completions().is_empty(), "not signalled yet");
+    t.r.release();
+    let done = t.completions();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].token, token);
+    let h = CtrlHdr::from_bytes(&done[0].resp[16..]).unwrap();
+    assert_eq!((h.ty, h.fence_id, h.ctx_id), (RESP_OK_NODATA, 9, 1));
+
+    // An unknown context, and a size that does not match: answered at once.
+    assert_eq!(
+        t.ty(&submit_cmd(fenced(CMD_SUBMIT_3D, 2, 10), b"abcd")),
+        RESP_ERR_INVALID_CONTEXT_ID
+    );
+    let mut short = submit_cmd(fenced(CMD_SUBMIT_3D, 1, 11), b"abcd");
+    short.pop();
+    assert_eq!(t.ty(&short), RESP_ERR_UNSPEC);
+    assert_eq!(t.venus.held(), 0);
+    // Unfenced submits take the ordinary path.
+    assert_eq!(
+        t.ty(&submit_cmd(hdr(CMD_SUBMIT_3D, 1), b"efgh")),
+        RESP_OK_NODATA
+    );
+    // A dead renderer: the submit fails as a submit, the device is lost.
+    t.r.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        t.ty(&submit_cmd(fenced(CMD_SUBMIT_3D, 1, 12), b"ijkl")),
+        RESP_ERR_UNSPEC
+    );
+    assert!(t.venus.is_lost());
 }

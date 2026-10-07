@@ -566,6 +566,21 @@ fn collect_host(r: &mut Report) {
     // NVIDIA driver
     let (supported, from) = host::supported_drivers();
     driver_checks(r, host::driver(), &supported, from);
+    // Which GPU. Informational: any Turing or later GPU works (docs/GPU-SUPPORT.md). Whether
+    // Resizable BAR is on is the BAR1 line's (gpu_host_lines).
+    for g in host::gpus() {
+        let name = g
+            .model
+            .clone()
+            .unwrap_or_else(|| format!("NVIDIA device {:#06x}", g.device));
+        let bar1 = g.bar1.map(ui::human_bytes).unwrap_or_else(|| "?".into());
+        r.line(
+            Level::Ok,
+            "GPU",
+            &format!("{name} at {}, BAR1 {bar1}", g.addr),
+            "",
+        );
+    }
     for dev in ["/dev/nvidiactl", "/dev/nvidia-uvm"] {
         if Path::new(dev).exists() && !may_open_rw(dev) {
             r.line(Level::Warn, "GPU access", &format!("you cannot open {dev}"), "Usually fixed by logging in on the desktop as yourself, or the 'video'/'render' group.");

@@ -27,6 +27,8 @@ impl NvidiaBackend {
         let Some(f) = ScanoutFlip::from_bytes(payload) else {
             return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, libc::EINVAL);
         };
+        // Stage timing follows the flip by its seq (docs/TRACING.md).
+        crate::stage::flip_decoded(f.seq);
         if f.scanout != 0 {
             return self.write_error_resp(resp_buf, Status::InvalidDevice, 0, libc::EINVAL);
         }
@@ -68,7 +70,11 @@ impl NvidiaBackend {
             }
         };
         if let Some(link) = self.display.as_ref() {
-            match link.flip(dmabuf, &f) {
+            let outcome = link.flip(dmabuf, &f);
+            if outcome == FlipOutcome::Sent {
+                crate::stage::flip(crate::stage::H_DISPLAY, f.seq);
+            }
+            match outcome {
                 FlipOutcome::Sent
                 | FlipOutcome::Busy
                 | FlipOutcome::NoBroker
@@ -329,6 +335,34 @@ mod tests {
             }
             .to_bytes(),
         )
+    }
+
+    /// Stage timing follows a flip by its seq, with or without a viewer.
+    #[cfg(feature = "venus")]
+    #[test]
+    fn a_flip_is_stamped_by_its_seq() {
+        use conduit_venus::stage::*;
+        let _one = crate::stage::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (mut be, _host, owner) = setup_without_viewer();
+        let mut resp = [0u8; 64];
+        let seq = 0xF11F_0000_0000_0042;
+        crate::stage::set_on(true);
+        be.dispatch(&flip(owner, 7, seq), &mut resp);
+        crate::stage::set_on(false);
+        be.dispatch(&flip(owner, 7, seq + 1), &mut resp);
+        let (recs, _) = decode_dump(&crate::stage::dump()).unwrap();
+        let mine: Vec<&Rec> = recs
+            .iter()
+            .filter(|r| r.kind == KIND_FLIP && r.id >= seq)
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "decoded only, and nothing once off: {mine:?}"
+        );
+        assert_eq!((mine[0].stage, mine[0].id), (H_DECODED, seq));
     }
 
     #[test]

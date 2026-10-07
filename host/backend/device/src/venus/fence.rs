@@ -23,6 +23,9 @@ pub struct Completion {
     pub token: u64,
     /// `MsgHeader` and the virtio-gpu response.
     pub resp: Vec<u8>,
+    /// The fence it waited for, `(ctx_id, ring, fence_id)`: the frame id
+    /// stage timing follows it by (`crate::stage`).
+    pub fence: (u32, u32, u64),
 }
 
 /// A fenced command waiting for its fence.
@@ -96,6 +99,18 @@ impl Fences {
             .partition::<Vec<_>, _>(|(i, h)| *i <= last && on(h));
         self.held = keep.into_iter().map(|(_, h)| h).collect();
         let now = Instant::now();
+        if crate::stage::on() {
+            let ns = crate::stage::now_ns();
+            for (_, h) in &done {
+                crate::stage::stamp(conduit_venus::stage::Rec::fence(
+                    conduit_venus::stage::H_SIGNALLED,
+                    h.hdr.ctx_id,
+                    h.hdr.ring(),
+                    h.hdr.fence_id,
+                    ns,
+                ));
+            }
+        }
         for (_, h) in done {
             let held = now.saturating_duration_since(h.at);
             if let Some(s) = self.latency.add((h.hdr.ctx_id, h.hdr.ring()), held, now) {
@@ -129,6 +144,7 @@ impl Fences {
         self.ready.push(Completion {
             token: h.token,
             resp,
+            fence: (h.hdr.ctx_id, h.hdr.ring(), h.hdr.fence_id),
         });
     }
 

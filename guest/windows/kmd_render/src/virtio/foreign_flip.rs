@@ -1200,6 +1200,8 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                     }
                 }
                 let t0 = now();
+                // `StageTrace` G_FLIP_DDI: read before `note_host_submit` takes it.
+                crate::ddi::stage_trace::set_flip_ddi(crate::ddi::flip_lat::prog_t());
                 crate::ddi::flip_lat::note_host_submit(t0);
                 let result = flip(passive, adapter, target);
                 if result == FlipResult::Shown {
@@ -1364,6 +1366,14 @@ fn flip_async(
     let at = now();
     match present_submit(passive, adapter, owner, t.drm, t.gem, &CELLS[i]) {
         Ok((seq, generation)) => {
+            // `StageTrace` G_FLIP_DDI: the programming's entry (the caller's `note_host_submit`
+            // takes it after this returns).
+            crate::ddi::stage_trace::stamp(
+                helios_kmd_logic::stage_trace::G_FLIP_DDI,
+                helios_kmd_logic::stage_trace::KIND_FLIP,
+                seq,
+                crate::ddi::flip_lat::prog_t(),
+            );
             {
                 let mut g = PIPE.lock();
                 let _ = g.begin_at(i, seq, at, generation, epoch, pslot, copied);

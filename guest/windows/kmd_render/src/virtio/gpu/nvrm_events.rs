@@ -207,6 +207,7 @@ fn take_event(ring: &mut EventRing) -> Taken {
     let Ok(len) = used else {
         return Taken::Broken;
     };
+    RING_POPS.fetch_add(1, Ordering::Relaxed);
     // The host's bytes, now ours until the buffer is posted again below.
     // SAFETY: the device is done with the buffer (`pop_used` succeeded).
     let bytes = unsafe { span.as_slice() };

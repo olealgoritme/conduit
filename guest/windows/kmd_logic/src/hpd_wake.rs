@@ -105,7 +105,13 @@ pub struct WaitInputs {
     /// is meant to run: without it a heartbeat that died while the worker sleeps (nothing else
     /// wakes it for an MMIO flip) would strand the pending flip for ever.
     pub watch: Option<i64>,
+    /// The message-interrupt safety net's poll ([`MSI_POLL_100NS`], relative), while delivery is
+    /// in doubt (`virtio::msi::polling`): the worker drains the rings that often.
+    pub poll: Option<i64>,
 }
+
+/// The safety net's poll while message-signalled interrupts are in doubt: 10 ms.
+pub const MSI_POLL_100NS: i64 = -100_000;
 
 /// The worker's watchdog tick while the vsync heartbeat is meant to run: 250 ms (4 wakes a
 /// second at idle), the same silence [`REVIVE_MIN_100NS`] counts as a dead heartbeat.
@@ -129,7 +135,7 @@ pub const fn wait_plan(i: WaitInputs) -> (Option<i64>, WaitClass) {
     }
     // Both are relative (negative) 100 ns units: the earlier is the one closer to zero, i.e. the
     // larger.
-    let due = earlier(earlier(i.foreign, i.mirror), i.watch);
+    let due = earlier(earlier(earlier(i.foreign, i.mirror), i.watch), i.poll);
     match due {
         Some(d) => (Some(floor(d)), WaitClass::Due),
         None => (None, WaitClass::Infinite),
@@ -577,6 +583,7 @@ mod tests {
             foreign: None,
             mirror: None,
             watch: idle_watch(0, 0, true, true, true),
+            poll: None,
         });
         assert_eq!((due, class), (None, WaitClass::Infinite));
     }
@@ -590,10 +597,29 @@ mod tests {
             foreign: f,
             mirror: m,
             watch: None,
+            poll: None,
         }
     }
 
     // ---- the wait ----------------------------------------------------------------------
+
+    #[test]
+    fn the_message_poll_is_one_more_due_time_and_never_beats_the_control_poll() {
+        let mut i = inputs(false, false, None, None);
+        i.poll = Some(MSI_POLL_100NS);
+        assert_eq!(wait_plan(i), (Some(-100_000), WaitClass::Due));
+        // The earlier due time wins, either way round.
+        i.foreign = Some(-20_000);
+        assert_eq!(wait_plan(i), (Some(-20_000), WaitClass::Due));
+        i.foreign = Some(-5_000_000);
+        assert_eq!(wait_plan(i), (Some(-100_000), WaitClass::Due));
+        // Not while an async command owns descriptors, nor while a retry is owed.
+        i.ctrl_inflight = true;
+        assert_eq!(wait_plan(i), (Some(-40_000), WaitClass::CtrlPoll));
+        i.ctrl_inflight = false;
+        i.retry_pending = true;
+        assert_eq!(wait_plan(i), (Some(-160_000), WaitClass::Retry));
+    }
 
     #[test]
     fn the_wait_is_what_the_loop_had_inline() {

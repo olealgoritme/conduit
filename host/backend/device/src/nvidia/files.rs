@@ -562,7 +562,9 @@ impl NvidiaBackend {
                     host_dev_info(&format!("/dev/dri/{name}"), &layout).unwrap_or_else(|| {
                         // The node did not answer (logged above). Same shape
                         // the guest used to invent, so a refusal is no worse
-                        // than the old behaviour.
+                        // than the old behaviour. 6 / 2 / 1 is what every
+                        // Turing-or-later desktop GPU answers (GB20x too: its
+                        // 8/16-bit GOBs are per format, not in GET_DEV_INFO).
                         abi::devinfo::DevInfo {
                             supports_alloc: 1,
                             generic_page_kind: 6,

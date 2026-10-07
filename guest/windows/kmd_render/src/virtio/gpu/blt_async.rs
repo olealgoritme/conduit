@@ -210,12 +210,15 @@ impl VirtioGpu {
     /// writers. A failed copy still hands it back: the host rejected a command that touched
     /// nothing, the Present's fence retires with the wire fence either way, and the destination
     /// keeps the previous frame (`BltAsyncFail`). One compare when nothing is in flight.
-    pub(super) fn blt_async_retire(&mut self, fence_id: u64, response_ok: bool) {
+    ///
+    /// Returns the copy's submission time (interrupt time) when it was a direct copy, for the
+    /// `StageTrace` completion stamp.
+    pub(super) fn blt_async_retire(&mut self, fence_id: u64, response_ok: bool) -> Option<u64> {
         if self.blt_async.table.is_empty() {
-            return;
+            return None;
         }
         let Some(done) = self.blt_async.table.complete(fence_id) else {
-            return;
+            return None;
         };
         crate::ddi::blt_async::note_infl_sub();
         crate::ddi::blt_async::note_copy_done(done.t0, response_ok);
@@ -238,6 +241,7 @@ impl VirtioGpu {
                 done.resource_id,
             );
         }
+        Some(done.t0)
     }
 
     /// A transport failure latched: nothing in the table can complete any more. Forget the
@@ -263,6 +267,7 @@ impl VirtioGpu {
         prepared: PreparedPresentBltSubmission,
         stream_boundary: u64,
         no_mirror: bool,
+        t_present: u64,
     ) -> Result<u64, VirtioError> {
         if self.failed
             || !self.present_stream_boundary_live(stream_boundary)
@@ -300,6 +305,7 @@ impl VirtioGpu {
             no_mirror,
             t_queue: crate::ddi::blt_async::now_100ns(),
             t_submit: 0,
+            t_present,
         });
         crate::ddi::blt_async::note_infl_add();
         crate::ddi::scanout_timeline::note(
@@ -351,6 +357,16 @@ impl VirtioGpu {
         }
         request.t_submit = crate::ddi::blt_async::now_100ns();
         crate::ddi::blt_async::note_defer_wait(request.t_queue, request.t_submit);
+    }
+
+    /// `StageTrace`: when the worker submitted the queued copy `(token, stream_boundary)`
+    /// (interrupt time; 0 for one it did not time or does not hold).
+    pub(super) fn windowed_blt_t_submit(&self, token: u64, stream_boundary: u64) -> u64 {
+        self.windowed_blt
+            .pending
+            .iter()
+            .find(|request| request.token == token && request.stream_boundary == stream_boundary)
+            .map_or(0, |request| request.t_submit)
     }
 
     /// Which ready request the worker dispatches next: `(index in pending, position in ready)`.

@@ -422,6 +422,57 @@ pub const fn gb20x_family(element_bytes: u32) -> u64 {
     }
 }
 
+/// Which GOBs the GPU's block-linear surfaces use, and with them which modifier
+/// family a plane of a given element size carries.
+///
+/// Turing, Ampere and Ada have one GOB (NIL's TuringColor2D, the desktop sector
+/// layout `s = 1`) for every element size, so every block-linear plane there
+/// carries [`MOD_NVIDIA_BL_GB20X`] (the name is historical: that value is the
+/// same `BLOCK_LINEAR_2D(c=0, s=1, g=2, k=0x06)` on every Turing+ GPU). GB20x adds
+/// the 8-bit and 16-bit GOBs ([`gb20x_family`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GobScheme {
+    /// Turing, Ampere, Ada (RM architecture 0x160, 0x170, 0x190): desktop GOB only.
+    Desktop,
+    /// Blackwell (3D class BLACKWELL_A and later; GB20x is RM architecture 0x1B0):
+    /// desktop + 8-bit + 16-bit GOBs.
+    Gb20x,
+}
+
+impl GobScheme {
+    /// The scheme NVK's NIL picks for a GPU whose 3D class is `cls_eng3d`
+    /// (`GOBType::choose` in src/nouveau/nil/tiling.rs: the Blackwell GOBs from
+    /// BLACKWELL_A 0xcd97 on, TuringColor2D for TURING_A 0xc597 up to ADA_A 0xc997
+    /// and HOPPER_A 0xcb97).
+    pub const fn from_eng3d_class(cls_eng3d: u32) -> Self {
+        if cls_eng3d >= 0xcd97 {
+            GobScheme::Gb20x
+        } else {
+            GobScheme::Desktop
+        }
+    }
+
+    /// The same by RM architecture (`NV2080_CTRL_MC_GET_ARCH_INFO_PARAMS::architecture`):
+    /// Blackwell (GB10x 0x1A0, GB20x 0x1B0) and later have the Blackwell GOBs; Turing
+    /// 0x160, Ampere 0x170, Hopper 0x180 and Ada 0x190 do not.
+    pub const fn from_rm_architecture(arch: u32) -> Self {
+        if arch >= 0x1A0 {
+            GobScheme::Gb20x
+        } else {
+            GobScheme::Desktop
+        }
+    }
+
+    /// The block-linear family a plane whose elements are `element_bytes` wide
+    /// must use on a GPU of this scheme. `Gb20x` is [`gb20x_family`].
+    pub const fn family(self, element_bytes: u32) -> u64 {
+        match self {
+            GobScheme::Gb20x => gb20x_family(element_bytes),
+            GobScheme::Desktop => MOD_NVIDIA_BL_GB20X,
+        }
+    }
+}
+
 /// The layout facts of `fourcc`, or `None` for a format a foreign resource may
 /// not hold. The four 32-bit RGB formats are always in; the rest need
 /// [`HELIOS_FOREIGN_CAP_LAYOUT_FORMATS`].
@@ -677,6 +728,28 @@ mod tests {
         assert_eq!(gb20x_family(p010.bpp0), MOD_NVIDIA_BL_GB20X_16BPP);
         assert_eq!(gb20x_family(p010.bpp1), MOD_NVIDIA_BL_GB20X);
         assert_eq!(gb20x_family(f16.bpp0), MOD_NVIDIA_BL_GB20X);
+        // GB20x keeps exactly the per-element-size families; pre-Blackwell GPUs use the
+        // desktop family for every element size.
+        for bytes in [0, 1, 2, 3, 4, 8, u32::MAX] {
+            assert_eq!(GobScheme::Gb20x.family(bytes), gb20x_family(bytes));
+            assert_eq!(GobScheme::Desktop.family(bytes), MOD_NVIDIA_BL_GB20X);
+        }
+        assert_eq!(GobScheme::from_rm_architecture(0x160), GobScheme::Desktop); // Turing
+        assert_eq!(GobScheme::from_rm_architecture(0x170), GobScheme::Desktop); // Ampere
+        assert_eq!(GobScheme::from_rm_architecture(0x190), GobScheme::Desktop); // Ada
+        assert_eq!(GobScheme::from_rm_architecture(0x180), GobScheme::Desktop); // Hopper
+        assert_eq!(GobScheme::from_rm_architecture(0x1A0), GobScheme::Gb20x); // GB10x
+        assert_eq!(GobScheme::from_rm_architecture(0x1B0), GobScheme::Gb20x); // GB20x
+        for (cls, want) in [
+            (0xc597, GobScheme::Desktop), // TURING_A
+            (0xc797, GobScheme::Desktop), // AMPERE_B
+            (0xc997, GobScheme::Desktop), // ADA_A
+            (0xcb97, GobScheme::Desktop), // HOPPER_A
+            (0xcd97, GobScheme::Gb20x),   // BLACKWELL_A
+            (0xce97, GobScheme::Gb20x),   // BLACKWELL_B
+        ] {
+            assert_eq!(GobScheme::from_eng3d_class(cls), want, "{cls:#x}");
+        }
         for (name, v) in [
             ("HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X_8BPP", MOD_NVIDIA_BL_GB20X_8BPP),
             ("HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X_16BPP", MOD_NVIDIA_BL_GB20X_16BPP),
