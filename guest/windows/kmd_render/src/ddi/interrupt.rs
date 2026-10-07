@@ -354,6 +354,8 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     // StartDevice before the transport goes live; 0 means INTx.
     let msi_state = adapter.msi_state.load(Ordering::Acquire);
     if msi_state != 0 {
+        // `StageTrace`: one relaxed load while off.
+        crate::ddi::stage_trace::note_isr();
         return msi_interrupt(adapter, msi_state, message_number);
     }
     let isr_va = adapter.isr_status.load(Ordering::Acquire);
@@ -371,6 +373,8 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     }
     INT_ROUTINE_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::virtio::msi::note_intx();
+    // `StageTrace`: when the last interrupt was claimed (one relaxed load while off).
+    crate::ddi::stage_trace::note_isr();
     // Bit 1 = configuration change: the virtio-gpu raises it on a
     // VIRTIO_GPU_EVENT_DISPLAY (monitor connect / mode change). Latch it for the
     // DPC, which wakes the HPD worker to (re-)indicate the child connected — the

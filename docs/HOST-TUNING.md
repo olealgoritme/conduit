@@ -111,6 +111,18 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   For a hard split, isolate the guest's cores with systemd
   (`systemctl set-property --runtime user.slice AllowedCPUs=0-7,16-23`,
   and the same for `system.slice`), or at boot with `isolcpus=`/`nohz_full=`.
+- **Keep the backend and conduit-venus off the guest's cores**, on part of
+  the host's CCD: on the reference host `conduit config set backend.cpus
+  0-3,16-19` (four cores and their SMT siblings; applies at the next backend
+  start). Unpinned, their threads wake mostly on the guest's idle CPUs and
+  preempt a vCPU there. Pinned like this, the GPU copy round trip of a
+  windowed Windows game fell from 441 to 398 µs (p50) on the host and its
+  share of copies under 0.5 ms in the guest rose from 0.5% to 13.5%
+  ([research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
+  This applies with MSI-X in the guest. A guest on INTx has every completion
+  raised by QEMU's main loop, which libvirt pins to the same host CPUs
+  (`emulatorpin`), and sharing them there gave millisecond tails. On INTx,
+  leave `backend.cpus` unset or keep it clear of the emulator CPUs.
 - **CPU governor**: `performance` avoids clock ramp-up latency.
 
 ## GPU memory: Resizable BAR and the video-memory limit

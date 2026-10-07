@@ -2146,6 +2146,9 @@ pub(crate) struct WindowedBltPending {
     /// Interrupt time (100 ns) the request was queued, and the worker submitted it (0 before).
     pub(crate) t_queue: u64,
     pub(crate) t_submit: u64,
+    /// `StageTrace`: the Present's DDI entry (interrupt time, 100 ns), stamped as G_PRESENT
+    /// under the copy's wire fence when the worker submits it.
+    pub(crate) t_present: u64,
 }
 
 /// Preallocated FIFO plus an exact terminal-membership table. Keeping terminal
@@ -5030,6 +5033,8 @@ impl VirtioGpu {
                     cell.as_ref().store(word, Ordering::Release);
                     KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
                 }
+                // `StageTrace` G_FLIP_ACK / G_FLIP_ISR (one relaxed load while off).
+                crate::ddi::stage_trace::flip_answered(tag);
                 // Nothing reads `meta` again: back to the pool, or parked for the PASSIVE
                 // reaper, exactly as a finished raw forward.
                 if entry.venus.is_none() && self.dma_pool_accepts(entry.meta.capacity()) {
@@ -5350,10 +5355,36 @@ impl VirtioGpu {
                             self.wake_ready_windowed_blt();
                         }
                     }
+                    // `StageTrace`: a queued copy's submission time, read before its ring
+                    // completion below can retire the request (one relaxed load while off).
+                    let stage_windowed_t = match windowed_blt.as_ref() {
+                        Some(r) if crate::ddi::stage_trace::on() => {
+                            Some(self.windowed_blt_t_submit(r.token, r.stream_boundary))
+                        }
+                        _ => None,
+                    };
                     // A direct asynchronous Blt (`BltAsync`): the destination goes back to its
                     // readers here, before the WDDM FIFO below can retire the Present's fence.
-                    if ring_idx != 0 {
-                        self.blt_async_retire(fence_id, response_ok);
+                    let stage_direct_t = if ring_idx != 0 {
+                        self.blt_async_retire(fence_id, response_ok)
+                    } else {
+                        None
+                    };
+                    // `StageTrace` G_ISR / G_DONE of a Present copy (direct, queued, or the
+                    // legacy arm's, which has no submission time and so no G_ISR).
+                    if crate::ddi::stage_trace::on() && ring_idx == SCANOUT_RING_IDX as u8 {
+                        let submitted = stage_direct_t
+                            .or(stage_windowed_t)
+                            .or(present_buffer_write.map(|_| 0));
+                        if let Some(t) = submitted {
+                            crate::ddi::stage_trace::completed(
+                                helios_kmd_logic::stage_trace::G_ISR,
+                                helios_kmd_logic::stage_trace::G_DONE,
+                                helios_kmd_logic::stage_trace::KIND_FENCE,
+                                fence_id,
+                                t,
+                            );
+                        }
                     }
                     if let Some(retire) = windowed_blt {
                         // SAFETY: every token stores the stable adapter that
@@ -7231,6 +7262,7 @@ impl VirtioGpu {
         destination: PresentDestinationDesc,
         prepared: PreparedPresentBltSubmission,
         stream_boundary: u64,
+        t_present: u64,
     ) -> Result<u64, VirtioError> {
         if self.failed
             || !self.present_stream_boundary_live(stream_boundary)
@@ -7269,6 +7301,7 @@ impl VirtioGpu {
             no_mirror: false,
             t_queue: 0,
             t_submit: 0,
+            t_present,
         });
         crate::ddi::scanout_timeline::note(
             crate::ddi::scanout_timeline::kind::WINDOWED_BLT_ARM,

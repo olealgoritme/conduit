@@ -76,6 +76,28 @@ impl NvidiaBackend {
             .unwrap_or_default()
     }
 
+    /// [`NvidiaBackend::venus_completions`] for the renderer connection's
+    /// reader thread: no renderer call ([`crate::venus::Venus::completions_no_call`]).
+    pub fn venus_completions_no_call(&mut self) -> Vec<crate::venus::Completion> {
+        let env = crate::venus::Env {
+            window: self.window.as_deref(),
+            display: self.display.as_deref(),
+            rm: None,
+            ram: None,
+        };
+        self.venus
+            .as_mut()
+            .map(|v| v.completions_no_call(env))
+            .unwrap_or_default()
+    }
+
+    /// `--latency direct-fences`: run `hook` when fences arrive (see
+    /// [`conduit_venus::Renderer::set_fence_hook`]). False without Venus or
+    /// when the renderer cannot.
+    pub fn venus_set_fence_hook(&mut self, hook: conduit_venus::FenceHook) -> bool {
+        self.venus.as_mut().is_some_and(|v| v.set_fence_hook(hook))
+    }
+
     /// The Venus renderer is gone for good (see [`crate::venus::Venus::is_lost`]).
     pub fn venus_lost(&self) -> bool {
         self.venus.as_ref().is_some_and(|v| v.is_lost())
