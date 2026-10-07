@@ -256,7 +256,7 @@ submit to completion DPC; driver 346.1, INTx):
 
 The guest's histogram has 250 µs buckets, so a 44 µs gain shows only as
 copies crossing the 500 µs edge: 7 → 27 → 135 of about 2450. Nearly every
-copy sits just above that edge in the guest, against 410-450 µs from host
+copy is between 500 µs and 1 ms in the guest, against 410-450 µs from host
 dispatch to interrupt. The rest of the guest's time is its submit, its kick,
 and the INTx interrupt through to the DPC.
 
