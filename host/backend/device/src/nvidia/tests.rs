@@ -3380,6 +3380,68 @@ mod fence_tests {
         word(&resp, BODY + 16) as u64
     }
 
+    /// An RM ioctl (type 'F') with `params` and no nested blocks.
+    fn rm_msg(handle: u64, nr: u32, params: &[u8]) -> Vec<u8> {
+        let mut v = drm_msg(handle, nr, params, &[]);
+        let at = size_of::<MsgHeader>();
+        let mut req = read_struct::<IoctlReq>(&v, at);
+        req.cmd = (3 << 30) | ((params.len() as u32) << 16) | ((b'F' as u32) << 8) | nr;
+        write_struct(&mut v[at..], &req);
+        v
+    }
+
+    fn set_word(p: &mut [u8], at: usize, v: u32) {
+        p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn a_huge_fence_timeout_is_clamped_and_a_normal_one_is_not() {
+        for (asked, sent) in [(0, 0), (5_000, 5_000), (10_000, 10_000), (u32::MAX, 10_000)] {
+            let host = FenceHost::default();
+            let (mut be, drm) = backend_on(&host);
+            let mut p = create_params(12345);
+            set_word(&mut p, 4, asked);
+            let mut resp = vec![0u8; 256];
+            be.dispatch(&drm_msg(drm, 0x55, &p, &[]), &mut resp);
+            assert_eq!(word(&host.calls()[0].1, 4), sent, "asked {asked}");
+        }
+    }
+
+    #[test]
+    fn safe_mode_shrinks_the_fence_and_idle_timeouts() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        be.set_safe_mode(true);
+        let mut p = create_params(12345);
+        set_word(&mut p, 4, 5_000);
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(drm, 0x55, &p, &[]), &mut resp);
+        assert_eq!(word(&host.calls()[0].1, 4), 1_000);
+
+        let mut idle = vec![0u8; 56];
+        set_word(&mut idle, 44, 5_000_000);
+        be.dispatch(&rm_msg(drm, 0x41, &idle), &mut resp);
+        let calls = host.calls();
+        assert_eq!(word(&calls.last().unwrap().1, 44), 1_000_000);
+    }
+
+    #[test]
+    fn idle_channels_forwards_a_modest_timeout_untouched_and_clamps_a_huge_one() {
+        for (asked, sent) in [(0, 0), (250_000, 250_000), (u32::MAX, 10_000_000)] {
+            let host = FenceHost::default();
+            let (mut be, drm) = backend_on(&host);
+            let mut idle = vec![0u8; 56];
+            set_word(&mut idle, 40, 0x1234); // flags are never touched
+            set_word(&mut idle, 44, asked);
+            let mut resp = vec![0u8; 256];
+            be.dispatch(&rm_msg(drm, 0x41, &idle), &mut resp);
+            let calls = host.calls();
+            let got = &calls.last().expect("reached the host").1;
+            assert_eq!(word(got, 44), sent, "asked {asked}");
+            assert_eq!(word(got, 40), 0x1234);
+        }
+    }
+
     /// The host's descriptor stays here; the guest gets a handle for it, the
     /// transport is told to watch it once, and closing it lets it go.
     #[test]

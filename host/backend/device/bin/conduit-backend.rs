@@ -1144,6 +1144,7 @@ impl NvGpuBackend {
         display: Option<(DisplayMode, Arc<DisplayLink>, bool)>,
         input_target: EventTarget,
         input_claims: Arc<GuestInputClaims>,
+        safe_mode: bool,
     ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
@@ -1179,6 +1180,8 @@ impl NvGpuBackend {
             log::warn!("{what}: starting anyway (--allow-nearest-abi)");
         }
         nvidia.set_caps(caps);
+        nvidia.set_safe_mode(safe_mode);
+        let vram_limit_mib = device::vram::effective_limit_mib(safe_mode, vram_limit_mib);
         nvidia
             .set_vram_limit_mib(vram_limit_mib)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
@@ -1891,11 +1894,22 @@ fn main() -> anyhow::Result<()> {
         report.seccomp_rules
     );
 
+    // Read once, here. The strictest posture for a first run on a GPU that
+    // also drives a desktop: a video-memory cap whatever was asked, and the
+    // blocking timeouts a guest may forward cut to 1 s (nvidia/bounds.rs).
+    let safe_mode = std::env::var("CONDUIT_SAFE_MODE").as_deref() == Ok("1");
+    if safe_mode {
+        log::warn!(
+            "SAFE MODE is on (CONDUIT_SAFE_MODE=1): video memory capped at {} MiB unless a lower \
+             --vram-limit-mib was given, forwarded blocking timeouts clamped to 1 s",
+            device::vram::SAFE_MODE_VRAM_MIB
+        );
+    }
     log::info!(
         "conduit-backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}",
         args.socket,
         args.caps,
-        match args.vram_limit_mib {
+        match device::vram::effective_limit_mib(safe_mode, args.vram_limit_mib) {
             Some(m) => format!("video memory limited to {m} MiB"),
             None => "no video memory limit".to_string(),
         }
@@ -1991,6 +2005,7 @@ fn main() -> anyhow::Result<()> {
         display,
         input_target,
         input_claims,
+        safe_mode,
     )?;
     #[cfg(feature = "venus")]
     if args.venus {

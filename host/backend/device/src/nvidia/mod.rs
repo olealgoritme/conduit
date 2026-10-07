@@ -367,6 +367,8 @@ pub struct NvidiaBackend {
     /// `crate::vram`. `Vram::new(None)` is no limit, which is what a VMM that
     /// never sets one gets.
     vram: crate::vram::Vram,
+    /// Ceilings on the timeouts a guest may forward (bounds.rs).
+    bounds: bounds::Bounds,
     /// Venus (docs/VENUS.md), with `--venus` only. `None`: `GpuCmd` is
     /// refused as an unknown message is.
     #[cfg(feature = "venus")]
@@ -443,6 +445,7 @@ impl NvidiaBackend {
             caps: crate::caps::Caps::DEFAULT,
             caps_refused: std::collections::BTreeMap::new(),
             vram: crate::vram::Vram::new(None),
+            bounds: bounds::Bounds::NORMAL,
             rmallow: None,
             uvm: None,
             osdesc: None,
@@ -535,6 +538,16 @@ impl NvidiaBackend {
         }
         self.vram = crate::vram::Vram::new(mib);
         Ok(())
+    }
+
+    /// Safe mode: the blocking timeouts a guest may forward shrink to
+    /// [`bounds::Bounds::SAFE`]. The caller also sets a video-memory limit.
+    pub fn set_safe_mode(&mut self, on: bool) {
+        self.bounds = if on {
+            bounds::Bounds::SAFE
+        } else {
+            bounds::Bounds::NORMAL
+        };
     }
 
     /// The budget this backend enforces, in MiB; 0 when there is none.
@@ -1122,6 +1135,7 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 }
 
 mod aperture;
+mod bounds;
 mod clipboard;
 mod fence;
 mod files;

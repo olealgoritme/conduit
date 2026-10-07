@@ -705,6 +705,17 @@ impl NvidiaBackend {
                 self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf)
             }
 
+            // Forwarded as it is, except that the timeout the guest chose is
+            // held to a ceiling (bounds.rs): the host idles with the GPU group
+            // lock held for that long.
+            NV_ESC_RM_IDLE_CHANNELS => {
+                let mut p = param_in.to_vec();
+                if self.bounds.clamp_idle_channels(&mut p) {
+                    log::warn!("NV_ESC_RM_IDLE_CHANNELS: timeout clamped");
+                }
+                self.dispatch_simple(cookie, host_fd, request, &p, resp_buf)
+            }
+
             NV_ESC_RM_MAP_MEMORY => {
                 self.dispatch_map_memory(cookie, host_fd, request, param_in, resp_buf)
             }
