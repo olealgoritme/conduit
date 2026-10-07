@@ -118,6 +118,61 @@ pub const TOOL_PACKAGES_APT: &[&str] = &[
     "coreutils",
 ];
 
+/// The same tools under Fedora and Arch names.
+const TOOL_PACKAGES_DNF: &[&str] = &[
+    "iproute",
+    "iptables",
+    "openssh-clients",
+    "curl",
+    "e2fsprogs",
+    "xz",
+    "coreutils",
+];
+const TOOL_PACKAGES_PACMAN: &[&str] = &[
+    "iproute2",
+    "iptables",
+    "openssh",
+    "curl",
+    "e2fsprogs",
+    "xz",
+    "coreutils",
+];
+
+/// What to know before touching the driver. Conduit changes nothing here.
+fn driver_guide(loaded: Option<&host::Driver>, supported: &[String]) -> String {
+    let now = match loaded {
+        Some(d) => format!(
+            "Loaded now: {} ({} kernel modules).",
+            d.version,
+            if d.open { "open" } else { "closed" }
+        ),
+        None => "No NVIDIA driver is loaded now.".into(),
+    };
+    format!(
+        "{now}\n\n\
+         Conduit never installs or changes a driver for you. Do it yourself, in your distribution's way, then restart the computer: the new kernel module only loads at boot.\n\n\
+         Open or closed: NVIDIA ships its kernel modules in two flavours. Conduit is built and tested on the OPEN modules, release 580 or newer (Ubuntu: the nvidia-driver-580-open package or a newer -open one). The closed modules and older branches may work for a release Conduit has tables for; Conduit then warns and starts in safe mode.\n\n\
+         Releases Conduit knows: {}",
+        if supported.is_empty() {
+            "(the list could not be read)".to_string()
+        } else {
+            supported.join(", ")
+        }
+    )
+}
+
+/// A missing part of Conduit itself: the doctor's words for this part, the
+/// wizard's pointer to the packages.
+fn conduit_part_remedy(hint: &str) -> Remedy {
+    Remedy::explain(
+        hint,
+        format!(
+            "Install the Conduit package for your distribution ({}), or, from a source checkout, build it with packaging/build.sh (the build packages step above installs what it needs).",
+            crate::setup::data::link("conduit-releases")
+        ),
+    )
+}
+
 /// One finding of a check: what `conduit doctor` prints, and what `conduit
 /// setup` turns into steps. `id` is a stable key (the title as a slug, or an
 /// explicit one where one title covers causes with different fixes).
@@ -127,8 +182,83 @@ pub struct Check {
     pub level: Level,
     pub title: String,
     pub detail: String,
-    /// How to fix it, in plain words; lines separated by `\n`.
-    pub hint: String,
+    /// The one thing to do about it; what the doctor prints and what the
+    /// setup wizard offers both come from this.
+    pub remedy: Option<Remedy>,
+}
+
+impl Check {
+    /// The doctor's words for the fix, lines separated by `\n`; empty when
+    /// there is no remedy.
+    pub fn hint(&self) -> String {
+        self.remedy.as_ref().map(Remedy::hint).unwrap_or_default()
+    }
+}
+
+/// How to fix a finding, built where the check is made (the one place that
+/// knows what is wrong). The doctor prints its `hint`; the wizard turns it
+/// into a command or a guide for the host's distribution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Remedy {
+    /// Words only. The hint and the wizard's guide are these words.
+    Guide { text: String },
+    /// A command only an administrator can run (`sudo` is added); `intro`
+    /// is the sentence before it.
+    Sudo { intro: String, cmd: Vec<String> },
+    /// Install packages; `hint` is the doctor's words, the lists are
+    /// per distribution family.
+    Install {
+        hint: String,
+        apt: Vec<String>,
+        dnf: Vec<String>,
+        pacman: Vec<String>,
+    },
+    /// Short words for the doctor, a longer guide for the wizard.
+    Explain { hint: String, guide: String },
+}
+
+impl Remedy {
+    pub fn guide(text: impl Into<String>) -> Remedy {
+        Remedy::Guide { text: text.into() }
+    }
+
+    pub fn sudo(intro: &str, cmd: &[&str]) -> Remedy {
+        Remedy::Sudo {
+            intro: intro.into(),
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    pub fn install(hint: impl Into<String>, apt: &[&str], dnf: &[&str], pacman: &[&str]) -> Remedy {
+        let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+        Remedy::Install {
+            hint: hint.into(),
+            apt: own(apt),
+            dnf: own(dnf),
+            pacman: own(pacman),
+        }
+    }
+
+    pub fn explain(hint: impl Into<String>, guide: impl Into<String>) -> Remedy {
+        Remedy::Explain {
+            hint: hint.into(),
+            guide: guide.into(),
+        }
+    }
+
+    /// What `conduit doctor` prints under a finding.
+    pub fn hint(&self) -> String {
+        match self {
+            Remedy::Guide { text } => text.clone(),
+            Remedy::Sudo { intro, cmd } => format!("{intro}\n  sudo {}", cmd.join(" ")),
+            Remedy::Install { hint, .. } | Remedy::Explain { hint, .. } => hint.clone(),
+        }
+    }
+
+    /// Does the wizard have something to say beyond the hint?
+    pub fn says_more_than_hint(&self) -> bool {
+        !matches!(self, Remedy::Guide { .. })
+    }
 }
 
 /// "NVIDIA driver" -> "nvidia-driver".
@@ -152,8 +282,9 @@ pub fn render_check(c: &Check) -> String {
         Level::Fail => " FAIL ",
     };
     let mut s = format!("[{tag}] {}: {}\n", c.title, c.detail);
-    if !c.hint.is_empty() && c.level != Level::Ok {
-        for l in c.hint.lines() {
+    let hint = c.hint();
+    if c.level != Level::Ok {
+        for l in hint.lines() {
             s.push_str(&format!("         {l}\n"));
         }
     }
@@ -178,17 +309,31 @@ impl Report {
         }
     }
 
+    /// A finding whose fix is plain words (none when `fix` is empty).
     fn line(&mut self, lvl: Level, what: &str, detail: &str, fix: &str) {
-        self.line_id(&slug(what), lvl, what, detail, fix);
+        self.line_remedy(
+            &slug(what),
+            lvl,
+            what,
+            detail,
+            (!fix.is_empty()).then(|| Remedy::guide(fix)),
+        );
     }
 
-    fn line_id(&mut self, id: &str, level: Level, title: &str, detail: &str, hint: &str) {
+    fn line_remedy(
+        &mut self,
+        id: &str,
+        level: Level,
+        title: &str,
+        detail: &str,
+        remedy: Option<Remedy>,
+    ) {
         let c = Check {
             id: id.into(),
             level,
             title: title.into(),
             detail: detail.into(),
-            hint: hint.into(),
+            remedy,
         };
         if self.stream {
             print!("{}", render_check(&c));
@@ -370,36 +515,57 @@ pub fn host_checks() -> Vec<Check> {
     r.checks
 }
 
+#[cfg(test)]
+pub fn driver_checks_for_test(driver: Option<host::Driver>, supported: &[String]) -> Vec<Check> {
+    let mut r = Report::new(false);
+    driver_checks(&mut r, driver, supported, "test");
+    r.checks
+}
+
+/// The driver lines: what is loaded, whether Conduit knows it, safe mode.
+fn driver_checks(r: &mut Report, driver: Option<host::Driver>, supported: &[String], from: &str) {
+    match driver {
+        None => r.line_remedy("nvidia-driver", Level::Fail, "NVIDIA driver", "not loaded",
+            Some(Remedy::explain("Install NVIDIA's driver with the OPEN kernel modules, version 580 or newer\n(Ubuntu: sudo apt install nvidia-driver-580-open), then restart.", driver_guide(None, supported)))),
+        Some(d) => {
+            let known = supported.iter().any(|v| host::same_release(v, &d.version));
+            let (lvl, detail, fix) = module_verdict(&d, known);
+            r.line_remedy("nvidia-driver", lvl, "NVIDIA driver", &detail,
+                (!fix.is_empty()).then(|| Remedy::explain(fix, driver_guide(Some(&d), supported))));
+            r.line(Level::Ok, "Safe mode", &safe_mode_report(&d), "");
+            if known {
+                r.line(Level::Ok, "Driver support", &format!("Conduit knows driver {}", d.version), "");
+            } else {
+                r.line_remedy("driver-support", Level::Fail, "Driver support", &format!("driver {} is not one Conduit supports yet ({from}: {})", d.version, supported.join(", ")),
+                    Some(Remedy::explain("Each NVIDIA driver release needs a matching Conduit update. Update Conduit,\nor install one of the listed driver versions.", driver_guide(Some(&d), supported))));
+            }
+        }
+    }
+}
+
 fn collect_host(r: &mut Report) {
     // KVM
     if !Path::new("/dev/kvm").exists() {
         r.line(Level::Fail, "KVM", "not available (/dev/kvm is missing)",
             "Turn on virtualization in your BIOS/UEFI settings (called VT-x, VT-d, AMD-V or SVM),\nthen restart. If it is on, load the module: sudo modprobe kvm_intel  (or kvm_amd)");
     } else if !may_open_rw("/dev/kvm") {
-        r.line_id("kvm-access", Level::Fail, "KVM", "present, but you may not use it",
-            &format!("Add yourself to the kvm group, then log out and back in:\n  sudo usermod -aG kvm {}", paths::username()));
+        r.line_remedy(
+            "kvm-access",
+            Level::Fail,
+            "KVM",
+            "present, but you may not use it",
+            Some(Remedy::sudo(
+                "Add yourself to the kvm group, then log out and back in:",
+                &["usermod", "-aG", "kvm", &paths::username()],
+            )),
+        );
     } else {
         r.line(Level::Ok, "KVM", "available", "");
     }
 
     // NVIDIA driver
     let (supported, from) = host::supported_drivers();
-    match host::driver() {
-        None => r.line(Level::Fail, "NVIDIA driver", "not loaded",
-            "Install NVIDIA's driver with the OPEN kernel modules, version 580 or newer\n(Ubuntu: sudo apt install nvidia-driver-580-open), then restart."),
-        Some(d) => {
-            let known = supported.iter().any(|v| host::same_release(v, &d.version));
-            let (lvl, detail, fix) = module_verdict(&d, known);
-            r.line(lvl, "NVIDIA driver", &detail, fix);
-            r.line(Level::Ok, "Safe mode", &safe_mode_report(&d), "");
-            if known {
-                r.line(Level::Ok, "Driver support", &format!("Conduit knows driver {}", d.version), "");
-            } else {
-                r.line(Level::Fail, "Driver support", &format!("driver {} is not one Conduit supports yet ({from}: {})", d.version, supported.join(", ")),
-                    "Each NVIDIA driver release needs a matching Conduit update. Update Conduit,\nor install one of the listed driver versions.");
-            }
-        }
-    }
+    driver_checks(r, host::driver(), &supported, from);
     for dev in ["/dev/nvidiactl", "/dev/nvidia-uvm"] {
         if Path::new(dev).exists() && !may_open_rw(dev) {
             r.line(Level::Warn, "GPU access", &format!("you cannot open {dev}"), "Usually fixed by logging in on the desktop as yourself, or the 'video'/'render' group.");
@@ -491,11 +657,17 @@ fn collect_host(r: &mut Report) {
     if missing.is_empty() {
         r.line(Level::Ok, "Tools", "network and disk tools present", "");
     } else {
-        r.line(
+        r.line_remedy(
+            "tools",
             Level::Fail,
             "Tools",
             &format!("missing: {}", missing.join(", ")),
-            &format!("Ubuntu: sudo apt install {}", TOOL_PACKAGES_APT.join(" ")),
+            Some(Remedy::install(
+                format!("Ubuntu: sudo apt install {}", TOOL_PACKAGES_APT.join(" ")),
+                TOOL_PACKAGES_APT,
+                TOOL_PACKAGES_DNF,
+                TOOL_PACKAGES_PACMAN,
+            )),
         );
     }
 
@@ -504,20 +676,20 @@ fn collect_host(r: &mut Report) {
     let qemu = Tool::BundledQemu.find();
     match (&qemu, crate::qemu::virtiofsd(), Tool::Vmm.find()) {
         (Some(q), Some(_), _) => r.line(Level::Ok, "VM runner", &format!("QEMU {}", q.display()), ""),
-        (Some(_), None, _) => r.line_id("virtiofsd", Level::Fail, "VM runner", "QEMU found, but virtiofsd is missing",
-            "Ubuntu/Debian: sudo apt install virtiofsd   Fedora: sudo dnf install virtiofsd"),
+        (Some(_), None, _) => r.line_remedy("virtiofsd", Level::Fail, "VM runner", "QEMU found, but virtiofsd is missing",
+            Some(Remedy::install("Ubuntu/Debian: sudo apt install virtiofsd   Fedora: sudo dnf install virtiofsd", &["virtiofsd"], &["virtiofsd"], &["virtiofsd"]))),
         (None, _, Some(v)) => r.line(Level::Warn, "VM runner",
             &format!("bundled QEMU missing; only the built-in runner ({})", v.display()),
             "The built-in runner has no sound and cannot boot a VM's own (stock) kernel. Reinstall the conduit package, or build host/qemu."),
-        (None, _, None) => r.line_id("conduit-part", Level::Fail, "VM runner", "neither the bundled QEMU nor the built-in runner was found",
-            "Reinstall the conduit package. In a source checkout: host/qemu/build-qemu.sh"),
+        (None, _, None) => r.line_remedy("conduit-part", Level::Fail, "VM runner", "neither the bundled QEMU nor the built-in runner was found",
+            Some(conduit_part_remedy("Reinstall the conduit package. In a source checkout: host/qemu/build-qemu.sh"))),
     }
 
     for t in [Tool::Backend, Tool::Viewer, Tool::GuestDeb, Tool::Userspace] {
         match t.find() {
             Some(p) => r.line(Level::Ok, t.label(), &p.display().to_string(), ""),
-            None => r.line_id("conduit-part", Level::Fail, t.label(), "not found",
-                &format!("Reinstall the conduit package. In a source checkout, build it first.\n(looked in {} and the source checkout; or point to it with {}=/path)", paths::prefix().display(), t.env_var())),
+            None => r.line_remedy("conduit-part", Level::Fail, t.label(), "not found",
+                Some(conduit_part_remedy(&format!("Reinstall the conduit package. In a source checkout, build it first.\n(looked in {} and the source checkout; or point to it with {}=/path)", paths::prefix().display(), t.env_var())))),
         }
     }
 
@@ -941,10 +1113,11 @@ mod tests {
             level,
             title: title.into(),
             detail: detail.into(),
-            hint: hint.into(),
+            remedy: (!hint.is_empty()).then(|| Remedy::guide(hint)),
         }
     }
 
+    /// The text `conduit doctor` has always printed for these lines.
     fn scratch(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("conduit-doctor-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -998,7 +1171,30 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
-    /// The text `conduit doctor` has always printed for these lines.
+    #[test]
+    fn the_printed_hint_is_derived_from_the_remedy() {
+        let kvm = Remedy::sudo(
+            "Add yourself to the kvm group:",
+            &["usermod", "-aG", "kvm", "ole"],
+        );
+        assert_eq!(
+            kvm.hint(),
+            "Add yourself to the kvm group:\n  sudo usermod -aG kvm ole"
+        );
+        let c = Check {
+            remedy: Some(kvm),
+            ..chk("kvm-access", Level::Fail, "KVM", "no", "")
+        };
+        assert_eq!(
+            c.hint(),
+            "Add yourself to the kvm group:\n  sudo usermod -aG kvm ole"
+        );
+        assert!(render_check(&c).ends_with(
+            "         Add yourself to the kvm group:\n           sudo usermod -aG kvm ole\n"
+        ));
+        assert_eq!(chk("a", Level::Ok, "A", "d", "").hint(), "");
+    }
+
     #[test]
     fn printer_output_is_the_established_text() {
         let checks = [
@@ -1046,7 +1242,7 @@ mod tests {
         assert_eq!(slug("Conduit's QEMU"), "conduit-s-qemu");
         let mut r = Report::new(false);
         r.line(Level::Ok, "KVM", "available", "");
-        r.line_id("kvm-access", Level::Fail, "KVM", "x", "y");
+        r.line_remedy("kvm-access", Level::Fail, "KVM", "x", None);
         let ids: Vec<&str> = r.checks.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["kvm", "kvm-access"]);
         assert_eq!((r.fails(), r.warns()), (1, 0));
