@@ -408,6 +408,7 @@ next window creation, counted), or `RedirVram` simply requires `DwmIcd=nvk`.
 | multi-monitor | redirection surfaces of windows spanning outputs | unchanged: one surface per window, the output does not matter |
 | DWM restart | DWM's imports die with it; the allocation is the app's | the foreign record's lifetime rules (`shared-foreign-surfaces.md` 3, 6.1) already cover an opener's death |
 | device restart / TDR | RM objects of the generation go | `rm_client::forget` sweep; allocations re-created by dxgkrnl after the reset; `RedirVram` refuses until the client is up |
+| GDI `EXISTINGSYSMEM` surfaces under GDI acceleration | the KMD backs them with its own standard buffer instead of the caller's pages, so GDI operations would read and write the wrong bytes | if the census (`StdNGdiSys`) shows them once `GdiAccel` is on: back them with the caller's pages (the allocation arm, this branch) |
 | security | a GPU-only window surface reachable by `RM_DUP_OBJECT` | `NvDupHarden` (the route's `h_client` rule applies to the producer side; the destination is KMD-owned and never handed out as an RM handle, only as a resid to authorized openers) |
 
 ### 5.9 V2-V5 as built (`RedirVram`, default 0)
