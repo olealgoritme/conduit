@@ -62,6 +62,38 @@
  *   CE launch it times is uvm_hopper_ce.c semaphore_timestamp).
  *   Work-submit token: runlist id 22:16, channel id 11:0 (610.57.04
  *   dev_vm.h for GB202, dev_ctrl.h for GA100).
+ *   Block-linear (--bl-roundtrip): SET_DST_BLOCK_SIZE..SET_DST_LAYER
+ *   0x70c..0x71c, SET_SRC_BLOCK_SIZE..SET_SRC_LAYER 0x728..0x738 (block
+ *   size WIDTH 3:0, HEIGHT 7:4, DEPTH 11:8, GOB_HEIGHT 15:12 = FERMI_8 1,
+ *   on 0xcab5 KIND_BPP 17:16 = BL_32 0), SRC_ORIGIN_X/Y 0x744/0x748,
+ *   DST_ORIGIN_X/Y 0x74c/0x750: Mesa's clcab5.h and clc7b5.h and the
+ *   610.57.04 clc7b5.h; the 610.57.04 clcab5.h omits them (UNVERIFIED there,
+ *   as above). The sequence is NVK's nvk_cmd_copy.c nouveau_copy_rect:
+ *   WIDTH = the row pitch in bytes, HEIGHT = the image rows, DEPTH 1,
+ *   LAYER 0, PITCH_IN/OUT = the row pitches. The block-linear -> pitch copy
+ *   is word for word what kmd_logic ce_present.rs `copy` emits for the
+ *   windowed source (test production_block_linear_push_follows_nvk).
+ *   PTE kind of a GPU mapping: NVOS46_FLAGS_PAGE_KIND_OVERRIDE 19:19 plus
+ *   NVOS46_PARAMETERS.kindOverride (nvos.h; crm_map_dma2), the way nvk-rm
+ *   patch 0005 (nvkmd_rm_va_bind_mem, 426-456) maps an image's VA with the
+ *   image's kind; patches 0022 and 0027 keep that rule ("kinds are applied
+ *   per mapping", 0027:159) and the memory itself is allocated without a
+ *   kind (no NVOS32_ATTR_FORMAT, COMPR_NONE), as NVK allocates it.
+ *   GB202 kinds: PITCH 0x00, GENERIC_MEMORY 0x06 (dev_mmu.h).
+ *   Component remap (--remap swap-rb): SET_REMAP_COMPONENTS 0x708 with
+ *   DST_X 2:0, DST_Y 6:4, DST_Z 10:8, DST_W 14:12 (SRC_X..SRC_W 0..3),
+ *   COMPONENT_SIZE 17:16 (ONE 0), NUM_SRC_COMPONENTS 21:20 and
+ *   NUM_DST_COMPONENTS 25:24 (FOUR 3), and LAUNCH_DMA REMAP_ENABLE 10: Mesa's
+ *   clcab5.h and clc7b5.h and the 610.57.04 clc7b5.h (all agree); the
+ *   610.57.04 clcab5.h omits them (UNVERIFIED there, as above). Swap R and
+ *   B: DST_X = SRC_Z, DST_Y = SRC_Y, DST_Z = SRC_X, DST_W = SRC_W, 1-byte
+ *   components, 4 in and 4 out = 0x03303012. With the remap on, X is counted
+ *   in elements of 4 bytes (NVK's nouveau_copy_rect): LINE_LENGTH_IN,
+ *   SET_SRC/DST_WIDTH and SRC/DST_ORIGIN_X are pixels, PITCH_IN/OUT stay
+ *   bytes. SET_REMAP_COMPONENTS goes after the copy's T1 semaphore address,
+ *   before OFFSET_IN_UPPER: the order of kmd_logic ce_present.rs `copy`
+ *   (tests swap_rb_pitch_to_pitch_words_reproduce_the_tool and
+ *   swap_rb_block_linear_to_pitch_words).
  *
  * Usage: crm_ce_copy_smoke [options]
  *   --gen gb202|ada        class set (default gb202: 0xca6f, 0xcab5, 0xc761;
@@ -81,6 +113,39 @@
  *   --release cpu|semsurf  the CPU sets V by a store (default) or SET_VALUE
  *   --timeout-ms <ms>      bound of every CPU wait (default 2000)
  *   --fence                (Windows) also time doorbell -> RM fence event
+ *   --bl-roundtrip         instead of the measured loop: per round the image
+ *                          is zeroed (PITCH -> PITCH from zeroed pages), then
+ *                          one push [copy pitch source -> block-linear image; host
+ *                          release (WFI); copy block-linear image -> pitch
+ *                          destination; release], then the CPU compares the
+ *                          destination with the pattern (bl_roundtrip=ok|BAD)
+ *                          (rounds: --iterations, default 16)
+ *   --bl-probe-pitch       also (implies --bl-roundtrip) copy the image out
+ *                          PITCH -> PITCH: its checksum must differ from the
+ *                          unswizzled pattern's (bl_probe_pitch=swizzled)
+ *   --modifier <hex>       the image's DRM modifier (default
+ *                          0x0300000000606014: NVIDIA block-linear 2D, h = 4,
+ *                          k = 0x06, g = 2, s = 1, c = 0, Heaven's windowed
+ *                          source); 32 bpp families only
+ *   --seed <n>             pattern seed, every mode (default 0xc0e5a11d; 0
+ *                          is allowed: then only word 0 of the pattern is 0)
+ *   --bl-kind <hex>        PTE kind of the image's GPU mapping (default the
+ *                          modifier's k; 0 = no override: the allocation's
+ *                          own pitch kind)
+ *   --remap none|swap-rb   copy through the CE remap unit, R and B swapped
+ *                          (an RGBA source into a BGRA destination). In the
+ *                          measured loop the measured copies remap and the
+ *                          verify expects the swapped pattern (remap_verify).
+ *                          With --bl-roundtrip: instead of the round trip, a
+ *                          matrix of copies with the remap off and on:
+ *                          pitch -> pitch, pitch -> BL -> pitch, pitch -> BL
+ *                          with remap, BL -> pitch with remap; per-stage
+ *                          times, remap_gbps lines, which combinations the
+ *                          engine accepted (default none)
+ *   --bl-src-only          (implies --bl-roundtrip --remap swap-rb) only the
+ *                          open question: pitch -> BL without remap, then
+ *                          BL -> pitch WITH remap (REMAP with a block-linear
+ *                          source), verified against the swapped pattern
  * Exit 0 on PASS, 1 on FAIL.
  */
 #ifndef _WIN32
@@ -145,6 +210,8 @@
 
 #define NVOS46_FLAGS_CACHE_SNOOP_ENABLE (1u << 4)  /* nvos.h 4:4 */
 #define NVOS46_FLAGS_PAGE_SIZE_4KB (1u << 8)       /* nvos.h 11:8 */
+#define NVOS46_FLAGS_PAGE_SIZE_BIG (2u << 8)       /* nvos.h 11:8 */
+#define NVOS46_FLAGS_PAGE_KIND_OVERRIDE (1u << 19) /* nvos.h 19:19, nvk-rm 0027 */
 #define SYSMEM_MAP_FLAGS (NVOS46_FLAGS_CACHE_SNOOP_ENABLE | NVOS46_FLAGS_PAGE_SIZE_4KB)
 
 typedef struct {
@@ -249,6 +316,24 @@ _Static_assert(sizeof(nv_notification) == 16, "NvNotification");
 #define NVB5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH (1u << 7)
 #define NVB5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH (1u << 8)
 #define NVB5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE (1u << 9)
+#define NVB5_LAUNCH_DMA_REMAP_ENABLE_TRUE (1u << 10)
+/* Component remap (see the header comment) */
+#define NVB5_SET_REMAP_COMPONENTS 0x0708u
+#define NVB5_REMAP_SWAP_RB 0x03303012u /* DST_X=SRC_Z, DST_Z=SRC_X, Y and W identity, 1 B x 4 */
+#define NVB5_REMAP_ELEMENT_BYTES 4u
+/* Block-linear surfaces (see the header comment) */
+#define NVB5_SET_DST_BLOCK_SIZE 0x070cu /* then DST_WIDTH, HEIGHT, DEPTH, LAYER */
+#define NVB5_SET_SRC_BLOCK_SIZE 0x0728u /* then SRC_WIDTH, HEIGHT, DEPTH, LAYER */
+#define NVB5_SRC_ORIGIN_X 0x0744u       /* then SRC_ORIGIN_Y */
+#define NVB5_DST_ORIGIN_X 0x074cu       /* then DST_ORIGIN_Y */
+#define NVB5_BLOCK_SIZE_GOB_HEIGHT_FERMI_8 (1u << 12)
+#define NVB5_BLOCK_SIZE_KIND_BPP_BL_32 (0u << 16) /* 0xcab5 only */
+
+/* DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c, s, g, k, h) fields (drm_fourcc.h) */
+#define MOD_VENDOR_NVIDIA 0x03u
+#define MOD_DEFAULT_BL 0x0300000000606014ull /* Heaven's windowed source */
+#define GOB_BYTES_X 64u
+#define GOB_ROWS 8u
 /* SRC_TYPE/DST_TYPE VIRTUAL, FLUSH_TYPE SYS and SEMAPHORE_PAYLOAD_SIZE
  * ONE_WORD are all 0. */
 
@@ -279,6 +364,11 @@ _Static_assert(sizeof(nv_notification) == 16, "NvNotification");
 #define ST_K 64u      /* contender completion (64-bit) */
 #define ST_K_T0 96u
 #define ST_K_T1 112u
+#define ST_BL_A0 128u  /* --bl-roundtrip: before / after the pitch -> BL copy */
+#define ST_BL_A1 144u
+#define ST_BL_B0 160u  /* before / after the BL -> pitch copy */
+#define ST_BL_B1 176u
+#define ST_BL_MID 192u /* host release between the two copies (64-bit) */
 
 #define MIB (1024ull * 1024ull)
 #define VA_BASE 0x2000000000ull /* 128 GiB: below 2^40 (GP_ENTRY1_GET_HI is 8 bits) */
@@ -335,7 +425,37 @@ static inline void full_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 
-static uint32_t pattern(size_t i) { return (uint32_t)(i * 2654435761u) ^ 0xc0e5a11du; }
+/* The pattern's seed (--seed, fixed by default so that two runs produce
+ * byte-identical sources; --bl-roundtrip zeroes its image first, so stale
+ * video memory of an earlier run cannot pass for a copy that did not happen) */
+#define PATTERN_SEED_DEFAULT 0xc0e5a11du
+static uint32_t pattern_salt = PATTERN_SEED_DEFAULT;
+static uint32_t pattern(size_t i) { return (uint32_t)(i * 2654435761u) ^ pattern_salt; }
+/* Bytes 0 and 2 of a pixel exchanged: the pattern read as RGBA, written as
+ * BGRA (what the swap-rb remap must produce) */
+static uint32_t swap_rb(uint32_t w) { return (w & 0xff00ff00u) | ((w & 0xffu) << 16) | ((w >> 16) & 0xffu); }
+static uint32_t expect(size_t i, int remap) { return remap ? swap_rb(pattern(i)) : pattern(i); }
+
+/* FNV-1a 64 over 32-bit words, in order (position-dependent: a permutation
+ * of the same words gives another value) */
+static uint64_t fnv_words(const volatile uint32_t *w, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= w[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+static uint64_t fnv_pattern(size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= pattern(i);
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
 
 /* Growable sample arrays and statistics */
 struct samples {
@@ -396,15 +516,15 @@ static uint64_t next_va = VA_BASE;
 /* GPU-map at a fixed, 2 MiB aligned VA below 2^40 (RM aligns a default page
  * size virtual allocation to 64 KiB, and offset and size to 2 MiB from 2 MiB
  * up: nvk-rm patch 0008); RM's choice if the fixed range is refused. */
-static int gpu_map(crm_client *c, uint32_t dev, uint32_t vas, struct gmem *m, uint32_t flags,
-                   const char *what)
+static int gpu_map_kind(crm_client *c, uint32_t dev, uint32_t vas, struct gmem *m, uint32_t flags,
+                        uint32_t kind, const char *what)
 {
     char w[200];
     uint64_t va = next_va;
-    int r = crm_map_dma2(c, dev, vas, m->h, 0, m->size, flags, 0, 0, &va);
+    int r = crm_map_dma2(c, dev, vas, m->h, 0, m->size, flags, 0, kind, &va);
     if (r > 0) {
         va = 0;
-        r = crm_map_dma2(c, dev, vas, m->h, 0, m->size, flags, 0, 0, &va);
+        r = crm_map_dma2(c, dev, vas, m->h, 0, m->size, flags, 0, kind, &va);
     }
     snprintf(w, sizeof w, "GPU-map %s (%" PRIu64 " bytes) -> VA 0x%" PRIx64, what, m->size, va);
     if (step(w, r))
@@ -413,6 +533,12 @@ static int gpu_map(crm_client *c, uint32_t dev, uint32_t vas, struct gmem *m, ui
     if (va == next_va)
         next_va += align_up(m->size, 2 * MIB) + 2 * MIB;
     return 0;
+}
+
+static int gpu_map(crm_client *c, uint32_t dev, uint32_t vas, struct gmem *m, uint32_t flags,
+                   const char *what)
+{
+    return gpu_map_kind(c, dev, vas, m, flags, 0, what);
 }
 
 static void gpu_unmap(crm_client *c, uint32_t dev, uint32_t vas, struct gmem *m)
@@ -706,30 +832,114 @@ static unsigned emit_ce_sem_addr(uint32_t *p, unsigned n, uint64_t va, uint32_t 
     return n;
 }
 
+/* X in the copy's units: bytes, or 4-byte elements with the remap on */
+static uint32_t x_units(uint32_t bytes, int remap) { return remap ? bytes / NVB5_REMAP_ELEMENT_BYTES : bytes; }
+
+/* SET_REMAP_COMPONENTS for swap-rb, when the copy remaps */
+static unsigned emit_remap(uint32_t *p, unsigned n, int remap)
+{
+    if (remap) {
+        p[n++] = mthd(SUBC_CE, NVB5_SET_REMAP_COMPONENTS, 1);
+        p[n++] = NVB5_REMAP_SWAP_RB;
+    }
+    return n;
+}
+
 /* T0 (CE semaphore-only launch with timestamp), the pitch copy with its own
- * timestamped semaphore (T1) */
+ * timestamped semaphore (T1); remap: R and B swapped by the remap unit */
 static unsigned emit_ce_copy(uint32_t *p, unsigned n, uint64_t src, uint64_t dst, uint32_t pitch,
-                             uint32_t lines, uint64_t t0_va, uint64_t t1_va, uint32_t payload)
+                             uint32_t lines, uint64_t t0_va, uint64_t t1_va, uint32_t payload, int remap)
 {
     n = emit_ce_sem_addr(p, n, t0_va, payload);
     p[n++] = mthd(SUBC_CE, NVB5_LAUNCH_DMA, 1);
     p[n++] = NVB5_LAUNCH_DMA_DATA_TRANSFER_TYPE_NONE | NVB5_LAUNCH_DMA_FLUSH_ENABLE_TRUE |
              NVB5_LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_SEMAPHORE_WITH_TIMESTAMP;
     n = emit_ce_sem_addr(p, n, t1_va, payload);
+    n = emit_remap(p, n, remap);
     p[n++] = mthd(SUBC_CE, NVB5_OFFSET_IN_UPPER, 8);
     p[n++] = (uint32_t)(src >> 32) & 0x1ffffffu;
     p[n++] = (uint32_t)src;
     p[n++] = (uint32_t)(dst >> 32) & 0x1ffffffu;
     p[n++] = (uint32_t)dst;
-    p[n++] = pitch; /* PITCH_IN */
-    p[n++] = pitch; /* PITCH_OUT */
-    p[n++] = pitch; /* LINE_LENGTH_IN (bytes) */
-    p[n++] = lines; /* LINE_COUNT */
+    p[n++] = pitch;                   /* PITCH_IN */
+    p[n++] = pitch;                   /* PITCH_OUT */
+    p[n++] = x_units(pitch, remap);   /* LINE_LENGTH_IN (bytes, or pixels with the remap) */
+    p[n++] = lines;                   /* LINE_COUNT */
     p[n++] = mthd(SUBC_CE, NVB5_LAUNCH_DMA, 1);
     p[n++] = NVB5_LAUNCH_DMA_DATA_TRANSFER_TYPE_NON_PIPELINED | NVB5_LAUNCH_DMA_FLUSH_ENABLE_TRUE |
              NVB5_LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_SEMAPHORE_WITH_TIMESTAMP |
              NVB5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH | NVB5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH |
-             NVB5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE;
+             NVB5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE | (remap ? NVB5_LAUNCH_DMA_REMAP_ENABLE_TRUE : 0u);
+    return n;
+}
+
+/* One side of a copy that may be block-linear */
+struct surf {
+    uint64_t va;       /* pitch: the first byte; block-linear: the image base */
+    uint32_t pitch;    /* row pitch in bytes (block-linear: whole GOBs) */
+    int bl;            /* block-linear */
+    uint32_t block;    /* SET_*_BLOCK_SIZE word (bl) */
+    uint32_t height;   /* image rows, SET_*_HEIGHT (bl) */
+};
+
+/* T0, then a copy of line_bytes x lines between two surfaces, each pitch or
+ * block-linear, with its own timestamped semaphore (T1). The order of the
+ * words is ce_present.rs `copy` (offsets, the source block-linear state, the
+ * destination block-linear state, LAUNCH_DMA), so a block-linear -> pitch
+ * copy is the KMD's word for word (plus the stamps). remap: SET_REMAP_COMPONENTS
+ * first (swap-rb), REMAP_ENABLE, and X in elements (LINE_LENGTH_IN, WIDTH,
+ * ORIGIN_X), as ce_present.rs emits it. */
+static unsigned emit_ce_copy_surf(uint32_t *p, unsigned n, const struct surf *s, const struct surf *d,
+                                  uint32_t line_bytes, uint32_t lines, uint64_t t0_va, uint64_t t1_va,
+                                  uint32_t payload, int remap)
+{
+    n = emit_ce_sem_addr(p, n, t0_va, payload);
+    p[n++] = mthd(SUBC_CE, NVB5_LAUNCH_DMA, 1);
+    p[n++] = NVB5_LAUNCH_DMA_DATA_TRANSFER_TYPE_NONE | NVB5_LAUNCH_DMA_FLUSH_ENABLE_TRUE |
+             NVB5_LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_SEMAPHORE_WITH_TIMESTAMP;
+    n = emit_ce_sem_addr(p, n, t1_va, payload);
+    n = emit_remap(p, n, remap);
+    p[n++] = mthd(SUBC_CE, NVB5_OFFSET_IN_UPPER, 8);
+    p[n++] = (uint32_t)(s->va >> 32) & 0x1ffffffu;
+    p[n++] = (uint32_t)s->va;
+    p[n++] = (uint32_t)(d->va >> 32) & 0x1ffffffu;
+    p[n++] = (uint32_t)d->va;
+    p[n++] = s->pitch;  /* PITCH_IN */
+    p[n++] = d->pitch;  /* PITCH_OUT */
+    p[n++] = x_units(line_bytes, remap); /* LINE_LENGTH_IN */
+    p[n++] = lines;     /* LINE_COUNT */
+    uint32_t launch = NVB5_LAUNCH_DMA_DATA_TRANSFER_TYPE_NON_PIPELINED | NVB5_LAUNCH_DMA_FLUSH_ENABLE_TRUE |
+                      NVB5_LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_SEMAPHORE_WITH_TIMESTAMP |
+                      NVB5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE |
+                      (remap ? NVB5_LAUNCH_DMA_REMAP_ENABLE_TRUE : 0u);
+    if (s->bl) {
+        p[n++] = mthd(SUBC_CE, NVB5_SET_SRC_BLOCK_SIZE, 5);
+        p[n++] = s->block;
+        p[n++] = x_units(s->pitch, remap); /* SET_SRC_WIDTH: the pitch (no tile width) */
+        p[n++] = s->height; /* SET_SRC_HEIGHT */
+        p[n++] = 1;         /* SET_SRC_DEPTH */
+        p[n++] = 0;         /* SET_SRC_LAYER */
+        p[n++] = mthd(SUBC_CE, NVB5_SRC_ORIGIN_X, 2);
+        p[n++] = 0;
+        p[n++] = 0;
+    } else {
+        launch |= NVB5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH;
+    }
+    if (d->bl) {
+        p[n++] = mthd(SUBC_CE, NVB5_SET_DST_BLOCK_SIZE, 5);
+        p[n++] = d->block;
+        p[n++] = x_units(d->pitch, remap);
+        p[n++] = d->height;
+        p[n++] = 1;
+        p[n++] = 0;
+        p[n++] = mthd(SUBC_CE, NVB5_DST_ORIGIN_X, 2);
+        p[n++] = 0;
+        p[n++] = 0;
+    } else {
+        launch |= NVB5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH;
+    }
+    p[n++] = mthd(SUBC_CE, NVB5_LAUNCH_DMA, 1);
+    p[n++] = launch;
     return n;
 }
 
@@ -792,6 +1002,14 @@ struct opts {
     int release_semsurf;
     unsigned timeout_ms;
     int fence;
+    int iterations_set;
+    int bl;             /* --bl-roundtrip */
+    int bl_probe;       /* --bl-probe-pitch */
+    uint64_t modifier;
+    int bl_kind;        /* -1: the modifier's k */
+    uint32_t seed;      /* pattern seed */
+    int remap;          /* --remap swap-rb */
+    int bl_src_only;    /* --bl-src-only */
 };
 
 static int parse(int argc, char **argv, struct opts *o)
@@ -806,6 +1024,9 @@ static int parse(int argc, char **argv, struct opts *o)
     o->contend_engine = -1;
     o->contend_mb = 64;
     o->timeout_ms = 2000;
+    o->modifier = MOD_DEFAULT_BL;
+    o->bl_kind = -1;
+    o->seed = PATTERN_SEED_DEFAULT;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -836,6 +1057,7 @@ static int parse(int argc, char **argv, struct opts *o)
         } else if (!strcmp(a, "--iterations")) {
             NEEDV;
             o->iterations = (unsigned)strtoul(v, NULL, 0);
+            o->iterations_set = 1;
         } else if (!strcmp(a, "--duration")) {
             NEEDV;
             o->duration_s = atof(v);
@@ -873,6 +1095,34 @@ static int parse(int argc, char **argv, struct opts *o)
             o->timeout_ms = (unsigned)strtoul(v, NULL, 0);
         } else if (!strcmp(a, "--fence")) {
             o->fence = 1;
+        } else if (!strcmp(a, "--bl-roundtrip")) {
+            o->bl = 1;
+        } else if (!strcmp(a, "--bl-probe-pitch")) {
+            o->bl = 1;
+            o->bl_probe = 1;
+        } else if (!strcmp(a, "--modifier")) {
+            NEEDV;
+            o->modifier = strtoull(v, NULL, 16);
+        } else if (!strcmp(a, "--seed")) {
+            NEEDV;
+            o->seed = (uint32_t)strtoul(v, NULL, 0);
+        } else if (!strcmp(a, "--bl-kind")) {
+            NEEDV;
+            o->bl_kind = (int)(strtoul(v, NULL, 16) & 0xffu);
+        } else if (!strcmp(a, "--remap")) {
+            NEEDV;
+            if (!strcmp(v, "swap-rb"))
+                o->remap = 1;
+            else if (!strcmp(v, "none"))
+                o->remap = 0;
+            else {
+                fprintf(stderr, "--remap none|swap-rb\n");
+                return -1;
+            }
+        } else if (!strcmp(a, "--bl-src-only")) {
+            o->bl = 1;
+            o->remap = 1;
+            o->bl_src_only = 1;
         } else {
             fprintf(stderr, "unknown option %s (see the header of crm_ce_copy_smoke.c)\n", a);
             return -1;
@@ -889,7 +1139,493 @@ static int parse(int argc, char **argv, struct opts *o)
         fprintf(stderr, "--size: at most 1 GiB\n");
         return -1;
     }
+    if (o->bl) {
+        if (o->contend || o->fence || o->duration_s > 0) {
+            fprintf(stderr, "--bl-roundtrip runs alone (no --contend, --fence, --duration)\n");
+            return -1;
+        }
+        if (!o->iterations_set)
+            o->iterations = 16;
+        if (o->width > 16384 || o->height > 16384) {
+            fprintf(stderr, "--bl-roundtrip: at most 16384x16384\n");
+            return -1;
+        }
+        if (o->remap && o->bl_probe) {
+            fprintf(stderr, "--bl-probe-pitch runs without --remap (the remap matrix has no probe)\n");
+            return -1;
+        }
+    }
     return 0;
+}
+
+/* ---- Block-linear image (--bl-roundtrip) ---- */
+
+struct bl_layout {
+    uint32_t h, k, g, s, c; /* modifier fields */
+    uint32_t pitch;         /* row pitch: width * 4 rounded up to whole GOBs */
+    uint32_t rows;          /* height rounded up to whole blocks (8 << h rows) */
+    uint64_t size;          /* pitch * rows, the object a producer allocates */
+    uint32_t block;         /* SET_*_BLOCK_SIZE word */
+};
+
+/* The 32 bpp DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D modifiers: vendor 0x03 in
+ * 63:56, the 2D bit 4, h 3:0 (at most 5), k 19:12, g 21:20, s 22, c 25:23,
+ * and 27:26 zero (the 8 and 16 bpp GOB families set them; kmd_logic
+ * foreign_resource gb20x_family). Size and pitch as foreign_resource Layout
+ * computes them: rows rounded up to the block, the pitch whole GOBs. */
+static int bl_layout(const struct gen *g, uint64_t mod, uint32_t width, uint32_t height,
+                     struct bl_layout *l)
+{
+    memset(l, 0, sizeof *l);
+    if ((uint32_t)(mod >> 56) != MOD_VENDOR_NVIDIA || !(mod & 0x10u) || (mod >> 26) & 0x3u ||
+        (mod >> 28) & 0xfffffffull)
+        return -1;
+    l->h = (uint32_t)(mod & 0xfu);
+    l->k = (uint32_t)(mod >> 12) & 0xffu;
+    l->g = (uint32_t)(mod >> 20) & 0x3u;
+    l->s = (uint32_t)(mod >> 22) & 0x1u;
+    l->c = (uint32_t)(mod >> 23) & 0x7u;
+    if (l->h > 5 || l->c != 0)
+        return -1;
+    l->pitch = (uint32_t)align_up((uint64_t)width * 4u, GOB_BYTES_X);
+    l->rows = (uint32_t)align_up(height, GOB_ROWS << l->h);
+    l->size = (uint64_t)l->pitch * l->rows;
+    l->block = (l->h << 4) | NVB5_BLOCK_SIZE_GOB_HEIGHT_FERMI_8;
+    if (g->ce == 0xcab5)
+        l->block |= NVB5_BLOCK_SIZE_KIND_BPP_BL_32;
+    return 0;
+}
+
+struct bl_run {
+    struct copier *k;
+    struct chan *ch;
+    const struct opts *o;
+    const struct bl_layout *l;
+    struct gmem *src, *img, *dst, *stamp, *done;
+    uint32_t pitch;
+    uint32_t kind;          /* PTE kind of the image's mapping */
+    uint64_t copy_bytes;
+    uint64_t *seq;
+    uint32_t *pay;
+    uint64_t *last_c;
+};
+
+static double stamp_us(volatile uint8_t *st, uint32_t a, uint32_t b)
+{
+    const uint64_t t0 = *(volatile uint64_t *)(st + a + 8);
+    const uint64_t t1 = *(volatile uint64_t *)(st + b + 8);
+    return t1 >= t0 ? (double)(t1 - t0) / 1000.0 : -1.0;
+}
+
+/* Zero the whole image (bl.size bytes, padding rows included) through the
+ * PITCH -> PITCH path the M1 run proved, from the zeroed destination pages,
+ * in chunks of at most dst.size bytes. The pattern seed is fixed (--seed),
+ * so without this an image left in video memory by an earlier run with the
+ * same seed could pass for a copy that did not happen. dst must be zero. */
+static const char *bl_clear(struct bl_run *r)
+{
+    const struct bl_layout *l = r->l;
+    const double tmo = (double)r->o->timeout_ms * 1000.0;
+    const uint32_t chunk = (uint32_t)(r->dst->size / l->pitch); /* rows per copy */
+    uint32_t row = 0;
+    if (chunk == 0)
+        return "bl clear: destination smaller than one image row";
+    while (row < l->rows) {
+        const uint64_t cval = ++*r->seq;
+        const uint32_t py = ++*r->pay;
+        *r->last_c = cval;
+        uint32_t *p = slot(r->ch);
+        unsigned n = 0;
+        /* 21 dwords per chunk, 6 for the release: 5 chunks per 128-dword slot */
+        for (unsigned c = 0; c < 5 && row < l->rows; c++) {
+            const uint32_t lines = l->rows - row < chunk ? l->rows - row : chunk;
+            const struct surf zero = { .va = r->dst->va, .pitch = l->pitch };
+            const struct surf part = { .va = r->img->va + (uint64_t)row * l->pitch, .pitch = l->pitch };
+            n = emit_ce_copy_surf(p, n, &zero, &part, l->pitch, lines, r->stamp->va + ST_BL_A0,
+                                  r->stamp->va + ST_BL_A1, py, 0);
+            row += lines;
+        }
+        n = emit_release(p, n, r->done->va, cval, 1, 0);
+        kick(r->k, r->ch, n);
+        if (!spin_ge((volatile uint64_t *)r->done->cpu, cval, now_us() + tmo))
+            return "bl clear: completion not seen";
+        if (channel_error(r->ch))
+            return "bl clear: channel error";
+    }
+    return NULL;
+}
+
+/* The rounds and the probe; NULL when every push completed (the verdicts
+ * are printed and failed through step()), else why it stopped. */
+static const char *bl_roundtrip(struct bl_run *r)
+{
+    const struct opts *o = r->o;
+    const struct bl_layout *l = r->l;
+    volatile uint8_t *st = r->stamp->cpu;
+    volatile uint64_t *cdone = r->done->cpu;
+    const double tmo = (double)o->timeout_ms * 1000.0;
+    const size_t words = (size_t)(r->copy_bytes / 4);
+    const uint32_t line = o->width * 4u;
+    const struct surf src = { .va = r->src->va, .pitch = r->pitch };
+    const struct surf dst = { .va = r->dst->va, .pitch = r->pitch };
+    const struct surf img = { .va = r->img->va, .pitch = l->pitch, .bl = 1, .block = l->block,
+                              .height = o->height };
+    const struct surf img_as_pitch = { .va = r->img->va, .pitch = l->pitch };
+    struct samples s_a = { .name = "bl_copy_pitch_to_bl_us" };
+    struct samples s_b = { .name = "bl_copy_bl_to_pitch_us" };
+    struct samples s_rt = { .name = "bl_roundtrip_doorbell_to_done_us" };
+    const char *stop = NULL;
+    uint64_t bad_words = 0;
+    unsigned rounds = 0, bad_rounds = 0, shown = 0;
+
+    printf("status: block-linear round trip, %u rounds\n", o->iterations);
+    fflush(stdout);
+    for (unsigned it = 0; it < o->iterations; it++) {
+        memset(r->dst->cpu, 0, r->dst->size);
+        full_fence();
+        stop = bl_clear(r);
+        if (stop)
+            break;
+        /* after the clear: its releases took values from the same sequence */
+        const uint64_t mid = ++*r->seq, cval = ++*r->seq;
+        const uint32_t py = ++*r->pay;
+        *r->last_c = cval;
+        uint32_t *p = slot(r->ch);
+        unsigned n = emit_ce_copy_surf(p, 0, &src, &img, line, o->height, r->stamp->va + ST_BL_A0,
+                                       r->stamp->va + ST_BL_A1, py, 0);
+        n = emit_release(p, n, r->stamp->va + ST_BL_MID, mid, 1, 0);
+        n = emit_ce_copy_surf(p, n, &img, &dst, line, o->height, r->stamp->va + ST_BL_B0,
+                              r->stamp->va + ST_BL_B1, py, 0);
+        n = emit_release(p, n, r->done->va, cval, 1, 0);
+        if (n > PUSH_SLOT_DW) {
+            step("block-linear push fits one slot", -E2BIG);
+            return "push too large";
+        }
+        const double a = now_us();
+        kick(r->k, r->ch, n);
+        const int ok = spin_ge(cdone, cval, a + tmo);
+        const double b = now_us();
+        if (!ok) {
+            printf("       round %u: middle release %s\n", it,
+                   *(volatile uint64_t *)(st + ST_BL_MID) >= mid ? "seen (the pitch -> BL copy finished)"
+                                                                 : "NOT seen (stuck in the pitch -> BL copy)");
+            stop = "bl round trip: completion not seen";
+            break;
+        }
+        if (channel_error(r->ch)) {
+            stop = "bl round trip: channel error";
+            break;
+        }
+        add(&s_rt, b - a);
+        if (spin_ge32((volatile uint32_t *)(st + ST_BL_B1), py, b + tmo)) {
+            const double ua = stamp_us(st, ST_BL_A0, ST_BL_A1), ub = stamp_us(st, ST_BL_B0, ST_BL_B1);
+            if (ua >= 0)
+                add(&s_a, ua);
+            if (ub >= 0)
+                add(&s_b, ub);
+        }
+        const volatile uint32_t *dw = r->dst->cpu;
+        uint64_t bad = 0;
+        for (size_t i = 0; i < words; i++) {
+            const uint32_t want = pattern(i);
+            if (dw[i] != want) {
+                if (shown < 8) {
+                    const uint64_t off = (uint64_t)i * 4u;
+                    printf("       mismatch round %u: offset 0x%" PRIx64 " (x %u, y %u): want 0x%08x got 0x%08x\n",
+                           it, off, (unsigned)((off % r->pitch) / 4u), (unsigned)(off / r->pitch), want,
+                           dw[i]);
+                    shown++;
+                }
+                bad++;
+            }
+        }
+        bad_words += bad;
+        bad_rounds += bad != 0;
+        rounds++;
+    }
+
+    uint64_t probe_sum = 0, want_sum = 0;
+    size_t in_place = 0;
+    int probed = 0;
+    if (!stop && o->bl_probe) {
+        /* The image as plain memory: PITCH -> PITCH with the image's pitch */
+        const uint64_t cval = ++*r->seq;
+        const uint32_t py = ++*r->pay;
+        *r->last_c = cval;
+        memset(r->dst->cpu, 0, r->copy_bytes);
+        full_fence();
+        uint32_t *p = slot(r->ch);
+        unsigned n = emit_ce_copy_surf(p, 0, &img_as_pitch, &dst, line, o->height,
+                                       r->stamp->va + ST_BL_A0, r->stamp->va + ST_BL_A1, py, 0);
+        n = emit_release(p, n, r->done->va, cval, 1, 0);
+        kick(r->k, r->ch, n);
+        if (!spin_ge(cdone, cval, now_us() + tmo))
+            stop = "bl probe: completion not seen";
+        else if (channel_error(r->ch))
+            stop = "bl probe: channel error";
+        else {
+            const volatile uint32_t *dw = r->dst->cpu;
+            probe_sum = fnv_words(dw, words);
+            want_sum = fnv_pattern(words);
+            for (size_t i = 0; i < words; i++)
+                in_place += dw[i] == pattern(i);
+            probed = 1;
+        }
+    }
+
+    printf("\n%-38s %6s %10s %10s %10s %10s %10s\n", "stage", "n", "min", "avg", "p50", "p99", "max");
+    stats_row(&s_a);
+    stats_row(&s_b);
+    stats_row(&s_rt);
+    printf("\n");
+    if (s_b.n)
+        printf("bl_copy_gbps_p50=%.2f (block-linear -> pitch)\n",
+               (double)r->copy_bytes / (s_b.v[s_b.n / 2] * 1000.0));
+    printf("bl_roundtrip=%s (%u rounds, %u bad, %" PRIu64 " bad words)\n",
+           !stop && rounds && bad_words == 0 ? "ok" : "BAD", rounds, bad_rounds, bad_words);
+    if (probed) {
+        printf("bl_probe_pitch=%s checksum_bl_as_pitch=0x%016" PRIx64 " checksum_unswizzled=0x%016" PRIx64
+               " words_in_place=%zu/%zu\n",
+               probe_sum != want_sum ? "swizzled" : "IDENTICAL", probe_sum, want_sum, in_place, words);
+        /* FNV-1a 64 over the 32-bit words, in order, of the first `height`
+         * rows of the image read as pitch (and of the pattern) */
+        printf("bl_probe_digest=0x%016" PRIx64 " seed=0x%08x bl_kind=0x%02x\n", probe_sum, pattern_salt,
+               r->kind);
+        printf("pattern_digest=0x%016" PRIx64 " seed=0x%08x\n", want_sum, pattern_salt);
+        printf("bl_probe_vs_kind_note: compare bl_probe_digest between --bl-kind 0x06 and --bl-kind 0 runs with "
+               "the same --seed: equal digests mean the page kind does not change the physical layout of this "
+               "copy path\n");
+    }
+    if (!stop) {
+        if (!rounds || bad_words)
+            step("block-linear round trip matches the pattern", -EIO);
+        if (probed && probe_sum == want_sum)
+            step("the image read as pitch differs from the unswizzled pattern", -EIO);
+    }
+    free(s_a.v);
+    free(s_b.v);
+    free(s_rt.v);
+    return stop;
+}
+
+/* ---- Remap matrix (--bl-roundtrip --remap swap-rb, --bl-src-only) ---- */
+
+/* The combinations, in the order they run. Each runs all its rounds before
+ * the next starts, so a refusal or a hang is attributable to exactly one
+ * combination and the ones before it keep their numbers. */
+enum { RC_P2P_OFF, RC_P2P_ON, RC_BL_OFF, RC_BL_DST_ON, RC_BL_SRC_ON, RC_N };
+struct remap_combo {
+    const char *name;
+    int bl;       /* through the block-linear image (two copies) */
+    int remap_a;  /* the first copy (pitch -> pitch, or pitch -> BL) remaps */
+    int remap_b;  /* the second copy (BL -> pitch) remaps */
+    const char *what;
+};
+static const struct remap_combo remap_combos[RC_N] = {
+    { "pitch_to_pitch_off", 0, 0, 0, "pitch -> pitch, no remap" },
+    { "pitch_to_pitch_on", 0, 1, 0, "pitch -> pitch, remap swap-rb" },
+    { "bl_off", 1, 0, 0, "pitch -> BL, BL -> pitch, no remap" },
+    { "bl_dst_remap", 1, 1, 0, "pitch -> BL WITH remap, BL -> pitch without (fallback: remap into the BL image)" },
+    { "bl_src_remap", 1, 0, 1,
+      "pitch -> BL without remap, BL -> pitch WITH remap (the open question: REMAP with a block-linear source; "
+      "Heaven's case)" },
+};
+
+/* Stage rows: three paths, remap off and on */
+enum { RS_P2P, RS_P2BL, RS_BL2P, RS_PATHS };
+static const char *const remap_path_names[RS_PATHS] = { "pitch_to_pitch", "pitch_to_bl", "bl_to_pitch" };
+
+static double p50_sorted(struct samples *s)
+{
+    if (!s->n)
+        return 0;
+    qsort(s->v, s->n, sizeof(double), cmp_d);
+    return s->v[s->n / 2];
+}
+
+/* One combination, `rounds` times; NULL when every push completed without
+ * a channel error (the data verdict is counted in *bad_words), else why it
+ * stopped. */
+static const char *remap_combo_run(struct bl_run *r, const struct remap_combo *c, struct samples st[RS_PATHS][2],
+                                   uint64_t *bad_words, unsigned *rounds_done)
+{
+    const struct opts *o = r->o;
+    const struct bl_layout *l = r->l;
+    volatile uint8_t *stp = r->stamp->cpu;
+    volatile uint64_t *cdone = r->done->cpu;
+    const double tmo = (double)o->timeout_ms * 1000.0;
+    const size_t words = (size_t)(r->copy_bytes / 4);
+    const uint32_t line = o->width * 4u;
+    const int swapped = c->remap_a || c->remap_b;
+    const struct surf src = { .va = r->src->va, .pitch = r->pitch };
+    const struct surf dst = { .va = r->dst->va, .pitch = r->pitch };
+    const struct surf img = { .va = r->img->va, .pitch = l->pitch, .bl = 1, .block = l->block,
+                              .height = o->height };
+    unsigned shown = 0;
+
+    printf("status: remap combination %s starts: %s, %u rounds\n", c->name, c->what, o->iterations);
+    fflush(stdout);
+    for (unsigned it = 0; it < o->iterations; it++) {
+        memset(r->dst->cpu, 0, r->dst->size);
+        full_fence();
+        if (c->bl) {
+            const char *stop = bl_clear(r);
+            if (stop)
+                return stop;
+        }
+        const uint64_t mid = ++*r->seq, cval = ++*r->seq;
+        const uint32_t py = ++*r->pay;
+        *r->last_c = cval;
+        uint32_t *p = slot(r->ch);
+        unsigned n;
+        if (!c->bl) {
+            n = emit_ce_copy_surf(p, 0, &src, &dst, line, o->height, r->stamp->va + ST_BL_A0,
+                                  r->stamp->va + ST_BL_A1, py, c->remap_a);
+        } else {
+            n = emit_ce_copy_surf(p, 0, &src, &img, line, o->height, r->stamp->va + ST_BL_A0,
+                                  r->stamp->va + ST_BL_A1, py, c->remap_a);
+            n = emit_release(p, n, r->stamp->va + ST_BL_MID, mid, 1, 0);
+            n = emit_ce_copy_surf(p, n, &img, &dst, line, o->height, r->stamp->va + ST_BL_B0,
+                                  r->stamp->va + ST_BL_B1, py, c->remap_b);
+        }
+        n = emit_release(p, n, r->done->va, cval, 1, 0);
+        if (n > PUSH_SLOT_DW) {
+            step("remap push fits one slot", -E2BIG);
+            return "push too large";
+        }
+        kick(r->k, r->ch, n);
+        const int ok = spin_ge(cdone, cval, now_us() + tmo);
+        if (!ok) {
+            if (c->bl)
+                printf("       %s round %u: middle release %s\n", c->name, it,
+                       *(volatile uint64_t *)(stp + ST_BL_MID) >= mid
+                           ? "seen (the pitch -> BL copy finished; stuck in BL -> pitch)"
+                           : "NOT seen (stuck in the pitch -> BL copy)");
+            return "remap combination: completion not seen";
+        }
+        if (channel_error(r->ch))
+            return "remap combination: channel error";
+        const double now = now_us();
+        if (c->bl ? spin_ge32((volatile uint32_t *)(stp + ST_BL_B1), py, now + tmo)
+                  : spin_ge32((volatile uint32_t *)(stp + ST_BL_A1), py, now + tmo)) {
+            const double ua = stamp_us(stp, ST_BL_A0, ST_BL_A1);
+            if (ua >= 0)
+                add(&st[c->bl ? RS_P2BL : RS_P2P][c->remap_a], ua);
+            if (c->bl) {
+                const double ub = stamp_us(stp, ST_BL_B0, ST_BL_B1);
+                if (ub >= 0)
+                    add(&st[RS_BL2P][c->remap_b], ub);
+            }
+        }
+        const volatile uint32_t *dw = r->dst->cpu;
+        for (size_t i = 0; i < words; i++) {
+            const uint32_t want = expect(i, swapped);
+            if (dw[i] != want) {
+                if (shown < 8) {
+                    const uint64_t off = (uint64_t)i * 4u;
+                    printf("       mismatch %s round %u: offset 0x%" PRIx64 " (x %u, y %u): want 0x%08x got 0x%08x "
+                           "(source 0x%08x)\n",
+                           c->name, it, off, (unsigned)((off % r->pitch) / 4u), (unsigned)(off / r->pitch), want,
+                           dw[i], pattern(i));
+                    shown++;
+                }
+                ++*bad_words;
+            }
+        }
+        ++*rounds_done;
+    }
+    return NULL;
+}
+
+/* The matrix; NULL when every combination ran (verdicts printed and failed
+ * through step()), else why it stopped (the caller reads the error notifier
+ * and tears down). */
+static const char *bl_remap_matrix(struct bl_run *r)
+{
+    const struct opts *o = r->o;
+    struct samples st[RS_PATHS][2];
+    static char names[RS_PATHS][2][48];
+    for (unsigned a = 0; a < RS_PATHS; a++)
+        for (unsigned b = 0; b < 2; b++) {
+            snprintf(names[a][b], sizeof names[a][b], "remap_%s_%s_us", b ? "on" : "off", remap_path_names[a]);
+            st[a][b] = (struct samples){ .name = names[a][b] };
+        }
+    /* 0 not run, 1 accepted, 2 refused or hung */
+    int state[RC_N] = { 0 };
+    uint64_t bad[RC_N] = { 0 };
+    unsigned done_rounds[RC_N] = { 0 };
+    const char *stop = NULL;
+    int stopped_at = -1;
+
+    printf("remap=swap-rb SET_REMAP_COMPONENTS=0x%08x (DST_X=SRC_Z DST_Y=SRC_Y DST_Z=SRC_X DST_W=SRC_W, 1-byte "
+           "components, 4 in, 4 out); X in 4-byte elements with the remap on\n",
+           NVB5_REMAP_SWAP_RB);
+    printf("remap_mode=%s\n", o->bl_src_only ? "bl-src-only (only bl_src_remap: the open question)" : "matrix");
+    for (int c = 0; c < RC_N; c++) {
+        if (o->bl_src_only && c != RC_BL_SRC_ON)
+            continue;
+        stop = remap_combo_run(r, &remap_combos[c], st, &bad[c], &done_rounds[c]);
+        state[c] = stop ? 2 : 1;
+        if (stop) {
+            stopped_at = c;
+            printf("remap_combo %s: NOT accepted after %u rounds: %s\n", remap_combos[c].name, done_rounds[c], stop);
+            break;
+        }
+        printf("remap_combo %s: accepted, %u rounds; remap_verify=%s (%" PRIu64 " bad words; want the %s pattern)\n",
+               remap_combos[c].name, done_rounds[c], bad[c] == 0 && done_rounds[c] ? "ok" : "BAD", bad[c],
+               remap_combos[c].remap_a || remap_combos[c].remap_b ? "swapped" : "plain");
+        fflush(stdout);
+    }
+
+    printf("\n%-38s %6s %10s %10s %10s %10s %10s\n", "stage", "n", "min", "avg", "p50", "p99", "max");
+    for (unsigned a = 0; a < RS_PATHS; a++)
+        for (unsigned b = 0; b < 2; b++)
+            stats_row(&st[a][b]);
+    printf("\n");
+    printf("copy_bytes=%" PRIu64 " (%ux%u, 4 bytes per pixel)\n", r->copy_bytes, o->width, o->height);
+    for (unsigned a = 0; a < RS_PATHS; a++) {
+        const double off = p50_sorted(&st[a][0]), on = p50_sorted(&st[a][1]);
+        const double goff = off > 0 ? (double)r->copy_bytes / (off * 1000.0) : 0;
+        const double gon = on > 0 ? (double)r->copy_bytes / (on * 1000.0) : 0;
+        char soff[32] = "-", son[32] = "-";
+        if (goff > 0)
+            snprintf(soff, sizeof soff, "%.2f", goff);
+        if (gon > 0)
+            snprintf(son, sizeof son, "%.2f", gon);
+        if (goff > 0 && gon > 0)
+            printf("remap_gbps path=%s off=%s on=%s on_vs_off=%.1f%%\n", remap_path_names[a], soff, son,
+                   100.0 * gon / goff);
+        else
+            printf("remap_gbps path=%s off=%s on=%s\n", remap_path_names[a], soff, son);
+    }
+    printf("remap_accepted:");
+    for (int c = 0; c < RC_N; c++)
+        printf(" %s=%s", remap_combos[c].name, state[c] == 1 ? "yes" : state[c] == 2 ? "NO" : "not-run");
+    printf("\n");
+    int all_ok = !stop;
+    for (int c = 0; c < RC_N; c++)
+        if (state[c] == 1 && (bad[c] || !done_rounds[c]))
+            all_ok = 0;
+    printf("remap_verify=%s (every combination that ran)\n", all_ok ? "ok" : "BAD");
+    if (stopped_at == RC_BL_SRC_ON)
+        printf("remap_open_question: REMAP with a block-linear source was NOT accepted on this engine; the "
+               "fallbacks are a second pass (BL -> pitch, then pitch -> pitch with remap) or the remap while "
+               "writing the BL image (bl_dst_remap), rm-copy-engine-present.md 12.4\n");
+    else if (state[RC_BL_SRC_ON] == 1)
+        printf("remap_open_question: REMAP with a block-linear source accepted, remap_verify=%s\n",
+               bad[RC_BL_SRC_ON] == 0 ? "ok" : "BAD");
+
+    for (int c = 0; c < RC_N; c++)
+        if (state[c] == 1 && (bad[c] || !done_rounds[c])) {
+            char w[128];
+            snprintf(w, sizeof w, "remap combination %s matches the %s pattern", remap_combos[c].name,
+                     remap_combos[c].remap_a || remap_combos[c].remap_b ? "swapped" : "plain");
+            step(w, -EIO);
+        }
+    for (unsigned a = 0; a < RS_PATHS; a++)
+        for (unsigned b = 0; b < 2; b++)
+            free(st[a][b].v);
+    return stop;
 }
 
 /* ---- main ---- */
@@ -910,9 +1646,40 @@ int main(int argc, char **argv)
            o.g->name, o.g->gpfifo_name, o.g->gpfifo, o.g->ce_name, o.g->ce, o.g->usermode, o.width,
            o.height, copy_bytes, o.src_sys ? "system memory" : "video memory");
 
+    pattern_salt = o.seed;
+    struct bl_layout bl;
+    uint32_t bl_kind = 0;
+    memset(&bl, 0, sizeof bl);
+    if (o.bl) {
+        if (bl_layout(o.g, o.modifier, o.width, o.height, &bl)) {
+            fprintf(stderr, "--modifier 0x%016" PRIx64 ": not a 32 bpp uncompressed NVIDIA block-linear 2D "
+                            "modifier with h <= 5\n", o.modifier);
+            return 1;
+        }
+        bl_kind = o.bl_kind < 0 ? bl.k : (uint32_t)o.bl_kind;
+        printf("bl_seed=0x%08x%s\n", o.seed,
+               o.seed == 0 ? " (seed 0: word 0 of the pattern is 0, every other word is nonzero)" : "");
+        printf("bl_modifier=0x%016" PRIx64 " h=%u (blocks of %u rows) k=0x%02x g=%u s=%u c=%u\n", o.modifier,
+               bl.h, GOB_ROWS << bl.h, bl.k, bl.g, bl.s, bl.c);
+        printf("bl_image: pitch=%u (%u GOBs) rows=%u size=%" PRIu64 " block_size_word=0x%x\n", bl.pitch,
+               bl.pitch / GOB_BYTES_X, bl.rows, bl.size, bl.block);
+        if (bl_kind)
+            printf("bl_kind=0x%02x (PAGE_KIND_OVERRIDE on the image's mapping%s)\n", bl_kind,
+                   bl_kind == bl.k ? ", the modifier's k" : ", NOT the modifier's k");
+        else
+            printf("bl_kind=0x00 (no override: the allocation's own pitch kind)\n");
+        if (bl_kind == 0 || bl_kind != bl.k)
+            printf("[info] a round trip through one mapping can pass with a wrong kind; only M3c "
+                   "(a real NVK image) checks the kind against NVK's\n");
+        if (o.g != &gens[0])
+            printf("[info] --gen %s: the GB20x modifiers name another GOB layout; the KMD route "
+                   "refuses block-linear there\n", o.g->name);
+    }
+
     /* Producer */
     crm_client *pc = NULL;
-    uint32_t p_dev = 0, p_sub = 0, p_sem = 0, p_semsurf = 0, p_src = 0;
+    uint32_t p_dev = 0, p_sub = 0, p_sem = 0, p_semsurf = 0, p_src = 0, p_bl = 0;
+    const uint64_t bl_alloc = align_up(bl.size, 2 * MIB);
     void *p_sem_map = NULL, *p_src_map = NULL;
     volatile uint64_t *prod = NULL;
     /* Copier */
@@ -922,7 +1689,8 @@ int main(int argc, char **argv)
     struct chan ch, cch;
     memset(&ch, 0, sizeof ch);
     memset(&cch, 0, sizeof cch);
-    struct gmem d_sem, d_src, dst, stamp, done, csrc, cdst;
+    struct gmem d_sem, d_src, d_bl, dst, stamp, done, csrc, cdst;
+    memset(&d_bl, 0, sizeof d_bl);
     memset(&d_sem, 0, sizeof d_sem);
     memset(&d_src, 0, sizeof d_src);
     memset(&dst, 0, sizeof dst);
@@ -949,7 +1717,7 @@ int main(int argc, char **argv)
     struct samples s_c_copy = { .name = "copy_us_contended" };
     struct samples s_c_other = { .name = "contend_copy_us" };
     struct samples s_setval = { .name = "set_value_call_us" };
-    unsigned held = 0, wait_rounds = 0, verified = 0, overlapped = 0, contended = 0;
+    unsigned held = 0, wait_rounds = 0, verified = 0, overlapped = 0, contended = 0, mismatches_shown = 0;
     uint64_t bad_bytes = 0;
     uint32_t gp_get_seen = 0;
 
@@ -1027,6 +1795,15 @@ int main(int argc, char **argv)
                  o.src_sys ? "system memory" : "video memory through BAR1");
         if (step(w, bad ? -EIO : 0))
             goto out;
+    }
+    if (o.bl) {
+        /* The block-linear image: plain video memory without a kind, as NVK
+         * allocates an image (nvk-rm 0004/0028 alloc_rm_memory); the kind
+         * goes on the copier's mapping. */
+        if (vidmem_alloc(pc, p_dev, &p_bl, bl_alloc, "block-linear image")) {
+            p_bl = 0;
+            goto out;
+        }
     }
 
     /* Copier */
@@ -1148,6 +1925,24 @@ int main(int argc, char **argv)
     d_src.size = src_size;
     if (gpu_map(k.c, k.dev, k.vas, &d_src, o.src_sys ? SYSMEM_MAP_FLAGS : 0, "source (dup)"))
         goto out;
+    if (o.bl) {
+        snprintf(w, sizeof w, "copier: DUP_OBJECT block-linear image 0x%08x of client 0x%08x", p_bl,
+                 crm_root(pc));
+        if (step(w, crm_dup_object(k.c, k.dev, &d_bl.h, crm_root(pc), p_bl, NV01_MEMORY_LOCAL_USER, 0))) {
+            d_bl.h = 0;
+            goto out;
+        }
+        d_bl.size = bl_alloc;
+        /* As nvk-rm 0005 binds an image's VA: big pages for video memory, the
+         * kind through PAGE_KIND_OVERRIDE + kindOverride (none for kind 0) */
+        char what[96];
+        snprintf(what, sizeof what, "block-linear image (dup), PTE kind 0x%02x%s", bl_kind,
+                 bl_kind ? " (override)" : " (no override)");
+        if (gpu_map_kind(k.c, k.dev, k.vas, &d_bl,
+                         NVOS46_FLAGS_PAGE_SIZE_BIG | (bl_kind ? NVOS46_FLAGS_PAGE_KIND_OVERRIDE : 0), bl_kind,
+                         what))
+            goto out;
+    }
 
     /* Destination: OS descriptor over process pages */
     if (osdesc_alloc(k.c, k.dev, k.vas, &dst, copy_bytes, "destination"))
@@ -1156,6 +1951,10 @@ int main(int argc, char **argv)
            " (4 KiB pages touched by the destination)\n",
            copy_bytes, (copy_bytes + PAGE_4K - 1) / PAGE_4K);
     printf("copy_bytes=%" PRIu64 "\n", copy_bytes);
+    if (o.remap && !o.bl)
+        printf("remap=swap-rb SET_REMAP_COMPONENTS=0x%08x on the measured copies (the contend copy does not "
+               "remap); the verify expects the pattern with bytes 0 and 2 exchanged\n",
+               NVB5_REMAP_SWAP_RB);
     if (osdesc_alloc(k.c, k.dev, k.vas, &stamp, STAMP_SIZE, "timestamps"))
         goto out;
 
@@ -1228,6 +2027,29 @@ int main(int argc, char **argv)
         }
     }
 
+    if (o.bl) {
+        struct bl_run br = { .k = &k, .ch = &ch, .o = &o, .l = &bl, .src = &d_src, .img = &d_bl,
+                             .dst = &dst, .stamp = &stamp, .done = &done, .pitch = pitch, .kind = bl_kind,
+                             .copy_bytes = copy_bytes, .seq = &seq, .pay = &pay, .last_c = &last_c };
+        const char *bstop = o.remap ? bl_remap_matrix(&br) : bl_roundtrip(&br);
+        if (bstop) {
+            /* No acquire in these pushes: one more timeout for the channel,
+             * then the error notifier (an RC error resets the channel; the
+             * teardown below frees it) */
+            spin_ge(cdone, last_c, now_us() + tmo);
+            channel_error(&ch);
+            printf("       ce channel error notifier: status 0x%x info32 0x%x\n",
+                   ch.notifier[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].status,
+                   ch.notifier[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].info32);
+            printf("       completion 0x%" PRIx64 " (want 0x%" PRIx64 "), USERD GP_PUT %u GP_GET %u\n",
+                   (uint64_t)*cdone, last_c, ch.userd[USERD_GP_PUT / 4], ch.userd[USERD_GP_GET / 4]);
+            step(bstop, -ETIMEDOUT);
+        } else if (ch.notifier[0].status) {
+            step("error notifier stays 0", -EIO);
+        }
+        goto out;
+    }
+
     /* Competing channel and its buffers */
     if (o.contend) {
         const int cgr = o.contend_engine < 0;
@@ -1296,7 +2118,7 @@ int main(int argc, char **argv)
             n = emit_host_sem(p, 0, d_sem.va, v,
                               SEM_EXECUTE_OPERATION_ACQ_STRICT_GEQ | SEM_EXECUTE_ACQUIRE_SWITCH_TSG_EN |
                                   SEM_EXECUTE_PAYLOAD_SIZE_64BIT);
-            n = emit_ce_copy(p, n, d_src.va, dst.va, pitch, o.height, stamp.va + ST_T0, stamp.va + ST_T1, py);
+            n = emit_ce_copy(p, n, d_src.va, dst.va, pitch, o.height, stamp.va + ST_T0, stamp.va + ST_T1, py, o.remap);
             n = emit_release(p, n, done.va, cval, 1, 1);
 #ifdef _WIN32
             int fence = -1;
@@ -1338,8 +2160,20 @@ int main(int argc, char **argv)
             if (verify) {
                 const volatile uint32_t *dw = dst.cpu;
                 uint64_t bad = 0;
-                for (size_t i = 0; i < copy_bytes / 4; i++)
-                    bad += dw[i] != pattern(i);
+                for (size_t i = 0; i < copy_bytes / 4; i++) {
+                    const uint32_t want = expect(i, o.remap);
+                    if (dw[i] != want) {
+                        if (o.remap && mismatches_shown < 8) {
+                            const uint64_t off = (uint64_t)i * 4u;
+                            printf("       mismatch iteration %u: offset 0x%" PRIx64 " (x %u, y %u): want 0x%08x "
+                                   "got 0x%08x (source 0x%08x)\n",
+                                   it, off, (unsigned)((off % pitch) / 4u), (unsigned)(off / pitch), want, dw[i],
+                                   pattern(i));
+                            mismatches_shown++;
+                        }
+                        bad++;
+                    }
+                }
                 bad_bytes += bad * 4;
                 verified++;
             }
@@ -1357,7 +2191,7 @@ int main(int argc, char **argv)
             n = emit_host_sem(p, 0, d_sem.va, v,
                               SEM_EXECUTE_OPERATION_ACQ_STRICT_GEQ | SEM_EXECUTE_ACQUIRE_SWITCH_TSG_EN |
                                   SEM_EXECUTE_PAYLOAD_SIZE_64BIT);
-            n = emit_ce_copy(p, n, d_src.va, dst.va, pitch, o.height, stamp.va + ST_T0, stamp.va + ST_T1, py);
+            n = emit_ce_copy(p, n, d_src.va, dst.va, pitch, o.height, stamp.va + ST_T0, stamp.va + ST_T1, py, o.remap);
             n = emit_release(p, n, done.va, cval, 1, 1);
             kick(&k, &ch, n);
             sleep_ms(o.hold_ms);
@@ -1420,7 +2254,7 @@ int main(int argc, char **argv)
             const uint32_t cpitch = 16384u;
             uint32_t *q = slot(&cch);
             unsigned m = emit_ce_copy(q, 0, csrc.va, cdst.va, cpitch, (uint32_t)(contend_bytes / cpitch),
-                                      stamp.va + ST_K_T0, stamp.va + ST_K_T1, kpy);
+                                      stamp.va + ST_K_T0, stamp.va + ST_K_T1, kpy, 0);
             m = emit_release(q, m, stamp.va + ST_K, kv, 1, 0);
             const double ka = now_us();
             kick(&k, &cch, m);
@@ -1436,7 +2270,7 @@ int main(int argc, char **argv)
             n = emit_host_sem(p, 0, d_sem.va, v,
                               SEM_EXECUTE_OPERATION_ACQ_STRICT_GEQ | SEM_EXECUTE_ACQUIRE_SWITCH_TSG_EN |
                                   SEM_EXECUTE_PAYLOAD_SIZE_64BIT);
-            n = emit_ce_copy(p, n, d_src.va, dst.va, pitch, o.height, stamp.va + ST_T0, stamp.va + ST_T1, py);
+            n = emit_ce_copy(p, n, d_src.va, dst.va, pitch, o.height, stamp.va + ST_T0, stamp.va + ST_T1, py, o.remap);
             n = emit_release(p, n, done.va, cval, 1, 1);
             const double a = now_us();
             kick(&k, &ch, n);
@@ -1515,6 +2349,15 @@ int main(int argc, char **argv)
     printf("userd_gp_get_written_back=%s\n", gp_get_seen ? "yes" : "no");
     printf("verify=%s (%u checks, %" PRIu64 " bad bytes)\n", bad_bytes == 0 && verified ? "ok" : "BAD",
            verified, bad_bytes);
+    if (o.remap) {
+        printf("remap_verify=%s (swap-rb: the destination is the pattern with bytes 0 and 2 exchanged; %u checks, "
+               "%" PRIu64 " bad words)\n",
+               bad_bytes == 0 && verified ? "ok" : "BAD", verified, bad_bytes / 4);
+        if (s_copy.n)
+            printf("remap_gbps path=pitch_to_pitch on=%.2f (compare with copy_gbps_p50 of the same run line "
+                   "without --remap)\n",
+                   (double)copy_bytes / (s_copy.v[s_copy.n / 2] * 1000.0));
+    }
     if (!stop) {
         if (wait_rounds && held != wait_rounds)
             step("acquire held in every wait round", -EIO);
@@ -1552,6 +2395,9 @@ out:
             crm_free(k.c, k.dev, csrc.h);
         osdesc_free(k.c, k.dev, k.vas, &stamp);
         osdesc_free(k.c, k.dev, k.vas, &dst);
+        gpu_unmap(k.c, k.dev, k.vas, &d_bl);
+        if (d_bl.h)
+            crm_free(k.c, k.dev, d_bl.h);
         gpu_unmap(k.c, k.dev, k.vas, &d_src);
         if (d_src.h)
             crm_free(k.c, k.dev, d_src.h);
@@ -1579,6 +2425,8 @@ out:
             crm_unmap_memory(pc, p_dev, p_src, p_src_map, src_size, 0);
         if (p_src)
             crm_free(pc, p_dev, p_src);
+        if (p_bl)
+            crm_free(pc, p_dev, p_bl);
         if (p_semsurf)
             crm_free(pc, p_sub, p_semsurf);
         if (p_sem_map)

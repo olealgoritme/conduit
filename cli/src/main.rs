@@ -19,6 +19,7 @@ mod qemu;
 mod run;
 mod scope;
 mod setup;
+mod stages;
 mod stream;
 mod sys;
 mod trace;
@@ -275,7 +276,8 @@ enum Cmd {
     /// Trace the GPU requests a running VM makes: record them, watch them
     /// live or summarise their latency (docs/TRACING.md).
     /// Also: `trace NAME status`, `trace NAME on|off` (the backend's own
-    /// --trace file), `trace analyze FILE`
+    /// --trace file), `trace analyze FILE`, `trace NAME stages` (per-frame
+    /// stage timing of the Windows present paths), `trace stages DIR`
     Trace {
         /// The VM, or `analyze`
         target: String,
@@ -300,9 +302,25 @@ enum Cmd {
         /// json or bin (default: from the file name; .bin is binary)
         #[arg(long, value_parser = ["json", "bin"])]
         format: Option<String>,
-        /// Stop after this many seconds instead of at Ctrl-C
+        /// Stop after this many seconds instead of at Ctrl-C (stages: how
+        /// long to collect, default 10)
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
+        /// stages: a command printing the guest driver's StgRing value
+        /// (`reg query ... /v StgRing`), run every second
+        #[arg(long, value_name = "CMD")]
+        guest_cmd: Option<String>,
+        /// stages: keep what was collected in this folder (reanalyse with
+        /// `conduit trace stages DIR`)
+        #[arg(long, value_name = "DIR")]
+        save: Option<PathBuf>,
+        /// stages: also write a Chrome trace-event / Perfetto JSON file
+        #[arg(long, value_name = "FILE")]
+        perfetto: Option<PathBuf>,
+        /// stages: a guest DxgKrnl ETW capture as CSV
+        /// (ts_100ns,event,pid,tid[,detail]) for the Perfetto file
+        #[arg(long, value_name = "FILE")]
+        etw: Option<PathBuf>,
     },
     /// Show a VM that another computer streams (`conduit stream NAME --link` there)
     Remote {
@@ -650,8 +668,25 @@ fn main() {
             output,
             format,
             duration,
+            guest_cmd,
+            save,
+            perfetto,
+            etw,
         } => match (target.as_str(), arg.as_deref()) {
             ("analyze", Some(file)) => trace::analyze(std::path::Path::new(file), &filter, follow),
+            ("stages", Some(dir)) => {
+                stages::offline(std::path::Path::new(dir), perfetto.as_deref(), etw.as_deref())
+            }
+            (name, Some("stages")) => stages::live(
+                name,
+                stages::Opts {
+                    duration: duration.unwrap_or(10),
+                    guest_cmd,
+                    save,
+                    perfetto,
+                    etw,
+                },
+            ),
             ("analyze", None) => Err(ui::oops(
                 "usage: conduit trace analyze FILE",
                 "FILE is a trace from `conduit trace NAME` or the backend's --trace",
@@ -659,7 +694,7 @@ fn main() {
             (name, Some(a @ ("status" | "on" | "off"))) => trace::action(name, a),
             (_, Some(other)) => Err(ui::oops(
                 format!("unknown trace action {other:?}"),
-                "Use: conduit trace NAME [status|on|off] or conduit trace analyze FILE",
+                "Use: conduit trace NAME [status|on|off|stages] or conduit trace analyze|stages FILE",
             )),
             (name, None) => trace::live(
                 name,

@@ -46,6 +46,15 @@ pub enum StashedMarker {
     Resolved(u64),
 }
 
+/// A copy-engine Present record (`'HEF3'`) that passed the protocol's checks, beside the boundary
+/// of the RM fence it travelled with (`ContextContext::ce_record`). Plain data.
+#[derive(Clone, Copy)]
+pub struct StashedCeRecord {
+    /// The boundary `rm_gate_attach` returned for the record's fence (never 0).
+    pub boundary: u64,
+    pub record: helios_protocol::HeliosRmFenceTailV3,
+}
+
 /// State for one scheduler context opened on a D3D device.
 pub struct ContextContext {
     /// Back-pointer to the owning device (valid for the context's lifetime).
@@ -107,6 +116,13 @@ pub struct ContextContext {
     /// relaxed atomic and take the lock only for a context that carries a tag.
     onscanout_tag: crate::sync::SpinLock<Option<helios_kmd_logic::onscanout::Tag>>,
     onscanout_flag: AtomicU32,
+    /// The copy-engine Present record (`'HEF3'`, `ddi/ce_record.rs`) the last `HERF` / `HEPR`
+    /// Render with an attached RM fence parsed, keyed by that fence's boundary so the Present that
+    /// carries the same boundary (`StashedMarker::Resolved`) is the only one it can pair with.
+    /// READ-ONLY DATA in M3c-0: nothing takes it yet. `ce_record_flag` is the lock-free "is there
+    /// one", so a Render with a fence and no record pays one relaxed load.
+    ce_record: crate::sync::SpinLock<Option<StashedCeRecord>>,
+    ce_record_flag: AtomicU32,
     /// One authenticated, generation-qualified execution stream per context.
     execution_stream: AtomicU64,
     /// Flush-gate trace (`ddi::flush_trace`): what the last `HEFL` Render of this
@@ -285,6 +301,39 @@ impl<'a> ContextHandleRef<'a> {
         tag
     }
 
+    /// Replace the stashed copy-engine record with `record` (`None` clears it). Called by every
+    /// `HERF` / `HEPR` Render whose FENCE tail was parsed for a record, so a record only ever
+    /// outlives its Render until the next fenced Render of this context. One relaxed load when
+    /// there is nothing to do. PASSIVE (`DxgkDdiRender`).
+    pub fn stash_ce_record(&self, record: Option<StashedCeRecord>) {
+        let ctx = self.context;
+        if record.is_none() && ctx.ce_record_flag.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut slot = ctx.ce_record.lock();
+        *slot = record;
+        // The flag changes only under the lock, so it can never disagree with the slot.
+        ctx.ce_record_flag
+            .store(u32::from(slot.is_some()), Ordering::Relaxed);
+    }
+
+    /// Take (read + clear) the stashed record if it belongs to the fence `boundary`, else `None`
+    /// (a record of another fence stays where it is). The Present's half of the pairing; M3c's
+    /// route is its first caller, M3c-0 never calls it.
+    #[allow(dead_code)]
+    pub fn take_ce_record(&self, boundary: u64) -> Option<StashedCeRecord> {
+        let ctx = self.context;
+        if boundary == 0 || ctx.ce_record_flag.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut slot = ctx.ce_record.lock();
+        if slot.as_ref().map(|r| r.boundary) != Some(boundary) {
+            return None;
+        }
+        ctx.ce_record_flag.store(0, Ordering::Relaxed);
+        slot.take()
+    }
+
     /// Low 32 bits of the context handle (a pointer): enough to tell contexts apart in
     /// the flush-gate trace.
     pub fn trace_id(&self) -> u32 {
@@ -403,7 +452,11 @@ pub unsafe extern "C" fn dxgkddi_create_device(
         creator_process: args.hKmdProcess as usize,
     });
     // Hand the device handle back to Dxgkrnl; reclaimed in destroy_device.
-    args.hDevice = Box::into_raw(ctx) as *mut c_void;
+    let device_handle = Box::into_raw(ctx) as *mut c_void;
+    args.hDevice = device_handle;
+    // `DwDevNew` / `DwReuse` (docs/zero-copy-present.md "DWM restart and stale Explorer"): atomics
+    // and one leaf spin lock, nothing else.
+    crate::ddi::dwm_restart::note_device_created(device_handle as usize);
     STATUS_SUCCESS
 }
 
@@ -436,6 +489,9 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
             return STATUS_SUCCESS;
         };
         let owner = h_device as usize;
+        // The `Dw*` window opens here (`DwDevDel` is counted at its end): what the Present path
+        // and the flips do from now on is "since a device died".
+        let destroy_started = crate::ddi::dwm_restart::begin_destroy(adapter);
         // SAFETY: `DxgkDdiDestroyDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
         // DXGKDDI_DESTROYDEVICE), and the unmap loop below already depends on it
         // — `MmUnmapLockedPages` is PASSIVE-only, which is exactly why the table
@@ -525,6 +581,16 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
         // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).
         crate::diag::record(0x0E03_0000 | ((blobs.min(0xFF) << 8) | contexts.min(0xFF)));
+        // The `Dw*` block: durations, what the sweeps reclaimed, and the census of what this
+        // device left pinned in the present machinery (the live machine, so after the sweeps).
+        crate::ddi::dwm_restart::end_destroy(
+            adapter,
+            owner,
+            destroy_started,
+            blobs,
+            contexts,
+            purged_streams,
+        );
         // SAFETY: produced by Box::into_raw in create_device; destroyed exactly once.
         drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
     }
@@ -562,6 +628,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         present_stream_marker: crate::sync::SpinLock::new(None),
         onscanout_tag: crate::sync::SpinLock::new(None),
         onscanout_flag: AtomicU32::new(0),
+        ce_record: crate::sync::SpinLock::new(None),
+        ce_record_flag: AtomicU32::new(0),
         execution_stream: AtomicU64::new(0),
         flush_pending: crate::sync::SpinLock::new(None),
         flush_pending_flag: AtomicU32::new(0),

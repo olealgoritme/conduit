@@ -35,6 +35,10 @@ const START_COMPLETE_FALLBACK_100NS: i64 = -5_000_000; // 500 ms, relative
 // `hpd_wake::CTRL_INFLIGHT_POLL_100NS` and `REFRESH_RETRY_100NS`, host-tested with the rest of
 // the wait (`hpd_wake::wait_plan`).
 
+// The message-interrupt safety net's poll (10 ms, `hpd_wake::MSI_POLL_100NS`): while delivery is in
+// doubt (`virtio::msi::polling`) the worker wakes that often and drains the rings, so a delivery that
+// does not work costs latency instead of a hang. Off (one load) otherwise.
+
 /// How long the worker sleeps while an `Nv*` counter mirror is wanted but not yet
 /// due: the mirror's own minimum interval (`publish_gate::MIN_INTERVAL_100NS`).
 const NVRM_PUBLISH_RECHECK_100NS: i64 = -2_500_000; // 250 ms, relative
@@ -208,14 +212,19 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // mirror, the vsync heartbeat's watchdog tick), all RELATIVE (negative) 100 ns units.
         // Every timed wait is at least 0.5 ms, so no input can make the worker spin on a zero or
         // an absolute timeout.
+        // The message-interrupt safety net (`virtio::msi`): one load, off unless delivery is in
+        // doubt.
+        let msi_poll = crate::virtio::msi::polling();
         let optional = !ctrl_inflight && !retry_pending;
         let foreign = if optional {
             adapter.foreign_scanout_wait_100ns()
         } else {
             None
         };
-        let mirror = (optional && super::escape::nvrm_publish_pending())
-            .then_some(NVRM_PUBLISH_RECHECK_100NS);
+        // The `Dw*` follow-up censuses after a device died ride the mirror's recheck.
+        let mirror = (optional
+            && (super::escape::nvrm_publish_pending() || super::dwm_restart::pending()))
+        .then_some(NVRM_PUBLISH_RECHECK_100NS);
         // While the heartbeat is meant to run the worker wakes 4 times a second even when idle,
         // to check it (`AdapterContext::vsync_watch`): an MMIO flip is woken by the heartbeat
         // alone, so a dead heartbeat and a sleeping worker would hold the flip for ever.
@@ -234,6 +243,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             foreign,
             mirror,
             watch,
+            poll: msi_poll.then_some(hpd_wake::MSI_POLL_100NS),
         });
         let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
         let timeout_ptr = match due {
@@ -285,7 +295,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // async flush owns descriptors; also do one poll when a new dirty frame
         // arrives behind it. This frees the coalescing gate without waiting for
         // the old exponential synchronous-roundtrip slices.
-        if (wait_status == STATUS_TIMEOUT && ctrl_inflight)
+        if msi_poll && wait_status == STATUS_TIMEOUT && !ctrl_inflight {
+            crate::virtio::msi::note_poll();
+        }
+        if (wait_status == STATUS_TIMEOUT && (ctrl_inflight || msi_poll))
             || (adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0
                 && adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0)
             // A presentation lease ended somewhere that could not pop the WDDM
@@ -344,6 +357,8 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // the deferred programming above, so a primary bound in this very pass is seen.
         stall_diag::hpd_enter(site::RM_CLIENT);
         crate::virtio::rm_client::service(passive, adapter);
+        // `RmCopyEngine` (off by default: one relaxed load): the copy-engine channel's self-test.
+        crate::virtio::rm_client::ce_channel::service(passive, adapter);
 
         // `ForeignFlip`: the flips of a foreign allocation Windows is showing (off by default:
         // one atomic load). After the level 5 service, which leaves the shared edges to it
@@ -357,6 +372,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // 15.18.16: the mirror thread writes it; this step hands it over.
         stall_diag::hpd_enter(site::NVRM_PUBLISH);
         super::escape::nvrm_publish_service(!crate::ddi::flip_announce::worker_idle(adapter));
+        // The boot-loop breaker's marker, once the start has proved healthy (one load otherwise).
+        crate::virtio::msi::service(false);
+        // The follow-up censuses after a device died (`Dw*`, about 2 s apart; one load when none
+        // is owed): a transient pin and a wedge look the same in the first one.
+        super::dwm_restart::service(adapter);
 
         // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
         // site that mirrors it; accumulation happens at DIRQL/DISPATCH with

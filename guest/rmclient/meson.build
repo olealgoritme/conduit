@@ -85,3 +85,11 @@ executable('crm_share_smoke', 'tests/crm_share_smoke.c',
 executable('crm_ce_copy_smoke', 'tests/crm_ce_copy_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)
+# HELIOS_ESCAPE_FOREIGN_RESOURCE / IMPORT_RM of the Helios KMD on a Windows guest
+# (RM memory -> GEM -> Venus resource id, status and errno of each refusal); skips
+# when the host does not serve the import, exits 77 elsewhere. The ABI is the
+# KMD's own helios_foreign.h.
+executable('crm_import_smoke', 'tests/crm_import_smoke.c',
+  include_directories : [inc, include_directories('src'),
+                         include_directories('../windows/protocol/include')],
+  dependencies : rmclient_dep)

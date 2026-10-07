@@ -1450,6 +1450,31 @@ unsafe fn nvk_source_is_primary(shown: ddi::D3D10DDI_HRESOURCE) -> bool {
         .is_some_and(|e| e.1 != 0 && e.4)
 }
 
+/// A primary source goes to NVK's own scan-out source (no WDDM present) only while dxgkrnl does
+/// not do independent flip on this adapter. With independent flip (the KMD's `IndepFlip`), DXGI
+/// creates a borderless window's flip-model buffers as primaries too, and that path would hide
+/// every frame from dxgkrnl: no flip queue, no vblank pacing (interval 1 ran at ~2700 fps at 240
+/// Hz), no promotion or demotion. Then the frame takes the WDDM present like any composed frame,
+/// and dxgkrnl flips the application's buffer itself (the KMD shows it through `ForeignFlip`)
+/// or DWM composes it. `NvkPresent=1` still forces scan-out 0.
+unsafe fn nvk_primary_takes_scanout(shown: ddi::D3D10DDI_HRESOURCE) -> bool {
+    if !nvk_source_is_primary(shown) {
+        return false;
+    }
+    if crate::forward::transfer::kmd_reports_independent_flip() {
+        let n = NVK_PRIMARY_IFLIP.fetch_add(1, Ordering::Relaxed);
+        if n == 0 || n % 4096 == 0 {
+            log_error!(
+                "NVK present: primary source #{n} takes the WDDM flip (dxgkrnl reports independent flip)"
+            );
+        }
+        return false;
+    }
+    true
+}
+
+static NVK_PRIMARY_IFLIP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 unsafe fn nvk_log_present_source(shown: ddi::D3D10DDI_HRESOURCE) {
     let alloc = resource_allocation(shown);
     let entry = lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == alloc).copied();
@@ -1587,7 +1612,7 @@ unsafe fn nvk_present_frame(
         1 => true,
         2 => false,
         _ => {
-            nvk_source_is_primary(shown)
+            nvk_primary_takes_scanout(shown)
                 || !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1)
         }
     };

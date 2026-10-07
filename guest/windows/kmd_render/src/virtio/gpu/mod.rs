@@ -584,6 +584,10 @@ pub struct SyncWaitBlock {
 /// completion, and therefore the only one on which a [`ScanoutNotify`] may be
 /// honoured. Ring 0 retires at host DECODE, which is too early to publish pixels.
 pub(crate) const SCANOUT_RING_IDX: u32 = 1;
+// The main queue's ring in `helios_kmd_logic::copy_queue` is this ring, and the transfer queue's
+// (`CopyQueue`) is a different one.
+const _: () = assert!(SCANOUT_RING_IDX == helios_kmd_logic::copy_queue::MAIN_RING_IDX);
+const _: () = assert!(SCANOUT_RING_IDX != helios_kmd_logic::copy_queue::COPY_RING_IDX);
 
 #[derive(Clone, Copy)]
 pub struct ScanoutNotify {
@@ -2146,6 +2150,9 @@ pub(crate) struct WindowedBltPending {
     /// Interrupt time (100 ns) the request was queued, and the worker submitted it (0 before).
     pub(crate) t_queue: u64,
     pub(crate) t_submit: u64,
+    /// `StageTrace`: the Present's DDI entry (interrupt time, 100 ns), stamped as G_PRESENT
+    /// under the copy's wire fence when the worker submits it.
+    pub(crate) t_present: u64,
 }
 
 /// Preallocated FIFO plus an exact terminal-membership table. Keeping terminal
@@ -2454,6 +2461,15 @@ pub struct VirtioGpu {
     /// existing virtio spinlock, but allocation/free never occurs there.
     dma_pool: Vec<DmaBuffer>,
     dma_pool_bytes: usize,
+    /// The display submitters' notify timer (`SubKick`, docs 24.14): armed by a display
+    /// submitter inside its own lock hold, recorded by [`Self::publish_then_notify`], taken in
+    /// the same hold. 16 bytes inline; every other enqueue pays one `armed` test.
+    kick_timer: helios_kmd_logic::submit_stage::KickTimer,
+    /// The late doorbell's state (`SubKickUnlock`, docs 24.14.10): the guard word, the
+    /// control queue's own notify register and the per-hold "owed" slot. Heap-owned (one
+    /// pointer here) because a [`KickTicket`] rung after the lock must outlive the borrow;
+    /// freed by `Drop` only once no kick is pending (see `close_late_kicks`).
+    kick: NonNull<KickState>,
     /// The command buffers the DISPATCH-level fast bind may use (ROADMAP defect
     /// 0ab-C, D1(ii)), allocated at transport init and recycled by the drain
     /// forever after.
@@ -2855,6 +2871,7 @@ impl VirtioGpu {
             let queues = [CTRL_QUEUE, nvrm_events::EVENT_QUEUE];
             let live = if nvrm_event_ring.is_some() { 2 } else { 1 };
             match super::msi::program_vectors(
+                passive,
                 &DxgkConfigAccess::new(dxgkrnl),
                 msi_granted,
                 &queues[..live],
@@ -3114,6 +3131,8 @@ impl VirtioGpu {
             reap_in_progress: false,
             dma_pool: Vec::with_capacity(MAX_DMA_POOL),
             dma_pool_bytes: 0,
+            kick_timer: helios_kmd_logic::submit_stage::KickTimer::new(),
+            kick: new_kick_state(dxgkrnl),
             bind_cmd_pool,
             fast_bind: allocate_fast_bind_state(),
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
@@ -3331,12 +3350,171 @@ impl VirtioGpu {
     /// structural instead of repeated, so a future change that moves
     /// `drain_used` off `virtio_lock` cannot reintroduce the race in exactly
     /// one of three places.
+    ///
+    /// LATE DOORBELL (`SubKickUnlock`, docs 24.14.10). When the caller armed it in this hold
+    /// ([`Self::arm_late_kick`]: the display submitters and the pipelined flip, through
+    /// `ctrl::display_enqueue`) the doorbell is NOT rung here. Instead: a full fence after the
+    /// avail-index store, the suppression check, and if a notify is owed one pending count on
+    /// the guard (`kick_defer::begin`) and the owed slot set; the caller takes a
+    /// [`KickTicket`] in the same hold and rings it after the release. The ordering and the
+    /// teardown rule are `helios_kmd_logic::kick_defer`'s module doc. Every other caller, and
+    /// every caller with the knob off, takes the block below unchanged.
     fn publish_then_notify(&mut self, entry: InFlight) {
         self.inflight.push(entry);
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
-        if self.control.should_notify() {
-            self.transport.notify(CTRL_QUEUE);
+        // SAFETY: `kick` is freed only by `Drop` (no `&mut self` exists any more then).
+        let kick = unsafe { self.kick.as_ref() };
+        if kick.unlocked && kick.late_armed.load(Ordering::Relaxed) {
+            use helios_kmd_logic::kick_defer as kd;
+            // virtio 2.7.13.3: the avail-index store (Release, in `add`) must be globally
+            // visible before the suppression read below. Release/Acquire do not order a store
+            // before a later load; this full fence does (Linux `virtio_mb` in
+            // `virtqueue_kick_prepare`).
+            core::sync::atomic::fence(Ordering::SeqCst);
+            let owed = kick.owed_at.load(Ordering::Relaxed) != KICK_NOT_OWED;
+            let word = kick.guard.load(Ordering::Relaxed);
+            let wants = self.control.should_notify();
+            let decision = kd::decide(
+                true,
+                true,
+                kick.doorbell != 0,
+                wants,
+                owed,
+                kd::begin(word).is_some(),
+            );
+            let timed = self.kick_timer.armed();
+            match decision {
+                kd::Notify::None => {
+                    if timed && !owed {
+                        self.kick_timer.record(helios_kmd_logic::submit_stage::Kick {
+                            ticks: 0,
+                            notified: false,
+                        });
+                    }
+                    return;
+                }
+                kd::Notify::Late => {
+                    // Under the lock, and `close` runs only in `Drop`, when no hold can exist:
+                    // the closed bit cannot appear between the `begin` test and this add.
+                    kick.guard.fetch_add(1, Ordering::AcqRel);
+                    let at = if crate::virtio::submit_stage::timing() {
+                        crate::virtio::submit_stage::now_100ns().max(KICK_OWED_UNTIMED + 1)
+                    } else {
+                        KICK_OWED_UNTIMED
+                    };
+                    kick.owed_at.store(at, Ordering::Relaxed);
+                    if timed {
+                        // The doorbell's cost is charged after the release (`Stage::Kick`).
+                        self.kick_timer.record(helios_kmd_logic::submit_stage::Kick {
+                            ticks: 0,
+                            notified: true,
+                        });
+                    }
+                    return;
+                }
+                kd::Notify::Locked => {}
+            }
         }
+        // The notify timing (`SubKick`, docs 24.14) only for a display submitter that armed the
+        // timer in this same lock hold; atomics-free, two interrupt-time reads.
+        let timed = self.kick_timer.armed();
+        if self.control.should_notify() {
+            let t0 = if timed { crate::virtio::submit_stage::now_100ns() } else { 0 };
+            self.transport.notify(CTRL_QUEUE);
+            if timed {
+                let ticks = crate::virtio::submit_stage::now_100ns().saturating_sub(t0);
+                self.kick_timer.record(helios_kmd_logic::submit_stage::Kick {
+                    ticks: helios_kmd_logic::submit_stage::kick_ticks(ticks),
+                    notified: true,
+                });
+            }
+        } else if timed {
+            self.kick_timer.record(helios_kmd_logic::submit_stage::Kick {
+                ticks: 0,
+                notified: false,
+            });
+        }
+    }
+
+    /// Arm the late doorbell for this hold (`SubKickUnlock`): the caller MUST take the ticket
+    /// with [`Self::take_late_kick`] before the hold ends and ring it after the release.
+    pub(crate) fn arm_late_kick(&mut self) {
+        // SAFETY: as in `publish_then_notify`.
+        unsafe { self.kick.as_ref() }.late_armed.store(true, Ordering::Relaxed);
+    }
+
+    /// Disarm, and take the ring this hold owes (None when nothing is owed). Same hold as
+    /// [`Self::arm_late_kick`]; the ticket is rung (dropped) after the lock is released.
+    pub(crate) fn take_late_kick(&mut self) -> Option<KickTicket> {
+        // SAFETY: as in `publish_then_notify`.
+        let kick = unsafe { self.kick.as_ref() };
+        kick.late_armed.store(false, Ordering::Relaxed);
+        let at = kick.owed_at.swap(KICK_NOT_OWED, Ordering::Relaxed);
+        // NOT `then_some`: that would build (and drop, i.e. RING and release) a ticket nobody
+        // owes. A `KickTicket` may only ever exist for a pending count `publish` took.
+        if at == KICK_NOT_OWED {
+            return None;
+        }
+        Some(KickTicket {
+            state: self.kick,
+            at,
+        })
+    }
+
+    /// Teardown half of the late doorbell: close the guard, wait (bounded) for every owed
+    /// kick to be rung or dropped, then free the state, or leak it if a kicker is stalled past
+    /// the budget (it then sees the closed bit, drops its ring, and its `end` touches live
+    /// memory). PASSIVE (`Drop`), before the device reset.
+    fn close_late_kicks(&mut self) {
+        use helios_kmd_logic::kick_defer as kd;
+        // SAFETY: as in `publish_then_notify`; nothing frees it before the match below.
+        let guard = unsafe { &self.kick.as_ref().guard };
+        let mut word = guard.fetch_or(kd::CLOSED, Ordering::AcqRel) | kd::CLOSED;
+        if !kd::drained(word) {
+            KICK_TEARDOWN_WAITS.fetch_add(1, Ordering::Relaxed);
+            // A kicker holds the count only between its unlock and one MMIO write: spin briefly
+            // first, then sleep in 1 ms slices (rounded up to the timer tick) within the budget.
+            for _ in 0..KICK_TEARDOWN_SPINS {
+                core::hint::spin_loop();
+                word = guard.load(Ordering::Acquire);
+                if kd::drained(word) {
+                    break;
+                }
+            }
+            let mut slices = 0;
+            while !kd::drained(word) && slices < KICK_TEARDOWN_SLICES {
+                let mut interval: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
+                interval.QuadPart = -10_000;
+                // SAFETY: PASSIVE (transport `Drop`), relative-timeout sleep, KernelMode.
+                let _ = unsafe { wdk_sys::ntddk::KeDelayExecutionThread(0, 0, &mut interval) };
+                slices += 1;
+                word = guard.load(Ordering::Acquire);
+            }
+        }
+        match kd::teardown(word) {
+            // SAFETY: allocated by `new_kick_state` with `Box::leak`; drained, so no ticket
+            // can touch it again, and `Drop` does not use `self.kick` after this.
+            kd::Teardown::Free => drop(unsafe { Box::from_raw(self.kick.as_ptr()) }),
+            kd::Teardown::Leak => {
+                KICK_TEARDOWN_LEAKS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Arm the notify timer for the next publish (display submitters, docs 24.14).
+    pub(crate) fn arm_kick_timer(&mut self) {
+        self.kick_timer.arm();
+    }
+
+    /// What the armed publish recorded (None when nothing was published), and disarm.
+    pub(crate) fn take_kick_timer(&mut self) -> Option<helios_kmd_logic::submit_stage::Kick> {
+        self.kick_timer.take()
+    }
+
+    /// Whether the used ring holds a completion `drain_used` has not consumed yet (one
+    /// acquire load of the used index; the `SubDrainHit` evidence of docs 24.14).
+    pub(crate) fn used_pending(&self) -> bool {
+        !self.failed && self.control.can_pop()
     }
 
     pub fn enqueue_sync<F>(
@@ -4478,6 +4656,7 @@ impl VirtioGpu {
         venus_len: usize,
         token: u64,
         stream_boundary: u64,
+        ring_idx: u32,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
         let known = self.windowed_blt.pending.iter().any(|request| {
             request.token == token
@@ -4488,9 +4667,11 @@ impl VirtioGpu {
         if !known {
             return Err((meta, venus, VirtioError::DeviceError));
         }
+        // `ring_idx`: the ring of the copy's queue (1, or the `CopyQueue` transfer ring); the
+        // retire below is matched by token, not by ring.
         self.enqueue_submit_inner(
             ctx_id,
-            SCANOUT_RING_IDX,
+            ring_idx,
             meta,
             venus,
             venus_len,
@@ -4927,6 +5108,7 @@ impl VirtioGpu {
                 return;
             };
             self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
+            RING_POPS.fetch_add(1, Ordering::Relaxed);
             let mut entry = self.inflight.swap_remove(idx);
             // As in `latch_failed_and_fail_inflight`: take the ownership token
             // out before the `match entry.kind` moves the other fields, so the
@@ -5028,6 +5210,8 @@ impl VirtioGpu {
                     cell.as_ref().store(word, Ordering::Release);
                     KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
                 }
+                // `StageTrace` G_FLIP_ACK / G_FLIP_ISR (one relaxed load while off).
+                crate::ddi::stage_trace::flip_answered(tag);
                 // Nothing reads `meta` again: back to the pool, or parked for the PASSIVE
                 // reaper, exactly as a finished raw forward.
                 if entry.venus.is_none() && self.dma_pool_accepts(entry.meta.capacity()) {
@@ -5348,10 +5532,36 @@ impl VirtioGpu {
                             self.wake_ready_windowed_blt();
                         }
                     }
+                    // `StageTrace`: a queued copy's submission time, read before its ring
+                    // completion below can retire the request (one relaxed load while off).
+                    let stage_windowed_t = match windowed_blt.as_ref() {
+                        Some(r) if crate::ddi::stage_trace::on() => {
+                            Some(self.windowed_blt_t_submit(r.token, r.stream_boundary))
+                        }
+                        _ => None,
+                    };
                     // A direct asynchronous Blt (`BltAsync`): the destination goes back to its
                     // readers here, before the WDDM FIFO below can retire the Present's fence.
-                    if ring_idx != 0 {
-                        self.blt_async_retire(fence_id, response_ok);
+                    let stage_direct_t = if ring_idx != 0 {
+                        self.blt_async_retire(fence_id, response_ok)
+                    } else {
+                        None
+                    };
+                    // `StageTrace` G_ISR / G_DONE of a Present copy (direct, queued, or the
+                    // legacy arm's, which has no submission time and so no G_ISR).
+                    if crate::ddi::stage_trace::on() && ring_idx == SCANOUT_RING_IDX as u8 {
+                        let submitted = stage_direct_t
+                            .or(stage_windowed_t)
+                            .or(present_buffer_write.map(|_| 0));
+                        if let Some(t) = submitted {
+                            crate::ddi::stage_trace::completed(
+                                helios_kmd_logic::stage_trace::G_ISR,
+                                helios_kmd_logic::stage_trace::G_DONE,
+                                helios_kmd_logic::stage_trace::KIND_FENCE,
+                                fence_id,
+                                t,
+                            );
+                        }
                     }
                     if let Some(retire) = windowed_blt {
                         // SAFETY: every token stores the stable adapter that
@@ -6767,6 +6977,30 @@ impl VirtioGpu {
         })
     }
 
+    /// `RmCopyEngine` = 3 (the copy-engine shadow mode): the Present buffer `resource_id` is
+    /// settled, i.e. no KMD writer or CPU mirror owns it, any reader's boundary is reached, and no
+    /// queued (WindowedBlt / deferred) copy names it: every production copy admitted into it so
+    /// far has completed and been mirrored. An untracked buffer is not settled. Spinlock-only,
+    /// read-only.
+    pub(crate) fn present_buffer_settled(&self, resource_id: u32) -> bool {
+        let Some(slot) = self
+            .present_buffer_syncs
+            .iter()
+            .find(|slot| slot.resource_id == resource_id)
+        else {
+            return false;
+        };
+        let free = match slot.access {
+            PresentBufferAccess::ExternalReady => true,
+            PresentBufferAccess::Consumer(boundary) => self.scanout_boundary_ready(boundary),
+            PresentBufferAccess::Empty
+            | PresentBufferAccess::KmdWriter
+            | PresentBufferAccess::KmdCpuMirror
+            | PresentBufferAccess::Teardown => false,
+        };
+        free && !self.blt_dst_deferred_pending(resource_id)
+    }
+
     /// End the CPU reader lifetime after the mirror routine has returned. A
     /// content-copy failure still releases ownership: the CPU no longer reads
     /// the buffer, while the WDDM transaction separately reports the failure.
@@ -6793,6 +7027,87 @@ impl VirtioGpu {
     /// transport failure is deliberately not routed here: those stay pinned.
     pub fn abort_present_buffer_write_before_submit(&mut self, resource_id: u32) {
         self.complete_present_buffer_write(resource_id);
+    }
+
+    /// Whether `try_begin_present_buffer_write` would acquire `resource_id` right now, changing
+    /// nothing (the census's view of "destination busy").
+    fn present_buffer_would_acquire(&self, resource_id: u32) -> bool {
+        self.present_buffer_syncs
+            .iter()
+            .find(|slot| slot.resource_id == resource_id)
+            .is_some_and(|slot| match slot.access {
+                PresentBufferAccess::ExternalReady => true,
+                PresentBufferAccess::Consumer(boundary) => self.scanout_boundary_ready(boundary),
+                PresentBufferAccess::Empty
+                | PresentBufferAccess::KmdWriter
+                | PresentBufferAccess::KmdCpuMirror
+                | PresentBufferAccess::Teardown => false,
+            })
+    }
+
+    /// What the present machinery holds now: present buffers by owner, stream slots, the windowed
+    /// Blt queue and why its head is not going out (`DwWbHead`, `DwWedge`: `docs/zero-copy-present.md`
+    /// "DWM restart and stale Explorer"). Read-only, one pass over small preallocated tables, under
+    /// the transport lock the caller holds. It exists to show what a dead DWM left pinned: a buffer
+    /// still claimed through a stream that no longer exists, slots waiting for a CTX_DESTROY that
+    /// never confirmed, a READY head that no wake will ever move.
+    pub fn dwm_census(&self) -> helios_kmd_logic::dwm_restart::Census {
+        use helios_kmd_logic::dwm_restart::{head_blocker, Census};
+        let mut census = Census::default();
+        for slot in self.present_buffer_syncs.iter() {
+            match slot.access {
+                PresentBufferAccess::Empty | PresentBufferAccess::Teardown => {}
+                PresentBufferAccess::ExternalReady => census.buffers_external += 1,
+                PresentBufferAccess::Consumer(boundary) => {
+                    census.buffers_consumer += 1;
+                    if !self.present_stream_boundary_live(boundary) {
+                        census.buffers_consumer_dead += 1;
+                    }
+                }
+                PresentBufferAccess::KmdWriter | PresentBufferAccess::KmdCpuMirror => {
+                    census.buffers_kmd += 1
+                }
+            }
+        }
+        for slot in self.present_streams.iter() {
+            if slot.live {
+                census.streams_live += 1;
+                if slot.closing {
+                    census.streams_closing += 1;
+                }
+            }
+        }
+        census.blt_pending = self.windowed_blt.pending.len() as u32;
+        census.blt_ready = self.windowed_blt.ready.len() as u32;
+        let head = self.windowed_blt.ready.front().copied();
+        let request = head.and_then(|token| {
+            self.windowed_blt
+                .pending
+                .iter()
+                .find(|request| request.token == token)
+        });
+        let entry = request.map(|request| (request.admitted, request.dispatched));
+        let (boundary_ready, boundary_live, destination_busy) = match request {
+            Some(request) => (
+                self.scanout_boundary_ready(request.stream_boundary),
+                self.scanout_bind_boundary_live(request.stream_boundary),
+                match request.destination {
+                    PresentDestinationDesc::StandardBuffer(destination) => {
+                        !self.present_buffer_would_acquire(destination.resource_id())
+                    }
+                    _ => false,
+                },
+            ),
+            None => (true, true, false),
+        };
+        census.head = Some(head_blocker(
+            head,
+            entry,
+            boundary_ready,
+            boundary_live,
+            destination_busy,
+        ));
+        census
     }
 
     fn prepare_present_stream_tag(
@@ -7148,6 +7463,7 @@ impl VirtioGpu {
         destination: PresentDestinationDesc,
         prepared: PreparedPresentBltSubmission,
         stream_boundary: u64,
+        t_present: u64,
     ) -> Result<u64, VirtioError> {
         if self.failed
             || !self.present_stream_boundary_live(stream_boundary)
@@ -7186,6 +7502,7 @@ impl VirtioGpu {
             no_mirror: false,
             t_queue: 0,
             t_submit: 0,
+            t_present,
         });
         crate::ddi::scanout_timeline::note(
             crate::ddi::scanout_timeline::kind::WINDOWED_BLT_ARM,
@@ -8506,8 +8823,211 @@ impl VirtioGpu {
 // harness cannot exist here at all — AGENTS.md's invariant table says exactly
 // that. Do not reintroduce tests in this file; add them to `kmd_logic`.
 
+/// `owed_at` value: no ring owed in this hold.
+const KICK_NOT_OWED: u64 = 0;
+/// `owed_at` value: a ring owed, publish time not taken (`SubStageClk` 0).
+const KICK_OWED_UNTIMED: u64 = 1;
+/// Teardown's wait for a pending late kick: spins, then 1 ms sleeps (about 16 ms each).
+const KICK_TEARDOWN_SPINS: u32 = 4096;
+const KICK_TEARDOWN_SLICES: u32 = 8;
+
+/// Doorbells rung after the release (`SubKickLate`), dropped because the transport was
+/// closing (`SubKickDrop`), the publish-to-doorbell time in 100 ns (`SubKickGap`), teardowns
+/// that waited for a pending kick (`SubKickWait`) and that leaked the state (`SubKickLeak`).
+/// Published by `ctrl::publish_kick_counters`.
+pub static KICK_LATE: AtomicU32 = AtomicU32::new(0);
+pub static KICK_DROPPED: AtomicU32 = AtomicU32::new(0);
+pub static KICK_GAP_TICKS: AtomicU64 = AtomicU64::new(0);
+pub static KICK_TEARDOWN_WAITS: AtomicU32 = AtomicU32::new(0);
+pub static KICK_TEARDOWN_LEAKS: AtomicU32 = AtomicU32::new(0);
+
+/// The late doorbell's state, one per transport generation (docs 24.14.10).
+pub(crate) struct KickState {
+    /// `helios_kmd_logic::kick_defer` guard word: closed bit + pending kicks.
+    guard: AtomicU32,
+    /// Kernel VA of the control queue's notify register (0 = not located: always locked).
+    doorbell: usize,
+    /// The value a notify writes (the queue index; no `VIRTIO_F_NOTIFICATION_DATA`).
+    value: u16,
+    /// `SubKickUnlock` in force (knob on AND doorbell located).
+    unlocked: bool,
+    /// Lock-protected: the current hold armed the late ring.
+    late_armed: AtomicBool,
+    /// Lock-protected: the ring this hold owes (`KICK_NOT_OWED`, `KICK_OWED_UNTIMED` or the
+    /// publish time in 100 ns).
+    owed_at: AtomicU64,
+}
+
+/// One owed doorbell, rung when dropped: after `with_virtio` returned, i.e. after the release.
+/// Holds one pending count on the guard from the publish until the very end of its `drop`.
+pub(crate) struct KickTicket {
+    state: NonNull<KickState>,
+    at: u64,
+}
+
+impl KickTicket {
+    /// Ring now (the doorbell write, or the drop of a closing transport's kick).
+    pub(crate) fn ring(self) {
+        drop(self);
+    }
+}
+
+impl Drop for KickTicket {
+    fn drop(&mut self) {
+        use helios_kmd_logic::kick_defer as kd;
+        // SAFETY: the pending count this ticket holds keeps `close_late_kicks` from freeing the
+        // state (it frees only when drained, and leaks otherwise) until the `fetch_sub` below,
+        // which is this function's last access to it.
+        let st = unsafe { self.state.as_ref() };
+        if kd::may_ring(st.guard.load(Ordering::Acquire)) {
+            // SAFETY: `doorbell` is the notify register of this transport's control queue,
+            // mapped through the MMIO cache that lives until driver unload (so it is mapped
+            // even after this generation's `Drop`); a 16-bit MMIO write is legal at any IRQL.
+            unsafe { core::ptr::write_volatile(st.doorbell as *mut u16, st.value) };
+            KICK_LATE.fetch_add(1, Ordering::Relaxed);
+            if self.at > KICK_OWED_UNTIMED {
+                let gap = crate::virtio::submit_stage::now_100ns().saturating_sub(self.at);
+                KICK_GAP_TICKS.fetch_add(gap, Ordering::Relaxed);
+            }
+        } else {
+            KICK_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        // Strictly after the doorbell write: from here on teardown may reset and free.
+        st.guard.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Build this generation's [`KickState`]: read `SubKickUnlock` (default 1), locate the control
+/// queue's notify register, mirror the setting in force as `SubKickUnl`. PASSIVE (init).
+#[inline(never)]
+fn new_kick_state(dxgkrnl: &DXGKRNL_INTERFACE) -> NonNull<KickState> {
+    // Built here, not in `init`'s measured frame.
+    let access = &DxgkConfigAccess::new(dxgkrnl);
+    let knob = crate::diag::read_config_dword(crate::diag::knobs::SUBMIT_KICK_UNLOCK, 1) != 0;
+    let doorbell = if knob { locate_ctrl_doorbell(access) } else { 0 };
+    let unlocked = knob && doorbell != 0;
+    crate::diag::record_named_bytes(b"SubKickUnl", unlocked as u32);
+    NonNull::from(Box::leak(Box::new(KickState {
+        guard: AtomicU32::new(0),
+        doorbell,
+        value: CTRL_QUEUE,
+        unlocked,
+        late_armed: AtomicBool::new(false),
+        owed_at: AtomicU64::new(KICK_NOT_OWED),
+    })))
+}
+
+/// The kernel VA of the control queue's notify register, 0 if it cannot be located exactly.
+///
+/// `PciTransport::notify` computes it on every call (write `queue_select`, read
+/// `queue_notify_off`, both in the shared common configuration), which is why it may only run
+/// under `virtio_lock`. This computes it once, at init: the NOTIFY_CFG capability (BAR, offset,
+/// length, `notify_off_multiplier`) and the COMMON_CFG capability (to read the queue's
+/// `queue_notify_off`), each mapped with the capability's own length so the MMIO cache hands
+/// back the transport's own mapping. The capability walk is `pci_caps.rs`'s, repeated here so
+/// this change stays inside the transport. PASSIVE.
+fn locate_ctrl_doorbell(access: &DxgkConfigAccess) -> usize {
+    use virtio_drivers::transport::pci::bus::ConfigurationAccess;
+    let rd = |off: u8| {
+        access.read_word(
+            DeviceFunction {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            off,
+        )
+    };
+    let bar_base = |bar: u32| -> Option<u64> {
+        if bar > 5 {
+            return None;
+        }
+        let reg = 0x10 + (bar as u8) * 4;
+        let lo = rd(reg);
+        if lo & 1 != 0 {
+            return None;
+        }
+        let base = u64::from(lo & 0xFFFF_FFF0);
+        Some(if (lo >> 1) & 3 == 2 {
+            base | (u64::from(rd(reg + 4)) << 32)
+        } else {
+            base
+        })
+    };
+    // Status bit 4: capability list present.
+    if (rd(0x04) >> 16) & (1 << 4) == 0 {
+        return 0;
+    }
+    // (phys, length) of COMMON_CFG; (phys, length, multiplier) of NOTIFY_CFG.
+    let mut common: Option<(u64, u32)> = None;
+    let mut notify: Option<(u64, u32, u32)> = None;
+    let mut cap = (rd(0x34) & 0xFF) as u8 & 0xFC;
+    for _ in 0..48 {
+        if cap == 0 {
+            break;
+        }
+        let d0 = rd(cap);
+        let next = ((d0 >> 8) & 0xFF) as u8 & 0xFC;
+        let cfg_type = (d0 >> 24) & 0xFF;
+        if d0 & 0xFF == 0x09 {
+            // `virtio_pci_notify_cap` is 20 bytes: every read below stays in config space.
+            if cap > u8::MAX - 20 {
+                return 0;
+            }
+            let bar = rd(cap + 4) & 0xFF;
+            let offset = u64::from(rd(cap + 8));
+            let length = rd(cap + 12);
+            let Some(base) = bar_base(bar) else {
+                cap = next;
+                continue;
+            };
+            if cfg_type == u32::from(helios_protocol::VIRTIO_PCI_CAP_COMMON_CFG) && common.is_none() {
+                common = Some((base + offset, length));
+            } else if cfg_type == u32::from(helios_protocol::VIRTIO_PCI_CAP_NOTIFY_CFG)
+                && notify.is_none()
+            {
+                notify = Some((base + offset, length, rd(cap + 16)));
+            }
+        }
+        cap = next;
+    }
+    let (Some((cphys, clen)), Some((nphys, nlen, mult))) = (common, notify) else {
+        return 0;
+    };
+    // `queue_notify_off` is at 0x1E; the structure must reach it. The multiplier must be even
+    // (virtio-drivers refuses the device otherwise).
+    if clen < 0x20 || mult % 2 != 0 {
+        return 0;
+    }
+    // SAFETY: real device BAR sub-regions, mapped (or found in the cache) at PASSIVE with the
+    // capability's own length; the fallible form never yields a dangling VA.
+    let Some(cva) = (unsafe {
+        crate::virtio::hal::try_mmio_map(cphys as virtio_drivers::PhysAddr, clen as usize)
+    }) else {
+        return 0;
+    };
+    // SAFETY: `queue_select` (0x16) and `queue_notify_off` (0x1E) inside the mapped common
+    // configuration; init is single-threaded and the transport selects before every queue
+    // access it makes, so this select changes nothing it relies on.
+    let off = unsafe {
+        core::ptr::write_volatile(cva.as_ptr().add(0x16) as *mut u16, CTRL_QUEUE);
+        core::ptr::read_volatile(cva.as_ptr().add(0x1E) as *const u16)
+    };
+    let byte = usize::from(off) * mult as usize;
+    if byte + 2 > nlen as usize {
+        return 0;
+    }
+    // SAFETY: as above, the NOTIFY_CFG region with its own length.
+    match unsafe { crate::virtio::hal::try_mmio_map(nphys as virtio_drivers::PhysAddr, nlen as usize) } {
+        Some(nva) => nva.as_ptr() as usize + byte,
+        None => 0,
+    }
+}
+
 impl Drop for VirtioGpu {
     fn drop(&mut self) {
+        // FIRST: no late doorbell may be owed when the device is reset below (docs 24.14.10).
+        self.close_late_kicks();
         // Quiesce the device before ending reader leases: unlike ordinary
         // scheduler reset, transport Drop is terminal and no host DMA may
         // retain a snapshot once this reset returns.

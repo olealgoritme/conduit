@@ -501,6 +501,8 @@ pub(crate) enum Taken {
 /// was submitted (the capacity was checked before any host work, so it cannot happen; the arm
 /// reports it as it always did).
 ///
+/// `t_present` is the DDI's entry time (interrupt time), the `StageTrace` G_PRESENT stamp.
+///
 /// # Safety
 /// `args` is dxgkrnl's `DXGKARG_PRESENT` for this call (PASSIVE_LEVEL) and its private-data
 /// pointer is writable for `DmaBufferPrivateDataSize` bytes.
@@ -511,6 +513,7 @@ pub(crate) unsafe fn try_async(
     source: OptimalPresentImageDesc,
     destination: PresentDestinationDesc,
     boundary: Option<u64>,
+    t_present: u64,
 ) -> Result<Taken, NTSTATUS> {
     let destination_resource = destination.resource_id();
     let source_resource = source.resource_id();
@@ -545,10 +548,10 @@ pub(crate) unsafe fn try_async(
     let taken = match route {
         Route::Legacy { why } | Route::LegacyAfterDrain { why } => Ok(fall(why)),
         Route::Direct => unsafe {
-            direct(passive, adapter, args, source, destination, !no_mirror)
+            direct(passive, adapter, args, source, destination, !no_mirror, t_present)
         },
         Route::Deferred => unsafe {
-            deferred(passive, adapter, args, source, destination, boundary)
+            deferred(passive, adapter, args, source, destination, boundary, t_present)
         },
     };
     // Every way out to the legacy arm (a refused queue, token or submission included): the arm
@@ -596,6 +599,7 @@ unsafe fn direct(
     source: OptimalPresentImageDesc,
     destination: PresentDestinationDesc,
     need_guest: bool,
+    t_present: u64,
 ) -> Result<Taken, NTSTATUS> {
     let destination_resource = destination.resource_id();
     let copy = adapter.with_venus_client(passive, |client| {
@@ -633,6 +637,14 @@ unsafe fn direct(
         // refusal means (a foreign source's refusal is a counted success there).
         Ok(Err(_)) | Err(_) => return Ok(fall(Why::SubmitRefused)),
     };
+    // `StageTrace`: this Present's entry, under the copy's wire fence (G_SUBMIT was stamped by
+    // the submission).
+    crate::ddi::stage_trace::stamp(
+        helios_kmd_logic::stage_trace::G_PRESENT,
+        helios_kmd_logic::stage_trace::KIND_FENCE,
+        fence,
+        t_present,
+    );
     // Capacity was checked before host work was queued, so this cannot fail. Merge preserves the
     // newest fence if dxgkrnl batches more than one Present into the same DMA private-data buffer.
     if let Err(status) = unsafe {
@@ -661,6 +673,7 @@ unsafe fn deferred(
     source: OptimalPresentImageDesc,
     destination: PresentDestinationDesc,
     boundary: Option<u64>,
+    t_present: u64,
 ) -> Result<Taken, NTSTATUS> {
     let Some(boundary) = boundary else {
         return Ok(fall(Why::NoBoundaryMirror));
@@ -683,7 +696,15 @@ unsafe fn deferred(
         let no_mirror = no_mirror_knob || prepared.guest_target();
         adapter
             .with_virtio(|v| {
-                v.queue_async_blt(adapter, source, destination, prepared, boundary, no_mirror)
+                v.queue_async_blt(
+                    adapter,
+                    source,
+                    destination,
+                    prepared,
+                    boundary,
+                    no_mirror,
+                    t_present,
+                )
             })
             .unwrap_or(Err(VirtioError::DeviceError))
     });

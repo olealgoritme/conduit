@@ -318,6 +318,17 @@ pub(crate) fn publish_nvrm_counters() {
     crate::ddi::blt_async::publish_counters();
     // The guest-memory blob Blt destination (`GuestBlob`): `Gb*`, written once an event happened.
     crate::ddi::guest_blob::publish_counters();
+    // The display submit stages (`Sub*`, docs 24.14), written once a display submit was measured.
+    crate::virtio::submit_stage::publish_counters();
+    // The copy-engine Present record behind a fenced marker (M3c-0): `CeRec*`, written once a
+    // fenced marker was seen.
+    crate::ddi::ce_record::publish_counters();
+    // The transfer-only queue for the Present copies (`CopyQueue`): `CqMain` / `CqXfer`, the
+    // fallbacks `CqFall` / `CqWhy` / `CqMask`, the queue-switch waits, written once the knob is on.
+    crate::ddi::copy_queue::publish_counters();
+    // The DWM-restart block (`Dw*`): device lifecycle, the census of what a dead device left
+    // pinned, the Present / flip / open windows since it died. Only words that changed.
+    crate::ddi::dwm_restart::publish_counters();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();
@@ -330,6 +341,13 @@ pub(crate) fn publish_nvrm_counters() {
     // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a
     // deliberate negative test means a process names something that is not its own.
     crate::virtio::nvrm_harden::publish_counters();
+    // Interrupts by vector (`MsiInts` is their sum: 0 on the INTx path, the one number that says
+    // whether MSI is actually delivering), DPCs by vector, the INTx counts, delivery health and
+    // the polling safety net (`virtio::msi`, `docs/msi-interrupts.md`).
+    crate::virtio::msi::publish_counters();
+    // Round trip of forwarded RM calls: count, min / mean / max and a histogram (`NvRtt*`), the
+    // number that compares MSI-X with INTx per call.
+    crate::virtio::nvrm::publish_rtt_counters();
     // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
     // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
     // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that
@@ -743,12 +761,8 @@ pub fn diag_dump_engine_atomics() {
     crate::diag::record(
         0x0F0E_0000 | (super::interrupt::CONTROL_INT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
     );
-    // Interrupts taken in message mode (0 on the INTx path): the one number that
-    // says whether MSI is actually delivering.
-    crate::diag::record_named_bytes(
-        b"MsiInts",
-        super::interrupt::MSI_INT_COUNT.load(Ordering::Relaxed),
-    );
+    // (`MsiInts` and the other interrupt counters moved to `publish_nvrm_counters`, the
+    // periodic mirror: this dump runs only at DestroyDevice.)
     crate::diag::record(0x0F0F_0000 | (DMA_NOTIFY_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F10_0000 | (DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F11_0000 | (DMA_SYNC_STATUS_LOW.load(Ordering::Relaxed) & 0xFFFF));
@@ -2312,8 +2326,24 @@ pub unsafe extern "C" fn dxgkddi_render(
                     })
                 } else if let Some(tail) = fence_tail {
                     if stream_tail_zero {
-                        creator
-                            .and_then(|process| attach_or_take_fence_tail(adapter, process, &tail))
+                        let marker = creator
+                            .and_then(|process| attach_or_take_fence_tail(adapter, process, &tail));
+                        if let Some(context) = context.as_ref() {
+                            // The copy-engine record behind the tail (168-byte form, M3c-0):
+                            // parsed, counted, stashed beside the fence; it changes nothing above.
+                            // SAFETY: `cmd_len` bytes are readable at `pCommand`.
+                            unsafe {
+                                crate::ddi::ce_record::note_render(
+                                    context,
+                                    args.pCommand as *const u8,
+                                    cmd_len,
+                                    helios_protocol::HELIOS_RM_FENCE_TAIL_V3_HERF_OFFSET,
+                                    &tail,
+                                    marker.as_ref().map(|m| m.rm_boundary),
+                                )
+                            };
+                        }
+                        marker
                     } else {
                         // A partial stream tail beside a fence: not a marker, but
                         // the handle is still the KMD's.
@@ -2504,9 +2534,25 @@ pub unsafe extern "C" fn dxgkddi_render(
                                 && private.present_value == 0
                                 && private.present_cookie == 0;
                             if stream_tail_zero {
-                                creator.and_then(|process| {
+                                let marker = creator.and_then(|process| {
                                     attach_or_take_fence_tail(adapter, process, &tail)
-                                })
+                                });
+                                if let Some(context) = context.as_ref() {
+                                    // The copy-engine record behind the tail (192-byte form,
+                                    // M3c-0): parsed, counted, stashed beside the fence.
+                                    // SAFETY: `cmd_len` bytes are readable at `pCommand`.
+                                    unsafe {
+                                        crate::ddi::ce_record::note_render(
+                                            context,
+                                            args.pCommand as *const u8,
+                                            cmd_len,
+                                            helios_protocol::HELIOS_RM_FENCE_TAIL_V3_HEPR_OFFSET,
+                                            &tail,
+                                            marker.as_ref().map(|m| m.rm_boundary),
+                                        )
+                                    };
+                                }
+                                marker
                             } else {
                                 crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
                                 take_fence_tail(adapter, creator, &tail);

@@ -1159,6 +1159,9 @@ full zero block once per generation even if nothing is ever seen.
 | `DmaGpuFence`, `PresentWmk`, `WddmHoldMs`, `WddmHeadMs` | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` fields / statics | `DmaGfEff`, `PrWmkEff`, `WdHoldEff`, `WdHeadEff` (new) |
 | `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
+| `MsiMode`, `MsiLatch` | AddDevice (`virtio::msi::apply_key_policy`; `MsiLatch` also at transport up) | not cached | `MsiModeEff`, `MsiWant`, `MsiKeyWr` (the device-key write), `MsiLatch` (0 or 1) |
+| `SubmitPool`, `SubStageClk` (24.14) | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `SubPoolOn`, `SubClkOn` (every start) |
+| `SubKickUnlock` (24.14.10) | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` (`KickState`) | `SubKickUnl` (every init; 1 only with the doorbell located) |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `VsPowerMode`, `VsWatchdog`, `VsIdleWake`, `VsWdTimer` (15.4, 19.3) | StartDevice (`stall_diag::reread_knobs`) | static | `VsPwrEff`, `VsWdgEff`, `VsIdlEff`, `VsWdTmEff` (every start, 0 included) |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
@@ -3436,6 +3439,444 @@ Pass conditions on hardware (Heaven windowed, NVK DWM, `GuestBlob=1`, host `--ve
 * Not done: creating the guest blob off the Present path (on the HPD worker); a periodic first-row checksum (`GbBad` in 13.3's
   test plan).
 
+### 24.13 The Present copies on the transfer-only queue (`CopyQueue`)
+
+Status: implemented behind `CopyQueue` (default 0 = the previous behaviour, byte for byte). Pure logic host-tested
+(`kmd_logic/src/copy_queue.rs`, 20 tests including the counter-name scans); `kmd_render` stub type-checked (no new error
+against the base). NOT built with the WDK or run here.
+
+#### 24.13.1 Why
+
+The KMD's Venus device had one queue: family 0, queue 0, bound to ring 1 (`bringup.rs`). On the RTX 5090 the host's families
+are 0 = graphics (graphics + compute + transfer, 16 queues), 1 = transfer only (the copy engine, 2 queues), 2 = compute. The
+windowed copy (5.76 MB at 1600x900) on family 0 shares graphics-engine timeslices with the game's NVK channel. Host measurement:
+208 us alone, p50 2.3 ms against a heavy competing graphics load, about 130 us more per frame under Heaven. The same copy on
+family 1 runs beside that load: p50 306 us.
+
+#### 24.13.2 What changes with `CopyQueue` 1
+
+* **Family choice** (`copy_queue::choose_transfer_family`). At bring-up, after the memory properties, the KMD asks
+  `vkGetPhysicalDeviceQueueFamilyProperties` (command 7, up to 8 families) and takes the first family other than 0 with
+  `TRANSFER` and neither `GRAPHICS` nor `COMPUTE` and at least one queue. The family is found by its flags, never by its index.
+  None: the device is the one-queue device and every copy stays on family 0 (`CqFam` 0xFFFFFFFF). With the knob 0 the query is
+  not sent.
+* **Device** (`copy_queue::first_attempt` / `next_attempt`). Every `vkCreateDevice` attempt of the extension ladder also asks
+  for one queue of that family. If even the last tier is refused, the ladder runs again from its start without it: exactly the
+  devices a `CopyQueue` 0 boot tries (`CqDevFall` 1). The knob can cost the queue, never the device.
+* **Queue and ring.** `vkGetDeviceQueue2(family, 0)` with `VkDeviceQueueTimelineInfoMESA.ringIdx = 2`
+  (`copy_queue::COPY_RING_IDX`). virglrenderer refuses a second queue on an already bound ring and destroys the context for a
+  fence on a ring with no queue (`docs/VENUS.md`, fences), so the copy queue exists in the client (`VenusClient::copy_queue`) only
+  when this call succeeded; otherwise nothing is ever fenced on ring 2 (`CqReady` 0).
+* **Route** (`copy_queue::route`), decided once per cached copy record (`PreparedPresentBlt::route`), because the record's
+  command buffer comes from a pool of one family and may only be submitted to a queue of that family. The transfer queue takes a
+  record that is a plain full-surface `vkCmdCopyImageToBuffer` into a buffer: a KMD standard Present buffer or its guest blob
+  (`GuestBlob`), whatever the source (an imported Venus allocation, or a foreign NVK resource with `ForeignCopy`), on every arm
+  that uses the record (legacy Blt, `BltAsync` DIRECT and DEFERRED, the WindowedBlt snapshot). Family 0 keeps, with a reason
+  (`CqWhy`): no transfer queue (1); an image destination (2: a DWM primary or another OPTIMAL image, which the scan-out copies
+  read on ring 1 and so keep their ring-1 order); a format conversion (3: `vkCmdBlitImage` needs a graphics queue); a copy region
+  that breaks `minImageTransferGranularity` (4). The level 5 staging copy (`rm_blt_copy_to_stage`) is an image destination and
+  stays on family 0. Scan-out copies, conversion initializers, Present-buffer creation and every other KMD submission are
+  unchanged: family 0, ring 1.
+* **Submission.** A record's submission goes to its queue and its SUBMIT_3D is fenced on that queue's ring
+  (`present_blt_queue`; `ctrl::submit_venus_async_present` / `_blt` / `_windowed_blt` take the ring now).
+
+#### 24.13.3 Queue-family ownership: transfers through EXTERNAL, no CONCURRENT
+
+Every resource the copy touches, and why it is right on either family:
+
+| resource | sharing | what the copy does |
+|---|---|---|
+| source image: imported Venus OPTIMAL alias, or explicit-modifier foreign NVK image | EXCLUSIVE (as created by its owner) | acquire `EXTERNAL -> F`, copy, release `F -> EXTERNAL`; F = the record's family (`copy_queue::barrier_family`, `ImageBarrier::on_family`) |
+| destination KMD standard Present buffer | EXCLUSIVE (the KMD's exported buffer; released `0 -> EXTERNAL` once at creation) | acquire `EXTERNAL -> F`, copy, HOST-read barrier, release `F -> EXTERNAL` |
+| destination guest-blob buffer | EXCLUSIVE, private to the KMD device | no ownership barrier: written only by copies of records of one route at a time, read only by the CPU; HOST-read barrier as before |
+| conversion scratch image | EXCLUSIVE, private | only in conversion records, which are always family 0 (unchanged) |
+| semaphores | none | the submissions have none |
+| fences | the host's per-ring wire fence | an empty submit with a fence on the queue bound to the SUBMIT_3D's ring, so the copy's own ring orders it after the copy |
+
+Proper ownership transfers were chosen over `VK_SHARING_MODE_CONCURRENT`: an imported image or buffer must be created with the
+same create info as its owner (DXVK, NVK, the KMD's exported Present buffer), and those are exclusive. The protocol the copies
+already used (acquire from `VK_QUEUE_FAMILY_EXTERNAL`, release back) carries over with only the KMD-side family changed. The
+resting owner stays EXTERNAL, so a resource copied on family 0 in one frame and on the transfer family in the next is never handed
+from one family to the other directly.
+
+Two records of different routes can share a resource: one destination written from a source that needs a conversion (family 0)
+and one that does not (transfer), or one source read into an image and into a buffer. Copies on two queues do not run in
+submission order, and an EXTERNAL acquire on one family while the other still owns the resource is invalid. So before a record is
+submitted, every record of the other route that shares its source or destination and has a submission is waited for
+(`copy_queue::conflicts`; a poll first, then at most `SWITCH_WAIT_MS` = 100 ms; `CqSwitch`, `CqSwitchTo`). This is the only new
+wait in a Present, it happens only on such a switch (a swapchain format change), and a single-format window never sees it.
+
+Granularity. A transfer-only family may have a coarse `minImageTransferGranularity` (0,0,0 means whole subresources only). The
+copy reads the whole source image from (0,0) (the import's extent is the copy's, foreign sources included), which every
+granularity allows; `copy_queue::granularity_ok` checks it anyway and a failure keeps the record on family 0 (`CqWhy` 4).
+`CqGran` shows the family's value (one byte per axis; the 5090's copy engine is expected to report 1,1,1).
+
+#### 24.13.4 Completion and the KMD's polling
+
+Nothing that observes completion compares fence ids across rings: the transport retires each SUBMIT_3D by its own used-ring
+entry (`InFlightKind::AsyncVenus`), `wait_fence` and `fence_wait_prepare` look up the one fence, `blt_async_retire` and the
+in-flight table hand a destination back when its last writer retires in any order (`Table::complete`, counted writers), the
+WindowedBlt terminal is matched by token, the Present's DMA fence names the copy's own wire fence (`WireBoundary::Exact`), and a
+prefix boundary already spans every ring (`async_retired_up_to`, `RetireDomain::IncludingGpu` is any nonzero ring). The CPU
+mirror, the present probe and the drains wait the copy's wire fence as before. The drains that destroy objects a copy may use
+(`release_present_blits_for_resource`, the guest-blob retire's queue marker) also put a fence marker on the transfer queue
+(`copy_queue_marker`), since the main queue's marker does not order it.
+
+#### 24.13.5 Knob and counters
+
+`CopyQueue` (REG_DWORD in the service key, default 0; `diag::knobs::COPY_QUEUE`), read at every StartDevice before the Venus
+bring-up (the device is created with it), mirrored as `CqKnob`. 1 = the transfer queue; 2 = the transfer queue, and the family-0
+queue at high global priority (24.13.8). Counters (`kmd_logic::copy_queue::COUNTERS`, all written by
+`ddi/copy_queue.rs` only):
+
+| counter | meaning |
+|---|---|
+| `CqKnob` | knob in force |
+| `CqFamN` | queue families the host reported (0 with the knob 0: not asked) |
+| `CqFam` | the transfer family chosen (0xFFFFFFFF: none) |
+| `CqGran` | its `minImageTransferGranularity`, width / height / depth one byte each |
+| `CqReady` | 1: the device has the transfer queue, bound to ring 2 |
+| `CqDevFall` | 1: `vkCreateDevice` refused the two-queue device at every tier, the one-queue device was made |
+| `CqPrio` | 1: the family-0 queue has `VK_QUEUE_GLOBAL_PRIORITY_HIGH` (`CopyQueue` 2) |
+| `CqPrioFall` | 1: `CopyQueue` 2 and the device refused the priority at every tier (made without it) |
+| `CqMain` / `CqXfer` | Present copies submitted on family 0 / on the transfer family (written once the knob is on) |
+| `CqFall` | of `CqMain`, copies the knob wanted on the transfer queue |
+| `CqWhy` / `CqMask` | last reason / every reason (bit `code - 1`): 1 no queue, 2 image destination, 3 conversion, 4 granularity |
+| `CqSwitch` / `CqSwitchTo` | submissions that waited for a copy of the other queue sharing a resource / of those, waits that gave up |
+
+#### 24.13.6 Hardware checklist (Heaven windowed, composed; 1920x1080 at 60 Hz first, then bigger)
+
+Same setup as 24.9 row 6 (or the current default set), A/B on `CopyQueue` only, ten minutes a row, `pnputil /restart-device`
+between rows (the device is created at StartDevice):
+
+1. `CopyQueue` 0: the baseline. `CqKnob` 0, `CqReady` 0, `CqFamN` 0, no `CqMain`/`CqXfer` written. Record `BltAsyncLat0..7`,
+   `BltWaitUs / BltWaitN`, PresentMon `msInPresentAPI`, `msBetweenPresents`, fps, host GPU utilization.
+2. `CopyQueue` 1: `CqFamN` 3, `CqFam` 1, `CqGran` 0x010101 (expected), `CqReady` 1, `CqDevFall` 0. `CqXfer` grows with the Blt
+   count, `CqFall` 0 for a BGRA swap chain into a BGRA redirection surface (`CqWhy` 3 when the formats differ, 2 for image
+   destinations). `CqSwitch` 0 or tiny, `CqSwitchTo` 0.
+
+Expected change: the copy's submission-to-completion time under a busy game drops from about 2.3 ms p50 toward 0.3 ms, so
+`BltAsyncLat` moves out of the 2..4 ms buckets (`Lat4`) into the < 500 us ones (`Lat0`, `Lat1`); in the legacy arm
+`BltWaitUs / BltWaitN` drops by the same amount; host GPU time per frame on the graphics engine drops by about 130 us under
+Heaven. Pass: no visual difference (no torn, old or black window content, a GDI app beside it correct), `BltAsyncFail` 0,
+`FlipPendWd` 0, no `WddmHeadMs` rebase, the host log free of virglrenderer `invalid ring_idx` / `sync_queue is already bound`
+lines, and `pnputil /restart-device` returns with the counters restarting.
+
+#### 24.13.8 Converting copies: the first hardware result and `CopyQueue` 2
+
+Package 22.22.346.1, windowed Heaven D3D11 1600x900 (`GuestBlob`, `BltAsync`, `ForeignCopy` on), `CopyQueue` 1: bring-up as
+designed (`CqFamN` 6, `CqFam` 1, `CqGran` 0x010101, `CqReady` 1), but `CqXfer` 0 and `CqFall` = `CqMain` = 15419 with `CqWhy` 3:
+every copy is a conversion. Heaven's NVK swap-chain image is `AB24` (`DRM_FORMAT_ABGR8888`, bytes `R G B A`, block-linear
+modifier 0x0300000000606014) and the destination (DWM's redirection surface) is BGRA, so the copy is a `vkCmdBlitImage`, which a
+transfer queue cannot run. The options considered:
+
+* **(a) A destination in the source's byte order.** The KMD does not choose the redirection surface's format: DWM creates it,
+  BGRA for every SDR windowed swap chain, and reads it as BGRA (its own Venus or NVK import, or the guest pages through
+  dxgkrnl's CPU view). Writing RGBA bytes into it shows red and blue swapped. Not possible from the KMD.
+* **(b) The conversion as a compute shader on the compute-only family.** On NVIDIA the compute-only family is not a separate
+  engine: its channels run on the same graphics engine (GR) as family 0 and the game, on GR's runlist. Between channel groups of
+  different processes that engine is time-sliced, which is exactly the wait measured on family 0 (the copy engine, family 1, has
+  its own runlist, which is why it escaped). So (b) would wait like family 0 does, and would bring a shader module, pipeline,
+  descriptor sets and storage-image usage on the imported foreign image (a new import shape) into the KMD for no expected gain.
+  Not done.
+* **(c) Transfer-only tricks.** No transfer command reorders bytes within a texel (image-to-buffer, image-to-image and
+  buffer-to-buffer copies are byte copies; aspect copies only extract planes). A CPU swap after a transfer-queue copy is the CPU
+  mirror this work removed. Not done.
+* **(d) Priority on the queue that must run it: `CopyQueue` 2 (implemented).** The converting copy has to run on the graphics
+  engine, so the lever is how long it waits there behind the game's channel group. `CopyQueue` 2 keeps everything of 1 and creates
+  the family-0 queue with `VkDeviceQueueGlobalPriorityCreateInfoKHR { VK_QUEUE_GLOBAL_PRIORITY_HIGH }` (device extension
+  `VK_KHR_global_priority`, which the host renderer allows; the struct rides the queue create info's pNext). One queue per family
+  0 entry, so the priority is the whole family-0 queue's: the scan-out copies and the other short KMD submissions get it too. Not
+  `REALTIME`: it needs privileges the sandboxed renderer lacks. A host that refuses the extension or the priority at every tier
+  gets the device of `CopyQueue` 1 (`CqPrioFall` 1), then, if that is refused too, the old one (`copy_queue::next_attempt`). The
+  routes do not change. Whether NVIDIA turns a high global priority into an earlier slot on GR for this channel group is the open
+  question this knob value answers on hardware.
+* **The real fix is upstream of the KMD:** present a BGRA image. If the producer's final present image (NVK / the D3D11 layer
+  above it) were `AR24` for a windowed swap chain, the copy would be a plain one and `CopyQueue` 1 would take it to the copy
+  engine with no other change (`CqWhy` would stop being 3). The format conversion would then happen in the game's own frame on
+  its own channel, where it costs no extra timeslice wait. This is outside the KMD and is left as a follow-up.
+
+Hardware rows for 2: as 24.13.6 with `CopyQueue` 2. Expect `CqPrio` 1 and `CqPrioFall` 0 (or `CqPrioFall` 1 if the host's NVIDIA
+driver refuses the priority, and then the row equals `CopyQueue` 1). `CqFall` and `CqWhy` 3 stay as they are (the copies are still
+conversions); the effect to look for is `BltAsyncLat` moving down from `Lat4` against the `CopyQueue` 1 row, `BltWaitUs/BltWaitN`
+dropping in the legacy arm, and no loss of game fps (the game's channel yields earlier to the copies).
+
+#### 24.13.7 Verified, and not
+
+* Verified (host tests): the family choice over the 5090 layout and others (by flags, never index 0, empty families, past the
+  request), the query's golden bytes, the device-creation ladder with and without the queue (without it, the old ladder exactly),
+  the granularity rule, the route table exhaustively (transfer only with a queue, a buffer, no blit, a legal region; the knob 0
+  always family 0 with no fallback counted), the barrier family, the queue-switch rule, the counter names (listed = written by
+  `ddi/copy_queue.rs`, nowhere else, the knob in `diag.rs`).
+* Also host-tested: the knob values, the three-way device ladder (priority dropped first, then the queue, then the old ladder),
+  and that the priority never changes a route.
+* NOT verified: anything on hardware for `CopyQueue` 2 (whether the host exposes `VK_KHR_global_priority` and grants HIGH, and
+  whether that shortens the wait on GR); for 1, anything beyond the first hardware row (24.13.8); that the host accepts the
+  two-queue device and binds ring 2 (virglrenderer's
+  `vkr_queue_assign_ring_idx` allows rings 1 to 63 per context); the 5090's `minImageTransferGranularity` for family 1; that the
+  copy engine's throughput under load matches the host measurement inside the VM; that the source's acquire from EXTERNAL on
+  the transfer family behaves on NVIDIA as on family 0 (it is the same barrier with a different `dstQueueFamilyIndex`).
+
+### 24.14 Display submit staging (`SubmitPool`, `Sub*`)
+
+#### 24.14.1 The evidence
+
+The joined guest+host stage table of windowed Heaven (`GuestBlob`, `BltAsync`, `ForeignCopy`) gives p50 **KMD submit ->
+backend kick = 114.5 us** (p99 186 us) for the windowed Blt copy, against **19.7 us** for the foreign-flip submit. Everything
+else on that path (defer, host hops, the 234 us GPU copy, the 33 us interrupt) is measured separately. So about 95 us of guest
+time goes into putting one display command on the virtqueue and ringing the doorbell, and the flip shows that most of it is
+not the virtqueue.
+
+Reading the code gave the suspect. Each of the four display submitters (`ctrl::submit_venus_async_scanout`, `_present`,
+`_blt`, `_windowed_blt`) calls `stage_display_submit`, which ran `reap_parked`, then **two `DmaBuffer::new`** (the SUBMIT_3D
+meta and the Venus stream: `MmAllocateContiguousMemory` at PASSIVE each, plus the matching frees in a later reap), a copy of the
+stream, and then under `virtio_lock` a `drain_used` before the enqueue. The foreign flip allocates nothing per flip. The escape
+path (`submit_venus_async`) had taken its buffers from the transport's DMA pool all along. The display paths never did. The reap
+still recycled their buffers into that pool, so the pool was fed by display buffers that only the escape path ever took.
+
+#### 24.14.2 The stages (instrumentation, `kmd_logic::submit_stage::Clock`)
+
+Each display submit runs under a stage clock (interrupt time, 100 ns, atomics only, published by `publish_nvrm_counters` on
+the mirror thread's cadence and zeroed at every start). The stages are, in order:
+
+| Stage | Counter (total us) | What it covers |
+|---|---|---|
+| Reap | `SubReap` | `reap_parked` / `reap_parked_work`: recycling (and freeing the excess of) completed entries' buffers |
+| Take | `SubTake` | the one lock hold that begins the reap and takes both buffers from the pool (`SubmitPool` 1 only) |
+| Alloc | `SubAlloc` | fresh `DmaBuffer::new` calls, both buffers together |
+| Copy | `SubCopy` | the stream copy into its staged buffer |
+| Lock | `SubLock` | from the call into `with_virtio` to the first instruction under the lock (on the scan-out path it also includes building the notify target) |
+| Drain | `SubDrain` | `drain_used` before the enqueue |
+| Enq | `SubEnq` | the enqueue: descriptors, avail-ring publish, in-flight record, minus the notify |
+| Kick | `SubKick` | `transport.notify` (the doorbell, a VM exit), timed inside `publish_then_notify` by a timer the display submitter arms in its own lock hold (`KickTimer`; every other enqueue pays one `armed` test) |
+| Prep | `SubPrep` | work of the submit before its staging: the foreign flip's mint and request build (24.14.9); 0 on the display paths |
+
+Also written: `SubTotal` / `SubTotMax` (whole submit, total and longest, us), `SubN` (submits measured, every call),
+`SubAllocN` (fresh allocations), `SubPoolHit` (buffers taken from the pool), `SubNoKick` (enqueues whose notify the device
+suppressed), `SubDrainHit` (pre-enqueue drains that found completions), `SubClock` (two back-to-back stamps per submit, us in
+all: the clock's own cost), and per path `SubNScan`, `SubNPres`, `SubNBlt`, `SubNWin`. `SubPoolOn` (the knob in force) is
+written at every StartDevice. All names are in `kmd_logic::submit_stage::COUNTERS` (14 characters at most). The host tests
+check that `virtio/submit_stage.rs` writes exactly that list and that no other `kmd_render` file spells one of them.
+
+#### 24.14.3 The pool (`SubmitPool` 1, the default)
+
+`stage_display_submit` now does what the escape path does. In ONE `with_virtio` hold it runs `begin_parked_reap`,
+`take_dma_buffer(SUBMIT_META_BYTES)` and `take_dma_buffer(stream.len())`. Then it finishes the reap at PASSIVE
+(`reap_parked_work`; what the reap recycles serves the next submit). It allocates fresh only for a buffer the pool could not
+supply (`submit_stage::plan`, host-tested). There is no new pool.
+
+* **Why the existing pool and not a new class-sized free list.** `VirtioGpu::dma_pool` is already a bounded free list (256
+  buffers, 8 MiB, 260 KiB per buffer at most) with a best-fit take that stops at the first one-page buffer. It already gets
+  every display buffer back through the reap. Its lifetime rule is already the right one (below), and so is its teardown. A
+  second pool would split the budget, and the same submit would have to be reaped into one pool or the other by kind, which
+  duplicates the lifetime logic. The display streams are under one page, so a size class would always be the smallest one.
+* **The lifetime rule** (unchanged, and the reason this is safe). A buffer enters `dma_pool` only from a completed in-flight
+  entry: `drain_used` popped that submit's used-ring element, so the host has consumed both descriptors. It then enters through
+  the PASSIVE reap (`recycle_dma_buffers`) or through the drain's push for raw forwards. A buffer that a submit took belongs to
+  its in-flight entry until that same completion. After a transport failure (`latch_failed_and_fail_inflight`) the entries are
+  parked as well, but the failed transport refuses every enqueue, so a buffer recycled then is never handed to the device again
+  in that generation. The pool lives in the transport generation, so StopDevice drops it at PASSIVE together with the transport.
+* **Stale bytes.** A pooled buffer is not zeroed. `take_dma_buffer` re-stamps the wire tail (`reset`), the enqueue overwrites
+  the SUBMIT_3D header, the device writes the response, and the stream descriptor's length is `stream.len()`, so the device
+  never reads a stale byte. The escape path has relied on this all along.
+* **Failure semantics, unchanged.** A miss is a fresh PASSIVE allocation, and that allocation failing is `OutOfMemory`.
+  Nothing waits. A QueueFull, `DstBusy` or refused enqueue drops the staged buffers at PASSIVE, as before (they are not
+  returned to the pool on that rare path).
+* **No per-prepared-command cached stream.** The prepared Present copy's stream is byte-identical every frame
+  (`encode_command_buffer_submit(prepared.command_buffer_id)`), but it is a few dozen bytes. A buffer that is never rewritten
+  would be shared by every in-flight submit of that command, which needs a reference count on the in-flight entries, and the
+  copy it saves is `SubCopy` (expected well under 1 us). Revisit only if `SubCopy / SubN` says otherwise.
+
+#### 24.14.4 The pre-enqueue drain
+
+`drain_used` stays unconditional. On an empty used ring it is already one acquire load (`peek_used` of the used index), so a
+separate peek before it saves nothing. On a non-empty ring it does the DPC's work early, and the enqueue in the same hold
+depends on that work: free descriptors (the display paths do not retry a QueueFull), the destination ownership that a retired
+Blt released (otherwise `BltEnq::Busy`, a needless legacy fallback), and the windowed-Blt FIFO state. Skipping it would trade
+microseconds for more QueueFull and `DstBusy` outcomes. `SubDrainHit / SubN` and `SubDrain / SubDrainHit` show what it costs
+when it has work. If that is large, the next step is to drain only when `available_desc()` is short. That would be safe for
+the scan-out and Present paths and not for `BltAsync`.
+
+#### 24.14.5 Knob
+
+`SubmitPool` (REG_DWORD in the service key, default 1; `diag::knobs::SUBMIT_POOL`), read at AddDevice and every StartDevice
+(`AdapterKnobs`), mirrored as `SubPoolOn`. 0 is the old allocate-per-submit path exactly, for a same-boot A/B
+(`reg add` + `pnputil /restart-device`). The stage counters run with either value.
+
+#### 24.14.6 What to read on hardware (windowed Heaven, lowest mode first)
+
+Run `SubmitPool=0` and then `SubmitPool=1` in the same boot, and compare per submit (divide by `SubN`):
+
+* `SubPoolOn` matches the knob. With 1, `SubAllocN` stays near 0 after the first frames and `SubPoolHit` grows by about
+  2 x `SubN`. With 0, `SubAllocN` = 2 x `SubN` and `SubPoolHit` stays 0.
+* **`SubAlloc / SubN` should collapse** (expected: tens of us with 0, about 0 with 1). `SubReap / SubN` should also drop,
+  because the reap no longer frees the excess buffers that the pool could not hold.
+* `SubKick / (SubN - SubNoKick)` is the doorbell cost. This is the floor that the foreign flip pays too.
+* `SubLock`, `SubDrain`, `SubEnq` per submit should be single-digit us. A large `SubLock` means contention on `virtio_lock`
+  (the DPC drain), which is not this change.
+* `SubTotal / SubN` against `SubTotMax`, and `SubClock / SubN` stays well under 1 us (otherwise the clock itself is in the
+  numbers: the interrupt-time source is slow on that host).
+* In the joined table, **KMD submit -> backend kick should go from about 114 us to about 20-30 us** for the windowed Blt
+  copy, close to the foreign flip's 19.7 us. `SubNBlt` / `SubNWin` say which Blt arm carried the frames.
+* The transport pool's own counters move with the extra takes: `DpHit` grows by about 2 x `SubN`, `DpMis` only by the misses
+  (`SubAllocN`), `DpDrp` (buffers
+  the full pool refused) should not grow faster than before, and `DpByt` (cached bytes) settles a few pages higher.
+
+#### 24.14.7 Risks
+
+* The display paths now share the pool with the escape path. Both take and both return, and a miss is a fresh allocation, so
+  the worst case is today's behaviour.
+* The kick timer is a field of `VirtioGpu` (16 bytes inline). It is armed and taken in the same lock hold, so no other enqueue
+  can be charged to a display submit.
+* The clock reads interrupt time about 10 times per display submit (`SubClock` shows what that costs).
+
+#### 24.14.8 Where the code is, verified and not
+
+* Pure: `kmd_logic/src/submit_stage.rs` (`Clock`, `KickTimer`, `plan`, `fresh_count`, `COUNTERS`, `TABLE_NAMES`, the name scans; 13 tests).
+* I/O: `kmd_render/src/virtio/submit_stage.rs` (atomics, publication, knob mirror). `virtio/ctrl.rs`: `stage_display_submit`
+  (the pool), `measured`, `display_enqueue` (the drain, enqueue and kick timing). `virtio/gpu/mod.rs`: `publish_then_notify`
+  (kick timer), `used_pending`. The knob is in `diag.rs` and `adapter/mod.rs` (`AdapterKnobs::submit_pool`).
+* Verified: `kmd_logic` host tests (including the exact-list scans over `kmd_render`), and a stub type check of `kmd_render`
+  with no new error against the base (a deliberate error planted in each edited file was reported).
+* NOT verified: anything on hardware. In particular, the size of each stage, and that the pool hit rate stays high under the
+  escape path's load.
+
+#### 24.14.9 First hardware run (349.1), and the foreign flip
+
+The pool did what it was meant to do. Submit -> kick for the windowed Blt copy fell from 121.7 us to 21.1 us, and `SubAlloc`
+per submit fell from 96 us to 0.03 us. `SubKick` per submit is about 18.6 us, so the doorbell is now almost all of what is
+left. In the same run, the foreign flip's KMD submit -> backend kick rose from about 20 us to about 36 us. The flips (about
+2739 per Heaven run) were not instrumented, because they do not go through the display submitters.
+
+**The flip's submit path.** `foreign_flip::flip_async` (`virtio/foreign_flip.rs:1332`) calls
+`foreign_scanout::present_submit` (`virtio/foreign_scanout.rs:277`: mint, release-book entry, request build), which calls
+`ctrl::raw_submit_async` (`virtio/ctrl.rs:758`). That function does one `with_virtio` hold for `begin_parked_reap` and
+`take_dma_buffer(req + 32)`, then the PASSIVE reap, then a pool miss's allocation, then one `with_virtio` hold for `drain_used`
+and `enqueue_raw_async`. The enqueue ends in `publish_then_notify` (`virtio/gpu/mod.rs:3339`), which rings the doorbell under
+`virtio_lock`. The flip's buffer goes straight back to the pool in the drain's `RawAsync` arm (`virtio/gpu/mod.rs:5033`).
+
+**Why the pool change could slow it (by reading).**
+
+* **It does not starve the flip of buffers.** The flip shares the pool, but it returns its buffer at its own completion, and
+  the display paths return theirs through the reap. The pool hit rate of the display paths is about 100 %.
+* **A larger pooled buffer costs nothing.** It is not zeroed, and the descriptor names only the request length.
+* **The take+reap hold did not grow materially.** The display path's take hold is `begin_parked_reap` plus two best-fit takes.
+  Each take stops at the first page-sized buffer, and the pool is full of them, so the hold is about the old reap's own begin
+  hold. The recycle and finish holds are unchanged. So shortening the take (moving it outside the lock, or a free list per
+  class) would not buy the flip's 16 us, and I did not do it.
+* **The doorbell inside `virtio_lock` is the likely cause.** It costs about 18.6 us (a VM exit), and every submitter rings it
+  while holding `virtio_lock`. Before the pool, the Blt submit spent about 95 us allocating outside the lock, and its short
+  locked enqueue+kick happened at some other moment. Now the whole Blt submit is about 21 us. Its locked kick lands in the same
+  short window after a frame in which the HPD worker submits the flip, so a flip that meets it spins on `virtio_lock` for up to
+  one kick, about 18 us. That is the size of the regression. The instrumentation itself is the other candidate: five
+  interrupt-time reads inside the hold (the `Lock`, `Drain` and `Enq` laps, and the two kick stamps). `SubClock` says what one
+  read costs.
+
+**Instrumented now.** The flip runs under the same stage clock (`Path::Flip`). `Prep` is the mint and the request build, and
+the staging and the enqueue hold are timed as for the display paths. It is NOT in the aggregate `Sub*` totals, which remain the
+four display submitters' totals and are comparable with 349.1. It has its own table, and the windowed Blt gets one too
+(`kmd_logic::submit_stage::TABLE_NAMES`, written by `virtio/submit_stage.rs`, covered by the same name scans):
+
+| Row | Names (total us unless noted) |
+|---|---|
+| windowed Blt | `SubWPrep` `SubWReap` `SubWTake` `SubWAlloc` `SubWLock` `SubWDrain` `SubWEnq` `SubWKick` `SubWTot` `SubWTotMax` `SubWN` (count) |
+| foreign flip | `SubFPrep` `SubFReap` `SubFTake` `SubFAlloc` `SubFLock` `SubFDrain` `SubFEnq` `SubFKick` `SubFTot` `SubFTotMax` `SubFN` (count) |
+
+The aggregate gained `SubPrep` (0 on the display paths).
+
+**New knob, `SubStageClk`** (default 1; `diag::knobs::SUBMIT_STAGE_CLOCK`, mirrored as `SubClkOn`). With 0, no interrupt time
+is read on any submit path, and only the counts run (`SubN`, `SubWN`, `SubFN`, `SubAllocN`, `SubPoolHit`). This is the A/B
+for the clock's own cost inside the lock.
+
+**What to read next (divide each total by its row's `N`).**
+
+* `SubWTot / SubWN` should be about 21 us, with `SubWKick` about 18.6 us and `SubWAlloc` about 0. This confirms 349.1 for the
+  windowed path alone.
+* `SubFTot / SubFN` should be about 36 us. If the lock-wait hypothesis holds, `SubFLock / SubFN` is about 15 us, `SubFKick /
+  SubFN` about 18 us, and `SubFTake + SubFReap + SubFAlloc` under 2 us in all (the pool is not the cause). A large `SubFTake`
+  or `SubFAlloc` would point at the pool after all. A large `SubFPrep` points at the mint, which this change did not touch.
+* `SubClock / (SubN + SubFN)` is the cost of one pair of reads. If it is more than about 0.5 us, rerun with `SubStageClk=0`.
+  If the flip's submit -> kick in the joined table then returns to about 20 us, the regression was the clock.
+* **If `SubFLock` carries it, the fix is the doorbell outside the lock**, split the way Linux splits kick-prepare and notify:
+  decide `should_notify` under the lock and ring after the release. That fix needs a reference that keeps the transport
+  generation (its notify BAR mapping) alive across the release against a concurrent StopDevice, so it is a separate, reviewed
+  change, not part of this one. Expected after it: both the flip and the Blt pay their own kick (about 18 us) and never each
+  other's.
+
+#### 24.14.10 The doorbell after the lock (`SubKickUnlock`)
+
+24.14.9 read the flip's regression as a wait on `virtio_lock` while another submitter rang its doorbell. `PciTransport::notify`
+makes three MMIO accesses, each a VM exit: it writes `queue_select` and reads `queue_notify_off` in the shared common
+configuration, then writes the notify register. Because of those first two accesses it may only run under the lock. The doorbell
+is now rung after the release, in the one place every display submitter and the pipelined flip share
+(`ctrl::display_enqueue`, deciding through `VirtioGpu::publish_then_notify`). It is a single MMIO write to the control queue's
+notify register, which is located once at transport init (`gpu/mod.rs` `locate_ctrl_doorbell`: the NOTIFY_CFG and COMMON_CFG
+capabilities, mapped with their own lengths so the MMIO cache returns the transport's own mappings). The pure rules and
+their model tests are in `kmd_logic::kick_defer`.
+
+**The ordering, for one submit that rings late.**
+
+1. Descriptors and the avail ring slot are written under `virtio_lock`.
+2. The avail index is stored with Release.
+3. A **full fence** follows, then the suppression check (`VIRTQ_USED_F_NO_NOTIFY` or the event index), still under the lock.
+   This is virtio 1.x 2.7.13.3 and Linux `virtqueue_kick_prepare`. Release/Acquire does not order a store before a later
+   load. Without the fence, the check could read a stale "do not notify" from before the index store, and the wake of a
+   device that had just re-enabled notifications and found the old index would be lost.
+4. If a notify is owed, the guard's pending count is incremented (`kick_defer::begin`) and the hold's owed slot is set.
+5. The lock is released.
+6. The guard is checked (`may_ring`). The doorbell is written, or the kick is dropped if the transport is closing.
+7. The pending count is decremented (`end`), strictly after the write.
+
+**Two submitters.** Notifications carry no payload for a split ring, so a doorbell after the last publish covers every
+earlier one. If A and B both owe a ring, either may ring first. Each ring comes after its own publish, and the later ring
+comes after both publishes. A hold that publishes twice owes one ring. The model test explores every interleaving of two
+submitters with the device's "enable notifications, then re-check" loop and finds no lost wake. The same model with the check
+moved before the index store, which is what a missing fence permits, does lose one. That proves the model can see the bug.
+
+**Teardown.** `VirtioGpu::drop` first closes the guard (`close`). Then it waits, bounded (spins, then up to 8 sleeps of about
+16 ms), for the pending count to drain. Only then does it reset the device and free the state. A late kick that finds the
+guard closed is dropped (`SubKickDrop`): the device is reset next and nothing published will be answered. If a kicker
+stalls past the budget, the state is leaked rather than freed (`SubKickLeak`). The kicker's `end` then touches live memory,
+and its doorbell is a write to the transport's notify register. That register stays mapped until driver unload (BAR
+mappings are cached for the driver's lifetime, see `Drop`), so a late write reaches a reset queue, which ignores it.
+
+**Unchanged.** Every staging-buffer lifetime rule (24.14.3), the per-path counters, and every other `with_virtio` caller:
+those never arm the late ring, so they ring under the lock as before. With the knob at 0 the old block runs exactly, without
+the new fence. That pre-existing missing fence is also present in the locked path; this change does not touch it, so that
+0 stays the old behaviour.
+
+**Knob.** `SubKickUnlock` (REG_DWORD, default 1; `diag::knobs::SUBMIT_KICK_UNLOCK`; the requested `SubKickUnlocked` is 15 bytes
+and would not survive the 14-byte lookup buffer). It is read at every transport init and mirrored as `SubKickUnl`, which is
+1 only when the doorbell was also located; otherwise the setting in force is "locked".
+
+**Counters** (`kmd_logic::kick_defer::COUNTERS`, written by `virtio/ctrl.rs` at most once a second after a late ring):
+
+* `SubKickLate`: doorbells rung after the release.
+* `SubKickDrop`: kicks dropped by a closing transport.
+* `SubKickGap`: microseconds in all from the publish to the doorbell write (rest of the hold, release, ring; only with
+  `SubStageClk` 1).
+* `SubKickWait` / `SubKickLeak`: teardowns that waited for a pending kick / that gave up waiting and leaked the state. These
+  are written on the next late ring after the restart.
+
+**What to read on hardware** (Heaven windowed; `SubKickUnlock=0` first, then 1, same boot):
+
+* `SubKickUnl` is 1, and `SubKickLate` grows with `SubNWin + SubNBlt + SubNScan + SubNPres + SubFN` (minus suppressed
+  notifies). `SubKickDrop` and `SubKickLeak` stay 0 outside a restart.
+* `SubWKick / SubWN` and `SubFKick / SubFN` drop from about 18 us to the cost of one MMIO write (one exit, expected about a
+  third of the old cost), and that time is now spent outside the lock.
+* `SubFLock / SubFN` falls to about 0-2 us, because nobody holds the lock across a doorbell any more. `SubWLock` falls the
+  same way.
+* In the joined table, the flip's submit -> kick returns to about 20 us or less, and the windowed Blt's falls below its 21 us.
+* `SubKickGap / SubKickLate` is a few us (the tail of the hold plus the release). If it grows to tens of us, the submitter is
+  being preempted between the release and the ring.
+* With `SubKickUnlock=0` every number is as in 24.14.9.
+
+**Risks.** The doorbell location duplicates `pci_caps.rs`'s capability walk inside `gpu/mod.rs`, so this change stays in the
+transport. Move it into `pci_caps.rs` after the merge. If the doorbell cannot be located exactly, the knob degrades to the
+locked path and `SubKickUnl` reads 0. A late doorbell can reach the device after a later submitter's locked doorbell, which
+is harmless (an extra notify). Teardown can wait up to about 130 ms if a kicker is preempted inside its window, and is
+otherwise unchanged.
+
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
 ### 25.1 The incident
@@ -3571,3 +4012,149 @@ StopDevice disable does not lengthen a restart (it is bounded by the StopDevice 
 anything on hardware. Two statements elsewhere are wrong across an image reload: the doc comment of
 `reset_display_publication_state` and the row "TRANSPORT_SERIAL, NEXT_WIRE_FENCE_BASE: monotonic, KEPT" of section 20.4. Both restart at
 zero with the image, which the salt now covers.
+
+## 26. DWM restart and stale Explorer
+
+Symptom (win11 tester): after `dwm.exe` is killed and restarts (the DWM device is destroyed and a new one created),
+Explorer does not repaint: the taskbar clock stays frozen and the desktop icons are missing until `explorer.exe` is
+restarted. Question: can the KMD's handling of a DWM device teardown and recreate leave Explorer's redirected surfaces
+stale or unpresented?
+
+Status: STATIC analysis only; no hardware run, no WDK build. Nothing below is a measured cause. This change ships
+(a) a ranked list of hypotheses with the counter signature each would leave (26.2), (b) the `Dw*` breadcrumb block that
+settles them on the next run (26.4), (c) one fix of a defect that is certain against the code's own stated invariant but is
+not proven to be the cause (26.3, hypothesis 3), (d) the checklist (26.6).
+
+### 26.1 What a DWM device teardown does in the KMD, and what it clears
+
+`DxgkDdiDestroyDevice` (`device.rs` `dxgkddi_destroy_device`) runs for the killed DWM's device, after dxgkrnl closed its
+opens and destroyed its allocations and contexts. In order: end a foreign scanout source the device held
+(`foreign_scanout_owner_exit`: the `ForeignFlip` records, the shown target, the scanout-release book; `ForeignFlip` and the
+foreign scanout are off or absent in a Venus-only run); drain the user mappings; the read-ledger event registrations; the
+producer bindings; purge the present-stream slots of the owner (`purge_present_streams_for_owner`); release the blobs the
+device owned (`release_blobs_for_owner`); `CTX_DESTROY` every Venus context it owned (`destroy_contexts_for_owner`); close
+its NVRM handles; free the `DeviceContext` box.
+
+`DeviceOwner` is the address of that box, so a new DWM device can get the same token. Audited table by table: every
+structure keyed by the token is cleared before the box is freed (present-stream slots keep no owner once `closing`; rm gates
+are keyed by process and purged at `DestroyProcess`; the present-buffer and foreign-open tables are released at
+`CloseAllocation`), so the aliasing is not a mechanism (`DwReuse` counts it anyway, 26.4). `CommitVidPn`,
+`SetVidPnSourceVisibility` and `UpdateActiveVidPnPresentPath` hold no scanout state (`ddi/display.rs`). A destroyed primary
+cancels a deferred `pending_vidpn_allocation` handle and lowers its programming gate under the scanout lock
+(`retire_scanout_allocation_locked`, `adapter/scanout.rs`, `VpCncl`), so neither is left raised or stale. `CrossAdaptCaps`
+is a knob snapshotted at AddAdapter and constant across a restart (`ddi/query_adapter_info.rs`, the comment at 638): it can
+only explain a Blt-model swap chain that never calls `DxgkDdiPresent`, not a restart-specific freeze.
+
+### 26.2 Ranked hypotheses
+
+| # | hypothesis | verdict | where | what the counters show |
+|---|---|---|---|---|
+| 1 | The dead DWM left a present buffer pinned. A buffer the DWM claimed for read stays `Consumer(boundary)` until its stream slot retires; a slot with claimed or in-flight work only goes `closing` at `DestroyDevice` and is finalized by `finalize_closed_present_streams_for_context` only after a SUCCESSFUL host `CTX_DESTROY`. A timeout or error skips the finalize and nothing retries (the context is already out of the table). The buffer is then busy for every writer, and `take_ready_windowed_blt` returns `None` for a busy head destination while keeping FIFO ownership, so one pinned destination holds every windowed Blt of every process (Explorer's included) until the 64-entry token table is full | POSSIBLE; needs a slow or failed `CTX_DESTROY` while DWM had work in flight | `virtio/ctrl.rs` `ctx_destroy_within`, `destroy_contexts_for_owner`; `virtio/gpu/mod.rs` `close_present_stream_slot`, `finalize_closed_present_streams_for_context`, `try_begin_present_buffer_write`, `take_ready_windowed_blt`; the legacy arm `virtio/ctrl.rs` `begin_present_buffer_write_legacy` (about 5 s, then `STATUS_DEVICE_NOT_READY`, site 25 for an ordinary allocation) | `DwCtxFail` > 0; `DwPsClose` > 0 and `DwPbCons` > 0 that do not fall in the follow-ups; `DwPbConsDd` > 0 (claimed through a dead stream: never writable); `DwWbHead` 3, 4 or 5; `DwWedge` nibbles repeating 1, 2 or 3; `DwWrBusy` / `DwRdBusy` rising; legacy arm: `PBRet` 0xC00000A3, `PBRetSite` 25, `PBOwn` 0xE1; two-phase arm: `PBCpy` stays 2, `PBRet` stays 0 until `DwWbPend` reaches 64, then site 24 |
+| 2 | A skip that succeeds hides the damage: an unresolved Blt handle (`PrUnres`) or a `ColorFill` with no source (`PrColFill`) completes without writing the destination, dxgkrnl and DWM believe it was updated, nothing is re-sent. A handle that never resolves (an open of an older generation, or one that recorded no identity) leaves its surface stale for good | LIKELY to exist (T2 saw `PBCpy` 225 on a restarted DWM's first presents); unproven as THE cause | `ddi/display.rs` Blt arm and `present_blt_skipped`; `ddi/present_foreign.rs` `unresolved_skip`; `ddi/create_allocation.rs` `present_alloc_cause`, `read_alloc_identity` | `DwPrUnr` / `DwPrCol` rising; `DwUnrSrc` / `DwUnrDst` name the cause per side (byte 0 null, 1 not ours (`OaBadH`), 2 older generation (`PgStale`), 3 no identity; `DwOpNoId` / `DwOpNoIdSz` say whether opens recorded none); `DwRunMax` large with `DwPrOk` 0 or flat = a surface that never gets a copy; `DwOkMs` = how long until the first copy |
+| 3 | Destroying a WDDM allocation that only IMPORTS the adapter-owned LINEAR scanout target (a DWM generation that is gone) retired its resource id from the host scanout: `SET_SCANOUT_BLOB(0)`, `active_scanout_resource` and the refresh state cleared, leases ended, no bind until dxgkrnl's next `SetVidPnSourceAddress`. The code says an importer must not do that (`forget_primary_scanout` and `destroy_allocation_ctx` comments) and guarded the other steps, not this one | CERTAIN defect against the stated invariant; effect on Explorer UNPROVEN (a flip-model DWM rebinds at its first flip; a Blt-model one does not flip); FIXED here (26.3) | `ddi/create_allocation.rs` `destroy_allocation_ctx`; `adapter/scanout.rs` `retire_scanout_allocation_locked`; `ddi/hpd.rs` `ScanoutRefreshQueue::Unavailable` (drops the dirty bit) | before the fix: `ScRet` equal to `CpRid` right after the kill, `DwActRes` 0, `DwRfPost` flat, `DwUnavPost` rising (`ScUnav` is only mirrored after a Queued refresh, so it was invisible in exactly this state); after: `DwImpDest` > 0 with `DwActRes` still `CpRid` |
+| 4 | The new DWM cannot open what a client shares: `OpenAllocation`'s liveness gate (C1) refuses an identified allocation whose resource is no longer alive (`STATUS_INVALID_PARAMETER`); a blob swept as the dead device's, with another context still attached through `ATTACH_RESOURCE`, would do it | POSSIBLE, narrow (adopted allocation blobs are re-owned to the KMD and are safe) | `ddi/create_allocation.rs` `dxgkddi_open_allocation` (the gate near 3985); `virtio/ctrl.rs` blob sweep | `DwOpFail` > 0 with `DwOpFailId` (the ring record `0x0C02_00E4` had no named counter) |
+| 5 | The new DWM's first flips are refused or never retire: `SetVidPnSourceAddress` returns `STATUS_INVALID_PARAMETER` when the handle pairs with nothing (a NULL or stale handle from win32k's GDI fallback primary is not understood) | UNVERIFIED, low (the kept address, `FkDdi`, completes the flip) | `ddi/display.rs` `dxgkddi_set_vidpn_source_address` | `DwFlipBad` > 0, `DwFlipN` flat, `FkDdi`, `FkWhy`, `VpPrF`, `FlipIss` against `FlipPub` |
+| 6 | Not the KMD: Explorer's DirectComposition / XAML surfaces are not presented through `DxgkDdiPresent` at all (composition swap chains are a kernel redirect), and the shell's own recovery from a DWM restart is what fails | PLAUSIBLE; only the counters can clear this driver | none | `DwPrN` and `PBcall` flat while the clock should tick, with the census clear, `DwCtxFail` 0 and `DwOpFail` 0: the KMD is not in the path; compare with a WARP or bare-metal run of the same kill |
+| 7 | Ruled out by reading: `CrossAdaptCaps` (constant across a restart), `CommitVidPn` / `SetVidPnSourceVisibility` (no state), owner-token aliasing (every table cleared), the gate or the pending handle left raised (cancelled under the scanout lock), `ForeignFlip` / foreign scanout (default off; `owner_exit` ends the source and drops the shown target), the read ledger (a slot of a retired resource is re-issued on its next use) | | | |
+
+What is NOT known and decides between 1, 2 and 6: whether Explorer's updates reach `DxgkDdiPresent` after the restart, and by which arm
+(legacy Blt, two-phase windowed snapshot, neither). `DwPrN`, `DwPrOk`, `DwPrSkip` and `PBCpy` answer it.
+
+### 26.3 What changed in behaviour
+
+One change. `destroy_allocation_ctx` computes `retire_id = helios_kmd_logic::dwm_restart::importer_retire_id(resource_id,
+dedicated_scanout_resource)`: `0` for an allocation that carries the adapter-owned scanout target's id, the resource id for
+every other allocation (so every non-importer destroy is byte-identical to v325). `retire_scanout_allocation` then retires
+that importer by HANDLE only (it still cancels a deferred `SetVidPnSourceAddress` naming it and lowers the gate, and touches
+no host state), and the registration it withdraws is looked up by handle, not by id, so it cannot remove the registration an
+owner of the same id holds. `DwImpDest` counts the skips. The host keeps showing the last frame until the next bind instead
+of going blank; the host resource and image were already kept (`CpKeep`). Host test:
+`dwm_restart::tests::an_importer_of_the_scanout_target_retires_by_handle_only`.
+
+Not changed, deliberately: a retry of `CTX_DESTROY` for closing stream slots (hypothesis 1). The slots are fail-closed on
+purpose (a consumer may still be reading the buffer on the host), and a retry queue is a new lifecycle that should be built only
+if `DwCtxFail` proves the failure happens. `ColorFill` is still a no-op (implementing it needs the colour, the sub-rectangles
+and a host or CPU write of the destination: new host-visible behaviour, not a blind change).
+
+### 26.4 The `Dw*` block
+
+Names are the single table in `helios_kmd_logic::dwm_restart` (`NAMES`; a host test pins at most 14 characters, unique,
+`Dw` prefix; a scan of every `b"..."` literal in `kmd_render` and `kmd_logic` found none of them in use). The words are
+atomics (the flip word at DIRQL, the Present words at PASSIVE); the registry is written only at PASSIVE, and only words that
+changed since the last mirror. K = cumulative since StartDevice, W = WINDOW (zeroed at the ENTRY of every `DestroyDevice`;
+read right after the restart with no other GPU process starting or stopping: `DwDevDel` says if another device died), L = the
+last value.
+
+Mirror points: the end of `DestroyDevice`; the HPD worker (three follow-up censuses about 2 s apart, and whenever an event asks
+for a mirror through `request_publish`, the same worker pass as the `Nv*` mirror, within 250 ms); `publish_nvrm_counters`; and
+a zero block at StartDevice.
+
+| word | kind | meaning |
+|---|---|---|
+| `DwDevNew`, `DwDevDel` | K | `CreateDevice` / `DestroyDevice` calls |
+| `DwReuse` | K | a device created at the address of one of the last four destroyed (owner-token aliasing evidence) |
+| `DwDelMs`, `DwDelMsMax` | L, K | the last and the longest `DestroyDevice`, ms (the blob and context sweeps are host round trips of up to 30 s) |
+| `DwDelBlob`, `DwDelCtx`, `DwDelStrm` | L | blobs, contexts and present streams the last destroy reclaimed or purged |
+| `DwCtxFail` | K | `CTX_DESTROY` round trips that did not confirm (hypothesis 1: the slots stay `closing`) |
+| `DwCtxFin` | K | closing stream slots finalized by a successful `CTX_DESTROY` |
+| `DwImpDest` | K | importers of the scanout target destroyed with the host unbind skipped (hypothesis 3) |
+| `DwPbExt`, `DwPbCons`, `DwPbConsDd`, `DwPbWr` | L | census: present buffers idle / claimed by a consumer / of those through a stream that is not live / held by the KMD writer or mirror |
+| `DwPsLive`, `DwPsClose` | L | present-stream slots live / closing |
+| `DwWbPend`, `DwWbReady` | L | windowed Blt requests pending / READY queue length |
+| `DwWbHead` | L | why the READY head does not go: 0 empty, 1 stale token, 2 not admitted, 3 boundary pending (stream live), 4 boundary dead, 5 destination busy, 6 ready (the next pass dispatches it) |
+| `DwWedge` | W | the verdicts of the last four censuses, one nibble each, newest low: 0 clear, 1 a buffer claimed through a dead stream, 2 closing stream slots, 3 head blocked (3, 4 or 5 above), 4 a buffer held by the KMD. Transient states read the same in the first census; a wedge repeats in the follow-ups |
+| `DwCenN` | W | censuses taken since the destroy (1 at the end of it, up to 4) |
+| `DwPrN`, `DwPrFail` | W | `DxgkDdiPresent` calls / failures |
+| `DwPrOk`, `DwPrSkip`, `DwPrUnr`, `DwPrCol` | W | Blts copied or queued / completed without a copy, any reason / of those an unresolved handle / of those a no-source `ColorFill` |
+| `DwOkMs`, `DwUnrMs`, `DwFlipMs` | W | ms from the destroy to the first copied Blt / unresolved Blt / flip, PLUS ONE (0 = it did not happen) |
+| `DwRunNow`, `DwRunMax` | W | Blts skipped in a row right now / the longest run with no copy between |
+| `DwUnrSrc`, `DwUnrDst` | W | unresolved SOURCE / DESTINATION causes, a saturating byte each: byte 0 null slot, 1 not ours, 2 older generation, 3 no identity |
+| `DwUnrAdp` | W | Blts whose adapter did not resolve |
+| `DwFlipN`, `DwFlipBad` | W | `SetVidPnSourceAddress` calls / those refused for a handle that pairs with nothing |
+| `DwOpFail`, `DwOpFailId` | W | `OpenAllocation` refusals by the liveness gate, and the last resource id |
+| `DwOpNoId`, `DwOpNoIdSz` | W | opens that recorded no identity, and the private data sizes of the last (`entry \| call << 16`) |
+| `DwActRes` | L | the resource bound to the host scanout at the end of the destroy (0 = nothing bound) |
+| `DwRfPost`, `DwUnavPost` | derived | refreshes queued / refreshes dropped for an unbound scanout since the destroy (as fresh as the worker's last pass) |
+| `DwWrBusy`, `DwRdBusy`, `DwSyncRej`, `DwRdClaim` | K | `PRESENT_BUFFER_WRITE_BUSY`, `_READ_BUSY`, `_SYNC_REJECTS`, `_READ_CLAIMS`, which existed and were never mirrored |
+
+### 26.5 Reading it
+
+| pattern after the kill and restart | means |
+|---|---|
+| `DwCtxFail` > 0, `DwWedge` low nibbles 1 or 2 in two follow-ups, `DwPbConsDd` or `DwPsClose` > 0, `DwWbHead` 3 to 5 | hypothesis 1: a pin the dead DWM left. Next: a retry of the unconfirmed `CTX_DESTROY` for closing slots, with a deadline |
+| `DwPrSkip` and `DwRunMax` large, `DwPrOk` 0 or `DwOkMs` 0, `DwUnrSrc` / `DwUnrDst` byte 3 or 2 | hypothesis 2 with cause "no identity" or "older generation": opens that cannot resolve. Read `DwOpNoIdSz`; check `OaBadH` and `PgStale` |
+| `DwPrSkip` = `DwPrCol`, `DwPrUnr` 0 | hypothesis 2, ColorFill only: a fill that matters is dropped; implement it |
+| `DwImpDest` > 0, `DwActRes` still `CpRid`, `DwRfPost` rising | hypothesis 3 happened and the fix held: the screen did not go blank |
+| `DwOpFail` > 0 | hypothesis 4: the new DWM cannot open a shared surface; `DwOpFailId` names the resource, compare with `DwDelBlob` |
+| `DwFlipBad` > 0, or `DwFlipN` 0 after `DwDevDel` | hypothesis 5 |
+| `DwPrN` flat for the whole freeze, census clear, `DwOpFail` 0, `DwCtxFail` 0 | hypothesis 6: the KMD is not in Explorer's path; run the same kill on WARP |
+| `DwReuse` 1 | the new device got the old token; with every other word clear it is a coincidence to rule out, not a cause |
+
+### 26.6 Hardware checklist, in order
+
+1. Win11 tester, Venus defaults (every knob off), the driver of this change. Boot, log in, let Explorer settle. Note `HELIOS_KMD_VERSION`.
+2. Read the service key once as the baseline: `DwDevNew`, `DwDevDel`, `DwCtxFail`, `DwImpDest`, `PrUnres`, `PrUnrWhy`, `PrColFill`, `PrFgSkip`, `PBRet`, `PBRetSite`, `PBCpy`, `PBcall`, `CpRid`, `ScRid`, `ScUnav`, `RfCnt`, `VpSA`, `FlipIss`, `FlipPub`.
+3. Kill `dwm.exe`, start nothing else, wait until the desktop is back (the clock frozen, the icons missing).
+4. Read after 5 s, then after 15 s (the follow-up censuses are at about 2, 4 and 6 s after the destroy; later changes mirror on events). Record every `Dw*` word and the set of step 2.
+5. Compare against 26.5. Write down `DwDelMs` (a long destroy is a long sweep) and `DwCenN`.
+6. Restart `explorer.exe` and read again: if Explorer recovers and every `Dw*` word stays as it was, the KMD held nothing for Explorer (hypothesis 6).
+7. Repeat once with a Vulkan app running through the kill and once with nothing, so a Venus-in-flight DWM (hypothesis 1) and an idle one are told apart.
+8. Report the counters, not the screen.
+
+### 26.7 Verified, and not
+
+Verified (host tests, `kmd_logic`): the name table (at most 14 characters, unique, `Dw` prefix, `ALL` in order); the destroyed-address
+ring (a reuse is counted once; the oldest of four is forgotten); the millisecond helpers (saturating, a zero means "never", the marker is
+plus one); the packed histogram (a saturating byte per cause, out of range ignored); `importer_retire_id`; the head blocker
+(the dispatch order of `take_ready_windowed_blt`, codes pinned); the census verdict and its history; the follow-up schedule.
+Type-checked: the whole `kmd_render` against the stub harness, with an injected error in the new file and in the touched
+`gpu/mod.rs` both reported, and the error set equal to the base (v325) apart from the counts of the stub's missing bindgen fields at the new use sites.
+
+NOT verified: anything on hardware; the WDK build; that dxgkrnl closes the dead DWM's opens before `DestroyDevice` on every path;
+whether the importer of the scanout target exists on the tester's DWM at all (`DwImpDest` says); what Explorer's updates call.
+
+Risks: `begin_destroy` zeroes the window for EVERY device that dies, so a short-lived GPU process exiting between the kill and the
+read resets it (`DwDevDel` shows it); the mirror at the end of `DestroyDevice` is a few dozen registry writes in a PASSIVE DDI that
+already does host round trips; the follow-ups keep the HPD worker waking every 250 ms for about six seconds after a destroy; the importer fix
+leaves the host scanout showing the old frame instead of blanking, which is the intended change but a visible one where a dead
+generation's destroy used to blank the screen for a moment.

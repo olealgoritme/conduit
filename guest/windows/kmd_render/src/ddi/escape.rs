@@ -1793,7 +1793,11 @@ const NVRM_OPS_IMPLEMENTED: u64 = (1 << HELIOS_NVRM_OP_QUERY_CAPS)
     // Op 13 and its capability bit 36: the RM window report (always answerable: with the
     // transport down it reports a window of 0 bytes).
     | (1 << helios_protocol::HELIOS_NVRM_OP_WINDOW_INFO)
-    | helios_protocol::HELIOS_NVRM_CAP_WINDOW_INFO;
+    | helios_protocol::HELIOS_NVRM_CAP_WINDOW_INFO
+    // Capability bit 37: the KMD parses the copy-engine Present record ('HEF3') behind a
+    // marker's RM fence tail (`ddi/ce_record.rs`). Always set: the record is only an input, and
+    // whether a Present takes the copy-engine route is decided per frame, not by this bit.
+    | helios_protocol::HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3;
 /// The event ops, reported (`QUERY_CAPS.supported_ops`) only while events are
 /// usable on this device; see `virtio::gpu::nvrm_events`.
 const NVRM_EVENT_OPS: u64 =
@@ -1919,6 +1923,19 @@ fn nvrm_publish_counters_if_due(adapter: &AdapterContext) {
     if NVRM_PUBLISH_WANTED.swap(1, Ordering::AcqRel) == 0 {
         // A SynchronizationEvent the worker already treats as "something to look
         // at"; a wake it has nothing to do for costs it one pass of its loop.
+        adapter.signal_hpd();
+    }
+}
+
+/// Ask for the `Nv*` registry mirror (and everything `publish_nvrm_counters` writes) without a
+/// session-shaping change behind it: the worker does it within 250 ms. One load when one is
+/// already wanted; legal at DISPATCH (an atomic and `KeSetEvent(Wait = FALSE)`).
+pub(super) fn request_nvrm_publish(adapter: &AdapterContext) {
+    use core::sync::atomic::Ordering;
+    if NVRM_PUBLISH_WANTED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    if NVRM_PUBLISH_WANTED.swap(1, Ordering::AcqRel) == 0 {
         adapter.signal_hpd();
     }
 }

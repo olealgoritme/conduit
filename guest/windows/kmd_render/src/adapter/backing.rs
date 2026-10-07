@@ -355,6 +355,18 @@ impl SystemBackingSnapshot<'_> {
         true
     }
 
+    /// A read-only handle on exactly these leases (`RmCopyEngine` = 3, the copy-engine shadow
+    /// mode's compare): like a [`GuestPin`] it keeps every lease locked while it lives, so its
+    /// pages can be read after the content transaction ended. Reads made then are not ordered
+    /// against a later Present's copy into the same pages: the caller detects and reports that,
+    /// it never writes. Dropped at PASSIVE only. `None` only when the reference count would
+    /// overflow.
+    pub(crate) fn reader(&self) -> Option<SystemBackingReader> {
+        Some(SystemBackingReader {
+            ranges: self.ranges.try_clone()?,
+        })
+    }
+
     pub(crate) unsafe fn copy_from_blob(&self, blob: *const u8, blob_size: u64) -> bool {
         self.ranges
             .iter()
@@ -371,6 +383,29 @@ impl SystemBackingSnapshot<'_> {
         self.ranges.iter().all(|range| unsafe {
             range.copy_blob_intersection(blob, blob_size, update_offset, update_size)
         })
+    }
+}
+
+/// See [`SystemBackingSnapshot::reader`].
+pub(crate) struct SystemBackingReader {
+    ranges: FallibleArc<Vec<SystemBackingRange>>,
+}
+
+impl SystemBackingReader {
+    /// The leases, sorted by allocation offset as stored: `(allocation offset, bytes)` into
+    /// `runs` and the kernel address of each lease's first byte into `vas`. `false` when the
+    /// vectors could not grow.
+    pub(crate) fn runs(&self, runs: &mut Vec<(u64, u64)>, vas: &mut Vec<*const u8>) -> bool {
+        if runs.try_reserve_exact(self.ranges.len()).is_err()
+            || vas.try_reserve_exact(self.ranges.len()).is_err()
+        {
+            return false;
+        }
+        for range in self.ranges.iter() {
+            runs.push((range.blob_offset, range.size));
+            vas.push(range.lease.system_va.as_ptr().cast_const());
+        }
+        true
     }
 }
 
@@ -545,6 +580,16 @@ impl SystemBackingTable {
         Some(SystemBackingGuard {
             table: self,
             _mutex: self.content_mutex.as_ref()?.lock(passive)?,
+        })
+    }
+
+    /// [`Self::serialize`] only if the content transaction is free now (`None` at once
+    /// otherwise): the copy-engine shadow mode never makes a Present's mirror or a paging
+    /// operation wait for it.
+    pub(crate) fn try_serialize(&self, passive: PassiveLevel) -> Option<SystemBackingGuard<'_>> {
+        Some(SystemBackingGuard {
+            table: self,
+            _mutex: self.content_mutex.as_ref()?.try_lock(passive)?,
         })
     }
 }

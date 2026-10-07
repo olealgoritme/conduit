@@ -24,6 +24,7 @@ pub mod external_memory;
 pub mod nvrm_clients;
 pub mod nvrm_events;
 pub mod nvrm_fastpath;
+pub mod nvrm_rtt;
 pub mod nvrm_fence;
 pub mod nvrm_views;
 pub mod window_units;
@@ -32,6 +33,7 @@ pub mod rm_window;
 pub mod foreign_copy;
 pub mod foreign_errno;
 pub mod flip_completion;
+pub mod dwm_restart;
 pub mod flip_flags;
 pub mod flip_pipeline;
 pub mod flip_retire;
@@ -59,7 +61,14 @@ pub mod present_foreign;
 pub mod onscanout;
 pub mod blt_async;
 pub mod guest_blob;
+pub mod submit_stage;
+pub mod kick_defer;
 pub mod ce_present;
+pub mod rm_ce_channel;
+pub mod ce_record;
+pub mod ce_dup;
+pub mod ce_shadow;
+pub mod copy_queue;
 pub mod msi;
 pub mod paging;
 pub mod shared_placeholder;
@@ -74,6 +83,7 @@ pub mod windowed_ready;
 pub mod slice_budget;
 pub mod flip_pend_wd;
 pub mod wait_bound;
+pub mod stage_trace;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

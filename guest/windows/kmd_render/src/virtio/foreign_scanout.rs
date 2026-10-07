@@ -18,6 +18,7 @@ use crate::irql::PassiveLevel;
 use crate::virtio::gpu::DeviceOwner;
 use helios_kmd_logic::foreign_scanout::{Flip, PresentError};
 use helios_kmd_logic::nvrm_fence::is_fence;
+use helios_kmd_logic::submit_stage::{Path, Stage};
 use helios_protocol::HELIOS_NVRM_SCANOUT_FLIP_BYTES;
 
 /// Host `MsgType::ScanoutFlip`.
@@ -96,6 +97,8 @@ fn send(
     let req = build_flip(flip, gem);
 
     let mut resp = [0u8; 2 * MSG_HDR_LEN];
+    // `StageTrace` (G_FLIP_SUBMIT): taken before the message can reach the host; 0 when off.
+    let t_submit = crate::ddi::stage_trace::now_if_on();
     let sent = match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms) {
         // MsgHeader.status (offset 8) is a signed errno; 0 is success.
         Ok(n) if n >= MSG_HDR_LEN => {
@@ -109,6 +112,19 @@ fn send(
         Ok(_) => Err(VirtioError::DeviceError),
         Err(e) => Err(e),
     };
+    if t_submit != 0 {
+        use helios_kmd_logic::stage_trace as st;
+        crate::ddi::stage_trace::stamp(st::G_FLIP_SUBMIT, st::KIND_FLIP, flip.seq, t_submit);
+        if sent.is_ok() {
+            crate::ddi::stage_trace::completed(
+                st::G_FLIP_ISR,
+                st::G_FLIP_ACK,
+                st::KIND_FLIP,
+                flip.seq,
+                t_submit,
+            );
+        }
+    }
     note_flip_sent(adapter, flip.seq, &sent);
     sent
 }
@@ -238,8 +254,17 @@ pub fn present_within(
     gem: u32,
     timeout_ms: u64,
 ) -> Result<u64, PresentRefusal> {
+    // `StageTrace`: the ForeignFlip programming's DDI entry, left for this send (0 otherwise),
+    // taken first so a refused mint cannot leave it for another flip.
+    let ddi_t = crate::ddi::stage_trace::take_flip_ddi();
     let flip = mint(adapter, owner, handle, false)?;
     scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
+    crate::ddi::stage_trace::stamp(
+        helios_kmd_logic::stage_trace::G_FLIP_DDI,
+        helios_kmd_logic::stage_trace::KIND_FLIP,
+        flip.seq,
+        ddi_t,
+    );
     let sent = send(passive, adapter, &flip, gem, timeout_ms);
     adapter.foreign_scanout_flip_done(flip.generation, sent.is_ok());
     match sent {
@@ -281,24 +306,34 @@ pub fn present_submit(
     gem: u32,
     cell: &'static core::sync::atomic::AtomicU64,
 ) -> Result<(u64, u32), PresentRefusal> {
-    let flip = mint(adapter, owner, handle, false)?;
-    scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
-    let req = build_flip(&flip, gem);
-    cell.store(0, core::sync::atomic::Ordering::Release);
-    let tag = helios_kmd_logic::flip_pipeline::tag_of(flip.seq);
-    match ctrl::raw_submit_async(passive, adapter, &req, cell, tag) {
-        Ok(()) => Ok((flip.seq, flip.generation)),
-        Err(e) => {
-            // It never reached the ring: no flip, nothing for the host to release.
-            if let Some(owner) = scanout_release::gone(flip.seq) {
-                scanout_release::wake(adapter, owner);
+    // The flip's stage clock (`SubF*`, docs 24.14): `Prep` is the mint, the release-book entry
+    // and the request build; the staging and the enqueue are timed in `raw_submit_async`.
+    super::submit_stage::measured(Path::Flip, |clock| {
+        let flip = mint(adapter, owner, handle, false)?;
+        scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
+        let req = build_flip(&flip, gem);
+        cell.store(0, core::sync::atomic::Ordering::Release);
+        let tag = helios_kmd_logic::flip_pipeline::tag_of(flip.seq);
+        super::submit_stage::lap(clock, Stage::Prep);
+        // `StageTrace` (G_FLIP_SUBMIT): taken before the message can reach the host; 0 when off.
+        let t_submit = crate::ddi::stage_trace::now_if_on();
+        match ctrl::raw_submit_async(passive, adapter, &req, cell, tag, clock) {
+            Ok(()) => {
+                crate::ddi::stage_trace::flip_submitted(flip.seq, tag, t_submit);
+                Ok((flip.seq, flip.generation))
             }
-            if e != VirtioError::QueueFull {
-                adapter.foreign_scanout_flip_done(flip.generation, false);
+            Err(e) => {
+                // It never reached the ring: no flip, nothing for the host to release.
+                if let Some(owner) = scanout_release::gone(flip.seq) {
+                    scanout_release::wake(adapter, owner);
+                }
+                if e != VirtioError::QueueFull {
+                    adapter.foreign_scanout_flip_done(flip.generation, false);
+                }
+                Err(PresentRefusal::Device(e))
             }
-            Err(PresentRefusal::Device(e))
         }
-    }
+    })
 }
 
 /// Settle a pipelined flip: tell the release book and the source what became of it, the same

@@ -12,7 +12,8 @@
 //! The one exception is a `GuestBlob` bounded section ([`begin_bounded`]): a thread inside one
 //! sees that section's deadline through [`probe`] as if it were an escape's (no kill, no stop),
 //! so every "never aborts a thread outside an escape" in the wait primitives reads "outside an
-//! escape or a bounded section". No section is ever opened with `GuestBlob` 0.
+//! escape or a bounded section". No section is ever opened with `GuestBlob` 0 and `RmCopyEngine`
+//! 0 (the copy-engine channel's bring-up and self-test open one each, on the HPD worker).
 //!
 //! The abort is a FAILURE of the wait, delivered through the path the wait already has for a
 //! timeout (`wait_block` -> the abandon path -> `VirtioError::Timeout` -> the escape's own timeout

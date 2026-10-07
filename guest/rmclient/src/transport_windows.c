@@ -28,7 +28,8 @@
  * Beyond the transport vtable, crm_win_open_device / crm_win_ioctl /
  * crm_win_scanout_flip (rmclient_transport.h) send what presenting RM memory
  * takes: an Open of a DRM render node, a DRM ioctl with its NVKMS block as the
- * nested block, and a ScanoutFlip.
+ * nested block, and a ScanoutFlip. crm_win_escape_raw sends any other Helios
+ * escape verb as the caller built it (tests: FOREIGN_RESOURCE refusals).
  *
  * CPU mapping follows Linux's protocol, which the host's backend ties to a
  * channel: open a fresh channel, NV_ESC_RM_MAP_MEMORY on the control channel
@@ -376,7 +377,9 @@ static void win_mark_lost(struct win_ctx *c, const char *why, unsigned long deta
         SetEvent(c->lost_ev);
 }
 
-static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
+/* One D3DKMTEscape of `buf` on this generation's device, with the loss rules
+ * below. *nt (when not NULL) gets the D3DKMTEscape NTSTATUS. */
+static int escape_judged(struct win_ctx *c, void *buf, uint32_t size, int32_t *nt)
 {
     /* Nothing of a lost generation reaches the KMD, not even a release: ids
      * restart per transport, so an old MUNMAP / UNPIN / EVENT_UNREGISTER could
@@ -394,6 +397,8 @@ static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
     esc.pPrivateDriverData = buf;
     esc.PrivateDriverDataSize = size;
     const NTSTATUS st = c->escape(&esc);
+    if (nt)
+        *nt = (int32_t)st;
     if (st != 0) {
         if (c->ready && (helios_kmdmap_status_is_device_gone(st) ||
                          helios_nvrm_ntstatus_is_lost((int32_t)st))) {
@@ -415,6 +420,11 @@ static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
         return -ENODEV;
     }
     return 0;
+}
+
+static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
+{
+    return escape_judged(c, buf, size, NULL);
 }
 
 /*
@@ -2221,6 +2231,18 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     return TRUE;
 }
 
+int crm_win_escape_raw(void *buf, uint32_t size, int32_t *ntstatus)
+{
+    struct win_ctx *c = &g_ctx;
+    if (ntstatus)
+        *ntstatus = 0;
+    if (!c->ready)
+        return -ENODEV;
+    if (!buf || size < sizeof(struct crm_helios_hdr))
+        return -EINVAL;
+    return escape_judged(c, buf, size, ntstatus);
+}
+
 const struct crm_transport *crm_windows_transport(void)
 {
     return &windows_transport;
@@ -2383,6 +2405,15 @@ int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id
     *resource_id = 0;
     if (host_errno)
         *host_errno = 0;
+    return -ENOSYS;
+}
+
+int crm_win_escape_raw(void *buf, uint32_t size, int32_t *ntstatus)
+{
+    (void)buf;
+    (void)size;
+    if (ntstatus)
+        *ntstatus = 0;
     return -ENOSYS;
 }
 

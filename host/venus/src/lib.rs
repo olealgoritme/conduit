@@ -6,11 +6,13 @@
 
 use std::os::fd::{BorrowedFd, OwnedFd};
 
+pub mod affinity;
 pub mod guest_pages;
 pub mod ipc;
 pub mod latency;
 pub mod mock;
 pub mod sandbox;
+pub mod stage;
 #[cfg(feature = "renderer")]
 pub mod virgl;
 
@@ -97,6 +99,34 @@ pub const FEATURE_IMPORT_DMABUF: u32 = 1 << 0;
 /// `VK_EXT_external_memory_host` (docs/VENUS.md "Guest-memory blobs").
 pub const FEATURE_IMPORT_GUEST_PAGES: u32 = 1 << 1;
 
+/// [`Renderer::features`]: the renderer stamps frame stages and hands them
+/// over with [`Renderer::stages`] (docs/TRACING.md "Frame stage timing").
+pub const FEATURE_STAGE_TRACE: u32 = 1 << 2;
+
+/// [`Renderer::features`]: a submit and the fence after it travel as one
+/// call ([`Renderer::submit_fenced`]), one round trip instead of two. The
+/// IPC server adds this bit itself, whatever its renderer: any renderer
+/// serves the call through the trait's default.
+pub const FEATURE_SUBMIT_FENCED: u32 = 1 << 3;
+
+/// Why [`Renderer::submit_fenced`] failed: the submit (no fence was asked
+/// for), or the fence after a submit that went through.
+#[derive(Debug)]
+pub enum FencedError {
+    Submit(Error),
+    Fence(Error),
+}
+
+/// Called by an IPC client's reader thread right after it queued signalled
+/// fences ([`Renderer::set_fence_hook`]). Returns whether it took them; on
+/// `false` the client wakes [`Renderer::fence_fd`] as it does without a hook.
+pub type FenceHook = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// Called by a renderer on the thread that retires a fence, with that fence,
+/// instead of queueing it for [`Renderer::signalled`]
+/// ([`Renderer::set_fence_sink`]).
+pub type FenceSink = Box<dyn Fn(Signalled) + Send + Sync>;
+
 /// One run of guest pages for [`Renderer::import_guest_pages`]: `len` bytes
 /// at `offset` of the guest RAM file, both whole pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +164,38 @@ pub trait Renderer: Send {
     /// Ask for `fence_id` on `(ctx_id, ring_idx)`; it shows up in
     /// [`Renderer::signalled`] once the GPU work before it is done.
     fn create_fence(&mut self, ctx_id: u32, ring_idx: u32, fence_id: u64) -> Result<()>;
+
+    /// [`Renderer::submit`] and then, if it went through,
+    /// [`Renderer::create_fence`]: what a fenced `SUBMIT_3D` asks for. The
+    /// IPC client sends both as one message when the server has
+    /// [`FEATURE_SUBMIT_FENCED`].
+    fn submit_fenced(
+        &mut self,
+        ctx_id: u32,
+        commands: &[u8],
+        ring_idx: u32,
+        fence_id: u64,
+    ) -> std::result::Result<(), FencedError> {
+        self.submit(ctx_id, commands).map_err(FencedError::Submit)?;
+        self.create_fence(ctx_id, ring_idx, fence_id).map_err(FencedError::Fence)
+    }
+
+    /// Run `hook` as soon as signalled fences arrive, on whatever thread
+    /// receives them, instead of only waking [`Renderer::fence_fd`]. Returns
+    /// whether the renderer can (the IPC client can; others say no and keep
+    /// the descriptor as the only wakeup).
+    fn set_fence_hook(&mut self, hook: FenceHook) -> bool {
+        let _ = hook;
+        false
+    }
+
+    /// Hand every fence signalled from now on to `sink`, on the thread that
+    /// retires it, instead of queueing it for [`Renderer::signalled`].
+    /// Returns whether the renderer can; one that cannot keeps queueing.
+    fn set_fence_sink(&mut self, sink: FenceSink) -> bool {
+        let _ = sink;
+        false
+    }
     /// Readable when [`Renderer::signalled`] has something.
     fn fence_fd(&self) -> BorrowedFd<'_>;
     /// Drain signalled fences. [`Error::Disconnected`] once the renderer is
@@ -181,5 +243,13 @@ pub trait Renderer: Send {
     fn import_guest_pages(&mut self, res_id: u32, ram: BorrowedFd<'_>, runs: &[PageRun]) -> Result<()> {
         let _ = (res_id, ram, runs);
         Err(Error::Refused("this renderer cannot import guest pages".into()))
+    }
+
+    /// Turn the renderer's stage stamps on or off ([`stage`]) and take
+    /// every stamp it made since the last call. Only with
+    /// [`FEATURE_STAGE_TRACE`].
+    fn stages(&mut self, on: bool) -> Result<Vec<stage::Rec>> {
+        let _ = on;
+        Err(Error::Refused("this renderer does not stamp stages".into()))
     }
 }

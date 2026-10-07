@@ -15,6 +15,7 @@ Adjust those before using them elsewhere. Context: [docs/HANDOFF.md](../../../..
 | `longloop.sh` | Long-running version of the watchdog; exits on a reboot alert. |
 | `install.sh oemNN.inf` | Install a staged driver package, restart DWM and the shell, print driver version, mode and knobs. A new package: `pnputil /add-driver W:\...\helios_kmd_render.inf /install`. |
 | `hvwin.sh API [ENV]` | Windowed Unigine Heaven (`direct3d11`, `opengl`, ...); env `WW WH TESS QUAL DXCFG`. |
+| `stages.sh VMNAME [SECS]` | Per-frame stage timing of the windowed copy and the foreign flip (`conduit trace VMNAME stages` with the guest's `StgRing` read over SSH every second; needs `StageTrace=1` in the guest): the stage table, the raw collection and a Perfetto trace in `$VMTEST_DIR/win/stages-<time>/`. |
 | `blrow.sh LABEL ENV Knob=Val...` | One A/B row for the windowed (composed) Present: set KMD knobs, restart the device, fresh DWM + shell, Heaven, PresentMon 10 s, screenshot, KMD counters (`PrDdiBlt*`, `BltMirror*`, `BltAsync*`, `Gb*`). |
 | `gbrows.sh` | The three guest-blob rows (GuestBlob 0, 1, 1 + BltAsync + ForeignCopy). Loops that split arguments must stay in bash scripts: the agent shell is zsh and does not word-split. |
 | `stress.ps1`, `stressrun.sh` | 10-minute window stress in the user session (move, resize, minimise/restore, open/close windows) with counters before and after. |
