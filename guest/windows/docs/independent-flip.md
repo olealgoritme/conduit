@@ -1,7 +1,8 @@
 # Independent flip (direct flip) of flip-model swap chains: KMD design
 
-Status: DESIGN ONLY. Nothing in `kmd_render` changes with this document. The one piece of code that accompanies
-it, `kmd_logic/src/independent_flip.rs` (the decision table of section 6, 16 host tests), is **not wired**.
+Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; the rest is design. The decision table of
+section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
+failure.
 Written against v327 (`225ce42`, branch `kmd/independent-flip-design`). Line numbers are that commit's.
 **Re-verified (second pass) against the WDK 10.0.26100 miniport headers**: section 1 names them `[HK]`, section 10 holds
 the header facts, and several first-pass statements changed (most importantly `DXGK_FLIPCAPS.FlipIndependent`, which the
@@ -441,7 +442,11 @@ A flip retires when a `CRTC_VSYNC` reports its address. Per tick (4.17 ms at 240
 * The watchdogs (`VsWatchdog`, `FlipWdogMs`, `DeferBudget`; `zero-copy-present.md` 14, 15.4) are the safety nets for a dead
   heartbeat and a stuck flip; they stay as they are.
 
-### 4.5 Cursor and overlay interplay  [open]
+### 4.5 Cursor and overlay interplay  [pointer: answered, section 12]
+
+Measured since: promoted, the pointer is gone (Heaven at 5120x1440@240 through independent flip, `IdfDirFor` 172362): dxgkrnl
+promotes without a hardware pointer and nothing draws the software one. The hardware cursor (`HwCursor`) is section 12. The
+analysis as first written:
 
 * **Pointer.** The KMD reports no hardware pointer and accepts `SetPointerShape` / `SetPointerPosition` as no-ops with the
   comment "the OS software-composes the cursor" (`display.rs:1720-1753`). A software cursor is drawn by DWM into the frame DWM
@@ -956,3 +961,253 @@ claim in `wddm_surface.rs` rests on the measured `E_NOTIMPL` at 3.2 alone.
   created with `DXGK_ALLOCATIONINFOFLAGS2.NotifyEviction` / `NotifyIoMmuUnmap` (`:3861-3862`, `:4854-4876`). For a GpuMmu (WDDMv2) driver such
   as this one the operations dxgkrnl sends are the `>= WDDM2_0` set (`VIRTUAL_TRANSFER`, `VIRTUAL_FILL`, page-table, `NOTIFY_RESIDENCY`,
   `MAP/UNMAP_APERTURE_SEGMENT`); which of them represent eviction in practice is dxgkrnl's, not a named operation.
+p='independent-flip.md'
+s=open(p).read()
+old=s[s.index('Status: DESIGN ONLY.'):s.index('Written against v327')]
+new='''Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; the rest is design. The decision table of
+section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
+failure.
+'''
+s=s.replace(old,new)
+s=s.rstrip()+'\n'+open('/dev/stdin').read()
+open(p,'w').write(s)
+
+## 11. Stage S-1 as built (`IndepFlip`), the test recipe, and the flip-model upgrade route
+
+Branch `feat/independent-flip`. Main already had the S-0a instruments (`FlipCapsX` as an OR mask, the `IdfSpa*` / `IdfPr*` flag
+counters, `zero-copy-present.md` section 18) and the UMD's `DirectFlipSupport` knob (`docs/WINDOWS.md`). This stage bundles the caps
+into one knob and wires the decision table.
+
+### 11.1 What `IndepFlip` does
+
+| value | caps | census | flip paths |
+|---|---|---|---|
+| 0 (default, absent) | as `DirectFlipCaps` / `FlipCapsX` say, unchanged | off | unchanged |
+| 1 | `SupportDirectFlip` = 1, aperture segment `DirectFlip` = 1, `FlipCaps` OR `FlipIndependent \| DdiPresentForIFlip` (`FlipCapsRep` 0x32) | every flip judged and counted | unchanged |
+| 2 | as 1 | as 1 | a DMA-buffer flip of a Venus allocation that is not in the direct-scan-out table completes as a kept picture instead of failing (`PBFlip` 0xE6, now `IdfEnfKeep`) |
+| other | as 1 | as 1 | unchanged (a typo never enforces) |
+
+* The caps are folded in `AdapterKnobs::read` (`independent_flip::advertise`): the knob ORs into what `DirectFlipCaps` and `FlipCapsX`
+  ask for, so the caps query, the segment descriptors and the `FlipCapsXEff` / `FlipCapsRep` mirrors all report the same thing, and
+  `FlipImmediateMmIo` stays impossible. `FlipImmediateOnHSync` is not added (unmeasured; `FlipCapsX=0x40` still adds it).
+* The census (`kmd_render/src/ddi/indep_flip.rs`) counts each flip once: in the flip worker for every MMIO flip and every armed DMA flip
+  (`worker_pre`, before any arm; a foreign source is finished when `ForeignFlip` or the level-5 arm answered), and in `DxgkDdiPresent`
+  for a DMA flip answered without arming (`count_dma_unarmed`). Owner life, a user scan-out source and the failing pause are judged
+  inside `ForeignFlip`; the census reports those refusals as `IdfRef13` (`ForeignOther`), with the reason in `FfRef*`.
+* `MISC_PRIMARY` is now kept on the allocation context (`primary_tagged`), read only by the census: `IdfUntagged` counts direct flips of
+  sources the UMD did not create from a `pPrimaryDesc` (question 2.4).
+* `SCANOUT_ALLOCS` grows from 32 to 64 slots (2.8), whatever the knob.
+* Not in this stage: `IdfNeedPrim`, `IdfHoldRel`, `IdfSwitch` (names reserved), MPO (S-5: a smaller-than-output window cannot be
+  promoted to "Hardware: Independent Flip" without overlay planes, so the test window covers the output), a hardware pointer (4.5; now
+  section 12, `HwCursor`), the
+  D3D12 `pfnCheckDirectFlipSupport` slot (2.3; the D3D11 one has the `DirectFlipSupport` knob).
+
+Counters (event-gated; the whole block is written as zeros at every StartDevice, then from the periodic `scanout_trace` dump when a count
+moved): `IdfKnob` (mode in force 0/1/2), `IdfSeen`, `IdfDirect` = `IdfDirFor` + `IdfDirVen`, `IdfCopy`, `IdfKeep`, `IdfWhy` (last reason),
+`IdfRef01`..`IdfRef13` (6.2 codes), `IdfArmMmio` (`SetVidPnSourceAddress` calls), `IdfArmDma`, `IdfUntagged`, `IdfEnfKeep`.
+`IdfSeen` can differ from the sum of verdicts by level-5 retries (counted when retried) and from `IdfArm*` by flips whose handle did not
+resolve.
+
+### 11.2 The test app
+
+`guest/windows/tools/d3d11_iflip.cpp` (mingw build line in its header): a `FLIP_DISCARD` D3D11 swap chain, by default in a **borderless
+window covering the output at its current mode** (the only windowed shape eligible without MPO: extent must equal the mode, 2.2), 2
+buffers, interval 1, cursor hidden over the window (a software cursor is drawn by DWM, 4.5). Options: `window` (1280x720 decorated, the
+negative control), `interval0` (the DMA-buffer contract), `tearing`, `cursor`, `rgba`, `buffers=N`, `adapter=N`. It logs dxgkrnl's derived
+answers (`KMTQAITYPE` 19, 28, 20, 39 for the adapter), then every second the fps and the DXGI presentation mode from
+`IDXGISwapChainMedia::GetFrameStatisticsMedia` (`COMPOSED`, `NONE` = not composed, `OVERLAY` = an MPO plane [M]), and a final `RESULT` line.
+
+### 11.3 Recipe (main runs it; lowest mode first)
+
+Per row: set the service values, reboot (dxgkrnl derives the user-mode answers when the adapter is created), check `IdfKnob` and
+`FlipCapsRep`, run the app for 20 s under PresentMon (`--process_name d3d11_iflip.exe`), then read the counters.
+
+| row | `IndepFlip` | `HKLM\SOFTWARE\Helios` `DirectFlipSupport` | run | expect |
+|---|---|---|---|---|
+| A | 0 | 0 | `d3d11_iflip.exe 20` | `Composed: Flip`, `RESULT ... COMPOSED`, kmt 19/28 = 0, `IdfKnob` 0 |
+| B | 1 | 0 | same | kmt answers show what our caps buy; `IdfSeen` ~ DWM's flips (`IdfDirFor` with DWM on NVK); still composed if the UMD is the gate |
+| C | 1 | 1 | same | the promotion row. UMD log: `CheckDirectFlipSupport ... -> yes`. PresentMon `Hardware: Independent Flip`, DXGI mode `NONE`, `IdfPrRedir` / `IdfSpaExcl` / `IdfSpaTrans` rising, `IdfSeen` rising with the app's rate, `FfReowned` +2 per promotion round trip |
+| D | 1 | 1 | `d3d11_iflip.exe 20 window` | negative control: composed |
+| E | 1 | 1 | `d3d11_iflip.exe 20 interval0` | DMA contract: `IdfArmDma` rising; `IdfRef06` (`NotRegistered`) and `PBFlip` 0xE6 if the app's buffers are not direct primaries |
+| F | 2 | 1 | as E | `IdfEnfKeep` replaces 0xE6 (screen keeps a picture instead of the Present failing) |
+| G | 1 | 1 | as C with `cursor` | does a visible software cursor block or break promotion (4.5) |
+
+Read with every row: `IdfKnob`, `IdfSeen`, `IdfDirect`, `IdfDirFor`, `IdfDirVen`, `IdfCopy`, `IdfKeep`, `IdfWhy`, `IdfRef01..13`, `IdfArmMmio`,
+`IdfArmDma`, `IdfUntagged`, `IdfEnfKeep`; the S-0a flags `IdfSpaTrans`, `IdfSpaExcl`, `IdfSpaMove`, `IdfPrRedir`; and `FlipCapsRep`, `PBFlip`,
+`FkKeep*`, `FfProg`, `FfReowned`, `ScAlcFul`. UMD log: `CheckDirectFlipSupport` answers and `primary_desc=` on the app's buffers
+(2.4: `true` means the app's buffers are primaries, and with format 87 they are `MISC_DIRECT_SCANOUT` and take the direct bind).
+
+Reading the outcome: promotion with `IdfDirect` rising is the goal. Promotion with `IdfKeep` rising means the app's frames are not shown
+(`IdfWhy` names why). No promotion with C's UMD answer `yes`: the next suspects are the pointer (row G vs C), the app's buffers not being
+primaries (`primary_desc=false`, `IdfUntagged`), and what kmt 28 reports. Safety: `FlipIndependent` may change how DWM's own flips arrive;
+watch `PBFlip` and `FkKeep*` on the first boot with it; recovery is `IndepFlip=0` and a reboot (the knob is the whole surface).
+
+### 11.4 Why it matters
+
+A composed windowed frame costs a copy of the frame (5.8 MB at the measured size, about 345 us of GPU/PCIe time on the host) into the
+redirection surface before DWM can use it, and no host tuning removes it. A promoted chain is scanned out from the application's own
+buffer: the copy and DWM's composition of that window disappear.
+
+### 11.5 The flip-model upgrade of blt-model games (`REASON_NONGAME`), re-checked
+
+Heaven presents blt-model (one buffer, `DXGI_SWAP_EFFECT_DISCARD`); independent flip needs a flip-model chain, so for such games the
+route is Windows' swap-effect upgrade ("optimizations for windowed games"): DXGI silently creates a flip-model chain for a D3D10/11
+blt-model one. What was measured (`kmd-handoff-2026-10.md` section 2): DXGI's `DXGI_ETW_SWAPCHAIN_CREATE` event carries
+`WINDOWEDSWAPEFFECTUPGRADE_REASON_NONGAME` for Heaven; the per-app `UserGpuPreferences` value upgraded `d3d11_triangle` some of the time
+and never Heaven; the `FlipCapsX` rows changed nothing.
+
+What gates it, and what the driver can do:
+
+* **The game classification is a user-mode OS policy keyed on the process, not on the adapter.** [M] DXGI asks the system's game
+  detection (the same one Game Bar uses; its per-user store is `HKCU\System\GameConfigStore`, and Game Bar's "Remember this is a game"
+  adds an executable to it) whether the process is a game. Nothing in the KMD caps or the UMD DDI is an input to that answer, so **the
+  driver cannot influence `REASON_NONGAME`**. The user-side levers to test: Game Bar's "Remember this is a game" with Heaven focused, then
+  the per-app `SwapEffectUpgradeEnable=1;` value, then re-run the capture.
+* **The other reasons are listed by DXGI's own manifest**, which no doc on disk has: `ci/vmtest/swapeffect-upgrade.ps1 -ListOnly` prints
+  every `WINDOWEDSWAPEFFECTUPGRADE_REASON_*` the provider defines. Any of them that name a driver property are the ones the driver can
+  act on. The single-buffer and `ALLOW_MODE_SWITCH` properties of Heaven's chain are app-side (`d3d11_triangle` options `modeswitch`,
+  `rgba` reproduce them).
+* `-Exe <path> -PerApp` runs a program under the capture with the per-app opt-in and prints the reasons and swap effects it hit.
+* "Some of the time" for `d3d11_triangle` suggests a second, transient gate (for example a reason tied to the window or output at
+  creation time, like the separate "Failed to find an output for the swapchain" message). The script's per-run reason histogram separates
+  the two.
+* Even when it works, an upgraded 1280x720 or 1600x900 window is `Composed: Flip`, not independent flip. That still removes the blt into
+  the redirection surface, because DWM composes from the app's buffer. Independent flip additionally needs the window to cover the output
+  (11.2).
+* The UMD's `CheckDirectFlipSupport` answer may also feed the upgrade decision (the knob's commit message says "may"); row C with a
+  blt-model app (`d3d11_triangle helios blt`) under the script answers whether `DirectFlipSupport=1` changes the reason list.
+
+### 11.6 First hardware result, and the pacing fix
+
+Package 22.22.345.1, 1920x1080@240, `d3d11_iflip.exe 20` (borderless, interval 1):
+
+| row | kmt DIRECTFLIP / INDEPENDENTFLIP | `FlipCapsRep` | DXGI mode | fps | KMD |
+|---|---|---|---|---|---|
+| A (`IndepFlip=0`) | 0 / 0 | 0x2 | COMPOSED 18 | 240 | `Idf*` 0 |
+| C (`IndepFlip=1`, `DirectFlipSupport=1`) | 1 / 1 | 0x32 | NONE 10 | **2758** | `IdfSeen` 295, `IdfDirFor` 293, `IdfArmMmio` 295, `IdfSpaTrans` 2, `IdfKeep` 0 |
+| F (`IndepFlip=2`) | 1 / 1 | 0x32 | NONE 8 | 1930 | as C, `IdfEnfKeep` 0 |
+
+dxgkrnl derives both answers from our caps, and DXGI leaves composition. The pacing was wrong, and the cause is in the UMD, not in the
+KMD's flip completion. With independent flip, DXGI creates the borderless chain's buffers from a `pPrimaryDesc`, so the NVK present path
+(`nvk_present_frame`, default `NvkPresent=0`) took its rule for primaries: show the frame through NVK's own scan-out source (the user
+`SCANOUT_PRESENT` source, the fullscreen-exclusive path) and return without calling `pfnPresentCb`. The exception is the first frame
+(`NvkScanoutComposeEvery` 0 at the WDDM 1.3 DDI level). So dxgkrnl never saw the application's presents: no flip queue, no vblank
+throttle, an unpaced 2758 fps. The 295 flips the KMD counted are DWM's and that one frame, and `IdfSpaTrans` 2 is the one promotion
+transition.
+
+Fix (commit "umd: with independent flip, NVK primaries take the WDDM flip"): when dxgkrnl reports `KMTQAITYPE_INDEPENDENTFLIP_SUPPORT`
+for the adapter (only with `IndepFlip` set), a primary source takes the WDDM present like any composed frame. dxgkrnl then flips the
+application's own buffer (the MMIO flip; the KMD shows it through `ForeignFlip`, zero-copy) or DWM composes it, and the flip retires on
+the vsync heartbeat. `NvkPresent=1` still forces the old scan-out path, and `NvkPresent=2` forces the WDDM present for every frame (the
+same result without the new build). The UMD log says `NVK present: primary source #0 takes the WDDM flip`.
+
+Re-run C. Expect fps at about 240 and DXGI mode NONE. On the KMD side, `IdfArmMmio`, `IdfSeen` and `IdfDirFor` should rise by about 240
+per second (about 4800 in 20 s), `VpEnt` likewise, with `FfProg` and `FfFrames` rising at that rate, `FfReowned` +2 per promotion round
+trip, `IdfSpaTrans` / `IdfSpaExcl` nonzero, `IdfKeep` 0 and `FkKeep*` 0. `FfRttUsMax` should stay below about 4 ms at 240 Hz. If the rate
+caps at about 120, check `FfAsyncWin` (4.4). The UMD log should no longer show `NVK present: N frames on scanout 0`.
+
+Re-run of C with `NvkPresent=2` (the same routing as the fix, on the 345.1 UMD): **paced and promoted**. 4803 frames in 20.0 s
+(240.1 fps), DXGI mode OVERLAY 18 (COMPOSED 0). `IdfSeen` 5059, `IdfDirFor` 5057, `IdfArmMmio` 5059, `IdfKeep` 0. `VpEnt` 5059, `VpPres`
+6015, `VpFlip` = `VpMmio` 5053, `FfProg` 5057, `FfFrames` 5050, `FfReowned` 1, `FfRttUsMax` 2429 us, `FkKeep` 0, `IdfSpaTrans` 2,
+`IdfPrRedir` 957.
+
+* The DXGI mode reads OVERLAY, not NONE. With kmt MPO = 0 there is no overlay plane, so DXGI evidently reports a promoted chain as
+  OVERLAY [M]. The unpaced run's NONE was the user-source state, which dxgkrnl never saw. PresentMon's PresentMode column remains the
+  authority.
+* `IdfPrRedir` 957 and `VpPres` - `VpFlip` = 962: the `RedirectedFlip` presents are, by the arithmetic, non-Flip presents. The KMD's arm
+  choice is `Flags` bit 2, so they take the Blt arm. Reading: with `DdiPresentForIFlip`, dxgkrnl calls `DxgkDdiPresent` for a candidate
+  present that it redirects to DWM (composed) instead of flipping. 957 is about 4 s at 240 Hz, consistent with a composed phase before
+  promotion. To confirm: the flag histogram `FlR<n>` / `FlC<n>` (a word with 0x2000 set and 0x4 clear, count about 957), `FiR<n>` /
+  `FiC<n>`, `VpBlt`, and `IdfPrRedir` read at about 5 s and again at the end (a start-up burst vs. a steady trickle). A steady trickle
+  would mean partial demotions, and `IdfSpaTrans` / `FfReowned` would rise with it.
+
+## 12. The hardware cursor (`HwCursor`)
+
+Branch `feat/indepflip-hw-cursor`. The hardware result that asked for it: with `IndepFlip=1` and `DirectFlipSupport=1`, full-screen
+Heaven at 5120x1440@240 ran 300-400 fps through independent flip (`IdfDirFor` 172362 direct flips of the application's own buffer,
+`IdfKeep` 0), and the mouse cursor disappeared. Without a hardware pointer dxgkrnl has DWM draw the cursor into the frames DWM
+composes (4.5); promoted, DWM composes nothing, and the cursor goes with it. The fix is a hardware pointer: the cursor stops being
+part of any frame.
+
+### 12.1 What it does
+
+* **Caps.** `DXGK_DRIVERCAPS.MaxPointerWidth` / `MaxPointerHeight` 256 and `PointerCaps` = `Monochrome | Color | MaskedColor` (7),
+  when `helios_kmd_logic::hw_cursor::advertise` says so: the knob is not 0, the display half is on, and the host advertises
+  `NVGPU_CFG_CURSOR | NVGPU_CFG_VENUS | NVGPU_CFG_VENUS_CURSOR` (bits 9, 10, 18). Otherwise the caps are zeros, as before, and
+  dxgkrnl keeps the software cursor.
+* **The image.** One KMD-owned linear Venus image, 256 x 512 B8G8R8A8, host-visible (`allocate_linear_scanout_image_blob`, the
+  allocation every Venus primary uses, so its dma-buf export is the proven one), made on the first shape of a transport generation.
+  Two 256x256 slots: a new shape is written into the slot not on screen, so the host never reads a half-written cursor.
+* **`DxgkDdiSetPointerShape`** (PASSIVE): `hw_cursor::validate` (exactly one kind, 1..256 square, pitch, hotspot inside, source
+  0), the conversion to premultiplied ARGB row by row into the slot through a transient `MmMapIoSpace` of the mapped blob, then
+  `HELIOS_CMD_SET_CURSOR_BLOB` (0x0380, a Conduit extension of the virtio-gpu control queue: blob, rectangle, stride, offset, hotspot,
+  visibility) when the cursor is visible. Conversions: color is per-pixel alpha, premultiplied unless already premultiplied (no
+  channel above its alpha); masked color is alpha 0 = opaque colour, alpha 0xFF = XOR (black XOR is transparent); monochrome is
+  AND/XOR, 0/0 black, 0/1 white, 1/0 transparent, 1/1 invert. An ARGB plane cannot invert, so an inverting pixel is drawn black
+  with a white outline on its transparent neighbours (the text I-beam stays visible on dark and light backgrounds).
+* **`DxgkDdiSetPointerPosition`** (PASSIVE, up to the mouse rate): one spinlock and a compare, unless `Flags.Visible` changed;
+  then the image is shown or hidden on the host. **The position never travels**: the host pointer is the cursor (the viewer sets
+  the image as its `wl_pointer` cursor over the guest), so it moves at host rate with no guest latency. X and Y ride along on
+  each command, informational.
+* **Failure is the software cursor.** A shape the host cannot take, an image that cannot be made or mapped, a host command that
+  fails: `SetPointerShape` answers `STATUS_UNSUCCESSFUL`, and dxgkrnl draws that shape in software, as before (the host image is
+  hidden first, so two cursors never show). A host that refuses the command (`RESP_ERR_*`: an old backend under `HwCursor=2`) is not
+  asked again in that generation (`CurHostErr`). `SetPointerPosition` always succeeds (failure is not in its legal set).
+* **Host side** (`docs/SCANOUT.md` "Hardware cursor, Windows guests"): the backend exports the blob once, as a scanout, and hands
+  the rectangle to the display link exactly as a Linux guest's `CursorUpdate`: `CMD_CURSOR` with the dma-buf to every client that
+  takes cursors. The viewer and the stream host already draw it; nothing changed there.
+
+### 12.2 Transitions
+
+| transition | what keeps the cursor right |
+|---|---|
+| composed ↔ independent flip (promotion, demotion, `IdfSpaTrans`) | nothing to do: the cursor is in no frame, so it is the same in both. With `HwCursor=0` the cursor is lost while promoted (the bug) |
+| mode change (CommitVidPn, `EV_MODE_HINT` re-mode) | the image does not depend on the mode, and the host keeps showing it; dxgkrnl is expected to re-apply the pointer after a mode set [M] (row H3 checks). The viewer draws it at the picture's scale |
+| DWM restart | dxgkrnl owns the pointer, not DWM; DWM's restart re-sets the shape at most. A shape it cannot show goes to the software cursor, as before |
+| device restart (`pnputil /restart-device`, TDR) | per generation: `reset_for_start` forgets the image (its resource id may name another resource in the next generation), the host hides the cursor when the transport resets (`Venus::release`), dxgkrnl sets the shape again and the first shape makes a new image |
+| host refused / old backend | the caps carry no pointer without `NVGPU_CFG_VENUS_CURSOR` (default knob); with `HwCursor=2` every shape fails over to software |
+| viewer reconnect, `conduit view` started later | the backend keeps the last cursor and re-sends it to a client that connects (as for Linux guests) |
+| grab (CTRL+ALT+G, relative pointer) | the viewer hides the host pointer, and with it the guest's image: no cursor under grab (as for a Linux guest's cursor plane; games draw their own). `HwCursor=0` keeps the old guest-drawn cursor for desktop use under grab |
+| multi-monitor | one VidPN source; a shape or position for another source is refused (shape) or ignored (position) |
+| boot console shown | the backend does not send the guest's cursor over the console |
+
+### 12.3 Knob and counters
+
+`HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, `HwCursor` (REG_DWORD), read with the other adapter knobs at StartDevice:
+
+| value | effect |
+|---|---|
+| absent, 1 | hardware cursor when the host advertises it (default) |
+| 0 | software cursor, exactly as before (the A/B and the off switch) |
+| 2 | caps reported whatever the host says (bring-up; on an old host every shape fails over to software, `CurHostErr` 1) |
+
+Counters (event-gated like `Idf*`: zeros at every StartDevice, then from the periodic dump when one moved): `CurKnob` (the knob),
+`CurCaps` (1 when the caps report the pointer), `CurShapeN` / `CurPosN` (SetPointerShape / SetPointerPosition calls; `CurPosN` is
+published with the next other change), `CurShow` / `CurHide` (show / hide commands the host took), `CurFmt` (last shape: 1 mono, 2
+color, 4 masked color, +0x100 premultiplied by the KMD), `CurSize` (`width << 16 | height`), `CurRefuse` (shapes left to the
+software cursor), `CurWhy` (last reason: 1 flags, 2 size, 3 pitch, 4 hotspot, 5 no pixels, 6 source, 7 host, 8 image), `CurHostErr`
+(host commands that failed), `CurXor` (inverting pixels in the last shape). Host: the backend logs `venus: the guest's hardware
+cursor is served (CMD_SET_CURSOR_BLOB)` at start and counts `set_cursor_blob=N` in its teardown `venus: ... command(s)` line.
+
+### 12.4 Recipe (main runs it; lowest mode first)
+
+Needs the backend and the KMD of this branch (`NVGPU_CFG_VENUS_CURSOR` is new; with an older backend the default knob reports no
+pointer and nothing changes). Per row: set the values, reboot (or `pnputil /restart-device`), check `CurKnob` / `CurCaps`, run,
+read the counters.
+
+| row | `HwCursor` | `IndepFlip` / `DirectFlipSupport` | run | expect |
+|---|---|---|---|---|
+| H0 | 0 | 0 / 0 | desktop, move the mouse, hover a text field and a window edge | today's behaviour: `CurCaps` 0, `Cur*` 0, cursor drawn by DWM |
+| H1 | absent | 0 / 0 | same | `CurCaps` 1, `CurShapeN` >= 1 and rising with each new shape (arrow, I-beam, resize), `CurShow` >= 1, `CurRefuse` 0, `CurHostErr` 0, `CurFmt` 2 or 4 (Windows' cursors), `CurXor` > 0 on the I-beam if it inverts. Cursor visible and tracking with no lag; the I-beam black with a white outline |
+| H2 | absent | 1 / 1 | `d3d11_iflip.exe 20 cursor` at 1920x1080@240, then Heaven full-screen at 5120x1440@240 | promotion as 11.6 (`IdfDirFor` rising, `IdfKeep` 0) **and the cursor visible** over the promoted window; `CurHide` / `CurShow` move only when an application hides or shows the cursor; fps as without the cursor (the cursor costs no frame work) |
+| H3 | absent | 1 / 1 | as H2, then Alt+Tab out and back (demote, promote), change the mode (viewer fullscreen toggle), `taskkill /f /im dwm.exe`, `pnputil /restart-device` | cursor present after each; after the restart `CurShapeN` restarts from 0 and rises again; no two cursors at any time |
+| H4 | 2 | 0 / 0 | on an old backend (no `NVGPU_CFG_VENUS_CURSOR`) | `CurCaps` 1, `CurHostErr` 1, `CurRefuse` = `CurShapeN`, `CurWhy` 7: the software cursor, visible |
+
+**Screenshot check.** An in-guest screenshot (`ci/vmtest/shot.ps1`, `CopyFromScreen`) never contains the cursor, hardware or not,
+so it checks only the picture. The cursor check is on the host: with the pointer over the guest window, `grim -c` (cursor included)
+of the output; the guest's arrow must be in the shot at the pointer, at the guest picture's scale, and in H2 over the promoted
+Heaven frame. Read `CurSize` / `CurFmt` with it: a 32x32 color arrow is `CurSize` 0x200020, `CurFmt` 0x102 (straight alpha,
+premultiplied by the KMD) or 2.
+
+Safety: the knob is the whole surface (`HwCursor=0` and a restart restore the software cursor). A host that stops answering costs
+at most 500 ms per pointer command before that shape falls back to software.

@@ -72,6 +72,15 @@ const _: () = assert!(CONDUIT_OPTIONAL_FEATURES & NVGPU_F_TAKES_INPUT == 0);
 /// `docs/VENUS.md`, "Guest-memory blobs".
 pub const NVGPU_CFG_GUEST_BLOB: u32 = 1 << 16;
 
+/// `NVGPU_CFG_CURSOR` (config `features` bit 9): the host shows a cursor image as its own
+/// pointer (docs/SCANOUT.md "Hardware cursor").
+pub const NVGPU_CFG_CURSOR: u32 = 1 << 9;
+/// `NVGPU_CFG_VENUS_CURSOR` (config `features` bit 18, only together with `NVGPU_CFG_VENUS`
+/// and `NVGPU_CFG_CURSOR`): the host serves `HELIOS_CMD_SET_CURSOR_BLOB`, the hardware cursor
+/// as a blob (docs/SCANOUT.md "Hardware cursor, Windows guests"). The KMD's `HwCursor` follows
+/// it (`helios_kmd_logic::hw_cursor::advertise`).
+pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
+
 // ── Device status bits (VirtIO spec §2.1) ──────────────────────────────────
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 pub const VIRTIO_STATUS_DRIVER: u8 = 2;

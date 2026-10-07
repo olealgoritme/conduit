@@ -224,6 +224,16 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         caps_offset!(ApertureSegmentCommitLimit),
         aperture_segment_commit_limit,
     );
+    // The hardware cursor (`HwCursor`, `ddi::hw_cursor`): a 256x256 monochrome / color /
+    // masked-color pointer when the knob and the host allow it, else none (zeros: dxgkrnl
+    // draws a software cursor, which independent flip loses).
+    if crate::ddi::hw_cursor::advertised(adapter) {
+        let max_pointer: UINT = helios_kmd_logic::hw_cursor::MAX_DIM;
+        out.set(caps_offset!(MaxPointerWidth), max_pointer);
+        out.set(caps_offset!(MaxPointerHeight), max_pointer);
+        let pointer_caps: UINT = helios_kmd_logic::hw_cursor::POINTER_CAPS;
+        out.set(caps_offset!(PointerCaps), pointer_caps);
+    }
     // Not a legacy VGA device.
     let support_non_vga: BOOLEAN = 1;
     out.set(caps_offset!(SupportNonVGA), support_non_vga);
@@ -441,6 +451,11 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // (mcdm-implementation-guidelines.md) requires 0 here. `DirectFlipCaps`
     // service knob (default 0) restores the legacy advertisement for A/B via
     // reg add + devcon restart; value lands in the 0x01D7 diag record bit 2.
+    // STALE PREMISE, corrected for independent flip (docs/independent-flip.md 2.7):
+    // the adapter now has a display half, a flip path and a host scan-out, so a
+    // promoted window IS shown. `IndepFlip` (default 0) advertises this cap, the
+    // aperture DirectFlip flag and FlipIndependent|DdiPresentForIFlip together;
+    // `knobs.direct_flip` already carries it (AdapterKnobs::read).
     let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
     let nb_asymetric_processing_nodes: UINT = 1;

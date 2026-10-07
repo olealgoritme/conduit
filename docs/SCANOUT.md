@@ -29,7 +29,7 @@ All little-endian, `#[repr(C)]`, after the common message header. Display
 | 21 | `ScanoutDisable` | guest → host | control (reply: header only, status) |
 | 22 | `InputEvent` | host → guest | event |
 | 23 | `DisplayMode` | host → guest | event |
-| 24 | `CursorUpdate` | guest → host | control, fire-and-forget like `ScanoutFlip` (reply: header only) |
+| 24 | `CursorUpdate` | guest → host | control, fire-and-forget like `ScanoutFlip` (reply: header only); a Windows guest uses `CMD_SET_CURSOR_BLOB` in a `GpuCmd` instead ([below](#hardware-cursor-windows-guests)) |
 | 25 | `ClipboardFromHost` | host → guest | event (see docs/CLIPBOARD.md) |
 | 26 | `ClipboardToHost` | guest → host | control (reply: header only, status) |
 | 27 | `ClipboardRequest` | guest → host | control, no payload: resend the host clipboard (reply: header only, status) |
@@ -153,6 +153,54 @@ guest cursor plane commit ──CursorUpdate{owner,handle,hot}──► backend 
   `CAP_CURSOR` never gets `CMD_CURSOR` (it would be a protocol violation).
 - The viewer draws it at the picture's scale (guest pixel → window pixel)
   through a viewport, so it keeps its size relative to the guest desktop.
+
+### Hardware cursor, Windows guests
+
+```
+DxgkDdiSetPointerShape ──ARGB into a slot of the KMD's cursor blob──► CMD_SET_CURSOR_BLOB{res, rect, stride, offset, hot}
+                                                                        │ GpuCmd (control queue), round trip
+                                                                        ▼
+                                  backend venus/cursor.rs: export the blob once (as a scanout) ──► DisplayLink::cursor
+                                                                        │ CMD_CURSOR + dma-buf, as above
+                                                                        ▼
+                                                    viewer / stream host: unchanged
+```
+
+A Windows guest has no GEM pair for its cursor, so its KMD names a Venus
+blob instead: `CMD_SET_CURSOR_BLOB` (`0x0380`, a Conduit extension outside
+the virtio-gpu ranges; `host/backend/protocol/src/venus.rs`
+`SetCursorBlob`, 72 bytes):
+
+```c
+struct set_cursor_blob {       /* after the virtio-gpu ctrl header */
+    u32 scanout_id;            /* 0 */
+    u32 resource_id;           /* the blob; 0 = hide */
+    u32 width, height;         /* <= 256 */
+    u32 format;                /* VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM (DRM AR24), premultiplied */
+    u32 stride, offset;        /* the rectangle in the blob */
+    u32 hot_x, hot_y;          /* inside the image */
+    s32 x, y;                  /* informational, as crtc_x/y */
+    u32 flags;                 /* bit 0 VISIBLE; clear = hidden */
+};
+```
+
+- Served only with `NVGPU_CFG_VENUS_CURSOR = 1<<18` (set when the backend
+  serves Venus and `--display-cursor on`, the default); without it
+  `RESP_ERR_UNSPEC`, and the KMD's default keeps the software cursor.
+  Refused: a scanout other than 0 (`INVALID_SCANOUT_ID`), an unknown
+  resource (`INVALID_RESOURCE_ID`), any other format, a size of 0 or above
+  256, a hotspot outside, a stride below `width * 4` or rows past the blob
+  (`INVALID_PARAMETER`).
+- The blob is exported once (the renderer's scanout export; an RM-export
+  blob is its own dma-buf), whatever rectangle it is first named with; each
+  update carries its rectangle. The KMD keeps two slots in one blob and
+  writes the one not on screen, so the viewer's import cache (keyed by
+  dma-buf and offset) holds both and a change is a re-attach.
+- Sent for a shape or a visibility change, never for a move, as for Linux.
+  A hide (resource 0 or `VISIBLE` clear) is `CMD_CURSOR` without a buffer.
+  Unref of the cursor's resource and a device reset hide it.
+- The KMD side, its knob (`HwCursor`), counters and the test recipe:
+  `guest/windows/docs/independent-flip.md` section 12.
 
 ## Backend → viewer
 

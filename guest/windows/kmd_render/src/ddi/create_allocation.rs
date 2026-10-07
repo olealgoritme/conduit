@@ -165,6 +165,10 @@ struct AllocationContext {
     /// The UMD created this exact `pPrimaryDesc` allocation as a plain LINEAR
     /// DMA_BUF and recorded the verified direct-scanout marker in its meta.
     direct_scanout: bool,
+    /// The creator's `MISC_PRIMARY` (the UMD created it from a `pPrimaryDesc`, or it is a
+    /// `SHAREDPRIMARYSURFACE` standard allocation). Read by the independent-flip census only
+    /// (`IdfUntagged`, `docs/independent-flip.md` 2.4); no policy branches on it.
+    primary_tagged: bool,
     /// Byte offset of the plain-LINEAR COLOR plane within the backing allocation
     /// (from the UMD's `vkGetImageSubresourceLayout` on a direct primary).
     /// `SetVidPnSourceAddress`'s `SET_SCANOUT_BLOB` uses it as the plane offset;
@@ -906,6 +910,8 @@ pub(crate) struct WindowsPrimary {
     /// shape. Kept HERE and not on the target: the programming path still
     /// branches on it to decide whether to publish the fallback cache.
     pub direct_scanout: bool,
+    /// The allocation's `MISC_PRIMARY` (census only, see `AllocationContext::primary_tagged`).
+    pub primary_tagged: bool,
     /// Exact `PrimarySegment` paired with this hAllocation by Windows.
     pub primary_segment: u32,
     /// Exact `PrimaryAddress` paired with this hAllocation by Windows. The ONLY
@@ -1266,6 +1272,7 @@ pub(crate) unsafe fn scanout_alloc_info(
         venus_alloc_size: ctx.venus_alloc_size,
         memory_type_index: ctx.memory_type_index,
         direct_scanout: ctx.direct_scanout,
+        primary_tagged: ctx.primary_tagged,
         primary_segment: ctx.vidpn_primary_segment.load(Ordering::Relaxed),
         primary_address,
         primary_flags: ctx.vidpn_primary_flags.load(Ordering::Relaxed),
@@ -1587,7 +1594,12 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
 /// foreign ones: DWM-on-NVK rotates 3 to 4 swap-chain buffers), which is what keeps a fixed
 /// table adequate: DWM rotates 3 and an app's flip chain 2-4, so the live set is
 /// under ten even across a fullscreen transition.
-const SCANOUT_ALLOC_SLOTS: usize = 32;
+///
+/// 64 since independent flip (`docs/independent-flip.md` 2.8, stage S-1): with `ForeignFlip` on
+/// EVERY adopted foreign allocation registers, i.e. the buffers of every flip-model window on the
+/// desktop, and an independent flip makes the application's entry load-bearing. A slot is 24
+/// bytes; the lookups are linear scans that stop at the first match.
+const SCANOUT_ALLOC_SLOTS: usize = 64;
 
 struct ScanoutAllocSlot {
     resource_id: AtomicU32,
@@ -3452,6 +3464,7 @@ unsafe fn create_one_inner(
         pitch: meta.pitch,
         dxgi_format: meta.dxgi_format,
         direct_scanout: (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT) != 0,
+        primary_tagged: is_primary,
         plane_offset: meta.plane_offset,
         venus_alloc_size: meta.venus_alloc_size,
         memory_type_index: meta.memory_type_index,

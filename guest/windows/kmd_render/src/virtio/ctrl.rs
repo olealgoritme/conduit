@@ -80,8 +80,8 @@ use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
     VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
     VirtioGpuResourceMapBlob, VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
-    VirtioGpuRespCapsetInfo, VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob,
-    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY,
+    VirtioGpuRespCapsetInfo, VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob, HeliosSetCursorBlob,
+    HELIOS_CMD_SET_CURSOR_BLOB, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY,
     VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, VIRTIO_GPU_CMD_GET_CAPSET_INFO,
     VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
     VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
@@ -1205,6 +1205,21 @@ pub fn disable_scanout_within(
 ) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
     fill_set_scanout_blob(&mut cmd, 0, 0, 0, 0, 0, 0);
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
+}
+
+/// `HELIOS_CMD_SET_CURSOR_BLOB`: the hardware cursor's image, or its hiding
+/// (`ddi::hw_cursor`; docs/SCANOUT.md "Hardware cursor, Windows guests"). `cmd.hdr` is filled
+/// here. Waits at most `timeout_ms`: it runs inside `DxgkDdiSetPointerShape` /
+/// `SetPointerPosition`, which must not hang the desktop on a wedged host. PASSIVE_LEVEL only.
+pub fn set_cursor_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    mut cmd: HeliosSetCursorBlob,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
+    cmd.hdr = VirtioGpuCtrlHdr::zeroed();
+    cmd.hdr.type_ = HELIOS_CMD_SET_CURSOR_BLOB;
     ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 

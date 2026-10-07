@@ -61,6 +61,7 @@ pub mod present_foreign;
 pub mod onscanout;
 pub mod blt_async;
 pub mod guest_blob;
+pub mod hw_cursor;
 pub mod msi;
 pub mod paging;
 pub mod shared_placeholder;

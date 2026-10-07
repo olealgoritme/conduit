@@ -1373,6 +1373,22 @@ unsafe fn dxgkddi_present_inner(
         // picture and the flip's DMA fence retires normally. An ordinary allocation that is not
         // registered still fails (`PBFlip` 0xE6).
         let route = crate::ddi::present_foreign::flip_route(adapter, registered.is_some(), &source);
+        // `IndepFlip` census (`ddi/indep_flip.rs`): one DMA-contract flip; and when this Present
+        // answers it without arming the worker, its verdict is counted here (an armed flip is
+        // counted by the worker). Nothing when the knob is off.
+        let idf_mode = crate::ddi::indep_flip::mode();
+        if idf_mode.is_on() {
+            crate::ddi::indep_flip::note_arm_dma();
+            if !matches!((route, registered), (FlipRoute::Arm { .. }, Some(_))) {
+                crate::ddi::indep_flip::count_dma_unarmed(
+                    &source,
+                    registered.is_some(),
+                    flip_source.physical_address(),
+                    adapter.is_some_and(|a| a.display_half()),
+                    adapter.map_or((0, 0), |a| a.display_mode()),
+                );
+            }
+        }
         // FLIP COMPLETION (`helios_kmd_logic::flip_completion`, `docs/zero-copy-present.md`). A
         // flip this Present answers without arming anything (the counted skip of a foreign
         // allocation, or the failure of a HOLLOW one: no resource id, or a non-direct allocation
@@ -1397,6 +1413,24 @@ unsafe fn dxgkddi_present_inner(
         let flip_allocation = match (route, registered) {
             (FlipRoute::Arm { .. }, Some(handle)) => handle,
             _ if keep_flip => {
+                return unsafe {
+                    present_flip_kept(
+                        args,
+                        present_allocations,
+                        flip_source.physical_address(),
+                        present_stream_boundary,
+                        present_arm,
+                        adapter,
+                        src_info,
+                        dst_info,
+                    )
+                };
+            }
+            // `IndepFlip=2`: under independent flip this is an application's buffer dxgkrnl chose
+            // to flip, and a flip dxgkrnl issued COMPLETES (`docs/independent-flip.md` 4.1): a
+            // kept picture instead of failing the Present. Off and 1 fail it as always.
+            _ if helios_kmd_logic::independent_flip::keeps_unregistered_dma_flip(idf_mode) => {
+                crate::ddi::indep_flip::note_enforced_keep();
                 return unsafe {
                     present_flip_kept(
                         args,
@@ -2079,10 +2113,21 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_position(
     }
     // SetPointerPosition's legal set does NOT include STATUS_NOT_SUPPORTED — an
     // illegal return here is logged as a driver bug during the modeset (AzureTriage,
-    // 36th session). With the display half up, accept the (software-cursor) position
-    // as a no-op; render-only never receives this call.
+    // 36th session). With the display half up the hardware cursor takes it
+    // (`ddi::hw_cursor`; a no-op that succeeds when no pointer was reported, the
+    // software cursor); render-only never receives this call.
     if unsafe { display_half_on(_adapter) } {
-        STATUS_SUCCESS
+        if position.is_null() {
+            return STATUS_SUCCESS;
+        }
+        // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
+        // valid for the call, at PASSIVE.
+        unsafe {
+            crate::ddi::hw_cursor::set_pointer_position(
+                &*(_adapter as *const AdapterContext),
+                &*position,
+            )
+        }
     } else {
         STATUS_NOT_SUPPORTED
     }
@@ -2096,10 +2141,19 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_shape(
     if !shape.is_null() {
         crate::diag::record(0x1311_0000 | unsafe { (*shape).VidPnSourceId & 0xFFFF });
     }
-    // As with SetPointerPosition: NOT_SUPPORTED is illegal for this DDI. Accept as a
-    // no-op with the display half up (the OS software-composes the cursor).
+    // As with SetPointerPosition: NOT_SUPPORTED is illegal for this DDI. With the display
+    // half up the hardware cursor takes it (`ddi::hw_cursor`): success when the host shows the
+    // shape, STATUS_UNSUCCESSFUL when dxgkrnl must draw it in software, and the old no-op
+    // success when no pointer was reported.
     if unsafe { display_half_on(_adapter) } {
-        STATUS_SUCCESS
+        if shape.is_null() {
+            return STATUS_SUCCESS;
+        }
+        // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
+        // valid for the call, at PASSIVE.
+        unsafe {
+            crate::ddi::hw_cursor::set_pointer_shape(&*(_adapter as *const AdapterContext), &*shape)
+        }
     } else {
         STATUS_NOT_SUPPORTED
     }
@@ -2291,6 +2345,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     let primary_flags = unsafe { (*address).Flags.__bindgen_anon_1.Value };
     // S-0a: count the flip flags this DDI ignores (atomics only, legal at DIRQL).
     crate::ddi::scanout_trace::note_set_vidpn_flags(primary_flags);
+    // `IndepFlip` census: one MMIO-contract flip (atomics only; nothing when the knob is off).
+    crate::ddi::indep_flip::note_arm_mmio();
     // `FlipIss` (`ddi::stall_diag`): a flip dxgkrnl issued, recorded as the newest for the
     // watchdog. Atomics only, legal at DIRQL. Before anything below can publish or raise the gate.
     crate::ddi::stall_diag::note_flip_issued(primary_address);
@@ -3596,6 +3652,11 @@ unsafe fn program_vidpn_source_inner(
         crate::diag::record_named_bytes(b"SaHi", (source.primary_address >> 32) as u32);
         crate::diag::record_named_bytes(b"SaFlg", source.primary_flags);
     }
+    // `IndepFlip` census (`ddi/indep_flip.rs`): every resolved flip source is judged once here,
+    // before any arm. A foreign source's verdict waits for the arm's answer below (`idf_pending`).
+    // Nothing when the knob is off; no arm below reads it.
+    let idf_pending =
+        crate::ddi::indep_flip::worker_pre(&source, (width, height), (mode_w, mode_h));
     if width != mode_w || height != mode_h {
         return Err(ScanoutReject::Extent);
     }
@@ -3615,13 +3676,22 @@ unsafe fn program_vidpn_source_inner(
         ) {
             Programmed::NotOurs => rm_flip::other_source(adapter),
             Programmed::Ok => {
+                if let Some(p) = idf_pending {
+                    p.finish(true);
+                }
                 // The screen's source is the KMD's own primary: a foreign allocation shown
                 // by `ForeignFlip` before it is forgotten (one load when it shows nothing).
                 crate::virtio::foreign_flip::other_source(adapter);
                 trace.target_resource = source.resource_id;
                 return Ok(ScanoutOutcome::Programmed);
             }
-            Programmed::BadLayout => return Err(ScanoutReject::Layout),
+            Programmed::BadLayout => {
+                if let Some(p) = idf_pending {
+                    p.finish(false);
+                }
+                return Err(ScanoutReject::Layout);
+            }
+            // Not counted: the retry runs this function again and is counted then.
             Programmed::Retry => return Err(ScanoutReject::SetFailed),
         }
     }
@@ -3642,6 +3712,9 @@ unsafe fn program_vidpn_source_inner(
             height,
             source.direct_scanout,
         );
+        if let Some(p) = idf_pending {
+            p.finish(matches!(arm, FfProgrammed::Ok));
+        }
         match arm {
             FfProgrammed::NotOurs | FfProgrammed::Refused => {
                 // FLIP COMPLETION (`helios_kmd_logic::flip_completion`, `docs/zero-copy-present.md`).
