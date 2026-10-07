@@ -78,17 +78,26 @@ None of this can be switched off from the command line.
 - **Anything outside `--caps`.** No CUDA (`nvidia-uvm`) without `compute`, no
   encoders without `video`, no 3D without `graphics`.
 - **VRAM past `--vram-limit-mib`.** Allocations over the limit fail, and the
-  guest sees the limit as the card's memory size. When the NVIDIA card has a
-  monitor connected, `conduit` passes a limit by default (the smaller of half
-  the card's memory and its memory minus 3 GiB; 4 GiB when the card's memory
-  size is not known), so a guest cannot fill the memory the desktop needs.
-  `gpu.vram_limit_mib` (`auto`, `off` or MiB) overrides it.
-- **Blocking calls.** Two guest-supplied waits are bounded before they reach
-  the driver, because RM holds a GPU lock while it waits: the timeout of
-  `NV_ESC_RM_IDLE_CHANNELS` and of `SEMSURF_FENCE_CREATE` (10 s).
-- **Safe mode.** `CONDUIT_SAFE_MODE=1` (or `conduit config set gpu.safe_mode
-  true`) tightens both: a 2 GiB video-memory limit and 1 s on those waits.
-  It is meant for the first run on a new GPU or driver.
+  guest sees the limit as the card's memory size. With no setting, `conduit`
+  passes a limit only in safe mode (below) and only when the NVIDIA card has a
+  monitor connected: the smaller of half the card's memory and its memory
+  minus 3 GiB (4 GiB when the card's memory size is not known), so a guest
+  cannot fill the memory the desktop needs. On the tested setup nothing is
+  passed. `gpu.vram_limit_mib` overrides it either way: MiB, `auto` (that
+  default whenever a monitor is connected) or `off`.
+- **Blocking calls (safe mode only).** Two guest-supplied waits can be
+  bounded before they reach the driver, because RM holds a GPU lock while it
+  waits: the timeout of `NV_ESC_RM_IDLE_CHANNELS` and of
+  `SEMSURF_FENCE_CREATE`. In safe mode both are clamped to 1 s; otherwise
+  they are forwarded exactly as the guest sent them.
+- **Safe mode.** A 2 GiB video-memory limit (a lower explicit one stays) and
+  the 1 s clamp above. `gpu.safe_mode` is `auto`, `true` or `false`
+  (default `auto`; `CONDUIT_SAFE_MODE=1` or `0` in the environment of the
+  command wins). `auto` follows one rule, applied to the loaded driver: the
+  open kernel modules, release 580 or newer, are what Conduit was built and
+  tested on, so safe mode is off there and nothing changes; with the closed
+  modules or a branch older than 580 it is on. `conduit doctor` says which
+  and why.
 
 The backend counts refusals and logs the totals when the VM exits
 (`conduit logs NAME`).

@@ -27,12 +27,12 @@ const KEYS: &[(&str, &[&str], &str)] = &[
     (
         "gpu.vram_limit_mib",
         &["auto", "off"],
-        "MiB of video memory a guest may hold, or off, from the next backend start (default auto: a cap when the NVIDIA card drives a monitor; also any number of MiB)",
+        "MiB of video memory a guest may hold, or off, from the next backend start (unset: a cap when safe mode is on and the NVIDIA card drives a monitor; auto: that cap whatever the driver; off: none; also any number of MiB)",
     ),
     (
         "gpu.safe_mode",
-        &["true", "false"],
-        "start backends in safe mode (CONDUIT_SAFE_MODE=1): small video-memory cap and 1 s blocking timeouts, from the next backend start (default false)",
+        &["auto", "true", "false"],
+        "safe mode (CONDUIT_SAFE_MODE=1): a 2 GiB video-memory cap and 1 s blocking timeouts, from the next backend start (default auto: on for a driver Conduit is untested with, off for open modules 580 or newer)",
     ),
     (
         "gpu.window_mib",
@@ -151,7 +151,10 @@ pub fn venus_guest_blobs() -> bool {
 /// `gpu.vram_limit_mib`: how the backend's video-memory cap is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VramSetting {
-    /// A default when the card drives a monitor (protect.rs).
+    /// Unset: the default cap when safe mode is on and the card drives a
+    /// monitor, nothing otherwise (protect.rs).
+    Default,
+    /// The default cap whenever the card drives a monitor.
     Auto,
     /// No cap.
     Off,
@@ -165,23 +168,35 @@ pub fn vram_limit_mib() -> VramSetting {
 fn vram_setting_of(m: &Map<String, Value>) -> VramSetting {
     match m.get("gpu.vram_limit_mib").and_then(Value::as_str) {
         Some("off") => VramSetting::Off,
+        Some("auto") => VramSetting::Auto,
         Some(s) => s
             .parse::<u64>()
             .ok()
             .filter(|n| *n >= 1)
-            .map_or(VramSetting::Auto, VramSetting::Mib),
-        None => VramSetting::Auto,
+            .map_or(VramSetting::Default, VramSetting::Mib),
+        None => VramSetting::Default,
     }
 }
 
-/// Safe mode for every backend this CLI starts: `gpu.safe_mode`, or
-/// `CONDUIT_SAFE_MODE=1` in the environment of the command.
-pub fn safe_mode() -> bool {
-    std::env::var("CONDUIT_SAFE_MODE").as_deref() == Ok("1")
-        || load()
-            .get("gpu.safe_mode")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+/// `gpu.safe_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeSetting {
+    /// On for a driver Conduit is untested with (protect.rs).
+    Auto,
+    On,
+    Off,
+}
+
+pub fn safe_setting() -> SafeSetting {
+    safe_setting_of(&load())
+}
+
+fn safe_setting_of(m: &Map<String, Value>) -> SafeSetting {
+    match m.get("gpu.safe_mode") {
+        Some(Value::Bool(true)) => SafeSetting::On,
+        Some(Value::Bool(false)) => SafeSetting::Off,
+        _ => SafeSetting::Auto,
+    }
 }
 
 /// `gpu.window_mib` as a number; `None` for `auto` (unset, or set to auto).
@@ -212,16 +227,31 @@ mod tests {
     #[test]
     fn vram_limit_setting_reads_auto_off_and_numbers() {
         let mut m = Map::new();
-        assert_eq!(vram_setting_of(&m), VramSetting::Auto);
+        assert_eq!(vram_setting_of(&m), VramSetting::Default);
         for (v, want) in [
             ("auto", VramSetting::Auto),
             ("off", VramSetting::Off),
             ("4096", VramSetting::Mib(4096)),
-            ("0", VramSetting::Auto),
-            ("lots", VramSetting::Auto),
+            ("0", VramSetting::Default),
+            ("lots", VramSetting::Default),
         ] {
             m.insert("gpu.vram_limit_mib".into(), Value::String(v.into()));
             assert_eq!(vram_setting_of(&m), want, "{v}");
+        }
+    }
+
+    #[test]
+    fn safe_mode_setting_reads_auto_true_false() {
+        let mut m = Map::new();
+        assert_eq!(safe_setting_of(&m), SafeSetting::Auto);
+        for (v, want) in [
+            (Value::Bool(true), SafeSetting::On),
+            (Value::Bool(false), SafeSetting::Off),
+            (Value::String("auto".into()), SafeSetting::Auto),
+            (Value::String("maybe".into()), SafeSetting::Auto),
+        ] {
+            m.insert("gpu.safe_mode".into(), v.clone());
+            assert_eq!(safe_setting_of(&m), want, "{v}");
         }
     }
 

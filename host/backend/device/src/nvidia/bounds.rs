@@ -8,20 +8,16 @@
 //! - `DRM_NVIDIA_SEMSURF_FENCE_CREATE` carries `timeout_ms`, after which the
 //!   host fence signals with an error.
 //!
-//! Both are clamped to a ceiling before they are forwarded; a request under the
-//! ceiling is forwarded byte for byte. A timeout of 0 is left alone: for the
-//! fence it means "the driver's default" (5000 ms, `nvidia-drm-ioctl.h`), and
-//! for IDLE_CHANNELS it is RM's own default.
-//!
-//! # The ceilings
-//!
-//! The normal ones are generous on purpose: the driver's own default fence
-//! timeout is 5 s, so no client that leaves the default is touched and one that
-//! asks for twice that still gets it. IDLE_CHANNELS is clamped to 10 s, and
-//! its field is taken to be in microseconds, as RM's timeout fields are (the
-//! open source holds only the plumbing, not the unit; a wrong guess makes the
-//! ceiling looser, never tighter than intended). Safe mode
-//! (`CONDUIT_SAFE_MODE=1`) uses 1 s for both.
+//! Normally both are forwarded byte for byte, as the guest sent them: that is
+//! what Conduit was built and tested on. In safe mode (`CONDUIT_SAFE_MODE=1`,
+//! which the CLI sets for a driver it is untested with) both are clamped to
+//! 1 s, so a guest cannot hold the host's GPU group lock or a fence for long.
+//! A timeout of 0 is left alone either way: for the fence it means "the
+//! driver's default" (5000 ms, `nvidia-drm-ioctl.h`), and for IDLE_CHANNELS it
+//! is RM's own default. IDLE_CHANNELS' field is taken to be in microseconds,
+//! as RM's timeout fields are (the open source holds only the plumbing, not
+//! the unit; a wrong guess makes the ceiling looser, never tighter than
+//! intended).
 
 /// `NVOS30_PARAMETERS::timeout`: four u32 (hClient, hDevice, hChannel,
 /// numChannels) to 16, three 8-byte pointers to 40, `flags` at 40, `timeout`
@@ -37,9 +33,10 @@ pub struct Bounds {
 }
 
 impl Bounds {
+    /// No ceiling: nothing is changed.
     pub const NORMAL: Bounds = Bounds {
-        idle_channels_us: 10_000_000,
-        fence_timeout_ms: 10_000,
+        idle_channels_us: u32::MAX,
+        fence_timeout_ms: u32::MAX,
     };
     pub const SAFE: Bounds = Bounds {
         idle_channels_us: 1_000_000,
