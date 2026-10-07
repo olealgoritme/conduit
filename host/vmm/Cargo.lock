@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.1.4"
+
+[[package]]
 name = "acpi_tables"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -682,6 +686,7 @@ checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
 name = "virtio-devices"
 version = "0.1.4"
 dependencies = [
+ "abi",
  "anyhow",
  "displaydoc",
  "io-uring",

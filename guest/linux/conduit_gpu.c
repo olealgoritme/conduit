@@ -62,6 +62,7 @@
 #include "nvgpu_pcimap.h"
 #include "nvgpu_devinfo.h"
 #include "nvgpu_rmctrl.h"
+#include "nvgpu_version.h"
 
 /*
  * module_kset lives in kernel/module/sysfs.c and is NOT exported to modules,
@@ -3982,9 +3983,9 @@ static const struct file_operations nvgpu_uvm_fops = {
  * backend picks it the same way.
  */
 static u32 nvgpu_nvkms_register_surface(const char *version) {
-  unsigned int maj = 0, min = 0, pat = 0;
+  u32 maj, min, pat;
 
-  if (sscanf(version, "%u.%u.%u", &maj, &min, &pat) < 2)
+  if (!nvgpu_parse_version(version, &maj, &min, &pat))
     return 16;
   return (maj >= 580 && maj < 615) ? 17 : 16;
 }

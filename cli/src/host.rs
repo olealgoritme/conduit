@@ -1,6 +1,7 @@
 //! Facts about the host: NVIDIA driver, supported driver versions, QEMU.
 
 use crate::paths;
+use abi::version::DriverVersion;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -9,19 +10,13 @@ pub struct Driver {
     pub open: bool,
 }
 
-/// Parse /proc/driver/nvidia/version.
+/// Parse /proc/driver/nvidia/version: the rule is `abi::version::parse_proc_version`.
 pub fn parse_driver(text: &str) -> Option<Driver> {
-    let line = text.lines().find(|l| l.starts_with("NVRM version:"))?;
-    let open = line.contains("Open Kernel Module");
-    let version = line
-        .split_whitespace()
-        .find(|w| {
-            w.split('.').count() >= 2
-                && w.split('.')
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        })?
-        .to_string();
-    Some(Driver { version, open })
+    let p = abi::version::parse_proc_version(text)?;
+    Some(Driver {
+        version: p.raw,
+        open: p.open,
+    })
 }
 
 pub fn driver() -> Option<Driver> {
@@ -31,14 +26,10 @@ pub fn driver() -> Option<Driver> {
 /// "565.77" and "565.77.00" are one release: a missing patch is 0, as in the
 /// backend's `DriverVersion::parse` and the table file names (`v565_77_00`).
 pub fn same_release(a: &str, b: &str) -> bool {
-    fn key(v: &str) -> Vec<u64> {
-        let mut k = version_key(v);
-        while k.len() < 3 {
-            k.push(0);
-        }
-        k
+    match (DriverVersion::parse(a), DriverVersion::parse(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
     }
-    key(a) == key(b)
 }
 
 /// Why a loaded driver is outside what Conduit was built and tested on: the
@@ -55,10 +46,7 @@ pub fn untested_because(d: &Driver) -> Option<&'static str> {
 }
 
 pub fn major(v: &str) -> u32 {
-    v.split('.')
-        .next()
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(0)
+    DriverVersion::parse(v).map_or(0, |v| v.major)
 }
 
 /// Driver releases the backend accepts: those with exact ABI tables.
@@ -216,6 +204,22 @@ mod tests {
         );
         assert_eq!(parse_driver("garbage"), None);
         assert_eq!(major("610.57.04"), 610);
+    }
+
+    /// The lines `abi::version` and the backend and guest readers are tested
+    /// on: the CLI must say the same about each.
+    #[test]
+    fn driver_follows_the_shared_fixture() {
+        let fixture = include_str!("../../host/backend/gen/fixtures/proc_version.tsv");
+        for line in fixture.lines().filter(|l| !l.starts_with('#')) {
+            let (text, want) = line.split_once('\t').unwrap();
+            let got = parse_driver(&text.replace("\\n", "\n"))
+                .map(|d| format!("{} {}", d.version, if d.open { "open" } else { "closed" }));
+            // "<canonical> <open|closed> <raw>" becomes "<raw> <open|closed>".
+            let f: Vec<&str> = want.split(' ').collect();
+            let want = (f.len() == 3).then(|| format!("{} {}", f[2], f[1]));
+            assert_eq!(got, want, "{text:?}");
+        }
     }
 
     #[test]

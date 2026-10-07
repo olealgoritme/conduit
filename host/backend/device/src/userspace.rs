@@ -87,20 +87,13 @@ pub const LOADED_VERSION_PATH: &str = "/proc/driver/nvidia/version";
 /// NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.99.02  Wed Aug 26 ...
 /// ```
 ///
-/// `None` when the file is absent (no driver loaded) or holds nothing
-/// version-shaped. The caller decides what that means: it is normal when
+/// `None` when the file is absent (no driver loaded) or is not in a form
+/// `abi::version::parse_proc_version` accepts. The caller decides what that means: it is normal when
 /// planning a share on a machine with no GPU, and a reason to stop when about
 /// to stage one for a guest.
 pub fn loaded_driver_version(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    // The NVRM line first, where a two-part release (`565.77`) is a version:
-    // the GCC line under it has a three-part number that would win otherwise.
-    // Failing that, any line with a three-part number -- the line has been
-    // reworded across releases, while the dotted version on it has not.
-    text.lines()
-        .find(|l| l.contains("NVRM"))
-        .and_then(|l| dotted_number(l, 1))
-        .or_else(|| text.lines().find_map(version_in))
+    abi::version::parse_proc_version(&text).map(|p| p.raw)
 }
 
 /// The driver version the resolved files belong to, taken from the library
@@ -127,13 +120,6 @@ pub fn staged_driver_version(found: &[Resolved]) -> Option<String> {
         .into_iter()
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
         .map(|(v, _)| v)
-}
-
-/// The first `N.N.N` (or longer) dotted number in `s`, where every component
-/// is digits. Written out rather than pulled from a regex crate: this crate
-/// carries no such dependency, and the shape is fixed.
-fn version_in(s: &str) -> Option<String> {
-    dotted_number(s, 2)
 }
 
 /// The first dotted number in `s` with at least `min_dots` dots, every
@@ -907,9 +893,7 @@ pub fn soname(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Entry, FileKind, Resolved, loaded_driver_version, staged_driver_version, version_in,
-    };
+    use super::{Entry, FileKind, Resolved, loaded_driver_version, staged_driver_version};
     use std::collections::BTreeSet as TestSet;
 
     fn resolved(host_name: &str) -> Resolved {
@@ -968,21 +952,33 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The same lines `abi::version` is tested on: the loaded version is
+    /// whatever `parse_proc_version` says, with no looser fallback. A file that
+    /// holds only a GCC line has no driver version (it used to yield the
+    /// compiler's `13.3.0`).
     #[test]
-    fn the_gcc_version_on_the_second_line_is_not_mistaken_for_the_driver() {
-        // "gcc version 15.2.0" is dotted and comes second; the driver version
-        // is on the first line, so a find_map over lines must take that one.
+    fn loaded_version_follows_the_shared_fixture() {
+        let dir = std::env::temp_dir().join(format!("nvgpu-fix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("version");
+        let fixture = include_str!("../../gen/fixtures/proc_version.tsv");
+        for line in fixture.lines().filter(|l| !l.starts_with('#')) {
+            let (text, want) = line.split_once('\t').unwrap();
+            std::fs::write(&p, text.replace("\\n", "\n")).unwrap();
+            let want = want.split(' ').nth(2).map(String::from);
+            assert_eq!(loaded_driver_version(&p), want, "{text:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_named_for_a_release_gives_its_version() {
         assert_eq!(
-            version_in("GCC version:  gcc version 15.2.0 (Ubuntu)"),
-            Some("15.2.0".into())
+            dotted_number("libcuda.so.595.99.02", 1),
+            Some("595.99.02".into())
         );
-        assert_eq!(
-            version_in("libcuda.so.1"),
-            None,
-            "so.1 is not a driver version"
-        );
-        assert_eq!(version_in("libcuda.so.595.99.02"), Some("595.99.02".into()));
-        assert_eq!(version_in("no digits here"), None);
+        assert_eq!(dotted_number("libcuda.so.565.77", 1), Some("565.77".into()));
+        assert_eq!(dotted_number("libcuda.so.1", 1), None);
     }
 
     #[test]

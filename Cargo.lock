@@ -160,6 +160,7 @@ dependencies = [
 name = "conduit"
 version = "0.1.4"
 dependencies = [
+ "abi",
  "anyhow",
  "clap",
  "conduit-trace",

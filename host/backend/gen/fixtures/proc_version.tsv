@@ -1,0 +1,19 @@
+# /proc/driver/nvidia/version -> expected. text<TAB>expected; \n is a newline.
+# expected: none | <version> <open|closed> <raw release as printed>.
+# Read by abi::version (Rust) and guest/linux/test/version_test.c (C).
+NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  610.57.04  Release Build  (dvs-builder@U22)  Wed Jul 29 02:45:17 UTC 2026\nGCC version:  gcc version 13.3.0\n	610.57.04 open 610.57.04
+NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09  Release Build  (root@)  \nGCC version:  gcc version 16.2.1 20260810 (GCC)\n	615.71.09 open 615.71.09
+NVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77  Wed Oct 23 12:00:00 UTC 2024\nGCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n	565.77.00 closed 565.77
+NVRM version: NVIDIA UNIX x86_64 Kernel Module  550.54.14  Thu Feb 22 01:44:30 UTC 2024\n	550.54.14 closed 550.54.14
+NVRM version: NVIDIA UNIX x86_64 Kernel Module  535.129.03  Sat Oct 28 20:53:36 UTC 2023\nGCC version:  gcc version 12.2.0\n	535.129.03 closed 535.129.03
+NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.178.04  Release Build  (dvs-builder@U22)\n	580.178.04 open 580.178.04
+NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.99.02  Wed Aug 26 05:24:08 UTC 2026\nGCC version:  gcc version 15.2.0 (Ubuntu 15.2.0-16ubuntu1)\n	595.99.02 closed 595.99.02
+NVRM version: NVIDIA UNIX Open Kernel Module for aarch64  595.71.05  Release Build\n	595.71.05 open 595.71.05
+garbage	none
+	none
+NVRM version: NVIDIA UNIX x86_64 Kernel Module  Extra  565.77  Wed Oct 23 12:00:00 UTC 2024\n	none
+NVRM version: NVIDIA UNIX x86_64 Kernel Module  565  Wed Oct 23 12:00:00 UTC 2024\n	none
+NVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77.1.2  Wed Oct 23\n	none
+NVRM version: something else entirely 565.77\n	none
+GCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n	none
+GCC version:  gcc version 13.3.0\nNVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77  Wed\n	565.77.00 closed 565.77
