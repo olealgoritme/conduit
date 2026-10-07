@@ -1177,6 +1177,15 @@ impl Route {
         }
     }
 
+    /// The channel was torn down and its client freed: nothing it ran can still write, and a new
+    /// channel counts its completion values from its own start. Forget the old ring's values and
+    /// any poison that waited for one of them; the strikes stay (M3c-2, `ce_route`).
+    pub fn on_channel_gone(&mut self) {
+        self.submitted = 0;
+        self.producer_fired_ms = None;
+        self.poison = 0;
+    }
+
     /// May the destination's pages be unlocked (eviction, destroy)? Only when no copy can still
     /// write them: nothing outstanding at `completed`.
     pub const fn may_unlock(&self, completed: u64) -> bool {

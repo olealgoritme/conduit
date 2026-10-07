@@ -191,6 +191,11 @@ pub(crate) fn prepare(
     if !knob_on() {
         return;
     }
+    // A destination the copy-engine route holds gets no guest blob (one of the two, never both;
+    // one relaxed load while the route holds nothing).
+    if crate::ddi::ce_present_route::holds(resource_id) {
+        return;
+    }
     let advertised = advertised(adapter);
     note_feature(advertised);
     let foreign_consumer = adapter
@@ -501,6 +506,9 @@ pub(crate) fn before_lease_change(
     guard: &SystemBackingGuard<'_>,
     resource_id: u32,
 ) {
+    // The copy-engine route's descriptor over the same pages first: drained, freed and unpinned
+    // before any lease changes (one relaxed load while the route holds nothing).
+    crate::ddi::ce_present_route::before_lease_change(passive, adapter, guard, resource_id);
     let Some(record) = adapter.system_backings.guest_record(resource_id) else {
         return;
     };
@@ -575,6 +583,8 @@ pub(crate) fn destination_gone(
     guard: &SystemBackingGuard<'_>,
     resource_id: u32,
 ) {
+    // The copy-engine route's record of the destination (one relaxed load without one).
+    crate::ddi::ce_present_route::destination_gone(passive, adapter, guard, resource_id);
     if adapter.system_backings.guest_record(resource_id).is_none() {
         return;
     }

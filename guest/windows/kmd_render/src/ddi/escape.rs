@@ -423,7 +423,16 @@ unsafe fn dxgkddi_escape_inner(
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_NVRM => match owner {
-            Some(owner) => escape_nvrm(passive, adapter, buf, &hdr, owner),
+            Some(owner) => {
+                // `hKmdProcess` of the escaping device: an RM client this escape allocates is
+                // recorded with it (the copy-engine Present route's `h_client` rule).
+                // SAFETY: the runtime supplies our live DeviceContext (non-null: `owner` is
+                // Some) for this Escape.
+                let process = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+                    .map(|d| d.creator_process())
+                    .unwrap_or(0);
+                escape_nvrm(passive, adapter, buf, &hdr, owner, process)
+            }
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_SUBMIT_VENUS_BATCH => match owner {
@@ -1834,12 +1843,13 @@ fn escape_nvrm(
     buf: &mut [u8],
     hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
+    process: usize,
 ) -> NTSTATUS {
     // First, in the owner's own process: unmap the views it still holds of a
     // transport that was stopped (the one thing `StopDevice` could not do for it).
     // One atomic load when there are none.
     crate::virtio::nvrm::reclaim_stale_views(passive, adapter, owner);
-    let st = escape_nvrm_op(passive, adapter, buf, hdr, owner);
+    let st = escape_nvrm_op(passive, adapter, buf, hdr, owner, process);
     nvrm_publish_counters_if_due(adapter);
     // No HPD worker (render-only `DisplayHalf=0`, or its creation failed): nobody
     // else would ever run the mirror, so do it here. Still rate limited by the
@@ -2006,6 +2016,7 @@ fn escape_nvrm_op(
     buf: &mut [u8],
     hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
+    process: usize,
 ) -> NTSTATUS {
     let head_size = size_of::<HeliosNvrmHeader>();
     if buf.len() < head_size || (hdr.size as usize) < head_size {
@@ -2086,7 +2097,7 @@ fn escape_nvrm_op(
             wire.write_back(&caps);
             STATUS_SUCCESS
         }
-        HELIOS_NVRM_OP_FORWARD => nvrm_forward(passive, adapter, buf, hdr, owner, head),
+        HELIOS_NVRM_OP_FORWARD => nvrm_forward(passive, adapter, buf, hdr, owner, process, head),
         // Valid in the ABI, not implemented by this KMD build: QUERY_CAPS says so.
         HELIOS_NVRM_OP_MMAP => nvrm_mmap(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_MUNMAP => nvrm_munmap(passive, adapter, buf, hdr, owner, epoch),
@@ -2567,12 +2578,14 @@ fn nvrm_unpin(
 }
 
 /// `HELIOS_NVRM_OP_FORWARD`: validate the layout, forward, report.
+#[allow(clippy::too_many_arguments)]
 fn nvrm_forward(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
     hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
+    process: usize,
     head: HeliosNvrmHeader,
 ) -> NTSTATUS {
     use crate::virtio::nvrm::{self, Refusal};
@@ -2627,6 +2640,7 @@ fn nvrm_forward(
         passive,
         adapter,
         owner,
+        process,
         req,
         resp,
         u64::from(timeout_ms),

@@ -33,7 +33,7 @@ mod segments;
 mod tracking;
 
 pub(crate) use backing::{
-    SystemBackingGuard, SystemBackingReader, SystemBackingTable, MAX_SYSTEM_BACKING_RANGES,
+    GuestPin, SystemBackingGuard, SystemBackingReader, SystemBackingTable, MAX_SYSTEM_BACKING_RANGES,
 };
 pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard, WITH_VIRTIO_TORN};
 pub(crate) use read_ledger::{

@@ -87,17 +87,28 @@ unsafe fn read_record(command: *const u8, cmd_len: usize, offset: usize) -> Tail
     }
 }
 
-/// TODO(M3c-2): the `h_client` rule. A record's `semaphore.h_client` and `source.h_client` must be
-/// RM clients the PRESENTING process created itself (the `NvDupHarden` rule). The KMD records
-/// clients per NVRM owner (`nvrm_clients::ClientTable`, keyed by the escape device), not per
-/// process, and keeps no owner-to-process map, so this cannot be answered yet and says
-/// [`ClientCheck::Unknown`]. The shadow mode of M3c-1 (`RmCopyEngine` = 3, a diagnostic) dups on
-/// that answer and counts it (`CeRecClient`); the route of M3c-2 must answer it first. Until then
-/// a process that knows (or guesses) another process's client and memory handles could have the
-/// KMD read that memory into its scratch buffer in shadow mode; nothing of it reaches any process
-/// (the scratch is the KMD's, only counters come out), see `docs/rm-copy-engine-present.md` 14.
-fn record_client_owned_by_presenter(_process: usize, _h_client: u32) -> ClientCheck {
-    ClientCheck::Unknown
+/// The `h_client` rule (M3c-2): a record's `semaphore.h_client` and `source.h_client` must be RM
+/// clients the PRESENTING process created itself. What is compared: `process`, the
+/// `hKmdProcess` token of the D3DKMT device that owns the presenting context
+/// (`ContextHandleRef::creator_process`), against the token the KMD recorded with `h_client`
+/// when it forwarded the `NV_ESC_RM_ALLOC` of that client's root object: the escape's own device
+/// (`DeviceHandleRef::creator_process` of `hDevice`, `ddi/escape.rs`), stored in the client table
+/// beside the owner (`nvrm_clients::ClientTable::process_of`). One process has one
+/// `hKmdProcess` for all its devices (the token the present-stream registration already uses
+/// to tie the ICD's device to the runtime's), and a client leaves the table with its free, its
+/// file's close, its device's destruction and the transport, so a token of a dead process names
+/// no client. `Unknown` (refused by the route) whenever the table cannot say: hardening off
+/// (`NvDupHarden` 0 records nothing), a full table, no presenter, no transport. Spinlock only.
+pub(crate) fn record_client_owned_by_presenter(
+    adapter: &crate::adapter::AdapterContext,
+    process: usize,
+    h_client: u32,
+) -> ClientCheck {
+    let recorded = adapter
+        .with_virtio(|v| v.nvrm_client_process(h_client))
+        .ok()
+        .flatten();
+    cr::client_check(process, recorded)
 }
 
 /// A `HERF` / `HEPR` Render whose RM fence `tail` went to `attach_or_take_fence_tail`: read the
@@ -151,15 +162,13 @@ pub(crate) unsafe fn note_render(
                 crate::diag::record_named_qword(b"CeRecMod", record.source.modifier);
                 MODIFIER_WRITTEN.store(record.source.modifier, Ordering::Relaxed);
             }
-            let process = context.creator_process().unwrap_or(0);
-            let semaphore = record_client_owned_by_presenter(process, record.semaphore.h_client);
-            let source = record_client_owned_by_presenter(process, record.source.h_client);
-            // The shadow mode (`RmCopyEngine` = 3) dups what the record names although the rule
-            // above cannot be answered: counted, once per record (`CeRecClient`). With any
-            // other knob value this is one relaxed load. A `NotOwned` client is a TODO of M3c-2
-            // (the route), which must refuse it and must not run on `Unknown`.
+            // The h_client rule is the route's (`record_client_owned_by_presenter`, at the Present
+            // that would use the record, `ddi/ce_present_route.rs`): the stash keeps what the
+            // producer sent. The shadow mode (`RmCopyEngine` = 3, diagnostic only) dups what a
+            // record names WITHOUT that check: every record it can use is used on trust and
+            // counted once (`CeRecClient`); with any other knob value this is one relaxed load.
             let shadow = crate::virtio::rm_client::ce_channel::shadow_mode();
-            if cr::counts_unknown_client(shadow, semaphore, source) {
+            if cr::counts_unknown_client(shadow, cr::ClientCheck::Unknown, cr::ClientCheck::Unknown) {
                 let n = CLIENT_UNKNOWN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                 if cr::publish_now(n) {
                     crate::diag::record_named_bytes(b"CeRecClient", n);

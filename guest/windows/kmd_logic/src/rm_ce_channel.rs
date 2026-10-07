@@ -2128,11 +2128,13 @@ mod tests {
                     assert!(!text.contains("b\"RmCopyEngine\""), "{s} spells the knob name");
                     // The record's writer (M3c-0) spells only its own list, which
                     // `ce_record`'s exact-list test checks; none of these names.
-                    // So do the dup cache's and the shadow mode's (M3c-1).
+                    // So do the other Ce writers' lists (the record, the dup cache, the shadow mode and
+                    // the Present route: M3c-0, M3c-1, M3c-2).
                     let mut other_writers = crate::ce_record::WRITERS
                         .iter()
                         .chain(crate::ce_dup::WRITERS.iter())
-                        .chain(crate::ce_shadow::WRITERS.iter());
+                        .chain(crate::ce_shadow::WRITERS.iter())
+                        .chain(crate::ce_route::WRITERS.iter());
                     if other_writers.any(|w| s.ends_with(w)) {
                         for n in COUNTERS {
                             assert!(!text.contains(&std::format!("b\"{n}\"")), "{s} spells {n}");

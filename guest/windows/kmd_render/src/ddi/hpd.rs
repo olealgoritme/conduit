@@ -225,6 +225,9 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         let mirror = (optional
             && (super::escape::nvrm_publish_pending() || super::dwm_restart::pending()))
         .then_some(NVRM_PUBLISH_RECHECK_100NS);
+        // `RmCopyEngine` 1: a short poll while copy-engine copies are in flight or jobs wait to
+        // be prepared (the mirror's slot, the earlier of the two; one relaxed load otherwise).
+        let mirror = crate::ddi::ce_present_route::fold_due(optional, mirror);
         // While the heartbeat is meant to run the worker wakes 4 times a second even when idle,
         // to check it (`AdapterContext::vsync_watch`): an MMIO flip is woken by the heartbeat
         // alone, so a dead heartbeat and a sleeping worker would hold the flip for ever.
@@ -351,7 +354,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // and have its exact producer stream retire. This call merely consumes
         // those already-signalled edges; it never polls a producer.
         stall_diag::hpd_enter(site::WINDOWED_BLT);
+        // `RmCopyEngine` 1 (one relaxed load otherwise): the copy-engine route's bring-up,
+        // completions and job preparation before the dispatch, a short settle after it.
+        crate::ddi::ce_present_route::service(passive, adapter);
         crate::ddi::display::service_windowed_blt(passive, adapter);
+        crate::ddi::ce_present_route::settle_after_dispatch(passive, adapter);
 
         // The KMD's own RM client (`KmdRmClient`, off by default: a no-op then). After
         // the deferred programming above, so a primary bound in this very pass is seen.
