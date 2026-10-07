@@ -2,8 +2,9 @@
 
 Status: sections 0 to 9 are the research (M0) and the M1 tool, which PASSed on a GB202 (async CE, acquire held, verify ok).
 M3a, the host-testable half of the KMD route, is
-sections 10 and 11 (`protocol/src/rm_fence_v3.rs`, `kmd_logic/src/ce_present.rs`); no `kmd_render` code exists yet. M1b, the
-tool's block-linear round trip, is built and has not run yet (10.4). Every claim cites the file or patch it comes
+sections 10 and 11 (`protocol/src/rm_fence_v3.rs`, `kmd_logic/src/ce_present.rs`). M3b, the KMD's own copy-engine channel and
+its hardware self-test (`RmCopyEngine` = 2), is built and has not run yet (11.9, 11.10); the Present route (M3c) is not built.
+M1b, the tool's block-linear round trip, is built and has not run yet (10.4). Every claim cites the file or patch it comes
 from; "unknown" marks what nobody has run, with what would settle it. Host driver release assumed: 610.57.04 (the release
 the host backend runs, `host/backend/gen/src/rmallow/v610_57_04.rs`). GPU: RTX 5090 (GB202) unless Ada is named.
 
@@ -677,7 +678,9 @@ M3a built the pure half: the record (10), and `kmd_logic/src/ce_present.rs` with
 words reproduce `crm_ce_copy_smoke`'s, its block-linear words follow NVK's `nouveau_copy_rect`), the GPFIFO entry and ring
 arithmetic, `source_plan` (the foreign layout rules of `foreign_resource::Layout`, the page kind to map with), the
 per-destination `Route` (decision order, strikes, poison, timeout), the retire rule, the knob `RmCopyEngine` (default 0) and the
-`Ce*` counter names. This section is the plan for the I/O half. Nothing in `kmd_render` exists yet; line numbers are of v343.
+`Ce*` counter names. Sections 11.1 to 11.8 are the plan for the I/O half, written before it; line numbers are of v343. M3b
+built the channel subsystem of 11.2 (without the source/semaphore dup cache and the destination descriptors, which are M3c's)
+and a hardware self-test: what is built and how it differs from the plan and the tool is 11.9, the test procedure 11.10.
 
 ### 11.1 Where the route decision plugs in
 
@@ -840,3 +843,140 @@ How the KMD learns the value advanced, two ways, both reading the CPU mapping of
 
 Naming: the knob is `RmCopyEngine` (section 6 and 9 called it `BltRmCe`; the M3 knob list uses the longer, unambiguous
 name, still within 14 characters).
+
+### 11.9 M3b as built: the channel in the KMD's own RM client
+
+Built, host-tested where pure, type-checked against the stub WDK (`tools/kmd-dev/stubcheck.sh`), never compiled against the
+real WDK and never run:
+
+| file | what |
+|---|---|
+| `kmd_logic/src/rm_ce_channel.rs` | the parameter blocks (device, VA space, TSG, subcontext, channel, copy object, usermode, the controls, `NV50_MEMORY_VIRTUAL`, `MAP_MEMORY_DMA` / `UNMAP_MEMORY_DMA`), pinned by tests to the bytes the tool's own fill code writes (the tool's structs and fill code compiled on the host, every nonzero byte printed: the module docs say how); the memory layout; the engine pick; the generation from the class list; the bring-up stage machine (`Stage`, `BringUp`) and its reverse-order undo (`next_undo`); the service (`Svc`: cold, bringing up, ready, broken, tearing down, cool-down, disabled; `MAX_STRIKES` 3); the deadlines; the self-test rules (`selftest`); `COUNTERS` |
+| `kmd_render/src/virtio/rm_client/ce_channel.rs` | the I/O: `ensure_up` (lazy bring-up), `submit`, `poll`, `teardown`, `retire_for_stop`, `drop_views`, `forget`, the knob and the counters (the plan's `channel.rs`) |
+| `kmd_render/src/virtio/rm_client/ce_selftest.rs` | the self-test of `RmCopyEngine` = 2 (11.10) |
+| hooks | `ddi/hpd.rs` (`ce_channel::service` after `rm_client::service`), `ddi/lifecycle.rs` (`reset_for_start` in `start_generation_mirrors`; `retire_for_stop` in StopDevice after the GuestBlob retire, before the Venus teardown and the transport reset, on the stop budget, and in StartDevice before `retire_transport`), `virtio/rm_client.rs` (the modules; `retire_begin` calls `drop_views`, `forget` calls `forget`), `diag.rs` (`KnobName::new(b"RmCopyEngine")`) |
+
+The plan's `ce_map.rs` (source and timeline dup cache, destination descriptors) and the `CE` lock of `adapter/locks.rs` are
+M3c's: the channel's state is one leaf spinlock of its own (`STATE` in `ce_channel.rs`).
+
+**The knob.** `RmCopyEngine` (service-key REG_DWORD), read at every StartDevice and mirrored as `CeKnob` (the value in force):
+
+| value | does |
+|---|---|
+| 0 (default), and any value not listed | nothing |
+| 1 | reserved for the Present route (M3c); nothing in M3b |
+| 2 | the self-test (11.10), once per transport generation, from the HPD worker |
+
+What runs at 0: StartDevice reads the knob and writes `CeKnob` = 0 (the read and mirror every per-generation knob does); the HPD
+worker pays one relaxed load per pass (`ce_channel::service`); StopDevice and StartDevice pay one relaxed load
+(`retire_for_stop`), `retire_begin` one (`drop_views`), `forget` a reset of plain data under the leaf lock. No RM message, no
+allocation, no other registry value, no bounded section.
+
+**The bring-up** (`CeChStage` names the stage started last, `CeChFail` = `stage << 24 | kind << 16 | code` of a failure):
+
+| stage | what | messages |
+|---|---|---|
+| 1 `Client` | the ring client's bring-up machine (`rm_client::Client`, as `sysmem.rs` drives it) with ONE change: the device is allocated with the tool's parameters (`hClientShare` = the client, 64 KiB big pages, `OPTIONAL_MULTIPLE_VASPACES`) | 11 |
+| 2 `ClassList` | `GPU_GET_CLASSLIST_V2` on the device: the Blackwell channel, copy and usermode classes if listed, else Ada's | 1 |
+| 3 `VaSpace` | `FERMI_VASPACE_A`, index `GPU_DEVICE` | 1 |
+| 4 `Engines` | `GET_ENGINES_V2`, `CE_GET_CAPS_V2` per `COPYn` (a refused query is skipped, as the tool does), the pick | 1 + n |
+| 5, 6 `Usermode`, `UsermodeMap` | `*_USERMODE_A` under the subdevice (`{bBar1Mapping = 1}` from 0xc661 on), its CPU view | 1 + 4 |
+| 7, 8 `Ctl`, `CtlMap` | 8 KiB RM system memory (error notifier at 0, USERD at 4096), its CPU view, zeroed | 1 + 4 |
+| 9, 10, 11 `Ring`, `RingMap`, `RingGpuMap` | 128 KiB RM system memory (GPFIFO at 0, the completion value at 4096, the self-test's producer value at 4160, 128 push slots of 512 B from 8192), its CPU view, its GPU mapping at 0x20_0000_0000 | 1 + 4 + 2 |
+| 12 to 19 | TSG `{COPY(n)}`, subcontext (SYNC), channel (128 entries, `hObjectError` and USERD = the control memory), `BIND`, copy object `{VERSION_1, COPY(n)}`, `SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX`, `GET_WORK_SUBMIT_TOKEN`, `GPFIFO_SCHEDULE {enable}` | 8 |
+| 20 `FirstPush` | `SET_OBJECT` + a WFI release of value 1 (`ce_present`'s words), kicked, polled for 250 ms; the error notifier must be 0 | 0 |
+
+About 40 messages, one 6 s deadline (`BRING_UP_BUDGET_MS`, the sysmem creation budget) for all of them, inside an
+`escape_wait` bounded section so every wait primitive under them obeys it; a stage is not started once StopDevice asked the
+worker to go. A failed stage gives back everything the earlier ones made, in the tool's teardown order (`next_undo`: schedule
+off, the TSG with its children, the ring's GPU mapping, the ring's CPU view, the ring, the control view and memory, the
+doorbell view and object, the VA space, the client's files), on its own 3 s allowance; an undo step that fails is counted
+(`CeChSoft`) and never retried (what RM may still hold goes with the control file's close, or the transport sweep). The
+service then cools down 2 s; three failures in a row disable it for the transport generation. A teardown (after the
+self-test, at StopDevice, at a start without a stop) first takes the channel out of the state (no submitter can reach a view
+it unmaps), releases every acquire it could wait on (the producer value far ahead), gives what was submitted 250 ms to land,
+then runs the same undo.
+
+**Submission and completion.** `submit` (under the leaf lock: plain stores, no RM call) builds `ce_present::present_push`
+into the next slot, writes the GPFIFO entry, a full barrier (`mfence`: the write-combined stores drain), `GP_PUT`, a full
+barrier, the token to the doorbell, and returns the completion value the push releases. `poll` reads the completion value and
+the error notifier through the kernel views and advances `ce_present::Ring`; a set notifier breaks the channel (`CeChanFail`,
+`CeNotify`): nothing is submitted until it is torn down. The first cut polls (option C of 4.3); the event path is M3c's.
+
+**How it differs from the tool** (`crm_ce_copy_smoke`):
+
+| | tool (PASSed on GB202) | KMD (M3b) |
+|---|---|---|
+| client and device | a user-mode client; device `{hClientShare, 64 KiB big pages, OPTIONAL_MULTIPLE_VASPACES}` | a client of its own under the KMD's owner (not the ring client's), the same device parameters: item 5 of 11.7 does not arise |
+| VA space | `FERMI_VASPACE_A` index `GPU_DEVICE` | the same |
+| generation | `--gen` | `GET_CLASSLIST_V2` (nvk-rm 0003's way) |
+| engine | the first async CE | the first async CE with `SYSMEM_WRITE` and not `SHARED`, then one with `SYSMEM_WRITE`, then the tool's rule (7.2) |
+| GPFIFO and push slots | an OS descriptor over process pages | RM system memory, write-combined, CPU view through the RM window (`MmMapIoSpace` write-combined), GPU-mapped snooped with 4 KiB pages |
+| completion value | its own 4 KiB of RM system memory | a page of the ring allocation |
+| error notifier and USERD | 8 KiB RM system memory, cached | 8 KiB RM system memory, write-combined (every view agrees with the host's: no alias, `kmd-rm-client.md` 15.5) |
+| doorbell | the usermode object, `crm_map_memory` through the subdevice, a user-mode store | the same object and the same messages (`RM_MAP_MEMORY` on the subdevice armed on a fresh GPU file, the host's `Mmap`), then `MmMapIoSpace` UNCACHED of that range of the RM window, and the store from kernel mode: item 8 of 11.7, settled by a self-test PASS |
+| GPU VAs | packed from 0x20_0000_0000, 2 MiB apart | fixed 64 MiB windows from 0x20_0000_0000 (ring, self-test source, destination), RM's choice if the fixed range is refused, below 2^40 checked |
+| GPU timestamps, `--fence` | yes | none: the self-test's times are CPU times (`KeQueryInterruptTimePrecise`), spinning up to 20 ms then 1 ms sleeps |
+| teardown check | `crm_object_count` 0 | every undo's RM status (`CeChSoft` 0) and `NvOpen - NvClose` back to its value before the test |
+
+**RM calls the KMD client does not make (yet), and why:**
+- `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` over KMD pages: the page-run registration (`nvrm::pin_pages`, `forward_pinned`) exists only
+  for a user process's escape (it locks that process's pages and splices the runs into its own forwarded `RM_ALLOC`); a
+  KMD-owned registration is M3c's work (the destination, 11.3). M3b uses RM system memory everywhere instead.
+- `NV_ESC_RM_DUP_OBJECT` of another client's memory, `NV_SEMAPHORE_SURFACE`, `NV01_EVENT_OS_EVENT`: not needed by the
+  self-test (the producer is a value the KMD writes; completion is polled). M3c.
+
+### 11.10 The self-test (`RmCopyEngine` = 2): what it does and the hardware procedure
+
+Once per transport generation, from the HPD worker at PASSIVE (the first pass with the RM transport up and a VidPn primary
+bound), never inside a DDI: bring the channel up; allocate a source and a destination (5763072 B each) of RM system memory
+in the channel's client (write-combined, CPU views, GPU mappings); fill the source with a salted position-dependent pattern;
+copy 1600x900x4 pitch-linear twice with `ce_present::present_push`:
+1. **ready**: the producer value is set before the kick. `CeSelfUs` = kick to completion seen.
+2. **wait**: the push acquires a value the producer does not have; the worker sleeps 2 ms (a timer tick), checks the completion
+   has NOT landed (else `NotHeld`), sets the producer, and `CeSelfWaitUs` = producer set to completion seen. This copy reads
+   the source one word further on, so its destination differs from the first copy's at every word.
+
+Each destination is compared word for word. Then the buffers are freed (after the GPU is idle) and the channel is torn down
+(M3b keeps no channel; M3c will). The whole is bounded: 6 s for the bring-up, 4 s for the copies, 250 ms per copy, 3 s for
+each undo. A failure is counted, never fatal, and touches nothing of the Present path. The worker is busy for the length of
+the test, expected well under a second (most of it the CPU fill and the two compares at write-combined speed).
+
+**Procedure** (main session; the knob is read at StartDevice, so a restart is needed after every change):
+
+```
+reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v RmCopyEngine /t REG_DWORD /d 2 /f
+pnputil /restart-device "<the Helios display adapter's instance id>"
+:: wait for the desktop, then
+reg query HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render
+```
+
+Repeat the restart five to ten times (one self-test per generation; `CeChSoft` must stay 0 and `NvOpen - NvClose` must come
+back to its value without the knob), then set the knob back to 0 and restart.
+
+**Expected values on a PASS** (GB202):
+
+| value | expected | if not |
+|---|---|---|
+| `CeKnob` | 2 | the knob was not read: no restart since `reg add` |
+| `CeSelfTest` | **1** | `0xE0 + stage`: 0xE1 bring-up (read `CeChStage` / `CeChFail`), 0xE2 source, 0xE3 destination, 0xE4 push, 0xE5 ring full, 0xE6 ready copy not seen in 250 ms, 0xE7 ready copy wrong, 0xE8 the acquire did not hold, 0xE9 wait copy not seen, 0xEA wait copy wrong, 0xEB error notifier set, 0xEC out of time |
+| `CeSelfWhy` | 0 | RM's `NV_STATUS` of the failing call, or `0x8000_0000 \| kind << 16 \| code` |
+| `CeSelfUs` | about the tool's ready doorbell-to-done (below 400 us: the copy is about 200 to 350 us) | |
+| `CeSelfWaitUs` | below 50 us plus the copy | |
+| `CeSelfPages` | 1407 | |
+| `CeSelfMs` | hundreds of ms (the fill and the compares at write-combined speed) | |
+| `CeChTry` / `CeChUp` / `CeChDown` | 1 / 1 / 1 per generation | |
+| `CeChStage` | 20 (the last stage started) | the stage that hung or failed |
+| `CeChFail` | 0 | `stage << 24 \| kind << 16 \| code`; kinds as `RmFail` (`kmd-rm-client.md` 3); Transport codes 0xE1 budget spent, 0xE2 StopDevice, 0xE3 the first push never landed (the doorbell from kernel mode is the first suspect); Layout 0x60 no known class set, 0x61 no async copy engine, 0x68 a GPU VA at or above 2^40; Rm with `CeNotify` set: the error notifier |
+| `CeChSoft` | **0** | undo steps RM or the host did not confirm |
+| `CeRmErr` / `CeChanFail` / `CeNotify` | 0 / 0 / 0 | a refused caps query adds 1 to `CeRmErr` and is harmless |
+| `CeChan` / `CeChState` | 0 / 0 (torn down, cold, no strikes) | `CeChState` = `phase << 28 \| strikes << 24 \| made bits` |
+| `CeGen` | 1 (GB20x; 2 on Ada) | |
+| `CeEngine` / `CeCaps` | a `COPYn` type (0x09..0x12, 0x34..0x3d) / its caps, `SYSMEM_WRITE` (0x08) set, `GRCE` (0x01) clear | |
+| `CeToken` / `CeRunlist` | the token / its runlist (bits 22:16): not GR's (the tool prints both) | |
+| `CeSubmit` | 3 (the first push and the two copies) | |
+| `CeChMs` | tens of ms | |
+
+A PASS settles items 3 (no `NON_STALL_INTERRUPT` is used), 5 (does not arise) and 8 (the kernel-mode doorbell) of 11.7 for
+the KMD client, and that a write-combined RM system-memory ring, USERD and notifier work for a CE channel. It says nothing
+about block-linear sources, dups of NVK's memory or the destination descriptors (M3c).
