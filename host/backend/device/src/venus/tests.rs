@@ -1584,3 +1584,50 @@ fn a_reset_turns_the_scanout_off_and_late_flushes_show_nothing() {
     assert_eq!(t.send_on(&flush_cmd(11), Some(&link)).0.ty, RESP_OK_NODATA);
     assert_eq!(link.stats.sent.load(Relaxed), 1, "nothing shown");
 }
+
+/// `--latency fused-submit`: a fenced submit is held and signals exactly as
+/// without it; its refusals are the same answers.
+#[test]
+fn fused_submit_holds_and_refuses_like_two_calls() {
+    let mut t = Rig::new();
+    t.venus.set_fused_submit(true);
+    t.ctx(1);
+    t.r.hold_fences();
+    let Outcome::Held(token) = t.send_with(&submit_cmd(fenced(CMD_SUBMIT_3D, 1, 9), b"abcd"), None)
+    else {
+        panic!("a fenced submit must be held");
+    };
+    assert_eq!(
+        t.r.mock.lock().unwrap().submitted,
+        vec![(1, b"abcd".to_vec())]
+    );
+    assert!(t.completions().is_empty(), "not signalled yet");
+    t.r.release();
+    let done = t.completions();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].token, token);
+    let h = CtrlHdr::from_bytes(&done[0].resp[16..]).unwrap();
+    assert_eq!((h.ty, h.fence_id, h.ctx_id), (RESP_OK_NODATA, 9, 1));
+
+    // An unknown context, and a size that does not match: answered at once.
+    assert_eq!(
+        t.ty(&submit_cmd(fenced(CMD_SUBMIT_3D, 2, 10), b"abcd")),
+        RESP_ERR_INVALID_CONTEXT_ID
+    );
+    let mut short = submit_cmd(fenced(CMD_SUBMIT_3D, 1, 11), b"abcd");
+    short.pop();
+    assert_eq!(t.ty(&short), RESP_ERR_UNSPEC);
+    assert_eq!(t.venus.held(), 0);
+    // Unfenced submits take the ordinary path.
+    assert_eq!(
+        t.ty(&submit_cmd(hdr(CMD_SUBMIT_3D, 1), b"efgh")),
+        RESP_OK_NODATA
+    );
+    // A dead renderer: the submit fails as a submit, the device is lost.
+    t.r.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        t.ty(&submit_cmd(fenced(CMD_SUBMIT_3D, 1, 12), b"ijkl")),
+        RESP_ERR_UNSPEC
+    );
+    assert!(t.venus.is_lost());
+}

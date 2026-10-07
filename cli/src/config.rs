@@ -4,6 +4,8 @@
 //! |---|---|---|
 //! | `view.close_stops_vm` | true, false | true: closing the window of a VM that `conduit view` started shuts it down. A VM started any other way (`conduit up`, virt-manager, virsh) always keeps running. |
 //! | `venus.guest_blobs` | true, false | false: the backend serves guest-memory blobs (docs/VENUS.md "Guest-memory blobs"), Venus copy destinations over the guest's own pages, for the Windows KMD's windowed Present. Opt-in while new. Applies when a VM's backend next starts. |
+//! | `backend.latency` | off, all, or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch | off: round-trip latency options for the backend and conduit-venus (docs/research/host-roundtrip-latency.md). Opt-in while measured. Applies when a VM's backend next starts. |
+//! | `backend.cpus` | a CPU list such as 0-7,16-23 | unset: the backend and conduit-venus run on any CPU; set: every thread of both stays on these (docs/HOST-TUNING.md). Applies when a VM's backend next starts. |
 //! | `gpu.window_mib` | auto, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 | auto: the host GPU's BAR1 (as Resizable BAR on bare metal), clamped to what the guest's 64-bit MMIO window holds, 4096 without a GPU. The shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
 use crate::paths;
@@ -23,6 +25,16 @@ const KEYS: &[(&str, &[&str], &str)] = &[
         "venus.guest_blobs",
         &["true", "false"],
         "serve guest-memory blobs to Venus guests (the Windows KMD's windowed Present writes guest pages directly), from the next backend start (default false)",
+    ),
+    (
+        "backend.latency",
+        &["off", "all"],
+        "round-trip latency options for the backend and conduit-venus, from the next backend start (default off; also a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch)",
+    ),
+    (
+        "backend.cpus",
+        &[],
+        "keep the backend and conduit-venus on these host CPUs, from the next backend start (unset: any CPU; a list such as 0-7,16-23)",
     ),
     (
         "gpu.vram_limit_mib",
@@ -78,16 +90,22 @@ fn key(k: &str) -> Result<&'static (&'static str, &'static [&'static str], &'sta
 pub fn set(k: &str, v: &str) -> Result<()> {
     let (name, values, _) = key(k)?;
     let number = *name == "gpu.vram_limit_mib" && v.parse::<u64>().is_ok_and(|n| n >= 1);
-    if !values.contains(&v) && !number {
+    let list = match *name {
+        "backend.latency" => latency_list(v).is_some(),
+        "backend.cpus" => cpu_list(v),
+        _ => false,
+    };
+    if !values.contains(&v) && !number && !list {
         return Err(oops(
             format!("\"{v}\" is not a value for {name}"),
             format!(
                 "Use one of: {}{}",
                 values.join(", "),
-                if *name == "gpu.vram_limit_mib" {
-                    ", or a number of MiB"
-                } else {
-                    ""
+                match *name {
+                    "gpu.vram_limit_mib" => ", or a number of MiB",
+                    "backend.latency" => ", or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch",
+                    "backend.cpus" => "a CPU list such as 0-7,16-23",
+                    _ => "",
                 }
             ),
         ));
@@ -146,6 +164,62 @@ pub fn venus_guest_blobs() -> bool {
         .get("venus.guest_blobs")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The backend's `--latency` options a `backend.latency` value names, in a
+/// fixed order; `None` for a value that is not one.
+fn latency_list(v: &str) -> Option<Vec<&'static str>> {
+    const ALL: [&str; 4] = ["quiet-held", "fused-submit", "direct-fences", "event-batch"];
+    match v {
+        "off" => return Some(Vec::new()),
+        "all" => return Some(ALL.to_vec()),
+        _ => {}
+    }
+    let names: Vec<&str> = v
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    if names.is_empty() || names.iter().any(|n| !ALL.contains(n)) {
+        return None;
+    }
+    Some(ALL.into_iter().filter(|a| names.contains(a)).collect())
+}
+
+/// A CPU list in the kernel's format (`0-7,16-23`).
+fn cpu_list(v: &str) -> bool {
+    !v.is_empty()
+        && v.split(',').all(|part| {
+            let mut ends = part.splitn(2, '-').map(|n| n.trim().parse::<u32>().ok());
+            match (ends.next().flatten(), ends.next()) {
+                (Some(_), None) => true,
+                (Some(a), Some(Some(b))) => a <= b && b < 1024,
+                _ => false,
+            }
+        })
+}
+
+/// `backend.latency`: the options the backend gets as `--latency` (empty
+/// for off or unset). conduit-venus gets `--direct-fences` when the list
+/// has `direct-fences`.
+pub fn backend_latency() -> Vec<&'static str> {
+    latency_of(&load())
+}
+
+fn latency_of(m: &Map<String, Value>) -> Vec<&'static str> {
+    m.get("backend.latency")
+        .and_then(Value::as_str)
+        .and_then(latency_list)
+        .unwrap_or_default()
+}
+
+/// `backend.cpus`: the CPU list the backend and conduit-venus get as `--cpus`.
+pub fn backend_cpus() -> Option<String> {
+    load()
+        .get("backend.cpus")
+        .and_then(Value::as_str)
+        .filter(|v| cpu_list(v))
+        .map(str::to_owned)
 }
 
 /// `gpu.vram_limit_mib`: how the backend's video-memory cap is chosen.
@@ -224,6 +298,32 @@ mod tests {
         assert!(key("view.close_stops_vm").is_ok());
         assert!(key("view.nope").is_err());
         assert!(key("gpu.window_mib").is_ok());
+    }
+
+    #[test]
+    fn latency_and_cpu_settings() {
+        let mut m = Map::new();
+        assert!(latency_of(&m).is_empty());
+        for (v, want) in [
+            ("off", vec![]),
+            (
+                "all",
+                vec!["quiet-held", "fused-submit", "direct-fences", "event-batch"],
+            ),
+            ("event-batch,quiet-held", vec!["quiet-held", "event-batch"]),
+            ("fast", vec![]),
+            ("quiet-held,fast", vec![]),
+        ] {
+            m.insert("backend.latency".into(), Value::String(v.into()));
+            assert_eq!(latency_of(&m), want, "{v}");
+        }
+        assert!(latency_list("quiet-held,fast").is_none());
+        for ok in ["0-7,16-23", "3", "0-0"] {
+            assert!(cpu_list(ok), "{ok}");
+        }
+        for bad in ["", "7-0", "a", "1,", "1-2-3", "0-5000"] {
+            assert!(!cpu_list(bad), "{bad}");
+        }
     }
 
     #[test]

@@ -166,6 +166,8 @@ pub struct Venus {
     is_dmabuf: fn(BorrowedFd<'_>) -> bool,
     /// Stage timing on the renderer's side (`Venus::pull_stages`).
     stages: RendererStages,
+    /// `--latency fused-submit` ([`Venus::set_fused_submit`]).
+    fused_submit: bool,
 }
 
 /// The renderer's half of stage timing: whether it can stamp, whether it
@@ -224,6 +226,7 @@ impl Venus {
             lose_pending: false,
             counts: BTreeMap::new(),
             stages,
+            fused_submit: false,
         }
     }
 
@@ -247,6 +250,18 @@ impl Venus {
     /// then calls [`Venus::completions`].
     pub fn fence_fd(&self) -> BorrowedFd<'_> {
         self.renderer.fence_fd()
+    }
+
+    /// `--latency fused-submit`: a fenced `SUBMIT_3D` goes to the renderer as
+    /// one call with its fence ([`conduit_venus::Renderer::submit_fenced`]),
+    /// one round trip instead of two while the queue thread waits.
+    pub fn set_fused_submit(&mut self, yes: bool) {
+        self.fused_submit = yes;
+    }
+
+    /// See [`conduit_venus::Renderer::set_fence_hook`].
+    pub fn set_fence_hook(&mut self, hook: conduit_venus::FenceHook) -> bool {
+        self.renderer.set_fence_hook(hook)
     }
 
     /// Fenced chains still waiting for the renderer.
@@ -276,6 +291,19 @@ impl Venus {
     /// device is released through `env` as on any other loss, and the held
     /// chains come back `RESP_ERR_UNSPEC`.
     pub fn completions(&mut self, env: Env<'_>) -> Vec<Completion> {
+        self.completions_with(env, true)
+    }
+
+    /// [`Venus::completions`] without asking the renderer anything: what
+    /// the renderer connection's own reader thread runs (`--latency
+    /// direct-fences`). A renderer call from there would wait for a reply
+    /// only that thread can deliver, so the stage pull is left to the
+    /// fence pump and the queue thread.
+    pub fn completions_no_call(&mut self, env: Env<'_>) -> Vec<Completion> {
+        self.completions_with(env, false)
+    }
+
+    fn completions_with(&mut self, env: Env<'_>, may_call: bool) -> Vec<Completion> {
         if !self.lost {
             match self.renderer.signalled() {
                 Ok(signalled) => {
@@ -293,7 +321,9 @@ impl Venus {
             }
         }
         self.fences.flush_latency();
-        self.pull_stages();
+        if may_call {
+            self.pull_stages();
+        }
         self.fences.take_ready()
     }
 
@@ -355,6 +385,14 @@ impl Venus {
         } else {
             0
         };
+        if self.fused_submit
+            && !self.lost
+            && hdr.ty == CMD_SUBMIT_3D
+            && hdr.fenced()
+            && hdr.ring() < MAX_RINGS
+        {
+            return self.submit_fenced(&hdr, payload, resp, env, decoded_ns);
+        }
         let answer = if self.lost {
             Err(RESP_ERR_UNSPEC)
         } else if hdr.fenced() && hdr.ring() >= MAX_RINGS {
@@ -429,6 +467,83 @@ impl Venus {
                     h.padding = errno_padding(errno);
                 }
                 Outcome::Done(reply(resp, &h, &[]))
+            }
+        }
+    }
+
+    /// A fenced `SUBMIT_3D` with `fused-submit`: the same checks and answers
+    /// as `serve` and the fence step of `dispatch`, but the submit and the
+    /// fence reach the renderer as one call.
+    fn submit_fenced(
+        &mut self,
+        hdr: &CtrlHdr,
+        b: &[u8],
+        resp: &mut [u8],
+        env: Env<'_>,
+        decoded_ns: u64,
+    ) -> Outcome {
+        let checked = match Submit3d::from_bytes(b) {
+            Some(s) if b.len() == Submit3d::LEN + s.size as usize => {
+                if self.contexts.contains(&hdr.ctx_id) {
+                    Ok(&b[Submit3d::LEN..])
+                } else {
+                    Err(RESP_ERR_INVALID_CONTEXT_ID)
+                }
+            }
+            _ => Err(RESP_ERR_UNSPEC),
+        };
+        let fail = |me: &mut Self, resp: &mut [u8], e: u32| {
+            me.count(err_name(e));
+            log::debug!(
+                "venus: command {:#06x} ctx {} ({} bytes) -> {}",
+                hdr.ty,
+                hdr.ctx_id,
+                b.len(),
+                err_name(e)
+            );
+            if std::mem::take(&mut me.lose_pending) {
+                me.lose(env);
+            }
+            Outcome::Done(reply(resp, &hdr.response(e), &[]))
+        };
+        let commands = match checked {
+            Ok(c) => c,
+            Err(e) => return fail(self, resp, e),
+        };
+        self.count("submit_3d");
+        match self
+            .renderer
+            .submit_fenced(hdr.ctx_id, commands, hdr.ring(), hdr.fence_id)
+        {
+            Ok(()) => {
+                log::debug!(
+                    "venus: command {:#06x} ctx {} ({} bytes) -> ok",
+                    hdr.ty,
+                    hdr.ctx_id,
+                    b.len()
+                );
+                // One call: submitted and fence asked are the same moment.
+                if decoded_ns != 0 {
+                    stamp_held(hdr, decoded_ns, crate::stage::now_ns());
+                }
+                Outcome::Held(self.fences.hold(hdr))
+            }
+            Err(conduit_venus::FencedError::Submit(e)) => {
+                let code = self.renderer_error(&e);
+                fail(self, resp, code)
+            }
+            Err(conduit_venus::FencedError::Fence(e)) => {
+                log::warn!(
+                    "venus: fence {} on ctx {} ring {}: {e}",
+                    hdr.fence_id,
+                    hdr.ctx_id,
+                    hdr.ring()
+                );
+                self.renderer_error(&e);
+                if std::mem::take(&mut self.lose_pending) {
+                    self.lose(env);
+                }
+                Outcome::Done(reply(resp, &hdr.response(RESP_ERR_UNSPEC), &[]))
             }
         }
     }

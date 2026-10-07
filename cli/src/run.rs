@@ -253,6 +253,7 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
             cmd.arg("--venus-guest-blobs");
         }
     }
+    latency_args(&mut cmd);
     // A video-memory cap when this GPU also drives the desktop, and safe mode
     // when asked for (protect.rs).
     crate::protect::apply(&mut cmd);
@@ -297,6 +298,18 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
     Ok(())
 }
 
+/// `backend.latency` and `backend.cpus` as the backend's `--latency` and
+/// `--cpus` (docs/research/host-roundtrip-latency.md); nothing when unset.
+pub(crate) fn latency_args(cmd: &mut Command) {
+    let latency = crate::config::backend_latency();
+    if !latency.is_empty() {
+        cmd.arg("--latency").arg(latency.join(","));
+    }
+    if let Some(cpus) = crate::config::backend_cpus() {
+        cmd.arg("--cpus").arg(cpus);
+    }
+}
+
 /// conduit-venus, located for `--venus`, with a build hint when it is missing.
 pub(crate) fn need_venus() -> Result<PathBuf> {
     Tool::Venus.require()
@@ -309,6 +322,13 @@ pub(crate) fn need_venus() -> Result<PathBuf> {
 pub(crate) fn venus_cmd(bin: &Path, sock: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("--socket").arg(sock);
+    // `backend.latency` and `backend.cpus` (docs/research/host-roundtrip-latency.md).
+    if crate::config::backend_latency().contains(&"direct-fences") {
+        cmd.arg("--direct-fences");
+    }
+    if let Some(cpus) = crate::config::backend_cpus() {
+        cmd.arg("--cpus").arg(cpus);
+    }
     if let Some(l) = std::env::var_os("CONDUIT_VENUS_LD_LIBRARY_PATH").filter(|l| !l.is_empty()) {
         cmd.env("LD_LIBRARY_PATH", l);
     }
