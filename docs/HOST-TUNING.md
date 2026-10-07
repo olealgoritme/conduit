@@ -125,8 +125,10 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   branch older than 580), guests get a default video-memory limit so the
   compositor keeps room. On the open modules 580 or newer nothing is set
   unless you ask: `conduit config set gpu.vram_limit_mib auto` (or a number
-  of MiB). See [SECURITY.md](SECURITY.md); check what applies with
-  `conduit doctor`. `off` removes the limit on a dedicated card.
+  of MiB). The limit is the smallest of your number, the display default and,
+  in safe mode, 2 GiB (see [SECURITY.md](SECURITY.md); check what applies
+  with `conduit doctor`). `off` removes the limit on a dedicated card, but
+  not safe mode's 2 GiB: turn safe mode off too (`gpu.safe_mode false`).
 
 ## Measuring
 

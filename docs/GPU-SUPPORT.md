@@ -127,7 +127,8 @@ possible with the current stack).
 ## Testing a new GPU
 
 What `conduit doctor` should verify (today it checks the driver: kernel
-module flavour and branch (a warning when untested), supported release; GPU name, architecture and BAR1 are not
+module flavour and branch (a warning when untested), supported release, and
+shows BAR1 and whether the GPU has a monitor; GPU name and architecture are not
 yet shown):
 
 1. A release with tables; open kernel modules, 580 or newer, are the tested setup and anything else is a warning (`conduit doctor`).

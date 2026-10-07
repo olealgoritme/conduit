@@ -78,22 +78,29 @@ None of this can be switched off from the command line.
 - **Anything outside `--caps`.** No CUDA (`nvidia-uvm`) without `compute`, no
   encoders without `video`, no 3D without `graphics`.
 - **VRAM past `--vram-limit-mib`.** Allocations over the limit fail, and the
-  guest sees the limit as the card's memory size. With no setting, `conduit`
-  passes a limit only in safe mode (below) and only when the NVIDIA card has a
-  monitor connected: the smaller of half the card's memory and its memory
-  minus 3 GiB (4 GiB when the card's memory size is not known), so a guest
-  cannot fill the memory the desktop needs. On the tested setup nothing is
-  passed. `gpu.vram_limit_mib` overrides it either way: MiB, `auto` (that
-  default whenever a monitor is connected) or `off`.
+  guest sees the limit as the card's memory size. One rule in the CLI
+  (`protect::final_limit_mib`) computes the number and the backend enforces it
+  as given: the limit is the **smallest** of (1) `gpu.vram_limit_mib` when it
+  is a number of MiB, (2) the display default, when it applies, and (3) 2 GiB
+  when safe mode is on. The display default applies for `gpu.vram_limit_mib
+  auto`, and when it is unset while safe mode is on, and only when the NVIDIA
+  card has a monitor connected: the smaller of half the card's memory and its
+  memory minus 3 GiB (4 GiB when the card's memory size is not known), so a
+  guest cannot fill the memory the desktop needs. `off` drops (1) and (2).
+  Safe mode's 2 GiB is a ceiling that no number and no `off` raises; to lift
+  it, turn safe mode off. On the tested setup (safe mode off, nothing set)
+  no limit is passed.
 - **Blocking calls (safe mode only).** Two guest-supplied waits can be
   bounded before they reach the driver, because RM holds a GPU lock while it
   waits: the timeout of `NV_ESC_RM_IDLE_CHANNELS` and of
   `SEMSURF_FENCE_CREATE`. In safe mode both are clamped to 1 s; otherwise
   they are forwarded exactly as the guest sent them.
-- **Safe mode.** A 2 GiB video-memory limit (a lower explicit one stays) and
-  the 1 s clamp above. `gpu.safe_mode` is `auto`, `true` or `false`
+- **Safe mode.** A 2 GiB video-memory ceiling (a smaller `gpu.vram_limit_mib`
+  number stays, a larger one or `off` does not raise it) and the 1 s clamp
+  above. `gpu.safe_mode` is `auto`, `true` or `false`
   (default `auto`; `CONDUIT_SAFE_MODE=1` or `0` in the environment of the
-  command wins). `auto` follows one rule, applied to the loaded driver: the
+  `conduit` command wins, but a VM started from libvirt or virt-manager does
+  not see your shell and follows `gpu.safe_mode`). `auto` follows one rule, applied to the loaded driver: the
   open kernel modules, release 580 or newer, are what Conduit was built and
   tested on, so safe mode is off there and nothing changes; with the closed
   modules or a branch older than 580 it is on. `conduit doctor` says which
