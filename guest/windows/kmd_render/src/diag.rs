@@ -1230,8 +1230,14 @@ pub mod knobs {
     /// meta, Venus stream) from the transport's bounded DMA pool, in the same lock hold as the
     /// reap, instead of two `MmAllocateContiguousMemory` calls per submit. A miss falls back to
     /// a fresh allocation. 0 restores allocate-per-submit exactly: the same-boot A/B. Read at
-    /// every StartDevice, mirrored as `SubPoolOn`. `docs/zero-copy-present.md` 24.13.
+    /// every StartDevice, mirrored as `SubPoolOn`. `docs/zero-copy-present.md` 24.14.
     pub const SUBMIT_POOL: KnobName = KnobName::new(b"SubmitPool");
+    /// `SubStageClk` (default 1 = ON). The stage clock of the display submitters and of the
+    /// pipelined foreign flip (`Sub*`, `SubW*`, `SubF*`): 0 reads no interrupt time on any submit
+    /// path (four of the reads sit inside the `virtio_lock` hold) and leaves only the counts, the
+    /// A/B that tells the clock's own cost from what it measures. Read at every StartDevice,
+    /// mirrored as `SubClkOn`. `docs/zero-copy-present.md` 24.14.
+    pub const SUBMIT_STAGE_CLOCK: KnobName = KnobName::new(b"SubStageClk");
     /// `WddmHoldMs` (default 0 = OFF, and OFF is the only shipping value).
     ///
     /// # THE KNOB IS THE EXPERIMENT (UV1, `docs/dx12/KMD_IMPACT.md` §14a.1)

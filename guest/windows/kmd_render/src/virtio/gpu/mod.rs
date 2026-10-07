@@ -2454,7 +2454,7 @@ pub struct VirtioGpu {
     /// existing virtio spinlock, but allocation/free never occurs there.
     dma_pool: Vec<DmaBuffer>,
     dma_pool_bytes: usize,
-    /// The display submitters' notify timer (`SubKick`, docs 24.13): armed by a display
+    /// The display submitters' notify timer (`SubKick`, docs 24.14): armed by a display
     /// submitter inside its own lock hold, recorded by [`Self::publish_then_notify`], taken in
     /// the same hold. 16 bytes inline; every other enqueue pays one `armed` test.
     kick_timer: helios_kmd_logic::submit_stage::KickTimer,
@@ -3339,7 +3339,7 @@ impl VirtioGpu {
     fn publish_then_notify(&mut self, entry: InFlight) {
         self.inflight.push(entry);
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
-        // The notify timing (`SubKick`, docs 24.13) only for a display submitter that armed the
+        // The notify timing (`SubKick`, docs 24.14) only for a display submitter that armed the
         // timer in this same lock hold; atomics-free, two interrupt-time reads.
         let timed = self.kick_timer.armed();
         if self.control.should_notify() {
@@ -3360,7 +3360,7 @@ impl VirtioGpu {
         }
     }
 
-    /// Arm the notify timer for the next publish (display submitters, docs 24.13).
+    /// Arm the notify timer for the next publish (display submitters, docs 24.14).
     pub(crate) fn arm_kick_timer(&mut self) {
         self.kick_timer.arm();
     }
@@ -3371,7 +3371,7 @@ impl VirtioGpu {
     }
 
     /// Whether the used ring holds a completion `drain_used` has not consumed yet (one
-    /// acquire load of the used index; the `SubDrainHit` evidence of docs 24.13).
+    /// acquire load of the used index; the `SubDrainHit` evidence of docs 24.14).
     pub(crate) fn used_pending(&self) -> bool {
         !self.failed && self.control.can_pop()
     }

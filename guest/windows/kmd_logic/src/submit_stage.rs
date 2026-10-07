@@ -1,4 +1,4 @@
-//! Display submit staging (`SubmitPool`, `docs/zero-copy-present.md` 24.13): the pure half. The
+//! Display submit staging (`SubmitPool`, `docs/zero-copy-present.md` 24.14): the pure half. The
 //! I/O half is `kmd_render/src/virtio/submit_stage.rs` (atomics, knob mirror, registry
 //! publication) and `kmd_render/src/virtio/ctrl.rs` (`stage_display_submit` and the four
 //! display submitters that call it).
@@ -18,7 +18,7 @@
 //! The buffer lifetime rule is NOT re-implemented here: the pool is the transport's existing
 //! `dma_pool` (`virtio/gpu/mod.rs`), which only ever receives a buffer after the host consumed
 //! it (the used-ring completion popped by `drain_used`, then the PASSIVE reap), and which dies
-//! with the transport generation at StopDevice. 24.13 says why a second pool would be worse.
+//! with the transport generation at StopDevice. 24.14 says why a second pool would be worse.
 
 /// The stages of one display submit, in the order they run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,10 +40,13 @@ pub enum Stage {
     Enq,
     /// The doorbell (`transport.notify`), when the device asked for one.
     Kick,
+    /// Work of the submit before its staging: the foreign flip's mint, release-book entry and
+    /// request build (`foreign_scanout::present_submit`). 0 on the four display submitters.
+    Prep,
 }
 
 /// Number of [`Stage`]s.
-pub const STAGES: usize = 8;
+pub const STAGES: usize = 9;
 
 impl Stage {
     /// Every stage, in order. Index `i` is `ALL[i].index()`.
@@ -56,6 +59,7 @@ impl Stage {
         Stage::Drain,
         Stage::Enq,
         Stage::Kick,
+        Stage::Prep,
     ];
 
     /// Slot of this stage in [`Clock::stages`].
@@ -69,6 +73,7 @@ impl Stage {
             Stage::Drain => 5,
             Stage::Enq => 6,
             Stage::Kick => 7,
+            Stage::Prep => 8,
         }
     }
 
@@ -78,7 +83,7 @@ impl Stage {
     }
 }
 
-/// One submit's stage clock, in 100 ns ticks. Lives on the submitter's stack (80 bytes).
+/// One submit's stage clock, in 100 ns ticks. Lives on the submitter's stack (88 bytes).
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     start: u64,
@@ -234,10 +239,15 @@ pub const fn fresh_count(p: (Source, Source)) -> u32 {
 }
 
 /// The knob (REG_DWORD in the service key, default 1 = take the staged buffers from the pool;
-/// 0 = allocate both per submit, the behaviour before 24.13). Read at every StartDevice.
+/// 0 = allocate both per submit, the behaviour before 24.14). Read at every StartDevice.
 pub const KNOB: &str = "SubmitPool";
 
-/// Which display submitter ran (`SubNScan` .. `SubNWin`).
+/// The timing knob (REG_DWORD, default 1 = stamp every stage; 0 = counts only, no interrupt-time
+/// read anywhere on the submit paths): the A/B that tells the clock's own cost apart from what it
+/// measures, in particular inside the `virtio_lock` hold. Read at every StartDevice.
+pub const KNOB_TIMING: &str = "SubStageClk";
+
+/// Which submitter ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Path {
     /// `submit_venus_async_scanout` (the scan-out copy of a flip).
@@ -248,35 +258,58 @@ pub enum Path {
     Blt,
     /// `submit_venus_async_windowed_blt` (deferred windowed Blt).
     Windowed,
+    /// `foreign_scanout::present_submit` -> `ctrl::raw_submit_async`: the pipelined foreign
+    /// flip (`ScanoutFlip`). NOT in the aggregate `Sub*` totals (they stay the four display
+    /// submitters', comparable with earlier runs); its own table is `SubF*`.
+    Flip,
 }
 
 impl Path {
-    /// Every path, in counter order.
+    /// The four display submitters, in `SubNScan` .. `SubNWin` order (the aggregate).
     pub const ALL: [Path; 4] = [Path::Scanout, Path::Present, Path::Blt, Path::Windowed];
 
-    /// Index into the per-path counters.
+    /// Index: the aggregate per-path counter for the four display submitters, 4 for the flip.
     pub const fn index(self) -> usize {
         match self {
             Path::Scanout => 0,
             Path::Present => 1,
             Path::Blt => 2,
             Path::Windowed => 3,
+            Path::Flip => 4,
+        }
+    }
+
+    /// Whether this path's stages go into the aggregate `Sub*` totals.
+    pub const fn aggregate(self) -> bool {
+        !matches!(self, Path::Flip)
+    }
+
+    /// This path's own table in [`TABLE_NAMES`], if it has one.
+    pub const fn table(self) -> Option<usize> {
+        match self {
+            Path::Windowed => Some(0),
+            Path::Flip => Some(1),
+            _ => None,
         }
     }
 
     /// The per-path call counter.
     pub const fn counter(self) -> &'static str {
-        COUNTERS[PATH_COUNTER_BASE + self.index()]
+        match self {
+            Path::Flip => TABLE_NAMES[1][TABLE_N],
+            _ => COUNTERS[PATH_COUNTER_BASE + self.index()],
+        }
     }
 }
 
 /// Index of `SubNScan` in [`COUNTERS`].
-pub const PATH_COUNTER_BASE: usize = 16;
+pub const PATH_COUNTER_BASE: usize = 17;
 
-/// Every counter the I/O half writes, at most 14 characters, all `Sub*`. The first [`STAGES`]
-/// are the per-stage totals in microseconds, in [`Stage`] order; then the totals, the counts,
-/// and (from [`PATH_COUNTER_BASE`]) the per-path call counts in [`Path`] order.
-pub const COUNTERS: [&str; 20] = [
+/// Every aggregate counter the I/O half writes, at most 14 characters, all `Sub*`. The first
+/// [`STAGES`] are the per-stage totals in microseconds, in [`Stage`] order; then the totals, the
+/// counts, and (from [`PATH_COUNTER_BASE`]) the per-path call counts in [`Path::ALL`] order.
+/// The four display submitters only (see [`Path::Flip`]).
+pub const COUNTERS: [&str; 21] = [
     // Stage totals, microseconds since the start of the transport generation.
     "SubReap",
     "SubTake",
@@ -286,6 +319,7 @@ pub const COUNTERS: [&str; 20] = [
     "SubDrain",
     "SubEnq",
     "SubKick",
+    "SubPrep",
     // Whole submit (first stamp to last), total and longest, microseconds.
     "SubTotal",
     "SubTotMax",
@@ -306,9 +340,65 @@ pub const COUNTERS: [&str; 20] = [
     "SubNWin",
 ];
 
-/// The StartDevice mirror of the knob in force (written with the knob read, not with the
-/// throttled counters, so it is not in [`COUNTERS`]).
-pub const KNOB_MIRROR: &str = "SubPoolOn";
+/// The stages a per-path table carries, in table-slot order (`Copy` is left out: it is the same
+/// sub-microsecond memcpy on every path, and the aggregate `SubCopy` has it).
+pub const TABLE_STAGES: [Stage; 8] = [
+    Stage::Prep,
+    Stage::Reap,
+    Stage::Take,
+    Stage::Alloc,
+    Stage::Lock,
+    Stage::Drain,
+    Stage::Enq,
+    Stage::Kick,
+];
+
+/// Slot of the whole-submit total (us) in a table row.
+pub const TABLE_TOT: usize = 8;
+/// Slot of the longest submit (us).
+pub const TABLE_TOT_MAX: usize = 9;
+/// Slot of the call count.
+pub const TABLE_N: usize = 10;
+/// Names per table row.
+pub const TABLE_WIDTH: usize = 11;
+/// Number of per-path tables.
+pub const TABLES: usize = 2;
+
+/// The per-path tables: row 0 the windowed Blt (`SubW*`), row 1 the foreign flip (`SubF*`).
+/// Slots `0..8` are [`TABLE_STAGES`] totals in microseconds, then [`TABLE_TOT`],
+/// [`TABLE_TOT_MAX`], [`TABLE_N`]. The I/O half writes them from this table (no literals).
+pub const TABLE_NAMES: [[&str; TABLE_WIDTH]; TABLES] = [
+    [
+        "SubWPrep",
+        "SubWReap",
+        "SubWTake",
+        "SubWAlloc",
+        "SubWLock",
+        "SubWDrain",
+        "SubWEnq",
+        "SubWKick",
+        "SubWTot",
+        "SubWTotMax",
+        "SubWN",
+    ],
+    [
+        "SubFPrep",
+        "SubFReap",
+        "SubFTake",
+        "SubFAlloc",
+        "SubFLock",
+        "SubFDrain",
+        "SubFEnq",
+        "SubFKick",
+        "SubFTot",
+        "SubFTotMax",
+        "SubFN",
+    ],
+];
+
+/// The StartDevice mirrors of the knobs in force (written with the knob read, not with the
+/// throttled counters, so they are not in [`COUNTERS`]): `SubmitPool`, `SubStageClk`.
+pub const KNOB_MIRRORS: [&str; 2] = ["SubPoolOn", "SubClkOn"];
 
 #[cfg(test)]
 mod tests {
@@ -462,13 +552,39 @@ mod tests {
         }
         assert_eq!(Path::Scanout.counter(), "SubNScan");
         assert_eq!(Path::Windowed.counter(), "SubNWin");
+        assert_eq!(Path::Flip.counter(), "SubFN");
         assert_eq!(PATH_COUNTER_BASE + Path::ALL.len(), COUNTERS.len());
+        assert_eq!(Stage::Prep.counter(), "SubPrep");
+        assert_eq!(COUNTERS[STAGES], "SubTotal");
+        // The flip is never in the aggregate; the windowed Blt is in both.
+        assert!(!Path::Flip.aggregate());
+        assert!(Path::ALL.iter().all(|p| p.aggregate()));
+        assert_eq!(Path::Windowed.table(), Some(0));
+        assert_eq!(Path::Flip.table(), Some(1));
+        assert_eq!(Path::Blt.table(), None);
+    }
+
+    #[test]
+    fn table_rows_follow_the_table_stages_and_name_their_path() {
+        for (row, prefix) in [(0usize, "SubW"), (1, "SubF")] {
+            for (i, stage) in TABLE_STAGES.iter().enumerate() {
+                // `SubWAlloc` is the windowed row's `SubAlloc`: the aggregate name with the
+                // path letter after `Sub`.
+                let aggregate = stage.counter();
+                let want = std::format!("{prefix}{}", &aggregate[3..]);
+                assert_eq!(TABLE_NAMES[row][i], want.as_str());
+            }
+            assert_eq!(TABLE_NAMES[row][TABLE_TOT], std::format!("{prefix}Tot").as_str());
+            assert_eq!(TABLE_NAMES[row][TABLE_TOT_MAX], std::format!("{prefix}TotMax").as_str());
+            assert_eq!(TABLE_NAMES[row][TABLE_N], std::format!("{prefix}N").as_str());
+        }
+        assert_eq!(TABLE_STAGES.len(), TABLE_TOT);
+        assert!(!TABLE_STAGES.contains(&Stage::Copy));
     }
 
     #[test]
     fn counter_names_fit_and_are_unique_and_differ_from_the_knobs() {
-        let mut names: Vec<&str> = COUNTERS.to_vec();
-        names.push(KNOB_MIRROR);
+        let mut names: Vec<&str> = all_names();
         for n in &names {
             assert!(n.len() <= 14, "{n} is longer than 14");
             assert!(n.starts_with("Sub"), "{n}");
@@ -479,7 +595,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "duplicate counter name");
         // The knobs share the service key: a counter of the same name would overwrite one.
-        for knob in [KNOB, "SubSpaceWake"] {
+        for knob in [KNOB, KNOB_TIMING, "SubSpaceWake"] {
             assert!(knob.len() <= 14);
             assert!(!names.contains(&knob), "{knob} is also a counter");
         }
@@ -493,6 +609,16 @@ mod tests {
                 assert!(!names.contains(other), "{other} collides");
             }
         }
+    }
+
+    /// Every name this module owns: aggregate, tables, knob mirrors.
+    fn all_names() -> Vec<&'static str> {
+        let mut names: Vec<&str> = COUNTERS.to_vec();
+        for row in TABLE_NAMES.iter() {
+            names.extend_from_slice(row);
+        }
+        names.extend_from_slice(&KNOB_MIRRORS);
+        names
     }
 
     fn render_src() -> Option<std::path::PathBuf> {
@@ -538,7 +664,7 @@ mod tests {
         };
         let text = std::fs::read_to_string(render.join("virtio/submit_stage.rs")).unwrap();
         let written = literals(&text);
-        for n in COUNTERS.iter().chain([KNOB_MIRROR].iter()) {
+        for n in COUNTERS.iter().chain(KNOB_MIRRORS.iter()) {
             assert!(
                 written.iter().any(|l| l == n),
                 "{n} is listed but not written by virtio/submit_stage.rs"
@@ -546,10 +672,12 @@ mod tests {
         }
         for l in written.iter().filter(|l| l.starts_with("Sub")) {
             assert!(
-                COUNTERS.contains(&l.as_str()) || l == KNOB_MIRROR,
+                COUNTERS.contains(&l.as_str()) || KNOB_MIRRORS.contains(&l.as_str()),
                 "{l} is written by virtio/submit_stage.rs but not listed"
             );
         }
+        // The per-path tables are written from `TABLE_NAMES` (no literals): the file must use it.
+        assert!(text.contains("TABLE_NAMES"), "the per-path tables are not written");
     }
 
     /// No other `kmd_render` file spells one of these names (or a longer literal that the
@@ -559,8 +687,7 @@ mod tests {
         let Some(render) = render_src() else {
             return;
         };
-        let mut mine: Vec<&str> = COUNTERS.to_vec();
-        mine.push(KNOB_MIRROR);
+        let mine = all_names();
         let mut stack = std::vec![render.clone()];
         let mut checked = 0;
         while let Some(dir) = stack.pop() {
@@ -589,5 +716,6 @@ mod tests {
         assert!(checked > 20);
         let diag = std::fs::read_to_string(render.join("diag.rs")).unwrap();
         assert!(diag.contains("KnobName::new(b\"SubmitPool\")"));
+        assert!(diag.contains("KnobName::new(b\"SubStageClk\")"));
     }
 }

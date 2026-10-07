@@ -69,7 +69,7 @@ use super::gpu::{
     FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
-use super::submit_stage;
+use super::submit_stage::{self, measured};
 use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::error::NotStarted;
@@ -751,12 +751,17 @@ pub fn raw_roundtrip(
 /// loop as the round trip has; the worker keeps the frame owed and comes back), an allocation
 /// failure as `OutOfMemory`. On every error return nothing reached the ring and `cell` is
 /// untouched. `cell` must be `'static` (it is read by the drain after this returns).
+///
+/// Timed on `clock` (the flip's `SubF*` table, docs 24.14): `Take` (the reap's begin and the pool
+/// take, one lock hold), `Reap`, `Alloc` (a pool miss), `Copy`, then the enqueue hold's `Lock`,
+/// `Drain`, `Enq`, `Kick` as for the display submitters.
 pub fn raw_submit_async(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     req: &[u8],
     cell: &'static core::sync::atomic::AtomicU64,
     tag: u32,
+    clock: &mut Clock,
 ) -> Result<(), VirtioError> {
     const MH: usize = super::hal::MSG_HDR_LEN;
     let req_len = req.len();
@@ -772,15 +777,19 @@ pub fn raw_submit_async(
             Ok((work, pooled)) => (Ok(work), pooled),
             Err(e) => (Err(e), None),
         };
+    submit_stage::lap(clock, Stage::Take);
     reap_parked_work(passive, adapter, work);
-    let mut meta = pooled
+    submit_stage::lap(clock, Stage::Reap);
+    let meta = pooled
         .or_else(|| DmaBuffer::new(passive, total))
-        .ok_or(VirtioError::OutOfMemory)?;
+        .ok_or(VirtioError::OutOfMemory);
+    submit_stage::lap(clock, Stage::Alloc);
+    let mut meta = meta?;
     meta.as_mut_slice()[..req_len].copy_from_slice(req);
+    submit_stage::lap(clock, Stage::Copy);
     let wake = NonNull::new(adapter.hpd_event.get()).ok_or(VirtioError::DeviceError)?;
     let cell = NonNull::from(cell);
-    let queued = adapter.with_virtio(move |v| {
-        v.drain_used();
+    let queued = display_enqueue(adapter, Path::Flip, clock, move |v| {
         v.enqueue_raw_async(meta, req_len, resp_len, cell, tag, wake)
     });
     match queued {
@@ -2440,7 +2449,7 @@ pub fn count_submit_escape() {
 /// The prologue every display submitter shares: refuse an empty stream, reap
 /// parked buffers, and stage the meta + venus DMA buffers.
 ///
-/// R1004 made it one function; docs 24.13 (`SubmitPool`, default 1) made it
+/// R1004 made it one function; docs 24.14 (`SubmitPool`, default 1) made it
 /// take the two buffers from the transport's DMA POOL, as the escape path
 /// (`submit_venus_async`) always has, instead of two `MmAllocateContiguousMemory`
 /// calls per frame. `SubmitPool` 0 is the old allocate-per-submit path exactly.
@@ -2460,7 +2469,7 @@ pub fn count_submit_escape() {
 /// pattern); a miss (pool empty, nothing big enough) falls back to a fresh
 /// allocation here at PASSIVE, never under the lock and never waiting.
 ///
-/// Every stage is timed on `clock` (docs 24.13, `Sub*` counters): `Take`,
+/// Every stage is timed on `clock` (docs 24.14, `Sub*` counters): `Take`,
 /// `Reap`, `Alloc`, `Copy`.
 fn stage_display_submit(
     passive: PassiveLevel,
@@ -2525,46 +2534,41 @@ fn stage_display_submit(
     Ok((meta, venus, stream.len()))
 }
 
-/// Run one display submitter under the stage clock and fold the clock into the `Sub*` totals,
-/// whatever the outcome (docs 24.13). Atomics only beyond what `f` does.
-fn measured<T>(
-    path: Path,
-    f: impl FnOnce(&mut Clock) -> Result<T, VirtioError>,
-) -> Result<T, VirtioError> {
-    let mut clock = submit_stage::start();
-    let result = f(&mut clock);
-    submit_stage::finish(path, &clock);
-    result
-}
-
-/// The display submitters' enqueue hold: `drain_used`, then `enqueue` (one attempt), each timed
-/// on `clock` (`Lock` from the call to the first instruction under the lock, `Drain`, `Enq`, and
-/// `Kick` carved out of `Enq` by the transport's notify timer armed for this hold only).
+/// The display submitters' (and the pipelined flip's) enqueue hold: `drain_used`, then
+/// `enqueue` (one attempt), each timed on `clock` (`Lock` from the call to the first instruction
+/// under the lock, `Drain`, `Enq`, and `Kick` carved out of `Enq` by the transport's notify
+/// timer, armed for this hold only and only with `SubStageClk` on).
 ///
 /// The drain stays unconditional. When the used ring is empty it is one acquire load
 /// (`peek_used`), so there is nothing to save; when it is not, what it consumes is exactly
 /// what the enqueue may depend on in the same hold: free descriptors (the display paths do not
 /// retry a QueueFull), and the destination ownership a retired Blt released (`BltEnq::Busy`
-/// otherwise) or the windowed-Blt FIFO state. `SubDrainHit` counts the second case; docs 24.13.
+/// otherwise) or the windowed-Blt FIFO state. `SubDrainHit` counts the second case; docs 24.14.
 fn display_enqueue<R>(
     adapter: &AdapterContext,
+    path: Path,
     clock: &mut Clock,
     enqueue: impl FnOnce(&mut super::gpu::VirtioGpu) -> R,
 ) -> Result<R, NotStarted> {
+    let timing = submit_stage::timing();
     adapter.with_virtio(move |v| {
         submit_stage::lap(clock, Stage::Lock);
         if v.used_pending() {
-            submit_stage::note_drain_hit();
+            submit_stage::note_drain_hit(path);
         }
         v.drain_used();
         submit_stage::lap(clock, Stage::Drain);
-        v.arm_kick_timer();
+        if timing {
+            v.arm_kick_timer();
+        }
         let result = enqueue(v);
         submit_stage::lap(clock, Stage::Enq);
-        if let Some(kick) = v.take_kick_timer() {
-            clock.carve(Stage::Enq, Stage::Kick, u64::from(kick.ticks));
-            if !kick.notified {
-                submit_stage::note_no_kick();
+        if timing {
+            if let Some(kick) = v.take_kick_timer() {
+                clock.carve(Stage::Enq, Stage::Kick, u64::from(kick.ticks));
+                if !kick.notified {
+                    submit_stage::note_no_kick(path);
+                }
             }
         }
         result
@@ -2613,7 +2617,7 @@ pub fn submit_venus_async_scanout(
         // to attach it, so it necessarily lands on the ring the drain honours.
         let notify = adapter.scanout_notify(primary_address, ticket, keep_on_failure);
 
-        display_submit_outcome(display_enqueue(adapter, clock, move |v| {
+        display_submit_outcome(display_enqueue(adapter, Path::Scanout, clock, move |v| {
             v.enqueue_scanout_submit(ctx_id, meta, venus, venus_len, notify)
         }))
     })
@@ -2641,7 +2645,7 @@ pub fn submit_venus_async_present(
         // path above: used-ring retirement still represents GPU completion, but an
         // ordinary app/DWM BLT must not mark the physical scanout dirty or wake the
         // display refresh worker.
-        display_submit_outcome(display_enqueue(adapter, clock, move |v| {
+        display_submit_outcome(display_enqueue(adapter, Path::Present, clock, move |v| {
             match present_buffer_write {
                 Some(resource_id) => v.enqueue_async_submit_present_buffer(
                     ctx_id,
@@ -2690,7 +2694,7 @@ pub fn submit_venus_async_blt(
 ) -> Result<BltSubmit, VirtioError> {
     measured(Path::Blt, |clock| {
         let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
-        let queued = display_enqueue(adapter, clock, move |v| {
+        let queued = display_enqueue(adapter, Path::Blt, clock, move |v| {
             v.enqueue_async_submit_blt(
                 adapter,
                 ctx_id,
@@ -2783,7 +2787,7 @@ pub fn submit_venus_async_windowed_blt(
 ) -> Result<u64, VirtioError> {
     measured(Path::Windowed, |clock| {
         let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
-        display_submit_outcome(display_enqueue(adapter, clock, move |v| {
+        display_submit_outcome(display_enqueue(adapter, Path::Windowed, clock, move |v| {
             v.enqueue_async_submit_windowed_blt(
                 adapter,
                 ctx_id,
