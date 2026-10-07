@@ -25,9 +25,12 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use helios_kmd_logic::gdi_accel::{self as ga, Cmd, Surface, SurfaceClass};
+use alloc::vec::Vec;
+
+use helios_kmd_logic::gdi_accel::{self as ga, Cmd, Rect, Surface, SurfaceClass};
 
 use crate::adapter::AdapterContext;
+use crate::ddi::gdi_exec as gx;
 use crate::dxgk::*;
 
 // ---- counters (`helios_kmd_logic::gdi_accel::COUNTERS`, written here and in `gdi_exec.rs`) ------
@@ -127,7 +130,9 @@ unsafe fn surface_at(
     let info = unsafe { crate::ddi::create_allocation::present_alloc_info(Some(adapter), h) }?;
     let class = if crate::ddi::gdi_ce_glue::is_vram(info.resource_id) {
         SurfaceClass::Vram
-    } else if adapter.system_backings.is_backed(info.resource_id) {
+    } else if info.storage == crate::ddi::create_allocation::PresentAllocationStorage::PitchedStandardBuffer {
+        // A KMD standard buffer (staging, shadow, lookup table): its authoritative CPU view is
+        // reachable whether VidMm holds it in system pages or in the Venus window.
         SurfaceClass::System
     } else {
         SurfaceClass::Unreachable
@@ -179,6 +184,7 @@ pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> 
         *nrefs += 1;
     }
 
+    let mut ops: Vec<gx::Op> = Vec::new();
     let len = args.CommandLength as usize;
     if len > 0 && !args.pCommand.is_null() {
         // SAFETY: dxgkrnl's command buffer, `CommandLength` readable bytes (kernel memory, no
@@ -215,11 +221,48 @@ pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> 
             if let Some(w) = why {
                 note_why(w);
             }
-            crate::ddi::gdi_exec::note_census(&cmd, engine, dst.as_ref(), [srcs[0].as_ref(), srcs[1].as_ref()]);
-            // Stage G0: nothing is executed (an Escape is ignored by contract, not dropped).
-            if !matches!(cmd, Cmd::Escape) {
-                DROP.fetch_add(1, Ordering::Relaxed);
+            gx::note_census(&cmd, dst.as_ref(), [srcs[0].as_ref(), srcs[1].as_ref()]);
+            if matches!(cmd, Cmd::Escape) {
+                continue;
             }
+            // The destination sub-rectangles, materialised and clipped.
+            let mut subs: Vec<Rect> = Vec::new();
+            let dst_rect = cmd.dst_rect();
+            let count = cmd.subs().count() as usize;
+            if subs.try_reserve_exact(count.max(1)).is_err() {
+                DROP.fetch_add(1, Ordering::Relaxed);
+                note_why(ga::Why::CpuFailed);
+                continue;
+            }
+            match cmd.subs() {
+                ga::SubRects::None => subs.push(gx::clip_sub(&dst_rect, &dst_rect, dst.as_ref())),
+                ga::SubRects::Inline { offset, count } => {
+                    for i in 0..count {
+                        if let Some(r) = ga::inline_rect(bytes, offset, i) {
+                            subs.push(gx::clip_sub(&r, &dst_rect, dst.as_ref()));
+                        }
+                    }
+                }
+                ga::SubRects::External { ptr, count } => {
+                    // SAFETY: dxgkrnl's kernel array of `count` RECTs (bounded by the parser's
+                    // MAX_SUB_RECTS); kernel buffers need no try/except (DDI remarks).
+                    let raw = unsafe {
+                        core::slice::from_raw_parts(ptr as *const u8, count as usize * ga::layout::RECT_BYTES)
+                    };
+                    for i in 0..count {
+                        if let Some(r) = ga::rect_at(raw, i) {
+                            subs.push(gx::clip_sub(&r, &dst_rect, dst.as_ref()));
+                        }
+                    }
+                }
+            }
+            subs.retain(|r| !r.is_empty());
+            if ops.try_reserve(1).is_err() {
+                DROP.fetch_add(1, Ordering::Relaxed);
+                note_why(ga::Why::CpuFailed);
+                continue;
+            }
+            ops.push(gx::Op { cmd, dst, srcs, engine, why, subs });
         }
     }
 
@@ -229,6 +272,7 @@ pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> 
     // the list honest.
     let room = if args.pPatchLocationListOut.is_null() { 0 } else { args.PatchLocationListOutSize as usize };
     if nrefs > room {
+        // Nothing committed yet: dxgkrnl retries with fresh lists and the commands are parsed again.
         return crate::ddi::present_packet::STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
     }
     for (k, &index) in refs[..nrefs].iter().enumerate() {
@@ -246,9 +290,19 @@ pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> 
 
     // The private data: a RenderKm buffer carries no Present, flip or execution record. dxgkrnl
     // recycles DMA buffers, so the whole private range is cleared first (a stale `HPBL` prefix
-    // would gate this buffer's fence on an old copy), then the job record is written (job 0 in
-    // G0: SubmitCommand ignores it).
-    let job = 0u64;
+    // would gate this buffer's fence on an old copy), then the job record is written. Job 0 (no
+    // command to run, or the table refused it) makes SubmitCommand gate nothing.
+    let job = if ops.is_empty() {
+        0
+    } else {
+        let n_ops = ops.len() as u32;
+        let id = gx::commit(ops);
+        if id == 0 {
+            DROP.fetch_add(n_ops, Ordering::Relaxed);
+            note_why(ga::Why::CpuFailed);
+        }
+        id
+    };
     let rec = ga::Private { job }.encode();
     if !args.pDmaBufferPrivateData.is_null() {
         let size = args.DmaBufferPrivateDataSize as usize;
