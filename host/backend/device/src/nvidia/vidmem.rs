@@ -110,7 +110,7 @@ impl NvidiaBackend {
     /// The layout to act on: this release's own, never a neighbour's, whose
     /// index numbers would rewrite whichever field now holds them.
     fn vidmem_layout(&self) -> Option<&'static Layout> {
-        self.vidmem.filter(|s| s.exact).map(|s| s.layout)
+        self.start.vidmem.filter(|s| s.exact).map(|s| s.layout)
     }
 
     /// Admit a video-memory allocation before the host sees it, or answer it

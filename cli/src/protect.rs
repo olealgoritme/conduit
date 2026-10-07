@@ -3,8 +3,9 @@
 //! A guest's video memory comes out of the same card as the host's own. When
 //! that card also drives a monitor, a guest that fills it leaves the desktop's
 //! next allocation to fail, and the compositor with it. So the backend gets a
-//! video-memory cap when safe mode is on and the NVIDIA card has a connected
-//! display, unless the owner said otherwise (`gpu.vram_limit_mib`).
+//! video-memory cap when safe mode is on or the owner asks for one
+//! (`gpu.vram_limit_mib`). [`final_limit_mib`] is the one rule that computes
+//! the number; the backend enforces it as given.
 //!
 //! One rule decides what is on by default: [`protection`], from the loaded
 //! driver. The setup Conduit was built and tested on (open kernel modules,
@@ -246,27 +247,51 @@ pub fn safe_mode(
     }
 }
 
-/// `--vram-limit-mib` for the backend. A number is the owner's, `off` is none;
-/// `auto` is the default cap when the card drives a display; unset is that
-/// same cap only while safe mode is on. Nothing when there is no display to
-/// protect or no NVIDIA card to ask.
+/// What safe mode holds a guest's video memory to, whatever else is set.
+pub const SAFE_MODE_VRAM_MIB: u64 = 2048;
+
+/// The one rule for the backend's video-memory limit, and the only place it
+/// is computed: the backend enforces the number it is given and has no rule
+/// of its own.
+///
+/// The limit is the smallest of
+///   - `gpu.vram_limit_mib`, when it is a number;
+///   - the display default (`display_default`), when it applies: setting
+///     `auto`, or unset with safe mode on, and the card drives a monitor;
+///   - [`SAFE_MODE_VRAM_MIB`], when safe mode is on.
+///
+/// `off` drops the first two, so with safe mode off it means no limit. Safe
+/// mode's 2 GiB is a ceiling nothing here raises, a larger number and `off`
+/// included: to lift it, switch safe mode off (`gpu.safe_mode false`).
+pub fn final_limit_mib(
+    setting: crate::config::VramSetting,
+    safe_mode: bool,
+    display_default: Option<u64>,
+) -> Option<u64> {
+    use crate::config::VramSetting::*;
+    let owner = match setting {
+        Off => None,
+        Mib(n) => Some(n),
+        Auto => display_default,
+        Default => safe_mode.then_some(display_default).flatten(),
+    };
+    [owner, safe_mode.then_some(SAFE_MODE_VRAM_MIB)]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// `--vram-limit-mib` for the backend: [`final_limit_mib`] with the display
+/// default read from sysfs (only when the setting could use it).
 pub fn vram_limit_mib(
     drm_root: &Path,
     setting: crate::config::VramSetting,
     safe_mode: bool,
 ) -> Option<u64> {
-    use crate::config::VramSetting::*;
-    let display_default = || {
-        let card = nvidia_card(drm_root)?;
-        card.drives_display()
-            .then(|| default_limit_mib(card.total_vram_mib()))
-    };
-    match setting {
-        Off => None,
-        Mib(n) => Some(n),
-        Auto => display_default(),
-        Default => safe_mode.then(display_default).flatten(),
-    }
+    let display_default = nvidia_card(drm_root)
+        .filter(Card::drives_display)
+        .map(|card| default_limit_mib(card.total_vram_mib()));
+    final_limit_mib(setting, safe_mode, display_default)
 }
 
 /// What a backend start gets: the flag and the environment.
@@ -419,7 +444,7 @@ mod tests {
     fn the_setting_overrides_the_default_either_way() {
         let t = drm("0x2783", &[("DP-2", "connected", "enabled")]);
         assert!(nvidia_card(&t.0).unwrap().display_active());
-        assert_eq!(vram_limit_mib(&t.0, VramSetting::Off, true), None);
+        assert_eq!(vram_limit_mib(&t.0, VramSetting::Off, false), None);
         assert_eq!(
             vram_limit_mib(&t.0, VramSetting::Mib(2000), false),
             Some(2000)
@@ -511,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_565_77_with_a_monitor_gets_safe_mode_and_the_display_cap() {
+    fn closed_565_77_with_a_monitor_gets_safe_mode_and_2_gib_not_half_the_card() {
         for d in [
             drv("565.77", false),
             drv("595.104.02", false),
@@ -522,12 +547,12 @@ mod tests {
             assert_eq!(
                 p,
                 Plan {
-                    vram_limit_mib: Some(6144),
+                    vram_limit_mib: Some(SAFE_MODE_VRAM_MIB),
                     safe_mode: true
                 }
             );
             let (args, set, _) = command_line(&p);
-            assert_eq!(args, ["--vram-limit-mib", "6144"]);
+            assert_eq!(args, ["--vram-limit-mib", "2048"]);
             assert_eq!(set.as_deref(), Some("1"));
         }
         assert_eq!(protection(None), Protection::Untested);
@@ -539,28 +564,60 @@ mod tests {
         let closed = drv("565.77", false);
         // Forced on for the proven driver.
         let p = plan_for(&proven, VramSetting::Default, SafeSetting::On, None);
-        assert_eq!((p.safe_mode, p.vram_limit_mib), (true, Some(6144)));
+        assert_eq!((p.safe_mode, p.vram_limit_mib), (true, Some(2048)));
         // Forced off for the untested one: nothing reaches the backend.
         let p = plan_for(&closed, VramSetting::Default, SafeSetting::Off, None);
         assert_eq!((p.safe_mode, p.vram_limit_mib), (false, None));
         // The environment is an explicit setting too.
         assert!(plan_for(&proven, VramSetting::Default, SafeSetting::Auto, Some("1")).safe_mode);
         assert!(!plan_for(&closed, VramSetting::Default, SafeSetting::Auto, Some("0")).safe_mode);
-        // A number or `auto` caps even a proven driver; `off` removes the
-        // cap even on an untested one while safe mode stays on.
+        // A number or `auto` caps even a proven driver; `off` cannot lift
+        // safe mode's 2 GiB, only switching safe mode off does.
         let p = plan_for(&proven, VramSetting::Mib(3000), SafeSetting::Auto, None);
         assert_eq!((p.safe_mode, p.vram_limit_mib), (false, Some(3000)));
         let p = plan_for(&proven, VramSetting::Auto, SafeSetting::Auto, None);
         assert_eq!((p.safe_mode, p.vram_limit_mib), (false, Some(6144)));
         let p = plan_for(&closed, VramSetting::Off, SafeSetting::Auto, None);
-        assert_eq!((p.safe_mode, p.vram_limit_mib), (true, None));
+        assert_eq!((p.safe_mode, p.vram_limit_mib), (true, Some(2048)));
         let (_, set, _) = command_line(&p);
         assert_eq!(set.as_deref(), Some("1"));
     }
 
     #[test]
-    fn a_headless_untested_card_is_in_safe_mode_without_a_cap_flag() {
+    fn a_headless_untested_card_gets_the_safe_mode_cap() {
         let t = drm("0x2783", &[("DP-1", "disconnected", "disabled")]);
-        assert_eq!(vram_limit_mib(&t.0, VramSetting::Default, true), None);
+        assert_eq!(vram_limit_mib(&t.0, VramSetting::Default, true), Some(2048));
+    }
+
+    /// The one rule, as a table: (setting, safe mode, display default) -> the
+    /// smallest of the owner's number, the display default and 2 GiB.
+    #[test]
+    fn the_final_limit_is_the_smallest_of_number_display_default_and_safe_mode() {
+        use VramSetting::*;
+        let half = Some(16384); // a monitor on a 32 GiB card
+        for (setting, safe, display, want) in [
+            // Safe mode with a monitor: 2 GiB, not half the card (the defect).
+            (Default, true, half, Some(2048)),
+            (Default, true, None, Some(2048)),
+            (Auto, true, half, Some(2048)),
+            // A smaller number wins; a larger one does not raise the cap.
+            (Mib(1024), true, half, Some(1024)),
+            (Mib(8192), true, half, Some(2048)),
+            (Off, true, half, Some(2048)),
+            // A small card's display default is below 2 GiB.
+            (Default, true, Some(1024), Some(1024)),
+            // Safe mode off: the owner's number, the default for `auto`, or none.
+            (Default, false, half, None),
+            (Auto, false, half, half),
+            (Auto, false, None, None),
+            (Mib(8192), false, half, Some(8192)),
+            (Off, false, half, None),
+        ] {
+            assert_eq!(
+                final_limit_mib(setting, safe, display),
+                want,
+                "{setting:?} safe={safe} display={display:?}"
+            );
+        }
     }
 }

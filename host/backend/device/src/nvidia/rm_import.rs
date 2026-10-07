@@ -446,7 +446,7 @@ impl NvidiaBackend {
                 let Ok(fd) = self.handles.get_raw(owner as u64) else {
                     return;
                 };
-                let Some(devinfo) = self.devinfo else {
+                let Some(devinfo) = self.start.devinfo else {
                     return;
                 };
                 tiling_of(&*self.host, fd, &devinfo.layout).and_then(|t| modifier_for(layout, t))
@@ -699,7 +699,7 @@ mod tests {
         object_size: u64,
     ) -> (NvidiaBackend, u64, u64, Arc<Mutex<Vec<u64>>>) {
         let mut be = NvidiaBackend::for_test();
-        be.devinfo = abi::devinfo::select(release);
+        be.start.devinfo = abi::devinfo::select(release);
         let calls = Arc::new(Mutex::new(Vec::new()));
         be.set_host(Box::new(DrmHost {
             object_size,

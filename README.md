@@ -258,7 +258,8 @@ isolation like a dedicated GPU: only run VMs you trust. See
 
 The guest's video memory comes out of the same card as your desktop. On a
 driver or GPU that is not the tested one (the closed NVIDIA modules, a driver
-before 580), Conduit starts in **safe mode**: a 2 GiB video-memory limit and
+before 580), Conduit starts in **safe mode**: a 2 GiB video-memory limit (a smaller
+`gpu.vram_limit_mib` stays) and
 1 s bounds on blocking GPU calls; `conduit doctor` shows whether it is on and
 why. Cards other than the RTX 5090 (Ada, Ampere, Turing) have not been run
 yet: for a first run keep an ssh session or a text console open on the host

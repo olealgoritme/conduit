@@ -228,7 +228,7 @@ impl NvidiaBackend {
     /// from whatever follows the buffer. It is the backend that knows which
     /// release the host runs, so the sizes come from here.
     pub(super) fn write_alloc_size_section(&self, buf: &mut [u8]) -> usize {
-        let Some(sel) = self.rmallow else {
+        let Some(sel) = self.start.rmallow else {
             // Nothing learned about the host yet, so nothing to say. The guest
             // keeps its own table, which is where it was before this section.
             return 0;
@@ -284,7 +284,7 @@ impl NvidiaBackend {
     /// Which byte to look at is the host release's business, so it comes from
     /// here, and the backend checks what comes back.
     pub(super) fn write_uvm_section(&self, buf: &mut [u8]) -> usize {
-        let Some(sel) = self.uvm else {
+        let Some(sel) = self.start.uvm else {
             // No release known, so nothing to say. The guest refuses every UVM
             // call rather than guessing, which is what the backend does too.
             return 0;
@@ -358,7 +358,7 @@ impl NvidiaBackend {
     /// sends no pages, and a registration with no pages is refused, which is
     /// the same answer as before this existed.
     pub(super) fn write_osdesc_section(&self, buf: &mut [u8]) -> usize {
-        let Some(d) = self.osdesc else {
+        let Some(d) = self.start.osdesc else {
             return 0;
         };
         // magic, class, vid_heap_function, vid_heap_function_at,
@@ -426,7 +426,7 @@ impl NvidiaBackend {
     pub(super) fn write_dri_section(&self, buf: &mut [u8]) -> usize {
         // Without graphics there is no render node to offer, and a guest told
         // of none creates none, whatever it knows about capabilities.
-        let devices = if self.caps.has(crate::caps::GRAPHICS) {
+        let devices = if self.start.caps.has(crate::caps::GRAPHICS) {
             self.dri_devices()
         } else {
             Vec::new()
@@ -451,7 +451,7 @@ impl NvidiaBackend {
     /// device forwards compute and render; handing one out would be a
     /// different kind of access than the guest asked for.
     pub(super) fn dri_devices(&self) -> Vec<DriDevice> {
-        let layout = self.devinfo.map(|s| s.layout);
+        let layout = self.start.devinfo.map(|s| s.layout);
         let mut out = Vec::new();
         for (index, slot) in crate::host::gpu_slots(std::path::Path::new(FileTree::Proc.root()))
             .iter()

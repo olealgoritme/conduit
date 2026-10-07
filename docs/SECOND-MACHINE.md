@@ -18,15 +18,18 @@ status, first-hour plan for an RTX 4070) first. Background: [WINDOWS.md](WINDOWS
   only for a version it has tables for. A release without them is refused.
   Its tables are generated offline, with no GPU
   (`.github/scripts/abi_update.py`, `host/backend/gen/README.md`): rmctrl,
-  rmallow, uvm, vidmem, osdesc, devinfo, nvkms and the escape sizes. Two
-  lists are still edited by hand for a new release: the `PROFILES` of
-  `abi::devinfo` and the includes in `guest/linux/nvgpu_devinfo.h`.
+  rmallow, uvm, vidmem, osdesc, devinfo, nvkms and the escape sizes. The
+  `PROFILES` lists of `abi::devinfo` and `abi::nvkms` and the includes in
+  `guest/linux/nvgpu_devinfo.h` are still edited by hand for a new release (a
+  missed `PROFILES` entry keeps the release refused and fails
+  `accepted_releases_match_the_cli_list`; a missed include is not checked).
 - With the closed modules or a branch older than 580 (565.77 is the first
-  such setup), the backend starts in safe mode by itself: a 2 GiB
-  video-memory limit and 1 s clamps on blocking GPU calls, plus the display
-  default limit when a monitor is on the NVIDIA card. `conduit doctor` says
-  whether safe mode is on and why, the limit guests get, and the card's BAR1
-  size. Turn it off once the setup has proven itself:
+  such setup), the backend starts in safe mode by itself: a video-memory
+  limit of 2 GiB (the smallest of 2 GiB, the display default and your
+  `gpu.vram_limit_mib` number, [SECURITY.md](SECURITY.md)) and 1 s clamps on
+  blocking GPU calls. `conduit doctor` says whether safe mode is on and which
+  source decided (the setting, your shell, or the driver), the limit guests
+  get, and the card's BAR1 size. Turn it off once the setup has proven itself:
   `conduit config set gpu.safe_mode false` ([SECURITY.md](SECURITY.md)).
 - The NVIDIA Vulkan driver of the same release (`conduit-venus` uses it for
   the Venus fallback).

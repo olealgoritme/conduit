@@ -59,7 +59,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
         }
 
-        let Some(sel) = self.uvm else {
+        let Some(sel) = self.start.uvm else {
             self.note_allow_refusal(
                 format!("UVM {request:#x}"),
                 "the host driver release is not known yet, so nothing says what this call is"
@@ -164,7 +164,9 @@ impl NvidiaBackend {
                     "this release has no flag to disable pageable access and the VA space \
                      reports it on, so the GPU could fault on host memory the guest never \
                      registered (host driver {})",
-                    self.driver.expect("a UVM table implies a known release")
+                    self.start
+                        .driver
+                        .expect("a UVM table implies a known release")
                 ),
             );
             traced_refusal!(self, UvmPageable);
