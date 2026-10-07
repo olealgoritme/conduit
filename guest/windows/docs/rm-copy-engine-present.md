@@ -919,9 +919,9 @@ the error notifier through the kernel views and advances `ce_present::Ring`; a s
 | VA space | `FERMI_VASPACE_A` index `GPU_DEVICE` | the same |
 | generation | `--gen` | `GET_CLASSLIST_V2` (nvk-rm 0003's way) |
 | engine | the first async CE | the first async CE with `SYSMEM_WRITE` and not `SHARED`, then one with `SYSMEM_WRITE`, then the tool's rule (7.2) |
-| GPFIFO and push slots | an OS descriptor over process pages | RM system memory, write-combined, CPU view through the RM window (`MmMapIoSpace` write-combined), GPU-mapped snooped with 4 KiB pages |
+| GPFIFO and push slots | an OS descriptor over process pages | RM system memory, cached as the tool's (`RmCeCache` 1: write-combined), CPU view through the RM window armed on a fresh CONTROL file (`MmMapIoSpace` cached, or write-combined with the knob), GPU-mapped snooped with 4 KiB pages |
 | completion value | its own 4 KiB of RM system memory | a page of the ring allocation |
-| error notifier and USERD | 8 KiB RM system memory, cached | 8 KiB RM system memory, write-combined (every view agrees with the host's: no alias, `kmd-rm-client.md` 15.5) |
+| error notifier and USERD | 8 KiB RM system memory, cached | the same (the channel's private memory has no dxgkrnl view, so the level-5 alias concern of `kmd-rm-client.md` 15.5 does not apply) |
 | doorbell | the usermode object, `crm_map_memory` through the subdevice, a user-mode store | the same object and the same messages (`RM_MAP_MEMORY` on the subdevice armed on a fresh GPU file, the host's `Mmap`), then `MmMapIoSpace` UNCACHED of that range of the RM window, and the store from kernel mode: item 8 of 11.7, settled by a self-test PASS |
 | GPU VAs | packed from 0x20_0000_0000, 2 MiB apart | fixed 64 MiB windows from 0x20_0000_0000 (ring, self-test source, destination), RM's choice if the fixed range is refused, below 2^40 checked |
 | GPU timestamps, `--fence` | yes | none: the self-test's times are CPU times (`KeQueryInterruptTimePrecise`), spinning up to 20 ms then 1 ms sleeps |
@@ -938,7 +938,7 @@ the error notifier through the kernel views and advances `ce_present::Ring`; a s
 
 Once per transport generation, from the HPD worker at PASSIVE (the first pass with the RM transport up and a VidPn primary
 bound), never inside a DDI: bring the channel up; allocate a source and a destination (5763072 B each) of RM system memory
-in the channel's client (write-combined, CPU views, GPU mappings); fill the source with a salted position-dependent pattern;
+in the channel's client (cached by default, CPU views, GPU mappings); fill the source with a salted position-dependent pattern;
 copy 1600x900x4 pitch-linear twice with `ce_present::present_push`:
 1. **ready**: the producer value is set before the kick. `CeSelfUs` = kick to completion seen.
 2. **wait**: the push acquires a value the producer does not have; the worker sleeps 2 ms (a timer tick), checks the completion
@@ -972,10 +972,10 @@ back to its value without the knob), then set the knob back to 0 and restart.
 | `CeSelfUs` | about the tool's ready doorbell-to-done (below 400 us: the copy is about 200 to 350 us) | |
 | `CeSelfWaitUs` | below 50 us plus the copy | |
 | `CeSelfPages` | 1407 | |
-| `CeSelfMs` | hundreds of ms (the fill and the compares at write-combined speed) | |
+| `CeSelfMs` | tens of ms cached; hundreds with `RmCeCache` 1 (the fill and the compares at write-combined speed) | |
 | `CeChTry` / `CeChUp` / `CeChDown` | 1 / 1 / 1 per generation | |
 | `CeChStage` | 20 (the last stage started) | the stage that hung or failed |
-| `CeChFail` | 0 | `stage << 24 \| kind << 16 \| code`; kinds as `RmFail` (`kmd-rm-client.md` 3); Transport codes 0xE1 budget spent, 0xE2 StopDevice, 0xE3 the first push never landed (the doorbell from kernel mode is the first suspect); Layout 0x60 no known class set, 0x61 no async copy engine, 0x68 a GPU VA at or above 2^40; Rm with `CeNotify` set: the error notifier |
+| `CeChFail` | 0 | example: 0x0804001F = stage 8 (`CtlMap`), kind 4 (RM), code 0x1F `NV_ERR_INVALID_ARGUMENT` (11.11). `stage << 24 \| kind << 16 \| code`; kinds as `RmFail` (`kmd-rm-client.md` 3); Transport codes 0xE1 budget spent, 0xE2 StopDevice, 0xE3 the first push never landed (the doorbell from kernel mode is the first suspect); Layout 0x60 no known class set, 0x61 no async copy engine, 0x68 a GPU VA at or above 2^40; Rm with `CeNotify` set: the error notifier |
 | `CeChSoft` | **0** | undo steps RM or the host did not confirm |
 | `CeRmErr` / `CeChanFail` / `CeNotify` | 0 / 0 / 0 | a refused caps query adds 1 to `CeRmErr` and is harmless |
 | `CeChan` / `CeChState` | 0 / 0 (torn down, cold, no strikes) | `CeChState` = `phase << 28 \| strikes << 24 \| made bits` |
@@ -983,104 +983,53 @@ back to its value without the knob), then set the knob back to 0 and restart.
 | `CeEngine` / `CeCaps` | a `COPYn` type (0x09..0x12, 0x34..0x3d) / its caps, `SYSMEM_WRITE` (0x08) set, `GRCE` (0x01) clear | |
 | `CeToken` / `CeRunlist` | the token / its runlist (bits 22:16): not GR's (the tool prints both) | |
 | `CeSubmit` | 3 (the first push and the two copies) | |
+| `CeCache` | 0 (cached; 1 with `RmCeCache` = 1) | |
+| `CeRmCall` / `CeRmStat` / `CeMapNode` | 0 / 0 / 0 | the last failing call (11.11) |
 | `CeChMs` | tens of ms | |
 
 A PASS settles items 3 (no `NON_STALL_INTERRUPT` is used), 5 (does not arise) and 8 (the kernel-mode doorbell) of 11.7 for
-the KMD client, and that a write-combined RM system-memory ring, USERD and notifier work for a CE channel. It says nothing
+the KMD client, and that an RM system-memory ring, USERD and notifier (of the kind `CeCache` names) work for a CE channel. It says nothing
 about block-linear sources, dups of NVK's memory or the destination descriptors (M3c).
 
-## 12. The NVK and UMD side (as built)
+### 11.11 The 348.1 failure: system memory mapped on the wrong kind of file (fixed)
 
-The producer half of 10.2. Nothing here changes what the KMD does with a Present: an older KMD reads the
-first 48 / 96 bytes as before, and the record only reaches a KMD that says it reads it.
+The first hardware run (348.1, 1920x1080@240, `RmCopyEngine` = 2) stopped at stage 8: `CeChStage` = 8 (`CtlMap`),
+`CeChFail` = 0x0804001F (stage 8, kind 4 = RM status, code 0x1F = `NV_ERR_INVALID_ARGUMENT`), `CeSelfTest` = 0xE1,
+`CeSelfWhy` = 0x1F, `CeRmErr` = 1, `CeChState` = 0x51000000 (cool-down, one strike). Stages 1 to 7 passed, among them the
+doorbell's CPU view (stage 6).
 
-### 12.1 NVK: `queue_rm_fence_v3` (`patches-windows/0053`)
+Cause, in the KMD: `cpu_map` armed EVERY CPU view on a fresh GPU file (the minor, tied with `REGISTER_FD`), the way
+`rm_client.rs`'s level 2 maps VIDEO memory. RM maps system memory only on a control file: librmclient's `map_node_hint`
+(`guest/rmclient/src/rmclient.c`) sends `NV01_MEMORY_SYSTEM` and OS descriptors to the control node, and
+`win_map_memory` (`transport_windows.c`) opens a fresh control file (no `REGISTER_FD`) for them; a map on the wrong kind
+is answered `NV_ERR_INVALID_ARGUMENT` ("wrong channel kind, RM already undid its side"), after which librmclient retries
+once on the other kind. The doorbell (BAR memory) is mapped on a GPU file, which is why stage 6 passed. The host passes
+`RM_MAP_MEMORY` through as it is (`host/backend/device/src/nvidia/rm_fd.rs` `dispatch_map_memory`: the embedded file
+handle translated, the status returned unchanged), and serves a write-combined mapping of system memory for a user client
+(the DWM/NVK log): the cache attribute was not the cause. The NVOS33 block matched librmclient's (`rc::nvos33_with_fd`:
+hClient 0, hDevice 4 = the device, hMemory 8, offset 16, length 24, flags 44 = 0, fd 48).
 
-`helios_icd_interface.h` version 6 appends one entry and two structs:
+Fix: `rm_ce_channel::MapNode` picks the kind by class (system memory and OS descriptors: a fresh control file, no
+`REGISTER_FD`; anything else: a GPU file with `REGISTER_FD`), and `cpu_map` retries once on the other kind after RM's
+`INVALID_ARGUMENT`, as librmclient does. The kernel view is placed in the region of the map file's device type (the RM
+window for both). Every stage that maps system memory had the same fault: stage 8 (`CtlMap`), stage 10 (`RingMap`) and the
+self-test's source and destination views (stage 0xE2 / 0xE3 of `CeSelfTest`); allocations (stages 7 and 9, the self-test's
+buffers), GPU mappings (stage 11) and the channel objects (12 to 19) never take a map file and were not affected.
 
-```c
-VkResult (*queue_rm_fence_v3)(VkDevice, VkQueue, VkDeviceMemory memory, VkImage image,
-                              uint32_t *fence_handle, uint64_t *value,
-                              struct helios_icd_rm_copy *copy);
-struct helios_icd_rm_copy { struct helios_icd_rm_semaphore semaphore;   /* 24 bytes */
-                            struct helios_icd_rm_source source; };     /* 56 bytes */
-```
+Also changed with it:
+- **`RmCeCache`** (service-key REG_DWORD, read at StartDevice when `RmCopyEngine` is nonzero, mirrored as `CeCache`): 0
+  (default) the channel's own RM system memory is CACHED, as the tool allocates it (`NVOS32_ATTR_COHERENCY_CACHED`), and its
+  kernel views are `MmCached`; 1 write-combined memory and `MmWriteCombined` views (M3b's first choice), for an A/B. The
+  doorbell stays uncached.
+- **The failing call is named**: `CeRmCall` = `esc << 24 | what` (`esc` 0x2b ALLOC with the class, 0x2a CONTROL with the
+  command's low 24 bits, 0x29 FREE, 0x4e MAP_MEMORY, 0x4f UNMAP_MEMORY, 0x57 / 0x58 MAP / UNMAP_MEMORY_DMA with the object
+  handle's low 24 bits; 0xf1 the `Open` of a map file with its device type, 0xf2 the host's `Mmap`, 0xf3 `MmMapIoSpace`),
+  `CeRmStat` = RM's status (or `0x8000_0000 | kind << 16 | code`), `CeMapNode` = `node << 28 | map file handle` of a failed CPU
+  view (node 1 control file, 2 GPU file). The 348.1 failure would have read `CeRmCall` 0x4e4d3003, `CeRmStat` 0x1F,
+  `CeMapNode` 0x2000_00xx.
 
-The two structs are, member for member, `HeliosRmSemaphoreLoc` and `HeliosRmCopySource` of
-`helios_rm_fence.h` (the header's own static asserts pin the C sizes, and the protocol test
-`the_icd_copy_struct_is_the_record_s_semaphore_and_source` pins the member order against the Rust record).
-The ICD does not build the `'HEF3'` record itself: Mesa carries a verbatim copy of `helios_icd_interface.h`
-and nothing else of the protocol, so the UMD adds the magic, version, flags and byte count.
-
-Return codes (a change from the proposal in 10.2, which returned an error with the fence still owned):
-
-| result | fence | `*copy` |
-|---|---|---|
-| `VK_SUCCESS` | the caller's | filled; `semaphore.value == *value` |
-| `VK_INCOMPLETE` | the caller's | all zero: the image cannot be described |
-| an error | none | all zero (`VK_ERROR_FEATURE_NOT_PRESENT`: no RM fences, wait on the CPU as before) |
-
-A non-negative result therefore always means "the fence is yours", the same rule as `queue_rm_fence`.
-
-How each value is found (the table of 10.2, as implemented):
-- the fence: `nvk_queue_rm_fence_sync`, which is `nvk_queue_rm_fence` that also returns the present timeline's
-  `vk_sync`. The source is described before the fence is made, so a refusal changes nothing.
-- the semaphore: `nvkmd_rm_rmfence_semaphore` finds the timeline under `rmfence_mutex` and returns
-  `lib->root(client)`, `nvkmd_rm_mem(rf->mem)->h_memory` and `index * entry_size_B`. That is the same entry
-  `rmfence_tl_locked` gave the semaphore surface.
-- the source: `helios_image_layout(image, formats = true)`, one plane only. The memory must be the image's
-  dedicated memory, and the handles come from `nvkmd_rm_mem_rm_handles` (the device's root client and
-  `h_memory`). `size` is `mem->size_B`.
-- refusals (`VK_INCOMPLETE`): no image or memory, not dedicated, `is_compressed`, a layout
-  `helios_image_layout` refuses, two planes, and a block-linear image whose PTE kind differs from the kind
-  its modifier names (bits 12..19). The last one is the open item of 10.3 seen from the producer side. nil
-  picks `GENERIC_MEMORY` (0x06) for every uncompressed GB20x image and the modifier family names 0x06, so
-  today it never fires. If it ever did, the KMD would map the source with a kind other than NVK's.
-
-### 12.2 UMD: the 168-byte `HERF` and the 192-byte `HEPR`
-
-- **Capability.** `HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3` = `QUERY_CAPS.supported_ops` bit 37 (Rust
-  `protocol/src/rm_fence_v3.rs`, C `helios_rm_fence.h` and `rmclient/src/helios_nvrm_escape.h`). This is the
-  bit 10.2 left "to be assigned in M3c". The KMD sets it when it parses the record, whatever `RmCopyEngine`
-  says: the record is an input, and the route decision stays the KMD's. The UMD reads it with the cached
-  per-process `QUERY_CAPS` that the flush gate already asks (`scanout_acquire::nvrm_supported_ops`).
-- **When the record is filled.** `nvk_present_frame` -> `nvk_marker_fence` (`umd/src/forward/present.rs`),
-  only on the composed path that already sends an RM fence in the marker (carrier (b), `NvkRmFencePresent`).
-  All of these must hold: bit 37, the knob `NvkRmCopyRecord` (default 1, `HELIOS_NVK_RM_COPY_RECORD`), and a
-  shown resource that is the WDDM present's source. When DXGI hands a destination resource, the UMD copies
-  into it itself, the KMD's Blt source is not what NVK rendered, and no record is sent. Otherwise the fence
-  goes alone through `nvk_present_fence`, exactly as before.
-- **The bridge.** `HeliosDxvkDevice::nvk_present_fence_v3` (`umd/bridge/dxvk_bridge.cpp`) takes DXVK's
-  submission lock like `queue_rm_fence` and resolves the texture's `VkImage`/`VkDeviceMemory`. An image at a
-  non-zero memory offset is passed as null, so NVK answers `VK_INCOMPLETE`. An NVK without the entry gets
-  the plain `queue_rm_fence`, with return code 2 = fence only.
-- **The check before sending.** `helios_protocol::producer_record` builds the record from the 80 bytes and
-  applies every rule the KMD applies (`HeliosRmFenceTailV3::validate`, `matches_fence`). A record the KMD
-  would refuse is never sent: the frame goes with the 48 / 96-byte fence form, and the reason is counted.
-- **The wire.** `PresentStreamCorrelation.rm_copy` carries the record. The `HERF` becomes
-  `HeliosPresentRefreshCmdRmCopy` (168 bytes, the on-scanout slot 48..72 zero) and the `HEPR` becomes
-  `HeliosPresentRenderCmdRmCopy` (192 bytes). `command_length_and_label` and the writer both decide through
-  `rm_copy_record`, so the length and the bytes cannot disagree. The record never travels with the on-scanout
-  tag, because an on-scanout frame is not copied.
-- **Log lines.** `NVK present: copy-engine record: semaphore ... source ...` (the first record, every field),
-  `copy-engine record not sent: <why>` (first 8, then every 4096th), `NVK described no copy source`, and
-  the record / without / refused counts on the every-4096th `WDDM presents carry an RM fence` line.
-
-### 12.3 Tests and what is unverified
-
-- Host: the protocol crate (`cargo test` in `guest/windows/protocol`): the carriers place the record where
-  the KMD reads it, the ICD struct mirror, the capability bit is free, and `producer_record`'s refusals. The
-  NVK series applies in order and cross-builds (`build-windows.sh`, x86_64). The Windows test tool builds
-  (`guest/nvk-rm/windows/build-tests.sh`).
-- Guest, not run yet: `vk_rmfence_test.exe` now ends with a `copy record` check. It fills a dedicated
-  1920x1080 image, calls `queue_rm_fence_v3`, checks the record against the KMD's rules (value equal to the
-  fence's, 8-aligned offset in the 4 KiB surface, handles nonzero, the image inside its memory, the GB20x
-  family), waits for the fence, and checks the null-image case (`VK_INCOMPLETE`, record zero). It exits 2 on
-  a fault.
-- The UMD cannot be type-checked on the Linux host (WDK bindgen, clang-cl). Its first compile is the
-  Windows build.
-- End to end (M3c): the record parsed by a KMD that sets bit 37, the `h_client` check against the process's
-  recorded clients, the dup of `h_memory` from the KMD client, and the mapping kind (10.3).
+The next run reads as 11.10 says for a PASS, with `CeCache` = 0 and `CeRmCall` / `CeRmStat` / `CeMapNode` = 0; then once with
+`RmCeCache` = 1 for the A/B (`CeSelfUs`, `CeSelfWaitUs`, `CeSelfMs`).
 
 ## 12. Format conversion with the CE remap unit (M1c)
 
@@ -1181,3 +1130,207 @@ Pass criteria:
 A PASS settles the remap's methods and fields on 0xcab5 against Mesa's header (11.7 item 9) and the open question for the
 tool's own block-linear image. As with M1b, the round trip goes through one mapping, so the match with NVK's own layout and
 kind is still M3c's check (10.3). Ada (0xc7b5) stays unverified until an Ada GPU runs the tool.
+
+## 13. M3c-0 as built: the KMD parses the record and advertises it
+
+The first step of M3c: the KMD reads the `'HEF3'` record (10) behind a present marker's RM fence tail, counts it, keeps
+it beside the fence, and advertises that it does. No route uses it yet: nothing reads the kept record, and every
+Present is copied as before. Built, host-tested where pure, type-checked against the stub WDK, never compiled against
+the real WDK and never run.
+
+The producer side is the NVK/UMD branch `feat/rm-copy-engine-present-nvk` (its doc section "The NVK and UMD side",
+numbered 12 there, needs a new number when the branches meet). This branch carries that branch's protocol files
+unchanged (`protocol/src/rm_fence_v3.rs`, `protocol/include/helios_rm_fence.h`, `protocol/include/helios_icd_interface.h`,
+`rmclient/src/helios_nvrm_escape.h`), so the two merge without conflicts. Those files bring
+`HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3`, the 168-byte `HeliosPresentRefreshCmdRmCopy`, the 192-byte
+`HeliosPresentRenderCmdRmCopy` and `producer_record`.
+
+### 13.1 Where the marker is accepted and where the record is read
+
+Both carriers arrive in `DxgkDdiRender` (`kmd_render/src/ddi/submit_command.rs`); `DxgkDdiPresent` never sees command
+bytes. The KMD already accepted a longer command before this change, so no check was relaxed:
+- the only length refusal is `cmd_len > DmaSize` (the runtime grows the DMA buffer and retries). The command is copied
+  whole into the DMA buffer;
+- `HERF`: decoded when `cmd_len >= 16`, with the first 32 bytes copied into a local. The fence tail is read at 32 when
+  `cmd_len >= 48`, and the on-scanout slot at 48..72 (`onscanout::note_render`). That slot is zero in the 168-byte form
+  and parses as "no tag". Nothing past 72 was read;
+- `HEPR`: decoded when `cmd_len` covers the 48-byte prefix, with the first 80 bytes copied into a local. The fence tail
+  is read at 80 when `FLAG_RM_FENCE` is set and `cmd_len >= 96`. Nothing past 96 was read.
+
+An older KMD therefore reads a 168- or 192-byte command as the 48- or 96-byte one, as `rm_fence_v3.rs` states.
+
+The record is read in exactly one place per carrier: the arm where the fence tail goes to `attach_or_take_fence_tail`
+(a fence tail and an all-zero stream tail). `ddi/ce_record.rs::note_render` then does the following:
+1. It returns at once unless the tail is a FENCE tail (`HeliosRmFenceTail::is_fence`).
+2. It copies at most 96 bytes, once, from offset 72 (`HERF`) or 96 (`HEPR`) into a local and runs the protocol's parser
+   on them. A short tail goes through `HeliosRmFenceTailV3::parse`. A full one goes through `validate`, with the
+   command's remaining length as the bound for `bytes`, so a later, longer revision is accepted and its extra bytes are
+   ignored.
+3. It requires `matches_fence` against the tail just read (`semaphore.value == rm_fence_value`).
+4. It counts the outcome (13.2) and stashes a valid record on the context as `StashedCeRecord { boundary, record }`.
+   The slot is `ContextContext::ce_record`: plain data under a leaf spinlock with a lock-free flag, like the on-scanout
+   tag. `boundary` is what `rm_gate_attach` returned for the record's own fence, and a fence that was not attached
+   stashes nothing. Each fenced Render replaces the stash, so a record lives until the next fenced Render of the
+   context. `take_ce_record(boundary)` has no caller yet; it hands the record only to the Present whose stashed marker
+   is `StashedMarker::Resolved` with the same boundary.
+
+The record never changes the fence. It is parsed after the attach, and the attach, the marker stash and the scanout
+refresh run exactly as before. A refused record is counted and never fails the Render.
+
+**The `h_client` rule is not checked yet.** Both `h_client`s must be RM clients that the presenting process created
+(the `NvDupHarden` rule). The KMD records RM clients per NVRM owner (`nvrm_clients::ClientTable`, keyed by the escape
+device), not per process, and keeps no map from owner to process. The hook is `record_client_owned_by_presenter`. It
+returns `ClientCheck::Unknown` today and carries a TODO for M3c, which must answer it before it dups anything the record
+names. From then on a mismatch is only counted (`CeRecClient`); it never refuses the Present.
+
+What runs when no record is present:
+- a Render without a FENCE tail (Venus stream markers, `HE12`, `HEFL`, every other command): nothing new;
+- a FENCE tail in the 48- or 96-byte form: after the unchanged attach, one `is_fence` test, `available = 0` (nothing is
+  copied), one relaxed `fetch_add` (`CeRecNoCopy`, with a registry write on the first and every 256th) and one relaxed
+  load of the stash flag;
+- `DxgkDdiPresent`, SubmitCommand, the DMA buffer and the private record: unchanged.
+
+### 13.2 Counters and the capability
+
+The counters are listed in `kmd_logic::ce_record::COUNTERS` and written only by `ddi/ce_record.rs`. An exact-list test
+checks that file and checks that no other file spells the names; `rm_ce_channel`'s name scan admits that one file. The
+values live in atomics in the Render DDI. The registry is written at PASSIVE only: from the Render DDI on the first
+event, on a new refusal reason, and on every 64th refusal or 256th record, and otherwise from `publish_nvrm_counters`
+(the throttled block). All of them are zeroed at StartDevice.
+
+| value | meaning |
+|---|---|
+| `CeRecSeen` | records that passed `validate` and `matches_fence` (kept beside the fence when it was attached) |
+| `CeRecBad` | records refused |
+| `CeRecWhy` | the last refusal. 1..14 are the protocol's `TailV3Error` in declaration order (`BadMagic`, `Short`, `Version`, `Flags`, `Incomplete`, `Reserved`, `Handle`, `SemaphoreOffset`, `Value`, `Dimensions`, `Format`, `Pitch`, `Modifier`, `Size`); 15 means the semaphore value is not the fence's |
+| `CeRecMask` | every refusal seen, bit `code - 1` |
+| `CeRecNoCopy` | FENCE tails without a record (the 48- and 96-byte forms) |
+| `CeRecLast` | `semaphore.h_client` of the latest kept record (REG_DWORD) |
+| `CeRecMod` | `source.modifier` of the latest kept record (REG_QWORD) |
+
+The route's planned `CeTail*` names in `ce_present::COUNTERS` stay unwritten; M3c decides whether it still needs them
+beside these.
+
+`QUERY_CAPS.supported_ops` bit 37 (`HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3`) is part of `NVRM_OPS_IMPLEMENTED`
+(`ddi/escape.rs`). This build always sets it, whatever `RmCopyEngine` says: the record is an input, and the route
+decision stays per frame. A `kmd_logic::ce_record` test pins the bit in the protocol's Rust and C sources and in that
+mask.
+
+### 13.3 Hardware procedure (main session)
+
+Builds: this KMD, plus the UMD and the NVK series of `feat/rm-copy-engine-present-nvk`. The NVK series must include
+`patches-windows/0053` (`helios_icd_interface` version 6, `queue_rm_fence_v3`), and the D3D11 UMD runs with
+`NvkRmCopyRecord` = 1 (the default). The composed RM-fence path must be on, which it is by default (`NvkRmFence`,
+`NvkRmFencePresent`). `RmCopyEngine` stays 0: M3c-0 does not need it, and nothing reads the record anyway.
+
+1. Install the KMD and the UMD/NVK builds, restart the device, and wait for the desktop.
+2. Run a windowed (composed) DXVK-on-NVK app (Heaven windowed at 1600x900) for about a minute.
+3. Read `reg query HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render` twice, about 10 s apart, and read the UMD
+   log.
+
+Expected:
+
+| what | expected | if not |
+|---|---|---|
+| bit 37 | the UMD logs `NVK present: copy-engine record: semaphore 0x<client>/0x<memory>+<offset> value <v>, source ...` once. The UMD sends the record only after it reads bit 37 in its cached `QUERY_CAPS` | `copy-engine record not sent: <why>` gives the UMD's reason. No line at all: bit 37 was not seen, `NvkRmCopyRecord` is 0, or NVK lacks `queue_rm_fence_v3` |
+| `CeRecSeen` | grows between the two reads, about one per composed frame, in step with `RmGAtt` | 0 while `CeRecNoCopy` grows: the UMD sends the 48- or 96-byte forms |
+| `CeRecBad` / `CeRecWhy` / `CeRecMask` | 0 / 0 / 0 | the producer and the KMD disagree on a rule. The UMD's `producer_record` applies the same checks, so any value is a bug; `CeRecWhy` names the rule |
+| `CeRecNoCopy` | 0, or small (frames whose image NVK could not describe, `VK_INCOMPLETE`) | |
+| `CeRecLast` | the NVK device's root client, equal to the `semaphore 0x<client>` of the UMD's log line | |
+| `CeRecMod` | 0x0300000000606014 for Heaven's block-linear source (10.3), 0 for a LINEAR one | another value: compare it with the UMD log's `modifier` |
+| the desktop and the app | frames on screen, everything else as without the record | |
+
+A PASS shows that the record arrives intact and that the KMD reads it. It says nothing about the copy itself (M3c).
+
+## 14. The NVK and UMD side (as built)
+
+The producer half of 10.2. Nothing here changes what the KMD does with a Present: an older KMD reads the
+first 48 / 96 bytes as before, and the record only reaches a KMD that says it reads it.
+
+### 14.1 NVK: `queue_rm_fence_v3` (`patches-windows/0053`)
+
+`helios_icd_interface.h` version 6 appends one entry and two structs:
+
+```c
+VkResult (*queue_rm_fence_v3)(VkDevice, VkQueue, VkDeviceMemory memory, VkImage image,
+                              uint32_t *fence_handle, uint64_t *value,
+                              struct helios_icd_rm_copy *copy);
+struct helios_icd_rm_copy { struct helios_icd_rm_semaphore semaphore;   /* 24 bytes */
+                            struct helios_icd_rm_source source; };     /* 56 bytes */
+```
+
+The two structs are, member for member, `HeliosRmSemaphoreLoc` and `HeliosRmCopySource` of
+`helios_rm_fence.h` (the header's own static asserts pin the C sizes, and the protocol test
+`the_icd_copy_struct_is_the_record_s_semaphore_and_source` pins the member order against the Rust record).
+The ICD does not build the `'HEF3'` record itself: Mesa carries a verbatim copy of `helios_icd_interface.h`
+and nothing else of the protocol, so the UMD adds the magic, version, flags and byte count.
+
+Return codes (a change from the proposal in 10.2, which returned an error with the fence still owned):
+
+| result | fence | `*copy` |
+|---|---|---|
+| `VK_SUCCESS` | the caller's | filled; `semaphore.value == *value` |
+| `VK_INCOMPLETE` | the caller's | all zero: the image cannot be described |
+| an error | none | all zero (`VK_ERROR_FEATURE_NOT_PRESENT`: no RM fences, wait on the CPU as before) |
+
+A non-negative result therefore always means "the fence is yours", the same rule as `queue_rm_fence`.
+
+How each value is found (the table of 10.2, as implemented):
+- the fence: `nvk_queue_rm_fence_sync`, which is `nvk_queue_rm_fence` that also returns the present timeline's
+  `vk_sync`. The source is described before the fence is made, so a refusal changes nothing.
+- the semaphore: `nvkmd_rm_rmfence_semaphore` finds the timeline under `rmfence_mutex` and returns
+  `lib->root(client)`, `nvkmd_rm_mem(rf->mem)->h_memory` and `index * entry_size_B`. That is the same entry
+  `rmfence_tl_locked` gave the semaphore surface.
+- the source: `helios_image_layout(image, formats = true)`, one plane only. The memory must be the image's
+  dedicated memory, and the handles come from `nvkmd_rm_mem_rm_handles` (the device's root client and
+  `h_memory`). `size` is `mem->size_B`.
+- refusals (`VK_INCOMPLETE`): no image or memory, not dedicated, `is_compressed`, a layout
+  `helios_image_layout` refuses, two planes, and a block-linear image whose PTE kind differs from the kind
+  its modifier names (bits 12..19). The last one is the open item of 10.3 seen from the producer side. nil
+  picks `GENERIC_MEMORY` (0x06) for every uncompressed GB20x image and the modifier family names 0x06, so
+  today it never fires. If it ever did, the KMD would map the source with a kind other than NVK's.
+
+### 14.2 UMD: the 168-byte `HERF` and the 192-byte `HEPR`
+
+- **Capability.** `HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3` = `QUERY_CAPS.supported_ops` bit 37 (Rust
+  `protocol/src/rm_fence_v3.rs`, C `helios_rm_fence.h` and `rmclient/src/helios_nvrm_escape.h`). This is the
+  bit 10.2 left "to be assigned in M3c". The KMD sets it when it parses the record, whatever `RmCopyEngine`
+  says: the record is an input, and the route decision stays the KMD's. The UMD reads it with the cached
+  per-process `QUERY_CAPS` that the flush gate already asks (`scanout_acquire::nvrm_supported_ops`).
+- **When the record is filled.** `nvk_present_frame` -> `nvk_marker_fence` (`umd/src/forward/present.rs`),
+  only on the composed path that already sends an RM fence in the marker (carrier (b), `NvkRmFencePresent`).
+  All of these must hold: bit 37, the knob `NvkRmCopyRecord` (default 1, `HELIOS_NVK_RM_COPY_RECORD`), and a
+  shown resource that is the WDDM present's source. When DXGI hands a destination resource, the UMD copies
+  into it itself, the KMD's Blt source is not what NVK rendered, and no record is sent. Otherwise the fence
+  goes alone through `nvk_present_fence`, exactly as before.
+- **The bridge.** `HeliosDxvkDevice::nvk_present_fence_v3` (`umd/bridge/dxvk_bridge.cpp`) takes DXVK's
+  submission lock like `queue_rm_fence` and resolves the texture's `VkImage`/`VkDeviceMemory`. An image at a
+  non-zero memory offset is passed as null, so NVK answers `VK_INCOMPLETE`. An NVK without the entry gets
+  the plain `queue_rm_fence`, with return code 2 = fence only.
+- **The check before sending.** `helios_protocol::producer_record` builds the record from the 80 bytes and
+  applies every rule the KMD applies (`HeliosRmFenceTailV3::validate`, `matches_fence`). A record the KMD
+  would refuse is never sent: the frame goes with the 48 / 96-byte fence form, and the reason is counted.
+- **The wire.** `PresentStreamCorrelation.rm_copy` carries the record. The `HERF` becomes
+  `HeliosPresentRefreshCmdRmCopy` (168 bytes, the on-scanout slot 48..72 zero) and the `HEPR` becomes
+  `HeliosPresentRenderCmdRmCopy` (192 bytes). `command_length_and_label` and the writer both decide through
+  `rm_copy_record`, so the length and the bytes cannot disagree. The record never travels with the on-scanout
+  tag, because an on-scanout frame is not copied.
+- **Log lines.** `NVK present: copy-engine record: semaphore ... source ...` (the first record, every field),
+  `copy-engine record not sent: <why>` (first 8, then every 4096th), `NVK described no copy source`, and
+  the record / without / refused counts on the every-4096th `WDDM presents carry an RM fence` line.
+
+### 14.3 Tests and what is unverified
+
+- Host: the protocol crate (`cargo test` in `guest/windows/protocol`): the carriers place the record where
+  the KMD reads it, the ICD struct mirror, the capability bit is free, and `producer_record`'s refusals. The
+  NVK series applies in order and cross-builds (`build-windows.sh`, x86_64). The Windows test tool builds
+  (`guest/nvk-rm/windows/build-tests.sh`).
+- Guest, not run yet: `vk_rmfence_test.exe` now ends with a `copy record` check. It fills a dedicated
+  1920x1080 image, calls `queue_rm_fence_v3`, checks the record against the KMD's rules (value equal to the
+  fence's, 8-aligned offset in the 4 KiB surface, handles nonzero, the image inside its memory, the GB20x
+  family), waits for the fence, and checks the null-image case (`VK_INCOMPLETE`, record zero). It exits 2 on
+  a fault.
+- The UMD cannot be type-checked on the Linux host (WDK bindgen, clang-cl). Its first compile is the
+  Windows build.
+- End to end (M3c): the record parsed by a KMD that sets bit 37, the `h_client` check against the process's
+  recorded clients, the dup of `h_memory` from the KMD client, and the mapping kind (10.3).

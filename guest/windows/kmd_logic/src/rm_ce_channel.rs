@@ -970,6 +970,112 @@ impl Svc {
     }
 }
 
+// ── CPU views: which map channel, which cache attribute ──────────────────────────────────────
+
+/// The kind of file a CPU view's `RM_MAP_MEMORY` is armed on (librmclient's `map_node_hint`,
+/// `transport_windows.c` `win_map_memory`): system memory maps on a fresh CONTROL file (device
+/// type 255, no `REGISTER_FD`), BAR memory (video memory, the usermode doorbell) on a fresh GPU
+/// file (the minor, tied to the control file with `REGISTER_FD`). The wrong kind is RM's
+/// `NV_ERR_INVALID_ARGUMENT`, after which librmclient tries the other kind once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapNode {
+    Ctl,
+    Gpu,
+}
+
+impl MapNode {
+    /// The kind for memory of `class`.
+    pub const fn for_class(class: u32) -> MapNode {
+        match class {
+            NV01_MEMORY_SYSTEM | NV01_MEMORY_SYSTEM_OS_DESCRIPTOR => MapNode::Ctl,
+            _ => MapNode::Gpu,
+        }
+    }
+
+    pub const fn other(self) -> MapNode {
+        match self {
+            MapNode::Ctl => MapNode::Gpu,
+            MapNode::Gpu => MapNode::Ctl,
+        }
+    }
+}
+
+/// `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`.
+pub const NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: u32 = 0x71;
+/// `NV_ERR_INVALID_ARGUMENT`: what RM answers a map armed on the wrong kind of file.
+pub const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
+
+/// May a failed `RM_MAP_MEMORY` be retried on the other kind of file (once)?
+pub fn retry_other_node(f: Fail, already_retried: bool) -> bool {
+    !already_retried && f.kind == FailKind::Rm && f.code == NV_ERR_INVALID_ARGUMENT
+}
+
+/// `RmCeCache`: what the channel's own RM system memory (control, ring, the self-test's buffers)
+/// is made of. 0 (default, and any other value): cached, as the tool allocates it
+/// (`NVOS32_ATTR_COHERENCY_CACHED`); 1: write-combined (M3b's first choice, for an A/B). Private
+/// channel memory has no dxgkrnl view, so the level-5 alias concern does not apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheMode {
+    Cached,
+    WriteCombine,
+}
+
+impl CacheMode {
+    pub const fn from_knob(v: u32) -> CacheMode {
+        match v {
+            1 => CacheMode::WriteCombine,
+            _ => CacheMode::Cached,
+        }
+    }
+
+    /// What RM is asked for.
+    pub const fn sysmem(self) -> crate::rm_sysmem::Cache {
+        match self {
+            CacheMode::Cached => crate::rm_sysmem::Cache::Cached,
+            CacheMode::WriteCombine => crate::rm_sysmem::Cache::WriteCombine,
+        }
+    }
+
+    /// `CeCache`: the value in force.
+    pub const fn word(self) -> u32 {
+        match self {
+            CacheMode::Cached => 0,
+            CacheMode::WriteCombine => 1,
+        }
+    }
+}
+
+// ── the failing RM call ──────────────────────────────────────────────────────────────────────
+
+/// `CeRmCall`: the last failing RM call of the channel, `esc << 24 | what & 0xff_ffff`. `esc` is
+/// the escape number (`0x2b` ALLOC, `0x2a` CONTROL, `0x29` FREE, `0x4e` MAP_MEMORY, `0x4f`
+/// UNMAP_MEMORY, `0x57` / `0x58` MAP / UNMAP_MEMORY_DMA); `what` the class for an ALLOC, the
+/// command's low 24 bits for a CONTROL (`0x2080_0170` -> `0x80_0170`), the object handle's low 24
+/// bits for the others (`0x4b4d_3003` -> `0x4d_3003`).
+pub const fn rm_call_word(esc: u32, what: u32) -> u32 {
+    ((esc & 0xff) << 24) | (what & 0x00ff_ffff)
+}
+
+/// `CeRmStat` (and `CeSelfWhy`): RM's `NV_STATUS` as it is; any other failure as
+/// `0x8000_0000 | kind << 16 | code & 0xffff`.
+pub fn fail_word(f: Fail) -> u32 {
+    if f.kind == FailKind::Rm {
+        f.code
+    } else {
+        0x8000_0000 | ((f.kind as u32) << 16) | (f.code & 0xffff)
+    }
+}
+
+/// `CeMapNode` of a failed CPU view: `node << 28 | map_ch & 0x0fff_ffff` (node 1 control file,
+/// 2 GPU file), so a dump names the file the map was armed on.
+pub const fn map_node_word(node: MapNode, map_ch: u32) -> u32 {
+    let n = match node {
+        MapNode::Ctl => 1,
+        MapNode::Gpu => 2,
+    };
+    (n << 28) | (map_ch & 0x0fff_ffff)
+}
+
 // ── the knob ─────────────────────────────────────────────────────────────────────────────────
 
 /// `RmCopyEngine` (`ce_present::KNOB`).
@@ -1030,7 +1136,7 @@ pub const fn chan_word(phase: Phase) -> u32 {
 /// pass, `0xE0 + stage` on failure ([`Stage`]), with `CeSelfWhy` the RM status of the failing
 /// call when there was one ([`why_word`]).
 pub mod selftest {
-    use super::{Fail, FailKind};
+    use super::Fail;
     use crate::ce_present::{CopyRect, Remap, SurfaceLayout};
 
     pub const WIDTH: u32 = 1600;
@@ -1095,11 +1201,7 @@ pub mod selftest {
     /// `0x8000_0000 | kind << 16 | code & 0xffff`; 0 for a failure that had no call (a mismatch,
     /// a timeout).
     pub fn why_word(f: Option<Fail>) -> u32 {
-        match f {
-            None => 0,
-            Some(f) if f.kind == FailKind::Rm => f.code,
-            Some(f) => 0x8000_0000 | ((f.kind as u32) << 16) | (f.code & 0xffff),
-        }
+        f.map_or(0, super::fail_word)
     }
 
     /// The source's word `i` (the tool's position-dependent pattern, with a per-run salt so a
@@ -1217,6 +1319,13 @@ pub const COUNTERS: &[&str] = &[
     "CeSelfWaitUs",
     "CeSelfPages",
     "CeSelfMs",
+    // The channel memory's cache attribute in force (`RmCeCache`: 0 cached, 1 write-combined);
+    // the last failing RM call (`rm_call_word`), its status (`fail_word`) and, for a CPU view, the
+    // file it was armed on (`map_node_word`).
+    "CeCache",
+    "CeRmCall",
+    "CeRmStat",
+    "CeMapNode",
 ];
 
 /// `CeGen`.
@@ -1704,6 +1813,46 @@ mod tests {
         assert_eq!(UNDO_BUDGET_MS, 3_000);
     }
 
+    // ── CPU views and the failing call ───────────────────────────────────────────────────────
+
+    #[test]
+    fn system_memory_maps_on_a_control_file_bar_memory_on_a_gpu_file() {
+        assert_eq!(MapNode::for_class(NV01_MEMORY_SYSTEM), MapNode::Ctl);
+        assert_eq!(MapNode::for_class(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR), MapNode::Ctl);
+        assert_eq!(MapNode::for_class(0xc761), MapNode::Gpu, "the usermode doorbell");
+        assert_eq!(MapNode::for_class(crate::rm_client::NV01_MEMORY_LOCAL_USER), MapNode::Gpu);
+        assert_eq!(MapNode::Ctl.other(), MapNode::Gpu);
+        // Only RM's INVALID_ARGUMENT, and only once, moves to the other kind.
+        assert!(retry_other_node(Fail::new(FailKind::Rm, 0x1f), false));
+        assert!(!retry_other_node(Fail::new(FailKind::Rm, 0x1f), true));
+        assert!(!retry_other_node(Fail::new(FailKind::Rm, 0x56), false));
+        assert!(!retry_other_node(Fail::new(FailKind::Transport, 0x1f), false));
+    }
+
+    #[test]
+    fn the_cache_knob_defaults_to_cached_like_the_tool() {
+        assert_eq!(CacheMode::from_knob(0), CacheMode::Cached);
+        assert_eq!(CacheMode::from_knob(1), CacheMode::WriteCombine);
+        assert_eq!(CacheMode::from_knob(7), CacheMode::Cached);
+        assert_eq!(CacheMode::Cached.sysmem(), crate::rm_sysmem::Cache::Cached);
+        // PCI, cached, any physicality: the tool's location and coherency.
+        assert_eq!(CacheMode::Cached.sysmem().attr(), 0x3a00_0000);
+        assert_eq!((CacheMode::Cached.word(), CacheMode::WriteCombine.word()), (0, 1));
+    }
+
+    #[test]
+    fn the_failing_call_words() {
+        // The 348.1 failure: RM_MAP_MEMORY of the control memory, INVALID_ARGUMENT.
+        assert_eq!(rm_call_word(0x4e, H_CTL), 0x4e4d_3003);
+        assert_eq!(rm_call_word(0x2b, KEPLER_CHANNEL_GROUP_A), 0x2b00_a06c);
+        assert_eq!(rm_call_word(0x2a, CTRL_GET_ENGINES_V2), 0x2a80_0170);
+        assert_eq!(fail_word(Fail::new(FailKind::Rm, 0x1f)), 0x1f);
+        assert_eq!(fail_word(Fail::new(FailKind::Host, 22)), 0x8003_0016);
+        assert_eq!(map_node_word(MapNode::Gpu, 0x123), 0x2000_0123);
+        assert_eq!(map_node_word(MapNode::Ctl, 0x123), 0x1000_0123);
+        assert_eq!(pack_failure(Stage::CtlMap as u8, Fail::new(FailKind::Rm, 0x1f)), 0x0804_001f);
+    }
+
     // ── the knob ──────────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1888,8 +2037,16 @@ mod tests {
                     }
                     checked += 1;
                     let text = std::fs::read_to_string(&p).unwrap();
-                    assert!(!text.contains("b\"Ce"), "{s} spells a Ce counter name");
                     assert!(!text.contains("b\"RmCopyEngine\""), "{s} spells the knob name");
+                    // The record's writer (M3c-0) spells only its own list, which
+                    // `ce_record`'s exact-list test checks; none of these names.
+                    if crate::ce_record::WRITERS.iter().any(|w| s.ends_with(w)) {
+                        for n in COUNTERS {
+                            assert!(!text.contains(&std::format!("b\"{n}\"")), "{s} spells {n}");
+                        }
+                        continue;
+                    }
+                    assert!(!text.contains("b\"Ce"), "{s} spells a Ce counter name");
                 }
             }
         }

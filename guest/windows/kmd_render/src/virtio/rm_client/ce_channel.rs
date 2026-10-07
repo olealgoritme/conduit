@@ -80,6 +80,13 @@ static CAPS: AtomicU32 = AtomicU32::new(0);
 static TOKEN: AtomicU32 = AtomicU32::new(0);
 static NOTIFY: AtomicU32 = AtomicU32::new(0);
 static SUBMIT: AtomicU32 = AtomicU32::new(0);
+/// `RmCeCache` in force (`CacheMode::word`: 0 cached, 1 write-combined), read at StartDevice.
+static CACHE: AtomicU32 = AtomicU32::new(0);
+/// The last failing RM call (`rm_call_word`), its status (`fail_word`), and for a CPU view the
+/// file it was armed on (`map_node_word`).
+static RM_CALL: AtomicU32 = AtomicU32::new(0);
+static RM_STAT: AtomicU32 = AtomicU32::new(0);
+static MAP_NODE: AtomicU32 = AtomicU32::new(0);
 // The self-test's results (`ce_selftest.rs` stores them; published here with the rest).
 pub(super) static SELF_TEST: AtomicU32 = AtomicU32::new(0);
 pub(super) static SELF_WHY: AtomicU32 = AtomicU32::new(0);
@@ -102,7 +109,7 @@ pub(crate) fn reset_for_start() {
     for cell in [
         &RUNLIST, &RM_ERR, &CHAN_FAIL, &CH_TRY, &CH_UP, &CH_DOWN, &CH_STAGE, &CH_FAIL, &CH_SOFT,
         &CH_MS, &GEN, &ENGINE, &CAPS, &TOKEN, &NOTIFY, &SUBMIT, &SELF_TEST, &SELF_WHY, &SELF_US,
-        &SELF_WAIT_US, &SELF_PAGES, &SELF_MS, &SELF_DONE,
+        &SELF_WAIT_US, &SELF_PAGES, &SELF_MS, &SELF_DONE, &RM_CALL, &RM_STAT, &MAP_NODE,
     ] {
         cell.store(0, Ordering::Relaxed);
     }
@@ -112,6 +119,51 @@ pub(crate) fn reset_for_start() {
     ));
     KNOB.store(v, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"CeKnob", v);
+    // `RmCeCache` (default 0 = cached, the tool's kind), mirrored as `CeCache` with the value in
+    // force. Read only when the channel can run at all.
+    let cache = if v == 0 {
+        cc::CacheMode::Cached
+    } else {
+        cc::CacheMode::from_knob(crate::diag::read_config_dword(crate::diag::knobs::RM_CE_CACHE, 0))
+    };
+    CACHE.store(cache.word(), Ordering::Relaxed);
+    if v != 0 {
+        crate::diag::record_named_bytes(b"CeCache", cache.word());
+    }
+}
+
+/// The cache attribute of the channel's own RM system memory in force.
+fn cache_mode() -> cc::CacheMode {
+    cc::CacheMode::from_knob(CACHE.load(Ordering::Relaxed))
+}
+
+/// The kernel views of the channel's RM system memory: the attribute the memory was made with.
+pub(super) fn sysmem_view_cache() -> _MEMORY_CACHING_TYPE::Type {
+    match cache_mode() {
+        cc::CacheMode::Cached => _MEMORY_CACHING_TYPE::MmCached,
+        cc::CacheMode::WriteCombine => _MEMORY_CACHING_TYPE::MmWriteCombined,
+    }
+}
+
+/// Pseudo escape numbers of `CeRmCall` for the steps of a CPU view that are not RM escapes: the
+/// `Open` of its map file, the host's `Mmap`, `MmMapIoSpace`.
+const CALL_OPEN: u32 = 0xf1;
+const CALL_HOST_MMAP: u32 = 0xf2;
+const CALL_KERNEL_MAP: u32 = 0xf3;
+
+/// A call of the channel failed: name it (`CeRmCall`, `CeRmStat`) so a dump says which, without
+/// the backend log. Atomics only.
+fn note_call(esc: u32, what: u32, f: Fail) {
+    RM_CALL.store(cc::rm_call_word(esc, what), Ordering::Relaxed);
+    RM_STAT.store(cc::fail_word(f), Ordering::Relaxed);
+}
+
+/// [`note_call`] on the error of `r`.
+fn noted<T>(r: Result<T, Fail>, esc: u32, what: u32) -> Result<T, Fail> {
+    if let Err(f) = &r {
+        note_call(esc, what, *f);
+    }
+    r
 }
 
 /// Mirror the counters to the service key once the channel was asked for. PASSIVE only.
@@ -150,6 +202,10 @@ pub(crate) fn publish_counters() {
     rec(b"CeSelfWaitUs", SELF_WAIT_US.load(Ordering::Relaxed));
     rec(b"CeSelfPages", SELF_PAGES.load(Ordering::Relaxed));
     rec(b"CeSelfMs", SELF_MS.load(Ordering::Relaxed));
+    rec(b"CeCache", CACHE.load(Ordering::Relaxed));
+    rec(b"CeRmCall", RM_CALL.load(Ordering::Relaxed));
+    rec(b"CeRmStat", RM_STAT.load(Ordering::Relaxed));
+    rec(b"CeMapNode", MAP_NODE.load(Ordering::Relaxed));
 }
 
 /// The stage about to run, written BEFORE it runs (a hang names itself).
@@ -207,6 +263,9 @@ pub(super) struct CpuView {
     /// The kernel VA; 0 when not mapped.
     pub va: u64,
     pub len: u64,
+    /// The device type of the map file: `rm_client::DEV_CTL` for system memory, the GPU's minor
+    /// for BAR memory (`rm_ce_channel::MapNode`); also the RM window region's key.
+    pub node_dev: u32,
     /// The object the RM mapping names: its parent (the device, or the subdevice for the
     /// doorbell) and the memory.
     pub parent: u32,
@@ -434,6 +493,7 @@ fn perform(io: &Io<'_>, stage: Stage, p: &mut Parts, ring: &mut cp::Ring) -> Res
                 &h,
                 rc::H_SUBDEVICE,
                 cc::H_USERMODE,
+                cc::MapNode::for_class(p.usermode_class),
                 cp::USERMODE_BYTES,
                 _MEMORY_CACHING_TYPE::MmNonCached,
             )?;
@@ -441,14 +501,14 @@ fn perform(io: &Io<'_>, stage: Stage, p: &mut Parts, ring: &mut cp::Ring) -> Res
         }
         Stage::Ctl => alloc_sys(io, &h, cc::H_CTL, cc::CTL_BYTES),
         Stage::CtlMap => {
-            p.ctl = cpu_map(io, &h, rc::H_DEVICE, cc::H_CTL, cc::CTL_BYTES, WC)?;
+            p.ctl = cpu_map(io, &h, rc::H_DEVICE, cc::H_CTL, SYSMEM, cc::CTL_BYTES, sysmem_view_cache())?;
             // The error notifier and USERD start at zero, as the tool's `memset`.
             zero(p.ctl.va, cc::CTL_BYTES);
             Ok(())
         }
         Stage::Ring => alloc_sys(io, &h, cc::H_RING, cc::RING_BYTES),
         Stage::RingMap => {
-            p.ring = cpu_map(io, &h, rc::H_DEVICE, cc::H_RING, cc::RING_BYTES, WC)?;
+            p.ring = cpu_map(io, &h, rc::H_DEVICE, cc::H_RING, SYSMEM, cc::RING_BYTES, sysmem_view_cache())?;
             // The GPFIFO and the semaphore page; a push slot is written whole before use.
             zero(p.ring.va, cc::PUSH_OFFSET);
             Ok(())
@@ -1071,15 +1131,19 @@ pub(super) fn alloc(
     params: &[u8],
 ) -> Result<(), Fail> {
     let mut resp = heap(rc::REPLY_DATA + rc::NVOS64_BYTES + params.len() + 64)?;
-    io.rm_alloc(h.ctl, h.root, parent, h_new, class, params, &mut resp)
-        .map(|_| ())
+    noted(
+        io.rm_alloc(h.ctl, h.root, parent, h_new, class, params, &mut resp)
+            .map(|_| ()),
+        rc::ESC_RM_ALLOC,
+        class,
+    )
 }
 
-/// `NV_ESC_RM_ALLOC` of RM system memory (`NV01_MEMORY_SYSTEM`, write-combined: the sysmem
-/// service's default kind, `rm_sysmem::params`), as `h_mem` under the device.
+/// `NV_ESC_RM_ALLOC` of RM system memory (`NV01_MEMORY_SYSTEM`, `rm_sysmem::params`), as `h_mem`
+/// under the device: cached by default as the tool's (`RmCeCache` 1: write-combined).
 #[inline(never)]
 pub(super) fn alloc_sys(io: &Io<'_>, h: &Handles, h_mem: u32, size: u64) -> Result<(), Fail> {
-    let params = rs::params(h.root, rs::Cache::WriteCombine, size);
+    let params = rs::params(h.root, cache_mode().sysmem(), size);
     alloc(io, h, rc::H_DEVICE, h_mem, cc::NV01_MEMORY_SYSTEM, &params)
 }
 
@@ -1088,19 +1152,33 @@ pub(super) fn alloc_sys(io: &Io<'_>, h: &Handles, h_mem: u32, size: u64) -> Resu
 pub(super) fn rm_free(io: &Io<'_>, h: &Handles, parent: u32, h_obj: u32) -> Result<(), Fail> {
     let block = rc::nvos00(h.root, parent, h_obj);
     let mut resp = [0u8; super::REPLY_MAX];
-    let n = io.exchange(h.ctl, rc::nv_cmd(rc::ESC_RM_FREE, 16), &block, &[], &mut resp)?;
-    rc::rm_reply(
-        resp.get(..n).ok_or(Fail::new(FailKind::Parse, 0x66))?,
-        rc::NVOS00_STATUS_AT,
-    )
-    .map(|_| ())
-    .map_err(Fail::from)
+    let r = io
+        .exchange(h.ctl, rc::nv_cmd(rc::ESC_RM_FREE, 16), &block, &[], &mut resp)
+        .and_then(|n| {
+            rc::rm_reply(
+                resp.get(..n).ok_or(Fail::new(FailKind::Parse, 0x66))?,
+                rc::NVOS00_STATUS_AT,
+            )
+            .map(|_| ())
+            .map_err(Fail::from)
+        });
+    noted(r, rc::ESC_RM_FREE, h_obj)
 }
 
 /// `NV_ESC_RM_CONTROL` of `cmd` on `object` with `params` (in and out: RM's answer is copied
 /// back).
 #[inline(never)]
 pub(super) fn control(
+    io: &Io<'_>,
+    h: &Handles,
+    object: u32,
+    cmd: u32,
+    params: &mut [u8],
+) -> Result<(), Fail> {
+    noted(control_inner(io, h, object, cmd, params), rc::ESC_RM_CONTROL, cmd)
+}
+
+fn control_inner(
     io: &Io<'_>,
     h: &Handles,
     object: u32,
@@ -1158,7 +1236,7 @@ pub(super) fn gpu_map(
         length: len,
         flags: cc::MAP_FLAGS_SYSMEM,
     };
-    let mapped = map_dma(io, h, &m);
+    let mapped = noted(map_dma(io, h, &m), cc::ESC_RM_MAP_MEMORY_DMA, mem);
     let got = match mapped {
         Ok(got) => got,
         Err(f) => {
@@ -1225,67 +1303,96 @@ pub(super) fn gpu_unmap(io: &Io<'_>, h: &Handles, g: &GpuMap) -> bool {
         .ok()
         .and_then(|n| resp.get(..n))
         .is_some_and(|r| rc::rm_reply(r, cc::NVOS47_STATUS_AT).is_ok());
+    if !unmapped {
+        note_call(cc::ESC_RM_UNMAP_MEMORY_DMA, g.mem, Fail::new(FailKind::Parse, 0x6d));
+    }
     let freed = rm_free(io, h, rc::H_DEVICE, g.virt).is_ok();
     unmapped && freed
 }
 
 // ---- CPU views ------------------------------------------------------------------------------------
 
-/// Write-combined: the RM system memory is made write-combined, so every view agrees with the
-/// host's (`kmd-rm-client.md` 15.5: no alias).
-pub(super) const WC: _MEMORY_CACHING_TYPE::Type = _MEMORY_CACHING_TYPE::MmWriteCombined;
+/// System memory's map kind (`MapNode::for_class(NV01_MEMORY_SYSTEM)`: a control file).
+pub(super) const SYSMEM: cc::MapNode = cc::MapNode::for_class(cc::NV01_MEMORY_SYSTEM);
 
-/// Map `len` bytes of `mem` (under `parent`) for the CPU. A failure gives back what it made.
+/// Map `len` bytes of `mem` (under `parent`) for the CPU, armed on a fresh file of kind `node`
+/// (system memory: a control file; BAR memory: a GPU file, as librmclient chooses). RM's
+/// `NV_ERR_INVALID_ARGUMENT` (the wrong kind) is retried once on the other kind, as librmclient
+/// does. A failure gives back what it made, and is named in `CeRmCall` / `CeRmStat` / `CeMapNode`.
 #[inline(never)]
 pub(super) fn cpu_map(
     io: &Io<'_>,
     h: &Handles,
     parent: u32,
     mem: u32,
+    node: cc::MapNode,
     len: u64,
     cache: _MEMORY_CACHING_TYPE::Type,
 ) -> Result<CpuView, Fail> {
-    let mut v = CpuView {
-        len,
-        parent,
-        mem,
-        ..CpuView::default()
-    };
-    v.map_ch = io.open_file(h.minor)?;
-    let r = cpu_map_steps(io, h, &mut v, cache);
-    if let Err(f) = r {
+    let mut node = node;
+    let mut retried = false;
+    loop {
+        let mut v = CpuView {
+            len,
+            parent,
+            mem,
+            node_dev: match node {
+                cc::MapNode::Ctl => rc::DEV_CTL,
+                cc::MapNode::Gpu => h.minor,
+            },
+            ..CpuView::default()
+        };
+        v.map_ch = noted(io.open_file(v.node_dev), CALL_OPEN, v.node_dev)?;
+        let r = cpu_map_steps(io, h, &mut v, node, cache);
+        let Err(f) = r else {
+            return Ok(v);
+        };
+        MAP_NODE.store(cc::map_node_word(node, v.map_ch), Ordering::Relaxed);
         // Partial: give back in reverse (no kernel view was made, or it failed).
         if !cpu_unmap(io, h, &mut v, true) {
             CH_SOFT.fetch_add(1, Ordering::Relaxed);
         }
+        if cc::retry_other_node(f, retried) {
+            retried = true;
+            node = node.other();
+            continue;
+        }
         return Err(f);
     }
-    Ok(v)
 }
 
 fn cpu_map_steps(
     io: &Io<'_>,
     h: &Handles,
     v: &mut CpuView,
+    node: cc::MapNode,
     cache: _MEMORY_CACHING_TYPE::Type,
 ) -> Result<(), Fail> {
-    io.register_fd(v.map_ch, h.ctl)?;
-    // `NV_ESC_RM_MAP_MEMORY` with the channel's handle, on the control file.
+    // A GPU file is tied to the control file (`REGISTER_FD`); a control file is not
+    // (librmclient registers only a GPU-minor map file).
+    if node == cc::MapNode::Gpu {
+        io.register_fd(v.map_ch, h.ctl)?;
+    }
+    // `NV_ESC_RM_MAP_MEMORY` with the map file's handle, on the client's control file.
     let block = rc::nvos33_with_fd(h.root, v.parent, v.mem, 0, v.len, v.map_ch);
     let mut resp = [0u8; super::REPLY_MAX];
-    let n = io.exchange(
-        h.ctl,
-        rc::nv_cmd(rc::ESC_RM_MAP_MEMORY, rc::NVOS33_FD_BYTES as u32),
-        &block,
-        &[],
-        &mut resp,
-    )?;
-    let reply = rc::rm_reply(
-        resp.get(..n).ok_or(Fail::new(FailKind::Parse, 0x6a))?,
-        rc::NVOS33_STATUS_AT,
-    )
-    .map_err(Fail::from)?;
-    let cookie = rc::map_cookie(&reply).ok_or(Fail::new(FailKind::Parse, 0x6a))?;
+    let mapped = io
+        .exchange(
+            h.ctl,
+            rc::nv_cmd(rc::ESC_RM_MAP_MEMORY, rc::NVOS33_FD_BYTES as u32),
+            &block,
+            &[],
+            &mut resp,
+        )
+        .and_then(|n| {
+            let reply = rc::rm_reply(
+                resp.get(..n).ok_or(Fail::new(FailKind::Parse, 0x6a))?,
+                rc::NVOS33_STATUS_AT,
+            )
+            .map_err(Fail::from)?;
+            rc::map_cookie(&reply).ok_or(Fail::new(FailKind::Parse, 0x6a))
+        });
+    let cookie = noted(mapped, rc::ESC_RM_MAP_MEMORY, v.mem)?;
     // A nonzero cookie marks "RM mapped it" for the undo.
     v.cookie = cookie | MAPPED;
     let Some(timeout_ms) = io.message_timeout_ms() else {
@@ -1295,33 +1402,44 @@ fn cpu_map_steps(
         io.passive, io.adapter, KMD, v.map_ch, true, 0, v.len, timeout_ms,
     ) {
         Ok(m) => m,
-        Err(MapRefusal::Host(errno)) => return Err(Fail::new(FailKind::Host, errno.unsigned_abs())),
-        Err(MapRefusal::Transport(e)) => return Err(fail_of(Refusal::Transport(e))),
-        Err(MapRefusal::NotOwned) => return Err(Fail::new(FailKind::Refused, 2)),
-        Err(MapRefusal::BadRange) => return Err(Fail::new(FailKind::Refused, 5)),
-        Err(MapRefusal::NoResources) => return Err(Fail::new(FailKind::Refused, 3)),
+        Err(e) => {
+            let f = match e {
+                MapRefusal::Host(errno) => Fail::new(FailKind::Host, errno.unsigned_abs()),
+                MapRefusal::Transport(e) => fail_of(Refusal::Transport(e)),
+                MapRefusal::NotOwned => Fail::new(FailKind::Refused, 2),
+                MapRefusal::BadRange => Fail::new(FailKind::Refused, 5),
+                MapRefusal::NoResources => Fail::new(FailKind::Refused, 3),
+            };
+            note_call(CALL_HOST_MMAP, v.mem, f);
+            return Err(f);
+        }
     };
     v.host_id = m.host_id;
     v.host_mapped = true;
     if m.size < v.len {
         return Err(Fail::new(FailKind::Layout, 0x6b));
     }
-    v.va = kernel_map(io.adapter, h.minor, m.offset, v.len, cache)?;
+    v.va = noted(
+        kernel_map(io.adapter, v.node_dev, m.offset, v.len, cache),
+        CALL_KERNEL_MAP,
+        v.mem,
+    )?;
     Ok(())
 }
 
 /// High bit of `CpuView::cookie`: RM mapped it (the cookie itself may be 0).
 const MAPPED: u64 = 1 << 63;
 
-/// `MmMapIoSpace` of `[off, off + size)` of the RM window (region of the GPU's minor).
+/// `MmMapIoSpace` of `[off, off + size)` of the RM window (the region of the map file's device
+/// type: the RM window for a control file and for a GPU minor alike).
 fn kernel_map(
     adapter: &AdapterContext,
-    minor: u32,
+    node_dev: u32,
     off: u64,
     size: u64,
     cache: _MEMORY_CACHING_TYPE::Type,
 ) -> Result<u64, Fail> {
-    let region = nvrm::region_for(adapter, minor).ok_or(Fail::new(FailKind::Os, 0x60))?;
+    let region = nvrm::region_for(adapter, node_dev).ok_or(Fail::new(FailKind::Os, 0x60))?;
     let Some(phys) = helios_kmd_logic::window_units::place(region.base, region.len, off, size)
     else {
         return Err(Fail::new(FailKind::Layout, 0x6c));
@@ -1375,6 +1493,9 @@ pub(super) fn cpu_unmap(io: &Io<'_>, h: &Handles, v: &mut CpuView, send: bool) -
             .ok()
             .and_then(|n| resp.get(..n))
             .is_some_and(|r| rc::rm_reply(r, rc::NVOS34_STATUS_AT).is_ok());
+        if !done {
+            note_call(rc::ESC_RM_UNMAP_MEMORY, v.mem, Fail::new(FailKind::Parse, 0x6e));
+        }
         ok &= done;
         v.cookie = 0;
     }
