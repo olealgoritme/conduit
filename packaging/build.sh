@@ -370,11 +370,23 @@ cmd_guest_src() {
     dst=${1:-$DIST/guest-src/conduit-guest-$v}
     log "guest DKMS source -> $dst"
     rm -rf "$dst"; install -d "$dst"
-    (cd "$ROOT/guest/linux" && cp -a Makefile ./*.c ./*.h gen rmctrl "$dst/")
+    # Every directory but test/ is a generated per-release table (gen, rmctrl,
+    # devinfo, ...): copy them all, so a new table is never left out of the
+    # package (the in-tree build cannot notice that).
+    (cd "$ROOT/guest/linux" && cp -a Makefile ./*.c ./*.h "$dst/" \
+        && for d in */; do case "$d" in test/) ;; *) cp -a "$d" "$dst/" ;; esac; done)
     [ -f "$ROOT/guest/linux/Kbuild" ] && cp -a "$ROOT/guest/linux/Kbuild" "$dst/"
     sed "s/@VERSION@/$v/g" "$PKG/dkms/dkms.conf" > "$dst/dkms.conf"
     # Kbuild objects must never ship in the source package.
     find "$dst" \( -name '*.o' -o -name '*.ko' -o -name '*.mod*' -o -name '.*.cmd' \) -delete
+    # Every quoted #include of the sources must resolve inside the package.
+    local f inc missing=0
+    for f in "$dst"/*.c "$dst"/*.h; do
+        while IFS= read -r inc; do
+            [ -f "$dst/$inc" ] || { echo "guest-src: $(basename "$f") includes \"$inc\", not in the package" >&2; missing=1; }
+        done < <(sed -n 's/^[[:space:]]*#[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' "$f")
+    done
+    [ "$missing" = 0 ] || die "the guest DKMS source is incomplete"
 }
 
 # ------------------------------------------------------------- package -----
