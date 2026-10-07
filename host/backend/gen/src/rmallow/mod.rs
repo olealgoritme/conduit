@@ -29,6 +29,7 @@
 //! set, and so does everything here.
 
 pub mod v535_129_03;
+pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
 pub mod v595_71_05;
@@ -229,6 +230,14 @@ static PROFILES: &[Profile] = &[
         deprec: || v535_129_03::DEPREC,
         catch_all: || v535_129_03::CATCH_ALL,
         gss: || v535_129_03::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(565, 77, 0),
+        ctrl: || v565_77_00::CTRL,
+        class: || v565_77_00::CLASS,
+        deprec: || v565_77_00::DEPREC,
+        catch_all: || v565_77_00::CATCH_ALL,
+        gss: || v565_77_00::GSS,
     },
     Profile {
         version: DriverVersion::new(580, 178, 4),

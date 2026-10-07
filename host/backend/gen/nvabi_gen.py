@@ -54,6 +54,19 @@ CONDUIT_EXTRA = [
     ("NV_ESC_RM_GET_EVENT_DATA", 0x52, "EventData", "NVOS41_PARAMETERS", 16),
 ]
 
+# Escapes whose kernel handler takes more than one struct size, every release.
+#
+# escape.c's rm_ioctl checks `dataSize` against sizeof of each struct it
+# understands and answers NV_ERR_INVALID_ARGUMENT to anything else. For
+# NV_ESC_RM_ALLOC that is two: NVOS64_PARAMETERS (nvproxy's) and the older
+# NVOS21_PARAMETERS, which NVIDIA's userspace still sends for allocations that
+# take no rights (565.77's libnvidia-ml sends it for NV01_ROOT). nvproxy accepts
+# both (rmAlloc, frontend.go) and so does RM; the table has to as well, or the
+# second is refused before RM sees it. Sizes are computed, not typed.
+ALSO_ACCEPTS = {
+    "NV_ESC_RM_ALLOC": ["NVOS21_PARAMETERS"],
+}
+
 VER_RE = re.compile(
     r"(?:(v\d+_\d+_\d+)\s*:=\s*|_\s*=\s*)add(?:Unsupported)?DriverABI\("
     r"\s*(\d+),\s*(\d+),\s*(\d+),"
@@ -207,8 +220,10 @@ pub fn table() -> &'static [IoctlEntry] {{
         else:
             note = st or "variable length"
         sz = "None" if size is None else f"Some({size})"
+        also = [layout(s, gs, consts)[0] for s in ALSO_ACCEPTS.get(esc, [])]
+        also_s = "&[" + ", ".join(str(a) for a in also) + "]"
         print(f"        // {note}")
-        print(f"        IoctlEntry {{ escape: {esc}, param_size: {sz}, kind: IoctlKind::{kind} }},")
+        print(f"        IoctlEntry {{ escape: {esc}, param_size: {sz}, also: {also_s}, kind: IoctlKind::{kind} }},")
     print("    ];\n    TABLE\n}")
 
 

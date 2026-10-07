@@ -253,6 +253,9 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
             cmd.arg("--venus-guest-blobs");
         }
     }
+    // A video-memory cap when this GPU also drives the desktop, and safe mode
+    // when asked for (protect.rs).
+    crate::protect::apply(&mut cmd);
     // conduit-vmm is given the same number (vm::vmm_config).
     cmd.arg("--window-mib").arg(p.window_mib.to_string());
     if let Some(m) = mode {

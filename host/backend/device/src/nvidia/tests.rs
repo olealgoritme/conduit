@@ -51,10 +51,32 @@ mod abi_tests {
         let mut b = backend();
         b.learn_driver_version(&t4_version_reply());
         assert_eq!(
-            b.driver,
+            b.start.driver,
             Some(abi::version::DriverVersion::new(580, 178, 4))
         );
-        assert!(b.abi.is_some(), "580.178.04 must select a profile");
+        assert!(b.start.abi.is_some(), "580.178.04 must select a profile");
+    }
+
+    /// The closed 565.77 module answers CHECK_VERSION_STR with "565.77", two
+    /// parts. It must still select every table, each its own.
+    #[test]
+    fn learns_a_two_part_release_and_every_table_is_its_own() {
+        let mut b = backend();
+        let mut reply = vec![0u8; 72];
+        reply[4] = 1;
+        reply[8..14].copy_from_slice(b"565.77");
+        b.learn_driver_version(&reply);
+        assert_eq!(
+            b.start.driver,
+            Some(abi::version::DriverVersion::new(565, 77, 0))
+        );
+        assert!(b.start.abi.is_some());
+        assert!(b.inexact_tables().is_empty(), "{:?}", b.inexact_tables());
+        assert!(b.start.osdesc.is_some());
+        assert!(
+            NvidiaBackend::accepted_releases()
+                .contains(&abi::version::DriverVersion::new(565, 77, 0))
+        );
     }
 
     /// The property the tables exist for: an escape nobody described does not
@@ -64,7 +86,7 @@ mod abi_tests {
     fn an_escape_outside_the_profile_is_refused() {
         let mut b = backend();
         b.learn_driver_version(&t4_version_reply());
-        assert!(b.abi.is_some());
+        assert!(b.start.abi.is_some());
 
         // 0x7f is not an NVIDIA escape and is in no profile.
         assert_eq!(b.check_abi(0x7f, 16), AbiCheck::UnknownEscape);
@@ -137,7 +159,7 @@ mod abi_tests {
         let mut junk = vec![0u8; 72];
         junk[8..12].copy_from_slice(b"oops");
         b.learn_driver_version(&junk);
-        assert!(b.driver.is_none());
+        assert!(b.start.driver.is_none());
         assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
     }
 
@@ -145,7 +167,7 @@ mod abi_tests {
     fn a_short_reply_is_ignored_rather_than_panicking() {
         let mut b = backend();
         b.learn_driver_version(&[0u8; 4]);
-        assert!(b.driver.is_none());
+        assert!(b.start.driver.is_none());
     }
 }
 
@@ -448,6 +470,23 @@ mod tests {
             t.contains(&"RM allowlist") && t.contains(&"UVM command table"),
             "{t:?}"
         );
+        assert!(t.contains(&"GET_DEV_INFO layout"), "{t:?}");
+    }
+
+    /// GET_DEV_INFO has no nearest-older fallback: 580.65.06 sits between
+    /// tables (the nearest older, 565.77, is a 32-byte struct and the host
+    /// wants 36), so under `--allow-nearest-abi` the backend starts with no
+    /// layout, says so, and is never asked for one. The same seven releases
+    /// are accepted without the flag.
+    #[test]
+    fn a_release_without_a_devinfo_table_is_started_with_none_and_named() {
+        use abi::version::DriverVersion as V;
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(V::new(580, 65, 6)).unwrap();
+        assert!(be.start.devinfo.is_none());
+        assert!(be.inexact_tables().contains(&"GET_DEV_INFO layout"));
+        assert_eq!(NvidiaBackend::accepted_releases().len(), 7);
+        assert!(!NvidiaBackend::accepted_releases().contains(&V::new(580, 65, 6)));
     }
 
     /// A device reset (guest reboot under QEMU) leaves the backend as a fresh
@@ -500,7 +539,7 @@ mod tests {
         assert_eq!(be.vram.in_use(), 0);
         assert!(be.msg_counts.is_empty() && be.rm_classes.is_empty());
         assert_eq!(be.caps(), caps);
-        assert!(be.driver.is_some() && be.rmallow.is_some() && be.uvm.is_some());
+        assert!(be.start.driver.is_some() && be.start.rmallow.is_some() && be.start.uvm.is_some());
         // The transport is told to drop its watches of the old files, and a
         // new file never reuses an old handle.
         let (_, removed) = be.take_watch_updates();
@@ -735,6 +774,7 @@ mod tests {
         // RM copies no more than this for an unprivileged caller, and a size
         // RM will not copy is a host allocation sized by the guest.
         let max = be
+            .start
             .rmallow
             .expect("the fixture learned a release")
             .max_params();
@@ -801,6 +841,51 @@ mod tests {
         assert!(buf.iter().all(|b| *b == 0), "something was written anyway");
     }
 
+    /// The guest refuses a size by this list, so the list has to be the one
+    /// the backend itself checks calls against, entry for entry -- including
+    /// the second size of RM_ALLOC and the escapes of any length.
+    #[test]
+    fn the_guest_is_told_the_sizes_the_backend_checks_against() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(565, 77, 0))
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = be.write_escape_size_section(&mut buf);
+        let word = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), NvidiaBackend::ESCAPE_SIZE_MAGIC);
+        let count = word(1) as usize;
+        assert_eq!(n, 8 + count * 8);
+        let sent: Vec<(u32, u32)> = (0..count)
+            .map(|i| (word(2 + 2 * i), word(3 + 2 * i)))
+            .collect();
+
+        // Whatever the section says, check_abi says the same, in both
+        // directions, for every size up to a page.
+        for e in be.start.abi.unwrap() {
+            for size in 0..4200u32 {
+                let in_list = sent.iter().any(|(esc, s)| {
+                    *esc == e.escape && (*s == size || *s == NvidiaBackend::ESCAPE_SIZE_ANY)
+                });
+                assert_eq!(
+                    in_list,
+                    !matches!(be.check_abi(e.escape, size), AbiCheck::SizeMismatch { .. }),
+                    "escape {:#x} at {size}",
+                    e.escape
+                );
+            }
+        }
+        assert!(sent.contains(&(abi::ioctl::NV_ESC_RM_ALLOC, 32)));
+        assert!(sent.contains(&(abi::ioctl::NV_ESC_RM_ALLOC, 48)));
+        assert!(sent.contains(&(abi::ioctl::NV_ESC_CARD_INFO, NvidiaBackend::ESCAPE_SIZE_ANY)));
+    }
+
+    #[test]
+    fn a_backend_with_no_release_sends_no_escape_sizes() {
+        let be = NvidiaBackend::for_test();
+        let mut buf = vec![0u8; 4096];
+        assert_eq!(be.write_escape_size_section(&mut buf), 0);
+    }
+
     /// A class RM does not let an unprivileged caller allocate.
     #[test]
     fn a_class_rm_does_not_export_never_reaches_the_host() {
@@ -859,9 +944,9 @@ mod tests {
         use abi::version::DriverVersion as V;
         let mut be = NvidiaBackend::for_test();
         assert!(be.set_host_driver_version(V::new(470, 0, 0)).is_err());
-        assert!(be.driver.is_none());
+        assert!(be.start.driver.is_none());
         assert!(be.set_host_driver_version(V::new(595, 104, 2)).is_ok());
-        assert_eq!(be.driver, Some(V::new(595, 104, 2)));
+        assert_eq!(be.start.driver, Some(V::new(595, 104, 2)));
     }
 
     #[test]
@@ -2926,6 +3011,24 @@ mod tests {
         );
     }
 
+    /// A device reset keeps the limit whole (usage starts at zero), and keeps
+    /// the release the limit is only allowed on.
+    #[test]
+    fn reset_keeps_the_video_memory_limit() {
+        let host = UvmHost::default();
+        let (mut be, _, ctl) = uvm_backend(&host, v615());
+        be.set_vram_limit_mib(Some(100)).unwrap();
+        rm_client(&mut be, ctl, CLIENT);
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, CLIENT, 0x10, 60)),
+            0
+        );
+        be.reset();
+        assert_eq!(be.vram_limit_mib(), 100);
+        assert_eq!(be.vram.in_use(), 0, "the books start empty");
+        assert_eq!(be.vram.limit(), Some(100 << 20));
+    }
+
     /// Freeing the object an allocation was made under frees the allocation,
     /// as RM does.
     #[test]
@@ -2968,6 +3071,113 @@ mod tests {
         assert!(be.set_vram_limit_mib(None).is_ok());
         be.set_host_driver_version(v615()).unwrap();
         assert!(be.set_vram_limit_mib(Some(100)).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // NV_ESC_RM_ALLOC in its older, 32-byte form (NVOS21_PARAMETERS)
+    // -----------------------------------------------------------------------
+
+    const BODY: usize = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+
+    fn word(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    /// What reached the host: the request and the parameter block, as RM would
+    /// have been handed them. Writes `answer` into the block's status field.
+    #[derive(Clone, Default)]
+    struct StatusHost(std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>, u32);
+
+    impl HostDriver for StatusHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.0.lock().unwrap().push((request, arg.to_vec()));
+            // NVOS21: status at 28; NVOS64: at 40.
+            let at = if arg.len() == 32 { 28 } else { 40 };
+            arg[at..at + 4].copy_from_slice(&self.1.to_le_bytes());
+            Ok(())
+        }
+    }
+
+    fn nvos21_root_alloc() -> Vec<u8> {
+        // hRoot, hObjectParent, hObjectNew, hClass = NV01_ROOT_CLIENT,
+        // pAllocParms = NULL, paramsSize = a marker no one may disturb, status.
+        let mut p = vec![0u8; 32];
+        p[12..16].copy_from_slice(&0x41u32.to_le_bytes());
+        p[24..28].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        p
+    }
+
+    /// 565.77's libnvidia-ml opens its client with a 32-byte RM_ALLOC, which
+    /// RM takes (`rm_ioctl` accepts both sizes). The backend answered EINVAL
+    /// before the host was asked, and NVML reported the GPU as blocked.
+    #[test]
+    fn a_32_byte_rm_alloc_reaches_the_host_as_32_bytes_and_answers_in_place() {
+        let host = StatusHost(Default::default(), 0);
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(565, 77, 0))
+            .expect("565.77 has tables");
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos21_root_alloc()),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl succeeds");
+        let seen = host.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one host call");
+        assert_eq!(
+            seen[0].0,
+            abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_ALLOC, 32),
+            "with the size the caller used"
+        );
+        assert_eq!(seen[0].1.len(), 32);
+        assert_eq!(
+            word(&seen[0].1, 24),
+            0xdead_beef,
+            "offset 24 is paramsSize in NVOS21, not pRightsRequested; it is not cleared"
+        );
+        assert_eq!(
+            word(&resp[BODY..], 28),
+            0,
+            "RM's answer comes back at NVOS21.status"
+        );
+    }
+
+    /// The status of a refused 32-byte allocation is NVOS21's own.
+    #[test]
+    fn a_refused_32_byte_alloc_is_answered_at_nvos21_status() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_caps(crate::caps::Caps::parse("graphics,compute").unwrap());
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+
+        let mut nvos21 = vec![0u8; 32];
+        nvos21[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes()); // Ampere NVENC
+        // With allocation parameters behind it, as a real one has: the block
+        // is 32 bytes and the message is longer.
+        let resp = send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos21, 24);
+
+        assert_eq!(word(&resp[BODY..], 28), 0x22, "NV_ERR_INVALID_CLASS");
+    }
+
+    /// Only the two sizes RM takes are ABI; a 40-byte block is neither.
+    #[test]
+    fn an_rm_alloc_of_neither_size_is_refused_for_every_release() {
+        for v in abi::versions::supported_versions() {
+            let mut be = NvidiaBackend::for_test();
+            be.set_host_driver_version(v).unwrap();
+            for (size, ok) in [(32u32, true), (48, true), (40, false), (44, false)] {
+                assert_eq!(
+                    be.check_abi(abi::ioctl::NV_ESC_RM_ALLOC, size) == AbiCheck::Ok,
+                    ok,
+                    "{v}: RM_ALLOC at {size} bytes"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "trace")]
@@ -3361,6 +3571,127 @@ mod fence_tests {
         word(&resp, BODY + 16) as u64
     }
 
+    /// An RM ioctl (type 'F') with `params` and no nested blocks.
+    fn rm_msg(handle: u64, nr: u32, params: &[u8]) -> Vec<u8> {
+        let mut v = drm_msg(handle, nr, params, &[]);
+        let at = size_of::<MsgHeader>();
+        let mut req = read_struct::<IoctlReq>(&v, at);
+        req.cmd = (3 << 30) | ((params.len() as u32) << 16) | ((b'F' as u32) << 8) | nr;
+        write_struct(&mut v[at..], &req);
+        v
+    }
+
+    fn set_word(p: &mut [u8], at: usize, v: u32) {
+        p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Without safe mode a guest's timeouts reach the host as sent, byte for
+    /// byte, however long.
+    #[test]
+    fn without_safe_mode_a_fence_timeout_is_forwarded_unchanged() {
+        for asked in [0, 5_000, 10_000, 60_000, u32::MAX] {
+            let host = FenceHost::default();
+            let (mut be, drm) = backend_on(&host);
+            let p = {
+                let mut p = create_params(12345);
+                set_word(&mut p, 4, asked);
+                p
+            };
+            let mut resp = vec![0u8; 256];
+            be.dispatch(&drm_msg(drm, 0x55, &p, &[]), &mut resp);
+            let sent = &host.calls()[0].1;
+            assert_eq!(word(sent, 4), asked, "asked {asked}");
+        }
+    }
+
+    #[test]
+    fn safe_mode_clamps_the_fence_and_idle_timeouts() {
+        for (asked, sent) in [(0, 0), (500, 500), (5_000, 1_000), (60_000, 1_000)] {
+            let host = FenceHost::default();
+            let (mut be, drm) = backend_on(&host);
+            be.set_safe_mode(true);
+            let mut p = create_params(12345);
+            set_word(&mut p, 4, asked);
+            let mut resp = vec![0u8; 256];
+            be.dispatch(&drm_msg(drm, 0x55, &p, &[]), &mut resp);
+            assert_eq!(word(&host.calls()[0].1, 4), sent, "fence {asked}");
+
+            let mut idle = vec![0u8; 56];
+            set_word(&mut idle, 44, asked * 1000);
+            be.dispatch(&rm_msg(drm, 0x41, &idle), &mut resp);
+            let calls = host.calls();
+            assert_eq!(
+                word(&calls.last().unwrap().1, 44),
+                sent * 1000,
+                "idle {asked}"
+            );
+        }
+    }
+
+    /// Without safe mode IDLE_CHANNELS reaches the host with the guest's
+    /// parameters untouched: the whole struct, not just the timeout.
+    #[test]
+    fn without_safe_mode_idle_channels_is_forwarded_byte_identical() {
+        for asked in [0, 250_000, 60_000_000, u32::MAX] {
+            let host = FenceHost::default();
+            let (mut be, drm) = backend_on(&host);
+            let mut idle = vec![0u8; 56];
+            set_word(&mut idle, 40, 0x1234);
+            set_word(&mut idle, 44, asked);
+            let mut resp = vec![0u8; 256];
+            be.dispatch(&rm_msg(drm, 0x41, &idle), &mut resp);
+            let calls = host.calls();
+            let got = &calls.last().expect("reached the host").1;
+            assert_eq!(word(got, 44), asked, "asked {asked}");
+            assert_eq!(word(got, 40), 0x1234);
+        }
+    }
+
+    /// A device reset (a guest reboot) keeps safe mode: the timeout ceilings
+    /// are start settings, carried with the rest, not rebuilt to NORMAL.
+    #[test]
+    fn reset_keeps_safe_mode_timeout_clamps() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        be.set_safe_mode(true);
+        be.reset();
+        let mut resp = vec![0u8; 256];
+
+        // reset closed the file; open another the way a guest would.
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let drm = {
+            let _ = drm;
+            be.handles.insert(OwnedFd::from(null))
+        };
+        let mut idle = vec![0u8; 56];
+        set_word(&mut idle, 44, 60_000_000);
+        be.dispatch(&rm_msg(drm, 0x41, &idle), &mut resp);
+        assert_eq!(
+            word(&host.calls().last().unwrap().1, 44),
+            1_000_000,
+            "IDLE_CHANNELS 60 s is still clamped to 1 s"
+        );
+
+        let mut p = create_params(12345);
+        set_word(&mut p, 4, 60_000);
+        be.dispatch(&drm_msg(drm, 0x55, &p, &[]), &mut resp);
+        assert_eq!(word(&host.calls().last().unwrap().1, 4), 1_000);
+    }
+
+    /// Safe mode turned back off restores the pass-through.
+    #[test]
+    fn safe_mode_off_again_stops_clamping() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        be.set_safe_mode(true);
+        be.set_safe_mode(false);
+        let mut idle = vec![0u8; 56];
+        set_word(&mut idle, 44, 60_000_000);
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&rm_msg(drm, 0x41, &idle), &mut resp);
+        assert_eq!(word(&host.calls().last().unwrap().1, 44), 60_000_000);
+    }
+
     /// The host's descriptor stays here; the guest gets a handle for it, the
     /// transport is told to watch it once, and closing it lets it go.
     #[test]
@@ -3655,6 +3986,8 @@ mod fence_tests {
     fn nvkms_query_disp_reports_a_disp_with_nothing_on_it() {
         let host = FenceHost::default();
         let (mut be, h) = backend_on(&host);
+        be.set_host_driver_version(abi::version::DriverVersion::new(610, 57, 4))
+            .unwrap();
         let mut params = vec![0xa5u8; QUERY_DISP_PARAMS];
         params[0..4].copy_from_slice(&0x11u32.to_le_bytes()); // deviceHandle
         params[4..8].copy_from_slice(&0x22u32.to_le_bytes()); // dispHandle
@@ -3677,6 +4010,8 @@ mod fence_tests {
     fn nvkms_query_disp_too_short_for_its_request_is_einval() {
         let host = FenceHost::default();
         let (mut be, h) = backend_on(&host);
+        be.set_host_driver_version(abi::version::DriverVersion::new(610, 57, 4))
+            .unwrap();
         let mut resp = vec![0u8; 256];
         be.dispatch(&nvkms_msg(h, NVKMS_QUERY_DISP, &[0u8; 4]), &mut resp);
         assert_eq!(status(&resp), -libc::EINVAL);
@@ -3697,6 +4032,98 @@ mod fence_tests {
             assert_eq!(status(&resp), -libc::EPERM, "cmd {cmd}");
         }
         assert!(host.calls().is_empty());
+    }
+
+    /// 565.77: ENABLE (60) and DISABLE (61) are answered here, ENABLE with a
+    /// handle; SET_FLIPLOCK_GROUP (59), which the old `register + 43` landed
+    /// on, is refused rather than answered with a made-up handle.
+    #[test]
+    fn nvkms_vblank_commands_are_the_releases_own_on_565_77() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_host_driver_version(abi::version::DriverVersion::new(565, 77, 0))
+            .unwrap();
+        let mut resp = vec![0u8; 1024];
+        let params = vec![0u8; 64];
+
+        be.dispatch(&nvkms_msg(h, 60, &params), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert_eq!(word(&resp, BODY + 16 + 24), 1, "ENABLE hands back a handle");
+
+        be.dispatch(&nvkms_msg(h, 61, &params), &mut resp);
+        assert_eq!(status(&resp), 0, "DISABLE succeeds instead of EPERM");
+        assert_eq!(word(&resp, BODY + 16 + 24), 0, "and writes no handle");
+
+        be.dispatch(&nvkms_msg(h, 59, &params), &mut resp);
+        assert_eq!(status(&resp), -libc::EPERM, "SET_FLIPLOCK_GROUP");
+        assert!(host.calls().is_empty());
+    }
+
+    /// 580.178.04 has two more commands before ENABLE (EXPORT_VRR_SEMAPHORE_SURFACE
+    /// and VRR_SIGNAL_SEMAPHORE are not in 595+): SET_FLIPLOCK_GROUP is 60 and
+    /// is refused, ENABLE is 61 and answered with a handle, DISABLE is 62.
+    #[test]
+    fn nvkms_vblank_commands_are_the_releases_own_on_580_178_04() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_host_driver_version(abi::version::DriverVersion::new(580, 178, 4))
+            .unwrap();
+        let mut resp = vec![0u8; 1024];
+        let params = vec![0u8; 64];
+
+        be.dispatch(&nvkms_msg(h, 60, &params), &mut resp);
+        assert_eq!(status(&resp), -libc::EPERM, "SET_FLIPLOCK_GROUP is refused");
+
+        be.dispatch(&nvkms_msg(h, 61, &params), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert_eq!(word(&resp, BODY + 16 + 24), 1, "ENABLE hands back a handle");
+
+        be.dispatch(&nvkms_msg(h, 62, &params), &mut resp);
+        assert_eq!(status(&resp), 0, "DISABLE succeeds");
+        assert_eq!(word(&resp, BODY + 16 + 24), 0, "and writes no handle");
+        assert!(host.calls().is_empty());
+    }
+
+    /// Where the old arithmetic was right it still is: 595..615 answer
+    /// register+43 and +44 and refuse the command before.
+    #[test]
+    fn nvkms_vblank_commands_are_unchanged_where_the_old_rule_was_right() {
+        for (v, enable, disable) in [
+            ((595, 71, 5), 60, 61),
+            ((595, 104, 2), 60, 61),
+            ((610, 57, 4), 60, 61),
+            ((615, 71, 9), 59, 60),
+        ] {
+            let host = FenceHost::default();
+            let (mut be, h) = backend_on(&host);
+            be.set_host_driver_version(abi::version::DriverVersion::new(v.0, v.1, v.2))
+                .unwrap();
+            let mut resp = vec![0u8; 1024];
+            be.dispatch(&nvkms_msg(h, enable, &[0u8; 64]), &mut resp);
+            assert_eq!((status(&resp), word(&resp, BODY + 40)), (0, 1), "{v:?}");
+            be.dispatch(&nvkms_msg(h, disable, &[0u8; 64]), &mut resp);
+            assert_eq!(status(&resp), 0, "{v:?}");
+            be.dispatch(&nvkms_msg(h, enable - 1, &[0u8; 64]), &mut resp);
+            assert_eq!(status(&resp), -libc::EPERM, "{v:?}");
+            assert!(host.calls().is_empty());
+        }
+    }
+
+    /// A release with no NVKMS table is served ALLOC/FREE_DEVICE and nothing
+    /// else: not REGISTER_SURFACE, not QUERY_DISP, not the vblank answers.
+    #[test]
+    fn nvkms_on_a_release_with_no_table_serves_only_the_device_commands() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.start.driver = Some(abi::version::DriverVersion::new(570, 86, 15));
+        let mut resp = vec![0u8; 1024];
+        for cmd in [2, 16, 60, 61] {
+            be.dispatch(&nvkms_msg(h, cmd, &[0u8; 64]), &mut resp);
+            assert_eq!(status(&resp), -libc::EPERM, "cmd {cmd}");
+        }
+        assert!(host.calls().is_empty());
+        be.dispatch(&nvkms_msg(h, 0, &[0u8; 64]), &mut resp);
+        assert!(!host.calls().is_empty(), "ALLOC_DEVICE reaches the host");
     }
 
     /// ALLOC_DEVICE still goes to the host: the guest needs a real device

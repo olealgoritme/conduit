@@ -1,38 +1,52 @@
 //! Facts about the host: NVIDIA driver, supported driver versions, QEMU.
 
 use crate::paths;
+use abi::version::DriverVersion;
 use std::path::Path;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Driver {
     pub version: String,
     pub open: bool,
 }
 
-/// Parse /proc/driver/nvidia/version.
+/// Parse /proc/driver/nvidia/version: the rule is `abi::version::parse_proc_version`.
 pub fn parse_driver(text: &str) -> Option<Driver> {
-    let line = text.lines().find(|l| l.starts_with("NVRM version:"))?;
-    let open = line.contains("Open Kernel Module");
-    let version = line
-        .split_whitespace()
-        .find(|w| {
-            w.split('.').count() >= 2
-                && w.split('.')
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        })?
-        .to_string();
-    Some(Driver { version, open })
+    let p = abi::version::parse_proc_version(text)?;
+    Some(Driver {
+        version: p.raw,
+        open: p.open,
+    })
 }
 
 pub fn driver() -> Option<Driver> {
     parse_driver(&std::fs::read_to_string("/proc/driver/nvidia/version").ok()?)
 }
 
+/// "565.77" and "565.77.00" are one release: a missing patch is 0, as in the
+/// backend's `DriverVersion::parse` and the table file names (`v565_77_00`).
+pub fn same_release(a: &str, b: &str) -> bool {
+    match (DriverVersion::parse(a), DriverVersion::parse(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Why a loaded driver is outside what Conduit was built and tested on: the
+/// open kernel modules, release 580 or newer. `None` is the proven setup.
+/// The one rule behind `conduit doctor`'s module line and every protection
+/// that is on by default (protect.rs).
+pub fn untested_because(d: &Driver) -> Option<&'static str> {
+    match (d.open, major(&d.version) < 580) {
+        (true, false) => None,
+        (false, false) => Some("the closed kernel modules"),
+        (true, true) => Some("a branch older than 580"),
+        (false, true) => Some("the closed kernel modules and a branch older than 580"),
+    }
+}
+
 pub fn major(v: &str) -> u32 {
-    v.split('.')
-        .next()
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(0)
+    DriverVersion::parse(v).map_or(0, |v| v.major)
 }
 
 /// Driver releases the backend accepts: those with exact ABI tables.
@@ -66,7 +80,7 @@ pub fn supported_drivers() -> (Vec<String>, &'static str) {
 
 /// The table directories the backend's exact-table check reads
 /// (`NvidiaBackend::inexact_tables`); a release needs its own file in each.
-pub const EXACT_TABLES: &[&str] = &["rmctrl", "rmallow", "uvm", "vidmem"];
+pub const EXACT_TABLES: &[&str] = &["rmctrl", "rmallow", "uvm", "vidmem", "devinfo", "nvkms"];
 
 /// Releases with a table of their own in every one of [`EXACT_TABLES`]
 /// under `gen_src` (host/backend/gen/src), ascending.
@@ -95,6 +109,7 @@ fn version_key(v: &str) -> Vec<u64> {
 
 const BUILT_IN: &[&str] = &[
     "535.129.03",
+    "565.77.00",
     "580.178.04",
     "595.71.05",
     "595.104.02",
@@ -144,6 +159,7 @@ mod tests {
         let tree = tree_releases(&gen);
         assert!(tree.iter().any(|v| v == "595.104.02"), "{tree:?}");
         assert!(tree.iter().any(|v| v == "615.71.09"), "{tree:?}");
+        assert!(tree.iter().any(|v| v == "565.77.00"), "{tree:?}");
         let out = std::process::Command::new(root.join("packaging/supported-drivers.sh"))
             .arg(&gen)
             .output()
@@ -176,8 +192,42 @@ mod tests {
                 open: false
             })
         );
+        // The closed 565.77 module: two-part version, and the GCC line's
+        // three-part number is not the driver's.
+        let c = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77  Wed Oct 23 12:00:00 UTC 2024\nGCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n";
+        assert_eq!(
+            parse_driver(c),
+            Some(Driver {
+                version: "565.77".into(),
+                open: false
+            })
+        );
         assert_eq!(parse_driver("garbage"), None);
         assert_eq!(major("610.57.04"), 610);
+    }
+
+    /// The lines `abi::version` and the backend and guest readers are tested
+    /// on: the CLI must say the same about each.
+    #[test]
+    fn driver_follows_the_shared_fixture() {
+        let fixture = include_str!("../../host/backend/gen/fixtures/proc_version.tsv");
+        for line in fixture.lines().filter(|l| !l.starts_with('#')) {
+            let (text, want) = line.split_once('\t').unwrap();
+            let got = parse_driver(&text.replace("\\n", "\n"))
+                .map(|d| format!("{} {}", d.version, if d.open { "open" } else { "closed" }));
+            // "<canonical> <open|closed> <raw>" becomes "<raw> <open|closed>".
+            let f: Vec<&str> = want.split(' ').collect();
+            let want = (f.len() == 3).then(|| format!("{} {}", f[2], f[1]));
+            assert_eq!(got, want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_patch_is_zero() {
+        assert!(same_release("565.77", "565.77.00"));
+        assert!(same_release("580.178.04", "580.178.4"));
+        assert!(!same_release("565.77", "565.77.01"));
+        assert!(!same_release("565.77", "565.57.01"));
     }
 
     #[test]

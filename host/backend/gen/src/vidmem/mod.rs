@@ -32,6 +32,7 @@
 //! table.
 
 pub mod v535_129_03;
+pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
 pub mod v595_71_05;
@@ -167,6 +168,7 @@ pub struct Selected {
 /// Profiles in ascending version order.
 static PROFILES: &[(DriverVersion, &Layout)] = &[
     (DriverVersion::new(535, 129, 3), &v535_129_03::LAYOUT),
+    (DriverVersion::new(565, 77, 0), &v565_77_00::LAYOUT),
     (DriverVersion::new(580, 178, 4), &v580_178_04::LAYOUT),
     (DriverVersion::new(595, 71, 5), &v595_71_05::LAYOUT),
     (DriverVersion::new(595, 104, 2), &v595_104_02::LAYOUT),

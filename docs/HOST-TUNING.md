@@ -113,6 +113,23 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   and the same for `system.slice`), or at boot with `isolcpus=`/`nohz_full=`.
 - **CPU governor**: `performance` avoids clock ramp-up latency.
 
+## GPU memory: Resizable BAR and the video-memory limit
+
+- **BAR1.** Without Resizable BAR a GeForce exposes 256 MiB of its memory
+  to the CPU, and every guest mapping of GPU memory goes through that window,
+  shared with the host desktop. Turn on Above 4G Decoding and Resizable BAR in
+  the firmware settings for large guest workloads. `conduit doctor` prints the
+  size.
+- **Sharing the card with your desktop.** When the card has a monitor
+  connected and safe mode is on (the default for the closed modules or a
+  branch older than 580), guests get a default video-memory limit so the
+  compositor keeps room. On the open modules 580 or newer nothing is set
+  unless you ask: `conduit config set gpu.vram_limit_mib auto` (or a number
+  of MiB). The limit is the smallest of your number, the display default and,
+  in safe mode, 2 GiB (see [SECURITY.md](SECURITY.md); check what applies
+  with `conduit doctor`). `off` removes the limit on a dedicated card, but
+  not safe mode's 2 GiB: turn safe mode off too (`gpu.safe_mode false`).
+
 ## Measuring
 
 Before trusting a benchmark difference, run it at least three times on a

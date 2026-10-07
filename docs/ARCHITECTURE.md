@@ -35,7 +35,11 @@ The guest runs NVIDIA's real user-mode driver: Vulkan, OpenGL/EGL, CUDA,
 NVENC/NVDEC. Its userspace files are the host's own, staged by
 `conduit-userspace` and mounted read-only over virtiofs, because the forwarded
 ioctls are a private contract between one driver build's userspace and kernel
-module.
+module. The file list is the driver's own manifest
+(`/usr/share/nvidia/files.d/sandboxutils-filelist.json`) when it ships one;
+for a driver that ships none, a built-in list for the loaded version is
+resolved against the installed files. Either way only the loaded module's
+version is staged.
 
 `conduit_gpu.ko` creates `/dev/nvidiactl`, `/dev/nvidia0..N`,
 `/dev/nvidia-uvm`, `/dev/nvidia-modeset` and a DRM device. It forwards each

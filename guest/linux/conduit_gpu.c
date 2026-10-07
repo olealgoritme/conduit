@@ -60,7 +60,10 @@
 #include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
 #include "nvgpu_pcimap.h"
+#include "nvgpu_devinfo.h"
 #include "nvgpu_rmctrl.h"
+#include "nvgpu_version.h"
+#include "nvgpu_escape.h"
 
 /*
  * module_kset lives in kernel/module/sysfs.c and is NOT exported to modules,
@@ -566,10 +569,8 @@ static int nvgpu_poll_spin_us;
 module_param_named(poll_spin_us, nvgpu_poll_spin_us, int, 0644);
 MODULE_PARM_DESC(poll_spin_us, "microseconds to spin before sleeping for an event");
 
-/* struct drm_nvidia_get_dev_info_params is nine u32s. */
-#define NVGPU_DEV_INFO_WORDS 9
-/* name_len, major, minor, slot_index, then the dev_info words. */
-#define NVGPU_DRI_RECORD_BYTES (16 + 4 * NVGPU_DEV_INFO_WORDS)
+/* name_len, major, minor, slot_index, then the dev_info record. */
+#define NVGPU_DRI_RECORD_BYTES (16 + NVGPU_DI_WIRE_BYTES)
 
 struct nvgpu_dri_dev {
   char name[32];
@@ -578,11 +579,12 @@ struct nvgpu_dri_dev {
   /* Which GPU slot this node hangs off. Ours, not NVIDIA's -- it is matched
    * against the GPU's minor, and is not the gpu_id GET_DEV_INFO reports. */
   u32 slot_index;
-  /* GET_DEV_INFO as the host's own node answered it. Passed through rather
-   * than reconstructed here: the gpu_id in it is what the ICD matches a DRM
-   * node to an RM device by, and the page-kind and sector-layout fields are
-   * per-architecture and were previously hardcoded for Ampere. */
-  u32 dev_info[NVGPU_DEV_INFO_WORDS];
+  /* GET_DEV_INFO as the host's own node answered it, decoded by the backend
+   * into named fields. Passed through rather than reconstructed here: the
+   * gpu_id in it is what the ICD matches a DRM node to an RM device by, and
+   * the page-kind and sector-layout fields are per-architecture. It is not
+   * the layout of any release; the caller's own is chosen when it asks. */
+  struct nvgpu_devinfo dev_info;
   struct cdev cdev;
   /* The registered DRM device, which owns the node and its sysfs tree. */
   struct drm_device *drm;
@@ -791,6 +793,14 @@ struct nvgpu_device {
     u32 params_size;
   } alloc_sizes[NVGPU_MAX_ALLOC_SIZES];
   int num_alloc_sizes;
+
+  /*
+   * The sizes the host release's kernel module takes for each escape. Empty
+   * until GET_SYS_FILES answers, and against a backend too old to send it:
+   * nothing is then refused here, and the backend's own check stands.
+   */
+  struct nvgpu_escape_size escape_sizes[NVGPU_MAX_ESCAPE_SIZES];
+  int num_escape_sizes;
 
   /*
    * The UVM calls the host release takes: the whole ioctl number, the size of
@@ -1168,7 +1178,8 @@ static bool nvgpu_fence_host_signalled(struct nvgpu_device *dev, u32 handle,
 /* Whether this node serves explicit sync: the backend relays fences and the
  * host's own node has semaphore surfaces (its GET_DEV_INFO supports_semsurf). */
 static bool nvgpu_dri_fences(const struct nvgpu_dri_dev *dri) {
-  return nvgpu_explicit_sync && dri->dev->fences && dri->dev_info[8];
+  return nvgpu_explicit_sync && dri->dev->fences &&
+         dri->dev_info.v[NVGPU_DI_SUPPORTS_SEMSURF];
 }
 
 /*
@@ -1187,18 +1198,6 @@ struct nvgpu_drm_version {
   size_t desc_len;
   char __user *desc;
 };
-
-struct drm_nvidia_get_dev_info_params {
-  __u32 gpu_id;
-  __u32 mig_device;
-  __u32 primary_index;
-  __u32 supports_alloc;
-  __u32 generic_page_kind;
-  __u32 page_kind_generation;
-  __u32 sector_layout;
-  __u32 supports_sync_fd;
-  __u32 supports_semsurf;
-} __packed;
 
 /*
  * nvgpu_drm_handle_ioctl — handle all DRM-layer ioctls on our /dev/dri/..
@@ -1264,27 +1263,26 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      * that used to be here reported gpu_id 0 where the host says 0x100, and a
      * page kind correct only on the two architectures the comment named.
      */
-    u32 info[NVGPU_DEV_INFO_WORDS];
+    struct nvgpu_devinfo info = dri->dev_info;
+    const struct nvgpu_devinfo_layout *layout;
+    u8 out[NVGPU_DI_WIRE_BYTES];
     bool fences;
 
-    BUILD_BUG_ON(sizeof(struct drm_nvidia_get_dev_info_params) !=
-                 NVGPU_DEV_INFO_WORDS * sizeof(u32));
-
-    memcpy(info, dri->dev_info, sizeof(info));
-
     /*
-     * The ICD's idea of this struct's size, against ours. A newer driver can
-     * grow it, and this handler answers the user pointer directly rather than
-     * through drm_ioctl's buffer -- so a larger struct is filled to 36 bytes
-     * and the rest is left as whatever the caller had there. The ICD then
-     * reads rubbish for the fields it added, and the symptom is not an error:
-     * it is a device that associates with no DRM node at all.
+     * The struct is the caller's release's, and its ioctl number says how big
+     * that is: 20, 32 or 36 bytes, each a different layout (nvgpu_devinfo.h).
+     * This handler answers the user pointer directly rather than through
+     * drm_ioctl's buffer, so a layout bigger than the caller's would write
+     * past its struct, and one of the wrong shape would hand it every field
+     * a word off. A size no release has is refused rather than guessed at.
      */
-    if (_IOC_SIZE(cmd) != sizeof(info))
+    layout = nvgpu_devinfo_layout_for_size(_IOC_SIZE(cmd));
+    if (!layout || layout->size > sizeof(out)) {
       dev_warn(&nfd->dev->vdev->dev,
-               "conduit-gpu: GET_DEV_INFO size mismatch: caller wants %u "
-               "bytes, this build answers %zu\n",
-               _IOC_SIZE(cmd), sizeof(info));
+               "conduit-gpu: GET_DEV_INFO: no release has a %u-byte struct\n",
+               _IOC_SIZE(cmd));
+      return -EINVAL;
+    }
 
     /*
      * The three capability bits are the host's answer about the host's node,
@@ -1312,9 +1310,9 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      */
     /* The fence ioctls need a drm_file, which the fallback cdev lacks. */
     fences = file && nvgpu_dri_fences(dri);
-    info[3] = nvgpu_claim_alloc;            /* supports_alloc */
-    info[7] = nvgpu_claim_sync_fd || fences; /* supports_sync_fd */
-    info[8] = fences;                        /* supports_semsurf */
+    info.v[NVGPU_DI_SUPPORTS_ALLOC] = nvgpu_claim_alloc;
+    info.v[NVGPU_DI_SUPPORTS_SYNC_FD] = nvgpu_claim_sync_fd || fences;
+    info.v[NVGPU_DI_SUPPORTS_SEMSURF] = fences;
 
     /*
      * primary_index is the number of the DRM node this device is, and it has
@@ -1336,9 +1334,11 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      * and nothing presented.
      */
     if (file && file->minor && file->minor->dev && file->minor->dev->primary)
-      info[2] = file->minor->dev->primary->index;
+      info.v[NVGPU_DI_PRIMARY_INDEX] = file->minor->dev->primary->index;
 
-    if (copy_to_user(uarg, info, sizeof(info)))
+    memset(out, 0, sizeof(out));
+    nvgpu_devinfo_encode(layout, &info, out, layout->size);
+    if (copy_to_user(uarg, out, layout->size))
       return -EFAULT;
     return 0;
   }
@@ -2628,7 +2628,9 @@ static u32 nvgpu_host_alloc_param_size(struct nvgpu_device *dev, u32 hClass) {
 }
 
 /*
- * nvgpu_ioctl_rm_alloc — NV_ESC_RM_ALLOC, same pattern via NVOS64_PARAMETERS.
+ * nvgpu_ioctl_rm_alloc — NV_ESC_RM_ALLOC, same pattern via NVOS64_PARAMETERS
+ * or, for the older form userspace still sends, NVOS21_PARAMETERS. RM takes
+ * either by the size in the ioctl number; see nvgpu_alloc_layout().
  *
  * Subtlety: when paramsSize == 0 but pAllocParms != NULL, the host RM
  * driver determines size from hClass.  We must look up the size ourselves
@@ -2636,7 +2638,8 @@ static u32 nvgpu_host_alloc_param_size(struct nvgpu_device *dev, u32 hClass) {
  */
 static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
                                  void __user *uarg, unsigned int sz) {
-  struct NVOS64_PARAMETERS params;
+  struct NVOS64_PARAMETERS params = {};
+  const struct nvgpu_alloc_layout *layout = nvgpu_alloc_layout(sz);
   void __user *user_alloc;
   u32 nested_size;
   void *req_buf = NULL, *resp_buf = NULL, *nested;
@@ -2644,14 +2647,16 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
 
-  if (sz < sizeof(params))
+  /* Neither size is not a call RM answers; it is not forwarded either. */
+  if (!layout)
     return -EINVAL;
 
-  if (copy_from_user(&params, uarg, sizeof(params)))
+  /* The first five fields are the same in both; what follows is the layout's. */
+  if (copy_from_user(&params, uarg, layout->size))
     return -EFAULT;
 
   user_alloc = (void __user *)(unsigned long)le64_to_cpu(params.pAllocParms);
-  nested_size = le32_to_cpu(params.paramsSize);
+  nested_size = nvgpu_le32_at(&params, layout->params_size_at);
 
   /*
    * When paramsSize == 0 but pAllocParms is non-NULL,
@@ -2669,8 +2674,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   if (nested_size > 1024 * 1024)
     return -EINVAL;
 
-  req_total = sizeof(*req) + sizeof(params) + nested_size;
-  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
+  req_total = sizeof(*req) + layout->size + nested_size;
+  resp_max = sizeof(struct nvgpu_ioctl_resp) + layout->size + nested_size;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
   resp_buf = kmalloc(resp_max, GFP_KERNEL);
@@ -2685,16 +2690,16 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   req->hdr.status = 0;
   req->hdr.padding = 0;
   req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sizeof(params));
-  req->nested_offset = cpu_to_le32(sizeof(params));
+  req->data_len = cpu_to_le32(layout->size);
+  req->nested_offset = cpu_to_le32(layout->size);
   req->nested_len = cpu_to_le32(nested_size);
   req->deep_ptr_offset = 0;
   req->deep_len = 0;
 
-  memcpy(req_buf + sizeof(*req), &params, sizeof(params));
+  memcpy(req_buf + sizeof(*req), &params, layout->size);
 
   if (user_alloc && nested_size > 0) {
-    nested = req_buf + sizeof(*req) + sizeof(params);
+    nested = req_buf + sizeof(*req) + layout->size;
     if (copy_from_user(nested, user_alloc, nested_size)) {
       ret = -EFAULT;
       goto out;
@@ -2715,10 +2720,10 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
 
       if (route) {
         ret = nvgpu_ioctl_register_memory(
-            nfd, cmd, uarg, sz, route, &params, sizeof(params), nested,
+            nfd, cmd, uarg, sz, route, &params, layout->size, nested,
             nested_size, le32_to_cpu(params.hRoot),
             /* the allocation routes report the handle as hObjectNew */
-            0xffffffffu, offsetof(struct NVOS64_PARAMETERS, status));
+            0xffffffffu, layout->status_at);
         goto out;
       }
     }
@@ -2774,14 +2779,14 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
-  if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
+  if (copy_to_user(uarg, resp_buf + sizeof(*resp), layout->size)) {
     ret = -EFAULT;
     goto out;
   }
 
   if (user_alloc && le32_to_cpu(resp->nested_len) > 0) {
     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
-    if (copy_to_user(user_alloc, resp_buf + sizeof(*resp) + sizeof(params),
+    if (copy_to_user(user_alloc, resp_buf + sizeof(*resp) + layout->size,
                      copy_back))
       ret = -EFAULT;
   }
@@ -3484,6 +3489,20 @@ static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
     return -EINVAL;
 
   /*
+   * RM's own rule: the escape takes the sizes the host release says, and
+   * anything else is invalid before any handler reads a field of it. See
+   * nvgpu_escape.h.
+   */
+  if (_IOC_TYPE(cmd) == 'F' &&
+      !nvgpu_escape_size_ok(nfd->dev->escape_sizes, nfd->dev->num_escape_sizes,
+                            nr, sz)) {
+    dev_dbg(&nfd->dev->vdev->dev,
+            "conduit-gpu: escape 0x%02x does not take %u bytes on this host\n",
+            nr, sz);
+    return -EINVAL;
+  }
+
+  /*
    * Memory named by a CPU address, before anything else looks at the block.
    * Two of the three routes would otherwise be handled by paths that know
    * nothing about it: NV_ESC_RM_ALLOC_MEMORY has a descriptor translation
@@ -3992,9 +4011,9 @@ static const struct file_operations nvgpu_uvm_fops = {
  * backend picks it the same way.
  */
 static u32 nvgpu_nvkms_register_surface(const char *version) {
-  unsigned int maj = 0, min = 0, pat = 0;
+  u32 maj, min, pat;
 
-  if (sscanf(version, "%u.%u.%u", &maj, &min, &pat) < 2)
+  if (!nvgpu_parse_version(version, &maj, &min, &pat))
     return 16;
   return (maj >= 580 && maj < 615) ? 17 : 16;
 }
@@ -5711,7 +5730,8 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
     dev_info(&dev->vdev->dev,
              "conduit-gpu: registered render node for %s, host (%u:%u) "
              "gpu_id=0x%x\n",
-             dri->name, dri->major, dri->minor, dri->dev_info[0]);
+             dri->name, dri->major, dri->minor,
+             dri->dev_info.v[NVGPU_DI_GPU_ID]);
   }
 
   return 0;
@@ -6072,7 +6092,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     for (i = 0; i < num_dri; i++) {
       __le32 raw_name_len, raw_major, raw_minor, raw_slot, raw_info;
       u32 name_len, major, minor, slot_index, nl;
-      u32 info[NVGPU_DEV_INFO_WORDS];
+      struct nvgpu_devinfo info;
       int idx, w;
 
       /* name_len + major + minor + slot_index, then the dev_info words */
@@ -6090,9 +6110,9 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       major = le32_to_cpu(raw_major);
       minor = le32_to_cpu(raw_minor);
       slot_index = le32_to_cpu(raw_slot);
-      for (w = 0; w < NVGPU_DEV_INFO_WORDS; w++) {
+      for (w = 0; w < NVGPU_DI_FIELDS; w++) {
         memcpy(&raw_info, p + 16 + 4 * w, sizeof(__le32));
-        info[w] = le32_to_cpu(raw_info);
+        info.v[w] = le32_to_cpu(raw_info);
       }
       p += NVGPU_DRI_RECORD_BYTES;
 
@@ -6109,14 +6129,16 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       dev->dri_devs[idx].major = major;
       dev->dri_devs[idx].minor = minor;
       dev->dri_devs[idx].slot_index = slot_index;
-      memcpy(dev->dri_devs[idx].dev_info, info, sizeof(info));
+      dev->dri_devs[idx].dev_info = info;
       dev->num_dri_devs++;
 
       dev_info(&dev->vdev->dev,
                "conduit-gpu: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
                "page kind %u/%u, sector layout %u\n",
-               dev->dri_devs[idx].name, major, minor, slot_index, info[0],
-               info[4], info[5], info[6]);
+               dev->dri_devs[idx].name, major, minor, slot_index,
+               info.v[NVGPU_DI_GPU_ID], info.v[NVGPU_DI_GENERIC_PAGE_KIND],
+               info.v[NVGPU_DI_PAGE_KIND_GENERATION],
+               info.v[NVGPU_DI_SECTOR_LAYOUT]);
       p += name_len;
     }
   }
@@ -6266,14 +6288,14 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     int i;
 
     if (p + sizeof(w) > end)
-      goto out;
+      goto escape_sizes;
 
     memcpy(&raw, p, sizeof(__le32));
     if (le32_to_cpu(raw) != NVGPU_OSDESC_MAGIC) {
       dev_info(&dev->vdev->dev,
                "conduit-gpu: backend says nothing about registering memory "
                "by address; such calls will be refused\n");
-      goto out;
+      goto escape_sizes;
     }
     for (i = 0; i < (int)ARRAY_SIZE(w); i++) {
       memcpy(&raw, p + i * 4, sizeof(__le32));
@@ -6329,6 +6351,69 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
                "conduit-gpu: memory may be registered by address, class "
                "0x%04x\n",
                dev->osdesc.class_id);
+  }
+
+escape_sizes:
+  /* ── Section 6: the escape sizes the host release takes ───────── */
+  /*
+   * Magic-guarded like the ones before it, and last so that a module from
+   * before it reads every section it knows and stops. Reached when section 5
+   * is absent too: its magic is looked for where the stream stands. Without
+   * this section no size is refused here and the backend's own check stands,
+   * which is what it was before.
+   */
+  {
+    __le32 raw;
+    u32 magic, count, i;
+
+    if (p + 8 > end)
+      goto out;
+
+    memcpy(&raw, p, sizeof(__le32));
+    magic = le32_to_cpu(raw);
+    if (magic != NVGPU_ESCAPE_SIZE_MAGIC) {
+      dev_info(&dev->vdev->dev,
+               "conduit-gpu: backend sent no escape sizes; the backend "
+               "alone checks them\n");
+    } else {
+      memcpy(&raw, p + 4, sizeof(__le32));
+      count = le32_to_cpu(raw);
+      p += 8;
+
+      /*
+       * Only a whole list is a rule. Keeping the first N of a longer one
+       * would refuse a size the release takes, so a list too long for this
+       * module is dropped and p still moves past it.
+       */
+      dev->num_escape_sizes = 0;
+      for (i = 0; i < count; i++) {
+        if (p + 8 > end) {
+          dev_warn(&dev->vdev->dev,
+                   "conduit-gpu: escape sizes truncated at entry %u; "
+                   "checking none\n", i);
+          dev->num_escape_sizes = 0;
+          goto out;
+        }
+        if (i < NVGPU_MAX_ESCAPE_SIZES) {
+          memcpy(&raw, p, sizeof(__le32));
+          dev->escape_sizes[i].escape = le32_to_cpu(raw);
+          memcpy(&raw, p + 4, sizeof(__le32));
+          dev->escape_sizes[i].size = le32_to_cpu(raw);
+        }
+        p += 8;
+      }
+      if (count > NVGPU_MAX_ESCAPE_SIZES) {
+        dev_warn(&dev->vdev->dev,
+                 "conduit-gpu: backend sent %u escape sizes, more than the "
+                 "%u this module holds; checking none\n",
+                 count, (u32)NVGPU_MAX_ESCAPE_SIZES);
+      } else {
+        dev->num_escape_sizes = count;
+        dev_info(&dev->vdev->dev,
+                 "conduit-gpu: the host release takes %u escape size(s)\n",
+                 count);
+      }
+    }
   }
 
 out:

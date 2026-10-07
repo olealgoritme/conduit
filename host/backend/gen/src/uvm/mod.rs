@@ -27,6 +27,7 @@
 //! that have one.
 
 pub mod v535_129_03;
+pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
 pub mod v595_71_05;
@@ -149,6 +150,11 @@ static PROFILES: &[Profile] = &[
         version: DriverVersion::new(535, 129, 3),
         cmd: || v535_129_03::CMD,
         init: || v535_129_03::INIT,
+    },
+    Profile {
+        version: DriverVersion::new(565, 77, 0),
+        cmd: || v565_77_00::CMD,
+        init: || v565_77_00::INIT,
     },
     Profile {
         version: DriverVersion::new(580, 178, 4),

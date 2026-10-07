@@ -305,12 +305,16 @@ impl NvidiaBackend {
         };
         let p = &mut self.rm_placements;
         match req.cmd & 0xFF {
-            // NVOS64: hRoot, hObjectParent, hObjectNew, hClass, pAllocParms,
-            // pRightsRequested, paramsSize, flags, status at 40.
+            // hRoot, hObjectParent, hObjectNew, hClass, pAllocParms, and then,
+            // by size, NVOS64's rights, paramsSize, flags and status at 40 or
+            // NVOS21's paramsSize and status at 28.
             ESC_RM_ALLOC => {
-                let (Some(client), Some(object), Some(class), Some(status)) =
-                    (w(top, 0), w(top, 8), w(top, 12), w(top, 40))
-                else {
+                let (Some(client), Some(object), Some(class), Some(status)) = (
+                    w(top, 0),
+                    w(top, 8),
+                    w(top, 12),
+                    alloc_status_at(data_len).and_then(|at| w(top, at)),
+                ) else {
                     return;
                 };
                 if status != 0 || !PLACED_CLASSES.contains(&class) {
@@ -371,23 +375,19 @@ impl NvidiaBackend {
     }
 }
 
-/// `DRM_IOCTL_NVIDIA_GET_DEV_INFO`, as the `u64` the host driver takes (the
-/// cast is needed where `libc::Ioctl` is not `u64`, as on musl).
-#[allow(clippy::unnecessary_cast)]
-const GET_DEV_INFO: u64 = DRM_IOCTL_NVIDIA_GET_DEV_INFO as u64;
-
-/// `DRM_IOCTL_NVIDIA_GET_DEV_INFO` on `fd`, through the host driver.
-fn tiling_of(host: &dyn HostDriver, fd: RawFd) -> Option<Tiling> {
-    let mut p = [0u8; 4 * NV_DEV_INFO_WORDS];
-    if let Err(e) = host.ioctl(fd, GET_DEV_INFO, &mut p) {
+/// `DRM_IOCTL_NVIDIA_GET_DEV_INFO` on `fd`, through the host driver, in the
+/// host release's layout.
+fn tiling_of(host: &dyn HostDriver, fd: RawFd, layout: &abi::devinfo::Layout) -> Option<Tiling> {
+    let mut p = vec![0u8; layout.size];
+    if let Err(e) = host.ioctl(fd, u64::from(layout.ioctl()), &mut p) {
         log::warn!("rm import: GET_DEV_INFO on the render node failed: errno {e}");
         return None;
     }
-    let word = |i: usize| u32::from_le_bytes(p[i * 4..i * 4 + 4].try_into().unwrap());
+    let d = layout.decode(&p)?;
     Some(Tiling {
-        kind: word(4),
-        generation: word(5),
-        sector_layout: word(6),
+        kind: d.generic_page_kind,
+        generation: d.page_kind_generation,
+        sector_layout: d.sector_layout,
     })
 }
 
@@ -450,7 +450,12 @@ impl NvidiaBackend {
                 let Ok(fd) = self.handles.get_raw(owner as u64) else {
                     return;
                 };
-                tiling_of(&*self.host, fd).and_then(|t| modifier_for(layout, t))
+                // No layout for this release (never an older one's): the node
+                // is not asked, and the surface has no known modifier.
+                self.start
+                    .devinfo
+                    .and_then(|l| tiling_of(&*self.host, fd, &l))
+                    .and_then(|t| modifier_for(layout, t))
             }
         };
         log::debug!(
@@ -618,6 +623,21 @@ mod tests {
     struct DrmHost {
         object_size: u64,
         calls: Arc<Mutex<Vec<u64>>>,
+        /// What the node answers `GET_DEV_INFO` with, in the host release's
+        /// own words. The ioctl number it is asked with has to carry their
+        /// size, as the real driver's does.
+        dev_info: Vec<u32>,
+    }
+
+    /// What GB202 answers on 575 and later, nine words.
+    const GB202_575: [u32; 9] = [0x100, 0, 0, 1, 6, 2, 1, 1, 1];
+    /// What an RTX 4070 SUPER answers on 565.77: eight words, no `mig_device`.
+    const AD104_565: [u32; 8] = [0x200, 1, 1, 6, 2, 1, 1, 1];
+
+    /// `_IOWR('d', 0x43, <size>)`, written out so a change to
+    /// [`abi::devinfo::Layout::ioctl`] cannot hide behind itself.
+    fn get_dev_info_cmd(size: u32) -> u64 {
+        0xC000_6443 | u64::from(size) << 16
     }
 
     pub(crate) const GEM_HANDLE: u32 = 77;
@@ -632,8 +652,16 @@ mod tests {
                     .copy_from_slice(&GEM_HANDLE.to_le_bytes());
                 return Ok(());
             }
-            if request == GET_DEV_INFO {
-                for (i, w) in [0x100u32, 0, 0, 1, 6, 2, 1, 1, 1].iter().enumerate() {
+            if request & 0xffff == 0x6443 {
+                // The real driver copies in the number's size, fills its own
+                // struct and copies that out: a mismatch is not an error
+                // there, it is a short or a long read. Here it is one.
+                if request != get_dev_info_cmd(self.dev_info.len() as u32 * 4)
+                    || arg.len() != self.dev_info.len() * 4
+                {
+                    return Err(libc::EINVAL);
+                }
+                for (i, w) in self.dev_info.iter().enumerate() {
                     arg[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
                 }
                 return Ok(());
@@ -663,11 +691,26 @@ mod tests {
     /// A backend on [`DrmHost`] with a render node (and a control file whose
     /// handle stands in for NVK's export descriptor) open.
     pub(crate) fn drm_backend(object_size: u64) -> (NvidiaBackend, u64, u64, Arc<Mutex<Vec<u64>>>) {
+        drm_backend_on(
+            abi::version::DriverVersion::new(615, 71, 9),
+            &GB202_575,
+            object_size,
+        )
+    }
+
+    /// [`drm_backend`] on a host release whose nvidia-drm answers `dev_info`.
+    fn drm_backend_on(
+        release: abi::version::DriverVersion,
+        dev_info: &[u32],
+        object_size: u64,
+    ) -> (NvidiaBackend, u64, u64, Arc<Mutex<Vec<u64>>>) {
         let mut be = NvidiaBackend::for_test();
+        be.start.devinfo = abi::devinfo::select(release);
         let calls = Arc::new(Mutex::new(Vec::new()));
         be.set_host(Box::new(DrmHost {
             object_size,
             calls: calls.clone(),
+            dev_info: dev_info.to_vec(),
         }));
         let open = |be: &mut NvidiaBackend, kind| {
             let null = std::fs::File::open("/dev/null").expect("/dev/null");
@@ -736,8 +779,8 @@ mod tests {
             Some(Some(0x0300_0000_0060_6015))
         );
         assert!(
-            calls.lock().unwrap().contains(&GET_DEV_INFO),
-            "the node's own tiling was asked"
+            calls.lock().unwrap().contains(&get_dev_info_cmd(36)),
+            "the node's own tiling was asked, in the size its release has"
         );
         let o = be.rm_view().export(dri as u32, GEM_HANDLE).unwrap();
         assert_eq!(o.modifier, Some(0x0300_0000_0060_6015));
@@ -748,6 +791,44 @@ mod tests {
             be.rm_layouts.get(dri as u32, GEM_HANDLE),
             Some(Some(MOD_LINEAR))
         );
+    }
+
+    /// On 565.77 the struct is eight words. Read as nine, the page kind comes
+    /// out as 2 and the generation as 1 and the modifier names a layout the
+    /// card does not use; asked with a 36-byte number the real driver reads
+    /// 36 bytes of the caller's 32 as well.
+    #[test]
+    fn a_565_host_is_asked_and_read_in_its_own_layout() {
+        let v565 = abi::version::DriverVersion::new(565, 77, 0);
+        let (mut be, dri, ctl, calls) = drm_backend_on(v565, &AD104_565, 1 << 20);
+        import_layout(&mut be, dri, ctl, NVKMS_LAYOUT_BLOCK_LINEAR, 5);
+        assert_eq!(
+            be.rm_layouts.get(dri as u32, GEM_HANDLE),
+            Some(Some(0x0300_0000_0060_6015)),
+            "kind 6, generation 2, sector layout 1"
+        );
+        assert!(calls.lock().unwrap().contains(&get_dev_info_cmd(32)));
+        assert!(!calls.lock().unwrap().contains(&get_dev_info_cmd(36)));
+    }
+
+    /// A host release with no GET_DEV_INFO table (580.65.06, started under
+    /// `--allow-nearest-abi`) is never asked with a layout it does not have:
+    /// not 565.77's 32 bytes, not the newest 36. The import still succeeds
+    /// and the surface simply has no known modifier.
+    #[test]
+    fn a_release_without_a_devinfo_table_is_not_asked_and_has_no_modifier() {
+        let v = abi::version::DriverVersion::new(580, 65, 6);
+        // The host would answer in 36 bytes, which the backend must not ask.
+        let (mut be, dri, ctl, calls) = drm_backend_on(v, &GB202_575, 1 << 20);
+        assert!(be.start.devinfo.is_none());
+        import_layout(&mut be, dri, ctl, NVKMS_LAYOUT_BLOCK_LINEAR, 5);
+        assert!(
+            calls.lock().unwrap().iter().all(|c| c & 0xffff != 0x6443),
+            "GET_DEV_INFO reached the host: {:x?}",
+            calls.lock().unwrap()
+        );
+        assert_eq!(be.rm_layouts.get(dri as u32, GEM_HANDLE), Some(None));
+        assert_eq!(be.rm_layouts.get(dri as u32, GEM_HANDLE).flatten(), None);
     }
 
     /// An answered RM call as `note_rm_placement` sees it: the request

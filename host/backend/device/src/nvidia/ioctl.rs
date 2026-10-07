@@ -16,7 +16,7 @@ impl NvidiaBackend {
     /// Layout is `nv_ioctl_rm_api_version_t`: cmd (4), reply (4), then a
     /// NUL-terminated 64-byte version string.
     pub(super) fn learn_driver_version(&mut self, param_buf: &[u8]) {
-        if self.driver.is_some() || param_buf.len() < 12 {
+        if self.start.driver.is_some() || param_buf.len() < 12 {
             return;
         }
         let tail = &param_buf[8..];
@@ -27,19 +27,20 @@ impl NvidiaBackend {
         let Some(v) = abi::version::DriverVersion::parse(text) else {
             return;
         };
-        self.driver = Some(v);
-        self.abi = abi::versions::table_for(v);
+        self.start.driver = Some(v);
+        self.start.abi = abi::versions::table_for(v);
         // The RM pointer table goes with it. A caller that learns the release
         // this way rather than through `set_host_driver_version` -- another
         // VMM embedding this crate -- would otherwise have an ABI profile and
         // no pointer table, and every control that carries a pointer would go
         // through undescribed, which is what this crate stopped doing in M3.
-        self.rmctrl = abi::rmctrl::select(v);
-        self.rmallow = abi::rmallow::select(v);
-        self.uvm = abi::uvm::select(v);
-        self.osdesc = abi::osdesc::select(v);
-        self.vidmem = abi::vidmem::select(v);
-        match self.abi {
+        self.start.rmctrl = abi::rmctrl::select(v);
+        self.start.rmallow = abi::rmallow::select(v);
+        self.start.uvm = abi::uvm::select(v);
+        self.start.osdesc = abi::osdesc::select(v);
+        self.start.vidmem = abi::vidmem::select(v);
+        self.start.devinfo = abi::devinfo::select(v);
+        match self.start.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
             None => log::warn!(
                 "host driver {v} is older than every ABI profile; ioctls will be \
@@ -60,6 +61,7 @@ impl NvidiaBackend {
         class: u32,
         bit: u32,
         param_in: &[u8],
+        block: usize,
         resp_buf: &mut [u8],
     ) -> usize {
         const NV_ERR_INVALID_CLASS: u32 = 0x22;
@@ -70,10 +72,10 @@ impl NvidiaBackend {
         };
         self.refuse_for_caps(format!("RM_ALLOC class {class:#06x}"), needs);
         let mut out = param_in.to_vec();
-        if out.len() < NVOS64_STATUS + 4 {
+        let Some(at) = alloc_status_at(block) else {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
-        }
-        out[NVOS64_STATUS..NVOS64_STATUS + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
+        };
+        out[at..at + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &out)
     }
 
@@ -89,7 +91,7 @@ impl NvidiaBackend {
         // No allowlist at all means nothing can be said about any control.
         // Unreachable through `set_host_driver_version`, which refuses to
         // start without one; reachable by another VMM embedding this crate.
-        let Some(sel) = self.rmallow else {
+        let Some(sel) = self.start.rmallow else {
             return Some("no RM allowlist for this host".into());
         };
         let Some(rule) = sel.ctrl_rule(cmd) else {
@@ -136,7 +138,7 @@ impl NvidiaBackend {
     /// way. NVIDIA's userspace leaves it zero, so checking it refused every
     /// workload at its first VA space (`FERMI_VASPACE_A`).
     fn rm_class_refusal(&self, class: u32, have: usize) -> Option<String> {
-        let Some(sel) = self.rmallow else {
+        let Some(sel) = self.start.rmallow else {
             return Some("no RM allowlist for this host".into());
         };
         let Some(entry) = sel.class_entry(class) else {
@@ -194,15 +196,16 @@ impl NvidiaBackend {
         class: u32,
         why: String,
         param_in: &[u8],
+        block: usize,
         resp_buf: &mut [u8],
     ) -> usize {
         const NV_ERR_INVALID_CLASS: u32 = 0x22;
         self.note_allow_refusal(format!("RM_ALLOC class {class:#06x}"), why);
         let mut out = param_in.to_vec();
-        if out.len() < NVOS64_STATUS + 4 {
+        let Some(at) = alloc_status_at(block) else {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
-        }
-        out[NVOS64_STATUS..NVOS64_STATUS + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
+        };
+        out[at..at + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &out)
     }
 
@@ -223,7 +226,7 @@ impl NvidiaBackend {
     /// bytes. Without a check it surfaces as corrupt GPU state rather than an
     /// error.
     pub fn check_abi(&self, escape: u32, param_size: u32) -> AbiCheck {
-        let Some(table) = self.abi else {
+        let Some(table) = self.start.abi else {
             return AbiCheck::NoProfile;
         };
         let Some(entry) = abi::versions::lookup(table, escape) else {
@@ -231,7 +234,7 @@ impl NvidiaBackend {
         };
         match entry.param_size {
             None => AbiCheck::VariableLength,
-            Some(expected) if expected == param_size => AbiCheck::Ok,
+            Some(_) if entry.accepts(param_size) => AbiCheck::Ok,
             Some(expected) => AbiCheck::SizeMismatch {
                 expected,
                 actual: param_size,
@@ -444,14 +447,18 @@ impl NvidiaBackend {
                     log::warn!(
                         "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects \
                          {expected}",
-                        self.driver.expect("a profile implies a known version")
+                        self.start
+                            .driver
+                            .expect("a profile implies a known version")
                     );
                     true
                 }
                 AbiCheck::UnknownEscape => {
                     log::warn!(
                         "escape {escape:#04x} is not in the ABI profile for host driver {}",
-                        self.driver.expect("a profile implies a known version")
+                        self.start
+                            .driver
+                            .expect("a profile implies a known version")
                     );
                     true
                 }
@@ -487,24 +494,16 @@ impl NvidiaBackend {
                 // semaphore control -- would act on the host's monitors; a
                 // guest enabling and dropping VBLANK_SEM_CONTROL crashed the
                 // host's Hyprland inside libnvidia-eglcore.
-                let reg = super::nvkms_register_surface(self.driver);
-                // ENABLE/DISABLE_VBLANK_SEM_CONTROL sit 43 and 44 past
-                // REGISTER_SURFACE (60/61 on 580..610). NVIDIA's EGL requires
-                // them to succeed and crashes otherwise, but a guest has no
-                // display whose vblanks it could count, so they are answered
-                // here: success, a handle that names nothing on the host.
-                if nvkms_cmd == reg + 43 || nvkms_cmd == reg + 44 {
-                    const OUTER: usize = 16;
-                    const ENABLE_REPLY_HANDLE: usize = 24;
-                    let mut combined = param_in.to_vec();
-                    if nvkms_cmd == reg + 43 && combined.len() >= OUTER + ENABLE_REPLY_HANDLE + 4 {
-                        let h = OUTER + ENABLE_REPLY_HANDLE;
-                        combined[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
-                    }
-                    log::debug!("NVKMS cmd={nvkms_cmd} answered locally (vblank sem control)");
-                    traced_refusal!(self, Local);
-                    return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
-                }
+                // Every command is named by the host release's own table
+                // (abi::nvkms); nothing here is computed from another command's
+                // number, and a release with no table is served only
+                // ALLOC/FREE_DEVICE.
+                //
+                // ENABLE/DISABLE_VBLANK_SEM_CONTROL: NVIDIA's EGL requires them
+                // to succeed and crashes otherwise, but a guest has no display
+                // whose vblanks it could count, so they are answered here:
+                // success, a handle that names nothing on the host.
+                //
                 // QUERY_DISP is answered here too, with a disp that has no
                 // connectors and no dpys: what NVKMS itself reports for a
                 // display engine with nothing wired to it. Refusing it is not
@@ -516,19 +515,33 @@ impl NvidiaBackend {
                 // a connector or a dpy, so the queries that would describe the
                 // host's monitors are never asked, and they stay refused if
                 // they are.
-                if nvkms_cmd == super::NVKMS_QUERY_DISP {
-                    return self.answer_nvkms_query_disp(resp_buf, cookie, param_in);
-                }
-                let allowed = nvkms_cmd <= 1 || (reg..=reg + 4).contains(&nvkms_cmd);
-                if !allowed {
-                    log::warn!("NVKMS cmd={nvkms_cmd} refused: acts on the host display");
-                    traced_refusal!(self, HostDisplay);
-                    return self.write_error_resp(
-                        resp_buf,
-                        Status::IoctlFailed,
-                        cookie,
-                        libc::EPERM,
-                    );
+                match abi::nvkms::verdict(self.start.driver, nvkms_cmd) {
+                    abi::nvkms::Verdict::AnswerVblank { reply_handle } => {
+                        const OUTER: usize = 16;
+                        const ENABLE_REPLY_HANDLE: usize = 24;
+                        let mut combined = param_in.to_vec();
+                        if reply_handle && combined.len() >= OUTER + ENABLE_REPLY_HANDLE + 4 {
+                            let h = OUTER + ENABLE_REPLY_HANDLE;
+                            combined[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
+                        }
+                        log::debug!("NVKMS cmd={nvkms_cmd} answered locally (vblank sem control)");
+                        traced_refusal!(self, Local);
+                        return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
+                    }
+                    abi::nvkms::Verdict::AnswerQueryDisp => {
+                        return self.answer_nvkms_query_disp(resp_buf, cookie, param_in);
+                    }
+                    abi::nvkms::Verdict::Refuse => {
+                        log::warn!("NVKMS cmd={nvkms_cmd} refused: acts on the host display");
+                        traced_refusal!(self, HostDisplay);
+                        return self.write_error_resp(
+                            resp_buf,
+                            Status::IoctlFailed,
+                            cookie,
+                            libc::EPERM,
+                        );
+                    }
+                    abi::nvkms::Verdict::Forward | abi::nvkms::Verdict::ForwardWithFd => {}
                 }
             }
             // REGISTER_SURFACE carries one of our handles where NVKMS expects a
@@ -537,8 +550,10 @@ impl NvidiaBackend {
             // back. See the driver's side of this, which explains why it only
             // shows up on some driver versions.
             let nvkms_fd_offset = if param_in.len() >= 4
-                && u32::from_le_bytes(param_in[0..4].try_into().unwrap())
-                    == super::nvkms_register_surface(self.driver)
+                && abi::nvkms::verdict(
+                    self.start.driver,
+                    u32::from_le_bytes(param_in[0..4].try_into().unwrap()),
+                ) == abi::nvkms::Verdict::ForwardWithFd
             {
                 Some(NVKMS_SURFACE_FD_OFFSET)
             } else {
@@ -705,6 +720,17 @@ impl NvidiaBackend {
                 self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf)
             }
 
+            // Forwarded as it is, except that in safe mode the timeout the
+            // guest chose is held to a ceiling (bounds.rs): the host idles
+            // with the GPU group lock held for that long.
+            NV_ESC_RM_IDLE_CHANNELS => {
+                let mut p = param_in.to_vec();
+                if self.start.bounds.clamp_idle_channels(&mut p) {
+                    log::warn!("NV_ESC_RM_IDLE_CHANNELS: timeout clamped");
+                }
+                self.dispatch_simple(cookie, host_fd, request, &p, resp_buf)
+            }
+
             NV_ESC_RM_MAP_MEMORY => {
                 self.dispatch_map_memory(cookie, host_fd, request, param_in, resp_buf)
             }
@@ -754,9 +780,16 @@ impl NvidiaBackend {
                     let class = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
                     *self.rm_classes.entry(class).or_insert(0) += 1;
                     if let Some(bit) = crate::caps::Caps::for_class(class)
-                        && !self.caps.has(bit)
+                        && !self.start.caps.has(bit)
                     {
-                        return self.refuse_alloc_class(cookie, class, bit, param_in, resp_buf);
+                        return self.refuse_alloc_class(
+                            cookie,
+                            class,
+                            bit,
+                            param_in,
+                            ireq.data_len as usize,
+                            resp_buf,
+                        );
                     }
                     // The cap is a decision somebody made; this is RM's. Both
                     // have to pass. The allocation parameters are the nested
@@ -764,7 +797,14 @@ impl NvidiaBackend {
                     // one level further in: a pointer inside those parameters.
                     let have = ireq.nested_len as usize;
                     if let Some(why) = self.rm_class_refusal(class, have) {
-                        return self.refuse_alloc(cookie, class, why, param_in, resp_buf);
+                        return self.refuse_alloc(
+                            cookie,
+                            class,
+                            why,
+                            param_in,
+                            ireq.data_len as usize,
+                            resp_buf,
+                        );
                     }
                     // RM marks this class non-privileged, so the allowlist
                     // above lets it through: RM is right, for a caller whose
@@ -783,8 +823,15 @@ impl NvidiaBackend {
                         );
                     }
                 }
+                // The block is whichever of the two sizes the caller sent; RM
+                // took it by that size and so does the host driver.
+                let outer = if ireq.data_len as usize == NVOS21_SIZE {
+                    NVOS21_SIZE
+                } else {
+                    NVOS64_SIZE
+                };
                 self.dispatch_nested(
-                    cookie, host_fd, request, param_in, resp_buf, 48, 16, 32, deep_in, None,
+                    cookie, host_fd, request, param_in, resp_buf, outer, 16, 32, deep_in, None,
                 )
             }
 

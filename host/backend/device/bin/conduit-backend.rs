@@ -1144,6 +1144,7 @@ impl NvGpuBackend {
         display: Option<(DisplayMode, Arc<DisplayLink>, bool)>,
         input_target: EventTarget,
         input_claims: Arc<GuestInputClaims>,
+        safe_mode: bool,
     ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
@@ -1167,7 +1168,9 @@ impl NvGpuBackend {
         let inexact = nvidia.inexact_tables();
         if !inexact.is_empty() {
             let what = format!(
-                "host driver {version} has no ABI tables of its own ({}); only an older release's",
+                "host driver {version} has no ABI tables of its own ({}); the GET_DEV_INFO and NVKMS \
+                 tables have no older release's to fall back on (their layouts are not \
+                 monotonic), the rest use the nearest older one's",
                 inexact.join(", ")
             );
             anyhow::ensure!(
@@ -1179,6 +1182,7 @@ impl NvGpuBackend {
             log::warn!("{what}: starting anyway (--allow-nearest-abi)");
         }
         nvidia.set_caps(caps);
+        nvidia.set_safe_mode(safe_mode);
         nvidia
             .set_vram_limit_mib(vram_limit_mib)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
@@ -1891,6 +1895,24 @@ fn main() -> anyhow::Result<()> {
         report.seccomp_rules
     );
 
+    // Read once, here. The strictest posture for a first run on a GPU that
+    // also drives a desktop: the blocking timeouts a guest may forward cut to
+    // 1 s (nvidia/bounds.rs).
+    let safe_mode = std::env::var("CONDUIT_SAFE_MODE").as_deref() == Ok("1");
+    if safe_mode {
+        // The video-memory limit is not decided here: the CLI computes the one
+        // final number (cli/src/protect.rs `final_limit_mib`: the smallest of
+        // the owner's number, the display default and the 2 GiB safe-mode cap)
+        // and this process enforces what it was given.
+        log::warn!(
+            "SAFE MODE is on (CONDUIT_SAFE_MODE=1): forwarded blocking timeouts clamped to 1 s; \
+             video memory is held to --vram-limit-mib as the CLI computed it ({})",
+            args.vram_limit_mib
+                .map_or("none given, so no limit".to_string(), |m| format!(
+                    "{m} MiB"
+                ))
+        );
+    }
     log::info!(
         "conduit-backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}",
         args.socket,
@@ -1991,6 +2013,7 @@ fn main() -> anyhow::Result<()> {
         display,
         input_target,
         input_claims,
+        safe_mode,
     )?;
     #[cfg(feature = "venus")]
     if args.venus {

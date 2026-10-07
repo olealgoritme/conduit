@@ -6,6 +6,7 @@
 // driver the host is running.
 
 pub mod v535_129_03;
+pub mod v565_57_01;
 pub mod v580_178_04;
 pub mod v595_71_05;
 pub mod v610_57_04;
@@ -49,7 +50,22 @@ pub struct IoctlEntry {
     /// `sizeof` the parameter struct for this driver version, or `None` when
     /// the ioctl is variable length.
     pub param_size: Option<u32>,
+    /// Further sizes this release's kernel module takes for the same escape.
+    /// Only `NV_ESC_RM_ALLOC` has one (NVOS21, 32 bytes, beside NVOS64's 48);
+    /// see `ALSO_ACCEPTS` in `nvabi_gen.py`.
+    pub also: &'static [u32],
     pub kind: IoctlKind,
+}
+
+impl IoctlEntry {
+    /// Whether the kernel module of this release takes `size` bytes here.
+    /// A variable-length escape takes any.
+    pub fn accepts(&self, size: u32) -> bool {
+        match self.param_size {
+            None => true,
+            Some(own) => own == size || self.also.contains(&size),
+        }
+    }
 }
 
 /// A supported driver version and the table it selects.
@@ -63,6 +79,10 @@ static PROFILES: &[Profile] = &[
     Profile {
         version: DriverVersion::new(535, 129, 3),
         table: v535_129_03::table,
+    },
+    Profile {
+        version: DriverVersion::new(565, 57, 1),
+        table: v565_57_01::table,
     },
     Profile {
         version: DriverVersion::new(580, 178, 4),
@@ -120,15 +140,25 @@ mod tests {
 
     #[test]
     fn version_between_profiles_selects_the_lower_one() {
-        // 570.x sits between the 535 and 580 profiles.
-        let t = table_for(DriverVersion::new(570, 86, 15)).expect("falls back to 535");
-        assert!(std::ptr::eq(t, v535_129_03::table()));
+        // 570.x sits between the 565.57.01 and 580 profiles.
+        let t = table_for(DriverVersion::new(570, 86, 15)).expect("falls back to 565.57.01");
+        assert!(std::ptr::eq(t, v565_57_01::table()));
     }
 
     #[test]
     fn version_above_every_profile_selects_the_highest() {
         let t = table_for(DriverVersion::new(610, 43, 2)).expect("falls back to 595");
         assert!(std::ptr::eq(t, v595_71_05::table()));
+    }
+
+    #[test]
+    fn the_565_77_release_uses_the_565_57_01_profile() {
+        // gVisor's nvproxy has 565.57.01 and no 565.77; open-gpu-kernel-modules
+        // differs between the two in no escape struct or ioctl number, so
+        // 565.77 selects 565.57.01 by range. The 535 profile it would otherwise
+        // get has a 40-byte UNMAP_MEMORY_DMA and no WAIT_OPEN_COMPLETE.
+        let t = table_for(DriverVersion::new(565, 77, 0)).expect("565.77 has a profile");
+        assert!(std::ptr::eq(t, v565_57_01::table()));
     }
 
     #[test]
@@ -143,5 +173,52 @@ mod tests {
         let mut sorted = vs.clone();
         sorted.sort();
         assert_eq!(vs, sorted, "PROFILES must stay in ascending order");
+    }
+
+    /// Escape x release -> accepted sizes, one row each, as the table says.
+    fn sizes_tsv() -> String {
+        let mut out = String::from("release\tescape\tname\tsizes\n");
+        for p in PROFILES {
+            for e in (p.table)() {
+                let sizes = match e.param_size {
+                    None => "any".to_string(),
+                    Some(own) => std::iter::once(own)
+                        .chain(e.also.iter().copied())
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                };
+                let name = crate::names::escape(e.escape).unwrap_or("?");
+                out += &format!("{}\t{:#04x}\t{name}\t{sizes}\n", p.version, e.escape);
+            }
+        }
+        out
+    }
+
+    /// The fixture the guest's C test (`guest/linux/test/escape_test.c`) reads:
+    /// the same table the backend checks calls against and sends the guest.
+    /// Regenerate with `UPDATE_FIXTURES=1 cargo test -p abi escape_size`.
+    #[test]
+    fn the_escape_size_fixture_is_the_tables() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/escape_sizes.tsv");
+        let now = sizes_tsv();
+        if std::env::var_os("UPDATE_FIXTURES").is_some() {
+            std::fs::write(path, &now).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(path).expect("fixtures/escape_sizes.tsv"),
+            now,
+            "stale: run UPDATE_FIXTURES=1 cargo test -p abi escape_size"
+        );
+    }
+
+    /// RM_ALLOC takes NVOS21 (32) and NVOS64 (48) in every release.
+    #[test]
+    fn rm_alloc_takes_both_its_sizes_in_every_release() {
+        for p in PROFILES {
+            let e = lookup((p.table)(), crate::ioctl::NV_ESC_RM_ALLOC).unwrap();
+            assert!(e.accepts(32) && e.accepts(48), "{}", p.version);
+            assert!(!e.accepts(40) && !e.accepts(0), "{}", p.version);
+        }
     }
 }

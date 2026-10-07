@@ -1,11 +1,12 @@
 # GPU support: RTX 20 / 30 / 40 / 50
 
 What Conduit needs to work on every GeForce RTX generation, for Linux guests
-and Windows 11 guests (NVK-on-RM, Venus fallback). Everything so far ran on
-one GPU only: an RTX 5090 (Blackwell, GB202). Nothing here has been run on
-Turing, Ampere or Ada yet; every verdict for them is read from the code and
-from upstream, not measured. Guesses are marked **(guess)**, things to check
-on hardware **(to verify)**.
+and Windows 11 guests (NVK-on-RM, Venus fallback). The reference machine is an
+RTX 5090 (Blackwell, GB202). One Linux-guest run exists on an RTX 4070 SUPER
+(Ada, AD104; [measured below](#measured-rtx-4070-super-ada-ad104)). Nothing
+has been run on Turing or Ampere, and every other verdict is read from the
+code and from upstream, not measured. Guesses are marked **(guess)**, things
+to check on hardware **(to verify)**.
 
 Related: [SECOND-MACHINE.md](SECOND-MACHINE.md) (setting up the second
 machine), [NVK-ROADMAP.md](NVK-ROADMAP.md), [HANDOFF.md](HANDOFF.md).
@@ -53,12 +54,45 @@ possible with the current stack).
 
 | Requirement | RTX 20 | RTX 30 | RTX 40 | RTX 50 | Evidence |
 |---|---|---|---|---|---|
-| NVIDIA open kernel modules | expected | expected | expected | works | Open modules support Turing and later only (README of [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)); Blackwell requires them. `conduit doctor` refuses the closed modules: `cli/src/doctor.rs:77` |
-| Driver release with RM ABI tables (580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09) | expected | expected | expected | works | Tables are **per driver release, not per GPU**: RM's ioctl/control layouts do not depend on the chip. `host/backend/gen/src/osdesc/mod.rs:185` picks the nearest older release; doctor checks the version against the supported list (`cli/src/doctor.rs:86`). A newer driver needs new tables (`host/backend/gen`, `.github/workflows/abi.yml`) |
+| NVIDIA open kernel modules | expected | expected | expected | works | Open modules support Turing and later only (README of [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)); Blackwell requires them. `conduit doctor` warns (not fails) on the closed modules for a release that has tables, and says Conduit is untested with them: `module_verdict` in `cli/src/doctor.rs`. Nothing in the backend checks for the open modules (it reads `/proc/driver/nvidia` and per-release tables). A 565.77 closed-module host (RTX 4070 Super) is the first closed-module host this was pointed at, and it is **not run yet** (to verify) |
+| Driver release with RM ABI tables (535.129.03, 565.77, 580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09) | expected | expected | expected | works | Tables are **per driver release, not per GPU**: RM's ioctl/control layouts do not depend on the chip. `host/backend/gen/src/osdesc/mod.rs:185` picks the nearest older release; doctor checks the version against the supported list (`cli/src/doctor.rs`; `565.77` and `565.77.00` are one release). 565.77 was generated from open-gpu-kernel-modules tag `565.77`, which differs from `565.57.01` in no ioctl number or parameter struct (an I2C SMBus fix, a vGPU notifier enum, NVKMS null checks); gVisor's nvproxy has no 565.77, so its escape profile is the generated `versions/v565_57_01.rs`, which 565.77 selects by range. **Not exercised against a live 565.77 driver.** Parameter sizes differ per release (the `GF100_CHANNEL_GPFIFO` allocation is 360 bytes in the 565.77 table, 368 in 580.178.04 and 615.71.09, 376 in 595) and the backend refuses a block of the wrong size, while NVK-on-RM's patch 0002 asserts 376: whether NVK-on-RM allocates a channel on a 565.77 host is **to verify** on the host | A newer driver needs new tables (`host/backend/gen`, `.github/workflows/abi.yml`) |
 | Turing still supported by the driver branch | expected | | | | 580 is the last branch for Maxwell/Pascal/Volta; 590+ supports Turing (GTX 16 / RTX 20) and later, no Linux EOL for Turing announced ([Arch news on 590](https://archlinux.org/news/nvidia-590-driver-drops-pascal-support-main-packages-switch-to-open-kernel-modules/)). 615 ships open modules only |
 | BAR1 / RM window sizing | needs check: 256 MiB BAR1 | expected (ReBAR on) / needs check (off) | expected | works | `gpu.window_mib` defaults to the host GPU's BAR1 (`cli/src/config.rs:7`, `cli/src/lvrun.rs:639`); the KMD handles small windows (`guest/windows/kmd_logic/src/rm_window.rs:158`, test row "BAR1 256 MiB" at :814). Functionally fine. NVK-on-RM's host-visible VRAM heap is `MIN2(bar1, vram - 64K)` (Mesa 0045:158-163; 0022 had a 256 MiB cap), so a 256 MiB BAR1 gives a 256 MiB heap; past it allocations fall back to system memory (0025, 0045). A real 595.71.05 bug hit a 5070 with ReBAR off ([open-gpu-kernel-modules#1132](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1132)) **(guess: noticeable DXVK perf drop without ReBAR)** |
 | Guest shared-memory BAR (64 GiB, QEMU) | expected | expected | expected | works | Not GPU-dependent: `cli/src/qemu.rs:147`, `docs/examples/win11.xml:71` |
 | Venus host renderer (NVIDIA Vulkan) | expected | expected | expected | works | Conduit's virglrenderer patches use `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`, `VK_EXT_external_memory_host`, exposed by NVIDIA's Linux driver on every Turing+ GPU (dma-buf and modifiers since 515.43.04, external_memory_host since 440.66.17); they are hidden without `nvidia-drm modeset=1` and render-node access. No per-generation differences documented **(check `vulkaninfo` on the 4070)** |
+
+### Escape sizes, per driver release
+
+The NVIDIA userspace in a Linux guest is the host's, so the sizes of its
+`NV_ESC_*` parameter blocks are the host release's, not the guest module's.
+RM's `rm_ioctl` takes an escape at the sizes of the structs it knows and
+answers anything else `NV_ERR_INVALID_ARGUMENT`; the guest module and the
+backend apply the same list. It is generated (`host/backend/gen/nvabi_gen.py`,
+`IoctlEntry` in `abi::versions`), the backend checks every call against it and
+sends it to the guest in the last section of GET_SYS_FILES, and
+`nvgpu_ioctl_fd` answers `EINVAL` to a size outside it. A backend that sends no
+list leaves the check to the backend. The rows are in
+`host/backend/gen/fixtures/escape_sizes.tsv`, which a test keeps equal to the
+tables and `guest/linux/test/escape_test.c` applies. The sizes that differ:
+
+| Escape | 535.129.03 | 565.57.01 (also 565.77) | 580.178.04 | 595.71.05 | 610.57.04 (also 615.71.09) |
+|---|---|---|---|---|---|
+| `RM_ALLOC` (0x2b) | 32 or 48 | 32 or 48 | 32 or 48 | 32 or 48 | 32 or 48 |
+| `RM_MAP_MEMORY_DMA` (0x57) | 56 | 56 | 64 | 64 | 64 |
+| `RM_UNMAP_MEMORY_DMA` (0x58) | 40 | 48 | 48 | 48 | 48 |
+| `EXPORT_TO_DMABUF_FD` (0xd9) | 2600 | 2600 | 2608 | 2608 | 2608 |
+| `WAIT_OPEN_COMPLETE` (0xda) | not taken | 8 | 8 | 8 | 8 |
+
+Every other escape has one size in all five tables (`RM_CONTROL` 32,
+`RM_FREE` 16, `RM_ALLOC_MEMORY` 56, `RM_VID_HEAP_CONTROL` 184,
+`GET_EVENT_DATA` 16, ...), and `CARD_INFO`, `ATTACH_GPUS_TO_FD` and `NUMA_INFO`
+take any length. `RM_ALLOC` is NVOS21 (32 bytes) or NVOS64 (48): the first five
+fields agree, then NVOS21 has `paramsSize` at 24 and status at 28, NVOS64 has
+`pRightsRequested` at 24, `paramsSize` at 32 and status at 40. 565.77's
+userspace sends the 32-byte form for `NV01_ROOT`, so `nvidia-smi` in a guest
+needs it. The 565.77 sizes were checked against the 565.77 open modules'
+headers (NVOS21 32, NVOS64 48, NVOS46 56, NVOS47 48, NVOS54 32). **Not run
+against a live 565.77 guest after this change.**
 
 ### Guest RM client (librmclient) and Linux guest
 
@@ -66,7 +100,7 @@ possible with the current stack).
 |---|---|---|---|---|---|
 | librmclient: no hardcoded GPU classes | expected | expected | expected | works | Library code only names FERMI_VASPACE_A / root/device classes (`guest/rmclient/src/nv_ioctl_defs.h:272`); classes come from the caller (NVK) |
 | crm_smoke usermode probe | expected | expected | expected | works | Tries 0xc761, 0xc661, 0xc561, 0xc461 in turn (`guest/rmclient/tests/crm_smoke.c:165`) |
-| Linux guest kernel module (conduit_gpu) | expected | expected | expected | works | Page-kind/sector-layout dev_info words are passed through from the host's node, not hardcoded (`guest/linux/conduit_gpu.c:580`); allocation-size table covers Turing..Blackwell classes (`guest/linux/gen/nvgpu_rmalloc_classes.h`) |
+| Linux guest kernel module (conduit_gpu) | expected | expected | expected | works | Page-kind/sector-layout dev_info words are passed through from the host's node, not hardcoded (`guest/linux/conduit_gpu.c`, `dri_dev.dev_info`). The `GET_DEV_INFO` struct is per release (20 bytes on 535, 32 on 565-570, 36 from 575): the backend asks and decodes it in the host's own layout (`abi::devinfo`, exact release only: a release without a table is not asked and gets no render node) and the module answers in the layout of the caller's ioctl size (`guest/linux/nvgpu_devinfo.h`), both generated by `host/backend/gen/devinfo_extract.py`; allocation-size table covers Turing..Blackwell classes (`guest/linux/gen/nvgpu_rmalloc_classes.h`) |
 | Linux guest NVIDIA userspace (CUDA, Vulkan via the passed-through stack) | expected | expected | expected | works | Same RM, same driver release as the host |
 
 ### NVK / NAK (Mesa base 70c4c018, `guest/nvk-rm/build-windows.sh:50`)
@@ -99,7 +133,9 @@ possible with the current stack).
 ### Verdict per generation
 
 - **RTX 50 (Blackwell)**: works (the reference machine).
-- **RTX 40 (Ada)**: expected to work for DWM-on-NVK, games and scanout;
+- **RTX 40 (Ada)**: a Linux guest on NVIDIA's own user-mode driver works
+  (measured on an RTX 4070 SUPER, see below). Expected to work for
+  DWM-on-NVK, games and scanout;
   1-/2-byte shared formats need the KMD fix; compression off (perf below
   the 5090 numbers, by more than the GPU difference **(guess)**). The best
   candidate after Blackwell: ReBAR, same driver releases, NVK conformant.
@@ -108,6 +144,43 @@ possible with the current stack).
 - **RTX 20 (Turing)**: as Ampere, without ReBAR: BAR1 256 MiB, the
   host-visible VRAM heap is tiny; expect lower DXVK performance **(guess)**.
   Functionally expected to work.
+
+## Measured: RTX 4070 SUPER (Ada, AD104)
+
+One session, in a Linux guest on NVIDIA's own user-mode driver (the host's
+files shared over virtiofs); NVK-on-RM and Windows were not run.
+
+| | |
+|---|---|
+| Host | Ubuntu 24.04, **closed** kernel modules 565.77 (GSP firmware on), PCI `10de:2783`, 12 GiB, BAR1 256 MiB (Resizable BAR off), a monitor connected to the same GPU |
+| Guest | Omarchy (Arch), kernel 7.2.5, Hyprland, `conduit attach`ed libvirt VM |
+| Protections | safe mode (automatic for an untested driver): 2 GiB video-memory limit, 1 s bounds on blocking calls |
+| Bring-up | staged: guest module held at boot; loaded by hand; then `nvidia-smi`, `vulkaninfo`; then the compositor on the Conduit GPU |
+
+What ran, with the host kernel log free of `NVRM` and `Xid` lines throughout:
+
+- The backend picks the exact 565.77 tables; the guest module loads and reports
+  `1 GPU(s), driver 565.77`; the backend log shows `page kind 6/2, sector
+  layout 1` for the render node.
+- `nvidia-smi` lists the GPU. `vulkaninfo --summary` lists `NVIDIA GeForce RTX
+  4070 SUPER`, `driverVersion 565.77.0.0`, `deviceID 0x2783`,
+  `DRIVER_ID_NVIDIA_PROPRIETARY`, conformance 1.3.8.2.
+- Hyprland in the guest renders on the Conduit GPU and `vkcube` runs on it; the
+  owner used the desktop for a while without a glitch. This was not a soak
+  test and not a benchmark.
+
+Seen in the backend log, harmless so far: `SYS_PARAMS` answered with a
+synthesized success when the host returns EBUSY; `UNMAP_MEMORY: no mapping for
+pLinearAddress=...` at process exit; the 1 s clamp on `RM_IDLE_CHANNELS`
+(safe mode working); `RM_CONTROL GPU_GET_PIDS` refused by design.
+
+Not covered: CUDA, NVENC/NVDEC, NVK-on-RM (its structs are sized for 610.57.04,
+so it does not enumerate a device on 565.77), Windows guests, games, long runs,
+the open modules on this card, and the limit's behaviour under memory pressure.
+
+Two things the run fixed that no table could have shown: the guest module
+accepted only the 48-byte `RM_ALLOC` layout while this release's NVML sends the
+32-byte one, and it read `GET_DEV_INFO` in the 36-byte layout of 575 and later.
 
 ## Code changes needed
 
@@ -120,17 +193,18 @@ possible with the current stack).
 | `conduit doctor`: report GPU name and BAR1, warn on a BAR1 of 256 MiB or less | all | S | `cli/src/doctor.rs`, `cli/src/host.rs` | done on branch `feat/multi-gpu` (cli tests + clippy pass; on the 5090 it adds `GPU: NVIDIA GeForce RTX 5090 at 0000:01:00.0, BAR1 32.0 GB`) |
 | Backend caps tests pin the Turing/Ampere/Ada/Blackwell classes; comment fixes (0xfe/gen 0 is Fermi-Volta; 6/2/1 is right on every Turing+ GPU) | all | XS | `host/backend/device/src/caps.rs`, `nvidia/rm_import.rs`, `nvidia/files.rs` | done on branch `feat/multi-gpu` |
 | KMD wiring: pass a `GobScheme` at the three `validate_request` call sites (`kmd_render/src/virtio/foreign.rs:171`, `virtio/rm_client/sysmem.rs:824`, `virtio/rm_foreign.rs:133`), from `NV2080_CTRL_CMD_MC_GET_ARCH_INFO` through the KMD's RM client or the PCI id from CardInfo | 20/30/40 | M; WDK build | `guest/windows/kmd_render` | needs work |
-| `conduit doctor`: 535.129.03 is in the supported list but `major < 580` fails it | all | XS | `cli/src/doctor.rs:80`, `cli/src/host.rs` | needs a decision (drop 535 tables or the 580 floor) |
+| `conduit doctor`: 535.129.03 is in the supported list but `major < 580` failed it | all | XS | `cli/src/doctor.rs` (`module_verdict`) | done: a release with tables and a closed module or a branch older than 580 is a warning that it is untested; a release without tables still fails |
 | Venus scanout modifier hardcoded `0x0300000000606010 \| h` (`host/backend/device/src/venus/scanout.rs:34-42`) and the NVIDIA Vulkan driver's block-height heuristic (:56-73), measured on the 5090 only | all | S | backend | right on every Turing+ desktop GPU; heuristic **to verify** (override: `CONDUIT_VENUS_SCANOUT_MODIFIER`) |
 | crm_smoke: architecture names per family (TU10x/GA10x/AD10x/GB20x) | all | XS | `guest/rmclient/tests/crm_smoke.c:32` | cosmetic |
 
 ## Testing a new GPU
 
-What `conduit doctor` should verify (today it checks the driver: open
-modules, version, supported release; GPU name, architecture and BAR1 are not
+What `conduit doctor` should verify (today it checks the driver: kernel
+module flavour and branch (a warning when untested), supported release, and
+shows BAR1 and whether the GPU has a monitor; GPU name and architecture are not
 yet shown):
 
-1. Open kernel modules, a release with tables (`conduit doctor`).
+1. A release with tables; open kernel modules, 580 or newer, are the tested setup and anything else is a warning (`conduit doctor`).
 2. GPU and BAR1: `nvidia-smi -q | grep -A3 -i 'bar1'` and `lspci -vv -s <gpu> | grep -i 'resizable\|Region 1'`.
    ReBAR on means BAR1 ≈ VRAM rounded up; 256 MiB means it is off (BIOS:
    Above 4G decoding + Re-Size BAR support).
@@ -156,8 +230,9 @@ Then Windows: `Verify-Helios.ps1 -RunSmokeTests`, a D3D11 app with
 
 ## First hour on the RTX 4070 (Ada, AD104)
 
-0. Note which 4070 it is: `lspci -nn | grep -i nvidia` shows 0x2786 (AD104)
-   or 0x2709 (AD103). Both are Ada; nothing in Conduit depends on which.
+0. Note which 4070 it is: `lspci -nn | grep -i nvidia` shows 0x2786 (AD104),
+   0x2709 (AD103) or, for the SUPER, 0x2783 (AD104). All are Ada; nothing in
+   Conduit depends on which.
 1. **Host (10 min)**: install the open modules at a supported release
    (same as the 5090 host, e.g. 610.57.04 or 615.71.09); check ReBAR is on in
    the BIOS; `conduit doctor` all ok; `nvidia-smi -q` shows BAR1 ≈ 16 GiB

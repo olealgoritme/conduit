@@ -86,5 +86,5 @@ Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora with zero warnings, and runs
 tree, `CONFIG_CONDUIT_GPU` builds it in tree (`Kconfig`);
 `guest-kernel.config` is a minimal config for a custom guest `vmlinux`.
 
-`gen/` and `rmctrl/` are generated from NVIDIA's open kernel modules by
+`gen/`, `rmctrl/` and `devinfo/` are generated from NVIDIA's open kernel modules by
 `host/backend/gen/` (see its README). Don't edit them by hand.

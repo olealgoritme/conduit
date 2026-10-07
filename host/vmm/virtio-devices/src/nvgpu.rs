@@ -728,22 +728,11 @@ fn new_queues() -> [QState; NUM_QUEUES] {
     })
 }
 
-/// The host GPU driver version, as its procfs reports it.
-///
-/// Matched by shape rather than by field position: the wording around the
-/// number differs between driver builds and has changed before, but a bare
-/// three-part dotted number in that line has not.
+/// The host GPU driver version, as its procfs reports it: the one parser in
+/// `abi::version`, which the backend and the CLI use as well.
 fn driver_version(proc_root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(proc_root.join("version")).ok()?;
-    text.split_whitespace()
-        .find(|w| {
-            let mut parts = w.split('.');
-            let num = |p: Option<&str>| {
-                p.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            };
-            num(parts.next()) && num(parts.next()) && num(parts.next()) && parts.next().is_none()
-        })
-        .map(str::to_string)
+    abi::version::parse_proc_version(&text).map(|p| p.raw)
 }
 
 /// Check a config the backend served before any guest reads it.
@@ -1292,16 +1281,18 @@ mod tests {
         );
     }
 
+    /// The lines the backend, the CLI and the guest are tested on.
     #[test]
-    fn the_driver_version_is_read_from_procfs_by_shape() {
+    fn the_driver_version_follows_the_shared_fixture() {
         let dir = std::env::temp_dir().join(format!("nvgpu-ver-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(
-            dir.join("version"),
-            "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09  Release Build\n",
-        )
-        .expect("write");
-        assert_eq!(driver_version(&dir).as_deref(), Some("615.71.09"));
+        let fixture = include_str!("../../../backend/gen/fixtures/proc_version.tsv");
+        for line in fixture.lines().filter(|l| !l.starts_with('#')) {
+            let (text, want) = line.split_once('\t').expect("text<TAB>expected");
+            std::fs::write(dir.join("version"), text.replace("\\n", "\n")).expect("write");
+            let want = want.split(' ').nth(2).map(String::from);
+            assert_eq!(driver_version(&dir), want, "{text:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

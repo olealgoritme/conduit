@@ -193,6 +193,12 @@ and pacman's own dkms hooks build the module as well). `dkms.conf` limits builds
 `BUILD_EXCLUSIVE_KERNEL_MIN`). The postinst builds for the running kernel and
 reports, rather than fails, when headers are missing.
 
+The source package carries every directory of `guest/linux` except `test/`
+(the generated per-release tables: `gen/`, `rmctrl/`, `devinfo/`, ...), and
+`build.sh guest-src` fails when a quoted `#include` of the sources does not
+resolve inside the package, since the in-tree build cannot notice a missing
+directory.
+
 An akmod (RPM Fusion style) variant would need a `conduit-guest-kmod.spec`
 using `kmodtool`; it is not provided. Add it only if a Fedora user base asks
 for it, since DKMS already covers Fedora.

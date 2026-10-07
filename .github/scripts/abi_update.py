@@ -11,7 +11,8 @@ Two sources, two kinds of table (see host/backend/gen/README.md):
       -> nvabi_gen.py      -> gen/src/versions/vX.rs
   open-gpu-kernel-modules release tags
       -> rmctrl_extract.py -> gen/src/rmctrl/vX.rs and guest/linux/rmctrl/vX.h
-      -> rmallow/uvm/osdesc/vidmem_extract.py -> gen/src/<table>/vX.rs
+      -> rmallow/uvm/osdesc/vidmem/devinfo/nvkms_extract.py -> gen/src/<table>/vX.rs
+      -> devinfo_extract.py --lang c -> guest/linux/devinfo/vX.h
       -> nvgpu_gen.py (newest release only) -> guest/linux/gen/
 
 New modules are added to each table's mod.rs as `pub mod vX;`. Anything a
@@ -41,6 +42,8 @@ OGKM_TABLES = [
     ("uvm", "uvm_extract.py"),
     ("osdesc", "osdesc_extract.py"),
     ("vidmem", "vidmem_extract.py"),
+    ("devinfo", "devinfo_extract.py"),
+    ("nvkms", "nvkms_extract.py"),
 ]
 
 Version = tuple[int, int, int]
@@ -186,6 +189,14 @@ def main() -> int:
                 problems.append(f"`rmctrl_extract.py --lang c` {dotted(v)}:\n```\n{err}\n```")
             else:
                 added.append(f"guest rmctrl/{dst.name}")
+            # The guest's copy of the GET_DEV_INFO layout.
+            dst = GUEST / "devinfo" / f"{stem(v)}.h"
+            err = run_to_file([py, "devinfo_extract.py", "--ogkm", str(ogkm),
+                               "--version", dotted(v), "--lang", "c"], dst, GEN)
+            if err:
+                problems.append(f"`devinfo_extract.py --lang c` {dotted(v)}:\n```\n{err}\n```")
+            else:
+                added.append(f"guest devinfo/{dst.name}")
             # The guest's allocation tables follow the newest release only.
             if v == newest:
                 r = subprocess.run([py, "nvgpu_gen.py", "--src", str(ogkm),

@@ -25,6 +25,19 @@
 //! distinguishes a library the guest needs from one only the host does, and it
 //! says which capability each file serves.
 //!
+//! # Drivers with no manifest
+//!
+//! Older drivers (565.77 among them) ship none. For those, [`builtin_entries`]
+//! produces the same [`Entry`] list from a small table in this file: each row
+//! is a file name with a `{v}` placeholder for the driver version, its kind and
+//! its categories. The table states its own shape and takes the version from
+//! the *loaded* module, so nothing about which build is staged is guessed from
+//! files found on disk (which is what [`retarget`] has to do, and gets wrong
+//! when the only versioned names it sees are `libnvidia-egl-gbm.so.1.1.2`).
+//! The table is validated against `dpkg -L` of the 565.77 packages in the
+//! tests; the same deliberate exclusions apply because they are applied by
+//! [`Entry::is_host_only`], not by the table.
+//!
 //! # The manifest is not always the loaded driver
 //!
 //! "versioned with the driver that installed it" is true of the manifest and
@@ -74,15 +87,13 @@ pub const LOADED_VERSION_PATH: &str = "/proc/driver/nvidia/version";
 /// NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.99.02  Wed Aug 26 ...
 /// ```
 ///
-/// `None` when the file is absent (no driver loaded) or holds nothing
-/// version-shaped. The caller decides what that means: it is normal when
+/// `None` when the file is absent (no driver loaded) or is not in a form
+/// `abi::version::parse_proc_version` accepts. The caller decides what that means: it is normal when
 /// planning a share on a machine with no GPU, and a reason to stop when about
 /// to stage one for a guest.
 pub fn loaded_driver_version(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    // Deliberately not anchored to "NVRM version:" -- the line has been
-    // reworded across releases, while the dotted version on it has not.
-    text.lines().find_map(version_in)
+    abi::version::parse_proc_version(&text).map(|p| p.raw)
 }
 
 /// The driver version the resolved files belong to, taken from the library
@@ -98,7 +109,7 @@ pub fn staged_driver_version(found: &[Resolved]) -> Option<String> {
         if let Some(v) = r
             .host_path
             .file_name()
-            .and_then(|n| version_in(&n.to_string_lossy()))
+            .and_then(|n| dotted_number(&n.to_string_lossy(), 1))
         {
             *counts.entry(v).or_default() += 1;
         }
@@ -111,10 +122,11 @@ pub fn staged_driver_version(found: &[Resolved]) -> Option<String> {
         .map(|(v, _)| v)
 }
 
-/// The first `N.N.N` (or longer) dotted number in `s`, where every component
-/// is digits. Written out rather than pulled from a regex crate: this crate
-/// carries no such dependency, and the shape is fixed.
-fn version_in(s: &str) -> Option<String> {
+/// The first dotted number in `s` with at least `min_dots` dots, every
+/// component digits. One dot is a two-part release (`565.77`); a file named
+/// for it (`libcuda.so.565.77`) is the only place a staged share shows its
+/// version.
+fn dotted_number(s: &str, min_dots: usize) -> Option<String> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -134,7 +146,7 @@ fn version_in(s: &str) -> Option<String> {
             }
             i += 1;
         }
-        if dots >= 2 {
+        if dots >= min_dots {
             return Some(s[start..i].to_string());
         }
         while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -166,6 +178,11 @@ pub const DEFAULT_SEARCH_PATHS: &[&str] = &[
     "/usr/lib/nvidia",
     "/usr/lib/xorg/modules/drivers",
     "/usr/lib/xorg/modules/extensions",
+    // VDPAU and OpenCL keep their NVIDIA files in a directory of their own;
+    // without these libvdpau_nvidia and nvidia.icd are "not installed" on a
+    // host that has them.
+    "/usr/lib/x86_64-linux-gnu/vdpau",
+    "/etc/OpenCL/vendors",
 ];
 
 /// What a file is, as the driver's manifest classifies it.
@@ -489,6 +506,131 @@ pub fn retarget(entries: &[Entry], from: &str, to: &str) -> Vec<Entry> {
         .collect()
 }
 
+/// One row of the built-in list for drivers that ship no manifest.
+///
+/// `name` is a file name in which `{v}` stands for the driver version, so a row
+/// matches exactly one build. A trailing `*` instead stands for a component
+/// versioned on its own (`libnvidia-egl-gbm.so.1.1.2`); those rows can only be
+/// named by looking at what is installed.
+struct Builtin {
+    name: &'static str,
+    kind: FileKind,
+    categories: &'static [&'static str],
+}
+
+const fn b(name: &'static str, kind: FileKind, categories: &'static [&'static str]) -> Builtin {
+    Builtin {
+        name,
+        kind,
+        categories,
+    }
+}
+
+/// What a guest needs for graphics, video, utility and compute, by file name.
+///
+/// Left out on purpose, beyond the firmware/modprobe rule: the X server module
+/// (`libglxserver_nvidia`, `nvidia_drv`), `nvidia-persistenced`, `nvidia-xconfig`
+/// and the other setup tools, the `libnvidia-pkcs11*` confidential-compute
+/// libraries and `libnvidia-cfg` (host configuration), `libnvidia-api` (NVAPI,
+/// no guest consumer) and the NGX/DLSS pieces.
+fn builtin_table() -> Vec<Builtin> {
+    use FileKind::{Binary, Json, Lib, Symlink};
+    vec![
+        // utility
+        b("libnvidia-ml.so.{v}", Lib, &["nvml"]),
+        b("nvidia-smi", Binary, &["utils"]),
+        // compute
+        b("libcuda.so.{v}", Lib, &["cuda"]),
+        b("libcudadebugger.so.{v}", Lib, &["cuda"]),
+        b("libnvidia-ptxjitcompiler.so.{v}", Lib, &["cuda"]),
+        b("libnvidia-nvvm.so.{v}", Lib, &["cuda"]),
+        b("libnvidia-opencl.so.{v}", Lib, &["opencl"]),
+        b("nvidia.icd", Json, &["opencl"]),
+        b("libnvoptix.so.{v}", Lib, &["optix"]),
+        b("libnvidia-rtcore.so.{v}", Lib, &["optix", "vulkan"]),
+        // graphics: GLX, EGL, GLES, Vulkan
+        b("libGLX_nvidia.so.{v}", Lib, &["glx", "vulkan", "glvnd"]),
+        b(
+            "libEGL_nvidia.so.{v}",
+            Lib,
+            &["egl", "egl_headless", "glvnd"],
+        ),
+        b("libGLESv1_CM_nvidia.so.{v}", Lib, &["egl", "glvnd"]),
+        b("libGLESv2_nvidia.so.{v}", Lib, &["egl", "glvnd"]),
+        b("libnvidia-glcore.so.{v}", Lib, &["glx", "egl"]),
+        b("libnvidia-eglcore.so.{v}", Lib, &["glx", "egl"]),
+        b("libnvidia-glsi.so.{v}", Lib, &["glx", "egl"]),
+        b("libnvidia-glvkspirv.so.{v}", Lib, &["glx", "egl", "vulkan"]),
+        b("libnvidia-gpucomp.so.{v}", Lib, &["glx", "egl", "vulkan"]),
+        b("libnvidia-tls.so.{v}", Lib, &["glx", "egl", "vulkan"]),
+        b("libnvidia-vksc-core.so.{v}", Lib, &["vulkan"]),
+        b("nvidia_icd.json", Json, &["vulkan"]),
+        b("nvidia_icd_vksc.json", Json, &["vulkan"]),
+        b("nvidia_layers.json", Json, &["vulkan"]),
+        b("10_nvidia.json", Json, &["egl", "glvnd"]),
+        // graphics: window-system glue (own version numbers) and GBM
+        b("libnvidia-egl-gbm.so.*", Lib, &["egl_gbm"]),
+        b("libnvidia-egl-wayland.so.*", Lib, &["egl_wayland"]),
+        b("libnvidia-egl-xcb.so.*", Lib, &["egl_x11"]),
+        b("libnvidia-egl-xlib.so.*", Lib, &["egl_x11"]),
+        b("10_nvidia_wayland.json", Json, &["egl_wayland"]),
+        b("15_nvidia_gbm.json", Json, &["egl_gbm"]),
+        b("20_nvidia_xcb.json", Json, &["egl_x11"]),
+        b("20_nvidia_xlib.json", Json, &["egl_x11"]),
+        b("libnvidia-allocator.so.{v}", Lib, &["gbm", "egl_gbm"]),
+        b("nvidia-drm_gbm.so", Symlink, &["gbm", "egl_gbm"]),
+        // video
+        b("libnvidia-encode.so.{v}", Lib, &["video"]),
+        b("libnvcuvid.so.{v}", Lib, &["video"]),
+        b("libnvidia-opticalflow.so.{v}", Lib, &["video"]),
+        b("libnvidia-fbc.so.{v}", Lib, &["video"]),
+        b("libvdpau_nvidia.so.{v}", Lib, &["video"]),
+    ]
+}
+
+/// The manifest-less equivalent of [`load_manifest`]: the entries a driver of
+/// exactly `version` would list, with the same kinds and categories.
+///
+/// Versioned rows are named for `version` whether or not that build is
+/// installed, so [`resolve`] reports what is absent in the same way it does
+/// for a manifest. Rows with a `*` are named from the files in `search_paths`;
+/// none installed means no entry, since there is no name to report.
+pub fn builtin_entries(version: &str, search_paths: &[impl AsRef<Path>]) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for row in builtin_table() {
+        let categories: BTreeSet<String> = row.categories.iter().map(|c| c.to_string()).collect();
+        let mut push = |name: String| {
+            out.push(Entry {
+                name,
+                kind: row.kind.clone(),
+                categories: categories.clone(),
+            })
+        };
+        if let Some(prefix) = row.name.strip_suffix('*') {
+            let mut seen = BTreeSet::new();
+            for d in search_paths {
+                let Ok(rd) = std::fs::read_dir(d.as_ref()) else {
+                    continue;
+                };
+                for f in rd.flatten() {
+                    let n = f.file_name().to_string_lossy().into_owned();
+                    // `libnvidia-egl-gbm.so.1.1.2`, not the `.so.1` link
+                    // beside it: the link is made below from the SONAME.
+                    if n.strip_prefix(prefix)
+                        .is_some_and(|rest| rest.contains('.'))
+                    {
+                        seen.insert(n);
+                    }
+                }
+            }
+            seen.into_iter().for_each(&mut push);
+        } else {
+            push(row.name.replace("{v}", version));
+        }
+    }
+    out
+}
+
 /// Read the manifest this host's driver installed.
 pub fn load_manifest(path: &Path) -> Result<Vec<Entry>, UserspaceError> {
     if !path.exists() {
@@ -541,6 +683,10 @@ fn guest_dir(entry: &Entry, host_path: &Path) -> PathBuf {
         // guest's GBM_BACKENDS_PATH points at `lib/gbm`.
         _ if host_path.parent().and_then(Path::file_name) == Some("gbm".as_ref()) => {
             PathBuf::from("lib/gbm")
+        }
+        // libvdpau looks for its driver in a `vdpau` directory of its own.
+        _ if host_path.parent().and_then(Path::file_name) == Some("vdpau".as_ref()) => {
+            PathBuf::from("lib/vdpau")
         }
         _ => PathBuf::from("lib"),
     }
@@ -747,9 +893,7 @@ pub fn soname(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Entry, FileKind, Resolved, loaded_driver_version, staged_driver_version, version_in,
-    };
+    use super::{Entry, FileKind, Resolved, loaded_driver_version, staged_driver_version};
     use std::collections::BTreeSet as TestSet;
 
     fn resolved(host_name: &str) -> Resolved {
@@ -808,21 +952,54 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The same lines `abi::version` is tested on: the loaded version is
+    /// whatever `parse_proc_version` says, with no looser fallback. A file that
+    /// holds only a GCC line has no driver version (it used to yield the
+    /// compiler's `13.3.0`).
     #[test]
-    fn the_gcc_version_on_the_second_line_is_not_mistaken_for_the_driver() {
-        // "gcc version 15.2.0" is dotted and comes second; the driver version
-        // is on the first line, so a find_map over lines must take that one.
+    fn loaded_version_follows_the_shared_fixture() {
+        let dir = std::env::temp_dir().join(format!("nvgpu-fix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("version");
+        let fixture = include_str!("../../gen/fixtures/proc_version.tsv");
+        for line in fixture.lines().filter(|l| !l.starts_with('#')) {
+            let (text, want) = line.split_once('\t').unwrap();
+            std::fs::write(&p, text.replace("\\n", "\n")).unwrap();
+            let want = want.split(' ').nth(2).map(String::from);
+            assert_eq!(loaded_driver_version(&p), want, "{text:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_named_for_a_release_gives_its_version() {
         assert_eq!(
-            version_in("GCC version:  gcc version 15.2.0 (Ubuntu)"),
-            Some("15.2.0".into())
+            dotted_number("libcuda.so.595.99.02", 1),
+            Some("595.99.02".into())
         );
-        assert_eq!(
-            version_in("libcuda.so.1"),
-            None,
-            "so.1 is not a driver version"
-        );
-        assert_eq!(version_in("libcuda.so.595.99.02"), Some("595.99.02".into()));
-        assert_eq!(version_in("no digits here"), None);
+        assert_eq!(dotted_number("libcuda.so.565.77", 1), Some("565.77".into()));
+        assert_eq!(dotted_number("libcuda.so.1", 1), None);
+    }
+
+    #[test]
+    fn a_two_part_release_is_the_loaded_and_the_staged_version() {
+        let dir = std::env::temp_dir().join(format!("nvgpu-ver2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("version");
+        std::fs::write(
+            &p,
+            "NVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77  Wed Oct 23 12:00:00 UTC 2024\n\
+             GCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n",
+        )
+        .unwrap();
+        assert_eq!(loaded_driver_version(&p).as_deref(), Some("565.77"));
+        std::fs::remove_dir_all(&dir).ok();
+        let found = [
+            resolved("libcuda.so.565.77"),
+            resolved("libnvidia-eglcore.so.565.77"),
+            resolved("libnvidia-egl-wayland.so.1.1.21"),
+        ];
+        assert_eq!(staged_driver_version(&found).as_deref(), Some("565.77"));
     }
 
     #[test]
@@ -1125,6 +1302,169 @@ mod tests {
             parse_manifest("[{\"type\": \"LIB\"}]").is_err(),
             "an entry with no name"
         );
+    }
+
+    /// `dpkg -L` of libnvidia-{gl,compute,decode,encode,fbc1,extra}-565 and
+    /// nvidia-utils-565 on Ubuntu 24.04 with 565.77 (the .so.1 symlinks the
+    /// packages also list are made by the staging step, not carried), plus the
+    /// host-only files those packages and the X/firmware packages install.
+    const UBUNTU_565_77: &[&str] = &[
+        "usr/bin/nvidia-smi",
+        "usr/bin/nvidia-debugdump",
+        "usr/bin/nvidia-xconfig",
+        "usr/bin/nvidia-modprobe",
+        "usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libGLESv1_CM_nvidia.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libGLESv2_nvidia.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-api.so.1",
+        "usr/lib/x86_64-linux-gnu/libnvidia-egl-gbm.so.1.1.2",
+        "usr/lib/x86_64-linux-gnu/libnvidia-egl-wayland.so.1.1.17",
+        "usr/lib/x86_64-linux-gnu/libnvidia-egl-xcb.so.1.0.0",
+        "usr/lib/x86_64-linux-gnu/libnvidia-egl-xlib.so.1.0.0",
+        "usr/lib/x86_64-linux-gnu/libnvidia-eglcore.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-glcore.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-glsi.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-glvkspirv.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-gpucomp.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-rtcore.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-tls.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-vksc-core.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvoptix.so.565.77",
+        "usr/lib/x86_64-linux-gnu/nvidia/xorg/libglxserver_nvidia.so.565.77",
+        "usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json",
+        "usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json",
+        "usr/share/egl/egl_external_platform.d/20_nvidia_xcb.json",
+        "usr/share/egl/egl_external_platform.d/20_nvidia_xlib.json",
+        "usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+        "usr/share/vulkan/icd.d/nvidia_icd.json",
+        "usr/share/vulkan/implicit_layer.d/nvidia_layers.json",
+        "usr/share/vulkansc/icd.d/nvidia_icd_vksc.json",
+        "etc/OpenCL/vendors/nvidia.icd",
+        "usr/lib/x86_64-linux-gnu/libcuda.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libcudadebugger.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-ml.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-pkcs11-openssl3.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-pkcs11.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvcuvid.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-opticalflow.so.565.77",
+        "usr/lib/x86_64-linux-gnu/vdpau/libvdpau_nvidia.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-encode.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-fbc.so.565.77",
+        "usr/lib/x86_64-linux-gnu/libnvidia-allocator.so.565.77",
+        "usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so",
+        "usr/lib/x86_64-linux-gnu/libnvidia-cfg.so.565.77",
+        "usr/lib/firmware/nvidia/565.77/gsp_ga10x.bin",
+    ];
+
+    fn plan_in(tree: &TempTree, version: &str, caps: &[super::Capability]) -> Vec<String> {
+        let search: Vec<PathBuf> = super::DEFAULT_SEARCH_PATHS
+            .iter()
+            .map(|d| tree.path().join(d.trim_start_matches('/')))
+            .collect();
+        let entries = super::builtin_entries(version, &search);
+        let (found, _) = super::resolve(&entries, caps, &search);
+        let mut v: Vec<String> = found
+            .iter()
+            .map(|r| r.guest_path.display().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn no_manifest_lists_what_a_565_77_guest_needs() {
+        use super::Capability::*;
+        let tree = TempTree::new(UBUNTU_565_77);
+        let got = plan_in(&tree, "565.77", &[Graphics, Video, Utility, Compute]);
+        let has = |n: &str| got.iter().any(|g| g == n);
+        for want in [
+            "bin/nvidia-smi",
+            "lib/libcuda.so.565.77",
+            "lib/libnvidia-ml.so.565.77",
+            "lib/libGLX_nvidia.so.565.77",
+            "lib/libEGL_nvidia.so.565.77",
+            "lib/libnvidia-egl-gbm.so.1.1.2",
+            "lib/libnvidia-egl-wayland.so.1.1.17",
+            "lib/gbm/nvidia-drm_gbm.so",
+            "lib/vdpau/libvdpau_nvidia.so.565.77",
+            "lib/libnvidia-encode.so.565.77",
+            "share/vulkan/icd.d/nvidia_icd.json",
+            "share/glvnd/egl_vendor.d/10_nvidia.json",
+            "share/egl/egl_external_platform.d/15_nvidia_gbm.json",
+        ] {
+            assert!(has(want), "{want} missing from {got:#?}");
+        }
+        // Host-only and deliberately excluded files never reach the guest.
+        for no in [
+            "nvidia-modprobe",
+            "nvidia-xconfig",
+            "nvidia-debugdump",
+            "gsp_ga10x.bin",
+            "libglxserver_nvidia",
+            "libnvidia-pkcs11",
+            "libnvidia-cfg",
+            "libnvidia-api",
+            "libnvidia-ngx",
+        ] {
+            assert!(!got.iter().any(|g| g.contains(no)), "{no} staged: {got:#?}");
+        }
+        assert_eq!(got.len(), 40, "{got:#?}");
+    }
+
+    #[test]
+    fn no_manifest_capabilities_select_their_own_files() {
+        use super::Capability::*;
+        let tree = TempTree::new(UBUNTU_565_77);
+        let util = plan_in(&tree, "565.77", &[Utility]);
+        assert_eq!(util, ["bin/nvidia-smi", "lib/libnvidia-ml.so.565.77"]);
+        let video = plan_in(&tree, "565.77", &[Video]);
+        assert!(video.iter().any(|g| g.contains("libnvidia-encode")));
+        assert!(!video.iter().any(|g| g.contains("libcuda")));
+        let gfx = plan_in(&tree, "565.77", &[Graphics]);
+        assert!(
+            !gfx.iter()
+                .any(|g| g.contains("libcuda") || g.contains("encode"))
+        );
+    }
+
+    #[test]
+    fn no_manifest_stages_only_the_exact_version_asked_for() {
+        use super::Capability::*;
+        // A host that has 565.77 and a stray 570.1 install side by side.
+        let mut files: Vec<&str> = UBUNTU_565_77.to_vec();
+        files.push("usr/lib/x86_64-linux-gnu/libcuda.so.570.1");
+        let tree = TempTree::new(&files);
+        let got = plan_in(&tree, "565.77", &[Compute]);
+        assert!(got.contains(&"lib/libcuda.so.565.77".to_string()));
+        assert!(!got.iter().any(|g| g.contains("570.1")), "{got:#?}");
+        // Asking for a build that is not installed finds none of its files
+        // (the caller compares against the loaded module and refuses).
+        let none = plan_in(&tree, "580.9", &[Compute]);
+        assert!(!none.iter().any(|g| g.contains(".so.")), "{none:#?}");
+    }
+
+    #[test]
+    fn no_manifest_names_what_is_not_installed() {
+        use super::Capability::*;
+        let files: Vec<&str> = UBUNTU_565_77
+            .iter()
+            .copied()
+            .filter(|f| !f.contains("vdpau") && !f.contains("egl-wayland"))
+            .collect();
+        let tree = TempTree::new(&files);
+        let search: Vec<PathBuf> = super::DEFAULT_SEARCH_PATHS
+            .iter()
+            .map(|d| tree.path().join(d.trim_start_matches('/')))
+            .collect();
+        let entries = super::builtin_entries("565.77", &search);
+        let (_, missing) = super::resolve(&entries, &[Video, Graphics], &search);
+        let names: Vec<_> = missing.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["libvdpau_nvidia.so.565.77"], "{names:?}");
     }
 
     /// A directory of empty files, removed on drop.

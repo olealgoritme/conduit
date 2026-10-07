@@ -9,12 +9,33 @@ status, first-hour plan for an RTX 4070) first. Background: [WINDOWS.md](WINDOWS
 
 ## 1. Host driver
 
-- NVIDIA **open** kernel modules, a release Conduit has RM ABI tables for:
-  580.178.04, 595.71.05, 595.104.02, 610.57.04 or 615.71.09
-  (`host/backend/gen/src/osdesc/`). The RM protocol (ioctl and control
-  layouts) changes between driver versions, and the backend forwards the
-  guest's RM calls only for a version it has tables for. A newer driver needs
-  its tables generated first (`host/backend/gen`, `.github/workflows/abi.yml`).
+- A driver release Conduit has ABI tables for: 535.129.03, 565.77, 580.178.04,
+  595.71.05, 595.104.02, 610.57.04 or 615.71.09 (`conduit doctor` lists
+  them). It is developed on the NVIDIA **open** kernel modules, 580 or newer;
+  the closed modules and older branches with tables are accepted with a
+  warning and are untested. The RM protocol (ioctl and control layouts)
+  changes between driver versions, and the backend forwards the guest's calls
+  only for a version it has tables for. A release without them is refused
+  unless the backend runs with `--allow-nearest-abi`, which lets the RM
+  pointer, allowlist, UVM, video-memory and OS-descriptor tables fall back to
+  the nearest older release's. The GET_DEV_INFO layout and the NVKMS commands
+  never do, because their layouts are not monotonic across releases: such a
+  release gets no render node and only NVKMS ALLOC/FREE_DEVICE.
+  Its tables are generated offline, with no GPU
+  (`.github/scripts/abi_update.py`, `host/backend/gen/README.md`): rmctrl,
+  rmallow, uvm, vidmem, osdesc, devinfo, nvkms and the escape sizes. The
+  `PROFILES` lists of `abi::devinfo` and `abi::nvkms` and the includes in
+  `guest/linux/nvgpu_devinfo.h` are still edited by hand for a new release (a
+  missed `PROFILES` entry keeps the release refused and fails
+  `accepted_releases_match_the_cli_list`; a missed include is not checked).
+- With the closed modules or a branch older than 580 (565.77 is the first
+  such setup), the backend starts in safe mode by itself: a video-memory
+  limit of 2 GiB (the smallest of 2 GiB, the display default and your
+  `gpu.vram_limit_mib` number, [SECURITY.md](SECURITY.md)) and 1 s clamps on
+  blocking GPU calls. `conduit doctor` says whether safe mode is on and which
+  source decided (the setting, your shell, or the driver), the limit guests
+  get, and the card's BAR1 size. Turn it off once the setup has proven itself:
+  `conduit config set gpu.safe_mode false` ([SECURITY.md](SECURITY.md)).
 - The NVIDIA Vulkan driver of the same release (`conduit-venus` uses it for
   the Venus fallback).
 - KVM (`ls /dev/kvm`), a Wayland desktop, `virt-manager`/libvirt for the VM.
