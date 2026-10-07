@@ -7,7 +7,7 @@
 # backend's binary, its flags, conduit-venus, SSH, and the Helios driver/mode.
 # Any failed check prints FAIL and exits non-zero; nothing is skipped silently.
 set -u
-H="Ole Algoritme@127.0.0.1"; MODE=5120x1440@240; NEW=${1:-}
+H="${WIN_SSH:?set WIN_SSH=user@127.0.0.1 (the guest account)}"; MODE=5120x1440@240; NEW=${1:-}
 # --verify: run only the post-start checks on the running VM (no shutdown, no start).
 VERIFY=0; [ "$NEW" = --verify ] && { VERIFY=1; NEW=; }
 fail() { echo "FAIL: $*"; exit 1; }
@@ -118,5 +118,5 @@ sleep 40
 R=$(ssh -o ConnectTimeout=10 -p 2222 "$H" '$r=Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render; $v=Get-CimInstance Win32_VideoController | ? Name -match Helios; "$($v.CurrentHorizontalResolution)x$($v.CurrentVerticalResolution)@$($v.CurrentRefreshRate) $($v.DriverVersion) InitStg=$($r.InitStg) StVio=$($r.StVio)"')
 echo "guest: $R"
 case "$R" in "5120x1440@240 "*"InitStg=7 StVio=0"*) echo "ok: Helios up at $MODE";; *) fail "Helios not up as expected: $R";; esac
-ssh -o ConnectTimeout=10 -p 2222 "$H" 'schtasks /create /f /tn ConduitApply /tr C:\Users\Public\apply.cmd /sc once /st 23:59 /it /ru "Ole Algoritme" | Out-Null; schtasks /run /tn ConduitApply | Out-Null; Start-Sleep 15; schtasks /delete /f /tn ConduitApply | Out-Null; Get-Content C:\Users\Public\display-apply.txt -EA 0 | Select-String "now the only|already|WARNING"'
+ssh -o ConnectTimeout=10 -p 2222 "$H" 'schtasks /create /f /tn ConduitApply /tr C:\Users\Public\apply.cmd /sc once /st 23:59 /it /ru $env:USERNAME | Out-Null; schtasks /run /tn ConduitApply | Out-Null; Start-Sleep 15; schtasks /delete /f /tn ConduitApply | Out-Null; Get-Content C:\Users\Public\display-apply.txt -EA 0 | Select-String "now the only|already|WARNING"'
 echo "== cycle: done"

@@ -24,7 +24,7 @@ Remove-Item (Join-Path $logs "*") -EA 0
 $frames = Join-Path $logs "frames.csv"
 
 $tr = "cmd /c $Dir\run-heaven-nvk.bat $Dir $Width $Height" + $(if ($Prof) { " prof" } else { "" })
-schtasks /create /f /tn ConduitHeavenNvk /tr $tr /sc once /st 23:59 /it /ru "Ole Algoritme" | Out-Null
+schtasks /create /f /tn ConduitHeavenNvk /tr $tr /sc once /st 23:59 /it /ru $env:USERNAME | Out-Null
 schtasks /run /tn ConduitHeavenNvk | Out-Null
 Start-Sleep 3
 schtasks /delete /f /tn ConduitHeavenNvk | Out-Null

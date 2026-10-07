@@ -1,4 +1,4 @@
-H="Ole Algoritme@127.0.0.1"; b0=""; d0=""; fails=0
+H="${WIN_SSH:?set WIN_SSH=user@127.0.0.1 (the guest account)}"; b0=""; d0=""; fails=0
 while true; do
   st=$(virsh -c qemu:///session domstate win11 2>/dev/null | head -1)
   [ "$st" = running ] || { echo "$(date +%T) ALERT: VM state $st"; exit 1; }

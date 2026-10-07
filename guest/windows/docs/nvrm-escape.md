@@ -718,7 +718,7 @@ ninja -C build-win          # crm_smoke.exe crm_pin_smoke.exe crm_event_smoke.ex
 ```
 
 Run in win11: win11 is the Windows guest and also the driver build VM; its SSH defaults
-are in `guest/windows/ci/vm/win-build.sh` (`WIN_SSH` default `Ole Algoritme@127.0.0.1`,
+are in `guest/windows/ci/vm/win-build.sh` (`WIN_SSH`, the guest account as `user@127.0.0.1`,
 `WIN_PORT` 2222). Install the KMD package as for any Helios test (restart the guest only
 through the project's checked restart script), `scp` the `.exe` files and `librmclient.dll`
 next to them into the guest, and run them over `ssh -p 2222`. Check first that

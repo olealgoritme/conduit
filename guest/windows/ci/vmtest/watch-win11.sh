@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # win11 watchdog for a Monitor: state, backend, disk, MAP_BLOB refusals, reboot, dumps, app crash/hang, TDR, DWM, unresponsive guest.
-H="Ole Algoritme@127.0.0.1"; BL=~/.local/share/conduit/vms/win11/logs/backend.log
+H="${WIN_SSH:?set WIN_SSH=user@127.0.0.1 (the guest account)}"; BL=~/.local/share/conduit/vms/win11/logs/backend.log
 last_dump=""; last_boot=""; last_state=""; last_be=""; fails=0; dlow=0; ra=0; rs=0
 mapn=$(grep -c "Frontend internal error" $BL 2>/dev/null)
 while true; do

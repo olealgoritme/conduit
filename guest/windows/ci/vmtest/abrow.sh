@@ -1,6 +1,6 @@
 #!/bin/bash
 # abrow.sh LABEL DWM(venus|nvk) [Knob=Val ...] : set knobs, restart device + fresh DWM, run T6, print flip-latency deltas.
-L=$1; D=$2; shift 2; H="Ole Algoritme@127.0.0.1"; T=${VMTEST_DIR:-$HOME/.cache/conduit-vmtest}/t
+L=$1; D=$2; shift 2; H="${WIN_SSH:?set WIN_SSH=user@127.0.0.1 (the guest account)}"; T=${VMTEST_DIR:-$HOME/.cache/conduit-vmtest}/t
 SETS=""; for kv in "$@"; do k=${kv%%=*}; v=${kv#*=}; SETS="$SETS Set-ItemProperty \$K -Name $k -Value $v -Type DWord;"; done
 if [ "$D" = nvk ]; then DW='Set-ItemProperty HKLM:\SOFTWARE\Helios -Name DwmIcd -Value nvk; Set-ItemProperty $K -Name ForeignFlip -Value 1 -Type DWord;'
 else DW='Set-ItemProperty HKLM:\SOFTWARE\Helios -Name DwmIcd -Value ([string]::Empty); Set-ItemProperty $K -Name ForeignFlip -Value 0 -Type DWord;'; fi

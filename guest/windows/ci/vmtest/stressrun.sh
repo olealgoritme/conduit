@@ -1,5 +1,5 @@
 #!/bin/bash
-T=${VMTEST_DIR:-$HOME/.cache/conduit-vmtest}/t; H="Ole Algoritme@127.0.0.1"
+T=${VMTEST_DIR:-$HOME/.cache/conduit-vmtest}/t; H="${WIN_SSH:?set WIN_SSH=user@127.0.0.1 (the guest account)}"
 K='$r=Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render; ($r.PSObject.Properties | ? { $_.Name -match "^(Gb|BltMirrorN|BltAsyncFa|PgSe|PgInvOvf|PrDdiBlt)" } | % { "$($_.Name)=$($_.Value)" }) -join " "'
 scp -O -q -F $T/sshcfg $T/stress.ps1 "win11g:C:/Users/Public/t/stress.ps1"
 echo "before: $(timeout 20 ssh -p 2222 "$H" "$K" | tr -d '\r')"

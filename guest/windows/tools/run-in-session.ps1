@@ -4,13 +4,13 @@
 # Same transient-scheduled-task approach as guest/nvk-rm/windows/heaven-nvk-fps.ps1.
 #
 #   run-in-session.ps1 -Dir C:\Users\Public\s3\app -Command "d3d11_spin.exe 10 1920 1080" `
-#       [-Env @{ HELIOS_ICD = "nvk" }] [-TimeoutSec 120] [-User "Ole Algoritme"]
+#       [-Env @{ HELIOS_ICD = "nvk" }] [-TimeoutSec 120] [-User NAME]
 param(
     [Parameter(Mandatory)][string]$Dir,
     [Parameter(Mandatory)][string]$Command,
     [hashtable]$Env = @{},
     [int]$TimeoutSec = 120,
-    [string]$User = "Ole Algoritme",
+    [string]$User = $env:USERNAME,
     # One transient task per caller, so concurrent callers do not replace each other.
     [string]$Task = "ConduitSession$PID"
 )
