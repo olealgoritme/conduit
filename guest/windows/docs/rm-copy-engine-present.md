@@ -401,7 +401,105 @@ Smaller unknowns:
 - Whether dxgkrnl ever touches the destination while a CE copy is in flight. The DMA fence orders this today; it is unchanged as
   long as the fence retires on the completion semaphore.
 
-## 7. Milestones
+## 7. Concurrency with the 3D channel, and the PCIe stage line
+
+### 7.1 Which engine a copy runs on
+
+A channel's engine is fixed when it is allocated. The same `engineType` (an `NV2080_ENGINE_TYPE_*` value) goes into three
+places:
+- the TSG's `NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.engineType`;
+- the channel's `NV_CHANNEL_ALLOC_PARAMS.engineType`;
+- `NVA06F_CTRL_CMD_BIND {engineType}`.
+
+RM puts the TSG on that engine's runlist. NVK-on-RM shows both cases:
+- **Its 3D channel** uses `NV2080_ENGINE_TYPE_GRAPHICS` (0006:598-638, BIND in 0008:596-611). It allocates the copy object
+  with NULL parameters, and "RM picks the GR copy engine" (0006:529-532). That copy engine is the graphics engine's CE
+  (GRCE). It runs on the GR runlist, inside the 3D channel's TSG.
+- **Its video channel** uses `NV2080_ENGINE_TYPE_NVDEC0` in all three places (0035:68-97) and gets a runlist of its own
+  ("NVDEC runs on a runlist of its own", 0035:68).
+
+A CE channel is the second case with `NV2080_ENGINE_TYPE_COPY(n)`. Values from the 610.57.04 open kernel modules'
+`cl2080_notification.h`: `COPY0..COPY9` are 0x09..0x12, `COPY10..COPY19` are 0x34..0x3d, and
+`COPY(i) = i < 10 ? 0x09 + i : 0x34 + i - 10`. The CE object then takes `NVB0B5_ALLOCATION_PARAMETERS {version =
+VERSION_1, engineType = COPY(n)}`. With `VERSION_1`, engineType is an `NV2080_ENGINE_TYPE` (`clb0b5sw.h`; VERSION_0 would read
+it as a CE instance number).
+
+**GRCE and async CEs.** The difference follows from the runlists:
+- A copy on the GRCE (the copy object on the 3D channel, or a separate TSG on the GR engine) is on the GR runlist. It
+  time-slices with the app's 3D TSG: a copy submitted while the app renders waits for a TSG switch, and the app waits
+  for it in turn.
+- An async CE has its own runlist (one per CE engine, as for NVDEC). Its TSG is scheduled independently of GR, so the copy
+  runs while the app's 3D work runs. The two compete only for memory and PCIe bandwidth.
+
+**UNVERIFIED** (no repo file shows it): that GSP-RM accepts a TSG with `engineType = COPY(n)` from an unprivileged client.
+The allowlist gates only class and control, so nothing on the host refuses it (1.2), but no tool has allocated one yet.
+Also unverified: that every non-GRCE CE has its own runlist on GB202 and Ada. The prototype answers both (7.3).
+
+### 7.2 Which copy engines exist, and how a client finds an async one
+
+The repo has no per-GPU CE count. `docs/GPU-SUPPORT.md` 27 lists only the copy class per generation (Ada 0xc7b5, Blackwell
+0xcab5), `nvgpu_rmalloc_classes.h` lists only the parameter sizes (8 B for every `*_DMA_COPY_*`), and the allowlist rows are
+in 1.2. **UNVERIFIED:** how many `COPYn` GB202 and AD10x expose, and which of them are GRCEs. The prototype prints both.
+
+Every query a client needs is allowed in 610.57.04 (`v610_57_04.rs` line in brackets):
+- `NV2080_CTRL_CMD_GPU_GET_ENGINES_V2` 0x20800170, 340 B (268): `{engineCount, engineList[0x54]}` of `NV2080_ENGINE_TYPE`
+  values. The `COPYn` entries are the CEs this GPU exposes.
+- `NV2080_CTRL_CMD_CE_GET_CAPS_V2` 0x20802a03, 8 B (470): `{ceEngineType, capsTbl[2]}` for one CE. In byte 0, bit 0x01 is
+  `CE_GRCE`, 0x02 is `CE_SHARED` and 0x08 is `CE_SYSMEM_WRITE`. In byte 1, 0x01 is `SUPPORTS_NONPIPELINED_BL`
+  (`ctrl2080ce.h`).
+- `NV2080_CTRL_CMD_CE_GET_ALL_CAPS` 0x20802a0a, 136 B (471): the same caps for all 64 CE slots plus a `present` mask, in one
+  call.
+
+The rule for a KMD client: take the first `COPYn` from `GET_ENGINES_V2` whose caps lack `CE_GRCE` and have
+`CE_SYSMEM_WRITE` (the destination is guest RAM). Prefer one without `CE_SHARED`, then use `COPY(n)` in the TSG, channel,
+BIND and CE object. Neither `NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE` (0x20801112) nor any other runlist query is in the
+allowlist. The work-submit token carries the runlist, though:
+- `RUNLIST_ID` 22:16 and the channel id in 11:0 (the 610.57.04 open kernel modules: `kfifoGenerateWorkSubmitTokenHal_GB202`
+  with `dev_vm.h` `NV_VIRTUAL_FUNCTION_DOORBELL_*`; `kfifoGenerateWorkSubmitTokenHal_GA100` with `dev_ctrl.h`
+  `NV_CTRL_VF_DOORBELL_*`);
+- so two channels on different runlists show different token bits 22:16.
+
+### 7.3 What the prototype does about it
+
+`crm_ce_copy_smoke`:
+- prints every `COPYn` with its caps and takes the first async one by default (`--engine <n>` picks one, `--engine gr`
+  builds the channel on GR with a NULL-parameter copy object, as NVK does, for the A/B);
+- prints the engine and the runlist id decoded from the token.
+
+**UNVERIFIED:** whether GSP-RM accepts a GR channel with only a copy object and no 3D object. NVK always allocates 3D
+first.
+
+Concurrent mode (`--contend`): a GPU 3D load of our own cannot be built here, because user mode has no shader stack. Instead
+a second channel (`--contend-engine`, default `gr`) runs a large copy, 64 MiB by default, from video memory into another
+OS descriptor in guest RAM. That copy uses the same PCIe write path. The measured CE copy starts while it is in flight. The
+tool then reports:
+- `copy_us` (no competitor) next to `copy_us_contended`;
+- `contend_overlapped`, the rounds in which the competitor was still running when the measured copy completed;
+- whether the two channels got the same runlist, that is, whether they time-slice or run concurrently.
+
+The real contention case is the second run with a windowed 3D app, using `--delay` to start it (`guest/rmclient/tests/crm_ce_copy_smoke.md`, run 3).
+
+### 7.4 The PCIe stage line: today and with the CE route
+
+Host measurement of today's windowed copy: 5.8 MB per frame written into guest RAM over PCIe while a 3D app shares the
+GPU. Host dispatch to MSI is 446 us p50 / 828 us p99, and the guest sees 0.5-1 ms in total. The CE route keeps the
+transfer and drops the hops around it. The producer wait moves into the GPU acquire, so the copy starts on the producer's
+release and overlaps its tail instead of waiting for a KMD worker.
+
+| stage | today (us) | expected with the CE route (us) | the prototype measures it with |
+|---|---|---|---|
+| producer wait (KMD worker) | 610 mean (`BltDeferUs`) | 0 on the CPU; inside the GPU acquire | `acquire_satisfy_to_done_us` minus `copy_us`: what remains after the release |
+| submit (host dispatch, or doorbell to the GPU reading the push) | part of about 105 host CPU overhead (being cut by 50-60) | the doorbell MMIO, expected about 10 | `doorbell_to_gpfifo_get_us` |
+| GPU copy plus the driver wake | about 345 | about 345 for the transfer, with no host driver wake | `copy_us` (GPU timestamps around the copy), and `copy_us_contended` |
+| MSI injection | 3-6 | none for the copy itself | n/a |
+| guest kick exit, MSI -> ISR -> DPC, delivery | 100-400 | the completion path of 4.3 (about 100 for a GPU release, unverified) | `doorbell_to_event_us` minus `submit_to_done_acquire_satisfied_us` (`--fence`) |
+| total after the producer finishes | 500-1000 (guest view) | about 345 plus the completion path | `acquire_satisfy_to_done_us` (the copy overlaps the producer's tail) |
+
+The ~150 us of host hops (the ~105 us CPU overhead plus the wake and delivery around the transfer) is what the route removes.
+The ~345 us of transfer stays unless the copy gets faster on an idle async CE. `copy_us` against `copy_us_contended` shows
+how much PCIe contention costs.
+
+## 8. Milestones
 
 - **M0**: this document.
 - **M1**: `crm_ce_copy_smoke.c` plus the meson entry (section 5), and a test request to the main session with the exact build and
