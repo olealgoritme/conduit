@@ -31,13 +31,14 @@ ForeignCopy=1`, MSI-X in the guest, about 220 fps.
   transfer-only family 1 (the copy engine), which runs alongside graphics.
   **Moving the KMD's copy queue to family 1 is the largest lever left on this
   round trip.** It is a guest change.
-- Host-side fixes, each behind an option, off by default: no empty interrupt
+- Host-side fixes, each behind an option: no empty interrupt
   after holding a fenced chain, one renderer round trip per fenced submit
   instead of two, two thread hops fewer on the fence's way back, a batched and
   cheaper event thread, and CPU placement. Measured with MSI-X: host round
   trip 441.5 → 398.0 µs p50, fence return path 45.0 → 20.9 µs, queue thread
   per fenced submit 83 → 37 µs, event-thread interrupts 10,051 → 1,245 a
-  second ("Before and after").
+  second ("Before and after"). The first four are on by default; CPU
+  placement is host configuration.
 - C-states do not show on this path. Every wakeup on it landed on a CPU that
   was already awake, and wake to run took 2-3 µs.
 
@@ -193,10 +194,17 @@ guest-blob buffer (`VK_SHARING_MODE_CONCURRENT`, or ownership transfers).
   that sleep waits for the 2 ms poll timeout or the next kick. This is
   probably part of the 66 µs p99 above.
 
-## Options (off by default)
+## Options
 
-`conduit config set backend.latency all` (or a list) and `conduit config set
-backend.cpus 0-7,16-23`. Both apply when the VM's backend next starts.
+`quiet-held`, `fused-submit`, `direct-fences` and `event-batch` are on by
+default: the backend's `--latency` defaults to `all`, and conduit-venus sends
+fences directly unless given `--no-direct-fences`. `conduit config set
+backend.latency off` turns all of them off. A list sets exactly the options
+it names, for example `all,fence-spin`, or `quiet-held,event-batch`; the
+backend also takes `no-NAME`. `fence-spin` is used only when named.
+`conduit config set backend.cpus 0-3,16-19` pins both processes
+([HOST-TUNING.md](../HOST-TUNING.md)). Both settings apply when the VM's
+backend next starts.
 
 | option | where | what |
 |---|---|---|
@@ -204,7 +212,7 @@ backend.cpus 0-7,16-23`. Both apply when the VM's backend next starts.
 | `fused-submit` | backend, conduit-venus (`FEATURE_SUBMIT_FENCED` bit 3, IPC op 15) | a fenced `SUBMIT_3D` is one renderer call, `submit_fenced`, instead of `submit` and `create_fence`: one round trip less while the queue thread waits (about 33 µs) |
 | `direct-fences` | conduit-venus `--direct-fences`, backend | conduit-venus sends each fence from the virglrenderer thread that retires it, under one send lock with the serve loop, instead of through the serve loop. The backend's renderer reader returns the chains itself, through `Renderer::set_fence_hook`, when the backend lock is free, and otherwise leaves them to the fence pump as before. Two hops fewer on the way back |
 | `event-batch` | backend | the event thread signals once per pass and sweeps with one `poll` over all descriptors |
-| `fence-spin` (named only, not in `all`) | conduit-venus `--fence-spin-us 150`, virglrenderer patch 0004 | vkr's fence threads poll around a fence's expected completion (phase 3) |
+| `fence-spin` (only when named, not in `all`) | conduit-venus `--fence-spin-us 150`, virglrenderer patch 0004 | vkr's fence threads poll around a fence's expected completion (phase 3) |
 | `backend.cpus` | backend and conduit-venus `--cpus` | every thread of both stays on the given CPUs (the host's CCD, away from the vCPUs) |
 
 `direct-fences` without the backend lock: the queue thread holds the lock
@@ -286,8 +294,25 @@ remaining 82-93 interrupts from the queue thread within 30 µs of holding a
 chain are probably drains that also answered another request (not checked
 per kick).
 
-Guest side, same rows (the KMD's `BltAsyncLat` histogram over about 11 s,
-submit to completion DPC; driver 346.1, INTx):
+Guest side of the MSI-X rows (`BltAsyncLat`, about 11 s per row,
+`MsiGrant` 3 and no INTx interrupts in every row):
+
+| | A off | B all | C all + cpus 0-7,16-23 | D all + cpus 0-3,16-19 | E all + fence spin |
+|---|---|---|---|---|---|
+| copies < 500 µs | 0.5 % | 4.2 % | 8.0 % | **13.5 %** | 8.4 % |
+| copies > 1 ms | 0.6 % | 4.9 % | 5.0 % | **1.4 %** | 5.7 % |
+| producer deferral | 728 µs | 791 µs | 805 µs | 773 µs | 797 µs |
+
+D is the best row in the guest as on the host. B, C and E grow a > 1 ms
+tail of about 5% that A and D lack. The host captures do not show it: host
+dispatch to MSI exceeded 900 µs for only 0.2-0.4% of the copies in every
+row, and those few spent their time before vkr's timeline write (GPU
+included), not in the return path. So the tail comes after the host's MSI
+(the guest's interrupt to DPC, or its next submit) or from the GPU timeslices
+the guest's own work gets. It is not attributed yet.
+
+Guest side of the INTx rows (the KMD's `BltAsyncLat` histogram over about
+11 s, submit to completion DPC; driver 346.1, INTx):
 
 | | A off | B all | C all + cpus |
 |---|---|---|---|
@@ -323,11 +348,12 @@ Reading:
   interrupt is an irqfd write from the backend thread and QEMU's main loop
   is not on the path. Under INTx, keep `backend.cpus` off QEMU's emulator
   CPUs, or leave it unset.
-- Recommendation: make `quiet-held`, `fused-submit`, `direct-fences` and
-  `event-batch` the default once a soak is clean. `event-batch` cuts the
-  event thread's interrupts sevenfold with MSI-X. Also recommend
-  `backend.cpus` with MSI-X, on part of the host's CCD (row D: `0-3,16-19`).
-  Under INTx it competes with QEMU's main loop. `fence-spin` stays opt-in.
+- Decision: `quiet-held`, `fused-submit`, `direct-fences` and `event-batch`
+  are on by default, and daily use is the soak. `event-batch` cuts the event
+  thread's interrupts sevenfold with MSI-X. `backend.cpus` stays host
+  configuration, recommended on part of the host's CCD with MSI-X (row D:
+  `0-3,16-19`; [HOST-TUNING.md](../HOST-TUNING.md)). Under INTx it competes
+  with QEMU's main loop. `fence-spin` stays opt-in.
 
 ## Phase 3: observing the fence sooner
 

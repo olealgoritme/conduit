@@ -623,7 +623,8 @@ not know (an unknown op ends the connection). Both
 sides use the `conduit_venus::Renderer` trait (`host/venus/src/lib.rs`): the
 backend through the IPC client, tests through `conduit_venus::mock::Mock`.
 
-**Latency options** (off by default; `conduit config set backend.latency`,
+**Latency options** (on by default; `conduit config set backend.latency off`
+or a list to change that,
 [research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
 `fused-submit`: a fenced `SUBMIT_3D` is one call, `Renderer::submit_fenced`
 (IPC op `SUBMIT_FENCED` (15), sent only to a server with `FEATURE_SUBMIT_FENCED` (bit 3),
