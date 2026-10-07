@@ -5,7 +5,7 @@
 
 use super::data::*;
 use super::{CheckResult, Env, Family, Fix, Step, Verify};
-use crate::doctor::{Check, Level};
+use crate::doctor::{Check, Level, Remedy};
 
 /// The step for one doctor check.
 pub fn step_for(c: &Check, env: &Env) -> Step {
@@ -14,7 +14,7 @@ pub fn step_for(c: &Check, env: &Env) -> Step {
     Step::new(
         &id,
         &title,
-        &c.hint,
+        &c.hint(),
         move |env: &Env| match env
             .checks
             .iter()
@@ -106,46 +106,23 @@ pub fn libvirt_fix(env: &Env) -> Fix {
     install_fix(env, LIBVIRT_APT, LIBVIRT_DNF, LIBVIRT_PACMAN)
 }
 
-/// The fix for a check that is not ok; None when the doctor's hint says all there is.
+/// The wizard's fix for a check that is not ok: its own remedy, resolved for
+/// this host's distribution. None when the check says nothing to do.
 pub fn fix_for(c: &Check, env: &Env) -> Option<Fix> {
-    let hint = || (!c.hint.is_empty()).then(|| Fix::guide(c.hint.clone()));
-    match c.id.as_str() {
-        "kvm-access" => Some(sudo_fix(env, &["usermod", "-aG", "kvm", &env.user])),
-        "nvidia-driver" | "driver-support" => Some(Fix::guide(driver_guide(env))),
-        "tools" => Some(install_fix(
-            env,
-            crate::doctor::TOOL_PACKAGES_APT,
-            &["iproute", "iptables", "openssh-clients", "curl", "e2fsprogs", "xz", "coreutils"],
-            &["iproute2", "iptables", "openssh", "curl", "e2fsprogs", "xz", "coreutils"],
-        )),
-        "virtiofsd" => Some(install_fix(env, &["virtiofsd"], &["virtiofsd"], &["virtiofsd"])),
-        "conduit-part" => Some(Fix::guide(format!(
-            "Install the Conduit package for your distribution ({}), or, from a source checkout, build it with packaging/build.sh (the build packages step above installs what it needs).",
-            link("conduit-releases")
-        ))),
-        _ => hint(),
-    }
+    c.remedy.as_ref().map(|r| fix_of(r, env))
 }
 
-/// What to know before touching the driver. The wizard changes nothing here.
-pub fn driver_guide(env: &Env) -> String {
-    let now = match &env.driver {
-        Some(d) => format!(
-            "Loaded now: {} ({} kernel modules).",
-            d.version,
-            if d.open { "open" } else { "closed" }
-        ),
-        None => "No NVIDIA driver is loaded now.".into(),
-    };
-    format!(
-        "{now}\n\n\
-         Conduit never installs or changes a driver for you. Do it yourself, in your distribution's way, then restart the computer: the new kernel module only loads at boot.\n\n\
-         Open or closed: NVIDIA ships its kernel modules in two flavours. Conduit is built and tested on the OPEN modules, release 580 or newer (Ubuntu: the nvidia-driver-580-open package or a newer -open one). The closed modules and older branches may work for a release Conduit has tables for; Conduit then warns and starts in safe mode.\n\n\
-         Releases Conduit knows: {}",
-        if env.supported.is_empty() {
-            "(the list could not be read)".to_string()
-        } else {
-            env.supported.join(", ")
-        }
-    )
+/// A remedy as something the wizard can offer: commands on Debian, the same
+/// words elsewhere.
+pub fn fix_of(r: &Remedy, env: &Env) -> Fix {
+    fn strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    match r {
+        Remedy::Guide { text } | Remedy::Explain { guide: text, .. } => Fix::guide(text.clone()),
+        Remedy::Sudo { cmd, .. } => sudo_fix(env, &strs(cmd)),
+        Remedy::Install {
+            apt, dnf, pacman, ..
+        } => install_fix(env, &strs(apt), &strs(dnf), &strs(pacman)),
+    }
 }

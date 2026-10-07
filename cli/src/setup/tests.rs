@@ -1,7 +1,7 @@
 use super::data::*;
 use super::env::{not_installed, Distro, Env, Family};
 use super::*;
-use crate::doctor::{Check, Level};
+use crate::doctor::{Check, Level, Remedy};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -11,8 +11,25 @@ fn chk(id: &str, level: Level, title: &str, detail: &str, hint: &str) -> Check {
         level,
         title: title.into(),
         detail: detail.into(),
-        hint: hint.into(),
+        remedy: (!hint.is_empty()).then(|| Remedy::guide(hint)),
     }
+}
+
+/// A check with the remedy the doctor really builds for it.
+fn chk_with(id: &str, level: Level, title: &str, detail: &str, remedy: Remedy) -> Check {
+    Check {
+        remedy: Some(remedy),
+        ..chk(id, level, title, detail, "")
+    }
+}
+
+fn tools_remedy() -> Remedy {
+    Remedy::install(
+        "Ubuntu: sudo apt install iproute2",
+        crate::doctor::TOOL_PACKAGES_APT,
+        &["iproute", "iptables"],
+        &["iproute2", "iptables"],
+    )
 }
 
 /// A host with one passing check, a failing Tools check and a failing driver.
@@ -20,19 +37,16 @@ fn sick_env() -> Env {
     let mut e = Env::fixture();
     e.checks = vec![
         chk("kvm", Level::Ok, "KVM", "available", ""),
-        chk(
-            "tools",
-            Level::Fail,
-            "Tools",
-            "missing: ip, curl",
-            "Ubuntu: sudo apt install iproute2",
-        ),
-        chk(
+        chk_with("tools", Level::Fail, "Tools", "missing: ip, curl", tools_remedy()),
+        chk_with(
             "nvidia-driver",
             Level::Fail,
             "NVIDIA driver",
             "not loaded",
-            "Install NVIDIA's driver with the OPEN kernel modules.",
+            Remedy::explain(
+                "Install NVIDIA's driver with the OPEN kernel modules.",
+                "No NVIDIA driver is loaded now.\n\nConduit never installs or changes a driver for you. OPEN modules, closed, restart. Releases Conduit knows: 580.95.05",
+            ),
         ),
         chk(
             "safe-mode",
@@ -137,7 +151,7 @@ fn dpkg_status_lines_say_what_is_missing() {
 
 #[test]
 fn debian_gets_commands_and_other_distros_get_the_same_steps_as_words() {
-    let tools = chk("tools", Level::Fail, "Tools", "missing", "h");
+    let tools = chk_with("tools", Level::Fail, "Tools", "missing", tools_remedy());
     let deb = hostfix::fix_for(&tools, &Env::fixture()).unwrap();
     let Fix::Run { cmd, needs_sudo } = &deb else {
         panic!("{deb:?}")
@@ -153,7 +167,7 @@ fn debian_gets_commands_and_other_distros_get_the_same_steps_as_words() {
         panic!()
     };
     assert!(
-        text.contains("sudo dnf install") && text.contains("iproute"),
+        text.contains("sudo dnf install") && text.contains("iproute "),
         "{text}"
     );
 
@@ -164,11 +178,17 @@ fn debian_gets_commands_and_other_distros_get_the_same_steps_as_words() {
     };
     assert!(text.contains("sudo pacman -S --needed") && text.contains("iproute2"));
 
-    let kvm = chk("kvm-access", Level::Fail, "KVM", "present, but", "h");
-    assert!(matches!(
-        hostfix::fix_for(&kvm, &Env::fixture()),
-        Some(Fix::Run { .. })
-    ));
+    let kvm = chk_with(
+        "kvm-access",
+        Level::Fail,
+        "KVM",
+        "present, but",
+        Remedy::sudo("Add yourself:", &["usermod", "-aG", "kvm", "ole"]),
+    );
+    let Some(Fix::Run { cmd, .. }) = hostfix::fix_for(&kvm, &Env::fixture()) else {
+        panic!("kvm on Debian is a command")
+    };
+    assert_eq!(cmd, ["usermod", "-aG", "kvm", "ole"]);
     assert!(matches!(
         hostfix::fix_for(&kvm, &arch),
         Some(Fix::Guide { .. })
@@ -176,16 +196,29 @@ fn debian_gets_commands_and_other_distros_get_the_same_steps_as_words() {
 }
 
 #[test]
+fn a_check_without_a_remedy_has_no_fix_and_a_plain_hint_is_its_own_guide() {
+    let none = chk("x", Level::Warn, "X", "d", "");
+    assert_eq!(hostfix::fix_for(&none, &Env::fixture()), None);
+    let words = chk("y", Level::Warn, "Y", "d", "Do this.");
+    assert_eq!(
+        hostfix::fix_for(&words, &Env::fixture()),
+        Some(Fix::guide("Do this."))
+    );
+    assert!(!words.remedy.as_ref().unwrap().says_more_than_hint());
+}
+
+#[test]
 fn the_driver_is_never_changed_only_explained() {
-    let mut e = Env::fixture();
-    e.driver = Some(crate::host::Driver {
+    let loaded = crate::host::Driver {
         version: "570.1".into(),
         open: false,
-    });
-    for id in ["nvidia-driver", "driver-support"] {
-        let c = chk(id, Level::Fail, "NVIDIA driver", "closed", "h");
-        let Some(Fix::Guide { text }) = hostfix::fix_for(&c, &e) else {
-            panic!("{id}: not a guide")
+    };
+    let supported = vec!["580.95.05".to_string()];
+    let checks = crate::doctor::driver_checks_for_test(Some(loaded), &supported);
+    assert!(checks.iter().any(|c| c.level != Level::Ok));
+    for c in checks.iter().filter(|c| c.level != Level::Ok) {
+        let Some(Fix::Guide { text }) = hostfix::fix_for(c, &Env::fixture()) else {
+            panic!("{}: not a guide", c.id)
         };
         assert!(
             text.contains("580.95.05"),

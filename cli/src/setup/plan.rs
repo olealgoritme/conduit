@@ -57,9 +57,13 @@ pub fn plan_text(env: &Env) -> String {
     for c in &env.checks {
         o.push_str(&indent(render_check(c).trim_end(), "  "));
         if c.level != Level::Ok {
-            // A guide that only repeats the hint printed above adds nothing.
-            let repeats = |f: &Fix| matches!(f, Fix::Guide { text } if *text == c.hint);
-            if let Some(f) = hostfix::fix_for(c, env).filter(|f| !repeats(f)) {
+            // Words that only repeat the hint printed above add nothing.
+            if let Some(f) = c
+                .remedy
+                .as_ref()
+                .filter(|r| r.says_more_than_hint())
+                .map(|r| hostfix::fix_of(r, env))
+            {
                 o.push_str(&indent("what to do:", "       "));
                 o.push_str(&indent(&fix_text(&f), "         "));
             }
