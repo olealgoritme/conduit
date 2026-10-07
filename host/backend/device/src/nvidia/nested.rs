@@ -64,7 +64,9 @@ impl NvidiaBackend {
         // this project asks for rights, so the host sees null and the caller
         // gets its own value back.
         const NVOS64_RIGHTS: usize = 24;
-        let rights = if escape == 0x2b && outer.len() >= NVOS64_RIGHTS + 8 {
+        // Only NVOS64 has the field: at 24 NVOS21 holds `paramsSize`, which
+        // must reach RM as it was sent.
+        let rights = if escape == 0x2b && outer.len() == NVOS64_SIZE {
             let saved: [u8; 8] = outer[NVOS64_RIGHTS..NVOS64_RIGHTS + 8]
                 .try_into()
                 .expect("just checked the length");
@@ -545,7 +547,9 @@ impl NvidiaBackend {
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
                 log::debug!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
             } else if escape == 0x2b {
-                let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
+                let status = alloc_status_at(outer.len())
+                    .map(|at| u32::from_le_bytes(outer[at..at + 4].try_into().unwrap()))
+                    .unwrap_or(0);
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
                 log::debug!(
                     "(else) RM_ALLOC hClass=0x{:04x} status=0x{:x}",

@@ -39,6 +39,23 @@ const DEEP_BUF_FLOOR: usize = 64 * 1024;
 
 /// `NVOS64_PARAMETERS.status`, where RM writes its answer to an allocation.
 const NVOS64_STATUS: usize = 40;
+/// `NVOS21_PARAMETERS.status`. NVOS21 is NVOS64 without `pRightsRequested` and
+/// `flags`: the same first five fields, `paramsSize` at 24, then status.
+const NVOS21_STATUS: usize = 28;
+/// The two block sizes `NV_ESC_RM_ALLOC` takes, which is how its layout is
+/// told: RM's `rm_ioctl` compares `dataSize` against each `sizeof`.
+const NVOS21_SIZE: usize = 32;
+const NVOS64_SIZE: usize = 48;
+
+/// Where RM writes its answer to an allocation, for a parameter block this
+/// long. The one place that says so; a block that is neither size has none.
+fn alloc_status_at(data_len: usize) -> Option<usize> {
+    match data_len {
+        NVOS64_SIZE => Some(NVOS64_STATUS),
+        NVOS21_SIZE => Some(NVOS21_STATUS),
+        _ => None,
+    }
+}
 /// RM_ALLOC classes that make a client rather than an object in one.
 const ROOT_CLASSES: [u32; 3] = [0x0, 0x1, 0x41];
 

@@ -46,8 +46,7 @@ impl HostDriver for Detached {
 fn nv_status_offset(call: Call, data_len: usize) -> Option<usize> {
     let at = match call {
         // NVOS64 (48 bytes) or the older NVOS21 (32).
-        Call::Alloc if data_len >= NVOS64_STATUS + 4 => NVOS64_STATUS,
-        Call::Alloc => 28,
+        Call::Alloc => alloc_status_at(data_len)?,
         Call::Control => NVOS54_STATUS,
         Call::Free => 12,  // NVOS00
         Call::Dup => 24,   // NVOS55
