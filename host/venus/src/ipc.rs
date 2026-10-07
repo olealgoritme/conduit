@@ -69,6 +69,10 @@ mod op {
     /// RAM file as the request's fd. Sent only to a server whose features
     /// carry `FEATURE_IMPORT_GUEST_PAGES`.
     pub const IMPORT_GUEST_PAGES: u32 = 13;
+    /// `{on u32}`: stage stamps on (1) or off (0); the reply is every stamp
+    /// since the last `STAGES` as a `stage` dump. Sent only to a server
+    /// whose features carry `FEATURE_STAGE_TRACE`.
+    pub const STAGES: u32 = 14;
 
     /// `CAPSET_INFO` with this index asks for [`Renderer::features`]: the
     /// reply's first word is the bits. A server from before features passes
@@ -676,6 +680,14 @@ impl Renderer for IpcClient {
         self.call_fd(op::IMPORT_GUEST_PAGES, &w.0, Some(ram))?;
         Ok(())
     }
+
+    fn stages(&mut self, on: bool) -> Result<Vec<crate::stage::Rec>> {
+        if self.features() & crate::FEATURE_STAGE_TRACE == 0 {
+            return Err(Error::Refused("the renderer does not stamp stages".into()));
+        }
+        let m = self.call(op::STAGES, &W::default().u32(on as u32).0)?;
+        crate::stage::decode_dump(&m.body).map(|(r, _)| r).ok_or_else(|| proto("bad stage dump"))
+    }
 }
 
 // -------------------------------------------------------------------- server
@@ -735,7 +747,20 @@ impl IpcServer {
         if f.is_empty() {
             return Ok(());
         }
-        send_msg(self.sock.as_fd(), op::FENCES, &encode_fences(&f), None)
+        send_msg(self.sock.as_fd(), op::FENCES, &encode_fences(&f), None)?;
+        if crate::stage::on() {
+            let now = crate::stage::now_ns();
+            for s in &f {
+                crate::stage::stamp(crate::stage::Rec::fence(
+                    crate::stage::R_PUSH,
+                    s.ctx_id,
+                    s.ring_idx,
+                    s.fence_id,
+                    now,
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn reply(&self, r: Result<Vec<u8>>, fd: Option<BorrowedFd<'_>>) -> io::Result<()> {
@@ -827,6 +852,11 @@ impl IpcServer {
                 let res = rd.import_guest_pages(res, m.fds[0].as_fd(), &runs).map(|()| Vec::new());
                 self.reply(res, None)
             }
+            op::STAGES => {
+                let on = r.u32().map_err(|_| bad())? != 0;
+                let res = rd.stages(on).map(|recs| crate::stage::encode_dump(&recs, 0));
+                self.reply(res, None)
+            }
             op::CREATE_FENCE => {
                 let mut f = || -> Result<_> { Ok((r.u32()?, r.u32()?, r.u64()?)) };
                 let (ctx, ring, id) = f().map_err(|_| bad())?;
@@ -913,6 +943,25 @@ mod tests {
         assert!(matches!(c.capset_info(1), Err(Error::Refused(s)) if s == "capset index"));
         assert_eq!(c.capset(CAPSET_VENUS, 0).unwrap(), vec![0; 160]);
         assert!(matches!(c.capset(1, 0), Err(Error::Refused(s)) if s == "capset id"));
+    }
+
+    #[test]
+    fn stage_stamps_cross_the_socket() {
+        let (mut c, s) = pair();
+        assert!(c.stages(true).unwrap().is_empty());
+        c.ctx_create(1, CAPSET_VENUS, b"dwm.exe").unwrap();
+        c.create_fence(1, 1, 0x1_0000_0077).unwrap();
+        let recs = c.stages(false).unwrap();
+        assert_eq!(recs.len(), 1);
+        let r = recs[0];
+        assert_eq!(
+            (r.stage, r.kind, r.ctx, r.ring, r.id),
+            (crate::stage::R_FENCE, crate::stage::KIND_FENCE, 1, 1, 0x1_0000_0077)
+        );
+        c.create_fence(1, 1, 0x78).unwrap();
+        assert!(c.stages(false).unwrap().is_empty(), "off: nothing stamped");
+        drop(c);
+        s.join().unwrap();
     }
 
     #[test]

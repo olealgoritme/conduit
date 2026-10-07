@@ -81,6 +81,11 @@ fn main() -> ExitCode {
     // Vulkan comes up before listening: a host without a working driver
     // fails here, where the backend sees the process exit, rather than after
     // the guest has started talking Venus.
+    // CONDUIT_STAGE_TRACE=1: frame stage stamps from the start (the backend
+    // turns them on and off at run time otherwise; docs/TRACING.md).
+    if conduit_venus::stage::init_from_env() {
+        eprintln!("conduit-venus: stage timing on (CONDUIT_STAGE_TRACE)");
+    }
     let renderer = match Virgl::new() {
         Ok(r) => r,
         Err(e) => return fail(e),
