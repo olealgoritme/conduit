@@ -2437,20 +2437,31 @@ pub fn count_submit_escape() {
     ESCAPE_SUBMIT_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The prologue both per-frame display submitters share: refuse an empty
-/// stream, reap parked buffers, and stage the meta + venus DMA buffers.
+/// The prologue every display submitter shares: refuse an empty stream, reap
+/// parked buffers, and stage the meta + venus DMA buffers.
 ///
-/// R1004. `submit_venus_async_scanout` and `submit_venus_async_present` were
-/// identical apart from which enqueue entry point they called.
+/// R1004 made it one function; docs 24.13 (`SubmitPool`, default 1) made it
+/// take the two buffers from the transport's DMA POOL, as the escape path
+/// (`submit_venus_async`) always has, instead of two `MmAllocateContiguousMemory`
+/// calls per frame. `SubmitPool` 0 is the old allocate-per-submit path exactly.
 ///
-/// ⚠ NOTE THE DIVERGENCE THIS MAKES VISIBLE, and does NOT change: unlike
-/// `submit_venus_async` (the escape path), neither display submitter uses the
-/// DMA POOL -- `DmaBuffer::new` allocates contiguous memory PER FRAME on both.
-/// Switching them onto `take_dma_buffer` is a perf change with its own gate and
-/// is explicitly out of scope here; what this commit buys is that the policy is
-/// now stated in one place instead of inferred from two.
+/// THE LIFETIME RULE is the pool's own and is not changed here: a buffer enters
+/// `dma_pool` only from a completed in-flight entry, i.e. after `drain_used`
+/// popped that submit's used-ring element (the host has consumed both
+/// descriptors), through the PASSIVE reap (`recycle_dma_buffers`) or the
+/// drain's raw-forward push; and a buffer a submit took is owned by its
+/// in-flight entry until that same completion. The pool is bounded
+/// (`MAX_DMA_POOL` buffers, `MAX_DMA_POOL_BYTES`) and lives in the transport
+/// generation (`VirtioGpu`), so StopDevice frees it at PASSIVE with the
+/// transport, before anything the allocation depends on goes. Display buffers
+/// were already RECYCLED into it by the reap; they were simply never taken.
 ///
-/// Every stage is timed on `clock` (docs 24.13, `Sub*` counters): `Reap`, `Alloc`, `Copy`.
+/// The reap's begin and both takes share ONE lock hold (the `raw_roundtrip`
+/// pattern); a miss (pool empty, nothing big enough) falls back to a fresh
+/// allocation here at PASSIVE, never under the lock and never waiting.
+///
+/// Every stage is timed on `clock` (docs 24.13, `Sub*` counters): `Take`,
+/// `Reap`, `Alloc`, `Copy`.
 fn stage_display_submit(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -2460,17 +2471,55 @@ fn stage_display_submit(
     if stream.is_empty() || !stream_fits(stream) {
         return Err(VirtioError::DeviceError);
     }
-    reap_parked(passive, adapter);
-    submit_stage::lap(clock, Stage::Reap);
-    submit_stage::note_staging(2, 0);
-    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory);
-    let venus = meta
-        .as_ref()
-        .ok()
-        .and_then(|_| DmaBuffer::new(passive, stream.len()));
+    let pool_on = adapter.knobs().submit_pool;
+    let (pooled_meta, pooled_venus) = if pool_on {
+        let taken = adapter.with_virtio(|v| {
+            (
+                v.begin_parked_reap(),
+                v.take_dma_buffer(SUBMIT_META_BYTES),
+                v.take_dma_buffer(stream.len()),
+            )
+        });
+        submit_stage::lap(clock, Stage::Take);
+        let (work, meta, venus) = match taken {
+            Ok((work, meta, venus)) => (Ok(work), meta, venus),
+            Err(gone) => (Err(gone), None, None),
+        };
+        // Whatever `begin_parked_reap` returned MUST reach the reap (see
+        // `reap_parked_work`). The buffers it recycles serve the NEXT submit.
+        reap_parked_work(passive, adapter, work);
+        submit_stage::lap(clock, Stage::Reap);
+        (meta, venus)
+    } else {
+        reap_parked(passive, adapter);
+        submit_stage::lap(clock, Stage::Reap);
+        (None, None)
+    };
+    let plan = helios_kmd_logic::submit_stage::plan(
+        pool_on,
+        pooled_meta.is_some(),
+        pooled_venus.is_some(),
+    );
+    let fresh = helios_kmd_logic::submit_stage::fresh_count(plan);
+    submit_stage::note_staging(fresh, 2 - fresh);
+    // A failed fresh allocation drops the other (pooled or fresh) buffer here,
+    // at PASSIVE, exactly as before.
+    let meta = match pooled_meta {
+        Some(buf) => Some(buf),
+        None => DmaBuffer::new(passive, SUBMIT_META_BYTES),
+    }
+    .ok_or(VirtioError::OutOfMemory);
+    let venus = match (&meta, pooled_venus) {
+        (Err(_), _) => None,
+        (Ok(_), Some(buf)) => Some(buf),
+        (Ok(_), None) => DmaBuffer::new(passive, stream.len()),
+    };
     submit_stage::lap(clock, Stage::Alloc);
     let meta = meta?;
     let mut venus = venus.ok_or(VirtioError::OutOfMemory)?;
+    // A pooled buffer keeps stale bytes past `stream.len()`; the device reads
+    // only `[..venus_len]` (the descriptor length), and `take_dma_buffer`'s
+    // `reset` re-stamped the wire tail.
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
     submit_stage::lap(clock, Stage::Copy);
     Ok((meta, venus, stream.len()))
