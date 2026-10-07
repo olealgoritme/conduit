@@ -129,8 +129,10 @@ pub(crate) fn reset_for_start() {
     CACHE.store(cache.word(), Ordering::Relaxed);
     if v != 0 {
         crate::diag::record_named_bytes(b"CeCache", cache.word());
-        // The dup cache's counters (M3c-1): only when the channel can run at all.
+        // The dup cache's and the shadow mode's counters (M3c-1): only when the channel can
+        // run at all.
         super::ce_dup::reset_for_start();
+        super::ce_shadow::reset_for_start(v);
     }
 }
 
@@ -214,6 +216,7 @@ pub(crate) fn publish_counters() {
     rec(b"CeRmStat", RM_STAT.load(Ordering::Relaxed));
     rec(b"CeMapNode", MAP_NODE.load(Ordering::Relaxed));
     super::ce_dup::publish_counters();
+    super::ce_shadow::publish_counters();
 }
 
 /// The stage about to run, written BEFORE it runs (a hang names itself).
@@ -334,8 +337,17 @@ static STATE: SpinLock<State> = SpinLock::new(State {
 #[inline(never)]
 pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     let knob = KNOB.load(Ordering::Relaxed);
-    if cc::mode(knob) != cc::Mode::SelfTest || knob == UNREAD {
+    if knob == UNREAD {
         return;
+    }
+    match cc::mode(knob) {
+        cc::Mode::SelfTest => {}
+        // 3: the shadow mode (M3c-1): a sampled Present's copy, when one is waiting.
+        cc::Mode::Shadow => {
+            super::ce_shadow::service(passive, adapter);
+            return;
+        }
+        cc::Mode::Off | cc::Mode::Route => return,
     }
     if SELF_DONE.load(Ordering::Relaxed) != 0 {
         return;
@@ -373,6 +385,18 @@ pub(super) enum NotUp {
     Refused(cc::Why),
     /// This call's bring-up failed: the stage and how.
     Failed(Stage, Fail),
+}
+
+/// Take the channel's I/O for this thread (`IO_BUSY`): `false` when another thread has it.
+pub(super) fn try_io() -> bool {
+    IO_BUSY
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Give the channel's I/O back ([`try_io`]).
+pub(super) fn end_io() {
+    IO_BUSY.store(0, Ordering::Release);
 }
 
 /// The channel up for transport generation `epoch`, bringing it up now if it is cold (or its
@@ -1006,6 +1030,7 @@ fn undo_all(io: &Io<'_>, p: &mut Parts, ring: &mut cp::Ring) {
     }
     let h = p.h;
     if idle {
+        super::ce_shadow::release_scratch(io, &h);
         super::ce_dup::release_all(io, &h);
     }
     while let Some(u) = cc::next_undo(p.made) {
@@ -1016,11 +1041,13 @@ fn undo_all(io: &Io<'_>, p: &mut Parts, ring: &mut cp::Ring) {
         }
         p.made = p.made.without(u.undoes());
         if matches!(u, Undo::FreeTsg) {
+            super::ce_shadow::release_scratch(io, &h);
             super::ce_dup::release_all(io, &h);
         }
     }
     // Whatever is left (no channel group was made): before the client's files close (a no-op
     // when the cache is empty). A closed client takes the rest with it.
+    super::ce_shadow::release_scratch(io, &h);
     super::ce_dup::release_all(io, &h);
 }
 
@@ -1116,6 +1143,8 @@ pub(crate) fn drop_views() {
             kernel_unmap(v.va, v.len);
         }
     }
+    // The shadow mode's scratch view likewise (M3c-1; nothing when there is none).
+    super::ce_shadow::drop_views();
     IO_BUSY.store(0, Ordering::Release);
 }
 
@@ -1123,8 +1152,9 @@ pub(crate) fn drop_views() {
 #[inline(never)]
 pub(crate) fn forget() {
     drop_views();
-    // The dup cache names objects of the client the sweep closed.
+    // The dup cache and the shadow mode's scratch name objects of the client the sweep closed.
     super::ce_dup::forget();
+    super::ce_shadow::forget();
     {
         let mut g = STATE.lock();
         g.svc.reset();
@@ -1507,7 +1537,7 @@ fn kernel_map(
     Ok(va as u64)
 }
 
-fn kernel_unmap(va: u64, len: u64) {
+pub(super) fn kernel_unmap(va: u64, len: u64) {
     if va != 0 {
         // SAFETY: `va`/`len` came from `MmMapIoSpace` in `kernel_map` and were taken out of the
         // view (zeroed by the caller or dropped with it) exactly once; PASSIVE.

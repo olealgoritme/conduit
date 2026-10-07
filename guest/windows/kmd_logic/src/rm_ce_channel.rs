@@ -2128,9 +2128,11 @@ mod tests {
                     assert!(!text.contains("b\"RmCopyEngine\""), "{s} spells the knob name");
                     // The record's writer (M3c-0) spells only its own list, which
                     // `ce_record`'s exact-list test checks; none of these names.
-                    // So does the dup cache's (M3c-1).
-                    let mut other_writers =
-                        crate::ce_record::WRITERS.iter().chain(crate::ce_dup::WRITERS.iter());
+                    // So do the dup cache's and the shadow mode's (M3c-1).
+                    let mut other_writers = crate::ce_record::WRITERS
+                        .iter()
+                        .chain(crate::ce_dup::WRITERS.iter())
+                        .chain(crate::ce_shadow::WRITERS.iter());
                     if other_writers.any(|w| s.ends_with(w)) {
                         for n in COUNTERS {
                             assert!(!text.contains(&std::format!("b\"{n}\"")), "{s} spells {n}");
@@ -2144,6 +2146,10 @@ mod tests {
         assert!(checked > 20);
         let diag = std::fs::read_to_string(render.join("diag.rs")).unwrap();
         assert!(diag.contains("KnobName::new(b\"RmCopyEngine\")"));
-        assert!(!diag.contains("b\"Ce"), "diag.rs spells a Ce counter name");
+        // The shadow mode's knob (M3c-1) is the one `Ce` name diag.rs may spell: a knob, not a
+        // counter (`ce_shadow::EVERY_KNOB`).
+        let knob = std::format!("KnobName::new(b\"{}\")", crate::ce_shadow::EVERY_KNOB);
+        assert!(diag.contains(&knob));
+        assert!(!diag.replace(&knob, "").contains("b\"Ce"), "diag.rs spells a Ce counter name");
     }
 }

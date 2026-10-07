@@ -85,16 +85,7 @@ pub(crate) fn dup_map_record(
 ) -> Result<Producer, Fail> {
     let r = rec.record;
     let (sem, src) = (r.semaphore, r.source);
-    let desc = cp::SourceDesc {
-        offset: src.offset,
-        size: src.size,
-        modifier: src.modifier,
-        pitch: src.pitch,
-        width: src.width,
-        height: src.height,
-        fourcc: src.fourcc,
-        compressed: src.flags & helios_protocol::HELIOS_RM_COPY_SOURCE_FLAG_COMPRESSED != 0,
-    };
+    let desc = source_desc(rec);
     let plan = cp::source_plan(gen, &desc)
         .map_err(|w| Fail::new(FailKind::Layout, WHY_SOURCE | (w.code() << 8)))?;
     let sem_len = cd::semaphore_map_len(sem.offset)
@@ -129,6 +120,56 @@ pub(crate) fn dup_map_record(
         .checked_add(plan.offset)
         .ok_or(Fail::new(FailKind::Layout, WHY_SOURCE_LEN))?;
     Ok(Producer { sem_va, src_va })
+}
+
+/// The record's image as `ce_present::source_plan` reads it.
+pub(crate) fn source_desc(rec: &StashedCeRecord) -> cp::SourceDesc {
+    let src = rec.record.source;
+    cp::SourceDesc {
+        offset: src.offset,
+        size: src.size,
+        modifier: src.modifier,
+        pitch: src.pitch,
+        width: src.width,
+        height: src.height,
+        fourcc: src.fourcc,
+        compressed: src.flags & helios_protocol::HELIOS_RM_COPY_SOURCE_FLAG_COMPRESSED != 0,
+    }
+}
+
+/// Dups refused so far (`CeDupFail`): a caller tells a refused dup from a refused map by it.
+pub(super) fn dup_failures() -> u32 {
+    DUP_FAIL.load(Ordering::Relaxed)
+}
+
+/// The 64-bit value at `offset` of the record's semaphore memory as the KMD's dup sees it, through
+/// a short-lived CPU view (the memory is system memory: a control file). For the diagnosis of a
+/// copy that did not complete (`CeShadowSem`). `None` when the semaphore is not cached or the view
+/// failed. PASSIVE, the caller holds the channel's `IO_BUSY`.
+pub(super) fn read_semaphore(io: &Io<'_>, h: &Handles, rec: &StashedCeRecord) -> Option<u64> {
+    let sem = rec.record.semaphore;
+    let e = CACHE.lock().find(sem.h_client, sem.h_memory, What::Semaphore)?;
+    if sem.offset.checked_add(8)? > e.key.len {
+        return None;
+    }
+    let (h_dup, _) = cd::handles(e.slot);
+    let mut v = ce::cpu_map(
+        io,
+        h,
+        rc::H_DEVICE,
+        h_dup,
+        ce::SYSMEM,
+        e.key.len,
+        wdk_sys::_MEMORY_CACHING_TYPE::MmCached,
+    )
+    .ok()?;
+    // SAFETY: `offset + 8 <= len` (checked), inside the view mapped just above; 8-aligned (the
+    // record parser requires it).
+    let value = unsafe { ce::rd64(v.va, sem.offset) };
+    if !ce::cpu_unmap(io, h, &mut v, true) {
+        ce::note_soft();
+    }
+    Some(value)
 }
 
 /// Whether `(client, memory)` is dup'd and mapped now (any role).

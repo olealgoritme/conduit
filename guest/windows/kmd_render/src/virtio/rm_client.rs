@@ -74,6 +74,9 @@ pub(crate) mod ce_selftest;
 // M3c-1: the producer's memory (the `'HEF3'` record's semaphore and image) dup'd into the
 // channel's client and GPU-mapped, cached for the life of the channel.
 pub(crate) mod ce_dup;
+// M3c-1: the shadow mode (`RmCopyEngine` = 3): sampled Presents copied again by the channel and
+// compared with the production copy.
+pub(crate) mod ce_shadow;
 
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;

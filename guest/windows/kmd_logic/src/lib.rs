@@ -63,6 +63,7 @@ pub mod ce_present;
 pub mod rm_ce_channel;
 pub mod ce_record;
 pub mod ce_dup;
+pub mod ce_shadow;
 pub mod msi;
 pub mod paging;
 pub mod shared_placeholder;

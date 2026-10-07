@@ -208,6 +208,15 @@ impl Cache {
         n
     }
 
+    /// The live slot holding `(client, memory)` as `what`, if any (not marked used).
+    pub fn find(&self, client: u32, memory: u32, what: What) -> Option<Entry> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|e| e.key.client == client && e.key.memory == memory && e.key.what == what)
+            .copied()
+    }
+
     /// Whether a live slot holds `(client, memory)` (any kind, length or role).
     pub fn is_cached(&self, client: u32, memory: u32) -> bool {
         self.slots
@@ -454,6 +463,8 @@ mod tests {
         assert!(c.is_cached(0xc1d0_9d92, 0x5c00_0079));
         assert!(!c.is_cached(0xc1d0_9d92, 0x5c00_007a));
         assert!(!c.is_cached(0xc1d0_0001, 0x5c00_0079));
+        assert_eq!(c.find(0xc1d0_9d92, 0x5c00_0079, What::Source).map(|e| e.slot), Some(0));
+        assert_eq!(c.find(0xc1d0_9d92, 0x5c00_0079, What::Semaphore), None);
         for (i, m) in [0x5c00_007a, 0x5c00_007b, 0x5c00_007c].into_iter().enumerate() {
             let k = key(m, What::Source);
             let Plan::Make { slot, evict: None } = c.plan(&k) else { panic!() };
