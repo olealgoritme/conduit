@@ -11,6 +11,6 @@ D=${VMTEST_DIR:-$HOME/.cache/conduit-vmtest}
 OUT=$D/win/stages-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 conduit trace "$VM" stages --duration "$SECS" \
-    --guest-cmd "timeout 10 ssh -p 2222 $H 'reg query HKLM\\SYSTEM\\CurrentControlSet\\Services\\helios_kmd_render /v StgRing'" \
+    --guest-cmd "timeout 10 ssh -p 2222 \"$H\" 'reg query HKLM\\SYSTEM\\CurrentControlSet\\Services\\helios_kmd_render /v StgRing'" \
     --save "$OUT" --perfetto "$OUT/stages.json" | tee "$OUT/table.txt"
 echo "saved: $OUT (reanalyse: conduit trace stages $OUT; open stages.json in ui.perfetto.dev)"
