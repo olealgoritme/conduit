@@ -340,6 +340,13 @@ fn main() {
     c.ctx_attach(1, RES_REPLY).expect("attach reply blob");
     let reply = mmap(reply_blob.fd.as_raw_fd(), REPLY_SIZE).expect("mmap reply blob");
     let mut v = Venus { c, reply, fence: 0 };
+    // VENUS_STAGES=1: stage timing on for the run, and the ring fence's
+    // stamps printed after it signals (docs/TRACING.md "Frame stage timing");
+    // VENUS_STAGES_ALL=1 prints every stamp of the run.
+    let stages = std::env::var_os("VENUS_STAGES").is_some();
+    if stages {
+        v.c.stages(true).expect("stages on (renderer without FEATURE_STAGE_TRACE?)");
+    }
 
     // vkCreateInstance(apiVersion 1.3)
     let mut e = Enc::default();
@@ -646,6 +653,32 @@ fn main() {
         if ring_ok { "signalled" } else { "NOT signalled" },
         t.elapsed()
     );
+    if stages {
+        // The sync thread reports the GPU duration right after the fence.
+        std::thread::sleep(Duration::from_millis(50));
+        let all = std::env::var_os("VENUS_STAGES_ALL").is_some();
+        let mut recs: Vec<_> =
+            v.c.stages(false)
+                .expect("stages")
+                .into_iter()
+                .filter(|r| all || (r.ring == QUEUE_RING as u8 && r.id == ring_fence))
+                .collect();
+        recs.sort_by_key(|r| r.ts_ns);
+        let t0 = recs.first().map_or(0, |r| r.ts_ns);
+        for r in &recs {
+            let extra =
+                if r.stage == conduit_venus::stage::V_GPU { format!(" (gpu {} ns)", r.aux) } else { String::new() };
+            println!(
+                "  stage {:>3} {:<18} +{:>8.1} us ctx {} ring {} id {}{extra}",
+                r.stage,
+                conduit_venus::stage::name(r.stage),
+                (r.ts_ns - t0) as f64 / 1e3,
+                r.ctx,
+                r.ring,
+                r.id
+            );
+        }
+    }
 
     // And the Vulkan way: vkWaitForFences (synchronous in the renderer).
     let mut e = Enc::default();

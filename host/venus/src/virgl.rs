@@ -15,6 +15,7 @@
 //! thread never has to poll virglrenderer for fences.
 
 use crate::latency;
+use crate::stage::{self, Rec};
 use crate::{
     Blob, CAPSET_VENUS, CapsetInfo, DRM_FORMAT_MOD_LINEAR, Dmabuf, Error, Renderer, Result, ScanoutLayout, Signalled,
 };
@@ -189,6 +190,9 @@ extern "C" fn write_fence(_cookie: *mut c_void, _fence: u32) {
 extern "C" fn write_context_fence(_cookie: *mut c_void, ctx_id: u32, ring_idx: u32, fence_id: u64) {
     // Runs on a virglrenderer thread: no panics across the FFI boundary, so a
     // poisoned lock is used as is.
+    if stage::on() {
+        stage::stamp(Rec::fence(stage::R_SIGNAL, ctx_id, ring_idx, fence_id, stage::now_ns()));
+    }
     FENCES.lock().unwrap_or_else(|p| p.into_inner()).push(Signalled { ctx_id, ring_idx, fence_id });
     fence_latency((ctx_id, ring_idx, fence_id));
     let fd = EVENT.load(Ordering::Acquire);
@@ -198,6 +202,55 @@ extern "C" fn write_context_fence(_cookie: *mut c_void, ctx_id: u32, ring_idx: u
         // until after virgl_renderer_cleanup has joined the sync threads.
         unsafe { libc::write(fd, (&one as *const u64).cast(), 8) };
     }
+}
+
+/// The proxy's seqno of each pending ring fence -> the guest's fence id,
+/// keyed `(ctx_id, ring_idx, seqno)`: vkr reports fences by the seqno the
+/// proxy gave them (patches/0003-vkr-stage-timing.patch).
+type SeqnoMap = std::collections::HashMap<(u32, u32, u32), u64>;
+static SEQNOS: Mutex<Option<SeqnoMap>> = Mutex::new(None);
+
+/// vkr's and the proxy's stage reports, on the serving, render server and
+/// sync threads: translated to the guest's fence id, then into the ring.
+extern "C" fn vkr_stage(stage: u32, ctx_id: u32, ring_idx: u32, fence_id: u64, ts_ns: u64, aux: u64) {
+    let mut seqnos = SEQNOS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = seqnos.get_or_insert_with(Default::default);
+    if stage == u32::from(stage::V_SEQNO) {
+        // Ring 0 is retired on the CPU timeline: vkr reports nothing for it.
+        if ring_idx != 0 {
+            if map.len() >= 1 << 16 {
+                map.clear(); // fences that never retired (a lost context)
+            }
+            map.insert((ctx_id, ring_idx, aux as u32), fence_id);
+        }
+        return;
+    }
+    let key = (ctx_id, ring_idx, fence_id as u32);
+    let Some(&guest_id) = map.get(&key) else { return };
+    if stage == u32::from(stage::V_FENCE_DONE) {
+        map.remove(&key);
+    }
+    drop(seqnos);
+    stage::stamp(Rec { aux, ..Rec::fence(stage as u8, ctx_id, ring_idx, guest_id, ts_ns) });
+}
+
+type StageHookFn = Option<extern "C" fn(u32, u32, u32, u64, u64, u64)>;
+
+/// Hand vkr the stage hook, or take it back. Looked up at run time so a
+/// virglrenderer without the 0003 patch still loads (and stamps no vkr
+/// stages). Returns whether vkr has the hook.
+fn vkr_stage_hook(on: bool) -> bool {
+    // SAFETY: a lookup in the already loaded objects; the symbol, when there,
+    // has the signature of virglrenderer.h's virgl_renderer_conduit_stage_hook.
+    unsafe {
+        let f = libc::dlsym(libc::RTLD_DEFAULT, c"virgl_renderer_conduit_stage_hook".as_ptr());
+        if f.is_null() {
+            return false;
+        }
+        let set: extern "C" fn(StageHookFn) = std::mem::transmute(f);
+        set(if on { Some(vkr_stage) } else { None });
+    }
+    true
 }
 
 static CALLBACKS: ffi::Callbacks = ffi::Callbacks {
@@ -227,6 +280,9 @@ pub struct Virgl {
     guest: std::collections::HashMap<u32, crate::guest_pages::Span>,
     /// Whether every host Vulkan device imports host pointers; asked once.
     host_ptr: Option<bool>,
+    /// Stage timing: per context, when its last `SUBMIT` came in and when
+    /// `virgl_renderer_submit_cmd` returned, until a fence names them.
+    stage_submits: std::collections::HashMap<u32, (u64, u64)>,
 }
 
 impl Virgl {
@@ -262,7 +318,11 @@ impl Virgl {
             INITIALIZED.store(false, Ordering::Release);
             return Err(Error::Io(io::Error::from_raw_os_error(ret.abs())));
         }
-        let me = Self { event, arena: None, guest: Default::default(), host_ptr: None };
+        let me =
+            Self { event, arena: None, guest: Default::default(), host_ptr: None, stage_submits: Default::default() };
+        if stage::on() && !vkr_stage_hook(true) {
+            eprintln!("conduit-venus: stage timing: this virglrenderer has no stage hook; no vkr stages");
+        }
         // Venus registers its capset only when the render server came up and
         // found a Vulkan driver; without it every context would be refused.
         if me.venus_caps().1 == 0 {
@@ -379,13 +439,18 @@ impl Renderer for Virgl {
         }
         // Copied into u64s: virglrenderer wants 4-byte alignment and copies
         // again internally below 8, and IPC hands us an unaligned slice.
+        let t0 = if stage::on() { stage::now_ns() } else { 0 };
         let mut buf = vec![0u64; commands.len().div_ceil(8)];
         // SAFETY: buf has at least commands.len() bytes.
         unsafe { std::ptr::copy_nonoverlapping(commands.as_ptr(), buf.as_mut_ptr().cast::<u8>(), commands.len()) };
         // SAFETY: buf is aligned and ndw words long; virglrenderer only reads.
-        check(unsafe {
+        let r = check(unsafe {
             ffi::virgl_renderer_submit_cmd(buf.as_mut_ptr().cast(), ctx_id as c_int, (commands.len() / 4) as c_int)
-        })
+        });
+        if t0 != 0 {
+            self.stage_submits.insert(ctx_id, (t0, stage::now_ns()));
+        }
+        r
     }
 
     fn create_blob(&mut self, ctx_id: u32, res_id: u32, blob_id: u64, size: u64, flags: u32) -> Result<Blob> {
@@ -442,6 +507,14 @@ impl Renderer for Virgl {
             .unwrap_or_else(|p| p.into_inner())
             .get_or_insert_with(Default::default)
             .insert((ctx_id, ring_idx, fence_id), std::time::Instant::now());
+        if stage::on() {
+            let now = stage::now_ns();
+            if let Some((recv, done)) = self.stage_submits.remove(&ctx_id) {
+                stage::stamp(Rec::fence(stage::R_RECV, ctx_id, ring_idx, fence_id, recv));
+                stage::stamp(Rec::fence(stage::R_SUBMITTED, ctx_id, ring_idx, fence_id, done));
+            }
+            stage::stamp(Rec::fence(stage::R_FENCE, ctx_id, ring_idx, fence_id, now));
+        }
         // SAFETY: plain values.
         check(unsafe { ffi::virgl_renderer_context_create_fence(ctx_id, 0, ring_idx, fence_id) })
     }
@@ -479,7 +552,30 @@ impl Renderer for Virgl {
             );
             yes
         });
-        crate::FEATURE_IMPORT_DMABUF | if host_ptr { crate::FEATURE_IMPORT_GUEST_PAGES } else { 0 }
+        crate::FEATURE_IMPORT_DMABUF
+            | crate::FEATURE_STAGE_TRACE
+            | if host_ptr { crate::FEATURE_IMPORT_GUEST_PAGES } else { 0 }
+    }
+
+    fn stages(&mut self, on: bool) -> Result<Vec<Rec>> {
+        if on != stage::on() {
+            stage::set_on(on);
+            let hooked = vkr_stage_hook(on);
+            eprintln!(
+                "conduit-venus: stage timing {}{}",
+                if on { "on" } else { "off" },
+                if on && !hooked { " (this virglrenderer has no stage hook: no vkr stages)" } else { "" }
+            );
+            if !on {
+                self.stage_submits.clear();
+                *SEQNOS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+        }
+        let (recs, lost) = stage::take();
+        if lost > 0 {
+            eprintln!("conduit-venus: stage timing: {lost} stamp(s) lost (ring full)");
+        }
+        Ok(recs)
     }
 
     /// The runs mapped as one span of the guest-page arena, then
