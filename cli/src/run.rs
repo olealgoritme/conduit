@@ -298,10 +298,19 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
     Ok(())
 }
 
+/// `backend.latency fence-spin`: conduit-venus's fence threads poll for at
+/// most this long around a fence's expected completion
+/// (docs/research/host-roundtrip-latency.md, phase 3).
+const FENCE_SPIN_US: u32 = 150;
+
 /// `backend.latency` and `backend.cpus` as the backend's `--latency` and
 /// `--cpus` (docs/research/host-roundtrip-latency.md); nothing when unset.
 pub(crate) fn latency_args(cmd: &mut Command) {
-    let latency = crate::config::backend_latency();
+    // fence-spin is conduit-venus's alone (`venus_cmd`).
+    let latency: Vec<&str> = crate::config::backend_latency()
+        .into_iter()
+        .filter(|o| *o != "fence-spin")
+        .collect();
     if !latency.is_empty() {
         cmd.arg("--latency").arg(latency.join(","));
     }
@@ -323,8 +332,12 @@ pub(crate) fn venus_cmd(bin: &Path, sock: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("--socket").arg(sock);
     // `backend.latency` and `backend.cpus` (docs/research/host-roundtrip-latency.md).
-    if crate::config::backend_latency().contains(&"direct-fences") {
+    let latency = crate::config::backend_latency();
+    if latency.contains(&"direct-fences") {
         cmd.arg("--direct-fences");
+    }
+    if latency.contains(&"fence-spin") {
+        cmd.arg("--fence-spin-us").arg(FENCE_SPIN_US.to_string());
     }
     if let Some(cpus) = crate::config::backend_cpus() {
         cmd.arg("--cpus").arg(cpus);

@@ -11,7 +11,9 @@
 //! `--direct-fences` sends each signalled fence to the backend from the
 //! virglrenderer thread that retires it, instead of through the serve loop;
 //! `--cpus LIST` (e.g. `0-7,16-23`) keeps every thread of the process on
-//! those CPUs.
+//! those CPUs; `--fence-spin-us N` has vkr's fence threads poll for at most
+//! N us around a fence's expected completion instead of only sleeping in the
+//! driver's wait (patches/0004-vkr-queue-fence-spin.patch).
 
 use conduit_venus::ipc::{IpcServer, listen_accept_one};
 use conduit_venus::sandbox::{self, Sandbox};
@@ -20,7 +22,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: conduit-venus --socket PATH [--vm NAME] [--no-sandbox] [--direct-fences] [--cpus LIST]");
+    eprintln!(
+        "usage: conduit-venus --socket PATH [--vm NAME] [--no-sandbox] [--direct-fences] [--cpus LIST] [--fence-spin-us N]"
+    );
     eprintln!("       conduit-venus --sandbox-selftest [--vm NAME]");
     ExitCode::from(2)
 }
@@ -37,6 +41,7 @@ fn main() -> ExitCode {
     let mut selftest = false;
     let mut direct_fences = false;
     let mut cpus: Option<String> = None;
+    let mut fence_spin_us: Option<u32> = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         match a.to_str() {
@@ -46,6 +51,10 @@ fn main() -> ExitCode {
             Some("--sandbox-selftest") => selftest = true,
             Some("--direct-fences") => direct_fences = true,
             Some("--cpus") => cpus = args.next().and_then(|v| v.into_string().ok()),
+            Some("--fence-spin-us") => match args.next().and_then(|v| v.into_string().ok()?.parse().ok()) {
+                Some(n) if n <= 2000 => fence_spin_us = Some(n),
+                _ => return usage(),
+            },
             Some("-h" | "--help") => {
                 usage();
                 return ExitCode::SUCCESS;
@@ -69,6 +78,12 @@ fn main() -> ExitCode {
             Ok(n) => eprintln!("conduit-venus: pinned to CPUs {list} ({n} CPUs)"),
             Err(e) => return fail(format_args!("--cpus {list}: {e}")),
         }
+    }
+
+    if let Some(n) = fence_spin_us {
+        // SAFETY: no other thread exists yet; virglrenderer reads it later.
+        unsafe { std::env::set_var("CONDUIT_VKR_FENCE_SPIN_US", n.to_string()) };
+        eprintln!("conduit-venus: fence spin {n} us");
     }
 
     let nofile = sandbox::raise_nofile();

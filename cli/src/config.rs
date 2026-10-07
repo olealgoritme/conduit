@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `view.close_stops_vm` | true, false | true: closing the window of a VM that `conduit view` started shuts it down. A VM started any other way (`conduit up`, virt-manager, virsh) always keeps running. |
 //! | `venus.guest_blobs` | true, false | false: the backend serves guest-memory blobs (docs/VENUS.md "Guest-memory blobs"), Venus copy destinations over the guest's own pages, for the Windows KMD's windowed Present. Opt-in while new. Applies when a VM's backend next starts. |
-//! | `backend.latency` | off, all, or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch | off: round-trip latency options for the backend and conduit-venus (docs/research/host-roundtrip-latency.md). Opt-in while measured. Applies when a VM's backend next starts. |
+//! | `backend.latency` | off, all, or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin | off: round-trip latency options for the backend and conduit-venus (docs/research/host-roundtrip-latency.md). Opt-in while measured. Applies when a VM's backend next starts. |
 //! | `backend.cpus` | a CPU list such as 0-7,16-23 | unset: the backend and conduit-venus run on any CPU; set: every thread of both stays on these (docs/HOST-TUNING.md). Applies when a VM's backend next starts. |
 //! | `gpu.window_mib` | auto, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 | auto: the host GPU's BAR1 (as Resizable BAR on bare metal), clamped to what the guest's 64-bit MMIO window holds, 4096 without a GPU. The shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
@@ -29,7 +29,7 @@ const KEYS: &[(&str, &[&str], &str)] = &[
     (
         "backend.latency",
         &["off", "all"],
-        "round-trip latency options for the backend and conduit-venus, from the next backend start (default off; also a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch)",
+        "round-trip latency options for the backend and conduit-venus, from the next backend start (default off; also a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin)",
     ),
     (
         "backend.cpus",
@@ -103,7 +103,7 @@ pub fn set(k: &str, v: &str) -> Result<()> {
                 values.join(", "),
                 match *name {
                     "gpu.vram_limit_mib" => ", or a number of MiB",
-                    "backend.latency" => ", or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch",
+                    "backend.latency" => ", or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin",
                     "backend.cpus" => "a CPU list such as 0-7,16-23",
                     _ => "",
                 }
@@ -170,6 +170,8 @@ pub fn venus_guest_blobs() -> bool {
 /// fixed order; `None` for a value that is not one.
 fn latency_list(v: &str) -> Option<Vec<&'static str>> {
     const ALL: [&str; 4] = ["quiet-held", "fused-submit", "direct-fences", "event-batch"];
+    // Named only: it spends CPU time polling.
+    const EXTRA: [&str; 1] = ["fence-spin"];
     match v {
         "off" => return Some(Vec::new()),
         "all" => return Some(ALL.to_vec()),
@@ -180,10 +182,20 @@ fn latency_list(v: &str) -> Option<Vec<&'static str>> {
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .collect();
-    if names.is_empty() || names.iter().any(|n| !ALL.contains(n)) {
+    if names.is_empty()
+        || names
+            .iter()
+            .any(|n| *n != "all" && !ALL.contains(n) && !EXTRA.contains(n))
+    {
         return None;
     }
-    Some(ALL.into_iter().filter(|a| names.contains(a)).collect())
+    let every = names.contains(&"all");
+    Some(
+        ALL.into_iter()
+            .filter(|a| every || names.contains(a))
+            .chain(EXTRA.into_iter().filter(|a| names.contains(a)))
+            .collect(),
+    )
 }
 
 /// A CPU list in the kernel's format (`0-7,16-23`).
@@ -311,6 +323,20 @@ mod tests {
                 vec!["quiet-held", "fused-submit", "direct-fences", "event-batch"],
             ),
             ("event-batch,quiet-held", vec!["quiet-held", "event-batch"]),
+            (
+                "all,fence-spin",
+                vec![
+                    "quiet-held",
+                    "fused-submit",
+                    "direct-fences",
+                    "event-batch",
+                    "fence-spin",
+                ],
+            ),
+            (
+                "fence-spin,direct-fences",
+                vec!["direct-fences", "fence-spin"],
+            ),
             ("fast", vec![]),
             ("quiet-held,fast", vec![]),
         ] {
