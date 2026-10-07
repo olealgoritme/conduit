@@ -193,6 +193,9 @@ pub(crate) struct AdapterKnobs {
     /// [`Self::flip_caps_x`] by [`Self::read`] (`helios_kmd_logic::independent_flip::advertise`),
     /// so the caps and segment writers need not know it; [`Self::indep_flip_mode`] is the census.
     pub indep_flip: u32,
+    /// `HwCursor` (default 1), raw (`helios_kmd_logic::hw_cursor::KNOB_*`). Whether the caps
+    /// report a pointer also depends on the host ([`crate::ddi::hw_cursor::advertised`]).
+    pub hw_cursor: u32,
     /// `CrossAdaptCaps` (default 0). Nonzero advertises
     /// `DXGK_VIDMMCAPS.CrossAdapterResource` (tier-1 cross-adapter copy support).
     /// The compile-time `DECLARE_CROSS_ADAPTER_RESOURCE` this used to be OR'd
@@ -256,6 +259,7 @@ impl AdapterKnobs {
         direct_flip: false,
         flip_caps_x: 0,
         indep_flip: 0,
+        hw_cursor: helios_kmd_logic::hw_cursor::KNOB_ON,
         cross_adapter: false,
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
@@ -298,6 +302,7 @@ impl AdapterKnobs {
             direct_flip: advertised.direct_flip,
             flip_caps_x: advertised.flip_caps_x,
             indep_flip,
+            hw_cursor: read_config_dword(knobs::HW_CURSOR, helios_kmd_logic::hw_cursor::KNOB_ON),
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),

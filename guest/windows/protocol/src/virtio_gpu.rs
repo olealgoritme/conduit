@@ -47,6 +47,15 @@ pub const VIRTIO_GPU_CMD_SUBMIT_3D: u32 = 0x0207;
 pub const VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB: u32 = 0x0208;
 pub const VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 
+/// Conduit extension, not virtio-gpu: the hardware cursor as a blob
+/// ([`HeliosSetCursorBlob`]). Outside every range the spec uses; a host without it answers
+/// `RESP_ERR_UNSPEC`. Sent only when the config has `NVGPU_CFG_VENUS_CURSOR`
+/// (`crate::features`). The host's definition is `host/backend/protocol/src/venus.rs`
+/// `CMD_SET_CURSOR_BLOB`; docs/SCANOUT.md "Hardware cursor, Windows guests".
+pub const HELIOS_CMD_SET_CURSOR_BLOB: u32 = 0x0380;
+/// [`HeliosSetCursorBlob::flags`]: shown. Clear (or resource 0): hidden.
+pub const HELIOS_CURSOR_BLOB_F_VISIBLE: u32 = 1 << 0;
+
 // ── Response types ────────────────────────────────────────────────────────
 pub const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 pub const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
@@ -332,6 +341,29 @@ pub struct VirtioGpuResourceFlush {
     pub padding: u32,
 }
 
+/// [`HELIOS_CMD_SET_CURSOR_BLOB`]: show `width` x `height` premultiplied ARGB pixels
+/// (`VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM`, at most 256 square, linear) of blob `resource_id`, from
+/// `offset` with `stride` bytes per row, as the host pointer's image with its hotspot at
+/// (`hot_x`, `hot_y`); or hide it. The host positions it; `x`, `y` are informational. 72 bytes,
+/// field for field the host's `SetCursorBlob`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosSetCursorBlob {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub scanout_id: u32,
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub stride: u32,
+    pub offset: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    pub x: i32,
+    pub y: i32,
+    pub flags: u32,
+}
+
 // Compile-time guarantees that the on-wire sizes are what the host expects.
 const _: () = {
     assert!(core::mem::size_of::<VirtioGpuCtrlHdr>() == 24);
@@ -345,6 +377,10 @@ const _: () = {
     assert!(core::mem::size_of::<VirtioGpuRespDisplayInfo>() == 24 + 16 * 24);
     assert!(core::mem::size_of::<VirtioGpuSetScanoutBlob>() == 96);
     assert!(core::mem::size_of::<VirtioGpuResourceFlush>() == 48);
+    assert!(core::mem::size_of::<HeliosSetCursorBlob>() == 72);
+    assert!(core::mem::offset_of!(HeliosSetCursorBlob, resource_id) == 28);
+    assert!(core::mem::offset_of!(HeliosSetCursorBlob, offset) == 48);
+    assert!(core::mem::offset_of!(HeliosSetCursorBlob, flags) == 68);
 };
 
 /// Pin every wire constant above to the `virtio-bindings` crate (generated from
