@@ -820,8 +820,10 @@ static const struct drm_mode_config_funcs nvgpu_kms_mode_funcs = {
  * metal. Without a page kind (no video memory), LINEAR alone.
  */
 static unsigned int nvgpu_kms_build_modifiers(struct nvgpu_kms *kms) {
-  const u32 *info = kms->dri->dev_info;
-  u32 kind = info[4], gen = info[5], sector = info[6];
+  const struct nvgpu_devinfo *info = &kms->dri->dev_info;
+  u32 kind = info->v[NVGPU_DI_GENERIC_PAGE_KIND];
+  u32 gen = info->v[NVGPU_DI_PAGE_KIND_GENERATION];
+  u32 sector = info->v[NVGPU_DI_SECTOR_LAYOUT];
   unsigned int n = 0;
   int h;
 
@@ -967,8 +969,10 @@ static int nvgpu_kms_init(struct nvgpu_dri_dev *dri, struct drm_device *drm) {
            "conduit-gpu: KMS head %ux%u@%u on %s, %d modifiers "
            "(kind %#x gen %u sector %u)%s\n",
            kms->width, kms->height, kms->refresh_mhz / 1000, dri->name,
-           kms->dri->dev_info[4] ? 7 : 1, kms->dri->dev_info[4],
-           kms->dri->dev_info[5], kms->dri->dev_info[6],
+           kms->dri->dev_info.v[NVGPU_DI_GENERIC_PAGE_KIND] ? 7 : 1,
+           kms->dri->dev_info.v[NVGPU_DI_GENERIC_PAGE_KIND],
+           kms->dri->dev_info.v[NVGPU_DI_PAGE_KIND_GENERATION],
+           kms->dri->dev_info.v[NVGPU_DI_SECTOR_LAYOUT],
            kms->has_cursor ? ", cursor plane" : "");
   return 0;
 }
