@@ -236,6 +236,8 @@ fn start_generation_mirrors() {
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();
+    // The `Dw*` block (DWM restart and a stale Explorer): zeroed, and the zero block written.
+    crate::ddi::dwm_restart::reset_for_start();
     // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
     // mirroring `FfKnob` first), as does the `Fk*` block.
     crate::virtio::foreign_flip::publish_counters();

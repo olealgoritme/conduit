@@ -6797,6 +6797,87 @@ impl VirtioGpu {
         self.complete_present_buffer_write(resource_id);
     }
 
+    /// Whether `try_begin_present_buffer_write` would acquire `resource_id` right now, changing
+    /// nothing (the census's view of "destination busy").
+    fn present_buffer_would_acquire(&self, resource_id: u32) -> bool {
+        self.present_buffer_syncs
+            .iter()
+            .find(|slot| slot.resource_id == resource_id)
+            .is_some_and(|slot| match slot.access {
+                PresentBufferAccess::ExternalReady => true,
+                PresentBufferAccess::Consumer(boundary) => self.scanout_boundary_ready(boundary),
+                PresentBufferAccess::Empty
+                | PresentBufferAccess::KmdWriter
+                | PresentBufferAccess::KmdCpuMirror
+                | PresentBufferAccess::Teardown => false,
+            })
+    }
+
+    /// What the present machinery holds now: present buffers by owner, stream slots, the windowed
+    /// Blt queue and why its head is not going out (`DwWbHead`, `DwWedge`: `docs/zero-copy-present.md`
+    /// "DWM restart and stale Explorer"). Read-only, one pass over small preallocated tables, under
+    /// the transport lock the caller holds. It exists to show what a dead DWM left pinned: a buffer
+    /// still claimed through a stream that no longer exists, slots waiting for a CTX_DESTROY that
+    /// never confirmed, a READY head that no wake will ever move.
+    pub fn dwm_census(&self) -> helios_kmd_logic::dwm_restart::Census {
+        use helios_kmd_logic::dwm_restart::{head_blocker, Census};
+        let mut census = Census::default();
+        for slot in self.present_buffer_syncs.iter() {
+            match slot.access {
+                PresentBufferAccess::Empty | PresentBufferAccess::Teardown => {}
+                PresentBufferAccess::ExternalReady => census.buffers_external += 1,
+                PresentBufferAccess::Consumer(boundary) => {
+                    census.buffers_consumer += 1;
+                    if !self.present_stream_boundary_live(boundary) {
+                        census.buffers_consumer_dead += 1;
+                    }
+                }
+                PresentBufferAccess::KmdWriter | PresentBufferAccess::KmdCpuMirror => {
+                    census.buffers_kmd += 1
+                }
+            }
+        }
+        for slot in self.present_streams.iter() {
+            if slot.live {
+                census.streams_live += 1;
+                if slot.closing {
+                    census.streams_closing += 1;
+                }
+            }
+        }
+        census.blt_pending = self.windowed_blt.pending.len() as u32;
+        census.blt_ready = self.windowed_blt.ready.len() as u32;
+        let head = self.windowed_blt.ready.front().copied();
+        let request = head.and_then(|token| {
+            self.windowed_blt
+                .pending
+                .iter()
+                .find(|request| request.token == token)
+        });
+        let entry = request.map(|request| (request.admitted, request.dispatched));
+        let (boundary_ready, boundary_live, destination_busy) = match request {
+            Some(request) => (
+                self.scanout_boundary_ready(request.stream_boundary),
+                self.scanout_bind_boundary_live(request.stream_boundary),
+                match request.destination {
+                    PresentDestinationDesc::StandardBuffer(destination) => {
+                        !self.present_buffer_would_acquire(destination.resource_id())
+                    }
+                    _ => false,
+                },
+            ),
+            None => (true, true, false),
+        };
+        census.head = Some(head_blocker(
+            head,
+            entry,
+            boundary_ready,
+            boundary_live,
+            destination_busy,
+        ));
+        census
+    }
+
     fn prepare_present_stream_tag(
         &self,
         owner: DeviceOwner,

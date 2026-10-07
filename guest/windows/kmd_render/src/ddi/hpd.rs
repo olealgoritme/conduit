@@ -221,8 +221,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         } else {
             None
         };
-        let mirror = (optional && super::escape::nvrm_publish_pending())
-            .then_some(NVRM_PUBLISH_RECHECK_100NS);
+        // The `Dw*` follow-up censuses after a device died ride the mirror's recheck.
+        let mirror = (optional
+            && (super::escape::nvrm_publish_pending() || super::dwm_restart::pending()))
+        .then_some(NVRM_PUBLISH_RECHECK_100NS);
         // While the heartbeat is meant to run the worker wakes 4 times a second even when idle,
         // to check it (`AdapterContext::vsync_watch`): an MMIO flip is woken by the heartbeat
         // alone, so a dead heartbeat and a sleeping worker would hold the flip for ever.
@@ -370,6 +372,9 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         super::escape::nvrm_publish_service(!crate::ddi::flip_announce::worker_idle(adapter));
         // The boot-loop breaker's marker, once the start has proved healthy (one load otherwise).
         crate::virtio::msi::service(false);
+        // The follow-up censuses after a device died (`Dw*`, about 2 s apart; one load when none
+        // is owed): a transient pin and a wedge look the same in the first one.
+        super::dwm_restart::service(adapter);
 
         // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
         // site that mirrors it; accumulation happens at DIRQL/DISPATCH with

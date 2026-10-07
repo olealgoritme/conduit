@@ -995,10 +995,15 @@ pub fn ctx_destroy_within(
                 })
                 .unwrap_or(0)
         });
+        crate::ddi::dwm_restart::note_streams_finalized(finalized);
         if finalized != 0 {
             crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
             adapter.signal_hpd();
         }
+    } else {
+        // The host did not confirm: the stream slots this context closed stay `closing`, and the
+        // consumer claims they carry stay pinned (nothing retries). `DwCtxFail`, and the census.
+        crate::ddi::dwm_restart::note_ctx_destroy_failed();
     }
     result
 }
@@ -1048,10 +1053,14 @@ pub fn destroy_contexts_for_owner(
                     })
                     .unwrap_or(0)
             });
+            crate::ddi::dwm_restart::note_streams_finalized(finalized);
             if finalized != 0 {
                 crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
                 adapter.signal_hpd();
             }
+        } else {
+            // As in `ctx_destroy_within`: unconfirmed, nothing retries.
+            crate::ddi::dwm_restart::note_ctx_destroy_failed();
         }
         destroyed += 1;
     }

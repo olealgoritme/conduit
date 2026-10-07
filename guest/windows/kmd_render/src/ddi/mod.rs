@@ -18,6 +18,7 @@ pub(crate) mod blt_async;
 pub(crate) mod create_allocation;
 pub(crate) mod device_lost;
 pub(crate) mod display;
+pub(crate) mod dwm_restart;
 mod escape;
 pub(crate) mod escape_wait;
 mod escape_foreign;
