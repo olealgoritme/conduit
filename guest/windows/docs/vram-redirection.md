@@ -599,6 +599,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiCls` | surface classes seen: destination bit 0 VRAM, 1 standard buffer, 2 unreachable; sources the same at bits 4-6 |
 | `GdiDstRes`, `GdiDstWH` | last destination's resource id and `w << 16 \| h` |
 | `GdiRkIn`, `GdiRgIn` | entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing |
+| `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, jobs claimed by context because the record was missing, the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
@@ -612,6 +613,16 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   `DXGK_RENDERKM_COMMAND` stream, no patch lists, the DMA buffer's GPU VA), not RenderKm; the KMD's
   RenderGdi was still the pass-through. Both entry points now share the translation (`render_km`,
   `render_gdi` -> `translate`), and `GdiRgIn`/`GdiRkIn`/`GdiCtxN`/`GdiCtxFl` show which one runs.
+* **G1 on hardware (357.1):** RenderGdi translated the buffers (`GdiCmdN` 64-128, `GdiOpN` 118-288,
+  `GdiBad` 0) but no command was executed, fallen back or dropped (`GdiBltN`, `GdiFillN`, `GdiFall`,
+  `GdiDrop` 0) and the desktop capture was black: the worker never ran a job, i.e. SubmitCommand admitted
+  none (fences then retire ungated, which matches the responsive DWM). Decode of that row: `GdiWhy` 6 =
+  a copy or fill touching a standard buffer (planned on the CPU); `GdiCls` 0x77 = destinations and
+  sources of all three classes (VRAM, standard buffer, unreachable); `RvWhy` 6 = `Extent` (a GDI texture
+  under 64 pixels on a side is refused by `rm_client::surface_layout` and stays a Venus image, so GDI
+  operations on it are dropped). Since 358.1 a submission on a GDI context reads the record at the KMD's
+  half and at 0, and without one claims the context's oldest unclaimed job; `GdiSubN`/`GdiPrvOk`/
+  `GdiCtxClm`/`GdiPrvSz` say which path admitted it.
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.

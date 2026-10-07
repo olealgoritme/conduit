@@ -72,6 +72,8 @@ pub(crate) struct Op {
 
 struct Job {
     id: u64,
+    /// The `hContext` RenderKm/RenderGdi ran on (SubmitCommand's by-context claim).
+    ctx: usize,
     /// `None` until SubmitCommand admits it.
     seq: Option<u64>,
     /// Taken by the worker while it executes (the entry stays, so a replay still waits).
@@ -158,8 +160,8 @@ pub(crate) fn seq_ready(seq: u64) -> bool {
 
 /// Insert a job (RenderKm, PASSIVE). Returns its id, or 0 when it could not be stored (the
 /// buffer then carries no job and its fence does not wait: its commands are dropped, counted).
-pub(crate) fn commit(ops: Vec<Op>) -> u64 {
-    let mut job = Job { id: 0, seq: None, ops, running: false };
+pub(crate) fn commit(ops: Vec<Op>, ctx: usize) -> u64 {
+    let mut job = Job { id: 0, ctx, seq: None, ops, running: false };
     let mut orphans: Vec<Job> = Vec::new();
     let id = {
         let mut t = TABLE.lock();
@@ -223,6 +225,39 @@ pub(crate) fn admit(adapter: &AdapterContext, id: u64) -> Option<u64> {
             Some(seq)
         }
         ga::Admit::NoWait => None,
+    }
+}
+
+/// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH): the context's oldest
+/// unclaimed job. dxgkrnl submits a context's DMA buffers in the order it rendered them, so this
+/// names the buffer being submitted; a preempted replay without its record would claim the next
+/// one instead (counted with the claims, `GdiCtxClm`). `None`: nothing unclaimed.
+pub(crate) fn oldest_unclaimed(ctx: usize) -> Option<u64> {
+    let t = TABLE.lock();
+    t.jobs.iter().filter(|j| j.ctx == ctx && j.seq.is_none()).map(|j| j.id).min()
+}
+
+/// DestroyContext: its unclaimed jobs can never be submitted (dropped, counted as orphans).
+pub(crate) fn forget_context(ctx: usize) {
+    let gone: Vec<Job> = {
+        let mut t = TABLE.lock();
+        let mut keep = Vec::new();
+        let mut gone = Vec::new();
+        if keep.try_reserve(t.jobs.len()).is_err() || gone.try_reserve(t.jobs.len()).is_err() {
+            return;
+        }
+        for j in core::mem::take(&mut t.jobs) {
+            if j.ctx == ctx && j.seq.is_none() {
+                gone.push(j);
+            } else {
+                keep.push(j);
+            }
+        }
+        t.jobs = keep;
+        gone
+    };
+    if !gone.is_empty() {
+        ORPH.fetch_add(gone.len() as u32, Ordering::Relaxed);
     }
 }
 

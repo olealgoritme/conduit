@@ -600,9 +600,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     }
 
     let args = unsafe { &mut *create_context };
-    // `GdiAccel` census: GDI contexts (`DXGK_CREATECONTEXTFLAGS.GdiContext`). An atomic add.
     // SAFETY: `Value` is the plain UINT view of the flags union.
-    crate::ddi::gdi_accel::note_create_context(unsafe { args.Flags.__bindgen_anon_1.Value });
+    let create_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     let ctx = Box::new(ContextContext {
         device: h_device as *mut DeviceContext,
         snap_resid: AtomicU32::new(0),
@@ -624,6 +623,9 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         flush_pending_flag: AtomicU32::new(0),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
+    // `GdiAccel`: GDI contexts are counted and remembered (their submissions name their job by
+    // context when the private record is missing). Atomics only.
+    crate::ddi::gdi_accel::note_create_context(create_flags, args.hContext as usize);
 
     // Use the paging aperture for DMA buffers. With the decorative GpuMmu model,
     // dxgkrnl's CDD context creates a privileged DMA pool with GPU-VA mapping
@@ -649,6 +651,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
+        crate::ddi::gdi_accel::forget_context(h_context as usize);
+        crate::ddi::gdi_exec::forget_context(h_context as usize);
         drop(unsafe { Box::from_raw(h_context as *mut ContextContext) });
     }
     STATUS_SUCCESS
