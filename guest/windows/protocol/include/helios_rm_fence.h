@@ -57,6 +57,88 @@ struct HeliosD3D12SubmitCmdV4 {
    struct HeliosRmFenceTail fence;
 };
 
+/* Fence tail v3 (protocol/src/rm_fence_v3.rs; guest/windows/docs/rm-copy-engine-present.md
+ * section 10): an OPTIONAL record behind a FENCE tail that lets the KMD copy the frame on its own
+ * copy-engine channel, acquiring the producer's semaphore on the GPU. Placement:
+ *   HERF: 0..32 HERF, 32..48 fence tail, 48..72 on-scanout slot ALL ZERO, 72..168 this record
+ *         (CommandLength = 168)
+ *   HEPR: 0..80 HEPR (reserved |= FLAG_RM_FENCE), 80..96 fence tail, 96..192 this record
+ * An older KMD ignores the record (the fence and the Venus copy work as before). Send it only
+ * with a FENCE tail; semaphore.value MUST equal rm_fence_value (the copy engine acquires on it).
+ * Handles are RM handles of the producer's own client (not backend handles). The source must be
+ * uncompressed, one plane, LINEAR or a GB20x block-linear modifier of its element size. */
+#define HELIOS_RM_FENCE_TAIL_V3_MAGIC 0x33464548u /* 'HEF3' */
+#define HELIOS_RM_FENCE_TAIL_V3_VERSION 3u
+#define HELIOS_RM_FENCE_TAIL_V3_BYTES 96u
+#define HELIOS_RM_FENCE_TAIL_V3_HERF_OFFSET 72u
+#define HELIOS_RM_FENCE_TAIL_V3_HEPR_OFFSET 96u
+#define HELIOS_RM_FENCE_TAIL_V3_FLAG_SEMAPHORE 0x1u /* version 3 needs both flags */
+#define HELIOS_RM_FENCE_TAIL_V3_FLAG_SOURCE 0x2u
+#define HELIOS_RM_COPY_SOURCE_FLAG_COMPRESSED 0x1u /* known; the copy-engine route refuses it */
+
+struct HeliosRmSemaphoreLoc {
+   uint32_t h_client;  /* the producer's RM client (NVK's device client) */
+   uint32_t h_memory;  /* hSemaphoreMem of the timeline's NV_SEMAPHORE_SURFACE */
+   uint64_t offset;    /* entry index * entry size; 8-aligned */
+   uint64_t value;     /* the value the frame's work releases; nonzero */
+};
+
+struct HeliosRmCopySource {
+   uint32_t h_client;  /* the producer's RM client */
+   uint32_t h_memory;  /* the presented image's RM memory */
+   uint64_t offset;    /* plane 0 offset in that memory */
+   uint64_t size;      /* bytes of the memory object */
+   uint64_t modifier;  /* DRM_FORMAT_MOD_LINEAR or the GB20x block-linear family | h (h <= 5) */
+   uint32_t pitch;     /* row pitch in bytes; block-linear: a multiple of 64 */
+   uint32_t width;     /* 1..16384 */
+   uint32_t height;    /* 1..16384 */
+   uint32_t fourcc;    /* DRM_FORMAT_*, one plane */
+   uint32_t flags;     /* HELIOS_RM_COPY_SOURCE_FLAG_* */
+   uint32_t reserved;  /* zero */
+};
+
+struct HeliosRmFenceTailV3 {
+   uint32_t magic;     /* HELIOS_RM_FENCE_TAIL_V3_MAGIC */
+   uint16_t version;   /* HELIOS_RM_FENCE_TAIL_V3_VERSION */
+   uint16_t flags;     /* SEMAPHORE | SOURCE */
+   uint32_t bytes;     /* HELIOS_RM_FENCE_TAIL_V3_BYTES */
+   uint32_t reserved;  /* zero */
+   struct HeliosRmSemaphoreLoc semaphore;
+   struct HeliosRmCopySource source;
+};
+
+#if defined(__cplusplus)
+static_assert(sizeof(HeliosRmSemaphoreLoc) == 24, "semaphore location");
+static_assert(offsetof(HeliosRmSemaphoreLoc, offset) == 8, "semaphore offset");
+static_assert(offsetof(HeliosRmSemaphoreLoc, value) == 16, "semaphore value");
+static_assert(sizeof(HeliosRmCopySource) == 56, "copy source");
+static_assert(offsetof(HeliosRmCopySource, offset) == 8, "source offset");
+static_assert(offsetof(HeliosRmCopySource, size) == 16, "source size");
+static_assert(offsetof(HeliosRmCopySource, modifier) == 24, "source modifier");
+static_assert(offsetof(HeliosRmCopySource, pitch) == 32, "source pitch");
+static_assert(offsetof(HeliosRmCopySource, fourcc) == 44, "source fourcc");
+static_assert(offsetof(HeliosRmCopySource, reserved) == 52, "source reserved");
+static_assert(sizeof(HeliosRmFenceTailV3) == 96, "fence tail v3");
+static_assert(offsetof(HeliosRmFenceTailV3, bytes) == 8, "v3 bytes");
+static_assert(offsetof(HeliosRmFenceTailV3, semaphore) == 16, "v3 semaphore");
+static_assert(offsetof(HeliosRmFenceTailV3, source) == 40, "v3 source");
+#else
+_Static_assert(sizeof(struct HeliosRmSemaphoreLoc) == 24, "semaphore location");
+_Static_assert(offsetof(struct HeliosRmSemaphoreLoc, offset) == 8, "semaphore offset");
+_Static_assert(offsetof(struct HeliosRmSemaphoreLoc, value) == 16, "semaphore value");
+_Static_assert(sizeof(struct HeliosRmCopySource) == 56, "copy source");
+_Static_assert(offsetof(struct HeliosRmCopySource, offset) == 8, "source offset");
+_Static_assert(offsetof(struct HeliosRmCopySource, size) == 16, "source size");
+_Static_assert(offsetof(struct HeliosRmCopySource, modifier) == 24, "source modifier");
+_Static_assert(offsetof(struct HeliosRmCopySource, pitch) == 32, "source pitch");
+_Static_assert(offsetof(struct HeliosRmCopySource, fourcc) == 44, "source fourcc");
+_Static_assert(offsetof(struct HeliosRmCopySource, reserved) == 52, "source reserved");
+_Static_assert(sizeof(struct HeliosRmFenceTailV3) == 96, "fence tail v3");
+_Static_assert(offsetof(struct HeliosRmFenceTailV3, bytes) == 8, "v3 bytes");
+_Static_assert(offsetof(struct HeliosRmFenceTailV3, semaphore) == 16, "v3 semaphore");
+_Static_assert(offsetof(struct HeliosRmFenceTailV3, source) == 40, "v3 source");
+#endif
+
 #if defined(__cplusplus)
 static_assert(sizeof(HeliosRmFenceTail) == 16, "fence tail");
 static_assert(sizeof(HeliosPresentRefreshCmdFence) == 48, "HERF fence");

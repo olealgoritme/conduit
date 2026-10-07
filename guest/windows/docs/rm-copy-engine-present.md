@@ -536,3 +536,97 @@ transfer.
   section 5 thresholds; unknowns 1-3 answered.
 - **M3**: KMD integration (pieces 3-7) behind `BltRmCe`, with the Venus GuestBlob copy as fallback, then the GuestBlob sign-off
   procedure of `kmd-handoff-2026-10.md` 4 repeated for this route.
+
+## 10. Fence tail v3: what NVK must fill
+
+Route (b) of 2.3, built in M3a: an optional 96-byte record behind the 16-byte fence tail. ABI and parser:
+`protocol/src/rm_fence_v3.rs`; C mirror: `protocol/include/helios_rm_fence.h` (pinned by a protocol test, compiled as C 64/32-bit
+and C++). Nothing existing changes size or meaning: the fence tail keeps its rules (`rm-fence-marker.md`), `rm_fence_value`
+in it stays diagnostic, and a KMD or producer that does not know the record works as before.
+
+### 10.1 Wire shape
+
+```text
+HERF, CommandLength = 168            HEPR, CommandLength = 192
+   0..32   HeliosPresentRefreshCmd      0..80   HeliosPresentRenderCmd (reserved |= FLAG_RM_FENCE)
+  32..48   HeliosRmFenceTail (FENCE)   80..96   HeliosRmFenceTail (FENCE)
+  48..72   on-scanout slot, ALL ZERO   96..192  HeliosRmFenceTailV3
+  72..168  HeliosRmFenceTailV3
+```
+
+| offset | field | type | rule |
+|---|---|---|---|
+| 0 | `magic` | u32 | `'HEF3'` (0x33464548); zero = no record |
+| 4 | `version` | u16 | 3; any other version is refused, never reinterpreted |
+| 6 | `flags` | u16 | `SEMAPHORE` (1) and `SOURCE` (2), both required |
+| 8 | `bytes` | u32 | at least 96 and inside the command (a later revision may be longer) |
+| 12 | `reserved` | u32 | zero |
+| 16 | `semaphore.h_client` | u32 | the producer's RM client; nonzero |
+| 20 | `semaphore.h_memory` | u32 | `hSemaphoreMem` of the timeline's `NV_SEMAPHORE_SURFACE`; nonzero |
+| 24 | `semaphore.offset` | u64 | byte offset of the 64-bit value; 8-aligned, no overflow |
+| 32 | `semaphore.value` | u64 | the value the frame's work releases; nonzero; must equal `rm_fence_value` |
+| 40 | `source.h_client` | u32 | the producer's RM client; nonzero |
+| 44 | `source.h_memory` | u32 | the presented image's RM memory; nonzero |
+| 48 | `source.offset` | u64 | plane 0 offset in that memory |
+| 56 | `source.size` | u64 | bytes of the memory object |
+| 64 | `source.modifier` | u64 | `DRM_FORMAT_MOD_LINEAR` or `gb20x_family(bpp) \| h`, `h <= 5` |
+| 72 | `source.pitch` | u32 | row pitch in bytes; at least the row, aligned, at most 1 MiB; block-linear: a multiple of 64 |
+| 76 | `source.width` | u32 | 1..16384 |
+| 80 | `source.height` | u32 | 1..16384 |
+| 84 | `source.fourcc` | u32 | a one-plane format of `share_format` |
+| 88 | `source.flags` | u32 | `COMPRESSED` (1) known (the route refuses it); other bits refused |
+| 92 | `source.reserved` | u32 | zero |
+
+`offset + pitch * rows <= size`, with `rows` the height rounded up to the block (`8 << h` rows) for block-linear, in checked
+arithmetic. Why a record and not a bumped `HERF`/`HEPR`: a bumped version would be ignored whole by an older KMD, losing the
+refresh arm and the fence (the reason `rm-fence-marker.md` gives for not bumping them). The on-scanout slot stays zero: an
+on-scanout frame is never copied, so the tag and the record never meet, and the zero slot parses as "no tag" in every KMD.
+
+### 10.2 Where NVK knows each value
+
+The values come from two places in NVK's present path (`patches-windows/0030`, with `helios_image_layout` of 0025/0041):
+
+| field | NVK source |
+|---|---|
+| `semaphore.h_client` | `dev->lib->root(dev->client)`: the client `rmfence_tl_locked` already passes to `SEMSURF_FENCE_CTX_CREATE` |
+| `semaphore.h_memory` | `nvkmd_rm_mem(rf->mem)->h_memory`: the `hSemaphoreMem` of `rmfence_init`'s surface |
+| `semaphore.offset` | `index * rf->entry_size_B`: `offset_B` of the queue's timeline in `rmfence_tl_locked` |
+| `semaphore.value` | `++tl->next_value` of `nvkmd_rm_rmfence_sync`, the same value `queue_rm_fence` returns as `*value` |
+| `source.h_client` | the same root client (the image is NVK's device memory) |
+| `source.h_memory` | `nvkmd_rm_mem(mem->mem)->h_memory` of the presented image's dedicated memory |
+| `source.offset` | `fl.offset` of `helios_image_layout` (`plane_offset_B + level offset_B`) |
+| `source.size` | `mem->mem->size_B` |
+| `source.modifier`, `pitch`, `width`, `height`, `fourcc` | `fl.modifier`, `fl.stride`, `fl.width`, `fl.height`, `fl.fourcc` of `helios_image_layout` |
+| `source.flags` | `COMPRESSED` when `image->is_compressed` (better: send no record then) |
+
+`helios_scanout_present_fenced` already computes all the source values for the scanout path. The windowed path does not:
+the UMD calls `nvk_present_fence` (`umd/src/bridge.rs`, DXVK bridge) -> `queue_rm_fence` (helios_icd_interface v3), which
+returns only `(handle, value)` and knows no image. The NVK session's work:
+1. A new appended `helios_icd_interface` entry (the next free version), for example
+   `queue_rm_fence_v3(VkDevice, VkQueue, VkDeviceMemory, VkImage, uint32_t *fence_handle, struct HeliosRmFenceTailV3 *out)`:
+   the fence as `queue_rm_fence` makes it, plus the record filled from the table above. `VK_ERROR_FORMAT_NOT_SUPPORTED` for a
+   source `helios_image_layout` refuses (the fence is still returned; the UMD then sends the 48-byte tail).
+2. The DXVK bridge passes the presented resource's memory and image (as `nvk_scanout_present_fenced` already does).
+3. The UMD (`umd/src/forward/present.rs`, `MarkerPresent`) writes the 168-byte `HERF` when the KMD advertises the route
+   (a new `QUERY_CAPS` bit in `supported_ops` bits 32..63, to be assigned in M3c), and the 48-byte one otherwise.
+
+### 10.3 The block-linear case (the measured one)
+
+Heaven's windowed source is block-linear: the UMD log shows `1600x900 stride=6400 offset=0 fourcc=0x34324241 (AB24)
+modifier=0x0300000000606014 size=6553600`. Decoded as `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c=0, s=1, g=2, k=0x06, h=4)`:
+blocks of 16 GOBs (128 rows), page kind 0x06 (generic), the GB20x GOB generation, sector layout 1, no compression. It is
+`MOD_NVIDIA_BL_GB20X | 4`, the family `helios_image_layout` emits, so the record carries it unchanged. The 6553600-byte
+object is exactly `6400 * 1024` (900 rows rounded up to 8 blocks); the copy reads 900 rows, 5760000 bytes. The protocol test
+`the_heaven_source_is_a_valid_record_with_the_documented_bytes` pins this record.
+
+**Open item: the mapping kind.** The KMD client dups `source.h_memory` and maps it in its own VA space. The copy engine
+de-swizzles a block-linear source according to the GOB layout, and the PTE kind of the mapping decides the physical
+swizzle within a GOB. A mapping with another kind (for example the pitch kind) reads scrambled pixels without any error.
+The kind is therefore part of the dup+map contract: the KMD maps with the kind the modifier names (`k = 0x06`), as NVK maps
+the image. Nothing checks this yet. Needed:
+- **M1b**: a round trip in `crm_ce_copy_smoke`: copy a pitch pattern into a block-linear destination and back through the
+  same mapping, then compare;
+- **M3c**: a check against a real NVK image (Heaven windowed, the pattern compared with the Venus copy of the same frame).
+
+The block-linear push-buffer words (`kmd_logic::ce_present`) are host-tested only; nothing claims block-linear works on
+hardware.
