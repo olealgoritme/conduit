@@ -1225,6 +1225,13 @@ pub mod knobs {
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.
     pub const SUBMIT_SPACE_WAKE: KnobName = KnobName::new(b"SubSpaceWake");
+    /// `SubmitPool` (default 1 = ON). The KMD display submitters (scan-out copy, Present Blt,
+    /// `BltAsync` direct, deferred windowed Blt) take their two staged DMA buffers (SUBMIT_3D
+    /// meta, Venus stream) from the transport's bounded DMA pool, in the same lock hold as the
+    /// reap, instead of two `MmAllocateContiguousMemory` calls per submit. A miss falls back to
+    /// a fresh allocation. 0 restores allocate-per-submit exactly: the same-boot A/B. Read at
+    /// every StartDevice, mirrored as `SubPoolOn`. `docs/zero-copy-present.md` 24.13.
+    pub const SUBMIT_POOL: KnobName = KnobName::new(b"SubmitPool");
     /// `WddmHoldMs` (default 0 = OFF, and OFF is the only shipping value).
     ///
     /// # THE KNOB IS THE EXPERIMENT (UV1, `docs/dx12/KMD_IMPACT.md` §14a.1)

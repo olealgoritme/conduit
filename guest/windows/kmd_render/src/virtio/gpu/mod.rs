@@ -2454,6 +2454,10 @@ pub struct VirtioGpu {
     /// existing virtio spinlock, but allocation/free never occurs there.
     dma_pool: Vec<DmaBuffer>,
     dma_pool_bytes: usize,
+    /// The display submitters' notify timer (`SubKick`, docs 24.13): armed by a display
+    /// submitter inside its own lock hold, recorded by [`Self::publish_then_notify`], taken in
+    /// the same hold. 16 bytes inline; every other enqueue pays one `armed` test.
+    kick_timer: helios_kmd_logic::submit_stage::KickTimer,
     /// The command buffers the DISPATCH-level fast bind may use (ROADMAP defect
     /// 0ab-C, D1(ii)), allocated at transport init and recycled by the drain
     /// forever after.
@@ -3114,6 +3118,7 @@ impl VirtioGpu {
             reap_in_progress: false,
             dma_pool: Vec::with_capacity(MAX_DMA_POOL),
             dma_pool_bytes: 0,
+            kick_timer: helios_kmd_logic::submit_stage::KickTimer::new(),
             bind_cmd_pool,
             fast_bind: allocate_fast_bind_state(),
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
@@ -3334,9 +3339,41 @@ impl VirtioGpu {
     fn publish_then_notify(&mut self, entry: InFlight) {
         self.inflight.push(entry);
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
+        // The notify timing (`SubKick`, docs 24.13) only for a display submitter that armed the
+        // timer in this same lock hold; atomics-free, two interrupt-time reads.
+        let timed = self.kick_timer.armed();
         if self.control.should_notify() {
+            let t0 = if timed { crate::virtio::submit_stage::now_100ns() } else { 0 };
             self.transport.notify(CTRL_QUEUE);
+            if timed {
+                let ticks = crate::virtio::submit_stage::now_100ns().saturating_sub(t0);
+                self.kick_timer.record(helios_kmd_logic::submit_stage::Kick {
+                    ticks: helios_kmd_logic::submit_stage::kick_ticks(ticks),
+                    notified: true,
+                });
+            }
+        } else if timed {
+            self.kick_timer.record(helios_kmd_logic::submit_stage::Kick {
+                ticks: 0,
+                notified: false,
+            });
         }
+    }
+
+    /// Arm the notify timer for the next publish (display submitters, docs 24.13).
+    pub(crate) fn arm_kick_timer(&mut self) {
+        self.kick_timer.arm();
+    }
+
+    /// What the armed publish recorded (None when nothing was published), and disarm.
+    pub(crate) fn take_kick_timer(&mut self) -> Option<helios_kmd_logic::submit_stage::Kick> {
+        self.kick_timer.take()
+    }
+
+    /// Whether the used ring holds a completion `drain_used` has not consumed yet (one
+    /// acquire load of the used index; the `SubDrainHit` evidence of docs 24.13).
+    pub(crate) fn used_pending(&self) -> bool {
+        !self.failed && self.control.can_pop()
     }
 
     pub fn enqueue_sync<F>(

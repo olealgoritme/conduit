@@ -69,12 +69,14 @@ use super::gpu::{
     FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
+use super::submit_stage;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::error::NotStarted;
 use crate::irql::PassiveLevel;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
+use helios_kmd_logic::submit_stage::{Clock, Path, Stage};
 use helios_kmd_logic::sweep_budget::SweepBudget;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
@@ -2447,19 +2449,77 @@ pub fn count_submit_escape() {
 /// Switching them onto `take_dma_buffer` is a perf change with its own gate and
 /// is explicitly out of scope here; what this commit buys is that the policy is
 /// now stated in one place instead of inferred from two.
+///
+/// Every stage is timed on `clock` (docs 24.13, `Sub*` counters): `Reap`, `Alloc`, `Copy`.
 fn stage_display_submit(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     stream: &[u8],
+    clock: &mut Clock,
 ) -> Result<(DmaBuffer, DmaBuffer, usize), VirtioError> {
     if stream.is_empty() || !stream_fits(stream) {
         return Err(VirtioError::DeviceError);
     }
     reap_parked(passive, adapter);
-    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = DmaBuffer::new(passive, stream.len()).ok_or(VirtioError::OutOfMemory)?;
+    submit_stage::lap(clock, Stage::Reap);
+    submit_stage::note_staging(2, 0);
+    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory);
+    let venus = meta
+        .as_ref()
+        .ok()
+        .and_then(|_| DmaBuffer::new(passive, stream.len()));
+    submit_stage::lap(clock, Stage::Alloc);
+    let meta = meta?;
+    let mut venus = venus.ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
+    submit_stage::lap(clock, Stage::Copy);
     Ok((meta, venus, stream.len()))
+}
+
+/// Run one display submitter under the stage clock and fold the clock into the `Sub*` totals,
+/// whatever the outcome (docs 24.13). Atomics only beyond what `f` does.
+fn measured<T>(
+    path: Path,
+    f: impl FnOnce(&mut Clock) -> Result<T, VirtioError>,
+) -> Result<T, VirtioError> {
+    let mut clock = submit_stage::start();
+    let result = f(&mut clock);
+    submit_stage::finish(path, &clock);
+    result
+}
+
+/// The display submitters' enqueue hold: `drain_used`, then `enqueue` (one attempt), each timed
+/// on `clock` (`Lock` from the call to the first instruction under the lock, `Drain`, `Enq`, and
+/// `Kick` carved out of `Enq` by the transport's notify timer armed for this hold only).
+///
+/// The drain stays unconditional. When the used ring is empty it is one acquire load
+/// (`peek_used`), so there is nothing to save; when it is not, what it consumes is exactly
+/// what the enqueue may depend on in the same hold: free descriptors (the display paths do not
+/// retry a QueueFull), and the destination ownership a retired Blt released (`BltEnq::Busy`
+/// otherwise) or the windowed-Blt FIFO state. `SubDrainHit` counts the second case; docs 24.13.
+fn display_enqueue<R>(
+    adapter: &AdapterContext,
+    clock: &mut Clock,
+    enqueue: impl FnOnce(&mut super::gpu::VirtioGpu) -> R,
+) -> Result<R, NotStarted> {
+    adapter.with_virtio(move |v| {
+        submit_stage::lap(clock, Stage::Lock);
+        if v.used_pending() {
+            submit_stage::note_drain_hit();
+        }
+        v.drain_used();
+        submit_stage::lap(clock, Stage::Drain);
+        v.arm_kick_timer();
+        let result = enqueue(v);
+        submit_stage::lap(clock, Stage::Enq);
+        if let Some(kick) = v.take_kick_timer() {
+            clock.carve(Stage::Enq, Stage::Kick, u64::from(kick.ticks));
+            if !kick.notified {
+                submit_stage::note_no_kick();
+            }
+        }
+        result
+    })
 }
 
 /// The outcome mapping both display submitters share: a transport-gone outer
@@ -2497,16 +2557,17 @@ pub fn submit_venus_async_scanout(
     ticket: crate::adapter::ProgrammingTicket,
     keep_on_failure: bool,
 ) -> Result<u64, VirtioError> {
-    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
-    // One construction site, on the adapter, so all four pointers necessarily
-    // come from the same adapter; and `enqueue_scanout_submit` is the only way
-    // to attach it, so it necessarily lands on the ring the drain honours.
-    let notify = adapter.scanout_notify(primary_address, ticket, keep_on_failure);
+    measured(Path::Scanout, |clock| {
+        let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
+        // One construction site, on the adapter, so all four pointers necessarily
+        // come from the same adapter; and `enqueue_scanout_submit` is the only way
+        // to attach it, so it necessarily lands on the ring the drain honours.
+        let notify = adapter.scanout_notify(primary_address, ticket, keep_on_failure);
 
-    display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used();
-        v.enqueue_scanout_submit(ctx_id, meta, venus, venus_len, notify)
-    }))
+        display_submit_outcome(display_enqueue(adapter, clock, move |v| {
+            v.enqueue_scanout_submit(ctx_id, meta, venus, venus_len, notify)
+        }))
+    })
 }
 
 /// Nonblocking KMD Present-BLT submission.
@@ -2524,32 +2585,33 @@ pub fn submit_venus_async_present(
     stream: &[u8],
     present_buffer_write: Option<u32>,
 ) -> Result<u64, VirtioError> {
-    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
+    measured(Path::Present, |clock| {
+        let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
 
-    // Ring 1 WITHOUT a notify, which is the whole difference from the scanout
-    // path above: used-ring retirement still represents GPU completion, but an
-    // ordinary app/DWM BLT must not mark the physical scanout dirty or wake the
-    // display refresh worker.
-    display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used();
-        match present_buffer_write {
-            Some(resource_id) => v.enqueue_async_submit_present_buffer(
-                ctx_id,
-                crate::virtio::gpu::SCANOUT_RING_IDX,
-                meta,
-                venus,
-                venus_len,
-                resource_id,
-            ),
-            None => v.enqueue_async_submit(
-                ctx_id,
-                crate::virtio::gpu::SCANOUT_RING_IDX,
-                meta,
-                venus,
-                venus_len,
-            ),
-        }
-    }))
+        // Ring 1 WITHOUT a notify, which is the whole difference from the scanout
+        // path above: used-ring retirement still represents GPU completion, but an
+        // ordinary app/DWM BLT must not mark the physical scanout dirty or wake the
+        // display refresh worker.
+        display_submit_outcome(display_enqueue(adapter, clock, move |v| {
+            match present_buffer_write {
+                Some(resource_id) => v.enqueue_async_submit_present_buffer(
+                    ctx_id,
+                    crate::virtio::gpu::SCANOUT_RING_IDX,
+                    meta,
+                    venus,
+                    venus_len,
+                    resource_id,
+                ),
+                None => v.enqueue_async_submit(
+                    ctx_id,
+                    crate::virtio::gpu::SCANOUT_RING_IDX,
+                    meta,
+                    venus,
+                    venus_len,
+                ),
+            }
+        }))
+    })
 }
 
 /// The outcome of [`submit_venus_async_blt`].
@@ -2577,18 +2639,27 @@ pub fn submit_venus_async_blt(
     resource_id: u32,
     source_id: u32,
 ) -> Result<BltSubmit, VirtioError> {
-    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
-    let queued = adapter.with_virtio(move |v| {
-        v.drain_used();
-        v.enqueue_async_submit_blt(adapter, ctx_id, meta, venus, venus_len, resource_id, source_id)
-    });
-    match queued {
-        Ok(Ok(crate::virtio::gpu::BltEnq::Fence(fence_id))) => Ok(BltSubmit::Fence(fence_id)),
-        // The staged buffers are dropped here, at PASSIVE.
-        Ok(Ok(crate::virtio::gpu::BltEnq::Busy(_meta, _venus))) => Ok(BltSubmit::DstBusy),
-        Ok(Err((_meta, _venus, e))) => Err(e),
-        Err(_) => Err(VirtioError::DeviceError),
-    }
+    measured(Path::Blt, |clock| {
+        let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
+        let queued = display_enqueue(adapter, clock, move |v| {
+            v.enqueue_async_submit_blt(
+                adapter,
+                ctx_id,
+                meta,
+                venus,
+                venus_len,
+                resource_id,
+                source_id,
+            )
+        });
+        match queued {
+            Ok(Ok(crate::virtio::gpu::BltEnq::Fence(fence_id))) => Ok(BltSubmit::Fence(fence_id)),
+            // The staged buffers are dropped here, at PASSIVE.
+            Ok(Ok(crate::virtio::gpu::BltEnq::Busy(_meta, _venus))) => Ok(BltSubmit::DstBusy),
+            Ok(Err((_meta, _venus, e))) => Err(e),
+            Err(_) => Err(VirtioError::DeviceError),
+        }
+    })
 }
 
 /// Legacy inline Present cannot leave the callback and retry asynchronously.
@@ -2661,19 +2732,20 @@ pub fn submit_venus_async_windowed_blt(
     token: u64,
     stream_boundary: u64,
 ) -> Result<u64, VirtioError> {
-    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
-    display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used();
-        v.enqueue_async_submit_windowed_blt(
-            adapter,
-            ctx_id,
-            meta,
-            venus,
-            venus_len,
-            token,
-            stream_boundary,
-        )
-    }))
+    measured(Path::Windowed, |clock| {
+        let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
+        display_submit_outcome(display_enqueue(adapter, clock, move |v| {
+            v.enqueue_async_submit_windowed_blt(
+                adapter,
+                ctx_id,
+                meta,
+                venus,
+                venus_len,
+                token,
+                stream_boundary,
+            )
+        }))
+    })
 }
 
 /// Outcome of a [`wait_fence`] call.
