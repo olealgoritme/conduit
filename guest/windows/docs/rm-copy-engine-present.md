@@ -1,6 +1,8 @@
 # The windowed Present copy on an RM copy-engine channel: feasibility findings
 
-Status: M0 (this document). Research only: no code exists for any part of this. Every claim cites the file or patch it comes
+Status: sections 0 to 9 are the research (M0) and the M1 tool, which PASSed on a GB202 (async CE, acquire held, verify ok).
+M3a, the host-testable half of the KMD route, is
+sections 10 and 11 (`protocol/src/rm_fence_v3.rs`, `kmd_logic/src/ce_present.rs`); no `kmd_render` code exists yet. Every claim cites the file or patch it comes
 from; "unknown" marks what nobody has run, with what would settle it. Host driver release assumed: 610.57.04 (the release
 the host backend runs, `host/backend/gen/src/rmallow/v610_57_04.rs`). GPU: RTX 5090 (GB202) unless Ada is named.
 
@@ -630,3 +632,171 @@ the image. Nothing checks this yet. Needed:
 
 The block-linear push-buffer words (`kmd_logic::ce_present`) are host-tested only; nothing claims block-linear works on
 hardware.
+
+## 11. KMD integration points
+
+M3a built the pure half: the record (10), and `kmd_logic/src/ce_present.rs` with the push-buffer builder (its pitch-linear
+words reproduce `crm_ce_copy_smoke`'s, its block-linear words follow NVK's `nouveau_copy_rect`), the GPFIFO entry and ring
+arithmetic, `source_plan` (the foreign layout rules of `foreign_resource::Layout`, the page kind to map with), the
+per-destination `Route` (decision order, strikes, poison, timeout), the retire rule, the knob `RmCopyEngine` (default 0) and the
+`Ce*` counter names. This section is the plan for the I/O half. Nothing in `kmd_render` exists yet; line numbers are of v343.
+
+### 11.1 Where the route decision plugs in
+
+The Present Blt arm (`ddi/display.rs`) today runs, for a foreign (NVK) source into a standard-buffer destination:
+`guest_blob::prepare` (817-834) -> `blt_async::entry` (838-849) -> `blt_async::try_async` (945-957; `ddi/blt_async.rs`
+507-560, which reads `blt_async_facts` of `virtio/gpu/blt_async.rs` 75-94 and takes DIRECT, DEFERRED or the legacy arm).
+
+The copy-engine route goes FIRST inside the `entry.async_enter` branch, before `try_async`:
+1. `ddi/ce_present.rs::try_ce(passive, adapter, args, source, destination, present_stream_boundary, record)` gathers
+   `ce_present::Facts`: the knob, the channel's state, the stashed record of this context (below), `source_plan` of the
+   record's source, `Route::admits` of the destination, the destination's coverage, ring room.
+2. `ce_present::decide` -> `CopyEngine`: build `present_push` into the slot, `Ring::submit`, `kick` (the entry, `GP_PUT`, the
+   doorbell), merge the copy-engine boundary (11.5) into the private record, `present_complete` as the DIRECT arm does.
+3. `Venus { why, after }`: count `CeFallback`/`CeWhy`/`CeMask`; with `after = Some(v)` the boundary of the Venus copy must
+   include "completion >= v" (merged into the private record like a second boundary, or the DEFERRED arm with that
+   boundary), so a Venus frame is never overwritten by an older copy-engine frame. Then `try_async` runs unchanged.
+
+Where the record comes from: `DxgkDdiRender` (`ddi/submit_command.rs`) already reads the fence tail of `HERF` (2275-2288)
+and `HEPR` (2470-2485) and stashes the on-scanout tag per context (`ddi/onscanout.rs::note_render` 88-122). The record is
+parsed there too (`HeliosRmFenceTailV3::parse` at offset 72 / 96, `matches_fence` against the tail just read, the
+`h_client`s checked with `ClientTable::is_client_owned_by` for the NVRM devices of the context's `creator_process`), and
+stashed on the context beside the on-scanout tag with the same pairing and orphan rule. The fence keeps its own path
+(`attach_rm_fence_marker`, the RM gate); the record never changes what happens to the fence. The DEFERRED arm's worker
+(`service_windowed_blt`, `ddi/display.rs` 1880) is not involved: the copy-engine route has no worker hop at all.
+
+### 11.2 The channel subsystem in the KMD's RM client
+
+The KMD's client (`virtio/rm_client.rs`, the step machine `perform` 782-846, `Io::rm_alloc` 758, the map steps
+`rm_map_memory` 1163, `host_mmap` 1212, `kernel_map` 1249) grows, at a level of its own (`RmCopyEngine` 1 implies it):
+
+| object | how | reference |
+|---|---|---|
+| device | the existing one; whether it needs `vaMode = OPTIONAL_MULTIPLE_VASPACES` is unverified (6, unknown 3); if so, a second device of the same client for the channel | `crm_ce_copy_smoke` copier |
+| VA space | `FERMI_VASPACE_A` `index = GPU_DEVICE` | tool, nvk-rm 0008 |
+| engine | `GPU_GET_ENGINES_V2` + `CE_GET_CAPS_V2`: the first async CE with `SYSMEM_WRITE`, preferring one without `SHARED` (7.2) | tool |
+| TSG, subcontext, channel, BIND, CE object, token, schedule | 1.1 with `engineType = COPY(n)`, 64 or 128 entries | tool `chan_create` |
+| USERD + error notifier | 8 KiB `NV01_MEMORY_SYSTEM` (`sysmem.rs` `alloc_sys` 715), CPU-mapped through the RM window (`rm_map_memory` -> `host_mmap` -> `kernel_map`) | `sysmem.rs`, `rm_client.rs` 1163-1284 |
+| GPFIFO + push slots | 128 KiB: KMD nonpaged pages as an OS descriptor (the page-run block of `kmd_logic/src/page_runs.rs`, as `virtio/nvrm.rs` 793 `pin_pages` builds it for user mode), or RM sysmem through the window; GPU-mapped snooped below 2^40 | tool `osdesc_alloc` |
+| doorbell | `*_USERMODE_A` under the subdevice (`{bBar1Mapping = 1, bPriv = 0}` from 0xc661 up), 64 KiB, mapped through the subdevice into window region 1 (`kmd_logic/src/rm_window.rs`) | `crm_smoke.c` 164-191 |
+| completion | 4 KiB RM sysmem, CPU-mapped (window) and GPU-mapped; one value per channel, `Ring::submitted` | tool `done` |
+| completion event | option B of 4.3: `NV01_EVENT_OS_EVENT` with `SET_NOTIFICATION` REPEAT; which notifier index a CE channel's `NON_STALL_INTERRUPT` raises is unverified (the tool measured only option A) | 4.3 |
+
+The first push is `SET_OBJECT` + a release (`ce_present` test `the_first_push_reproduces_the_tool_words`); the channel is
+"alive" when that value lands and the error notifier is 0. Teardown in the tool's order: schedule off, free the TSG (the
+channel and the CE object with it), then unmap and free the memory, the doorbell, the VA space. Device loss and StopDevice
+follow the RM client's existing `retire_begin` / `forget` (`rm_client.rs` 468-497): a lost transport frees nothing on the
+host (the backend frees with the client), and every destination with copies outstanding is poisoned (`on_channel_failed`).
+
+Per source and per producer semaphore (keyed by `(h_client, h_memory)`): `NV_ESC_RM_DUP_OBJECT` into the KMD client, then
+`NV50_MEMORY_VIRTUAL` + `MAP_MEMORY_DMA`. The semaphore: 4 KiB, `PAGE_SIZE_4KB | CACHE_SNOOP_ENABLE`. The source: the page
+kind of `SourcePlan::page_kind` (0x06 for block-linear; 10.3), the image's own page size. A small cache (8 sources and 4
+timelines per process, LRU) because a swapchain rotates two or three images; entries are freed when the NVRM client that
+owns the original is freed (`nvrm_clients::ClientTable::forget_client`) or the process ends, since a dup keeps the memory
+alive on the host past the app's own free.
+
+### 11.3 The destination: the GuestBlob lease and pin lifecycle
+
+A destination is a KMD standard Present buffer whose system pages VidMm holds under `MmProbeAndLockPages` leases
+(`adapter.system_backings`, `adapter/backing.rs` `guest_record` 451). The copy-engine route reuses that lifecycle
+(`zero-copy-present.md` 24.12) one to one:
+- **Create, lazily, on the first covered Blt**: when `guest_blob::build_runs` says the leases cover `[0, pitch * height)`, the
+  KMD registers the same pages with its RM client as an `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` (`PAGE_RUNS_INDIRECT` for many
+  runs, `osdesc.rs` limits) and GPU-maps it snooped. The record lives beside the guest-blob record (one more state in the same
+  entry) so the eviction and destroy paths find both.
+- **Pin**: the leases stay held while the descriptor exists (exactly the guest blob's rule).
+- **Retire** (eviction in `BuildPagingBuffer`, destroy, StopDevice): (1) stop new copies (the record leaves `Ready`);
+  (2) wait, bounded by the guest blob's 250 ms per phase, until the completion value reaches `Route::submitted`
+  (`Route::teardown` -> `WaitFor`); (3) `RM_FREE` the mapping and the descriptor (the host unmaps its stitched alias);
+  (4) the guest-blob retire, then the unlock. `Teardown::Leak` (a poisoned destination whose copy never completed) keeps the
+  pages pinned for good, counted `CeLeak`, as `GbLeak` does.
+- A destination with both a guest blob and a descriptor has two host aliases of the same pages; both are snooped, so the
+  Venus fallback and the copy engine see the same memory. The `after` bound of 11.1 orders them.
+
+### 11.4 Submission at Present (PASSIVE)
+
+Per frame, no RM call: write about 34 dwords into the slot (KMD nonpaged memory), the 8-byte entry, `GP_PUT` (one store into
+the window-mapped USERD), the token (one store into the window-mapped doorbell). The source and semaphore mappings and the
+destination descriptor are made on first use (forwarded RM calls, about 55 us each, PASSIVE, outside every lock, under the
+RM client's own serialization as `sysmem.rs` does); a frame that would need one takes the Venus copy while it is made.
+
+### 11.5 Completion into the Present's DMA fence
+
+The copy-engine boundary uses the existing tagged stream namespace, as the RM gates do (`rm-fence-marker.md`,
+"Representation"): one KMD-owned "copy-engine gate" (a present-stream slot with no Venus context, `virtio/gpu/rm_gates.rs`
+195-268 is the model) whose retired value is the channel's completion value. The Present's private record carries
+`encode(ce_gate, value)`; `WddmPending.stream_boundary` (`virtio/gpu/mod.rs` 2036) and `scanout_boundary_ready` (7120)
+then work unchanged, and `take_one_ready_wddm` (8179) retires the DMA fence only when the value is reached:
+`ce_present::retire` is the rule, `Retire::Discharge` the timeout's counted exception. The gate's value is 32 bits wide; the
+channel is rebuilt before its completion value reaches `2^32 - 1025` (about 49 days at 1000 frames per second).
+
+How the KMD learns the value advanced, two ways, both reading the CPU mapping of the completion page:
+- **Event (preferred)**: the push's `NON_STALL_INTERRUPT` -> RM event of the KMD client -> host `EventReady` -> the existing
+  `nvrm_events` DPC (`virtio/gpu/nvrm_events.rs` `drain_nvrm_events` 560, `deliver_nvrm_ready`) recognizes the KMD's own
+  event handle, reads the completion value, `Ring::observe`, advances the gate, and the same DPC pass re-evaluates the WDDM
+  FIFO head (as a fired RM gate point does today). Edge-triggered: every pass reads the value, never counts events.
+- **Poll (fallback, and the timeout clock)**: the HPD worker and the heartbeat read the value; `Route::poll` with the time of
+  the producer's fence (the RM gate point of the same Present fired in the same DPC) runs the timeout of
+  `TIMEOUT_AFTER_PRODUCER_MS`. The completion delivery latency of the event path for a GPU release on a KMD-owned client is
+  unverified (unknown 2 of 6); M3c measures `CeLatUs` against the poll.
+
+### 11.6 Locking and IRQL
+
+- Order: `scanout_mutex -> venus_mutex -> virtio_lock -> CE` (`adapter/locks.rs`); `CE` is a new leaf spinlock over the ring
+  (`Ring`), the gate's value and the per-destination `Route`s. Nothing is allocated, waited on or sent under it; the
+  slot write, the entry, `GP_PUT` and the doorbell are plain stores and run under it at DISPATCH.
+- Present: PASSIVE, takes `CE` alone (no Venus or virtio lock) for submit; the private-record merge is the existing code.
+- DPC: under `virtio_lock` (where `drain_nvrm_events` runs), then `CE` to observe; it signals the worker with
+  `KeSetEvent(Wait = FALSE)` as today.
+- RM calls (bring-up, dup, map, descriptor, teardown): PASSIVE, no spinlock held, through the RM client's `Io` with its
+  bounded message timeouts; a teardown that must wait for the GPU polls the value with `sleep_ms` (as `blt_async::drain`).
+- Eviction: `BuildPagingBuffer` already serializes the guest-blob retire (`system_backings.serialize`); the copy-engine retire
+  runs first inside the same serialization.
+
+### 11.7 Unverified items
+
+1. The source mapping kind (10.3): a block-linear source mapped by the KMD with kind 0x06 reads the right pixels (M1b, M3c).
+2. The block-linear words on 0xcab5 against the 610.57.04 headers (its `clcab5.h` omits them; Mesa's has them) and
+   `KIND_BPP` (Mesa only).
+3. `SEM_EXECUTE.RELEASE_TIMESTAMP` and `NON_STALL_INTERRUPT` on 0xca6f (not in `clca6f.h`; the tool's PASS used
+   `NON_STALL_INTERRUPT`).
+4. Which notifier index a CE channel's non-stall interrupt raises for an `NV01_EVENT_OS_EVENT` (option B); the tool only
+   measured the semaphore-surface fence (option A).
+5. The KMD client's device without `OPTIONAL_MULTIPLE_VASPACES` taking a CE channel (unknown 3 of 6).
+6. A dup of another guest client's image memory from the KMD client, and its GPU mapping with the image's kind (the tool
+   dup'd a pitch source of its own process).
+7. Compressed sources (GB20x compressible kinds): refused by the route (`source_plan`) until a tool proves them.
+8. The doorbell store from kernel mode through window region 1 (the tool stored from user mode).
+
+### 11.8 Work list
+
+**M3b, the channel subsystem (about 1700 lines):**
+
+| file | what | lines |
+|---|---|---|
+| `kmd_logic/src/ce_channel.rs` (new) | the bring-up/teardown step machine (VA space, engine pick from `GET_ENGINES_V2`/`CE_GET_CAPS_V2` replies, TSG, subcontext, channel, BIND, CE object, token, schedule, USERD, ring, doorbell, completion), the parameter encoders with byte tests (`NV_CHANNEL_ALLOC_PARAMS` 376 B, `NVB0B5_ALLOCATION_PARAMETERS`, `NV_HOPPER_USERMODE_A_PARAMS`), the engine-type mapping `COPY(n)` | 500 |
+| `kmd_render/src/virtio/rm_client/channel.rs` (new) | the I/O of those steps through `Io::rm_alloc`/control, the window maps (reusing `sysmem.rs` `alloc_sys` and the `rm_client.rs` map steps), the first push, teardown, device loss | 600 |
+| `kmd_render/src/virtio/rm_client/ce_map.rs` (new) | dup + `NV50_MEMORY_VIRTUAL` + `MAP_MEMORY_DMA` with a kind, unmap/free; the OS descriptor from page runs; the source/timeline cache | 400 |
+| `kmd_render/src/virtio/rm_client.rs` | the level, the service hook, `forget`/`retire_begin` reaching the channel | 80 |
+| `kmd_render/src/diag.rs` | `KnobName::new(b"RmCopyEngine")` | 10 |
+| `kmd_render/src/adapter/locks.rs` | the `CE` leaf lock | 40 |
+| hardware | channel up/down 100 times, error notifier 0, `crm_object_count` equivalent 0, the doorbell from kernel mode | |
+
+**M3c, Present integration (about 1300 lines, plus the NVK/UMD side of 10.2):**
+
+| file | what | lines |
+|---|---|---|
+| `kmd_render/src/ddi/submit_command.rs` | parse and validate the record beside the fence tail (`HERF` 72, `HEPR` 96), the client check, the stash | 90 |
+| `kmd_render/src/ddi/onscanout.rs` or the context | the stash slot and its pairing/orphan rule | 40 |
+| `kmd_render/src/ddi/ce_present.rs` (new) | knob, counters (`ce_present::COUNTERS`, exact-list test replaces `the_names_are_free_in_kmd_render`), `try_ce`, the destination record hooks | 550 |
+| `kmd_render/src/ddi/display.rs` | the call before `try_async`, the `after` bound on the fallback | 50 |
+| `kmd_render/src/virtio/gpu/rm_gates.rs` (or `ce_gate.rs`) | the copy-engine gate: encode, observe, purge on transport loss | 150 |
+| `kmd_render/src/virtio/gpu/nvrm_events.rs` | the KMD's own event -> observe -> re-evaluate | 50 |
+| `kmd_render/src/adapter/backing.rs`, `ddi/guest_blob.rs` | the descriptor state beside the guest blob, the retire order, `CeLeak` | 200 |
+| `protocol/src/rm_fence.rs`, `helios_nvrm_escape.h` | the `QUERY_CAPS` bit that tells the UMD to send the record | 20 |
+| `kmd_logic` | tests for the stash and the gate arithmetic | 150 |
+| NVK (`patches-windows`, new), DXVK bridge, `umd/src/forward/present.rs` | `queue_rm_fence_v3` and the 168-byte `HERF` (10.2) | NVK session |
+| hardware | Heaven windowed: `CeHit` = Presents, `CeFallback` 0, pattern equal to the Venus copy, then the GuestBlob sign-off procedure of `kmd-handoff-2026-10.md` 4 | |
+
+Naming: the knob is `RmCopyEngine` (section 6 and 9 called it `BltRmCe`; the M3 knob list uses the longer, unambiguous
+name, still within 14 characters).
