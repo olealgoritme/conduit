@@ -345,8 +345,7 @@ pub(crate) unsafe fn try_route(
         let no_mirror = no_mirror_knob || prepared.guest_target();
         adapter
             .with_virtio(|v| {
-                // `t_present` 0: not stamped (the route does not carry the DDI's entry time).
-                v.queue_async_blt(adapter, source, destination, prepared, boundary, no_mirror, 0)
+                v.queue_async_blt(adapter, source, destination, prepared, boundary, no_mirror)
             })
             .unwrap_or(Err(VirtioError::DeviceError))
     });
