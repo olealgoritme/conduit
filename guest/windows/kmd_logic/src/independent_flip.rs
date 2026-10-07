@@ -1,9 +1,13 @@
 //! Independent flip (direct flip) of a flip-model swap chain: the pure decision "may this flip
-//! source go direct" (`docs/independent-flip.md`, section 6 and the table in 6.2).
+//! source go direct" (`docs/independent-flip.md`, section 6 and the table in 6.2), and the
+//! stage-1 knob that turns the independent-flip advertisement on (section 11).
 //!
-//! ⚠ NOT WIRED. Nothing in `kmd_render` calls this module, and the driver's behaviour is
-//! unchanged by it. It exists so the decision can be argued, tested and reviewed on the host
-//! before any DDI code is written, the way `foreign_flip` and `flip_completion` were.
+//! WIRED AT STAGE S-1 (`IndepFlip`, default 0). With the knob at 0 nothing here is consulted and
+//! the driver behaves byte for byte as before. With it at 1 the KMD advertises the
+//! independent-flip caps ([`advertise`]) and evaluates [`decide`] on every flip as a census
+//! (`ddi/indep_flip.rs`, counters `Idf*`); nothing is enforced. At 2 it also completes the one
+//! flip the driver used to FAIL (a DMA-buffer flip of a Venus allocation that is not in the
+//! direct-scan-out table, `PBFlip` 0xE6) as a kept picture ([`keeps_unregistered_dma_flip`]).
 //!
 //! What it decides. When dxgkrnl flips an application's own swap-chain buffer (an independent
 //! flip: DWM stops composing that window and the application's buffer is the primary), the
@@ -34,20 +38,103 @@ use crate::present_foreign::Arm;
 use crate::snapshot_bind::{validate_layout, SnapshotDescriptor, SnapshotReject};
 use crate::ScanoutFormat;
 
-/// Service-key knob (REG_DWORD, default 0): the table is consulted. 0 is today's behaviour:
-/// every flip is answered by the existing arms alone.
+/// Service-key knob (REG_DWORD, default 0), read once per AddAdapter/StartDevice with the other
+/// adapter knobs. 0: off, today's behaviour. 1: advertise the independent-flip caps and count
+/// the table's verdicts (census). 2: as 1, and enforce the one behaviour change of stage S-2
+/// that is safe without a measurement ([`keeps_unregistered_dma_flip`]). See [`Mode`].
 pub const KNOB_ENABLE: &str = "IndepFlip";
-/// Service-key knob (default 0): a source the UMD did not create as a primary
-/// (`MISC_PRIMARY` clear) is refused. 0 judges the allocation by what it is, not by what the
-/// UMD called it; the census (`IdfUntagged`) says whether the 1 is ever needed.
+/// Reserved (not read yet): a source the UMD did not create as a primary (`MISC_PRIMARY` clear)
+/// is refused. The census (`IdfUntagged`) says whether it is ever needed.
 pub const KNOB_NEED_PRIMARY: &str = "IdfNeedPrim";
-/// Service-key knob (default 0): hold the displayed-address publication of a flip until the
-/// host released the buffer it replaces (`scanout_release`). Design item S-2b; this module
-/// does not use it.
+/// Reserved (not read yet): hold the displayed-address publication of a flip until the host
+/// released the buffer it replaces (`scanout_release`). Design item S-2b.
 pub const KNOB_HOLD_RELEASE: &str = "IdfHoldRel";
 
-/// The knobs, for the collision tests.
-pub const KNOBS: [&str; 3] = [KNOB_ENABLE, KNOB_NEED_PRIMARY, KNOB_HOLD_RELEASE];
+/// The knobs the driver reads.
+pub const KNOBS: [&str; 1] = [KNOB_ENABLE];
+/// Names reserved for later stages: they collide with nothing, and the driver does not read them.
+pub const RESERVED_KNOBS: [&str; 2] = [KNOB_NEED_PRIMARY, KNOB_HOLD_RELEASE];
+
+/// What `IndepFlip` asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// 0 (the default, and absent): nothing advertised, nothing evaluated.
+    Off,
+    /// 1: the caps are advertised and every flip is judged and counted. No behaviour change on
+    /// any flip path.
+    Census,
+    /// 2: as [`Mode::Census`], plus [`keeps_unregistered_dma_flip`].
+    Enforce,
+}
+
+impl Mode {
+    /// The raw service value. 0 is off, 1 census, 2 enforce. Any other value is read as
+    /// [`Mode::Census`]: a mistyped value advertises and counts but never changes a flip path.
+    pub const fn from_knob(raw: u32) -> Mode {
+        match raw {
+            0 => Mode::Off,
+            2 => Mode::Enforce,
+            _ => Mode::Census,
+        }
+    }
+
+    pub const fn is_on(self) -> bool {
+        !matches!(self, Mode::Off)
+    }
+
+    /// The value mirrored as `IdfKnob`: 0, 1 or 2 (the mode actually in force, not the raw value).
+    pub const fn code(self) -> u32 {
+        match self {
+            Mode::Off => 0,
+            Mode::Census => 1,
+            Mode::Enforce => 2,
+        }
+    }
+}
+
+/// The `DXGK_FLIPCAPS` bits the independent-flip advertisement adds: `FlipIndependent` (bit 4,
+/// "MMIO flip to redirected surfaces bypassing DWM Present", WDDM 1.3) and `DdiPresentForIFlip`
+/// (bit 5, "Call DxgkDdiPresent when independent flip Present might be issued", WDDM 2.0).
+/// `FlipImmediateOnHSync` (bit 6) stays out until it is measured (design 2.2).
+pub const IFLIP_CAPS: u32 = crate::flip_flags::FLIPCAPS_FLIP_INDEPENDENT
+    | crate::flip_flags::FLIPCAPS_DDI_PRESENT_FOR_IFLIP;
+
+/// The caps surface one adapter-knob snapshot reports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Advertised {
+    /// `DXGK_DRIVERCAPS.SupportDirectFlip` and the aperture segment's `DirectFlip` flag (one
+    /// value for both, so the two can never disagree).
+    pub direct_flip: bool,
+    /// The raw `FlipCapsX` value handed to `flip_flags::resolve_flip_caps` (which still filters
+    /// it to the accepted bits).
+    pub flip_caps_x: u32,
+}
+
+/// Fold `IndepFlip` into the two existing caps knobs: the advertisement is the OR of what each
+/// asks for, so `DirectFlipCaps` and `FlipCapsX` keep working exactly as before when the mode is
+/// off, and turning the mode on never takes a bit away.
+pub const fn advertise(mode: Mode, direct_flip_caps: bool, flip_caps_x: u32) -> Advertised {
+    if mode.is_on() {
+        Advertised {
+            direct_flip: true,
+            flip_caps_x: flip_caps_x | IFLIP_CAPS,
+        }
+    } else {
+        Advertised {
+            direct_flip: direct_flip_caps,
+            flip_caps_x,
+        }
+    }
+}
+
+/// A DMA-buffer flip of a Venus allocation that is not in the direct-scan-out table (and is not
+/// hollow) FAILS its Present today (`PBFlip` 0xE6, `STATUS_INVALID_PARAMETER`). Under
+/// independent flip that is an application's buffer dxgkrnl chose to flip, and the doc's rule
+/// is that such a flip COMPLETES (section 4.1, `Why::NotRegistered`). True: complete it as a
+/// kept picture instead. Only [`Mode::Enforce`] changes it.
+pub const fn keeps_unregistered_dma_flip(mode: Mode) -> bool {
+    matches!(mode, Mode::Enforce)
+}
 
 /// Which kind of allocation the flip names (`flip_completion::classify` plus the direct flag).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -357,27 +444,140 @@ pub fn decide(f: &Facts) -> Verdict {
     }
 }
 
+/// What the flip worker (`program_vidpn_source_inner`) knows about a source before any arm
+/// runs. Every flip that reaches the worker is a resolved allocation (the MMIO flip's
+/// `SetVidPnSourceAddress` handle, or an armed DMA flip, which was in the table by construction).
+#[derive(Clone, Copy, Debug)]
+pub struct WorkerFacts {
+    pub caps: bool,
+    pub display: bool,
+    pub class: Class,
+    pub address: u64,
+    pub primary_tagged: bool,
+    pub mode: (u32, u32),
+    pub extent: (u32, u32),
+    pub dxgi_format: u32,
+    pub pitch: u32,
+    pub plane_offset: u64,
+    pub alloc_size: u64,
+}
+
+/// The census verdict in the worker, before the arms run.
+///
+/// Owner life, a user scan-out source and the failing pause are judged inside `ForeignFlip` (and
+/// show up there as its refusal), so they are taken as fine here. For a foreign source
+/// `ForeignFlip`'s own answer is not known yet: the verdict is `Direct(Foreign)` provisionally,
+/// and the caller finishes it with [`finish_foreign`] once the arm answered. The worker refuses a
+/// source whose extent is not the mode's before any arm, for every class; for a foreign source
+/// that is reported as `Extent` (the reason `foreign_flip::decide` would give).
+pub fn census_worker(mode: Mode, w: &WorkerFacts) -> Verdict {
+    let f = Facts {
+        knob: mode.is_on(),
+        caps: w.caps,
+        display: w.display,
+        arm: Arm::FlipMmio,
+        class: w.class,
+        address: w.address,
+        primary_tagged: w.primary_tagged,
+        need_primary: false,
+        registered: true,
+        mode: w.mode,
+        extent: w.extent,
+        dxgi_format: w.dxgi_format,
+        pitch: w.pitch,
+        plane_offset: w.plane_offset,
+        alloc_size: w.alloc_size,
+        owner_live: true,
+        user_source: false,
+        failing: false,
+        foreign: Some(ForeignOutcome::Take),
+    };
+    match decide(&f) {
+        Verdict::Direct(Route::Foreign) if w.extent != w.mode => Verdict::Keep(Why::Extent),
+        v => v,
+    }
+}
+
+/// Finish a provisional [`census_worker`] verdict once `ForeignFlip` answered: `took` is its
+/// `Programmed::Ok` (or the level-5 arm's). A refusal's own reason is counted by `ForeignFlip`
+/// (`FfRef<NN>`); here it is [`Why::ForeignOther`]. Any other verdict is returned unchanged.
+pub const fn finish_foreign(pre: Verdict, took: bool) -> Verdict {
+    match pre {
+        Verdict::Direct(Route::Foreign) if !took => Verdict::Keep(Why::ForeignOther),
+        v => v,
+    }
+}
+
+/// What the Present DDI knows about a DMA-buffer flip it answers WITHOUT arming the worker (the
+/// counted skip of a foreign source, a hollow source, or the 0xE6 row). An armed DMA flip is
+/// judged in the worker instead, so every flip is counted once.
+#[derive(Clone, Copy, Debug)]
+pub struct DmaFacts {
+    pub caps: bool,
+    pub display: bool,
+    pub class: Class,
+    pub address: u64,
+    pub registered: bool,
+    pub mode: (u32, u32),
+    pub extent: (u32, u32),
+    pub dxgi_format: u32,
+}
+
+/// The census verdict of an unarmed DMA-buffer flip. `ForeignFlip` was not asked (it is off, or
+/// the source is not registered), so a foreign source that gets past the table row is
+/// [`Why::ForeignOther`].
+pub fn census_dma_unarmed(mode: Mode, d: &DmaFacts) -> Verdict {
+    decide(&Facts {
+        knob: mode.is_on(),
+        caps: d.caps,
+        display: d.display,
+        arm: Arm::FlipDma,
+        class: d.class,
+        address: d.address,
+        primary_tagged: false,
+        need_primary: false,
+        registered: d.registered,
+        mode: d.mode,
+        extent: d.extent,
+        dxgi_format: d.dxgi_format,
+        // Never reached for an unarmed flip (the table row or the class answers first), and
+        // zero fails the undersize guard if it ever were: refused, never direct.
+        pitch: 0,
+        plane_offset: 0,
+        alloc_size: 0,
+        owner_live: true,
+        user_source: false,
+        failing: false,
+        foreign: None,
+    })
+}
+
 /// Counter names (service-key values, REG_DWORD, at most 14 characters, none shared with any
 /// other counter or knob in either crate). Event-gated like `Ff*` and `Fk*`: a zero block is
 /// published once per StartDevice, then values on events (`zero-copy-present.md` 13.8).
 ///
 /// `IdfRef01` .. `IdfRef13` are the per-reason counts ([`ref_name`]); they are not repeated
 /// here.
-pub const COUNTERS: [&str; 14] = [
-    "IdfKnob",     // the knob in force (IndepFlip, IdfNeedPrim, IdfHoldRel as bits 0 to 2)
+pub const COUNTERS: [&str; 12] = [
+    "IdfKnob",     // the mode in force: 0 off, 1 census, 2 enforce (Mode::code)
     "IdfSeen",     // flips the table was asked about
     "IdfDirect",   // verdict Direct
-    "IdfDirFor",   // ... through ForeignFlip
+    "IdfDirFor",   // ... through ForeignFlip (or the level-5 RM arm)
     "IdfDirVen",   // ... through the Venus direct bind
     "IdfCopy",     // verdict Copy
     "IdfKeep",     // verdict Keep
     "IdfWhy",      // the last Keep reason's code
-    "IdfArmMmio",  // asked on the MMIO contract
-    "IdfArmDma",   // asked on the DMA-buffer contract
-    "IdfSwitch",   // the shown source changed owner (a promotion or a demotion edge)
-    "IdfHold",     // publications held for the host's release of the replaced buffer
-    "IdfHoldTmo",  // ... that gave up waiting
+    "IdfArmMmio",  // flips on the MMIO contract (SetVidPnSourceAddress calls) while on
+    "IdfArmDma",   // flips on the DMA-buffer contract while on
     "IdfUntagged", // direct flips of a source with MISC_PRIMARY clear (the UMD's primary-compat)
+    "IdfEnfKeep",  // Mode::Enforce: 0xE6 flips completed as kept pictures instead of failed
+];
+
+/// Counter names reserved for later stages (design 6.4), written by nothing yet.
+pub const RESERVED_COUNTERS: [&str; 3] = [
+    "IdfSwitch",  // the shown source changed owner (a promotion or a demotion edge)
+    "IdfHold",    // publications held for the host's release of the replaced buffer
+    "IdfHoldTmo", // ... that gave up waiting
 ];
 
 /// Name of the per-reason counter, `IdfRef01` .. `IdfRef13`.
@@ -828,10 +1028,229 @@ mod tests {
         assert_eq!(Why::ForeignOther.code(), 13);
     }
 
+    // ---- stage S-1: the knob, the caps, the census ---------------------------------------
+
+    #[test]
+    fn the_knob_values_and_a_typo_never_enforces() {
+        assert_eq!(Mode::from_knob(0), Mode::Off);
+        assert_eq!(Mode::from_knob(1), Mode::Census);
+        assert_eq!(Mode::from_knob(2), Mode::Enforce);
+        for raw in [3u32, 7, 0x10, u32::MAX] {
+            assert_eq!(Mode::from_knob(raw), Mode::Census, "{raw}");
+        }
+        assert!(!Mode::Off.is_on());
+        assert!(Mode::Census.is_on() && Mode::Enforce.is_on());
+        assert_eq!(
+            [Mode::Off.code(), Mode::Census.code(), Mode::Enforce.code()],
+            [0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn off_leaves_the_caps_knobs_exactly_as_they_were() {
+        for dfc in [false, true] {
+            for x in [0u32, 0x10, 0x30, 0x70, 0xFFFF_FFFF] {
+                assert_eq!(
+                    advertise(Mode::Off, dfc, x),
+                    Advertised {
+                        direct_flip: dfc,
+                        flip_caps_x: x
+                    }
+                );
+            }
+        }
+        // And the default reports the driver's own word, byte for byte.
+        let a = advertise(Mode::Off, false, 0);
+        assert_eq!(
+            crate::flip_flags::resolve_flip_caps(a.flip_caps_x).reported,
+            0x2
+        );
+        assert!(!a.direct_flip);
+    }
+
+    #[test]
+    fn on_advertises_direct_flip_and_the_two_iflip_bits_and_takes_nothing_away() {
+        assert_eq!(IFLIP_CAPS, 0x30);
+        for mode in [Mode::Census, Mode::Enforce] {
+            let a = advertise(mode, false, 0);
+            assert!(a.direct_flip);
+            let caps = crate::flip_flags::resolve_flip_caps(a.flip_caps_x);
+            assert_eq!(
+                caps.reported, 0x32,
+                "FlipOnVSyncMmIo | FlipIndependent | DdiPresentForIFlip"
+            );
+            assert_eq!(caps.dropped, 0);
+            // FlipImmediateOnHSync asked for separately is kept; the mode does not add it.
+            let a = advertise(mode, false, 0x40);
+            assert_eq!(
+                crate::flip_flags::resolve_flip_caps(a.flip_caps_x).reported,
+                0x72
+            );
+            // FlipImmediateMmIo stays impossible whatever is OR'd in.
+            let a = advertise(mode, true, 0x08);
+            assert_eq!(
+                crate::flip_flags::resolve_flip_caps(a.flip_caps_x).reported & 0x08,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn only_enforce_completes_the_unregistered_dma_flip() {
+        assert!(!keeps_unregistered_dma_flip(Mode::Off));
+        assert!(!keeps_unregistered_dma_flip(Mode::Census));
+        assert!(keeps_unregistered_dma_flip(Mode::Enforce));
+    }
+
+    fn worker(class: Class) -> WorkerFacts {
+        WorkerFacts {
+            caps: true,
+            display: true,
+            class,
+            address: 0x1_0000_0000,
+            primary_tagged: true,
+            mode: MODE,
+            extent: MODE,
+            dxgi_format: 87,
+            pitch: MODE.0 * 4,
+            plane_offset: 0,
+            alloc_size: MODE.0 as u64 * MODE.1 as u64 * 4,
+        }
+    }
+
+    #[test]
+    fn the_worker_census_matches_the_table_and_finishes_foreign_sources() {
+        assert_eq!(
+            census_worker(Mode::Off, &worker(Class::Foreign)),
+            Verdict::Off
+        );
+        assert_eq!(
+            census_worker(
+                Mode::Census,
+                &WorkerFacts {
+                    caps: false,
+                    ..worker(Class::Foreign)
+                }
+            ),
+            Verdict::Off
+        );
+        let pre = census_worker(Mode::Census, &worker(Class::Foreign));
+        assert_eq!(pre, Verdict::Direct(Route::Foreign));
+        assert_eq!(finish_foreign(pre, true), Verdict::Direct(Route::Foreign));
+        assert_eq!(finish_foreign(pre, false), Verdict::Keep(Why::ForeignOther));
+        assert_eq!(
+            census_worker(Mode::Enforce, &worker(Class::VenusDirect)),
+            Verdict::Direct(Route::VenusBind)
+        );
+        assert_eq!(
+            census_worker(Mode::Census, &worker(Class::VenusOther)),
+            Verdict::Copy
+        );
+        // finish_foreign leaves every non-provisional verdict alone.
+        for v in [
+            Verdict::Off,
+            Verdict::Copy,
+            Verdict::Direct(Route::VenusBind),
+            Verdict::Keep(Why::Extent),
+        ] {
+            assert_eq!(finish_foreign(v, false), v);
+            assert_eq!(finish_foreign(v, true), v);
+        }
+    }
+
+    #[test]
+    fn the_worker_refuses_a_wrong_extent_for_every_class_including_foreign() {
+        for class in [Class::Foreign, Class::VenusDirect, Class::VenusOther] {
+            let w = WorkerFacts {
+                extent: (1280, 720),
+                ..worker(class)
+            };
+            assert_eq!(
+                census_worker(Mode::Census, &w),
+                Verdict::Keep(Why::Extent),
+                "{class:?}"
+            );
+        }
+        // A zero address still comes first (row 4 before the pixels).
+        let w = WorkerFacts {
+            extent: (1280, 720),
+            address: 0,
+            ..worker(Class::Foreign)
+        };
+        assert_eq!(
+            census_worker(Mode::Census, &w),
+            Verdict::Keep(Why::NoAddress)
+        );
+    }
+
+    #[test]
+    fn the_unarmed_dma_census_names_the_0xe6_row_and_never_goes_direct() {
+        let d = DmaFacts {
+            caps: true,
+            display: true,
+            class: Class::VenusOther,
+            address: 0x2000,
+            registered: false,
+            mode: MODE,
+            extent: MODE,
+            dxgi_format: 87,
+        };
+        assert_eq!(
+            census_dma_unarmed(Mode::Census, &d),
+            Verdict::Keep(Why::NotRegistered)
+        );
+        assert_eq!(census_dma_unarmed(Mode::Off, &d), Verdict::Off);
+        let hollow = DmaFacts {
+            class: Class::Hollow,
+            ..d
+        };
+        assert_eq!(
+            census_dma_unarmed(Mode::Census, &hollow),
+            Verdict::Keep(Why::Hollow)
+        );
+        // A foreign source the table holds but ForeignFlip did not take (the knob is off).
+        let foreign = DmaFacts {
+            class: Class::Foreign,
+            registered: true,
+            ..d
+        };
+        assert_eq!(
+            census_dma_unarmed(Mode::Census, &foreign),
+            Verdict::Keep(Why::ForeignOther)
+        );
+        // The combinations the Present answers without arming (a registered Venus source is
+        // always armed): never counted as direct or copy.
+        for (class, registered) in [
+            (Class::Foreign, false),
+            (Class::Foreign, true),
+            (Class::VenusDirect, false),
+            (Class::VenusOther, false),
+            (Class::Hollow, false),
+            (Class::Hollow, true),
+        ] {
+            let v = census_dma_unarmed(
+                Mode::Enforce,
+                &DmaFacts {
+                    class,
+                    registered,
+                    ..d
+                },
+            );
+            assert!(
+                matches!(v, Verdict::Keep(_)),
+                "{class:?} {registered} {v:?}"
+            );
+        }
+    }
+
     // ---- counter and knob names ---------------------------------------------------------
 
     fn all_counter_names() -> Vec<std::string::String> {
-        let mut names: Vec<std::string::String> = COUNTERS.iter().map(|s| (*s).into()).collect();
+        let mut names: Vec<std::string::String> = COUNTERS
+            .iter()
+            .chain(RESERVED_COUNTERS.iter())
+            .map(|s| (*s).into())
+            .collect();
         for w in Why::ALL {
             names.push(std::str::from_utf8(&ref_name(w)).unwrap().into());
         }
@@ -864,47 +1283,102 @@ mod tests {
     #[test]
     fn knob_names_fit_and_are_not_counter_names() {
         let names = all_counter_names();
-        for k in KNOBS {
+        let all: Vec<&str> = KNOBS.iter().chain(RESERVED_KNOBS.iter()).copied().collect();
+        for k in &all {
             // The service-key lookup clamps names to 14 characters (`read_config_dword`).
             assert!(k.len() <= 14, "{k} is longer than 14");
             assert!(!names.iter().any(|n| n == k), "{k} is also a counter");
         }
-        let mut sorted: Vec<&str> = KNOBS.to_vec();
+        let mut sorted = all.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(sorted.len(), KNOBS.len());
+        assert_eq!(sorted.len(), all.len());
     }
 
-    #[test]
-    fn nothing_in_the_driver_spells_one_of_these_names_yet() {
-        // The module is not wired. This pins that, and the day it is wired this test is the
-        // one to replace with the `the_counters_the_driver_writes_are_exactly_the_ones_listed`
-        // pair the other modules carry (`flip_completion`, `foreign_flip`).
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
-        if !root.exists() {
-            return; // a copy of this crate without its sibling: nothing to scan
+    /// The sibling `kmd_render/src`, or `None` when this copy of the crate has none. With
+    /// `HELIOS_REQUIRE_NAME_SCAN=1` an absent sibling FAILS instead of skipping.
+    fn render_src() -> Option<std::path::PathBuf> {
+        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
+        if render.exists() {
+            return Some(render);
         }
-        let names: Vec<std::string::String> = all_counter_names()
-            .into_iter()
-            .chain(KNOBS.iter().map(|k| (*k).into()))
-            .collect();
-        let mut stack = std::vec![root];
-        let mut checked = 0;
+        assert!(
+            std::env::var("HELIOS_REQUIRE_NAME_SCAN").map_or(true, |v| v != "1"),
+            "HELIOS_REQUIRE_NAME_SCAN=1 but {} does not exist: copy kmd_render next to kmd_logic",
+            render.display()
+        );
+        None
+    }
+
+    fn rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = std::vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             for e in std::fs::read_dir(&dir).unwrap() {
                 let p = e.unwrap().path();
                 if p.is_dir() {
                     stack.push(p);
                 } else if p.extension().is_some_and(|x| x == "rs") {
-                    checked += 1;
-                    let text = std::fs::read_to_string(&p).unwrap();
-                    for n in &names {
-                        let lit = std::format!("b\"{n}\"");
-                        assert!(!text.contains(&lit), "{} already spells {n}", p.display());
-                    }
+                    out.push(p);
                 }
             }
         }
-        assert!(checked > 20);
+        out
+    }
+
+    /// The census module of the driver.
+    const RENDER_FILE: &str = "ddi/indep_flip.rs";
+
+    #[test]
+    fn the_counters_the_driver_writes_are_exactly_the_ones_listed() {
+        let Some(root) = render_src() else {
+            return;
+        };
+        let text = std::fs::read_to_string(root.join(RENDER_FILE)).unwrap();
+        let mut written: Vec<std::string::String> = Vec::new();
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("b\"Idf") {
+            let tail = &rest[i + 2..];
+            let end = tail.find('"').unwrap();
+            let name = &tail[..end];
+            if !written.iter().any(|w| w == name) {
+                written.push(name.into());
+            }
+            rest = &tail[end..];
+        }
+        written.sort();
+        let mut listed: Vec<std::string::String> = COUNTERS.iter().map(|s| (*s).into()).collect();
+        listed.sort();
+        assert_eq!(written, listed);
+    }
+
+    #[test]
+    fn no_other_driver_file_spells_these_names_and_the_knob_is_read_by_this_name() {
+        let Some(root) = render_src() else {
+            return;
+        };
+        let ours = root.join(RENDER_FILE);
+        let names: Vec<std::string::String> = all_counter_names()
+            .into_iter()
+            .chain(RESERVED_KNOBS.iter().map(|k| (*k).into()))
+            .collect();
+        let mut knob_spelled = 0;
+        let files = rust_files(&root);
+        assert!(files.len() > 20);
+        for p in files {
+            let text = std::fs::read_to_string(&p).unwrap();
+            if text.contains(&std::format!("b\"{KNOB_ENABLE}\"")) {
+                knob_spelled += 1;
+            }
+            if p == ours {
+                continue;
+            }
+            for n in &names {
+                let lit = std::format!("b\"{n}\"");
+                assert!(!text.contains(&lit), "{} spells {n}", p.display());
+            }
+        }
+        // `diag::knobs::INDEP_FLIP` is the one spelling of the knob.
+        assert_eq!(knob_spelled, 1, "the knob literal must exist exactly once");
     }
 }
