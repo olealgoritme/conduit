@@ -23,6 +23,7 @@ Adjust those before using them elsewhere. Context: [docs/HANDOFF.md](../../../..
 | `shot.ps1` | In-session screenshot (run through `lvl5\run-in-session.ps1`). |
 | `outs.ps1` | DXGI adapters/outputs, GDI and monitor probe. |
 | `etw.ps1`, `hvetw.ps1` | DxgKrnl ETW captures (Heaven). |
+| `vramcap.sh LABEL [SECONDS]`, `vram-etw.ps1` | Redirection-surface capture (WPR: DxgKrnl Lock/Unlock, Blit, QueuePacket, PresentHistory, allocation and segment rundown; DXGI Present), copied back and reported per frame by `guest/windows/tools/vram_redirection_report.py` ([vram-redirection.md](../../docs/vram-redirection.md)). `HEAVEN=1` starts windowed Heaven first. |
 | `hvpm.sh`, `hvclose.sh` | PresentMon on Heaven; close Heaven by window. |
 | `rtest.ps1` | Restart test. |
 | `host-deploy4-build.sh` | Builds a staged host deploy (backend, conduit-venus, virglrenderer with patches) with an `install.sh` that checks everything and keeps `.prev` backups (`--rollback`). |
