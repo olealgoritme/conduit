@@ -111,9 +111,10 @@ def main():
         # loop, which raises the line.
         if not msi:
             u0 = ix.next("U0", wf[0], lambda e: e[1] in deliverers or not deliverers)
-            irq = u0 and ix.next("IRQ", u0[0])
+            irq = ix.next("IRQ", u0[0] if u0 else wf[0])
             if irq:
-                add("16b signal_used_queue -> QEMU raises INTx", u0[0], irq[0])
+                if u0:
+                    add("16b signal_used_queue -> QEMU raises INTx", u0[0], irq[0])
                 msi = irq
         kick = before(wk_ts.get(tid, []), ts, 2_000_000)
         run = before(rn.get(tid, []), ts, 2_000_000)
