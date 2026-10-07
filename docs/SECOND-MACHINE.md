@@ -21,9 +21,13 @@ status, first-hour plan for an RTX 4070) first. Background: [WINDOWS.md](WINDOWS
   rmallow, uvm, vidmem, osdesc, devinfo, nvkms and the escape sizes. Two
   lists are still edited by hand for a new release: the `PROFILES` of
   `abi::devinfo` and the includes in `guest/linux/nvgpu_devinfo.h`.
-- On a GPU that also drives your monitor, `conduit doctor` prints the video
-  memory limit guests get and the card's BAR1 size; set
-  `CONDUIT_SAFE_MODE=1` for the first run ([SECURITY.md](SECURITY.md)).
+- With the closed modules or a branch older than 580 (565.77 is the first
+  such setup), the backend starts in safe mode by itself: a 2 GiB
+  video-memory limit and 1 s clamps on blocking GPU calls, plus the display
+  default limit when a monitor is on the NVIDIA card. `conduit doctor` says
+  whether safe mode is on and why, the limit guests get, and the card's BAR1
+  size. Turn it off once the setup has proven itself:
+  `conduit config set gpu.safe_mode false` ([SECURITY.md](SECURITY.md)).
 - The NVIDIA Vulkan driver of the same release (`conduit-venus` uses it for
   the Venus fallback).
 - KVM (`ls /dev/kvm`), a Wayland desktop, `virt-manager`/libvirt for the VM.

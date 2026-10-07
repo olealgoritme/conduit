@@ -121,9 +121,12 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   the firmware settings for large guest workloads. `conduit doctor` prints the
   size.
 - **Sharing the card with your desktop.** When the card has a monitor
-  connected, guests get a default video-memory limit so the compositor keeps
-  room (`gpu.vram_limit_mib`, [SECURITY.md](SECURITY.md)). Check it with
-  `conduit doctor`; `off` removes it on a headless or dedicated card.
+  connected and safe mode is on (the default for the closed modules or a
+  branch older than 580), guests get a default video-memory limit so the
+  compositor keeps room. On the open modules 580 or newer nothing is set
+  unless you ask: `conduit config set gpu.vram_limit_mib auto` (or a number
+  of MiB). See [SECURITY.md](SECURITY.md); check what applies with
+  `conduit doctor`. `off` removes the limit on a dedicated card.
 
 ## Measuring
 
