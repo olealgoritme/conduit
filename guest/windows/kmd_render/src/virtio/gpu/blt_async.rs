@@ -440,6 +440,69 @@ impl VirtioGpu {
         self.complete_windowed_blt_ring(adapter, token, stream_boundary, ok);
     }
 
+    /// The copy-engine route (`CeRtDirect`): whether the CPU may consider the producer of
+    /// `stream_boundary` finished: its boundary is ready, or dead (a stream that is gone will
+    /// never fire: the copy's deadline starts and it is discharged if its acquire never
+    /// releases). Spinlock only.
+    pub(crate) fn ce_boundary_seen(&self, stream_boundary: u64) -> bool {
+        !self.present_stream_boundary_live(stream_boundary)
+            || self.scanout_boundary_ready(stream_boundary)
+    }
+
+    /// The copy-engine route's DIRECT dispatch (`CeRtDirect`) of the request
+    /// `(token, stream_boundary)` at its own Present, before its producer finished: in ONE
+    /// critical section of this lock, the request must exist undispatched, be the only pending
+    /// request naming `destination` (per-destination order), and the destination must be taken as
+    /// `KmdWriter` without waiting (`try_begin_present_buffer_write`, the worker's rule); then
+    /// `submit` runs (the route's spinlock and the channel's: plain stores) and, if it submitted,
+    /// the request is dispatched and admitted (SubmitCommand's later admission finds it admitted
+    /// and skips it), else the writer goes back and the request stays a deferred one. Spinlocks
+    /// only. `Err(())`: nothing changed (the caller counts why).
+    pub(crate) fn ce_direct_dispatch(
+        &mut self,
+        token: u64,
+        stream_boundary: u64,
+        destination: u32,
+        submit: impl FnOnce() -> bool,
+    ) -> Result<(), bool> {
+        let Some(index) = self.windowed_blt.pending.iter().position(|request| {
+            request.token == token && request.stream_boundary == stream_boundary
+        }) else {
+            return Err(false);
+        };
+        let request = &self.windowed_blt.pending[index];
+        let older = self.windowed_blt.pending.iter().any(|r| {
+            r.destination_resource_id == destination
+                && !(r.token == token && r.stream_boundary == stream_boundary)
+        });
+        if request.dispatched
+            || request.destination_resource_id != destination
+            || !matches!(request.destination, PresentDestinationDesc::StandardBuffer(_))
+            || older
+        {
+            return Err(false);
+        }
+        if self.try_begin_present_buffer_write(destination) != PresentBufferWriteBegin::Acquired {
+            return Err(false);
+        }
+        if !submit() {
+            // Nothing reached the GPU: the destination goes back, the request stays deferred.
+            self.complete_present_buffer_write(destination);
+            return Err(true);
+        }
+        let was_admitted = self.windowed_blt.pending[index].admitted;
+        {
+            let request = &mut self.windowed_blt.pending[index];
+            request.dispatched = true;
+            request.admitted = true;
+        }
+        if was_admitted {
+            self.windowed_blt.ready.retain(|known| *known != token);
+        }
+        self.blt_async_dispatched(index);
+        Ok(())
+    }
+
     /// A request left `pending` (terminal, cancelled or abandoned).
     pub(super) fn blt_async_gone(&self, request: &WindowedBltPending) {
         if request.async_blt {

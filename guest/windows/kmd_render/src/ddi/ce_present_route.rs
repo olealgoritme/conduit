@@ -83,6 +83,13 @@ static DST_NEW: AtomicU32 = AtomicU32::new(0);
 static DST_DROP: AtomicU32 = AtomicU32::new(0);
 static DST_LIVE: AtomicU32 = AtomicU32::new(0);
 static RUNS: AtomicU32 = AtomicU32::new(0);
+/// `CeRtDirect` in force (0 or 1), read at StartDevice with the route on.
+static DIRECT_KNOB: AtomicU32 = AtomicU32::new(0);
+static DIR: AtomicU32 = AtomicU32::new(0);
+static DIR_NO: AtomicU32 = AtomicU32::new(0);
+static DIR_WHY: AtomicU32 = AtomicU32::new(0);
+static DIR_US: AtomicU32 = AtomicU32::new(0);
+static LAG: AtomicU32 = AtomicU32::new(0);
 
 /// Nonzero while any job or destination record exists: every hook's fast exit.
 static ACTIVE: AtomicU32 = AtomicU32::new(0);
@@ -114,11 +121,15 @@ pub(crate) fn reset_for_start() {
     for c in [
         &SEEN, &ROUTED, &DONE, &FALL, &WHY, &MASK, &DISP_FALL, &CLIENT, &STRIKE, &STRUCK,
         &CH_STRIKE, &OFF, &POISON, &LEAK, &TIMEOUT, &CH_FAIL, &TIMED_OUT, &UP, &INFL, &PEAK, &DEC_US, &DUP_US, &SUB_US,
-        &DONE_US, &DONE_MAX, &POLL_US, &DST_NEW, &DST_DROP, &DST_LIVE, &RUNS,
+        &DONE_US, &DONE_MAX, &POLL_US, &DST_NEW, &DST_DROP, &DST_LIVE, &RUNS, &DIR, &DIR_NO,
+        &DIR_WHY, &DIR_US, &LAG,
     ] {
         c.store(0, Ordering::Relaxed);
     }
     WANT_UP.store(0, Ordering::Relaxed);
+    // `CeRtDirect`: read only with the route on (nothing is read or written with the knob off).
+    let direct = on() && crate::diag::read_config_dword(crate::diag::knobs::CE_RT_DIRECT, 0) == 1;
+    DIRECT_KNOB.store(u32::from(direct), Ordering::Relaxed);
     if on() {
         write_counters();
     }
@@ -163,6 +174,12 @@ fn write_counters() {
     rec(b"CeRtDstDrop", DST_DROP.load(Ordering::Relaxed));
     rec(b"CeRtDstLive", DST_LIVE.load(Ordering::Relaxed));
     rec(b"CeRtRuns", RUNS.load(Ordering::Relaxed));
+    rec(b"CeRtDirKnob", DIRECT_KNOB.load(Ordering::Relaxed));
+    rec(b"CeRtDir", DIR.load(Ordering::Relaxed));
+    rec(b"CeRtDirNo", DIR_NO.load(Ordering::Relaxed));
+    rec(b"CeRtDirWhy", DIR_WHY.load(Ordering::Relaxed));
+    rec(b"CeRtDirUs", DIR_US.load(Ordering::Relaxed));
+    rec(b"CeRtLag", LAG.load(Ordering::Relaxed));
 }
 
 /// A Present (or a dispatch) keeps the Venus copy.
@@ -382,12 +399,128 @@ pub(crate) unsafe fn try_route(
     }
     if recorded {
         ROUTED.fetch_add(1, Ordering::Relaxed);
-        // The worker prepares the job (dup, descriptor) before the request can be dispatched.
+        // `CeRtDirect` 1: submit the copy now, the GPU acquire waiting for the producer; when it
+        // cannot go without waiting, the request stays the deferred one (counted, `CeRtDirWhy`).
+        if DIRECT_KNOB.load(Ordering::Relaxed) != 0 {
+            try_direct(adapter, token, boundary, dst.resource_id);
+        }
+        // The worker prepares the job (dup, descriptor) before the request can be dispatched,
+        // or polls the copy just submitted.
         adapter.signal_hpd();
     } else {
         fall(Why::Full);
     }
     Some(token)
+}
+
+fn dir_no(why: cr::DirNo) {
+    DIR_NO.fetch_add(1, Ordering::Relaxed);
+    DIR_WHY.store(why.code(), Ordering::Relaxed);
+}
+
+/// The push of one job: the producer's acquire and the copy into the destination's descriptor.
+fn push_of(p: &Payload, sem_va: u64, src_va: u64, dst_va: u64) -> (cp::Acquire, cp::CopyRect) {
+    (
+        cp::Acquire {
+            va: sem_va,
+            value: p.rec.record.semaphore.value,
+        },
+        cp::CopyRect {
+            src_va: src_va.wrapping_add(p.plan.offset),
+            dst_va,
+            src_pitch: p.rec.record.source.pitch,
+            dst_pitch: p.dst_pitch,
+            line_bytes: p.plan.line_bytes,
+            lines: p.lines,
+            layout: p.plan.layout,
+            dst_layout: SurfaceLayout::Pitch,
+            remap: p.remap,
+            stamp: None,
+        },
+    )
+}
+
+/// `CeRtDirect` 1, from the Present DDI right after the routed request was queued and its token
+/// merged: submit its copy now instead of when the worker sees the producer's boundary ready.
+/// The push ACQUIREs the record's own value, so the GPU holds the copy until the producer's work
+/// released it. Only when nothing has to wait: the channel up with NO copy in flight (a direct
+/// copy never queues behind another destination's, nor lets one queue behind its acquire), the
+/// destination's descriptor made, both producer dups cached (no RM call), the channel's I/O free
+/// (`try_io`: no dup is remade or given back while the cached VAs are used), the destination
+/// taken as `KmdWriter` without waiting and no older request naming it. Everything else: the
+/// request stays deferred (`CeRtDirNo`, `CeRtDirWhy`). The submit is spinlocks and plain stores
+/// (the push, the GPFIFO entry, `GP_PUT`, the doorbell): bounded, never a wait, legal in the
+/// PASSIVE Present DDI, which holds no lock here.
+fn try_direct(adapter: &AdapterContext, token: u64, boundary: u64, dst: u32) {
+    let t0 = now_100ns();
+    let view = rio::chan_view();
+    if !view.up || adapter.system_backings.system_copy_invalid(dst) {
+        return dir_no(cr::DirNo::NotUp);
+    }
+    let (payload, dst_va) = {
+        let mut g = STATE.lock();
+        if g.jobs.in_flight() != 0 {
+            drop(g);
+            return dir_no(cr::DirNo::ChannelBusy);
+        }
+        let Some(payload) = g.jobs.find(token, boundary).map(|j| j.payload) else {
+            drop(g);
+            return dir_no(cr::DirNo::DstBusy);
+        };
+        match g.dst(dst).map(|e| e.dst.ready_va()) {
+            Some(Ok(va)) => (payload, va),
+            _ => {
+                drop(g);
+                return dir_no(cr::DirNo::NotPrepared);
+            }
+        }
+    };
+    if !rio::try_io() {
+        return dir_no(cr::DirNo::IoBusy);
+    }
+    let Some(producer) = rio::cached_producer(&payload.rec) else {
+        rio::end_io();
+        return dir_no(cr::DirNo::NotCached);
+    };
+    let (acquire, copy) = push_of(&payload, producer.sem_va, producer.src_va, dst_va);
+    let completed = rio::poll().map(|(c, _)| c);
+    // Lock order: virtio -> the route's STATE -> the channel's STATE (nothing takes them the
+    // other way round).
+    let dispatched = adapter.with_virtio(|v| {
+        v.ce_direct_dispatch(token, boundary, dst, || {
+            let Some(completed) = completed else {
+                return false;
+            };
+            let mut g = STATE.lock();
+            if g.jobs.in_flight() != 0 || g.jobs.find(token, boundary).is_none() {
+                return false;
+            }
+            let Ok(value) = rio::submit(acquire, &copy) else {
+                return false;
+            };
+            if let Some(j) = g.jobs.find_mut(token, boundary) {
+                j.state = JobState::Submitted { value, t_submit: now_100ns() };
+                j.direct = true;
+                j.seen = 0;
+                j.prep = Prep::Ready { sem_va: producer.sem_va, src_va: producer.src_va };
+            }
+            if let Some(e) = g.dst(dst) {
+                // No clock yet: it starts when the CPU sees the producer finish (`settle`).
+                e.dst.route.on_submit(value, completed);
+            }
+            true
+        })
+    });
+    rio::end_io();
+    match dispatched {
+        Ok(Ok(())) => {
+            DIR.fetch_add(1, Ordering::Relaxed);
+            infl_add();
+            add_us(&DIR_US, t0);
+        }
+        Ok(Err(true)) => dir_no(cr::DirNo::Submit),
+        Ok(Err(false)) | Err(_) => dir_no(cr::DirNo::DstBusy),
+    }
 }
 
 /// The destination's record, made when there is none (a free slot). `false`: no room.
@@ -582,9 +715,13 @@ pub(crate) fn dispatch(adapter: &AdapterContext, token: u64, boundary: u64) -> b
         return false;
     };
     let chan_up = rio::chan_view().up;
+    // A direct copy of another destination still waits on the GPU for its producer: this copy
+    // would queue behind that acquire (head-of-line), so it takes its Venus copy instead.
+    let blocked = g.jobs.blocked_by_direct(job.dst);
     let stale = adapter.system_backings.system_copy_invalid(job.dst);
     let va = g.dst(job.dst).map_or(Err(Why::Retiring), |e| e.dst.ready_va());
     let ready = match (job.prep, va, completed) {
+        _ if blocked => Err(Why::Blocked),
         _ if stale => Err(Why::Stale),
         (Prep::Pending, _, _) => Err(Why::NotReady),
         (Prep::Failed(w), _, _) => Err(w),
@@ -719,8 +856,10 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
     let t0 = now_100ns();
     let spin_until = t0 + cr::SETTLE_SPIN_US * 10;
     loop {
+        observe_direct_producers(adapter);
         let progress = rio::poll();
-        let mut done: [(u64, u64, bool, u64); cr::MAX_JOBS] = [(0, 0, false, 0); cr::MAX_JOBS];
+        let mut done: [(u64, u64, bool, u64, u64); cr::MAX_JOBS] =
+            [(0, 0, false, 0, 0); cr::MAX_JOBS];
         let mut n = 0usize;
         let mut timed_out_any = false;
         let more = {
@@ -729,8 +868,26 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
             let mut timed = [0u32; cr::MAX_DSTS];
             match progress {
                 Some((completed, _)) => {
-                    for (i, slot) in g.dsts.iter_mut().enumerate() {
+                    let State { jobs, dsts, .. } = &mut *g;
+                    for (i, slot) in dsts.iter_mut().enumerate() {
                         let Some(e) = slot.as_mut() else { continue };
+                        // A direct copy's clock starts when its producer was seen finished (or
+                        // at the sanity cap); a deferred one's started at its dispatch.
+                        let direct = jobs.iter().find(|j| {
+                            j.dst == e.dst.resource_id
+                                && j.direct
+                                && matches!(j.state, JobState::Submitted { .. })
+                        });
+                        if let Some(j) = direct {
+                            if let JobState::Submitted { t_submit, .. } = j.state {
+                                let seen = (j.seen != 0).then_some(j.seen / 10_000);
+                                if let Some(t) =
+                                    cr::route_fire_ms(true, t_submit / 10_000, seen, now_ms)
+                                {
+                                    e.dst.route.on_producer_fired(t, completed);
+                                }
+                            }
+                        }
                         if e.dst.route.poll(completed, now_ms) == cp::Poll::TimedOut {
                             // Its own deadline (`Discharge::Own`): `Route::poll` struck and
                             // poisoned it; never the route again, the pages stay pinned for the
@@ -747,7 +904,8 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
                         g.jobs.take_settled(completed, |d| d != 0 && timed.contains(&d))
                     {
                         if let JobState::Submitted { t_submit, .. } = job.state {
-                            done[n] = (job.token, job.boundary, r == Retire::Retire, t_submit);
+                            let ok = r == Retire::Retire;
+                            done[n] = (job.token, job.boundary, ok, t_submit, job.seen);
                             n += 1;
                         }
                     }
@@ -759,7 +917,7 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
                         g.jobs.take_first(|j| matches!(j.state, JobState::Submitted { .. }))
                     {
                         if let JobState::Submitted { t_submit, .. } = job.state {
-                            done[n] = (job.token, job.boundary, false, t_submit);
+                            done[n] = (job.token, job.boundary, false, t_submit, 0);
                             n += 1;
                         }
                         bystander(&mut g, job.dst);
@@ -777,13 +935,18 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
             }
             g.jobs.in_flight() != 0
         };
-        for &(token, boundary, ok, t_submit) in done.iter().take(n) {
+        for &(token, boundary, ok, t_submit, seen) in done.iter().take(n) {
             let _ = adapter.with_virtio(|v| v.complete_ce_blt(adapter, token, boundary, ok));
             infl_sub();
             if ok {
                 DONE.fetch_add(1, Ordering::Relaxed);
                 let us = add_us(&DONE_US, t_submit);
                 DONE_MAX.fetch_max(us, Ordering::Relaxed);
+                if seen != 0 {
+                    // A direct copy: the CPU's lag from seeing its producer finish to seeing it
+                    // done (0 when the completion was seen first: the copy beat the event).
+                    add_us(&LAG, seen);
+                }
             } else if progress.is_some() {
                 TIMEOUT.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -802,6 +965,41 @@ fn settle(_passive: PassiveLevel, adapter: &AdapterContext, spin: bool) {
         core::hint::spin_loop();
     }
     add_us(&POLL_US, t0);
+}
+
+/// The direct copies whose producer the CPU has not seen finish yet: their boundary is checked
+/// (`VirtioGpu::ce_boundary_seen`, a dead stream counts as finished) and the time it was first
+/// seen recorded, which starts the copy's deadline. One relaxed load with no direct copy.
+fn observe_direct_producers(adapter: &AdapterContext) {
+    if DIRECT_KNOB.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let unseen: [(u64, u64); cr::MAX_JOBS] = {
+        let g = STATE.lock();
+        let mut out = [(0u64, 0u64); cr::MAX_JOBS];
+        for (k, j) in g
+            .jobs
+            .iter()
+            .filter(|j| j.direct && j.seen == 0 && matches!(j.state, JobState::Submitted { .. }))
+            .enumerate()
+        {
+            out[k] = (j.token, j.boundary);
+        }
+        out
+    };
+    for &(token, boundary) in unseen.iter().filter(|(t, _)| *t != 0) {
+        let seen = adapter
+            .with_virtio(|v| v.ce_boundary_seen(boundary))
+            .unwrap_or(true);
+        if seen {
+            let now = now_100ns().max(1);
+            if let Some(j) = STATE.lock().jobs.find_mut(token, boundary) {
+                if j.seen == 0 {
+                    j.seen = now;
+                }
+            }
+        }
+    }
 }
 
 /// The channel broke (its error notifier, a copy that never completed) or its service struck
@@ -1000,6 +1198,27 @@ fn prepare(passive: PassiveLevel, adapter: &AdapterContext) {
             // The `h_client` rule once more, immediately before the dup: a client freed (and its
             // number re-minted for another process) since the Present is refused here.
             Ok(()) if !clients_still_owned(adapter, &rec, presenter) => Prep::Failed(Why::Client),
+            // A copy in flight may read a cached dup: only a cache hit now (no dup is remade or
+            // evicted, which would unmap a slot under that copy); a miss waits for the next pass.
+            Ok(()) if STATE.lock().jobs.in_flight() != 0 => {
+                let hit = if rio::try_io() {
+                    let p = rio::cached_producer(&rec);
+                    rio::end_io();
+                    p
+                } else {
+                    None
+                };
+                match hit {
+                    Some(p) => Prep::Ready {
+                        sem_va: p.sem_va,
+                        src_va: p.src_va,
+                    },
+                    None => {
+                        add_us(&DUP_US, t0);
+                        return;
+                    }
+                }
+            }
             Ok(()) => match rio::prep_producer(passive, adapter, &rec) {
                 Ok(p) => Prep::Ready {
                     sem_va: p.sem_va,

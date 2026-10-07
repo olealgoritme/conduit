@@ -84,10 +84,14 @@ pub enum Why {
     ChannelLost = 22,
     /// Dispatch: the destination is being retired (a lease change or its destruction).
     Retiring = 23,
+    /// Dispatch (`CeRtDirect` 1): a copy of ANOTHER destination was submitted directly and its
+    /// producer has not finished: this copy would queue behind its GPU acquire, so the request
+    /// takes its Venus copy instead (no head-of-line wait for another app's frame).
+    Blocked = 24,
 }
 
 /// Every reason, in code order.
-pub const ALL_WHY: [Why; 23] = [
+pub const ALL_WHY: [Why; 24] = [
     Why::NoBoundary,
     Why::NoRecord,
     Why::Client,
@@ -111,6 +115,7 @@ pub const ALL_WHY: [Why; 23] = [
     Why::Submit,
     Why::ChannelLost,
     Why::Retiring,
+    Why::Blocked,
 ];
 
 impl Why {
@@ -395,6 +400,12 @@ pub struct Job<P: Copy> {
     pub dst: u32,
     pub prep: Prep,
     pub state: JobState,
+    /// Submitted at the Present (`CeRtDirect` 1), before the producer's boundary was ready: the
+    /// GPU acquire holds the copy until the producer releases the record's value.
+    pub direct: bool,
+    /// Interrupt time (100 ns) the CPU first saw the producer's boundary ready after a direct
+    /// submit; 0 = not yet. Starts the copy's deadline ([`route_fire_ms`]).
+    pub seen: u64,
     pub payload: P,
 }
 
@@ -448,6 +459,8 @@ impl<P: Copy, const N: usize> Jobs<P, N> {
                     dst,
                     prep: Prep::Pending,
                     state: JobState::Queued,
+                    direct: false,
+                    seen: 0,
                     payload,
                 });
                 true
@@ -509,6 +522,14 @@ impl<P: Copy, const N: usize> Jobs<P, N> {
             .any(|j| j.dst == dst && matches!(j.state, JobState::Submitted { .. }))
     }
 
+    /// A copy submitted directly whose producer the CPU has not yet seen finish, into a destination
+    /// other than `dst`: a copy for `dst` submitted now would wait behind its GPU acquire.
+    pub fn blocked_by_direct(&self, dst: u32) -> bool {
+        self.iter().any(|j| {
+            j.direct && j.seen == 0 && j.dst != dst && matches!(j.state, JobState::Submitted { .. })
+        })
+    }
+
     /// Remove and return one submitted job `retire` decides for (`Retire` or `Discharge`) at
     /// `completed`; `timed_out(dst)` says whether the destination's poll timed out.
     pub fn take_settled(
@@ -542,6 +563,83 @@ impl<P: Copy, const N: usize> Jobs<P, N> {
 /// The jobs table's size: the WindowedBlt FIFO's depth is the real bound; this is enough for a
 /// few windows each with a frame queued and one in flight.
 pub const MAX_JOBS: usize = 16;
+
+// ── direct submission (`CeRtDirect`) ──────────────────────────────────────────────────────────
+
+/// `CeRtDirect` (service-key REG_DWORD, read at StartDevice with `RmCopyEngine` 1, mirrored as
+/// `CeRtDirKnob`): 1 submits a routed copy at its Present, the GPU acquire on the record's value
+/// making the copy wait for the producer, instead of when the worker sees the boundary ready.
+pub const DIRECT_KNOB: &str = "CeRtDirect";
+
+/// The sanity cap of a direct copy whose producer the CPU has not yet seen finish (ms from its
+/// submit). Longer than the RM gate's own expiry (`rm_fence_present::GATE_EXPIRE_DEFAULT_MS`,
+/// 6 s, after which the boundary is declared ready and the normal deadline starts), so it only
+/// acts when `RmGateMs` is 0 or the gate never fires: the copy is then discharged as its own
+/// (the producer's) failure and the channel torn down, so the acquire cannot hold the GPU.
+pub const DIRECT_CAP_MS: u64 = 7_000;
+
+const _: () = assert!(DIRECT_CAP_MS > crate::rm_fence_present::GATE_EXPIRE_DEFAULT_MS as u64);
+
+/// Why a routed copy was not submitted at its Present (`CeRtDirWhy`): it is queued as before and
+/// the worker dispatches it when the boundary is ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DirNo {
+    /// The channel already has a copy in flight (a direct copy would queue behind it, or put
+    /// another destination's copy behind its acquire).
+    ChannelBusy = 1,
+    /// The destination's descriptor is not made yet.
+    NotPrepared = 2,
+    /// The producer's dup and mapping are not cached (making them is RM I/O: the worker's).
+    NotCached = 3,
+    /// The channel's RM I/O is held by another thread (`try_io`).
+    IoBusy = 4,
+    /// The destination cannot be taken as `KmdWriter` now, or an older request names it.
+    DstBusy = 5,
+    /// The channel refused the push.
+    Submit = 6,
+    /// The channel is not up, or the destination's system copy is marked stale.
+    NotUp = 7,
+}
+
+impl DirNo {
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+}
+
+/// When the deadline of a submitted copy starts (ms, the value `Route::on_producer_fired` takes),
+/// or `None` while it must not run. A deferred copy (`direct` false) was dispatched only once the
+/// producer's boundary was ready: its clock starts at the dispatch. A direct copy waits on the GPU
+/// for the producer, which may legitimately take long: its clock starts when the CPU sees the
+/// boundary ready (`seen_ms`); while it has not, nothing runs until `DIRECT_CAP_MS` after the
+/// submit, when the clock is set already expired (the next poll discharges the copy).
+pub const fn route_fire_ms(
+    direct: bool,
+    t_submit_ms: u64,
+    seen_ms: Option<u64>,
+    now_ms: u64,
+) -> Option<u64> {
+    if !direct {
+        return Some(t_submit_ms);
+    }
+    match seen_ms {
+        Some(t) => Some(t),
+        None if now_ms.saturating_sub(t_submit_ms) > DIRECT_CAP_MS => {
+            Some(now_ms.saturating_sub(COMPLETE_MS + 1))
+        }
+        None => None,
+    }
+}
+
+/// Whether the semaphore ACQUIRE of a copy releases at `current` for the record's `value`: the
+/// host-class `ACQ_STRICT_GEQ`, unsigned 64-bit `current >= value`. On one producer timeline the
+/// values a queue releases only grow, so `current >= value` means frame `value`'s work has
+/// finished (a later frame's higher value implies it); a lower or equal value of an older frame
+/// releases at once and never hangs.
+pub const fn acquire_releases(current: u64, value: u64) -> bool {
+    current >= value
+}
 
 // ── the route's own strikes ──────────────────────────────────────────────────────────────────
 
@@ -712,6 +810,15 @@ pub const COUNTERS: &[&str] = &[
     "CeRtDstDrop",
     "CeRtDstLive",
     "CeRtRuns",
+    // `CeRtDirect`: the knob in force; copies submitted at their Present; not (and the last
+    // reason); microseconds in those submits (sum); the CPU's lag from seeing a direct copy's
+    // producer boundary ready to seeing its completion (sum, us).
+    "CeRtDirKnob",
+    "CeRtDir",
+    "CeRtDirNo",
+    "CeRtDirWhy",
+    "CeRtDirUs",
+    "CeRtLag",
 ];
 
 /// The files that write [`COUNTERS`] (relative to `kmd_render/src`).
@@ -1098,6 +1205,103 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_copy_s_deadline_starts_when_its_producer_is_seen() {
+        // Deferred: at the dispatch.
+        assert_eq!(route_fire_ms(false, 10, None, 99_999), Some(10));
+        // Direct, the producer still rendering (a heavy frame): no clock, however long, up to
+        // the cap.
+        assert_eq!(route_fire_ms(true, 10, None, 10 + 500), None);
+        assert_eq!(route_fire_ms(true, 10, None, 10 + DIRECT_CAP_MS), None);
+        // Seen ready: the clock starts at the observation, not at the submit.
+        assert_eq!(route_fire_ms(true, 10, Some(4_000), 4_050), Some(4_000));
+        // Past the cap unseen: the clock is set expired, so the next poll discharges it.
+        let now = 10 + DIRECT_CAP_MS + 1;
+        let fire = route_fire_ms(true, 10, None, now).unwrap();
+        assert!(now - fire > COMPLETE_MS);
+        // End to end with the destination's route: submitted direct at 10 ms, the producer seen
+        // at 4000 ms, still pending at 4050 ms, timed out after 4000 + COMPLETE_MS.
+        let mut r = cp::Route::new();
+        r.on_submit(7, 6);
+        assert_eq!(r.poll(6, 3_000), cp::Poll::Pending, "no clock before the producer is seen");
+        if let Some(t) = route_fire_ms(true, 10, Some(4_000), 4_050) {
+            r.on_producer_fired(t, 6);
+        }
+        assert_eq!(r.poll(6, 4_050), cp::Poll::Pending);
+        assert_eq!(r.poll(6, 4_000 + COMPLETE_MS + 1), cp::Poll::TimedOut);
+        // A cap-overdue direct copy times out on the poll right after it is stamped.
+        let mut r = cp::Route::new();
+        r.on_submit(7, 6);
+        let now = 10 + DIRECT_CAP_MS + 5;
+        r.on_producer_fired(route_fire_ms(true, 10, None, now).unwrap(), 6);
+        assert_eq!(r.poll(6, now), cp::Poll::TimedOut);
+    }
+
+    #[test]
+    fn a_direct_copy_blocks_other_destinations_until_its_producer_is_seen() {
+        let mut j: Jobs<u8, 4> = Jobs::new();
+        assert!(j.add(1, 0xa, 7, 0));
+        assert!(!j.blocked_by_direct(8));
+        let x = j.find_mut(1, 0xa).unwrap();
+        x.state = JobState::Submitted { value: 5, t_submit: 0 };
+        x.direct = true;
+        // Another destination's copy would queue behind the unsatisfied acquire.
+        assert!(j.blocked_by_direct(8));
+        // Its own destination never has two copies in flight (KmdWriter), so it is not "blocked".
+        assert!(!j.blocked_by_direct(7));
+        // Seen ready: the acquire is satisfied or about to be; others may go.
+        j.find_mut(1, 0xa).unwrap().seen = 123;
+        assert!(!j.blocked_by_direct(8));
+        // A deferred copy in flight never blocks.
+        assert!(j.add(2, 0xa, 9, 0));
+        j.find_mut(2, 0xa).unwrap().state = JobState::Submitted { value: 6, t_submit: 0 };
+        assert!(!j.blocked_by_direct(8));
+    }
+
+    /// Head-of-line: the direct head that times out is charged as its own (the producer's)
+    /// failure, everything submitted behind it is a bystander, and each is settled once.
+    #[test]
+    fn a_discharged_direct_head_settles_every_copy_behind_it_once() {
+        let mut j: Jobs<u8, 4> = Jobs::new();
+        for (t, d, v) in [(1u64, 7u32, 5u64), (2, 8, 6), (3, 9, 7)] {
+            assert!(j.add(t, 0xa, d, 0));
+            let x = j.find_mut(t, 0xa).unwrap();
+            x.state = JobState::Submitted { value: v, t_submit: 0 };
+            x.direct = t == 1;
+        }
+        // The head (destination 7) timed out: only its own copy settles as a discharge here.
+        let (head, r) = j.take_settled(4, |d| d == 7).unwrap();
+        assert_eq!((head.token, r), (1, Retire::Discharge));
+        assert!(j.take_settled(4, |d| d == 7).is_none());
+        // The channel is then torn down: the others are taken once each, as bystanders.
+        let mut seen = Vec::new();
+        while let Some(x) = j.take_first(|x| matches!(x.state, JobState::Submitted { .. })) {
+            seen.push(x.token);
+            assert_eq!(cr_charge(x.token == 1), (false, false));
+        }
+        assert_eq!(seen, [2, 3]);
+        assert!(j.is_empty());
+    }
+
+    fn cr_charge(own: bool) -> (bool, bool) {
+        if own { Discharge::Own } else { Discharge::Bystander }.charges()
+    }
+
+    #[test]
+    fn the_acquire_is_geq_on_one_growing_timeline() {
+        // Frame 5's copy releases once 5 (or anything later) landed, never before.
+        assert!(!acquire_releases(4, 5));
+        assert!(acquire_releases(5, 5));
+        assert!(acquire_releases(6, 5));
+        // An older frame's value is released already: no hang.
+        assert!(acquire_releases(9, 3));
+        assert!(acquire_releases(u64::MAX, u64::MAX));
+        assert!(!acquire_releases(0, 1));
+        assert_eq!(DirNo::ChannelBusy.code(), 1);
+        assert_eq!(DirNo::NotUp.code(), 7);
+        assert!(DIRECT_KNOB.len() <= 14 && DIRECT_KNOB.starts_with("CeRt"));
+    }
+
+    #[test]
     fn a_bystander_is_never_charged() {
         assert_eq!(Discharge::Own.charges(), (true, true));
         assert_eq!(Discharge::Bystander.charges(), (false, false));
@@ -1182,9 +1386,12 @@ mod tests {
             assert!(written.iter().any(|l| l == n), "{n} is listed but not written by {WRITERS:?}");
         }
         for l in written.iter().filter(|l| l.starts_with("Ce")) {
-            assert!(COUNTERS.contains(&l.as_str()), "{l} is written by {WRITERS:?} but not listed");
+            assert!(
+                COUNTERS.contains(&l.as_str()) || l == DIRECT_KNOB,
+                "{l} is written by {WRITERS:?} but not listed"
+            );
         }
-        // No other file spells these names (nor any `CeRt` name).
+        // No other file spells these names (nor any `CeRt` name); diag.rs only the knob.
         let mut stack = std::vec![render.clone()];
         let mut checked = 0;
         while let Some(dir) = stack.pop() {
@@ -1198,7 +1405,12 @@ mod tests {
                         continue;
                     }
                     checked += 1;
-                    let text = std::fs::read_to_string(&p).unwrap();
+                    let mut text = std::fs::read_to_string(&p).unwrap();
+                    if s.ends_with("/diag.rs") {
+                        let knob = std::format!("KnobName::new(b\"{DIRECT_KNOB}\")");
+                        assert!(text.contains(&knob), "diag.rs lacks the {DIRECT_KNOB} knob");
+                        text = text.replace(&knob, "");
+                    }
                     assert!(!text.contains("b\"CeRt"), "{s} spells a CeRt counter name");
                 }
             }
