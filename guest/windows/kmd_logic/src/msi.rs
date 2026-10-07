@@ -575,15 +575,19 @@ pub enum LatchVerdict {
     Clear,
     /// Latched by THIS build (`MsiLatchVer` = the running tag): honoured.
     Held,
-    /// Latched with no build tag: written by the operator (or an image older than the tag).
-    /// Honoured: an operator's `MsiLatch=1` keeps working, and deleting `MsiLatch` (or writing
-    /// 0) is how an operator clears any latch.
+    /// Latched with no build tag and no KMD reason (`MsiLatchWhy` absent, 0, or a value the KMD
+    /// never writes): the operator's. Honoured. Deleting `MsiLatch` (or writing 0) is how an
+    /// operator clears any latch; a permanent INTx is `MsiMode=1`, which is not a latch.
     Operator,
-    /// Latched by a DIFFERENT build: stale. Ignored for this start's decision, cleared
+    /// Latched by a DIFFERENT build (tagged): stale. Ignored for this start's decision, cleared
     /// (`MsiLatch`, `MsiLatchWhy`, `MsiLatchVer` to 0) and counted (`MsiLatchOld`). A new build
     /// gets one fresh attempt at MSI-X; the breaker and the latch protect against a fault of
     /// THAT build.
     Stale,
+    /// Latched with no build tag but with a KMD reason (`MsiLatchWhy` 1 to 4): written by an image
+    /// older than the build tag. Stale like [`LatchVerdict::Stale`], and also marked
+    /// `MsiLatchLegacy=1`. Without this, every install coming from such a build stayed on INTx.
+    Legacy,
 }
 
 impl LatchVerdict {
@@ -591,15 +595,40 @@ impl LatchVerdict {
     pub const fn latched(self) -> bool {
         matches!(self, LatchVerdict::Held | LatchVerdict::Operator)
     }
+
+    /// Whether `AddDevice` sets the latch aside (clears it, `MsiLatchOld` + 1).
+    pub const fn set_aside(self) -> bool {
+        matches!(self, LatchVerdict::Stale | LatchVerdict::Legacy)
+    }
 }
 
-/// The latch decision: `latch` is `MsiLatch != 0`, `latch_build` is `MsiLatchVer` (0 = absent),
-/// `running` is [`build_tag`] of this image.
-pub const fn latch_verdict(latch: bool, latch_build: u32, running: u32) -> LatchVerdict {
+/// Whether `why` is a reason the KMD writes into `MsiLatchWhy` ([`latch_why`]).
+pub const fn kmd_latch_reason(why: u32) -> bool {
+    matches!(
+        why,
+        latch_why::SILENT | latch_why::REFUSED | latch_why::NO_CFG | latch_why::BREAKER
+    )
+}
+
+/// The latch decision: `latch` is `MsiLatch != 0`, `why` is `MsiLatchWhy` (0 = absent),
+/// `latch_build` is `MsiLatchVer` (0 = absent), `running` is [`build_tag`] of this image.
+///
+/// | latch | tag | why | verdict |
+/// | --- | --- | --- | --- |
+/// | no | any | any | Clear |
+/// | yes | the running build | any | Held |
+/// | yes | another build | any | Stale |
+/// | yes | none | 1 to 4 (a KMD reason) | Legacy (an image older than the tag wrote it) |
+/// | yes | none | 0 / absent / other | Operator |
+pub const fn latch_verdict(latch: bool, why: u32, latch_build: u32, running: u32) -> LatchVerdict {
     if !latch {
         LatchVerdict::Clear
     } else if latch_build == 0 {
-        LatchVerdict::Operator
+        if kmd_latch_reason(why) {
+            LatchVerdict::Legacy
+        } else {
+            LatchVerdict::Operator
+        }
     } else if latch_build == running {
         LatchVerdict::Held
     } else {
@@ -613,6 +642,14 @@ pub const fn latch_verdict(latch: bool, latch_build: u32, running: u32) -> Latch
 /// stale latch of the old build and ignored.
 pub const fn latch_tag_orphaned(latch: bool, latch_build: u32) -> bool {
     !latch && latch_build != 0
+}
+
+/// Whether `AddDevice` should zero a leftover `MsiLatchWhy`: the latch is clear but a reason is
+/// still there. Without this, an operator who wrote `MsiLatch=0` over a KMD latch and later sets
+/// `MsiLatch=1` by hand would have it read as an untagged KMD latch ([`LatchVerdict::Legacy`])
+/// and set aside.
+pub const fn latch_why_orphaned(latch: bool, why: u32) -> bool {
+    !latch && why != 0
 }
 
 // ── Counting: per-vector interrupts and DPCs ─────────────────────────────────
@@ -924,7 +961,7 @@ pub mod latch_why {
 /// `kmd_render/src/virtio/msi.rs` only. `MsiMode` and `MsiVectors` are knobs the
 /// operator writes and are not listed; `MsiLatch` is both: the KMD writes 1, an
 /// operator may write either. At most 14 characters each.
-pub const COUNTERS: [&str; 47] = [
+pub const COUNTERS: [&str; 48] = [
     // The set-up breadcrumbs.
     "MsiCap",
     "MsiList",
@@ -974,6 +1011,9 @@ pub const COUNTERS: [&str; 47] = [
     "MsiLatchVer",
     "MsiMarkerOld",
     "MsiLatchOld",
+    // 1 = the last latch set aside was untagged with a KMD reason (an image older than the tag),
+    // 0 = it was tagged by another build.
+    "MsiLatchLegacy",
     // Latches a run-time verdict asked for while the device was stopping, ignored
     // (`latch_allowed`; per image load), and the `MsiLatchWhy` of the last one.
     "MsiLatchStop",
@@ -1462,18 +1502,26 @@ mod tests {
 
     #[test]
     fn latch_verdict_table() {
-        assert_eq!(latch_verdict(false, 0, THIS), LatchVerdict::Clear);
-        assert_eq!(latch_verdict(false, OLDER, THIS), LatchVerdict::Clear);
+        assert_eq!(latch_verdict(false, 0, 0, THIS), LatchVerdict::Clear);
+        assert_eq!(latch_verdict(false, 4, OLDER, THIS), LatchVerdict::Clear);
         // This build's latch holds.
-        assert_eq!(latch_verdict(true, THIS, THIS), LatchVerdict::Held);
-        // No tag: the operator's (or an old image's) latch holds.
-        assert_eq!(latch_verdict(true, 0, THIS), LatchVerdict::Operator);
+        assert_eq!(latch_verdict(true, 1, THIS, THIS), LatchVerdict::Held);
+        // No tag, no KMD reason: the operator's latch holds.
+        assert_eq!(latch_verdict(true, 0, 0, THIS), LatchVerdict::Operator);
+        // No tag, a KMD reason: an image older than the tag wrote it (346.1 -> 347.1).
+        assert_eq!(latch_verdict(true, 4, 0, THIS), LatchVerdict::Legacy);
         // Another build's latch is stale.
-        assert_eq!(latch_verdict(true, OLDER, THIS), LatchVerdict::Stale);
+        assert_eq!(latch_verdict(true, 1, OLDER, THIS), LatchVerdict::Stale);
         assert!(LatchVerdict::Held.latched());
         assert!(LatchVerdict::Operator.latched());
         assert!(!LatchVerdict::Stale.latched());
+        assert!(!LatchVerdict::Legacy.latched());
         assert!(!LatchVerdict::Clear.latched());
+        assert!(LatchVerdict::Stale.set_aside());
+        assert!(LatchVerdict::Legacy.set_aside());
+        assert!(!LatchVerdict::Held.set_aside());
+        assert!(!LatchVerdict::Operator.set_aside());
+        assert!(!LatchVerdict::Clear.set_aside());
         // An operator who wrote 0 instead of deleting leaves a tag that is zeroed, so a later
         // hand-set 1 reads as the operator's.
         assert!(latch_tag_orphaned(false, OLDER));
@@ -1483,12 +1531,96 @@ mod tests {
     }
 
     #[test]
+    fn latch_verdict_every_combination() {
+        let modes = [
+            Mode::Auto,
+            Mode::ForceIntx,
+            Mode::ForceMsi,
+            Mode::ForceMsiNoBreaker,
+        ];
+        for latch in [false, true] {
+            for why in [0u32, 1, 2, 3, 4, 5, 99, u32::MAX] {
+                for tag in [0u32, THIS, OLDER] {
+                    let v = latch_verdict(latch, why, tag, THIS);
+                    let expected = if !latch {
+                        LatchVerdict::Clear
+                    } else if tag == THIS {
+                        LatchVerdict::Held
+                    } else if tag != 0 {
+                        LatchVerdict::Stale
+                    } else if (1..=4).contains(&why) {
+                        LatchVerdict::Legacy
+                    } else {
+                        LatchVerdict::Operator
+                    };
+                    assert_eq!(v, expected, "latch={latch} why={why} tag={tag:#x}");
+                    // What the key asks for, in every mode.
+                    for mode in modes {
+                        let action = key_action(mode, v.latched());
+                        match mode {
+                            Mode::ForceIntx => assert_eq!(action, KeyAction::SetIntx),
+                            Mode::ForceMsiNoBreaker => assert_eq!(action, KeyAction::SetMsi),
+                            Mode::ForceMsi => assert_eq!(
+                                action,
+                                if v.latched() {
+                                    KeyAction::SetIntx
+                                } else {
+                                    KeyAction::SetMsi
+                                }
+                            ),
+                            Mode::Auto => assert_eq!(
+                                action,
+                                if v.latched() {
+                                    KeyAction::SetIntx
+                                } else {
+                                    KeyAction::Leave
+                                }
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        // The KMD reasons are exactly latch_why.
+        for why in [
+            latch_why::SILENT,
+            latch_why::REFUSED,
+            latch_why::NO_CFG,
+            latch_why::BREAKER,
+        ] {
+            assert!(kmd_latch_reason(why));
+        }
+        assert!(!kmd_latch_reason(0));
+        assert!(!kmd_latch_reason(5));
+    }
+
+    #[test]
+    fn a_cleared_latch_loses_its_leftover_reason() {
+        assert!(latch_why_orphaned(false, 4));
+        assert!(!latch_why_orphaned(false, 0));
+        assert!(!latch_why_orphaned(true, 4));
+        // After the zeroing, a hand-set 1 is the operator's, not a legacy KMD latch.
+        assert_eq!(latch_verdict(true, 0, 0, THIS), LatchVerdict::Operator);
+    }
+
+    #[test]
+    fn an_update_from_a_pre_tag_build_keeps_msi() {
+        // 346.1 -> 347.1: the old image wrote MsiLatch=1, MsiLatchWhy=4 and no tag.
+        let v = latch_verdict(true, latch_why::BREAKER, 0, THIS);
+        assert_eq!(v, LatchVerdict::Legacy);
+        assert_eq!(key_action(Mode::ForceMsi, v.latched()), KeyAction::SetMsi);
+        // The operator's latch (no reason) still forces INTx under the opt-in.
+        let v = latch_verdict(true, 0, 0, THIS);
+        assert_eq!(key_action(Mode::ForceMsi, v.latched()), KeyAction::SetIntx);
+    }
+
+    #[test]
     fn a_package_update_over_a_running_msi_device_keeps_msi() {
         // The hardware case (2026-10-07): the old build's start left its marker (or its latch),
         // the new build's AddDevice must still ask for MSI-X under the opt-in.
         let marker = marker_verdict(Mode::ForceMsi, true, OLDER, THIS);
         assert_eq!(marker, MarkerVerdict::Stale);
-        let latch = latch_verdict(true, OLDER, THIS);
+        let latch = latch_verdict(true, 1, OLDER, THIS);
         let latched = latch.latched() || marker == MarkerVerdict::Trip;
         assert_eq!(key_action(Mode::ForceMsi, latched), KeyAction::SetMsi);
         // A marker of an image that predates the tag is stale too.
@@ -1500,10 +1632,10 @@ mod tests {
         let marker = marker_verdict(Mode::ForceMsi, true, THIS, THIS);
         assert_eq!(marker, MarkerVerdict::Trip);
         assert_eq!(key_action(Mode::ForceMsi, true), KeyAction::SetIntx);
-        assert!(latch_verdict(true, THIS, THIS).latched());
+        assert!(latch_verdict(true, 4, THIS, THIS).latched());
         // An operator's latch (no tag) still forces INTx under the opt-in.
         assert_eq!(
-            key_action(Mode::ForceMsi, latch_verdict(true, 0, THIS).latched()),
+            key_action(Mode::ForceMsi, latch_verdict(true, 0, 0, THIS).latched()),
             KeyAction::SetIntx
         );
     }
@@ -1912,6 +2044,7 @@ mod tests {
                                     "MsiLatchVer",
                                     "MsiMarkerOld",
                                     "MsiLatchOld",
+                                    "MsiLatchWhy",
                                 ]
                                 .contains(mine)
                                     && name == "diag.rs")
