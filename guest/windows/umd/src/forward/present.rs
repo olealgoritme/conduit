@@ -770,6 +770,11 @@ impl RuntimeSubmission {
         // An RM fence (NVK on RM, S4) appends the 16-byte tail of
         // `helios_rm_fence.h`; the KMD reads it only from the longer command.
         match self {
+            // The copy-engine record rides behind the fence tail: 192 bytes.
+            Self::TypedPresent { correlation, .. } if rm_copy_record(*correlation).is_some() => (
+                core::mem::size_of::<helios_protocol::HeliosPresentRenderCmdRmCopy>() as u32,
+                "Present",
+            ),
             Self::TypedPresent { correlation, .. } if rm_fence_tail(*correlation).is_some() => (
                 core::mem::size_of::<helios_protocol::HeliosPresentRenderCmdFence>() as u32,
                 "Present",
@@ -782,6 +787,12 @@ impl RuntimeSubmission {
             // slot: 72 bytes (`helios_onscanout.h`).
             Self::MarkerPresent { correlation, .. } if correlation.on_scanout.is_some() => (
                 helios_protocol::HELIOS_ONSCANOUT_HERF_BYTES as u32,
+                "Present",
+            ),
+            // The copy-engine record at 72, behind the zero on-scanout slot:
+            // 168 bytes.
+            Self::MarkerPresent { correlation, .. } if rm_copy_record(*correlation).is_some() => (
+                core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmdRmCopy>() as u32,
                 "Present",
             ),
             Self::MarkerPresent { correlation, .. } if rm_fence_tail(*correlation).is_some() => (
@@ -863,6 +874,18 @@ fn rm_fence_tail(correlation: PresentStreamCorrelation) -> Option<helios_protoco
         })
 }
 
+/// The copy-engine record behind a present marker's fence tail
+/// (`helios_rm_fence.h` v3): only with a fence tail (whose value it was checked
+/// against) and never with the on-scanout tag (an on-scanout frame is never
+/// copied; the two would also claim the same bytes 48..72 differently).
+fn rm_copy_record(
+    correlation: PresentStreamCorrelation,
+) -> Option<helios_protocol::HeliosRmFenceTailV3> {
+    let tail = rm_fence_tail(correlation)?;
+    let record = correlation.rm_copy?;
+    (correlation.on_scanout.is_none() && record.matches_fence(&tail)).then_some(record)
+}
+
 /// Submit a runtime-owned WDDM command buffer.
 ///
 /// The legacy pfnRenderCb allocation list is mandatory for a DXGI present even
@@ -922,16 +945,23 @@ pub(crate) unsafe fn submit_runtime_submission(
             private.present_cookie = correlation.cookie;
             if let Some(tail) = rm_fence_tail(correlation) {
                 private.reserved |= helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_RM_FENCE;
-                (command as *mut helios_protocol::HeliosPresentRenderCmdFence).write_unaligned(
-                    helios_protocol::HeliosPresentRenderCmdFence {
-                        base: HeliosPresentRenderCmd {
-                            magic: HELIOS_PRESENT_RENDER_MAGIC,
-                            version: HELIOS_PRESENT_RENDER_VERSION,
-                            present: private,
-                        },
-                        fence: tail,
+                let fenced = helios_protocol::HeliosPresentRenderCmdFence {
+                    base: HeliosPresentRenderCmd {
+                        magic: HELIOS_PRESENT_RENDER_MAGIC,
+                        version: HELIOS_PRESENT_RENDER_VERSION,
+                        present: private,
                     },
-                );
+                    fence: tail,
+                };
+                // The length above came from the same `rm_copy_record`.
+                if let Some(record) = rm_copy_record(correlation) {
+                    (command as *mut helios_protocol::HeliosPresentRenderCmdRmCopy).write_unaligned(
+                        helios_protocol::HeliosPresentRenderCmdRmCopy::new(fenced, record),
+                    );
+                } else {
+                    (command as *mut helios_protocol::HeliosPresentRenderCmdFence)
+                        .write_unaligned(fenced);
+                }
             } else {
                 (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
                     magic: HELIOS_PRESENT_RENDER_MAGIC,
@@ -956,6 +986,16 @@ pub(crate) unsafe fn submit_runtime_submission(
                 (command as *mut helios_protocol::HeliosPresentRefreshCmdOnScanout)
                     .write_unaligned(onscanout_marker(correlation, claim));
                 NVK_ONSCANOUT_TAGGED.fetch_add(1, Ordering::Relaxed);
+            } else if let (Some(tail), Some(record)) =
+                (rm_fence_tail(correlation), rm_copy_record(correlation))
+            {
+                (command as *mut helios_protocol::HeliosPresentRefreshCmdRmCopy).write_unaligned(
+                    helios_protocol::HeliosPresentRefreshCmdRmCopy::new(
+                        present_refresh_cmd(correlation),
+                        tail,
+                        record,
+                    ),
+                );
             } else if let Some(tail) = rm_fence_tail(correlation) {
                 (command as *mut helios_protocol::HeliosPresentRefreshCmdFence).write_unaligned(
                     helios_protocol::HeliosPresentRefreshCmdFence {
@@ -1489,6 +1529,12 @@ fn dwm_on_nvk_marker() -> bool {
 static NVK_FENCED_PRESENTS: AtomicUsize = AtomicUsize::new(0);
 static NVK_FENCED_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static NVK_MARKER_FENCES: AtomicUsize = AtomicUsize::new(0);
+/// Composed frames whose fence carried the copy-engine record (`'HEF3'`).
+static NVK_RM_COPY_RECORDS: AtomicUsize = AtomicUsize::new(0);
+/// ... and those that went without one: NVK described nothing (an older NVK,
+/// an image it cannot describe) or the record broke a rule the KMD applies.
+static NVK_RM_COPY_NONE: AtomicUsize = AtomicUsize::new(0);
+static NVK_RM_COPY_REFUSED: AtomicUsize = AtomicUsize::new(0);
 
 /// `HELIOS_ICD_CAP_*` bits this file reads (`helios_icd_interface.h`).
 const HELIOS_ICD_CAP_RM_FENCE: u32 = 1 << 4;
@@ -1511,9 +1557,15 @@ const HELIOS_ICD_CAP_PRESENT_FENCE_KMD: u32 = 1 << 6;
 /// Without RM fences (no DRM fences on the host, an older NVK or librmclient,
 /// `NvkRmFence=0`): the S3 behaviour, a CPU wait for the frame's GPU work
 /// before the flip or the WDDM present.
+///
+/// `blt_source`: `shown` is the source allocation of the WDDM present that
+/// follows (the KMD's Blt source), so a composed frame's fence may carry the
+/// copy-engine Present record naming it (docs/rm-copy-engine-present.md 12);
+/// false when the UMD copied the frame elsewhere first.
 unsafe fn nvk_present_frame(
     h: Hdevice,
     shown: ddi::D3D10DDI_HRESOURCE,
+    blt_source: bool,
 ) -> Result<NvkFrame, i32> {
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
@@ -1577,15 +1629,22 @@ unsafe fn nvk_present_frame(
                 // No RM fences after all: the CPU wait below.
                 None => {}
             }
-        } else if let Some((fence, value)) = dev.dxvk.nvk_present_fence() {
+        } else if let Some((fence, value, rm_copy)) = nvk_marker_fence(dev, shown, blt_source) {
             let n = NVK_MARKER_FENCES.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 || n % 4096 == 0 {
-                log_error!("NVK present: {n} WDDM presents carry an RM fence (value {value})");
+                log_error!(
+                    "NVK present: {n} WDDM presents carry an RM fence (value {value}); \
+                     copy-engine record {} (without {}, refused {})",
+                    NVK_RM_COPY_RECORDS.load(Ordering::Relaxed),
+                    NVK_RM_COPY_NONE.load(Ordering::Relaxed),
+                    NVK_RM_COPY_REFUSED.load(Ordering::Relaxed),
+                );
             }
             return Ok(NvkFrame {
                 correlation: PresentStreamCorrelation {
                     rm_fence_handle: fence,
                     rm_fence_value: value,
+                    rm_copy,
                     ..PresentStreamCorrelation::default()
                 },
                 on_scanout: false,
@@ -1629,6 +1688,78 @@ unsafe fn nvk_present_frame(
         }
     }
     Ok(NvkFrame::default())
+}
+
+/// The RM fence of a composed frame's WDDM present, and the copy-engine
+/// Present record behind it when the KMD reads one (QueryCaps bit 37), NVK
+/// has `queue_rm_fence_v3`, `NvkRmCopyRecord` is on and `shown` is the Blt
+/// source. The record goes only when it passes every rule the KMD applies
+/// (`helios_protocol::producer_record`); otherwise the fence goes alone, as
+/// before. The caller owns the fence.
+unsafe fn nvk_marker_fence(
+    dev: &HeliosDevice,
+    shown: ddi::D3D10DDI_HRESOURCE,
+    blt_source: bool,
+) -> Option<(u32, u64, Option<helios_protocol::HeliosRmFenceTailV3>)> {
+    let wanted = blt_source
+        && crate::knobs::nvk_rm_copy_record()
+        // SAFETY: `dev` is the live device of this present.
+        && unsafe { crate::scanout_acquire::nvrm_rm_fence_tail_v3_capable(dev) };
+    if !wanted {
+        return dev.dxvk.nvk_present_fence().map(|(fence, value)| (fence, value, None));
+    }
+    let src = load_resource(shown);
+    let (fence, value, copy) = dev.dxvk.nvk_present_fence_v3(src.as_deref())?;
+    let tail = helios_protocol::HeliosRmFenceTail {
+        rm_fence_handle: fence,
+        flags: helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
+        rm_fence_value: value,
+    };
+    let record = match copy.map(|c| helios_protocol::producer_record(&c, &tail)) {
+        Some(Ok(record)) => {
+            let n = NVK_RM_COPY_RECORDS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 {
+                let s = &record.source;
+                log_error!(
+                    "NVK present: copy-engine record: semaphore 0x{:x}/0x{:x}+{} value {}, \
+                     source 0x{:x}/0x{:x} {}x{} pitch {} fourcc 0x{:08x} modifier 0x{:016x} \
+                     offset {} size {}",
+                    record.semaphore.h_client,
+                    record.semaphore.h_memory,
+                    record.semaphore.offset,
+                    record.semaphore.value,
+                    s.h_client,
+                    s.h_memory,
+                    s.width,
+                    s.height,
+                    s.pitch,
+                    s.fourcc,
+                    s.modifier,
+                    s.offset,
+                    s.size,
+                );
+            }
+            Some(record)
+        }
+        Some(Err(why)) => {
+            let n = NVK_RM_COPY_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n % 4096 == 0 {
+                log_error!("NVK present: copy-engine record not sent: {why:?} (x{n})");
+            }
+            None
+        }
+        None => {
+            let n = NVK_RM_COPY_NONE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 4096 == 0 {
+                log_error!(
+                    "NVK present: NVK described no copy source (x{n}): an older NVK, or a \
+                     source it cannot describe; the fence goes alone"
+                );
+            }
+            None
+        }
+    };
+    Some((fence, value, record))
 }
 
 /// What `nvk_present_frame` did with a frame: the marker the WDDM present
@@ -1767,6 +1898,7 @@ unsafe fn nvk_present_impl(
     dst_alloc: u32,
 ) -> i32 {
     let mut shown = src_h;
+    let mut blt_source = true;
     if let Some(context) = d3d11_context(h) {
         if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
             context.CopySubresourceRegion(
@@ -1780,12 +1912,13 @@ unsafe fn nvk_present_impl(
                 None,
             );
             shown = dst_h;
+            blt_source = false;
         }
         // A keyed-mutex surface may be released right after this present.
         context.Flush();
         flush_gate(h, &context);
     }
-    let frame = match nvk_present_frame(h, shown) {
+    let frame = match nvk_present_frame(h, shown, blt_source) {
         Ok(f) => f,
         Err(hr) => return hr,
     };
@@ -3173,7 +3306,7 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
 
     let mut nvk_correlation = PresentStreamCorrelation::default();
     if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
-        match nvk_present_frame(h, src_h) {
+        match nvk_present_frame(h, src_h, true) {
             Ok(frame) if !nvk_scanout_compose(frame) => return 0,
             Ok(frame) => {
                 nvk_correlation = frame.correlation;

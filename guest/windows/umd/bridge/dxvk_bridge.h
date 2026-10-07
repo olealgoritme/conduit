@@ -149,6 +149,18 @@ struct HeliosDxvkDevice {
   // (helios_rm_fence.h). 0 = *fence_handle is the caller's, 1 = none here.
   std::int32_t nvk_present_fence(std::uint32_t* fence_handle,
                                  std::uint64_t* value) const noexcept;
+  // nvk_present_fence plus the copy-engine Present record's inputs for the
+  // texture (helios_icd_interface.h version 6, queue_rm_fence_v3): the
+  // producer's semaphore and the texture's RM memory and layout, as the 80
+  // bytes of struct helios_icd_rm_copy into `copy` (`copy_len` must be 80).
+  // 0 = fence and copy, 2 = fence only (`copy` zeroed: the texture cannot be
+  // described, or an older NVK without the entry), 1 = no fence here.
+  // d3d11_resource_ptr may be 0 (fence only).
+  std::int32_t nvk_present_fence_v3(std::size_t d3d11_resource_ptr,
+                                    std::uint32_t* fence_handle,
+                                    std::uint64_t* value,
+                                    std::uint8_t* copy,
+                                    std::size_t copy_len) const noexcept;
   // Close a fence the caller still owns.
   void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
 

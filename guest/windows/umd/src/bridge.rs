@@ -178,6 +178,19 @@ mod ffi {
             fence_handle: *mut u32,
             value: *mut u64,
         ) -> i32;
+        /// NVK (`queue_rm_fence_v3`): `nvk_present_fence` plus the 80 bytes of
+        /// `helios_icd_rm_copy` for the texture (copy-engine Present record).
+        /// 0 = fence and copy, 2 = fence only (copy zeroed), 1 = no fence.
+        /// # Safety: `d3d11_resource_ptr` is 0 or a live `ID3D11Resource*`;
+        /// every pointer is live writable storage, `copy` of `copy_len` bytes.
+        unsafe fn nvk_present_fence_v3(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            fence_handle: *mut u32,
+            value: *mut u64,
+            copy: *mut u8,
+            copy_len: usize,
+        ) -> i32;
         /// NVK: close a fence the caller still owns.
         fn nvk_rm_fence_close(self: &HeliosDxvkDevice, fence_handle: u32);
         /// Flush gate (docs/flush-gate.md): flush, then the point the HEFL
@@ -675,6 +688,12 @@ pub(crate) struct PresentStreamCorrelation {
     /// so the KMD can complete the Blt present without copying. `None` = no
     /// claim (the ordinary Blt).
     pub(crate) on_scanout: Option<OnScanoutClaim>,
+    /// NVK: the copy-engine Present record (`'HEF3'`, `helios_rm_fence.h`,
+    /// docs/rm-copy-engine-present.md 10 and 12) that rides behind the RM
+    /// fence tail: the 168-byte `HERF` / 192-byte `HEPR`. Only with an RM
+    /// fence and no on-scanout claim; already checked against the fence and
+    /// every rule the KMD applies (`helios_protocol::producer_record`).
+    pub(crate) rm_copy: Option<helios_protocol::HeliosRmFenceTailV3>,
 }
 
 /// The already-on-scanout claim: the KMD's own names for the frame.
@@ -882,6 +901,30 @@ impl BridgeDevice {
         // SAFETY: both out-pointers borrow live locals for this synchronous call.
         let r = unsafe { d.nvk_present_fence(&mut fence, &mut value) };
         (r == 0 && fence != 0).then_some((fence, value))
+    }
+
+    /// NVK (`queue_rm_fence_v3`): a fence as [`Self::nvk_present_fence`], plus
+    /// the ICD's description of `res` for the copy-engine Present record
+    /// (`helios_icd_rm_copy`, `None` when the ICD described nothing). The
+    /// caller owns the handle either way.
+    pub(crate) fn nvk_present_fence_v3(
+        &self,
+        res: Option<&ID3D11Resource>,
+    ) -> Option<(u32, u64, Option<[u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES]>)> {
+        let d = self.get()?;
+        let (mut fence, mut value) = (0u32, 0u64);
+        let mut copy = [0u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES];
+        let ptr = res.map_or(0, |r| r.as_raw() as usize);
+        // SAFETY: `res` (if any) is borrowed live for the call; the out-pointers
+        // borrow live locals, `copy` exactly `copy.len()` bytes.
+        let r = unsafe {
+            d.nvk_present_fence_v3(ptr, &mut fence, &mut value, copy.as_mut_ptr(), copy.len())
+        };
+        match r {
+            0 if fence != 0 => Some((fence, value, Some(copy))),
+            2 if fence != 0 => Some((fence, value, None)),
+            _ => None,
+        }
     }
 
     pub(crate) fn nvk_rm_fence_close(&self, fence: u32) {
