@@ -447,6 +447,7 @@ def report(evs, procs, target, csv_path=None, show=20, out=sys.stdout):
             s = qp_start.pop(e.d.get('pQueuePacket'), None)
             if s:
                 qp_spans.append((s.ts, e.ts, s))
+    qp_by_ptr_start = {(ev.d.get('pQueuePacket'), s): (s, t) for s, t, ev in qp_spans}
     dma_to_qp = {}
     for s, t, ev in qp_spans:
         dma_to_qp.setdefault(ev.d.get('hDmaBuffer'), []).append((s, t, ev))
@@ -504,11 +505,31 @@ def report(evs, procs, target, csv_path=None, show=20, out=sys.stdout):
         retire_lead = (gap_end - qp_stops[k]) / 1e3 if k >= 0 and qp_stops[k] >= ts[j] else None
         bl = f['blit']
         pkt = None
+        own = None          # (start, stop) of this frame's Blt packet
         if bl is not None:
-            for s, t, ev in dma_to_qp.get(bl.d.get('pDmaBuffer'), []):
-                if s >= bl.ts - 1_000_000:
-                    pkt = (t - s) / 1e3
+            # the packet the Present submitted: same thread, first QueuePacket start after the Blit
+            for e in f['events']:
+                if kind(e) == 'qp_start' and e.ts >= bl.ts:
+                    own = qp_by_ptr_start.get((e.d.get('pQueuePacket'), e.ts))
                     break
+            if own is None:
+                for s0, t0, ev in sorted(dma_to_qp.get(bl.d.get('pDmaBuffer'), []), key=lambda x: x[0]):
+                    if s0 >= bl.ts - 50_000:
+                        own = (s0, t0)
+                        break
+            if own is not None:
+                pkt = (own[1] - own[0]) / 1e3
+        f['own'] = own
+        prev_own = frames[i - 1].get('own') if i else None
+        lo, hi = ts[j], gap_end + 100_000
+        if own is not None and lo <= own[1] <= hi:
+            ends_on = 'own Blt retire'
+        elif prev_own is not None and lo <= prev_own[1] <= hi:
+            ends_on = 'previous Blt retire'
+        elif retire_lead is not None:
+            ends_on = 'other packet retire'
+        else:
+            ends_on = 'no retire'
         rows.append({
             'frame': i, 'tid': f['tid'], 'start_us': (f['start'] - frames[0]['start']) / 1e3,
             'interval_us': ((f['start'] - frames[i - 1]['start']) / 1e3) if i else float('nan'),
@@ -519,6 +540,7 @@ def report(evs, procs, target, csv_path=None, show=20, out=sys.stdout):
             'retire_to_wake_us': retire_lead if retire_lead is not None else float('nan'),
             'blt_packet_us': pkt if pkt is not None else float('nan'),
             'dst_locks': f['locks_dst'],
+            'stall_ends_on': ends_on,
             'prof': '; '.join(f'{k}={v:.0f}' for k, v in f['prof'].most_common(4)),
         })
     P(f'\nframes (target Present calls): {len(rows)}')
@@ -537,6 +559,8 @@ def report(evs, procs, target, csv_path=None, show=20, out=sys.stdout):
         P('  dxgkrnl profiler spans inside Present (total us over all frames, per frame mean):')
         for k, v in pt.most_common(8):
             P(f'    {k}: {v:.0f} total, {v / len(frames):.1f} per frame ({prof_names[k]} spans)')
+    eo = collections.Counter(r['stall_ends_on'] for r in rows)
+    P('  the longest stall ends on: ' + ', '.join(f'{k} {v}' for k, v in eo.most_common()))
     near = [r for r in rows if r['retire_to_wake_us'] == r['retire_to_wake_us']]
     if near:
         tight = sum(1 for r in near if r['retire_to_wake_us'] < 100)
@@ -609,10 +633,11 @@ def verdict(P, rows, lock_any, dest_roots, allocs, segs):
     P(f'  median Present {pct(pr, 50):.0f} us, of which the longest single stall {pct(st, 50):.0f} us '
       f'({100 * pct(st, 50) / max(1e-9, pct(pr, 50)):.0f}%).')
     near = [r for r in rows if r['retire_to_wake_us'] == r['retire_to_wake_us'] and r['retire_to_wake_us'] < 100]
+    eo = collections.Counter(r['stall_ends_on'] for r in rows).most_common(1)[0]
     if len(near) > 0.6 * len(rows):
-        P('  The stall ends right after a DMA packet retires: the app waits for the previous Blt '
-          '(serialisation on the destination) - consistent with the CPU-access hypothesis if the stall '
-          'is a Lock/profiler CPU-access span on the redirection surface.')
+        P(f'  The stall ends right after a DMA packet retires ({eo[0]} in {eo[1]}/{len(rows)} frames): the app '
+          'waits for a Blt to retire (serialisation on the destination) - the CPU-access hypothesis holds if '
+          'the stall is bracketed by Lock/Unlock (or a profiler CPU-access span) on the redirection surface.')
     else:
         P('  The stall does not line up with packet retires in most frames: look at the stall-between '
           'column; the wait is something else.')
@@ -697,7 +722,7 @@ def selftest():
     s = buf.getvalue()
     checks = ['bRedirectedPresent=1: 3', 'aperture segment', 'Heaven.exe', 'frames (target Present calls): 3',
               'within 100 us of a packet retire (QueuePacket stop): 2/3', 'dwReadSegment set: [1]',
-              'Heaven.exe tid 77: 3 locks']
+              'Heaven.exe tid 77: 3 locks', 'previous Blt retire 2']
     bad = [c for c in checks if c not in s]
     print(s)
     if bad:
