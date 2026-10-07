@@ -644,7 +644,8 @@ pairing and `conduit-venus` translates. With the hook null (stage timing off)
 vkr takes its unmodified path. The guest-visible protocol is unchanged: stage
 timing uses the fence ids and flip `seq`s already on the wire.
 
-**Latency options** (off by default; `conduit config set backend.latency`,
+**Latency options** (on by default; `conduit config set backend.latency off`
+or a list to change that,
 [research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
 `fused-submit`: a fenced `SUBMIT_3D` is one call, `Renderer::submit_fenced`
 (IPC op `SUBMIT_FENCED` (15), sent only to a server with `FEATURE_SUBMIT_FENCED` (bit 3),

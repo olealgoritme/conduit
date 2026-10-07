@@ -204,13 +204,14 @@ struct Args {
     venus_guest_blobs: bool,
 
     /// Round-trip latency options (docs/research/host-roundtrip-latency.md),
-    /// a comma-separated list or `all`; none by default:
+    /// a comma-separated list, read in order; `all` (the default) is every
+    /// one, `off` none, `no-NAME` drops one:
     /// `quiet-held` (no interrupt for a kick that only held fenced chains),
     /// `fused-submit` (a fenced SUBMIT_3D's submit and fence in one renderer
     /// round trip), `direct-fences` (the renderer connection's reader
     /// returns signalled chains itself), `event-batch` (the event thread
     /// signals the guest once per pass and sweeps with one poll).
-    #[arg(long, value_name = "LIST", default_value = "", value_parser = Latency::parse)]
+    #[arg(long, value_name = "LIST", default_value = "all", value_parser = Latency::parse)]
     latency: Latency,
 
     /// Keep every thread of the backend on these host CPUs (`0-7,16-23`):
@@ -219,7 +220,8 @@ struct Args {
     cpus: Option<String>,
 }
 
-/// `--latency`: each option is off unless named.
+/// `--latency`. `Default` is every option off (what `off` asks for); the
+/// command line's default is `all`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Latency {
     quiet_held: bool,
@@ -229,17 +231,22 @@ struct Latency {
 }
 
 impl Latency {
-    const NAMES: &'static str = "quiet-held, fused-submit, direct-fences, event-batch, all";
+    const NAMES: &'static str =
+        "quiet-held, fused-submit, direct-fences, event-batch (each also as no-NAME), all, off";
 
     fn parse(list: &str) -> Result<Self, String> {
         let mut l = Self::default();
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-            match name {
-                "quiet-held" => l.quiet_held = true,
-                "fused-submit" => l.fused_submit = true,
-                "direct-fences" => l.direct_fences = true,
-                "event-batch" => l.event_batch = true,
-                "all" => {
+            let (on, base) = match name.strip_prefix("no-") {
+                Some(b) => (false, b),
+                None => (true, name),
+            };
+            match base {
+                "quiet-held" => l.quiet_held = on,
+                "fused-submit" => l.fused_submit = on,
+                "direct-fences" => l.direct_fences = on,
+                "event-batch" => l.event_batch = on,
+                "all" if on => {
                     l = Self {
                         quiet_held: true,
                         fused_submit: true,
@@ -247,7 +254,7 @@ impl Latency {
                         event_batch: true,
                     }
                 }
-                "off" | "none" => l = Self::default(),
+                "off" | "none" if on => l = Self::default(),
                 other => return Err(format!("unknown option {other:?} (known: {})", Self::NAMES)),
             }
         }
@@ -2294,9 +2301,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
     nvgpu.latency = args.latency;
-    if args.latency != Latency::default() {
-        log::info!("latency options: {:?}", args.latency);
-    }
+    log::info!("latency options: {:?}", args.latency);
     let backend = Arc::new(RwLock::new(nvgpu));
     // Frame stage stamps from the start (docs/TRACING.md "Frame stage
     // timing"); `stages on` on the trace socket otherwise.
@@ -2483,6 +2488,15 @@ mod tests {
         assert!(all.quiet_held && all.fused_submit && all.direct_fences && all.event_batch);
         assert_eq!(Latency::parse("all,off").unwrap(), Latency::default());
         assert!(Latency::parse("fast").is_err());
+        assert!(Latency::parse("no-all").is_err());
+        let l = Latency::parse("all,no-direct-fences").unwrap();
+        assert!(l.quiet_held && l.fused_submit && !l.direct_fences && l.event_batch);
+        // The command line's default is every option.
+        use clap::Parser;
+        let a = Args::try_parse_from(["conduit-backend"]).unwrap();
+        assert_eq!(a.latency, Latency::parse("all").unwrap());
+        let a = Args::try_parse_from(["conduit-backend", "--latency", "off"]).unwrap();
+        assert_eq!(a.latency, Latency::default());
     }
 
     /// A fence's status rides in the header, signed, as the guest reads it.

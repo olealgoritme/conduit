@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `view.close_stops_vm` | true, false | true: closing the window of a VM that `conduit view` started shuts it down. A VM started any other way (`conduit up`, virt-manager, virsh) always keeps running. |
 //! | `venus.guest_blobs` | true, false | false: the backend serves guest-memory blobs (docs/VENUS.md "Guest-memory blobs"), Venus copy destinations over the guest's own pages, for the Windows KMD's windowed Present. Opt-in while new. Applies when a VM's backend next starts. |
-//! | `backend.latency` | off, all, or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin | off: round-trip latency options for the backend and conduit-venus (docs/research/host-roundtrip-latency.md). Opt-in while measured. Applies when a VM's backend next starts. |
+//! | `backend.latency` | off, all, or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin | unset: the backend's and conduit-venus's defaults (`all`: the first four); a list is exactly those options (`all,fence-spin` adds the polling fence wait). Round-trip latency options, docs/research/host-roundtrip-latency.md. Applies when a VM's backend next starts. |
 //! | `backend.cpus` | a CPU list such as 0-7,16-23 | unset: the backend and conduit-venus run on any CPU; set: every thread of both stays on these (docs/HOST-TUNING.md). Applies when a VM's backend next starts. |
 //! | `gpu.window_mib` | auto, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 | auto: the host GPU's BAR1 (as Resizable BAR on bare metal), clamped to what the guest's 64-bit MMIO window holds, 4096 without a GPU. The shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
@@ -29,7 +29,7 @@ const KEYS: &[(&str, &[&str], &str)] = &[
     (
         "backend.latency",
         &["off", "all"],
-        "round-trip latency options for the backend and conduit-venus, from the next backend start (default off; also a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin)",
+        "round-trip latency options for the backend and conduit-venus, from the next backend start (default all: quiet-held, fused-submit, direct-fences, event-batch; a comma-separated list sets exactly those, fence-spin included only when named)",
     ),
     (
         "backend.cpus",
@@ -211,18 +211,17 @@ fn cpu_list(v: &str) -> bool {
         })
 }
 
-/// `backend.latency`: the options the backend gets as `--latency` (empty
-/// for off or unset). conduit-venus gets `--direct-fences` when the list
-/// has `direct-fences`.
-pub fn backend_latency() -> Vec<&'static str> {
+/// `backend.latency`: `None` when unset (or not a value), and the backend
+/// and conduit-venus keep their defaults; otherwise exactly the options
+/// named (empty for off).
+pub fn backend_latency() -> Option<Vec<&'static str>> {
     latency_of(&load())
 }
 
-fn latency_of(m: &Map<String, Value>) -> Vec<&'static str> {
+fn latency_of(m: &Map<String, Value>) -> Option<Vec<&'static str>> {
     m.get("backend.latency")
         .and_then(Value::as_str)
         .and_then(latency_list)
-        .unwrap_or_default()
 }
 
 /// `backend.cpus`: the CPU list the backend and conduit-venus get as `--cpus`.
@@ -315,7 +314,7 @@ mod tests {
     #[test]
     fn latency_and_cpu_settings() {
         let mut m = Map::new();
-        assert!(latency_of(&m).is_empty());
+        assert_eq!(latency_of(&m), None);
         for (v, want) in [
             ("off", vec![]),
             (
@@ -337,11 +336,14 @@ mod tests {
                 "fence-spin,direct-fences",
                 vec!["direct-fences", "fence-spin"],
             ),
-            ("fast", vec![]),
-            ("quiet-held,fast", vec![]),
         ] {
             m.insert("backend.latency".into(), Value::String(v.into()));
-            assert_eq!(latency_of(&m), want, "{v}");
+            assert_eq!(latency_of(&m), Some(want), "{v}");
+        }
+        // Not a value: the defaults, as unset.
+        for v in ["fast", "quiet-held,fast"] {
+            m.insert("backend.latency".into(), Value::String(v.into()));
+            assert_eq!(latency_of(&m), None, "{v}");
         }
         assert!(latency_list("quiet-held,fast").is_none());
         for ok in ["0-7,16-23", "3", "0-0"] {

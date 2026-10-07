@@ -304,15 +304,17 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
 const FENCE_SPIN_US: u32 = 150;
 
 /// `backend.latency` and `backend.cpus` as the backend's `--latency` and
-/// `--cpus` (docs/research/host-roundtrip-latency.md); nothing when unset.
+/// `--cpus` (docs/research/host-roundtrip-latency.md); nothing when unset,
+/// and the backend keeps its default (`all`).
 pub(crate) fn latency_args(cmd: &mut Command) {
-    // fence-spin is conduit-venus's alone (`venus_cmd`).
-    let latency: Vec<&str> = crate::config::backend_latency()
-        .into_iter()
-        .filter(|o| *o != "fence-spin")
-        .collect();
-    if !latency.is_empty() {
-        cmd.arg("--latency").arg(latency.join(","));
+    if let Some(list) = crate::config::backend_latency() {
+        // fence-spin is conduit-venus's alone (`venus_cmd`).
+        let latency: Vec<&str> = list.into_iter().filter(|o| *o != "fence-spin").collect();
+        cmd.arg("--latency").arg(if latency.is_empty() {
+            "off".to_string()
+        } else {
+            latency.join(",")
+        });
     }
     if let Some(cpus) = crate::config::backend_cpus() {
         cmd.arg("--cpus").arg(cpus);
@@ -332,11 +334,15 @@ pub(crate) fn venus_cmd(bin: &Path, sock: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("--socket").arg(sock);
     // `backend.latency` and `backend.cpus` (docs/research/host-roundtrip-latency.md).
+    // Unset: conduit-venus's defaults (direct fences on, no fence spin).
     let latency = crate::config::backend_latency();
-    if latency.contains(&"direct-fences") {
-        cmd.arg("--direct-fences");
+    if latency
+        .as_ref()
+        .is_some_and(|l| !l.contains(&"direct-fences"))
+    {
+        cmd.arg("--no-direct-fences");
     }
-    if latency.contains(&"fence-spin") {
+    if latency.as_ref().is_some_and(|l| l.contains(&"fence-spin")) {
         cmd.arg("--fence-spin-us").arg(FENCE_SPIN_US.to_string());
     }
     if let Some(cpus) = crate::config::backend_cpus() {
