@@ -38,6 +38,19 @@ producer wait (defer→submit) ~650 µs · GPU copy 234 µs (PCIe x8 write bound
 fixed) · graphics-engine wait before the copy ~120 µs · submit→kick 21 µs ·
 IPC hops ~40 µs · irq→ISR 7 µs · total present→done ~1180 µs.
 
+Later, for production (on the list):
+- Conduit Helios as the only GPU **and** display from power-on: a UEFI GOP for
+  the Helios device so firmware, boot logo, safe mode and bugchecks show on it,
+  then drop QEMU's VGA (`<video><model type='none'/>`). Until then the VGA stays
+  as the fallback console and Windows' Basic Display Adapter on it is disabled
+  (`pnputil /disable-device`; removing it inside Windows does not stick).
+- GPU stats for tools: report the host GPU's name and real VRAM through
+  WDDM/DXGI, fill WDDM's node/segment statistics so Task Manager shows GPU
+  graphs, and an `nvapi64.dll` shim (clocks, temperature, power, load via RM
+  controls) for GPU-Z-style sensors. PCI IDs stay virtio.
+- Explorer repaint after a display-device restart (wallpaper, clock, icons stay
+  black until something redraws; the `Dw*` breadcrumbs in PR #1 track it).
+
 Next (in progress): M3c-1 shadow mode (`RmCopyEngine=3`: dup NVK's semaphore
 and source per Present, CE copy into scratch, compare with production) and
 the doorbell rung after the virtio lock is released (#11); then M3c-2, the
