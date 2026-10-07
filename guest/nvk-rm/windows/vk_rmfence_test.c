@@ -7,7 +7,13 @@
  *     either vkWaitForFences (NVK's CPU wait: spin, then the RM non-stall
  *     event) or queue_rm_fence + rm_fence_wait (an RM semaphore-surface fence
  *     through nvidia-drm on the host and EVENT_REGISTER in the KMD);
- *  2. presenting (optional): N frames of fills into three scanout images,
+ *  2. the copy-engine Present record (helios_icd_interface.h version 6,
+ *     queue_rm_fence_v3; guest/windows/docs/rm-copy-engine-present.md 12):
+ *     a fill into a dedicated 1920x1080 image, then the fence with the
+ *     image's semaphore and source description, checked for the rules the
+ *     KMD applies to the 'HEF3' record (value == the fence's, 8-aligned
+ *     offset, handles nonzero, the image inside its memory);
+ *  3. presenting (optional): N frames of fills into three scanout images,
  *     each shown by scanout_present after a CPU wait (S3) or by
  *     scanout_present_fenced (S4: no wait on the presenting thread), with the
  *     frame pipelining a renderer would use (wait for frame P-2 before reusing
@@ -17,6 +23,7 @@
  *
  * Run with NVK_RM=1 and librmclient.dll next to the driver.
  */
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -244,6 +251,97 @@ static void latency(const char *what, unsigned rounds, int fill, int use_rm)
     vkDestroyFence(dev, f, NULL);
 }
 
+/* queue_rm_fence_v3 for a dedicated image: the record's fields as the KMD
+ * checks them.  Returns the number of faults. */
+static unsigned copy_record_check(void)
+{
+    DFN(vkDestroyImage);
+    DFN(vkFreeMemory);
+    DFN(vkFreeCommandBuffers);
+    DFN(vkQueueWaitIdle);
+    if (api.size < offsetof(struct helios_icd_api, queue_rm_fence_v3) + sizeof(void *) ||
+        !api.queue_rm_fence_v3) {
+        printf("copy record: no queue_rm_fence_v3 in this ICD (version %u)\n", api.version);
+        return 0;
+    }
+    struct img im;
+    if (make_image(1920, 1080, &im)) {
+        printf("copy record: image failed\n");
+        return 1;
+    }
+    VkCommandBuffer cb = record(1, im.image, 0.5f);
+    submit(cb, VK_NULL_HANDLE);
+
+    unsigned faults = 0;
+    uint32_t fence = 0;
+    uint64_t value = 0;
+    struct helios_icd_rm_copy copy;
+    VkResult r = api.queue_rm_fence_v3(dev, queue, im.mem, im.image, &fence, &value, &copy);
+    const struct helios_icd_rm_semaphore *s = &copy.semaphore;
+    const struct helios_icd_rm_source *src = &copy.source;
+    printf("copy record: %d, fence %u value %llu\n"
+           "  semaphore client 0x%x memory 0x%x offset %llu value %llu\n"
+           "  source client 0x%x memory 0x%x offset %llu size %llu modifier 0x%016llx\n"
+           "         %ux%u pitch %u fourcc 0x%08x flags 0x%x\n",
+           r, fence, (unsigned long long)value, s->h_client, s->h_memory,
+           (unsigned long long)s->offset, (unsigned long long)s->value, src->h_client,
+           src->h_memory, (unsigned long long)src->offset, (unsigned long long)src->size,
+           (unsigned long long)src->modifier, src->width, src->height, src->pitch, src->fourcc,
+           src->flags);
+    if (r == VK_SUCCESS) {
+        const uint64_t rows = src->modifier == 0 ? src->height
+            : ((src->height + (8u << (src->modifier & 0xf)) - 1) / (8u << (src->modifier & 0xf))) *
+              (8u << (src->modifier & 0xf));
+#define FAULT(cond, what) do { if (cond) { printf("  FAULT: %s\n", what); faults++; } } while (0)
+        FAULT(fence == 0, "no fence");
+        FAULT(s->value != value || value == 0, "semaphore value is not the fence's");
+        FAULT(s->h_client == 0 || s->h_memory == 0, "semaphore handle zero");
+        FAULT(s->offset % 8 != 0 || s->offset + 8 > 4096, "semaphore offset");
+        FAULT(src->h_client != s->h_client, "source client differs from the semaphore's");
+        FAULT(src->h_memory == 0 || src->h_memory == s->h_memory, "source memory");
+        FAULT(src->width != 1920 || src->height != 1080, "source size");
+        FAULT(src->fourcc != HELIOS_DRM_FORMAT_ARGB8888, "source fourcc (B8G8R8A8 = AR24)");
+        FAULT(src->pitch < 1920 * 4, "source pitch");
+        FAULT(src->modifier != 0 && (src->modifier & ~0xfull) !=
+              (HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X & ~0xfull), "source modifier family");
+        FAULT(src->offset + (uint64_t)src->pitch * rows > src->size, "source past its memory");
+        FAULT(src->flags != 0 || src->reserved != 0, "source flags");
+#undef FAULT
+    } else if (r == VK_INCOMPLETE) {
+        printf("  the image could not be described (fence only)\n");
+        faults++;
+    } else {
+        faults++;
+    }
+    if (fence != 0) {
+        if (api.rm_fence_wait(dev, fence, 5000000000ull) != VK_SUCCESS) {
+            printf("  FAULT: the fence did not fire\n");
+            faults++;
+        }
+        api.rm_fence_close(dev, fence);
+    }
+    /* A null image: the fence alone (VK_INCOMPLETE), the record all zero */
+    fence = 0;
+    memset(&copy, 0xff, sizeof(copy));
+    r = api.queue_rm_fence_v3(dev, queue, VK_NULL_HANDLE, VK_NULL_HANDLE, &fence, NULL, &copy);
+    const struct helios_icd_rm_copy zero = { 0 };
+    if (r != VK_INCOMPLETE || fence == 0 || memcmp(&copy, &zero, sizeof(copy)) != 0) {
+        printf("  FAULT: no image: %d, fence %u, record %s\n", r, fence,
+               memcmp(&copy, &zero, sizeof(copy)) ? "not zero" : "zero");
+        faults++;
+    }
+    if (fence != 0) {
+        api.rm_fence_wait(dev, fence, 5000000000ull);
+        api.rm_fence_close(dev, fence);
+    }
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(dev, pool, 1, &cb);
+    vkDestroyImage(dev, im.image, NULL);
+    vkFreeMemory(dev, im.mem, NULL);
+    printf("copy record: %s\n", faults ? "FAIL" : "PASS");
+    return faults;
+}
+
 static void present_run(int fenced, unsigned seconds, int fill)
 {
     DFN(vkCreateFence);
@@ -348,7 +446,9 @@ int main(int argc, char **argv)
            r, api.version, api.size, (unsigned)sizeof(api), api.caps,
            !!(api.caps & HELIOS_ICD_CAP_RM_FENCE), !!(api.caps & HELIOS_ICD_CAP_SCANOUT_FENCE_KMD),
            !!(api.caps & HELIOS_ICD_CAP_PRESENT_FENCE_KMD), !!(api.caps & HELIOS_ICD_CAP_SCANOUT));
-    if (r || api.size < sizeof(api) || !api.queue_rm_fence || !(api.caps & HELIOS_ICD_CAP_RM_FENCE)) {
+    /* Version 3 is enough for the latency series (an older ICD fills less) */
+    if (r || api.size < offsetof(struct helios_icd_api, memory_res_plane1) || !api.queue_rm_fence ||
+        !(api.caps & HELIOS_ICD_CAP_RM_FENCE)) {
         printf("no RM fences in this ICD\n");
         return 1;
     }
@@ -422,6 +522,8 @@ int main(int argc, char **argv)
     snprintf(what, sizeof(what), "%u MiB fill, RM fence", fill_mib);
     latency(what, rounds, 1, 1);
 
+    const unsigned copy_faults = copy_record_check();
+
     if (present_s > 0) {
         printf("presenting 1920x1080 on scanout 0, 3 images, %u MiB fill per frame:\n", fill_mib);
         present_run(0, present_s, 1);
@@ -431,5 +533,5 @@ int main(int argc, char **argv)
     DFN(vkDestroyDevice);
     vkDestroyDevice(dev, NULL);
     printf("done\n");
-    return 0;
+    return copy_faults ? 2 : 0;
 }
