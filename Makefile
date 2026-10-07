@@ -60,6 +60,7 @@ test:
 	cd host/vmm && $(CARGO) test --workspace --no-default-features
 	cd host/venus && $(CARGO) test
 	cd host/stream && $(CARGO) test
+	packaging/test/icons.sh
 	$(MAKE) -C host/viewer check
 
 # Builds the release tarball and runs its installer (the same path users take).

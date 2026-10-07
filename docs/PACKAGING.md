@@ -23,7 +23,15 @@ layout, so a layout change is made in one place.
 | `/opt/conduit/share/doc/conduit/` | LICENSE and every component's LICENSE/NOTICE |
 | `/usr/bin/conduit` (packages), `/usr/local/bin/conduit` (tarball) | symlink to the CLI |
 | `/usr/share/applications/conduit.desktop` (`/usr/local/share/...` for the tarball) | desktop entry |
+| `/usr/share/icons/hicolor/scalable/apps/conduit.svg`, `/usr/share/icons/hicolor/<N>x<N>/apps/conduit.png` for N = 16, 22, 24, 32, 48, 64, 128, 256, 512 (`/usr/local/share/...` for the tarball) | app icon, `Icon=conduit` in the desktop entry |
 | `/etc/apparmor.d/abstractions/conduit` | AppArmor rules for libvirt's QEMU |
+
+The icon set is `packaging/common/icons/conduit.svg` and its PNG renders
+`conduit-<N>.png` (committed, so builds need no SVG renderer; regenerate with
+`rsvg-convert -w N -h N conduit.svg -o conduit-N.png`). `install_icons` in
+`packaging/common/icons.sh` is the only code that lays them out; `build.sh
+stage`, the tarball staging and the flake all call it, and the RPM spec,
+nfpm template and PKGBUILD list the result. `packaging/test/icons.sh` checks it.
 
 `conduit-venus`, the Venus renderer for `--venus` (experimental,
 docs/VENUS.md), is packaged in `/opt/conduit/bin` with its own virglrenderer
@@ -69,7 +77,7 @@ packaging/
 ├── release.sh                 version bump + tag (make release / release-minor / release-major)
 ├── tarball/install.sh         -> /opt/conduit, /usr/local/bin/conduit
 ├── tarball/uninstall.sh       also installed as /opt/conduit/uninstall.sh
-└── common/                    desktop entry, AppArmor abstraction, conduit-integrate
+└── common/                    desktop entry, icons/ (svg + PNG renders) and icons.sh (`install_icons`), AppArmor abstraction, conduit-integrate
 ```
 
 ## Building locally
