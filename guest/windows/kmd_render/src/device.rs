@@ -452,7 +452,11 @@ pub unsafe extern "C" fn dxgkddi_create_device(
         creator_process: args.hKmdProcess as usize,
     });
     // Hand the device handle back to Dxgkrnl; reclaimed in destroy_device.
-    args.hDevice = Box::into_raw(ctx) as *mut c_void;
+    let device_handle = Box::into_raw(ctx) as *mut c_void;
+    args.hDevice = device_handle;
+    // `DwDevNew` / `DwReuse` (docs/zero-copy-present.md "DWM restart and stale Explorer"): atomics
+    // and one leaf spin lock, nothing else.
+    crate::ddi::dwm_restart::note_device_created(device_handle as usize);
     STATUS_SUCCESS
 }
 
@@ -485,6 +489,9 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
             return STATUS_SUCCESS;
         };
         let owner = h_device as usize;
+        // The `Dw*` window opens here (`DwDevDel` is counted at its end): what the Present path
+        // and the flips do from now on is "since a device died".
+        let destroy_started = crate::ddi::dwm_restart::begin_destroy(adapter);
         // SAFETY: `DxgkDdiDestroyDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
         // DXGKDDI_DESTROYDEVICE), and the unmap loop below already depends on it
         // — `MmUnmapLockedPages` is PASSIVE-only, which is exactly why the table
@@ -574,6 +581,16 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
         // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).
         crate::diag::record(0x0E03_0000 | ((blobs.min(0xFF) << 8) | contexts.min(0xFF)));
+        // The `Dw*` block: durations, what the sweeps reclaimed, and the census of what this
+        // device left pinned in the present machinery (the live machine, so after the sweeps).
+        crate::ddi::dwm_restart::end_destroy(
+            adapter,
+            owner,
+            destroy_started,
+            blobs,
+            contexts,
+            purged_streams,
+        );
         // SAFETY: produced by Box::into_raw in create_device; destroyed exactly once.
         drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
     }

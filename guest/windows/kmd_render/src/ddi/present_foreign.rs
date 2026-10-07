@@ -144,7 +144,16 @@ pub(crate) fn unresolved_skip(
             unsafe { crate::ddi::create_allocation::present_alloc_cause(adapter, handle) }
         }
     };
-    let causes = pf::pack_causes(adapter.is_none(), cause(source), cause(destination));
+    let (source_cause, destination_cause) = (cause(source), cause(destination));
+    let causes = pf::pack_causes(adapter.is_none(), source_cause, destination_cause);
+    // `DwPrUnr` / `DwPrCol`, the per-cause histograms `DwUnrSrc` / `DwUnrDst` and the time of the
+    // first one since a device died (the `PrUnrWhy` above keeps only the LAST).
+    crate::ddi::dwm_restart::note_unresolved(
+        source_cause as u32,
+        destination_cause as u32,
+        adapter.is_none(),
+        why.refusal == Refusal::ColorFill,
+    );
     if why.refusal == Refusal::ColorFill {
         let n = COLOR_FILLS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         LAST_WHY.store(why.code(), Ordering::Relaxed);

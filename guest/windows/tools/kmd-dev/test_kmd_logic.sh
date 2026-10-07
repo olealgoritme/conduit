@@ -10,6 +10,7 @@ cp -r "$KW/kmd_render/src" "$S/kl_tree/kmd_render/src"
 # The protocol sources, for the scans that pin kmd_logic's mirrors to them (ce_record).
 mkdir -p "$S/kl_tree/protocol"
 cp -r "$KW/protocol/src" "$KW/protocol/include" "$S/kl_tree/protocol/"
+cp "$KW/kmd_render/driver-version.env" "$S/kl_tree/kmd_render/driver-version.env"
 cd "$S/kl_tree/kmd_logic" || exit 1
 HELIOS_REQUIRE_NAME_SCAN=1 cargo test --offline 2>&1 | tail -25
 rm -rf "$S/kl_tree/kmd_logic/target"

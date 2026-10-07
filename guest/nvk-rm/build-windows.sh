@@ -77,7 +77,10 @@ fi
 # no present wait on Win32, R/B order of the GDI present).
 # patches-common/: generic NVK patches (per-draw cost) shared with the Linux
 # series, applied after everything else.
-series="$here/patches/*.patch $here/patches-windows/*.patch $here/patches-windows-dxvk/*.patch $here/patches-common/*.patch"
+# patches/0014-0017 are the Linux series' versions of patches-windows/0022 and
+# 0027-0029 (BAR heap, cached sysmem, compression, ZCULL); the Windows stack
+# takes patches/ only up to 0013.
+series="$(ls "$here"/patches/00*.patch | awk -F/ '{ n = substr($NF, 1, 4) + 0 } n <= 13') $here/patches-windows/*.patch $here/patches-windows-dxvk/*.patch $here/patches-common/*.patch"
 # The whole series, in order (the start of each subject: a folded Subject:
 # line only holds its beginning), must be what is on top of the base; a tree
 # with an older or different series (another branch's patches) is rebuilt.

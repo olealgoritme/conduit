@@ -1,0 +1,518 @@
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index 181e8078..7e528667 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -17,6 +17,9 @@
+ 
+ #include "proxy_client.h"
+ 
++/* Conduit stage timing (venus/vkr_queue.c). */
++void (*vkr_stage_hook_current(void))(uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t);
++
+ struct proxy_fence {
+    uint32_t flags;
+    uint32_t seqno;
+@@ -215,6 +218,16 @@ proxy_context_submit_fence(struct virgl_context *base,
+    fence->seqno = timeline->next_seqno++;
+    fence->fence_id = fence_id;
+ 
++   /* Conduit stage timing: vkr reports this fence by its seqno; say which
++    * guest fence that is (stage 240 is the pairing, aux the seqno).
++    */
++   {
++      void (*hook)(uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t) =
++         vkr_stage_hook_current();
++      if (hook)
++         hook(240, ctx->base.ctx_id, ring_idx, fence_id, 0, fence->seqno);
++   }
++
+    if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
+       mtx_lock(&ctx->timeline_mutex);
+ 
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index fbda972d..65ebc9db 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -11,6 +11,349 @@
+ #include "vkr_physical_device.h"
+ #include "vkr_queue_gen.h"
+ 
++/* Conduit stage timing (host/venus/patches/0003). Off while no hook is set:
++ * then every site below is one relaxed load and the plain path. The stage
++ * numbers are conduit_venus::stage's V_*.
++ */
++#include <time.h>
++
++#define VKR_STAGE_SUBMIT 51
++#define VKR_STAGE_SUBMIT_DONE 52
++#define VKR_STAGE_FENCE 53
++#define VKR_STAGE_FENCE_DONE 54
++#define VKR_STAGE_GPU 57
++
++/* Timestamp pairs per queue; a slot is reused after this many timed submits. */
++#define VKR_STAGE_SLOTS 64
++
++static vkr_stage_fn vkr_stage_hook_fn;
++
++__attribute__((visibility("default"))) void
++virgl_renderer_conduit_stage_hook(vkr_stage_fn hook)
++{
++   __atomic_store_n(&vkr_stage_hook_fn, hook, __ATOMIC_RELEASE);
++}
++
++static inline vkr_stage_fn
++vkr_stage_hook(void)
++{
++   return __atomic_load_n(&vkr_stage_hook_fn, __ATOMIC_ACQUIRE);
++}
++
++/* For the proxy, which numbers each timeline's fences itself (vkr sees its
++ * seqno, not the guest's fence id) and reports the pairing.
++ */
++vkr_stage_fn
++vkr_stage_hook_current(void)
++{
++   return vkr_stage_hook();
++}
++
++static inline uint64_t
++vkr_stage_now(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++struct vkr_queue_stage {
++   /* false: this queue cannot take timestamps; submits are only timed */
++   bool usable;
++   VkCommandPool pool;
++   VkQueryPool queries;
++   VkCommandBuffer begin[VKR_STAGE_SLOTS];
++   VkCommandBuffer end[VKR_STAGE_SLOTS];
++   uint32_t next;
++   float period;
++   uint64_t mask;
++   /* The last vkQueueSubmit since the previous sync fence (render server
++    * thread only).
++    */
++   uint64_t submit_ns;
++   uint64_t submit_done_ns;
++   int32_t slot;
++};
++
++static bool
++vkr_queue_stage_record(struct vn_device_proc_table *vk,
++                       VkCommandBuffer cmd,
++                       VkQueryPool queries,
++                       uint32_t query,
++                       bool begin)
++{
++   const VkCommandBufferBeginInfo info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT,
++   };
++   if (vk->BeginCommandBuffer(cmd, &info) != VK_SUCCESS)
++      return false;
++   if (begin) {
++      vk->CmdResetQueryPool(cmd, queries, query, 2);
++      vk->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, query);
++   } else {
++      vk->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, query);
++   }
++   return vk->EndCommandBuffer(cmd) == VK_SUCCESS;
++}
++
++/* The queue's timing state, made on first use (render server thread). */
++static struct vkr_queue_stage *
++vkr_queue_stage_get(struct vkr_queue *queue)
++{
++   if (queue->stage)
++      return queue->stage;
++
++   struct vkr_queue_stage *st = calloc(1, sizeof(*st));
++   if (!st)
++      return NULL;
++   st->slot = -1;
++   queue->stage = st;
++
++   struct vkr_device *dev = queue->device;
++   struct vkr_physical_device *pdev = dev->physical_device;
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++
++   if (queue->flags || queue->family >= pdev->queue_family_property_count)
++      return st;
++   const uint32_t bits = pdev->queue_family_properties[queue->family].timestampValidBits;
++   if (!bits || pdev->properties.limits.timestampPeriod <= 0.0f)
++      return st;
++   st->mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
++   st->period = pdev->properties.limits.timestampPeriod;
++
++   const VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .queueFamilyIndex = queue->family,
++   };
++   const VkQueryPoolCreateInfo query_info = {
++      .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++      .queryType = VK_QUERY_TYPE_TIMESTAMP,
++      .queryCount = 2 * VKR_STAGE_SLOTS,
++   };
++   if (vk->CreateCommandPool(device, &pool_info, NULL, &st->pool) != VK_SUCCESS) {
++      st->pool = VK_NULL_HANDLE;
++      return st;
++   }
++   if (vk->CreateQueryPool(device, &query_info, NULL, &st->queries) != VK_SUCCESS) {
++      st->queries = VK_NULL_HANDLE;
++      return st;
++   }
++   const VkCommandBufferAllocateInfo alloc_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = st->pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = VKR_STAGE_SLOTS,
++   };
++   if (vk->AllocateCommandBuffers(device, &alloc_info, st->begin) != VK_SUCCESS)
++      return st;
++   if (vk->AllocateCommandBuffers(device, &alloc_info, st->end) != VK_SUCCESS) {
++      vk->FreeCommandBuffers(device, st->pool, VKR_STAGE_SLOTS, st->begin);
++      return st;
++   }
++   for (uint32_t i = 0; i < VKR_STAGE_SLOTS; i++) {
++      /* Allocated from the driver, not through the Venus decoder: they need
++       * their loader dispatch pointer like any command buffer.
++       */
++      if (!vkr_queue_stage_record(vk, st->begin[i], st->queries, 2 * i, true) ||
++          !vkr_queue_stage_record(vk, st->end[i], st->queries, 2 * i + 1, false)) {
++         vk->FreeCommandBuffers(device, st->pool, VKR_STAGE_SLOTS, st->begin);
++         vk->FreeCommandBuffers(device, st->pool, VKR_STAGE_SLOTS, st->end);
++         return st;
++      }
++   }
++   st->usable = true;
++   return st;
++}
++
++static void
++vkr_queue_stage_destroy(struct vkr_queue *queue)
++{
++   struct vkr_queue_stage *st = queue->stage;
++   if (!st)
++      return;
++   struct vkr_device *dev = queue->device;
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   /* Only after vkr_device_destroy's vkDeviceWaitIdle (worker thread):
++    * otherwise the GPU may still be using them, and they go with the device.
++    * Freeing the pool frees its command buffers.
++    */
++   if (!queue->context->on_worker_thread) {
++      free(st);
++      queue->stage = NULL;
++      return;
++   }
++   if (st->pool != VK_NULL_HANDLE)
++      vk->DestroyCommandPool(dev->base.handle.device, st->pool, NULL);
++   if (st->queries != VK_NULL_HANDLE)
++      vk->DestroyQueryPool(dev->base.handle.device, st->queries, NULL);
++   free(st);
++   queue->stage = NULL;
++}
++
++/* Whether a submit can take the two timestamp command buffers: not a
++ * device-group or protected submit, whose arrays are tied to the command
++ * buffer count.
++ */
++static bool
++vkr_queue_stage_wrappable(const VkSubmitInfo *info)
++{
++   if (!info->commandBufferCount)
++      return false;
++   for (const VkBaseInStructure *p = info->pNext; p; p = p->pNext) {
++      if (p->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO ||
++          p->sType == VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO)
++         return false;
++   }
++   return true;
++}
++
++static VkResult
++vkr_queue_submit_staged(struct vkr_queue *queue,
++                        VkQueue handle,
++                        uint32_t count,
++                        const VkSubmitInfo *submits,
++                        VkFence fence)
++{
++   struct vn_device_proc_table *vk = &queue->device->proc_table;
++   struct vkr_queue_stage *st = vkr_queue_stage_get(queue);
++   VkSubmitInfo *copy = NULL;
++   VkCommandBuffer *cmds = NULL;
++   int32_t slot = -1;
++
++   if (st && st->usable && count && vkr_queue_stage_wrappable(&submits[count - 1])) {
++      const VkSubmitInfo *last = &submits[count - 1];
++      copy = malloc(sizeof(*copy) * count);
++      cmds = malloc(sizeof(*cmds) * (last->commandBufferCount + 2));
++      if (copy && cmds) {
++         slot = (int32_t)(st->next++ % VKR_STAGE_SLOTS);
++         cmds[0] = st->begin[slot];
++         memcpy(&cmds[1], last->pCommandBuffers, sizeof(*cmds) * last->commandBufferCount);
++         cmds[last->commandBufferCount + 1] = st->end[slot];
++         memcpy(copy, submits, sizeof(*copy) * count);
++         copy[count - 1].commandBufferCount = last->commandBufferCount + 2;
++         copy[count - 1].pCommandBuffers = cmds;
++         submits = copy;
++      }
++   }
++
++   const uint64_t t0 = vkr_stage_now();
++   mtx_lock(&queue->vk_mutex);
++   VkResult ret = vk->QueueSubmit(handle, count, submits, fence);
++   mtx_unlock(&queue->vk_mutex);
++   const uint64_t t1 = vkr_stage_now();
++
++   free(copy);
++   free(cmds);
++   if (st) {
++      st->submit_ns = t0;
++      st->submit_done_ns = t1;
++      st->slot = ret == VK_SUCCESS ? slot : -1;
++   }
++   return ret;
++}
++
++static VkResult
++vkr_queue_submit2_staged(struct vkr_queue *queue,
++                         VkQueue handle,
++                         uint32_t count,
++                         const VkSubmitInfo2 *submits,
++                         VkFence fence)
++{
++   struct vn_device_proc_table *vk = &queue->device->proc_table;
++   struct vkr_queue_stage *st = vkr_queue_stage_get(queue);
++   VkSubmitInfo2 *copy = NULL;
++   VkCommandBufferSubmitInfo *cmds = NULL;
++   int32_t slot = -1;
++
++   if (st && st->usable && count && submits[count - 1].commandBufferInfoCount &&
++       !(submits[count - 1].flags & VK_SUBMIT_PROTECTED_BIT)) {
++      const VkSubmitInfo2 *last = &submits[count - 1];
++      const uint32_t n = last->commandBufferInfoCount;
++      copy = malloc(sizeof(*copy) * count);
++      cmds = malloc(sizeof(*cmds) * (n + 2));
++      if (copy && cmds) {
++         slot = (int32_t)(st->next++ % VKR_STAGE_SLOTS);
++         cmds[0] = (VkCommandBufferSubmitInfo){
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
++            .commandBuffer = st->begin[slot],
++         };
++         memcpy(&cmds[1], last->pCommandBufferInfos, sizeof(*cmds) * n);
++         cmds[n + 1] = (VkCommandBufferSubmitInfo){
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
++            .commandBuffer = st->end[slot],
++         };
++         memcpy(copy, submits, sizeof(*copy) * count);
++         copy[count - 1].commandBufferInfoCount = n + 2;
++         copy[count - 1].pCommandBufferInfos = cmds;
++         submits = copy;
++      }
++   }
++
++   const uint64_t t0 = vkr_stage_now();
++   mtx_lock(&queue->vk_mutex);
++   VkResult ret = vk->QueueSubmit2(handle, count, submits, fence);
++   mtx_unlock(&queue->vk_mutex);
++   const uint64_t t1 = vkr_stage_now();
++
++   free(copy);
++   free(cmds);
++   if (st) {
++      st->submit_ns = t0;
++      st->submit_done_ns = t1;
++      st->slot = ret == VK_SUCCESS ? slot : -1;
++   }
++   return ret;
++}
++
++/* The sync fence for (ring_idx, fence_id) is being submitted: report the
++ * last submit before it and hand its timestamp slot to the sync.
++ */
++static void
++vkr_queue_stage_fence(struct vkr_queue *queue,
++                      struct vkr_queue_sync *sync,
++                      vkr_stage_fn hook,
++                      uint64_t fence_ns)
++{
++   const uint32_t ctx_id = queue->context->ctx_id;
++   struct vkr_queue_stage *st = queue->stage;
++   if (st && st->submit_ns) {
++      hook(VKR_STAGE_SUBMIT, ctx_id, sync->ring_idx, sync->fence_id, st->submit_ns, 0);
++      hook(VKR_STAGE_SUBMIT_DONE, ctx_id, sync->ring_idx, sync->fence_id, st->submit_done_ns, 0);
++      sync->stage_slot = st->slot;
++      st->submit_ns = 0;
++      st->slot = -1;
++   }
++   hook(VKR_STAGE_FENCE, ctx_id, sync->ring_idx, sync->fence_id, fence_ns, 0);
++}
++
++/* The sync thread saw the sync signalled: report it, and the GPU duration
++ * of the submit before it if its timestamps are there.
++ */
++static void
++vkr_queue_stage_retired(struct vkr_queue *queue, struct vkr_queue_sync *sync, vkr_stage_fn hook)
++{
++   const uint64_t now = vkr_stage_now();
++   const uint32_t ctx_id = queue->context->ctx_id;
++
++   /* The GPU duration first: FENCE_DONE is the last report for the fence. */
++   struct vkr_queue_stage *st = queue->stage;
++   if (sync->stage_slot >= 0 && st && st->usable) {
++      struct vkr_device *dev = queue->device;
++      uint64_t ts[2];
++      VkResult r = dev->proc_table.GetQueryPoolResults(
++         dev->base.handle.device, st->queries, 2 * (uint32_t)sync->stage_slot, 2, sizeof(ts),
++         ts, sizeof(ts[0]), VK_QUERY_RESULT_64_BIT);
++      if (r == VK_SUCCESS) {
++         const uint64_t ticks = (ts[1] - ts[0]) & st->mask;
++         hook(VKR_STAGE_GPU, ctx_id, sync->ring_idx, sync->fence_id, now,
++              (uint64_t)((double)ticks * (double)st->period));
++      }
++   }
++   hook(VKR_STAGE_FENCE_DONE, ctx_id, sync->ring_idx, sync->fence_id, now, 0);
++}
++
+ static struct vkr_queue_sync *
+ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+                             uint32_t fence_flags,
+@@ -58,6 +401,7 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+    }
+ 
+    sync->device_lost = false;
++   sync->stage_slot = -1;
+    sync->flags = fence_flags;
+    sync->ring_idx = ring_idx;
+    sync->fence_id = fence_id;
+@@ -96,6 +440,10 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+    if (!sync)
+       return false;
+ 
++   vkr_stage_fn hook = vkr_stage_hook();
++   if (unlikely(hook))
++      vkr_queue_stage_fence(queue, sync, hook, vkr_stage_now());
++
+    mtx_lock(&queue->vk_mutex);
+    VkResult result = vk->QueueSubmit(queue->base.handle.queue, 0, NULL, sync->fence);
+    mtx_unlock(&queue->vk_mutex);
+@@ -139,6 +487,7 @@ void
+ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue)
+ {
+    vkr_queue_sync_thread_fini(queue);
++   vkr_queue_stage_destroy(queue);
+ 
+    list_del(&queue->base.track_head);
+ 
+@@ -188,6 +537,12 @@ vkr_queue_thread(void *arg)
+                                     ns_per_sec * 3);
+       }
+ 
++      if (result == VK_SUCCESS) {
++         vkr_stage_fn hook = vkr_stage_hook();
++         if (unlikely(hook))
++            vkr_queue_stage_retired(queue, sync, hook);
++      }
++
+       mtx_lock(&queue->sync_thread.mutex);
+ 
+       if (result == VK_TIMEOUT)
+@@ -380,6 +735,12 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
+ 
+    vn_replace_vkQueueSubmit_args_handle(args);
+ 
++   if (unlikely(vkr_stage_hook())) {
++      args->ret = vkr_queue_submit_staged(queue, args->queue, args->submitCount,
++                                          args->pSubmits, args->fence);
++      return;
++   }
++
+    mtx_lock(&queue->vk_mutex);
+    args->ret =
+       vk->QueueSubmit(args->queue, args->submitCount, args->pSubmits, args->fence);
+@@ -421,6 +782,12 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
+ 
+    vn_replace_vkQueueSubmit2_args_handle(args);
+ 
++   if (unlikely(vkr_stage_hook())) {
++      args->ret = vkr_queue_submit2_staged(queue, args->queue, args->submitCount,
++                                           args->pSubmits, args->fence);
++      return;
++   }
++
+    mtx_lock(&queue->vk_mutex);
+    args->ret =
+       vk->QueueSubmit2(args->queue, args->submitCount, args->pSubmits, args->fence);
+diff --git a/src/venus/vkr_queue.h b/src/venus/vkr_queue.h
+index 6a3a909e..eb018d1f 100644
+--- a/src/venus/vkr_queue.h
++++ b/src/venus/vkr_queue.h
+@@ -16,9 +16,16 @@ struct vkr_queue_sync {
+    uint32_t ring_idx;
+    uint64_t fence_id;
+ 
++   /* Conduit stage timing: the timestamp slot of the last submit before
++    * this fence, -1 for none.
++    */
++   int32_t stage_slot;
++
+    struct list_head head;
+ };
+ 
++struct vkr_queue_stage;
++
+ struct vkr_queue {
+    struct vkr_object base;
+ 
+@@ -48,6 +55,9 @@ struct vkr_queue {
+       thrd_t thread;
+       bool join;
+    } sync_thread;
++
++   /* Conduit stage timing, made on the first submit while a hook is set. */
++   struct vkr_queue_stage *stage;
+ };
+ VKR_DEFINE_OBJECT_CAST(queue, VK_OBJECT_TYPE_QUEUE, VkQueue)
+ 
+@@ -89,6 +99,13 @@ vkr_queue_create(struct vkr_context *ctx,
+ void
+ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
+ 
++/* Conduit stage timing: the hook set by virgl_renderer_conduit_stage_hook,
++ * NULL while off.
++ */
++typedef void (*vkr_stage_fn)(uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t);
++vkr_stage_fn
++vkr_stage_hook_current(void);
++
+ bool
+ vkr_queue_sync_submit(struct vkr_queue *queue,
+                       uint32_t flags,
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 2929b617..690f758e 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -172,6 +172,17 @@ struct virgl_renderer_callbacks {
+ VIRGL_EXPORT int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cb);
+ VIRGL_EXPORT void virgl_renderer_poll(void); /* force fences */
+ 
++/* Conduit: per-frame stage timing (docs/TRACING.md in Conduit). With a hook
++ * set, vkr reports when it calls vkQueueSubmit for a ring's work, when it
++ * submits and sees the ring's sync fence, and the GPU duration of the work
++ * from timestamp queries it wraps around the last submit before each fence;
++ * NULL turns all of it off. ts_ns is CLOCK_MONOTONIC. The hook runs on
++ * render server and sync threads and must not block.
++ */
++typedef void (*virgl_renderer_conduit_stage_fn)(uint32_t stage, uint32_t ctx_id, uint32_t ring_idx,
++                                                uint64_t fence_id, uint64_t ts_ns, uint64_t aux);
++VIRGL_EXPORT void virgl_renderer_conduit_stage_hook(virgl_renderer_conduit_stage_fn hook);
++
+ /* we need to give qemu the cursor resource contents */
+ VIRGL_EXPORT void *virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t *width, uint32_t *height);
+ 

@@ -291,7 +291,9 @@ impl VenusRing {
 }
 
 impl VenusInstance {
-    /// `vkGetDeviceQueue2` for family 0, queue 0 on ring 1.
+    /// `vkGetDeviceQueue2` for queue 0 of `family`, bound to `ring_idx`: family 0 on ring 1 (the
+    /// main queue, every KMD submission), and with `CopyQueue` 1 the transfer family on
+    /// `copy_queue::COPY_RING_IDX`.
     ///
     /// Takes the device id as an argument rather than reading a field: at this
     /// point the device exists but the `VenusClient` that will own it does not,
@@ -300,6 +302,8 @@ impl VenusInstance {
         &mut self,
         adapter: &AdapterContext,
         device_id: VkDeviceId,
+        family: u32,
+        ring_idx: u32,
     ) -> Result<VkQueueId, VirtioError> {
         let queue_id = self.ring.next_raw();
         let mut w = Writer::new();
@@ -310,9 +314,9 @@ impl VenusInstance {
         w.count(true); // pNext: VkDeviceQueueTimelineInfoMESA
         w.i32(ST_DEVICE_QUEUE_TIMELINE_INFO_MESA);
         w.count(false);
-        w.u32(1); // ringIdx; 0 is the renderer's CPU timeline.
+        w.u32(ring_idx); // ringIdx; 0 is the renderer's CPU timeline.
         w.u32(0); // flags
-        w.u32(0); // queueFamilyIndex
+        w.u32(family); // queueFamilyIndex
         w.u32(0); // queueIndex
         w.count(true);
         w.u64(queue_id.get());
@@ -406,12 +410,56 @@ impl VenusInstance {
         }
         diag(0x0008);
 
-        // ── 7. vkCreateDevice — one queue, family 0, priority 1.0 ─────────────
-        let (device_id, modifier_import_device) = self.create_device_with_ext_ladder(adapter)?;
+        // ── 6b. `CopyQueue` 1 only: the transfer-only family, from the host's list ──
+        // With the knob 0 (the default) nothing is asked and the device below is the one it was.
+        let knob = crate::ddi::copy_queue::knob();
+        let (families, choice) = if knob.transfer() {
+            self.query_transfer_family(adapter)
+        } else {
+            (0, None)
+        };
+
+        // ── 7. vkCreateDevice — family 0 (priority 1.0), plus the transfer family ──
+        let (device_id, modifier_import_device, transfer_granted, priority_granted) =
+            self.create_device_with_ext_ladder(adapter, choice, knob.priority())?;
         diag(0x0009);
 
-        let queue_id = self.get_device_queue(adapter, device_id)?;
+        let queue_id = self.get_device_queue(
+            adapter,
+            device_id,
+            helios_kmd_logic::copy_queue::MAIN_FAMILY,
+            helios_kmd_logic::copy_queue::MAIN_RING_IDX,
+        )?;
         diag(0x000D);
+        // The transfer queue and its ring. A refusal here only costs the queue: no submission is
+        // ever fenced on a ring whose queue was not obtained (virglrenderer destroys the context
+        // for that), because `copy_queue` stays `None` and every copy routes to family 0.
+        let copy_queue = match (transfer_granted, choice) {
+            (true, Some(choice)) => self
+                .get_device_queue(
+                    adapter,
+                    device_id,
+                    choice.index,
+                    helios_kmd_logic::copy_queue::COPY_RING_IDX,
+                )
+                .ok()
+                .map(|queue_id| CopyQueue {
+                    queue_id,
+                    device: helios_kmd_logic::copy_queue::Device {
+                        family: Some(choice.index),
+                        granularity: choice.granularity,
+                    },
+                }),
+            _ => None,
+        };
+        crate::ddi::copy_queue::note_bringup(
+            families,
+            choice,
+            copy_queue.is_some(),
+            choice.is_some() && !transfer_granted,
+            priority_granted,
+            knob.priority() && !priority_granted,
+        );
 
         Ok(VenusClient {
             ring: self.ring,
@@ -420,6 +468,8 @@ impl VenusInstance {
             device_id,
             modifier_import_device,
             queue_id,
+            copy_knob: knob,
+            copy_queue,
             memory_type_index,
             memory_type_flags,
             memory_type_count,
@@ -439,6 +489,50 @@ impl VenusInstance {
             rm_blt_stage_allocs: 0,
             guest_buffers: Vec::new(),
         })
+    }
+
+    /// `vkGetPhysicalDeviceQueueFamilyProperties`: how many families the host reported and the
+    /// transfer-only one the copy queue goes on (`copy_queue::choose_transfer_family`: chosen by
+    /// its flags, never by index; `None` when there is none, and every copy stays on family 0).
+    ///
+    /// `CopyQueue` 1 only. Any failure is "no transfer family", never a bring-up failure. Its
+    /// own frame (`#[inline(never)]`): the family array is 192 bytes and this runs on
+    /// StartDevice's stack (see `allocate_host_visible_blob`).
+    #[inline(never)]
+    fn query_transfer_family(
+        &mut self,
+        adapter: &AdapterContext,
+    ) -> (u32, Option<helios_kmd_logic::copy_queue::Choice>) {
+        use helios_kmd_logic::copy_queue as cq;
+        let mut families = [cq::Family::from_words([0; 6]); cq::MAX_FAMILIES as usize];
+        let read = (|| -> Result<usize, VirtioError> {
+            let w =
+                cq::encode_get_queue_family_properties(self.phys_dev_id.get(), cq::MAX_FAMILIES);
+            let mut r = self.ring.ring_command_expect(
+                adapter,
+                w.as_slice()?,
+                ReplyCheck::new(cq::CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES),
+            )?;
+            // Reply (no VkResult): [i32 cmd][sp u64][u32 count][array_size u64][6 x u32 each].
+            if r.read_u64()? == 0 {
+                return Err(VirtioError::DeviceError);
+            }
+            let count = r.read_u32()?;
+            let array = r.read_u64()?;
+            let n = (count.min(cq::MAX_FAMILIES) as u64).min(array) as usize;
+            for family in families.iter_mut().take(n) {
+                let mut words = [0u32; 6];
+                for word in words.iter_mut() {
+                    *word = r.read_u32()?;
+                }
+                *family = cq::Family::from_words(words);
+            }
+            Ok(n)
+        })();
+        match read {
+            Ok(n) => (n as u32, cq::choose_transfer_family(&families[..n])),
+            Err(_) => (0, None),
+        }
     }
 
     /// The CreateDevice extension ladder: export-trio + modifier → export-trio
@@ -473,11 +567,23 @@ impl VenusInstance {
     /// (`SdgDevR`) go to fixed registry names so a `reg query` reveals them
     /// without the S-ring. Both are owner bring-up ABI: do not collapse the
     /// per-attempt `SdgDevR` record into a single write.
+    ///
+    /// `CopyQueue` 1 with a transfer family (`transfer`): every attempt also asks for one queue
+    /// of that family, and when even the last tier is refused the ladder runs again from its
+    /// start WITHOUT it, i.e. exactly the devices a `CopyQueue` 0 boot tries
+    /// (`copy_queue::next_attempt`). The third value says whether the device has the queue.
+    ///
+    /// `CopyQueue` 2 (`priority`): every attempt also enables `VK_KHR_global_priority` and gives
+    /// the family-0 queue `VkDeviceQueueGlobalPriorityCreateInfoKHR { HIGH }`; refused at every
+    /// tier, the walk repeats without it before it drops the transfer queue. The fourth value
+    /// says whether the device has the priority.
     #[inline(never)]
     pub(super) fn create_device_with_ext_ladder(
         &mut self,
         adapter: &AdapterContext,
-    ) -> Result<(VkDeviceId, bool), VirtioError> {
+        transfer: Option<helios_kmd_logic::copy_queue::Choice>,
+        priority: bool,
+    ) -> Result<(VkDeviceId, bool, bool, bool), VirtioError> {
         const EXT_EXPORT: [&[u8]; 3] = [
             b"VK_KHR_external_memory\0",
             b"VK_KHR_external_memory_fd\0",
@@ -531,13 +637,31 @@ impl VenusInstance {
         // Tier 1 = export-only, 2 = none. Render-only starts at 2, exactly the
         // old no-ext behaviour. Tier numbering is UNCHANGED so `SdgDevX` keeps
         // its meaning across the deletion: a DisplayHalf boot still reads 1.
-        let mut ext_tier: u32 =
+        let start_tier: u32 =
             helios_kmd_logic::foreign_copy::ladder_start_tier(want_scanout_exts, want_modifier);
+        let mut attempt =
+            helios_kmd_logic::copy_queue::first_attempt(start_tier, transfer.is_some(), priority);
         loop {
+            let ext_tier = attempt.tier;
+            let transfer_family = match (attempt.transfer, transfer) {
+                (true, Some(choice)) => Some(choice.index),
+                _ => None,
+            };
             let exts: &[&[u8]] = match ext_tier {
                 0 => &EXT_EXPORT_MODIFIER,
                 1 => &EXT_EXPORT,
                 _ => &[],
+            };
+            // `CopyQueue` 2: the tier's extensions plus `VK_KHR_global_priority` (the largest
+            // set, tier 0 with two queue infos and the priority struct, is about 390 bytes of
+            // the writer's 512).
+            let prio_ext = helios_kmd_logic::copy_queue::EXT_GLOBAL_PRIORITY;
+            let mut with_prio: [&[u8]; 5] = [prio_ext; 5];
+            let exts: &[&[u8]] = if attempt.priority {
+                with_prio[..exts.len()].copy_from_slice(exts);
+                &with_prio[..exts.len() + 1]
+            } else {
+                exts
             };
             // A FRESH handle per attempt. Reusing one across tiers would make a
             // retry collide with the host's record of the failed device.
@@ -550,17 +674,36 @@ impl VenusInstance {
             w.i32(ST_DEVICE_CREATE_INFO); // sType
             w.u64(0); // pNext NULL
             w.u32(0); // flags
-            w.u32(1); // queueCreateInfoCount
-            w.count(true); // array_size(1) for pQueueCreateInfos
-                           // VkDeviceQueueCreateInfo[0]:
+            let queue_infos = 1 + transfer_family.is_some() as u32;
+            w.u32(queue_infos); // queueCreateInfoCount
+            w.u64(u64::from(queue_infos)); // array_size for pQueueCreateInfos
+                                           // VkDeviceQueueCreateInfo[0]:
             w.i32(ST_DEVICE_QUEUE_CREATE_INFO); // sType
-            w.u64(0); // pNext NULL
+            if attempt.priority {
+                // pNext: VkDeviceQueueGlobalPriorityCreateInfoKHR { HIGH }, nothing after it.
+                w.count(true);
+                w.i32(helios_kmd_logic::copy_queue::ST_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO);
+                w.u64(0); // its pNext NULL
+                w.u32(helios_kmd_logic::copy_queue::GLOBAL_PRIORITY_HIGH);
+            } else {
+                w.u64(0); // pNext NULL
+            }
             w.u32(0); // flags
             w.u32(0); // queueFamilyIndex
             w.u32(1); // queueCount
             w.count(true); // array_size(1) for pQueuePriorities
             w.f32(1.0); // priority
-                        // back to VkDeviceCreateInfo:
+            if let Some(family) = transfer_family {
+                // VkDeviceQueueCreateInfo[1]: one queue of the transfer-only family.
+                w.i32(ST_DEVICE_QUEUE_CREATE_INFO); // sType
+                w.u64(0); // pNext NULL
+                w.u32(0); // flags
+                w.u32(family); // queueFamilyIndex
+                w.u32(1); // queueCount
+                w.count(true); // array_size(1) for pQueuePriorities
+                w.f32(1.0); // priority
+            }
+            // back to VkDeviceCreateInfo:
             w.u32(0); // enabledLayerCount
             w.count(false); // ppEnabledLayerNames array_size 0
             if exts.is_empty() {
@@ -597,13 +740,18 @@ impl VenusInstance {
                 crate::diag::record_named_bytes(b"SdgDevX", ext_tier);
                 // 1 = the foreign copy path exists on this device.
                 crate::diag::record_named_bytes(b"FcDevX", (ext_tier == 0) as u32);
-                return Ok((device_id, ext_tier == 0));
+                return Ok((
+                    device_id,
+                    ext_tier == 0,
+                    transfer_family.is_some(),
+                    attempt.priority,
+                ));
             }
             // Record the VkResult that knocked this tier down before stepping.
             crate::diag::record_named_bytes(b"SdgDevR", result as u32);
-            if ext_tier < 2 {
+            if let Some(next) = helios_kmd_logic::copy_queue::next_attempt(attempt, start_tier) {
                 diag(0x00F4);
-                ext_tier += 1;
+                attempt = next;
                 continue;
             }
             // If this fails, the host may require a VkDeviceQueueTimelineInfoMESA

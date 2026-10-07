@@ -479,6 +479,15 @@ pub(crate) static NVK_RM_FENCE: BoolKnob = BoolKnob::new(c"NvkRmFence", true);
 /// composed frames.
 pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", true);
 
+/// `NvkRmCopyRecord`: 1 (default) = a composed NVK frame whose WDDM present
+/// carries an RM fence also carries the copy-engine Present record (`'HEF3'`,
+/// the 168-byte `HERF` / 192-byte `HEPR`, docs/rm-copy-engine-present.md 12)
+/// when the KMD reads it (QueryCaps bit 37) and NVK has `queue_rm_fence_v3`.
+/// The record is only an input: whether a frame is copied on the copy engine
+/// is the KMD's `RmCopyEngine` knob and its per-frame decision. 0 (registry,
+/// or `HELIOS_NVK_RM_COPY_RECORD=0`) = the 48 / 96-byte fence forms as before.
+pub(crate) static NVK_RM_COPY_RECORD: BoolKnob = BoolKnob::new(c"NvkRmCopyRecord", true);
+
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|v| match v.trim() {
         "0" => Some(false),
@@ -498,6 +507,14 @@ pub(crate) fn nvk_rm_fence_present() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
         env_bool("HELIOS_NVK_RM_FENCE_PRESENT").unwrap_or_else(|| NVK_RM_FENCE_PRESENT.get())
+    })
+}
+
+/// `NvkRmCopyRecord`, or `HELIOS_NVK_RM_COPY_RECORD` from the environment.
+pub(crate) fn nvk_rm_copy_record() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_RM_COPY_RECORD").unwrap_or_else(|| NVK_RM_COPY_RECORD.get())
     })
 }
 

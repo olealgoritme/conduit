@@ -311,6 +311,53 @@ pub const fn gb20x_family(element_bytes: u32) -> u64 {
     }
 }
 
+/// Which GOBs the GPU's block-linear surfaces use. Copy of `helios_protocol::GobScheme`.
+///
+/// Turing, Ampere and Ada have one GOB (NIL's TuringColor2D, sector layout 1) for every
+/// element size, so every block-linear plane there carries [`MOD_NVIDIA_BLOCK_LINEAR_BASE`];
+/// NVK's 1- and 2-byte planes on those GPUs are `BASE | h`, which the GB20x rule
+/// ([`gb20x_family`]) refuses. Blackwell (3D class BLACKWELL_A and later) adds the 8-bit
+/// and 16-bit GOBs. [`Layout::validate`] is the `Gb20x` rule (the only GPU this KMD has
+/// run on); [`Layout::validate_with`] takes the scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GobScheme {
+    /// Turing, Ampere, Ada: the desktop GOB for every element size.
+    Desktop,
+    /// Blackwell: the desktop GOB for 4- and 8-byte elements, the 8-bit and 16-bit GOBs
+    /// for 1- and 2-byte elements.
+    Gb20x,
+}
+
+impl GobScheme {
+    /// The scheme NIL picks for a 3D class (`GOBType::choose`, src/nouveau/nil/tiling.rs):
+    /// the Blackwell GOBs from BLACKWELL_A (0xcd97) on.
+    pub const fn from_eng3d_class(cls_eng3d: u32) -> Self {
+        if cls_eng3d >= 0xcd97 {
+            GobScheme::Gb20x
+        } else {
+            GobScheme::Desktop
+        }
+    }
+
+    /// The same by RM architecture (`NV2080_CTRL_CMD_MC_GET_ARCH_INFO`): Blackwell is
+    /// 0x1A0 (GB10x) and 0x1B0 (GB20x); Turing 0x160, Ampere 0x170, Hopper 0x180, Ada 0x190.
+    pub const fn from_rm_architecture(arch: u32) -> Self {
+        if arch >= 0x1A0 {
+            GobScheme::Gb20x
+        } else {
+            GobScheme::Desktop
+        }
+    }
+
+    /// The block-linear family a plane of `element_bytes` wide elements must carry.
+    pub const fn family(self, element_bytes: u32) -> u64 {
+        match self {
+            GobScheme::Gb20x => gb20x_family(element_bytes),
+            GobScheme::Desktop => MOD_NVIDIA_BLOCK_LINEAR_BASE,
+        }
+    }
+}
+
 /// Largest accepted `h` (32 GOBs = 256 rows per block).
 pub const MAX_BLOCK_HEIGHT_LOG2: u32 = 5;
 /// Rows in one GOB.
@@ -401,8 +448,8 @@ const fn block_log2(modifier: u64) -> Option<u32> {
 /// A modifier a plane whose elements are `element_bytes` wide may carry: LINEAR, or the one
 /// block-linear family [`gb20x_family`] names for that element size, with `h <= 5`. Every
 /// other value, another family's included, is refused.
-const fn plane_modifier_ok(modifier: u64, element_bytes: u32) -> bool {
-    modifier == MOD_LINEAR || family_log2(modifier, gb20x_family(element_bytes)).is_some()
+const fn plane_modifier_ok(modifier: u64, element_bytes: u32, scheme: GobScheme) -> bool {
+    modifier == MOD_LINEAR || family_log2(modifier, scheme.family(element_bytes)).is_some()
 }
 
 /// `offset + stride * rows`, `rows` rounded up to the plane's block when it is
@@ -427,7 +474,13 @@ const fn plane_min_bytes(offset: u32, stride: u32, rows: u64, modifier: u64) -> 
 }
 
 impl Layout {
+    /// [`Self::validate_with`] under the GB20x rule.
     pub const fn validate(&self) -> Result<(), LayoutError> {
+        self.validate_with(GobScheme::Gb20x)
+    }
+
+    /// The layout is well formed for a GPU whose block-linear planes follow `scheme`.
+    pub const fn validate_with(&self, scheme: GobScheme) -> Result<(), LayoutError> {
         if self.width < MIN_DIM
             || self.width > MAX_DIM
             || self.height < MIN_DIM
@@ -450,7 +503,7 @@ impl Layout {
         {
             return Err(LayoutError::Stride);
         }
-        if !plane_modifier_ok(self.modifier, f.bpp0) {
+        if !plane_modifier_ok(self.modifier, f.bpp0, scheme) {
             return Err(LayoutError::Modifier);
         }
         if let Some(p) = self.plane1 {
@@ -462,7 +515,7 @@ impl Layout {
             }
             // LINEAR planes stay LINEAR together; block-linear ones may differ in `h` and in
             // family (each plane's family follows its own element size: NV12 is 8BPP + 16BPP).
-            if !plane_modifier_ok(p.modifier, f.bpp1)
+            if !plane_modifier_ok(p.modifier, f.bpp1, scheme)
                 || (p.modifier == MOD_LINEAR) != (self.modifier == MOD_LINEAR)
             {
                 return Err(LayoutError::Modifier);
@@ -535,7 +588,12 @@ impl Layout {
 
     /// The layout is valid and fits an object of `size` bytes.
     pub const fn validate_for(&self, size: u64) -> Result<(), LayoutError> {
-        if let Err(e) = self.validate() {
+        self.validate_for_with(size, GobScheme::Gb20x)
+    }
+
+    /// [`Self::validate_for`] for a GPU whose block-linear planes follow `scheme`.
+    pub const fn validate_for_with(&self, size: u64, scheme: GobScheme) -> Result<(), LayoutError> {
+        if let Err(e) = self.validate_with(scheme) {
             return Err(e);
         }
         if self.min_bytes() > size {
@@ -580,6 +638,27 @@ pub fn validate_request(
     size: u64,
     layout: Option<Layout>,
 ) -> Result<Layout, RequestError> {
+    validate_request_with(
+        ctx_id,
+        rm_handle,
+        gem_handle,
+        flags,
+        size,
+        layout,
+        GobScheme::Gb20x,
+    )
+}
+
+/// [`validate_request`] for a GPU whose block-linear planes follow `scheme`.
+pub fn validate_request_with(
+    ctx_id: u32,
+    rm_handle: u32,
+    gem_handle: u32,
+    flags: u32,
+    size: u64,
+    layout: Option<Layout>,
+    scheme: GobScheme,
+) -> Result<Layout, RequestError> {
     if ctx_id == 0 || rm_handle == 0 || gem_handle == 0 {
         return Err(RequestError::ZeroId);
     }
@@ -604,7 +683,9 @@ pub fn validate_request(
     if (flags & FLAG_PLANE1 != 0) != layout.plane1.is_some() {
         return Err(RequestError::Flags);
     }
-    layout.validate_for(size).map_err(RequestError::Layout)?;
+    layout
+        .validate_for_with(size, scheme)
+        .map_err(RequestError::Layout)?;
     Ok(layout)
 }
 
@@ -2885,6 +2966,135 @@ mod shared_format_tests {
         p.modifier = gb20x_family(bpp * 2) | h1;
         p.offset = off as u32;
         l
+    }
+
+    // ---- GOB schemes (pre-Blackwell GPUs) ---------------------------------------------
+
+    /// What NVK produces on Turing, Ampere and Ada: the desktop family for every plane.
+    fn two_desktop(fourcc: u32, w: u32, h: u32, h0: u64, h1: u64) -> Layout {
+        let mut l = two(fourcc, w, h);
+        l.modifier = BL | h0;
+        let off = l.plane0_min_bytes();
+        let p = l.plane1.as_mut().unwrap();
+        p.modifier = BL | h1;
+        p.offset = off as u32;
+        l
+    }
+
+    #[test]
+    fn the_scheme_follows_the_3d_class_and_the_architecture() {
+        for cls in [0xc597, 0xc797, 0xc997, 0xcb97] {
+            assert_eq!(
+                GobScheme::from_eng3d_class(cls),
+                GobScheme::Desktop,
+                "{cls:#x}"
+            );
+        }
+        for cls in [0xcd97, 0xce97] {
+            assert_eq!(
+                GobScheme::from_eng3d_class(cls),
+                GobScheme::Gb20x,
+                "{cls:#x}"
+            );
+        }
+        for arch in [0x160, 0x170, 0x180, 0x190] {
+            assert_eq!(
+                GobScheme::from_rm_architecture(arch),
+                GobScheme::Desktop,
+                "{arch:#x}"
+            );
+        }
+        for arch in [0x1A0, 0x1B0] {
+            assert_eq!(
+                GobScheme::from_rm_architecture(arch),
+                GobScheme::Gb20x,
+                "{arch:#x}"
+            );
+        }
+        for bytes in [0, 1, 2, 4, 8, u32::MAX] {
+            assert_eq!(GobScheme::Gb20x.family(bytes), gb20x_family(bytes));
+            assert_eq!(GobScheme::Desktop.family(bytes), BL);
+        }
+    }
+
+    #[test]
+    fn validate_is_the_gb20x_rule() {
+        // The default entry points keep the rule the 5090 runs with.
+        for &(fourcc, _, bpp, hdiv) in ONE_PLANE.iter() {
+            let w = 64;
+            for m in [MOD_LINEAR, gb20x_family(bpp) | 3, BL | 3] {
+                let l = Layout {
+                    modifier: m,
+                    ..one(fourcc, w, 64, row0(bpp, hdiv, w))
+                };
+                assert_eq!(
+                    l.validate(),
+                    l.validate_with(GobScheme::Gb20x),
+                    "{fourcc:#x} {m:#x}"
+                );
+                assert_eq!(
+                    l.validate_for(MIB),
+                    l.validate_for_with(MIB, GobScheme::Gb20x),
+                    "{fourcc:#x} {m:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_blackwell_planes_carry_the_desktop_family() {
+        // One-plane formats: 1- and 2-byte ones differ between the schemes, 4- and 8-byte
+        // ones are the same family on both.
+        for &(fourcc, name, bpp, hdiv) in ONE_PLANE.iter() {
+            let w = 64;
+            let desk = Layout {
+                modifier: BL | 2,
+                ..one(fourcc, w, 64, row0(bpp, hdiv, w))
+            };
+            let gb = Layout {
+                modifier: gb20x_family(bpp) | 2,
+                ..desk
+            };
+            assert_eq!(desk.validate_with(GobScheme::Desktop), Ok(()), "{name}");
+            assert_eq!(gb.validate_with(GobScheme::Gb20x), Ok(()), "{name}");
+            if bpp <= 2 {
+                assert_eq!(desk.validate(), Err(LayoutError::Modifier), "{name}");
+                assert_eq!(
+                    gb.validate_with(GobScheme::Desktop),
+                    Err(LayoutError::Modifier),
+                    "{name}"
+                );
+            } else {
+                assert_eq!(desk, gb, "{name}");
+            }
+        }
+        // Two-plane formats: NV12 is 1 + 2 bytes, P010/P016 2 + 4.
+        for &(fourcc, name, _) in TWO_PLANE.iter() {
+            let desk = two_desktop(fourcc, 1920, 1080, 4, 3);
+            let gb = two_bl(fourcc, 1920, 1080, 4, 3);
+            assert_eq!(desk.validate_with(GobScheme::Desktop), Ok(()), "{name}");
+            assert_eq!(gb.validate_with(GobScheme::Gb20x), Ok(()), "{name}");
+            assert_eq!(desk.validate(), Err(LayoutError::Modifier), "{name}");
+            assert_eq!(
+                gb.validate_with(GobScheme::Desktop),
+                Err(LayoutError::Modifier),
+                "{name}"
+            );
+            // The block height bound does not depend on the family.
+            assert_eq!(desk.min_bytes(), gb.min_bytes(), "{name}");
+        }
+        // The request path takes the scheme too.
+        let desk = two_desktop(FOURCC_NV12, 1920, 1080, 4, 3);
+        let size = rup(desk.min_bytes(), PAGE);
+        let flags = FLAG_LAYOUT | FLAG_PLANE1;
+        assert_eq!(
+            validate_request_with(1, 2, 3, flags, size, Some(desk), GobScheme::Desktop),
+            Ok(desk)
+        );
+        assert_eq!(
+            validate_request(1, 2, 3, flags, size, Some(desk)),
+            Err(RequestError::Layout(LayoutError::Modifier))
+        );
     }
 
     // ---- the table -----------------------------------------------------------------
