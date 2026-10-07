@@ -216,26 +216,18 @@ static PROFILES: &[Profile] = &[
     },
 ];
 
-/// The layout of one host release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Selected {
-    pub layout: Layout,
-    /// The host release has a table of its own. When false this is an older
-    /// release's, and the struct may have grown since: 565 to 575 added a
-    /// word and moved the rest.
-    pub exact: bool,
-}
-
-/// The layout for a host driver version: its own, or the nearest older one.
-pub fn select(v: DriverVersion) -> Option<Selected> {
+/// The layout of exactly this host release, or `None`.
+///
+/// Never the nearest older release's: the struct is not monotonic (535 is 20
+/// bytes, 565.77 to 570 are 32, 575 and later 36), so an older layout for a
+/// newer release is as likely to be the wrong size as the right one, and
+/// asking the host with the wrong size reads the wrong words or none. A
+/// release without a table is not asked (the same rule as `abi::nvkms`).
+pub fn select(v: DriverVersion) -> Option<Layout> {
     PROFILES
         .iter()
-        .rev()
-        .find(|p| p.version <= v)
-        .map(|p| Selected {
-            layout: (p.layout)(),
-            exact: p.version == v,
-        })
+        .find(|p| p.version == v)
+        .map(|p| (p.layout)())
 }
 
 /// The releases that have a layout.
@@ -259,7 +251,6 @@ mod tests {
         let host = words(&[0x200, 1, 1, 6, 2, 1, 1, 1]);
         let got = select(DriverVersion::new(565, 77, 0))
             .unwrap()
-            .layout
             .decode(&host)
             .unwrap();
         assert_eq!(
@@ -304,7 +295,7 @@ mod tests {
             DriverVersion::new(610, 57, 4),
             DriverVersion::new(615, 71, 9),
         ] {
-            let d = select(v).unwrap().layout.decode(&host).unwrap();
+            let d = select(v).unwrap().decode(&host).unwrap();
             let wire = d.to_wire();
             assert_eq!(wire.to_vec(), vec![0x100, 0, 0, 1, 6, 2, 1, 1, 1], "{v}");
         }
@@ -315,7 +306,6 @@ mod tests {
         let host = words(&[0x100, 0, 0xfe, 0, 1]);
         let d = select(DriverVersion::new(535, 129, 3))
             .unwrap()
-            .layout
             .decode(&host)
             .unwrap();
         assert_eq!(d.gpu_id, 0x100);
@@ -430,15 +420,20 @@ mod tests {
         }
     }
 
+    /// A release with no table of its own has none, whatever is older: the
+    /// layouts are 20, 32 and 36 bytes, so a guess is a wrong ioctl size.
     #[test]
-    fn a_release_older_than_every_table_has_none() {
-        assert!(select(DriverVersion::new(470, 0, 0)).is_none());
-        // 570 is between tables: the nearest older (565.77, 32 bytes) is also
-        // right for it, and says it is not its own.
-        let s = select(DriverVersion::new(570, 86, 15)).unwrap();
-        assert!(!s.exact);
-        assert_eq!(s.layout.size, 32);
-        assert!(select(DriverVersion::new(565, 77, 0)).unwrap().exact);
+    fn a_release_between_tables_has_none_not_the_older_ones() {
+        for (a, b, c) in [(470, 0, 0), (570, 86, 15), (575, 51, 2), (580, 65, 6)] {
+            assert!(select(DriverVersion::new(a, b, c)).is_none(), "{a}.{b}.{c}");
+        }
+        // Past the newest table, too.
+        assert!(select(DriverVersion::new(999, 0, 0)).is_none());
+        // And every table is found by exactly its own release.
+        for p in PROFILES {
+            assert_eq!(select(p.version), Some((p.layout)()), "{}", p.version);
+        }
+        assert_eq!(select(DriverVersion::new(565, 77, 0)).unwrap().size, 32);
     }
 
     /// `guest/linux/nvgpu_devinfo.h` names the same words in the same order.

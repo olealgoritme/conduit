@@ -1168,7 +1168,9 @@ impl NvGpuBackend {
         let inexact = nvidia.inexact_tables();
         if !inexact.is_empty() {
             let what = format!(
-                "host driver {version} has no ABI tables of its own ({}); only an older release's",
+                "host driver {version} has no ABI tables of its own ({}); the GET_DEV_INFO and NVKMS \
+                 tables have no older release's to fall back on (their layouts are not \
+                 monotonic), the rest use the nearest older one's",
                 inexact.join(", ")
             );
             anyhow::ensure!(

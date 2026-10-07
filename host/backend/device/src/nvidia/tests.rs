@@ -470,6 +470,23 @@ mod tests {
             t.contains(&"RM allowlist") && t.contains(&"UVM command table"),
             "{t:?}"
         );
+        assert!(t.contains(&"GET_DEV_INFO layout"), "{t:?}");
+    }
+
+    /// GET_DEV_INFO has no nearest-older fallback: 580.65.06 sits between
+    /// tables (the nearest older, 565.77, is a 32-byte struct and the host
+    /// wants 36), so under `--allow-nearest-abi` the backend starts with no
+    /// layout, says so, and is never asked for one. The same seven releases
+    /// are accepted without the flag.
+    #[test]
+    fn a_release_without_a_devinfo_table_is_started_with_none_and_named() {
+        use abi::version::DriverVersion as V;
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(V::new(580, 65, 6)).unwrap();
+        assert!(be.start.devinfo.is_none());
+        assert!(be.inexact_tables().contains(&"GET_DEV_INFO layout"));
+        assert_eq!(NvidiaBackend::accepted_releases().len(), 7);
+        assert!(!NvidiaBackend::accepted_releases().contains(&V::new(580, 65, 6)));
     }
 
     /// A device reset (guest reboot under QEMU) leaves the backend as a fresh

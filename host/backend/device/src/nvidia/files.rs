@@ -451,7 +451,7 @@ impl NvidiaBackend {
     /// device forwards compute and render; handing one out would be a
     /// different kind of access than the guest asked for.
     pub(super) fn dri_devices(&self) -> Vec<DriDevice> {
-        let layout = self.start.devinfo.map(|s| s.layout);
+        let layout = self.start.devinfo;
         let mut out = Vec::new();
         for (index, slot) in crate::host::gpu_slots(std::path::Path::new(FileTree::Proc.root()))
             .iter()
@@ -492,13 +492,25 @@ impl NvidiaBackend {
                     log::warn!("DRI node {name}: cannot read {text:?} as major:minor");
                     continue;
                 };
-                let dev_info = layout
-                    .and_then(|l| host_dev_info(&format!("/dev/dri/{name}"), &l))
+                // No table for this release, no node: the layout is never
+                // an older release's, so the node is not asked what it is,
+                // and a node the guest cannot be told about truthfully is
+                // not offered (one line, naming the release and the table).
+                let Some(layout) = layout else {
+                    log::warn!(
+                        "DRI node {name} not offered: host driver {} has no GET_DEV_INFO layout table \
+                         (abi::devinfo), and an older release's is never guessed",
+                        self.start
+                            .driver
+                            .map_or("(unknown)".into(), |v| v.to_string())
+                    );
+                    continue;
+                };
+                let dev_info = host_dev_info(&format!("/dev/dri/{name}"), &layout)
                     .unwrap_or_else(|| {
-                        // Same shape the guest used to invent, so a refusal is
-                        // no worse than the old behaviour -- but it is logged
-                        // above (or the release has no layout, which the
-                        // backend refuses to start on).
+                        // The node did not answer (logged above). Same shape
+                        // the guest used to invent, so a refusal is no worse
+                        // than the old behaviour.
                         abi::devinfo::DevInfo {
                             supports_alloc: 1,
                             generic_page_kind: 6,
@@ -578,11 +590,9 @@ mod dri_tests {
         let v615 = abi::devinfo::select(abi::version::DriverVersion::new(615, 71, 9)).unwrap();
         // The same card, as each release's nvidia-drm would answer for it.
         let from_565 = v565
-            .layout
             .decode(&le(&[0x200, 1, 1, 6, 2, 1, 1, 1]))
             .unwrap();
         let from_615 = v615
-            .layout
             .decode(&le(&[0x200, 0, 1, 1, 6, 2, 1, 1, 1]))
             .unwrap();
         assert_eq!(from_565, from_615);

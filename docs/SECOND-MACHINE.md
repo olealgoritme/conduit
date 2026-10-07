@@ -15,7 +15,12 @@ status, first-hour plan for an RTX 4070) first. Background: [WINDOWS.md](WINDOWS
   the closed modules and older branches with tables are accepted with a
   warning and are untested. The RM protocol (ioctl and control layouts)
   changes between driver versions, and the backend forwards the guest's calls
-  only for a version it has tables for. A release without them is refused.
+  only for a version it has tables for. A release without them is refused
+  unless the backend runs with `--allow-nearest-abi`, which lets the RM
+  pointer, allowlist, UVM, video-memory and OS-descriptor tables fall back to
+  the nearest older release's. The GET_DEV_INFO layout and the NVKMS commands
+  never do, because their layouts are not monotonic across releases: such a
+  release gets no render node and only NVKMS ALLOC/FREE_DEVICE.
   Its tables are generated offline, with no GPU
   (`.github/scripts/abi_update.py`, `host/backend/gen/README.md`): rmctrl,
   rmallow, uvm, vidmem, osdesc, devinfo, nvkms and the escape sizes. The
