@@ -68,6 +68,7 @@ pub mod rm_ce_channel;
 pub mod ce_record;
 pub mod ce_dup;
 pub mod ce_shadow;
+pub mod ce_route;
 pub mod copy_queue;
 pub mod msi;
 pub mod paging;

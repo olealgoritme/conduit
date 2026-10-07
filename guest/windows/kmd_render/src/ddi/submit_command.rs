@@ -318,11 +318,14 @@ pub(crate) fn publish_nvrm_counters() {
     crate::ddi::blt_async::publish_counters();
     // The guest-memory blob Blt destination (`GuestBlob`): `Gb*`, written once an event happened.
     crate::ddi::guest_blob::publish_counters();
-    // The display submit stages (`Sub*`, docs 24.14), written once a display submit was measured.
-    crate::virtio::submit_stage::publish_counters();
     // The copy-engine Present record behind a fenced marker (M3c-0): `CeRec*`, written once a
     // fenced marker was seen.
     crate::ddi::ce_record::publish_counters();
+    // The display submit stages (`Sub*`, docs 24.14), written once a display submit was measured.
+    crate::virtio::submit_stage::publish_counters();
+    // The copy-engine Present route (`RmCopyEngine` 1, M3c-2): `CeRt*`, written once a Present
+    // reached its decision.
+    crate::ddi::ce_present_route::publish_counters();
     // The transfer-only queue for the Present copies (`CopyQueue`): `CqMain` / `CqXfer`, the
     // fallbacks `CqFall` / `CqWhy` / `CqMask`, the queue-switch waits, written once the knob is on.
     crate::ddi::copy_queue::publish_counters();

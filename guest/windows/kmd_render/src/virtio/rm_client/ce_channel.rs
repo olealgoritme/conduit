@@ -1634,3 +1634,29 @@ pub(super) fn full_barrier() {
     // SAFETY: SSE2 is baseline on x86_64.
     unsafe { core::arch::x86_64::_mm_mfence() };
 }
+
+// ---- the Present route's doors (M3c-2, `rm_client::ce_route`) ----------------------------------
+
+/// `RmCopyEngine`'s mode in force (`Off` before the first StartDevice read it). One relaxed load.
+pub(crate) fn knob_mode() -> cc::Mode {
+    match KNOB.load(Ordering::Relaxed) {
+        UNREAD => cc::Mode::Off,
+        v => cc::mode(v),
+    }
+}
+
+/// The service's phase and, while a channel is in `STATE`, its generation. Spinlock only.
+pub(super) fn route_view() -> (cc::Phase, Option<Gen>) {
+    let g = STATE.lock();
+    (g.svc.phase(), g.parts.and_then(|p| p.gen))
+}
+
+/// A copy of the route never completed: treat the channel as failed (nothing is submitted until
+/// it is torn down, and its teardown is a strike). Spinlock only.
+pub(super) fn mark_broken() {
+    let mut g = STATE.lock();
+    if g.svc.phase() == cc::Phase::Ready {
+        g.svc.on_channel_error();
+        CHAN_FAIL.fetch_add(1, Ordering::Relaxed);
+    }
+}

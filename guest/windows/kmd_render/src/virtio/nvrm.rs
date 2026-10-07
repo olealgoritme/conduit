@@ -337,11 +337,16 @@ fn owned(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) -> bool {
 /// `epoch` is set to the device generation as of the first transport lock this
 /// call took (an `Ioctl` folds the read into its ownership check, so the hot path
 /// pays no lock for it); it stays `None` when the call was refused before any.
+///
+/// `process` is the `hKmdProcess` token of `owner`'s device (0 for the KMD's own client, or
+/// when unknown): an RM client this call allocates is recorded with it, which the
+/// copy-engine Present route's `h_client` rule reads (`ClientTable::process_of`).
 #[allow(clippy::too_many_arguments)]
 pub fn forward(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     owner: DeviceOwner,
+    process: usize,
     req: &[u8],
     resp: &mut [u8],
     timeout_ms: u64,
@@ -521,7 +526,7 @@ pub fn forward(
                     return Err(Refusal::Transport(e));
                 }
             };
-            harden::after_reply(adapter, owner, handle, hmode, reserved, req, resp, n);
+            harden::after_reply(adapter, owner, process, handle, hmode, reserved, req, resp, n);
             after_ioctl(adapter, owner, req, resp, n);
             Ok(n)
         }
@@ -833,6 +838,18 @@ fn build_table(
             pages,
         )
     };
+    page_run_table(passive, pfns)
+}
+
+/// The deep block for the page frames `pfns` (in buffer order): the run table itself when it
+/// fits a message, else a one-run table pointing at a big one in contiguous memory, which the
+/// caller keeps until the host can no longer read it. The pages must stay locked for as long as
+/// the registration that carries the table lives. Shared by the user PIN ([`build_table`]) and the
+/// KMD's own registrations (`rm_client::ce_route`, the copy-engine destination over lease pages).
+pub(crate) fn page_run_table(
+    passive: PassiveLevel,
+    pfns: &[u64],
+) -> Result<(u32, Box<[u8]>, Option<DmaBuffer>), PinRefusal> {
     let runs = page_runs::count_runs(pfns);
     if runs == 0 {
         return Err(PinRefusal::BadRange);
@@ -1015,12 +1032,7 @@ fn forward_pinned(
             .ok_or(Refusal::NotOwned)?
     };
     // IoctlReq.deep_ptr_offset@32 deep_len@36 (the caller's were checked empty).
-    if let Some(d) = buf.get_mut(32..36) {
-        d.copy_from_slice(&kind.to_le_bytes());
-    }
-    if let Some(d) = buf.get_mut(36..40) {
-        d.copy_from_slice(&(deep_len as u32).to_le_bytes());
-    }
+    set_deep(&mut buf, kind, deep_len);
     NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
     let result = timed_roundtrip(passive, adapter, &buf, resp, timeout_ms, RttClass::Other);
     let keep = match &result {
@@ -1040,6 +1052,64 @@ fn forward_pinned(
         discard_pin(adapter, owner, pin_id);
     }
     result.map_err(Refusal::Transport)
+}
+
+/// `IoctlReq.deep_ptr_offset` (@32, which for a page-run block carries its kind) and
+/// `IoctlReq.deep_len` (@36) of a request whose deep block the KMD appended.
+fn set_deep(buf: &mut [u8], kind: u32, deep_len: usize) {
+    if let Some(d) = buf.get_mut(32..36) {
+        d.copy_from_slice(&kind.to_le_bytes());
+    }
+    if let Some(d) = buf.get_mut(36..40) {
+        d.copy_from_slice(&(deep_len as u32).to_le_bytes());
+    }
+}
+
+/// A registration by the KMD's OWN RM client (`DeviceOwner::KMD_RM`) of pages the KMD itself
+/// holds locked (the copy-engine destination's lease pages, `rm_client::ce_route`): `req` is a
+/// complete `Ioctl` request (`MsgHeader | IoctlReq | data | nested`, its deep fields zero) on a
+/// file the KMD's client opened; the page-run table `deep` of kind `kind` (from
+/// [`page_run_table`]) is appended as its deep block, exactly as [`forward_pinned`] appends a
+/// user pin's. The pages stay locked by the caller for as long as the registration lives; the
+/// outcome (the host's and RM's status) is the caller's to judge. PASSIVE, no lock held.
+pub(crate) fn forward_kmd_registration(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    kind: u32,
+    deep: &[u8],
+    resp: &mut [u8],
+    timeout_ms: u64,
+) -> Result<usize, Refusal> {
+    let (Some(msg), Some(handle), Some(data_len), Some(nested_len)) =
+        (rd_u32(req, 0), rd_u32(req, 4), rd_u32(req, 20), rd_u32(req, 28))
+    else {
+        return Err(Refusal::BadRange);
+    };
+    if msg != MSG_IOCTL
+        || (kind != HELIOS_NVRM_DEEP_PAGE_RUNS && kind != HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT)
+        || deep.is_empty()
+    {
+        return Err(Refusal::Forbidden);
+    }
+    // Only a file the KMD's own client opened (never a process's).
+    if !owned(adapter, DeviceOwner::KMD_RM, handle) {
+        return Err(Refusal::NotOwned);
+    }
+    let declared = IOCTL_HDR as u64 + u64::from(data_len) + u64::from(nested_len);
+    if declared != req.len() as u64 {
+        return Err(Refusal::BadRange);
+    }
+    let total = req.len().checked_add(deep.len()).ok_or(Refusal::BadRange)?;
+    let mut buf = Vec::<u8>::new();
+    if buf.try_reserve_exact(total).is_err() {
+        return Err(Refusal::Transport(VirtioError::OutOfMemory));
+    }
+    buf.extend_from_slice(req);
+    buf.extend_from_slice(deep);
+    set_deep(&mut buf, kind, deep.len());
+    NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
+    ctrl::raw_roundtrip(passive, adapter, &buf, resp, timeout_ms).map_err(Refusal::Transport)
 }
 
 // ---- mappings -----------------------------------------------------------------------
@@ -1721,6 +1791,8 @@ pub fn close_all_on_host(
         .with_virtio(|v| !v.transport_failed())
         .unwrap_or(false);
     if !alive {
+        // Nothing was confirmed closed: the KMD's own pins (the copy-engine route's) stay locked.
+        LAST_SWEEP_LEAK.store(1, Ordering::Relaxed);
         return 0;
     }
     let mut sending = true;
@@ -1801,6 +1873,12 @@ pub fn close_all_on_host(
     }
     // Every file is closed (or forgotten), and the host frees a client with its file.
     harden::forget_all(adapter);
+    // The KMD's own registrations (the copy-engine route's destination descriptors, in the
+    // channel's client) follow the same fate at `rm_client::forget`.
+    // Sticky until read: an idempotent second sweep (nothing left to close) must not clear it.
+    if tally.pin_fate() == PinFate::Leak {
+        LAST_SWEEP_LEAK.store(1, Ordering::Relaxed);
+    }
     // Last: the pins. Unlocked only if the host confirmed every close above; if
     // sending stopped early they stay locked (leaked, `NvPinLeak`), because the
     // host keeps its RM files across a device reset and the GPU may still write
@@ -1817,6 +1895,20 @@ pub fn close_all_on_host(
         release_or_leak_pin(pin, fate);
     }
     closed
+}
+
+/// 1 once a transport sweep of this generation left a close unconfirmed (or found the transport
+/// failed); taken (and cleared) by `rm_client::forget` for the pins the KMD's own client
+/// registered.
+static LAST_SWEEP_LEAK: AtomicU32 = AtomicU32::new(0);
+
+/// The fate of the KMD's own registered pins after the transport sweep (`rm_client::forget`).
+pub(crate) fn last_sweep_fate() -> PinFate {
+    if LAST_SWEEP_LEAK.swap(0, Ordering::Relaxed) != 0 {
+        PinFate::Leak
+    } else {
+        PinFate::Unlock
+    }
 }
 
 /// Drop the live transport (if there is one) the safe way: tell the host to let go

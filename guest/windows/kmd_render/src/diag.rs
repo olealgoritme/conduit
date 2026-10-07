@@ -1225,6 +1225,11 @@ pub mod knobs {
     /// production copy. Read at StartDevice in shadow mode only; mirrored as `CeShadowEach`.
     /// `docs/rm-copy-engine-present.md` section 14.
     pub const CE_SHADOW_EVERY: KnobName = KnobName::new(b"CeShadowEvery");
+    /// `CeRtDirect` (default 0): with `RmCopyEngine` = 1, submit a routed copy at its Present (the
+    /// GPU acquire on the record's value waits for the producer) instead of when the HPD worker
+    /// sees the producer's boundary ready. Read at StartDevice with the route on; mirrored as
+    /// `CeRtDirKnob`. `docs/rm-copy-engine-present.md` section 15.13.
+    pub const CE_RT_DIRECT: KnobName = KnobName::new(b"CeRtDirect");
     /// `CopyQueue` (default 0 = the previous behaviour: one queue, family 0). 1: the KMD's Venus
     /// device also gets a queue on a transfer-only family (chosen from the queue family
     /// properties, bound to ring 2), and the windowed Present copies a transfer queue can run (a
