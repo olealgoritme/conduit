@@ -75,6 +75,8 @@ struct HeliosD3D12SubmitCmdV4 {
 #define HELIOS_RM_FENCE_TAIL_V3_FLAG_SEMAPHORE 0x1u /* version 3 needs both flags */
 #define HELIOS_RM_FENCE_TAIL_V3_FLAG_SOURCE 0x2u
 #define HELIOS_RM_COPY_SOURCE_FLAG_COMPRESSED 0x1u /* known; the copy-engine route refuses it */
+/* QueryCaps.supported_ops bit 37 (1ull << 37): the KMD reads the record. Send it only then. */
+#define HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3 0x2000000000ull
 
 struct HeliosRmSemaphoreLoc {
    uint32_t h_client;  /* the producer's RM client (NVK's device client) */
