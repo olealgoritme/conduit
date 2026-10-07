@@ -23,7 +23,7 @@
 //!   cool-down, [`MAX_STRIKES`] disable the subsystem for the transport generation (the
 //!   `rm_sysmem::Svc` philosophy), with the deadline constants.
 //! * The self-test's rules ([`selftest`]): the pattern, the two copies, the verdict words.
-//! * [`COUNTERS`]: the `Ce*` names the I/O writes (M3b's), checked against the I/O files by the
+//! * [`COUNTERS`]: the `Ce*` names the I/O writes (M3b's), checked against the I/O file by the
 //!   tests below.
 //!
 //! The push words, the GPFIFO entry, the ring of slots and the completion watermark are NOT here:
@@ -1053,9 +1053,6 @@ pub mod selftest {
     /// The whole self-test after the channel is up (allocations, fills, copies, verification,
     /// frees): a stage that would start after it is spent fails with [`Stage::NoTime`].
     pub const BUDGET_MS: u64 = 4_000;
-    /// The display must have been running this long before the self-test starts (the desktop's
-    /// own bring-up goes first).
-    pub const DELAY_MS: u64 = 3_000;
 
     /// The producer values the two copies acquire (the semaphore starts at 0).
     pub const PRODUCER_READY: u64 = 1;
@@ -1177,11 +1174,11 @@ pub mod selftest {
 
 // ── counters ─────────────────────────────────────────────────────────────────────────────────
 
-/// The counters M3b writes, all in `kmd_render/src/virtio/rm_client/ce_channel.rs` and
-/// `ce_selftest.rs`. At most 14 characters, prefix `Ce`, unique across `kmd_render` and
-/// `kmd_logic`. The first five are `ce_present::COUNTERS`' channel names (that list is the
-/// route's whole set; its other names are M3c's and still unwritten). A test below checks this
-/// list against the two I/O files, both ways.
+/// The counters M3b writes, all in `kmd_render/src/virtio/rm_client/ce_channel.rs` (the
+/// self-test, `ce_selftest.rs`, stores its results in that file's atomics). At most 14
+/// characters, prefix `Ce`, unique across `kmd_render` and `kmd_logic`. The first five are
+/// `ce_present::COUNTERS`' channel names (that list is the route's whole set; its other names are
+/// M3c's and still unwritten). A test below checks this list against the I/O file, both ways.
 pub const COUNTERS: &[&str] = &[
     // From `ce_present::COUNTERS`: the knob in force; the channel's state (0 none, 1 alive,
     // 2 dead) and its runlist; RM calls of the channel that failed; channels that failed while up.
@@ -1813,5 +1810,90 @@ mod tests {
         let shared: Vec<&str> =
             COUNTERS.iter().copied().filter(|n| crate::ce_present::COUNTERS.contains(n)).collect();
         assert_eq!(shared, ["CeKnob", "CeChan", "CeRunlist", "CeRmErr", "CeChanFail"]);
+    }
+
+    fn render_src() -> Option<std::path::PathBuf> {
+        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
+        if render.exists() {
+            return Some(render);
+        }
+        assert!(
+            std::env::var("HELIOS_REQUIRE_NAME_SCAN").map_or(true, |v| v != "1"),
+            "HELIOS_REQUIRE_NAME_SCAN=1 but {} does not exist: copy kmd_render next to kmd_logic",
+            render.display()
+        );
+        None
+    }
+
+    fn literals(text: &str) -> Vec<std::string::String> {
+        let mut out: Vec<std::string::String> = Vec::new();
+        let mut rest = text;
+        while let Some(i) = rest.find("b\"") {
+            let tail = &rest[i + 2..];
+            let Some(end) = tail.find('"') else {
+                break;
+            };
+            let name = &tail[..end];
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric())
+                && !out.iter().any(|w| w == name)
+            {
+                out.push(name.into());
+            }
+            rest = &tail[end + 1..];
+        }
+        out
+    }
+
+    /// Every name is written by the channel's I/O file (the self-test stores its results in that
+    /// file's atomics; `ce_selftest.rs` spells no name, which the next test checks).
+    const WRITERS: [&str; 1] = ["virtio/rm_client/ce_channel.rs"];
+
+    #[test]
+    fn the_counters_the_driver_writes_are_exactly_the_ones_listed() {
+        let Some(render) = render_src() else {
+            return;
+        };
+        let mut written = Vec::new();
+        for f in WRITERS {
+            let text = std::fs::read_to_string(render.join(f)).unwrap();
+            written.extend(literals(&text));
+        }
+        for n in COUNTERS {
+            assert!(written.iter().any(|l| l == n), "{n} is listed but not written by {WRITERS:?}");
+        }
+        for l in written.iter().filter(|l| l.starts_with("Ce")) {
+            assert!(COUNTERS.contains(&l.as_str()), "{l} is written by {WRITERS:?} but not listed");
+        }
+    }
+
+    #[test]
+    fn no_other_file_writes_these_names_and_the_knob_is_in_diag() {
+        let Some(render) = render_src() else {
+            return;
+        };
+        let mut stack = std::vec![render.clone()];
+        let mut checked = 0;
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let s = p.to_string_lossy().replace('\\', "/");
+                    if WRITERS.iter().any(|w| s.ends_with(w)) || s.ends_with("/diag.rs") {
+                        continue;
+                    }
+                    checked += 1;
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    assert!(!text.contains("b\"Ce"), "{s} spells a Ce counter name");
+                    assert!(!text.contains("b\"RmCopyEngine\""), "{s} spells the knob name");
+                }
+            }
+        }
+        assert!(checked > 20);
+        let diag = std::fs::read_to_string(render.join("diag.rs")).unwrap();
+        assert!(diag.contains("KnobName::new(b\"RmCopyEngine\")"));
+        assert!(!diag.contains("b\"Ce"), "diag.rs spells a Ce counter name");
     }
 }
