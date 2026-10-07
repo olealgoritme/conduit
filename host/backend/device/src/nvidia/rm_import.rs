@@ -580,15 +580,16 @@ mod tests {
         );
         assert_eq!(modifier_for(SurfaceLayout::Pitch, GB202), Some(MOD_LINEAR));
         assert_eq!(modifier_for(SurfaceLayout::Other, GB202), None);
-        // Turing-era generation 0 / sector layout 1 / kind 0xfe, from the
-        // same formula: drm_fourcc.h's own example.
-        let turing = Tiling {
+        // Fermi-to-Volta generation 0 / sector layout 1 / kind 0xfe, from the
+        // same formula: drm_fourcc.h's own example. (Turing, Ampere and Ada
+        // answer 0x06 / 2 / 1 like GB202's 32 bpp surfaces.)
+        let fermi = Tiling {
             kind: 0xfe,
             generation: 0,
             sector_layout: 1,
         };
         assert_eq!(
-            modifier_for(SurfaceLayout::BlockLinear { log2_gobs_y: 4 }, turing),
+            modifier_for(SurfaceLayout::BlockLinear { log2_gobs_y: 4 }, fermi),
             Some(0x0300_0000_004f_e014)
         );
     }

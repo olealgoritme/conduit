@@ -1,0 +1,150 @@
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index fbda972..f5a03bd 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -73,10 +73,99 @@ vkr_device_free_queue_sync(struct vkr_device *dev, struct vkr_queue_sync *sync)
+    mtx_unlock(&dev->free_sync_mutex);
+ }
+ 
++/* Conduit fence spin (CONDUIT_VKR_FENCE_SPIN_US, off by default): NVIDIA's
++ * vkWaitForFences returns 13-15 us after the GPU is done (interrupt, wakeup);
++ * a thread that polls vkGetFenceStatus sees it within 1-2 us. The sync thread
++ * sleeps until just before the fence is expected, from the recent
++ * queued-to-signalled times of its queue, then polls for at most the budget,
++ * then waits as before. docs/research/host-roundtrip-latency.md, phase 3.
++ */
++#include <stdlib.h>
++#include <sys/prctl.h>
++#include <time.h>
++
++static uint64_t
++vkr_conduit_now_ns(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++/* The spin budget in ns, 0 when off; read once. */
++static uint64_t
++vkr_conduit_spin_budget_ns(void)
++{
++   static int64_t budget = -1;
++   if (budget < 0) {
++      const char *v = getenv("CONDUIT_VKR_FENCE_SPIN_US");
++      long us = v ? strtol(v, NULL, 10) : 0;
++      if (us < 0)
++         us = 0;
++      if (us > 2000)
++         us = 2000;
++      budget = (int64_t)us * 1000;
++   }
++   return (uint64_t)budget;
++}
++
++static void
++vkr_queue_conduit_note(struct vkr_queue *queue, struct vkr_queue_sync *sync)
++{
++   if (!sync->conduit_queued_ns || sync->device_lost)
++      return;
++   uint64_t took = vkr_conduit_now_ns() - sync->conduit_queued_ns;
++   queue->conduit_wait_ns[queue->conduit_wait_count++ % ARRAY_SIZE(queue->conduit_wait_ns)] = took;
++}
++
++static void
++vkr_queue_conduit_spin(struct vkr_queue *queue, struct vkr_queue_sync *sync)
++{
++   const uint64_t budget = vkr_conduit_spin_budget_ns();
++   if (!budget || sync->conduit_spun || sync->device_lost || !sync->conduit_queued_ns)
++      return;
++   sync->conduit_spun = true;
++   struct vn_device_proc_table *vk = &queue->device->proc_table;
++   VkDevice dev = queue->device->base.handle.device;
++
++   /* The second shortest of the recent times: early rather than late. */
++   uint64_t first = UINT64_MAX, second = UINT64_MAX;
++   uint32_t n = MIN2(queue->conduit_wait_count, ARRAY_SIZE(queue->conduit_wait_ns));
++   for (uint32_t i = 0; i < n; i++) {
++      uint64_t t = queue->conduit_wait_ns[i];
++      if (t < first) {
++         second = first;
++         first = t;
++      } else if (t < second) {
++         second = t;
++      }
++   }
++   const uint64_t margin = 30000;
++   if (n >= 4 && second != UINT64_MAX && second > margin) {
++      static __thread bool slack_set;
++      if (!slack_set) {
++         prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
++         slack_set = true;
++      }
++      uint64_t at = sync->conduit_queued_ns + second - margin;
++      if (at > vkr_conduit_now_ns()) {
++         struct timespec ts = { (time_t)(at / 1000000000ull), (long)(at % 1000000000ull) };
++         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR)
++            ;
++      }
++   }
++   const uint64_t until = vkr_conduit_now_ns() + budget;
++   do {
++      if (vk->GetFenceStatus(dev, sync->fence) != VK_NOT_READY)
++         return;
++   } while (vkr_conduit_now_ns() < until);
++}
++
+ static inline void
+ vkr_queue_sync_retire(struct vkr_queue *queue, struct vkr_queue_sync *sync)
+ {
+    TRACE_FUNC();
++   vkr_queue_conduit_note(queue, sync);
+    queue->context->retire_fence(queue->context->ctx_id, sync->ring_idx, sync->fence_id);
+    vkr_device_free_queue_sync(queue->device, sync);
+ }
+@@ -109,6 +198,9 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+       return false;
+    }
+ 
++   sync->conduit_queued_ns = vkr_conduit_spin_budget_ns() ? vkr_conduit_now_ns() : 0;
++   sync->conduit_spun = false;
++
+    mtx_lock(&queue->sync_thread.mutex);
+    list_addtail(&sync->head, &queue->sync_thread.syncs);
+    cnd_signal(&queue->sync_thread.cond);
+@@ -179,6 +271,8 @@ vkr_queue_thread(void *arg)
+ 
+       mtx_unlock(&queue->sync_thread.mutex);
+ 
++      vkr_queue_conduit_spin(queue, sync);
++
+       VkResult result;
+       if (sync->device_lost) {
+          result = VK_ERROR_DEVICE_LOST;
+diff --git a/src/venus/vkr_queue.h b/src/venus/vkr_queue.h
+index 6a3a909..0fbda68 100644
+--- a/src/venus/vkr_queue.h
++++ b/src/venus/vkr_queue.h
+@@ -11,6 +11,11 @@
+ struct vkr_queue_sync {
+    VkFence fence;
+    bool device_lost;
++   /* Conduit fence spin: when the fence was queued, and whether the sync
++    * thread has spun on it already.
++    */
++   uint64_t conduit_queued_ns;
++   bool conduit_spun;
+ 
+    uint32_t flags;
+    uint32_t ring_idx;
+@@ -29,6 +34,10 @@ struct vkr_queue {
+    uint32_t family;
+    uint32_t index;
+ 
++   /* Conduit fence spin: the last queued-to-signalled times, in ns. */
++   uint64_t conduit_wait_ns[16];
++   uint32_t conduit_wait_count;
++
+    /* only used when client driver uses multiple timelines */
+    uint32_t ring_idx;
+ 

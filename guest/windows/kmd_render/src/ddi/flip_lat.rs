@@ -390,6 +390,12 @@ pub(crate) fn note_programmed(address: u64) {
     }
 }
 
+/// The DDI entry time of the picture `ForeignFlip` last programmed, until its host flip is
+/// submitted ([`note_host_submit`] takes it); 0 when none or `FlipLat` is off. For `StageTrace`.
+pub(crate) fn prog_t() -> u64 {
+    PROG_T.load(Ordering::Relaxed)
+}
+
 /// The `ForeignFlip` host flip of the picture last programmed was submitted at `at` (100 ns).
 pub(crate) fn note_host_submit(at: u64) {
     if !on() {

@@ -200,7 +200,9 @@ pub unsafe extern "C" fn dxgkddi_present(
     // the output pointer names a live local. DXGKDDI_PRESENT itself is PASSIVE.
     let start_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
     crate::ddi::present_foreign::begin_call();
-    let status = unsafe { dxgkddi_present_inner(h_context, present) };
+    let status = unsafe { dxgkddi_present_inner(h_context, present, start_100ns) };
+    // `DwPrN` / `DwPrFail`: Presents since the last device died (atomics).
+    crate::ddi::dwm_restart::note_present(status == STATUS_SUCCESS);
     // Fixed-name telemetry survives the steady-state registry ring flood and
     // proves whether a failing UMD pfnPresentCb originated in this DDI. A
     // failure is never delayed. Successful frames update the same name on the
@@ -240,9 +242,12 @@ pub unsafe extern "C" fn dxgkddi_present(
     status
 }
 
+/// `present_t_100ns`: the exported DDI's entry time (interrupt time), the `StageTrace` G_PRESENT
+/// stamp of a Blt copy.
 unsafe fn dxgkddi_present_inner(
     h_context: IN_CONST_HANDLE,
     present: INOUT_PDXGKARG_PRESENT,
+    present_t_100ns: u64,
 ) -> NTSTATUS {
     PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
     if present.is_null() {
@@ -880,6 +885,7 @@ unsafe fn dxgkddi_present_inner(
                                 destination_desc,
                                 prepared,
                                 boundary,
+                                present_t_100ns,
                             )
                         })
                         .unwrap_or(Err(VirtioError::DeviceError))
@@ -927,6 +933,8 @@ unsafe fn dxgkddi_present_inner(
                 if crate::diag::sample_tick(&PB_FNC_TICK) {
                     crate::diag::record_named_bytes(b"PBFnc", token as u32);
                 }
+                // `DwPrOk`: a Blt queued (the first since a device died also asks for a mirror).
+                crate::ddi::dwm_restart::note_blt_done(Some(adapter));
             } else {
                 // SAFETY: `DxgkDdiPresent` is documented "IRQL: PASSIVE_LEVEL" (WDK
                 // DXGKDDI_PRESENT) — it is a pageable DDI, and the BLT arm below
@@ -953,6 +961,7 @@ unsafe fn dxgkddi_present_inner(
                             source_desc,
                             destination_desc,
                             present_stream_boundary,
+                            present_t_100ns,
                         )
                     } {
                         Ok(crate::ddi::blt_async::Taken::Legacy) => {}
@@ -1044,6 +1053,13 @@ unsafe fn dxgkddi_present_inner(
                         );
                     }
                 };
+                // `StageTrace`: this Present's entry, under the copy's wire fence.
+                crate::ddi::stage_trace::stamp(
+                    helios_kmd_logic::stage_trace::G_PRESENT,
+                    helios_kmd_logic::stage_trace::KIND_FENCE,
+                    gpu_fence,
+                    present_t_100ns,
+                );
                 crate::diag::record_named_on_change(
                     b"PBConv",
                     u32::from(source_dxgi_format != destination_dxgi_format),
@@ -1194,6 +1210,8 @@ unsafe fn dxgkddi_present_inner(
                 if crate::diag::sample_tick(&PB_FNC_TICK) {
                     crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
                 }
+                // `DwPrOk`: a Blt copied.
+                crate::ddi::dwm_restart::note_blt_done(Some(adapter));
                 // Level 5: a standard-buffer destination was waited for above, so the blit is
                 // in the memory: if it is the RM primary the screen shows, a frame is owed.
                 // Atomics only; one relaxed load with the knob below 5.
@@ -1676,6 +1694,9 @@ unsafe fn present_blt_skipped(
     src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
     dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
 ) -> NTSTATUS {
+    // `DwPrSkip` / `DwRunNow` / `DwRunMax`: a Blt that copied nothing, whatever the reason; the
+    // destination keeps its bytes (docs/zero-copy-present.md "DWM restart and stale Explorer").
+    crate::ddi::dwm_restart::note_blt_skipped(adapter);
     // Capacity was checked before this point, so this cannot fail; a failure would only leave the
     // previous record, which a recycled DMA buffer may carry.
     let _ = unsafe {
@@ -1893,6 +1914,12 @@ unsafe fn present_blt_to_rm_primary(
     };
     // 3 = copied by the CPU into the RM primary, 4 = skipped (answered with success).
     let cpy = if done.skipped.is_some() { 4 } else { 3 };
+    // `DwPrOk` / `DwPrSkip` for the level 5 arm as for the legacy one.
+    if done.skipped.is_some() {
+        crate::ddi::dwm_restart::note_blt_skipped(Some(adapter));
+    } else {
+        crate::ddi::dwm_restart::note_blt_done(Some(adapter));
+    }
     if RM_BLT_LAST_CPY.swap(cpy, Ordering::Relaxed) != cpy {
         crate::diag::record_named_on_change(b"PBCpy", cpy, &PB_CPY_LAST);
     }
@@ -1972,6 +1999,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 (
                     request.token,
                     request.stream_boundary,
+                    (request.t_present, request.t_queue),
                     match request.destination {
                         PresentDestinationDesc::StandardBuffer(destination) => {
                             Some(destination.resource_id())
@@ -1990,17 +2018,35 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 )
             })
         });
-        if let Ok(Some((token, boundary, destination_buffer, result))) = submit {
+        if let Ok(Some((token, boundary, (t_present, t_queue), destination_buffer, result))) =
+            submit
+        {
             match result {
-                Ok(fence) => crate::ddi::scanout_timeline::note(
-                    crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
-                    crate::ddi::scanout_timeline::flag::SUCCESS,
-                    0,
-                    boundary,
-                    token,
-                    fence as u32,
-                    0,
-                ),
+                Ok(fence) => {
+                    // `StageTrace`: the Present's entry and its queueing, under the copy's wire
+                    // fence (G_SUBMIT was stamped by the submission; a time of 0 is not stamped).
+                    crate::ddi::stage_trace::stamp(
+                        helios_kmd_logic::stage_trace::G_PRESENT,
+                        helios_kmd_logic::stage_trace::KIND_FENCE,
+                        fence,
+                        t_present,
+                    );
+                    crate::ddi::stage_trace::stamp(
+                        helios_kmd_logic::stage_trace::G_DEFER,
+                        helios_kmd_logic::stage_trace::KIND_FENCE,
+                        fence,
+                        t_queue,
+                    );
+                    crate::ddi::scanout_timeline::note(
+                        crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
+                        crate::ddi::scanout_timeline::flag::SUCCESS,
+                        0,
+                        boundary,
+                        token,
+                        fence as u32,
+                        0,
+                    )
+                }
                 Err(_) => {
                     let _ = adapter.with_virtio(|v| {
                         if let Some(resource_id) = destination_buffer {
@@ -2264,6 +2310,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     // is silent about it. Legal here: this is a plain atomic increment with no
     // registry transaction, and the DDI can arrive at DIRQL.
     crate::ddi::scanout_trace::note_ddi_entry();
+    // `DwFlipN` / `DwFlipMs`: flips since the last device died (atomics, legal at DIRQL).
+    crate::ddi::dwm_restart::note_flip();
     // Windows names the authoritative desktop primary here. This—not resource
     // dimensions, OM bindings, process name, or an arbitrary Present call—is the
     // only allocation the KMD may bind directly or copy into the fallback image.
@@ -2302,6 +2350,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         )
     } {
         crate::ddi::scanout_trace::note_ddi_pair_failed();
+        // `DwFlipBad`: the same refusal, counted since the last device died.
+        crate::ddi::dwm_restart::note_flip_unpaired();
         // The handle pairs with no allocation of the live transport generation (stale, foreign,
         // null): not a Venus allocation of this host, nothing will ever bind it, and the only
         // thing left to complete is the flip's address (an atomic store, legal at the DIRQL this
