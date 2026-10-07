@@ -99,8 +99,9 @@
  *   --release cpu|semsurf  the CPU sets V by a store (default) or SET_VALUE
  *   --timeout-ms <ms>      bound of every CPU wait (default 2000)
  *   --fence                (Windows) also time doorbell -> RM fence event
- *   --bl-roundtrip         instead of the measured loop: per round one push
- *                          [copy pitch source -> block-linear image; host
+ *   --bl-roundtrip         instead of the measured loop: per round the image
+ *                          is zeroed (PITCH -> PITCH from zeroed pages), then
+ *                          one push [copy pitch source -> block-linear image; host
  *                          release (WFI); copy block-linear image -> pitch
  *                          destination; release], then the CPU compares the
  *                          destination with the pattern (bl_roundtrip=ok|BAD)
@@ -112,6 +113,8 @@
  *                          0x0300000000606014: NVIDIA block-linear 2D, h = 4,
  *                          k = 0x06, g = 2, s = 1, c = 0, Heaven's windowed
  *                          source); 32 bpp families only
+ *   --seed <n>             pattern seed, every mode (default 0xc0e5a11d; 0
+ *                          is allowed: then only word 0 of the pattern is 0)
  *   --bl-kind <hex>        PTE kind of the image's GPU mapping (default the
  *                          modifier's k; 0 = no override: the allocation's
  *                          own pitch kind)
@@ -389,9 +392,11 @@ static inline void full_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 
-/* --bl-roundtrip salts the pattern per run, so stale video memory of an
- * earlier run can never pass for a copy that did not happen */
-static uint32_t pattern_salt = 0xc0e5a11du;
+/* The pattern's seed (--seed, fixed by default so that two runs produce
+ * byte-identical sources; --bl-roundtrip zeroes its image first, so stale
+ * video memory of an earlier run cannot pass for a copy that did not happen) */
+#define PATTERN_SEED_DEFAULT 0xc0e5a11du
+static uint32_t pattern_salt = PATTERN_SEED_DEFAULT;
 static uint32_t pattern(size_t i) { return (uint32_t)(i * 2654435761u) ^ pattern_salt; }
 
 /* FNV-1a 64 over 32-bit words, in order (position-dependent: a permutation
@@ -947,6 +952,7 @@ struct opts {
     int bl_probe;       /* --bl-probe-pitch */
     uint64_t modifier;
     int bl_kind;        /* -1: the modifier's k */
+    uint32_t seed;      /* pattern seed */
 };
 
 static int parse(int argc, char **argv, struct opts *o)
@@ -963,6 +969,7 @@ static int parse(int argc, char **argv, struct opts *o)
     o->timeout_ms = 2000;
     o->modifier = MOD_DEFAULT_BL;
     o->bl_kind = -1;
+    o->seed = PATTERN_SEED_DEFAULT;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -1039,6 +1046,9 @@ static int parse(int argc, char **argv, struct opts *o)
         } else if (!strcmp(a, "--modifier")) {
             NEEDV;
             o->modifier = strtoull(v, NULL, 16);
+        } else if (!strcmp(a, "--seed")) {
+            NEEDV;
+            o->seed = (uint32_t)strtoul(v, NULL, 0);
         } else if (!strcmp(a, "--bl-kind")) {
             NEEDV;
             o->bl_kind = (int)(strtoul(v, NULL, 16) & 0xffu);
@@ -1118,6 +1128,7 @@ struct bl_run {
     const struct bl_layout *l;
     struct gmem *src, *img, *dst, *stamp, *done;
     uint32_t pitch;
+    uint32_t kind;          /* PTE kind of the image's mapping */
     uint64_t copy_bytes;
     uint64_t *seq;
     uint32_t *pay;
@@ -1129,6 +1140,44 @@ static double stamp_us(volatile uint8_t *st, uint32_t a, uint32_t b)
     const uint64_t t0 = *(volatile uint64_t *)(st + a + 8);
     const uint64_t t1 = *(volatile uint64_t *)(st + b + 8);
     return t1 >= t0 ? (double)(t1 - t0) / 1000.0 : -1.0;
+}
+
+/* Zero the whole image (bl.size bytes, padding rows included) through the
+ * PITCH -> PITCH path the M1 run proved, from the zeroed destination pages,
+ * in chunks of at most dst.size bytes. The pattern seed is fixed (--seed),
+ * so without this an image left in video memory by an earlier run with the
+ * same seed could pass for a copy that did not happen. dst must be zero. */
+static const char *bl_clear(struct bl_run *r)
+{
+    const struct bl_layout *l = r->l;
+    const double tmo = (double)r->o->timeout_ms * 1000.0;
+    const uint32_t chunk = (uint32_t)(r->dst->size / l->pitch); /* rows per copy */
+    uint32_t row = 0;
+    if (chunk == 0)
+        return "bl clear: destination smaller than one image row";
+    while (row < l->rows) {
+        const uint64_t cval = ++*r->seq;
+        const uint32_t py = ++*r->pay;
+        *r->last_c = cval;
+        uint32_t *p = slot(r->ch);
+        unsigned n = 0;
+        /* 21 dwords per chunk, 6 for the release: 5 chunks per 128-dword slot */
+        for (unsigned c = 0; c < 5 && row < l->rows; c++) {
+            const uint32_t lines = l->rows - row < chunk ? l->rows - row : chunk;
+            const struct surf zero = { .va = r->dst->va, .pitch = l->pitch };
+            const struct surf part = { .va = r->img->va + (uint64_t)row * l->pitch, .pitch = l->pitch };
+            n = emit_ce_copy_surf(p, n, &zero, &part, l->pitch, lines, r->stamp->va + ST_BL_A0,
+                                  r->stamp->va + ST_BL_A1, py);
+            row += lines;
+        }
+        n = emit_release(p, n, r->done->va, cval, 1, 0);
+        kick(r->k, r->ch, n);
+        if (!spin_ge((volatile uint64_t *)r->done->cpu, cval, now_us() + tmo))
+            return "bl clear: completion not seen";
+        if (channel_error(r->ch))
+            return "bl clear: channel error";
+    }
+    return NULL;
 }
 
 /* The rounds and the probe; NULL when every push completed (the verdicts
@@ -1157,11 +1206,15 @@ static const char *bl_roundtrip(struct bl_run *r)
     printf("status: block-linear round trip, %u rounds\n", o->iterations);
     fflush(stdout);
     for (unsigned it = 0; it < o->iterations; it++) {
+        memset(r->dst->cpu, 0, r->dst->size);
+        full_fence();
+        stop = bl_clear(r);
+        if (stop)
+            break;
+        /* after the clear: its releases took values from the same sequence */
         const uint64_t mid = ++*r->seq, cval = ++*r->seq;
         const uint32_t py = ++*r->pay;
         *r->last_c = cval;
-        memset(r->dst->cpu, 0, r->copy_bytes);
-        full_fence();
         uint32_t *p = slot(r->ch);
         unsigned n = emit_ce_copy_surf(p, 0, &src, &img, line, o->height, r->stamp->va + ST_BL_A0,
                                        r->stamp->va + ST_BL_A1, py);
@@ -1259,6 +1312,14 @@ static const char *bl_roundtrip(struct bl_run *r)
         printf("bl_probe_pitch=%s checksum_bl_as_pitch=0x%016" PRIx64 " checksum_unswizzled=0x%016" PRIx64
                " words_in_place=%zu/%zu\n",
                probe_sum != want_sum ? "swizzled" : "IDENTICAL", probe_sum, want_sum, in_place, words);
+        /* FNV-1a 64 over the 32-bit words, in order, of the first `height`
+         * rows of the image read as pitch (and of the pattern) */
+        printf("bl_probe_digest=0x%016" PRIx64 " seed=0x%08x bl_kind=0x%02x\n", probe_sum, pattern_salt,
+               r->kind);
+        printf("pattern_digest=0x%016" PRIx64 " seed=0x%08x\n", want_sum, pattern_salt);
+        printf("bl_probe_vs_kind_note: compare bl_probe_digest between --bl-kind 0x06 and --bl-kind 0 runs with "
+               "the same --seed: equal digests mean the page kind does not change the physical layout of this "
+               "copy path\n");
     }
     if (!stop) {
         if (!rounds || bad_words)
@@ -1290,6 +1351,7 @@ int main(int argc, char **argv)
            o.g->name, o.g->gpfifo_name, o.g->gpfifo, o.g->ce_name, o.g->ce, o.g->usermode, o.width,
            o.height, copy_bytes, o.src_sys ? "system memory" : "video memory");
 
+    pattern_salt = o.seed;
     struct bl_layout bl;
     uint32_t bl_kind = 0;
     memset(&bl, 0, sizeof bl);
@@ -1300,7 +1362,8 @@ int main(int argc, char **argv)
             return 1;
         }
         bl_kind = o.bl_kind < 0 ? bl.k : (uint32_t)o.bl_kind;
-        pattern_salt ^= (uint32_t)(uint64_t)now_us() | 1u;
+        printf("bl_seed=0x%08x%s\n", o.seed,
+               o.seed == 0 ? " (seed 0: word 0 of the pattern is 0, every other word is nonzero)" : "");
         printf("bl_modifier=0x%016" PRIx64 " h=%u (blocks of %u rows) k=0x%02x g=%u s=%u c=%u\n", o.modifier,
                bl.h, GOB_ROWS << bl.h, bl.k, bl.g, bl.s, bl.c);
         printf("bl_image: pitch=%u (%u GOBs) rows=%u size=%" PRIu64 " block_size_word=0x%x\n", bl.pitch,
@@ -1667,7 +1730,7 @@ int main(int argc, char **argv)
 
     if (o.bl) {
         struct bl_run br = { .k = &k, .ch = &ch, .o = &o, .l = &bl, .src = &d_src, .img = &d_bl,
-                             .dst = &dst, .stamp = &stamp, .done = &done, .pitch = pitch,
+                             .dst = &dst, .stamp = &stamp, .done = &done, .pitch = pitch, .kind = bl_kind,
                              .copy_bytes = copy_bytes, .seq = &seq, .pay = &pay, .last_c = &last_c };
         const char *bstop = bl_roundtrip(&br);
         if (bstop) {

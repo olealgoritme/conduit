@@ -140,8 +140,10 @@ Per round, one push:
    copy are exactly the ones `ce_present.rs` emits for the windowed source.
 4. The completion release.
 
-Each copy carries its own pair of CE timestamps. The pattern is salted per run, so stale video memory from an earlier run
-cannot pass. `--bl-probe-pitch` adds one more push after the rounds: it copies the image out PITCH -> PITCH (the same
+Each copy carries its own pair of CE timestamps. The pattern comes from a fixed seed (`--seed`, default 0xc0e5a11d), so
+runs with the same seed have byte-identical sources. So that stale video memory from an earlier run with the same seed
+cannot pass, each round first zeroes the whole image (padding rows included). The zeroing is a PITCH -> PITCH copy from
+zeroed pages, the path run 1 already proved. `--bl-probe-pitch` adds one more push after the rounds: it copies the image out PITCH -> PITCH (the same
 memory read as plain rows of the image pitch) and compares a position-dependent checksum with that of the unswizzled
 pattern. The two must differ.
 
@@ -152,7 +154,11 @@ ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe --bl-probe-pitch
 ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe --bl-probe-pitch --bl-kind 0'
 ```
 
-Options: `--modifier <hex>` (32 bpp uncompressed NVIDIA block-linear 2D only, `h <= 5`) [0x0300000000606014];
+Both run lines use the default seed, so their `pattern_digest` lines must be equal. Pass the same `--seed <n>` to both runs
+if you change it.
+
+Options: `--seed <n>`, the pattern seed in every mode [0xc0e5a11d; 0 is allowed, and then only word 0 of the pattern is
+0]; `--modifier <hex>` (32 bpp uncompressed NVIDIA block-linear 2D only, `h <= 5`) [0x0300000000606014];
 `--bl-kind <hex>`, the PTE kind of the image's mapping [the modifier's k, 0x06; 0 = no override, the allocation's own pitch
 kind]; `--iterations <n>` rounds [16]; `--size WxH` [1600x900]. `--contend`, `--fence` and `--duration` are refused with
 this mode.
@@ -160,6 +166,7 @@ this mode.
 Expected output (first run):
 
 ```
+bl_seed=0xc0e5a11d
 bl_modifier=0x0300000000606014 h=4 (blocks of 128 rows) k=0x06 g=2 s=1 c=0
 bl_image: pitch=6400 (100 GOBs) rows=1024 size=6553600 block_size_word=0x1040
 bl_kind=0x06 (PAGE_KIND_OVERRIDE on the image's mapping, the modifier's k)
@@ -178,6 +185,9 @@ bl_roundtrip_doorbell_to_done_us           16        ...
 bl_copy_gbps_p50=...
 bl_roundtrip=ok (16 rounds, 0 bad, 0 bad words)
 bl_probe_pitch=swizzled checksum_bl_as_pitch=0x... checksum_unswizzled=0x... words_in_place=N/1440000
+bl_probe_digest=0x... seed=0xc0e5a11d bl_kind=0x06
+pattern_digest=0x... seed=0xc0e5a11d
+bl_probe_vs_kind_note: compare bl_probe_digest between --bl-kind 0x06 and --bl-kind 0 runs with the same --seed: equal digests mean the page kind does not change the physical layout of this copy path
        copier: objects still tracked 0, CPU mappings 0
        producer: objects still tracked 0, CPU mappings 0
 RESULT PASS
@@ -190,8 +200,19 @@ close to the pitch `copy_us` of run 1 (about 0.2 ms for 5.76 MB). A much slower 
 
 With `--bl-kind 0` the tool prints `bl_kind=0x00 (no override: the allocation's own pitch kind)` and an `[info]` line. The
 expected result is still `bl_roundtrip=ok`: both copies go through the same mapping, so a wrong kind cancels out. The CE
-computes the block-linear addresses itself, so `swizzled` is also expected. Compare `bl_probe_pitch`'s checksum with the
-kind-0x06 run's: if they differ, the kind changes the physical layout within a GOB. The round trip therefore proves that
+computes the block-linear addresses itself, so `swizzled` is also expected.
+
+The two runs' digest lines decide whether the kind matters. `bl_probe_digest` is FNV-1a 64 over the first `height` rows (900) of
+the image read back as pitch. `pattern_digest` is the same digest of the unswizzled pattern. Compare the runs:
+- `pattern_digest` differs between the runs: the seeds differ, so the comparison is void. Rerun both with the same
+  `--seed`.
+- `pattern_digest` is equal and `bl_probe_digest` is equal: the page kind (0x06 or the pitch kind) does not change the
+  physical layout the CE writes through this mapping. The KMD's kind choice then cannot scramble a source on this copy
+  path, though M3c still has to check it against NVK's 3D writes.
+- `pattern_digest` is equal and `bl_probe_digest` differs: the kind changes the physical layout. The KMD must map NVK's
+  image with exactly NVK's kind (0x06, `SourcePlan::page_kind`), and M3c is the check that it does.
+
+The round trip therefore proves that
 the CE accepts the block-linear words and that the two directions invert each other. It does not prove that they, or the
 mapping kind, match NVK's layout (a block height that is wrong in both directions cancels out too). Only M3c, which reads a
 real NVK image, checks that (`rm-copy-engine-present.md` 10.4).
