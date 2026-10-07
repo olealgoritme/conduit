@@ -316,7 +316,20 @@ pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
 /// of `msi::latch_why`. FLUSHED to disk: the faults it records are the ones that end in a hang
 /// or a bugcheck, and a latch the lazy writer had not written would be lost with them. Written
 /// without a guard against repeats: callers are once per start.
+///
+/// Not while the device is stopping (`msi::latch_allowed`, the flag `ddi::escape_wait` raises at
+/// StopDevice / RemoveDevice entry): a run-time verdict then is ignored and counted
+/// (`MsiLatchStop`, `MsiLatchStopW`). The breaker is exempt (it runs at AddDevice, where a
+/// same-image restart still has the previous RemoveDevice's flag up).
 pub(crate) fn latch_intx(passive: PassiveLevel, why: u32) {
+    if !msi::latch_allowed(why, crate::ddi::escape_wait::stopping()) {
+        crate::diag::record_named_bytes(
+            b"MsiLatchStop",
+            LATCH_STOP.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+        );
+        crate::diag::record_named_bytes(b"MsiLatchStopW", why);
+        return;
+    }
     // The tag first: a latch is never on disk with another build's tag next to it.
     crate::diag::record_named_bytes(b"MsiLatchVer", BUILD_TAG);
     crate::diag::record_named_bytes(b"MsiLatch", 1);
@@ -435,6 +448,8 @@ static LATCHED: AtomicU32 = AtomicU32::new(0);
 static POLL_ONLY: AtomicU32 = AtomicU32::new(0);
 /// The `MsiStarting` marker is set in the registry for this start.
 static STARTING: AtomicU32 = AtomicU32::new(0);
+/// Latches ignored because the device was stopping (`MsiLatchStop`), since the image loaded.
+static LATCH_STOP: AtomicU32 = AtomicU32::new(0);
 /// Interrupt time (100 ns) when run-time judging was armed; 0 = not armed.
 static ARMED_AT: AtomicU64 = AtomicU64::new(0);
 /// The latch was written by the run-time verdict of this start.
@@ -547,8 +562,11 @@ pub(crate) fn service(stopping: bool) {
     let _ = clear_marker(stopping);
 }
 
-/// StopDevice's clear of the marker (PASSIVE): as [`service`] with `stopping`, and when it
-/// cleared the marker the service key is FLUSHED, so the clear is on disk before the image can be
+/// StopDevice's clear of the marker (PASSIVE): UNCONDITIONAL whenever this start set one
+/// (`msi::marker_may_clear` with `stopping`: a clean stop proves the start did not hang or die,
+/// whether or not judging was armed, interrupts arrived, 3 s passed or delivery was convicted;
+/// a conviction is the run-time latch's business). The service key is then FLUSHED, so the
+/// clear is on disk before the image can be
 /// unloaded (a driver update), the machine rebooted or powered off. The clear of a clean stop
 /// must not depend on the lazy writer, nor on `StopFlush` and the later stop stages (the stage-5
 /// flush that would also cover it is skipped with `StopFlush=0`, and a stop that dies before it
@@ -591,7 +609,15 @@ fn clear_marker(stopping: bool) -> bool {
 #[inline(never)]
 pub(crate) fn note_rescue(passive: PassiveLevel, adapter: &AdapterContext) {
     RESCUES.fetch_add(1, Ordering::Relaxed);
-    if adapter.msi_state.load(Ordering::Acquire) == 0 || ARMED.load(Ordering::Acquire) == 0 {
+    let message_mode = adapter.msi_state.load(Ordering::Acquire) != 0;
+    let armed = ARMED.load(Ordering::Acquire) != 0;
+    if !msi::rescue_judged(message_mode, armed, crate::ddi::escape_wait::stopping()) {
+        // A stopping device's waits time out by design: not judged (no streak, no health, no
+        // latch). An armed message-mode rescue still queues the DPC, as before, so the event
+        // queue and the fences drain.
+        if message_mode && armed {
+            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        }
         return;
     }
     let now = ints_total();

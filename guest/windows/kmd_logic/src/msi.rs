@@ -426,10 +426,16 @@ pub const fn breaker_trips(mode: Mode, marker_found: bool) -> bool {
 /// still trips the breaker.
 pub const MARKER_CLEAR_AFTER_100NS: u64 = 30_000_000;
 
-/// Whether the `MsiStarting` marker may be cleared now: run-time judging is armed
-/// (`armed_at` is its time, 0 = not armed), delivery is not convicted, at least one
-/// interrupt arrived, and either the start is ending cleanly (`stopping`) or
-/// [`MARKER_CLEAR_AFTER_100NS`] has passed.
+/// Whether the `MsiStarting` marker may be cleared now.
+///
+/// * A CLEAN `StopDevice` (`stopping`) clears it UNCONDITIONALLY: reaching it proves the start
+///   did not hang, bugcheck or reboot into its fault, which is all the marker is for. Armed or
+///   not, interrupts or none, younger than 3 s or not, convicted or not (a convicted delivery is
+///   the run-time latch's business, `MsiLatchWhy=1`, not the breaker's). Keeping the marker at a
+///   clean stop is what made a plain `pnputil /restart-device` trip the breaker (2026-10-07).
+/// * While the device runs (the lazy periodic clear): run-time judging is armed (`armed_at` is
+///   its time, 0 = not armed), delivery is not convicted, at least one interrupt arrived, and
+///   [`MARKER_CLEAR_AFTER_100NS`] has passed.
 pub const fn marker_may_clear(
     armed_at: u64,
     now: u64,
@@ -437,10 +443,29 @@ pub const fn marker_may_clear(
     convicted: bool,
     stopping: bool,
 ) -> bool {
-    armed_at != 0
-        && !convicted
-        && ints_seen > 0
-        && (stopping || now.saturating_sub(armed_at) >= MARKER_CLEAR_AFTER_100NS)
+    stopping
+        || (armed_at != 0
+            && !convicted
+            && ints_seen > 0
+            && now.saturating_sub(armed_at) >= MARKER_CLEAR_AFTER_100NS)
+}
+
+/// Whether a latch for `why` (one of [`latch_why`]) may be written now. `stopping` is the
+/// KMD's stop flag (raised at `StopDevice` / `RemoveDevice` entry, lowered at `StartDevice`):
+/// while it is up the device is being torn down, waits that time out are expected (the ISR gate
+/// is cleared, the host is being swept), and a run-time verdict made then says nothing about
+/// delivery. Such a latch is ignored. The breaker is the exception: it is decided at
+/// `AddDevice` from the marker, which on a same-image restart runs while the flag from the
+/// previous `RemoveDevice` is still up, and it is not a run-time verdict.
+pub const fn latch_allowed(why: u32, stopping: bool) -> bool {
+    why == latch_why::BREAKER || !stopping
+}
+
+/// Whether a rescue is judged for delivery health ([`rescue_step`]): message mode, run-time
+/// judging armed, and the device not stopping (see [`latch_allowed`]). A rescue that is not
+/// judged is still counted and still queues the DPC.
+pub const fn rescue_judged(message_mode: bool, armed: bool, stopping: bool) -> bool {
+    message_mode && armed && !stopping
 }
 
 // ── Which build: the marker and the latch belong to the image that wrote them ──
@@ -749,7 +774,7 @@ pub mod latch_why {
 /// `kmd_render/src/virtio/msi.rs` only. `MsiMode` and `MsiVectors` are knobs the
 /// operator writes and are not listed; `MsiLatch` is both: the KMD writes 1, an
 /// operator may write either. At most 14 characters each.
-pub const COUNTERS: [&str; 40] = [
+pub const COUNTERS: [&str; 42] = [
     // The set-up breadcrumbs.
     "MsiCap",
     "MsiList",
@@ -799,6 +824,10 @@ pub const COUNTERS: [&str; 40] = [
     "MsiLatchVer",
     "MsiMarkerOld",
     "MsiLatchOld",
+    // Latches a run-time verdict asked for while the device was stopping, ignored
+    // (`latch_allowed`; per image load), and the `MsiLatchWhy` of the last one.
+    "MsiLatchStop",
+    "MsiLatchStopW",
 ];
 
 #[cfg(test)]
@@ -1092,24 +1121,83 @@ mod tests {
 
     #[test]
     fn the_marker_clears_only_when_interrupts_were_seen_and_the_start_is_old_enough() {
+        // The lazy clear of a running device (not stopping).
         let armed = 1_000_000u64;
         let after = armed + MARKER_CLEAR_AFTER_100NS;
         // Not armed yet: never.
         assert!(!marker_may_clear(0, after, 5, false, false));
-        assert!(!marker_may_clear(0, after, 5, false, true));
         // Armed, interrupts seen, old enough.
         assert!(marker_may_clear(armed, after, 1, false, false));
-        // Too young, unless the start is ending cleanly.
+        // Too young.
         assert!(!marker_may_clear(armed, after - 1, 1, false, false));
-        assert!(marker_may_clear(armed, armed, 1, false, true));
-        // No interrupt: a quiet device is not a healthy one, even stopping.
+        // No interrupt: a quiet device is not a healthy one.
         assert!(!marker_may_clear(armed, after, 0, false, false));
-        assert!(!marker_may_clear(armed, after, 0, false, true));
-        // A convicted delivery keeps the marker.
+        // A convicted delivery keeps the marker while running.
         assert!(!marker_may_clear(armed, after, 9, true, false));
-        assert!(!marker_may_clear(armed, after, 9, true, true));
         // A clock that went backwards does not clear early.
         assert!(!marker_may_clear(armed, 0, 1, false, false));
+    }
+
+    #[test]
+    fn a_clean_stop_clears_the_marker_unconditionally() {
+        let armed = 1_000_000u64;
+        let after = armed + MARKER_CLEAR_AFTER_100NS;
+        // Marker set, never armed, zero interrupts, a start younger than 3 s: cleared.
+        assert!(marker_may_clear(0, 0, 0, false, true));
+        assert!(marker_may_clear(0, after, 0, false, true));
+        assert!(marker_may_clear(armed, armed, 0, false, true));
+        // Convicted and stopping: cleared too (the conviction is the run-time latch's).
+        assert!(marker_may_clear(armed, after, 9, true, true));
+        assert!(marker_may_clear(0, 0, 0, true, true));
+        // Every input combination clears at a clean stop.
+        for armed_at in [0, armed] {
+            for now in [0, armed, after, u64::MAX] {
+                for ints in [0, 1, u32::MAX] {
+                    for convicted in [false, true] {
+                        assert!(marker_may_clear(armed_at, now, ints, convicted, true));
+                    }
+                }
+            }
+        }
+        // Running with zero interrupts: never, however old.
+        assert!(!marker_may_clear(armed, u64::MAX, 0, false, false));
+    }
+
+    #[test]
+    fn no_latch_but_the_breaker_is_written_while_stopping() {
+        use latch_why::*;
+        for why in [SILENT, REFUSED, NO_CFG] {
+            assert!(latch_allowed(why, false));
+            assert!(!latch_allowed(why, true), "why {why} while stopping");
+        }
+        // The breaker runs at AddDevice, where a same-image restart still has the flag up.
+        assert!(latch_allowed(BREAKER, false));
+        assert!(latch_allowed(BREAKER, true));
+        // Rescues during a stop are not judged at all, so health cannot go Broken from them.
+        assert!(rescue_judged(true, true, false));
+        assert!(!rescue_judged(true, true, true));
+        assert!(!rescue_judged(false, true, false));
+        assert!(!rescue_judged(true, false, false));
+    }
+
+    #[test]
+    fn a_plain_restart_of_a_healthy_or_quiet_start_does_not_trip_the_breaker() {
+        // The restart-device sequence: begin_start set the marker (this build), the start ran
+        // (armed or not, interrupts or none), StopDevice cleared it unconditionally, so
+        // AddDevice of the next start finds no marker and asks for MSI-X again.
+        for (armed_at, ints) in [(0u64, 0u32), (5, 0), (5, 100)] {
+            let cleared = marker_may_clear(armed_at, armed_at, ints, false, true);
+            assert!(cleared);
+            let marker = !cleared;
+            let v = marker_verdict(Mode::ForceMsi, marker, THIS, THIS);
+            assert_eq!(v, MarkerVerdict::Absent);
+            assert_eq!(key_action(Mode::ForceMsi, false), KeyAction::SetMsi);
+        }
+        // Without a clean stop (a hang, a bugcheck) the marker is still there: the breaker.
+        assert_eq!(
+            marker_verdict(Mode::ForceMsi, true, THIS, THIS),
+            MarkerVerdict::Trip
+        );
     }
 
     // ── the build a marker or latch belongs to ───────────────────────────────

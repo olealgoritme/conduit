@@ -200,11 +200,13 @@ All decisions are in `kmd_logic/src/msi.rs` (host tested); the WDK glue is
    messages sets `MsiStarting=1` in the service key and FLUSHES it to disk before anything
    that could hang (set in `StartDevice` after `probe_granted`, not in `AddDevice`: only a
    message-mode start can be the one that loops, and an INTx start must not leave a marker).
-   It is cleared (`msi::marker_may_clear`) once run-time judging is armed, an interrupt has
-   been seen, delivery is not convicted, and the start is 3 s old (lazily: not flushed), or at
-   once at a clean `StopDevice` (FLUSHED, `service_stop`). If `AddDevice` finds it still set,
-   the previous message-mode start never became healthy (a hang, a bugcheck, a reboot into the
-   same fault): the breaker trips, `MsiLatch=1` (`MsiLatchWhy=4`), `MsiBreaker` counts it, and
+   It is cleared (`msi::marker_may_clear`) while running once run-time judging is armed, an
+   interrupt has been seen, delivery is not convicted, and the start is 3 s old (lazily: not
+   flushed), and UNCONDITIONALLY at a clean `StopDevice` (FLUSHED, `service_stop`): reaching
+   StopDevice proves the start did not hang or die, armed or not, interrupts or none, convicted
+   or not (a conviction is the run-time latch's, `MsiLatchWhy=1`). If `AddDevice` finds it still
+   set, the previous message-mode start never reached a clean stop and never became healthy (a
+   hang, a bugcheck, a reboot into the same fault): the breaker trips, `MsiLatch=1` (`MsiLatchWhy=4`), `MsiBreaker` counts it, and
    the key goes to INTx. `MsiMode=2` does NOT override it; only `MsiMode=3` (debugging) does.
    The marker and the latch carry the build that wrote them ("Driver updates and the
    breaker"): only a marker or a latch of the RUNNING build counts.
@@ -253,11 +255,29 @@ the middle of whatever it was doing, and the latch was a verdict on the old code
 
   The breaker runs after the latch verdict, so a Trip in the same `AddDevice` latches again,
   with the running build's tag.
-* **The clear at a clean stop is flushed.** `StopDevice` calls `service_stop`: when it clears
-  the marker it flushes the service key there and then (the time is credited to the stop's host
-  budget), instead of relying on the lazy writer, `StopFlush` and the stage-5 flush. The
-  periodic clear (3 s after a healthy start) stays lazy. A clean stop with NO interrupt seen
-  still keeps the marker (`marker_may_clear` is unchanged).
+* **A clean stop clears the marker unconditionally, and flushes.** `StopDevice` calls
+  `service_stop`: whenever this start set a marker it is cleared (armed or not, interrupts or
+  none, younger than 3 s or not, convicted or not) and the service key is flushed there and
+  then (the time is credited to the stop's host budget), instead of relying on the lazy writer,
+  `StopFlush` and the stage-5 flush. The periodic clear of a running device (armed, an
+  interrupt seen, not convicted, 3 s old) stays lazy.
+* **No run-time latch while stopping.** `msi::latch_allowed`: while the KMD's stop flag is up
+  (`ddi::escape_wait::stopping`, raised at StopDevice / RemoveDevice entry, lowered at
+  StartDevice) a latch for `SILENT`, `REFUSED` or `NO_CFG` is ignored and counted
+  (`MsiLatchStop`, the last reason in `MsiLatchStopW`), and rescues are not judged at all
+  (`msi::rescue_judged`: no streak, no health, still the DPC). Waits that time out during a
+  stop are expected. The breaker (`BREAKER`) is exempt: it is decided at `AddDevice`, where a
+  same-image restart still has the previous RemoveDevice's flag up.
+
+  Every writer of `MsiLatch`, and whether it can fire during a `pnputil /restart-device`
+  (StopDevice, RemoveDevice, AddDevice, StartDevice of the same image):
+
+  | Writer (`virtio/msi.rs`) | Why | When | During a restart-device |
+  | --- | --- | --- | --- |
+  | `note_rescue` -> `latch_intx` | 1 `SILENT` | 3 silent rescues in a row, message mode, armed | Before: in StopDevice stages 1-2 (the ISR gate `msi_state` is cleared at stage 3, after which `note_rescue` returned anyway). Now: never while stopping. |
+  | `give_up_on_vectors` -> `latch_intx` | 2 `REFUSED`, 3 `NO_CFG` | `program_vectors` in StartDevice | Only in the new StartDevice, after the stop flag is lowered; it shows `MsiPollOnly=1`, `MsiVec=0xFFFF`. |
+  | `apply_key_policy` (breaker) -> `latch_intx` | 4 `BREAKER` | AddDevice found a marker of this build | Before: whenever the previous start's marker had not been cleared at its stop (no interrupt counted, not armed, or convicted). Now: only when the previous start never reached a clean StopDevice. |
+  | `apply_key_policy` (stale latch) | writes 0 | AddDevice, another build's latch | Clears, never sets. |
 
 **The consequence.** A new build gets ONE fresh attempt at MSI-X under `MsiMode=2`, whatever
 the build before it latched. The breaker and the latch protect against a boot loop (or a
@@ -265,14 +285,31 @@ convicted delivery) of THAT build: if the new build loops, its own marker trips 
 on the next `AddDevice` and its own latch holds until the next build or the operator. An
 operator's `MsiLatch=1` (written without `MsiLatchVer`) is never set aside.
 
-**What is not covered.** A marker of the RUNNING build still trips, by design: if a build's
-own start is cut short before it proves healthy (stopped before `StartDevice` finished, stopped
-with no interrupt seen, or a reboot within 3 s of the start with no `StopDevice`), its breaker
-trips once and latches that build. Whether the 2026-10-07 trip was the old build's marker or
-the new build's own is not known from the counters of that run (the tag did not exist yet);
-`MsiStartingVer` next to `MsiBreaker` / `MsiMarkerOld` settles it on the next update. Before
-this change, a default `StopFlush=1` already flushed at stage 5 after the clear, so an unflushed
-clear explains the trip only for a stop that ended before stage 5 or ran with `StopFlush=0`.
+**A plain restart-device tripped the breaker (2026-10-07, 346.1, `MsiMode=2`).** After the
+latch values were cleared, restart-device twice (20 s apart), then once more: `MsiBreaker=2`,
+`MsiLatchWhy=4`, the last start on INTx. Read path by path, the old code could leave a marker
+of a start that ran 15-20 s only if, in that start, `marker_may_clear` saw `ints_total() == 0`
+(no message interrupt counted since `begin_start`), `ARMED_AT == 0` (`finish_start` not
+reached), or `MsiHealth == 3` (convicted), because the old clean-stop clear required the same
+three things as the running clear except the age. None of the other suspects holds:
+`service` is called from the HPD worker's pass (`ddi/hpd.rs`), the periodic mirror
+(`publish_counters`, from `publish_nvrm_counters`) and StopDevice; `STARTING`, `ARMED_AT` and
+the per-vector counts are written only by `begin_start` / `finish_start` / the ISR (all three
+vectors, `vector_slot`); the clear and the set go through the same `record_named_bytes` and the
+same service key that `read_config_dword` reads, and the mirror's changed-only cache cannot
+skip the clear (`begin_start` cached 1); `begin_start` runs only from StartDevice, after
+AddDevice has read the marker; PnP does not overlap StopDevice and the next AddDevice. Since
+`finish_start` is on every successful start path, the likely reading is a start that counted no
+message interrupt (`MsiInts=0` with `MsiGrant=3`: delivery not reaching the ISR, the device
+running on the polling net), or one convicted by silent rescues (`MsiLatchWhy=1`, later
+overwritten by the breaker's 4). The unconditional clean-stop clear removes the trip in every
+one of these cases; a start that really does not deliver is still latched, by `SILENT`, while
+it runs.
+
+**What is not covered.** A marker of the RUNNING build still trips, by design, when a start of
+that build ends without a clean StopDevice (a hang, a bugcheck, a reset or power-off, or a
+reboot within 3 s of the start: Windows does not stop a display adapter at shutdown, so a
+reboot relies on the lazy clear having run).
 
 #### Test procedure: a package update over a running MSI-X device
 
@@ -307,6 +344,28 @@ Operator actions: to FORCE INTx across updates, `MsiMode=1` (or `MsiLatch=1` wit
 a hand-set latch is never set aside by a newer build). To CLEAR a latch, delete `MsiLatch` (or
 write 0; `AddDevice` then drops the stale tag). To disable the breaker while debugging,
 `MsiMode=3`.
+
+#### Test procedure: plain restarts of the same build
+
+The registry sequence across one `pnputil /restart-device` of an MSI-X start (same build, tag T):
+
+| Step | `MsiStarting` | `MsiStartingVer` | Writes |
+| --- | --- | --- | --- |
+| StartDevice, `begin_start` (granted > 0) | 1 | T | `MsiStartingVer=T`, `MsiStarting=1`, flush |
+| running, armed + an interrupt + 3 s | 0 | T | `MsiStarting=0` (lazy) |
+| StopDevice, `service_stop` (if still 1) | 0 | T | `MsiStarting=0`, flush |
+| StopDevice / RemoveDevice, stop flag up | unchanged | unchanged | no `MsiLatch` except the breaker (`MsiLatchStop` counts the ignored ones) |
+| AddDevice, `apply_key_policy` | 0: Absent | T | `MsiModeEff`, `MsiWant=1`, `MSISupported=1` (`MsiKeyWr`) |
+| StartDevice, `begin_start` | 1 | T | as the first row |
+
+1. `MsiMode=2`, no `MsiLatch`, `MsiStarting` 0; two restarts until `MsiGrant=3`.
+2. Read, a few seconds into the start: `MsiInts`, `MsiV1`, `MsiV2`, `MsiStart`, `MsiHealth`,
+   `MsiPoll`, `IrqRescue`, `MsiStarting` (0 after ~3 s if `MsiInts > 0`; still 1 if not),
+   `MsiLatch`, `MsiLatchWhy`.
+3. Restart five times, 5 to 20 s apart, with and without load. After each: `MsiGrant=3`,
+   `MsiBreaker` unchanged, `MsiLatch=0`, `MsiWant=1`, `MsiStartingVer=T`.
+4. `MsiLatchStop` / `MsiLatchStopW`: nonzero means a silent-rescue (or other) latch was asked
+   for during a stop and ignored, the case this rule exists for.
 
 ### Is the shared interrupt code right for MSI?
 
@@ -351,7 +410,7 @@ write 0; `AddDevice` then drops the stale tag). To disable the breaker while deb
 | OS granted 3+ | | Config 0, control 1, event 2. |
 | Device refuses a vector | read-back in `write_plan` | `setup_plan`: shared on 0. |
 | Every plan refused, or the common cfg cannot be mapped | `program_vectors` | POLLING-ONLY: transport up, no vector, `MsiPollOnly=1`, safety net on, `MsiLatch=1` (`MsiLatchWhy` 2 / 3, flushed), INTx next start. Slow (every wait costs a slice, fences ride the worker's 10 ms poll) but alive. |
-| A message-mode start of THIS build never became healthy (hang, bugcheck, reboot loop) | `AddDevice` finds `MsiStarting` with `MsiStartingVer` = the running build | Breaker: `MsiLatch=1` (`MsiLatchWhy=4`, `MsiLatchVer`, flushed), `MsiBreaker` + 1, INTx for this start's key write. |
+| A message-mode start of THIS build ended without a clean StopDevice before it became healthy (hang, bugcheck, reboot loop) | `AddDevice` finds `MsiStarting` with `MsiStartingVer` = the running build | Breaker: `MsiLatch=1` (`MsiLatchWhy=4`, `MsiLatchVer`, flushed), `MsiBreaker` + 1, INTx for this start's key write. |
 | A driver update: the marker or the latch is another build's (or a pre-tag image's marker) | `AddDevice` (`marker_verdict`, `latch_verdict`) | Set aside: `MsiMarkerOld` / `MsiLatchOld` + 1, no trip, the latch cleared; the new build gets one fresh MSI-X attempt ("Driver updates and the breaker"). |
 | Start finished and completions were polled with no interrupt | `finish_start` (`msi::start_verdict`: no interrupt, >= 3 completions since the transport went live) | `MsiStart=2` (suspect), the polling safety net turns on. Never latches by itself: whether dxgkrnl delivers interrupts to a device that is still starting is not assumed. |
 | Lost interrupt (delivery broken) | `wait_block`: a polling drain, after a wait slice timed out, found a completion (`IrqRescue`). `msi::rescue_step`: no interrupt since the previous rescue = silent; 3 silent in a row convict | First doubt: polling safety net on, the rescue queues the DPC (so events and fences drain too). Conviction: `MsiHealth=3`, `MsiLatch=1` (`MsiLatchWhy=1`, flushed), INTx next start. The device keeps working meanwhile at polling latency. |
@@ -381,7 +440,9 @@ connected, and an enabled-but-unconnected level interrupt is a hang. The fallbac
 Host tests (`kmd_logic`, `cargo test`) cover every decision: `setup_plan` (order,
 no identical retry, never an ungranted vector), `key_action` (the table; only an explicit
 opt-in raises the key, a latch beats everything but mode 3), `breaker_trips` and
-`marker_may_clear` (the marker clears only with an interrupt seen and a start old enough),
+`marker_may_clear` (while running, the marker clears only with an interrupt seen and a start
+old enough; a clean stop clears it whatever the inputs), `latch_allowed` / `rescue_judged` (no
+run-time latch and no rescue judging while stopping; the breaker exempt),
 `build_tag` (on samples and on the real `driver-version.env`), `marker_verdict` and
 `latch_verdict` (same build trips / holds, another build or no tag on the marker is stale, no
 tag on the latch is the operator's, mode 3 ignores the marker, the package-update case keeps
@@ -444,6 +505,7 @@ keep their old meaning (all interrupts, all DPCs, cumulative since the image loa
 | `MsiLatch`, `MsiLatchWhy` | The INTx latch and why (1 silent rescues, 2 refused, 3 cfg unmapped, 4 breaker). |
 | `MsiStartingVer`, `MsiLatchVer` | The build tag (`build << 16 \| revision` of `HELIOS_KMD_VERSION`) of the image that set the marker / wrote the latch; absent = an older image or the operator. |
 | `MsiMarkerOld`, `MsiLatchOld` | Markers / latches of another build (or a marker without a tag) that `AddDevice` set aside instead of tripping / honouring them. |
+| `MsiLatchStop`, `MsiLatchStopW` | Run-time latches asked for while the device was stopping and ignored (`latch_allowed`; since the image loaded), and the `MsiLatchWhy` of the last one. |
 | `NvRttN`, `NvRttMinUs`, `NvRttMeanUs`, `NvRttMaxUs` | Forwarded RM `Ioctl` round trips as the calling thread saw them (see below): count, min, mean, max in microseconds. |
 | `NvRttB0` .. `NvRttB7` | Histogram of the same, bounds `< 15, 25, 40, 60, 100, 250, 1000` us, last open. The INTx cost (about 55 us) lands in B3, a 25 us MSI-X call in B2. |
 | `NvRttON`, `NvRttOMinUs`, `NvRttOMeanUs`, `NvRttOMaxUs` | The same for every other forwarded message: open, close, scan-out flip, the pinned registration, listings. |
