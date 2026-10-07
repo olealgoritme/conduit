@@ -1041,6 +1041,8 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     PRESENT_FLAGS_HISTOGRAM.dump([b'F', b'l']);
     PRESENT_INTERVAL_HISTOGRAM.dump([b'F', b'i']);
     publish_idf_flags();
+    // The independent-flip census (`Idf*` of `ddi/indep_flip.rs`), when a count moved.
+    crate::ddi::indep_flip::publish();
 
     // The D4a read-ledger census (`Rd*`/`Aq*` — FIX-DESIGN-d4a.md §3.4).
     // Identity for every run: `RdIss == RdRet` at quiescence, `RdIss <= FfTot`

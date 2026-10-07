@@ -800,13 +800,32 @@ fn kmd_reports_direct_flip() -> bool {
     *CELL.get_or_init(|| {
         // SAFETY: gdi32's documented D3DKMT ABI; every buffer is local and
         // sized as the call expects; adapters opened by EnumAdapters2 are closed.
-        let r = unsafe { query_direct_flip() };
+        let r = unsafe { query_adapter_support(KMTQAITYPE_DIRECTFLIP_SUPPORT) };
         log_error!("DDI CheckDirectFlipSupport: dxgkrnl DirectFlip support = {r}");
         r
     })
 }
 
-unsafe fn query_direct_flip() -> bool {
+const KMTQAITYPE_DIRECTFLIP_SUPPORT: u32 = 19;
+const KMTQAITYPE_INDEPENDENTFLIP_SUPPORT: u32 = 28;
+
+/// Does dxgkrnl report independent-flip support (KMTQAITYPE_INDEPENDENTFLIP_SUPPORT, derived
+/// from the KMD's `FlipIndependent` caps, i.e. `IndepFlip`) for a hardware render adapter?
+/// Asked once per process. Off by default: the KMD does not advertise it unless `IndepFlip`
+/// is set (docs/independent-flip.md section 11).
+pub(crate) fn kmd_reports_independent_flip() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        // SAFETY: as `kmd_reports_direct_flip`.
+        let r = unsafe { query_adapter_support(KMTQAITYPE_INDEPENDENTFLIP_SUPPORT) };
+        log_error!("dxgkrnl IndependentFlip support = {r}");
+        r
+    })
+}
+
+/// Whether any hardware render adapter answers `kind` (a `KMTQAITYPE_*` whose answer starts
+/// with a BOOL `Supported`) with yes.
+unsafe fn query_adapter_support(kind_query: u32) -> bool {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn LoadLibraryA(name: *const u8) -> *mut c_void;
@@ -834,7 +853,6 @@ unsafe fn query_direct_flip() -> bool {
         size: u32,
     }
     const KMTQAITYPE_ADAPTERTYPE: u32 = 15;
-    const KMTQAITYPE_DIRECTFLIP_SUPPORT: u32 = 19;
     type Enum2 = unsafe extern "system" fn(*mut EnumAdapters2) -> i32;
     type Query = unsafe extern "system" fn(*const QueryAdapterInfo) -> i32;
     type Close = unsafe extern "system" fn(*const u32) -> i32;
@@ -873,7 +891,7 @@ unsafe fn query_direct_flip() -> bool {
             let mut df: i32 = 0;
             let qd = QueryAdapterInfo {
                 h_adapter: a.h_adapter,
-                kind: KMTQAITYPE_DIRECTFLIP_SUPPORT,
+                kind: kind_query,
                 data: (&mut df as *mut i32).cast(),
                 size: 4,
             };
