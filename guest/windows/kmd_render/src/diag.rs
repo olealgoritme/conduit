@@ -1208,6 +1208,23 @@ pub mod knobs {
     /// does nothing. Read at every StartDevice; mirrored as `GbKnob`.
     /// `docs/zero-copy-present.md` section 24.12.
     pub const GUEST_BLOB: KnobName = KnobName::new(b"GuestBlob");
+    /// `RmCopyEngine` (default 0 = nothing happens: no allocation, no RM message). 1: reserved for
+    /// the windowed Present copy on the KMD's own copy-engine channel (M3c; nothing yet). 2: the
+    /// channel's hardware self-test, once per transport generation, from the HPD worker. 3: the
+    /// shadow mode (M3c-1): a sample of real Presents copied again by the channel into a scratch
+    /// buffer and compared with the production copy. Any other value is 0. Read at every
+    /// StartDevice; mirrored as `CeKnob`.
+    /// `docs/rm-copy-engine-present.md` section 11.
+    pub const RM_COPY_ENGINE: KnobName = KnobName::new(b"RmCopyEngine");
+    /// `RmCeCache` (default 0 = cached, as the copy-engine tool allocates it). 1: the channel's own
+    /// RM system memory (control, ring, the self-test's buffers) write-combined, for an A/B. Read at
+    /// StartDevice when `RmCopyEngine` is nonzero; mirrored as `CeCache`.
+    pub const RM_CE_CACHE: KnobName = KnobName::new(b"RmCeCache");
+    /// `CeShadowEvery` (default 0 = 64): with `RmCopyEngine` = 3 (the shadow mode, M3c-1), one in
+    /// how many Presents is copied again by the copy-engine channel and compared with the
+    /// production copy. Read at StartDevice in shadow mode only; mirrored as `CeShadowEach`.
+    /// `docs/rm-copy-engine-present.md` section 14.
+    pub const CE_SHADOW_EVERY: KnobName = KnobName::new(b"CeShadowEvery");
     /// `CopyQueue` (default 0 = the previous behaviour: one queue, family 0). 1: the KMD's Venus
     /// device also gets a queue on a transfer-only family (chosen from the queue family
     /// properties, bound to ring 2), and the windowed Present copies a transfer queue can run (a

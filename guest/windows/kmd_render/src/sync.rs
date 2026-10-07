@@ -236,6 +236,25 @@ impl PassiveMutex {
             _not_send: PhantomData,
         })
     }
+
+    /// Exclusive ownership if it is free NOW (a zero-timeout wait), else `None` at once. For a
+    /// diagnostic that must never make the owner's other users wait (the copy-engine shadow
+    /// mode's look at a Present destination's leases).
+    pub(crate) fn try_lock(&self, _passive: PassiveLevel) -> Option<PassiveMutexGuard<'_>> {
+        // SAFETY: an all-zero LARGE_INTEGER is a valid plain integer union; 0 is a zero timeout.
+        let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        timeout.QuadPart = 0;
+        // SAFETY: as in `lock`; a zero timeout returns STATUS_TIMEOUT without waiting when the
+        // mutex is owned by another thread.
+        let status = unsafe {
+            KeWaitForSingleObject(self.raw.get().cast::<core::ffi::c_void>() as PVOID, 0, 0, 0, &mut timeout)
+        };
+        // STATUS_SUCCESS only: STATUS_TIMEOUT (0x102) is positive and means "not acquired".
+        (status == 0).then_some(PassiveMutexGuard {
+            owner: self,
+            _not_send: PhantomData,
+        })
+    }
 }
 
 /// Releases a [`PassiveMutex`] on every return path.

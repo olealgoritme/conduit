@@ -67,6 +67,16 @@ use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
 pub(crate) mod sysmem;
 pub(crate) mod sysmem_blt;
 pub(crate) mod sysmem_flip;
+// `RmCopyEngine`: the KMD's own copy-engine channel (its own RM client, driven by the same `Io`)
+// and its hardware self-test. Independent of `KmdRmClient`.
+pub(crate) mod ce_channel;
+pub(crate) mod ce_selftest;
+// M3c-1: the producer's memory (the `'HEF3'` record's semaphore and image) dup'd into the
+// channel's client and GPU-mapped, cached for the life of the channel.
+pub(crate) mod ce_dup;
+// M3c-1: the shadow mode (`RmCopyEngine` = 3): sampled Presents copied again by the channel and
+// compared with the production copy.
+pub(crate) mod ce_shadow;
 
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -472,6 +482,8 @@ pub(crate) fn retire_begin(passive: PassiveLevel) {
     // in every normal path) so no virtual address outlives its window range.
     wait_for_lease(passive);
     unmap_views(&views);
+    // The copy-engine channel's kernel views likewise (one load when there is none).
+    ce_channel::drop_views();
 }
 
 /// The transport is gone: forget everything (the sweep closed the host side). A view
@@ -491,6 +503,7 @@ pub(crate) fn forget() {
     unmap_views(&views);
     rm_present::reset();
     sysmem::forget();
+    ce_channel::forget();
     // The next transport generation reads the knob again (once).
     KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }
@@ -607,7 +620,7 @@ fn fail_of(r: Refusal) -> Fail {
 }
 
 /// One step's context: the token, the adapter, and the generation the client belongs to.
-struct Io<'a> {
+pub(crate) struct Io<'a> {
     passive: PassiveLevel,
     adapter: &'a AdapterContext,
     epoch: u64,

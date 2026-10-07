@@ -6807,6 +6807,30 @@ impl VirtioGpu {
         })
     }
 
+    /// `RmCopyEngine` = 3 (the copy-engine shadow mode): the Present buffer `resource_id` is
+    /// settled, i.e. no KMD writer or CPU mirror owns it, any reader's boundary is reached, and no
+    /// queued (WindowedBlt / deferred) copy names it: every production copy admitted into it so
+    /// far has completed and been mirrored. An untracked buffer is not settled. Spinlock-only,
+    /// read-only.
+    pub(crate) fn present_buffer_settled(&self, resource_id: u32) -> bool {
+        let Some(slot) = self
+            .present_buffer_syncs
+            .iter()
+            .find(|slot| slot.resource_id == resource_id)
+        else {
+            return false;
+        };
+        let free = match slot.access {
+            PresentBufferAccess::ExternalReady => true,
+            PresentBufferAccess::Consumer(boundary) => self.scanout_boundary_ready(boundary),
+            PresentBufferAccess::Empty
+            | PresentBufferAccess::KmdWriter
+            | PresentBufferAccess::KmdCpuMirror
+            | PresentBufferAccess::Teardown => false,
+        };
+        free && !self.blt_dst_deferred_pending(resource_id)
+    }
+
     /// End the CPU reader lifetime after the mirror routine has returned. A
     /// content-copy failure still releases ownership: the CPU no longer reads
     /// the buffer, while the WDDM transaction separately reports the failure.

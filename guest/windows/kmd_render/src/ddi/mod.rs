@@ -15,6 +15,7 @@ mod build_paging_buffer;
 mod child;
 pub(crate) mod cpu_host_aperture;
 pub(crate) mod blt_async;
+pub(crate) mod ce_record;
 pub(crate) mod create_allocation;
 pub(crate) mod device_lost;
 pub(crate) mod display;

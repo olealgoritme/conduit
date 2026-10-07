@@ -357,6 +357,8 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // the deferred programming above, so a primary bound in this very pass is seen.
         stall_diag::hpd_enter(site::RM_CLIENT);
         crate::virtio::rm_client::service(passive, adapter);
+        // `RmCopyEngine` (off by default: one relaxed load): the copy-engine channel's self-test.
+        crate::virtio::rm_client::ce_channel::service(passive, adapter);
 
         // `ForeignFlip`: the flips of a foreign allocation Windows is showing (off by default:
         // one atomic load). After the level 5 service, which leaves the shared edges to it
