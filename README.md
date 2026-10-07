@@ -256,6 +256,15 @@ touch your display settings or other apps' GPU work. It is not hardware
 isolation like a dedicated GPU: only run VMs you trust. See
 [docs/SECURITY.md](docs/SECURITY.md).
 
+The guest's video memory comes out of the same card as your desktop. On a
+driver or GPU that is not the tested one (the closed NVIDIA modules, a driver
+before 580), Conduit starts in **safe mode**: a 2 GiB video-memory limit and
+1 s bounds on blocking GPU calls; `conduit doctor` shows whether it is on and
+why. Cards other than the RTX 5090 (Ada, Ampere, Turing) have not been run
+yet: for a first run keep an ssh session or a text console open on the host
+([docs/GPU-SUPPORT.md](docs/GPU-SUPPORT.md)). To check that a change leaves the
+tested setup alone, see [docs/PROVEN-SETUP-CHECK.md](docs/PROVEN-SETUP-CHECK.md).
+
 ## Troubleshooting
 
 | Problem | Try |
