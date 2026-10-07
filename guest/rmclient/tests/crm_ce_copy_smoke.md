@@ -60,6 +60,7 @@ Options (defaults in brackets):
 - `--timeout-ms <ms>`: bound of every CPU wait [2000]
 - `--fence`: Windows only; also time doorbell -> RM fence event
 - `--bl-roundtrip`, `--bl-probe-pitch`, `--modifier <hex>`, `--bl-kind <hex>`: the block-linear check (below)
+- `--remap none|swap-rb`, `--bl-src-only`: R/B swap inside the copy with the CE remap unit (below) [none]
 
 Exit 0 on PASS, 1 on FAIL.
 
@@ -227,6 +228,104 @@ On failure:
 - `bl_probe_pitch=IDENTICAL` means the copy did not swizzle: block-linear was not in effect. That is a FAIL.
 
 Send back the full output of both runs.
+
+## Format conversion with the remap unit (M1c)
+
+Heaven's windowed source is RGBA (`AB24`) and DWM's redirection surface is BGRA (`AR24`), so every windowed Present
+swaps bytes 0 and 2 of each pixel. `--remap swap-rb` does that inside the copy with the CE's remap unit
+(`SET_REMAP_COMPONENTS` 0x03303012: DST_X = SRC_Z, DST_Z = SRC_X, Y and W identity, 1-byte components, 4 in and 4
+out; `LAUNCH_DMA.REMAP_ENABLE`). With the remap on, the X quantities of the copy (`LINE_LENGTH_IN`,
+`SET_SRC/DST_WIDTH`, `SRC/DST_ORIGIN_X`) are counted in 4-byte pixels instead of bytes, as NVK does; the pitches stay
+bytes. The source is the fixed seeded pattern, read as RGBA; the CPU checks that the destination is the same pattern
+with bytes 0 and 2 exchanged. Design and fallbacks: `rm-copy-engine-present.md` section 12.
+
+Run lines, in this order (after the scp above). Run 3 is the open question; run it on its own line so a refusal or a
+hang belongs to that combination alone:
+
+```sh
+ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe --iterations 200 --remap swap-rb'
+ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe --bl-roundtrip --remap swap-rb'
+ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe --bl-src-only'
+```
+
+1. **Measured loop with the remap** (`--remap swap-rb` without `--bl-roundtrip`): the ready, wait and contended copies
+   remap; the contender does not. Output as run 1 above, plus:
+
+   ```
+   remap=swap-rb SET_REMAP_COMPONENTS=0x03303012 on the measured copies (...)
+   ...
+   verify=ok (13 checks, 0 bad bytes)
+   remap_verify=ok (swap-rb: the destination is the pattern with bytes 0 and 2 exchanged; 13 checks, 0 bad words)
+   remap_gbps path=pitch_to_pitch on=... (compare with copy_gbps_p50 of the same run line without --remap)
+   RESULT PASS
+   ```
+
+2. **The matrix** (`--bl-roundtrip --remap swap-rb`, 16 rounds per combination): instead of the round trip, five
+   combinations run one after the other, each all of its rounds before the next starts:
+
+   | combination | copies | the destination must be |
+   |---|---|---|
+   | `pitch_to_pitch_off` | pitch -> pitch | the pattern |
+   | `pitch_to_pitch_on` | pitch -> pitch with remap | swapped |
+   | `bl_off` | pitch -> BL, BL -> pitch | the pattern |
+   | `bl_dst_remap` | pitch -> BL with remap, BL -> pitch | swapped (fallback B: remap while writing the image) |
+   | `bl_src_remap` | pitch -> BL, BL -> pitch with remap | swapped (the open question; Heaven's case) |
+
+   The image is zeroed before each block-linear round, as in the round trip. Expected output:
+
+   ```
+   remap=swap-rb SET_REMAP_COMPONENTS=0x03303012 (...)
+   remap_mode=matrix
+   status: remap combination pitch_to_pitch_off starts: pitch -> pitch, no remap, 16 rounds
+   remap_combo pitch_to_pitch_off: accepted, 16 rounds; remap_verify=ok (0 bad words; want the plain pattern)
+   status: remap combination pitch_to_pitch_on starts: ...
+   remap_combo pitch_to_pitch_on: accepted, 16 rounds; remap_verify=ok (0 bad words; want the swapped pattern)
+   ... (bl_off, bl_dst_remap, bl_src_remap)
+
+   stage                                       n        min        avg        p50        p99        max
+   remap_off_pitch_to_pitch_us                16        ...
+   remap_on_pitch_to_pitch_us                 16        ...
+   remap_off_pitch_to_bl_us                   32        ...   (bl_off and bl_src_remap)
+   remap_on_pitch_to_bl_us                    16        ...   (bl_dst_remap)
+   remap_off_bl_to_pitch_us                   32        ...   (bl_off and bl_dst_remap)
+   remap_on_bl_to_pitch_us                    16        ...   (bl_src_remap)
+
+   copy_bytes=5760000 (1600x900, 4 bytes per pixel)
+   remap_gbps path=pitch_to_pitch off=... on=... on_vs_off=...%
+   remap_gbps path=pitch_to_bl off=... on=... on_vs_off=...%
+   remap_gbps path=bl_to_pitch off=... on=... on_vs_off=...%
+   remap_accepted: pitch_to_pitch_off=yes pitch_to_pitch_on=yes bl_off=yes bl_dst_remap=yes bl_src_remap=yes
+   remap_verify=ok (every combination that ran)
+   remap_open_question: REMAP with a block-linear source accepted, remap_verify=ok
+   RESULT PASS
+   ```
+
+3. **The open question alone** (`--bl-src-only`, which implies `--bl-roundtrip --remap swap-rb`): only
+   `bl_src_remap`: the pitch pattern into the block-linear image WITHOUT the remap (the M1b words), then the image into
+   the pitch destination WITH the remap. `remap_mode=bl-src-only`, the other combinations print `not-run`.
+
+The time rows are GPU time between the CE's own timestamps around each copy (not the CPU's view). `on_vs_off` is the
+remap-on rate as a percentage of the remap-off rate of the same path.
+
+On failure (run 2 or 3):
+- A combination the engine refuses raises an RC error on the tool's channel: `[FAIL] ce channel: channel error notifier
+  status 0x.. info32 0x.. (RC error)`, then `remap_combo <name>: NOT accepted after N rounds: ...`.
+- A hang (no completion within `--timeout-ms`) prints `remap_combo <name>: NOT accepted ...: completion not seen` and,
+  for a block-linear combination, whether the middle release landed (`seen`: the first copy finished, it stopped in the
+  BL -> pitch copy; `NOT seen`: it stopped in the pitch -> BL copy).
+- Either way the tool then gives the channel one more `--timeout-ms`, prints `ce channel error notifier: status 0x..
+  info32 0x..`, the completion value and USERD, the stage table of what completed, `remap_accepted:` with `NO` for the
+  combination and `not-run` for the rest, tears the channel down (schedule off, the TSG freed first) and prints
+  `RESULT FAIL ...`. A failing `bl_src_remap` also prints `remap_open_question: REMAP with a block-linear source was
+  NOT accepted on this engine; ...`.
+- Wrong data with no error: `remap_verify=BAD`, up to 8 `mismatch <combination> round R: offset .. (x X, y Y): want
+  0x.. got 0x.. (source 0x..)` lines per combination, and `RESULT FAIL remap combination <name> matches the ...
+  pattern`. `got` equal to `source` means the remap was not applied; `got` equal to `want` with the bytes in another
+  order means the components were selected differently.
+
+Pass criteria: `RESULT PASS`; `remap_accepted` all `yes`; `remap_verify=ok`; every `on_vs_off` at 90% or more (the
+remap costs at most about 10% of the throughput); the pitch rates near 28 GB/s (`copy_gbps_p50` of run 1). Send back
+the full output of the three runs.
 
 ## What to send back
 
