@@ -3523,7 +3523,8 @@ mirror, the present probe and the drains wait the copy's wire fence as before. T
 #### 24.13.5 Knob and counters
 
 `CopyQueue` (REG_DWORD in the service key, default 0; `diag::knobs::COPY_QUEUE`), read at every StartDevice before the Venus
-bring-up (the device is created with it), mirrored as `CqKnob`. Counters (`kmd_logic::copy_queue::COUNTERS`, all written by
+bring-up (the device is created with it), mirrored as `CqKnob`. 1 = the transfer queue; 2 = the transfer queue, and the family-0
+queue at high global priority (24.13.8). Counters (`kmd_logic::copy_queue::COUNTERS`, all written by
 `ddi/copy_queue.rs` only):
 
 | counter | meaning |
@@ -3534,6 +3535,8 @@ bring-up (the device is created with it), mirrored as `CqKnob`. Counters (`kmd_l
 | `CqGran` | its `minImageTransferGranularity`, width / height / depth one byte each |
 | `CqReady` | 1: the device has the transfer queue, bound to ring 2 |
 | `CqDevFall` | 1: `vkCreateDevice` refused the two-queue device at every tier, the one-queue device was made |
+| `CqPrio` | 1: the family-0 queue has `VK_QUEUE_GLOBAL_PRIORITY_HIGH` (`CopyQueue` 2) |
+| `CqPrioFall` | 1: `CopyQueue` 2 and the device refused the priority at every tier (made without it) |
 | `CqMain` / `CqXfer` | Present copies submitted on family 0 / on the transfer family (written once the knob is on) |
 | `CqFall` | of `CqMain`, copies the knob wanted on the transfer queue |
 | `CqWhy` / `CqMask` | last reason / every reason (bit `code - 1`): 1 no queue, 2 image destination, 3 conversion, 4 granularity |
@@ -3557,6 +3560,45 @@ Heaven. Pass: no visual difference (no torn, old or black window content, a GDI 
 `FlipPendWd` 0, no `WddmHeadMs` rebase, the host log free of virglrenderer `invalid ring_idx` / `sync_queue is already bound`
 lines, and `pnputil /restart-device` returns with the counters restarting.
 
+#### 24.13.8 Converting copies: the first hardware result and `CopyQueue` 2
+
+Package 22.22.346.1, windowed Heaven D3D11 1600x900 (`GuestBlob`, `BltAsync`, `ForeignCopy` on), `CopyQueue` 1: bring-up as
+designed (`CqFamN` 6, `CqFam` 1, `CqGran` 0x010101, `CqReady` 1), but `CqXfer` 0 and `CqFall` = `CqMain` = 15419 with `CqWhy` 3:
+every copy is a conversion. Heaven's NVK swap-chain image is `AB24` (`DRM_FORMAT_ABGR8888`, bytes `R G B A`, block-linear
+modifier 0x0300000000606014) and the destination (DWM's redirection surface) is BGRA, so the copy is a `vkCmdBlitImage`, which a
+transfer queue cannot run. The options considered:
+
+* **(a) A destination in the source's byte order.** The KMD does not choose the redirection surface's format: DWM creates it,
+  BGRA for every SDR windowed swap chain, and reads it as BGRA (its own Venus or NVK import, or the guest pages through
+  dxgkrnl's CPU view). Writing RGBA bytes into it shows red and blue swapped. Not possible from the KMD.
+* **(b) The conversion as a compute shader on the compute-only family.** On NVIDIA the compute-only family is not a separate
+  engine: its channels run on the same graphics engine (GR) as family 0 and the game, on GR's runlist. Between channel groups of
+  different processes that engine is time-sliced, which is exactly the wait measured on family 0 (the copy engine, family 1, has
+  its own runlist, which is why it escaped). So (b) would wait like family 0 does, and would bring a shader module, pipeline,
+  descriptor sets and storage-image usage on the imported foreign image (a new import shape) into the KMD for no expected gain.
+  Not done.
+* **(c) Transfer-only tricks.** No transfer command reorders bytes within a texel (image-to-buffer, image-to-image and
+  buffer-to-buffer copies are byte copies; aspect copies only extract planes). A CPU swap after a transfer-queue copy is the CPU
+  mirror this work removed. Not done.
+* **(d) Priority on the queue that must run it: `CopyQueue` 2 (implemented).** The converting copy has to run on the graphics
+  engine, so the lever is how long it waits there behind the game's channel group. `CopyQueue` 2 keeps everything of 1 and creates
+  the family-0 queue with `VkDeviceQueueGlobalPriorityCreateInfoKHR { VK_QUEUE_GLOBAL_PRIORITY_HIGH }` (device extension
+  `VK_KHR_global_priority`, which the host renderer allows; the struct rides the queue create info's pNext). One queue per family
+  0 entry, so the priority is the whole family-0 queue's: the scan-out copies and the other short KMD submissions get it too. Not
+  `REALTIME`: it needs privileges the sandboxed renderer lacks. A host that refuses the extension or the priority at every tier
+  gets the device of `CopyQueue` 1 (`CqPrioFall` 1), then, if that is refused too, the old one (`copy_queue::next_attempt`). The
+  routes do not change. Whether NVIDIA turns a high global priority into an earlier slot on GR for this channel group is the open
+  question this knob value answers on hardware.
+* **The real fix is upstream of the KMD:** present a BGRA image. If the producer's final present image (NVK / the D3D11 layer
+  above it) were `AR24` for a windowed swap chain, the copy would be a plain one and `CopyQueue` 1 would take it to the copy
+  engine with no other change (`CqWhy` would stop being 3). The format conversion would then happen in the game's own frame on
+  its own channel, where it costs no extra timeslice wait. This is outside the KMD and is left as a follow-up.
+
+Hardware rows for 2: as 24.13.6 with `CopyQueue` 2. Expect `CqPrio` 1 and `CqPrioFall` 0 (or `CqPrioFall` 1 if the host's NVIDIA
+driver refuses the priority, and then the row equals `CopyQueue` 1). `CqFall` and `CqWhy` 3 stay as they are (the copies are still
+conversions); the effect to look for is `BltAsyncLat` moving down from `Lat4` against the `CopyQueue` 1 row, `BltWaitUs/BltWaitN`
+dropping in the legacy arm, and no loss of game fps (the game's channel yields earlier to the copies).
+
 #### 24.13.7 Verified, and not
 
 * Verified (host tests): the family choice over the 5090 layout and others (by flags, never index 0, empty families, past the
@@ -3564,7 +3606,11 @@ lines, and `pnputil /restart-device` returns with the counters restarting.
   the granularity rule, the route table exhaustively (transfer only with a queue, a buffer, no blit, a legal region; the knob 0
   always family 0 with no fallback counted), the barrier family, the queue-switch rule, the counter names (listed = written by
   `ddi/copy_queue.rs`, nowhere else, the knob in `diag.rs`).
-* NOT verified: anything on hardware; that the host accepts the two-queue device and binds ring 2 (virglrenderer's
+* Also host-tested: the knob values, the three-way device ladder (priority dropped first, then the queue, then the old ladder),
+  and that the priority never changes a route.
+* NOT verified: anything on hardware for `CopyQueue` 2 (whether the host exposes `VK_KHR_global_priority` and grants HIGH, and
+  whether that shortens the wait on GR); for 1, anything beyond the first hardware row (24.13.8); that the host accepts the
+  two-queue device and binds ring 2 (virglrenderer's
   `vkr_queue_assign_ring_idx` allows rings 1 to 63 per context); the 5090's `minImageTransferGranularity` for family 1; that the
   copy engine's throughput under load matches the host measurement inside the VM; that the source's acquire from EXTERNAL on
   the transfer family behaves on NVIDIA as on family 0 (it is the same barrier with a different `dstQueueFamilyIndex`).
