@@ -899,6 +899,26 @@ const NVRM_OPS_ASKED: u64 = 1 << 63;
 /// # Safety
 /// `dev` is a live device (its callback table valid for the call).
 pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
+    // SAFETY: the caller's contract.
+    (unsafe { nvrm_supported_ops(dev) } & helios_protocol::HELIOS_NVRM_CAP_FLUSH_GATE) != 0
+}
+
+/// The copy-engine Present record (`'HEF3'`): NVRM `QUERY_CAPS.supported_ops`
+/// bit 37 (`HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3`), the KMD reads it.
+///
+/// # Safety
+/// `dev` is a live device (its callback table valid for the call).
+pub(crate) unsafe fn nvrm_rm_fence_tail_v3_capable(dev: &HeliosDevice) -> bool {
+    // SAFETY: the caller's contract.
+    (unsafe { nvrm_supported_ops(dev) } & helios_protocol::HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3) != 0
+}
+
+/// NVRM `QUERY_CAPS.supported_ops` (bit 63 set once asked), asked once per
+/// process through this device's escape callback.
+///
+/// # Safety
+/// `dev` is a live device (its callback table valid for the call).
+unsafe fn nvrm_supported_ops(dev: &HeliosDevice) -> u64 {
     let mut ops = NVRM_OPS.load(Ordering::Relaxed);
     if ops == 0 {
         ops = NVRM_OPS_ASKED;
@@ -927,7 +947,7 @@ pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
                 ops |= q.supported_ops;
             }
             log_error!(
-                "flush-gate: NVRM QUERY_CAPS hr=0x{:08x} status={} supported_ops=0x{:016x}",
+                "nvrm: QUERY_CAPS hr=0x{:08x} status={} supported_ops=0x{:016x}",
                 hr as u32,
                 q.head.status,
                 q.supported_ops
@@ -935,5 +955,5 @@ pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
         }
         NVRM_OPS.store(ops, Ordering::Relaxed);
     }
-    ops & helios_protocol::HELIOS_NVRM_CAP_FLUSH_GATE != 0
+    ops
 }
