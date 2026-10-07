@@ -202,6 +202,57 @@ struct Args {
     #[cfg(feature = "venus")]
     #[arg(long, requires = "venus")]
     venus_guest_blobs: bool,
+
+    /// Round-trip latency options (docs/research/host-roundtrip-latency.md),
+    /// a comma-separated list or `all`; none by default:
+    /// `quiet-held` (no interrupt for a kick that only held fenced chains),
+    /// `fused-submit` (a fenced SUBMIT_3D's submit and fence in one renderer
+    /// round trip), `direct-fences` (the renderer connection's reader
+    /// returns signalled chains itself), `event-batch` (the event thread
+    /// signals the guest once per pass and sweeps with one poll).
+    #[arg(long, value_name = "LIST", default_value = "", value_parser = Latency::parse)]
+    latency: Latency,
+
+    /// Keep every thread of the backend on these host CPUs (`0-7,16-23`):
+    /// docs/research/host-roundtrip-latency.md, "Placement".
+    #[arg(long, value_name = "LIST")]
+    cpus: Option<String>,
+}
+
+/// `--latency`: each option is off unless named.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Latency {
+    quiet_held: bool,
+    fused_submit: bool,
+    direct_fences: bool,
+    event_batch: bool,
+}
+
+impl Latency {
+    const NAMES: &'static str = "quiet-held, fused-submit, direct-fences, event-batch, all";
+
+    fn parse(list: &str) -> Result<Self, String> {
+        let mut l = Self::default();
+        for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            match name {
+                "quiet-held" => l.quiet_held = true,
+                "fused-submit" => l.fused_submit = true,
+                "direct-fences" => l.direct_fences = true,
+                "event-batch" => l.event_batch = true,
+                "all" => {
+                    l = Self {
+                        quiet_held: true,
+                        fused_submit: true,
+                        direct_fences: true,
+                        event_batch: true,
+                    }
+                }
+                "off" | "none" => l = Self::default(),
+                other => return Err(format!("unknown option {other:?} (known: {})", Self::NAMES)),
+            }
+        }
+        Ok(l)
+    }
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -408,17 +459,37 @@ fn sync_file_raw_status(fd: RawFd) -> Option<i32> {
 /// Returns false when the guest has posted none, which is the normal state of
 /// a guest whose driver predates this queue having a use -- and a reason to
 /// drop the notification rather than to fail.
+///
+/// With `batch` the guest is not interrupted here: the caller signals the
+/// queue once for everything it pushed in a pass ([`Batch`]).
 fn push_event(
     vring: &VringRwLock,
     mem: &GuestMemoryAtomic<GuestMemoryMmap>,
     handle: u32,
     status: i32,
+    batch: Option<&mut Batch>,
 ) -> bool {
     #[cfg(feature = "trace")]
     if device::trace::enabled() {
-        return push_event_traced(vring, mem, handle, status);
+        return push_event_traced(vring, mem, handle, status, batch);
     }
-    deliver_event(vring, mem, handle, status)
+    deliver_event(vring, mem, handle, status, batch)
+}
+
+/// `--latency event-batch`: chains put on the event queue in one pass of the
+/// event thread, for one interrupt at the end of it instead of one each
+/// (11,000 a second under a game, measured).
+#[derive(Default)]
+struct Batch {
+    pending: bool,
+}
+
+impl Batch {
+    fn signal(&mut self, vring: &VringRwLock) {
+        if std::mem::take(&mut self.pending) {
+            let _ = vring.signal_used_queue();
+        }
+    }
 }
 
 /// `push_event`, recorded: an `event` record whose latency is the time it
@@ -431,10 +502,11 @@ fn push_event_traced(
     mem: &GuestMemoryAtomic<GuestMemoryMmap>,
     handle: u32,
     status: i32,
+    batch: Option<&mut Batch>,
 ) -> bool {
     use device::trace::format::{Call, Kind, Record};
     let t0 = device::trace::now_ns();
-    let delivered = deliver_event(vring, mem, handle, status);
+    let delivered = deliver_event(vring, mem, handle, status, batch);
     device::trace::emit(Record {
         ts_ns: t0,
         handle,
@@ -452,6 +524,7 @@ fn deliver_event(
     mem: &GuestMemoryAtomic<GuestMemoryMmap>,
     handle: u32,
     status: i32,
+    batch: Option<&mut Batch>,
 ) -> bool {
     let guard = mem.memory();
     let mut vr = vring.get_mut();
@@ -472,7 +545,12 @@ fn deliver_event(
     if vring.add_used(head, written as u32).is_err() {
         return false;
     }
-    let _ = vring.signal_used_queue();
+    match batch {
+        Some(b) => b.pending = true,
+        None => {
+            let _ = vring.signal_used_queue();
+        }
+    }
     written > 0
 }
 
@@ -770,7 +848,18 @@ impl ReleaseSink for VqReleaseSink {
 /// event, which happens through an ioctl this thread never sees. Re-arming on
 /// a timer costs a duplicate notification at worst, and the guest answers one
 /// by waking, finding nothing, and waiting again.
-fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<GuestMemoryMmap>) {
+///
+/// `batch` (`--latency event-batch`): one interrupt per pass for everything
+/// the pass put on the queue, and the sweep asks every descriptor in one
+/// `poll` instead of one `poll` each (about 400 a millisecond under a game,
+/// measured: 500,000 system calls a second).
+fn event_pump(
+    rx: Receiver<Watch>,
+    vring: VringRwLock,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    batch: bool,
+) {
+    let mut pass = Batch::default();
     // How often to re-check a descriptor that is still readable. See the
     // sweep below; this is a safety net, not the notification path.
     const SWEEP: Duration = Duration::from_millis(1);
@@ -841,12 +930,14 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                             // Reported once and never watched, as the sweep
                             // would do for a signalled fence.
                             let status = sync_file_status(fd.as_raw_fd());
-                            if push_event(&vring, &mem, handle, status) {
+                            if push_event(&vring, &mem, handle, status, batch.then_some(&mut pass))
+                            {
                                 ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
                                 continue;
                             }
                         }
-                        if ready && push_event(&vring, &mem, handle, 0) {
+                        if ready && push_event(&vring, &mem, handle, 0, batch.then_some(&mut pass))
+                        {
                             last_report.insert(handle as u64, Instant::now());
                         }
                         watched.insert(handle as u64, fd);
@@ -874,7 +965,49 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
         // told within REPEAT. A lost wake costs a sixteenth of a frame at
         // 60 Hz rather than a hang.
         let mut reported: Vec<u64> = Vec::new();
-        if last_sweep.elapsed() >= SWEEP {
+        if batch && last_sweep.elapsed() >= SWEEP {
+            let now = Instant::now();
+            last_sweep = now;
+            let due: Vec<u64> = watched
+                .keys()
+                .copied()
+                .filter(|h| {
+                    !last_report
+                        .get(h)
+                        .is_some_and(|&t| now.duration_since(t) < REPEAT)
+                })
+                .collect();
+            let mut pfds: Vec<libc::pollfd> = due
+                .iter()
+                .map(|h| libc::pollfd {
+                    fd: watched[h].as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect();
+            // SAFETY: pfds is a live array of pfds.len() pollfds on
+            // descriptors `watched` keeps open for the call.
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+            if n > 0 {
+                for (&handle, p) in due.iter().zip(&pfds) {
+                    if p.revents & libc::POLLIN == 0 {
+                        continue;
+                    }
+                    let status = if once.contains(&handle) {
+                        sync_file_status(p.fd)
+                    } else {
+                        0
+                    };
+                    if push_event(&vring, &mem, handle as u32, status, Some(&mut pass)) {
+                        if once.contains(&handle) {
+                            reported.push(handle);
+                        } else {
+                            last_report.insert(handle, now);
+                        }
+                    }
+                }
+            }
+        } else if last_sweep.elapsed() >= SWEEP {
             let now = Instant::now();
             last_sweep = now;
             for (&handle, fd) in watched.iter() {
@@ -895,7 +1028,7 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                     } else {
                         0
                     };
-                    if push_event(&vring, &mem, handle as u32, status) {
+                    if push_event(&vring, &mem, handle as u32, status, None) {
                         if once.contains(&handle) {
                             reported.push(handle);
                         } else {
@@ -906,6 +1039,7 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
             }
         }
 
+        pass.signal(&vring);
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
         let n = unsafe {
             libc::epoll_wait(
@@ -937,7 +1071,7 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                 Some(fd) if fence => sync_file_status(fd.as_raw_fd()),
                 _ => 0,
             };
-            if !push_event(&vring, &mem, handle, status) {
+            if !push_event(&vring, &mem, handle, status, batch.then_some(&mut pass)) {
                 // A fence stays in the set, and the sweep sends it again.
                 log::debug!("event pump: no buffer posted for handle {handle}; dropped");
             } else if fence {
@@ -946,6 +1080,7 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                 last_report.insert(handle as u64, Instant::now());
             }
         }
+        pass.signal(&vring);
         // A fence the guest has heard about is done here. Its descriptor
         // stays open until the guest closes the handle.
         for handle in reported {
@@ -967,6 +1102,49 @@ fn deliver_completions(
     mem: &GuestMemoryMmap,
 ) -> bool {
     let done = nvidia.lock().expect("backend mutex").venus_completions();
+    return_chains(done, held, vring, mem)
+}
+
+/// `--latency direct-fences`: what the renderer connection's reader thread
+/// runs as soon as signalled fences arrive, instead of waking the fence pump
+/// (one thread hop fewer). It never waits for the backend lock: the queue
+/// thread may hold it while it waits for this very reader to bring a reply,
+/// so a busy lock leaves the fences to the pump, as without the option.
+#[cfg(feature = "venus")]
+fn fence_hook(
+    nvidia: std::sync::Weak<Mutex<NvidiaBackend>>,
+    held: HeldChains,
+    vring: VringRwLock,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+) -> conduit_venus::FenceHook {
+    Box::new(move || {
+        let Some(nvidia) = nvidia.upgrade() else {
+            return false;
+        };
+        let done = match nvidia.try_lock() {
+            Ok(mut n) => {
+                // A lost renderer is the pump's to report and stop on.
+                if n.venus_lost() {
+                    return false;
+                }
+                n.venus_completions()
+            }
+            Err(_) => return false,
+        };
+        return_chains(done, &held, &vring, &mem.memory());
+        true
+    })
+}
+
+/// Write each completion's response and put its chain on the used ring,
+/// then interrupt the guest once. Returns whether any chain went back.
+#[cfg(feature = "venus")]
+fn return_chains(
+    done: Vec<device::venus::Completion>,
+    held: &HeldChains,
+    vring: &VringRwLock,
+    mem: &GuestMemoryMmap,
+) -> bool {
     if done.is_empty() {
         return false;
     }
@@ -1100,6 +1278,8 @@ struct NvGpuBackend {
     /// and two more locks of the backend.
     #[cfg(feature = "venus")]
     gpu_cmd_seen: bool,
+    /// `--latency`.
+    latency: Latency,
     /// Venus, with `--venus`: the size of region 3 (0 without), and the
     /// fenced chains waiting for their fences.
     #[cfg(feature = "venus")]
@@ -1224,6 +1404,7 @@ impl NvGpuBackend {
             watch_dirty: true,
             #[cfg(feature = "venus")]
             gpu_cmd_seen: false,
+            latency: Latency::default(),
             #[cfg(feature = "venus")]
             venus: VenusChains::default(),
         })
@@ -1237,6 +1418,7 @@ impl NvGpuBackend {
         renderer: Box<dyn conduit_venus::Renderer>,
         hostmem_len: u64,
         guest_blobs: bool,
+        fused_submit: bool,
     ) {
         let display = ({ self.config.features } & protocol::messages::NVGPU_CFG_DISPLAY != 0)
             .then_some(device::display::DisplayMode {
@@ -1246,6 +1428,7 @@ impl NvGpuBackend {
             });
         self.config.set_venus();
         let mut venus = device::venus::Venus::new(renderer, hostmem_len, display);
+        venus.set_fused_submit(fused_submit);
         if venus.rm_import() {
             self.config.set_rm_import();
         }
@@ -1278,6 +1461,26 @@ impl NvGpuBackend {
             return;
         };
         let (nvidia, held, vring) = (self.nvidia.clone(), self.venus.held.clone(), vring.clone());
+        if self.latency.direct_fences {
+            let hook = fence_hook(
+                Arc::downgrade(&nvidia),
+                held.clone(),
+                vring.clone(),
+                atomic.clone(),
+            );
+            let on = nvidia
+                .lock()
+                .expect("backend mutex")
+                .venus_set_fence_hook(hook);
+            log::info!(
+                "venus: direct fences {}",
+                if on {
+                    "on"
+                } else {
+                    "not supported by the renderer"
+                }
+            );
+        }
         std::thread::Builder::new()
             .name("nvgpu-fences".into())
             .spawn(move || fence_pump(fd, nvidia, held, vring, atomic))
@@ -1310,9 +1513,10 @@ impl NvGpuBackend {
             };
             *self.input_target.lock().expect("event target") = Some((vring.clone(), mem.clone()));
             let (tx, rx) = channel();
+            let batch = self.latency.event_batch;
             std::thread::Builder::new()
                 .name("nvgpu-events".into())
-                .spawn(move || event_pump(rx, vring, mem))
+                .spawn(move || event_pump(rx, vring, mem, batch))
                 .map(|_| self.watches = Some(tx))
                 .unwrap_or_else(|e| log::error!("event pump would not start: {e}"));
         }
@@ -1470,7 +1674,11 @@ impl NvGpuBackend {
                             r.reply_ns = device::trace::now_ns().saturating_sub(t_recv);
                             device::trace::emit(r);
                         }
-                        used = true;
+                        // Nothing went on the used ring. Without quiet-held
+                        // the kick still interrupts the guest, which then
+                        // finds nothing: one empty interrupt per fenced
+                        // submit (docs/research/host-roundtrip-latency.md).
+                        used |= !self.latency.quiet_held;
                         self.served = true;
                         continue;
                     }
@@ -1838,6 +2046,12 @@ fn disconnect_is_ok(e: vhost_user_backend::Error) -> Result<(), vhost_user_backe
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    // Before any thread is started, so every one inherits it.
+    if let Some(list) = &args.cpus {
+        let n = device::affinity::pin_process(list)
+            .map_err(|e| anyhow::anyhow!("--cpus {list}: {e}"))?;
+        log::info!("pinned to CPUs {list} ({n} CPUs)");
+    }
     // Before the sandbox and before any device: sysfs and CPUID only.
     let (window_mib, window_why) = window_mib(&args);
     if args.print_window_mib {
@@ -2003,7 +2217,6 @@ fn main() -> anyhow::Result<()> {
              the firmware may leave the device's BAR unassigned"
         );
     }
-    #[allow(unused_mut)]
     let mut nvgpu = NvGpuBackend::new(
         &args.proc_nvidia,
         args.allow_nearest_abi,
@@ -2019,11 +2232,20 @@ fn main() -> anyhow::Result<()> {
     if args.venus {
         let len = device::shm_regions::venus_hostmem_len(args.venus_hostmem_mib)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
-        nvgpu.enable_venus(venus_renderer(&args)?, len, args.venus_guest_blobs);
+        nvgpu.enable_venus(
+            venus_renderer(&args)?,
+            len,
+            args.venus_guest_blobs,
+            args.latency.fused_submit,
+        );
         log::info!(
             "venus: serving GpuCmd, region 3 {} MiB",
             args.venus_hostmem_mib
         );
+    }
+    nvgpu.latency = args.latency;
+    if args.latency != Latency::default() {
+        log::info!("latency options: {:?}", args.latency);
     }
     let backend = Arc::new(RwLock::new(nvgpu));
     #[cfg(feature = "trace")]
@@ -2178,6 +2400,17 @@ mod tests {
         // be the Linux module.
         claims.saw_request(MsgType::GetSysFiles as u32);
         assert!(!sink.takes_input(), "Windows NVK is not the Linux module");
+    }
+
+    #[test]
+    fn latency_options_parse() {
+        assert_eq!(Latency::parse("").unwrap(), Latency::default());
+        let l = Latency::parse("quiet-held, event-batch").unwrap();
+        assert!(l.quiet_held && l.event_batch && !l.fused_submit && !l.direct_fences);
+        let all = Latency::parse("all").unwrap();
+        assert!(all.quiet_held && all.fused_submit && all.direct_fences && all.event_batch);
+        assert_eq!(Latency::parse("all,off").unwrap(), Latency::default());
+        assert!(Latency::parse("fast").is_err());
     }
 
     /// A fence's status rides in the header, signed, as the guest reads it.

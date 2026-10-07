@@ -186,9 +186,18 @@ extern "C" fn write_fence(_cookie: *mut c_void, _fence: u32) {
     // Context-0 fences belong to vrend, which is not built.
 }
 
+/// [`Renderer::set_fence_sink`]: when set, fences go straight to it from the
+/// sync thread that retires them instead of through [`FENCES`].
+static SINK: std::sync::OnceLock<crate::FenceSink> = std::sync::OnceLock::new();
+
 extern "C" fn write_context_fence(_cookie: *mut c_void, ctx_id: u32, ring_idx: u32, fence_id: u64) {
     // Runs on a virglrenderer thread: no panics across the FFI boundary, so a
     // poisoned lock is used as is.
+    if let Some(sink) = SINK.get() {
+        sink(Signalled { ctx_id, ring_idx, fence_id });
+        fence_latency((ctx_id, ring_idx, fence_id));
+        return;
+    }
     FENCES.lock().unwrap_or_else(|p| p.into_inner()).push(Signalled { ctx_id, ring_idx, fence_id });
     fence_latency((ctx_id, ring_idx, fence_id));
     let fd = EVENT.load(Ordering::Acquire);
@@ -464,6 +473,12 @@ impl Renderer for Virgl {
 
     fn tick(&mut self) -> Option<std::time::Duration> {
         flush_latency()
+    }
+
+    /// The sink is set once per process, before the first fence: fences
+    /// already queued in [`FENCES`] still go out through `signalled`.
+    fn set_fence_sink(&mut self, sink: crate::FenceSink) -> bool {
+        SINK.set(sink).is_ok()
     }
 
     fn features(&mut self) -> u32 {

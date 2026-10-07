@@ -76,6 +76,13 @@ impl NvidiaBackend {
             .unwrap_or_default()
     }
 
+    /// `--latency direct-fences`: run `hook` when fences arrive (see
+    /// [`conduit_venus::Renderer::set_fence_hook`]). False without Venus or
+    /// when the renderer cannot.
+    pub fn venus_set_fence_hook(&mut self, hook: conduit_venus::FenceHook) -> bool {
+        self.venus.as_mut().is_some_and(|v| v.set_fence_hook(hook))
+    }
+
     /// The Venus renderer is gone for good (see [`crate::venus::Venus::is_lost`]).
     pub fn venus_lost(&self) -> bool {
         self.venus.as_ref().is_some_and(|v| v.is_lost())

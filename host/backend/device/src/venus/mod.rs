@@ -164,6 +164,8 @@ pub struct Venus {
     /// Whether a renderer descriptor is a dma-buf (`rm::is_dmabuf`); a
     /// stand-in in tests, whose mock renderer hands out memfds.
     is_dmabuf: fn(BorrowedFd<'_>) -> bool,
+    /// `--latency fused-submit` ([`Venus::set_fused_submit`]).
+    fused_submit: bool,
 }
 
 impl Venus {
@@ -205,6 +207,7 @@ impl Venus {
             lost: false,
             lose_pending: false,
             counts: BTreeMap::new(),
+            fused_submit: false,
         }
     }
 
@@ -228,6 +231,18 @@ impl Venus {
     /// then calls [`Venus::completions`].
     pub fn fence_fd(&self) -> BorrowedFd<'_> {
         self.renderer.fence_fd()
+    }
+
+    /// `--latency fused-submit`: a fenced `SUBMIT_3D` goes to the renderer as
+    /// one call with its fence ([`conduit_venus::Renderer::submit_fenced`]),
+    /// one round trip instead of two while the queue thread waits.
+    pub fn set_fused_submit(&mut self, yes: bool) {
+        self.fused_submit = yes;
+    }
+
+    /// See [`conduit_venus::Renderer::set_fence_hook`].
+    pub fn set_fence_hook(&mut self, hook: conduit_venus::FenceHook) -> bool {
+        self.renderer.set_fence_hook(hook)
     }
 
     /// Fenced chains still waiting for the renderer.
@@ -294,6 +309,14 @@ impl Venus {
             return Outcome::Done(transport_err(resp, libc::EINVAL));
         };
         self.refusal_errno = None;
+        if self.fused_submit
+            && !self.lost
+            && hdr.ty == CMD_SUBMIT_3D
+            && hdr.fenced()
+            && hdr.ring() < MAX_RINGS
+        {
+            return self.submit_fenced(&hdr, payload, resp, env);
+        }
         let answer = if self.lost {
             Err(RESP_ERR_UNSPEC)
         } else if hdr.fenced() && hdr.ring() >= MAX_RINGS {
@@ -358,6 +381,72 @@ impl Venus {
                     h.padding = errno_padding(errno);
                 }
                 Outcome::Done(reply(resp, &h, &[]))
+            }
+        }
+    }
+
+    /// A fenced `SUBMIT_3D` with `fused-submit`: the same checks and answers
+    /// as `serve` and the fence step of `dispatch`, but the submit and the
+    /// fence reach the renderer as one call.
+    fn submit_fenced(&mut self, hdr: &CtrlHdr, b: &[u8], resp: &mut [u8], env: Env<'_>) -> Outcome {
+        let checked = match Submit3d::from_bytes(b) {
+            Some(s) if b.len() == Submit3d::LEN + s.size as usize => {
+                if self.contexts.contains(&hdr.ctx_id) {
+                    Ok(&b[Submit3d::LEN..])
+                } else {
+                    Err(RESP_ERR_INVALID_CONTEXT_ID)
+                }
+            }
+            _ => Err(RESP_ERR_UNSPEC),
+        };
+        let fail = |me: &mut Self, resp: &mut [u8], e: u32| {
+            me.count(err_name(e));
+            log::debug!(
+                "venus: command {:#06x} ctx {} ({} bytes) -> {}",
+                hdr.ty,
+                hdr.ctx_id,
+                b.len(),
+                err_name(e)
+            );
+            if std::mem::take(&mut me.lose_pending) {
+                me.lose(env);
+            }
+            Outcome::Done(reply(resp, &hdr.response(e), &[]))
+        };
+        let commands = match checked {
+            Ok(c) => c,
+            Err(e) => return fail(self, resp, e),
+        };
+        self.count("submit_3d");
+        match self
+            .renderer
+            .submit_fenced(hdr.ctx_id, commands, hdr.ring(), hdr.fence_id)
+        {
+            Ok(()) => {
+                log::debug!(
+                    "venus: command {:#06x} ctx {} ({} bytes) -> ok",
+                    hdr.ty,
+                    hdr.ctx_id,
+                    b.len()
+                );
+                Outcome::Held(self.fences.hold(hdr))
+            }
+            Err(conduit_venus::FencedError::Submit(e)) => {
+                let code = self.renderer_error(&e);
+                fail(self, resp, code)
+            }
+            Err(conduit_venus::FencedError::Fence(e)) => {
+                log::warn!(
+                    "venus: fence {} on ctx {} ring {}: {e}",
+                    hdr.fence_id,
+                    hdr.ctx_id,
+                    hdr.ring()
+                );
+                self.renderer_error(&e);
+                if std::mem::take(&mut self.lose_pending) {
+                    self.lose(env);
+                }
+                Outcome::Done(reply(resp, &hdr.response(RESP_ERR_UNSPEC), &[]))
             }
         }
     }
