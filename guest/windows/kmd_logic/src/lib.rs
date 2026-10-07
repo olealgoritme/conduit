@@ -59,6 +59,8 @@ pub mod present_foreign;
 pub mod onscanout;
 pub mod blt_async;
 pub mod guest_blob;
+pub mod submit_stage;
+pub mod kick_defer;
 pub mod ce_present;
 pub mod rm_ce_channel;
 pub mod ce_record;
