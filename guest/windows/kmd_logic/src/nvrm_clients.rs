@@ -124,12 +124,17 @@ struct Slot {
     /// The backend file handle the client was allocated through: the host closes the
     /// client when that file closes, so the entry goes with it.
     via: u32,
+    /// The process the owner's device belongs to (its `hKmdProcess` token, captured by the
+    /// escape that allocated the client); 0 when unknown. Read by the copy-engine Present
+    /// route's `h_client` rule ([`ClientTable::process_of`]).
+    process: usize,
 }
 
 const EMPTY: Slot = Slot {
     owner: 0,
     client: 0,
     via: 0,
+    process: 0,
 };
 
 /// What [`ClientTable::commit`] did.
@@ -201,6 +206,21 @@ impl ClientTable {
                 .any(|s| s.owner == owner && s.client == client)
     }
 
+    /// The process that `client` was made for: the `hKmdProcess` token recorded with it, or
+    /// `None` when the client is not recorded (hardening off, a full table, a client of the
+    /// KMD's own) or its process is unknown. RM never has two live clients of one number
+    /// ([`commit_in`](Self::commit_in) evicts a stale one), so at most one slot matches.
+    pub fn process_of(&self, client: u32) -> Option<usize> {
+        if client == 0 {
+            return None;
+        }
+        self.live()
+            .iter()
+            .find(|s| s.client == client)
+            .map(|s| s.process)
+            .filter(|p| *p != 0)
+    }
+
     /// Promise a slot to a client allocation about to be forwarded, so a full table
     /// refuses BEFORE the host makes a client nobody tracks. `false`: no room (table or
     /// the owner's quota, reservations in flight counted).
@@ -213,6 +233,7 @@ impl ClientTable {
             owner,
             client: 0,
             via: 0,
+            process: 0,
         };
         self.used += 1;
         true
@@ -243,6 +264,21 @@ impl ClientTable {
     /// owner, which this consumes (success or not); without one (log-only mode records
     /// opportunistically) another request's promise is left alone.
     pub fn commit(&mut self, owner: usize, via: u32, client: u32, reserved: bool) -> Commit {
+        self.commit_in(owner, 0, via, client, reserved)
+    }
+
+    /// [`commit`](Self::commit), also recording the process `owner`'s device belongs to
+    /// (`process`, its `hKmdProcess` token; 0 when unknown). An owner is one device, so its
+    /// process never changes; a known client whose recorded process disagrees becomes unknown
+    /// (the safe direction for [`process_of`](Self::process_of)).
+    pub fn commit_in(
+        &mut self,
+        owner: usize,
+        process: usize,
+        via: u32,
+        client: u32,
+        reserved: bool,
+    ) -> Commit {
         if reserved {
             self.take_reservation(owner);
         }
@@ -256,6 +292,9 @@ impl ClientTable {
             if s.client == client {
                 if s.owner == owner {
                     self.slots[i].via = via;
+                    if s.process != process {
+                        self.slots[i].process = 0;
+                    }
                     return Commit::Known;
                 }
                 // RM never has two live clients of one number: the other owner's
@@ -270,7 +309,12 @@ impl ClientTable {
         if self.used >= MAX_CLIENTS || self.count_for(owner) >= MAX_CLIENTS_PER_OWNER {
             return Commit::Refused;
         }
-        self.slots[self.used] = Slot { owner, client, via };
+        self.slots[self.used] = Slot {
+            owner,
+            client,
+            via,
+            process,
+        };
         self.used += 1;
         if evicted {
             Commit::Evicted
@@ -1192,6 +1236,35 @@ mod tests {
         assert_eq!(t.clear(), 1);
         assert!(!t.is_client_owned_by(B, CB));
         assert!(t.is_empty());
+    }
+
+    /// The copy-engine route's `h_client` rule reads the process recorded with a client.
+    #[test]
+    fn a_client_names_the_process_it_was_made_for() {
+        const P: usize = 0xffff_8000_1234_0000;
+        const Q: usize = 0xffff_8000_5678_0000;
+        let mut t = ClientTable::new();
+        assert!(t.reserve(A));
+        assert_eq!(t.process_of(0), None);
+        assert_eq!(t.commit_in(A, P, 1, 0x10, true), Commit::Recorded);
+        assert_eq!(t.process_of(0x10), Some(P));
+        // A reservation names no client and no process.
+        assert!(t.reserve(B));
+        assert_eq!(t.process_of(0), None);
+        t.cancel(B);
+        // The old entry point records no process: unknown, never someone's.
+        assert_eq!(t.commit(B, 1, 0x20, false), Commit::Recorded);
+        assert_eq!(t.process_of(0x20), None);
+        // RM minting 0x10 again for another owner evicts the stale entry and its process.
+        assert_eq!(t.commit_in(B, Q, 2, 0x10, false), Commit::Evicted);
+        assert_eq!(t.process_of(0x10), Some(Q));
+        // A known client whose process disagrees becomes unknown.
+        assert_eq!(t.commit_in(B, P, 2, 0x10, false), Commit::Known);
+        assert_eq!(t.process_of(0x10), None);
+        // Forgetting the owner forgets the process.
+        assert_eq!(t.commit_in(A, P, 1, 0x30, false), Commit::Recorded);
+        assert_eq!(t.forget_owner(A), 1);
+        assert_eq!(t.process_of(0x30), None);
     }
 
     #[test]

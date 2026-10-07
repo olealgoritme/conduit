@@ -239,6 +239,8 @@ fn start_generation_mirrors() {
     crate::ddi::ce_record::reset_for_start();
     // The display submit stage counters (`Sub*`, docs 24.14): zeroed, block written once.
     crate::virtio::submit_stage::reset_for_start();
+    // The copy-engine Present route (M3c-2): `CeRt*` zeroed (written only with the knob at 1).
+    crate::ddi::ce_present_route::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();
@@ -455,7 +457,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // that ran first has retired them already; one spinlock lookup then, and with the knob 0).
     crate::ddi::guest_blob::retire_all_for_stop(passive, adapter, &live_budget);
     // `RmCopyEngine`: a copy-engine channel of the old generation is freed while it still answers
-    // (one load when there is none: always, with the knob at 0).
+    // (one load when there is none: always, with the knob at 0); the Present route's destination
+    // descriptors and producer dups first (one load when it holds nothing).
+    crate::ddi::ce_present_route::retire_for_stop(passive, adapter, &live_budget);
     crate::virtio::rm_client::ce_channel::retire_for_stop(passive, adapter, &live_budget);
     crate::virtio::nvrm::retire_transport(passive, adapter, &live_budget);
     start_generation_mirrors();
@@ -825,7 +829,10 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         crate::ddi::guest_blob::retire_all_for_stop(passive_stop, adapter, &budget);
         // `RmCopyEngine`: the copy-engine channel (schedule off, the channel group, its memory, the
         // doorbell, the VA space, the client) is freed before the transport reset, on the same
-        // budget; the worker that could use it is joined. One load when there is none.
+        // budget; the worker that could use it is joined. One load when there is none. The
+        // Present route's destination descriptors and producer dups go first (one load when it
+        // holds nothing).
+        crate::ddi::ce_present_route::retire_for_stop(passive_stop, adapter, &budget);
         crate::virtio::rm_client::ce_channel::retire_for_stop(passive_stop, adapter, &budget);
 
         // Tear down the venus client + page-table blob + context BEFORE dropping
