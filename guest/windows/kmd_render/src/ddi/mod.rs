@@ -30,6 +30,7 @@ pub(crate) mod flip_lat;
 pub(crate) mod indep_flip;
 pub(crate) mod flush_trace;
 pub(crate) mod guest_blob;
+pub(crate) mod copy_queue;
 mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;

@@ -135,6 +135,7 @@ impl VirtioGpu {
         venus_len: usize,
         resource_id: u32,
         source_id: u32,
+        ring_idx: u32,
     ) -> Result<BltEnq, (DmaBuffer, DmaBuffer, VirtioError)> {
         if !self.blt_async.table.has_room() {
             return Err((meta, venus, VirtioError::QueueFull));
@@ -161,9 +162,11 @@ impl VirtioGpu {
         // WindowedBlt snapshot's: a consumer of the ledger (the UMD) sees the source busy. A
         // full ledger leaves the copy unledgered (loud in `RdOvf`, never a refusal).
         let ticket = adapter.read_ledger.issue(source_id);
+        // `ring_idx`: the ring of the copy's queue (1, or the `CopyQueue` transfer ring). The
+        // table's hand-back counts writers and does not depend on completion order across rings.
         match self.enqueue_submit_inner(
             ctx_id,
-            SCANOUT_RING_IDX,
+            ring_idx,
             meta,
             venus,
             venus_len,

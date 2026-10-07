@@ -1208,6 +1208,13 @@ pub mod knobs {
     /// does nothing. Read at every StartDevice; mirrored as `GbKnob`.
     /// `docs/zero-copy-present.md` section 24.12.
     pub const GUEST_BLOB: KnobName = KnobName::new(b"GuestBlob");
+    /// `CopyQueue` (default 0 = the previous behaviour: one queue, family 0). 1: the KMD's Venus
+    /// device also gets a queue on a transfer-only family (chosen from the queue family
+    /// properties, bound to ring 2), and the windowed Present copies a transfer queue can run (a
+    /// plain image-to-buffer copy into a standard buffer or its guest blob, foreign sources
+    /// included) go there instead of waiting for graphics-engine timeslices. Read at every
+    /// StartDevice (device creation); mirrored as `CqKnob`. `docs/zero-copy-present.md` 24.13.
+    pub const COPY_QUEUE: KnobName = KnobName::new(b"CopyQueue");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
