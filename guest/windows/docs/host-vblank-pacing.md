@@ -255,7 +255,7 @@ Why `sent_ns` and `present_ns` and not a host-to-guest clock offset: see 4.3.
 
 Negotiation and acks (the same shape as `NVGPU_F_SCANOUT_RELEASE`, `docs/foreign-scanout.md` "Buffer release"):
 
-* feature bit: `NVGPU_F_HOST_VBLANK` = virtio feature bit 16 (`kmd_logic::host_vblank::FEATURE`). Allocation check:
+* feature bit: `NVGPU_F_HOST_VBLANK` = virtio feature bit 17 (`kmd_logic::host_vblank::FEATURE`). Allocation check:
   `protocol/src/features.rs` uses 12 (`TAKES_INPUT`, never acked by this driver) and 15 (`SCANOUT_RELEASE`) of the
   Conduit bits, plus the standard virtio-gpu bits 0..4 and transport bits 28, 29, 32, 40; the host's config
   `features` word is a different space (its bits 8 to 11, 13, 14 are used, 12 and 15 skipped on purpose). No local branch
@@ -533,7 +533,7 @@ constant is the only other place.
    * the `VSYNC` flag of the event is the AND of its samples'; an event whose samples are all non-VSYNC is not sent;
    * `refresh_mhz`: the output's nominal refresh from the latest presentation's `refresh` field (the viewer's
      `EV_SURFACE.w0` already carries it), 0 unknown.
-5. Delivery (`conduit-backend.rs`, beside `VqReleaseSink`): offer `NVGPU_F_HOST_VBLANK` (virtio feature bit 16) in
+5. Delivery (`conduit-backend.rs`, beside `VqReleaseSink`): offer `NVGPU_F_HOST_VBLANK` (virtio feature bit 17) in
    `features()` whenever the backend has a display (like release); send only while a client with the capability exists; record the ack in `acked_features` (as
    `set_release_enabled`); write `HostVblank` into a posted buffer exactly as `VqReleaseSink::released` does (`add_used`,
    one `signal_used_queue` per batch); DROP when no buffer is posted or fewer than 4 remain; count drops into `lost`. No

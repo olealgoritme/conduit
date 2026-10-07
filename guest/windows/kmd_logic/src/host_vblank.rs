@@ -39,10 +39,10 @@ use crate::vsync_deadline;
 /// `RmResourceImport` (31) is used. The host session may renumber; the guest constant is the only
 /// other place.
 pub const MSG_HOST_VBLANK: u32 = 32;
-/// Proposed device feature bit (`NVGPU_F_HOST_VBLANK`, virtio feature bit 16): the next free bit
+/// Proposed device feature bit (`NVGPU_F_HOST_VBLANK`, virtio feature bit 17): the next free bit
 /// after `NVGPU_F_SCANOUT_RELEASE` (15). Bit 12 is `TAKES_INPUT` (never acked by this driver); the
 /// config `features` word is a different space (its bits 8..14 are used, 15 is skipped).
-pub const FEATURE_BIT: u32 = 16;
+pub const FEATURE_BIT: u32 = 17;
 /// [`FEATURE_BIT`] as a mask over the 64-bit virtio feature word.
 pub const FEATURE: u64 = 1 << FEATURE_BIT;
 /// The wire layout's version. A different version is dropped and counted, not guessed at.
@@ -1096,7 +1096,7 @@ mod tests {
         assert_eq!(HEADER_BYTES + BODY_FIXED_BYTES, 64);
         assert_eq!(MAX_MSG_BYTES, 192);
         assert!(MAX_MSG_BYTES <= 256, "a posted event buffer is 256 bytes");
-        assert_eq!(FEATURE, 1 << 16);
+        assert_eq!(FEATURE, 1 << 17);
         assert_eq!(MSG_HOST_VBLANK, 32);
     }
 
@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn the_feature_bit_collides_with_no_protocol_feature() {
-        assert_eq!(FEATURE_BIT, 16);
+        assert_eq!(FEATURE_BIT, 17);
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../protocol/src/features.rs");
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -2327,7 +2327,7 @@ mod tests {
         }
         // The documented defaults are the code's.
         assert!(text.contains("proposed value 32"));
-        assert!(text.contains("virtio feature bit 16"));
+        assert!(text.contains("virtio feature bit 17"));
         assert!(text.contains(&std::format!("(default {HOLD_MS_DEFAULT},")));
     }
 
