@@ -391,20 +391,9 @@ struct LiveMap {
     length: u64,
 }
 
-/// `NvKmsIoctlCommand::NVKMS_IOCTL_REGISTER_SURFACE`, the one that names the
-/// memory it registers by a file descriptor. Its enum index moves between
-/// releases (nvkms-api.h): 16 in 535, 17 from 580 through 610, 16 again in
-/// 615. Read with the wrong index, the fd goes to the host untranslated, NVKMS
-/// fails the call (-EPERM) and NVIDIA's EGL crashes importing a dma-buf.
-fn nvkms_register_surface(v: Option<abi::version::DriverVersion>) -> u32 {
-    use abi::version::DriverVersion as V;
-    match v {
-        Some(v) if v >= V::new(580, 0, 0) && v < V::new(615, 0, 0) => 17,
-        _ => 16,
-    }
-}
-/// `NVKMS_IOCTL_QUERY_DISP`. Third in the enum since NVKMS's first release;
-/// the commands that moved (see above) all come after it.
+/// `NVKMS_IOCTL_QUERY_DISP`'s number, for tests that build one. The backend
+/// itself takes it from `abi::nvkms`.
+#[cfg(test)]
 const NVKMS_QUERY_DISP: u32 = 2;
 /// `sizeof(struct NvKmsQueryDispRequest)`: a device handle and a disp handle.
 /// The reply follows it and is the part whose size varies between releases.
@@ -648,6 +637,7 @@ impl NvidiaBackend {
             .filter(|v| abi::rmallow::select(*v).is_some_and(|s| s.exact))
             .filter(|v| abi::uvm::select(*v).is_some_and(|s| s.exact))
             .filter(|v| abi::vidmem::select(*v).is_some_and(|s| s.exact))
+            .filter(|v| abi::nvkms::select(*v).is_some())
             .collect()
     }
 
@@ -678,6 +668,11 @@ impl NvidiaBackend {
         }
         if self.vidmem.is_some_and(|s| !s.exact) {
             out.push("video-memory table");
+        }
+        // No nearest-older fallback: with no table of its own a release is
+        // served only ALLOC/FREE_DEVICE through NVKMS.
+        if self.driver.is_some_and(|v| abi::nvkms::select(v).is_none()) {
+            out.push("NVKMS command table");
         }
         out
     }

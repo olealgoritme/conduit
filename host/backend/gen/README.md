@@ -15,6 +15,7 @@ and checked in.
 | `uvm_extract.py` | open-gpu-kernel-modules | `src/uvm/` |
 | `osdesc_extract.py` | open-gpu-kernel-modules | `src/osdesc/` |
 | `vidmem_extract.py` | open-gpu-kernel-modules | `src/vidmem/` (`--vram-limit-mib`) |
+| `nvkms_extract.py` | open-gpu-kernel-modules | `src/nvkms/` (NVKMS command numbers; the one source of which modeset commands a guest is served) |
 | `nvgpu_gen.py` | open-gpu-kernel-modules | `guest/linux/gen/` |
 | `names_extract.py` | open-gpu-kernel-modules (several releases), `drm.h` | `src/names/table.rs` (names in traces) |
 

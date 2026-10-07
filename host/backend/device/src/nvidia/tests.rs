@@ -3736,6 +3736,8 @@ mod fence_tests {
     fn nvkms_query_disp_reports_a_disp_with_nothing_on_it() {
         let host = FenceHost::default();
         let (mut be, h) = backend_on(&host);
+        be.set_host_driver_version(abi::version::DriverVersion::new(610, 57, 4))
+            .unwrap();
         let mut params = vec![0xa5u8; QUERY_DISP_PARAMS];
         params[0..4].copy_from_slice(&0x11u32.to_le_bytes()); // deviceHandle
         params[4..8].copy_from_slice(&0x22u32.to_le_bytes()); // dispHandle
@@ -3758,6 +3760,8 @@ mod fence_tests {
     fn nvkms_query_disp_too_short_for_its_request_is_einval() {
         let host = FenceHost::default();
         let (mut be, h) = backend_on(&host);
+        be.set_host_driver_version(abi::version::DriverVersion::new(610, 57, 4))
+            .unwrap();
         let mut resp = vec![0u8; 256];
         be.dispatch(&nvkms_msg(h, NVKMS_QUERY_DISP, &[0u8; 4]), &mut resp);
         assert_eq!(status(&resp), -libc::EINVAL);
@@ -3778,6 +3782,72 @@ mod fence_tests {
             assert_eq!(status(&resp), -libc::EPERM, "cmd {cmd}");
         }
         assert!(host.calls().is_empty());
+    }
+
+    /// 565.77: ENABLE (60) and DISABLE (61) are answered here, ENABLE with a
+    /// handle; SET_FLIPLOCK_GROUP (59), which the old `register + 43` landed
+    /// on, is refused rather than answered with a made-up handle.
+    #[test]
+    fn nvkms_vblank_commands_are_the_releases_own_on_565_77() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_host_driver_version(abi::version::DriverVersion::new(565, 77, 0))
+            .unwrap();
+        let mut resp = vec![0u8; 1024];
+        let params = vec![0u8; 64];
+
+        be.dispatch(&nvkms_msg(h, 60, &params), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert_eq!(word(&resp, BODY + 16 + 24), 1, "ENABLE hands back a handle");
+
+        be.dispatch(&nvkms_msg(h, 61, &params), &mut resp);
+        assert_eq!(status(&resp), 0, "DISABLE succeeds instead of EPERM");
+        assert_eq!(word(&resp, BODY + 16 + 24), 0, "and writes no handle");
+
+        be.dispatch(&nvkms_msg(h, 59, &params), &mut resp);
+        assert_eq!(status(&resp), -libc::EPERM, "SET_FLIPLOCK_GROUP");
+        assert!(host.calls().is_empty());
+    }
+
+    /// Where the old arithmetic was right it still is: 595..615 answer
+    /// register+43 and +44 and refuse the command before.
+    #[test]
+    fn nvkms_vblank_commands_are_unchanged_where_the_old_rule_was_right() {
+        for (v, enable, disable) in [
+            ((595, 104, 2), 60, 61),
+            ((610, 57, 4), 60, 61),
+            ((615, 71, 9), 59, 60),
+        ] {
+            let host = FenceHost::default();
+            let (mut be, h) = backend_on(&host);
+            be.set_host_driver_version(abi::version::DriverVersion::new(v.0, v.1, v.2))
+                .unwrap();
+            let mut resp = vec![0u8; 1024];
+            be.dispatch(&nvkms_msg(h, enable, &[0u8; 64]), &mut resp);
+            assert_eq!((status(&resp), word(&resp, BODY + 40)), (0, 1), "{v:?}");
+            be.dispatch(&nvkms_msg(h, disable, &[0u8; 64]), &mut resp);
+            assert_eq!(status(&resp), 0, "{v:?}");
+            be.dispatch(&nvkms_msg(h, enable - 1, &[0u8; 64]), &mut resp);
+            assert_eq!(status(&resp), -libc::EPERM, "{v:?}");
+            assert!(host.calls().is_empty());
+        }
+    }
+
+    /// A release with no NVKMS table is served ALLOC/FREE_DEVICE and nothing
+    /// else: not REGISTER_SURFACE, not QUERY_DISP, not the vblank answers.
+    #[test]
+    fn nvkms_on_a_release_with_no_table_serves_only_the_device_commands() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.driver = Some(abi::version::DriverVersion::new(570, 86, 15));
+        let mut resp = vec![0u8; 1024];
+        for cmd in [2, 16, 60, 61] {
+            be.dispatch(&nvkms_msg(h, cmd, &[0u8; 64]), &mut resp);
+            assert_eq!(status(&resp), -libc::EPERM, "cmd {cmd}");
+        }
+        assert!(host.calls().is_empty());
+        be.dispatch(&nvkms_msg(h, 0, &[0u8; 64]), &mut resp);
+        assert!(!host.calls().is_empty(), "ALLOC_DEVICE reaches the host");
     }
 
     /// ALLOC_DEVICE still goes to the host: the guest needs a real device

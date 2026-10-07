@@ -487,24 +487,16 @@ impl NvidiaBackend {
                 // semaphore control -- would act on the host's monitors; a
                 // guest enabling and dropping VBLANK_SEM_CONTROL crashed the
                 // host's Hyprland inside libnvidia-eglcore.
-                let reg = super::nvkms_register_surface(self.driver);
-                // ENABLE/DISABLE_VBLANK_SEM_CONTROL sit 43 and 44 past
-                // REGISTER_SURFACE (60/61 on 580..610). NVIDIA's EGL requires
-                // them to succeed and crashes otherwise, but a guest has no
-                // display whose vblanks it could count, so they are answered
-                // here: success, a handle that names nothing on the host.
-                if nvkms_cmd == reg + 43 || nvkms_cmd == reg + 44 {
-                    const OUTER: usize = 16;
-                    const ENABLE_REPLY_HANDLE: usize = 24;
-                    let mut combined = param_in.to_vec();
-                    if nvkms_cmd == reg + 43 && combined.len() >= OUTER + ENABLE_REPLY_HANDLE + 4 {
-                        let h = OUTER + ENABLE_REPLY_HANDLE;
-                        combined[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
-                    }
-                    log::debug!("NVKMS cmd={nvkms_cmd} answered locally (vblank sem control)");
-                    traced_refusal!(self, Local);
-                    return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
-                }
+                // Every command is named by the host release's own table
+                // (abi::nvkms); nothing here is computed from another command's
+                // number, and a release with no table is served only
+                // ALLOC/FREE_DEVICE.
+                //
+                // ENABLE/DISABLE_VBLANK_SEM_CONTROL: NVIDIA's EGL requires them
+                // to succeed and crashes otherwise, but a guest has no display
+                // whose vblanks it could count, so they are answered here:
+                // success, a handle that names nothing on the host.
+                //
                 // QUERY_DISP is answered here too, with a disp that has no
                 // connectors and no dpys: what NVKMS itself reports for a
                 // display engine with nothing wired to it. Refusing it is not
@@ -516,19 +508,33 @@ impl NvidiaBackend {
                 // a connector or a dpy, so the queries that would describe the
                 // host's monitors are never asked, and they stay refused if
                 // they are.
-                if nvkms_cmd == super::NVKMS_QUERY_DISP {
-                    return self.answer_nvkms_query_disp(resp_buf, cookie, param_in);
-                }
-                let allowed = nvkms_cmd <= 1 || (reg..=reg + 4).contains(&nvkms_cmd);
-                if !allowed {
-                    log::warn!("NVKMS cmd={nvkms_cmd} refused: acts on the host display");
-                    traced_refusal!(self, HostDisplay);
-                    return self.write_error_resp(
-                        resp_buf,
-                        Status::IoctlFailed,
-                        cookie,
-                        libc::EPERM,
-                    );
+                match abi::nvkms::verdict(self.driver, nvkms_cmd) {
+                    abi::nvkms::Verdict::AnswerVblank { reply_handle } => {
+                        const OUTER: usize = 16;
+                        const ENABLE_REPLY_HANDLE: usize = 24;
+                        let mut combined = param_in.to_vec();
+                        if reply_handle && combined.len() >= OUTER + ENABLE_REPLY_HANDLE + 4 {
+                            let h = OUTER + ENABLE_REPLY_HANDLE;
+                            combined[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
+                        }
+                        log::debug!("NVKMS cmd={nvkms_cmd} answered locally (vblank sem control)");
+                        traced_refusal!(self, Local);
+                        return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
+                    }
+                    abi::nvkms::Verdict::AnswerQueryDisp => {
+                        return self.answer_nvkms_query_disp(resp_buf, cookie, param_in);
+                    }
+                    abi::nvkms::Verdict::Refuse => {
+                        log::warn!("NVKMS cmd={nvkms_cmd} refused: acts on the host display");
+                        traced_refusal!(self, HostDisplay);
+                        return self.write_error_resp(
+                            resp_buf,
+                            Status::IoctlFailed,
+                            cookie,
+                            libc::EPERM,
+                        );
+                    }
+                    abi::nvkms::Verdict::Forward | abi::nvkms::Verdict::ForwardWithFd => {}
                 }
             }
             // REGISTER_SURFACE carries one of our handles where NVKMS expects a
@@ -537,8 +543,10 @@ impl NvidiaBackend {
             // back. See the driver's side of this, which explains why it only
             // shows up on some driver versions.
             let nvkms_fd_offset = if param_in.len() >= 4
-                && u32::from_le_bytes(param_in[0..4].try_into().unwrap())
-                    == super::nvkms_register_surface(self.driver)
+                && abi::nvkms::verdict(
+                    self.driver,
+                    u32::from_le_bytes(param_in[0..4].try_into().unwrap()),
+                ) == abi::nvkms::Verdict::ForwardWithFd
             {
                 Some(NVKMS_SURFACE_FD_OFFSET)
             } else {
