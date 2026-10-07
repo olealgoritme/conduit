@@ -40,6 +40,14 @@ static OP_N: AtomicU32 = AtomicU32::new(0);
 static BAD: AtomicU32 = AtomicU32::new(0);
 static BAD_WHY: AtomicU32 = AtomicU32::new(0);
 static OP_MASK: AtomicU32 = AtomicU32::new(0);
+/// Entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing.
+static RK_IN: AtomicU32 = AtomicU32::new(0);
+static RG_IN: AtomicU32 = AtomicU32::new(0);
+/// `DxgkDdiCreateDevice` with `GdiDevice`, `DxgkDdiCreateContext` with `GdiContext` (the knob on
+/// or not: counted always, mirrored with the knob on), and the last GDI context's raw flags.
+static DEV_N: AtomicU32 = AtomicU32::new(0);
+static CTX_N: AtomicU32 = AtomicU32::new(0);
+static CTX_FLAGS: AtomicU32 = AtomicU32::new(0);
 static ROP_MASK: AtomicU32 = AtomicU32::new(0);
 pub(crate) static DROP: AtomicU32 = AtomicU32::new(0);
 pub(crate) static WHY: AtomicU32 = AtomicU32::new(0);
@@ -60,7 +68,7 @@ pub(crate) fn reported_caps(knob: u32) -> u32 {
 /// and with the knob on write the mirrors. With the knob off nothing is written.
 pub(crate) fn note_start(knob: u32) {
     let caps = ga::resolve_caps(knob);
-    for c in [&CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK] {
+    for c in [&CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN] {
         c.store(0, Ordering::Relaxed);
     }
     CAPS.store(caps.reported, Ordering::Relaxed);
@@ -92,7 +100,36 @@ pub(crate) fn publish_counters() {
     w(b"GdiDrop", DROP.load(Ordering::Relaxed));
     w(b"GdiWhy", WHY.load(Ordering::Relaxed));
     w(b"GdiMask", MASK.load(Ordering::Relaxed));
+    w(b"GdiRkIn", RK_IN.load(Ordering::Relaxed));
+    w(b"GdiRgIn", RG_IN.load(Ordering::Relaxed));
+    w(b"GdiDevN", DEV_N.load(Ordering::Relaxed));
+    w(b"GdiCtxN", CTX_N.load(Ordering::Relaxed));
+    w(b"GdiCtxFl", CTX_FLAGS.load(Ordering::Relaxed));
     crate::ddi::gdi_exec::publish_counters();
+}
+
+/// `DxgkDdiCreateDevice` (PASSIVE): `flags` is `DXGK_CREATEDEVICEFLAGS.Value`. Bit 1 `GdiDevice`.
+/// Counted with the knob off too (an atomic add), mirrored only with it on.
+pub(crate) fn note_create_device(flags: u32) {
+    if flags & 2 != 0 {
+        DEV_N.fetch_add(1, Ordering::Relaxed);
+        if on() {
+            crate::diag::record_named_bytes(b"GdiDevN", DEV_N.load(Ordering::Relaxed));
+        }
+    }
+}
+
+/// `DxgkDdiCreateContext` (PASSIVE): `flags` is `DXGK_CREATECONTEXTFLAGS.Value`. Bit 1
+/// `GdiContext` (bit 2 `VirtualAddressing`: such a context gets `DxgkDdiRenderGdi`, not RenderKm).
+pub(crate) fn note_create_context(flags: u32) {
+    if flags & 2 != 0 {
+        CTX_N.fetch_add(1, Ordering::Relaxed);
+        CTX_FLAGS.store(flags, Ordering::Relaxed);
+        if on() {
+            crate::diag::record_named_bytes(b"GdiCtxN", CTX_N.load(Ordering::Relaxed));
+            crate::diag::record_named_bytes(b"GdiCtxFl", flags);
+        }
+    }
 }
 
 /// Record a reason a command is off the copy engine.
@@ -161,14 +198,78 @@ fn note_opcode(cmd: &Cmd) {
     }
 }
 
+/// The fields `DxgkDdiRenderKm` (`DXGKARG_RENDER`) and `DxgkDdiRenderGdi` (`DXGKARG_RENDERGDI`)
+/// share; the second has no patch lists (GPU virtual addressing: nothing to patch).
+struct Call<'a> {
+    p_command: *const c_void,
+    command_length: u32,
+    p_dma_buffer: &'a mut *mut c_void,
+    dma_size: u32,
+    p_private: *mut c_void,
+    private_size: u32,
+    p_allocation_list: *const DXGK_ALLOCATIONLIST,
+    allocation_list_size: u32,
+    /// The output patch list's cursor and room (RenderKm only).
+    patch_out: Option<(&'a mut *mut D3DDDI_PATCHLOCATIONLIST, u32)>,
+    multipass: &'a mut u32,
+}
+
 /// `DxgkDdiRenderKm` with `GdiAccel` = 1 (PASSIVE).
 ///
 /// # Safety
 /// `h_context` and `args` are dxgkrnl's for this call; the command buffer, the DMA buffer, the
 /// private data and the lists are valid for the sizes it states.
 pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> NTSTATUS {
+    RK_IN.fetch_add(1, Ordering::Relaxed);
+    let room = if args.pPatchLocationListOut.is_null() { 0 } else { args.PatchLocationListOutSize };
+    let call = Call {
+        p_command: args.pCommand,
+        command_length: args.CommandLength,
+        p_dma_buffer: &mut args.pDmaBuffer,
+        dma_size: args.DmaSize,
+        p_private: args.pDmaBufferPrivateData,
+        private_size: args.DmaBufferPrivateDataSize,
+        p_allocation_list: args.pAllocationList as *const DXGK_ALLOCATIONLIST,
+        allocation_list_size: args.AllocationListSize,
+        patch_out: Some((&mut args.pPatchLocationListOut, room)),
+        multipass: &mut args.MultipassOffset,
+    };
+    // SAFETY: as the caller's.
+    unsafe { translate(h_context, call) }
+}
+
+/// `DxgkDdiRenderGdi` with `GdiAccel` = 1 (PASSIVE): the GDI command buffer on a GPU-virtual-
+/// addressing adapter. dxgkrnl's `ADAPTER_RENDER::DdiRenderGdi` calls this DDI, not RenderKm,
+/// when the adapter reports GpuMmu (this one does): same `DXGK_RENDERKM_COMMAND` stream, no patch
+/// lists, the DMA buffer's GPU VA in place of the segment list (WDK `DXGKARG_RENDERGDI`).
+///
+/// # Safety
+/// As [`render_km`].
+pub(crate) unsafe fn render_gdi(h_context: HANDLE, args: &mut DXGKARG_RENDERGDI) -> NTSTATUS {
+    RG_IN.fetch_add(1, Ordering::Relaxed);
+    let call = Call {
+        p_command: args.pCommand,
+        command_length: args.CommandLength,
+        p_dma_buffer: &mut args.pDmaBuffer,
+        dma_size: args.DmaSize,
+        p_private: args.pDmaBufferPrivateData,
+        private_size: args.DmaBufferPrivateDataSize,
+        p_allocation_list: args.pAllocationList as *const DXGK_ALLOCATIONLIST,
+        allocation_list_size: args.AllocationListSize,
+        patch_out: None,
+        multipass: &mut args.MultipassOffset,
+    };
+    // SAFETY: as the caller's.
+    unsafe { translate(h_context, call) }
+}
+
+/// The translation both entry points share.
+///
+/// # Safety
+/// As [`render_km`].
+unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
     let n = CMD_N.fetch_add(1, Ordering::Relaxed) + 1;
-    if (args.DmaSize as usize) < DMA_MARKER_BYTES {
+    if (args.dma_size as usize) < DMA_MARKER_BYTES {
         return crate::ddi::present_packet::STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
     }
     // SAFETY: a live hContext from our CreateContext.
@@ -187,14 +288,14 @@ pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> 
     }
 
     let mut ops: Vec<gx::Op> = Vec::new();
-    let len = args.CommandLength as usize;
-    if len > 0 && !args.pCommand.is_null() {
+    let len = args.command_length as usize;
+    if len > 0 && !args.p_command.is_null() {
         // SAFETY: dxgkrnl's command buffer, `CommandLength` readable bytes (kernel memory, no
         // try/except needed per the DDI's remarks).
-        let bytes = unsafe { core::slice::from_raw_parts(args.pCommand as *const u8, len) };
-        let mut parser = ga::Parser::new(bytes, args.pCommand as u64);
-        let list = args.pAllocationList as *const DXGK_ALLOCATIONLIST;
-        let list_len = args.AllocationListSize;
+        let bytes = unsafe { core::slice::from_raw_parts(args.p_command as *const u8, len) };
+        let mut parser = ga::Parser::new(bytes, args.p_command as u64);
+        let list = args.p_allocation_list;
+        let list_len = args.allocation_list_size;
         while let Some(next) = parser.next_cmd() {
             let cmd = match next {
                 Ok(cmd) => cmd,
@@ -272,22 +373,26 @@ pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> 
     // "insert all the references to allocations into the output patch-location list"). The
     // decorative GpuMmu has nothing to patch (`DxgkDdiPatch` is a no-op), the entries only keep
     // the list honest.
-    let room = if args.pPatchLocationListOut.is_null() { 0 } else { args.PatchLocationListOutSize as usize };
-    if nrefs > room {
-        // Nothing committed yet: dxgkrnl retries with fresh lists and the commands are parsed again.
-        return crate::ddi::present_packet::STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
-    }
-    for (k, &index) in refs[..nrefs].iter().enumerate() {
-        // SAFETY: `k < nrefs <= PatchLocationListOutSize` entries of dxgkrnl's output list.
-        unsafe {
-            let patch = args.pPatchLocationListOut.add(k);
-            core::ptr::write_bytes(patch, 0, 1);
-            (*patch).AllocationIndex = index;
+    // RenderGdi (GPU virtual addressing) has no patch list.
+    let Call { p_dma_buffer, p_private, private_size, patch_out, multipass, .. } = args;
+    if let Some((cursor, room)) = patch_out {
+        if nrefs > room as usize || (nrefs > 0 && cursor.is_null()) {
+            // Nothing committed yet: dxgkrnl retries with fresh lists and the commands are parsed
+            // again.
+            return crate::ddi::present_packet::STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
         }
-    }
-    if nrefs > 0 {
-        // SAFETY: advancing within the list by the entries written.
-        args.pPatchLocationListOut = unsafe { args.pPatchLocationListOut.add(nrefs) };
+        for (k, &index) in refs[..nrefs].iter().enumerate() {
+            // SAFETY: `k < nrefs <= PatchLocationListOutSize` entries of dxgkrnl's output list.
+            unsafe {
+                let patch = cursor.add(k);
+                core::ptr::write_bytes(patch, 0, 1);
+                (*patch).AllocationIndex = index;
+            }
+        }
+        if nrefs > 0 {
+            // SAFETY: advancing within the list by the entries written.
+            *cursor = unsafe { cursor.add(nrefs) };
+        }
     }
 
     // The private data: a RenderKm buffer carries no Present, flip or execution record. dxgkrnl
@@ -306,22 +411,22 @@ pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> 
         id
     };
     let rec = ga::Private { job }.encode();
-    if !args.pDmaBufferPrivateData.is_null() {
-        let size = args.DmaBufferPrivateDataSize as usize;
+    if !p_private.is_null() {
+        let size = private_size as usize;
         // SAFETY: dxgkrnl's private data of `size` writable bytes.
         unsafe {
-            core::ptr::write_bytes(args.pDmaBufferPrivateData as *mut u8, 0, size);
+            core::ptr::write_bytes(p_private as *mut u8, 0, size);
             if size >= rec.len() {
-                core::ptr::copy_nonoverlapping(rec.as_ptr(), args.pDmaBufferPrivateData as *mut u8, rec.len());
+                core::ptr::copy_nonoverlapping(rec.as_ptr(), p_private as *mut u8, rec.len());
             }
         }
     }
     // SAFETY: `DmaSize >= DMA_MARKER_BYTES` writable bytes at `pDmaBuffer`.
     unsafe {
-        core::ptr::copy_nonoverlapping(rec.as_ptr(), args.pDmaBuffer as *mut u8, DMA_MARKER_BYTES);
-        args.pDmaBuffer = (args.pDmaBuffer as *mut u8).add(DMA_MARKER_BYTES) as *mut c_void;
+        core::ptr::copy_nonoverlapping(rec.as_ptr(), *p_dma_buffer as *mut u8, DMA_MARKER_BYTES);
+        *p_dma_buffer = (*p_dma_buffer as *mut u8).add(DMA_MARKER_BYTES) as *mut c_void;
     }
-    args.MultipassOffset = 0;
+    *multipass = 0;
 
     if n == 1 || n % 64 == 0 {
         publish_counters();

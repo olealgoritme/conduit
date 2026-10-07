@@ -1411,6 +1411,14 @@ pub const COUNTERS: &[&str] = &[
     "GdiCls",
     "GdiDstRes",
     "GdiDstWH",
+    // Entry census, before any parsing: RenderKm and RenderGdi calls with the knob on; GDI devices
+    // and GDI contexts created (counted with the knob off too), the last GDI context's raw
+    // DXGK_CREATECONTEXTFLAGS (bit 2 VirtualAddressing: its commands come through RenderGdi).
+    "GdiRkIn",
+    "GdiRgIn",
+    "GdiDevN",
+    "GdiCtxN",
+    "GdiCtxFl",
 ];
 
 #[cfg(test)]

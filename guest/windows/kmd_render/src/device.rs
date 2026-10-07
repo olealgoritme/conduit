@@ -447,6 +447,9 @@ pub unsafe extern "C" fn dxgkddi_create_device(
     }
     // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
     let args = unsafe { &mut *create_device };
+    // `GdiAccel` census: GDI devices (`DXGK_CREATEDEVICEFLAGS.GdiDevice`). An atomic add.
+    // SAFETY: `Flags` is the input arm of the union (`pInfo` is the obsolete output arm).
+    crate::ddi::gdi_accel::note_create_device(unsafe { args.__bindgen_anon_1.Flags.__bindgen_anon_1.Value });
     let ctx = Box::new(DeviceContext {
         adapter: miniport_device_context as *mut AdapterContext,
         creator_process: args.hKmdProcess as usize,
@@ -597,6 +600,9 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     }
 
     let args = unsafe { &mut *create_context };
+    // `GdiAccel` census: GDI contexts (`DXGK_CREATECONTEXTFLAGS.GdiContext`). An atomic add.
+    // SAFETY: `Value` is the plain UINT view of the flags union.
+    crate::ddi::gdi_accel::note_create_context(unsafe { args.Flags.__bindgen_anon_1.Value });
     let ctx = Box::new(ContextContext {
         device: h_device as *mut DeviceContext,
         snap_resid: AtomicU32::new(0),

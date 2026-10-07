@@ -2783,6 +2783,12 @@ pub unsafe extern "C" fn dxgkddi_render_gdi(
     if args.pDmaBuffer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    // `GdiAccel` = 1: on this GpuMmu adapter the GDI command buffer arrives HERE, not in
+    // RenderKm (`ddi/gdi_accel.rs`). Off: one relaxed load and the pass-through below.
+    if crate::ddi::gdi_accel::on() {
+        // SAFETY: dxgkrnl's context handle and arguments for this PASSIVE call.
+        return unsafe { crate::ddi::gdi_accel::render_gdi(_h_context, args) };
+    }
     let cmd_len = args.CommandLength as usize;
     let dma_cap = args.DmaSize as usize;
     // Ask the runtime to grow the DMA buffer rather than truncating the stream.
