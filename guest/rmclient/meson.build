@@ -79,3 +79,9 @@ executable('crm_semsurf_smoke', 'tests/crm_semsurf_smoke.c',
 executable('crm_share_smoke', 'tests/crm_share_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)
+# A copy-engine channel: semaphore acquire on another client's semaphore, CE copy
+# into an OS descriptor over process pages, release, with per-stage latencies
+# (guest/windows/docs/rm-copy-engine-present.md, M1).
+executable('crm_ce_copy_smoke', 'tests/crm_ce_copy_smoke.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)
