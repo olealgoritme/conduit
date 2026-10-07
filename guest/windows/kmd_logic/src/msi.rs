@@ -426,10 +426,16 @@ pub const fn breaker_trips(mode: Mode, marker_found: bool) -> bool {
 /// still trips the breaker.
 pub const MARKER_CLEAR_AFTER_100NS: u64 = 30_000_000;
 
-/// Whether the `MsiStarting` marker may be cleared now: run-time judging is armed
-/// (`armed_at` is its time, 0 = not armed), delivery is not convicted, at least one
-/// interrupt arrived, and either the start is ending cleanly (`stopping`) or
-/// [`MARKER_CLEAR_AFTER_100NS`] has passed.
+/// Whether the `MsiStarting` marker may be cleared now.
+///
+/// * A CLEAN `StopDevice` (`stopping`) clears it UNCONDITIONALLY: reaching it proves the start
+///   did not hang, bugcheck or reboot into its fault, which is all the marker is for. Armed or
+///   not, interrupts or none, younger than 3 s or not, convicted or not (a convicted delivery is
+///   the run-time latch's business, `MsiLatchWhy=1`, not the breaker's). Keeping the marker at a
+///   clean stop is what made a plain `pnputil /restart-device` trip the breaker (2026-10-07).
+/// * While the device runs (the lazy periodic clear): run-time judging is armed (`armed_at` is
+///   its time, 0 = not armed), delivery is not convicted, at least one interrupt arrived, and
+///   [`MARKER_CLEAR_AFTER_100NS`] has passed.
 pub const fn marker_may_clear(
     armed_at: u64,
     now: u64,
@@ -437,10 +443,176 @@ pub const fn marker_may_clear(
     convicted: bool,
     stopping: bool,
 ) -> bool {
-    armed_at != 0
-        && !convicted
-        && ints_seen > 0
-        && (stopping || now.saturating_sub(armed_at) >= MARKER_CLEAR_AFTER_100NS)
+    stopping
+        || (armed_at != 0
+            && !convicted
+            && ints_seen > 0
+            && now.saturating_sub(armed_at) >= MARKER_CLEAR_AFTER_100NS)
+}
+
+/// Whether a latch for `why` (one of [`latch_why`]) may be written now. `stopping` is the
+/// KMD's stop flag (raised at `StopDevice` / `RemoveDevice` entry, lowered at `StartDevice`):
+/// while it is up the device is being torn down, waits that time out are expected (the ISR gate
+/// is cleared, the host is being swept), and a run-time verdict made then says nothing about
+/// delivery. Such a latch is ignored. The breaker is the exception: it is decided at
+/// `AddDevice` from the marker, which on a same-image restart runs while the flag from the
+/// previous `RemoveDevice` is still up, and it is not a run-time verdict.
+pub const fn latch_allowed(why: u32, stopping: bool) -> bool {
+    why == latch_why::BREAKER || !stopping
+}
+
+/// Whether a rescue is judged for delivery health ([`rescue_step`]): message mode, run-time
+/// judging armed, and the device not stopping (see [`latch_allowed`]). A rescue that is not
+/// judged is still counted and still queues the DPC.
+pub const fn rescue_judged(message_mode: bool, armed: bool, stopping: bool) -> bool {
+    message_mode && armed && !stopping
+}
+
+// ── Which build: the marker and the latch belong to the image that wrote them ──
+
+/// The running KMD's build tag (`MsiStartingVer`, `MsiLatchVer`) from the text of
+/// `kmd_render/driver-version.env` (`HELIOS_KMD_VERSION=a.b.c.d`): `c << 16 | d`, the build and
+/// revision components (`22.22.346.1` is `0x015A_0001`). The leading `a.b` is the fixed WDDM
+/// prefix and is not part of it. Never 0: 0 is what an ABSENT value reads as (a marker or latch
+/// written by an image older than the tag, or by hand). `None` when the text has no well-formed
+/// version, or it would encode as 0; the driver evaluates this in a `const`, so either is a
+/// build failure, not a wrong tag.
+pub const fn build_tag(env: &str) -> Option<u32> {
+    const KEY: &[u8] = b"HELIOS_KMD_VERSION=";
+    let b = env.as_bytes();
+    let mut i = 0;
+    // Find the key at the start of a line.
+    let start = loop {
+        if i + KEY.len() > b.len() {
+            return None;
+        }
+        if i == 0 || b[i - 1] == b'\n' {
+            let mut k = 0;
+            while k < KEY.len() && b[i + k] == KEY[k] {
+                k += 1;
+            }
+            if k == KEY.len() {
+                break i + k;
+            }
+        }
+        i += 1;
+    };
+    // Four decimal components, each a u16, separated by dots, ending the line.
+    let mut parts = [0u32; 4];
+    let mut n = 0;
+    let mut digits = 0;
+    let mut j = start;
+    while j < b.len() && !matches!(b[j], b'\n' | b'\r' | b' ' | b'\t') {
+        let c = b[j];
+        if c == b'.' {
+            if digits == 0 || n == 3 {
+                return None;
+            }
+            n += 1;
+            digits = 0;
+        } else if c.is_ascii_digit() {
+            parts[n] = parts[n] * 10 + (c - b'0') as u32;
+            digits += 1;
+            if parts[n] > 0xFFFF {
+                return None;
+            }
+        } else {
+            return None;
+        }
+        j += 1;
+    }
+    if n != 3 || digits == 0 {
+        return None;
+    }
+    let tag = parts[2] << 16 | parts[3];
+    if tag == 0 {
+        None
+    } else {
+        Some(tag)
+    }
+}
+
+/// What `AddDevice` does with the breaker's `MsiStarting` marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerVerdict {
+    /// No marker: nothing to do.
+    Absent,
+    /// `MsiMode=3`: consumed, the breaker is off (as [`breaker_trips`] always said).
+    Ignored,
+    /// Set by a DIFFERENT build, or with no build tag (an older image): consumed without a trip
+    /// and counted (`MsiMarkerOld`). That start's health says nothing about this build; a driver
+    /// update stops the old image in the middle of whatever it was doing.
+    Stale,
+    /// Set by THIS build: a message-mode start of this build never became healthy. The breaker
+    /// trips (`MsiLatch=1`, `MsiLatchWhy=4`).
+    Trip,
+}
+
+/// The marker decision: `marker` is `MsiStarting != 0`, `marker_build` is `MsiStartingVer` (0 =
+/// absent), `running` is [`build_tag`] of this image. `MsiMode=3` ignores the marker whatever
+/// build set it; otherwise only a marker of the running build trips the breaker.
+pub const fn marker_verdict(
+    mode: Mode,
+    marker: bool,
+    marker_build: u32,
+    running: u32,
+) -> MarkerVerdict {
+    if !marker {
+        MarkerVerdict::Absent
+    } else if !breaker_trips(mode, true) {
+        MarkerVerdict::Ignored
+    } else if marker_build == 0 || marker_build != running {
+        MarkerVerdict::Stale
+    } else {
+        MarkerVerdict::Trip
+    }
+}
+
+/// What `AddDevice` does with the INTx latch `MsiLatch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatchVerdict {
+    /// Not latched.
+    Clear,
+    /// Latched by THIS build (`MsiLatchVer` = the running tag): honoured.
+    Held,
+    /// Latched with no build tag: written by the operator (or an image older than the tag).
+    /// Honoured: an operator's `MsiLatch=1` keeps working, and deleting `MsiLatch` (or writing
+    /// 0) is how an operator clears any latch.
+    Operator,
+    /// Latched by a DIFFERENT build: stale. Ignored for this start's decision, cleared
+    /// (`MsiLatch`, `MsiLatchWhy`, `MsiLatchVer` to 0) and counted (`MsiLatchOld`). A new build
+    /// gets one fresh attempt at MSI-X; the breaker and the latch protect against a fault of
+    /// THAT build.
+    Stale,
+}
+
+impl LatchVerdict {
+    /// Whether INTx is latched for [`key_action`].
+    pub const fn latched(self) -> bool {
+        matches!(self, LatchVerdict::Held | LatchVerdict::Operator)
+    }
+}
+
+/// The latch decision: `latch` is `MsiLatch != 0`, `latch_build` is `MsiLatchVer` (0 = absent),
+/// `running` is [`build_tag`] of this image.
+pub const fn latch_verdict(latch: bool, latch_build: u32, running: u32) -> LatchVerdict {
+    if !latch {
+        LatchVerdict::Clear
+    } else if latch_build == 0 {
+        LatchVerdict::Operator
+    } else if latch_build == running {
+        LatchVerdict::Held
+    } else {
+        LatchVerdict::Stale
+    }
+}
+
+/// Whether `AddDevice` should zero a leftover `MsiLatchVer`: the latch is clear (an operator
+/// wrote `MsiLatch=0` instead of deleting it) but a build tag is still there. Without this, an
+/// operator who later sets `MsiLatch=1` by hand under a newer build would have it read as a
+/// stale latch of the old build and ignored.
+pub const fn latch_tag_orphaned(latch: bool, latch_build: u32) -> bool {
+    !latch && latch_build != 0
 }
 
 // ── Counting: per-vector interrupts and DPCs ─────────────────────────────────
@@ -511,15 +683,149 @@ impl Health {
     }
 }
 
-/// A suspect state is cleared once interrupts have arrived since the evidence
-/// that raised it (`ints_prev`: the total at the last rescue, or when run-time
-/// judging was armed): the silence was the start, not the delivery. `Broken` is a
-/// conviction and stays, and so does everything else.
+/// A suspect state, AND a conviction, are withdrawn once interrupts have arrived
+/// since the evidence that raised them (`ints_prev`: the total when it was last
+/// judged): a device that delivers is not broken, whatever a run of polled
+/// completions suggested (2026-10-07: a conviction under load next to 240 k
+/// interrupts). Everything else stays.
 pub const fn reassess(health: Health, ints_prev: u32, ints_now: u32) -> Health {
-    if matches!(health, Health::Suspect) && ints_now != ints_prev {
+    if matches!(health, Health::Suspect | Health::Broken) && ints_now != ints_prev {
         Health::Healthy
     } else {
         health
+    }
+}
+
+/// How long the interrupt total (every vector) must have stood still before a rescue counts as
+/// evidence of silence: 1 s, 100 ns units. A device delivering thousands of interrupts a second
+/// can never reach it; a polling drain that merely beat the ISR / DPC of a completion that was
+/// already posted, or a wait slice that ran out during a host stall shorter than this, is not
+/// evidence.
+pub const SILENCE_MIN_100NS: u64 = 10_000_000;
+/// Rescues closer together than this (1 s) are ONE piece of evidence: several waiters whose
+/// slices ran out together (a host stall, a teardown) each drain and each find something, with
+/// no time for an interrupt between them.
+pub const RESCUE_SPACING_100NS: u64 = 10_000_000;
+
+/// The run-time judge's memory between rescues (all times in 100 ns, 0 = never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SilenceState {
+    /// The interrupt total (every vector) at the last observation.
+    pub last_total: u32,
+    /// When the total was last seen to change (or judging was armed).
+    pub last_move_at: u64,
+    /// When the last piece of silence evidence was counted.
+    pub last_evidence_at: u64,
+    /// Pieces of evidence in a row with no movement between them.
+    pub streak: u32,
+}
+
+impl SilenceState {
+    /// Judging starts: `total` is the interrupt total, `now` the time.
+    pub const fn armed(total: u32, now: u64) -> SilenceState {
+        SilenceState {
+            last_total: total,
+            last_move_at: now,
+            last_evidence_at: 0,
+            streak: 0,
+        }
+    }
+
+    /// An observation of the total with no rescue (the periodic mirror, the worker): only the
+    /// movement tracker advances. A change ends the streak.
+    pub const fn observe(self, total: u32, now: u64) -> SilenceState {
+        if total != self.last_total {
+            SilenceState {
+                last_total: total,
+                last_move_at: now,
+                last_evidence_at: self.last_evidence_at,
+                streak: 0,
+            }
+        } else {
+            self
+        }
+    }
+
+    /// How long the total has stood still at `now` (a lower bound: the last time it was SEEN to
+    /// move, so a rare observer errs towards "recent").
+    pub const fn quiet_for(&self, now: u64) -> u64 {
+        now.saturating_sub(self.last_move_at)
+    }
+}
+
+/// What one rescue was, as evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// The total moved since the last observation: delivery works, the streak ends.
+    Moved,
+    /// No movement, but for less than [`SILENCE_MIN_100NS`]: not evidence.
+    TooRecent,
+    /// Silent long enough, but within [`RESCUE_SPACING_100NS`] of the last counted evidence:
+    /// the same piece of evidence.
+    Merged,
+    /// A counted piece of evidence of silence.
+    Counted,
+}
+
+/// The outcome of [`judge_rescue`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Judged {
+    pub state: SilenceState,
+    pub evidence: Evidence,
+    /// The new health, or `None` to leave it as it is.
+    pub health: Option<Health>,
+}
+
+/// Judge one RESCUE (a polling drain, after a wait slice timed out, found a completion no
+/// interrupt had announced) at time `now` with the interrupt total `total` (every vector).
+///
+/// * The total moved since the last observation: `Healthy`, the streak ends.
+/// * It has stood still for less than [`SILENCE_MIN_100NS`]: nothing (a drain that beat the ISR,
+///   a short host stall).
+/// * Silent long enough but within [`RESCUE_SPACING_100NS`] of the last counted evidence:
+///   merged into it, nothing changes.
+/// * Otherwise one more piece of evidence: `Suspect`, and `Broken` at
+///   [`SILENT_RESCUES_BROKEN`] in a row. A conviction therefore needs the total to stand still
+///   for at least `SILENCE_MIN + (SILENT_RESCUES_BROKEN - 1) * RESCUE_SPACING` (3 s) while
+///   completions keep being found by polling.
+pub const fn judge_rescue(state: SilenceState, total: u32, now: u64) -> Judged {
+    if total != state.last_total {
+        return Judged {
+            state: state.observe(total, now),
+            evidence: Evidence::Moved,
+            health: Some(Health::Healthy),
+        };
+    }
+    if state.quiet_for(now) < SILENCE_MIN_100NS {
+        return Judged {
+            state,
+            evidence: Evidence::TooRecent,
+            health: None,
+        };
+    }
+    if state.last_evidence_at != 0
+        && now.saturating_sub(state.last_evidence_at) < RESCUE_SPACING_100NS
+    {
+        return Judged {
+            state,
+            evidence: Evidence::Merged,
+            health: None,
+        };
+    }
+    let streak = state.streak.saturating_add(1);
+    Judged {
+        state: SilenceState {
+            last_total: state.last_total,
+            last_move_at: state.last_move_at,
+            last_evidence_at: if now == 0 { 1 } else { now },
+            streak,
+        },
+        evidence: Evidence::Counted,
+        health: Some(if streak >= SILENT_RESCUES_BROKEN {
+            Health::Broken
+        } else {
+            Health::Suspect
+        }),
     }
 }
 
@@ -555,6 +861,22 @@ pub const fn rescue_step(streak: u32, ints_prev: u32, ints_now: u32) -> RescueSt
             Health::Suspect
         },
     }
+}
+
+/// Whether the `SILENT` latch THIS start wrote is withdrawn: its conviction was (`before` is
+/// `Broken`, `after` is not), and the start did not begin latched (`latched_at_start`: an
+/// operator's latch, a breaker trip or an earlier conviction is never cleared by it). A latch of
+/// any other cause, or of another start, is untouched.
+pub const fn withdraw_silent_latch(
+    latched_by_this_start: bool,
+    latched_at_start: bool,
+    before: Health,
+    after: Health,
+) -> bool {
+    latched_by_this_start
+        && !latched_at_start
+        && matches!(before, Health::Broken)
+        && !matches!(after, Health::Broken)
 }
 
 /// The verdict at the end of `StartDevice` from the interrupts taken and the
@@ -602,7 +924,7 @@ pub mod latch_why {
 /// `kmd_render/src/virtio/msi.rs` only. `MsiMode` and `MsiVectors` are knobs the
 /// operator writes and are not listed; `MsiLatch` is both: the KMD writes 1, an
 /// operator may write either. At most 14 characters each.
-pub const COUNTERS: [&str; 36] = [
+pub const COUNTERS: [&str; 47] = [
     // The set-up breadcrumbs.
     "MsiCap",
     "MsiList",
@@ -646,6 +968,25 @@ pub const COUNTERS: [&str; 36] = [
     // The boot-loop breaker: the marker a message-mode start sets, how often it tripped.
     "MsiStarting",
     "MsiBreaker",
+    // Which build wrote the marker and the latch (`build_tag`), and how often AddDevice found
+    // one written by another build (or by an image without the tag) and set it aside.
+    "MsiStartingVer",
+    "MsiLatchVer",
+    "MsiMarkerOld",
+    "MsiLatchOld",
+    // Latches a run-time verdict asked for while the device was stopping, ignored
+    // (`latch_allowed`; per image load), and the `MsiLatchWhy` of the last one.
+    "MsiLatchStop",
+    "MsiLatchStopW",
+    // The run-time judge (`judge_rescue`): pieces of silence evidence in a row now, rescues
+    // that were not evidence (too recent / merged), the quiet age at the last counted piece,
+    // and convictions withdrawn because interrupts flowed again. `MsiSilent` above counts the
+    // counted pieces of this start.
+    "MsiStreak",
+    "MsiTooRecent",
+    "MsiMerged",
+    "MsiQuietMs",
+    "MsiWithdraw",
 ];
 
 #[cfg(test)]
@@ -939,24 +1280,232 @@ mod tests {
 
     #[test]
     fn the_marker_clears_only_when_interrupts_were_seen_and_the_start_is_old_enough() {
+        // The lazy clear of a running device (not stopping).
         let armed = 1_000_000u64;
         let after = armed + MARKER_CLEAR_AFTER_100NS;
         // Not armed yet: never.
         assert!(!marker_may_clear(0, after, 5, false, false));
-        assert!(!marker_may_clear(0, after, 5, false, true));
         // Armed, interrupts seen, old enough.
         assert!(marker_may_clear(armed, after, 1, false, false));
-        // Too young, unless the start is ending cleanly.
+        // Too young.
         assert!(!marker_may_clear(armed, after - 1, 1, false, false));
-        assert!(marker_may_clear(armed, armed, 1, false, true));
-        // No interrupt: a quiet device is not a healthy one, even stopping.
+        // No interrupt: a quiet device is not a healthy one.
         assert!(!marker_may_clear(armed, after, 0, false, false));
-        assert!(!marker_may_clear(armed, after, 0, false, true));
-        // A convicted delivery keeps the marker.
+        // A convicted delivery keeps the marker while running.
         assert!(!marker_may_clear(armed, after, 9, true, false));
-        assert!(!marker_may_clear(armed, after, 9, true, true));
         // A clock that went backwards does not clear early.
         assert!(!marker_may_clear(armed, 0, 1, false, false));
+    }
+
+    #[test]
+    fn a_clean_stop_clears_the_marker_unconditionally() {
+        let armed = 1_000_000u64;
+        let after = armed + MARKER_CLEAR_AFTER_100NS;
+        // Marker set, never armed, zero interrupts, a start younger than 3 s: cleared.
+        assert!(marker_may_clear(0, 0, 0, false, true));
+        assert!(marker_may_clear(0, after, 0, false, true));
+        assert!(marker_may_clear(armed, armed, 0, false, true));
+        // Convicted and stopping: cleared too (the conviction is the run-time latch's).
+        assert!(marker_may_clear(armed, after, 9, true, true));
+        assert!(marker_may_clear(0, 0, 0, true, true));
+        // Every input combination clears at a clean stop.
+        for armed_at in [0, armed] {
+            for now in [0, armed, after, u64::MAX] {
+                for ints in [0, 1, u32::MAX] {
+                    for convicted in [false, true] {
+                        assert!(marker_may_clear(armed_at, now, ints, convicted, true));
+                    }
+                }
+            }
+        }
+        // Running with zero interrupts: never, however old.
+        assert!(!marker_may_clear(armed, u64::MAX, 0, false, false));
+    }
+
+    #[test]
+    fn no_latch_but_the_breaker_is_written_while_stopping() {
+        use latch_why::*;
+        for why in [SILENT, REFUSED, NO_CFG] {
+            assert!(latch_allowed(why, false));
+            assert!(!latch_allowed(why, true), "why {why} while stopping");
+        }
+        // The breaker runs at AddDevice, where a same-image restart still has the flag up.
+        assert!(latch_allowed(BREAKER, false));
+        assert!(latch_allowed(BREAKER, true));
+        // Rescues during a stop are not judged at all, so health cannot go Broken from them.
+        assert!(rescue_judged(true, true, false));
+        assert!(!rescue_judged(true, true, true));
+        assert!(!rescue_judged(false, true, false));
+        assert!(!rescue_judged(true, false, false));
+    }
+
+    #[test]
+    fn a_plain_restart_of_a_healthy_or_quiet_start_does_not_trip_the_breaker() {
+        // The restart-device sequence: begin_start set the marker (this build), the start ran
+        // (armed or not, interrupts or none), StopDevice cleared it unconditionally, so
+        // AddDevice of the next start finds no marker and asks for MSI-X again.
+        for (armed_at, ints) in [(0u64, 0u32), (5, 0), (5, 100)] {
+            let cleared = marker_may_clear(armed_at, armed_at, ints, false, true);
+            assert!(cleared);
+            let marker = !cleared;
+            let v = marker_verdict(Mode::ForceMsi, marker, THIS, THIS);
+            assert_eq!(v, MarkerVerdict::Absent);
+            assert_eq!(key_action(Mode::ForceMsi, false), KeyAction::SetMsi);
+        }
+        // Without a clean stop (a hang, a bugcheck) the marker is still there: the breaker.
+        assert_eq!(
+            marker_verdict(Mode::ForceMsi, true, THIS, THIS),
+            MarkerVerdict::Trip
+        );
+    }
+
+    // ── the build a marker or latch belongs to ───────────────────────────────
+
+    const THIS: u32 = 0x015A_0001; // 22.22.346.1
+    const OLDER: u32 = 0x0159_0001; // 22.22.345.1
+
+    #[test]
+    fn build_tag_is_build_and_revision() {
+        assert_eq!(build_tag("HELIOS_KMD_VERSION=22.22.346.1\n"), Some(THIS));
+        assert_eq!(build_tag("HELIOS_KMD_VERSION=22.22.345.1"), Some(OLDER));
+        assert_eq!(
+            build_tag("# a comment naming HELIOS_KMD_VERSION=1.2.3.4\r\nHELIOS_KMD_VERSION=22.22.343.2\r\n"),
+            Some(343 << 16 | 2)
+        );
+        assert_eq!(
+            build_tag("HELIOS_KMD_VERSION=22.22.65535.65535"),
+            Some(u32::MAX)
+        );
+        // Trailing blanks end the value (the metadata reader trims lines).
+        assert_eq!(build_tag("HELIOS_KMD_VERSION=22.22.346.1 \n"), Some(THIS));
+        // Not well formed, or a tag that would read as "absent": no tag (a build failure).
+        for bad in [
+            "",
+            "HELIOS_KMD_VERSION=",
+            "HELIOS_KMD_VERSION=22.22.346",
+            "HELIOS_KMD_VERSION=22.22.346.1.0",
+            "HELIOS_KMD_VERSION=22.22..1",
+            "HELIOS_KMD_VERSION=22.22.65536.1",
+            "HELIOS_KMD_VERSION=22.22.0.0",
+            "XHELIOS_KMD_VERSION=22.22.346.1",
+            "# HELIOS_KMD_VERSION=22.22.346.1",
+        ] {
+            assert_eq!(build_tag(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn build_tag_of_the_real_version_file() {
+        // The driver evaluates the same function on the same file in a `const`.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("../kmd_render/driver-version.env");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            assert!(
+                std::env::var_os("HELIOS_REQUIRE_NAME_SCAN").is_none(),
+                "{} is missing",
+                path.display()
+            );
+            return;
+        };
+        let tag = build_tag(&text).expect("driver-version.env has no usable build tag");
+        assert_ne!(tag, 0);
+    }
+
+    #[test]
+    fn marker_verdict_table() {
+        for mode in [Mode::Auto, Mode::ForceIntx, Mode::ForceMsi] {
+            // No marker.
+            assert_eq!(
+                marker_verdict(mode, false, THIS, THIS),
+                MarkerVerdict::Absent
+            );
+            assert_eq!(marker_verdict(mode, false, 0, THIS), MarkerVerdict::Absent);
+            // Set by this build: a boot loop of this build. The breaker trips.
+            assert_eq!(marker_verdict(mode, true, THIS, THIS), MarkerVerdict::Trip);
+            // Set by another build (a driver update stopped it), or by an image without the tag.
+            assert_eq!(
+                marker_verdict(mode, true, OLDER, THIS),
+                MarkerVerdict::Stale
+            );
+            assert_eq!(
+                marker_verdict(mode, true, THIS, OLDER),
+                MarkerVerdict::Stale
+            );
+            assert_eq!(marker_verdict(mode, true, 0, THIS), MarkerVerdict::Stale);
+        }
+        // The debugging mode ignores the marker whatever build set it.
+        for build in [0, OLDER, THIS] {
+            assert_eq!(
+                marker_verdict(Mode::ForceMsiNoBreaker, true, build, THIS),
+                MarkerVerdict::Ignored
+            );
+        }
+        assert_eq!(
+            marker_verdict(Mode::ForceMsiNoBreaker, false, THIS, THIS),
+            MarkerVerdict::Absent
+        );
+        // Only a trip is a breaker trip, and it agrees with `breaker_trips` on it.
+        for mode in [
+            Mode::Auto,
+            Mode::ForceIntx,
+            Mode::ForceMsi,
+            Mode::ForceMsiNoBreaker,
+        ] {
+            for (marker, build) in [(false, 0), (true, 0), (true, OLDER), (true, THIS)] {
+                let v = marker_verdict(mode, marker, build, THIS);
+                if v == MarkerVerdict::Trip {
+                    assert!(breaker_trips(mode, marker));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn latch_verdict_table() {
+        assert_eq!(latch_verdict(false, 0, THIS), LatchVerdict::Clear);
+        assert_eq!(latch_verdict(false, OLDER, THIS), LatchVerdict::Clear);
+        // This build's latch holds.
+        assert_eq!(latch_verdict(true, THIS, THIS), LatchVerdict::Held);
+        // No tag: the operator's (or an old image's) latch holds.
+        assert_eq!(latch_verdict(true, 0, THIS), LatchVerdict::Operator);
+        // Another build's latch is stale.
+        assert_eq!(latch_verdict(true, OLDER, THIS), LatchVerdict::Stale);
+        assert!(LatchVerdict::Held.latched());
+        assert!(LatchVerdict::Operator.latched());
+        assert!(!LatchVerdict::Stale.latched());
+        assert!(!LatchVerdict::Clear.latched());
+        // An operator who wrote 0 instead of deleting leaves a tag that is zeroed, so a later
+        // hand-set 1 reads as the operator's.
+        assert!(latch_tag_orphaned(false, OLDER));
+        assert!(!latch_tag_orphaned(false, 0));
+        assert!(!latch_tag_orphaned(true, OLDER));
+        assert!(!latch_tag_orphaned(true, THIS));
+    }
+
+    #[test]
+    fn a_package_update_over_a_running_msi_device_keeps_msi() {
+        // The hardware case (2026-10-07): the old build's start left its marker (or its latch),
+        // the new build's AddDevice must still ask for MSI-X under the opt-in.
+        let marker = marker_verdict(Mode::ForceMsi, true, OLDER, THIS);
+        assert_eq!(marker, MarkerVerdict::Stale);
+        let latch = latch_verdict(true, OLDER, THIS);
+        let latched = latch.latched() || marker == MarkerVerdict::Trip;
+        assert_eq!(key_action(Mode::ForceMsi, latched), KeyAction::SetMsi);
+        // A marker of an image that predates the tag is stale too.
+        assert_eq!(
+            marker_verdict(Mode::ForceMsi, true, 0, THIS),
+            MarkerVerdict::Stale
+        );
+        // A boot loop of THIS build still latches INTx, and the latch it writes holds.
+        let marker = marker_verdict(Mode::ForceMsi, true, THIS, THIS);
+        assert_eq!(marker, MarkerVerdict::Trip);
+        assert_eq!(key_action(Mode::ForceMsi, true), KeyAction::SetIntx);
+        assert!(latch_verdict(true, THIS, THIS).latched());
+        // An operator's latch (no tag) still forces INTx under the opt-in.
+        assert_eq!(
+            key_action(Mode::ForceMsi, latch_verdict(true, 0, THIS).latched()),
+            KeyAction::SetIntx
+        );
     }
 
     #[test]
@@ -1068,6 +1617,149 @@ mod tests {
         assert_eq!(rescue_step(s.streak, 101, 101).streak, 1);
     }
 
+    // ── the run-time judge (silence by time, not by rescue count) ────────────
+
+    const S: u64 = 10_000_000; // 1 s in 100 ns
+
+    #[test]
+    fn rescues_with_interrupts_flowing_never_convict() {
+        // Thousands of interrupts a second: every rescue sees the total moved.
+        let mut st = SilenceState::armed(0, 1);
+        let mut total = 0u32;
+        for i in 0..10_000u64 {
+            total = total.wrapping_add(3);
+            let j = judge_rescue(st, total, 1 + i * 1_000); // a rescue every 100 us
+            assert_eq!(j.evidence, Evidence::Moved);
+            assert_eq!(j.health, Some(Health::Healthy));
+            st = j.state;
+        }
+        assert_eq!(st.streak, 0);
+    }
+
+    #[test]
+    fn simultaneous_rescues_of_several_waiters_are_one_piece_of_evidence() {
+        // The 2026-10-07 false conviction: waiters whose slices ran out together each drained
+        // and each counted a silent rescue, microseconds apart, no interrupt between them.
+        let t0 = 100 * S;
+        let mut st = SilenceState::armed(500, t0);
+        // Even after a long silence, 8 waiters within 1 ms are ONE piece of evidence.
+        let at = t0 + 2 * S;
+        let mut counted = 0;
+        for k in 0..8u64 {
+            let j = judge_rescue(st, 500, at + k * 100);
+            if j.evidence == Evidence::Counted {
+                counted += 1;
+            } else {
+                assert_eq!(j.evidence, Evidence::Merged);
+            }
+            assert_ne!(j.health, Some(Health::Broken));
+            st = j.state;
+        }
+        assert_eq!(counted, 1);
+        assert_eq!(st.streak, 1);
+    }
+
+    #[test]
+    fn a_short_silence_is_not_evidence() {
+        let t0 = 50 * S;
+        let st = SilenceState::armed(7, t0);
+        // A drain that beat the ISR, or a host stall shorter than the minimum.
+        for dt in [0, 1, S / 2, S - 1] {
+            let j = judge_rescue(st, 7, t0 + dt);
+            assert_eq!(j.evidence, Evidence::TooRecent);
+            assert_eq!(j.health, None);
+            assert_eq!(j.state, st);
+        }
+        assert_eq!(judge_rescue(st, 7, t0 + S).evidence, Evidence::Counted);
+    }
+
+    #[test]
+    fn real_silence_still_convicts_after_three_spaced_pieces() {
+        let t0 = 10 * S;
+        let mut st = SilenceState::armed(42, t0);
+        let mut last = None;
+        for k in 1..=SILENT_RESCUES_BROKEN as u64 {
+            let j = judge_rescue(st, 42, t0 + k * S);
+            assert_eq!(j.evidence, Evidence::Counted);
+            st = j.state;
+            last = j.health;
+            if k < SILENT_RESCUES_BROKEN as u64 {
+                assert_eq!(last, Some(Health::Suspect));
+            }
+        }
+        assert_eq!(last, Some(Health::Broken));
+        assert!(should_latch(Health::Broken));
+        // The earliest possible conviction: SILENCE_MIN + 2 spacings of a frozen total.
+        assert_eq!(
+            SILENCE_MIN_100NS + (SILENT_RESCUES_BROKEN as u64 - 1) * RESCUE_SPACING_100NS,
+            3 * S
+        );
+    }
+
+    #[test]
+    fn movement_seen_by_any_observer_ends_the_streak_and_restarts_the_clock() {
+        let t0 = 10 * S;
+        let st = SilenceState::armed(1, t0);
+        let j = judge_rescue(st, 1, t0 + S);
+        assert_eq!(j.state.streak, 1);
+        // The mirror sees the total move: streak 0, the clock restarts there.
+        let st = j.state.observe(2, t0 + S + 5);
+        assert_eq!(st.streak, 0);
+        assert_eq!(st.last_move_at, t0 + S + 5);
+        // A rescue just after that is too recent.
+        assert_eq!(
+            judge_rescue(st, 2, t0 + S + 10).evidence,
+            Evidence::TooRecent
+        );
+        // An unchanged observation changes nothing.
+        assert_eq!(st.observe(2, t0 + 9 * S), st);
+        // A wrapped total is movement.
+        let st = SilenceState::armed(u32::MAX, t0);
+        assert_eq!(judge_rescue(st, 0, t0 + 5 * S).evidence, Evidence::Moved);
+    }
+
+    #[test]
+    fn a_clock_going_backwards_is_not_silence() {
+        let st = SilenceState::armed(3, 100 * S);
+        assert_eq!(judge_rescue(st, 3, 0).evidence, Evidence::TooRecent);
+        assert_eq!(judge_rescue(st, 3, 50 * S).evidence, Evidence::TooRecent);
+    }
+
+    #[test]
+    fn a_withdrawn_conviction_withdraws_this_starts_silent_latch_only() {
+        let after = reassess(Health::Broken, 10, 11);
+        assert_eq!(after, Health::Healthy);
+        assert!(withdraw_silent_latch(true, false, Health::Broken, after));
+        // Not latched by this start's verdict (the breaker, the operator, a refused plan).
+        assert!(!withdraw_silent_latch(false, false, Health::Broken, after));
+        // The start began latched: that latch is not this verdict's to clear.
+        assert!(!withdraw_silent_latch(true, true, Health::Broken, after));
+        // Still convicted, or never convicted.
+        assert!(!withdraw_silent_latch(
+            true,
+            false,
+            Health::Broken,
+            Health::Broken
+        ));
+        assert!(!withdraw_silent_latch(
+            true,
+            false,
+            Health::Suspect,
+            Health::Healthy
+        ));
+        // And the polling net goes off with it (unless a start latch holds it on).
+        assert!(!polling_wanted(false, after));
+        assert!(polling_wanted(true, after));
+        // The marker may then be cleared by the running path again.
+        assert!(marker_may_clear(
+            1,
+            1 + MARKER_CLEAR_AFTER_100NS,
+            5,
+            false,
+            false
+        ));
+    }
+
     #[test]
     fn rescue_streak_saturates() {
         let s = rescue_step(u32::MAX, 5, 5);
@@ -1109,8 +1801,9 @@ mod tests {
         assert_eq!(reassess(Health::Suspect, 5, 5), Health::Suspect);
         // A wrapped total is movement.
         assert_eq!(reassess(Health::Suspect, u32::MAX, 0), Health::Healthy);
-        // A conviction is never cleared by it, nor is anything else touched.
-        assert_eq!(reassess(Health::Broken, 5, 600), Health::Broken);
+        // A conviction is withdrawn by flowing interrupts too, never without them.
+        assert_eq!(reassess(Health::Broken, 5, 600), Health::Healthy);
+        assert_eq!(reassess(Health::Broken, 5, 5), Health::Broken);
         assert_eq!(reassess(Health::Healthy, 5, 6), Health::Healthy);
         assert_eq!(reassess(Health::Unknown, 5, 6), Health::Unknown);
         // Once cleared, the polling net is off (unless a latch holds it on).
@@ -1211,7 +1904,16 @@ mod tests {
                         } else {
                             // These are also read as knobs, declared with the others in diag.rs.
                             name == "msi.rs"
-                                || (["MsiLatch", "MsiStarting", "MsiBreaker"].contains(mine)
+                                || ([
+                                    "MsiLatch",
+                                    "MsiStarting",
+                                    "MsiBreaker",
+                                    "MsiStartingVer",
+                                    "MsiLatchVer",
+                                    "MsiMarkerOld",
+                                    "MsiLatchOld",
+                                ]
+                                .contains(mine)
                                     && name == "diag.rs")
                         };
                         assert!(ok, "{mine} is also spelled in {}", file.display());
