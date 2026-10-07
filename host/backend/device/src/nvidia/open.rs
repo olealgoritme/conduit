@@ -23,13 +23,13 @@ impl NvidiaBackend {
         use crate::caps::{COMPUTE, GRAPHICS};
         let refusal = match DeviceKind::from_device_type(req.device_type) {
             Some(DeviceKind::UvmTools) => Some(("open nvidia-uvm-tools", "(none: never served)")),
-            Some(DeviceKind::Uvm) if !self.caps.has(COMPUTE) => {
+            Some(DeviceKind::Uvm) if !self.start.caps.has(COMPUTE) => {
                 Some(("open nvidia-uvm", "compute"))
             }
-            Some(DeviceKind::Modeset) if !self.caps.has(GRAPHICS) => {
+            Some(DeviceKind::Modeset) if !self.start.caps.has(GRAPHICS) => {
                 Some(("open nvidia-modeset", "graphics"))
             }
-            Some(DeviceKind::Dri(_)) if !self.caps.has(GRAPHICS) => {
+            Some(DeviceKind::Dri(_)) if !self.start.caps.has(GRAPHICS) => {
                 Some(("open render node", "graphics"))
             }
             _ => None,

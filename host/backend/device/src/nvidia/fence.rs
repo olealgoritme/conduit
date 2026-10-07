@@ -94,7 +94,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EAGAIN);
         }
         let mut p = param_in.to_vec();
-        if self.bounds.clamp_fence_create(&mut p) {
+        if self.start.bounds.clamp_fence_create(&mut p) {
             log::warn!("SEMSURF_FENCE_CREATE: timeout clamped");
         }
         // -1 in, so a host that answers without writing the field is caught

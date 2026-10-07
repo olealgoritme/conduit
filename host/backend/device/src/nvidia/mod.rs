@@ -176,7 +176,75 @@ fn host_dev_info(path: &str, layout: &abi::devinfo::Layout) -> Option<abi::devin
 // NvidiaBackend
 // ============================================================
 
+/// Everything the transport and the command line set at start and a device
+/// reset must keep: the host release and the tables selected for it, what is
+/// served, the video-memory limit and the timeout ceilings. One value, carried
+/// whole by [`NvidiaBackend::reset`], so a setting added here is kept by
+/// construction and cannot be dropped by a field-by-field copy.
+pub(super) struct StartSettings {
+    /// What this guest is served. See `crate::caps`.
+    pub(super) caps: crate::caps::Caps,
+    /// Host driver version, learned from the first successful
+    /// `NV_ESC_CHECK_VERSION_STR`.
+    pub(super) driver: Option<abi::version::DriverVersion>,
+    /// ABI profile selected for `driver`, if one exists.
+    pub(super) abi: Option<&'static [abi::versions::IoctlEntry]>,
+    /// The RM controls whose parameters carry a pointer RM dereferences, for
+    /// `driver`, and whether the table is this release's own. `None` until the
+    /// release is known; the backend refuses to start without one.
+    pub(super) rmctrl: Option<abi::rmctrl::Selected>,
+    /// The controls and classes RM exports to an unprivileged caller, for
+    /// `driver`, and whether the tables are this release's own. `None` until
+    /// the release is known; the backend refuses to start without them.
+    ///
+    /// RM applies this rule to the *backend*, which is a service account on
+    /// the host, not to the guest. So the backend applies it on the guest's
+    /// behalf, before forwarding. See `abi::rmallow`.
+    pub(super) rmallow: Option<abi::rmallow::Selected>,
+    /// The UVM commands the host release defines, their sizes, and where the
+    /// descriptors sit in them. `None` until the release is known, and until
+    /// then nothing says what a UVM call even is, so none is served.
+    pub(super) uvm: Option<abi::uvm::Selected>,
+    /// Where the host release keeps the CPU address on each of the three
+    /// routes that let a caller name memory by one. `None` until the release
+    /// is known, and until then those routes are not recognised -- which is
+    /// why nothing is served before a release is known at all.
+    pub(super) osdesc: Option<abi::osdesc::OsDesc>,
+    /// Where an allocation's size is and what tells the guest how much video
+    /// memory there is, for this release. See `vidmem.rs`.
+    pub(super) vidmem: Option<abi::vidmem::Selected>,
+    /// Where the host release keeps each field of `DRM_NVIDIA_GET_DEV_INFO`,
+    /// and so which size of the ioctl to ask the host's nodes. `None` until
+    /// the release is known. See [`abi::devinfo`].
+    pub(super) devinfo: Option<abi::devinfo::Selected>,
+    /// Ceilings on the timeouts a guest may forward (bounds.rs).
+    pub(super) bounds: bounds::Bounds,
+    /// The video-memory limit in MiB, `None` for none: the number
+    /// [`Vram`](crate::vram::Vram) is rebuilt from, its books starting empty.
+    pub(super) vram_limit_mib: Option<u64>,
+}
+
+impl StartSettings {
+    fn new() -> Self {
+        Self {
+            caps: crate::caps::Caps::DEFAULT,
+            driver: None,
+            abi: None,
+            rmctrl: None,
+            rmallow: None,
+            uvm: None,
+            osdesc: None,
+            vidmem: None,
+            devinfo: None,
+            bounds: bounds::Bounds::NORMAL,
+            vram_limit_mib: None,
+        }
+    }
+}
+
 pub struct NvidiaBackend {
+    /// What a device reset keeps. See [`StartSettings`].
+    start: StartSettings,
     /// The message being served, so a response can echo its type, and the
     /// handle it named, so handlers need not thread either through.
     current_msg: MsgType,
@@ -194,39 +262,6 @@ pub struct NvidiaBackend {
     active_maps: crate::mmap::MmapContext,
     /// Which device each open handle names, for mappings made without one.
     handle_kinds: std::collections::HashMap<u64, DeviceKind>,
-    /// Host driver version, learned from the first successful
-    /// `NV_ESC_CHECK_VERSION_STR`.
-    driver: Option<abi::version::DriverVersion>,
-    /// ABI profile selected for `driver`, if one exists.
-    abi: Option<&'static [abi::versions::IoctlEntry]>,
-    /// The RM controls whose parameters carry a pointer RM dereferences, for
-    /// `driver`, and whether the table is this release's own. `None` until the
-    /// release is known; the backend refuses to start without one.
-    rmctrl: Option<abi::rmctrl::Selected>,
-    /// The controls and classes RM exports to an unprivileged caller, for
-    /// `driver`, and whether the tables are this release's own. `None` until
-    /// the release is known; the backend refuses to start without them.
-    ///
-    /// RM applies this rule to the *backend*, which is a service account on
-    /// the host, not to the guest. So the backend applies it on the guest's
-    /// behalf, before forwarding. See `abi::rmallow`.
-    rmallow: Option<abi::rmallow::Selected>,
-    /// The UVM commands the host release defines, their sizes, and where the
-    /// descriptors sit in them. `None` until the release is known, and until
-    /// then nothing says what a UVM call even is, so none is served.
-    uvm: Option<abi::uvm::Selected>,
-    /// Where the host release keeps the CPU address on each of the three
-    /// routes that let a caller name memory by one. `None` until the release
-    /// is known, and until then those routes are not recognised -- which is
-    /// why nothing is served before a release is known at all.
-    osdesc: Option<abi::osdesc::OsDesc>,
-    /// Where an allocation's size is and what tells the guest how much video
-    /// memory there is, for this release. See `vidmem.rs`.
-    vidmem: Option<abi::vidmem::Selected>,
-    /// Where the host release keeps each field of `DRM_NVIDIA_GET_DEV_INFO`,
-    /// and so which size of the ioctl to ask the host's nodes. `None` until
-    /// the release is known. See [`abi::devinfo`].
-    devinfo: Option<abi::devinfo::Selected>,
     /// NVOS32 FREE calls seen. Not charged back, because the table has no
     /// layout for them; reported so a workload that uses them is noticed.
     vidmem_untracked_frees: u64,
@@ -296,8 +331,6 @@ pub struct NvidiaBackend {
     live_maps: std::collections::HashMap<u32, LiveMap>,
     /// Guarded buffers for parameter blocks, reused across calls.
     guards: std::cell::RefCell<crate::guarded::GuardPool>,
-    /// What this guest is served. See `crate::caps`.
-    caps: crate::caps::Caps,
     /// Opens and allocations refused because their capability is off, by
     /// what was asked for. Reported at teardown.
     caps_refused: std::collections::BTreeMap<String, u64>,
@@ -362,8 +395,6 @@ pub struct NvidiaBackend {
     /// `crate::vram`. `Vram::new(None)` is no limit, which is what a VMM that
     /// never sets one gets.
     vram: crate::vram::Vram,
-    /// Ceilings on the timeouts a guest may forward (bounds.rs).
-    bounds: bounds::Bounds,
     /// Venus (docs/VENUS.md), with `--venus` only. `None`: `GpuCmd` is
     /// refused as an unknown message is.
     #[cfg(feature = "venus")]
@@ -418,6 +449,7 @@ impl NvidiaBackend {
 
     fn with_shm(shm: ShmAllocator) -> Self {
         Self {
+            start: StartSettings::new(),
             window: None,
             dri_maps: std::collections::HashMap::new(),
             aperture: Default::default(),
@@ -425,16 +457,8 @@ impl NvidiaBackend {
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             guards: Default::default(),
-            rmctrl: None,
-            caps: crate::caps::Caps::DEFAULT,
             caps_refused: std::collections::BTreeMap::new(),
             vram: crate::vram::Vram::new(None),
-            bounds: bounds::Bounds::NORMAL,
-            rmallow: None,
-            uvm: None,
-            osdesc: None,
-            vidmem: None,
-            devinfo: None,
             vidmem_untracked_frees: 0,
             guest_ram: None,
             registrations: std::collections::HashMap::new(),
@@ -460,8 +484,6 @@ impl NvidiaBackend {
             shm,
             active_maps: crate::mmap::MmapContext::new(),
             handle_kinds: std::collections::HashMap::new(),
-            driver: None,
-            abi: None,
             host: Box::new(RealHost),
             display: None,
             dmabufs: Default::default(),
@@ -500,11 +522,11 @@ impl NvidiaBackend {
 
     /// Choose what this guest is served.
     pub fn set_caps(&mut self, caps: crate::caps::Caps) {
-        self.caps = caps;
+        self.start.caps = caps;
     }
 
     pub fn caps(&self) -> crate::caps::Caps {
-        self.caps
+        self.start.caps
     }
 
     /// Set the guest's video-memory budget. `None` is no limit.
@@ -513,22 +535,24 @@ impl NvidiaBackend {
     /// own: the limit could not be enforced, and a backend that announces a
     /// limit it is not holding the guest to is worse than one with none.
     pub fn set_vram_limit_mib(&mut self, mib: Option<u64>) -> std::result::Result<(), String> {
-        if mib.is_some() && !self.vidmem.is_some_and(|s| s.exact) {
-            return Err(match self.driver {
+        if mib.is_some() && !self.start.vidmem.is_some_and(|s| s.exact) {
+            return Err(match self.start.driver {
                 Some(v) => format!(
                     "--vram-limit-mib: host driver {v} has no video-memory table of its own"
                 ),
                 None => "--vram-limit-mib: the host driver release is not known yet".to_string(),
             });
         }
+        self.start.vram_limit_mib = mib;
         self.vram = crate::vram::Vram::new(mib);
         Ok(())
     }
 
     /// Safe mode: the blocking timeouts a guest may forward shrink to
-    /// [`bounds::Bounds::SAFE`]. The caller also sets a video-memory limit.
+    /// [`bounds::Bounds::SAFE`]. The video-memory limit is not decided here: the CLI passes the final number
+    /// (`--vram-limit-mib`) and [`Self::set_vram_limit_mib`] enforces it.
     pub fn set_safe_mode(&mut self, on: bool) {
-        self.bounds = if on {
+        self.start.bounds = if on {
             bounds::Bounds::SAFE
         } else {
             bounds::Bounds::NORMAL
@@ -551,7 +575,7 @@ impl NvidiaBackend {
         if *n == 0 {
             log::warn!(
                 "{what} refused: needs --caps {needs} (serving {})",
-                self.caps
+                self.start.caps
             );
         }
         *n += 1;
@@ -567,8 +591,8 @@ impl NvidiaBackend {
         let Some(t) = abi::versions::table_for(v) else {
             return Err(format!("host driver {v} is older than every ABI profile"));
         };
-        self.driver = Some(v);
-        self.abi = Some(t);
+        self.start.driver = Some(v);
+        self.start.abi = Some(t);
         // Without a table nothing can be said about which controls carry a
         // pointer RM dereferences, and the backend would forward all of them.
         // It refuses to start instead. Unreachable as things are -- the tables
@@ -577,14 +601,14 @@ impl NvidiaBackend {
         let Some(sel) = abi::rmctrl::select(v) else {
             return Err(format!("host driver {v} has no RM pointer table"));
         };
-        self.rmctrl = Some(sel);
+        self.start.rmctrl = Some(sel);
         // Likewise for the allowlist: without it the backend would forward
         // every control RM is willing to run for a service account, which is
         // most of them.
         let Some(allow) = abi::rmallow::select(v) else {
             return Err(format!("host driver {v} has no RM allowlist"));
         };
-        self.rmallow = Some(allow);
+        self.start.rmallow = Some(allow);
         // And for UVM. Nothing here is a privilege rule -- UVM has none to
         // read -- but without the table a UVM call has no size to be checked
         // against and no way to say where its descriptors are, which is the
@@ -592,21 +616,21 @@ impl NvidiaBackend {
         let Some(uvm) = abi::uvm::select(v) else {
             return Err(format!("host driver {v} has no UVM command table"));
         };
-        self.uvm = Some(uvm);
+        self.start.uvm = Some(uvm);
         // And the routes that name memory by a CPU address, so they can be
         // recognised and refused. Without the table they would not be.
         let Some(osdesc) = abi::osdesc::select(v) else {
             return Err(format!("host driver {v} has no OS-descriptor table"));
         };
-        self.osdesc = Some(osdesc);
-        self.vidmem = abi::vidmem::select(v);
+        self.start.osdesc = Some(osdesc);
+        self.start.vidmem = abi::vidmem::select(v);
         // And what the host's DRM nodes answer GET_DEV_INFO with: its size is
         // in the ioctl number, so asking with the wrong one reads the wrong
         // words, or none.
         let Some(devinfo) = abi::devinfo::select(v) else {
             return Err(format!("host driver {v} has no GET_DEV_INFO layout"));
         };
-        self.devinfo = Some(devinfo);
+        self.start.devinfo = Some(devinfo);
         log::info!(
             "host driver {v}: {} RM controls carry a pointer RM dereferences",
             sel.table.len()
@@ -654,31 +678,35 @@ impl NvidiaBackend {
     /// one whose parameter size changed -- which a channel allocation's always
     /// has, so a guest fails at its first channel rather than at start.
     pub fn inexact_tables(&self) -> Vec<&'static str> {
-        if self.driver.is_none() {
+        if self.start.driver.is_none() {
             return Vec::new();
         }
         // The escape profile is not counted: it comes from gVisor's nvproxy,
         // which lags NVIDIA's releases, and the escapes it describes have
         // kept their sizes across them (CHECK_VERSION_STR still guards it).
         let mut out = Vec::new();
-        if self.rmctrl.is_some_and(|s| !s.exact) {
+        if self.start.rmctrl.is_some_and(|s| !s.exact) {
             out.push("RM pointer table");
         }
-        if self.rmallow.is_some_and(|s| !s.exact) {
+        if self.start.rmallow.is_some_and(|s| !s.exact) {
             out.push("RM allowlist");
         }
-        if self.uvm.is_some_and(|s| !s.exact) {
+        if self.start.uvm.is_some_and(|s| !s.exact) {
             out.push("UVM command table");
         }
-        if self.vidmem.is_some_and(|s| !s.exact) {
+        if self.start.vidmem.is_some_and(|s| !s.exact) {
             out.push("video-memory table");
         }
-        if self.devinfo.is_some_and(|s| !s.exact) {
+        if self.start.devinfo.is_some_and(|s| !s.exact) {
             out.push("GET_DEV_INFO layout");
         }
         // No nearest-older fallback: with no table of its own a release is
         // served only ALLOC/FREE_DEVICE through NVKMS.
-        if self.driver.is_some_and(|v| abi::nvkms::select(v).is_none()) {
+        if self
+            .start
+            .driver
+            .is_some_and(|v| abi::nvkms::select(v).is_none())
+        {
             out.push("NVKMS command table");
         }
         out
@@ -999,16 +1027,8 @@ impl NvidiaBackend {
         // firmware, boot menu, disk password -- until the guest's driver
         // flips again.
         self.display = old.display.take();
-        self.caps = old.caps;
-        self.driver = old.driver;
-        self.abi = old.abi;
-        self.rmctrl = old.rmctrl.take();
-        self.rmallow = old.rmallow.take();
-        self.uvm = old.uvm.take();
-        self.osdesc = old.osdesc.take();
-        self.vidmem = old.vidmem.take();
-        self.devinfo = old.devinfo;
-        self.vram = crate::vram::Vram::new(old.vram.limit().map(|b| b >> 20));
+        self.start = std::mem::replace(&mut old.start, StartSettings::new());
+        self.vram = crate::vram::Vram::new(self.start.vram_limit_mib);
         #[cfg(feature = "venus")]
         {
             self.venus = venus;

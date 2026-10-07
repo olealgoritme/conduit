@@ -67,7 +67,7 @@ impl NvidiaBackend {
         params: &[u8],
     ) -> Option<Registration> {
         use abi::ioctl::*;
-        let d = self.osdesc?;
+        let d = self.start.osdesc?;
         match escape {
             NV_ESC_RM_ALLOC if class == Some(d.class) => Some(Registration::Alloc),
             NV_ESC_RM_ALLOC_MEMORY => {
@@ -92,6 +92,7 @@ impl NvidiaBackend {
     /// message, its fields sit.
     fn shape(&self, route: Registration, data_len: usize) -> Shape {
         let d = self
+            .start
             .osdesc
             .expect("a route is only recognised when the table is there");
         match route {
@@ -237,6 +238,7 @@ impl NvidiaBackend {
         // this route is NV_ERR_NOT_SUPPORTED, so refusing the rest here costs
         // a guest nothing it could otherwise have had.
         let d = self
+            .start
             .osdesc
             .expect("a route is only recognised when the table is there");
         if s.route
@@ -371,6 +373,7 @@ impl NvidiaBackend {
         resp_buf: &mut [u8],
     ) -> usize {
         let d = self
+            .start
             .osdesc
             .expect("a route is only recognised when the table is there");
 

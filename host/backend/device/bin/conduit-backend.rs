@@ -1181,7 +1181,6 @@ impl NvGpuBackend {
         }
         nvidia.set_caps(caps);
         nvidia.set_safe_mode(safe_mode);
-        let vram_limit_mib = device::vram::effective_limit_mib(safe_mode, vram_limit_mib);
         nvidia
             .set_vram_limit_mib(vram_limit_mib)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
@@ -1895,21 +1894,28 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Read once, here. The strictest posture for a first run on a GPU that
-    // also drives a desktop: a video-memory cap whatever was asked, and the
-    // blocking timeouts a guest may forward cut to 1 s (nvidia/bounds.rs).
+    // also drives a desktop: the blocking timeouts a guest may forward cut to
+    // 1 s (nvidia/bounds.rs).
     let safe_mode = std::env::var("CONDUIT_SAFE_MODE").as_deref() == Ok("1");
     if safe_mode {
+        // The video-memory limit is not decided here: the CLI computes the one
+        // final number (cli/src/protect.rs `final_limit_mib`: the smallest of
+        // the owner's number, the display default and the 2 GiB safe-mode cap)
+        // and this process enforces what it was given.
         log::warn!(
-            "SAFE MODE is on (CONDUIT_SAFE_MODE=1): video memory capped at {} MiB unless a lower \
-             --vram-limit-mib was given, forwarded blocking timeouts clamped to 1 s",
-            device::vram::SAFE_MODE_VRAM_MIB
+            "SAFE MODE is on (CONDUIT_SAFE_MODE=1): forwarded blocking timeouts clamped to 1 s; \
+             video memory is held to --vram-limit-mib as the CLI computed it ({})",
+            args.vram_limit_mib
+                .map_or("none given, so no limit".to_string(), |m| format!(
+                    "{m} MiB"
+                ))
         );
     }
     log::info!(
         "conduit-backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}",
         args.socket,
         args.caps,
-        match device::vram::effective_limit_mib(safe_mode, args.vram_limit_mib) {
+        match args.vram_limit_mib {
             Some(m) => format!("video memory limited to {m} MiB"),
             None => "no video memory limit".to_string(),
         }

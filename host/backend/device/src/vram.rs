@@ -40,20 +40,6 @@
 
 use std::collections::HashMap;
 
-/// The video-memory budget safe mode (`CONDUIT_SAFE_MODE=1`) holds a guest to
-/// when no limit was given: small enough for any card a desktop shares.
-pub const SAFE_MODE_VRAM_MIB: u64 = 2048;
-
-/// The limit to enforce: the one asked for, or in safe mode at least
-/// [`SAFE_MODE_VRAM_MIB`]'s worth of cap where there was none. Safe mode never
-/// raises a limit someone set, and never lets one be absent.
-pub fn effective_limit_mib(safe_mode: bool, requested: Option<u64>) -> Option<u64> {
-    match (safe_mode, requested) {
-        (true, None) => Some(SAFE_MODE_VRAM_MIB),
-        (_, r) => r,
-    }
-}
-
 /// An RM client handle (`hClient` / `hRoot`).
 pub type Client = u32;
 /// An RM object handle, unique within its client.
@@ -460,13 +446,5 @@ mod tests {
         v.freed(0xbad, 0xbad);
         v.file_closed(99);
         assert_eq!(v.in_use(), 0);
-    }
-
-    #[test]
-    fn safe_mode_caps_an_unlimited_guest_and_never_raises_a_limit() {
-        assert_eq!(effective_limit_mib(false, None), None);
-        assert_eq!(effective_limit_mib(true, None), Some(SAFE_MODE_VRAM_MIB));
-        assert_eq!(effective_limit_mib(true, Some(512)), Some(512));
-        assert_eq!(effective_limit_mib(false, Some(9000)), Some(9000));
     }
 }

@@ -16,7 +16,7 @@ impl NvidiaBackend {
     /// Layout is `nv_ioctl_rm_api_version_t`: cmd (4), reply (4), then a
     /// NUL-terminated 64-byte version string.
     pub(super) fn learn_driver_version(&mut self, param_buf: &[u8]) {
-        if self.driver.is_some() || param_buf.len() < 12 {
+        if self.start.driver.is_some() || param_buf.len() < 12 {
             return;
         }
         let tail = &param_buf[8..];
@@ -27,20 +27,20 @@ impl NvidiaBackend {
         let Some(v) = abi::version::DriverVersion::parse(text) else {
             return;
         };
-        self.driver = Some(v);
-        self.abi = abi::versions::table_for(v);
+        self.start.driver = Some(v);
+        self.start.abi = abi::versions::table_for(v);
         // The RM pointer table goes with it. A caller that learns the release
         // this way rather than through `set_host_driver_version` -- another
         // VMM embedding this crate -- would otherwise have an ABI profile and
         // no pointer table, and every control that carries a pointer would go
         // through undescribed, which is what this crate stopped doing in M3.
-        self.rmctrl = abi::rmctrl::select(v);
-        self.rmallow = abi::rmallow::select(v);
-        self.uvm = abi::uvm::select(v);
-        self.osdesc = abi::osdesc::select(v);
-        self.vidmem = abi::vidmem::select(v);
-        self.devinfo = abi::devinfo::select(v);
-        match self.abi {
+        self.start.rmctrl = abi::rmctrl::select(v);
+        self.start.rmallow = abi::rmallow::select(v);
+        self.start.uvm = abi::uvm::select(v);
+        self.start.osdesc = abi::osdesc::select(v);
+        self.start.vidmem = abi::vidmem::select(v);
+        self.start.devinfo = abi::devinfo::select(v);
+        match self.start.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
             None => log::warn!(
                 "host driver {v} is older than every ABI profile; ioctls will be \
@@ -90,7 +90,7 @@ impl NvidiaBackend {
         // No allowlist at all means nothing can be said about any control.
         // Unreachable through `set_host_driver_version`, which refuses to
         // start without one; reachable by another VMM embedding this crate.
-        let Some(sel) = self.rmallow else {
+        let Some(sel) = self.start.rmallow else {
             return Some("no RM allowlist for this host".into());
         };
         let Some(rule) = sel.ctrl_rule(cmd) else {
@@ -137,7 +137,7 @@ impl NvidiaBackend {
     /// way. NVIDIA's userspace leaves it zero, so checking it refused every
     /// workload at its first VA space (`FERMI_VASPACE_A`).
     fn rm_class_refusal(&self, class: u32, have: usize) -> Option<String> {
-        let Some(sel) = self.rmallow else {
+        let Some(sel) = self.start.rmallow else {
             return Some("no RM allowlist for this host".into());
         };
         let Some(entry) = sel.class_entry(class) else {
@@ -224,7 +224,7 @@ impl NvidiaBackend {
     /// bytes. Without a check it surfaces as corrupt GPU state rather than an
     /// error.
     pub fn check_abi(&self, escape: u32, param_size: u32) -> AbiCheck {
-        let Some(table) = self.abi else {
+        let Some(table) = self.start.abi else {
             return AbiCheck::NoProfile;
         };
         let Some(entry) = abi::versions::lookup(table, escape) else {
@@ -445,14 +445,18 @@ impl NvidiaBackend {
                     log::warn!(
                         "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects \
                          {expected}",
-                        self.driver.expect("a profile implies a known version")
+                        self.start
+                            .driver
+                            .expect("a profile implies a known version")
                     );
                     true
                 }
                 AbiCheck::UnknownEscape => {
                     log::warn!(
                         "escape {escape:#04x} is not in the ABI profile for host driver {}",
-                        self.driver.expect("a profile implies a known version")
+                        self.start
+                            .driver
+                            .expect("a profile implies a known version")
                     );
                     true
                 }
@@ -509,7 +513,7 @@ impl NvidiaBackend {
                 // a connector or a dpy, so the queries that would describe the
                 // host's monitors are never asked, and they stay refused if
                 // they are.
-                match abi::nvkms::verdict(self.driver, nvkms_cmd) {
+                match abi::nvkms::verdict(self.start.driver, nvkms_cmd) {
                     abi::nvkms::Verdict::AnswerVblank { reply_handle } => {
                         const OUTER: usize = 16;
                         const ENABLE_REPLY_HANDLE: usize = 24;
@@ -545,7 +549,7 @@ impl NvidiaBackend {
             // shows up on some driver versions.
             let nvkms_fd_offset = if param_in.len() >= 4
                 && abi::nvkms::verdict(
-                    self.driver,
+                    self.start.driver,
                     u32::from_le_bytes(param_in[0..4].try_into().unwrap()),
                 ) == abi::nvkms::Verdict::ForwardWithFd
             {
@@ -719,7 +723,7 @@ impl NvidiaBackend {
             // with the GPU group lock held for that long.
             NV_ESC_RM_IDLE_CHANNELS => {
                 let mut p = param_in.to_vec();
-                if self.bounds.clamp_idle_channels(&mut p) {
+                if self.start.bounds.clamp_idle_channels(&mut p) {
                     log::warn!("NV_ESC_RM_IDLE_CHANNELS: timeout clamped");
                 }
                 self.dispatch_simple(cookie, host_fd, request, &p, resp_buf)
@@ -774,7 +778,7 @@ impl NvidiaBackend {
                     let class = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
                     *self.rm_classes.entry(class).or_insert(0) += 1;
                     if let Some(bit) = crate::caps::Caps::for_class(class)
-                        && !self.caps.has(bit)
+                        && !self.start.caps.has(bit)
                     {
                         return self.refuse_alloc_class(cookie, class, bit, param_in, resp_buf);
                     }
