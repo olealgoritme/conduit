@@ -1159,7 +1159,7 @@ full zero block once per generation even if nothing is ever seen.
 | `DmaGpuFence`, `PresentWmk`, `WddmHoldMs`, `WddmHeadMs` | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` fields / statics | `DmaGfEff`, `PrWmkEff`, `WdHoldEff`, `WdHeadEff` (new) |
 | `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
-| `SubmitPool` (24.13) | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `SubPoolOn` (every start) |
+| `SubmitPool`, `SubStageClk` (24.14) | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `SubPoolOn`, `SubClkOn` (every start) |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `VsPowerMode`, `VsWatchdog`, `VsIdleWake`, `VsWdTimer` (15.4, 19.3) | StartDevice (`stall_diag::reread_knobs`) | static | `VsPwrEff`, `VsWdgEff`, `VsIdlEff`, `VsWdTmEff` (every start, 0 included) |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
@@ -3437,9 +3437,9 @@ Pass conditions on hardware (Heaven windowed, NVK DWM, `GuestBlob=1`, host `--ve
 * Not done: creating the guest blob off the Present path (on the HPD worker); a periodic first-row checksum (`GbBad` in 13.3's
   test plan).
 
-### 24.13 Display submit staging (`SubmitPool`, `Sub*`)
+### 24.14 Display submit staging (`SubmitPool`, `Sub*`)
 
-#### 24.13.1 The evidence
+#### 24.14.1 The evidence
 
 The joined guest+host stage table of windowed Heaven (`GuestBlob`, `BltAsync`, `ForeignCopy`) gives p50 **KMD submit ->
 backend kick = 114.5 us** (p99 186 us) for the windowed Blt copy, against **19.7 us** for the foreign-flip submit. Everything
@@ -3454,7 +3454,7 @@ stream, and then under `virtio_lock` a `drain_used` before the enqueue. The fore
 path (`submit_venus_async`) had taken its buffers from the transport's DMA pool all along. The display paths never did. The reap
 still recycled their buffers into that pool, so the pool was fed by display buffers that only the escape path ever took.
 
-#### 24.13.2 The stages (instrumentation, `kmd_logic::submit_stage::Clock`)
+#### 24.14.2 The stages (instrumentation, `kmd_logic::submit_stage::Clock`)
 
 Each display submit runs under a stage clock (interrupt time, 100 ns, atomics only, published by `publish_nvrm_counters` on
 the mirror thread's cadence and zeroed at every start). The stages are, in order:
@@ -3469,6 +3469,7 @@ the mirror thread's cadence and zeroed at every start). The stages are, in order
 | Drain | `SubDrain` | `drain_used` before the enqueue |
 | Enq | `SubEnq` | the enqueue: descriptors, avail-ring publish, in-flight record, minus the notify |
 | Kick | `SubKick` | `transport.notify` (the doorbell, a VM exit), timed inside `publish_then_notify` by a timer the display submitter arms in its own lock hold (`KickTimer`; every other enqueue pays one `armed` test) |
+| Prep | `SubPrep` | work of the submit before its staging: the foreign flip's mint and request build (24.14.9); 0 on the display paths |
 
 Also written: `SubTotal` / `SubTotMax` (whole submit, total and longest, us), `SubN` (submits measured, every call),
 `SubAllocN` (fresh allocations), `SubPoolHit` (buffers taken from the pool), `SubNoKick` (enqueues whose notify the device
@@ -3477,7 +3478,7 @@ all: the clock's own cost), and per path `SubNScan`, `SubNPres`, `SubNBlt`, `Sub
 written at every StartDevice. All names are in `kmd_logic::submit_stage::COUNTERS` (14 characters at most). The host tests
 check that `virtio/submit_stage.rs` writes exactly that list and that no other `kmd_render` file spells one of them.
 
-#### 24.13.3 The pool (`SubmitPool` 1, the default)
+#### 24.14.3 The pool (`SubmitPool` 1, the default)
 
 `stage_display_submit` now does what the escape path does. In ONE `with_virtio` hold it runs `begin_parked_reap`,
 `take_dma_buffer(SUBMIT_META_BYTES)` and `take_dma_buffer(stream.len())`. Then it finishes the reap at PASSIVE
@@ -3506,7 +3507,7 @@ supply (`submit_stage::plan`, host-tested). There is no new pool.
   would be shared by every in-flight submit of that command, which needs a reference count on the in-flight entries, and the
   copy it saves is `SubCopy` (expected well under 1 us). Revisit only if `SubCopy / SubN` says otherwise.
 
-#### 24.13.4 The pre-enqueue drain
+#### 24.14.4 The pre-enqueue drain
 
 `drain_used` stays unconditional. On an empty used ring it is already one acquire load (`peek_used` of the used index), so a
 separate peek before it saves nothing. On a non-empty ring it does the DPC's work early, and the enqueue in the same hold
@@ -3516,13 +3517,13 @@ microseconds for more QueueFull and `DstBusy` outcomes. `SubDrainHit / SubN` and
 when it has work. If that is large, the next step is to drain only when `available_desc()` is short. That would be safe for
 the scan-out and Present paths and not for `BltAsync`.
 
-#### 24.13.5 Knob
+#### 24.14.5 Knob
 
 `SubmitPool` (REG_DWORD in the service key, default 1; `diag::knobs::SUBMIT_POOL`), read at AddDevice and every StartDevice
 (`AdapterKnobs`), mirrored as `SubPoolOn`. 0 is the old allocate-per-submit path exactly, for a same-boot A/B
 (`reg add` + `pnputil /restart-device`). The stage counters run with either value.
 
-#### 24.13.6 What to read on hardware (windowed Heaven, lowest mode first)
+#### 24.14.6 What to read on hardware (windowed Heaven, lowest mode first)
 
 Run `SubmitPool=0` and then `SubmitPool=1` in the same boot, and compare per submit (divide by `SubN`):
 
@@ -3541,7 +3542,7 @@ Run `SubmitPool=0` and then `SubmitPool=1` in the same boot, and compare per sub
   (`SubAllocN`), `DpDrp` (buffers
   the full pool refused) should not grow faster than before, and `DpByt` (cached bytes) settles a few pages higher.
 
-#### 24.13.7 Risks
+#### 24.14.7 Risks
 
 * The display paths now share the pool with the escape path. Both take and both return, and a miss is a fresh allocation, so
   the worst case is today's behaviour.
@@ -3549,9 +3550,9 @@ Run `SubmitPool=0` and then `SubmitPool=1` in the same boot, and compare per sub
   can be charged to a display submit.
 * The clock reads interrupt time about 10 times per display submit (`SubClock` shows what that costs).
 
-#### 24.13.8 Where the code is, verified and not
+#### 24.14.8 Where the code is, verified and not
 
-* Pure: `kmd_logic/src/submit_stage.rs` (`Clock`, `KickTimer`, `plan`, `fresh_count`, `COUNTERS`, the name scans; 12 tests).
+* Pure: `kmd_logic/src/submit_stage.rs` (`Clock`, `KickTimer`, `plan`, `fresh_count`, `COUNTERS`, `TABLE_NAMES`, the name scans; 13 tests).
 * I/O: `kmd_render/src/virtio/submit_stage.rs` (atomics, publication, knob mirror). `virtio/ctrl.rs`: `stage_display_submit`
   (the pool), `measured`, `display_enqueue` (the drain, enqueue and kick timing). `virtio/gpu/mod.rs`: `publish_then_notify`
   (kick timer), `used_pending`. The knob is in `diag.rs` and `adapter/mod.rs` (`AdapterKnobs::submit_pool`).
@@ -3559,6 +3560,68 @@ Run `SubmitPool=0` and then `SubmitPool=1` in the same boot, and compare per sub
   with no new error against the base (a deliberate error planted in each edited file was reported).
 * NOT verified: anything on hardware. In particular, the size of each stage, and that the pool hit rate stays high under the
   escape path's load.
+
+#### 24.14.9 First hardware run (349.1), and the foreign flip
+
+The pool did what it was meant to do. Submit -> kick for the windowed Blt copy fell from 121.7 us to 21.1 us, and `SubAlloc`
+per submit fell from 96 us to 0.03 us. `SubKick` per submit is about 18.6 us, so the doorbell is now almost all of what is
+left. In the same run, the foreign flip's KMD submit -> backend kick rose from about 20 us to about 36 us. The flips (about
+2739 per Heaven run) were not instrumented, because they do not go through the display submitters.
+
+**The flip's submit path.** `foreign_flip::flip_async` (`virtio/foreign_flip.rs:1332`) calls
+`foreign_scanout::present_submit` (`virtio/foreign_scanout.rs:277`: mint, release-book entry, request build), which calls
+`ctrl::raw_submit_async` (`virtio/ctrl.rs:758`). That function does one `with_virtio` hold for `begin_parked_reap` and
+`take_dma_buffer(req + 32)`, then the PASSIVE reap, then a pool miss's allocation, then one `with_virtio` hold for `drain_used`
+and `enqueue_raw_async`. The enqueue ends in `publish_then_notify` (`virtio/gpu/mod.rs:3339`), which rings the doorbell under
+`virtio_lock`. The flip's buffer goes straight back to the pool in the drain's `RawAsync` arm (`virtio/gpu/mod.rs:5033`).
+
+**Why the pool change could slow it (by reading).**
+
+* **It does not starve the flip of buffers.** The flip shares the pool, but it returns its buffer at its own completion, and
+  the display paths return theirs through the reap. The pool hit rate of the display paths is about 100 %.
+* **A larger pooled buffer costs nothing.** It is not zeroed, and the descriptor names only the request length.
+* **The take+reap hold did not grow materially.** The display path's take hold is `begin_parked_reap` plus two best-fit takes.
+  Each take stops at the first page-sized buffer, and the pool is full of them, so the hold is about the old reap's own begin
+  hold. The recycle and finish holds are unchanged. So shortening the take (moving it outside the lock, or a free list per
+  class) would not buy the flip's 16 us, and I did not do it.
+* **The doorbell inside `virtio_lock` is the likely cause.** It costs about 18.6 us (a VM exit), and every submitter rings it
+  while holding `virtio_lock`. Before the pool, the Blt submit spent about 95 us allocating outside the lock, and its short
+  locked enqueue+kick happened at some other moment. Now the whole Blt submit is about 21 us. Its locked kick lands in the same
+  short window after a frame in which the HPD worker submits the flip, so a flip that meets it spins on `virtio_lock` for up to
+  one kick, about 18 us. That is the size of the regression. The instrumentation itself is the other candidate: five
+  interrupt-time reads inside the hold (the `Lock`, `Drain` and `Enq` laps, and the two kick stamps). `SubClock` says what one
+  read costs.
+
+**Instrumented now.** The flip runs under the same stage clock (`Path::Flip`). `Prep` is the mint and the request build, and
+the staging and the enqueue hold are timed as for the display paths. It is NOT in the aggregate `Sub*` totals, which remain the
+four display submitters' totals and are comparable with 349.1. It has its own table, and the windowed Blt gets one too
+(`kmd_logic::submit_stage::TABLE_NAMES`, written by `virtio/submit_stage.rs`, covered by the same name scans):
+
+| Row | Names (total us unless noted) |
+|---|---|
+| windowed Blt | `SubWPrep` `SubWReap` `SubWTake` `SubWAlloc` `SubWLock` `SubWDrain` `SubWEnq` `SubWKick` `SubWTot` `SubWTotMax` `SubWN` (count) |
+| foreign flip | `SubFPrep` `SubFReap` `SubFTake` `SubFAlloc` `SubFLock` `SubFDrain` `SubFEnq` `SubFKick` `SubFTot` `SubFTotMax` `SubFN` (count) |
+
+The aggregate gained `SubPrep` (0 on the display paths).
+
+**New knob, `SubStageClk`** (default 1; `diag::knobs::SUBMIT_STAGE_CLOCK`, mirrored as `SubClkOn`). With 0, no interrupt time
+is read on any submit path, and only the counts run (`SubN`, `SubWN`, `SubFN`, `SubAllocN`, `SubPoolHit`). This is the A/B
+for the clock's own cost inside the lock.
+
+**What to read next (divide each total by its row's `N`).**
+
+* `SubWTot / SubWN` should be about 21 us, with `SubWKick` about 18.6 us and `SubWAlloc` about 0. This confirms 349.1 for the
+  windowed path alone.
+* `SubFTot / SubFN` should be about 36 us. If the lock-wait hypothesis holds, `SubFLock / SubFN` is about 15 us, `SubFKick /
+  SubFN` about 18 us, and `SubFTake + SubFReap + SubFAlloc` under 2 us in all (the pool is not the cause). A large `SubFTake`
+  or `SubFAlloc` would point at the pool after all. A large `SubFPrep` points at the mint, which this change did not touch.
+* `SubClock / (SubN + SubFN)` is the cost of one pair of reads. If it is more than about 0.5 us, rerun with `SubStageClk=0`.
+  If the flip's submit -> kick in the joined table then returns to about 20 us, the regression was the clock.
+* **If `SubFLock` carries it, the fix is the doorbell outside the lock**, split the way Linux splits kick-prepare and notify:
+  decide `should_notify` under the lock and ring after the release. That fix needs a reference that keeps the transport
+  generation (its notify BAR mapping) alive across the release against a concurrent StopDevice, so it is a separate, reviewed
+  change, not part of this one. Expected after it: both the flip and the Blt pay their own kick (about 18 us) and never each
+  other's.
 
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
