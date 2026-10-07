@@ -71,6 +71,12 @@ pub(crate) mod sysmem_flip;
 // and its hardware self-test. Independent of `KmdRmClient`.
 pub(crate) mod ce_channel;
 pub(crate) mod ce_selftest;
+// M3c-1: the producer's memory (the `'HEF3'` record's semaphore and image) dup'd into the
+// channel's client and GPU-mapped, cached for the life of the channel.
+pub(crate) mod ce_dup;
+// M3c-1: the shadow mode (`RmCopyEngine` = 3): sampled Presents copied again by the channel and
+// compared with the production copy.
+pub(crate) mod ce_shadow;
 
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -614,7 +620,7 @@ fn fail_of(r: Refusal) -> Fail {
 }
 
 /// One step's context: the token, the adapter, and the generation the client belongs to.
-struct Io<'a> {
+pub(crate) struct Io<'a> {
     passive: PassiveLevel,
     adapter: &'a AdapterContext,
     epoch: u64,

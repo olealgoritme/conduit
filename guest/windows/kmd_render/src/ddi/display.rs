@@ -975,6 +975,23 @@ unsafe fn dxgkddi_present_inner(
                             };
                             crate::diag::record_named_bytes(b"PBCpy", copy);
                             crate::diag::record_named_bytes(b"PBFnc", id as u32);
+                            // `RmCopyEngine` = 3 (the copy-engine shadow mode, M3c-1): the copy
+                            // is handed off and owns the destination until it is done. One
+                            // relaxed load with any other value.
+                            if let Some(resource_id) = destination_buffer {
+                                crate::virtio::rm_client::ce_shadow::note_present(
+                                    adapter,
+                                    present_context.as_ref(),
+                                    present_stream_boundary,
+                                    crate::virtio::rm_client::ce_shadow::ShadowDst {
+                                        resource_id,
+                                        width: destination.width,
+                                        height: destination.height,
+                                        pitch: destination.pitch,
+                                        dxgi_format: destination_dxgi_format,
+                                    },
+                                );
+                            }
                             return unsafe {
                                 present_complete(
                                     args,
@@ -1220,6 +1237,23 @@ unsafe fn dxgkddi_present_inner(
                         adapter,
                         Edge::PresentBlt,
                         destination.resource_id,
+                    );
+                }
+                // `RmCopyEngine` = 3 (the copy-engine shadow mode, M3c-1): this Present's copy is
+                // in the destination's pages (waited for and mirrored above). One relaxed load
+                // with any other value.
+                if let Some(resource_id) = destination_buffer {
+                    crate::virtio::rm_client::ce_shadow::note_present(
+                        adapter,
+                        present_context.as_ref(),
+                        present_stream_boundary,
+                        crate::virtio::rm_client::ce_shadow::ShadowDst {
+                            resource_id,
+                            width: destination.width,
+                            height: destination.height,
+                            pitch: destination.pitch,
+                            dxgi_format: destination_dxgi_format,
+                        },
                     );
                 }
             }

@@ -28,6 +28,8 @@ static BAD: AtomicU32 = AtomicU32::new(0);
 static LAST_WHY: AtomicU32 = AtomicU32::new(0);
 static WHY_MASK: AtomicU32 = AtomicU32::new(0);
 static NO_COPY: AtomicU32 = AtomicU32::new(0);
+/// Records the shadow mode kept although the `h_client` rule was not answered (`CeRecClient`).
+static CLIENT_UNKNOWN: AtomicU32 = AtomicU32::new(0);
 static LAST_CLIENT: AtomicU32 = AtomicU32::new(0);
 static LAST_MODIFIER: AtomicU64 = AtomicU64::new(0);
 /// The `CeRecMod` value last written: a REG_QWORD write is outside the registry mirror's
@@ -85,11 +87,15 @@ unsafe fn read_record(command: *const u8, cmd_len: usize, offset: usize) -> Tail
     }
 }
 
-/// TODO(M3c): the `h_client` rule. A record's `semaphore.h_client` and `source.h_client` must be
+/// TODO(M3c-2): the `h_client` rule. A record's `semaphore.h_client` and `source.h_client` must be
 /// RM clients the PRESENTING process created itself (the `NvDupHarden` rule). The KMD records
 /// clients per NVRM owner (`nvrm_clients::ClientTable`, keyed by the escape device), not per
 /// process, and keeps no owner-to-process map, so this cannot be answered yet and says
-/// [`ClientCheck::Unknown`]. M3c answers it before it dups anything the record names.
+/// [`ClientCheck::Unknown`]. The shadow mode of M3c-1 (`RmCopyEngine` = 3, a diagnostic) dups on
+/// that answer and counts it (`CeRecClient`); the route of M3c-2 must answer it first. Until then
+/// a process that knows (or guesses) another process's client and memory handles could have the
+/// KMD read that memory into its scratch buffer in shadow mode; nothing of it reaches any process
+/// (the scratch is the KMD's, only counters come out), see `docs/rm-copy-engine-present.md` 14.
 fn record_client_owned_by_presenter(_process: usize, _h_client: u32) -> ClientCheck {
     ClientCheck::Unknown
 }
@@ -146,11 +152,17 @@ pub(crate) unsafe fn note_render(
                 MODIFIER_WRITTEN.store(record.source.modifier, Ordering::Relaxed);
             }
             let process = context.creator_process().unwrap_or(0);
-            for h_client in [record.semaphore.h_client, record.source.h_client] {
-                match record_client_owned_by_presenter(process, h_client) {
-                    ClientCheck::Owned | ClientCheck::Unknown => {}
-                    // M3c: count a mismatch here (`CeRecClient`); it never refuses the Present.
-                    ClientCheck::NotOwned => {}
+            let semaphore = record_client_owned_by_presenter(process, record.semaphore.h_client);
+            let source = record_client_owned_by_presenter(process, record.source.h_client);
+            // The shadow mode (`RmCopyEngine` = 3) dups what the record names although the rule
+            // above cannot be answered: counted, once per record (`CeRecClient`). With any
+            // other knob value this is one relaxed load. A `NotOwned` client is a TODO of M3c-2
+            // (the route), which must refuse it and must not run on `Unknown`.
+            let shadow = crate::virtio::rm_client::ce_channel::shadow_mode();
+            if cr::counts_unknown_client(shadow, semaphore, source) {
+                let n = CLIENT_UNKNOWN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                if cr::publish_now(n) {
+                    crate::diag::record_named_bytes(b"CeRecClient", n);
                 }
             }
             record
@@ -178,7 +190,7 @@ fn note_bad(why: Why) {
 /// A new generation (StartDevice): zero the counters and write zeros over their service-key
 /// values, so a block an earlier run left is never read as this one's. PASSIVE.
 pub(crate) fn reset_for_start() {
-    for c in [&SEEN, &BAD, &LAST_WHY, &WHY_MASK, &NO_COPY, &LAST_CLIENT] {
+    for c in [&SEEN, &BAD, &LAST_WHY, &WHY_MASK, &NO_COPY, &LAST_CLIENT, &CLIENT_UNKNOWN] {
         c.store(0, Ordering::Relaxed);
     }
     LAST_MODIFIER.store(0, Ordering::Relaxed);
@@ -190,6 +202,7 @@ pub(crate) fn reset_for_start() {
     rec(b"CeRecMask", 0);
     rec(b"CeRecNoCopy", 0);
     rec(b"CeRecLast", 0);
+    rec(b"CeRecClient", 0);
     crate::diag::record_named_qword(b"CeRecMod", 0);
 }
 
@@ -209,6 +222,7 @@ pub(crate) fn publish_counters() {
     rec(b"CeRecMask", WHY_MASK.load(Ordering::Relaxed));
     rec(b"CeRecNoCopy", no_copy);
     rec(b"CeRecLast", LAST_CLIENT.load(Ordering::Relaxed));
+    rec(b"CeRecClient", CLIENT_UNKNOWN.load(Ordering::Relaxed));
     let modifier = LAST_MODIFIER.load(Ordering::Relaxed);
     if MODIFIER_WRITTEN.swap(modifier, Ordering::Relaxed) != modifier {
         crate::diag::record_named_qword(b"CeRecMod", modifier);

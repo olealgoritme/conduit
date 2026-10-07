@@ -133,6 +133,17 @@ pub enum ClientCheck {
     Unknown,
 }
 
+/// Whether a kept record counts in `CeRecClient`. Only the shadow mode (`RmCopyEngine` = 3,
+/// M3c-1) dups what a record names while the `h_client` rule cannot be checked: it ACCEPTS a
+/// record whose clients are [`ClientCheck::Unknown`] and counts it (once per record), so the
+/// count says how many records were used on trust. The route (M3c-2) must not dup on trust: it
+/// needs [`ClientCheck::Owned`] for both clients. A [`ClientCheck::NotOwned`] client is never
+/// accepted by either and is not counted here.
+pub const fn counts_unknown_client(shadow: bool, semaphore: ClientCheck, source: ClientCheck) -> bool {
+    shadow
+        && (matches!(semaphore, ClientCheck::Unknown) || matches!(source, ClientCheck::Unknown))
+}
+
 /// The counters M3c-0 writes, all in `kmd_render/src/ddi/ce_record.rs`. At most 14 characters,
 /// prefix `Ce`, unique across `kmd_render` and `kmd_logic` (the route's planned `CeTail*` names of
 /// `ce_present::COUNTERS` are separate and still unwritten).
@@ -147,6 +158,9 @@ pub const COUNTERS: &[&str] = &[
     // The latest kept record: `semaphore.h_client` (REG_DWORD) and `source.modifier` (REG_QWORD).
     "CeRecLast",
     "CeRecMod",
+    // M3c-1: records the shadow mode kept although the `h_client` rule could not be checked
+    // (`counts_unknown_client`).
+    "CeRecClient",
 ];
 
 /// The files that write [`COUNTERS`] (relative to `kmd_render/src`).
@@ -236,6 +250,16 @@ mod tests {
         assert_eq!(available(96, 96), Some(0));
         assert_eq!(available(192, 96), Some(96));
         assert_eq!(available(256, 96), Some(160));
+    }
+
+    #[test]
+    fn only_the_shadow_mode_counts_a_record_kept_on_trust() {
+        use ClientCheck::*;
+        assert!(counts_unknown_client(true, Unknown, Unknown));
+        assert!(counts_unknown_client(true, Owned, Unknown));
+        assert!(!counts_unknown_client(true, Owned, Owned));
+        assert!(!counts_unknown_client(false, Unknown, Unknown));
+        assert!(!counts_unknown_client(true, NotOwned, Owned));
     }
 
     #[test]
