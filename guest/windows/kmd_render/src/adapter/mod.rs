@@ -125,6 +125,9 @@ pub(crate) const VIDMM_VRAM_MB_AUTO: u32 = u32::MAX;
 pub(crate) struct AdapterKnobs {
     /// Event-driven Venus backpressure retry. 0 restores timed polling.
     pub submit_space_wake: bool,
+    /// `SubmitPool` (default 1). The display submitters stage from the transport's DMA pool;
+    /// 0 = allocate both staged buffers per submit (docs 24.13).
+    pub submit_pool: bool,
     /// `AllocCached` (default 1). When set, CpuVisible allocations are
     /// additionally flagged `Cached` so dxgkrnl maps CPU views write-back
     /// instead of write-combined. The BAR window is RAM-backed host shmem (x86
@@ -247,6 +250,7 @@ impl AdapterKnobs {
     #[allow(dead_code)]
     pub const DEFAULTS: Self = Self {
         submit_space_wake: true,
+        submit_pool: true,
         alloc_cached: true,
         bind_flush_immediate: false,
         dispatch_bind: true,
@@ -290,6 +294,7 @@ impl AdapterKnobs {
             // See docs/PERFORMANCE_FEEDBACK.md and
             // tmp/dx12-profile-20260906/space-comparison.json. Keep 0 reachable.
             submit_space_wake: read_config_dword(knobs::SUBMIT_SPACE_WAKE, 1) != 0,
+            submit_pool: read_config_dword(knobs::SUBMIT_POOL, 1) != 0,
             bind_flush_immediate: read_config_dword(knobs::BIND_FLUSH_MODE, 0) == 1,
             dispatch_bind: read_config_dword(knobs::DISPATCH_BIND, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
@@ -329,6 +334,7 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"PBPrEn", knobs.present_probe as u32);
         crate::diag::record_named_bytes(b"FcKnob", knobs.foreign_copy as u32);
         crate::diag::record_named_bytes(b"DspH", knobs.display_half as u32);
+        crate::virtio::submit_stage::record_knob(knobs.submit_pool);
         crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
         crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
         crate::diag::record_named_bytes(b"BarM", knobs.bar_seg_mode);

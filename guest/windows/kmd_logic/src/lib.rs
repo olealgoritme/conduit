@@ -62,6 +62,7 @@ pub mod onscanout;
 pub mod blt_async;
 pub mod guest_blob;
 pub mod copy_queue;
+pub mod submit_stage;
 pub mod ce_present;
 pub mod rm_ce_channel;
 pub mod ce_record;

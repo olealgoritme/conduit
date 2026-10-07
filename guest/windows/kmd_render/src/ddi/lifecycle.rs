@@ -240,6 +240,8 @@ fn start_generation_mirrors() {
     crate::virtio::rm_client::ce_channel::reset_for_start();
     // The copy-engine Present record (M3c-0): `CeRec*` zeroed.
     crate::ddi::ce_record::reset_for_start();
+    // The display submit stage counters (`Sub*`, docs 24.13): zeroed, block written once.
+    crate::virtio::submit_stage::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();

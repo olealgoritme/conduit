@@ -1160,6 +1160,7 @@ full zero block once per generation even if nothing is ever seen.
 | `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
 | `MsiMode`, `MsiLatch` | AddDevice (`virtio::msi::apply_key_policy`; `MsiLatch` also at transport up) | not cached | `MsiModeEff`, `MsiWant`, `MsiKeyWr` (the device-key write), `MsiLatch` (0 or 1) |
+| `SubmitPool` (24.14) | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `SubPoolOn` (every start) |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `VsPowerMode`, `VsWatchdog`, `VsIdleWake`, `VsWdTimer` (15.4, 19.3) | StartDevice (`stall_diag::reread_knobs`) | static | `VsPwrEff`, `VsWdgEff`, `VsIdlEff`, `VsWdTmEff` (every start, 0 included) |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
@@ -3614,6 +3615,129 @@ dropping in the legacy arm, and no loss of game fps (the game's channel yields e
   `vkr_queue_assign_ring_idx` allows rings 1 to 63 per context); the 5090's `minImageTransferGranularity` for family 1; that the
   copy engine's throughput under load matches the host measurement inside the VM; that the source's acquire from EXTERNAL on
   the transfer family behaves on NVIDIA as on family 0 (it is the same barrier with a different `dstQueueFamilyIndex`).
+
+### 24.14 Display submit staging (`SubmitPool`, `Sub*`)
+
+#### 24.14.1 The evidence
+
+The joined guest+host stage table of windowed Heaven (`GuestBlob`, `BltAsync`, `ForeignCopy`) gives p50 **KMD submit ->
+backend kick = 114.5 us** (p99 186 us) for the windowed Blt copy, against **19.7 us** for the foreign-flip submit. Everything
+else on that path (defer, host hops, the 234 us GPU copy, the 33 us interrupt) is measured separately. So about 95 us of guest
+time goes into putting one display command on the virtqueue and ringing the doorbell, and the flip shows that most of it is
+not the virtqueue.
+
+Reading the code gave the suspect. Each of the four display submitters (`ctrl::submit_venus_async_scanout`, `_present`,
+`_blt`, `_windowed_blt`) calls `stage_display_submit`, which ran `reap_parked`, then **two `DmaBuffer::new`** (the SUBMIT_3D
+meta and the Venus stream: `MmAllocateContiguousMemory` at PASSIVE each, plus the matching frees in a later reap), a copy of the
+stream, and then under `virtio_lock` a `drain_used` before the enqueue. The foreign flip allocates nothing per flip. The escape
+path (`submit_venus_async`) had taken its buffers from the transport's DMA pool all along. The display paths never did. The reap
+still recycled their buffers into that pool, so the pool was fed by display buffers that only the escape path ever took.
+
+#### 24.14.2 The stages (instrumentation, `kmd_logic::submit_stage::Clock`)
+
+Each display submit runs under a stage clock (interrupt time, 100 ns, atomics only, published by `publish_nvrm_counters` on
+the mirror thread's cadence and zeroed at every start). The stages are, in order:
+
+| Stage | Counter (total us) | What it covers |
+|---|---|---|
+| Reap | `SubReap` | `reap_parked` / `reap_parked_work`: recycling (and freeing the excess of) completed entries' buffers |
+| Take | `SubTake` | the one lock hold that begins the reap and takes both buffers from the pool (`SubmitPool` 1 only) |
+| Alloc | `SubAlloc` | fresh `DmaBuffer::new` calls, both buffers together |
+| Copy | `SubCopy` | the stream copy into its staged buffer |
+| Lock | `SubLock` | from the call into `with_virtio` to the first instruction under the lock (on the scan-out path it also includes building the notify target) |
+| Drain | `SubDrain` | `drain_used` before the enqueue |
+| Enq | `SubEnq` | the enqueue: descriptors, avail-ring publish, in-flight record, minus the notify |
+| Kick | `SubKick` | `transport.notify` (the doorbell, a VM exit), timed inside `publish_then_notify` by a timer the display submitter arms in its own lock hold (`KickTimer`; every other enqueue pays one `armed` test) |
+
+Also written: `SubTotal` / `SubTotMax` (whole submit, total and longest, us), `SubN` (submits measured, every call),
+`SubAllocN` (fresh allocations), `SubPoolHit` (buffers taken from the pool), `SubNoKick` (enqueues whose notify the device
+suppressed), `SubDrainHit` (pre-enqueue drains that found completions), `SubClock` (two back-to-back stamps per submit, us in
+all: the clock's own cost), and per path `SubNScan`, `SubNPres`, `SubNBlt`, `SubNWin`. `SubPoolOn` (the knob in force) is
+written at every StartDevice. All names are in `kmd_logic::submit_stage::COUNTERS` (14 characters at most). The host tests
+check that `virtio/submit_stage.rs` writes exactly that list and that no other `kmd_render` file spells one of them.
+
+#### 24.14.3 The pool (`SubmitPool` 1, the default)
+
+`stage_display_submit` now does what the escape path does. In ONE `with_virtio` hold it runs `begin_parked_reap`,
+`take_dma_buffer(SUBMIT_META_BYTES)` and `take_dma_buffer(stream.len())`. Then it finishes the reap at PASSIVE
+(`reap_parked_work`; what the reap recycles serves the next submit). It allocates fresh only for a buffer the pool could not
+supply (`submit_stage::plan`, host-tested). There is no new pool.
+
+* **Why the existing pool and not a new class-sized free list.** `VirtioGpu::dma_pool` is already a bounded free list (256
+  buffers, 8 MiB, 260 KiB per buffer at most) with a best-fit take that stops at the first one-page buffer. It already gets
+  every display buffer back through the reap. Its lifetime rule is already the right one (below), and so is its teardown. A
+  second pool would split the budget, and the same submit would have to be reaped into one pool or the other by kind, which
+  duplicates the lifetime logic. The display streams are under one page, so a size class would always be the smallest one.
+* **The lifetime rule** (unchanged, and the reason this is safe). A buffer enters `dma_pool` only from a completed in-flight
+  entry: `drain_used` popped that submit's used-ring element, so the host has consumed both descriptors. It then enters through
+  the PASSIVE reap (`recycle_dma_buffers`) or through the drain's push for raw forwards. A buffer that a submit took belongs to
+  its in-flight entry until that same completion. After a transport failure (`latch_failed_and_fail_inflight`) the entries are
+  parked as well, but the failed transport refuses every enqueue, so a buffer recycled then is never handed to the device again
+  in that generation. The pool lives in the transport generation, so StopDevice drops it at PASSIVE together with the transport.
+* **Stale bytes.** A pooled buffer is not zeroed. `take_dma_buffer` re-stamps the wire tail (`reset`), the enqueue overwrites
+  the SUBMIT_3D header, the device writes the response, and the stream descriptor's length is `stream.len()`, so the device
+  never reads a stale byte. The escape path has relied on this all along.
+* **Failure semantics, unchanged.** A miss is a fresh PASSIVE allocation, and that allocation failing is `OutOfMemory`.
+  Nothing waits. A QueueFull, `DstBusy` or refused enqueue drops the staged buffers at PASSIVE, as before (they are not
+  returned to the pool on that rare path).
+* **No per-prepared-command cached stream.** The prepared Present copy's stream is byte-identical every frame
+  (`encode_command_buffer_submit(prepared.command_buffer_id)`), but it is a few dozen bytes. A buffer that is never rewritten
+  would be shared by every in-flight submit of that command, which needs a reference count on the in-flight entries, and the
+  copy it saves is `SubCopy` (expected well under 1 us). Revisit only if `SubCopy / SubN` says otherwise.
+
+#### 24.14.4 The pre-enqueue drain
+
+`drain_used` stays unconditional. On an empty used ring it is already one acquire load (`peek_used` of the used index), so a
+separate peek before it saves nothing. On a non-empty ring it does the DPC's work early, and the enqueue in the same hold
+depends on that work: free descriptors (the display paths do not retry a QueueFull), the destination ownership that a retired
+Blt released (otherwise `BltEnq::Busy`, a needless legacy fallback), and the windowed-Blt FIFO state. Skipping it would trade
+microseconds for more QueueFull and `DstBusy` outcomes. `SubDrainHit / SubN` and `SubDrain / SubDrainHit` show what it costs
+when it has work. If that is large, the next step is to drain only when `available_desc()` is short. That would be safe for
+the scan-out and Present paths and not for `BltAsync`.
+
+#### 24.14.5 Knob
+
+`SubmitPool` (REG_DWORD in the service key, default 1; `diag::knobs::SUBMIT_POOL`), read at AddDevice and every StartDevice
+(`AdapterKnobs`), mirrored as `SubPoolOn`. 0 is the old allocate-per-submit path exactly, for a same-boot A/B
+(`reg add` + `pnputil /restart-device`). The stage counters run with either value.
+
+#### 24.14.6 What to read on hardware (windowed Heaven, lowest mode first)
+
+Run `SubmitPool=0` and then `SubmitPool=1` in the same boot, and compare per submit (divide by `SubN`):
+
+* `SubPoolOn` matches the knob. With 1, `SubAllocN` stays near 0 after the first frames and `SubPoolHit` grows by about
+  2 x `SubN`. With 0, `SubAllocN` = 2 x `SubN` and `SubPoolHit` stays 0.
+* **`SubAlloc / SubN` should collapse** (expected: tens of us with 0, about 0 with 1). `SubReap / SubN` should also drop,
+  because the reap no longer frees the excess buffers that the pool could not hold.
+* `SubKick / (SubN - SubNoKick)` is the doorbell cost. This is the floor that the foreign flip pays too.
+* `SubLock`, `SubDrain`, `SubEnq` per submit should be single-digit us. A large `SubLock` means contention on `virtio_lock`
+  (the DPC drain), which is not this change.
+* `SubTotal / SubN` against `SubTotMax`, and `SubClock / SubN` stays well under 1 us (otherwise the clock itself is in the
+  numbers: the interrupt-time source is slow on that host).
+* In the joined table, **KMD submit -> backend kick should go from about 114 us to about 20-30 us** for the windowed Blt
+  copy, close to the foreign flip's 19.7 us. `SubNBlt` / `SubNWin` say which Blt arm carried the frames.
+* The transport pool's own counters move with the extra takes: `DpHit` grows by about 2 x `SubN`, `DpMis` only by the misses
+  (`SubAllocN`), `DpDrp` (buffers
+  the full pool refused) should not grow faster than before, and `DpByt` (cached bytes) settles a few pages higher.
+
+#### 24.14.7 Risks
+
+* The display paths now share the pool with the escape path. Both take and both return, and a miss is a fresh allocation, so
+  the worst case is today's behaviour.
+* The kick timer is a field of `VirtioGpu` (16 bytes inline). It is armed and taken in the same lock hold, so no other enqueue
+  can be charged to a display submit.
+* The clock reads interrupt time about 10 times per display submit (`SubClock` shows what that costs).
+
+#### 24.14.8 Where the code is, verified and not
+
+* Pure: `kmd_logic/src/submit_stage.rs` (`Clock`, `KickTimer`, `plan`, `fresh_count`, `COUNTERS`, the name scans; 12 tests).
+* I/O: `kmd_render/src/virtio/submit_stage.rs` (atomics, publication, knob mirror). `virtio/ctrl.rs`: `stage_display_submit`
+  (the pool), `measured`, `display_enqueue` (the drain, enqueue and kick timing). `virtio/gpu/mod.rs`: `publish_then_notify`
+  (kick timer), `used_pending`. The knob is in `diag.rs` and `adapter/mod.rs` (`AdapterKnobs::submit_pool`).
+* Verified: `kmd_logic` host tests (including the exact-list scans over `kmd_render`), and a stub type check of `kmd_render`
+  with no new error against the base (a deliberate error planted in each edited file was reported).
+* NOT verified: anything on hardware. In particular, the size of each stage, and that the pool hit rate stays high under the
+  escape path's load.
 
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
