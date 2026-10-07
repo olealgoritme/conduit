@@ -22,20 +22,7 @@ pub const PROC_NVIDIA: &str = "/proc/driver/nvidia";
 /// a host that has not yet had one inserted -- not an error to propagate.
 pub fn driver_version(root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(root.join("version")).ok()?;
-    // "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09 ..."
-    // Matched by shape rather than by position: the words around it differ
-    // between the open and proprietary modules, and have changed before.
-    // Only the NVRM line: the GCC line under it carries a dotted number too,
-    // and a two-part release would otherwise lose to it.
-    let line = text.lines().find(|l| l.starts_with("NVRM version:"))?;
-    line.split_whitespace()
-        .find(|w| {
-            let n = w.split('.').count();
-            (2..=3).contains(&n)
-                && w.split('.')
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .map(str::to_string)
+    abi::version::parse_proc_version(&text).map(|p| p.raw)
 }
 
 /// Every GPU the host driver owns, in PCI address order.

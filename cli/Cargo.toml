@@ -17,5 +17,7 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 xmltree = { version = "0.11", features = ["attribute-order"] }
+# The one parser of the driver version text, and the release type.
+abi = { path = "../host/backend/gen" }
 # The backend's trace format, for `conduit trace` (docs/TRACING.md).
 conduit-trace = { path = "../host/backend/trace" }
