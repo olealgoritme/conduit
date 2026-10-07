@@ -304,6 +304,14 @@ impl VirtioGpuNvConfig {
         self.features |= protocol::messages::NVGPU_CFG_GUEST_BLOB;
     }
 
+    /// Serve a Windows guest's hardware cursor as a Venus blob
+    /// (`CMD_SET_CURSOR_BLOB`, docs/SCANOUT.md "Hardware cursor, Windows
+    /// guests"): sets [`protocol::messages::NVGPU_CFG_VENUS_CURSOR`]. Only
+    /// with Venus and the cursor plane.
+    pub fn set_venus_cursor(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_VENUS_CURSOR;
+    }
+
     /// Turn host fences into guest fences (docs/SYNC.md): sets
     /// [`protocol::messages::NVGPU_CFG_DRM_FENCES`]. Only by a transport that
     /// delivers one-shot fence watches (`take_watch_updates`); without that
@@ -548,5 +556,21 @@ mod tests {
         );
         // The number the guest driver tests (docs/VENUS.md).
         assert_eq!(NVGPU_CFG_GUEST_BLOB, 1 << 16);
+    }
+
+    #[test]
+    fn venus_cursor_is_announced_only_when_set() {
+        use protocol::messages::{NVGPU_CFG_CURSOR, NVGPU_CFG_VENUS, NVGPU_CFG_VENUS_CURSOR};
+        let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
+        cfg.set_cursor();
+        cfg.set_venus();
+        assert_eq!({ cfg.features } & NVGPU_CFG_VENUS_CURSOR, 0);
+        cfg.set_venus_cursor();
+        assert_eq!(
+            { cfg.features },
+            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_CURSOR | NVGPU_CFG_VENUS | NVGPU_CFG_VENUS_CURSOR
+        );
+        // The number the Windows KMD tests (guest/windows/protocol/src/features.rs).
+        assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
     }
 }

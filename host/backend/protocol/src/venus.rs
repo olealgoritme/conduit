@@ -42,6 +42,14 @@ pub const CMD_SUBMIT_3D: u32 = 0x0207;
 pub const CMD_RESOURCE_MAP_BLOB: u32 = 0x0208;
 pub const CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 
+/// Conduit extension, not virtio-gpu: the guest's hardware cursor is a blob
+/// ([`SetCursorBlob`], docs/SCANOUT.md "Hardware cursor, Windows guests").
+/// Outside every range the spec uses (2D 0x01xx, 3D 0x02xx, cursor queue
+/// 0x03xx up to 0x0301), so a backend without it answers `RESP_ERR_UNSPEC`
+/// and the guest falls back to its software cursor. Served only when the
+/// config has [`crate::messages::NVGPU_CFG_VENUS_CURSOR`].
+pub const CMD_SET_CURSOR_BLOB: u32 = 0x0380;
+
 /// Success responses.
 pub const RESP_OK_NODATA: u32 = 0x1100;
 pub const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
@@ -666,6 +674,92 @@ impl SetScanoutBlob {
     }
 }
 
+/// [`SetCursorBlob::flags`]: the cursor is shown. Clear (or resource 0):
+/// hidden, every other field ignored.
+pub const CURSOR_BLOB_F_VISIBLE: u32 = 1 << 0;
+
+/// [`CMD_SET_CURSOR_BLOB`]: show `width` x `height` pixels of blob
+/// `resource_id` at `offset`, `stride` bytes per row, as the host pointer's
+/// image with its hotspot at (`hot_x`, `hot_y`); or hide it. The image is
+/// premultiplied ARGB in [`format::B8G8R8A8_UNORM`] (DRM ARGB8888), at most
+/// 256 x 256, linear. The host positions it (it is the host pointer's
+/// image); `x`, `y` are where the guest last put it, informational only.
+/// 72 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SetCursorBlob {
+    pub hdr: CtrlHdr,
+    pub scanout_id: u32,
+    /// Zero hides the cursor.
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// [`format`]; only `B8G8R8A8_UNORM`.
+    pub format: u32,
+    pub stride: u32,
+    pub offset: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    pub x: i32,
+    pub y: i32,
+    /// `CURSOR_BLOB_F_*`.
+    pub flags: u32,
+}
+
+impl SetCursorBlob {
+    pub const LEN: usize = 72;
+
+    pub fn visible(&self) -> bool {
+        self.resource_id != 0 && self.flags & CURSOR_BLOB_F_VISIBLE != 0
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            hdr: CtrlHdr::from_bytes(b)?,
+            scanout_id: w(b, 24),
+            resource_id: w(b, 28),
+            width: w(b, 32),
+            height: w(b, 36),
+            format: w(b, 40),
+            stride: w(b, 44),
+            offset: w(b, 48),
+            hot_x: w(b, 52),
+            hot_y: w(b, 56),
+            x: w(b, 60) as i32,
+            y: w(b, 64) as i32,
+            flags: w(b, 68),
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut o = [0u8; Self::LEN];
+        o[..CTRL_HDR_LEN].copy_from_slice(&self.hdr.to_bytes());
+        for (i, v) in [
+            self.scanout_id,
+            self.resource_id,
+            self.width,
+            self.height,
+            self.format,
+            self.stride,
+            self.offset,
+            self.hot_x,
+            self.hot_y,
+            self.x as u32,
+            self.y as u32,
+            self.flags,
+        ]
+        .iter()
+        .enumerate()
+        {
+            put_w(&mut o, 24 + i * 4, *v);
+        }
+        o
+    }
+}
+
 /// `struct virtio_gpu_resource_map_blob`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -943,6 +1037,50 @@ mod tests {
         assert_eq!((FLAG_FENCE, FLAG_INFO_RING_IDX), (1, 2));
         assert_eq!(BLOB_MEM_HOST3D, 2);
         assert_eq!(CAPSET_VENUS, 4);
+    }
+
+    /// The Conduit cursor command: its value, outside the spec's ranges,
+    /// and its 72-byte layout, as the Windows KMD encodes it
+    /// (`guest/windows/protocol/src/virtio_gpu.rs` `HeliosSetCursorBlob`).
+    #[test]
+    fn set_cursor_blob_layout() {
+        assert_eq!(CMD_SET_CURSOR_BLOB, 0x0380);
+        let c = SetCursorBlob {
+            hdr: CtrlHdr {
+                ty: CMD_SET_CURSOR_BLOB,
+                ..Default::default()
+            },
+            scanout_id: 0,
+            resource_id: 7,
+            width: 32,
+            height: 48,
+            format: format::B8G8R8A8_UNORM,
+            stride: 1024,
+            offset: 262_144,
+            hot_x: 3,
+            hot_y: 4,
+            x: -5,
+            y: 600,
+            flags: CURSOR_BLOB_F_VISIBLE,
+        };
+        let b = c.to_bytes();
+        assert_eq!(b.len(), SetCursorBlob::LEN);
+        assert_eq!(&b[0..4], &0x0380u32.to_le_bytes());
+        assert_eq!(&b[28..32], &7u32.to_le_bytes());
+        assert_eq!(&b[48..52], &262_144u32.to_le_bytes());
+        assert_eq!(&b[60..64], &(-5i32).to_le_bytes());
+        assert_eq!(&b[68..72], &1u32.to_le_bytes());
+        assert_eq!(SetCursorBlob::from_bytes(&b), Some(c));
+        assert!(SetCursorBlob::from_bytes(&b[..71]).is_none());
+        assert!(c.visible());
+        assert!(
+            !SetCursorBlob {
+                resource_id: 0,
+                ..c
+            }
+            .visible()
+        );
+        assert!(!SetCursorBlob { flags: 0, ..c }.visible());
     }
 
     #[test]
