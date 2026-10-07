@@ -235,6 +235,8 @@ fn start_generation_mirrors() {
     crate::ddi::guest_blob::reset_for_start();
     // `RmCopyEngine` (default 0): the knob read again and mirrored (`CeKnob`), counters zeroed.
     crate::virtio::rm_client::ce_channel::reset_for_start();
+    // The display submit stage counters (`Sub*`, docs 24.14): zeroed, block written once.
+    crate::virtio::submit_stage::reset_for_start();
     // The copy-engine Present record (M3c-0): `CeRec*` zeroed.
     crate::ddi::ce_record::reset_for_start();
     // `CopyQueue` (default 0): the knob read again (the Venus bring-up below creates the device
