@@ -2,7 +2,8 @@
 
 The scripts the Windows work was tested with on the development host (RTX
 5090, win11 guest at 5120x1440@240). They are kept as they ran, so they hold
-that host's paths (`${VMTEST_DIR:-$HOME/.cache/conduit-vmtest}/...`), the guest user
+that host's layout: a working directory (`$VMTEST_DIR`, default
+`~/.cache/conduit-vmtest`; the ssh config `t/sshcfg` and the result folders live in it), the guest user
 (`Ole Algoritme`, SSH on 127.0.0.1:2222) and the guest folders
 (`C:\Users\Public\t`, `C:\Users\Public\heaven-umd`, `C:\Users\Public\lvl5`).
 Adjust those before using them elsewhere. Context: [docs/HANDOFF.md](../../../../docs/HANDOFF.md).
