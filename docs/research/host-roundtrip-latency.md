@@ -34,8 +34,9 @@ ForeignCopy=1`, MSI-X in the guest, about 220 fps.
 - Host-side fixes, each behind an option, off by default: no empty interrupt
   after holding a fenced chain, one renderer round trip per fenced submit
   instead of two, two thread hops fewer on the fence's way back, a batched and
-  cheaper event thread, and CPU placement. They target about 50-60 µs of the
-  105 µs.
+  cheaper event thread, and CPU placement. Measured: host round trip 454 →
+  410 µs p50, fence return path 57.5 → 25.4 µs, queue thread per fenced submit
+  89 → 37 µs ("Before and after").
 - C-states do not show on this path. Every wakeup on it landed on a CPU that
   was already awake, and wake to run took 2-3 µs.
 
@@ -213,9 +214,60 @@ released the lock.
 
 ## Before and after
 
-To be filled from A/B captures with the same Heaven load: rows `off`, `all`,
-and `all` with `backend.cpus 0-7,16-23`, each with the light capture
-(dispatch → timeline → MSI) and the full stage capture.
+Same host, the same Heaven load (windowed 1600x900 on a 5120x1440@240
+desktop, `GuestBlob`/`BltAsync`/`ForeignCopy`), one VM cycle per row:
+A `backend.latency off`, B `all`, C `all` plus `backend.cpus 0-7,16-23`.
+In all three rows the guest ran on **INTx**: its MSI-X grant was lost after
+a driver package install. So the interrupt stage here includes QEMU's main
+loop raising the line (`kvm_set_irq` from QEMU's main thread, 2900-3200 a
+second), not irqfd as in the baseline above. The comparison between the
+rows holds. For the irqfd path, the MSI-X baseline above is the reference.
+
+Light captures (three uprobes), µs, p50 / p99:
+
+| stage | A off | B all | C all + cpus |
+|---|---|---|---|
+| queue thread woken → `Venus::dispatch` | 6.0 / 11.2 | 6.0 / 10.9 | 5.9 / 9.3 |
+| dispatch → timeline written (submit, GPU, wake) | 394 / 707 | 391 / 722 | 380 / 713 |
+| timeline → `write_context_fence` | 12.0 / 26.9 | 11.7 / 26.1 | 9.0 / 25.2 |
+| `write_context_fence` → interrupt | 45.1 / 76.1 | 28.0 / 45.3 | 15.1 / 43.9 |
+| **timeline → interrupt (fence return path)** | **57.5 / 90.6** | **40.6 / 65.5** | **25.4 / 65.9** |
+| **dispatch → interrupt (host round trip)** | **454 / 762** | **433 / 776** | **410 / 739** |
+
+Full captures (every probe; each probe adds a little to every row), µs, p50:
+
+| stage | A off | B all | C all + cpus |
+|---|---|---|---|
+| dispatch → chain held (queue thread busy) | 89.3 | 59.4 | 37.2 |
+| dispatch → copy's `vkQueueSubmit` returned | 54.9 | 51.5 | 31.0 |
+| copy submitted → NVIDIA interrupt (GPU) | 327.7 | 328.5 | 328.3 |
+| NVIDIA interrupt → vkr-queue running | 18.5 | 16.1 | 23.2 |
+| `signal_used_queue` → QEMU raises INTx, p50 / p99 | 13.2 / 270 | 13.2 / 996 | 11.5 / 1582 |
+
+Reading:
+
+- The options cut the host's own part of the round trip:
+  - the fence return path from 57.5 to 40.6 µs (`direct-fences`), and to
+    25.4 µs with the threads on the host's CCD;
+  - the queue thread's time per fenced submit from 89 to 59 µs
+    (`fused-submit`), and to 37 µs pinned;
+  - the copy reaching the driver 24 µs sooner when pinned.
+  End to end: 454 → 433 → 410 µs p50, 44 µs (10%) off the host round trip.
+  The GPU part (328 µs from the copy's submit to the NVIDIA interrupt) does
+  not move. The next step there is the copy-engine queue.
+- `quiet-held`: interrupts raised by QEMU went from 3210 to 2911 a second
+  (B), about one fewer per fenced submit.
+- The tails come from INTx. The p99 of the step where QEMU's main loop
+  raises the line grows from 270 µs (A) to 1.6 ms (C) in the full captures.
+  In row C the backend and conduit-venus share CPUs 0-7,16-23 with QEMU's
+  main loop, emulator thread and iothread, which libvirt pins there too,
+  and the full capture's probes add load on the same CPUs. With MSI-X the
+  interrupt is an irqfd write from the backend thread and QEMU's main loop
+  is not on the path. Under INTx, keep `backend.cpus` off QEMU's emulator
+  CPUs, or leave it unset.
+- Recommendation: make `quiet-held`, `fused-submit` and `direct-fences` the
+  default once a soak is clean. Re-measure `backend.cpus` with MSI-X before
+  recommending it. `event-batch` matters for the NVK event path, not this one.
 
 ## Reproducing
 
