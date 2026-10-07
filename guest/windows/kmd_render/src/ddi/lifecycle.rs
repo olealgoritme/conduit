@@ -236,6 +236,8 @@ fn start_generation_mirrors() {
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();
+    // The `Dw*` block (DWM restart and a stale Explorer): zeroed, and the zero block written.
+    crate::ddi::dwm_restart::reset_for_start();
     // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
     // mirroring `FfKnob` first), as does the `Fk*` block.
     crate::virtio::foreign_flip::publish_counters();
@@ -245,8 +247,11 @@ fn start_generation_mirrors() {
     // The flip retire measurement and the announce knobs (`FlipLat`, `FlipAnnounce`,
     // `FlipEarlyWake`), read and zeroed before the block above is first written.
     crate::ddi::flip_lat::start_generation();
+    crate::ddi::stage_trace::start_generation();
     crate::ddi::flip_announce::start_generation();
     crate::ddi::stall_diag::start_generation();
+    // The round-trip statistics of forwarded RM calls start over: this generation's `NvRtt*`.
+    crate::virtio::nvrm::reset_rtt_counters();
 }
 
 /// Flush the service key (when `flush`) so the stage just recorded survives a
@@ -467,6 +472,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // budget) and passed in as a bare u32. 0 = INTx = the driver's historical
     // behaviour, byte for byte. See `virtio::msi`.
     let msi_granted = crate::virtio::msi::probe_granted(unsafe { &*dxgkrnl_interface });
+    // This start's interrupt counters begin at zero, and a start that got messages sets the
+    // boot-loop breaker's marker (flushed) before anything below can hang. Own noinline frame.
+    crate::virtio::msi::begin_start(passive, msi_granted);
     // The host's buffer-release event (`NVGPU_F_SCANOUT_RELEASE`) is acked only with the
     // display half: it serves the foreign scanout sources and the RM ring presenter,
     // which exist only there. A render-only start acks nothing new (the host then keeps
@@ -491,6 +499,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // is moved into set_virtio). The message-mode word goes FIRST so an
             // ISR that sees a nonzero `isr_status` can never still believe it is
             // on a line the device is no longer using.
+            // The interrupt counters and the delivery-health state of this start begin here
+            // (before the ISR can count anything into them).
+            crate::virtio::msi::on_transport_up(gpu.msi_isr_state() != 0);
             adapter
                 .msi_state
                 .store(gpu.msi_isr_state(), core::sync::atomic::Ordering::Release);
@@ -602,6 +613,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Same rule for the unsampled scanout-bind trace: its whole purpose is that
     // a value read after a workload describes THAT workload.
     crate::ddi::scanout_trace::reset(adapter);
+    // `IndepFlip` (independent flip, stage S-1): the mode this generation counts under, and the
+    // `Idf*` block zeroed (`IdfKnob` written, 0 included).
+    crate::ddi::indep_flip::reset_for_start(&knobs);
 
     // The scan-out mode and its EDID, resolved BEFORE publication because
     // `StartedState` is published exactly once. In its own transient frame: the
@@ -686,6 +700,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     }
 
     crate::diag::record(0x0B00_0004);
+    // In message mode: the verdict on whether interrupts reached this start (the venus bring-up
+    // above ran sync round trips), and the run-time health judging is armed from here. A no-op
+    // on the INTx line. Never fails the start.
+    crate::virtio::msi::finish_start(adapter);
     // LAST action: the real edge the HPD worker waits on. Its prologue used to
     // approximate "StartDevice has returned" with a 500 ms delay; that delay is
     // now only a bounded fallback (`HpdStTo` counts it firing). Safe to signal
@@ -790,7 +808,14 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         crate::ddi::stall_diag::stop_sub(ss::HPD_STOPPED);
         budget = stop_credit(budget, joined_from);
         stop_stage(entry, 4);
-        // The HPD worker did the `Nv*` registry mirror and is gone: leave the
+        // A clean stop of a start that saw interrupts is a healthy one: the boot-loop breaker's
+        // marker goes, flushed to disk before the image can be unloaded or the machine rebooted
+        // (`virtio::msi::service_stop`).
+        // The flush (only when a marker was cleared) is credited back like the HPD join.
+        let marker_from = crate::adapter::foreign_scanout::now_100ns();
+        if crate::virtio::msi::service_stop(passive_stop) {
+            budget = stop_credit(budget, marker_from);
+        }        // The HPD worker did the `Nv*` registry mirror and is gone: leave the
         // registry with the final counts (PASSIVE, StopDevice).
         crate::ddi::stall_diag::stop_sub(ss::FINAL_PUBLISH);
         crate::ddi::publish_nvrm_counters();

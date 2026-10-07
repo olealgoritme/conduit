@@ -235,6 +235,17 @@ struct crm_foreign_import {
  * for a layout the KMD refuses, -EIO for a host refusal (*host_errno). */
 int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
                       uint32_t *host_errno);
+/* Send one Helios escape verb as the caller built it (any HELIOS_ESCAPE_*:
+ * context create/destroy, release blob, FOREIGN_RESOURCE, ...) through the same
+ * D3DKMT device the other calls use, so the KMD sees one owner for the handles
+ * opened here and what `buf` names. `buf` (size bytes, read and written in
+ * place) starts with the 16-byte Helios escape header the caller filled in. The
+ * loss rules of the RM escapes apply (only an NVRM reply's contents are
+ * judged). Returns 0 when the escape returned success, else a negative errno
+ * (-ENODEV before the transport is up or once it is lost, -ENOSYS on an older
+ * KMD, -EIO for other failures); *ntstatus, when not NULL, is the D3DKMTEscape
+ * NTSTATUS either way. -ENOSYS on non-Windows builds. */
+int crm_win_escape_raw(void *buf, uint32_t size, int32_t *ntstatus);
 /* Plane 1 of a two-plane format (NV12/P010/P016), guest/windows/docs/
  * shared-formats.md: its own modifier, pitch and offset. */
 struct crm_foreign_plane {

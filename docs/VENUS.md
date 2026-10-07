@@ -616,12 +616,51 @@ by `SCM_RIGHTS` (from the renderer, and to it for `IMPORT_DMABUF`, the
 RM-export blob's dma-buf, and for `IMPORT_GUEST_PAGES`, the guest RAM file of
 a guest-memory blob), and fence signals pushed by the renderer on their
 own. What a renderer can do beyond the base calls (`Renderer::features`:
-`FEATURE_IMPORT_DMABUF`, `FEATURE_IMPORT_GUEST_PAGES`) is asked once as `CAPSET_INFO` with index
+`FEATURE_IMPORT_DMABUF`, `FEATURE_IMPORT_GUEST_PAGES`, `FEATURE_STAGE_TRACE`) is asked once as `CAPSET_INFO` with index
 `0xffffffff`: a `conduit-venus` from before it refuses that index like any
 other, so the backend reads "no features" and never sends it an op it does
 not know (an unknown op ends the connection). Both
 sides use the `conduit_venus::Renderer` trait (`host/venus/src/lib.rs`): the
 backend through the IPC client, tests through `conduit_venus::mock::Mock`.
+
+**Frame stage timing** ([TRACING.md](TRACING.md#frame-stage-timing)). Op
+`STAGES` (14), `{on u32}`, sent only to a renderer with `FEATURE_STAGE_TRACE`
+(bit 2): turns the renderer's stage stamps on or off and replies with every
+stamp since the last `STAGES`, as a stage dump (`host/venus/src/stage.rs`).
+The backend sends it from its completion pass, every 50 ms while its own stage
+timing is on and once more when it goes off; never while it was never on. A
+renderer from before it reports no such feature and is never asked. Inside
+`conduit-venus` the renderer stamps the stream's arrival, the fence request,
+virglrenderer's fence callback and the push to the backend, and hands vkr a
+hook (`virgl_renderer_conduit_stage_hook`, looked up at run time) from
+`host/venus/patches/0003-vkr-stage-timing.patch`: with it set, vkr reports its
+`vkQueueSubmit` of the stream's last submit, the ring's sync fence submitted
+and seen signalled, and the GPU time of that submit from two timestamp
+queries it adds around it (two prerecorded command buffers per slot, 64 slots
+per queue, made on first use; device-group and protected submits are not
+wrapped). virglrenderer's proxy numbers each ring's fences itself, so vkr
+sees its seqno, not the guest's fence id; the patch makes the proxy report the
+pairing and `conduit-venus` translates. With the hook null (stage timing off)
+vkr takes its unmodified path. The guest-visible protocol is unchanged: stage
+timing uses the fence ids and flip `seq`s already on the wire.
+
+**Latency options** (on by default; `conduit config set backend.latency off`
+or a list to change that,
+[research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
+`fused-submit`: a fenced `SUBMIT_3D` is one call, `Renderer::submit_fenced`
+(IPC op `SUBMIT_FENCED` (15), sent only to a server with `FEATURE_SUBMIT_FENCED` (bit 3),
+which every server from this release on adds itself), instead of `SUBMIT`
+and `CREATE_FENCE`, each waiting for its reply. `direct-fences`:
+`conduit-venus --direct-fences` sends each `FENCES` message from the
+virglrenderer thread that retired the fence, under the same send lock as the
+serve loop's replies, so the fragments of a message never interleave. The
+backend's reader thread then returns the signalled chains itself when the
+backend lock is free (`Renderer::set_fence_hook`), and otherwise leaves them
+to the fence pump; it asks the renderer nothing from there (the stage pull
+stays with the pump and the queue thread). Stage stamps are the same on
+this path: `venus signal` in the callback, `venus push` after the send. A fence can now reach the backend before the reply to
+its `CREATE_FENCE`. It is taken only under the backend lock, which the queue
+thread holds until it has recorded the chain.
 
 One `conduit-venus` per VM: `conduit up/view --venus` (and the libvirt
 backend unit) starts it before the backend, on `venus.sock` in the VM's run

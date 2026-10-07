@@ -96,6 +96,8 @@ fn send(
     let req = build_flip(flip, gem);
 
     let mut resp = [0u8; 2 * MSG_HDR_LEN];
+    // `StageTrace` (G_FLIP_SUBMIT): taken before the message can reach the host; 0 when off.
+    let t_submit = crate::ddi::stage_trace::now_if_on();
     let sent = match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms) {
         // MsgHeader.status (offset 8) is a signed errno; 0 is success.
         Ok(n) if n >= MSG_HDR_LEN => {
@@ -109,6 +111,19 @@ fn send(
         Ok(_) => Err(VirtioError::DeviceError),
         Err(e) => Err(e),
     };
+    if t_submit != 0 {
+        use helios_kmd_logic::stage_trace as st;
+        crate::ddi::stage_trace::stamp(st::G_FLIP_SUBMIT, st::KIND_FLIP, flip.seq, t_submit);
+        if sent.is_ok() {
+            crate::ddi::stage_trace::completed(
+                st::G_FLIP_ISR,
+                st::G_FLIP_ACK,
+                st::KIND_FLIP,
+                flip.seq,
+                t_submit,
+            );
+        }
+    }
     note_flip_sent(adapter, flip.seq, &sent);
     sent
 }
@@ -238,8 +253,17 @@ pub fn present_within(
     gem: u32,
     timeout_ms: u64,
 ) -> Result<u64, PresentRefusal> {
+    // `StageTrace`: the ForeignFlip programming's DDI entry, left for this send (0 otherwise),
+    // taken first so a refused mint cannot leave it for another flip.
+    let ddi_t = crate::ddi::stage_trace::take_flip_ddi();
     let flip = mint(adapter, owner, handle, false)?;
     scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
+    crate::ddi::stage_trace::stamp(
+        helios_kmd_logic::stage_trace::G_FLIP_DDI,
+        helios_kmd_logic::stage_trace::KIND_FLIP,
+        flip.seq,
+        ddi_t,
+    );
     let sent = send(passive, adapter, &flip, gem, timeout_ms);
     adapter.foreign_scanout_flip_done(flip.generation, sent.is_ok());
     match sent {
@@ -286,8 +310,13 @@ pub fn present_submit(
     let req = build_flip(&flip, gem);
     cell.store(0, core::sync::atomic::Ordering::Release);
     let tag = helios_kmd_logic::flip_pipeline::tag_of(flip.seq);
+    // `StageTrace` (G_FLIP_SUBMIT): taken before the message can reach the host; 0 when off.
+    let t_submit = crate::ddi::stage_trace::now_if_on();
     match ctrl::raw_submit_async(passive, adapter, &req, cell, tag) {
-        Ok(()) => Ok((flip.seq, flip.generation)),
+        Ok(()) => {
+            crate::ddi::stage_trace::flip_submitted(flip.seq, tag, t_submit);
+            Ok((flip.seq, flip.generation))
+        }
         Err(e) => {
             // It never reached the ring: no flip, nothing for the host to release.
             if let Some(owner) = scanout_release::gone(flip.seq) {

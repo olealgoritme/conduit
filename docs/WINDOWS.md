@@ -148,6 +148,7 @@ Off by default while new; each one was measured on the test machine
 | Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). Use with `ForeignFlip=1` |
 | Guest, KMD service key | `ForeignFlip` = 1 | the KMD flips the NVK DWM's swap-chain buffers to the scanout itself, zero-copy. Read at adapter start (`pnputil /restart-device`) |
 | Guest, `HKLM\SOFTWARE\Helios` | `DirectFlipSupport` = 1 (or `HELIOS_DIRECT_FLIP_SUPPORT` per process) | the D3D11.1 `CheckDirectFlipSupport` DDI answers yes when dxgkrnl reports DirectFlip for the adapter and size and format match; 2 = whenever size and format match (test lever); 0 (default) = never. Windows uses the answer for independent flip and the blt-to-flip upgrade |
+| Guest, KMD service key | `IndepFlip` = 1 (2 also completes the unregistered DMA flip instead of failing it) | independent flip, stage 1: advertises `SupportDirectFlip`, the segment `DirectFlip` flag and `FlipIndependent \| DdiPresentForIFlip`, and counts every flip (`Idf*`); needs `DirectFlipSupport` = 1 for the UMD answer; 0 (default) = off. Read at StartDevice; reboot per change. [independent-flip.md](../guest/windows/docs/independent-flip.md) section 11 |
 
 On by default, with a way back: `NvkRmFencePresent` (composed NVK presents
 retire on the RM fence; 0, or `HELIOS_NVK_RM_FENCE_PRESENT=0`, restores the
