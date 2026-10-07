@@ -1020,6 +1020,8 @@ fn note_and_maybe_signal(
     // Flush-gate trace (`ddi::flush_trace`): `Some` only for the SubmitCommand that
     // follows a `HEFL` Render. Record-only; nothing below branches on it.
     trace: Option<&crate::ddi::flush_trace::SubmitTrace>,
+    // `GdiAccel`: the GDI job sequence this buffer's fence waits for (`ddi/gdi_exec.rs`).
+    gdi_seq: Option<u64>,
 ) -> SubmitAck {
     let Ok(dxgkrnl) = adapter.dxgkrnl() else {
         // Effectively unreachable: dxgkrnl is set at StartDevice and never
@@ -1064,6 +1066,7 @@ fn note_and_maybe_signal(
                     blt_token,
                     exact_execution,
                     execution_boundary_value,
+                    gdi_seq,
                 )
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
@@ -1437,6 +1440,20 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     } else {
         None
     };
+    // `GdiAccel`: a RenderKm buffer's job (one relaxed load with the knob off).
+    // SAFETY: dxgkrnl's private range; the helper checks null and size.
+    let gdi_seq = if !is_paging && crate::ddi::gdi_accel::on() {
+        unsafe {
+            gdi_job_seq(
+                adapter,
+                submit.pDmaBufferPrivateData,
+                submit.DmaBufferPrivateDataSize,
+                submit.DmaBufferUmdPrivateDataSize,
+            )
+        }
+    } else {
+        None
+    };
     let SubmitAck::Accepted = note_and_maybe_signal(
         adapter,
         fence,
@@ -1444,6 +1461,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         present_fence,
         execution_boundary,
         trace.as_ref(),
+        gdi_seq,
     );
     STATUS_SUCCESS
 }
@@ -1507,6 +1525,15 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     } else {
         None
     };
+    // `GdiAccel`: a RenderKm buffer's job (one relaxed load with the knob off).
+    // SAFETY: dxgkrnl's private range; the helper checks null and size.
+    let gdi_seq = if !is_paging && crate::ddi::gdi_accel::on() {
+        unsafe {
+            gdi_job_seq(adapter, submit.pDmaBufferPrivateData, submit.DmaBufferPrivateDataSize, 0)
+        }
+    } else {
+        None
+    };
     let SubmitAck::Accepted = note_and_maybe_signal(
         adapter,
         fence,
@@ -1514,8 +1541,30 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         present_fence,
         execution_boundary,
         trace.as_ref(),
+        gdi_seq,
     );
     STATUS_SUCCESS
+}
+
+/// `GdiAccel`: the job a RenderKm buffer names in its private data (`gdi_accel::Private`, at
+/// the start of the KMD's half), admitted to the executor; `Some(seq)` gates the fence.
+///
+/// # Safety
+/// `data` is dxgkrnl's private data of `size` bytes, the KMD's half starting at `umd`.
+unsafe fn gdi_job_seq(adapter: &AdapterContext, data: *mut c_void, size: u32, umd: u32) -> Option<u64> {
+    if data.is_null() || size < umd {
+        return None;
+    }
+    let len = (size - umd) as usize;
+    if len < helios_kmd_logic::gdi_accel::PRIVATE_BYTES {
+        return None;
+    }
+    // SAFETY: `[umd, size)` of the runtime's private range is readable.
+    let bytes = unsafe {
+        core::slice::from_raw_parts((data as *const u8).add(umd as usize), helios_kmd_logic::gdi_accel::PRIVATE_BYTES)
+    };
+    let private = helios_kmd_logic::gdi_accel::Private::decode(bytes)?;
+    crate::ddi::gdi_exec::admit(adapter, private.job)
 }
 
 /// Cumulative count of pending WDDM fences discarded by a scheduler epoch —

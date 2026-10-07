@@ -371,13 +371,13 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"FlipCapsXEff", flip.effective);
         crate::diag::record_named_bytes(b"FlipCapsXMsk", flip.dropped);
         crate::diag::record_named_bytes(b"FlipCapsRep", flip.reported);
+        // GDI acceleration: latch the knob for RenderKm and write its mirrors (knob on only).
+        crate::ddi::gdi_accel::note_start(knobs.gdi_accel);
         // The extra VidMm caps this start accepts (the reported word itself is mirrored by the
         // caps query, which owns the base word: `VmCapsRep`).
         let vm = knobs.vidmm_caps(0);
         crate::diag::record_named_bytes(b"VmCapsXEff", vm.effective);
         crate::diag::record_named_bytes(b"VmCapsXMsk", vm.dropped);
-        // GDI acceleration: latch the knob for RenderKm and write its mirrors (knob on only).
-        crate::ddi::gdi_accel::note_start(knobs.gdi_accel);
         // VidVram is recorded after StartDevice resolves the absent-value
         // sentinel from the virtio host-visible capability.
         crate::diag::record_named_bytes(b"VidVBad", 0);

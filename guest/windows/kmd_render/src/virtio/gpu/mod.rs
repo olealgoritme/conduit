@@ -2061,6 +2061,11 @@ struct WddmPending {
     /// be discharged after generation death, but a dispatched copy still has
     /// to wait for the terminal pair rather than `(token, None)`.
     blt_stream_boundary: Option<u64>,
+    /// `GdiAccel`: the GDI job sequence of a RenderKm packet (`ddi/gdi_exec.rs`); the entry
+    /// completes once the executor's watermark reaches it. `None` for every other packet. Not
+    /// rebasable: the executor completes every admitted job within its own deadlines, and
+    /// StopDevice discharges the rest.
+    gdi_seq: Option<u64>,
     /// `WddmHoldMs`: interrupt-time deadline (100 ns units) before which this
     /// entry may not complete, or 0 for every ordinary submission.
     ///
@@ -8061,6 +8066,9 @@ impl VirtioGpu {
         blt_token: Option<u64>,
         d3d12: bool,
         execution_boundary: Option<u64>,
+        // `GdiAccel`: the GDI job sequence (`ddi/gdi_exec.rs`) this packet's commands are; the
+        // fence waits until the executor's watermark reaches it.
+        gdi_seq: Option<u64>,
     ) -> bool {
         if self.failed {
             // Transport failure is not producer completion. Let the scheduler
@@ -8336,6 +8344,7 @@ impl VirtioGpu {
             && stream_ready
             && execution.map_or(true, |wait| wait.completed())
             && blt_ready
+            && gdi_seq.map_or(true, crate::ddi::gdi_exec::seq_ready)
             // A held packet must not take the immediate-signal path: that is the
             // exact case the experiment measures (a packet with nothing real to
             // wait for), so the hold has to be able to reach it.
@@ -8368,6 +8377,7 @@ impl VirtioGpu {
             hold_until_100ns,
             head_deadline_100ns: 0,
             rebased: false,
+            gdi_seq,
         });
         false
     }
@@ -8525,6 +8535,7 @@ impl VirtioGpu {
                 blt_token,
                 blt_stream_boundary,
                 hold_until,
+                gdi_seq,
             ) = {
                 let Some(head) = self.wddm_pending.front() else {
                     return WddmTake::Empty;
@@ -8537,6 +8548,7 @@ impl VirtioGpu {
                     head.blt_token,
                     head.blt_stream_boundary,
                     head.hold_until_100ns,
+                    head.gdi_seq,
                 )
             };
             // Evaluated as three named conditions rather than one `||` chain: the
@@ -8574,6 +8586,11 @@ impl VirtioGpu {
                 if pass == 1 && self.rebase_blocked_head(RebaseArm::Blt) {
                     continue;
                 }
+                return WddmTake::BlockedOnProducer;
+            }
+            // `GdiAccel`: the GDI executor has not run this packet's job yet. Not rebasable
+            // (see `WddmPending::gdi_seq`); the executor's completion requests the DPC.
+            if !gdi_seq.map_or(true, crate::ddi::gdi_exec::seq_ready) {
                 return WddmTake::BlockedOnProducer;
             }
             // FOURTH ARM, AND DELIBERATELY LAST (`WddmHoldMs`, UV1). Placed after

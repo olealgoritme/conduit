@@ -241,6 +241,10 @@ struct DstEntry {
     gone: bool,
     /// `[0, cover)`: `pitch * height` rounded up to pages (`guest_blob::cover_len`).
     cover: u64,
+    /// The destination is a KMD RM video-memory surface (`RedirVram`, `docs/vram-redirection.md`
+    /// 5.3): its "descriptor" is its mapping in the channel (`ce_vram`), it has no lease pages, no
+    /// pin and no OS descriptor to free.
+    vram: bool,
 }
 
 struct State {
@@ -333,12 +337,54 @@ pub(crate) unsafe fn try_route(
     dst: DstInfo,
     boundary: Option<u64>,
 ) -> Option<u64> {
+    // SAFETY: the caller's contract.
+    unsafe { try_route_as(passive, adapter, args, context, source, destination, dst, boundary, false) }
+}
+
+/// [`try_route`] for a `RedirVram` destination (`docs/vram-redirection.md` 5.3): the Blt of an
+/// NVK-on-RM source into a KMD RM video-memory surface. Decided as a routed copy is, with the
+/// destination rule of [`vram_destination_facts`] in place of the lease rule; queued as a deferred
+/// WindowedBlt request whose destination is that image (its Venus copy into the imported image is
+/// the fallback the worker submits whenever the copy engine does not); the copy is VRAM to VRAM.
+/// `None`: nothing queued (counted), the caller decides what the Present does.
+///
+/// # Safety
+/// As [`try_route`].
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) unsafe fn try_route_vram(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    args: &DXGKARG_PRESENT,
+    context: Option<&ContextHandleRef<'_>>,
+    source: OptimalPresentImageDesc,
+    destination: PresentDestinationDesc,
+    dst: DstInfo,
+    boundary: Option<u64>,
+) -> Option<u64> {
+    // SAFETY: the caller's contract.
+    unsafe { try_route_as(passive, adapter, args, context, source, destination, dst, boundary, true) }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+unsafe fn try_route_as(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    args: &DXGKARG_PRESENT,
+    context: Option<&ContextHandleRef<'_>>,
+    source: OptimalPresentImageDesc,
+    destination: PresentDestinationDesc,
+    dst: DstInfo,
+    boundary: Option<u64>,
+    vram: bool,
+) -> Option<u64> {
     if !on() {
         return None;
     }
     let t0 = now_100ns();
     SEEN.fetch_add(1, Ordering::Relaxed);
-    let decided = decide_present(adapter, context, destination, dst, boundary);
+    let decided = decide_present(adapter, context, destination, dst, boundary, vram);
     add_us(&DEC_US, t0);
     let (payload, boundary) = match decided {
         Ok(v) => v,
@@ -356,6 +402,13 @@ pub(crate) unsafe fn try_route(
         });
         let prepared = match prepared {
             Ok(Ok(prepared)) => prepared,
+            // A VRAM destination Venus cannot import: the copy engine is its only copy.
+            Ok(Err(_)) | Err(_) if vram => {
+                match crate::virtio::venus::PreparedPresentBltSubmission::none(destination) {
+                    Some(p) => p,
+                    None => return Err(VirtioError::DeviceError),
+                }
+            }
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(VirtioError::DeviceError),
         };
@@ -376,7 +429,7 @@ pub(crate) unsafe fn try_route(
     // A job that could not be recorded leaves the request a plain deferred Venus copy.
     let recorded = {
         let mut g = STATE.lock();
-        let ok = ensure_dst(&mut g, dst) && g.jobs.add(token, boundary, dst.resource_id, payload);
+        let ok = ensure_dst_as(&mut g, dst, vram) && g.jobs.add(token, boundary, dst.resource_id, payload);
         refresh_active(&g);
         ok
     };
@@ -526,6 +579,10 @@ fn try_direct(adapter: &AdapterContext, token: u64, boundary: u64, dst: u32) {
 
 /// The destination's record, made when there is none (a free slot). `false`: no room.
 fn ensure_dst(g: &mut State, dst: DstInfo) -> bool {
+    ensure_dst_as(g, dst, false)
+}
+
+fn ensure_dst_as(g: &mut State, dst: DstInfo, vram: bool) -> bool {
     if g.dst_index(dst.resource_id).is_some() {
         return true;
     }
@@ -542,6 +599,7 @@ fn ensure_dst(g: &mut State, dst: DstInfo) -> bool {
         orphan: None,
         gone: false,
         cover,
+        vram,
     });
     true
 }
@@ -554,6 +612,7 @@ fn decide_present(
     destination: PresentDestinationDesc,
     dst: DstInfo,
     boundary: Option<u64>,
+    vram: bool,
 ) -> Result<(Payload, u64), Why> {
     let Some(boundary) = boundary else {
         return Err(Why::NoBoundary);
@@ -587,7 +646,11 @@ fn decide_present(
         Some(gen) if view.up => source_facts(gen, &rec, dst),
         _ => Err(Why::ChannelDown),
     };
-    let destination_ok = destination_facts(adapter, destination, dst, presenter);
+    let destination_ok = if vram {
+        vram_destination_facts(destination, dst)
+    } else {
+        destination_facts(adapter, destination, dst, presenter)
+    };
     let (dst_state, room) = {
         let g = STATE.lock();
         let state = match g.dst_index(dst.resource_id).and_then(|i| g.dsts[i].as_ref()) {
@@ -681,6 +744,23 @@ fn destination_facts(
         .is_some_and(|r| !r.may_unlock())
     {
         return Err(Why::GuestBlob);
+    }
+    Ok(())
+}
+
+/// A `RedirVram` destination: a pitch-linear KMD RM video-memory surface (an optimal-image
+/// destination the VRAM service made) that fits one channel window.
+fn vram_destination_facts(destination: PresentDestinationDesc, dst: DstInfo) -> Result<(), Why> {
+    if !matches!(destination, PresentDestinationDesc::OptimalImage(_)) {
+        return Err(Why::Destination);
+    }
+    let Some(obj) = crate::virtio::rm_client::vidmem::lookup(dst.resource_id) else {
+        return Err(Why::Destination);
+    };
+    let cover = helios_kmd_logic::guest_blob::cover_len(obj.pitch, obj.height, obj.size)
+        .map_err(|_| Why::Destination)?;
+    if !cr::fits_window(cover) || obj.pitch != dst.pitch || obj.width != dst.width || obj.height != dst.height {
+        return Err(Why::Destination);
     }
     Ok(())
 }
@@ -1095,7 +1175,7 @@ fn free_all_descriptors(passive: PassiveLevel, adapter: &AdapterContext, wait_io
             match (plan, e.dst.desc) {
                 (RetirePlan::Free, Desc::Ready { va, len }) => {
                     e.dst.desc = Desc::Draining;
-                    Some((e.dst.slot, va, len, e.dst.resource_id))
+                    Some((e.dst.slot, va, len, e.dst.resource_id, e.vram))
                 }
                 // A `Draining` one belongs to the paging thread retiring it.
                 (RetirePlan::Wait(_) | RetirePlan::Leak, Desc::Ready { .. }) => {
@@ -1106,8 +1186,10 @@ fn free_all_descriptors(passive: PassiveLevel, adapter: &AdapterContext, wait_io
                 _ => None,
             }
         };
-        if let Some((slot, va, len, resource_id)) = plan {
-            let freed = rio::free_dst(passive, adapter, slot, va, len, wait_io_ms, cr::FREE_MS);
+        if let Some((slot, va, len, resource_id, vram)) = plan {
+            // A VRAM destination's mapping is `ce_vram`'s (given back with the channel): nothing
+            // to free here.
+            let freed = vram || rio::free_dst(passive, adapter, slot, va, len, wait_io_ms, cr::FREE_MS);
             finish_free(i, resource_id, freed);
         }
     }
@@ -1285,6 +1367,11 @@ fn ensure_descriptor(
             Desc::Leaked => return Err(Why::Poisoned),
         }
         e.dst.admits()?;
+        if e.vram {
+            let cover = e.cover;
+            drop(g);
+            return vram_descriptor(passive, adapter, resource_id, cover);
+        }
     }
     // Never wait on the worker: a paging operation may hold the transaction for its whole bound.
     let Some(guard) = adapter.system_backings.try_serialize(passive) else {
@@ -1293,6 +1380,38 @@ fn ensure_descriptor(
     let r = create_descriptor(passive, adapter, &guard, resource_id);
     drop(guard);
     r
+}
+
+/// A `RedirVram` destination's "descriptor": its mapping in the channel (`ce_vram::ce_surface`,
+/// made on demand; no content transaction: it has no leases).
+fn vram_descriptor(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    cover: u64,
+) -> Result<(), Why> {
+    match crate::virtio::rm_client::ce_vram::ce_surface(passive, adapter, resource_id) {
+        Ok(s) => {
+            let mut g = STATE.lock();
+            if let Some(e) = g.dst(resource_id) {
+                if e.dst.desc == Desc::Absent {
+                    e.dst.desc = Desc::Ready { va: s.va, len: cover };
+                    DST_NEW.fetch_add(1, Ordering::Relaxed);
+                    DST_LIVE.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            } else {
+                Err(Why::Full)
+            }
+        }
+        Err(f) if rio::is_busy(&f) => Err(Why::NotReady),
+        Err(_) => {
+            if let Some(e) = STATE.lock().dst(resource_id) {
+                strike_dst(&mut e.dst, cp::Why::RmError);
+            }
+            Err(Why::Desc)
+        }
+    }
 }
 
 fn set_desc(resource_id: u32, desc: Desc) {
@@ -1551,6 +1670,31 @@ pub(crate) fn destination_gone(
     };
     // PASSIVE, outside the spinlock: may release the last owner of a lease.
     drop(removed);
+}
+
+/// A `RedirVram` destination's allocation is being destroyed (`vidmem::released`, before its memory
+/// is freed): its record goes unless a copy into it is still submitted (then it stays, `gone`,
+/// until the generation ends: the dup in the channel keeps the memory alive meanwhile). PASSIVE.
+pub(crate) fn vram_destination_gone(resource_id: u32) {
+    if ACTIVE.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = STATE.lock();
+    let submitted = g.jobs.submitted_for(resource_id);
+    if let Some(i) = g.dst_index(resource_id) {
+        let vram = g.dsts[i].as_ref().is_some_and(|e| e.vram);
+        if vram {
+            if submitted {
+                if let Some(e) = g.dsts[i].as_mut() {
+                    e.gone = true;
+                    e.dst.desc = Desc::Leaked;
+                }
+            } else if g.dsts[i].take().is_some() {
+                let _ = DST_LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+            }
+        }
+    }
+    refresh_active(&g);
 }
 
 /// StopDevice (the worker joined) and a StartDevice that finds an old transport, BEFORE the

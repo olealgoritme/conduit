@@ -359,6 +359,8 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         crate::ddi::ce_present_route::service(passive, adapter);
         crate::ddi::display::service_windowed_blt(passive, adapter);
         crate::ddi::ce_present_route::settle_after_dispatch(passive, adapter);
+        // `GdiAccel` (one relaxed load otherwise): execute the admitted GDI jobs.
+        crate::ddi::gdi_exec::service(passive, adapter);
 
         // The KMD's own RM client (`KmdRmClient`, off by default: a no-op then). After
         // the deferred programming above, so a primary bound in this very pass is seen.

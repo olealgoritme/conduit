@@ -69,10 +69,13 @@ pub mod pcaps {
     pub const SUPPORT_LINEAR_HEAP: u32 = 1 << 30;
 }
 
-/// The service knob (`HKR\Parameters`, `diag.rs` `KnobName`): 0 off (default: the caps word is 0,
+/// The service knob (the service key, `diag.rs` `KnobName`): 0 off (default: the caps word is 0,
 /// `DxgkDdiRenderKm` keeps its pass-through body), 1 GDI acceleration on (the caps word of
-/// [`ACCEL_CAPS`], the RenderKm translation, the executor). Any other value is 0. Read at
-/// AddAdapter and StartDevice with the other caps knobs.
+/// [`ACCEL_CAPS`], the RenderKm translation, the executor). Two one-bit experiments without GDI
+/// acceleration (RenderKm stays the pass-through, nothing else changes): 2 reports only
+/// `DriverSupportsCddDwmInterop` (CDD presents into DWM's UMD-created textures), 3 only
+/// `SupportSoftwareDeviceBitmaps` (`TEXTURE_CPUVISIBLE` redirection bitmaps). Any other value is
+/// 0. Read at AddAdapter and StartDevice with the other caps knobs.
 pub const KNOB: &str = "GdiAccel";
 pub const KNOB_DEFAULT: u32 = 0;
 
@@ -115,17 +118,18 @@ pub const ACCEL_CAPS: u32 = pcaps::SUPPORT_KERNEL_MODE_COMMAND_BUFFER
 /// The outcome of a `GdiAccel` value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
-    /// The knob in force: 1 or 0 (mirrored as `GdiKnob`).
+    /// GDI acceleration (RenderKm translation and executor) in force: knob 1 only.
     pub on: bool,
     /// The `DXGK_DRIVERCAPS.PresentationCaps` word (mirrored as `GdiCaps`).
     pub reported: u32,
 }
 
 pub const fn resolve_caps(knob: u32) -> Caps {
-    if knob == 1 {
-        Caps { on: true, reported: ACCEL_CAPS }
-    } else {
-        Caps { on: false, reported: 0 }
+    match knob {
+        1 => Caps { on: true, reported: ACCEL_CAPS },
+        2 => Caps { on: false, reported: pcaps::DRIVER_SUPPORTS_CDD_DWM_INTEROP },
+        3 => Caps { on: false, reported: pcaps::SUPPORT_SOFTWARE_DEVICE_BITMAPS },
+        _ => Caps { on: false, reported: 0 },
     }
 }
 
@@ -371,8 +375,8 @@ fn rd_rect(b: &[u8], at: usize) -> Option<Rect> {
 /// kernel buffers does not require protection from try/except code" (`DxgkDdiRenderKm`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubRects {
-    /// `NumSubRects` 0: the destination rectangle alone (inference: no clipping; see 9.4 of the
-    /// doc, unverified).
+    /// `NumSubRects` 0: the destination rectangle alone (inference: no clipping; see 10.6 of
+    /// `docs/vram-redirection.md`, unverified).
     None,
     /// At this byte offset of the command buffer.
     Inline { offset: usize, count: u32 },
@@ -1093,7 +1097,7 @@ pub mod cpu {
         r
     }
 
-    /// The 8-bit ROP3 code of a `Rop3` field (low byte; see 9.4 of the doc).
+    /// The 8-bit ROP3 code of a `Rop3` field (low byte; see 10.6 of `docs/vram-redirection.md`).
     pub const fn rop3_code(rop3: u16) -> u8 {
         rop3 as u8
     }
@@ -1420,7 +1424,9 @@ mod tests {
     #[test]
     fn caps_off_is_zero_and_on_is_the_documented_word() {
         assert_eq!(resolve_caps(0), Caps { on: false, reported: 0 });
-        assert_eq!(resolve_caps(2), Caps { on: false, reported: 0 });
+        assert_eq!(resolve_caps(2), Caps { on: false, reported: 0x100 });
+        assert_eq!(resolve_caps(3), Caps { on: false, reported: 0x1000_0000 });
+        assert_eq!(resolve_caps(4), Caps { on: false, reported: 0 });
         assert_eq!(resolve_caps(0xffff_ffff).reported, 0);
         let c = resolve_caps(1);
         assert!(c.on);

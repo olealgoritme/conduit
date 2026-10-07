@@ -57,6 +57,7 @@ pub(crate) mod std_census;
 pub(crate) mod submit_command;
 pub(crate) mod traced;
 pub(crate) mod vidpn;
+pub(crate) mod vram_redirect;
 pub(crate) mod wddm_surface;
 
 pub use add_device::dxgkddi_add_device;
