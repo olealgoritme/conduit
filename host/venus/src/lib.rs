@@ -102,7 +102,7 @@ pub const FEATURE_IMPORT_GUEST_PAGES: u32 = 1 << 1;
 /// call ([`Renderer::submit_fenced`]), one round trip instead of two. The
 /// IPC server adds this bit itself, whatever its renderer: any renderer
 /// serves the call through the trait's default.
-pub const FEATURE_SUBMIT_FENCED: u32 = 1 << 2;
+pub const FEATURE_SUBMIT_FENCED: u32 = 1 << 3;
 
 /// Why [`Renderer::submit_fenced`] failed: the submit (no fence was asked
 /// for), or the fence after a submit that went through.

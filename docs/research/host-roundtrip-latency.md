@@ -199,7 +199,7 @@ backend.cpus 0-7,16-23`. Both apply when the VM's backend next starts.
 | option | where | what |
 |---|---|---|
 | `quiet-held` | backend | a kick that only held fenced chains does not interrupt the guest |
-| `fused-submit` | backend, conduit-venus (`FEATURE_SUBMIT_FENCED`, IPC op 14) | a fenced `SUBMIT_3D` is one renderer call, `submit_fenced`, instead of `submit` and `create_fence`: one round trip less while the queue thread waits (about 33 µs) |
+| `fused-submit` | backend, conduit-venus (`FEATURE_SUBMIT_FENCED` bit 3, IPC op 15) | a fenced `SUBMIT_3D` is one renderer call, `submit_fenced`, instead of `submit` and `create_fence`: one round trip less while the queue thread waits (about 33 µs) |
 | `direct-fences` | conduit-venus `--direct-fences`, backend | conduit-venus sends each fence from the virglrenderer thread that retires it, under one send lock with the serve loop, instead of through the serve loop. The backend's renderer reader returns the chains itself, through `Renderer::set_fence_hook`, when the backend lock is free, and otherwise leaves them to the fence pump as before. Two hops fewer on the way back |
 | `event-batch` | backend | the event thread signals once per pass and sweeps with one `poll` over all descriptors |
 | `backend.cpus` | backend and conduit-venus `--cpus` | every thread of both stays on the given CPUs (the host's CCD, away from the vCPUs) |

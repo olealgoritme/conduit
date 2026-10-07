@@ -626,7 +626,7 @@ backend through the IPC client, tests through `conduit_venus::mock::Mock`.
 **Latency options** (off by default; `conduit config set backend.latency`,
 [research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
 `fused-submit`: a fenced `SUBMIT_3D` is one call, `Renderer::submit_fenced`
-(IPC op `SUBMIT_FENCED`, sent only to a server with `FEATURE_SUBMIT_FENCED`,
+(IPC op `SUBMIT_FENCED` (15), sent only to a server with `FEATURE_SUBMIT_FENCED` (bit 3),
 which every server from this release on adds itself), instead of `SUBMIT`
 and `CREATE_FENCE`, each waiting for its reply. `direct-fences`:
 `conduit-venus --direct-fences` sends each `FENCES` message from the

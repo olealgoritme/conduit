@@ -77,7 +77,7 @@ mod op {
     /// both done; `OK` with `{1 u32, error}` is a submit that went through
     /// and a fence that did not. Sent only to a server whose features carry
     /// `FEATURE_SUBMIT_FENCED`.
-    pub const SUBMIT_FENCED: u32 = 14;
+    pub const SUBMIT_FENCED: u32 = 15;
 
     /// `CAPSET_INFO` with this index asks for [`Renderer::features`]: the
     /// reply's first word is the bits. A server from before features passes
