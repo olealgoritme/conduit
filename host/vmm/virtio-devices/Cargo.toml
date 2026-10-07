@@ -12,6 +12,8 @@ virtio-bindings = "0.2"
 vmm-sys-util = "0.15"
 vm-memory.workspace = true
 pci = { path = "../pci" }
+# The one parser of /proc/driver/nvidia/version.
+abi = { path = "../../backend/gen" }
 rutabaga_gfx = { workspace = true, optional = true }
 thiserror = "2.0"
 displaydoc = "0.2"

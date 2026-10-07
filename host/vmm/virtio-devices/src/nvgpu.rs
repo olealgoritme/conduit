@@ -728,24 +728,11 @@ fn new_queues() -> [QState; NUM_QUEUES] {
     })
 }
 
-/// The host GPU driver version, as its procfs reports it.
-///
-/// Matched by shape rather than by field position: the wording around the
-/// number differs between driver builds and has changed before, but a bare
-/// two- or three-part dotted number in that line has not.
+/// The host GPU driver version, as its procfs reports it: the one parser in
+/// `abi::version`, which the backend and the CLI use as well.
 fn driver_version(proc_root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(proc_root.join("version")).ok()?;
-    // Only the NVRM line, and two or three parts: a release can be `565.77`,
-    // and the GCC line under it carries a three-part number of its own.
-    let line = text.lines().find(|l| l.starts_with("NVRM version:"))?;
-    line.split_whitespace()
-        .find(|w| {
-            let n = w.split('.').count();
-            (2..=3).contains(&n)
-                && w.split('.')
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .map(str::to_string)
+    abi::version::parse_proc_version(&text).map(|p| p.raw)
 }
 
 /// Check a config the backend served before any guest reads it.
@@ -1294,29 +1281,18 @@ mod tests {
         );
     }
 
+    /// The lines the backend, the CLI and the guest are tested on.
     #[test]
-    fn the_driver_version_is_read_from_procfs_by_shape() {
+    fn the_driver_version_follows_the_shared_fixture() {
         let dir = std::env::temp_dir().join(format!("nvgpu-ver-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(
-            dir.join("version"),
-            "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09  Release Build\n",
-        )
-        .expect("write");
-        assert_eq!(driver_version(&dir).as_deref(), Some("615.71.09"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_two_part_release_is_read_and_the_gcc_line_ignored() {
-        let dir = std::env::temp_dir().join(format!("nvgpu-ver2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(
-            dir.join("version"),
-            "NVRM version: NVIDIA UNIX x86_64 Kernel Module  565.77  Wed Oct 23 12:00:00 UTC 2024\nGCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n",
-        )
-        .expect("write");
-        assert_eq!(driver_version(&dir).as_deref(), Some("565.77"));
+        let fixture = include_str!("../../../backend/gen/fixtures/proc_version.tsv");
+        for line in fixture.lines().filter(|l| !l.starts_with('#')) {
+            let (text, want) = line.split_once('\t').expect("text<TAB>expected");
+            std::fs::write(dir.join("version"), text.replace("\\n", "\n")).expect("write");
+            let want = want.split(' ').nth(2).map(String::from);
+            assert_eq!(driver_version(&dir), want, "{text:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
