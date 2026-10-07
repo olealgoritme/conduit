@@ -2,7 +2,8 @@
 
 Status: sections 0 to 9 are the research (M0) and the M1 tool, which PASSed on a GB202 (async CE, acquire held, verify ok).
 M3a, the host-testable half of the KMD route, is
-sections 10 and 11 (`protocol/src/rm_fence_v3.rs`, `kmd_logic/src/ce_present.rs`); no `kmd_render` code exists yet. Every claim cites the file or patch it comes
+sections 10 and 11 (`protocol/src/rm_fence_v3.rs`, `kmd_logic/src/ce_present.rs`); no `kmd_render` code exists yet. M1b, the
+tool's block-linear round trip, is built and has not run yet (10.4). Every claim cites the file or patch it comes
 from; "unknown" marks what nobody has run, with what would settle it. Host driver release assumed: 610.57.04 (the release
 the host backend runs, `host/backend/gen/src/rmallow/v610_57_04.rs`). GPU: RTX 5090 (GB202) unless Ada is named.
 
@@ -309,7 +310,8 @@ style), `crm_pin_smoke.c` (OS descriptor over `crm_alloc_pages`), `crm_smoke.c` 
   probe are in OS-descriptor pages.
 - The producer value is a CPU store by default (`--release semsurf` uses `SET_VALUE`).
 - The ring has 128 entries. Every channel uses the device's VA space (`--vas new` tries a new one) at fixed VAs below 2^40.
-- Not built: the block-linear source (`bl`) and a compressed source (unknown 1 of section 6). Both still need a later tool.
+- Block-linear: `--bl-roundtrip` / `--bl-probe-pitch` (M1b, section 10.4). Not built: a compressed source (unknown 1 of
+  section 6).
 - Added: `--engine`, `--contend`, `--delay`/`--duration` (section 7) and the `precondition:` line (section 8).
 
 Structure (two clients in one process, so the cross-client route of 2.3 is exercised):
@@ -633,6 +635,42 @@ the image. Nothing checks this yet. Needed:
 The block-linear push-buffer words (`kmd_logic::ce_present`) are host-tested only; nothing claims block-linear works on
 hardware.
 
+### 10.4 M1b: the block-linear round trip in `crm_ce_copy_smoke` (built, not yet run)
+
+`--bl-roundtrip` (run lines and expected output in `crm_ce_copy_smoke.md`) works as follows:
+- The producer allocates a 6553600-byte image (pitch 6400 = 100 GOBs, 1024 rows = 8 blocks of 128) as plain video memory.
+  As in NVK (patch 0004/0028 `alloc_rm_memory`), the allocation carries no kind.
+- The copier dups it and maps it with big pages and the PTE kind given by `NVOS46_FLAGS_PAGE_KIND_OVERRIDE` (19:19) plus
+  `NVOS46_PARAMETERS.kindOverride`. That is how patch 0005 (`nvkmd_rm_va_bind_mem`) gives an image's VA its kind, and
+  0022/0027 keep the rule ("kinds are applied per mapping"). The default kind is the modifier's k, 0x06; `--bl-kind`
+  overrides it.
+- Per round, one push copies the salted pitch pattern into the image with the CE's destination block-linear state
+  (`SET_DST_BLOCK_SIZE` 0x70c..`SET_DST_LAYER`, `DST_ORIGIN_X/Y` 0x74c/0x750, Mesa `clcab5.h`). It then makes a host release
+  with WFI and copies the image back into an OS descriptor with the source block-linear state. Those words are the ones
+  `ce_present::copy` emits for Heaven's source, checked against the builder's pinned test words. The CPU then compares
+  every word.
+- `--bl-probe-pitch` also copies the image out PITCH -> PITCH. Its position-dependent checksum must differ from the
+  unswizzled pattern's.
+
+What a PASS proves:
+- that 0xcab5 accepts the block-linear methods at these offsets with these words: block-size word 0x1040,
+  `SRC/DST_WIDTH` = pitch in bytes, `HEIGHT` = image rows (the method half of unverified item 2 of 11.7). A bad method or
+  value raises an RC error on the tool's channel;
+- that the pitch -> block-linear and block-linear -> pitch copies are exact inverses over the whole 1600x900 frame. A
+  field that is wrong in the same way in both directions, such as the block height or `KIND_BPP`, still cancels out;
+- that the CE really swizzles: the probe differs;
+- that the copy rate from block-linear video memory into guest RAM is close to the pitch copy rate;
+- that a dup of a video-memory image mapped with an override kind works from a second client.
+
+What it cannot prove:
+- **Compatibility with NVK's own layout and mapping.** Both directions go through the same mapping with the same block
+  parameters, so any self-consistent but wrong choice cancels out. That includes the kind: `--bl-kind 0` is expected to pass the round
+  trip as well. The checksum of the pitch probe under kind 0 versus 0x06 shows whether the kind changes the physical
+  layout. A real NVK image rendered by the 3D engine, read through the KMD's mapping and compared with the Venus copy of
+  the same frame, is the only check of 10.3's open item: M3c.
+- A dup across processes (NVK's client in the app, the KMD's client), a compressed source, and the kernel-mode path. These
+  stay unverified items 6, 7 and 8 of 11.7.
+
 ## 11. KMD integration points
 
 M3a built the pure half: the record (10), and `kmd_logic/src/ce_present.rs` with the push-buffer builder (its pitch-linear
@@ -755,9 +793,11 @@ How the KMD learns the value advanced, two ways, both reading the CPU mapping of
 
 ### 11.7 Unverified items
 
-1. The source mapping kind (10.3): a block-linear source mapped by the KMD with kind 0x06 reads the right pixels (M1b, M3c).
+1. The source mapping kind (10.3): a block-linear source mapped by the KMD with kind 0x06 reads the right pixels. M1b
+   (10.4) cannot settle this, because its round trip passes with any kind; only M3c can.
 2. The block-linear words on 0xcab5 against the 610.57.04 headers (its `clcab5.h` omits them; Mesa's has them) and
-   `KIND_BPP` (Mesa only).
+   `KIND_BPP` (Mesa only). An M1b PASS (10.4) settles the methods; whether the field values match NVK's layout is left to
+   M3c. The tool is built but has not run yet.
 3. `SEM_EXECUTE.RELEASE_TIMESTAMP` and `NON_STALL_INTERRUPT` on 0xca6f (not in `clca6f.h`; the tool's PASS used
    `NON_STALL_INTERRUPT`).
 4. Which notifier index a CE channel's non-stall interrupt raises for an `NV01_EVENT_OS_EVENT` (option B); the tool only

@@ -59,6 +59,7 @@ Options (defaults in brackets):
 - `--release cpu|semsurf`: the producer value is set by a CPU store or by `SET_VALUE` 0xda0004 [cpu]
 - `--timeout-ms <ms>`: bound of every CPU wait [2000]
 - `--fence`: Windows only; also time doorbell -> RM fence event
+- `--bl-roundtrip`, `--bl-probe-pitch`, `--modifier <hex>`, `--bl-kind <hex>`: the block-linear check (below)
 
 Exit 0 on PASS, 1 on FAIL.
 
@@ -117,6 +118,94 @@ What the stages are:
 - Section 5 thresholds for M3: `submit_to_done_acquire_satisfied_us` p50 below 400 us, and `acquire_satisfy_to_done_us`
   p50 below 50 us plus `copy_us` p50.
 - With `--contend`, a "separate runlists" line, and `contend_overlapped` close to the number of rounds.
+
+## Block-linear round trip (M1b)
+
+`--bl-roundtrip` replaces the measured loop. It checks on hardware the block-linear copy words before the KMD uses them for
+Heaven's windowed source (modifier 0x0300000000606014: h = 4, so blocks of 16 GOBs or 128 rows; page kind 0x06; GOB
+generation 2; sector layout; no compression). No CPU-side GOB swizzle is involved.
+
+Setup:
+- The producer allocates the image as plain video memory. Its size is the modifier's layout: pitch = `width * 4` rounded up to
+  whole 64-byte GOBs (6400 = 100 GOBs), rows = the height rounded up to whole blocks (1024), so 6553600 bytes, the same
+  arithmetic as `foreign_resource::Layout`.
+- The copier dups the image and GPU-maps it with big pages and the PTE kind: `NVOS46_FLAGS_PAGE_KIND_OVERRIDE` plus
+  `kindOverride`, as nvk-rm patch 0005 binds an image's VA.
+
+Per round, one push:
+1. A CE copy from the pitch source to the block-linear image (the destination block-linear state: `SET_DST_BLOCK_SIZE`
+   0x1040, `DST_WIDTH` = pitch, `DST_HEIGHT` = 900, `DST_ORIGIN` 0).
+2. A host release with WFI.
+3. A CE copy from the block-linear image to the pitch destination (the OS descriptor over process pages). The words of this
+   copy are exactly the ones `ce_present.rs` emits for the windowed source.
+4. The completion release.
+
+Each copy carries its own pair of CE timestamps. The pattern is salted per run, so stale video memory from an earlier run
+cannot pass. `--bl-probe-pitch` adds one more push after the rounds: it copies the image out PITCH -> PITCH (the same
+memory read as plain rows of the image pitch) and compares a position-dependent checksum with that of the unswizzled
+pattern. The two must differ.
+
+Run lines (after the scp above):
+
+```sh
+ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe --bl-probe-pitch'
+ssh -p 2222 "$WIN_SSH" 'C:\Users\Public\t\crm_ce_copy_smoke.exe --bl-probe-pitch --bl-kind 0'
+```
+
+Options: `--modifier <hex>` (32 bpp uncompressed NVIDIA block-linear 2D only, `h <= 5`) [0x0300000000606014];
+`--bl-kind <hex>`, the PTE kind of the image's mapping [the modifier's k, 0x06; 0 = no override, the allocation's own pitch
+kind]; `--iterations <n>` rounds [16]; `--size WxH` [1600x900]. `--contend`, `--fence` and `--duration` are refused with
+this mode.
+
+Expected output (first run):
+
+```
+bl_modifier=0x0300000000606014 h=4 (blocks of 128 rows) k=0x06 g=2 s=1 c=0
+bl_image: pitch=6400 (100 GOBs) rows=1024 size=6553600 block_size_word=0x1040
+bl_kind=0x06 (PAGE_KIND_OVERRIDE on the image's mapping, the modifier's k)
+...
+[ ok ] alloc NV01_MEMORY_LOCAL_USER 0x40 8388608 bytes (block-linear image)
+[ ok ] copier: DUP_OBJECT block-linear image 0x... of client 0x...
+[ ok ] GPU-map block-linear image (dup), PTE kind 0x06 (override) (8388608 bytes) -> VA 0x...
+[ ok ] ce channel alive: SET_OBJECT + release seen
+status: block-linear round trip, 16 rounds
+
+stage                                       n        min        avg        p50        p99        max
+bl_copy_pitch_to_bl_us                     16        ...
+bl_copy_bl_to_pitch_us                     16        ...
+bl_roundtrip_doorbell_to_done_us           16        ...
+
+bl_copy_gbps_p50=...
+bl_roundtrip=ok (16 rounds, 0 bad, 0 bad words)
+bl_probe_pitch=swizzled checksum_bl_as_pitch=0x... checksum_unswizzled=0x... words_in_place=N/1440000
+       copier: objects still tracked 0, CPU mappings 0
+       producer: objects still tracked 0, CPU mappings 0
+RESULT PASS
+```
+
+`words_in_place` is expected to be a small fraction: a few words, such as the first bytes of row 0, land where the pitch
+layout puts them. It is informational; the verdict is the checksum. PASS needs
+`bl_roundtrip=ok`, `bl_probe_pitch=swizzled`, the error notifier still 0, and nothing left tracked. The copy times should be
+close to the pitch `copy_us` of run 1 (about 0.2 ms for 5.76 MB). A much slower block-linear read is a finding for M3.
+
+With `--bl-kind 0` the tool prints `bl_kind=0x00 (no override: the allocation's own pitch kind)` and an `[info]` line. The
+expected result is still `bl_roundtrip=ok`: both copies go through the same mapping, so a wrong kind cancels out. The CE
+computes the block-linear addresses itself, so `swizzled` is also expected. Compare `bl_probe_pitch`'s checksum with the
+kind-0x06 run's: if they differ, the kind changes the physical layout within a GOB. The round trip therefore proves that
+the CE accepts the block-linear words and that the two directions invert each other. It does not prove that they, or the
+mapping kind, match NVK's layout (a block height that is wrong in both directions cancels out too). Only M3c, which reads a
+real NVK image, checks that (`rm-copy-engine-present.md` 10.4).
+
+On failure:
+- A bad encoding raises an RM channel error (RC) on the tool's own channel. The tool prints `[FAIL] ce channel: channel
+  error notifier status 0x.. info32 0x.. (RC error)`, the `middle release seen / NOT seen` line (which copy it stopped in),
+  the completion value and USERD, then tears down and prints `RESULT FAIL bl round trip: ...`. That is a reset of the
+  tool's channel, not a GPU hang. Every wait is bounded by `--timeout-ms`.
+- Wrong data with no error prints `bl_roundtrip=BAD`, up to 8 `mismatch round R: offset 0x.. (x X, y Y): want 0x.. got
+  0x..` lines, and `RESULT FAIL block-linear round trip matches the pattern`.
+- `bl_probe_pitch=IDENTICAL` means the copy did not swizzle: block-linear was not in effect. That is a FAIL.
+
+Send back the full output of both runs.
 
 ## What to send back
 
