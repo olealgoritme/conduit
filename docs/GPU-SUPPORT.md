@@ -1,11 +1,12 @@
 # GPU support: RTX 20 / 30 / 40 / 50
 
 What Conduit needs to work on every GeForce RTX generation, for Linux guests
-and Windows 11 guests (NVK-on-RM, Venus fallback). Everything so far ran on
-one GPU only: an RTX 5090 (Blackwell, GB202). Nothing here has been run on
-Turing, Ampere or Ada yet; every verdict for them is read from the code and
-from upstream, not measured. Guesses are marked **(guess)**, things to check
-on hardware **(to verify)**.
+and Windows 11 guests (NVK-on-RM, Venus fallback). The reference machine is an
+RTX 5090 (Blackwell, GB202). One Linux-guest run exists on an RTX 4070 SUPER
+(Ada, AD104; [measured below](#measured-rtx-4070-super-ada-ad104)). Nothing
+has been run on Turing or Ampere, and every other verdict is read from the
+code and from upstream, not measured. Guesses are marked **(guess)**, things
+to check on hardware **(to verify)**.
 
 Related: [SECOND-MACHINE.md](SECOND-MACHINE.md) (setting up the second
 machine), [NVK-ROADMAP.md](NVK-ROADMAP.md), [HANDOFF.md](HANDOFF.md).
@@ -132,7 +133,9 @@ against a live 565.77 guest after this change.**
 ### Verdict per generation
 
 - **RTX 50 (Blackwell)**: works (the reference machine).
-- **RTX 40 (Ada)**: expected to work for DWM-on-NVK, games and scanout;
+- **RTX 40 (Ada)**: a Linux guest on NVIDIA's own user-mode driver works
+  (measured on an RTX 4070 SUPER, see below). Expected to work for
+  DWM-on-NVK, games and scanout;
   1-/2-byte shared formats need the KMD fix; compression off (perf below
   the 5090 numbers, by more than the GPU difference **(guess)**). The best
   candidate after Blackwell: ReBAR, same driver releases, NVK conformant.
@@ -141,6 +144,43 @@ against a live 565.77 guest after this change.**
 - **RTX 20 (Turing)**: as Ampere, without ReBAR: BAR1 256 MiB, the
   host-visible VRAM heap is tiny; expect lower DXVK performance **(guess)**.
   Functionally expected to work.
+
+## Measured: RTX 4070 SUPER (Ada, AD104)
+
+One session, in a Linux guest on NVIDIA's own user-mode driver (the host's
+files shared over virtiofs); NVK-on-RM and Windows were not run.
+
+| | |
+|---|---|
+| Host | Ubuntu 24.04, **closed** kernel modules 565.77 (GSP firmware on), PCI `10de:2783`, 12 GiB, BAR1 256 MiB (Resizable BAR off), a monitor connected to the same GPU |
+| Guest | Omarchy (Arch), kernel 7.2.5, Hyprland, `conduit attach`ed libvirt VM |
+| Protections | safe mode (automatic for an untested driver): 2 GiB video-memory limit, 1 s bounds on blocking calls |
+| Bring-up | staged: guest module held at boot; loaded by hand; then `nvidia-smi`, `vulkaninfo`; then the compositor on the Conduit GPU |
+
+What ran, with the host kernel log free of `NVRM` and `Xid` lines throughout:
+
+- The backend picks the exact 565.77 tables; the guest module loads and reports
+  `1 GPU(s), driver 565.77`; the backend log shows `page kind 6/2, sector
+  layout 1` for the render node.
+- `nvidia-smi` lists the GPU. `vulkaninfo --summary` lists `NVIDIA GeForce RTX
+  4070 SUPER`, `driverVersion 565.77.0.0`, `deviceID 0x2783`,
+  `DRIVER_ID_NVIDIA_PROPRIETARY`, conformance 1.3.8.2.
+- Hyprland in the guest renders on the Conduit GPU and `vkcube` runs on it; the
+  owner used the desktop for a while without a glitch. This was not a soak
+  test and not a benchmark.
+
+Seen in the backend log, harmless so far: `SYS_PARAMS` answered with a
+synthesized success when the host returns EBUSY; `UNMAP_MEMORY: no mapping for
+pLinearAddress=...` at process exit; the 1 s clamp on `RM_IDLE_CHANNELS`
+(safe mode working); `RM_CONTROL GPU_GET_PIDS` refused by design.
+
+Not covered: CUDA, NVENC/NVDEC, NVK-on-RM (its structs are sized for 610.57.04,
+so it does not enumerate a device on 565.77), Windows guests, games, long runs,
+the open modules on this card, and the limit's behaviour under memory pressure.
+
+Two things the run fixed that no table could have shown: the guest module
+accepted only the 48-byte `RM_ALLOC` layout while this release's NVML sends the
+32-byte one, and it read `GET_DEV_INFO` in the 36-byte layout of 575 and later.
 
 ## Code changes needed
 
@@ -190,8 +230,9 @@ Then Windows: `Verify-Helios.ps1 -RunSmokeTests`, a D3D11 app with
 
 ## First hour on the RTX 4070 (Ada, AD104)
 
-0. Note which 4070 it is: `lspci -nn | grep -i nvidia` shows 0x2786 (AD104)
-   or 0x2709 (AD103). Both are Ada; nothing in Conduit depends on which.
+0. Note which 4070 it is: `lspci -nn | grep -i nvidia` shows 0x2786 (AD104),
+   0x2709 (AD103) or, for the SUPER, 0x2783 (AD104). All are Ada; nothing in
+   Conduit depends on which.
 1. **Host (10 min)**: install the open modules at a supported release
    (same as the 5090 host, e.g. 610.57.04 or 615.71.09); check ReBAR is on in
    the BIOS; `conduit doctor` all ok; `nvidia-smi -q` shows BAR1 ≈ 16 GiB

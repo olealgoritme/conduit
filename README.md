@@ -31,6 +31,13 @@ from GPU memory to your screen: no copying, no video compression.
 > and Hyprland. Expect rough edges. Windows guests are experimental (`--venus`),
 > and the guest driver is test-signed ([docs/WINDOWS.md](docs/WINDOWS.md),
 > [Roadmap](docs/ROADMAP.md)).
+>
+> It has also run once on an RTX 4070 SUPER (Ada) with the closed NVIDIA 565.77
+> modules, a Linux guest (Omarchy, Hyprland) and NVIDIA's own user-mode driver:
+> `nvidia-smi`, Vulkan and the desktop on the GPU worked
+> ([what was measured, and what was not](docs/GPU-SUPPORT.md#measured-rtx-4070-super-ada-ad104)).
+> RTX 20 and 30 cards, CUDA and video encode in that setup, and Windows guests
+> on other GPUs have not been run.
 
 ### Windows guests
 
@@ -54,7 +61,7 @@ RTX 5090.
 | | |
 |---|---|
 | Host | Linux, x86-64, with KVM (`ls /dev/kvm` works) |
-| GPU | NVIDIA, Turing (RTX 20xx) or newer |
+| GPU | NVIDIA, Turing (RTX 20xx) or newer. Run so far: RTX 5090 (reference), RTX 4070 SUPER (one Linux-guest session) |
 | Host driver | A release Conduit has ABI tables for (535.129.03, 565.77, 580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09; `conduit doctor` lists them). Tested with the **open** kernel modules, 580 or newer; the closed modules and older branches are accepted when the release has tables, with a warning that they are untested |
 | Desktop | Any Wayland desktop (GNOME, KDE, Hyprland, Sway, …) |
 | VM | Linux, kernel 6.4 or newer: Ubuntu 24.04 recommended (`conduit create`); `conduit attach` also sets up Debian and Arch-based VMs (Arch, Omarchy, EndeavourOS, Manjaro). Windows 11: experimental ([docs/WINDOWS.md](docs/WINDOWS.md)) |
