@@ -143,13 +143,35 @@ impl LayoutError {
 
 /// The layout of a `width` x `height` surface of DXGI format `dxgi` (28, 87, 88): the ring
 /// surfaces' geometry (pitch rounded to 256, size to 64 KiB), at most `MAX_SURFACE_BYTES`.
+///
+/// The extents are the foreign record's (`foreign_resource::MIN_DIM`..=`MAX_DIM`, 1..=16384), NOT
+/// the scanout's (`rm_client::surface_layout` starts at 64): GDI textures of small windows,
+/// tooltips and the cursor are below 64 in a dimension (357.1: `RvWhy` 6 for 8 of 19 requests).
 pub fn layout(width: u32, height: u32, dxgi: u32) -> Result<VidLayout, LayoutError> {
+    use crate::foreign_resource::{MAX_DIM, MIN_DIM};
     let fourcc = fourcc_for_dxgi(dxgi).ok_or(LayoutError::Format)?;
-    let surface = rc::surface_layout(width, height).ok_or(LayoutError::Extent)?;
-    if surface.size > MAX_FOREIGN_RESOURCE_BYTES {
+    if !(MIN_DIM..=MAX_DIM).contains(&width) || !(MIN_DIM..=MAX_DIM).contains(&height) {
         return Err(LayoutError::Extent);
     }
-    Ok(VidLayout { surface, fourcc })
+    let row = u64::from(width) * u64::from(rc::BYTES_PER_PIXEL);
+    let align = u64::from(rc::PITCH_ALIGN);
+    let pitch = row.div_ceil(align) * align;
+    if pitch > u64::from(crate::foreign_scanout::MAX_STRIDE) {
+        return Err(LayoutError::Extent);
+    }
+    let size = (pitch * u64::from(height)).div_ceil(rc::SIZE_ALIGN) * rc::SIZE_ALIGN;
+    if size > rc::MAX_SURFACE_BYTES || size > MAX_FOREIGN_RESOURCE_BYTES {
+        return Err(LayoutError::Extent);
+    }
+    Ok(VidLayout {
+        surface: RcLayout {
+            width,
+            height,
+            pitch: pitch as u32,
+            size,
+        },
+        fourcc,
+    })
 }
 
 /// What RM made (it may round pitch and size up), or why it cannot be used.
@@ -526,7 +548,8 @@ pub fn bounce_copy(vram: &Surface, rect: Rect, dir: Dir) -> Result<CopyRect, Cop
 pub const COUNTERS: &[&str] = &[
     // the service (`vidmem.rs`)
     "RvKnob", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
-    "RvBytes", "RvFreed", "RvBring", "RvMs", "RvMsMax", "RvSoft", "RvLeak",
+    "RvBytes", "RvFreed", "RvBring", "RvMs", "RvMsMax", "RvSoft", "RvLeak", "RvOpen", "RvOpenFg",
+    "RvOpenLay", "RvOpenPid",
     // the channel side (`ce_vram.rs`)
     "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvXfer", "RvXferFail",
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
@@ -575,6 +598,16 @@ mod tests {
         assert_eq!(layout(800, 600, 87).unwrap().surface.pitch, 3328);
         assert_eq!(layout(1600, 900, 0), Err(LayoutError::Format));
         assert_eq!(layout(0, 900, 87), Err(LayoutError::Extent));
+        // Small GDI textures (tooltips, the cursor, narrow windows) are VRAM too (357.1 RvWhy 6).
+        let t = layout(32, 32, 87).unwrap();
+        assert_eq!((t.surface.pitch, t.surface.size), (256, 65536));
+        assert!(foreign_layout(&t).is_some());
+        let n = layout(1, 1, 88).unwrap();
+        assert_eq!((n.surface.pitch, n.surface.size), (256, 65536));
+        assert!(foreign_layout(&n).is_some());
+        // The same answer as the ring surfaces' rule where both apply.
+        assert_eq!(layout(1600, 900, 87).unwrap().surface, rc::surface_layout(1600, 900).unwrap());
+        assert_eq!(layout(16385, 8, 87), Err(LayoutError::Extent));
     }
 
     #[test]

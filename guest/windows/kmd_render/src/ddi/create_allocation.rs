@@ -4262,6 +4262,13 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         if ident.is_some_and(|identity| identity.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD) {
             crate::ddi::std_census::note_open(meta.map_or(0, |m| m.misc_flags));
         }
+        // `RedirVram`: an open of a KMD RM video-memory surface (one relaxed load when none is
+        // alive), whether it was served as a foreign record (the opener can import it by id).
+        crate::virtio::rm_client::vidmem::note_open(
+            resource_id,
+            ident.is_some_and(|identity| identity.foreign),
+            foreign_layout.is_some(),
+        );
         info.hDeviceSpecificAllocation = Box::into_raw(open) as HANDLE;
         crate::diag::record(
             0x0C36_0000 | ((info.hDeviceSpecificAllocation as usize as u32) & 0xFFFF),

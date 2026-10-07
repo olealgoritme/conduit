@@ -431,6 +431,16 @@ Blts with the others. `RvBltWhy`: 1 route refused, 2 no foreign source (`Foreign
 descriptor, 4 format, 5 rectangle (stretch), 6 channel busy or down, 7 copy, 8 read, 9 write, 10 memory,
 11 unknown source.
 
+First hardware run (357.1, with fallback A's `GdiAccel`): GDI `TEXTURE` surfaces are created and
+VRAM-backed (1920x1080: `StdNGdiTex` 8, `RvTry` 19 / `RvOk` 11; 5120x1440: 25 / 16), no crash. The
+misses were all `RvWhy` 6 (Extent): the layout used the scanout's minimum of 64 pixels, so the small
+textures (tooltips, the cursor, narrow windows) went to Venus. Fixed: the foreign record's extents
+(1..=16384). Opens of a VRAM surface are now counted: `RvOpen`, `RvOpenFg` (served as FOREIGN),
+`RvOpenLay` (the layout record reached the opener), `RvOpenPid` (DWM's pid = DWM opened it); with the
+foreign table's `FgOpen`, `FgRiOk`/`FgRiErr`/`FgRiRef` (DWM's NVK import by id) and the census's
+`StdOGdiTex`/`StdOpenPid`. The UMD no longer treats a VRAM GDI texture as a Venus cross-context image
+when its open carries the foreign layout (`umd/src/forward/resource.rs`), so DWM's NVK takes the import.
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
