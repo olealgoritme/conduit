@@ -151,13 +151,15 @@ pub fn venus_guest_blobs() -> bool {
 /// `gpu.vram_limit_mib`: how the backend's video-memory cap is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VramSetting {
-    /// Unset: the default cap when safe mode is on and the card drives a
-    /// monitor, nothing otherwise (protect.rs).
+    /// Unset: the display default while safe mode is on and the card drives
+    /// a monitor, nothing otherwise. Safe mode's own 2 GiB applies on top
+    /// (`protect::final_limit_mib` is the one rule).
     Default,
     /// The default cap whenever the card drives a monitor.
     Auto,
-    /// No cap.
+    /// No cap of the owner's; safe mode's 2 GiB, if safe mode is on, stays.
     Off,
+    /// A number of MiB; safe mode's 2 GiB, if on, still bounds it.
     Mib(u64),
 }
 

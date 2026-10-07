@@ -65,30 +65,45 @@ fn safe_mode_text(
     d: &host::Driver,
 ) -> String {
     use crate::config::SafeSetting::*;
-    let on = crate::protect::safe_mode(env, setting, crate::protect::protection(Some(d)));
-    let how = match (env, setting) {
-        (Some("1" | "0"), _) => "CONDUIT_SAFE_MODE is set in this shell".to_string(),
-        (_, On) => "gpu.safe_mode is true".to_string(),
-        (_, Off) => "gpu.safe_mode is false".to_string(),
-        (_, Auto) => match host::untested_because(d) {
-            Some(what) => format!("{} ({what}) is untested", d.version),
-            None => format!(
-                "{} on the open kernel modules is what Conduit is tested on",
-                d.version
-            ),
-        },
+    let protection = crate::protect::protection(Some(d));
+    let on = crate::protect::safe_mode(env, setting, protection);
+    // What a start that does not inherit this shell gets (libvirt units and
+    // virt-manager run under systemd's environment): the setting, then auto.
+    let unit_on = crate::protect::safe_mode(None, setting, protection);
+    let auto = || match host::untested_because(d) {
+        Some(what) => format!("{} ({what}) is untested", d.version),
+        None => format!(
+            "{} on the open kernel modules is what Conduit is tested on",
+            d.version
+        ),
     };
-    let reason = if matches!((env, setting), (Some("1" | "0"), _) | (_, On) | (_, Off)) {
-        how
-    } else {
-        format!("because {how}")
+    let by_setting = match setting {
+        On => "the setting (gpu.safe_mode is true)".to_string(),
+        Off => "the setting (gpu.safe_mode is false)".to_string(),
+        Auto => format!("auto, from the driver: {}", auto()),
+    };
+    let decided = match env {
+        Some("1" | "0") => format!(
+            "decided by the environment (CONDUIT_SAFE_MODE={} in this shell)",
+            env.unwrap_or_default()
+        ),
+        _ => format!("decided by {by_setting}"),
+    };
+    let shell_note = match env {
+        Some("1" | "0") => format!(
+            "\n         A libvirt or virt-manager start does not see this shell: it follows gpu.safe_mode, \
+             which gives safe mode {} ({})",
+            if unit_on { "ON" } else { "off" },
+            by_setting
+        ),
+        _ => String::new(),
     };
     if on {
         format!(
-            "ON, {reason}: a 2 GiB video-memory cap and 1 s limits on blocking GPU calls\n         `conduit config set gpu.safe_mode false` turns it off"
+            "ON, {decided}: video memory capped at 2 GiB (a smaller gpu.vram_limit_mib stays) and 1 s limits on blocking GPU calls{shell_note}\n         `conduit config set gpu.safe_mode false` turns it off for every start"
         )
     } else {
-        format!("off, {reason}\n         `conduit config set gpu.safe_mode true` turns it on")
+        format!("off, {decided}{shell_note}\n         `conduit config set gpu.safe_mode true` turns it on for every start")
     }
 }
 
@@ -167,7 +182,7 @@ fn gpu_host_lines(r: &mut Report) {
                     if plan.safe_mode {
                         "Safe mode is on (see the Safe mode line)."
                     } else {
-                        "For a first run: conduit config set gpu.safe_mode true (a 2 GiB cap and 1 s limits on blocking GPU calls)."
+                        "For a first run: conduit config set gpu.safe_mode true (a cap of at most 2 GiB and 1 s limits on blocking GPU calls)."
                     }
                 ),
             );
@@ -901,18 +916,36 @@ mod tests {
         use crate::config::SafeSetting::*;
         let closed = safe_mode_text(None, Auto, &drv("565.77", false));
         assert!(
-            closed.starts_with("ON, because 565.77 (the closed kernel modules"),
+            closed.starts_with(
+                "ON, decided by auto, from the driver: 565.77 (the closed kernel modules"
+            ),
             "{closed}"
         );
         assert!(closed.contains("gpu.safe_mode false"));
         let proven = safe_mode_text(None, Auto, &drv("610.57.04", true));
-        assert!(proven.starts_with("off, because 610.57.04"), "{proven}");
+        assert!(
+            proven.starts_with("off, decided by auto, from the driver: 610.57.04"),
+            "{proven}"
+        );
         assert!(safe_mode_text(None, On, &drv("610.57.04", true))
-            .starts_with("ON, gpu.safe_mode is true"));
+            .starts_with("ON, decided by the setting (gpu.safe_mode is true)"));
         assert!(safe_mode_text(None, Off, &drv("565.77", false))
-            .starts_with("off, gpu.safe_mode is false"));
-        assert!(safe_mode_text(Some("1"), Auto, &drv("610.57.04", true))
-            .starts_with("ON, CONDUIT_SAFE_MODE"));
+            .starts_with("off, decided by the setting (gpu.safe_mode is false)"));
+        // The shell decided: say so, and say what a libvirt start gets instead.
+        let shell = safe_mode_text(Some("1"), Auto, &drv("610.57.04", true));
+        assert!(
+            shell.starts_with("ON, decided by the environment (CONDUIT_SAFE_MODE=1 in this shell)"),
+            "{shell}"
+        );
+        assert!(
+            shell.contains("libvirt or virt-manager start does not see this shell")
+                && shell.contains("safe mode off (auto, from the driver"),
+            "{shell}"
+        );
+        assert!(
+            !proven.contains("libvirt"),
+            "no note when the shell did not decide"
+        );
     }
 
     #[test]
