@@ -320,21 +320,22 @@ pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
 /// Not while the device is stopping (`msi::latch_allowed`, the flag `ddi::escape_wait` raises at
 /// StopDevice / RemoveDevice entry): a run-time verdict then is ignored and counted
 /// (`MsiLatchStop`, `MsiLatchStopW`). The breaker is exempt (it runs at AddDevice, where a
-/// same-image restart still has the previous RemoveDevice's flag up).
-pub(crate) fn latch_intx(passive: PassiveLevel, why: u32) {
+/// same-image restart still has the previous RemoveDevice's flag up). Returns whether it wrote.
+pub(crate) fn latch_intx(passive: PassiveLevel, why: u32) -> bool {
     if !msi::latch_allowed(why, crate::ddi::escape_wait::stopping()) {
         crate::diag::record_named_bytes(
             b"MsiLatchStop",
             LATCH_STOP.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
         );
         crate::diag::record_named_bytes(b"MsiLatchStopW", why);
-        return;
+        return false;
     }
     // The tag first: a latch is never on disk with another build's tag next to it.
     crate::diag::record_named_bytes(b"MsiLatchVer", BUILD_TAG);
     crate::diag::record_named_bytes(b"MsiLatch", 1);
     crate::diag::record_named_bytes(b"MsiLatchWhy", why);
     crate::diag::flush_service_key(passive);
+    true
 }
 
 // ── Counting: interrupts and DPCs by vector (DIRQL / DISPATCH, atomics only) ──
@@ -430,9 +431,26 @@ static RESCUES: AtomicU32 = AtomicU32::new(0);
 /// `msi::Health::code` now / of the end-of-start verdict.
 static HEALTH: AtomicU32 = AtomicU32::new(0);
 static START_VERDICT: AtomicU32 = AtomicU32::new(0);
-/// Silent rescues in a row, and the message total at the last rescue (or when armed).
+/// The run-time judge's state (`msi::SilenceState`), written only by the holder of
+/// `JUDGE_LOCK`: the total at the last observation, when it was last seen to move, when the last
+/// piece of silence evidence was counted, and the pieces in a row (`MsiStreak`).
+static JUDGE_LOCK: AtomicU32 = AtomicU32::new(0);
+static SIL_TOTAL: AtomicU32 = AtomicU32::new(0);
+static SIL_MOVE_AT: AtomicU64 = AtomicU64::new(0);
+static SIL_EVID_AT: AtomicU64 = AtomicU64::new(0);
 static STREAK: AtomicU32 = AtomicU32::new(0);
+/// The message total when health was last judged (a rescue, or arming): `msi::reassess`
+/// withdraws a suspect or convicted state once the total moves past it.
 static INTS_PREV: AtomicU32 = AtomicU32::new(0);
+/// Counted pieces of silence evidence this start (`MsiSilent`), rescues that were not evidence
+/// because the total had moved less than `SILENCE_MIN` ago (`MsiTooRecent`) or that merged into
+/// a piece already counted (`MsiMerged`, including a rescue that found the judge busy), the
+/// quiet age at the last counted piece (`MsiQuietMs`), and withdrawn convictions (`MsiWithdraw`).
+static SILENT_N: AtomicU32 = AtomicU32::new(0);
+static TOO_RECENT_N: AtomicU32 = AtomicU32::new(0);
+static MERGED_N: AtomicU32 = AtomicU32::new(0);
+static QUIET_MS: AtomicU32 = AtomicU32::new(0);
+static WITHDRAWN_N: AtomicU32 = AtomicU32::new(0);
 /// Set when `StartDevice` has finished: rescues before that prove nothing (whether dxgkrnl
 /// delivers interrupts to a device that is still starting is not assumed).
 static ARMED: AtomicU32 = AtomicU32::new(0);
@@ -478,6 +496,11 @@ pub(crate) fn begin_start(passive: PassiveLevel, granted: u32) {
         &RESCUES,
         &POLL_N,
         &POLL_ONLY,
+        &SILENT_N,
+        &TOO_RECENT_N,
+        &MERGED_N,
+        &QUIET_MS,
+        &WITHDRAWN_N,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -540,12 +563,19 @@ pub(crate) fn finish_start(adapter: &AdapterContext) {
     if msi::polling_wanted(LATCHED.load(Ordering::Relaxed) != 0, verdict) {
         POLL.store(1, Ordering::Release);
     }
-    INTS_PREV.store(ints_total(), Ordering::Relaxed);
-    STREAK.store(0, Ordering::Relaxed);
-    ARMED_AT.store(
-        crate::adapter::foreign_scanout::now_100ns().max(1),
-        Ordering::Relaxed,
-    );
+    let armed_at = crate::adapter::foreign_scanout::now_100ns().max(1);
+    let total = ints_total();
+    INTS_PREV.store(total, Ordering::Relaxed);
+    // Holders keep the judge for a few loads and stores, never across a wait: spin for it.
+    while JUDGE_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    store_silence(msi::SilenceState::armed(total, armed_at));
+    JUDGE_LOCK.store(0, Ordering::Release);
+    ARMED_AT.store(armed_at, Ordering::Relaxed);
     ARMED.store(1, Ordering::Release);
     // Zeros and the verdict into the registry now, so it shows this start immediately rather
     // than the last one's numbers until the first periodic mirror.
@@ -602,10 +632,19 @@ fn clear_marker(stopping: bool) -> bool {
 
 /// A waiter's polling drain found a completion after its wait slice timed out (PASSIVE).
 ///
-/// In message mode, after `StartDevice`: judge it (`msi::rescue_step`: enough silent ones in a
-/// row convict delivery), turn the polling safety net on at the first doubt, and queue the DPC
-/// so the event queue and the fences are drained too (the rescuer drained the control ring
-/// only). A conviction latches INTx for the next start. The device keeps working meanwhile.
+/// In message mode, after `StartDevice`, not stopping: judge it (`msi::judge_rescue`: evidence of
+/// silence only when the interrupt total of every vector has stood still for
+/// `msi::SILENCE_MIN_100NS`, rescues closer than `msi::RESCUE_SPACING_100NS` are one piece, and
+/// `msi::SILENT_RESCUES_BROKEN` pieces in a row convict), turn the polling safety net on at the
+/// first counted piece, and queue the DPC so the event queue and the fences are drained too (the
+/// rescuer drained the control ring only). A conviction latches INTx for the next start; the
+/// device keeps working meanwhile, and `reassess_health` withdraws both if interrupts flow again.
+///
+/// The judge was `rescue_step` on the totals of two consecutive rescues, with no notion of time:
+/// several waiters whose slices ran out together (a host stall under load, NVK torn down by a
+/// DWM kill) each drained, each found something, and each counted a "silent" rescue
+/// microseconds after the last, so three of them convicted a device taking thousands of
+/// interrupts a second (2026-10-07: `MsiHealth=3`, `MsiLatchWhy=1` next to 240 k interrupts).
 #[inline(never)]
 pub(crate) fn note_rescue(passive: PassiveLevel, adapter: &AdapterContext) {
     RESCUES.fetch_add(1, Ordering::Relaxed);
@@ -620,37 +659,112 @@ pub(crate) fn note_rescue(passive: PassiveLevel, adapter: &AdapterContext) {
         }
         return;
     }
-    let now = ints_total();
-    let prev = INTS_PREV.swap(now, Ordering::Relaxed);
-    let step = msi::rescue_step(STREAK.load(Ordering::Relaxed), prev, now);
-    STREAK.store(step.streak, Ordering::Relaxed);
-    // A conviction is not undone by a later interrupt: `Broken` is sticky until the next start.
-    if HEALTH.load(Ordering::Relaxed) != Health::Broken.code() {
-        HEALTH.store(step.health.code(), Ordering::Relaxed);
+    // One judge at a time. A rescue that finds it busy is simultaneous with the one being
+    // judged: the same piece of evidence (rule of `RESCUE_SPACING`).
+    if JUDGE_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        MERGED_N.fetch_add(1, Ordering::Relaxed);
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        return;
     }
-    if msi::polling_wanted(false, step.health) {
-        POLL.store(1, Ordering::Release);
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let total = ints_total();
+    let judged = msi::judge_rescue(load_silence(), total, now);
+    store_silence(judged.state);
+    JUDGE_LOCK.store(0, Ordering::Release);
+    match judged.evidence {
+        msi::Evidence::Moved => {
+            INTS_PREV.store(total, Ordering::Relaxed);
+        }
+        msi::Evidence::TooRecent => {
+            TOO_RECENT_N.fetch_add(1, Ordering::Relaxed);
+        }
+        msi::Evidence::Merged => {
+            MERGED_N.fetch_add(1, Ordering::Relaxed);
+        }
+        msi::Evidence::Counted => {
+            INTS_PREV.store(total, Ordering::Relaxed);
+            SILENT_N.fetch_add(1, Ordering::Relaxed);
+            let ms = judged.state.quiet_for(now) / 10_000;
+            QUIET_MS.store(ms.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        }
     }
-    if msi::should_latch(step.health) && RUNTIME_LATCHED.swap(1, Ordering::Relaxed) == 0 {
-        latch_intx(passive, msi::latch_why::SILENT);
+    if let Some(health) = judged.health {
+        // `Broken` stays until `reassess_health` sees interrupts flow again.
+        if HEALTH.load(Ordering::Relaxed) != Health::Broken.code() {
+            HEALTH.store(health.code(), Ordering::Relaxed);
+        }
+        if msi::polling_wanted(false, health) {
+            POLL.store(1, Ordering::Release);
+        }
+        if msi::should_latch(health)
+            && RUNTIME_LATCHED.load(Ordering::Relaxed) == 0
+            && latch_intx(passive, msi::latch_why::SILENT)
+        {
+            RUNTIME_LATCHED.store(1, Ordering::Relaxed);
+        }
     }
     crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
 }
 
-/// Clear a suspect state once interrupts have flowed since it was raised (`msi::reassess`), and
-/// with it the polling safety net unless the latch holds it on. PASSIVE: from the periodic
-/// mirror, so an end-of-start "no interrupts yet" does not leave the net on for the whole run.
+/// The judge's state (`JUDGE_LOCK` held).
+fn load_silence() -> msi::SilenceState {
+    msi::SilenceState {
+        last_total: SIL_TOTAL.load(Ordering::Relaxed),
+        last_move_at: SIL_MOVE_AT.load(Ordering::Relaxed),
+        last_evidence_at: SIL_EVID_AT.load(Ordering::Relaxed),
+        streak: STREAK.load(Ordering::Relaxed),
+    }
+}
+
+fn store_silence(s: msi::SilenceState) {
+    SIL_TOTAL.store(s.last_total, Ordering::Relaxed);
+    SIL_MOVE_AT.store(s.last_move_at, Ordering::Relaxed);
+    SIL_EVID_AT.store(s.last_evidence_at, Ordering::Relaxed);
+    STREAK.store(s.streak, Ordering::Relaxed);
+}
+
+/// PASSIVE, from the periodic mirror (and through it StopDevice's final publish): feed the
+/// judge's movement tracker (`SilenceState::observe`, so a rescue after a quiet mirror pass sees
+/// the right silence age), then withdraw a suspect state OR a conviction once interrupts have
+/// flowed since it was raised (`msi::reassess`), with the polling safety net (unless a start
+/// latch holds it on) and the `SILENT` latch this start wrote (`msi::withdraw_silent_latch`;
+/// lazily written: losing the withdrawal costs one INTx start, the safe direction). The marker
+/// can then be cleared by the running path again.
 fn reassess_health() {
     if ARMED.load(Ordering::Acquire) == 0 {
         return;
     }
+    let total = ints_total();
+    if JUDGE_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        let now = crate::adapter::foreign_scanout::now_100ns();
+        store_silence(load_silence().observe(total, now));
+        JUDGE_LOCK.store(0, Ordering::Release);
+    }
     let health = Health::from_code(HEALTH.load(Ordering::Relaxed));
-    let next = msi::reassess(health, INTS_PREV.load(Ordering::Relaxed), ints_total());
+    let next = msi::reassess(health, INTS_PREV.load(Ordering::Relaxed), total);
     if next != health {
         HEALTH.store(next.code(), Ordering::Relaxed);
-        STREAK.store(0, Ordering::Relaxed);
-        if LATCHED.load(Ordering::Relaxed) == 0 {
+        INTS_PREV.store(total, Ordering::Relaxed);
+        if LATCHED.load(Ordering::Relaxed) == 0 && POLL_ONLY.load(Ordering::Relaxed) == 0 {
             POLL.store(0, Ordering::Release);
+        }
+        if msi::withdraw_silent_latch(
+            RUNTIME_LATCHED.load(Ordering::Relaxed) != 0,
+            LATCHED.load(Ordering::Relaxed) != 0,
+            health,
+            next,
+        ) && RUNTIME_LATCHED.swap(0, Ordering::Relaxed) != 0
+        {
+            crate::diag::record_named_bytes(b"MsiLatch", 0);
+            crate::diag::record_named_bytes(b"MsiLatchWhy", 0);
+            crate::diag::record_named_bytes(b"MsiLatchVer", 0);
+            WITHDRAWN_N.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -693,7 +807,12 @@ pub(crate) fn publish_counters() {
     rec(b"IntxMiss", INTX_MISS.load(Ordering::Relaxed));
     rec(b"MsiIdle", MSI_IDLE.load(Ordering::Relaxed));
     rec(b"IrqRescue", RESCUES.load(Ordering::Relaxed));
-    rec(b"MsiSilent", STREAK.load(Ordering::Relaxed));
+    rec(b"MsiSilent", SILENT_N.load(Ordering::Relaxed));
+    rec(b"MsiStreak", STREAK.load(Ordering::Relaxed));
+    rec(b"MsiTooRecent", TOO_RECENT_N.load(Ordering::Relaxed));
+    rec(b"MsiMerged", MERGED_N.load(Ordering::Relaxed));
+    rec(b"MsiQuietMs", QUIET_MS.load(Ordering::Relaxed));
+    rec(b"MsiWithdraw", WITHDRAWN_N.load(Ordering::Relaxed));
     rec(b"MsiHealth", HEALTH.load(Ordering::Relaxed));
     rec(b"MsiStart", START_VERDICT.load(Ordering::Relaxed));
     rec(b"MsiPoll", POLL.load(Ordering::Relaxed));

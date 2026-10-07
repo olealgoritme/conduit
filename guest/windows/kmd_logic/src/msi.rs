@@ -683,15 +683,149 @@ impl Health {
     }
 }
 
-/// A suspect state is cleared once interrupts have arrived since the evidence
-/// that raised it (`ints_prev`: the total at the last rescue, or when run-time
-/// judging was armed): the silence was the start, not the delivery. `Broken` is a
-/// conviction and stays, and so does everything else.
+/// A suspect state, AND a conviction, are withdrawn once interrupts have arrived
+/// since the evidence that raised them (`ints_prev`: the total when it was last
+/// judged): a device that delivers is not broken, whatever a run of polled
+/// completions suggested (2026-10-07: a conviction under load next to 240 k
+/// interrupts). Everything else stays.
 pub const fn reassess(health: Health, ints_prev: u32, ints_now: u32) -> Health {
-    if matches!(health, Health::Suspect) && ints_now != ints_prev {
+    if matches!(health, Health::Suspect | Health::Broken) && ints_now != ints_prev {
         Health::Healthy
     } else {
         health
+    }
+}
+
+/// How long the interrupt total (every vector) must have stood still before a rescue counts as
+/// evidence of silence: 1 s, 100 ns units. A device delivering thousands of interrupts a second
+/// can never reach it; a polling drain that merely beat the ISR / DPC of a completion that was
+/// already posted, or a wait slice that ran out during a host stall shorter than this, is not
+/// evidence.
+pub const SILENCE_MIN_100NS: u64 = 10_000_000;
+/// Rescues closer together than this (1 s) are ONE piece of evidence: several waiters whose
+/// slices ran out together (a host stall, a teardown) each drain and each find something, with
+/// no time for an interrupt between them.
+pub const RESCUE_SPACING_100NS: u64 = 10_000_000;
+
+/// The run-time judge's memory between rescues (all times in 100 ns, 0 = never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SilenceState {
+    /// The interrupt total (every vector) at the last observation.
+    pub last_total: u32,
+    /// When the total was last seen to change (or judging was armed).
+    pub last_move_at: u64,
+    /// When the last piece of silence evidence was counted.
+    pub last_evidence_at: u64,
+    /// Pieces of evidence in a row with no movement between them.
+    pub streak: u32,
+}
+
+impl SilenceState {
+    /// Judging starts: `total` is the interrupt total, `now` the time.
+    pub const fn armed(total: u32, now: u64) -> SilenceState {
+        SilenceState {
+            last_total: total,
+            last_move_at: now,
+            last_evidence_at: 0,
+            streak: 0,
+        }
+    }
+
+    /// An observation of the total with no rescue (the periodic mirror, the worker): only the
+    /// movement tracker advances. A change ends the streak.
+    pub const fn observe(self, total: u32, now: u64) -> SilenceState {
+        if total != self.last_total {
+            SilenceState {
+                last_total: total,
+                last_move_at: now,
+                last_evidence_at: self.last_evidence_at,
+                streak: 0,
+            }
+        } else {
+            self
+        }
+    }
+
+    /// How long the total has stood still at `now` (a lower bound: the last time it was SEEN to
+    /// move, so a rare observer errs towards "recent").
+    pub const fn quiet_for(&self, now: u64) -> u64 {
+        now.saturating_sub(self.last_move_at)
+    }
+}
+
+/// What one rescue was, as evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// The total moved since the last observation: delivery works, the streak ends.
+    Moved,
+    /// No movement, but for less than [`SILENCE_MIN_100NS`]: not evidence.
+    TooRecent,
+    /// Silent long enough, but within [`RESCUE_SPACING_100NS`] of the last counted evidence:
+    /// the same piece of evidence.
+    Merged,
+    /// A counted piece of evidence of silence.
+    Counted,
+}
+
+/// The outcome of [`judge_rescue`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Judged {
+    pub state: SilenceState,
+    pub evidence: Evidence,
+    /// The new health, or `None` to leave it as it is.
+    pub health: Option<Health>,
+}
+
+/// Judge one RESCUE (a polling drain, after a wait slice timed out, found a completion no
+/// interrupt had announced) at time `now` with the interrupt total `total` (every vector).
+///
+/// * The total moved since the last observation: `Healthy`, the streak ends.
+/// * It has stood still for less than [`SILENCE_MIN_100NS`]: nothing (a drain that beat the ISR,
+///   a short host stall).
+/// * Silent long enough but within [`RESCUE_SPACING_100NS`] of the last counted evidence:
+///   merged into it, nothing changes.
+/// * Otherwise one more piece of evidence: `Suspect`, and `Broken` at
+///   [`SILENT_RESCUES_BROKEN`] in a row. A conviction therefore needs the total to stand still
+///   for at least `SILENCE_MIN + (SILENT_RESCUES_BROKEN - 1) * RESCUE_SPACING` (3 s) while
+///   completions keep being found by polling.
+pub const fn judge_rescue(state: SilenceState, total: u32, now: u64) -> Judged {
+    if total != state.last_total {
+        return Judged {
+            state: state.observe(total, now),
+            evidence: Evidence::Moved,
+            health: Some(Health::Healthy),
+        };
+    }
+    if state.quiet_for(now) < SILENCE_MIN_100NS {
+        return Judged {
+            state,
+            evidence: Evidence::TooRecent,
+            health: None,
+        };
+    }
+    if state.last_evidence_at != 0
+        && now.saturating_sub(state.last_evidence_at) < RESCUE_SPACING_100NS
+    {
+        return Judged {
+            state,
+            evidence: Evidence::Merged,
+            health: None,
+        };
+    }
+    let streak = state.streak.saturating_add(1);
+    Judged {
+        state: SilenceState {
+            last_total: state.last_total,
+            last_move_at: state.last_move_at,
+            last_evidence_at: if now == 0 { 1 } else { now },
+            streak,
+        },
+        evidence: Evidence::Counted,
+        health: Some(if streak >= SILENT_RESCUES_BROKEN {
+            Health::Broken
+        } else {
+            Health::Suspect
+        }),
     }
 }
 
@@ -727,6 +861,22 @@ pub const fn rescue_step(streak: u32, ints_prev: u32, ints_now: u32) -> RescueSt
             Health::Suspect
         },
     }
+}
+
+/// Whether the `SILENT` latch THIS start wrote is withdrawn: its conviction was (`before` is
+/// `Broken`, `after` is not), and the start did not begin latched (`latched_at_start`: an
+/// operator's latch, a breaker trip or an earlier conviction is never cleared by it). A latch of
+/// any other cause, or of another start, is untouched.
+pub const fn withdraw_silent_latch(
+    latched_by_this_start: bool,
+    latched_at_start: bool,
+    before: Health,
+    after: Health,
+) -> bool {
+    latched_by_this_start
+        && !latched_at_start
+        && matches!(before, Health::Broken)
+        && !matches!(after, Health::Broken)
 }
 
 /// The verdict at the end of `StartDevice` from the interrupts taken and the
@@ -774,7 +924,7 @@ pub mod latch_why {
 /// `kmd_render/src/virtio/msi.rs` only. `MsiMode` and `MsiVectors` are knobs the
 /// operator writes and are not listed; `MsiLatch` is both: the KMD writes 1, an
 /// operator may write either. At most 14 characters each.
-pub const COUNTERS: [&str; 42] = [
+pub const COUNTERS: [&str; 47] = [
     // The set-up breadcrumbs.
     "MsiCap",
     "MsiList",
@@ -828,6 +978,15 @@ pub const COUNTERS: [&str; 42] = [
     // (`latch_allowed`; per image load), and the `MsiLatchWhy` of the last one.
     "MsiLatchStop",
     "MsiLatchStopW",
+    // The run-time judge (`judge_rescue`): pieces of silence evidence in a row now, rescues
+    // that were not evidence (too recent / merged), the quiet age at the last counted piece,
+    // and convictions withdrawn because interrupts flowed again. `MsiSilent` above counts the
+    // counted pieces of this start.
+    "MsiStreak",
+    "MsiTooRecent",
+    "MsiMerged",
+    "MsiQuietMs",
+    "MsiWithdraw",
 ];
 
 #[cfg(test)]
@@ -1458,6 +1617,149 @@ mod tests {
         assert_eq!(rescue_step(s.streak, 101, 101).streak, 1);
     }
 
+    // ── the run-time judge (silence by time, not by rescue count) ────────────
+
+    const S: u64 = 10_000_000; // 1 s in 100 ns
+
+    #[test]
+    fn rescues_with_interrupts_flowing_never_convict() {
+        // Thousands of interrupts a second: every rescue sees the total moved.
+        let mut st = SilenceState::armed(0, 1);
+        let mut total = 0u32;
+        for i in 0..10_000u64 {
+            total = total.wrapping_add(3);
+            let j = judge_rescue(st, total, 1 + i * 1_000); // a rescue every 100 us
+            assert_eq!(j.evidence, Evidence::Moved);
+            assert_eq!(j.health, Some(Health::Healthy));
+            st = j.state;
+        }
+        assert_eq!(st.streak, 0);
+    }
+
+    #[test]
+    fn simultaneous_rescues_of_several_waiters_are_one_piece_of_evidence() {
+        // The 2026-10-07 false conviction: waiters whose slices ran out together each drained
+        // and each counted a silent rescue, microseconds apart, no interrupt between them.
+        let t0 = 100 * S;
+        let mut st = SilenceState::armed(500, t0);
+        // Even after a long silence, 8 waiters within 1 ms are ONE piece of evidence.
+        let at = t0 + 2 * S;
+        let mut counted = 0;
+        for k in 0..8u64 {
+            let j = judge_rescue(st, 500, at + k * 100);
+            if j.evidence == Evidence::Counted {
+                counted += 1;
+            } else {
+                assert_eq!(j.evidence, Evidence::Merged);
+            }
+            assert_ne!(j.health, Some(Health::Broken));
+            st = j.state;
+        }
+        assert_eq!(counted, 1);
+        assert_eq!(st.streak, 1);
+    }
+
+    #[test]
+    fn a_short_silence_is_not_evidence() {
+        let t0 = 50 * S;
+        let st = SilenceState::armed(7, t0);
+        // A drain that beat the ISR, or a host stall shorter than the minimum.
+        for dt in [0, 1, S / 2, S - 1] {
+            let j = judge_rescue(st, 7, t0 + dt);
+            assert_eq!(j.evidence, Evidence::TooRecent);
+            assert_eq!(j.health, None);
+            assert_eq!(j.state, st);
+        }
+        assert_eq!(judge_rescue(st, 7, t0 + S).evidence, Evidence::Counted);
+    }
+
+    #[test]
+    fn real_silence_still_convicts_after_three_spaced_pieces() {
+        let t0 = 10 * S;
+        let mut st = SilenceState::armed(42, t0);
+        let mut last = None;
+        for k in 1..=SILENT_RESCUES_BROKEN as u64 {
+            let j = judge_rescue(st, 42, t0 + k * S);
+            assert_eq!(j.evidence, Evidence::Counted);
+            st = j.state;
+            last = j.health;
+            if k < SILENT_RESCUES_BROKEN as u64 {
+                assert_eq!(last, Some(Health::Suspect));
+            }
+        }
+        assert_eq!(last, Some(Health::Broken));
+        assert!(should_latch(Health::Broken));
+        // The earliest possible conviction: SILENCE_MIN + 2 spacings of a frozen total.
+        assert_eq!(
+            SILENCE_MIN_100NS + (SILENT_RESCUES_BROKEN as u64 - 1) * RESCUE_SPACING_100NS,
+            3 * S
+        );
+    }
+
+    #[test]
+    fn movement_seen_by_any_observer_ends_the_streak_and_restarts_the_clock() {
+        let t0 = 10 * S;
+        let st = SilenceState::armed(1, t0);
+        let j = judge_rescue(st, 1, t0 + S);
+        assert_eq!(j.state.streak, 1);
+        // The mirror sees the total move: streak 0, the clock restarts there.
+        let st = j.state.observe(2, t0 + S + 5);
+        assert_eq!(st.streak, 0);
+        assert_eq!(st.last_move_at, t0 + S + 5);
+        // A rescue just after that is too recent.
+        assert_eq!(
+            judge_rescue(st, 2, t0 + S + 10).evidence,
+            Evidence::TooRecent
+        );
+        // An unchanged observation changes nothing.
+        assert_eq!(st.observe(2, t0 + 9 * S), st);
+        // A wrapped total is movement.
+        let st = SilenceState::armed(u32::MAX, t0);
+        assert_eq!(judge_rescue(st, 0, t0 + 5 * S).evidence, Evidence::Moved);
+    }
+
+    #[test]
+    fn a_clock_going_backwards_is_not_silence() {
+        let st = SilenceState::armed(3, 100 * S);
+        assert_eq!(judge_rescue(st, 3, 0).evidence, Evidence::TooRecent);
+        assert_eq!(judge_rescue(st, 3, 50 * S).evidence, Evidence::TooRecent);
+    }
+
+    #[test]
+    fn a_withdrawn_conviction_withdraws_this_starts_silent_latch_only() {
+        let after = reassess(Health::Broken, 10, 11);
+        assert_eq!(after, Health::Healthy);
+        assert!(withdraw_silent_latch(true, false, Health::Broken, after));
+        // Not latched by this start's verdict (the breaker, the operator, a refused plan).
+        assert!(!withdraw_silent_latch(false, false, Health::Broken, after));
+        // The start began latched: that latch is not this verdict's to clear.
+        assert!(!withdraw_silent_latch(true, true, Health::Broken, after));
+        // Still convicted, or never convicted.
+        assert!(!withdraw_silent_latch(
+            true,
+            false,
+            Health::Broken,
+            Health::Broken
+        ));
+        assert!(!withdraw_silent_latch(
+            true,
+            false,
+            Health::Suspect,
+            Health::Healthy
+        ));
+        // And the polling net goes off with it (unless a start latch holds it on).
+        assert!(!polling_wanted(false, after));
+        assert!(polling_wanted(true, after));
+        // The marker may then be cleared by the running path again.
+        assert!(marker_may_clear(
+            1,
+            1 + MARKER_CLEAR_AFTER_100NS,
+            5,
+            false,
+            false
+        ));
+    }
+
     #[test]
     fn rescue_streak_saturates() {
         let s = rescue_step(u32::MAX, 5, 5);
@@ -1499,8 +1801,9 @@ mod tests {
         assert_eq!(reassess(Health::Suspect, 5, 5), Health::Suspect);
         // A wrapped total is movement.
         assert_eq!(reassess(Health::Suspect, u32::MAX, 0), Health::Healthy);
-        // A conviction is never cleared by it, nor is anything else touched.
-        assert_eq!(reassess(Health::Broken, 5, 600), Health::Broken);
+        // A conviction is withdrawn by flowing interrupts too, never without them.
+        assert_eq!(reassess(Health::Broken, 5, 600), Health::Healthy);
+        assert_eq!(reassess(Health::Broken, 5, 5), Health::Broken);
         assert_eq!(reassess(Health::Healthy, 5, 6), Health::Healthy);
         assert_eq!(reassess(Health::Unknown, 5, 6), Health::Unknown);
         // Once cleared, the polling net is off (unless a latch holds it on).

@@ -274,7 +274,7 @@ the middle of whatever it was doing, and the latch was a verdict on the old code
 
   | Writer (`virtio/msi.rs`) | Why | When | During a restart-device |
   | --- | --- | --- | --- |
-  | `note_rescue` -> `latch_intx` | 1 `SILENT` | 3 silent rescues in a row, message mode, armed | Before: in StopDevice stages 1-2 (the ISR gate `msi_state` is cleared at stage 3, after which `note_rescue` returned anyway). Now: never while stopping. |
+  | `note_rescue` -> `latch_intx` | 1 `SILENT` | 3 pieces of silence evidence in a row (`judge_rescue`), message mode, armed | Before: in StopDevice stages 1-2 (the ISR gate `msi_state` is cleared at stage 3, after which `note_rescue` returned anyway). Now: never while stopping. |
   | `give_up_on_vectors` -> `latch_intx` | 2 `REFUSED`, 3 `NO_CFG` | `program_vectors` in StartDevice | Only in the new StartDevice, after the stop flag is lowered; it shows `MsiPollOnly=1`, `MsiVec=0xFFFF`. |
   | `apply_key_policy` (breaker) -> `latch_intx` | 4 `BREAKER` | AddDevice found a marker of this build | Before: whenever the previous start's marker had not been cleared at its stop (no interrupt counted, not armed, or convicted). Now: only when the previous start never reached a clean StopDevice. |
   | `apply_key_policy` (stale latch) | writes 0 | AddDevice, another build's latch | Clears, never sets. |
@@ -299,12 +299,12 @@ vectors, `vector_slot`); the clear and the set go through the same `record_named
 same service key that `read_config_dword` reads, and the mirror's changed-only cache cannot
 skip the clear (`begin_start` cached 1); `begin_start` runs only from StartDevice, after
 AddDevice has read the marker; PnP does not overlap StopDevice and the next AddDevice. Since
-`finish_start` is on every successful start path, the likely reading is a start that counted no
-message interrupt (`MsiInts=0` with `MsiGrant=3`: delivery not reaching the ISR, the device
-running on the polling net), or one convicted by silent rescues (`MsiLatchWhy=1`, later
-overwritten by the breaker's 4). The unconditional clean-stop clear removes the trip in every
-one of these cases; a start that really does not deliver is still latched, by `SILENT`, while
-it runs.
+`finish_start` is on every successful start path, the reading was a start that counted no
+message interrupt, or one convicted by silent rescues. A later reproduction settled it: a FALSE
+run-time conviction under load (`MsiHealth=3`, `MsiLatchWhy=1`, `MsiStarting=1` kept while
+convicted, 240 k interrupts), which the breaker then turned into `MsiLatchWhy=4` at the next
+restart. Fixed at the source ("The run-time verdict: what counts as silence"); the
+unconditional clean-stop clear removes the restart trip in every one of these cases.
 
 **What is not covered.** A marker of the RUNNING build still trips, by design, when a start of
 that build ends without a clean StopDevice (a hang, a bugcheck, a reset or power-off, or a
@@ -413,7 +413,7 @@ The registry sequence across one `pnputil /restart-device` of an MSI-X start (sa
 | A message-mode start of THIS build ended without a clean StopDevice before it became healthy (hang, bugcheck, reboot loop) | `AddDevice` finds `MsiStarting` with `MsiStartingVer` = the running build | Breaker: `MsiLatch=1` (`MsiLatchWhy=4`, `MsiLatchVer`, flushed), `MsiBreaker` + 1, INTx for this start's key write. |
 | A driver update: the marker or the latch is another build's (or a pre-tag image's marker) | `AddDevice` (`marker_verdict`, `latch_verdict`) | Set aside: `MsiMarkerOld` / `MsiLatchOld` + 1, no trip, the latch cleared; the new build gets one fresh MSI-X attempt ("Driver updates and the breaker"). |
 | Start finished and completions were polled with no interrupt | `finish_start` (`msi::start_verdict`: no interrupt, >= 3 completions since the transport went live) | `MsiStart=2` (suspect), the polling safety net turns on. Never latches by itself: whether dxgkrnl delivers interrupts to a device that is still starting is not assumed. |
-| Lost interrupt (delivery broken) | `wait_block`: a polling drain, after a wait slice timed out, found a completion (`IrqRescue`). `msi::rescue_step`: no interrupt since the previous rescue = silent; 3 silent in a row convict | First doubt: polling safety net on, the rescue queues the DPC (so events and fences drain too). Conviction: `MsiHealth=3`, `MsiLatch=1` (`MsiLatchWhy=1`, flushed), INTx next start. The device keeps working meanwhile at polling latency. |
+| Lost interrupt (delivery broken) | `wait_block`: a polling drain, after a wait slice timed out, found a completion (`IrqRescue`). `msi::judge_rescue`: evidence only after >= 1 s with no interrupt on any vector, rescues within 1 s are one piece, 3 pieces in a row convict ("The run-time verdict") | First counted piece: polling safety net on, the rescue queues the DPC (so events and fences drain too). Conviction: `MsiHealth=3`, `MsiLatch=1` (`MsiLatchWhy=1`, flushed), INTx next start, unless interrupts flow again first (then withdrawn, `MsiWithdraw`). The device keeps working meanwhile at polling latency. |
 | Interrupt storm | not a message-mode failure | Messages are edge events with no level line: the line-based storm detector (`~10000 unclaimed ISRs -> Code 43`) cannot happen. A device that fires without work is bounded by DPC coalescing and counted in `MsiIdle`. |
 | A previous start latched INTx but PnP still gave messages | `on_transport_up` | Polling safety net from the first moment. |
 
@@ -426,10 +426,49 @@ drain the DPC runs, counted in `MsiPollN`. It also runs while a vsync heartbeat 
 vsync DPC drains). A render-only adapter has no worker: there a rescue still queues the DPC, so
 the NVRM path (which rescues on every slow call) keeps its events moving, but an idle render-only
 adapter with broken delivery is not covered. That is why the conviction latches INTx for the
-next start. A suspect verdict (not a conviction, not a latched start) is cleared by the periodic
-mirror once interrupts have arrived since the evidence that raised it (`msi::reassess`), and the
-net goes off with it: an end-of-start "no interrupts yet" does not keep the worker polling for the
-whole run.
+next start. A suspect verdict, or a conviction, of a start that did not begin latched is
+withdrawn by the periodic mirror once interrupts have arrived since the evidence that raised it
+(`msi::reassess`), and the net goes off with it: an end-of-start "no interrupts yet" does not
+keep the worker polling for the whole run.
+
+### The run-time verdict: what counts as silence
+
+**The false conviction (2026-10-07, 346.1, `MsiMode=2`).** Under load (a restart, DWM and the
+shell killed 15 s later, windowed Heaven on NVK for 70 s) a start that took 240 589 message
+interrupts (`MsiV1` 133 414, `MsiV2` 107 175) read `MsiHealth=3`, `MsiLatch=1`,
+`MsiLatchWhy=1`, `MsiStarting=1` (kept while convicted), `MsiPoll=1`, `MsiPollN=2478`; the next
+restart's breaker then found the marker (`MsiLatchWhy=4`). Delivery worked; the verdict was
+wrong.
+
+**Root cause.** The judge was `msi::rescue_step(streak, ints_prev, ints_now)` with
+`ints_prev` = the total at the PREVIOUS rescue (`virtio/msi.rs`, `note_rescue`:
+`INTS_PREV.swap(ints_total())`, then `rescue_step`): it compared interrupt totals between two
+consecutive rescues and had no notion of time. Several waiters whose wait slices ran out
+together (a host stall: NVK torn down by the DWM kill, a heavy RM call) each run a polling drain
+after the timeout, each finds something (the drain pops every finished entry, its own and other
+waiters'), and each calls `note_rescue` microseconds after the previous one, with no interrupt
+in between: three such rescues were three "silent rescues in a row" and convicted a device
+taking thousands of interrupts a second. A second way to the same verdict: a drain that beat the
+ISR / DPC of a completion already posted. `STREAK` was also updated with a load and a separate
+store from concurrent waiters. `MsiSilent` read 0 next to the conviction because it published
+`STREAK`, the CURRENT streak, which the next non-silent rescue zeroed while `MsiHealth` stayed
+at 3.
+
+**The rule now** (`msi::judge_rescue`, host tested; `virtio/msi.rs` `note_rescue` holds one
+judge at a time, a rescue that finds it busy is merged):
+
+| Rule | Constant | Meaning |
+| --- | --- | --- |
+| (a) A rescue is evidence of silence only if the interrupt total of EVERY vector has not moved for at least 1 s | `SILENCE_MIN_100NS` | Movement is tracked at every observation (each rescue and each mirror pass, `SilenceState::observe`); the age is measured from the last time the total was SEEN to move, so a rare observer errs towards "recent". |
+| (b) Rescues closer together than 1 s are one piece of evidence | `RESCUE_SPACING_100NS` | Simultaneous waiters, and a rescue that finds the judge busy, are merged (`MsiMerged`). |
+| Three pieces in a row convict | `SILENT_RESCUES_BROKEN` | A conviction needs the total frozen for at least 1 s + 2 x 1 s = 3 s while completions keep being found by polling. Any movement ends the streak. |
+| (c) A conviction is withdrawn when interrupts flow again | `msi::reassess` | `Broken` (and `Suspect`) go back to `Healthy` at the next mirror pass that sees the total move; the polling net goes off (unless the start began latched or polling-only); the `SILENT` latch this start wrote is cleared (`MsiLatch`, `MsiLatchWhy`, `MsiLatchVer` to 0, lazily, `msi::withdraw_silent_latch`, counted in `MsiWithdraw`), but never a latch the start began with; the marker can then be cleared by the running path, and a clean stop clears it anyway. |
+| (d) What the verdict saw is published | | `MsiSilent` counts the counted pieces of this start, `MsiStreak` the pieces in a row now, `MsiQuietMs` the quiet age at the last counted piece, `MsiTooRecent` and `MsiMerged` the rescues that were not evidence. |
+
+A rescue that is not evidence (too recent, merged) changes neither the health nor the polling
+net; it still queues the DPC. What the rule gives up: a device that delivers on SOME vectors
+and not on the one carrying the control queue is not convicted (the total moves); the rescues
+and the DPC they queue keep it working.
 
 **What cannot be done:** switch to INTx inside the start that got messages. The line is not
 connected, and an enabled-but-unconnected level interrupt is a hang. The fallback is therefore
@@ -450,7 +489,10 @@ MSI-X),
 `polling_only_state`, `Mode::from_knob` (unknown values are `Auto`),
 `rescue_step` / `start_verdict` / `polling_wanted` / `should_latch` (the start
 verdict never convicts; an interrupt between rescues ends the streak; wrap
-tolerant), the vector slots and cause bits, the routing of `isr_route` in both
+tolerant), `judge_rescue` / `SilenceState` / `reassess` / `withdraw_silent_latch` (interrupts
+flowing never convict; simultaneous rescues are one piece; a silence shorter than 1 s is not
+evidence; real silence still convicts after three spaced pieces; a conviction and its own
+`SILENT` latch are withdrawn when interrupts flow, never a latch the start began with), the vector slots and cause bits, the routing of `isr_route` in both
 modes, and the counter-name checks (14-character limit, no collision with another
 counter list, the render sources spell exactly the listed names, the knobs are
 spelled only in `diag.rs`). What no test reaches is the WDK glue: the INTx path
@@ -497,7 +539,8 @@ keep their old meaning (all interrupts, all DPCs, cumulative since the image loa
 | `DpcNoCause` | DPCs nothing recorded a cause for: vsync / DMA-completion notifies, `request_wddm_completion_dpc`, a rescue. |
 | `MsiIdle` | DPCs a message queued that found both rings empty (spurious, or taken by a waiter's drain or an earlier DPC). |
 | `IrqRescue` | Waits whose polling drain found a completion after a slice timeout. Both modes. A healthy run reads 0 or near it. |
-| `MsiSilent`, `MsiHealth`, `MsiStart` | Silent rescues in a row now; health (0 unknown, 1 healthy, 2 suspect, 3 broken); the end-of-start verdict (0/1/2). |
+| `MsiSilent`, `MsiHealth`, `MsiStart` | Counted pieces of silence evidence this start (before 2026-10-07: the current streak, which read 0 next to a conviction); health (0 unknown, 1 healthy, 2 suspect, 3 broken); the end-of-start verdict (0/1/2). |
+| `MsiStreak`, `MsiQuietMs`, `MsiTooRecent`, `MsiMerged`, `MsiWithdraw` | The verdict's inputs: pieces of evidence in a row now; the quiet age (ms) at the last counted piece; rescues that were not evidence because the total had moved less than 1 s before, or merged into a piece already counted; convictions withdrawn because interrupts flowed again. |
 | `MsiPoll`, `MsiPollN` | The polling safety net is on; worker wakes that drained under it. |
 | `MsiPollOnly` | 1 = this start got messages but no vector could be programmed: transport up, polling only. |
 | `MsiStarting`, `MsiBreaker` | The breaker's marker (1 from the start of a message-mode start until it proved healthy) and how many times it tripped. |
@@ -556,7 +599,9 @@ steps when it does not. In order of how much still works:
    property is a recovery that needs nothing from the guest.
 
 The fallback is written to be robust rather than clever: it never convicts on the
-end-of-start verdict, it requires three silent rescues in a row, it never raises the key
+end-of-start verdict, it requires three pieces of silence evidence (each after >= 1 s with no
+interrupt on any vector, at least 1 s apart) and withdraws a conviction when interrupts flow
+again, it never raises the key
 on its own, the breaker and every latch are flushed to disk before the fault can take
 them (and so is the marker's clear at a clean stop), a failure of any registry write only loses
 the latch (the polling net still runs this start), and a marker or a latch is a verdict on the
