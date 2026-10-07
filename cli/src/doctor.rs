@@ -205,12 +205,15 @@ impl Report {
     }
 }
 
-fn can_open_rw(p: &str) -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(p)
-        .is_ok()
+/// May this user open `p` for reading and writing? Answered by access(2),
+/// from the permissions alone: nothing is opened, so probing a GPU node
+/// never creates a client of the card that may be driving the desktop.
+fn may_open_rw(p: &str) -> bool {
+    let Ok(c) = std::ffi::CString::new(p) else {
+        return false;
+    };
+    // SAFETY: `c` is a valid NUL-terminated string that outlives the call.
+    unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) == 0 }
 }
 
 fn in_group(g: &str) -> bool {
@@ -372,7 +375,7 @@ fn collect_host(r: &mut Report) {
     if !Path::new("/dev/kvm").exists() {
         r.line(Level::Fail, "KVM", "not available (/dev/kvm is missing)",
             "Turn on virtualization in your BIOS/UEFI settings (called VT-x, VT-d, AMD-V or SVM),\nthen restart. If it is on, load the module: sudo modprobe kvm_intel  (or kvm_amd)");
-    } else if !can_open_rw("/dev/kvm") {
+    } else if !may_open_rw("/dev/kvm") {
         r.line_id("kvm-access", Level::Fail, "KVM", "present, but you may not use it",
             &format!("Add yourself to the kvm group, then log out and back in:\n  sudo usermod -aG kvm {}", paths::username()));
     } else {
@@ -398,7 +401,7 @@ fn collect_host(r: &mut Report) {
         }
     }
     for dev in ["/dev/nvidiactl", "/dev/nvidia-uvm"] {
-        if Path::new(dev).exists() && !can_open_rw(dev) {
+        if Path::new(dev).exists() && !may_open_rw(dev) {
             r.line(Level::Warn, "GPU access", &format!("you cannot open {dev}"), "Usually fixed by logging in on the desktop as yourself, or the 'video'/'render' group.");
         }
     }
@@ -940,6 +943,59 @@ mod tests {
             detail: detail.into(),
             hint: hint.into(),
         }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("conduit-doctor-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn access_probe_follows_the_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("modes");
+        let f = d.join("node");
+        std::fs::write(&f, b"").unwrap();
+        let p = f.to_str().unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(may_open_rw(p));
+        if !is_root() {
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert!(!may_open_rw(p), "read-only is not read-write");
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o200)).unwrap();
+            assert!(!may_open_rw(p), "write-only is not read-write");
+        }
+        assert!(!may_open_rw(d.join("missing").to_str().unwrap()));
+        assert!(
+            !may_open_rw("/dev/null\0x"),
+            "an embedded NUL is not a path"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The probe must not open the node. A directory cannot be opened
+    /// read-write (EISDIR) yet access(2) says its permissions allow it, so
+    /// only a probe that never calls open() answers true here; the old
+    /// open-based one answered false.
+    #[test]
+    fn access_probe_does_not_open_the_node() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("noopen");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let opened = std::fs::OpenOptions::new().read(true).write(true).open(&d);
+        assert!(
+            opened.is_err(),
+            "the premise: open(O_RDWR) on a directory fails"
+        );
+        assert!(may_open_rw(d.to_str().unwrap()));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     /// The text `conduit doctor` has always printed for these lines.
