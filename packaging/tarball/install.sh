@@ -43,6 +43,12 @@ if [ -d /etc/apparmor.d ]; then
     install -d /etc/apparmor.d/abstractions
     install -m0644 "$PREFIX/share/conduit/apparmor/conduit" /etc/apparmor.d/abstractions/conduit
 fi
+# The icon set (Icon=conduit), staged by build.sh under $PREFIX/share/icons/hicolor.
+(cd "$PREFIX/share/icons/hicolor" && find . -type f -path '*/apps/conduit.*') | while IFS= read -r f; do
+    install -D -m0644 "$PREFIX/share/icons/hicolor/$f" "/usr/local/share/icons/hicolor/$f"
+done
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+    && gtk-update-icon-cache -q -t -f /usr/local/share/icons/hicolor 2>/dev/null || true
 "$PREFIX/libexec/conduit-integrate" enable
 
 echo "Done. Try: conduit create myvm && conduit view myvm"

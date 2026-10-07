@@ -1,4 +1,4 @@
-# Conduit
+# <img src="packaging/common/icons/conduit.svg" width="44" align="middle" alt=""> Conduit
 
 **Share your NVIDIA GPU with a virtual machine, and see its desktop on yours, at full speed.**
 
@@ -38,6 +38,17 @@ from GPU memory to your screen: no copying, no video compression.
 > ([what was measured, and what was not](docs/GPU-SUPPORT.md#measured-rtx-4070-super-ada-ad104)).
 > RTX 20 and 30 cards, CUDA and video encode in that setup, and Windows guests
 > on other GPUs have not been run.
+
+<p align="center">
+  <img src="docs/assets/conduit-rtx4070s.png" alt="An RTX 4070 SUPER shared between an Ubuntu host and an Omarchy guest: the host's nvidia-smi lists conduit-backend, the guest shows Conduit's overlay at 1920x1080@240, its own nvidia-smi and vkcube" width="860">
+</p>
+
+<p align="center"><sub>One RTX 4070 SUPER, shared. Top: the Ubuntu 24.04 host (closed NVIDIA 565.77 modules);
+its <code>nvidia-smi</code> lists <code>conduit-backend</code> among the GPU processes. Bottom: an Omarchy
+(Arch, Hyprland) guest with Conduit's overlay (1920x1080@240, about 235 fps), the guest's own
+<code>nvidia-smi</code> (capped at 2 GiB by safe mode), <code>vkcube</code> on the GPU and the
+<code>conduit_gpu</code> module. <code>vkcube</code> prints the driver version as a packed integer, which is why it
+shows <code>-1923923968</code>; the Vulkan driver reports 565.77.0.0.</sub></p>
 
 ### Windows guests
 

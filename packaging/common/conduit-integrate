@@ -13,7 +13,7 @@
 #             local/usr.sbin.libvirtd so libvirtd itself (Ubuntu confines it, the
 #             per-user session daemon too) may start the bundled QEMU.
 #   SELinux:  labels the bundled QEMU qemu_exec_t, so svirt can transition to it.
-#   Desktop:  refreshes the desktop entry cache.
+#   Desktop:  refreshes the desktop entry and icon caches.
 set -u
 
 MARK="# added by conduit-integrate"
@@ -53,6 +53,14 @@ selinux_on() {
         && command -v semanage >/dev/null 2>&1
 }
 
+refresh_desktop() {
+    command -v update-desktop-database >/dev/null 2>&1 \
+        && update-desktop-database -q 2>/dev/null || true
+    if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -d /usr/share/icons/hicolor ]; then
+        gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+}
+
 do_enable() {
     if [ -d "$AA" ]; then
         # libvirt regenerates per-VM profiles at VM start, so no reload is
@@ -68,8 +76,7 @@ do_enable() {
         restorecon -F "$QEMU" 2>/dev/null || true
         say "labelled $QEMU qemu_exec_t"
     fi
-    command -v update-desktop-database >/dev/null 2>&1 \
-        && update-desktop-database -q 2>/dev/null || true
+    refresh_desktop
 }
 
 do_disable() {
@@ -80,8 +87,7 @@ do_disable() {
     if selinux_on; then
         semanage fcontext -d "$QEMU" 2>/dev/null || true
     fi
-    command -v update-desktop-database >/dev/null 2>&1 \
-        && update-desktop-database -q 2>/dev/null || true
+    refresh_desktop
 }
 
 case "${1:-}" in

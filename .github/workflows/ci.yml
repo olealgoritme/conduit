@@ -220,7 +220,13 @@ jobs:
           shellcheck -S warning \
             packaging/build.sh packaging/supported-drivers.sh packaging/common/conduit-integrate \
             packaging/tarball/*.sh packaging/deb/*/* \
-            guest/system/conduit-guest-setup cli/assets/build-disk.sh
+            guest/system/conduit-guest-setup cli/assets/build-disk.sh \
+            packaging/common/icons.sh packaging/test/icons.sh
+      - name: App icon set
+        run: |
+          sudo apt-get install -y --no-install-recommends desktop-file-utils
+          desktop-file-validate packaging/common/conduit.desktop
+          packaging/test/icons.sh
       # The RPM spec and the flake fetch the venus submodules themselves
       # (git archive and flake sources leave submodules out).
       - name: Venus submodule pins in flake.nix and conduit.spec

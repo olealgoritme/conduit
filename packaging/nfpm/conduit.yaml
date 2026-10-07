@@ -35,6 +35,10 @@ contents:
     type: symlink
   - src: "@STAGE@/usr/share/applications/conduit.desktop"
     dst: /usr/share/applications/conduit.desktop
+  # The app icon set (packaging/common/icons.sh: install_icons).
+  - src: "@STAGE@/usr/share/icons/hicolor"
+    dst: /usr/share/icons/hicolor
+    type: tree
   - src: "@STAGE@/etc/apparmor.d/abstractions/conduit"
     dst: /etc/apparmor.d/abstractions/conduit
     type: config|noreplace

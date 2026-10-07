@@ -55,6 +55,8 @@ package_conduit() {
   backup=(etc/apparmor.d/abstractions/conduit)
   install=conduit.install
   cd "$pkgbase"
+  # stage also lays out the app icon set under usr/share/icons/hicolor
+  # (packaging/common/icons.sh), so pacman owns the icons too.
   VERSION=$pkgver STAGE="$pkgdir" packaging/build.sh stage
 }
 

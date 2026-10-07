@@ -473,10 +473,14 @@ fn desktop_file(name: &str) -> PathBuf {
         .join(format!("conduit-{name}.desktop"))
 }
 
+/// The icon name of every Conduit launcher entry: the file stem
+/// `packaging/common/icons.sh` installs under `hicolor/*/apps/`.
+pub const APP_ICON: &str = "conduit";
+
 pub fn desktop_entry(name: &str, conduit: &Path) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName={name} (Conduit VM)\nComment=Open the VM {name} in a window (starts it if needed)\n\
-         Exec={} view {name}\nIcon=computer\nTerminal=false\nCategories=System;Emulator;\nKeywords=VM;Conduit;\nStartupNotify=true\n",
+         Exec={} view {name}\nIcon={APP_ICON}\nTerminal=false\nCategories=System;Emulator;\nKeywords=VM;Conduit;\nStartupNotify=true\n",
         conduit.display()
     )
 }
@@ -702,6 +706,22 @@ pub fn shutdown(link: &Link, grace: Duration) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_launcher_entry_uses_the_installed_icon() {
+        // The per-VM entry the CLI writes and the packaged conduit.desktop name the same icon.
+        let e = desktop_entry("myvm", Path::new("/opt/conduit/bin/conduit"));
+        assert!(e.contains(&format!("\nIcon={APP_ICON}\n")), "{e}");
+        let packaged = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../packaging/common/conduit.desktop"
+        ))
+        .expect("packaging/common/conduit.desktop");
+        assert!(
+            packaged.contains(&format!("\nIcon={APP_ICON}\n")),
+            "conduit.desktop must use Icon={APP_ICON}"
+        );
+    }
+
     use super::*;
 
     fn sample() -> String {
