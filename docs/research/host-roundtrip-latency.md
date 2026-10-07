@@ -255,10 +255,10 @@ submit to completion DPC; driver 346.1, INTx):
 | producer deferral (`BltDeferUs / BltAsyncDefer`) | 753 µs | 654 µs | 767 µs |
 
 The guest's histogram has 250 µs buckets, so a 44 µs gain shows only as
-copies crossing the 500 µs edge: 7 → 27 → 135 of about 2450. Copies take
-about 500-550 µs in the guest against about 410-450 µs host dispatch to
-interrupt. The difference is the guest's submit, its kick, and the INTx
-interrupt through to the DPC.
+copies crossing the 500 µs edge: 7 → 27 → 135 of about 2450. Nearly every
+copy sits just above that edge in the guest, against 410-450 µs from host
+dispatch to interrupt. The rest of the guest's time is its submit, its kick,
+and the INTx interrupt through to the DPC.
 
 Reading:
 
