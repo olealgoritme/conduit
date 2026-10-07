@@ -76,6 +76,20 @@ impl ImageBarrier {
         }
     }
 
+    /// The same EXTERNAL transition with `family` on the KMD side instead of family 0: the
+    /// family of the queue the command is recorded for (`CopyQueue`,
+    /// `helios_kmd_logic::copy_queue::barrier_family`). The resting owner stays EXTERNAL, so a
+    /// resource copied on family 0 one frame and on the transfer family the next is never handed
+    /// from one family to the other directly. A barrier without an EXTERNAL side is unchanged.
+    pub(super) const fn on_family(mut self, family: u32) -> Self {
+        if self.src_queue_family == QUEUE_FAMILY_EXTERNAL {
+            self.dst_queue_family = family;
+        } else if self.dst_queue_family == QUEUE_FAMILY_EXTERNAL {
+            self.src_queue_family = family;
+        }
+        self
+    }
+
     /// A transfer-to-transfer transition with NO ownership change, for the
     /// scratch conversion image. `QUEUE_FAMILY_IGNORED` on both sides.
     pub(super) const fn internal(image: VkImageId, src_access: u32, dst_access: u32) -> Self {
@@ -167,6 +181,16 @@ impl BufferBarrier {
             src_queue_family: 0,
             dst_queue_family: QUEUE_FAMILY_EXTERNAL,
         }
+    }
+
+    /// See [`ImageBarrier::on_family`].
+    pub(super) const fn on_family(mut self, family: u32) -> Self {
+        if self.src_queue_family == QUEUE_FAMILY_EXTERNAL {
+            self.dst_queue_family = family;
+        } else if self.dst_queue_family == QUEUE_FAMILY_EXTERNAL {
+            self.src_queue_family = family;
+        }
+        self
     }
 
     /// Make transfer writes available to CPU reads after the submission fence
@@ -1152,6 +1176,16 @@ impl VenusClient {
         &mut self,
         adapter: &AdapterContext,
     ) -> Result<VkCommandPoolId, VirtioError> {
+        self.create_command_pool_on(adapter, helios_kmd_logic::copy_queue::MAIN_FAMILY)
+    }
+
+    /// A command pool of `family`: its command buffers may only be submitted to a queue of that
+    /// family (family 0 everywhere, the transfer family for a `CopyQueue` record).
+    pub(super) fn create_command_pool_on(
+        &mut self,
+        adapter: &AdapterContext,
+        family: u32,
+    ) -> Result<VkCommandPoolId, VirtioError> {
         let pool_id = self.new_command_pool_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_COMMAND_POOL, CMD_FLAG_GENERATE_REPLY);
@@ -1160,7 +1194,7 @@ impl VenusClient {
         w.i32(ST_COMMAND_POOL_CREATE_INFO);
         w.count(false);
         w.u32(0); // flags
-        w.u32(0); // queueFamilyIndex
+        w.u32(family); // queueFamilyIndex
         w.count(false); // pAllocator
         w.count(true);
         w.handle(pool_id);
@@ -1273,10 +1307,28 @@ impl VenusClient {
         image: VkImageId,
         access: TransferAccess,
     ) -> Result<(), VirtioError> {
+        self.cmd_acquire_image_from_external_on(
+            adapter,
+            command_buffer_id,
+            image,
+            access,
+            helios_kmd_logic::copy_queue::MAIN_FAMILY,
+        )
+    }
+
+    /// [`Self::cmd_acquire_image_from_external`] into `family` (the command buffer's own).
+    pub(super) fn cmd_acquire_image_from_external_on(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        image: VkImageId,
+        access: TransferAccess,
+        family: u32,
+    ) -> Result<(), VirtioError> {
         self.cmd_image_barrier(
             adapter,
             command_buffer_id,
-            ImageBarrier::acquire_from_external(image, access),
+            ImageBarrier::acquire_from_external(image, access).on_family(family),
         )
     }
 
@@ -1287,10 +1339,28 @@ impl VenusClient {
         image: VkImageId,
         access: TransferAccess,
     ) -> Result<(), VirtioError> {
+        self.cmd_release_image_to_external_on(
+            adapter,
+            command_buffer_id,
+            image,
+            access,
+            helios_kmd_logic::copy_queue::MAIN_FAMILY,
+        )
+    }
+
+    /// [`Self::cmd_release_image_to_external`] from `family` (the command buffer's own).
+    pub(super) fn cmd_release_image_to_external_on(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        image: VkImageId,
+        access: TransferAccess,
+        family: u32,
+    ) -> Result<(), VirtioError> {
         self.cmd_image_barrier(
             adapter,
             command_buffer_id,
-            ImageBarrier::release_to_external(image, access),
+            ImageBarrier::release_to_external(image, access).on_family(family),
         )
     }
 
@@ -1335,10 +1405,28 @@ impl VenusClient {
         buffer: VkBufferId,
         size: u64,
     ) -> Result<(), VirtioError> {
+        self.cmd_acquire_buffer_from_external_on(
+            adapter,
+            command_buffer_id,
+            buffer,
+            size,
+            helios_kmd_logic::copy_queue::MAIN_FAMILY,
+        )
+    }
+
+    /// [`Self::cmd_acquire_buffer_from_external`] into `family` (the command buffer's own).
+    pub(super) fn cmd_acquire_buffer_from_external_on(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        buffer: VkBufferId,
+        size: u64,
+        family: u32,
+    ) -> Result<(), VirtioError> {
         self.cmd_buffer_barrier(
             adapter,
             command_buffer_id,
-            BufferBarrier::acquire_from_external(buffer, size),
+            BufferBarrier::acquire_from_external(buffer, size).on_family(family),
         )
     }
 
@@ -1349,6 +1437,26 @@ impl VenusClient {
         buffer: VkBufferId,
         size: u64,
     ) -> Result<(), VirtioError> {
+        self.cmd_release_buffer_to_external_on(
+            adapter,
+            command_buffer_id,
+            buffer,
+            size,
+            helios_kmd_logic::copy_queue::MAIN_FAMILY,
+        )
+    }
+
+    /// [`Self::cmd_release_buffer_to_external`] from `family` (the command buffer's own). The
+    /// HOST-read barrier has no ownership side and is the same on every family (the HOST stage is
+    /// valid on a transfer-only queue).
+    pub(super) fn cmd_release_buffer_to_external_on(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        buffer: VkBufferId,
+        size: u64,
+        family: u32,
+    ) -> Result<(), VirtioError> {
         self.cmd_buffer_barrier(
             adapter,
             command_buffer_id,
@@ -1357,7 +1465,7 @@ impl VenusClient {
         self.cmd_buffer_barrier(
             adapter,
             command_buffer_id,
-            BufferBarrier::release_to_external(buffer, size),
+            BufferBarrier::release_to_external(buffer, size).on_family(family),
         )
     }
 
@@ -1698,9 +1806,20 @@ impl VenusClient {
         adapter: &AdapterContext,
         fence_id: VkFenceId,
     ) -> Result<(), VirtioError> {
+        let queue_id = self.queue_id;
+        self.queue_submit_fence_marker_on(adapter, queue_id, fence_id)
+    }
+
+    /// [`Self::queue_submit_fence_marker`] on `queue_id`.
+    pub(super) fn queue_submit_fence_marker_on(
+        &mut self,
+        adapter: &AdapterContext,
+        queue_id: VkQueueId,
+        fence_id: VkFenceId,
+    ) -> Result<(), VirtioError> {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, CMD_FLAG_GENERATE_REPLY);
-        submit.handle(self.queue_id);
+        submit.handle(queue_id);
         submit.u32(0); // submitCount
         submit.count(false); // pSubmits
         submit.handle(fence_id);
@@ -1751,6 +1870,25 @@ impl VenusClient {
         Ok(())
     }
 
+    /// With a transfer queue (`CopyQueue`): an empty fence marker on it, waited for with the
+    /// host timeout `timeout_ns`. When it returns `Ok`, every copy submitted to the transfer
+    /// queue before it has completed: the drains that destroy objects a copy may use
+    /// (`release_present_blits_for_resource`, the guest-blob retire) run it beside their marker
+    /// on the main queue, which does not order the other queue. `Ok` at once without one.
+    pub(super) fn copy_queue_marker(
+        &mut self,
+        adapter: &AdapterContext,
+        timeout_ns: u64,
+    ) -> Result<(), VirtioError> {
+        let Some(copy) = self.copy_queue else {
+            return Ok(());
+        };
+        let fence = self.create_fence(adapter)?;
+        self.queue_submit_fence_marker_on(adapter, copy.queue_id, fence)?;
+        self.wait_for_fence_within(adapter, fence, timeout_ns)?;
+        self.destroy_fence(adapter, fence)
+    }
+
     pub(super) fn destroy_image_on_ring(
         &mut self,
         adapter: &AdapterContext,
@@ -1799,9 +1937,19 @@ impl VenusClient {
         &self,
         command_buffer_id: VkCommandBufferId,
     ) -> Writer {
+        self.encode_command_buffer_submit_on(self.queue_id, command_buffer_id)
+    }
+
+    /// [`Self::encode_command_buffer_submit`] to `queue_id`, which must be of the family the
+    /// command buffer's pool was created for.
+    pub(super) fn encode_command_buffer_submit_on(
+        &self,
+        queue_id: VkQueueId,
+        command_buffer_id: VkCommandBufferId,
+    ) -> Writer {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, 0);
-        submit.handle(self.queue_id);
+        submit.handle(queue_id);
         submit.u32(1); // submitCount
         submit.u64(1); // pSubmits array_size
         submit.i32(ST_SUBMIT_INFO);

@@ -156,6 +156,9 @@ impl VenusClient {
     /// and every earlier queue submission has completed when this returns `Ok`. The host waits
     /// at most [`deadline::FENCE_MS`] (`vkWaitForFences`), so its ring is never blocked longer;
     /// the guest side is bounded by the caller's section (`escape_wait::begin_bounded`).
+    ///
+    /// With a transfer queue (`CopyQueue`) a second marker goes there: copies into a guest buffer
+    /// may run on it, and the main queue's marker does not order it.
     fn guest_queue_marker(&mut self, adapter: &AdapterContext) -> Result<(), VirtioError> {
         let fence = self.create_fence(adapter)?;
         self.queue_submit_fence_marker(adapter, fence)?;
@@ -163,7 +166,11 @@ impl VenusClient {
             crate::ddi::escape_wait::bounded_left_ms(),
         )) * 1_000_000;
         self.wait_for_fence_within(adapter, fence, ns)?;
-        self.destroy_fence(adapter, fence)
+        self.destroy_fence(adapter, fence)?;
+        let ns = u64::from(deadline::fence_wait_ms(
+            crate::ddi::escape_wait::bounded_left_ms(),
+        )) * 1_000_000;
+        self.copy_queue_marker(adapter, ns)
     }
 
     /// Undo a partial import: destroy the buffer, free the memory, and fence after the free
@@ -351,9 +358,16 @@ impl VenusClient {
     /// KMD standard buffer there is no queue-family transfer on the destination (a plain,
     /// exclusive buffer only this device touches); the copy ends with the host's barrier
     /// TRANSFER/TRANSFER_WRITE -> HOST/HOST_READ, so CPU reads after the fence see it.
+    /// `family` is the record's queue family (`CopyQueue`): the pool's and the KMD side of the
+    /// source's EXTERNAL acquire/release. The guest buffer itself takes no ownership barrier: it
+    /// is exclusive to this device, written only by copies of records of one route at a time
+    /// (`copy_queue::conflicts` orders a route change) and read by the CPU, and every copy
+    /// rewrites the whole extent, so no content has to survive a family change. A conversion
+    /// (`conversion_image_id`) needs `vkCmdBlitImage` and is only ever recorded for family 0.
     pub(super) fn record_reusable_guest_blt(
         &mut self,
         adapter: &AdapterContext,
+        family: u32,
         source_image_id: VkImageId,
         conversion_image_id: Option<VkImageId>,
         destination_buffer_id: VkBufferId,
@@ -373,12 +387,16 @@ impl VenusClient {
         {
             return Err(VirtioError::DeviceError);
         }
-        self.record_reusable(adapter, |s, command_buffer_id| {
-            s.cmd_acquire_image_from_external(
+        if conversion_image_id.is_some() && family != helios_kmd_logic::copy_queue::MAIN_FAMILY {
+            return Err(VirtioError::DeviceError);
+        }
+        self.record_reusable_on(adapter, family, |s, command_buffer_id| {
+            s.cmd_acquire_image_from_external_on(
                 adapter,
                 command_buffer_id,
                 source_image_id,
                 TransferAccess::Read,
+                family,
             )?;
             let copy_from = match conversion_image_id {
                 Some(conversion_image_id) => {
@@ -418,11 +436,12 @@ impl VenusClient {
                 pitch,
                 bytes_per_pixel,
             )?;
-            s.cmd_release_image_to_external(
+            s.cmd_release_image_to_external_on(
                 adapter,
                 command_buffer_id,
                 source_image_id,
                 TransferAccess::Read,
+                family,
             )?;
             s.cmd_buffer_barrier(
                 adapter,

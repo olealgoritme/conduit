@@ -3436,6 +3436,138 @@ Pass conditions on hardware (Heaven windowed, NVK DWM, `GuestBlob=1`, host `--ve
 * Not done: creating the guest blob off the Present path (on the HPD worker); a periodic first-row checksum (`GbBad` in 13.3's
   test plan).
 
+### 24.13 The Present copies on the transfer-only queue (`CopyQueue`)
+
+Status: implemented behind `CopyQueue` (default 0 = the previous behaviour, byte for byte). Pure logic host-tested
+(`kmd_logic/src/copy_queue.rs`, 20 tests including the counter-name scans); `kmd_render` stub type-checked (no new error
+against the base). NOT built with the WDK or run here.
+
+#### 24.13.1 Why
+
+The KMD's Venus device had one queue: family 0, queue 0, bound to ring 1 (`bringup.rs`). On the RTX 5090 the host's families
+are 0 = graphics (graphics + compute + transfer, 16 queues), 1 = transfer only (the copy engine, 2 queues), 2 = compute. The
+windowed copy (5.76 MB at 1600x900) on family 0 shares graphics-engine timeslices with the game's NVK channel. Host measurement:
+208 us alone, p50 2.3 ms against a heavy competing graphics load, about 130 us more per frame under Heaven. The same copy on
+family 1 runs beside that load: p50 306 us.
+
+#### 24.13.2 What changes with `CopyQueue` 1
+
+* **Family choice** (`copy_queue::choose_transfer_family`). At bring-up, after the memory properties, the KMD asks
+  `vkGetPhysicalDeviceQueueFamilyProperties` (command 7, up to 8 families) and takes the first family other than 0 with
+  `TRANSFER` and neither `GRAPHICS` nor `COMPUTE` and at least one queue. The family is found by its flags, never by its index.
+  None: the device is the one-queue device and every copy stays on family 0 (`CqFam` 0xFFFFFFFF). With the knob 0 the query is
+  not sent.
+* **Device** (`copy_queue::first_attempt` / `next_attempt`). Every `vkCreateDevice` attempt of the extension ladder also asks
+  for one queue of that family. If even the last tier is refused, the ladder runs again from its start without it: exactly the
+  devices a `CopyQueue` 0 boot tries (`CqDevFall` 1). The knob can cost the queue, never the device.
+* **Queue and ring.** `vkGetDeviceQueue2(family, 0)` with `VkDeviceQueueTimelineInfoMESA.ringIdx = 2`
+  (`copy_queue::COPY_RING_IDX`). virglrenderer refuses a second queue on an already bound ring and destroys the context for a
+  fence on a ring with no queue (`docs/VENUS.md`, fences), so the copy queue exists in the client (`VenusClient::copy_queue`) only
+  when this call succeeded; otherwise nothing is ever fenced on ring 2 (`CqReady` 0).
+* **Route** (`copy_queue::route`), decided once per cached copy record (`PreparedPresentBlt::route`), because the record's
+  command buffer comes from a pool of one family and may only be submitted to a queue of that family. The transfer queue takes a
+  record that is a plain full-surface `vkCmdCopyImageToBuffer` into a buffer: a KMD standard Present buffer or its guest blob
+  (`GuestBlob`), whatever the source (an imported Venus allocation, or a foreign NVK resource with `ForeignCopy`), on every arm
+  that uses the record (legacy Blt, `BltAsync` DIRECT and DEFERRED, the WindowedBlt snapshot). Family 0 keeps, with a reason
+  (`CqWhy`): no transfer queue (1); an image destination (2: a DWM primary or another OPTIMAL image, which the scan-out copies
+  read on ring 1 and so keep their ring-1 order); a format conversion (3: `vkCmdBlitImage` needs a graphics queue); a copy region
+  that breaks `minImageTransferGranularity` (4). The level 5 staging copy (`rm_blt_copy_to_stage`) is an image destination and
+  stays on family 0. Scan-out copies, conversion initializers, Present-buffer creation and every other KMD submission are
+  unchanged: family 0, ring 1.
+* **Submission.** A record's submission goes to its queue and its SUBMIT_3D is fenced on that queue's ring
+  (`present_blt_queue`; `ctrl::submit_venus_async_present` / `_blt` / `_windowed_blt` take the ring now).
+
+#### 24.13.3 Queue-family ownership: transfers through EXTERNAL, no CONCURRENT
+
+Every resource the copy touches, and why it is right on either family:
+
+| resource | sharing | what the copy does |
+|---|---|---|
+| source image: imported Venus OPTIMAL alias, or explicit-modifier foreign NVK image | EXCLUSIVE (as created by its owner) | acquire `EXTERNAL -> F`, copy, release `F -> EXTERNAL`; F = the record's family (`copy_queue::barrier_family`, `ImageBarrier::on_family`) |
+| destination KMD standard Present buffer | EXCLUSIVE (the KMD's exported buffer; released `0 -> EXTERNAL` once at creation) | acquire `EXTERNAL -> F`, copy, HOST-read barrier, release `F -> EXTERNAL` |
+| destination guest-blob buffer | EXCLUSIVE, private to the KMD device | no ownership barrier: written only by copies of records of one route at a time, read only by the CPU; HOST-read barrier as before |
+| conversion scratch image | EXCLUSIVE, private | only in conversion records, which are always family 0 (unchanged) |
+| semaphores | none | the submissions have none |
+| fences | the host's per-ring wire fence | an empty submit with a fence on the queue bound to the SUBMIT_3D's ring, so the copy's own ring orders it after the copy |
+
+Proper ownership transfers were chosen over `VK_SHARING_MODE_CONCURRENT`: an imported image or buffer must be created with the
+same create info as its owner (DXVK, NVK, the KMD's exported Present buffer), and those are exclusive. The protocol the copies
+already used (acquire from `VK_QUEUE_FAMILY_EXTERNAL`, release back) carries over with only the KMD-side family changed. The
+resting owner stays EXTERNAL, so a resource copied on family 0 in one frame and on the transfer family in the next is never handed
+from one family to the other directly.
+
+Two records of different routes can share a resource: one destination written from a source that needs a conversion (family 0)
+and one that does not (transfer), or one source read into an image and into a buffer. Copies on two queues do not run in
+submission order, and an EXTERNAL acquire on one family while the other still owns the resource is invalid. So before a record is
+submitted, every record of the other route that shares its source or destination and has a submission is waited for
+(`copy_queue::conflicts`; a poll first, then at most `SWITCH_WAIT_MS` = 100 ms; `CqSwitch`, `CqSwitchTo`). This is the only new
+wait in a Present, it happens only on such a switch (a swapchain format change), and a single-format window never sees it.
+
+Granularity. A transfer-only family may have a coarse `minImageTransferGranularity` (0,0,0 means whole subresources only). The
+copy reads the whole source image from (0,0) (the import's extent is the copy's, foreign sources included), which every
+granularity allows; `copy_queue::granularity_ok` checks it anyway and a failure keeps the record on family 0 (`CqWhy` 4).
+`CqGran` shows the family's value (one byte per axis; the 5090's copy engine is expected to report 1,1,1).
+
+#### 24.13.4 Completion and the KMD's polling
+
+Nothing that observes completion compares fence ids across rings: the transport retires each SUBMIT_3D by its own used-ring
+entry (`InFlightKind::AsyncVenus`), `wait_fence` and `fence_wait_prepare` look up the one fence, `blt_async_retire` and the
+in-flight table hand a destination back when its last writer retires in any order (`Table::complete`, counted writers), the
+WindowedBlt terminal is matched by token, the Present's DMA fence names the copy's own wire fence (`WireBoundary::Exact`), and a
+prefix boundary already spans every ring (`async_retired_up_to`, `RetireDomain::IncludingGpu` is any nonzero ring). The CPU
+mirror, the present probe and the drains wait the copy's wire fence as before. The drains that destroy objects a copy may use
+(`release_present_blits_for_resource`, the guest-blob retire's queue marker) also put a fence marker on the transfer queue
+(`copy_queue_marker`), since the main queue's marker does not order it.
+
+#### 24.13.5 Knob and counters
+
+`CopyQueue` (REG_DWORD in the service key, default 0; `diag::knobs::COPY_QUEUE`), read at every StartDevice before the Venus
+bring-up (the device is created with it), mirrored as `CqKnob`. Counters (`kmd_logic::copy_queue::COUNTERS`, all written by
+`ddi/copy_queue.rs` only):
+
+| counter | meaning |
+|---|---|
+| `CqKnob` | knob in force |
+| `CqFamN` | queue families the host reported (0 with the knob 0: not asked) |
+| `CqFam` | the transfer family chosen (0xFFFFFFFF: none) |
+| `CqGran` | its `minImageTransferGranularity`, width / height / depth one byte each |
+| `CqReady` | 1: the device has the transfer queue, bound to ring 2 |
+| `CqDevFall` | 1: `vkCreateDevice` refused the two-queue device at every tier, the one-queue device was made |
+| `CqMain` / `CqXfer` | Present copies submitted on family 0 / on the transfer family (written once the knob is on) |
+| `CqFall` | of `CqMain`, copies the knob wanted on the transfer queue |
+| `CqWhy` / `CqMask` | last reason / every reason (bit `code - 1`): 1 no queue, 2 image destination, 3 conversion, 4 granularity |
+| `CqSwitch` / `CqSwitchTo` | submissions that waited for a copy of the other queue sharing a resource / of those, waits that gave up |
+
+#### 24.13.6 Hardware checklist (Heaven windowed, composed; 1920x1080 at 60 Hz first, then bigger)
+
+Same setup as 24.9 row 6 (or the current default set), A/B on `CopyQueue` only, ten minutes a row, `pnputil /restart-device`
+between rows (the device is created at StartDevice):
+
+1. `CopyQueue` 0: the baseline. `CqKnob` 0, `CqReady` 0, `CqFamN` 0, no `CqMain`/`CqXfer` written. Record `BltAsyncLat0..7`,
+   `BltWaitUs / BltWaitN`, PresentMon `msInPresentAPI`, `msBetweenPresents`, fps, host GPU utilization.
+2. `CopyQueue` 1: `CqFamN` 3, `CqFam` 1, `CqGran` 0x010101 (expected), `CqReady` 1, `CqDevFall` 0. `CqXfer` grows with the Blt
+   count, `CqFall` 0 for a BGRA swap chain into a BGRA redirection surface (`CqWhy` 3 when the formats differ, 2 for image
+   destinations). `CqSwitch` 0 or tiny, `CqSwitchTo` 0.
+
+Expected change: the copy's submission-to-completion time under a busy game drops from about 2.3 ms p50 toward 0.3 ms, so
+`BltAsyncLat` moves out of the 2..4 ms buckets (`Lat4`) into the < 500 us ones (`Lat0`, `Lat1`); in the legacy arm
+`BltWaitUs / BltWaitN` drops by the same amount; host GPU time per frame on the graphics engine drops by about 130 us under
+Heaven. Pass: no visual difference (no torn, old or black window content, a GDI app beside it correct), `BltAsyncFail` 0,
+`FlipPendWd` 0, no `WddmHeadMs` rebase, the host log free of virglrenderer `invalid ring_idx` / `sync_queue is already bound`
+lines, and `pnputil /restart-device` returns with the counters restarting.
+
+#### 24.13.7 Verified, and not
+
+* Verified (host tests): the family choice over the 5090 layout and others (by flags, never index 0, empty families, past the
+  request), the query's golden bytes, the device-creation ladder with and without the queue (without it, the old ladder exactly),
+  the granularity rule, the route table exhaustively (transfer only with a queue, a buffer, no blit, a legal region; the knob 0
+  always family 0 with no fallback counted), the barrier family, the queue-switch rule, the counter names (listed = written by
+  `ddi/copy_queue.rs`, nowhere else, the knob in `diag.rs`).
+* NOT verified: anything on hardware; that the host accepts the two-queue device and binds ring 2 (virglrenderer's
+  `vkr_queue_assign_ring_idx` allows rings 1 to 63 per context); the 5090's `minImageTransferGranularity` for family 1; that the
+  copy engine's throughput under load matches the host measurement inside the VM; that the source's acquire from EXTERNAL on
+  the transfer family behaves on NVIDIA as on family 0 (it is the same barrier with a different `dstQueueFamilyIndex`).
+
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
 ### 25.1 The incident

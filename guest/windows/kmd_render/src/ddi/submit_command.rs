@@ -318,6 +318,9 @@ pub(crate) fn publish_nvrm_counters() {
     crate::ddi::blt_async::publish_counters();
     // The guest-memory blob Blt destination (`GuestBlob`): `Gb*`, written once an event happened.
     crate::ddi::guest_blob::publish_counters();
+    // The transfer-only queue for the Present copies (`CopyQueue`): `CqMain` / `CqXfer`, the
+    // fallbacks `CqFall` / `CqWhy` / `CqMask`, the queue-switch waits, written once the knob is on.
+    crate::ddi::copy_queue::publish_counters();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();

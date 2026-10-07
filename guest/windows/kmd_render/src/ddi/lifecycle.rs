@@ -233,6 +233,9 @@ fn start_generation_mirrors() {
     crate::ddi::blt_async::reset_for_start();
     // `GuestBlob` (default 0): the knob read again and mirrored (`GbKnob`), counters zeroed.
     crate::ddi::guest_blob::reset_for_start();
+    // `CopyQueue` (default 0): the knob read again (the Venus bring-up below creates the device
+    // with it) and mirrored (`CqKnob`), the bring-up block reset, the counters zeroed.
+    crate::ddi::copy_queue::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();
