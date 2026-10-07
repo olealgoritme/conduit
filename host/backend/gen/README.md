@@ -7,6 +7,15 @@ the backend picks the host release's table at start and refuses calls of the
 wrong size rather than guessing. Every table is generated, never hand-written,
 and checked in.
 
+A release without a table of its own is refused at start. With
+`--allow-nearest-abi` the RM pointer table (`rmctrl`), `rmallow`, `uvm`,
+`vidmem`, `osdesc` and the escape sizes (`versions`) fall back to the nearest
+older release's. `devinfo` and `nvkms` never do: their layouts are not
+monotonic across releases (GET_DEV_INFO is 20, 32 or 36 bytes), so `select`
+returns the exact release or `None`, and a release with `None` is served only
+NVKMS ALLOC/FREE_DEVICE and is not asked GET_DEV_INFO (no render node is
+offered to the guest).
+
 | script | reads | writes |
 |---|---|---|
 | `nvabi_gen.py` | gVisor nvproxy, plus its `CONDUIT_EXTRA` list (escapes nvproxy does not serve, e.g. `NV_ESC_RM_GET_EVENT_DATA`) | `src/versions/` (escape sizes) |
