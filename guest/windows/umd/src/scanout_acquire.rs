@@ -900,7 +900,7 @@ const NVRM_OPS_ASKED: u64 = 1 << 63;
 /// `dev` is a live device (its callback table valid for the call).
 pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
     // SAFETY: the caller's contract.
-    unsafe { nvrm_supported_ops(dev) } & helios_protocol::HELIOS_NVRM_CAP_FLUSH_GATE != 0
+    (unsafe { nvrm_supported_ops(dev) } & helios_protocol::HELIOS_NVRM_CAP_FLUSH_GATE) != 0
 }
 
 /// The copy-engine Present record (`'HEF3'`): NVRM `QUERY_CAPS.supported_ops`
@@ -910,7 +910,7 @@ pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
 /// `dev` is a live device (its callback table valid for the call).
 pub(crate) unsafe fn nvrm_rm_fence_tail_v3_capable(dev: &HeliosDevice) -> bool {
     // SAFETY: the caller's contract.
-    unsafe { nvrm_supported_ops(dev) } & helios_protocol::HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3 != 0
+    (unsafe { nvrm_supported_ops(dev) } & helios_protocol::HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3) != 0
 }
 
 /// NVRM `QUERY_CAPS.supported_ops` (bit 63 set once asked), asked once per
