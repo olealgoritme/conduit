@@ -1967,7 +1967,14 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                     request.token,
                     request.stream_boundary,
                 ) {
-                    return (request.token, request.stream_boundary, None, Ok(0));
+                    // Times 0: no `StageTrace` stamps under the placeholder fence 0.
+                    return (
+                        request.token,
+                        request.stream_boundary,
+                        (0, 0),
+                        None,
+                        Ok(0),
+                    );
                 }
                 // `GuestBlob`: a copy prepared into a guest buffer that is no longer its
                 // destination's copy target (retired by a paging operation since the Present)

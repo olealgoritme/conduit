@@ -1645,18 +1645,6 @@ pub(crate) fn knob_mode() -> cc::Mode {
     }
 }
 
-/// Take the channel's RM I/O (`IO_BUSY`) without waiting; `false`: another thread has it.
-pub(super) fn try_io() -> bool {
-    IO_BUSY
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
-/// Give back what [`try_io`] took.
-pub(super) fn end_io() {
-    IO_BUSY.store(0, Ordering::Release);
-}
-
 /// The service's phase and, while a channel is in `STATE`, its generation. Spinlock only.
 pub(super) fn route_view() -> (cc::Phase, Option<Gen>) {
     let g = STATE.lock();
