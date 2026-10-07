@@ -23,6 +23,7 @@ $DxgiGuid = 'ca11c036-0102-4a2d-a6ad-f03cfed5d3c9'   # Microsoft-Windows-DXGI (P
 # 1. The provider's own manifest on this build: event ids, field order, keyword masks.
 wevtutil gp Microsoft-Windows-DxgKrnl /ge:true /gm:true /f:xml > "$Out\dxgkrnl-manifest.xml" 2>$null
 wevtutil gp Microsoft-Windows-DXGI /ge:true /gm:true /f:xml > "$Out\dxgi-manifest.xml" 2>$null
+wevtutil gp Microsoft-Windows-Win32k /ge:true /gm:true /f:xml > "$Out\win32k-manifest.xml" 2>$null
 
 # 2. Keyword mask from names (masks move between builds); fallback = the 26H1 masks.
 $want = @('Base','Profiler','References','Resource','Memory','Present','GPUScheduler')
@@ -37,10 +38,22 @@ try {
 } catch { }
 if ($mask -eq 0) { $mask = [UInt64]0x80C7 }
 $hex = '0x{0:X}' -f $mask
+# Win32k token events (PresentMon's: TokenCompositionSurfaceObject, TokenStateChanged): when DWM takes
+# and retires each window's redirected frame.
+$w32 = [UInt64]0
+try {
+    [xml]$wm = Get-Content "$Out\win32k-manifest.xml" -Raw
+    foreach ($k in $wm.SelectNodes("//*[local-name()='keyword']")) {
+        if (@('Updates','Visualization','Microsoft-Windows-Win32k/Tracing') -contains $k.name) {
+            $w32 = $w32 -bor [Convert]::ToUInt64(($k.mask -replace '^0x',''), 16)
+        }
+    }
+} catch { }
+$w32hex = '0x{0:X}' -f $w32
 # Rundown (capture state): adapters, segments (ReportSegment), allocations
 # (AdapterAllocation/DeviceAllocation DC_Start, ReportCommittedGlobalAllocation).
 $rd = '0x{0:X}' -f ($mask -band [UInt64]0xC5)
-"dxgkrnl keywords=$hex rundown=$rd seconds=$Seconds cswitch=$([bool]$CSwitch)" | Tee-Object "$Out\capture.txt"
+"dxgkrnl keywords=$hex rundown=$rd win32k=$w32hex seconds=$Seconds cswitch=$([bool]$CSwitch)" | Tee-Object "$Out\capture.txt"
 
 $sysKw = '<Keyword Value="ProcessThread" /><Keyword Value="Loader" />'
 if ($CSwitch) { $sysKw += '<Keyword Value="CSwitch" /><Keyword Value="ReadyThread" />' }
@@ -67,6 +80,9 @@ $wprp = @"
     <EventProvider Id="EP_Dxgi" Name="$DxgiGuid" Level="5">
       <Keywords><Keyword Value="0xFFFFFFFFFFFFFFFF" /></Keywords>
     </EventProvider>
+    <EventProvider Id="EP_Win32k" Name="8c416c79-d49b-4f01-a467-e56d3aa8234c" Level="5">
+      <Keywords><Keyword Value="$w32hex" /></Keywords>
+    </EventProvider>
     <Profile Id="VramRedir.Verbose.File" Name="VramRedir" Description="conduit redirection-surface capture" LoggingMode="File" DetailLevel="Verbose">
       <Collectors>
         <SystemCollectorId Value="SC_Vram">
@@ -76,6 +92,7 @@ $wprp = @"
           <EventProviders>
             <EventProviderId Value="EP_DxgKrnl" />
             <EventProviderId Value="EP_Dxgi" />
+$(if ($w32 -ne 0) { '            <EventProviderId Value="EP_Win32k" />' })
           </EventProviders>
         </EventCollectorId>
       </Collectors>

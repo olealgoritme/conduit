@@ -353,6 +353,14 @@ def report(evs, procs, target, csv_path=None, show=20, out=sys.stdout):
     span = (evs[-1].ts - evs[0].ts) / 1e9 if evs else 0
     P(f'events {len(evs)} over {span:.2f} s; target {target} pids {sorted(tpids) or "not found in process list"}')
     P('event kinds: ' + ', '.join(f'{k}={v}' for k, v in sorted(kinds.items(), key=lambda x: -x[1])[:28]))
+    byproc = collections.Counter()
+    for e in evs:
+        k = kind(e)
+        if k not in ('process', 'cswitch'):
+            byproc[(pname(e.pid), k or f'{e.prov[:8]}:{e.id}:{e.task}')] += 1
+    P('busiest (process, event) pairs:')
+    for (pn, k), c in byproc.most_common(24):
+        P(f'  {pn:24s} {k:40s} {c}')
     P('\nsegments (ReportSegment):')
     for sid in sorted(segs):
         P('  ' + seg_desc(segs, sid))
@@ -361,7 +369,10 @@ def report(evs, procs, target, csv_path=None, show=20, out=sys.stdout):
 
     # The redirected Blts of the target: destination = the redirection surface.
     blits = [e for e in evs if kind(e) == 'blit' and (not tpids or e.pid in tpids)]
-    red = [e for e in blits if e.n('bRedirectedPresent')]
+    # Composed: Copy with GPU GDI is a Blit with bRedirectedPresent 0 followed by PresentHistory model
+    # REDIRECTED_BLT (PresentMon's rule); with CPU GDI the flag is 1. Either way the destination is the
+    # surface DWM composes from.
+    red = [e for e in blits if e.n('bRedirectedPresent')] or blits
     presents = [e for e in evs if kind(e) == 'present' and (not tpids or e.pid in tpids)]
     dsts = collections.Counter(e.d['hDestAllocation'] for e in red) or \
         collections.Counter(e.d['hDstAllocHandle'] for e in presents)
@@ -369,7 +380,8 @@ def report(evs, procs, target, csv_path=None, show=20, out=sys.stdout):
     ph = collections.Counter(PM_NAMES.get(e.n('Model'), e.d.get('Model')) for e in evs
                              if kind(e) == 'ph_start' and (not tpids or e.pid in tpids))
     P(f'\npresent models (PresentHistory start, target): {dict(ph)}')
-    P(f'Blit events: {len(blits)} (redirected {len(red)}); Present events {len(presents)}')
+    P(f'Blit events: {len(blits)} (bRedirectedPresent=1: {sum(1 for e in blits if e.n("bRedirectedPresent"))}); '
+      f'Present events {len(presents)}')
     dest_roots = set()
     for h, c in dsts.most_common(4):
         r = allocs.root(h)
@@ -459,7 +471,7 @@ def report(evs, procs, target, csv_path=None, show=20, out=sys.stdout):
                 cur = None
             elif cur is not None:
                 cur['events'].append(e)
-                if k == 'blit' and e.n('bRedirectedPresent'):
+                if k == 'blit' and cur['blit'] is None:
                     cur['blit'] = e
                 elif k == 'lock':
                     r = allocs.root(e.d.get('hAllocationHandle') or e.d.get('pAlloc'), e.pid)
@@ -683,7 +695,7 @@ def selftest():
     buf = io.StringIO()
     report(evs, {A: 'Heaven.exe', 4: 'System.exe'}, 'Heaven.exe', out=buf)
     s = buf.getvalue()
-    checks = ['redirected 3', 'aperture segment', 'Heaven.exe', 'frames (target Present calls): 3',
+    checks = ['bRedirectedPresent=1: 3', 'aperture segment', 'Heaven.exe', 'frames (target Present calls): 3',
               'within 100 us of a packet retire (QueuePacket stop): 2/3', 'dwReadSegment set: [1]',
               'Heaven.exe tid 77: 3 locks']
     bad = [c for c in checks if c not in s]
