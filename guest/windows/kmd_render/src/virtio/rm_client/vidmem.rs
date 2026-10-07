@@ -126,7 +126,10 @@ pub(crate) fn any_live() -> bool {
 pub(crate) fn reset_for_start() {
     let k = crate::diag::read_config_dword(crate::diag::knobs::REDIR_VRAM, rv::KNOB_OFF);
     KNOB.store(k, Ordering::Relaxed);
-    for c in [&TRY, &OK, &VENUS, &WHY, &STAGE, &FAIL, &FREED, &BRING, &MS, &MS_MAX, &SOFT, &LEAK] {
+    for c in [
+        &TRY, &OK, &VENUS, &WHY, &STAGE, &FAIL, &FREED, &BRING, &MS, &MS_MAX, &SOFT, &LEAK, &OPEN,
+        &OPEN_FG, &OPEN_LAY,
+    ] {
         c.store(0, Ordering::Relaxed);
     }
     crate::diag::record_named_bytes(b"RvKnob", k);
@@ -518,6 +521,30 @@ pub(crate) fn lookup(resource_id: u32) -> Option<VramObject> {
     }
     let g = STATE.lock();
     g.objs.iter().flatten().find(|o| o.resource_id == resource_id).copied()
+}
+
+static OPEN: AtomicU32 = AtomicU32::new(0);
+static OPEN_FG: AtomicU32 = AtomicU32::new(0);
+static OPEN_LAY: AtomicU32 = AtomicU32::new(0);
+
+/// `DxgkDdiOpenAllocation` registered an open of `resource_id` (PASSIVE): if it is one of the
+/// service's objects, count it (`RvOpen`), whether the open identity says FOREIGN (`RvOpenFg`: the
+/// opener's UMD takes the import-by-id route) and whether the layout record reached it
+/// (`RvOpenLay`), and the opener's process (`RvOpenPid`: DWM's pid means DWM opened the
+/// redirection surface). One relaxed load when nothing is alive.
+pub(crate) fn note_open(resource_id: u32, foreign: bool, layout: bool) {
+    if lookup(resource_id).is_none() {
+        return;
+    }
+    use crate::diag::record_named_bytes as rec;
+    rec(b"RvOpen", OPEN.fetch_add(1, Ordering::Relaxed) + 1);
+    if foreign {
+        rec(b"RvOpenFg", OPEN_FG.fetch_add(1, Ordering::Relaxed) + 1);
+    }
+    if layout {
+        rec(b"RvOpenLay", OPEN_LAY.fetch_add(1, Ordering::Relaxed) + 1);
+    }
+    rec(b"RvOpenPid", crate::virtio::nvrm_window::current_pid());
 }
 
 /// The host resource `resource_id` has been released (`ctrl::release_allocation_resource`): if the
