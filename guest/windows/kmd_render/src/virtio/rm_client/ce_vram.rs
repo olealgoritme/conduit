@@ -950,6 +950,87 @@ pub(crate) fn transfer(
     r
 }
 
+/// [`transfer`] with a foreign NVK image ([`foreign_source`]) on the image side: `rect` of the
+/// image through the bounce buffer to or from `bytes` (rows `row_pitch` apart, in the image's own
+/// pixel format), waited for. For the GDI executor's read-modify-write of an app's image (fills,
+/// ClearType, blends, ROPs: everything that is not a plain copy). No acquire of the producer's
+/// semaphore: the image is read or written as it is in memory, as GDI on a D3D surface is on bare
+/// metal. PASSIVE, no lock held; takes the channel's I/O without waiting (`BUSY`).
+pub(crate) fn foreign_transfer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    fs: &ForeignSource,
+    rect: Rect,
+    dir: Dir,
+    bytes: &mut [u8],
+    row_pitch: usize,
+) -> Result<(), Fail> {
+    if fs.chan_gen != chan_gen() {
+        return Err(BAD_SHAPE);
+    }
+    let t0 = now();
+    let r = with_io(passive, adapter, |io, h| {
+        let packed = rv::bounce_surface(rect).map_err(|_| BAD_SHAPE)?;
+        let row = packed.pitch as usize;
+        let rows = packed.height as usize;
+        if row_pitch < row || bytes.len() < row_pitch * (rows - 1) + row {
+            return Err(BAD_SHAPE);
+        }
+        let copy = rv::foreign_bounce_copy(&fs.plan, fs.va, fs.pitch, fs.width, fs.height, rect, dir)
+            .map_err(|_| BAD_SHAPE)?;
+        let need = rv::bounce_bytes(rect).map_err(|_| BAD_SHAPE)?;
+        let b = bounce(io, h, need)?;
+        if dir == Dir::Upload {
+            for y in 0..rows {
+                // SAFETY: as in `transfer`: the bounce view holds `need` bytes, `bytes` row `y`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr().add(y * row_pitch),
+                        (b.cpu.va as *mut u8).add(y * row),
+                        row,
+                    );
+                }
+            }
+            ce::full_barrier();
+        }
+        let value = ce::submit_copy(&copy).map_err(|_| SUBMIT)?;
+        if !wait(io.passive, value, XFER_MS) {
+            super::ce_route::mark_broken();
+            return Err(TIMEOUT);
+        }
+        if dir == Dir::Readback {
+            ce::full_barrier();
+            for y in 0..rows {
+                // SAFETY: as above, the other way round.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (b.cpu.va as *const u8).add(y * row),
+                        bytes.as_mut_ptr().add(y * row_pitch),
+                        row,
+                    );
+                }
+            }
+        }
+        Ok(())
+    });
+    let us = us_since(t0);
+    XFER_US.store(us, Ordering::Relaxed);
+    XFER_MAX.fetch_max(us, Ordering::Relaxed);
+    match &r {
+        Ok(()) => {
+            XFER.fetch_add(1, Ordering::Relaxed);
+            if dir == Dir::Upload {
+                FGN_WRITE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Err(f) => {
+            XFER_FAIL.fetch_add(1, Ordering::Relaxed);
+            XFER_WHY.store(cc::fail_word(*f), Ordering::Relaxed);
+        }
+    }
+    r
+}
+
 /// The bounce buffer, at least `need` bytes (kept between calls; a larger request replaces it).
 /// The caller holds the channel's I/O and nothing is in flight on the old one (transfers wait).
 fn bounce(io: &Io<'_>, h: &Handles, need: u64) -> Result<Bounce, Fail> {
