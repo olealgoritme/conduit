@@ -193,6 +193,7 @@ int main(int argc, char** argv) {
     typedef BOOL(WINAPI * SetCtx)(HANDLE);
     if (SetCtx f = user32 ? (SetCtx)GetProcAddress(user32, "SetProcessDpiAwarenessContext") : nullptr)
         f((HANDLE)-4);  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    std::printf("DUPSHOT pid=%lu\n", (unsigned long)GetCurrentProcessId());
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) { fail("coinit", hr); return 1; }
     IDXGIFactory1* fac = nullptr;
