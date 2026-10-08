@@ -183,6 +183,11 @@ fn write_counters() {
 }
 
 /// A Present (or a dispatch) keeps the Venus copy.
+/// The code of the route's last refusal (`CeRtWhy`), for a caller that falls back on its own.
+pub(crate) fn last_why() -> u32 {
+    WHY.load(Ordering::Relaxed)
+}
+
 fn fall(why: Why) {
     FALL.fetch_add(1, Ordering::Relaxed);
     WHY.store(why.code(), Ordering::Relaxed);
