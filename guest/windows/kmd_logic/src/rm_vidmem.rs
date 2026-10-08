@@ -837,6 +837,38 @@ pub fn bounce_copy(vram: &Surface, rect: Rect, dir: Dir) -> Result<CopyRect, Cop
     }
 }
 
+/// The bounce copy of a rectangle of a foreign (NVK-made) image, block-linear or pitch-linear by
+/// its `plan`: `Readback` copies `rect` of the image into the packed bounce rows, `Upload` the
+/// bounce rows into `rect` of the image. The pixel layout is the image's (no R/B exchange): the
+/// CPU works on the image's own format.
+#[allow(clippy::too_many_arguments)]
+pub fn foreign_bounce_copy(
+    plan: &crate::ce_present::SourcePlan,
+    va: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    rect: Rect,
+    dir: Dir,
+) -> Result<CopyRect, CopyError> {
+    let b = bounce_surface(rect)?;
+    match dir {
+        Dir::Readback => foreign_copy(plan, va, pitch, width, height, rect, &b, 0, 0, Remap::None),
+        Dir::Upload => foreign_write(
+            &b,
+            Rect::whole(b.width, b.height),
+            plan,
+            va,
+            pitch,
+            width,
+            height,
+            rect.left,
+            rect.top,
+            Remap::None,
+        ),
+    }
+}
+
 // ---- counters ---------------------------------------------------------------------------------------
 
 /// Every value the two I/O halves write (at most 14 characters each; the name scan of the
@@ -850,7 +882,7 @@ pub const COUNTERS: &[&str] = &[
     "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvBookReent", "RvXfer", "RvXferFail",
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
     // the Present (`ddi/vram_redirect.rs`)
-    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy", "RvSyncTry", "RvSyncWhy", "RvMkNone", "RvMkRes", "RvMkStr", "RvMkVramNo", "RvSyPix", "RvSyPixN", "RvSyPixNz", "RvSyDst", "RvSySrc", "RvSyWH", "RvPrUs", "RvPrN", "RvPrMax", "RvRtUs", "RvRtN", "RvRtMax", "RvSyFsUs", "RvSyFsN", "RvSyFsMax", "RvSyDsUs", "RvSyDsN", "RvSyDsMax", "RvSySubUs", "RvSySubN", "RvSySubMax", "RvSyWtUs", "RvSyWtN", "RvSyWtMax",
+    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy", "RvSyncTry", "RvSyncWhy", "RvMkNone", "RvMkRes", "RvMkStr", "RvMkVramNo", "RvSyPix", "RvSyPixN", "RvSyPixNz", "RvDst0", "RvDst1", "RvDst2", "RvDst3", "RvDst4", "RvDst5", "RvDst6", "RvDst7", "RvDstMore", "RvNew0", "RvNew1", "RvNew2", "RvNew3", "RvNew4", "RvNew5", "RvNew6", "RvNew7", "RvNewWH0", "RvNewWH1", "RvNewWH2", "RvNewWH3", "RvNewWH4", "RvNewWH5", "RvNewWH6", "RvNewWH7", "RvSyDst", "RvSySrc", "RvSyWH", "RvPrUs", "RvPrN", "RvPrMax", "RvRtUs", "RvRtN", "RvRtMax", "RvSyFsUs", "RvSyFsN", "RvSyFsMax", "RvSyDsUs", "RvSyDsN", "RvSyDsMax", "RvSySubUs", "RvSySubN", "RvSySubMax", "RvSyWtUs", "RvSyWtN", "RvSyWtMax",
     // foreign NVK sources for GDI commands (`ce_vram.rs`)
     "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy", "RvFgnWrite",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
@@ -1063,6 +1095,23 @@ mod tests {
             foreign_copy(&bl_plan, map_va(4), 7680, 1908, 910, Rect { left: 0, top: 0, right: 1909, bottom: 1 }, &dst, 0, 0, Remap::None),
             Err(CopyError::Rect)
         );
+    }
+
+    #[test]
+    fn a_foreign_rect_bounces_both_ways_through_the_packed_rows() {
+        use crate::ce_present::SourcePlan;
+        let plan = SourcePlan { layout: SurfaceLayout::Pitch, page_kind: None, line_bytes: 1908 * 4, offset: 0 };
+        let r = Rect { left: 10, top: 20, right: 110, bottom: 70 };
+        let rb = foreign_bounce_copy(&plan, map_va(4), 7680, 1908, 910, r, Dir::Readback).unwrap();
+        assert_eq!(rb.dst_va, BOUNCE_VA);
+        assert_eq!(rb.dst_pitch, 100 * 4);
+        assert_eq!(rb.lines, 50);
+        let up = foreign_bounce_copy(&plan, map_va(4), 7680, 1908, 910, r, Dir::Upload).unwrap();
+        assert_eq!(up.src_va, BOUNCE_VA);
+        assert_eq!(up.src_pitch, 100 * 4);
+        assert_eq!(up.lines, 50);
+        let outside = Rect { left: 1900, top: 0, right: 1910, bottom: 1 };
+        assert!(foreign_bounce_copy(&plan, map_va(4), 7680, 1908, 910, outside, Dir::Readback).is_err());
     }
 
     #[test]

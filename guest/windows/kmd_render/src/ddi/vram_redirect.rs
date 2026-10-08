@@ -140,6 +140,35 @@ static T_DS: Stage = Stage::new();
 static T_SUB: Stage = Stage::new();
 static T_WT: Stage = Stage::new();
 
+/// Which VRAM surfaces the Present path wrote: up to 8 distinct destinations, `RvDst0..7` =
+/// resource id << 12 | writes (saturating at 0xfff), `RvDstMore`: writes to further ones. The
+/// route's queued copies count when queued, the others when done.
+const DST_LEDGER: usize = 8;
+static DST_RES: [AtomicU32; DST_LEDGER] = [const { AtomicU32::new(0) }; DST_LEDGER];
+static DST_CNT: [AtomicU32; DST_LEDGER] = [const { AtomicU32::new(0) }; DST_LEDGER];
+static DST_MORE: AtomicU32 = AtomicU32::new(0);
+
+fn note_dst(resource_id: u32) {
+    for i in 0..DST_LEDGER {
+        let r = DST_RES[i].load(Ordering::Relaxed);
+        if r == resource_id {
+            DST_CNT[i].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if r == 0 {
+            if DST_RES[i]
+                .compare_exchange(0, resource_id, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+                || DST_RES[i].load(Ordering::Relaxed) == resource_id
+            {
+                DST_CNT[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    DST_MORE.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The Present's stash (0 none, 1 resolved RM fence, 2 stream point). Any IRQL.
 pub(crate) fn note_marker(kind: u32) {
     match kind {
@@ -180,6 +209,11 @@ pub(crate) fn reset_for_start() {
     for t in [&T_PR, &T_RT, &T_FS, &T_DS, &T_SUB, &T_WT] {
         t.reset();
     }
+    for i in 0..DST_LEDGER {
+        DST_RES[i].store(0, Ordering::Relaxed);
+        DST_CNT[i].store(0, Ordering::Relaxed);
+    }
+    DST_MORE.store(0, Ordering::Relaxed);
 }
 
 fn publish() {
@@ -205,6 +239,16 @@ fn publish() {
     rec(b"RvMkRes", MK_RES.load(Ordering::Relaxed));
     rec(b"RvMkStr", MK_STR.load(Ordering::Relaxed));
     rec(b"RvMkVramNo", MK_VRAM_NO.load(Ordering::Relaxed));
+    for (i, name) in [b"RvDst0", b"RvDst1", b"RvDst2", b"RvDst3", b"RvDst4", b"RvDst5", b"RvDst6", b"RvDst7"]
+        .iter()
+        .enumerate()
+    {
+        let r = DST_RES[i].load(Ordering::Relaxed);
+        if r != 0 {
+            rec(*name, r << 12 | DST_CNT[i].load(Ordering::Relaxed).min(0xfff));
+        }
+    }
+    rec(b"RvDstMore", DST_MORE.load(Ordering::Relaxed));
     T_PR.publish(b"RvPrUs", b"RvPrN", b"RvPrMax");
     T_RT.publish(b"RvRtUs", b"RvRtN", b"RvRtMax");
     T_FS.publish(b"RvSyFsUs", b"RvSyFsN", b"RvSyFsMax");
@@ -355,6 +399,7 @@ pub(crate) unsafe fn blt(
             if !ce_vram::wait(passive, value, ce_vram::XFER_MS) {
                 return skip(Why::Copy);
             }
+            note_dst(destination.resource_id);
             maybe_publish(false);
             Some(Outcome::Done)
         }
@@ -399,6 +444,7 @@ pub(crate) unsafe fn blt(
             ) {
                 Ok(()) => {
                     UPLOAD.fetch_add(1, Ordering::Relaxed);
+                    note_dst(destination.resource_id);
                     maybe_publish(false);
                     Some(Outcome::Done)
                 }
@@ -628,6 +674,7 @@ unsafe fn foreign_arm(
     match token {
         Some(t) => {
             ROUTED.fetch_add(1, Ordering::Relaxed);
+            note_dst(destination.resource_id);
             maybe_publish(false);
             Some(Outcome::Routed(t))
         }
@@ -652,6 +699,7 @@ unsafe fn foreign_arm(
                 dst.fourcc,
             ) {
                 SYNC.fetch_add(1, Ordering::Relaxed);
+                note_dst(destination.resource_id);
                 maybe_publish(false);
                 Some(Outcome::Done)
             } else {
