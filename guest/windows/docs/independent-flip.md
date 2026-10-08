@@ -1448,3 +1448,44 @@ application and `dwm.exe` while promoted, interval 0, tearing), `IndepFlip` defa
 `DirectFlipSupport` to 1. Opt-outs: `IndepFlip` = 0 in the KMD service key (then the UMD answer is no as well: dxgkrnl reports no
 DirectFlip), or `HKLM\SOFTWARE\Helios` `DirectFlipSupport` = 0 to keep the caps but refuse every promotion. `FlipDoneHost` stays 0
 until its own rows (13.4) are measured.
+
+### 13.9 Counter-Strike 2 (D3D11, flip model): why it stays composed, and the rows
+
+Measured on 405.5: CS2 at 2560x1440 presents `Composed: Flip` on the 5120x1440@240 desktop. Three gates hold it there, each
+sufficient on its own:
+
+1. **The defaults.** 405.5 has the S-1 code (the no-destination fix of 13.6 included) but `IndepFlip` and `DirectFlipSupport`
+   both default to 0 there (13.8 landed on `main` only): no `SupportDirectFlip`, no `FlipIndependent`, and the UMD answers no.
+   This branch carries 13.8.
+2. **The extent.** The KMD offers exactly one resolution, the host's (`vidpn.rs`: source and target modes at `display_mode()`,
+   only the refresh varies), and has no scaler (`foreign_flip::decide` refuses `Extent`, the UMD rule compares the two
+   buffers' sizes). A 2560x1440 swap chain in a borderless window covering a 5120x1440 output is stretched by DWM, and
+   `CheckDirectFlipSupport` answers "size differs" for it. A 2560x1440 game is promotable only when the guest mode is
+   2560x1440: the viewer's `--resolution=2560x1440` (fixed hint; the viewer scales the scan-out to its window), or the game
+   at the native 5120x1440. "Fullscreen" (exclusive) in the game cannot switch the guest to 2560x1440 by itself: the mode is
+   not in the list.
+3. **The format.** DWM's primary is B8G8R8A8_UNORM; Source 2 presents R8G8B8A8_UNORM (to confirm from the dwm UMD log
+   line below). The 393.1 rule wanted equal formats. `DirectFlipSupport` 1 now pairs any two of R8G8B8A8 / B8G8R8A8 /
+   B8G8R8X8 UNORM (the KMD flips each buffer in its own format); 4 keeps the exact rule for the A/B.
+
+The `dwm` UMD log (`C:\ProgramData\Helios\`) line `CheckDirectFlipSupport #n: ... app=tex2d WxH fmt=F ... dwm_res=tex2d WxH
+fmt=F -> yes|no (why)` names which gate refused. No line at all: DWM never considered the window (not covering the output,
+an overlay on top, or kmt 19/28 = 0).
+
+Rows (main runs them; one reboot per KMD knob change; CS2 on a bot map, `fps_max 0`, V-sync off, the same spot and 30 s
+of PresentMon `--process_name cs2.exe`; read `PresentMode`, the fps, the dwm log lines above, and `IdfSpaTrans`, `IdfSpaExcl`,
+`IdfDirFor`, `IdfPrRedir`, `IdfRedErr`, `IdfKeep`, `IdfArmDma`, `PBFlip`, `FfReowned`):
+
+| row | build / knobs | guest mode, CS2 video settings | expect |
+|---|---|---|---|
+| C0 | 405.5 as is | 5120x1440, CS2 2560x1440 fullscreen windowed (today) | `Composed: Flip`, 85-120 fps; no `CheckDirectFlipSupport` answer other than `DirectFlipSupport=0` |
+| C1 | this build (defaults on) | as C0 | still `Composed: Flip`; dwm log `-> no (size differs ...)`: gate 2 confirmed |
+| C2 | this build | 5120x1440, CS2 at 5120x1440 fullscreen windowed | `Hardware: Independent Flip`, `IdfSpaExcl` at the flip rate; fps vs C1 shows the render cost of 2x pixels against the composition saved |
+| C3 | this build, `DirectFlipSupport=4` | as C2 | if the log shows `fmt=28` vs `fmt=87`: `Composed: Flip` (`formats not scan-out compatible`), which proves gate 3 |
+| C4 | this build | viewer `--resolution=2560x1440` (guest 2560x1440@240), CS2 2560x1440 fullscreen | `Hardware: Independent Flip`; compare fps with C1 at the same render size: the composed path's cost |
+| C5 | as C4 | C4 with V-sync on in CS2 | about 240 fps, `Hardware: Independent Flip`, `MsBetweenDisplayChange` about 4.17 |
+| C6 | as C4 | `d3d11_iflip 20 topmost fg interval0 tearing` at 2560x1440 | the tool's fps line: above 240 means interval-0 flips under independent flip are not refresh-capped (4.3); about 240 means they are, and CS2 at C4 would be capped at 240 while C1 is not |
+
+Colour check on C2/C4: a red/blue swap on screen means the R8G8B8A8 buffer's layout record carries a BGRA fourcc; `DirectFlipSupport=4`
+is the fallback until it is fixed. Cursor: with `HwCursor` 0 (the 404 default) nothing draws the Windows pointer while
+promoted (4.5); CS2 draws its own crosshair, its menus may show no pointer.
