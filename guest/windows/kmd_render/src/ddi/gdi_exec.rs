@@ -216,12 +216,14 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 /// StartDevice (PASSIVE): zero everything, forget the jobs of the previous generation (their
 /// fences went with it).
 /// The bisect switches (`GdiFgn`, `GdiFgnAcq`, `GdiSysCe`, `GdiPair`), bits 0..3 of `PATHS`.
-static PATHS: AtomicU32 = AtomicU32::new(PATH_FGN | PATH_SYS | PATH_PAIR | PATH_OVL);
+static PATHS: AtomicU32 = AtomicU32::new(PATH_FGN | PATH_SYS | PATH_PAIR | PATH_OVL | PATH_FGN_WR);
 const PATH_FGN: u32 = 1;
 const PATH_FGN_ACQ: u32 = 2;
 const PATH_SYS: u32 = 4;
 const PATH_PAIR: u32 = 8;
 const PATH_OVL: u32 = 16;
+/// Copies INTO a foreign NVK image (`GdiOff` 0x20 turns them off).
+const PATH_FGN_WR: u32 = 32;
 
 fn path(bit: u32) -> bool {
     PATHS.load(Ordering::Relaxed) & bit != 0
@@ -781,6 +783,9 @@ fn run_foreign_write(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -
     };
     if !path(PATH_FGN) {
         return fail(9);
+    }
+    if !path(PATH_FGN_WR) {
+        return fail(10);
     }
     if glue::channel_state() != 0 {
         return fail(6);
