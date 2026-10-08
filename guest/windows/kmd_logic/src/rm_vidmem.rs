@@ -65,11 +65,13 @@ pub mod off {
     /// DIAGNOSTIC: a new VRAM surface is cleared to opaque magenta instead of 0, so content no
     /// path ever wrote shows as magenta wherever DWM composes the surface.
     pub const CLEAR_MAGENTA: u32 = 0x2000;
-    /// OPT-IN: CDD's CPU-written GDI surfaces (`STAGING_CPUVISIBLE`, `LOOKUPTABLE`) go to the
-    /// aperture segment only (CpuVisible, Cached, no RM or BAR backing), as the GDI surface type
-    /// requires, and the KMD reads and writes them through the system pages Windows maps them to
-    /// (`ddi/aperture_pages.rs`), where win32k's CPU drawing is.
-    pub const STAGING_APERTURE: u32 = 0x4000;
+    /// CDD's CPU-written GDI surfaces (`STAGING_CPUVISIBLE`, `LOOKUPTABLE`) go to the aperture
+    /// segment only (CpuVisible, Cached, no RM or BAR backing), as the GDI surface type requires,
+    /// and the KMD reads and writes them through the system pages Windows maps them to
+    /// (`ddi/aperture_pages.rs`), where win32k's CPU drawing is. The default since 390.1
+    /// (Explorer's file list and the wallpaper render; black without it); this bit turns it OFF
+    /// (the BAR / RM placement and the blob view as before). It opted in before.
+    pub const STAGING_APERTURE_OFF: u32 = 0x4000;
     /// The Present hook (`ddi/vram_redirect.rs`) skips every Blt with a VRAM surface (counted).
     pub const PRESENT_HOOK: u32 = 0x80;
     /// OPT-IN: the CPU helpers reuse blob views (`build_paging_buffer`). Off by default since 364.1:
@@ -91,7 +93,12 @@ pub mod off {
 /// `off` is the `RvOff` mask.
 pub const fn rm_backed_standard(std_type: u32, gdi_type: u32, primary: bool, off: u32) -> bool {
     use crate::rm_standard::{GDI_LOOKUPTABLE, GDI_STAGING_CPUVISIBLE, STD_GDISURFACE};
-    if primary || std_type != STD_GDISURFACE || off & (off::STAGING_RM | off::STAGING_APERTURE) != 0 {
+    // The aperture placement (the default) takes these surfaces; RM backing only with it off.
+    if primary
+        || std_type != STD_GDISURFACE
+        || off & off::STAGING_RM != 0
+        || off & off::STAGING_APERTURE_OFF == 0
+    {
         return false;
     }
     gdi_type == GDI_STAGING_CPUVISIBLE || (gdi_type == GDI_LOOKUPTABLE && off & off::LUT_RM == 0)
@@ -899,7 +906,7 @@ pub const COUNTERS: &[&str] = &[
     // foreign NVK sources for GDI commands (`ce_vram.rs`)
     "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy", "RvFgnWrite",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
-    "RvSysMade", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak", "RvSysObj",
+    "RvSysMade", "RvSysApV", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak", "RvSysObj",
     // the CPU helpers' blob views (`ddi/build_paging_buffer.rs`)
     "RvCpuMapUs", "RvCpuCpyUs", "RvCpuKB", "RvCpuCache", "RvCpuHit", "RvCpuView",
 ];
@@ -920,20 +927,24 @@ mod tests {
     fn staging_and_lookup_tables_are_rm_backed() {
         use super::{off, rm_backed_standard};
         use crate::rm_standard::*;
-        assert!(rm_backed_standard(STD_GDISURFACE, GDI_STAGING_CPUVISIBLE, false, 0));
-        assert!(rm_backed_standard(STD_GDISURFACE, GDI_LOOKUPTABLE, false, 0));
-        assert!(!rm_backed_standard(STD_GDISURFACE, GDI_LOOKUPTABLE, false, off::LUT_RM));
-        assert!(rm_backed_standard(STD_GDISURFACE, GDI_STAGING_CPUVISIBLE, false, off::LUT_RM));
+        // The aperture placement is the default: RM backing only with it turned off.
+        let rm = off::STAGING_APERTURE_OFF;
+        assert!(!rm_backed_standard(STD_GDISURFACE, GDI_STAGING_CPUVISIBLE, false, 0));
+        assert!(!rm_backed_standard(STD_GDISURFACE, GDI_LOOKUPTABLE, false, 0));
+        assert!(rm_backed_standard(STD_GDISURFACE, GDI_STAGING_CPUVISIBLE, false, rm));
+        assert!(rm_backed_standard(STD_GDISURFACE, GDI_LOOKUPTABLE, false, rm));
+        assert!(!rm_backed_standard(STD_GDISURFACE, GDI_LOOKUPTABLE, false, rm | off::LUT_RM));
+        assert!(rm_backed_standard(STD_GDISURFACE, GDI_STAGING_CPUVISIBLE, false, rm | off::LUT_RM));
         for g in [GDI_STAGING_CPUVISIBLE, GDI_LOOKUPTABLE] {
-            assert!(!rm_backed_standard(STD_GDISURFACE, g, false, off::STAGING_RM));
-            assert!(!rm_backed_standard(STD_GDISURFACE, g, true, 0));
+            assert!(!rm_backed_standard(STD_GDISURFACE, g, false, rm | off::STAGING_RM));
+            assert!(!rm_backed_standard(STD_GDISURFACE, g, true, rm));
         }
         for g in [GDI_INVALID, GDI_TEXTURE, GDI_STAGING, GDI_EXISTINGSYSMEM, GDI_TEXTURE_CPUVISIBLE, 9] {
-            assert!(!rm_backed_standard(STD_GDISURFACE, g, false, 0), "gdi {g}");
+            assert!(!rm_backed_standard(STD_GDISURFACE, g, false, rm), "gdi {g}");
         }
         for s in [STD_SHAREDPRIMARYSURFACE, STD_SHADOWSURFACE, STD_STAGINGSURFACE] {
-            assert!(!rm_backed_standard(s, GDI_STAGING_CPUVISIBLE, false, 0));
-            assert!(!rm_backed_standard(s, GDI_LOOKUPTABLE, false, 0));
+            assert!(!rm_backed_standard(s, GDI_STAGING_CPUVISIBLE, false, rm));
+            assert!(!rm_backed_standard(s, GDI_LOOKUPTABLE, false, rm));
         }
     }
 
