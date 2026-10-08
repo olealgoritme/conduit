@@ -124,6 +124,17 @@ pub struct Caps {
     pub reported: u32,
 }
 
+/// `knob` with the prerequisites of `GdiAccel` = 1: GDI `TEXTURE` surfaces in RM video memory
+/// (`RedirVram` = 1) and the copy-engine channel (`RmCopyEngine` = 1). Without them every GDI
+/// texture is a Venus image no engine of the executor reaches, every command on it is dropped and
+/// the desktop is garbage (362.1 row a): the caps are then not reported at all (`needs_more`).
+pub const fn resolve_caps_with(knob: u32, redir_vram_on: bool, copy_engine_on: bool) -> Caps {
+    if knob == 1 && !(redir_vram_on && copy_engine_on) {
+        return Caps { on: false, reported: 0 };
+    }
+    resolve_caps(knob)
+}
+
 pub const fn resolve_caps(knob: u32) -> Caps {
     match knob {
         1 => Caps { on: true, reported: ACCEL_CAPS },
@@ -803,6 +814,10 @@ pub enum SurfaceClass {
     System,
     /// Neither (a Venus image, an allocation VidMm holds in the Venus window, an unknown handle).
     Unreachable,
+    /// A UMD-created NVK image with a foreign (RM) identity: a copy-engine SOURCE only
+    /// (`ce_vram::foreign_source`, the producer's record or an import by resource id), for a
+    /// SRCCOPY BitBlt into VRAM or a staging buffer. Anything else on it is dropped.
+    Foreign,
 }
 
 /// Which engine executes a command.
@@ -878,6 +893,17 @@ pub fn plan(cmd: &Cmd, dst: Option<&Surface>, srcs: [Option<&Surface>; 2]) -> (E
     let all = [Some(dst), srcs[0], srcs[1]];
     if all.iter().flatten().any(|s| s.class == SurfaceClass::Unreachable) {
         return (Engine::Drop, Some(Why::Unreachable));
+    }
+    if all.iter().flatten().any(|s| s.class == SurfaceClass::Foreign) {
+        // Only a plain copy FROM the foreign image into a surface the executor writes.
+        let copy_from = matches!(*cmd, Cmd::BitBlt { rop, .. } if rop == rop::SRCCOPY)
+            && srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign)
+            && dst.class != SurfaceClass::Foreign;
+        return match (copy_from, dst.class) {
+            (true, SurfaceClass::Vram) => (Engine::Ce, None),
+            (true, _) => (Engine::Cpu, Some(Why::SystemSurface)),
+            (false, _) => (Engine::Drop, Some(Why::Unreachable)),
+        };
     }
     let all_vram = all.iter().flatten().all(|s| s.class == SurfaceClass::Vram);
     let ce_shape = match *cmd {
@@ -1498,6 +1524,13 @@ pub const COUNTERS: &[&str] = &[
     "GdiChUpUs",
     "GdiSlowUs",
     "GdiSlowOp",
+    // Foreign NVK images resolved; copies from them done on the copy engine; refused or failed
+    // (the last reason: 1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view
+    // refused, 6 channel down, 7 memory, 8 destination class).
+    "GdiFgnN",
+    "GdiFgnCe",
+    "GdiFgnFail",
+    "GdiFgnWhy",
 ];
 
 #[cfg(test)]
@@ -1514,6 +1547,10 @@ mod tests {
         assert_eq!(resolve_caps(2), Caps { on: false, reported: 0x100 });
         assert_eq!(resolve_caps(3), Caps { on: false, reported: 0x1000_0000 });
         assert_eq!(resolve_caps(4), Caps { on: false, reported: 0 });
+        assert_eq!(resolve_caps_with(1, true, true), resolve_caps(1));
+        assert_eq!(resolve_caps_with(1, false, true), Caps { on: false, reported: 0 });
+        assert_eq!(resolve_caps_with(1, true, false), Caps { on: false, reported: 0 });
+        assert_eq!(resolve_caps_with(2, false, false), resolve_caps(2));
         assert_eq!(resolve_caps(0xffff_ffff).reported, 0);
         let c = resolve_caps(1);
         assert!(c.on);
@@ -1762,6 +1799,12 @@ mod tests {
         assert_eq!(plan(&cf(cfrop::PATCOPY), Some(&sys), [None, None]), (Engine::Cpu, Some(Why::SystemSurface)));
         assert_eq!(plan(&cf(cfrop::DSTINVERT), Some(&a), [None, None]), (Engine::Cpu, Some(Why::Rop)));
         assert_eq!(plan(&Cmd::Escape, None, [None, None]), (Engine::Drop, None));
+        // A foreign NVK image: only a SRCCOPY source.
+        let fg = Surface { class: SurfaceClass::Foreign, ..vram(5) };
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Ce, None));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&sys), [Some(&fg), None]), (Engine::Cpu, Some(Why::SystemSurface)));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&b), None]), (Engine::Drop, Some(Why::Unreachable)));
+        assert_eq!(plan(&bb(rop::SRCOR, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Drop, Some(Why::Unreachable)));
     }
 
     #[test]

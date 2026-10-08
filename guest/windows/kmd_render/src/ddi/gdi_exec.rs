@@ -78,6 +78,10 @@ static SYS_MSK: AtomicU32 = AtomicU32::new(0);
 static CH_UP_US: AtomicU32 = AtomicU32::new(0);
 static SLOW_US: AtomicU32 = AtomicU32::new(0);
 static SLOW_OP: AtomicU32 = AtomicU32::new(0);
+/// Copies from a foreign NVK image done on the copy engine; failed (dropped); the last failing step.
+static FGN_CE: AtomicU32 = AtomicU32::new(0);
+static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
+static FGN_WHY: AtomicU32 = AtomicU32::new(0);
 
 fn sys_refused(why: u32, bit: u32) {
     SYS_WHY.store(why, Ordering::Relaxed);
@@ -128,7 +132,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 pub(crate) fn reset_for_start(_on: bool) {
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -170,6 +174,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiChUpUs", CH_UP_US.load(Ordering::Relaxed));
     w(b"GdiSlowUs", SLOW_US.load(Ordering::Relaxed));
     w(b"GdiSlowOp", SLOW_OP.load(Ordering::Relaxed));
+    w(b"GdiFgnCe", FGN_CE.load(Ordering::Relaxed));
+    w(b"GdiFgnFail", FGN_FAIL.load(Ordering::Relaxed));
+    w(b"GdiFgnWhy", FGN_WHY.load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
 }
 
@@ -198,7 +205,10 @@ fn ensure_channel(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
 fn needs_channel(op: &Op) -> bool {
     op.engine == Engine::Ce
         || op.why == Some(Why::SystemSurface)
-        || [op.dst, op.srcs[0], op.srcs[1]].iter().flatten().any(|s| s.class == SurfaceClass::Vram)
+        || [op.dst, op.srcs[0], op.srcs[1]]
+            .iter()
+            .flatten()
+            .any(|s| matches!(s.class, SurfaceClass::Vram | SurfaceClass::Foreign))
 }
 
 fn class_bit(c: SurfaceClass) -> u32 {
@@ -206,6 +216,7 @@ fn class_bit(c: SurfaceClass) -> u32 {
         SurfaceClass::Vram => 1,
         SurfaceClass::System => 2,
         SurfaceClass::Unreachable => 4,
+        SurfaceClass::Foreign => 8,
     }
 }
 
@@ -477,7 +488,61 @@ fn op_signature(op: &Op) -> u32 {
         | u32::from(big) << 24
 }
 
+/// A SRCCOPY BitBlt from a foreign NVK image into VRAM or a staging buffer, on the copy engine.
+/// There is no CPU fallback (the image has no CPU view): a failure drops the command.
+fn run_foreign(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
+    let (Some(dst), Some(src), Cmd::BitBlt { src: sr, dst: dr, .. }) = (op.dst, op.srcs[0], op.cmd) else {
+        return false;
+    };
+    let fail = |why: u32| {
+        FGN_FAIL.fetch_add(1, Ordering::Relaxed);
+        FGN_WHY.store(why, Ordering::Relaxed);
+        false
+    };
+    if glue::channel_state() != 0 {
+        return fail(6);
+    }
+    let Some(fs) = glue::foreign_source(passive, adapter, src.resource_id) else {
+        return fail(1);
+    };
+    let mut pairs: Vec<(Rect, Rect)> = Vec::new();
+    if pairs.try_reserve_exact(op.subs.len()).is_err() {
+        return fail(7);
+    }
+    for r in &op.subs {
+        let s = clip_to(&ga::bitblt_src(r, &dr, &sr), &src);
+        let d = ga::bitblt_src(&s, &sr, &dr);
+        if !s.is_empty() && s.width() == d.width() && s.height() == d.height() {
+            pairs.push((s, d));
+        }
+    }
+    let fourcc = glue::fourcc_of(dst.format);
+    let step = match dst.class {
+        SurfaceClass::Vram => glue::foreign_to_vram(passive, adapter, &fs, dst.resource_id, &pairs, fourcc),
+        SurfaceClass::System => {
+            let (dpc, _) = cmd_pitches(&op.cmd);
+            glue::foreign_to_standard(
+                passive, adapter, &fs, dst.resource_id, map_pitch(&dst, dpc), dst.width, dst.height, &pairs, fourcc,
+            )
+        }
+        _ => 8,
+    };
+    if step != 0 {
+        return fail(step);
+    }
+    FGN_CE.fetch_add(1, Ordering::Relaxed);
+    BLT_N.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    if op.engine != Engine::Drop && op.srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign) {
+        if !run_foreign(passive, adapter, op) {
+            crate::ddi::gdi_accel::note_why(Why::CeFailed);
+            crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
     match op.engine {
         Engine::Drop => {
             if !matches!(op.cmd, Cmd::Escape) {
@@ -688,8 +753,13 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                         submit_and_wait(passive, op, v, Some(v))
                     })
                 }
+                (SurfaceClass::System, SurfaceClass::System) => {
+                    // Staging to another staging buffer: both views in one content transaction.
+                    let a = (src.resource_id, map_pitch(&src, spc), src.width, src.height);
+                    let b = (dst.resource_id, map_pitch(&dst, dpc), dst.width, dst.height);
+                    glue::with_standard_pair(passive, adapter, a, b, |sv, dv| submit_and_wait(passive, op, dv, Some(sv)))
+                }
                 _ => {
-                    // Staging to another staging buffer: no copy-engine view of two buffers at once.
                     sys_refused(1, 1);
                     SYS_REF.fetch_add(1, Ordering::Relaxed);
                     return false;
@@ -775,7 +845,7 @@ fn read_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rec
                 out[y * w * 4..(y + 1) * w * 4].copy_from_slice(&tmp[from..from + w * 4]);
             }
         }
-        SurfaceClass::Unreachable => return Err(Why::Unreachable),
+        SurfaceClass::Unreachable | SurfaceClass::Foreign => return Err(Why::Unreachable),
     }
     Ok(out)
 }
@@ -798,7 +868,7 @@ fn write_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, re
                 Err(Why::CpuFailed)
             }
         }
-        SurfaceClass::Unreachable => Err(Why::Unreachable),
+        SurfaceClass::Unreachable | SurfaceClass::Foreign => Err(Why::Unreachable),
     }
 }
 

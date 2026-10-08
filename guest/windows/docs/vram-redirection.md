@@ -476,6 +476,19 @@ buffers whose D3DDDIFORMAT has no DXGI name (or is `A8B8G8R8`) carry the legacy 
 is authored as `width * 4` regardless, so `layout_standard` now records them as `XRGB8888` bytes
 (nothing imports a staging buffer as an image; the copy engine copies bytes).
 
+Foreign NVK images as GDI sources (362.1: 14-15 GDI commands per session read a UMD optimal image
+with a foreign layout, 1908x910, dropped): `ce_vram::foreign_source(passive, adapter, resid)` and
+`ce_vram::foreign_copy(&src, src_rect, &dst, x, y, dst_fourcc)`. With a record the route validated for
+that image at a Present (`ce_present_route::source_record`, the latest per source, the `h_client` rule
+re-checked), the producer's own objects are used (`ce_dup`) and the copy ACQUIREs its semaphore.
+Without one, the KMD imports the image by resource id into the channel's client (the host's
+`RmResourceImport` into the channel's DRM file under `authorize_kmd`, `GEM_EXPORT_NVKMS`,
+`OS_UNIX_IMPORT_OBJECT_FROM_FD`: NVK's own route) and maps it with the modifier's page kind; no acquire
+(the image is copied as it is in memory). Any rectangle: pitch-linear by address, block-linear by the
+copy's source origin. Counters `RvFgnRec`, `RvFgnImp`, `RvFgnFail`, `RvFgnWhy`. The KMD's imports do
+not count in `FgRi*`. Found on the way: the route added the source plan's offset twice
+(`ce_dup`'s VA already has it); harmless for NVK's offset-0 images, fixed.
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
@@ -661,6 +674,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiSysWhy`, `GdiSysMsk` | why the last staging copy was refused (1 staging to staging, 2 the VRAM side's mapping, 3 channel down, else `ce_sysmem`'s fail word: 0x8003_00EA not system-resident, 0x8005_00EB uncovered, 0x8001_00E4 busy, ...), and every class seen (1, 2, 4 not system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down) |
 | `GdiUnrN`, `GdiUnrK`, `GdiUnrWH` | unreachable surfaces resolved; the last one's identity (`storage << 24 \| kind << 16 \| foreign layout << 8 \| foreign identity << 9 \| direct scanout << 10`; storage 0 UMD OPTIMAL image, 1 cross-context image, 2 standard buffer) and extent |
 | `GdiChUpUs`, `GdiSlowUs`, `GdiSlowOp` | the channel bring-up's time, outside every job's `GdiUs`; the slowest command's time and signature (`opcode \| engine << 4 \| dst class << 8 \| src class << 12 \| sub-rects << 16 \| over-1-MPixel << 24`) |
+| `GdiFgnN`, `GdiFgnCe`, `GdiFgnFail`, `GdiFgnWhy` | foreign NVK images resolved (`SurfaceClass::Foreign`: UMD optimal image with an RM identity); copies from them done on the copy engine; failed (dropped: the image has no CPU view); the last failing step (1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view refused, 6 channel down, 7 memory, 8 destination class) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
@@ -732,6 +746,16 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   a staging buffer under 64 pixels on a side stays a Venus blob (`rm_client::surface_layout`). The
   28 ms `GdiUsMax` included the channel's bring-up inside the first job; the bring-up now runs
   before the job's clock (`GdiChUpUs`), and `GdiSlowUs`/`GdiSlowOp` name the slowest command.
+* **Since 364.1:** the unreachable class of 362.1 (`GdiUnrK` 0x10300: storage 0, kind 1, foreign
+  layout and identity, 1908x910, a window's NVK image) is `SurfaceClass::Foreign`: a SRCCOPY BitBlt from
+  it into VRAM or a staging buffer is copy-engine copies through the V2 branch's
+  `ce_vram::foreign_source`/`foreign_copy` (the producer's acquire when the route saw its record at a
+  Present, otherwise an import by resource id and no acquire); every other command on it is dropped.
+  A copy between two different staging buffers runs through `ce_sysmem::with_standard_pair` (one
+  content transaction, both views), so `GdiSysWhy` 1 should not recur; a 362.1 run showed that class
+  at 22 ms on the CPU. Copies between R G B and B G R surfaces exchange bytes 0 and 2 (remap on the CE,
+  swap on the CPU). `GdiAccel=1` reports its caps only with `RedirVram=1` and `RmCopyEngine=1`
+  (row a of the duplication A/B: without them the desktop was garbage).
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.
