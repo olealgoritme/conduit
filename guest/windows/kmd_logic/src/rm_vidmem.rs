@@ -55,6 +55,8 @@ pub mod off {
     /// GDI lookup tables (`D3DKMDT_GDISURFACE_LOOKUPTABLE`) stay Venus blobs; the staging
     /// buffers still come from RM system memory unless `STAGING_RM` is set too.
     pub const LUT_RM: u32 = 0x400;
+    /// A new VRAM surface is NOT cleared at its first copy-engine mapping (A/B for the clear).
+    pub const CLEAR: u32 = 0x800;
     /// The Present hook (`ddi/vram_redirect.rs`) skips every Blt with a VRAM surface (counted).
     pub const PRESENT_HOOK: u32 = 0x80;
     /// OPT-IN: the CPU helpers reuse blob views (`build_paging_buffer`). Off by default since 364.1:
@@ -836,7 +838,7 @@ pub fn bounce_copy(vram: &Surface, rect: Rect, dir: Dir) -> Result<CopyRect, Cop
 /// driver checks the list).
 pub const COUNTERS: &[&str] = &[
     // the service (`vidmem.rs`)
-    "RvKnob", "RvOffEff", "RvWaitTmo", "RvCleared", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
+    "RvKnob", "RvOffEff", "RvWaitTmo", "RvCleared", "RvClrFail", "RvClrSkip", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
     "RvBytes", "RvFreed", "RvBring", "RvMs", "RvMsMax", "RvSoft", "RvLeak", "RvOpen", "RvOpenFg",
     "RvOpenLay", "RvOpenPid", "RvOpenNoRm", "RvOpenNoRmPid",
     // the channel side (`ce_vram.rs`)
