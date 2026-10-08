@@ -850,7 +850,7 @@ pub const COUNTERS: &[&str] = &[
     "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvBookReent", "RvXfer", "RvXferFail",
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
     // the Present (`ddi/vram_redirect.rs`)
-    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy", "RvSyncTry", "RvSyncWhy", "RvMkNone", "RvMkRes", "RvMkStr", "RvMkVramNo", "RvSyPix", "RvSyPixN", "RvSyPixNz", "RvPrUs", "RvPrN", "RvPrMax", "RvRtUs", "RvRtN", "RvRtMax", "RvSyFsUs", "RvSyFsN", "RvSyFsMax", "RvSyDsUs", "RvSyDsN", "RvSyDsMax", "RvSySubUs", "RvSySubN", "RvSySubMax", "RvSyWtUs", "RvSyWtN", "RvSyWtMax",
+    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy", "RvSyncTry", "RvSyncWhy", "RvMkNone", "RvMkRes", "RvMkStr", "RvMkVramNo", "RvSyPix", "RvSyPixN", "RvSyPixNz", "RvSyDst", "RvSySrc", "RvSyWH", "RvPrUs", "RvPrN", "RvPrMax", "RvRtUs", "RvRtN", "RvRtMax", "RvSyFsUs", "RvSyFsN", "RvSyFsMax", "RvSyDsUs", "RvSyDsN", "RvSyDsMax", "RvSySubUs", "RvSySubN", "RvSySubMax", "RvSyWtUs", "RvSyWtN", "RvSyWtMax",
     // foreign NVK sources for GDI commands (`ce_vram.rs`)
     "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy", "RvFgnWrite",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)

@@ -86,6 +86,12 @@ static SYNC_WHY: AtomicU32 = AtomicU32::new(0);
 static PIX: AtomicU32 = AtomicU32::new(0);
 static PIX_N: AtomicU32 = AtomicU32::new(0);
 static PIX_NZ: AtomicU32 = AtomicU32::new(0);
+/// The sampled copy's destination and source resource ids (`RvSyDst`, `RvSySrc`) and its
+/// destination rectangle's size (`RvSyWH`, width << 16 | height): to compare with what DWM
+/// imports for the window (its umd log).
+static PIX_DST: AtomicU32 = AtomicU32::new(0);
+static PIX_SRC: AtomicU32 = AtomicU32::new(0);
+static PIX_WH: AtomicU32 = AtomicU32::new(0);
 static MK_NONE: AtomicU32 = AtomicU32::new(0);
 static MK_RES: AtomicU32 = AtomicU32::new(0);
 static MK_STR: AtomicU32 = AtomicU32::new(0);
@@ -162,6 +168,12 @@ pub(crate) fn reset_for_start() {
         &MK_RES,
         &MK_STR,
         &MK_VRAM_NO,
+        &PIX,
+        &PIX_N,
+        &PIX_NZ,
+        &PIX_DST,
+        &PIX_SRC,
+        &PIX_WH,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -186,6 +198,9 @@ fn publish() {
     rec(b"RvSyPix", PIX.load(Ordering::Relaxed));
     rec(b"RvSyPixN", PIX_N.load(Ordering::Relaxed));
     rec(b"RvSyPixNz", PIX_NZ.load(Ordering::Relaxed));
+    rec(b"RvSyDst", PIX_DST.load(Ordering::Relaxed));
+    rec(b"RvSySrc", PIX_SRC.load(Ordering::Relaxed));
+    rec(b"RvSyWH", PIX_WH.load(Ordering::Relaxed));
     rec(b"RvMkNone", MK_NONE.load(Ordering::Relaxed));
     rec(b"RvMkRes", MK_RES.load(Ordering::Relaxed));
     rec(b"RvMkStr", MK_STR.load(Ordering::Relaxed));
@@ -199,9 +214,23 @@ fn publish() {
     vidmem::publish_counters();
 }
 
-/// Throttled publish: every 64th VRAM Blt, and every skip.
+/// Throttled publish: every 64th VRAM Blt, and every skip. With the mirror thread running, a
+/// request for its `Nv*` pass (which calls [`publish_if_seen`]); a publish is some fifty registry
+/// writes, far too much inline in a Present.
 fn maybe_publish(force: bool) {
     if force || SEEN.load(Ordering::Relaxed) % 64 == 1 {
+        if crate::ddi::mirror_thread::running() {
+            crate::ddi::mirror_thread::request_bits(crate::ddi::mirror_thread::NV);
+        } else {
+            publish();
+        }
+    }
+}
+
+/// The `Nv*` mirror pass: everything [`publish`] writes, once a VRAM Blt was seen or the VRAM
+/// service has objects.
+pub(crate) fn publish_if_seen() {
+    if SEEN.load(Ordering::Relaxed) != 0 || vidmem::any_live() {
         publish();
     }
 }
@@ -500,6 +529,12 @@ fn sync_foreign(
         .is_ok()
         {
             let v = u32::from_le_bytes(px);
+            PIX_DST.store(destination, Ordering::Relaxed);
+            PIX_SRC.store(source, Ordering::Relaxed);
+            PIX_WH.store(
+                (dst_rect.right - dst_rect.left) << 16 | (dst_rect.bottom - dst_rect.top),
+                Ordering::Relaxed,
+            );
             PIX.store(v, Ordering::Relaxed);
             PIX_N.fetch_add(1, Ordering::Relaxed);
             if v & 0x00ff_ffff != 0 {
