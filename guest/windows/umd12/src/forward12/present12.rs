@@ -162,6 +162,25 @@ unsafe extern "system" fn get_present_private_driver_data_size(
 /// must be live for the call when non-null. `h_queue`'s private block, when
 /// non-null, must be one `pfnCreateCommandQueue` wrote.
 unsafe extern "system" fn present(
+    h_command_list: ddi12::D3D12DDI_HCOMMANDLIST,
+    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    p_present: *const ddi12::D3D12DDIARG_PRESENT_0001,
+    p_out: *mut ddi12::D3D12DDI_PRESENT_0051,
+    p_contexts: *mut ddi12::D3D12DDI_PRESENT_CONTEXTS_0051,
+    p_hw_queues: *mut ddi12::D3D12DDI_PRESENT_HWQUEUES_0051,
+) {
+    // Per-frame accounting (`nvk12::FrameStats`): one present closes a frame.
+    let started = std::time::Instant::now();
+    // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
+    unsafe { present_body(h_command_list, h_queue, p_present, p_out, p_contexts, p_hw_queues) };
+    super::nvk12::FRAME_STATS.note_present(started);
+}
+
+/// The body of [`present`].
+///
+/// # Safety
+/// As [`present`].
+unsafe fn present_body(
     _h_command_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     p_present: *const ddi12::D3D12DDIARG_PRESENT_0001,
