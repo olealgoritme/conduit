@@ -64,6 +64,20 @@ const SUBKEY: &CStr = c"SOFTWARE\\Helios";
 /// The single audited FFI site. Every knob in every Helios UMD funnels through
 /// it.
 pub fn reg_dword(name: &CStr) -> Option<u32> {
+    reg_dword_at(SUBKEY, name)
+}
+
+/// The KMD's service key, where its own knobs live (`RedirVram`, `GdiAccel`, ...): read by a UMD
+/// only to follow a KMD configuration it cannot otherwise see.
+const KMD_SERVICE_SUBKEY: &CStr = c"SYSTEM\\CurrentControlSet\\Services\\helios_kmd_render";
+
+/// Read one REG_DWORD of the KMD's service key, or `None` if it is absent or unreadable.
+pub fn kmd_service_dword(name: &CStr) -> Option<u32> {
+    reg_dword_at(KMD_SERVICE_SUBKEY, name)
+}
+
+/// [`reg_dword`] under `subkey` of `HKLM`: the single audited FFI site.
+fn reg_dword_at(subkey: &CStr, name: &CStr) -> Option<u32> {
     let mut value: u32 = 0;
     let mut len: u32 = 4;
     // SAFETY: both names are NUL-terminated `CStr`s that outlive the call;
@@ -73,7 +87,7 @@ pub fn reg_dword(name: &CStr) -> Option<u32> {
     let rc = unsafe {
         RegGetValueA(
             HKEY_LOCAL_MACHINE,
-            SUBKEY.as_ptr().cast(),
+            subkey.as_ptr().cast(),
             name.as_ptr().cast(),
             RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
             core::ptr::null_mut(),
