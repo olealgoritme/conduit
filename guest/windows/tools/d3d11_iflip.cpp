@@ -29,6 +29,16 @@
 //     buffers=N   back buffer count (default 2)
 //     adapter=N   DXGI adapter index (default: the first adapter whose name contains "Helios",
 //                 else the default adapter)
+//     topmost     WS_EX_TOPMOST on the borderless window (nothing, the taskbar included, can sit
+//                 above it)
+//     fg          take the foreground at start (a process started by the task scheduler is not
+//                 allowed to: SetForegroundWindow fails and the console or the taskbar stays
+//                 active, which keeps the window from being treated as full screen)
+//     noconsole   detach from (and so hide) this program's own console window
+// Every second it also logs whether the window is the foreground window and which window is
+// under the output's four corners and centre (anything but this window there is an overlap that
+// forces composition), and once the output's hardware composition support
+// (IDXGIOutput6::CheckHardwareCompositionSupport).
 // Logs to stdout and to d3d11_iflip.txt in the current directory.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -118,6 +128,7 @@ int main(int argc, char** argv) {
   int seconds = 20;
   bool windowed = false, interval0 = false, tearing = false, rgba = false;
   int buffers = 2, adapterIndex = -1;
+  bool topmost = false, takeFg = false, noConsole = false;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (a[0] >= '0' && a[0] <= '9') seconds = atoi(a);
@@ -128,13 +139,19 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "rgba")) rgba = true;
     else if (!strncmp(a, "buffers=", 8)) buffers = atoi(a + 8);
     else if (!strncmp(a, "adapter=", 8)) adapterIndex = atoi(a + 8);
+    else if (!strcmp(a, "topmost")) topmost = true;
+    else if (!strcmp(a, "fg")) takeFg = true;
+    else if (!strcmp(a, "noconsole")) noConsole = true;
     else L("unknown option %s", a);
   }
   if (buffers < 2) buffers = 2;
   if (buffers > 16) buffers = 16;
-  L("d3d11_iflip pid=%lu seconds=%d %s interval=%d tearing=%d cursor=%s format=%s buffers=%d",
+  L("d3d11_iflip pid=%lu seconds=%d %s interval=%d tearing=%d cursor=%s format=%s buffers=%d "
+    "topmost=%d fg=%d noconsole=%d",
     GetCurrentProcessId(), seconds, windowed ? "window" : "borderless", interval0 ? 0 : 1, tearing,
-    g_hide_cursor ? "hidden" : "visible", rgba ? "RGBA8" : "BGRA8", buffers);
+    g_hide_cursor ? "hidden" : "visible", rgba ? "RGBA8" : "BGRA8", buffers, topmost, takeFg,
+    noConsole);
+  if (noConsole) FreeConsole();
 
   IDXGIFactory2* factory = nullptr;
   HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory2), (void**)&factory);
@@ -175,6 +192,14 @@ int main(int argc, char** argv) {
       L("output %ls desktop=%ld,%ld-%ld,%ld mode=%lux%lu@%lu attached=%d", od.DeviceName,
         target.left, target.top, target.right, target.bottom, dm.dmPelsWidth, dm.dmPelsHeight,
         dm.dmDisplayFrequency, od.AttachedToDesktop);
+      IDXGIOutput6* o6 = nullptr;
+      if (SUCCEEDED(out->QueryInterface(__uuidof(IDXGIOutput6), (void**)&o6))) {
+        UINT hcs = 0;
+        HRESULT h = o6->CheckHardwareCompositionSupport(&hcs);
+        L("output hardware composition support hr=0x%08x flags=0x%x (FULLSCREEN=1 WINDOWED=2 "
+          "CURSOR_STRETCHED=4)", (unsigned)h, hcs);
+        o6->Release();
+      }
       out->Release();
     } else {
       L("adapter has no output 0: borderless falls back to the primary monitor");
@@ -201,11 +226,30 @@ int main(int argc, char** argv) {
   } else {
     width = target.right - target.left;
     height = target.bottom - target.top;
-    hwnd = CreateWindowExA(0, "iflip", "d3d11-iflip", WS_POPUP, target.left, target.top, width,
-                           height, nullptr, nullptr, wc.hInstance, nullptr);
+    hwnd = CreateWindowExA(topmost ? WS_EX_TOPMOST : 0, "iflip", "d3d11-iflip", WS_POPUP,
+                           target.left, target.top, width, height, nullptr, nullptr, wc.hInstance,
+                           nullptr);
   }
   ShowWindow(hwnd, SW_SHOW);
-  SetForegroundWindow(hwnd);
+  if (takeFg) {
+    // The documented ways a background process may take the foreground: attach to the input of
+    // the thread that owns it, and a synthetic key event (the foreground lock yields to input).
+    HWND fgw = GetForegroundWindow();
+    DWORD fgThread = fgw ? GetWindowThreadProcessId(fgw, nullptr) : 0;
+    DWORD me = GetCurrentThreadId();
+    if (fgThread && fgThread != me) AttachThreadInput(me, fgThread, TRUE);
+    keybd_event(VK_MENU, 0, 0, 0);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    SetWindowPos(hwnd, topmost ? HWND_TOPMOST : HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    SetFocus(hwnd);
+    if (fgThread && fgThread != me) AttachThreadInput(me, fgThread, FALSE);
+  } else {
+    SetForegroundWindow(hwnd);
+  }
+  L("foreground after start: %s (foreground hwnd=%p)",
+    GetForegroundWindow() == hwnd ? "this window" : "ANOTHER window", GetForegroundWindow());
   RECT cr{};
   GetClientRect(hwnd, &cr);
   L("hwnd=%p client=%ldx%ld", hwnd, cr.right - cr.left, cr.bottom - cr.top);
@@ -301,9 +345,23 @@ int main(int argc, char** argv) {
       HRESULT hs = sc->GetFrameStatistics(&fs);
       UINT lastCount = 0;
       sc->GetLastPresentCount(&lastCount);
-      L("t=%5.1fs fps=%6.1f dxgi_mode=%s stats_hr=0x%08x present=%u refresh=%u sync_refresh=%u last=%u",
+      // Overlap check: the window under the four corners and the centre of the output.
+      POINT pts[5] = {{target.left, target.top}, {target.right - 1, target.top},
+                      {target.left, target.bottom - 1}, {target.right - 1, target.bottom - 1},
+                      {(target.left + target.right) / 2, (target.top + target.bottom) / 2}};
+      int covered = 0;
+      HWND other = nullptr;
+      for (auto& p : pts) {
+        HWND w = WindowFromPoint(p);
+        if (w == hwnd) covered++;
+        else if (!other) other = w;
+      }
+      char otherClass[64] = "";
+      if (other) GetClassNameA(other, otherClass, sizeof(otherClass));
+      L("t=%5.1fs fps=%6.1f dxgi_mode=%s stats_hr=0x%08x present=%u refresh=%u sync_refresh=%u last=%u "
+        "fg=%d points_on_us=%d/5 other=%p(%s)",
         t, framesSec / dt, mode, (unsigned)hs, fs.PresentCount, fs.PresentRefreshCount,
-        fs.SyncRefreshCount, lastCount);
+        fs.SyncRefreshCount, lastCount, GetForegroundWindow() == hwnd, covered, other, otherClass);
       framesSec = 0;
       last = now;
     }

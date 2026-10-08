@@ -533,7 +533,9 @@ pub(crate) fn nvk_rm_copy_record() -> bool {
 /// 0 (default) = never (the behaviour before this knob); 1 = yes when dxgkrnl
 /// reports DirectFlip support for the Helios adapter (KMTQAITYPE_DIRECTFLIP_SUPPORT,
 /// i.e. the KMD's SupportDirectFlip cap) and the two resources have the same
-/// size and format; 2 = yes whenever size and format match (test lever).
+/// size and format; 2 = yes whenever size and format match (test lever); 3 = as 1, and also only
+/// for a pair the KMD can scan out as is (one of R8G8B8A8 / B8G8R8A8 / B8G8R8X8 UNORM, one sample,
+/// one mip, one slice). 3 was briefly the meaning of 1 (driver 388.1).
 /// Windows decides independent flip and the blt-to-flip swap-effect upgrade
 /// partly from this answer.
 pub(crate) fn direct_flip_support() -> u32 {
