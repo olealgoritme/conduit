@@ -118,6 +118,26 @@ pub(crate) fn vram_write(
     retry_busy(passive, || ce_vram::transfer(passive, adapter, resource_id, r, rv::Dir::Upload, data, row_pitch)).is_some()
 }
 
+/// Run `f` with KMD standard buffer `resource_id` (`pitch` bytes per row, `width` x `height`) as a
+/// copy-engine surface over its system pages (`ce_sysmem::with_standard`: takes the content
+/// transaction, then the channel's I/O). `f` must wait for everything it submits and must not
+/// resolve a VRAM surface (do that before). `None`: refused (not system-resident, partial leases,
+/// busy, no channel, an RM timeout). PASSIVE, no lock held.
+pub(crate) fn with_standard<R>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    f: impl FnOnce(&CeView) -> R,
+) -> Option<R> {
+    crate::ddi::ce_sysmem::with_standard(passive, adapter, resource_id, pitch, width, height, |s| {
+        f(&CeView { va: s.va, pitch: s.pitch, width: s.width, height: s.height })
+    })
+    .ok()
+}
+
 /// `out.len()` bytes at `offset` of KMD standard buffer `resource_id`'s authoritative CPU view
 /// (`read_standard_buffer`). PASSIVE.
 pub(crate) fn std_read(

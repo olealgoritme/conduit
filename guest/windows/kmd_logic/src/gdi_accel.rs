@@ -1450,6 +1450,11 @@ pub const COUNTERS: &[&str] = &[
     // and the executor thread's state (1 running, 0 on the HPD worker).
     "GdiRdBk",
     "GdiThr",
+    // Copies and fills with a staging buffer on one side run on the copy engine over the buffer's
+    // system pages; refused (the CPU instead); failed after the mapping (the CPU instead).
+    "GdiSysCe",
+    "GdiSysRef",
+    "GdiSysFail",
 ];
 
 #[cfg(test)]

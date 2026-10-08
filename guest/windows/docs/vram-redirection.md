@@ -634,6 +634,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, jobs claimed by context because the record was missing, the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
 | `GdiChUp`, `GdiCeWhy` | channel bring-ups the executor asked for; why the last CE attempt failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + channel state when it could not come up: 17 cold, 18 disabled, 19 broken, 20 other) |
 | `GdiRdBk`, `GdiThr` | copies from a VRAM surface into a standard buffer (GDI readback); the executor's own thread running (1) or the HPD worker in charge (0) |
+| `GdiSysCe`, `GdiSysRef`, `GdiSysFail` | copies/fills with a staging buffer on one side done on the copy engine over its system pages; refused (CPU instead); failed after the mapping (CPU instead) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
@@ -680,11 +681,16 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   - the executor runs on its own thread (`ddi/gdi_thread.rs`, started by the first GDI buffer,
     joined in `stop_hpd`; `GdiThr`), so a slow job no longer holds the HPD worker;
   - `GdiRdBk` counts copies from a VRAM surface into a standard buffer (a GDI screen or window read).
-  Still open: a copy between a staging buffer and VRAM is a CPU memcpy plus a bounce copy, not one
-  copy-engine copy from the staging buffer's pages (that needs a copy-engine mapping of the staging
-  buffer's system pages, `ce_route::create_dst`'s OS descriptor, which only exists while VidMm holds
-  the buffer in system pages); AlphaBlend cannot run on the copy engine (it has no blend unit) and
-  stays on the CPU.
+  AlphaBlend cannot run on the copy engine (it has no blend unit) and stays on the CPU.
+* **Since 361.1:** a SRCCOPY BitBlt between a staging buffer and VRAM (either direction, the readback
+  included) and a PATCOPY ColorFill into a staging buffer are ONE copy-engine copy or fill over the
+  staging buffer's system pages (`ce_sysmem::with_standard`, the V2 branch's OS-descriptor mapping,
+  cached per buffer). The VRAM side is resolved first, outside the content transaction; the pushes
+  are waited for inside it. Refused (the buffer is in the Venus window, a stale system copy, partial
+  leases, more than 64 MiB, the channel busy, a staging-to-staging copy): the CPU path as before.
+  Counters `GdiSysCe` (done on the copy engine, also counted in `GdiBltN`/`GdiFillN`), `GdiSysRef`
+  (refused), `GdiSysFail` (failed after the mapping); the V2 side's `RvSysMade`/`RvSysHit`/
+  `RvSysRefuse`/`RvSysWhy`.
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.
