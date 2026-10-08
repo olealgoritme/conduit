@@ -158,6 +158,11 @@ pub(crate) fn stop() {
     let _ = unsafe { wdk_sys::ntddk::ZwClose(h as wdk_sys::HANDLE) };
 }
 
+/// The executor's idle wait: on its expiry the last burst's counters are mirrored.
+const IDLE_PUBLISH_100NS: i64 = 300 * 10_000;
+/// `STATUS_TIMEOUT` of a timed `KeWaitForSingleObject`.
+const STATUS_WAIT_TIMEOUT: i32 = 0x0000_0102;
+
 unsafe extern "C" fn routine(_context: *mut c_void) {
     // SAFETY: a system thread runs at PASSIVE_LEVEL.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
@@ -170,9 +175,17 @@ unsafe extern "C" fn routine(_context: *mut c_void) {
     }
     loop {
         // SAFETY: initialised event; a kick or a stop wakes it.
-        let _ = unsafe { KeWaitForSingleObject(REQ.0.get() as PVOID, 0, 0, 0, core::ptr::null_mut()) };
+        // A bounded wait: an idle period mirrors the counters of the last burst
+        // (`gdi_exec::publish_if_due`, throttled while jobs run).
+        let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        timeout.QuadPart = -IDLE_PUBLISH_100NS;
+        let st = unsafe { KeWaitForSingleObject(REQ.0.get() as PVOID, 0, 0, 0, &mut timeout) };
         if STOPPING.load(Ordering::Acquire) != 0 {
             break;
+        }
+        if st == STATUS_WAIT_TIMEOUT {
+            crate::ddi::gdi_exec::publish_if_due(true);
+            continue;
         }
         let a = ADAPTER.load(Ordering::Acquire);
         if a == 0 {

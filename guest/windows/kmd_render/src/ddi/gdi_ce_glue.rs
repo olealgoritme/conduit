@@ -151,7 +151,6 @@ pub(crate) fn standard_to_foreign(
     let r = crate::ddi::ce_sysmem::with_standard(passive, adapter, src_resource_id, pitch, width, height, |src| {
         foreign_writes(passive, src, src_fourcc, dst, pairs)
     });
-    crate::ddi::ce_sysmem::publish_counters();
     r.unwrap_or(5)
 }
 
@@ -188,7 +187,6 @@ pub(crate) fn foreign_to_standard(
     let r = crate::ddi::ce_sysmem::with_standard(passive, adapter, dst_resource_id, pitch, width, height, |dst| {
         foreign_copies(passive, src, dst, pairs, fourcc)
     });
-    crate::ddi::ce_sysmem::publish_counters();
     r.unwrap_or(5)
 }
 
@@ -323,9 +321,8 @@ pub(crate) fn with_standard<R>(
     let r = crate::ddi::ce_sysmem::with_standard(passive, adapter, resource_id, pitch, width, height, |s| {
         f(&CeView { va: s.va, pitch: s.pitch, width: s.width, height: s.height })
     });
-    // `ce_sysmem` mirrors its `RvSys*` counters only after a success; a refusal is mirrored here
-    // too, so a session where everything is refused still shows why.
-    crate::ddi::ce_sysmem::publish_counters();
+    // `ce_sysmem` mirrors its `RvSys*` counters itself (refusals, the first call, every 64th): a
+    // publish here on every call was a dozen registry writes per GDI command.
     r.map_err(refusal)
 }
 
@@ -341,7 +338,6 @@ pub(crate) fn with_standard_pair<R>(
 ) -> Result<R, SysRefusal> {
     let view = |s: &ce_vram::CeSurface| CeView { va: s.va, pitch: s.pitch, width: s.width, height: s.height };
     let r = crate::ddi::ce_sysmem::with_standard_pair(passive, adapter, a, b, |x, y| f(&view(x), &view(y)));
-    crate::ddi::ce_sysmem::publish_counters();
     r.map_err(refusal)
 }
 

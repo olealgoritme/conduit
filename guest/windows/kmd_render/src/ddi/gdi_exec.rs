@@ -657,9 +657,34 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread
         }
     }
     if ran > 0 {
-        crate::ddi::gdi_accel::publish_counters();
+        DIRTY.store(1, Ordering::Relaxed);
+        publish_if_due(false);
     }
     more
+}
+
+/// Executed jobs whose counters are not mirrored yet.
+static DIRTY: AtomicU32 = AtomicU32::new(0);
+/// When the counters were last mirrored (100 ns).
+static LAST_PUBLISH: AtomicU64 = AtomicU64::new(0);
+/// The counters are mirrored at most this often while jobs run: one publish is ~100 registry
+/// writes (~100 µs each), which after every worker pass was most of a short job's cost.
+const PUBLISH_EVERY_100NS: u64 = 250 * 10_000;
+
+/// Mirror the counters when some changed and the last publish is `PUBLISH_EVERY_100NS` old (or
+/// `force`). The executor thread calls it after each pass and when it idles (`gdi_thread`), so the
+/// last burst's counters land within one idle period. PASSIVE.
+pub(crate) fn publish_if_due(force: bool) {
+    if DIRTY.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let now = now_100ns();
+    if !force && now.wrapping_sub(LAST_PUBLISH.load(Ordering::Relaxed)) < PUBLISH_EVERY_100NS {
+        return;
+    }
+    DIRTY.store(0, Ordering::Relaxed);
+    LAST_PUBLISH.store(now, Ordering::Relaxed);
+    crate::ddi::gdi_accel::publish_counters();
 }
 
 /// One pixel of a surface (VRAM through the bounce buffer, a staging buffer through its CPU view).
