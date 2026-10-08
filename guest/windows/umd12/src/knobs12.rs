@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 21] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 22] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -331,6 +331,7 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 21] {
         // Appended (measurement).
         ("Umd12DdiTimes", umd12_ddi_times() as u32),
         ("Umd12WaitSplit", umd12_wait_split() as u32),
+        ("Umd12MergeEcl", umd12_merge_ecl() as u32),
     ]
 }
 
@@ -500,6 +501,19 @@ pub(crate) static UMD12_WAIT_SPLIT: BoolKnob = BoolKnob::new(c"Umd12WaitSplit", 
 #[inline]
 pub(crate) fn umd12_wait_split() -> bool {
     UMD12_WAIT_SPLIT.get()
+}
+
+/// `Umd12MergeEcl` (default 0; DIAGNOSTIC, unsafe for applications that
+/// signal or wait between ExecuteCommandLists): with `Nvk12EclSync=2`, hold
+/// each ECL's HE12 v4 packet and let the next ECL's fence stand for it, so one
+/// packet completes a run of ECLs (`queue.rs` `MergePending`). Measures what
+/// fewer packets per frame would give; see the type's docs for why it cannot
+/// be made safe without driver-backed fences. Read once per process.
+pub(crate) static UMD12_MERGE_ECL: BoolKnob = BoolKnob::new(c"Umd12MergeEcl", false);
+
+#[inline]
+pub(crate) fn umd12_merge_ecl() -> bool {
+    UMD12_MERGE_ECL.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {
