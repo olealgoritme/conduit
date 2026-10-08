@@ -333,6 +333,7 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
 /// |---:|---|
 /// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. Falls back to 1 if the fence cannot be created |
 /// | 1 | CPU wait: ExecuteCommandLists returns only after its work completed (2 s cap per call, then it proceeds and counts a timeout). The default |
+/// | 2 | ECL fence: each ECL submits an `HE12` v4 record naming an RM fence the engine signals after the batch; the KMD withholds the packet's DMA completion until it fires. Nothing waits and batches pipeline. Needs NVK helios_icd_interface v7 and a KMD that takes RM fences in `HE12` v4 (`HELIOS_ICD_CAP_PRESENT_FENCE_KMD`); without them, and for a batch whose fence could not be made or whose Render is refused, it acts as 1 |
 ///
 /// Default 1 since 2026-10-06: with 0, Basemark GPU DX12 on NVK deadlocks after
 /// its first frame (the ECL worker waits in librmclient for the engine's
@@ -373,7 +374,7 @@ pub(crate) fn nvk12_ecl_spin_us() -> u32 {
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {
-    NVK12_ECL_SYNC.get().min(1)
+    NVK12_ECL_SYNC.get().min(2)
 }
 
 pub(crate) fn nvk12_present_mode() -> u32 {
