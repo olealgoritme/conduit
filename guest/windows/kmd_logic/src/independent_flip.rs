@@ -60,9 +60,41 @@ pub const KNOB_REDIR_SKIP: &str = "IdfRedirSkip";
 pub const KNOBS: [&str; 2] = [KNOB_ENABLE, KNOB_REDIR_SKIP];
 
 /// Whether a Present with these `DXGK_PRESENTFLAGS` is an independent-flip candidate on the Blt arm
-/// (`RedirectedFlip` set, `Flip` clear): the presents `IdfRedirSkip` completes with no copy.
+/// (`RedirectedFlip` set, `Flip` clear).
 pub const fn redirected_blt(present_flags: u32) -> bool {
     present_flags & crate::flip_flags::PRESENT_REDIRECTED_FLIP != 0 && present_flags & (1 << 2) == 0
+}
+
+/// What the KMD does with a Blt-arm Present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedirectedBlt {
+    /// Not an independent-flip candidate, or `IndepFlip` is off: the ordinary Blt arm.
+    Ordinary,
+    /// A candidate with no destination allocation (driver 392.1: source 1, destination 0, every one
+    /// failed `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` on the Blt arm's DMA-size check). There is
+    /// nothing to copy: complete it with no copy, whatever `IdfRedirSkip` says.
+    NoDestination,
+    /// A candidate with a destination, and `IdfRedirSkip` = 1: complete it with no copy.
+    Skip,
+}
+
+/// The decision for one Blt-arm Present: `mode_on` is `IndepFlip` (the only setting under which
+/// dxgkrnl sends candidates, `DdiPresentForIFlip`), `skip_knob` is `IdfRedirSkip`.
+pub const fn redirected_blt_action(
+    mode_on: bool,
+    skip_knob: bool,
+    present_flags: u32,
+    destinations: u32,
+) -> RedirectedBlt {
+    if !mode_on || !redirected_blt(present_flags) {
+        RedirectedBlt::Ordinary
+    } else if destinations == 0 {
+        RedirectedBlt::NoDestination
+    } else if skip_knob {
+        RedirectedBlt::Skip
+    } else {
+        RedirectedBlt::Ordinary
+    }
 }
 /// Names reserved for later stages: they collide with nothing, and the driver does not read them.
 pub const RESERVED_KNOBS: [&str; 2] = [KNOB_NEED_PRIMARY, KNOB_HOLD_RELEASE];
@@ -570,7 +602,7 @@ pub fn census_dma_unarmed(mode: Mode, d: &DmaFacts) -> Verdict {
 ///
 /// `IdfRef01` .. `IdfRef13` are the per-reason counts ([`ref_name`]); they are not repeated
 /// here.
-pub const COUNTERS: [&str; 17] = [
+pub const COUNTERS: [&str; 21] = [
     "IdfKnob",     // the mode in force: 0 off, 1 census, 2 enforce (Mode::code)
     "IdfSeen",     // flips the table was asked about
     "IdfDirect",   // verdict Direct
@@ -588,6 +620,10 @@ pub const COUNTERS: [&str; 17] = [
     "IdfRedSt",    // ... the last failing status
     "IdfRedSD",    // ... the last one's source count << 16 | destination count
     "IdfRedSkip",  // ... completed with no copy (IdfRedirSkip=1)
+    "IdfRedNoDst", // ... with no destination, completed with no copy (always, with IndepFlip)
+    "IdfRedFlg",   // ... the last one's DXGK_PRESENTFLAGS
+    "IdfRedSite",  // ... the last failing one's return site (present_foreign::site)
+    "IdfRedDma",   // ... the last one's DmaSize << 16 | DmaBufferPrivateDataSize (saturated)
 ];
 
 /// Counter names reserved for later stages (design 6.4), written by nothing yet.
@@ -1284,6 +1320,20 @@ mod tests {
             "a redirected FLIP is a flip, never skipped"
         );
         assert!(!redirected_blt(0x0001));
+    }
+
+    #[test]
+    fn a_candidate_with_no_destination_is_always_completed_without_a_copy() {
+        use RedirectedBlt::*;
+        assert_eq!(redirected_blt_action(true, false, 0x2001, 0), NoDestination);
+        assert_eq!(redirected_blt_action(true, true, 0x2001, 0), NoDestination);
+        assert_eq!(redirected_blt_action(true, false, 0x2001, 1), Ordinary);
+        assert_eq!(redirected_blt_action(true, true, 0x2001, 1), Skip);
+        // IndepFlip off: never (dxgkrnl sends no candidates then anyway).
+        assert_eq!(redirected_blt_action(false, true, 0x2001, 0), Ordinary);
+        // Not a candidate, or a flip.
+        assert_eq!(redirected_blt_action(true, true, 0x0001, 0), Ordinary);
+        assert_eq!(redirected_blt_action(true, true, 0x2004, 0), Ordinary);
     }
 
     #[test]

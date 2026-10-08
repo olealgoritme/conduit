@@ -48,6 +48,10 @@ static RED_ERR: AtomicU32 = AtomicU32::new(0);
 static RED_ST: AtomicU32 = AtomicU32::new(0);
 static RED_SD: AtomicU32 = AtomicU32::new(0);
 static RED_SKIP: AtomicU32 = AtomicU32::new(0);
+static RED_NODST: AtomicU32 = AtomicU32::new(0);
+static RED_FLG: AtomicU32 = AtomicU32::new(0);
+static RED_SITE: AtomicU32 = AtomicU32::new(0);
+static RED_DMA: AtomicU32 = AtomicU32::new(0);
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU32 = AtomicU32::new(0);
 static REFS: [AtomicU32; Why::COUNT] = [ZERO; Why::COUNT];
@@ -77,7 +81,8 @@ pub(crate) fn reset_for_start(knobs: &crate::adapter::AdapterKnobs) {
     REDIR_SKIP.store(u32::from(skip), Ordering::Relaxed);
     for c in [
         &SEEN, &DIRECT, &DIR_FOR, &DIR_VEN, &COPY, &KEEP, &WHY, &ARM_MMIO, &ARM_DMA, &UNTAGGED,
-        &ENF_KEEP, &RED_OK, &RED_ERR, &RED_ST, &RED_SD, &RED_SKIP,
+        &ENF_KEEP, &RED_OK, &RED_ERR, &RED_ST, &RED_SD, &RED_SKIP, &RED_NODST, &RED_FLG, &RED_SITE,
+        &RED_DMA,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -115,6 +120,10 @@ fn write_block() {
     crate::diag::record_named_bytes(b"IdfRedSt", r(&RED_ST));
     crate::diag::record_named_bytes(b"IdfRedSD", r(&RED_SD));
     crate::diag::record_named_bytes(b"IdfRedSkip", r(&RED_SKIP));
+    crate::diag::record_named_bytes(b"IdfRedNoDst", r(&RED_NODST));
+    crate::diag::record_named_bytes(b"IdfRedFlg", r(&RED_FLG));
+    crate::diag::record_named_bytes(b"IdfRedSite", r(&RED_SITE));
+    crate::diag::record_named_bytes(b"IdfRedDma", r(&RED_DMA));
     for why in Why::ALL {
         crate::diag::record_named_bytes(&idf::ref_name(why), r(&REFS[why.index()]));
     }
@@ -163,7 +172,14 @@ pub(crate) fn note_arm_dma() {
 /// only for such presents: the question is whether dxgkrnl's independent-flip candidate presents
 /// fail or succeed here. Atomics only.
 #[inline]
-pub(crate) fn note_present_result(flags: u32, src: u32, dst: u32, ok: bool, status: u32) {
+pub(crate) fn note_present_result(
+    flags: u32,
+    src: u32,
+    dst: u32,
+    dma: (u32, u32),
+    ok: bool,
+    status: u32,
+) {
     if !mode().is_on() || !helios_kmd_logic::flip_flags::present_is_redirected(flags) {
         return;
     }
@@ -171,20 +187,36 @@ pub(crate) fn note_present_result(flags: u32, src: u32, dst: u32, ok: bool, stat
         bump(&RED_OK);
     } else {
         RED_ST.store(status, Ordering::Relaxed);
+        RED_SITE.store(crate::ddi::present_foreign::call_site(), Ordering::Relaxed);
         bump(&RED_ERR);
     }
     RED_SD.store((src << 16) | (dst & 0xFFFF), Ordering::Relaxed);
+    RED_FLG.store(flags, Ordering::Relaxed);
+    RED_DMA.store(
+        (dma.0.min(0xFFFF) << 16) | dma.1.min(0xFFFF),
+        Ordering::Relaxed,
+    );
 }
 
 /// `IdfRedirSkip`: whether this Blt-arm Present (flags `flags`) completes with no copy. Counts
 /// the ones it skips. Atomics only.
 #[inline]
-pub(crate) fn skip_redirected_blt(flags: u32) -> bool {
-    if REDIR_SKIP.load(Ordering::Relaxed) == 0 || !idf::redirected_blt(flags) {
-        return false;
+pub(crate) fn redirected_blt_action(flags: u32, destinations: u32) -> idf::RedirectedBlt {
+    if !mode().is_on() {
+        return idf::RedirectedBlt::Ordinary;
     }
-    bump(&RED_SKIP);
-    true
+    let a = idf::redirected_blt_action(
+        true,
+        REDIR_SKIP.load(Ordering::Relaxed) != 0,
+        flags,
+        destinations,
+    );
+    match a {
+        idf::RedirectedBlt::NoDestination => bump(&RED_NODST),
+        idf::RedirectedBlt::Skip => bump(&RED_SKIP),
+        idf::RedirectedBlt::Ordinary => {}
+    }
+    a
 }
 
 /// `IndepFlip=2` completed a `PBFlip` 0xE6 flip as a kept picture. Atomics only.
