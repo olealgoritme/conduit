@@ -1628,7 +1628,7 @@ unsafe fn nvk_present_frame(
 
     if (scanout && fences) || (!scanout && marker_fences) {
         // Submitted, not complete: the fence is signalled after this on the GPU.
-        match dev.dxvk.present_frame_gate(NVK_PRESENT_WAIT_US, PRESENT_ORDER_SUBMITTED) {
+        match present_timing::gate(|| dev.dxvk.present_frame_gate(NVK_PRESENT_WAIT_US, PRESENT_ORDER_SUBMITTED)) {
             0 | 1 => {}
             hr => {
                 log_error!("NVK present refused: frame submission failed hr=0x{:08x}", hr as u32);
@@ -1684,7 +1684,7 @@ unsafe fn nvk_present_frame(
 
     // v1 sync (S3, decision D5): wait on the CPU for the frame's GPU work; the
     // present then carries no stream marker (the KMD has nothing to wait for).
-    match dev.dxvk.present_frame_gate(NVK_PRESENT_WAIT_US, PRESENT_ORDER_COMPLETE) {
+    match present_timing::gate(|| dev.dxvk.present_frame_gate(NVK_PRESENT_WAIT_US, PRESENT_ORDER_COMPLETE)) {
         0 => {}
         1 => {
             let n = NVK_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1926,6 +1926,176 @@ unsafe fn nvk_present_impl(
     src_alloc: u32,
     dst_alloc: u32,
 ) -> i32 {
+    let mut t = present_timing::Stamps::start();
+    let hr = nvk_present_impl_timed(a, boundary, h, src_h, dst_h, src_alloc, dst_alloc, &mut t);
+    t.finish();
+    hr
+}
+
+/// Per-present stage times of the NVK present (`nvk_present_impl`), logged every
+/// [`present_timing::EVERY`] presents as averages and maxima in µs: the DXGI Blt copy and flush,
+/// `nvk_present_frame` (of which the frame gate), the Blt-source mark, `finish_present` (the
+/// runtime's Render/Present callbacks, i.e. dxgkrnl and the KMD's DxgkDdiPresent), the whole call,
+/// and the interval between presents. PresentMon's inPresent is the whole call plus the runtime's
+/// own part around it.
+pub(crate) mod present_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub(super) const EVERY: u64 = 1024;
+    const STEPS: usize = 6;
+    const NAMES: [&str; STEPS] = ["copy+flush", "frame", "gate", "mark", "finish", "total"];
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    static SUM: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
+    static MAX: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
+    static GATE: AtomicU64 = AtomicU64::new(0);
+    static LAST_START: AtomicU64 = AtomicU64::new(0);
+    /// The copy+flush step's parts: 0 the DXGI Blt copy, 1 `Flush`, 2 `flush_gate` (sums, maxima).
+    static SUB_SUM: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static SUB_MAX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    /// The device's shared (keyed-mutex candidate) resources at the last present: nonzero makes
+    /// `flush_gate` wait on the CPU for the GPU on NVK.
+    static SHARED: AtomicU64 = AtomicU64::new(0);
+    /// The Flush DDI's `flush_gate` (the keyed-mutex hand-off point): calls, sum and max µs since
+    /// the last line.
+    static DDI_N: AtomicU64 = AtomicU64::new(0);
+    static DDI_SUM: AtomicU64 = AtomicU64::new(0);
+    static DDI_MAX: AtomicU64 = AtomicU64::new(0);
+    static INTERVAL_SUM: AtomicU64 = AtomicU64::new(0);
+
+    fn epoch() -> Instant {
+        static E: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *E.get_or_init(Instant::now)
+    }
+
+    fn now_us() -> u64 {
+        epoch().elapsed().as_micros() as u64
+    }
+
+    pub(super) struct Stamps {
+        t0: u64,
+        marks: [u64; 4],
+        gate0: u64,
+    }
+
+    impl Stamps {
+        pub(super) fn start() -> Self {
+            let t0 = now_us();
+            let last = LAST_START.swap(t0, Ordering::Relaxed);
+            if last != 0 {
+                INTERVAL_SUM.fetch_add(t0.saturating_sub(last), Ordering::Relaxed);
+            }
+            Stamps { t0, marks: [0; 4], gate0: GATE.load(Ordering::Relaxed) }
+        }
+
+        /// The end of step `i` (0 copy+flush, 1 frame, 2 mark, 3 finish).
+        pub(super) fn mark(&mut self, i: usize) {
+            self.marks[i] = now_us();
+        }
+
+        pub(super) fn finish(self) {
+            let end = now_us();
+            let mut d = [0u64; STEPS];
+            // Step slots: 0 copy+flush, 1 frame, 3 mark, 4 finish (2 is the gate, 5 the total). A
+            // step not reached (an early return) counts 0, and the rest falls into the total only.
+            let mut prev = self.t0;
+            for (m, slot) in self.marks.iter().zip([0usize, 1, 3, 4]) {
+                if *m == 0 {
+                    break;
+                }
+                d[slot] = m.saturating_sub(prev);
+                prev = *m;
+            }
+            d[2] = GATE.load(Ordering::Relaxed).saturating_sub(self.gate0);
+            d[5] = end.saturating_sub(self.t0);
+            for i in 0..STEPS {
+                SUM[i].fetch_add(d[i], Ordering::Relaxed);
+                MAX[i].fetch_max(d[i], Ordering::Relaxed);
+            }
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % EVERY == 0 {
+                let mut line = String::new();
+                for i in 0..STEPS {
+                    let s = SUM[i].swap(0, Ordering::Relaxed);
+                    let m = MAX[i].swap(0, Ordering::Relaxed);
+                    line.push_str(&format!(" {}={}/{}", NAMES[i], s / EVERY, m));
+                }
+                for (i, name) in ["blt", "flush", "fgate"].iter().enumerate() {
+                    let s = SUB_SUM[i].swap(0, Ordering::Relaxed);
+                    let m = SUB_MAX[i].swap(0, Ordering::Relaxed);
+                    line.push_str(&format!(" {}={}/{}", name, s / EVERY, m));
+                }
+                let iv = INTERVAL_SUM.swap(0, Ordering::Relaxed);
+                let dn = DDI_N.swap(0, Ordering::Relaxed);
+                let ds = DDI_SUM.swap(0, Ordering::Relaxed);
+                let dm = DDI_MAX.swap(0, Ordering::Relaxed);
+                crate::log_error!(
+                    "NVK present timing (avg/max us over {EVERY}, #{n}):{line} interval={} shared={} \
+                     present_gate={} ddi_flush_gate={}x sum={} max={}",
+                    iv / EVERY,
+                    SHARED.load(Ordering::Relaxed),
+                    u8::from(super::nvk_present_gate()),
+                    dn,
+                    ds,
+                    dm
+                );
+            }
+        }
+    }
+
+    /// Time the Flush DDI's `flush_gate`.
+    pub(crate) fn ddi_flush_gate<R>(f: impl FnOnce() -> R) -> R {
+        let t = now_us();
+        let r = f();
+        let d = now_us().saturating_sub(t);
+        DDI_N.fetch_add(1, Ordering::Relaxed);
+        DDI_SUM.fetch_add(d, Ordering::Relaxed);
+        DDI_MAX.fetch_max(d, Ordering::Relaxed);
+        r
+    }
+
+    /// Time one part `i` of the copy+flush step.
+    pub(super) fn sub<R>(i: usize, f: impl FnOnce() -> R) -> R {
+        let t = now_us();
+        let r = f();
+        let d = now_us().saturating_sub(t);
+        SUB_SUM[i].fetch_add(d, Ordering::Relaxed);
+        SUB_MAX[i].fetch_max(d, Ordering::Relaxed);
+        r
+    }
+
+    pub(super) fn note_shared(n: usize) {
+        SHARED.store(n as u64, Ordering::Relaxed);
+    }
+
+    /// Time spent in `present_frame_gate` (added to the present in flight on this thread's call).
+    pub(super) fn gate<R>(f: impl FnOnce() -> R) -> R {
+        let t = now_us();
+        let r = f();
+        GATE.fetch_add(now_us().saturating_sub(t), Ordering::Relaxed);
+        r
+    }
+}
+
+/// `HELIOS_NVK_PRESENT_GATE=1` (process environment): the NVK present runs the shared-surface
+/// flush gate too (it always did before the Flush DDI was made the only gate).
+fn nvk_present_gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HELIOS_NVK_PRESENT_GATE").is_ok_and(|v| v == "1"))
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn nvk_present_impl_timed(
+    a: &ddi::DXGI_DDI_ARG_PRESENT,
+    boundary: PresentBoundaryEntry,
+    h: Hdevice,
+    src_h: ddi::D3D10DDI_HRESOURCE,
+    dst_h: ddi::D3D10DDI_HRESOURCE,
+    src_alloc: u32,
+    dst_alloc: u32,
+    t: &mut present_timing::Stamps,
+) -> i32 {
     let mut shown = src_h;
     // `NvkSkipBltCopy` (A/B, off by default): the KMD's Blt reads `src_h` and writes the window's
     // surface itself; the UMD's copy into DXGI's destination is then the same pixels twice.
@@ -1934,26 +2104,40 @@ unsafe fn nvk_present_impl(
         if skip_copy {
             // Nothing copied: `shown` stays the source.
         } else if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
-            context.CopySubresourceRegion(
-                &*dst,
-                a.DstSubResourceIndex,
-                0,
-                0,
-                0,
-                &*src,
-                a.SrcSubResourceIndex,
-                None,
-            );
+            present_timing::sub(0, || {
+                context.CopySubresourceRegion(
+                    &*dst,
+                    a.DstSubResourceIndex,
+                    0,
+                    0,
+                    0,
+                    &*src,
+                    a.SrcSubResourceIndex,
+                    None,
+                )
+            });
             shown = dst_h;
         }
-        // A keyed-mutex surface may be released right after this present.
-        context.Flush();
-        flush_gate(h, &context);
+        present_timing::sub(1, || context.Flush());
+        // The keyed-mutex hand-off point is the Flush DDI: the runtime releases a keyed mutex
+        // right after `pfnFlush` (`transfer::flush`, which gates). A gate here as well made every
+        // present of a device holding any shared resource wait on the CPU for the GPU to go idle
+        // on NVK (377.1 Heaven windowed: copy+flush 0.66-0.87 ms of a 1.8-2.0 ms present, the
+        // UMD log's "keyed-mutex flush wait" at every frame). `HELIOS_NVK_PRESENT_GATE=1`
+        // restores it.
+        if nvk_present_gate() {
+            present_timing::sub(2, || flush_gate(h, &context));
+        }
+        if let Some(dev) = helios_device(h) {
+            present_timing::note_shared(lock_ignore_poison(&dev.nvk_keyed_resources).len());
+        }
     }
+    t.mark(0);
     let frame = match nvk_present_frame(h, shown, src_h) {
         Ok(f) => f,
         Err(hr) => return hr,
     };
+    t.mark(1);
     if !nvk_scanout_compose(frame) {
         return 0;
     }
@@ -1965,6 +2149,7 @@ unsafe fn nvk_present_impl(
     if let (Some(dev), Some(src)) = (helios_device(h), load_resource(src_h)) {
         let _ = dev.dxvk.mark_blt_source(src.as_raw() as usize);
     }
+    t.mark(2);
     let correlation = frame.correlation;
     let result = finish_present(
         h,
@@ -1981,6 +2166,7 @@ unsafe fn nvk_present_impl(
         None,
         correlation,
     );
+    t.mark(3);
     nvk_release_unsent_fence(h, correlation.rm_fence_handle, &result);
     match result {
         Ok(hr) => hr,
