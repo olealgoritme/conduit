@@ -66,7 +66,7 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 6 | `nvk: bind vertex and index buffers with plain methods on Turing+` | no `NVK_MME_BIND_VB/IB` for CPU-recorded binds, and the range already bound is skipped |
 | 7 | `nvk: keep what changes per draw in one hardware root table bank` | changing a second 256-byte root table bank between draws costs ~5 ns; the dynamic-offset dword of the dynamic buffer descriptors moves into bank 0 with the draw parameters and `sets[0..3]`. **API-visible**: `NVK_MAX_DYNAMIC_BUFFERS` 64 -> 32, i.e. 16 dynamic UBOs + 16 dynamic SSBOs per layout (NVIDIA: 15 + 16) |
 | 8 | `nvk: ZCULL for DXVK depth buffers and reverse Z` | ZCULL storage also for depth images with `TRANSFER_DST` (DXVK sets it on every D3D11 depth texture; `EXCLUSIVE` sharing only), reset to a conservative state by an empty render pass after a copy, blit or resolve writes them or another queue hands them over; `SET_ZCULL_DIR_FORMAT` per image (GREATER when the first application render pass clears below 0.5, LESS otherwise, never changed afterwards) instead of always LESS. See "GPU time against NVIDIA in D3D11-through-DXVK shapes" |
-| 11 | `nvk, nvk/rm: compression for images outside dedicated allocations on GB20x` | `NVK_RM_COMPRESS_ALL=1` (default off while it is measured): device-local memory that is neither host-visible nor shared nor imported is allocated COMPR_ANY (`NVKMD_MEM_COMPRESSIBLE`, `nvkmd_info::has_compressible_mem`), and a compressible image bound anywhere in it gets its own VA with the compressible GMK kind and `is_compressed`; every other mapping of such memory uses a compressible kind too. Applies after 9-10 of the build branches and without them. See "Compression outside dedicated allocations" |
+| 11 | `nvk, nvk/rm: compression for images outside dedicated allocations on GB20x` | On by default (`NVK_RM_COMPRESS_ALL=0` off): device-local memory that is neither host-visible nor shared nor imported is allocated COMPR_ANY (`NVKMD_MEM_COMPRESSIBLE`, `nvkmd_info::has_compressible_mem`), and a compressible image bound anywhere in it gets its own VA with the compressible GMK kind and `is_compressed`; every other mapping of such memory uses a compressible kind too. Applies after 9-10 of the build branches and without them. See "Compression outside dedicated allocations" |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
@@ -157,7 +157,7 @@ Risks:
   buffers in a compressed heap. NVKMS allocates scanout surfaces
   COMPR_ANY, so hub clients reading compressible GMK is the hardware's
   normal case, but this is the first thing to check if
-  `NVK_RM_COMPRESS_ALL=1` misrenders or faults.
+  something misrenders or faults (`NVK_RM_COMPRESS_ALL=0` to compare).
 - Image/buffer aliasing in one heap: both go through compressible kinds,
   so reinterpreting the bytes is as undefined as the Vulkan spec says and
   no more.
@@ -169,8 +169,43 @@ Risks:
 
 Logs (`mesa_logi`): the number of compressible memories and MiB as it
 reaches each power of two, image binds that got the compressible kind,
-and a summary at device destruction (memories, MiB, refusals, compressed
-image binds, 0x6 binds made 0x8).
+image plane binds in compressible memory left uncompressed and why (not a
+render target, depth/stencil or storage image; a separate depth/stencil
+plane; other), and a summary at device destruction (memories, MiB,
+refusals, compressed image binds, 0x6 binds made 0x8). The 0x6 -> 0x8
+count also includes every tile bind of a sparse image, which the
+NVK-side breakdown does not see.
+
+Measured in the VM (RTX 5090, Basemark at 1080p, windowed), off against
+on: Vulkan 268 compressed image binds in 11 compressible memories
+(2565 MiB), none refused, calibration 7-9 % faster, demo-scene median
+20.4 -> 19.2 ms; D3D12 (vkd3d-proton) 67 compressed binds in 6 memories
+(1971 MiB), frame 21.8 -> 20.7 ms. No faults or device loss; a compressed
+vkcube renders correctly. Now on by default.
+
+What stays uncompressed (D3D12 had 306 binds made 0x8 against 67
+compressed):
+
+- Sampled-only textures (no `ALLOW_RENDER_TARGET`, `ALLOW_DEPTH_STENCIL`
+  or `ALLOW_UNORDERED_ACCESS`, so vkd3d-proton gives them neither
+  attachment nor storage usage): `nvk_image_can_compress` leaves them
+  out. They are already mapped 0x8, though, so copy-engine and shader
+  writes to them go through the compressible kind; the 3D compression
+  state only matters for attachments. Little to gain.
+- Depth/stencil formats (D24S8, D32S8X24): on Blackwell NVK splits them
+  into separate depth and stencil planes, and `can_compress` rejects
+  every image with more than one plane, dedicated or not. These are the
+  main render targets still left uncompressed. A follow-up could allow
+  `separate_zs` (non-disjoint) images: each plane already gets its own VA
+  in the sub-allocated path, NIL computes a compressed kind for both, and
+  the draw path sets `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION`
+  from `is_compressed`.
+- Reserved (tiled) resources: sparse, excluded by `can_compress`; every
+  tile bind counts as one 0x6 -> 0x8.
+- Render targets and UAV textures (`COLOR_ATTACHMENT`, `STORAGE`,
+  single-plane depth such as D32/D16), with typeless/mutable formats
+  included: already compressed. GB20x compression is generic, so a format
+  reinterpretation reads the same bytes.
 
 ### GPU time against NVIDIA in D3D11-through-DXVK shapes (patch 8)
 
