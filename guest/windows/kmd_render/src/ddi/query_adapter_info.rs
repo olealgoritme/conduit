@@ -228,11 +228,18 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // masked-color pointer when the knob and the host allow it, else none (zeros: dxgkrnl
     // draws a software cursor, which independent flip loses).
     if crate::ddi::hw_cursor::advertised(adapter) {
-        let max_pointer: UINT = helios_kmd_logic::hw_cursor::MAX_DIM;
+        let max_pointer: UINT = crate::ddi::hw_cursor::pointer_max();
         out.set(caps_offset!(MaxPointerWidth), max_pointer);
         out.set(caps_offset!(MaxPointerHeight), max_pointer);
         let pointer_caps: UINT = crate::ddi::hw_cursor::pointer_caps();
         out.set(caps_offset!(PointerCaps), pointer_caps);
+    }
+    // `SmoothRotCaps` (default 0): report `SupportSmoothRotation`, as the virtio-gpu and QXL
+    // display-only drivers do (an A/B lever for the hardware cursor, which dxgkrnl never uses on
+    // this adapter as of 400.2). The KMD accepts identity rotation only either way.
+    if crate::ddi::hw_cursor::smooth_rotation() {
+        let smooth: BOOLEAN = 1;
+        out.set(caps_offset!(SupportSmoothRotation), smooth);
     }
     // Not a legacy VGA device.
     let support_non_vga: BOOLEAN = 1;
