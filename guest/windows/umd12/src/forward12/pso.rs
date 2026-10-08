@@ -50,12 +50,13 @@ use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::slot::{Boxed, BoxedHandle, Com, ComHandle, Slot};
 
-use windows::core::Interface;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF, ID3D12Device2, ID3D12PipelineState,
-    ID3D12RootSignature, D3D12_BLEND, D3D12_BLEND_DESC, D3D12_BLEND_ONE, D3D12_BLEND_OP,
-    D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMPARISON_FUNC,
-    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF, ID3D12Device1, ID3D12Device2,
+    ID3D12PipelineLibrary1, ID3D12PipelineState, ID3D12RootSignature, D3D12_BLEND,
+    D3D12_BLEND_DESC, D3D12_BLEND_ONE, D3D12_BLEND_OP, D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO,
+    D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMPARISON_FUNC, D3D12_COMPARISON_FUNC_ALWAYS,
+    D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC,
     D3D12_CONSERVATIVE_RASTERIZATION_MODE, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
     D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON, D3D12_CULL_MODE, D3D12_CULL_MODE_BACK,
     D3D12_DEFAULT_STENCIL_READ_MASK, D3D12_DEFAULT_STENCIL_WRITE_MASK, D3D12_DEPTH_STENCILOP_DESC1,
@@ -134,6 +135,7 @@ helios_umd_common::boxed_handles!(
     crate::ddi12::D3D12DDI_HBLENDSTATE => BlendState,
     crate::ddi12::D3D12DDI_HDEPTHSTENCILSTATE => DepthStencilState,
     crate::ddi12::D3D12DDI_HRASTERIZERSTATE => RasterizerState,
+    crate::ddi12::D3D12DDI_HPIPELINELIBRARY => PipelineLibraryState,
 );
 
 /// The private block behind a `D3D12DDI_HELEMENTLAYOUT`.
@@ -538,11 +540,10 @@ fn sub_state_private_size() -> ddi12::SIZE_T {
 /// Count a create that was handed a `LibraryReference`.
 ///
 /// ⚠ Every sub-state desc, every shader arg and the PSO arg carry a
-/// `D3D12DDI_LIBRARY_REFERENCE_0010 { hLibrary, PipelineIndex }`. A non-null
-/// `hLibrary` means the runtime is asking this object to come out of a
-/// **pipeline library**, which this lane refuses wholesale (see
-/// [`create_pipeline_library`]). Counted here so the refusal upstream is
-/// visible at the objects it affects, not only at the library itself.
+/// `D3D12DDI_LIBRARY_REFERENCE_0010 { hLibrary, PipelineIndex }`. Only the
+/// PSO's reference names something the engine stores ([`load_from_library`]);
+/// sub-state and shader objects have no engine object, so theirs is ignored
+/// and counted here. Harmless: they are rebuilt from their own descs.
 fn note_library_reference(reference: &ddi12::D3D12DDI_LIBRARY_REFERENCE_0010) {
     if !reference.hLibrary.pDrvPrivate.is_null() {
         note_refusal(&L6_REFUSALS.library_reference_ignored);
@@ -1598,7 +1599,6 @@ unsafe extern "system" fn create_pipeline_state(
     }
     // SAFETY: non-null per the check; `_In_ CONST`.
     let a = unsafe { &*arg };
-    note_library_reference(&a.LibraryReference);
     L6_REFUSALS.pso_creates.bump();
 
     // ⚠ `SUBSTRATE.md` §4.5: the `DYNAMIC_*` PSO flags are HINTS, and the DDI
@@ -1689,10 +1689,19 @@ unsafe extern "system" fn create_pipeline_state(
             a.NodeMask,
             a.Flags,
         );
-        // SAFETY: `engine` is the bridge's borrowed device; `desc` is a live
-        // local whose bytecode pointer addresses a container the shader handle
-        // owns for at least this call.
-        unsafe { engine.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+        // SAFETY: the runtime handed `LibraryReference` in this call; `desc` is
+        // a live local for the whole call.
+        match unsafe {
+            load_from_library(&a.LibraryReference, |lib, name| {
+                lib.LoadComputePipeline::<_, ID3D12PipelineState>(name, &desc)
+            })
+        } {
+            Some(pso) => Ok(pso),
+            // SAFETY: `engine` is the bridge's borrowed device; `desc` is a live
+            // local whose bytecode pointer addresses a container the shader
+            // handle owns for at least this call.
+            None => unsafe { engine.CreateComputePipelineState::<ID3D12PipelineState>(&desc) },
+        }
     } else {
         // SAFETY: `hElementLayout`, when non-null, is a handle
         // `create_element_layout` stored into and live for this call;
@@ -1898,7 +1907,18 @@ unsafe extern "system" fn create_pipeline_state(
         if stream_output.NumEntries != 0 {
             // SAFETY: the same complete stream lifetime applies. This private
             // factory supplies DDI SO origin; public semantic text cannot do so.
+            // ⚠ Never loaded from a library: the private SO factory hashes
+            // state the public `LoadPipeline` cannot express, so a load would
+            // only ever miss.
             unsafe { crate::bridge12::create_stream_output_pipeline(&engine, &stream_desc) }
+        } else if let Some(pso) = unsafe {
+            // SAFETY: the runtime handed `LibraryReference` in this call; the
+            // stream outlives the call, as for the create below.
+            load_from_library(&a.LibraryReference, |lib, name| {
+                lib.LoadPipeline::<_, ID3D12PipelineState>(name, &stream_desc)
+            })
+        } {
+            Ok(pso)
         } else {
             // SAFETY: the local stream and all its borrowed inputs outlive the call.
             unsafe { device2.CreatePipelineState::<ID3D12PipelineState>(&stream_desc) }
@@ -2199,40 +2219,113 @@ unsafe extern "system" fn destroy_pipeline_state(
 }
 
 // ---------------------------------------------------------------------------
-// (e) Pipeline libraries — 6 slots, REFUSED
+// (e) Pipeline libraries — 6 slots, forwarded to vkd3d's ID3D12PipelineLibrary1
 // ---------------------------------------------------------------------------
 //
-// ⭐ **A pipeline library is a PSO CACHE, and vkd3d has its own.**
-// `DDI_REFERENCE.md` §9.9: *"Pipeline libraries … map to `ID3D12PipelineLibrary`"*
-// — an engine object this bridge does not expose, sitting on top of a caching
-// layer (`libs/vkd3d/cache.c`) vkd3d drives itself from `VkPipelineCache`. So
-// implementing them here would be a second cache in front of a first one, and
-// the only thing it would buy is the app's ability to persist a blob across
-// runs.
+// ⭐ **Why these are forwarded.** A refused `CreatePipelineLibrary` reaches the
+// application as `DXGI_ERROR_UNSUPPORTED`, and the usual response is to create
+// every PSO from scratch on every run, which is where the shader-recompile
+// stutter comes from. vkd3d implements `ID3D12PipelineLibrary1` itself
+// (`libs/vkd3d/cache.c`), so each slot maps to one engine call.
 //
-// ⛔ **Refusing is checked against the `pfnFillDDITable` lesson, not assumed
-// safe.** That lesson — refusing an unknown table type LOST THE DEVICE
-// (`lib.rs`'s `FillDDITableUnknownType`) — is the standing warning that
-// "refuse" is not automatically the safe direction. It does not transfer here,
-// and the reason is structural rather than hopeful: `ID3D12Device1::CreatePipelineLibrary`
-// is documented to return `E_NOTIMPL` when the driver does not support
-// libraries, and the D3D12 runtime's own contract is that an application then
-// falls back to creating PSOs directly. The failure is delivered to the app that
-// asked, through an `HRESULT` **the DDI defines** — four of these six slots
-// return one — rather than to the device.
+// ⚠ **The DDI is index-keyed and the engine is name-keyed.** The runtime keeps
+// the application's name -> index table in its own part of the serialized blob
+// and hands the driver only `PipelineIndex` (`pfnAddPipelineStateToLibrary`,
+// and `LibraryReference` on a later `pfnCreatePipelineState`). Each index is
+// stored in the engine library under a name derived from it
+// ([`library_entry_name`]). The derivation is fixed, so a blob serialized by
+// one process resolves the same indices in the next.
 //
-// ⚠ What makes it visible when it happens: `L6PipelineLibraryRefused` counts the
-// requests, and `L6LibraryReferenceIgnored` counts every sub-state, shader or
-// PSO create that arrived carrying a `LibraryReference` — i.e. the downstream
-// effect, at the objects it affects.
+// ⚠ **A load never fails a create.** [`load_from_library`] is tried first when
+// a PSO carries a `LibraryReference`; any engine refusal (unknown entry, a
+// desc that does not match the stored one, a blob from another driver
+// version) falls back to the ordinary create of the same desc and is counted
+// as `L6PipelineLibraryLoadFallback`.
+//
+// ⛔ `Umd12PipelineLibrary=0` (HKLM\SOFTWARE\Helios, DWORD) restores the old
+// behaviour: every slot refuses with `E_NOTIMPL`, counted as
+// `L6PipelineLibraryRefused`.
 
-/// `pfnCalcPrivatePipelineLibrarySize`.
+/// The private block behind a `D3D12DDI_HPIPELINELIBRARY`.
 ///
-/// ⚠ Answers **one machine word**, not 0. A driver that refuses `CreateX` must
-/// still return a size `CalcPrivateXSize` and `CreateX` agree on: the runtime
-/// allocates before it calls, and a zero-byte private region with a create that
-/// writes anything is the R702/§12-rule-16 class of heap corruption. Nothing is
-/// written into it, but the word exists.
+/// ⚠ `pub` for the same E0446 reason as [`ElementLayoutState`].
+pub struct PipelineLibraryState {
+    /// The owning engine reference.
+    pub(crate) library: ID3D12PipelineLibrary1,
+    /// The byte count the last `pfnCalcSerializedLibrarySize` answered. The
+    /// runtime allocates exactly that many bytes for `pfnSerializeLibrary`,
+    /// which carries no size of its own; passing the engine's current size
+    /// instead would overrun the buffer if a store landed between the two
+    /// calls. vkd3d refuses a too-small buffer with `E_INVALIDARG`.
+    pub(crate) serialized_size: core::sync::atomic::AtomicUsize,
+}
+
+/// The engine library behind a DDI library handle, borrowed for one DDI call.
+///
+/// # Safety
+/// `h_library`'s `pDrvPrivate` must address the word
+/// [`calc_private_pipeline_library_size`] sized, and the result must not
+/// outlive the DDI call that obtained it.
+unsafe fn library_state<'a>(
+    h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
+) -> Option<&'a PipelineLibraryState> {
+    // SAFETY: forwarded; the runtime only destroys a library it no longer
+    // passes as an argument.
+    unsafe { boxed_state(h_library) }
+}
+
+/// The engine-side name of DDI library entry `index`, NUL-terminated UTF-16.
+fn library_entry_name(index: u32) -> Vec<u16> {
+    format!("HeliosDdiPso{index}")
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect()
+}
+
+/// Try to take a PSO out of the pipeline library the runtime referenced.
+///
+/// `None` when there is no reference, the feature is off, or the engine
+/// refused the load; the caller then creates the PSO from its desc.
+///
+/// # Safety
+/// `reference.hLibrary`, when non-null, must be a live library handle handed
+/// in by the runtime for this call.
+unsafe fn load_from_library(
+    reference: &ddi12::D3D12DDI_LIBRARY_REFERENCE_0010,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+) -> Option<ID3D12PipelineState> {
+    if reference.hLibrary.pDrvPrivate.is_null() {
+        return None;
+    }
+    // SAFETY: the caller guarantees a live library handle.
+    let Some(state) = (unsafe { library_state(reference.hLibrary) }) else {
+        note_refusal(&L6_REFUSALS.library_reference_ignored);
+        return None;
+    };
+    let name = library_entry_name(reference.PipelineIndex);
+    match load(&state.library, PCWSTR(name.as_ptr())) {
+        Ok(pso) => {
+            L6_REFUSALS.pipeline_library_loaded.bump();
+            Some(pso)
+        }
+        Err(e) => {
+            L6_REFUSALS.pipeline_library_load_fallback.bump();
+            let n = L6_REFUSALS.pipeline_library_load_fallback.get();
+            if n <= LOG_BUDGET {
+                log_error!(
+                    "CreatePipelineState: library entry {} not loadable hr={:#010x}; creating \
+                     from the desc (x{n})",
+                    reference.PipelineIndex,
+                    e.code().0 as u32,
+                );
+            }
+            None
+        }
+    }
+}
+
+/// `pfnCalcPrivatePipelineLibrarySize` — one machine word, the boxed
+/// [`PipelineLibraryState`].
 ///
 /// # Safety
 /// As [`calc_private_element_layout_size`].
@@ -2243,87 +2336,235 @@ unsafe extern "system" fn calc_private_pipeline_library_size(
     core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T
 }
 
-/// `pfnCreatePipelineLibrary` — refused, with the `HRESULT` the DDI provides.
+/// `pfnCreatePipelineLibrary` -> `ID3D12Device1::CreatePipelineLibrary`.
+///
+/// ⚠ The engine's own `HRESULT` is returned unchanged: a stale blob answers
+/// `D3D12_ERROR_DRIVER_VERSION_MISMATCH` / `D3D12_ERROR_ADAPTER_NOT_FOUND`,
+/// which applications handle by starting an empty library.
 ///
 /// # Safety
-/// `h_library`'s `pDrvPrivate`, when non-null, must address the machine word
+/// `arg`, when non-null, must point at a live
+/// `D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010` whose `pInitialData` addresses
+/// `InitialDataSize` bytes, and `h_library` must carry the machine word
 /// [`calc_private_pipeline_library_size`] sized.
 unsafe extern "system" fn create_pipeline_library(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
-    _arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010,
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010,
     h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
 ) -> ddi12::HRESULT {
-    if !h_library.pDrvPrivate.is_null() {
-        // SAFETY: non-null per the check, and it is the word the paired
-        // calc-size sized. Nulling it leaves a refused create with a clear
-        // handle rather than stale garbage.
-        unsafe {
-            core::ptr::write(
-                h_library.pDrvPrivate.cast::<*mut c_void>(),
-                core::ptr::null_mut(),
-            )
-        };
+    // SAFETY: the caller guarantees the slot word; a failed create leaves it
+    // null.
+    unsafe { clear_boxed(h_library) };
+    if !crate::knobs12::umd12_pipeline_library() {
+        note_refusal(&L6_REFUSALS.pipeline_library_refused);
+        return helios_umd_common::hr::E_NOTIMPL;
     }
-    note_refusal(&L6_REFUSALS.pipeline_library_refused);
-    helios_umd_common::hr::E_NOTIMPL
+    if arg.is_null() {
+        note_refusal(&L6_REFUSALS.pso_bad_arg);
+        return E_INVALIDARG;
+    }
+    // SAFETY: non-null per the check; `_In_ CONST`.
+    let a = unsafe { &*arg };
+    // SAFETY: `h_device` is this DDI's device handle.
+    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+        note_refusal(&L6_REFUSALS.no_device);
+        return E_FAIL;
+    };
+    let Some(engine) = dev.engine.d3d12_device() else {
+        note_refusal(&L6_REFUSALS.no_device);
+        return E_FAIL;
+    };
+    let device1 = match engine.cast::<ID3D12Device1>() {
+        Ok(d) => d,
+        Err(e) => {
+            note_refusal(&L6_REFUSALS.pipeline_library_engine_failed);
+            return e.code().0;
+        }
+    };
+    // ⛔ An empty library must reach the engine as (NULL, 0). vkd3d refuses a
+    // non-null pointer with a zero length (`d3d12_pipeline_library_init`), and
+    // the `windows` wrapper would pass an empty slice's dangling pointer, so
+    // the vtable is called directly.
+    let (blob, blob_len) = if a.InitialDataSize == 0 || a.pInitialData.is_null() {
+        (core::ptr::null(), 0)
+    } else {
+        (a.pInitialData, a.InitialDataSize as usize)
+    };
+    let mut raw: *mut c_void = core::ptr::null_mut();
+    // SAFETY: `device1` is a live engine device; `blob` addresses `blob_len`
+    // runtime-owned bytes for the call (or is null with a zero length), and
+    // `raw` receives one owning reference on success.
+    let hr = unsafe {
+        (Interface::vtable(&device1).CreatePipelineLibrary)(
+            Interface::as_raw(&device1),
+            blob,
+            blob_len,
+            &ID3D12PipelineLibrary1::IID,
+            &mut raw,
+        )
+    };
+    if hr.is_err() || raw.is_null() {
+        note_refusal(&L6_REFUSALS.pipeline_library_engine_failed);
+        let n = L6_REFUSALS.pipeline_library_engine_failed.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CreatePipelineLibrary: engine refused {blob_len} B hr={:#010x} (x{n})",
+                hr.0 as u32
+            );
+        }
+        return if hr.is_err() { hr.0 } else { E_FAIL };
+    }
+    // SAFETY: `raw` is the owning reference the engine just returned for the
+    // IID requested.
+    let library = unsafe { ID3D12PipelineLibrary1::from_raw(raw) };
+    // SAFETY: the caller guarantees the slot word.
+    let Some(slot) = (unsafe { boxed_slot(h_library) }) else {
+        note_refusal(&L6_REFUSALS.pso_bad_arg);
+        return E_INVALIDARG;
+    };
+    // SAFETY: the slot was cleared above; `store` moves the box into it.
+    unsafe {
+        slot.store(PipelineLibraryState {
+            library,
+            serialized_size: core::sync::atomic::AtomicUsize::new(0),
+        })
+    };
+    L6_REFUSALS.pipeline_library_created.bump();
+    trace_line!("CreatePipelineLibrary: {blob_len} B initial data");
+    S_OK
 }
 
-/// `pfnDestroyPipelineLibrary` — nothing was ever created, so nothing is freed.
+/// `pfnDestroyPipelineLibrary` — releases the engine library.
 ///
-/// ⚠ Still counted: reaching this means the runtime believes a library exists,
-/// which contradicts [`create_pipeline_library`] having refused every one.
+/// ⚠ An empty slot is counted as `L6PipelineLibraryUnexpected`: the runtime
+/// believes a library exists that this driver never created.
 ///
 /// # Safety
-/// Trivially safe: the handle is not dereferenced.
+/// `h_library` must be a handle [`create_pipeline_library`] stored into,
+/// destroyed at most once.
 unsafe extern "system" fn destroy_pipeline_library(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    _h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
+    h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
 ) {
-    note_refusal(&L6_REFUSALS.pipeline_library_unexpected);
+    // SAFETY: the caller guarantees a live slot; `take` empties it, so a
+    // second destroy finds `None` rather than double-freeing.
+    let taken = unsafe { boxed_slot(h_library) }.and_then(|slot| unsafe { slot.take() });
+    if taken.is_none() {
+        note_refusal(&L6_REFUSALS.pipeline_library_unexpected);
+    }
 }
 
-/// `pfnAddPipelineStateToLibrary` — refused.
+/// `pfnAddPipelineStateToLibrary` -> `ID3D12PipelineLibrary::StorePipeline`.
 ///
 /// # Safety
-/// Trivially safe: no handle is dereferenced.
+/// `h_library` and `h_pipeline_state` must be live handles this driver
+/// created, handed in by the runtime for this call.
 unsafe extern "system" fn add_pipeline_state_to_library(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    _h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
-    _h_pipeline_state: ddi12::D3D12DDI_HPIPELINESTATE,
-    _pipeline_index: ddi12::UINT,
+    h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
+    h_pipeline_state: ddi12::D3D12DDI_HPIPELINESTATE,
+    pipeline_index: ddi12::UINT,
 ) -> ddi12::HRESULT {
-    note_refusal(&L6_REFUSALS.pipeline_library_refused);
-    helios_umd_common::hr::E_NOTIMPL
+    if !crate::knobs12::umd12_pipeline_library() {
+        note_refusal(&L6_REFUSALS.pipeline_library_refused);
+        return helios_umd_common::hr::E_NOTIMPL;
+    }
+    // SAFETY: the caller guarantees a live library handle.
+    let Some(state) = (unsafe { library_state(h_library) }) else {
+        note_refusal(&L6_REFUSALS.pipeline_library_unexpected);
+        return E_INVALIDARG;
+    };
+    // SAFETY: the caller guarantees a live PSO handle; the borrow is not
+    // released (`ManuallyDrop`).
+    let Some(pso) = (unsafe { engine_pipeline_state(h_pipeline_state) }) else {
+        note_refusal(&L6_REFUSALS.pipeline_library_store_failed);
+        return E_INVALIDARG;
+    };
+    let name = library_entry_name(pipeline_index);
+    // SAFETY: `name` is NUL-terminated and outlives the call; the engine
+    // takes its own reference on what it keeps.
+    match unsafe { state.library.StorePipeline(PCWSTR(name.as_ptr()), &*pso) } {
+        Ok(()) => {
+            L6_REFUSALS.pipeline_library_stored.bump();
+            S_OK
+        }
+        Err(e) => {
+            note_refusal(&L6_REFUSALS.pipeline_library_store_failed);
+            let n = L6_REFUSALS.pipeline_library_store_failed.get();
+            if n <= LOG_BUDGET {
+                log_error!(
+                    "AddPipelineStateToLibrary: index {pipeline_index} refused hr={:#010x} (x{n})",
+                    e.code().0 as u32
+                );
+            }
+            e.code().0
+        }
+    }
 }
 
-/// `pfnCalcSerializedLibrarySize` — nothing to serialize.
-///
-/// ⚠ Returns 0 rather than a placeholder: this is a byte count for a blob that
-/// does not exist, and any non-zero answer would make the runtime allocate a
-/// buffer and then call [`serialize_library`], which refuses.
+/// `pfnCalcSerializedLibrarySize` -> `ID3D12PipelineLibrary::GetSerializedSize`.
 ///
 /// # Safety
-/// Trivially safe: no handle is dereferenced.
+/// `h_library` must be a live handle this driver created.
 unsafe extern "system" fn calc_serialized_library_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    _h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
+    h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
 ) -> ddi12::SIZE_T {
-    note_refusal(&L6_REFUSALS.pipeline_library_refused);
-    0
+    if !crate::knobs12::umd12_pipeline_library() {
+        note_refusal(&L6_REFUSALS.pipeline_library_refused);
+        return 0;
+    }
+    // SAFETY: the caller guarantees a live library handle.
+    let Some(state) = (unsafe { library_state(h_library) }) else {
+        note_refusal(&L6_REFUSALS.pipeline_library_unexpected);
+        return 0;
+    };
+    // SAFETY: a live engine library.
+    let size = unsafe { state.library.GetSerializedSize() };
+    state
+        .serialized_size
+        .store(size, core::sync::atomic::Ordering::Release);
+    size as ddi12::SIZE_T
 }
 
-/// `pfnSerializeLibrary` — refused.
+/// `pfnSerializeLibrary` -> `ID3D12PipelineLibrary::Serialize`, into the
+/// buffer the runtime sized from [`calc_serialized_library_size`].
 ///
 /// # Safety
-/// Trivially safe: `p_blob` is not dereferenced, which is the whole of the
-/// refusal.
+/// `p_blob`, when non-null, must address the number of writable bytes the
+/// last `pfnCalcSerializedLibrarySize` on this library answered.
 unsafe extern "system" fn serialize_library(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    _h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
-    _p_blob: *mut c_void,
+    h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
+    p_blob: *mut c_void,
 ) -> ddi12::HRESULT {
-    note_refusal(&L6_REFUSALS.pipeline_library_refused);
-    helios_umd_common::hr::E_NOTIMPL
+    if !crate::knobs12::umd12_pipeline_library() {
+        note_refusal(&L6_REFUSALS.pipeline_library_refused);
+        return helios_umd_common::hr::E_NOTIMPL;
+    }
+    // SAFETY: the caller guarantees a live library handle.
+    let Some(state) = (unsafe { library_state(h_library) }) else {
+        note_refusal(&L6_REFUSALS.pipeline_library_unexpected);
+        return E_INVALIDARG;
+    };
+    let size = state
+        .serialized_size
+        .load(core::sync::atomic::Ordering::Acquire);
+    if p_blob.is_null() || size == 0 {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the runtime allocated `size` bytes at `p_blob` (the answer of the
+    // paired calc-size call), writable for the duration of this call.
+    let buf = unsafe { core::slice::from_raw_parts_mut(p_blob.cast::<u8>(), size) };
+    // SAFETY: a live engine library writing into `buf`, which it bounds-checks
+    // against its own required size.
+    match unsafe { state.library.Serialize(buf) } {
+        Ok(()) => S_OK,
+        Err(e) => {
+            note_refusal(&L6_REFUSALS.pipeline_library_engine_failed);
+            e.code().0
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2414,10 +2655,10 @@ pub(crate) struct L6Refusals {
     /// enable. ⚠ Expected 0; a hit means per-face stencil ops are being applied
     /// where the runtime asked for them not to be.
     pub(crate) depth_stencil_face_enable_folded: RefusalCounter,
-    /// An object arrived carrying a non-null `LibraryReference::hLibrary`, i.e.
-    /// the runtime asked for it to come out of a pipeline library this lane
-    /// refuses. ⚠ Expected 0 while `L6PipelineLibraryRefused` is also 0; the
-    /// two move together.
+    /// A sub-state or shader object arrived carrying a non-null
+    /// `LibraryReference::hLibrary`. These have no engine object to load, so
+    /// the reference is ignored and the object built from its desc; benign.
+    /// Also bumped when a PSO's reference names a library with an empty slot.
     pub(crate) library_reference_ignored: RefusalCounter,
 
     // ── shaders (c), bumped from `shaders.rs` ──────────────────────────────
@@ -2572,14 +2813,12 @@ pub(crate) struct L6Refusals {
     pub(crate) pso_engine_failed: RefusalCounter,
 
     // ── pipeline libraries (e) ─────────────────────────────────────────────
-    /// A pipeline-library slot was called and refused with `E_NOTIMPL`. ⚠
-    /// Expected 0 on dwm and on most apps; non-zero means an application is
-    /// asking for a persistent PSO cache and falling back to direct creation.
+    /// A pipeline-library slot was called and refused with `E_NOTIMPL`
+    /// because `Umd12PipelineLibrary=0`. Expected 0 with the default knob.
     pub(crate) pipeline_library_refused: RefusalCounter,
-    /// `pfnDestroyPipelineLibrary` on a library that was never created. ⛔
-    /// Expected 0 — [`create_pipeline_library`] refuses every one, so reaching
-    /// the destroy means the runtime tracked a library this driver does not
-    /// have.
+    /// A library slot was called on a handle whose create did not store an
+    /// engine library. ⛔ Expected 0: the runtime only passes libraries whose
+    /// create succeeded.
     pub(crate) pipeline_library_unexpected: RefusalCounter,
 
     // ── the error channel ──────────────────────────────────────────────────
@@ -2629,6 +2868,22 @@ pub(crate) struct L6Refusals {
     /// shader handle stays clear and SetErrorCb receives E_OUTOFMEMORY.
     /// Expected zero in valid runs without allocation-failure injection.
     pub(crate) stream_output_out_of_memory: RefusalCounter,
+
+    // ── pipeline-library passthrough, appended ─────────────────────────────
+    /// Engine pipeline libraries created. Not a refusal.
+    pub(crate) pipeline_library_created: RefusalCounter,
+    /// The engine refused a library create or serialize (a stale blob answers
+    /// `D3D12_ERROR_DRIVER_VERSION_MISMATCH`; the app then starts empty).
+    pub(crate) pipeline_library_engine_failed: RefusalCounter,
+    /// `pfnAddPipelineStateToLibrary` calls the engine stored. Not a refusal.
+    pub(crate) pipeline_library_stored: RefusalCounter,
+    /// `StorePipeline` refused, or the PSO handle was empty.
+    pub(crate) pipeline_library_store_failed: RefusalCounter,
+    /// PSOs taken out of a library instead of compiled. Not a refusal.
+    pub(crate) pipeline_library_loaded: RefusalCounter,
+    /// A PSO named a library entry the engine could not load; it was created
+    /// from its desc instead. Expected on the first run after a driver update.
+    pub(crate) pipeline_library_load_fallback: RefusalCounter,
 }
 
 pub(crate) static L6_REFUSALS: L6Refusals = L6Refusals {
@@ -2668,6 +2923,12 @@ pub(crate) static L6_REFUSALS: L6Refusals = L6Refusals {
     pso_sub_state_unresolved: RefusalCounter::new("L6PsoSubStateUnresolved"),
     pso_view_instancing_bad_arg: RefusalCounter::new("L6PsoViewInstancingBadArg"),
     stream_output_out_of_memory: RefusalCounter::new("L6StreamOutputOutOfMemory"),
+    pipeline_library_created: RefusalCounter::new("L6PipelineLibraryCreated"),
+    pipeline_library_engine_failed: RefusalCounter::new("L6PipelineLibraryEngineFailed"),
+    pipeline_library_stored: RefusalCounter::new("L6PipelineLibraryStored"),
+    pipeline_library_store_failed: RefusalCounter::new("L6PipelineLibraryStoreFailed"),
+    pipeline_library_loaded: RefusalCounter::new("L6PipelineLibraryLoaded"),
+    pipeline_library_load_fallback: RefusalCounter::new("L6PipelineLibraryLoadFallback"),
 };
 
 /// L6's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -2711,4 +2972,10 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L6_REFUSALS.pso_sub_state_unresolved,
     &L6_REFUSALS.pso_view_instancing_bad_arg,
     &L6_REFUSALS.stream_output_out_of_memory,
+    &L6_REFUSALS.pipeline_library_created,
+    &L6_REFUSALS.pipeline_library_engine_failed,
+    &L6_REFUSALS.pipeline_library_stored,
+    &L6_REFUSALS.pipeline_library_store_failed,
+    &L6_REFUSALS.pipeline_library_loaded,
+    &L6_REFUSALS.pipeline_library_load_fallback,
 ];

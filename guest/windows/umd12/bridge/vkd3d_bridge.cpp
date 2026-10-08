@@ -56,6 +56,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <new>
 #include <share.h>
@@ -978,6 +980,91 @@ std::unique_ptr<HeliosVkd3dDevice> create_on_nvk(LUID luid, std::uint32_t minimu
   return out;
 }
 
+// ── vkd3d's disk shader cache location ──────────────────────────────────────
+//
+// With `VKD3D_SHADER_CACHE_PATH` unset vkd3d writes `vkd3d-proton.cache` into
+// the process's CURRENT DIRECTORY (`libs/vkd3d/cache.c`,
+// `vkd3d_pipeline_library_init_disk_cache`): a game's install folder, often not
+// writable, and shared by every exe launched from it. So the bridge picks a
+// per-user directory instead; vkd3d appends `vkd3d-proton.<exe>.cache` to it.
+//
+// The longest directory accepted. vkd3d builds its paths in `_MAX_PATH`
+// buffers and appends `\vkd3d-proton.<exe>.cache.write`, so a deep profile
+// path must fall through to the next candidate rather than truncate.
+constexpr std::size_t kShaderCacheDirMax = 150;
+
+/// `<base>\Helios\vkd3d`, created, probed writable and representable in the
+/// ANSI code page (vkd3d reads the variable with `GetEnvironmentVariableA` and
+/// opens the files with A-calls). Writes the ANSI path to `out` on success.
+bool usable_shader_cache_dir(const wchar_t* base, char* out, std::size_t out_size) {
+  if (!base || !base[0]) return false;
+  std::size_t n = wcslen(base);
+  while (n && (base[n - 1] == L'\\' || base[n - 1] == L'/')) --n;
+  if (!n) return false;
+  wchar_t dir[MAX_PATH];
+  if (_snwprintf_s(dir, MAX_PATH, _TRUNCATE, L"%.*ls\\Helios", (int)n, base) < 0) return false;
+  CreateDirectoryW(dir, nullptr);
+  if (wcscat_s(dir, MAX_PATH, L"\\vkd3d") != 0) return false;
+  if (!CreateDirectoryW(dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+  // A directory that exists is not one this process may write (a sandboxed
+  // or impersonating process sees the user's profile but cannot create in it).
+  wchar_t probe[MAX_PATH];
+  if (_snwprintf_s(probe, MAX_PATH, _TRUNCATE, L"%ls\\.probe-%lu", dir,
+                   (unsigned long)GetCurrentProcessId()) < 0)
+    return false;
+  HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  CloseHandle(h);
+  BOOL lossy = FALSE;
+  const int len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, dir, -1, out,
+                                      (int)out_size, nullptr, &lossy);
+  return len > 0 && !lossy && std::strlen(out) <= kShaderCacheDirMax;
+}
+
+/// Set `VKD3D_SHADER_CACHE_PATH` unless the process already has one. Runs
+/// inside the bridge's env `call_once`, before the first vkd3d instance reads
+/// its config.
+///
+/// Candidates, first usable wins:
+///   1. `%LOCALAPPDATA%\Helios\vkd3d` — the per-user default;
+///   2. `<GetTempPathW>\Helios\vkd3d` — service accounts without a profile
+///      (`SYSTEM` gets `C:\Windows\Temp`);
+///   3. `0` — vkd3d's own "no disk cache" value, which leaves only the
+///      application's pipeline libraries. Better than writing into the CWD.
+void configure_shader_cache_path() {
+  char existing[MAX_PATH] = {};
+  const DWORD have = GetEnvironmentVariableA("VKD3D_SHADER_CACHE_PATH", existing,
+                                             (DWORD)sizeof(existing));
+  char msg[MAX_PATH + 96];
+  if (have > 0) {
+    std::snprintf(msg, sizeof(msg), "vkd3d env: VKD3D_SHADER_CACHE_PATH=%s (pre-set, kept)",
+                  have < sizeof(existing) ? existing : "<long value>");
+    umd_log(msg);
+    return;
+  }
+
+  char chosen[MAX_PATH] = {};
+  const char* source = nullptr;
+  wchar_t base[MAX_PATH];
+  DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+  if (got > 0 && got < MAX_PATH && usable_shader_cache_dir(base, chosen, sizeof(chosen))) {
+    source = "LOCALAPPDATA";
+  } else {
+    got = GetTempPathW(MAX_PATH, base);
+    if (got > 0 && got < MAX_PATH && usable_shader_cache_dir(base, chosen, sizeof(chosen))) {
+      source = "temp";
+    } else {
+      std::snprintf(chosen, sizeof(chosen), "0");
+      source = "no writable directory, disk cache off";
+    }
+  }
+  _putenv_s("VKD3D_SHADER_CACHE_PATH", chosen);
+  std::snprintf(msg, sizeof(msg), "vkd3d env: VKD3D_SHADER_CACHE_PATH=%s (set by bridge: %s)",
+                chosen, source);
+  umd_log(msg);
+}
+
 }  // namespace
 
 std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
@@ -999,6 +1086,10 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
     // ⛔ `VKD3D_DEBUG` and `VKD3D_CONFIG` are deliberately NOT set here. They
     // change engine behaviour and verbosity; a driver that pins them removes
     // the operator's only lever and makes every measurement configuration-blind.
+    //
+    // `VKD3D_SHADER_CACHE_PATH` is the one exception, and only when absent:
+    // vkd3d's default is the CWD (see `configure_shader_cache_path`). A
+    // pre-set value, including `0`, is kept.
     const char* existing = std::getenv("VKD3D_LOG_FILE");
     char chosen[MAX_PATH] = {};
     if (existing && existing[0]) {
@@ -1016,6 +1107,8 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
                   "vkd3d env configured once: VKD3D_LOG_FILE=%s (%s)", chosen,
                   (existing && existing[0]) ? "pre-set, kept" : "set by bridge");
     umd_log(msg);
+
+    configure_shader_cache_path();
   });
 
   // S5 (dxvk-on-nvk): global NVK with a deny-list, Venus whenever NVK is denied,
