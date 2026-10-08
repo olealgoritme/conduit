@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 01:02:58 +0200
+Subject: [PATCH] nvk: indirect draw records through the pushbuffer
+ (NVK_INDIRECT_PUSH)
+
+CS2 on 405.8 (1920x1080 windowed, 2x MSAA) spends 548 of 998 GPU ms/s in
+a depth prepass of about 80 draw calls, 77 of them vkCmdDrawIndexedIndirect
+with 2.6 draws each: 8.6 ms per pass, 30-45 us per indirect draw, while
+the direct draws of the same frame cost a few us per pass.  Batching the
+MME reads (NVK_MDI_BATCH, 0024) changed nothing, and making host-visible
+and descriptor memory GPU-uncached (NVK_RM_SYSMEM_CACHED=0) made the pass
+4.6 ms: the cost is in the per-draw memory reads, not in the batching.
+
+On Turing+ every indirect draw is an MME_DMA_READ_FIFOED of its record
+that the front end waits for before it can draw.  Before Turing NVK
+instead points a pushbuffer segment at the records and lets the host
+fetch them as the macro's inline data.  NVK_INDIRECT_PUSH (default on;
+=0 restores the MME reads) does that on Turing+ too:
+vkCmdDraw[Indexed]Indirect calls new NVK_MME_DRAW[_INDEXED]_INDIRECT_INLINE
+macros whose records follow the parameters in the pushbuffer, from a
+no-prefetch GPFIFO entry (SYNC_WAIT, as nvk_cmd_buffer_push_indirect does
+for pre-Turing) so the host fetches them only after the work that may
+have written them.  One wait per call instead of one memory round trip
+per draw; padding of larger strides is dropped and gl_DrawID continues
+across the segments a long multi-draw is split into.  Indirect count
+draws keep the MME reads (the count is only known on the GPU).
+
+Also:
+- NVK_PASS_PROFILE=2 reported its counters at pipeline location ALL,
+  which faulted the channel in CS2.  Each counter is now reported at its
+  own location with flush_disable, as NVK's pipeline statistics queries
+  do; the ZCULL counters only with NVK_PASS_PROFILE=3, at the ZCULL
+  location.
+- NVK_RM_SYSMEM_CACHED=desc or =app makes only descriptor memory or only
+  coherent host-visible memory GPU-cacheable, to tell which of the two
+  the GPU reads on the slow path (1 and 0 unchanged).
+
+Checked in the MME simulator: the inline macro's method stream equals the
+per-record DMA loop's for strides of 4-16 dwords, 1-1000 draws and the
+segment splits.  Not measured on hardware yet.
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c          | 117 ++++++++++++++++++---
+ src/nouveau/vulkan/nvk_mme.c               |   2 +
+ src/nouveau/vulkan/nvk_mme.h               |   4 +
+ src/nouveau/vulkan/nvk_pass_profile.c      |  50 ++++++---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |   6 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c |  18 +++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c |   9 +-
+ 7 files changed, 172 insertions(+), 34 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 97abdf2c..347860aa 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -5599,22 +5599,33 @@ nvk_mdi_batch(void)
+    return s - 1;
+ }
+ 
++/* dma: the records come from one MME_DMA_READ_FIFOED (NVK_MDI_BATCH);
++ * else they follow the parameters in the pushbuffer (NVK_INDIRECT_PUSH).
++ */
+ static void
+-nvk_mme_build_draw_indirect_batch(struct mme_builder *b, bool indexed)
++nvk_mme_build_draw_indirect_batch(struct mme_builder *b, bool indexed,
++                                  bool dma)
+ {
+-   /* Only called on Turing+ (nvk_cmd_draw_indirect_batched()) */
++   /* Only called on Turing+ (nvk_cmd_draw_indirect_batched/pushed()) */
+    if (b->devinfo->cls_eng3d < TURING_A)
+       return;
+ 
+-   struct mme_value64 draw_addr = mme_load_addr64(b);
+-   struct mme_value read_dw = mme_load(b);
+-   struct mme_value pad_dw = mme_load(b);
+-   struct mme_value draw = mme_load(b);
+-   struct mme_value draw_end = mme_load(b);
+-
+-   mme_tu104_read_fifoed(b, draw_addr, read_dw);
+-   mme_free_reg64(b, draw_addr);
+-   mme_free_reg(b, read_dw);
++   struct mme_value pad_dw, draw, draw_end;
++   if (dma) {
++      struct mme_value64 draw_addr = mme_load_addr64(b);
++      struct mme_value read_dw = mme_load(b);
++      pad_dw = mme_load(b);
++      draw = mme_load(b);
++      draw_end = mme_load(b);
++
++      mme_tu104_read_fifoed(b, draw_addr, read_dw);
++      mme_free_reg64(b, draw_addr);
++      mme_free_reg(b, read_dw);
++   } else {
++      pad_dw = mme_load(b);
++      draw = mme_load(b);
++      draw_end = mme_load(b);
++   }
+ 
+    struct mme_value first = mme_mov(b, draw);
+    mme_while(b, ult, draw, draw_end) {
+@@ -5640,13 +5651,83 @@ nvk_mme_build_draw_indirect_batch(struct mme_builder *b, bool indexed)
+ void
+ nvk_mme_draw_indirect_batch(struct mme_builder *b)
+ {
+-   nvk_mme_build_draw_indirect_batch(b, false);
++   nvk_mme_build_draw_indirect_batch(b, false, true);
+ }
+ 
+ void
+ nvk_mme_draw_indexed_indirect_batch(struct mme_builder *b)
+ {
+-   nvk_mme_build_draw_indirect_batch(b, true);
++   nvk_mme_build_draw_indirect_batch(b, true, true);
++}
++
++void
++nvk_mme_draw_indirect_inline(struct mme_builder *b)
++{
++   nvk_mme_build_draw_indirect_batch(b, false, false);
++}
++
++void
++nvk_mme_draw_indexed_indirect_inline(struct mme_builder *b)
++{
++   nvk_mme_build_draw_indirect_batch(b, true, false);
++}
++
++/* NVK_INDIRECT_PUSH (Turing+, default on; =0 is upstream's MME DMA reads):
++ * the draw records of vkCmdDraw[Indexed]Indirect reach the MME as inline
++ * macro data fetched by the host from the indirect buffer itself (a
++ * pushbuffer segment pointing at the records, as NVK does before Turing),
++ * instead of an MME_DMA_READ_FIFOED per draw that the front end waits for.
++ * The segment is a no-prefetch GPFIFO entry (SYNC_WAIT), so it is fetched
++ * only after the work before it, which may have written the records, is
++ * done; one wait per call instead of one memory round trip per draw.
++ */
++static bool
++nvk_indirect_push(void)
++{
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      s = debug_get_bool_option("NVK_INDIRECT_PUSH", true) ? 2 : 1;
++      p_atomic_set(&state, s);
++   }
++   return s == 2;
++}
++
++static bool
++nvk_cmd_draw_indirect_pushed(struct nvk_cmd_buffer *cmd, bool indexed,
++                             uint64_t draw_addr, uint32_t draw_count,
++                             uint64_t stride)
++{
++   if (!nvk_indirect_push() || nvk_cmd_buffer_3d_cls(cmd) < TURING_A)
++      return false;
++
++   const uint32_t rec_dw = indexed ? 5 : 4;
++   assert(stride % 4 == 0 && stride / 4 >= rec_dw);
++   const uint32_t stride_dw = stride / 4;
++   /* The macro's 3 parameters and the records in one method's data */
++   const uint32_t max_dw = NV_PUSH_MAX_COUNT - 3;
++   if (stride_dw > max_dw - rec_dw)
++      return false;
++   const uint32_t max_n = (max_dw - rec_dw) / stride_dw + 1;
++
++   for (uint32_t first = 0; first < draw_count;) {
++      const uint32_t n = MIN2(max_n, draw_count - first);
++      const uint64_t addr = draw_addr + (uint64_t)first * stride;
++      const uint32_t rec_total_dw = (n - 1) * stride_dw + rec_dw;
++
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
++      P_1INC(p, NV9097, CALL_MME_MACRO(indexed ?
++                                       NVK_MME_DRAW_INDEXED_INDIRECT_INLINE :
++                                       NVK_MME_DRAW_INDIRECT_INLINE));
++      P_INLINE_DATA(p, stride_dw - rec_dw);
++      P_INLINE_DATA(p, first);
++      P_INLINE_DATA(p, first + n);
++      nv_push_update_count(p, rec_total_dw);
++      nvk_cmd_buffer_push_indirect(cmd, addr, rec_total_dw * 4);
++
++      first += n;
++   }
++   return true;
+ }
+ 
+ /* Returns false when the batch path does not apply (the caller takes the
+@@ -5720,7 +5801,10 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+-   if (nvk_cmd_draw_indirect_batched(cmd, false, pInfo->addressRange.address,
++   if (nvk_cmd_draw_indirect_pushed(cmd, false, pInfo->addressRange.address,
++                                    pInfo->drawCount, stride)) {
++      /* NVK_INDIRECT_PUSH */
++   } else if (nvk_cmd_draw_indirect_batched(cmd, false, pInfo->addressRange.address,
+                                      pInfo->drawCount, stride)) {
+       /* NVK_MDI_BATCH */
+    } else if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+@@ -5833,7 +5917,10 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+-   if (nvk_cmd_draw_indirect_batched(cmd, true, pInfo->addressRange.address,
++   if (nvk_cmd_draw_indirect_pushed(cmd, true, pInfo->addressRange.address,
++                                    pInfo->drawCount, stride)) {
++      /* NVK_INDIRECT_PUSH */
++   } else if (nvk_cmd_draw_indirect_batched(cmd, true, pInfo->addressRange.address,
+                                      pInfo->drawCount, stride)) {
+       /* NVK_MDI_BATCH */
+    } else if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+diff --git a/src/nouveau/vulkan/nvk_mme.c b/src/nouveau/vulkan/nvk_mme.c
+index bc4ba398..e59611b3 100644
+--- a/src/nouveau/vulkan/nvk_mme.c
++++ b/src/nouveau/vulkan/nvk_mme.c
+@@ -42,6 +42,8 @@ static const nvk_mme_builder_func mme_builders[NVK_MME_COUNT] = {
+    [NVK_MME_DRAW_MESH_INDIRECT_COUNT]      = nvk_mme_draw_mesh_indirect_count,
+    [NVK_MME_DRAW_INDIRECT_BATCH]           = nvk_mme_draw_indirect_batch,
+    [NVK_MME_DRAW_INDEXED_INDIRECT_BATCH]   = nvk_mme_draw_indexed_indirect_batch,
++   [NVK_MME_DRAW_INDIRECT_INLINE]          = nvk_mme_draw_indirect_inline,
++   [NVK_MME_DRAW_INDEXED_INDIRECT_INLINE]  = nvk_mme_draw_indexed_indirect_inline,
+ };
+ 
+ static const struct nvk_mme_test_case *mme_tests[NVK_MME_COUNT] = {
+diff --git a/src/nouveau/vulkan/nvk_mme.h b/src/nouveau/vulkan/nvk_mme.h
+index e2bdea05..761173e8 100644
+--- a/src/nouveau/vulkan/nvk_mme.h
++++ b/src/nouveau/vulkan/nvk_mme.h
+@@ -46,6 +46,8 @@ enum nvk_mme {
+    NVK_MME_DRAW_MESH_INDIRECT_COUNT,
+    NVK_MME_DRAW_INDIRECT_BATCH,
+    NVK_MME_DRAW_INDEXED_INDIRECT_BATCH,
++   NVK_MME_DRAW_INDIRECT_INLINE,
++   NVK_MME_DRAW_INDEXED_INDIRECT_INLINE,
+ 
+    NVK_MME_COUNT,
+ };
+@@ -263,6 +265,8 @@ void nvk_mme_draw_mesh_indirect(struct mme_builder *b);
+ void nvk_mme_draw_mesh_indirect_count(struct mme_builder *b);
+ void nvk_mme_draw_indirect_batch(struct mme_builder *b);
+ void nvk_mme_draw_indexed_indirect_batch(struct mme_builder *b);
++void nvk_mme_draw_indirect_inline(struct mme_builder *b);
++void nvk_mme_draw_indexed_indirect_inline(struct mme_builder *b);
+ 
+ uint32_t nvk_mme_tess_params(mesa_shader_stage stage,
+                              enum nak_ts_domain domain,
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
+index f543f1a5..4d58c7f2 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.c
++++ b/src/nouveau/vulkan/nvk_pass_profile.c
+@@ -111,21 +111,42 @@ struct prof_slot_gpu {
+ 
+ /* NVK_PASS_PROFILE=2: counters sampled at the start and the end of a pass */
+ #define PROF_STATS 8
++/* Each counter is reported at its own pipeline location, as NVK's pipeline
++ * statistics queries do (nvk_3d_stat_queries): reporting them at location
++ * ALL faulted the channel in CS2 (405.8).  The ZCULL counters are only
++ * sampled with NVK_PASS_PROFILE=3, at the ZCULL location.
++ */
++#define PROF_STATS_BASIC 4
+ static const struct {
+    uint32_t report;
++   uint32_t loc;
+    const char *name;
+    bool counter32;
+ } prof_stats[PROF_STATS] = {
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_VS_INVOCATIONS, "vs", false },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_INVOCATIONS, "prims-in", false },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_PRIMITIVES_GENERATED, "prims-out", false },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_PS_INVOCATIONS, "ps", false },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS0, "zc0", true },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS1, "zc1", true },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS2, "zc2", true },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS3, "zc3", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_VS_INVOCATIONS,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_VERTEX_SHADER, "vs", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_INVOCATIONS,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_VPC, "prims-in", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_PRIMITIVES_GENERATED,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_VPC, "prims-out", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_PS_INVOCATIONS,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_PIXEL_SHADER, "ps", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS0,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_ZCULL, "zc0", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS1,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_ZCULL, "zc1", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS2,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_ZCULL, "zc2", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS3,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_ZCULL, "zc3", true },
+ };
+ 
++static unsigned
++prof_stat_count(unsigned level)
++{
++   return level >= 3 ? PROF_STATS : PROF_STATS_BASIC;
++}
++
+ struct prof_stat_gpu {
+    struct prof_report begin[PROF_STATS];
+    struct prof_report end[PROF_STATS];
+@@ -570,9 +591,9 @@ prof_emit_stats(struct nvk_cmd_buffer *cmd, uint32_t stat, bool end)
+                          stat * sizeof(struct prof_stat_gpu) +
+                          (end ? offsetof(struct prof_stat_gpu, end) : 0);
+ 
+-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 2 + PROF_STATS * 5);
+-   P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);
+-   for (unsigned i = 0; i < PROF_STATS; i++) {
++   const unsigned n = prof_stat_count(prof->level);
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, n * 5);
++   for (unsigned i = 0; i < n; i++) {
+       const uint64_t addr = base + i * sizeof(struct prof_report);
+       P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
+       P_NV9097_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
+@@ -580,9 +601,10 @@ prof_emit_stats(struct nvk_cmd_buffer *cmd, uint32_t stat, bool end)
+       P_NV9097_SET_REPORT_SEMAPHORE_C(p, 0);
+       P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
+          .operation = OPERATION_REPORT_ONLY,
+-         .pipeline_location = PIPELINE_LOCATION_ALL,
++         .pipeline_location = prof_stats[i].loc,
+          .report = prof_stats[i].report,
+          .structure_size = STRUCTURE_SIZE_FOUR_WORDS,
++         .flush_disable = true,
+       });
+    }
+ }
+@@ -886,7 +908,7 @@ prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
+       const double sn = (double)s->stat_count;
+       char line[256];
+       int l = 0;
+-      for (unsigned i = 0; i < PROF_STATS && l < (int)sizeof(line); i++)
++      for (unsigned i = 0; i < prof_stat_count(prof->level) && l < (int)sizeof(line); i++)
+          l += snprintf(line + l, sizeof(line) - l, " %s %.0f",
+                        prof_stats[i].name, s->stats[i] / sn);
+       prof_log(prof, "NVK pass profile:            per pass:%s", line);
+@@ -920,7 +942,7 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+       ps->barriers += m->counts.barriers;
+       if (m->stat != 0 && prof->stat_gpu != NULL) {
+          volatile struct prof_stat_gpu *st = &prof->stat_gpu[m->stat - 1];
+-         for (unsigned k = 0; k < PROF_STATS; k++) {
++         for (unsigned k = 0; k < prof_stat_count(prof->level); k++) {
+             uint64_t b, e;
+             if (prof_stats[k].counter32) {
+                b = st->begin[k].payload;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 5fcc5bbb..eeeff87b 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -318,6 +318,12 @@ struct nvkmd_rm_dev {
+ 
+    /* Map coherent host-visible system memory GPU-cacheable */
+    bool sysmem_cached;
++   /* NVK_RM_SYSMEM_CACHED=desc / =app: only descriptor memory
++    * (NVKMD_MEM_GPU_READ_ONLY) / only coherent host-visible memory is
++    * GPU-cacheable (an A/B split of the default, both).
++    */
++   bool sysmem_cached_desc;
++   bool sysmem_cached_app;
+ 
+    /* lib->win_loss_epoch() when the device was created; see
+     * nvkmd_rm_dev_lost()
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 80d05e1c..18d3357b 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -9,6 +9,7 @@
+ #include "c11/threads.h"
+ #include <inttypes.h>
+ #include "util/log.h"
++#include "util/os_misc.h"
+ #include "util/os_time.h"
+ #include "util/u_debug.h"
+ #include "util/u_math.h"
+@@ -142,7 +143,22 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    simple_mtx_init(&dev->drm_mutex, mtx_plain);
+    simple_mtx_init(&dev->rmfence_mutex, mtx_plain);
+ #endif
+-   dev->sysmem_cached = debug_get_bool_option("NVK_RM_SYSMEM_CACHED", true);
++   {
++      /* 1 (default): descriptor and host-visible memory GPU-cacheable;
++       * 0: neither; desc / app: only one of them (A/B split).
++       */
++      const char *c = os_get_option("NVK_RM_SYSMEM_CACHED");
++      if (c != NULL && strcmp(c, "desc") == 0) {
++         dev->sysmem_cached_desc = true;
++      } else if (c != NULL && strcmp(c, "app") == 0) {
++         dev->sysmem_cached_app = true;
++      } else {
++         const bool on = debug_get_bool_option("NVK_RM_SYSMEM_CACHED", true);
++         dev->sysmem_cached_desc = on;
++         dev->sysmem_cached_app = on;
++      }
++      dev->sysmem_cached = dev->sysmem_cached_desc || dev->sysmem_cached_app;
++   }
+ 
+    list_inithead(&dev->base.mems);
+    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 08c2e901..b3bd6d93 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -328,10 +328,11 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+     */
+    const bool force_rm_sysmem = (flags & NVKMD_RM_MEM_RM_SYSMEM) ||
+                                 (flags & NVKMD_MEM_SHARED);
+-   const bool gpu_cacheable = (((flags & NVKMD_MEM_GART) &&
+-                                (flags & NVKMD_MEM_COHERENT)) ||
+-                               (flags & NVKMD_MEM_GPU_READ_ONLY)) &&
+-                              !force_rm_sysmem && dev->sysmem_cached;
++   const bool gpu_cacheable =
++      ((dev->sysmem_cached_app && (flags & NVKMD_MEM_GART) &&
++        (flags & NVKMD_MEM_COHERENT) && !(flags & NVKMD_MEM_GPU_READ_ONLY)) ||
++       (dev->sysmem_cached_desc && (flags & NVKMD_MEM_GPU_READ_ONLY))) &&
++      !force_rm_sysmem;
+    flags &= ~NVKMD_RM_MEM_RM_SYSMEM;
+ 
+    /* Kinds are applied per mapping (the image's own VA).  The layout is only
+-- 
+2.43.0
+
