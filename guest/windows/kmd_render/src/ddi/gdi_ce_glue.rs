@@ -125,6 +125,11 @@ pub(crate) fn foreign_to_standard(
 /// How often a call that found the channel's I/O held by another thread tries again (1 ms apart).
 const BUSY_TRIES: u32 = 10;
 
+/// `RedirVram` in force for this start (`vidmem::knob_on`).
+pub(crate) fn vram_knob_on() -> bool {
+    vidmem::knob_on()
+}
+
 /// Is `resource_id` an RM-VRAM-backed surface (`vidmem::lookup`)? Spinlock-only, any IRQL up to
 /// DISPATCH.
 pub(crate) fn is_vram(resource_id: u32) -> bool {

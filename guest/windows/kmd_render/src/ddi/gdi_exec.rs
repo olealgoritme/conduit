@@ -202,6 +202,14 @@ fn ensure_channel(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
     }
 }
 
+/// The executor thread's first act: the channel up before any job asks (`RedirVram` on and the
+/// channel cold). PASSIVE.
+pub(crate) fn warm_up(passive: PassiveLevel, adapter: &AdapterContext) {
+    if crate::ddi::gdi_accel::on() && glue::vram_knob_on() && glue::channel_state() == 1 {
+        let _ = ensure_channel(passive, adapter);
+    }
+}
+
 fn needs_channel(op: &Op) -> bool {
     op.engine == Engine::Ce
         || op.why == Some(Why::SystemSurface)

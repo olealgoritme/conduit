@@ -161,6 +161,13 @@ pub(crate) fn stop() {
 unsafe extern "C" fn routine(_context: *mut c_void) {
     // SAFETY: a system thread runs at PASSIVE_LEVEL.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    // Bring the copy-engine channel up now, at the first GDI buffer of the session, rather than
+    // inside the first job that needs it (`GdiChUpUs`, ~13 ms once per start).
+    let a = ADAPTER.load(Ordering::Acquire);
+    if a != 0 && STOPPING.load(Ordering::Acquire) == 0 {
+        // SAFETY: as in the loop below.
+        crate::ddi::gdi_exec::warm_up(passive, unsafe { &*(a as *const AdapterContext) });
+    }
     loop {
         // SAFETY: initialised event; a kick or a stop wakes it.
         let _ = unsafe { KeWaitForSingleObject(REQ.0.get() as PVOID, 0, 0, 0, core::ptr::null_mut()) };
