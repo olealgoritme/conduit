@@ -865,7 +865,7 @@ to VRAM, 1 rect, about 1.3 ms each, three of the 16 commands in the 12 ms job at
 (BitBlt, CPU, staging to staging, 32.7 ms at 5120x1440) left no `GdiSys*` trace because the staging
 copy-engine path only takes SRCCOPY and PATCOPY (`Why::SystemSurface`). These carried `Why::Rop`
 (`GdiMask` 0x46 has bit 1 set), so they went straight to the CPU. The copy engine has no raster
-operations. Since 373.1:
+operations. Since the head after 372.1 (d14580e5):
 * a `ROP3` BitBlt whose result is the source alone (0xCC, or any code with the same P = 0 half) is
   parsed as SRCCOPY, and a `ROP3` fill of 0xF0 as PATCOPY, so both take the copy engine;
 * the CPU runs every unscaled BitBlt row by row through a two-input truth table on whole words
