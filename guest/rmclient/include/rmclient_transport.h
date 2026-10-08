@@ -335,6 +335,11 @@ int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeou
  * records it when it starts and is lost once it differs. 0 off Windows. */
 int32_t crm_win_loss_epoch(void);
 
+/* Wakes this process's threads blocked in crm_event_wait on event channel
+ * `fd`, with no KMD call (a CPU-side signal raises no GPU interrupt).
+ * 0, -ENOENT when no wait registered `fd` yet, -ENOSYS off Windows. */
+int crm_win_event_kick(int fd);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

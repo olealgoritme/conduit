@@ -780,6 +780,7 @@ pins another one. `patches-windows-dxvk/` is applied after
 | 2 | no `VK_KHR_present_id`/`present_wait(2)` on Windows | the Win32 WSI has no `wait_for_present`; DXVK uses present wait when offered and hit `assert(swapchain->wait_for_present)` |
 | 3 | R/B swizzle in the GDI present for R8G8B8A8 swapchains | the DIB is BGRA; DXVK picked `R8G8B8A8_UNORM`, so the sky came out orange |
 | 4 | `NVK_RM_WAIT_SPIN`, `NVK_RM_WAIT_POLL_MS` | knobs for measuring the CPU wait path |
+| 5 | CPU waits without a host round trip per wake; CPU signals wake waiters | a wake no longer reads the event's data (`NV_ESC_RM_GET_EVENT_DATA`, a synchronous host escape of ~60-100 us, ~10 per frame in a D3D11 game, that never finds anything: the non-stall event is allocated `NV01_EVENT_WITHOUT_EVENT_DATA`; `NVK_RM_EVENT_DRAIN=1` reads as before); a host signal or a raised pending value kicks the process's wait handle through librmclient's `crm_win_event_kick` instead of waiting for the next GPU interrupt or the 10 ms poll (`NVK_RM_CPU_KICK=0` off); `NVK_RM_WAIT_SPIN_US=N` polls N us before blocking (default 0). Needs librmclient with `crm_win_event_kick` for the kick (older: as before) |
 
 The upstream DXVK 3.1.1 release `d3d11.dll` is quarantined by Windows
 Defender in the guest (a false positive). The fork build is not.
@@ -1019,7 +1020,7 @@ The canonical Windows build: every finished NVK-on-RM patch in one series.
 | 5 | `patches-windows/0026` | shader cache on Windows |
 | 6 | `patches-windows/0027-0029` | L2-cached sysmem, compression, ZCULL info (`NVK_RM_SYSMEM_CACHED=0`, `NVK_RM_COMPRESSION=0`, `NVK_RM_ZCULL=0`) |
 | 7 | `patches-windows/0035` | H.264 decode on NVDEC (`NVK_EXPERIMENTAL=video`) |
-| 8 | `patches-windows-dxvk/0001-0004` | what DXVK needs |
+| 8 | `patches-windows-dxvk/0001-0005` | what DXVK needs, CPU wait path |
 | 9 | `patches-common/0001-0007` | per-draw cost (shared with the Linux series) |
 
 0023 (S3's Helios ICD interface) is not in this stack: S3 stages its own
