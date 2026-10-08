@@ -455,7 +455,7 @@ impl FrameSums {
         log_error!(
             "D3D12 frame time ({what}, {} frames): frame {} us = ECL {} us ({} calls, of which \
              CPU wait {} us) + Present {} us + outside the driver's queue DDIs {} us; recording \
-             {} us in {} lists (Reset to Close, all threads), of which draws {} us ({}) and \
+             {} us in {} lists (Reset to Close, all threads), of which draws {} us ({}, 1 in 16 timed) and \
              barriers {} us ({})",
             self.frames,
             per(self.frame_ns),
@@ -532,7 +532,11 @@ fn ns_of(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// One draw in this many is timed (`FrameStats::draw_start`).
+const DRAW_SAMPLE: u32 = 16;
+
 std::thread_local! {
+    static DRAW_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Command lists this thread is recording, with their Reset time.
     static OPEN_LISTS: std::cell::RefCell<Vec<(usize, Instant)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -575,8 +579,25 @@ impl FrameStats {
         }
     }
 
-    pub(crate) fn note_draw(&self, elapsed: Duration) {
-        self.draw_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+    /// The start of a draw's engine call, timed for one draw in
+    /// `DRAW_SAMPLE` per thread: two `Instant`s on every one of ~50,000 draws a
+    /// frame were ~1 ms of recording CPU a frame for a statistic.
+    #[inline]
+    pub(crate) fn draw_start(&self) -> Option<Instant> {
+        DRAW_TICK.with(|t| {
+            let n = t.get();
+            t.set(n.wrapping_add(1));
+            (n % DRAW_SAMPLE == 0).then(Instant::now)
+        })
+    }
+
+    /// A draw done; `started` from [`Self::draw_start`] (scaled up by the
+    /// sampling rate when it timed this one).
+    #[inline]
+    pub(crate) fn note_draw(&self, started: Option<Instant>) {
+        if let Some(t) = started {
+            self.draw_ns.fetch_add(ns_of(t.elapsed()) * u64::from(DRAW_SAMPLE), Ordering::Relaxed);
+        }
         self.draws.fetch_add(1, Ordering::Relaxed);
     }
 

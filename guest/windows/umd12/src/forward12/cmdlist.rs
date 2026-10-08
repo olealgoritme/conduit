@@ -564,7 +564,7 @@ unsafe extern "system" fn draw_instanced(
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
     };
-    let started = std::time::Instant::now();
+    let started = super::nvk12::FRAME_STATS.draw_start();
     // SAFETY: `engine()` borrows the list this box owns; all four arguments are
     // by-value `UINT`s the engine records without dereferencing.
     unsafe {
@@ -575,7 +575,7 @@ unsafe extern "system" fn draw_instanced(
             start_instance_location,
         );
     }
-    super::nvk12::FRAME_STATS.note_draw(started.elapsed());
+    super::nvk12::FRAME_STATS.note_draw(started);
 }
 
 /// `pfnDrawIndexedInstanced` -> `ID3D12GraphicsCommandList::DrawIndexedInstanced`.
@@ -600,7 +600,7 @@ unsafe extern "system" fn draw_indexed_instanced(
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
     };
-    let started = std::time::Instant::now();
+    let started = super::nvk12::FRAME_STATS.draw_start();
     // SAFETY: as `draw_instanced`; five by-value scalars.
     unsafe {
         state.engine().DrawIndexedInstanced(
@@ -611,7 +611,7 @@ unsafe extern "system" fn draw_indexed_instanced(
             start_instance_location,
         );
     }
-    super::nvk12::FRAME_STATS.note_draw(started.elapsed());
+    super::nvk12::FRAME_STATS.note_draw(started);
 }
 
 /// `pfnDispatch` -> `ID3D12GraphicsCommandList::Dispatch`.
