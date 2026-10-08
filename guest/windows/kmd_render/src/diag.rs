@@ -1138,21 +1138,14 @@ pub mod knobs {
     /// other caps knobs at AddAdapter and StartDevice; mirrored as `GdiKnob`/`GdiCaps`.
     /// `docs/vram-redirection.md` section 10.
     pub const GDI_ACCEL: KnobName = KnobName::new(b"GdiAccel");
-    /// `GdiAccel` bisect switches (read at StartDevice with the knob on; mirrored as `GdiPaths`).
-    /// `GdiFgn` (default 1): copies from foreign NVK images on the copy engine; 0 drops them.
-    pub const GDI_FGN: KnobName = KnobName::new(b"GdiFgn");
-    /// `GdiFgnAcq` (default 0): 1 lets such a copy acquire the producer's semaphore (a copy-engine
-    /// acquire cannot time out); 0 copies the image as it is in memory.
-    pub const GDI_FGN_ACQ: KnobName = KnobName::new(b"GdiFgnAcq");
-    /// `GdiSysCe` (default 1): copies and fills over a staging buffer's copy-engine view
-    /// (`ce_sysmem::with_standard`); 0 keeps them on the CPU path.
-    pub const GDI_SYS_CE: KnobName = KnobName::new(b"GdiSysCe");
-    /// `GdiPair` (default 1): staging-to-staging copies with two views (`with_standard_pair`);
-    /// 0 keeps them on the CPU path.
-    pub const GDI_PAIR: KnobName = KnobName::new(b"GdiPair");
-    /// `GdiOvl` (default 1): an overlapping copy inside one surface (a scroll) as ordered
-    /// copy-engine bands; 0 keeps it on the CPU path.
-    pub const GDI_OVL: KnobName = KnobName::new(b"GdiOvl");
+    /// `GdiOff` (default 0): the `GdiAccel` bisect mask, read at StartDevice with the knob on and
+    /// mirrored as `GdiPaths` (the paths in force). A set bit turns a path OFF: 0x1 copies from
+    /// foreign NVK images (dropped), 0x4 copies and fills over a staging buffer's copy-engine view
+    /// (CPU instead), 0x8 two staging views at once (CPU instead), 0x10 scrolls as copy-engine
+    /// bands (CPU instead). One opt-in: 0x2 lets a foreign copy acquire the producer's semaphore.
+    /// One value with a name no counter has: the four separate switches of 365-367 shared
+    /// `GdiSysCe` with a counter, so the knob read the last boot's counter.
+    pub const GDI_OFF: KnobName = KnobName::new(b"GdiOff");
     /// `DXGK_VIDMMCAPS` extra bits (default 0 = the driver's own word). A raw mask OR'd into
     /// `MemoryManagementCaps`; only bit 9 `NonCpuVisiblePrimary` (0x200) is accepted
     /// (`helios_kmd_logic::vidmm_caps`), the rest is dropped and reported in `VmCapsXMsk`. The

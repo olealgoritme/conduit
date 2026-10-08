@@ -819,24 +819,31 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
 * ClearType's gamma row is read from the `LOOKUPTABLE` surface at `Gamma * pitch` (8 bpp, 512 entries);
   if that surface is not a standard buffer the blend runs without gamma.
 
-### 10.6b Bisect switches (365.1)
+### 10.6b Bisect switches (`GdiOff`, since 368.1)
 
-364.1 hung the guest under windowed Heaven with every new path on. Each path GDI acceleration added
-in 362-364 has its own service-key switch, read at StartDevice with `GdiAccel=1` and mirrored as
-`GdiPaths` (bit 0 `GdiFgn`, 1 `GdiFgnAcq`, 2 `GdiSysCe`, 3 `GdiPair`):
+One service-key mask, `GdiOff` (default 0), read at StartDevice with `GdiAccel=1`; the paths in force
+are mirrored as `GdiPaths` (1 foreign copies, 2 foreign acquire, 4 staging views, 8 two staging
+views, 16 scrolls; default 0x1D). A set bit turns a path off:
 
-| knob | default | 0 means |
+| bit | path | off means |
 |---|---|---|
-| `GdiFgn` | 1 | copies from foreign NVK images are dropped (`GdiFgnWhy` 9) |
-| `GdiFgnAcq` | **0** | a foreign copy does not acquire the producer's semaphore (a copy-engine acquire cannot time out; a value never reached would stall the channel the Present route shares); the image is copied as it is in memory |
-| `GdiSysCe` | 1 | copies and fills over a staging buffer's copy-engine view are not tried; the CPU path runs them |
-| `GdiPair` | 1 | staging-to-staging copies between two buffers run on the CPU |
-| `GdiOvl` | 1 | an overlapping copy inside one surface (a scroll) runs on the CPU |
+| 0x1 | copies from foreign NVK images | dropped (`GdiFgnWhy` 9) |
+| 0x2 | (opt-in) the producer-semaphore acquire of a foreign copy | default off: a copy-engine acquire cannot time out |
+| 0x4 | copies and fills over a staging buffer's copy-engine view | CPU path |
+| 0x8 | two staging views at once (`with_standard_pair`) | CPU path |
+| 0x10 | scrolls as ordered copy-engine bands | CPU path |
 
-**365.1:** the slowest command (25-34 ms, `GdiSlowOp` 0x12211/0x1012211) was an OVERLAPPING SRCCOPY
-inside one staging buffer: a scroll, which CDD sends despite `NoSameBitmapOverlappedBitBlt`. It is
-planned `Why::Overlap` and never reached the staging copy-engine path (nor `with_standard_pair`), so
-it ran as a full read-modify-write on the CPU. Since 367.1 it runs as ordered, non-overlapping
+**The 365-367 switches were broken**: four separate values `GdiFgn`, `GdiFgnAcq`, `GdiSysCe`,
+`GdiPair` (and `GdiOvl`), and `GdiSysCe` was also the name of a COUNTER the executor writes, so the knob
+read the previous boot's counter (0 after a run without staging copies: the path off, 365.1 and 367.1;
+any nonzero count: on). A kmd_logic test (`no_knob_name_is_a_counter_name`) now fails the build when a
+knob name of `diag.rs` appears as a byte-string literal anywhere else in `kmd_render`.
+
+**365.1/367.1:** the slowest command (25-41 ms, `GdiSlowOp` 0x12211/0x1012211, staging to staging on
+the CPU) ran there because the staging copy-engine path was OFF through the `GdiSysCe` collision above
+(367.1: `GdiPaths` 0x19, `GdiOvlN` 0, so it was not a scroll). Scrolls (overlapping copies inside one
+surface), which CDD sends despite `NoSameBitmapOverlappedBitBlt`, would also have run on the CPU; since
+367.1 they run as ordered, non-overlapping
 copy-engine bands of `|dy|` rows (or `|dx|` columns) from the far side of the move
 (`gdi_accel::split_overlap`, checked against a model scroll in the tests) in one view of the surface;
 counters `GdiOvlN`, `GdiOvlCe`, `GdiOvlWhy`.

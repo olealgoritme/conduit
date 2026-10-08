@@ -153,24 +153,8 @@ fn path(bit: u32) -> bool {
 
 pub(crate) fn reset_for_start(on: bool) {
     if on {
-        use crate::diag::{knobs, read_config_dword as rd};
-        let mut p = 0;
-        if rd(knobs::GDI_FGN, 1) != 0 {
-            p |= PATH_FGN;
-        }
-        if rd(knobs::GDI_FGN_ACQ, 0) == 1 {
-            p |= PATH_FGN_ACQ;
-        }
-        if rd(knobs::GDI_SYS_CE, 1) != 0 {
-            p |= PATH_SYS;
-        }
-        if rd(knobs::GDI_PAIR, 1) != 0 {
-            p |= PATH_PAIR;
-        }
-        if rd(knobs::GDI_OVL, 1) != 0 {
-            p |= PATH_OVL;
-        }
-        PATHS.store(p, Ordering::Relaxed);
+        let off = crate::diag::read_config_dword(crate::diag::knobs::GDI_OFF, 0);
+        PATHS.store(ga::paths_from_off(off), Ordering::Relaxed);
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
