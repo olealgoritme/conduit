@@ -41,6 +41,13 @@ static ARM_MMIO: AtomicU32 = AtomicU32::new(0);
 static ARM_DMA: AtomicU32 = AtomicU32::new(0);
 static UNTAGGED: AtomicU32 = AtomicU32::new(0);
 static ENF_KEEP: AtomicU32 = AtomicU32::new(0);
+/// `IdfRedirSkip` in force (1 / 0; only with the mode on).
+static REDIR_SKIP: AtomicU32 = AtomicU32::new(0);
+static RED_OK: AtomicU32 = AtomicU32::new(0);
+static RED_ERR: AtomicU32 = AtomicU32::new(0);
+static RED_ST: AtomicU32 = AtomicU32::new(0);
+static RED_SD: AtomicU32 = AtomicU32::new(0);
+static RED_SKIP: AtomicU32 = AtomicU32::new(0);
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU32 = AtomicU32::new(0);
 static REFS: [AtomicU32; Why::COUNT] = [ZERO; Why::COUNT];
@@ -65,9 +72,12 @@ pub(crate) fn reset_for_start(knobs: &crate::adapter::AdapterKnobs) {
     let mode = knobs.indep_flip_mode();
     MODE.store(mode.code(), Ordering::Relaxed);
     CAPS.store(u32::from(knobs.direct_flip), Ordering::Relaxed);
+    let skip =
+        mode.is_on() && crate::diag::read_config_dword(crate::diag::knobs::IDF_REDIR_SKIP, 0) != 0;
+    REDIR_SKIP.store(u32::from(skip), Ordering::Relaxed);
     for c in [
         &SEEN, &DIRECT, &DIR_FOR, &DIR_VEN, &COPY, &KEEP, &WHY, &ARM_MMIO, &ARM_DMA, &UNTAGGED,
-        &ENF_KEEP,
+        &ENF_KEEP, &RED_OK, &RED_ERR, &RED_ST, &RED_SD, &RED_SKIP,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -100,6 +110,11 @@ fn write_block() {
     crate::diag::record_named_bytes(b"IdfArmDma", r(&ARM_DMA));
     crate::diag::record_named_bytes(b"IdfUntagged", r(&UNTAGGED));
     crate::diag::record_named_bytes(b"IdfEnfKeep", r(&ENF_KEEP));
+    crate::diag::record_named_bytes(b"IdfRedOk", r(&RED_OK));
+    crate::diag::record_named_bytes(b"IdfRedErr", r(&RED_ERR));
+    crate::diag::record_named_bytes(b"IdfRedSt", r(&RED_ST));
+    crate::diag::record_named_bytes(b"IdfRedSD", r(&RED_SD));
+    crate::diag::record_named_bytes(b"IdfRedSkip", r(&RED_SKIP));
     for why in Why::ALL {
         crate::diag::record_named_bytes(&idf::ref_name(why), r(&REFS[why.index()]));
     }
@@ -141,6 +156,33 @@ pub(crate) fn note_arm_dma() {
     if mode().is_on() {
         bump(&ARM_DMA);
     }
+}
+
+/// What one `DxgkDdiPresent` that carried `RedirectedFlip` returned (`flags` its
+/// `DXGK_PRESENTFLAGS`, `src`/`dst` its allocation counts). Counted only with the mode on, and
+/// only for such presents: the question is whether dxgkrnl's independent-flip candidate presents
+/// fail or succeed here. Atomics only.
+pub(crate) fn note_present_result(flags: u32, src: u32, dst: u32, ok: bool, status: u32) {
+    if !mode().is_on() || !helios_kmd_logic::flip_flags::present_is_redirected(flags) {
+        return;
+    }
+    if ok {
+        bump(&RED_OK);
+    } else {
+        RED_ST.store(status, Ordering::Relaxed);
+        bump(&RED_ERR);
+    }
+    RED_SD.store((src << 16) | (dst & 0xFFFF), Ordering::Relaxed);
+}
+
+/// `IdfRedirSkip`: whether this Blt-arm Present (flags `flags`) completes with no copy. Counts
+/// the ones it skips. Atomics only.
+pub(crate) fn skip_redirected_blt(flags: u32) -> bool {
+    if REDIR_SKIP.load(Ordering::Relaxed) == 0 || !idf::redirected_blt(flags) {
+        return false;
+    }
+    bump(&RED_SKIP);
+    true
 }
 
 /// `IndepFlip=2` completed a `PBFlip` 0xE6 flip as a kept picture. Atomics only.

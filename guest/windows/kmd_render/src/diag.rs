@@ -1408,6 +1408,10 @@ pub mod knobs {
     /// and a DMA-buffer flip of an unregistered Venus allocation completes as a kept picture
     /// instead of failing (`PBFlip` 0xE6). Read with the other adapter knobs; mirrored as `IdfKnob`.
     pub const INDEP_FLIP: KnobName = KnobName::new(b"IndepFlip");
+    /// `IdfRedirSkip` (default 0; `helios_kmd_logic::independent_flip::KNOB_REDIR_SKIP`): with
+    /// `IndepFlip` on, a Present carrying `RedirectedFlip` on the Blt arm completes with no copy.
+    /// An experiment (docs/independent-flip.md 13.5). Read at StartDevice; counted `IdfRedSkip`.
+    pub const IDF_REDIR_SKIP: KnobName = KnobName::new(b"IdfRedirSkip");
     /// `GdiAccel` (default 0 = no GDI hardware acceleration: `PresentationCaps` 0, the word since
     /// 22.22.180.0). 1: report `helios_kmd_logic::gdi_accel::ACCEL_CAPS`
     /// (`SupportKernelModeCommandBuffer` with the `NoSameBitmap*` declines) and translate

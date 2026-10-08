@@ -1311,3 +1311,61 @@ pending slot (4.4): `FdhTmo` and frozen presents would say so; `FlipQueueN=1` wi
 the DPC racing the tick on another CPU: at worst two vsyncs a fraction of a period apart, once (`VsFast`). (3) A host that reports
 late (the compositor composites instead of scanning out directly): the hold costs up to a period of latency, `FdhLatAvg` shows
 it; `FlipDoneHost=2` or 0 is the fallback. The knob is the whole surface: 0 and a reboot restore today's behaviour.
+
+### 13.5 First run on 388.1: composed, never promoted, and what to read next
+
+Run: G1 knobs, `IndepFlip=1`, `DirectFlipSupport=1`, `FlipDoneHost` unset, 1920x1080@240, `d3d11_iflip.exe 40` (40 is the run
+time in seconds; with no other option the window is the borderless `WS_POPUP` covering output 0 at its mode, interval 1, 2 BGRA8
+buffers, cursor hidden: the shape 11.6 promoted with), PresentMon 10 s. PresentMon `Composed: Flip` for all 2393 frames, pacing fine
+(median 4.03 ms). `IdfDirFor` 7382, `IdfKeep` 0, every `IdfRef*` / `FfRef*` 0, `FlipQueV` 1, `Fdh*` 0.
+
+Reading:
+
+* `IdfDirFor` alone does not show promotion. With DWM on NVK every flip DWM makes of its own chain is a `ForeignFlip` direct flip:
+  7382 over the 40 s run is about DWM's own rate. The evidence of a hand-over is `IdfSpaTrans` (a `SharedPrimaryTransition`
+  flip), `IdfSpaExcl`, `FfReowned` (the shown allocation changed importer: the application's buffer), `IdfPrRedir` (dxgkrnl's
+  candidate presents) and the tool's own `dxgi_mode` lines (11.6 promoted with `OVERLAY`). None of these were reported.
+* What the docs require (`/steam/refsrc`): the flip-model guide (`win32/desktop-src/direct3ddxgi/for-best-performance--use-dxgi-
+  flip-model.md`, "DirectFlip") names three DirectFlip shapes: buffers equal to the screen with a window covering it (ours), the
+  same with panel fitters, and MPO. Independent flip is then engaged in **any** of them; MPO is one way to stay in it with content on
+  top, not a requirement. `DXGK_FLIPCAPS.FlipIndependent` is mandatory for WDDM 1.3+ drivers (set by `IndepFlip`). The UMD's
+  `CheckDirectFlipSupport` is called by DWM "at least once before DWM attempts to present to a Direct Flip swapchain", again after
+  every mode change or DWM swap-chain re-creation; its checks are MSAA, stereo, swizzle and the same `VidPnSourceId`
+  (`d3d10umddi/nc-d3d10umddi-pfnd3d11_1ddi_checkdirectflipsupport.md`). Nothing documented asks for `SupportMultiPlaneOverlay`, an
+  MPO caps query, `FlipInterval` or immediate-flip caps for a full-screen window, and 11.6 promoted with none of them. Two shipping
+  references (`GpuDrivers/.../GsDevice.cpp`, `graphics-driver-samples` roskmd) set `FlipIndependent` and `DdiPresentForIFlip` and
+  nothing MPO-related for it.
+* What changed between the promoted build (345.1) and 388.1 on this path: (1) **this branch's UMD change**: `DirectFlipSupport=1`
+  had become the stricter scan-out rule (13.1); if DWM's chain or the opened application buffer reports a format outside 28/87/88
+  or anything else the rule refuses, DWM is told no and never promotes. Restored: 1 is again the measured rule (same size and
+  format), the strict rule is now 3. (2) The G1 knobs and the lane F GDI/redirection work, which change how the Blt arm runs; the
+  candidate presents dxgkrnl sends with `DdiPresentForIFlip` (`RedirectedFlip` without `Flip`, 11.6: 957 of them before promotion)
+  take that arm. If they now fail or stall, dxgkrnl has reason to keep the window composed. New counters say: `IdfRedOk`,
+  `IdfRedErr`, `IdfRedSt` (last failing status), `IdfRedSD` (source and destination counts), and the experiment knob
+  `IdfRedirSkip=1` completes them with no copy (`IdfRedSkip`). (3) `HwCursor` defaults to 1 (section 12); a hardware pointer is what
+  bare metal has, so it is not a suspect, but it is one knob to flip if nothing else explains it.
+* The launch: a program started by the task scheduler may not take the foreground (`SetForegroundWindow` fails under the foreground
+  lock), so its console or the taskbar stays the active window. A full-screen window that is not the foreground window can be
+  overlapped by the topmost taskbar and is not treated as full screen. The tool now logs `foreground after start`, and every second
+  `fg=` and `points_on_us=N/5` (which window is under the output's corners and centre), and takes options `topmost`, `fg` (take the
+  foreground: attach to the foreground thread's input and a synthetic key event) and `noconsole`.
+
+Recipe (main runs it; 1920x1080@240; one reboot per knob change; PresentMon 10 s from t=10 s; every row collects: PresentMon
+`PresentMode`, the tool's `foreground after start`, its `fg=` / `points_on_us=` / `dxgi_mode=` lines and `RESULT`, the counters
+`IdfSeen IdfDirFor IdfDirVen IdfKeep IdfSpaTrans IdfSpaExcl IdfSpaFlg IdfPrRedir IdfPrFlg IdfRedOk IdfRedErr IdfRedSt IdfRedSD
+IdfRedSkip FfReowned FfMoved FfProg PBFlip FkKeep`, and from `C:\ProgramData\Helios\` the `dwm` UMD log's
+`CheckDirectFlipSupport #` lines (they now print `dwm=`, both resources' kind, size, format and slices, and the answer):
+
+| row | change from the 13.5 run | read |
+|---|---|---|
+| R1 | the new build only (`DirectFlipSupport=1` is the 345.1 rule again), `d3d11_iflip.exe 40 topmost fg noconsole` | the main row. `fg=1` and `points_on_us=5/5` every second rule out the launch. Promoted: PresentMon `Hardware: Independent Flip`, `dxgi_mode=OVERLAY` (or NONE), `IdfSpaTrans` >= 1, `FfReowned` >= 1 |
+| R2 | as R1 with `DirectFlipSupport=3` | the strict rule: if R1 promotes and R2 does not, the dwm log line names the refused field |
+| R3 | as R1, G1 knobs off (the 345.1 knob set) | if R1 stays composed and R3 promotes, it is the lane F path: read `IdfRedErr` / `IdfRedSt` in R1 |
+| R4 | as R1 with `IdfRedirSkip=1` | only if R1 shows `IdfPrRedir` rising with no promotion, or `IdfRedErr` > 0 |
+| R5 | as R1 with `HwCursor=0` | last: whether the hardware pointer matters |
+| R6 | R1's winner with `FlipDoneHost=2`, then `=1` | 13.4 rows P1 and P2 |
+
+Diagnosis table: no `CheckDirectFlipSupport` line in the dwm log at all means DWM never considered DirectFlip for the window (the
+launch, an overlap, or dxgkrnl's derived support: the tool's `kmt:` lines at start must show `DIRECTFLIP_SUPPORT` and
+`INDEPENDENTFLIP_SUPPORT` = 1); lines answering `no` name why; `yes` with no `IdfSpaTrans` points at dxgkrnl's side (the candidate
+presents: `IdfPrRedir`, `IdfRed*`).

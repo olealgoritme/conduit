@@ -201,6 +201,16 @@ pub unsafe extern "C" fn dxgkddi_present(
     let start_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
     crate::ddi::present_foreign::begin_call();
     let status = unsafe { dxgkddi_present_inner(h_context, present, start_100ns) };
+    // `IdfRed*`: what dxgkrnl's independent-flip candidate presents (`RedirectedFlip`) got.
+    if !present.is_null() {
+        crate::ddi::indep_flip::note_present_result(
+            PRESENT_LAST_FLAGS.load(Ordering::Relaxed),
+            PRESENT_LAST_SRC_COUNT.load(Ordering::Relaxed),
+            PRESENT_LAST_DST_COUNT.load(Ordering::Relaxed),
+            status == STATUS_SUCCESS,
+            status as u32,
+        );
+    }
     // `DwPrN` / `DwPrFail`: Presents since the last device died (atomics).
     crate::ddi::dwm_restart::note_present(status == STATUS_SUCCESS);
     // Fixed-name telemetry survives the steady-state registry ring flood and
@@ -518,6 +528,20 @@ unsafe fn dxgkddi_present_inner(
                     present_allocations,
                     present_stream_boundary,
                     tag,
+                    adapter,
+                    src_info,
+                    dst_info,
+                )
+            };
+        }
+        // `IdfRedirSkip` (default 0, an experiment): dxgkrnl's independent-flip candidate present
+        // (`RedirectedFlip` on the Blt arm) completes with no copy, the same completion as above.
+        if crate::ddi::indep_flip::skip_redirected_blt(present_flags) {
+            return unsafe {
+                present_blt_no_copy(
+                    args,
+                    present_allocations,
+                    present_stream_boundary,
                     adapter,
                     src_info,
                     dst_info,
@@ -1913,6 +1937,56 @@ unsafe fn present_blt_onscanout(
         }
     };
     crate::ddi::onscanout::note_skip(tag, src_info.as_ref());
+    unsafe {
+        present_blt_skipped(
+            args,
+            present_allocations,
+            Some(capacity),
+            present_stream_boundary,
+            adapter,
+            src_info,
+            dst_info,
+        )
+    }
+}
+
+/// A Blt completed with no copy and no host call for `IdfRedirSkip`: the preconditions of
+/// [`present_blt_onscanout`] (a DMA buffer for the marker, the private record, the patch capacity,
+/// so a retry is the ordinary Blt), then [`present_blt_skipped`].
+///
+/// # Safety
+/// As [`present_complete`]; `args` names the Blt arm.
+unsafe fn present_blt_no_copy(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    present_stream_boundary: Option<u64>,
+    adapter: Option<&AdapterContext>,
+    src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+) -> NTSTATUS {
+    let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
+    if args.pDmaBuffer.is_null()
+        || args.DmaSize < bytes
+        || args.pDmaBufferPrivateData.is_null()
+        || (args.DmaBufferPrivateDataSize as usize)
+            < core::mem::size_of::<PresentSubmissionPrivate>()
+    {
+        PRESENT_LAST_STATUS.store(
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
+            Ordering::Relaxed,
+        );
+        return crate::ddi::present_foreign::site(
+            site::BLT_DMA_SMALL,
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+        );
+    }
+    let capacity = match present_allocations.validate_patch_capacity(args) {
+        Ok(capacity) => capacity,
+        Err(status) => {
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return crate::ddi::present_foreign::site(site::BLT_PATCH, status);
+        }
+    };
     unsafe {
         present_blt_skipped(
             args,

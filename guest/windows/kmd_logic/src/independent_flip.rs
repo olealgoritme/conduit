@@ -51,7 +51,19 @@ pub const KNOB_NEED_PRIMARY: &str = "IdfNeedPrim";
 pub const KNOB_HOLD_RELEASE: &str = "IdfHoldRel";
 
 /// The knobs the driver reads.
-pub const KNOBS: [&str; 1] = [KNOB_ENABLE];
+/// `IdfRedirSkip` (default 0): a `DxgkDdiPresent` that carries `RedirectedFlip` (0x2000) on the Blt
+/// arm (Flip clear: dxgkrnl's independent-flip candidate present, `DdiPresentForIFlip`) completes
+/// with no copy, like a Blt the producer already put on scan-out. An experiment for the case where
+/// the copy those presents cost (or fail) is what keeps DWM from promoting: `IdfRedOk` /
+/// `IdfRedErr` / `IdfRedSt` say whether they fail, `IdfRedSkip` counts the skipped ones.
+pub const KNOB_REDIR_SKIP: &str = "IdfRedirSkip";
+pub const KNOBS: [&str; 2] = [KNOB_ENABLE, KNOB_REDIR_SKIP];
+
+/// Whether a Present with these `DXGK_PRESENTFLAGS` is an independent-flip candidate on the Blt arm
+/// (`RedirectedFlip` set, `Flip` clear): the presents `IdfRedirSkip` completes with no copy.
+pub const fn redirected_blt(present_flags: u32) -> bool {
+    present_flags & crate::flip_flags::PRESENT_REDIRECTED_FLIP != 0 && present_flags & (1 << 2) == 0
+}
 /// Names reserved for later stages: they collide with nothing, and the driver does not read them.
 pub const RESERVED_KNOBS: [&str; 2] = [KNOB_NEED_PRIMARY, KNOB_HOLD_RELEASE];
 
@@ -558,7 +570,7 @@ pub fn census_dma_unarmed(mode: Mode, d: &DmaFacts) -> Verdict {
 ///
 /// `IdfRef01` .. `IdfRef13` are the per-reason counts ([`ref_name`]); they are not repeated
 /// here.
-pub const COUNTERS: [&str; 12] = [
+pub const COUNTERS: [&str; 17] = [
     "IdfKnob",     // the mode in force: 0 off, 1 census, 2 enforce (Mode::code)
     "IdfSeen",     // flips the table was asked about
     "IdfDirect",   // verdict Direct
@@ -571,6 +583,11 @@ pub const COUNTERS: [&str; 12] = [
     "IdfArmDma",   // flips on the DMA-buffer contract while on
     "IdfUntagged", // direct flips of a source with MISC_PRIMARY clear (the UMD's primary-compat)
     "IdfEnfKeep",  // Mode::Enforce: 0xE6 flips completed as kept pictures instead of failed
+    "IdfRedOk",    // Presents with RedirectedFlip that returned STATUS_SUCCESS
+    "IdfRedErr",   // ... that returned anything else
+    "IdfRedSt",    // ... the last failing status
+    "IdfRedSD",    // ... the last one's source count << 16 | destination count
+    "IdfRedSkip",  // ... completed with no copy (IdfRedirSkip=1)
 ];
 
 /// Counter names reserved for later stages (design 6.4), written by nothing yet.
@@ -1255,6 +1272,18 @@ mod tests {
             names.push(std::str::from_utf8(&ref_name(w)).unwrap().into());
         }
         names
+    }
+
+    #[test]
+    fn a_redirected_blt_is_redirectedflip_without_flip() {
+        // 11.6's IdfPrFlg words: RedirectedFlip with Blt (bit 0) and no Flip (bit 2).
+        assert!(redirected_blt(0x2001));
+        assert!(redirected_blt(0x2000));
+        assert!(
+            !redirected_blt(0x2004),
+            "a redirected FLIP is a flip, never skipped"
+        );
+        assert!(!redirected_blt(0x0001));
     }
 
     #[test]
