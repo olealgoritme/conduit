@@ -12,7 +12,7 @@ time, so nearly every dispatch wakes a sleeping thread, and the present gate
 thread and has the workers wake it again.
 
 Each such wait now polls a lock-free indicator for up to
-HELIOS_DXVK_SPIN_US microseconds (process environment; default 30, 0 off,
+HELIOS_DXVK_SPIN_US microseconds (process environment; default 0 = off (384.1 A/B: no gain),
 at most 1000) before it blocks on its condition variable as before:
 - the CS worker, for a new chunk (m_heliosAdded, counted where chunks are
   queued);
@@ -134,14 +134,14 @@ index 00000000..4936574f
 +   * a VM exit on the waking thread (Conduit 382.1 Heaven profile:
 +   * HalpInterruptSendIpi 2.7% of the app process, ~17 CS chunk dispatches per
 +   * frame into a CS thread that is 78% idle). A short poll catches the next
-+   * chunk of a burst without that wake. 0 disables it; default 30, at most
++   * chunk of a burst without that wake. 0 (the default) disables it; at most
 +   * 1000.
 +   */
 +  inline uint32_t budgetUs() {
 +    static const uint32_t us = [] {
 +      const std::string v = env::getEnvVar("HELIOS_DXVK_SPIN_US");
 +      if (v.empty())
-+        return 30u;
++        return 0u;
 +      const unsigned long n = std::strtoul(v.c_str(), nullptr, 10);
 +      return uint32_t(n > 1000ul ? 1000ul : n);
 +    }();
