@@ -67,6 +67,7 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 7 | `nvk: keep what changes per draw in one hardware root table bank` | changing a second 256-byte root table bank between draws costs ~5 ns; the dynamic-offset dword of the dynamic buffer descriptors moves into bank 0 with the draw parameters and `sets[0..3]`. **API-visible**: `NVK_MAX_DYNAMIC_BUFFERS` 64 -> 32, i.e. 16 dynamic UBOs + 16 dynamic SSBOs per layout (NVIDIA: 15 + 16) |
 | 8 | `nvk: ZCULL for DXVK depth buffers and reverse Z` | ZCULL storage also for depth images with `TRANSFER_DST` (DXVK sets it on every D3D11 depth texture; `EXCLUSIVE` sharing only), reset to a conservative state by an empty render pass after a copy, blit or resolve writes them or another queue hands them over; `SET_ZCULL_DIR_FORMAT` per image (GREATER when the first application render pass clears below 0.5, LESS otherwise, never changed afterwards) instead of always LESS. See "GPU time against NVIDIA in D3D11-through-DXVK shapes" |
 | 11 | `nvk, nvk/rm: compression for images outside dedicated allocations on GB20x` | On by default (`NVK_RM_COMPRESS_ALL=0` off): device-local memory that is neither host-visible nor shared nor imported is allocated COMPR_ANY (`NVKMD_MEM_COMPRESSIBLE`, `nvkmd_info::has_compressible_mem`), and a compressible image bound anywhere in it gets its own VA with the compressible GMK kind and `is_compressed`; every other mapping of such memory uses a compressible kind too. Applies after 9-10 of the build branches and without them. See "Compression outside dedicated allocations" |
+| 12 | `nvk, nvk/rm: compress separate depth/stencil images on GB20x` | `NVK_RM_COMPRESS_ZS=1` (default off while it is measured, `nvkmd_info::has_zs_compression`): combined depth/stencil formats (D24S8, D32S8X24), which Blackwell splits into separate depth and stencil planes, pass `nvk_image_can_compress`; both planes are compressed in a dedicated allocation (the memory's own VA) and in compressible memory from patch 11 (each plane's own VA). Needs 11. See "Compression outside dedicated allocations" |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
@@ -195,11 +196,17 @@ compressed):
 - Depth/stencil formats (D24S8, D32S8X24): on Blackwell NVK splits them
   into separate depth and stencil planes, and `can_compress` rejects
   every image with more than one plane, dedicated or not. These are the
-  main render targets still left uncompressed. A follow-up could allow
-  `separate_zs` (non-disjoint) images: each plane already gets its own VA
-  in the sub-allocated path, NIL computes a compressed kind for both, and
-  the draw path sets `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION`
-  from `is_compressed`.
+  main render targets still left uncompressed. Patch 12
+  (`NVK_RM_COMPRESS_ZS=1`, default off) allows `separate_zs` images: they
+  are never disjoint, each plane gets its own VA in the sub-allocated path
+  and the memory's compressible VA in a dedicated one, NIL computes a
+  compressed kind for both planes, and the draw path sets
+  `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION` from `is_compressed`.
+  `NVK: N depth/stencil images (separate planes) bound compressed` counts
+  them; the "separate depth/stencil planes" figure of the uncompressed
+  breakdown should drop to 0. As compressible images they also prefer a
+  dedicated allocation now (`prefersDedicatedAllocation`), which
+  vkd3d-proton follows for committed resources.
 - Reserved (tiled) resources: sparse, excluded by `can_compress`; every
   tile bind counts as one 0x6 -> 0x8.
 - Render targets and UAV textures (`COLOR_ATTACHMENT`, `STORAGE`,
