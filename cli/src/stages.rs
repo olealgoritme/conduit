@@ -177,6 +177,19 @@ fn guest_snapshot(cmd: &str, c: &mut Collected) {
 
 /// `conduit trace NAME stages`.
 pub fn live(name: &str, o: Opts) -> Result<()> {
+    info(format!("collecting frame stages for {} s", o.duration));
+    let end = Instant::now() + Duration::from_secs(o.duration);
+    let c = collect(name, o.guest_cmd.as_deref(), &|| Instant::now() >= end)?;
+    if let Some(dir) = &o.save {
+        save(dir, &c)?;
+        info(format!("saved to {}", dir.display()));
+    }
+    report(&c, o.perfetto.as_deref(), o.etw.as_deref(), Vec::new())
+}
+
+/// Turn stage stamping on (unless it was), collect every second until
+/// `stop` says so, and turn it off again (if it was off).
+pub fn collect(name: &str, guest_cmd: Option<&str>, stop: &dyn Fn() -> bool) -> Result<Collected> {
     // `stages status` begins "stages on" or "stages off".
     let status = ask_text(name, "stages status")?;
     let was_on = status
@@ -191,25 +204,24 @@ pub fn live(name: &str, o: Opts) -> Result<()> {
     // Whatever was stamped before now is not part of this collection.
     let mut stale = Collected::default();
     host_dump(name, &mut stale)?;
-    if let Some(cmd) = &o.guest_cmd {
+    if let Some(cmd) = guest_cmd {
         guest_snapshot(cmd, &mut c);
     }
-    info(format!("collecting frame stages for {} s", o.duration));
-    let end = Instant::now() + Duration::from_secs(o.duration);
-    let collect = (|| -> Result<()> {
-        while Instant::now() < end {
-            std::thread::sleep(
-                Duration::from_secs(1).min(end.saturating_duration_since(Instant::now())),
-            );
+    let run = (|| -> Result<()> {
+        while !stop() {
+            let tick = Instant::now() + Duration::from_secs(1);
+            while !stop() && Instant::now() < tick {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             host_dump(name, &mut c)?;
-            if let Some(cmd) = &o.guest_cmd {
+            if let Some(cmd) = guest_cmd {
                 guest_snapshot(cmd, &mut c);
             }
         }
         // The renderer's records reach the backend on its fence pump.
         std::thread::sleep(Duration::from_millis(300));
         host_dump(name, &mut c)?;
-        if let Some(cmd) = &o.guest_cmd {
+        if let Some(cmd) = guest_cmd {
             guest_snapshot(cmd, &mut c);
         }
         Ok(())
@@ -217,15 +229,11 @@ pub fn live(name: &str, o: Opts) -> Result<()> {
     if !was_on {
         let _ = ask_text(name, "stages off");
     }
-    collect?;
-    if let Some(dir) = &o.save {
-        save(dir, &c)?;
-        info(format!("saved to {}", dir.display()));
-    }
-    report(&c, o.perfetto.as_deref(), o.etw.as_deref())
+    run?;
+    Ok(c)
 }
 
-fn save(dir: &Path, c: &Collected) -> Result<()> {
+pub fn save(dir: &Path, c: &Collected) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::write(
         dir.join("host.bin"),
@@ -239,6 +247,18 @@ fn save(dir: &Path, c: &Collected) -> Result<()> {
 
 /// `conduit trace stages DIR`: a collection saved with `--save`.
 pub fn offline(dir: &Path, perfetto: Option<&Path>, etw: Option<&Path>) -> Result<()> {
+    let c = load(dir)?;
+    if c.host.is_empty() && c.guest.is_empty() {
+        return Err(oops(
+            format!("nothing in {}", dir.display()),
+            "Expected host.bin and guest-NNN.bin",
+        ));
+    }
+    report(&c, perfetto, etw, Vec::new())
+}
+
+/// What `save` wrote to `dir` (empty when it holds no stage files).
+pub fn load(dir: &Path) -> Result<Collected> {
     let mut c = Collected::default();
     let host = dir.join("host.bin");
     if host.exists() {
@@ -257,13 +277,7 @@ pub fn offline(dir: &Path, perfetto: Option<&Path>, etw: Option<&Path>) -> Resul
     for n in names {
         c.guest.push(std::fs::read(dir.join(n))?);
     }
-    if c.host.is_empty() && c.guest.is_empty() {
-        return Err(oops(
-            format!("nothing in {}", dir.display()),
-            "Expected host.bin and guest-NNN.bin",
-        ));
-    }
-    report(&c, perfetto, etw)
+    Ok(c)
 }
 
 /// The guest's records, each once, from overlapping snapshots; and how many
@@ -795,8 +809,13 @@ pub fn render(rep: &PathReport) -> String {
 }
 
 /// The whole report: clock line, counts, both tables; and the optional
-/// trace-event file.
-pub fn report(c: &Collected, perfetto: Option<&Path>, etw: Option<&Path>) -> Result<()> {
+/// trace-event file, with `extra` events (host µs) added to it.
+pub fn report(
+    c: &Collected,
+    perfetto: Option<&Path>,
+    etw: Option<&Path>,
+    mut extra: Vec<Value>,
+) -> Result<()> {
     let (grecs, guest_lost) = dedupe_guest(&c.guest);
     let clock = Clock::from_bounds(&bounds(&c.host, &grecs));
     match &clock {
@@ -845,7 +864,8 @@ pub fn report(c: &Collected, perfetto: Option<&Path>, etw: Option<&Path>) -> Res
             }
             _ => None,
         };
-        let v = trace_events(&frames, etw_events.as_deref());
+        extra.extend(etw_events.unwrap_or_default());
+        let v = trace_events(&frames, (!extra.is_empty()).then_some(extra.as_slice()));
         std::fs::write(out, serde_json::to_vec(&v)?)
             .with_context(|| format!("writing {}", out.display()))?;
         info(format!(
@@ -878,13 +898,25 @@ fn track(from: u8, to: u8) -> u32 {
 }
 
 /// Chrome trace-event JSON: one slice per interval per frame, flows linking
-/// a frame's slices across tracks, and `extra` events (ETW) as given.
+/// a frame's slices across tracks, and `extra` events (ETW, the latency
+/// capture's round trips; `ts` in absolute host µs) as given. Time 0 is the
+/// earliest stamp or extra event.
 pub fn trace_events(frames: &[Frame], extra: Option<&[Value]>) -> Value {
+    let extra_ts = extra
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|e| e.get("ts").and_then(Value::as_f64))
+        .map(|us| us * 1e3);
     let t0 = frames
         .iter()
         .filter_map(|f| f.stamps.first().map(|s| s.1))
+        .chain(extra_ts)
         .fold(f64::INFINITY, f64::min);
     let t0 = if t0.is_finite() { t0 } else { 0.0 };
+    let has_etw = extra
+        .unwrap_or(&[])
+        .iter()
+        .any(|e| e.get("cat").and_then(Value::as_str) == Some("etw"));
     let us = |ns: f64| (ns - t0) / 1e3;
     let mut ev = Vec::new();
     for (pid, name) in [
@@ -895,7 +927,8 @@ pub fn trace_events(frames: &[Frame], extra: Option<&[Value]>) -> Value {
         (P_GPU, "host GPU"),
         (P_IRQ, "interrupt delivery"),
     ] {
-        if pid == P_DXGKRNL && extra.is_none() {
+        // Without frames (a latency capture alone) the stage tracks stay out.
+        if (pid == P_DXGKRNL && !has_etw) || (pid != P_DXGKRNL && frames.is_empty()) {
             continue;
         }
         ev.push(json!({"ph": "M", "name": "process_name", "pid": pid, "tid": 0, "args": {"name": name}}));

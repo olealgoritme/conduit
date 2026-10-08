@@ -770,6 +770,20 @@ fn collect_host(r: &mut Report) {
             "Run: virsh -c qemu:///session list   to see why",
         );
     }
+
+    // Tracing prerequisites (`conduit trace NAME latency`): optional, so
+    // never more than a note.
+    let (ready, what) = crate::latency::capture::prerequisites();
+    r.line(
+        Level::Ok,
+        "Latency tracing",
+        &what,
+        if ready {
+            ""
+        } else {
+            "Only needed for `conduit trace NAME latency` (docs/TRACING.md \"Latency capture\")."
+        },
+    );
 }
 
 pub fn run() -> i32 {
