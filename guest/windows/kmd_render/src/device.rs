@@ -334,6 +334,21 @@ impl<'a> ContextHandleRef<'a> {
         slot.take()
     }
 
+    /// Why [`Self::take_ce_record`] found nothing for `boundary`: 1 no record stashed, 2 a record
+    /// of another boundary (`boundary` and the stashed one's low 32 bits in the returned pair).
+    /// Diagnostics of the route's `NoRecord`.
+    pub fn ce_record_miss(&self, boundary: u64) -> (u32, u32) {
+        let ctx = self.context;
+        if ctx.ce_record_flag.load(Ordering::Relaxed) == 0 {
+            return (1, 0);
+        }
+        match ctx.ce_record.lock().as_ref() {
+            None => (1, 0),
+            Some(r) if r.boundary != boundary => (2, r.boundary as u32),
+            Some(_) => (0, 0),
+        }
+    }
+
     /// Low 32 bits of the context handle (a pointer): enough to tell contexts apart in
     /// the flush-gate trace.
     pub fn trace_id(&self) -> u32 {

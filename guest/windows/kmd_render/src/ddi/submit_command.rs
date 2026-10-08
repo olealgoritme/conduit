@@ -332,6 +332,10 @@ pub(crate) fn publish_nvrm_counters() {
     // The copy-engine Present route (`RmCopyEngine` 1, M3c-2): `CeRt*`, written once a Present
     // reached its decision.
     crate::ddi::ce_present_route::publish_counters();
+    // `RedirVram` (`Rv*`, the VRAM service and its copy-engine objects) and the staging views
+    // (`RmSys*` of `ce_sysmem`): their hot paths ask for this pass instead of writing inline.
+    crate::ddi::vram_redirect::publish_if_seen();
+    crate::ddi::ce_sysmem::publish_if_used();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();

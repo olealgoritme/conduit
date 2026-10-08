@@ -237,8 +237,26 @@ pub(crate) fn foreign_source(
     resource_id: u32,
 ) -> Result<ForeignSource, Fail> {
     let r = foreign_source_inner(passive, adapter, resource_id).map_err(fgn_fail);
-    publish_counters();
+    publish_throttled(r.is_err());
     r
+}
+
+/// The counter mirror of a per-command or per-Present path: every refusal, the first call and every
+/// 64th, and with the mirror thread as a request for its `Nv*` pass (which publishes `Rv*`). Each
+/// `record_named_bytes` of a changed value is a registry write of about 100 us, and
+/// `publish_counters` writes a dozen: 377.1/378.1 spent 830 us of a 940 us Present in it
+/// (`RvSyFs`), from `foreign_source` publishing on every call.
+pub(crate) fn publish_throttled(failed: bool) {
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if !(failed || n % 64 == 0) {
+        return;
+    }
+    if crate::ddi::mirror_thread::running() {
+        crate::ddi::mirror_thread::request_bits(crate::ddi::mirror_thread::NV);
+    } else {
+        publish_counters();
+    }
 }
 
 fn foreign_source_inner(
