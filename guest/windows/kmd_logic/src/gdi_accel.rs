@@ -1591,6 +1591,9 @@ pub const COUNTERS: &[&str] = &[
     // system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down).
     "GdiSysWhy",
     "GdiSysMsk",
+    // The last staging-path copy or fill that ran on the CPU: opcode | src class << 4 | dst class
+    // << 8 | same buffer << 12 | GdiPaths << 16 | stage << 24 (1 path off, 2 refused, 3 failed).
+    "GdiSysCpuK",
     // Unreachable surfaces: count, the last one's identity (storage << 24 | kind << 16 | foreign
     // layout << 8 | foreign identity << 9 | direct scanout << 10) and extent.
     "GdiUnrN",

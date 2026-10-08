@@ -101,6 +101,26 @@ fn sys_refused(why: u32, bit: u32) {
     SYS_MSK.fetch_or(bit, Ordering::Relaxed);
 }
 
+/// The last copy or fill planned for a staging copy-engine path that ran on the CPU instead
+/// (`GdiSysCpuK`): opcode | src class bit << 4 | dst class bit << 8 | same buffer << 12 |
+/// `GdiPaths` << 16 | (where it left: 1 not tried, the path off; 2 run_ce_sys refused; 3 failed
+/// after the mapping) << 24.
+static SYS_CPU_K: AtomicU32 = AtomicU32::new(0);
+
+fn note_sys_cpu(op: &Op, stage: u32) {
+    let src = op.srcs[0];
+    let same = matches!((src, op.dst), (Some(a), Some(b)) if a.resource_id == b.resource_id);
+    SYS_CPU_K.store(
+        op.cmd.opcode()
+            | class_bit_of(src) << 4
+            | class_bit_of(op.dst) << 8
+            | u32::from(same) << 12
+            | (PATHS.load(Ordering::Relaxed) & 0xff) << 16
+            | stage << 24,
+        Ordering::Relaxed,
+    );
+}
+
 /// The timeline's completed watermark, for [`seq_ready`].
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
 /// Nonzero while the table holds an admitted, unexecuted job (the worker's fast exit).
@@ -161,7 +181,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -200,6 +220,7 @@ pub(crate) fn publish_counters() {
     w(b"GdiSysFail", SYS_FAIL.load(Ordering::Relaxed));
     w(b"GdiSysWhy", SYS_WHY.load(Ordering::Relaxed));
     w(b"GdiSysMsk", SYS_MSK.load(Ordering::Relaxed));
+    w(b"GdiSysCpuK", SYS_CPU_K.load(Ordering::Relaxed));
     w(b"GdiChUpUs", CH_UP_US.load(Ordering::Relaxed));
     w(b"GdiSlowUs", SLOW_US.load(Ordering::Relaxed));
     w(b"GdiSlowOp", SLOW_OP.load(Ordering::Relaxed));
@@ -695,13 +716,30 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
         Engine::Cpu => {
             // A copy or fill that touches a staging buffer: the copy engine over its system pages
             // first, the CPU only when that is refused.
-            if op.why == Some(Why::SystemSurface) && path(PATH_SYS) && run_ce_sys(passive, adapter, op) {
+            let stage = if op.why != Some(Why::SystemSurface) {
+                0
+            } else if !path(PATH_SYS) {
+                1
+            } else {
+                let before = SYS_FAIL.load(Ordering::Relaxed);
+                if run_ce_sys(passive, adapter, op) {
+                    4
+                } else if SYS_FAIL.load(Ordering::Relaxed) != before {
+                    3
+                } else {
+                    2
+                }
+            };
+            if stage == 4 {
                 SYS_CE.fetch_add(1, Ordering::Relaxed);
                 match op.cmd {
                     Cmd::ColorFill { .. } => FILL_N.fetch_add(1, Ordering::Relaxed),
                     _ => BLT_N.fetch_add(1, Ordering::Relaxed),
                 };
             } else {
+                if stage != 0 {
+                    note_sys_cpu(op, stage);
+                }
                 run_cpu_counted(passive, adapter, op);
             }
         }
