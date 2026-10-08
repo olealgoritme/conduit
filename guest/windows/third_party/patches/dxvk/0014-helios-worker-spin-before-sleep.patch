@@ -1,0 +1,260 @@
+Helios DXVK fork: poll briefly before a worker or waiter sleeps
+
+Conduit guest/windows/docs (382.1 windowed Heaven profile). Applied after
+0013 by ci/windows/Build-Driver.ps1.
+
+Under a hypervisor, waking a thread that sleeps on another vCPU costs an IPI
+and a VM exit on the thread that wakes it. In the 382.1 profile of windowed
+Heaven, HalpInterruptSendIpi was 2.7% of the app process. The app thread
+dispatches ~17 CS chunks per frame into a CS thread that is idle 78% of the
+time, so nearly every dispatch wakes a sleeping thread, and the present gate
+(SynchronizeCsThread + syncSubmissions, ~180 us per frame) sleeps the app
+thread and has the workers wake it again.
+
+Each such wait now polls a lock-free indicator for up to
+HELIOS_DXVK_SPIN_US microseconds (process environment; default 30, 0 off,
+at most 1000) before it blocks on its condition variable as before:
+- the CS worker, for a new chunk (m_heliosAdded, counted where chunks are
+  queued);
+- DxvkCsThread::synchronize / injectChunk(synchronize), for the CS counter;
+- the submission thread, for a new submission (m_heliosSubmitPending,
+  m_submitQueue's size);
+- DxvkSubmissionQueue::synchronize (syncSubmissions), for an empty queue.
+The predicates under the lock are unchanged: the poll only decides how long
+a thread stays awake before it waits, never what it waits for.
+
+diff --git a/src/dxvk/dxvk_cs.cpp b/src/dxvk/dxvk_cs.cpp
+index 51ff8dbb..ebcea749 100644
+--- a/src/dxvk/dxvk_cs.cpp
++++ b/src/dxvk/dxvk_cs.cpp
+@@ -1,4 +1,5 @@
+ #include "dxvk_cs.h"
++#include "dxvk_helios_spin.h"
+ #include "dxvk_helios_feed_trace.h"
+ 
+ #include <cstdio>
+@@ -187,6 +188,7 @@ namespace dxvk {
+       entry.chunk = std::move(chunk);
+       entry.seq = seq;
+       m_queueOrdered.seqDispatch = seq;
++      m_heliosAdded.fetch_add(1u, std::memory_order_release);
+ 
+       helios_feed::csChunkEnqueued(
+         m_queueOrdered.queue.size() + m_queueHighPrio.queue.size());
+@@ -214,6 +216,7 @@ namespace dxvk {
+       entry.seq = timeline;
+       if (synchronize)
+         q.seqDispatch = timeline;
++      m_heliosAdded.fetch_add(1u, std::memory_order_release);
+ 
+       helios_feed::csChunkEnqueued(
+         m_queueOrdered.queue.size() + m_queueHighPrio.queue.size());
+@@ -228,6 +231,10 @@ namespace dxvk {
+     }
+ 
+     if (synchronize) {
++      helios_spin::until([this, queue, timeline] {
++        return getCounter(queue).load() >= timeline || hasError();
++      });
++
+       std::unique_lock<dxvk::mutex> lock(m_counterMutex);
+ 
+       m_condOnSync.wait(lock, [this, queue, timeline] {
+@@ -255,6 +262,11 @@ namespace dxvk {
+ 
+       auto t0 = dxvk::high_resolution_clock::now();
+ 
++      // Helios: the CS thread is usually just behind; poll before sleeping.
++      helios_spin::until([this, seq] {
++        return m_seqOrdered.load() >= seq || hasError();
++      });
++
+       { std::unique_lock<dxvk::mutex> lock(m_counterMutex);
+         m_condOnSync.wait(lock, [this, seq] {
+           return m_seqOrdered.load() >= seq || hasError();
+@@ -323,6 +335,18 @@ namespace dxvk {
+           if (unlikely(!pred())) {
+             auto t0 = dxvk::high_resolution_clock::now();
+ 
++            // Helios: poll briefly before sleeping, so a chunk that follows
++            // within the spin budget needs no cross-vCPU wake.
++            if (helios_spin::budgetUs()) {
++              const uint64_t seen = m_heliosAdded.load(std::memory_order_acquire);
++              lock.unlock();
++              helios_spin::until([&] {
++                return m_heliosAdded.load(std::memory_order_acquire) != seen
++                    || m_stopped.load();
++              });
++              lock.lock();
++            }
++
+             m_condOnAdd.wait(lock, [&] {
+               return pred();
+             });
+diff --git a/src/dxvk/dxvk_cs.h b/src/dxvk/dxvk_cs.h
+index aa77d61b..9abdd7d8 100644
+--- a/src/dxvk/dxvk_cs.h
++++ b/src/dxvk/dxvk_cs.h
+@@ -638,6 +638,9 @@ namespace dxvk {
+     std::atomic<bool>           m_stopped     = { false };
+     std::atomic<bool>           m_hasError    = { false };
+     std::atomic<bool>           m_hasHighPrio = { false };
++    // Helios: chunks ever added to either queue (written under m_mutex), so
++    // the worker can poll for new work without the lock (dxvk_helios_spin.h).
++    std::atomic<uint64_t>       m_heliosAdded = { 0u };
+ 
+     alignas(CACHE_LINE_SIZE)
+     dxvk::mutex                 m_mutex;
+diff --git a/src/dxvk/dxvk_helios_spin.h b/src/dxvk/dxvk_helios_spin.h
+new file mode 100644
+index 00000000..4936574f
+--- /dev/null
++++ b/src/dxvk/dxvk_helios_spin.h
+@@ -0,0 +1,68 @@
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++
++#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
++#include <immintrin.h>
++#endif
++
++#include "../util/util_env.h"
++
++namespace dxvk::helios_spin {
++
++  /**
++   * \brief Spin budget before a DXVK worker or waiter blocks, in microseconds
++   *
++   * HELIOS_DXVK_SPIN_US (process environment): the time a thread polls its
++   * queue or counter before it waits on the condition variable. Under a
++   * hypervisor, waking a thread that sleeps on another vCPU costs an IPI and
++   * a VM exit on the waking thread (Conduit 382.1 Heaven profile:
++   * HalpInterruptSendIpi 2.7% of the app process, ~17 CS chunk dispatches per
++   * frame into a CS thread that is 78% idle). A short poll catches the next
++   * chunk of a burst without that wake. 0 disables it; default 30, at most
++   * 1000.
++   */
++  inline uint32_t budgetUs() {
++    static const uint32_t us = [] {
++      const std::string v = env::getEnvVar("HELIOS_DXVK_SPIN_US");
++      if (v.empty())
++        return 30u;
++      const unsigned long n = std::strtoul(v.c_str(), nullptr, 10);
++      return uint32_t(n > 1000ul ? 1000ul : n);
++    }();
++    return us;
++  }
++
++  inline void pause() {
++#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
++    _mm_pause();
++#endif
++  }
++
++  /**
++   * \brief Polls \c done for up to \ref budgetUs microseconds
++   *
++   * Call with no lock held. \c done must be cheap and lock-free (atomic
++   * loads). Returns whether it became true; a false return means the caller
++   * waits on its condition variable as before, so the spin never changes
++   * what is waited for, only how long the thread stays awake first.
++   */
++  template<typename Pred>
++  bool until(Pred&& done) {
++    const uint32_t us = budgetUs();
++    if (!us)
++      return done();
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
++    for (uint32_t i = 0u; ; i++) {
++      if (done())
++        return true;
++      // The clock read costs more than a poll: every 32 polls.
++      if ((i & 31u) == 31u && std::chrono::steady_clock::now() >= deadline)
++        return done();
++      pause();
++    }
++  }
++
++}
+diff --git a/src/dxvk/dxvk_queue.cpp b/src/dxvk/dxvk_queue.cpp
+index 57f2289a..e304a96f 100644
+--- a/src/dxvk/dxvk_queue.cpp
++++ b/src/dxvk/dxvk_queue.cpp
+@@ -1,6 +1,7 @@
+ #include "dxvk_device.h"
+ #include "dxvk_helios_feed_trace.h"
+ #include "dxvk_queue.h"
++#include "dxvk_helios_spin.h"
+ 
+ namespace dxvk {
+   
+@@ -62,6 +63,7 @@ namespace dxvk {
+     entry.latency = std::move(latencyInfo);
+ 
+     m_submitQueue.push(std::move(entry));
++    m_heliosSubmitPending.store(m_submitQueue.size(), std::memory_order_release);
+     helios_feed::submissionEnqueued(m_submitQueue.size());
+     m_appendCond.notify_all();
+   }
+@@ -79,6 +81,7 @@ namespace dxvk {
+     entry.latency = std::move(latencyInfo);
+ 
+     m_submitQueue.push(std::move(entry));
++    m_heliosSubmitPending.store(m_submitQueue.size(), std::memory_order_release);
+     helios_feed::submissionEnqueued(m_submitQueue.size());
+     m_appendCond.notify_all();
+   }
+@@ -95,6 +98,11 @@ namespace dxvk {
+ 
+ 
+   void DxvkSubmissionQueue::synchronize() {
++    // Helios: the submission thread is usually just behind; poll first.
++    helios_spin::until([this] {
++      return m_heliosSubmitPending.load(std::memory_order_acquire) == 0u;
++    });
++
+     std::unique_lock<dxvk::mutex> lock(m_mutex);
+ 
+     m_submitCond.wait(lock, [this] {
+@@ -143,6 +151,16 @@ namespace dxvk {
+ 
+       { std::unique_lock<dxvk::mutex> lock(m_mutex);
+ 
++        // Helios: poll briefly for the next submission before sleeping.
++        if (m_submitQueue.empty() && helios_spin::budgetUs()) {
++          lock.unlock();
++          helios_spin::until([this] {
++            return m_heliosSubmitPending.load(std::memory_order_acquire) != 0u
++                || m_stopped.load();
++          });
++          lock.lock();
++        }
++
+         m_appendCond.wait(lock, [this] {
+           return m_stopped.load() || !m_submitQueue.empty();
+         });
+@@ -249,6 +267,7 @@ namespace dxvk {
+         }
+ 
+         m_submitQueue.pop();
++        m_heliosSubmitPending.store(m_submitQueue.size(), std::memory_order_release);
+         helios_feed::submissionDequeued(m_submitQueue.size());
+         m_submitCond.notify_all();
+ 
+diff --git a/src/dxvk/dxvk_queue.h b/src/dxvk/dxvk_queue.h
+index 3445c636..90343f99 100644
+--- a/src/dxvk/dxvk_queue.h
++++ b/src/dxvk/dxvk_queue.h
+@@ -252,6 +252,9 @@ namespace dxvk {
+     dxvk::condition_variable    m_finishCond;
+ 
+     std::queue<DxvkSubmitEntry> m_submitQueue;
++    // Helios: m_submitQueue's size, written under m_mutex, read without it by
++    // the polls before the submission thread and syncSubmissions() block.
++    std::atomic<size_t>         m_heliosSubmitPending = { 0u };
+     std::queue<DxvkSubmitEntry> m_finishQueue;
+ 
+     // HELIOS: command lists whose host work never retired before a
