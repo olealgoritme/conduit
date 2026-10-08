@@ -1947,6 +1947,12 @@ mod present_timing {
     static MAX: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
     static GATE: AtomicU64 = AtomicU64::new(0);
     static LAST_START: AtomicU64 = AtomicU64::new(0);
+    /// The copy+flush step's parts: 0 the DXGI Blt copy, 1 `Flush`, 2 `flush_gate` (sums, maxima).
+    static SUB_SUM: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static SUB_MAX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    /// The device's shared (keyed-mutex candidate) resources at the last present: nonzero makes
+    /// `flush_gate` wait on the CPU for the GPU on NVK.
+    static SHARED: AtomicU64 = AtomicU64::new(0);
     static INTERVAL_SUM: AtomicU64 = AtomicU64::new(0);
 
     fn epoch() -> Instant {
@@ -2006,13 +2012,33 @@ mod present_timing {
                     let m = MAX[i].swap(0, Ordering::Relaxed);
                     line.push_str(&format!(" {}={}/{}", NAMES[i], s / EVERY, m));
                 }
+                for (i, name) in ["blt", "flush", "fgate"].iter().enumerate() {
+                    let s = SUB_SUM[i].swap(0, Ordering::Relaxed);
+                    let m = SUB_MAX[i].swap(0, Ordering::Relaxed);
+                    line.push_str(&format!(" {}={}/{}", name, s / EVERY, m));
+                }
                 let iv = INTERVAL_SUM.swap(0, Ordering::Relaxed);
                 crate::log_error!(
-                    "NVK present timing (avg/max us over {EVERY}, #{n}):{line} interval={}",
-                    iv / EVERY
+                    "NVK present timing (avg/max us over {EVERY}, #{n}):{line} interval={} shared={}",
+                    iv / EVERY,
+                    SHARED.load(Ordering::Relaxed)
                 );
             }
         }
+    }
+
+    /// Time one part `i` of the copy+flush step.
+    pub(super) fn sub<R>(i: usize, f: impl FnOnce() -> R) -> R {
+        let t = now_us();
+        let r = f();
+        let d = now_us().saturating_sub(t);
+        SUB_SUM[i].fetch_add(d, Ordering::Relaxed);
+        SUB_MAX[i].fetch_max(d, Ordering::Relaxed);
+        r
+    }
+
+    pub(super) fn note_shared(n: usize) {
+        SHARED.store(n as u64, Ordering::Relaxed);
     }
 
     /// Time spent in `present_frame_gate` (added to the present in flight on this thread's call).
@@ -2039,22 +2065,27 @@ unsafe fn nvk_present_impl_timed(
     let mut blt_source = true;
     if let Some(context) = d3d11_context(h) {
         if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
-            context.CopySubresourceRegion(
-                &*dst,
-                a.DstSubResourceIndex,
-                0,
-                0,
-                0,
-                &*src,
-                a.SrcSubResourceIndex,
-                None,
-            );
+            present_timing::sub(0, || {
+                context.CopySubresourceRegion(
+                    &*dst,
+                    a.DstSubResourceIndex,
+                    0,
+                    0,
+                    0,
+                    &*src,
+                    a.SrcSubResourceIndex,
+                    None,
+                )
+            });
             shown = dst_h;
             blt_source = false;
         }
         // A keyed-mutex surface may be released right after this present.
-        context.Flush();
-        flush_gate(h, &context);
+        present_timing::sub(1, || context.Flush());
+        present_timing::sub(2, || flush_gate(h, &context));
+        if let Some(dev) = helios_device(h) {
+            present_timing::note_shared(lock_ignore_poison(&dev.nvk_keyed_resources).len());
+        }
     }
     t.mark(0);
     let frame = match nvk_present_frame(h, shown, blt_source) {
