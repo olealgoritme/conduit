@@ -96,6 +96,11 @@ static SYS_PX: AtomicU32 = AtomicU32::new(0);
 /// (sub-rectangles, at most 0xffff | same buffer << 16 | covers the whole destination << 17 |
 /// source and destination the same extent << 18).
 static SYS_K: AtomicU32 = AtomicU32::new(0);
+/// Windows of foreign NVK images the CPU executor read and wrote (`Why::Foreign`, read-modify-
+/// write through `ce_vram::foreign_transfer`), and transfers that failed.
+static FGN_RMW_RD: AtomicU32 = AtomicU32::new(0);
+static FGN_RMW_WR: AtomicU32 = AtomicU32::new(0);
+static FGN_RMW_FAIL: AtomicU32 = AtomicU32::new(0);
 static SYS_SWH: AtomicU32 = AtomicU32::new(0);
 static SYS_DWH: AtomicU32 = AtomicU32::new(0);
 static SYS_RES: AtomicU32 = AtomicU32::new(0);
@@ -254,7 +259,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -310,6 +315,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiSysWtUs", SYS_WT_US.load(Ordering::Relaxed));
     w(b"GdiSysPx", SYS_PX.load(Ordering::Relaxed));
     w(b"GdiSysK", SYS_K.load(Ordering::Relaxed));
+    w(b"GdiFgnRd", FGN_RMW_RD.load(Ordering::Relaxed));
+    w(b"GdiFgnWb", FGN_RMW_WR.load(Ordering::Relaxed));
+    w(b"GdiFgnRwF", FGN_RMW_FAIL.load(Ordering::Relaxed));
     w(b"GdiSysSWH", SYS_SWH.load(Ordering::Relaxed));
     w(b"GdiSysDWH", SYS_DWH.load(Ordering::Relaxed));
     w(b"GdiSysRes", SYS_RES.load(Ordering::Relaxed));
@@ -886,14 +894,15 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
 }
 
 fn execute_inner(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
-    if op.engine != Engine::Drop && op.dst.is_some_and(|d| d.class == SurfaceClass::Foreign) {
+    let fgn_copy = ga::is_foreign_copy(&op.cmd, op.dst.as_ref(), op.srcs[0].as_ref());
+    if fgn_copy && op.engine != Engine::Drop && op.dst.is_some_and(|d| d.class == SurfaceClass::Foreign) {
         if !run_foreign_write(passive, adapter, op) {
             crate::ddi::gdi_accel::note_why(Why::CeFailed);
             crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
         }
         return;
     }
-    if op.engine != Engine::Drop && op.srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign) {
+    if fgn_copy && op.engine != Engine::Drop && op.srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign) {
         if !run_foreign(passive, adapter, op) {
             crate::ddi::gdi_accel::note_why(Why::CeFailed);
             crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
@@ -1418,7 +1427,17 @@ fn read_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rec
                 out[y * w * 4..(y + 1) * w * 4].copy_from_slice(&tmp[from..from + w * 4]);
             }
         }
-        SurfaceClass::Unreachable | SurfaceClass::Foreign => return Err(Why::Unreachable),
+        SurfaceClass::Foreign => {
+            if !path(PATH_FGN) {
+                return Err(Why::Unreachable);
+            }
+            if !glue::foreign_read(passive, adapter, s.resource_id, *rect, &mut out, w * 4) {
+                FGN_RMW_FAIL.fetch_add(1, Ordering::Relaxed);
+                return Err(Why::CpuFailed);
+            }
+            FGN_RMW_RD.fetch_add(1, Ordering::Relaxed);
+        }
+        SurfaceClass::Unreachable => return Err(Why::Unreachable),
     }
     Ok(out)
 }
@@ -1441,7 +1460,19 @@ fn write_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, re
                 Err(Why::CpuFailed)
             }
         }
-        SurfaceClass::Unreachable | SurfaceClass::Foreign => Err(Why::Unreachable),
+        SurfaceClass::Foreign => {
+            if !path(PATH_FGN) || !path(PATH_FGN_WR) {
+                return Err(Why::Unreachable);
+            }
+            if glue::foreign_upload(passive, adapter, s.resource_id, *rect, data, w as usize * 4) {
+                FGN_RMW_WR.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            } else {
+                FGN_RMW_FAIL.fetch_add(1, Ordering::Relaxed);
+                Err(Why::CpuFailed)
+            }
+        }
+        SurfaceClass::Unreachable => Err(Why::Unreachable),
     }
 }
 
@@ -1521,7 +1552,9 @@ fn run_cpu_copy(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &
             continue;
         }
         let mut buf = read_window(passive, adapter, &src, &s, spitch)?;
-        if ga::swaps_rb(&src, dst) {
+        // A foreign image's window is already B G R A (`glue::foreign_read` / `foreign_upload`).
+        let bgra = |x: &Surface| if x.class == SurfaceClass::Foreign { Surface { format: 21, ..*x } } else { *x };
+        if ga::swaps_rb(&bgra(&src), &bgra(dst)) {
             for px in buf.chunks_exact_mut(4) {
                 px.swap(0, 2);
             }

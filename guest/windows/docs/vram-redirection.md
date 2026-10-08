@@ -733,6 +733,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiFgnDrop`, `GdiFgnOp` | commands dropped because a foreign image is in them other than as a SRCCOPY source (the plan's drop), and the last one's signature (`opcode \| foreign dst << 8 \| foreign src << 9 \| rop << 16`). Note `GdiFgnN` counts surface RESOLUTIONS (a command naming the image twice counts twice), not commands |
 | `GdiSysUs`, `GdiSysVwUs`, `GdiSysSubUs`, `GdiSysWtUs`, `GdiSysPx` | the slowest staging copy-engine command: total µs, the part until its views were resolved, until its last submit, the wait, its pixels |
 | `GdiSysK`, `GdiSysSWH`, `GdiSysDWH`, `GdiSysRes`, `GdiSysShape` | that command's surfaces: kinds (source `std type << 4 \| GDI type \| RM-backed << 8`, destination's << 16), extents (`w << 16 \| h`), resource ids (source \| destination << 16), shape (sub-rects \| same buffer << 16 \| covers the whole destination << 17 \| same extent << 18) |
+| `GdiFgnRd`, `GdiFgnWb`, `GdiFgnRwF` | windows of foreign NVK images the CPU executor read and wrote back (`Why` 14 `Foreign`: fills, blends, ClearType, ROPs, foreign to foreign), and the transfers that failed |
 | `GdiSlowRop`, `GdiCpuMsk`, `GdiCpuRop` | the slowest command's reason and ROP (`Why \| rop enum << 8 \| ROP3 << 16`); the reasons of the commands the CPU ran (bit per `Why` code, 1 for none); the last CPU command's reason and ROP |
 | `GdiJobMaxN`, `GdiJobT1..3`, `GdiJobT1Us..3Us` | the slowest job (`GdiUsMax`): its command count and its three slowest commands (signature as `GdiSlowOp`, µs) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
@@ -832,6 +833,15 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   reads whole bounding windows; a GDI-heavy desktop costs worker time the Present path shares.
 * ClearType's gamma row is read from the `LOOKUPTABLE` surface at `Gamma * pitch` (8 bpp, 512 entries);
   if that surface is not a standard buffer the blend runs without gamma.
+
+**Commands on foreign NVK images (since the head after 1a23f0cd):** until then only a SRCCOPY
+BitBlt with one side a foreign image (and the other VRAM or a staging buffer) ran, on the copy engine
+(`foreign_copy`, `foreign_write`); every other command touching a foreign image was dropped
+(`GdiFgnDrop`). Such commands, e.g. GDI text and fills on a GDI-compatible D3D surface (`GetDC`), now
+plan as `Why::Foreign` (14) and run on the CPU over windows of the image: `ce_vram::foreign_transfer`
+reads the window through the bounce buffer (R G B images reordered to B G R A), the CPU executor runs
+the command, and the window is written back the same way. No producer acquire, as GDI on a D3D surface
+on bare metal. `GdiOff` 0x1 turns these off with the copies, 0x20 the write-back.
 
 ### 10.6b Bisect switches (`GdiOff`, since 368.1)
 
