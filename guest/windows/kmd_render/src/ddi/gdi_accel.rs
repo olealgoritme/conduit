@@ -56,6 +56,10 @@ static SUB_N: AtomicU32 = AtomicU32::new(0);
 static UNR_N: AtomicU32 = AtomicU32::new(0);
 /// Foreign NVK images resolved (copy-engine sources).
 static FGN_N: AtomicU32 = AtomicU32::new(0);
+/// Commands dropped because a foreign image is in them other than as a SRCCOPY source, and the last
+/// one's signature (opcode | foreign dst << 8 | foreign src << 9 | rop << 16).
+static FGN_DROP: AtomicU32 = AtomicU32::new(0);
+static FGN_OP: AtomicU32 = AtomicU32::new(0);
 static UNR_K: AtomicU32 = AtomicU32::new(0);
 static UNR_WH: AtomicU32 = AtomicU32::new(0);
 static PRV_OK: AtomicU32 = AtomicU32::new(0);
@@ -123,7 +127,7 @@ pub(crate) fn note_start(knobs: &crate::adapter::AdapterKnobs) {
     let caps = caps_of(knobs);
     for c in [
         &CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN, &SUB_N,
-        &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD, &UNR_N, &UNR_K, &UNR_WH, &FGN_N,
+        &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD, &UNR_N, &UNR_K, &UNR_WH, &FGN_N, &FGN_DROP, &FGN_OP,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -171,6 +175,8 @@ pub(crate) fn publish_counters() {
     w(b"GdiUnrK", UNR_K.load(Ordering::Relaxed));
     w(b"GdiUnrWH", UNR_WH.load(Ordering::Relaxed));
     w(b"GdiFgnN", FGN_N.load(Ordering::Relaxed));
+    w(b"GdiFgnDrop", FGN_DROP.load(Ordering::Relaxed));
+    w(b"GdiFgnOp", FGN_OP.load(Ordering::Relaxed));
     crate::ddi::gdi_exec::publish_counters();
 }
 
@@ -416,6 +422,17 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
             let (engine, why) = ga::plan(&cmd, dst.as_ref(), [srcs[0].as_ref(), srcs[1].as_ref()]);
             if let Some(w) = why {
                 note_why(w);
+            }
+            // A foreign NVK image used other than as a SRCCOPY source: dropped by the plan.
+            let fgn_dst = dst.is_some_and(|d| d.class == SurfaceClass::Foreign);
+            let fgn_src = srcs.iter().flatten().any(|s| s.class == SurfaceClass::Foreign);
+            if engine == ga::Engine::Drop && (fgn_dst || fgn_src) {
+                FGN_DROP.fetch_add(1, Ordering::Relaxed);
+                let rop = match cmd {
+                    Cmd::BitBlt { rop, .. } | Cmd::ColorFill { rop, .. } => rop as u32,
+                    _ => 0,
+                };
+                FGN_OP.store(cmd.opcode() | u32::from(fgn_dst) << 8 | u32::from(fgn_src) << 9 | rop << 16, Ordering::Relaxed);
             }
             gx::note_census(&cmd, dst.as_ref(), [srcs[0].as_ref(), srcs[1].as_ref()]);
             if matches!(cmd, Cmd::Escape) {

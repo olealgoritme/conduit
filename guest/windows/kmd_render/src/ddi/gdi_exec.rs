@@ -85,6 +85,10 @@ static FGN_WHY: AtomicU32 = AtomicU32::new(0);
 /// Overlapping copies inside one surface (scrolls) seen, done on the copy engine as ordered
 /// non-overlapping bands, and the last refusal (1 not VRAM/staging, 2 view refused, 3 submit,
 /// 4 wait, 5 GdiOvl 0, 6 channel down).
+/// The slowest job's breakdown: its command count and its three slowest commands (signature as
+/// `GdiSlowOp`, time in µs).
+static JOB_N_OPS: AtomicU32 = AtomicU32::new(0);
+static JOB_T: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
 static OVL_N: AtomicU32 = AtomicU32::new(0);
 static OVL_CE: AtomicU32 = AtomicU32::new(0);
 static OVL_WHY: AtomicU32 = AtomicU32::new(0);
@@ -170,7 +174,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &OVL_N, &OVL_CE, &OVL_WHY,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -219,6 +223,13 @@ pub(crate) fn publish_counters() {
     w(b"GdiOvlN", OVL_N.load(Ordering::Relaxed));
     w(b"GdiOvlCe", OVL_CE.load(Ordering::Relaxed));
     w(b"GdiOvlWhy", OVL_WHY.load(Ordering::Relaxed));
+    w(b"GdiJobMaxN", JOB_N_OPS.load(Ordering::Relaxed));
+    w(b"GdiJobT1", JOB_T[0].load(Ordering::Relaxed));
+    w(b"GdiJobT1Us", JOB_T[1].load(Ordering::Relaxed));
+    w(b"GdiJobT2", JOB_T[2].load(Ordering::Relaxed));
+    w(b"GdiJobT2Us", JOB_T[3].load(Ordering::Relaxed));
+    w(b"GdiJobT3", JOB_T[4].load(Ordering::Relaxed));
+    w(b"GdiJobT3Us", JOB_T[5].load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
 }
 
@@ -473,6 +484,8 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread
             channel = Some(ensure_channel(passive, adapter));
         }
         let t0 = now_100ns();
+        // The three slowest commands of this job: (µs, signature).
+        let mut top = [(0u32, 0u32); 3];
         for op in &ops {
             if crate::ddi::gdi_thread::stopping() {
                 // StopDevice discharges the job; the rest of its commands are not run.
@@ -488,10 +501,20 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread
                 SLOW_US.store(ous, Ordering::Relaxed);
                 SLOW_OP.store(op_signature(op), Ordering::Relaxed);
             }
+            if ous > top[2].0 {
+                top[2] = (ous, op_signature(op));
+                top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            }
         }
         let us = (now_100ns().wrapping_sub(t0) / 10).min(u64::from(u32::MAX)) as u32;
         US.fetch_add(us, Ordering::Relaxed);
-        US_MAX.fetch_max(us, Ordering::Relaxed);
+        if us > US_MAX.fetch_max(us, Ordering::Relaxed) {
+            JOB_N_OPS.store(ops.len() as u32, Ordering::Relaxed);
+            for (i, (t, sig)) in top.iter().enumerate() {
+                JOB_T[2 * i].store(*sig, Ordering::Relaxed);
+                JOB_T[2 * i + 1].store(*t, Ordering::Relaxed);
+            }
+        }
         let finished = {
             let mut t = TABLE.lock();
             t.tl.complete(seq);
