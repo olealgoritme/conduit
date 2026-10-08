@@ -1689,6 +1689,9 @@ pub const fn paths_from_off(off: u32) -> u32 {
     if off & 0x80 != 0 {
         p |= 128;
     }
+    if off & 0x100 != 0 {
+        p |= 256;
+    }
     p
 }
 
@@ -2341,6 +2344,7 @@ mod tests {
         assert_eq!(paths_from_off(0x20), 0x1D);
         assert_eq!(paths_from_off(0x40), 0x7D);
         assert_eq!(paths_from_off(0x80), 0xBD);
+        assert_eq!(paths_from_off(0x100), 0x13D);
     }
 
     /// A knob is a service-key value the driver READS; a counter is one it WRITES. The same name

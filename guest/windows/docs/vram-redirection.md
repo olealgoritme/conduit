@@ -880,6 +880,8 @@ turns the acquire on):
 | 0x4 | copies and fills over a staging buffer's copy-engine view | CPU path |
 | 0x8 | two staging views at once (`with_standard_pair`) | CPU path |
 | 0x10 | scrolls as ordered copy-engine bands | CPU path |
+| 0x80 | (opt-in) execute each GDI buffer synchronously inside RenderGdi/RenderKm (timing diagnostic) | default: the executor thread after SubmitCommand |
+| 0x100 | (opt-in) readback diagnostics: pixel self-check and alpha census (`GdiChk*`), content probes (`GdiPrb*`, `GdiPre*`, `GdiSrcScan*`) | default off since the head after ecefd6ee: they cost bounce readbacks per sampled command |
 | 0x40 | (opt-in) every GDI write into a VRAM or foreign surface sets alpha 0xff (fills, copies, ClearType, stretch/transparent blits; AlphaBlend excepted) | default: only an `X8` source into an `A8` texture gets alpha 0xff |
 | 0x20 | (since the head after 2f94a4a6) copies INTO a foreign NVK image (`foreign_write`), reads stay on | dropped (`GdiFgnWhy` 26) |
 

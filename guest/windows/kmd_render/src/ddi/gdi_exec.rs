@@ -293,6 +293,10 @@ const PATH_OPAQUE: u32 = 64;
 /// Execute each job synchronously inside RenderGdi/RenderKm, before its fence exists (`GdiOff`
 /// 0x80 opts in; the timing test of the RGB-0 sources).
 const PATH_SYNC: u32 = 128;
+/// The readback diagnostics: the pixel self-check (`GdiChk*`, alpha census) and the content probes
+/// (`GdiPrb*`, `GdiPre*`, `GdiSrcScan*`). Each costs bounce-buffer readbacks per sampled command,
+/// so they are off unless `GdiOff` 0x100 opts in (they found 384.1-390.1's empty staging source).
+const PATH_DIAG: u32 = 256;
 
 static SYNC_N: AtomicU32 = AtomicU32::new(0);
 static SYNC_OPS: AtomicU32 = AtomicU32::new(0);
@@ -844,6 +848,9 @@ fn read_px(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, x: i32,
 /// The sampled pixel self-check of a command that reported success (`path`: 1 CE, 2 staging CE
 /// view, 3 CPU, 4 scroll bands). PASSIVE, no lock held.
 fn self_check(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, path: u32) {
+    if !self::path(PATH_DIAG) {
+        return;
+    }
     let (Some(dst), Some(sub)) = (op.dst, op.subs.first()) else {
         return;
     };
@@ -1097,6 +1104,9 @@ fn gpu_dst(op: &Op) -> Option<Surface> {
 
 /// Before the command: the first touch of a GPU destination (did the magenta clear reach it?).
 fn probe_before(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    if !path(PATH_DIAG) {
+        return;
+    }
     let (Some(d), Some(sub)) = (gpu_dst(op), op.subs.first()) else { return };
     let id = d.resource_id & 0xffff;
     if id == 0 || PRE.iter().any(|s| s.load(Ordering::Relaxed) >> 16 == id) {
@@ -1111,6 +1121,9 @@ fn probe_before(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
 
 /// After the command: is the destination's row, and the source's matching row, all RGB 0?
 fn probe_after(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    if !path(PATH_DIAG) {
+        return;
+    }
     let Some(sub) = op.subs.first() else { return };
     let (d, prb, seen, key) = match op.dst {
         Some(d) if matches!(d.class, SurfaceClass::Vram | SurfaceClass::Foreign) => (d, &PRB, &PRB_SEEN, &PRB_K),

@@ -1426,7 +1426,8 @@ pub mod knobs {
     /// foreign NVK images (dropped), 0x4 copies and fills over a staging buffer's copy-engine view
     /// (CPU instead), 0x8 two staging views at once (CPU instead), 0x10 scrolls as copy-engine
     /// bands (CPU instead), 0x20 copies into foreign NVK images (dropped). Opt-in 0x40: every GDI write into a GPU surface
-    /// sets alpha 0xff (AlphaBlend excepted). One opt-in: 0x2 lets a foreign copy acquire the producer's semaphore.
+    /// sets alpha 0xff (AlphaBlend excepted). Opt-in 0x80: execute each buffer at render
+    /// (timing diagnostic). Opt-in 0x100: the readback diagnostics (self-check, content probes). One opt-in: 0x2 lets a foreign copy acquire the producer's semaphore.
     /// One value with a name no counter has: the four separate switches of 365-367 shared
     /// `GdiSysCe` with a counter, so the knob read the last boot's counter.
     pub const GDI_OFF: KnobName = KnobName::new(b"GdiOff");
