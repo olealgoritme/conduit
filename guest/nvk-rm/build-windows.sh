@@ -20,6 +20,8 @@
 #                 built from MESA_DIR into BUILD_DIR-host (needs the LLVM/clang
 #                 development packages listed in README.md)
 #   OUT_DIR       where the Windows files are staged. Default: MESA_DIR/BUILD_DIR/dist
+#                 (the unstripped DLLs, for symbolizing CPU profiles, go to
+#                 OUT_DIR/debug: tools/etw-symbolize.py in guest/windows)
 #   JOBS          ninja -j (default 2)
 #   MEMORY_MAX    memory cap for the compile, via systemd-run --user --scope
 #                 when available (default 2500M; set empty to run uncapped)
@@ -182,6 +184,11 @@ mkdir -p "$OUT_DIR"
 # ~18 MB without); the unstripped DLLs stay in the build directories.
 "$tool-strip" -o "$OUT_DIR/vulkan_nouveau.dll" "$BUILD_DIR/src/nouveau/vulkan/vulkan_nouveau.dll"
 "$tool-strip" -o "$OUT_DIR/librmclient.dll" "$rmc/librmclient.dll"
+# The same DLLs unstripped (DWARF), for symbolizing CPU profiles of exactly
+# this build; stripping only drops debug sections, so RVAs match.
+mkdir -p "$OUT_DIR/debug"
+cp "$BUILD_DIR/src/nouveau/vulkan/vulkan_nouveau.dll" "$OUT_DIR/debug/vulkan_nouveau.dll"
+cp "$rmc/librmclient.dll" "$OUT_DIR/debug/librmclient.dll"
 if [ "$GL" = 1 ]; then
   "$tool-strip" -o "$OUT_DIR/libgallium_wgl.dll" "$BUILD_DIR/src/gallium/targets/wgl/libgallium_wgl.dll"
   "$tool-strip" -o "$OUT_DIR/opengl32.dll" "$BUILD_DIR/src/gallium/targets/libgl-gdi/opengl32.dll"

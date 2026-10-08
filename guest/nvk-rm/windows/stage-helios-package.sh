@@ -72,5 +72,19 @@ for f in librmclient.dll librmclient32.dll; do
     { echo "$f has no crm_win_adapter_luid (the Vulkan loader matches NVK to the adapter by LUID)" >&2; exit 1; }
 done
 (cd "$OUT_DIR" && sha256sum ./*.dll ./*.json > SHA256SUMS)
+
+# Unstripped NVK and librmclient of exactly these DLLs, for symbolizing CPU
+# profiles (guest/windows/tools/etw-symbolize.py --dll). Beside OUT_DIR, not
+# in it: win-build.sh copies OUT_DIR to the build VM whole. SHA256SUMS in it
+# names the stripped DLLs they belong to.
+DEBUG_DIR=${DEBUG_DIR:-$OUT_DIR-debug}
+mkdir -p "$DEBUG_DIR"
+cp "$d64/debug/vulkan_nouveau.dll" "$DEBUG_DIR/vulkan_nouveau64-unstripped.dll"
+cp "$d64/debug/librmclient.dll" "$DEBUG_DIR/librmclient64-unstripped.dll"
+cp "$d32/debug/vulkan_nouveau.dll" "$DEBUG_DIR/vulkan_nouveau32-unstripped.dll"
+cp "$d32/debug/librmclient.dll" "$DEBUG_DIR/librmclient32-unstripped.dll"
+cp "$OUT_DIR/SHA256SUMS" "$DEBUG_DIR/SHA256SUMS.stripped"
+(cd "$DEBUG_DIR" && sha256sum ./*-unstripped.dll > SHA256SUMS)
+echo "stage-helios-package: unstripped DLLs in $DEBUG_DIR"
 ls -l "$OUT_DIR"
 echo "stage-helios-package: $OUT_DIR"
