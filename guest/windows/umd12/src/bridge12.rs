@@ -272,6 +272,12 @@ mod ffi {
         /// The engine's GPU timestamp counters; returns how many it wrote.
         fn helios_vkd3d_bridge_gpu_time_stats(out: &mut [u64]) -> u32;
 
+        /// NVK: make the queue's next ECL fence now.
+        ///
+        /// # Safety
+        /// `queue` is a borrowed live engine `ID3D12CommandQueue*`.
+        unsafe fn helios_vkd3d_bridge_prepare_ecl_fence(queue: usize) -> i32;
+
         /// # Safety
         /// All engine objects and API-typed arrays are live for this call.
         /// The engine copies mapping data and duplicates the admission event.
@@ -765,12 +771,24 @@ pub(crate) const MEMORY_STATS_LEN: usize = 385;
 /// commit-to-signal sum and max (us), signal failures, values reserved, fences
 /// made, creates failed, then 7 histogram buckets; then (vkd3d patch 0006)
 /// admissions, commit-to-admission sum (us), its 7 buckets, the ECL fences'
-/// admission-to-signal sum (us), inline producer signals, separate ones. An
-/// engine without patch 0006 leaves those zero.
-pub(crate) fn ecl_fence_stats() -> [u64; 26] {
-    let mut out = [0u64; 26];
+/// admission-to-signal sum (us), inline producer signals, separate ones; then
+/// (patch 0009) fences made ahead and those taken. An engine without a patch
+/// leaves its values zero.
+pub(crate) fn ecl_fence_stats() -> [u64; 28] {
+    let mut out = [0u64; 28];
     ffi::helios_vkd3d_bridge_ecl_fence_stats(&mut out);
     out
+}
+
+/// NVK (vkd3d patch 0009): make `queue`'s next ECL fence now, so that ECL's
+/// HE12 v4 Render does not wait for the fence-create escape.
+///
+/// # Safety
+/// `queue` is a borrowed live engine `ID3D12CommandQueue*`, called under the
+/// queue's execution lock (serialised with its ECLs).
+pub(crate) unsafe fn prepare_ecl_fence(queue: usize) -> bool {
+    // SAFETY: forwarded precondition.
+    unsafe { ffi::helios_vkd3d_bridge_prepare_ecl_fence(queue) >= 0 }
 }
 
 /// The engine's GPU timestamp counters (`helios_vkd3d_gpu_time_stats`, vkd3d

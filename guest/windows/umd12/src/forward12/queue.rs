@@ -3397,6 +3397,19 @@ unsafe fn execute_command_lists_body(
                 Ok(true) => {
                     L2_REFUSALS.ecl_nvk_ordered.bump();
                     note_refusal(&L2_REFUSALS.ecl_admission_queued);
+                    // `Nvk12EclFencePrefetch`: the next ECL's fence now, with
+                    // this batch already admitted, so its Render need not wait
+                    // for the fence-create escape. Still under the execution
+                    // lock, so no other ECL of this queue interleaves.
+                    if crate::knobs12::nvk12_ecl_fence_prefetch() {
+                        // SAFETY: the live engine queue, execution lock held.
+                        let made = unsafe {
+                            crate::bridge12::prepare_ecl_fence(queue.engine_queue.as_raw() as usize)
+                        };
+                        if !made {
+                            note_refusal(&L2_REFUSALS.ecl_fence_prefetch_failed);
+                        }
+                    }
                     return;
                 }
                 Ok(false) => {}
@@ -4086,6 +4099,9 @@ pub(crate) struct L2Refusals {
     /// NVK ECLs released without the runtime admission event (diagnostic
     /// `Nvk12AdmitAfterPresentOnly`).
     ecl_admission_skipped: RefusalCounter,
+    /// `Nvk12EclFencePrefetch`: the next ECL's fence could not be made ahead
+    /// (that ECL makes it inline).
+    ecl_fence_prefetch_failed: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -4186,6 +4202,7 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     command_signature_translation_oom: RefusalCounter::new("CommandSignatureTranslationOom"),
     ecl_nvk_ordered: RefusalCounter::new("EclNvkOrdered"),
     ecl_admission_skipped: RefusalCounter::new("EclAdmissionSkipped"),
+    ecl_fence_prefetch_failed: RefusalCounter::new("EclFencePrefetchFailed"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -4330,6 +4347,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.command_signature_translation_oom,
     &L2_REFUSALS.ecl_nvk_ordered,
     &L2_REFUSALS.ecl_admission_skipped,
+    &L2_REFUSALS.ecl_fence_prefetch_failed,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

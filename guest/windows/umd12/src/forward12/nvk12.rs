@@ -244,7 +244,7 @@ fn log_engine_timing(frames: u64) {
         log_error!(
             "vkd3d batches: {admits} admitted, commit-to-admission avg {} us, hist <50us {} <200us {} \
              <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {}; ECL fence admission-to-signal avg {} us; \
-             producer signal inline {} separate {}",
+             producer signal inline {} separate {}; ECL fences made ahead {} taken {}",
             st[15] / admits,
             st[16],
             st[17],
@@ -256,6 +256,8 @@ fn log_engine_timing(frames: u64) {
             if st[0] != 0 { st[23] / st[0] } else { 0 },
             st[24],
             st[25],
+            st[26],
+            st[27],
         );
     }
     let gt = crate::bridge12::gpu_time_stats();
