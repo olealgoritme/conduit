@@ -271,9 +271,14 @@ fn qmp_args(console: &Path) -> [String; 4] {
 /// relative motion *and* its buttons, so a click under a grab never jumps the
 /// pointer back to the tablet's last position. On the command line, after
 /// libvirt's devices, because the binding needs the VGA to exist already
-/// (QEMU skips it silently otherwise).
+/// (QEMU skips it silently otherwise) -- and in JSON form: QEMU creates every
+/// `key=value` -device before any JSON one, and libvirt writes its own in
+/// JSON, so a `key=value` tablet came before the xhci controller and failed
+/// with "Bus 'usb.0' not found" (QEMU 11.1, 2026-10-08).
 fn tablet_arg() -> String {
-    format!("usb-tablet,id={TABLET_ID},bus=usb.0,port=1,display=video0")
+    format!(
+        r#"{{"driver":"usb-tablet","id":"{TABLET_ID}","bus":"usb.0","port":"1","display":"video0"}}"#
+    )
 }
 
 /// Take libvirt's `<input type='tablet' bus='usb'>` out (its place is the
@@ -478,18 +483,18 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         .collect();
     let prev = previous_slot(&values);
     // The tablet moves to the command line once and stays there.
-    let tablet = has_video
-        && (moved_tablet
-            || values
-                .iter()
-                .any(|v| v.contains(&format!("id={TABLET_ID}"))));
+    let tablet = has_video && (moved_tablet || values.iter().any(|v| v.contains(TABLET_ID)));
     let mut keep: Vec<Element> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let next = values.get(i + 1).cloned().unwrap_or_default();
         let ours = match values[i].as_str() {
             "-chardev" => next.contains(CHARDEV_ID) || next.contains(&format!("id={QMP_ID},")),
-            "-device" => next.contains(CHARDEV_ID) || next.contains(&format!("id={TABLET_ID},")),
+            "-device" => {
+                next.contains(CHARDEV_ID)
+                    || next.contains(&format!("id={TABLET_ID},"))
+                    || next.contains(&format!(r#""id":"{TABLET_ID}""#))
+            }
             "-mon" => next.contains(&format!("chardev={QMP_ID},")),
             _ => false,
         };
@@ -1141,6 +1146,18 @@ mod tests {
         assert!(out.contains("myvm.qcow2"));
     }
 
+    /// The `<qemu:arg>` values, unescaped.
+    fn qemu_args(out: &str) -> Vec<String> {
+        let root = Element::parse(out.as_bytes()).unwrap();
+        root.children
+            .iter()
+            .filter_map(|n| n.as_element())
+            .filter(|e| e.name == "commandline")
+            .flat_map(|e| e.children.iter().filter_map(|n| n.as_element()))
+            .filter_map(|a| a.attributes.get("value").cloned())
+            .collect()
+    }
+
     #[test]
     fn the_tablet_moves_to_the_command_line_bound_to_the_display_and_qmp_is_added() {
         let out = edit(VIRT_INSTALL);
@@ -1152,9 +1169,10 @@ mod tests {
                 .any(|e| e.attributes.get("type").map(String::as_str) == Some("tablet")),
             "libvirt's tablet is gone: {out}"
         );
-        assert!(
-            out.contains("value=\"usb-tablet,id=conduit-tablet,bus=usb.0,port=1,display=video0\""),
-            "{out}"
+        assert!(qemu_args(&out).contains(&super::tablet_arg()), "{out}");
+        assert_eq!(
+            super::tablet_arg(),
+            r#"{"driver":"usb-tablet","id":"conduit-tablet","bus":"usb.0","port":"1","display":"video0"}"#
         );
         assert!(
             out.contains(&format!(
@@ -1192,7 +1210,7 @@ mod tests {
             "the GPU and QMP: {twice}"
         );
         assert_eq!(
-            twice.matches("id=conduit-tablet").count(),
+            twice.matches("conduit-tablet").count(),
             0,
             "no tablet, none added: {twice}"
         );
@@ -1256,7 +1274,7 @@ mod tests {
         assert_eq!(all(&dev, "tpm").len(), 1, "the TPM stays");
         assert!(all(&dev, "input").is_empty(), "the tablet moved: {out}");
         assert!(
-            out.contains("usb-tablet,id=conduit-tablet,bus=usb.0,port=1,display=video0"),
+            qemu_args(&out).contains(&super::tablet_arg()),
             "to the command line: {out}"
         );
         assert_eq!(edit(&out), out, "idempotent");
