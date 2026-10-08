@@ -23,7 +23,9 @@
 //!   the admission event, the DDI waits for the boundary on the calling thread.
 //!   A wait-before-signal pattern (Queue::Wait on a fence the app signals after
 //!   ExecuteCommandLists returns) would deadlock that wait, so it is capped at
-//!   2 s per call and counted.
+//!   2 s per call and counted. The wait first polls the stream with zero
+//!   timeouts for `Nvk12EclSpinUs` (default 2 ms): NVK's own blocking wait
+//!   costs at least a Windows timer tick, once per ECL.
 //!
 //! The order on the context matters: admission first (it only fires once the
 //! runtime's earlier waits are satisfied, and the engine worker waits for it),
@@ -33,6 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use helios_umd_common::hr::{E_FAIL, E_NOTIMPL};
 use helios_umd_common::refusals::RefusalCounter;
@@ -42,6 +45,90 @@ use crate::{ddi12, device12, log_error, note_refusal};
 
 /// The CPU-wait arm's cap per ExecuteCommandLists.
 const CPU_WAIT_NS: u64 = 2_000_000_000;
+/// Zero-timeout probes between two clock reads in [`spin_wait`].
+const SPIN_PROBES_PER_CLOCK: u32 = 8;
+/// Waits per ECL CPU-wait timing line.
+const ECL_WAIT_LOG_EVERY: u64 = 4096;
+
+/// Poll the engine's execution stream for `value` with zero-timeout waits for
+/// up to `Nvk12EclSpinUs`. `Some(result)` when the poll settled it (reached,
+/// or an engine error), `None` when the budget ran out (or is 0) and the
+/// caller must block.
+///
+/// Why not just block: NVK's RM backend blocks on the non-stall event or in
+/// `Sleep()`, which on Windows costs at least a timer tick per wait; the
+/// per-ECL wait then dominates the frame (`knobs12::NVK12_ECL_SPIN_US`).
+///
+/// # Safety
+/// `engine_queue` is the live engine queue.
+unsafe fn spin_wait(engine_queue: usize, value: u64) -> Option<Result<bool, ddi12::HRESULT>> {
+    let budget_us = crate::knobs12::nvk12_ecl_spin_us();
+    if budget_us == 0 {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_micros(u64::from(budget_us));
+    loop {
+        for _ in 0..SPIN_PROBES_PER_CLOCK {
+            // SAFETY: forwarded precondition.
+            match unsafe { crate::bridge12::wait_execution(engine_queue, value, 0) } {
+                Ok(false) => std::hint::spin_loop(),
+                settled => return Some(settled),
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        // Let a runnable thread on this core (the engine's submit worker,
+        // which releases this very work) go first.
+        std::thread::yield_now();
+    }
+}
+
+/// Per-process timing of the ECL CPU waits, so the per-frame cost is a number
+/// in the log rather than an inference from PresentMon.
+struct EclWaitStats {
+    waits: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    /// Waits the poll settled (no blocking engine wait).
+    polled: AtomicU64,
+}
+
+impl EclWaitStats {
+    fn record(&self, elapsed: Duration, polled: bool) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let total = self.total_ns.fetch_add(ns, Ordering::Relaxed).saturating_add(ns);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        let polled_n = if polled {
+            NVK_REFUSALS.cpu_wait_polled.bump();
+            self.polled.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            NVK_REFUSALS.cpu_wait_blocked.bump();
+            self.polled.load(Ordering::Relaxed)
+        };
+        let n = self.waits.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % ECL_WAIT_LOG_EVERY == 0 {
+            // Window max: reset so each line says something about its own window.
+            let max = self.max_ns.swap(0, Ordering::Relaxed);
+            log_error!(
+                "NVK ECL CPU wait: {n} waits, avg {} us, window max {} us, polled {polled_n} \
+                 blocked {} (Nvk12EclSpinUs={})",
+                total / n / 1000,
+                max / 1000,
+                n - polled_n,
+                crate::knobs12::nvk12_ecl_spin_us(),
+            );
+        }
+    }
+}
+
+static ECL_WAIT_STATS: EclWaitStats = EclWaitStats {
+    waits: AtomicU64::new(0),
+    total_ns: AtomicU64::new(0),
+    max_ns: AtomicU64::new(0),
+    polled: AtomicU64::new(0),
+};
+
 /// The worker's wait slice: it rechecks its stop flag this often.
 const WORKER_SLICE_NS: u64 = 100_000_000;
 
@@ -135,9 +222,17 @@ impl NvkSync {
             // SAFETY: forwarded precondition.
             return unsafe { arm.order_context(dev, h_context, value) };
         }
-        // CPU wait.
+        // CPU wait: poll first (`Nvk12EclSpinUs`), then block.
+        let started = Instant::now();
         // SAFETY: the live engine queue.
-        match unsafe { crate::bridge12::wait_execution(engine_queue, value, CPU_WAIT_NS) } {
+        let polled = unsafe { spin_wait(engine_queue, value) };
+        let result = match polled {
+            Some(reached) => reached,
+            // SAFETY: the live engine queue.
+            None => unsafe { crate::bridge12::wait_execution(engine_queue, value, CPU_WAIT_NS) },
+        };
+        ECL_WAIT_STATS.record(started.elapsed(), polled.is_some());
+        match result {
             Ok(true) => {
                 NVK_REFUSALS.cpu_waits.bump();
                 Ok(())
@@ -361,6 +456,10 @@ struct NvkRefusals {
     fence_create_failed: RefusalCounter,
     /// CPU waits that hit the 2 s cap. Expected zero.
     cpu_wait_timeouts: RefusalCounter,
+    /// ECL CPU waits settled by the zero-timeout poll (`Nvk12EclSpinUs`).
+    cpu_wait_polled: RefusalCounter,
+    /// ECL CPU waits that fell back to the blocking engine wait.
+    cpu_wait_blocked: RefusalCounter,
     /// The worker had exited when a value was handed to it. Expected zero.
     worker_gone: RefusalCounter,
     /// WaitForSynchronizationObjectFromGpu refused. Expected zero.
@@ -378,6 +477,8 @@ static NVK_REFUSALS: NvkRefusals = NvkRefusals {
     cpu_wait_arm: RefusalCounter::new("Nvk12CpuWaitArm"),
     fence_create_failed: RefusalCounter::new("Nvk12FenceCreateFailed"),
     cpu_wait_timeouts: RefusalCounter::new("Nvk12CpuWaitTimeouts"),
+    cpu_wait_polled: RefusalCounter::new("Nvk12CpuWaitPolled"),
+    cpu_wait_blocked: RefusalCounter::new("Nvk12CpuWaitBlocked"),
     worker_gone: RefusalCounter::new("Nvk12WorkerGone"),
     gpu_wait_failed: RefusalCounter::new("Nvk12GpuWaitFailed"),
     worker_engine_error: RefusalCounter::new("Nvk12WorkerEngineError"),
@@ -391,6 +492,8 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &NVK_REFUSALS.cpu_wait_arm,
     &NVK_REFUSALS.fence_create_failed,
     &NVK_REFUSALS.cpu_wait_timeouts,
+    &NVK_REFUSALS.cpu_wait_polled,
+    &NVK_REFUSALS.cpu_wait_blocked,
     &NVK_REFUSALS.worker_gone,
     &NVK_REFUSALS.gpu_wait_failed,
     &NVK_REFUSALS.worker_engine_error,

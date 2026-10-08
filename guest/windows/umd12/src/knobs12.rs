@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 12] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -314,6 +314,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 12] {
         ("Nvk12Present", nvk12_present_mode()),
         // Appended.
         ("Umd12PipelineLibrary", UMD12_PIPELINE_LIBRARY.get() as u32),
+        // Appended. Clamped, as read by the ECL CPU wait.
+        ("Nvk12EclSpinUs", nvk12_ecl_spin_us()),
     ]
 }
 
@@ -344,6 +346,31 @@ pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 1)
 /// 1 = always scanout 0 (zero-copy flip; the desktop is hidden while the app
 /// presents), 2 = always the WDDM present (DWM composes).
 pub(crate) static NVK12_PRESENT: DwordKnob = DwordKnob::new(c"Nvk12Present", 0);
+
+/// `Nvk12EclSpinUs`: how long, in microseconds, the CPU-wait arm of
+/// [`NVK12_ECL_SYNC`] polls the engine's execution stream on the calling
+/// thread before it falls back to the blocking engine wait. `0` = no polling
+/// (block at once, the behaviour before this knob). Default 2000, clamped to
+/// [`MAX_ECL_SPIN_US`].
+///
+/// Why: the blocking wait is NVK's `vkWaitSemaphores`, whose RM backend
+/// yields 64 times and then blocks on the non-stall event or `Sleep()`s;
+/// on Windows `os_time_sleep(10 us)` is `Sleep(1)`, i.e. a whole timer tick.
+/// Basemark GPU DX12 submits ~21 ECLs per frame, each waited here, so a tick
+/// per ECL alone is the measured ~36 ms of CPU per frame. Polling with a zero
+/// timeout costs a semaphore read per probe and returns as soon as the GPU
+/// is done (the whole frame's GPU time is ~1 ms on this scene).
+/// Read once per process.
+pub(crate) static NVK12_ECL_SPIN_US: DwordKnob = DwordKnob::new(c"Nvk12EclSpinUs", 2000);
+
+/// Upper bound of [`NVK12_ECL_SPIN_US`]: a mistyped value must not turn every
+/// ECL into a long busy loop.
+const MAX_ECL_SPIN_US: u32 = 50_000;
+
+/// The ECL CPU-wait poll budget in microseconds, clamped. See [`NVK12_ECL_SPIN_US`].
+pub(crate) fn nvk12_ecl_spin_us() -> u32 {
+    NVK12_ECL_SPIN_US.get().min(MAX_ECL_SPIN_US)
+}
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {
     NVK12_ECL_SYNC.get().min(1)
