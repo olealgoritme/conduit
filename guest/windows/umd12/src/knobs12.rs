@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 18] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 19] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -326,6 +326,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 18] {
         ("Nvk12EclFencePrefetch", nvk12_ecl_fence_prefetch() as u32),
         // Appended.
         ("Umd12ContextNode", umd12_context_node() as u32),
+        // Appended (probe).
+        ("Umd12FenceVaProbe", umd12_fence_va_probe() as u32),
     ]
 }
 
@@ -455,6 +457,18 @@ pub(crate) static UMD12_CONTEXT_NODE: BoolKnob = BoolKnob::new(c"Umd12ContextNod
 
 pub(crate) fn umd12_context_node() -> bool {
     UMD12_CONTEXT_NODE.get()
+}
+
+/// `Umd12FenceVaProbe` (default 0; probe, no behaviour change): at device
+/// creation, create one monitored fence through the runtime's kernel callbacks
+/// and log the GPU virtual address dxgkrnl gives it (`nvk12::
+/// probe_monitored_fence_va`). Whether that is nonzero decides the first step of
+/// driver-backed fences (pfnSignalFence / pfnWaitForFence). Read once per
+/// process.
+pub(crate) static UMD12_FENCE_VA_PROBE: BoolKnob = BoolKnob::new(c"Umd12FenceVaProbe", false);
+
+pub(crate) fn umd12_fence_va_probe() -> bool {
+    UMD12_FENCE_VA_PROBE.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {

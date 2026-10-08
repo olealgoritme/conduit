@@ -277,6 +277,19 @@ unsafe extern "system" fn create_fence(
     }
     if placement.FenceValue.BaseAddress != 0 || placement.FenceMonitoredValue.BaseAddress != 0 {
         note_refusal(&L7_REFUSALS.fence_gpu_va_refused);
+        // Driver-backed fences, probe 1: the placements the runtime offers when
+        // it wants this driver to signal and wait (pfnSignalFence /
+        // pfnWaitForFence). Still refused: nothing here can write them yet.
+        if let Some(n) = budget(&FENCE_LOG) {
+            log_error!(
+                "CreateFence: placements valueVA={:#x} monitoredVA={:#x} flags={:#x} -> E_NOTIMPL \
+                 (driver-backed fences not implemented) (x{})",
+                placement.FenceValue.BaseAddress,
+                placement.FenceMonitoredValue.BaseAddress,
+                flags,
+                n + 1,
+            );
+        }
         return E_NOTIMPL;
     }
     // SAFETY: this device-scope DDI supplies its live creating device.
