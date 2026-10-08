@@ -558,6 +558,17 @@ fn wait_last(passive: PassiveLevel, last: Option<u64>) -> bool {
     }
 }
 
+/// The pitch a staging buffer's copy-engine view is made with: the allocation's authored pitch
+/// whenever it has one, so every call names the same descriptor (`ce_sysmem` caches per resource,
+/// pitch and extent); the command's pitch only for a buffer without one.
+fn map_pitch(s: &Surface, cmd_pitch: u32) -> u32 {
+    if s.pitch != 0 {
+        s.pitch
+    } else {
+        pitch_of(s, cmd_pitch)
+    }
+}
+
 /// A SRCCOPY BitBlt or PATCOPY ColorFill with a KMD standard buffer (staging) on one side: one
 /// copy-engine copy (or fill) over the buffer's system pages (`ce_sysmem::with_standard`), the
 /// other side VRAM (or the fill's color). `false`: refused (not system-resident, partial leases,
@@ -572,7 +583,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
     let (dpc, spc) = cmd_pitches(&op.cmd);
     let r = match op.cmd {
         Cmd::ColorFill { rop, .. } if rop == ga::cfrop::PATCOPY && dst.class == SurfaceClass::System => {
-            let dp = pitch_of(&dst, dpc);
+            let dp = map_pitch(&dst, dpc);
             glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
                 submit_and_wait(passive, op, dv, None)
             })
@@ -588,7 +599,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                         return false;
                     };
                     RD_BACK.fetch_add(1, Ordering::Relaxed);
-                    let dp = pitch_of(&dst, dpc);
+                    let dp = map_pitch(&dst, dpc);
                     glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
                         submit_and_wait(passive, op, dv, Some(&sv))
                     })
@@ -597,7 +608,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                     let Some(dv) = glue::ce_surface(passive, adapter, dst.resource_id) else {
                         return false;
                     };
-                    let sp = pitch_of(&src, spc);
+                    let sp = map_pitch(&src, spc);
                     glue::with_standard(passive, adapter, src.resource_id, sp, src.width, src.height, |sv| {
                         submit_and_wait(passive, op, &dv, Some(sv))
                     })
