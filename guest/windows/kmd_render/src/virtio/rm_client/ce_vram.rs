@@ -644,6 +644,17 @@ fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, F
 /// diagnostic clear (`RvOff` 0x2000, magenta) never reaches (384.1: Explorer's file list stayed
 /// black, not magenta). Counted `RvClrLate`. One relaxed load with nothing alive.
 pub(crate) fn clear_pending(passive: PassiveLevel, adapter: &AdapterContext) {
+    // At most once a second: a mapping that keeps failing must not cost every HPD pass RM calls.
+    static LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if !super::vidmem::any_live() {
+        return;
+    }
+    let now = crate::adapter::AdapterContext::interrupt_time_ms() as u64;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < 1000 {
+        return;
+    }
+    LAST_MS.store(now, Ordering::Relaxed);
     let mut ids = [0u32; 4];
     let n = super::vidmem::uncleared(&mut ids);
     for &id in &ids[..n] {
