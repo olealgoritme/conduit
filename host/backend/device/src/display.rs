@@ -3054,6 +3054,15 @@ impl DisplayLink {
                     // console has no gamepad to give them to.
                     if routed_console && p.ty != wire::EV_PAD {
                         tr.packet(&p, &mut to_console);
+                        // The console sends motion to QEMU's relative mouse
+                        // under a grab (`crate::console::EV_GRAB_MARK`).
+                        if p.ty == wire::EV_GRAB {
+                            to_console.push(InputEventEntry::new(
+                                crate::console::EV_GRAB_MARK,
+                                0,
+                                (p.x != 0) as i32,
+                            ));
+                        }
                     } else {
                         tr.packet(&p, &mut pending);
                     }

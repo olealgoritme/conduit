@@ -270,22 +270,220 @@ fn queue_stats_make_one_line_per_interval_with_input() {
     let t0 = Instant::now();
     let mut q = QueueStats::new();
     q.since = t0;
-    assert_eq!(q.take(t0 + QueueStats::EVERY, 0), None, "no input, no line");
+    assert_eq!(
+        q.take(t0 + QueueStats::EVERY, 0, 0),
+        None,
+        "no input, no line"
+    );
     q.events = 42;
     q.note_queue(120, 0);
     q.note_queue(30, 6);
-    assert_eq!(q.take(t0 + QueueStats::EVERY, 5), None, "too soon");
-    let line = q.take(t0 + QueueStats::EVERY * 2, 5).expect("a line");
+    assert_eq!(q.take(t0 + QueueStats::EVERY, 5, 0), None, "too soon");
+    let line = q.take(t0 + QueueStats::EVERY * 2, 5, 3).expect("a line");
     assert_eq!(
         line,
         "console: input to QEMU, last 10 s: 42 events, 5 positions coalesced, \
-         Send-Q max 120 bytes, unsent max 6 bytes"
+         Send-Q max 120 bytes, unsent max 6 bytes; relative: 3 batches summed, \
+         QMP Send-Q max 0 bytes"
     );
     assert_eq!(
-        q.take(t0 + QueueStats::EVERY * 3, 5),
+        q.take(t0 + QueueStats::EVERY * 3, 5, 3),
         None,
         "counted afresh"
     );
+}
+
+fn grab(on: bool) -> InputEventEntry {
+    ev(EV_GRAB_MARK, 0, on as i32)
+}
+
+fn qmp_text(e: &mut InputEncoder) -> String {
+    String::from_utf8(e.take_qmp()).unwrap()
+}
+
+#[test]
+fn under_a_grab_relative_motion_is_summed_into_one_qmp_command() {
+    let size = Sizes::console((800, 600));
+    let mut e = InputEncoder::default();
+    e.set_relative_route(true);
+    let mut out = Vec::new();
+    let mut burst = vec![grab(true)];
+    for _ in 0..100 {
+        burst.push(ev(input::EV_REL, input::REL_X, 3));
+        burst.push(ev(input::EV_REL, input::REL_Y, -1));
+        burst.push(syn());
+    }
+    e.events(&burst, size, true, &mut out);
+    assert!(out.is_empty(), "nothing for the tablet");
+    assert!(e.relative());
+    assert!(e.rel_owed());
+    assert_eq!(e.rel_merged(), 99);
+    assert!(qmp_text(&mut e).is_empty(), "held until flushed");
+    assert!(e.flush_rel());
+    assert_eq!(qmp_text(&mut e), qmp::rel_command(300, -100));
+    // Held back again (QMP not reading): summed, not dropped.
+    e.events(
+        &[
+            ev(input::EV_REL, input::REL_X, -7),
+            syn(),
+            ev(input::EV_REL, input::REL_X, -8),
+            syn(),
+        ],
+        size,
+        true,
+        &mut out,
+    );
+    e.flush_rel();
+    assert_eq!(qmp_text(&mut e), qmp::rel_command(-15, 0));
+}
+
+#[test]
+fn under_a_grab_buttons_and_wheel_follow_the_motion_on_the_relative_mouse() {
+    let size = Sizes::console((800, 600));
+    let mut e = InputEncoder::default();
+    e.set_relative_route(true);
+    let mut out = Vec::new();
+    e.events(
+        &[
+            grab(true),
+            ev(input::EV_REL, input::REL_X, 5),
+            syn(),
+            ev(input::EV_KEY, BTN_LEFT, 1),
+            syn(),
+            ev(input::EV_REL, input::REL_WHEEL, -1),
+            ev(input::EV_REL, input::REL_WHEEL_HI_RES, -120),
+            syn(),
+            ev(input::EV_KEY, 30, 1),
+            syn(),
+        ],
+        size,
+        true,
+        &mut out,
+    );
+    // The key goes to the keyboard over VNC.
+    assert_eq!(out, rfb::qemu_key_event(true, 0x61, 0x1e));
+    let want = [
+        qmp::rel_command(5, 0),
+        qmp::btn_command(&[("left", true)]),
+        qmp::btn_command(&[("wheel-down", true), ("wheel-down", false)]),
+    ]
+    .concat();
+    assert_eq!(qmp_text(&mut e), want);
+    // Grab off: the held button comes up on the relative mouse, and
+    // absolute motion goes to the tablet again.
+    out.clear();
+    e.events(
+        &[
+            grab(false),
+            ev(input::EV_ABS, input::ABS_X, INPUT_ABS_MAX),
+            ev(input::EV_ABS, input::ABS_Y, 0),
+            syn(),
+        ],
+        size,
+        true,
+        &mut out,
+    );
+    assert!(!e.relative());
+    assert_eq!(qmp_text(&mut e), qmp::btn_command(&[("left", false)]));
+    e.flush_motion(&mut out);
+    assert_eq!(out, rfb::pointer_event(0, 799, 0));
+}
+
+#[test]
+fn without_qmp_a_grab_moves_the_absolute_pointer_as_before() {
+    let size = Sizes::console((800, 600));
+    let mut e = InputEncoder::default();
+    let mut out = Vec::new();
+    e.events(
+        &[grab(true), ev(input::EV_REL, input::REL_X, 10), syn()],
+        size,
+        true,
+        &mut out,
+    );
+    assert!(!e.relative());
+    assert!(qmp_text(&mut e).is_empty());
+    e.flush_motion(&mut out);
+    assert_eq!(out, rfb::pointer_event(0, 10, 0));
+}
+
+#[test]
+fn relative_motion_without_a_grab_mark_still_counts_as_a_grab() {
+    // A grab that began before this backend: the viewer sends relative
+    // motion only under one.
+    let size = Sizes::console((800, 600));
+    let mut e = InputEncoder::default();
+    e.set_relative_route(true);
+    let mut out = Vec::new();
+    e.events(
+        &[ev(input::EV_REL, input::REL_Y, 4), syn()],
+        size,
+        true,
+        &mut out,
+    );
+    assert!(e.relative());
+    e.flush_rel();
+    assert_eq!(qmp_text(&mut e), qmp::rel_command(0, 4));
+}
+
+#[test]
+fn qmp_commands_are_input_send_event() {
+    assert_eq!(
+        qmp::rel_command(3, -2),
+        "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[\
+         {\"type\":\"rel\",\"data\":{\"axis\":\"x\",\"value\":3}},\
+         {\"type\":\"rel\",\"data\":{\"axis\":\"y\",\"value\":-2}}]}}\n"
+    );
+    assert_eq!(
+        qmp::btn_command(&[("right", false)]),
+        "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[\
+         {\"type\":\"btn\",\"data\":{\"down\":false,\"button\":\"right\"}}]}}\n"
+    );
+    assert_eq!(
+        qmp::path_for(Path::new("/run/user/1000/conduit/win11/console.sock")),
+        Path::new("/run/user/1000/conduit/win11/qmp.sock")
+    );
+}
+
+#[test]
+fn the_qmp_handshake_and_error_replies() {
+    let dir = std::env::temp_dir().join(format!("conduit-qmp-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("qmp.sock");
+    let _ = std::fs::remove_file(&path);
+    let l = UnixListener::bind(&path).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut c, _) = l.accept().unwrap();
+        c.write_all(b"{\"QMP\": {\"version\": {}, \"capabilities\": []}}\r\n")
+            .unwrap();
+        let mut r = std::io::BufReader::new(c.try_clone().unwrap());
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut r, &mut line).unwrap();
+        assert!(line.contains("qmp_capabilities"));
+        c.write_all(b"{\"return\": {}}\r\n").unwrap();
+        line.clear();
+        std::io::BufRead::read_line(&mut r, &mut line).unwrap();
+        assert!(line.contains("input-send-event"), "{line}");
+        c.write_all(
+            b"{\"error\": {\"class\": \"GenericError\", \"desc\": \"VM not running\"}}\r\n",
+        )
+        .unwrap();
+        c
+    });
+    let mut q = qmp::Qmp::connect(&path, Duration::from_secs(2)).unwrap();
+    (&q.sock)
+        .write_all(qmp::rel_command(1, 1).as_bytes())
+        .unwrap();
+    let c = server.join().unwrap();
+    assert!(wait_for(|| {
+        q.drain().unwrap();
+        q.errors == 1
+    }));
+    drop(c);
+    assert!(
+        wait_for(|| q.drain().is_err()),
+        "a closed monitor is noticed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // -- a fake VNC server ------------------------------------------------------
