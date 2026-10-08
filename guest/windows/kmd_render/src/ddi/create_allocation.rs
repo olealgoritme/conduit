@@ -4266,7 +4266,9 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // `RedirVram`: an open of a KMD RM video-memory surface (one relaxed load when none is
         // alive), whether it was served as a foreign record (the opener can import it by id).
         crate::virtio::rm_client::vidmem::note_open(
+            adapter,
             resource_id,
+            creator_process,
             ident.is_some_and(|identity| identity.foreign),
             foreign_layout.is_some(),
         );

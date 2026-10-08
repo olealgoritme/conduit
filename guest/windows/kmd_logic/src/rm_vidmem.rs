@@ -699,7 +699,7 @@ pub const COUNTERS: &[&str] = &[
     // the service (`vidmem.rs`)
     "RvKnob", "RvOffEff", "RvWaitTmo", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
     "RvBytes", "RvFreed", "RvBring", "RvMs", "RvMsMax", "RvSoft", "RvLeak", "RvOpen", "RvOpenFg",
-    "RvOpenLay", "RvOpenPid",
+    "RvOpenLay", "RvOpenPid", "RvOpenNoRm", "RvOpenNoRmPid",
     // the channel side (`ce_vram.rs`)
     "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvBookReent", "RvXfer", "RvXferFail",
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",

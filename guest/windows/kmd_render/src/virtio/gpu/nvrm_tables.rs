@@ -498,6 +498,11 @@ impl VirtioGpu {
         self.nvrm_clients.process_of(client)
     }
 
+    /// Whether `process` has any recorded RM client (`RedirVram`'s open census).
+    pub fn nvrm_process_has_client(&self, process: usize) -> bool {
+        self.nvrm_clients.process_has_client(process)
+    }
+
     /// Forget one client of `owner` (its free went through). `false`: not its client.
     pub fn forget_nvrm_client(&mut self, owner: DeviceOwner, client: u32) -> bool {
         self.nvrm_clients.forget_client(owner.raw(), client)

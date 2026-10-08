@@ -137,7 +137,7 @@ pub(crate) fn reset_for_start() {
     crate::diag::record_named_bytes(b"RvOffEff", o);
     for c in [
         &TRY, &OK, &VENUS, &WHY, &STAGE, &FAIL, &FREED, &BRING, &MS, &MS_MAX, &SOFT, &LEAK, &OPEN,
-        &OPEN_FG, &OPEN_LAY,
+        &OPEN_FG, &OPEN_LAY, &OPEN_NORM,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -535,17 +535,35 @@ pub(crate) fn lookup(resource_id: u32) -> Option<VramObject> {
 static OPEN: AtomicU32 = AtomicU32::new(0);
 static OPEN_FG: AtomicU32 = AtomicU32::new(0);
 static OPEN_LAY: AtomicU32 = AtomicU32::new(0);
+static OPEN_NORM: AtomicU32 = AtomicU32::new(0);
 
 /// `DxgkDdiOpenAllocation` registered an open of `resource_id` (PASSIVE): if it is one of the
 /// service's objects, count it (`RvOpen`), whether the open identity says FOREIGN (`RvOpenFg`: the
 /// opener's UMD takes the import-by-id route) and whether the layout record reached it
 /// (`RvOpenLay`), and the opener's process (`RvOpenPid`: DWM's pid means DWM opened the
 /// redirection surface). One relaxed load when nothing is alive.
-pub(crate) fn note_open(resource_id: u32, foreign: bool, layout: bool) {
+///
+/// Also counts (never refuses) an opener whose process has no RM client in the client table
+/// (`RvOpenNoRm`, `RvOpenNoRmPid`): a process not on NVK (a Venus device, or hardening off) cannot
+/// import an RM video-memory texture, so its UMD will fail after the open.
+pub(crate) fn note_open(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    process: usize,
+    foreign: bool,
+    layout: bool,
+) {
     if lookup(resource_id).is_none() {
         return;
     }
     use crate::diag::record_named_bytes as rec;
+    let has_rm = adapter
+        .with_virtio(|v| v.nvrm_process_has_client(process))
+        .unwrap_or(false);
+    if !has_rm {
+        rec(b"RvOpenNoRm", OPEN_NORM.fetch_add(1, Ordering::Relaxed) + 1);
+        rec(b"RvOpenNoRmPid", crate::virtio::nvrm_window::current_pid());
+    }
     rec(b"RvOpen", OPEN.fetch_add(1, Ordering::Relaxed) + 1);
     if foreign {
         rec(b"RvOpenFg", OPEN_FG.fetch_add(1, Ordering::Relaxed) + 1);
