@@ -253,7 +253,7 @@ static int kmd_status_to_errno(int32_t status)
  * the KMD's verdict in head->status, or a negative errno for a transport
  * failure (an older KMD without the verb answers STATUS_NOT_IMPLEMENTED). */
 /*
- * CRM_WIN_PROF_FILE=path: count and time every escape by kind, from any
+ * CRM_WIN_PROF_FILE=path ("%p" in it becomes the process id): count and time every escape by kind, from any
  * thread, and rewrite `path` with the cumulative table at most once a second
  * (so a killed process still leaves one; diff two snapshots for a rate).
  * Kinds: op (QUERY_CAPS/MMAP, MUNMAP, EVENT_REGISTER, PIN, ...), FORWARD by message type,
@@ -338,11 +338,27 @@ static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size);
 static int nvrm_escape(struct win_ctx *c, void *buf, uint32_t size)
 {
     if (g_prof_on < 0) {
-        const DWORD n = GetEnvironmentVariableA("CRM_WIN_PROF_FILE", g_prof_path, sizeof(g_prof_path));
+        char raw[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableA("CRM_WIN_PROF_FILE", raw, sizeof(raw));
         QueryPerformanceFrequency(&g_prof_freq);
         QueryPerformanceCounter(&g_prof_t0);
         g_prof_last = g_prof_t0;
-        g_prof_on = n > 0 && n < sizeof(g_prof_path);
+        g_prof_on = n > 0 && n < sizeof(raw);
+        if (g_prof_on) {
+            /* "%p" becomes the process id, so one machine-wide setting gives
+             * every process its own table (Steam, the game, DWM). */
+            size_t o = 0;
+            for (DWORD i = 0; i < n && o + 12 < sizeof(g_prof_path); i++) {
+                if (raw[i] == '%' && i + 1 < n && raw[i + 1] == 'p') {
+                    o += (size_t)snprintf(g_prof_path + o, sizeof(g_prof_path) - o, "%lu",
+                                          (unsigned long)GetCurrentProcessId());
+                    i++;
+                } else {
+                    g_prof_path[o++] = raw[i];
+                }
+            }
+            g_prof_path[o] = 0;
+        }
     }
     if (!g_prof_on)
         return nvrm_escape_raw(c, buf, size);
@@ -2218,6 +2234,29 @@ int32_t crm_win_loss_epoch(void)
     return (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0);
 }
 
+/* Signals this process's wait handle for event channel `fd` (registered by a
+ * previous crm_event_wait), with no KMD call: a waiter blocked in
+ * win_event_wait wakes and re-reads what it waits for. For a store the CPU
+ * made (a host semaphore signal), which raises no GPU interrupt and so no
+ * host report. The handle is manual reset, so a kick before the waiter
+ * blocks is not lost; a spurious one costs the waiter one wake. Returns 0,
+ * or -ENOENT when no wait has registered `fd` yet (nobody can be blocked). */
+int crm_win_event_kick(int fd)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = -ENOENT;
+    AcquireSRWLockShared(&c->lock);
+    for (uint32_t i = 0; i < c->n_evs; i++) {
+        if (c->evs[i].fd == fd) {
+            SetEvent(c->evs[i].ev);
+            r = 0;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&c->lock);
+    return r;
+}
+
 /* The vectored handler lives in this DLL: take it out when the DLL is
  * unloaded while the process goes on (FreeLibrary; at process exit nothing
  * runs any more). The table entries stay: the Venus ICD or the UMD may still
@@ -2259,6 +2298,8 @@ const struct crm_transport *crm_windows_transport(void) { return NULL; }
 int32_t crm_win_loss_epoch(void) { return 0; }
 
 #include <errno.h>
+
+int crm_win_event_kick(int fd) { (void)fd; return -ENOSYS; }
 
 int crm_win_open_device(uint32_t device_type, int *fd)
 {
