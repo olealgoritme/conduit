@@ -70,6 +70,7 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 6 | `nvk: bind vertex and index buffers with plain methods on Turing+` | no `NVK_MME_BIND_VB/IB` for CPU-recorded binds, and the range already bound is skipped |
 | 7 | `nvk: keep what changes per draw in one hardware root table bank` | changing a second 256-byte root table bank between draws costs ~5 ns; the dynamic-offset dword of the dynamic buffer descriptors moves into bank 0 with the draw parameters and `sets[0..3]`. **API-visible**: `NVK_MAX_DYNAMIC_BUFFERS` 64 -> 32, i.e. 16 dynamic UBOs + 16 dynamic SSBOs per layout (NVIDIA: 15 + 16) |
 | 8 | `nvk: ZCULL for DXVK depth buffers and reverse Z` | ZCULL storage also for depth images with `TRANSFER_DST` (DXVK sets it on every D3D11 depth texture; `EXCLUSIVE` sharing only), reset to a conservative state by an empty render pass after a copy, blit or resolve writes them or another queue hands them over; `SET_ZCULL_DIR_FORMAT` per image (GREATER when the first application render pass clears below 0.5, LESS otherwise, never changed afterwards) instead of always LESS. See "GPU time against NVIDIA in D3D11-through-DXVK shapes" |
+| 11 | `nvk, nvk/rm: compression for images outside dedicated allocations on GB20x` | `NVK_RM_COMPRESS_ALL=1` (default off while it is measured): device-local memory that is neither host-visible nor shared nor imported is allocated COMPR_ANY (`NVKMD_MEM_COMPRESSIBLE`, `nvkmd_info::has_compressible_mem`), and a compressible image bound anywhere in it gets its own VA with the compressible GMK kind and `is_compressed`; every other mapping of such memory uses a compressible kind too. Applies after 9-10 of the build branches and without them. See "Compression outside dedicated allocations" |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
@@ -112,6 +113,68 @@ and repeats a direct draw right after each indirect one (dropping one
 invalidation in the driver changes its hash); `dynidx` indexes dynamic UBO
 arrays in two sets at run time; `descupd` rewrites a descriptor set between
 submits. dEQP-VK is not installed on the host and was not run.
+
+### Compression outside dedicated allocations (patch 11)
+
+NVK compresses an image only in a dedicated allocation. vkd3d-proton
+places every D3D12 resource in a heap and native engines sub-allocate, so
+in the VM every Basemark render target (Vulkan and D3D12) was mapped with
+kind 0x6 (GMK), never 0x8 (GMK compressible).
+
+What GB20x and RM need (open-gpu-kernel-modules 615.78.08):
+
+- GB20x has only GMK (0x6), GMK compressible (0x8) and GMK compressible
+  without PLC (0x9) for block-linear memory, depth included
+  (`mem_mgr_gb202.c`, `mem_mgr_gb202_base.c`).
+- Compression state is per physical page: GB20x uses GMMU format v3,
+  whose PTEs have no comptag line (`virt_mem_allocator_gm107.c` writes
+  comptag lines only for format <= 2; `memmgrGetKindComprForGpu_KERNEL`
+  marks such memory `bPhysBasedComptags`). There is no comptag pool to
+  run out of, and COMPR_ANY costs no extra VRAM.
+- The kind still has to be compressible at allocation time: a mapping
+  whose kind override is compressible over memory whose own kind is not
+  is quietly downgraded to the uncompressed kind (`virtual_mem.c`,
+  "downgrading pteKind ... over uncompressed physical backing"). That is
+  why sub-allocated images stayed 0x6 even with a 0x8 kind.
+- PLC: RM picks 0x8 or 0x9 for the allocation and applies its per-page
+  PLC workaround itself when it writes PTEs; NVK maps images with 0x8 as
+  the dedicated path does.
+
+The patch: NVK asks for `NVKMD_MEM_COMPRESSIBLE` on plain device-local
+allocations (not host-visible, not exported or imported). The RM backend
+allocates those like dedicated image memory (block linear, 32 bpp,
+COMPR_ANY) and keeps the flag only if RM granted compression. At bind
+time a `can_compress` image in such memory gets its own VA with
+`compressed_pte_kind` and `is_compressed` (the draw path already turns
+on color/Z compression from it). Accessing compressible pages through an
+uncompressed kind would read raw compressed data, so every GPU mapping of
+such memory is compressible: the memory's own VA is mapped 0x8 (buffers,
+linear images, ZCULL), and an image VA with kind 0x6
+(sampled-only textures, sparse images, other images NVK does not
+compress) is mapped 0x8 with its 3D compression state left off.
+
+Risks:
+
+- Clients other than the 3D and copy engines reading compressible GMK
+  through the memory's own VA: indirect draw/dispatch arguments and
+  generated command streams read by the front end and PBDMA from
+  buffers in a compressed heap. NVKMS allocates scanout surfaces
+  COMPR_ANY, so hub clients reading compressible GMK is the hardware's
+  normal case, but this is the first thing to check if
+  `NVK_RM_COMPRESS_ALL=1` misrenders or faults.
+- Image/buffer aliasing in one heap: both go through compressible kinds,
+  so reinterpreting the bytes is as undefined as the Vulkan spec says and
+  no more.
+- No CPU access: host-visible types (the BAR heap, system memory) are
+  never made compressible, and host image copies are already excluded by
+  `can_compress`.
+- RM refusing COMPR_ANY: the memory falls back to uncompressed (logged,
+  counted) and images in it stay 0x6.
+
+Logs (`mesa_logi`): the number of compressible memories and MiB as it
+reaches each power of two, image binds that got the compressible kind,
+and a summary at device destruction (memories, MiB, refusals, compressed
+image binds, 0x6 binds made 0x8).
 
 ### GPU time against NVIDIA in D3D11-through-DXVK shapes (patch 8)
 
