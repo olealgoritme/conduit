@@ -476,6 +476,19 @@ buffers whose D3DDDIFORMAT has no DXGI name (or is `A8B8G8R8`) carry the legacy 
 is authored as `width * 4` regardless, so `layout_standard` now records them as `XRGB8888` bytes
 (nothing imports a staging buffer as an image; the copy engine copies bytes).
 
+Foreign NVK images as GDI sources (362.1: 14-15 GDI commands per session read a UMD optimal image
+with a foreign layout, 1908x910, dropped): `ce_vram::foreign_source(passive, adapter, resid)` and
+`ce_vram::foreign_copy(&src, src_rect, &dst, x, y, dst_fourcc)`. With a record the route validated for
+that image at a Present (`ce_present_route::source_record`, the latest per source, the `h_client` rule
+re-checked), the producer's own objects are used (`ce_dup`) and the copy ACQUIREs its semaphore.
+Without one, the KMD imports the image by resource id into the channel's client (the host's
+`RmResourceImport` into the channel's DRM file under `authorize_kmd`, `GEM_EXPORT_NVKMS`,
+`OS_UNIX_IMPORT_OBJECT_FROM_FD`: NVK's own route) and maps it with the modifier's page kind; no acquire
+(the image is copied as it is in memory). Any rectangle: pitch-linear by address, block-linear by the
+copy's source origin. Counters `RvFgnRec`, `RvFgnImp`, `RvFgnFail`, `RvFgnWhy`. The KMD's imports do
+not count in `FgRi*`. Found on the way: the route added the source plan's offset twice
+(`ce_dup`'s VA already has it); harmless for NVK's offset-0 images, fixed.
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the

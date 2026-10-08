@@ -153,6 +153,49 @@ pub fn rm_resource_import(
     })
 }
 
+/// The KMD's OWN `RM_RESOURCE_IMPORT` of `resource_id` into its DRM file `rm_handle` (the copy
+/// engine's client: `ce_vram::foreign_source`, `RedirVram`). Same host message; the gate is
+/// `authorize_kmd`; counted in the caller's counters, not in `FgRi*` (which stay the user-mode
+/// imports' evidence). PASSIVE only.
+pub fn rm_resource_import_kmd(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    rm_handle: u32,
+    resource_id: u32,
+) -> Result<Imported, RiError> {
+    if !rm_resource_import_served(adapter) {
+        return Err(RiError::Local(Verdict::Unsupported));
+    }
+    let epoch = match adapter
+        .with_virtio(|v| v.rm_resource_import_begin_kmd(rm_handle, resource_id))
+        .map_err(|_| RiError::NoTransport)?
+    {
+        Ok(epoch) => epoch,
+        Err(refusal) => return Err(RiError::Local(refusal.verdict())),
+    };
+    let req = ri::build_request(rm_handle, resource_id);
+    let mut resp = [0u8; REPLY_BYTES];
+    let n = ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, TIMEOUT_MS)
+        .map_err(|_| RiError::Host(Verdict::Device, 0))?;
+    let reply = match ri::parse_reply(&resp, n) {
+        Ok(r) => r,
+        Err(ReplyError::HostErrno(errno)) => return Err(RiError::Host(ri::verdict_for_errno(errno), errno)),
+        Err(ReplyError::Short | ReplyError::Malformed) => return Err(RiError::Host(Verdict::Device, 0)),
+    };
+    let valid = adapter
+        .with_virtio(|v| v.rm_resource_import_still_valid(DeviceOwner::KMD_RM, rm_handle, epoch))
+        .unwrap_or(false);
+    if !valid {
+        return Err(RiError::Local(Verdict::NotOwned));
+    }
+    Ok(Imported {
+        gem_handle: reply.gem_handle,
+        flags: reply.flags,
+        size: reply.size,
+        modifier: reply.modifier,
+    })
+}
+
 /// Mirror the counters to the service key. PASSIVE only; the escape layer
 /// throttles the calls.
 pub fn publish_counters() {

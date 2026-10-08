@@ -393,6 +393,9 @@ unsafe fn try_route_as(
             return None;
         }
     };
+    // The latest validated record of this source image: a GDI command that later reads the same
+    // NVK image on the copy engine (`ce_vram::foreign_source`, `RedirVram`) acquires its semaphore.
+    remember_source_record(source.resource_id(), payload.rec, payload.presenter);
     // Queued exactly as a deferred `BltAsync` copy is (`ddi/blt_async.rs::deferred`): the Venus
     // copy prepared now is the fallback the worker submits whenever the copy engine does not.
     let no_mirror_knob = crate::ddi::blt_async::no_mirror_on();
@@ -466,6 +469,44 @@ unsafe fn try_route_as(
     Some(token)
 }
 
+/// The latest record the route validated per source image (`RedirVram`'s GDI copies out of an NVK
+/// image take the producer's semaphore from it). Small, most recent first out.
+const SOURCE_RECORDS: usize = 8;
+static SOURCE_RECS: SpinLock<[(u32, Option<(StashedCeRecord, usize)>); SOURCE_RECORDS]> =
+    SpinLock::new([(0, None); SOURCE_RECORDS]);
+
+fn remember_source_record(resource_id: u32, rec: StashedCeRecord, presenter: usize) {
+    if resource_id == 0 {
+        return;
+    }
+    let mut t = SOURCE_RECS.lock();
+    let i = t.iter().position(|e| e.0 == resource_id).unwrap_or(SOURCE_RECORDS - 1);
+    // Move to the front.
+    let mut k = i;
+    while k > 0 {
+        t[k] = t[k - 1];
+        k -= 1;
+    }
+    t[0] = (resource_id, Some((rec, presenter)));
+}
+
+/// The latest record the route validated for the NVK image `resource_id`, if its two clients still
+/// belong to the process that presented it. Spinlock only (plus the client table's lock).
+pub(crate) fn source_record(adapter: &AdapterContext, resource_id: u32) -> Option<StashedCeRecord> {
+    let found = SOURCE_RECS
+        .lock()
+        .iter()
+        .find(|e| e.0 == resource_id)
+        .and_then(|e| e.1);
+    let (rec, presenter) = found?;
+    clients_still_owned(adapter, &rec, presenter).then_some(rec)
+}
+
+/// The transport generation ended: no record names a live client any more.
+pub(crate) fn forget_source_records() {
+    *SOURCE_RECS.lock() = [(0, None); SOURCE_RECORDS];
+}
+
 fn dir_no(why: cr::DirNo) {
     DIR_NO.fetch_add(1, Ordering::Relaxed);
     DIR_WHY.store(why.code(), Ordering::Relaxed);
@@ -479,7 +520,9 @@ fn push_of(p: &Payload, sem_va: u64, src_va: u64, dst_va: u64) -> (cp::Acquire, 
             value: p.rec.record.semaphore.value,
         },
         cp::CopyRect {
-            src_va: src_va.wrapping_add(p.plan.offset),
+            // `ce_dup`'s source VA already includes the plan's offset (as the shadow mode uses it):
+        // adding it again read `offset` bytes too far for a source with a nonzero offset.
+        src_va,
             dst_va,
             src_pitch: p.rec.record.source.pitch,
             dst_pitch: p.dst_pitch,
@@ -822,7 +865,9 @@ pub(crate) fn dispatch(adapter: &AdapterContext, token: u64, boundary: u64) -> b
     };
     let p = job.payload;
     let copy = cp::CopyRect {
-        src_va: src_va.wrapping_add(p.plan.offset),
+        // `ce_dup`'s source VA already includes the plan's offset (as the shadow mode uses it):
+        // adding it again read `offset` bytes too far for a source with a nonzero offset.
+        src_va,
         dst_va,
         src_pitch: p.rec.record.source.pitch,
         dst_pitch: p.dst_pitch,
@@ -1728,6 +1773,7 @@ pub(crate) fn retire_for_stop(
 /// is leaked on purpose (never unlock pages a GPU may still write). PASSIVE, no lock held.
 pub(crate) fn forget(fate: helios_kmd_logic::sweep_budget::PinFate) {
     WANT_UP.store(0, Ordering::Relaxed);
+    forget_source_records();
     if ACTIVE.load(Ordering::Acquire) == 0 {
         return;
     }

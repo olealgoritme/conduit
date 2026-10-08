@@ -6,7 +6,7 @@
 //! The rule itself is `helios_kmd_logic::rm_resource_import::authorize`.
 
 use super::*;
-use helios_kmd_logic::rm_resource_import::{authorize, Refusal};
+use helios_kmd_logic::rm_resource_import::{authorize, authorize_kmd, Refusal};
 
 impl VirtioGpu {
     /// Whether `owner` may ask the host for a GEM handle of `resource_id` in its
@@ -30,6 +30,18 @@ impl VirtioGpu {
             self.nvrm_handle_device_type(owner, rm_handle),
             owner.raw() as u64,
             process as u64,
+            rm_handle,
+            resource_id,
+        )?;
+        Ok(self.nvrm_epoch())
+    }
+
+    /// The KMD's own import into its DRM file `rm_handle` (`authorize_kmd`): the handle must be a
+    /// DRI node the KMD's RM owner holds; any live foreign resource. `RedirVram` only.
+    pub fn rm_resource_import_begin_kmd(&self, rm_handle: u32, resource_id: u32) -> Result<u64, Refusal> {
+        authorize_kmd(
+            &self.foreign,
+            self.nvrm_handle_device_type(DeviceOwner::KMD_RM, rm_handle),
             rm_handle,
             resource_id,
         )?;
