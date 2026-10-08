@@ -1946,12 +1946,13 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       {
         static std::atomic<std::uint32_t> s_openBeginLogs{0};
         if (bridge_log_budget(s_openBeginLogs, 64, 512)) {
-          char msg[256];
+          char msg[320];
           std::snprintf(msg, sizeof(msg),
-            "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u vidmm_identity=0x%016llx",
+            "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u vidmm_identity=0x%016llx backend=%s foreign=%d",
             width, height, format, bind_flags, misc_flags, global, renderer_resource_id,
             static_cast<unsigned long long>(venus_alloc_size), memory_type_index,
-            static_cast<unsigned long long>(global_vidmm_tracker));
+            static_cast<unsigned long long>(global_vidmm_tracker),
+            impl->backend == helios_bridge::IcdBackend::Venus ? "venus" : "nvk", int(foreign));
           umd_log(msg);
         }
       }
@@ -2073,11 +2074,13 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
             reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(renderer_resource_id)),
             &importInfo);
       } catch (const dxvk::DxvkError& e) {
-        // DWM on NVK: a surface it cannot import must not take the compositor down (an E_FAIL
-        // here is a device removal, winlogon restarts DWM, Desktop Duplication returns
-        // E_ACCESSDENIED: 367.1 with a KMD GDI texture in RM video memory). Same rule as the
-        // non-importable case above: a blank texture of the same size, logged.
-        if (!(impl->backend != helios_bridge::IcdBackend::Venus && helios_bridge::is_dwm_process()))
+        // DWM: a surface it cannot import must not take the compositor down (an E_FAIL here is
+        // a device removal, winlogon restarts DWM, Desktop Duplication returns E_ACCESSDENIED:
+        // 367.1 with a KMD GDI texture in RM video memory). Same rule as the non-importable
+        // case above: a blank texture of the same size, logged. Both backends: DWM can be on
+        // Venus too (Icd=venus, or DwmIcd=nvk refused by the crash-loop guard after such
+        // restarts), and Venus cannot import an RM video memory surface either (368.1, res 23).
+        if (!helios_bridge::is_dwm_process())
           throw;
         D3D11_TEXTURE2D_DESC td = { };
         td.Width = width;
@@ -2101,9 +2104,10 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
         if (n <= 16 || (n % 512u) == 0) {
           char msg[320];
           std::snprintf(msg, sizeof(msg),
-            "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d modifier=0x%016llx stride=%u) on NVK DWM: import failed (%s): blank placeholder hr=0x%08lx (x%u)",
+            "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d modifier=0x%016llx stride=%u) on %s DWM: import failed (%s): blank placeholder hr=0x%08lx (x%u)",
             renderer_resource_id, width, height, int(foreign),
             static_cast<unsigned long long>(foreign_modifier), foreign_stride,
+            impl->backend == helios_bridge::IcdBackend::Venus ? "Venus" : "NVK",
             e.message().c_str(), static_cast<unsigned long>(phr), n);
           umd_log(msg);
         }
