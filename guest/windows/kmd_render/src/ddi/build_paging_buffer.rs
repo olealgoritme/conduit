@@ -933,6 +933,156 @@ pub(crate) unsafe fn mirror_present_system_backing(
     Some(ok)
 }
 
+// ---- `RedirVram`: a reused kernel view of a standard buffer's blob for the CPU helpers ----------
+//
+// `with_blob_bytes` maps the whole blob with `MmMapIoSpace` and unmaps it on every call. The two
+// helpers below (the GDI executor's CPU fallback) keep up to `CPU_VIEWS` of those views instead,
+// keyed by `(resource id, window GPA, size, cache attribute)`: every call still asks
+// `map_blob_prepare` where the blob is mapped NOW (cheap when it is), and reuses the view only when
+// that answer is the cached one, so a blob moved to another window offset gets a fresh view. Only
+// these helpers use the cache, and both run under the content transaction, so no two threads use
+// or evict a view at once. `release_cpu_views` unmaps them all (StopDevice, before the window goes).
+
+const CPU_VIEWS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct CpuViewEntry {
+    resid: u32,
+    gpa: u64,
+    size: u64,
+    cache: u32,
+    va: usize,
+    used: u64,
+}
+
+static CPU_VIEW_CACHE: crate::sync::SpinLock<([Option<CpuViewEntry>; CPU_VIEWS], u64)> =
+    crate::sync::SpinLock::new(([None; CPU_VIEWS], 0));
+
+static CPU_MAP_US: AtomicU32 = AtomicU32::new(0);
+static CPU_CPY_US: AtomicU32 = AtomicU32::new(0);
+static CPU_KB: AtomicU32 = AtomicU32::new(0);
+static CPU_CACHE: AtomicU32 = AtomicU32::new(0);
+static CPU_HIT: AtomicU32 = AtomicU32::new(0);
+static CPU_VIEW: AtomicU32 = AtomicU32::new(0);
+
+fn now_us() -> u64 {
+    crate::adapter::foreign_scanout::now_100ns() / 10
+}
+
+/// Mirror the CPU helpers' counters (PASSIVE): the last call's map and copy time (us), size (KiB),
+/// the host's cache attribute of the blob (`VIRTIO_GPU_MAP_CACHE_*`: 1 cached, 2 uncached, 3 WC,
+/// anything else mapped uncached), view reuses, and which view the last call read or wrote
+/// (1 leases, 2 blob).
+fn publish_cpu_counters() {
+    use crate::diag::record_named_bytes as rec;
+    rec(b"RvCpuMapUs", CPU_MAP_US.load(Ordering::Relaxed));
+    rec(b"RvCpuCpyUs", CPU_CPY_US.load(Ordering::Relaxed));
+    rec(b"RvCpuKB", CPU_KB.load(Ordering::Relaxed));
+    rec(b"RvCpuCache", CPU_CACHE.load(Ordering::Relaxed));
+    rec(b"RvCpuHit", CPU_HIT.load(Ordering::Relaxed));
+    rec(b"RvCpuView", CPU_VIEW.load(Ordering::Relaxed));
+}
+
+/// [`with_blob_bytes`] through a reused view. The caller holds the content transaction.
+unsafe fn with_blob_bytes_cached(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    f: impl FnOnce(*mut u8, u64),
+) -> bool {
+    let t0 = now_us();
+    let Ok(prep) = crate::virtio::ctrl::map_blob_prepare(
+        passive,
+        adapter,
+        crate::virtio::gpu::OwnerFilter::Any,
+        resource_id,
+    ) else {
+        return false;
+    };
+    CPU_CACHE.store(prep.map_cache, Ordering::Relaxed);
+    let hit = {
+        let mut g = CPU_VIEW_CACHE.lock();
+        g.1 += 1;
+        let tick = g.1;
+        let e = g.0.iter_mut().flatten().find(|e| {
+            e.resid == resource_id && e.gpa == prep.gpa && e.size == prep.size && e.cache == prep.map_cache
+        });
+        e.map(|e| {
+            e.used = tick;
+            e.va
+        })
+    };
+    let va = match hit {
+        Some(va) => {
+            CPU_HIT.fetch_add(1, Ordering::Relaxed);
+            va as *mut u8
+        }
+        None => {
+            // A stale view of the same resource (moved, resized) goes, then the least recently used.
+            let victim = {
+                let mut g = CPU_VIEW_CACHE.lock();
+                let i = g
+                    .0
+                    .iter()
+                    .position(|e| e.is_some_and(|e| e.resid == resource_id))
+                    .or_else(|| g.0.iter().position(Option::is_none))
+                    .unwrap_or_else(|| {
+                        let mut best = 0;
+                        for (k, e) in g.0.iter().enumerate() {
+                            if let (Some(e), Some(b)) = (e, g.0[best]) {
+                                if e.used < b.used {
+                                    best = k;
+                                }
+                            }
+                        }
+                        best
+                    });
+                (i, g.0[i].take())
+            };
+            if let (_, Some(old)) = victim {
+                // SAFETY: `old.va` maps `old.size` bytes (made below on an earlier call); nothing
+                // else uses it (the content transaction).
+                unsafe { MmUnmapIoSpace(old.va as *mut c_void, old.size) };
+            }
+            let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+            pa.QuadPart = prep.gpa as i64;
+            let cache = super::blob_map::map_cache_to_mm(prep.map_cache);
+            // SAFETY: PASSIVE; the range was RESOURCE_MAP_BLOB'd into the host-visible window with
+            // this cache attribute (the host's MAP_INFO), as `with_blob_bytes` maps it.
+            let va = unsafe { MmMapIoSpace(pa, prep.size, cache) } as *mut u8;
+            if va.is_null() {
+                return false;
+            }
+            CPU_VIEW_CACHE.lock().0[victim.0] = Some(CpuViewEntry {
+                resid: resource_id,
+                gpa: prep.gpa,
+                size: prep.size,
+                cache: prep.map_cache,
+                va: va as usize,
+                used: 0,
+            });
+            va
+        }
+    };
+    let t1 = now_us();
+    f(va, prep.size);
+    CPU_MAP_US.store((t1 - t0).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+    CPU_CPY_US.store((now_us() - t1).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+    true
+}
+
+/// Unmap every reused view (StopDevice, before the window goes; takes the content transaction so
+/// no helper is inside one). PASSIVE.
+pub(crate) fn release_cpu_views(passive: PassiveLevel, adapter: &AdapterContext) {
+    let guard = adapter.system_backings.serialize(passive);
+    let views = core::mem::replace(&mut CPU_VIEW_CACHE.lock().0, [None; CPU_VIEWS]);
+    for e in views.into_iter().flatten() {
+        // SAFETY: made by `with_blob_bytes_cached`, used by no one (the content transaction).
+        unsafe { MmUnmapIoSpace(e.va as *mut c_void, e.size) };
+    }
+    drop(guard);
+}
+
 /// `RedirVram` (docs/vram-redirection.md 5.6): copy `out.len()` bytes from offset `offset` of the
 /// KMD standard buffer `resource_id`'s AUTHORITATIVE CPU view into `out`: the system pages VidMm
 /// holds while it has leases that are current (the system copy is not marked invalid), the Venus
@@ -978,13 +1128,16 @@ pub(crate) fn read_standard_buffer(
                 }
                 covered += end - start;
             }
+            CPU_VIEW.store(1, Ordering::Relaxed);
+            CPU_KB.store((out.len() / 1024) as u32, Ordering::Relaxed);
+            publish_cpu_counters();
             return covered == out.len() as u64;
         }
     }
     let mut ok = false;
     // SAFETY: PASSIVE; the content transaction is held for the whole copy.
     let mapped = unsafe {
-        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
+        with_blob_bytes_cached(passive, adapter, resource_id, |blob, len| {
             if want_end <= len {
                 // SAFETY: `[offset, want_end)` is inside the mapped blob (`len` bytes).
                 core::ptr::copy_nonoverlapping(blob.add(offset as usize), out.as_mut_ptr(), out.len());
@@ -992,6 +1145,9 @@ pub(crate) fn read_standard_buffer(
             }
         })
     };
+    CPU_VIEW.store(2, Ordering::Relaxed);
+    CPU_KB.store((out.len() / 1024) as u32, Ordering::Relaxed);
+    publish_cpu_counters();
     mapped && ok
 }
 
@@ -1026,7 +1182,7 @@ pub(crate) fn write_standard_buffer(
     let mut ok = false;
     // SAFETY: PASSIVE; the content transaction is held for the whole copy.
     let mapped = unsafe {
-        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
+        with_blob_bytes_cached(passive, adapter, resource_id, |blob, len| {
             if end > len {
                 return;
             }
@@ -1045,6 +1201,9 @@ pub(crate) fn write_standard_buffer(
             };
         })
     };
+    CPU_VIEW.store(2, Ordering::Relaxed);
+    CPU_KB.store((span / 1024) as u32, Ordering::Relaxed);
+    publish_cpu_counters();
     mapped && ok
 }
 

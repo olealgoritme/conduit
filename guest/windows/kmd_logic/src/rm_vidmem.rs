@@ -684,14 +684,17 @@ pub const COUNTERS: &[&str] = &[
     "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
     "RvSysMade", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak", "RvSysObj",
+    // the CPU helpers' blob views (`ddi/build_paging_buffer.rs`)
+    "RvCpuMapUs", "RvCpuCpyUs", "RvCpuKB", "RvCpuCache", "RvCpuHit", "RvCpuView",
 ];
 
 /// The files that write [`COUNTERS`] (relative to `kmd_render/src`).
-pub const WRITERS: [&str; 4] = [
+pub const WRITERS: [&str; 5] = [
     "virtio/rm_client/vidmem.rs",
     "virtio/rm_client/ce_vram.rs",
     "ddi/vram_redirect.rs",
     "ddi/ce_sysmem.rs",
+    "ddi/build_paging_buffer.rs",
 ];
 
 #[cfg(test)]

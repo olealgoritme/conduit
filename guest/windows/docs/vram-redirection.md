@@ -489,6 +489,14 @@ copy's source origin. Counters `RvFgnRec`, `RvFgnImp`, `RvFgnFail`, `RvFgnWhy`. 
 not count in `FgRi*`. Found on the way: the route added the source plan's offset twice
 (`ce_dup`'s VA already has it); harmless for NVK's offset-0 images, fixed.
 
+The CPU helpers (`read_standard_buffer`, `write_standard_buffer`, the GDI executor's fallback) now
+reuse up to 4 kernel views of a blob (keyed by resource id, window GPA, size and the host's cache
+attribute, re-checked with `map_blob_prepare` on every call) instead of mapping and unmapping the whole
+blob each time; the views are released at StopDevice and StartDevice. Counters per call: `RvCpuMapUs`,
+`RvCpuCpyUs`, `RvCpuKB`, `RvCpuCache` (1 cached, 2 uncached, 3 WC; any other value is mapped UNCACHED,
+which alone would explain ~200 MB/s), `RvCpuHit`, `RvCpuView` (1 leases, 2 blob). Staging -> staging
+between RM-backed buffers should not reach the CPU at all any more (`with_standard_pair`).
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
