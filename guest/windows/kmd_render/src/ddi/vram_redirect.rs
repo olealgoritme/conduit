@@ -163,7 +163,15 @@ pub(crate) unsafe fn blt(
         return skip(Why::Rect);
     };
     match (src_vram, dst_vram) {
-        (_, Some(dst)) if source.foreign.is_some() && src_vram.is_none() => {
+        // A KMD standard buffer carries the foreign layout trailer too when it is RM system memory
+        // (a GDI staging buffer, `RedirVram`), but it is not an NVK frame: it takes the UPLOAD arm
+        // below. 371.1: every staging buffer RM-backed, RvUpload 0, RvBltSkip 9788, and the boot
+        // desktop black (CDD's Present Blts of it went to the foreign arm and were refused).
+        (_, Some(dst))
+            if source.foreign.is_some()
+                && src_vram.is_none()
+                && source.storage != PresentAllocationStorage::PitchedStandardBuffer =>
+        {
             // The redirected Blt of an NVK-on-RM frame into the GPU-only redirection surface.
             let Some(fsrc) = crate::virtio::venus::foreign_source_if_enabled(
                 adapter,
