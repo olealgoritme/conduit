@@ -393,6 +393,12 @@ Common: `NvFenceCl` (existing) counts every fence handle closed, including the K
   release: `SCANOUT_STATUS` + the `SCANOUT_RELEASED` event (`foreign-scanout.md`), a signal of
   "the host is DONE with it", stronger than "sent". Only on a host that offers it.
 * NVK D3D12 (`HE12`) has no Venus stream: confirm the v4 FENCE/COMPLETE variants cover
-  `ExecuteCommandLists` (one fence per batch, created right before it).
+  `ExecuteCommandLists` (one fence per batch, created right before it). Answered by
+  `Nvk12EclSync=2` (UMD `forward12/queue.rs` `nvk_complete_fenced`): the batch's value
+  is reserved on a per-queue ECL timeline at the commit (NVK `helios_icd_interface`
+  version 7 `ecl_fence_reserve`/`ecl_fence_create`, vkd3d patch 0004), the fence for
+  it rides in the v4 record, and vkd3d's worker signals the value right after the
+  batch (`ecl_fence_signal`). A refused v4 Render leaves the fence the UMD's, which
+  closes it and waits for that batch on the CPU.
 * One fence per present means one `0x55` round trip (about one escape) per frame on the
   presenting thread. If that is too slow, a batch create is a host change.

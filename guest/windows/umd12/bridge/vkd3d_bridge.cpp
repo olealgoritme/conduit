@@ -869,6 +869,33 @@ std::int32_t HeliosVkd3dDevice::nvk_scanout_present(std::size_t resource) const 
   });
 }
 
+std::uint32_t HeliosVkd3dDevice::nvk_ecl_fence_caps() const noexcept {
+  return helios_bridge::bridge_guard("nvk_ecl_fence_caps12", std::uint32_t(0),
+      [&]() -> std::uint32_t {
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm || !impl->vk_device)
+      return 0;
+    const helios_icd_api& icd = impl->icd;
+    std::uint32_t caps = 0;
+    if (icd.version >= 7 &&
+        icd.size >= offsetof(helios_icd_api, ecl_fence_signal) + sizeof(icd.ecl_fence_signal) &&
+        icd.ecl_fence_reserve && icd.ecl_fence_create && icd.ecl_fence_signal &&
+        icd.rm_fence_close && (icd.caps & HELIOS_ICD_CAP_RM_FENCE))
+      caps |= 1u;
+    if (icd.caps & HELIOS_ICD_CAP_PRESENT_FENCE_KMD)
+      caps |= 2u;
+    return caps;
+  });
+}
+
+void HeliosVkd3dDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept {
+  helios_bridge::bridge_guard("nvk_rm_fence_close12", false, [&]() -> bool {
+    if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm && impl->icd.rm_fence_close &&
+        impl->vk_device && fence_handle)
+      impl->icd.rm_fence_close((VkDevice)impl->vk_device, fence_handle);
+    return true;
+  });
+}
+
 void HeliosVkd3dDevice::nvk_scanout_release() const noexcept {
   helios_bridge::bridge_guard("nvk_scanout_release12", false, [&]() -> bool {
     if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm && impl->icd.scanout_release &&
@@ -1418,6 +1445,40 @@ std::int32_t helios_vkd3d_bridge_execute(std::size_t queue, rust::Slice<const st
     return helios_vkd3d_execute_command_lists(reinterpret_cast<ID3D12CommandQueue*>(queue),
       static_cast<UINT>(commands.size()), commands.data(), reinterpret_cast<HANDLE>(admission_event),
       ctx, value, cookie);
+  });
+}
+
+extern "C" HRESULT helios_vkd3d_execute_command_lists_rm(ID3D12CommandQueue*, UINT,
+    ID3D12CommandList* const*, HANDLE, std::uint32_t*, std::uint32_t*, std::uint64_t*,
+    std::uint32_t*, std::uint64_t*);
+extern "C" std::uint32_t helios_vkd3d_ecl_fence_stats(std::uint64_t*, std::uint32_t);
+extern "C" std::uint32_t helios_vkd3d_memory_stats(std::uint64_t*, std::uint32_t);
+
+std::uint32_t helios_vkd3d_bridge_memory_stats(rust::Slice<std::uint64_t> out) noexcept {
+  return helios_bridge::bridge_guard("memory_stats12", std::uint32_t(0), [&]() -> std::uint32_t {
+    if (out.size() > UINT_MAX) return 0;
+    return helios_vkd3d_memory_stats(out.data(), static_cast<std::uint32_t>(out.size()));
+  });
+}
+
+std::int32_t helios_vkd3d_bridge_execute_rm(std::size_t queue, rust::Slice<const std::size_t> lists,
+    std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie,
+    std::uint32_t* rm_fence, std::uint64_t* rm_value) {
+  return helios_bridge::bridge_guard("execute_rm12", std::int32_t(E_FAIL), [&]() -> std::int32_t {
+    if (lists.empty() || lists.size() > UINT_MAX) return E_INVALIDARG;
+    std::vector<ID3D12CommandList*> commands;
+    commands.reserve(lists.size());
+    for (auto list : lists) commands.push_back(reinterpret_cast<ID3D12CommandList*>(list));
+    return helios_vkd3d_execute_command_lists_rm(reinterpret_cast<ID3D12CommandQueue*>(queue),
+      static_cast<UINT>(commands.size()), commands.data(), reinterpret_cast<HANDLE>(admission_event),
+      ctx, value, cookie, rm_fence, rm_value);
+  });
+}
+
+std::uint32_t helios_vkd3d_bridge_ecl_fence_stats(rust::Slice<std::uint64_t> out) noexcept {
+  return helios_bridge::bridge_guard("ecl_fence_stats12", std::uint32_t(0), [&]() -> std::uint32_t {
+    if (out.size() > UINT_MAX) return 0;
+    return helios_vkd3d_ecl_fence_stats(out.data(), static_cast<std::uint32_t>(out.size()));
   });
 }
 

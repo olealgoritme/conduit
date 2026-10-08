@@ -1472,6 +1472,22 @@ unsafe extern "system" fn resource_barrier(
     count: ddi12::UINT,
     barriers: *const ddi12::D3D12DDIARG_RESOURCE_BARRIER_0022,
 ) {
+    // Per-frame accounting (`nvk12::FrameStats`): time inside this DDI.
+    let started = std::time::Instant::now();
+    // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
+    unsafe { resource_barrier_body(h_list, count, barriers) };
+    super::nvk12::FRAME_STATS.note_barrier(started.elapsed());
+}
+
+/// The body of [`resource_barrier`].
+///
+/// # Safety
+/// As [`resource_barrier`].
+unsafe fn resource_barrier_body(
+    h_list: ddi12::D3D12DDI_HCOMMANDLIST,
+    count: ddi12::UINT,
+    barriers: *const ddi12::D3D12DDIARG_RESOURCE_BARRIER_0022,
+) {
     // ⚠ Counted before anything can fail; see [`barrier`]'s twin. The pair is
     // what says WHICH arm the shipping build actually exercises, and neither
     // reading alone does: `EnhancedBarrierCalled = 0` on its own is equally

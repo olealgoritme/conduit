@@ -70,6 +70,12 @@ struct HeliosVkd3dDevice {
   std::int32_t nvk_scanout_present(std::size_t resource) const noexcept;
   // S5, NVK only: give scanout 0 back to the desktop.
   void nvk_scanout_release() const noexcept;
+  // NVK only: what the ICD offers for ECL fences (Nvk12EclSync=2). Bit 0: ECL
+  // fences (helios_icd_interface version 7 entries and HELIOS_ICD_CAP_RM_FENCE),
+  // bit 1: the KMD takes RM fences in HE12 v4 (HELIOS_ICD_CAP_PRESENT_FENCE_KMD).
+  std::uint32_t nvk_ecl_fence_caps() const noexcept;
+  // NVK only: close an RM fence this process still owns (a refused HE12 v4).
+  void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
 
   // BORROWED — the bridge keeps the owning reference. 0 if not created.
   // The caller must NOT `Release()` this, and on the Rust side must not let a
@@ -222,6 +228,15 @@ std::int32_t helios_vkd3d_bridge_try_reset_allocator(std::size_t allocator);
 std::int32_t helios_vkd3d_bridge_execute(std::size_t queue, rust::Slice<const std::size_t> lists,
     std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie);
 void helios_vkd3d_bridge_cancel_execution(std::size_t queue, std::int32_t reason);
+// helios_vkd3d_bridge_execute plus an ECL fence (NVK, HE12 v4): *rm_fence is an
+// RM fence handle the caller owns, 0 when the engine made none.
+std::int32_t helios_vkd3d_bridge_execute_rm(std::size_t queue, rust::Slice<const std::size_t> lists,
+    std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie,
+    std::uint32_t* rm_fence, std::uint64_t* rm_value);
+// The engine's ECL fence counters (helios_vkd3d_ecl_fence_stats); how many it wrote.
+std::uint32_t helios_vkd3d_bridge_ecl_fence_stats(rust::Slice<std::uint64_t> out) noexcept;
+// The engine's memory placement counters (helios_vkd3d_memory_stats); how many it wrote.
+std::uint32_t helios_vkd3d_bridge_memory_stats(rust::Slice<std::uint64_t> out) noexcept;
 
 std::int32_t helios_vkd3d_bridge_update_tiles(std::size_t queue, std::size_t resource,
     std::uint32_t region_count, std::size_t coords, std::size_t sizes, std::size_t heap,

@@ -2934,6 +2934,75 @@ unsafe fn nvk_complete(
     unsafe { sync.order_context(dev, queue.h_context, engine, u64::from(value)) }
 }
 
+/// NVK, `Nvk12EclSync=2`: order the runtime context behind boundary `value`
+/// with an HE12 v4 record naming the batch's ECL fence
+/// (`docs/rm-fence-marker.md`). The KMD withholds the packet's DMA completion
+/// until the fence fires (the engine signals it right after the batch), so the
+/// runtime's fence signals and presents queued after this ECL follow the real
+/// work, while the admission event queued after the packet (SignalAtSubmission,
+/// exactly as on Venus) releases the batch as soon as the packet is submitted.
+/// Nothing waits on this thread.
+///
+/// `Ok(true)`: ordered. `Ok(false)`: not ordered, nothing queued, the fence (if
+/// any) closed: the caller orders the batch another way. `Err`: the packet went
+/// in but its admission could not be queued (report it).
+///
+/// # Safety
+/// As [`nvk_complete`].
+unsafe fn nvk_complete_fenced(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    value: u32,
+    admission: &AdmissionEvent,
+    fence: Option<crate::bridge12::EclFence>,
+) -> Result<bool, ddi12::HRESULT> {
+    let Some(fence) = fence else {
+        super::nvk12::note_ecl_fence(super::nvk12::EclFenceOutcome::NoFence);
+        return Ok(false);
+    };
+    // Fence variant: no stream, no wire fence, the fence handle.
+    let record = helios_protocol::HeliosD3D12SubmitCmdV4 {
+        base: helios_protocol::HeliosD3D12SubmitCmd {
+            magic: helios_protocol::HELIOS_D3D12_SUBMIT_MAGIC,
+            version: helios_protocol::HELIOS_D3D12_SUBMIT_VERSION_V4,
+            ctx_id: 0,
+            value: 0,
+            cookie: 0,
+            gpu_wire_fence: 0,
+        },
+        fence: helios_protocol::HeliosRmFenceTail {
+            rm_fence_handle: fence.handle,
+            flags: helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
+            rm_fence_value: fence.value,
+        },
+    };
+    debug_assert!(record.is_fence_record());
+    // SAFETY: required runtime callback on the entering DDI thread.
+    match unsafe { submit_wddm_render(dev, queue, &record, "ExecuteCommandLists (HE12 v4)") } {
+        WddmSubmit::Submitted => {}
+        WddmSubmit::Refused(hr) => {
+            // A refused v4 Render leaves the fence ours (rm-fence-marker.md).
+            super::nvk12::note_ecl_fence_refused(hr);
+            super::nvk12::close_unused_fence(dev, fence);
+            return Ok(false);
+        }
+        WddmSubmit::Unavailable => {
+            super::nvk12::note_ecl_fence(super::nvk12::EclFenceOutcome::Unavailable);
+            super::nvk12::close_unused_fence(dev, fence);
+            return Ok(false);
+        }
+    }
+    super::nvk12::note_ecl_fence(super::nvk12::EclFenceOutcome::Submitted);
+    // The scanout present's CPU wait reads this (`nvk_wait_queue_idle`).
+    queue
+        .nvk_last_value
+        .fetch_max(u64::from(value), std::sync::atomic::Ordering::AcqRel);
+    // SAFETY: same entering thread and exact context as the Render above.
+    // SignalAtSubmission is essential: a completion event here deadlocks.
+    unsafe { enqueue_runtime_admission(dev, queue, admission) }?;
+    Ok(true)
+}
+
 /// S5: does this queue's device run its engine on NVK on RM?
 ///
 /// # Safety
@@ -3010,6 +3079,22 @@ fn report_ecl_submit_error(queue: &QueueState, hr: ddi12::HRESULT) {
 /// `h_queue` must be a live queue handle; `lists` must address `count` readable
 /// `D3D12DDI_HCOMMANDLIST`s, each a live handle from [`create_command_list`].
 unsafe extern "system" fn execute_command_lists(
+    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    count: ddi12::UINT,
+    lists: *const ddi12::D3D12DDI_HCOMMANDLIST,
+) {
+    // Per-frame accounting (`nvk12::FrameStats`): the whole DDI, wait included.
+    let started = std::time::Instant::now();
+    // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
+    unsafe { execute_command_lists_body(h_queue, count, lists) };
+    super::nvk12::FRAME_STATS.note_ecl(started.elapsed());
+}
+
+/// The body of [`execute_command_lists`].
+///
+/// # Safety
+/// As [`execute_command_lists`].
+unsafe fn execute_command_lists_body(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     count: ddi12::UINT,
     lists: *const ddi12::D3D12DDI_HCOMMANDLIST,
@@ -3155,17 +3240,33 @@ unsafe extern "system" fn execute_command_lists(
         .flatten()
         .map(|list| list.as_raw() as usize)
         .collect();
+    // NVK, Nvk12EclSync=2: ask the engine for an ECL fence with the batch.
+    let want_fence = dev.engine.is_nvk() && super::nvk12::ecl_fences_wanted(dev);
     // SAFETY: owned list interfaces and event outlive this call. The engine
     // duplicates the event and retains allocator/command-buffer lifetimes.
-    let boundary = match unsafe {
-        crate::bridge12::execute(
-            queue.engine_queue.as_raw() as usize,
-            &commands,
-            admission.0 .0 as usize,
-        )
-    } {
-        Ok(boundary) => boundary,
-        Err(hr) => {
+    let executed = unsafe {
+        if want_fence {
+            crate::bridge12::execute_rm(
+                queue.engine_queue.as_raw() as usize,
+                &commands,
+                admission.0 .0 as usize,
+            )
+        } else {
+            crate::bridge12::execute(
+                queue.engine_queue.as_raw() as usize,
+                &commands,
+                admission.0 .0 as usize,
+            )
+            .map(|boundary| (boundary, None))
+            .map_err(|hr| (hr, None))
+        }
+    };
+    let (boundary, ecl_fence) = match executed {
+        Ok(executed) => executed,
+        Err((hr, fence)) => {
+            if let Some(fence) = fence {
+                super::nvk12::close_unused_fence(dev, fence);
+            }
             note_refusal(&L2_REFUSALS.ecl_worker_failed);
             report_ecl_submit_error(queue, hr);
             return;
@@ -3173,7 +3274,33 @@ unsafe extern "system" fn execute_command_lists(
     };
     L2_REFUSALS.ecl_forwarded.bump();
     L2_REFUSALS.ecl_exact_boundary.bump();
+    if boundary.0 != 0 {
+        if let Some(fence) = ecl_fence {
+            // A Venus boundary never comes with an ECL fence; never leak one.
+            super::nvk12::close_unused_fence(dev, fence);
+        }
+    }
     if boundary.0 == 0 {
+        if want_fence {
+            // HE12 v4: the KMD withholds this packet's DMA completion until the
+            // ECL fence fires, so nothing here waits. `false` = not ordered
+            // that way (no fence, or the Render refused it): the CPU wait
+            // below orders this batch instead.
+            // SAFETY: entering ECL thread, live device/queue, execution lock held.
+            match unsafe { nvk_complete_fenced(dev, queue, boundary.1, &admission, ecl_fence) } {
+                Ok(true) => {
+                    L2_REFUSALS.ecl_nvk_ordered.bump();
+                    note_refusal(&L2_REFUSALS.ecl_admission_queued);
+                    return;
+                }
+                Ok(false) => {}
+                Err(hr) => {
+                    note_refusal(&L2_REFUSALS.ecl_admission_failed);
+                    report_ecl_submit_error(queue, hr);
+                    return;
+                }
+            }
+        }
         // S5: NVK on RM -- no HE12 record (the KMD knows no NVK stream); the
         // context is ordered behind the boundary by this driver.
         // SAFETY: entering ECL thread, live device/queue, execution lock held.

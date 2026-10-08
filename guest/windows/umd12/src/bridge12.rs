@@ -174,6 +174,13 @@ mod ffi {
         /// S5, NVK only: give scanout 0 back to the desktop.
         fn nvk_scanout_release(self: &HeliosVkd3dDevice);
 
+        /// NVK only: bit 0 = the ICD serves ECL fences (helios_icd_interface
+        /// v7), bit 1 = the KMD takes RM fences in HE12 v4.
+        fn nvk_ecl_fence_caps(self: &HeliosVkd3dDevice) -> u32;
+
+        /// NVK only: close an RM fence this process still owns.
+        fn nvk_rm_fence_close(self: &HeliosVkd3dDevice, fence_handle: u32);
+
         /// S5, NVK only: wait for the queue's execution stream to reach `value`.
         ///
         /// # Safety
@@ -229,6 +236,26 @@ mod ffi {
             value: *mut u32,
             cookie: *mut u64,
         ) -> i32;
+
+        /// `helios_vkd3d_bridge_execute` plus an ECL fence (NVK, HE12 v4).
+        /// # Safety
+        /// As `helios_vkd3d_bridge_execute`; the two extra outputs are writable.
+        unsafe fn helios_vkd3d_bridge_execute_rm(
+            queue: usize,
+            lists: &[usize],
+            admission_event: usize,
+            ctx: *mut u32,
+            value: *mut u32,
+            cookie: *mut u64,
+            rm_fence: *mut u32,
+            rm_value: *mut u64,
+        ) -> i32;
+
+        /// The engine's ECL fence counters; returns how many it wrote.
+        fn helios_vkd3d_bridge_ecl_fence_stats(out: &mut [u64]) -> u32;
+
+        /// The engine's memory placement counters; returns how many it wrote.
+        fn helios_vkd3d_bridge_memory_stats(out: &mut [u64]) -> u32;
 
         /// # Safety
         /// All engine objects and API-typed arrays are live for this call.
@@ -632,6 +659,89 @@ impl BridgeDevice12 {
             d.nvk_scanout_release();
         }
     }
+
+    /// NVK only: true when ExecuteCommandLists can be ordered by an HE12 v4
+    /// RM fence: the ICD serves ECL fences and the KMD takes them.
+    pub(crate) fn nvk_ecl_fences(&self) -> bool {
+        self.get().is_some_and(|d| d.nvk_ecl_fence_caps() & 3 == 3)
+    }
+
+    /// NVK only: close an RM fence this process still owns.
+    pub(crate) fn nvk_rm_fence_close(&self, fence_handle: u32) {
+        if let Some(d) = self.get() {
+            d.nvk_rm_fence_close(fence_handle);
+        }
+    }
+}
+
+/// An ECL fence the engine made for one batch (NVK, HE12 v4).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EclFence {
+    /// The RM fence handle; this process owns it until a Render takes it.
+    pub(crate) handle: u32,
+    /// The ECL timeline value it fires at (diagnostic).
+    pub(crate) value: u64,
+}
+
+/// What [`execute_rm`] returns: the boundary and the batch's ECL fence, or the
+/// failure and any fence the engine made anyway (the caller closes it).
+pub(crate) type ExecuteRm = Result<((u32, u32, u64), Option<EclFence>), (i32, Option<EclFence>)>;
+
+/// [`execute`], asking the engine for an ECL fence too. The fence is `None`
+/// when the engine made none; the batch is committed either way.
+///
+/// # Safety
+/// As [`execute`].
+pub(crate) unsafe fn execute_rm(
+    queue: usize,
+    lists: &[usize],
+    admission_event: usize,
+) -> ExecuteRm {
+    let (mut ctx, mut value, mut cookie) = (0, 0, 0);
+    let (mut rm_fence, mut rm_value) = (0u32, 0u64);
+    // SAFETY: forwarded live borrowed objects; outputs are writable locals.
+    let hr = unsafe {
+        ffi::helios_vkd3d_bridge_execute_rm(
+            queue,
+            lists,
+            admission_event,
+            &mut ctx,
+            &mut value,
+            &mut cookie,
+            &mut rm_fence,
+            &mut rm_value,
+        )
+    };
+    let fence = (rm_fence != 0).then_some(EclFence { handle: rm_fence, value: rm_value });
+    // An error still hands back a fence the engine made, so the caller can
+    // close it rather than leak it.
+    match boundary(hr, ctx, value, cookie) {
+        Ok(b) => Ok((b, fence)),
+        Err(hr) => Err((hr, fence)),
+    }
+}
+
+/// The engine's ECL fence counters (`helios_vkd3d_ecl_fence_stats`): signals,
+/// commit-to-signal sum and max (us), signal failures, values reserved, fences
+/// made, creates failed, then 7 histogram buckets.
+/// The engine's memory placement counters (`helios_vkd3d_memory_stats`, vkd3d
+/// patch 0005), in its layout: live bytes per memory type (32), bytes and
+/// allocations per (request class, type) (5 x 32 each), per-type
+/// `propertyFlags | heapIndex << 32 | seen << 63` (32), then the count of
+/// DEVICE_LOCAL requests that got a type without it. `None` from an engine
+/// without the export's data.
+pub(crate) fn memory_stats() -> Option<Box<[u64; MEMORY_STATS_LEN]>> {
+    let mut out = Box::new([0u64; MEMORY_STATS_LEN]);
+    (ffi::helios_vkd3d_bridge_memory_stats(&mut out[..]) as usize == MEMORY_STATS_LEN).then_some(out)
+}
+
+/// Values in [`memory_stats`].
+pub(crate) const MEMORY_STATS_LEN: usize = 385;
+
+pub(crate) fn ecl_fence_stats() -> [u64; 14] {
+    let mut out = [0u64; 14];
+    ffi::helios_vkd3d_bridge_ecl_fence_stats(&mut out);
+    out
 }
 
 /// S5: an NVK-made (foreign) resource id for one D3D12 texture, with the layout

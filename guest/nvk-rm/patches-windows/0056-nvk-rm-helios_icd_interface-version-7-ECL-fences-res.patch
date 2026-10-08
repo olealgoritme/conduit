@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 12:31:00 +0200
+Subject: [PATCH] nvk/rm: helios_icd_interface version 7, ECL fences (reserve
+ before submit, signal after)
+
+D3D12 ExecuteCommandLists on NVK orders the runtime's WDDM context behind
+the GPU work by an HE12 v4 record carrying an RM fence (Conduit
+guest/windows/docs/rm-fence-marker.md): the KMD withholds the packet's DMA
+completion until the fence fires, so the runtime's fence signals and
+presents follow the real work while the next batch is admitted at once.
+The record goes in at the ExecuteCommandLists call, before vkd3d's
+submission worker has submitted the batch, so the fence must name a value
+that is reserved now and signalled later; queue_rm_fence signals at once.
+
+Three entries on a caller-keyed timeline (vkd3d keys it with its
+d3d12_command_queue, so D3D12 queues that share a VkQueue never interleave
+values):
+
+- ecl_fence_reserve(device, key, &value): the next value, nothing
+  submitted (nvkmd_rm_rmfence_sync).
+- ecl_fence_create(device, key, value, &fence): the RM fence for it
+  (SEMSURF_FENCE_CREATE), the caller's as for queue_rm_fence.
+- ecl_fence_signal(device, queue, key, value): vk_queue_signal_sync of the
+  timeline after everything submitted to the queue so far.
+
+The key is tagged with bit 0, so an ECL timeline never shares a present
+timeline's entry (keyed by the vk_queue pointer) and a present fence
+signalled at once on the same queue cannot overtake a reserved value.
+nvkmd_rm_rmfence_find looks a timeline up without reserving.
+---
+ src/nouveau/vulkan/helios_icd_interface.h     | 38 ++++++++-
+ src/nouveau/vulkan/nvk_helios.c               | 77 +++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h        |  6 ++
+ .../vulkan/nvkmd/rm/nvkmd_rm_rmfence.c        | 16 ++++
+ 4 files changed, 135 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
+index f5d6aac..c9d71b4 100644
+--- a/src/nouveau/vulkan/helios_icd_interface.h
++++ b/src/nouveau/vulkan/helios_icd_interface.h
+@@ -42,8 +42,9 @@ extern "C" {
+ #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
+ /* The export keeps its name; version 3 only appends entries (and caps 4..6),
+  * version 4 appends memory_res_plane1 (and cap 8), version 5 scanout_frame,
+- * version 6 queue_rm_fence_v3. */
+-#define HELIOS_ICD_INTERFACE_VERSION 6u
++ * version 6 queue_rm_fence_v3, version 7 the ECL fence timeline
++ * (ecl_fence_reserve / ecl_fence_create / ecl_fence_signal). */
++#define HELIOS_ICD_INTERFACE_VERSION 7u
+ 
+ enum helios_icd_backend {
+    HELIOS_ICD_BACKEND_VENUS = 1,
+@@ -318,6 +319,39 @@ struct helios_icd_api {
+                                  VkDeviceMemory memory, VkImage image,
+                                  uint32_t *fence_handle, uint64_t *value,
+                                  struct helios_icd_rm_copy *copy);
++
++   /* ---- version 7 (size covers it; NULL = not supported) ----------------
++    * RM fences for a point that is RESERVED before the work is submitted
++    * and signalled after it (D3D12 ExecuteCommandLists on NVK: the UMD hands
++    * the fence to the KMD in an HE12 v4 record before the engine's worker
++    * has submitted the batch; guest/windows/docs/rm-fence-marker.md).
++    * Needs HELIOS_ICD_CAP_RM_FENCE.
++    *
++    * `key` names one ECL timeline of the device: any nonzero, 2-aligned
++    * value the caller owns (vkd3d: its d3d12_command_queue). The timelines
++    * are separate from the present timelines of queue_rm_fence, so a
++    * present fence signalled at once on the same VkQueue never overtakes a
++    * reserved value. A device has few timelines (8 in all, presents
++    * included); VK_ERROR_FEATURE_NOT_PRESENT when none is left.
++    *
++    * ecl_fence_reserve: the next value of `key`'s timeline, without
++    *   submitting anything. Cheap after the first call for a key (that one
++    *   makes the timeline: an escape). Values come back strictly increasing
++    *   per key; the caller must signal them in that order.
++    * ecl_fence_create: an RM fence for `value` of `key`'s timeline (one
++    *   SEMSURF_FENCE_CREATE escape). *fence_handle is the caller's, as for
++    *   queue_rm_fence (hand it to the KMD or rm_fence_close it). A fence
++    *   whose value is never signalled fires after the host's 5 s timeout.
++    * ecl_fence_signal: signal `key`'s timeline to `value` on `queue` after
++    *   everything submitted to it so far. The caller holds the queue as
++    *   vkQueueSubmit requires. A reserved value that is never signalled is
++    *   covered by the next larger one. */
++   VkResult (*ecl_fence_reserve)(VkDevice device, uint64_t key,
++                                 uint64_t *value);
++   VkResult (*ecl_fence_create)(VkDevice device, uint64_t key,
++                                uint64_t value, uint32_t *fence_handle);
++   VkResult (*ecl_fence_signal)(VkDevice device, VkQueue queue,
++                                uint64_t key, uint64_t value);
+ };
+ 
+ typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);
+diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
+index 80924da..78c895f 100644
+--- a/src/nouveau/vulkan/nvk_helios.c
++++ b/src/nouveau/vulkan/nvk_helios.c
+@@ -390,6 +390,80 @@ helios_queue_rm_fence(VkDevice _device, VkQueue _queue, uint32_t *fence_handle,
+    return VK_SUCCESS;
+ }
+ 
++/* ECL fences (helios_icd_interface.h version 7): a point reserved before
++ * the work is submitted and signalled after it.  The timeline key is the
++ * caller's (2-aligned), tagged with bit 0 so it can never equal a present
++ * timeline's key (a vk_queue pointer).
++ */
++static const void *
++helios_ecl_key(uint64_t key)
++{
++   return (const void *)(uintptr_t)(key | 1);
++}
++
++static VkResult
++helios_ecl_fence_reserve(VkDevice _device, uint64_t key, uint64_t *value)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++
++   *value = 0;
++   if (dev == NULL || key == 0 || (key & 1))
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   uint64_t v = 0;
++   struct vk_sync *sync = nvkmd_rm_rmfence_sync(dev->nvkmd, &dev->vk.base,
++                                                helios_ecl_key(key), &v);
++   if (sync == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   *value = v;
++   return VK_SUCCESS;
++}
++
++static VkResult
++helios_ecl_fence_create(VkDevice _device, uint64_t key, uint64_t value,
++                        uint32_t *fence_handle)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++
++   *fence_handle = 0;
++   if (dev == NULL || key == 0 || (key & 1))
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   struct vk_sync *sync = nvkmd_rm_rmfence_find(dev->nvkmd,
++                                                helios_ecl_key(key));
++   if (sync == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   int fence = -1;
++   VkResult result = nvkmd_rm_rmfence_create(dev->nvkmd, &dev->vk.base,
++                                             sync, value, &fence);
++   if (result != VK_SUCCESS)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   *fence_handle = (uint32_t)fence;
++   return VK_SUCCESS;
++}
++
++static VkResult
++helios_ecl_fence_signal(VkDevice _device, VkQueue _queue, uint64_t key,
++                        uint64_t value)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(vk_queue, queue, _queue);
++
++   if (dev == NULL || queue == NULL || key == 0 || (key & 1))
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   struct vk_sync *sync = nvkmd_rm_rmfence_find(dev->nvkmd,
++                                                helios_ecl_key(key));
++   if (sync == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   /* In submission order on this queue: after everything submitted to it
++    * so far, the reserved batch included (one channel per queue).
++    */
++   return vk_queue_signal_sync(queue, sync, value);
++}
++
+ static VkResult
+ helios_rm_fence_wait(VkDevice _device, uint32_t fence_handle,
+                      uint64_t timeout_ns)
+@@ -649,6 +723,9 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+       .memory_res_plane1 = helios_memory_res_plane1,
+       .scanout_frame = helios_scanout_frame,
+       .queue_rm_fence_v3 = helios_queue_rm_fence_v3,
++      .ecl_fence_reserve = helios_ecl_fence_reserve,
++      .ecl_fence_create = helios_ecl_fence_create,
++      .ecl_fence_signal = helios_ecl_fence_signal,
+    };
+    memcpy(out, &api, cap);
+    return VK_SUCCESS;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 1ef4bfd..d1b7eb1 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -572,6 +572,12 @@ VkResult nvkmd_rm_rmfence_create(struct nvkmd_dev *dev,
+  * Present's semaphore acquire).  False for a sync that is no present
+  * timeline of this device.
+  */
++/* The timeline of `queue_key` if it exists (no value is reserved), else
++ * NULL.
++ */
++struct vk_sync *nvkmd_rm_rmfence_find(struct nvkmd_dev *dev,
++                                      const void *queue_key);
++
+ bool nvkmd_rm_rmfence_semaphore(struct nvkmd_dev *dev, struct vk_sync *sync,
+                                 uint32_t *h_client, uint32_t *h_memory,
+                                 uint64_t *offset_B);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+index d1887a8..3d28cf6 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+@@ -272,6 +272,22 @@ nvkmd_rm_rmfence_sync(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
+    return sync;
+ }
+ 
++struct vk_sync *
++nvkmd_rm_rmfence_find(struct nvkmd_dev *_dev, const void *queue_key)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   struct vk_sync *sync = NULL;
++
++   simple_mtx_lock(&dev->rmfence_mutex);
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++   for (uint32_t i = 0; rf != NULL && i < rf->tl_count; i++) {
++      if (rf->tl[i].key == queue_key)
++         sync = &rf->tl[i].sync.base;
++   }
++   simple_mtx_unlock(&dev->rmfence_mutex);
++   return sync;
++}
++
+ VkResult
+ nvkmd_rm_rmfence_create(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
+                         struct vk_sync *sync, uint64_t value, int *fence_out)
+-- 
+2.43.0
+

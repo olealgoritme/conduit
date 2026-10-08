@@ -10,7 +10,7 @@
 //! has no RM-fence boundary yet (S4), and an `HE12` record without a stream is
 //! refused at Render. So this driver orders the context itself:
 //!
-//! * **Monitored fence** (`Nvk12EclSync=0`; off by default since it deadlocked Basemark DX12). Each queue owns one
+//! * **Monitored fence** (`Nvk12EclSync=0`, the default). Each queue owns one
 //!   WDDM monitored fence created through the kernel callbacks. Every NVK
 //!   boundary appends, on the queue's own context, the runtime admission event
 //!   (exactly as on Venus) followed by a GPU wait for the fence to reach the
@@ -19,11 +19,22 @@
 //!   runtime queues on the context afterwards -- the app's fence signals, its
 //!   presents, DWM's view of them -- waits behind the real GPU work; the app
 //!   thread never blocks.
-//! * **CPU wait** (`Nvk12EclSync=1`, the default, or if the fence cannot be created). After
+//! * **CPU wait** (`Nvk12EclSync=1`, or if the fence cannot be created). After
 //!   the admission event, the DDI waits for the boundary on the calling thread.
 //!   A wait-before-signal pattern (Queue::Wait on a fence the app signals after
 //!   ExecuteCommandLists returns) would deadlock that wait, so it is capped at
-//!   2 s per call and counted.
+//!   2 s per call and counted. The wait first polls the stream with zero
+//!   timeouts for `Nvk12EclSpinUs` (default 2 ms): NVK's own blocking wait
+//!   costs at least a Windows timer tick, once per ECL.
+//!
+//! * **ECL fence** (`Nvk12EclSync=2`). Each ExecuteCommandLists submits an
+//!   `HE12` v4 Render record naming an RM fence the engine reserved for the
+//!   batch (NVK helios_icd_interface v7 `ecl_fence_*`, vkd3d patch 0004), then
+//!   queues the admission event exactly as on Venus. The KMD withholds the
+//!   packet's DMA completion until the fence fires, which the engine's worker
+//!   signals right after the batch. Nothing waits, and the next batch is
+//!   admitted at once (the packet is submitted, not completed). A batch that
+//!   gets no fence, or whose Render is refused, takes the CPU-wait arm.
 //!
 //! The order on the context matters: admission first (it only fires once the
 //! runtime's earlier waits are satisfied, and the engine worker waits for it),
@@ -33,6 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use helios_umd_common::hr::{E_FAIL, E_NOTIMPL};
 use helios_umd_common::refusals::RefusalCounter;
@@ -42,6 +54,478 @@ use crate::{ddi12, device12, log_error, note_refusal};
 
 /// The CPU-wait arm's cap per ExecuteCommandLists.
 const CPU_WAIT_NS: u64 = 2_000_000_000;
+/// Zero-timeout probes between two clock reads in [`spin_wait`].
+const SPIN_PROBES_PER_CLOCK: u32 = 8;
+/// Waits per ECL CPU-wait timing line.
+const ECL_WAIT_LOG_EVERY: u64 = 4096;
+
+/// Poll the engine's execution stream for `value` with zero-timeout waits for
+/// up to `Nvk12EclSpinUs`. `Some(result)` when the poll settled it (reached,
+/// or an engine error), `None` when the budget ran out (or is 0) and the
+/// caller must block.
+///
+/// Why not just block: NVK's RM backend blocks on the non-stall event or in
+/// `Sleep()`, which on Windows costs at least a timer tick per wait; the
+/// per-ECL wait then dominates the frame (`knobs12::NVK12_ECL_SPIN_US`).
+///
+/// # Safety
+/// `engine_queue` is the live engine queue.
+unsafe fn spin_wait(engine_queue: usize, value: u64) -> Option<Result<bool, ddi12::HRESULT>> {
+    let budget_us = crate::knobs12::nvk12_ecl_spin_us();
+    if budget_us == 0 {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_micros(u64::from(budget_us));
+    loop {
+        for _ in 0..SPIN_PROBES_PER_CLOCK {
+            // SAFETY: forwarded precondition.
+            match unsafe { crate::bridge12::wait_execution(engine_queue, value, 0) } {
+                Ok(false) => std::hint::spin_loop(),
+                settled => return Some(settled),
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        // Let a runnable thread on this core (the engine's submit worker,
+        // which releases this very work) go first.
+        std::thread::yield_now();
+    }
+}
+
+/// Per-process timing of the ECL CPU waits, so the per-frame cost is a number
+/// in the log rather than an inference from PresentMon.
+struct EclWaitStats {
+    waits: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    /// Waits the poll settled (no blocking engine wait).
+    polled: AtomicU64,
+    /// Wait-time histogram, upper bounds in [`ECL_WAIT_BUCKETS_US`] (last: above).
+    buckets: [AtomicU64; ECL_WAIT_BUCKETS_US.len() + 1],
+}
+
+/// Histogram bucket upper bounds (us). Separates a timer tick per wait
+/// (1-2 ms each, every ECL) from one long wait per frame (a context wait the
+/// admission event sat behind, e.g. a swap-chain buffer DWM has not released).
+const ECL_WAIT_BUCKETS_US: [u64; 6] = [50, 200, 1000, 2000, 5000, 20000];
+
+impl EclWaitStats {
+    fn record(&self, elapsed: Duration, polled: bool) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let total = self.total_ns.fetch_add(ns, Ordering::Relaxed).saturating_add(ns);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        let us = ns / 1000;
+        let bucket = ECL_WAIT_BUCKETS_US
+            .iter()
+            .position(|&bound| us < bound)
+            .unwrap_or(ECL_WAIT_BUCKETS_US.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        let polled_n = if polled {
+            NVK_REFUSALS.cpu_wait_polled.bump();
+            self.polled.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            NVK_REFUSALS.cpu_wait_blocked.bump();
+            self.polled.load(Ordering::Relaxed)
+        };
+        let n = self.waits.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % ECL_WAIT_LOG_EVERY == 0 {
+            // Window max: reset so each line says something about its own window.
+            let max = self.max_ns.swap(0, Ordering::Relaxed);
+            let b: [u64; ECL_WAIT_BUCKETS_US.len() + 1] =
+                core::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));
+            log_error!(
+                "NVK ECL CPU wait: {n} waits, avg {} us, window max {} us, polled {polled_n} \
+                 blocked {}, hist <50us {} <200us {} <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {} \
+                 (Nvk12EclSpinUs={})",
+                total / n / 1000,
+                max / 1000,
+                n - polled_n,
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                b[4],
+                b[5],
+                b[6],
+                crate::knobs12::nvk12_ecl_spin_us(),
+            );
+        }
+    }
+}
+
+static ECL_WAIT_STATS: EclWaitStats = EclWaitStats {
+    waits: AtomicU64::new(0),
+    total_ns: AtomicU64::new(0),
+    max_ns: AtomicU64::new(0),
+    polled: AtomicU64::new(0),
+    buckets: [const { AtomicU64::new(0) }; ECL_WAIT_BUCKETS_US.len() + 1],
+};
+
+/// `Nvk12EclSync=2` on this device: the knob asks for ECL fences and both the
+/// ICD (helios_icd_interface v7) and the KMD (HE12 v4 RM fences) serve them.
+/// Without them every batch takes the CPU-wait arm, said once.
+pub(crate) fn ecl_fences_wanted(dev: &device12::HeliosD3D12Device) -> bool {
+    if crate::knobs12::nvk12_ecl_sync() != 2 {
+        return false;
+    }
+    let served = dev.engine.nvk_ecl_fences();
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        if served {
+            log_error!("NVK ECL sync: ECL fences (Nvk12EclSync=2, HE12 v4 records; CPU wait only as fallback)");
+        } else {
+            note_refusal(&NVK_REFUSALS.ecl_fence_not_served);
+            log_error!(
+                "NVK ECL sync: Nvk12EclSync=2 but the ICD or the KMD serves no ECL fences \
+                 (helios_icd_interface < 7, or no HELIOS_ICD_CAP_PRESENT_FENCE_KMD); CPU wait"
+            );
+        }
+    }
+    served
+}
+
+/// What became of one batch's ECL fence (`queue::nvk_complete_fenced`).
+pub(crate) enum EclFenceOutcome {
+    /// The HE12 v4 packet went in; the KMD owns the fence.
+    Submitted,
+    /// The engine made no fence for the batch (CPU-wait fallback).
+    NoFence,
+    /// No packet could be made (CPU-wait fallback; fence closed).
+    Unavailable,
+}
+
+pub(crate) fn note_ecl_fence(outcome: EclFenceOutcome) {
+    match outcome {
+        EclFenceOutcome::Submitted => NVK_REFUSALS.ecl_fence_submitted.bump(),
+        EclFenceOutcome::NoFence => note_refusal(&NVK_REFUSALS.ecl_fence_none),
+        EclFenceOutcome::Unavailable => note_refusal(&NVK_REFUSALS.ecl_fence_unavailable),
+    }
+}
+
+/// The KMD refused an HE12 v4 Render (e.g. its process gate is full: `RmGRef`).
+pub(crate) fn note_ecl_fence_refused(hr: ddi12::HRESULT) {
+    note_refusal(&NVK_REFUSALS.ecl_fence_refused);
+    if let Some(k) = NVK_LOG.first_n_then_every(16, 4096) {
+        log_error!(
+            "NVK ECL fence: HE12 v4 Render refused hr={:#010x}; this batch waits on the CPU (x{})",
+            hr as u32,
+            k + 1
+        );
+    }
+}
+
+/// Close an ECL fence this process still owns (no Render took it).
+pub(crate) fn close_unused_fence(dev: &device12::HeliosD3D12Device, fence: crate::bridge12::EclFence) {
+    NVK_REFUSALS.ecl_fence_closed.bump();
+    dev.engine.nvk_rm_fence_close(fence.handle);
+}
+
+/// The engine's ECL fence counters as one line (mode 2 only).
+fn log_ecl_fence_stats() {
+    if crate::knobs12::nvk12_ecl_sync() != 2 {
+        return;
+    }
+    let st = crate::bridge12::ecl_fence_stats();
+    let signals = st[0];
+    log_error!(
+        "NVK ECL fences: submitted {} no-fence {} refused {} unavailable {} closed {}; engine: \
+         reserved {} made {} create-failed {} signalled {} signal-failed {}; commit-to-signal avg {} us \
+         max {} us, hist <50us {} <200us {} <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {}",
+        NVK_REFUSALS.ecl_fence_submitted.get(),
+        NVK_REFUSALS.ecl_fence_none.get(),
+        NVK_REFUSALS.ecl_fence_refused.get(),
+        NVK_REFUSALS.ecl_fence_unavailable.get(),
+        NVK_REFUSALS.ecl_fence_closed.get(),
+        st[4],
+        st[5],
+        st[6],
+        signals,
+        st[3],
+        if signals != 0 { st[1] / signals } else { 0 },
+        st[2],
+        st[7],
+        st[8],
+        st[9],
+        st[10],
+        st[11],
+        st[12],
+        st[13],
+    );
+}
+
+/// Where vkd3d's memory lives, one line per Vulkan memory type it used
+/// (`bridge12::memory_stats`).
+fn log_memory_placement() {
+    let Some(st) = crate::bridge12::memory_stats() else {
+        return;
+    };
+    const TYPES: usize = 32;
+    const CLASSES: [&str; 5] = ["DEFAULT", "UPLOAD", "READBACK", "HVV", "other"];
+    let mib = |b: u64| b / (1024 * 1024);
+    for t in 0..TYPES {
+        let info = st[TYPES + 2 * CLASSES.len() * TYPES + t];
+        if info >> 63 == 0 {
+            continue;
+        }
+        let mut classes = String::new();
+        for (c, name) in CLASSES.iter().enumerate() {
+            let bytes = st[TYPES + c * TYPES + t];
+            let count = st[TYPES + CLASSES.len() * TYPES + c * TYPES + t];
+            if count != 0 {
+                classes.push_str(&format!(" {name} {} MiB ({count})", mib(bytes)));
+            }
+        }
+        log_error!(
+            "vkd3d memory type {t} (heap {}, flags {:#x}): live {} MiB; allocated by request:{classes}",
+            (info >> 32) & 0x7fff_ffff,
+            info & 0xffff_ffff,
+            mib(st[t]),
+        );
+    }
+    log_error!(
+        "vkd3d memory: {} DEVICE_LOCAL requests got a type without DEVICE_LOCAL",
+        st[crate::bridge12::MEMORY_STATS_LEN - 1]
+    );
+}
+
+/// Frames per frame-accounting line.
+const FRAME_LOG_EVERY: u64 = 256;
+
+/// Per-frame accounting of the D3D12 thread time this driver owns, so the
+/// frame splits into "inside our DDIs" and "everything else" without a
+/// profiler. A frame is present-to-present; the other sums accumulate between
+/// presents. All D3D12 queues and recording threads of the process share one
+/// set.
+///
+/// * ECL / CPU wait / Present: wall time inside those DDIs.
+/// * Recording: Reset-to-Close spans of command lists, summed over every list
+///   and thread (the app's own work between its recording calls included; on
+///   several threads it can exceed the frame).
+/// * Draws / barriers: wall time inside the draw and ResourceBarrier DDIs, i.e.
+///   vkd3d and NVK recording work the app waits for on its recording thread.
+///
+/// What none of these cover (the frame minus ECL and Present on the presenting
+/// thread, less what recording explains) is the app's own work or its waits
+/// (ID3D12Fence completion, which never enters this driver).
+pub(crate) struct FrameStats {
+    ecl_ns: AtomicU64,
+    ecl_calls: AtomicU64,
+    wait_ns: AtomicU64,
+    record_ns: AtomicU64,
+    record_lists: AtomicU64,
+    draw_ns: AtomicU64,
+    draws: AtomicU64,
+    barrier_ns: AtomicU64,
+    barriers: AtomicU64,
+    acc: Mutex<FrameAcc>,
+}
+
+/// Window sums (ns) and counts; `total` keeps the process totals.
+#[derive(Clone, Copy)]
+struct FrameSums {
+    frames: u64,
+    frame_ns: u64,
+    ecl_ns: u64,
+    ecl_calls: u64,
+    wait_ns: u64,
+    present_ns: u64,
+    record_ns: u64,
+    record_lists: u64,
+    draw_ns: u64,
+    draws: u64,
+    barrier_ns: u64,
+    barriers: u64,
+}
+
+impl FrameSums {
+    const ZERO: Self = Self {
+        frames: 0,
+        frame_ns: 0,
+        ecl_ns: 0,
+        ecl_calls: 0,
+        wait_ns: 0,
+        present_ns: 0,
+        record_ns: 0,
+        record_lists: 0,
+        draw_ns: 0,
+        draws: 0,
+        barrier_ns: 0,
+        barriers: 0,
+    };
+
+    fn add(&mut self, o: &Self) {
+        self.frames += o.frames;
+        self.frame_ns += o.frame_ns;
+        self.ecl_ns += o.ecl_ns;
+        self.ecl_calls += o.ecl_calls;
+        self.wait_ns += o.wait_ns;
+        self.present_ns += o.present_ns;
+        self.record_ns += o.record_ns;
+        self.record_lists += o.record_lists;
+        self.draw_ns += o.draw_ns;
+        self.draws += o.draws;
+        self.barrier_ns += o.barrier_ns;
+        self.barriers += o.barriers;
+    }
+
+    fn log(&self, what: &str) {
+        let f = self.frames.max(1);
+        let per = |ns: u64| ns / f / 1000;
+        let other = self.frame_ns.saturating_sub(self.ecl_ns + self.present_ns);
+        log_error!(
+            "D3D12 frame time ({what}, {} frames): frame {} us = ECL {} us ({} calls, of which \
+             CPU wait {} us) + Present {} us + outside the driver's queue DDIs {} us; recording \
+             {} us in {} lists (Reset to Close, all threads), of which draws {} us ({}) and \
+             barriers {} us ({})",
+            self.frames,
+            per(self.frame_ns),
+            per(self.ecl_ns),
+            self.ecl_calls / f,
+            per(self.wait_ns),
+            per(self.present_ns),
+            per(other),
+            per(self.record_ns),
+            self.record_lists / f,
+            per(self.draw_ns),
+            self.draws / f,
+            per(self.barrier_ns),
+            self.barriers / f,
+        );
+    }
+}
+
+struct FrameAcc {
+    last_present_end: Option<Instant>,
+    window: FrameSums,
+    total: FrameSums,
+}
+
+fn ns_of(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+std::thread_local! {
+    /// Command lists this thread is recording, with their Reset time.
+    static OPEN_LISTS: std::cell::RefCell<Vec<(usize, Instant)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl FrameStats {
+    pub(crate) fn note_ecl(&self, elapsed: Duration) {
+        self.ecl_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+        self.ecl_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_wait(&self, elapsed: Duration) {
+        self.wait_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+    }
+
+    /// A command list starts recording on this thread (`pfnResetCommandList`,
+    /// and the first recording after `pfnCreateCommandList`).
+    pub(crate) fn note_reset(&self, list: usize) {
+        let now = Instant::now();
+        OPEN_LISTS.with(|open| {
+            let mut open = open.borrow_mut();
+            if let Some(slot) = open.iter_mut().find(|(l, _)| *l == list) {
+                slot.1 = now;
+            } else if open.len() < 64 {
+                open.push((list, now));
+            }
+        });
+    }
+
+    /// A command list closes (`pfnCloseCommandList`).
+    pub(crate) fn note_close(&self, list: usize) {
+        let span = OPEN_LISTS.with(|open| {
+            let mut open = open.borrow_mut();
+            let i = open.iter().position(|(l, _)| *l == list)?;
+            Some(open.swap_remove(i).1.elapsed())
+        });
+        if let Some(span) = span {
+            self.record_ns.fetch_add(ns_of(span), Ordering::Relaxed);
+            self.record_lists.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn note_draw(&self, elapsed: Duration) {
+        self.draw_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+        self.draws.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_barrier(&self, elapsed: Duration) {
+        self.barrier_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+        self.barriers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Close a frame: `started` is the Present DDI's entry.
+    pub(crate) fn note_present(&self, started: Instant) {
+        let now = Instant::now();
+        let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+        let mut frame = FrameSums {
+            frames: 1,
+            frame_ns: 0,
+            ecl_ns: take(&self.ecl_ns),
+            ecl_calls: take(&self.ecl_calls),
+            wait_ns: take(&self.wait_ns),
+            present_ns: ns_of(now - started),
+            record_ns: take(&self.record_ns),
+            record_lists: take(&self.record_lists),
+            draw_ns: take(&self.draw_ns),
+            draws: take(&self.draws),
+            barrier_ns: take(&self.barrier_ns),
+            barriers: take(&self.barriers),
+        };
+        let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(last) = acc.last_present_end.replace(now) else {
+            return; // the first present only opens a frame
+        };
+        frame.frame_ns = ns_of(now - last);
+        acc.window.add(&frame);
+        acc.total.add(&frame);
+        if acc.window.frames < FRAME_LOG_EVERY && acc.total.frames != 1 {
+            return;
+        }
+        let window = acc.window;
+        acc.window = FrameSums::ZERO;
+        let total_frames = acc.total.frames;
+        drop(acc);
+        window.log(&format!("last frames, {total_frames} so far"));
+        log_ecl_fence_stats();
+        // After the first frame and every 2048 frames: placement barely moves.
+        if total_frames == 1 || total_frames % (8 * FRAME_LOG_EVERY) == 0 {
+            log_memory_placement();
+        }
+    }
+
+    /// The process totals, at device teardown.
+    pub(crate) fn log_totals(&self) {
+        let total = self.acc.lock().unwrap_or_else(|p| p.into_inner()).total;
+        if total.frames != 0 {
+            total.log("totals");
+            log_ecl_fence_stats();
+            log_memory_placement();
+        }
+    }
+}
+
+pub(crate) static FRAME_STATS: FrameStats = FrameStats {
+    ecl_ns: AtomicU64::new(0),
+    ecl_calls: AtomicU64::new(0),
+    wait_ns: AtomicU64::new(0),
+    record_ns: AtomicU64::new(0),
+    record_lists: AtomicU64::new(0),
+    draw_ns: AtomicU64::new(0),
+    draws: AtomicU64::new(0),
+    barrier_ns: AtomicU64::new(0),
+    barriers: AtomicU64::new(0),
+    acc: Mutex::new(FrameAcc {
+        last_present_end: None,
+        window: FrameSums::ZERO,
+        total: FrameSums::ZERO,
+    }),
+};
+
 /// The worker's wait slice: it rechecks its stop flag this often.
 const WORKER_SLICE_NS: u64 = 100_000_000;
 
@@ -102,9 +586,12 @@ impl NvkSync {
     /// `dev` is the live device of the queue whose engine queue `engine_queue`
     /// is; the engine queue outlives this value (the queue drops it first).
     pub(crate) unsafe fn new(dev: &device12::HeliosD3D12Device, engine_queue: usize) -> Self {
-        if crate::knobs12::nvk12_ecl_sync() != 0 {
+        let mode = crate::knobs12::nvk12_ecl_sync();
+        if mode != 0 {
+            // Mode 2 orders batches with ECL fences (`nvk_complete_fenced`);
+            // this arm is its fallback for a batch that got none.
             note_refusal(&NVK_REFUSALS.cpu_wait_arm);
-            log_error!("NVK ECL sync: CPU wait (Nvk12EclSync=1)");
+            log_error!("NVK ECL sync: CPU wait arm (Nvk12EclSync={mode})");
             return Self { fence: None };
         }
         // SAFETY: forwarded precondition.
@@ -135,9 +622,19 @@ impl NvkSync {
             // SAFETY: forwarded precondition.
             return unsafe { arm.order_context(dev, h_context, value) };
         }
-        // CPU wait.
+        // CPU wait: poll first (`Nvk12EclSpinUs`), then block.
+        let started = Instant::now();
         // SAFETY: the live engine queue.
-        match unsafe { crate::bridge12::wait_execution(engine_queue, value, CPU_WAIT_NS) } {
+        let polled = unsafe { spin_wait(engine_queue, value) };
+        let result = match polled {
+            Some(reached) => reached,
+            // SAFETY: the live engine queue.
+            None => unsafe { crate::bridge12::wait_execution(engine_queue, value, CPU_WAIT_NS) },
+        };
+        let waited = started.elapsed();
+        FRAME_STATS.note_wait(waited);
+        ECL_WAIT_STATS.record(waited, polled.is_some());
+        match result {
             Ok(true) => {
                 NVK_REFUSALS.cpu_waits.bump();
                 Ok(())
@@ -361,6 +858,10 @@ struct NvkRefusals {
     fence_create_failed: RefusalCounter,
     /// CPU waits that hit the 2 s cap. Expected zero.
     cpu_wait_timeouts: RefusalCounter,
+    /// ECL CPU waits settled by the zero-timeout poll (`Nvk12EclSpinUs`).
+    cpu_wait_polled: RefusalCounter,
+    /// ECL CPU waits that fell back to the blocking engine wait.
+    cpu_wait_blocked: RefusalCounter,
     /// The worker had exited when a value was handed to it. Expected zero.
     worker_gone: RefusalCounter,
     /// WaitForSynchronizationObjectFromGpu refused. Expected zero.
@@ -369,6 +870,18 @@ struct NvkRefusals {
     worker_engine_error: RefusalCounter,
     /// SignalSynchronizationObjectFromCpu refused. Expected zero.
     cpu_signal_failed: RefusalCounter,
+    /// Mode 2: HE12 v4 ECL packets submitted (the KMD took the fence).
+    ecl_fence_submitted: RefusalCounter,
+    /// Mode 2: batches the engine made no ECL fence for (CPU-wait fallback).
+    ecl_fence_none: RefusalCounter,
+    /// Mode 2: HE12 v4 Renders the KMD refused (CPU-wait fallback).
+    ecl_fence_refused: RefusalCounter,
+    /// Mode 2: no packet could be made (CPU-wait fallback).
+    ecl_fence_unavailable: RefusalCounter,
+    /// ECL fences closed by this driver (no Render took them).
+    ecl_fence_closed: RefusalCounter,
+    /// Mode 2 asked for, but the ICD or the KMD serves no ECL fences.
+    ecl_fence_not_served: RefusalCounter,
 }
 
 static NVK_REFUSALS: NvkRefusals = NvkRefusals {
@@ -378,10 +891,18 @@ static NVK_REFUSALS: NvkRefusals = NvkRefusals {
     cpu_wait_arm: RefusalCounter::new("Nvk12CpuWaitArm"),
     fence_create_failed: RefusalCounter::new("Nvk12FenceCreateFailed"),
     cpu_wait_timeouts: RefusalCounter::new("Nvk12CpuWaitTimeouts"),
+    cpu_wait_polled: RefusalCounter::new("Nvk12CpuWaitPolled"),
+    cpu_wait_blocked: RefusalCounter::new("Nvk12CpuWaitBlocked"),
     worker_gone: RefusalCounter::new("Nvk12WorkerGone"),
     gpu_wait_failed: RefusalCounter::new("Nvk12GpuWaitFailed"),
     worker_engine_error: RefusalCounter::new("Nvk12WorkerEngineError"),
     cpu_signal_failed: RefusalCounter::new("Nvk12CpuSignalFailed"),
+    ecl_fence_submitted: RefusalCounter::new("Nvk12EclFenceSubmitted"),
+    ecl_fence_none: RefusalCounter::new("Nvk12EclFenceNone"),
+    ecl_fence_refused: RefusalCounter::new("Nvk12EclFenceRefused"),
+    ecl_fence_unavailable: RefusalCounter::new("Nvk12EclFenceUnavailable"),
+    ecl_fence_closed: RefusalCounter::new("Nvk12EclFenceClosed"),
+    ecl_fence_not_served: RefusalCounter::new("Nvk12EclFenceNotServed"),
 };
 
 pub(crate) static REFUSALS: &[&RefusalCounter] = &[
@@ -391,8 +912,16 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &NVK_REFUSALS.cpu_wait_arm,
     &NVK_REFUSALS.fence_create_failed,
     &NVK_REFUSALS.cpu_wait_timeouts,
+    &NVK_REFUSALS.cpu_wait_polled,
+    &NVK_REFUSALS.cpu_wait_blocked,
     &NVK_REFUSALS.worker_gone,
     &NVK_REFUSALS.gpu_wait_failed,
     &NVK_REFUSALS.worker_engine_error,
     &NVK_REFUSALS.cpu_signal_failed,
+    &NVK_REFUSALS.ecl_fence_submitted,
+    &NVK_REFUSALS.ecl_fence_none,
+    &NVK_REFUSALS.ecl_fence_refused,
+    &NVK_REFUSALS.ecl_fence_unavailable,
+    &NVK_REFUSALS.ecl_fence_closed,
+    &NVK_REFUSALS.ecl_fence_not_served,
 ];
