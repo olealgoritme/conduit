@@ -2414,7 +2414,11 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_position(
         if position.is_null() {
             return STATUS_SUCCESS;
         }
-        crate::ddi::hw_cursor::note_ddi_position();
+        crate::ddi::hw_cursor::note_ddi_position(
+            // SAFETY: non-null, dxgkrnl's argument for this call; `Value` is the whole word.
+            unsafe { (*position).Flags.__bindgen_anon_1.Value } & 1 != 0,
+            unsafe { (*position).VidPnSourceId },
+        );
         // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
         // valid for the call, at PASSIVE.
         unsafe {
