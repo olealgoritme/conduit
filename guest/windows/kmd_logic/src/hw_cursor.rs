@@ -43,6 +43,21 @@ pub const POINTER_CAPS: u32 = FLAG_MONOCHROME | FLAG_COLOR | FLAG_MASKED_COLOR;
 /// experiments (docs/independent-flip.md 12.3b).
 pub const KNOB_DEFAULT: u32 = KNOB_OFF;
 
+/// `HwCursor` when the value is absent, given the raw `IndepFlip` value: [`KNOB_ON`] when
+/// independent flip is advertised, else [`KNOB_DEFAULT`]. 405.8 rows (CS2 fullscreen, promoted
+/// to independent flip): with no pointer reported the first independent-flip present never
+/// completed (one frame, then frozen); with `HwCursor=1` the same run reached "Hardware:
+/// Independent Flip" at 37.8 fps against 32.8 composed. Without independent flip the composed
+/// desktop keeps 0, where reporting the pointer cost Heaven ten times the hitches. An explicit
+/// `HwCursor` value always wins.
+pub const fn knob_default_for(indep_flip_raw: u32) -> u32 {
+    if indep_flip_raw != 0 {
+        KNOB_ON
+    } else {
+        KNOB_DEFAULT
+    }
+}
+
 /// `HwCursor` values.
 pub const KNOB_OFF: u32 = 0;
 pub const KNOB_ON: u32 = 1;
@@ -457,6 +472,14 @@ mod tests {
         assert!(
             !advertise(KNOB_DEFAULT, true, Some(host)),
             "absent: no pointer reported"
+        );
+        assert!(
+            advertise(knob_default_for(1), true, Some(host)),
+            "absent with independent flip: the pointer is reported"
+        );
+        assert!(
+            !advertise(knob_default_for(0), true, Some(host)),
+            "absent without independent flip: no pointer"
         );
         assert!(!advertise(KNOB_OFF, true, Some(host)));
         assert!(
