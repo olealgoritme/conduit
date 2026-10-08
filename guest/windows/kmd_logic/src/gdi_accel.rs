@@ -763,6 +763,33 @@ pub struct Surface {
     /// `DXGK_GDIARG_BITBLT` remarks).
     pub pitch: u32,
     pub class: SurfaceClass,
+    /// The allocation's D3DDDIFORMAT (0 unknown): picks the byte order of a copy ([`order_of`]).
+    pub format: u32,
+}
+
+/// The byte order of a 32 bpp GDI surface format: `Some(false)` B G R A|X (`A8R8G8B8` 21,
+/// `X8R8G8B8` 22), `Some(true)` R G B A|X (`A8B8G8R8` 32, `X8B8G8R8` 33), `None` for anything else
+/// (unknown, or not 32 bpp: treated as the GDI default B G R A).
+pub const fn order_of(d3dddi_format: u32) -> Option<bool> {
+    match d3dddi_format {
+        21 | 22 => Some(false),
+        32 | 33 => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether a copy from `src` to `dst` exchanges bytes 0 and 2 (one R G B, the other B G R). An
+/// unknown format counts as B G R A, the format of every CDD surface.
+pub const fn swaps_rb(src: &Surface, dst: &Surface) -> bool {
+    let s = match order_of(src.format) {
+        Some(v) => v,
+        None => false,
+    };
+    let d = match order_of(dst.format) {
+        Some(v) => v,
+        None => false,
+    };
+    s != d
 }
 
 /// Where a surface's authoritative bytes are, as far as GDI acceleration can reach them.
@@ -957,8 +984,8 @@ pub struct CeView {
     pub height: u32,
 }
 
-/// One copied rectangle `src_r` of `src` to the same-sized rectangle at `dst_r` of `dst` (a byte
-/// copy: GDI surfaces are all 32 bpp BGRA/BGRX).
+/// One copied rectangle `src_r` of `src` to the same-sized rectangle at `dst_r` of `dst` (32 bpp;
+/// `swap_rb` exchanges bytes 0 and 2, for an R G B surface on one side and B G R on the other).
 pub fn copy_rect(
     p: &mut Push<'_>,
     gen: Gen,
@@ -966,6 +993,7 @@ pub fn copy_rect(
     src_r: &Rect,
     dst: &CeView,
     dst_r: &Rect,
+    swap_rb: bool,
 ) -> Result<(), PushError> {
     if src_r.width() != dst_r.width()
         || src_r.height() != dst_r.height()
@@ -995,7 +1023,7 @@ pub fn copy_rect(
             lines: src_r.height(),
             layout: cp::SurfaceLayout::Pitch,
             dst_layout: cp::SurfaceLayout::Pitch,
-            remap: cp::Remap::None,
+            remap: if swap_rb { cp::Remap::SwapRb } else { cp::Remap::None },
             stamp: None,
         },
     )
@@ -1700,7 +1728,7 @@ mod tests {
     }
 
     fn vram(id: u32) -> Surface {
-        Surface { resource_id: id, width: 1600, height: 900, pitch: 6400, class: SurfaceClass::Vram }
+        Surface { resource_id: id, width: 1600, height: 900, pitch: 6400, class: SurfaceClass::Vram, format: 21 }
     }
 
     #[test]
@@ -1767,7 +1795,7 @@ mod tests {
         let mut p = Push::new(&mut buf);
         let s = CeView { va: 0x1000_0000, pitch: 6400, width: 1600, height: 900 };
         let d = CeView { va: 0x2000_0000, pitch: 8192, width: 2048, height: 1080 };
-        copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(1, 2, 11, 22), &d, &Rect::new(100, 200, 110, 220)).unwrap();
+        copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(1, 2, 11, 22), &d, &Rect::new(100, 200, 110, 220), false).unwrap();
         let w = p.words();
         assert_eq!(w.len(), COPY_RECT_DWORDS);
         let sva = 0x1000_0000u64 + 2 * 6400 + 4;
@@ -1775,8 +1803,16 @@ mod tests {
         assert_eq!(&w[1..9], &[0, sva as u32, 0, dva as u32, 6400, 8192, 40, 20]);
         let mut buf = [0u32; 64];
         let mut p = Push::new(&mut buf);
-        assert_eq!(copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(0, 0, 10, 10), &d, &Rect::new(0, 0, 10, 11)), Err(PushError::Shape));
-        assert_eq!(copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(1595, 0, 1605, 10), &d, &Rect::new(0, 0, 10, 10)), Err(PushError::Shape));
+        assert_eq!(copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(0, 0, 10, 10), &d, &Rect::new(0, 0, 10, 11), false), Err(PushError::Shape));
+        assert_eq!(copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(1595, 0, 1605, 10), &d, &Rect::new(0, 0, 10, 10), false), Err(PushError::Shape));
+        // An R/B exchange programs the remap (components word, LAUNCH_DMA REMAP_ENABLE).
+        let mut buf = [0u32; 64];
+        let mut p = Push::new(&mut buf);
+        copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(0, 0, 4, 4), &d, &Rect::new(0, 0, 4, 4), true).unwrap();
+        assert!(p.words().contains(&cp::SWAP_RB_COMPONENTS));
+        let a = Surface { format: 32, ..vram(1) };
+        let b = vram(2);
+        assert!(swaps_rb(&a, &b) && !swaps_rb(&b, &b) && !swaps_rb(&Surface { format: 0, ..b }, &b));
         assert_eq!(rects_per_push(128, FILL_STATE_DWORDS, FILL_RECT_DWORDS), 10);
         assert_eq!(rects_per_push(128, 0, COPY_RECT_DWORDS), 11);
     }

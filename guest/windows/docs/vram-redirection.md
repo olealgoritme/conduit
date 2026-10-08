@@ -471,6 +471,10 @@ pages it uses the OS descriptor over the leases as before. The level 5 counters 
 its staging buffer in segment 2 (served by its RM object, `RvSysObj`). 2 of 6 staging creations fell
 back to Venus with `RmSysWhy` 10 (Extent): the level 5 layout used the scanout's 64-pixel minimum.
 Fixed: a staging buffer uses `rm_sysmem::layout_standard` (the foreign record's 1..=16384).
+362.1: the extent refusals are gone; 2 of 6 still fell back with `RmSysWhy` 9 (Format): GDI staging
+buffers whose D3DDDIFORMAT has no DXGI name (or is `A8B8G8R8`) carry the legacy zero hint. Their pitch
+is authored as `width * 4` regardless, so `layout_standard` now records them as `XRGB8888` bytes
+(nothing imports a staging buffer as an image; the copy engine copies bytes).
 
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
