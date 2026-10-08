@@ -54,6 +54,8 @@ static CTX_FLAGS: AtomicU32 = AtomicU32::new(0);
 static SUB_N: AtomicU32 = AtomicU32::new(0);
 /// Unreachable surfaces resolved, the last one's identity word and extent.
 static UNR_N: AtomicU32 = AtomicU32::new(0);
+/// Foreign NVK images resolved (copy-engine sources).
+static FGN_N: AtomicU32 = AtomicU32::new(0);
 static UNR_K: AtomicU32 = AtomicU32::new(0);
 static UNR_WH: AtomicU32 = AtomicU32::new(0);
 static PRV_OK: AtomicU32 = AtomicU32::new(0);
@@ -121,7 +123,7 @@ pub(crate) fn note_start(knobs: &crate::adapter::AdapterKnobs) {
     let caps = caps_of(knobs);
     for c in [
         &CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN, &SUB_N,
-        &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD, &UNR_N, &UNR_K, &UNR_WH,
+        &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD, &UNR_N, &UNR_K, &UNR_WH, &FGN_N,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -168,6 +170,7 @@ pub(crate) fn publish_counters() {
     w(b"GdiUnrN", UNR_N.load(Ordering::Relaxed));
     w(b"GdiUnrK", UNR_K.load(Ordering::Relaxed));
     w(b"GdiUnrWH", UNR_WH.load(Ordering::Relaxed));
+    w(b"GdiFgnN", FGN_N.load(Ordering::Relaxed));
     crate::ddi::gdi_exec::publish_counters();
 }
 
@@ -241,6 +244,10 @@ unsafe fn surface_at(
         // A KMD standard buffer (staging, shadow, lookup table): its authoritative CPU view is
         // reachable whether VidMm holds it in system pages or in the Venus window.
         SurfaceClass::System
+    } else if info.foreign.is_some() && info.foreign_identity {
+        // A UMD-created NVK image with an RM identity: a copy-engine source (`ce_vram::foreign_source`).
+        FGN_N.fetch_add(1, Ordering::Relaxed);
+        SurfaceClass::Foreign
     } else {
         // Census of what is unreachable: storage << 24 | kind << 16 | foreign layout << 8 |
         // foreign identity << 9 | direct scanout << 10 (`GdiUnrK`), its extent (`GdiUnrWH`).

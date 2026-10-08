@@ -814,6 +814,10 @@ pub enum SurfaceClass {
     System,
     /// Neither (a Venus image, an allocation VidMm holds in the Venus window, an unknown handle).
     Unreachable,
+    /// A UMD-created NVK image with a foreign (RM) identity: a copy-engine SOURCE only
+    /// (`ce_vram::foreign_source`, the producer's record or an import by resource id), for a
+    /// SRCCOPY BitBlt into VRAM or a staging buffer. Anything else on it is dropped.
+    Foreign,
 }
 
 /// Which engine executes a command.
@@ -889,6 +893,17 @@ pub fn plan(cmd: &Cmd, dst: Option<&Surface>, srcs: [Option<&Surface>; 2]) -> (E
     let all = [Some(dst), srcs[0], srcs[1]];
     if all.iter().flatten().any(|s| s.class == SurfaceClass::Unreachable) {
         return (Engine::Drop, Some(Why::Unreachable));
+    }
+    if all.iter().flatten().any(|s| s.class == SurfaceClass::Foreign) {
+        // Only a plain copy FROM the foreign image into a surface the executor writes.
+        let copy_from = matches!(*cmd, Cmd::BitBlt { rop, .. } if rop == rop::SRCCOPY)
+            && srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign)
+            && dst.class != SurfaceClass::Foreign;
+        return match (copy_from, dst.class) {
+            (true, SurfaceClass::Vram) => (Engine::Ce, None),
+            (true, _) => (Engine::Cpu, Some(Why::SystemSurface)),
+            (false, _) => (Engine::Drop, Some(Why::Unreachable)),
+        };
     }
     let all_vram = all.iter().flatten().all(|s| s.class == SurfaceClass::Vram);
     let ce_shape = match *cmd {
@@ -1509,6 +1524,13 @@ pub const COUNTERS: &[&str] = &[
     "GdiChUpUs",
     "GdiSlowUs",
     "GdiSlowOp",
+    // Foreign NVK images resolved; copies from them done on the copy engine; refused or failed
+    // (the last reason: 1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view
+    // refused, 6 channel down, 7 memory, 8 destination class).
+    "GdiFgnN",
+    "GdiFgnCe",
+    "GdiFgnFail",
+    "GdiFgnWhy",
 ];
 
 #[cfg(test)]
@@ -1777,6 +1799,12 @@ mod tests {
         assert_eq!(plan(&cf(cfrop::PATCOPY), Some(&sys), [None, None]), (Engine::Cpu, Some(Why::SystemSurface)));
         assert_eq!(plan(&cf(cfrop::DSTINVERT), Some(&a), [None, None]), (Engine::Cpu, Some(Why::Rop)));
         assert_eq!(plan(&Cmd::Escape, None, [None, None]), (Engine::Drop, None));
+        // A foreign NVK image: only a SRCCOPY source.
+        let fg = Surface { class: SurfaceClass::Foreign, ..vram(5) };
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Ce, None));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&sys), [Some(&fg), None]), (Engine::Cpu, Some(Why::SystemSurface)));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&b), None]), (Engine::Drop, Some(Why::Unreachable)));
+        assert_eq!(plan(&bb(rop::SRCOR, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Drop, Some(Why::Unreachable)));
     }
 
     #[test]
