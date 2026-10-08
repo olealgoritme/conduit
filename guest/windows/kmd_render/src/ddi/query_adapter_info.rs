@@ -429,39 +429,42 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // exhaust: `arm_dma_flip_programming` publishes into ONE coalescing pending
     // slot (`VpCoal`/`DEFERRED_REPLACED`) whose newest entry wins, and it already
     // coalesces the large majority of flips at depth 1.
+    //
+    // `FlipDoneHost` (`ddi::host_flip_done`) raises the default to 2: with flips retiring when the
+    // host really showed them (up to a period later than the timer would), a depth of 1 would
+    // stall the application behind every host present. An explicit `FlipQueueN` still wins.
     const FLIP_QUEUE_DEPTH_DEFAULT: u32 = 1;
+    const FLIP_QUEUE_DEPTH_FLIP_DONE_HOST: u32 = 2;
     /// Bound on the advertised depth. Not a WDK limit — a guard so a mistyped
     /// service value cannot ask dxgkrnl to queue an absurd number of flips.
     const FLIP_QUEUE_DEPTH_MAX: u32 = 16;
     let max_queued_flip_on_vsync: UINT = crate::diag::read_config_dword(
         crate::diag::knobs::FLIP_QUEUE_DEPTH,
-        FLIP_QUEUE_DEPTH_DEFAULT,
+        if helios_kmd_logic::host_flip_done::Mode::from_knob(knobs.flip_done).is_on() {
+            FLIP_QUEUE_DEPTH_FLIP_DONE_HOST
+        } else {
+            FLIP_QUEUE_DEPTH_DEFAULT
+        },
     )
     .clamp(1, FLIP_QUEUE_DEPTH_MAX);
     out.set(caps_offset!(MaxQueuedFlipOnVSync), max_queued_flip_on_vsync);
     // Same reason as `FlipCapV`: what was ADVERTISED, so a knob that read as its
     // default cannot be mistaken for a knob that had no effect.
     crate::diag::record_named_bytes(b"FlipQueV", max_queued_flip_on_vsync);
-    // DIRECT-FLIP DENIAL (27th session, 2026-07-07): SupportDirectFlip=1 was an
-    // unbacked bring-up advertisement (no bisect ever showed it load-mandatory —
-    // the STEP-0 bisect above proved only FlipOnVSyncMmIo). On this adapter it is
-    // a LIE: Helios has zero scanout (all VidPn DDIs NOT_SUPPORTED; the display
-    // is an IddCx driver capturing dwm's COMPOSED output), so a dwm direct/
-    // independent-flip promotion of an eligible visual (flip-model + IGNORE-alpha
-    // + unoccluded — exactly the dcomp vehicle chain) makes dwm STOP COMPOSING it
-    // while every fence stays green: the owner-reproduced two-stale-frame
-    // alternation + old-frames-flashing stutter, cured by any dirty-region
-    // recompose (the taskbar clock's minute repaint = the hands-off ~60 s
-    // recovery). The UMD already denies CheckDirectFlipSupport unconditionally;
-    // this makes the KMD agree. Display-less-adapter guidance
-    // (mcdm-implementation-guidelines.md) requires 0 here. `DirectFlipCaps`
-    // service knob (default 0) restores the legacy advertisement for A/B via
-    // reg add + devcon restart; value lands in the 0x01D7 diag record bit 2.
-    // STALE PREMISE, corrected for independent flip (docs/independent-flip.md 2.7):
-    // the adapter now has a display half, a flip path and a host scan-out, so a
-    // promoted window IS shown. `IndepFlip` (default 0) advertises this cap, the
-    // aperture DirectFlip flag and FlipIndependent|DdiPresentForIFlip together;
-    // `knobs.direct_flip` already carries it (AdapterKnobs::read).
+    // `SupportDirectFlip`: whether DWM may flip an application's swap-chain buffer to the
+    // screen instead of composing it (Direct Flip, and with `FlipIndependent |
+    // DdiPresentForIFlip` in the flip caps, independent flip: docs/independent-flip.md).
+    // The adapter has a display half: a promoted application's buffer is scanned out by the
+    // same flip arms DWM's chain takes (`ForeignFlip` for an NVK buffer, the Venus direct
+    // bind for a `pPrimaryDesc` one), and the KMD completes every flip it is given, shown or
+    // kept. It stays 0 by default only because promotion is opt-in while it is measured:
+    // `IndepFlip` (the whole set: this cap, the aperture segment's `DirectFlip` flag and the
+    // two flip-caps bits) or `DirectFlipCaps` (this cap and the segment flag alone, the
+    // older A/B lever) set it; `knobs.direct_flip` carries the result (AdapterKnobs::read),
+    // so the caps and the segment descriptors cannot disagree. The UMD's
+    // `CheckDirectFlipSupport` (knob `DirectFlipSupport`) is the third door. The value
+    // lands in the 0x01D7 diag record bit 2. (The old denial here dated from when the
+    // display was an IddCx capture and the KMD scanned out nothing; that premise is gone.)
     let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
     let nb_asymetric_processing_nodes: UINT = 1;

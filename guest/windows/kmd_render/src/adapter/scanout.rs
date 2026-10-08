@@ -204,6 +204,9 @@ impl AdapterContext {
     /// `helios_kmd_logic::flip_completion::decide` and counts through `ddi::flip_keep`.
     pub(crate) fn publish_kept_primary(&self, address: u64) {
         self.publish_displayed_primary(super::ProgrammedPrimary::kept_picture(address));
+        // `FlipDoneHost`: the host is never told about a kept picture, so its vsync is not held
+        // for a report.
+        crate::ddi::host_flip_done::note_kept(address);
     }
 
     /// `FlipAnnounce`: publish a flip's address AT `SetVidPnSourceAddress` (DIRQL), before the
