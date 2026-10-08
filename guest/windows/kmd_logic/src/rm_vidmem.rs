@@ -52,6 +52,9 @@ pub mod off {
     pub const SYSMEM: u32 = 0x10;
     /// GDI staging buffers stay Venus blobs (no RM system memory, `sysmem::try_create_standard`).
     pub const STAGING_RM: u32 = 0x40;
+    /// GDI lookup tables (`D3DKMDT_GDISURFACE_LOOKUPTABLE`) stay Venus blobs; the staging
+    /// buffers still come from RM system memory unless `STAGING_RM` is set too.
+    pub const LUT_RM: u32 = 0x400;
     /// The Present hook (`ddi/vram_redirect.rs`) skips every Blt with a VRAM surface (counted).
     pub const PRESENT_HOOK: u32 = 0x80;
     /// OPT-IN: the CPU helpers reuse blob views (`build_paging_buffer`). Off by default since 364.1:
@@ -62,6 +65,21 @@ pub mod off {
     /// Off by default since 364.1 (a record's semaphore value is not guaranteed to be released
     /// again, e.g. a recreated swap chain, and an acquire that never releases holds the channel).
     pub const FOREIGN_ACQUIRE_ON: u32 = 0x100;
+}
+
+/// Whether a KMD standard allocation is made from RM system memory (`sysmem::try_create_standard`)
+/// rather than a Venus blob: a CPU-visible GDI staging buffer, and the GDI lookup table CDD uploads
+/// from one (the ClearType gamma table): 370.1 `GdiSysCpuT` 0x00440142, a STAGING_CPUVISIBLE to
+/// LOOKUPTABLE copy that `with_standard_pair` refused because the table was a Venus blob, so it ran
+/// on the CPU (10-17 ms). Neither is ever opened by a UMD (DWM composes the GDI TEXTURE). Both keep
+/// the authored pitch, `cross_adapter_pitch(width)` whatever the format, which is the RM layout's.
+/// `off` is the `RvOff` mask.
+pub const fn rm_backed_standard(std_type: u32, gdi_type: u32, primary: bool, off: u32) -> bool {
+    use crate::rm_standard::{GDI_LOOKUPTABLE, GDI_STAGING_CPUVISIBLE, STD_GDISURFACE};
+    if primary || std_type != STD_GDISURFACE || off & off::STAGING_RM != 0 {
+        return false;
+    }
+    gdi_type == GDI_STAGING_CPUVISIBLE || (gdi_type == GDI_LOOKUPTABLE && off & off::LUT_RM == 0)
 }
 
 /// The knob as read from the service key: anything but 1 is off.
@@ -845,6 +863,38 @@ pub const WRITERS: [&str; 5] = [
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staging_and_lookup_tables_are_rm_backed() {
+        use super::{off, rm_backed_standard};
+        use crate::rm_standard::*;
+        assert!(rm_backed_standard(STD_GDISURFACE, GDI_STAGING_CPUVISIBLE, false, 0));
+        assert!(rm_backed_standard(STD_GDISURFACE, GDI_LOOKUPTABLE, false, 0));
+        assert!(!rm_backed_standard(STD_GDISURFACE, GDI_LOOKUPTABLE, false, off::LUT_RM));
+        assert!(rm_backed_standard(STD_GDISURFACE, GDI_STAGING_CPUVISIBLE, false, off::LUT_RM));
+        for g in [GDI_STAGING_CPUVISIBLE, GDI_LOOKUPTABLE] {
+            assert!(!rm_backed_standard(STD_GDISURFACE, g, false, off::STAGING_RM));
+            assert!(!rm_backed_standard(STD_GDISURFACE, g, true, 0));
+        }
+        for g in [GDI_INVALID, GDI_TEXTURE, GDI_STAGING, GDI_EXISTINGSYSMEM, GDI_TEXTURE_CPUVISIBLE, 9] {
+            assert!(!rm_backed_standard(STD_GDISURFACE, g, false, 0), "gdi {g}");
+        }
+        for s in [STD_SHAREDPRIMARYSURFACE, STD_SHADOWSURFACE, STD_STAGINGSURFACE] {
+            assert!(!rm_backed_standard(s, GDI_STAGING_CPUVISIBLE, false, 0));
+            assert!(!rm_backed_standard(s, GDI_LOOKUPTABLE, false, 0));
+        }
+    }
+
+    #[test]
+    fn a_lookup_table_of_any_format_gets_the_authored_pitch() {
+        // CDD's gamma table is 8 bpp; the KMD authors every non-TEXTURE GDI surface with
+        // `cross_adapter_pitch(width)` (32 bpp), and the RM layout must equal it.
+        for dxgi in [0u32, 61, 62, 65, 87, 88] {
+            let l = crate::rm_sysmem::layout_standard(512, 16, dxgi).unwrap();
+            assert_eq!(l.pitch, crate::cross_adapter_pitch(512), "dxgi {dxgi}");
+            assert!(l.size >= u64::from(l.pitch) * 16);
+        }
+    }
+
     use super::*;
     use crate::foreign_resource::FOURCC_ARGB8888;
 
