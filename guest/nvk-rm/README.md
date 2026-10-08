@@ -73,6 +73,7 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 11 | `nvk, nvk/rm: compression for images outside dedicated allocations on GB20x` | `NVK_RM_COMPRESS_ALL=1` (default off): device-local memory that is neither host-visible nor shared nor imported is allocated COMPR_ANY (`NVKMD_MEM_COMPRESSIBLE`, `nvkmd_info::has_compressible_mem`), and a compressible image bound anywhere in it gets its own VA with the compressible GMK kind and `is_compressed`; every other mapping of such memory uses a compressible kind too. Applies after 9-10 of the build branches and without them. See "Compression outside dedicated allocations" |
 | 12 | `nvk, nvk/rm: compress separate depth/stencil images on GB20x` | `NVK_RM_COMPRESS_ZS=1` (default off while it is measured, `nvkmd_info::has_zs_compression`): combined depth/stencil formats (D24S8, D32S8X24), which Blackwell splits into separate depth and stencil planes, pass `nvk_image_can_compress`; both planes are compressed in a dedicated allocation (the memory's own VA) and in compressible memory from patch 11 (each plane's own VA). Needs 11. See "Compression outside dedicated allocations" |
 | 13 | `nvk, nvk/rm: a compressible device-local memory type for images on GB20x` | `NVK_RM_COMPRESS_TYPE=1` (default off): a second DEVICE_LOCAL type on the VRAM heap, before the plain one, whose memory is COMPR_ANY. Optimal-tiling images report it (not sparse, protected, host-transfer, external or video); buffers only when transfer-only (the clear buffers vkd3d-proton and DXVK put over image memory), never vertex, index, indirect, uniform, storage or device-address buffers. Needs 11 (and 12 for depth/stencil). See "A compressible memory type (patch 13)" |
+| 15 | `nvk, nvk/rm: compression diagnostics and a clear-on-allocate knob` | `NVK_RM_COMPRESS_CLEAR=1` writes every compressible memory once through its compressible VA at allocation (candidate fix for stale compression state); `NVK_RM_COMPRESS_UPGRADE=0` keeps uncompressed images in compressible memory on kind 0x6; `NVK_RM_COMPRESS_TYPE_SCOPE=attachments` offers patch 13's type only to images that are compressed themselves (against the spec, testing only). All inert unless set. Numbered 15: the build branches have their own 14. See "Corruption with patches 11 and 13" |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
@@ -271,6 +272,59 @@ targets are covered, render targets placed in tier-2 mixed heaps are not.
 The log tells: `memory type 0 is compressible VRAM`, then patch 11's
 counters (compressible memories and MiB, compressed image binds) against
 the patch 11 run (6 memories, 1971 MiB, 67 binds).
+
+
+### Corruption with patches 11 and 13
+
+Counter-Strike 2 (D3D11 through DXVK), driver 403.1/404.1:
+`NVK_RM_COMPRESS_ALL=1` drew a huge stretched "beam" (vertex or draw
+parameters read wrong); `NVK_RM_COMPRESS_TYPE=1` draws one agent model's
+body black while its mask, trousers and the other models are fine (a
+per-texture fault). Both default off.
+
+Candidates, from the sources:
+
+1. **Host (PBDMA) reads of compressible memory (patch 11 only).** NVK
+   feeds indirect draw and dispatch arguments, draw counts, conditional
+   rendering values and generated commands to the GPU as GPFIFO segments
+   that point into the application's buffer
+   (`nvk_cmd_buffer_push_indirect`): the PBDMA fetches them as pushbuffer
+   data. Neither NVIDIA's driver nor upstream NVK ever puts such buffers
+   in compressible memory (upstream compresses dedicated images only), and
+   nothing says the host fetch path decompresses. Indirect arguments
+   written by a culling compute shader through kind 0x8 and fetched raw
+   would give exactly garbage draws. Patch 13 keeps every buffer except
+   transfer-only ones out of compressible memory, and the beam is gone
+   with it, which fits.
+2. **Stale compression state on reused pages (11 and 13).** On GB20x RM
+   scrubs freed VRAM with copy-engine writes in physical mode
+   (`memmgrScrubRegistryOverrides_GA100` only sets
+   `bUseVasForCeMemoryOps` for SR-IOV heavy), i.e. without a PTE kind,
+   so the compression state of those pages is not reset. A new
+   compressible allocation read before it is written through kind 0x8
+   (or written partially) can then return garbage instead of zeros. NVK
+   does not clear new memory unless asked.
+3. **Sub-allocated compressed render targets or UAVs (13).** New with 13:
+   a compressed image on its own VA in a shared allocation; dedicated
+   compressed images (patch 0028, on by default) have been fine.
+4. **Uncompressed images on kind 0x8 (11 and 13).** Sampled-only
+   textures in compressible memory are mapped 0x8 with compression off in
+   their state; texture headers carry no compression field (only
+   `SECTOR_PROMOTION`), so the descriptor is not the problem, but the
+   copy-engine uploads and texture reads through 0x8 are new.
+5. **I2M (11).** `vkCmdUpdateBuffer` of up to 2012 bytes is written by
+   the 3D class's inline-to-memory DMA, which DXVK uses for small buffer
+   updates. Not ruled out, but patch 13 keeps those buffers out too.
+
+Test matrix (Counter-Strike 2, same spot; patch 15 gives the knobs):
+
+| run | settings | reading |
+|---|---|---|
+| A | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_CLEAR=1` | model fixed: stale compression state (2); keep `CLEAR` as the fix |
+| B | `NVK_RM_COMPRESS_TYPE=1 NVK_DEBUG=no_compression` | fixed: compression of sub-allocated images (3); still black: the memory or kind itself (2 or 4) |
+| C | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_TYPE_SCOPE=attachments` | fixed: something about uncompressed images in compressible memory (4) |
+| D | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_UPGRADE=0` | fixed (with C fixed too): reads or writes of those images through kind 0x8 |
+| E | `NVK_RM_COMPRESS_ALL=1 NVK_RM_COMPRESS_CLEAR=1` | beam gone: stale state (2) was also the beam; beam stays: host reads (1) or I2M (5), and patch 11 stays retired in favour of 13 |
 
 ### GPU time against NVIDIA in D3D11-through-DXVK shapes (patch 8)
 

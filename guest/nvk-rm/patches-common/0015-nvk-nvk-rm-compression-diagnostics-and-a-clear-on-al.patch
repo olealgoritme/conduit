@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 20:29:26 +0200
+Subject: [PATCH 15/15] nvk, nvk/rm: compression diagnostics and a clear-on-allocate
+ knob
+
+Three knobs to tell apart the causes of the corruption seen with
+NVK_RM_COMPRESS_ALL (broken vertex data in Counter-Strike 2) and
+NVK_RM_COMPRESS_TYPE (one model shaded black).  Each does nothing unless
+set, and none matters unless 0011 or 0013 is on:
+
+- NVK_RM_COMPRESS_CLEAR=1: every compressible memory (NVKMD_MEM_COMPRESSIBLE)
+  is written with zeros through its compressible VA when it is allocated,
+  as NVK_DEBUG=zero_memory does for all memory.  On GB20x RM scrubs freed
+  VRAM with physical copy-engine writes (bUseVasForCeMemoryOps is off
+  outside SR-IOV), which may leave compression state from an earlier
+  owner on pages that are later read before they are written through the
+  compressible kind.
+
+- NVK_RM_COMPRESS_UPGRADE=0: images bound to compressible memory without
+  being compressed themselves keep the uncompressed kind on their own VA
+  instead of getting the compressible one.
+
+- NVK_RM_COMPRESS_TYPE_SCOPE=attachments: the compressible memory type is
+  offered only to images that are compressed themselves (render targets,
+  depth, storage images).  Against the spec (memoryTypeBits may not
+  depend on usage for color formats); for testing only.
+---
+ src/nouveau/vulkan/nvk_device_memory.c    |  8 ++++++++
+ src/nouveau/vulkan/nvk_image.c            |  8 ++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c | 11 +++++++++++
+ 3 files changed, 27 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index 7db3a29..b588407 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -376,6 +376,14 @@ nvk_AllocateMemory(VkDevice device,
+          init = NVK_MEMORY_INIT_ZERO;
+       else if (pdev->debug_flags & NVK_DEBUG_ZERO_MEMORY)
+          init = NVK_MEMORY_INIT_ZERO;
++      else if ((mem->mem->flags & NVKMD_MEM_COMPRESSIBLE) &&
++               getenv("NVK_RM_COMPRESS_CLEAR") != NULL &&
++               atoi(getenv("NVK_RM_COMPRESS_CLEAR")) != 0)
++         /* Compressible memory written once through its compressible VA,
++          * so no page keeps compression state from an earlier owner (RM
++          * scrubs freed VRAM through physical copy-engine writes on GB20x)
++          */
++         init = NVK_MEMORY_INIT_ZERO;
+       else if (pdev->debug_flags & NVK_DEBUG_TRASH_MEMORY)
+          init = NVK_MEMORY_INIT_TRASH;
+       else
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 4421567..2838956 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -15,6 +15,7 @@
+ #include "util/detect_os.h"
+ #include "util/u_atomic.h"
+ #include "util/log.h"
++#include "util/os_misc.h"
+ #include "vk_android.h"
+ #include "vk_enum_to_str.h"
+ #include "vk_format.h"
+@@ -1404,7 +1405,14 @@ nvk_get_image_memory_requirements(struct nvk_device *dev,
+       VK_IMAGE_USAGE_VIDEO_ENCODE_DST_BIT_KHR |
+       VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR |
+       VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR;
++   /* Diagnostic, against the spec: NVK_RM_COMPRESS_TYPE_SCOPE=attachments
++    * offers the type only to images that are compressed themselves.
++    */
++   const char *scope = os_get_option("NVK_RM_COMPRESS_TYPE_SCOPE");
++   const bool attachments_only =
++      scope != NULL && strcmp(scope, "attachments") == 0;
+    if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ||
++       (attachments_only && !image->can_compress) ||
+        (image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                   VK_IMAGE_CREATE_PROTECTED_BIT)) ||
+        (image->vk.usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+index 265a39c..b316dc6 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+@@ -7,6 +7,7 @@
+ 
+ #include "util/log.h"
+ #include "util/u_atomic.h"
++#include "util/u_debug.h"
+ #include "util/u_math.h"
+ #include "vk_log.h"
+ 
+@@ -355,10 +356,20 @@ nvkmd_rm_va_free(struct nvkmd_va *_va)
+  * buffers through the memory's own VA, and their 3D state keeps
+  * compression off.
+  */
++DEBUG_GET_ONCE_BOOL_OPTION(nvk_rm_compress_upgrade, "NVK_RM_COMPRESS_UPGRADE",
++                           true)
++
+ static uint32_t
+ compressed_mem_kind(struct nvkmd_rm_dev *dev, const struct nvkmd_rm_va *va,
+                     const struct nvkmd_rm_mem *mem, uint32_t kind)
+ {
++   /* Diagnostic: NVK_RM_COMPRESS_UPGRADE=0 leaves such images on the
++    * uncompressed kind, so they are only ever accessed uncompressed
++    * through their own VA.
++    */
++   if (kind == NVKMD_RM_VA_KIND_GMK && !debug_get_option_nvk_rm_compress_upgrade())
++      return kind;
++
+    if (kind == NVKMD_RM_VA_KIND_GMK) {
+       p_atomic_inc(&dev->compr_upgraded);
+       return NVKMD_RM_VA_KIND_GMK_COMPRESSIBLE;
+-- 
+2.43.0
+
