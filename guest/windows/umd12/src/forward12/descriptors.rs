@@ -456,6 +456,7 @@ unsafe extern "system" fn calc_private_descriptor_heap_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_descriptor_heap_size");
     if arg.is_null() {
         note_refusal(&DESCRIPTOR_REFUSALS.heap_bad_arg);
         return HEAP_PRIVATE_SIZE;
@@ -491,6 +492,7 @@ unsafe extern "system" fn create_descriptor_heap(
     arg: *const ddi12::D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001,
     h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_descriptor_heap");
     // SAFETY: the caller guarantees the slot; `heap_slot` folds null into `None`.
     let Some(slot) = (unsafe { heap_slot(h_heap) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.heap_bad_arg);
@@ -606,6 +608,7 @@ unsafe extern "system" fn destroy_descriptor_heap(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
 ) {
+    ddi_time!("destroy_descriptor_heap");
     // SAFETY: the caller guarantees a live handle from `create_descriptor_heap`.
     let Some(slot) = (unsafe { heap_slot(h_heap) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.heap_bad_arg);
@@ -635,6 +638,7 @@ unsafe extern "system" fn get_descriptor_size_in_bytes(
     h_device: ddi12::D3D12DDI_HDEVICE,
     heap_type: ddi12::D3D12DDI_DESCRIPTOR_HEAP_TYPE,
 ) -> ddi12::UINT {
+    ddi_time!("get_descriptor_size_in_bytes");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);
@@ -685,6 +689,7 @@ unsafe extern "system" fn get_cpu_descriptor_handle_for_heap_start(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
 ) -> ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE {
+    ddi_time!("get_cpu_descriptor_handle_for_heap_start");
     let mut out = ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE { ptr: 0 };
     // SAFETY: the caller guarantees a live handle from `create_descriptor_heap`.
     let Some(slot) = (unsafe { heap_slot(h_heap) }) else {
@@ -750,6 +755,7 @@ unsafe extern "system" fn get_gpu_descriptor_handle_for_heap_start(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
 ) -> ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE {
+    ddi_time!("get_gpu_descriptor_handle_for_heap_start");
     let mut out = ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE { ptr: 0 };
     // SAFETY: the caller guarantees a live handle from `create_descriptor_heap`.
     let Some(slot) = (unsafe { heap_slot(h_heap) }) else {
@@ -1235,6 +1241,7 @@ unsafe extern "system" fn create_shader_resource_view(
     arg: *const ddi12::D3D12DDIARG_CREATE_SHADER_RESOURCE_VIEW_0002,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("create_shader_resource_view");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);
@@ -1465,6 +1472,7 @@ unsafe extern "system" fn create_unordered_access_view(
     arg: *const ddi12::D3D12DDIARG_CREATE_UNORDERED_ACCESS_VIEW_0002,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("create_unordered_access_view");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);
@@ -1730,6 +1738,7 @@ unsafe extern "system" fn create_render_target_view(
     arg: *const ddi12::D3D12DDIARG_CREATE_RENDER_TARGET_VIEW_0002,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("create_render_target_view");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);
@@ -1931,6 +1940,7 @@ unsafe extern "system" fn create_depth_stencil_view(
     arg: *const ddi12::D3D12DDIARG_CREATE_DEPTH_STENCIL_VIEW,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("create_depth_stencil_view");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);
@@ -2017,6 +2027,7 @@ unsafe extern "system" fn create_constant_buffer_view(
     arg: *const ddi12::D3D12DDI_CONSTANT_BUFFER_VIEW_DESC,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("create_constant_buffer_view");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);
@@ -2166,6 +2177,7 @@ unsafe extern "system" fn create_sampler(
     arg: *const ddi12::D3D12DDIARG_CREATE_SAMPLER_0096,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("create_sampler");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);
@@ -2289,6 +2301,7 @@ unsafe extern "system" fn create_sampler_feedback_unordered_access_view(
     _h_feedback_resource: ddi12::D3D12DDI_HRESOURCE,
     _dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("create_sampler_feedback_unordered_access_view");
     note_refusal(&DESCRIPTOR_REFUSALS.sampler_feedback_refused);
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     if let Some(dev) = unsafe { device12::device(h_device) } {
@@ -2410,6 +2423,7 @@ unsafe extern "system" fn copy_descriptors(
     src_range_sizes: *const ddi12::UINT,
     heap_type: ddi12::D3D12DDI_DESCRIPTOR_HEAP_TYPE,
 ) {
+    ddi_time!("copy_descriptors");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);
@@ -2473,6 +2487,7 @@ unsafe extern "system" fn copy_descriptors_simple(
     src: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
     heap_type: ddi12::D3D12DDI_DESCRIPTOR_HEAP_TYPE,
 ) {
+    ddi_time!("copy_descriptors_simple");
     // SAFETY: device-scope DDI; see `create_descriptor_heap`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&DESCRIPTOR_REFUSALS.no_device);

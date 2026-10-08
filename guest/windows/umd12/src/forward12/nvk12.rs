@@ -407,6 +407,10 @@ struct FrameSums {
     draws: u64,
     barrier_ns: u64,
     barriers: u64,
+    /// CPU time (kernel + user) of the presenting thread and of the whole
+    /// process during the frame.
+    present_thread_cpu_ns: u64,
+    process_cpu_ns: u64,
 }
 
 impl FrameSums {
@@ -423,6 +427,8 @@ impl FrameSums {
         draws: 0,
         barrier_ns: 0,
         barriers: 0,
+        present_thread_cpu_ns: 0,
+        process_cpu_ns: 0,
     };
 
     fn add(&mut self, o: &Self) {
@@ -438,6 +444,8 @@ impl FrameSums {
         self.draws += o.draws;
         self.barrier_ns += o.barrier_ns;
         self.barriers += o.barriers;
+        self.present_thread_cpu_ns += o.present_thread_cpu_ns;
+        self.process_cpu_ns += o.process_cpu_ns;
     }
 
     fn log(&self, what: &str) {
@@ -463,13 +471,61 @@ impl FrameSums {
             per(self.barrier_ns),
             self.barriers / f,
         );
+        // Wall frame vs CPU: what the presenting thread did not spend on the
+        // CPU it spent waiting (a fence, the GPU, a lock); the process figure
+        // is every thread's CPU (recording threads included).
+        log_error!(
+            "D3D12 frame CPU ({what}): presenting thread {} us/frame on the CPU of a {} us frame \
+             ({} us/frame not on the CPU), whole process {} us/frame",
+            per(self.present_thread_cpu_ns),
+            per(self.frame_ns),
+            per(self.frame_ns.saturating_sub(self.present_thread_cpu_ns)),
+            per(self.process_cpu_ns),
+        );
     }
 }
 
 struct FrameAcc {
     last_present_end: Option<Instant>,
+    /// CPU times (100 ns) at the last present: the presenting thread, the
+    /// process.
+    last_thread_cpu: u64,
+    last_process_cpu: u64,
     window: FrameSums,
     total: FrameSums,
+}
+
+/// CPU time (kernel + user, 100 ns units) of the calling thread and of the
+/// process.
+fn cpu_times_100ns() -> (u64, u64) {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, GetProcessTimes, GetThreadTimes,
+    };
+    let ft = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: pseudo-handles of this thread and process; all four out-pointers
+    // are writable locals.
+    let thread = unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) }
+        .map_or(0, |_| ft(k) + ft(u));
+    let (mut c2, mut e2, mut k2, mut u2) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: as above.
+    let process = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c2, &mut e2, &mut k2, &mut u2) }
+        .map_or(0, |_| ft(k2) + ft(u2));
+    (thread, process)
+}
+
+/// `Umd12DdiTimes`: the five DDIs with the most CPU time in the window.
+fn log_ddi_times(frames: u64) {
+    if !crate::knobs12::umd12_ddi_times() {
+        return;
+    }
+    let f = frames.max(1);
+    let mut line = String::new();
+    for (name, ns, calls) in crate::ddi_time::take_top(8) {
+        line.push_str(&format!(" {name} {} us/frame ({} calls/frame, {} ns each);", ns / f / 1000, calls / f, ns / calls.max(1)));
+    }
+    log_error!("D3D12 DDI time (top 8 by time):{line}");
 }
 
 fn ns_of(d: Duration) -> u64 {
@@ -546,11 +602,18 @@ impl FrameStats {
             draws: take(&self.draws),
             barrier_ns: take(&self.barrier_ns),
             barriers: take(&self.barriers),
+            present_thread_cpu_ns: 0,
+            process_cpu_ns: 0,
         };
+        let (thread_cpu, process_cpu) = cpu_times_100ns();
         let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner());
+        let last_thread = core::mem::replace(&mut acc.last_thread_cpu, thread_cpu);
+        let last_process = core::mem::replace(&mut acc.last_process_cpu, process_cpu);
         let Some(last) = acc.last_present_end.replace(now) else {
             return; // the first present only opens a frame
         };
+        frame.present_thread_cpu_ns = thread_cpu.saturating_sub(last_thread) * 100;
+        frame.process_cpu_ns = process_cpu.saturating_sub(last_process) * 100;
         frame.frame_ns = ns_of(now - last);
         acc.window.add(&frame);
         acc.total.add(&frame);
@@ -562,6 +625,7 @@ impl FrameStats {
         let total_frames = acc.total.frames;
         drop(acc);
         window.log(&format!("last frames, {total_frames} so far"));
+        log_ddi_times(window.frames);
         log_ecl_fence_stats();
         log_engine_timing(total_frames);
         // After the first frame and every 2048 frames: placement barely moves.
@@ -594,6 +658,8 @@ pub(crate) static FRAME_STATS: FrameStats = FrameStats {
     barriers: AtomicU64::new(0),
     acc: Mutex::new(FrameAcc {
         last_present_end: None,
+        last_thread_cpu: 0,
+        last_process_cpu: 0,
         window: FrameSums::ZERO,
         total: FrameSums::ZERO,
     }),

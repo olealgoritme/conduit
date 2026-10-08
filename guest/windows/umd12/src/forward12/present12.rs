@@ -114,6 +114,7 @@ unsafe extern "system" fn get_present_private_driver_data_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _p_present: *const ddi12::D3D12DDIARG_PRESENT_0001,
 ) -> ddi12::UINT {
+    ddi_time!("get_present_private_driver_data_size");
     L8_REFUSALS.present_private_data_size_queries.bump();
     0
 }
@@ -169,6 +170,7 @@ unsafe extern "system" fn present(
     p_contexts: *mut ddi12::D3D12DDI_PRESENT_CONTEXTS_0051,
     p_hw_queues: *mut ddi12::D3D12DDI_PRESENT_HWQUEUES_0051,
 ) {
+    ddi_time!("present");
     // Per-frame accounting (`nvk12::FrameStats`): one present closes a frame.
     let started = std::time::Instant::now();
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.

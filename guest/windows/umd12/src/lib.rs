@@ -84,7 +84,16 @@
 
 #![deny(deprecated)]
 
+/// Per-DDI CPU time (`ddi_time.rs`, `Umd12DdiTimes`).
+macro_rules! ddi_time {
+    ($name:literal) => {
+        static __DDI_STAT: $crate::ddi_time::DdiStat = $crate::ddi_time::DdiStat::new($name);
+        let _ddi_time = __DDI_STAT.start();
+    };
+}
+
 mod adapter12;
+mod ddi_time;
 mod bridge12;
 mod caps12;
 mod ddi12;

@@ -914,6 +914,7 @@ pub(super) unsafe extern "system" fn create_state_object(
     h_state: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     _h_rt: ddi12::D3D12DDI_HRTSTATEOBJECT_0054,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_state_object");
     if !valid_slot(h_state) {
         note_refusal(&L9_REFUSALS.state_object_bad_slot);
     }
@@ -947,6 +948,7 @@ pub(super) unsafe extern "system" fn add_to_state_object(
     h_state: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     _h_rt: ddi12::D3D12DDI_HRTSTATEOBJECT_0054,
 ) -> ddi12::HRESULT {
+    ddi_time!("add_to_state_object");
     if !valid_slot(h_state) {
         note_refusal(&L9_REFUSALS.add_to_state_object_bad_slot);
     }
@@ -983,6 +985,7 @@ pub(super) unsafe extern "system" fn destroy_state_object(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_state: ddi12::D3D12DDI_HSTATEOBJECT_0054,
 ) {
+    ddi_time!("destroy_state_object");
     if !valid_slot(h_state) {
         note_refusal(&L9_REFUSALS.state_object_destroy_unexpected);
         return;
@@ -1010,6 +1013,7 @@ pub(super) unsafe extern "system" fn get_shader_identifier(
     h: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     export: ddi12::LPCWSTR,
 ) -> *mut c_void {
+    ddi_time!("get_shader_identifier");
     // SAFETY: live state and runtime-owned name; returned identifier remains
     // engine-owned for the state object's lifetime, as required by the DDI.
     let result = unsafe {
@@ -1037,6 +1041,7 @@ pub(super) unsafe extern "system" fn get_shader_stack_size(
     h: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     export: ddi12::LPCWSTR,
 ) -> ddi12::UINT {
+    ddi_time!("get_shader_stack_size");
     // SAFETY: live state/name borrowed only for this query.
     let result = unsafe {
         (|| {
@@ -1063,6 +1068,7 @@ pub(super) unsafe extern "system" fn get_shader_stack_size(
 pub(super) unsafe extern "system" fn get_pipeline_stack_size(
     h: ddi12::D3D12DDI_HSTATEOBJECT_0054,
 ) -> ddi12::UINT {
+    ddi_time!("get_pipeline_stack_size");
     // SAFETY: the runtime holds the state live for this query.
     let result = unsafe {
         (|| {
@@ -1086,6 +1092,7 @@ pub(super) unsafe extern "system" fn set_pipeline_stack_size(
     h: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     size: ddi12::UINT,
 ) {
+    ddi_time!("set_pipeline_stack_size");
     // SAFETY: native runtime synchronizes stack mutation with other operations;
     // the engine object is held live by the DDI private slot.
     match unsafe { state(h) } {
@@ -1104,6 +1111,7 @@ pub(super) unsafe extern "system" fn check_driver_matching_identifier(
     data_type: ddi12::D3D12DDI_SERIALIZED_DATA_TYPE,
     identifier: *const ddi12::D3D12DDI_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER_0054,
 ) -> ddi12::D3D12DDI_DRIVER_MATCHING_IDENTIFIER_STATUS {
+    ddi_time!("check_driver_matching_identifier");
     // SAFETY: typed runtime identifier and device are readable during the query.
     let result = unsafe {
         (|| {
@@ -1524,6 +1532,7 @@ pub(super) unsafe extern "system" fn get_raytracing_acceleration_structure_prebu
     desc: *const ddi12::D3D12DDI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0054,
     info: *mut ddi12::D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054,
 ) {
+    ddi_time!("get_raytracing_acceleration_structure_prebuild_info");
     if info.is_null()
         || !(info as usize).is_multiple_of(align_of::<
             ddi12::D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054,
@@ -1579,6 +1588,7 @@ pub(super) unsafe extern "system" fn build_raytracing_acceleration_structure(
     h: ddi12::D3D12DDI_HCOMMANDLIST,
     arg: *const ddi12::D3D12DDIARG_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_0054,
 ) {
+    ddi_time!("build_raytracing_acceleration_structure");
     // SAFETY: runtime holds list, descriptor and both CPU arrays live for call.
     unsafe {
         list_call(
@@ -1619,6 +1629,7 @@ pub(super) unsafe extern "system" fn emit_raytracing_acceleration_structure_post
     h: ddi12::D3D12DDI_HCOMMANDLIST,
     arg: *const ddi12::D3D12DDIARG_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_0054,
 ) {
+    ddi_time!("emit_raytracing_acceleration_structure_postbuild_info");
     // SAFETY: runtime-owned list/descriptor and source-address array, live for call.
     unsafe {
         list_call(
@@ -1649,6 +1660,7 @@ pub(super) unsafe extern "system" fn copy_raytracing_acceleration_structure(
     h: ddi12::D3D12DDI_HCOMMANDLIST,
     arg: *const ddi12::D3D12DDIARG_COPY_RAYTRACING_ACCELERATION_STRUCTURE_0054,
 ) {
+    ddi_time!("copy_raytracing_acceleration_structure");
     // SAFETY: list and exact copy descriptor are live for this recording call.
     unsafe {
         list_call(
@@ -1695,6 +1707,7 @@ pub(super) unsafe extern "system" fn set_pipeline_state1(
     h: ddi12::D3D12DDI_HCOMMANDLIST,
     h_state: ddi12::D3D12DDI_HSTATEOBJECT_0054,
 ) {
+    ddi_time!("set_pipeline_state1");
     // SAFETY: the runtime keeps state object and list alive through recording;
     // its recorded-object lifetime rules and app's GPU lifetime obligations
     // prevent Destroy while command execution still references this pipeline.
@@ -1758,6 +1771,7 @@ pub(super) unsafe extern "system" fn dispatch_rays(
     h: ddi12::D3D12DDI_HCOMMANDLIST,
     arg: *const ddi12::D3D12DDIARG_DISPATCH_RAYS_0054,
 ) {
+    ddi_time!("dispatch_rays");
     // SAFETY: runtime owns the checked list and descriptor for this invocation.
     unsafe {
         list_call(

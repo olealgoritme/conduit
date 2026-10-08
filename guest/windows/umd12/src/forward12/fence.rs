@@ -208,6 +208,7 @@ unsafe extern "system" fn calc_private_fence_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_FENCE,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_fence_size");
     if arg.is_null() {
         note_refusal(&L7_REFUSALS.fence_bad_arg);
     }
@@ -232,6 +233,7 @@ unsafe extern "system" fn create_fence(
     h_fence: ddi12::D3D12DDI_HFENCE,
     arg: *const ddi12::D3D12DDIARG_CREATE_FENCE,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_fence");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { fence_slot(h_fence) }) else {
         note_refusal(&L7_REFUSALS.fence_bad_arg);
@@ -333,6 +335,7 @@ unsafe extern "system" fn destroy_fence(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_fence: ddi12::D3D12DDI_HFENCE,
 ) {
+    ddi_time!("destroy_fence");
     // SAFETY: the caller guarantees a live handle from `create_fence`.
     let Some(slot) = (unsafe { fence_slot(h_fence) }) else {
         note_refusal(&L7_REFUSALS.fence_bad_arg);
@@ -392,6 +395,7 @@ unsafe extern "system" fn calc_private_query_heap_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_QUERY_HEAP_0001,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_query_heap_size");
     if arg.is_null() {
         note_refusal(&L7_REFUSALS.query_heap_bad_arg);
     }
@@ -411,6 +415,7 @@ unsafe extern "system" fn create_query_heap(
     arg: *const ddi12::D3D12DDIARG_CREATE_QUERY_HEAP_0001,
     h_heap: ddi12::D3D12DDI_HQUERYHEAP,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_query_heap");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { query_heap_slot(h_heap) }) else {
         note_refusal(&L7_REFUSALS.query_heap_bad_arg);
@@ -498,6 +503,7 @@ unsafe extern "system" fn destroy_query_heap(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HQUERYHEAP,
 ) {
+    ddi_time!("destroy_query_heap");
     // SAFETY: the caller guarantees a live handle from `create_query_heap`.
     let Some(slot) = (unsafe { query_heap_slot(h_heap) }) else {
         note_refusal(&L7_REFUSALS.query_heap_bad_arg);
