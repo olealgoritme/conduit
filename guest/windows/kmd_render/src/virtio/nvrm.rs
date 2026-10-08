@@ -183,6 +183,12 @@ pub static NVRM_EV_DROPS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_LOST: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_OTHER: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Event-queue drain passes that took a whole ring's worth (`NvEvFull`: the host
+/// filled every posted buffer before the DPC ran, so it may have had reports with
+/// no buffer to put them in; its backend counts those), and the most buffers one
+/// pass took (`NvEvMaxP`).
+pub static NVRM_EV_FULL: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_EV_MAX_PASS: AtomicU32 = AtomicU32::new(0);
 /// What a transport found still tracked when it was dropped (handles, mappings and
 /// pins nobody had closed: dxgkrnl normally destroys every device first, so this
 /// is 0), the user views left behind by it (`NvStale`), and how many of those the
