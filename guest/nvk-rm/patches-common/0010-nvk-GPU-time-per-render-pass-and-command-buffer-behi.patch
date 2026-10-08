@@ -17,6 +17,10 @@ two seconds the 24 heaviest signatures are logged with GPU ms per second,
 us per pass, count and draws per pass; the command-buffer line is the
 whole GPU time, so what no pass explains is compute, copies and clears.
 
+The lines also go to NVK_PASS_PROFILE_FILE, else on Windows to
+C:\ProgramData\Helios\nvk-pass-<pid>.txt (mesa's own log only reaches a
+debugger there).
+
 Each report is a flush of pending writes plus a release, a little GPU time
 per pass: good for finding a 10x, not for measuring 1 %.
 ---
@@ -26,10 +30,10 @@ per pass: good for finding a 10x, not for measuring 1 %.
  src/nouveau/vulkan/nvk_cmd_draw.c     |   9 +
  src/nouveau/vulkan/nvk_device.c       |   6 +
  src/nouveau/vulkan/nvk_device.h       |   5 +
- src/nouveau/vulkan/nvk_pass_profile.c | 334 ++++++++++++++++++++++++++
- src/nouveau/vulkan/nvk_pass_profile.h |  28 +++
+ src/nouveau/vulkan/nvk_pass_profile.c | 374 ++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_pass_profile.h |  28 ++
  src/nouveau/vulkan/nvk_queue.c        |   4 +
- 9 files changed, 398 insertions(+)
+ 9 files changed, 438 insertions(+)
  create mode 100644 src/nouveau/vulkan/nvk_pass_profile.c
  create mode 100644 src/nouveau/vulkan/nvk_pass_profile.h
 
@@ -187,10 +191,10 @@ index 5359e66..a17a5ba 100644
     struct nvk_layer_dispatch_tables layer_dispatch;
 diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
 new file mode 100644
-index 0000000..12a8563
+index 0000000..6d04ecd
 --- /dev/null
 +++ b/src/nouveau/vulkan/nvk_pass_profile.c
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,374 @@
 +/*
 + * Copyright © 2026 Conduit contributors
 + * SPDX-License-Identifier: MIT
@@ -210,7 +214,10 @@ index 0000000..12a8563
 + * whether the image is linear or block-linear, its PTE kind and whether it
 + * is compressed -- so the line also says how the attachments are laid out.
 + * Every two seconds the heaviest signatures are logged (mesa_logi, GPU ms
-+ * per second and per pass, draws per pass), then the totals reset.
++ * per second and per pass, draws per pass), then the totals reset.  The
++ * lines also go to a file: NVK_PASS_PROFILE_FILE, else on Windows
++ * C:\ProgramData\Helios\nvk-pass-<pid>.txt (mesa's log there only reaches
++ * a debugger).
 + *
 + * Passes nest inside command buffers, so the command-buffer line is the
 + * whole GPU time and the pass lines are a breakdown of it; what is in the
@@ -232,12 +239,17 @@ index 0000000..12a8563
 +#include "util/os_time.h"
 +#include "util/simple_mtx.h"
 +#include "util/u_atomic.h"
++#include "util/os_misc.h"
 +#include "util/u_debug.h"
 +#include "vk_enum_to_str.h"
 +
 +#include <inttypes.h>
++#include <stdarg.h>
 +#include <stdio.h>
 +#include <string.h>
++#ifdef _WIN32
++#include <process.h>
++#endif
 +
 +#define PROF_SLOTS     16384u
 +#define PROF_SIGS      128u
@@ -279,7 +291,21 @@ index 0000000..12a8563
 +   uint32_t sig_count;
 +   uint64_t window_start_ns;
 +   uint64_t dropped;
++   FILE *file;
 +};
++
++static void PRINTFLIKE(2, 3)
++prof_log(struct nvk_pass_profile *prof, const char *fmt, ...)
++{
++   char line[512];
++   va_list args;
++   va_start(args, fmt);
++   vsnprintf(line, sizeof(line), fmt, args);
++   va_end(args);
++   mesa_logi("%s", line);
++   if (prof->file != NULL)
++      fprintf(prof->file, "%s\n", line);
++}
 +
 +void
 +nvk_pass_profile_init(struct nvk_device *dev)
@@ -305,8 +331,22 @@ index 0000000..12a8563
 +   memset(prof->gpu, 0, PROF_SLOTS * sizeof(struct prof_slot_gpu));
 +   simple_mtx_init(&prof->mutex, mtx_plain);
 +   prof->window_start_ns = os_time_get_nano();
++   const char *path = os_get_option("NVK_PASS_PROFILE_FILE");
++   char default_path[256];
++#ifdef _WIN32
++   if (path == NULL) {
++      snprintf(default_path, sizeof(default_path),
++               "C:\\ProgramData\\Helios\\nvk-pass-%d.txt", _getpid());
++      path = default_path;
++   }
++#else
++   (void)default_path;
++#endif
++   if (path != NULL)
++      prof->file = fopen(path, "a");
 +   dev->pass_profile = prof;
-+   mesa_logi("NVK pass profile: on (%u slots)", PROF_SLOTS);
++   prof_log(prof, "NVK pass profile: on (%u slots), file %s", PROF_SLOTS,
++            prof->file != NULL ? path : "(none)");
 +}
 +
 +void
@@ -316,6 +356,8 @@ index 0000000..12a8563
 +   if (prof == NULL)
 +      return;
 +   nvkmd_mem_unref(prof->mem);
++   if (prof->file != NULL)
++      fclose(prof->file);
 +   simple_mtx_destroy(&prof->mutex);
 +   free(prof);
 +   dev->pass_profile = NULL;
@@ -505,13 +547,13 @@ index 0000000..12a8563
 +      struct prof_sig sorted[PROF_SIGS];
 +      memcpy(sorted, prof->sigs, prof->sig_count * sizeof(sorted[0]));
 +      qsort(sorted, prof->sig_count, sizeof(sorted[0]), prof_sig_cmp);
-+      mesa_logi("NVK pass profile: %.2f s window, %u signatures, %" PRIu64
-+                " dropped", window / 1e9, prof->sig_count, prof->dropped);
++      prof_log(prof, "NVK pass profile: %.2f s window, %u signatures, %" PRIu64
++               " dropped", window / 1e9, prof->sig_count, prof->dropped);
 +      for (uint32_t i = 0; i < prof->sig_count && i < 24; i++) {
 +         if (sorted[i].count == 0)
 +            break;
-+         mesa_logi("NVK pass profile: %8.2f GPU ms/s %8.1f us each %6" PRIu64
-+                   "x %6.1f draws  %s",
++         prof_log(prof, "NVK pass profile: %8.2f GPU ms/s %8.1f us each %6" PRIu64
++                  "x %6.1f draws  %s",
 +                   sorted[i].gpu_ns / 1e6 / (window / 1e9),
 +                   sorted[i].gpu_ns / 1e3 / sorted[i].count, sorted[i].count,
 +                   (double)sorted[i].draws / sorted[i].count, sorted[i].name);
@@ -522,6 +564,8 @@ index 0000000..12a8563
 +         prof->sigs[i].draws = 0;
 +      }
 +      prof->window_start_ns = now;
++      if (prof->file != NULL)
++         fflush(prof->file);
 +   }
 +   simple_mtx_unlock(&prof->mutex);
 +}
