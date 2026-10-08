@@ -2416,8 +2416,10 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_position(
         }
         crate::ddi::hw_cursor::note_ddi_position(
             // SAFETY: non-null, dxgkrnl's argument for this call; `Value` is the whole word.
-            unsafe { (*position).Flags.__bindgen_anon_1.Value } & 1 != 0,
+            unsafe { (*position).Flags.__bindgen_anon_1.Value },
             unsafe { (*position).VidPnSourceId },
+            unsafe { (*position).X },
+            unsafe { (*position).Y },
         );
         // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
         // valid for the call, at PASSIVE.
@@ -2552,6 +2554,11 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
     }
     // No scanout: visibility is a no-op we simply accept.
     if unsafe { display_half_on(_adapter) } {
+        if !visibility.is_null() {
+            // `CurVisOn` / `CurVisOff`: dxgkrnl does not call the pointer DDIs for a source whose
+            // topology it considers disabled; whether it ever made this source visible.
+            crate::ddi::hw_cursor::note_source_visibility(unsafe { (*visibility).Visible } != 0);
+        }
         STATUS_SUCCESS
     } else {
         STATUS_NOT_SUPPORTED

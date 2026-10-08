@@ -165,11 +165,27 @@ pub(crate) fn note_ddi_shape() {
 static POS_VIS: AtomicU32 = AtomicU32::new(0);
 static POS_HID: AtomicU32 = AtomicU32::new(0);
 static POS_SRC: AtomicU32 = AtomicU32::new(0);
+/// The last position call's whole `Flags` word and `X << 16 | Y` (16 bits each).
+static POS_FLG: AtomicU32 = AtomicU32::new(0);
+static POS_XY: AtomicU32 = AtomicU32::new(0);
+/// `DxgkDdiSetVidPnSourceVisibility` calls making a source visible / invisible.
+static VIS_ON: AtomicU32 = AtomicU32::new(0);
+static VIS_OFF: AtomicU32 = AtomicU32::new(0);
 
-pub(crate) fn note_ddi_position(visible: bool, source: u32) {
+/// A `DxgkDdiSetVidPnSourceVisibility` call (display half on). PASSIVE.
+pub(crate) fn note_source_visibility(visible: bool) {
+    bump(if visible { &VIS_ON } else { &VIS_OFF });
+}
+
+pub(crate) fn note_ddi_position(flags: u32, source: u32, x: i32, y: i32) {
     DDI_POS.fetch_add(1, Ordering::Relaxed);
-    (if visible { &POS_VIS } else { &POS_HID }).fetch_add(1, Ordering::Relaxed);
+    (if flags & 1 != 0 { &POS_VIS } else { &POS_HID }).fetch_add(1, Ordering::Relaxed);
     POS_SRC.store(source, Ordering::Relaxed);
+    POS_FLG.store(flags, Ordering::Relaxed);
+    POS_XY.store(
+        (x as u32 & 0xFFFF) << 16 | (y as u32 & 0xFFFF),
+        Ordering::Relaxed,
+    );
     // Positions arrive at mouse rate: published with the next change, or once a second.
     mark_dirty();
 }
@@ -204,6 +220,10 @@ fn write_block() {
     crate::diag::record_named_bytes(b"CurPosVis", r(&POS_VIS));
     crate::diag::record_named_bytes(b"CurPosHid", r(&POS_HID));
     crate::diag::record_named_bytes(b"CurPosSrc", r(&POS_SRC));
+    crate::diag::record_named_bytes(b"CurPosFlg", r(&POS_FLG));
+    crate::diag::record_named_bytes(b"CurPosXY", r(&POS_XY));
+    crate::diag::record_named_bytes(b"CurVisOn", r(&VIS_ON));
+    crate::diag::record_named_bytes(b"CurVisOff", r(&VIS_OFF));
     crate::diag::record_named_bytes(b"CurCapQn", r(&CAPQ_N));
     crate::diag::record_named_bytes(b"CurCapRep", r(&CAPQ_LAST));
 }

@@ -1211,6 +1211,36 @@ was still out), `CurRttUs` / `CurRttMax` (round trip, microseconds), `CurTmo`, `
 `CurGateMs` (longest wait for another pointer operation's I/O), `CurSwN` / `CurSwMs` / `CurSwMax`
 (software-cursor episodes: a refused shape until the host shows one again).
 
+### 12.3b The hardware pointer Windows does not use (open, as of 402)
+
+What is known: dxgkrnl is told about the pointer (`CurCapRep` bit 0, caps 7, max 256, one query, after
+StartDevice published), yet it never calls `DxgkDdiSetPointerShape` (`CurDdiS` 0) and calls
+`DxgkDdiSetPointerPosition` only twice, both hides (`CurPosHid` 2), with DWM on NVK; with DWM on Venus
+not even those. A hardware cursor in use gets position calls at mouse rate, so Windows draws a software
+cursor on this output. Ruled out on VM rows: the caps word and size (6 and 64, `SmoothRotCaps`), the G1
+knobs (GDI acceleration, VRAM redirection), DWM on NVK, independent flip, pointer trails, cursor shadow,
+accessibility cursor size and colour, an RDP session, a second active screen.
+
+Counters for the next rows (written about once a second, `CurDdiS` / `CurDdiP` count every call that
+reached the display half): `CurVisOn` / `CurVisOff` (`DxgkDdiSetVidPnSourceVisibility`: dxgkrnl does not
+call the pointer DDIs for a source whose topology it considers disabled), `CurPosFlg` and `CurPosXY` (the
+last position call's whole `Flags` word and `X << 16 | Y`), `CurCapRep` (12.3a and the commit messages).
+
+Next experiments, cheapest first:
+
+1. **The real mouse.** Move the host mouse over the viewer for 20 s (not `curstress.ps1`), then read
+   `CurDdiP`, `CurDdiS`. `SetCursorPos` moves the pointer through the same window-manager path, so it
+   is a valid stimulus, but a hand test removes the doubt.
+2. **DWM effects that compose the cursor in software:** Settings > Accessibility > Colour filters off,
+   Magnifier not running, Text cursor indicator off, Mouse pointer style "White" (not Custom).
+   `Get-ItemProperty HKCU:\Software\Microsoft\ColorFiltering`, `Get-Process Magnify -EA 0`.
+3. **The boot VGA adapter** (Microsoft Basic Display Adapter, status Error, no screen): disable it in
+   Device Manager, reboot, repeat 1.
+4. **The pointing device:** the domain has a USB tablet (absolute) and a PS/2 mouse; try the tablet
+   removed (relative PS/2 mouse only) for one boot, repeat 1 (a domain XML change, main session).
+5. **`CurVisOn` 0** after a boot would mean dxgkrnl never made the source visible through this DDI; then
+   the pointer path is gated on the source state, not on the cursor code.
+
 ### 12.4 Recipe (main runs it; lowest mode first)
 
 Needs the backend and the KMD of this branch (`NVGPU_CFG_VENUS_CURSOR` is new; with an older backend the default knob reports no

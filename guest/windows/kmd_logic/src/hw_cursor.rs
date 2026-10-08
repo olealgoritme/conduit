@@ -372,7 +372,7 @@ pub const fn retry_due(now: u64, last_try: u64) -> bool {
 
 /// Counter names (`kmd_render/src/ddi/hw_cursor.rs`), at most 14 characters, in the order the
 /// driver writes them.
-pub const COUNTERS: [&str; 30] = [
+pub const COUNTERS: [&str; 34] = [
     "CurKnob",
     "CurCaps",
     "CurShapeN",
@@ -401,6 +401,10 @@ pub const COUNTERS: [&str; 30] = [
     "CurPosVis", // ... of them with Flags.Visible set
     "CurPosHid", // ... with it clear
     "CurPosSrc", // the last one's VidPnSourceId
+    "CurPosFlg", // ... its whole Flags word
+    "CurPosXY",  // ... its X << 16 | Y (16 bits each)
+    "CurVisOn",  // SetVidPnSourceVisibility calls making the source visible
+    "CurVisOff", // ... invisible
     "CurCapQn",  // DXGK_DRIVERCAPS queries (never reset)
     "CurCapRep", // what the last one reported (bit 0 pointer, 1 host known, 4..7 knob, 8 display, 16.. caps)
 ];
