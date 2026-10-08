@@ -240,13 +240,35 @@ pub(crate) fn submit(
 /// The push slot's size in dwords (`rm_ce_channel::SLOT_DWORDS`).
 pub(crate) const SLOT_DWORDS: usize = helios_kmd_logic::rm_ce_channel::SLOT_DWORDS;
 
-/// Wait until the channel's completion reaches `value` (`ce_vram::wait`), at most `max_ms`.
+/// Wait until the channel's completion reaches `value`, at most `max_ms`, polling
+/// (`ce_channel::poll`) WITHOUT sleeping: `ce_vram::wait` spins 20 ms and then sleeps 1 ms ticks,
+/// which `KeDelayExecutionThread` rounds up to the timer granularity (~15.6 ms), so a copy that
+/// took 21 ms cost up to ~36 ms (373.1 `GdiSlowOp` 0x12211 at 31.6 ms on the staging copy-engine
+/// path). This runs on the GDI executor's own thread, so the spin costs no one else.
 /// Bounded; it does NOT mark the channel broken: only the route's worker tears a broken channel
 /// down, and only while the route holds jobs, so a broken mark from here could leave the channel
 /// unusable for the rest of the generation. GDI's own pushes never acquire (`GdiFgnAcq` 0), so
 /// they cannot be what stalls it.
-pub(crate) fn wait(passive: PassiveLevel, value: u64, max_ms: u64) -> bool {
-    ce_vram::wait(passive, value, max_ms)
+pub(crate) fn wait(_passive: PassiveLevel, value: u64, max_ms: u64) -> bool {
+    let start = crate::ddi::blt_async::now_100ns();
+    let deadline = start + max_ms * 10_000;
+    loop {
+        let Some(p) = ce_channel::poll() else {
+            return false;
+        };
+        if p.notifier != 0 {
+            return false;
+        }
+        if p.completed >= value {
+            return true;
+        }
+        if crate::ddi::blt_async::now_100ns() >= deadline {
+            return false;
+        }
+        for _ in 0..64 {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 fn vrect(r: Rect) -> Option<rv::Rect> {
