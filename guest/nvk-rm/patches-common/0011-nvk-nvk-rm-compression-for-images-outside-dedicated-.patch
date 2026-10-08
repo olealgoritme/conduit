@@ -10,7 +10,7 @@ vkd3d-proton places every D3D12 resource in a heap, and native engines
 bind their render targets into large allocations, so on RM every render
 target was mapped with the uncompressed generic kind (0x6).
 
-With NVK_RM_COMPRESS_ALL=1 (default off while it is measured):
+On by default (NVK_RM_COMPRESS_ALL=0 turns it off):
 
 - nvkmd: new NVKMD_MEM_COMPRESSIBLE memory flag and
   nvkmd_info::has_compressible_mem.  NVK asks for it on device-local
@@ -31,17 +31,26 @@ With NVK_RM_COMPRESS_ALL=1 (default off while it is measured):
   pages uncompressed.  A refusal falls back to uncompressed memory.
 
 Statistics as they grow and at device destruction: compressible memories
-and their size, refusals, compressed image binds, upgraded binds.
+and their size, refusals, compressed image binds, upgraded binds, and
+why image planes in compressible memory were left uncompressed (not a
+render target, depth/stencil or storage image; a separate depth/stencil
+plane; other).
+
+In the VM (RTX 5090, Basemark at 1080p, windowed): Vulkan 268 compressed
+image binds in 11 compressible memories (2565 MiB), none refused,
+calibration 7-9 % faster, demo scene median 20.4 -> 19.2 ms; D3D12
+through vkd3d-proton 67 binds in 6 memories (1971 MiB), frame 21.8 ->
+20.7 ms.  No faults, no device loss.
 ---
- src/nouveau/vulkan/nvk_device_memory.c      | 20 +++++++++
- src/nouveau/vulkan/nvk_image.c              | 29 ++++++++++---
- src/nouveau/vulkan/nvkmd/nvkmd.h            | 14 ++++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      | 14 ++++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  | 10 +++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  | 48 ++++++++++++++++++++-
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |  9 ++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c   | 39 +++++++++++++++++
- 8 files changed, 177 insertions(+), 6 deletions(-)
+ src/nouveau/vulkan/nvk_device_memory.c      | 20 +++++++
+ src/nouveau/vulkan/nvk_image.c              | 66 +++++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/nvkmd.h            | 14 +++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      | 14 +++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  | 10 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  | 48 ++++++++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |  9 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c   | 39 ++++++++++++
+ 8 files changed, 214 insertions(+), 6 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
 index 10992e8..fcb7116 100644
@@ -82,10 +91,19 @@ index 10992e8..fcb7116 100644
                                     aligned_size, alignment, flags,
                                     &mem->mem);
 diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
-index af77ee7..42211d0 100644
+index af77ee7..062ded9 100644
 --- a/src/nouveau/vulkan/nvk_image.c
 +++ b/src/nouveau/vulkan/nvk_image.c
-@@ -1210,7 +1210,8 @@ nvk_image_init(struct nvk_device *dev,
+@@ -13,6 +13,8 @@
+ #include "nvkmd/nvkmd.h"
+ 
+ #include "util/detect_os.h"
++#include "util/u_atomic.h"
++#include "util/log.h"
+ #include "vk_android.h"
+ #include "vk_enum_to_str.h"
+ #include "vk_format.h"
+@@ -1210,7 +1212,8 @@ nvk_image_init(struct nvk_device *dev,
  static VkResult
  nvk_image_plane_alloc_va(struct nvk_device *dev,
                           const struct nvk_image *image,
@@ -95,7 +113,7 @@ index af77ee7..42211d0 100644
  {
     assert(plane->va == NULL);
     VkResult result;
-@@ -1230,7 +1231,7 @@ nvk_image_plane_alloc_va(struct nvk_device *dev,
+@@ -1230,7 +1233,7 @@ nvk_image_plane_alloc_va(struct nvk_device *dev,
        const uint64_t va_size_B = align64(plane->nil.size_B, va_align_B);
  
        result = nvkmd_dev_alloc_va(dev->nvkmd, &dev->vk.base,
@@ -104,7 +122,7 @@ index af77ee7..42211d0 100644
                                    va_size_B, va_align_B,
                                    0 /* fixed_addr */, &plane->va);
        if (result != VK_SUCCESS)
-@@ -1308,13 +1309,15 @@ nvk_CreateImage(VkDevice _device,
+@@ -1308,13 +1311,15 @@ nvk_CreateImage(VkDevice _device,
     if (image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
                                   VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) {
        for (uint8_t plane = 0; plane < image->plane_count; plane++) {
@@ -122,7 +140,47 @@ index af77ee7..42211d0 100644
           if (result != VK_SUCCESS)
              goto fail;
        }
-@@ -1655,7 +1658,20 @@ nvk_image_plane_bind(struct nvk_device *dev,
+@@ -1638,6 +1643,39 @@ nvk_GetDeviceImageSubresourceLayoutKHR(
+    nvk_image_finish(dev, &image, NULL);
+ }
+ 
++/* NVK_RM_COMPRESS_ALL: why block-linear image planes bound into
++ * compressible memory are not compressed (the backend maps them with the
++ * compressible kind anyway, with compression off in their 3D state).  Per
++ * process, logged as the total reaches each power of two.  Sparse images
++ * are bound through the bind queue and do not show up here.
++ */
++static struct {
++   uint32_t total, not_attachment, separate_zs, other;
++} nvk_uncompressed_binds;
++
++static void
++nvk_count_uncompressed_bind(const struct nvk_image *image)
++{
++   if (image->separate_zs)
++      p_atomic_inc(&nvk_uncompressed_binds.separate_zs);
++   else if (!(image->vk.usage & (VK_IMAGE_USAGE_STORAGE_BIT |
++                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
++      p_atomic_inc(&nvk_uncompressed_binds.not_attachment);
++   else
++      p_atomic_inc(&nvk_uncompressed_binds.other);
++
++   const uint32_t n = p_atomic_inc_return(&nvk_uncompressed_binds.total);
++   if (util_is_power_of_two_nonzero(n)) {
++      mesa_logi("NVK: %u image plane binds in compressible memory left "
++                "uncompressed: %u not render target/depth/storage, %u "
++                "separate depth/stencil planes, %u other", n,
++                p_atomic_read(&nvk_uncompressed_binds.not_attachment),
++                p_atomic_read(&nvk_uncompressed_binds.separate_zs),
++                p_atomic_read(&nvk_uncompressed_binds.other));
++   }
++}
++
+ static VkResult
+ nvk_image_plane_bind(struct nvk_device *dev,
+                      struct nvk_image *image,
+@@ -1655,7 +1693,20 @@ nvk_image_plane_bind(struct nvk_device *dev,
           image->is_compressed = true;
           plane->addr = mem->mem->va->addr + offset_B;
        } else {
@@ -144,13 +202,15 @@ index af77ee7..42211d0 100644
           if (result != VK_SUCCESS)
              return result;
  
-@@ -1664,6 +1680,9 @@ nvk_image_plane_bind(struct nvk_device *dev,
+@@ -1664,6 +1715,11 @@ nvk_image_plane_bind(struct nvk_device *dev,
                                      plane->va->size_B);
           if (result != VK_SUCCESS)
              return result;
 +
 +         if (compress)
 +            image->is_compressed = true;
++         else if (mem->mem->flags & NVKMD_MEM_COMPRESSIBLE)
++            nvk_count_uncompressed_bind(image);
        }
     } else {
        plane->addr = mem->mem->va->addr + offset_B;
@@ -306,7 +366,7 @@ index 8dc582e..f7dbbaf 100644
      * RM declined).  Everything else maps the memory as generic and gives
      * images their kind on their own VA.
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
-index de1f951..852d5eb 100644
+index de1f951..56e6241 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
 @@ -426,6 +426,15 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
@@ -316,11 +376,11 @@ index de1f951..852d5eb 100644
 +   /* GB20x compression is per physical page (GMMU v3 PTEs carry no
 +    * comptag line), so device-local memory may be allocated compressible
 +    * as a whole and sub-allocated images compressed by their PTE kind
-+    * (nvkmd_rm_mem.c).  Off by default while it is measured.
++    * (nvkmd_rm_mem.c).  NVK_RM_COMPRESS_ALL=0 turns it off.
 +    */
 +   pdev->base.kmd_info.has_compressible_mem =
 +      pdev->base.kmd_info.has_compression &&
-+      debug_get_bool_option("NVK_RM_COMPRESS_ALL", false);
++      debug_get_bool_option("NVK_RM_COMPRESS_ALL", true);
 +
     /* VRAM is allocated with 64 KiB pages; system memory BOs get their own
      * 4 KiB bind alignment (nvkmd_mem::bind_align_B).
