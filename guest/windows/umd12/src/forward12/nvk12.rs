@@ -648,6 +648,7 @@ impl FrameStats {
         drop(acc);
         window.log(&format!("last frames, {total_frames} so far"));
         log_ddi_times(window.frames);
+        super::queue::log_merge_stats(window.frames);
         log_ecl_fence_stats();
         log_engine_timing(total_frames);
         // After the first frame and every 2048 frames: placement barely moves.

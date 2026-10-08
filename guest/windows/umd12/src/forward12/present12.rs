@@ -173,6 +173,9 @@ unsafe extern "system" fn present(
     ddi_time!("present");
     // Per-frame accounting (`nvk12::FrameStats`): one present closes a frame.
     let started = std::time::Instant::now();
+    // `Umd12MergeEcl` (diagnostic): the queue's held ECL packet goes in first.
+    // SAFETY: the runtime's live queue handle, on the Present DDI thread.
+    unsafe { super::queue::flush_merged_for_present(h_queue) };
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe { present_body(h_command_list, h_queue, p_present, p_out, p_contexts, p_hw_queues) };
     super::nvk12::FRAME_STATS.note_present(started);
