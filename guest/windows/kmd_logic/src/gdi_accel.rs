@@ -1627,6 +1627,14 @@ pub const COUNTERS: &[&str] = &[
     "GdiFgnWr",
     "GdiFgnOp",
     // The slowest job: its command count and its three slowest commands (GdiSlowOp signature, µs).
+    // Pixel self-check after a fill/copy that reported success (sampled): checks, mismatches, the
+    // last mismatch's command (GdiSlowOp signature | path << 28: 1 CE, 2 staging view, 3 CPU,
+    // 4 scroll), the pixel read and the pixel wanted.
+    "GdiChkN",
+    "GdiChkBad",
+    "GdiChkK",
+    "GdiChkGot",
+    "GdiChkWant",
     "GdiJobMaxN",
     "GdiJobT1",
     "GdiJobT1Us",
