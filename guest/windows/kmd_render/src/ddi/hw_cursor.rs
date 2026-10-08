@@ -95,6 +95,8 @@ static SW_N: AtomicU32 = AtomicU32::new(0);
 static SW_MS: AtomicU32 = AtomicU32::new(0);
 static SW_MAX: AtomicU32 = AtomicU32::new(0);
 static RETRY: AtomicU32 = AtomicU32::new(0);
+static QUEUE_ON: AtomicU32 = AtomicU32::new(0);
+static Q_BUSY: AtomicU32 = AtomicU32::new(0);
 /// When the current software-cursor episode began (0: none).
 static SW_SINCE: AtomicU64 = AtomicU64::new(0);
 /// When an owed command last failed to reach the queue (0: nothing to retry).
@@ -141,6 +143,8 @@ fn write_block() {
     crate::diag::record_named_bytes(b"CurSwMs", r(&SW_MS));
     crate::diag::record_named_bytes(b"CurSwMax", r(&SW_MAX));
     crate::diag::record_named_bytes(b"CurRetry", r(&RETRY));
+    crate::diag::record_named_bytes(b"CurQ", r(&QUEUE_ON));
+    crate::diag::record_named_bytes(b"CurQBusy", r(&Q_BUSY));
 }
 
 /// From the periodic `scanout_trace` dump: the block, when a count moved. PASSIVE.
@@ -229,10 +233,18 @@ pub(crate) fn reset_for_start(adapter: &AdapterContext, knobs: &crate::adapter::
     CAPS.store(u32::from(caps), Ordering::Relaxed);
     for c in [
         &SHAPE_N, &POS_N, &SHOW, &HIDE, &FMT, &SIZE, &REFUSE, &WHY, &HOST_ERR, &XOR, &RTT_US,
-        &RTT_MAX, &TMO, &GATE_MS, &SW_N, &SW_MS, &SW_MAX, &RETRY,
+        &RTT_MAX, &TMO, &GATE_MS, &SW_N, &SW_MS, &SW_MAX, &RETRY, &Q_BUSY,
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    QUEUE_ON.store(
+        u32::from(
+            adapter
+                .with_virtio(|v| v.cursor_queue_on())
+                .unwrap_or(false),
+        ),
+        Ordering::Relaxed,
+    );
     SW_SINCE.store(0, Ordering::Relaxed);
     NOT_SENT_AT.store(0, Ordering::Relaxed);
     DIRTY.store(0, Ordering::Relaxed);
@@ -479,7 +491,22 @@ fn settle(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
         };
         let show = cmd.flags & HELIOS_CURSOR_BLOB_F_VISIBLE != 0;
         let t0 = now_100ns();
-        let result = crate::virtio::ctrl::set_cursor_blob(passive, adapter, cmd, HOST_TIMEOUT_MS);
+        // The cursor queue when the transport has one (never behind Venus traffic), else the
+        // control queue (`HwCursorQ` = 0, or a host or VMM without the queue).
+        let result = match crate::virtio::ctrl::set_cursor_blob_cursorq(
+            passive,
+            adapter,
+            cmd,
+            HOST_TIMEOUT_MS,
+        ) {
+            Some(r) => {
+                if matches!(r, Err(VirtioError::QueueFull)) {
+                    bump(&Q_BUSY);
+                }
+                r
+            }
+            None => crate::virtio::ctrl::set_cursor_blob(passive, adapter, cmd, HOST_TIMEOUT_MS),
+        };
         let t1 = now_100ns();
         let rtt = (t1.saturating_sub(t0) / 10).min(u64::from(u32::MAX)) as u32;
         let failure = match result {

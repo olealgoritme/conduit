@@ -14,7 +14,7 @@
 //! ```text
 //! qemu-system-x86_64 \
 //!   -chardev socket,id=nv,path=/tmp/nvgpu.sock \
-//!   -device vhost-user-test-device-pci,chardev=nv,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036 \
+//!   -device vhost-user-test-device-pci,chardev=nv,virtio-id=45,num_vqs=3,vq_size=256,config_size=4036 \
 //!   -object memory-backend-memfd,id=mem,size=8G,share=on -machine q35,memory-backend=mem
 //! ```
 //!
@@ -47,7 +47,7 @@ use device::shm_regions::{
 };
 #[cfg(feature = "venus")]
 use device::shm_regions::{SHM_ID_VENUS, region_sizes_with_venus};
-use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
+use device::virtio::{CURSOR_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
     DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT,
@@ -71,8 +71,11 @@ use vm_memory::{
 };
 
 /// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
-/// error from that call, so offering fewer is fatal before config is read.
-const QUEUE_COUNT: usize = NUM_QUEUES;
+/// error from that call, so offering fewer is fatal before config is read. A
+/// third, the cursor queue, is served when the VMM exposes it (`num_vqs=3`);
+/// the Linux driver finds its two and ignores it.
+const QUEUE_COUNT: usize = NUM_QUEUES + 1;
+const _: () = assert!(CURSOR_QUEUE == NUM_QUEUES);
 /// Largest response we will build for one request.
 const RESP_MAX: usize = 64 * 1024;
 
@@ -1487,6 +1490,10 @@ impl NvGpuBackend {
             && venus.enable_cursor()
         {
             self.config.set_venus_cursor();
+            // ...on its own queue, served ahead of the control queue's Venus
+            // traffic (it only works where the VMM has `num_vqs=3`; the guest
+            // checks that the queue exists).
+            self.config.set_cursor_queue();
         }
         self.nvidia.lock().expect("backend mutex").set_venus(venus);
         self.venus.hostmem_len = hostmem_len;
@@ -1624,23 +1631,45 @@ impl NvGpuBackend {
     /// Whether to trace is decided here, once per drain, and the drain itself
     /// is compiled twice: with tracing off it is exactly the untraced loop,
     /// with no per-request check at all (docs/TRACING.md).
+    /// Serve `vring`. With `prio` (the cursor queue, when `vring` is the
+    /// control queue), `prio` is served first and again after every control
+    /// request, so a cursor command waits for at most one control request,
+    /// never for the queue's whole backlog of Venus traffic.
     fn process(
         &mut self,
         vring: &VringRwLock,
+        prio: Option<&VringRwLock>,
         mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
     ) -> std::io::Result<bool> {
         #[cfg(feature = "trace")]
         if device::trace::enabled() {
-            return self.drain::<true>(vring, mem);
+            return self.drain::<true>(vring, prio, mem);
         }
-        self.drain::<false>(vring, mem)
+        self.drain::<false>(vring, prio, mem)
+    }
+
+    /// Serve the cursor queue now, if it has anything, and tell the guest.
+    fn serve_prio<const TRACE: bool>(
+        &mut self,
+        prio: Option<&VringRwLock>,
+        mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
+    ) -> std::io::Result<()> {
+        if let Some(p) = prio
+            && self.drain::<TRACE>(p, None, mem)?
+        {
+            p.signal_used_queue()
+                .map_err(|e| std::io::Error::other(format!("signal used queue: {e}")))?;
+        }
+        Ok(())
     }
 
     fn drain<const TRACE: bool>(
         &mut self,
         vring: &VringRwLock,
+        prio: Option<&VringRwLock>,
         mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
     ) -> std::io::Result<bool> {
+        self.serve_prio::<TRACE>(prio, mem)?;
         let mut used = false;
         loop {
             let mut guard = vring.get_mut();
@@ -1733,6 +1762,7 @@ impl NvGpuBackend {
                         // submit (docs/research/host-roundtrip-latency.md).
                         used |= !self.latency.quiet_held;
                         self.served = true;
+                        self.serve_prio::<TRACE>(prio, mem)?;
                         continue;
                     }
                     drop(nvidia);
@@ -1761,6 +1791,7 @@ impl NvGpuBackend {
             }
             used = true;
             self.served = true;
+            self.serve_prio::<TRACE>(prio, mem)?;
         }
         Ok(used)
     }
@@ -1929,6 +1960,15 @@ impl VhostUserBackendMut for NvGpuBackend {
             .memory();
 
         let vring = &vrings[device_event as usize];
+        // The cursor queue rides along with every control drain (`process`);
+        // a kick on it alone is served here like any queue, with no
+        // interleaving and no held chains (those are the control queue's).
+        let cursor = device_event as usize == CURSOR_QUEUE;
+        let prio = if cursor {
+            None
+        } else {
+            vrings.get(CURSOR_QUEUE)
+        };
         device::stage::kick();
         let mut used = false;
         if self.event_idx {
@@ -1936,16 +1976,18 @@ impl VhostUserBackendMut for NvGpuBackend {
             // drain again rather than waiting for a kick that will not come.
             loop {
                 vring.disable_notification().ok();
-                used |= self.process(vring, &mem)?;
+                used |= self.process(vring, prio, &mem)?;
                 if !vring.enable_notification().unwrap_or(false) {
                     break;
                 }
             }
         } else {
-            used |= self.process(vring, &mem)?;
+            used |= self.process(vring, prio, &mem)?;
         }
         #[cfg(feature = "venus")]
-        self.venus_complete(vring, &mem);
+        if !cursor {
+            self.venus_complete(vring, &mem);
+        }
         // After serving, not before: a message that opened a descriptor has to
         // have been served for the backend to know about it.
         self.sync_watches(vrings);

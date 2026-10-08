@@ -1234,6 +1234,56 @@ pub fn set_cursor_blob(
     ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
+/// `HELIOS_CMD_SET_CURSOR_BLOB` on the cursor queue (`gpu::cursor_ring`), when the transport has
+/// one (`Some`); `None` when it has none (the caller uses [`set_cursor_blob`]). Polls for the
+/// answer at PASSIVE: first a short spin (a backend that serves the cursor queue ahead of the
+/// control queue answers within one control request), then 1 ms sleeps, up to `timeout_ms`.
+/// `Timeout`: the command is still on the queue and the host runs it late. `QueueFull`: the
+/// previous command is still out and this one was not sent.
+pub fn set_cursor_blob_cursorq(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    mut cmd: HeliosSetCursorBlob,
+    timeout_ms: u64,
+) -> Option<Result<(), VirtioError>> {
+    use crate::virtio::gpu::CursorPoll;
+    cmd.hdr = VirtioGpuCtrlHdr::zeroed();
+    cmd.hdr.type_ = HELIOS_CMD_SET_CURSOR_BLOB;
+    match adapter.with_virtio(|v| v.cursor_queue_on().then(|| v.cursor_send(bytes_of(&cmd)))) {
+        Err(_) => return Some(Err(VirtioError::DeviceError)),
+        Ok(None) => return None,
+        Ok(Some(Err(e))) => return Some(Err(e)),
+        Ok(Some(Ok(()))) => {}
+    }
+    let poll = || match adapter.with_virtio(|v| v.cursor_poll()) {
+        Ok(CursorPoll::Done(ok)) => Some(if ok {
+            Ok(())
+        } else {
+            Err(VirtioError::DeviceError)
+        }),
+        Ok(CursorPoll::Pending) => None,
+        // Reaped by someone else (a racing send cannot happen: the caller holds the cursor
+        // gate), or the transport is gone.
+        Ok(CursorPoll::Idle) => Some(Ok(())),
+        Err(_) => Some(Err(VirtioError::DeviceError)),
+    };
+    let start = crate::adapter::foreign_scanout::now_100ns();
+    // Spin up to 2 ms: the answer normally comes in well under one.
+    while crate::adapter::foreign_scanout::now_100ns().saturating_sub(start) < 20_000 {
+        if let Some(r) = poll() {
+            return Some(r);
+        }
+        core::hint::spin_loop();
+    }
+    while crate::adapter::foreign_scanout::now_100ns().saturating_sub(start) < timeout_ms * 10_000 {
+        if let Some(r) = poll() {
+            return Some(r);
+        }
+        sleep_ms(passive, 1);
+    }
+    Some(poll().unwrap_or(Err(VirtioError::Timeout)))
+}
+
 /// Encode one `SET_SCANOUT_BLOB` into `cmd`, whoever owns the storage.
 ///
 /// THE ONE ENCODER. Its two callers are the synchronous round-trip above, which

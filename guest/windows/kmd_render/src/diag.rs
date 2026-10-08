@@ -1450,6 +1450,12 @@ pub mod knobs {
     /// (every shape then fails over to the software cursor on a host without it). Read with the
     /// other adapter knobs (a change applies at the next StartDevice); mirrored as `CurKnob`.
     pub const HW_CURSOR: KnobName = KnobName::new(b"HwCursor");
+    /// `HwCursorQ` (default 1): send the hardware cursor's commands on the cursor queue
+    /// (virtqueue 2, `virtio/gpu/cursor_ring.rs`) when the host announces it
+    /// (`NVGPU_CFG_CURSOR_QUEUE`) and the VMM exposes it (`num_vqs=3`), so they never wait behind
+    /// Venus traffic. 0 keeps them on the control queue (the fallback, and the old path). Read at
+    /// StartDevice; mirrored as `CurQ`.
+    pub const HW_CURSOR_Q: KnobName = KnobName::new(b"HwCursorQ");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,

@@ -464,6 +464,16 @@ pub const NVGPU_CFG_GUEST_BLOB: u32 = 1 << 16;
 /// proposed host vblank feature.
 pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 
+/// Device config `features` bit, only together with [`NVGPU_CFG_VENUS_CURSOR`]:
+/// the backend serves a third virtqueue, the cursor queue (index 2, like
+/// virtio-gpu's cursorq), with the same messages as the control queue. A guest
+/// that sends its cursor commands there never waits behind Venus `GpuCmd`
+/// traffic: the backend serves the cursor queue first, between any two control
+/// requests. A guest also needs the VMM to expose the queue (`num_vqs=3`).
+/// Bit 19 is the presentation-feedback virtio feature's (config bit 19 stays
+/// unused), bit 17 the host vblank proposal's.
+pub const NVGPU_CFG_CURSOR_QUEUE: u32 = 1 << 20;
+
 /// A **virtio device feature** the guest acks (like [`NVGPU_CFG_TAKES_INPUT`],
 /// not a config `features` bit; config bit 15 stays unused): the guest wants
 /// `ScanoutReleased` events. The backend offers it in its device features
@@ -1254,6 +1264,7 @@ mod tests {
         assert_eq!(NVGPU_CFG_RM_RESOURCE_IMPORT, 1 << 14);
         // Bit 17 is the proposed host vblank feature's.
         assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
+        assert_eq!(NVGPU_CFG_CURSOR_QUEUE, 1 << 20);
         let r = RmResourceImport {
             owner_handle: 9,
             resource_id: 50,

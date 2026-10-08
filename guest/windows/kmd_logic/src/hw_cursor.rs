@@ -372,7 +372,7 @@ pub const fn retry_due(now: u64, last_try: u64) -> bool {
 
 /// Counter names (`kmd_render/src/ddi/hw_cursor.rs`), at most 14 characters, in the order the
 /// driver writes them.
-pub const COUNTERS: [&str; 20] = [
+pub const COUNTERS: [&str; 22] = [
     "CurKnob",
     "CurCaps",
     "CurShapeN",
@@ -393,6 +393,8 @@ pub const COUNTERS: [&str; 20] = [
     "CurSwMs",   // the last episode's length, ms
     "CurSwMax",  // the longest, ms
     "CurRetry",  // commands sent again after one that never reached the queue
+    "CurQ",      // 1: the commands go on the cursor queue (virtqueue 2), 0: the control queue
+    "CurQBusy",  // cursor-queue sends deferred: the previous command was still out
 ];
 
 #[cfg(test)]
