@@ -1591,6 +1591,9 @@ pub const COUNTERS: &[&str] = &[
     // system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down).
     "GdiSysWhy",
     "GdiSysMsk",
+    // The last staging-path copy or fill that ran on the CPU: opcode | src class << 4 | dst class
+    // << 8 | same buffer << 12 | GdiPaths << 16 | stage << 24 (1 path off, 2 refused, 3 failed).
+    "GdiSysCpuK",
     // Unreachable surfaces: count, the last one's identity (storage << 24 | kind << 16 | foreign
     // layout << 8 | foreign identity << 9 | direct scanout << 10) and extent.
     "GdiUnrN",
@@ -2015,9 +2018,9 @@ mod tests {
         }
         // `FlipLat` is the prefix of `FlipLat0..` histogram names; `NvSpinUs` mirrors its own
         // clamped effective value under the knob's name (an existing pattern, stable because the
-        // mirror equals what the read will return next time). The `Msi*` names are the MSI
-        // latch, breaker and start markers that `virtio/msi.rs` writes on purpose to read them
-        // back on the next start.
+        // mirror equals what the read will return next time).
+        // The MSI breaker/latch state of `virtio/msi.rs` (on main): deliberate write-and-read-back
+        // values, the knob and the state being one registry value by design.
         const ALLOWED: &[&str] = &[
             "FlipLat",
             "NvSpinUs",
