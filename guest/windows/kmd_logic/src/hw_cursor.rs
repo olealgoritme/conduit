@@ -36,7 +36,14 @@ pub const FLAG_MASKED_COLOR: u32 = 1 << 2;
 /// `DXGK_DRIVERCAPS.PointerCaps` with the pointer on: all three.
 pub const POINTER_CAPS: u32 = FLAG_MONOCHROME | FLAG_COLOR | FLAG_MASKED_COLOR;
 
-/// `HwCursor` values. Absent is [`KNOB_ON`].
+/// `HwCursor` when the value is absent: [`KNOB_OFF`] (no pointer reported, dxgkrnl's software
+/// cursor). dxgkrnl has not used the reported pointer on this adapter (403.1: no SetPointerShape
+/// call with the pointer reported), and reporting it cost every shape and visibility change a
+/// blocking round trip and Heaven ten times the hitches. `HwCursor=1` reports it, for
+/// experiments (docs/independent-flip.md 12.3b).
+pub const KNOB_DEFAULT: u32 = KNOB_OFF;
+
+/// `HwCursor` values.
 pub const KNOB_OFF: u32 = 0;
 pub const KNOB_ON: u32 = 1;
 /// Advertise even when the host does not say it serves the cursor (bring-up: every shape then
@@ -451,6 +458,10 @@ mod tests {
             "cursor off"
         );
         assert!(advertise(KNOB_ON, true, None), "transport not up: the knob");
+        assert!(
+            !advertise(KNOB_DEFAULT, true, Some(host)),
+            "absent: no pointer reported"
+        );
         assert!(!advertise(KNOB_OFF, true, Some(host)));
         assert!(
             !advertise(KNOB_ON, false, Some(host)),
