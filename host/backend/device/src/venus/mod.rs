@@ -10,8 +10,8 @@
 //! this side has not seen created.
 //!
 //! `mod.rs` holds the state and the dispatch; display info, the EDID,
-//! contexts and capsets are in `cmd.rs` (the EDID's bytes in `edid.rs`), blobs and region 3 in `blob.rs`, RM-export blobs in `rm.rs`, guest-memory blobs in `guest.rs`, fences in `fence.rs` and the
-//! scanout in `scanout.rs`.
+//! contexts and capsets are in `cmd.rs` (the EDID's bytes in `edid.rs`), blobs and region 3 in `blob.rs`, RM-export blobs in `rm.rs`, guest-memory blobs in `guest.rs`, fences in `fence.rs`, the
+//! scanout in `scanout.rs` and the guest's hardware cursor in `cursor.rs`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -25,6 +25,7 @@ use crate::shm::WindowPlacer;
 
 mod blob;
 mod cmd;
+mod cursor;
 pub mod edid;
 mod fence;
 mod guest;
@@ -168,6 +169,12 @@ pub struct Venus {
     stages: RendererStages,
     /// `--latency fused-submit` ([`Venus::set_fused_submit`]).
     fused_submit: bool,
+    /// `CMD_SET_CURSOR_BLOB` is served (`cursor.rs`).
+    cursor_on: bool,
+    /// The resource the guest's cursor shows, while shown.
+    cursor: Option<u32>,
+    /// `CursorUpdate::seq` of the last cursor update.
+    cursor_seq: u32,
 }
 
 /// The renderer's half of stage timing: whether it can stamp, whether it
@@ -213,6 +220,9 @@ impl Venus {
             guest_live: Default::default(),
             refusal_errno: None,
             is_dmabuf: rm::is_dmabuf,
+            cursor_on: false,
+            cursor: None,
+            cursor_seq: 0,
             renderer,
             hostmem_len,
             display,
@@ -641,6 +651,11 @@ impl Venus {
                 self.count("set_scanout_blob");
                 self.set_scanout_blob(&SetScanoutBlob::from_bytes(b).expect("length checked"), env)
             }
+            CMD_SET_CURSOR_BLOB => {
+                exact(SetCursorBlob::LEN)?;
+                self.count("set_cursor_blob");
+                self.set_cursor_blob(&SetCursorBlob::from_bytes(b).expect("length checked"), env)
+            }
             CMD_RESOURCE_FLUSH => {
                 exact(ResourceFlush::LEN)?;
                 self.count("resource_flush");
@@ -706,6 +721,10 @@ impl Venus {
             && let Some(link) = display
         {
             link.disable();
+        }
+        // The cursor's resource goes too, and the next generation reuses ids.
+        if self.cursor.is_some() {
+            self.hide_cursor(display);
         }
         if tell {
             for (&id, r) in &self.resources {
