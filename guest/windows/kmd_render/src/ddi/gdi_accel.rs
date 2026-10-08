@@ -252,6 +252,7 @@ unsafe fn surface_at(
         height: info.height,
         pitch: info.pitch,
         class,
+        format: info.format,
     })
 }
 

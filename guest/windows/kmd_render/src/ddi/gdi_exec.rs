@@ -578,12 +578,16 @@ fn submit_and_wait(passive: PassiveLevel, op: &Op, dv: &CeView, sv: Option<&CeVi
             }
         }
         (Cmd::BitBlt { src: sr, dst: dr, .. }, Some(sv)) => {
+            let swap = match (op.srcs[0], op.dst) {
+                (Some(a), Some(b)) => ga::swaps_rb(&a, &b),
+                _ => false,
+            };
             let per = ga::rects_per_push(glue::SLOT_DWORDS, 0, ga::COPY_RECT_DWORDS).max(1);
             for chunk in op.subs.chunks(per) {
                 let v = glue::submit(|p, gen, done| {
                     for r in chunk {
                         let s = ga::bitblt_src(r, &dr, &sr);
-                        ga::copy_rect(p, gen, sv, &s, dv, r)?;
+                        ga::copy_rect(p, gen, sv, &s, dv, r, swap)?;
                     }
                     cp::release(p, done)
                 });
@@ -676,8 +680,16 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                         submit_and_wait(passive, op, &dv, Some(sv))
                     })
                 }
+                (SurfaceClass::System, SurfaceClass::System) if src.resource_id == dst.resource_id => {
+                    // Within one staging buffer (disjoint: an overlapping one is planned `Overlap`
+                    // and never comes here): one view serves both sides.
+                    let p = map_pitch(&dst, dpc);
+                    glue::with_standard(passive, adapter, dst.resource_id, p, dst.width, dst.height, |v| {
+                        submit_and_wait(passive, op, v, Some(v))
+                    })
+                }
                 _ => {
-                    // Staging to staging: no copy-engine view of two buffers at once.
+                    // Staging to another staging buffer: no copy-engine view of two buffers at once.
                     sys_refused(1, 1);
                     SYS_REF.fetch_add(1, Ordering::Relaxed);
                     return false;
@@ -866,6 +878,11 @@ fn run_cpu_copy(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &
             continue;
         }
         let mut buf = read_window(passive, adapter, &src, &s, spitch)?;
+        if ga::swaps_rb(&src, dst) {
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
         write_window(passive, adapter, dst, &d, dpitch, &mut buf)?;
     }
     Ok(())
