@@ -330,7 +330,15 @@ pub(crate) fn advertised(adapter: &AdapterContext) -> bool {
     // key's `DisplayHalf` (the same default, 1).
     let snap = adapter.knobs();
     let started = adapter.started().is_some();
-    let knob = crate::diag::read_config_dword(crate::diag::knobs::HW_CURSOR, hc::KNOB_DEFAULT);
+    // Absent: on with independent flip (`IndepFlip`, read the same way as the caps), else off.
+    let indep_flip = crate::diag::read_config_dword(
+        crate::diag::knobs::INDEP_FLIP,
+        helios_kmd_logic::independent_flip::KNOB_DEFAULT,
+    );
+    let knob = crate::diag::read_config_dword(
+        crate::diag::knobs::HW_CURSOR,
+        hc::knob_default_for(indep_flip),
+    );
     let display_half = if started {
         snap.display_half
     } else {
