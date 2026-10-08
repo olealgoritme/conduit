@@ -1408,6 +1408,11 @@ pub mod knobs {
     /// and a DMA-buffer flip of an unregistered Venus allocation completes as a kept picture
     /// instead of failing (`PBFlip` 0xE6). Read with the other adapter knobs; mirrored as `IdfKnob`.
     pub const INDEP_FLIP: KnobName = KnobName::new(b"IndepFlip");
+    /// `D3d12Node` (default 0): 1 reports a second 3D node (ordinal 1) for the D3D12 UMD's
+    /// contexts (`Umd12ContextNode`), completed independently of node 0 (DWM, D3D11,
+    /// presents, paging): `virtio::gpu::MAX_WDDM_NODES`. Read with the other adapter knobs at
+    /// AddAdapter; the node count dxgkrnl got then is kept until the adapter restarts.
+    pub const D3D12_NODE: KnobName = KnobName::new(b"D3d12Node");
     /// `IdfRedirSkip` (default 0; `helios_kmd_logic::independent_flip::KNOB_REDIR_SKIP`): with
     /// `IndepFlip` on, a Present carrying `RedirectedFlip` on the Blt arm completes with no copy.
     /// An experiment (docs/independent-flip.md 13.5). Read at StartDevice; counted `IdfRedSkip`.

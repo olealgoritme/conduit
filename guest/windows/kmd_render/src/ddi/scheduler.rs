@@ -63,10 +63,11 @@ pub unsafe extern "C" fn dxgkddi_query_dependent_engine_group(
     }
 
     let query = unsafe { &mut *query };
-    if query.NodeOrdinal != 0 || query.EngineOrdinal != 0 {
+    if !crate::virtio::gpu::wddm_node_valid(query.NodeOrdinal) || query.EngineOrdinal != 0 {
         return STATUS_INVALID_PARAMETER;
     }
 
+    // `D3d12Node`: the D3D12 node is independent of node 0.
     query.DependentNodeOrdinalMask = 0;
     STATUS_SUCCESS
 }
@@ -80,7 +81,7 @@ pub unsafe extern "C" fn dxgkddi_query_engine_status(
     }
 
     let query = unsafe { &mut *query };
-    if query.NodeOrdinal != 0 || query.EngineOrdinal != 0 {
+    if !crate::virtio::gpu::wddm_node_valid(query.NodeOrdinal) || query.EngineOrdinal != 0 {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -103,9 +104,10 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
     }
 
     let reset = unsafe { &mut *reset };
-    if reset.NodeOrdinal != 0 || reset.EngineOrdinal != 0 {
+    if !crate::virtio::gpu::wddm_node_valid(reset.NodeOrdinal) || reset.EngineOrdinal != 0 {
         return STATUS_INVALID_PARAMETER;
     }
+    let reset_node = reset.NodeOrdinal;
 
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     // Engine reset aborts the node's outstanding submissions: drop the pending
@@ -117,10 +119,15 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
         crate::ddi::AbandonOutcome::ReportLastAborted {
             out: &mut reset.LastAbortedFenceId,
         },
+        Some(reset_node),
     );
-    adapter.with_wddm_notify_lock(|guard| {
-        let _ = guard.with_virtio(|order, v| v.purge_all_present_streams_ordered(order));
-    });
+    // Present streams are node 0's (DWM, D3D11 presents); a reset of the D3D12
+    // node (`D3d12Node`) leaves them.
+    if reset_node == 0 {
+        adapter.with_wddm_notify_lock(|guard| {
+            let _ = guard.with_virtio(|order, v| v.purge_all_present_streams_ordered(order));
+        });
+    }
     STATUS_SUCCESS
 }
 
@@ -219,7 +226,7 @@ pub unsafe extern "C" fn dxgkddi_switch_to_hw_context_list(
     }
 
     let args = unsafe { &*args };
-    if args.NodeOrdinal != 0 || args.EngineOrdinal != 0 {
+    if !crate::virtio::gpu::wddm_node_valid(args.NodeOrdinal) || args.EngineOrdinal != 0 {
         return STATUS_INVALID_PARAMETER;
     }
 

@@ -7,6 +7,7 @@
 
 use core::ffi::c_void;
 use core::mem::{offset_of, size_of};
+use core::sync::atomic::Ordering;
 
 use crate::dxgk::_D3DKMDT_COMPUTE_PREEMPTION_GRANULARITY::D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
 use crate::dxgk::_D3DKMDT_GRAPHICS_PREEMPTION_GRANULARITY::D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
@@ -467,7 +468,11 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // display was an IddCx capture and the KMD scanned out nothing; that premise is gone.)
     let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
-    let nb_asymetric_processing_nodes: UINT = 1;
+    // `D3d12Node`: a second 3D node (ordinal 1) for the D3D12 UMD's contexts,
+    // completed independently of node 0 (`virtio::gpu`, "WDDM nodes"). The count
+    // dxgkrnl gets here is the one every per-node path validates against.
+    let nb_asymetric_processing_nodes: UINT = if knobs.d3d12_node { 2 } else { 1 };
+    crate::virtio::gpu::WDDM_NODE_COUNT.store(nb_asymetric_processing_nodes, Ordering::Relaxed);
     out.set(
         caps_offset!(
             GpuEngineTopology,
@@ -1279,8 +1284,8 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
 ) -> NTSTATUS {
     // DIAG: log node-metadata enumeration during AddAdapter.
     crate::diag::record(0x0300_0000 | (node_ordinal & 0xFFFF));
-    // Only node 0 exists; any other ordinal is out of range.
-    if get_node_metadata.is_null() || node_ordinal != 0 {
+    // Node 0, and node 1 with `D3d12Node`; any other ordinal is out of range.
+    if get_node_metadata.is_null() || !crate::virtio::gpu::wddm_node_valid(node_ordinal) {
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: non-null per the check above; Dxgkrnl provides a writable

@@ -2094,6 +2094,45 @@ struct WddmPending {
     /// Interrupt time (100 ns) the entry was queued at SubmitCommand, for the
     /// queue-depth / hold-time counters (`publish_wddm_queue_counters`).
     queued_100ns: u64,
+    /// The WDDM node it was submitted on (`D3d12Node`); completion is in order
+    /// per node.
+    node: u8,
+}
+
+// ---- WDDM nodes (`D3d12Node`) ---------------------------------------------------
+//
+// With `D3d12Node` = 1 the adapter reports two 3D nodes: node 0 for everything it
+// had before (DWM, D3D11, presents, paging) and node 1 for the D3D12 UMD's
+// contexts (it asks for node 1 at CreateContext, `Umd12ContextNode`). Every node
+// has its own SubmissionFenceId sequence and its own in-order completion, so a
+// D3D12 batch waiting for its RM fence no longer holds back DWM's packets, and a
+// slow present no longer holds back the D3D12 batches behind it: the pending
+// FIFO stays one queue, but each node completes from its own first entry.
+/// Most WDDM nodes this driver can report.
+pub const MAX_WDDM_NODES: usize = 2;
+/// WDDM nodes reported, fixed when the caps were answered (AddAdapter).
+pub static WDDM_NODE_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// Nodes reported now (1 or 2).
+pub fn wddm_node_count() -> u32 {
+    WDDM_NODE_COUNT
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_WDDM_NODES as u32)
+}
+
+/// Whether `node` is one this adapter reported.
+pub fn wddm_node_valid(node: u32) -> bool {
+    node < wddm_node_count()
+}
+
+/// `node` if reported, else 0 (dxgkrnl only names reported nodes; this keeps an
+/// impossible one from indexing past the per-node state).
+pub fn wddm_node_of(node: u32) -> u32 {
+    if wddm_node_valid(node) {
+        node
+    } else {
+        0
+    }
 }
 
 // ---- WDDM queue depth and hold time (`Qd*`) -----------------------------------
@@ -2344,6 +2383,11 @@ pub enum WddmTake {
 impl WddmReady {
     pub fn fence(&self) -> u32 {
         self.pending.fence
+    }
+
+    /// The WDDM node the fence belongs to (`D3d12Node`).
+    pub fn node(&self) -> u32 {
+        u32::from(self.pending.node)
     }
 
     /// Whether this fence was released by the `WddmHeadMs` rebase (its tagged
@@ -2653,8 +2697,10 @@ pub struct VirtioGpu {
     wddm_pending: VecDeque<WddmPending>,
     /// `Qd*`: when the last FIFO entry was popped (100 ns; the next entry
     /// became head then) and whether it was an execution packet.
-    qd_last_pop_100ns: u64,
-    qd_last_pop_execution: bool,
+    qd_last_pop_100ns: [u64; MAX_WDDM_NODES],
+    qd_last_pop_execution: [bool; MAX_WDDM_NODES],
+    /// The node `take_one_ready_wddm` tries first (alternates).
+    wddm_next_node: u8,
     /// Bounded two-phase WindowedBlt transactions. Both deques reserve at
     /// StartDevice, so Present/Submit/DPC mutations never allocate under the
     /// virtio spinlock.
@@ -3291,8 +3337,9 @@ impl VirtioGpu {
             next_wire_fence: wire_fence_base,
             wire_fence_base,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
-            qd_last_pop_100ns: 0,
-            qd_last_pop_execution: false,
+            qd_last_pop_100ns: [0; MAX_WDDM_NODES],
+            qd_last_pop_execution: [false; MAX_WDDM_NODES],
+            wddm_next_node: 0,
             windowed_blt: WindowedBltState::new(),
             blt_async: blt_async::BltAsyncState::new(),
             // Snapshotted at transport init like every other knob, so
@@ -7998,9 +8045,21 @@ impl VirtioGpu {
     pub fn terminal_abandon_wddm_epoch(
         &mut self,
         _order: &crate::adapter::NotifyOrdered<'_>,
+        // `Some(node)`: only that node's entries (ResetEngine, `D3d12Node`);
+        // `None`: every node (ResetFromTimeout).
+        node: Option<u32>,
     ) -> u32 {
-        let n = self.wddm_pending.len() as u32;
-        while let Some(pending) = self.wddm_pending.pop_front() {
+        let mut n = 0u32;
+        let mut i = 0;
+        while i < self.wddm_pending.len() {
+            if node.is_some_and(|node| u32::from(self.wddm_pending[i].node) != node) {
+                i += 1;
+                continue;
+            }
+            let Some(pending) = self.wddm_pending.remove(i) else {
+                break;
+            };
+            n += 1;
             if let Some(prefix) = pending
                 .blt_token
                 .zip(pending.blt_stream_boundary)
@@ -8008,6 +8067,11 @@ impl VirtioGpu {
             {
                 self.abandon_windowed_blt_wddm_prefix(prefix);
             }
+        }
+        // The WindowedBlt ledger is node 0's (presents); a D3D12-node reset
+        // leaves it.
+        if node.is_some_and(|node| node != 0) {
+            return n;
         }
         while let Some((token, boundary, adapter)) =
             self.windowed_blt.pending.iter().find_map(|request| {
@@ -8192,7 +8256,10 @@ impl VirtioGpu {
         // `GdiAccel`: the GDI job sequence (`ddi/gdi_exec.rs`) this packet's commands are; the
         // fence waits until the executor's watermark reaches it.
         gdi_seq: Option<u64>,
+        // The WDDM node (`D3d12Node`); 0 unless the adapter reports two.
+        node: u32,
     ) -> bool {
+        let node = node.min(MAX_WDDM_NODES as u32 - 1) as u8;
         if self.failed {
             // Transport failure is not producer completion. Let the scheduler
             // reset the failed epoch; never advance its successful watermark.
@@ -8462,7 +8529,7 @@ impl VirtioGpu {
             (None, _) => true,
             _ => false,
         };
-        if self.wddm_pending.is_empty()
+        if !self.wddm_pending.iter().any(|pending| pending.node == node)
             && self.wire_boundary_ready(watermark, domain, wire_boundary)
             && stream_ready
             && execution.map_or(true, |wait| wait.completed())
@@ -8482,7 +8549,10 @@ impl VirtioGpu {
             qd_note_submit(1, d3d12);
             return true;
         }
-        qd_note_submit(self.wddm_pending.len() + 1, execution.is_some());
+        qd_note_submit(
+            self.wddm_pending.iter().filter(|pending| pending.node == node).count() + 1,
+            execution.is_some(),
+        );
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
             // Losing a pending boundary cannot complete any of its successors.
             // Fail the transport and retain the FIFO until scheduler reset.
@@ -8504,6 +8574,7 @@ impl VirtioGpu {
             rebased: false,
             gdi_seq,
             queued_100ns: qd_now_100ns(),
+            node,
         });
         false
     }
@@ -8633,9 +8704,41 @@ impl VirtioGpu {
         if self.failed {
             return WddmTake::BlockedOnProducer;
         }
+        // Each node completes from its own first entry (`D3d12Node`); with one
+        // node this is exactly the old single-head FIFO. The start alternates so
+        // a node that is always ready cannot starve the other within a drain.
+        let nodes = wddm_node_count() as u8;
+        let first = self.wddm_next_node % nodes;
+        self.wddm_next_node = (first + 1) % nodes;
+        let mut blocked = false;
+        for k in 0..nodes {
+            let node = (first + k) % nodes;
+            match self.take_one_ready_wddm_node(node) {
+                WddmTake::Ready(ready) => return WddmTake::Ready(ready),
+                WddmTake::BlockedOnProducer => blocked = true,
+                WddmTake::Empty => {}
+            }
+        }
+        if blocked {
+            WddmTake::BlockedOnProducer
+        } else {
+            WddmTake::Empty
+        }
+    }
+
+    /// The first pending entry of `node`.
+    fn wddm_head_index(&self, node: u8) -> Option<usize> {
+        self.wddm_pending.iter().position(|pending| pending.node == node)
+    }
+
+    /// [`Self::take_one_ready_wddm`] for one node's head.
+    fn take_one_ready_wddm_node(&mut self, node: u8) -> WddmTake {
+        let Some(head_index) = self.wddm_head_index(node) else {
+            return WddmTake::Empty;
+        };
         if self
             .wddm_pending
-            .front()
+            .get(head_index)
             .and_then(|head| head.execution)
             .is_some_and(|wait| !wait.completed())
         {
@@ -8663,7 +8766,7 @@ impl VirtioGpu {
                 hold_until,
                 gdi_seq,
             ) = {
-                let Some(head) = self.wddm_pending.front() else {
+                let Some(head) = self.wddm_pending.get(head_index) else {
                     return WddmTake::Empty;
                 };
                 (
@@ -8696,7 +8799,7 @@ impl VirtioGpu {
             }
             if !stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary)) {
                 WDDM_HEAD_BLOCKED_STREAM.fetch_add(1, Ordering::Relaxed);
-                if pass == 1 && self.rebase_blocked_head(RebaseArm::Stream) {
+                if pass == 1 && self.rebase_blocked_head(RebaseArm::Stream, head_index) {
                     continue;
                 }
                 return WddmTake::BlockedOnProducer;
@@ -8709,7 +8812,7 @@ impl VirtioGpu {
                 _ => false,
             } {
                 WDDM_HEAD_BLOCKED_BLT.fetch_add(1, Ordering::Relaxed);
-                if pass == 1 && self.rebase_blocked_head(RebaseArm::Blt) {
+                if pass == 1 && self.rebase_blocked_head(RebaseArm::Blt, head_index) {
                     continue;
                 }
                 return WddmTake::BlockedOnProducer;
@@ -8740,14 +8843,15 @@ impl VirtioGpu {
                     return WddmTake::BlockedOnProducer;
                 }
             }
-            let Some(pending) = self.wddm_pending.pop_front() else {
+            let Some(pending) = self.wddm_pending.remove(head_index) else {
                 return WddmTake::Empty;
             };
             {
                 // `Qd*`: behind = queued until it became head (the previous pop),
                 // own = head until now.
                 let now = qd_now_100ns();
-                let became_head = pending.queued_100ns.max(self.qd_last_pop_100ns).min(now);
+                let n = usize::from(node);
+                let became_head = pending.queued_100ns.max(self.qd_last_pop_100ns[n]).min(now);
                 if pending.execution.is_some() {
                     let behind_us = became_head.saturating_sub(pending.queued_100ns) / 10;
                     let own_us = now.saturating_sub(became_head) / 10;
@@ -8756,12 +8860,12 @@ impl VirtioGpu {
                     QD_EX_BEHIND_US.fetch_add(behind_us as u32, Ordering::Relaxed);
                     QD_EX_OWN_HIST[qd_bucket(own_us)].fetch_add(1, Ordering::Relaxed);
                     QD_EX_BEHIND_HIST[qd_bucket(behind_us)].fetch_add(1, Ordering::Relaxed);
-                    if behind_us != 0 && !self.qd_last_pop_execution {
+                    if behind_us != 0 && !self.qd_last_pop_execution[n] {
                         QD_EX_BEHIND_OTHER.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                self.qd_last_pop_100ns = now;
-                self.qd_last_pop_execution = pending.execution.is_some();
+                self.qd_last_pop_100ns[n] = now;
+                self.qd_last_pop_execution[n] = pending.execution.is_some();
             }
             let terminal_prefix = match (blt_token, blt_stream_boundary) {
                 (Some(token), Some(boundary)) => WindowedBltTerminalPrefix::new(token, boundary),
@@ -8826,12 +8930,12 @@ impl VirtioGpu {
     /// in costs one relaxed `fetch_add` on the path that already writes three of
     /// them, and turns an undiagnosable price tag into an attributed one
     /// (`WfBRebS`/`WfBRebB`, which partition `WfBReb`).
-    fn rebase_blocked_head(&mut self, arm: RebaseArm) -> bool {
+    fn rebase_blocked_head(&mut self, arm: RebaseArm, head_index: usize) -> bool {
         // Exact execution packets must preserve every completion obligation,
         // including a Present copy batched beside the ECL tail.
         if self
             .wddm_pending
-            .front()
+            .get(head_index)
             .is_some_and(|head| head.execution.is_some())
         {
             return false;
@@ -8848,7 +8952,7 @@ impl VirtioGpu {
         // Read before the mutable borrow of the FIFO below.
         let rebase_watermark = self.next_wire_fence;
         let abandoned_prefix = {
-            let Some(head) = self.wddm_pending.front_mut() else {
+            let Some(head) = self.wddm_pending.get_mut(head_index) else {
                 return false;
             };
             // The arm/wait/expire state machine is
@@ -8934,9 +9038,25 @@ impl VirtioGpu {
     /// unfinished DMA buffers with fresh fence ids after the preempt completes;
     /// the underlying venus work keeps executing host-side). Returns the count
     /// dropped.
-    pub fn preempt_flush(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> u32 {
-        let n = self.wddm_pending.len() as u32;
-        self.wddm_pending.clear();
+    pub fn preempt_flush(
+        &mut self,
+        _order: &crate::adapter::NotifyOrdered<'_>,
+        // `Some(node)`: only that node's entries (`D3d12Node`); `None`: all.
+        node: Option<u32>,
+    ) -> u32 {
+        let before = self.wddm_pending.len();
+        match node {
+            None => self.wddm_pending.clear(),
+            Some(node) => self
+                .wddm_pending
+                .retain(|pending| u32::from(pending.node) != node),
+        }
+        let n = (before - self.wddm_pending.len()) as u32;
+        // WindowedBlt admission is node 0's (presents); a D3D12-node preempt
+        // leaves it.
+        if node.is_some_and(|node| node != 0) {
+            return n;
+        }
         // Scheduler residency admission was revoked. A request that has not
         // reached ring 1 must await the resubmitted DMA buffer's exact token;
         // dispatching it merely because its producer happened to retire would
