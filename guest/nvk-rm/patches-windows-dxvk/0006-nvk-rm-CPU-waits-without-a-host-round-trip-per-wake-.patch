@@ -30,24 +30,12 @@ with pause instructions before blocking, instead of NVK_RM_WAIT_SPIN
 thrd_yield calls, for measuring the wake latency of the event path (~140
 us host event round trip) against spinning.
 ---
- build-win-pkgconfig/rmclient.pc             |   4 +
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  30 +++++
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  | 130 +++++++++++++++++---
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   1 +
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c |  40 ++++--
- 5 files changed, 182 insertions(+), 23 deletions(-)
- create mode 100644 build-win-pkgconfig/rmclient.pc
+ 4 files changed, 178 insertions(+), 23 deletions(-)
 
-diff --git a/build-win-pkgconfig/rmclient.pc b/build-win-pkgconfig/rmclient.pc
-new file mode 100644
-index 0000000..3e2b966
---- /dev/null
-+++ b/build-win-pkgconfig/rmclient.pc
-@@ -0,0 +1,4 @@
-+Name: rmclient
-+Description: librmclient headers (Conduit); NVK loads librmclient.dll at runtime
-+Version: 0.1.0
-+Cflags: -I/steam/conduit-scratch/wt-d3d11sub/guest/rmclient/include -I/steam/conduit-scratch/wt-d3d11sub/guest/windows/protocol/include
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 index 77e6424..490b9e2 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
