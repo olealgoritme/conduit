@@ -948,6 +948,13 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         rio::bring_up(passive, adapter);
     }
     if ACTIVE.load(Ordering::Acquire) == 0 {
+        // Nothing of the route's in flight, but another user of the channel (the GDI executor's
+        // copies, `RedirVram`'s transfers, `ce_vram::wait` on a timeout) may have broken it: tear it
+        // down now (no route job to discharge, so `fail_channel` does nothing else), so the next
+        // bring-up makes a fresh one instead of the channel staying broken for the generation.
+        if rio::chan_view().broken {
+            fail_channel(passive, adapter);
+        }
         return;
     }
     settle(passive, adapter, false);
