@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 01:24:13 +0200
+Subject: [PATCH] nvk: macros of off-by-default paths stay empty,
+ NVK_INDIRECT_PUSH off
+
+pkg-405.9 raised continuous Xid 13 on the idle Windows desktop from
+install (DWM composes on NVK), about 100 a minute, also with
+NVK_INDIRECT_PUSH=0: ESR 0x404490 = 0x80000080 on BLACKWELL_A, the MME's
+exception status (nouveau's gf100 trap handler reads it as MACRO).
+
+Every NVK_MME_* macro is uploaded into the MME instruction RAM when a
+queue is created, back to back.  Measured with the builders on the host
+for BLACKWELL_A: 405.8's macros take 2976 dwords and ran clean; 0025's
+two NVK_MME_DRAW[_INDEXED]_INDIRECT_INLINE macros bring it to 3303
+dwords, which overflows the RAM, so macros every draw calls are corrupt
+whatever the knobs say.
+
+The macros of off-by-default paths are now only built when their knob is
+on (NVK_MDI_BATCH >= 2 for 0024's batch macros, NVK_INDIRECT_PUSH for
+0025's inline ones); otherwise each is the builder's empty macro (two
+instructions).  Default total: 2649 dwords; NVK_MDI_BATCH=64: 2988;
+NVK_INDIRECT_PUSH=1: 2964; both: 3303 again, so a warning is logged at
+queue creation when the total passes 3072 dwords (the RAM's exact size is
+not documented; 2976 is known to work, 3303 known to fail).
+
+NVK_INDIRECT_PUSH is also off by default now: its path is unproven on
+hardware.
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c | 40 +++++++++++++++++++++++++------
+ 1 file changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 347860aa..e8143756 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -181,7 +181,8 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
+       .engine_id = 0,
+    });
+ 
+-   for (uint32_t mme = 0, mme_pos = 0; mme < NVK_MME_COUNT; mme++) {
++   uint32_t mme_pos = 0;
++   for (uint32_t mme = 0; mme < NVK_MME_COUNT; mme++) {
+       size_t size;
+       uint32_t *dw = nvk_build_mme(&pdev->info, mme, &size);
+       if (dw == NULL)
+@@ -203,6 +204,15 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
+       free(dw);
+    }
+ 
++   /* See nvk_mme_draw_indirect_batch(): 2976 dwords worked on GB20x, 3303
++    * did not.  The exact size of the instruction RAM is not documented.
++    */
++   if (mme_pos > 3072) {
++      mesa_logw("NVK: MME macros take %u dwords, more than the 3072 known to "
++                "fit; macro calls may fault (NVK_MDI_BATCH and "
++                "NVK_INDIRECT_PUSH add macros)", mme_pos);
++   }
++
+    if (pdev->info.cls_eng3d >= TURING_A && pdev->info.cls_eng3d < BLACKWELL_A)
+       P_IMMD(p, NVC597, SET_MME_DATA_FIFO_CONFIG, FIFO_SIZE_SIZE_4KB);
+ 
+@@ -5581,6 +5591,8 @@ nvk_mme_draw_indirect(struct mme_builder *b)
+  * record's last dword, never past it.  gl_DrawID continues across the
+  * calls.
+  */
++static bool nvk_indirect_push(void);
++
+ #define NVK_MDI_FIFO_DW 1024u
+ #define NVK_MDI_BATCH_MAX 204u
+ 
+@@ -5648,31 +5660,45 @@ nvk_mme_build_draw_indirect_batch(struct mme_builder *b, bool indexed,
+    }
+ }
+ 
++/* The macros of off-by-default paths are only built when their knob is on:
++ * every macro is uploaded into the MME's instruction RAM at queue creation
++ * and the RAM is full.  405.8's macros take 2976 dwords and were fine;
++ * 405.9's two more (3303 dwords) overflowed it on GB20x and every macro
++ * call raised MME exceptions (Xid 13, ESR 0x404490 = 0x80000080), even on
++ * an idle desktop.  Off, each is the builder's empty macro (2 NOPs).
++ */
+ void
+ nvk_mme_draw_indirect_batch(struct mme_builder *b)
+ {
+-   nvk_mme_build_draw_indirect_batch(b, false, true);
++   if (nvk_mdi_batch() >= 2)
++      nvk_mme_build_draw_indirect_batch(b, false, true);
+ }
+ 
+ void
+ nvk_mme_draw_indexed_indirect_batch(struct mme_builder *b)
+ {
+-   nvk_mme_build_draw_indirect_batch(b, true, true);
++   if (nvk_mdi_batch() >= 2)
++      nvk_mme_build_draw_indirect_batch(b, true, true);
+ }
+ 
+ void
+ nvk_mme_draw_indirect_inline(struct mme_builder *b)
+ {
+-   nvk_mme_build_draw_indirect_batch(b, false, false);
++   if (nvk_indirect_push())
++      nvk_mme_build_draw_indirect_batch(b, false, false);
+ }
+ 
+ void
+ nvk_mme_draw_indexed_indirect_inline(struct mme_builder *b)
+ {
+-   nvk_mme_build_draw_indirect_batch(b, true, false);
++   if (nvk_indirect_push())
++      nvk_mme_build_draw_indirect_batch(b, true, false);
+ }
+ 
+-/* NVK_INDIRECT_PUSH (Turing+, default on; =0 is upstream's MME DMA reads):
++/* NVK_INDIRECT_PUSH=1 (Turing+, default off: upstream's MME DMA reads;
++ * experimental: on 405.9 it raised MME exceptions, ESR 0x404490 =
++ * 0x80000080, on the desktop, so its long inline parameter streams are
++ * not something the Turing+ MME accepts as is):
+  * the draw records of vkCmdDraw[Indexed]Indirect reach the MME as inline
+  * macro data fetched by the host from the indirect buffer itself (a
+  * pushbuffer segment pointing at the records, as NVK does before Turing),
+@@ -5687,7 +5713,7 @@ nvk_indirect_push(void)
+    static uint32_t state;
+    uint32_t s = p_atomic_read(&state);
+    if (unlikely(s == 0)) {
+-      s = debug_get_bool_option("NVK_INDIRECT_PUSH", true) ? 2 : 1;
++      s = debug_get_bool_option("NVK_INDIRECT_PUSH", false) ? 2 : 1;
+       p_atomic_set(&state, s);
+    }
+    return s == 2;
+-- 
+2.43.0
+
