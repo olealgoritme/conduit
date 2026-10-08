@@ -94,6 +94,7 @@ macro_rules! ddi_time {
 
 mod adapter12;
 mod ddi_time;
+mod wait_split;
 mod bridge12;
 mod caps12;
 mod ddi12;

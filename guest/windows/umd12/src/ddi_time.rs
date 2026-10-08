@@ -21,10 +21,14 @@ static HEAD: AtomicPtr<DdiStat> = AtomicPtr::new(core::ptr::null_mut());
 
 pub(crate) struct DdiTimer {
     stat: Option<(&'static DdiStat, Instant)>,
+    split: Option<crate::wait_split::Entry>,
 }
 
 impl Drop for DdiTimer {
     fn drop(&mut self) {
+        if let Some(entry) = self.split.take() {
+            crate::wait_split::leave(entry);
+        }
         if let Some((stat, started)) = self.stat {
             let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             stat.ns.fetch_add(ns, Ordering::Relaxed);
@@ -46,8 +50,10 @@ impl DdiStat {
 
     #[inline]
     pub(crate) fn start(&'static self) -> DdiTimer {
+        // `Umd12WaitSplit`: the presenting thread's DDIs (`wait_split.rs`).
+        let split = if crate::wait_split::enabled() { crate::wait_split::enter(self.name) } else { None };
         if !crate::knobs12::umd12_ddi_times() {
-            return DdiTimer { stat: None };
+            return DdiTimer { stat: None, split };
         }
         if !self.registered.load(Ordering::Acquire) && !self.registered.swap(true, Ordering::AcqRel) {
             let me = self as *const DdiStat as *mut DdiStat;
@@ -60,7 +66,7 @@ impl DdiStat {
                 }
             }
         }
-        DdiTimer { stat: Some((self, Instant::now())) }
+        DdiTimer { stat: Some((self, Instant::now())), split }
     }
 }
 

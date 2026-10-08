@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 20] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 21] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -330,6 +330,7 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 20] {
         ("Umd12FenceVaProbe", umd12_fence_va_probe() as u32),
         // Appended (measurement).
         ("Umd12DdiTimes", umd12_ddi_times() as u32),
+        ("Umd12WaitSplit", umd12_wait_split() as u32),
     ]
 }
 
@@ -488,6 +489,17 @@ pub(crate) static UMD12_DDI_TIMES: BoolKnob = BoolKnob::new(c"Umd12DdiTimes", fa
 #[inline]
 pub(crate) fn umd12_ddi_times() -> bool {
     UMD12_DDI_TIMES.get()
+}
+
+/// `Umd12WaitSplit` (default 0; measurement): split the presenting thread's
+/// frame into time in this driver's DDIs (on and off the CPU, by blocking DDI)
+/// and time outside it, on and off the CPU (`wait_split.rs`), every 256
+/// frames. Read once per process.
+pub(crate) static UMD12_WAIT_SPLIT: BoolKnob = BoolKnob::new(c"Umd12WaitSplit", false);
+
+#[inline]
+pub(crate) fn umd12_wait_split() -> bool {
+    UMD12_WAIT_SPLIT.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {
