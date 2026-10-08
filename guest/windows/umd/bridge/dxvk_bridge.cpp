@@ -2048,6 +2048,24 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       // rebase inserts a base class into D3D11Device this becomes a compile error
       // instead of a silently mis-offset `this`. R823.
       auto* device = static_cast<dxvk::D3D11Device*>(impl->d3d11);
+      if (foreign && impl->backend != helios_bridge::IcdBackend::Venus) {
+        // What DXVK's NVK import will take (patch 0010: a LINEAR record is imported with an
+        // explicit DRM-modifier layout only when the device enabled VK_EXT_image_drm_format_modifier),
+        // in the umd log: DXVK's own lines go to the debugger only.
+        static std::atomic<std::uint32_t> s_importPlanLogs{0};
+        if (bridge_log_budget(s_importPlanLogs, 64, 512)) {
+          char msg[256];
+          std::snprintf(msg, sizeof(msg),
+            "OpenDdiTexture2D NVK import plan res_id=%u %ux%u modifier=0x%016llx stride=%u offset=%u size=%llu drm_modifier_ext=%d explicit_linear=%d",
+            renderer_resource_id, width, height,
+            static_cast<unsigned long long>(foreign_modifier), foreign_stride, foreign_offset,
+            static_cast<unsigned long long>(venus_alloc_size),
+            int(bool(device->GetDXVKDevice()->features().extImageDrmFormatModifier)),
+            int(foreign_modifier == 0 && foreign_stride != 0 && foreign_plane1_stride == 0
+                && bool(device->GetDXVKDevice()->features().extImageDrmFormatModifier)));
+          umd_log(msg);
+        }
+      }
       dxvk::D3D11Texture2D* texture = nullptr;
       try {
         texture = new dxvk::D3D11Texture2D(
