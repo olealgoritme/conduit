@@ -465,6 +465,13 @@ in segment 2 its CPU view is that memory (the CPU host aperture maps its `RM_EXP
 pages it uses the OS descriptor over the leases as before. The level 5 counters (`RmSysTry`, `RmSysOk`,
 `RmSysVenus`, `RmSysWhy`, `RmSysTrial`, `RmSysMis`) count these creations.
 
+361.1 (1920x1080@240, `RedirVram` 1 + G1): staging works: `GdiSysCe` 212, `GdiSysRef` 2 (360.1:
+136/136 refused), `RvSysObj` 212, `RmSysTrial` 4, `RmSysTrialF` 0, `RmSysMis` 0. `RvSysMade`/`RvSysHit`
+0 is expected: they count only the OS-descriptor path over system-page leases, and every call found
+its staging buffer in segment 2 (served by its RM object, `RvSysObj`). 2 of 6 staging creations fell
+back to Venus with `RmSysWhy` 10 (Extent): the level 5 layout used the scanout's 64-pixel minimum.
+Fixed: a staging buffer uses `rm_sysmem::layout_standard` (the foreign record's 1..=16384).
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
