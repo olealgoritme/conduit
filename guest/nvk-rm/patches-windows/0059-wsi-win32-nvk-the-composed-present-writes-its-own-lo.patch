@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 14:33:18 +0200
+Subject: [PATCH] wsi/win32, nvk: the composed present writes its own log
+ (helios-wsi-<pid>.log)
+
+On the Windows guest MESA_LOG_FILE output never appears, so patch 58's
+milestones and failures (mesa_logi/mesa_loge) could not be seen.
+
+With NVK_HELIOS_WSI_COMPOSE=1 every composed-path line now also goes to
+helios-wsi-<pid>.log in %ProgramData%\Helios (HELIOS_VK_FRAMETIME_DIR
+overrides the folder; %TEMP% when it is not writable), independent of
+HELIOS_VK_FRAMETIME, timestamped, with failures marked FAIL and also
+sent to OutputDebugString: NVK's knob decision, the D3D11 device and
+DXGI swap chain, each shared texture's resource id and layout, each
+import, the first present, and every failure with its HRESULT, NTSTATUS
+or VkResult. A refused import also logs the KMD's record next to the
+image's own size, row pitch and offset.
+---
+ src/nouveau/vulkan/nvk_wsi.c                | 28 +++++++-
+ src/vulkan/wsi/wsi_common.h                 |  6 ++
+ src/vulkan/wsi/wsi_common_win32.cpp         | 12 ++--
+ src/vulkan/wsi/wsi_common_win32_compose.cpp | 80 ++++++++++++++++++++-
+ 4 files changed, 115 insertions(+), 11 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index 689b03f4..55804816 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ #include "nvk_wsi.h"
++#include <inttypes.h>
+ #include "nvk_instance.h"
+ #include "nvkmd/nvkmd.h"
+ #include "wsi_common.h"
+@@ -184,7 +185,28 @@ nvk_wsi_compose_import(VkDevice _device, VkImage _image,
+       .allocationSize = reqs.size,
+       .memoryTypeIndex = type_index,
+    };
+-   return nvk_AllocateMemory(_device, &info, &dev->vk.alloc, memory);
++   VkResult result = nvk_AllocateMemory(_device, &info, &dev->vk.alloc, memory);
++   if (result != VK_SUCCESS) {
++      /* NVK's own reason went to the Mesa log; say what was compared */
++      const VkImageSubresource2KHR sub = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_KHR,
++         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 },
++      };
++      VkSubresourceLayout2KHR lay2 = {
++         .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2_KHR,
++      };
++      nvk_GetImageSubresourceLayout2KHR(_device, _image, &sub, &lay2);
++      const VkSubresourceLayout lay = lay2.subresourceLayout;
++      wsi_win32_compose_log(true, "NVK: import of resource %u refused (%d): "
++                            "KMD record %" PRIu64 " B, modifier 0x%016" PRIx64
++                            ", stride %u, offset %u; the image: %" PRIu64
++                            " B, row pitch %" PRIu64 ", offset %" PRIu64
++                            ", memory type %u", import->resource_id,
++                            (int)result, import->size, import->modifier,
++                            import->stride, import->offset, reqs.size,
++                            lay.rowPitch, lay.offset, type_index);
++   }
++   return result;
+ }
+ 
+ static void
+@@ -254,10 +276,10 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+    if (debug_get_bool_option("NVK_HELIOS_WSI_COMPOSE", false)) {
+       if (nvkmd_rm_win_shared_import_supported()) {
+          pdev->wsi_device.win32.compose_import = nvk_wsi_compose_import;
+-         mesa_logi("NVK: NVK_HELIOS_WSI_COMPOSE=1: window swap chains present "
++         wsi_win32_compose_log(false, "NVK: NVK_HELIOS_WSI_COMPOSE=1: window swap chains present "
+                    "through a D3D11 flip swap chain");
+       } else {
+-         mesa_loge("NVK: NVK_HELIOS_WSI_COMPOSE=1, but the KMD or librmclient "
++         wsi_win32_compose_log(true, "NVK: NVK_HELIOS_WSI_COMPOSE=1, but the KMD or librmclient "
+                    "has no shared-surface import: not composing");
+       }
+    }
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index 80049fe8..defdf7ba 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -58,6 +58,12 @@ struct driOptionCache;
+  * compose_import): the Helios resource id of a D3D11 shared texture, the
+  * object's size and the layout the image must have.
+  */
++#ifdef _WIN32
++/* A line in helios-wsi-<pid>.log (the composed path's own log, written
++ * whatever MESA_LOG_* say; failures also to OutputDebugString). */
++void wsi_win32_compose_log(bool failure, const char *fmt, ...);
++#endif
++
+ struct wsi_win32_compose_import {
+    uint32_t resource_id;
+    uint64_t size;
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 49cd74b4..686eb3f7 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -892,13 +892,13 @@ wsi_win32_create_compose_image_mem(const struct wsi_swapchain *drv_chain,
+    result = wsi->win32.compose_import(drv_chain->device, image->image, &imp,
+                                       &image->memory);
+    if (result != VK_SUCCESS) {
+-      mesa_loge("MESA-WSI: compose: importing resource %u into the Vulkan "
++      wsi_win32_compose_log(true, "compose: importing resource %u into the Vulkan "
+                 "device failed (%d)", imp.resource_id, (int)result);
+       wsi_win32_compose_image_destroy(chain->surface->compose,
+                                       &win32_image->compose);
+       return result;
+    }
+-   mesa_logi("MESA-WSI: compose: resource %u imported as swapchain image %u",
++   wsi_win32_compose_log(false, "compose: resource %u imported as swapchain image %u",
+              imp.resource_id, (unsigned)(win32_image - chain->images));
+ 
+    image->num_planes = 1;
+@@ -1595,11 +1595,11 @@ wsi_win32_surface_create_swapchain(
+       if (cr == VK_SUCCESS)
+          image_params = &compose_image_params;
+       else
+-         mesa_loge("MESA-WSI: compose: no D3D11 swap chain for the window "
++         wsi_win32_compose_log(true, "compose: no D3D11 swap chain for the window "
+                    "(%d), presenting by %s", (int)cr,
+                    try_scanout ? "Helios scanout" : "GDI");
+    } else if (wsi_device->win32.compose_import != NULL) {
+-      mesa_loge("MESA-WSI: compose: format %d / %u layers has no composed "
++      wsi_win32_compose_log(true, "compose: format %d / %u layers has no composed "
+                 "path, presenting by %s", (int)create_info->imageFormat,
+                 create_info->imageArrayLayers,
+                 try_scanout ? "Helios scanout" : "GDI");
+@@ -1610,7 +1610,7 @@ retry:
+    result = wsi_swapchain_init(wsi_device, &chain->base, device,
+                                create_info, image_params, allocator);
+    if (result != VK_SUCCESS && image_params == &compose_image_params) {
+-      mesa_loge("MESA-WSI: compose: swapchain init failed (%d)", (int)result);
++      wsi_win32_compose_log(true, "compose: swapchain init failed (%d)", (int)result);
+       image_params = fallback_params;
+       goto retry;
+    }
+@@ -1687,7 +1687,7 @@ retry:
+ 
+    /* The shared textures could not be made or imported: scanout or GDI */
+    if (result != VK_SUCCESS && chain->compose.enabled) {
+-      mesa_loge("MESA-WSI: compose: swapchain images unavailable (%d), "
++      wsi_win32_compose_log(true, "compose: swapchain images unavailable (%d), "
+                 "presenting by %s", (int)result,
+                 fallback_params == &scanout_image_params ? "Helios scanout" : "GDI");
+       for (uint32_t i = 0; i < chain->base.image_count; i++)
+diff --git a/src/vulkan/wsi/wsi_common_win32_compose.cpp b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+index da9d1ee1..5f487db5 100644
+--- a/src/vulkan/wsi/wsi_common_win32_compose.cpp
++++ b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+@@ -46,6 +46,7 @@
+ #include <windows.h>
+ #include <d3d11.h>
+ #include <dxgi1_2.h>
++#include <stdarg.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <wchar.h>
+@@ -182,8 +183,83 @@ static struct {
+    PFN_kmt_close_adapter close_adapter;
+ } fn;
+ 
+-#define LOGI(...) mesa_logi("MESA-WSI: compose: " __VA_ARGS__)
+-#define LOGE(...) mesa_loge("MESA-WSI: compose: " __VA_ARGS__)
++/* helios-wsi-<pid>.log: the composed path's milestones and failures, in
++ * %ProgramData%\Helios (HELIOS_VK_FRAMETIME_DIR overrides the folder, %TEMP%
++ * when it is not writable), whatever MESA_LOG_* say; failures also go to
++ * OutputDebugString. Only the composed path writes it. */
++static INIT_ONCE log_once = INIT_ONCE_STATIC_INIT;
++static FILE *log_file;
++static ULONGLONG log_t0;
++
++static FILE *
++log_open_in(const char *dir)
++{
++   char path[MAX_PATH];
++   CreateDirectoryA(dir, NULL);
++   snprintf(path, sizeof(path), "%s\\helios-wsi-%lu.log", dir,
++            (unsigned long)GetCurrentProcessId());
++   return fopen(path, "a");
++}
++
++static BOOL CALLBACK
++log_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
++{
++   (void)once; (void)param; (void)ctx;
++   log_t0 = GetTickCount64();
++   char dir[MAX_PATH];
++   DWORD n = GetEnvironmentVariableA("HELIOS_VK_FRAMETIME_DIR", dir, sizeof(dir));
++   if (n == 0 || n >= sizeof(dir)) {
++      char pd[MAX_PATH];
++      n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
++      snprintf(dir, sizeof(dir), "%s\\Helios",
++               n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData");
++   }
++   log_file = log_open_in(dir);
++   if (!log_file) {
++      char tmp[MAX_PATH];
++      n = GetTempPathA(sizeof(tmp), tmp);
++      if (n > 0 && n < sizeof(tmp)) {
++         if (tmp[n - 1] == '\\')
++            tmp[n - 1] = '\0';
++         log_file = log_open_in(tmp);
++      }
++   }
++   if (log_file) {
++      char exe[MAX_PATH] = "";
++      GetModuleFileNameA(NULL, exe, sizeof(exe));
++      fprintf(log_file, "---- %s pid %lu\n", exe, (unsigned long)GetCurrentProcessId());
++      fflush(log_file);
++   }
++   return TRUE;
++}
++
++void
++wsi_win32_compose_log(bool failure, const char *fmt, ...)
++{
++   InitOnceExecuteOnce(&log_once, log_init, NULL, NULL);
++   char line[1024];
++   va_list ap;
++   va_start(ap, fmt);
++   vsnprintf(line, sizeof(line), fmt, ap);
++   va_end(ap);
++   if (log_file) {
++      fprintf(log_file, "%10.3f %s%s\n", (GetTickCount64() - log_t0) / 1000.0,
++              failure ? "FAIL " : "", line);
++      fflush(log_file);
++   }
++   if (failure || !log_file) {
++      char dbg[1100];
++      snprintf(dbg, sizeof(dbg), "MESA-WSI: %s\n", line);
++      OutputDebugStringA(dbg);
++   }
++   if (failure)
++      mesa_loge("MESA-WSI: %s", line);
++   else
++      mesa_logi("MESA-WSI: %s", line);
++}
++
++#define LOGI(...) wsi_win32_compose_log(false, "compose: " __VA_ARGS__)
++#define LOGE(...) wsi_win32_compose_log(true, "compose: " __VA_ARGS__)
+ 
+ static bool
+ compose_load(void)
+-- 
+2.43.0
+
