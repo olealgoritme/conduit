@@ -946,14 +946,17 @@ pub fn plan(cmd: &Cmd, dst: Option<&Surface>, srcs: [Option<&Surface>; 2]) -> (E
         return (Engine::Drop, Some(Why::Unreachable));
     }
     if all.iter().flatten().any(|s| s.class == SurfaceClass::Foreign) {
-        // Only a plain copy FROM the foreign image into a surface the executor writes.
-        let copy_from = matches!(*cmd, Cmd::BitBlt { rop, .. } if rop == rop::SRCCOPY)
-            && srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign)
-            && dst.class != SurfaceClass::Foreign;
-        return match (copy_from, dst.class) {
-            (true, SurfaceClass::Vram) => (Engine::Ce, None),
-            (true, _) => (Engine::Cpu, Some(Why::SystemSurface)),
-            (false, _) => (Engine::Drop, Some(Why::Unreachable)),
+        // Only a plain copy FROM the foreign image into a surface the executor writes, or a plain
+        // copy INTO it from VRAM or a staging buffer (`ce_vram::foreign_write`).
+        let srccopy = matches!(*cmd, Cmd::BitBlt { rop, .. } if rop == rop::SRCCOPY);
+        let src_fgn = srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign);
+        let dst_fgn = dst.class == SurfaceClass::Foreign;
+        return match (srccopy, src_fgn, dst_fgn, dst.class, srcs[0].map(|s| s.class)) {
+            (true, true, false, SurfaceClass::Vram, _) => (Engine::Ce, None),
+            (true, true, false, _, _) => (Engine::Cpu, Some(Why::SystemSurface)),
+            (true, false, true, _, Some(SurfaceClass::Vram)) => (Engine::Ce, None),
+            (true, false, true, _, Some(SurfaceClass::System)) => (Engine::Cpu, Some(Why::SystemSurface)),
+            _ => (Engine::Drop, Some(Why::Unreachable)),
         };
     }
     let all_vram = all.iter().flatten().all(|s| s.class == SurfaceClass::Vram);
@@ -1616,6 +1619,9 @@ pub const COUNTERS: &[&str] = &[
     // Commands dropped because a foreign image is in them other than as a SRCCOPY source, and the
     // last one's signature (opcode | foreign dst << 8 | foreign src << 9 | rop << 16).
     "GdiFgnDrop",
+    // Copies INTO a foreign NVK image done on the copy engine (failures: GdiFgnFail, GdiFgnWhy 16 +
+    // the step).
+    "GdiFgnWr",
     "GdiFgnOp",
     // The slowest job: its command count and its three slowest commands (GdiSlowOp signature, µs).
     "GdiJobMaxN",
@@ -1897,7 +1903,9 @@ mod tests {
         let fg = Surface { class: SurfaceClass::Foreign, ..vram(5) };
         assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Ce, None));
         assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&sys), [Some(&fg), None]), (Engine::Cpu, Some(Why::SystemSurface)));
-        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&b), None]), (Engine::Drop, Some(Why::Unreachable)));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&b), None]), (Engine::Ce, None));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&sys), None]), (Engine::Cpu, Some(Why::SystemSurface)));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&fg), None]), (Engine::Drop, Some(Why::Unreachable)));
         assert_eq!(plan(&bb(rop::SRCOR, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Drop, Some(Why::Unreachable)));
     }
 
