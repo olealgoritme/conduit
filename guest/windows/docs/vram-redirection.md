@@ -732,6 +732,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiFgnN`, `GdiFgnCe`, `GdiFgnFail`, `GdiFgnWhy` | foreign NVK images resolved (`SurfaceClass::Foreign`: UMD optimal image with an RM identity); copies from them done on the copy engine; failed (dropped: the image has no CPU view); the last failing step (1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view refused, 6 channel down, 7 memory, 8 destination class) |
 | `GdiFgnDrop`, `GdiFgnOp` | commands dropped because a foreign image is in them other than as a SRCCOPY source (the plan's drop), and the last one's signature (`opcode \| foreign dst << 8 \| foreign src << 9 \| rop << 16`). Note `GdiFgnN` counts surface RESOLUTIONS (a command naming the image twice counts twice), not commands |
 | `GdiSysUs`, `GdiSysVwUs`, `GdiSysSubUs`, `GdiSysWtUs`, `GdiSysPx` | the slowest staging copy-engine command: total µs, the part until its views were resolved, until its last submit, the wait, its pixels |
+| `GdiSysK`, `GdiSysSWH`, `GdiSysDWH`, `GdiSysRes`, `GdiSysShape` | that command's surfaces: kinds (source `std type << 4 \| GDI type \| RM-backed << 8`, destination's << 16), extents (`w << 16 \| h`), resource ids (source \| destination << 16), shape (sub-rects \| same buffer << 16 \| covers the whole destination << 17 \| same extent << 18) |
 | `GdiSlowRop`, `GdiCpuMsk`, `GdiCpuRop` | the slowest command's reason and ROP (`Why \| rop enum << 8 \| ROP3 << 16`); the reasons of the commands the CPU ran (bit per `Why` code, 1 for none); the last CPU command's reason and ROP |
 | `GdiJobMaxN`, `GdiJobT1..3`, `GdiJobT1Us..3Us` | the slowest job (`GdiUsMax`): its command count and its three slowest commands (signature as `GdiSlowOp`, µs) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
@@ -886,6 +887,15 @@ plan's, Cpu, before that path). The executor's wait was `ce_vram::wait`: it spin
 1 ms, which `KeDelayExecutionThread` rounds up to the ~15.6 ms timer tick, so 31.6 ms reads as a copy
 of just over 20 ms plus one tick. Since this head the GDI executor waits by polling without sleeping
 (its own thread), and `GdiSys*Us` split the slowest such command into view resolution, submit and wait.
+
+**375.1:** the wait fix took the slowest command from 31.6 to 5.7 ms (1080p) and windowed Heaven at
+5120x1440 from 221 to 259 fps. The split puts the rest in the copy itself: `GdiSysVwUs` 2-3 µs (the
+RM objects' mappings are cached, `RvSysObj` 129, `RvSysMade` 1), `GdiSysWtUs` 4.5 ms for 2.0 MPixel
+(1080p) and 15.8 ms for 7.1 MPixel (5120), about 1.8 GB/s each way, system memory to system memory.
+One push, one multi-line pitch copy per rectangle, so not a per-line overhead. These are rare (the
+slowest of 137 commands, not one per frame). `GdiSysK`/`GdiSysSWH`/`GdiSysDWH`/`GdiSysRes`/`GdiSysShape`
+name the surfaces of that command, so the next row shows whether it is a whole-surface copy between
+two same-sized staging buffers (a CDD shadow refresh) that could be avoided rather than sped up.
 
 Every wait of the executor is bounded: the copy-engine waits 100 ms (the job's command is then
 redone on the CPU or dropped), `ce_sysmem`'s channel I/O 250 ms, the RM calls their bounded sections,

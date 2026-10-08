@@ -91,6 +91,15 @@ static SYS_VW_US: AtomicU32 = AtomicU32::new(0);
 static SYS_SUB_US: AtomicU32 = AtomicU32::new(0);
 static SYS_WT_US: AtomicU32 = AtomicU32::new(0);
 static SYS_PX: AtomicU32 = AtomicU32::new(0);
+/// Its surfaces: kinds (source `kind_bits` low 16 | destination's << 16), extents (width << 16 |
+/// height, source and destination), resource ids (source low 16 | destination << 16), and shape
+/// (sub-rectangles, at most 0xffff | same buffer << 16 | covers the whole destination << 17 |
+/// source and destination the same extent << 18).
+static SYS_K: AtomicU32 = AtomicU32::new(0);
+static SYS_SWH: AtomicU32 = AtomicU32::new(0);
+static SYS_DWH: AtomicU32 = AtomicU32::new(0);
+static SYS_RES: AtomicU32 = AtomicU32::new(0);
+static SYS_SHAPE: AtomicU32 = AtomicU32::new(0);
 /// The last `wait_last`'s µs (read by `run_ce_sys` for its split; executor thread only).
 static LAST_WAIT_US: AtomicU32 = AtomicU32::new(0);
 /// Copies from a foreign NVK image done on the copy engine; failed (dropped); the last failing step.
@@ -245,7 +254,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -300,6 +309,11 @@ pub(crate) fn publish_counters() {
     w(b"GdiSysSubUs", SYS_SUB_US.load(Ordering::Relaxed));
     w(b"GdiSysWtUs", SYS_WT_US.load(Ordering::Relaxed));
     w(b"GdiSysPx", SYS_PX.load(Ordering::Relaxed));
+    w(b"GdiSysK", SYS_K.load(Ordering::Relaxed));
+    w(b"GdiSysSWH", SYS_SWH.load(Ordering::Relaxed));
+    w(b"GdiSysDWH", SYS_DWH.load(Ordering::Relaxed));
+    w(b"GdiSysRes", SYS_RES.load(Ordering::Relaxed));
+    w(b"GdiSysShape", SYS_SHAPE.load(Ordering::Relaxed));
     w(b"GdiFgnCe", FGN_CE.load(Ordering::Relaxed));
     w(b"GdiFgnFail", FGN_FAIL.load(Ordering::Relaxed));
     w(b"GdiFgnWhy", FGN_WHY.load(Ordering::Relaxed));
@@ -1203,6 +1217,19 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
         SYS_WT_US.store(wt, Ordering::Relaxed);
         SYS_SUB_US.store(total.saturating_sub(wt).saturating_sub(view_us.get()), Ordering::Relaxed);
         SYS_PX.store(op.subs.iter().map(|r| area(r)).sum::<u64>().min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        let wh = |s: Option<Surface>| s.map_or(0, |s| (s.width & 0xffff) << 16 | (s.height & 0xffff));
+        let (src, dst) = (op.srcs[0], op.dst);
+        SYS_K.store(src.map_or(0, |s| s.kind_bits & 0xffff) | dst.map_or(0, |d| d.kind_bits & 0xffff) << 16, Ordering::Relaxed);
+        SYS_SWH.store(wh(src), Ordering::Relaxed);
+        SYS_DWH.store(wh(dst), Ordering::Relaxed);
+        SYS_RES.store(src.map_or(0, |s| s.resource_id & 0xffff) | dst.map_or(0, |d| d.resource_id & 0xffff) << 16, Ordering::Relaxed);
+        let same = matches!((src, dst), (Some(a), Some(b)) if a.resource_id == b.resource_id);
+        let whole = dst.is_some_and(|d| op.subs.iter().map(|r| area(&clip_to(r, &d))).sum::<u64>() >= u64::from(d.width) * u64::from(d.height));
+        let same_wh = wh(src) == wh(dst) && src.is_some();
+        SYS_SHAPE.store(
+            (op.subs.len().min(0xffff) as u32) | u32::from(same) << 16 | u32::from(whole) << 17 | u32::from(same_wh) << 18,
+            Ordering::Relaxed,
+        );
     }
     ok
 }
