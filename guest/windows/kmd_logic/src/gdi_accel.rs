@@ -710,12 +710,35 @@ impl<'a> Parser<'a> {
             },
             _ => Cmd::Escape,
         };
-        Ok((cmd, size))
+        Ok((normalize_rop(cmd), size))
     }
 
     /// Sub-rectangle `i` of an inline array.
     pub fn inline_rect(&self, offset: usize, i: u32) -> Option<Rect> {
         rd_rect(self.bytes, offset.checked_add(i as usize * layout::RECT_BYTES)?)
+    }
+}
+
+/// A `ROP3` BitBlt whose result is the source alone (`0xCC`, and any code equal to it with P = 0)
+/// is a SRCCOPY; a `ROP3` ColorFill whose result is the pattern alone (`0xF0`) is a PATCOPY. Both
+/// then take the copy engine like the named forms.
+pub fn normalize_rop(cmd: Cmd) -> Cmd {
+    match cmd {
+        Cmd::BitBlt { rop, rop3, .. } if rop == rop::ROP3 && cpu::bitblt_table(rop, rop3) == cpu::TABLE_S => {
+            let mut c = cmd;
+            if let Cmd::BitBlt { rop: r, .. } = &mut c {
+                *r = rop::SRCCOPY;
+            }
+            c
+        }
+        Cmd::ColorFill { rop, rop3, .. } if rop == cfrop::ROP3 && cpu::rop3_code(rop3) == 0xF0 => {
+            let mut c = cmd;
+            if let Cmd::ColorFill { rop: r, .. } = &mut c {
+                *r = cfrop::PATCOPY;
+            }
+            c
+        }
+        _ => cmd,
     }
 }
 
@@ -1213,6 +1236,71 @@ pub mod cpu {
         rop3 as u8
     }
 
+    /// A BitBlt's raster operation as a two-input truth table (no pattern in a BitBlt: P = 0):
+    /// bit `(S << 1) | D` gives each result bit. [`TABLE_S`] is a copy, [`TABLE_D`] leaves the
+    /// destination.
+    pub fn bitblt_table(rop: u16, r3: u16) -> u8 {
+        match rop {
+            super::rop::SRCCOPY => TABLE_S,
+            super::rop::SRCINVERT => 0b0110,
+            super::rop::SRCAND => 0b1000,
+            super::rop::SRCOR => 0b1110,
+            super::rop::ROP3 => rop3_code(r3) & 0x0f,
+            _ => TABLE_D,
+        }
+    }
+
+    pub const TABLE_S: u8 = 0b1100;
+    pub const TABLE_D: u8 = 0b1010;
+
+    /// [`bitblt_table`] applied to 32 bits at once.
+    #[inline(always)]
+    pub fn apply_table(t: u8, s: u32, d: u32) -> u32 {
+        let m = |i: u8| if t & (1 << i) != 0 { u32::MAX } else { 0 };
+        (m(3) & s & d) | (m(2) & s & !d) | (m(1) & !s & d) | (m(0) & !s & !d)
+    }
+
+    /// An unscaled BitBlt of `sub` done row by row with [`apply_table`] when the whole
+    /// sub-rectangle lies inside both views (the common case); `false` leaves it to [`run`].
+    pub fn bitblt_rows(cmd: &Cmd, sub: &Rect, dst: &mut ViewMut<'_>, src: &View<'_>, done: &mut Done) -> bool {
+        let Cmd::BitBlt { src: sr, dst: dr, rop, rop3, .. } = *cmd else {
+            return false;
+        };
+        if sub.is_empty() {
+            return true;
+        }
+        let (sx, sy) = (sub.left - dr.left + sr.left, sub.top - dr.top + sr.top);
+        let inside = |x0: i32, y0: i32, w: u32, h: u32, x: i32, y: i32| {
+            x >= x0
+                && y >= y0
+                && (x as i64 + sub.width() as i64) <= x0 as i64 + w as i64
+                && (y as i64 + sub.height() as i64) <= y0 as i64 + h as i64
+        };
+        if !inside(dst.x0, dst.y0, dst.w, dst.h, sub.left, sub.top) || !inside(src.x0, src.y0, src.w, src.h, sx, sy) {
+            return false;
+        }
+        let t = bitblt_table(rop, rop3);
+        let n = sub.width() as usize * 4;
+        for row in 0..sub.height() as usize {
+            let d0 = (sub.top - dst.y0) as usize * dst.pitch + row * dst.pitch + (sub.left - dst.x0) as usize * 4;
+            let s0 = (sy - src.y0) as usize * src.pitch + row * src.pitch + (sx - src.x0) as usize * 4;
+            let (Some(d), Some(s)) = (dst.data.get_mut(d0..d0 + n), src.data.get(s0..s0 + n)) else {
+                return false;
+            };
+            if t == TABLE_S {
+                d.copy_from_slice(s);
+            } else {
+                for (dp, sp) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+                    let sv = u32::from_le_bytes([sp[0], sp[1], sp[2], sp[3]]);
+                    let dv = u32::from_le_bytes([dp[0], dp[1], dp[2], dp[3]]);
+                    dp.copy_from_slice(&apply_table(t, sv, dv).to_le_bytes());
+                }
+            }
+        }
+        done.pixels += sub.width() as u64 * sub.height() as u64;
+        true
+    }
+
     pub fn bitblt_pixel(rop: u16, r3: u16, s: u32, d: u32) -> u32 {
         match rop {
             super::rop::SRCCOPY => s,
@@ -1609,6 +1697,12 @@ pub const COUNTERS: &[&str] = &[
     "GdiChUpUs",
     "GdiSlowUs",
     "GdiSlowOp",
+    // The slowest command's reason and raster operation (Why code | DXGK rop enum << 8 | ROP3
+    // << 16); commands the CPU ran: their reasons (bit per Why code, 1 none) and the last one's
+    // reason and rop (same encoding).
+    "GdiSlowRop",
+    "GdiCpuMsk",
+    "GdiCpuRop",
     // Foreign NVK images resolved; copies from them done on the copy engine; refused or failed
     // (the last reason: 1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view
     // refused, 6 channel down, 7 memory, 8 destination class, 9 GdiFgn 0).
@@ -2106,6 +2200,83 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_truth_table_agrees_with_the_per_pixel_rops() {
+        let vals = [0u32, u32::MAX, 0x1234_5678, 0xF0F0_0F0F, 0xCCCC_AAAA];
+        for (r, codes) in [(rop::SRCCOPY, 0..1u16), (rop::SRCINVERT, 0..1), (rop::SRCAND, 0..1), (rop::SRCOR, 0..1), (rop::ROP3, 0..256)] {
+            for c in codes {
+                let t = bitblt_table(r, c);
+                for &sv in &vals {
+                    for &dv in &vals {
+                        assert_eq!(apply_table(t, sv, dv), bitblt_pixel(r, c, sv, dv), "rop {r} code {c:#x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_rop3_copy_or_pattern_fill_is_normalized_to_the_named_form() {
+        let bb = |rop_v: u16, r3: u16| Cmd::BitBlt {
+            src: Rect::new(0, 0, 4, 4),
+            dst: Rect::new(0, 0, 4, 4),
+            src_index: 0,
+            dst_index: 1,
+            subs: SubRects::None,
+            rop: rop_v,
+            rop3: r3,
+            src_pitch: 16,
+            dst_pitch: 16,
+        };
+        assert!(matches!(super::normalize_rop(bb(rop::ROP3, 0xCC)), Cmd::BitBlt { rop: rop::SRCCOPY, .. }));
+        // 0x0C is also S when P = 0.
+        assert!(matches!(super::normalize_rop(bb(rop::ROP3, 0x0C)), Cmd::BitBlt { rop: rop::SRCCOPY, .. }));
+        assert!(matches!(super::normalize_rop(bb(rop::ROP3, 0x66)), Cmd::BitBlt { rop: rop::ROP3, .. }));
+        let cf = |r3: u16| Cmd::ColorFill { dst: Rect::new(0, 0, 4, 4), dst_index: 1, subs: SubRects::None, color: 1, rop: cfrop::ROP3, rop3: r3 };
+        assert!(matches!(super::normalize_rop(cf(0xF0)), Cmd::ColorFill { rop: cfrop::PATCOPY, .. }));
+        assert!(matches!(super::normalize_rop(cf(0x5A)), Cmd::ColorFill { rop: cfrop::ROP3, .. }));
+    }
+
+    #[test]
+    fn the_row_bitblt_matches_the_per_pixel_executor() {
+        let src = surface(64, 32, |x, y| (y as u32) << 16 | x as u32 | 0x5500_0000);
+        for (r, c) in [(rop::SRCCOPY, 0u16), (rop::SRCAND, 0), (rop::SRCINVERT, 0), (rop::ROP3, 0x33), (rop::ROP3, 0x88), (rop::ROP3, 0xEE)] {
+            let cmd = Cmd::BitBlt {
+                src: Rect::new(2, 1, 50, 30),
+                dst: Rect::new(4, 2, 52, 31),
+                src_index: 0,
+                dst_index: 1,
+                subs: SubRects::None,
+                rop: r,
+                rop3: c,
+                src_pitch: 256,
+                dst_pitch: 256,
+            };
+            let sub = Rect::new(10, 5, 40, 20);
+            let sv = View { data: &src, pitch: 256, x0: 0, y0: 0, w: 64, h: 32 };
+            let mut a = surface(64, 32, |x, y| (x as u32).wrapping_mul(0x0101_0101) ^ y as u32);
+            let mut b = a.clone();
+            let mut da = Done::default();
+            let mut db = Done::default();
+            run(&cmd, &sub, &mut ViewMut { data: &mut a, pitch: 256, x0: 0, y0: 0, w: 64, h: 32 }, Some(&sv), None, &mut da);
+            // The window view starts at (3, 4): offsets in both views.
+            let mut win = vec![0u8; 50 * 4 * 25];
+            for y in 0..25 {
+                win[y * 200..(y + 1) * 200].copy_from_slice(&b[(y + 4) * 256 + 12..(y + 4) * 256 + 212]);
+            }
+            let mut wv = ViewMut { data: &mut win, pitch: 200, x0: 3, y0: 4, w: 50, h: 25 };
+            assert!(bitblt_rows(&cmd, &sub, &mut wv, &sv, &mut db));
+            for y in 0..25 {
+                b[(y + 4) * 256 + 12..(y + 4) * 256 + 212].copy_from_slice(&win[y * 200..(y + 1) * 200]);
+            }
+            assert_eq!(a, b, "rop {r} {c:#x}");
+            assert_eq!(da.pixels, db.pixels);
+            // A sub-rectangle outside the window is left to the per-pixel path.
+            let mut wv = ViewMut { data: &mut win, pitch: 200, x0: 3, y0: 4, w: 50, h: 25 };
+            assert!(!bitblt_rows(&cmd, &Rect::new(0, 0, 8, 8), &mut wv, &sv, &mut db));
         }
     }
 

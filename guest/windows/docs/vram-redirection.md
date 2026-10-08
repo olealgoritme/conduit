@@ -731,6 +731,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiChUpUs`, `GdiSlowUs`, `GdiSlowOp` | the channel bring-up's time, outside every job's `GdiUs`; the slowest command's time and signature (`opcode \| engine << 4 \| dst class << 8 \| src class << 12 \| sub-rects << 16 \| over-1-MPixel << 24`) |
 | `GdiFgnN`, `GdiFgnCe`, `GdiFgnFail`, `GdiFgnWhy` | foreign NVK images resolved (`SurfaceClass::Foreign`: UMD optimal image with an RM identity); copies from them done on the copy engine; failed (dropped: the image has no CPU view); the last failing step (1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view refused, 6 channel down, 7 memory, 8 destination class) |
 | `GdiFgnDrop`, `GdiFgnOp` | commands dropped because a foreign image is in them other than as a SRCCOPY source (the plan's drop), and the last one's signature (`opcode \| foreign dst << 8 \| foreign src << 9 \| rop << 16`). Note `GdiFgnN` counts surface RESOLUTIONS (a command naming the image twice counts twice), not commands |
+| `GdiSlowRop`, `GdiCpuMsk`, `GdiCpuRop` | the slowest command's reason and ROP (`Why \| rop enum << 8 \| ROP3 << 16`); the reasons of the commands the CPU ran (bit per `Why` code, 1 for none); the last CPU command's reason and ROP |
 | `GdiJobMaxN`, `GdiJobT1..3`, `GdiJobT1Us..3Us` | the slowest job (`GdiUsMax`): its command count and its three slowest commands (signature as `GdiSlowOp`, µs) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
@@ -858,6 +859,22 @@ surface), which CDD sends despite `NoSameBitmapOverlappedBitBlt`, would also hav
 copy-engine bands of `|dy|` rows (or `|dx|` columns) from the far side of the move
 (`gdi_accel::split_overlap`, checked against a model scroll in the tests) in one view of the surface;
 counters `GdiOvlN`, `GdiOvlCe`, `GdiOvlWhy`.
+
+**371.1:** the slow CPU commands left were ROP blits, not refused copies. 0x12111 (BitBlt, CPU, staging
+to VRAM, 1 rect, about 1.3 ms each, three of the 16 commands in the 12 ms job at 1080p) and 0x12211
+(BitBlt, CPU, staging to staging, 32.7 ms at 5120x1440) left no `GdiSys*` trace because the staging
+copy-engine path only takes SRCCOPY and PATCOPY (`Why::SystemSurface`). These carried `Why::Rop`
+(`GdiMask` 0x46 has bit 1 set), so they went straight to the CPU. The copy engine has no raster
+operations. Since 373.1:
+* a `ROP3` BitBlt whose result is the source alone (0xCC, or any code with the same P = 0 half) is
+  parsed as SRCCOPY, and a `ROP3` fill of 0xF0 as PATCOPY, so both take the copy engine;
+* the CPU runs every unscaled BitBlt row by row through a two-input truth table on whole words
+  (`cpu::bitblt_rows`, checked against the per-pixel reference) instead of a bounds-checked
+  per-pixel loop;
+* `GdiSlowRop` (the slowest command), `GdiCpuRop` (the last CPU command) and `GdiCpuMsk` (the reasons
+  of all CPU commands, one bit per `Why` code, bit 0 for none) show which ROP these are:
+  `Why | DXGK rop enum << 8 | ROP3 << 16`, where the rop enum is 1 SRCCOPY, 2 SRCINVERT, 3 SRCAND,
+  4 SRCOR, 5 ROP3.
 
 Every wait of the executor is bounded: the copy-engine waits 100 ms (the job's command is then
 redone on the CPU or dropped), `ce_sysmem`'s channel I/O 250 ms, the RM calls their bounded sections,

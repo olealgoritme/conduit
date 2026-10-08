@@ -78,6 +78,12 @@ static SYS_MSK: AtomicU32 = AtomicU32::new(0);
 static CH_UP_US: AtomicU32 = AtomicU32::new(0);
 static SLOW_US: AtomicU32 = AtomicU32::new(0);
 static SLOW_OP: AtomicU32 = AtomicU32::new(0);
+/// The slowest command's reason and raster operation ([`rop_key`]).
+static SLOW_ROP: AtomicU32 = AtomicU32::new(0);
+/// Commands the CPU executor ran: the reasons seen (bit per `Why` code, as `GdiMask`) and the last
+/// one's [`rop_key`].
+static CPU_MSK: AtomicU32 = AtomicU32::new(0);
+static CPU_ROP: AtomicU32 = AtomicU32::new(0);
 /// Copies from a foreign NVK image done on the copy engine; failed (dropped); the last failing step.
 static FGN_CE: AtomicU32 = AtomicU32::new(0);
 static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
@@ -228,7 +234,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -275,6 +281,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiChUpUs", CH_UP_US.load(Ordering::Relaxed));
     w(b"GdiSlowUs", SLOW_US.load(Ordering::Relaxed));
     w(b"GdiSlowOp", SLOW_OP.load(Ordering::Relaxed));
+    w(b"GdiSlowRop", SLOW_ROP.load(Ordering::Relaxed));
+    w(b"GdiCpuMsk", CPU_MSK.load(Ordering::Relaxed));
+    w(b"GdiCpuRop", CPU_ROP.load(Ordering::Relaxed));
     w(b"GdiFgnCe", FGN_CE.load(Ordering::Relaxed));
     w(b"GdiFgnFail", FGN_FAIL.load(Ordering::Relaxed));
     w(b"GdiFgnWhy", FGN_WHY.load(Ordering::Relaxed));
@@ -581,6 +590,7 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread
             if ous > SLOW_US.load(Ordering::Relaxed) {
                 SLOW_US.store(ous, Ordering::Relaxed);
                 SLOW_OP.store(op_signature(op), Ordering::Relaxed);
+                SLOW_ROP.store(rop_key(op), Ordering::Relaxed);
             }
             if ous > top[2].0 {
                 top[2] = (ous, op_signature(op));
@@ -679,6 +689,16 @@ fn self_check(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, path: u3
 
 fn class_bit_of(s: Option<Surface>) -> u32 {
     s.map_or(0, |s| class_bit(s.class))
+}
+
+/// `GdiSlowRop` / `GdiCpuRop`: the plan's reason (`Why` code, 0 none) | the DXGK rop enum << 8 |
+/// the ROP3 code << 16 (a BitBlt's or ColorFill's; 0 for the other commands).
+fn rop_key(op: &Op) -> u32 {
+    let (r, r3) = match op.cmd {
+        Cmd::BitBlt { rop, rop3, .. } | Cmd::ColorFill { rop, rop3, .. } => (u32::from(rop), u32::from(rop3 & 0xff)),
+        _ => (0, 0),
+    };
+    op.why.map_or(0, |w| w.code()) | (r & 0xff) << 8 | r3 << 16
 }
 
 /// `GdiSlowOp`: opcode | engine << 4 (0 CE, 1 CPU, 2 drop) | dst class << 8 | src class << 12 |
@@ -885,6 +905,8 @@ fn execute_inner(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
 }
 
 fn run_cpu_counted(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    CPU_MSK.fetch_or(op.why.map_or(1, |w| w.bit()), Ordering::Relaxed);
+    CPU_ROP.store(rop_key(op), Ordering::Relaxed);
     match run_cpu(passive, adapter, op) {
         Ok(()) => {
             FALL.fetch_add(1, Ordering::Relaxed);
@@ -1478,7 +1500,12 @@ fn run_cpu_window(
             h: r.height(),
         });
         for sub in subs {
-            cpu::run(&op.cmd, sub, &mut dv, sv.as_ref(), gamma_row.as_ref(), &mut done);
+            // An unscaled BitBlt (any ROP) row by row; the per-pixel reference otherwise.
+            let rows = matches!(op.cmd, Cmd::BitBlt { .. })
+                && sv.as_ref().is_some_and(|s| cpu::bitblt_rows(&op.cmd, sub, &mut dv, s, &mut done));
+            if !rows {
+                cpu::run(&op.cmd, sub, &mut dv, sv.as_ref(), gamma_row.as_ref(), &mut done);
+            }
         }
     }
     write_window(passive, adapter, dst, &dwin, dpitch, &mut dbuf)
