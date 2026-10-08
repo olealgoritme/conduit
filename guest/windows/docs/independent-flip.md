@@ -983,8 +983,8 @@ into one knob and wires the decision table.
 
 | value | caps | census | flip paths |
 |---|---|---|---|
-| 0 (default, absent) | as `DirectFlipCaps` / `FlipCapsX` say, unchanged | off | unchanged |
-| 1 | `SupportDirectFlip` = 1, aperture segment `DirectFlip` = 1, `FlipCaps` OR `FlipIndependent \| DdiPresentForIFlip` (`FlipCapsRep` 0x32) | every flip judged and counted | unchanged |
+| 0 (the opt-out; was the default until 13.8) | as `DirectFlipCaps` / `FlipCapsX` say, unchanged | off | unchanged |
+| 1 (default since 13.8, also absent) | `SupportDirectFlip` = 1, aperture segment `DirectFlip` = 1, `FlipCaps` OR `FlipIndependent \| DdiPresentForIFlip` (`FlipCapsRep` 0x32) | every flip judged and counted | unchanged |
 | 2 | as 1 | as 1 | a DMA-buffer flip of a Venus allocation that is not in the direct-scan-out table completes as a kept picture instead of failing (`PBFlip` 0xE6, now `IdfEnfKeep`) |
 | other | as 1 | as 1 | unchanged (a typo never enforces) |
 
@@ -1439,3 +1439,12 @@ Before `IndepFlip=1` becomes the default, these rows (each a reboot; 1920x1080@2
 
 The tool now writes its log next to the executable (`d3d11_iflip.txt`, or `log=PATH`): a scheduled task runs in
 `C:\Windows\System32`, where the old current-directory log could not be created, and its stdout is not captured.
+
+### 13.8 The defaults
+
+After 393.1 / 394.1 (promotion with `IdfRedErr` 0; `DirectFlipSupport=0` stays composed, so DWM does consult the UMD; `rgb10` and
+`fp16` stay composed with `IdfKeep` 0) and the safety rows (`iflip-safety.sh`: alt-tab, Start, a toast, a resize, killing the
+application and `dwm.exe` while promoted, interval 0, tearing), `IndepFlip` defaults to 1 (`independent_flip::KNOB_DEFAULT`) and
+`DirectFlipSupport` to 1. Opt-outs: `IndepFlip` = 0 in the KMD service key (then the UMD answer is no as well: dxgkrnl reports no
+DirectFlip), or `HKLM\SOFTWARE\Helios` `DirectFlipSupport` = 0 to keep the caps but refuse every promotion. `FlipDoneHost` stays 0
+until its own rows (13.4) are measured.

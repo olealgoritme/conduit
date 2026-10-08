@@ -128,7 +128,8 @@ In this order, checking the desktop after each:
    `pnputil /restart-device` on the adapter (or reboot).
 3. Guest: `DwmIcd` = `nvk` (REG_SZ) under `HKLM\SOFTWARE\Helios`, then
    reboot. The desktop follows DWM onto NVK.
-4. Optional: `DirectFlipSupport` = 1 under `HKLM\SOFTWARE\Helios`.
+4. Independent flip is on by default (`IndepFlip`, `DirectFlipSupport`); to turn it off set
+   `IndepFlip` = 0 in the KMD service key and reboot.
 
 Each is described in [WINDOWS.md](WINDOWS.md) "Opt-ins". To back out: delete
 `DwmIcd` (DWM's crash-loop guard also falls back to Venus on its own), set

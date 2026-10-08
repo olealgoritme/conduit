@@ -534,7 +534,7 @@ pub(crate) fn nvk_rm_copy_record() -> bool {
 
 /// `DirectFlipSupport` (REG_DWORD), or `HELIOS_DIRECT_FLIP_SUPPORT` from the
 /// process environment: what the D3D11.1 `CheckDirectFlipSupport` DDI answers.
-/// 0 (default) = never (the behaviour before this knob); 1 = yes when dxgkrnl
+/// 0 = never (the opt-out); 1 (default) = yes when dxgkrnl
 /// reports DirectFlip support for the Helios adapter (KMTQAITYPE_DIRECTFLIP_SUPPORT,
 /// i.e. the KMD's SupportDirectFlip cap) and the two resources have the same
 /// size and format; 2 = yes whenever size and format match (test lever); 3 = as 1, and also only
@@ -549,7 +549,10 @@ pub(crate) fn direct_flip_support() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .or_else(|| helios_umd_common::knobs::reg_dword(c"DirectFlipSupport"))
-            .unwrap_or(0)
+            // 1: DWM consults this answer for independent flip (394.1: 0 kept every frame
+            // composed). It still says no unless dxgkrnl reports DirectFlip, i.e. unless the KMD's
+            // `IndepFlip` (default 1) advertises it.
+            .unwrap_or(1)
     })
 }
 

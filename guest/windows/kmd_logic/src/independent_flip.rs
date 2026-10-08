@@ -43,6 +43,10 @@ use crate::ScanoutFormat;
 /// the table's verdicts (census). 2: as 1, and enforce the one behaviour change of stage S-2
 /// that is safe without a measurement ([`keeps_unregistered_dma_flip`]). See [`Mode`].
 pub const KNOB_ENABLE: &str = "IndepFlip";
+/// `IndepFlip` when the value is absent: 1 (advertise and count). Promotion measured on 393.1 and
+/// 394.1 ("Hardware: Independent Flip", `IdfRedErr` 0), 10-bit and fp16 chains stay composed, and the
+/// safety rows of section 13.7 passed. `IndepFlip` = 0 is the opt-out.
+pub const KNOB_DEFAULT: u32 = 1;
 /// Reserved (not read yet): a source the UMD did not create as a primary (`MISC_PRIMARY` clear)
 /// is refused. The census (`IdfUntagged`) says whether it is ever needed.
 pub const KNOB_NEED_PRIMARY: &str = "IdfNeedPrim";
@@ -102,7 +106,7 @@ pub const RESERVED_KNOBS: [&str; 2] = [KNOB_NEED_PRIMARY, KNOB_HOLD_RELEASE];
 /// What `IndepFlip` asks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// 0 (the default, and absent): nothing advertised, nothing evaluated.
+    /// 0 (the opt-out; absent is [`KNOB_DEFAULT`]): nothing advertised, nothing evaluated.
     Off,
     /// 1: the caps are advertised and every flip is judged and counted. No behaviour change on
     /// any flip path.
@@ -1308,6 +1312,14 @@ mod tests {
             names.push(std::str::from_utf8(&ref_name(w)).unwrap().into());
         }
         names
+    }
+
+    #[test]
+    fn the_default_is_on_and_zero_still_opts_out() {
+        assert_eq!(Mode::from_knob(KNOB_DEFAULT), Mode::Census);
+        assert!(advertise(Mode::from_knob(KNOB_DEFAULT), false, 0).direct_flip);
+        assert_eq!(Mode::from_knob(0), Mode::Off);
+        assert!(!advertise(Mode::Off, false, 0).direct_flip);
     }
 
     #[test]
