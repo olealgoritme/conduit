@@ -331,15 +331,18 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
 ///
 /// | value | meaning |
 /// |---:|---|
-/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. Falls back to 1 if the fence cannot be created |
-/// | 1 | CPU wait: ExecuteCommandLists returns only after its work completed (2 s cap per call, then it proceeds and counts a timeout). The default |
+/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. Falls back to 1 if the fence cannot be created. The default |
+/// | 1 | CPU wait: ExecuteCommandLists returns only after its work completed (2 s cap per call, then it proceeds and counts a timeout) |
 /// | 2 | ECL fence: each ECL submits an `HE12` v4 record naming an RM fence the engine signals after the batch; the KMD withholds the packet's DMA completion until it fires. Nothing waits and batches pipeline. Needs NVK helios_icd_interface v7 and a KMD that takes RM fences in `HE12` v4 (`HELIOS_ICD_CAP_PRESENT_FENCE_KMD`); without them, and for a batch whose fence could not be made or whose Render is refused, it acts as 1 |
 ///
-/// Default 1 since 2026-10-06: with 0, Basemark GPU DX12 on NVK deadlocks after
-/// its first frame (the ECL worker waits in librmclient for the engine's
-/// execution stream while the app thread waits on its own fence); with 1 it
-/// completes (79,799, 798 fps). 0 returns once that deadlock is fixed.
-pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 1);
+/// Default 0 since 2026-10-08. 1 was the default from 2026-10-06, when 0
+/// deadlocked Basemark GPU DX12 after its first frame: the worker coalesced
+/// handed values and waited for N+1, whose admission sat on the context behind
+/// the wait for N (fixed the same day, c5ee89b7: values are waited for and
+/// signalled in order). Measured on 393.1 (Basemark DX12, 1920x1080 windowed,
+/// 3 loops): 1 = median frame 36.7 ms, CPUBusy 36.6 ms (20 ECLs a frame, each
+/// a ~0.85 ms CPU wait); 0 = median 22.65 ms, CPUBusy 17.9 ms, no deadlock.
+pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 0);
 
 /// `Nvk12Present` (or `HELIOS_NVK_PRESENT` in the process environment): 0 =
 /// automatic (DWM composes the back buffer from its NVK resource id when the
