@@ -96,6 +96,26 @@ pub(crate) fn reset_for_start() {
 }
 
 /// Mirror the counters (PASSIVE), once a descriptor was asked for.
+fn publish_throttled(failed: bool) {
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if !(failed || n % 64 == 0) {
+        return;
+    }
+    if crate::ddi::mirror_thread::running() {
+        crate::ddi::mirror_thread::request_bits(crate::ddi::mirror_thread::NV);
+    } else {
+        publish_counters();
+    }
+}
+
+/// The `Nv*` mirror pass: the counters, once a staging view was asked for.
+pub(crate) fn publish_if_used() {
+    if MADE.load(Ordering::Relaxed) | HIT.load(Ordering::Relaxed) | REFUSE.load(Ordering::Relaxed) != 0 {
+        publish_counters();
+    }
+}
+
 pub(crate) fn publish_counters() {
     if MADE.load(Ordering::Relaxed) == 0
         && REFUSE.load(Ordering::Relaxed) == 0
@@ -136,8 +156,9 @@ pub(crate) fn with_standard<R>(
         return Err(refuse(ce_vram::DISABLED));
     }
     let r = with_standard_inner(passive, adapter, resource_id, pitch, width, height, f);
-    // Every call, refusals included (360.1 wrote nothing on a pure-refusal run).
-    publish_counters();
+    // Every refusal (360.1 wrote nothing on a pure-refusal run), the first call and every 64th: a
+    // publish is a dozen registry writes, too much for every GDI command.
+    publish_throttled(r.is_err());
     r
 }
 
@@ -187,7 +208,7 @@ pub(crate) fn with_standard_pair<R>(
         drop(guard);
         Ok(r)
     })();
-    publish_counters();
+    publish_throttled(r.is_err());
     r
 }
 

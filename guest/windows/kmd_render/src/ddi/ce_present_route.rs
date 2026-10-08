@@ -56,6 +56,10 @@ static ROUTED: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 static FALL: AtomicU32 = AtomicU32::new(0);
 static WHY: AtomicU32 = AtomicU32::new(0);
+static REC_NONE: AtomicU32 = AtomicU32::new(0);
+static REC_KEY: AtomicU32 = AtomicU32::new(0);
+static REC_LAST: AtomicU32 = AtomicU32::new(0);
+static REC_WANT: AtomicU32 = AtomicU32::new(0);
 static MASK: AtomicU32 = AtomicU32::new(0);
 static DISP_FALL: AtomicU32 = AtomicU32::new(0);
 static CLIENT: AtomicU32 = AtomicU32::new(0);
@@ -119,7 +123,7 @@ fn on() -> bool {
 /// (only with the route on: with the knob at 0 nothing here writes the registry).
 pub(crate) fn reset_for_start() {
     for c in [
-        &SEEN, &ROUTED, &DONE, &FALL, &WHY, &MASK, &DISP_FALL, &CLIENT, &STRIKE, &STRUCK,
+        &SEEN, &ROUTED, &DONE, &FALL, &WHY, &MASK, &REC_NONE, &REC_KEY, &REC_LAST, &REC_WANT, &DISP_FALL, &CLIENT, &STRIKE, &STRUCK,
         &CH_STRIKE, &OFF, &POISON, &LEAK, &TIMEOUT, &CH_FAIL, &TIMED_OUT, &UP, &INFL, &PEAK, &DEC_US, &DUP_US, &SUB_US,
         &DONE_US, &DONE_MAX, &POLL_US, &DST_NEW, &DST_DROP, &DST_LIVE, &RUNS, &DIR, &DIR_NO,
         &DIR_WHY, &DIR_US, &LAG,
@@ -150,6 +154,10 @@ fn write_counters() {
     rec(b"CeRtDone", DONE.load(Ordering::Relaxed));
     rec(b"CeRtFall", FALL.load(Ordering::Relaxed));
     rec(b"CeRtWhy", WHY.load(Ordering::Relaxed));
+    rec(b"CeRtRecNone", REC_NONE.load(Ordering::Relaxed));
+    rec(b"CeRtRecKey", REC_KEY.load(Ordering::Relaxed));
+    rec(b"CeRtRecLast", REC_LAST.load(Ordering::Relaxed));
+    rec(b"CeRtRecWant", REC_WANT.load(Ordering::Relaxed));
     rec(b"CeRtMask", MASK.load(Ordering::Relaxed));
     rec(b"CeRtDispFall", DISP_FALL.load(Ordering::Relaxed));
     rec(b"CeRtClient", CLIENT.load(Ordering::Relaxed));
@@ -666,6 +674,18 @@ fn decide_present(
         return Err(Why::NoBoundary);
     };
     let Some(rec) = context.and_then(|c| c.take_ce_record(boundary)) else {
+        // `CeRtRecNone`: no record on the context; `CeRtRecKey`: one of another boundary
+        // (`CeRtRecLast`: the stashed boundary's low half, `CeRtRecWant`: the Present's).
+        match context.map(|c| c.ce_record_miss(boundary)) {
+            Some((2, have)) => {
+                REC_KEY.fetch_add(1, Ordering::Relaxed);
+                REC_LAST.store(have, Ordering::Relaxed);
+                REC_WANT.store(boundary as u32, Ordering::Relaxed);
+            }
+            _ => {
+                REC_NONE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         return Err(Why::NoRecord);
     };
     let presenter = context.and_then(ContextHandleRef::creator_process).unwrap_or(0);
