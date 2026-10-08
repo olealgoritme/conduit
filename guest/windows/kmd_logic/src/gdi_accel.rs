@@ -1138,7 +1138,8 @@ pub struct CeView {
 }
 
 /// One copied rectangle `src_r` of `src` to the same-sized rectangle at `dst_r` of `dst` (32 bpp;
-/// `swap_rb` exchanges bytes 0 and 2, for an R G B surface on one side and B G R on the other).
+/// `remap` from [`copy_remap`]: bytes 0 and 2 exchanged for an R G B surface on one side and
+/// B G R on the other, the alpha byte set to 0xff for an opaque write).
 pub fn copy_rect(
     p: &mut Push<'_>,
     gen: Gen,
@@ -1146,7 +1147,7 @@ pub fn copy_rect(
     src_r: &Rect,
     dst: &CeView,
     dst_r: &Rect,
-    swap_rb: bool,
+    remap: cp::Remap,
 ) -> Result<(), PushError> {
     if src_r.width() != dst_r.width()
         || src_r.height() != dst_r.height()
@@ -1176,10 +1177,47 @@ pub fn copy_rect(
             lines: src_r.height(),
             layout: cp::SurfaceLayout::Pitch,
             dst_layout: cp::SurfaceLayout::Pitch,
-            remap: if swap_rb { cp::Remap::SwapRb } else { cp::Remap::None },
+            remap,
             stamp: None,
         },
     )
+}
+
+/// The copy engine's remap for a GDI copy: `swap_rb` exchanges bytes 0 and 2, `opaque` sets the
+/// destination's alpha byte to 0xff ([`opaque_alpha`]).
+pub const fn copy_remap(swap_rb: bool, opaque: bool) -> cp::Remap {
+    match (swap_rb, opaque) {
+        (false, false) => cp::Remap::None,
+        (true, false) => cp::Remap::SwapRb,
+        (false, true) => cp::Remap::Select(cp::Selector::IDENTITY.with_alpha_one()),
+        (true, true) => cp::Remap::Select(cp::Selector::SWAP_RB.with_alpha_one()),
+    }
+}
+
+/// Whether a format's fourth byte is alpha (`A8R8G8B8` 21, `A8B8G8R8` 32); `X8` (22, 33) and an
+/// unknown format count as not.
+pub const fn format_has_alpha(d3dddi_format: u32) -> bool {
+    matches!(d3dddi_format, 21 | 32)
+}
+
+/// Whether a GDI write into `dst` sets the alpha byte to 0xff. Only GPU surfaces DWM samples
+/// (VRAM, foreign) are touched; staging buffers keep what GDI wrote. Always: a copy from an `X8`
+/// source into an `A8` destination (the source's fourth byte is undefined; the same rule as the
+/// windowed Present's `remap_for`). With `force` (`GdiOff` 0x40): every BitBlt, ColorFill,
+/// StretchBlt, TransparentBlt and ClearTypeBlend (GDI has no alpha: a COLORREF fill or a GDI-drawn
+/// staging source carries alpha 0, which a compositor that blends the window reads as
+/// transparent). AlphaBlend is never touched: it is what carries real per-pixel alpha.
+pub fn opaque_alpha(cmd: &Cmd, src: Option<&Surface>, dst: &Surface, force: bool) -> bool {
+    if !matches!(dst.class, SurfaceClass::Vram | SurfaceClass::Foreign) {
+        return false;
+    }
+    match *cmd {
+        Cmd::AlphaBlend { .. } | Cmd::Escape => false,
+        Cmd::BitBlt { .. } | Cmd::StretchBlt { .. } | Cmd::TransparentBlt { .. } => {
+            force || (format_has_alpha(dst.format) && src.is_some_and(|s| !format_has_alpha(s.format)))
+        }
+        Cmd::ColorFill { .. } | Cmd::ClearTypeBlend { .. } => force,
+    }
 }
 
 /// How many rectangles of `per_rect` dwords fit in one push slot of `slot_dwords` after `state`
@@ -1645,6 +1683,9 @@ pub const fn paths_from_off(off: u32) -> u32 {
     if off & 0x20 == 0 {
         p |= 32;
     }
+    if off & 0x40 != 0 {
+        p |= 64;
+    }
     p
 }
 
@@ -1806,6 +1847,13 @@ pub const COUNTERS: &[&str] = &[
     "GdiChkK",
     "GdiChkGot",
     "GdiChkWant",
+    // Checked pixels in GPU surfaces with alpha 0 / alpha 0xff, the last one read (32 bits);
+    // commands that wrote an opaque alpha; the last GPU write's formats (src | dst << 16).
+    "GdiChkA0",
+    "GdiChkAFF",
+    "GdiChkGpuPx",
+    "GdiOpaqN",
+    "GdiFmtK",
     // Staging commands whose pitch differs from the view's (authored) pitch; the last pair.
     "GdiPitchMis",
     "GdiPitchCmd",
@@ -2177,7 +2225,7 @@ mod tests {
         let mut p = Push::new(&mut buf);
         let s = CeView { va: 0x1000_0000, pitch: 6400, width: 1600, height: 900 };
         let d = CeView { va: 0x2000_0000, pitch: 8192, width: 2048, height: 1080 };
-        copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(1, 2, 11, 22), &d, &Rect::new(100, 200, 110, 220), false).unwrap();
+        copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(1, 2, 11, 22), &d, &Rect::new(100, 200, 110, 220), cp::Remap::None).unwrap();
         let w = p.words();
         assert_eq!(w.len(), COPY_RECT_DWORDS);
         let sva = 0x1000_0000u64 + 2 * 6400 + 4;
@@ -2185,12 +2233,12 @@ mod tests {
         assert_eq!(&w[1..9], &[0, sva as u32, 0, dva as u32, 6400, 8192, 40, 20]);
         let mut buf = [0u32; 64];
         let mut p = Push::new(&mut buf);
-        assert_eq!(copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(0, 0, 10, 10), &d, &Rect::new(0, 0, 10, 11), false), Err(PushError::Shape));
-        assert_eq!(copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(1595, 0, 1605, 10), &d, &Rect::new(0, 0, 10, 10), false), Err(PushError::Shape));
+        assert_eq!(copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(0, 0, 10, 10), &d, &Rect::new(0, 0, 10, 11), cp::Remap::None), Err(PushError::Shape));
+        assert_eq!(copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(1595, 0, 1605, 10), &d, &Rect::new(0, 0, 10, 10), cp::Remap::None), Err(PushError::Shape));
         // An R/B exchange programs the remap (components word, LAUNCH_DMA REMAP_ENABLE).
         let mut buf = [0u32; 64];
         let mut p = Push::new(&mut buf);
-        copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(0, 0, 4, 4), &d, &Rect::new(0, 0, 4, 4), true).unwrap();
+        copy_rect(&mut p, Gen::Gb202, &s, &Rect::new(0, 0, 4, 4), &d, &Rect::new(0, 0, 4, 4), cp::Remap::SwapRb).unwrap();
         assert!(p.words().contains(&cp::SWAP_RB_COMPONENTS));
         let a = Surface { format: 32, ..vram(1) };
         let b = vram(2);
@@ -2238,6 +2286,7 @@ mod tests {
         assert_eq!(paths_from_off(0x2), 0x3F);
         assert_eq!(paths_from_off(0x4), 0x39);
         assert_eq!(paths_from_off(0x20), 0x1D);
+        assert_eq!(paths_from_off(0x40), 0x7D);
     }
 
     /// A knob is a service-key value the driver READS; a counter is one it WRITES. The same name
@@ -2393,6 +2442,32 @@ mod tests {
             let mut wv = ViewMut { data: &mut win, pitch: 200, x0: 3, y0: 4, w: 50, h: 25 };
             assert!(!bitblt_rows(&cmd, &Rect::new(0, 0, 8, 8), &mut wv, &sv, &mut db));
         }
+    }
+
+    #[test]
+    fn opaque_alpha_only_for_gpu_destinations_and_never_for_alphablend() {
+        let mk = |class, format| Surface { resource_id: 1, width: 8, height: 8, pitch: 32, class, format, kind_bits: 0 };
+        let tex_a = mk(SurfaceClass::Vram, 21);
+        let tex_x = mk(SurfaceClass::Vram, 22);
+        let stg_x = mk(SurfaceClass::System, 22);
+        let stg_a = mk(SurfaceClass::System, 21);
+        let r = Rect::new(0, 0, 4, 4);
+        let bb = Cmd::BitBlt { src: r, dst: r, src_index: 0, dst_index: 1, subs: SubRects::None, rop: rop::SRCCOPY, rop3: 0, src_pitch: 0, dst_pitch: 0 };
+        let cf = Cmd::ColorFill { dst: r, dst_index: 1, subs: SubRects::None, color: 0x00336699, rop: cfrop::PATCOPY, rop3: 0 };
+        let ab = Cmd::AlphaBlend { src: r, dst: r, src_index: 0, dst_index: 1, subs: SubRects::None, const_alpha: 255, has_alpha: true, src_pitch: 0 };
+        // X8 source into an A8 texture: always.
+        assert!(opaque_alpha(&bb, Some(&stg_x), &tex_a, false));
+        assert!(!opaque_alpha(&bb, Some(&stg_a), &tex_a, false));
+        assert!(!opaque_alpha(&bb, Some(&stg_x), &tex_x, false));
+        // Staging destinations never.
+        assert!(!opaque_alpha(&bb, Some(&stg_x), &stg_a, true));
+        // Forced: copies and fills into textures, never AlphaBlend.
+        assert!(opaque_alpha(&cf, None, &tex_a, true));
+        assert!(!opaque_alpha(&cf, None, &tex_a, false));
+        assert!(!opaque_alpha(&ab, Some(&stg_a), &tex_a, true));
+        assert_eq!(copy_remap(false, false), cp::Remap::None);
+        assert_eq!(copy_remap(true, false), cp::Remap::SwapRb);
+        assert!(matches!(copy_remap(true, true), cp::Remap::Select(_)));
     }
 
     #[test]

@@ -132,6 +132,14 @@ static CHK_BAD: AtomicU32 = AtomicU32::new(0);
 static CHK_K: AtomicU32 = AtomicU32::new(0);
 static CHK_GOT: AtomicU32 = AtomicU32::new(0);
 static CHK_WANT: AtomicU32 = AtomicU32::new(0);
+/// Of the checked pixels in GPU surfaces (VRAM, foreign): alpha byte 0, alpha byte 0xff, and the
+/// last such pixel read (all 32 bits). Commands that wrote an opaque alpha (`ga::opaque_alpha`).
+static CHK_A0: AtomicU32 = AtomicU32::new(0);
+static CHK_AFF: AtomicU32 = AtomicU32::new(0);
+static CHK_GPU_PX: AtomicU32 = AtomicU32::new(0);
+static OPAQ_N: AtomicU32 = AtomicU32::new(0);
+/// The last GPU-destination write's formats: source D3DDDIFORMAT (low 16) | destination's << 16.
+static FMT_K: AtomicU32 = AtomicU32::new(0);
 static PITCH_MIS: AtomicU32 = AtomicU32::new(0);
 static PITCH_CMD: AtomicU32 = AtomicU32::new(0);
 static PITCH_AL: AtomicU32 = AtomicU32::new(0);
@@ -280,6 +288,33 @@ const PATH_PAIR: u32 = 8;
 const PATH_OVL: u32 = 16;
 /// Copies INTO a foreign NVK image (`GdiOff` 0x20 turns them off).
 const PATH_FGN_WR: u32 = 32;
+/// Every GDI write into a GPU surface sets alpha 0xff (`GdiOff` 0x40 opts in; `ga::opaque_alpha`).
+const PATH_OPAQUE: u32 = 64;
+
+/// Whether `op` writes an opaque alpha byte (`ga::opaque_alpha`), counted in `GdiOpaqN`.
+fn opaque(op: &Op) -> bool {
+    let Some(d) = op.dst else { return false };
+    ga::opaque_alpha(&op.cmd, op.srcs[0].as_ref(), &d, path(PATH_OPAQUE))
+}
+
+/// Sets byte 3 of every pixel of `subs` (surface coordinates) inside a packed window `win`.
+fn force_alpha(buf: &mut [u8], win: &Rect, subs: &[Rect]) {
+    let w = win.width().max(0) as usize;
+    for sub in subs {
+        let r = sub.intersect(win);
+        if r.is_empty() {
+            continue;
+        }
+        for y in r.top..r.bottom {
+            let row = (y - win.top) as usize * w * 4;
+            for x in r.left..r.right {
+                if let Some(a) = buf.get_mut(row + (x - win.left) as usize * 4 + 3) {
+                    *a = 0xff;
+                }
+            }
+        }
+    }
+}
 
 fn path(bit: u32) -> bool {
     PATHS.load(Ordering::Relaxed) & bit != 0
@@ -292,7 +327,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -391,6 +426,11 @@ pub(crate) fn publish_counters() {
     w(b"GdiChkBad", CHK_BAD.load(Ordering::Relaxed));
     w(b"GdiChkK", CHK_K.load(Ordering::Relaxed));
     w(b"GdiChkGot", CHK_GOT.load(Ordering::Relaxed));
+    w(b"GdiChkA0", CHK_A0.load(Ordering::Relaxed));
+    w(b"GdiChkAFF", CHK_AFF.load(Ordering::Relaxed));
+    w(b"GdiChkGpuPx", CHK_GPU_PX.load(Ordering::Relaxed));
+    w(b"GdiOpaqN", OPAQ_N.load(Ordering::Relaxed));
+    w(b"GdiFmtK", FMT_K.load(Ordering::Relaxed));
     w(b"GdiChkWant", CHK_WANT.load(Ordering::Relaxed));
     w(b"GdiPitchMis", PITCH_MIS.load(Ordering::Relaxed));
     w(b"GdiPitchCmd", PITCH_CMD.load(Ordering::Relaxed));
@@ -785,6 +825,14 @@ fn self_check(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, path: u3
         return;
     };
     CHK_N.fetch_add(1, Ordering::Relaxed);
+    if matches!(dst.class, SurfaceClass::Vram | SurfaceClass::Foreign) {
+        match got >> 24 {
+            0 => CHK_A0.fetch_add(1, Ordering::Relaxed),
+            0xff => CHK_AFF.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+        CHK_GPU_PX.store(got, Ordering::Relaxed);
+    }
     if (got ^ want) & 0x00ff_ffff != 0 {
         CHK_BAD.fetch_add(1, Ordering::Relaxed);
         CHK_K.store(op_signature(op) | path << 28, Ordering::Relaxed);
@@ -929,6 +977,12 @@ fn run_foreign_write(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -
 }
 
 fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    if opaque(op) {
+        OPAQ_N.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(d) = op.dst.filter(|d| matches!(d.class, SurfaceClass::Vram | SurfaceClass::Foreign)) {
+        FMT_K.store(op.srcs[0].map_or(0, |s| s.format & 0xffff) | (d.format & 0xffff) << 16, Ordering::Relaxed);
+    }
     let drops = crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed);
     execute_inner(passive, adapter, op);
     if crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed) == drops {
@@ -1065,6 +1119,7 @@ fn submit_and_wait(passive: PassiveLevel, op: &Op, dv: &CeView, sv: Option<&CeVi
     let mut last = None;
     match (op.cmd, sv) {
         (Cmd::ColorFill { color, .. }, _) => {
+            let color = if opaque(op) { color | 0xff00_0000 } else { color };
             let per = ga::rects_per_push(glue::SLOT_DWORDS, ga::FILL_STATE_DWORDS, ga::FILL_RECT_DWORDS).max(1);
             for chunk in op.subs.chunks(per) {
                 let v = glue::submit(|p, _gen, done| {
@@ -1088,12 +1143,13 @@ fn submit_and_wait(passive: PassiveLevel, op: &Op, dv: &CeView, sv: Option<&CeVi
                 (Some(a), Some(b)) => ga::swaps_rb(&a, &b),
                 _ => false,
             };
+            let opq = opaque(op);
             let per = ga::rects_per_push(glue::SLOT_DWORDS, 0, ga::COPY_RECT_DWORDS).max(1);
             for chunk in op.subs.chunks(per) {
                 let v = glue::submit(|p, gen, done| {
                     for r in chunk {
                         let s = ga::bitblt_src(r, &dr, &sr);
-                        ga::copy_rect(p, gen, sv, &s, dv, r, swap)?;
+                        ga::copy_rect(p, gen, sv, &s, dv, r, ga::copy_remap(swap, opq))?;
                     }
                     cp::release(p, done)
                 });
@@ -1583,6 +1639,7 @@ fn run_cpu_copy(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &
         return Err(Why::BadIndex);
     };
     let src = op.srcs[0].ok_or(Why::BadIndex)?;
+    let opq = opaque(op);
     let (dpc, spc) = cmd_pitches(&op.cmd);
     let (dpitch, spitch) = (pitch_of(dst, dpc), pitch_of(&src, spc));
     if src.class == SurfaceClass::Vram && dst.class == SurfaceClass::System {
@@ -1602,6 +1659,11 @@ fn run_cpu_copy(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &
                 px.swap(0, 2);
             }
         }
+        if opq {
+            for px in buf.chunks_exact_mut(4) {
+                px[3] = 0xff;
+            }
+        }
         write_window(passive, adapter, dst, &d, dpitch, &mut buf)?;
     }
     Ok(())
@@ -1609,6 +1671,7 @@ fn run_cpu_copy(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &
 
 /// PATCOPY per sub-rectangle: the color written, nothing read.
 fn run_cpu_fill(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &Surface, color: u32) -> Result<(), Why> {
+    let color = if opaque(op) { color | 0xff00_0000 } else { color };
     let dpitch = pitch_of(dst, 0);
     for sub in &op.subs {
         let d = clip_to(sub, dst);
@@ -1694,6 +1757,9 @@ fn run_cpu_window(
                 cpu::run(&op.cmd, sub, &mut dv, sv.as_ref(), gamma_row.as_ref(), &mut done);
             }
         }
+    }
+    if opaque(op) {
+        force_alpha(&mut dbuf, &dwin, subs);
     }
     write_window(passive, adapter, dst, &dwin, dpitch, &mut dbuf)
 }
