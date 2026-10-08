@@ -10,7 +10,7 @@
 //! has no RM-fence boundary yet (S4), and an `HE12` record without a stream is
 //! refused at Render. So this driver orders the context itself:
 //!
-//! * **Monitored fence** (`Nvk12EclSync=0`, the default). Each queue owns one
+//! * **Monitored fence** (`Nvk12EclSync=0`, and mode 2's fallback). Each queue owns one
 //!   WDDM monitored fence created through the kernel callbacks. Every NVK
 //!   boundary appends, on the queue's own context, the runtime admission event
 //!   (exactly as on Venus) followed by a GPU wait for the fence to reach the
@@ -27,14 +27,14 @@
 //!   timeouts for `Nvk12EclSpinUs` (default 2 ms): NVK's own blocking wait
 //!   costs at least a Windows timer tick, once per ECL.
 //!
-//! * **ECL fence** (`Nvk12EclSync=2`). Each ExecuteCommandLists submits an
+//! * **ECL fence** (`Nvk12EclSync=2`, the default). Each ExecuteCommandLists submits an
 //!   `HE12` v4 Render record naming an RM fence the engine reserved for the
 //!   batch (NVK helios_icd_interface v7 `ecl_fence_*`, vkd3d patch 0004), then
 //!   queues the admission event exactly as on Venus. The KMD withholds the
 //!   packet's DMA completion until the fence fires, which the engine's worker
 //!   signals right after the batch. Nothing waits, and the next batch is
 //!   admitted at once (the packet is submitted, not completed). A batch that
-//!   gets no fence, or whose Render is refused, takes the CPU-wait arm.
+//!   gets no fence, or whose Render is refused, takes the monitored-fence arm.
 //!
 //! The order on the context matters: admission first (it only fires once the
 //! runtime's earlier waits are satisfied, and the engine worker waits for it),
@@ -718,9 +718,11 @@ impl NvkSync {
     /// is; the engine queue outlives this value (the queue drops it first).
     pub(crate) unsafe fn new(dev: &device12::HeliosD3D12Device, engine_queue: usize) -> Self {
         let mode = crate::knobs12::nvk12_ecl_sync();
-        if mode != 0 {
-            // Mode 2 orders batches with ECL fences (`nvk_complete_fenced`);
-            // this arm is its fallback for a batch that got none.
+        // Mode 2 orders batches with ECL fences (`nvk_complete_fenced`); this
+        // object is its fallback for a batch that got none, and that fallback
+        // is the monitored-fence arm (mode 0), never the CPU wait: a device
+        // without ECL fences (an older NVK or KMD) runs exactly as mode 0.
+        if mode == 1 {
             note_refusal(&NVK_REFUSALS.cpu_wait_arm);
             log_error!("NVK ECL sync: CPU wait arm (Nvk12EclSync={mode})");
             return Self { fence: None };

@@ -343,9 +343,9 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 19] {
 ///
 /// | value | meaning |
 /// |---:|---|
-/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. Falls back to 1 if the fence cannot be created. The default |
+/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. Falls back to 1 if the fence cannot be created |
 /// | 1 | CPU wait: ExecuteCommandLists returns only after its work completed (2 s cap per call, then it proceeds and counts a timeout) |
-/// | 2 | ECL fence: each ECL submits an `HE12` v4 record naming an RM fence the engine signals after the batch; the KMD withholds the packet's DMA completion until it fires. Nothing waits and batches pipeline. Needs NVK helios_icd_interface v7 and a KMD that takes RM fences in `HE12` v4 (`HELIOS_ICD_CAP_PRESENT_FENCE_KMD`); without them, and for a batch whose fence could not be made or whose Render is refused, it acts as 1 |
+/// | 2 | ECL fence: each ECL submits an `HE12` v4 record naming an RM fence the engine signals after the batch; the KMD withholds the packet's DMA completion until it fires. Nothing waits and batches pipeline. Needs NVK helios_icd_interface v7 and a KMD that takes RM fences in `HE12` v4 (`HELIOS_ICD_CAP_PRESENT_FENCE_KMD`); without them, and for a batch whose fence could not be made or whose Render is refused, it acts as 0. The default |
 ///
 /// Default 0 since 2026-10-08. 1 was the default from 2026-10-06, when 0
 /// deadlocked Basemark GPU DX12 after its first frame: the worker coalesced
@@ -354,7 +354,13 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 19] {
 /// signalled in order). Measured on 393.1 (Basemark DX12, 1920x1080 windowed,
 /// 3 loops): 1 = median frame 36.7 ms, CPUBusy 36.6 ms (20 ECLs a frame, each
 /// a ~0.85 ms CPU wait); 0 = median 22.65 ms, CPUBusy 17.9 ms, no deadlock.
-pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 0);
+///
+/// Default 2 since 2026-10-08 (399.1, same scene, 876 frames): 0 = frame
+/// 24.7 ms with 4.6 ms in Present (the scanout present's CPU wait); 2 = 21.4 ms
+/// with 67 us in Present (fenced scanout present). Mode 2 ran clean on 394.1,
+/// 395.1, 396.1 and 399.1 (no fallback batches, RmGErr 0). Its fallback is
+/// mode 0, so a device without ECL fences behaves as before.
+pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 2);
 
 /// `Nvk12Present` (or `HELIOS_NVK_PRESENT` in the process environment): 0 =
 /// automatic (DWM composes the back buffer from its NVK resource id when the
