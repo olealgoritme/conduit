@@ -523,6 +523,16 @@ of the other paths were already bounded: RM I/O by `IO_MS` (2 s) per call inside
 channel I/O by 250 ms, the copies by `XFER_MS` (250 ms); the content transaction is held only around one
 command's resolve, copies and waits.
 
+364.1 hang, root cause (NMI dump, stacks through the build's map): a SELF-DEADLOCK on `ce_vram`'s map
+table spinlock. `foreign_source` read the table in a `match` scrutinee (`match BOOK.lock()...find()`),
+which keeps the guard alive across the arms; the `None` arm (a foreign image not mapped yet, the
+import path) called `with_io` -> `give_back_stale` -> the same spinlock on the same CPU at DISPATCH,
+which spun forever (another CPU then waited on it for a generic DPC and the guest wedged).
+`import_foreign` had the same shape with a re-lock in an arm, and two bounce paths held the table
+across RM frees at DISPATCH. Fixed: every guard is taken in its own statement and never held across
+I/O or a call back into the file; all access goes through `book()`, which tags the owning thread and
+answers a re-entry with a refusal (`REENTRY`, counted in `RvBookReent`) instead of spinning.
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
