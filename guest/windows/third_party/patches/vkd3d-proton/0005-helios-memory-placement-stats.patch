@@ -1,0 +1,178 @@
+Helios vkd3d-proton fork: where vkd3d's memory lands (memory placement stats)
+
+Conduit Basemark D3D12 on NVK: is DEFAULT or UPLOAD data in memory the GPU
+reads slowly? Applied after 0004.
+
+- At device init the memory heaps and types are logged (INFO "Helios:
+  memory heap/type"), next to the existing topology lines.
+- Every VkDeviceMemory allocation is counted by its Vulkan memory type and
+  by what it asked for (class: 0 DEVICE_LOCAL = DEFAULT, 1 HOST_VISIBLE =
+  UPLOAD, 2 HOST_CACHED = READBACK, 3 DEVICE_LOCAL|HOST_VISIBLE = descriptor
+  heaps and GPU_UPLOAD, 4 other), with live bytes per type (frees counted)
+  and the allocations that asked for DEVICE_LOCAL but got a type without it.
+- helios_vkd3d_memory_stats(out, count) exports them for the UMD's log
+  (layout in memory.c). Windows only; helios_vkd3d.def exports it.
+
+diff --git a/libs/d3d12core/helios_vkd3d.def b/libs/d3d12core/helios_vkd3d.def
+index f5fa1e9e..ff11a687 100644
+--- a/libs/d3d12core/helios_vkd3d.def
++++ b/libs/d3d12core/helios_vkd3d.def
+@@ -11,3 +11,4 @@ EXPORTS
+     helios_vkd3d_wait_execution
+     helios_vkd3d_execute_command_lists_rm
+     helios_vkd3d_ecl_fence_stats
++    helios_vkd3d_memory_stats
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index c2bd1b58..d233d792 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -816,6 +816,112 @@ static HRESULT vkd3d_create_global_buffer(struct d3d12_device *device, VkDeviceS
+     return vkd3d_create_buffer(device, heap_properties, heap_flags, &resource_desc, "global-buffer", vk_buffer);
+ }
+ 
++/* Helios: where vkd3d's VkDeviceMemory lands, per Vulkan memory type, and
++ * what each allocation asked for (the request class: DEFAULT-like
++ * DEVICE_LOCAL, UPLOAD-like HOST_VISIBLE|HOST_COHERENT, READBACK-like
++ * HOST_CACHED, HVV DEVICE_LOCAL|HOST_VISIBLE for descriptor heaps and
++ * GPU_UPLOAD, anything else). Exported by helios_vkd3d_memory_stats for the
++ * Conduit UMD's log. Process-wide: one NVK device per process in practice. */
++#ifdef _WIN32
++#define VKD3D_HELIOS_MEM_TYPES 32
++#define VKD3D_HELIOS_MEM_CLASSES 5
++static struct
++{
++    LONG64 live_bytes[VKD3D_HELIOS_MEM_TYPES];
++    LONG64 class_bytes[VKD3D_HELIOS_MEM_CLASSES][VKD3D_HELIOS_MEM_TYPES];
++    LONG64 class_count[VKD3D_HELIOS_MEM_CLASSES][VKD3D_HELIOS_MEM_TYPES];
++    LONG64 type_info[VKD3D_HELIOS_MEM_TYPES];
++    LONG64 fallbacks;
++} vkd3d_helios_mem;
++
++static unsigned int vkd3d_helios_mem_class(VkMemoryPropertyFlags type_flags)
++{
++    const VkMemoryPropertyFlags dl = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++    const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++    if ((type_flags & (dl | hv)) == dl)
++        return 0;
++    if ((type_flags & (dl | hv)) == (dl | hv))
++        return 3;
++    if ((type_flags & hv) && (type_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
++        return 2;
++    if (type_flags & hv)
++        return 1;
++    return 4;
++}
++
++static void vkd3d_helios_mem_note_alloc(struct d3d12_device *device, VkMemoryPropertyFlags type_flags,
++        uint32_t type_index, VkDeviceSize size)
++{
++    const VkMemoryType *type;
++    unsigned int c;
++    if (type_index >= VKD3D_HELIOS_MEM_TYPES)
++        return;
++    type = &device->memory_properties.memoryTypes[type_index];
++    c = vkd3d_helios_mem_class(type_flags);
++    InterlockedExchange64(&vkd3d_helios_mem.type_info[type_index],
++            (LONG64)((uint64_t)type->propertyFlags | ((uint64_t)type->heapIndex << 32) | (1ull << 63)));
++    InterlockedExchangeAdd64(&vkd3d_helios_mem.live_bytes[type_index], (LONG64)size);
++    InterlockedExchangeAdd64(&vkd3d_helios_mem.class_bytes[c][type_index], (LONG64)size);
++    InterlockedIncrement64(&vkd3d_helios_mem.class_count[c][type_index]);
++    /* The request wanted device-local memory and got a type without it. */
++    if ((type_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
++            !(type->propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++        InterlockedIncrement64(&vkd3d_helios_mem.fallbacks);
++}
++
++static void vkd3d_helios_mem_note_free(uint32_t type_index, VkDeviceSize size)
++{
++    if (type_index < VKD3D_HELIOS_MEM_TYPES)
++        InterlockedExchangeAdd64(&vkd3d_helios_mem.live_bytes[type_index], -(LONG64)size);
++}
++#else
++static void vkd3d_helios_mem_note_alloc(struct d3d12_device *device, VkMemoryPropertyFlags type_flags,
++        uint32_t type_index, VkDeviceSize size)
++{
++    (void)device; (void)type_flags; (void)type_index; (void)size;
++}
++
++static void vkd3d_helios_mem_note_free(uint32_t type_index, VkDeviceSize size)
++{
++    (void)type_index; (void)size;
++}
++#endif
++
++/* helios_vkd3d_memory_stats(out, count) layout, u64 each:
++ *   [0, 32)     live bytes per memory type
++ *   [32, 192)   bytes allocated per (class, type), class-major
++ *   [192, 352)  allocations per (class, type), class-major
++ *   [352, 384)  per type: propertyFlags | heapIndex << 32 | bit 63 (seen)
++ *   [384]       allocations that asked for DEVICE_LOCAL and got a type without it
++ * Classes: 0 DEVICE_LOCAL (DEFAULT), 1 HOST_VISIBLE (UPLOAD), 2 HOST_CACHED
++ * (READBACK), 3 DEVICE_LOCAL|HOST_VISIBLE (descriptor heaps, GPU_UPLOAD),
++ * 4 other. Returns how many values it wrote. */
++uint32_t helios_vkd3d_memory_stats(uint64_t *out, uint32_t count)
++{
++#ifdef _WIN32
++    uint64_t all[385];
++    uint32_t i, c, n = 0;
++    for (i = 0; i < VKD3D_HELIOS_MEM_TYPES; i++)
++        all[n++] = (uint64_t)vkd3d_helios_mem.live_bytes[i];
++    for (c = 0; c < VKD3D_HELIOS_MEM_CLASSES; c++)
++        for (i = 0; i < VKD3D_HELIOS_MEM_TYPES; i++)
++            all[n++] = (uint64_t)vkd3d_helios_mem.class_bytes[c][i];
++    for (c = 0; c < VKD3D_HELIOS_MEM_CLASSES; c++)
++        for (i = 0; i < VKD3D_HELIOS_MEM_TYPES; i++)
++            all[n++] = (uint64_t)vkd3d_helios_mem.class_count[c][i];
++    for (i = 0; i < VKD3D_HELIOS_MEM_TYPES; i++)
++        all[n++] = (uint64_t)vkd3d_helios_mem.type_info[i];
++    all[n++] = (uint64_t)vkd3d_helios_mem.fallbacks;
++    n = count < n ? count : n;
++    if (out)
++        memcpy(out, all, n * sizeof(*out));
++    return n;
++#else
++    (void)out; (void)count;
++    return 0;
++#endif
++}
++
+ static void vkd3d_report_memory_budget(struct d3d12_device *device)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+@@ -858,6 +964,7 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
+     }
+ 
+     VK_CALL(vkFreeMemory(device->vk_device, allocation->vk_memory, NULL));
++    vkd3d_helios_mem_note_free(allocation->vk_memory_type, allocation->size);
+     rebar_budget = !!(device->memory_info.rebar_budget_mask & (1u << allocation->vk_memory_type));
+ 
+     if (rebar_budget || VKD3D_CONFIG_FLAG_IS_SET(LOG_MEMORY_BUDGET))
+@@ -1028,6 +1135,7 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
+     {
+         vkd3d_queue_timeline_trace_register_instantaneous(&device->queue_timeline_trace,
+                 VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_VK_ALLOCATE_MEMORY, allocate_info.allocationSize);
++        vkd3d_helios_mem_note_alloc(device, type_flags, allocate_info.memoryTypeIndex, size);
+     }
+ 
+     if (vr == VK_SUCCESS && vkd3d_address_binding_tracker_active(&device->address_binding_tracker))
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 0001ca5e..904314e6 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -11291,6 +11291,16 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
+     bool is_hvv_use_allowed;
+     uint32_t i;
+ 
++    for (i = 0; i < device->memory_properties.memoryHeapCount; i++)
++        INFO("Helios: memory heap %u: %"PRIu64" MiB%s.\n", i,
++                device->memory_properties.memoryHeaps[i].size / (1024 * 1024),
++                (device->memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ?
++                " DEVICE_LOCAL" : "");
++    for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
++        INFO("Helios: memory type %u: heap %u, flags %#x.\n", i,
++                device->memory_properties.memoryTypes[i].heapIndex,
++                device->memory_properties.memoryTypes[i].propertyFlags);
++
+     vkd3d_memory_info_get_topology(&topology, device);
+     is_hvv_use_allowed = vkd3d_memory_info_decide_hvv_usage(&topology, device);
+     info->upload_heap_memory_properties =
