@@ -533,6 +533,15 @@ across RM frees at DISPATCH. Fixed: every guard is taken in its own statement an
 I/O or a call back into the file; all access goes through `book()`, which tags the owning thread and
 answers a re-entry with a refusal (`REENTRY`, counted in `RvBookReent`) instead of spinning.
 
+367.1 showed CDD BitBlts INTO the app's NVK image too (`GdiFgnDrop` 6, SRCCOPY with the foreign image
+as destination). `ce_vram::foreign_write(&src, src_rect, src_fourcc, &dst_foreign, x, y)` is the write
+direction: the same `ForeignSource` (record or import), a pitch-linear source, the image as destination
+(pitch by address, block-linear by the copy's destination origin, `ce_present::copy_push`), R/B remap,
+counted in `RvFgnWrite`. Ordering: no acquire by default (opt-in `RvOff` 0x100 waits for the app's frame
+before GDI writes over it); the GDI side waits for the copy before it completes the command, so the
+app's later submissions follow it on the CPU timeline. An app rendering into the same image at that
+moment races the write, as unflushed GDI-on-D3D does on bare metal.
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
