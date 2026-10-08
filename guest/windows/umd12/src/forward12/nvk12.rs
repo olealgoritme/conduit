@@ -255,37 +255,125 @@ fn log_ecl_fence_stats() {
 }
 
 /// Frames per frame-accounting line.
-const FRAME_LOG_EVERY: u64 = 1024;
+const FRAME_LOG_EVERY: u64 = 256;
 
 /// Per-frame accounting of the D3D12 thread time this driver owns, so the
-/// frame splits into "inside our DDIs" and "everything else" (the app's own
-/// work, command-list recording through vkd3d and NVK, the runtime) without a
-/// profiler. A frame is present-to-present; ECL and wait time accumulate
-/// between presents. All D3D12 queues of the process share one set (Basemark
-/// submits from one thread; a multi-threaded submitter sums its threads).
+/// frame splits into "inside our DDIs" and "everything else" without a
+/// profiler. A frame is present-to-present; the other sums accumulate between
+/// presents. All D3D12 queues and recording threads of the process share one
+/// set.
+///
+/// * ECL / CPU wait / Present: wall time inside those DDIs.
+/// * Recording: Reset-to-Close spans of command lists, summed over every list
+///   and thread (the app's own work between its recording calls included; on
+///   several threads it can exceed the frame).
+/// * Draws / barriers: wall time inside the draw and ResourceBarrier DDIs, i.e.
+///   vkd3d and NVK recording work the app waits for on its recording thread.
+///
+/// What none of these cover (the frame minus ECL and Present on the presenting
+/// thread, less what recording explains) is the app's own work or its waits
+/// (ID3D12Fence completion, which never enters this driver).
 pub(crate) struct FrameStats {
-    /// ECL DDI wall time since the last present (ns), wait included.
     ecl_ns: AtomicU64,
     ecl_calls: AtomicU64,
-    /// Of which ECL CPU waits (ns).
     wait_ns: AtomicU64,
-    /// Window sums, ns, and the window's frame count.
+    record_ns: AtomicU64,
+    record_lists: AtomicU64,
+    draw_ns: AtomicU64,
+    draws: AtomicU64,
+    barrier_ns: AtomicU64,
+    barriers: AtomicU64,
     acc: Mutex<FrameAcc>,
 }
 
-struct FrameAcc {
-    last_present_end: Option<Instant>,
+/// Window sums (ns) and counts; `total` keeps the process totals.
+#[derive(Clone, Copy)]
+struct FrameSums {
     frames: u64,
     frame_ns: u64,
     ecl_ns: u64,
     ecl_calls: u64,
     wait_ns: u64,
     present_ns: u64,
-    total_frames: u64,
+    record_ns: u64,
+    record_lists: u64,
+    draw_ns: u64,
+    draws: u64,
+    barrier_ns: u64,
+    barriers: u64,
+}
+
+impl FrameSums {
+    const ZERO: Self = Self {
+        frames: 0,
+        frame_ns: 0,
+        ecl_ns: 0,
+        ecl_calls: 0,
+        wait_ns: 0,
+        present_ns: 0,
+        record_ns: 0,
+        record_lists: 0,
+        draw_ns: 0,
+        draws: 0,
+        barrier_ns: 0,
+        barriers: 0,
+    };
+
+    fn add(&mut self, o: &Self) {
+        self.frames += o.frames;
+        self.frame_ns += o.frame_ns;
+        self.ecl_ns += o.ecl_ns;
+        self.ecl_calls += o.ecl_calls;
+        self.wait_ns += o.wait_ns;
+        self.present_ns += o.present_ns;
+        self.record_ns += o.record_ns;
+        self.record_lists += o.record_lists;
+        self.draw_ns += o.draw_ns;
+        self.draws += o.draws;
+        self.barrier_ns += o.barrier_ns;
+        self.barriers += o.barriers;
+    }
+
+    fn log(&self, what: &str) {
+        let f = self.frames.max(1);
+        let per = |ns: u64| ns / f / 1000;
+        let other = self.frame_ns.saturating_sub(self.ecl_ns + self.present_ns);
+        log_error!(
+            "D3D12 frame time ({what}, {} frames): frame {} us = ECL {} us ({} calls, of which \
+             CPU wait {} us) + Present {} us + outside the driver's queue DDIs {} us; recording \
+             {} us in {} lists (Reset to Close, all threads), of which draws {} us ({}) and \
+             barriers {} us ({})",
+            self.frames,
+            per(self.frame_ns),
+            per(self.ecl_ns),
+            self.ecl_calls / f,
+            per(self.wait_ns),
+            per(self.present_ns),
+            per(other),
+            per(self.record_ns),
+            self.record_lists / f,
+            per(self.draw_ns),
+            self.draws / f,
+            per(self.barrier_ns),
+            self.barriers / f,
+        );
+    }
+}
+
+struct FrameAcc {
+    last_present_end: Option<Instant>,
+    window: FrameSums,
+    total: FrameSums,
 }
 
 fn ns_of(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+std::thread_local! {
+    /// Command lists this thread is recording, with their Reset time.
+    static OPEN_LISTS: std::cell::RefCell<Vec<(usize, Instant)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl FrameStats {
@@ -298,68 +386,104 @@ impl FrameStats {
         self.wait_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
     }
 
+    /// A command list starts recording on this thread (`pfnResetCommandList`,
+    /// and the first recording after `pfnCreateCommandList`).
+    pub(crate) fn note_reset(&self, list: usize) {
+        let now = Instant::now();
+        OPEN_LISTS.with(|open| {
+            let mut open = open.borrow_mut();
+            if let Some(slot) = open.iter_mut().find(|(l, _)| *l == list) {
+                slot.1 = now;
+            } else if open.len() < 64 {
+                open.push((list, now));
+            }
+        });
+    }
+
+    /// A command list closes (`pfnCloseCommandList`).
+    pub(crate) fn note_close(&self, list: usize) {
+        let span = OPEN_LISTS.with(|open| {
+            let mut open = open.borrow_mut();
+            let i = open.iter().position(|(l, _)| *l == list)?;
+            Some(open.swap_remove(i).1.elapsed())
+        });
+        if let Some(span) = span {
+            self.record_ns.fetch_add(ns_of(span), Ordering::Relaxed);
+            self.record_lists.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn note_draw(&self, elapsed: Duration) {
+        self.draw_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+        self.draws.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_barrier(&self, elapsed: Duration) {
+        self.barrier_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+        self.barriers.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Close a frame: `started` is the Present DDI's entry.
     pub(crate) fn note_present(&self, started: Instant) {
         let now = Instant::now();
-        let present_ns = ns_of(now - started);
-        let ecl_ns = self.ecl_ns.swap(0, Ordering::Relaxed);
-        let ecl_calls = self.ecl_calls.swap(0, Ordering::Relaxed);
-        let wait_ns = self.wait_ns.swap(0, Ordering::Relaxed);
+        let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+        let mut frame = FrameSums {
+            frames: 1,
+            frame_ns: 0,
+            ecl_ns: take(&self.ecl_ns),
+            ecl_calls: take(&self.ecl_calls),
+            wait_ns: take(&self.wait_ns),
+            present_ns: ns_of(now - started),
+            record_ns: take(&self.record_ns),
+            record_lists: take(&self.record_lists),
+            draw_ns: take(&self.draw_ns),
+            draws: take(&self.draws),
+            barrier_ns: take(&self.barrier_ns),
+            barriers: take(&self.barriers),
+        };
         let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner());
         let Some(last) = acc.last_present_end.replace(now) else {
             return; // the first present only opens a frame
         };
-        acc.frames += 1;
-        acc.total_frames += 1;
-        acc.frame_ns += ns_of(now - last);
-        acc.ecl_ns += ecl_ns;
-        acc.ecl_calls += ecl_calls;
-        acc.wait_ns += wait_ns;
-        acc.present_ns += present_ns;
-        if acc.frames < FRAME_LOG_EVERY && acc.total_frames != 1 {
+        frame.frame_ns = ns_of(now - last);
+        acc.window.add(&frame);
+        acc.total.add(&frame);
+        if acc.window.frames < FRAME_LOG_EVERY && acc.total.frames != 1 {
             return;
         }
-        let f = acc.frames;
-        let per = |ns: u64| ns / f / 1000;
-        let other = acc.frame_ns.saturating_sub(acc.ecl_ns + acc.present_ns);
-        log_error!(
-            "D3D12 frame time ({} frames, total {}): frame {} us = ECL {} us ({} calls, of which \
-             CPU wait {} us) + Present {} us + outside the driver's queue DDIs {} us",
-            f,
-            acc.total_frames,
-            per(acc.frame_ns),
-            per(acc.ecl_ns),
-            acc.ecl_calls / f,
-            per(acc.wait_ns),
-            per(acc.present_ns),
-            per(other),
-        );
-        let total_frames = acc.total_frames;
-        let last_present_end = acc.last_present_end;
-        *acc = FrameAcc { last_present_end, total_frames, ..FrameAcc::EMPTY };
+        let window = acc.window;
+        acc.window = FrameSums::ZERO;
+        let total_frames = acc.total.frames;
         drop(acc);
+        window.log(&format!("last frames, {total_frames} so far"));
         log_ecl_fence_stats();
     }
-}
 
-impl FrameAcc {
-    const EMPTY: Self = Self {
-        last_present_end: None,
-        frames: 0,
-        frame_ns: 0,
-        ecl_ns: 0,
-        ecl_calls: 0,
-        wait_ns: 0,
-        present_ns: 0,
-        total_frames: 0,
-    };
+    /// The process totals, at device teardown.
+    pub(crate) fn log_totals(&self) {
+        let total = self.acc.lock().unwrap_or_else(|p| p.into_inner()).total;
+        if total.frames != 0 {
+            total.log("totals");
+            log_ecl_fence_stats();
+        }
+    }
 }
 
 pub(crate) static FRAME_STATS: FrameStats = FrameStats {
     ecl_ns: AtomicU64::new(0),
     ecl_calls: AtomicU64::new(0),
     wait_ns: AtomicU64::new(0),
-    acc: Mutex::new(FrameAcc::EMPTY),
+    record_ns: AtomicU64::new(0),
+    record_lists: AtomicU64::new(0),
+    draw_ns: AtomicU64::new(0),
+    draws: AtomicU64::new(0),
+    barrier_ns: AtomicU64::new(0),
+    barriers: AtomicU64::new(0),
+    acc: Mutex::new(FrameAcc {
+        last_present_end: None,
+        window: FrameSums::ZERO,
+        total: FrameSums::ZERO,
+    }),
 };
 
 /// The worker's wait slice: it rechecks its stop flag this often.
