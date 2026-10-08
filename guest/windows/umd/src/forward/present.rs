@@ -2097,8 +2097,13 @@ unsafe fn nvk_present_impl_timed(
     t: &mut present_timing::Stamps,
 ) -> i32 {
     let mut shown = src_h;
+    // `NvkSkipBltCopy` (A/B, off by default): the KMD's Blt reads `src_h` and writes the window's
+    // surface itself; the UMD's copy into DXGI's destination is then the same pixels twice.
+    let skip_copy = crate::knobs::nvk_skip_blt_copy();
     if let Some(context) = d3d11_context(h) {
-        if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
+        if skip_copy {
+            // Nothing copied: `shown` stays the source.
+        } else if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
             present_timing::sub(0, || {
                 context.CopySubresourceRegion(
                     &*dst,

@@ -488,6 +488,16 @@ pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePre
 /// or `HELIOS_NVK_RM_COPY_RECORD=0`) = the 48 / 96-byte fence forms as before.
 pub(crate) static NVK_RM_COPY_RECORD: BoolKnob = BoolKnob::new(c"NvkRmCopyRecord", true);
 
+/// `NvkSkipBltCopy`: 0 (default) = when DXGI hands a windowed NVK present a
+/// destination resource, the UMD copies the frame into it
+/// (`CopySubresourceRegion`) before the WDDM present, as always. 1 (registry,
+/// or `HELIOS_NVK_SKIP_BLT_COPY=1`) = that copy is skipped: the KMD's Blt reads
+/// the present's source (`hSrcAllocation`) itself and writes the same pixels
+/// into the window's surface (`RedirVram`'s copy or route), so the UMD's copy
+/// only doubles the GPU work. An A/B knob: correct only where the KMD's Blt
+/// copies every such present.
+pub(crate) static NVK_SKIP_BLT_COPY: BoolKnob = BoolKnob::new(c"NvkSkipBltCopy", false);
+
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|v| match v.trim() {
         "0" => Some(false),
@@ -534,5 +544,13 @@ pub(crate) fn direct_flip_support() -> u32 {
             .and_then(|v| v.trim().parse().ok())
             .or_else(|| helios_umd_common::knobs::reg_dword(c"DirectFlipSupport"))
             .unwrap_or(0)
+    })
+}
+
+/// `NvkSkipBltCopy`, or `HELIOS_NVK_SKIP_BLT_COPY` from the environment.
+pub(crate) fn nvk_skip_blt_copy() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_SKIP_BLT_COPY").unwrap_or_else(|| NVK_SKIP_BLT_COPY.get())
     })
 }
