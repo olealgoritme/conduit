@@ -120,6 +120,9 @@ fn sys_refused(why: u32, bit: u32) {
 /// `GdiPaths` << 16 | (where it left: 1 not tried, the path off; 2 run_ce_sys refused; 3 failed
 /// after the mapping) << 24.
 static SYS_CPU_K: AtomicU32 = AtomicU32::new(0);
+/// The same command's surfaces (`Surface::kind_bits`: std type << 4 | GDI type | RM-backed << 8):
+/// source in the low 16 bits, destination in the high 16 (`GdiSysCpuT`).
+static SYS_CPU_T: AtomicU32 = AtomicU32::new(0);
 
 fn note_sys_cpu(op: &Op, stage: u32) {
     let src = op.srcs[0];
@@ -131,6 +134,10 @@ fn note_sys_cpu(op: &Op, stage: u32) {
             | u32::from(same) << 12
             | (PATHS.load(Ordering::Relaxed) & 0xff) << 16
             | stage << 24,
+        Ordering::Relaxed,
+    );
+    SYS_CPU_T.store(
+        src.map_or(0, |s| s.kind_bits & 0xffff) | op.dst.map_or(0, |d| d.kind_bits & 0xffff) << 16,
         Ordering::Relaxed,
     );
 }
@@ -195,7 +202,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -235,6 +242,7 @@ pub(crate) fn publish_counters() {
     w(b"GdiSysWhy", SYS_WHY.load(Ordering::Relaxed));
     w(b"GdiSysMsk", SYS_MSK.load(Ordering::Relaxed));
     w(b"GdiSysCpuK", SYS_CPU_K.load(Ordering::Relaxed));
+    w(b"GdiSysCpuT", SYS_CPU_T.load(Ordering::Relaxed));
     w(b"GdiChUpUs", CH_UP_US.load(Ordering::Relaxed));
     w(b"GdiSlowUs", SLOW_US.load(Ordering::Relaxed));
     w(b"GdiSlowOp", SLOW_OP.load(Ordering::Relaxed));

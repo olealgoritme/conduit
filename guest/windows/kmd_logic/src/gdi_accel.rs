@@ -827,6 +827,9 @@ pub struct Surface {
     pub class: SurfaceClass,
     /// The allocation's D3DDDIFORMAT (0 unknown): picks the byte order of a copy ([`order_of`]).
     pub format: u32,
+    /// Census only: `standard allocation type << 4 | GDI surface type` (each 4 bits) `| RM-backed
+    /// << 8` (a KMD standard buffer whose memory is RM system memory, `ce_sysmem`'s object path).
+    pub kind_bits: u32,
 }
 
 /// The byte order of a 32 bpp GDI surface format: `Some(false)` B G R A|X (`A8R8G8B8` 21,
@@ -1594,6 +1597,8 @@ pub const COUNTERS: &[&str] = &[
     // The last staging-path copy or fill that ran on the CPU: opcode | src class << 4 | dst class
     // << 8 | same buffer << 12 | GdiPaths << 16 | stage << 24 (1 path off, 2 refused, 3 failed).
     "GdiSysCpuK",
+    // Its surfaces: std type << 4 | GDI type | RM-backed << 8, source low 16 bits, dest high 16.
+    "GdiSysCpuT",
     // Unreachable surfaces: count, the last one's identity (storage << 24 | kind << 16 | foreign
     // layout << 8 | foreign identity << 9 | direct scanout << 10) and extent.
     "GdiUnrN",
@@ -1880,7 +1885,7 @@ mod tests {
     }
 
     fn vram(id: u32) -> Surface {
-        Surface { resource_id: id, width: 1600, height: 900, pitch: 6400, class: SurfaceClass::Vram, format: 21 }
+        Surface { resource_id: id, width: 1600, height: 900, pitch: 6400, class: SurfaceClass::Vram, format: 21, kind_bits: 0 }
     }
 
     #[test]
