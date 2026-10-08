@@ -961,6 +961,15 @@ unsafe extern "system" fn set_background_processing_mode(
 /// can enumerate, invalidate or clear through this DDI, and claiming otherwise
 /// would make `CLEAR` a request this driver silently ignores.
 ///
+/// ⛔ **Not forwarded, because the engine has nothing to forward to.** The API
+/// twin of this slot is `ID3D12Device9::ShaderCacheControl`, and vkd3d's is a
+/// `FIXME` stub returning `E_NOTIMPL` (`libs/vkd3d/device.c`,
+/// `d3d12_device_ShaderCacheControl`). The slot returns `VOID`, so the
+/// documented benign result is exactly this: do nothing and keep reporting
+/// `DriverManagedShaderCachePresent = 0`, which tells the runtime not to call
+/// it. vkd3d's own disk cache is placed by the bridge
+/// (`VKD3D_SHADER_CACHE_PATH`, `bridge/vkd3d_bridge.cpp`), not by this DDI.
+///
 /// # Safety
 /// Nothing is dereferenced. Declared `unsafe` because the DDI's PFN typedef is.
 unsafe extern "system" fn implicit_shader_cache_control(
