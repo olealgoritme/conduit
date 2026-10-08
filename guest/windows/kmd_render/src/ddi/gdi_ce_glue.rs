@@ -220,7 +220,27 @@ pub(crate) fn with_standard<R>(
     // `ce_sysmem` mirrors its `RvSys*` counters only after a success; a refusal is mirrored here
     // too, so a session where everything is refused still shows why.
     crate::ddi::ce_sysmem::publish_counters();
-    r.map_err(|f| SysRefusal {
+    r.map_err(refusal)
+}
+
+/// Two staging buffers' copy-engine views in one content transaction
+/// (`ce_sysmem::with_standard_pair`); `a`, `b` are `(resource_id, pitch, width, height)`. Same rules
+/// as [`with_standard`]. PASSIVE, no lock held.
+pub(crate) fn with_standard_pair<R>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    a: (u32, u32, u32, u32),
+    b: (u32, u32, u32, u32),
+    f: impl FnOnce(&CeView, &CeView) -> R,
+) -> Result<R, SysRefusal> {
+    let view = |s: &ce_vram::CeSurface| CeView { va: s.va, pitch: s.pitch, width: s.width, height: s.height };
+    let r = crate::ddi::ce_sysmem::with_standard_pair(passive, adapter, a, b, |x, y| f(&view(x), &view(y)));
+    crate::ddi::ce_sysmem::publish_counters();
+    r.map_err(refusal)
+}
+
+fn refusal(f: helios_kmd_logic::rm_client::Fail) -> SysRefusal {
+    SysRefusal {
         class: if f == crate::ddi::ce_sysmem::NOT_SYSTEM {
             SysClass::NotSystem
         } else if f == crate::ddi::ce_sysmem::UNCOVERED {
@@ -233,7 +253,7 @@ pub(crate) fn with_standard<R>(
             SysClass::Other
         },
         word: helios_kmd_logic::rm_ce_channel::fail_word(f),
-    })
+    }
 }
 
 /// Why `with_standard` refused.

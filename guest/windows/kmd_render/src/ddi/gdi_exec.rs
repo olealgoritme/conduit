@@ -753,8 +753,13 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                         submit_and_wait(passive, op, v, Some(v))
                     })
                 }
+                (SurfaceClass::System, SurfaceClass::System) => {
+                    // Staging to another staging buffer: both views in one content transaction.
+                    let a = (src.resource_id, map_pitch(&src, spc), src.width, src.height);
+                    let b = (dst.resource_id, map_pitch(&dst, dpc), dst.width, dst.height);
+                    glue::with_standard_pair(passive, adapter, a, b, |sv, dv| submit_and_wait(passive, op, dv, Some(sv)))
+                }
                 _ => {
-                    // Staging to another staging buffer: no copy-engine view of two buffers at once.
                     sys_refused(1, 1);
                     SYS_REF.fetch_add(1, Ordering::Relaxed);
                     return false;
