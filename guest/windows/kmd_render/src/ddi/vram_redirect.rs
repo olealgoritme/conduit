@@ -77,10 +77,27 @@ static RT_WHY: AtomicU32 = AtomicU32::new(0);
 /// bits (`RvSyncWhy`; step 1 foreign_source, 2 the destination's mapping, 3 the copy, 4 the wait).
 static SYNC_TRY: AtomicU32 = AtomicU32::new(0);
 static SYNC_WHY: AtomicU32 = AtomicU32::new(0);
+/// Every Present's marker stash as `DxgkDdiPresent` found it (`RvMkNone`: empty, `RvMkRes`: an
+/// RM fence attached at Render, `RvMkStr`: a stream point), and VRAM Blts that reached the route
+/// with no boundary (`RvMkVramNo`).
+static MK_NONE: AtomicU32 = AtomicU32::new(0);
+static MK_RES: AtomicU32 = AtomicU32::new(0);
+static MK_STR: AtomicU32 = AtomicU32::new(0);
+static MK_VRAM_NO: AtomicU32 = AtomicU32::new(0);
+
+/// The Present's stash (0 none, 1 resolved RM fence, 2 stream point). Any IRQL.
+pub(crate) fn note_marker(kind: u32) {
+    match kind {
+        1 => &MK_RES,
+        2 => &MK_STR,
+        _ => &MK_NONE,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
 
 /// StartDevice (PASSIVE): zero the counters (written only once a VRAM Blt was seen).
 pub(crate) fn reset_for_start() {
-    for c in [&SEEN, &ROUTED, &SKIP, &WHY, &READBACK, &UPLOAD, &GDI_FAIL, &SYNC, &RT_WHY, &SYNC_TRY, &SYNC_WHY] {
+    for c in [&SEEN, &ROUTED, &SKIP, &WHY, &READBACK, &UPLOAD, &GDI_FAIL, &SYNC, &RT_WHY, &SYNC_TRY, &SYNC_WHY, &MK_NONE, &MK_RES, &MK_STR, &MK_VRAM_NO] {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -98,6 +115,10 @@ fn publish() {
     rec(b"RvRtWhy", RT_WHY.load(Ordering::Relaxed));
     rec(b"RvSyncTry", SYNC_TRY.load(Ordering::Relaxed));
     rec(b"RvSyncWhy", SYNC_WHY.load(Ordering::Relaxed));
+    rec(b"RvMkNone", MK_NONE.load(Ordering::Relaxed));
+    rec(b"RvMkRes", MK_RES.load(Ordering::Relaxed));
+    rec(b"RvMkStr", MK_STR.load(Ordering::Relaxed));
+    rec(b"RvMkVramNo", MK_VRAM_NO.load(Ordering::Relaxed));
     vidmem::publish_counters();
 }
 
@@ -168,6 +189,9 @@ pub(crate) unsafe fn blt(
         return None;
     }
     SEEN.fetch_add(1, Ordering::Relaxed);
+    if boundary.is_none() {
+        MK_VRAM_NO.fetch_add(1, Ordering::Relaxed);
+    }
     if vidmem::off(helios_kmd_logic::rm_vidmem::off::PRESENT_HOOK) {
         return skip(Why::Disabled);
     }
