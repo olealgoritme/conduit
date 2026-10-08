@@ -247,11 +247,15 @@ pub fn foreign_layout(l: &VidLayout) -> Option<FrLayout> {
 
 // ---- the objects in the channel's client --------------------------------------------------------
 
-/// VRAM objects mapped in the channel at once.
-pub const MAP_SLOTS: usize = 16;
-/// Handles of map slot `i`: the dup, then its `NV50_MEMORY_VIRTUAL`. Above the route's
-/// destination handles (`ce_route::H_DST_BASE` + 16) and the dup cache's (`H_DUP_BASE` + 32).
-pub const H_MAP_BASE: u32 = cc::H_BASE + 0x100;
+/// Objects mapped in the channel at once: the KMD's VRAM surfaces, the RM staging buffers and the
+/// NVK images imported by resource id (`ce_vram::foreign_source`), one LRU. 16 thrashed once every
+/// window of the NVK desktop was a VRAM surface fed by an NVK swap chain: 377.1 imported again on
+/// almost every Present (`RvSyFs` 827 us of the 940 us a Present took). 48.
+pub const MAP_SLOTS: usize = 48;
+/// Handles of map slot `i`: the dup, then its `NV50_MEMORY_VIRTUAL`. Above the system views'
+/// (`H_SYS_BASE` + 16), the route's destination handles (`ce_route::H_DST_BASE` + 16) and the dup
+/// cache's (`H_DUP_BASE` + 32).
+pub const H_MAP_BASE: u32 = cc::H_BASE + 0x200;
 /// The bounce buffer (RM system memory of the channel's client) and its virtual allocation.
 pub const H_BOUNCE: u32 = cc::H_BASE + 0x0F0;
 pub const H_BOUNCE_VIRT: u32 = cc::H_BASE + 0x0F1;
@@ -261,9 +265,9 @@ pub const fn map_handles(slot: u8) -> (u32, u32) {
     (h, h + 1)
 }
 
-/// The GPU window of map slot `i`: 64 MiB windows from 48 windows above the channel's base (the
-/// route's destinations use 32..40, the dup cache 4..20).
-pub const MAP_VA_BASE: u64 = cc::VA_BASE + 48 * cc::VA_WINDOW;
+/// The GPU window of map slot `i`: 64 MiB windows from 80 windows above the channel's base (the
+/// route's destinations use 32..40, the dup cache 4..20, the bounce 44, the system views 64..72).
+pub const MAP_VA_BASE: u64 = cc::VA_BASE + 80 * cc::VA_WINDOW;
 pub const fn map_va(slot: u8) -> u64 {
     MAP_VA_BASE + slot as u64 * cc::VA_WINDOW
 }
@@ -290,8 +294,9 @@ pub const fn sys_va(slot: u8) -> u64 {
     SYS_VA_BASE + slot as u64 * cc::VA_WINDOW
 }
 const _: () = assert!(sys_va(SYS_SLOTS as u8 - 1) + cc::VA_WINDOW <= MAX_VA);
-const _: () = assert!(map_va(MAP_SLOTS as u8 - 1) + cc::VA_WINDOW <= SYS_VA_BASE);
-const _: () = assert!(H_MAP_BASE + 2 * MAP_SLOTS as u32 <= H_SYS_BASE);
+const _: () = assert!(sys_va(SYS_SLOTS as u8 - 1) + cc::VA_WINDOW <= MAP_VA_BASE);
+const _: () = assert!(H_SYS_BASE + 2 * SYS_SLOTS as u32 <= H_MAP_BASE);
+const _: () = assert!(MAP_SLOTS <= u8::MAX as usize);
 
 /// One mapped object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -971,10 +976,14 @@ mod tests {
         assert_eq!(v, d + 1);
         assert!(H_BOUNCE > crate::ce_route::H_DST_BASE + 2 * crate::ce_route::MAX_DSTS as u32);
         assert!(H_BOUNCE > cc::H_DUP_BASE + 32);
-        // windows: dup cache 4..20, route destinations 32..40, bounce 44, maps 48..64
+        // windows: dup cache 4..20, route destinations 32..40, bounce 44, system views 64..72,
+        // maps 80..128
         assert!(BOUNCE_VA >= crate::ce_route::dst_va(crate::ce_route::MAX_DSTS as u8 - 1) + cc::VA_WINDOW);
         assert!(crate::ce_dup::slot_va(15) + cc::VA_WINDOW <= crate::ce_route::DST_VA_BASE);
         assert_eq!(map_va(1) - map_va(0), cc::VA_WINDOW);
+        assert!(map_va(0) >= sys_va(SYS_SLOTS as u8 - 1) + cc::VA_WINDOW);
+        let (s_last, _) = sys_handles(SYS_SLOTS as u8 - 1);
+        assert!(map_handles(0).0 > s_last + 1);
     }
 
     #[test]
