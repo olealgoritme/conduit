@@ -1934,7 +1934,7 @@ unsafe fn nvk_present_impl(
 /// runtime's Render/Present callbacks, i.e. dxgkrnl and the KMD's DxgkDdiPresent), the whole call,
 /// and the interval between presents. PresentMon's inPresent is the whole call plus the runtime's
 /// own part around it.
-mod present_timing {
+pub(crate) mod present_timing {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
@@ -1953,6 +1953,11 @@ mod present_timing {
     /// The device's shared (keyed-mutex candidate) resources at the last present: nonzero makes
     /// `flush_gate` wait on the CPU for the GPU on NVK.
     static SHARED: AtomicU64 = AtomicU64::new(0);
+    /// The Flush DDI's `flush_gate` (the keyed-mutex hand-off point): calls, sum and max µs since
+    /// the last line.
+    static DDI_N: AtomicU64 = AtomicU64::new(0);
+    static DDI_SUM: AtomicU64 = AtomicU64::new(0);
+    static DDI_MAX: AtomicU64 = AtomicU64::new(0);
     static INTERVAL_SUM: AtomicU64 = AtomicU64::new(0);
 
     fn epoch() -> Instant {
@@ -2018,13 +2023,32 @@ mod present_timing {
                     line.push_str(&format!(" {}={}/{}", name, s / EVERY, m));
                 }
                 let iv = INTERVAL_SUM.swap(0, Ordering::Relaxed);
+                let dn = DDI_N.swap(0, Ordering::Relaxed);
+                let ds = DDI_SUM.swap(0, Ordering::Relaxed);
+                let dm = DDI_MAX.swap(0, Ordering::Relaxed);
                 crate::log_error!(
-                    "NVK present timing (avg/max us over {EVERY}, #{n}):{line} interval={} shared={}",
+                    "NVK present timing (avg/max us over {EVERY}, #{n}):{line} interval={} shared={} \
+                     present_gate={} ddi_flush_gate={}x sum={} max={}",
                     iv / EVERY,
-                    SHARED.load(Ordering::Relaxed)
+                    SHARED.load(Ordering::Relaxed),
+                    u8::from(super::nvk_present_gate()),
+                    dn,
+                    ds,
+                    dm
                 );
             }
         }
+    }
+
+    /// Time the Flush DDI's `flush_gate`.
+    pub(crate) fn ddi_flush_gate<R>(f: impl FnOnce() -> R) -> R {
+        let t = now_us();
+        let r = f();
+        let d = now_us().saturating_sub(t);
+        DDI_N.fetch_add(1, Ordering::Relaxed);
+        DDI_SUM.fetch_add(d, Ordering::Relaxed);
+        DDI_MAX.fetch_max(d, Ordering::Relaxed);
+        r
     }
 
     /// Time one part `i` of the copy+flush step.
@@ -2048,6 +2072,13 @@ mod present_timing {
         GATE.fetch_add(now_us().saturating_sub(t), Ordering::Relaxed);
         r
     }
+}
+
+/// `HELIOS_NVK_PRESENT_GATE=1` (process environment): the NVK present runs the shared-surface
+/// flush gate too (it always did before the Flush DDI was made the only gate).
+fn nvk_present_gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HELIOS_NVK_PRESENT_GATE").is_ok_and(|v| v == "1"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2080,9 +2111,16 @@ unsafe fn nvk_present_impl_timed(
             shown = dst_h;
             blt_source = false;
         }
-        // A keyed-mutex surface may be released right after this present.
         present_timing::sub(1, || context.Flush());
-        present_timing::sub(2, || flush_gate(h, &context));
+        // The keyed-mutex hand-off point is the Flush DDI: the runtime releases a keyed mutex
+        // right after `pfnFlush` (`transfer::flush`, which gates). A gate here as well made every
+        // present of a device holding any shared resource wait on the CPU for the GPU to go idle
+        // on NVK (377.1 Heaven windowed: copy+flush 0.66-0.87 ms of a 1.8-2.0 ms present, the
+        // UMD log's "keyed-mutex flush wait" at every frame). `HELIOS_NVK_PRESENT_GATE=1`
+        // restores it.
+        if nvk_present_gate() {
+            present_timing::sub(2, || flush_gate(h, &context));
+        }
         if let Some(dev) = helios_device(h) {
             present_timing::note_shared(lock_ignore_poison(&dev.nvk_keyed_resources).len());
         }
