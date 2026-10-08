@@ -269,6 +269,11 @@ unsafe fn surface_at(
         UNR_WH.store((info.width.min(0xffff) << 16) | info.height.min(0xffff), Ordering::Relaxed);
         SurfaceClass::Unreachable
     };
+    // Census: the standard/GDI type and whether the buffer is RM system memory.
+    // SAFETY: the same live open handle `present_alloc_info` just resolved.
+    let kind_bits = unsafe { crate::ddi::create_allocation::present_alloc_diag(h) }
+        .map_or(0, |d| ((d.standard_allocation_type & 0xf) << 4) | (d.standard_gdi_surface_type & 0xf))
+        | u32::from(class == SurfaceClass::System && crate::ddi::gdi_ce_glue::is_rm_standard(info.resource_id)) << 8;
     Some(Surface {
         resource_id: info.resource_id,
         width: info.width,
@@ -276,6 +281,7 @@ unsafe fn surface_at(
         pitch: info.pitch,
         class,
         format: info.format,
+        kind_bits,
     })
 }
 

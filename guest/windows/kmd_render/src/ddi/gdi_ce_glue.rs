@@ -200,6 +200,11 @@ pub(crate) fn vram_knob_on() -> bool {
     vidmem::knob_on()
 }
 
+/// Is `resource_id` a KMD standard buffer backed by RM system memory (`sysmem::object`)?
+pub(crate) fn is_rm_standard(resource_id: u32) -> bool {
+    crate::virtio::rm_client::sysmem::object(resource_id).is_some()
+}
+
 /// Is `resource_id` an RM-VRAM-backed surface (`vidmem::lookup`)? Spinlock-only, any IRQL up to
 /// DISPATCH.
 pub(crate) fn is_vram(resource_id: u32) -> bool {
