@@ -1448,7 +1448,8 @@ pub mod knobs {
     /// the other `AdapterKnobs` at AddAdapter and StartDevice; mirrored as `VmCapsXEff` and
     /// `VmCapsRep` at every start.
     pub const VIDMM_CAPS_EXTRA: KnobName = KnobName::new(b"VidMmCapsX");
-    /// `HwCursor` (default 1): the hardware cursor (`docs/independent-flip.md` section 12,
+    /// `HwCursor` (default 0 since 404: dxgkrnl never used the reported pointer, see
+    /// `hw_cursor::KNOB_DEFAULT`; 1 reports it, for experiments): the hardware cursor (`docs/independent-flip.md` section 12,
     /// `helios_kmd_logic::hw_cursor`). 1 reports a 256x256 monochrome / color / masked-color
     /// pointer in `DXGK_DRIVERCAPS` when the host serves it (`NVGPU_CFG_VENUS_CURSOR`), and
     /// `SetPointerShape` / `SetPointerPosition` drive the host pointer's image; dxgkrnl then

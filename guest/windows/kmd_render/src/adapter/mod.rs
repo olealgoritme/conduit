@@ -203,7 +203,7 @@ pub(crate) struct AdapterKnobs {
     /// `FlipDoneHost` (default 0), raw (`helios_kmd_logic::host_flip_done::Mode`): flips retire
     /// from the host's presentation feedback; also the default `FlipQueueN` (2 when nonzero).
     pub flip_done: u32,
-    /// `HwCursor` (default 1), raw (`helios_kmd_logic::hw_cursor::KNOB_*`). Whether the caps
+    /// `HwCursor` (default 0, `hw_cursor::KNOB_DEFAULT`), raw (`helios_kmd_logic::hw_cursor::KNOB_*`). Whether the caps
     /// report a pointer also depends on the host ([`crate::ddi::hw_cursor::advertised`]).
     pub hw_cursor: u32,
     /// `CrossAdaptCaps` (default 0). Nonzero advertises
@@ -287,7 +287,7 @@ impl AdapterKnobs {
         flip_caps_x: 0,
         indep_flip: 0,
         flip_done: 0,
-        hw_cursor: helios_kmd_logic::hw_cursor::KNOB_ON,
+        hw_cursor: helios_kmd_logic::hw_cursor::KNOB_DEFAULT,
         cross_adapter: false,
         vidmm_caps_x: 0,
         bar_seg_flags: 0x1C,
@@ -339,7 +339,10 @@ impl AdapterKnobs {
             flip_caps_x: advertised.flip_caps_x,
             indep_flip,
             flip_done: read_config_dword(knobs::FLIP_DONE_HOST, 0),
-            hw_cursor: read_config_dword(knobs::HW_CURSOR, helios_kmd_logic::hw_cursor::KNOB_ON),
+            hw_cursor: read_config_dword(
+                knobs::HW_CURSOR,
+                helios_kmd_logic::hw_cursor::KNOB_DEFAULT,
+            ),
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             vidmm_caps_x: read_config_dword(knobs::VIDMM_CAPS_EXTRA, 0),
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
