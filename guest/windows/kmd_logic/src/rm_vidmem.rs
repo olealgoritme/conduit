@@ -647,6 +647,84 @@ pub fn import_from_fd_params(fd: u32, h_device: u32, h_object: u32) -> [u8; IMPO
     a
 }
 
+/// A copy INTO an NVK-made (foreign) image (a GDI BitBlt whose destination is an app's image):
+/// `src_rect` of the pitch-linear `src` to `(dst_x, dst_y)` of the image whose base is `dst_va`,
+/// laid out as `plan` says. Pitch-linear destination by address, block-linear by the copy's
+/// destination origin.
+#[allow(clippy::too_many_arguments)]
+pub fn foreign_write(
+    src: &Surface,
+    src_rect: Rect,
+    plan: &crate::ce_present::SourcePlan,
+    dst_va: u64,
+    dst_pitch: u32,
+    dst_width: u32,
+    dst_height: u32,
+    dst_x: u32,
+    dst_y: u32,
+    remap: Remap,
+) -> Result<CopyRect, CopyError> {
+    if !src_rect.valid_in(src.width, src.height) {
+        return Err(CopyError::Rect);
+    }
+    match plan.layout {
+        SurfaceLayout::Pitch => {
+            let dst = Surface {
+                va: dst_va.checked_add(plan.offset).ok_or(CopyError::Va)?,
+                pitch: dst_pitch,
+                width: dst_width,
+                height: dst_height,
+            };
+            vram_copy(src, src_rect, &dst, dst_x, dst_y, remap)
+        }
+        SurfaceLayout::BlockLinear {
+            block_height_log2,
+            element_bytes,
+            image_height,
+            ..
+        } => {
+            let w = src_rect.right - src_rect.left;
+            let h = src_rect.bottom - src_rect.top;
+            let dst_rect = Rect {
+                left: dst_x,
+                top: dst_y,
+                right: dst_x.checked_add(w).ok_or(CopyError::Rect)?,
+                bottom: dst_y.checked_add(h).ok_or(CopyError::Rect)?,
+            };
+            if !dst_rect.valid_in(dst_width, dst_height) {
+                return Err(CopyError::Rect);
+            }
+            let line = u64::from(w) * BPP;
+            if line > u64::from(src.pitch) {
+                return Err(CopyError::Pitch);
+            }
+            let s = origin(src, src_rect.left, src_rect.top).ok_or(CopyError::Va)?;
+            let s_end = s + (u64::from(h) - 1) * u64::from(src.pitch) + line;
+            if s_end > MAX_VA || dst_va >= MAX_VA {
+                return Err(CopyError::Va);
+            }
+            Ok(CopyRect {
+                src_va: s,
+                dst_va,
+                src_pitch: src.pitch,
+                dst_pitch,
+                line_bytes: line as u32,
+                lines: h,
+                layout: SurfaceLayout::Pitch,
+                dst_layout: SurfaceLayout::BlockLinear {
+                    block_height_log2,
+                    element_bytes,
+                    image_height,
+                    origin_x_bytes: dst_x * BPP as u32,
+                    origin_y: dst_y,
+                },
+                remap,
+                stamp: None,
+            })
+        }
+    }
+}
+
 /// Direction of a bounce transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -706,7 +784,7 @@ pub const COUNTERS: &[&str] = &[
     // the Present (`ddi/vram_redirect.rs`)
     "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail",
     // foreign NVK sources for GDI commands (`ce_vram.rs`)
-    "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy",
+    "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy", "RvFgnWrite",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
     "RvSysMade", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak", "RvSysObj",
     // the CPU helpers' blob views (`ddi/build_paging_buffer.rs`)
@@ -881,6 +959,25 @@ mod tests {
             foreign_copy(&bl_plan, map_va(4), 7680, 1908, 910, Rect { left: 0, top: 0, right: 1909, bottom: 1 }, &dst, 0, 0, Remap::None),
             Err(CopyError::Rect)
         );
+    }
+
+    #[test]
+    fn foreign_writes_pitch_by_address_block_linear_by_origin() {
+        use crate::ce_present::SourcePlan;
+        let src = Surface { va: map_va(3), pitch: 6400, width: 1600, height: 900 };
+        let r = Rect { left: 10, top: 20, right: 110, bottom: 70 };
+        let pitch_plan = SourcePlan { layout: SurfaceLayout::Pitch, page_kind: None, line_bytes: 7632, offset: 0 };
+        let c = foreign_write(&src, r, &pitch_plan, map_va(4), 7680, 1908, 910, 5, 6, Remap::SwapRb).unwrap();
+        assert_eq!(c.src_va, src.va + 20 * 6400 + 40);
+        assert_eq!(c.dst_va, map_va(4) + 6 * 7680 + 20);
+        assert_eq!(c.dst_layout, SurfaceLayout::Pitch);
+        let bl = SurfaceLayout::BlockLinear { block_height_log2: 4, element_bytes: 4, image_height: 910, origin_x_bytes: 0, origin_y: 0 };
+        let bl_plan = SourcePlan { layout: bl, page_kind: Some(6), line_bytes: 7632, offset: 0 };
+        let c = foreign_write(&src, r, &bl_plan, map_va(4), 7680, 1908, 910, 5, 6, Remap::None).unwrap();
+        assert_eq!((c.src_va, c.dst_va, c.line_bytes, c.lines), (src.va + 20 * 6400 + 40, map_va(4), 400, 50));
+        assert_eq!(c.layout, SurfaceLayout::Pitch);
+        assert!(matches!(c.dst_layout, SurfaceLayout::BlockLinear { origin_x_bytes: 20, origin_y: 6, image_height: 910, .. }));
+        assert_eq!(foreign_write(&src, r, &bl_plan, map_va(4), 7680, 1908, 910, 1850, 0, Remap::None), Err(CopyError::Rect));
     }
 
     #[test]
