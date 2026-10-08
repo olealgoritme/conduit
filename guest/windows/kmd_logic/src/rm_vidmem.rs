@@ -65,6 +65,11 @@ pub mod off {
     /// DIAGNOSTIC: a new VRAM surface is cleared to opaque magenta instead of 0, so content no
     /// path ever wrote shows as magenta wherever DWM composes the surface.
     pub const CLEAR_MAGENTA: u32 = 0x2000;
+    /// OPT-IN: CDD's CPU-written GDI surfaces (`STAGING_CPUVISIBLE`, `LOOKUPTABLE`) go to the
+    /// aperture segment only (CpuVisible, Cached, no RM or BAR backing), as the GDI surface type
+    /// requires, and the KMD reads and writes them through the system pages Windows maps them to
+    /// (`ddi/aperture_pages.rs`), where win32k's CPU drawing is.
+    pub const STAGING_APERTURE: u32 = 0x4000;
     /// The Present hook (`ddi/vram_redirect.rs`) skips every Blt with a VRAM surface (counted).
     pub const PRESENT_HOOK: u32 = 0x80;
     /// OPT-IN: the CPU helpers reuse blob views (`build_paging_buffer`). Off by default since 364.1:
@@ -86,7 +91,7 @@ pub mod off {
 /// `off` is the `RvOff` mask.
 pub const fn rm_backed_standard(std_type: u32, gdi_type: u32, primary: bool, off: u32) -> bool {
     use crate::rm_standard::{GDI_LOOKUPTABLE, GDI_STAGING_CPUVISIBLE, STD_GDISURFACE};
-    if primary || std_type != STD_GDISURFACE || off & off::STAGING_RM != 0 {
+    if primary || std_type != STD_GDISURFACE || off & (off::STAGING_RM | off::STAGING_APERTURE) != 0 {
         return false;
     }
     gdi_type == GDI_STAGING_CPUVISIBLE || (gdi_type == GDI_LOOKUPTABLE && off & off::LUT_RM == 0)
@@ -890,7 +895,7 @@ pub const COUNTERS: &[&str] = &[
     "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvBookReent", "RvXfer", "RvXferFail",
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
     // the Present (`ddi/vram_redirect.rs`)
-    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy", "RvSyncTry", "RvSyncWhy", "RvMkNone", "RvMkRes", "RvMkStr", "RvMkVramNo", "RvSyPix", "RvSyPixN", "RvSyPixNz", "RvDst0", "RvDst1", "RvDst2", "RvDst3", "RvDst4", "RvDst5", "RvDst6", "RvDst7", "RvDstMore", "RvPgXfer", "RvPgFill", "RvPgDisc", "RvPgOther", "RvPgLast", "RvNew0", "RvNew1", "RvNew2", "RvNew3", "RvNew4", "RvNew5", "RvNew6", "RvNew7", "RvNewWH0", "RvNewWH1", "RvNewWH2", "RvNewWH3", "RvNewWH4", "RvNewWH5", "RvNewWH6", "RvNewWH7", "RvNewOp0", "RvNewOp1", "RvNewOp2", "RvNewOp3", "RvNewOp4", "RvNewOp5", "RvNewOp6", "RvNewOp7", "RvNewPid0", "RvNewPid1", "RvNewPid2", "RvNewPid3", "RvNewPid4", "RvNewPid5", "RvNewPid6", "RvNewPid7", "RvNewGone", "RvRdLease", "RvRdInval", "RvRdBlob", "RvRdLast", "RvSyDst", "RvSySrc", "RvSyWH", "RvPrUs", "RvPrN", "RvPrMax", "RvRtUs", "RvRtN", "RvRtMax", "RvSyFsUs", "RvSyFsN", "RvSyFsMax", "RvSyDsUs", "RvSyDsN", "RvSyDsMax", "RvSySubUs", "RvSySubN", "RvSySubMax", "RvSyWtUs", "RvSyWtN", "RvSyWtMax",
+    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy", "RvSyncTry", "RvSyncWhy", "RvMkNone", "RvMkRes", "RvMkStr", "RvMkVramNo", "RvSyPix", "RvSyPixN", "RvSyPixNz", "RvDst0", "RvDst1", "RvDst2", "RvDst3", "RvDst4", "RvDst5", "RvDst6", "RvDst7", "RvDstMore", "RvPgXfer", "RvPgFill", "RvPgDisc", "RvPgOther", "RvPgLast", "RvNew0", "RvNew1", "RvNew2", "RvNew3", "RvNew4", "RvNew5", "RvNew6", "RvNew7", "RvNewWH0", "RvNewWH1", "RvNewWH2", "RvNewWH3", "RvNewWH4", "RvNewWH5", "RvNewWH6", "RvNewWH7", "RvNewOp0", "RvNewOp1", "RvNewOp2", "RvNewOp3", "RvNewOp4", "RvNewOp5", "RvNewOp6", "RvNewOp7", "RvNewPid0", "RvNewPid1", "RvNewPid2", "RvNewPid3", "RvNewPid4", "RvNewPid5", "RvNewPid6", "RvNewPid7", "RvNewGone", "RvRdLease", "RvRdInval", "RvRdBlob", "RvRdLast", "RvApReg", "RvApPte", "RvApRd", "RvApWr", "RvApMiss", "RvApFull", "RvSyDst", "RvSySrc", "RvSyWH", "RvPrUs", "RvPrN", "RvPrMax", "RvRtUs", "RvRtN", "RvRtMax", "RvSyFsUs", "RvSyFsN", "RvSyFsMax", "RvSyDsUs", "RvSyDsN", "RvSyDsMax", "RvSySubUs", "RvSySubN", "RvSySubMax", "RvSyWtUs", "RvSyWtN", "RvSyWtMax",
     // foreign NVK sources for GDI commands (`ce_vram.rs`)
     "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy", "RvFgnWrite",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
@@ -900,12 +905,13 @@ pub const COUNTERS: &[&str] = &[
 ];
 
 /// The files that write [`COUNTERS`] (relative to `kmd_render/src`).
-pub const WRITERS: [&str; 5] = [
+pub const WRITERS: [&str; 6] = [
     "virtio/rm_client/vidmem.rs",
     "virtio/rm_client/ce_vram.rs",
     "ddi/vram_redirect.rs",
     "ddi/ce_sysmem.rs",
     "ddi/build_paging_buffer.rs",
+    "ddi/aperture_pages.rs",
 ];
 
 #[cfg(test)]

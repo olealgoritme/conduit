@@ -1126,6 +1126,10 @@ pub(crate) fn read_standard_buffer(
     offset: u64,
     out: &mut [u8],
 ) -> bool {
+    // `RvOff` 0x4000: an aperture GDI surface's content is its system pages.
+    if let Some(ok) = crate::ddi::aperture_pages::read(resource_id, offset, out) {
+        return ok;
+    }
     let Some(guard) = adapter.system_backings.serialize(passive) else {
         return false;
     };
@@ -1216,6 +1220,9 @@ pub(crate) fn write_standard_buffer(
     let Some(end) = offset.checked_add(span) else {
         return false;
     };
+    if let Some(ok) = crate::ddi::aperture_pages::write(resource_id, offset, pitch, row_bytes, rows, data) {
+        return ok;
+    }
     let Some(guard) = adapter.system_backings.serialize(passive) else {
         return false;
     };
@@ -2185,8 +2192,13 @@ unsafe fn build_paging_buffer_inner(
 
     // Placement harvest is DISPATCH-safe (atomic store only) — no IRQL gate.
     if let PagingOperation::UpdatePageTable(update) = operation {
-        let track_system_pages = unsafe { paging_alloc_info(adapter, update.hAllocation) }
-            .is_some_and(|alloc| alloc.bar_eligible);
+        let alloc_info = unsafe { paging_alloc_info(adapter, update.hAllocation) };
+        // `RvOff` 0x4000: the system pages of CDD's aperture GDI surfaces (spinlock only).
+        if let Some(a) = alloc_info.as_ref() {
+            // SAFETY: dxgkrnl's live operation.
+            unsafe { crate::ddi::aperture_pages::note_update(a.resource_id, update) };
+        }
+        let track_system_pages = alloc_info.is_some_and(|alloc| alloc.bar_eligible);
         // Preserve the exact leaf mapping before retiring the page-table update.
         // Every update clears its Windows-supplied VA range first, including
         // updates for unrelated allocations and explicit unmaps.
