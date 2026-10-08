@@ -239,6 +239,55 @@ fn buttons_and_keys_go_after_the_position_they_were_made_at() {
     assert_eq!(out, want);
 }
 
+#[test]
+fn coalesced_positions_are_counted() {
+    let size = Sizes::console((800, 600));
+    let mut e = InputEncoder::default();
+    let mut out = Vec::new();
+    let mut burst = Vec::new();
+    for i in 0..10 {
+        burst.push(ev(input::EV_ABS, input::ABS_X, i));
+        burst.push(syn());
+    }
+    e.events(&burst, size, true, &mut out);
+    assert_eq!(e.merged(), 9, "ten positions, one owed");
+}
+
+#[test]
+fn the_send_queue_is_what_the_peer_has_not_read() {
+    let (a, b) = UnixStream::pair().unwrap();
+    assert_eq!(send_queue(a.as_raw_fd()), 0);
+    (&a).write_all(&[0u8; 600]).unwrap();
+    // A unix socket counts what the unsent bytes take, overhead included.
+    assert!(send_queue(a.as_raw_fd()) >= 600);
+    let mut buf = [0u8; 600];
+    (&b).read_exact(&mut buf).unwrap();
+    assert_eq!(send_queue(a.as_raw_fd()), 0);
+}
+
+#[test]
+fn queue_stats_make_one_line_per_interval_with_input() {
+    let t0 = Instant::now();
+    let mut q = QueueStats::new();
+    q.since = t0;
+    assert_eq!(q.take(t0 + QueueStats::EVERY, 0), None, "no input, no line");
+    q.events = 42;
+    q.note_queue(120, 0);
+    q.note_queue(30, 6);
+    assert_eq!(q.take(t0 + QueueStats::EVERY, 5), None, "too soon");
+    let line = q.take(t0 + QueueStats::EVERY * 2, 5).expect("a line");
+    assert_eq!(
+        line,
+        "console: input to QEMU, last 10 s: 42 events, 5 positions coalesced, \
+         Send-Q max 120 bytes, unsent max 6 bytes"
+    );
+    assert_eq!(
+        q.take(t0 + QueueStats::EVERY * 3, 5),
+        None,
+        "counted afresh"
+    );
+}
+
 // -- a fake VNC server ------------------------------------------------------
 
 struct Server {

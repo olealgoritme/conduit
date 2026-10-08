@@ -131,6 +131,8 @@ pub struct InputEncoder {
     /// Inside [`InputEncoder::events`]: a SYN owes the position instead of
     /// sending it.
     defer: bool,
+    /// Positions superseded before they were sent, since the start.
+    merged: u64,
 }
 
 /// The sizes one event is encoded against.
@@ -196,6 +198,11 @@ impl InputEncoder {
         let (x, y) = self.position();
         out.extend_from_slice(&rfb::pointer_event(mask, x, y));
         self.owed = false;
+    }
+
+    /// Positions superseded by a newer one before they were sent.
+    pub fn merged(&self) -> u64 {
+        self.merged
     }
 
     /// Whether a coalesced position is waiting for [`Self::flush_motion`].
@@ -306,6 +313,9 @@ impl InputEncoder {
             },
             input::EV_SYN if self.moved => {
                 if self.defer {
+                    if self.owed {
+                        self.merged += 1;
+                    }
                     self.owed = true;
                 } else {
                     self.pointer(self.buttons, out);
@@ -587,6 +597,7 @@ impl Console {
             enc: InputEncoder::default(),
             last_probe: Instant::now(),
             out: Vec::new(),
+            qstats: QueueStats::new(),
         };
         let thread = std::thread::Builder::new()
             .name("nvgpu-console".into())
@@ -632,6 +643,72 @@ struct Worker {
     enc: InputEncoder,
     last_probe: Instant,
     out: Vec<u8>,
+    qstats: QueueStats,
+}
+
+/// How far behind QEMU's VNC server is with our input, per
+/// [`QueueStats::EVERY`]: the kernel's unsent bytes on the socket (Send-Q)
+/// and ours not yet written, at their highest.
+#[derive(Debug)]
+struct QueueStats {
+    since: Instant,
+    events: u64,
+    merged_before: u64,
+    sendq_max: usize,
+    out_max: usize,
+}
+
+impl QueueStats {
+    const EVERY: Duration = Duration::from_secs(10);
+
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            events: 0,
+            merged_before: 0,
+            sendq_max: 0,
+            out_max: 0,
+        }
+    }
+
+    fn note_queue(&mut self, sendq: usize, out: usize) {
+        self.sendq_max = self.sendq_max.max(sendq);
+        self.out_max = self.out_max.max(out);
+    }
+
+    /// The line, once per `EVERY` that saw input.
+    fn take(&mut self, now: Instant, merged: u64) -> Option<String> {
+        if now.saturating_duration_since(self.since) < Self::EVERY {
+            return None;
+        }
+        let line = (self.events > 0).then(|| {
+            format!(
+                "console: input to QEMU, last {} s: {} events, {} positions coalesced, \
+                 Send-Q max {} bytes, unsent max {} bytes",
+                now.saturating_duration_since(self.since).as_secs(),
+                self.events,
+                merged.saturating_sub(self.merged_before),
+                self.sendq_max,
+                self.out_max
+            )
+        });
+        *self = Self::new();
+        self.since = now;
+        self.merged_before = merged;
+        line
+    }
+}
+
+/// Bytes written to `fd` that the peer has not read yet (`SIOCOUTQ`; for a
+/// unix socket the memory they take, kernel overhead included), 0 if the
+/// kernel will not say.
+pub fn send_queue(fd: RawFd) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: TIOCOUTQ (SIOCOUTQ) writes one int through the pointer.
+    if unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut n) } < 0 {
+        return 0;
+    }
+    n.max(0) as usize
 }
 
 /// One connection's state.
@@ -782,6 +859,10 @@ impl Worker {
                     sizes.view = view;
                 }
                 self.enc.events(&events, sizes, s.ext_key, &mut self.out);
+                self.qstats.events += events.len() as u64;
+            }
+            if let Some(line) = self.qstats.take(Instant::now(), self.enc.merged()) {
+                log::info!("{line}");
             }
             // The newest position goes only once QEMU has read everything
             // before it. While its main loop is busy (a memory transaction,
@@ -840,6 +921,8 @@ impl Worker {
                 Err(e) => return Err(e),
             }
         }
+        self.qstats
+            .note_queue(send_queue(sock.as_raw_fd()), self.out.len());
         if self.out.len() > OUT_MAX {
             return Err(io::Error::other("the VNC server stopped reading"));
         }
