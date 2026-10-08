@@ -235,6 +235,8 @@ std::int32_t helios_vkd3d_bridge_execute_rm(std::size_t queue, rust::Slice<const
     std::uint32_t* rm_fence, std::uint64_t* rm_value);
 // The engine's ECL fence counters (helios_vkd3d_ecl_fence_stats); how many it wrote.
 std::uint32_t helios_vkd3d_bridge_ecl_fence_stats(rust::Slice<std::uint64_t> out) noexcept;
+// The engine's memory placement counters (helios_vkd3d_memory_stats); how many it wrote.
+std::uint32_t helios_vkd3d_bridge_memory_stats(rust::Slice<std::uint64_t> out) noexcept;
 
 std::int32_t helios_vkd3d_bridge_update_tiles(std::size_t queue, std::size_t resource,
     std::uint32_t region_count, std::size_t coords, std::size_t sizes, std::size_t heap,

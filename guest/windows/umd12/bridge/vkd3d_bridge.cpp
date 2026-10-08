@@ -1452,6 +1452,14 @@ extern "C" HRESULT helios_vkd3d_execute_command_lists_rm(ID3D12CommandQueue*, UI
     ID3D12CommandList* const*, HANDLE, std::uint32_t*, std::uint32_t*, std::uint64_t*,
     std::uint32_t*, std::uint64_t*);
 extern "C" std::uint32_t helios_vkd3d_ecl_fence_stats(std::uint64_t*, std::uint32_t);
+extern "C" std::uint32_t helios_vkd3d_memory_stats(std::uint64_t*, std::uint32_t);
+
+std::uint32_t helios_vkd3d_bridge_memory_stats(rust::Slice<std::uint64_t> out) noexcept {
+  return helios_bridge::bridge_guard("memory_stats12", std::uint32_t(0), [&]() -> std::uint32_t {
+    if (out.size() > UINT_MAX) return 0;
+    return helios_vkd3d_memory_stats(out.data(), static_cast<std::uint32_t>(out.size()));
+  });
+}
 
 std::int32_t helios_vkd3d_bridge_execute_rm(std::size_t queue, rust::Slice<const std::size_t> lists,
     std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie,
