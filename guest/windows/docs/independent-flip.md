@@ -1369,3 +1369,25 @@ Diagnosis table: no `CheckDirectFlipSupport` line in the dwm log at all means DW
 launch, an overlap, or dxgkrnl's derived support: the tool's `kmt:` lines at start must show `DIRECTFLIP_SUPPORT` and
 `INDEPENDENTFLIP_SUPPORT` = 1); lines answering `no` name why; `yes` with no `IdfSpaTrans` points at dxgkrnl's side (the candidate
 presents: `IdfPrRedir`, `IdfRed*`).
+
+### 13.6 392.1: the candidate presents failed `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER`; fixed
+
+R1 and R3 on 392.1 (`topmost fg noconsole`, `DirectFlipSupport=1`, with and without the G1 knobs) were identical and still
+`Composed: Flip`, but they showed the hand-over starting: `IdfSpaTrans` 2, `FfReowned` 1. Then every candidate present failed:
+`IdfPrRedir` 1981, `IdfRedErr` 1980, `IdfRedOk` 0, `IdfRedSt` 0xC01E0001 = `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER`,
+`IdfRedSD` 0x10000 = one source and **no destination**. A `RedirectedFlip` present without `Flip` takes the Blt arm, whose first
+check refuses a DMA buffer smaller than the 16-byte refresh marker (site `BLT_DMA_SMALL`, 22). dxgkrnl offers these presents no DMA
+room: there is nothing to copy (no destination), so it never retries with a bigger buffer, and the failed present gives it every
+reason to stay composed. Lane F is not involved (R3).
+
+Fix (`helios_kmd_logic::independent_flip::redirected_blt_action`, whenever `IndepFlip` is on, no knob): a candidate present with no
+destination completes with no copy: with no DMA buffer (or `DmaSize` 0) it returns success and writes nothing, so nothing is
+submitted; with room for the marker it takes the no-copy completion (fence-0 marker, patch references) so a submitted buffer never
+carries a stale record. Counted `IdfRedNoDst`. `IdfRedirSkip` = 1 still does the same for candidates that have a destination
+(`IdfRedSkip`); 392.1 showed none. New diagnostics: `IdfRedFlg` (the last candidate's present flags), `IdfRedSite` (the last failing
+one's return site), `IdfRedDma` (`DmaSize << 16 | DmaBufferPrivateDataSize`, each saturated at 0xFFFF).
+
+Next run: R1 alone. Expect `IdfRedNoDst` = `IdfPrRedir`, `IdfRedErr` 0, `IdfRedOk` = `IdfPrRedir`, PresentMon `Hardware: Independent
+Flip`, `FfReowned` >= 1 and `FfMoved` / `IdfDirFor` at the application's rate. R4 (`IdfRedirSkip=1`) only matters if `IdfRedErr` is
+still nonzero with `IdfRedSD` showing a destination. If R1 still stays composed with `IdfRedErr` 0, read `IdfRedDma` and `IdfRedFlg`
+and the dwm log's `CheckDirectFlipSupport #` lines next.

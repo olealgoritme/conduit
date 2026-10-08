@@ -57,6 +57,8 @@ static PRESENT_RESULT_TRACE_TICK: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_SRC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DMA_SIZE: AtomicU32 = AtomicU32::new(0);
+/// `DmaBufferPrivateDataSize` of the last Present (for `IdfRedDma`).
+pub static PRESENT_LAST_PRIV_SIZE: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_PATCH_SIZE: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_SRC_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
@@ -207,6 +209,10 @@ pub unsafe extern "C" fn dxgkddi_present(
             PRESENT_LAST_FLAGS.load(Ordering::Relaxed),
             PRESENT_LAST_SRC_COUNT.load(Ordering::Relaxed),
             PRESENT_LAST_DST_COUNT.load(Ordering::Relaxed),
+            (
+                PRESENT_LAST_DMA_SIZE.load(Ordering::Relaxed),
+                PRESENT_LAST_PRIV_SIZE.load(Ordering::Relaxed),
+            ),
             status == STATUS_SUCCESS,
             status as u32,
         );
@@ -272,6 +278,7 @@ unsafe fn dxgkddi_present_inner(
     PRESENT_LAST_SRC_COUNT.store(args.NumSrcAllocations, Ordering::Relaxed);
     PRESENT_LAST_DST_COUNT.store(args.NumDstAllocations, Ordering::Relaxed);
     PRESENT_LAST_DMA_SIZE.store(args.DmaSize, Ordering::Relaxed);
+    PRESENT_LAST_PRIV_SIZE.store(args.DmaBufferPrivateDataSize, Ordering::Relaxed);
     PRESENT_LAST_PATCH_SIZE.store(args.PatchLocationListOutSize, Ordering::Relaxed);
     let present_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     PRESENT_LAST_FLAGS.store(present_flags, Ordering::Relaxed);
@@ -534,19 +541,38 @@ unsafe fn dxgkddi_present_inner(
                 )
             };
         }
-        // `IdfRedirSkip` (default 0, an experiment): dxgkrnl's independent-flip candidate present
-        // (`RedirectedFlip` on the Blt arm) completes with no copy, the same completion as above.
-        if crate::ddi::indep_flip::skip_redirected_blt(present_flags) {
-            return unsafe {
-                present_blt_no_copy(
-                    args,
-                    present_allocations,
-                    present_stream_boundary,
-                    adapter,
-                    src_info,
-                    dst_info,
-                )
-            };
+        // dxgkrnl's independent-flip candidate presents (`RedirectedFlip` on the Blt arm,
+        // `DdiPresentForIFlip`; only with `IndepFlip`). One with no destination has nothing to
+        // copy: 392.1 failed every one of them `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` at the
+        // Blt arm's DMA check below (dxgkrnl gives it no room), which kept DWM composing. It
+        // completes with no copy. `IdfRedirSkip` = 1 does the same for one with a destination.
+        match crate::ddi::indep_flip::redirected_blt_action(present_flags, args.NumDstAllocations)
+        {
+            helios_kmd_logic::independent_flip::RedirectedBlt::Ordinary => {}
+            helios_kmd_logic::independent_flip::RedirectedBlt::NoDestination => {
+                return unsafe {
+                    present_redirected_no_destination(
+                        args,
+                        present_allocations,
+                        present_stream_boundary,
+                        adapter,
+                        src_info,
+                        dst_info,
+                    )
+                };
+            }
+            helios_kmd_logic::independent_flip::RedirectedBlt::Skip => {
+                return unsafe {
+                    present_blt_no_copy(
+                        args,
+                        present_allocations,
+                        present_stream_boundary,
+                        adapter,
+                        src_info,
+                        dst_info,
+                    )
+                };
+            }
         }
 
         // Level 5 (`KmdRmClient` = 5): a Blt whose destination is the RM system-memory
@@ -1942,6 +1968,39 @@ unsafe fn present_blt_onscanout(
             args,
             present_allocations,
             Some(capacity),
+            present_stream_boundary,
+            adapter,
+            src_info,
+            dst_info,
+        )
+    }
+}
+
+/// An independent-flip candidate present with no destination (`RedirectedFlip`, source only): there
+/// is nothing to copy. With no DMA buffer to write (dxgkrnl's usual offer for these: 392.1 failed
+/// every one on the DMA-size check) it succeeds and writes nothing, so nothing is submitted; with a
+/// buffer big enough for the marker it takes [`present_blt_no_copy`] (the fence-0 marker and the
+/// patch references, so a submitted buffer never carries a stale record); with a buffer too small
+/// for the marker it asks for a bigger one, as every Blt does.
+///
+/// # Safety
+/// As [`present_complete`]; `args` names the Blt arm.
+unsafe fn present_redirected_no_destination(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    present_stream_boundary: Option<u64>,
+    adapter: Option<&AdapterContext>,
+    src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+) -> NTSTATUS {
+    if args.pDmaBuffer.is_null() || args.DmaSize == 0 {
+        PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
+        return STATUS_SUCCESS;
+    }
+    unsafe {
+        present_blt_no_copy(
+            args,
+            present_allocations,
             present_stream_boundary,
             adapter,
             src_info,
