@@ -1,0 +1,340 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 12:38:13 +0200
+Subject: [PATCH] wsi/win32: the frame-time log says what it did, and falls
+ back to %TEMP%
+
+A HELIOS_VK_FRAMETIME=1 run that leaves no vkframes-<pid>.csv could not
+tell an unwritable folder from a process that never presented through
+NVK, or never loaded NVK at all: the only message went to stderr.
+
+The log now starts when NVK creates its WSI device (wsi_device_init,
+i.e. vkEnumeratePhysicalDevices) instead of at the first present, and
+writes vkframes-<pid>.log next to the CSV: the variable as the process
+environment block and the CRT see it (read with GetEnvironmentVariableA
+first), the files, each swapchain (size, present mode, images, and
+whether it presents by Helios scanout, DXGI or GDI), the first present,
+that the flush thread runs, and the totals at exit. When the folder
+cannot be written both files go to %TEMP%; every failure is also sent
+to OutputDebugString and stderr.
+---
+ src/vulkan/wsi/wsi_common.c                 |   5 +
+ src/vulkan/wsi/wsi_common_private.h         |   4 +
+ src/vulkan/wsi/wsi_common_win32.cpp         |   6 +
+ src/vulkan/wsi/wsi_common_win32_frametime.c | 166 ++++++++++++++++----
+ 4 files changed, 149 insertions(+), 32 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 9a2d261d..acfd9d56 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -78,6 +78,11 @@ wsi_device_init(struct wsi_device *wsi,
+    UNUSED VkResult result;
+ 
+    WSI_DEBUG = parse_debug_string(os_get_option("MESA_VK_WSI_DEBUG"), debug_control);
++#ifdef _WIN32
++   /* HELIOS_VK_FRAMETIME: open the log now, so a process that never
++    * presents still says so */
++   wsi_win32_frametime_init();
++#endif
+ 
+    util_cpu_trace_init();
+ 
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index ba65be82..da952669 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -635,6 +635,10 @@ bool wsi_win32_frametime_begin(int64_t *start);
+ void wsi_win32_frametime_end(int64_t start, const VkPresentInfoKHR *info,
+                              VkResult result);
+ void wsi_win32_frametime_flush(void);
++void wsi_win32_frametime_init(void);
++void wsi_win32_frametime_swapchain(const void *chain, const char *path,
++                                   uint32_t width, uint32_t height,
++                                   int present_mode, uint32_t images);
+ #endif
+ 
+ #ifdef __cplusplus
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 86ef1743..b5f27cf8 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -1555,6 +1555,12 @@ retry:
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
++   wsi_win32_frametime_swapchain(chain,
++                                 chain->dxgi ? "DXGI" :
++                                 chain->scanout.enabled ? "Helios scanout" : "GDI",
++                                 chain->extent.width, chain->extent.height,
++                                 (int)chain->base.present_mode,
++                                 chain->base.image_count);
+    *swapchain_out = &chain->base;
+ 
+    return VK_SUCCESS;
+diff --git a/src/vulkan/wsi/wsi_common_win32_frametime.c b/src/vulkan/wsi/wsi_common_win32_frametime.c
+index 3e2110fe..b813a891 100644
+--- a/src/vulkan/wsi/wsi_common_win32_frametime.c
++++ b/src/vulkan/wsi/wsi_common_win32_frametime.c
+@@ -38,6 +38,15 @@
+  * The present thread only reads QPC twice and stores one ring entry.  A
+  * background thread turns the ring into CSV lines about once a second; the
+  * rest is written at swapchain destruction and at process exit.
++ *
++ * Next to the CSV, vkframes-<pid>.log says what the log did: the variable's
++ * value, the files, each swapchain (size, present mode, path), the first
++ * present, that the flush thread runs, and the totals at exit.  When the
++ * folder cannot be written both files go to %TEMP%; every failure is also
++ * sent to OutputDebugString ("MESA-WSI: HELIOS_VK_FRAMETIME: ...").  The
++ * log starts when NVK creates its WSI device (vkEnumeratePhysicalDevices),
++ * so a process that has the files but no rows never presented through NVK,
++ * and a process without them never loaded NVK's WSI.
+  */
+ 
+ #include "wsi_common_private.h"
+@@ -46,6 +55,8 @@
+ #include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <errno.h>
++#include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -70,7 +81,10 @@ static struct {
+    double ms_per_tick;
+    int64_t t0;
+    FILE *file;
++   FILE *note;           /* the .log next to the CSV */
+    char app[MAX_PATH];
++   _Atomic uint32_t first_present;
++   uint32_t flushes;     /* under lock */
+    CRITICAL_SECTION lock;
+    HANDLE thread;
+    struct {
+@@ -84,10 +98,36 @@ static INIT_ONCE ft_once = INIT_ONCE_STATIC_INIT;
+ 
+ static void ft_flush(bool at_exit);
+ 
++/* A line in the .log (and, for failures, OutputDebugString) */
++static void
++ft_note(bool failure, const char *fmt, ...)
++{
++   char line[1024];
++   va_list ap;
++   va_start(ap, fmt);
++   vsnprintf(line, sizeof(line), fmt, ap);
++   va_end(ap);
++   if (failure || !ft.note) {
++      char dbg[1100];
++      snprintf(dbg, sizeof(dbg), "MESA-WSI: HELIOS_VK_FRAMETIME: %s\n", line);
++      OutputDebugStringA(dbg);
++      fputs(dbg, stderr);
++   }
++   if (ft.note) {
++      LARGE_INTEGER now;
++      QueryPerformanceCounter(&now);
++      fprintf(ft.note, "%10.3f %s\n",
++              ft.ms_per_tick ? (double)(now.QuadPart - ft.t0) * ft.ms_per_tick / 1000.0 : 0.0,
++              line);
++      fflush(ft.note);
++   }
++}
++
+ static DWORD WINAPI
+ ft_thread(LPVOID arg)
+ {
+    (void)arg;
++   ft_note(false, "flush thread running (tid %lu)", (unsigned long)GetCurrentThreadId());
+    for (;;) {
+       Sleep(1000);
+       ft_flush(false);
+@@ -101,57 +141,93 @@ ft_atexit(void)
+    ft_flush(true);
+ }
+ 
+-static FILE *
+-ft_open(void)
++/* Opens <dir>\vkframes-<pid>.csv and .log; false with the Win32 error */
++static bool
++ft_open_in(const char *dir, DWORD *err)
+ {
+-   char dir[MAX_PATH];
+-   const char *env = getenv("HELIOS_VK_FRAMETIME_DIR");
+-   if (env && env[0]) {
+-      snprintf(dir, sizeof(dir), "%s", env);
+-   } else {
+-      const char *pd = getenv("ProgramData");
+-      snprintf(dir, sizeof(dir), "%s\\Helios", pd && pd[0] ? pd : "C:\\ProgramData");
+-   }
++   char path[MAX_PATH], note[MAX_PATH];
+    CreateDirectoryA(dir, NULL);
+-
+-   char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\vkframes-%lu.csv", dir,
+             (unsigned long)GetCurrentProcessId());
++   snprintf(note, sizeof(note), "%s\\vkframes-%lu.log", dir,
++            (unsigned long)GetCurrentProcessId());
+    FILE *f = fopen(path, "w");
+    if (!f) {
+-      fprintf(stderr, "MESA-WSI: HELIOS_VK_FRAMETIME: cannot write %s\n", path);
+-      return NULL;
++      *err = GetLastError();
++      ft_note(true, "cannot write %s (Win32 error %lu, errno %d)", path,
++              (unsigned long)*err, errno);
++      return false;
+    }
+    fputs("Application,ProcessID,SwapChainAddress,Runtime,TimeInSeconds,"
+          "MsBetweenPresents,MsInPresentAPI,Result\n", f);
+    fflush(f);
+-   return f;
++   ft.file = f;
++   ft.note = fopen(note, "w");
++   ft_note(false, "writing %s", path);
++   return true;
++}
++
++static bool
++ft_open(void)
++{
++   char dir[MAX_PATH];
++   DWORD err = 0;
++   DWORD n = GetEnvironmentVariableA("HELIOS_VK_FRAMETIME_DIR", dir, sizeof(dir));
++   if (n == 0 || n >= sizeof(dir)) {
++      char pd[MAX_PATH];
++      n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
++      snprintf(dir, sizeof(dir), "%s\\Helios",
++               n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData");
++   }
++   if (ft_open_in(dir, &err))
++      return true;
++
++   char tmp[MAX_PATH];
++   n = GetTempPathA(sizeof(tmp), tmp);
++   if (n > 0 && n < sizeof(tmp)) {
++      if (tmp[n - 1] == '\\')
++         tmp[n - 1] = '\0';
++      if (ft_open_in(tmp, &err)) {
++         ft_note(true, "fell back to %s: %s was not writable", tmp, dir);
++         return true;
++      }
++   }
++   return false;
+ }
+ 
+ static BOOL CALLBACK
+ ft_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+ {
+    (void)once; (void)param; (void)ctx;
+-   const char *env = getenv("HELIOS_VK_FRAMETIME");
++   /* The process environment block, and the CRT's copy as a second
++    * opinion (they differ only if someone called _putenv/SetEnvironment-
++    * Variable after the CRT started).
++    */
++   char val[64] = "";
++   const DWORD n = GetEnvironmentVariableA("HELIOS_VK_FRAMETIME", val, sizeof(val));
++   const char *crt = getenv("HELIOS_VK_FRAMETIME");
++   const char *env = n > 0 && n < sizeof(val) ? val : crt;
+    if (!env || !env[0] || env[0] == '0')
+       return TRUE;
+ 
++   LARGE_INTEGER freq, now;
++   QueryPerformanceFrequency(&freq);
++   QueryPerformanceCounter(&now);
++   ft.ms_per_tick = 1000.0 / (double)freq.QuadPart;
++   ft.t0 = now.QuadPart;
++
+    ft.ring = calloc(FT_RING_SIZE, sizeof(*ft.ring));
+-   if (!ft.ring)
++   if (!ft.ring) {
++      ft_note(true, "no memory for the ring, off");
+       return TRUE;
+-   ft.file = ft_open();
+-   if (!ft.file) {
++   }
++   if (!ft_open()) {
++      ft_note(true, "no writable folder, off");
+       free(ft.ring);
+       ft.ring = NULL;
+       return TRUE;
+    }
+ 
+-   LARGE_INTEGER freq, now;
+-   QueryPerformanceFrequency(&freq);
+-   QueryPerformanceCounter(&now);
+-   ft.ms_per_tick = 1000.0 / (double)freq.QuadPart;
+-   ft.t0 = now.QuadPart;
+-
+    char exe[MAX_PATH] = "";
+    GetModuleFileNameA(NULL, exe, sizeof(exe));
+    const char *base = strrchr(exe, '\\');
+@@ -171,15 +247,36 @@ ft_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_PIN,
+                       (LPCSTR)(void *)ft_thread, &self);
++   ft.enabled = true;
++   ft_note(false, "on: HELIOS_VK_FRAMETIME=%s (environment block '%s', CRT '%s'), "
++           "process %s pid %lu", env, n > 0 && n < sizeof(val) ? val : "",
++           crt ? crt : "", ft.app, (unsigned long)GetCurrentProcessId());
+    ft.thread = CreateThread(NULL, 0, ft_thread, NULL, 0, NULL);
++   if (!ft.thread)
++      ft_note(true, "flush thread not started (error %lu): rows are written "
++              "at swapchain destruction and exit only", (unsigned long)GetLastError());
+    atexit(ft_atexit);
+-
+-   ft.enabled = true;
+-   fprintf(stderr, "MESA-WSI: HELIOS_VK_FRAMETIME: logging presents of %s\n",
+-           ft.app);
+    return TRUE;
+ }
+ 
++void
++wsi_win32_frametime_init(void)
++{
++   InitOnceExecuteOnce(&ft_once, ft_init, NULL, NULL);
++}
++
++void
++wsi_win32_frametime_swapchain(const void *chain, const char *path,
++                              uint32_t width, uint32_t height,
++                              int present_mode, uint32_t images)
++{
++   InitOnceExecuteOnce(&ft_once, ft_init, NULL, NULL);
++   if (ft.enabled)
++      ft_note(false, "swapchain 0x%016llX: %ux%u, present mode %d, %u images, %s",
++              (unsigned long long)(uintptr_t)chain, width, height,
++              present_mode, images, path);
++}
++
+ bool
+ wsi_win32_frametime_begin(int64_t *start)
+ {
+@@ -210,6 +307,9 @@ wsi_win32_frametime_end(int64_t start, const VkPresentInfoKHR *info,
+       e->result = info->pResults ? (int32_t)info->pResults[i] : (int32_t)result;
+       atomic_store_explicit(&e->seq, idx + 1, memory_order_release);
+    }
++   if (atomic_load_explicit(&ft.first_present, memory_order_relaxed) == 0 &&
++       atomic_exchange(&ft.first_present, 1) == 0)
++      ft_note(false, "first present (result %d)", (int)result);
+ }
+ 
+ /* Under ft.lock: the previous present start of this swapchain (0: none) */
+@@ -283,10 +383,12 @@ ft_flush(bool at_exit)
+       ft.read++;
+    }
+    fflush(ft.file);
++   ft.flushes++;
+ 
+-   if (at_exit && ft.dropped)
+-      fprintf(stderr, "MESA-WSI: HELIOS_VK_FRAMETIME: %llu presents dropped\n",
+-              (unsigned long long)ft.dropped);
++   if (at_exit)
++      ft_note(ft.dropped != 0, "exit: %llu presents, %llu dropped, %u flushes",
++              (unsigned long long)ft.read, (unsigned long long)ft.dropped,
++              ft.flushes);
+    if (locked)
+       LeaveCriticalSection(&ft.lock);
+ }
+-- 
+2.43.0
+
