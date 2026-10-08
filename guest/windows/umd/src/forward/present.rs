@@ -1583,14 +1583,18 @@ const HELIOS_ICD_CAP_PRESENT_FENCE_KMD: u32 = 1 << 6;
 /// `NvkRmFence=0`): the S3 behaviour, a CPU wait for the frame's GPU work
 /// before the flip or the WDDM present.
 ///
-/// `blt_source`: `shown` is the source allocation of the WDDM present that
-/// follows (the KMD's Blt source), so a composed frame's fence may carry the
-/// copy-engine Present record naming it (docs/rm-copy-engine-present.md 12);
-/// false when the UMD copied the frame elsewhere first.
+/// `blt_source`: the source allocation of the WDDM present that follows (the
+/// KMD's Blt source), which a composed frame's fence's copy-engine Present
+/// record names (docs/rm-copy-engine-present.md 12). It is the present's
+/// source even when the UMD copied the frame into DXGI's destination first
+/// (`shown` is then that destination): the KMD's Blt still reads the source,
+/// and the fence follows the copy. 380.1: with `false` there, every windowed
+/// Heaven frame went without a record ("copy-engine record 0 (without 0,
+/// refused 0)") and the KMD's route fell back on every one (`CeRtRecNone`).
 unsafe fn nvk_present_frame(
     h: Hdevice,
     shown: ddi::D3D10DDI_HRESOURCE,
-    blt_source: bool,
+    blt_source: ddi::D3D10DDI_HRESOURCE,
 ) -> Result<NvkFrame, i32> {
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
@@ -1654,7 +1658,7 @@ unsafe fn nvk_present_frame(
                 // No RM fences after all: the CPU wait below.
                 None => {}
             }
-        } else if let Some((fence, value, rm_copy)) = nvk_marker_fence(dev, shown, blt_source) {
+        } else if let Some((fence, value, rm_copy)) = nvk_marker_fence(dev, blt_source) {
             let n = NVK_MARKER_FENCES.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 || n % 4096 == 0 {
                 log_error!(
@@ -1717,23 +1721,23 @@ unsafe fn nvk_present_frame(
 
 /// The RM fence of a composed frame's WDDM present, and the copy-engine
 /// Present record behind it when the KMD reads one (QueryCaps bit 37), NVK
-/// has `queue_rm_fence_v3`, `NvkRmCopyRecord` is on and `shown` is the Blt
-/// source. The record goes only when it passes every rule the KMD applies
+/// has `queue_rm_fence_v3`, `NvkRmCopyRecord` is on and `blt_source` (the
+/// present's source, the image the KMD's Blt reads) is a resource. The record
+/// goes only when it passes every rule the KMD applies
 /// (`helios_protocol::producer_record`); otherwise the fence goes alone, as
 /// before. The caller owns the fence.
 unsafe fn nvk_marker_fence(
     dev: &HeliosDevice,
-    shown: ddi::D3D10DDI_HRESOURCE,
-    blt_source: bool,
+    blt_source: ddi::D3D10DDI_HRESOURCE,
 ) -> Option<(u32, u64, Option<helios_protocol::HeliosRmFenceTailV3>)> {
-    let wanted = blt_source
+    let wanted = !blt_source.pDrvPrivate.is_null()
         && crate::knobs::nvk_rm_copy_record()
         // SAFETY: `dev` is the live device of this present.
         && unsafe { crate::scanout_acquire::nvrm_rm_fence_tail_v3_capable(dev) };
     if !wanted {
         return dev.dxvk.nvk_present_fence().map(|(fence, value)| (fence, value, None));
     }
-    let src = load_resource(shown);
+    let src = load_resource(blt_source);
     let (fence, value, copy) = dev.dxvk.nvk_present_fence_v3(src.as_deref())?;
     let tail = helios_protocol::HeliosRmFenceTail {
         rm_fence_handle: fence,
@@ -1923,7 +1927,6 @@ unsafe fn nvk_present_impl(
     dst_alloc: u32,
 ) -> i32 {
     let mut shown = src_h;
-    let mut blt_source = true;
     if let Some(context) = d3d11_context(h) {
         if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
             context.CopySubresourceRegion(
@@ -1937,13 +1940,12 @@ unsafe fn nvk_present_impl(
                 None,
             );
             shown = dst_h;
-            blt_source = false;
         }
         // A keyed-mutex surface may be released right after this present.
         context.Flush();
         flush_gate(h, &context);
     }
-    let frame = match nvk_present_frame(h, shown, blt_source) {
+    let frame = match nvk_present_frame(h, shown, src_h) {
         Ok(f) => f,
         Err(hr) => return hr,
     };
@@ -3331,7 +3333,7 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
 
     let mut nvk_correlation = PresentStreamCorrelation::default();
     if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
-        match nvk_present_frame(h, src_h, true) {
+        match nvk_present_frame(h, src_h, src_h) {
             Ok(frame) if !nvk_scanout_compose(frame) => return 0,
             Ok(frame) => {
                 nvk_correlation = frame.correlation;
