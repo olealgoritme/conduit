@@ -151,7 +151,11 @@ pub(crate) fn reset_for_start() {
     for i in 0..NEW_RING {
         NEW_RES[i].store(0, Ordering::Relaxed);
         NEW_WH[i].store(0, Ordering::Relaxed);
+        NEW_OPEN[i].store(0, Ordering::Relaxed);
+        NEW_USE[i].store(0, Ordering::Relaxed);
+        NEW_PID[i].store(0, Ordering::Relaxed);
     }
+    NEW_GONE.store(0, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"RvKnob", k);
     if rv::knob_on(k) {
         publish(true);
@@ -191,6 +195,30 @@ pub(crate) fn note_paging(resource_id: u32, kind: u32) {
 const NEW_RING: usize = 8;
 static NEW_RES: [AtomicU32; NEW_RING] = [const { AtomicU32::new(0) }; NEW_RING];
 static NEW_WH: [AtomicU32; NEW_RING] = [const { AtomicU32::new(0) }; NEW_RING];
+/// Per ring entry: `DxgkDdiOpenAllocation`s of it (`RvNewOp0..7` = opens << 16 | uses, each
+/// saturating at 0xffff; an open by DWM is DWM importing the window surface), copy-engine uses of
+/// it (the GDI executor's and the Present path's writes and reads: every one resolves the surface
+/// through `ce_vram::ce_surface` or `transfer`), and which entries were destroyed (`RvNewGone`, bit
+/// i). One Explorer row then says "written, not imported", "imported, not written", or both; and a
+/// destroyed-and-recreated surface (a resize) shows as a gone entry next to a new one.
+static NEW_OPEN: [AtomicU32; NEW_RING] = [const { AtomicU32::new(0) }; NEW_RING];
+static NEW_USE: [AtomicU32; NEW_RING] = [const { AtomicU32::new(0) }; NEW_RING];
+static NEW_GONE: AtomicU32 = AtomicU32::new(0);
+/// The pid of the last open of each entry (`RvNewPid0..7`).
+static NEW_PID: [AtomicU32; NEW_RING] = [const { AtomicU32::new(0) }; NEW_RING];
+
+fn ring_slot(resource_id: u32) -> Option<usize> {
+    (resource_id != 0)
+        .then(|| NEW_RES.iter().position(|r| r.load(Ordering::Relaxed) == resource_id))
+        .flatten()
+}
+
+/// A copy-engine use of `resource_id` (`RvNewOp*` low half). Atomics only.
+pub(crate) fn note_use(resource_id: u32) {
+    if let Some(i) = ring_slot(resource_id) {
+        NEW_USE[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 pub(crate) fn publish_counters() {
     publish(false);
@@ -231,13 +259,26 @@ fn publish(always: bool) {
         b"RvNewWH0", b"RvNewWH1", b"RvNewWH2", b"RvNewWH3", b"RvNewWH4", b"RvNewWH5", b"RvNewWH6",
         b"RvNewWH7",
     ];
+    const OP_NAMES: [&[u8]; NEW_RING] = [
+        b"RvNewOp0", b"RvNewOp1", b"RvNewOp2", b"RvNewOp3", b"RvNewOp4", b"RvNewOp5", b"RvNewOp6",
+        b"RvNewOp7",
+    ];
+    const PID_NAMES: [&[u8]; NEW_RING] = [
+        b"RvNewPid0", b"RvNewPid1", b"RvNewPid2", b"RvNewPid3", b"RvNewPid4", b"RvNewPid5",
+        b"RvNewPid6", b"RvNewPid7",
+    ];
     for i in 0..NEW_RING {
         let r = NEW_RES[i].load(Ordering::Relaxed);
         if r != 0 {
             rec(NEW_NAMES[i], r);
             rec(WH_NAMES[i], NEW_WH[i].load(Ordering::Relaxed));
+            let op = NEW_OPEN[i].load(Ordering::Relaxed).min(0xffff) << 16
+                | NEW_USE[i].load(Ordering::Relaxed).min(0xffff);
+            rec(OP_NAMES[i], op);
+            rec(PID_NAMES[i], NEW_PID[i].load(Ordering::Relaxed));
         }
     }
+    rec(b"RvNewGone", NEW_GONE.load(Ordering::Relaxed));
     super::ce_vram::publish_counters();
 }
 
@@ -298,8 +339,13 @@ pub(crate) fn try_create(
     let out = match r {
         Ok(c) => {
             let n = OK.fetch_add(1, Ordering::Relaxed) as usize;
-            NEW_RES[n % NEW_RING].store(c.resource_id, Ordering::Relaxed);
-            NEW_WH[n % NEW_RING].store(width << 16 | (height & 0xffff), Ordering::Relaxed);
+            let i = n % NEW_RING;
+            NEW_RES[i].store(c.resource_id, Ordering::Relaxed);
+            NEW_WH[i].store(width << 16 | (height & 0xffff), Ordering::Relaxed);
+            NEW_OPEN[i].store(0, Ordering::Relaxed);
+            NEW_USE[i].store(0, Ordering::Relaxed);
+            NEW_PID[i].store(0, Ordering::Relaxed);
+            NEW_GONE.fetch_and(!(1 << i), Ordering::Relaxed);
             Some(c)
         }
         Err(why) => {
@@ -621,6 +667,10 @@ pub(crate) fn note_open(
     if lookup(resource_id).is_none() {
         return;
     }
+    if let Some(i) = ring_slot(resource_id) {
+        NEW_OPEN[i].fetch_add(1, Ordering::Relaxed);
+        NEW_PID[i].store(crate::virtio::nvrm_window::current_pid(), Ordering::Relaxed);
+    }
     use crate::diag::record_named_bytes as rec;
     let has_rm = adapter
         .with_virtio(|v| v.nvrm_process_has_client(process))
@@ -686,6 +736,9 @@ pub(crate) fn clear_failed(resource_id: u32) {
 pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) {
     if !any_live() {
         return;
+    }
+    if let Some(i) = ring_slot(resource_id) {
+        NEW_GONE.fetch_or(1 << i, Ordering::Relaxed);
     }
     let (taken, h, obj) = {
         let mut g = STATE.lock();

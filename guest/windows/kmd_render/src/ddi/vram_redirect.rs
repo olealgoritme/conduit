@@ -149,6 +149,7 @@ static DST_CNT: [AtomicU32; DST_LEDGER] = [const { AtomicU32::new(0) }; DST_LEDG
 static DST_MORE: AtomicU32 = AtomicU32::new(0);
 
 fn note_dst(resource_id: u32) {
+    vidmem::note_use(resource_id);
     for i in 0..DST_LEDGER {
         let r = DST_RES[i].load(Ordering::Relaxed);
         if r == resource_id {
