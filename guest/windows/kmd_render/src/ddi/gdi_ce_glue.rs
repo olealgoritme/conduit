@@ -45,8 +45,19 @@ pub(crate) fn bring_up(passive: PassiveLevel, adapter: &AdapterContext) -> bool 
 /// Takes the channel's I/O itself: call it before `with_standard`. PASSIVE.
 pub(crate) struct ForeignSrc(ce_vram::ForeignSource);
 
-pub(crate) fn foreign_source(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) -> Option<ForeignSrc> {
-    retry_busy(passive, || ce_vram::foreign_source(passive, adapter, resource_id)).map(ForeignSrc)
+/// `acquire` false drops the producer's semaphore acquire (`GdiFgnAcq` 0): a copy-engine acquire
+/// cannot time out, and a value that is never reached would stall the shared channel.
+pub(crate) fn foreign_source(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    acquire: bool,
+) -> Option<ForeignSrc> {
+    let mut s = retry_busy(passive, || ce_vram::foreign_source(passive, adapter, resource_id))?;
+    if !acquire {
+        s.acquire = None;
+    }
+    Some(ForeignSrc(s))
 }
 
 /// The `DRM_FORMAT_*` of a GDI surface's D3DDDIFORMAT (21 A8R8G8B8, 22 X8R8G8B8, 32 A8B8G8R8,
@@ -73,14 +84,14 @@ fn foreign_copies(passive: PassiveLevel, src: &ForeignSrc, dst: &ce_vram::CeSurf
             Ok(v) => last = Some(v),
             Err(_) => {
                 if let Some(v) = last {
-                    let _ = ce_vram::wait(passive, v, 100);
+                    let _ = wait(passive, v, 100);
                 }
                 return 3;
             }
         }
     }
     match last {
-        Some(v) if !ce_vram::wait(passive, v, 100) => 4,
+        Some(v) if !wait(passive, v, 100) => 4,
         _ => 0,
     }
 }
@@ -165,7 +176,11 @@ pub(crate) fn submit(
 /// The push slot's size in dwords (`rm_ce_channel::SLOT_DWORDS`).
 pub(crate) const SLOT_DWORDS: usize = helios_kmd_logic::rm_ce_channel::SLOT_DWORDS;
 
-/// Wait until the channel's completion reaches `value` (`ce_vram::wait`).
+/// Wait until the channel's completion reaches `value` (`ce_vram::wait`), at most `max_ms`.
+/// Bounded; it does NOT mark the channel broken: only the route's worker tears a broken channel
+/// down, and only while the route holds jobs, so a broken mark from here could leave the channel
+/// unusable for the rest of the generation. GDI's own pushes never acquire (`GdiFgnAcq` 0), so
+/// they cannot be what stalls it.
 pub(crate) fn wait(passive: PassiveLevel, value: u64, max_ms: u64) -> bool {
     ce_vram::wait(passive, value, max_ms)
 }

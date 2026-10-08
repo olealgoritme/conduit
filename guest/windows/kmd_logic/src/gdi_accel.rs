@@ -1526,11 +1526,13 @@ pub const COUNTERS: &[&str] = &[
     "GdiSlowOp",
     // Foreign NVK images resolved; copies from them done on the copy engine; refused or failed
     // (the last reason: 1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view
-    // refused, 6 channel down, 7 memory, 8 destination class).
+    // refused, 6 channel down, 7 memory, 8 destination class, 9 GdiFgn 0).
     "GdiFgnN",
     "GdiFgnCe",
     "GdiFgnFail",
     "GdiFgnWhy",
+    // The bisect switches in force: 1 GdiFgn, 2 GdiFgnAcq, 4 GdiSysCe, 8 GdiPair.
+    "GdiPaths",
 ];
 
 #[cfg(test)]

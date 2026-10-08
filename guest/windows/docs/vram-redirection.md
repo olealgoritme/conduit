@@ -781,6 +781,24 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
 * ClearType's gamma row is read from the `LOOKUPTABLE` surface at `Gamma * pitch` (8 bpp, 512 entries);
   if that surface is not a standard buffer the blend runs without gamma.
 
+### 10.6b Bisect switches (365.1)
+
+364.1 hung the guest under windowed Heaven with every new path on. Each path GDI acceleration added
+in 362-364 has its own service-key switch, read at StartDevice with `GdiAccel=1` and mirrored as
+`GdiPaths` (bit 0 `GdiFgn`, 1 `GdiFgnAcq`, 2 `GdiSysCe`, 3 `GdiPair`):
+
+| knob | default | 0 means |
+|---|---|---|
+| `GdiFgn` | 1 | copies from foreign NVK images are dropped (`GdiFgnWhy` 9) |
+| `GdiFgnAcq` | **0** | a foreign copy does not acquire the producer's semaphore (a copy-engine acquire cannot time out; a value never reached would stall the channel the Present route shares); the image is copied as it is in memory |
+| `GdiSysCe` | 1 | copies and fills over a staging buffer's copy-engine view are not tried; the CPU path runs them |
+| `GdiPair` | 1 | staging-to-staging copies between two buffers run on the CPU |
+
+Every wait of the executor is bounded: the copy-engine waits 100 ms (the job's command is then
+redone on the CPU or dropped), `ce_sysmem`'s channel I/O 250 ms, the RM calls their bounded sections,
+a busy channel 10 retries of 1 ms. The V2 side's switches (foreign import, the CPU view cache) are
+its own (section 5.9).
+
 ### 10.7 Test recipe (main session)
 
 G0 rows (census only; with the G1 build the same counters plus execution):
