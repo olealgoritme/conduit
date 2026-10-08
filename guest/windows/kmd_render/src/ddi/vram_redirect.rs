@@ -607,8 +607,8 @@ unsafe fn foreign_arm(
     src_rect: Rect,
     dst_rect: Rect,
 ) -> Option<Outcome> {
-    // The route is opt-in (`RvOff` 0x1000): without it, the synchronous copy.
-    if !vidmem::off(helios_kmd_logic::rm_vidmem::off::ROUTE_ON) {
+    // The route is the default; `RvOff` 0x1000 takes the synchronous copy instead.
+    if vidmem::off(helios_kmd_logic::rm_vidmem::off::ROUTE_OFF) {
         return sync_or_skip(passive, adapter, source, destination, &dst, src_rect, dst_rect);
     }
     let Some(fsrc) = crate::virtio::venus::foreign_source_if_enabled(
