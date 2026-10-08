@@ -835,8 +835,8 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
 
 One service-key mask, `GdiOff` (default 0), read at StartDevice with `GdiAccel=1`; the paths in force
 are mirrored as `GdiPaths` (1 foreign copies, 2 foreign acquire, 4 staging views, 8 two staging
-views, 16 scrolls, 32 copies into foreign images; default 0x1D). A set bit turns a path off (0x2 and
-0x20 turn one on):
+views, 16 scrolls, 32 copies into foreign images; default 0x3D). A set bit turns a path off (0x2
+turns the acquire on):
 
 | bit | path | off means |
 |---|---|---|
@@ -845,7 +845,7 @@ views, 16 scrolls, 32 copies into foreign images; default 0x1D). A set bit turns
 | 0x4 | copies and fills over a staging buffer's copy-engine view | CPU path |
 | 0x8 | two staging views at once (`with_standard_pair`) | CPU path |
 | 0x10 | scrolls as ordered copy-engine bands | CPU path |
-| 0x20 | (opt-in, since the head after 2f94a4a6) copies INTO a foreign NVK image (`foreign_write`) | default off: dropped (`GdiFgnWhy` 26); 372.1 Notepad fail-fasted in every `RvOff` row except 0x1 (foreign_source off) |
+| 0x20 | (since the head after 2f94a4a6) copies INTO a foreign NVK image (`foreign_write`), reads stay on | dropped (`GdiFgnWhy` 26) |
 
 **The 365-367 switches were broken**: four separate values `GdiFgn`, `GdiFgnAcq`, `GdiSysCe`,
 `GdiPair` (and `GdiOvl`), and `GdiSysCe` was also the name of a COUNTER the executor writes, so the knob

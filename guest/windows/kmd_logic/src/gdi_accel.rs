@@ -1577,8 +1577,7 @@ impl Timeline {
 
 /// The paths in force (`GdiPaths`: 1 foreign copies, 2 foreign acquire, 4 staging views, 8 two
 /// staging views, 16 scrolls, 32 copies INTO foreign images) for a `GdiOff` mask (a set bit turns a
-/// path off; bits 0x2 and 0x20 are opt-ins, off by default: 372.1 Notepad fail-fasts with the
-/// foreign path on).
+/// path off; bit 0x2 is the opt-in of the acquire, off by default).
 pub const fn paths_from_off(off: u32) -> u32 {
     let mut p = 0;
     if off & 0x1 == 0 {
@@ -1596,7 +1595,7 @@ pub const fn paths_from_off(off: u32) -> u32 {
     if off & 0x10 == 0 {
         p |= 16;
     }
-    if off & 0x20 != 0 {
+    if off & 0x20 == 0 {
         p |= 32;
     }
     p
@@ -2123,11 +2122,11 @@ mod tests {
 
     #[test]
     fn gdi_off_mask() {
-        assert_eq!(paths_from_off(0), 0x1D);
-        assert_eq!(paths_from_off(0x1D), 0);
-        assert_eq!(paths_from_off(0x2), 0x1F);
-        assert_eq!(paths_from_off(0x4), 0x19);
-        assert_eq!(paths_from_off(0x20), 0x3D);
+        assert_eq!(paths_from_off(0), 0x3D);
+        assert_eq!(paths_from_off(0x3D), 0);
+        assert_eq!(paths_from_off(0x2), 0x3F);
+        assert_eq!(paths_from_off(0x4), 0x39);
+        assert_eq!(paths_from_off(0x20), 0x1D);
     }
 
     /// A knob is a service-key value the driver READS; a counter is one it WRITES. The same name
