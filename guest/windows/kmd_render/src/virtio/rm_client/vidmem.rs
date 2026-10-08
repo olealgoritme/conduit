@@ -144,7 +144,7 @@ pub(crate) fn reset_for_start() {
     crate::diag::record_named_bytes(b"RvOffEff", o);
     for c in [
         &TRY, &OK, &VENUS, &WHY, &STAGE, &FAIL, &FREED, &BRING, &MS, &MS_MAX, &SOFT, &LEAK, &OPEN,
-        &OPEN_FG, &OPEN_LAY, &OPEN_NORM,
+        &OPEN_FG, &OPEN_LAY, &OPEN_NORM, &PG_XFER, &PG_FILL, &PG_DISC, &PG_OTHER, &PG_LAST,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -159,6 +159,32 @@ pub(crate) fn reset_for_start() {
 }
 
 /// Mirror the counters (PASSIVE), once the service was asked for something.
+/// `BuildPagingBuffer` content operations VidMm asked for on a VRAM surface (`RvPgXfer`,
+/// `RvPgFill`, `RvPgDisc`, `RvPgOther`) and the last surface named (`RvPgLast`). The KMD does not
+/// carry them out on the VRAM object (its content is the RM memory, `docs/vram-redirection.md`
+/// 5.3); a count here says VidMm believes the content moved somewhere the KMD never looks.
+static PG_XFER: AtomicU32 = AtomicU32::new(0);
+static PG_FILL: AtomicU32 = AtomicU32::new(0);
+static PG_DISC: AtomicU32 = AtomicU32::new(0);
+static PG_OTHER: AtomicU32 = AtomicU32::new(0);
+static PG_LAST: AtomicU32 = AtomicU32::new(0);
+
+/// One paging content operation on `resource_id` (`kind`: 0 transfer, 1 fill, 2 discard, else
+/// other), counted when it names a VRAM surface. Spinlock only.
+pub(crate) fn note_paging(resource_id: u32, kind: u32) {
+    if !any_live() || lookup(resource_id).is_none() {
+        return;
+    }
+    match kind {
+        0 => &PG_XFER,
+        1 => &PG_FILL,
+        2 => &PG_DISC,
+        _ => &PG_OTHER,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+    PG_LAST.store(resource_id, Ordering::Relaxed);
+}
+
 /// The last 8 surfaces made (`RvNew0..7`: resource id, `RvNewWH0..7`: width << 16 | height,
 /// slot `n % 8` for the n-th): which resource ids are RM video memory, to match against what DWM
 /// imports and what the Present path writes (`RvDst*`).
@@ -194,6 +220,11 @@ fn publish(always: bool) {
     rec(b"RvMsMax", MS_MAX.load(Ordering::Relaxed));
     rec(b"RvSoft", SOFT.load(Ordering::Relaxed));
     rec(b"RvLeak", LEAK.load(Ordering::Relaxed));
+    rec(b"RvPgXfer", PG_XFER.load(Ordering::Relaxed));
+    rec(b"RvPgFill", PG_FILL.load(Ordering::Relaxed));
+    rec(b"RvPgDisc", PG_DISC.load(Ordering::Relaxed));
+    rec(b"RvPgOther", PG_OTHER.load(Ordering::Relaxed));
+    rec(b"RvPgLast", PG_LAST.load(Ordering::Relaxed));
     const NEW_NAMES: [&[u8]; NEW_RING] =
         [b"RvNew0", b"RvNew1", b"RvNew2", b"RvNew3", b"RvNew4", b"RvNew5", b"RvNew6", b"RvNew7"];
     const WH_NAMES: [&[u8]; NEW_RING] = [

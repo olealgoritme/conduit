@@ -647,7 +647,12 @@ fn clear_new(io: &Io<'_>, resource_id: u32, va: u64) -> bool {
     };
     let lines = (obj.size / u64::from(obj.pitch.max(1))) as u32;
     let r = ce::submit_build(|push, _gen, done| {
-        rv::clear(push, va, obj.pitch, lines, 0)?;
+        let value = if super::vidmem::off(helios_kmd_logic::rm_vidmem::off::CLEAR_MAGENTA) {
+            0xFFFF_00FF
+        } else {
+            0
+        };
+        rv::clear(push, va, obj.pitch, lines, value)?;
         helios_kmd_logic::ce_present::release(push, done)
     });
     let ok = match r {
