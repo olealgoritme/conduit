@@ -4178,6 +4178,18 @@ static void pres_presented(void *d, struct wp_presentation_feedback *f,
     (void)sh; (void)sl;
     wp_presentation_feedback_destroy(f);
 
+    /* The client's guest completes the flip on this (EV_PRESENTED): the
+     * frame is on the screen now, not when it was committed. */
+    if (w->sink) {
+        uint64_t tp = 0;
+
+        if (w->pres_clock == CLOCK_MONOTONIC) {
+            tp = ((((uint64_t)tv_sec_hi << 32) | tv_sec_lo) * 1000000000ull) +
+                 tv_nsec;
+        }
+        nb_sink_presented(w->sink, pc->seq, flags, tp);
+    }
+
     /* virtio-nvgpu --stats: commit -> presented, and sender -> presented. */
     w->st_presented++;
     w->st_zc += (unsigned)zc;
@@ -5833,6 +5845,10 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     s->height = (uint32_t)w->surf_h;
     s->caps = NVKVM_BROKER_CAP_FULLSCREEN | NVKVM_BROKER_CAP_DMABUF |
               NVKVM_BROKER_CAP_RELEASE | NVKVM_BROKER_CAP_RELEASE_SEQ;
+    /* Presentation feedback is what EV_PRESENTED reports. */
+    if (w->presentation) {
+        s->caps |= NVKVM_BROKER_CAP_PRESENTED;
+    }
     if (w->seat) {
         s->caps |= NVKVM_BROKER_CAP_KEYBOARD | NVKVM_BROKER_CAP_ABS_POINTER |
                    NVKVM_BROKER_CAP_FOCUS_EVENTS;

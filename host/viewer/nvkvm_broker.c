@@ -810,6 +810,16 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id, uint32_t seq)
             (uint32_t)buf_id, (uint32_t)(buf_id >> 32));
 }
 
+void nb_sink_presented(struct nb_sink *s, uint32_t seq, uint32_t kind,
+                       uint64_t t_ns)
+{
+    if (!s || !(s->sess->caps & NVKVM_BROKER_CAP_PRESENTED)) {
+        return;
+    }
+    nb_emit(s, NVKVM_BROKER_EV_PRESENTED, (int32_t)seq, (int32_t)kind,
+            (uint32_t)t_ns, (uint32_t)(t_ns >> 32));
+}
+
 /*
  * NVKVM_BROKER_CAP_RELEASE_SEQ: an ATTACH that will never be shown (refused
  * by validation or by the display) is released at once -- the client waits
