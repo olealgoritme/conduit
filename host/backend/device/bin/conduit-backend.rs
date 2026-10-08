@@ -36,7 +36,9 @@ use device::caps::Caps;
 use device::chain::{
     ReadableAfterWritable, Segment, capacity, sort_chain, writable, write_scattered,
 };
-use device::display::{DisplayLink, DisplayMode, GuestInputClaims, InputSink, ReleaseSink};
+use device::display::{
+    DisplayLink, DisplayMode, GuestInputClaims, InputSink, PresentedSink, ReleaseSink,
+};
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::shm::WindowPlacer;
@@ -51,9 +53,10 @@ use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
     DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT,
-    NVGPU_F_SCANOUT_RELEASE, SCANOUT_RELEASED_MESSAGE_LEN, ScanoutReleased, clipboard_mime,
-    encode_clipboard_chunk, encode_display_mode, encode_input_events, encode_scanout_released,
-    input_events_that_fit,
+    NVGPU_F_SCANOUT_PRESENTED, NVGPU_F_SCANOUT_RELEASE, SCANOUT_PRESENTED_MESSAGE_LEN,
+    SCANOUT_RELEASED_MESSAGE_LEN, ScanoutPresented, ScanoutReleased, clipboard_mime,
+    encode_clipboard_chunk, encode_display_mode, encode_input_events, encode_scanout_presented,
+    encode_scanout_released, input_events_that_fit,
 };
 use std::os::fd::{BorrowedFd, RawFd};
 use vhost::vhost_user::message::{
@@ -839,6 +842,49 @@ impl ReleaseSink for VqReleaseSink {
     }
 }
 
+/// `ScanoutPresented` onto the same event queue: one message into one posted
+/// buffer, or dropped when none is posted (a presentation report is stale
+/// within a frame; the guest falls back to its own timer for that flip).
+impl PresentedSink for VqReleaseSink {
+    fn presented(&self, p: &ScanoutPresented) -> bool {
+        let Some((vring, mem)) = self.target.lock().expect("event target").clone() else {
+            return false;
+        };
+        let guard = mem.memory();
+        let mut vr = vring.get_mut();
+        let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
+            return false;
+        };
+        let Some(chain) = avail.next() else {
+            return false;
+        };
+        let head = chain.head_index();
+        drop(vr);
+        let segs = writable(chain);
+        let mut written = 0u32;
+        if capacity(&segs) >= SCANOUT_PRESENTED_MESSAGE_LEN {
+            let mut msg = [0u8; SCANOUT_PRESENTED_MESSAGE_LEN];
+            let n = encode_scanout_presented(p, &mut msg).expect("sized for it");
+            if let Ok(w) = write_scattered(&*guard, &segs, &msg[..n]) {
+                written = w as u32;
+            }
+        } else if !self
+            .warned_small
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            log::warn!(
+                "display: guest event buffers are {} bytes, too small for ScanoutPresented; dropped",
+                capacity(&segs)
+            );
+        }
+        if vring.add_used(head, written).is_err() {
+            return false;
+        }
+        let _ = vring.signal_used_queue();
+        written != 0
+    }
+}
+
 /// Watch the host's descriptors and tell the guest when one has something to
 /// say.
 ///
@@ -1423,10 +1469,12 @@ impl NvGpuBackend {
             if cursor {
                 config.set_cursor();
             }
-            link.set_release_sink(Arc::new(VqReleaseSink {
+            let sink = Arc::new(VqReleaseSink {
                 target: input_target.clone(),
                 warned_small: std::sync::atomic::AtomicBool::new(false),
-            }));
+            });
+            link.set_release_sink(sink.clone());
+            link.set_presented_sink(sink);
             display_link = Some(link.clone());
             nvidia.set_display(link);
         }
@@ -1616,6 +1664,7 @@ impl NvGpuBackend {
         self.input_claims.reset();
         if let Some(link) = self.display_link.as_ref() {
             link.set_release_enabled(false);
+            link.set_presented_enabled(false);
         }
     }
 
@@ -1786,8 +1835,9 @@ impl VhostUserBackendMut for NvGpuBackend {
             | u64::from(NVGPU_CFG_TAKES_INPUT)
             // Acked by a guest that wants `ScanoutReleased`; offered only
             // with a display.
+            // Likewise `ScanoutPresented`.
             | if self.display_link.is_some() {
-                u64::from(NVGPU_F_SCANOUT_RELEASE)
+                u64::from(NVGPU_F_SCANOUT_RELEASE) | u64::from(NVGPU_F_SCANOUT_PRESENTED)
             } else {
                 0
             }
@@ -1829,11 +1879,13 @@ impl VhostUserBackendMut for NvGpuBackend {
         }
         self.input_claims.device_started(features);
         let release = features & u64::from(NVGPU_F_SCANOUT_RELEASE) != 0;
+        let presented = features & u64::from(NVGPU_F_SCANOUT_PRESENTED) != 0;
         if let Some(link) = self.display_link.as_ref() {
             link.set_release_enabled(release);
+            link.set_presented_enabled(presented);
         }
         log::info!(
-            "guest driver features {features:#x}: {}{}",
+            "guest driver features {features:#x}: {}{}{}",
             if features & u64::from(NVGPU_CFG_TAKES_INPUT) != 0 {
                 "takes Conduit input"
             } else {
@@ -1841,6 +1893,11 @@ impl VhostUserBackendMut for NvGpuBackend {
             },
             if release {
                 ", wants scanout buffer releases"
+            } else {
+                ""
+            },
+            if presented {
+                ", wants presentation feedback"
             } else {
                 ""
             }
