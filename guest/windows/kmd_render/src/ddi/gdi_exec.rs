@@ -66,6 +66,17 @@ static RD_BACK: AtomicU32 = AtomicU32::new(0);
 static SYS_CE: AtomicU32 = AtomicU32::new(0);
 static SYS_REF: AtomicU32 = AtomicU32::new(0);
 static SYS_FAIL: AtomicU32 = AtomicU32::new(0);
+/// Why the last staging copy was not done on the copy engine (`GdiSysWhy`): 1 staging to staging,
+/// 2 the VRAM side's mapping, 3 the channel down, else the `fail_word` of `ce_sysmem`'s refusal;
+/// and every class seen (`GdiSysMsk`: 1 staging to staging, 2 VRAM side, 4 not system-resident, 8
+/// uncovered, 16 busy or no channel, 32 RM unsure, 64 other, 128 channel down).
+static SYS_WHY: AtomicU32 = AtomicU32::new(0);
+static SYS_MSK: AtomicU32 = AtomicU32::new(0);
+
+fn sys_refused(why: u32, bit: u32) {
+    SYS_WHY.store(why, Ordering::Relaxed);
+    SYS_MSK.fetch_or(bit, Ordering::Relaxed);
+}
 
 /// The timeline's completed watermark, for [`seq_ready`].
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -111,7 +122,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 pub(crate) fn reset_for_start(_on: bool) {
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -148,6 +159,8 @@ pub(crate) fn publish_counters() {
     w(b"GdiSysCe", SYS_CE.load(Ordering::Relaxed));
     w(b"GdiSysRef", SYS_REF.load(Ordering::Relaxed));
     w(b"GdiSysFail", SYS_FAIL.load(Ordering::Relaxed));
+    w(b"GdiSysWhy", SYS_WHY.load(Ordering::Relaxed));
+    w(b"GdiSysMsk", SYS_MSK.load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
 }
 
@@ -578,6 +591,8 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
         return false;
     };
     if glue::channel_state() != 0 {
+        sys_refused(3, 128);
+        SYS_REF.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     let (dpc, spc) = cmd_pitches(&op.cmd);
@@ -596,9 +611,10 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                 (SurfaceClass::Vram, SurfaceClass::System) => {
                     // The VRAM side first: it takes the channel's I/O itself.
                     let Some(sv) = glue::ce_surface(passive, adapter, src.resource_id) else {
+                        sys_refused(2, 2);
+                        SYS_REF.fetch_add(1, Ordering::Relaxed);
                         return false;
                     };
-                    RD_BACK.fetch_add(1, Ordering::Relaxed);
                     let dp = map_pitch(&dst, dpc);
                     glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
                         submit_and_wait(passive, op, dv, Some(&sv))
@@ -606,6 +622,8 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                 }
                 (SurfaceClass::System, SurfaceClass::Vram) => {
                     let Some(dv) = glue::ce_surface(passive, adapter, dst.resource_id) else {
+                        sys_refused(2, 2);
+                        SYS_REF.fetch_add(1, Ordering::Relaxed);
                         return false;
                     };
                     let sp = map_pitch(&src, spc);
@@ -613,18 +631,36 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                         submit_and_wait(passive, op, &dv, Some(sv))
                     })
                 }
-                _ => None,
+                _ => {
+                    // Staging to staging: no copy-engine view of two buffers at once.
+                    sys_refused(1, 1);
+                    SYS_REF.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
             }
         }
-        _ => None,
+        _ => return false,
     };
     match r {
-        Some(true) => true,
-        Some(false) => {
+        Ok(true) => {
+            if matches!((op.srcs[0].map(|s| s.class), dst.class), (Some(SurfaceClass::Vram), SurfaceClass::System)) {
+                RD_BACK.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        }
+        Ok(false) => {
             SYS_FAIL.fetch_add(1, Ordering::Relaxed);
             false
         }
-        None => {
+        Err(e) => {
+            let bit = match e.class {
+                glue::SysClass::NotSystem => 4,
+                glue::SysClass::Uncovered => 8,
+                glue::SysClass::Busy => 16,
+                glue::SysClass::Unsure => 32,
+                glue::SysClass::Other => 64,
+            };
+            sys_refused(e.word, bit);
             SYS_REF.fetch_add(1, Ordering::Relaxed);
             false
         }

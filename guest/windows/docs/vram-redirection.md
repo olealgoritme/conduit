@@ -635,6 +635,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiChUp`, `GdiCeWhy` | channel bring-ups the executor asked for; why the last CE attempt failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + channel state when it could not come up: 17 cold, 18 disabled, 19 broken, 20 other) |
 | `GdiRdBk`, `GdiThr` | copies from a VRAM surface into a standard buffer (GDI readback); the executor's own thread running (1) or the HPD worker in charge (0) |
 | `GdiSysCe`, `GdiSysRef`, `GdiSysFail` | copies/fills with a staging buffer on one side done on the copy engine over its system pages; refused (CPU instead); failed after the mapping (CPU instead) |
+| `GdiSysWhy`, `GdiSysMsk` | why the last staging copy was refused (1 staging to staging, 2 the VRAM side's mapping, 3 channel down, else `ce_sysmem`'s fail word: 0x8003_00EA not system-resident, 0x8005_00EB uncovered, 0x8001_00E4 busy, ...), and every class seen (1, 2, 4 not system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
@@ -691,6 +692,10 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   Counters `GdiSysCe` (done on the copy engine, also counted in `GdiBltN`/`GdiFillN`), `GdiSysRef`
   (refused), `GdiSysFail` (failed after the mapping); the V2 side's `RvSysMade`/`RvSysHit`/
   `RvSysRefuse`/`RvSysWhy`.
+* **360.1:** every staging copy was refused (`GdiSysCe` 0, `GdiSysRef` 136) and no `RvSys*` value
+  appeared: `ce_sysmem` mirrors its counters only after a success. Since 361.1 the glue mirrors them
+  after every call, and the refusal is classified in `GdiSysWhy`/`GdiSysMsk`; `GdiRdBk` was counted
+  twice for a refused readback (once before the attempt, once on the CPU path) and is now counted once.
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.

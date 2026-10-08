@@ -121,8 +121,8 @@ pub(crate) fn vram_write(
 /// Run `f` with KMD standard buffer `resource_id` (`pitch` bytes per row, `width` x `height`) as a
 /// copy-engine surface over its system pages (`ce_sysmem::with_standard`: takes the content
 /// transaction, then the channel's I/O). `f` must wait for everything it submits and must not
-/// resolve a VRAM surface (do that before). `None`: refused (not system-resident, partial leases,
-/// busy, no channel, an RM timeout). PASSIVE, no lock held.
+/// resolve a VRAM surface (do that before). `Err`: the refusal as a [`SysRefusal`]. PASSIVE, no
+/// lock held.
 pub(crate) fn with_standard<R>(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -131,11 +131,48 @@ pub(crate) fn with_standard<R>(
     width: u32,
     height: u32,
     f: impl FnOnce(&CeView) -> R,
-) -> Option<R> {
-    crate::ddi::ce_sysmem::with_standard(passive, adapter, resource_id, pitch, width, height, |s| {
+) -> Result<R, SysRefusal> {
+    let r = crate::ddi::ce_sysmem::with_standard(passive, adapter, resource_id, pitch, width, height, |s| {
         f(&CeView { va: s.va, pitch: s.pitch, width: s.width, height: s.height })
+    });
+    // `ce_sysmem` mirrors its `RvSys*` counters only after a success; a refusal is mirrored here
+    // too, so a session where everything is refused still shows why.
+    crate::ddi::ce_sysmem::publish_counters();
+    r.map_err(|f| SysRefusal {
+        class: if f == crate::ddi::ce_sysmem::NOT_SYSTEM {
+            SysClass::NotSystem
+        } else if f == crate::ddi::ce_sysmem::UNCOVERED {
+            SysClass::Uncovered
+        } else if ce_route::is_busy(&f) || f == ce_route::NO_CHANNEL {
+            SysClass::Busy
+        } else if f == crate::ddi::ce_sysmem::UNSURE {
+            SysClass::Unsure
+        } else {
+            SysClass::Other
+        },
+        word: helios_kmd_logic::rm_ce_channel::fail_word(f),
     })
-    .ok()
+}
+
+/// Why `with_standard` refused.
+#[derive(Clone, Copy)]
+pub(crate) struct SysRefusal {
+    pub class: SysClass,
+    /// `rm_ce_channel::fail_word` of the refusal.
+    pub word: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SysClass {
+    /// No leases (the buffer is in the Venus window, segment 2), a stale system copy, a guest blob.
+    NotSystem,
+    /// Partial leases, more than one window (64 MiB), no slot.
+    Uncovered,
+    /// The channel's I/O busy past 250 ms, or no channel.
+    Busy,
+    /// An RM timeout (the pages stay pinned).
+    Unsure,
+    Other,
 }
 
 /// `out.len()` bytes at `offset` of KMD standard buffer `resource_id`'s authoritative CPU view
