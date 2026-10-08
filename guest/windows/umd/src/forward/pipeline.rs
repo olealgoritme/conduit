@@ -135,18 +135,22 @@ pub(crate) unsafe extern "system" fn set_viewports(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let mut out: Vec<D3D11_VIEWPORT> = Vec::with_capacity(num as usize);
-    for i in 0..num as usize {
+    // On the stack: at most D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE (16) per call,
+    // and this runs once per render pass or more (was a heap Vec per call).
+    let mut buf = [D3D11_VIEWPORT::default(); 16];
+    let n = if vps.is_null() { 0 } else { (num as usize).min(buf.len()) };
+    for (i, slot) in buf.iter_mut().enumerate().take(n) {
         let v = &*vps.add(i);
-        out.push(D3D11_VIEWPORT {
+        *slot = D3D11_VIEWPORT {
             TopLeftX: v.TopLeftX as f32,
             TopLeftY: v.TopLeftY as f32,
             Width: v.Width as f32,
             Height: v.Height as f32,
             MinDepth: v.MinDepth,
             MaxDepth: v.MaxDepth,
-        });
+        };
     }
+    let out = &buf[..n];
     if crate::trace_enabled() && (VIEWPORT_LOG_COUNT.next() < 64 || num == 0) {
         if let Some(v) = out.first() {
             trace_line!(
@@ -164,7 +168,7 @@ pub(crate) unsafe extern "system" fn set_viewports(
             trace_line!("DDI RSSetViewports num={} clear={} empty", num, _clear);
         }
     }
-    context.RSSetViewports(Some(&out));
+    context.RSSetViewports(Some(out));
 }
 
 pub(crate) unsafe extern "system" fn set_scissor_rects(
@@ -176,18 +180,19 @@ pub(crate) unsafe extern "system" fn set_scissor_rects(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let mut out: Vec<RECT> = Vec::with_capacity(num as usize);
-    if !rects.is_null() {
-        for i in 0..num as usize {
-            let r = &*rects.add(i);
-            out.push(RECT {
-                left: r.left,
-                top: r.top,
-                right: r.right,
-                bottom: r.bottom,
-            });
-        }
+    // On the stack, as `set_viewports` (at most 16 per call).
+    let mut buf = [RECT::default(); 16];
+    let n = if rects.is_null() { 0 } else { (num as usize).min(buf.len()) };
+    for (i, slot) in buf.iter_mut().enumerate().take(n) {
+        let r = &*rects.add(i);
+        *slot = RECT {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        };
     }
+    let out = &buf[..n];
     if crate::trace_enabled() && (SCISSOR_LOG_COUNT.next() < 64 || num == 0) {
         if let Some(r) = out.first() {
             trace_line!(
@@ -208,7 +213,7 @@ pub(crate) unsafe extern "system" fn set_scissor_rects(
             );
         }
     }
-    context.RSSetScissorRects(Some(&out));
+    context.RSSetScissorRects(Some(out));
 }
 
 pub(crate) unsafe extern "system" fn set_text_filter_size(_h: Hdevice, _w: u32, _hgt: u32) {
