@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 13:59:15 +0200
+Subject: [PATCH] nvk/rm, wsi/win32: say where a VK_ERROR_DEVICE_LOST comes
+ from
+
+Basemark GPU's Vulkan test on NVK (395.1, DWM on NVK, GDI swapchain)
+exits with -4 (VK_ERROR_DEVICE_LOST) about 1.5 s after creating its
+swapchain and before its first present, and nothing says which call
+failed or why.
+
+The loss-epoch check (nvkmd_rm_dev_lost) makes the sync waits, signals
+and value reads, and the CPU wait steps, return VK_ERROR_DEVICE_LOST
+without a log line: the first time a device sees the epoch move, NVK
+now logs it once per process (mesa_loge, the epochs before and after).
+The other DEVICE_LOST paths already log through vk_errorf.
+
+With HELIOS_VK_FRAMETIME=1 the frame-time log also records every
+failing vkAcquireNextImageKHR (and its semaphore/fence signal) and
+vkQueuePresentKHR with its result (first 32 per process), in
+vkframes-<pid>.log and on OutputDebugString.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      | 12 ++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  | 13 +++++++++++++
+ src/vulkan/wsi/wsi_common.c                 | 14 ++++++++++++++
+ src/vulkan/wsi/wsi_common_private.h         |  1 +
+ src/vulkan/wsi/wsi_common_win32_frametime.c | 17 +++++++++++++++++
+ 5 files changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index d1b7eb1f..77e6424b 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -328,11 +328,19 @@ NVKMD_DECL_SUBCLASS(dev, rm);
+  * may touch them any more, and everything reports VK_ERROR_DEVICE_LOST.  A
+  * device created after the KMD came back is not lost.
+  */
++void nvkmd_rm_dev_note_lost(const struct nvkmd_rm_dev *dev, int32_t epoch);
++
+ static inline bool
+ nvkmd_rm_dev_lost(const struct nvkmd_rm_dev *dev)
+ {
+-   return dev->lib->win_loss_epoch != NULL &&
+-          dev->lib->win_loss_epoch() != dev->loss_epoch;
++   if (dev->lib->win_loss_epoch == NULL)
++      return false;
++   const int32_t epoch = dev->lib->win_loss_epoch();
++   if (likely(epoch == dev->loss_epoch))
++      return false;
++   /* Several callers return VK_ERROR_DEVICE_LOST on this without a word */
++   nvkmd_rm_dev_note_lost(dev, epoch);
++   return true;
+ }
+ 
+ VkResult nvkmd_rm_create_dev(struct nvkmd_pdev *pdev,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 2faf2596..f6f51f43 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -14,6 +14,19 @@
+ #include "util/u_math.h"
+ #include "vk_log.h"
+ 
++/* Once per process: which device saw the loss epoch move, and to what */
++void
++nvkmd_rm_dev_note_lost(const struct nvkmd_rm_dev *dev, int32_t epoch)
++{
++   static uint32_t noted;
++   if (p_atomic_xchg(&noted, 1) == 0) {
++      mesa_loge("NVK: RM device lost: librmclient loss epoch %d -> %d "
++                "(the KMD stopped or restarted, or the driver was updated); "
++                "everything on this device now returns VK_ERROR_DEVICE_LOST",
++                (int)dev->loss_epoch, (int)epoch);
++   }
++}
++
+ static VkResult
+ nvkmd_rm_dev_init_usermode(struct nvkmd_rm_dev *dev,
+                            struct nvkmd_rm_pdev *pdev,
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index acfd9d56..74a057fd 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -2299,6 +2299,10 @@ wsi_common_acquire_next_image2(const struct wsi_device *wsi,
+ 
+    VkResult result = swapchain->acquire_next_image(swapchain, pAcquireInfo,
+                                                    pImageIndex);
++#ifdef _WIN32
++   if (result < 0)
++      wsi_win32_frametime_result("vkAcquireNextImageKHR", result);
++#endif
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+       return result;
+    struct wsi_image *image =
+@@ -2310,6 +2314,10 @@ wsi_common_acquire_next_image2(const struct wsi_device *wsi,
+       VkResult signal_result =
+          wsi_signal_semaphore_for_image(device, swapchain, image,
+                                         pAcquireInfo->semaphore);
++#ifdef _WIN32
++      if (signal_result < 0)
++         wsi_win32_frametime_result("vkAcquireNextImageKHR semaphore", signal_result);
++#endif
+       if (signal_result != VK_SUCCESS)
+          return signal_result;
+    }
+@@ -2318,6 +2326,10 @@ wsi_common_acquire_next_image2(const struct wsi_device *wsi,
+       VkResult signal_result =
+          wsi_signal_fence_for_image(device, swapchain, image,
+                                     pAcquireInfo->fence);
++#ifdef _WIN32
++      if (signal_result < 0)
++         wsi_win32_frametime_result("vkAcquireNextImageKHR fence", signal_result);
++#endif
+       if (signal_result != VK_SUCCESS)
+          return signal_result;
+    }
+@@ -2946,6 +2958,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+ #ifdef _WIN32
+    if (ft_on)
+       wsi_win32_frametime_end(ft_start, pPresentInfo, final_result);
++   if (final_result < 0)
++      wsi_win32_frametime_result("vkQueuePresentKHR", final_result);
+ #endif
+    return final_result;
+ }
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index da952669..6670c31b 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -636,6 +636,7 @@ void wsi_win32_frametime_end(int64_t start, const VkPresentInfoKHR *info,
+                              VkResult result);
+ void wsi_win32_frametime_flush(void);
+ void wsi_win32_frametime_init(void);
++void wsi_win32_frametime_result(const char *what, VkResult result);
+ void wsi_win32_frametime_swapchain(const void *chain, const char *path,
+                                    uint32_t width, uint32_t height,
+                                    int present_mode, uint32_t images);
+diff --git a/src/vulkan/wsi/wsi_common_win32_frametime.c b/src/vulkan/wsi/wsi_common_win32_frametime.c
+index b813a891..95a1cefe 100644
+--- a/src/vulkan/wsi/wsi_common_win32_frametime.c
++++ b/src/vulkan/wsi/wsi_common_win32_frametime.c
+@@ -277,6 +277,23 @@ wsi_win32_frametime_swapchain(const void *chain, const char *path,
+               present_mode, images, path);
+ }
+ 
++/* A failing WSI call, in the .log (first 32 per process) */
++void
++wsi_win32_frametime_result(const char *what, VkResult result)
++{
++   static _Atomic uint32_t count;
++   if (!ft.enabled)
++      return;
++   const uint32_t n = atomic_fetch_add(&count, 1);
++   if (n < 32)
++      ft_note(true, "%s returned %d%s", what, (int)result,
++              result == VK_ERROR_DEVICE_LOST ? " (VK_ERROR_DEVICE_LOST)" :
++              result == VK_ERROR_OUT_OF_DATE_KHR ? " (VK_ERROR_OUT_OF_DATE_KHR)" :
++              result == VK_ERROR_SURFACE_LOST_KHR ? " (VK_ERROR_SURFACE_LOST_KHR)" : "");
++   else if (n == 32)
++      ft_note(true, "more failing WSI calls, not logged");
++}
++
+ bool
+ wsi_win32_frametime_begin(int64_t *start)
+ {
+-- 
+2.43.0
+
