@@ -10,7 +10,7 @@
 //! has no RM-fence boundary yet (S4), and an `HE12` record without a stream is
 //! refused at Render. So this driver orders the context itself:
 //!
-//! * **Monitored fence** (`Nvk12EclSync=0`; off by default since it deadlocked Basemark DX12). Each queue owns one
+//! * **Monitored fence** (`Nvk12EclSync=0`, the default). Each queue owns one
 //!   WDDM monitored fence created through the kernel callbacks. Every NVK
 //!   boundary appends, on the queue's own context, the runtime admission event
 //!   (exactly as on Venus) followed by a GPU wait for the fence to reach the
@@ -19,7 +19,7 @@
 //!   runtime queues on the context afterwards -- the app's fence signals, its
 //!   presents, DWM's view of them -- waits behind the real GPU work; the app
 //!   thread never blocks.
-//! * **CPU wait** (`Nvk12EclSync=1`, the default, or if the fence cannot be created). After
+//! * **CPU wait** (`Nvk12EclSync=1`, or if the fence cannot be created). After
 //!   the admission event, the DDI waits for the boundary on the calling thread.
 //!   A wait-before-signal pattern (Queue::Wait on a fence the app signals after
 //!   ExecuteCommandLists returns) would deadlock that wait, so it is capped at
