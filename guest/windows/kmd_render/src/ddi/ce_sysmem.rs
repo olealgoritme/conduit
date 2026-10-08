@@ -59,7 +59,11 @@ struct Entry {
     width: u32,
     height: u32,
     chan_gen: u64,
-    pin: GuestPin,
+    /// The leases' pin; `None` for a view over an aperture surface's recorded pages
+    /// (`aperture_pages`), which are VidMm's and are checked by generation instead.
+    pin: Option<GuestPin>,
+    /// The `aperture_pages` generation the view was made at (0 for a lease view).
+    ap_gen: u32,
 }
 
 struct State {
@@ -76,6 +80,8 @@ static STATE: SpinLock<State> = SpinLock::new(State {
 static ANY: AtomicU32 = AtomicU32::new(0);
 
 static MADE: AtomicU32 = AtomicU32::new(0);
+/// Views made over an aperture surface's recorded pages (`RmSysApV`).
+static AP_VIEWS: AtomicU32 = AtomicU32::new(0);
 static HIT: AtomicU32 = AtomicU32::new(0);
 static REFUSE: AtomicU32 = AtomicU32::new(0);
 static WHY: AtomicU32 = AtomicU32::new(0);
@@ -125,6 +131,7 @@ pub(crate) fn publish_counters() {
     }
     use crate::diag::record_named_bytes as rec;
     rec(b"RvSysMade", MADE.load(Ordering::Relaxed));
+    rec(b"RvSysApV", AP_VIEWS.load(Ordering::Relaxed));
     rec(b"RvSysHit", HIT.load(Ordering::Relaxed));
     rec(b"RvSysRefuse", REFUSE.load(Ordering::Relaxed));
     rec(b"RvSysWhy", WHY.load(Ordering::Relaxed));
@@ -228,6 +235,10 @@ fn resolve(
     height: u32,
     keep: u32,
 ) -> Result<CeSurface, Fail> {
+    // An aperture GDI surface (`RvOff` 0x4000 off, the default): a view over its recorded pages.
+    if crate::ddi::aperture_pages::tracked(resource_id) {
+        return aperture_view(passive, adapter, resource_id, pitch, width, height, keep);
+    }
     if guard.snapshot(resource_id).is_some() {
         return surface_locked(passive, adapter, guard, resource_id, pitch, width, height, keep);
     }
@@ -357,7 +368,8 @@ fn surface_locked(
                 width,
                 height,
                 chan_gen: gen,
-                pin,
+                pin: Some(pin),
+                ap_gen: 0,
             });
             refresh_any(&g);
             Ok(CeSurface {
@@ -385,6 +397,104 @@ fn surface_locked(
     }
 }
 
+/// A copy-engine view of an aperture GDI surface (`ddi/aperture_pages.rs`): an OS descriptor over
+/// the system pages Windows maps it to, made again whenever those pages changed (their generation).
+/// `NOT_SYSTEM` while a page is not mapped. The pages are VidMm's: the allocation stays resident
+/// while a DMA buffer naming it is in flight, which covers the GDI executor's copies. PASSIVE.
+fn aperture_view(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    keep: u32,
+) -> Result<CeSurface, Fail> {
+    let gen = ce_vram::chan_gen();
+    let cover = helios_kmd_logic::guest_blob::cover_len(pitch, height, u64::from(pitch) * u64::from(height))
+        .map_err(|_| refuse(UNCOVERED))?;
+    if !helios_kmd_logic::ce_route::fits_window(cover) {
+        return Err(refuse(UNCOVERED));
+    }
+    let pages = (cover / 4096) as usize;
+    let mut pfns: Vec<u64> = Vec::new();
+    if pfns.try_reserve_exact(pages).is_err() {
+        return Err(refuse(UNCOVERED));
+    }
+    let Some(ap_gen) = crate::ddi::aperture_pages::pages(resource_id, pages, &mut pfns) else {
+        return Err(refuse(NOT_SYSTEM));
+    };
+    {
+        let g = STATE.lock();
+        if let Some(e) = g.slots.iter().flatten().find(|e| e.resid == resource_id) {
+            if e.chan_gen == gen
+                && e.ap_gen == ap_gen
+                && e.pitch == pitch
+                && e.width == width
+                && e.height == height
+            {
+                HIT.fetch_add(1, Ordering::Relaxed);
+                return Ok(CeSurface { va: e.va, pitch, width, height, fourcc: 0, chan_gen: gen });
+            }
+        }
+    }
+    free_entry(passive, adapter, resource_id);
+    let slot = {
+        let g = STATE.lock();
+        g.slots.iter().position(Option::is_none)
+    };
+    let slot = match slot {
+        Some(i) => i as u8,
+        None => {
+            let victim = STATE
+                .lock()
+                .slots
+                .iter()
+                .flatten()
+                .find(|e| keep == 0 || e.resid != keep)
+                .map(|e| e.resid);
+            if let Some(v) = victim {
+                free_entry(passive, adapter, v);
+            }
+            let free = STATE.lock().slots.iter().position(Option::is_none);
+            match free {
+                Some(i) => i as u8,
+                None => return Err(refuse(UNCOVERED)),
+            }
+        }
+    };
+    let made = rio::with_channel_io(passive, adapter, IO_WAIT_MS, MAKE_MS, |io, h| {
+        rio::create_osdesc_io(io, h, rv::sys_handles(slot), rv::sys_va(slot), &pfns, cover)
+    });
+    match made {
+        Some(Ok(va)) => {
+            MADE.fetch_add(1, Ordering::Relaxed);
+            AP_VIEWS.fetch_add(1, Ordering::Relaxed);
+            let mut g = STATE.lock();
+            g.slots[slot as usize] = Some(Entry {
+                resid: resource_id,
+                slot,
+                va,
+                cover,
+                pitch,
+                width,
+                height,
+                chan_gen: gen,
+                pin: None,
+                ap_gen,
+            });
+            refresh_any(&g);
+            Ok(CeSurface { va, pitch, width, height, fourcc: 0, chan_gen: gen })
+        }
+        Some(Err(rio::DstFail::Clean(f))) => Err(refuse(f)),
+        Some(Err(rio::DstFail::Unsure(_))) => {
+            LEAK.fetch_add(1, Ordering::Relaxed);
+            Err(refuse(UNSURE))
+        }
+        None => Err(refuse(rio::BUSY)),
+    }
+}
+
 /// Free `resource_id`'s descriptor (if any) and drop its pin; an unconfirmed free leaks the pin.
 fn free_entry(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) {
     let taken = {
@@ -409,7 +519,9 @@ fn free_entry(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32)
         drop(e.pin);
     } else {
         LEAK.fetch_add(1, Ordering::Relaxed);
-        STATE.lock().leaked.push(e.pin);
+        if let Some(p) = e.pin {
+            STATE.lock().leaked.push(p);
+        }
     }
 }
 
@@ -446,7 +558,9 @@ pub(crate) fn release_all(io: &crate::virtio::rm_client::Io<'_>, h: &crate::virt
             drop(e.pin);
         } else {
             LEAK.fetch_add(1, Ordering::Relaxed);
-            STATE.lock().leaked.push(e.pin);
+            if let Some(p) = e.pin {
+                STATE.lock().leaked.push(p);
+            }
         }
     }
 }
@@ -456,7 +570,7 @@ pub(crate) fn release_all(io: &crate::virtio::rm_client::Io<'_>, h: &crate::virt
 pub(crate) fn forget(fate: helios_kmd_logic::sweep_budget::PinFate) {
     let (pins, leaked) = {
         let mut g = STATE.lock();
-        let pins: Vec<GuestPin> = g.slots.iter_mut().filter_map(|s| s.take().map(|e| e.pin)).collect();
+        let pins: Vec<GuestPin> = g.slots.iter_mut().filter_map(|s| s.take().and_then(|e| e.pin)).collect();
         let leaked = core::mem::take(&mut g.leaked);
         refresh_any(&g);
         (pins, leaked)

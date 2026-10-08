@@ -1,4 +1,4 @@
-//! `RvOff` 0x4000 (opt-in): CDD's CPU-written GDI surfaces in the aperture segment, and the system
+//! The default with `RedirVram` (`RvOff` 0x4000 turns it off): CDD's CPU-written GDI surfaces in the aperture segment, and the system
 //! pages Windows gives them, as the KMD's view of their content.
 //!
 //! `D3DKMDT_GDISURFACE_STAGING_CPUVISIBLE` "must be a linear format and in a cache-coherent GPU
@@ -34,6 +34,9 @@ struct Entry {
     resource_id: u32,
     /// The system page behind each page of the allocation, 0 when not mapped now.
     pfns: Vec<u64>,
+    /// Bumped whenever a page changes: a copy-engine view made over the pages is current only at
+    /// the generation it was made at (`ce_sysmem`).
+    generation: u32,
 }
 
 static TABLE: SpinLock<[Option<Entry>; SLOTS]> = SpinLock::new([const { None }; SLOTS]);
@@ -49,10 +52,10 @@ static WR: AtomicU32 = AtomicU32::new(0);
 static MISS: AtomicU32 = AtomicU32::new(0);
 static FULL: AtomicU32 = AtomicU32::new(0);
 
-/// Whether the opt-in is in force (`RvOff` 0x4000, with `RedirVram` on).
+/// Whether it is in force (`RedirVram` on, `RvOff` 0x4000 clear).
 pub(crate) fn on() -> bool {
     crate::virtio::rm_client::vidmem::knob_on()
-        && crate::virtio::rm_client::vidmem::off(helios_kmd_logic::rm_vidmem::off::STAGING_APERTURE)
+        && !crate::virtio::rm_client::vidmem::off(helios_kmd_logic::rm_vidmem::off::STAGING_APERTURE_OFF)
 }
 
 /// Whether a KMD standard allocation of this standard / GDI type goes to the aperture with its
@@ -76,7 +79,7 @@ pub(crate) fn register(resource_id: u32, size: u64) {
         return;
     }
     pfns.resize(pages, 0);
-    let entry = Entry { resource_id, pfns };
+    let entry = Entry { resource_id, pfns, generation: 1 };
     let mut t = TABLE.lock();
     let slot = t
         .iter()
@@ -130,6 +133,7 @@ pub(crate) unsafe fn note_update(resource_id: u32, update: &DXGK_BUILDPAGINGBUFF
     let first = (update.AllocationOffsetInBytes / 4096) as usize;
     let repeat = update.Flags.Repeat() != 0;
     let mut recorded = 0u32;
+    let mut changed = false;
     for i in 0..update.NumPageTableEntries as usize {
         let Some(slot) = e.pfns.get_mut(first + i) else {
             break;
@@ -138,13 +142,20 @@ pub(crate) unsafe fn note_update(resource_id: u32, update: &DXGK_BUILDPAGINGBUFF
         let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(if repeat { 0 } else { i })) };
         // SAFETY: plain bitfield / scalar reads of the PTE value.
         let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
-        if bits.Valid() != 0 && bits.Zero() == 0 && bits.Segment() == 0 {
-            // SAFETY: as above.
-            *slot = unsafe { pte.__bindgen_anon_2.PageAddress };
+        let new = if bits.Valid() != 0 && bits.Zero() == 0 && bits.Segment() == 0 {
             recorded += 1;
+            // SAFETY: as above.
+            unsafe { pte.__bindgen_anon_2.PageAddress }
         } else {
-            *slot = 0;
+            0
+        };
+        if *slot != new {
+            *slot = new;
+            changed = true;
         }
+    }
+    if changed {
+        e.generation = e.generation.wrapping_add(1).max(1);
     }
     PTE.fetch_add(recorded, Ordering::Relaxed);
 }
@@ -169,6 +180,19 @@ fn pages_of(resource_id: u32, first: usize, count: usize, out: &mut Vec<u64>) ->
     }
     out.extend_from_slice(range);
     true
+}
+
+/// The first `count` pages of `resource_id` into `out` and their generation, if every one is
+/// mapped now (`ce_sysmem`'s view over them). Spinlock only.
+pub(crate) fn pages(resource_id: u32, count: usize, out: &mut Vec<u64>) -> Option<u32> {
+    let t = TABLE.lock();
+    let e = t.iter().flatten().find(|e| e.resource_id == resource_id)?;
+    let range = e.pfns.get(..count)?;
+    if range.iter().any(|&p| p == 0) {
+        return None;
+    }
+    out.extend_from_slice(range);
+    Some(e.generation)
 }
 
 /// `NormalPagePriority | MdlMappingNoExecute`.
