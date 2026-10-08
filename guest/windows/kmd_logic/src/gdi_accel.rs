@@ -2015,8 +2015,21 @@ mod tests {
         }
         // `FlipLat` is the prefix of `FlipLat0..` histogram names; `NvSpinUs` mirrors its own
         // clamped effective value under the knob's name (an existing pattern, stable because the
-        // mirror equals what the read will return next time).
-        const ALLOWED: &[&str] = &["FlipLat", "NvSpinUs"];
+        // mirror equals what the read will return next time). The `Msi*` names are the MSI
+        // latch, breaker and start markers that `virtio/msi.rs` writes on purpose to read them
+        // back on the next start.
+        const ALLOWED: &[&str] = &[
+            "FlipLat",
+            "NvSpinUs",
+            "MsiBreaker",
+            "MsiLatch",
+            "MsiLatchOld",
+            "MsiLatchVer",
+            "MsiLatchWhy",
+            "MsiMarkerOld",
+            "MsiStarting",
+            "MsiStartingVer",
+        ];
         fn lits(text: &str) -> Vec<std::string::String> {
             let mut out = Vec::new();
             let mut rest = text;
