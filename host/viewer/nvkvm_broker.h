@@ -422,6 +422,11 @@ void nb_sink_mode_hint(struct nb_sink *s, unsigned w, unsigned h,
 /* EV_RELEASE of buffer `buf_id` (its dma-buf inode), covering its ATTACHes up
  * to the one whose seq was `seq` (NVKVM_BROKER_CAP_RELEASE_SEQ). */
 void nb_sink_release(struct nb_sink *s, uint64_t buf_id, uint32_t seq);
+/* EV_PRESENTED: the commit of the ATTACH whose seq was `seq` reached the
+ * screen at `t_ns` (CLOCK_MONOTONIC, 0 unknown) with feedback kind `kind`
+ * (NVKVM_BROKER_CAP_PRESENTED). */
+void nb_sink_presented(struct nb_sink *s, uint32_t seq, uint32_t kind,
+                       uint64_t t_ns);
 /* The user closed the display.  Reports it to the client and returns; the
  * client decides what that means for the VM.  Returns false when nobody is
  * connected, in which case the caller should just quit -- there is no policy

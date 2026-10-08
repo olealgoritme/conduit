@@ -34,6 +34,7 @@ All little-endian, `#[repr(C)]`, after the common message header. Display
 | 26 | `ClipboardToHost` | guest → host | control (reply: header only, status) |
 | 27 | `ClipboardRequest` | guest → host | control, no payload: resend the host clipboard (reply: header only, status) |
 | 28 | `ScanoutReleased` | host → guest | event, only to a guest that acked `NVGPU_F_SCANOUT_RELEASE` (see [Buffer release](#buffer-release)) |
+| 33 | `ScanoutPresented` | host → guest | event, only to a guest that acked `NVGPU_F_SCANOUT_PRESENTED` (see [Presentation feedback](#presentation-feedback)) |
 
 ```c
 struct scanout_flip {          /* 64 bytes */
@@ -231,6 +232,7 @@ types, no version bump; record sizes unchanged:
 | `EV_ACTIVE` = 19 | broker → backend | x = 1 send frames from now on, 0 stop (only from a `CAP_IDLE` broker) |
 | `CMD_CAPS` width bit `CLIENT_IDLE` (1<<4) | backend → broker | the backend honours `EV_ACTIVE` and arbitrates the mode between clients, so a session that ends goes idle instead of asking for a restore |
 | `CAP_RELEASE_SEQ` (HELLO w1 bit 15) | broker → backend | `EV_RELEASE` (4) is exact: x = the `seq` of the newest ATTACH of that buffer (w0,w1 = its dma-buf inode) the release covers, and every ATTACH is released eventually, a refused or dropped one at once (see [Buffer release](#buffer-release)) |
+| `CAP_PRESENTED` (HELLO w1 bit 16) / `EV_PRESENTED` = 21 | broker → backend | the broker answers each commit the display showed: x = the ATTACH's `seq`, y = the `wp_presentation_feedback` kind bits, w0,w1 = the presentation time in `CLOCK_MONOTONIC` ns (0 unknown) (see [Presentation feedback](#presentation-feedback)) |
 
 ## Several display clients
 
@@ -337,6 +339,51 @@ that attaches later is not shown a buffer the guest may be drawing into.
 
 The Linux module would only warn about an unknown event type, but it never
 acks the bit, so it never sees one.
+
+### Presentation feedback
+
+A guest that wants to complete a flip when the host display really showed it
+(the Windows KMD's `FlipDoneHost`, guest/windows/docs/independent-flip.md
+section 13) acks the **virtio device feature** `NVGPU_F_SCANOUT_PRESENTED =
+1 << 19` (offered whenever the backend has a display; config bit 19 stays
+unused, bit 17 is kept for the proposed host vblank feature). Only then does
+it get `ScanoutPresented` events, and only then does the backend keep the
+bookkeeping for them.
+
+```c
+struct scanout_presented {     /* 48 bytes, event queue, after the header
+                                * (msg_type 33, handle 0, status 0) */
+    u32 scanout;               /* 0 */
+    u32 flags;                 /* SCANOUT_PRESENTED_* below */
+    u32 owner_handle;          /* ScanoutFlip.owner_handle; 0 for Venus */
+    u32 host_handle;           /* ScanoutFlip.host_handle, or the Venus resource id */
+    u64 seq;                   /* ScanoutFlip.seq of the flip shown; 0 for Venus */
+    u64 present_ns;            /* host CLOCK_MONOTONIC when it reached the screen (TIMED) */
+    u64 sent_ns;               /* host CLOCK_MONOTONIC when the backend sent this event */
+    u64 reserved;              /* 0 */
+};
+#define SCANOUT_PRESENTED_RESOURCE  (1u << 0)  /* a Venus SET_SCANOUT_BLOB resource */
+#define SCANOUT_PRESENTED_VSYNC     (1u << 1)  /* vblank-synchronised */
+#define SCANOUT_PRESENTED_ZERO_COPY (1u << 2)  /* the guest's buffer itself was scanned out */
+#define SCANOUT_PRESENTED_TIMED     (1u << 3)  /* present_ns is known */
+```
+
+Where it comes from: a display client that declared `CAP_PRESENTED` (the
+viewer's Wayland backend, when the compositor offers `wp_presentation`)
+answers every commit the compositor presented with `EV_PRESENTED`, carrying
+the ATTACH's `seq` stamp; the backend remembers which guest flip each stamp
+(per client, per send) carried and turns the first report of each flip into
+the event. One event per flip at most: a second client's report of the same
+flip, or a report of an older flip than one already reported, is dropped. A
+flip nobody reports (no presenting client, the compositor replaced the commit
+before showing it, `discarded`) produces nothing; the guest falls back to its
+own timer for it. `sent_ns - present_ns` is the host-side delay, free of any
+clock offset.
+
+Delivery: from the link thread as soon as the report is read, into one posted
+event buffer; with none posted the event is **dropped** (counted,
+`presented_dropped`), never retried, because it is stale within a frame. The
+X11 backend and conduit-stream do not declare the capability.
 
 ### Mode policy with several clients
 
