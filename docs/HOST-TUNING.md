@@ -148,5 +148,9 @@ Before trusting a benchmark difference, run it at least three times on a
 quiet host: no builds, no other VM, no browser playing video. Swings of
 ±20% between runs on an untuned host are normal and are not regressions.
 
+To see where a Windows guest's frame copy spends its time on the host (and
+what CPU placement changes), `conduit trace NAME latency` prints the host
+round trip stage by stage ([TRACING.md](TRACING.md), "Latency capture").
+
 See also: [LIBVIRT.md](LIBVIRT.md) (the domain Conduit writes),
 [WINDOWS.md](WINDOWS.md).
