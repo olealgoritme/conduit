@@ -313,7 +313,8 @@ fn surface_locked(
             if let Some(v) = victim {
                 free_entry(passive, adapter, v);
             }
-            match STATE.lock().slots.iter().position(Option::is_none) {
+            let free = STATE.lock().slots.iter().position(Option::is_none);
+            match free {
                 Some(i) => i as u8,
                 None => return Err(refuse(UNCOVERED)),
             }

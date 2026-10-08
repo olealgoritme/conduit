@@ -701,7 +701,7 @@ pub const COUNTERS: &[&str] = &[
     "RvBytes", "RvFreed", "RvBring", "RvMs", "RvMsMax", "RvSoft", "RvLeak", "RvOpen", "RvOpenFg",
     "RvOpenLay", "RvOpenPid",
     // the channel side (`ce_vram.rs`)
-    "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvXfer", "RvXferFail",
+    "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvBookReent", "RvXfer", "RvXferFail",
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
     // the Present (`ddi/vram_redirect.rs`)
     "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail",
