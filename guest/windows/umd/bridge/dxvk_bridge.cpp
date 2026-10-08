@@ -47,6 +47,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <new>
 #include <vector>
 #include <unordered_map>
 
@@ -1937,6 +1938,48 @@ bool HeliosDxvkDevice::transfer_resource_ownership(
   });
 }
 
+// A blank stand-in for a surface DWM cannot import: a texture of the same size and format, filled
+// with zeros through initial data. Without initial data the image is whatever the video memory
+// held (368.1: green/black stripes where the wallpaper, taskbar and windows were). Returns the
+// ID3D11Resource (one reference) or nullptr, and the creation HRESULT in *phr.
+static ID3D11Resource* blank_ddi_placeholder(dxvk::D3D11Device* device, std::uint32_t width,
+    std::uint32_t height, std::uint32_t format, std::uint32_t bind_flags, HRESULT* phr) {
+  D3D11_TEXTURE2D_DESC td = { };
+  td.Width = width;
+  td.Height = height;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.Format = static_cast<DXGI_FORMAT>(format);
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+  // 4 bytes per pixel for the 32-bit formats (every GDI surface); 16, the widest uncompressed
+  // texel and more than any block format needs per pixel, for anything else.
+  const std::size_t bpp = helios_bridge::is_32bpp_dxgi_format(td.Format) ? 4u : 16u;
+  const std::size_t pitch = std::size_t(width) * bpp;
+  std::vector<std::uint8_t> zeros;
+  D3D11_SUBRESOURCE_DATA init = { };
+  bool have_init = false;
+  try {
+    zeros.assign(pitch * height, 0u);
+    init.pSysMem = zeros.data();
+    init.SysMemPitch = static_cast<UINT>(pitch);
+    init.SysMemSlicePitch = static_cast<UINT>(pitch * height);
+    have_init = true;
+  } catch (const std::bad_alloc&) {
+  }
+  ID3D11Texture2D* placeholder = nullptr;
+  HRESULT hr = device->CreateTexture2D(&td, have_init ? &init : nullptr, &placeholder);
+  ID3D11Resource* res = nullptr;
+  if (SUCCEEDED(hr) && placeholder) {
+    hr = placeholder->QueryInterface(__uuidof(ID3D11Resource), reinterpret_cast<void**>(&res));
+    placeholder->Release();
+  }
+  if (phr)
+    *phr = SUCCEEDED(hr) && !have_init ? S_FALSE : hr;
+  return SUCCEEDED(hr) ? res : nullptr;
+}
+
 std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint32_t width,
     std::uint32_t height,
@@ -1999,12 +2042,13 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       {
         static std::atomic<std::uint32_t> s_openBeginLogs{0};
         if (bridge_log_budget(s_openBeginLogs, 64, 512)) {
-          char msg[256];
+          char msg[320];
           std::snprintf(msg, sizeof(msg),
-            "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u vidmm_identity=0x%016llx",
+            "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u vidmm_identity=0x%016llx backend=%s foreign=%d",
             width, height, format, bind_flags, misc_flags, global, renderer_resource_id,
             static_cast<unsigned long long>(venus_alloc_size), memory_type_index,
-            static_cast<unsigned long long>(global_vidmm_tracker));
+            static_cast<unsigned long long>(global_vidmm_tracker),
+            impl->backend == helios_bridge::IcdBackend::Venus ? "venus" : "nvk", int(foreign));
           umd_log(msg);
         }
       }
@@ -2018,24 +2062,9 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       // as designed (NvkPresent auto picks scanout without ForeignImport).
       if (nvk_blank || (foreign && impl->backend == helios_bridge::IcdBackend::Venus
           && !dxvk::heliosForeignImport())) {
-        D3D11_TEXTURE2D_DESC td = { };
-        td.Width = width;
-        td.Height = height;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = static_cast<DXGI_FORMAT>(format);
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
-        ID3D11Texture2D* placeholder = nullptr;
-        HRESULT phr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->CreateTexture2D(
-            &td, nullptr, &placeholder);
-        ID3D11Resource* res = nullptr;
-        if (SUCCEEDED(phr) && placeholder) {
-          phr = placeholder->QueryInterface(__uuidof(ID3D11Resource),
-                                            reinterpret_cast<void**>(&res));
-          placeholder->Release();
-        }
+        HRESULT phr = E_FAIL;
+        ID3D11Resource* res = blank_ddi_placeholder(
+            static_cast<dxvk::D3D11Device*>(impl->d3d11), width, height, format, bind_flags, &phr);
         static std::atomic<std::uint32_t> s_placeholders{0};
         const std::uint32_t n = s_placeholders.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 8 || (n % 512u) == 0) {
@@ -2126,37 +2155,25 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
             reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(renderer_resource_id)),
             &importInfo);
       } catch (const dxvk::DxvkError& e) {
-        // DWM on NVK: a surface it cannot import must not take the compositor down (an E_FAIL
-        // here is a device removal, winlogon restarts DWM, Desktop Duplication returns
-        // E_ACCESSDENIED: 367.1 with a KMD GDI texture in RM video memory). Same rule as the
-        // non-importable case above: a blank texture of the same size, logged.
-        if (!(impl->backend != helios_bridge::IcdBackend::Venus && helios_bridge::is_dwm_process()))
+        // DWM: a surface it cannot import must not take the compositor down (an E_FAIL here is
+        // a device removal, winlogon restarts DWM, Desktop Duplication returns E_ACCESSDENIED:
+        // 367.1 with a KMD GDI texture in RM video memory). Same rule as the non-importable
+        // case above: a blank texture of the same size, logged. Both backends: DWM can be on
+        // Venus too (Icd=venus, or DwmIcd=nvk refused by the crash-loop guard after such
+        // restarts), and Venus cannot import an RM video memory surface either (368.1, res 23).
+        if (!helios_bridge::is_dwm_process())
           throw;
-        D3D11_TEXTURE2D_DESC td = { };
-        td.Width = width;
-        td.Height = height;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = static_cast<DXGI_FORMAT>(format);
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
-        ID3D11Texture2D* placeholder = nullptr;
-        HRESULT phr = device->CreateTexture2D(&td, nullptr, &placeholder);
-        ID3D11Resource* res = nullptr;
-        if (SUCCEEDED(phr) && placeholder) {
-          phr = placeholder->QueryInterface(__uuidof(ID3D11Resource),
-                                            reinterpret_cast<void**>(&res));
-          placeholder->Release();
-        }
+        HRESULT phr = E_FAIL;
+        ID3D11Resource* res = blank_ddi_placeholder(device, width, height, format, bind_flags, &phr);
         static std::atomic<std::uint32_t> s_importFallbacks{0};
         const std::uint32_t n = s_importFallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 16 || (n % 512u) == 0) {
           char msg[320];
           std::snprintf(msg, sizeof(msg),
-            "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d modifier=0x%016llx stride=%u) on NVK DWM: import failed (%s): blank placeholder hr=0x%08lx (x%u)",
+            "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d modifier=0x%016llx stride=%u) on %s DWM: import failed (%s): blank placeholder hr=0x%08lx (x%u)",
             renderer_resource_id, width, height, int(foreign),
             static_cast<unsigned long long>(foreign_modifier), foreign_stride,
+            impl->backend == helios_bridge::IcdBackend::Venus ? "Venus" : "NVK",
             e.message().c_str(), static_cast<unsigned long>(phr), n);
           umd_log(msg);
         }
