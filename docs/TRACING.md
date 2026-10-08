@@ -468,3 +468,161 @@ a lock-free ring; vkr adds two prerecorded command buffers (a timestamp each)
 to the last submit before each ring fence and reads two query results when
 it retires; the backend collects the renderer's stamps over its socket every
 50 ms; the guest driver writes a 196 KB registry value twice a second.
+
+## Latency capture
+
+Frame stage timing stamps a frame at the points the backend, `conduit-venus`
+and the guest driver chose. The latency capture looks underneath, from the
+host kernel: which thread woke when, what the GPU interrupt did, how long each
+renderer call took, which thread raised the MSI. It follows every windowed
+copy (the fenced ring-1 `SUBMIT_3D`) from the queue thread's wakeup to the
+interrupt into the guest:
+
+```sh
+conduit trace win11 latency                           # 5 s light capture, prints the table
+conduit trace win11 latency --full --duration 10      # every probe
+conduit trace win11 latency --save DIR                # keep the raw capture
+conduit trace win11 latency --perfetto run.json       # plus the frame stages of the same window, one file
+conduit trace latency DIR [--perfetto run.json]       # again, from a saved capture
+```
+
+It needs `bpftrace`, a kernel with BTF (`/sys/kernel/btf/vmlinux`) and root
+for bpftrace. conduit runs `sudo -n bpftrace`: run `sudo -v` first, or allow
+bpftrace without a password in sudoers (`USER ALL=(root) NOPASSWD:
+/usr/bin/bpftrace`, with your user name). It never asks for a password itself. Giving bpftrace
+file capabilities instead (`setcap`) does not work: bpftrace up to at least
+0.20 refuses to run as any other user than root. `conduit doctor` has a
+"Latency tracing" line saying what is there.
+
+### What it does to the VM
+
+Nothing that changes it. conduit finds the processes from what it started
+them with: the backend is the process serving the VM's trace socket
+(`--trace-socket`), `conduit-venus` the one listening on the VM's
+`venus.sock`, QEMU from its pid file (or libvirt's). It then writes a bpftrace
+program for those PIDs and the symbols of the binaries they run (read from
+the files, no `nm` needed), and runs it for `--duration` seconds (at most 30)
+from the moment the probes are attached. No process is stopped, signalled or
+reconfigured. With `--perfetto` it also collects the frame stages over the
+same window (`stages on` / `stages off` on the trace socket, as `conduit trace
+NAME stages` does, and left on if it was on).
+
+The probes are uprobes on the backend, `conduit-venus` and its
+virglrenderer, and tracepoints: `sched_wakeup`, `sched_waking` and
+`sched_switch` filtered to those processes (and QEMU's vCPU threads),
+`power:cpu_idle`, `kvm:kvm_msi_set_irq`, `kvm:kvm_set_irq` (INTx) and the
+NVIDIA interrupt lines' `irq_handler_entry`. They need the unstripped
+binaries the packages ship; a probe whose symbol a binary lacks is left out
+with a warning, and its rows stay empty.
+
+A light capture (the default) has three uprobes (`Venus::dispatch`, vkr's
+timeline write, `write_context_fence`) and costs under 15 µs of probe time
+per round trip; `--full` adds the renderer calls, the held chain and the
+GPU interrupt and costs about 30 µs. Under load a full capture writes about
+80,000 lines a second; when bpftrace cannot keep up it drops events and the
+table says how many.
+
+### Reading the table
+
+```text
+2514 host round trips (fenced SUBMIT_3D on ring 1) of 2726 dispatches in 12.0 s, full capture
+stage (us)                                                  n    mean     p50     p90     p99
+01 queue thread woken -> Venus::dispatch                 2455    14.5     5.5     7.5   348.9
+02 queue thread running -> Venus::dispatch               2455    12.0     3.1     5.0   346.0
+03 dispatch -> renderer call sent                        2514     2.8     2.6     4.0     6.6
+04 call sent -> conduit-venus Virgl::submit              2514    18.4    18.9    25.3    34.5
+05 Virgl::submit                                         2514     7.0     7.6     9.7    12.9
+06 Virgl::submit -> Virgl::create_fence                  2514    36.7    36.6    45.9    57.4
+07 dispatch -> backend has the fence reply               2514    83.9    85.5   102.4   129.4
+08 dispatch -> chain held (queue thread free)            2514    85.1    86.7   104.0   131.3
+09 dispatch -> copy's vkQueueSubmit returned             2514    54.0    49.4    68.6    92.4
+10 dispatch -> fence's sync submit returned              2514    85.9    82.9   100.0   131.6
+11 copy submitted -> vkr-queue running (GPU + wake)      2454   365.0   347.5   396.6   676.3
+12 copy submitted -> NVIDIA interrupt (GPU)              2507   345.2   329.4   376.6   644.3
+13 NVIDIA interrupt -> vkr-queue running                 2454    19.5    15.5    30.0    33.3
+14 dispatch -> timeline written                          2514   421.0   402.0   454.3   742.6
+15 timeline -> write_context_fence                       2514    14.6    11.4    23.4    25.1
+16 write_context_fence -> MSI                            2474    51.9    35.2    51.6   549.0
+17 timeline -> MSI (fence return path)                   2474    66.4    51.8    67.2   569.1
+18 dispatch -> MSI (host round trip)                     2474   487.8   456.9   524.9  1230.3
+held chains: 2514, followed by an interrupt from the queue thread: 2456
+idle state of the deliverer's CPU at its wakeup: nvgpu-fences awake 2454
+interrupts per second: MSI 12289 (nvgpu-events 9805, vring_worker 2273, nvgpu-fences 210), NVIDIA 2001
+```
+
+(Heaven on a Windows 11 guest with MSI-X, before the backend's latency
+options; [research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)
+has the whole study.) A round trip is keyed by its fence id, from the
+guest's `SUBMIT_3D` header in `Venus::dispatch` to `write_context_fence`.
+The rows, in the path's order:
+
+- 01-02: the guest's kick. When the queue thread (`vring_worker`) was woken,
+  and when it got a CPU, before `Venus::dispatch` began.
+- 03-10 (full): the way in. The backend's calls to `conduit-venus`
+  (`Virgl::submit`, `Virgl::create_fence`), when the backend has the fence
+  reply, when the chain is held and the queue thread is free again, and when
+  virglrenderer's `vkQueueSubmit` of the copy and its sync submit of the fence
+  returned.
+- 11-13 (full): the GPU. From the copy's submit to the NVIDIA interrupt (the
+  copy, plus any wait for the engine), and from the interrupt to the
+  `vkr-queue` thread running.
+- 14: dispatch to vkr's timeline write: the whole way in, the GPU and the
+  wake.
+- 15-17: the fence's way back. vkr's sync thread to `write_context_fence`,
+  then on to the MSI. 17 is the host's fence return path.
+- 16b: with INTx instead of MSI-X, from `signal_used_queue` to QEMU raising
+  the line.
+- 18: dispatch to MSI, the host round trip.
+
+Each row is the interval for every round trip that had both ends; `n`
+differs where a probe missed one. The percentiles are nearest rank.
+
+`held chains`: how often the queue thread raised an interrupt right after
+holding a chain: the empty interrupt the `quiet-held` option removes (on by
+default). `idle state`: the C-state the CPU of the thread that raised the MSI
+was in when it was woken (awake, POLL, C1, C2, C3; `acpi_idle` names).
+`interrupts per second`: every MSI the backend raised over the capture, by
+thread (the fence deliverer, the queue thread, the event thread), INTx raised
+by QEMU, and the NVIDIA card's own interrupts.
+
+A capture from this command adds the thread hops, from `sched_waking`, which
+fires in the waker's context:
+
+```text
+thread hops, timeline written -> interrupt:
+   96%   1801  4 hop(s): vkr-queue-1 -> conduit-venus -> conduit-venus -> venus-ipc -> nvgpu-fences
+    4%     70  not followed through the wakeups
+```
+
+(the format, before `direct-fences`; numbers illustrative). Each chain starts at the thread that
+wrote vkr's timeline and the thread of the fence callback, then follows the
+first wakeup each thread made after it was woken, until the thread that
+raised the interrupt. A chain that wanders off within six hops counts as not
+followed. `direct-fences` (on by default) takes two hops off this chain.
+
+### Perfetto
+
+`--perfetto FILE` writes the round trips as trace events: a track per traced
+thread (named `name (tid)`), on it a slice per call (`Venus::dispatch`,
+`Virgl::submit`, `vkQueueSubmit (copy)`, `sync submit (fence)`) and a mark
+for vkr's timeline write, `write_context_fence` and the MSI, linked by flow
+arrows; a "host round trips" track with one span per round trip; every other
+MSI and the NVIDIA interrupts as instants. With the frame stages collected
+over the same window, the same file holds the stage tracks (see "Frame stage
+timing" above). bpftrace's time and the stage stamps are both
+`CLOCK_MONOTONIC`, so they line up without correlation, and every latency
+event carries the copy's fence as `frame`, the id the stage slices use.
+
+### Saved captures
+
+`--save DIR` keeps `latency.txt` (bpftrace's output, one event per line:
+`TAG NSECS TID FIELDS...`), `latency.threads` (`TID NAME` of every thread of
+the backend and `conduit-venus` when the capture ended), `latency.bt` (the
+program that ran) and, with `--perfetto`, the frame stage collection
+(`host.bin`, `guest-NNN.bin`). `conduit trace latency DIR` reanalyses it;
+`conduit trace latency FILE` also reads the output of the former
+`host/latency/capture.sh` (with `FILE.threads` next to it).
+
+`host/latency/fencewake.c` stays a separate developer tool: it measures the
+host Vulkan driver's fence wake with no VM involved, needs the Vulkan headers
+and a C compiler to build, and keeps the GPU and two CPUs busy while it runs.

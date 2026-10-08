@@ -7,6 +7,7 @@ mod doctor;
 mod guest;
 mod host;
 mod hypr;
+mod latency;
 mod libvirt;
 mod lvrun;
 mod mem;
@@ -277,7 +278,9 @@ enum Cmd {
     /// live or summarise their latency (docs/TRACING.md).
     /// Also: `trace NAME status`, `trace NAME on|off` (the backend's own
     /// --trace file), `trace analyze FILE`, `trace NAME stages` (per-frame
-    /// stage timing of the Windows present paths), `trace stages DIR`
+    /// stage timing of the Windows present paths), `trace stages DIR`,
+    /// `trace NAME latency` (the host round trip of a guest copy, through
+    /// bpftrace), `trace latency DIR`
     Trace {
         /// The VM, or `analyze`
         target: String,
@@ -303,20 +306,25 @@ enum Cmd {
         #[arg(long, value_parser = ["json", "bin"])]
         format: Option<String>,
         /// Stop after this many seconds instead of at Ctrl-C (stages: how
-        /// long to collect, default 10)
+        /// long to collect, default 10; latency: default 5, at most 30)
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
         /// stages: a command printing the guest driver's StgRing value
         /// (`reg query ... /v StgRing`), run every second
         #[arg(long, value_name = "CMD")]
         guest_cmd: Option<String>,
-        /// stages: keep what was collected in this folder (reanalyse with
-        /// `conduit trace stages DIR`)
+        /// stages, latency: keep what was collected in this folder
+        /// (reanalyse with `conduit trace stages|latency DIR`)
         #[arg(long, value_name = "DIR")]
         save: Option<PathBuf>,
-        /// stages: also write a Chrome trace-event / Perfetto JSON file
+        /// stages, latency: also write a Chrome trace-event / Perfetto JSON
+        /// file (latency: with the frame stages of the same window)
         #[arg(long, value_name = "FILE")]
         perfetto: Option<PathBuf>,
+        /// latency: every probe (about 30 us per round trip instead of 15;
+        /// adds the renderer calls, the held chain, the GPU interrupt)
+        #[arg(long)]
+        full: bool,
         /// stages: a guest DxgKrnl ETW capture as CSV
         /// (ts_100ns,event,pid,tid[,detail]) for the Perfetto file
         #[arg(long, value_name = "FILE")]
@@ -672,11 +680,25 @@ fn main() {
             save,
             perfetto,
             etw,
+            full,
         } => match (target.as_str(), arg.as_deref()) {
             ("analyze", Some(file)) => trace::analyze(std::path::Path::new(file), &filter, follow),
             ("stages", Some(dir)) => {
                 stages::offline(std::path::Path::new(dir), perfetto.as_deref(), etw.as_deref())
             }
+            ("latency", Some(dir)) => {
+                latency::offline(std::path::Path::new(dir), perfetto.as_deref())
+            }
+            (name, Some("latency")) => latency::live(
+                name,
+                latency::Opts {
+                    duration: duration.unwrap_or(latency::DEFAULT_SECS),
+                    full,
+                    save,
+                    perfetto,
+                    guest_cmd,
+                },
+            ),
             (name, Some("stages")) => stages::live(
                 name,
                 stages::Opts {
@@ -694,7 +716,7 @@ fn main() {
             (name, Some(a @ ("status" | "on" | "off"))) => trace::action(name, a),
             (_, Some(other)) => Err(ui::oops(
                 format!("unknown trace action {other:?}"),
-                "Use: conduit trace NAME [status|on|off|stages] or conduit trace analyze|stages FILE",
+                "Use: conduit trace NAME [status|on|off|stages|latency] or conduit trace analyze|stages|latency FILE",
             )),
             (name, None) => trace::live(
                 name,
