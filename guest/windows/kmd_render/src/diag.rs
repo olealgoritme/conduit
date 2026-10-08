@@ -1470,6 +1470,12 @@ pub mod knobs {
     /// Venus traffic. 0 keeps them on the control queue (the fallback, and the old path). Read at
     /// StartDevice; mirrored as `CurQ`.
     pub const HW_CURSOR_Q: KnobName = KnobName::new(b"HwCursorQ");
+    /// `HwCursorCaps` (default 0 = monochrome | color | masked color, 7): the
+    /// `DXGK_DRIVERCAPS.PointerCaps` word reported with the pointer, masked to those three bits.
+    /// An A/B lever for "dxgkrnl never calls SetPointerShape": 6 is what the virtio-gpu and QXL
+    /// display-only drivers report. Read at each caps query (reboot to apply); `CurCapRep`
+    /// bits 16..23 say what was reported.
+    pub const HW_CURSOR_CAPS: KnobName = KnobName::new(b"HwCursorCaps");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,

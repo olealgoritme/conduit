@@ -232,7 +232,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         let max_pointer: UINT = helios_kmd_logic::hw_cursor::MAX_DIM;
         out.set(caps_offset!(MaxPointerWidth), max_pointer);
         out.set(caps_offset!(MaxPointerHeight), max_pointer);
-        let pointer_caps: UINT = helios_kmd_logic::hw_cursor::POINTER_CAPS;
+        let pointer_caps: UINT = crate::ddi::hw_cursor::pointer_caps();
         out.set(caps_offset!(PointerCaps), pointer_caps);
     }
     // Not a legacy VGA device.

@@ -161,8 +161,15 @@ pub(crate) fn note_ddi_shape() {
     bump(&DDI_SHAPE);
 }
 
-pub(crate) fn note_ddi_position() {
+/// Position calls that asked to show the pointer / to hide it, and the last call's source id.
+static POS_VIS: AtomicU32 = AtomicU32::new(0);
+static POS_HID: AtomicU32 = AtomicU32::new(0);
+static POS_SRC: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn note_ddi_position(visible: bool, source: u32) {
     DDI_POS.fetch_add(1, Ordering::Relaxed);
+    (if visible { &POS_VIS } else { &POS_HID }).fetch_add(1, Ordering::Relaxed);
+    POS_SRC.store(source, Ordering::Relaxed);
     // Positions arrive at mouse rate: published with the next change, or once a second.
     mark_dirty();
 }
@@ -194,6 +201,11 @@ fn write_block() {
     crate::diag::record_named_bytes(b"CurQSent", r(&Q_SENT));
     crate::diag::record_named_bytes(b"CurDdiS", r(&DDI_SHAPE));
     crate::diag::record_named_bytes(b"CurDdiP", r(&DDI_POS));
+    crate::diag::record_named_bytes(b"CurPosVis", r(&POS_VIS));
+    crate::diag::record_named_bytes(b"CurPosHid", r(&POS_HID));
+    crate::diag::record_named_bytes(b"CurPosSrc", r(&POS_SRC));
+    crate::diag::record_named_bytes(b"CurCapQn", r(&CAPQ_N));
+    crate::diag::record_named_bytes(b"CurCapRep", r(&CAPQ_LAST));
 }
 
 /// The block, when a count moved: from the mirror thread's pass (asked for by [`mark_dirty`]) and
@@ -284,7 +296,7 @@ pub(crate) fn reset_for_start(adapter: &AdapterContext, knobs: &crate::adapter::
     for c in [
         &SHAPE_N, &POS_N, &SHOW, &HIDE, &FMT, &SIZE, &REFUSE, &WHY, &HOST_ERR, &XOR, &RTT_US,
         &RTT_MAX, &TMO, &GATE_MS, &SW_N, &SW_MS, &SW_MAX, &RETRY, &Q_BUSY, &Q_SENT, &DDI_SHAPE,
-        &DDI_POS,
+        &DDI_POS, &POS_VIS, &POS_HID, &POS_SRC,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -310,12 +322,42 @@ fn host_features(adapter: &AdapterContext) -> Option<u32> {
 /// runs at (PASSIVE). Recorded, so the pointer DDIs follow what dxgkrnl was told.
 pub(crate) fn advertised(adapter: &AdapterContext) -> bool {
     let knobs = adapter.knobs();
-    let caps = hc::advertise(knobs.hw_cursor, knobs.display_half, host_features(adapter));
+    let host = host_features(adapter);
+    let caps = hc::advertise(knobs.hw_cursor, knobs.display_half, host);
     if u32::from(caps) != CAPS.swap(u32::from(caps), Ordering::Relaxed) {
         DIRTY.store(1, Ordering::Relaxed);
     }
+    // What THIS query told dxgkrnl, kept across StartDevice (the caps query can come before it;
+    // `CurCaps` is recomputed there and is not proof of what dxgkrnl was told): bit 0 a pointer
+    // was reported, bit 1 the host's features were known (the transport was up), bits 4..7 the
+    // knob, bit 8 the display half, bits 16..23 the `PointerCaps` word reported.
+    CAPQ_N.fetch_add(1, Ordering::Relaxed);
+    CAPQ_LAST.store(
+        u32::from(caps)
+            | u32::from(host.is_some()) << 1
+            | (knobs.hw_cursor & 0xF) << 4
+            | u32::from(knobs.display_half) << 8
+            | if caps { pointer_caps() << 16 } else { 0 },
+        Ordering::Relaxed,
+    );
+    DIRTY.store(1, Ordering::Relaxed);
     caps
 }
+
+/// The `DXGK_DRIVERCAPS.PointerCaps` word to report: `hc::POINTER_CAPS` (monochrome, color,
+/// masked color), or what `HwCursorCaps` asks for (nonzero; masked to those three bits; 6 is
+/// what the virtio-gpu and QXL display-only drivers report: color and masked color, no
+/// monochrome). Read with each caps query (PASSIVE).
+pub(crate) fn pointer_caps() -> u32 {
+    match crate::diag::read_config_dword(crate::diag::knobs::HW_CURSOR_CAPS, 0) & hc::POINTER_CAPS {
+        0 => hc::POINTER_CAPS,
+        m => m,
+    }
+}
+
+/// `DXGK_DRIVERCAPS` queries and what the last one reported (see [`advertised`]); never reset.
+static CAPQ_N: AtomicU32 = AtomicU32::new(0);
+static CAPQ_LAST: AtomicU32 = AtomicU32::new(0);
 
 fn caps_on() -> bool {
     CAPS.load(Ordering::Relaxed) != 0
