@@ -486,14 +486,22 @@ impl PumpWake {
         let one: u64 = 1;
         // A full counter (EAGAIN) is already a pending wake.
         let _ = unsafe {
-            libc::write(self.0.as_raw_fd(), (&one as *const u64).cast(), size_of::<u64>())
+            libc::write(
+                self.0.as_raw_fd(),
+                (&one as *const u64).cast(),
+                size_of::<u64>(),
+            )
         };
     }
 
     fn drain(&self) {
         let mut n: u64 = 0;
         let _ = unsafe {
-            libc::read(self.0.as_raw_fd(), (&mut n as *mut u64).cast(), size_of::<u64>())
+            libc::read(
+                self.0.as_raw_fd(),
+                (&mut n as *mut u64).cast(),
+                size_of::<u64>(),
+            )
         };
     }
 }
@@ -688,6 +696,14 @@ impl InputSink for VqInputSink {
     /// Windows KMD may run the event queue (for `EventReady`) but never acks
     /// the bit, and has nowhere to put an `InputEvent`.
     fn takes_input(&mut self) -> bool {
+        // A driver that has said nothing about taking input (the Windows
+        // KMD) takes none whatever its queue does: answered without the
+        // event queue's lock, which the event pump holds hundreds of times a
+        // millisecond under a game. The link thread asks on every packet it
+        // reads, input included.
+        if !self.claims.acked() && !self.claims.linux() {
+            return false;
+        }
         let target = self.target.lock().expect("event target").clone();
         self.posted = match target {
             Some((vring, mem)) => event_buffers_posted(&vring, &mem, self.posted),
@@ -914,6 +930,54 @@ impl ReleaseSink for VqReleaseSink {
     }
 }
 
+/// `ScanoutPresented` off the display link's thread.
+///
+/// The link thread is also the one that routes the viewer's input; a
+/// per-frame report must not take the event queue's lock there, behind the
+/// event pump. It leaves the newest report here and a thread of its own puts
+/// it on the queue. Newest wins: a presentation report is stale within a
+/// frame.
+struct PresentedRelay {
+    slot: std::sync::Mutex<Option<ScanoutPresented>>,
+    ready: std::sync::Condvar,
+}
+
+impl PresentedRelay {
+    fn start(inner: Arc<dyn PresentedSink>) -> std::io::Result<Arc<Self>> {
+        let relay = Arc::new(Self {
+            slot: std::sync::Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+        });
+        let r = relay.clone();
+        std::thread::Builder::new()
+            .name("nvgpu-presented".into())
+            .spawn(move || {
+                loop {
+                    let p = {
+                        let mut slot = r.slot.lock().unwrap();
+                        loop {
+                            if let Some(p) = slot.take() {
+                                break p;
+                            }
+                            slot = r.ready.wait(slot).unwrap();
+                        }
+                    };
+                    inner.presented(&p);
+                }
+            })?;
+        Ok(relay)
+    }
+}
+
+impl PresentedSink for PresentedRelay {
+    /// Never blocks on the event queue; `true` means handed on.
+    fn presented(&self, p: &ScanoutPresented) -> bool {
+        *self.slot.lock().unwrap() = Some(*p);
+        self.ready.notify_one();
+        true
+    }
+}
+
 /// `ScanoutPresented` onto the same event queue: one message into one posted
 /// buffer, or dropped when none is posted (a presentation report is stale
 /// within a frame; the guest falls back to its own timer for that flip).
@@ -1018,7 +1082,10 @@ struct RingDepth {
 impl RingDepth {
     fn note(&mut self, free: u16) -> u16 {
         let now = Instant::now();
-        if self.since.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+        if self
+            .since
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+        {
             self.prev = self.cur;
             self.cur = 0;
             self.since = Some(now);
@@ -1259,6 +1326,33 @@ impl EventReports {
     }
 }
 
+/// Whether the sweep asks descriptor `h` now: an event file whose last edge
+/// was coalesced (`recheck`) every sweep; a fence `repeat` after its last
+/// report; an event file the guest was told about `repeat_idle` after it
+/// (nothing new happened on it, or there would have been an edge); anything
+/// never reported, at once.
+fn sweep_due(
+    h: u64,
+    now: Instant,
+    once: &HashSet<u64>,
+    last_report: &HashMap<u64, Instant>,
+    recheck: &HashSet<u64>,
+    repeat: Duration,
+    repeat_idle: Duration,
+) -> bool {
+    if recheck.contains(&h) {
+        return true;
+    }
+    let gap = if once.contains(&h) {
+        repeat
+    } else {
+        repeat_idle
+    };
+    last_report
+        .get(&h)
+        .is_none_or(|&t| now.duration_since(t) >= gap)
+}
+
 /// Watch the host's descriptors and tell the guest when one has something to
 /// say.
 ///
@@ -1305,6 +1399,18 @@ fn event_pump(
     // net for an event the guest woke for and then left queued, which still
     // finds it within this.
     const REPEAT: Duration = Duration::from_millis(10);
+    // The same for an event file the guest was told about and that has had
+    // no edge since. A Windows guest never drains its event files (no
+    // `GET_EVENT_DATA` at all: it takes the report as a wake), so each one
+    // stays readable for as long as it is open, and every NVK device a
+    // process ever made kept costing an EventReady per REPEAT -- 100 a second
+    // per file, for ever, on top of the real edges: about 1700 a second at an
+    // idle desktop after a CS2 session (2026-10-08), vCPU0 at 96 % and Heaven
+    // at a third of its frame rate until the VM was restarted. New events
+    // come as edges, and an edge that was coalesced is re-checked every
+    // SWEEP (`recheck`), so this only paces the safety net for a file
+    // nothing new happened on.
+    const REPEAT_IDLE: Duration = Duration::from_secs(1);
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -1322,6 +1428,10 @@ fn event_pump(
     let mut once: HashSet<u64> = HashSet::new();
     // When each descriptor was last reported (REPEAT).
     let mut last_report: HashMap<u64, Instant> = HashMap::new();
+    // Event files whose last edge was coalesced (`Sent::Coalesced`): asked
+    // again every SWEEP until a report goes out, so an edge held back on a
+    // wrong guess of what the guest has read waits COALESCE_MAX at most.
+    let mut recheck: HashSet<u64> = HashSet::new();
     let mut last_sweep = Instant::now();
 
     // Edge-triggered. Level-triggered would report a descriptor as readable
@@ -1344,7 +1454,15 @@ fn event_pump(
             events: libc::EPOLLIN as u32,
             u64: PUMP_WAKE_TAG,
         };
-        if unsafe { libc::epoll_ctl(epfd.as_raw_fd(), libc::EPOLL_CTL_ADD, w.0.as_raw_fd(), &mut ev) } != 0 {
+        if unsafe {
+            libc::epoll_ctl(
+                epfd.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                w.0.as_raw_fd(),
+                &mut ev,
+            )
+        } != 0
+        {
             log::warn!(
                 "event pump: watching the wake eventfd: {}",
                 std::io::Error::last_os_error()
@@ -1359,9 +1477,10 @@ fn event_pump(
     // What `EventReports::flush` sent: a fence is done (as below, `reported`),
     // an event file was reported now.
     let settle = |delivered: &mut Vec<(u32, bool)>,
-                      watched: &mut HashMap<u64, OwnedFd>,
-                      once: &mut HashSet<u64>,
-                      last_report: &mut HashMap<u64, Instant>| {
+                  watched: &mut HashMap<u64, OwnedFd>,
+                  once: &mut HashSet<u64>,
+                  last_report: &mut HashMap<u64, Instant>,
+                  recheck: &mut HashSet<u64>| {
         for (handle, fence) in delivered.drain(..) {
             if fence {
                 once.remove(&(handle as u64));
@@ -1370,8 +1489,16 @@ fn event_pump(
                 }
             } else {
                 last_report.insert(handle as u64, Instant::now());
+                recheck.remove(&(handle as u64));
             }
         }
+    };
+    let due_at = |h: u64,
+                  now: Instant,
+                  once: &HashSet<u64>,
+                  last_report: &HashMap<u64, Instant>,
+                  recheck: &HashSet<u64>| {
+        sweep_due(h, now, once, last_report, recheck, REPEAT, REPEAT_IDLE)
     };
 
     loop {
@@ -1419,8 +1546,13 @@ fn event_pump(
                         let ready = unsafe { libc::poll(&mut pfd, 1, 0) } > 0
                             && pfd.revents & libc::POLLIN != 0;
                         if ready {
-                            let status = if fence { sync_file_status(fd.as_raw_fd()) } else { 0 };
-                            match reports.report(handle, fence, status, batch.then_some(&mut pass)) {
+                            let status = if fence {
+                                sync_file_status(fd.as_raw_fd())
+                            } else {
+                                0
+                            };
+                            match reports.report(handle, fence, status, batch.then_some(&mut pass))
+                            {
                                 // Reported once and never watched, as the sweep
                                 // would do for a signalled fence.
                                 Sent::Pushed if fence => {
@@ -1445,6 +1577,7 @@ fn event_pump(
                     reports.forget(handle);
                     once.remove(&(handle as u64));
                     last_report.remove(&(handle as u64));
+                    recheck.remove(&(handle as u64));
                     if let Some(fd) = watched.remove(&(handle as u64)) {
                         ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
                     }
@@ -1459,7 +1592,13 @@ fn event_pump(
             let mut p = batch.then_some(&mut pass);
             reports.flush(&mut p, &mut delivered);
         }
-        settle(&mut delivered, &mut watched, &mut once, &mut last_report);
+        settle(
+            &mut delivered,
+            &mut watched,
+            &mut once,
+            &mut last_report,
+            &mut recheck,
+        );
         reports.log_stats();
 
         // The safety net: an edge can be missed if a descriptor was already
@@ -1476,10 +1615,7 @@ fn event_pump(
                 .keys()
                 .copied()
                 .filter(|h| {
-                    !reports.owed(*h as u32)
-                        && !last_report
-                            .get(h)
-                            .is_some_and(|&t| now.duration_since(t) < REPEAT)
+                    !reports.owed(*h as u32) && due_at(*h, now, &once, &last_report, &recheck)
                 })
                 .collect();
             let mut pfds: Vec<libc::pollfd> = due
@@ -1503,14 +1639,25 @@ fn event_pump(
                     } else {
                         0
                     };
-                    if reports.report(handle as u32, once.contains(&handle), status, Some(&mut pass))
-                        == Sent::Pushed
-                    {
-                        if once.contains(&handle) {
-                            reported.push(handle);
-                        } else {
+                    match reports.report(
+                        handle as u32,
+                        once.contains(&handle),
+                        status,
+                        Some(&mut pass),
+                    ) {
+                        Sent::Pushed if once.contains(&handle) => reported.push(handle),
+                        Sent::Pushed => {
                             last_report.insert(handle, now);
+                            recheck.remove(&handle);
                         }
+                        Sent::Coalesced => {
+                            recheck.insert(handle);
+                        }
+                        // Asked again on the next sweep.
+                        Sent::Dropped => {
+                            last_report.remove(&handle);
+                        }
+                        Sent::Queued => {}
                     }
                 }
             }
@@ -1519,9 +1666,7 @@ fn event_pump(
             last_sweep = now;
             for (&handle, fd) in watched.iter() {
                 if reports.owed(handle as u32)
-                    || last_report
-                        .get(&handle)
-                        .is_some_and(|&t| now.duration_since(t) < REPEAT)
+                    || !due_at(handle, now, &once, &last_report, &recheck)
                 {
                     continue;
                 }
@@ -1536,14 +1681,19 @@ fn event_pump(
                     } else {
                         0
                     };
-                    if reports.report(handle as u32, once.contains(&handle), status, None)
-                        == Sent::Pushed
-                    {
-                        if once.contains(&handle) {
-                            reported.push(handle);
-                        } else {
+                    match reports.report(handle as u32, once.contains(&handle), status, None) {
+                        Sent::Pushed if once.contains(&handle) => reported.push(handle),
+                        Sent::Pushed => {
                             last_report.insert(handle, now);
+                            recheck.remove(&handle);
                         }
+                        Sent::Coalesced => {
+                            recheck.insert(handle);
+                        }
+                        Sent::Dropped => {
+                            last_report.remove(&handle);
+                        }
+                        Sent::Queued => {}
                     }
                 }
             }
@@ -1589,22 +1739,40 @@ fn event_pump(
             let Some(fd) = watched.get(&(handle as u64)) else {
                 continue;
             };
-            let status = if fence { sync_file_status(fd.as_raw_fd()) } else { 0 };
+            let status = if fence {
+                sync_file_status(fd.as_raw_fd())
+            } else {
+                0
+            };
             match reports.report(handle, fence, status, batch.then_some(&mut pass)) {
                 Sent::Pushed if fence => reported.push(handle as u64),
                 Sent::Pushed => {
                     last_report.insert(handle as u64, Instant::now());
+                    recheck.remove(&(handle as u64));
                 }
-                // Counted (`EventReports`); a queued one goes out with the
-                // next buffer, a dropped one with the sweep.
-                Sent::Coalesced | Sent::Queued | Sent::Dropped => {}
+                // Counted (`EventReports`). A coalesced edge is asked again
+                // every sweep until it goes out; a queued one goes out with
+                // the next buffer; a dropped one with the next sweep.
+                Sent::Coalesced => {
+                    recheck.insert(handle as u64);
+                }
+                Sent::Dropped => {
+                    last_report.remove(&(handle as u64));
+                }
+                Sent::Queued => {}
             }
         }
         {
             let mut p = batch.then_some(&mut pass);
             reports.flush(&mut p, &mut delivered);
         }
-        settle(&mut delivered, &mut watched, &mut once, &mut last_report);
+        settle(
+            &mut delivered,
+            &mut watched,
+            &mut once,
+            &mut last_report,
+            &mut recheck,
+        );
         pass.signal(&vring);
         // A fence the guest has heard about is done here. Its descriptor
         // stays open until the guest closes the handle.
@@ -1948,7 +2116,12 @@ impl NvGpuBackend {
                 warned_small: std::sync::atomic::AtomicBool::new(false),
             });
             link.set_release_sink(sink.clone());
-            link.set_presented_sink(sink);
+            match PresentedRelay::start(sink.clone()) {
+                Ok(relay) => link.set_presented_sink(relay),
+                Err(e) => {
+                    log::warn!("display: presentation reports off ({e}): no thread for them");
+                }
+            }
             display_link = Some(link.clone());
             nvidia.set_display(link);
         }
@@ -2923,6 +3096,48 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_event_file_the_guest_was_told_about_is_asked_again_only_when_idle() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, Instant};
+        let (rep, idle) = (Duration::from_millis(10), Duration::from_secs(1));
+        let t0 = Instant::now();
+        let mut once = HashSet::new();
+        let mut last = HashMap::new();
+        let mut recheck = HashSet::new();
+        // Never reported: due.
+        assert!(super::sweep_due(8, t0, &once, &last, &recheck, rep, idle));
+        // An event file reported 20 ms ago is not asked (was: every 10 ms).
+        last.insert(8, t0);
+        let t = t0 + Duration::from_millis(20);
+        assert!(!super::sweep_due(8, t, &once, &last, &recheck, rep, idle));
+        assert!(super::sweep_due(
+            8,
+            t0 + idle,
+            &once,
+            &last,
+            &recheck,
+            rep,
+            idle
+        ));
+        // A coalesced edge is asked every sweep.
+        recheck.insert(8);
+        assert!(super::sweep_due(8, t, &once, &last, &recheck, rep, idle));
+        // A fence keeps the short repeat.
+        once.insert(9);
+        last.insert(9, t0);
+        assert!(!super::sweep_due(
+            9,
+            t0 + Duration::from_millis(5),
+            &once,
+            &last,
+            &recheck,
+            rep,
+            idle
+        ));
+        assert!(super::sweep_due(9, t, &once, &last, &recheck, rep, idle));
+    }
+
     use super::*;
 
     #[test]
