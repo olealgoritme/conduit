@@ -21,7 +21,12 @@
 //! FAILURE. Any shape the host cannot take, a blob that cannot be made, or a host that refuses
 //! the command answers `STATUS_UNSUCCESSFUL`, and dxgkrnl draws that shape in software, as
 //! before; the host image is hidden first so two cursors never show. A host that REFUSES the
-//! command (an old backend; `CurHostErr`) is not asked again in this generation.
+//! command (an old backend; `CurHostErr`) is not asked again in this generation. A command that
+//! only TIMED OUT is not a refusal (`hc::after_failure`): it is on the in-order control queue
+//! behind the Venus traffic and the host runs it late, so it counts as taken (`CurTmo`) and the
+//! host image stays. Falling back to software for it hid a working host cursor and left the
+//! pointer to DWM's frames, which froze it for as long as the backend was busy. A command that
+//! never reached the queue keeps the host image as it is and is sent again (`CurRetry`).
 //!
 //! GENERATIONS. Everything is per transport generation (`reset_for_start`): the blob belongs to
 //! the Venus client of one generation and its id may name another resource in the next. dxgkrnl
@@ -33,7 +38,7 @@
 //! taken only records the visibility, and the holder applies it before it lets go
 //! ([`settle`]). Both DDIs are PASSIVE.
 
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bytemuck::Zeroable;
 
@@ -43,7 +48,7 @@ use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use crate::virtio::gpu::OwnerFilter;
 use crate::virtio::VirtioError;
-use helios_kmd_logic::hw_cursor::{self as hc, Refuse, Shape, Slots};
+use helios_kmd_logic::hw_cursor::{self as hc, AfterFailure, HostFailure, Refuse, Shape, Slots};
 use helios_protocol::{
     HeliosSetCursorBlob, HELIOS_CURSOR_BLOB_F_VISIBLE, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
 };
@@ -82,7 +87,27 @@ static REFUSE: AtomicU32 = AtomicU32::new(0);
 static WHY: AtomicU32 = AtomicU32::new(0);
 static HOST_ERR: AtomicU32 = AtomicU32::new(0);
 static XOR: AtomicU32 = AtomicU32::new(0);
+static RTT_US: AtomicU32 = AtomicU32::new(0);
+static RTT_MAX: AtomicU32 = AtomicU32::new(0);
+static TMO: AtomicU32 = AtomicU32::new(0);
+static GATE_MS: AtomicU32 = AtomicU32::new(0);
+static SW_N: AtomicU32 = AtomicU32::new(0);
+static SW_MS: AtomicU32 = AtomicU32::new(0);
+static SW_MAX: AtomicU32 = AtomicU32::new(0);
+static RETRY: AtomicU32 = AtomicU32::new(0);
+/// When the current software-cursor episode began (0: none).
+static SW_SINCE: AtomicU64 = AtomicU64::new(0);
+/// When an owed command last failed to reach the queue (0: nothing to retry).
+static NOT_SENT_AT: AtomicU64 = AtomicU64::new(0);
 static DIRTY: AtomicU32 = AtomicU32::new(0);
+
+fn now_100ns() -> u64 {
+    crate::adapter::foreign_scanout::now_100ns()
+}
+
+fn ms_from_100ns(t: u64) -> u32 {
+    (t / 10_000).min(u64::from(u32::MAX)) as u32
+}
 
 fn bump(c: &AtomicU32) {
     c.fetch_add(1, Ordering::Relaxed);
@@ -108,6 +133,14 @@ fn write_block() {
     crate::diag::record_named_bytes(b"CurWhy", r(&WHY));
     crate::diag::record_named_bytes(b"CurHostErr", r(&HOST_ERR));
     crate::diag::record_named_bytes(b"CurXor", r(&XOR));
+    crate::diag::record_named_bytes(b"CurRttUs", r(&RTT_US));
+    crate::diag::record_named_bytes(b"CurRttMax", r(&RTT_MAX));
+    crate::diag::record_named_bytes(b"CurTmo", r(&TMO));
+    crate::diag::record_named_bytes(b"CurGateMs", r(&GATE_MS));
+    crate::diag::record_named_bytes(b"CurSwN", r(&SW_N));
+    crate::diag::record_named_bytes(b"CurSwMs", r(&SW_MS));
+    crate::diag::record_named_bytes(b"CurSwMax", r(&SW_MAX));
+    crate::diag::record_named_bytes(b"CurRetry", r(&RETRY));
 }
 
 /// From the periodic `scanout_trace` dump: the block, when a count moved. PASSIVE.
@@ -195,10 +228,13 @@ pub(crate) fn reset_for_start(adapter: &AdapterContext, knobs: &crate::adapter::
     let caps = hc::advertise(knobs.hw_cursor, knobs.display_half, host_features(adapter));
     CAPS.store(u32::from(caps), Ordering::Relaxed);
     for c in [
-        &SHAPE_N, &POS_N, &SHOW, &HIDE, &FMT, &SIZE, &REFUSE, &WHY, &HOST_ERR, &XOR,
+        &SHAPE_N, &POS_N, &SHOW, &HIDE, &FMT, &SIZE, &REFUSE, &WHY, &HOST_ERR, &XOR, &RTT_US,
+        &RTT_MAX, &TMO, &GATE_MS, &SW_N, &SW_MS, &SW_MAX, &RETRY,
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    SW_SINCE.store(0, Ordering::Relaxed);
+    NOT_SENT_AT.store(0, Ordering::Relaxed);
     DIRTY.store(0, Ordering::Relaxed);
     write_block();
 }
@@ -327,6 +363,19 @@ pub(crate) unsafe fn set_pointer_position(
         changed
     };
     if !changed {
+        // A command that never reached the queue is owed: try again, at most every 250 ms (this
+        // runs at mouse rate), and only when no other pointer operation does I/O.
+        let failed = NOT_SENT_AT.load(Ordering::Relaxed);
+        if failed != 0 && hc::retry_due(now_100ns(), failed) {
+            if let Some(gate) = Gate::try_take() {
+                NOT_SENT_AT.store(0, Ordering::Relaxed);
+                bump(&RETRY);
+                // SAFETY: PASSIVE per the DDI contract.
+                let passive = unsafe { PassiveLevel::assume() };
+                let _ = settle(passive, adapter);
+                drop(gate);
+            }
+        }
         return STATUS_SUCCESS;
     }
     DIRTY.store(1, Ordering::Relaxed);
@@ -345,6 +394,13 @@ pub(crate) unsafe fn set_pointer_position(
 fn refuse(passive: PassiveLevel, adapter: &AdapterContext, why: Refuse) -> NTSTATUS {
     bump(&REFUSE);
     set(&WHY, why.code());
+    // A software-cursor episode starts (it ends when the host shows a shape again).
+    if SW_SINCE
+        .compare_exchange(0, now_100ns().max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        bump(&SW_N);
+    }
     let shown = {
         let mut st = STATE.lock();
         st.shape = None;
@@ -373,12 +429,21 @@ impl Gate {
     }
 
     fn wait(passive: PassiveLevel) -> Option<Gate> {
+        let t0 = now_100ns();
+        let note = || {
+            let ms = ms_from_100ns(now_100ns().saturating_sub(t0));
+            if ms > GATE_MS.fetch_max(ms, Ordering::Relaxed) {
+                DIRTY.store(1, Ordering::Relaxed);
+            }
+        };
         for _ in 0..BUSY_WAIT_MS {
             if let Some(g) = Self::try_take() {
+                note();
                 return Some(g);
             }
             crate::virtio::ctrl::sleep_ms(passive, 1);
         }
+        note();
         Self::try_take()
     }
 }
@@ -393,7 +458,8 @@ impl Drop for Gate {
 /// settle once more if something is owed and nobody else holds the gate.
 fn after_gate(passive: PassiveLevel, adapter: &AdapterContext) {
     for _ in 0..4 {
-        if STATE.lock().owed().is_none() {
+        // A command that could not be queued is retried later, rate limited, not here.
+        if STATE.lock().owed().is_none() || NOT_SENT_AT.load(Ordering::Relaxed) != 0 {
             return;
         }
         let Some(gate) = Gate::try_take() else {
@@ -412,23 +478,54 @@ fn settle(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
             return true;
         };
         let show = cmd.flags & HELIOS_CURSOR_BLOB_F_VISIBLE != 0;
+        let t0 = now_100ns();
         let result = crate::virtio::ctrl::set_cursor_blob(passive, adapter, cmd, HOST_TIMEOUT_MS);
+        let t1 = now_100ns();
+        let rtt = (t1.saturating_sub(t0) / 10).min(u64::from(u32::MAX)) as u32;
+        let failure = match result {
+            Ok(()) => None,
+            Err(VirtioError::Timeout) => Some(HostFailure::Late),
+            // An answer with an error, or the transport gone: the host will not show it.
+            Err(VirtioError::DeviceError) => Some(HostFailure::Refused),
+            Err(_) => Some(HostFailure::NotSent),
+        };
         let mut st = STATE.lock();
-        match result {
-            Ok(()) => {
+        match failure.map(hc::after_failure) {
+            None | Some(AfterFailure::AssumeTaken) => {
                 st.host_shown = show;
                 if show {
                     st.shape_dirty = false;
                 }
                 drop(st);
-                bump(if show { &SHOW } else { &HIDE });
-            }
-            Err(e) => {
-                // A refusal is an answer (an old backend): do not ask again this generation. A
-                // timeout or a transport error is not; the next shape tries again.
-                if matches!(e, VirtioError::DeviceError) {
-                    st.host_refused = true;
+                NOT_SENT_AT.store(0, Ordering::Relaxed);
+                if failure.is_some() {
+                    bump(&TMO);
+                } else {
+                    RTT_US.store(rtt, Ordering::Relaxed);
+                    RTT_MAX.fetch_max(rtt, Ordering::Relaxed);
                 }
+                bump(if show { &SHOW } else { &HIDE });
+                if show {
+                    // The host shows a shape again: a software-cursor episode, if any, ends.
+                    let since = SW_SINCE.swap(0, Ordering::Relaxed);
+                    if since != 0 {
+                        let ms = ms_from_100ns(t1.saturating_sub(since));
+                        SW_MS.store(ms, Ordering::Relaxed);
+                        SW_MAX.fetch_max(ms, Ordering::Relaxed);
+                    }
+                }
+            }
+            Some(AfterFailure::RetryLater) => {
+                // Never queued: the host image stays as it was; the command stays owed and a
+                // later pointer call sends it (`set_pointer_position`, rate limited).
+                drop(st);
+                NOT_SENT_AT.store(t1.max(1), Ordering::Relaxed);
+                bump(&HOST_ERR);
+                return true;
+            }
+            Some(AfterFailure::SoftwareCursor) => {
+                // A refusal is an answer (an old backend): do not ask again this generation.
+                st.host_refused = true;
                 st.shape_dirty = false;
                 if !show {
                     // A hide the host did not take: assume nothing of ours is shown from here.
