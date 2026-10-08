@@ -649,6 +649,14 @@ unsafe fn foreign_arm(
     else {
         return skip(Why::NoDestinationDesc);
     };
+    // The source's (0, 0) in the surface: `DstRect` minus `SrcRect` (equal sizes, `rects`); a
+    // `SrcRect` origin past the `DstRect` one cannot be placed.
+    let (Some(place_x), Some(place_y)) = (
+        dst_rect.left.checked_sub(src_rect.left),
+        dst_rect.top.checked_sub(src_rect.top),
+    ) else {
+        return skip(Why::Rect);
+    };
     let t_rt = crate::ddi::blt_async::now_100ns();
     // SAFETY: the caller's contract.
     let token = unsafe {
@@ -666,6 +674,8 @@ unsafe fn foreign_arm(
                 pitch: dst.pitch,
                 dxgi_format: destination_dxgi,
                 alloc_size: dst.size,
+                x: place_x,
+                y: place_y,
             },
             boundary,
         )
