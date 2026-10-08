@@ -573,7 +573,7 @@ pub const COUNTERS: &[&str] = &[
     // the Present (`ddi/vram_redirect.rs`)
     "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
-    "RvSysMade", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak",
+    "RvSysMade", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak", "RvSysObj",
 ];
 
 /// The files that write [`COUNTERS`] (relative to `kmd_render/src`).

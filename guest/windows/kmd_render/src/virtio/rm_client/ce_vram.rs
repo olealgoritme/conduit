@@ -193,13 +193,51 @@ fn surface_of(obj: &super::vidmem::VramObject, m: &Mapped) -> CeSurface {
     }
 }
 
+/// The GPU VA of the KMD RM object behind `resource_id` in the channel, mapped on demand: a VRAM
+/// surface of the `vidmem` service, or a GDI staging buffer of the `sysmem` service (RM system
+/// memory, `RedirVram`). The VA of byte 0; the caller knows the layout. PASSIVE, no lock held but
+/// possibly the content transaction (the order is content -> channel I/O); takes the channel's
+/// I/O without waiting (`BUSY`).
+pub(crate) fn ce_object_va(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) -> Result<u64, Fail> {
+    if let Some(m) = BOOK.lock().maps.find(resource_id) {
+        return Ok(m.va);
+    }
+    let (client, memory, size, sysmem) = rm_object(resource_id).ok_or(NOT_VRAM)?;
+    with_io(passive, adapter, |io, h| map_object(io, h, resource_id, client, memory, size, sysmem))
+}
+
+/// `(client, memory, size, is system memory)` of a KMD RM object.
+fn rm_object(resource_id: u32) -> Option<(u32, u32, u64, bool)> {
+    if let Some(o) = super::vidmem::lookup(resource_id) {
+        return Some((o.client, o.memory, o.size, false));
+    }
+    super::sysmem::object(resource_id).map(|(c, m, s)| (c, m, s, true))
+}
+
 /// The mapping of `resource_id`, made if needed. The caller holds the channel's I/O.
 fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, Fail> {
     let obj = super::vidmem::lookup(resource_id).ok_or(NOT_VRAM)?;
-    let len = rv::map_len(obj.size).ok_or(BAD_SHAPE)?;
+    let va = map_object(io, h, resource_id, obj.client, obj.memory, obj.size, false)?;
+    let m = BOOK.lock().maps.find(resource_id).ok_or(BAD_SHAPE)?;
+    debug_assert_eq!(m.va, va);
+    Ok(surface_of(&obj, &m))
+}
+
+/// Dup `(client, memory)` into the channel's client and map it at a slot's window (VRAM: big pages
+/// first; system memory: the snooped system flags first). The caller holds the channel's I/O.
+fn map_object(
+    io: &Io<'_>,
+    h: &Handles,
+    resource_id: u32,
+    client: u32,
+    memory: u32,
+    size: u64,
+    sysmem: bool,
+) -> Result<u64, Fail> {
+    let len = rv::map_len(helios_kmd_logic::round_up_page(size)).ok_or(BAD_SHAPE)?;
     let plan = BOOK.lock().maps.plan(resource_id);
     let slot = match plan {
-        MapPlan::Hit(m) => return Ok(surface_of(&obj, &m)),
+        MapPlan::Hit(m) => return Ok(m.va),
         MapPlan::Make { slot, evict } => {
             if let Some(old) = evict {
                 BOOK.lock().maps.remove(old.slot);
@@ -209,17 +247,22 @@ fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, F
         }
     };
     let (h_dup, h_virt) = rv::map_handles(slot);
-    if let Err(f) = dup(io, h, h_dup, obj.client, obj.memory) {
+    if let Err(f) = dup(io, h, h_dup, client, memory) {
         MAP_FAIL.fetch_add(1, Ordering::Relaxed);
         MAP_STAT.store(cc::fail_word(f), Ordering::Relaxed);
         ce::note_rm_error();
         return Err(f);
     }
     let va = rv::map_va(slot);
-    let mut mapped = ce::gpu_map_with(io, h, h_virt, h_dup, va, len, rv::map_flags_first(), None);
+    let (first, second) = if sysmem {
+        (rv::map_flags_second(), rv::map_flags_first())
+    } else {
+        (rv::map_flags_first(), rv::map_flags_second())
+    };
+    let mut mapped = ce::gpu_map_with(io, h, h_virt, h_dup, va, len, first, None);
     if let Err(f) = mapped {
         if f.kind == FailKind::Rm {
-            mapped = ce::gpu_map_with(io, h, h_virt, h_dup, va, len, rv::map_flags_second(), None);
+            mapped = ce::gpu_map_with(io, h, h_virt, h_dup, va, len, second, None);
         }
     }
     match mapped {
@@ -228,8 +271,7 @@ fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, F
             let mut b = BOOK.lock();
             b.maps.insert(slot, resource_id, g.va, len);
             refresh_any(&b);
-            let m = b.maps.find(resource_id).ok_or(BAD_SHAPE)?;
-            Ok(surface_of(&obj, &m))
+            Ok(g.va)
         }
         Err(f) => {
             MAP_FAIL.fetch_add(1, Ordering::Relaxed);

@@ -2921,6 +2921,50 @@ fn build_backing(
             }
         }
         Backing::KmdStandardBuffer { size, primary } => {
+            // `RedirVram` (docs/vram-redirection.md 8; one relaxed load otherwise): a CPU-visible
+            // GDI staging buffer (`D3DKMDT_GDISURFACE_STAGING_CPUVISIBLE`) from CACHED RM system
+            // memory, adopted as a foreign resource of the KMD's own, so the copy engine reaches it
+            // by RM object while it sits in segment 2 (`ce_sysmem`). Its paging and CPU view are
+            // a standard buffer's (`PresentLinearBuffer`); any refusal: the Venus blob below.
+            let std_type = (meta.misc_flags >> 24) & 0xF;
+            let gdi_type = (meta.misc_flags >> 20) & 0xF;
+            if !primary
+                && std_type == helios_kmd_logic::rm_standard::STD_GDISURFACE
+                && gdi_type == helios_kmd_logic::rm_standard::GDI_STAGING_CPUVISIBLE
+            {
+                if let Some(rm) = crate::virtio::rm_client::sysmem::try_create_standard(
+                    passive,
+                    adapter,
+                    meta.width,
+                    meta.height,
+                    meta.dxgi_format,
+                ) {
+                    if rm.layout.stride == meta.pitch {
+                        return Ok(CreatedBacking {
+                            resource_id: rm.resource_id,
+                            venus_memory_id: 0,
+                            venus_image_id: 0,
+                            pitch: rm.layout.stride,
+                            plane_offset: 0,
+                            dxgi_format: meta.dxgi_format,
+                            venus_alloc_size: rm.size,
+                            memory_type_index: 0,
+                            blob_size: BackingSize::HostAuthoritative(rm.size),
+                            system_backing_policy: SystemBackingPolicy::PresentLinearBuffer,
+                            dedicated_present_buffer: false,
+                            foreign: ForeignBacking::Adopted(rm.layout),
+                        });
+                    }
+                    // The authored pitch must be the RM layout's (both are `cross_adapter_pitch`);
+                    // a disagreement gives the allocation back to Venus.
+                    crate::virtio::ctrl::release_allocation_resource(
+                        passive,
+                        adapter,
+                        adapter.venus_ctx_id(),
+                        rm.resource_id,
+                    );
+                }
+            }
             // KMD-originated standard allocation (indirect-swapchain backbuffer,
             // GDI redirection/staging surface). Back it with a REAL venus
             // `VkDeviceMemory` blob through the kernel venus client: user-mode

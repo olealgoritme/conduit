@@ -81,6 +81,8 @@ static REFUSE: AtomicU32 = AtomicU32::new(0);
 static WHY: AtomicU32 = AtomicU32::new(0);
 static FREED: AtomicU32 = AtomicU32::new(0);
 static LEAK: AtomicU32 = AtomicU32::new(0);
+/// Calls served by the buffer's own RM system-memory object (not system-resident).
+static OBJ: AtomicU32 = AtomicU32::new(0);
 
 fn refresh_any(g: &State) {
     ANY.store(u32::from(g.slots.iter().any(Option::is_some)), Ordering::Release);
@@ -88,14 +90,17 @@ fn refresh_any(g: &State) {
 
 /// StartDevice (PASSIVE): zero the counters.
 pub(crate) fn reset_for_start() {
-    for c in [&MADE, &HIT, &REFUSE, &WHY, &FREED, &LEAK] {
+    for c in [&MADE, &HIT, &REFUSE, &WHY, &FREED, &LEAK, &OBJ] {
         c.store(0, Ordering::Relaxed);
     }
 }
 
 /// Mirror the counters (PASSIVE), once a descriptor was asked for.
 pub(crate) fn publish_counters() {
-    if MADE.load(Ordering::Relaxed) == 0 && REFUSE.load(Ordering::Relaxed) == 0 {
+    if MADE.load(Ordering::Relaxed) == 0
+        && REFUSE.load(Ordering::Relaxed) == 0
+        && OBJ.load(Ordering::Relaxed) == 0
+    {
         return;
     }
     use crate::diag::record_named_bytes as rec;
@@ -105,6 +110,7 @@ pub(crate) fn publish_counters() {
     rec(b"RvSysWhy", WHY.load(Ordering::Relaxed));
     rec(b"RvSysFreed", FREED.load(Ordering::Relaxed));
     rec(b"RvSysLeak", LEAK.load(Ordering::Relaxed));
+    rec(b"RvSysObj", OBJ.load(Ordering::Relaxed));
 }
 
 fn refuse(f: Fail) -> Fail {
@@ -126,13 +132,49 @@ pub(crate) fn with_standard<R>(
     height: u32,
     f: impl FnOnce(&CeSurface) -> R,
 ) -> Result<R, Fail> {
+    let r = with_standard_inner(passive, adapter, resource_id, pitch, width, height, f);
+    // Every call, refusals included (360.1 wrote nothing on a pure-refusal run).
+    publish_counters();
+    r
+}
+
+fn with_standard_inner<R>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    f: impl FnOnce(&CeSurface) -> R,
+) -> Result<R, Fail> {
     let Some(guard) = adapter.system_backings.serialize(passive) else {
         return Err(refuse(NOT_SYSTEM));
     };
-    let s = surface_locked(passive, adapter, &guard, resource_id, pitch, width, height)?;
+    // In system pages (leases): the OS descriptor over them. Not system-resident: the buffer's own
+    // RM object, when the KMD made it from RM system memory (`sysmem::try_create_standard`, a GDI
+    // staging buffer under `RedirVram`): in segment 2 that memory IS its content (the CPU host
+    // aperture maps it), and the content transaction keeps a paging transfer out meanwhile.
+    let s = if guard.snapshot(resource_id).is_some() {
+        surface_locked(passive, adapter, &guard, resource_id, pitch, width, height)?
+    } else if crate::virtio::rm_client::sysmem::object(resource_id).is_some() {
+        if guard.system_copy_invalid(resource_id) {
+            return Err(refuse(NOT_SYSTEM));
+        }
+        let va = ce_vram::ce_object_va(passive, adapter, resource_id).map_err(refuse)?;
+        OBJ.fetch_add(1, Ordering::Relaxed);
+        CeSurface {
+            va,
+            pitch,
+            width,
+            height,
+            fourcc: 0,
+            chan_gen: ce_vram::chan_gen(),
+        }
+    } else {
+        return Err(refuse(NOT_SYSTEM));
+    };
     let r = f(&s);
     drop(guard);
-    publish_counters();
     Ok(r)
 }
 

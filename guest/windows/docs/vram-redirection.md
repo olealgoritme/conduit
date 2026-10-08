@@ -451,7 +451,19 @@ copy (`ce_vram::copy` with this surface on one side, waited inside the closure).
 while the buffer is in segment 2 (no leases) or its system copy is stale: then the bounce path.
 Descriptors are cached per resource and freed before any lease change (the `guest_blob` paging hooks),
 at destroy, at the channel's teardown; an unconfirmed free leaks the pin until the generation ends.
-Counters `RvSysMade RvSysHit RvSysRefuse RvSysWhy RvSysFreed RvSysLeak`.
+Counters `RvSysMade RvSysHit RvSysRefuse RvSysWhy RvSysFreed RvSysLeak RvSysObj`.
+
+360.1: every `with_standard` call was refused (`GdiSysRef` 136) and no `RvSys*` value was written (the
+refusal path returned before the publish; fixed: published on every call). The cause: CDD's GDI staging
+buffers sit in segment 2 (the Venus window), so they have no system-page leases (the KMD takes leases
+only on an eviction transfer; an aperture-only placement would not create any either: an allocation
+placed in system memory from the start is never transferred). Fix: under `RedirVram`, a
+`STAGING_CPUVISIBLE` GDI buffer is CACHED RM system memory from the level 5 service
+(`sysmem::try_create_standard`, adopted as a KMD_RM foreign resource, `PresentLinearBuffer` paging);
+in segment 2 its CPU view is that memory (the CPU host aperture maps its `RM_EXPORT` blob) and
+`with_standard` maps the RM object itself on the CE (`ce_vram::ce_object_va`, `RvSysObj`); in system
+pages it uses the OS descriptor over the leases as before. The level 5 counters (`RmSysTry`, `RmSysOk`,
+`RmSysVenus`, `RmSysWhy`, `RmSysTrial`, `RmSysMis`) count these creations.
 
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
