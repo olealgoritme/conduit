@@ -139,6 +139,7 @@ def main():
     stacks = {}                       # (ts, tid) -> [frame names, innermost first]
     stack_by_ts = {}                  # ts -> (ts, tid) of the first stack at it
     cur_stack = None
+    readied = {}                      # tid -> (ts, who readied it) most recent
     proc_tids = set()
     first_ts = last_ts = None
 
@@ -159,6 +160,29 @@ def main():
                 continue
             if kind == "Stack" and "TimeStamp" in row[1:3]:
                 headers["Stack"] = row
+                continue
+            if kind == "ReadyThread" and "TimeStamp" in row[1:3]:
+                headers["ReadyThread"] = row
+                continue
+            if kind == "ReadyThread" and a.waits and "ReadyThread" in headers:
+                # Who made a thread runnable: the current thread (or a DPC on its
+                # CPU) readies "Rdy TID".
+                h = headers["ReadyThread"]
+                col = {n: i for i, n in enumerate(h)}
+                rdy = next((i for n, i in col.items() if n.startswith("Rdy") and "TID" in n), None)
+                who_p = col.get("Process Name ( PID)")
+                who_t = col.get("ThreadID")
+                dpc = col.get("InDPC")
+                if rdy is None or who_p is None or who_t is None:
+                    continue
+                try:
+                    ts = int(row[col["TimeStamp"]])
+                except (ValueError, KeyError, IndexError):
+                    continue
+                who = "%s tid %s" % (row[who_p].split("(")[0].strip(), row[who_t])
+                if dpc is not None and dpc < len(row) and row[dpc].strip() not in ("0", "", "False"):
+                    who = "DPC on " + row[who_p].split("(")[0].strip()
+                readied[row[rdy]] = (ts, who)
                 continue
             if kind == "Stack" and a.waits:
                 h = headers.get("Stack")
@@ -220,7 +244,9 @@ def main():
                     proc_tids.add(ntid)
                     if ntid in last_out:
                         out = last_out.pop(ntid)
-                        off_iv.append((ntid, out, ts - out))
+                        r = readied.get(ntid)
+                        who = r[1] if r and out <= r[0] <= ts else "?"
+                        off_iv.append((ntid, out, ts - out, who))
                     last_in[ntid] = ts
                 if proc_re.search(row[col["New Process Name ( PID)"]]):
                     tid = row[col["New TID"]]
@@ -287,7 +313,7 @@ def report_waits(a, dlls, modules, on_cpu, off_iv, stacks, stack_by_ts, first_ts
         print("--waits: no switch-ins of %s threads after a switch-out" % a.process)
         return
     off_total = collections.Counter()
-    for tid, _, us in off_iv:
+    for tid, _, us, _ in off_iv:
         off_total[tid] += us
     tids = a.thread or [t for t, _ in off_total.most_common(3)]
     # Name user-mode frames of modules given with --dll; others by the dumper's name.
@@ -299,7 +325,7 @@ def report_waits(a, dlls, modules, on_cpu, off_iv, stacks, stack_by_ts, first_ts
                 return mod, addr - base
         return None, 0
 
-    for tid, out, _ in off_iv:
+    for tid, out, _, _ in off_iv:
         if tid not in tids:
             continue
         for name, addr in stacks.get((out, tid)) or stacks.get(stack_by_ts.get(out), []) or []:
@@ -340,7 +366,9 @@ def report_waits(a, dlls, modules, on_cpu, off_iv, stacks, stack_by_ts, first_ts
     for tid in tids:
         by = collections.Counter()
         cnt = collections.Counter()
-        for t, out, us in off_iv:
+        woke = collections.Counter()
+        by_who = collections.defaultdict(collections.Counter)
+        for t, out, us, who in off_iv:
             if t != tid:
                 continue
             st = stacks.get((out, t))
@@ -350,6 +378,8 @@ def report_waits(a, dlls, modules, on_cpu, off_iv, stacks, stack_by_ts, first_ts
             sig = signature(st)
             by[sig] += us
             cnt[sig] += 1
+            woke[who] += us
+            by_who[sig][who] += us
         off = sum(by.values())
         print("\n== thread %s: on the CPU %.1f ms, off %.1f ms, window %.1f ms%s"
               % (tid, on_cpu[tid] / 1000.0, off / 1000.0, window / 1000.0,
@@ -359,6 +389,14 @@ def report_waits(a, dlls, modules, on_cpu, off_iv, stacks, stack_by_ts, first_ts
             print("%6.2f%% %9.1f ms %7d waits%s  %s" % (
                 100.0 * us / max(off, 1), us / 1000.0, cnt[sig],
                 ("  %6.0f us/frame" % (us / per)) if per else "", sig))
+            if any(w != "?" for w in by_who[sig]):
+                print("          woken by: " + ", ".join(
+                    "%s %.0f%%" % (w, 100.0 * v / max(us, 1)) for w, v in by_who[sig].most_common(4)))
+        if any(w != "?" for w in woke):
+            print("   off-CPU by who readied the thread (ReadyThread; 'DPC on X' = a DPC, e.g. the "
+                  "GPU interrupt path; a tid of this process = its own thread):")
+            for w, us in woke.most_common(10):
+                print("%6.2f%% %9.1f ms  %s" % (100.0 * us / max(off, 1), us / 1000.0, w))
 
 
 if __name__ == "__main__":
