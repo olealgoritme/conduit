@@ -441,6 +441,18 @@ foreign table's `FgOpen`, `FgRiOk`/`FgRiErr`/`FgRiRef` (DWM's NVK import by id) 
 `StdOGdiTex`/`StdOpenPid`. The UMD no longer treats a VRAM GDI texture as a Venus cross-context image
 when its open carries the foreign layout (`umd/src/forward/resource.rs`), so DWM's NVK takes the import.
 
+359.1 (with fallback A): the chain works end to end (`RvTry` = `RvOk`, `FgRiOk` 136, `RvXfer` 275
+without a failure, 68 CE fills), but staging <-> VRAM blits went through the bounce on the CPU (185
+`GdiFall`, `GdiUsMax` 105 ms). Added `ddi/ce_sysmem.rs`: `with_standard(passive, adapter, resource_id,
+pitch, width, height, |s: &CeSurface| ..)` maps a CPU-visible standard buffer's SYSTEM PAGES on the CE
+(an OS descriptor over its leases, the route's page-run rules, its own 8 slots: handles
+`H_BASE+0x140..`, windows 64..72), under the content transaction, so a staging <-> VRAM BitBlt is one CE
+copy (`ce_vram::copy` with this surface on one side, waited inside the closure). Refused (`NOT_SYSTEM`)
+while the buffer is in segment 2 (no leases) or its system copy is stale: then the bounce path.
+Descriptors are cached per resource and freed before any lease change (the `guest_blob` paging hooks),
+at destroy, at the channel's teardown; an unconfirmed free leaks the pin until the generation ends.
+Counters `RvSysMade RvSysHit RvSysRefuse RvSysWhy RvSysFreed RvSysLeak`.
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the

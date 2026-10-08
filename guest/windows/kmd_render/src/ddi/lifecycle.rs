@@ -244,6 +244,7 @@ fn start_generation_mirrors() {
     // `RedirVram` (docs/vram-redirection.md): the knob and the counters of the VRAM service.
     crate::virtio::rm_client::vidmem::reset_for_start();
     crate::ddi::vram_redirect::reset_for_start();
+    crate::ddi::ce_sysmem::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();
