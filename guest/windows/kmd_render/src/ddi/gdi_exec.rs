@@ -82,6 +82,12 @@ static SLOW_OP: AtomicU32 = AtomicU32::new(0);
 static FGN_CE: AtomicU32 = AtomicU32::new(0);
 static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
 static FGN_WHY: AtomicU32 = AtomicU32::new(0);
+/// Overlapping copies inside one surface (scrolls) seen, done on the copy engine as ordered
+/// non-overlapping bands, and the last refusal (1 not VRAM/staging, 2 view refused, 3 submit,
+/// 4 wait, 5 GdiOvl 0, 6 channel down).
+static OVL_N: AtomicU32 = AtomicU32::new(0);
+static OVL_CE: AtomicU32 = AtomicU32::new(0);
+static OVL_WHY: AtomicU32 = AtomicU32::new(0);
 
 fn sys_refused(why: u32, bit: u32) {
     SYS_WHY.store(why, Ordering::Relaxed);
@@ -130,11 +136,12 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 /// StartDevice (PASSIVE): zero everything, forget the jobs of the previous generation (their
 /// fences went with it).
 /// The bisect switches (`GdiFgn`, `GdiFgnAcq`, `GdiSysCe`, `GdiPair`), bits 0..3 of `PATHS`.
-static PATHS: AtomicU32 = AtomicU32::new(PATH_FGN | PATH_SYS | PATH_PAIR);
+static PATHS: AtomicU32 = AtomicU32::new(PATH_FGN | PATH_SYS | PATH_PAIR | PATH_OVL);
 const PATH_FGN: u32 = 1;
 const PATH_FGN_ACQ: u32 = 2;
 const PATH_SYS: u32 = 4;
 const PATH_PAIR: u32 = 8;
+const PATH_OVL: u32 = 16;
 
 fn path(bit: u32) -> bool {
     PATHS.load(Ordering::Relaxed) & bit != 0
@@ -156,11 +163,14 @@ pub(crate) fn reset_for_start(on: bool) {
         if rd(knobs::GDI_PAIR, 1) != 0 {
             p |= PATH_PAIR;
         }
+        if rd(knobs::GDI_OVL, 1) != 0 {
+            p |= PATH_OVL;
+        }
         PATHS.store(p, Ordering::Relaxed);
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &OVL_N, &OVL_CE, &OVL_WHY,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -206,6 +216,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiFgnFail", FGN_FAIL.load(Ordering::Relaxed));
     w(b"GdiFgnWhy", FGN_WHY.load(Ordering::Relaxed));
     w(b"GdiPaths", PATHS.load(Ordering::Relaxed));
+    w(b"GdiOvlN", OVL_N.load(Ordering::Relaxed));
+    w(b"GdiOvlCe", OVL_CE.load(Ordering::Relaxed));
+    w(b"GdiOvlWhy", OVL_WHY.load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
 }
 
@@ -242,6 +255,7 @@ pub(crate) fn warm_up(passive: PassiveLevel, adapter: &AdapterContext) {
 fn needs_channel(op: &Op) -> bool {
     op.engine == Engine::Ce
         || op.why == Some(Why::SystemSurface)
+        || op.why == Some(Why::Overlap)
         || [op.dst, op.srcs[0], op.srcs[1]]
             .iter()
             .flatten()
@@ -600,6 +614,15 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
                 run_cpu_counted(passive, adapter, op);
             }
         }
+        Engine::Cpu if op.why == Some(Why::Overlap) => {
+            // A scroll inside one surface: ordered non-overlapping copy-engine bands.
+            if run_overlap(passive, adapter, op) {
+                OVL_CE.fetch_add(1, Ordering::Relaxed);
+                BLT_N.fetch_add(1, Ordering::Relaxed);
+            } else {
+                run_cpu_counted(passive, adapter, op);
+            }
+        }
         Engine::Cpu => {
             // A copy or fill that touches a staging buffer: the copy engine over its system pages
             // first, the CPU only when that is refused.
@@ -733,6 +756,117 @@ fn map_pitch(s: &Surface, cmd_pitch: u32) -> u32 {
         s.pitch
     } else {
         pitch_of(s, cmd_pitch)
+    }
+}
+
+/// Submits `(src, dst)` band copies of one surface view in order (a ring-full submit waits for the
+/// previous push and tries once more), then waits for the last. `0` done, 3 submit, 4 wait.
+fn submit_bands(passive: PassiveLevel, v: &CeView, bands: &[(Rect, Rect)]) -> u32 {
+    let per = ga::rects_per_push(glue::SLOT_DWORDS, 0, ga::COPY_RECT_DWORDS).max(1);
+    let mut last: Option<u64> = None;
+    for chunk in bands.chunks(per) {
+        let push = |p: &mut cp::Push<'_>, gen: cp::Gen, done: cp::Release| {
+            for (s, d) in chunk {
+                ga::copy_rect(p, gen, v, s, v, d, false)?;
+            }
+            cp::release(p, done)
+        };
+        let v1 = match glue::submit(push) {
+            Some(x) => Some(x),
+            None => {
+                // Ring full (or a transient refusal): drain what is queued, then once more.
+                if !wait_last(passive, last) {
+                    return 4;
+                }
+                glue::submit(|p, gen, done| {
+                    for (s, d) in chunk {
+                        ga::copy_rect(p, gen, v, s, v, d, false)?;
+                    }
+                    cp::release(p, done)
+                })
+            }
+        };
+        let Some(x) = v1 else {
+            let _ = wait_last(passive, last);
+            return 3;
+        };
+        CE_SUB.fetch_add(1, Ordering::Relaxed);
+        last = Some(x);
+    }
+    if wait_last(passive, last) {
+        0
+    } else {
+        4
+    }
+}
+
+/// A SRCCOPY BitBlt whose source and destination overlap in one VRAM surface or staging buffer
+/// (a scroll; CDD sends these although the caps ask it not to, 365.1 `GdiSlowOp` 0x12211): ordered
+/// bands of `|dy|` rows (or `|dx|` columns) on the copy engine (`gdi_accel::split_overlap`).
+fn run_overlap(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
+    OVL_N.fetch_add(1, Ordering::Relaxed);
+    let fail = |why: u32| {
+        OVL_WHY.store(why, Ordering::Relaxed);
+        false
+    };
+    let (Some(dst), Cmd::BitBlt { src: sr, dst: dr, rop, .. }) = (op.dst, op.cmd) else {
+        return fail(1);
+    };
+    if rop != ga::rop::SRCCOPY || op.srcs[0].map(|s| s.resource_id) != Some(dst.resource_id) {
+        return fail(1);
+    }
+    if !path(PATH_OVL) {
+        return fail(5);
+    }
+    if glue::channel_state() != 0 {
+        return fail(6);
+    }
+    let mut bands: Vec<(Rect, Rect)> = Vec::new();
+    for sub in &op.subs {
+        let d = clip_to(sub, &dst);
+        let s = clip_to(&ga::bitblt_src(&d, &dr, &sr), &dst);
+        if d.is_empty() || s.width() != d.width() || s.height() != d.height() {
+            continue;
+        }
+        let mut ok = true;
+        let need = (d.height().max(d.width())) as usize + 1;
+        if bands.try_reserve(need).is_err() {
+            return fail(1);
+        }
+        ga::split_overlap(&s, &d, |a, b| {
+            if bands.try_reserve(1).is_ok() {
+                bands.push((a, b));
+            } else {
+                ok = false;
+            }
+        });
+        if !ok {
+            return fail(1);
+        }
+    }
+    if bands.is_empty() {
+        return true;
+    }
+    let step = match dst.class {
+        SurfaceClass::Vram => match glue::ce_surface(passive, adapter, dst.resource_id) {
+            Some(v) => submit_bands(passive, &v, &bands),
+            None => 2,
+        },
+        SurfaceClass::System => {
+            let (dpc, _) = cmd_pitches(&op.cmd);
+            match glue::with_standard(passive, adapter, dst.resource_id, map_pitch(&dst, dpc), dst.width, dst.height, |v| {
+                submit_bands(passive, v, &bands)
+            }) {
+                Ok(s) => s,
+                Err(_) => 2,
+            }
+        }
+        _ => 1,
+    };
+    if step == 0 {
+        true
+    } else {
+        fail(step)
     }
 }
 

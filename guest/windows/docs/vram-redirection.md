@@ -829,6 +829,15 @@ in 362-364 has its own service-key switch, read at StartDevice with `GdiAccel=1`
 | `GdiFgnAcq` | **0** | a foreign copy does not acquire the producer's semaphore (a copy-engine acquire cannot time out; a value never reached would stall the channel the Present route shares); the image is copied as it is in memory |
 | `GdiSysCe` | 1 | copies and fills over a staging buffer's copy-engine view are not tried; the CPU path runs them |
 | `GdiPair` | 1 | staging-to-staging copies between two buffers run on the CPU |
+| `GdiOvl` | 1 | an overlapping copy inside one surface (a scroll) runs on the CPU |
+
+**365.1:** the slowest command (25-34 ms, `GdiSlowOp` 0x12211/0x1012211) was an OVERLAPPING SRCCOPY
+inside one staging buffer: a scroll, which CDD sends despite `NoSameBitmapOverlappedBitBlt`. It is
+planned `Why::Overlap` and never reached the staging copy-engine path (nor `with_standard_pair`), so
+it ran as a full read-modify-write on the CPU. Since 367.1 it runs as ordered, non-overlapping
+copy-engine bands of `|dy|` rows (or `|dx|` columns) from the far side of the move
+(`gdi_accel::split_overlap`, checked against a model scroll in the tests) in one view of the surface;
+counters `GdiOvlN`, `GdiOvlCe`, `GdiOvlWhy`.
 
 Every wait of the executor is bounded: the copy-engine waits 100 ms (the job's command is then
 redone on the CPU or dropped), `ce_sysmem`'s channel I/O 250 ms, the RM calls their bounded sections,
