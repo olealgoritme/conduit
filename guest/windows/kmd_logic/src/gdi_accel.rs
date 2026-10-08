@@ -1589,6 +1589,18 @@ pub const COUNTERS: &[&str] = &[
     "GdiOvlN",
     "GdiOvlCe",
     "GdiOvlWhy",
+    // Commands dropped because a foreign image is in them other than as a SRCCOPY source, and the
+    // last one's signature (opcode | foreign dst << 8 | foreign src << 9 | rop << 16).
+    "GdiFgnDrop",
+    "GdiFgnOp",
+    // The slowest job: its command count and its three slowest commands (GdiSlowOp signature, µs).
+    "GdiJobMaxN",
+    "GdiJobT1",
+    "GdiJobT1Us",
+    "GdiJobT2",
+    "GdiJobT2Us",
+    "GdiJobT3",
+    "GdiJobT3Us",
 ];
 
 #[cfg(test)]
