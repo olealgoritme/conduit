@@ -332,6 +332,10 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         mem_caps |= MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED
             | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
     }
+    // `VidMmCapsX` (default 0: `mem_caps` unchanged): the GPU-memory redirection experiment
+    // (`docs/vram-redirection.md` 5.2) may add `NonCpuVisiblePrimary` and nothing else.
+    let mem_caps = knobs.vidmm_caps(mem_caps).reported;
+    crate::diag::record_named_bytes(b"VmCapsRep", mem_caps);
 
     // No GDI hardware acceleration (see the note above): every documented
     // DXGK_PRESENTATIONCAPS bit stays clear.

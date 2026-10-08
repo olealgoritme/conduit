@@ -779,6 +779,12 @@ pub const COUNTERS: &[&str] = &[
     "CeRtFall",
     "CeRtWhy",
     "CeRtMask",
+    // NoRecord split: no record on the context, a record of another boundary (its low half, and
+    // the Present's).
+    "CeRtRecNone",
+    "CeRtRecKey",
+    "CeRtRecLast",
+    "CeRtRecWant",
     "CeRtDispFall",
     "CeRtClient",
     // Strikes against destinations, destinations struck out, route strikes, route off for the

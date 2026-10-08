@@ -357,6 +357,9 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // `RmCopyEngine` 1 (one relaxed load otherwise): the copy-engine route's bring-up,
         // completions and job preparation before the dispatch, a short settle after it.
         crate::ddi::ce_present_route::service(passive, adapter);
+        // `RedirVram`: the first clear of VRAM surfaces nothing has mapped yet (one relaxed load
+        // with none alive).
+        crate::virtio::rm_client::ce_vram::clear_pending(passive, adapter);
         crate::ddi::display::service_windowed_blt(passive, adapter);
         crate::ddi::ce_present_route::settle_after_dispatch(passive, adapter);
 

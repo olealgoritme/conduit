@@ -20,8 +20,15 @@ use super::*;
 use helios_kmd_logic::nvrm_fence::NVGPU_CFG_DRM_FENCES;
 use helios_kmd_logic::rm_fence_present::{Attach, Gate, GateError, GATE_POINTS};
 
-/// Most processes with a live gate at once.
-pub(super) const MAX_RM_GATES: usize = 8;
+/// Most processes with a live gate at once. A gate lives until its process exits, and each takes
+/// one of the 64 present-stream slots. 8 was too few once every NVK process presents with an RM
+/// fence (`DwmIcd=nvk` and the NVK desktop): 376.1 had about 15 explorer.exe processes plus DWM,
+/// Notepad and Heaven, and every present of a process past the eighth was refused `NoRoom`
+/// (`RmGRef` 11851 = `RmGTake`), so its Blt reached the copy-engine route with no boundary
+/// (`CeRtWhy` 1 on every one). 32 leaves half the stream slots to Venus streams.
+pub(super) const MAX_RM_GATES: usize = 32;
+const _: () = assert!(MAX_RM_GATES <= u8::MAX as usize);
+const _: () = assert!(MAX_RM_GATES <= helios_kmd_logic::present_stream::MAX_STREAMS / 2);
 
 /// Points attached (`RmGAtt`), fired (`RmGFire`), fired with an error status
 /// (`RmGErr`), attached already fired (`RmGEarly`), cancelled by teardown
@@ -41,6 +48,11 @@ pub static RMG_TAKEN: AtomicU32 = AtomicU32::new(0);
 /// (`RmGExp`), and the knob in force (`RmGateMsEff`, 0 = never).
 pub static RMG_EXPIRED: AtomicU32 = AtomicU32::new(0);
 pub static RMG_EXPIRE_MS: AtomicU32 = AtomicU32::new(0);
+/// The last refusal of `rm_gate_attach` (`RmGWhy`: 1 unsupported, 2 not owned, 3 not a fence,
+/// 4 no gate or stream slot free, 5 the process's gate has no point free) and every reason seen
+/// (`RmGWhyMsk`, bit `1 << (code - 1)`).
+pub static RMG_WHY: AtomicU32 = AtomicU32::new(0);
+pub static RMG_WHY_MASK: AtomicU32 = AtomicU32::new(0);
 /// Gates open now (a count, not a counter): `DestroyProcess` reads it before it
 /// touches the adapter, so a process exit with no gate open costs one load.
 static RMG_OPEN: AtomicU32 = AtomicU32::new(0);
@@ -65,6 +77,8 @@ pub fn publish_rm_gate_counters() {
     rec(b"RmGTake", RMG_TAKEN.load(Ordering::Relaxed));
     rec(b"RmGExp", RMG_EXPIRED.load(Ordering::Relaxed));
     rec(b"RmGateMsEff", RMG_EXPIRE_MS.load(Ordering::Relaxed));
+    rec(b"RmGWhy", RMG_WHY.load(Ordering::Relaxed));
+    rec(b"RmGWhyMsk", RMG_WHY_MASK.load(Ordering::Relaxed));
 }
 
 /// One gate: the process it belongs to, the present-stream slot that carries its
@@ -197,9 +211,20 @@ impl VirtioGpu {
         fence: u32,
         process: usize,
     ) -> Result<GateAttached, GateRefusal> {
-        let refuse = |why: GateRefusal| {
+        let refuse_code = |why: GateRefusal, code: u32| {
             RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
+            RMG_WHY.store(code, Ordering::Relaxed);
+            RMG_WHY_MASK.fetch_or(1 << (code - 1), Ordering::Relaxed);
             Err(why)
+        };
+        let refuse = |why: GateRefusal| {
+            let code = match why {
+                GateRefusal::Unsupported => 1,
+                GateRefusal::NotOwned => 2,
+                GateRefusal::NotFence => 3,
+                GateRefusal::NoRoom => 4,
+            };
+            refuse_code(why, code)
         };
         if process == 0 || fence == 0 || !self.rm_fence_served() {
             return refuse(GateRefusal::Unsupported);
@@ -220,7 +245,7 @@ impl VirtioGpu {
                 if opened {
                     self.rm_gate_cancel(gi);
                 }
-                return refuse(GateRefusal::NoRoom);
+                return refuse_code(GateRefusal::NoRoom, 5);
             }
         }
         let early =

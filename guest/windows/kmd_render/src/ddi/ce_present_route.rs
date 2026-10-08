@@ -56,6 +56,10 @@ static ROUTED: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 static FALL: AtomicU32 = AtomicU32::new(0);
 static WHY: AtomicU32 = AtomicU32::new(0);
+static REC_NONE: AtomicU32 = AtomicU32::new(0);
+static REC_KEY: AtomicU32 = AtomicU32::new(0);
+static REC_LAST: AtomicU32 = AtomicU32::new(0);
+static REC_WANT: AtomicU32 = AtomicU32::new(0);
 static MASK: AtomicU32 = AtomicU32::new(0);
 static DISP_FALL: AtomicU32 = AtomicU32::new(0);
 static CLIENT: AtomicU32 = AtomicU32::new(0);
@@ -119,7 +123,7 @@ fn on() -> bool {
 /// (only with the route on: with the knob at 0 nothing here writes the registry).
 pub(crate) fn reset_for_start() {
     for c in [
-        &SEEN, &ROUTED, &DONE, &FALL, &WHY, &MASK, &DISP_FALL, &CLIENT, &STRIKE, &STRUCK,
+        &SEEN, &ROUTED, &DONE, &FALL, &WHY, &MASK, &REC_NONE, &REC_KEY, &REC_LAST, &REC_WANT, &DISP_FALL, &CLIENT, &STRIKE, &STRUCK,
         &CH_STRIKE, &OFF, &POISON, &LEAK, &TIMEOUT, &CH_FAIL, &TIMED_OUT, &UP, &INFL, &PEAK, &DEC_US, &DUP_US, &SUB_US,
         &DONE_US, &DONE_MAX, &POLL_US, &DST_NEW, &DST_DROP, &DST_LIVE, &RUNS, &DIR, &DIR_NO,
         &DIR_WHY, &DIR_US, &LAG,
@@ -150,6 +154,10 @@ fn write_counters() {
     rec(b"CeRtDone", DONE.load(Ordering::Relaxed));
     rec(b"CeRtFall", FALL.load(Ordering::Relaxed));
     rec(b"CeRtWhy", WHY.load(Ordering::Relaxed));
+    rec(b"CeRtRecNone", REC_NONE.load(Ordering::Relaxed));
+    rec(b"CeRtRecKey", REC_KEY.load(Ordering::Relaxed));
+    rec(b"CeRtRecLast", REC_LAST.load(Ordering::Relaxed));
+    rec(b"CeRtRecWant", REC_WANT.load(Ordering::Relaxed));
     rec(b"CeRtMask", MASK.load(Ordering::Relaxed));
     rec(b"CeRtDispFall", DISP_FALL.load(Ordering::Relaxed));
     rec(b"CeRtClient", CLIENT.load(Ordering::Relaxed));
@@ -183,6 +191,11 @@ fn write_counters() {
 }
 
 /// A Present (or a dispatch) keeps the Venus copy.
+/// The code of the route's last refusal (`CeRtWhy`), for a caller that falls back on its own.
+pub(crate) fn last_why() -> u32 {
+    WHY.load(Ordering::Relaxed)
+}
+
 fn fall(why: Why) {
     FALL.fetch_add(1, Ordering::Relaxed);
     WHY.store(why.code(), Ordering::Relaxed);
@@ -225,6 +238,8 @@ struct Payload {
     remap: cp::Remap,
     dst_pitch: u32,
     lines: u32,
+    /// Bytes from the destination's byte 0 to where the source's (0, 0) lands (`DstInfo::x/y`).
+    dst_offset: u64,
 }
 
 /// One destination: the pure record, the pin of its lease set while a descriptor may name it,
@@ -241,6 +256,10 @@ struct DstEntry {
     gone: bool,
     /// `[0, cover)`: `pitch * height` rounded up to pages (`guest_blob::cover_len`).
     cover: u64,
+    /// The destination is a KMD RM video-memory surface (`RedirVram`, `docs/vram-redirection.md`
+    /// 5.3): its "descriptor" is its mapping in the channel (`ce_vram`), it has no lease pages, no
+    /// pin and no OS descriptor to free.
+    vram: bool,
 }
 
 struct State {
@@ -309,6 +328,11 @@ pub(crate) struct DstInfo {
     pub pitch: u32,
     pub dxgi_format: u32,
     pub alloc_size: u64,
+    /// Where the source's pixel (0, 0) lands in the destination (`DstRect` minus `SrcRect`): 0 for
+    /// a Blt into a standard buffer (which must then be the source's size); a window's client
+    /// offset for a Blt into a VRAM redirection surface, which also holds the non-client area.
+    pub x: u32,
+    pub y: u32,
 }
 
 /// The Blt arm's `BltAsync` branch, before `blt_async::try_async`: take the copy-engine route
@@ -333,12 +357,54 @@ pub(crate) unsafe fn try_route(
     dst: DstInfo,
     boundary: Option<u64>,
 ) -> Option<u64> {
+    // SAFETY: the caller's contract.
+    unsafe { try_route_as(passive, adapter, args, context, source, destination, dst, boundary, false) }
+}
+
+/// [`try_route`] for a `RedirVram` destination (`docs/vram-redirection.md` 5.3): the Blt of an
+/// NVK-on-RM source into a KMD RM video-memory surface. Decided as a routed copy is, with the
+/// destination rule of [`vram_destination_facts`] in place of the lease rule; queued as a deferred
+/// WindowedBlt request whose destination is that image (its Venus copy into the imported image is
+/// the fallback the worker submits whenever the copy engine does not); the copy is VRAM to VRAM.
+/// `None`: nothing queued (counted), the caller decides what the Present does.
+///
+/// # Safety
+/// As [`try_route`].
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) unsafe fn try_route_vram(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    args: &DXGKARG_PRESENT,
+    context: Option<&ContextHandleRef<'_>>,
+    source: OptimalPresentImageDesc,
+    destination: PresentDestinationDesc,
+    dst: DstInfo,
+    boundary: Option<u64>,
+) -> Option<u64> {
+    // SAFETY: the caller's contract.
+    unsafe { try_route_as(passive, adapter, args, context, source, destination, dst, boundary, true) }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+unsafe fn try_route_as(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    args: &DXGKARG_PRESENT,
+    context: Option<&ContextHandleRef<'_>>,
+    source: OptimalPresentImageDesc,
+    destination: PresentDestinationDesc,
+    dst: DstInfo,
+    boundary: Option<u64>,
+    vram: bool,
+) -> Option<u64> {
     if !on() {
         return None;
     }
     let t0 = now_100ns();
     SEEN.fetch_add(1, Ordering::Relaxed);
-    let decided = decide_present(adapter, context, destination, dst, boundary);
+    let decided = decide_present(adapter, context, destination, dst, boundary, vram);
     add_us(&DEC_US, t0);
     let (payload, boundary) = match decided {
         Ok(v) => v,
@@ -347,6 +413,9 @@ pub(crate) unsafe fn try_route(
             return None;
         }
     };
+    // The latest validated record of this source image: a GDI command that later reads the same
+    // NVK image on the copy engine (`ce_vram::foreign_source`, `RedirVram`) acquires its semaphore.
+    remember_source_record(source.resource_id(), payload.rec, payload.presenter);
     // Queued exactly as a deferred `BltAsync` copy is (`ddi/blt_async.rs::deferred`): the Venus
     // copy prepared now is the fallback the worker submits whenever the copy engine does not.
     let no_mirror_knob = crate::ddi::blt_async::no_mirror_on();
@@ -356,6 +425,13 @@ pub(crate) unsafe fn try_route(
         });
         let prepared = match prepared {
             Ok(Ok(prepared)) => prepared,
+            // A VRAM destination Venus cannot import: the copy engine is its only copy.
+            Ok(Err(_)) | Err(_) if vram => {
+                match crate::virtio::venus::PreparedPresentBltSubmission::none(destination) {
+                    Some(p) => p,
+                    None => return Err(VirtioError::DeviceError),
+                }
+            }
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(VirtioError::DeviceError),
         };
@@ -376,7 +452,7 @@ pub(crate) unsafe fn try_route(
     // A job that could not be recorded leaves the request a plain deferred Venus copy.
     let recorded = {
         let mut g = STATE.lock();
-        let ok = ensure_dst(&mut g, dst) && g.jobs.add(token, boundary, dst.resource_id, payload);
+        let ok = ensure_dst_as(&mut g, dst, vram) && g.jobs.add(token, boundary, dst.resource_id, payload);
         refresh_active(&g);
         ok
     };
@@ -414,6 +490,44 @@ pub(crate) unsafe fn try_route(
     Some(token)
 }
 
+/// The latest record the route validated per source image (`RedirVram`'s GDI copies out of an NVK
+/// image take the producer's semaphore from it). Small, most recent first out.
+const SOURCE_RECORDS: usize = 8;
+static SOURCE_RECS: SpinLock<[(u32, Option<(StashedCeRecord, usize)>); SOURCE_RECORDS]> =
+    SpinLock::new([(0, None); SOURCE_RECORDS]);
+
+fn remember_source_record(resource_id: u32, rec: StashedCeRecord, presenter: usize) {
+    if resource_id == 0 {
+        return;
+    }
+    let mut t = SOURCE_RECS.lock();
+    let i = t.iter().position(|e| e.0 == resource_id).unwrap_or(SOURCE_RECORDS - 1);
+    // Move to the front.
+    let mut k = i;
+    while k > 0 {
+        t[k] = t[k - 1];
+        k -= 1;
+    }
+    t[0] = (resource_id, Some((rec, presenter)));
+}
+
+/// The latest record the route validated for the NVK image `resource_id`, if its two clients still
+/// belong to the process that presented it. Spinlock only (plus the client table's lock).
+pub(crate) fn source_record(adapter: &AdapterContext, resource_id: u32) -> Option<StashedCeRecord> {
+    let found = SOURCE_RECS
+        .lock()
+        .iter()
+        .find(|e| e.0 == resource_id)
+        .and_then(|e| e.1);
+    let (rec, presenter) = found?;
+    clients_still_owned(adapter, &rec, presenter).then_some(rec)
+}
+
+/// The transport generation ended: no record names a live client any more.
+pub(crate) fn forget_source_records() {
+    *SOURCE_RECS.lock() = [(0, None); SOURCE_RECORDS];
+}
+
 fn dir_no(why: cr::DirNo) {
     DIR_NO.fetch_add(1, Ordering::Relaxed);
     DIR_WHY.store(why.code(), Ordering::Relaxed);
@@ -427,8 +541,10 @@ fn push_of(p: &Payload, sem_va: u64, src_va: u64, dst_va: u64) -> (cp::Acquire, 
             value: p.rec.record.semaphore.value,
         },
         cp::CopyRect {
-            src_va: src_va.wrapping_add(p.plan.offset),
-            dst_va,
+            // `ce_dup`'s source VA already includes the plan's offset (as the shadow mode uses it):
+        // adding it again read `offset` bytes too far for a source with a nonzero offset.
+        src_va,
+            dst_va: dst_va + p.dst_offset,
             src_pitch: p.rec.record.source.pitch,
             dst_pitch: p.dst_pitch,
             line_bytes: p.plan.line_bytes,
@@ -526,6 +642,10 @@ fn try_direct(adapter: &AdapterContext, token: u64, boundary: u64, dst: u32) {
 
 /// The destination's record, made when there is none (a free slot). `false`: no room.
 fn ensure_dst(g: &mut State, dst: DstInfo) -> bool {
+    ensure_dst_as(g, dst, false)
+}
+
+fn ensure_dst_as(g: &mut State, dst: DstInfo, vram: bool) -> bool {
     if g.dst_index(dst.resource_id).is_some() {
         return true;
     }
@@ -542,6 +662,7 @@ fn ensure_dst(g: &mut State, dst: DstInfo) -> bool {
         orphan: None,
         gone: false,
         cover,
+        vram,
     });
     true
 }
@@ -554,11 +675,24 @@ fn decide_present(
     destination: PresentDestinationDesc,
     dst: DstInfo,
     boundary: Option<u64>,
+    vram: bool,
 ) -> Result<(Payload, u64), Why> {
     let Some(boundary) = boundary else {
         return Err(Why::NoBoundary);
     };
     let Some(rec) = context.and_then(|c| c.take_ce_record(boundary)) else {
+        // `CeRtRecNone`: no record on the context; `CeRtRecKey`: one of another boundary
+        // (`CeRtRecLast`: the stashed boundary's low half, `CeRtRecWant`: the Present's).
+        match context.map(|c| c.ce_record_miss(boundary)) {
+            Some((2, have)) => {
+                REC_KEY.fetch_add(1, Ordering::Relaxed);
+                REC_LAST.store(have, Ordering::Relaxed);
+                REC_WANT.store(boundary as u32, Ordering::Relaxed);
+            }
+            _ => {
+                REC_NONE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         return Err(Why::NoRecord);
     };
     let presenter = context.and_then(ContextHandleRef::creator_process).unwrap_or(0);
@@ -584,10 +718,14 @@ fn decide_present(
         }
     }
     let plan = match view.gen {
-        Some(gen) if view.up => source_facts(gen, &rec, dst),
+        Some(gen) if view.up => source_facts(gen, &rec, dst, vram),
         _ => Err(Why::ChannelDown),
     };
-    let destination_ok = destination_facts(adapter, destination, dst, presenter);
+    let destination_ok = if vram {
+        vram_destination_facts(destination, dst)
+    } else {
+        destination_facts(adapter, destination, dst, presenter)
+    };
     let (dst_state, room) = {
         let g = STATE.lock();
         let state = match g.dst_index(dst.resource_id).and_then(|i| g.dsts[i].as_ref()) {
@@ -618,7 +756,8 @@ fn decide_present(
             plan,
             remap,
             dst_pitch: dst.pitch,
-            lines: dst.height,
+            lines: rec.record.source.height,
+            dst_offset: u64::from(dst.y) * u64::from(dst.pitch) + u64::from(dst.x) * 4,
         },
         boundary,
     ))
@@ -629,6 +768,7 @@ fn source_facts(
     gen: cp::Gen,
     rec: &StashedCeRecord,
     dst: DstInfo,
+    vram: bool,
 ) -> Result<(SourcePlan, cp::Remap), Why> {
     let s = rec.record.source;
     let desc = SourceDesc {
@@ -644,7 +784,18 @@ fn source_facts(
     let plan = cp::source_plan(gen, &desc).map_err(|_| Why::Source)?;
     let dst_fourcc = cp::dst_fourcc_for_dxgi(dst.dxgi_format).ok_or(Why::Format)?;
     let remap = cp::remap_for(s.fourcc, dst_fourcc).map_err(|_| Why::Format)?;
-    if s.width != dst.width || s.height != dst.height || plan.line_bytes > dst.pitch {
+    // A standard buffer takes exactly the source's size at (0, 0). A VRAM window surface takes the
+    // whole source at (x, y) inside it (381.1: Heaven's 1600x900 frames into its window's larger
+    // surface were all `Extent`).
+    let fits = if vram {
+        s.width.checked_add(dst.x).is_some_and(|w| w <= dst.width)
+            && s.height.checked_add(dst.y).is_some_and(|h| h <= dst.height)
+            && u64::from(plan.line_bytes) + u64::from(dst.x) * 4 <= u64::from(dst.pitch)
+    } else {
+        dst.x == 0 && dst.y == 0 && s.width == dst.width && s.height == dst.height
+            && plan.line_bytes <= dst.pitch
+    };
+    if !fits {
         return Err(Why::Extent);
     }
     Ok((plan, remap))
@@ -681,6 +832,23 @@ fn destination_facts(
         .is_some_and(|r| !r.may_unlock())
     {
         return Err(Why::GuestBlob);
+    }
+    Ok(())
+}
+
+/// A `RedirVram` destination: a pitch-linear KMD RM video-memory surface (an optimal-image
+/// destination the VRAM service made) that fits one channel window.
+fn vram_destination_facts(destination: PresentDestinationDesc, dst: DstInfo) -> Result<(), Why> {
+    if !matches!(destination, PresentDestinationDesc::OptimalImage(_)) {
+        return Err(Why::Destination);
+    }
+    let Some(obj) = crate::virtio::rm_client::vidmem::lookup(dst.resource_id) else {
+        return Err(Why::Destination);
+    };
+    let cover = helios_kmd_logic::guest_blob::cover_len(obj.pitch, obj.height, obj.size)
+        .map_err(|_| Why::Destination)?;
+    if !cr::fits_window(cover) || obj.pitch != dst.pitch || obj.width != dst.width || obj.height != dst.height {
+        return Err(Why::Destination);
     }
     Ok(())
 }
@@ -743,8 +911,10 @@ pub(crate) fn dispatch(adapter: &AdapterContext, token: u64, boundary: u64) -> b
     };
     let p = job.payload;
     let copy = cp::CopyRect {
-        src_va: src_va.wrapping_add(p.plan.offset),
-        dst_va,
+        // `ce_dup`'s source VA already includes the plan's offset (as the shadow mode uses it):
+        // adding it again read `offset` bytes too far for a source with a nonzero offset.
+        src_va,
+        dst_va: dst_va + p.dst_offset,
         src_pitch: p.rec.record.source.pitch,
         dst_pitch: p.dst_pitch,
         line_bytes: p.plan.line_bytes,
@@ -823,9 +993,23 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         rio::bring_up(passive, adapter);
     }
     if ACTIVE.load(Ordering::Acquire) == 0 {
+        // Nothing of the route's in flight, but another user of the channel (the GDI executor's
+        // copies, `RedirVram`'s transfers, `ce_vram::wait` on a timeout) may have broken it: tear it
+        // down now (no route job to discharge, so `fail_channel` does nothing else), so the next
+        // bring-up makes a fresh one instead of the channel staying broken for the generation.
+        if rio::chan_view().broken {
+            fail_channel(passive, adapter);
+        }
         return;
     }
-    settle(passive, adapter, false);
+    // With copies in flight, spin briefly (`SETTLE_SPIN_US`) for them: a pass woken by a
+    // producer's fence event otherwise looks once, before the copy behind that acquire has run,
+    // and the next look is the timed wait's (a timer quantum, about 15.6 ms). Until a copy is
+    // retired, the app's next command list that touches the Blt source waits on the GPU for its
+    // read-ledger claim, and DXGI's frame-latency wait blocks Present, where
+    // `settle_from_present` would run (383.1, `RvOff` 0x1000: 85 fps, MsGPUBusy 11.8).
+    let spin = INFL.load(Ordering::Relaxed) != 0;
+    settle(passive, adapter, spin);
     // `poll` (inside `settle`) breaks a channel whose error notifier is set; a copy that timed
     // out broke it there too.
     if rio::chan_view().broken {
@@ -835,6 +1019,16 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     prepare(passive, adapter);
     let g = STATE.lock();
     refresh_active(&g);
+}
+
+/// From a Present into a VRAM surface (`RedirVram` with the route opted in): retire whatever the
+/// route's copies completed, without spinning. PASSIVE, no lock held. One relaxed load with
+/// nothing in flight.
+pub(crate) fn settle_from_present(passive: PassiveLevel, adapter: &AdapterContext) {
+    if ACTIVE.load(Ordering::Acquire) == 0 || INFL.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    settle(passive, adapter, false);
 }
 
 /// After the WindowedBlt dispatch of the same pass: spin briefly for a copy just submitted
@@ -1095,7 +1289,7 @@ fn free_all_descriptors(passive: PassiveLevel, adapter: &AdapterContext, wait_io
             match (plan, e.dst.desc) {
                 (RetirePlan::Free, Desc::Ready { va, len }) => {
                     e.dst.desc = Desc::Draining;
-                    Some((e.dst.slot, va, len, e.dst.resource_id))
+                    Some((e.dst.slot, va, len, e.dst.resource_id, e.vram))
                 }
                 // A `Draining` one belongs to the paging thread retiring it.
                 (RetirePlan::Wait(_) | RetirePlan::Leak, Desc::Ready { .. }) => {
@@ -1106,8 +1300,10 @@ fn free_all_descriptors(passive: PassiveLevel, adapter: &AdapterContext, wait_io
                 _ => None,
             }
         };
-        if let Some((slot, va, len, resource_id)) = plan {
-            let freed = rio::free_dst(passive, adapter, slot, va, len, wait_io_ms, cr::FREE_MS);
+        if let Some((slot, va, len, resource_id, vram)) = plan {
+            // A VRAM destination's mapping is `ce_vram`'s (given back with the channel): nothing
+            // to free here.
+            let freed = vram || rio::free_dst(passive, adapter, slot, va, len, wait_io_ms, cr::FREE_MS);
             finish_free(i, resource_id, freed);
         }
     }
@@ -1285,6 +1481,11 @@ fn ensure_descriptor(
             Desc::Leaked => return Err(Why::Poisoned),
         }
         e.dst.admits()?;
+        if e.vram {
+            let cover = e.cover;
+            drop(g);
+            return vram_descriptor(passive, adapter, resource_id, cover);
+        }
     }
     // Never wait on the worker: a paging operation may hold the transaction for its whole bound.
     let Some(guard) = adapter.system_backings.try_serialize(passive) else {
@@ -1293,6 +1494,38 @@ fn ensure_descriptor(
     let r = create_descriptor(passive, adapter, &guard, resource_id);
     drop(guard);
     r
+}
+
+/// A `RedirVram` destination's "descriptor": its mapping in the channel (`ce_vram::ce_surface`,
+/// made on demand; no content transaction: it has no leases).
+fn vram_descriptor(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    cover: u64,
+) -> Result<(), Why> {
+    match crate::virtio::rm_client::ce_vram::ce_surface(passive, adapter, resource_id) {
+        Ok(s) => {
+            let mut g = STATE.lock();
+            if let Some(e) = g.dst(resource_id) {
+                if e.dst.desc == Desc::Absent {
+                    e.dst.desc = Desc::Ready { va: s.va, len: cover };
+                    DST_NEW.fetch_add(1, Ordering::Relaxed);
+                    DST_LIVE.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            } else {
+                Err(Why::Full)
+            }
+        }
+        Err(f) if rio::is_busy(&f) => Err(Why::NotReady),
+        Err(_) => {
+            if let Some(e) = STATE.lock().dst(resource_id) {
+                strike_dst(&mut e.dst, cp::Why::RmError);
+            }
+            Err(Why::Desc)
+        }
+    }
 }
 
 fn set_desc(resource_id: u32, desc: Desc) {
@@ -1553,6 +1786,31 @@ pub(crate) fn destination_gone(
     drop(removed);
 }
 
+/// A `RedirVram` destination's allocation is being destroyed (`vidmem::released`, before its memory
+/// is freed): its record goes unless a copy into it is still submitted (then it stays, `gone`,
+/// until the generation ends: the dup in the channel keeps the memory alive meanwhile). PASSIVE.
+pub(crate) fn vram_destination_gone(resource_id: u32) {
+    if ACTIVE.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = STATE.lock();
+    let submitted = g.jobs.submitted_for(resource_id);
+    if let Some(i) = g.dst_index(resource_id) {
+        let vram = g.dsts[i].as_ref().is_some_and(|e| e.vram);
+        if vram {
+            if submitted {
+                if let Some(e) = g.dsts[i].as_mut() {
+                    e.gone = true;
+                    e.dst.desc = Desc::Leaked;
+                }
+            } else if g.dsts[i].take().is_some() {
+                let _ = DST_LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+            }
+        }
+    }
+    refresh_active(&g);
+}
+
 /// StopDevice (the worker joined) and a StartDevice that finds an old transport, BEFORE the
 /// channel's own `retire_for_stop`: free every destination descriptor nothing can still write
 /// and release the producer dups while the transport answers, on the caller's budget. What is
@@ -1585,6 +1843,7 @@ pub(crate) fn retire_for_stop(
 /// is leaked on purpose (never unlock pages a GPU may still write). PASSIVE, no lock held.
 pub(crate) fn forget(fate: helios_kmd_logic::sweep_budget::PinFate) {
     WANT_UP.store(0, Ordering::Relaxed);
+    forget_source_records();
     if ACTIVE.load(Ordering::Acquire) == 0 {
         return;
     }

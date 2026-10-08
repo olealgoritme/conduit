@@ -221,6 +221,12 @@ impl ClientTable {
             .filter(|p| *p != 0)
     }
 
+    /// Whether `process` has any recorded RM client (it runs NVK-on-RM). `false` for 0, and when
+    /// hardening records nothing (the caller cannot tell "none" from "not recorded" then).
+    pub fn process_has_client(&self, process: usize) -> bool {
+        process != 0 && self.live().iter().any(|s| s.process == process)
+    }
+
     /// Promise a slot to a client allocation about to be forwarded, so a full table
     /// refuses BEFORE the host makes a client nobody tracks. `false`: no room (table or
     /// the owner's quota, reservations in flight counted).

@@ -348,6 +348,8 @@ fn run_pass(mask: u32) -> bool {
         CHANGED.load(Ordering::Relaxed) != 0,
         YIELD.load(Ordering::Relaxed),
     );
+    // What other threads handed over instead of writing (`diag::hot`).
+    crate::diag::mirror_flush_deferred();
     let a = ADAPTER.load(Ordering::Acquire);
     if a != 0 && STOPPING.load(Ordering::Acquire) == 0 {
         // SAFETY: `start` stored the context of the worker this thread belongs to, `stop` clears
@@ -397,6 +399,11 @@ fn publish_own() {
     rec(b"MirPaces", PACES.load(Ordering::Relaxed));
     rec(b"MirYlds", YLDS.load(Ordering::Relaxed));
     rec(b"MirPrioOld", PRIO_OLD.load(Ordering::Relaxed));
+    let (hot, hot_name, deferred, defer_full) = crate::diag::hot_counts();
+    rec(b"NvRegHot", hot);
+    rec(b"NvRegHotNm", hot_name);
+    rec(b"NvRegDefer", deferred);
+    rec(b"NvRegDefFull", defer_full);
     let (writes, skipped) = crate::diag::mirror_write_counts();
     rec(b"MirWrN", writes);
     rec(b"MirSkipN", skipped);

@@ -79,6 +79,10 @@ pub(crate) mod ce_dup;
 pub(crate) mod ce_shadow;
 // `RmCopyEngine` = 1 (M3c-2): the Present route's RM I/O.
 pub(crate) mod ce_route;
+// `RedirVram` (docs/vram-redirection.md): the KMD's own GPU-only allocations from RM video
+// memory, and those objects in the copy-engine channel (map, copy, bounce transfers).
+pub(crate) mod vidmem;
+pub(crate) mod ce_vram;
 
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -505,10 +509,12 @@ pub(crate) fn forget() {
     unmap_views(&views);
     rm_present::reset();
     sysmem::forget();
+    vidmem::forget();
     ce_channel::forget();
     // The copy-engine route's destinations: the transport was reset, so nothing on the host
     // names their pages any more; every pin goes (one load when there is none).
     crate::ddi::ce_present_route::forget(super::nvrm::last_sweep_fate());
+    crate::ddi::ce_sysmem::forget(super::nvrm::last_sweep_fate());
     // The next transport generation reads the knob again (once).
     KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }

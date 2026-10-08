@@ -115,6 +115,14 @@ static SERVICE_NAME: [u16; 18] = [
 /// outside every policy this module documents. With the raw writer private,
 /// a future bypass has to be a deliberate edit to this file.
 fn record_named(name: &[u16], mut code: u32) {
+    // Outside a mirror pass, with the mirror thread running: hand the write to the thread (its
+    // next pass writes it) instead of a registry transaction on the caller's thread, which may be
+    // an app's (DxgkDdiPresent, Render, an escape: 383.1's profile had 1.5% of Heaven's CPU in the
+    // configuration manager).
+    if !mirror::in_pass() && crate::ddi::mirror_thread::running() && hot::defer(name, u64::from(code), false) {
+        return;
+    }
+    hot::note(name);
     // SAFETY: PASSIVE_LEVEL (see module note). `name` is a caller-provided
     // NUL-terminated UTF-16 value name; ValueData points to a 4-byte DWORD that
     // RtlWriteRegistryValue copies before returning.
@@ -133,6 +141,10 @@ fn record_named(name: &[u16], mut code: u32) {
 /// [`record_named`] for a 64-bit value (`REG_QWORD`, 8 bytes): one registry transaction, so a
 /// reader sees the whole value or none of it. PASSIVE_LEVEL only.
 fn record_named_q(name: &[u16], mut value: u64) {
+    if !mirror::in_pass() && crate::ddi::mirror_thread::running() && hot::defer(name, value, true) {
+        return;
+    }
+    hot::note(name);
     // SAFETY: PASSIVE_LEVEL (see module note). `name` is a NUL-terminated UTF-16 value name;
     // ValueData points to an 8-byte QWORD that RtlWriteRegistryValue copies before returning.
     unsafe {
@@ -161,6 +173,7 @@ pub fn record_named_binary(name: &[u8], data: &[u8]) {
     let Ok(len) = u32::try_from(data.len()) else {
         return;
     };
+    hot::note(&buf[..=n]);
     // SAFETY: PASSIVE_LEVEL (see module note). `buf` is a NUL-terminated UTF-16 value name;
     // ValueData points to `len` readable bytes that RtlWriteRegistryValue copies before
     // returning (it does not write through the pointer).
@@ -182,6 +195,131 @@ pub fn record_named_binary(name: &[u8], data: &[u8]) {
 /// registry lock for tens of milliseconds. Every OTHER writer is untouched, except that each write
 /// from anywhere updates the cache, so the cache is the registry's content (a name written by a
 /// worker one-shot and by the mirror cannot be skipped wrongly).
+/// Registry traffic off the mirror thread (`NvRegHot`: calls made outside a mirror pass, reads
+/// and writes; `NvRegHotNm`: the first four characters of the last one's name, little-endian), and
+/// the writes deferred to the mirror thread's next pass (`NvRegDefer`, `NvRegDefFull`: a slot held
+/// by another name, written directly instead). At steady state `NvRegHot` stays still.
+mod hot {
+    use super::{mirror, AtomicU32, Ordering};
+
+    pub(crate) static HOT: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static HOT_NAME: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static DEFERRED: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static DEFER_FULL: AtomicU32 = AtomicU32::new(0);
+
+    /// Open addressing over the name hash: a name probes up to `PROBES` slots from its home slot
+    /// (386.1: 512 slots with no probing overflowed under Heaven, `NvRegDefFull` +6/s).
+    const SLOTS: usize = 1024;
+    const PROBES: usize = 16;
+    /// One deferred write: the NUL-terminated name (at most 15 units and the NUL), the value, and
+    /// whether it is a `REG_QWORD`.
+    #[derive(Clone, Copy)]
+    struct Pending {
+        name: [u16; 16],
+        value: u64,
+        qword: bool,
+    }
+    static TABLE: crate::sync::SpinLock<[Option<Pending>; SLOTS]> =
+        crate::sync::SpinLock::new([None; SLOTS]);
+    static ANY: AtomicU32 = AtomicU32::new(0);
+
+    fn pack(units: impl Iterator<Item = u32>) -> u32 {
+        let mut w = 0u32;
+        for (i, c) in units.take(4).enumerate() {
+            w |= (c & 0xff) << (8 * i);
+        }
+        w
+    }
+
+    /// One registry call outside a mirror pass (any thread; StartDevice's count too).
+    pub(super) fn note(name: &[u16]) {
+        if mirror::in_pass() {
+            return;
+        }
+        HOT.fetch_add(1, Ordering::Relaxed);
+        HOT_NAME.store(pack(name.iter().map(|&c| u32::from(c))), Ordering::Relaxed);
+    }
+
+    pub(super) fn note_bytes(name: &[u8]) {
+        if mirror::in_pass() {
+            return;
+        }
+        HOT.fetch_add(1, Ordering::Relaxed);
+        HOT_NAME.store(pack(name.iter().map(|&c| u32::from(c))), Ordering::Relaxed);
+    }
+
+    /// Keep `value` for `name` (NUL-terminated) until the next pass writes it, and ask for one.
+    /// The latest value per name wins. `false`: no slot within `PROBES` of the name's home slot is
+    /// free or holds that name (the caller writes directly, `NvRegDefFull`).
+    pub(super) fn defer(name: &[u16], value: u64, qword: bool) -> bool {
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        if len == 0 || len > 15 {
+            return false;
+        }
+        let home = mirror::key(&name[..len]).0 & (SLOTS - 1);
+        let mut buf = [0u16; 16];
+        buf[..len].copy_from_slice(&name[..len]);
+        {
+            let mut t = TABLE.lock();
+            let mut placed = false;
+            for i in 0..PROBES {
+                let e = &mut t[(home + i) & (SLOTS - 1)];
+                match e {
+                    Some(p) if p.name != buf => continue,
+                    _ => {
+                        *e = Some(Pending { name: buf, value, qword });
+                        placed = true;
+                        break;
+                    }
+                }
+            }
+            if !placed {
+                DEFER_FULL.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        ANY.store(1, Ordering::Release);
+        DEFERRED.fetch_add(1, Ordering::Relaxed);
+        crate::ddi::mirror_thread::request();
+        true
+    }
+
+    /// Inside a pass: write every deferred value.
+    pub(crate) fn flush() {
+        if ANY.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        for slot in 0..SLOTS {
+            let p = TABLE.lock()[slot].take();
+            if let Some(p) = p {
+                let len = p.name.iter().position(|&c| c == 0).unwrap_or(15);
+                if p.qword {
+                    super::record_named_q(&p.name[..=len], p.value);
+                } else {
+                    let k = mirror::key(&p.name[..len]);
+                    super::record_named(&p.name[..=len], p.value as u32);
+                    mirror::wrote(k, p.value as u32);
+                }
+            }
+        }
+    }
+}
+
+/// Inside a mirror pass: write the values deferred from other threads.
+pub(crate) fn mirror_flush_deferred() {
+    hot::flush();
+}
+
+/// `NvRegHot`, `NvRegHotNm`, `NvRegDefer`, `NvRegDefFull` (written by the mirror thread).
+pub(crate) fn hot_counts() -> (u32, u32, u32, u32) {
+    (
+        hot::HOT.load(Ordering::Relaxed),
+        hot::HOT_NAME.load(Ordering::Relaxed),
+        hot::DEFERRED.load(Ordering::Relaxed),
+        hot::DEFER_FULL.load(Ordering::Relaxed),
+    )
+}
+
 mod mirror {
     use super::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -1263,6 +1401,20 @@ pub mod knobs {
     /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
     /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
+    /// `DXGK_VIDMMCAPS` extra bits (default 0 = the driver's own word). A raw mask OR'd into
+    /// `MemoryManagementCaps`; only bit 9 `NonCpuVisiblePrimary` (0x200) is accepted
+    /// (`helios_kmd_logic::vidmm_caps`), the rest is dropped and reported in `VmCapsXMsk`. The
+    /// GPU-memory redirection experiment, stage V1 (`docs/vram-redirection.md` 5.2). Read with
+    /// the other `AdapterKnobs` at AddAdapter and StartDevice; mirrored as `VmCapsXEff` and
+    /// `VmCapsRep` at every start.
+    pub const VIDMM_CAPS_EXTRA: KnobName = KnobName::new(b"VidMmCapsX");
+    /// GPU-only GDI surfaces from RM video memory, the redirected Blt into them on the copy
+    /// engine, CPU readers and writers through a bounce buffer (default 0 = off; 1 = on).
+    /// `helios_kmd_logic::rm_vidmem`, `docs/vram-redirection.md` 5.3-5.6. Read at StartDevice.
+    pub const REDIR_VRAM: KnobName = KnobName::new(b"RedirVram");
+    /// `RedirVram` per-path switches for bisecting (default 0; bits in
+    /// `helios_kmd_logic::rm_vidmem::off`). Read at StartDevice.
+    pub const RV_OFF: KnobName = KnobName::new(b"RvOff");
     /// `IndepFlip` (default 0): independent flip, stage S-1 (`docs/independent-flip.md` section
     /// 11, `helios_kmd_logic::independent_flip::Mode`). 0 off; 1 advertise `SupportDirectFlip`,
     /// the aperture `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip` (OR'd into what
@@ -1529,6 +1681,7 @@ pub mod knobs {
 /// Read a service-key REG_DWORD knob, or `default` if absent.
 pub fn read_config_dword(name: KnobName, default: u32) -> u32 {
     let name = name.0;
+    hot::note_bytes(name);
     let mut name_buf = [0u16; 16];
     let n = name.len().min(MAX_CONFIG_NAME);
     let mut i = 0;
@@ -1598,6 +1751,7 @@ pub fn record(mut code: u32) {
         i += 1;
     }
     name[1 + d] = 0;
+    hot::note(&name);
 
     // SAFETY: PASSIVE_LEVEL (see module note). Path/ValueName are NUL-terminated
     // UTF-16; ValueData points to a 4-byte DWORD. RtlWriteRegistryValue copies the

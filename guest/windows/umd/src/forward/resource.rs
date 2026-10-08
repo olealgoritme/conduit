@@ -1758,8 +1758,12 @@ unsafe fn open_resource_inner(
     } else {
         d3dddi_to_dxgi_format(meta.format).0 as u32
     };
+    // A KMD GDI texture is a cross-context Venus OPTIMAL image, unless the KMD backed it with RM
+    // video memory (`RedirVram`, docs/vram-redirection.md 5.3): then the open carries the foreign
+    // layout record (LINEAR) and the opener imports it by id like any NVK-made resource.
     let cross_context_optimal = ident.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
-        && meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0;
+        && meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0
+        && foreign_layout.is_none();
     let dedicated_present_buffer = ident.dedicated_present_buffer();
     log_error!(
         "DDI open_resource identity: res_id={} alloc_size={} mem_type={} kind={} ctx={} meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x} dxgi_fmt={} d3dddi_fmt={}",

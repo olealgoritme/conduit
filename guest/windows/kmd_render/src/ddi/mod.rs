@@ -8,6 +8,7 @@
 pub(crate) use crate::irql::PASSIVE_LEVEL_IRQL;
 
 mod add_device;
+pub(crate) mod aperture_pages;
 mod bar_segment;
 mod base;
 mod blob_map;
@@ -17,6 +18,7 @@ pub(crate) mod cpu_host_aperture;
 pub(crate) mod blt_async;
 pub(crate) mod ce_record;
 pub(crate) mod ce_present_route;
+pub(crate) mod ce_sysmem;
 pub(crate) mod create_allocation;
 pub(crate) mod device_lost;
 pub(crate) mod display;
@@ -53,6 +55,7 @@ pub(crate) mod std_census;
 pub(crate) mod submit_command;
 pub(crate) mod traced;
 pub(crate) mod vidpn;
+pub(crate) mod vram_redirect;
 pub(crate) mod wddm_surface;
 
 pub use add_device::dxgkddi_add_device;
