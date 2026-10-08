@@ -215,6 +215,32 @@ pub fn authorize(
     }
 }
 
+/// The KMD's OWN import of `resource_id` into a DRM file of its own client (`RedirVram`: a GDI
+/// command whose source is an NVK image, `docs/vram-redirection.md` 8). The kernel names no
+/// process; it may import any live, not destroyed foreign resource, into its own DRI node only.
+/// The opener rule of [`authorize`] is for user-mode callers.
+pub fn authorize_kmd(
+    table: &ForeignTable,
+    handle_device_type: Option<u32>,
+    rm_handle: u32,
+    resource_id: u32,
+) -> Result<(), Refusal> {
+    if rm_handle == 0 || resource_id == 0 {
+        return Err(Refusal::BadRequest);
+    }
+    match handle_device_type {
+        Some(t) if is_dri_node(t) => {}
+        _ => return Err(Refusal::HandleNotOwned),
+    }
+    let Some(e) = table.get(resource_id) else {
+        return Err(Refusal::NoSuchResource);
+    };
+    if e.destroyed {
+        return Err(Refusal::Destroyed);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -239,6 +265,17 @@ mod tests {
             modifier: 0x0300_0000_0060_6015,
             plane1: None,
         }
+    }
+
+    #[test]
+    fn the_kmd_imports_any_live_resource_into_its_own_dri_node_only() {
+        let t = imported();
+        let dri = Some(crate::nvrm_fence::DEVICE_TYPE_DRI_FIRST + 128);
+        assert_eq!(authorize_kmd(&t, dri, 9, RES), Ok(()));
+        assert_eq!(authorize_kmd(&t, dri, 9, 4242), Err(Refusal::NoSuchResource));
+        assert_eq!(authorize_kmd(&t, Some(0), 9, RES), Err(Refusal::HandleNotOwned));
+        assert_eq!(authorize_kmd(&t, None, 9, RES), Err(Refusal::HandleNotOwned));
+        assert_eq!(authorize_kmd(&t, dri, 0, RES), Err(Refusal::BadRequest));
     }
 
     /// Resource 100 imported by device A: the creator's state.

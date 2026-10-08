@@ -120,6 +120,253 @@ fn refresh_any(b: &Book) {
     ANY.store(u32::from(any), Ordering::Release);
 }
 
+/// An NVK-made (foreign) image as a copy-engine SOURCE for a GDI command (`RedirVram`,
+/// `docs/vram-redirection.md` 8): its base in the channel, its layout and plan, and the producer's
+/// semaphore when the route has seen a record of it at a Present.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForeignSource {
+    /// GPU VA in the channel of the memory the image lives in (byte 0 of the RM object; the plan's
+    /// offset is applied by `rm_vidmem::foreign_copy`). With a record: the record's mapping.
+    pub va: u64,
+    pub plan: helios_kmd_logic::ce_present::SourcePlan,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    /// Acquire this before the copy: the producer's frame is complete. `None`: no record seen (the
+    /// image is copied as it is in memory).
+    pub acquire: Option<helios_kmd_logic::ce_present::Acquire>,
+    pub chan_gen: u64,
+}
+
+static FGN_REC: AtomicU32 = AtomicU32::new(0);
+static FGN_IMP: AtomicU32 = AtomicU32::new(0);
+static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
+static FGN_WHY: AtomicU32 = AtomicU32::new(0);
+
+fn fgn_fail(f: Fail) -> Fail {
+    FGN_FAIL.fetch_add(1, Ordering::Relaxed);
+    FGN_WHY.store(cc::fail_word(f), Ordering::Relaxed);
+    f
+}
+
+/// `resource_id` (an adopted foreign NVK image) as a copy-engine source. With a record the route
+/// validated for it: the producer's own objects, dup'd and mapped (`ce_dup`, cached), and its
+/// semaphore. Without one: the image's memory imported into the channel's client by resource id
+/// (the host makes it a GEM of the channel's DRM file, `GEM_EXPORT_NVKMS`,
+/// `OS_UNIX_IMPORT_OBJECT_FROM_FD`: NVK's own route, `nvk-rm` 0031) and mapped with the modifier's
+/// page kind, cached per resource id; no acquire. PASSIVE, no lock held; takes the channel's I/O
+/// without waiting (`BUSY`). Call it BEFORE `ce_sysmem::with_standard` (the I/O order).
+pub(crate) fn foreign_source(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Result<ForeignSource, Fail> {
+    let r = foreign_source_inner(passive, adapter, resource_id).map_err(fgn_fail);
+    publish_counters();
+    r
+}
+
+fn foreign_source_inner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Result<ForeignSource, Fail> {
+    let view = super::ce_route::chan_view();
+    let (true, Some(gen)) = (view.up, view.gen) else {
+        return Err(super::ce_route::NO_CHANNEL);
+    };
+    if let Some(rec) = crate::ddi::ce_present_route::source_record(adapter, resource_id) {
+        let desc = super::ce_dup::source_desc(&rec);
+        let plan = helios_kmd_logic::ce_present::source_plan(gen, &desc).map_err(|_| BAD_SHAPE)?;
+        let p = super::ce_route::prep_producer(passive, adapter, &rec)?;
+        FGN_REC.fetch_add(1, Ordering::Relaxed);
+        let s = rec.record.source;
+        // `ce_dup`'s source VA already carries the plan's offset: give back the base.
+        return Ok(ForeignSource {
+            va: p.src_va.wrapping_sub(plan.offset),
+            plan,
+            pitch: s.pitch,
+            width: s.width,
+            height: s.height,
+            fourcc: s.fourcc,
+            acquire: Some(helios_kmd_logic::ce_present::Acquire {
+                va: p.sem_va,
+                value: rec.record.semaphore.value,
+            }),
+            chan_gen: chan_gen(),
+        });
+    }
+    let (layout, size) = adapter
+        .with_virtio(|v| v.foreign_record(resource_id))
+        .ok()
+        .flatten()
+        .ok_or(NOT_VRAM)?;
+    let desc = helios_kmd_logic::ce_present::SourceDesc {
+        offset: u64::from(layout.offset),
+        size,
+        modifier: layout.modifier,
+        pitch: layout.stride,
+        width: layout.width,
+        height: layout.height,
+        fourcc: layout.fourcc,
+        compressed: false,
+    };
+    let plan = helios_kmd_logic::ce_present::source_plan(gen, &desc).map_err(|_| BAD_SHAPE)?;
+    let va = match BOOK.lock().maps.find(resource_id) {
+        Some(m) => m.va,
+        None => with_io(passive, adapter, |io, h| import_foreign(io, h, resource_id, size, plan.page_kind))?,
+    };
+    FGN_IMP.fetch_add(1, Ordering::Relaxed);
+    Ok(ForeignSource {
+        va,
+        plan,
+        pitch: layout.stride,
+        width: layout.width,
+        height: layout.height,
+        fourcc: layout.fourcc,
+        acquire: None,
+        chan_gen: chan_gen(),
+    })
+}
+
+/// Copy `src_rect` of the foreign image `src` ([`foreign_source`]) to `(dst_x, dst_y)` of `dst`
+/// (a VRAM surface, or a staging view inside `ce_sysmem::with_standard`), whose pixel format is
+/// `dst_fourcc` (`DRM_FORMAT_*`; R/B are exchanged on the copy engine when the two differ). Acquires
+/// the producer's semaphore when the source has one. Submitted now; the completion value
+/// ([`wait`]). Spinlocks only.
+pub(crate) fn foreign_copy(
+    src: &ForeignSource,
+    src_rect: Rect,
+    dst: &CeSurface,
+    dst_x: u32,
+    dst_y: u32,
+    dst_fourcc: u32,
+) -> Result<u64, Fail> {
+    if src.chan_gen != chan_gen() || dst.chan_gen != chan_gen() {
+        return Err(BAD_SHAPE);
+    }
+    let remap = helios_kmd_logic::ce_present::remap_for(src.fourcc, dst_fourcc).map_err(|_| BAD_SHAPE)?;
+    let copy = rv::foreign_copy(
+        &src.plan,
+        src.va,
+        src.pitch,
+        src.width,
+        src.height,
+        src_rect,
+        &dst.surface(),
+        dst_x,
+        dst_y,
+        remap,
+    )
+    .map_err(|_| BAD_SHAPE)?;
+    let r = match src.acquire {
+        Some(acquire) => ce::submit_build(|push, gen, done| {
+            helios_kmd_logic::ce_present::present_push(push, gen, acquire, &copy, done)
+        }),
+        None => ce::submit_copy(&copy),
+    };
+    match r {
+        Ok(v) => {
+            COPY.fetch_add(1, Ordering::Relaxed);
+            Ok(v)
+        }
+        Err(_) => {
+            COPY_FAIL.fetch_add(1, Ordering::Relaxed);
+            Err(SUBMIT)
+        }
+    }
+}
+
+/// Import `resource_id` into the channel's client and map it at a slot's window. The caller holds
+/// the channel's I/O.
+fn import_foreign(
+    io: &Io<'_>,
+    h: &Handles,
+    resource_id: u32,
+    size: u64,
+    kind: Option<u32>,
+) -> Result<u64, Fail> {
+    let len = rv::map_len(helios_kmd_logic::round_up_page(size)).ok_or(BAD_SHAPE)?;
+    let slot = match BOOK.lock().maps.plan(resource_id) {
+        MapPlan::Hit(m) => return Ok(m.va),
+        MapPlan::Make { slot, evict } => {
+            if let Some(old) = evict {
+                BOOK.lock().maps.remove(old.slot);
+                give_back(io, h, &old);
+            }
+            slot
+        }
+    };
+    let (h_mem, h_virt) = rv::map_handles(slot);
+    // 1. The host: the resource's memory as a GEM of the channel client's DRM file.
+    let gem = crate::virtio::rm_resource_import::rm_resource_import_kmd(io.passive, io.adapter, h.drm, resource_id)
+        .map_err(|_| Fail::new(FailKind::Refused, 0xED))?
+        .gem_handle;
+    let r = import_gem(io, h, gem, h_mem);
+    // The GEM is only the envelope (our RM handle holds the memory once imported).
+    let close = rc::gem_close_params(gem);
+    let mut resp = [0u8; super::REPLY_MAX];
+    if io.exchange(h.drm, rc::DRM_IOCTL_GEM_CLOSE, &close, &[], &mut resp).is_err() {
+        ce::note_soft();
+    }
+    r?;
+    // 2. The mapping: the modifier's page kind, big pages first (as `ce_dup` maps an NVK image).
+    let va = rv::map_va(slot);
+    let (first, kind_flag) = match kind {
+        Some(_) => (cc::MAP_FLAGS_PAGE_SIZE_BIG | cc::MAP_FLAGS_KIND_OVERRIDE, cc::MAP_FLAGS_KIND_OVERRIDE),
+        None => (cc::MAP_FLAGS_PAGE_SIZE_BIG, 0),
+    };
+    let mut mapped = ce::gpu_map_with(io, h, h_virt, h_mem, va, len, first, kind);
+    if let Err(f) = mapped {
+        if f.kind == FailKind::Rm {
+            mapped = ce::gpu_map_with(io, h, h_virt, h_mem, va, len, cc::MAP_FLAGS_SYSMEM | kind_flag, kind);
+        }
+    }
+    match mapped {
+        Ok(g) => {
+            MAP_OK.fetch_add(1, Ordering::Relaxed);
+            let mut b = BOOK.lock();
+            b.maps.insert(slot, resource_id, g.va, len);
+            refresh_any(&b);
+            Ok(g.va)
+        }
+        Err(f) => {
+            MAP_FAIL.fetch_add(1, Ordering::Relaxed);
+            MAP_STAT.store(cc::fail_word(f), Ordering::Relaxed);
+            if ce::rm_free(io, h, rc::H_DEVICE, h_mem).is_err() {
+                ce::note_soft();
+            }
+            Err(f)
+        }
+    }
+}
+
+/// GEM `gem` of the channel's DRM file -> a fresh control file -> RM memory `h_mem` of the channel's
+/// client (`GEM_EXPORT_NVKMS`, `OS_UNIX_IMPORT_OBJECT_FROM_FD`). The caller holds the channel's I/O.
+fn import_gem(io: &Io<'_>, h: &Handles, gem: u32, h_mem: u32) -> Result<(), Fail> {
+    let ctl = io.open_file(rc::DEV_CTL)?;
+    let r = (|| {
+        let data = rv::gem_export_params(gem);
+        let nested = ctl.to_le_bytes();
+        let mut resp = [0u8; super::REPLY_MAX];
+        let n = io.exchange(h.drm, rv::DRM_IOCTL_GEM_EXPORT_NVKMS, &data, &nested, &mut resp)?;
+        rc::parse_ioctl_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 0x75))?)
+            .map_err(|_| Fail::new(FailKind::Parse, 0x75))?;
+        let params = rv::import_from_fd_params(ctl, rc::H_DEVICE, h_mem);
+        let block = rc::nvos54(h.root, h.root, rv::CTRL_IMPORT_OBJECT_FROM_FD, params.len() as u32);
+        let mut resp = [0u8; super::REPLY_MAX];
+        let n = io.exchange(h.ctl, rc::nv_cmd(rc::ESC_RM_CONTROL, 32), &block, &params, &mut resp)?;
+        rc::rm_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 0x76))?, rc::NVOS54_STATUS_AT)
+            .map(|_| ())
+            .map_err(Fail::from)
+    })();
+    if !io.close_file(ctl) {
+        ce::note_soft();
+    }
+    r
+}
+
 /// The channel's generation of mappings (see [`CeSurface::chan_gen`]).
 pub(crate) fn chan_gen() -> u64 {
     CHAN_GEN.load(Ordering::Acquire)
@@ -578,4 +825,10 @@ pub(crate) fn publish_counters() {
     rec(b"RvXferMax", XFER_MAX.load(Ordering::Relaxed));
     rec(b"RvCopy", COPY.load(Ordering::Relaxed));
     rec(b"RvCopyFail", COPY_FAIL.load(Ordering::Relaxed));
+    if FGN_REC.load(Ordering::Relaxed) | FGN_IMP.load(Ordering::Relaxed) | FGN_FAIL.load(Ordering::Relaxed) != 0 {
+        rec(b"RvFgnRec", FGN_REC.load(Ordering::Relaxed));
+        rec(b"RvFgnImp", FGN_IMP.load(Ordering::Relaxed));
+        rec(b"RvFgnFail", FGN_FAIL.load(Ordering::Relaxed));
+        rec(b"RvFgnWhy", FGN_WHY.load(Ordering::Relaxed));
+    }
 }

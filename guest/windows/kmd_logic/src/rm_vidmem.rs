@@ -514,6 +514,114 @@ pub fn vram_copy(
     })
 }
 
+/// A copy out of an NVK-made (foreign) image into a pitch-linear surface: `src_rect` of the image
+/// (whose base is at `src_va` in the channel, laid out as `plan` says) to `(dst_x, dst_y)` of `dst`.
+/// Any rectangle: pitch-linear by address, block-linear by the copy's source origin.
+#[allow(clippy::too_many_arguments)]
+pub fn foreign_copy(
+    plan: &crate::ce_present::SourcePlan,
+    src_va: u64,
+    src_pitch: u32,
+    src_width: u32,
+    src_height: u32,
+    src_rect: Rect,
+    dst: &Surface,
+    dst_x: u32,
+    dst_y: u32,
+    remap: Remap,
+) -> Result<CopyRect, CopyError> {
+    if !src_rect.valid_in(src_width, src_height) {
+        return Err(CopyError::Rect);
+    }
+    match plan.layout {
+        SurfaceLayout::Pitch => {
+            let src = Surface {
+                va: src_va.checked_add(plan.offset).ok_or(CopyError::Va)?,
+                pitch: src_pitch,
+                width: src_width,
+                height: src_height,
+            };
+            vram_copy(&src, src_rect, dst, dst_x, dst_y, remap)
+        }
+        SurfaceLayout::BlockLinear {
+            block_height_log2,
+            element_bytes,
+            image_height,
+            ..
+        } => {
+            let w = src_rect.right - src_rect.left;
+            let h = src_rect.bottom - src_rect.top;
+            let dst_rect = Rect {
+                left: dst_x,
+                top: dst_y,
+                right: dst_x.checked_add(w).ok_or(CopyError::Rect)?,
+                bottom: dst_y.checked_add(h).ok_or(CopyError::Rect)?,
+            };
+            if !dst_rect.valid_in(dst.width, dst.height) {
+                return Err(CopyError::Rect);
+            }
+            let line = u64::from(w) * BPP;
+            if line > u64::from(dst.pitch) {
+                return Err(CopyError::Pitch);
+            }
+            let d = origin(dst, dst_x, dst_y).ok_or(CopyError::Va)?;
+            let d_end = d + (u64::from(h) - 1) * u64::from(dst.pitch) + line;
+            if d_end > MAX_VA || src_va >= MAX_VA {
+                return Err(CopyError::Va);
+            }
+            Ok(CopyRect {
+                src_va,
+                dst_va: d,
+                src_pitch,
+                dst_pitch: dst.pitch,
+                line_bytes: line as u32,
+                lines: h,
+                // The origin selects the rectangle inside the block-linear image.
+                layout: SurfaceLayout::BlockLinear {
+                    block_height_log2,
+                    element_bytes,
+                    image_height,
+                    origin_x_bytes: src_rect.left * BPP as u32,
+                    origin_y: src_rect.top,
+                },
+                dst_layout: SurfaceLayout::Pitch,
+                remap,
+                stamp: None,
+            })
+        }
+    }
+}
+
+// ---- importing an NVK image into the channel's client (no producer record) ---------------------
+
+/// `NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD`.
+pub const CTRL_IMPORT_OBJECT_FROM_FD: u32 = 0x3d06;
+/// `DRM_IOCTL_NVIDIA_GEM_EXPORT_NVKMS_MEMORY`: `DRM_IOWR(0x40 + 0x09, 24)`.
+pub const DRM_IOCTL_GEM_EXPORT_NVKMS: u32 = 0xC018_6449;
+pub const GEM_EXPORT_BYTES: usize = 24;
+pub const IMPORT_FROM_FD_BYTES: usize = 20;
+
+/// `drm_nvidia_gem_export_nvkms_memory_params` of GEM `handle`: the NVKMS block (4 bytes, the
+/// control file's handle; the host replaces the pointer) follows as the nested block.
+pub fn gem_export_params(handle: u32) -> [u8; GEM_EXPORT_BYTES] {
+    let mut a = [0u8; GEM_EXPORT_BYTES];
+    a[0..4].copy_from_slice(&handle.to_le_bytes());
+    a[16..24].copy_from_slice(&4u64.to_le_bytes());
+    a
+}
+
+/// `NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS`: the memory exported to the control file
+/// `fd` becomes `h_object` under `h_device` (also the parent) of the caller's client.
+pub fn import_from_fd_params(fd: u32, h_device: u32, h_object: u32) -> [u8; IMPORT_FROM_FD_BYTES] {
+    let mut a = [0u8; IMPORT_FROM_FD_BYTES];
+    a[0..4].copy_from_slice(&fd.to_le_bytes());
+    a[4..8].copy_from_slice(&rc::EXPORT_OBJECT_TYPE_RM.to_le_bytes());
+    a[8..12].copy_from_slice(&h_device.to_le_bytes());
+    a[12..16].copy_from_slice(&h_device.to_le_bytes());
+    a[16..20].copy_from_slice(&h_object.to_le_bytes());
+    a
+}
+
 /// Direction of a bounce transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -572,6 +680,8 @@ pub const COUNTERS: &[&str] = &[
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
     // the Present (`ddi/vram_redirect.rs`)
     "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail",
+    // foreign NVK sources for GDI commands (`ce_vram.rs`)
+    "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
     "RvSysMade", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak", "RvSysObj",
 ];
@@ -715,6 +825,49 @@ mod tests {
         assert_eq!(vram_copy(&src, r, &narrow, 0, 0, Remap::None), Err(CopyError::Pitch));
         let high = Surface { va: MAX_VA - 4096, ..src };
         assert_eq!(vram_copy(&high, r, &dst, 0, 0, Remap::None), Err(CopyError::Va));
+    }
+
+    #[test]
+    fn foreign_copies_pitch_sub_rects_and_whole_block_linear_images() {
+        use crate::ce_present::SourcePlan;
+        let dst = Surface { va: map_va(3), pitch: 7680, width: 1920, height: 1080 };
+        let pitch_plan = SourcePlan { layout: SurfaceLayout::Pitch, page_kind: None, line_bytes: 1908 * 4, offset: 256 };
+        let r = Rect { left: 8, top: 2, right: 108, bottom: 12 };
+        let c = foreign_copy(&pitch_plan, map_va(4), 7680, 1908, 910, r, &dst, 10, 20, Remap::SwapRb).unwrap();
+        assert_eq!(c.src_va, map_va(4) + 256 + 2 * 7680 + 32);
+        assert_eq!(c.dst_va, dst.va + 20 * 7680 + 40);
+        assert_eq!((c.line_bytes, c.lines), (400, 10));
+        let bl = SurfaceLayout::BlockLinear { block_height_log2: 4, element_bytes: 4, image_height: 910, origin_x_bytes: 0, origin_y: 0 };
+        let bl_plan = SourcePlan { layout: bl, page_kind: Some(6), line_bytes: 1908 * 4, offset: 0 };
+        let w = Rect::whole(1908, 910);
+        let c = foreign_copy(&bl_plan, map_va(4), 7680, 1908, 910, w, &dst, 0, 0, Remap::None).unwrap();
+        assert_eq!((c.src_va, c.dst_va, c.lines, c.line_bytes), (map_va(4), dst.va, 910, 7632));
+        assert_eq!(c.layout, bl);
+        let c = foreign_copy(&bl_plan, map_va(4), 7680, 1908, 910, r, &dst, 5, 6, Remap::None).unwrap();
+        assert_eq!(c.src_va, map_va(4));
+        assert_eq!(c.dst_va, dst.va + 6 * 7680 + 20);
+        assert_eq!((c.line_bytes, c.lines), (400, 10));
+        assert!(matches!(c.layout, SurfaceLayout::BlockLinear { origin_x_bytes: 32, origin_y: 2, image_height: 910, .. }));
+        assert_eq!(foreign_copy(&bl_plan, map_va(4), 7680, 1908, 910, w, &dst, 100, 0, Remap::None), Err(CopyError::Rect));
+        assert_eq!(
+            foreign_copy(&bl_plan, map_va(4), 7680, 1908, 910, Rect { left: 0, top: 0, right: 1909, bottom: 1 }, &dst, 0, 0, Remap::None),
+            Err(CopyError::Rect)
+        );
+    }
+
+    #[test]
+    fn import_messages_match_nvk_s_layout() {
+        // `DRM_IOWR('d', 0x49, 24)`: dir 3 << 30, size 24 << 16, type 'd' << 8, nr 0x49.
+        assert_eq!(DRM_IOCTL_GEM_EXPORT_NVKMS, (3 << 30) | (24 << 16) | ((b'd' as u32) << 8) | 0x49);
+        let e = gem_export_params(0x1234);
+        assert_eq!(&e[0..4], &0x1234u32.to_le_bytes());
+        assert_eq!(&e[16..24], &4u64.to_le_bytes());
+        let i = import_from_fd_params(7, 0x4b4d_0001, 0x4b4d_3100);
+        assert_eq!(&i[0..4], &7u32.to_le_bytes());
+        assert_eq!(&i[4..8], &1u32.to_le_bytes());
+        assert_eq!(&i[8..12], &0x4b4d_0001u32.to_le_bytes());
+        assert_eq!(&i[12..16], &0x4b4d_0001u32.to_le_bytes());
+        assert_eq!(&i[16..20], &0x4b4d_3100u32.to_le_bytes());
     }
 
     #[test]
