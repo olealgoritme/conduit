@@ -124,6 +124,17 @@ pub struct Caps {
     pub reported: u32,
 }
 
+/// `knob` with the prerequisites of `GdiAccel` = 1: GDI `TEXTURE` surfaces in RM video memory
+/// (`RedirVram` = 1) and the copy-engine channel (`RmCopyEngine` = 1). Without them every GDI
+/// texture is a Venus image no engine of the executor reaches, every command on it is dropped and
+/// the desktop is garbage (362.1 row a): the caps are then not reported at all (`needs_more`).
+pub const fn resolve_caps_with(knob: u32, redir_vram_on: bool, copy_engine_on: bool) -> Caps {
+    if knob == 1 && !(redir_vram_on && copy_engine_on) {
+        return Caps { on: false, reported: 0 };
+    }
+    resolve_caps(knob)
+}
+
 pub const fn resolve_caps(knob: u32) -> Caps {
     match knob {
         1 => Caps { on: true, reported: ACCEL_CAPS },
@@ -1514,6 +1525,10 @@ mod tests {
         assert_eq!(resolve_caps(2), Caps { on: false, reported: 0x100 });
         assert_eq!(resolve_caps(3), Caps { on: false, reported: 0x1000_0000 });
         assert_eq!(resolve_caps(4), Caps { on: false, reported: 0 });
+        assert_eq!(resolve_caps_with(1, true, true), resolve_caps(1));
+        assert_eq!(resolve_caps_with(1, false, true), Caps { on: false, reported: 0 });
+        assert_eq!(resolve_caps_with(1, true, false), Caps { on: false, reported: 0 });
+        assert_eq!(resolve_caps_with(2, false, false), resolve_caps(2));
         assert_eq!(resolve_caps(0xffff_ffff).reported, 0);
         let c = resolve_caps(1);
         assert!(c.on);

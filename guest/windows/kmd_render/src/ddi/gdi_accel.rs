@@ -102,14 +102,23 @@ pub(crate) fn on() -> bool {
 }
 
 /// The caps word for a knob snapshot (`query_adapter_info`), pure.
-pub(crate) fn reported_caps(knob: u32) -> u32 {
-    ga::resolve_caps(knob).reported
+pub(crate) fn reported_caps(knobs: &crate::adapter::AdapterKnobs) -> u32 {
+    caps_of(knobs).reported
+}
+
+fn caps_of(k: &crate::adapter::AdapterKnobs) -> ga::Caps {
+    ga::resolve_caps_with(
+        k.gdi_accel,
+        helios_kmd_logic::rm_vidmem::knob_on(k.gdi_redir_vram),
+        k.gdi_rm_copy_engine == 1,
+    )
 }
 
 /// StartDevice (PASSIVE), from `AdapterKnobs::read_at_start`: latch the knob, zero the counters,
 /// and with the knob on write the mirrors. With the knob off nothing is written.
-pub(crate) fn note_start(knob: u32) {
-    let caps = ga::resolve_caps(knob);
+pub(crate) fn note_start(knobs: &crate::adapter::AdapterKnobs) {
+    let knob = knobs.gdi_accel;
+    let caps = caps_of(knobs);
     for c in [
         &CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN, &SUB_N,
         &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD, &UNR_N, &UNR_K, &UNR_WH,
@@ -121,8 +130,9 @@ pub(crate) fn note_start(knob: u32) {
     crate::ddi::gdi_exec::reset_for_start(caps.on);
     if caps.on {
         publish_counters();
-    } else if caps.reported != 0 {
-        // A one-bit experiment (knob 2 or 3): only the word is mirrored.
+    } else if caps.reported != 0 || knob == 1 {
+        // A one-bit experiment (knob 2 or 3): only the word is mirrored. Knob 1 without
+        // `RedirVram`/`RmCopyEngine`: `GdiCaps` 0 says GDI acceleration was not reported.
         crate::diag::record_named_bytes(b"GdiKnob", knob);
         crate::diag::record_named_bytes(b"GdiCaps", caps.reported);
     }
