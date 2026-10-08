@@ -1866,6 +1866,10 @@ pub const COUNTERS: &[&str] = &[
     "GdiPrb6",
     "GdiPrb7",
     "GdiPrbK",
+    // A probed all-zero source row: the whole source scanned (16 rows): scans | sources with any
+    // non-zero pixel << 10; the last: resource id << 16 | non-zero rows << 8 | GDI type.
+    "GdiSrcScan",
+    "GdiSrcScanK",
     "GdiPre0",
     "GdiPre1",
     "GdiPre2",
