@@ -258,6 +258,8 @@ pub(crate) struct AdapterKnobs {
     /// (`gdi_accel::resolve_caps_with`). Their owners read them again at StartDevice.
     pub gdi_redir_vram: u32,
     pub gdi_rm_copy_engine: u32,
+    /// `D3d12Node` (default off): report a second 3D node for D3D12 contexts.
+    pub d3d12_node: bool,
 }
 
 impl AdapterKnobs {
@@ -293,6 +295,7 @@ impl AdapterKnobs {
         gdi_accel: 0,
         gdi_redir_vram: 0,
         gdi_rm_copy_engine: 0,
+        d3d12_node: false,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -343,6 +346,7 @@ impl AdapterKnobs {
             gdi_accel: read_config_dword(knobs::GDI_ACCEL, 0),
             gdi_redir_vram: read_config_dword(knobs::REDIR_VRAM, 0),
             gdi_rm_copy_engine: read_config_dword(knobs::RM_COPY_ENGINE, 0),
+            d3d12_node: read_config_dword(knobs::D3D12_NODE, 0) != 0,
         }
     }
 
@@ -652,8 +656,9 @@ pub struct AdapterContext {
     /// table with no `isr_status` guard at all and used to rest on statement
     /// order plus a comment.
     started_published: AtomicU32,
-    /// Last fence completed by the bring-up scheduler path.
-    last_completed_fence: AtomicU32,
+    /// Last fence completed, per WDDM node (`D3d12Node`: node 1 carries D3D12
+    /// contexts; every node has its own SubmissionFenceId sequence).
+    last_completed_fence: [AtomicU32; crate::virtio::gpu::MAX_WDDM_NODES],
     /// Serializes DMA_COMPLETED notification and its monotonic fence update.
     /// A DPC can take an older ready fence out of the virtio FIFO while a new
     /// SubmitCommand concurrently takes the immediate-completion path; without
@@ -1326,7 +1331,7 @@ impl AdapterContext {
             ),
             started: UnsafeCell::new(None),
             started_published: AtomicU32::new(0),
-            last_completed_fence: AtomicU32::new(0),
+            last_completed_fence: [const { AtomicU32::new(0) }; crate::virtio::gpu::MAX_WDDM_NODES],
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
             msi_state: AtomicU32::new(0),
@@ -1938,7 +1943,14 @@ impl AdapterContext {
     /// only through [`WddmNotifyGuard`], so advancing the scheduler watermark
     /// statically requires ownership of the notification-lock proof.
     pub(crate) fn completed_fence(&self) -> u32 {
-        self.last_completed_fence.load(Ordering::Acquire)
+        self.completed_fence_node(0)
+    }
+
+    /// [`Self::completed_fence`] of WDDM node `node` (0 for an out-of-range one).
+    pub(crate) fn completed_fence_node(&self, node: u32) -> u32 {
+        self.last_completed_fence
+            .get(node as usize)
+            .map_or(0, |f| f.load(Ordering::Acquire))
     }
 
     /// Install (or clear) the virtio transport under the lock.
