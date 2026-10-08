@@ -1,0 +1,616 @@
+Helios vkd3d-proton fork: inline producer signal, admission timing, GPU timestamps, ECL fence for presents
+
+Conduit Basemark D3D12 on NVK. Applied after 0005.
+
+- The Helios producer signal of an ExecuteCommandLists rides on the batch's
+  own last vkQueueSubmit2 (one more VkSemaphoreSubmitInfo) instead of a
+  separate submit, when that submit goes to this queue (a fallback-queue tail
+  keeps the separate, joining submit). One NVK submit (a semaphore release
+  with wait-for-idle and a non-stall interrupt) less per batch.
+  HELIOS_VKD3D_INLINE_SIGNAL=0 turns it off.
+- The worker records when each batch's admission event is seen: commit-to-
+  admission and (ECL fences) admission-to-signal timing, plus inline vs
+  separate producer signal counts, appended to helios_vkd3d_ecl_fence_stats.
+- HELIOS_VKD3D_GPU_TIMESTAMPS=1 (off by default): a TOP_OF_PIPE timestamp in
+  a submit right before each Helios batch and an ALL_COMMANDS one right after
+  it, in a per-queue ring of 64 query pairs read back without waiting when a
+  slot comes round. helios_vkd3d_gpu_time_stats: batches, GPU busy per batch
+  (end - max(begin, previous end)), idle gap before each batch, maximum, and
+  histograms. Two extra submits per batch while on.
+- helios_vkd3d_create_ecl_fence(queue, value, &fence): another RM fence for a
+  value of the queue's ECL timeline, for a scanout present that flips when
+  the frame's last batch is done.
+- helios_vkd3d.def exports the new entry points.
+
+diff --git a/libs/d3d12core/helios_vkd3d.def b/libs/d3d12core/helios_vkd3d.def
+index ff11a687..b3cc58ec 100644
+--- a/libs/d3d12core/helios_vkd3d.def
++++ b/libs/d3d12core/helios_vkd3d.def
+@@ -12,3 +12,5 @@ EXPORTS
+     helios_vkd3d_execute_command_lists_rm
+     helios_vkd3d_ecl_fence_stats
+     helios_vkd3d_memory_stats
++    helios_vkd3d_create_ecl_fence
++    helios_vkd3d_gpu_time_stats
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index bf458e30..62921ada 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -39,6 +39,10 @@ struct vkd3d_helios_rm_request
+ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+         struct d3d12_command_queue_submission *sub, HANDLE admission_event,
+         uint32_t *ctx, uint32_t *value, uint64_t *cookie, struct vkd3d_helios_rm_request *rm);
++struct vkd3d_helios_execution;
++static bool vkd3d_helios_inline_signal_info(struct d3d12_command_queue *queue,
++        struct vkd3d_helios_execution *op, VkSemaphoreSubmitInfo *info);
++static void vkd3d_helios_mark_inline_signalled(struct vkd3d_helios_execution *op);
+ 
+ static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
+         const struct d3d12_command_queue_submission *sub);
+@@ -25744,7 +25748,8 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
+     VkLatencySubmissionPresentIdNV latency_submit_present_info;
+     VkSemaphoreSubmitInfo transition_wait_semaphore_info;
+     struct dxgi_vk_swap_chain *low_latency_swapchain;
+-    VkSemaphoreSubmitInfo signal_semaphore_infos[2];
++    VkSemaphoreSubmitInfo signal_semaphore_infos[3];
++    bool helios_inline = false;
+     VkSemaphoreSubmitInfo *binary_semaphore_info;
+     bool stagger_submissions, is_first, is_last;
+     VkSemaphoreSubmitInfo wait_semaphore_info;
+@@ -26024,6 +26029,15 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
+             binary_semaphore_info->stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+         }
+ 
++        /* Helios: the producer signal rides on the batch's last submit to
++         * this queue (patch 0006); a fallback-queue tail keeps the separate
++         * signal submit, which joins it. */
++        helios_inline = is_last && !fallback && exec->helios_execution &&
++                vkd3d_helios_inline_signal_info(command_queue, exec->helios_execution,
++                        &signal_semaphore_infos[submit->signalSemaphoreInfoCount]);
++        if (helios_inline)
++            submit->signalSemaphoreInfoCount++;
++
+         /* If we don't use serializing semaphore, we have to ensure that the last command buffer
+          * in a submit is not a fallback submit. */
+         assert(!is_last || command_queue->serializing_semaphore || !fallback);
+@@ -26073,6 +26087,8 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
+         }
+ 
+         last_submitted_value = signal_semaphore_infos[0].value;
++        if (helios_inline)
++            vkd3d_helios_mark_inline_signalled(exec->helios_execution);
+ 
+         /* If serializing binary semaphore is not used, the serializing command buffer is always executed on the expected
+          * queue at the end. If it is used, the last fallback queue submission signals the binary semaphore,
+@@ -26894,8 +26910,10 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
+                     &transition_cmd.commandBuffer,
+                     &transition_semaphore.value);
+ 
++            vkd3d_helios_ts_begin(queue, submission.execute.helios_execution);
+             d3d12_command_queue_execute(queue, &submission.execute, &transition_cmd, &transition_semaphore);
+             vkd3d_helios_execution_signal(queue, submission.execute.helios_execution);
++            vkd3d_helios_ts_end(queue, submission.execute.helios_execution);
+ 
+ helios_execute_cleanup:
+             vkd3d_helios_execution_free(submission.execute.helios_execution);
+diff --git a/libs/vkd3d/helios_producer.h b/libs/vkd3d/helios_producer.h
+index 29eb28d3..04f00a0d 100644
+--- a/libs/vkd3d/helios_producer.h
++++ b/libs/vkd3d/helios_producer.h
+@@ -31,6 +31,13 @@ struct vkd3d_helios_execution
+     /* QueryPerformanceCounter at the commit, for the commit-to-signal
+      * latency histogram. */
+     int64_t commit_qpc;
++    /* QueryPerformanceCounter when the admission event was seen (0 = not). */
++    int64_t admit_qpc;
++    /* The producer value was signalled by the batch's own last submit
++     * (vkd3d_helios_inline_signal_info), so no separate signal submit. */
++    bool signalled_inline;
++    /* GPU timestamp slot + 1 (HELIOS_VKD3D_GPU_TIMESTAMPS), 0 = none. */
++    uint32_t ts_slot;
+ };
+ 
+ #ifdef _WIN32
+@@ -90,9 +97,44 @@ static struct
+ {
+     uint64_t signals, sum_us, max_us, signal_failed, reserved, created, create_failed;
+     uint64_t buckets[VKD3D_HELIOS_ECL_BUCKETS];
++    /* Every Helios execution: commit to admission seen by the worker. */
++    uint64_t admits, admit_sum_us;
++    uint64_t admit_buckets[VKD3D_HELIOS_ECL_BUCKETS];
++    /* ECL fences: admission to the fence's timeline signal. */
++    uint64_t admit_to_signal_sum_us;
++    /* Executions whose producer signal rode on the batch's own submit. */
++    uint64_t inline_signals, separate_signals;
+ } vkd3d_helios_ecl_stats;
+ 
+-static void vkd3d_helios_ecl_note_signal(int64_t commit_qpc)
++static uint64_t vkd3d_helios_qpc_us(int64_t from, int64_t to)
++{
++    LARGE_INTEGER freq;
++    QueryPerformanceFrequency(&freq);
++    return to > from ? (uint64_t)(to - from) * 1000000ull / (uint64_t)freq.QuadPart : 0;
++}
++
++static unsigned int vkd3d_helios_ecl_bucket(uint64_t us)
++{
++    unsigned int i;
++    for (i = 0; i < ARRAY_SIZE(vkd3d_helios_ecl_buckets_us); i++)
++        if (us < vkd3d_helios_ecl_buckets_us[i])
++            break;
++    return i;
++}
++
++static void vkd3d_helios_note_admitted(struct vkd3d_helios_execution *op)
++{
++    LARGE_INTEGER now;
++    uint64_t us;
++    QueryPerformanceCounter(&now);
++    op->admit_qpc = now.QuadPart;
++    us = vkd3d_helios_qpc_us(op->commit_qpc, op->admit_qpc);
++    InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.admits);
++    InterlockedExchangeAdd64((LONG64 *)&vkd3d_helios_ecl_stats.admit_sum_us, (LONG64)us);
++    InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.admit_buckets[vkd3d_helios_ecl_bucket(us)]);
++}
++
++static void vkd3d_helios_ecl_note_signal(int64_t commit_qpc, int64_t admit_qpc)
+ {
+     LARGE_INTEGER now, freq;
+     uint64_t us, old;
+@@ -106,6 +148,9 @@ static void vkd3d_helios_ecl_note_signal(int64_t commit_qpc)
+     InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.buckets[i]);
+     InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.signals);
+     InterlockedExchangeAdd64((LONG64 *)&vkd3d_helios_ecl_stats.sum_us, (LONG64)us);
++    if (admit_qpc)
++        InterlockedExchangeAdd64((LONG64 *)&vkd3d_helios_ecl_stats.admit_to_signal_sum_us,
++                (LONG64)vkd3d_helios_qpc_us(admit_qpc, now.QuadPart));
+     old = (uint64_t)InterlockedCompareExchange64((LONG64 *)&vkd3d_helios_ecl_stats.max_us, 0, 0);
+     while (us > old)
+     {
+@@ -120,12 +165,45 @@ static void vkd3d_helios_ecl_note_signal(int64_t commit_qpc)
+ /* ECL fence counters for the UMD's log line, in this order: signals,
+  * commit-to-signal sum (us), max (us), signal failures, values reserved,
+  * fences created, fence creates failed, then the 7 histogram buckets
+- * (<50 us, <200 us, <1 ms, <2 ms, <5 ms, <20 ms, >= 20 ms). Returns how many
+- * values it wrote (at most `count`). */
++ * (<50 us, <200 us, <1 ms, <2 ms, <5 ms, <20 ms, >= 20 ms); then (patch
++ * 0006) admissions, commit-to-admission sum (us), its 7 buckets, the ECL
++ * fences' admission-to-signal sum (us), producer signals inline in the
++ * batch's submit, separate producer signal submits. Returns how many values
++ * it wrote (at most `count`). */
++/* NVK on RM: another RM fence for `value` of this queue's ECL timeline (a
++ * value a helios_vkd3d_execute_command_lists_rm returned), e.g. for a scanout
++ * present that must wait for the frame's last batch. *fence is the caller's
++ * (hand it on or close it with the ICD's rm_fence_close). S_OK with a nonzero
++ * handle; E_NOTIMPL without ECL fences; E_FAIL when the fence was refused. */
++HRESULT helios_vkd3d_create_ecl_fence(ID3D12CommandQueue *iface, uint64_t value, uint32_t *fence)
++{
++#ifdef _WIN32
++    const struct helios_icd_api *icd;
++    struct d3d12_command_queue *queue;
++    if (!iface || !value || !fence)
++        return E_INVALIDARG;
++    *fence = 0;
++    queue = impl_from_ID3D12CommandQueue(iface);
++    if (!(icd = vkd3d_helios_icd_ecl_api(queue->device)))
++        return E_NOTIMPL;
++    if (icd->ecl_fence_create((VkDevice)queue->device->vk_device, (uint64_t)(uintptr_t)queue,
++            value, fence) != VK_SUCCESS || !*fence)
++    {
++        *fence = 0;
++        return E_FAIL;
++    }
++    return S_OK;
++#else
++    (void)iface; (void)value;
++    if (fence) *fence = 0;
++    return E_NOTIMPL;
++#endif
++}
++
+ uint32_t helios_vkd3d_ecl_fence_stats(uint64_t *out, uint32_t count)
+ {
+ #ifdef _WIN32
+-    uint64_t all[7 + VKD3D_HELIOS_ECL_BUCKETS];
++    uint64_t all[7 + VKD3D_HELIOS_ECL_BUCKETS + 2 + VKD3D_HELIOS_ECL_BUCKETS + 3];
+     uint32_t i, n;
+     all[0] = vkd3d_helios_ecl_stats.signals;
+     all[1] = vkd3d_helios_ecl_stats.sum_us;
+@@ -136,6 +214,14 @@ uint32_t helios_vkd3d_ecl_fence_stats(uint64_t *out, uint32_t count)
+     all[6] = vkd3d_helios_ecl_stats.create_failed;
+     for (i = 0; i < VKD3D_HELIOS_ECL_BUCKETS; i++)
+         all[7 + i] = vkd3d_helios_ecl_stats.buckets[i];
++    n = 7 + VKD3D_HELIOS_ECL_BUCKETS;
++    all[n++] = vkd3d_helios_ecl_stats.admits;
++    all[n++] = vkd3d_helios_ecl_stats.admit_sum_us;
++    for (i = 0; i < VKD3D_HELIOS_ECL_BUCKETS; i++)
++        all[n++] = vkd3d_helios_ecl_stats.admit_buckets[i];
++    all[n++] = vkd3d_helios_ecl_stats.admit_to_signal_sum_us;
++    all[n++] = vkd3d_helios_ecl_stats.inline_signals;
++    all[n++] = vkd3d_helios_ecl_stats.separate_signals;
+     n = count < (uint32_t)ARRAY_SIZE(all) ? count : (uint32_t)ARRAY_SIZE(all);
+     if (out)
+         memcpy(out, all, n * sizeof(*out));
+@@ -323,14 +409,22 @@ static bool vkd3d_helios_execution_wait(struct d3d12_command_queue *queue,
+         /* Ordinary context destruction drains before setting cancellation.
+          * Failed submission/device teardown may cancel pending admissions. */
+         result = WaitForSingleObject(op->admission_event, 0);
+-        if (result == WAIT_OBJECT_0) return true;
++        if (result == WAIT_OBJECT_0)
++        {
++            vkd3d_helios_note_admitted(op);
++            return true;
++        }
+         if (result != WAIT_TIMEOUT ||
+                 vkd3d_atomic_uint32_load_explicit(&queue->helios_execution_cancelled, vkd3d_memory_order_acquire))
+             break;
+         /* No Vulkan queue lock is held here. Other queues can satisfy a runtime
+          * wait-before-signal. A timeout checks cancellation; it is never success. */
+         result = WaitForSingleObject(op->admission_event, 100);
+-        if (result == WAIT_OBJECT_0) return true;
++        if (result == WAIT_OBJECT_0)
++        {
++            vkd3d_helios_note_admitted(op);
++            return true;
++        }
+         if (result != WAIT_TIMEOUT) break;
+     }
+ #else
+@@ -341,6 +435,290 @@ static bool vkd3d_helios_execution_wait(struct d3d12_command_queue *queue,
+     return false;
+ }
+ 
++#ifdef _WIN32
++/* Fold the producer signal into the batch's last submit (patch 0006): one
++ * NVK submit (a semaphore release with a wait-for-idle and a non-stall
++ * interrupt each) less per ExecuteCommandLists. Only when that submit goes to
++ * this queue (not a fallback queue, whose join still needs the separate
++ * submit's waiter flush). HELIOS_VKD3D_INLINE_SIGNAL=0 turns it off. */
++static bool vkd3d_helios_inline_signal_enabled(void)
++{
++    static int enabled = -1;
++    char env[8];
++    if (enabled < 0)
++        enabled = !(vkd3d_get_env_var("HELIOS_VKD3D_INLINE_SIGNAL", env, sizeof(env)) && env[0] == '0');
++    return enabled;
++}
++
++static bool vkd3d_helios_inline_signal_info(struct d3d12_command_queue *queue,
++        struct vkd3d_helios_execution *op, VkSemaphoreSubmitInfo *info)
++{
++    if (!op || !queue->helios_producer || !vkd3d_helios_inline_signal_enabled())
++        return false;
++    memset(info, 0, sizeof(*info));
++    info->sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
++    info->semaphore = queue->helios_producer->semaphore;
++    info->value = op->value;
++    info->stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    return true;
++}
++
++static void vkd3d_helios_mark_inline_signalled(struct vkd3d_helios_execution *op)
++{
++    if (op)
++        op->signalled_inline = true;
++}
++
++/* GPU execution time per batch (HELIOS_VKD3D_GPU_TIMESTAMPS=1, off by
++ * default): a TOP_OF_PIPE timestamp in a submit right before each Helios
++ * execution and an ALL_COMMANDS timestamp in a submit right after it, in a
++ * per-queue ring of query pairs, read back (never waited for) when the ring
++ * slot comes round again. busy = end - max(begin, previous end), gap =
++ * begin - previous end (the queue idle before the batch). Costs two extra
++ * submits per batch while on. */
++#define VKD3D_HELIOS_TS_SLOTS 64u
++
++struct vkd3d_helios_ts
++{
++    VkQueryPool pool;
++    VkCommandPool cmd_pool;
++    VkCommandBuffer begin[VKD3D_HELIOS_TS_SLOTS];
++    VkCommandBuffer end[VKD3D_HELIOS_TS_SLOTS];
++    bool used[VKD3D_HELIOS_TS_SLOTS];
++    uint32_t next;
++    uint64_t last_end;
++    uint64_t mask;
++    double period_ns;
++};
++
++static struct
++{
++    uint64_t batches, busy_sum_ns, gap_sum_ns, busy_max_ns, unavailable;
++    uint64_t busy_buckets[VKD3D_HELIOS_ECL_BUCKETS];
++    uint64_t gap_buckets[VKD3D_HELIOS_ECL_BUCKETS];
++} vkd3d_helios_ts_stats;
++
++static bool vkd3d_helios_ts_enabled(void)
++{
++    static int enabled = -1;
++    char env[8];
++    if (enabled < 0)
++        enabled = vkd3d_get_env_var("HELIOS_VKD3D_GPU_TIMESTAMPS", env, sizeof(env)) && env[0] == '1';
++    return enabled;
++}
++
++static struct vkd3d_helios_ts *vkd3d_helios_ts_create(struct d3d12_command_queue *queue)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
++    VkDevice vk_device = queue->device->vk_device;
++    VkCommandBufferAllocateInfo alloc = {0};
++    VkCommandBufferBeginInfo begin_info = {0};
++    VkCommandPoolCreateInfo pool_info = {0};
++    VkQueryPoolCreateInfo query_info = {0};
++    VkCommandBuffer buffers[2 * VKD3D_HELIOS_TS_SLOTS];
++    struct vkd3d_helios_ts *ts;
++    uint32_t i;
++
++    if (!queue->vkd3d_queue->timestamp_bits)
++        return NULL;
++    if (!(ts = vkd3d_calloc(1, sizeof(*ts))))
++        return NULL;
++    ts->mask = queue->vkd3d_queue->timestamp_bits >= 64 ? ~0ull :
++            (1ull << queue->vkd3d_queue->timestamp_bits) - 1;
++    ts->period_ns = queue->device->vk_info.device_limits.timestampPeriod;
++    query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++    query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++    query_info.queryCount = 2 * VKD3D_HELIOS_TS_SLOTS;
++    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    pool_info.queueFamilyIndex = queue->vkd3d_queue->vk_family_index;
++    if (VK_CALL(vkCreateQueryPool(vk_device, &query_info, NULL, &ts->pool)) != VK_SUCCESS ||
++            VK_CALL(vkCreateCommandPool(vk_device, &pool_info, NULL, &ts->cmd_pool)) != VK_SUCCESS)
++        goto fail;
++    alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    alloc.commandPool = ts->cmd_pool;
++    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    alloc.commandBufferCount = 2 * VKD3D_HELIOS_TS_SLOTS;
++    if (VK_CALL(vkAllocateCommandBuffers(vk_device, &alloc, buffers)) != VK_SUCCESS)
++        goto fail;
++    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    begin_info.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
++    for (i = 0; i < VKD3D_HELIOS_TS_SLOTS; i++)
++    {
++        ts->begin[i] = buffers[2 * i];
++        ts->end[i] = buffers[2 * i + 1];
++        if (VK_CALL(vkBeginCommandBuffer(ts->begin[i], &begin_info)) != VK_SUCCESS)
++            goto fail;
++        VK_CALL(vkCmdResetQueryPool(ts->begin[i], ts->pool, 2 * i, 2));
++        VK_CALL(vkCmdWriteTimestamp2(ts->begin[i], VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts->pool, 2 * i));
++        if (VK_CALL(vkEndCommandBuffer(ts->begin[i])) != VK_SUCCESS ||
++                VK_CALL(vkBeginCommandBuffer(ts->end[i], &begin_info)) != VK_SUCCESS)
++            goto fail;
++        VK_CALL(vkCmdWriteTimestamp2(ts->end[i], VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ts->pool, 2 * i + 1));
++        if (VK_CALL(vkEndCommandBuffer(ts->end[i])) != VK_SUCCESS)
++            goto fail;
++    }
++    INFO("Helios: GPU timestamps on for queue %p (period %.3f ns, %u bits).\n",
++            queue, ts->period_ns, queue->vkd3d_queue->timestamp_bits);
++    return ts;
++
++fail:
++    ERR("Helios: GPU timestamps unavailable for queue %p.\n", queue);
++    if (ts->cmd_pool)
++        VK_CALL(vkDestroyCommandPool(vk_device, ts->cmd_pool, NULL));
++    if (ts->pool)
++        VK_CALL(vkDestroyQueryPool(vk_device, ts->pool, NULL));
++    vkd3d_free(ts);
++    return NULL;
++}
++
++static void vkd3d_helios_ts_destroy(struct d3d12_command_queue *queue)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
++    struct vkd3d_helios_ts *ts = queue->helios_ts;
++    if (!ts)
++        return;
++    VK_CALL(vkDestroyCommandPool(queue->device->vk_device, ts->cmd_pool, NULL));
++    VK_CALL(vkDestroyQueryPool(queue->device->vk_device, ts->pool, NULL));
++    vkd3d_free(ts);
++    queue->helios_ts = NULL;
++}
++
++/* Read slot `i`'s previous pair, if any, into the stats. In ring order, which
++ * is submission order on this queue. */
++static void vkd3d_helios_ts_harvest(struct d3d12_command_queue *queue, struct vkd3d_helios_ts *ts, uint32_t i)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
++    uint64_t data[4], begin, end, busy, gap, start;
++    if (!ts->used[i])
++        return;
++    ts->used[i] = false;
++    if (VK_CALL(vkGetQueryPoolResults(queue->device->vk_device, ts->pool, 2 * i, 2, sizeof(data), data,
++            2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)) < 0 ||
++            !data[1] || !data[3])
++    {
++        vkd3d_helios_ts_stats.unavailable++;
++        ts->last_end = 0;
++        return;
++    }
++    begin = data[0] & ts->mask;
++    end = data[2] & ts->mask;
++    if (end < begin)
++    {
++        vkd3d_helios_ts_stats.unavailable++;
++        ts->last_end = 0;
++        return;
++    }
++    start = ts->last_end && ts->last_end > begin ? ts->last_end : begin;
++    busy = end > start ? (uint64_t)((double)(end - start) * ts->period_ns) : 0;
++    gap = ts->last_end && begin > ts->last_end ? (uint64_t)((double)(begin - ts->last_end) * ts->period_ns) : 0;
++    ts->last_end = end;
++    vkd3d_helios_ts_stats.batches++;
++    vkd3d_helios_ts_stats.busy_sum_ns += busy;
++    vkd3d_helios_ts_stats.gap_sum_ns += gap;
++    if (busy > vkd3d_helios_ts_stats.busy_max_ns)
++        vkd3d_helios_ts_stats.busy_max_ns = busy;
++    vkd3d_helios_ts_stats.busy_buckets[vkd3d_helios_ecl_bucket(busy / 1000)]++;
++    vkd3d_helios_ts_stats.gap_buckets[vkd3d_helios_ecl_bucket(gap / 1000)]++;
++}
++
++static void vkd3d_helios_ts_submit(struct d3d12_command_queue *queue, VkCommandBuffer cmd)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
++    VkCommandBufferSubmitInfo cmd_info = {0};
++    VkSubmitInfo2 submit = {0};
++    VkQueue vk_queue;
++    cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++    cmd_info.commandBuffer = cmd;
++    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
++    submit.commandBufferInfoCount = 1;
++    submit.pCommandBufferInfos = &cmd_info;
++    if ((vk_queue = vkd3d_queue_acquire(queue->vkd3d_queue)))
++    {
++        VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit, VK_NULL_HANDLE));
++        vkd3d_queue_release(queue->vkd3d_queue);
++    }
++}
++
++/* Worker thread only (the ring and its command pool are the worker's). */
++static void vkd3d_helios_ts_begin(struct d3d12_command_queue *queue, struct vkd3d_helios_execution *op)
++{
++    struct vkd3d_helios_ts *ts;
++    uint32_t i;
++    if (!op || !vkd3d_helios_ts_enabled())
++        return;
++    if (!queue->helios_ts && !(queue->helios_ts = vkd3d_helios_ts_create(queue)))
++        return;
++    ts = queue->helios_ts;
++    i = ts->next;
++    ts->next = (ts->next + 1) % VKD3D_HELIOS_TS_SLOTS;
++    vkd3d_helios_ts_harvest(queue, ts, i);
++    vkd3d_helios_ts_submit(queue, ts->begin[i]);
++    op->ts_slot = i + 1;
++}
++
++static void vkd3d_helios_ts_end(struct d3d12_command_queue *queue, struct vkd3d_helios_execution *op)
++{
++    struct vkd3d_helios_ts *ts = queue->helios_ts;
++    if (!op || !op->ts_slot || !ts)
++        return;
++    vkd3d_helios_ts_submit(queue, ts->end[op->ts_slot - 1]);
++    ts->used[op->ts_slot - 1] = true;
++}
++
++/* GPU timestamp counters (HELIOS_VKD3D_GPU_TIMESTAMPS=1): batches, busy sum
++ * (ns), idle-gap sum (ns), busy max (ns), pairs not available, then the busy
++ * and gap histograms (7 buckets each: <50 us, <200 us, <1 ms, <2 ms, <5 ms,
++ * <20 ms, >= 20 ms). Read without a lock (worker-written plain counters).
++ * Returns how many values it wrote. */
++uint32_t helios_vkd3d_gpu_time_stats(uint64_t *out, uint32_t count)
++{
++    uint64_t all[5 + 2 * VKD3D_HELIOS_ECL_BUCKETS];
++    uint32_t i, n = 0;
++    all[n++] = vkd3d_helios_ts_stats.batches;
++    all[n++] = vkd3d_helios_ts_stats.busy_sum_ns;
++    all[n++] = vkd3d_helios_ts_stats.gap_sum_ns;
++    all[n++] = vkd3d_helios_ts_stats.busy_max_ns;
++    all[n++] = vkd3d_helios_ts_stats.unavailable;
++    for (i = 0; i < VKD3D_HELIOS_ECL_BUCKETS; i++)
++        all[n++] = vkd3d_helios_ts_stats.busy_buckets[i];
++    for (i = 0; i < VKD3D_HELIOS_ECL_BUCKETS; i++)
++        all[n++] = vkd3d_helios_ts_stats.gap_buckets[i];
++    n = count < n ? count : n;
++    if (out)
++        memcpy(out, all, n * sizeof(*out));
++    return n;
++}
++
++#else
++static bool vkd3d_helios_inline_signal_info(struct d3d12_command_queue *queue,
++        struct vkd3d_helios_execution *op, VkSemaphoreSubmitInfo *info)
++{
++    (void)queue; (void)op; (void)info;
++    return false;
++}
++
++static void vkd3d_helios_mark_inline_signalled(struct vkd3d_helios_execution *op)
++{
++    (void)op;
++}
++
++static void vkd3d_helios_ts_begin(struct d3d12_command_queue *queue, struct vkd3d_helios_execution *op)
++{
++    (void)queue; (void)op;
++}
++
++static void vkd3d_helios_ts_end(struct d3d12_command_queue *queue, struct vkd3d_helios_execution *op)
++{
++    (void)queue; (void)op;
++}
++
++uint32_t helios_vkd3d_gpu_time_stats(uint64_t *out, uint32_t count)
++{
++    (void)out; (void)count;
++    return 0;
++}
++#endif
++
+ static void vkd3d_helios_execution_signal(struct d3d12_command_queue *queue,
+         struct vkd3d_helios_execution *op)
+ {
+@@ -350,6 +728,33 @@ static void vkd3d_helios_execution_signal(struct d3d12_command_queue *queue,
+     VkQueue vk_queue;
+     VkResult vr = VK_ERROR_DEVICE_LOST;
+     if (!op) return;
++#ifdef _WIN32
++    if (op->signalled_inline)
++    {
++        /* The batch's last submit signalled the producer value already;
++         * only the ECL fence remains. */
++        InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.inline_signals);
++        if (!op->rm_value || FAILED(d3d12_device_removed_reason(queue->device)))
++            return;
++        if ((vk_queue = vkd3d_queue_acquire(queue->vkd3d_queue)))
++        {
++            const struct helios_icd_api *icd = vkd3d_helios_icd_ecl_api(queue->device);
++            vr = icd ? icd->ecl_fence_signal((VkDevice)queue->device->vk_device, vk_queue,
++                    (uint64_t)(uintptr_t)queue, op->rm_value) : VK_ERROR_FEATURE_NOT_PRESENT;
++            vkd3d_queue_release(queue->vkd3d_queue);
++        }
++        if (vr == VK_SUCCESS)
++            vkd3d_helios_ecl_note_signal(op->commit_qpc, op->admit_qpc);
++        else
++        {
++            InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.signal_failed);
++            d3d12_device_mark_as_removed(queue->device, hresult_from_vk_result(vr),
++                    "ECL fence signal failed, vr %d.", vr);
++        }
++        return;
++    }
++    InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.separate_signals);
++#endif
+     /* This also joins an engine fallback copy submission. It is the same
+      * worker ordering used by QUEUE_USING_CALLBACK, with no worker drain. */
+     d3d12_command_queue_flush_waiters(queue, VKD3D_WAIT_SEMAPHORES_EXTERNAL | VKD3D_WAIT_SEMAPHORES_SERIALIZING);
+@@ -377,7 +782,7 @@ static void vkd3d_helios_execution_signal(struct d3d12_command_queue *queue,
+             VkResult rm_vr = icd ? icd->ecl_fence_signal((VkDevice)queue->device->vk_device, vk_queue,
+                     (uint64_t)(uintptr_t)queue, op->rm_value) : VK_ERROR_FEATURE_NOT_PRESENT;
+             if (rm_vr == VK_SUCCESS)
+-                vkd3d_helios_ecl_note_signal(op->commit_qpc);
++                vkd3d_helios_ecl_note_signal(op->commit_qpc, op->admit_qpc);
+             else
+             {
+                 InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.signal_failed);
+@@ -421,6 +826,9 @@ void vkd3d_helios_binding_cleanup(struct d3d12_resource *resource)
+ void vkd3d_helios_queue_cleanup(struct d3d12_command_queue *queue)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
++#ifdef _WIN32
++    vkd3d_helios_ts_destroy(queue);
++#endif
+     if (!queue->helios_producer) return;
+     /* Release joins the submission and fence workers before reaching here. */
+     VK_CALL(vkDestroySemaphore(queue->device->vk_device, queue->helios_producer->semaphore, NULL));
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index a88b19f4..b957451d 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -4038,6 +4038,9 @@ struct d3d12_command_queue
+     LONG refcount;
+     struct vkd3d_helios_stream *helios_producer;
+     uint32_t helios_execution_cancelled;
++    /* Helios: GPU timestamp ring (HELIOS_VKD3D_GPU_TIMESTAMPS=1), the
++     * submission worker's. */
++    struct vkd3d_helios_ts *helios_ts;
+ 
+     D3D12_COMMAND_QUEUE_DESC desc;
+ 
