@@ -326,6 +326,11 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
     // SAFETY: a live hContext from our CreateContext.
     let adapter = unsafe { crate::device::ContextHandleRef::from_raw(h_context) }
         .and_then(|c| c.adapter());
+    // The executor's own thread, started by the first GDI buffer (PASSIVE here).
+    if let Some(a) = adapter {
+        // SAFETY: PASSIVE (RenderKm / RenderGdi); `stop_hpd` joins the thread before the adapter goes.
+        unsafe { crate::ddi::gdi_thread::ensure_started(a) };
+    }
 
     // Distinct allocation indices referenced, for the patch list.
     let mut refs = [0u32; MAX_REFS];

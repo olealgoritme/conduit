@@ -157,6 +157,12 @@ impl AdapterContext {
         use core::sync::atomic::Ordering;
         // The mirror thread first (idempotent): from here the callers publish inline again.
         crate::ddi::mirror_thread::stop();
+        // The GDI executor's thread (`GdiAccel`; idempotent, a no-op when it never started). One
+        // that could not be joined keeps this context allocated, as the mirror thread does.
+        crate::ddi::gdi_thread::stop();
+        if crate::ddi::gdi_thread::leaked() {
+            self.hpd_worker_leaked.store(1, Ordering::Release);
+        }
         // The mirror thread reads this context (the dump, the pacing snapshot): one that could not
         // be joined keeps it allocated, like a worker that could not be joined.
         if crate::ddi::mirror_thread::leaked() {

@@ -1263,16 +1263,30 @@ pub mod cpu {
         }
     }
 
+    /// The source pixels the destination sub-rectangle `sub` reads through the truncate mapping
+    /// (mirrored where asked): the hull of the mapped first and last column and row, inside SrcRect.
+    pub fn scaled_window(sub: &Rect, dst: &Rect, src: &Rect, mirror_x: bool, mirror_y: bool) -> Rect {
+        if sub.is_empty() {
+            return Rect::default();
+        }
+        let x0 = scale_coord_mirror(sub.left, dst.left, dst.width(), src.left, src.width(), mirror_x);
+        let x1 = scale_coord_mirror(sub.right - 1, dst.left, dst.width(), src.left, src.width(), mirror_x);
+        let y0 = scale_coord_mirror(sub.top, dst.top, dst.height(), src.top, src.height(), mirror_y);
+        let y1 = scale_coord_mirror(sub.bottom - 1, dst.top, dst.height(), src.top, src.height(), mirror_y);
+        Rect::new(x0.min(x1), y0.min(y1), x0.max(x1) + 1, y0.max(y1) + 1).intersect(src)
+    }
+
     /// The source rectangle (in source-surface coordinates) a destination sub-rectangle reads,
     /// for sizing the source window: exact for BitBlt, the scaled hull for the scaled operations,
     /// the alpha-surface rectangle for ClearTypeBlend. `None` when the command has no source.
     pub fn src_window(cmd: &Cmd, sub: &Rect) -> Option<Rect> {
         match *cmd {
             Cmd::BitBlt { src, dst, .. } => Some(bitblt_src(sub, &dst, &src)),
-            Cmd::StretchBlt { src, .. } | Cmd::AlphaBlend { src, .. } | Cmd::TransparentBlt { src, .. } => {
-                // The scaled operations read inside SrcRect (Learn: "the result is guaranteed to
-                // be within the source surface"); the whole SrcRect is a safe hull.
-                Some(src)
+            Cmd::StretchBlt { src, dst, flags, .. } => {
+                Some(scaled_window(sub, &dst, &src, flags & (1 << 16) != 0, flags & (1 << 17) != 0))
+            }
+            Cmd::AlphaBlend { src, dst, .. } | Cmd::TransparentBlt { src, dst, .. } => {
+                Some(scaled_window(sub, &dst, &src, false, false))
             }
             Cmd::ClearTypeBlend { dst_to_alpha_x, dst_to_alpha_y, .. } => {
                 Some(sub.offset(dst_to_alpha_x, dst_to_alpha_y))
@@ -1432,6 +1446,10 @@ pub const COUNTERS: &[&str] = &[
     // state when it could not be brought up: 17 cold, 18 disabled, 19 broken, 20 other).
     "GdiChUp",
     "GdiCeWhy",
+    // Copies from a VRAM surface into a standard buffer (GDI readback: screen or window reads),
+    // and the executor thread's state (1 running, 0 on the HPD worker).
+    "GdiRdBk",
+    "GdiThr",
 ];
 
 #[cfg(test)]
@@ -1882,6 +1900,17 @@ mod tests {
         let src = surface(8, 8, |x, y| (x + 8 * y) as u32);
         let sv = View { data: &src, pitch: 32, x0: 0, y0: 0, w: 8, h: 8 };
         assert_eq!(cpu::src_window(&cmd, &Rect::new(0, 0, 16, 16)), Some(Rect::new(0, 0, 8, 8)));
+        // A corner sub-rectangle reads only its corner of the source (mirrored: the far corner).
+        let mirrored = match cmd {
+            Cmd::StretchBlt { src, dst, src_index, dst_index, subs, src_pitch, .. } => Cmd::StretchBlt {
+                src, dst, src_index, dst_index, subs, src_pitch, flags: 3 | 1 << 16 | 1 << 17,
+            },
+            _ => unreachable!(),
+        };
+        assert_eq!(cpu::src_window(&mirrored, &Rect::new(0, 0, 4, 4)), Some(Rect::new(6, 6, 8, 8)));
+        let plain = cmd;
+        assert_eq!(cpu::src_window(&plain, &Rect::new(0, 0, 4, 4)), Some(Rect::new(0, 0, 2, 2)));
+        assert_eq!(cpu::src_window(&plain, &Rect::new(5, 5, 6, 6)), Some(Rect::new(2, 2, 3, 3)));
         let mut dst = vec![0u8; 16 * 16 * 4];
         let mut dv = ViewMut { data: &mut dst, pitch: 64, x0: 0, y0: 0, w: 16, h: 16 };
         let mut done = Done::default();

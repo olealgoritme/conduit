@@ -32,6 +32,7 @@ pub(crate) mod flush_trace;
 pub(crate) mod gdi_accel;
 pub(crate) mod gdi_ce_glue;
 pub(crate) mod gdi_exec;
+pub(crate) mod gdi_thread;
 pub(crate) mod guest_blob;
 mod gpummu;
 pub(crate) mod hpd;
