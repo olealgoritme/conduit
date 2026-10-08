@@ -2927,6 +2927,15 @@ std::int32_t HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us,
 
     // Gate-cost telemetry (PSC WS2 discipline): one line per 128 presents.
     QueryPerformanceCounter(&qpcT1);
+    // The opt-in DXVK feed trace (HELIOS_DXVK_FEED_TRACE=1) writes its CSV only at a clean
+    // device teardown, so a benchmark that is killed leaves nothing. Rewrite the same per-PID
+    // file every 2048 presents as well (seconds apart at benchmark rates; the dump is
+    // mutex-serialised and overwrites, so the last one has every bin so far).
+    if (dxvk::helios_feed::enabled()) {
+      static std::atomic<std::uint32_t> s_feedPresents{0};
+      if ((s_feedPresents.fetch_add(1, std::memory_order_relaxed) + 1u) % 2048u == 0u)
+        dxvk::helios_feed::dump();
+    }
     // Site-local extra, deliberately NEVER reset (unlike the running max), so
     // the printed count is cumulative for the process.
     static std::atomic<std::uint32_t> s_gateTimeouts{0};
