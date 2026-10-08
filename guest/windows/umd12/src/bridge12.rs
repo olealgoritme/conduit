@@ -254,6 +254,9 @@ mod ffi {
         /// The engine's ECL fence counters; returns how many it wrote.
         fn helios_vkd3d_bridge_ecl_fence_stats(out: &mut [u64]) -> u32;
 
+        /// The engine's memory placement counters; returns how many it wrote.
+        fn helios_vkd3d_bridge_memory_stats(out: &mut [u64]) -> u32;
+
         /// # Safety
         /// All engine objects and API-typed arrays are live for this call.
         /// The engine copies mapping data and duplicates the admission event.
@@ -721,6 +724,20 @@ pub(crate) unsafe fn execute_rm(
 /// The engine's ECL fence counters (`helios_vkd3d_ecl_fence_stats`): signals,
 /// commit-to-signal sum and max (us), signal failures, values reserved, fences
 /// made, creates failed, then 7 histogram buckets.
+/// The engine's memory placement counters (`helios_vkd3d_memory_stats`, vkd3d
+/// patch 0005), in its layout: live bytes per memory type (32), bytes and
+/// allocations per (request class, type) (5 x 32 each), per-type
+/// `propertyFlags | heapIndex << 32 | seen << 63` (32), then the count of
+/// DEVICE_LOCAL requests that got a type without it. `None` from an engine
+/// without the export's data.
+pub(crate) fn memory_stats() -> Option<Box<[u64; MEMORY_STATS_LEN]>> {
+    let mut out = Box::new([0u64; MEMORY_STATS_LEN]);
+    (ffi::helios_vkd3d_bridge_memory_stats(&mut out[..]) as usize == MEMORY_STATS_LEN).then_some(out)
+}
+
+/// Values in [`memory_stats`].
+pub(crate) const MEMORY_STATS_LEN: usize = 385;
+
 pub(crate) fn ecl_fence_stats() -> [u64; 14] {
     let mut out = [0u64; 14];
     ffi::helios_vkd3d_bridge_ecl_fence_stats(&mut out);
