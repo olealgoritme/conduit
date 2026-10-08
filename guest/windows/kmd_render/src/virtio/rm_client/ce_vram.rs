@@ -582,6 +582,7 @@ pub(crate) fn ce_surface(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<CeSurface, Fail> {
+    super::vidmem::note_use(resource_id);
     if let Some(s) = ce_surface_cached(resource_id) {
         return Ok(s);
     }
@@ -910,6 +911,7 @@ pub(crate) fn transfer(
     row_pitch: usize,
 ) -> Result<(), Fail> {
     let t0 = now();
+    super::vidmem::note_use(resource_id);
     let r = with_io(passive, adapter, |io, h| {
         let s = map_locked(io, h, resource_id)?;
         let packed = rv::bounce_surface(rect).map_err(|_| BAD_SHAPE)?;
