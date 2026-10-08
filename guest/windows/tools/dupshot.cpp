@@ -23,13 +23,16 @@
 #define COBJMACROS
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_6.h>
 #include <wincodec.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// IID_IDXGIOutput5 (mingw's libdxgi lacks it): 80A07424-AB52-42EB-833C-0C42FD282D98.
+static const GUID kIID_IDXGIOutput5 = {0x80a07424, 0xab52, 0x42eb, {0x83, 0x3c, 0x0c, 0x42, 0xfd, 0x28, 0x2d, 0x98}};
 
 static void fail(const char* step, HRESULT hr) {
     std::printf("DUPSHOT fail step=%s hr=0x%08lx\n", step, (unsigned long)hr);
@@ -94,7 +97,21 @@ static bool shoot(IDXGIAdapter1* adapter, IDXGIOutput* out, int idx, const std::
     IDXGIOutputDuplication* dup = nullptr;
     bool ok = false;
     do {
-        if (FAILED(hr = out1->DuplicateOutput(dev, &dup))) { fail("duplicate_output", hr); break; }
+        hr = out1->DuplicateOutput(dev, &dup);
+        if (FAILED(hr)) {
+            fail("duplicate_output", hr);
+            // The second entry point (IDXGIOutput5, Windows 10 1703+) takes a different kernel
+            // path for the format negotiation; try it before giving up.
+            IDXGIOutput5* out5 = nullptr;
+            if (SUCCEEDED(out->QueryInterface(kIID_IDXGIOutput5, (void**)&out5))) {
+                DXGI_FORMAT fmts[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
+                hr = out5->DuplicateOutput1(dev, 0, 1, fmts, &dup);
+                out5->Release();
+                if (FAILED(hr)) fail("duplicate_output1", hr);
+            }
+            if (FAILED(hr)) break;
+            std::printf("DUPSHOT note duplicate_output1 succeeded where duplicate_output failed\n");
+        }
         // The first frame after DuplicateOutput carries the whole current desktop image; wait up
         // to `wait_ms` for it.
         IDXGIResource* res = nullptr;
