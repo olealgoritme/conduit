@@ -504,11 +504,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // display half: it serves the foreign scanout sources and the RM ring presenter,
     // which exist only there. A render-only start acks nothing new (the host then keeps
     // no release bookkeeping for this guest).
+    // `FlipDoneHost`: the host's presentation feedback (`NVGPU_F_SCANOUT_PRESENTED`) likewise,
+    // and only with the knob.
     match crate::virtio::VirtioGpu::init(
         passive,
         unsafe { &*dxgkrnl_interface },
         msi_granted,
         knobs.display_half,
+        crate::ddi::host_flip_done::wants_feature(knobs.flip_done, knobs.display_half),
     ) {
         Ok(mut gpu) => {
             let Some(generation) = adapter.producer.start_transport() else {
@@ -641,6 +644,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // `IndepFlip` (independent flip, stage S-1): the mode this generation counts under, and the
     // `Idf*` block zeroed (`IdfKnob` written, 0 included).
     crate::ddi::indep_flip::reset_for_start(&knobs);
+    // `FlipDoneHost`: the mode this generation runs (off unless the host took the ack), the
+    // `Fdh*` block zeroed (`FdhKnob`, `FdhAck` written).
+    crate::ddi::host_flip_done::reset_for_start(
+        knobs.flip_done,
+        adapter
+            .with_virtio(|v| v.scanout_presented_on())
+            .unwrap_or(false),
+    );
     // `HwCursor`: the caps this generation reports, the `Cur*` block zeroed, the cursor image of
     // the last generation forgotten (its id may name another resource now).
     crate::ddi::hw_cursor::reset_for_start(adapter, &knobs);

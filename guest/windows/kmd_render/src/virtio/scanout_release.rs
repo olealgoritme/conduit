@@ -117,6 +117,9 @@ pub(crate) fn reset() {
 
 /// A flip of `(owner, handle, gem)` was minted as `seq`.
 pub(crate) fn minted(seq: u64, owner: usize, handle: u32, gem: u32) {
+    // `FlipDoneHost`: the newest `seq` minted is the floor of the next publication (every mint
+    // passes here, tracked or not).
+    crate::ddi::host_flip_done::note_minted(seq);
     if !tracking() {
         return;
     }

@@ -2398,6 +2398,10 @@ pub struct VirtioGpu {
     /// up: `ScanoutReleased` messages are consumed (`nvrm_events`) and the consumers of
     /// them (`virtio/scanout_release.rs`) are live. Fixed for the transport's life.
     scanout_release: bool,
+    /// The host's presentation feedback (`NVGPU_F_SCANOUT_PRESENTED`, `FlipDoneHost`) was acked
+    /// AND the event queue is up: `ScanoutPresented` messages go to `ddi::host_flip_done`.
+    /// Fixed for the transport's life.
+    scanout_presented: bool,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
     /// teardown. Starts at 1024 slots and grows (PASSIVE, outside the lock:
@@ -2763,6 +2767,7 @@ impl VirtioGpu {
         dxgkrnl: &DXGKRNL_INTERFACE,
         msi_granted: u32,
         scanout_release: bool,
+        scanout_presented: bool,
     ) -> Result<Box<Self>, VirtioError> {
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
         // A miniport doesn't own the bus, so config space is reached via the
@@ -2805,15 +2810,23 @@ impl VirtioGpu {
         // only with the display half, see `StartDevice`). A device that refuses the
         // larger set is retried once with the required one: an optional feature never
         // costs the transport.
+        // The presentation feedback only with `FlipDoneHost` (the caller's `scanout_presented`).
         let accepted = negotiate_features(
             &mut transport,
-            if scanout_release {
-                CONDUIT_OPTIONAL_FEATURES
-            } else {
-                0
-            },
+            CONDUIT_OPTIONAL_FEATURES
+                & ((if scanout_release {
+                    helios_protocol::NVGPU_F_SCANOUT_RELEASE
+                } else {
+                    0
+                }) | (if scanout_presented {
+                    helios_protocol::NVGPU_F_SCANOUT_PRESENTED
+                } else {
+                    0
+                })),
         )?;
         let scanout_release_acked = accepted & helios_protocol::NVGPU_F_SCANOUT_RELEASE != 0;
+        let scanout_presented_acked =
+            accepted & helios_protocol::NVGPU_F_SCANOUT_PRESENTED != 0;
         // 1 when the host's buffer-release event was acked, 0 when not offered / not wanted.
         crate::diag::record_named_bytes(b"RelAck", u32::from(scanout_release_acked));
 
@@ -3091,6 +3104,8 @@ impl VirtioGpu {
         // stay off. `RelNoQ` = 1 names that case (the host then keeps bookkeeping it can
         // never deliver on; it retries every 2 ms and drops nothing important).
         let scanout_release_on = scanout_release_acked && nvrm_event_ring.is_some();
+        // Likewise the presentation feedback (`FdhAck` says whether it is live).
+        let scanout_presented_on = scanout_presented_acked && nvrm_event_ring.is_some();
         if scanout_release_acked && !scanout_release_on {
             crate::diag::record_named_bytes(b"RelNoQ", 1);
         }
@@ -3118,6 +3133,7 @@ impl VirtioGpu {
             nvrm_events,
             cfg_features,
             scanout_release: scanout_release_on,
+            scanout_presented: scanout_presented_on,
             nvrm_handles: Vec::with_capacity(nvrm_limits.handle_bounds.initial),
             nvrm_reserved: 0,
             nvrm_clients: nvrm_tables::new_client_table(),
@@ -5627,6 +5643,10 @@ impl VirtioGpu {
                                             .as_ref()
                                             .store(notify.primary_address, Ordering::Release);
                                         crate::ddi::stall_diag::note_published(
+                                            notify.primary_address,
+                                        );
+                                        // `FlipDoneHost`: a kept picture is never reported.
+                                        crate::ddi::host_flip_done::note_kept(
                                             notify.primary_address,
                                         );
                                     }

@@ -53,10 +53,17 @@ pub const NVGPU_F_TAKES_INPUT: u64 = 1 << 12;
 /// release bookkeeping only for such a guest. `docs/foreign-scanout.md` ("Buffer
 /// release") is the KMD's use of it.
 pub const NVGPU_F_SCANOUT_RELEASE: u64 = 1 << 15;
+/// `NVGPU_F_SCANOUT_PRESENTED` (virtio feature bit 19; config `features` bit 19 stays
+/// unused, bit 17 is kept for the host vblank proposal). The host offers it whenever it has
+/// a display. A guest that acks it gets `MsgType::ScanoutPresented` (33) on the event queue
+/// when a display client reports that a flip reached the screen. The KMD acks it only under
+/// its `FlipDoneFromHost` knob (`kmd_logic::flip_done`, `docs/independent-flip.md` section 13).
+pub const NVGPU_F_SCANOUT_PRESENTED: u64 = 1 << 19;
 /// Conduit device features this driver acks when the device offers them (and, for
-/// `NVGPU_F_SCANOUT_RELEASE`, when the display half is on): the optional set,
+/// `NVGPU_F_SCANOUT_RELEASE`, when the display half is on; for
+/// `NVGPU_F_SCANOUT_PRESENTED`, when also `FlipDoneFromHost` is set): the optional set,
 /// besides `VIRTIO_F_VERSION_1`.
-pub const CONDUIT_OPTIONAL_FEATURES: u64 = NVGPU_F_SCANOUT_RELEASE;
+pub const CONDUIT_OPTIONAL_FEATURES: u64 = NVGPU_F_SCANOUT_RELEASE | NVGPU_F_SCANOUT_PRESENTED;
 
 const _: () = assert!(CONDUIT_OPTIONAL_FEATURES & NVGPU_F_TAKES_INPUT == 0);
 

@@ -521,6 +521,36 @@ impl AdapterContext {
         }
     }
 
+    /// The heartbeat's period in 100 ns units (the mode's refresh, or `VsyncRateMhz`).
+    pub(crate) fn vsync_period_100ns(&self) -> u64 {
+        helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(self))
+    }
+
+    /// `FlipDoneHost` (`ddi::host_flip_done`): move the armed heartbeat's next deadline to
+    /// `deadline` (strictly after `now`), so its ticks fall between the host's vblanks. The tick
+    /// then advances from the new deadline on its fixed-phase lattice as usual. A tick running
+    /// on another CPU may re-arm over it (its deadline wins: one tick on the old phase, no
+    /// harm). `true` when the one-shot was set. Legal at any IRQL up to DISPATCH (`ExSetTimer`
+    /// and `KeSetTimerEx` are).
+    pub(crate) fn rephase_vsync(&self, deadline: u64, now: u64) -> bool {
+        use core::sync::atomic::Ordering;
+        if deadline <= now || self.vsync_armed.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.vsync_deadline_100ns.store(deadline, Ordering::Release);
+        let due = helios_kmd_logic::vsync_deadline::relative_due(deadline, now);
+        // SAFETY: the one-shot was initialized at AddDevice; setting it is legal at
+        // DISPATCH_LEVEL and below, and replaces a pending expiry.
+        unsafe { self.set_vsync_one_shot(due) };
+        if self.vsync_armed.load(Ordering::Acquire) == 0 {
+            // A quiesce raced this: it wins, as in `arm_vsync`.
+            // SAFETY: as above.
+            unsafe { self.cancel_vsync_one_shot() };
+            return false;
+        }
+        true
+    }
+
     /// Set the one-shot again for a heartbeat found silent (the worker-side watchdog and the
     /// independent watchdog timer). `reference` is the silence reference the caller read: one of
     /// several racing callers wins and re-bases it, the others do nothing. `true` for the winner
@@ -951,9 +981,9 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         }
         return;
     }
-    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+    if adapter.dxgkrnl_opt().is_none() {
         return;
-    };
+    }
     // A CRTC_VSYNC describes the pixels the scanout pipeline would read at
     // this retrace. Every enabled retrace must report it, including while a
     // newer SetVidPnSourceAddress is still being programmed at PASSIVE_LEVEL.
@@ -961,7 +991,46 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     // `last_primary_address` remains the last actually displayed primary and
     // is therefore the truthful address to report.
     //
-    let phys = adapter.last_primary_address.load(Ordering::Acquire) as i64;
+    // `FlipDoneHost` (`ddi::host_flip_done`, default 0): with the host's presentation feedback
+    // live, the address the HOST confirmed instead of a newer one it has not shown yet (held at
+    // most a few periods), and no delivery at all when a report's own CRTC_VSYNC was this
+    // period's. With the knob at 0 this is `last_primary_address` and `true`, as before.
+    let plan = crate::ddi::host_flip_done::tick_plan(
+        adapter.last_primary_address.load(Ordering::Acquire),
+        tick_time_100ns,
+        adapter.vsync_period_100ns(),
+    );
+    if plan.deliver {
+        deliver_tick_vsync(adapter, plan.address, tick_time_100ns);
+    }
+    // SetVidPnSourceAddress may run inside the synchronized MMIO-flip callback
+    // above at DIRQL. It can only publish the exact hAllocation there. Back at
+    // this timer DPC's DISPATCH_LEVEL, wake the PASSIVE worker that is allowed
+    // to take the Venus mutex and issue the host scanout commands.
+    // Signal after the synchronized callback. This covers both a request that
+    // was already pending and one that the callback just published. Replacing
+    // this with a before/after nonzero comparison loses a wake if another CPU
+    // consumes the old request while the callback publishes its successor.
+    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+        adapter.signal_hpd();
+    }
+    // Time first, then the count: a reader that loads the count and then the time
+    // sees a pair that is at most one tick apart, never a time older than its
+    // count.
+    adapter
+        .vsync_last_100ns
+        .store(tick_time_100ns, Ordering::Relaxed);
+    adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The tick's CRTC_VSYNC carrying `phys`, and what is recorded about it when dxgkrnl took it.
+/// DISPATCH (the tick).
+fn deliver_tick_vsync(adapter: &AdapterContext, phys: u64, tick_time_100ns: u64) {
+    use core::sync::atomic::Ordering;
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        return;
+    };
+    let phys = phys as i64;
     // `FlipLat`: the instant just after the address was read (a flip issued later is not in it).
     let phys_t = crate::adapter::foreign_scanout::now_100ns();
     // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
@@ -1012,25 +1081,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
                 0,
             );
         }
+        crate::ddi::host_flip_done::note_tick_delivered(tick_time_100ns);
     }
-    // SetVidPnSourceAddress may run inside the synchronized MMIO-flip callback
-    // above at DIRQL. It can only publish the exact hAllocation there. Back at
-    // this timer DPC's DISPATCH_LEVEL, wake the PASSIVE worker that is allowed
-    // to take the Venus mutex and issue the host scanout commands.
-    // Signal after the synchronized callback. This covers both a request that
-    // was already pending and one that the callback just published. Replacing
-    // this with a before/after nonzero comparison loses a wake if another CPU
-    // consumes the old request while the callback publishes its successor.
-    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
-        adapter.signal_hpd();
-    }
-    // Time first, then the count: a reader that loads the count and then the time
-    // sees a pair that is at most one tick apart, never a time older than its
-    // count.
-    adapter
-        .vsync_last_100ns
-        .store(tick_time_100ns, Ordering::Relaxed);
-    adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
 }
 
 /// `EXT_CALLBACK` for the preferred system-allocated high-resolution timer.
