@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 19:49:26 +0200
+Subject: [PATCH 13/13] nvk, nvk/rm: a compressible device-local memory type
+ for images on GB20x
+
+Patch 0011 (NVK_RM_COMPRESS_ALL) makes every plain device-local
+allocation compressible, so vertex, index, indirect, uniform and storage
+buffers end up in compressible memory as well.  NVIDIA's driver keeps
+them apart with memory types instead, and so does this, behind
+NVK_RM_COMPRESS_TYPE=1 (default off):
+
+- A second DEVICE_LOCAL type on the VRAM heap, before the plain one so
+  that allocators which take the first type an image allows (vkd3d-proton,
+  DXVK) pick it for images.  Its memory is allocated
+  NVKMD_MEM_COMPRESSIBLE (COMPR_ANY on RM).
+
+- Images report it when they are optimal-tiling, not sparse, not
+  protected, not host-transfer, not external and not video.  For a color
+  format the spec does not let memoryTypeBits depend on the usage or the
+  format, so sampled-only images may land there too; they are mapped with
+  the compressible kind but not compressed, as with 0011.
+
+- Buffers report it only when their usage is transfer-only and they are
+  not sparse (the spec lets fewer usage bits allow more types).
+  vkd3d-proton and DXVK put a transfer-only buffer over their image
+  heaps and chunks to clear them; without it they would never use the
+  type.  Vertex, index, indirect, uniform, storage and device-address
+  buffers never do.  Generated-commands preprocess buffers, video
+  session memory and imports do not either.
+
+- A dedicated allocation of an image that is not compressed itself is
+  never made compressible (nothing to gain; Helios may export it with the
+  uncompressed layout); compressible images keep the dedicated path.
+  Exported memory of the type is allocated uncompressed.
+
+nvkmd_info gets the two policies, compress_all_mem (0011) and
+has_compressed_mem_type, with has_compressible_mem meaning either.  The
+counters of 0011 stay; a log line names the new type's index.
+---
+ src/nouveau/vulkan/nvk_buffer.c             | 14 +++++++++++-
+ src/nouveau/vulkan/nvk_cmd_indirect.c       |  3 ++-
+ src/nouveau/vulkan/nvk_device_memory.c      | 20 ++++++++++++++++-
+ src/nouveau/vulkan/nvk_image.c              | 24 +++++++++++++++++++++
+ src/nouveau/vulkan/nvk_physical_device.c    | 17 +++++++++++++++
+ src/nouveau/vulkan/nvk_physical_device.h    |  7 +++++-
+ src/nouveau/vulkan/nvk_video_session.c      |  3 ++-
+ src/nouveau/vulkan/nvkmd/nvkmd.h            | 11 ++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 16 +++++++++++++-
+ 9 files changed, 109 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_buffer.c b/src/nouveau/vulkan/nvk_buffer.c
+index 58f01b0..95500ff 100644
+--- a/src/nouveau/vulkan/nvk_buffer.c
++++ b/src/nouveau/vulkan/nvk_buffer.c
+@@ -189,10 +189,22 @@ nvk_GetDeviceBufferMemoryRequirements(
+                                pInfo->pCreateInfo->usage,
+                                pInfo->pCreateInfo->flags);
+ 
++   /* Compressible memory only for buffers the copy engine alone touches
++    * (vkd3d-proton's and DXVK's clear buffers over image memory).  The spec
++    * lets a buffer with fewer usage bits allow more memory types.
++    */
++   uint32_t memory_types = BITFIELD_MASK(pdev->mem_type_count);
++   const VkBufferUsageFlags2KHR transfer_usage =
++      VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT_KHR |
++      VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR;
++   if ((vk_buffer_usage_flags(pInfo->pCreateInfo) & ~transfer_usage) ||
++       (pInfo->pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT))
++      memory_types &= ~pdev->compressed_mem_types;
++
+    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
+       .size = align64(pInfo->pCreateInfo->size, alignment),
+       .alignment = alignment,
+-      .memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count),
++      .memoryTypeBits = memory_types,
+    };
+ 
+    vk_foreach_struct(sType, ext, pMemoryRequirements->pNext) {
+diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
+index f276955..0859a22 100644
+--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
+@@ -1041,7 +1041,8 @@ nvk_GetGeneratedCommandsMemoryRequirementsEXT(
+    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
+       .size = size,
+       .alignment = NAK_QMD_ALIGN_B,
+-      .memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count),
++      .memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count) &
++                        ~pdev->compressed_mem_types,
+    };
+ }
+ 
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index fcb7116..7db3a29 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -86,6 +86,15 @@ nvk_compressible_mem_flags(const struct nvk_physical_device *pdev,
+        (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+       return 0;
+ 
++   /* The compressible memory type (NVK_RM_COMPRESS_TYPE), or every
++    * device-local type (NVK_RM_COMPRESS_ALL).  Exported memory of the
++    * compressible type is allocated uncompressed (not_shared above).
++    */
++   const uint32_t type_bit = BITFIELD_BIT(type - pdev->mem_types);
++   if (!(pdev->compressed_mem_types & type_bit) &&
++       !pdev->nvkmd->kmd_info.compress_all_mem)
++      return 0;
++
+    return NVKMD_MEM_COMPRESSIBLE;
+ }
+ 
+@@ -122,6 +131,10 @@ nvk_GetMemoryFdPropertiesKHR(VkDevice device,
+    uint32_t type_bits = 0;
+    for (unsigned t = 0; t < ARRAY_SIZE(pdev->mem_types); t++) {
+       const VkMemoryType *type = &pdev->mem_types[t];
++
++      /* Imports never go in the compressible memory type */
++      if (pdev->compressed_mem_types & BITFIELD_BIT(t))
++         continue;
+       const enum nvkmd_mem_flags type_flags =
+          nvk_memory_type_flags(type, handleType, false);
+ 
+@@ -334,7 +347,12 @@ nvk_AllocateMemory(VkDevice device,
+       if (result != VK_SUCCESS)
+          goto fail_alloc;
+    } else {
+-      flags |= nvk_compressible_mem_flags(pdev, type, not_shared);
++      /* Not for a dedicated image that is not compressed itself: nothing
++       * to gain, and such memory may still be exported with the image's
++       * uncompressed layout (Helios).
++       */
++      if (mem->dedicated_image == NULL)
++         flags |= nvk_compressible_mem_flags(pdev, type, not_shared);
+       result = nvkmd_dev_alloc_mem(dev->nvkmd, &dev->vk.base,
+                                    aligned_size, alignment, flags,
+                                    &mem->mem);
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 21b3266..4421567 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -1388,6 +1388,30 @@ nvk_get_image_memory_requirements(struct nvk_device *dev,
+       }
+    }
+ 
++   /* Compressible memory types (NVK_RM_COMPRESS_TYPE): every optimal-tiling
++    * image may use them, compressible or not, since for a color format the
++    * spec lets memoryTypeBits depend on the tiling, sparse, protected and
++    * host transfer bits and the external handle types but not on the usage
++    * or format.  An image that is not compressed is mapped with the
++    * compressible kind there all the same (nvkmd_rm_va.c).  Video images are
++    * left out (the video engines have not been tried on compressible
++    * memory).
++    */
++   const VkImageUsageFlags video_usage =
++      VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR |
++      VK_IMAGE_USAGE_VIDEO_DECODE_SRC_BIT_KHR |
++      VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR |
++      VK_IMAGE_USAGE_VIDEO_ENCODE_DST_BIT_KHR |
++      VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR |
++      VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR;
++   if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ||
++       (image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++                                  VK_IMAGE_CREATE_PROTECTED_BIT)) ||
++       (image->vk.usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
++                           video_usage)) ||
++       image->vk.external_handle_types != 0)
++      memory_types &= ~pdev->compressed_mem_types;
++
+    uint64_t size_B = 0;
+    uint32_t align_B = 0;
+    if (image->disjoint) {
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 45d5d82..615fd60 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -33,6 +33,7 @@
+ #include "util/detect_os.h"
+ #include "util/disk_cache.h"
+ #include "util/hex.h"
++#include "util/log.h"
+ #include "util/mesa-blake3.h"
+ #include "util/os_misc.h"
+ 
+@@ -1680,6 +1681,22 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+       if (nvkmd->kmd_info.has_get_vram_used)
+          pdev->mem_heaps[vram_heap_idx].available = nvk_get_vram_heap_available;
+ 
++      /* Compressible VRAM, before plain VRAM in the same heap so that
++       * allocators which take the first type an image allows (vkd3d-proton,
++       * DXVK) pick it for images.  Only images and transfer-only buffers
++       * report it (nvk_image.c, nvk_buffer.c).
++       */
++      if (nvkmd->kmd_info.has_compressed_mem_type) {
++         mesa_logi("NVK: memory type %u is compressible VRAM, for images "
++                   "and transfer-only buffers (NVK_RM_COMPRESS_TYPE)",
++                   pdev->mem_type_count);
++         pdev->compressed_mem_types |= BITFIELD_BIT(pdev->mem_type_count);
++         pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
++            .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++            .heapIndex = vram_heap_idx,
++         };
++      }
++
+       pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+          .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+          .heapIndex = vram_heap_idx,
+diff --git a/src/nouveau/vulkan/nvk_physical_device.h b/src/nouveau/vulkan/nvk_physical_device.h
+index 68e4ab0..f2d0790 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -58,7 +58,12 @@ struct nvk_physical_device {
+ 
+    // TODO: add mapable VRAM heap if possible
+    struct nvk_memory_heap mem_heaps[3];
+-   VkMemoryType mem_types[3];
++   VkMemoryType mem_types[4];
++
++   /* Memory types backed by compressible memory (nvkmd_info::
++    * has_compressed_mem_type): images and transfer-only buffers only
++    */
++   uint32_t compressed_mem_types;
+    uint8_t mem_heap_count;
+    uint8_t mem_type_count;
+ 
+diff --git a/src/nouveau/vulkan/nvk_video_session.c b/src/nouveau/vulkan/nvk_video_session.c
+index 0cae835..1cb6556 100644
+--- a/src/nouveau/vulkan/nvk_video_session.c
++++ b/src/nouveau/vulkan/nvk_video_session.c
+@@ -94,7 +94,8 @@ nvk_GetVideoSessionMemoryRequirementsKHR(VkDevice _device,
+    VK_FROM_HANDLE(nvk_device, dev, _device);
+    VK_FROM_HANDLE(nvk_video_session, vid, videoSession);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+-   const uint32_t memory_type_bits = BITFIELD_MASK(pdev->mem_type_count);
++   const uint32_t memory_type_bits = BITFIELD_MASK(pdev->mem_type_count) &
++                                     ~pdev->compressed_mem_types;
+ 
+    VK_OUTARRAY_MAKE_TYPED(VkVideoSessionMemoryRequirementsKHR, out,
+                           pMemoryRequirements, pMemoryRequirementsCount);
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index 873b6b5..5263a78 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -150,6 +150,17 @@ struct nvkmd_info {
+     */
+    bool has_zs_compression;
+ 
++   /** Policy: NVK asks for NVKMD_MEM_COMPRESSIBLE on every plain
++    *  device-local allocation (needs has_compressible_mem)
++    */
++   bool compress_all_mem;
++
++   /** Policy: NVK exposes a device-local memory type of its own, allocated
++    *  NVKMD_MEM_COMPRESSIBLE, which images and transfer-only buffers may use
++    *  but no other buffer (needs has_compressible_mem)
++    */
++   bool has_compressed_mem_type;
++
+    /** VRAM may be mapped by the CPU (exposes a host-visible VRAM type) */
+    bool has_host_visible_vram;
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 199c1e9..fb592f9 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -431,10 +431,24 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+     * as a whole and sub-allocated images compressed by their PTE kind
+     * (nvkmd_rm_mem.c).  Off by default (NVK_RM_COMPRESS_ALL=1 turns it on).
+     */
+-   pdev->base.kmd_info.has_compressible_mem =
++   pdev->base.kmd_info.compress_all_mem =
+       pdev->base.kmd_info.has_compression &&
+       debug_get_bool_option("NVK_RM_COMPRESS_ALL", false);
+ 
++   /* The way NVIDIA's driver does it: a device-local memory type of its own
++    * for compressible memory, which images may use and buffers (vertex,
++    * index, indirect, uniform, storage) may not, so that no buffer the
++    * front end, the vertex fetch or a shader reads ends up in compressible
++    * memory.  Off by default (NVK_RM_COMPRESS_TYPE=1 turns it on).
++    */
++   pdev->base.kmd_info.has_compressed_mem_type =
++      pdev->base.kmd_info.has_compression &&
++      debug_get_bool_option("NVK_RM_COMPRESS_TYPE", false);
++
++   pdev->base.kmd_info.has_compressible_mem =
++      pdev->base.kmd_info.compress_all_mem ||
++      pdev->base.kmd_info.has_compressed_mem_type;
++
+    /* Combined depth/stencil formats are two planes on Blackwell, which NVK
+     * leaves uncompressed.  GB20x has only generic kinds, so each plane is
+     * compressed like any other image (nvk_image.c).  Off by default while
+-- 
+2.43.0
+

@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Thu, 8 Oct 2026 17:27:08 +0200
-Subject: [PATCH 12/12] nvk, nvk/rm: compress separate depth/stencil images on GB20x
+Subject: [PATCH 12/13] nvk, nvk/rm: compress separate depth/stencil images on
+ GB20x
 
 Blackwell splits combined depth/stencil formats (D24S8, D32S8X24) into
 separate depth and stencil planes, and nvk_image_can_compress rejects
@@ -102,12 +103,12 @@ index c478eb2..873b6b5 100644
     bool has_host_visible_vram;
  
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
-index 56e6241..4d88ebb 100644
+index fc8e2bc..199c1e9 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
 @@ -435,6 +435,15 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
        pdev->base.kmd_info.has_compression &&
-       debug_get_bool_option("NVK_RM_COMPRESS_ALL", true);
+       debug_get_bool_option("NVK_RM_COMPRESS_ALL", false);
  
 +   /* Combined depth/stencil formats are two planes on Blackwell, which NVK
 +    * leaves uncompressed.  GB20x has only generic kinds, so each plane is
