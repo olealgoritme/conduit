@@ -157,8 +157,16 @@ if (Test-Path -LiteralPath $err) {
     if ($sel) { $sel } else { '  (no loader lines; first 20 lines of stderr:)'; Head $err 20 }
 } else { '  (no stderr.txt)' }
 
+$mlog = Join-Path $Out 'mesa.log'
 "=== mesa log (first 30 lines)"
-Head (Join-Path $Out 'mesa.log') 30
+Head $mlog 30
+"=== mesa log: errors and losses (first 40)"
+if (Test-Path -LiteralPath $mlog) {
+    $m = Select-String -LiteralPath $mlog -Pattern 'lost|fail|error|RM |channel|timeout|did not|refus' -EA 0 | Select-Object -First 40 | ForEach-Object { '  ' + $_.Line }
+    if ($m) { $m } else { '  none' }
+    "=== mesa log (last 15 lines, $((Get-Content -LiteralPath $mlog | Measure-Object -Line).Lines) lines total)"
+    Get-Content -LiteralPath $mlog -Tail 15 | ForEach-Object { '  ' + $_ }
+}
 
 "=== vkframes files since start"
 $dirs = @('C:\ProgramData\Helios') + (Get-ChildItem 'C:\Users\*\AppData\Local\Temp' -Directory -EA 0 | ForEach-Object FullName) + @('C:\Windows\Temp')
