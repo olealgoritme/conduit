@@ -1635,6 +1635,10 @@ pub const COUNTERS: &[&str] = &[
     "GdiChkK",
     "GdiChkGot",
     "GdiChkWant",
+    // Staging commands whose pitch differs from the view's (authored) pitch; the last pair.
+    "GdiPitchMis",
+    "GdiPitchCmd",
+    "GdiPitchAl",
     "GdiJobMaxN",
     "GdiJobT1",
     "GdiJobT1Us",
