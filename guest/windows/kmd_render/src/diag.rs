@@ -119,7 +119,7 @@ fn record_named(name: &[u16], mut code: u32) {
     // next pass writes it) instead of a registry transaction on the caller's thread, which may be
     // an app's (DxgkDdiPresent, Render, an escape: 383.1's profile had 1.5% of Heaven's CPU in the
     // configuration manager).
-    if !mirror::in_pass() && crate::ddi::mirror_thread::running() && hot::defer(name, code) {
+    if !mirror::in_pass() && crate::ddi::mirror_thread::running() && hot::defer(name, u64::from(code), false) {
         return;
     }
     hot::note(name);
@@ -141,6 +141,9 @@ fn record_named(name: &[u16], mut code: u32) {
 /// [`record_named`] for a 64-bit value (`REG_QWORD`, 8 bytes): one registry transaction, so a
 /// reader sees the whole value or none of it. PASSIVE_LEVEL only.
 fn record_named_q(name: &[u16], mut value: u64) {
+    if !mirror::in_pass() && crate::ddi::mirror_thread::running() && hot::defer(name, value, true) {
+        return;
+    }
     hot::note(name);
     // SAFETY: PASSIVE_LEVEL (see module note). `name` is a NUL-terminated UTF-16 value name;
     // ValueData points to an 8-byte QWORD that RtlWriteRegistryValue copies before returning.
@@ -204,12 +207,17 @@ mod hot {
     pub(crate) static DEFERRED: AtomicU32 = AtomicU32::new(0);
     pub(crate) static DEFER_FULL: AtomicU32 = AtomicU32::new(0);
 
-    const SLOTS: usize = 512;
-    /// One deferred write: the NUL-terminated name (at most 15 units and the NUL) and the value.
+    /// Open addressing over the name hash: a name probes up to `PROBES` slots from its home slot
+    /// (386.1: 512 slots with no probing overflowed under Heaven, `NvRegDefFull` +6/s).
+    const SLOTS: usize = 1024;
+    const PROBES: usize = 16;
+    /// One deferred write: the NUL-terminated name (at most 15 units and the NUL), the value, and
+    /// whether it is a `REG_QWORD`.
     #[derive(Clone, Copy)]
     struct Pending {
         name: [u16; 16],
-        value: u32,
+        value: u64,
+        qword: bool,
     }
     static TABLE: crate::sync::SpinLock<[Option<Pending>; SLOTS]> =
         crate::sync::SpinLock::new([None; SLOTS]);
@@ -241,24 +249,33 @@ mod hot {
     }
 
     /// Keep `value` for `name` (NUL-terminated) until the next pass writes it, and ask for one.
-    /// `false`: the slot holds another name (the caller writes directly).
-    pub(super) fn defer(name: &[u16], value: u32) -> bool {
+    /// The latest value per name wins. `false`: no slot within `PROBES` of the name's home slot is
+    /// free or holds that name (the caller writes directly, `NvRegDefFull`).
+    pub(super) fn defer(name: &[u16], value: u64, qword: bool) -> bool {
         let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
         if len == 0 || len > 15 {
             return false;
         }
-        let k = mirror::key(&name[..len]);
-        let slot = k.0 & (SLOTS - 1);
+        let home = mirror::key(&name[..len]).0 & (SLOTS - 1);
         let mut buf = [0u16; 16];
         buf[..len].copy_from_slice(&name[..len]);
         {
             let mut t = TABLE.lock();
-            match &mut t[slot] {
-                Some(p) if p.name != buf => {
-                    DEFER_FULL.fetch_add(1, Ordering::Relaxed);
-                    return false;
+            let mut placed = false;
+            for i in 0..PROBES {
+                let e = &mut t[(home + i) & (SLOTS - 1)];
+                match e {
+                    Some(p) if p.name != buf => continue,
+                    _ => {
+                        *e = Some(Pending { name: buf, value, qword });
+                        placed = true;
+                        break;
+                    }
                 }
-                e => *e = Some(Pending { name: buf, value }),
+            }
+            if !placed {
+                DEFER_FULL.fetch_add(1, Ordering::Relaxed);
+                return false;
             }
         }
         ANY.store(1, Ordering::Release);
@@ -276,9 +293,13 @@ mod hot {
             let p = TABLE.lock()[slot].take();
             if let Some(p) = p {
                 let len = p.name.iter().position(|&c| c == 0).unwrap_or(15);
-                let k = mirror::key(&p.name[..len]);
-                super::record_named(&p.name[..=len], p.value);
-                mirror::wrote(k, p.value);
+                if p.qword {
+                    super::record_named_q(&p.name[..=len], p.value);
+                } else {
+                    let k = mirror::key(&p.name[..len]);
+                    super::record_named(&p.name[..=len], p.value as u32);
+                    mirror::wrote(k, p.value as u32);
+                }
             }
         }
     }
