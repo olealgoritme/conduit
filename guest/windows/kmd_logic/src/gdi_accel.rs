@@ -565,11 +565,18 @@ pub struct Parser<'a> {
     bytes: &'a [u8],
     base: u64,
     at: usize,
+    /// Final commands whose `CommandSize` ran past the buffer's end and were taken short.
+    tail_cut: u32,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(bytes: &'a [u8], base: u64) -> Self {
-        Self { bytes, base, at: 0 }
+        Self { bytes, base, at: 0, tail_cut: 0 }
+    }
+
+    /// Final commands taken although their `CommandSize` ran past the end (see `decode`).
+    pub fn tail_cut(&self) -> u32 {
+        self.tail_cut
     }
 
     /// Byte offset of the next command.
@@ -621,7 +628,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn decode(&self) -> Result<(Cmd, usize), Bad> {
+    fn decode(&mut self) -> Result<(Cmd, usize), Bad> {
         use layout::*;
         let start = self.at;
         let b = self.bytes;
@@ -640,9 +647,22 @@ impl<'a> Parser<'a> {
             op::ESCAPE => 0,
             _ => return Err(Bad::Opcode),
         };
-        let end = start.checked_add(size).ok_or(Bad::Size)?;
-        if size < CMD_ARG + need || size % 4 != 0 || end > b.len() {
+        let mut end = start.checked_add(size).ok_or(Bad::Size)?;
+        if size < CMD_ARG + need || size % 4 != 0 {
             return Err(Bad::Size);
+        }
+        if end > b.len() {
+            // The last command of a buffer may declare the whole union (`sizeof(
+            // DXGK_RENDERKM_COMMAND)`, 80 bytes) while the buffer ends after its own arm, when its
+            // arm is smaller than the largest. Refusing it dropped every such final command (the
+            // helios GDI executor lost about half its commands to this). Take it, short, when its
+            // own arm is all there; inline sub-rectangles must still lie inside what is there.
+            if size <= CMD_BYTES && start + CMD_ARG + need <= b.len() {
+                end = b.len();
+                self.tail_cut += 1;
+            } else {
+                return Err(Bad::Size);
+            }
         }
         let a = start + CMD_ARG;
         let cmd = match opcode {
@@ -1652,6 +1672,8 @@ pub const COUNTERS: &[&str] = &[
     "GdiOpN",
     "GdiBad",
     "GdiBadWhy",
+    // Final commands of a buffer taken short (CommandSize past the end, the arm complete).
+    "GdiTailCut",
     "GdiOpMask",
     "GdiRopMask",
     // Commands executed on the copy engine (BitBlt, ColorFill), on the CPU (GdiFall), not at all
@@ -1986,6 +2008,18 @@ mod tests {
         colorfill(&mut buf, Rect::new(0, 0, 1, 1), 0, 0, 1, &[]);
         put32(&mut buf, 4, 4096);
         assert_eq!(Parser::new(&buf, BASE).next_cmd(), Some(Err(Bad::Size)));
+        // A final command that declares the whole union (80) but ends after its own arm is taken.
+        let mut buf = Vec::new();
+        bitblt(&mut buf, Rect::new(0, 0, 4, 4), Rect::new(0, 0, 4, 4), 1, 2, rop::SRCCOPY, &[]);
+        let second = buf.len();
+        colorfill(&mut buf, Rect::new(0, 0, 1, 1), 3, 7, cfrop::PATCOPY, &[]);
+        put32(&mut buf, second + 4, layout::CMD_BYTES as u32);
+        buf.truncate(second + layout::CMD_ARG + layout::COLORFILL_BYTES);
+        let mut p = Parser::new(&buf, BASE);
+        assert!(matches!(p.next_cmd(), Some(Ok(Cmd::BitBlt { .. }))));
+        assert!(matches!(p.next_cmd(), Some(Ok(Cmd::ColorFill { dst_index: 3, color: 7, .. }))));
+        assert!(p.next_cmd().is_none());
+        assert_eq!(p.tail_cut(), 1);
         // Trailer.
         let buf = vec![0u8; 4];
         assert_eq!(Parser::new(&buf, BASE).next_cmd(), Some(Err(Bad::Trailer)));

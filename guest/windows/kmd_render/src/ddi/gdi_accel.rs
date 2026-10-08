@@ -39,6 +39,8 @@ static CMD_N: AtomicU32 = AtomicU32::new(0);
 static OP_N: AtomicU32 = AtomicU32::new(0);
 static BAD: AtomicU32 = AtomicU32::new(0);
 static BAD_WHY: AtomicU32 = AtomicU32::new(0);
+/// Final commands taken short: `CommandSize` past the buffer's end, the arm complete (`Parser::tail_cut`).
+static TAIL_CUT: AtomicU32 = AtomicU32::new(0);
 static OP_MASK: AtomicU32 = AtomicU32::new(0);
 /// Entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing.
 static RK_IN: AtomicU32 = AtomicU32::new(0);
@@ -126,7 +128,7 @@ pub(crate) fn note_start(knobs: &crate::adapter::AdapterKnobs) {
     let knob = knobs.gdi_accel;
     let caps = caps_of(knobs);
     for c in [
-        &CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN, &SUB_N,
+        &CMD_N, &OP_N, &BAD, &BAD_WHY, &TAIL_CUT, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN, &SUB_N,
         &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD, &UNR_N, &UNR_K, &UNR_WH, &FGN_N, &FGN_DROP, &FGN_OP,
     ] {
         c.store(0, Ordering::Relaxed);
@@ -156,6 +158,7 @@ pub(crate) fn publish_counters() {
     w(b"GdiOpN", OP_N.load(Ordering::Relaxed));
     w(b"GdiBad", BAD.load(Ordering::Relaxed));
     w(b"GdiBadWhy", BAD_WHY.load(Ordering::Relaxed));
+    w(b"GdiTailCut", TAIL_CUT.load(Ordering::Relaxed));
     w(b"GdiOpMask", OP_MASK.load(Ordering::Relaxed));
     w(b"GdiRopMask", ROP_MASK.load(Ordering::Relaxed));
     w(b"GdiDrop", DROP.load(Ordering::Relaxed));
@@ -486,6 +489,7 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
             }
             ops.push(gx::Op { cmd, dst, srcs, engine, why, subs });
         }
+        TAIL_CUT.fetch_add(parser.tail_cut(), Ordering::Relaxed);
     }
 
     // The output patch list: one reference per allocation the buffer uses (dxgkrnl's contract:
