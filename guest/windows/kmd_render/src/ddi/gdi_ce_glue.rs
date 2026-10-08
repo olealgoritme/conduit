@@ -276,6 +276,61 @@ fn vrect(r: Rect) -> Option<rv::Rect> {
     Some(rv::Rect { left: r.left as u32, top: r.top as u32, right: r.right as u32, bottom: r.bottom as u32 })
 }
 
+/// Whether a foreign image's bytes are R G B in memory (`DRM_FORMAT_[AX]BGR8888`); the CPU
+/// executor works in B G R A, the format of every CDD surface.
+fn foreign_rgb(fourcc: u32) -> bool {
+    use helios_kmd_logic::foreign_resource as fr;
+    fourcc == fr::FOURCC_ABGR8888 || fourcc == fr::FOURCC_XBGR8888
+}
+
+fn swap_rb(bytes: &mut [u8]) {
+    for px in bytes.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
+/// `rect` of foreign NVK image `resource_id` into `out` (B G R A, rows `row_pitch` apart), through
+/// the bounce buffer (`ce_vram::foreign_transfer`), no acquire. PASSIVE.
+pub(crate) fn foreign_read(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    rect: Rect,
+    out: &mut [u8],
+    row_pitch: usize,
+) -> bool {
+    let Some(r) = vrect(rect) else { return false };
+    let Some(fs) = foreign_source(passive, adapter, resource_id, false) else {
+        return false;
+    };
+    let ok = retry_busy(passive, || ce_vram::foreign_transfer(passive, adapter, &fs.0, r, rv::Dir::Readback, out, row_pitch))
+        .is_some();
+    if ok && foreign_rgb(fs.0.fourcc) {
+        swap_rb(out);
+    }
+    ok
+}
+
+/// `data` (B G R A, rows `row_pitch` apart; reordered in place for an R G B image) into `rect` of
+/// foreign NVK image `resource_id` (`ce_vram::foreign_transfer`). PASSIVE.
+pub(crate) fn foreign_upload(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    rect: Rect,
+    data: &mut [u8],
+    row_pitch: usize,
+) -> bool {
+    let Some(r) = vrect(rect) else { return false };
+    let Some(fs) = foreign_source(passive, adapter, resource_id, false) else {
+        return false;
+    };
+    if foreign_rgb(fs.0.fourcc) {
+        swap_rb(data);
+    }
+    retry_busy(passive, || ce_vram::foreign_transfer(passive, adapter, &fs.0, r, rv::Dir::Upload, data, row_pitch)).is_some()
+}
+
 /// `rect` of VRAM surface `resource_id` into `out`, rows `row_pitch` apart (`ce_vram::transfer`,
 /// readback through the bounce buffer). PASSIVE.
 pub(crate) fn vram_read(

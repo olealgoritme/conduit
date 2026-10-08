@@ -939,6 +939,10 @@ pub enum Why {
     CpuFailed = 12,
     /// The executor timed out on the copy engine and discharged the job (dropped).
     Timeout = 13,
+    /// A command on a foreign NVK image that no copy-engine path does (a fill, a blend, ClearType,
+    /// a ROP, foreign to foreign): the CPU executor reads and writes the image's window through
+    /// `ce_vram::foreign_transfer`.
+    Foreign = 14,
 }
 
 impl Why {
@@ -949,6 +953,20 @@ impl Why {
     pub const fn bit(self) -> u32 {
         1 << (self as u32)
     }
+}
+
+/// Whether `cmd` is one of the plain copies the foreign copy-engine paths do (`ce_vram`'s
+/// `foreign_copy` / `foreign_write`): a SRCCOPY BitBlt with exactly one side a foreign image and
+/// the other VRAM or a staging buffer. Every other command on a foreign image is [`Why::Foreign`].
+pub fn is_foreign_copy(cmd: &Cmd, dst: Option<&Surface>, src: Option<&Surface>) -> bool {
+    let (Some(d), Some(s)) = (dst, src) else {
+        return false;
+    };
+    let srccopy = matches!(*cmd, Cmd::BitBlt { rop, .. } if rop == rop::SRCCOPY);
+    let other = |c: SurfaceClass| matches!(c, SurfaceClass::Vram | SurfaceClass::System);
+    srccopy
+        && ((s.class == SurfaceClass::Foreign && other(d.class))
+            || (d.class == SurfaceClass::Foreign && other(s.class)))
 }
 
 /// The engine for `cmd` given its surfaces (`dst`, `srcs` in [`Cmd::indices`] order; `None` for
@@ -982,7 +1000,16 @@ pub fn plan(cmd: &Cmd, dst: Option<&Surface>, srcs: [Option<&Surface>; 2]) -> (E
             (true, true, false, _, _) => (Engine::Cpu, Some(Why::SystemSurface)),
             (true, false, true, _, Some(SurfaceClass::Vram)) => (Engine::Ce, None),
             (true, false, true, _, Some(SurfaceClass::System)) => (Engine::Cpu, Some(Why::SystemSurface)),
-            _ => (Engine::Drop, Some(Why::Unreachable)),
+            // Everything else runs on the CPU over windows of the image (read, run, write back).
+            _ => {
+                let overlap = match *cmd {
+                    Cmd::BitBlt { src, dst: d, src_index, dst_index, .. } => {
+                        src_index == dst_index && bitblt_src(&d, &d, &src).overlaps(&d)
+                    }
+                    _ => false,
+                };
+                (Engine::Cpu, Some(if overlap { Why::Overlap } else { Why::Foreign }))
+            }
         };
     }
     let all_vram = all.iter().flatten().all(|s| s.class == SurfaceClass::Vram);
@@ -1717,6 +1744,11 @@ pub const COUNTERS: &[&str] = &[
     // ids (source | destination << 16), shape (sub-rects | same buffer << 16 | whole destination
     // << 17 | same extent << 18).
     "GdiSysK",
+    // Windows of foreign NVK images the CPU executor read and wrote back (Why 14: fills, blends,
+    // ClearType, ROPs on an NVK image), and transfers that failed.
+    "GdiFgnRd",
+    "GdiFgnWb",
+    "GdiFgnRwF",
     "GdiSysSWH",
     "GdiSysDWH",
     "GdiSysRes",
@@ -2040,14 +2072,24 @@ mod tests {
         assert_eq!(plan(&cf(cfrop::PATCOPY), Some(&sys), [None, None]), (Engine::Cpu, Some(Why::SystemSurface)));
         assert_eq!(plan(&cf(cfrop::DSTINVERT), Some(&a), [None, None]), (Engine::Cpu, Some(Why::Rop)));
         assert_eq!(plan(&Cmd::Escape, None, [None, None]), (Engine::Drop, None));
-        // A foreign NVK image: only a SRCCOPY source.
+        // A foreign NVK image: plain copies on the copy engine, everything else on the CPU.
         let fg = Surface { class: SurfaceClass::Foreign, ..vram(5) };
         assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Ce, None));
         assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&sys), [Some(&fg), None]), (Engine::Cpu, Some(Why::SystemSurface)));
         assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&b), None]), (Engine::Ce, None));
         assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&sys), None]), (Engine::Cpu, Some(Why::SystemSurface)));
-        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&fg), None]), (Engine::Drop, Some(Why::Unreachable)));
-        assert_eq!(plan(&bb(rop::SRCOR, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Drop, Some(Why::Unreachable)));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&fg), None]), (Engine::Cpu, Some(Why::Foreign)));
+        assert_eq!(plan(&bb(rop::SRCOR, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Cpu, Some(Why::Foreign)));
+        assert_eq!(plan(&cf(cfrop::PATCOPY), Some(&fg), [None, None]), (Engine::Cpu, Some(Why::Foreign)));
+        let fg2 = Surface { class: SurfaceClass::Foreign, ..vram(5) };
+        assert_eq!(plan(&bb(rop::SRCCOPY, 1, 1, Rect::new(5, 0, 15, 10), r), Some(&fg2), [Some(&fg2), None]), (Engine::Cpu, Some(Why::Overlap)));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&venus), None]), (Engine::Drop, Some(Why::Unreachable)));
+        // Only the plain copies take the foreign copy-engine paths.
+        assert!(is_foreign_copy(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&b), Some(&fg)));
+        assert!(is_foreign_copy(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), Some(&sys)));
+        assert!(!is_foreign_copy(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), Some(&fg)));
+        assert!(!is_foreign_copy(&bb(rop::SRCOR, 0, 1, r, r), Some(&b), Some(&fg)));
+        assert!(!is_foreign_copy(&cf(cfrop::PATCOPY), Some(&fg), None));
     }
 
     #[test]
