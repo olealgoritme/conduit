@@ -350,6 +350,13 @@ unsafe fn dxgkddi_present_inner(
     let stashed_stream_marker = present_context
         .as_ref()
         .and_then(ContextHandleRef::take_present_stream_marker_stash);
+    // `RvMk*` (`RedirVram` diagnosis of the route's NoBoundary): what the stash held at this
+    // Present, before resolution. Two relaxed adds.
+    crate::ddi::vram_redirect::note_marker(match stashed_stream_marker {
+        None => 0,
+        Some(crate::device::StashedMarker::Resolved(_)) => 1,
+        Some(crate::device::StashedMarker::Stream { .. }) => 2,
+    });
     // The "already on scanout" tag (`HOSC`) the same Render left, taken (read + CLEAR) on every
     // Present that resolves its context, whatever its arm, like the snapshot and the marker. One
     // relaxed load for a context that carries none.
