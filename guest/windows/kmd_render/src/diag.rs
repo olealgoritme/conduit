@@ -1401,6 +1401,25 @@ pub mod knobs {
     /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
     /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
+    /// `GdiAccel` (default 0 = no GDI hardware acceleration: `PresentationCaps` 0, the word since
+    /// 22.22.180.0). 1: report `helios_kmd_logic::gdi_accel::ACCEL_CAPS`
+    /// (`SupportKernelModeCommandBuffer` with the `NoSameBitmap*` declines) and translate
+    /// `DxgkDdiRenderKm` command buffers (`ddi/gdi_accel.rs`). 2: only `DriverSupportsCddDwmInterop`
+    /// (0x100), 3: only `SupportSoftwareDeviceBitmaps` (0x10000000), one-bit experiments without
+    /// GDI acceleration. Any other value is 0. Read with the
+    /// other caps knobs at AddAdapter and StartDevice; mirrored as `GdiKnob`/`GdiCaps`.
+    /// `docs/vram-redirection.md` section 10.
+    pub const GDI_ACCEL: KnobName = KnobName::new(b"GdiAccel");
+    /// `GdiOff` (default 0): the `GdiAccel` bisect mask, read at StartDevice with the knob on and
+    /// mirrored as `GdiPaths` (the paths in force). A set bit turns a path OFF: 0x1 copies from
+    /// foreign NVK images (dropped), 0x4 copies and fills over a staging buffer's copy-engine view
+    /// (CPU instead), 0x8 two staging views at once (CPU instead), 0x10 scrolls as copy-engine
+    /// bands (CPU instead), 0x20 copies into foreign NVK images (dropped). Opt-in 0x40: every GDI write into a GPU surface
+    /// sets alpha 0xff (AlphaBlend excepted). Opt-in 0x80: execute each buffer at render
+    /// (timing diagnostic). Opt-in 0x100: the readback diagnostics (self-check, content probes). One opt-in: 0x2 lets a foreign copy acquire the producer's semaphore.
+    /// One value with a name no counter has: the four separate switches of 365-367 shared
+    /// `GdiSysCe` with a counter, so the knob read the last boot's counter.
+    pub const GDI_OFF: KnobName = KnobName::new(b"GdiOff");
     /// `DXGK_VIDMMCAPS` extra bits (default 0 = the driver's own word). A raw mask OR'd into
     /// `MemoryManagementCaps`; only bit 9 `NonCpuVisiblePrimary` (0x200) is accepted
     /// (`helios_kmd_logic::vidmm_caps`), the rest is dropped and reported in `VmCapsXMsk`. The

@@ -245,6 +245,13 @@ pub(crate) struct AdapterKnobs {
     /// clean. Out-of-range values are refused into `VidVBad` and fall back to
     /// the legacy topology rather than silently collapsing.
     pub vidmm_vram_mb: u32,
+    /// `GdiAccel` (default 0), raw: 1 reports GDI hardware acceleration (`ddi/gdi_accel.rs`).
+    /// Read here so the AddAdapter-time caps query and the StartDevice latch agree.
+    pub gdi_accel: u32,
+    /// `RedirVram` and `RmCopyEngine` as read here, raw: `GdiAccel` = 1 needs both on
+    /// (`gdi_accel::resolve_caps_with`). Their owners read them again at StartDevice.
+    pub gdi_redir_vram: u32,
+    pub gdi_rm_copy_engine: u32,
 }
 
 impl AdapterKnobs {
@@ -275,6 +282,9 @@ impl AdapterKnobs {
         bar_seg_base_mb: 0,
         bar_seg_mode: 10,
         vidmm_vram_mb: VIDMM_VRAM_MB_AUTO,
+        gdi_accel: 0,
+        gdi_redir_vram: 0,
+        gdi_rm_copy_engine: 0,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -320,6 +330,9 @@ impl AdapterKnobs {
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
             vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
+            gdi_accel: read_config_dword(knobs::GDI_ACCEL, 0),
+            gdi_redir_vram: read_config_dword(knobs::REDIR_VRAM, 0),
+            gdi_rm_copy_engine: read_config_dword(knobs::RM_COPY_ENGINE, 0),
         }
     }
 
@@ -361,6 +374,8 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"FlipCapsXEff", flip.effective);
         crate::diag::record_named_bytes(b"FlipCapsXMsk", flip.dropped);
         crate::diag::record_named_bytes(b"FlipCapsRep", flip.reported);
+        // GDI acceleration: latch the knob for RenderKm and write its mirrors (knob on only).
+        crate::ddi::gdi_accel::note_start(&knobs);
         // The extra VidMm caps this start accepts (the reported word itself is mirrored by the
         // caps query, which owns the base word: `VmCapsRep`).
         let vm = knobs.vidmm_caps(0);

@@ -1,0 +1,465 @@
+//! The one seam between GDI acceleration (`ddi/gdi_accel.rs`, `ddi/gdi_exec.rs`) and the modules
+//! of the redirection lane it executes on (boundary agreed with the V2-V5 work, recorded in
+//! `docs/vram-redirection.md` 8 and 10): the RM video-memory surfaces and their copy-engine
+//! mappings (`virtio/rm_client/{vidmem,ce_vram}.rs`, `RedirVram`), the generic submission on the
+//! KMD's copy-engine channel (`ce_channel::submit_build`), and the CPU view of a KMD standard
+//! buffer (`build_paging_buffer::{read,write}_standard_buffer`). Every function here is a thin
+//! call, so the executor depends on this file's names only.
+
+use helios_kmd_logic::ce_present::{self as cp, Gen};
+use helios_kmd_logic::gdi_accel::{CeView, Rect};
+use helios_kmd_logic::rm_vidmem as rv;
+
+use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
+use crate::virtio::rm_client::{ce_channel, ce_route, ce_vram, vidmem};
+
+/// The copy-engine channel's state for GDI acceleration: 0 up, 1 cold (a bring-up may be asked
+/// for), 2 disabled for the generation, 3 broken (waiting for its teardown), 4 another phase
+/// (coming up, cooling down). Spinlock only.
+pub(crate) fn channel_state() -> u32 {
+    let v = ce_route::chan_view();
+    if v.up {
+        0
+    } else if v.may_bring_up {
+        1
+    } else if v.disabled {
+        2
+    } else if v.broken {
+        3
+    } else {
+        4
+    }
+}
+
+/// Bring the channel up (`ce_route::bring_up`: the route's own bring-up, bounded by the channel's
+/// 6 s budget, never waiting for its I/O). HPD worker only. Until now only a routed Present asked
+/// for it, so a desktop with no windowed NVK Present left the channel cold and every GDI
+/// operation on a VRAM surface failed (358.1). Whether it is up afterwards.
+pub(crate) fn bring_up(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
+    ce_route::bring_up(passive, adapter)
+}
+
+/// A foreign NVK image as a copy-engine source (`ce_vram::foreign_source`): the producer's
+/// objects with an acquire when the route saw a record for it, else an import by resource id.
+/// Takes the channel's I/O itself: call it before `with_standard`. PASSIVE.
+pub(crate) struct ForeignSrc(ce_vram::ForeignSource);
+
+/// `acquire` false drops the producer's semaphore acquire (`GdiFgnAcq` 0): a copy-engine acquire
+/// cannot time out, and a value that is never reached would stall the shared channel.
+pub(crate) fn foreign_source(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    acquire: bool,
+) -> Option<ForeignSrc> {
+    let mut s = retry_busy(passive, || ce_vram::foreign_source(passive, adapter, resource_id))?;
+    if !acquire {
+        s.acquire = None;
+    }
+    Some(ForeignSrc(s))
+}
+
+/// The `DRM_FORMAT_*` of a GDI surface's D3DDDIFORMAT (21 A8R8G8B8, 22 X8R8G8B8, 32 A8B8G8R8,
+/// 33 X8B8G8R8; anything else is the GDI default ARGB8888).
+pub(crate) fn fourcc_of(d3dddi_format: u32) -> u32 {
+    use helios_kmd_logic::foreign_resource as fr;
+    match d3dddi_format {
+        22 => fr::FOURCC_XRGB8888,
+        32 => fr::FOURCC_ABGR8888,
+        33 => fr::FOURCC_XBGR8888,
+        _ => fr::FOURCC_ARGB8888,
+    }
+}
+
+/// Copies `(src_rect, dst_rect)` pairs from a foreign image into `dst` and waits for the last one;
+/// `0` when every copy landed, else the failing step (3 submit, 4 wait).
+fn foreign_copies(passive: PassiveLevel, src: &ForeignSrc, dst: &ce_vram::CeSurface, pairs: &[(Rect, Rect)], fourcc: u32) -> u32 {
+    let mut last = None;
+    for (s, d) in pairs {
+        let (Some(sr), true) = (vrect(*s), d.left >= 0 && d.top >= 0) else {
+            continue;
+        };
+        match ce_vram::foreign_copy(&src.0, sr, dst, d.left as u32, d.top as u32, fourcc) {
+            Ok(v) => last = Some(v),
+            Err(_) => {
+                if let Some(v) = last {
+                    let _ = wait(passive, v, 100);
+                }
+                return 3;
+            }
+        }
+    }
+    match last {
+        Some(v) if !wait(passive, v, 100) => 4,
+        _ => 0,
+    }
+}
+
+/// Copies `(src_rect, dst_rect)` pairs from `src` INTO a foreign image and waits for the last;
+/// `0` done, 3 submit, 4 wait.
+fn foreign_writes(passive: PassiveLevel, src: &ce_vram::CeSurface, src_fourcc: u32, dst: &ForeignSrc, pairs: &[(Rect, Rect)]) -> u32 {
+    let mut last = None;
+    for (s, d) in pairs {
+        let (Some(sr), true) = (vrect(*s), d.left >= 0 && d.top >= 0) else {
+            continue;
+        };
+        match ce_vram::foreign_write(src, sr, src_fourcc, &dst.0, d.left as u32, d.top as u32) {
+            Ok(v) => last = Some(v),
+            Err(_) => {
+                if let Some(v) = last {
+                    let _ = wait(passive, v, 100);
+                }
+                return 3;
+            }
+        }
+    }
+    match last {
+        Some(v) if !wait(passive, v, 100) => 4,
+        _ => 0,
+    }
+}
+
+/// A VRAM surface INTO a foreign image. `0` done, else 2 source mapping, 3 submit, 4 wait.
+pub(crate) fn vram_to_foreign(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    src_resource_id: u32,
+    src_fourcc: u32,
+    dst: &ForeignSrc,
+    pairs: &[(Rect, Rect)],
+) -> u32 {
+    let Some(src) = retry_busy(passive, || ce_vram::ce_surface(passive, adapter, src_resource_id)) else {
+        return 2;
+    };
+    foreign_writes(passive, &src, src_fourcc, dst, pairs)
+}
+
+/// A staging buffer INTO a foreign image (the buffer's copy-engine view). `0` done, 5 view refused.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn standard_to_foreign(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    src_resource_id: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    src_fourcc: u32,
+    dst: &ForeignSrc,
+    pairs: &[(Rect, Rect)],
+) -> u32 {
+    let r = crate::ddi::ce_sysmem::with_standard(passive, adapter, src_resource_id, pitch, width, height, |src| {
+        foreign_writes(passive, src, src_fourcc, dst, pairs)
+    });
+    r.unwrap_or(5)
+}
+
+/// A foreign image into a VRAM surface. `0` done, else the failing step (2 destination mapping,
+/// 3 submit, 4 wait).
+pub(crate) fn foreign_to_vram(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    src: &ForeignSrc,
+    dst_resource_id: u32,
+    pairs: &[(Rect, Rect)],
+    fourcc: u32,
+) -> u32 {
+    let Some(dst) = retry_busy(passive, || ce_vram::ce_surface(passive, adapter, dst_resource_id)) else {
+        return 2;
+    };
+    foreign_copies(passive, src, &dst, pairs, fourcc)
+}
+
+/// A foreign image into a staging buffer's copy-engine view (`ce_sysmem::with_standard`). `0`
+/// done, 5 the view refused, else as [`foreign_to_vram`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foreign_to_standard(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    src: &ForeignSrc,
+    dst_resource_id: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    pairs: &[(Rect, Rect)],
+    fourcc: u32,
+) -> u32 {
+    let r = crate::ddi::ce_sysmem::with_standard(passive, adapter, dst_resource_id, pitch, width, height, |dst| {
+        foreign_copies(passive, src, dst, pairs, fourcc)
+    });
+    r.unwrap_or(5)
+}
+
+/// How often a call that found the channel's I/O held by another thread tries again (1 ms apart).
+const BUSY_TRIES: u32 = 10;
+
+/// `RedirVram` in force for this start (`vidmem::knob_on`).
+pub(crate) fn vram_knob_on() -> bool {
+    vidmem::knob_on()
+}
+
+/// Is `resource_id` a KMD standard buffer backed by RM system memory (`sysmem::object`)?
+pub(crate) fn is_rm_standard(resource_id: u32) -> bool {
+    crate::virtio::rm_client::sysmem::object(resource_id).is_some()
+}
+
+/// Is `resource_id` an RM-VRAM-backed surface (`vidmem::lookup`)? Spinlock-only, any IRQL up to
+/// DISPATCH.
+pub(crate) fn is_vram(resource_id: u32) -> bool {
+    vidmem::lookup(resource_id).is_some()
+}
+
+fn retry_busy<T>(passive: PassiveLevel, mut f: impl FnMut() -> Result<T, helios_kmd_logic::rm_client::Fail>) -> Option<T> {
+    for i in 0..BUSY_TRIES {
+        match f() {
+            Ok(v) => return Some(v),
+            Err(e) if ce_route::is_busy(&e) && i + 1 < BUSY_TRIES => crate::virtio::ctrl::sleep_ms(passive, 1),
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// `resource_id` as a copy-engine surface, mapped on demand (`ce_vram::ce_surface`). PASSIVE, no
+/// lock held, the channel's I/O not held by the caller.
+pub(crate) fn ce_surface(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) -> Option<CeView> {
+    let s = retry_busy(passive, || ce_vram::ce_surface(passive, adapter, resource_id))?;
+    Some(CeView { va: s.va, pitch: s.pitch, width: s.width, height: s.height })
+}
+
+/// One push on the channel (`ce_channel::submit_build`): `build` writes its methods and must end
+/// with the release it is handed. The completion value, or `None` when the channel refused.
+pub(crate) fn submit(
+    build: impl FnOnce(&mut cp::Push<'_>, Gen, cp::Release) -> Result<(), cp::PushError>,
+) -> Option<u64> {
+    ce_channel::submit_build(build).ok()
+}
+
+/// The push slot's size in dwords (`rm_ce_channel::SLOT_DWORDS`).
+pub(crate) const SLOT_DWORDS: usize = helios_kmd_logic::rm_ce_channel::SLOT_DWORDS;
+
+/// Wait until the channel's completion reaches `value`, at most `max_ms`, polling
+/// (`ce_channel::poll`) WITHOUT sleeping: `ce_vram::wait` spins 20 ms and then sleeps 1 ms ticks,
+/// which `KeDelayExecutionThread` rounds up to the timer granularity (~15.6 ms), so a copy that
+/// took 21 ms cost up to ~36 ms (373.1 `GdiSlowOp` 0x12211 at 31.6 ms on the staging copy-engine
+/// path). This runs on the GDI executor's own thread, so the spin costs no one else.
+/// Bounded; it does NOT mark the channel broken: only the route's worker tears a broken channel
+/// down, and only while the route holds jobs, so a broken mark from here could leave the channel
+/// unusable for the rest of the generation. GDI's own pushes never acquire (`GdiFgnAcq` 0), so
+/// they cannot be what stalls it.
+pub(crate) fn wait(_passive: PassiveLevel, value: u64, max_ms: u64) -> bool {
+    let start = crate::ddi::blt_async::now_100ns();
+    let deadline = start + max_ms * 10_000;
+    loop {
+        let Some(p) = ce_channel::poll() else {
+            return false;
+        };
+        if p.notifier != 0 {
+            return false;
+        }
+        if p.completed >= value {
+            return true;
+        }
+        if crate::ddi::blt_async::now_100ns() >= deadline {
+            return false;
+        }
+        for _ in 0..64 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn vrect(r: Rect) -> Option<rv::Rect> {
+    if r.left < 0 || r.top < 0 || r.is_empty() {
+        return None;
+    }
+    Some(rv::Rect { left: r.left as u32, top: r.top as u32, right: r.right as u32, bottom: r.bottom as u32 })
+}
+
+/// Whether a foreign image's bytes are R G B in memory (`DRM_FORMAT_[AX]BGR8888`); the CPU
+/// executor works in B G R A, the format of every CDD surface.
+fn foreign_rgb(fourcc: u32) -> bool {
+    use helios_kmd_logic::foreign_resource as fr;
+    fourcc == fr::FOURCC_ABGR8888 || fourcc == fr::FOURCC_XBGR8888
+}
+
+fn swap_rb(bytes: &mut [u8]) {
+    for px in bytes.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
+/// `rect` of foreign NVK image `resource_id` into `out` (B G R A, rows `row_pitch` apart), through
+/// the bounce buffer (`ce_vram::foreign_transfer`), no acquire. PASSIVE.
+pub(crate) fn foreign_read(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    rect: Rect,
+    out: &mut [u8],
+    row_pitch: usize,
+) -> bool {
+    let Some(r) = vrect(rect) else { return false };
+    let Some(fs) = foreign_source(passive, adapter, resource_id, false) else {
+        return false;
+    };
+    let ok = retry_busy(passive, || ce_vram::foreign_transfer(passive, adapter, &fs.0, r, rv::Dir::Readback, out, row_pitch))
+        .is_some();
+    if ok && foreign_rgb(fs.0.fourcc) {
+        swap_rb(out);
+    }
+    ok
+}
+
+/// `data` (B G R A, rows `row_pitch` apart; reordered in place for an R G B image) into `rect` of
+/// foreign NVK image `resource_id` (`ce_vram::foreign_transfer`). PASSIVE.
+pub(crate) fn foreign_upload(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    rect: Rect,
+    data: &mut [u8],
+    row_pitch: usize,
+) -> bool {
+    let Some(r) = vrect(rect) else { return false };
+    let Some(fs) = foreign_source(passive, adapter, resource_id, false) else {
+        return false;
+    };
+    if foreign_rgb(fs.0.fourcc) {
+        swap_rb(data);
+    }
+    retry_busy(passive, || ce_vram::foreign_transfer(passive, adapter, &fs.0, r, rv::Dir::Upload, data, row_pitch)).is_some()
+}
+
+/// `rect` of VRAM surface `resource_id` into `out`, rows `row_pitch` apart (`ce_vram::transfer`,
+/// readback through the bounce buffer). PASSIVE.
+pub(crate) fn vram_read(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    rect: Rect,
+    out: &mut [u8],
+    row_pitch: usize,
+) -> bool {
+    let Some(r) = vrect(rect) else { return false };
+    retry_busy(passive, || ce_vram::transfer(passive, adapter, resource_id, r, rv::Dir::Readback, out, row_pitch)).is_some()
+}
+
+/// `data` (rows `row_pitch` apart) into `rect` of VRAM surface `resource_id` (`ce_vram::transfer`,
+/// upload). PASSIVE.
+pub(crate) fn vram_write(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    rect: Rect,
+    data: &mut [u8],
+    row_pitch: usize,
+) -> bool {
+    let Some(r) = vrect(rect) else { return false };
+    retry_busy(passive, || ce_vram::transfer(passive, adapter, resource_id, r, rv::Dir::Upload, data, row_pitch)).is_some()
+}
+
+/// Run `f` with KMD standard buffer `resource_id` (`pitch` bytes per row, `width` x `height`) as a
+/// copy-engine surface over its system pages (`ce_sysmem::with_standard`: takes the content
+/// transaction, then the channel's I/O). `f` must wait for everything it submits and must not
+/// resolve a VRAM surface (do that before). `Err`: the refusal as a [`SysRefusal`]. PASSIVE, no
+/// lock held.
+pub(crate) fn with_standard<R>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    f: impl FnOnce(&CeView) -> R,
+) -> Result<R, SysRefusal> {
+    let r = crate::ddi::ce_sysmem::with_standard(passive, adapter, resource_id, pitch, width, height, |s| {
+        f(&CeView { va: s.va, pitch: s.pitch, width: s.width, height: s.height })
+    });
+    // `ce_sysmem` mirrors its `RvSys*` counters itself (refusals, the first call, every 64th): a
+    // publish here on every call was a dozen registry writes per GDI command.
+    r.map_err(refusal)
+}
+
+/// Two staging buffers' copy-engine views in one content transaction
+/// (`ce_sysmem::with_standard_pair`); `a`, `b` are `(resource_id, pitch, width, height)`. Same rules
+/// as [`with_standard`]. PASSIVE, no lock held.
+pub(crate) fn with_standard_pair<R>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    a: (u32, u32, u32, u32),
+    b: (u32, u32, u32, u32),
+    f: impl FnOnce(&CeView, &CeView) -> R,
+) -> Result<R, SysRefusal> {
+    let view = |s: &ce_vram::CeSurface| CeView { va: s.va, pitch: s.pitch, width: s.width, height: s.height };
+    let r = crate::ddi::ce_sysmem::with_standard_pair(passive, adapter, a, b, |x, y| f(&view(x), &view(y)));
+    r.map_err(refusal)
+}
+
+fn refusal(f: helios_kmd_logic::rm_client::Fail) -> SysRefusal {
+    SysRefusal {
+        class: if f == crate::ddi::ce_sysmem::NOT_SYSTEM {
+            SysClass::NotSystem
+        } else if f == crate::ddi::ce_sysmem::UNCOVERED {
+            SysClass::Uncovered
+        } else if ce_route::is_busy(&f) || f == ce_route::NO_CHANNEL {
+            SysClass::Busy
+        } else if f == crate::ddi::ce_sysmem::UNSURE {
+            SysClass::Unsure
+        } else {
+            SysClass::Other
+        },
+        word: helios_kmd_logic::rm_ce_channel::fail_word(f),
+    }
+}
+
+/// Why `with_standard` refused.
+#[derive(Clone, Copy)]
+pub(crate) struct SysRefusal {
+    pub class: SysClass,
+    /// `rm_ce_channel::fail_word` of the refusal.
+    pub word: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SysClass {
+    /// No leases (the buffer is in the Venus window, segment 2), a stale system copy, a guest blob.
+    NotSystem,
+    /// Partial leases, more than one window (64 MiB), no slot.
+    Uncovered,
+    /// The channel's I/O busy past 250 ms, or no channel.
+    Busy,
+    /// An RM timeout (the pages stay pinned).
+    Unsure,
+    Other,
+}
+
+/// `out.len()` bytes at `offset` of KMD standard buffer `resource_id`'s authoritative CPU view
+/// (`read_standard_buffer`). PASSIVE.
+pub(crate) fn std_read(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    offset: u64,
+    out: &mut [u8],
+) -> bool {
+    crate::ddi::build_paging_buffer::read_standard_buffer(passive, adapter, resource_id, offset, out)
+}
+
+/// `rows` packed rows of `row_bytes` at `offset`, stride `pitch`, into KMD standard buffer
+/// `resource_id` (`write_standard_buffer`: the blob, then the system pages VidMm holds). PASSIVE.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn std_write(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    offset: u64,
+    pitch: u32,
+    row_bytes: u32,
+    rows: u32,
+    data: &[u8],
+) -> bool {
+    crate::ddi::build_paging_buffer::write_standard_buffer(
+        passive, adapter, resource_id, offset, pitch, row_bytes, rows, data,
+    )
+}

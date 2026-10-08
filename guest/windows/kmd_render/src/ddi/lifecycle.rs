@@ -472,6 +472,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // (one load when there is none: always, with the knob at 0); the Present route's destination
     // descriptors and producer dups first (one load when it holds nothing).
     crate::ddi::ce_present_route::retire_for_stop(passive, adapter, &live_budget);
+    // `GdiAccel`: every admitted GDI job's fence may retire now (no-op with the knob off).
+    if crate::ddi::gdi_accel::on() {
+        crate::ddi::gdi_exec::discharge_all(adapter);
+    }
     crate::ddi::build_paging_buffer::release_cpu_views(passive, adapter);
     crate::virtio::rm_client::ce_channel::retire_for_stop(passive, adapter, &live_budget);
     crate::virtio::nvrm::retire_transport(passive, adapter, &live_budget);
@@ -866,6 +870,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // Present route's destination descriptors and producer dups go first (one load when it
         // holds nothing).
         crate::ddi::ce_present_route::retire_for_stop(passive_stop, adapter, &budget);
+        if crate::ddi::gdi_accel::on() {
+            crate::ddi::gdi_exec::discharge_all(adapter);
+        }
         // `RedirVram`: the CPU helpers' reused blob views go before the window does.
         crate::ddi::build_paging_buffer::release_cpu_views(passive_stop, adapter);
         crate::virtio::rm_client::ce_channel::retire_for_stop(passive_stop, adapter, &budget);
