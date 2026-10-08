@@ -964,6 +964,14 @@ static CPU_KB: AtomicU32 = AtomicU32::new(0);
 static CPU_CACHE: AtomicU32 = AtomicU32::new(0);
 static CPU_HIT: AtomicU32 = AtomicU32::new(0);
 static CPU_VIEW: AtomicU32 = AtomicU32::new(0);
+/// `read_standard_buffer` by the view it took: the system pages (leases current, `RvRdLease`), the
+/// blob because the system copy is marked invalid (`RvRdInval`: VidMm moved the allocation and the
+/// KMD skipped the eviction copy), the blob because there are no leases (`RvRdBlob`), and the last
+/// resource read with its view (`RvRdLast` = resource id << 4 | view 1/2/3).
+static RD_LEASE: AtomicU32 = AtomicU32::new(0);
+static RD_INVAL: AtomicU32 = AtomicU32::new(0);
+static RD_BLOB: AtomicU32 = AtomicU32::new(0);
+static RD_LAST: AtomicU32 = AtomicU32::new(0);
 
 fn now_us() -> u64 {
     crate::adapter::foreign_scanout::now_100ns() / 10
@@ -981,6 +989,10 @@ fn publish_cpu_counters() {
     rec(b"RvCpuCache", CPU_CACHE.load(Ordering::Relaxed));
     rec(b"RvCpuHit", CPU_HIT.load(Ordering::Relaxed));
     rec(b"RvCpuView", CPU_VIEW.load(Ordering::Relaxed));
+    rec(b"RvRdLease", RD_LEASE.load(Ordering::Relaxed));
+    rec(b"RvRdInval", RD_INVAL.load(Ordering::Relaxed));
+    rec(b"RvRdBlob", RD_BLOB.load(Ordering::Relaxed));
+    rec(b"RvRdLast", RD_LAST.load(Ordering::Relaxed));
 }
 
 /// [`with_blob_bytes`] through a reused view. The caller holds the content transaction.
@@ -1118,8 +1130,15 @@ pub(crate) fn read_standard_buffer(
         return false;
     };
     let want_end = offset.saturating_add(out.len() as u64);
-    if !guard.system_copy_invalid(resource_id) {
+    let invalid = guard.system_copy_invalid(resource_id);
+    if invalid {
+        RD_INVAL.fetch_add(1, Ordering::Relaxed);
+        RD_LAST.store(resource_id << 4 | 2, Ordering::Relaxed);
+    }
+    if !invalid {
         if let Some(snapshot) = guard.snapshot(resource_id) {
+            RD_LEASE.fetch_add(1, Ordering::Relaxed);
+            RD_LAST.store(resource_id << 4 | 1, Ordering::Relaxed);
             let Some(reader) = snapshot.reader() else {
                 return false;
             };
@@ -1151,6 +1170,10 @@ pub(crate) fn read_standard_buffer(
             publish_cpu_counters();
             return covered == out.len() as u64;
         }
+    }
+    if !invalid {
+        RD_BLOB.fetch_add(1, Ordering::Relaxed);
+        RD_LAST.store(resource_id << 4 | 3, Ordering::Relaxed);
     }
     let mut ok = false;
     // SAFETY: PASSIVE; the content transaction is held for the whole copy.
