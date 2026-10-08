@@ -441,6 +441,9 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
                 FGN_OP.store(cmd.opcode() | u32::from(fgn_dst) << 8 | u32::from(fgn_src) << 9 | rop << 16, Ordering::Relaxed);
             }
             gx::note_census(&cmd, dst.as_ref(), [srcs[0].as_ref(), srcs[1].as_ref()]);
+            if let Some(d) = dst.as_ref() {
+                gx::note_dst_seen(d);
+            }
             if matches!(cmd, Cmd::Escape) {
                 continue;
             }
