@@ -737,6 +737,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiSysK`, `GdiSysSWH`, `GdiSysDWH`, `GdiSysRes`, `GdiSysShape` | that command's surfaces: kinds (source `std type << 4 \| GDI type \| RM-backed << 8`, destination's << 16), extents (`w << 16 \| h`), resource ids (source \| destination << 16), shape (sub-rects \| same buffer << 16 \| covers the whole destination << 17 \| same extent << 18) |
 | `GdiFgnRd`, `GdiFgnWb`, `GdiFgnRwF` | windows of foreign NVK images the CPU executor read and wrote back (`Why` 14 `Foreign`: fills, blends, ClearType, ROPs, foreign to foreign), and the transfers that failed |
 | `GdiSeen0..15`, `GdiSeenN` | destinations the parser saw whatever became of the command (first 16): `resource id << 16 \| class bit << 12 \| GDI surface type << 8 \| commands (max 255)`; distinct count (`+ 0x10000` per command to an unlisted one). A window whose surface is absent here gets no GDI commands at all |
+| `GdiChkA0`, `GdiChkAFF`, `GdiChkGpuPx`, `GdiOpaqN`, `GdiFmtK` | of the self-checked pixels in GPU surfaces: alpha 0, alpha 0xff, the last one read (32 bits); commands that wrote an opaque alpha; the last GPU write's formats (source D3DDDIFORMAT \| destination's << 16) |
 | `GdiSlowRop`, `GdiCpuMsk`, `GdiCpuRop` | the slowest command's reason and ROP (`Why \| rop enum << 8 \| ROP3 << 16`); the reasons of the commands the CPU ran (bit per `Why` code, 1 for none); the last CPU command's reason and ROP |
 | `GdiJobMaxN`, `GdiJobT1..3`, `GdiJobT1Us..3Us` | the slowest job (`GdiUsMax`): its command count and its three slowest commands (signature as `GdiSlowOp`, µs) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
@@ -846,6 +847,14 @@ reads the window through the bounce buffer (R G B images reordered to B G R A), 
 the command, and the window is written back the same way. No producer acquire, as GDI on a D3D surface
 on bare metal. `GdiOff` 0x1 turns these off with the copies, 0x20 the write-back.
 
+**383.1, black wallpaper and Explorer list under G1:** the commands reach and write the textures
+(`GdiRes` lists res 23, 49, 53, 56 with 40/10/8/28 commands, no drops) and the self-check matches,
+but it compared the low 24 bits only. GDI has no alpha: a COLORREF fill and a GDI-drawn staging
+source carry alpha byte 0, which a compositor that blends the window texture reads as transparent.
+`GdiChkA0`/`GdiChkAFF` now show the alpha the textures hold; an `X8` source into an `A8` texture
+always gets alpha 0xff (as the windowed Present's `remap_for`), and `GdiOff` 0x40 forces alpha 0xff on
+every GDI write into a GPU surface except AlphaBlend, for the A/B.
+
 ### 10.6b Bisect switches (`GdiOff`, since 368.1)
 
 One service-key mask, `GdiOff` (default 0), read at StartDevice with `GdiAccel=1`; the paths in force
@@ -860,6 +869,7 @@ turns the acquire on):
 | 0x4 | copies and fills over a staging buffer's copy-engine view | CPU path |
 | 0x8 | two staging views at once (`with_standard_pair`) | CPU path |
 | 0x10 | scrolls as ordered copy-engine bands | CPU path |
+| 0x40 | (opt-in) every GDI write into a VRAM or foreign surface sets alpha 0xff (fills, copies, ClearType, stretch/transparent blits; AlphaBlend excepted) | default: only an `X8` source into an `A8` texture gets alpha 0xff |
 | 0x20 | (since the head after 2f94a4a6) copies INTO a foreign NVK image (`foreign_write`), reads stay on | dropped (`GdiFgnWhy` 26) |
 
 **The 365-367 switches were broken**: four separate values `GdiFgn`, `GdiFgnAcq`, `GdiSysCe`,
