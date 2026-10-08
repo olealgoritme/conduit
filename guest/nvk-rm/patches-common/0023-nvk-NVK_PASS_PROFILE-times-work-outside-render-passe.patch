@@ -1,0 +1,1616 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 23:30:20 +0200
+Subject: [PATCH] nvk: NVK_PASS_PROFILE times work outside render passes, more
+ signatures
+
+The CS2 capture with patch 0010 explained only 45 % of the GPU time: about
+550 of 990 GPU ms/s was in no render pass, and the 128-entry signature
+table had filled up with signatures from the map load, so about 4900
+passes a second were dropped (the logged count was cumulative, which hid
+how many per window).
+
+Operations outside render passes are now timed as runs of one kind:
+dispatches, indirect dispatches, buffer copies, image copies, buffer to
+image and image to buffer copies, fills, updates, colour and depth/stencil
+image clears, blits, vkCmdResolveImage, the resolve at the end of a render
+pass, query resets and query copies.  A run ends at the next render pass,
+operation of another kind, secondary or the end of the command buffer, so
+it includes the barriers between its operations.  Meta operations and the
+render passes the driver records itself (image clears, resolves, ZCULL
+reseeds) count towards the operation that records them instead of showing
+up as passes of their own.  Each report goes to the engine of the last
+method: the 3D class as before, the compute class after WAIT_FOR_IDLE, or
+the copy engine with a non-pipelined semaphore, so a copy's or dispatch's
+time is its own.
+
+Every window now logs a summary: command buffers = render passes +
+operations + the time between them (barriers, state, waits), the GPU time
+of each operation kind with its rate, and the 40 heaviest signatures.
+
+Each line now also says, per instance, the draw calls, the draws they make
+(vkCmdDrawMulti*EXT and indirect multi-draws count drawCount, indirect
+count draws maxDrawCount), the indirect calls and draws, queries begun and
+pipeline barriers.  "Draws" in 0010 counted calls only, which hides DXVK's
+batching of D3D11 draws into multi-draws and of DrawIndexedInstancedIndirect
+runs into one vkCmdDrawIndexedIndirect.  Render pass signatures also carry
+the load and store ops of the first colour and the depth attachment and
+whether the depth image has ZCULL storage.
+
+NVK_PASS_PROFILE=2 adds, per render pass, the vertex shader, clipper in
+and out and fragment shader invocation counters and the four ZCULL
+statistics counters (raw deltas).
+
+Capacity: 4096 signatures (hash lookup instead of a linear strcmp), 65536
+ring slots, dropped signatures counted per window.  The harvest thread no
+longer holds the recording threads' lock while it scans the ring.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c   |   2 +
+ src/nouveau/vulkan/nvk_cmd_buffer.h   |  56 +-
+ src/nouveau/vulkan/nvk_cmd_clear.c    |  11 +
+ src/nouveau/vulkan/nvk_cmd_copy.c     |   3 +
+ src/nouveau/vulkan/nvk_cmd_dispatch.c |   5 +
+ src/nouveau/vulkan/nvk_cmd_draw.c     |  19 +-
+ src/nouveau/vulkan/nvk_cmd_meta.c     |  20 +
+ src/nouveau/vulkan/nvk_pass_profile.c | 771 +++++++++++++++++++++-----
+ src/nouveau/vulkan/nvk_pass_profile.h |  62 ++-
+ src/nouveau/vulkan/nvk_query_pool.c   |   5 +
+ 10 files changed, 810 insertions(+), 144 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 2de1566a..56c6b9d8 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -362,6 +362,7 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+ 
+    nvk_reset_cmd_buffer(&cmd->vk, 0);
++   nvk_pass_profile_reset_cmd(cmd);
+ 
+    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+       cmd->state.inherited_pipeline_statistics =
+@@ -918,6 +919,7 @@ nvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
++   nvk_cmd_profile_count_barrier(cmd);
+    nvk_cmd_flush_wait_dep(cmd, pDependencyInfo, true);
+    nvk_cmd_image_layout_transition(cmd, pDependencyInfo);
+    nvk_cmd_invalidate_deps(cmd, 1, pDependencyInfo);
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 3bfa993c..cb8d6f65 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -11,6 +11,7 @@
+ #include "nvk_cmd_pool.h"
+ #include "nvk_descriptor_set.h"
+ #include "nvk_image.h"
++#include "nvk_pass_profile.h"
+ #include "nvk_shader.h"
+ 
+ #include "util/u_dynarray.h"
+@@ -337,11 +338,23 @@ struct nvk_cmd_buffer {
+    struct list_head owned_gart_mem;
+    struct list_head owned_qmd;
+ 
+-   /* NVK_PASS_PROFILE: ring slots of the open pass / command buffer */
++   /* NVK_PASS_PROFILE (nvk_pass_profile.c): ring slots of the open render
++    * pass, of this primary command buffer and of the open run of operations
++    * outside render passes, what each recorded, and the depth of
++    * driver-internal work (meta operations) being recorded.
++    */
+    int32_t pass_profile_slot;
+    int32_t pass_profile_cmd_slot;
+-   uint32_t pass_profile_draws;
+-   uint32_t pass_profile_cmd_draws;
++   int32_t pass_profile_op_slot;
++   int32_t pass_profile_stat_slot;
++   enum nvk_pass_profile_op pass_profile_op;
++   uint32_t pass_profile_op_count;
++   uint64_t pass_profile_op_groups;
++   uint32_t pass_profile_internal;
++   bool pass_profile_in_pass;
++   struct nvk_pass_profile_counts pass_profile_pass_counts;
++   struct nvk_pass_profile_counts pass_profile_op_counts;
++   struct nvk_pass_profile_counts pass_profile_cmd_counts;
+ 
+    struct nvk_cmd_mem *upload_mem;
+    uint32_t upload_offset;
+@@ -496,6 +509,43 @@ nvk_cmd_buffer_last_subchannel(const struct nvk_cmd_buffer *cmd)
+ 
+ VkQueueFlags nvk_cmd_buffer_queue_flags(struct nvk_cmd_buffer *cmd);
+ 
++/* NVK_PASS_PROFILE counters (see struct nvk_pass_profile_counts) */
++static inline void
++nvk_cmd_profile_count_draws(struct nvk_cmd_buffer *cmd, uint32_t draws,
++                            bool indirect)
++{
++   struct nvk_pass_profile_counts *c[3] = {
++      &cmd->pass_profile_pass_counts,
++      &cmd->pass_profile_op_counts,
++      &cmd->pass_profile_cmd_counts,
++   };
++   for (unsigned i = 0; i < 3; i++) {
++      c[i]->calls++;
++      c[i]->draws += draws;
++      if (indirect) {
++         c[i]->ind_calls++;
++         c[i]->ind_draws += draws;
++      }
++   }
++}
++
++static inline void
++nvk_cmd_profile_count_query(struct nvk_cmd_buffer *cmd)
++{
++   cmd->pass_profile_pass_counts.queries++;
++   cmd->pass_profile_op_counts.queries++;
++   cmd->pass_profile_cmd_counts.queries++;
++}
++
++static inline void
++nvk_cmd_profile_count_barrier(struct nvk_cmd_buffer *cmd)
++{
++   cmd->pass_profile_pass_counts.barriers++;
++   cmd->pass_profile_op_counts.barriers++;
++   cmd->pass_profile_cmd_counts.barriers++;
++}
++
++
+ VkResult nvk_cmd_buffer_alloc_mem(struct nvk_cmd_buffer *cmd,
+                                   bool force_gart,
+                                   struct nvk_cmd_mem **mem_out);
+diff --git a/src/nouveau/vulkan/nvk_cmd_clear.c b/src/nouveau/vulkan/nvk_cmd_clear.c
+index e6af1bf8..bcfe072c 100644
+--- a/src/nouveau/vulkan/nvk_cmd_clear.c
++++ b/src/nouveau/vulkan/nvk_cmd_clear.c
+@@ -400,6 +400,9 @@ nvk_cmd_zcull_reseed(struct nvk_cmd_buffer *cmd, struct nvk_image *image)
+       .pDepthAttachment = &att,
+    };
+ 
++   /* Part of the operation that wrote the image (NVK_PASS_PROFILE) */
++   nvk_pass_profile_internal_begin(cmd);
++
+    cmd->state.gfx.zcull_internal = NVK_ZCULL_INTERNAL_RESEED;
+    nvk_CmdBeginRendering(nvk_cmd_buffer_to_handle(cmd), &render);
+    cmd->state.gfx.zcull_internal = NVK_ZCULL_INTERNAL_NONE;
+@@ -409,6 +412,8 @@ nvk_cmd_zcull_reseed(struct nvk_cmd_buffer *cmd, struct nvk_image *image)
+    };
+    nvk_CmdEndRendering2KHR(nvk_cmd_buffer_to_handle(cmd), &end);
+ 
++   nvk_pass_profile_internal_end(cmd);
++
+    nvk_image_view_finish(dev, &view);
+ }
+ 
+@@ -458,8 +463,11 @@ nvk_CmdClearColorImage(VkCommandBuffer commandBuffer,
+       vk_format = vk_packed_int_format_for_size(bpp);
+    }
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_CLEAR_COLOR_IMAGE, 0);
++   nvk_pass_profile_internal_begin(cmd);
+    clear_image(cmd, image, imageLayout, vk_format,
+                &clear_value, rangeCount, pRanges);
++   nvk_pass_profile_internal_end(cmd);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -477,6 +485,9 @@ nvk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
+       .depthStencil = *pDepthStencil,
+    };
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_CLEAR_DS_IMAGE, 0);
++   nvk_pass_profile_internal_begin(cmd);
+    clear_image(cmd, image, imageLayout, image->vk.format,
+                &clear_value, rangeCount, pRanges);
++   nvk_pass_profile_internal_end(cmd);
+ }
+diff --git a/src/nouveau/vulkan/nvk_cmd_copy.c b/src/nouveau/vulkan/nvk_cmd_copy.c
+index c167f157..7bf7c7a8 100644
+--- a/src/nouveau/vulkan/nvk_cmd_copy.c
++++ b/src/nouveau/vulkan/nvk_cmd_copy.c
+@@ -957,6 +957,9 @@ nvk_CmdUpdateMemoryKHR(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
+    uint64_t dst_addr = pDstRange->address;
++
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_UPDATE_BUFFER, 0);
++
+    uint8_t subc = nvk_cmd_buffer_last_subchannel(cmd);
+ 
+    /* From the Vulkan 1.4.354 spec:
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index beaa59cc..e49b14bc 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -308,6 +308,9 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_DISPATCH,
++                       (uint64_t)groupCountX * groupCountY * groupCountZ);
++
+    uint32_t base_workgroup[3] = { baseGroupX, baseGroupY, baseGroupZ };
+    uint32_t global_size[3] = { groupCountX, groupCountY, groupCountZ };
+    nvk_flush_compute_state(cmd, base_workgroup, global_size);
+@@ -462,6 +465,8 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+ 
+    uint64_t dispatch_addr = pInfo->addressRange.address;
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_DISPATCH_INDIRECT, 0);
++
+    /* We set these through the MME */
+    uint32_t base_workgroup[3] = { 0, 0, 0 };
+    uint32_t global_size[3] = { 0, 0, 0 };
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 87332b51..acaae264 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -1805,7 +1805,7 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+       nvk_cmd_set_sample_layout(cmd, sample_layout);
+ 
+    /* Before the load-op clears, so they count as the pass's */
+-   nvk_pass_profile_begin_pass(cmd);
++   nvk_pass_profile_begin_pass(cmd, pRenderingInfo);
+ 
+    if (render->flags & VK_RENDERING_RESUMING_BIT)
+       return;
+@@ -2030,6 +2030,8 @@ nvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+    memset(render, 0, sizeof(*render));
+ 
+    if (need_resolve) {
++      nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_RESOLVE_END_OF_PASS, 0);
++
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+       P_IMMD(p, NVA097, INVALIDATE_TEXTURE_DATA_CACHE, {
+          .lines = LINES_ALL,
+@@ -4551,9 +4553,6 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+ static void
+ nvk_cmd_flush_gfx_state(struct nvk_cmd_buffer *cmd)
+ {
+-   cmd->pass_profile_draws++;
+-   cmd->pass_profile_cmd_draws++;
+-
+    nvk_cmd_buffer_flush_push_descriptors(cmd, &cmd->state.gfx.descriptors);
+    nvk_cmd_flush_gfx_dynamic_state(cmd);
+    nvk_cmd_flush_gfx_shaders(cmd);
+@@ -5258,6 +5257,7 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+       return;
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, 1, false);
+ 
+    if (nvk_cmd_can_draw_direct(cmd)) {
+       nvk_cmd_draw_direct(cmd, 0, vertexCount, instanceCount,
+@@ -5290,6 +5290,7 @@ nvk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
+       return;
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, drawCount, false);
+ 
+    if (nvk_cmd_can_draw_direct(cmd)) {
+       for (uint32_t draw_index = 0; draw_index < drawCount; draw_index++) {
+@@ -5456,6 +5457,7 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+       return;
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, 1, false);
+ 
+    if (nvk_cmd_can_draw_direct(cmd)) {
+       nvk_cmd_draw_indexed_direct(cmd, 0, indexCount, instanceCount,
+@@ -5490,6 +5492,7 @@ nvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
+       return;
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, drawCount, false);
+ 
+    if (nvk_cmd_can_draw_direct(cmd)) {
+       for (uint32_t draw_index = 0; draw_index < drawCount; draw_index++) {
+@@ -5590,6 +5593,7 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+    }
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+@@ -5699,6 +5703,7 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+    }
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+@@ -5784,6 +5789,7 @@ nvk_CmdDrawIndirectCount2KHR(VkCommandBuffer commandBuffer,
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, pInfo->maxDrawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+@@ -5840,6 +5846,7 @@ nvk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, pInfo->maxDrawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+@@ -5953,6 +5960,7 @@ nvk_CmdDrawIndirectByteCount2EXT(VkCommandBuffer commandBuffer,
+       return;
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, 1, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    uint64_t counter_addr = pCounterInfo->addressRange.address;
+@@ -6110,6 +6118,7 @@ nvk_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, u
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, 1, false);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+@@ -6168,6 +6177,7 @@ nvk_CmdDrawMeshTasksIndirect2EXT(VkCommandBuffer commandBuffer,
+    }
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+@@ -6220,6 +6230,7 @@ nvk_CmdDrawMeshTasksIndirectCount2EXT(VkCommandBuffer commandBuffer,
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_profile_count_draws(cmd, pInfo->maxDrawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+diff --git a/src/nouveau/vulkan/nvk_cmd_meta.c b/src/nouveau/vulkan/nvk_cmd_meta.c
+index 26e58473..49b7ceda 100644
+--- a/src/nouveau/vulkan/nvk_cmd_meta.c
++++ b/src/nouveau/vulkan/nvk_cmd_meta.c
+@@ -95,6 +95,8 @@ nvk_meta_begin_gfx(struct nvk_cmd_buffer *cmd,
+ {
+    const struct nvk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+ 
++   nvk_pass_profile_internal_begin(cmd);
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
+    P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_PASSTHROUGH);
+    P_IMMD(p, NV9097, SET_RENDER_ENABLE_OVERRIDE, MODE_ALWAYS_RENDER);
+@@ -216,6 +218,8 @@ nvk_meta_end_gfx(struct nvk_cmd_buffer *cmd,
+    P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_TRACK_WITH_FILTER);
+ 
+    nvk_cmd_forget_gfx_gpu_state(cmd);
++
++   nvk_pass_profile_internal_end(cmd);
+ }
+ 
+ static void
+@@ -223,6 +227,7 @@ nvk_meta_begin_compute(struct nvk_cmd_buffer *cmd,
+                        struct nvk_meta_save_compute *save)
+ {
+    assert(cmd->state.cs.descriptors.flush_root == NULL);
++   nvk_pass_profile_internal_begin(cmd);
+    save->state = cmd->state.cs;
+    nvk_cmd_invalidate_compute_state(cmd);
+ 
+@@ -239,6 +244,7 @@ nvk_meta_end_compute(struct nvk_cmd_buffer *cmd,
+ 
+    nvk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
+    cmd->state.cs = save->state;
++   nvk_pass_profile_internal_end(cmd);
+ }
+ 
+ static void
+@@ -274,6 +280,8 @@ nvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_BLIT, 0);
++
+    struct nvk_meta_save_gfx save;
+    nvk_meta_begin_gfx(cmd, &save);
+ 
+@@ -292,6 +300,8 @@ nvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_RESOLVE_IMAGE, 0);
++
+    struct nvk_meta_save_gfx save;
+    nvk_meta_begin_gfx(cmd, &save);
+ 
+@@ -442,6 +452,8 @@ nvk_CmdCopyImageToMemoryKHR(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(nvk_image, src, pCopyMemoryInfo->image);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_COPY_IMAGE_TO_BUFFER, 0);
++
+    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+    if ((queue_flags & VK_QUEUE_COMPUTE_BIT) &&
+        nvk_meta_image_copy_compute_supported(src)) {
+@@ -476,6 +488,8 @@ nvk_CmdCopyMemoryToImageKHR(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(nvk_image, dst, pCopyMemoryInfo->image);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_COPY_BUFFER_TO_IMAGE, 0);
++
+    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+    if ((queue_flags & VK_QUEUE_GRAPHICS_BIT) &&
+        nvk_meta_image_copy_gfx_supported(dst)) {
+@@ -522,6 +536,8 @@ nvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_image, src, pCopyImageInfo->srcImage);
+    VK_FROM_HANDLE(nvk_image, dst, pCopyImageInfo->dstImage);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_COPY_IMAGE, 0);
++
+    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+    if ((queue_flags & VK_QUEUE_GRAPHICS_BIT) &&
+        nvk_meta_image_copy_gfx_supported(src) &&
+@@ -558,6 +574,8 @@ nvk_CmdCopyMemoryKHR(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_COPY_BUFFER, 0);
++
+    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+    if (queue_flags & VK_QUEUE_COMPUTE_BIT) {
+       nvk_cmd_copy_memory_meta(cmd, pCopyMemoryInfo);
+@@ -588,6 +606,8 @@ nvk_CmdFillMemoryKHR(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_FILL_BUFFER, 0);
++
+    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+    if (queue_flags & VK_QUEUE_COMPUTE_BIT) {
+       nvk_cmd_fill_memory_meta(cmd, pDstRange, dstFlags, data);
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
+index 7e3096ce..f543f1a5 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.c
++++ b/src/nouveau/vulkan/nvk_pass_profile.c
+@@ -2,35 +2,57 @@
+  * Copyright © 2026 Conduit contributors
+  * SPDX-License-Identifier: MIT
+  *
+- * GPU time per render pass and per primary command buffer, from GPU
+- * timestamps, for finding the passes that make a frame heavy
+- * (NVK_PASS_PROFILE=1; off by default).
++ * GPU time per render pass, per run of operations outside render passes and
++ * per primary command buffer, from GPU timestamps, for finding what makes a
++ * frame heavy (NVK_PASS_PROFILE=1; off by default).
+  *
+  * Each render pass (vkCmdBeginRendering, and render pass objects through the
+- * common runtime), each execution of a secondary command buffer
+- * (vkCmdExecuteCommands, timed in the primary) and each primary graphics
+- * command buffer gets a record
+- * slot in a mapped GART ring when it is recorded: a 16-byte report with a
+- * timestamp written by the 3D class at its start (pipeline location ALL,
+- * after the preceding work) and another at its end.  A command buffer that is
+- * submitted again rewrites its slots.  A harvest thread (every 200 ms, not
+- * tied to submits or frames) harvests slots
+- * whose end report carries the "written" payload, clears it, and adds
+- * end - begin to a per-signature total: the pass's size, sample count,
+- * attachment formats and, for the first colour and the depth attachment,
+- * whether the image is linear or block-linear, its PTE kind and whether it
+- * is compressed -- so the line also says how the attachments are laid out.
+- * Every two seconds the heaviest signatures are logged (mesa_logi, GPU ms
+- * per second and per pass, draws per pass), then the totals reset.  The
+- * lines also go to a file (prof_open_file: NVK_PASS_PROFILE_FILE, else on
+- * Windows %ProgramData%\Helios, then %TEMP%; mesa's log there only reaches a
+- * debugger).
++ * common runtime), each run of operations of one kind outside render passes
++ * (dispatches, indirect dispatches, buffer and image copies, fills and
++ * updates, image clears, blits, resolves -- vkCmdResolveImage and the
++ * resolve at the end of a render pass -- and query resets and copies), each
++ * execution of a secondary command buffer (vkCmdExecuteCommands, timed in
++ * the primary) and each primary graphics command buffer gets a record slot
++ * in a mapped GART ring when it is recorded: a 16-byte report with a
++ * timestamp written at its start (after the preceding work) and another at
++ * its end.  The reports go to the engine that ran the last method: the 3D
++ * class (FLUSH_PENDING_WRITES and pipeline location ALL), the compute class
++ * after a WAIT_FOR_IDLE, or the copy engine with a non-pipelined semaphore,
++ * so the time of a copy or a dispatch is its own and not the 3D pipe's.
+  *
+- * Passes nest inside command buffers, so the command-buffer line is the
+- * whole GPU time and the pass lines are a breakdown of it; what is in the
+- * command buffers but in no pass is compute, copies and clears.  The
+- * reports cost a little GPU time each (a flush of pending writes and a
+- * release); fine for finding a 10x, not for measuring 1 %.
++ * A run of operations ends at the first render pass, operation of another
++ * kind, secondary or the end of the command buffer, so it also holds the
++ * barriers and state changes recorded between its operations.  Meta
++ * operations and the render passes the driver records for image clears,
++ * resolves and ZCULL reseeds belong to the operation that records them
++ * (nvk_pass_profile_internal_begin/end), never to passes of their own.
++ *
++ * A harvest thread (every 200 ms, not tied to submits or frames) harvests
++ * slots whose end report carries the "written" payload, clears it, and adds
++ * end - begin to a per-signature total.  A render pass's signature is its
++ * size, sample count, layer and attachment counts and, for the first colour
++ * and the depth attachment, the format, LINEAR or block-linear, the PTE
++ * kind, whether the image is compressed, the load and store ops and (depth)
++ * whether the image has ZCULL storage.  A run's is its kind and a
++ * power-of-two bucket of its operation count (and workgroups for direct
++ * dispatches).  Every two seconds the heaviest signatures are logged with
++ * GPU ms per second, us per instance, count, and per instance the draw calls,
++ * draws (a multi-draw or indirect multi-draw counts drawCount), indirect
++ * calls and draws, queries and barriers; then a summary: command buffers,
++ * render passes, operations by kind, and what no pass or operation explains
++ * (time between them: barriers, state, waits).
++ *
++ * NVK_PASS_PROFILE=2 also samples, around each render pass, the vertex
++ * shader, clipper and fragment shader invocation counters and the four
++ * ZCULL statistics counters, reported per pass.
++ *
++ * The lines also go to a file: NVK_PASS_PROFILE_FILE if set, else on Windows
++ * %ProgramData%\Helios\nvk-pass-<pid>.txt, falling back to
++ * %TEMP%\nvk-pass-<pid>.txt (mesa's log there only reaches a debugger).
++ *
++ * The reports cost a little GPU time each (a flush of pending writes or a
++ * wait for idle, and a release); fine for finding a 10x, not for measuring
++ * 1 %.
+  */
+ #include "nvk_pass_profile.h"
+ 
+@@ -38,11 +60,15 @@
+ #include "nvk_device.h"
+ #include "nvk_image.h"
+ #include "nvk_image_view.h"
++#include "nvk_mme.h"
+ #include "nvkmd/nvkmd.h"
+ 
+ #include "nv_push_cl9097.h"
++#include "nv_push_cl90b5.h"
++#include "nv_push_cl90c0.h"
+ 
+ #include "c11/threads.h"
++#include "util/hash_table.h"
+ #include "util/log.h"
+ #include "util/os_time.h"
+ #include "util/simple_mtx.h"
+@@ -61,13 +87,17 @@
+ #include <windows.h>
+ #endif
+ 
+-#define PROF_SLOTS     16384u
+-#define PROF_SIGS      128u
+-#define PROF_LOG_NS    2000000000ull
++#define PROF_SLOTS      65536u
++#define PROF_STAT_SLOTS 8192u
++#define PROF_SIGS       4096u
++#define PROF_LOG_TOP    40u
++#define PROF_LOG_NS     2000000000ull
+ #define PROF_HARVEST_MS 200u
+-#define PROF_PAYLOAD   0x4e564b50u /* "NVKP" */
++#define PROF_PAYLOAD    0x4e564b50u /* "NVKP" */
+ 
+-/* One report as the 3D class writes it with STRUCTURE_SIZE_FOUR_WORDS */
++/* One report as the 3D or compute class or the copy engine writes it with a
++ * four-word structure: payload (or a counter's low 32 bits) and timestamp.
++ */
+ struct prof_report {
+    uint32_t payload;
+    uint32_t pad;
+@@ -79,29 +109,93 @@ struct prof_slot_gpu {
+    struct prof_report end;
+ };
+ 
++/* NVK_PASS_PROFILE=2: counters sampled at the start and the end of a pass */
++#define PROF_STATS 8
++static const struct {
++   uint32_t report;
++   const char *name;
++   bool counter32;
++} prof_stats[PROF_STATS] = {
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_VS_INVOCATIONS, "vs", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_INVOCATIONS, "prims-in", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_PRIMITIVES_GENERATED, "prims-out", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_PS_INVOCATIONS, "ps", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS0, "zc0", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS1, "zc1", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS2, "zc2", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS3, "zc3", true },
++};
++
++struct prof_stat_gpu {
++   struct prof_report begin[PROF_STATS];
++   struct prof_report end[PROF_STATS];
++};
++
++enum prof_kind {
++   PROF_KIND_CMD,
++   PROF_KIND_PASS,
++   PROF_KIND_OP,
++   PROF_KIND_SECONDARY,
++};
++
+ struct prof_meta {
+-   uint32_t sig;   /* index into sigs + 1, 0 = free */
+-   uint32_t draws;
++   uint32_t sig;   /* index into sigs + 1, 0 = none (yet) */
++   uint32_t stat;  /* index into the stat ring + 1, 0 = none */
++   struct nvk_pass_profile_counts counts;
+ };
+ 
+ struct prof_sig {
+-   char name[192];
++   char name[200];
++   enum prof_kind kind;
++   enum nvk_pass_profile_op op;
+    uint64_t gpu_ns;
+    uint64_t count;
+-   uint64_t draws;
++   uint64_t calls, draws, ind_calls, ind_draws, queries, barriers;
++   uint64_t stat_count;
++   uint64_t stats[PROF_STATS];
++};
++
++static const char *const prof_op_names[NVK_PASS_PROFILE_OP_COUNT] = {
++   [NVK_PASS_PROFILE_OP_NONE] = "none",
++   [NVK_PASS_PROFILE_OP_DISPATCH] = "dispatch",
++   [NVK_PASS_PROFILE_OP_DISPATCH_INDIRECT] = "dispatch indirect",
++   [NVK_PASS_PROFILE_OP_COPY_BUFFER] = "copy buffer",
++   [NVK_PASS_PROFILE_OP_COPY_IMAGE] = "copy image",
++   [NVK_PASS_PROFILE_OP_COPY_BUFFER_TO_IMAGE] = "copy buffer to image",
++   [NVK_PASS_PROFILE_OP_COPY_IMAGE_TO_BUFFER] = "copy image to buffer",
++   [NVK_PASS_PROFILE_OP_FILL_BUFFER] = "fill buffer",
++   [NVK_PASS_PROFILE_OP_UPDATE_BUFFER] = "update buffer",
++   [NVK_PASS_PROFILE_OP_CLEAR_COLOR_IMAGE] = "clear color image",
++   [NVK_PASS_PROFILE_OP_CLEAR_DS_IMAGE] = "clear depth/stencil image",
++   [NVK_PASS_PROFILE_OP_BLIT] = "blit",
++   [NVK_PASS_PROFILE_OP_RESOLVE_IMAGE] = "resolve image",
++   [NVK_PASS_PROFILE_OP_RESOLVE_END_OF_PASS] = "resolve at end of pass",
++   [NVK_PASS_PROFILE_OP_QUERY_RESET] = "query reset",
++   [NVK_PASS_PROFILE_OP_QUERY_COPY] = "query copy results",
+ };
+ 
+ struct nvk_pass_profile {
++   unsigned level;
++
+    struct nvkmd_mem *mem;
+    struct prof_slot_gpu *gpu;
+-   struct prof_meta meta[PROF_SLOTS];
++   struct prof_meta *meta;      /* PROF_SLOTS */
+    uint32_t next;
+ 
++   struct nvkmd_mem *stat_mem;  /* NVK_PASS_PROFILE=2 */
++   struct prof_stat_gpu *stat_gpu;
++   uint32_t stat_next;
++
++   /* Signature table and ring positions (recording threads) */
+    simple_mtx_t mutex;
+-   struct prof_sig sigs[PROF_SIGS];
++   struct hash_table *sig_ht;
++   struct prof_sig *sigs;       /* PROF_SIGS */
+    uint32_t sig_count;
++   uint64_t dropped, dropped_window;
++
++   /* Totals and the log (the harvest thread; recorders never take it) */
++   simple_mtx_t totals_mutex;
+    uint64_t window_start_ns;
+-   uint64_t dropped;
+    uint64_t windows;
+    FILE *file;
+ 
+@@ -142,7 +236,7 @@ prof_thread_main(void *arg)
+ static void PRINTFLIKE(2, 3)
+ prof_log(struct nvk_pass_profile *prof, const char *fmt, ...)
+ {
+-   char line[512];
++   char line[768];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+@@ -195,21 +289,51 @@ prof_open_file(char *path, size_t size)
+    return NULL;
+ }
+ 
++static void
++prof_free(struct nvk_pass_profile *prof)
++{
++   if (prof->stat_mem != NULL)
++      nvkmd_mem_unref(prof->stat_mem);
++   if (prof->mem != NULL)
++      nvkmd_mem_unref(prof->mem);
++   if (prof->sig_ht != NULL)
++      _mesa_hash_table_destroy(prof->sig_ht, NULL);
++   free(prof->sigs);
++   free(prof->meta);
++   free(prof);
++}
++
+ void
+ nvk_pass_profile_init(struct nvk_device *dev)
+ {
+-   if (!debug_get_bool_option("NVK_PASS_PROFILE", false))
++   const unsigned level = debug_get_num_option("NVK_PASS_PROFILE", 0);
++   if (level == 0)
+       return;
+ 
+    struct nvk_pass_profile *prof = calloc(1, sizeof(*prof));
+    if (prof == NULL)
+       return;
+-
+-   VkResult result =
+-      nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
+-                                 PROF_SLOTS * sizeof(struct prof_slot_gpu), 0,
+-                                 NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,
+-                                 &prof->mem);
++   prof->level = level;
++   prof->meta = calloc(PROF_SLOTS, sizeof(*prof->meta));
++   prof->sigs = calloc(PROF_SIGS, sizeof(*prof->sigs));
++   prof->sig_ht = _mesa_hash_table_create(NULL, _mesa_hash_string,
++                                          _mesa_key_string_equal);
++
++   VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
++   if (prof->meta != NULL && prof->sigs != NULL && prof->sig_ht != NULL) {
++      result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
++                                          PROF_SLOTS * sizeof(struct prof_slot_gpu),
++                                          0, NVKMD_MEM_GART,
++                                          NVKMD_MEM_MAP_RDWR, &prof->mem);
++   }
++   if (result == VK_SUCCESS && level >= 2) {
++      /* Without it the profile still runs, without counters */
++      if (nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
++                                     PROF_STAT_SLOTS * sizeof(struct prof_stat_gpu),
++                                     0, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,
++                                     &prof->stat_mem) != VK_SUCCESS)
++         prof->stat_mem = NULL;
++   }
+    if (result != VK_SUCCESS) {
+       char path[512];
+       FILE *f = prof_open_file(path, sizeof(path));
+@@ -218,19 +342,25 @@ nvk_pass_profile_init(struct nvk_device *dev)
+                  (void *)dev);
+          fclose(f);
+       }
+-      free(prof);
++      prof_free(prof);
+       mesa_logw("NVK pass profile: no ring memory");
+       return;
+    }
+    prof->gpu = prof->mem->map;
+    memset(prof->gpu, 0, PROF_SLOTS * sizeof(struct prof_slot_gpu));
++   if (prof->stat_mem != NULL) {
++      prof->stat_gpu = prof->stat_mem->map;
++      memset(prof->stat_gpu, 0, PROF_STAT_SLOTS * sizeof(struct prof_stat_gpu));
++   }
+    simple_mtx_init(&prof->mutex, mtx_plain);
++   simple_mtx_init(&prof->totals_mutex, mtx_plain);
+    prof->window_start_ns = os_time_get_nano();
+    char path[512] = "";
+    prof->file = prof_open_file(path, sizeof(path));
+    dev->pass_profile = prof;
+-   prof_log(prof, "NVK pass profile: on for device %p (%u slots), file %s",
+-            (void *)dev, PROF_SLOTS,
++   prof_log(prof, "NVK pass profile: level %u on for device %p (%u slots, "
++            "%u signatures%s), file %s", level, (void *)dev, PROF_SLOTS,
++            PROF_SIGS, prof->stat_mem != NULL ? ", pass counters" : "",
+             prof->file != NULL ? path : "(none: no writable folder)");
+    if (prof->file != NULL)
+       fflush(prof->file);
+@@ -257,32 +387,62 @@ nvk_pass_profile_finish(struct nvk_device *dev)
+    }
+    /* The device is idle here: what is left in the ring is final */
+    prof_harvest_and_log(prof, true);
+-   nvkmd_mem_unref(prof->mem);
+    if (prof->file != NULL)
+       fclose(prof->file);
+    simple_mtx_destroy(&prof->mutex);
+-   free(prof);
++   simple_mtx_destroy(&prof->totals_mutex);
+    dev->pass_profile = NULL;
++   prof_free(prof);
+ }
+ 
++/* With prof->mutex held: the signature's index + 1, 0 when the table is
++ * full.
++ */
+ static uint32_t
+-prof_sig_index_locked(struct nvk_pass_profile *prof, const char *name)
++prof_sig_index_locked(struct nvk_pass_profile *prof, const char *name,
++                      enum prof_kind kind, enum nvk_pass_profile_op op)
+ {
+-   for (uint32_t i = 0; i < prof->sig_count; i++) {
+-      if (strcmp(prof->sigs[i].name, name) == 0)
+-         return i + 1;
+-   }
++   struct hash_entry *he = _mesa_hash_table_search(prof->sig_ht, name);
++   if (he != NULL)
++      return (uint32_t)(uintptr_t)he->data;
+    if (prof->sig_count == PROF_SIGS)
+       return 0;
+-   struct prof_sig *sig = &prof->sigs[prof->sig_count++];
+-   memset(sig, 0, sizeof(*sig));
++   struct prof_sig *sig = &prof->sigs[prof->sig_count];
+    snprintf(sig->name, sizeof(sig->name), "%s", name);
++   sig->kind = kind;
++   sig->op = op;
++   /* Published to the harvest thread with the count below */
++   p_atomic_set(&prof->sig_count, prof->sig_count + 1);
++   _mesa_hash_table_insert(prof->sig_ht, sig->name,
++                           (void *)(uintptr_t)prof->sig_count);
+    return prof->sig_count;
+ }
+ 
++static const char *
++prof_load_op_str(VkAttachmentLoadOp op)
++{
++   switch (op) {
++   case VK_ATTACHMENT_LOAD_OP_LOAD: return "load";
++   case VK_ATTACHMENT_LOAD_OP_CLEAR: return "clear";
++   case VK_ATTACHMENT_LOAD_OP_DONT_CARE: return "dontcare";
++   default: return "none";
++   }
++}
++
++static const char *
++prof_store_op_str(VkAttachmentStoreOp op)
++{
++   switch (op) {
++   case VK_ATTACHMENT_STORE_OP_STORE: return "store";
++   case VK_ATTACHMENT_STORE_OP_DONT_CARE: return "dontcare";
++   default: return "none";
++   }
++}
++
+ static void
+ prof_describe_att(char *buf, size_t size, const char *what,
+-                  const struct nvk_attachment *att)
++                  const struct nvk_attachment *att,
++                  const VkRenderingAttachmentInfo *info, bool depth)
+ {
+    if (att->iview == NULL) {
+       buf[0] = 0;
+@@ -292,88 +452,279 @@ prof_describe_att(char *buf, size_t size, const char *what,
+       container_of(att->iview->vk.image, struct nvk_image, vk);
+    const struct nil_image *nil = &image->planes[0].nil;
+    const bool linear = nil->levels[0].tiling.gob_type == NIL_GOB_TYPE_LINEAR;
+-   snprintf(buf, size, " %s %s %s kind %#x%s", what,
++   snprintf(buf, size, " %s %s %s kind %#x%s%s %s/%s", what,
+             vk_Format_to_str(att->vk_format) + strlen("VK_FORMAT_"),
+             linear ? "LINEAR" : "BL", nil->pte_kind,
+-            image->is_compressed ? " compressed" : "");
++            image->is_compressed ? " compressed" : "",
++            depth ? (image->zcull.nil.size_B > 0 ? " zcull" : " no-zcull") : "",
++            info != NULL ? prof_load_op_str(info->loadOp) : "?",
++            info != NULL ? prof_store_op_str(info->storeOp) : "?");
+ }
+ 
++/* A timestamped report at addr, on the engine that ran the last method, so
++ * it is written after the preceding work on that engine has finished.
++ */
+ static void
+ prof_emit_report(struct nvk_cmd_buffer *cmd, uint64_t addr)
+ {
+-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
+-   P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);
+-   P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
+-   P_NV9097_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
+-   P_NV9097_SET_REPORT_SEMAPHORE_B(p, addr);
+-   P_NV9097_SET_REPORT_SEMAPHORE_C(p, PROF_PAYLOAD);
+-   P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
+-      .operation = OPERATION_RELEASE,
+-      .release = RELEASE_AFTER_ALL_PRECEEDING_WRITES_COMPLETE,
+-      .pipeline_location = PIPELINE_LOCATION_ALL,
+-      .structure_size = STRUCTURE_SIZE_FOUR_WORDS,
+-   });
++   const uint8_t subc = nvk_cmd_buffer_last_subchannel(cmd);
++   if (subc == SUBC_NV90C0) {
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
++      P_IMMD(p, NV90C0, WAIT_FOR_IDLE, 0);
++      P_MTHD(p, NV90C0, SET_REPORT_SEMAPHORE_A);
++      P_NV90C0_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
++      P_NV90C0_SET_REPORT_SEMAPHORE_B(p, addr);
++      P_NV90C0_SET_REPORT_SEMAPHORE_C(p, PROF_PAYLOAD);
++      P_NV90C0_SET_REPORT_SEMAPHORE_D(p, {
++         .operation = OPERATION_RELEASE,
++         .structure_size = STRUCTURE_SIZE_FOUR_WORDS,
++      });
++   } else if (subc == SUBC_NV90B5) {
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 9);
++      P_MTHD(p, NV90B5, SET_SEMAPHORE_A);
++      P_NV90B5_SET_SEMAPHORE_A(p, addr >> 32);
++      P_NV90B5_SET_SEMAPHORE_B(p, addr);
++      P_NV90B5_SET_SEMAPHORE_PAYLOAD(p, PROF_PAYLOAD);
++      P_MTHD(p, NV90B5, LINE_LENGTH_IN);
++      P_NV90B5_LINE_LENGTH_IN(p, 0);
++      P_NV90B5_LINE_COUNT(p, 0);
++      P_IMMD(p, NV90B5, LAUNCH_DMA, {
++         .data_transfer_type = DATA_TRANSFER_TYPE_NON_PIPELINED,
++         .semaphore_type = SEMAPHORE_TYPE_RELEASE_FOUR_WORD_SEMAPHORE,
++         .flush_enable = FLUSH_ENABLE_TRUE,
++      });
++   } else {
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
++      P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);
++      P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
++      P_NV9097_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
++      P_NV9097_SET_REPORT_SEMAPHORE_B(p, addr);
++      P_NV9097_SET_REPORT_SEMAPHORE_C(p, PROF_PAYLOAD);
++      P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
++         .operation = OPERATION_RELEASE,
++         .release = RELEASE_AFTER_ALL_PRECEEDING_WRITES_COMPLETE,
++         .pipeline_location = PIPELINE_LOCATION_ALL,
++         .structure_size = STRUCTURE_SIZE_FOUR_WORDS,
++      });
++   }
+ }
+ 
++static uint64_t
++prof_slot_addr(const struct nvk_pass_profile *prof, uint32_t slot, bool end)
++{
++   return prof->mem->va->addr + slot * sizeof(struct prof_slot_gpu) +
++          (end ? offsetof(struct prof_slot_gpu, end) : 0);
++}
++
++/* A slot and its begin report.  name == NULL: the signature is chosen at
++ * prof_end (a run of operations only knows its length then).
++ */
+ static int32_t
+-prof_begin(struct nvk_cmd_buffer *cmd, const char *name)
++prof_begin(struct nvk_cmd_buffer *cmd, const char *name, enum prof_kind kind)
+ {
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    struct nvk_pass_profile *prof = dev->pass_profile;
+ 
+    simple_mtx_lock(&prof->mutex);
+-   const uint32_t sig = prof_sig_index_locked(prof, name);
+-   const uint32_t slot = prof->next;
+-   prof->next = (prof->next + 1) % PROF_SLOTS;
++   uint32_t sig = 1;
++   if (name != NULL)
++      sig = prof_sig_index_locked(prof, name, kind, NVK_PASS_PROFILE_OP_NONE);
++   uint32_t slot = 0;
+    if (sig != 0) {
+-      prof->meta[slot].sig = sig;
+-      prof->meta[slot].draws = 0;
++      slot = prof->next;
++      prof->next = (prof->next + 1) % PROF_SLOTS;
++      prof->meta[slot].sig = name != NULL ? sig : 0;
++      prof->meta[slot].stat = 0;
++      memset(&prof->meta[slot].counts, 0, sizeof(prof->meta[slot].counts));
+    } else {
+       prof->dropped++;
++      prof->dropped_window++;
+    }
+    simple_mtx_unlock(&prof->mutex);
+    if (sig == 0)
+       return -1;
+ 
+-   prof_emit_report(cmd, prof->mem->va->addr +
+-                         slot * sizeof(struct prof_slot_gpu));
++   prof_emit_report(cmd, prof_slot_addr(prof, slot, false));
+    return (int32_t)slot;
+ }
+ 
+ static void
+-prof_end(struct nvk_cmd_buffer *cmd, int32_t slot, uint32_t draws)
++prof_end(struct nvk_cmd_buffer *cmd, int32_t slot,
++         const struct nvk_pass_profile_counts *counts)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_pass_profile *prof = dev->pass_profile;
++   if (slot < 0)
++      return;
++   prof->meta[slot].counts = *counts;
++   prof_emit_report(cmd, prof_slot_addr(prof, slot, true));
++}
++
++/* NVK_PASS_PROFILE=2: the counters at the start or the end of a pass */
++static void
++prof_emit_stats(struct nvk_cmd_buffer *cmd, uint32_t stat, bool end)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_pass_profile *prof = dev->pass_profile;
++   const uint64_t base = prof->stat_mem->va->addr +
++                         stat * sizeof(struct prof_stat_gpu) +
++                         (end ? offsetof(struct prof_stat_gpu, end) : 0);
++
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 2 + PROF_STATS * 5);
++   P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);
++   for (unsigned i = 0; i < PROF_STATS; i++) {
++      const uint64_t addr = base + i * sizeof(struct prof_report);
++      P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
++      P_NV9097_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
++      P_NV9097_SET_REPORT_SEMAPHORE_B(p, addr);
++      P_NV9097_SET_REPORT_SEMAPHORE_C(p, 0);
++      P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
++         .operation = OPERATION_REPORT_ONLY,
++         .pipeline_location = PIPELINE_LOCATION_ALL,
++         .report = prof_stats[i].report,
++         .structure_size = STRUCTURE_SIZE_FOUR_WORDS,
++      });
++   }
++}
++
++static void
++prof_end_op_run(struct nvk_cmd_buffer *cmd)
+ {
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    struct nvk_pass_profile *prof = dev->pass_profile;
++   const int32_t slot = cmd->pass_profile_op_slot;
+    if (slot < 0)
+       return;
+-   prof->meta[slot].draws = draws;
+-   prof_emit_report(cmd, prof->mem->va->addr +
+-                         slot * sizeof(struct prof_slot_gpu) +
+-                         offsetof(struct prof_slot_gpu, end));
++   cmd->pass_profile_op_slot = -1;
++
++   const uint32_t n = cmd->pass_profile_op_count;
++   char name[160];
++   int len = snprintf(name, sizeof(name), "ops: %s, %s%u",
++                      prof_op_names[cmd->pass_profile_op],
++                      n > 1 ? "<=" : "",
++                      n <= 1 ? n : 1u << util_logbase2_ceil(n));
++   if (cmd->pass_profile_op == NVK_PASS_PROFILE_OP_DISPATCH) {
++      const uint64_t g = MAX2(cmd->pass_profile_op_groups, 1);
++      snprintf(name + len, sizeof(name) - len, ", <=%" PRIu64 " groups",
++               (uint64_t)1 << util_logbase2_ceil64(g));
++   }
++
++   simple_mtx_lock(&prof->mutex);
++   const uint32_t sig = prof_sig_index_locked(prof, name, PROF_KIND_OP,
++                                              cmd->pass_profile_op);
++   prof->meta[slot].sig = sig;
++   if (sig == 0) {
++      prof->dropped++;
++      prof->dropped_window++;
++   }
++   simple_mtx_unlock(&prof->mutex);
++
++   struct nvk_pass_profile_counts counts = cmd->pass_profile_op_counts;
++   counts.calls = n;
++   prof_end(cmd, slot, &counts);
+ }
+ 
+ void
+-nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd)
++nvk_pass_profile_op(struct nvk_cmd_buffer *cmd, enum nvk_pass_profile_op op,
++                    uint64_t groups)
+ {
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    if (likely(dev->pass_profile == NULL))
+       return;
++   /* Inside a render pass it is the pass's; inside a meta operation the
++    * operation's.  Secondaries are timed as a whole by their primary.
++    */
++   if (cmd->pass_profile_internal > 0 || cmd->pass_profile_in_pass ||
++       cmd->pass_profile_cmd_slot < 0)
++      return;
++
++   if (cmd->pass_profile_op_slot >= 0 && cmd->pass_profile_op == op) {
++      cmd->pass_profile_op_count++;
++      cmd->pass_profile_op_groups += groups;
++      return;
++   }
++
++   prof_end_op_run(cmd);
++   cmd->pass_profile_op = op;
++   cmd->pass_profile_op_count = 1;
++   cmd->pass_profile_op_groups = groups;
++   memset(&cmd->pass_profile_op_counts, 0, sizeof(cmd->pass_profile_op_counts));
++   cmd->pass_profile_op_slot = prof_begin(cmd, NULL, PROF_KIND_OP);
++}
++
++void
++nvk_pass_profile_internal_begin(struct nvk_cmd_buffer *cmd)
++{
++   cmd->pass_profile_internal++;
++}
++
++void
++nvk_pass_profile_internal_end(struct nvk_cmd_buffer *cmd)
++{
++   assert(cmd->pass_profile_internal > 0);
++   cmd->pass_profile_internal--;
++}
++
++void
++nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd,
++                            const VkRenderingInfo *info)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_pass_profile *prof = dev->pass_profile;
++   if (likely(prof == NULL))
++      return;
+ 
+    const struct nvk_rendering_state *render = &cmd->state.gfx.render;
+-   /* A resumed pass continues the one its suspension ended */
+-   if (render->flags & VK_RENDERING_RESUMING_BIT)
++   /* A resumed pass continues the one its suspension ended; the driver's
++    * own passes belong to the operation that records them.
++    */
++   if ((render->flags & VK_RENDERING_RESUMING_BIT) ||
++       cmd->pass_profile_internal > 0)
+       return;
+ 
+-   char color[80], depth[80], name[192];
+-   prof_describe_att(color, sizeof(color), "c0", &render->color_att[0]);
+-   prof_describe_att(depth, sizeof(depth), "z", &render->depth_att);
++   prof_end_op_run(cmd);
++
++   const VkRenderingAttachmentInfo *c0_info =
++      info->colorAttachmentCount > 0 ? &info->pColorAttachments[0] : NULL;
++   char color[112], depth[128], name[256];
++   prof_describe_att(color, sizeof(color), "c0", &render->color_att[0],
++                     c0_info, false);
++   prof_describe_att(depth, sizeof(depth), "z", &render->depth_att,
++                     info->pDepthAttachment, true);
+    snprintf(name, sizeof(name), "pass %ux%u x%u layers %u, %u rt%s%s",
+             render->area.extent.width, render->area.extent.height,
+             MAX2(render->samples, 1), render->layer_count,
+             render->color_att_count, color, depth);
+-   cmd->pass_profile_slot = prof_begin(cmd, name);
+-   cmd->pass_profile_draws = 0;
++   cmd->pass_profile_slot = prof_begin(cmd, name, PROF_KIND_PASS);
++   memset(&cmd->pass_profile_pass_counts, 0,
++          sizeof(cmd->pass_profile_pass_counts));
++   cmd->pass_profile_in_pass = true;
++   cmd->pass_profile_stat_slot = -1;
++
++   if (cmd->pass_profile_slot >= 0 && prof->stat_mem != NULL) {
++      simple_mtx_lock(&prof->mutex);
++      const uint32_t stat = prof->stat_next;
++      prof->stat_next = (prof->stat_next + 1) % PROF_STAT_SLOTS;
++      prof->meta[cmd->pass_profile_slot].stat = stat + 1;
++      simple_mtx_unlock(&prof->mutex);
++      cmd->pass_profile_stat_slot = stat;
++
++      /* The counters count only while enabled; leave them on (queries and
++       * meta operations keep their own state through the same macro).
++       */
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 3);
++      P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_STATISTICS_COUNTERS));
++      uint32_t mask;
++      V_NV9097_SET_STATISTICS_COUNTER(mask, {
++         .vs_invocations_enable = true,
++         .clipper_invocations_enable = true,
++         .clipper_primitives_generated_enable = true,
++         .ps_invocations_enable = true,
++      });
++      P_INLINE_DATA(p, 1);
++      P_INLINE_DATA(p, mask);
++      prof_emit_stats(cmd, stat, false);
++   }
+ }
+ 
+ void
+@@ -382,26 +733,48 @@ nvk_pass_profile_end_pass(struct nvk_cmd_buffer *cmd)
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    if (likely(dev->pass_profile == NULL))
+       return;
+-   if (cmd->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT)
++   if ((cmd->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT) ||
++       cmd->pass_profile_internal > 0 || !cmd->pass_profile_in_pass)
+       return;
+-   prof_end(cmd, cmd->pass_profile_slot, cmd->pass_profile_draws);
++   if (cmd->pass_profile_stat_slot >= 0) {
++      prof_emit_stats(cmd, cmd->pass_profile_stat_slot, true);
++      cmd->pass_profile_stat_slot = -1;
++   }
++   prof_end(cmd, cmd->pass_profile_slot, &cmd->pass_profile_pass_counts);
+    cmd->pass_profile_slot = -1;
++   cmd->pass_profile_in_pass = false;
+ }
+ 
+ void
+-nvk_pass_profile_begin_cmd(struct nvk_cmd_buffer *cmd)
++nvk_pass_profile_reset_cmd(struct nvk_cmd_buffer *cmd)
+ {
+-   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    cmd->pass_profile_slot = -1;
+    cmd->pass_profile_cmd_slot = -1;
+-   cmd->pass_profile_draws = 0;
+-   cmd->pass_profile_cmd_draws = 0;
++   cmd->pass_profile_op_slot = -1;
++   cmd->pass_profile_stat_slot = -1;
++   cmd->pass_profile_op = NVK_PASS_PROFILE_OP_NONE;
++   cmd->pass_profile_op_count = 0;
++   cmd->pass_profile_op_groups = 0;
++   cmd->pass_profile_internal = 0;
++   cmd->pass_profile_in_pass = false;
++   memset(&cmd->pass_profile_pass_counts, 0,
++          sizeof(cmd->pass_profile_pass_counts));
++   memset(&cmd->pass_profile_op_counts, 0,
++          sizeof(cmd->pass_profile_op_counts));
++   memset(&cmd->pass_profile_cmd_counts, 0,
++          sizeof(cmd->pass_profile_cmd_counts));
++}
++
++void
++nvk_pass_profile_begin_cmd(struct nvk_cmd_buffer *cmd)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    if (likely(dev->pass_profile == NULL) ||
+        cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
+        !(nvk_cmd_buffer_queue_flags(cmd) & VK_QUEUE_GRAPHICS_BIT))
+       return;
+-   cmd->pass_profile_cmd_slot = prof_begin(cmd, "command buffer (all work)");
+-   cmd->pass_profile_cmd_draws = 0;
++   cmd->pass_profile_cmd_slot = prof_begin(cmd, "command buffer (all work)",
++                                           PROF_KIND_CMD);
+ }
+ 
+ void
+@@ -410,14 +783,16 @@ nvk_pass_profile_end_cmd(struct nvk_cmd_buffer *cmd)
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    if (likely(dev->pass_profile == NULL))
+       return;
+-   prof_end(cmd, cmd->pass_profile_cmd_slot, cmd->pass_profile_cmd_draws);
++   prof_end_op_run(cmd);
++   prof_end(cmd, cmd->pass_profile_cmd_slot, &cmd->pass_profile_cmd_counts);
+    cmd->pass_profile_cmd_slot = -1;
+ }
+ 
+ /* vkCmdExecuteCommands: each secondary command buffer is timed where the
+  * primary executes it (a slot per execution, so a secondary executed from
+- * many primaries is counted once per execution), and its draws count towards
+- * the primary's open pass and the primary itself.
++ * many primaries is counted once per execution), and what it recorded
++ * counts towards the primary's open pass and the primary itself.  Its
++ * passes, if any, are inside its time: the summary leaves secondaries out.
+  */
+ int32_t
+ nvk_pass_profile_begin_secondary(struct nvk_cmd_buffer *cmd,
+@@ -426,13 +801,26 @@ nvk_pass_profile_begin_secondary(struct nvk_cmd_buffer *cmd,
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    if (likely(dev->pass_profile == NULL))
+       return -1;
++   prof_end_op_run(cmd);
+    /* Power-of-two draw buckets keep the signature count bounded */
+-   const uint32_t draws = other->pass_profile_cmd_draws;
++   const uint32_t draws = other->pass_profile_cmd_counts.calls;
+    char name[96];
+-   snprintf(name, sizeof(name), "secondary command buffer, %s%u draws",
++   snprintf(name, sizeof(name), "secondary command buffer, %s%u draw calls",
+             draws > 1 ? "<=" : "",
+             draws <= 1 ? draws : 1u << util_logbase2_ceil(draws));
+-   return prof_begin(cmd, name);
++   return prof_begin(cmd, name, PROF_KIND_SECONDARY);
++}
++
++static void
++prof_counts_add(struct nvk_pass_profile_counts *dst,
++                const struct nvk_pass_profile_counts *src)
++{
++   dst->calls += src->calls;
++   dst->draws += src->draws;
++   dst->ind_calls += src->ind_calls;
++   dst->ind_draws += src->ind_draws;
++   dst->queries += src->queries;
++   dst->barriers += src->barriers;
+ }
+ 
+ void
+@@ -443,9 +831,11 @@ nvk_pass_profile_end_secondary(struct nvk_cmd_buffer *cmd,
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    if (likely(dev->pass_profile == NULL))
+       return;
+-   cmd->pass_profile_draws += other->pass_profile_cmd_draws;
+-   cmd->pass_profile_cmd_draws += other->pass_profile_cmd_draws;
+-   prof_end(cmd, slot, other->pass_profile_cmd_draws);
++   prof_counts_add(&cmd->pass_profile_pass_counts,
++                   &other->pass_profile_cmd_counts);
++   prof_counts_add(&cmd->pass_profile_cmd_counts,
++                   &other->pass_profile_cmd_counts);
++   prof_end(cmd, slot, &other->pass_profile_cmd_counts);
+ }
+ 
+ static int
+@@ -465,10 +855,49 @@ nvk_pass_profile_poll(struct nvk_device *dev)
+    prof_harvest_and_log(prof, false);
+ }
+ 
++static void
++prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
++             double window_s)
++{
++   const double n = (double)s->count;
++   char extra[256] = "";
++   int len = 0;
++   if (s->kind != PROF_KIND_OP) {
++      len = snprintf(extra, sizeof(extra), " %6.1f calls %7.1f draws",
++                     s->calls / n, s->draws / n);
++   } else {
++      len = snprintf(extra, sizeof(extra), " %6.1f ops", s->calls / n);
++   }
++   if (s->ind_calls > 0 && len < (int)sizeof(extra)) {
++      len += snprintf(extra + len, sizeof(extra) - len,
++                      " (indirect %.1f calls %.1f draws)",
++                      s->ind_calls / n, s->ind_draws / n);
++   }
++   if (s->queries > 0 && len < (int)sizeof(extra))
++      len += snprintf(extra + len, sizeof(extra) - len, " %.1f queries",
++                      s->queries / n);
++   if (s->barriers > 0 && len < (int)sizeof(extra))
++      len += snprintf(extra + len, sizeof(extra) - len, " %.1f barriers",
++                      s->barriers / n);
++   prof_log(prof, "NVK pass profile: %8.2f GPU ms/s %8.1f us each %6" PRIu64
++            "x%s  %s", s->gpu_ns / 1e6 / window_s, s->gpu_ns / 1e3 / n,
++            s->count, extra, s->name);
++   if (s->stat_count > 0) {
++      const double sn = (double)s->stat_count;
++      char line[256];
++      int l = 0;
++      for (unsigned i = 0; i < PROF_STATS && l < (int)sizeof(line); i++)
++         l += snprintf(line + l, sizeof(line) - l, " %s %.0f",
++                       prof_stats[i].name, s->stats[i] / sn);
++      prof_log(prof, "NVK pass profile:            per pass:%s", line);
++   }
++}
++
+ static void
+ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+ {
+-   simple_mtx_lock(&prof->mutex);
++   simple_mtx_lock(&prof->totals_mutex);
++   const uint32_t sig_count = p_atomic_read(&prof->sig_count);
+    for (uint32_t i = 0; i < PROF_SLOTS; i++) {
+       volatile struct prof_slot_gpu *s = &prof->gpu[i];
+       if (s->end.payload != PROF_PAYLOAD || s->begin.payload != PROF_PAYLOAD)
+@@ -476,43 +905,117 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+       const uint64_t begin = s->begin.timestamp, end = s->end.timestamp;
+       s->end.payload = 0;
+       s->begin.payload = 0;
+-      const uint32_t sig = prof->meta[i].sig;
+-      if (sig == 0 || end < begin)
++      const struct prof_meta *m = &prof->meta[i];
++      const uint32_t sig = m->sig;
++      if (sig == 0 || sig > sig_count || end < begin)
+          continue;
+       struct prof_sig *ps = &prof->sigs[sig - 1];
+       ps->gpu_ns += end - begin;
+       ps->count++;
+-      ps->draws += prof->meta[i].draws;
++      ps->calls += m->counts.calls;
++      ps->draws += m->counts.draws;
++      ps->ind_calls += m->counts.ind_calls;
++      ps->ind_draws += m->counts.ind_draws;
++      ps->queries += m->counts.queries;
++      ps->barriers += m->counts.barriers;
++      if (m->stat != 0 && prof->stat_gpu != NULL) {
++         volatile struct prof_stat_gpu *st = &prof->stat_gpu[m->stat - 1];
++         for (unsigned k = 0; k < PROF_STATS; k++) {
++            uint64_t b, e;
++            if (prof_stats[k].counter32) {
++               b = st->begin[k].payload;
++               e = st->end[k].payload;
++               ps->stats[k] += (uint32_t)(e - b);
++            } else {
++               b = st->begin[k].payload |
++                   ((uint64_t)st->begin[k].pad << 32);
++               e = st->end[k].payload | ((uint64_t)st->end[k].pad << 32);
++               ps->stats[k] += e >= b ? e - b : 0;
++            }
++         }
++         ps->stat_count++;
++      }
+    }
+ 
+    const uint64_t now = os_time_get_nano();
+    const uint64_t window = now - prof->window_start_ns;
+    if (window >= PROF_LOG_NS || (final && window > 0)) {
++      const double window_s = window / 1e9;
+       prof->windows++;
+-      struct prof_sig sorted[PROF_SIGS];
+-      memcpy(sorted, prof->sigs, prof->sig_count * sizeof(sorted[0]));
+-      qsort(sorted, prof->sig_count, sizeof(sorted[0]), prof_sig_cmp);
+-      prof_log(prof, "NVK pass profile: window %" PRIu64 "%s, %.2f s, %u "
+-               "signatures, %" PRIu64 " dropped", prof->windows,
+-               final ? " (final)" : "", window / 1e9, prof->sig_count,
+-               prof->dropped);
+-      for (uint32_t i = 0; i < prof->sig_count && i < 24; i++) {
+-         if (sorted[i].count == 0)
++
++      uint64_t cmd_ns = 0, pass_ns = 0, op_ns = 0, sec_ns = 0;
++      uint64_t op_kind_ns[NVK_PASS_PROFILE_OP_COUNT] = { 0 };
++      uint64_t op_kind_n[NVK_PASS_PROFILE_OP_COUNT] = { 0 };
++      uint32_t active = 0;
++      for (uint32_t i = 0; i < sig_count; i++) {
++         const struct prof_sig *s = &prof->sigs[i];
++         if (s->count == 0)
++            continue;
++         active++;
++         switch (s->kind) {
++         case PROF_KIND_CMD: cmd_ns += s->gpu_ns; break;
++         case PROF_KIND_PASS: pass_ns += s->gpu_ns; break;
++         case PROF_KIND_SECONDARY: sec_ns += s->gpu_ns; break;
++         case PROF_KIND_OP:
++            op_ns += s->gpu_ns;
++            op_kind_ns[s->op] += s->gpu_ns;
++            op_kind_n[s->op] += s->calls;
+             break;
+-         prof_log(prof, "NVK pass profile: %8.2f GPU ms/s %8.1f us each %6" PRIu64
+-                  "x %6.1f draws  %s",
+-                   sorted[i].gpu_ns / 1e6 / (window / 1e9),
+-                   sorted[i].gpu_ns / 1e3 / sorted[i].count, sorted[i].count,
+-                   (double)sorted[i].draws / sorted[i].count, sorted[i].name);
++         }
+       }
+-      for (uint32_t i = 0; i < prof->sig_count; i++) {
+-         prof->sigs[i].gpu_ns = 0;
+-         prof->sigs[i].count = 0;
+-         prof->sigs[i].draws = 0;
++
++      simple_mtx_lock(&prof->mutex);
++      const uint64_t dropped = prof->dropped;
++      const uint64_t dropped_window = prof->dropped_window;
++      prof->dropped_window = 0;
++      simple_mtx_unlock(&prof->mutex);
++
++      prof_log(prof, "NVK pass profile: window %" PRIu64 "%s, %.2f s, %u of %u "
++               "signatures active, %" PRIu64 " dropped (%" PRIu64 " in all)",
++               prof->windows, final ? " (final)" : "", window_s, active,
++               sig_count, dropped_window, dropped);
++      const double ms = 1e6 * window_s;
++      prof_log(prof, "NVK pass profile: summary GPU ms/s: command buffers "
++               "%.2f = render passes %.2f + operations %.2f + between them "
++               "%.2f (secondaries %.2f)", cmd_ns / ms, pass_ns / ms,
++               op_ns / ms,
++               cmd_ns > pass_ns + op_ns ? (cmd_ns - pass_ns - op_ns) / ms : 0.0,
++               sec_ns / ms);
++      char line[640];
++      int len = 0;
++      for (unsigned k = 1; k < NVK_PASS_PROFILE_OP_COUNT; k++) {
++         if (op_kind_n[k] == 0 || len >= (int)sizeof(line))
++            continue;
++         len += snprintf(line + len, sizeof(line) - len, "%s %s %.2f (%.0f/s)",
++                         len > 0 ? "," : "", prof_op_names[k],
++                         op_kind_ns[k] / ms, op_kind_n[k] / window_s);
++      }
++      if (len > 0)
++         prof_log(prof, "NVK pass profile: operations GPU ms/s:%s", line);
++
++      struct prof_sig *sorted = malloc(sig_count * sizeof(*sorted));
++      if (sorted != NULL) {
++         memcpy(sorted, prof->sigs, sig_count * sizeof(sorted[0]));
++         qsort(sorted, sig_count, sizeof(sorted[0]), prof_sig_cmp);
++         for (uint32_t i = 0; i < sig_count && i < PROF_LOG_TOP; i++) {
++            if (sorted[i].count == 0)
++               break;
++            prof_log_sig(prof, &sorted[i], window_s);
++         }
++         free(sorted);
++      }
++      for (uint32_t i = 0; i < sig_count; i++) {
++         struct prof_sig *s = &prof->sigs[i];
++         s->gpu_ns = 0;
++         s->count = 0;
++         s->calls = s->draws = s->ind_calls = s->ind_draws = 0;
++         s->queries = s->barriers = 0;
++         s->stat_count = 0;
++         memset(s->stats, 0, sizeof(s->stats));
+       }
+       prof->window_start_ns = now;
+       if (prof->file != NULL)
+          fflush(prof->file);
+    }
+-   simple_mtx_unlock(&prof->mutex);
++   simple_mtx_unlock(&prof->totals_mutex);
+ }
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.h b/src/nouveau/vulkan/nvk_pass_profile.h
+index efd6c23a..51bff5b0 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.h
++++ b/src/nouveau/vulkan/nvk_pass_profile.h
+@@ -8,20 +8,76 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
++#include <vulkan/vulkan_core.h>
++
+ struct nvk_cmd_buffer;
+ struct nvk_device;
+ 
+-/* GPU time per render pass and per command buffer (NVK_PASS_PROFILE=1).
+- * See nvk_pass_profile.c.
++/* What a render pass, a run of operations or a command buffer recorded:
++ * draw calls (one per vkCmdDraw*), the draws they make (a multi-draw or an
++ * indirect multi-draw counts drawCount; an indirect count draw its
++ * maxDrawCount), indirect calls and their draws, queries begun and pipeline
++ * barriers.  Counted always (a few adds per call), read only with
++ * NVK_PASS_PROFILE.
++ */
++struct nvk_pass_profile_counts {
++   uint32_t calls;
++   uint32_t draws;
++   uint32_t ind_calls;
++   uint32_t ind_draws;
++   uint32_t queries;
++   uint32_t barriers;
++};
++
++/* Operations outside render passes, timed as runs of the same kind */
++enum nvk_pass_profile_op {
++   NVK_PASS_PROFILE_OP_NONE = 0,
++   NVK_PASS_PROFILE_OP_DISPATCH,
++   NVK_PASS_PROFILE_OP_DISPATCH_INDIRECT,
++   NVK_PASS_PROFILE_OP_COPY_BUFFER,
++   NVK_PASS_PROFILE_OP_COPY_IMAGE,
++   NVK_PASS_PROFILE_OP_COPY_BUFFER_TO_IMAGE,
++   NVK_PASS_PROFILE_OP_COPY_IMAGE_TO_BUFFER,
++   NVK_PASS_PROFILE_OP_FILL_BUFFER,
++   NVK_PASS_PROFILE_OP_UPDATE_BUFFER,
++   NVK_PASS_PROFILE_OP_CLEAR_COLOR_IMAGE,
++   NVK_PASS_PROFILE_OP_CLEAR_DS_IMAGE,
++   NVK_PASS_PROFILE_OP_BLIT,
++   NVK_PASS_PROFILE_OP_RESOLVE_IMAGE,
++   NVK_PASS_PROFILE_OP_RESOLVE_END_OF_PASS,
++   NVK_PASS_PROFILE_OP_QUERY_RESET,
++   NVK_PASS_PROFILE_OP_QUERY_COPY,
++   NVK_PASS_PROFILE_OP_COUNT,
++};
++
++/* GPU time per render pass, per run of operations outside render passes and
++ * per command buffer (NVK_PASS_PROFILE=1; =2 adds pipeline statistics and
++ * ZCULL counters per render pass).  See nvk_pass_profile.c.
+  */
+ void nvk_pass_profile_init(struct nvk_device *dev);
+ void nvk_pass_profile_finish(struct nvk_device *dev);
+ 
+-void nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd);
++void nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd,
++                                 const VkRenderingInfo *info);
+ void nvk_pass_profile_end_pass(struct nvk_cmd_buffer *cmd);
++/* reset_cmd at the start of vkBeginCommandBuffer, begin_cmd at its end */
++void nvk_pass_profile_reset_cmd(struct nvk_cmd_buffer *cmd);
+ void nvk_pass_profile_begin_cmd(struct nvk_cmd_buffer *cmd);
+ void nvk_pass_profile_end_cmd(struct nvk_cmd_buffer *cmd);
+ 
++/* At the start of an operation outside a render pass; groups is the
++ * workgroup count of a direct dispatch, else 0.
++ */
++void nvk_pass_profile_op(struct nvk_cmd_buffer *cmd,
++                         enum nvk_pass_profile_op op, uint64_t groups);
++
++/* Around driver-internal work (meta operations, the render passes of image
++ * clears and ZCULL reseeds): its render passes and operations are part of
++ * the operation that records it, not passes of their own.
++ */
++void nvk_pass_profile_internal_begin(struct nvk_cmd_buffer *cmd);
++void nvk_pass_profile_internal_end(struct nvk_cmd_buffer *cmd);
++
+ /* Around one secondary in vkCmdExecuteCommands (returns its slot) */
+ int32_t nvk_pass_profile_begin_secondary(struct nvk_cmd_buffer *cmd,
+                                          const struct nvk_cmd_buffer *other);
+diff --git a/src/nouveau/vulkan/nvk_query_pool.c b/src/nouveau/vulkan/nvk_query_pool.c
+index 3169dea1..38708ef1 100644
+--- a/src/nouveau/vulkan/nvk_query_pool.c
++++ b/src/nouveau/vulkan/nvk_query_pool.c
+@@ -342,6 +342,8 @@ nvk_CmdResetQueryPool(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(nvk_query_pool, pool, queryPool);
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_QUERY_RESET, 0);
++
+    if (unlikely(!queryCount))
+       return;
+ 
+@@ -690,6 +692,7 @@ nvk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer,
+                             uint32_t index)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_profile_count_query(cmd);
+    VK_FROM_HANDLE(nvk_query_pool, pool, queryPool);
+ 
+    /* From the Vulkan 1.4.350 spec, vkCmdBeginQuery:
+@@ -1124,6 +1127,8 @@ nvk_CmdCopyQueryPoolResultsToMemoryKHR(VkCommandBuffer commandBuffer,
+    if (unlikely(!queryCount))
+       return;
+ 
++   nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_QUERY_COPY, 0);
++
+    if (flags & VK_QUERY_RESULT_WAIT_BIT) {
+       for (uint32_t i = 0; i < queryCount; i++) {
+          uint64_t avail_addr = nvk_query_available_addr(pool, firstQuery + i);
+-- 
+2.43.0
+
