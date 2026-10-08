@@ -2267,6 +2267,20 @@ unsafe fn build_paging_buffer_inner(
     // Every content arm yields a `PagingOpOutcome`, so the match itself is the
     // driver's answer: `Failed` is the only variant that reaches VidMm as a
     // status, and every arm that produces one routes through `paging_failure()`.
+    // `RvPg*`: content operations on a `RedirVram` surface (one relaxed load without one).
+    if crate::virtio::rm_client::vidmem::any_live() {
+        let named = match &operation {
+            PagingOperation::Transfer(t) => Some((t.hAllocation, 0)),
+            PagingOperation::Fill(f) => Some((f.hAllocation, 1)),
+            PagingOperation::DiscardContent(d) => Some((d.hAllocation, 2)),
+            _ => None,
+        };
+        if let Some((h, kind)) = named {
+            if let Some(alloc) = unsafe { paging_alloc_info(adapter, h) } {
+                crate::virtio::rm_client::vidmem::note_paging(alloc.resource_id, kind);
+            }
+        }
+    }
     let outcome = match operation {
         PagingOperation::Transfer(t) => unsafe {
             bar_transfer(passive, adapter, &content_guard, bar.seg_id, t)
