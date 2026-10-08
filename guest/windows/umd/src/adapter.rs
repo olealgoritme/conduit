@@ -9,7 +9,7 @@
 //! ⚠ **Two, not three, since S5.** `OpenAdapter12` left this DLL entirely when
 //! `helios_umd12.dll` took `UserModeDriverName[3]` (`ARCHITECTURE.md` §6.2). It
 //! is the only export S5 removes from the D3D11 driver, and it is deliberately
-//! not replaced by a refusing stub — see the note above `AdapterToken`.
+//! not replaced by a refusing stub — see the note above `AdapterOpen`.
 
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -164,19 +164,34 @@ const _: () = {
 // D3D12 kill switch lives in `umd12/src/knobs12.rs` as `UmdD3D12`, so "D3D12 is
 // off" is already a countable, greppable fact in exactly one place.
 
-/// The value handed back as every adapter's `pDrvPrivate`.
-///
-/// A zero-sized type, address-taken. It replaces a `static mut ADAPTER_COOKIE:
-/// usize = 0x4845_4c49_4f53_554d` ("HELIOSUM") whose stated purpose -- letting
-/// the driver recognise its own adapter -- was never realised: all three
-/// consumers bound it as `_h_adapter` and it was never read or written. A ZST
-/// says "this pointer is not dereferenceable state" in a way a `usize`
-/// carrying a magic number does not, and it drops a `static mut` carried for a
-/// value nothing consulted. R821.
-struct AdapterToken;
-static ADAPTER_TOKEN: AdapterToken = AdapterToken;
+/// Every adapter open's `pDrvPrivate`: one heap record per `OpenAdapter*`, freed by its
+/// `CloseAdapter`. It carries that open's RUNTIME adapter handle, the first argument
+/// `pfnEscapeCb` takes, so a device's escapes go through the adapter it was created on.
+/// A process-wide "last opened" handle is not safe: the runtime opens and closes probe adapters
+/// with no device (open, CloseAdapter right away), and an escape through such a closed adapter
+/// handle made d3d11's EscapeCB thunk call through a stale pointer (372.1: explorer.exe and
+/// notepad.exe fail-fast, FAST_FAIL_GUARD_ICALL_CHECK_FAILURE under
+/// `scanout_acquire::nvrm_supported_ops`).
+#[repr(C)]
+struct AdapterOpen {
+    magic: u64,
+    rt_adapter: usize,
+}
+const ADAPTER_MAGIC: u64 = 0x4845_4c49_4f53_4144; // "HELIOSAD"
 
-/// Adapter handles that did not carry [`ADAPTER_TOKEN`].
+/// The runtime adapter handle of the open `h` names, if it is one of ours.
+fn adapter_open(h: ddi::D3D10DDI_HADAPTER) -> Option<usize> {
+    let p = h.pDrvPrivate as *const AdapterOpen;
+    if p.is_null() || (p as usize) % core::mem::align_of::<AdapterOpen>() != 0 {
+        return None;
+    }
+    // SAFETY: the runtime hands back the `pDrvPrivate` this module returned from OpenAdapter (a
+    // live `AdapterOpen` until CloseAdapter); the magic guards against anything else.
+    let open = unsafe { &*p };
+    (open.magic == ADAPTER_MAGIC).then_some(open.rt_adapter)
+}
+
+/// Adapter handles that are not one of our [`AdapterOpen`] records.
 ///
 /// COUNT AND LOG ONLY -- deliberately not a refusal. The counter has to be
 /// observed at zero on a real boot before any DDI starts rejecting on it.
@@ -187,16 +202,14 @@ static ADAPTER_UNRECOGNISED: AtomicUsize = AtomicUsize::new(0);
 
 /// Validate an adapter handle against the token we handed out. Reports only.
 fn adapter_ok(h: ddi::D3D10DDI_HADAPTER) -> bool {
-    let expected = core::ptr::addr_of!(ADAPTER_TOKEN) as *const c_void;
-    if core::ptr::eq(h.pDrvPrivate as *const c_void, expected) {
+    if adapter_open(h).is_some() {
         return true;
     }
     let n = ADAPTER_UNRECOGNISED.fetch_add(1, Ordering::Relaxed);
     if n < 8 {
         log_error!(
-            "adapter handle not ours: pDrvPrivate={:p} expected={:p} (x{}) — counted only",
+            "adapter handle not ours: pDrvPrivate={:p} (x{}) — counted only",
             h.pDrvPrivate,
-            expected,
             n + 1
         );
     }
@@ -268,14 +281,16 @@ unsafe fn open_adapter_common(
     log_self_module_path();
     log_knob_inventory();
 
-    // D4a scanout acquire: `pfnEscapeCb`'s first argument is the RUNTIME
-    // adapter handle (PFND3DDDI_ESCAPECB(hAdapter, ..) — the WDK's own
-    // signature), which only ever appears here. Capture it; every open in a
-    // process targets the same Helios adapter.
-    crate::scanout_acquire::note_runtime_adapter(open.hRTAdapter.handle);
+    // `pfnEscapeCb`'s first argument is the RUNTIME adapter handle
+    // (PFND3DDDI_ESCAPECB(hAdapter, ..)), which only ever appears here: it goes
+    // into this open's `AdapterOpen` record below, and from there into the
+    // device created on it (`HeliosDevice::rt_adapter`).
 
     open.hAdapter = ddi::D3D10DDI_HADAPTER {
-        pDrvPrivate: core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void,
+        pDrvPrivate: Box::into_raw(Box::new(AdapterOpen {
+            magic: ADAPTER_MAGIC,
+            rt_adapter: open.hRTAdapter.handle as usize,
+        })) as *mut c_void,
     };
 
     // The generated D3D10_2DDI_ADAPTERFUNCS is FLAT -- the WDK repeats the
@@ -448,6 +463,7 @@ unsafe extern "system" fn create_device(
                 // the hand copy declared them as bare `c_void` pointers and had
                 // to cast at this site.
                 kt_callbacks: create.pKTCallbacks,
+                rt_adapter: adapter_open(h_adapter).unwrap_or(0),
                 paging_queue: None,
                 dxgi_callbacks: create.DXGIBaseDDI.pDXGIBaseCallbacks,
                 // R910 retired the whole legacy LINEAR scan-out value model
@@ -631,7 +647,16 @@ impl Drop for DeviceUnderConstruction {
 }
 
 unsafe extern "system" fn close_adapter(h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
-    let _ = adapter_ok(h_adapter);
+    if adapter_ok(h_adapter) {
+        let p = h_adapter.pDrvPrivate as *mut AdapterOpen;
+        // SAFETY: `adapter_ok` found our record; the runtime closes an adapter once, after its
+        // device (if any) is destroyed. The magic is cleared before the free so a stray reuse of
+        // the handle is refused rather than read.
+        unsafe {
+            (*p).magic = 0;
+            drop(Box::from_raw(p));
+        }
+    }
     log_error!("CloseAdapter");
     S_OK
 }
