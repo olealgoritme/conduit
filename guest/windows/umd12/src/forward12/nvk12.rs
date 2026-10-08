@@ -221,6 +221,63 @@ pub(crate) fn close_unused_fence(dev: &device12::HeliosD3D12Device, fence: crate
     dev.engine.nvk_rm_fence_close(fence.handle);
 }
 
+/// The engine's admission and producer-signal counters (every mode, NVK), and
+/// GPU execution time per batch when the engine measures it
+/// (`HELIOS_VKD3D_GPU_TIMESTAMPS=1`). `frames` = frames so far, for per-frame
+/// figures.
+fn log_engine_timing(frames: u64) {
+    let st = crate::bridge12::ecl_fence_stats();
+    let admits = st[14];
+    if admits != 0 {
+        log_error!(
+            "vkd3d batches: {admits} admitted, commit-to-admission avg {} us, hist <50us {} <200us {} \
+             <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {}; ECL fence admission-to-signal avg {} us; \
+             producer signal inline {} separate {}",
+            st[15] / admits,
+            st[16],
+            st[17],
+            st[18],
+            st[19],
+            st[20],
+            st[21],
+            st[22],
+            if st[0] != 0 { st[23] / st[0] } else { 0 },
+            st[24],
+            st[25],
+        );
+    }
+    let gt = crate::bridge12::gpu_time_stats();
+    let batches = gt[0];
+    if batches != 0 {
+        let f = frames.max(1);
+        log_error!(
+            "GPU timestamps: {batches} batches ({} not read), busy avg {} us/batch ({} us/frame), max {} us; \
+             idle gap before a batch avg {} us ({} us/frame); busy hist <50us {} <200us {} <1ms {} <2ms {} \
+             <5ms {} <20ms {} >=20ms {}; gap hist <50us {} <200us {} <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {}",
+            gt[4],
+            gt[1] / batches / 1000,
+            gt[1] / f / 1000,
+            gt[3] / 1000,
+            gt[2] / batches / 1000,
+            gt[2] / f / 1000,
+            gt[5],
+            gt[6],
+            gt[7],
+            gt[8],
+            gt[9],
+            gt[10],
+            gt[11],
+            gt[12],
+            gt[13],
+            gt[14],
+            gt[15],
+            gt[16],
+            gt[17],
+            gt[18],
+        );
+    }
+}
+
 /// The engine's ECL fence counters as one line (mode 2 only).
 fn log_ecl_fence_stats() {
     if crate::knobs12::nvk12_ecl_sync() != 2 {
@@ -492,6 +549,7 @@ impl FrameStats {
         drop(acc);
         window.log(&format!("last frames, {total_frames} so far"));
         log_ecl_fence_stats();
+        log_engine_timing(total_frames);
         // After the first frame and every 2048 frames: placement barely moves.
         if total_frames == 1 || total_frames % (8 * FRAME_LOG_EVERY) == 0 {
             log_memory_placement();
@@ -504,6 +562,7 @@ impl FrameStats {
         if total.frames != 0 {
             total.log("totals");
             log_ecl_fence_stats();
+            log_engine_timing(total.frames);
             log_memory_placement();
         }
     }

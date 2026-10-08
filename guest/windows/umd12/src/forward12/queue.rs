@@ -539,6 +539,9 @@ pub struct QueueState {
     /// S5: the highest NVK execution boundary committed on this queue (present
     /// waits for it before showing a frame on scanout 0).
     nvk_last_value: std::sync::atomic::AtomicU64,
+    /// `Nvk12EclSync=2`: the highest ECL fence value committed on this queue (a
+    /// fenced scanout present flips when it fires). 0 = none.
+    nvk_last_ecl_fence: std::sync::atomic::AtomicU64,
 }
 
 /// Engine allocators materialised for one DDI command pool, indexed by command
@@ -1257,6 +1260,7 @@ unsafe extern "system" fn create_command_queue(
             execution: Mutex::new(()),
             nvk: std::sync::OnceLock::new(),
             nvk_last_value: std::sync::atomic::AtomicU64::new(0),
+            nvk_last_ecl_fence: std::sync::atomic::AtomicU64::new(0),
         });
     }
     S_OK
@@ -3025,6 +3029,31 @@ pub(crate) unsafe fn nvk_scanout_present(h: ddi12::D3D12DDI_HCOMMANDQUEUE, resou
         .is_some_and(|dev| unsafe { dev.engine.nvk_scanout_present(resource) })
 }
 
+/// `Nvk12EclSync=2`: queue a scanout flip of `resource` for when the last ECL
+/// fence value committed on this queue fires, instead of waiting for the queue
+/// on the CPU. False when this queue has no ECL fence value or the flip could
+/// not be queued (the caller waits and flips as before).
+///
+/// # Safety
+/// As [`queue_state`]; `resource` is a live engine resource of this device.
+pub(crate) unsafe fn nvk_scanout_present_fenced(h: ddi12::D3D12DDI_HCOMMANDQUEUE, resource: usize) -> bool {
+    // SAFETY: forwarded precondition.
+    let Some(queue) = (unsafe { queue_state(h) }) else {
+        return false;
+    };
+    let value = queue
+        .nvk_last_ecl_fence
+        .load(std::sync::atomic::Ordering::Acquire);
+    if value == 0 {
+        return false;
+    }
+    // SAFETY: a live queue implies its live device; the engine queue lives with it.
+    unsafe { device12::device(queue.h_device) }.is_some_and(|dev| unsafe {
+        dev.engine
+            .nvk_scanout_present_fenced(resource, queue.engine_queue.as_raw() as usize, value)
+    })
+}
+
 /// S5: wait on the CPU until every NVK boundary committed on this queue
 /// completed (scanout present: the frame must be finished before it is shown).
 /// True when reached, or when nothing was committed.
@@ -3274,6 +3303,13 @@ unsafe fn execute_command_lists_body(
     };
     L2_REFUSALS.ecl_forwarded.bump();
     L2_REFUSALS.ecl_exact_boundary.bump();
+    if let Some(fence) = ecl_fence {
+        // The engine signals this value after the batch whatever becomes of the
+        // fence handle, so a scanout present may name it.
+        queue
+            .nvk_last_ecl_fence
+            .fetch_max(fence.value, std::sync::atomic::Ordering::AcqRel);
+    }
     if boundary.0 != 0 {
         if let Some(fence) = ecl_fence {
             // A Venus boundary never comes with an ECL fence; never leak one.

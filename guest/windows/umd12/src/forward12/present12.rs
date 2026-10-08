@@ -651,7 +651,28 @@ unsafe fn present_nvk(
         2 => false,
         _ => !(crate::knobs12::foreign_import() && has_id),
     };
-    if scanout {
+    // `Nvk12EclSync=2` + `Nvk12ScanoutFence`: the flip waits for the frame's
+    // last ECL fence in the KMD (or an ICD thread); this thread does not.
+    // SAFETY: forwarded precondition.
+    let fenced = scanout
+        && crate::knobs12::nvk12_ecl_sync() == 2
+        && crate::knobs12::nvk12_scanout_fence()
+        && unsafe { queue::nvk_scanout_present_fenced(h_queue, engine_resource) };
+    if fenced {
+        L8_REFUSALS.nvk_scanout_fenced.bump();
+        L8_REFUSALS.nvk_scanout_presents.bump();
+        let n = L8_REFUSALS.nvk_scanout_presents.get();
+        if n == 1 || n % 1024 == 0 {
+            log_error!(
+                "L8: NVK present: {n} frames on scanout 0 ({} fenced, failures {})",
+                L8_REFUSALS.nvk_scanout_fenced.get(),
+                L8_REFUSALS.nvk_scanout_failed.get()
+            );
+        }
+    } else if scanout {
+        if crate::knobs12::nvk12_ecl_sync() == 2 && crate::knobs12::nvk12_scanout_fence() {
+            note_refusal(&L8_REFUSALS.nvk_scanout_fence_fallback);
+        }
         // SAFETY: forwarded precondition.
         let done = unsafe { queue::nvk_wait_queue_idle(h_queue, NVK_SCANOUT_WAIT_NS) };
         if !done {
@@ -863,6 +884,12 @@ struct L8Refusals {
     nvk_scanout_presents: RefusalCounter,
     nvk_scanout_failed: RefusalCounter,
     nvk_scanout_wait_timeout: RefusalCounter,
+    /// Scanout presents whose flip waits for the frame's last ECL fence
+    /// (`Nvk12EclSync=2`, `Nvk12ScanoutFence`), no CPU wait.
+    nvk_scanout_fenced: RefusalCounter,
+    /// Scanout presents that wanted the fenced flip and waited on the CPU
+    /// instead (no ECL fence value on the queue, or the flip was refused).
+    nvk_scanout_fence_fallback: RefusalCounter,
     nvk_composed_presents: RefusalCounter,
 }
 
@@ -884,6 +911,8 @@ static L8_REFUSALS: L8Refusals = L8Refusals {
     nvk_scanout_presents: RefusalCounter::new("Nvk12ScanoutPresents"),
     nvk_scanout_failed: RefusalCounter::new("Nvk12ScanoutFailed"),
     nvk_scanout_wait_timeout: RefusalCounter::new("Nvk12ScanoutWaitTimeout"),
+    nvk_scanout_fenced: RefusalCounter::new("Nvk12ScanoutFenced"),
+    nvk_scanout_fence_fallback: RefusalCounter::new("Nvk12ScanoutFenceFallback"),
     nvk_composed_presents: RefusalCounter::new("Nvk12ComposedPresents"),
 };
 
@@ -924,5 +953,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L8_REFUSALS.nvk_scanout_presents,
     &L8_REFUSALS.nvk_scanout_failed,
     &L8_REFUSALS.nvk_scanout_wait_timeout,
+    &L8_REFUSALS.nvk_scanout_fenced,
+    &L8_REFUSALS.nvk_scanout_fence_fallback,
     &L8_REFUSALS.nvk_composed_presents,
 ];

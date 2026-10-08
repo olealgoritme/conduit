@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 14] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -316,6 +316,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
         ("Umd12PipelineLibrary", UMD12_PIPELINE_LIBRARY.get() as u32),
         // Appended. Clamped, as read by the ECL CPU wait.
         ("Nvk12EclSpinUs", nvk12_ecl_spin_us()),
+        // Appended.
+        ("Nvk12ScanoutFence", nvk12_scanout_fence() as u32),
     ]
 }
 
@@ -374,6 +376,23 @@ const MAX_ECL_SPIN_US: u32 = 50_000;
 /// The ECL CPU-wait poll budget in microseconds, clamped. See [`NVK12_ECL_SPIN_US`].
 pub(crate) fn nvk12_ecl_spin_us() -> u32 {
     NVK12_ECL_SPIN_US.get().min(MAX_ECL_SPIN_US)
+}
+
+/// `Nvk12ScanoutFence`: with `Nvk12EclSync=2`, a scanout present (scanout 0,
+/// `Nvk12Present`) hands the KMD (or a thread in NVK) a flip that waits for the
+/// frame's last ECL fence (`scanout_present_fenced`, helios_icd_interface v3)
+/// instead of waiting on the CPU for the queue before flipping. Absent = ON;
+/// 0 = the CPU wait, as before. Without an ECL fence value on the queue, or if
+/// the flip cannot be queued, the present waits on the CPU (counted).
+///
+/// ⚠ The flip now happens after Present returns, so the KMD may still show
+/// image P when DXGI hands it back for rendering (a torn frame at worst with
+/// two buffers; the scanout queue rule is three or more images).
+/// Read once per process.
+pub(crate) static NVK12_SCANOUT_FENCE: BoolKnob = BoolKnob::new(c"Nvk12ScanoutFence", true);
+
+pub(crate) fn nvk12_scanout_fence() -> bool {
+    NVK12_SCANOUT_FENCE.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {
