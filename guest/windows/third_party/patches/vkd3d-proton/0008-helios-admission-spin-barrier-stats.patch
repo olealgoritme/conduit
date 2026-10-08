@@ -1,0 +1,153 @@
+Helios vkd3d-proton fork: admission polling, barrier pass-end statistics
+
+Conduit Basemark D3D12 on NVK (398.1): commit-to-admission averages
+1.85 ms per batch with the GPU about half busy, and 61.7k of 75.4k passes
+per 2 s are ended by ResourceBarrier. Applied after 0007.
+
+- HELIOS_VKD3D_ADMISSION_SPIN_US (default 0): the submission worker polls a
+  batch's admission event for that long (WaitForSingleObject(0) with
+  YieldProcessor, clamped to 20 ms) before blocking on it, to take the
+  thread wake out of the admission chain. Logged once when on.
+- With HELIOS_VKD3D_PASS_END_STATS=1 the two-second window also gets one
+  "ResourceBarrier" line: calls, barriers asked for, calls that ended an
+  active render pass, how many of those emitted no Vulkan barrier at all
+  (ended the pass for nothing), and the Vulkan image and memory barriers
+  made. (A batch flushed half-way at MAX_BATCHED_IMAGE_BARRIERS counts only
+  its tail; transitions emitted outside the batch are not seen.)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 57423e57..afd4dbda 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -6728,6 +6728,10 @@ static struct
+     int enabled;
+     uint64_t window_start_ns;
+     uint64_t begins;
++    /* ResourceBarrier calls, those that found a pass active, and of those
++     * the ones that emitted no Vulkan barrier at all (ended the pass for
++     * nothing); barriers asked for and Vulkan image/memory barriers made. */
++    uint64_t rb_calls, rb_ended, rb_ended_noop, rb_barriers, rb_vk_images, rb_vk_memory;
+     unsigned int count;
+     struct
+     {
+@@ -6766,6 +6770,10 @@ static void helios_pass_end_log_locked(uint64_t now)
+     qsort(order, n, sizeof(order[0]), helios_pass_end_cmp);
+     INFO("Helios pass ends: %.2f s window, %"PRIu64" passes begun, %"PRIu64" ended or suspended.\n",
+             (now - helios_pass_ends.window_start_ns) / 1e9, helios_pass_ends.begins, total);
++    INFO("Helios pass ends: ResourceBarrier %"PRIu64" calls (%"PRIu64" barriers), %"PRIu64" ended an active pass, "
++            "%"PRIu64" of those emitted no Vulkan barrier; Vulkan image barriers %"PRIu64", memory barriers %"PRIu64".\n",
++            helios_pass_ends.rb_calls, helios_pass_ends.rb_barriers, helios_pass_ends.rb_ended,
++            helios_pass_ends.rb_ended_noop, helios_pass_ends.rb_vk_images, helios_pass_ends.rb_vk_memory);
+     for (i = 0; i < n && i < 24 && order[i][0]; i++)
+     {
+         unsigned int k = (unsigned int)order[i][1];
+@@ -6776,6 +6784,8 @@ static void helios_pass_end_log_locked(uint64_t now)
+     for (i = 0; i < n; i++)
+         helios_pass_ends.site[i].ends = helios_pass_ends.site[i].suspends = 0;
+     helios_pass_ends.begins = 0;
++    helios_pass_ends.rb_calls = helios_pass_ends.rb_ended = helios_pass_ends.rb_ended_noop = 0;
++    helios_pass_ends.rb_barriers = helios_pass_ends.rb_vk_images = helios_pass_ends.rb_vk_memory = 0;
+     helios_pass_ends.window_start_ns = now;
+ }
+ 
+@@ -6807,6 +6817,23 @@ static void helios_pass_end_note(const char *func, int line, bool suspend)
+     pthread_mutex_unlock(&helios_pass_ends.lock);
+ }
+ 
++static void helios_pass_barrier_note(bool ended_active, unsigned int barriers,
++        unsigned int vk_images, bool vk_memory)
++{
++    pthread_mutex_lock(&helios_pass_ends.lock);
++    helios_pass_ends.rb_calls++;
++    helios_pass_ends.rb_barriers += barriers;
++    helios_pass_ends.rb_vk_images += vk_images;
++    helios_pass_ends.rb_vk_memory += vk_memory;
++    if (ended_active)
++    {
++        helios_pass_ends.rb_ended++;
++        if (!vk_images && !vk_memory)
++            helios_pass_ends.rb_ended_noop++;
++    }
++    pthread_mutex_unlock(&helios_pass_ends.lock);
++}
++
+ static void helios_pass_begin_note(void)
+ {
+     pthread_mutex_lock(&helios_pass_ends.lock);
+@@ -14335,10 +14362,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
+     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+     struct d3d12_command_list_barrier_batch batch;
+     bool have_split_barriers = false;
++    bool helios_was_active;
+     unsigned int i, j;
+ 
+     TRACE("iface %p, barrier_count %u, barriers %p.\n", iface, barrier_count, barriers);
+ 
++    helios_was_active = !!(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE);
+     d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_end_current_render_pass(list, false);
+     d3d12_command_list_end_transfer_batch(list);
+@@ -14643,6 +14672,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
+             d3d12_command_list_track_resource_usage(list, preserve_resource, true);
+     }
+ 
++    if (helios_pass_end_stats_on())
++        helios_pass_barrier_note(helios_was_active, barrier_count, batch.image_barrier_count,
++                batch.vk_memory_barrier.srcStageMask || batch.vk_memory_barrier.dstStageMask);
+     d3d12_command_list_barrier_batch_end(list, &batch);
+ 
+     /* Vulkan doesn't support split barriers. */
+diff --git a/libs/vkd3d/helios_producer.h b/libs/vkd3d/helios_producer.h
+index 04f00a0d..3b72f642 100644
+--- a/libs/vkd3d/helios_producer.h
++++ b/libs/vkd3d/helios_producer.h
+@@ -397,11 +397,49 @@ void helios_vkd3d_cancel_execution(ID3D12CommandQueue *iface, HRESULT reason)
+         d3d12_device_mark_as_removed(queue->device, reason, "Runtime execution submission failed.");
+ }
+ 
++#ifdef _WIN32
++/* HELIOS_VKD3D_ADMISSION_SPIN_US (default 0): poll the admission event for
++ * this long before blocking on it. The worker is idle while it waits, and a
++ * blocked thread wakes a scheduler hop later than a polling one notices; the
++ * admission chain is per batch, ~20 a frame. */
++static uint32_t vkd3d_helios_admission_spin_us(void)
++{
++    static int spin = -1;
++    char env[16];
++    if (spin < 0)
++    {
++        spin = vkd3d_get_env_var("HELIOS_VKD3D_ADMISSION_SPIN_US", env, sizeof(env)) ? atoi(env) : 0;
++        if (spin < 0) spin = 0;
++        if (spin > 20000) spin = 20000;
++        if (spin)
++            INFO("Helios: admission waits poll for %d us before blocking.\n", spin);
++    }
++    return (uint32_t)spin;
++}
++#endif
++
+ static bool vkd3d_helios_execution_wait(struct d3d12_command_queue *queue,
+         struct vkd3d_helios_execution *op)
+ {
+     if (!op) return true;
+ #ifdef _WIN32
++    if (vkd3d_helios_admission_spin_us())
++    {
++        uint64_t deadline = vkd3d_get_current_time_ns() + vkd3d_helios_admission_spin_us() * 1000ull;
++        unsigned int k;
++        do
++        {
++            for (k = 0; k < 64; k++)
++            {
++                if (WaitForSingleObject(op->admission_event, 0) == WAIT_OBJECT_0)
++                {
++                    vkd3d_helios_note_admitted(op);
++                    return true;
++                }
++                YieldProcessor();
++            }
++        } while (vkd3d_get_current_time_ns() < deadline);
++    }
+     for (;;)
+     {
+         DWORD result;
