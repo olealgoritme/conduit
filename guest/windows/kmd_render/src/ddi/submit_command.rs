@@ -326,6 +326,13 @@ pub(crate) fn publish_nvrm_counters() {
     // The copy-engine Present route (`RmCopyEngine` 1, M3c-2): `CeRt*`, written once a Present
     // reached its decision.
     crate::ddi::ce_present_route::publish_counters();
+    // `RedirVram` (`Rv*`, the VRAM service and its copy-engine objects) and the staging views
+    // (`RmSys*` of `ce_sysmem`): their hot paths ask for this pass instead of writing inline.
+    crate::ddi::vram_redirect::publish_if_seen();
+    crate::ddi::ce_sysmem::publish_if_used();
+    // The CPU-host-aperture map log (`BarApR*`/`BarApP*`).
+    crate::ddi::cpu_host_aperture::publish_map_log();
+    crate::ddi::aperture_pages::publish_counters();
     // The transfer-only queue for the Present copies (`CopyQueue`): `CqMain` / `CqXfer`, the
     // fallbacks `CqFall` / `CqWhy` / `CqMask`, the queue-switch waits, written once the knob is on.
     crate::ddi::copy_queue::publish_counters();
@@ -1020,6 +1027,8 @@ fn note_and_maybe_signal(
     // Flush-gate trace (`ddi::flush_trace`): `Some` only for the SubmitCommand that
     // follows a `HEFL` Render. Record-only; nothing below branches on it.
     trace: Option<&crate::ddi::flush_trace::SubmitTrace>,
+    // `GdiAccel`: the GDI job sequence this buffer's fence waits for (`ddi/gdi_exec.rs`).
+    gdi_seq: Option<u64>,
 ) -> SubmitAck {
     let Ok(dxgkrnl) = adapter.dxgkrnl() else {
         // Effectively unreachable: dxgkrnl is set at StartDevice and never
@@ -1064,6 +1073,7 @@ fn note_and_maybe_signal(
                     blt_token,
                     exact_execution,
                     execution_boundary_value,
+                    gdi_seq,
                 )
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
@@ -1437,6 +1447,21 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     } else {
         None
     };
+    // `GdiAccel`: a RenderKm buffer's job (one relaxed load with the knob off).
+    // SAFETY: dxgkrnl's private range; the helper checks null and size.
+    let gdi_seq = if !is_paging && crate::ddi::gdi_accel::on() {
+        unsafe {
+            gdi_job_seq(
+                adapter,
+                submit.hContext,
+                submit.pDmaBufferPrivateData,
+                submit.DmaBufferPrivateDataSize,
+                submit.DmaBufferUmdPrivateDataSize,
+            )
+        }
+    } else {
+        None
+    };
     let SubmitAck::Accepted = note_and_maybe_signal(
         adapter,
         fence,
@@ -1444,6 +1469,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         present_fence,
         execution_boundary,
         trace.as_ref(),
+        gdi_seq,
     );
     STATUS_SUCCESS
 }
@@ -1507,6 +1533,21 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     } else {
         None
     };
+    // `GdiAccel`: a RenderKm buffer's job (one relaxed load with the knob off).
+    // SAFETY: dxgkrnl's private range; the helper checks null and size.
+    let gdi_seq = if !is_paging && crate::ddi::gdi_accel::on() {
+        unsafe {
+            gdi_job_seq(
+                adapter,
+                submit.__bindgen_anon_1.hContext,
+                submit.pDmaBufferPrivateData,
+                submit.DmaBufferPrivateDataSize,
+                0,
+            )
+        }
+    } else {
+        None
+    };
     let SubmitAck::Accepted = note_and_maybe_signal(
         adapter,
         fence,
@@ -1514,8 +1555,49 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         present_fence,
         execution_boundary,
         trace.as_ref(),
+        gdi_seq,
     );
     STATUS_SUCCESS
+}
+
+/// `GdiAccel`: the job a RenderKm/RenderGdi buffer names in its private data
+/// (`gdi_accel::Private`, at the start of the KMD's half, or at 0), admitted to the executor;
+/// `Some(seq)` gates the fence. A submission on a GDI context without the record claims that
+/// context's oldest unclaimed job (`gdi_exec::oldest_unclaimed`).
+///
+/// # Safety
+/// `data` is dxgkrnl's private data of `size` bytes, the KMD's half starting at `umd`.
+unsafe fn gdi_job_seq(
+    adapter: &AdapterContext,
+    h_context: HANDLE,
+    data: *mut c_void,
+    size: u32,
+    umd: u32,
+) -> Option<u64> {
+    use helios_kmd_logic::gdi_accel::{Private, PRIVATE_BYTES};
+    let gdi_ctx = crate::ddi::gdi_accel::is_gdi_context(h_context as usize);
+    let mut job = None;
+    // A UMD-written private prefix is never read as a GDI record (a user process could otherwise
+    // claim a GDI job): only the KMD's half, and offset 0 only on a GDI context.
+    if !data.is_null() && (gdi_ctx || umd == 0) {
+        for off in if gdi_ctx { [umd, 0] } else { [umd, umd] } {
+            if job.is_none() && size >= off && (size - off) as usize >= PRIVATE_BYTES {
+                // SAFETY: `[off, off + PRIVATE_BYTES)` lies inside the runtime's private range.
+                let bytes = unsafe { core::slice::from_raw_parts((data as *const u8).add(off as usize), PRIVATE_BYTES) };
+                job = Private::decode(bytes).map(|p| p.job);
+            }
+        }
+    }
+    let decoded = job.is_some();
+    let mut claimed = false;
+    if job.is_none() && gdi_ctx {
+        job = crate::ddi::gdi_exec::oldest_unclaimed(h_context as usize);
+        claimed = job.is_some();
+    }
+    if gdi_ctx || decoded {
+        crate::ddi::gdi_accel::note_submit(size, umd, decoded, claimed);
+    }
+    crate::ddi::gdi_exec::admit(adapter, job?)
 }
 
 /// Cumulative count of pending WDDM fences discarded by a scheduler epoch —
@@ -2680,6 +2762,12 @@ pub unsafe extern "C" fn dxgkddi_render_km(
     if args.pDmaBuffer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    // `GdiAccel` = 1: the GDI command buffer is translated (`ddi/gdi_accel.rs`). Off: one
+    // relaxed load and the pass-through below, unchanged.
+    if crate::ddi::gdi_accel::on() {
+        // SAFETY: dxgkrnl's context handle and arguments for this PASSIVE call.
+        return unsafe { crate::ddi::gdi_accel::render_km(_h_context, args) };
+    }
     let cmd_len = args.CommandLength as usize;
     let dma_cap = args.DmaSize as usize;
     // Ask the runtime to grow the DMA buffer if the command does not fit, rather
@@ -2736,6 +2824,12 @@ pub unsafe extern "C" fn dxgkddi_render_gdi(
     let args = unsafe { &mut *render_gdi };
     if args.pDmaBuffer.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    // `GdiAccel` = 1: on this GpuMmu adapter the GDI command buffer arrives HERE, not in
+    // RenderKm (`ddi/gdi_accel.rs`). Off: one relaxed load and the pass-through below.
+    if crate::ddi::gdi_accel::on() {
+        // SAFETY: dxgkrnl's context handle and arguments for this PASSIVE call.
+        return unsafe { crate::ddi::gdi_accel::render_gdi(_h_context, args) };
     }
     let cmd_len = args.CommandLength as usize;
     let dma_cap = args.DmaSize as usize;

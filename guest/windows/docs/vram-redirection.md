@@ -1,0 +1,1035 @@
+# The redirection surface in GPU memory (lane F): findings, design, staged plan
+
+Status (2026-10-08): phase 1 tooling built; V1 (`VidMmCapsX`) run on hardware (354.1) and NEGATIVE
+(section 2.4); V2-V5 machinery (`RedirVram`: the RM VRAM allocation service, the KMD_RM foreign
+adoption, the CE VRAM-to-VRAM route, the upload and readback for CPU writers and readers) built behind
+default-off knobs, host-tested (kmd-dev gate rc=0, stubcheck: no new errors beyond the stub model's
+known gap), never run. Branch `feat/vram-redirection`, which merges `fix/rm-ce-route-review-findings`
+(PR #13: the copy-engine channel and route) on top of `feat/rm-copy-engine-present` (PR #2). Because V1
+showed that Windows keeps a CPU-visible STAGING surface as the Blt destination, the path to a GPU-only
+redirection surface is GDI hardware acceleration on the copy engine (fallback A, 5.4, built on
+`feat/vram-redirection-gdi-accel` on top of these modules: section 8 lists the shared surface).
+
+Companion reading: `rm-copy-engine-present.md` (sections 11, 14, 15: the CE channel and the route),
+`rm-backed-standard.md` (sections 8 and 13: the census and the Blt destination), `zero-copy-present.md`
+(24: `BltAsync`, `GuestBlob`), `kmd-handoff-2026-10.md` (1, 2, 7), `kmd-rm-client.md` (5, 12, 14, 15),
+`shared-foreign-surfaces.md`, `../../../docs/dwm-on-nvk.md`, `../../../docs/HANDOFF.md`.
+
+## 0. The short answer
+
+* **The bar.** Heaven D3D11, windowed 1600x900, "Composed: Copy with GPU GDI". Bare metal on the same
+  host: about 576 fps. Here: 214-247 fps; Heaven spends about 1.8 ms per frame inside `Present`.
+* **Where the time goes (measured before this lane, confirmed per frame by the phase 1 capture).** The
+  app thread waits in dxgkrnl between `Lock` and `Unlock` (DxgKrnl events 41 and 42 on Windows 11 26H1)
+  on the destination of the Blt, until a Blt DMA packet retires (event 180). The packet retires only
+  after the producer's frame, the copy (about 220 µs over PCIe on the copy-engine route) and the guest
+  completion path: a GPU round trip through the guest per frame.
+* **What the destination is.** A KMD standard buffer (`KmdStandardBuffer`: shadow or staging standard
+  allocation, linear, `CpuVisible`, `Cached`) whose authoritative content, in steady state, is guest
+  system pages: VidMm moves it from the Venus-window memory segment (id 2) to system memory once and
+  keeps it there (`PgTo` 1). DWM never opens it (census, `rm-backed-standard.md` 8 "S-A0 result"); it
+  reads those system pages through dxgkrnl's CPU view (`BltNoMirror` froze the window). This is
+  Windows' canonical redirection path for an adapter WITHOUT GDI hardware acceleration: GDI and the
+  redirected window content live in CPU-visible memory, and every GPU write into it must retire before
+  the CPU side may touch it again.
+* **What bare metal does differently.** The window's redirection surface is a GPU surface that DWM
+  samples on the GPU; the redirected Blt is ordered on the GPU and never waits for a CPU lock.
+* **The design (section 5).** Make the redirection surface a GPU-only allocation (not `CpuVisible`,
+  never `Lock`ed), backed by RM video memory the KMD allocates on its own RM client, adopted as a
+  foreign resource so DWM on NVK imports it by resource id (zero copy, VRAM), and written by the
+  redirected Blt with a VRAM-to-VRAM copy on the KMD's RM copy-engine channel. Windows chooses a GPU-only
+  redirection surface only if the adapter tells it that GDI allocations need not be CPU visible
+  (`DXGK_VIDMMCAPS.NonCpuVisiblePrimary`, WDDM 2.0+) and, depending on what CDD then asks for, gives it
+  the copies it needs between CPU-written GDI staging and the GPU-only surfaces. Stage V1 is the
+  one-bit experiment that tells which allocations Windows asks for when that cap is set; stages V2-V5
+  build the memory, the copy, the import and the CPU readers.
+* **What cannot be promised before V1 runs.** That Windows 11 26H1 moves a DXGI blit-model window's
+  redirection to a GPU-only surface with that cap alone, without GDI hardware acceleration. If it does
+  not, section 5.4 (GDI hardware acceleration limited to copies and fills on the copy engine) and
+  section 5.5 (a VRAM shadow behind the same allocation) are the fallbacks; both are written down.
+
+## 1. Background and numbers
+
+| | value | source |
+|---|---|---|
+| Heaven windowed, bare metal, same host | ~576 fps (1.74 ms) | `docs/HANDOFF.md` |
+| here, `GuestBlob=1` | 247 fps (4.05 ms) | `docs/HANDOFF.md` |
+| `msInPresentAPI` | ~1.8 ms | PresentMon |
+| producer wait (Blt deferred until the producer's frame is done) | ~650 µs p50 | stage timing (PR #4) |
+| CE copy 5.76 MB (1600x900x4) into guest pages | ~220-234 µs (PCIe x8 write bound) | PR #2 smoke, route live: 16403/16403 Presents routed |
+| VRAM-to-VRAM copy of the same frame on the GPU | ~20 µs (estimate: ~1.5 TB/s copy-engine read+write; to be measured in V3) | |
+| Lock -> Unlock on the app thread (events 41 -> 42) | 1.0-1.7 ms | DxgKrnl ETW, `kmd-handoff-2026-10.md` 1 |
+
+The CPU cost of the rest of Heaven's frame (outside `Present`) is about 2.2-2.6 ms here against well under
+1.7 ms on bare metal; it is not this lane's subject, but it bounds what removing the wait can give (about
+400 fps if the wait goes to zero and nothing else changes).
+
+## 2. Phase 1: confirming the serialisation (ETW)
+
+### 2.1 What is captured
+
+`guest/windows/ci/vmtest/vram-etw.ps1` (run in the guest as administrator; `vramcap.sh` runs it from the
+host, copies the result back and calls the report):
+
+* the build's own DxgKrnl, DXGI and Win32k manifests (`wevtutil gp ... /ge /gm /f:xml`): event ids and
+  field order move between builds, so the parser keys on field names;
+* a WPR profile generated on the spot: DxgKrnl at level 5 with the keywords `Base`, `Profiler`,
+  `References`, `Resource`, `Memory` (and `Present`/`GPUScheduler` where the build has them), masks
+  read from the manifest; capture state (rundown) on start and on save for `Base|References|Resource|Memory`,
+  which is what emits `ReportSegment` (78), `AdapterAllocation`/`DeviceAllocation` DC_Start (35, 38) and
+  `ReportCommittedGlobalAllocation` (227); DXGI with every keyword (Present start/stop, 42/43); Win32k
+  `Updates|Visualization|Tracing` (the token events PresentMon uses to see DWM take a frame); kernel
+  process/thread/loader (optionally `-CSwitch`: context switches and ready-thread);
+* the KMD's registry counters before and after (the `blrow.sh` snapshot), the process list, the OS build;
+* the ETL itself (opens in WPA/GPUView) and `tracerpt -of XML`, zipped.
+
+The events the report uses (26H1 ids; classified by field names):
+
+| id | event | used for |
+|---|---|---|
+| DXGI 42/43 | Present start/stop | one frame = one `Present` call of the app thread |
+| 166 | Blit (`hSourceAllocation`, `hDestAllocation`, `bRedirectedPresent`) | the destination: the redirection surface. "Copy with GPU GDI" is a Blit with `bRedirectedPresent` 0 followed by PresentHistory model 3 (PresentMon's rule) |
+| 171/215 | PresentHistory(Detailed)Start, `Model` | 3 = `D3DKMT_PM_REDIRECTED_BLT` |
+| 178/180 | QueuePacket start/stop | the Blt's DMA packet: submitted, retired |
+| 41/42, 340/341 | Lock/Unlock (`hAllocationHandle`, `dwFlags`, `uiLockStatus`) | CPU access to an allocation: who (pid/tid) and how long |
+| 105/106 | ProfilerStart/Stop (`Function`) | dxgkrnl's own function spans (the CPU-access wait among them) |
+| 33/35, 36/38 | AdapterAllocation, DeviceAllocation (+ DC_Start) | handle joins, size, `Flags`, read/write segment sets, preferred segment, section object |
+| 78 | ReportSegment | segment id, size, flags, memory segment group |
+| 80/227, 73, 53/60, 70, 58, 74 | committed / page-in / transfer / placement / aperture map / evict | which segment the allocation is in, and when it moved |
+
+### 2.2 Run
+
+```text
+# windowed Heaven D3D11 1600x900 running (or HEAVEN=1 to start it), watchdog on
+WIN_SSH=<guest>@127.0.0.1 bash guest/windows/ci/vmtest/vramcap.sh hv-rmce 3
+WIN_SSH=<guest>@127.0.0.1 bash guest/windows/ci/vmtest/vramcap.sh hv-rmce-cs 2 -CSwitch
+```
+
+Output: `$VMTEST_DIR/win/vram-LABEL-HHMMSS/` with `report.txt`, `frames.csv` and the raw files. The parser
+alone: `guest/windows/tools/vram_redirection_report.py DIR [--process Heaven.exe] [--csv f.csv]`;
+`--selftest` checks it on a synthetic trace.
+
+### 2.3 How to read the report
+
+* `redirection surface candidate`: the Blit destination, its size, flags, read/write segment sets
+  (bit 0 = segment 1), the segments it was seen in and the last placement. "0 (no segment: system memory
+  / not resident)" or an aperture segment means the CPU-visible system-memory case.
+* `Lock events by process`: who takes CPU access to it. A `dwm.exe` row means DWM's composition reads
+  it with the CPU (through win32k or its own lock); the app's own row is dxgkrnl's CPU-access throttle
+  on the Present path.
+* Per frame: `present` (the app's `Present` call), `stall` (the longest gap between two consecutive
+  events of the app thread inside it) and what brackets it, `retire->wake` (stall end minus the nearest
+  QueuePacket retire before it), `the longest stall ends on` (own Blt retire / previous Blt retire / other),
+  `blt_pkt` (the frame's own packet, submit to retire), `dstlk` (locks on the destination inside the
+  frame), and the profiler spans.
+* The hypothesis is confirmed when the stall is bracketed by Lock/Unlock on the redirection surface, ends
+  within ~100 µs of a Blt packet retire in most frames, and the surface sits in system memory/aperture.
+
+### 2.4 Results
+
+**V1 on 354.1** (353.1 + V1, windowed Heaven 1600x900, 5120x1440@240, `RmCopyEngine` 0), knob absent and
+`VidMmCapsX=0x200`, identical: `PBdStd` 3 (STAGING), `PBdGdi` 0, `PBdSto` 2 (pitched standard buffer),
+`PBdKnd` 2, `PBdw`/`PBdh` 1600x900, `PBdPch` 6400, `PBdFmt` 87, `PBdSz` 6619136; `StdNStaging` 1, every
+`StdNGdi*` 0; 201 / 188 Presents per second, both "Composed: Copy with GPU GDI". So the destination is
+dxgkrnl's STAGING surface (the hypothesis of section 4 holds), and `NonCpuVisiblePrimary` alone does not
+make Windows hand out a GPU-only redirection surface.
+
+With `CeRtDirect=1` (route submit at Present): `CeRtDir` 17219/17223, `BltDeferUs` ~0, `CeRtLag` mean
+160 µs, `msInPresentAPI` 1.63 -> 1.52 ms, 249 -> 253 Presents per second: the producer's own GPU time and
+the staging readback (the CPU lock) remain the limit.
+
+The ETW captures (`hv-rmce`, `hv-rmce-cs`, `hv-venus`) failed on the transport (`vramcap.sh`, fixed in
+9b7226d8: ssh/scp through an ssh-config host alias, `DRY=1`); rerun pending.
+
+## 3. What the redirection surface is, here and on bare metal
+
+### 3.1 Windows' model (public documentation)
+
+* Blit model: "contents of the back buffer are copied into the redirection surface on each call to
+  Present1"; flip model: DWM composes straight from the shared back buffers
+  ([DXGI flip model](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-flip-model)).
+* Since Windows 7, GDI renders on the CPU into an aperture (CPU-visible system memory) surface and the GPU
+  copies the updates into the video-memory redirection surface DWM samples
+  ([Comparing Direct2D and GDI](https://learn.microsoft.com/en-us/windows/win32/direct2d/comparing-direct2d-and-gdi)).
+  The two halves are the GDI surface types `STAGING_CPUVISIBLE` (CPU, linear, cache-coherent aperture) and
+  `TEXTURE` (not CPU visible, shared, "used as a texture during DWM composition")
+  ([D3DKMDT_GDISURFACETYPE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ne-d3dkmdt-_d3dkmdt_gdisurfacetype)).
+  The GPU half needs GDI hardware acceleration (`SupportKernelModeCommandBuffer`,
+  [GDI hardware acceleration](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gdi-hardware-acceleration)).
+* `DXGK_VIDMMCAPS.NonCpuVisiblePrimary` (WDDM 2.0+): "GDI allocations are not required to be CPU visible"
+  ([DXGK_VIDMMCAPS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_vidmmcaps)).
+  The same page lists the cross-adapter resource rules (aperture only, CPU visible, write-combined,
+  linear): that is the shape the `CrossAdaptCaps` path gives a blit-model window here.
+* A CPU lock waits for the GPU to finish with the allocation unless `DonotWait`; `IgnoreSync` exists only
+  for aperture-placeable allocations
+  ([D3DDDICB_LOCKFLAGS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dukmdt/ns-d3dukmdt-_d3dddicb_lockflags)).
+  A GPU-only allocation is never locked, so writes to it are ordered on the GPU only (inference).
+* Segments: memory segments (VRAM, CPU access directly or through a CPU host aperture), one aperture
+  segment, and the implicit system segment 0
+  ([GPU segments](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-segments),
+  [CPU host aperture](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/cpu-host-aperature),
+  [DXGK_SEGMENTFLAGS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_segmentflags)).
+
+Other virtual GPUs, for comparison: VirtualBox's VMSVGA driver puts DEFAULT-usage surfaces in a
+CPU-invisible host segment and DYNAMIC/STAGING in a CPU-visible aperture, and its Present turns Blt into
+GPU commands
+([VBoxMPWddm.cpp](https://github.com/VirtualBox/virtualbox/blob/main/src/VBox/Additions/win/Graphics/Video/mp/wddm/VBoxMPWddm.cpp));
+viogpu3d reports a single cache-coherent aperture, every allocation `CpuVisible` in it
+([viogpu_adapter.cpp](https://github.com/max8rr8/kvm-guest-drivers-windows/blob/viogpu3d/viogpu/viogpu3d/viogpu_adapter.cpp),
+[viogpu_allocation.cpp](https://github.com/max8rr8/kvm-guest-drivers-windows/blob/viogpu3d/viogpu/viogpu3d/viogpu_allocation.cpp)),
+i.e. the system-memory redirection this KMD has today; Hyper-V GPU-PV keeps non-CPU-visible allocations
+entirely on the host GPU and maps only CPU-visible ones into the guest IO space
+([GPU paravirtualization](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-paravirtualization)).
+
+### 3.2 This KMD today (read on this branch)
+
+Segments (`ddi/query_adapter_info.rs`, `ddi/bar_segment.rs`, `ddi/segment_table.rs`; WDDM 2.1 + GpuMmu,
+`ddi/wddm_surface.rs`):
+
+| id | what | flags | backing | CPU access |
+|---|---|---|---|---|
+| 1 | aperture, 1 GiB | Aperture, CacheCoherent | guest system pages | n/a |
+| 2 | "BAR" memory segment, `VidMmVramMB` MiB, local budget group | CacheCoherent, SupportsCpuHostAperture, SupportsCachedCpuHostAperture (`BarSegFlags` 0x1C) | the virtio host-visible window: Venus blobs (host memory), **not VRAM** | `DxgkDdiMapCpuHostAperture` maps the allocation's Venus blob at dxgkrnl's offset |
+
+`DXGK_VIDMMCAPS`: `SectionBackedPrimary`, `CrossAdapterResource` with `CrossAdaptCaps`, GpuMmu bits.
+`PresentationCaps` 0: **no GDI hardware acceleration** (deliberately; `query_adapter_info.rs` explains the
+history). No `DxgkDdiLock`.
+
+The redirection surface: `GetStandardAllocationDriverData` accepts shared primary, shadow, staging and GDI
+surfaces; every non-primary one except GDI `TEXTURE` becomes `KmdStandardBuffer`: a Venus host-visible
+CACHED buffer, `CpuVisible`, `Cached`, preferred segment 2, supported {2, aperture},
+`SystemBackingPolicy::PresentLinearBuffer` (`create_allocation.rs` `build_backing`, `vidmm_placement`).
+The census saw the app create and open five shadow and one staging surface and DWM open none. The Blt arm
+accepts it as `PresentDestinationDesc::StandardBuffer` by storage class (`display.rs`), with no type check.
+In steady state its content is VidMm's system pages (leases in `system_backings`), which the copy writes:
+the Venus copy plus CPU mirror, the guest blob (`GuestBlob`), or the copy-engine route's OS descriptor
+(`RmCopyEngine=1`).
+
+The KMD's RM client already has what a VRAM surface needs: `alloc_memory` of `NV01_MEMORY_LOCAL_USER`
+(`virtio/rm_client.rs`), export to an fd and GEM, a `HELIOS_BLOB_MEM_RM_EXPORT` resource (`rm_foreign`),
+adoption of its own imports into a WDDM allocation (`foreign_tables.rs` `adopt_for_allocation`, KMD_RM
+creator), `RM_RESOURCE_IMPORT` for openers (NVK imports it as VRAM, which is NVK's assumption anyway), and
+the CE channel with GPU mappings of RM memory and dup'd NVK images (`rm_client/ce_channel.rs`, `ce_dup`).
+What it lacks for this lane: a vidmem object that is a WDDM allocation's backing (only the level 1-4 ring
+surfaces exist, adopted by nothing) and a CE copy whose destination is vidmem.
+
+## 4. Why the redirected Blt serialises here
+
+**Confirmed by `PBdStd` 3 on hardware (2.4); the per-frame Lock rows await the ETW rerun.** The census's one STAGING
+surface is the likeliest Blt destination. Microsoft documents exactly this flow for it: dxgkrnl Blts
+"from an application's back buffer into the staging surface. The staging surface is then locked and read
+by the CPU", and the staging surface is created "when a direct bitblt to the primary surface is not
+possible (for example, in multiple-monitor or sprites cases)"
+([D3DKMDT_STAGINGSURFACEDATA](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ns-d3dkmdt-_d3dkmdt_stagingsurfacedata)).
+The shadow surfaces are CDD's CPU copies of the primary, drawn by the CPU and Blitted to the primary
+([D3DKMDT_SHADOWSURFACEDATA](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ns-d3dkmdt-_d3dkmdt_shadowsurfacedata)).
+If `PBdStd` reads 3, the `Lock` on the app thread is dxgkrnl itself reading the staging surface back with
+the CPU, right after the GPU Blt into it, to move the frame into the window's CPU-side (GDI) redirection
+bitmap; the GPU Blt must retire first, which is the wait. That is the readback path Windows takes when the
+window's redirection surface cannot be a GPU target of the app's device (`DwmDxGetWindowSharedSurface`
+answers `DWM_S_GDI_REDIRECTION_SURFACE` and the app presents with model `REDIRECTED_BLT` into the GDI
+redirection surface,
+[DwmDxGetWindowSharedSurface](https://learn.microsoft.com/en-us/windows/win32/dwm/dwmdxgetwindowsharedsurface));
+here the GDI redirection surface is CPU-visible because the adapter has no GDI hardware acceleration.
+
+
+(To be finalised against 2.4.) The destination is CPU visible and lives in system memory; the
+consumer (DWM's composition of a CPU-GDI redirection surface) reads it with the CPU; dxgkrnl therefore
+puts a CPU-access acquire (`Lock`, VidMm "begin CPU access") between consecutive GPU writes into it, and
+that acquire waits for the previous write's DMA packet to retire. On bare metal the packet retires a few
+tens of microseconds after the producer's frame; here the retire is a guest round trip (producer wait +
+PCIe copy + completion), so the app thread pays it every frame. Moving the same CPU-visible allocation
+into VRAM would not remove the acquire (the CPU still reads it, now through a write-combined BAR view at
+~200 MB/s, `kmd-rm-client.md` 5.2): the allocation must stop being CPU visible.
+
+## 5. Design
+
+### 5.1 Target picture
+
+```text
+app (NVK, VRAM back buffer) --Present(Blt)--> KMD Blt arm
+   --> CE channel: ACQUIRE producer sem; COPY VRAM->VRAM (~20 us); RELEASE completion   (GPU-ordered)
+   --> DMA fence retires on the CE completion, no CPU access anywhere
+redirection surface = GPU-only WDDM allocation, backed by KMD RM vidmem (LOCAL_USER), adopted as a
+   foreign resource (resid + layout trailer)
+DWM (NVK) opens it -> RM_RESOURCE_IMPORT -> samples VRAM directly (zero copy)
+CPU readers (PrintWindow, capture, GDI on the window) -> through the CPU-visible staging half or an
+   on-demand readback (5.6)
+```
+
+### 5.2 Getting Windows to make the redirection surface GPU-only (stage V1)
+
+Windows decides the redirection surface's type from the adapter's caps; the KMD cannot relabel a
+`CpuVisible` shadow surface after the fact, because dxgkrnl and DWM have already chosen the CPU path for it.
+The documented lever is `DXGK_VIDMMCAPS.NonCpuVisiblePrimary`. What CDD asks for with it set is not
+documented for an adapter without GDI acceleration, so V1 measures it:
+
+* knob `VidMmCapsX` (default 0): raw `DXGK_VIDMMCAPS` bits OR'd into the reported word, restricted to an
+  accepted mask (today only bit 9, `NonCpuVisiblePrimary`, 0x200); mirrors `VmCapsXEff`, `VmCapsXMsk`
+  (at StartDevice) and `VmCapsRep` (the word the caps query reported). Pure logic
+  `kmd_logic::vidmm_caps`, same shape as `FlipCapsX`.
+* destination census: the Blt arm's sampled Present trace already records the destination's identity
+  (`PBdStd` standard allocation type, `PBdGdi` GDI surface type, `PBdw`/`PBdh`, `PBdSto` storage class,
+  `PBdKnd`, `PBdst` resource id). V1 adds `PBdSys` next to them: 1 when the destination has system-backing
+  leases at that Present (VidMm holds it in system memory), 0 when it is in segment 2 (or untracked).
+  `vram-etw.ps1` dumps all of them (`kmd-before.txt`/`kmd-after.txt`). Together with the `StdN*`/`StdO*`
+  census they answer: which standard type Heaven's redirection surface is (13.6 Q1 of
+  `rm-backed-standard.md`), whether it is system-resident while frames are presented, and with
+  `VidMmCapsX=0x200`, whether Windows now asks for GDI `TEXTURE` (or another non-CPU-visible type) and
+  whether DWM opens it (`StdOpenPid`).
+
+Code (V1 as built): `kmd_logic/src/vidmm_caps.rs` (`resolve_vidmm_caps`, 5 tests),
+`kmd_render/src/adapter/mod.rs` (`AdapterKnobs::vidmm_caps_x`, `vidmm_caps`, the start mirrors),
+`kmd_render/src/ddi/query_adapter_info.rs` (`query_driver_caps`: the word goes through
+`vidmm_caps(base).reported`, mirrored `VmCapsRep`), `kmd_render/src/diag.rs` (knob name),
+`kmd_render/src/ddi/display.rs` (`PBdSys`). With the knob absent the reported word is byte-identical.
+
+Result (2.4): the second row of the table below: the destination stayed the STAGING surface. Next:
+5.4. Other documented levers, checked: `CrossAdaptCaps` cannot help (a cross-adapter resource is by
+definition aperture-only, CPU visible and write-combined, [DXGK_VIDMMCAPS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_vidmmcaps));
+the staging surface exists "when a direct bitblt to the primary surface is not possible", is then
+"locked and read by the CPU" ([D3DKMDT_STAGINGSURFACEDATA](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ns-d3dkmdt-_d3dkmdt_stagingsurfacedata)),
+and the redirection surface that a direct Blt can target is the GPU `TEXTURE` GDI surface, which CDD
+uses with GDI hardware acceleration (`SupportKernelModeCommandBuffer`,
+[GDI hardware acceleration](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gdi-hardware-acceleration)).
+That is the one documented switch left. Microsoft's feature-caps table lists GDI hardware
+acceleration as mandatory for full-graphics and render-only WDDM 1.2+ drivers
+([WDDM driver and feature caps](https://github.com/MicrosoftDocs/windows-driver-docs/blob/staging/windows-driver-docs-pr/display/wddm-driver-and-feature-caps.md)),
+so bare-metal vendor drivers set it and their redirection bitmaps are GDI `TEXTURE` surfaces. Two
+`DXGK_PRESENTATIONCAPS` bits are still untested middle steps: `DriverSupportsCddDwmInterop` ("does not
+support HW GDI acceleration but supports Cdd-Dwm interop") and `SupportSoftwareDeviceBitmaps`
+(`TEXTURE_CPUVISIBLE` redirection bitmaps: CPU visible, so most likely still locked). They belong in the
+fallback-A branch's `PresentationCaps` hook. The non-driver alternative, Windows' flip-model upgrade of
+windowed games (`SwapEffectUpgradeEnable`), was tried before and is gated by DXGI's game classification
+(`docs/HANDOFF.md`, "Tried").
+
+Expected outcomes and what each means:
+
+| with `VidMmCapsX=0x200` | meaning | next |
+|---|---|---|
+| Heaven's destination becomes a GDI `TEXTURE` (`PBdStd` 4, `PBdGdi` 1, `PBdSto` 1 optimal), `StdOGdiTex` grows with `StdOpenPid` = DWM | Windows composes the window from a GPU-only surface | V2-V4 as written |
+| the destination stays a shadow/staging buffer, nothing else changes | the cap does not reach redirection without GDI acceleration | 5.4 |
+| the desktop breaks (black GDI windows, `PBCpy` 0xE6 refusals: CDD now Blts from a CPU-visible staging source into GPU-only surfaces) | CDD expects Present Blts staging -> GPU surface | V2 adds that Blt (standard-buffer source), then retry |
+| the adapter fails to start | the cap is refused at this WDDM level | knob off; 5.4 |
+
+The knob is read at StartDevice; recovery is `VidMmCapsX` removed plus `pnputil /restart-device`.
+
+### 5.3 The memory: RM vidmem behind a GPU-only allocation (stages V2, V3)
+
+* **Backing.** In `build_backing`, the `KmdOptimalGdiTexture` arm (and any other non-CPU-visible type V1
+  names) gets a new first choice behind knob `RedirVram` (default 0): `rm_client::alloc_memory`
+  (`NV01_MEMORY_LOCAL_USER`, pitch-linear first, 128-byte aligned pitch as NVK authors it for imports,
+  64 KiB pages), exported and imported as a KMD_RM foreign resource (`rm_foreign::import_surface`), adopted
+  by the WDDM allocation with a LINEAR layout trailer (the allocation's private data grows to 128 bytes
+  for this arm: `PRIV_SIZE` per type, `rm-backed-standard.md` 0 item 8). Fallback on any refusal: today's
+  Venus OPTIMAL image, counted.
+* **Placement.** Not `CpuVisible`, not `Cached`. Which segment VidMm is told: the honest answer is a
+  memory segment backed by VRAM. Two ways:
+  1. **(preferred) a third segment, "RM VRAM"**: a memory segment, not CPU visible, no CPU host aperture,
+     `LocalBudgetGroup`, size = the host's `--vram-limit-mib` share. Its "pages" are addresses VidMm assigns
+     inside a range the KMD never maps; the real memory is the per-allocation RM object, and paging
+     operations on it are no-ops for content (the content lives in the RM object and nowhere else),
+     exactly like the Venus window segment's tracking allocations today. Must respect the "cpu-host segment
+     last" rule (`segment_table.rs`): it goes before segment 2, which renumbers segment 2 -> 3 and touches
+     every `MEMORY_SEGMENT_ID` user (`gpummu.rs`), so it is its own reviewed change.
+  2. **(first step, no new segment) the aperture only, `EvictionSegmentSet` empty, no CPU access**: what
+     the GDI texture arm already declares. VidMm then believes the allocation lives in system pages it
+     maps through the aperture, but nothing ever reads those pages (no CPU view, the GPU copy and DWM go to
+     the RM object). Paging must not copy content for it (`BAR_DEVICE_OP_SKIPS` already skips it). Risk:
+     VidMm's budget accounting charges system memory for VRAM; harmless at 6 MB per window.
+* **The copy (V3).** `ce_present::present_push` with the destination VA = the RM vidmem object mapped on
+  the CE channel's VA space (`ce_channel::gpu_map_with` with the vidmem kind and big pages, the path
+  `ce_dup` uses for NVK images), source = the producer's dup'd image as today, ACQUIRE the producer's
+  semaphore, RELEASE completion. The Present's DMA fence retires on the CE completion
+  (`complete_ce_blt` without a mirror and without a lease: the destination has no system backing). The
+  route's decision (`ce_route::decide`) gets a destination class "RM vidmem" in place of row 7's lease
+  check; everything else (the record, the `h_client` rule, strikes, deadlines, bystander discharge)
+  is unchanged.
+* **Dispatch before the producer's boundary.** With no CPU lock left, the Present can return as soon as
+  the copy is queued. The route still waits for the producer's boundary before submitting (15.1 of
+  `rm-copy-engine-present.md`); that wait is on the worker, not on the app thread, so it costs latency,
+  not throughput. Submitting at Present with the GPU acquire (`CeRtDirect`, 15.13) removes it once a stuck
+  acquire can be released.
+
+### 5.4 Fallback A: copy-only GDI acceleration on the copy engine
+
+If `NonCpuVisiblePrimary` alone does not move redirection to `TEXTURE`, the documented switch is GDI
+hardware acceleration (`SupportKernelModeCommandBuffer`): CDD then keeps redirection surfaces as GDI
+`TEXTURE` and sends the GDI operations as kernel-mode command buffers (`DxgkDdiRenderKm`; BitBlt,
+ColorFill, AlphaBlend, StretchBlt, TransparentBlt, ClearType). A driver can accept the subset it can do and
+CDD falls back to the CPU path for the rest per surface; the copies and fills map onto the copy engine
+(remap unit for formats, `rm-copy-engine-present.md` 12) and the rest stays CPU (on the staging half).
+This is a larger change (a RenderKm parser, a GDI command executor on the CE channel, the CPU fallback)
+and the earlier KMD CPU blitter was removed for reasons recorded in `query_adapter_info.rs`; it is the
+fallback, not the plan.
+
+### 5.5 Fallback B: a VRAM shadow behind the CPU-visible allocation
+
+If Windows keeps a CPU-visible redirection surface whatever the caps, the zero-copy part is lost but the
+lock can still be shortened: the copy engine writes the frame VRAM-to-VRAM into a KMD RM vidmem shadow
+that DWM on NVK imports, and the guest pages (the CPU view) are written lazily. This needs DWM to sample
+the shadow instead of uploading the CPU view, i.e. a UMD-side substitution in `dwm.exe` (the NVK DWM's
+upload of that window's content replaced by a GPU copy from the shadow's resid). It is fragile (it depends
+on how DWM's composition reads a CPU-GDI surface, not documented) and is written down only as the last
+resort.
+
+### 5.6 CPU and GDI readers of a GPU-only redirection surface
+
+With `NonCpuVisiblePrimary`, Windows itself owns the CPU half: GDI renders into CPU-visible staging and
+reaches the GPU-only surface through copies the KMD performs (Present Blts staging -> surface, which V2
+adds), and readers such as `PrintWindow`, window capture (Windows.Graphics.Capture, BitBlt from the window
+DC) and Desktop Duplication go through DWM or through a copy back into CPU-visible staging, which is the
+same Blt in the other direction (surface -> staging) on the copy engine. No lazy BAR view of VRAM is
+needed or wanted (WC reads at ~200 MB/s). The KMD's `MapCpuHostAperture` must refuse an RM vidmem
+allocation loudly (counted) rather than map anything, which is what it does for a non-CPU-visible
+allocation already.
+
+### 5.7 How DWM reads it, and the earlier "DWM opens no KMD-made surfaces" finding
+
+The census (340.1) found DWM opening no KMD standard allocation, because the redirection surface was
+CPU-visible and DWM's composition reads such surfaces through dxgkrnl's CPU view. With a GPU-only
+redirection surface Windows has no CPU view to give DWM, so DWM must open it as a shared texture
+(`D3DKMDT_GDISURFACE_TEXTURE`: "created as a shared surface... used as a texture during DWM composition").
+On an NVK DWM that open goes through the Helios UMD's `OpenResource`; the KMD's foreign identity and
+layout trailer make `nvk_can_open` true and NVK imports the RM object by resource id
+(`RM_RESOURCE_IMPORT`). A Venus DWM (`DwmIcd=venus`) cannot import RM vidmem: with `RedirVram` on, the
+KMD keeps the Venus OPTIMAL image for a process that is not on NVK (the creator is the app, so the
+decision is made at the first open by a Venus device: refuse and fall back to a placeholder until the
+next window creation, counted), or `RedirVram` simply requires `DwmIcd=nvk`.
+
+### 5.8 Risks
+
+| risk | where it bites | mitigation |
+|---|---|---|
+| Windows ignores `NonCpuVisiblePrimary` without GDI acceleration | V1 | measured first; 5.4 |
+| CDD with the cap needs Present Blts from CPU-visible staging into GPU surfaces the KMD refuses (0xE6) | desktop black in V1 | V2 adds the arm; V1 is opt-in and recovers with a device restart |
+| residency/eviction: VidMm evicts the allocation (budget pressure) and asks for a paging transfer of a surface whose content lives only in RM | V2 | segment choice 5.3; paging content ops skip it (as for the GDI texture today); eviction leaves the RM object alive, page-in is a no-op |
+| VRAM budget | many windows (6 MB at 1600x900, 29 MB at 5120x1440) under the host's `--vram-limit-mib` | count `RvBytes`; refuse above a cap and fall back to the Venus image |
+| multi-monitor | redirection surfaces of windows spanning outputs | unchanged: one surface per window, the output does not matter |
+| DWM restart | DWM's imports die with it; the allocation is the app's | the foreign record's lifetime rules (`shared-foreign-surfaces.md` 3, 6.1) already cover an opener's death |
+| device restart / TDR | RM objects of the generation go | `rm_client::forget` sweep; allocations re-created by dxgkrnl after the reset; `RedirVram` refuses until the client is up |
+| GDI `EXISTINGSYSMEM` surfaces under GDI acceleration | the KMD backs them with its own standard buffer instead of the caller's pages, so GDI operations would read and write the wrong bytes | if the census (`StdNGdiSys`) shows them once `GdiAccel` is on: back them with the caller's pages (the allocation arm, this branch) |
+| security | a GPU-only window surface reachable by `RM_DUP_OBJECT` | `NvDupHarden` (the route's `h_client` rule applies to the producer side; the destination is KMD-owned and never handed out as an RM handle, only as a resid to authorized openers) |
+
+### 5.9 V2-V5 as built (`RedirVram`, default 0)
+
+| piece | file | what |
+|---|---|---|
+| pure rules | `kmd_logic/src/rm_vidmem.rs` | knob, route (only `KmdOptimalGdiTexture`), layout (the ring surfaces' pitch-linear geometry, `rm_client::surface_layout`), RM's answer (`adopt`), the foreign layout, a 1 GiB budget, the channel map table (`MapBook`, keyed by resource id, stale on destroy), fixed handles and VA windows in the channel's client, `vram_copy` / `bounce_copy` plans, the counter list and its writer scan; 11 tests |
+| allocation service | `kmd_render/src/virtio/rm_client/vidmem.rs` | its own RM client (level 5's bring-up machine and slot table `rm_sysmem::Svc`), `RM_ALLOC` of `NV01_MEMORY_LOCAL_USER`, export, `GEM_IMPORT_NVKMS`, an `RM_EXPORT` resource WITHOUT `USE_MAPPABLE` (`sysmem::import_resource_flags`), adoption by the WDDM allocation as a KMD_RM foreign resource with a LINEAR layout; `lookup`, `released` (route and channel forget it first, then GEM close and free), `forget` |
+| allocation hook | `ddi/create_allocation.rs` | `GetStandardAllocationDriverData` reports 128 bytes of private data for a GDI `TEXTURE` when the knob is on (room for the layout trailer DWM's NVK opener needs, zeroed); `build_backing`'s GDI texture arm asks `vidmem::try_create` first, else today's Venus image |
+| channel side | `kmd_render/src/virtio/rm_client/ce_vram.rs` | `ce_surface` (dup from the service's client into the channel's client, map at a fixed window, big pages then system flags), `copy` (VRAM to VRAM, no producer), `wait`, `transfer` (CPU bytes to or from a rectangle through the bounce buffer: RM system memory of the channel's client, CPU-mapped cached, GPU-mapped), teardown hooks in `ce_channel`/`ce_route` |
+| generic submit | `ce_channel::submit_build`, `submit_copy` | a push the caller builds, ending with the completion release it is handed; a copy with no producer (acquire of the channel's own page at 0) |
+| route | `ddi/ce_present_route.rs` | `try_route_vram`: the decision with `vram_destination_facts` (a VRAM object of the Blt's extent and pitch that fits a window) instead of the lease rule; the destination record's "descriptor" is its `ce_vram` mapping (no leases, no pin, no OS descriptor); the Venus fallback is the copy into the foreign-imported image if Venus imports it, else a submission with no command (`PreparedPresentBltSubmission::none`: the request terminalizes failed, the previous frame stays); `queue_async_blt` accepts an image destination only when it is a VRAM object; `vram_destination_gone` |
+| Present | `ddi/vram_redirect.rs`, hook in `display.rs` | every Blt with a VRAM surface on either side, before any descriptor: NVK source -> VRAM (the route, `PBCpy` 7), VRAM -> VRAM (one CE copy, waited), standard buffer -> VRAM (upload of the buffer's authoritative CPU view, `read_standard_buffer`), VRAM -> standard buffer (readback into the blob and its system pages, `write_standard_buffer`); anything else a counted skip (`PBCpy` 8, `RvBltSkip`, `RvBltWhy`) |
+
+Counters (`rm_vidmem::COUNTERS`, all `Rv*`): service `RvKnob RvTry RvOk RvVenus RvWhy RvStage RvFail
+RvState RvLive RvBytes(MiB) RvFreed RvBring RvMs RvMsMax RvSoft RvLeak`; channel `RvMapOk RvMapFail
+RvMapStat RvMapLive RvMapGive RvXfer RvXferFail RvXferWhy RvXferUs RvXferMax RvCopy RvCopyFail`; Present
+`RvBltSeen RvBltRoute RvBltSkip RvBltWhy RvRdBack RvUpload RvGdiFail`. The route's `CeRt*` count the VRAM
+Blts with the others. `RvBltWhy`: 1 route refused, 2 no foreign source (`ForeignCopy` 0), 3 no destination
+descriptor, 4 format, 5 rectangle (stretch), 6 channel busy or down, 7 copy, 8 read, 9 write, 10 memory,
+11 unknown source.
+
+First hardware run (357.1, with fallback A's `GdiAccel`): GDI `TEXTURE` surfaces are created and
+VRAM-backed (1920x1080: `StdNGdiTex` 8, `RvTry` 19 / `RvOk` 11; 5120x1440: 25 / 16), no crash. The
+misses were all `RvWhy` 6 (Extent): the layout used the scanout's minimum of 64 pixels, so the small
+textures (tooltips, the cursor, narrow windows) went to Venus. Fixed: the foreign record's extents
+(1..=16384). Opens of a VRAM surface are now counted: `RvOpen`, `RvOpenFg` (served as FOREIGN),
+`RvOpenLay` (the layout record reached the opener), `RvOpenPid` (DWM's pid = DWM opened it); with the
+foreign table's `FgOpen`, `FgRiOk`/`FgRiErr`/`FgRiRef` (DWM's NVK import by id) and the census's
+`StdOGdiTex`/`StdOpenPid`. The UMD no longer treats a VRAM GDI texture as a Venus cross-context image
+when its open carries the foreign layout (`umd/src/forward/resource.rs`), so DWM's NVK takes the import.
+
+359.1 (with fallback A): the chain works end to end (`RvTry` = `RvOk`, `FgRiOk` 136, `RvXfer` 275
+without a failure, 68 CE fills), but staging <-> VRAM blits went through the bounce on the CPU (185
+`GdiFall`, `GdiUsMax` 105 ms). Added `ddi/ce_sysmem.rs`: `with_standard(passive, adapter, resource_id,
+pitch, width, height, |s: &CeSurface| ..)` maps a CPU-visible standard buffer's SYSTEM PAGES on the CE
+(an OS descriptor over its leases, the route's page-run rules, its own 8 slots: handles
+`H_BASE+0x140..`, windows 64..72), under the content transaction, so a staging <-> VRAM BitBlt is one CE
+copy (`ce_vram::copy` with this surface on one side, waited inside the closure). Refused (`NOT_SYSTEM`)
+while the buffer is in segment 2 (no leases) or its system copy is stale: then the bounce path.
+Descriptors are cached per resource and freed before any lease change (the `guest_blob` paging hooks),
+at destroy, at the channel's teardown; an unconfirmed free leaks the pin until the generation ends.
+Counters `RvSysMade RvSysHit RvSysRefuse RvSysWhy RvSysFreed RvSysLeak RvSysObj`.
+
+360.1: every `with_standard` call was refused (`GdiSysRef` 136) and no `RvSys*` value was written (the
+refusal path returned before the publish; fixed: published on every call). The cause: CDD's GDI staging
+buffers sit in segment 2 (the Venus window), so they have no system-page leases (the KMD takes leases
+only on an eviction transfer; an aperture-only placement would not create any either: an allocation
+placed in system memory from the start is never transferred). Fix: under `RedirVram`, a
+`STAGING_CPUVISIBLE` GDI buffer is CACHED RM system memory from the level 5 service
+(`sysmem::try_create_standard`, adopted as a KMD_RM foreign resource, `PresentLinearBuffer` paging);
+in segment 2 its CPU view is that memory (the CPU host aperture maps its `RM_EXPORT` blob) and
+`with_standard` maps the RM object itself on the CE (`ce_vram::ce_object_va`, `RvSysObj`); in system
+pages it uses the OS descriptor over the leases as before. The level 5 counters (`RmSysTry`, `RmSysOk`,
+`RmSysVenus`, `RmSysWhy`, `RmSysTrial`, `RmSysMis`) count these creations.
+
+361.1 (1920x1080@240, `RedirVram` 1 + G1): staging works: `GdiSysCe` 212, `GdiSysRef` 2 (360.1:
+136/136 refused), `RvSysObj` 212, `RmSysTrial` 4, `RmSysTrialF` 0, `RmSysMis` 0. `RvSysMade`/`RvSysHit`
+0 is expected: they count only the OS-descriptor path over system-page leases, and every call found
+its staging buffer in segment 2 (served by its RM object, `RvSysObj`). 2 of 6 staging creations fell
+back to Venus with `RmSysWhy` 10 (Extent): the level 5 layout used the scanout's 64-pixel minimum.
+Fixed: a staging buffer uses `rm_sysmem::layout_standard` (the foreign record's 1..=16384).
+362.1: the extent refusals are gone; 2 of 6 still fell back with `RmSysWhy` 9 (Format): GDI staging
+buffers whose D3DDDIFORMAT has no DXGI name (or is `A8B8G8R8`) carry the legacy zero hint. Their pitch
+is authored as `width * 4` regardless, so `layout_standard` now records them as `XRGB8888` bytes
+(nothing imports a staging buffer as an image; the copy engine copies bytes).
+
+Foreign NVK images as GDI sources (362.1: 14-15 GDI commands per session read a UMD optimal image
+with a foreign layout, 1908x910, dropped): `ce_vram::foreign_source(passive, adapter, resid)` and
+`ce_vram::foreign_copy(&src, src_rect, &dst, x, y, dst_fourcc)`. With a record the route validated for
+that image at a Present (`ce_present_route::source_record`, the latest per source, the `h_client` rule
+re-checked), the producer's own objects are used (`ce_dup`) and the copy ACQUIREs its semaphore.
+Without one, the KMD imports the image by resource id into the channel's client (the host's
+`RmResourceImport` into the channel's DRM file under `authorize_kmd`, `GEM_EXPORT_NVKMS`,
+`OS_UNIX_IMPORT_OBJECT_FROM_FD`: NVK's own route) and maps it with the modifier's page kind; no acquire
+(the image is copied as it is in memory). Any rectangle: pitch-linear by address, block-linear by the
+copy's source origin. Counters `RvFgnRec`, `RvFgnImp`, `RvFgnFail`, `RvFgnWhy`. The KMD's imports do
+not count in `FgRi*`. Found on the way: the route added the source plan's offset twice
+(`ce_dup`'s VA already has it); harmless for NVK's offset-0 images, fixed.
+
+The CPU helpers (`read_standard_buffer`, `write_standard_buffer`, the GDI executor's fallback) now
+reuse up to 4 kernel views of a blob (keyed by resource id, window GPA, size and the host's cache
+attribute, re-checked with `map_blob_prepare` on every call) instead of mapping and unmapping the whole
+blob each time; the views are released at StopDevice and StartDevice. Counters per call: `RvCpuMapUs`,
+`RvCpuCpyUs`, `RvCpuKB`, `RvCpuCache` (1 cached, 2 uncached, 3 WC; any other value is mapped UNCACHED,
+which alone would explain ~200 MB/s), `RvCpuHit`, `RvCpuView` (1 leases, 2 blob). Staging -> staging
+between RM-backed buffers should not reach the CPU at all any more (`with_standard_pair`).
+
+After the 364.1 guest hang (windowed Heaven, `RedirVram` 1 + G1), every new path got a bounded wait
+and a switch (`RvOff`, a bit mask read at StartDevice, mirrored `RvOffEff`; a set bit turns the path
+off and its caller takes the fallback):
+
+| bit | path |
+|---|---|
+| 0x1 | `ce_vram::foreign_source` (both the record and the import path) |
+| 0x2 | its import-by-resource-id path only |
+| 0x8 | `ce_sysmem::with_standard_pair` |
+| 0x10 | `ce_sysmem::with_standard` and the pair (GDI staging copies on the CPU) |
+| 0x40 | GDI staging buffers from RM system memory (`sysmem::try_create_standard`) |
+| 0x80 | the Present hook (`ddi/vram_redirect.rs`): every Blt with a VRAM surface is a counted skip |
+| 0x100 | OPT-IN: a foreign copy from a record acquires the producer's semaphore |
+| 0x200 | OPT-IN: the CPU helpers reuse blob views |
+| 0x400 | GDI lookup tables (`LOOKUPTABLE`, CDD's ClearType gamma table) stay Venus blobs; with it clear they come from RM system memory like the staging buffers, so the staging-to-table upload runs on the copy engine (370.1 `GdiSysCpuT` 0x00440142: 10-17 ms on the CPU) |
+| 0x800 | a new VRAM surface is not cleared at its first copy-engine mapping (A/B for the clear; `RvClrSkip` counts). With it clear, the clear runs exactly once, inside the mapping, before the VA is handed out on any path; a clear that does not complete fails that mapping (`RvClrFail`) instead of being retried at a later one, where it would wipe what was drawn |
+| 0x1000 | an NVK frame into a VRAM window surface takes the synchronous copy in the Present instead of the copy-engine route. The route is the default since 384.1 (429 fps against the synchronous copy's 434 at 1080p, every frame routed, the completions retired by the HPD worker's short spin); until then this bit opted INTO the route (382.1: 89 fps before the spin) |
+| 0x2000 | DIAGNOSTIC: new VRAM surfaces are cleared to opaque magenta instead of 0: whatever DWM composes from a surface no path ever wrote shows magenta (`RvPg*` count VidMm's paging content operations on VRAM surfaces) |
+| 0x4000 | turns OFF the default (since 390.1) placement of CDD's CPU-written GDI surfaces (`STAGING_CPUVISIBLE`, `LOOKUPTABLE`) in the aperture segment only (CpuVisible, Cached, no RM or BAR backing), as the GDI surface type requires ("linear, in a cache-coherent GPU aperture segment"). The KMD records the system pages `UPDATE_PAGE_TABLE` maps them to; `read_standard_buffer` / `write_standard_buffer` serve those surfaces from these pages, and the copy engine views them through an OS descriptor over the same pages, remade when they change (`ddi/aperture_pages.rs`, `RvAp*`, `RvSysApV`). 388.1: CDD's staging buffer read all zero from the blob while win32k drew into its system pages, and Explorer's file list and the wallpaper composed black; 390.1 with the placement: both render. Until 390.1 this bit opted in |
+
+Two defaults changed with it: the record path's semaphore ACQUIRE is now opt-in (a record's value is
+not guaranteed to be released again, e.g. after a swap chain is recreated, and an acquire that never
+releases holds the copy engine for every user), and the CPU view reuse is opt-in (a view kept after its
+blob left that window range is a cached alias of whatever the host maps there next; reused views are
+also dropped at every paging change and destroy of their buffer). `ce_vram::wait` now marks the channel
+broken when a copy of the KMD's own does not complete in time (`RvWaitTmo`): nothing more is submitted,
+and the route's worker tears the channel down (bounded) and discharges what queued behind it. The waits
+of the other paths were already bounded: RM I/O by `IO_MS` (2 s) per call inside a bounded section, the
+channel I/O by 250 ms, the copies by `XFER_MS` (250 ms); the content transaction is held only around one
+command's resolve, copies and waits.
+
+364.1 hang, root cause (NMI dump, stacks through the build's map): a SELF-DEADLOCK on `ce_vram`'s map
+table spinlock. `foreign_source` read the table in a `match` scrutinee (`match BOOK.lock()...find()`),
+which keeps the guard alive across the arms; the `None` arm (a foreign image not mapped yet, the
+import path) called `with_io` -> `give_back_stale` -> the same spinlock on the same CPU at DISPATCH,
+which spun forever (another CPU then waited on it for a generic DPC and the guest wedged).
+`import_foreign` had the same shape with a re-lock in an arm, and two bounce paths held the table
+across RM frees at DISPATCH. Fixed: every guard is taken in its own statement and never held across
+I/O or a call back into the file; all access goes through `book()`, which tags the owning thread and
+answers a re-entry with a refusal (`REENTRY`, counted in `RvBookReent`) instead of spinning.
+
+367.1 showed CDD BitBlts INTO the app's NVK image too (`GdiFgnDrop` 6, SRCCOPY with the foreign image
+as destination). `ce_vram::foreign_write(&src, src_rect, src_fourcc, &dst_foreign, x, y)` is the write
+direction: the same `ForeignSource` (record or import), a pitch-linear source, the image as destination
+(pitch by address, block-linear by the copy's destination origin, `ce_present::copy_push`), R/B remap,
+counted in `RvFgnWrite`. Ordering: no acquire by default (opt-in `RvOff` 0x100 waits for the app's frame
+before GDI writes over it); the GDI side waits for the copy before it completes the command, so the
+app's later submissions follow it on the CPU timeline. An app rendering into the same image at that
+moment races the write, as unflushed GDI-on-D3D does on bare metal.
+
+Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
+flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
+DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
+Present thread (bounded by `XFER_MS` 250 ms plus `IO_MS` 2 s of RM I/O for the first bounce allocation);
+sub-rectangles (`pDstSubRects`) are covered by copying the whole `DstRect`.
+
+## 6. Staged plan and knobs
+
+| stage | what | knob (default) | pass |
+|---|---|---|---|
+| V0 | phase 1 ETW capture (built) | none | 2.3 criteria; 2.4 filled |
+| V1 | `VidMmCapsX` + `PBdSys` (built here) | `VidMmCapsX` (0) | table in 5.2 answered |
+| V2 | RM vidmem backing for GDI `TEXTURE` (built, 5.9); Blt staging <-> surface on the CE (built: upload/readback) | `RedirVram` (0) | windows draw, `RvOk` = textures, `RvVenus` 0, DWM imports (`FgRiOk`) |
+| V3 | the redirected Blt VRAM->VRAM on the CE route (built) | `RmCopyEngine=1` + `RedirVram=1` + `ForeignCopy=1` | `RvBltRoute` = Blts, `CeRtDone` grows, PresentMon `msInPresentAPI` < 0.2 ms, no Lock on the surface in the ETW capture |
+| V4 | submit at Present with the GPU acquire (no worker hop) | `CeRtDirect` | stage timing: present -> CE done < 300 µs |
+| V5 | soak, restart-device, DWM restart, multi-window, then defaults | | 10 min stress clean; `RvLeak` 0 |
+
+## 7. Test recipe (V1)
+
+1. Install the build, then in the guest:
+   `reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v VidMmCapsX /t REG_DWORD /d 0x200 /f`
+   and restart the device (`blrow.sh`-style: knob, `pnputil /restart-device`, DWM and shell restart).
+2. Read `VmCapsRep` (must have bit 9: 0x268 with `CrossAdaptCaps` off, 0x278 with it on), `VmCapsXMsk` 0,
+   `StdN*`, `StdO*`, `StdOpenPid`, `PBdStd`, `PBdGdi`, `PBdw`, `PBdh`, `PBdSto`, `PBdSys` before and after
+   starting windowed Heaven (`hvwin.sh`). `PBd*` are sampled: read them after 10 s of Heaven.
+3. Screenshot the desktop (`shot.ps1`): GDI windows (Explorer, Notepad) and Heaven drawn?
+4. ETW capture as in 2.2 with label `hv-ncvp`.
+5. Remove the knob, restart the device; the same counters with the knob absent are the baseline row.
+
+## 7b. Test recipe (V2-V5, one package)
+
+Only meaningful once Windows hands out GDI `TEXTURE` redirection surfaces, i.e. with fallback A's
+`GdiAccel` (its own recipe); before that `RvTry` stays 0 and nothing changes (a cheap regression row).
+
+1. Knobs: `RedirVram=1`, `RmCopyEngine=1`, `CeRtDirect=1`, `ForeignCopy=1`, `BltAsync=1`, `NvDupHarden` its
+   default; `HKLM\SOFTWARE\Helios DwmIcd=nvk`; restart the device (`blrow.sh` pattern), then DWM and the shell.
+2. Read `RvKnob` 1, `RvState` (phase 2 = up once a texture was made), `RvTry`/`RvOk`/`RvVenus`/`RvWhy`/`RvFail`.
+3. Desktop: Explorer, Notepad, a GDI-heavy window drawn (upload: `RvUpload` grows, `RvGdiFail` 0).
+4. Windowed Heaven: `RvBltRoute` and `CeRtDone` grow per frame, `RvBltSkip` flat, `PBCpy` 7;
+   PresentMon `msInPresentAPI`; ETW capture `hv-vram` (no Lock on the destination).
+5. CPU readers: Alt+PrintScreen of Heaven's window, Snipping Tool window capture, a PrintWindow tool:
+   `RvRdBack` grows, the image is the frame.
+6. Teardown: close Heaven (`RvFreed` grows, `RvLive` back), `taskkill dwm` (DWM restarts, windows redraw),
+   restart the device with windows open (`RvLeak` 0).
+7. Off row: `RedirVram` removed, restart: `RvTry` 0, everything as before.
+
+## 8. Shared surface for fallback A (copy-only GDI acceleration)
+
+Agreed with the fallback-A branch (`feat/vram-redirection-gdi-accel`): it consumes
+`ce_vram::{CeSurface, ce_surface, ce_surface_cached, wait, transfer, copy, Dir}`, keyed by the
+allocation's host resource id (`present_alloc_info(..).resource_id`), and
+`ce_channel::{submit_build, submit_copy, SubmitError, poll}`; `build_paging_buffer::{read_standard_buffer,
+write_standard_buffer}` for CPU-visible GDI surfaces. GDI `TEXTURE` is RM video memory only with
+`RedirVram=1`. Every remapped CE launch programs its own remap state. This branch owns `ce_channel.rs`,
+`create_allocation.rs`, `display.rs`, `ce_present_route.rs` and the new modules; fallback A owns its
+`gdi_accel`/`gdi_exec` files and the RenderKm hooks.
+
+## 9. Sources
+
+Microsoft Learn: [DXGI flip model](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-flip-model),
+[Comparing Direct2D and GDI](https://learn.microsoft.com/en-us/windows/win32/direct2d/comparing-direct2d-and-gdi),
+[D3DKMDT_GDISURFACETYPE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ne-d3dkmdt-_d3dkmdt_gdisurfacetype),
+[GDI hardware acceleration](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gdi-hardware-acceleration),
+[DXGK_VIDMMCAPS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_vidmmcaps),
+[D3DDDICB_LOCKFLAGS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dukmdt/ns-d3dukmdt-_d3dddicb_lockflags),
+[GPU segments](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-segments),
+[CPU host aperture](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/cpu-host-aperature),
+[DXGK_SEGMENTFLAGS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_segmentflags),
+[D3DKMT_PRESENT_MODEL](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmthk/ne-d3dkmthk-_d3dkmt_present_model),
+[GPU paravirtualization](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-paravirtualization).
+Other drivers: [VirtualBox VBoxMPWddm.cpp](https://github.com/VirtualBox/virtualbox/blob/main/src/VBox/Additions/win/Graphics/Video/mp/wddm/VBoxMPWddm.cpp),
+[viogpu3d (kvm-guest-drivers-windows PR 943)](https://github.com/virtio-win/kvm-guest-drivers-windows/pull/943),
+[WSL dxgkrnl](https://github.com/microsoft/WSL2-Linux-Kernel/tree/linux-msft-wsl-6.18.y/drivers/hv/dxgkrnl).
+ETW layouts: [Windows 11 26H1 DxgKrnl manifest (Windows10EtwEvents)](https://github.com/jdu2600/Windows10EtwEvents/blob/master/manifest/Microsoft-Windows-DxgKrnl.tsv);
+PresentMon's present-mode rules: [PresentMonTraceConsumer.cpp](https://github.com/GameTechDev/PresentMon/blob/main/PresentData/PresentMonTraceConsumer.cpp).
+
+## 10. Fallback A as built: GDI acceleration on the copy engine (`GdiAccel`, default 0)
+
+Status: G0 (caps + RenderKm census) and G1 (executor + fence gate) built on
+`feat/vram-redirection-gdi-accel`, host-tested where pure (`kmd_logic::gdi_accel`, 17 tests), type-checked
+against the stub WDK, never compiled against the real WDK and never run. V1 was negative on hardware
+(`PBdStd` 3, `StdNGdiTex` 0 with `VidMmCapsX=0x200`), so this is the main path to a GPU-resident
+redirection surface.
+
+### 10.1 What Windows requires (research)
+
+| item | mandatory? | source |
+|---|---|---|
+| `DXGK_PRESENTATIONCAPS.SupportKernelModeCommandBuffer` | the opt-in; "a required feature starting with WDDM 1.1" for full-graphics and render-only drivers in Microsoft's feature-caps table (certification), but not enforced at load: this KMD loads with it clear (22.22.180.0 A/B) | [GDI Hardware Acceleration](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gdi-hardware-acceleration), [WDDM driver and feature caps](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/wddm-driver-and-feature-caps), [DXGK_PRESENTATIONCAPS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_presentationcaps) |
+| a cache-coherent aperture segment | precondition ("report this support only if the cache-coherent GPU aperture segment exists"); segment 1 is one | same |
+| `DxgkDdiCreateAllocation`, `DxgkDdiGetStandardAllocationDriverData` (GDI surface types `TEXTURE`, `STAGING_CPUVISIBLE`, `STAGING`, `LOOKUPTABLE`, `EXISTINGSYSMEM`; Pitch returned for the CPU-visible ones) | mandatory | [Setting the Size and Pitch](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/setting-the-size-and-pitch-of-the-memory-allocation), [D3DKMDT_GDISURFACETYPE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ne-d3dkmdt-_d3dkmdt_gdisurfacetype) |
+| `DxgkDdiRenderKm` in `DRIVER_INITIALIZATION_DATA`; the GDI device/context (`GdiDevice`, `GdiContext` flags) | mandatory | [Initialization and DMA Buffer Creation](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/initialization-and-dma-buffer-creation), [DxgkDdiRenderKm](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_renderkm) |
+| translate the WHOLE command buffer: BitBlt (1), ColorFill (2), AlphaBlend (3), StretchBlt (4), TransparentBlt (6), ClearTypeBlend (7); Escape (5) ignored | mandatory: the return codes have no per-operation decline | [Specifying GDI Hardware-Accelerated Rendering Operations](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/specifying-gdi-hardware-accelerated-rendering-operations), the `DXGK_GDIARG_*` pages |
+| the output patch-location list with every allocation reference | mandatory | DxgkDdiRenderKm remarks |
+| `NoSameBitmap*`, `NoSameBitmapOverlapped*`, `NoScreenToScreenBlt`, `NoOverlapScreenBlt` | optional declines (dxgkrnl "will not request") | DXGK_PRESENTATIONCAPS |
+| `SupportAllBltRops`, `SupportMirrorStretchBlt`, `SupportMonoStretchBltModes` | optional; clear = CDD sends only the named ROPs, no mirror, no BLACKONWHITE/WHITEONBLACK | same, `DXGK_GDIARG_BITBLT`, `DXGK_GDIARG_STRETCHBLT` |
+| `AlignmentShift` (>= 2), `MaxTextureWidthShift`/`HeightShift` | required fields | DXGK_PRESENTATIONCAPS |
+| present CDD operations into DWM's UMD-created textures | implied by GDI acceleration (`DriverSupportsCddDwmInterop` is then ignored) | DXGK_PRESENTATIONCAPS |
+
+Public drivers: none implements RenderKm. VirtualBox's WDDM driver reports `NoScreenToScreenBlt |
+NoOverlapScreenBlt | AlignmentShift 2 | MaxTexture*Shift 2` without `SupportKernelModeCommandBuffer` and
+leaves its GDI surface case commented out
+([VBoxMPWddm.cpp](https://github.com/VirtualBox/virtualbox/blob/main/src/VBox/Additions/win/Graphics/Video/mp/wddm/VBoxMPWddm.cpp));
+viogpu3d registers no RenderKm and reports `PresentationCaps` 0
+([viogpu_adapter.cpp](https://github.com/max8rr8/kvm-guest-drivers-windows/blob/viogpu3d/viogpu/viogpu3d/viogpu_adapter.cpp));
+Microsoft's render-only sample driver sets it FALSE and stubs RenderKm
+([graphics-driver-samples, RosKmd](https://github.com/microsoft/graphics-driver-samples)); the KMDOD sample
+is display-only. The operation semantics this executor implements come from the Learn pages alone
+(the formulas of `DXGK_GDIARG_ALPHABLEND`, `_TRANSPARENTBLT`, `_STRETCHBLT`, `_CLEARTYPEBLEND`,
+`_BITBLT`). The fill words follow Mesa NVK's `nvk_cmd_fill_memory_ce` (remap `CONST_A`,
+[nvk_cmd_copy.c](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/nouveau/vulkan/nvk_cmd_copy.c)).
+PresentMon's "Composed: Copy with GPU GDI" is a Blt with `bRedirectedPresent` 0 followed by
+PresentHistory model `REDIRECTED_BLT`, independent of these caps
+([PresentMonTraceConsumer.cpp](https://github.com/GameTechDev/PresentMon/blob/main/PresentData/PresentMonTraceConsumer.cpp)).
+
+### 10.2 The caps word
+
+`GdiAccel=1` reports `0x0A06C8FC` (`kmd_logic::gdi_accel::ACCEL_CAPS`; bit positions from the C bitfield
+order of WDK 10.0.26100.0 `d3dkmddi.h`, NOT the Learn page's "Nth bit" sentences, which are wrong after the
+4-bit `AlignmentShift`): `SupportKernelModeCommandBuffer` (bit 2), `NoSameBitmapAlphaBlend`,
+`NoSameBitmapStretchBlt`, `NoSameBitmapTransparentBlt`, `NoSameBitmapOverlappedAlphaBlend`,
+`NoSameBitmapOverlappedStretchBlt` (3-7), `AlignmentShift` 2 (10-13), `MaxTextureWidthShift` and
+`MaxTextureHeightShift` 3 = 16384 (14-16, 17-19), `NoSameBitmapOverlappedBitBlt` (25: a scroll goes back to
+CDD; a disjoint copy inside one surface stays ours), `NoTempSurfaceForClearTypeBlend` (27). Clear:
+`SupportAllBltRops`, mirror, mono modes, `NoScreenToScreenBlt`/`NoOverlapScreenBlt` (the Present path is
+unchanged), the reserved bits. `GdiAccel=2` reports only `DriverSupportsCddDwmInterop` (0x100) and
+`GdiAccel=3` only `SupportSoftwareDeviceBitmaps` (0x10000000): one-bit experiments without GDI
+acceleration (RenderKm stays the pass-through; `GdiKnob`/`GdiCaps` mirror the word). Knob absent or any
+other value: 0, as before.
+
+### 10.3 The pieces
+
+| piece | file | what |
+|---|---|---|
+| pure rules | `kmd_logic/src/gdi_accel.rs` | caps; the `DXGK_RENDERKM_COMMAND` reader (x64 offsets checked against a C compile of the header's declarations; refusals `Bad`: size, opcode, sub-rects, trailer); `plan` (engine and `Why`); the CE words of a fill (`SET_REMAP_CONST_A/B/COMPONENTS` = `CONST_A` x4, `COMPONENT_SIZE_FOUR`, one component; `LAUNCH_DMA` with `REMAP_ENABLE`, pitch, multi-line, non-pipelined) and of a rectangle copy (`ce_present::copy`, `Remap::None`); the CPU reference executor (ROP3, the named ROPs, AlphaBlend premultiplied `AC_SRC_OVER`, TransparentBlt, StretchBlt with the truncate mapping and mirroring, ClearTypeBlend with and without the gamma table); the private record `"HGDA"`; the timeline |
+| caps, RenderKm and RenderGdi | `kmd_render/src/ddi/gdi_accel.rs` | `reported_caps` (query_adapter_info), `note_start` (AdapterKnobs at StartDevice), `note_create_device`/`note_create_context` (census), `render_km` and `render_gdi` (GpuMmu adapters get RenderGdi), both into `translate`: parse, resolve each allocation index through `present_alloc_info` and classify it (VRAM: `vidmem::lookup`; System: a `PitchedStandardBuffer`; else Unreachable), plan, materialise and clip sub-rectangles (inline from the command buffer, or copied from dxgkrnl's kernel pointer), patch list, clear the private data and write the job id, 16-byte DMA marker |
+| executor | `kmd_render/src/ddi/gdi_exec.rs` | job table (`commit`, orphans above 256 unclaimed), `admit` at SubmitCommand, `seq_ready` for the fence, `service` on the HPD worker, `discharge_all` at StopDevice |
+| seam | `kmd_render/src/ddi/gdi_ce_glue.rs` | the only calls into the V2-V5 modules (section 8): `vidmem::lookup`, `ce_vram::{ce_surface, wait, transfer}`, `ce_channel::submit_build`, `read/write_standard_buffer`; a busy channel retried 4 x 1 ms |
+| fence gate | `virtio/gpu/mod.rs` | `WddmPending::gdi_seq`: the immediate-signal path and the FIFO head both wait for `seq_ready`; not rebasable |
+| hooks | `submit_command.rs` (RenderKm body, both SubmitCommand entry points), `hpd.rs`, `lifecycle.rs`, `query_adapter_info.rs`, `adapter/mod.rs`, `diag.rs` | one relaxed load each with the knob off |
+
+### 10.4 A GDI command's path
+
+1. CDD -> `DxgkDdiRenderKm` (PASSIVE): the buffer becomes job N (commands, surfaces, engine, clipped
+   sub-rectangles); `pDmaBufferPrivateData[0..16]` = `"HGDA"`, version 1, N (the rest of the 112 bytes
+   zeroed: a recycled buffer's stale `"HPBL"` Present prefix would otherwise gate this fence on an old copy).
+2. `DxgkDdiSubmitCommand` (DISPATCH): `admit(N)`: first time, the next sequence S and a worker wake; a
+   preempted replay, the same S; N already executed and gone, no wait. The WDDM entry carries `gdi_seq` S.
+3. HPD worker: jobs in S order. Engine `Ce` (SRCCOPY BitBlt, PATCOPY ColorFill, every surface VRAM): one
+   push per 10-11 rectangles through `submit_build`, waited at most 100 ms. Engine `Cpu` (everything else,
+   or a CE failure): the bounding window of the sub-rectangles read from each surface (VRAM through the
+   bounce buffer, a standard buffer through its authoritative CPU view at the command's pitch for
+   `STAGING_CPUVISIBLE`), the reference executor over each sub-rectangle, the destination window written
+   back (`write_standard_buffer` updates the blob and the system pages VidMm holds). Then the watermark
+   moves to S and a completion DPC retires the fence.
+
+Every admitted job completes (CE failure -> CPU; CPU failure -> dropped, counted; StopDevice discharges),
+so a GDI fence cannot block the adapter-global FIFO forever.
+
+### 10.5 Counters (`gdi_accel::COUNTERS`, written only by `gdi_accel.rs` and `gdi_exec.rs`)
+
+| counter | meaning |
+|---|---|
+| `GdiKnob`, `GdiCaps` | knob in force, the PresentationCaps word reported |
+| `GdiCmdN`, `GdiOpN` | RenderKm calls, commands parsed |
+| `GdiBad`, `GdiBadWhy` | refused command buffers (parsing stopped there), last `Bad` code (1 size, 2 opcode, 3 sub-rects, 4 trailer) |
+| `GdiOpMask` | opcodes seen, bit = opcode (2 BitBlt, 4 ColorFill, 8 AlphaBlend, 16 StretchBlt, 32 Escape, 64 TransparentBlt, 128 ClearType) |
+| `GdiRopMask` | ROPs seen: BitBlt bit = rop (1 SRCCOPY .. 5 ROP3), ColorFill bit = 8 + rop (1 PATCOPY .. 7 ROP3) |
+| `GdiBltN`, `GdiFillN` | commands executed on the copy engine |
+| `GdiFall` | commands executed on the CPU |
+| `GdiDrop` | commands not executed |
+| `GdiWhy`, `GdiMask` | last reason off the copy engine, every reason seen (`1 << code`): 1 ROP, 2 blend, 3 stretch, 4 transparent, 5 ClearType, 6 a system surface, 7 overlap, 8 CE failed (redone on the CPU), 9 unreachable surface, 10 bad index, 11 out of bounds, 12 CPU failed, 13 timeout |
+| `GdiJobN`, `GdiAgain`, `GdiDone`, `GdiOrph` | jobs admitted, replays, executed, unclaimed jobs dropped |
+| `GdiCeSub`, `GdiRects` | CE pushes, sub-rectangles parsed |
+| `GdiUs`, `GdiUsMax` | executor time per job (sum, max, µs) |
+| `GdiCls` | surface classes seen: destination bit 0 VRAM, 1 standard buffer, 2 unreachable; sources the same at bits 4-6 |
+| `GdiDstRes`, `GdiDstWH` | last destination's resource id and `w << 16 \| h` |
+| `GdiRkIn`, `GdiRgIn` | entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing |
+| `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, jobs claimed by context because the record was missing, the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
+| `GdiChUp`, `GdiCeWhy` | channel bring-ups the executor asked for; why the last CE attempt failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + channel state when it could not come up: 17 cold, 18 disabled, 19 broken, 20 other) |
+| `GdiRdBk`, `GdiThr` | copies from a VRAM surface into a standard buffer (GDI readback); the executor's own thread running (1) or the HPD worker in charge (0) |
+| `GdiSysCe`, `GdiSysRef`, `GdiSysFail` | copies/fills with a staging buffer on one side done on the copy engine over its system pages; refused (CPU instead); failed after the mapping (CPU instead) |
+| `GdiSysWhy`, `GdiSysMsk` | why the last staging copy was refused (1 staging to staging, 2 the VRAM side's mapping, 3 channel down, else `ce_sysmem`'s fail word: 0x8003_00EA not system-resident, 0x8005_00EB uncovered, 0x8001_00E4 busy, ...), and every class seen (1, 2, 4 not system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down) |
+| `GdiUnrN`, `GdiUnrK`, `GdiUnrWH` | unreachable surfaces resolved; the last one's identity (`storage << 24 \| kind << 16 \| foreign layout << 8 \| foreign identity << 9 \| direct scanout << 10`; storage 0 UMD OPTIMAL image, 1 cross-context image, 2 standard buffer) and extent |
+| `GdiChUpUs`, `GdiSlowUs`, `GdiSlowOp` | the channel bring-up's time, outside every job's `GdiUs`; the slowest command's time and signature (`opcode \| engine << 4 \| dst class << 8 \| src class << 12 \| sub-rects << 16 \| over-1-MPixel << 24`) |
+| `GdiFgnN`, `GdiFgnCe`, `GdiFgnFail`, `GdiFgnWhy` | foreign NVK images resolved (`SurfaceClass::Foreign`: UMD optimal image with an RM identity); copies from them done on the copy engine; failed (dropped: the image has no CPU view); the last failing step (1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view refused, 6 channel down, 7 memory, 8 destination class) |
+| `GdiFgnDrop`, `GdiFgnOp` | commands dropped because a foreign image is in them other than as a SRCCOPY source (the plan's drop), and the last one's signature (`opcode \| foreign dst << 8 \| foreign src << 9 \| rop << 16`). Note `GdiFgnN` counts surface RESOLUTIONS (a command naming the image twice counts twice), not commands |
+| `GdiSysUs`, `GdiSysVwUs`, `GdiSysSubUs`, `GdiSysWtUs`, `GdiSysPx` | the slowest staging copy-engine command: total µs, the part until its views were resolved, until its last submit, the wait, its pixels |
+| `GdiSysK`, `GdiSysSWH`, `GdiSysDWH`, `GdiSysRes`, `GdiSysShape` | that command's surfaces: kinds (source `std type << 4 \| GDI type \| RM-backed << 8`, destination's << 16), extents (`w << 16 \| h`), resource ids (source \| destination << 16), shape (sub-rects \| same buffer << 16 \| covers the whole destination << 17 \| same extent << 18) |
+| `GdiFgnRd`, `GdiFgnWb`, `GdiFgnRwF` | windows of foreign NVK images the CPU executor read and wrote back (`Why` 14 `Foreign`: fills, blends, ClearType, ROPs, foreign to foreign), and the transfers that failed |
+| `GdiSeen0..15`, `GdiSeenN` | destinations the parser saw whatever became of the command (first 16): `resource id << 16 \| class bit << 12 \| GDI surface type << 8 \| commands (max 255)`; distinct count (`+ 0x10000` per command to an unlisted one). A window whose surface is absent here gets no GDI commands at all |
+| `GdiChkA0`, `GdiChkAFF`, `GdiChkGpuPx`, `GdiOpaqN`, `GdiFmtK` | of the self-checked pixels in GPU surfaces: alpha 0, alpha 0xff, the last one read (32 bits); commands that wrote an opaque alpha; the last GPU write's formats (source D3DDDIFORMAT \| destination's << 16) |
+| `GdiPrb1..7`, `GdiPrbK`, `GdiPre0..3` | content probes of commands into GPU surfaces (a row of up to 64 pixels through the middle of the first sub-rectangle). `GdiPrb<opcode>`: probes \| destination row all RGB 0 after the command << 10 \| source row (the window the command read) all RGB 0 << 20, each to 1023 (first 32 per opcode, then every 16th). `GdiPrbK`: the last all-zero probe, `opcode \| src class << 4 \| src GDI type << 8 \| dst GDI type << 12 \| src all zero << 16 \| engine << 18 \| Why << 20 \| rop << 26`. `GdiPre<i>`: the first command into each of 4 destinations, before it ran: `resource id << 16 \| magenta pixels << 8 \| RGB-0 pixels` |
+| `GdiSrcScan`, `GdiSrcScanK` | when a probed source row is all RGB 0, the whole source surface is scanned (16 evenly spaced rows): scans \| sources with any non-zero pixel << 10; the last: `resource id << 16 \| non-zero rows << 8 \| GDI type`. Non-zero elsewhere: the command's rectangle points at an empty part (offset, pitch); all zero: the surface holds nothing when the command runs |
+| `GdiSeg0..7`, `GdiSegPa0..7` | placement of the allocations GDI buffers name, from the allocation list (first 8 resources): `resource id << 16 \| SegmentId << 8 \| times seen`; the list's address >> 12 (low 32 bits) |
+| `GdiSlowRop`, `GdiCpuMsk`, `GdiCpuRop` | the slowest command's reason and ROP (`Why \| rop enum << 8 \| ROP3 << 16`); the reasons of the commands the CPU ran (bit per `Why` code, 1 for none); the last CPU command's reason and ROP |
+| `GdiJobMaxN`, `GdiJobT1..3`, `GdiJobT1Us..3Us` | the slowest job (`GdiUsMax`): its command count and its three slowest commands (signature as `GdiSlowOp`, µs) |
+| `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
+
+Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
+
+### 10.6 Unverified, and known limits
+
+* **G0 on hardware (356.1, 5120x1440):** Windows accepts the caps (adapter OK, `StdNGdiTex` 18 /
+  `StdOGdiTex` 38, `StdNGdiStgCpu` 5, `StdNGdiStg` 1, `StdNGdiLut` 1) but `GdiCmdN` stayed 0: RenderKm
+  was never called. The reason: on a GPU-virtual-addressing adapter (this one reports GpuMmu) dxgkrnl's
+  `ADAPTER_RENDER::DdiRenderGdi` calls `DxgkDdiRenderGdi` (`DXGKARG_RENDERGDI`: the same
+  `DXGK_RENDERKM_COMMAND` stream, no patch lists, the DMA buffer's GPU VA), not RenderKm; the KMD's
+  RenderGdi was still the pass-through. Both entry points now share the translation (`render_km`,
+  `render_gdi` -> `translate`), and `GdiRgIn`/`GdiRkIn`/`GdiCtxN`/`GdiCtxFl` show which one runs.
+* **G1 on hardware (357.1):** RenderGdi translated the buffers (`GdiCmdN` 64-128, `GdiOpN` 118-288,
+  `GdiBad` 0) but no command was executed, fallen back or dropped (`GdiBltN`, `GdiFillN`, `GdiFall`,
+  `GdiDrop` 0) and the desktop capture was black: the worker never ran a job, i.e. SubmitCommand admitted
+  none (fences then retire ungated, which matches the responsive DWM). Decode of that row: `GdiWhy` 6 =
+  a copy or fill touching a standard buffer (planned on the CPU); `GdiCls` 0x77 = destinations and
+  sources of all three classes (VRAM, standard buffer, unreachable); `RvWhy` 6 = `Extent` (a GDI texture
+  under 64 pixels on a side is refused by `rm_client::surface_layout` and stays a Venus image, so GDI
+  operations on it are dropped). Since 358.1 a submission on a GDI context reads the record at the KMD's
+  half and at 0, and without one claims the context's oldest unclaimed job; `GdiSubN`/`GdiPrvOk`/
+  `GdiCtxClm`/`GdiPrvSz` say which path admitted it.
+* **G1 on hardware (358.1):** admission works only through the by-context claim (`GdiPrvOk` 0,
+  `GdiCtxClm` 116, `GdiPrvSz` 112/0: the submission's private data carries no record, size 0), the
+  executor ran every job (`GdiJobN` = `GdiDone` 116), DWM imported the VRAM textures (`FgRiOk` 175), but
+  272 of 274 commands were dropped with `GdiWhy` 12 (CPU failed) after `GdiMask` 0x1144 (bits 2 blend,
+  6 standard-buffer surface, 8 CE failed, 12 CPU failed) and `GdiCeSub` 0. Cause: the copy-engine
+  channel was never brought up. Only a routed windowed Present asked for it, so `ce_vram::ce_surface`
+  and `ce_vram::transfer` answered "no channel" for every VRAM surface, on the CE and on the CPU path
+  alike. Since 359.1 the executor brings the channel up itself (`ce_route::bring_up`) for a job with a
+  VRAM surface (`GdiChUp`), names a failed CE attempt in `GdiCeWhy`, and yields the worker after 2 ms
+  of GDI work per pass (`GdiUsMax` 12 ms was one pass of many jobs; a single large CPU operation is
+  still one unit). GDI acceleration with `RedirVram` therefore needs `RmCopyEngine=1`.
+* **G1 on hardware (359.1):** the channel came up (`GdiChUp` 1, `CeChan` 1), fills ran on the copy
+  engine (`GdiFillN` = `GdiCeSub` 68), nothing was dropped, but 185 commands ran on the CPU (`GdiWhy` 6,
+  `GdiMask` 0x44: copies touching a staging buffer, and AlphaBlend) through 275 bounce transfers, one of
+  them a 105 ms unit on the HPD worker. Since 360.1:
+  - a SRCCOPY BitBlt and a PATCOPY ColorFill on the CPU path write each destination sub-rectangle
+    straight from the source rectangle (or the color): no read-modify-write of the destination;
+  - every other CPU operation reads only what its sub-rectangles touch: one window per sub-rectangle
+    when they cover less than half their bounding box, and the scaled operations read the source hull
+    of the mapped rectangle (`cpu::scaled_window`), not the whole SrcRect;
+  - the executor runs on its own thread (`ddi/gdi_thread.rs`, started by the first GDI buffer,
+    joined in `stop_hpd`; `GdiThr`), so a slow job no longer holds the HPD worker;
+  - `GdiRdBk` counts copies from a VRAM surface into a standard buffer (a GDI screen or window read).
+  AlphaBlend cannot run on the copy engine (it has no blend unit) and stays on the CPU.
+* **Since 361.1:** a SRCCOPY BitBlt between a staging buffer and VRAM (either direction, the readback
+  included) and a PATCOPY ColorFill into a staging buffer are ONE copy-engine copy or fill over the
+  staging buffer's system pages (`ce_sysmem::with_standard`, the V2 branch's OS-descriptor mapping,
+  cached per buffer). The VRAM side is resolved first, outside the content transaction; the pushes
+  are waited for inside it. Refused (the buffer is in the Venus window, a stale system copy, partial
+  leases, more than 64 MiB, the channel busy, a staging-to-staging copy): the CPU path as before.
+  Counters `GdiSysCe` (done on the copy engine, also counted in `GdiBltN`/`GdiFillN`), `GdiSysRef`
+  (refused), `GdiSysFail` (failed after the mapping); the V2 side's `RvSysMade`/`RvSysHit`/
+  `RvSysRefuse`/`RvSysWhy`.
+* **360.1:** every staging copy was refused (`GdiSysCe` 0, `GdiSysRef` 136) and no `RvSys*` value
+  appeared: `ce_sysmem` mirrors its counters only after a success. Since 361.1 the glue mirrors them
+  after every call, and the refusal is classified in `GdiSysWhy`/`GdiSysMsk`; `GdiRdBk` was counted
+  twice for a refused readback (once before the attempt, once on the CPU path) and is now counted once.
+* **361.1:** staging reaches the copy engine (`GdiSysCe` 212, `GdiBltN` 212, `GdiFall` 7, `GdiSysRef` 2).
+  Decode of the rest: `GdiMask` 0x246 = reasons 1 (ROP), 2 (blend), 6 (staging surface), 9
+  (unreachable surface): the 12 `GdiDrop` are commands on a surface neither VRAM nor a standard
+  buffer (`GdiCls` bit 2/6), most likely a GDI texture left on Venus or a UMD-created DWM texture
+  (CDD presents into DWM's textures under GDI acceleration); `GdiUnrK`/`GdiUnrWH` now say which.
+  `GdiSysMsk` 129 = staging-to-staging (1, the two refusals: two staging views cannot be held at
+  once, those run on the CPU) and channel down (128: a fill into staging before the channel came up,
+  since jobs with only staging surfaces did not ask for it; now they do). `RmSysWhy` 10 = `Extent`:
+  a staging buffer under 64 pixels on a side stays a Venus blob (`rm_client::surface_layout`). The
+  28 ms `GdiUsMax` included the channel's bring-up inside the first job; the bring-up now runs
+  before the job's clock (`GdiChUpUs`), and `GdiSlowUs`/`GdiSlowOp` name the slowest command.
+* **Since 364.1:** the unreachable class of 362.1 (`GdiUnrK` 0x10300: storage 0, kind 1, foreign
+  layout and identity, 1908x910, a window's NVK image) is `SurfaceClass::Foreign`: a SRCCOPY BitBlt from
+  it into VRAM or a staging buffer is copy-engine copies through the V2 branch's
+  `ce_vram::foreign_source`/`foreign_copy` (the producer's acquire when the route saw its record at a
+  Present, otherwise an import by resource id and no acquire); every other command on it is dropped.
+  A copy between two different staging buffers runs through `ce_sysmem::with_standard_pair` (one
+  content transaction, both views), so `GdiSysWhy` 1 should not recur; a 362.1 run showed that class
+  at 22 ms on the CPU. Copies between R G B and B G R surfaces exchange bytes 0 and 2 (remap on the CE,
+  swap on the CPU). `GdiAccel=1` reports its caps only with `RedirVram=1` and `RmCopyEngine=1`
+  (row a of the duplication A/B: without them the desktop was garbage).
+
+* Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
+  advertises it late (no other public driver does) is the first thing G0's census answers.
+* `NumSubRects` 0 is taken as "the destination rectangle alone" (not documented); an external `pSubRects`
+  (outside the command buffer) is read as a kernel pointer (documented as needing no try/except).
+* The `Rop3` field is read as its low byte.
+* Without `RedirVram` a GDI `TEXTURE` is a Venus image: Unreachable, every command on it dropped. G1 needs
+  `RedirVram=1` (and the copy-engine channel up) for windows to draw.
+* `EXISTINGSYSMEM` surfaces wrap user memory Windows hands to CreateAllocation; today's
+  `GetStandardAllocationDriverData` backs every non-TEXTURE GDI surface with a KMD standard buffer, so its
+  content is not the user's pages (counted as a standard buffer, executed on the wrong bytes). To fix in
+  the allocation arm (owned by the V2 branch) if the census shows Windows using it.
+* The CPU path is synchronous on the HPD worker (bounded by the bounce transfer's 250 ms per surface) and
+  reads whole bounding windows; a GDI-heavy desktop costs worker time the Present path shares.
+* ClearType's gamma row is read from the `LOOKUPTABLE` surface at `Gamma * pitch` (8 bpp, 512 entries);
+  if that surface is not a standard buffer the blend runs without gamma.
+
+**Commands on foreign NVK images (since the head after 1a23f0cd):** until then only a SRCCOPY
+BitBlt with one side a foreign image (and the other VRAM or a staging buffer) ran, on the copy engine
+(`foreign_copy`, `foreign_write`); every other command touching a foreign image was dropped
+(`GdiFgnDrop`). Such commands, e.g. GDI text and fills on a GDI-compatible D3D surface (`GetDC`), now
+plan as `Why::Foreign` (14) and run on the CPU over windows of the image: `ce_vram::foreign_transfer`
+reads the window through the bounce buffer (R G B images reordered to B G R A), the CPU executor runs
+the command, and the window is written back the same way. No producer acquire, as GDI on a D3D surface
+on bare metal. `GdiOff` 0x1 turns these off with the copies, 0x20 the write-back.
+
+**383.1, black wallpaper and Explorer list under G1:** the commands reach and write the textures
+(`GdiRes` lists res 23, 49, 53, 56 with 40/10/8/28 commands, no drops) and the self-check matches,
+but it compared the low 24 bits only. GDI has no alpha: a COLORREF fill and a GDI-drawn staging
+source carry alpha byte 0, which a compositor that blends the window texture reads as transparent.
+`GdiChkA0`/`GdiChkAFF` now show the alpha the textures hold; an `X8` source into an `A8` texture
+always gets alpha 0xff (as the windowed Present's `remap_for`), and `GdiOff` 0x40 forces alpha 0xff on
+every GDI write into a GPU surface except AlphaBlend, for the A/B.
+
+**384.1 (`RvOff` 0x2000, magenta clear):** Explorer's list body and the wallpaper are RGB 0, no
+magenta, and GDI writes reach the textures (`GdiRes` decodes to res 83 x10, 88 x9, 92 x27, 98 x8; the
+encoding is `id << 12 | count`). The probes tell apart (a) a zero source (`GdiPrb` source bit with the
+destination bit), (b) a command that writes zero from a nonzero source (destination bit alone, e.g. a
+fill or a ROP), and (c) the clear never reaching the texture (`GdiPre` magenta 0 with zeros before the
+first command).
+
+### 10.6b Bisect switches (`GdiOff`, since 368.1)
+
+One service-key mask, `GdiOff` (default 0), read at StartDevice with `GdiAccel=1`; the paths in force
+are mirrored as `GdiPaths` (1 foreign copies, 2 foreign acquire, 4 staging views, 8 two staging
+views, 16 scrolls, 32 copies into foreign images; default 0x3D). A set bit turns a path off (0x2
+turns the acquire on):
+
+| bit | path | off means |
+|---|---|---|
+| 0x1 | copies from foreign NVK images | dropped (`GdiFgnWhy` 9) |
+| 0x2 | (opt-in) the producer-semaphore acquire of a foreign copy | default off: a copy-engine acquire cannot time out |
+| 0x4 | copies and fills over a staging buffer's copy-engine view | CPU path |
+| 0x8 | two staging views at once (`with_standard_pair`) | CPU path |
+| 0x10 | scrolls as ordered copy-engine bands | CPU path |
+| 0x80 | (opt-in) execute each GDI buffer synchronously inside RenderGdi/RenderKm (timing diagnostic) | default: the executor thread after SubmitCommand |
+| 0x100 | (opt-in) readback diagnostics: pixel self-check and alpha census (`GdiChk*`), content probes (`GdiPrb*`, `GdiPre*`, `GdiSrcScan*`) | default off since the head after ecefd6ee: they cost bounce readbacks per sampled command |
+| 0x40 | (opt-in) every GDI write into a VRAM or foreign surface sets alpha 0xff (fills, copies, ClearType, stretch/transparent blits; AlphaBlend excepted) | default: only an `X8` source into an `A8` texture gets alpha 0xff |
+| 0x20 | (since the head after 2f94a4a6) copies INTO a foreign NVK image (`foreign_write`), reads stay on | dropped (`GdiFgnWhy` 26) |
+
+**The 365-367 switches were broken**: four separate values `GdiFgn`, `GdiFgnAcq`, `GdiSysCe`,
+`GdiPair` (and `GdiOvl`), and `GdiSysCe` was also the name of a COUNTER the executor writes, so the knob
+read the previous boot's counter (0 after a run without staging copies: the path off, 365.1 and 367.1;
+any nonzero count: on). A kmd_logic test (`no_knob_name_is_a_counter_name`) now fails the build when a
+knob name of `diag.rs` appears as a byte-string literal anywhere else in `kmd_render`.
+
+**365.1/367.1:** the slowest command (25-41 ms, `GdiSlowOp` 0x12211/0x1012211, staging to staging on
+the CPU) ran there because the staging copy-engine path was OFF through the `GdiSysCe` collision above
+(367.1: `GdiPaths` 0x19, `GdiOvlN` 0, so it was not a scroll). Scrolls (overlapping copies inside one
+surface), which CDD sends despite `NoSameBitmapOverlappedBitBlt`, would also have run on the CPU; since
+367.1 they run as ordered, non-overlapping
+copy-engine bands of `|dy|` rows (or `|dx|` columns) from the far side of the move
+(`gdi_accel::split_overlap`, checked against a model scroll in the tests) in one view of the surface;
+counters `GdiOvlN`, `GdiOvlCe`, `GdiOvlWhy`.
+
+**371.1:** the slow CPU commands left were ROP blits, not refused copies. 0x12111 (BitBlt, CPU, staging
+to VRAM, 1 rect, about 1.3 ms each, three of the 16 commands in the 12 ms job at 1080p) and 0x12211
+(BitBlt, CPU, staging to staging, 32.7 ms at 5120x1440) left no `GdiSys*` trace because the staging
+copy-engine path only takes SRCCOPY and PATCOPY (`Why::SystemSurface`). These carried `Why::Rop`
+(`GdiMask` 0x46 has bit 1 set), so they went straight to the CPU. The copy engine has no raster
+operations. Since the head after 372.1 (d14580e5):
+* a `ROP3` BitBlt whose result is the source alone (0xCC, or any code with the same P = 0 half) is
+  parsed as SRCCOPY, and a `ROP3` fill of 0xF0 as PATCOPY, so both take the copy engine;
+* the CPU runs every unscaled BitBlt row by row through a two-input truth table on whole words
+  (`cpu::bitblt_rows`, checked against the per-pixel reference) instead of a bounds-checked
+  per-pixel loop;
+* `GdiSlowRop` (the slowest command), `GdiCpuRop` (the last CPU command) and `GdiCpuMsk` (the reasons
+  of all CPU commands, one bit per `Why` code, bit 0 for none) show which ROP these are:
+  `Why | DXGK rop enum << 8 | ROP3 << 16`, where the rop enum is 1 SRCCOPY, 2 SRCINVERT, 3 SRCAND,
+  4 SRCOR, 5 ROP3.
+
+**373.1:** `GdiSlowRop` 0x106 (Why 6, SRCCOPY) for the 31-32 ms `0x12211`, and `GdiCpuMsk` without
+bit 6 (0x46 at 1080p; 4 at 5120, which is bit 2 = AlphaBlend only), so the slow copy did NOT run on
+the CPU: it succeeded on the staging copy-engine path (`run_ce_sys`; `GdiSlowOp`'s engine field is the
+plan's, Cpu, before that path). The executor's wait was `ce_vram::wait`: it spins 20 ms and then sleeps
+1 ms, which `KeDelayExecutionThread` rounds up to the ~15.6 ms timer tick, so 31.6 ms reads as a copy
+of just over 20 ms plus one tick. Since this head the GDI executor waits by polling without sleeping
+(its own thread), and `GdiSys*Us` split the slowest such command into view resolution, submit and wait.
+
+**375.1:** the wait fix took the slowest command from 31.6 to 5.7 ms (1080p) and windowed Heaven at
+5120x1440 from 221 to 259 fps. The split puts the rest in the copy itself: `GdiSysVwUs` 2-3 µs (the
+RM objects' mappings are cached, `RvSysObj` 129, `RvSysMade` 1), `GdiSysWtUs` 4.5 ms for 2.0 MPixel
+(1080p) and 15.8 ms for 7.1 MPixel (5120), about 1.8 GB/s each way, system memory to system memory.
+One push, one multi-line pitch copy per rectangle, so not a per-line overhead. These are rare (the
+slowest of 137 commands, not one per frame). `GdiSysK`/`GdiSysSWH`/`GdiSysDWH`/`GdiSysRes`/`GdiSysShape`
+name the surfaces of that command, so the next row shows whether it is a whole-surface copy between
+two same-sized staging buffers (a CDD shadow refresh) that could be avoided rather than sped up.
+
+Every wait of the executor is bounded: the copy-engine waits 100 ms (the job's command is then
+redone on the CPU or dropped), `ce_sysmem`'s channel I/O 250 ms, the RM calls their bounded sections,
+a busy channel 10 retries of 1 ms. The V2 side's switches (foreign import, the CPU view cache) are
+its own (section 5.9).
+
+### 10.7 Test recipe (main session)
+
+G0 rows (census only; with the G1 build the same counters plus execution):
+
+1. `reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v GdiAccel /t REG_DWORD /d 1 /f`;
+   for G1 also the 7b knobs (`RedirVram=1`, `RmCopyEngine=1`, `CeRtDirect=1`, `ForeignCopy=1`, `BltAsync=1`,
+   `DwmIcd=nvk`). Reboot (the caps are read at AddAdapter), or `pnputil /restart-device` then DWM and the
+   shell.
+2. Code 0? `GdiKnob` 1, `GdiCaps` 0x0A06C8FC.
+3. Before and after Explorer, Notepad, windowed Heaven (10 s): `StdNGdiTex`, `StdOGdiTex`, `StdOpenPid`,
+   `PBdStd` (4 = GDI surface), `PBdGdi` (1 = TEXTURE), `RvTry`/`RvOk`, the `Gdi*` row.
+4. Screenshot (`shot.ps1`). G0: content wrong or stale is expected. G1: windows drawn; `GdiDrop` flat,
+   `GdiBltN`/`GdiFillN` growing, `GdiFall` for blends and text.
+5. Heaven: PresentMon `msInPresentAPI`, ETW capture `hv-gdi` (no Lock on the redirection surface).
+6. Off row: knob removed, reboot: `GdiKnob` absent or 0, `PresentationCaps` 0 in the 0x01D1 record.
+
+What each G0 outcome means: `GdiCmdN` 0 and `StdNGdiTex` 0 -> Windows ignores the cap here (then 5.5);
+`StdNGdiTex` > 0 and `PBdStd` 4 for Heaven -> the redirection surface is GPU-only, G1 with `RedirVram` is
+the path; adapter fails to start or a bugcheck in RenderKm -> the counters and the code to the lane.
+
+## 11. AlphaBlend on the 2D engine: feasibility
+
+Question: can GDI AlphaBlend (and StretchBlt, TransparentBlt) run on the GPU's 2D engine
+(`FERMI_TWOD_A`, class 0x902D) instead of `gdi_exec`'s CPU path? Research only; nothing built.
+
+### 11.1 Is the class there
+
+* **RM exposes it on both generations, on the graphics engine only.** NVIDIA's open kernel modules list
+  `{ FERMI_TWOD_A, ENG_GR(0) }` in AD102's engine class list and `ENG_GR(0..3)` in GB202's
+  ([g_gpu_class_list.c](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/nvidia/generated/g_gpu_class_list.c),
+  `gpuGetEngClassDescriptorList_AD102` / `_GB202`), next to `ADA_A` / `BLACKWELL_B` (3D) and the
+  compute classes. It is never on a copy engine (`ENG_CE`).
+* **The host allowlist admits it:** `AllowClass::new(0x0000902d, 16, false), // FERMI_TWOD_A` in
+  `host/backend/gen/src/rmallow/v610_57_04.rs`.
+* **Open drivers:** Mesa's gallium nvc0 allocates it (`nouveau_object_new(..., NVC0_2D_CLASS, ...)` in
+  [nvc0_screen.c](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/gallium/drivers/nouveau/nvc0/nvc0_screen.c))
+  and supports chips only up to 0x190 (Ada); NVK does not use the 2D engine at all
+  ([nvk_queue.c](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/nouveau/vulkan/nvk_queue.c) sets
+  up 3D, compute and the inline-to-memory class). So 0x902D on Blackwell has no open user to copy words
+  from; the method list is Mesa's
+  [cl902d.h](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/nouveau/headers/nvidia/classes/cl902d.h).
+
+### 11.2 Can it live on the KMD's channel
+
+No. The KMD's channel (`rm_ce_channel`) runs on an async copy-engine runlist; a 2D object needs a
+channel on the graphics runlist (`ENG_GR`). That means a second channel in the KMD's RM client:
+a GPFIFO channel bound to GR (the same `*_CHANNEL_GPFIFO_*` class, a TSG on the GR runlist), its
+context buffers (RM allocates and promotes the GR context; several MB of video memory), the
+`FERMI_TWOD_A` object on a subchannel, and its own push ring, completion and teardown. That is
+roughly the size of the copy-engine channel work (11.9 of `rm-copy-engine-present.md`) again.
+
+The cost that matters is latency: a GR channel time-slices with the game's graphics channel on the
+one GR engine. A GDI blend submitted while Heaven renders waits for the scheduler's timeslice or a
+preemption (graphics preemption granularity, then a context switch both ways), while the copy-engine
+copies run on an async CE beside the game. A window's text blend would then cost a game frame some
+context-switch time, and the GDI job (and its WDDM fence, the gate of `WddmPending::gdi_seq`) would
+wait for the game. A 3D-engine path (a pixel shader blend) has the same cost and far more state.
+
+### 11.3 What maps
+
+GDI AlphaBlend is `AC_SRC_OVER` only, with `SourceConstantAlpha` (SCA) and optionally `AC_SRC_ALPHA`
+(a premultiplied per-pixel alpha); the KMD's reference is `cpu::blend_pixel`:
+
+| GDI | formula | 2D engine | confidence |
+|---|---|---|---|
+| `AC_SRC_ALPHA`, SCA | `D = S*SCA/255 + D*(1 - Sa*SCA/255)` (S premultiplied) | `SET_OPERATION = BLEND_PREMULT`, `SET_BETA4 = (SCA, SCA, SCA, SCA)`, source format `A8R8G8B8` | the operation and BETA4 exist (cl902d.h); the exact formula and rounding are not in the header: verify against `cpu::blend_pixel` |
+| no `AC_SRC_ALPHA`, SCA | `D = S*SCA/255 + D*(1 - SCA/255)` | the same with source format `X8R8G8B8` (alpha read as 1), or `BLEND_AND` with `SET_BETA1` | as above |
+| SCA 255, no per-pixel alpha | a copy | `SRCCOPY` (or the copy engine, as today) | |
+| stretch (COLORONCOLOR, truncate mapping) | `Xs = truncate((Xd - Dl + 0.5) * Ws/Wd + Sl)` | `SET_PIXELS_FROM_MEMORY_DU_DX/DV_DY` (32.32 fixed point), `SAMPLE_MODE` origin CENTER, filter POINT | close; the rounding of a fractional step against the truncate formula needs a test |
+| mirror | a negative step | not obviously expressible (the steps look unsigned); not advertised anyway (`SupportMirrorStretchBlt` clear) | |
+| TransparentBlt | skip source pixels equal to the key (24-bit compare, or 32 with `HonorAlpha`) | `SET_COLOR_KEY_FORMAT A8R8G8B8`, `SET_COLOR_KEY`, `SET_COLOR_KEY_ENABLE`; whether the key is compared on the source and with which mask is undocumented | low |
+| ClearTypeBlend | per-channel coverage with gamma tables | no | |
+| BitBlt ROP3, fills with ROPs | | `SET_OPERATION = ROP`, `SET_ROP` (with a solid pattern) | the CE does SRCCOPY/PATCOPY already; the other ROPs are rare and not advertised |
+| overlapping scroll in one surface | | `SET_PIXELS_FROM_MEMORY_DIRECTION` and `SAFE_OVERLAP` | would let the KMD take `NoSameBitmapOverlappedBitBlt` back from CDD |
+
+Formats: GDI surfaces are 32 bpp `A8R8G8B8`/`X8R8G8B8`, pitch-linear in RM video memory or in a
+staging buffer's system pages (both already have GPU VAs in the KMD's client: `ce_vram`, `ce_sysmem`),
+which the 2D engine reads and writes with `SET_*_MEMORY_LAYOUT = PITCH`.
+
+### 11.4 Recommendation
+
+**No-go for now; revisit only if 360.1/361.1 show blends to be the cost.** The decision rule:
+
+* go if CPU-path blends (`GdiMask` bit 2, `GdiFall` with the copies now on the copy engine:
+  `GdiSysCe`) still take a large share of `GdiUs` (say above 30%) or keep `GdiUsMax` above a frame
+  period (4 ms at 240 Hz) once the executor is on its own thread and touches only the
+  sub-rectangles;
+* otherwise the CPU path is the better trade: it costs a processor core on the executor's thread and
+  never the game's GR timeslices, and it is bit-exact with the documented formulas.
+
+If it becomes a go, the cheaper first step is not a GR channel: keep the blend on the CPU but feed it
+from the copy engine (read the source and destination windows through `ce_sysmem`/`ce_vram` bounce
+copies in one batch, blend, write back with one copy), which removes the per-row CPU reads of VRAM;
+only then a GR channel with `FERMI_TWOD_A` (BLEND_PREMULT + BETA4 for AlphaBlend, the DU/DV steps for
+StretchBlt), behind its own knob, validated pixel by pixel against `cpu::blend_pixel`.

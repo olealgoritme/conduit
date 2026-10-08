@@ -553,6 +553,26 @@ pub fn present_push(
     release(p, done)
 }
 
+/// A push of one copy whose destination may be block-linear (`RedirVram`'s GDI writes INTO an NVK
+/// image): an optional acquire, the copy, the release with WFI. Same checks as [`present_push`]
+/// except the destination layout.
+pub fn copy_push(
+    p: &mut Push<'_>,
+    gen: Gen,
+    producer: Option<Acquire>,
+    c: &CopyRect,
+    done: Release,
+) -> Result<(), PushError> {
+    if !done.wfi {
+        return Err(PushError::Shape);
+    }
+    if let Some(a) = producer {
+        acquire(p, a)?;
+    }
+    copy(p, gen, c)?;
+    release(p, done)
+}
+
 /// The dwords of the largest push [`present_push`] writes (block-linear source, a remap with
 /// constants, interrupt): 6 + 4 + 9 + 6 + 3 + 2 + 6 + 2. A 512-byte slot (128 dwords) holds it
 /// with room.

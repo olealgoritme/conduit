@@ -155,6 +155,29 @@ static AP_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
     policy: crate::diag::FlushPolicy::EveryNth(64),
 };
 
+/// The last 8 CPU-host-aperture maps that succeeded (`BarApR0..7`: resource id, `BarApP0..7`: the
+/// BAR page it was mapped at; slot `n % 8` for the n-th): which allocations win32k's CPU views of
+/// BAR-segment allocations reach, e.g. CDD's GDI staging buffer.
+const MAP_LOG: usize = 8;
+static MAP_LOG_RES: [AtomicU32; MAP_LOG] = [const { AtomicU32::new(0) }; MAP_LOG];
+static MAP_LOG_PG: [AtomicU32; MAP_LOG] = [const { AtomicU32::new(0) }; MAP_LOG];
+
+/// Mirror the map log (PASSIVE; the `Nv*` mirror pass).
+pub(crate) fn publish_map_log() {
+    const R: [&[u8]; MAP_LOG] =
+        [b"BarApR0", b"BarApR1", b"BarApR2", b"BarApR3", b"BarApR4", b"BarApR5", b"BarApR6", b"BarApR7"];
+    const P: [&[u8]; MAP_LOG] =
+        [b"BarApP0", b"BarApP1", b"BarApP2", b"BarApP3", b"BarApP4", b"BarApP5", b"BarApP6", b"BarApP7"];
+    for i in 0..MAP_LOG {
+        let r = MAP_LOG_RES[i].load(Ordering::Relaxed);
+        if r != 0 {
+            crate::diag::record_named_bytes(R[i], r);
+            crate::diag::record_named_bytes(P[i], MAP_LOG_PG[i].load(Ordering::Relaxed));
+        }
+    }
+    crate::diag::record_named_bytes(b"BarApUnmapN", CPU_HOST_UNMAP_COUNT.load(Ordering::Relaxed));
+}
+
 fn dump_bar_ap_counters() {
     AP_COUNTERS.flush();
 }
@@ -406,7 +429,9 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
 
     match crate::virtio::ctrl::map_blob_at(passive, adapter, alloc.resource_id, range.offset) {
         Ok(_prep) => {
-            BAR_AP_MAPS.fetch_add(1, Ordering::Relaxed);
+            let n = BAR_AP_MAPS.fetch_add(1, Ordering::Relaxed) as usize;
+            MAP_LOG_RES[n % MAP_LOG].store(alloc.resource_id, Ordering::Relaxed);
+            MAP_LOG_PG[n % MAP_LOG].store((range.offset >> 12) as u32, Ordering::Relaxed);
             BAR_AP_LAST_RESID.store(alloc.resource_id, Ordering::Relaxed);
             BAR_AP_LAST_PAGE.store((range.offset >> 12) as u32, Ordering::Relaxed);
             // No flush on the SUCCESS path: the atomics carry the values, the

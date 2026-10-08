@@ -211,6 +211,29 @@ pub fn layout(width: u32, height: u32, dxgi: u32) -> Result<SysLayout, LayoutErr
     if !(MIN_DIM..=MAX_DIM).contains(&width) || !(MIN_DIM..=MAX_DIM).contains(&height) {
         return Err(LayoutError::Extent);
     }
+    layout_unchecked_extent(width, height, dxgi)
+}
+
+/// [`layout`] for a buffer that is never scanned out (a GDI staging buffer, `RedirVram`): the
+/// foreign record's extents (`foreign_resource::MIN_DIM..=MAX_DIM`, 1..=16384) instead of the
+/// scanout's (64..), so small GDI surfaces (icons, tooltips, the caret, narrow windows) qualify
+/// (361.1: `RmSysWhy` 10 for 2 of 6 staging buffers).
+///
+/// The DXGI format is a hint only: the KMD authors every staging buffer's pitch as `width * 4`
+/// rounded to 256 whatever its D3DDDIFORMAT (`cross_adapter_pitch`), and it writes the legacy zero
+/// hint for `A8B8G8R8` and every format without a DXGI name. Those buffers (361.1/362.1: `RmSysWhy`
+/// 9, Format, for 2 of 6) are recorded as `XRGB8888` bytes: nothing imports a staging buffer as an
+/// image, and the copy engine moves its bytes unconverted.
+pub fn layout_standard(width: u32, height: u32, dxgi: u32) -> Result<SysLayout, LayoutError> {
+    use crate::foreign_resource::{MAX_DIM as FR_MAX, MIN_DIM as FR_MIN};
+    if !(FR_MIN..=FR_MAX).contains(&width) || !(FR_MIN..=FR_MAX).contains(&height) {
+        return Err(LayoutError::Extent);
+    }
+    let dxgi = if fourcc_for_dxgi(dxgi).is_some() { dxgi } else { 88 };
+    layout_unchecked_extent(width, height, dxgi)
+}
+
+fn layout_unchecked_extent(width: u32, height: u32, dxgi: u32) -> Result<SysLayout, LayoutError> {
     let fourcc = fourcc_for_dxgi(dxgi).ok_or(LayoutError::Format)?;
     let pitch = crate::cross_adapter_pitch(width);
     if pitch > MAX_STRIDE || u64::from(pitch) < u64::from(width) * 4 {
@@ -1021,6 +1044,28 @@ pub fn close_gate(w: CloseWait, released: bool, now: u64) -> Wait {
 mod tests {
     extern crate std;
     use super::*;
+
+    #[test]
+    fn standard_layout_takes_small_gdi_surfaces() {
+        assert_eq!(layout(32, 32, 87), Err(LayoutError::Extent));
+        let l = layout_standard(32, 32, 87).unwrap();
+        assert_eq!((l.pitch, l.size), (256, 8192));
+        assert!(foreign_layout(&l, l.size).is_some());
+        let one = layout_standard(1, 1, 88).unwrap();
+        assert_eq!((one.pitch, one.size), (256, 4096));
+        assert!(foreign_layout(&one, one.size).is_some());
+        assert_eq!(layout_standard(1920, 1080, 87), layout(1920, 1080, 87));
+        assert_eq!(layout_standard(0, 8, 87), Err(LayoutError::Extent));
+        assert_eq!(layout_standard(16_385, 8, 87), Err(LayoutError::Extent));
+        // The zero hint (A8B8G8R8, or no DXGI name) is recorded as XRGB8888 bytes, same geometry.
+        let z = layout_standard(32, 32, 0).unwrap();
+        assert_eq!(z.fourcc, FOURCC_XRGB8888);
+        assert_eq!((z.pitch, z.size), (256, 8192));
+        assert_eq!(layout_standard(32, 32, 28).unwrap().fourcc, FOURCC_ABGR8888);
+        assert_eq!(layout_standard(32, 32, 999).unwrap().fourcc, FOURCC_XRGB8888);
+        // The primary still refuses an unknown format.
+        assert_eq!(layout(1920, 1080, 0), Err(LayoutError::Format));
+    }
     use crate::foreign_scanout::{ForeignScanout, ResidentKind};
     use crate::paging::{clamp_range, Clamp};
     use crate::rm_present::{Act, FlipResult, Inputs, Presenter};

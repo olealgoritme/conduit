@@ -1,0 +1,42 @@
+Helios DXVK fork: record VK_EXT_image_drm_format_modifier support
+
+Conduit guest/windows/docs/shared-formats.md sections 9 and 10. Applied
+after 0012 by ci/windows/Build-Driver.ps1.
+
+0001 (Venus ForeignImport) and 0010 (NVK explicit LINEAR import) enable
+VK_EXT_image_drm_format_modifier in enableFeaturesAndExtensions when the
+device supports it. The extension is deliberately left out of the feature
+list (enabling it on every device changed ordinary OPTIMAL import
+requirements, the .38 regression), but initSupportedExtensions records
+support only for feature-list entries, so its spec version stayed 0: no
+device ever enabled it, and every import of a LINEAR foreign surface (a
+KMD GDI texture in RM video memory) took the rebuild path and failed with
+"DxvkImage: failed to allocate backing storage" (369.1: drm_modifier_ext=0
+on every NVK device, with NVK patch 0042 advertising the extension).
+Support is now recorded; enabling stays as 0001 and 0010 have it.
+
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 9b16e980..33a41aa6 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -388,6 +388,20 @@ namespace dxvk {
+           f.extensionSupported->specVersion = std::max(1u, iter->specVersion);
+       }
+     }
++
++    // Helios: VK_EXT_image_drm_format_modifier is deliberately not in the
++    // feature list (enabling it on every device changed ordinary OPTIMAL
++    // import requirements, the .38 regression), so the loop above never
++    // records its support, and enableFeaturesAndExtensions, which turns it on
++    // only for a ForeignImport Venus device or an NVK device, always saw spec
++    // version 0: no device ever enabled it and no explicit-modifier import
++    // ran. Record the support here; enabling stays where it was.
++    { auto& drm = m_extensionsSupported.extImageDrmFormatModifier;
++      auto iter = std::lower_bound(extensions.begin(), extensions.end(), drm, vk::SortExtension());
++
++      if (iter != extensions.end() && !vk::SortExtension()(drm, *iter))
++        drm.specVersion = std::max(1u, iter->specVersion);
++    }
+   }
+ 
+ 

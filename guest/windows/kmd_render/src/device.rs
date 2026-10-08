@@ -334,6 +334,21 @@ impl<'a> ContextHandleRef<'a> {
         slot.take()
     }
 
+    /// Why [`Self::take_ce_record`] found nothing for `boundary`: 1 no record stashed, 2 a record
+    /// of another boundary (`boundary` and the stashed one's low 32 bits in the returned pair).
+    /// Diagnostics of the route's `NoRecord`.
+    pub fn ce_record_miss(&self, boundary: u64) -> (u32, u32) {
+        let ctx = self.context;
+        if ctx.ce_record_flag.load(Ordering::Relaxed) == 0 {
+            return (1, 0);
+        }
+        match ctx.ce_record.lock().as_ref() {
+            None => (1, 0),
+            Some(r) if r.boundary != boundary => (2, r.boundary as u32),
+            Some(_) => (0, 0),
+        }
+    }
+
     /// Low 32 bits of the context handle (a pointer): enough to tell contexts apart in
     /// the flush-gate trace.
     pub fn trace_id(&self) -> u32 {
@@ -447,6 +462,9 @@ pub unsafe extern "C" fn dxgkddi_create_device(
     }
     // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
     let args = unsafe { &mut *create_device };
+    // `GdiAccel` census: GDI devices (`DXGK_CREATEDEVICEFLAGS.GdiDevice`). An atomic add.
+    // SAFETY: `Flags` is the input arm of the union (`pInfo` is the obsolete output arm).
+    crate::ddi::gdi_accel::note_create_device(unsafe { args.__bindgen_anon_1.Flags.__bindgen_anon_1.Value });
     let ctx = Box::new(DeviceContext {
         adapter: miniport_device_context as *mut AdapterContext,
         creator_process: args.hKmdProcess as usize,
@@ -614,6 +632,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     }
 
     let args = unsafe { &mut *create_context };
+    // SAFETY: `Value` is the plain UINT view of the flags union.
+    let create_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     let ctx = Box::new(ContextContext {
         device: h_device as *mut DeviceContext,
         snap_resid: AtomicU32::new(0),
@@ -635,6 +655,9 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         flush_pending_flag: AtomicU32::new(0),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
+    // `GdiAccel`: GDI contexts are counted and remembered (their submissions name their job by
+    // context when the private record is missing). Atomics only.
+    crate::ddi::gdi_accel::note_create_context(create_flags, args.hContext as usize);
 
     // Use the paging aperture for DMA buffers. With the decorative GpuMmu model,
     // dxgkrnl's CDD context creates a privileged DMA pool with GPU-VA mapping
@@ -660,6 +683,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
+        crate::ddi::gdi_accel::forget_context(h_context as usize);
+        crate::ddi::gdi_exec::forget_context(h_context as usize);
         drop(unsafe { Box::from_raw(h_context as *mut ContextContext) });
     }
     STATUS_SUCCESS

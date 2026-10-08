@@ -2300,6 +2300,10 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    // `RvOff` 0x4000: its system pages are not its content any more (one load otherwise).
+    if adapter.is_current_generation(ctx.serial) {
+        crate::ddi::aperture_pages::forget(ctx.resource_id);
+    }
     adapter.producer.remove_allocation(allocation_handle);
     adapter.vidmm_trackers.remove(ctx.vidmm_tracker_cookie);
     // An allocation of an OLDER transport generation (created before a StopDevice
@@ -2891,6 +2895,37 @@ fn build_backing(
             // Reinterpreting this allocation as pitched host bytes makes DWM
             // sample tiled memory as a different resource shape and produces a
             // black redirected window.
+            //
+            // `RedirVram` 1 (docs/vram-redirection.md 5.3; one relaxed load otherwise): first ask
+            // for pitch-linear RM VIDEO memory adopted as a foreign resource of the KMD's own, so
+            // DWM on NVK imports it by resource id (zero copy) and the redirected Blt writes it on
+            // the copy engine. Any refusal falls through to the Venus image below, unchanged.
+            if let Some(rm) = crate::virtio::rm_client::vidmem::try_create(
+                passive,
+                adapter,
+                helios_kmd_logic::rm_sysmem::Kind::OptimalGdiTexture,
+                width,
+                height,
+                dxgi_format,
+            ) {
+                // Clear it now when the copy engine is up and free (best effort, never waits for
+                // the channel: otherwise the first mapping clears it before any write).
+                let _ = crate::virtio::rm_client::ce_vram::ce_surface(passive, adapter, rm.resource_id);
+                return Ok(CreatedBacking {
+                    resource_id: rm.resource_id,
+                    venus_memory_id: 0,
+                    venus_image_id: 0,
+                    pitch: rm.layout.stride,
+                    plane_offset: u64::from(rm.layout.offset),
+                    dxgi_format,
+                    venus_alloc_size: rm.size,
+                    memory_type_index: 0,
+                    blob_size: BackingSize::HostAuthoritative(rm.size),
+                    system_backing_policy: SystemBackingPolicy::None,
+                    dedicated_present_buffer: false,
+                    foreign: ForeignBacking::Adopted(rm.layout),
+                });
+            }
             match adapter.with_venus_client(passive, |client| {
                 client.allocate_optimal_gdi_image_blob(
                     adapter,
@@ -2926,6 +2961,54 @@ fn build_backing(
             }
         }
         Backing::KmdStandardBuffer { size, primary } => {
+            // `RedirVram` (docs/vram-redirection.md 8; one relaxed load otherwise): a CPU-visible
+            // GDI staging buffer (`D3DKMDT_GDISURFACE_STAGING_CPUVISIBLE`) from CACHED RM system
+            // memory, adopted as a foreign resource of the KMD's own, so the copy engine reaches it
+            // by RM object while it sits in segment 2 (`ce_sysmem`). Its paging and CPU view are
+            // a standard buffer's (`PresentLinearBuffer`); any refusal: the Venus blob below.
+            // The GDI lookup table CDD uploads from such a buffer (`LOOKUPTABLE`, the ClearType
+            // gamma table) too, so that copy runs on the copy engine (`RvOff` 0x400 keeps it Venus).
+            let std_type = (meta.misc_flags >> 24) & 0xF;
+            let gdi_type = (meta.misc_flags >> 20) & 0xF;
+            if helios_kmd_logic::rm_vidmem::rm_backed_standard(
+                std_type,
+                gdi_type,
+                primary,
+                crate::virtio::rm_client::vidmem::off_mask(),
+            ) {
+                if let Some(rm) = crate::virtio::rm_client::sysmem::try_create_standard(
+                    passive,
+                    adapter,
+                    meta.width,
+                    meta.height,
+                    meta.dxgi_format,
+                ) {
+                    if rm.layout.stride == meta.pitch {
+                        return Ok(CreatedBacking {
+                            resource_id: rm.resource_id,
+                            venus_memory_id: 0,
+                            venus_image_id: 0,
+                            pitch: rm.layout.stride,
+                            plane_offset: 0,
+                            dxgi_format: meta.dxgi_format,
+                            venus_alloc_size: rm.size,
+                            memory_type_index: 0,
+                            blob_size: BackingSize::HostAuthoritative(rm.size),
+                            system_backing_policy: SystemBackingPolicy::PresentLinearBuffer,
+                            dedicated_present_buffer: false,
+                            foreign: ForeignBacking::Adopted(rm.layout),
+                        });
+                    }
+                    // The authored pitch must be the RM layout's (both are `cross_adapter_pitch`);
+                    // a disagreement gives the allocation back to Venus.
+                    crate::virtio::ctrl::release_allocation_resource(
+                        passive,
+                        adapter,
+                        adapter.venus_ctx_id(),
+                        rm.resource_id,
+                    );
+                }
+            }
             // KMD-originated standard allocation (indirect-swapchain backbuffer,
             // GDI redirection/staging surface). Back it with a REAL venus
             // `VkDeviceMemory` blob through the kernel venus client: user-mode
@@ -3409,8 +3492,12 @@ unsafe fn create_one_inner(
     // the arms that set venus_memory_id. What changes is that the aperture
     // path's safety now rests on a stated fact rather than on an incidental
     // property of an unrelated field.
+    // `RvOff` 0x4000: CDD's CPU-written GDI surfaces stay in the aperture (`ddi/aperture_pages.rs`).
+    let aperture_surface = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+        && crate::ddi::aperture_pages::wants((meta.misc_flags >> 24) & 0xF, (meta.misc_flags >> 20) & 0xF);
     let bar_eligible = created.blob_size.is_host_authoritative()
         && !is_optimal_gdi_texture
+        && !aperture_surface
         && bar_seg_id.is_some();
     // The ICD classifies the backing Vulkan heap. Non-device-local memory stays
     // in the aperture/shared budget. Device-local tracking enters the local
@@ -3528,6 +3615,9 @@ unsafe fn create_one_inner(
     // one dxgkrnl will hand back.
     if register_for_flip {
         register_scanout_allocation(ctx_resource_id, info.hAllocation as usize, ctx_serial);
+    }
+    if aperture_surface {
+        crate::ddi::aperture_pages::register(ctx_resource_id, vidmm_size as u64);
     }
     info.Size = vidmm_size;
     info.PitchAlignedSize = vidmm_size;
@@ -4234,6 +4324,15 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         if ident.is_some_and(|identity| identity.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD) {
             crate::ddi::std_census::note_open(meta.map_or(0, |m| m.misc_flags));
         }
+        // `RedirVram`: an open of a KMD RM video-memory surface (one relaxed load when none is
+        // alive), whether it was served as a foreign record (the opener can import it by id).
+        crate::virtio::rm_client::vidmem::note_open(
+            adapter,
+            resource_id,
+            creator_process,
+            ident.is_some_and(|identity| identity.foreign),
+            foreign_layout.is_some(),
+        );
         info.hDeviceSpecificAllocation = Box::into_raw(open) as HANDLE;
         crate::diag::record(
             0x0C36_0000 | ((info.hDeviceSpecificAllocation as usize as u32) & 0xFFFF),
@@ -4447,26 +4546,41 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     crate::diag::record_named_bytes(b"StdType", standard_allocation_type);
     crate::diag::record(0x0C02_0002 | ((args.StandardAllocationType as u32 & 0xFF) << 4));
 
-    const PRIV_SIZE: u32 =
+    const STD_PRIV_SIZE: u32 =
         (size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>()) as u32;
+    // `RedirVram` 1 (docs/vram-redirection.md 5.3): a GPU-only GDI texture may be RM video memory
+    // adopted as a foreign resource, whose openers (DWM on NVK) need the 32-byte layout trailer at
+    // offset 96, so its private data is 128 bytes. Every other request, and every request with the
+    // knob off (one relaxed load), keeps the 96 bytes it always had.
+    let gdi_texture_request = args.StandardAllocationType == D3DKMDT_STANDARDALLOCATION_GDISURFACE
+        // SAFETY: the union arm is selected by StandardAllocationType; a null pointer is refused.
+        && unsafe {
+            let p = args.__bindgen_anon_1.pCreateGdiSurfaceData;
+            !p.is_null() && (*p).Type as u32 == GDI_SURFACE_TYPE_TEXTURE
+        };
+    let priv_size: u32 = if gdi_texture_request && crate::virtio::rm_client::vidmem::knob_on() {
+        helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES as u32
+    } else {
+        STD_PRIV_SIZE
+    };
 
     // ── Phase 1: size query (runtime passes a null allocation buffer) ────────
     if args.pAllocationPrivateDriverData.is_null() {
-        args.AllocationPrivateDriverDataSize = PRIV_SIZE;
-        args.ResourcePrivateDriverDataSize = PRIV_SIZE;
+        args.AllocationPrivateDriverDataSize = priv_size;
+        args.ResourcePrivateDriverDataSize = priv_size;
         crate::diag::record_named_bytes(b"StdPhase", 1);
-        crate::diag::record_named_bytes(b"StdAPSz", PRIV_SIZE);
-        crate::diag::record_named_bytes(b"StdRPSz", PRIV_SIZE);
+        crate::diag::record_named_bytes(b"StdAPSz", priv_size);
+        crate::diag::record_named_bytes(b"StdRPSz", priv_size);
         return STATUS_SUCCESS;
     }
     crate::diag::record_named_bytes(b"StdPhase", 2);
     crate::diag::record_named_bytes(b"StdAPSz", args.AllocationPrivateDriverDataSize);
     crate::diag::record_named_bytes(b"StdRPSz", args.ResourcePrivateDriverDataSize);
-    if (args.AllocationPrivateDriverDataSize as usize) < PRIV_SIZE as usize {
+    if (args.AllocationPrivateDriverDataSize as usize) < priv_size as usize {
         return STATUS_INVALID_PARAMETER;
     }
     if !args.pResourcePrivateDriverData.is_null()
-        && (args.ResourcePrivateDriverDataSize as usize) < PRIV_SIZE as usize
+        && (args.ResourcePrivateDriverDataSize as usize) < priv_size as usize
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -4614,7 +4728,7 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         plane_offset: 0,
     };
 
-    // SAFETY: AllocationPrivateDriverDataSize bytes (>= PRIV_SIZE) are writable.
+    // SAFETY: AllocationPrivateDriverDataSize bytes (>= priv_size) are writable.
     let dst = args.pAllocationPrivateDriverData as *mut u8;
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -4627,6 +4741,15 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
             dst.add(size_of::<HeliosWddmAllocPrivate>()),
             size_of::<HeliosWddmAllocMeta>(),
         );
+        // The trailer room of a `RedirVram` texture starts zeroed (no stale layout magic): the
+        // adoption writes the trailer, an allocation Venus makes keeps none.
+        if priv_size > STD_PRIV_SIZE {
+            core::ptr::write_bytes(
+                dst.add(STD_PRIV_SIZE as usize),
+                0,
+                (priv_size - STD_PRIV_SIZE) as usize,
+            );
+        }
     }
     if !args.pResourcePrivateDriverData.is_null() {
         let dst = args.pResourcePrivateDriverData as *mut u8;
@@ -4642,9 +4765,9 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
                 size_of::<HeliosWddmAllocMeta>(),
             );
         }
-        args.ResourcePrivateDriverDataSize = PRIV_SIZE;
+        args.ResourcePrivateDriverDataSize = priv_size;
     }
-    args.AllocationPrivateDriverDataSize = PRIV_SIZE;
+    args.AllocationPrivateDriverDataSize = priv_size;
     // S-A0 census (`ddi/std_census.rs`): counting only, after every refusal arm above, so a
     // request is counted once (phase 2 only; phase 1 is the size query). PASSIVE DDI.
     crate::ddi::std_census::note_request(standard_allocation_type, gdi_surface_type, size);

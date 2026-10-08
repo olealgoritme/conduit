@@ -338,6 +338,13 @@ pub struct NvidiaBackend {
     /// The render nodes the guest was told of, by the index it opens them by.
     /// `None` until GET_SYS_FILES has answered.
     dri_given: std::cell::RefCell<Option<Vec<DriDevice>>>,
+    /// The last non-empty GET_SYS_FILES file list. The sandbox's Landlock rules hold the inodes
+    /// of `/proc/driver/nvidia` and the GPU's sysfs directory as they were at start; procfs drops
+    /// and recreates its inodes (memory pressure, a driver re-registering an entry), and a
+    /// recreated inode is outside every rule: from then on the rescan reads nothing.
+    sys_files_last: std::cell::RefCell<Vec<(String, Vec<u8>)>>,
+    /// The same for GET_PROC_FILES.
+    proc_files_last: std::cell::RefCell<Vec<(String, Vec<u8>)>>,
     /// UVM semaphore pools placed in the aperture. See `aperture.rs`.
     aperture: aperture::Aperture,
     /// Every message this backend has served, by kind.
@@ -473,6 +480,8 @@ impl NvidiaBackend {
             dri_maps: std::collections::HashMap::new(),
             aperture: Default::default(),
             dri_given: Default::default(),
+            sys_files_last: Default::default(),
+            proc_files_last: Default::default(),
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             guards: Default::default(),

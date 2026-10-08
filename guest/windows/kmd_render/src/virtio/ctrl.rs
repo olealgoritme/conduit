@@ -2207,6 +2207,7 @@ pub fn release_allocation_resource(
     // `KmdRmClient` = 5: a resource that was the KMD's own RM system memory also owes its
     // GEM and its RM memory (one atomic load when the service holds nothing).
     super::rm_client::sysmem::released(passive, adapter, resource_id);
+    super::rm_client::vidmem::released(passive, adapter, resource_id);
 }
 
 // ── Venus submission ─────────────────────────────────────────────────────────

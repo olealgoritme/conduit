@@ -788,7 +788,7 @@ fn first_push(passive: PassiveLevel, p: &Parts, ring: &mut cp::Ring) -> Result<(
 
 /// Why [`submit`] did not submit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SubmitError {
+pub(crate) enum SubmitError {
     /// No channel up (or it is broken).
     NoChannel,
     RingFull,
@@ -833,6 +833,55 @@ pub(super) fn submit(producer: cp::Acquire, copy: &cp::CopyRect) -> Result<u64, 
     kick(&p, &mut g.ring, buf.get(..n).unwrap_or(&[]))
 }
 
+/// Submit one push the CALLER builds (stage V2 of `docs/vram-redirection.md`, and the copy-only GDI
+/// acceleration): `build` writes its methods into the slot's buffer and must end with the
+/// `Release` it is handed (the next completion value, WFI, no interrupt), e.g. through
+/// `ce_present::present_push`. Returns that value. Same rules as [`submit`]: under the `STATE`
+/// lock, plain stores only, no RM call, any IRQL up to DISPATCH; `build` must not block.
+pub(crate) fn submit_build(
+    build: impl FnOnce(&mut cp::Push<'_>, Gen, cp::Release) -> Result<(), cp::PushError>,
+) -> Result<u64, SubmitError> {
+    let mut g = STATE.lock();
+    if g.svc.phase() != cc::Phase::Ready {
+        return Err(SubmitError::NoChannel);
+    }
+    let Some(p) = g.parts else {
+        return Err(SubmitError::NoChannel);
+    };
+    let gen = p.gen.ok_or(SubmitError::NoChannel)?;
+    if g.ring.is_full() {
+        return Err(SubmitError::RingFull);
+    }
+    let value = g.ring.submitted() + 1;
+    let mut buf = [0u32; cc::SLOT_DWORDS];
+    let mut push = cp::Push::new(&mut buf);
+    build(
+        &mut push,
+        gen,
+        cp::Release {
+            va: p.ring_gpu.va + cc::COMPLETION_OFFSET,
+            value,
+            wfi: true,
+            timestamp: false,
+            interrupt: false,
+        },
+    )
+    .map_err(SubmitError::Push)?;
+    let n = push.len();
+    kick(&p, &mut g.ring, buf.get(..n).unwrap_or(&[]))
+}
+
+/// One copy with no producer to wait for (the KMD's own copies: VRAM to VRAM, the bounce
+/// transfers): the acquire is the channel's own producer page at value 0, always satisfied.
+pub(crate) fn submit_copy(copy: &cp::CopyRect) -> Result<u64, SubmitError> {
+    let Some(va) = producer_va() else {
+        return Err(SubmitError::NoChannel);
+    };
+    submit_build(|push, gen, done| {
+        cp::present_push(push, gen, cp::Acquire { va, value: 0 }, copy, done)
+    })
+}
+
 /// Write `words` into the next slot and kick it: the entry, a full barrier (the write-combined
 /// stores drain), `GP_PUT`, a full barrier, the token to the doorbell (the tool's `kick`).
 fn kick(p: &Parts, ring: &mut cp::Ring, words: &[u32]) -> Result<u64, SubmitError> {
@@ -871,7 +920,7 @@ fn kick(p: &Parts, ring: &mut cp::Ring, words: &[u32]) -> Result<u64, SubmitErro
 
 /// What [`poll`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Progress {
+pub(crate) struct Progress {
     /// The completion value (the ring's watermark after this read).
     pub completed: u64,
     pub submitted: u64,
@@ -882,7 +931,7 @@ pub(super) struct Progress {
 /// Read the completion value and the error notifier through the kernel views; advance the ring.
 /// A set notifier breaks the channel (counted once): nothing is submitted until it is torn down.
 /// `None`: no channel. Under the `STATE` lock, plain loads; any IRQL up to DISPATCH.
-pub(super) fn poll() -> Option<Progress> {
+pub(crate) fn poll() -> Option<Progress> {
     let mut g = STATE.lock();
     let p = g.parts?;
     // SAFETY: the completion value is 8 bytes at `COMPLETION_OFFSET` of the ring's view, mapped
@@ -1031,6 +1080,7 @@ fn undo_all(io: &Io<'_>, p: &mut Parts, ring: &mut cp::Ring) {
     let h = p.h;
     if idle {
         super::ce_shadow::release_scratch(io, &h);
+        super::ce_vram::release_all(io, &h);
         super::ce_dup::release_all(io, &h);
     }
     while let Some(u) = cc::next_undo(p.made) {
@@ -1042,12 +1092,14 @@ fn undo_all(io: &Io<'_>, p: &mut Parts, ring: &mut cp::Ring) {
         p.made = p.made.without(u.undoes());
         if matches!(u, Undo::FreeTsg) {
             super::ce_shadow::release_scratch(io, &h);
+        super::ce_vram::release_all(io, &h);
             super::ce_dup::release_all(io, &h);
         }
     }
     // Whatever is left (no channel group was made): before the client's files close (a no-op
     // when the cache is empty). A closed client takes the rest with it.
     super::ce_shadow::release_scratch(io, &h);
+        super::ce_vram::release_all(io, &h);
     super::ce_dup::release_all(io, &h);
 }
 
@@ -1145,6 +1197,7 @@ pub(crate) fn drop_views() {
     }
     // The shadow mode's scratch view likewise (M3c-1; nothing when there is none).
     super::ce_shadow::drop_views();
+    super::ce_vram::drop_views();
     IO_BUSY.store(0, Ordering::Release);
 }
 
@@ -1155,6 +1208,7 @@ pub(crate) fn forget() {
     // The dup cache and the shadow mode's scratch name objects of the client the sweep closed.
     super::ce_dup::forget();
     super::ce_shadow::forget();
+    super::ce_vram::forget();
     {
         let mut g = STATE.lock();
         g.svc.reset();

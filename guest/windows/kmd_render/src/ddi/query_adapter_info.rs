@@ -332,10 +332,16 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         mem_caps |= MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED
             | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
     }
+    // `VidMmCapsX` (default 0: `mem_caps` unchanged): the GPU-memory redirection experiment
+    // (`docs/vram-redirection.md` 5.2) may add `NonCpuVisiblePrimary` and nothing else.
+    let mem_caps = knobs.vidmm_caps(mem_caps).reported;
+    crate::diag::record_named_bytes(b"VmCapsRep", mem_caps);
 
     // No GDI hardware acceleration (see the note above): every documented
-    // DXGK_PRESENTATIONCAPS bit stays clear.
-    let presentation_caps: UINT = 0;
+    // DXGK_PRESENTATIONCAPS bit stays clear — unless `GdiAccel` = 1, the copy-engine
+    // GDI acceleration experiment (`ddi/gdi_accel.rs`, docs/vram-redirection.md 10),
+    // which reports `helios_kmd_logic::gdi_accel::ACCEL_CAPS`. Absent knob: 0, as before.
+    let presentation_caps: UINT = crate::ddi::gdi_accel::reported_caps(&knobs);
     // BOTH MMIO flip capabilities, and the second one is a FIX, measured
     // 2026-07-29 (KMD 22.22.197.0).
     //

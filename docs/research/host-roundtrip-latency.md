@@ -425,9 +425,12 @@ copy-engine queue is the lever for this stage.
 
 ## Reproducing
 
-The capture scripts generate a bpftrace program for the live PIDs and symbols
-(uprobes need the unstripped binaries the packages ship) and pair the events
-by fence id. The light capture uses only `Venus::dispatch`,
+`conduit trace NAME latency [--full]` ([TRACING.md](../TRACING.md),
+"Latency capture") takes these captures and prints the stage table; it
+replaced the `host/latency/capture.sh` and `analyze.py` the numbers here came
+from, and gives the same rows for their captures. It generates a bpftrace
+program for the live PIDs and symbols (uprobes need the unstripped binaries
+the packages ship) and pairs the events by fence id. The light capture uses only `Venus::dispatch`,
 `render_context_update_timeline`, `write_context_fence`, `sched_*` and
 `kvm_msi_set_irq`, and costs under 15 µs per round trip. Keep a capture
 under 30 s: the full one writes about 80,000 lines a second under Heaven.

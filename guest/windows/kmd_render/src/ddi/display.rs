@@ -350,6 +350,13 @@ unsafe fn dxgkddi_present_inner(
     let stashed_stream_marker = present_context
         .as_ref()
         .and_then(ContextHandleRef::take_present_stream_marker_stash);
+    // `RvMk*` (`RedirVram` diagnosis of the route's NoBoundary): what the stash held at this
+    // Present, before resolution. Two relaxed adds.
+    crate::ddi::vram_redirect::note_marker(match stashed_stream_marker {
+        None => 0,
+        Some(crate::device::StashedMarker::Resolved(_)) => 1,
+        Some(crate::device::StashedMarker::Stream { .. }) => 2,
+    });
     // The "already on scanout" tag (`HOSC`) the same Render left, taken (read + CLEAR) on every
     // Present that resolves its context, whatever its arm, like the snapshot and the marker. One
     // relaxed load for a context that carries none.
@@ -491,6 +498,11 @@ unsafe fn dxgkddi_present_inner(
                     _ => 0,
                 };
                 crate::diag::record_named_bytes(b"PBdtrk", code);
+                // Whether VidMm holds the destination in system memory at this Present (it has
+                // system-backing leases): the KMD's view of the redirection surface's segment
+                // (`docs/vram-redirection.md` 5.2). 1 = system-resident, 0 = segment 2 or untracked.
+                let sys = adapter.is_some_and(|adapter| adapter.system_backings.is_backed(d.resource_id));
+                crate::diag::record_named_bytes(b"PBdSys", u32::from(sys));
             } else {
                 crate::diag::record_named_bytes(b"PBdst", 0);
             }
@@ -664,6 +676,62 @@ unsafe fn dxgkddi_present_inner(
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(site::BLT_FORMAT);
             };
+            // `RedirVram` (docs/vram-redirection.md 5.3-5.6; one relaxed load while no KMD RM
+            // video-memory surface is alive): a Blt with such a surface on either side is the copy
+            // engine's (the redirected Blt VRAM to VRAM, GDI's upload, a CPU reader's readback).
+            {
+                // SAFETY: DxgkDdiPresent is PASSIVE_LEVEL (see the BLT arm below).
+                let passive = unsafe { crate::irql::PassiveLevel::assume() };
+                // SAFETY: `args` is this call's present struct, its private data checked above.
+                let vram = unsafe {
+                    crate::ddi::vram_redirect::blt(
+                        passive,
+                        adapter,
+                        args,
+                        present_context.as_ref(),
+                        &source,
+                        &destination,
+                        source_dxgi_format,
+                        destination_dxgi_format,
+                        present_stream_boundary,
+                    )
+                };
+                match vram {
+                    Some(crate::ddi::vram_redirect::Outcome::Routed(token)) => {
+                        // 7: queued for the copy engine into a VRAM redirection surface.
+                        crate::diag::record_named_on_change(b"PBCpy", 7, &PB_CPY_LAST);
+                        crate::diag::record_named_bytes(b"PBFnc", token as u32);
+                        return unsafe {
+                            present_complete(
+                                args,
+                                present_allocations,
+                                patch_capacity.take(),
+                                present_stream_boundary,
+                                present_arm,
+                                Some(adapter),
+                                src_info,
+                                dst_info,
+                            )
+                        };
+                    }
+                    Some(crate::ddi::vram_redirect::Outcome::Done) => {
+                        // 8: copied synchronously by the copy engine, or skipped (counted).
+                        crate::diag::record_named_on_change(b"PBCpy", 8, &PB_CPY_LAST);
+                        return unsafe {
+                            present_blt_skipped(
+                                args,
+                                present_allocations,
+                                patch_capacity.take(),
+                                present_stream_boundary,
+                                Some(adapter),
+                                src_info,
+                                dst_info,
+                            )
+                        };
+                    }
+                    None => {}
+                }
+            }
             if source.kind != HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY {
                 blt_foreign_skip!(Refusal::BltSourceKind);
                 crate::diag::record_named_on_change(b"PBCpy", 0xE6, &PB_CPY_LAST);
@@ -970,6 +1038,8 @@ unsafe fn dxgkddi_present_inner(
                                 pitch: destination.pitch,
                                 dxgi_format: destination_dxgi_format,
                                 alloc_size: destination.venus_alloc_size,
+                                x: 0,
+                                y: 0,
                             },
                             present_stream_boundary,
                         )
