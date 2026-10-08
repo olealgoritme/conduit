@@ -2300,6 +2300,10 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    // `RvOff` 0x4000: its system pages are not its content any more (one load otherwise).
+    if adapter.is_current_generation(ctx.serial) {
+        crate::ddi::aperture_pages::forget(ctx.resource_id);
+    }
     adapter.producer.remove_allocation(allocation_handle);
     adapter.vidmm_trackers.remove(ctx.vidmm_tracker_cookie);
     // An allocation of an OLDER transport generation (created before a StopDevice
@@ -3488,8 +3492,12 @@ unsafe fn create_one_inner(
     // the arms that set venus_memory_id. What changes is that the aperture
     // path's safety now rests on a stated fact rather than on an incidental
     // property of an unrelated field.
+    // `RvOff` 0x4000: CDD's CPU-written GDI surfaces stay in the aperture (`ddi/aperture_pages.rs`).
+    let aperture_surface = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+        && crate::ddi::aperture_pages::wants((meta.misc_flags >> 24) & 0xF, (meta.misc_flags >> 20) & 0xF);
     let bar_eligible = created.blob_size.is_host_authoritative()
         && !is_optimal_gdi_texture
+        && !aperture_surface
         && bar_seg_id.is_some();
     // The ICD classifies the backing Vulkan heap. Non-device-local memory stays
     // in the aperture/shared budget. Device-local tracking enters the local
@@ -3607,6 +3615,9 @@ unsafe fn create_one_inner(
     // one dxgkrnl will hand back.
     if register_for_flip {
         register_scanout_allocation(ctx_resource_id, info.hAllocation as usize, ctx_serial);
+    }
+    if aperture_surface {
+        crate::ddi::aperture_pages::register(ctx_resource_id, vidmm_size as u64);
     }
     info.Size = vidmm_size;
     info.PitchAlignedSize = vidmm_size;

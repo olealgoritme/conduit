@@ -338,6 +338,7 @@ pub(crate) fn publish_nvrm_counters() {
     crate::ddi::ce_sysmem::publish_if_used();
     // The CPU-host-aperture map log (`BarApR*`/`BarApP*`).
     crate::ddi::cpu_host_aperture::publish_map_log();
+    crate::ddi::aperture_pages::publish_counters();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();
