@@ -32,15 +32,20 @@ path reads system memory.
   reads on Hopper+ emit the host WFI without the system memory barrier.
 - NVK_DEBUG=vm: mem+ lines end with where the memory really is (vram,
   bar, sysmem or sysmem,cached).
+
+This version applies directly after 0024 (without 0025) and carries
+0025's NVK_RM_SYSMEM_CACHED=desc/app split with it, which the placement
+code uses; default behaviour of that knob is unchanged (both cached).
+MME macros are untouched: 2976 dwords on BLACKWELL_A, as in 405.8.
 ---
- src/nouveau/vulkan/nvk_cmd_buffer.c        | 29 +++++++++---
- src/nouveau/vulkan/nvk_cmd_pool.c          |  5 ++-
+ src/nouveau/vulkan/nvk_cmd_buffer.c        | 29 ++++++++---
+ src/nouveau/vulkan/nvk_cmd_pool.c          |  5 +-
  src/nouveau/vulkan/nvkmd/nvkmd.c           |  6 ++-
  src/nouveau/vulkan/nvkmd/nvkmd.h           |  9 ++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  8 ++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c |  2 +
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c | 52 ++++++++++++++++++++--
- 7 files changed, 99 insertions(+), 12 deletions(-)
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     | 14 ++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 20 +++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c | 57 ++++++++++++++++++++--
+ 7 files changed, 125 insertions(+), 15 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
 index 56c6b9d8..c1a34fcb 100644
@@ -153,13 +158,19 @@ index 5263a784..2ea90778 100644
  
  struct nvkmd_mem {
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-index eeeff87b..87a2c5ff 100644
+index 5fcc5bbb..87a2c5ff 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-@@ -324,6 +324,14 @@ struct nvkmd_rm_dev {
-     */
-    bool sysmem_cached_desc;
-    bool sysmem_cached_app;
+@@ -318,6 +318,20 @@ struct nvkmd_rm_dev {
+ 
+    /* Map coherent host-visible system memory GPU-cacheable */
+    bool sysmem_cached;
++   /* NVK_RM_SYSMEM_CACHED=desc / =app: only descriptor memory
++    * (NVKMD_MEM_GPU_READ_ONLY) / only coherent host-visible memory is
++    * GPU-cacheable (an A/B split of the default, both).
++    */
++   bool sysmem_cached_desc;
++   bool sysmem_cached_app;
 +   /* NVK_RM_DESC_TABLE_VRAM / NVK_RM_UPLOAD_VRAM (default on): descriptor
 +    * memory (texture and sampler header tables, descriptor pools) and
 +    * command buffer upload memory live in CPU-mapped VRAM (the BAR heap)
@@ -172,26 +183,56 @@ index eeeff87b..87a2c5ff 100644
     /* lib->win_loss_epoch() when the device was created; see
      * nvkmd_rm_dev_lost()
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
-index 18d3357b..22f27f04 100644
+index 80d05e1c..22f27f04 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
-@@ -159,6 +159,8 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
-       }
-       dev->sysmem_cached = dev->sysmem_cached_desc || dev->sysmem_cached_app;
-    }
+@@ -9,6 +9,7 @@
+ #include "c11/threads.h"
+ #include <inttypes.h>
+ #include "util/log.h"
++#include "util/os_misc.h"
+ #include "util/os_time.h"
+ #include "util/u_debug.h"
+ #include "util/u_math.h"
+@@ -142,7 +143,24 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    simple_mtx_init(&dev->drm_mutex, mtx_plain);
+    simple_mtx_init(&dev->rmfence_mutex, mtx_plain);
+ #endif
+-   dev->sysmem_cached = debug_get_bool_option("NVK_RM_SYSMEM_CACHED", true);
++   {
++      /* 1 (default): descriptor and host-visible memory GPU-cacheable;
++       * 0: neither; desc / app: only one of them (A/B split).
++       */
++      const char *c = os_get_option("NVK_RM_SYSMEM_CACHED");
++      if (c != NULL && strcmp(c, "desc") == 0) {
++         dev->sysmem_cached_desc = true;
++      } else if (c != NULL && strcmp(c, "app") == 0) {
++         dev->sysmem_cached_app = true;
++      } else {
++         const bool on = debug_get_bool_option("NVK_RM_SYSMEM_CACHED", true);
++         dev->sysmem_cached_desc = on;
++         dev->sysmem_cached_app = on;
++      }
++      dev->sysmem_cached = dev->sysmem_cached_desc || dev->sysmem_cached_app;
++   }
 +   dev->desc_vram = debug_get_bool_option("NVK_RM_DESC_TABLE_VRAM", true);
 +   dev->upload_vram = debug_get_bool_option("NVK_RM_UPLOAD_VRAM", true);
  
     list_inithead(&dev->base.mems);
     simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-index b3bd6d93..25cdb177 100644
+index 08c2e901..25cdb177 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-@@ -328,12 +328,39 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+@@ -328,11 +328,39 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
      */
     const bool force_rm_sysmem = (flags & NVKMD_RM_MEM_RM_SYSMEM) ||
                                  (flags & NVKMD_MEM_SHARED);
+-   const bool gpu_cacheable = (((flags & NVKMD_MEM_GART) &&
+-                                (flags & NVKMD_MEM_COHERENT)) ||
+-                               (flags & NVKMD_MEM_GPU_READ_ONLY)) &&
+-                              !force_rm_sysmem && dev->sysmem_cached;
+-   flags &= ~NVKMD_RM_MEM_RM_SYSMEM;
 +   /* Host-visible VRAM requested by the app (the DEVICE_LOCAL |
 +    * HOST_VISIBLE type): if it ends up in system memory (heap full, map
 +    * refused) it is still the app's coherent host-visible memory and is
@@ -217,21 +258,18 @@ index b3bd6d93..25cdb177 100644
 +   if (want_bar_internal)
 +      flags = (flags & ~NVKMD_MEM_LOCAL) | NVKMD_MEM_VRAM;
 +
-    const bool gpu_cacheable =
--      ((dev->sysmem_cached_app && (flags & NVKMD_MEM_GART) &&
--        (flags & NVKMD_MEM_COHERENT) && !(flags & NVKMD_MEM_GPU_READ_ONLY)) ||
++   const bool gpu_cacheable =
 +      ((dev->sysmem_cached_app &&
 +        (((flags & NVKMD_MEM_GART) && (flags & NVKMD_MEM_COHERENT)) ||
 +         (app_bar && !want_bar_internal)) &&
 +        !(flags & NVKMD_MEM_GPU_READ_ONLY)) ||
-        (dev->sysmem_cached_desc && (flags & NVKMD_MEM_GPU_READ_ONLY))) &&
-       !force_rm_sysmem;
--   flags &= ~NVKMD_RM_MEM_RM_SYSMEM;
++       (dev->sysmem_cached_desc && (flags & NVKMD_MEM_GPU_READ_ONLY))) &&
++      !force_rm_sysmem;
 +   flags &= ~(NVKMD_RM_MEM_RM_SYSMEM | NVKMD_MEM_CPU_WRITE_ONLY);
  
     /* Kinds are applied per mapping (the image's own VA).  The layout is only
      * remembered, for NVKMS if the memory is exported.
-@@ -478,6 +505,15 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+@@ -477,6 +505,15 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
     mem->huge = vram && huge;
     mem->bar_charged = bar;
     mem->gpu_cached = !vram && gpu_cacheable;
@@ -247,7 +285,7 @@ index b3bd6d93..25cdb177 100644
     mem->pte_kind = pte_kind;
     mem->tile_mode = tile_mode;
     simple_mtx_init(&mem->export_mutex, mtx_plain);
-@@ -691,6 +727,15 @@ nvkmd_rm_mem_sync(struct nvkmd_mem *mem, uint64_t offset_B, uint64_t range_B)
+@@ -690,6 +727,15 @@ nvkmd_rm_mem_sync(struct nvkmd_mem *mem, uint64_t offset_B, uint64_t range_B)
     /* All memory is NVKMD_MEM_COHERENT; nothing to do */
  }
  
@@ -263,7 +301,7 @@ index b3bd6d93..25cdb177 100644
  static uint32_t
  nvkmd_rm_mem_log_handle(struct nvkmd_mem *mem)
  {
-@@ -706,4 +751,5 @@ const struct nvkmd_mem_ops nvkmd_rm_mem_ops = {
+@@ -705,4 +751,5 @@ const struct nvkmd_mem_ops nvkmd_rm_mem_ops = {
     .sync_from_gpu = nvkmd_rm_mem_sync,
     .export_dma_buf = nvkmd_rm_mem_export_dma_buf,
     .log_handle = nvkmd_rm_mem_log_handle,
