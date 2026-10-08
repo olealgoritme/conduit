@@ -607,6 +607,10 @@ unsafe fn foreign_arm(
     src_rect: Rect,
     dst_rect: Rect,
 ) -> Option<Outcome> {
+    // The route is opt-in (`RvOff` 0x1000): without it, the synchronous copy.
+    if !vidmem::off(helios_kmd_logic::rm_vidmem::off::ROUTE_ON) {
+        return sync_or_skip(passive, adapter, source, destination, &dst, src_rect, dst_rect);
+    }
     let Some(fsrc) = crate::virtio::venus::foreign_source_if_enabled(
         adapter,
         source.foreign,
@@ -657,6 +661,10 @@ unsafe fn foreign_arm(
     ) else {
         return skip(Why::Rect);
     };
+    // Retire the route's finished copies now, at this Present: the HPD worker polls them only at
+    // its timer-quantum waits (about 15.6 ms), and every Present whose copy is not retired holds
+    // the app's frame-latency budget (382.1: 89 fps).
+    crate::ddi::ce_present_route::settle_from_present(passive, adapter);
     let t_rt = crate::ddi::blt_async::now_100ns();
     // SAFETY: the caller's contract.
     let token = unsafe {
@@ -699,22 +707,35 @@ unsafe fn foreign_arm(
             // explorer's composition into its window surface refused (RvBltWhy 1), the
             // file list black.
             RT_WHY.store(crate::ddi::ce_present_route::last_why(), Ordering::Relaxed);
-            if sync_foreign(
-                passive,
-                adapter,
-                source.resource_id,
-                src_rect,
-                destination.resource_id,
-                dst_rect,
-                dst.fourcc,
-            ) {
-                SYNC.fetch_add(1, Ordering::Relaxed);
-                note_dst(destination.resource_id);
-                maybe_publish(false);
-                Some(Outcome::Done)
-            } else {
-                skip(Why::RouteRefused)
-            }
+            sync_or_skip(passive, adapter, source, destination, &dst, src_rect, dst_rect)
         }
+    }
+}
+
+/// The synchronous copy of a foreign frame into its VRAM surface, or a counted skip.
+fn sync_or_skip(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    source: &PresentAllocInfo,
+    destination: &PresentAllocInfo,
+    dst: &vidmem::VramObject,
+    src_rect: Rect,
+    dst_rect: Rect,
+) -> Option<Outcome> {
+    if sync_foreign(
+        passive,
+        adapter,
+        source.resource_id,
+        src_rect,
+        destination.resource_id,
+        dst_rect,
+        dst.fourcc,
+    ) {
+        SYNC.fetch_add(1, Ordering::Relaxed);
+        note_dst(destination.resource_id);
+        maybe_publish(false);
+        Some(Outcome::Done)
+    } else {
+        skip(Why::RouteRefused)
     }
 }

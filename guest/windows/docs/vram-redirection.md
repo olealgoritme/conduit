@@ -513,6 +513,7 @@ off and its caller takes the fallback):
 | 0x200 | OPT-IN: the CPU helpers reuse blob views |
 | 0x400 | GDI lookup tables (`LOOKUPTABLE`, CDD's ClearType gamma table) stay Venus blobs; with it clear they come from RM system memory like the staging buffers, so the staging-to-table upload runs on the copy engine (370.1 `GdiSysCpuT` 0x00440142: 10-17 ms on the CPU) |
 | 0x800 | a new VRAM surface is not cleared at its first copy-engine mapping (A/B for the clear; `RvClrSkip` counts). With it clear, the clear runs exactly once, inside the mapping, before the VA is handed out on any path; a clear that does not complete fails that mapping (`RvClrFail`) instead of being retried at a later one, where it would wipe what was drawn |
+| 0x1000 | OPT-IN: an NVK frame into a VRAM window surface takes the copy-engine route (queued, the Present completes on the copy; finished copies are also retired at the next such Present) instead of the synchronous copy in the Present. Opt-in since 382.1: routed, windowed Heaven fell from 411 to 89 fps because the completions were only seen at the HPD worker's timer-quantum polls |
 
 Two defaults changed with it: the record path's semaphore ACQUIRE is now opt-in (a record's value is
 not guaranteed to be released again, e.g. after a swap chain is recreated, and an acquire that never
