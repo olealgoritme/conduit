@@ -1231,7 +1231,7 @@ fn submit_bands(passive: PassiveLevel, v: &CeView, bands: &[(Rect, Rect)]) -> u3
     for chunk in bands.chunks(per) {
         let push = |p: &mut cp::Push<'_>, gen: cp::Gen, done: cp::Release| {
             for (s, d) in chunk {
-                ga::copy_rect(p, gen, v, s, v, d, false)?;
+                ga::copy_rect(p, gen, v, s, v, d, cp::Remap::None)?;
             }
             cp::release(p, done)
         };
@@ -1244,7 +1244,7 @@ fn submit_bands(passive: PassiveLevel, v: &CeView, bands: &[(Rect, Rect)]) -> u3
                 }
                 glue::submit(|p, gen, done| {
                     for (s, d) in chunk {
-                        ga::copy_rect(p, gen, v, s, v, d, false)?;
+                        ga::copy_rect(p, gen, v, s, v, d, cp::Remap::None)?;
                     }
                     cp::release(p, done)
                 })
