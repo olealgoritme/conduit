@@ -196,7 +196,7 @@ pub(crate) struct AdapterKnobs {
     /// used unfiltered; [`Self::flip_caps`] applies the accepted-bit mask. Read here, once per
     /// StartDevice, so the caps query reports what the `FlipCapsXEff`/`FlipCapsRep` mirrors say.
     pub flip_caps_x: u32,
-    /// `IndepFlip` (default 0), raw. Its caps are already folded into [`Self::direct_flip`] and
+    /// `IndepFlip` (default 1, `independent_flip::KNOB_DEFAULT`; 0 opts out), raw. Its caps are already folded into [`Self::direct_flip`] and
     /// [`Self::flip_caps_x`] by [`Self::read`] (`helios_kmd_logic::independent_flip::advertise`),
     /// so the caps and segment writers need not know it; [`Self::indep_flip_mode`] is the census.
     pub indep_flip: u32,
@@ -283,9 +283,24 @@ impl AdapterKnobs {
         present_probe: false,
         foreign_copy: false,
         display_half: true,
-        direct_flip: false,
-        flip_caps_x: 0,
-        indep_flip: 0,
+        // `IndepFlip` absent = `KNOB_DEFAULT` (1), which folds its caps in (`advertise`).
+        direct_flip: helios_kmd_logic::independent_flip::advertise(
+            helios_kmd_logic::independent_flip::Mode::from_knob(
+                helios_kmd_logic::independent_flip::KNOB_DEFAULT,
+            ),
+            false,
+            0,
+        )
+        .direct_flip,
+        flip_caps_x: helios_kmd_logic::independent_flip::advertise(
+            helios_kmd_logic::independent_flip::Mode::from_knob(
+                helios_kmd_logic::independent_flip::KNOB_DEFAULT,
+            ),
+            false,
+            0,
+        )
+        .flip_caps_x,
+        indep_flip: helios_kmd_logic::independent_flip::KNOB_DEFAULT,
         flip_done: 0,
         hw_cursor: helios_kmd_logic::hw_cursor::KNOB_DEFAULT,
         cross_adapter: false,
@@ -312,9 +327,9 @@ impl AdapterKnobs {
     pub fn read() -> Self {
         use crate::diag::{knobs, read_config_dword};
         use helios_kmd_logic::independent_flip as idf;
-        // `IndepFlip` ORs its caps into what `DirectFlipCaps` and `FlipCapsX` ask for; with it at
-        // 0 (the default) both are exactly the raw values, as before.
-        let indep_flip = read_config_dword(knobs::INDEP_FLIP, 0);
+        // `IndepFlip` ORs its caps into what `DirectFlipCaps` and `FlipCapsX` ask for. Absent, it is
+        // `KNOB_DEFAULT` (1, on); 0 is the opt-out, and then both are exactly the raw values.
+        let indep_flip = read_config_dword(knobs::INDEP_FLIP, idf::KNOB_DEFAULT);
         let advertised = idf::advertise(
             idf::Mode::from_knob(indep_flip),
             read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
