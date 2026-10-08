@@ -1,0 +1,199 @@
+Helios vkd3d-proton fork: ECL fence made ahead for the next batch
+
+Conduit, D3D12 on NVK, Nvk12EclSync=2. Applied after 0008.
+
+Each ExecuteCommandLists made its RM fence (ecl_fence_create, a
+SEMSURF_FENCE_CREATE escape: a host round trip) between the commit and the
+HE12 v4 Render whose admission releases the batch, so every batch's
+admission waited for it.
+
+- helios_vkd3d_prepare_ecl_fence(queue): reserve the queue's next ECL value
+  and make its fence now (the UMD calls it right after an ECL was admitted,
+  still serialised with that queue's ECLs). The next commit takes the pair
+  instead of reserving and creating inline; a value whose fence was refused
+  is still taken (it is next in order) and that batch makes its fence
+  inline. A prepared fence left at queue destruction is closed.
+- helios_vkd3d_ecl_fence_stats appends fences made ahead and taken.
+
+diff --git a/libs/d3d12core/helios_vkd3d.def b/libs/d3d12core/helios_vkd3d.def
+index b3cc58ec..935f1f70 100644
+--- a/libs/d3d12core/helios_vkd3d.def
++++ b/libs/d3d12core/helios_vkd3d.def
+@@ -14,3 +14,4 @@ EXPORTS
+     helios_vkd3d_memory_stats
+     helios_vkd3d_create_ecl_fence
+     helios_vkd3d_gpu_time_stats
++    helios_vkd3d_prepare_ecl_fence
+diff --git a/libs/vkd3d/helios_producer.h b/libs/vkd3d/helios_producer.h
+index 3b72f642..6b3f5749 100644
+--- a/libs/vkd3d/helios_producer.h
++++ b/libs/vkd3d/helios_producer.h
+@@ -104,6 +104,8 @@ static struct
+     uint64_t admit_to_signal_sum_us;
+     /* Executions whose producer signal rode on the batch's own submit. */
+     uint64_t inline_signals, separate_signals;
++    /* ECL fences made ahead (prepare) and taken by a commit. */
++    uint64_t prepared, prepared_used;
+ } vkd3d_helios_ecl_stats;
+ 
+ static uint64_t vkd3d_helios_qpc_us(int64_t from, int64_t to)
+@@ -168,8 +170,9 @@ static void vkd3d_helios_ecl_note_signal(int64_t commit_qpc, int64_t admit_qpc)
+  * (<50 us, <200 us, <1 ms, <2 ms, <5 ms, <20 ms, >= 20 ms); then (patch
+  * 0006) admissions, commit-to-admission sum (us), its 7 buckets, the ECL
+  * fences' admission-to-signal sum (us), producer signals inline in the
+- * batch's submit, separate producer signal submits. Returns how many values
+- * it wrote (at most `count`). */
++ * batch's submit, separate producer signal submits; then (patch 0009) ECL
++ * fences made ahead and those a commit took. Returns how many values it
++ * wrote (at most `count`). */
+ /* NVK on RM: another RM fence for `value` of this queue's ECL timeline (a
+  * value a helios_vkd3d_execute_command_lists_rm returned), e.g. for a scanout
+  * present that must wait for the frame's last batch. *fence is the caller's
+@@ -200,10 +203,65 @@ HRESULT helios_vkd3d_create_ecl_fence(ID3D12CommandQueue *iface, uint64_t value,
+ #endif
+ }
+ 
++/* NVK on RM (patch 0009): make the RM fence for this queue's next ECL now,
++ * so the next helios_vkd3d_execute_command_lists_rm takes it without the
++ * fence-create escape (a host round trip) before its HE12 v4 Render. The
++ * caller serialises it with that queue's ECLs (the UMD calls it at the end of
++ * an ECL, under the queue's execution lock). S_OK when one is ready (made
++ * now or already), E_NOTIMPL without ECL fences, E_FAIL if refused. */
++HRESULT helios_vkd3d_prepare_ecl_fence(ID3D12CommandQueue *iface)
++{
++#ifdef _WIN32
++    const struct helios_icd_api *icd;
++    struct d3d12_command_queue *queue;
++    uint64_t value = 0;
++    uint32_t fence = 0;
++    if (!iface)
++        return E_INVALIDARG;
++    queue = impl_from_ID3D12CommandQueue(iface);
++    if (!(icd = vkd3d_helios_icd_ecl_api(queue->device)))
++        return E_NOTIMPL;
++    pthread_mutex_lock(&queue->queue_lock);
++    if (queue->helios_ecl_prepared_value)
++    {
++        pthread_mutex_unlock(&queue->queue_lock);
++        return S_OK;
++    }
++    if (icd->ecl_fence_reserve((VkDevice)queue->device->vk_device, (uint64_t)(uintptr_t)queue,
++            &value) != VK_SUCCESS)
++        value = 0;
++    pthread_mutex_unlock(&queue->queue_lock);
++    if (!value)
++        return E_FAIL;
++    InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.reserved);
++    /* The escape runs outside queue_lock; no commit of this queue can run
++     * meanwhile (the caller holds its ECL lock). A value whose fence is
++     * refused is still taken by the next commit and signalled (it is the
++     * next in order); that batch makes its fence inline. */
++    if (icd->ecl_fence_create((VkDevice)queue->device->vk_device, (uint64_t)(uintptr_t)queue,
++            value, &fence) != VK_SUCCESS)
++        fence = 0;
++    pthread_mutex_lock(&queue->queue_lock);
++    queue->helios_ecl_prepared_value = value;
++    queue->helios_ecl_prepared_fence = fence;
++    pthread_mutex_unlock(&queue->queue_lock);
++    if (!fence)
++    {
++        InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.create_failed);
++        return E_FAIL;
++    }
++    InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.prepared);
++    return S_OK;
++#else
++    (void)iface;
++    return E_NOTIMPL;
++#endif
++}
++
+ uint32_t helios_vkd3d_ecl_fence_stats(uint64_t *out, uint32_t count)
+ {
+ #ifdef _WIN32
+-    uint64_t all[7 + VKD3D_HELIOS_ECL_BUCKETS + 2 + VKD3D_HELIOS_ECL_BUCKETS + 3];
++    uint64_t all[7 + VKD3D_HELIOS_ECL_BUCKETS + 2 + VKD3D_HELIOS_ECL_BUCKETS + 3 + 2];
+     uint32_t i, n;
+     all[0] = vkd3d_helios_ecl_stats.signals;
+     all[1] = vkd3d_helios_ecl_stats.sum_us;
+@@ -222,6 +280,8 @@ uint32_t helios_vkd3d_ecl_fence_stats(uint64_t *out, uint32_t count)
+     all[n++] = vkd3d_helios_ecl_stats.admit_to_signal_sum_us;
+     all[n++] = vkd3d_helios_ecl_stats.inline_signals;
+     all[n++] = vkd3d_helios_ecl_stats.separate_signals;
++    all[n++] = vkd3d_helios_ecl_stats.prepared;
++    all[n++] = vkd3d_helios_ecl_stats.prepared_used;
+     n = count < (uint32_t)ARRAY_SIZE(all) ? count : (uint32_t)ARRAY_SIZE(all);
+     if (out)
+         memcpy(out, all, n * sizeof(*out));
+@@ -311,6 +371,7 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+     struct vkd3d_helios_execution *op;
+     struct vkd3d_helios_stream *stream;
+     LARGE_INTEGER qpc;
++    uint32_t prepared_fence = 0;
+     uint64_t rm_value = 0;
+     bool committed = false;
+     if (rm)
+@@ -342,7 +403,17 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+          * under: values of this queue's ECL timeline are signalled in the
+          * order they are reserved. The key is this queue, so D3D12 queues
+          * that share a VkQueue never interleave values. */
+-        if (icd && icd->ecl_fence_reserve((VkDevice)queue->device->vk_device,
++        if (icd && queue->helios_ecl_prepared_value)
++        {
++            /* Made ahead by helios_vkd3d_prepare_ecl_fence (patch 0009): its
++             * value was the next one reserved, so the order holds. */
++            op->rm_value = rm_value = queue->helios_ecl_prepared_value;
++            prepared_fence = queue->helios_ecl_prepared_fence;
++            queue->helios_ecl_prepared_value = 0;
++            queue->helios_ecl_prepared_fence = 0;
++            InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.prepared_used);
++        }
++        else if (icd && icd->ecl_fence_reserve((VkDevice)queue->device->vk_device,
+                 (uint64_t)(uintptr_t)queue, &op->rm_value) == VK_SUCCESS)
+         {
+             rm_value = op->rm_value;
+@@ -369,7 +440,12 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+     /* `op` belongs to the worker now; only the local copy is used. The fence
+      * escape runs outside queue_lock. A reserved value without a fence is
+      * still signalled by the worker (harmless; the timeline stays dense). */
+-    if (rm && rm_value)
++    if (rm && rm_value && prepared_fence)
++    {
++        rm->fence = prepared_fence;
++        rm->value = rm_value;
++    }
++    else if (rm && rm_value)
+     {
+         uint32_t fence = 0;
+         if (icd->ecl_fence_create((VkDevice)queue->device->vk_device,
+@@ -866,6 +942,14 @@ void vkd3d_helios_queue_cleanup(struct d3d12_command_queue *queue)
+     const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
+ #ifdef _WIN32
+     vkd3d_helios_ts_destroy(queue);
++    if (queue->helios_ecl_prepared_fence)
++    {
++        const struct helios_icd_api *icd = vkd3d_helios_icd_ecl_api(queue->device);
++        if (icd)
++            icd->rm_fence_close((VkDevice)queue->device->vk_device, queue->helios_ecl_prepared_fence);
++        queue->helios_ecl_prepared_fence = 0;
++        queue->helios_ecl_prepared_value = 0;
++    }
+ #endif
+     if (!queue->helios_producer) return;
+     /* Release joins the submission and fence workers before reaching here. */
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 3814c289..14946c03 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -4046,6 +4046,11 @@ struct d3d12_command_queue
+     /* Helios: GPU timestamp ring (HELIOS_VKD3D_GPU_TIMESTAMPS=1), the
+      * submission worker's. */
+     struct vkd3d_helios_ts *helios_ts;
++    /* Helios: an ECL fence made ahead for the next batch
++     * (helios_vkd3d_prepare_ecl_fence), consumed by its commit; under
++     * queue_lock. value 0 = none. */
++    uint64_t helios_ecl_prepared_value;
++    uint32_t helios_ecl_prepared_fence;
+ 
+     D3D12_COMMAND_QUEUE_DESC desc;
+ 

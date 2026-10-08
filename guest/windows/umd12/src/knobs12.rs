@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 16] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 17] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -322,6 +322,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 16] {
         ("Nvk12WorkerSpinUs", nvk12_worker_spin_us()),
         // Appended (diagnostic).
         ("Nvk12AdmitAfterPresentOnly", nvk12_admit_after_present_only() as u32),
+        // Appended.
+        ("Nvk12EclFencePrefetch", nvk12_ecl_fence_prefetch() as u32),
     ]
 }
 
@@ -428,6 +430,17 @@ pub(crate) static NVK12_ADMIT_AFTER_PRESENT_ONLY: BoolKnob =
 
 pub(crate) fn nvk12_admit_after_present_only() -> bool {
     NVK12_ADMIT_AFTER_PRESENT_ONLY.get()
+}
+
+/// `Nvk12EclFencePrefetch` (`Nvk12EclSync=2`): after an ECL is admitted, make
+/// the queue's next ECL fence right away (vkd3d patch 0009,
+/// helios_vkd3d_prepare_ecl_fence), so the next ECL's HE12 v4 Render does not
+/// wait for the fence-create escape, a host round trip. Absent = ON; 0 = make
+/// each fence inline, as before. Read once per process.
+pub(crate) static NVK12_ECL_FENCE_PREFETCH: BoolKnob = BoolKnob::new(c"Nvk12EclFencePrefetch", true);
+
+pub(crate) fn nvk12_ecl_fence_prefetch() -> bool {
+    NVK12_ECL_FENCE_PREFETCH.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {

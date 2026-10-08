@@ -1493,6 +1493,13 @@ extern "C" HRESULT helios_vkd3d_execute_command_lists_rm(ID3D12CommandQueue*, UI
 extern "C" std::uint32_t helios_vkd3d_ecl_fence_stats(std::uint64_t*, std::uint32_t);
 extern "C" std::uint32_t helios_vkd3d_memory_stats(std::uint64_t*, std::uint32_t);
 extern "C" std::uint32_t helios_vkd3d_gpu_time_stats(std::uint64_t*, std::uint32_t);
+extern "C" HRESULT helios_vkd3d_prepare_ecl_fence(ID3D12CommandQueue*);
+
+std::int32_t helios_vkd3d_bridge_prepare_ecl_fence(std::size_t queue) noexcept {
+  return helios_bridge::bridge_guard("prepare_ecl_fence12", std::int32_t(E_FAIL), [&]() -> std::int32_t {
+    return helios_vkd3d_prepare_ecl_fence(reinterpret_cast<ID3D12CommandQueue*>(queue));
+  });
+}
 
 std::uint32_t helios_vkd3d_bridge_gpu_time_stats(rust::Slice<std::uint64_t> out) noexcept {
   return helios_bridge::bridge_guard("gpu_time_stats12", std::uint32_t(0), [&]() -> std::uint32_t {
