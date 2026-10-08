@@ -1,0 +1,405 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 11:48:29 +0200
+Subject: [PATCH] wsi/win32: opt-in per-present frame-time log
+ (HELIOS_VK_FRAMETIME=1)
+
+A Win32 present through the Helios scanout path is a driver escape and
+a GDI present is a StretchBlt: neither raises the DXGI or DxgKrnl
+present events PresentMon builds its frames from, so PresentMon shows no
+frames for a native Vulkan application on NVK.
+
+With HELIOS_VK_FRAMETIME=1 every vkQueuePresentKHR stores two QPC reads
+per swapchain in a lock-free ring; a background thread writes them about
+once a second to %ProgramData%\Helios\vkframes-<pid>.csv
+(HELIOS_VK_FRAMETIME_DIR overrides the folder), with PresentMon v1
+column names: Application, ProcessID, SwapChainAddress, Runtime,
+TimeInSeconds, MsBetweenPresents (per swapchain, NA for its first
+present), MsInPresentAPI (time inside vkQueuePresentKHR) and Result.
+The rest is written when a swapchain is destroyed and at process exit.
+The module is pinned while the thread runs, so the loader's FreeLibrary
+cannot unload it. Off by default; Windows builds only.
+---
+ src/vulkan/wsi/meson.build                  |   2 +-
+ src/vulkan/wsi/wsi_common.c                 |  11 +
+ src/vulkan/wsi/wsi_common_private.h         |   8 +
+ src/vulkan/wsi/wsi_common_win32_frametime.c | 299 ++++++++++++++++++++
+ 4 files changed, 319 insertions(+), 1 deletion(-)
+ create mode 100644 src/vulkan/wsi/wsi_common_win32_frametime.c
+
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 80925d14..7b839b2d 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -28,7 +28,7 @@ if with_platform_wayland
+ endif
+ 
+ if with_platform_windows
+-  files_vulkan_wsi += files('wsi_common_win32.cpp')
++  files_vulkan_wsi += files('wsi_common_win32.cpp', 'wsi_common_win32_frametime.c')
+   platform_deps += dep_dxheaders
+ else
+   files_vulkan_wsi += files('wsi_common_headless.c')
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index ef8eaf2c..9a2d261d 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -667,6 +667,9 @@ wsi_swapchain_get_present_mode(struct wsi_device *wsi,
+ void
+ wsi_swapchain_finish(struct wsi_swapchain *chain)
+ {
++#ifdef _WIN32
++   wsi_win32_frametime_flush();
++#endif
+    wsi_destroy_image_info(chain, &chain->image_info);
+ 
+    if (chain->fences) {
+@@ -2448,6 +2451,10 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+                          struct vk_queue *queue,
+                          const VkPresentInfoKHR *pPresentInfo)
+ {
++#ifdef _WIN32
++   int64_t ft_start = 0;
++   const bool ft_on = wsi_win32_frametime_begin(&ft_start);
++#endif
+    struct vk_device *dev = queue->base.device;
+    uint32_t current_frame = p_atomic_fetch_add(&dev->current_frame, 1);
+    VkResult final_result = handle_trace(queue, dev, current_frame);
+@@ -2931,6 +2938,10 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+    STACK_ARRAY_FINISH(semaphore_wait_infos);
+    STACK_ARRAY_FINISH(results);
+ 
++#ifdef _WIN32
++   if (ft_on)
++      wsi_win32_frametime_end(ft_start, pPresentInfo, final_result);
++#endif
+    return final_result;
+ }
+ 
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 89ebc867..ba65be82 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -629,6 +629,14 @@ wsi_metal_configure_image(const struct wsi_swapchain *chain,
+                           struct wsi_image_info *info);
+ #endif /* defined(VK_USE_PLATFORM_METAL_EXT) */
+ 
++#ifdef _WIN32
++/* Opt-in present log (HELIOS_VK_FRAMETIME=1), wsi_common_win32_frametime.c */
++bool wsi_win32_frametime_begin(int64_t *start);
++void wsi_win32_frametime_end(int64_t start, const VkPresentInfoKHR *info,
++                             VkResult result);
++void wsi_win32_frametime_flush(void);
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/vulkan/wsi/wsi_common_win32_frametime.c b/src/vulkan/wsi/wsi_common_win32_frametime.c
+new file mode 100644
+index 00000000..3e2110fe
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_frametime.c
+@@ -0,0 +1,299 @@
++/*
++ * Copyright © 2026 Ole Algoritme
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++/*
++ * Opt-in per-present frame-time log for the Win32 WSI (HELIOS_VK_FRAMETIME=1).
++ *
++ * A present through the Helios scanout path is a driver escape and a GDI
++ * present is a StretchBlt: neither raises the DXGI or DxgKrnl present events
++ * PresentMon builds its frames from, so PresentMon sees no frames from a
++ * native Vulkan application.  This log gives those frames back: one row per
++ * swapchain per vkQueuePresentKHR in
++ * %ProgramData%\Helios\vkframes-<pid>.csv (HELIOS_VK_FRAMETIME_DIR
++ * overrides the folder), with PresentMon v1 column names:
++ *
++ *   Application,ProcessID,SwapChainAddress,Runtime,TimeInSeconds,
++ *   MsBetweenPresents,MsInPresentAPI,Result
++ *
++ * The present thread only reads QPC twice and stores one ring entry.  A
++ * background thread turns the ring into CSV lines about once a second; the
++ * rest is written at swapchain destruction and at process exit.
++ */
++
++#include "wsi_common_private.h"
++
++#include <windows.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define FT_RING_SIZE (1u << 16) /* power of two; ~65 s at 1000 presents/s */
++#define FT_MAX_CHAINS 16
++
++struct ft_entry {
++   _Atomic uint64_t seq; /* index + 1 once the entry is complete */
++   uint64_t swapchain;
++   int64_t start;        /* QPC at vkQueuePresentKHR entry */
++   int64_t end;          /* QPC at its return */
++   int32_t result;
++};
++
++static struct {
++   bool enabled;
++   _Atomic uint64_t write;
++   uint64_t read;        /* under lock */
++   uint64_t dropped;     /* under lock */
++   struct ft_entry *ring;
++   double ms_per_tick;
++   int64_t t0;
++   FILE *file;
++   char app[MAX_PATH];
++   CRITICAL_SECTION lock;
++   HANDLE thread;
++   struct {
++      uint64_t swapchain;
++      int64_t last_start;
++   } chains[FT_MAX_CHAINS];
++   unsigned next_chain;
++} ft;
++
++static INIT_ONCE ft_once = INIT_ONCE_STATIC_INIT;
++
++static void ft_flush(bool at_exit);
++
++static DWORD WINAPI
++ft_thread(LPVOID arg)
++{
++   (void)arg;
++   for (;;) {
++      Sleep(1000);
++      ft_flush(false);
++   }
++   return 0;
++}
++
++static void
++ft_atexit(void)
++{
++   ft_flush(true);
++}
++
++static FILE *
++ft_open(void)
++{
++   char dir[MAX_PATH];
++   const char *env = getenv("HELIOS_VK_FRAMETIME_DIR");
++   if (env && env[0]) {
++      snprintf(dir, sizeof(dir), "%s", env);
++   } else {
++      const char *pd = getenv("ProgramData");
++      snprintf(dir, sizeof(dir), "%s\\Helios", pd && pd[0] ? pd : "C:\\ProgramData");
++   }
++   CreateDirectoryA(dir, NULL);
++
++   char path[MAX_PATH];
++   snprintf(path, sizeof(path), "%s\\vkframes-%lu.csv", dir,
++            (unsigned long)GetCurrentProcessId());
++   FILE *f = fopen(path, "w");
++   if (!f) {
++      fprintf(stderr, "MESA-WSI: HELIOS_VK_FRAMETIME: cannot write %s\n", path);
++      return NULL;
++   }
++   fputs("Application,ProcessID,SwapChainAddress,Runtime,TimeInSeconds,"
++         "MsBetweenPresents,MsInPresentAPI,Result\n", f);
++   fflush(f);
++   return f;
++}
++
++static BOOL CALLBACK
++ft_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
++{
++   (void)once; (void)param; (void)ctx;
++   const char *env = getenv("HELIOS_VK_FRAMETIME");
++   if (!env || !env[0] || env[0] == '0')
++      return TRUE;
++
++   ft.ring = calloc(FT_RING_SIZE, sizeof(*ft.ring));
++   if (!ft.ring)
++      return TRUE;
++   ft.file = ft_open();
++   if (!ft.file) {
++      free(ft.ring);
++      ft.ring = NULL;
++      return TRUE;
++   }
++
++   LARGE_INTEGER freq, now;
++   QueryPerformanceFrequency(&freq);
++   QueryPerformanceCounter(&now);
++   ft.ms_per_tick = 1000.0 / (double)freq.QuadPart;
++   ft.t0 = now.QuadPart;
++
++   char exe[MAX_PATH] = "";
++   GetModuleFileNameA(NULL, exe, sizeof(exe));
++   const char *base = strrchr(exe, '\\');
++   snprintf(ft.app, sizeof(ft.app), "%s", base ? base + 1 : exe);
++   for (char *c = ft.app; *c; c++) {
++      if (*c == ',')
++         *c = '_';
++   }
++
++   InitializeCriticalSection(&ft.lock);
++
++   /* The flush thread runs code of this DLL until the process ends: pin the
++    * module so the loader's FreeLibrary at vkDestroyInstance cannot unload it
++    * under the thread.  The exit flush then runs at DLL_PROCESS_DETACH.
++    */
++   HMODULE self;
++   GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                      GET_MODULE_HANDLE_EX_FLAG_PIN,
++                      (LPCSTR)(void *)ft_thread, &self);
++   ft.thread = CreateThread(NULL, 0, ft_thread, NULL, 0, NULL);
++   atexit(ft_atexit);
++
++   ft.enabled = true;
++   fprintf(stderr, "MESA-WSI: HELIOS_VK_FRAMETIME: logging presents of %s\n",
++           ft.app);
++   return TRUE;
++}
++
++bool
++wsi_win32_frametime_begin(int64_t *start)
++{
++   InitOnceExecuteOnce(&ft_once, ft_init, NULL, NULL);
++   if (!ft.enabled)
++      return false;
++   LARGE_INTEGER t;
++   QueryPerformanceCounter(&t);
++   *start = t.QuadPart;
++   return true;
++}
++
++void
++wsi_win32_frametime_end(int64_t start, const VkPresentInfoKHR *info,
++                        VkResult result)
++{
++   LARGE_INTEGER t;
++   QueryPerformanceCounter(&t);
++   for (uint32_t i = 0; i < info->swapchainCount; i++) {
++      const uint64_t idx = atomic_fetch_add_explicit(&ft.write, 1,
++                                                     memory_order_relaxed);
++      struct ft_entry *e = &ft.ring[idx & (FT_RING_SIZE - 1)];
++      atomic_store_explicit(&e->seq, 0, memory_order_relaxed);
++      atomic_thread_fence(memory_order_release);
++      e->swapchain = (uint64_t)info->pSwapchains[i];
++      e->start = start;
++      e->end = t.QuadPart;
++      e->result = info->pResults ? (int32_t)info->pResults[i] : (int32_t)result;
++      atomic_store_explicit(&e->seq, idx + 1, memory_order_release);
++   }
++}
++
++/* Under ft.lock: the previous present start of this swapchain (0: none) */
++static int64_t
++ft_chain_last(uint64_t swapchain, int64_t start)
++{
++   for (unsigned i = 0; i < FT_MAX_CHAINS; i++) {
++      if (ft.chains[i].swapchain == swapchain) {
++         const int64_t last = ft.chains[i].last_start;
++         ft.chains[i].last_start = start;
++         return last;
++      }
++   }
++   const unsigned i = ft.next_chain++ % FT_MAX_CHAINS;
++   ft.chains[i].swapchain = swapchain;
++   ft.chains[i].last_start = start;
++   return 0;
++}
++
++static void
++ft_flush(bool at_exit)
++{
++   if (!ft.enabled)
++      return;
++
++   /* At process exit the flush thread is gone, possibly while it held the
++    * lock: write without it then.
++    */
++   bool locked;
++   if (at_exit)
++      locked = TryEnterCriticalSection(&ft.lock);
++   else {
++      EnterCriticalSection(&ft.lock);
++      locked = true;
++   }
++
++   const uint64_t write = atomic_load_explicit(&ft.write, memory_order_acquire);
++   if (write - ft.read > FT_RING_SIZE) {
++      /* The writers lapped the reader: those entries are gone */
++      ft.dropped += write - ft.read - FT_RING_SIZE;
++      ft.read = write - FT_RING_SIZE;
++   }
++   while (ft.read < write) {
++      struct ft_entry *e = &ft.ring[ft.read & (FT_RING_SIZE - 1)];
++      const uint64_t seq = atomic_load_explicit(&e->seq, memory_order_acquire);
++      if (seq < ft.read + 1)
++         break; /* claimed, not yet written: next flush */
++      if (seq > ft.read + 1) {
++         ft.dropped++; /* overwritten by a later lap */
++         ft.read++;
++         continue;
++      }
++      const uint64_t sc = e->swapchain;
++      const int64_t start = e->start, end = e->end;
++      const int32_t res = e->result;
++      atomic_thread_fence(memory_order_acquire);
++      if (atomic_load_explicit(&e->seq, memory_order_relaxed) != seq) {
++         ft.dropped++;
++         ft.read++;
++         continue;
++      }
++      const int64_t last = ft_chain_last(sc, start);
++      char between[32] = "NA";
++      if (last != 0)
++         snprintf(between, sizeof(between), "%.4f", (double)(start - last) * ft.ms_per_tick);
++      fprintf(ft.file, "%s,%lu,0x%016llX,Vulkan,%.6f,%s,%.4f,%d\n",
++              ft.app, (unsigned long)GetCurrentProcessId(),
++              (unsigned long long)sc,
++              (double)(start - ft.t0) * ft.ms_per_tick / 1000.0, between,
++              (double)(end - start) * ft.ms_per_tick, res);
++      ft.read++;
++   }
++   fflush(ft.file);
++
++   if (at_exit && ft.dropped)
++      fprintf(stderr, "MESA-WSI: HELIOS_VK_FRAMETIME: %llu presents dropped\n",
++              (unsigned long long)ft.dropped);
++   if (locked)
++      LeaveCriticalSection(&ft.lock);
++}
++
++void
++wsi_win32_frametime_flush(void)
++{
++   if (ft.enabled)
++      ft_flush(false);
++}
+-- 
+2.43.0
+
