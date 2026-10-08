@@ -97,12 +97,15 @@ struct State {
     svc: Svc,
     h: Handles,
     cache: PrimaryCache,
+    /// The adopted size of each slot's allocation ([`object`]).
+    sizes: [u64; rs::TABLE_CAP],
 }
 
 static STATE: SpinLock<State> = SpinLock::new(State {
     svc: Svc::new(),
     h: Handles::NONE,
     cache: PrimaryCache::WriteCombine,
+    sizes: [0; rs::TABLE_CAP],
 });
 
 /// Allocations alive, mirrored out of `STATE` so [`released`] costs one load when the
@@ -313,6 +316,20 @@ fn create_primary(
     if !adapter.display_half() {
         return Err(Why::NoDisplay);
     }
+    create_with(passive, adapter, width, height, dxgi, None)
+}
+
+/// One RM system-memory allocation adopted by the WDDM allocation being created: the primary's
+/// (`force` None: the cache attribute of `KmdRmSysCache`) or a GDI staging buffer's (`force`
+/// `Some(Cached)`: GDI reads and writes it).
+fn create_with(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    width: u32,
+    height: u32,
+    dxgi: u32,
+    force: Option<Cache>,
+) -> Result<Created, Why> {
     let epoch = adapter
         .with_virtio(|v| v.nvrm_epoch())
         .map_err(|_| Why::NoTransport)?;
@@ -334,7 +351,7 @@ fn create_primary(
     };
     let slot = admit(&io)?;
     // From here the slot is ours: every exit commits it or aborts it.
-    match build(&io, ctx, slot, &lay) {
+    match build(&io, ctx, slot, &lay, force) {
         Ok(created) => Ok(created),
         Err((why, memory_may_be_live)) => {
             {
@@ -469,12 +486,19 @@ struct Made {
 /// `Err((why, memory_may_be_live))`: whether the undo could not make sure RM freed the memory,
 /// so the slot's handle may still be RM's ([`rs::mem_may_be_live`]).
 #[inline(never)]
-fn build(io: &Io<'_>, ctx: u32, slot: usize, lay: &rs::SysLayout) -> Result<Created, (Why, bool)> {
+fn build(
+    io: &Io<'_>,
+    ctx: u32,
+    slot: usize,
+    lay: &rs::SysLayout,
+    force: Option<Cache>,
+) -> Result<Created, (Why, bool)> {
     let (h, cache) = {
         let g = STATE.lock();
-        (g.h, g.cache.sysmem())
+        (g.h, force.unwrap_or(g.cache.sysmem()))
     };
-    let alias = STATE.lock().cache.aliases(adapter_alloc_cached(io.adapter));
+    // The alias check is the primary's (its write-combined default against dxgkrnl's view).
+    let alias = force.is_none() && STATE.lock().cache.aliases(adapter_alloc_cached(io.adapter));
     let mut made = Made::default();
     let r = build_steps(io, ctx, slot, lay, &h, cache, &mut made);
     match r {
@@ -637,6 +661,9 @@ fn build_steps(
     {
         let mut g = STATE.lock();
         g.svc.commit(slot, resource, made.gem);
+        if let Some(sz) = g.sizes.get_mut(slot) {
+            *sz = adopted_size;
+        }
     }
     mirror_live();
     // The mapping and the layout the allocation records are the adopted ones.
@@ -978,8 +1005,10 @@ pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource
     let Some(t) = taken else {
         return;
     };
-    // The screen stops using it first (no flip names a GEM about to be closed).
+    // The screen stops using it first (no flip names a GEM about to be closed); the copy engine's
+    // mapping of a staging buffer goes stale (`RedirVram`).
     super::sysmem_flip::target_gone(adapter, resource_id);
+    super::ce_vram::object_gone(resource_id);
     let epoch_now = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
     let mut freed = true;
     if epoch_now == t.epoch && epoch_now != 0 {
@@ -1056,6 +1085,51 @@ fn wait_released(io: &Io<'_>, w: CloseWait) {
     }
 }
 
+/// `RedirVram` (docs/vram-redirection.md 8): a CPU-visible GDI staging buffer
+/// (`D3DKMDT_GDISURFACE_STAGING_CPUVISIBLE`) from CACHED RM system memory, adopted as a foreign
+/// resource of the KMD's own, so the copy engine reaches it by RM object wherever VidMm keeps it:
+/// in segment 2 its CPU view is this memory (the CPU host aperture maps the `RM_EXPORT` blob), in
+/// system pages its content is the leases (the paging path copies it out and back). `None`: Venus
+/// makes it as before. With `RedirVram` off: one relaxed load.
+#[inline(never)]
+pub(crate) fn try_create_standard(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    width: u32,
+    height: u32,
+    dxgi: u32,
+) -> Option<Created> {
+    if !super::vidmem::knob_on() {
+        return None;
+    }
+    SYS_TRY.fetch_add(1, Ordering::Relaxed);
+    note_stage(stage::ADMIT);
+    let out = match create_with(passive, adapter, width, height, dxgi, Some(Cache::Cached)) {
+        Ok(c) => {
+            SYS_OK.fetch_add(1, Ordering::Relaxed);
+            Some(c)
+        }
+        Err(why) => {
+            venus(why);
+            None
+        }
+    };
+    publish_counters();
+    out
+}
+
+/// The RM object behind `resource_id` if this service made it: `(client, memory handle, size)`
+/// (what the copy engine dups). Spinlock only; one relaxed load while the service has nothing.
+pub(crate) fn object(resource_id: u32) -> Option<(u32, u32, u64)> {
+    if LIVE.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let g = STATE.lock();
+    let (slot, _, _) = g.svc.find(resource_id)?;
+    let size = g.sizes.get(slot).copied().unwrap_or(0);
+    Some((g.h.root, Svc::handle(slot), size))
+}
+
 /// The live slot of `resource_id`, for a flip: `(gem, epoch)`.
 pub(super) fn live_gem(resource_id: u32) -> Option<(u32, u64)> {
     STATE
@@ -1075,6 +1149,7 @@ pub(super) fn forget() {
         // The next generation reads the knob again at its bring-up; until then nothing asks
         // dxgkrnl for `Cached`.
         g.cache = PrimaryCache::WriteCombine;
+        g.sizes = [0; rs::TABLE_CAP];
     }
     LIVE.store(0, Ordering::Relaxed);
     super::sysmem_flip::reset();
