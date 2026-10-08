@@ -210,7 +210,24 @@ fn create_dst_io(
     pfns: &[u64],
     cover: u64,
 ) -> Result<u64, DstFail> {
-    let (h_mem, h_virt) = cr::dst_handles(slot);
+    create_osdesc_io(io, h, cr::dst_handles(slot), cr::dst_va(slot), pfns, cover)
+}
+
+/// [`create_dst`]'s registration and mapping with the caller's handles and window (`ce_sysmem`:
+/// the CE view of a CPU-visible standard buffer's system pages). The caller holds the channel's
+/// I/O, the content transaction and the pin of the leases `pfns` came from.
+pub(crate) fn create_osdesc_io(
+    io: &Io<'_>,
+    h: &Handles,
+    handles: (u32, u32),
+    va: u64,
+    pfns: &[u64],
+    cover: u64,
+) -> Result<u64, DstFail> {
+    if pfns.is_empty() || pfns.len() as u64 * 4096 != cover || !cr::fits_window(cover) {
+        return Err(DstFail::Clean(Fail::new(FailKind::Layout, 0x70)));
+    }
+    let (h_mem, h_virt) = handles;
     let (kind, deep, big) = nvrm::page_run_table(io.passive, pfns)
         .map_err(|_| DstFail::Clean(Fail::new(FailKind::Os, 0x71)))?;
     // `pMemory` is only logged by the host (it substitutes its alias of the runs): the first
@@ -249,7 +266,7 @@ fn create_dst_io(
     if let Err(e) = rc::rm_reply(reply, cr::NVOS02_STATUS_AT) {
         return Err(DstFail::Clean(Fail::from(e)));
     }
-    match ch::gpu_map(io, h, h_virt, h_mem, cr::dst_va(slot), cover) {
+    match ch::gpu_map(io, h, h_virt, h_mem, va, cover) {
         Ok(g) => Ok(g.va),
         Err(f) => {
             // The descriptor exists: free it, or the pages stay pinned with it.
@@ -297,6 +314,44 @@ pub(crate) fn free_dst(
     };
     ch::end_io();
     ok
+}
+
+/// Unmap and free an OS descriptor [`create_osdesc_io`] made. Whether both were confirmed (only
+/// then may its pages be unpinned). The caller holds the channel's I/O.
+pub(crate) fn free_osdesc_io(io: &Io<'_>, h: &Handles, handles: (u32, u32), va: u64, len: u64) -> bool {
+    let (h_mem, h_virt) = handles;
+    let g = GpuMap {
+        virt: h_virt,
+        mem: h_mem,
+        va,
+        len,
+    };
+    let unmapped = ch::gpu_unmap(io, h, &g);
+    unmapped && ch::rm_free(io, h, rc::H_DEVICE, h_mem).is_ok()
+}
+
+/// Run `f` with the channel's I/O (waiting at most `wait_io_ms` for it) and an `Io` on the
+/// channel's client bounded by `limit_ms`. `None`: no channel, or the I/O was not free in time.
+pub(crate) fn with_channel_io<T>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    wait_io_ms: u64,
+    limit_ms: u32,
+    f: impl FnOnce(&Io<'_>, &Handles) -> T,
+) -> Option<T> {
+    let (Some(h), Some(epoch)) = (ch::handles(), epoch(adapter)) else {
+        return None;
+    };
+    if !take_io(passive, wait_io_ms) {
+        return None;
+    }
+    let r = {
+        let _bounded = crate::ddi::escape_wait::begin_bounded(limit_ms);
+        let io = io(passive, adapter, epoch, u64::from(limit_ms));
+        f(&io, &h)
+    };
+    ch::end_io();
+    Some(r)
 }
 
 /// `IO_BUSY`, waiting at most `ms` of interrupt time (each sleep rounds up to the timer

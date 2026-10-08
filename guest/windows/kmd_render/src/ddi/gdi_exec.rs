@@ -60,6 +60,12 @@ static CH_UP: AtomicU32 = AtomicU32::new(0);
 static CE_WHY: AtomicU32 = AtomicU32::new(0);
 /// Copies from a VRAM surface into a standard buffer (a GDI readback: a screen or window read).
 static RD_BACK: AtomicU32 = AtomicU32::new(0);
+/// Copies and fills with a staging buffer on one side done on the copy engine over its system
+/// pages; refused (CPU instead: not system-resident, partial leases, busy, staging to staging);
+/// failed after the mapping (submit or wait; CPU instead).
+static SYS_CE: AtomicU32 = AtomicU32::new(0);
+static SYS_REF: AtomicU32 = AtomicU32::new(0);
+static SYS_FAIL: AtomicU32 = AtomicU32::new(0);
 
 /// The timeline's completed watermark, for [`seq_ready`].
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -105,7 +111,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 pub(crate) fn reset_for_start(_on: bool) {
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -139,6 +145,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiChUp", CH_UP.load(Ordering::Relaxed));
     w(b"GdiCeWhy", CE_WHY.load(Ordering::Relaxed));
     w(b"GdiRdBk", RD_BACK.load(Ordering::Relaxed));
+    w(b"GdiSysCe", SYS_CE.load(Ordering::Relaxed));
+    w(b"GdiSysRef", SYS_REF.load(Ordering::Relaxed));
+    w(b"GdiSysFail", SYS_FAIL.load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
 }
 
@@ -428,7 +437,19 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
                 run_cpu_counted(passive, adapter, op);
             }
         }
-        Engine::Cpu => run_cpu_counted(passive, adapter, op),
+        Engine::Cpu => {
+            // A copy or fill that touches a staging buffer: the copy engine over its system pages
+            // first, the CPU only when that is refused.
+            if op.why == Some(Why::SystemSurface) && run_ce_sys(passive, adapter, op) {
+                SYS_CE.fetch_add(1, Ordering::Relaxed);
+                match op.cmd {
+                    Cmd::ColorFill { .. } => FILL_N.fetch_add(1, Ordering::Relaxed),
+                    _ => BLT_N.fetch_add(1, Ordering::Relaxed),
+                };
+            } else {
+                run_cpu_counted(passive, adapter, op);
+            }
+        }
     }
 }
 
@@ -458,9 +479,28 @@ fn run_ce(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
         CE_WHY.store(2, Ordering::Relaxed);
         return false;
     };
+    let sv = match op.cmd {
+        Cmd::BitBlt { .. } => {
+            let Some(src) = op.srcs[0] else {
+                return false;
+            };
+            let Some(sv) = glue::ce_surface(passive, adapter, src.resource_id) else {
+                CE_WHY.store(3, Ordering::Relaxed);
+                return false;
+            };
+            Some(sv)
+        }
+        _ => None,
+    };
+    submit_and_wait(passive, op, &dv, sv.as_ref())
+}
+
+/// The copy-engine pushes of a SRCCOPY BitBlt (`sv` the source view) or a PATCOPY ColorFill into
+/// `dv`, waited for. Spinlocks and polling only: callable inside `ce_sysmem::with_standard`.
+fn submit_and_wait(passive: PassiveLevel, op: &Op, dv: &CeView, sv: Option<&CeView>) -> bool {
     let mut last = None;
-    match op.cmd {
-        Cmd::ColorFill { color, .. } => {
+    match (op.cmd, sv) {
+        (Cmd::ColorFill { color, .. }, _) => {
             let per = ga::rects_per_push(glue::SLOT_DWORDS, ga::FILL_STATE_DWORDS, ga::FILL_RECT_DWORDS).max(1);
             for chunk in op.subs.chunks(per) {
                 let v = glue::submit(|p, _gen, done| {
@@ -472,31 +512,26 @@ fn run_ce(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
                 });
                 let Some(v) = v else {
                     CE_WHY.store(4, Ordering::Relaxed);
+                    let _ = wait_last(passive, last);
                     return false;
                 };
                 CE_SUB.fetch_add(1, Ordering::Relaxed);
                 last = Some(v);
             }
         }
-        Cmd::BitBlt { src: sr, dst: dr, .. } => {
-            let Some(src) = op.srcs[0] else {
-                return false;
-            };
-            let Some(sv) = glue::ce_surface(passive, adapter, src.resource_id) else {
-                CE_WHY.store(3, Ordering::Relaxed);
-                return false;
-            };
+        (Cmd::BitBlt { src: sr, dst: dr, .. }, Some(sv)) => {
             let per = ga::rects_per_push(glue::SLOT_DWORDS, 0, ga::COPY_RECT_DWORDS).max(1);
             for chunk in op.subs.chunks(per) {
                 let v = glue::submit(|p, gen, done| {
                     for r in chunk {
                         let s = ga::bitblt_src(r, &dr, &sr);
-                        ga::copy_rect(p, gen, &sv, &s, &dv, r)?;
+                        ga::copy_rect(p, gen, sv, &s, dv, r)?;
                     }
                     cp::release(p, done)
                 });
                 let Some(v) = v else {
                     CE_WHY.store(4, Ordering::Relaxed);
+                    let _ = wait_last(passive, last);
                     return false;
                 };
                 CE_SUB.fetch_add(1, Ordering::Relaxed);
@@ -505,16 +540,82 @@ fn run_ce(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
         }
         _ => return false,
     }
+    if wait_last(passive, last) {
+        true
+    } else {
+        CE_WHY.store(5, Ordering::Relaxed);
+        // The copies may still land; the CPU redo writes the same pixels.
+        false
+    }
+}
+
+/// Wait for the last submitted value (none: nothing to wait for). A push refused part-way still
+/// waits for the earlier ones: nothing may be in flight once a caller's transaction ends.
+fn wait_last(passive: PassiveLevel, last: Option<u64>) -> bool {
     match last {
         None => true,
-        Some(v) => {
-            if glue::wait(passive, v, ga::CE_DEADLINE_MS) {
-                true
-            } else {
-                CE_WHY.store(5, Ordering::Relaxed);
-                // The copies may still land; the CPU redo writes the same pixels.
-                false
+        Some(v) => glue::wait(passive, v, ga::CE_DEADLINE_MS),
+    }
+}
+
+/// A SRCCOPY BitBlt or PATCOPY ColorFill with a KMD standard buffer (staging) on one side: one
+/// copy-engine copy (or fill) over the buffer's system pages (`ce_sysmem::with_standard`), the
+/// other side VRAM (or the fill's color). `false`: refused (not system-resident, partial leases,
+/// channel busy, a staging-to-staging copy), the caller takes the CPU path.
+fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
+    let Some(dst) = op.dst else {
+        return false;
+    };
+    if glue::channel_state() != 0 {
+        return false;
+    }
+    let (dpc, spc) = cmd_pitches(&op.cmd);
+    let r = match op.cmd {
+        Cmd::ColorFill { rop, .. } if rop == ga::cfrop::PATCOPY && dst.class == SurfaceClass::System => {
+            let dp = pitch_of(&dst, dpc);
+            glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
+                submit_and_wait(passive, op, dv, None)
+            })
+        }
+        Cmd::BitBlt { rop, .. } if rop == ga::rop::SRCCOPY => {
+            let Some(src) = op.srcs[0] else {
+                return false;
+            };
+            match (src.class, dst.class) {
+                (SurfaceClass::Vram, SurfaceClass::System) => {
+                    // The VRAM side first: it takes the channel's I/O itself.
+                    let Some(sv) = glue::ce_surface(passive, adapter, src.resource_id) else {
+                        return false;
+                    };
+                    RD_BACK.fetch_add(1, Ordering::Relaxed);
+                    let dp = pitch_of(&dst, dpc);
+                    glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
+                        submit_and_wait(passive, op, dv, Some(&sv))
+                    })
+                }
+                (SurfaceClass::System, SurfaceClass::Vram) => {
+                    let Some(dv) = glue::ce_surface(passive, adapter, dst.resource_id) else {
+                        return false;
+                    };
+                    let sp = pitch_of(&src, spc);
+                    glue::with_standard(passive, adapter, src.resource_id, sp, src.width, src.height, |sv| {
+                        submit_and_wait(passive, op, &dv, Some(sv))
+                    })
+                }
+                _ => None,
             }
+        }
+        _ => None,
+    };
+    match r {
+        Some(true) => true,
+        Some(false) => {
+            SYS_FAIL.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        None => {
+            SYS_REF.fetch_add(1, Ordering::Relaxed);
+            false
         }
     }
 }

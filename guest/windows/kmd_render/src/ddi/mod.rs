@@ -17,6 +17,7 @@ pub(crate) mod cpu_host_aperture;
 pub(crate) mod blt_async;
 pub(crate) mod ce_record;
 pub(crate) mod ce_present_route;
+pub(crate) mod ce_sysmem;
 pub(crate) mod create_allocation;
 pub(crate) mod device_lost;
 pub(crate) mod display;
