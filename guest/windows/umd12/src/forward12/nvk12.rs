@@ -153,6 +153,112 @@ static ECL_WAIT_STATS: EclWaitStats = EclWaitStats {
     buckets: [const { AtomicU64::new(0) }; ECL_WAIT_BUCKETS_US.len() + 1],
 };
 
+/// Frames per frame-accounting line.
+const FRAME_LOG_EVERY: u64 = 1024;
+
+/// Per-frame accounting of the D3D12 thread time this driver owns, so the
+/// frame splits into "inside our DDIs" and "everything else" (the app's own
+/// work, command-list recording through vkd3d and NVK, the runtime) without a
+/// profiler. A frame is present-to-present; ECL and wait time accumulate
+/// between presents. All D3D12 queues of the process share one set (Basemark
+/// submits from one thread; a multi-threaded submitter sums its threads).
+pub(crate) struct FrameStats {
+    /// ECL DDI wall time since the last present (ns), wait included.
+    ecl_ns: AtomicU64,
+    ecl_calls: AtomicU64,
+    /// Of which ECL CPU waits (ns).
+    wait_ns: AtomicU64,
+    /// Window sums, ns, and the window's frame count.
+    acc: Mutex<FrameAcc>,
+}
+
+struct FrameAcc {
+    last_present_end: Option<Instant>,
+    frames: u64,
+    frame_ns: u64,
+    ecl_ns: u64,
+    ecl_calls: u64,
+    wait_ns: u64,
+    present_ns: u64,
+    total_frames: u64,
+}
+
+fn ns_of(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl FrameStats {
+    pub(crate) fn note_ecl(&self, elapsed: Duration) {
+        self.ecl_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+        self.ecl_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_wait(&self, elapsed: Duration) {
+        self.wait_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+    }
+
+    /// Close a frame: `started` is the Present DDI's entry.
+    pub(crate) fn note_present(&self, started: Instant) {
+        let now = Instant::now();
+        let present_ns = ns_of(now - started);
+        let ecl_ns = self.ecl_ns.swap(0, Ordering::Relaxed);
+        let ecl_calls = self.ecl_calls.swap(0, Ordering::Relaxed);
+        let wait_ns = self.wait_ns.swap(0, Ordering::Relaxed);
+        let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(last) = acc.last_present_end.replace(now) else {
+            return; // the first present only opens a frame
+        };
+        acc.frames += 1;
+        acc.total_frames += 1;
+        acc.frame_ns += ns_of(now - last);
+        acc.ecl_ns += ecl_ns;
+        acc.ecl_calls += ecl_calls;
+        acc.wait_ns += wait_ns;
+        acc.present_ns += present_ns;
+        if acc.frames < FRAME_LOG_EVERY && acc.total_frames != 1 {
+            return;
+        }
+        let f = acc.frames;
+        let per = |ns: u64| ns / f / 1000;
+        let other = acc.frame_ns.saturating_sub(acc.ecl_ns + acc.present_ns);
+        log_error!(
+            "D3D12 frame time ({} frames, total {}): frame {} us = ECL {} us ({} calls, of which \
+             CPU wait {} us) + Present {} us + outside the driver's queue DDIs {} us",
+            f,
+            acc.total_frames,
+            per(acc.frame_ns),
+            per(acc.ecl_ns),
+            acc.ecl_calls / f,
+            per(acc.wait_ns),
+            per(acc.present_ns),
+            per(other),
+        );
+        let total_frames = acc.total_frames;
+        let last_present_end = acc.last_present_end;
+        *acc = FrameAcc { last_present_end, total_frames, ..FrameAcc::EMPTY };
+    }
+}
+
+impl FrameAcc {
+    const EMPTY: Self = Self {
+        last_present_end: None,
+        frames: 0,
+        frame_ns: 0,
+        ecl_ns: 0,
+        ecl_calls: 0,
+        wait_ns: 0,
+        present_ns: 0,
+        total_frames: 0,
+    };
+}
+
+pub(crate) static FRAME_STATS: FrameStats = FrameStats {
+    ecl_ns: AtomicU64::new(0),
+    ecl_calls: AtomicU64::new(0),
+    wait_ns: AtomicU64::new(0),
+    acc: Mutex::new(FrameAcc::EMPTY),
+};
+
 /// The worker's wait slice: it rechecks its stop flag this often.
 const WORKER_SLICE_NS: u64 = 100_000_000;
 
@@ -255,7 +361,9 @@ impl NvkSync {
             // SAFETY: the live engine queue.
             None => unsafe { crate::bridge12::wait_execution(engine_queue, value, CPU_WAIT_NS) },
         };
-        ECL_WAIT_STATS.record(started.elapsed(), polled.is_some());
+        let waited = started.elapsed();
+        FRAME_STATS.note_wait(waited);
+        ECL_WAIT_STATS.record(waited, polled.is_some());
         match result {
             Ok(true) => {
                 NVK_REFUSALS.cpu_waits.bump();

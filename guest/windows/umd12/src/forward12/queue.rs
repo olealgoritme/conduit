@@ -3014,6 +3014,22 @@ unsafe extern "system" fn execute_command_lists(
     count: ddi12::UINT,
     lists: *const ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
+    // Per-frame accounting (`nvk12::FrameStats`): the whole DDI, wait included.
+    let started = std::time::Instant::now();
+    // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
+    unsafe { execute_command_lists_body(h_queue, count, lists) };
+    super::nvk12::FRAME_STATS.note_ecl(started.elapsed());
+}
+
+/// The body of [`execute_command_lists`].
+///
+/// # Safety
+/// As [`execute_command_lists`].
+unsafe fn execute_command_lists_body(
+    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    count: ddi12::UINT,
+    lists: *const ddi12::D3D12DDI_HCOMMANDLIST,
+) {
     // SAFETY: the caller guarantees a live handle from `create_command_queue`.
     let Some(queue) = (unsafe { queue_state(h_queue) }) else {
         note_refusal(&L2_REFUSALS.execute_command_lists_bad_arg);
