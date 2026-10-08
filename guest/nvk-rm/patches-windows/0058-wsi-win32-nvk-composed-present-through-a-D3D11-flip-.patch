@@ -1,0 +1,1205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 14:24:25 +0200
+Subject: [PATCH] wsi/win32, nvk: composed present through a D3D11 flip swap
+ chain (NVK_HELIOS_WSI_COMPOSE=1)
+
+Under a DWM on NVK, NVK's Win32 swapchains take the WSI's GDI path
+(patch 50): a GPU copy into system memory, a CPU wait and copy, and a
+StretchBlt per frame. A D3D11 application's frames instead reach DWM
+through the Helios D3D11 driver's composed present.
+
+With NVK_HELIOS_WSI_COMPOSE=1 a window swapchain does the same:
+
+- the WSI creates a D3D11 device on the Helios adapter (the first DXGI
+  adapter whose description names Helios, MESA_WSI_COMPOSE_ADAPTER=<n>
+  picks one by index) and a DXGI flip-model swap chain for the window,
+  kept on the surface across swapchain re-creations (ResizeBuffers);
+- every swapchain image is a D3D11 shared texture of that device; the
+  WSI opens it through D3DKMT and reads what the Helios KMD records for
+  the allocation (HeliosWddmOpenIdentity: resource id, size;
+  HeliosWddmAllocLayout: modifier, stride, offset), and NVK imports that
+  resource id as the image's dedicated memory (patch 0031's shared
+  surface import, wsi_device::win32.compose_import), so the application
+  renders into the texture;
+- a present (after the common CPU wait for the rendering) copies the
+  texture into the back buffer on the D3D11 device, presents with sync
+  interval 1 for FIFO and 0 otherwise, and waits for the copy before the
+  image can be acquired again.
+
+Any failure (no Helios adapter, D3D11 device, swap chain, texture, open,
+an identity that is not an RM resource, a refused import) is logged and
+the swapchain falls back to Helios scanout or GDI as before. The D3D11
+side lives in wsi_common_win32_compose.cpp (d3d11.h and the
+DirectX-Headers' d3d12.h do not mix); D3D11, DXGI and D3DKMT entry
+points are loaded at run time. Formats: B8G8R8A8 and R8G8B8A8 (UNORM,
+SRGB). Off by default.
+---
+ src/nouveau/vulkan/nvk_wsi.c                |  71 +++
+ src/vulkan/wsi/meson.build                  |   2 +-
+ src/vulkan/wsi/wsi_common.c                 |   5 +
+ src/vulkan/wsi/wsi_common.h                 |  25 +
+ src/vulkan/wsi/wsi_common_private.h         |  28 +
+ src/vulkan/wsi/wsi_common_win32.cpp         | 174 +++++-
+ src/vulkan/wsi/wsi_common_win32_compose.cpp | 645 ++++++++++++++++++++
+ 7 files changed, 948 insertions(+), 2 deletions(-)
+ create mode 100644 src/vulkan/wsi/wsi_common_win32_compose.cpp
+
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index b9d73808..689b03f4 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -10,8 +10,10 @@
+ #ifdef _WIN32
+ #include "nvk_device.h"
+ #include "nvk_device_memory.h"
++#include "nvk_entrypoints.h"
+ #include "nvk_image.h"
+ #include "nvkmd/rm/nvkmd_rm.h"
++#include "helios_icd_interface.h"
+ #include "drm-uapi/drm_fourcc.h"
+ #include "util/u_debug.h"
+ #include "vk_queue.h"
+@@ -130,6 +132,61 @@ nvk_wsi_scanout_wait_released(VkDevice _device, VkDeviceMemory _mem,
+    return nvkmd_rm_mem_scanout_wait_released(mem->mem, timeout_ns);
+ }
+ 
++/* Composed present (NVK_HELIOS_WSI_COMPOSE=1): the swapchain image's memory
++ * is the D3D11 shared texture the WSI made, imported by its Helios resource
++ * id (patch 0031's shared-surface import) */
++static VkResult
++nvk_wsi_compose_import(VkDevice _device, VkImage _image,
++                       const struct wsi_win32_compose_import *import,
++                       VkDeviceMemory *memory)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++
++   const VkImageMemoryRequirementsInfo2 req_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++      .image = _image,
++   };
++   VkMemoryRequirements2 reqs2 = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++   };
++   nvk_GetImageMemoryRequirements2(_device, &req_info, &reqs2);
++   const VkMemoryRequirements reqs = reqs2.memoryRequirements;
++
++   uint32_t type_index = UINT32_MAX;
++   for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
++      if ((reqs.memoryTypeBits & BITFIELD_BIT(i)) &&
++          (pdev->mem_types[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++         type_index = i;
++         break;
++      }
++   }
++   if (type_index == UINT32_MAX)
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "compose: no device-local memory type for the image");
++
++   const struct helios_import_memory_resource_info helios = {
++      .sType = HELIOS_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO,
++      .resource_id = import->resource_id,
++      .size = import->size,
++      .modifier = import->modifier,
++      .stride = import->stride,
++      .offset = import->offset,
++   };
++   const VkMemoryDedicatedAllocateInfo dedicated = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++      .pNext = &helios,
++      .image = _image,
++   };
++   const VkMemoryAllocateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &dedicated,
++      .allocationSize = reqs.size,
++      .memoryTypeIndex = type_index,
++   };
++   return nvk_AllocateMemory(_device, &info, &dev->vk.alloc, memory);
++}
++
+ static void
+ nvk_wsi_scanout_release(VkDevice _device)
+ {
+@@ -190,6 +247,20 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+       !debug_get_bool_option("NVK_HELIOS_WSI_SCANOUT", false);
+    if (dwm_composes)
+       mesa_logi("NVK: DWM on NVK composes this desktop: no scanout swap chains");
++
++   /* Opt-in: window swapchains present through a D3D11 flip swap chain on
++    * the Helios adapter, their images D3D11 shared textures imported by
++    * resource id, so DWM composes them (before scanout and GDI) */
++   if (debug_get_bool_option("NVK_HELIOS_WSI_COMPOSE", false)) {
++      if (nvkmd_rm_win_shared_import_supported()) {
++         pdev->wsi_device.win32.compose_import = nvk_wsi_compose_import;
++         mesa_logi("NVK: NVK_HELIOS_WSI_COMPOSE=1: window swap chains present "
++                   "through a D3D11 flip swap chain");
++      } else {
++         mesa_loge("NVK: NVK_HELIOS_WSI_COMPOSE=1, but the KMD or librmclient "
++                   "has no shared-surface import: not composing");
++      }
++   }
+    if (!dwm_composes && nvkmd_rm_scanout_supported(pdev->nvkmd)) {
+       pdev->wsi_device.win32.scanout_export = nvk_wsi_scanout_export;
+       pdev->wsi_device.win32.scanout_flip = nvk_wsi_scanout_flip;
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 7b839b2d..d5201a2c 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -28,7 +28,7 @@ if with_platform_wayland
+ endif
+ 
+ if with_platform_windows
+-  files_vulkan_wsi += files('wsi_common_win32.cpp', 'wsi_common_win32_frametime.c')
++  files_vulkan_wsi += files('wsi_common_win32.cpp', 'wsi_common_win32_frametime.c', 'wsi_common_win32_compose.cpp')
+   platform_deps += dep_dxheaders
+ else
+   files_vulkan_wsi += files('wsi_common_headless.c')
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 74a057fd..28db48fd 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -432,6 +432,9 @@ get_blit_type(const struct wsi_device *wsi,
+        * tiling with a DRM format modifier
+        */
+       return WSI_SWAPCHAIN_NO_BLIT;
++   case WSI_IMAGE_TYPE_WIN32_COMPOSE:
++      /* Rendered into the D3D11 shared texture itself */
++      return WSI_SWAPCHAIN_NO_BLIT;
+ #endif
+ #if defined(VK_USE_PLATFORM_METAL_EXT)
+    case WSI_IMAGE_TYPE_METAL: {
+@@ -483,6 +486,8 @@ configure_image(const struct wsi_swapchain *chain,
+    }
+    case WSI_IMAGE_TYPE_WIN32_SCANOUT:
+       return wsi_win32_scanout_configure_image(chain, pCreateInfo, info);
++   case WSI_IMAGE_TYPE_WIN32_COMPOSE:
++      return wsi_win32_compose_configure_image(chain, pCreateInfo, info);
+ #endif
+ #if defined(VK_USE_PLATFORM_METAL_EXT)
+    case WSI_IMAGE_TYPE_METAL: {
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index 3e19741b..80049fe8 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -54,6 +54,18 @@ struct driOptionCache;
+ 
+ #define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_METAL + 1)
+ 
++/* What a composed present's swapchain image is (wsi_device::win32.
++ * compose_import): the Helios resource id of a D3D11 shared texture, the
++ * object's size and the layout the image must have.
++ */
++struct wsi_win32_compose_import {
++   uint32_t resource_id;
++   uint64_t size;
++   uint64_t modifier;
++   uint32_t stride;
++   uint32_t offset;
++};
++
+ /* What wsi_device::win32.scanout_flip shows: plane 0 of the memory */
+ struct wsi_win32_scanout_flip {
+    uint32_t width, height;
+@@ -201,6 +213,19 @@ struct wsi_device {
+                                         uint64_t timeout_ns);
+       void (*scanout_release)(VkDevice device);
+       bool scanout_linear;
++
++      /* Composed presentation (Conduit Helios, opt-in): window swapchains
++       * present through a DXGI flip swap chain of a D3D11 device on the
++       * same adapter, so DWM composes them like a D3D11 application's
++       * frames.  Each swapchain image is a D3D11 shared texture; the WSI
++       * reads its resource id and layout and the driver imports it as the
++       * image's (dedicated) memory here, so the application renders into
++       * the texture itself.  NULL: no composed path.  A failure anywhere
++       * makes the swapchain fall back to scanout or GDI.
++       */
++      VkResult (*compose_import)(VkDevice device, VkImage image,
++                                 const struct wsi_win32_compose_import *import,
++                                 VkDeviceMemory *memory);
+    } win32;
+ 
+    struct {
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 6670c31b..5691f813 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -50,6 +50,7 @@ enum wsi_image_type {
+    WSI_IMAGE_TYPE_DXGI,
+    WSI_IMAGE_TYPE_METAL,
+    WSI_IMAGE_TYPE_WIN32_SCANOUT,
++   WSI_IMAGE_TYPE_WIN32_COMPOSE,
+ };
+ 
+ struct wsi_base_image_params {
+@@ -414,6 +415,33 @@ wsi_win32_scanout_configure_image(const struct wsi_swapchain *chain,
+                                   const VkSwapchainCreateInfoKHR *pCreateInfo,
+                                   struct wsi_image_info *info);
+ 
++VkResult
++wsi_win32_compose_configure_image(const struct wsi_swapchain *chain,
++                                  const VkSwapchainCreateInfoKHR *pCreateInfo,
++                                  struct wsi_image_info *info);
++
++/* wsi_common_win32_compose.cpp: the D3D11 side of a composed present */
++struct wsi_win32_compose;
++struct wsi_win32_compose_image {
++   void *texture;          /* ID3D11Texture2D, shared */
++   void *query;            /* ID3D11Query (event) */
++   uint32_t kmt_resource;  /* D3DKMT handle of our open of it */
++};
++bool wsi_win32_compose_format_supported(VkFormat format);
++VkResult wsi_win32_compose_open(struct wsi_win32_compose **inout, void *hwnd,
++                                uint32_t width, uint32_t height,
++                                VkFormat format, uint32_t buffers);
++void wsi_win32_compose_destroy(struct wsi_win32_compose *compose);
++VkResult wsi_win32_compose_image_create(struct wsi_win32_compose *compose,
++                                        uint32_t width, uint32_t height,
++                                        struct wsi_win32_compose_image *image,
++                                        struct wsi_win32_compose_import *import);
++void wsi_win32_compose_image_destroy(struct wsi_win32_compose *compose,
++                                     struct wsi_win32_compose_image *image);
++VkResult wsi_win32_compose_present(struct wsi_win32_compose *compose,
++                                   struct wsi_win32_compose_image *image,
++                                   uint32_t sync_interval);
++
+ bool
+ wsi_cpu_image_needs_buffer_blit(const struct wsi_device *wsi,
+                                 const struct wsi_cpu_image_params *params);
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 28b4c9e4..78e376de 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -28,6 +28,7 @@
+ #include <string.h>
+ 
+ #include "util/cnd_monotonic.h"
++#include "util/log.h"
+ #include "util/os_time.h"
+ #include "util/u_debug.h"
+ #include "util/timespec.h"
+@@ -89,6 +90,8 @@ struct wsi_win32_image {
+    } sw;
+    /* DRM format modifier the scanout image is presented with (0: linear) */
+    uint64_t scanout_modifier;
++   /* Composed present: the D3D11 shared texture this image is */
++   struct wsi_win32_compose_image compose;
+ };
+ 
+ struct wsi_win32_surface {
+@@ -104,6 +107,11 @@ struct wsi_win32_surface {
+    IDCompositionTarget *target;
+    IDCompositionVisual *visual;
+    struct wsi_win32_swapchain *current_swapchain;
++
++   /* Composed present (wsi_device::win32.compose_import): the window's D3D11
++    * device and DXGI swap chain, kept across swapchain re-creations (a
++    * window has one flip-model swap chain at a time). */
++   struct wsi_win32_compose *compose;
+ };
+ 
+ struct wsi_win32_swapchain {
+@@ -147,6 +155,13 @@ struct wsi_win32_swapchain {
+       bool release;
+    } scanout;
+ 
++   /* Composed presentation (wsi_device::win32.compose_import) */
++   struct {
++      bool enabled;
++      uint32_t sync_interval;
++      bool presented;
++   } compose;
++
+    struct wsi_win32_image     images[0];
+ };
+ 
+@@ -192,6 +207,7 @@ wsi_win32_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
+ {
+    VK_FROM_HANDLE(vk_instance, instance, _instance);
+    wsi_win32_surface *surface = (wsi_win32_surface *)icd_surface;
++   wsi_win32_compose_destroy(surface->compose);
+    if (surface->visual)
+       surface->visual->Release();
+    if (surface->target)
+@@ -841,6 +857,92 @@ wsi_win32_scanout_configure_image(const struct wsi_swapchain *chain,
+    return VK_SUCCESS;
+ }
+ 
++/*
++ * Composed presentation (Conduit Helios, wsi_device::win32.compose_import)
++ *
++ * The images are D3D11 shared textures of the window's D3D11 device
++ * (wsi_common_win32_compose.cpp), imported by resource id: the application
++ * renders into them, and a present copies one into the DXGI swap chain's
++ * back buffer and presents it, so DWM composes the window as it does a
++ * D3D11 application's.
++ */
++static VkResult
++wsi_win32_create_compose_image_mem(const struct wsi_swapchain *drv_chain,
++                                   const struct wsi_image_info *info,
++                                   struct wsi_image *image)
++{
++   struct wsi_win32_swapchain *chain =
++      (struct wsi_win32_swapchain *)drv_chain;
++   struct wsi_win32_image *win32_image =
++      container_of(image, struct wsi_win32_image, base);
++   const struct wsi_device *wsi = drv_chain->wsi;
++
++   struct wsi_win32_compose_import imp = {};
++   VkResult result =
++      wsi_win32_compose_image_create(chain->surface->compose,
++                                     info->create.extent.width,
++                                     info->create.extent.height,
++                                     &win32_image->compose, &imp);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = wsi->win32.compose_import(drv_chain->device, image->image, &imp,
++                                      &image->memory);
++   if (result != VK_SUCCESS) {
++      mesa_loge("MESA-WSI: compose: importing resource %u into the Vulkan "
++                "device failed (%d)", imp.resource_id, (int)result);
++      wsi_win32_compose_image_destroy(chain->surface->compose,
++                                      &win32_image->compose);
++      return result;
++   }
++   mesa_logi("MESA-WSI: compose: resource %u imported as swapchain image %u",
++             imp.resource_id, (unsigned)(win32_image - chain->images));
++
++   image->num_planes = 1;
++   image->sizes[0] = imp.size;
++   image->row_pitches[0] = imp.stride;
++   image->offsets[0] = imp.offset;
++   return VK_SUCCESS;
++}
++
++VkResult
++wsi_win32_compose_configure_image(const struct wsi_swapchain *chain,
++                                  const VkSwapchainCreateInfoKHR *pCreateInfo,
++                                  struct wsi_image_info *info)
++{
++   VkResult result = wsi_configure_image(chain, pCreateInfo, 0, info);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* The layout the D3D11 driver gives the same texture: OPTIMAL, one
++    * level, one layer (the import checks it against the KMD's record) */
++   info->create.tiling = VK_IMAGE_TILING_OPTIMAL;
++   info->select_image_memory_type = wsi_select_device_memory_type;
++   info->create_mem = wsi_win32_create_compose_image_mem;
++   return VK_SUCCESS;
++}
++
++static VkResult
++wsi_win32_queue_present_compose(struct wsi_win32_swapchain *chain,
++                                struct wsi_win32_image *image)
++{
++   /* The rendering has finished (the common present waits for it: the
++    * driver is a software WSI device) */
++   /* A retired swapchain whose window gave up its D3D11 swap chain */
++   VkResult result = chain->surface->compose == NULL ? VK_ERROR_OUT_OF_DATE_KHR :
++      wsi_win32_compose_present(chain->surface->compose, &image->compose,
++                                chain->compose.sync_interval);
++   chain->compose.presented = true;
++   if (result != VK_SUCCESS)
++      chain->status = result;
++
++   mtx_lock(&chain->acquire_mutex);
++   image->state = WSI_IMAGE_IDLE;
++   u_cnd_monotonic_broadcast(&chain->acquire_cond);
++   mtx_unlock(&chain->acquire_mutex);
++   return result;
++}
++
+ static VkResult
+ wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
+                                 struct wsi_win32_image *image)
+@@ -964,7 +1066,7 @@ wsi_win32_image_init(VkDevice device_h,
+    chain->wnd = win32_surface->hwnd;
+    image->chain = chain;
+ 
+-   if (chain->dxgi || chain->scanout.enabled)
++   if (chain->dxgi || chain->scanout.enabled || chain->compose.enabled)
+       return VK_SUCCESS;
+ 
+    chain->chain_dc = GetDC(chain->wnd);
+@@ -1000,6 +1102,9 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
+ {
+    if (image->dxgi.swapchain_res)
+       image->dxgi.swapchain_res->Release();
++   if (image->compose.texture || image->compose.kmt_resource)
++      wsi_win32_compose_image_destroy(chain->surface ? chain->surface->compose : NULL,
++                                      &image->compose);
+ 
+    if (image->sw.dc)
+       DeleteDC(image->sw.dc);
+@@ -1295,6 +1400,9 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+    if (chain->dxgi)
+       return wsi_win32_queue_present_dxgi(chain, image, damage);
+ 
++   if (chain->compose.enabled)
++      return wsi_win32_queue_present_compose(chain, image);
++
+    if (chain->scanout.enabled)
+       return wsi_win32_queue_present_scanout(chain, image);
+ 
+@@ -1441,6 +1549,10 @@ wsi_win32_surface_create_swapchain(
+       WSI_IMAGE_TYPE_WIN32_SCANOUT,
+    };
+ 
++   struct wsi_base_image_params compose_image_params = {
++      WSI_IMAGE_TYPE_WIN32_COMPOSE,
++   };
++
+    bool supports_dxgi = wsi->dxgi.factory &&
+                         wsi->dxgi.dcomp &&
+                         wsi->wsi->win32.get_d3d12_command_queue;
+@@ -1455,11 +1567,41 @@ wsi_win32_surface_create_swapchain(
+                             create_info->imageArrayLayers == 1;
+    if (try_scanout)
+       image_params = &scanout_image_params;
++   struct wsi_base_image_params *fallback_params = image_params;
++
++   /* Composed presentation first when the driver offers it: the window's
++    * D3D11 device and DXGI swap chain must exist before the images */
++   if (wsi_device->win32.compose_import != NULL &&
++       create_info->imageArrayLayers == 1 &&
++       wsi_win32_compose_format_supported(create_info->imageFormat)) {
++      VkResult cr = wsi_win32_compose_open(&surface->compose,
++                                           (void *)surface->base.hwnd,
++                                           create_info->imageExtent.width,
++                                           create_info->imageExtent.height,
++                                           create_info->imageFormat,
++                                           num_images);
++      if (cr == VK_SUCCESS)
++         image_params = &compose_image_params;
++      else
++         mesa_loge("MESA-WSI: compose: no D3D11 swap chain for the window "
++                   "(%d), presenting by %s", (int)cr,
++                   try_scanout ? "Helios scanout" : "GDI");
++   } else if (wsi_device->win32.compose_import != NULL) {
++      mesa_loge("MESA-WSI: compose: format %d / %u layers has no composed "
++                "path, presenting by %s", (int)create_info->imageFormat,
++                create_info->imageArrayLayers,
++                try_scanout ? "Helios scanout" : "GDI");
++   }
+ 
+    VkResult result;
+ retry:
+    result = wsi_swapchain_init(wsi_device, &chain->base, device,
+                                create_info, image_params, allocator);
++   if (result != VK_SUCCESS && image_params == &compose_image_params) {
++      mesa_loge("MESA-WSI: compose: swapchain init failed (%d)", (int)result);
++      image_params = fallback_params;
++      goto retry;
++   }
+    if (result != VK_SUCCESS && image_params == &scanout_image_params) {
+       image_params = &cpu_image_params.base;
+       goto retry;
+@@ -1484,6 +1626,13 @@ retry:
+ 
+    chain->surface = surface;
+ 
++   if (image_params->image_type == WSI_IMAGE_TYPE_WIN32_COMPOSE) {
++      chain->compose.enabled = true;
++      chain->compose.sync_interval =
++         chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR ||
++         chain->base.present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? 1 : 0;
++   }
++
+    if (image_params->image_type == WSI_IMAGE_TYPE_WIN32_SCANOUT) {
+       chain->scanout.enabled = true;
+       chain->scanout.fourcc = scanout_fourcc;
+@@ -1522,6 +1671,28 @@ retry:
+       chain->base.image_count++;
+    }
+ 
++   /* The shared textures could not be made or imported: scanout or GDI */
++   if (result != VK_SUCCESS && chain->compose.enabled) {
++      mesa_loge("MESA-WSI: compose: swapchain images unavailable (%d), "
++                "presenting by %s", (int)result,
++                fallback_params == &scanout_image_params ? "Helios scanout" : "GDI");
++      for (uint32_t i = 0; i < chain->base.image_count; i++)
++         wsi_win32_image_finish(chain, allocator, &chain->images[i]);
++      /* image_init of the failing image left its texture behind */
++      for (uint32_t i = chain->base.image_count; i < num_images; i++)
++         wsi_win32_compose_image_destroy(surface->compose, &chain->images[i].compose);
++      memset(chain->images, 0, num_images * sizeof(chain->images[0]));
++      chain->base.image_count = 0;
++      wsi_swapchain_finish(&chain->base);
++      memset(&chain->base, 0, sizeof(chain->base));
++      memset(&chain->compose, 0, sizeof(chain->compose));
++      /* The window's DXGI swap chain goes too: GDI or scanout draw there */
++      wsi_win32_compose_destroy(surface->compose);
++      surface->compose = NULL;
++      image_params = fallback_params;
++      goto retry;
++   }
++
+    /* The driver could not make the images presentable: software path */
+    if (result != VK_SUCCESS && chain->scanout.enabled) {
+       fprintf(stderr, "MESA-WSI: scanout images unavailable (%d), "
+@@ -1543,6 +1714,7 @@ retry:
+ 
+    wsi_win32_frametime_swapchain(chain,
+                                  chain->dxgi ? "DXGI" :
++                                 chain->compose.enabled ? "Helios compose (D3D11 flip swap chain)" :
+                                  chain->scanout.enabled ? "Helios scanout" : "GDI",
+                                  chain->extent.width, chain->extent.height,
+                                  (int)chain->base.present_mode,
+diff --git a/src/vulkan/wsi/wsi_common_win32_compose.cpp b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+new file mode 100644
+index 00000000..da9d1ee1
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+@@ -0,0 +1,645 @@
++/*
++ * Copyright © 2026 Ole Algoritme
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++/*
++ * Composed present for the Win32 WSI (Conduit's Helios adapter,
++ * wsi_device::win32.compose_import, NVK_HELIOS_WSI_COMPOSE=1).
++ *
++ * A window's frames reach DWM the way a D3D11 application's do: the WSI
++ * creates a D3D11 device on the Helios adapter (the Helios D3D11 driver,
++ * itself on NVK) and a DXGI flip-model swap chain for the window.  Every
++ * Vulkan swapchain image is a D3D11 shared texture: the WSI opens it once
++ * through D3DKMT to read what the Helios KMD records for an allocation
++ * (its resource id, size and layout, HeliosWddmOpenIdentity and
++ * HeliosWddmAllocLayout), and the Vulkan driver imports that resource id
++ * into the application's device (compose_import), so the application
++ * renders straight into the texture.  A present copies the texture into the
++ * swap chain's back buffer on the D3D11 device and calls Present; the
++ * Helios D3D11 driver's composed present does the rest.
++ *
++ * Kept in a file of its own because d3d11.h and the DirectX-Headers'
++ * d3d12.h that wsi_common_win32.cpp includes do not mix.
++ */
++
++#include "wsi_common_private.h"
++
++#include <windows.h>
++#include <d3d11.h>
++#include <dxgi1_2.h>
++#include <stdio.h>
++#include <string.h>
++#include <wchar.h>
++
++#include "util/log.h"
++#include "util/u_debug.h"
++
++/* ---- D3DKMT, the subset this needs (d3dkmthk.h is not in MinGW) ------- */
++
++typedef UINT WSI_D3DKMT_HANDLE;
++typedef LONG WSI_NTSTATUS;
++
++struct wsi_kmt_open_adapter_from_luid {
++   LUID AdapterLuid;
++   WSI_D3DKMT_HANDLE hAdapter;
++};
++struct wsi_kmt_create_device {
++   union { WSI_D3DKMT_HANDLE hAdapter; VOID *pAdapter; };
++   UINT Flags;
++   WSI_D3DKMT_HANDLE hDevice;
++   VOID *pCommandBuffer;
++   UINT CommandBufferSize;
++   VOID *pAllocationList;
++   UINT AllocationListSize;
++   VOID *pPatchLocationList;
++   UINT PatchLocationListSize;
++};
++struct wsi_kmt_query_resource_info {
++   WSI_D3DKMT_HANDLE hDevice;
++   WSI_D3DKMT_HANDLE hGlobalShare;
++   VOID *pPrivateRuntimeData;
++   UINT PrivateRuntimeDataSize;
++   UINT TotalPrivateDriverDataSize;
++   UINT ResourcePrivateDriverDataSize;
++   UINT NumAllocations;
++};
++struct wsi_kmt_open_allocation_info {
++   WSI_D3DKMT_HANDLE hAllocation;
++   CONST VOID *pPrivateDriverData;
++   UINT PrivateDriverDataSize;
++};
++struct wsi_kmt_open_resource {
++   WSI_D3DKMT_HANDLE hDevice;
++   WSI_D3DKMT_HANDLE hGlobalShare;
++   UINT NumAllocations;
++   struct wsi_kmt_open_allocation_info *pOpenAllocationInfo;
++   VOID *pPrivateRuntimeData;
++   UINT PrivateRuntimeDataSize;
++   VOID *pResourcePrivateDriverData;
++   UINT ResourcePrivateDriverDataSize;
++   VOID *pTotalPrivateDriverDataBuffer;
++   UINT TotalPrivateDriverDataBufferSize;
++   WSI_D3DKMT_HANDLE hResource;
++};
++struct wsi_kmt_destroy_allocation {
++   WSI_D3DKMT_HANDLE hDevice;
++   WSI_D3DKMT_HANDLE hResource;
++   CONST WSI_D3DKMT_HANDLE *phAllocationList;
++   UINT AllocationCount;
++};
++struct wsi_kmt_destroy_device {
++   WSI_D3DKMT_HANDLE hDevice;
++};
++struct wsi_kmt_close_adapter {
++   WSI_D3DKMT_HANDLE hAdapter;
++};
++
++typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_open_adapter_from_luid)(struct wsi_kmt_open_adapter_from_luid *);
++typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_create_device)(struct wsi_kmt_create_device *);
++typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_query_resource_info)(struct wsi_kmt_query_resource_info *);
++typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_open_resource)(struct wsi_kmt_open_resource *);
++typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_destroy_allocation)(const struct wsi_kmt_destroy_allocation *);
++typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_destroy_device)(const struct wsi_kmt_destroy_device *);
++typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_close_adapter)(const struct wsi_kmt_close_adapter *);
++
++/* ---- What the Helios KMD writes into an open's allocation data --------
++ * Conduit guest/windows/protocol/src/wddm.rs, docs/shared-foreign-surfaces.md
++ * section 2: bytes 0..48 HeliosWddmOpenIdentity, 48..96 HeliosWddmAllocMeta,
++ * 96..128 HeliosWddmAllocLayout.
++ */
++struct wsi_helios_open_identity {
++   uint64_t venus_alloc_size;
++   uint64_t blob_size;
++   uint32_t magic;            /* 'HIDN' */
++   uint32_t version;          /* >= 2 */
++   uint32_t resource_id;
++   uint32_t memory_type_index;
++   uint32_t ctx_id;
++   uint32_t kind;             /* 1: device memory */
++   uint32_t reserved[2];      /* [0] bit 0: foreign (RM) resource, [1] 0 */
++};
++struct wsi_helios_alloc_layout {
++   uint64_t modifier;
++   uint32_t magic;            /* 'HFLY' */
++   uint32_t version;          /* 1 */
++   uint32_t fourcc;
++   uint32_t stride;
++   uint32_t plane_offset;
++   uint32_t reserved;
++};
++static_assert(sizeof(struct wsi_helios_open_identity) == 48, "identity");
++static_assert(sizeof(struct wsi_helios_alloc_layout) == 32, "layout");
++#define WSI_HELIOS_IDENTITY_MAGIC 0x4849444Eu
++#define WSI_HELIOS_LAYOUT_MAGIC   0x594C4648u
++#define WSI_HELIOS_LAYOUT_OFFSET  96u
++#define WSI_HELIOS_PRIVATE_BYTES  128u
++
++/* ---- State ------------------------------------------------------------ */
++
++struct wsi_win32_compose {
++   HWND hwnd;
++   ID3D11Device *device;
++   ID3D11DeviceContext *context;
++   IDXGISwapChain1 *swapchain;
++   DXGI_FORMAT format;
++   UINT buffers;
++   LUID luid;
++   WSI_D3DKMT_HANDLE kmt_adapter;
++   WSI_D3DKMT_HANDLE kmt_device;
++   bool first_present_logged;
++   uint32_t present_failures;
++};
++
++static struct {
++   bool loaded;
++   PFN_D3D11_CREATE_DEVICE create_device;
++   HRESULT (WINAPI *create_factory1)(REFIID, void **);
++   PFN_kmt_open_adapter_from_luid open_adapter_from_luid;
++   PFN_kmt_create_device kmt_create_device;
++   PFN_kmt_query_resource_info query_resource_info;
++   PFN_kmt_open_resource open_resource;
++   PFN_kmt_destroy_allocation destroy_allocation;
++   PFN_kmt_destroy_device destroy_device;
++   PFN_kmt_close_adapter close_adapter;
++} fn;
++
++#define LOGI(...) mesa_logi("MESA-WSI: compose: " __VA_ARGS__)
++#define LOGE(...) mesa_loge("MESA-WSI: compose: " __VA_ARGS__)
++
++static bool
++compose_load(void)
++{
++   if (fn.loaded)
++      return fn.create_device != NULL;
++   fn.loaded = true;
++
++   HMODULE d3d11 = LoadLibraryA("d3d11.dll");
++   HMODULE dxgi = LoadLibraryA("dxgi.dll");
++   HMODULE gdi = LoadLibraryA("gdi32.dll");
++   if (!d3d11 || !dxgi || !gdi) {
++      LOGE("d3d11.dll, dxgi.dll or gdi32.dll did not load");
++      return false;
++   }
++#define GET(mod, field, name) \
++   fn.field = (decltype(fn.field))(void *)GetProcAddress(mod, name)
++   GET(d3d11, create_device, "D3D11CreateDevice");
++   GET(dxgi, create_factory1, "CreateDXGIFactory1");
++   GET(gdi, open_adapter_from_luid, "D3DKMTOpenAdapterFromLuid");
++   GET(gdi, kmt_create_device, "D3DKMTCreateDevice");
++   GET(gdi, query_resource_info, "D3DKMTQueryResourceInfo");
++   GET(gdi, open_resource, "D3DKMTOpenResource");
++   GET(gdi, destroy_allocation, "D3DKMTDestroyAllocation");
++   GET(gdi, destroy_device, "D3DKMTDestroyDevice");
++   GET(gdi, close_adapter, "D3DKMTCloseAdapter");
++#undef GET
++   if (!fn.create_device || !fn.create_factory1 || !fn.open_adapter_from_luid ||
++       !fn.kmt_create_device || !fn.query_resource_info || !fn.open_resource ||
++       !fn.destroy_allocation || !fn.destroy_device || !fn.close_adapter) {
++      LOGE("a D3D11, DXGI or D3DKMT entry point is missing");
++      fn.create_device = NULL;
++      return false;
++   }
++   return true;
++}
++
++static DXGI_FORMAT
++compose_format(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_SRGB:
++      return DXGI_FORMAT_B8G8R8A8_UNORM;
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_SRGB:
++      return DXGI_FORMAT_R8G8B8A8_UNORM;
++   default:
++      return DXGI_FORMAT_UNKNOWN;
++   }
++}
++
++bool
++wsi_win32_compose_format_supported(VkFormat format)
++{
++   return compose_format(format) != DXGI_FORMAT_UNKNOWN;
++}
++
++/* The Helios adapter: MESA_WSI_COMPOSE_ADAPTER=<index> or the first whose
++ * description names Helios. */
++static IDXGIAdapter1 *
++compose_adapter(void)
++{
++   IDXGIFactory1 *factory = NULL;
++   if (FAILED(fn.create_factory1(__uuidof(IDXGIFactory1), (void **)&factory)))
++      return NULL;
++   const int forced = (int)debug_get_num_option("MESA_WSI_COMPOSE_ADAPTER", -1);
++   IDXGIAdapter1 *found = NULL;
++   IDXGIAdapter1 *adapter = NULL;
++   for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
++      DXGI_ADAPTER_DESC1 desc;
++      adapter->GetDesc1(&desc);
++      const bool pick = forced >= 0 ? (int)i == forced :
++                        wcsstr(desc.Description, L"Helios") != NULL;
++      if (pick && !found) {
++         found = adapter;
++         continue;
++      }
++      adapter->Release();
++   }
++   factory->Release();
++   return found;
++}
++
++static void
++compose_release_device(struct wsi_win32_compose *c)
++{
++   if (c->swapchain) {
++      c->swapchain->Release();
++      c->swapchain = NULL;
++   }
++   if (c->context) {
++      c->context->ClearState();
++      c->context->Flush();
++      c->context->Release();
++      c->context = NULL;
++   }
++   if (c->device) {
++      c->device->Release();
++      c->device = NULL;
++   }
++   if (c->kmt_device) {
++      struct wsi_kmt_destroy_device d = { c->kmt_device };
++      fn.destroy_device(&d);
++      c->kmt_device = 0;
++   }
++   if (c->kmt_adapter) {
++      struct wsi_kmt_close_adapter a = { c->kmt_adapter };
++      fn.close_adapter(&a);
++      c->kmt_adapter = 0;
++   }
++}
++
++VkResult
++wsi_win32_compose_open(struct wsi_win32_compose **inout, void *window,
++                       uint32_t width, uint32_t height, VkFormat vk_format,
++                       uint32_t buffers)
++{
++   HWND hwnd = (HWND)window;
++   const DXGI_FORMAT format = compose_format(vk_format);
++   if (format == DXGI_FORMAT_UNKNOWN) {
++      LOGE("format %d has no composed path", (int)vk_format);
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   }
++   if (!compose_load())
++      return VK_ERROR_INITIALIZATION_FAILED;
++
++   buffers = buffers < 2 ? 2 : buffers > 3 ? 3 : buffers;
++   struct wsi_win32_compose *c = *inout;
++   if (c && c->hwnd == hwnd && c->swapchain) {
++      /* A new Vulkan swapchain on the same window (resize, format): the
++       * DXGI swap chain stays, with new buffers. */
++      c->context->ClearState();
++      c->context->Flush();
++      HRESULT hr = c->swapchain->ResizeBuffers(buffers, width, height, format, 0);
++      if (FAILED(hr)) {
++         LOGE("ResizeBuffers(%u, %ux%u, format %d) failed: 0x%08lx",
++              buffers, width, height, (int)format, (unsigned long)hr);
++         return VK_ERROR_INITIALIZATION_FAILED;
++      }
++      c->format = format;
++      c->buffers = buffers;
++      LOGI("DXGI swap chain resized: %ux%u, format %d, %u buffers",
++           width, height, (int)format, buffers);
++      return VK_SUCCESS;
++   }
++
++   if (!c) {
++      c = (struct wsi_win32_compose *)calloc(1, sizeof(*c));
++      if (!c)
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      *inout = c;
++   }
++   compose_release_device(c);
++   c->hwnd = hwnd;
++
++   IDXGIAdapter1 *adapter = compose_adapter();
++   if (!adapter) {
++      LOGE("no Helios DXGI adapter (MESA_WSI_COMPOSE_ADAPTER picks one by index)");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   DXGI_ADAPTER_DESC1 adesc;
++   adapter->GetDesc1(&adesc);
++   c->luid = adesc.AdapterLuid;
++
++   static const D3D_FEATURE_LEVEL levels[] = {
++      D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
++   };
++   D3D_FEATURE_LEVEL got;
++   HRESULT hr = fn.create_device(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
++                                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
++                                 levels, 2, D3D11_SDK_VERSION,
++                                 &c->device, &got, &c->context);
++   if (FAILED(hr)) {
++      adapter->Release();
++      LOGE("D3D11CreateDevice on %ls failed: 0x%08lx", adesc.Description,
++           (unsigned long)hr);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   IDXGIFactory2 *factory = NULL;
++   hr = adapter->GetParent(__uuidof(IDXGIFactory2), (void **)&factory);
++   adapter->Release();
++   if (FAILED(hr)) {
++      LOGE("no IDXGIFactory2: 0x%08lx", (unsigned long)hr);
++      compose_release_device(c);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   DXGI_SWAP_CHAIN_DESC1 desc = {};
++   desc.Width = width;
++   desc.Height = height;
++   desc.Format = format;
++   desc.SampleDesc.Count = 1;
++   desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++   desc.BufferCount = buffers;
++   desc.Scaling = DXGI_SCALING_STRETCH;
++   desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++   desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++   hr = factory->CreateSwapChainForHwnd(c->device, hwnd, &desc, NULL, NULL,
++                                        &c->swapchain);
++   if (SUCCEEDED(hr))
++      factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_WINDOW_CHANGES |
++                                           DXGI_MWA_NO_ALT_ENTER);
++   factory->Release();
++   if (FAILED(hr)) {
++      LOGE("CreateSwapChainForHwnd(%ux%u, format %d) failed: 0x%08lx",
++           width, height, (int)format, (unsigned long)hr);
++      compose_release_device(c);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   struct wsi_kmt_open_adapter_from_luid oa = {};
++   oa.AdapterLuid = c->luid;
++   WSI_NTSTATUS st = fn.open_adapter_from_luid(&oa);
++   if (st < 0) {
++      LOGE("D3DKMTOpenAdapterFromLuid failed: 0x%08lx", (unsigned long)st);
++      compose_release_device(c);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   c->kmt_adapter = oa.hAdapter;
++   struct wsi_kmt_create_device cd = {};
++   cd.hAdapter = c->kmt_adapter;
++   st = fn.kmt_create_device(&cd);
++   if (st < 0) {
++      LOGE("D3DKMTCreateDevice failed: 0x%08lx", (unsigned long)st);
++      compose_release_device(c);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   c->kmt_device = cd.hDevice;
++   c->format = format;
++   c->buffers = buffers;
++
++   LOGI("D3D11 device (feature level 0x%x) and DXGI flip swap chain created "
++        "on %ls: %ux%u, format %d, %u buffers",
++        (unsigned)got, adesc.Description, width, height, (int)format, buffers);
++   return VK_SUCCESS;
++}
++
++void
++wsi_win32_compose_destroy(struct wsi_win32_compose *c)
++{
++   if (!c)
++      return;
++   compose_release_device(c);
++   free(c);
++}
++
++/* Reads the Helios KMD's record of a shared allocation by opening it */
++static VkResult
++compose_read_record(struct wsi_win32_compose *c, HANDLE share,
++                    struct wsi_win32_compose_image *img,
++                    struct wsi_win32_compose_import *imp)
++{
++   struct wsi_kmt_query_resource_info q = {};
++   q.hDevice = c->kmt_device;
++   q.hGlobalShare = (WSI_D3DKMT_HANDLE)(uintptr_t)share;
++   WSI_NTSTATUS st = fn.query_resource_info(&q);
++   if (st < 0 || q.NumAllocations == 0) {
++      LOGE("D3DKMTQueryResourceInfo(0x%x) failed: 0x%08lx, %u allocations",
++           q.hGlobalShare, (unsigned long)st, q.NumAllocations);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   void *runtime = calloc(1, q.PrivateRuntimeDataSize ? q.PrivateRuntimeDataSize : 1);
++   void *resdata = calloc(1, q.ResourcePrivateDriverDataSize ? q.ResourcePrivateDriverDataSize : 1);
++   void *total = calloc(1, q.TotalPrivateDriverDataSize ? q.TotalPrivateDriverDataSize : 1);
++   struct wsi_kmt_open_allocation_info *allocs =
++      (struct wsi_kmt_open_allocation_info *)calloc(q.NumAllocations, sizeof(*allocs));
++   VkResult result = VK_ERROR_INITIALIZATION_FAILED;
++   if (!runtime || !resdata || !total || !allocs)
++      goto out;
++
++   {
++      struct wsi_kmt_open_resource o = {};
++      o.hDevice = c->kmt_device;
++      o.hGlobalShare = q.hGlobalShare;
++      o.NumAllocations = q.NumAllocations;
++      o.pOpenAllocationInfo = allocs;
++      o.pPrivateRuntimeData = runtime;
++      o.PrivateRuntimeDataSize = q.PrivateRuntimeDataSize;
++      o.pResourcePrivateDriverData = resdata;
++      o.ResourcePrivateDriverDataSize = q.ResourcePrivateDriverDataSize;
++      o.pTotalPrivateDriverDataBuffer = total;
++      o.TotalPrivateDriverDataBufferSize = q.TotalPrivateDriverDataSize;
++      st = fn.open_resource(&o);
++      if (st < 0) {
++         LOGE("D3DKMTOpenResource(0x%x) failed: 0x%08lx", q.hGlobalShare,
++              (unsigned long)st);
++         goto out;
++      }
++      img->kmt_resource = o.hResource;
++
++      const struct wsi_kmt_open_allocation_info *a = &allocs[0];
++      if (a->pPrivateDriverData == NULL ||
++          a->PrivateDriverDataSize < WSI_HELIOS_PRIVATE_BYTES) {
++         LOGE("allocation data of %u bytes: not a Helios record with a layout",
++              a->PrivateDriverDataSize);
++         goto out;
++      }
++      struct wsi_helios_open_identity id;
++      struct wsi_helios_alloc_layout lay;
++      memcpy(&id, a->pPrivateDriverData, sizeof(id));
++      memcpy(&lay, (const uint8_t *)a->pPrivateDriverData + WSI_HELIOS_LAYOUT_OFFSET,
++             sizeof(lay));
++      const bool foreign = id.reserved[0] & 1 && id.reserved[1] == 0;
++      if (id.magic != WSI_HELIOS_IDENTITY_MAGIC || id.version < 2 ||
++          id.resource_id == 0 || id.kind != 1 || !foreign) {
++         LOGE("open identity magic 0x%08x version %u resource %u kind %u "
++              "flags 0x%x/0x%x: not an NVK (RM) resource; is the D3D11 driver "
++              "on Venus?", id.magic, id.version, id.resource_id, id.kind,
++              id.reserved[0], id.reserved[1]);
++         goto out;
++      }
++      if (lay.magic != WSI_HELIOS_LAYOUT_MAGIC || lay.version != 1) {
++         LOGE("layout trailer magic 0x%08x version %u: none recorded",
++              lay.magic, lay.version);
++         goto out;
++      }
++      imp->resource_id = id.resource_id;
++      imp->size = id.blob_size;
++      imp->modifier = lay.modifier;
++      imp->stride = lay.stride;
++      imp->offset = lay.plane_offset;
++      result = VK_SUCCESS;
++   }
++
++out:
++   free(runtime);
++   free(resdata);
++   free(total);
++   free(allocs);
++   return result;
++}
++
++VkResult
++wsi_win32_compose_image_create(struct wsi_win32_compose *c, uint32_t width,
++                               uint32_t height,
++                               struct wsi_win32_compose_image *img,
++                               struct wsi_win32_compose_import *imp)
++{
++   memset(img, 0, sizeof(*img));
++   D3D11_TEXTURE2D_DESC td = {};
++   td.Width = width;
++   td.Height = height;
++   td.MipLevels = 1;
++   td.ArraySize = 1;
++   td.Format = c->format;
++   td.SampleDesc.Count = 1;
++   td.Usage = D3D11_USAGE_DEFAULT;
++   td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++   td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
++   ID3D11Texture2D *tex = NULL;
++   HRESULT hr = c->device->CreateTexture2D(&td, NULL, &tex);
++   if (FAILED(hr)) {
++      LOGE("CreateTexture2D(%ux%u shared) failed: 0x%08lx", width, height,
++           (unsigned long)hr);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   img->texture = tex;
++
++   IDXGIResource *res = NULL;
++   HANDLE share = NULL;
++   hr = tex->QueryInterface(__uuidof(IDXGIResource), (void **)&res);
++   if (SUCCEEDED(hr)) {
++      hr = res->GetSharedHandle(&share);
++      res->Release();
++   }
++   if (FAILED(hr) || share == NULL) {
++      LOGE("no shared handle for the texture: 0x%08lx", (unsigned long)hr);
++      wsi_win32_compose_image_destroy(c, img);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   VkResult result = compose_read_record(c, share, img, imp);
++   if (result != VK_SUCCESS) {
++      wsi_win32_compose_image_destroy(c, img);
++      return result;
++   }
++
++   D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
++   ID3D11Query *query = NULL;
++   if (SUCCEEDED(c->device->CreateQuery(&qd, &query)))
++      img->query = query;
++
++   LOGI("shared texture %ux%u: resource id %u, %llu bytes, modifier 0x%016llx, "
++        "stride %u, offset %u", width, height, imp->resource_id,
++        (unsigned long long)imp->size, (unsigned long long)imp->modifier,
++        imp->stride, imp->offset);
++   return VK_SUCCESS;
++}
++
++void
++wsi_win32_compose_image_destroy(struct wsi_win32_compose *c,
++                                struct wsi_win32_compose_image *img)
++{
++   if (img->query)
++      ((ID3D11Query *)img->query)->Release();
++   if (img->texture)
++      ((ID3D11Texture2D *)img->texture)->Release();
++   if (img->kmt_resource && c && c->kmt_device) {
++      struct wsi_kmt_destroy_allocation d = {};
++      d.hDevice = c->kmt_device;
++      d.hResource = img->kmt_resource;
++      fn.destroy_allocation(&d);
++   }
++   memset(img, 0, sizeof(*img));
++}
++
++VkResult
++wsi_win32_compose_present(struct wsi_win32_compose *c,
++                          struct wsi_win32_compose_image *img,
++                          uint32_t sync_interval)
++{
++   ID3D11Texture2D *back = NULL;
++   HRESULT hr = c->swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
++   if (FAILED(hr)) {
++      if (c->present_failures++ < 8)
++         LOGE("GetBuffer failed: 0x%08lx", (unsigned long)hr);
++      return hr == DXGI_ERROR_DEVICE_REMOVED ? VK_ERROR_DEVICE_LOST :
++                                               VK_ERROR_OUT_OF_DATE_KHR;
++   }
++   c->context->CopyResource(back, (ID3D11Texture2D *)img->texture);
++   back->Release();
++
++   hr = c->swapchain->Present(sync_interval, 0);
++   if (FAILED(hr)) {
++      if (c->present_failures++ < 8)
++         LOGE("Present(%u) failed: 0x%08lx", sync_interval, (unsigned long)hr);
++      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
++         return VK_ERROR_DEVICE_LOST;
++      return VK_ERROR_OUT_OF_DATE_KHR;
++   }
++
++   /* The application may draw into the image again once acquire hands it
++    * back: wait for the copy out of it first. */
++   if (img->query) {
++      ID3D11Query *q = (ID3D11Query *)img->query;
++      c->context->End(q);
++      c->context->Flush();
++      const ULONGLONG deadline = GetTickCount64() + 2000;
++      BOOL done = FALSE;
++      while ((hr = c->context->GetData(q, &done, sizeof(done), 0)) == S_FALSE ||
++             (hr == S_OK && !done)) {
++         if (GetTickCount64() > deadline) {
++            if (c->present_failures++ < 8)
++               LOGE("the copy into the back buffer did not finish in 2 s");
++            break;
++         }
++         SwitchToThread();
++      }
++   }
++
++   if (!c->first_present_logged) {
++      c->first_present_logged = true;
++      LOGI("first composed present done (sync interval %u)", sync_interval);
++   }
++   return VK_SUCCESS;
++}
+-- 
+2.43.0
+
