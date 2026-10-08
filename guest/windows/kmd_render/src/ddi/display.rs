@@ -1038,6 +1038,8 @@ unsafe fn dxgkddi_present_inner(
                                 pitch: destination.pitch,
                                 dxgi_format: destination_dxgi_format,
                                 alloc_size: destination.venus_alloc_size,
+                                x: 0,
+                                y: 0,
                             },
                             present_stream_boundary,
                         )
