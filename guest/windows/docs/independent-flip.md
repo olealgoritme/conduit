@@ -1,6 +1,7 @@
 # Independent flip (direct flip) of flip-model swap chains: KMD design
 
-Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; the rest is design. The decision table of
+Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; flip completion from the host behind
+`FlipDoneHost` (default 0), section 13; the rest is design. The decision table of
 section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
 failure.
 Written against v327 (`225ce42`, branch `kmd/independent-flip-design`). Line numbers are that commit's.
@@ -1211,3 +1212,102 @@ premultiplied by the KMD) or 2.
 
 Safety: the knob is the whole surface (`HwCursor=0` and a restart restore the software cursor). A host that stops answering costs
 at most 500 ms per pointer command before that shape falls back to software.
+
+## 13. Flip completion from the host (`FlipDoneHost`)
+
+Branch `kmd/direct-flip-scanout`. Untested on hardware when written.
+
+### 13.1 Where the rest of the plan stood
+
+Checked against the base of this branch before writing anything:
+
+* **The caps and the UMD gate** (S-1, section 11) are in place: `IndepFlip` advertises `SupportDirectFlip`, the aperture
+  `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip`; the UMD's `DirectFlipSupport` answers `CheckDirectFlipSupport`.
+  This branch only tightens the UMD's mode 1 to pairs the KMD can scan out as they are (same extent and format, the format one
+  of R8G8B8A8 / B8G8R8A8 / B8G8R8X8 UNORM, one sample, one mip, one slice; mode 2 stays the size-and-format test lever), so a
+  10-bit or sRGB-typed chain is never promoted into a `WideFormat` refusal and a frozen picture. The stale comment above
+  `SupportDirectFlip` in `query_adapter_info.rs` (2.7) is rewritten.
+* **Application buffers on the scan-out** need no new acceptance rule: `foreign_flip::decide` takes any adopted NVK allocation of
+  the mode's extent in a scan-out format with a KMD-recorded layout (modifier included), whatever the UMD called it, and refuses
+  the rest with a counted reason (`FfRef*`, `IdfRef*`); with independent flip DXGI creates the chain from a `pPrimaryDesc`, so a
+  Venus chain is `MISC_DIRECT_SCANOUT` and takes the direct bind behind the undersize guard (11.6). The hardware runs of 11.6 and
+  12 (`IdfDirFor` 172362, `IdfKeep` 0) are that path working.
+* **Refresh rate**: the modes already include 240 Hz.
+
+What was missing is the completion: a flip retired on the guest's own timer, one tick after the KMD programmed it, whether or not
+the host had shown it, and on a phase unrelated to the host's vblank (`host-vblank-pacing.md` section 1).
+
+### 13.2 What it does
+
+The host side (`docs/SCANOUT.md`, "Presentation feedback"): the viewer's Wayland backend answers every commit the compositor
+presented (`wp_presentation_feedback.presented`) with `EV_PRESENTED` and the ATTACH's stamp; the backend maps the stamp to the guest
+flip it carried and sends `ScanoutPresented` (event queue message 33, virtio feature `NVGPU_F_SCANOUT_PRESENTED`, bit 19) once per
+flip. A report that finds no event buffer is dropped, never retried.
+
+The KMD side (`kmd_logic/src/host_flip_done.rs`, the rules and their host tests; `kmd_render/src/ddi/host_flip_done.rs`, the I/O):
+
+* every address publication records its time and a `seq` floor (one above the highest `ScanoutFlip` minted; the flip that carries
+  the new picture is minted after it). A `ScanoutFlip` report with `seq` at or above the floor confirms the published address; a
+  Venus report confirms it when it names the active scanout resource or the one the host is bound to (the copy path's image);
+* the vsync tick reports the **confirmed** address. A newer published one waits for its report, at most 3 periods (the timer
+  fallback: a discarded commit, a client that does not report). A kept picture is never held (the host is never told). Without a
+  report for 100 ms (static desktop, minimised viewer, no presenting client) the tick reports the published address, as before;
+* `FlipDoneHost=1` also delivers a CRTC_VSYNC from the report itself (unless any vsync went out less than half a period ago),
+  moves the timer's deadline to half a period after the report (only when it is more than an eighth of a period off, so the
+  steady state re-arms nothing), and a tick less than three quarters of a period after a report delivers nothing: the timer only
+  fills in the periods the host is silent in. A simulated 240 Hz run with 10% jitter (`a_simulated_240_hz_run...`) delivers every
+  host vblank and never two vsyncs closer than half a period;
+* `FlipDoneHost=2` is the hold alone (the timer delivers, on its own phase): the A/B for the early vsync;
+* the default `FlipQueueN` becomes 2 under the knob (an explicit `FlipQueueN` wins): with completion up to a period later than the
+  timer's, a depth of 1 would hold the application behind every host present.
+
+Why not a virtio-gpu fence on `RESOURCE_FLUSH` / `SET_SCANOUT_BLOB`: the NVK-on-RM path, which is what games and DWM run on, flips
+with `ScanoutFlip`, not `RESOURCE_FLUSH`; and the control queue answers in order, so a response held for a frame would stall every
+synchronous round trip behind it. The event queue already carries the per-frame `ScanoutReleased` the same way.
+
+### 13.3 Knob and counters
+
+`HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, `FlipDoneHost` (REG_DWORD, at most 14 characters, hence not
+`FlipDoneFromHost`), read with the adapter knobs (AddAdapter and StartDevice):
+
+| value | effect |
+|---|---|
+| absent, 0, other | off: the feature is not acked, the host sends nothing, every hook is one relaxed load, the tick is as before |
+| 1 | ack, hold, early vsync from the report, timer re-phase; default `FlipQueueN` 2 |
+| 2 | ack, hold only; default `FlipQueueN` 2 |
+
+Counters (event-gated: zeros at every StartDevice, then from the periodic dump when one moved; `FdhInact` alone does not make the
+block dirty): `FdhKnob` (the knob), `FdhAck` (1: the host took the ack and the event queue is up; with 0 the mode is forced off),
+`FdhEvN` (reports received), `FdhBad` (short), `FdhUnask` (sent without the ack), `FdhLatch` (reports that confirmed a newly
+published address), `FdhStale` (reports that confirmed nothing new), `FdhVsync` (CRTC_VSYNCs a report delivered), `FdhCoal` (reports
+that left the vsync to the tick), `FdhRephase` (timer re-phases), `FdhTkSkip` (ticks that delivered nothing), `FdhHeld` (ticks that
+reported the confirmed address over a newer published one), `FdhTmo` (ticks that gave up waiting), `FdhKept` (kept pictures
+reported at once), `FdhInact` (ticks with the knob on and no live feedback), `FdhLatUs` / `FdhLatMax` / `FdhLatAvg` (publish to
+report, microseconds, guest clock), `FdhAgeUs` (host-side screen to event-sent delay, microseconds). Host: the backend logs `wants
+presentation feedback` in its `guest driver features` line and counts `presented` / `presented_dropped` in `LinkStats`.
+
+### 13.4 Recipe (main runs it; lowest mode first)
+
+Needs the backend and the viewer of this branch (an older viewer sends no `EV_PRESENTED`: `FdhEvN` stays 0 and everything behaves
+as `FlipDoneHost=0`). Per row: set the values, reboot (the ack is negotiated at StartDevice and the caps at AddAdapter), check
+`FdhKnob`, `FdhAck`, `FlipQueV`, run `d3d11_iflip.exe 20` (borderless, covering the output, interval 1) under PresentMon for 20 s,
+read the counters. Base settings for every row: `IndepFlip=1`, `HKLM\SOFTWARE\Helios` `DirectFlipSupport=1`, `HwCursor` default.
+
+| row | `FlipDoneHost` | expect |
+|---|---|---|
+| P0 | 0 | as 11.6: PresentMon `Hardware: Independent Flip`, about 240 fps, `Fdh*` 0, `FlipQueV` 1 |
+| P1 | 2 | `FdhAck` 1, `FlipQueV` 2, `FdhEvN` and `FdhLatch` near 240/s, `FdhHeld` > 0, `FdhTmo` near 0, `FdhLatAvg` around 1-2 periods (4-8 ms at 240 Hz), `FdhVsync` 0. Still `Hardware: Independent Flip`, fps about 240 |
+| P2 | 1 | as P1, and `FdhVsync` near 240/s, `FdhTkSkip` near 240/s, `FdhRephase` small (only while locking, after a stall or a mode change), `FdhCoal` small; PresentMon `MsBetweenDisplayChange` steadier than P0; `VpVsN`/`VsCnt` still rising (the timer runs) |
+| P3 | 1 | as P2 with `interval0` and `tearing`: no regression against P0 (`IdfArmDma`, fps uncapped as before) |
+| P4 | 1 | desktop idle 10 s, then minimise the viewer for 10 s: `FdhInact` rises, `FdhTmo` stays near 0, the desktop keeps presenting (DWM not stuck) |
+| P5 | 1 | 5120x1440@240, Heaven full screen: as P2 |
+
+Read with every row: the `Idf*` block, `VpVsN`, `VsCnt`, `VsMinGap`, `VsFast` (a re-phase shortens one tick gap: a few `VsFast` per
+lock are expected), `FlipPub`, `FfRttUsMax`, the backend's `presented` / `presented_dropped`. A `presented_dropped` that rises with
+the frame rate means the guest's 16 event buffers are exhausted (releases and reports share them).
+
+Risks, in the order they would show: (1) dxgkrnl retiring flips only by exact address, with a queue depth of 2 and a coalescing
+pending slot (4.4): `FdhTmo` and frozen presents would say so; `FlipQueueN=1` with the knob is the lever. (2) The early vsync from
+the DPC racing the tick on another CPU: at worst two vsyncs a fraction of a period apart, once (`VsFast`). (3) A host that reports
+late (the compositor composites instead of scanning out directly): the hold costs up to a period of latency, `FdhLatAvg` shows
+it; `FlipDoneHost=2` or 0 is the fallback. The knob is the whole surface: 0 and a reboot restore today's behaviour.
