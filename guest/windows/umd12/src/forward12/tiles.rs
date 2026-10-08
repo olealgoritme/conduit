@@ -111,7 +111,8 @@ unsafe fn admit_mapping(
     if boundary.0 == 0 {
         // S5: NVK on RM, the same completion as an ECL boundary (queue.rs).
         // SAFETY: entering DDI thread, live device/queue, execution lock held.
-        match unsafe { nvk_complete(dev, queue, boundary.1, &event) } {
+        // Tile mappings always take the runtime admission.
+        match unsafe { nvk_complete(dev, queue, boundary.1, &event, true) } {
             Ok(()) => L2_REFUSALS.tile_mappings_admitted.bump(),
             Err(hr) => mapping_error(queue, hr),
         }

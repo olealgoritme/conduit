@@ -542,6 +542,43 @@ pub struct QueueState {
     /// `Nvk12EclSync=2`: the highest ECL fence value committed on this queue (a
     /// fenced scanout present flips when it fires). 0 = none.
     nvk_last_ecl_fence: std::sync::atomic::AtomicU64,
+    /// `Nvk12AdmitAfterPresentOnly` (diagnostic): the next NVK ECL on this
+    /// queue takes the runtime admission event (set at creation and by each
+    /// Present on the device).
+    nvk_admit_next: std::sync::atomic::AtomicBool,
+    /// The Present epoch this queue last admitted in.
+    nvk_admit_epoch: std::sync::atomic::AtomicU64,
+}
+
+/// `Nvk12AdmitAfterPresentOnly`: every queue of this device admits its next
+/// ECL through the runtime again (called by Present).
+pub(crate) fn nvk_admit_after_present(h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE) {
+    if !crate::knobs12::nvk12_admit_after_present_only() {
+        return;
+    }
+    // SAFETY: Present's live queue handle.
+    if let Some(queue) = unsafe { queue_state(h_queue) } {
+        queue
+            .nvk_admit_next
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    ADMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Bumped by each Present: a queue that has not admitted since admits next.
+static ADMIT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Should this NVK ECL wait for the runtime's admission event? Always, unless
+/// the diagnostic `Nvk12AdmitAfterPresentOnly` is on: then only the first ECL
+/// of each queue after a Present (or after creation) does.
+fn nvk_must_admit(queue: &QueueState) -> bool {
+    if !crate::knobs12::nvk12_admit_after_present_only() {
+        return true;
+    }
+    use std::sync::atomic::Ordering;
+    let epoch = ADMIT_EPOCH.load(Ordering::Acquire);
+    let seen = queue.nvk_admit_epoch.swap(epoch, Ordering::AcqRel);
+    queue.nvk_admit_next.swap(false, Ordering::AcqRel) || seen != epoch
 }
 
 /// Engine allocators materialised for one DDI command pool, indexed by command
@@ -1261,6 +1298,8 @@ unsafe extern "system" fn create_command_queue(
             nvk: std::sync::OnceLock::new(),
             nvk_last_value: std::sync::atomic::AtomicU64::new(0),
             nvk_last_ecl_fence: std::sync::atomic::AtomicU64::new(0),
+            nvk_admit_next: std::sync::atomic::AtomicBool::new(true),
+            nvk_admit_epoch: std::sync::atomic::AtomicU64::new(0),
         });
     }
     S_OK
@@ -2923,9 +2962,10 @@ unsafe fn nvk_complete(
     queue: &QueueState,
     value: u32,
     admission: &AdmissionEvent,
+    must_admit: bool,
 ) -> Result<(), ddi12::HRESULT> {
     // SAFETY: forwarded precondition.
-    unsafe { enqueue_runtime_admission(dev, queue, admission) }?;
+    unsafe { admit(dev, queue, admission, must_admit) }?;
     let engine = queue.engine_queue.as_raw() as usize;
     // SAFETY: the engine queue lives as long as the queue state that owns the sync.
     let sync = queue
@@ -2959,6 +2999,7 @@ unsafe fn nvk_complete_fenced(
     value: u32,
     admission: &AdmissionEvent,
     fence: Option<crate::bridge12::EclFence>,
+    must_admit: bool,
 ) -> Result<bool, ddi12::HRESULT> {
     let Some(fence) = fence else {
         super::nvk12::note_ecl_fence(super::nvk12::EclFenceOutcome::NoFence);
@@ -3003,8 +3044,33 @@ unsafe fn nvk_complete_fenced(
         .fetch_max(u64::from(value), std::sync::atomic::Ordering::AcqRel);
     // SAFETY: same entering thread and exact context as the Render above.
     // SignalAtSubmission is essential: a completion event here deadlocks.
-    unsafe { enqueue_runtime_admission(dev, queue, admission) }?;
+    unsafe { admit(dev, queue, admission, must_admit) }?;
     Ok(true)
+}
+
+/// Queue the runtime admission event for this NVK batch, or (diagnostic
+/// `Nvk12AdmitAfterPresentOnly`, `must_admit` false) release the engine at
+/// once by setting the event ourselves: the batch then does not wait for
+/// runtime waits queued before it on the context (cross-queue waits,
+/// flip-model buffer waits). Never a default: it is the ceiling of what
+/// skipping the per-batch admission round trip would give.
+///
+/// # Safety
+/// As [`enqueue_runtime_admission`].
+unsafe fn admit(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    admission: &AdmissionEvent,
+    must_admit: bool,
+) -> Result<(), ddi12::HRESULT> {
+    if must_admit {
+        // SAFETY: forwarded precondition.
+        return unsafe { enqueue_runtime_admission(dev, queue, admission) };
+    }
+    L2_REFUSALS.ecl_admission_skipped.bump();
+    // SAFETY: the owned, live admission event.
+    unsafe { windows::Win32::System::Threading::SetEvent(admission.0) }
+        .map_err(|e| e.code().0)
 }
 
 /// S5: does this queue's device run its engine on NVK on RM?
@@ -3271,6 +3337,8 @@ unsafe fn execute_command_lists_body(
         .collect();
     // NVK, Nvk12EclSync=2: ask the engine for an ECL fence with the batch.
     let want_fence = dev.engine.is_nvk() && super::nvk12::ecl_fences_wanted(dev);
+    // Diagnostic `Nvk12AdmitAfterPresentOnly`; true otherwise.
+    let must_admit = !dev.engine.is_nvk() || nvk_must_admit(queue);
     // SAFETY: owned list interfaces and event outlive this call. The engine
     // duplicates the event and retains allocator/command-buffer lifetimes.
     let executed = unsafe {
@@ -3323,7 +3391,9 @@ unsafe fn execute_command_lists_body(
             // that way (no fence, or the Render refused it): the CPU wait
             // below orders this batch instead.
             // SAFETY: entering ECL thread, live device/queue, execution lock held.
-            match unsafe { nvk_complete_fenced(dev, queue, boundary.1, &admission, ecl_fence) } {
+            match unsafe {
+                nvk_complete_fenced(dev, queue, boundary.1, &admission, ecl_fence, must_admit)
+            } {
                 Ok(true) => {
                     L2_REFUSALS.ecl_nvk_ordered.bump();
                     note_refusal(&L2_REFUSALS.ecl_admission_queued);
@@ -3340,7 +3410,7 @@ unsafe fn execute_command_lists_body(
         // S5: NVK on RM -- no HE12 record (the KMD knows no NVK stream); the
         // context is ordered behind the boundary by this driver.
         // SAFETY: entering ECL thread, live device/queue, execution lock held.
-        match unsafe { nvk_complete(dev, queue, boundary.1, &admission) } {
+        match unsafe { nvk_complete(dev, queue, boundary.1, &admission, must_admit) } {
             Ok(()) => {
                 L2_REFUSALS.ecl_nvk_ordered.bump();
                 note_refusal(&L2_REFUSALS.ecl_admission_queued);
@@ -4013,6 +4083,9 @@ pub(crate) struct L2Refusals {
     command_signature_translation_oom: RefusalCounter,
     /// S5: ECLs on NVK on RM ordered by the driver (no HE12 record).
     ecl_nvk_ordered: RefusalCounter,
+    /// NVK ECLs released without the runtime admission event (diagnostic
+    /// `Nvk12AdmitAfterPresentOnly`).
+    ecl_admission_skipped: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -4112,6 +4185,7 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     tile_mappings_admitted: RefusalCounter::new("TileMappingsAdmitted"),
     command_signature_translation_oom: RefusalCounter::new("CommandSignatureTranslationOom"),
     ecl_nvk_ordered: RefusalCounter::new("EclNvkOrdered"),
+    ecl_admission_skipped: RefusalCounter::new("EclAdmissionSkipped"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -4255,6 +4329,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.present_producer_admitted,
     &L2_REFUSALS.command_signature_translation_oom,
     &L2_REFUSALS.ecl_nvk_ordered,
+    &L2_REFUSALS.ecl_admission_skipped,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

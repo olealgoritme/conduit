@@ -646,6 +646,9 @@ unsafe fn present_nvk(
     p_contexts: *mut ddi12::D3D12DDI_PRESENT_CONTEXTS_0051,
 ) {
     let has_id = identity.venus_res_id != 0;
+    // Diagnostic `Nvk12AdmitAfterPresentOnly`: the next ECL of every queue
+    // waits for the runtime again (flip-model buffer waits follow presents).
+    queue::nvk_admit_after_present(h_queue);
     let scanout = match crate::knobs12::nvk12_present_mode() {
         1 => true,
         2 => false,

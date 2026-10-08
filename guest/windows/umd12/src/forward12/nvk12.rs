@@ -71,7 +71,19 @@ const ECL_WAIT_LOG_EVERY: u64 = 4096;
 /// # Safety
 /// `engine_queue` is the live engine queue.
 unsafe fn spin_wait(engine_queue: usize, value: u64) -> Option<Result<bool, ddi12::HRESULT>> {
-    let budget_us = crate::knobs12::nvk12_ecl_spin_us();
+    // SAFETY: forwarded precondition.
+    unsafe { spin_wait_for(engine_queue, value, crate::knobs12::nvk12_ecl_spin_us()) }
+}
+
+/// [`spin_wait`] with an explicit budget (microseconds; 0 = no polling).
+///
+/// # Safety
+/// `engine_queue` is the live engine queue.
+unsafe fn spin_wait_for(
+    engine_queue: usize,
+    value: u64,
+    budget_us: u32,
+) -> Option<Result<bool, ddi12::HRESULT>> {
     if budget_us == 0 {
         return None;
     }
@@ -585,6 +597,64 @@ pub(crate) static FRAME_STATS: FrameStats = FrameStats {
     }),
 };
 
+/// Mode 0 worker timing: how long each boundary took to be seen after it was
+/// handed over (GPU execution plus the event relay) and how long the CPU
+/// signal of the monitored fence took, logged every 4096 boundaries.
+struct WorkerStats {
+    n: AtomicU64,
+    wait_ns: AtomicU64,
+    signal_ns: AtomicU64,
+    polled: AtomicU64,
+    signal_buckets: [AtomicU64; ECL_WAIT_BUCKETS_US.len() + 1],
+}
+
+impl WorkerStats {
+    fn record(&self, waited: Duration, signal: Duration, polled: bool) {
+        let w = ns_of(waited);
+        let sg = ns_of(signal);
+        self.wait_ns.fetch_add(w, Ordering::Relaxed);
+        self.signal_ns.fetch_add(sg, Ordering::Relaxed);
+        if polled {
+            self.polled.fetch_add(1, Ordering::Relaxed);
+        }
+        let us = sg / 1000;
+        let b = ECL_WAIT_BUCKETS_US
+            .iter()
+            .position(|&bound| us < bound)
+            .unwrap_or(ECL_WAIT_BUCKETS_US.len());
+        self.signal_buckets[b].fetch_add(1, Ordering::Relaxed);
+        let n = self.n.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 4096 == 0 {
+            let sb: [u64; ECL_WAIT_BUCKETS_US.len() + 1] =
+                core::array::from_fn(|i| self.signal_buckets[i].load(Ordering::Relaxed));
+            log_error!(
+                "NVK ECL worker: {n} boundaries, handed-to-seen avg {} us ({} seen by polling, \
+                 Nvk12WorkerSpinUs={}), CPU signal avg {} us, signal hist <50us {} <200us {} <1ms {} \
+                 <2ms {} <5ms {} <20ms {} >=20ms {}",
+                self.wait_ns.load(Ordering::Relaxed) / n / 1000,
+                self.polled.load(Ordering::Relaxed),
+                crate::knobs12::nvk12_worker_spin_us(),
+                self.signal_ns.load(Ordering::Relaxed) / n / 1000,
+                sb[0],
+                sb[1],
+                sb[2],
+                sb[3],
+                sb[4],
+                sb[5],
+                sb[6],
+            );
+        }
+    }
+}
+
+static WORKER_STATS: WorkerStats = WorkerStats {
+    n: AtomicU64::new(0),
+    wait_ns: AtomicU64::new(0),
+    signal_ns: AtomicU64::new(0),
+    polled: AtomicU64::new(0),
+    signal_buckets: [const { AtomicU64::new(0) }; ECL_WAIT_BUCKETS_US.len() + 1],
+};
+
 /// The worker's wait slice: it rechecks its stop flag this often.
 const WORKER_SLICE_NS: u64 = 100_000_000;
 
@@ -869,7 +939,18 @@ fn worker_main(engine_queue: usize, target: SignalTarget, rx: Receiver<u64>, sto
         if value <= signalled {
             continue;
         }
+        let started = Instant::now();
+        // `Nvk12WorkerSpinUs`: poll the execution stream before blocking, so
+        // the boundary is seen without NVK's event relay (host interrupt,
+        // event forwarding, thread wake), which sits on the admission chain of
+        // the next batch.
+        // SAFETY: the queue joins this worker before releasing its engine queue.
+        let polled = unsafe { spin_wait_for(engine_queue, value, crate::knobs12::nvk12_worker_spin_us()) };
+        let mut engine_error = matches!(polled, Some(Err(_)));
         loop {
+            if polled.is_some() {
+                break;
+            }
             // SAFETY: the queue joins this worker before releasing its engine queue.
             match unsafe { crate::bridge12::wait_execution(engine_queue, value, WORKER_SLICE_NS) } {
                 Ok(true) => break,
@@ -879,6 +960,7 @@ fn worker_main(engine_queue: usize, target: SignalTarget, rx: Receiver<u64>, sto
                     }
                 }
                 Err(hr) => {
+                    engine_error = true;
                     note_refusal(&NVK_REFUSALS.worker_engine_error);
                     if let Some(k) = NVK_LOG.first_n_then_every(16, 4096) {
                         log_error!(
@@ -891,7 +973,13 @@ fn worker_main(engine_queue: usize, target: SignalTarget, rx: Receiver<u64>, sto
                 }
             }
         }
+        if engine_error && polled.is_some() {
+            note_refusal(&NVK_REFUSALS.worker_engine_error);
+        }
+        let waited = started.elapsed();
+        let signal_started = Instant::now();
         let hr = target.signal(value);
+        WORKER_STATS.record(waited, signal_started.elapsed(), polled.is_some());
         if hr < 0 {
             note_refusal(&NVK_REFUSALS.cpu_signal_failed);
             if let Some(k) = NVK_LOG.first_n_then_every(16, 4096) {
