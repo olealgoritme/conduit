@@ -482,7 +482,10 @@ fn free_bounce(io: &Io<'_>, h: &Handles, b: &mut Bounce) {
 /// The channel's teardown (the GPU idle, before the client's files close): give every mapping and
 /// the bounce back. The caller holds the channel's I/O. One relaxed load when there is nothing.
 pub(super) fn release_all(io: &Io<'_>, h: &Handles) {
+    // The CE views of standard buffers' system pages first (their own fast exit).
+    crate::ddi::ce_sysmem::release_all(io, h);
     if ANY.load(Ordering::Acquire) == 0 {
+        CHAN_GEN.fetch_add(1, Ordering::AcqRel);
         return;
     }
     loop {

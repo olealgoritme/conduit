@@ -231,6 +231,23 @@ const _: () = assert!(map_va(MAP_SLOTS as u8 - 1) + cc::VA_WINDOW <= MAX_VA);
 const _: () = assert!(BOUNCE_VA + cc::VA_WINDOW <= MAP_VA_BASE);
 const _: () = assert!(H_BOUNCE_VIRT < H_MAP_BASE);
 
+/// CE views of CPU-visible standard buffers (OS descriptors over their system pages, `ce_sysmem`).
+pub const SYS_SLOTS: usize = 8;
+/// Handles of system view slot `i`: the OS descriptor, then its `NV50_MEMORY_VIRTUAL`.
+pub const H_SYS_BASE: u32 = cc::H_BASE + 0x140;
+pub const fn sys_handles(slot: u8) -> (u32, u32) {
+    let h = H_SYS_BASE + 2 * slot as u32;
+    (h, h + 1)
+}
+/// The GPU window of system view slot `i`: 64 MiB windows from 64 windows above the base.
+pub const SYS_VA_BASE: u64 = cc::VA_BASE + 64 * cc::VA_WINDOW;
+pub const fn sys_va(slot: u8) -> u64 {
+    SYS_VA_BASE + slot as u64 * cc::VA_WINDOW
+}
+const _: () = assert!(sys_va(SYS_SLOTS as u8 - 1) + cc::VA_WINDOW <= MAX_VA);
+const _: () = assert!(map_va(MAP_SLOTS as u8 - 1) + cc::VA_WINDOW <= SYS_VA_BASE);
+const _: () = assert!(H_MAP_BASE + 2 * MAP_SLOTS as u32 <= H_SYS_BASE);
+
 /// One mapped object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mapped {
@@ -555,13 +572,16 @@ pub const COUNTERS: &[&str] = &[
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
     // the Present (`ddi/vram_redirect.rs`)
     "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail",
+    // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
+    "RvSysMade", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak",
 ];
 
 /// The files that write [`COUNTERS`] (relative to `kmd_render/src`).
-pub const WRITERS: [&str; 3] = [
+pub const WRITERS: [&str; 4] = [
     "virtio/rm_client/vidmem.rs",
     "virtio/rm_client/ce_vram.rs",
     "ddi/vram_redirect.rs",
+    "ddi/ce_sysmem.rs",
 ];
 
 #[cfg(test)]

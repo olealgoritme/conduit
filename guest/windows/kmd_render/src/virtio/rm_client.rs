@@ -514,6 +514,7 @@ pub(crate) fn forget() {
     // The copy-engine route's destinations: the transport was reset, so nothing on the host
     // names their pages any more; every pin goes (one load when there is none).
     crate::ddi::ce_present_route::forget(super::nvrm::last_sweep_fate());
+    crate::ddi::ce_sysmem::forget(super::nvrm::last_sweep_fate());
     // The next transport generation reads the knob again (once).
     KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }
