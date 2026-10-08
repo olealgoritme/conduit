@@ -334,6 +334,10 @@ pub(crate) fn note_flip_issued(address: u64) {
 /// a kept publication of any lane, the ring-1 completion DPC, the watchdog). Counts it and, when
 /// it names the newest recorded flip, marks that flip done. Atomics only, any IRQL.
 pub(crate) fn note_published(address: u64) {
+    // `FlipDoneHost`: every publication passes here (bound, kept, announced, the copy DPC's), so
+    // this is where the host-feedback book learns its time and `seq` floor. One relaxed load
+    // with the knob off.
+    crate::ddi::host_flip_done::note_published(address);
     FLIP_PUB.fetch_add(1, Ordering::Relaxed);
     FLIP_PUB_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
     if let Some(seq) = sd::flip_done_by(

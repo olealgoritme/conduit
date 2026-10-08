@@ -1437,6 +1437,14 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// `FlipDoneHost` (default 0; `ddi::host_flip_done`, `docs/independent-flip.md` section
+    /// 13). Nonzero acks the host's presentation feedback (`NVGPU_F_SCANOUT_PRESENTED`) and
+    /// retires flips from it: 1 holds a programmed address back from the vsync until the host
+    /// reports it on screen (at most 3 periods), delivers that report's CRTC_VSYNC at once and
+    /// puts the timer between the host's vblanks; 2 only holds (the timer delivers, on its own
+    /// phase). Also makes 2 the default `FlipQueueN`. Read with the other adapter knobs
+    /// (AddAdapter and StartDevice); mirrored as `FdhKnob`, the ack as `FdhAck`.
+    pub const FLIP_DONE_HOST: KnobName = KnobName::new(b"FlipDoneHost");
     /// `FlipAnnounce` (default 2 since the 332.1 hardware rows; 0 = off, the old behaviour): publish a flip's address toward
     /// dxgkrnl AT `SetVidPnSourceAddress` (atomics only, DIRQL) so the very next CRTC_VSYNC tick
     /// retires it (one tick per flip instead of two), while the HPD worker does the real

@@ -86,6 +86,9 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
         // closes the handle (the host round trips are not DPC work).
         adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FENCE);
     }
+    // `FlipDoneHost`: a `ScanoutPresented` the drain left in the mailbox, consumed with no
+    // transport lock held (it may deliver a CRTC_VSYNC). One relaxed load when none waits.
+    crate::ddi::host_flip_done::service(adapter);
 
     // A producer completion may have made the one deferred fast bind safe.
     // Promotion and sequence minting share this virtio-lock hold, so the host
