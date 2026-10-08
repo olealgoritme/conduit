@@ -587,6 +587,7 @@ impl FrameStats {
 
     /// Close a frame: `started` is the Present DDI's entry.
     pub(crate) fn note_present(&self, started: Instant) {
+        crate::wait_split::on_present();
         let now = Instant::now();
         let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
         let mut frame = FrameSums {
