@@ -146,12 +146,6 @@ pub(crate) fn windowed_blt_snapshot_capable() -> bool {
 /// the registry mutex, read anywhere.
 static ENABLED: AtomicU32 = AtomicU32::new(0);
 
-/// The runtime ADAPTER handle from the most recent `OpenAdapter*`, i.e. the
-/// first argument `pfnEscapeCb` documents (`hAdapter`). Every open in this
-/// process targets the same Helios adapter, so any live runtime adapter
-/// object reaches the same kernel adapter; the value is refreshed on every
-/// open so it always names the newest (longest-lived) object.
-static LAST_RT_ADAPTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-device acquire state. `key` is the `HeliosDevice` pointer value —
 /// identity only, never dereferenced here.
@@ -180,14 +174,6 @@ struct DeviceEntry {
 }
 
 static REGISTRY: Mutex<Vec<DeviceEntry>> = Mutex::new(Vec::new());
-
-/// Record the runtime adapter handle at `OpenAdapter*` time. Called from
-/// `open_adapter_common`.
-pub(crate) fn note_runtime_adapter(h_rt_adapter: *mut core::ffi::c_void) {
-    if !h_rt_adapter.is_null() {
-        LAST_RT_ADAPTER.store(h_rt_adapter as usize, Ordering::Release);
-    }
-}
 
 /// Build and issue one Helios escape through `pfnEscapeCb`.
 ///
@@ -309,7 +295,7 @@ pub(crate) fn windowed_snapshot_idle(dev: &HeliosDevice, resource_id: u32) -> bo
     let Some(context) = dev.context.as_ref() else {
         return false;
     };
-    let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
+    let rt_adapter = dev.rt_adapter;
     if rt_adapter == 0 || dev.kt_callbacks.is_null() {
         return false;
     }
@@ -428,7 +414,7 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
     if dev.kt_callbacks.is_null() {
         return 0;
     }
-    let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
+    let rt_adapter = dev.rt_adapter;
     if rt_adapter == 0 {
         log_error!(
             "scanout-acquire: no runtime adapter handle captured; feature off for this device"
@@ -899,10 +885,30 @@ const NVRM_OPS_ASKED: u64 = 1 << 63;
 /// # Safety
 /// `dev` is a live device (its callback table valid for the call).
 pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
+    // SAFETY: the caller's contract.
+    (unsafe { nvrm_supported_ops(dev) } & helios_protocol::HELIOS_NVRM_CAP_FLUSH_GATE) != 0
+}
+
+/// The copy-engine Present record (`'HEF3'`): NVRM `QUERY_CAPS.supported_ops`
+/// bit 37 (`HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3`), the KMD reads it.
+///
+/// # Safety
+/// `dev` is a live device (its callback table valid for the call).
+pub(crate) unsafe fn nvrm_rm_fence_tail_v3_capable(dev: &HeliosDevice) -> bool {
+    // SAFETY: the caller's contract.
+    (unsafe { nvrm_supported_ops(dev) } & helios_protocol::HELIOS_NVRM_CAP_RM_FENCE_TAIL_V3) != 0
+}
+
+/// NVRM `QUERY_CAPS.supported_ops` (bit 63 set once asked), asked once per
+/// process through this device's escape callback.
+///
+/// # Safety
+/// `dev` is a live device (its callback table valid for the call).
+unsafe fn nvrm_supported_ops(dev: &HeliosDevice) -> u64 {
     let mut ops = NVRM_OPS.load(Ordering::Relaxed);
     if ops == 0 {
         ops = NVRM_OPS_ASKED;
-        let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
+        let rt_adapter = dev.rt_adapter;
         if !dev.kt_callbacks.is_null() && rt_adapter != 0 {
             // SAFETY: HeliosNvrmQueryCaps is plain data; all-zero is valid.
             let mut q: helios_protocol::HeliosNvrmQueryCaps = unsafe { core::mem::zeroed() };
@@ -927,7 +933,7 @@ pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
                 ops |= q.supported_ops;
             }
             log_error!(
-                "flush-gate: NVRM QUERY_CAPS hr=0x{:08x} status={} supported_ops=0x{:016x}",
+                "nvrm: QUERY_CAPS hr=0x{:08x} status={} supported_ops=0x{:016x}",
                 hr as u32,
                 q.head.status,
                 q.supported_ops
@@ -935,5 +941,5 @@ pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
         }
         NVRM_OPS.store(ops, Ordering::Relaxed);
     }
-    ops & helios_protocol::HELIOS_NVRM_CAP_FLUSH_GATE != 0
+    ops
 }

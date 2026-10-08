@@ -200,7 +200,9 @@ pub unsafe extern "C" fn dxgkddi_present(
     // the output pointer names a live local. DXGKDDI_PRESENT itself is PASSIVE.
     let start_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
     crate::ddi::present_foreign::begin_call();
-    let status = unsafe { dxgkddi_present_inner(h_context, present) };
+    let status = unsafe { dxgkddi_present_inner(h_context, present, start_100ns) };
+    // `DwPrN` / `DwPrFail`: Presents since the last device died (atomics).
+    crate::ddi::dwm_restart::note_present(status == STATUS_SUCCESS);
     // Fixed-name telemetry survives the steady-state registry ring flood and
     // proves whether a failing UMD pfnPresentCb originated in this DDI. A
     // failure is never delayed. Successful frames update the same name on the
@@ -240,9 +242,12 @@ pub unsafe extern "C" fn dxgkddi_present(
     status
 }
 
+/// `present_t_100ns`: the exported DDI's entry time (interrupt time), the `StageTrace` G_PRESENT
+/// stamp of a Blt copy.
 unsafe fn dxgkddi_present_inner(
     h_context: IN_CONST_HANDLE,
     present: INOUT_PDXGKARG_PRESENT,
+    present_t_100ns: u64,
 ) -> NTSTATUS {
     PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
     if present.is_null() {
@@ -941,6 +946,7 @@ unsafe fn dxgkddi_present_inner(
                                 destination_desc,
                                 prepared,
                                 boundary,
+                                present_t_100ns,
                             )
                         })
                         .unwrap_or(Err(VirtioError::DeviceError))
@@ -988,6 +994,8 @@ unsafe fn dxgkddi_present_inner(
                 if crate::diag::sample_tick(&PB_FNC_TICK) {
                     crate::diag::record_named_bytes(b"PBFnc", token as u32);
                 }
+                // `DwPrOk`: a Blt queued (the first since a device died also asks for a mirror).
+                crate::ddi::dwm_restart::note_blt_done(Some(adapter));
             } else {
                 // SAFETY: `DxgkDdiPresent` is documented "IRQL: PASSIVE_LEVEL" (WDK
                 // DXGKDDI_PRESENT) — it is a pageable DDI, and the BLT arm below
@@ -1053,6 +1061,7 @@ unsafe fn dxgkddi_present_inner(
                             source_desc,
                             destination_desc,
                             present_stream_boundary,
+                            present_t_100ns,
                         )
                     } {
                         Ok(crate::ddi::blt_async::Taken::Legacy) => {}
@@ -1161,6 +1170,13 @@ unsafe fn dxgkddi_present_inner(
                         );
                     }
                 };
+                // `StageTrace`: this Present's entry, under the copy's wire fence.
+                crate::ddi::stage_trace::stamp(
+                    helios_kmd_logic::stage_trace::G_PRESENT,
+                    helios_kmd_logic::stage_trace::KIND_FENCE,
+                    gpu_fence,
+                    present_t_100ns,
+                );
                 crate::diag::record_named_on_change(
                     b"PBConv",
                     u32::from(source_dxgi_format != destination_dxgi_format),
@@ -1311,6 +1327,8 @@ unsafe fn dxgkddi_present_inner(
                 if crate::diag::sample_tick(&PB_FNC_TICK) {
                     crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
                 }
+                // `DwPrOk`: a Blt copied.
+                crate::ddi::dwm_restart::note_blt_done(Some(adapter));
                 // Level 5: a standard-buffer destination was waited for above, so the blit is
                 // in the memory: if it is the RM primary the screen shows, a frame is owed.
                 // Atomics only; one relaxed load with the knob below 5.
@@ -1489,6 +1507,22 @@ unsafe fn dxgkddi_present_inner(
         // picture and the flip's DMA fence retires normally. An ordinary allocation that is not
         // registered still fails (`PBFlip` 0xE6).
         let route = crate::ddi::present_foreign::flip_route(adapter, registered.is_some(), &source);
+        // `IndepFlip` census (`ddi/indep_flip.rs`): one DMA-contract flip; and when this Present
+        // answers it without arming the worker, its verdict is counted here (an armed flip is
+        // counted by the worker). Nothing when the knob is off.
+        let idf_mode = crate::ddi::indep_flip::mode();
+        if idf_mode.is_on() {
+            crate::ddi::indep_flip::note_arm_dma();
+            if !matches!((route, registered), (FlipRoute::Arm { .. }, Some(_))) {
+                crate::ddi::indep_flip::count_dma_unarmed(
+                    &source,
+                    registered.is_some(),
+                    flip_source.physical_address(),
+                    adapter.is_some_and(|a| a.display_half()),
+                    adapter.map_or((0, 0), |a| a.display_mode()),
+                );
+            }
+        }
         // FLIP COMPLETION (`helios_kmd_logic::flip_completion`, `docs/zero-copy-present.md`). A
         // flip this Present answers without arming anything (the counted skip of a foreign
         // allocation, or the failure of a HOLLOW one: no resource id, or a non-direct allocation
@@ -1513,6 +1547,24 @@ unsafe fn dxgkddi_present_inner(
         let flip_allocation = match (route, registered) {
             (FlipRoute::Arm { .. }, Some(handle)) => handle,
             _ if keep_flip => {
+                return unsafe {
+                    present_flip_kept(
+                        args,
+                        present_allocations,
+                        flip_source.physical_address(),
+                        present_stream_boundary,
+                        present_arm,
+                        adapter,
+                        src_info,
+                        dst_info,
+                    )
+                };
+            }
+            // `IndepFlip=2`: under independent flip this is an application's buffer dxgkrnl chose
+            // to flip, and a flip dxgkrnl issued COMPLETES (`docs/independent-flip.md` 4.1): a
+            // kept picture instead of failing the Present. Off and 1 fail it as always.
+            _ if helios_kmd_logic::independent_flip::keeps_unregistered_dma_flip(idf_mode) => {
+                crate::ddi::indep_flip::note_enforced_keep();
                 return unsafe {
                     present_flip_kept(
                         args,
@@ -1776,6 +1828,9 @@ unsafe fn present_blt_skipped(
     src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
     dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
 ) -> NTSTATUS {
+    // `DwPrSkip` / `DwRunNow` / `DwRunMax`: a Blt that copied nothing, whatever the reason; the
+    // destination keeps its bytes (docs/zero-copy-present.md "DWM restart and stale Explorer").
+    crate::ddi::dwm_restart::note_blt_skipped(adapter);
     // Capacity was checked before this point, so this cannot fail; a failure would only leave the
     // previous record, which a recycled DMA buffer may carry.
     let _ = unsafe {
@@ -1993,6 +2048,12 @@ unsafe fn present_blt_to_rm_primary(
     };
     // 3 = copied by the CPU into the RM primary, 4 = skipped (answered with success).
     let cpy = if done.skipped.is_some() { 4 } else { 3 };
+    // `DwPrOk` / `DwPrSkip` for the level 5 arm as for the legacy one.
+    if done.skipped.is_some() {
+        crate::ddi::dwm_restart::note_blt_skipped(Some(adapter));
+    } else {
+        crate::ddi::dwm_restart::note_blt_done(Some(adapter));
+    }
     if RM_BLT_LAST_CPY.swap(cpy, Ordering::Relaxed) != cpy {
         crate::diag::record_named_on_change(b"PBCpy", cpy, &PB_CPY_LAST);
     }
@@ -2028,7 +2089,14 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                     request.token,
                     request.stream_boundary,
                 ) {
-                    return (request.token, request.stream_boundary, None, Ok(0));
+                    // Times 0: no `StageTrace` stamps under the placeholder fence 0.
+                    return (
+                        request.token,
+                        request.stream_boundary,
+                        (0, 0),
+                        None,
+                        Ok(0),
+                    );
                 }
                 // `GuestBlob`: a copy prepared into a guest buffer that is no longer its
                 // destination's copy target (retired by a paging operation since the Present)
@@ -2083,6 +2151,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 (
                     request.token,
                     request.stream_boundary,
+                    (request.t_present, request.t_queue),
                     match request.destination {
                         PresentDestinationDesc::StandardBuffer(destination) => {
                             Some(destination.resource_id())
@@ -2101,17 +2170,35 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 )
             })
         });
-        if let Ok(Some((token, boundary, destination_buffer, result))) = submit {
+        if let Ok(Some((token, boundary, (t_present, t_queue), destination_buffer, result))) =
+            submit
+        {
             match result {
-                Ok(fence) => crate::ddi::scanout_timeline::note(
-                    crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
-                    crate::ddi::scanout_timeline::flag::SUCCESS,
-                    0,
-                    boundary,
-                    token,
-                    fence as u32,
-                    0,
-                ),
+                Ok(fence) => {
+                    // `StageTrace`: the Present's entry and its queueing, under the copy's wire
+                    // fence (G_SUBMIT was stamped by the submission; a time of 0 is not stamped).
+                    crate::ddi::stage_trace::stamp(
+                        helios_kmd_logic::stage_trace::G_PRESENT,
+                        helios_kmd_logic::stage_trace::KIND_FENCE,
+                        fence,
+                        t_present,
+                    );
+                    crate::ddi::stage_trace::stamp(
+                        helios_kmd_logic::stage_trace::G_DEFER,
+                        helios_kmd_logic::stage_trace::KIND_FENCE,
+                        fence,
+                        t_queue,
+                    );
+                    crate::ddi::scanout_timeline::note(
+                        crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
+                        crate::ddi::scanout_timeline::flag::SUCCESS,
+                        0,
+                        boundary,
+                        token,
+                        fence as u32,
+                        0,
+                    )
+                }
                 Err(_) => {
                     let _ = adapter.with_virtio(|v| {
                         if let Some(resource_id) = destination_buffer {
@@ -2375,6 +2462,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     // is silent about it. Legal here: this is a plain atomic increment with no
     // registry transaction, and the DDI can arrive at DIRQL.
     crate::ddi::scanout_trace::note_ddi_entry();
+    // `DwFlipN` / `DwFlipMs`: flips since the last device died (atomics, legal at DIRQL).
+    crate::ddi::dwm_restart::note_flip();
     // Windows names the authoritative desktop primary here. This—not resource
     // dimensions, OM bindings, process name, or an arbitrary Present call—is the
     // only allocation the KMD may bind directly or copy into the fallback image.
@@ -2388,6 +2477,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     let primary_flags = unsafe { (*address).Flags.__bindgen_anon_1.Value };
     // S-0a: count the flip flags this DDI ignores (atomics only, legal at DIRQL).
     crate::ddi::scanout_trace::note_set_vidpn_flags(primary_flags);
+    // `IndepFlip` census: one MMIO-contract flip (atomics only; nothing when the knob is off).
+    crate::ddi::indep_flip::note_arm_mmio();
     // `FlipIss` (`ddi::stall_diag`): a flip dxgkrnl issued, recorded as the newest for the
     // watchdog. Atomics only, legal at DIRQL. Before anything below can publish or raise the gate.
     crate::ddi::stall_diag::note_flip_issued(primary_address);
@@ -2411,6 +2502,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         )
     } {
         crate::ddi::scanout_trace::note_ddi_pair_failed();
+        // `DwFlipBad`: the same refusal, counted since the last device died.
+        crate::ddi::dwm_restart::note_flip_unpaired();
         // The handle pairs with no allocation of the live transport generation (stale, foreign,
         // null): not a Venus allocation of this host, nothing will ever bind it, and the only
         // thing left to complete is the flip's address (an atomic store, legal at the DIRQL this
@@ -3691,6 +3784,11 @@ unsafe fn program_vidpn_source_inner(
         crate::diag::record_named_bytes(b"SaHi", (source.primary_address >> 32) as u32);
         crate::diag::record_named_bytes(b"SaFlg", source.primary_flags);
     }
+    // `IndepFlip` census (`ddi/indep_flip.rs`): every resolved flip source is judged once here,
+    // before any arm. A foreign source's verdict waits for the arm's answer below (`idf_pending`).
+    // Nothing when the knob is off; no arm below reads it.
+    let idf_pending =
+        crate::ddi::indep_flip::worker_pre(&source, (width, height), (mode_w, mode_h));
     if width != mode_w || height != mode_h {
         return Err(ScanoutReject::Extent);
     }
@@ -3710,13 +3808,22 @@ unsafe fn program_vidpn_source_inner(
         ) {
             Programmed::NotOurs => rm_flip::other_source(adapter),
             Programmed::Ok => {
+                if let Some(p) = idf_pending {
+                    p.finish(true);
+                }
                 // The screen's source is the KMD's own primary: a foreign allocation shown
                 // by `ForeignFlip` before it is forgotten (one load when it shows nothing).
                 crate::virtio::foreign_flip::other_source(adapter);
                 trace.target_resource = source.resource_id;
                 return Ok(ScanoutOutcome::Programmed);
             }
-            Programmed::BadLayout => return Err(ScanoutReject::Layout),
+            Programmed::BadLayout => {
+                if let Some(p) = idf_pending {
+                    p.finish(false);
+                }
+                return Err(ScanoutReject::Layout);
+            }
+            // Not counted: the retry runs this function again and is counted then.
             Programmed::Retry => return Err(ScanoutReject::SetFailed),
         }
     }
@@ -3737,6 +3844,9 @@ unsafe fn program_vidpn_source_inner(
             height,
             source.direct_scanout,
         );
+        if let Some(p) = idf_pending {
+            p.finish(matches!(arm, FfProgrammed::Ok));
+        }
         match arm {
             FfProgrammed::NotOurs | FfProgrammed::Refused => {
                 // FLIP COMPLETION (`helios_kmd_logic::flip_completion`, `docs/zero-copy-present.md`).

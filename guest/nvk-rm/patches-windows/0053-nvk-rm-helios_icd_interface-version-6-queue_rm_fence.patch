@@ -1,0 +1,401 @@
+From 672de28be0962971245f68f649d18286f26f0482 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Wed, 7 Oct 2026 21:22:55 +0200
+Subject: [PATCH] nvk/rm: helios_icd_interface version 6, queue_rm_fence_v3
+ (the semaphore and copy source of a composed present)
+
+The KMD's copy-engine route for a composed (windowed Blt) Present copies
+the frame on its own RM copy-engine channel after a semaphore acquire on
+the producer's timeline (Conduit guest/windows/docs/rm-copy-engine-
+present.md, sections 2.3 (b), 10 and 12). The fence handle a present
+marker carries is opaque; the acquire needs the semaphore's RM memory,
+offset and value, and the copy needs the image's RM memory and layout.
+
+queue_rm_fence_v3 is queue_rm_fence plus that: the semaphore of the
+queue's present timeline (the root client, hSemaphoreMem of the
+NV_SEMAPHORE_SURFACE, entry * entry size, the fence's value) and the
+presented image as helios_image_layout describes it (one plane of the
+shared-format table, dedicated, uncompressed, block-linear only with the
+page kind its modifier names). VK_INCOMPLETE when the image cannot be
+described: the fence is still the caller's and goes without the record.
+The two structs are the bytes of HeliosRmSemaphoreLoc / HeliosRmCopySource
+of Conduit's helios_rm_fence.h; the UMD wraps them in the 'HEF3' record.
+---
+ src/nouveau/vulkan/helios_icd_interface.h     | 73 ++++++++++++++-
+ src/nouveau/vulkan/nvk_helios.c               | 93 +++++++++++++++++++
+ src/nouveau/vulkan/nvk_wsi.c                  | 12 +++
+ src/nouveau/vulkan/nvk_wsi.h                  |  7 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h        | 14 +++
+ .../vulkan/nvkmd/rm/nvkmd_rm_rmfence.c        | 33 +++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c    | 11 +++
+ 7 files changed, 241 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
+index 06fb02f..f5d6aac 100644
+--- a/src/nouveau/vulkan/helios_icd_interface.h
++++ b/src/nouveau/vulkan/helios_icd_interface.h
+@@ -31,6 +31,7 @@
+ #ifndef HELIOS_ICD_INTERFACE_H
+ #define HELIOS_ICD_INTERFACE_H
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ #include <vulkan/vulkan_core.h>
+ 
+@@ -40,8 +41,9 @@ extern "C" {
+ 
+ #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
+ /* The export keeps its name; version 3 only appends entries (and caps 4..6),
+- * version 4 appends memory_res_plane1 (and cap 8). */
+-#define HELIOS_ICD_INTERFACE_VERSION 5u
++ * version 4 appends memory_res_plane1 (and cap 8), version 5 scanout_frame,
++ * version 6 queue_rm_fence_v3. */
++#define HELIOS_ICD_INTERFACE_VERSION 6u
+ 
+ enum helios_icd_backend {
+    HELIOS_ICD_BACKEND_VENUS = 1,
+@@ -162,6 +164,52 @@ struct helios_icd_plane {
+    uint32_t offset;   /* bytes from the start of the object */
+ };
+ 
++/* ---- queue_rm_fence_v3 (version 6) ---------------------------------------
++ * What the KMD's copy-engine route needs for a composed (windowed Blt)
++ * Present: where the producer's timeline semaphore lives and which value the
++ * frame's work releases, and the presented image's RM memory and layout
++ * (guest/windows/docs/rm-copy-engine-present.md, sections 10 and 12). The
++ * same bytes as HeliosRmSemaphoreLoc / HeliosRmCopySource of
++ * protocol/include/helios_rm_fence.h (the 'HEF3' record behind a present
++ * marker's fence tail); the UMD wraps them in that record. Handles are RM
++ * handles of the ICD's own RM client. */
++struct helios_icd_rm_semaphore {
++   uint32_t h_client; /* the RM client the semaphore memory belongs to */
++   uint32_t h_memory; /* the memory behind the timeline's semaphore surface */
++   uint64_t offset;   /* bytes to the 64-bit value; 8-aligned */
++   uint64_t value;    /* the value the frame's work releases (the fence's) */
++};
++struct helios_icd_rm_source {
++   uint32_t h_client; /* the RM client the image memory belongs to */
++   uint32_t h_memory; /* the image's dedicated memory */
++   uint64_t offset;   /* plane 0 offset, bytes */
++   uint64_t size;     /* bytes of the memory object */
++   uint64_t modifier; /* DRM_FORMAT_MOD_* (LINEAR or the GB20x family | h) */
++   uint32_t pitch;    /* row pitch, bytes */
++   uint32_t width;
++   uint32_t height;
++   uint32_t fourcc;   /* DRM_FORMAT_*, one plane */
++   uint32_t flags;    /* 0 (a compressed image gets no record at all) */
++   uint32_t reserved; /* 0 */
++};
++struct helios_icd_rm_copy {
++   struct helios_icd_rm_semaphore semaphore;
++   struct helios_icd_rm_source source;
++};
++#if defined(__cplusplus)
++static_assert(sizeof(helios_icd_rm_semaphore) == 24, "rm semaphore");
++static_assert(sizeof(helios_icd_rm_source) == 56, "rm source");
++static_assert(offsetof(helios_icd_rm_source, pitch) == 32, "rm source pitch");
++static_assert(sizeof(helios_icd_rm_copy) == 80, "rm copy");
++static_assert(offsetof(helios_icd_rm_copy, source) == 24, "rm copy source");
++#else
++_Static_assert(sizeof(struct helios_icd_rm_semaphore) == 24, "rm semaphore");
++_Static_assert(sizeof(struct helios_icd_rm_source) == 56, "rm source");
++_Static_assert(offsetof(struct helios_icd_rm_source, pitch) == 32, "rm source pitch");
++_Static_assert(sizeof(struct helios_icd_rm_copy) == 80, "rm copy");
++_Static_assert(offsetof(struct helios_icd_rm_copy, source) == 24, "rm copy source");
++#endif
++
+ struct helios_icd_api {
+    uint32_t version; /* HELIOS_ICD_INTERFACE_VERSION */
+    uint32_t size;    /* sizeof(struct helios_icd_api) the ICD filled */
+@@ -249,6 +297,27 @@ struct helios_icd_api {
+     * was minted by a live KMD source. */
+    VkResult (*scanout_frame)(VkDevice device, VkDeviceMemory memory,
+                              uint64_t *sequence, uint32_t *generation);
++
++   /* ---- version 6 (size covers it; NULL = not supported) ----------------
++    * queue_rm_fence, plus what a copy engine needs to copy `image` (bound
++    * at offset 0 of its dedicated `memory`) once the fence's value landed:
++    * *copy (struct above). The same rules as queue_rm_fence for the queue
++    * and the fence:
++    *   VK_SUCCESS     *fence_handle is the caller's, *copy filled
++    *                  (copy->semaphore.value == *value);
++    *   VK_INCOMPLETE  *fence_handle is the caller's, *copy all zero: the
++    *                  image cannot be described (not a dedicated one-plane
++    *                  2D image of a shared format, compressed, a layout
++    *                  helios_icd_layout cannot express); send the fence
++    *                  without the record;
++    *   an error       no fence (VK_ERROR_FEATURE_NOT_PRESENT: no RM fences
++    *                  here, wait on the CPU as before).
++    * `value` may be NULL. The record is a hint for the KMD's copy-engine
++    * route; whether the KMD reads it is the UMD's business (QueryCaps). */
++   VkResult (*queue_rm_fence_v3)(VkDevice device, VkQueue queue,
++                                 VkDeviceMemory memory, VkImage image,
++                                 uint32_t *fence_handle, uint64_t *value,
++                                 struct helios_icd_rm_copy *copy);
+ };
+ 
+ typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);
+diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
+index 6c4ce03..80924da 100644
+--- a/src/nouveau/vulkan/nvk_helios.c
++++ b/src/nouveau/vulkan/nvk_helios.c
+@@ -488,6 +488,98 @@ helios_scanout_frame(VkDevice _device, VkDeviceMemory _mem, uint64_t *sequence,
+    return VK_SUCCESS;
+ }
+ 
++/* helios_icd_interface.h version 6: the copy source of a composed present
++ * (guest/windows/docs/rm-copy-engine-present.md, sections 10 and 12).  The
++ * same image rules as a resource id of the shared-format table, one plane,
++ * plus what the KMD's copy needs: an uncompressed image, mapped by the KMD
++ * with the page kind its modifier names (the GB20x family names the generic
++ * kind 0x06, nil's uncompressed kind on GB20x).
++ */
++static bool
++helios_rm_source(struct nvk_device_memory *mem, struct nvk_image *image,
++                 struct helios_icd_rm_source *out)
++{
++   if (mem == NULL || image == NULL || mem->dedicated_image != image ||
++       image->is_compressed)
++      return false;
++
++   struct nvkmd_rm_foreign_layout fl;
++   uint8_t pte_kind;
++   uint16_t tile_mode;
++   if (helios_image_layout(image, true, &fl, &pte_kind, &tile_mode) !=
++          VK_SUCCESS || fl.plane_count != 1)
++      return false;
++   if (fl.modifier != DRM_FORMAT_MOD_LINEAR &&
++       ((fl.modifier >> 12) & 0xff) != pte_kind)
++      return false;
++
++   uint32_t h_client = 0, h_memory = 0;
++   nvkmd_rm_mem_rm_handles(mem->mem, &h_client, &h_memory);
++   if (h_client == 0 || h_memory == 0)
++      return false;
++
++   *out = (struct helios_icd_rm_source) {
++      .h_client = h_client,
++      .h_memory = h_memory,
++      .offset = fl.offset,
++      .size = mem->mem->size_B,
++      .modifier = fl.modifier,
++      .pitch = fl.stride,
++      .width = fl.width,
++      .height = fl.height,
++      .fourcc = fl.fourcc,
++      .flags = 0,
++      .reserved = 0,
++   };
++   return true;
++}
++
++static VkResult
++helios_queue_rm_fence_v3(VkDevice _device, VkQueue _queue,
++                         VkDeviceMemory _mem, VkImage _image,
++                         uint32_t *fence_handle, uint64_t *value,
++                         struct helios_icd_rm_copy *copy)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(vk_queue, queue, _queue);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++   VK_FROM_HANDLE(nvk_image, image, _image);
++
++   *fence_handle = 0;
++   if (value != NULL)
++      *value = 0;
++   if (copy != NULL)
++      memset(copy, 0, sizeof(*copy));
++   if (dev == NULL || queue == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   /* The source first: describing it changes nothing, and a fence once
++    * made is the caller's whatever follows.
++    */
++   struct helios_icd_rm_source source;
++   const bool described = copy != NULL && helios_rm_source(mem, image, &source);
++
++   int fence = -1;
++   uint64_t v = 0;
++   struct vk_sync *sync = NULL;
++   VkResult result = nvk_queue_rm_fence_sync(dev, queue, &fence, &v, &sync);
++   if (result != VK_SUCCESS)
++      return result;
++   *fence_handle = (uint32_t)fence;
++   if (value != NULL)
++      *value = v;
++
++   struct helios_icd_rm_semaphore sem = { .value = v };
++   if (!described ||
++       !nvkmd_rm_rmfence_semaphore(dev->nvkmd, sync, &sem.h_client,
++                                   &sem.h_memory, &sem.offset))
++      return VK_INCOMPLETE;
++
++   copy->semaphore = sem;
++   copy->source = source;
++   return VK_SUCCESS;
++}
++
+ static void
+ helios_scanout_release(VkDevice _device)
+ {
+@@ -556,6 +648,7 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+       .scanout_present_fenced = helios_scanout_present_fenced,
+       .memory_res_plane1 = helios_memory_res_plane1,
+       .scanout_frame = helios_scanout_frame,
++      .queue_rm_fence_v3 = helios_queue_rm_fence_v3,
+    };
+    memcpy(out, &api, cap);
+    return VK_SUCCESS;
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index d26e880..b9d7380 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -52,10 +52,20 @@ nvk_wsi_scanout_flip(VkDevice _device, VkDeviceMemory _mem,
+ VkResult
+ nvk_queue_rm_fence(struct nvk_device *dev, struct vk_queue *queue,
+                    int *fence_out, uint64_t *value_out)
++{
++   return nvk_queue_rm_fence_sync(dev, queue, fence_out, value_out, NULL);
++}
++
++VkResult
++nvk_queue_rm_fence_sync(struct nvk_device *dev, struct vk_queue *queue,
++                        int *fence_out, uint64_t *value_out,
++                        struct vk_sync **sync_out)
+ {
+    uint64_t value = 0;
+ 
+    *fence_out = -1;
++   if (sync_out != NULL)
++      *sync_out = NULL;
+    struct vk_sync *sync = nvkmd_rm_rmfence_sync(dev->nvkmd, &dev->vk.base,
+                                                 queue, &value);
+    if (sync == NULL)
+@@ -74,6 +84,8 @@ nvk_queue_rm_fence(struct nvk_device *dev, struct vk_queue *queue,
+       return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (value_out != NULL)
+       *value_out = value;
++   if (sync_out != NULL)
++      *sync_out = sync;
+    return VK_SUCCESS;
+ }
+ 
+diff --git a/src/nouveau/vulkan/nvk_wsi.h b/src/nouveau/vulkan/nvk_wsi.h
+index eb41019..d3b937a 100644
+--- a/src/nouveau/vulkan/nvk_wsi.h
++++ b/src/nouveau/vulkan/nvk_wsi.h
+@@ -22,6 +22,13 @@ struct vk_queue;
+  */
+ VkResult nvk_queue_rm_fence(struct nvk_device *dev, struct vk_queue *queue,
+                             int *fence_out, uint64_t *value_out);
++/* nvk_queue_rm_fence, plus the present timeline the fence is a point of
++ * (nvkmd_rm_rmfence_semaphore locates its value).
++ */
++VkResult nvk_queue_rm_fence_sync(struct nvk_device *dev,
++                                 struct vk_queue *queue, int *fence_out,
++                                 uint64_t *value_out,
++                                 struct vk_sync **sync_out);
+ #endif
+ 
+ #endif
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index d11084d..1ef4bfd 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -525,6 +525,11 @@ void nvkmd_rm_dev_scanout_release(struct nvkmd_dev *dev);
+  */
+ bool nvkmd_rm_mem_scanout_frame(struct nvkmd_mem *mem, uint64_t *seq,
+                                 uint32_t *generation);
++/* The RM client of `mem`'s device and `mem`'s RM memory handle in it, for a
++ * peer that duplicates the memory (the KMD's copy-engine Present).
++ */
++void nvkmd_rm_mem_rm_handles(struct nvkmd_mem *mem, uint32_t *h_client,
++                             uint32_t *h_memory);
+ 
+ /*
+  * RM fences for presents (nvkmd_rm_rmfence.c; guest/windows/docs/
+@@ -561,6 +566,15 @@ VkResult nvkmd_rm_rmfence_create(struct nvkmd_dev *dev,
+                                  struct vk_object_base *log_obj,
+                                  struct vk_sync *sync, uint64_t value,
+                                  int *fence_out);
++/* Where the 64-bit value of that sync lives, in RM terms: the RM client and
++ * the memory behind the timeline's semaphore surface, and the value's byte
++ * offset in it (helios_icd_interface.h queue_rm_fence_v3, the copy-engine
++ * Present's semaphore acquire).  False for a sync that is no present
++ * timeline of this device.
++ */
++bool nvkmd_rm_rmfence_semaphore(struct nvkmd_dev *dev, struct vk_sync *sync,
++                                uint32_t *h_client, uint32_t *h_memory,
++                                uint64_t *offset_B);
+ VkResult nvkmd_rm_rmfence_wait(struct nvkmd_dev *dev, int fence,
+                                uint64_t timeout_ns);
+ void nvkmd_rm_rmfence_close(struct nvkmd_dev *dev, int fence);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+index 58e8150..d1887a8 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+@@ -307,6 +307,39 @@ nvkmd_rm_rmfence_create(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
+    return VK_SUCCESS;
+ }
+ 
++bool
++nvkmd_rm_rmfence_semaphore(struct nvkmd_dev *_dev, struct vk_sync *sync,
++                           uint32_t *h_client, uint32_t *h_memory,
++                           uint64_t *offset_B)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++
++   *h_client = 0;
++   *h_memory = 0;
++   *offset_B = 0;
++   if (rf == NULL || sync == NULL)
++      return false;
++
++   bool found = false;
++   simple_mtx_lock(&dev->rmfence_mutex);
++   for (uint32_t i = 0; i < rf->tl_count; i++) {
++      if (&rf->tl[i].sync.base == sync) {
++         /* rmfence_tl_locked: entry i of the surface over rf->mem */
++         *offset_B = i * rf->entry_size_B;
++         found = true;
++         break;
++      }
++   }
++   simple_mtx_unlock(&dev->rmfence_mutex);
++   if (!found)
++      return false;
++
++   *h_client = dev->lib->root(dev->client);
++   *h_memory = nvkmd_rm_mem(rf->mem)->h_memory;
++   return *h_client != 0 && *h_memory != 0;
++}
++
+ VkResult
+ nvkmd_rm_rmfence_wait(struct nvkmd_dev *_dev, int fence, uint64_t timeout_ns)
+ {
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index acb45d9..1b7500b 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -418,6 +418,17 @@ nvkmd_rm_mem_scanout_frame(struct nvkmd_mem *_mem, uint64_t *seq,
+    return true;
+ }
+ 
++void
++nvkmd_rm_mem_rm_handles(struct nvkmd_mem *_mem, uint32_t *h_client,
++                        uint32_t *h_memory)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++
++   *h_client = dev->lib->root(dev->client);
++   *h_memory = mem->h_memory;
++}
++
+ VkResult
+ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+                           struct vk_object_base *log_obj,
+-- 
+2.43.0
+

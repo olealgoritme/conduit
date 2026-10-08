@@ -320,6 +320,12 @@ pub(super) struct PreparedPresentBlt {
     pub(super) last_wire_fence_id: u64,
     pub(super) submit_count: u32,
     pub(super) probe_done: bool,
+    /// The queue this record runs on (`CopyQueue`), fixed when it is recorded: its pool and its
+    /// EXTERNAL barriers are of that family, so it is only ever submitted to that queue, fenced
+    /// on that queue's ring.
+    pub(super) route: helios_kmd_logic::copy_queue::Route,
+    /// Why the record is on family 0 although the knob asked for the transfer queue.
+    pub(super) route_why: Option<helios_kmd_logic::copy_queue::Why>,
 }
 
 /// PASSIVE-time cache preparation result. It contains only stable cache
@@ -818,7 +824,18 @@ impl VenusClient {
         adapter: &AdapterContext,
         body: impl FnOnce(&mut Self, VkCommandBufferId) -> Result<(), VirtioError>,
     ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
-        let command_pool_id = self.create_command_pool(adapter)?;
+        self.record_reusable_on(adapter, helios_kmd_logic::copy_queue::MAIN_FAMILY, body)
+    }
+
+    /// [`Self::record_reusable`] with the pool on `family` (`CopyQueue`: the transfer family
+    /// for a record routed there). The body's EXTERNAL barriers must name the same family.
+    pub(super) fn record_reusable_on(
+        &mut self,
+        adapter: &AdapterContext,
+        family: u32,
+        body: impl FnOnce(&mut Self, VkCommandBufferId) -> Result<(), VirtioError>,
+    ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
+        let command_pool_id = self.create_command_pool_on(adapter, family)?;
         let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
             Ok(id) => id,
             Err(e) => {
@@ -1033,9 +1050,15 @@ impl VenusClient {
 
     /// Record one reusable full-surface Present BLT from an imported OPTIMAL
     /// source image into the pitched buffer backing a KMD standard allocation.
+    ///
+    /// `family` is the queue family the record runs on (`CopyQueue`): the pool's, and the KMD
+    /// side of the source's and the destination's EXTERNAL acquire/release. A plain
+    /// image-to-buffer copy with barriers on TOP/TRANSFER/HOST/BOTTOM stages only, so a
+    /// transfer-only queue runs it.
     pub(super) fn record_reusable_present_blt(
         &mut self,
         adapter: &AdapterContext,
+        family: u32,
         source_image_id: VkImageId,
         destination_buffer_id: VkBufferId,
         destination_size: u64,
@@ -1055,18 +1078,20 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
-        self.record_reusable(adapter, |s, command_buffer_id| {
-            s.cmd_acquire_image_from_external(
+        self.record_reusable_on(adapter, family, |s, command_buffer_id| {
+            s.cmd_acquire_image_from_external_on(
                 adapter,
                 command_buffer_id,
                 source_image_id,
                 TransferAccess::Read,
+                family,
             )?;
-            s.cmd_acquire_buffer_from_external(
+            s.cmd_acquire_buffer_from_external_on(
                 adapter,
                 command_buffer_id,
                 destination_buffer_id,
                 destination_size,
+                family,
             )?;
             s.cmd_copy_image_to_buffer(
                 adapter,
@@ -1078,17 +1103,19 @@ impl VenusClient {
                 pitch,
                 bytes_per_pixel,
             )?;
-            s.cmd_release_image_to_external(
+            s.cmd_release_image_to_external_on(
                 adapter,
                 command_buffer_id,
                 source_image_id,
                 TransferAccess::Read,
+                family,
             )?;
-            s.cmd_release_buffer_to_external(
+            s.cmd_release_buffer_to_external_on(
                 adapter,
                 command_buffer_id,
                 destination_buffer_id,
                 destination_size,
+                family,
             )?;
             Ok(())
         })
@@ -1286,6 +1313,33 @@ impl VenusClient {
                 let mut conversion_image_id = None;
                 let mut conversion_memory_id = None;
                 let mut conversion_init_pool_id = None;
+                // `CopyQueue`: the queue this new record runs on, decided once, here
+                // (`helios_kmd_logic::copy_queue::route`). The transfer queue takes a plain
+                // full-surface image-to-buffer copy (a standard buffer or its guest blob, any
+                // source, foreign included); a conversion (`vkCmdBlitImage`) and an image
+                // destination stay on family 0. The copy reads the whole source image from
+                // (0,0), which every `minImageTransferGranularity` allows; checked anyway.
+                let copy_device = match self.copy_queue {
+                    Some(copy) => copy.device,
+                    None => helios_kmd_logic::copy_queue::Device::MAIN_ONLY,
+                };
+                let (route, route_why) = helios_kmd_logic::copy_queue::route(
+                    self.copy_knob,
+                    copy_device,
+                    helios_kmd_logic::copy_queue::CopyShape {
+                        buffer_destination: matches!(
+                            destination,
+                            PresentDestinationDesc::StandardBuffer(_)
+                        ),
+                        blit: requires_conversion,
+                        image_extent: [source.width, source.height, 1],
+                        copy_extent: [source.width, source.height, 1],
+                    },
+                );
+                let family = helios_kmd_logic::copy_queue::barrier_family(
+                    route,
+                    self.copy_queue.and_then(|c| c.device.family),
+                );
                 let command_result = match destination {
                     PresentDestinationDesc::StandardBuffer(desc) if guest.is_some() => {
                         let guest = guest.ok_or(VirtioError::DeviceError)?;
@@ -1304,6 +1358,7 @@ impl VenusClient {
                         };
                         let command = match self.record_reusable_guest_blt(
                             adapter,
+                            family,
                             source_image.image_id,
                             conversion.map(|c| c.0),
                             guest.buffer_id,
@@ -1370,6 +1425,7 @@ impl VenusClient {
                         } else {
                             self.record_reusable_present_blt(
                                 adapter,
+                                family,
                                 source_image.image_id,
                                 destination_buffer.buffer_id,
                                 desc.allocation_size,
@@ -1425,6 +1481,8 @@ impl VenusClient {
                     // buffer is never mapped through Venus).
                     probe_done: guest.is_some()
                         || matches!(destination, PresentDestinationDesc::OptimalImage(_)),
+                    route,
+                    route_why,
                 });
                 record_present_cache_high_water(
                     self.present_blits.len(),
@@ -1442,6 +1500,74 @@ impl VenusClient {
             cache_destination,
             guest: guest.is_some(),
         })
+    }
+
+    /// The queue a record runs on and the ring its SUBMIT_3D is fenced on. The wire fence of a
+    /// ring is the host's empty `vkQueueSubmit` with a fence on the queue bound to that ring, so
+    /// only the record's own ring orders the fence after the copy (`CopyQueue`).
+    fn present_blt_queue(&self, blt_index: usize) -> (VkQueueId, u32) {
+        use helios_kmd_logic::copy_queue::Route;
+        match (self.present_blits[blt_index].route, self.copy_queue) {
+            (Route::Transfer, Some(copy)) => (copy.queue_id, Route::Transfer.ring_idx()),
+            // A Transfer record without the queue cannot exist (`route` gives Transfer only with
+            // it, and the queue never goes away while the client lives).
+            _ => (self.queue_id, Route::Main.ring_idx()),
+        }
+    }
+
+    /// Encode the record's submission to its own queue, after any queue-switch wait it needs.
+    fn encode_present_blt_submit(
+        &self,
+        adapter: &AdapterContext,
+        blt_index: usize,
+    ) -> (Writer, u32) {
+        self.wait_present_blt_queue_switch(adapter, blt_index);
+        let (queue_id, ring_idx) = self.present_blt_queue(blt_index);
+        let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
+        (
+            self.encode_command_buffer_submit_on(queue_id, command_buffer_id),
+            ring_idx,
+        )
+    }
+
+    /// Copies on one queue run in submission order; copies on two do not. Before a copy is
+    /// submitted, a record of the OTHER queue that shares its source or destination and may still
+    /// run is waited for (`helios_kmd_logic::copy_queue::conflicts`), bounded by `SWITCH_WAIT_MS`
+    /// (`CqSwitch`, `CqSwitchTo`). Without a transfer queue every record is on family 0 and this
+    /// returns at once; with one it is a poll per sharing record of the other route (a switch
+    /// happens on a source format change, or one source into an image and a buffer).
+    fn wait_present_blt_queue_switch(&self, adapter: &AdapterContext, blt_index: usize) {
+        use helios_kmd_logic::copy_queue as cq;
+        if self.copy_queue.is_none() {
+            return;
+        }
+        let record = |b: &PreparedPresentBlt| cq::Record {
+            route: b.route,
+            source: b.source_resource_id,
+            destination: b.destination_resource_id,
+            last_fence: b.last_wire_fence_id,
+        };
+        let next = record(&self.present_blits[blt_index]);
+        for i in 0..self.present_blits.len() {
+            if i == blt_index {
+                continue;
+            }
+            let other = record(&self.present_blits[i]);
+            if !cq::conflicts(next, other) {
+                continue;
+            }
+            match ctrl::wait_fence(self.passive(), adapter, other.last_fence, 0) {
+                ctrl::WaitFenceOutcome::Complete | ctrl::WaitFenceOutcome::Invalid => continue,
+                ctrl::WaitFenceOutcome::TimedOut => {}
+            }
+            let outcome = ctrl::wait_fence(
+                self.passive(),
+                adapter,
+                other.last_fence,
+                cq::SWITCH_WAIT_MS * 1_000_000,
+            );
+            crate::ddi::copy_queue::note_switch(outcome == ctrl::WaitFenceOutcome::TimedOut);
+        }
     }
 
     /// Preserve the legacy Present path for an untyped source. It uses the
@@ -1478,18 +1604,27 @@ impl VenusClient {
     ) -> Result<(u64, bool), VirtioError> {
         let prepared = self.prepare_present_blt_to(adapter, source, destination, allow_guest)?;
         let blt_index = self.validate_prepared_present_blt(prepared)?;
-        let submit = self.encode_command_buffer_submit(prepared.command_buffer_id);
+        let (submit, ring_idx) = self.encode_present_blt_submit(adapter, blt_index);
         let present_buffer_write = match prepared.destination {
             PresentDestinationDesc::StandardBuffer(destination) => Some(destination.resource_id),
             PresentDestinationDesc::OptimalImage(_) => None,
         };
+        // `StageTrace` (G_SUBMIT): taken before the descriptor can reach the host; 0 when off.
+        let t_submit = crate::ddi::stage_trace::now_if_on();
         let fence_id = ctrl::submit_venus_async_present(
             self.passive(),
             adapter,
             self.ctx_id(),
             submit.as_slice()?,
             present_buffer_write,
+            ring_idx,
         )?;
+        crate::ddi::stage_trace::stamp(
+            helios_kmd_logic::stage_trace::G_SUBMIT,
+            helios_kmd_logic::stage_trace::KIND_FENCE,
+            fence_id,
+            t_submit,
+        );
         self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
         Ok((fence_id, prepared.guest))
     }
@@ -1513,7 +1648,9 @@ impl VenusClient {
         let PresentDestinationDesc::StandardBuffer(buffer) = prepared.destination else {
             return Err(VirtioError::DeviceError);
         };
-        let submit = self.encode_command_buffer_submit(prepared.command_buffer_id);
+        let (submit, ring_idx) = self.encode_present_blt_submit(adapter, blt_index);
+        // `StageTrace` (G_SUBMIT): taken before the descriptor can reach the host; 0 when off.
+        let t_submit = crate::ddi::stage_trace::now_if_on();
         let outcome = ctrl::submit_venus_async_blt(
             self.passive(),
             adapter,
@@ -1521,8 +1658,15 @@ impl VenusClient {
             submit.as_slice()?,
             buffer.resource_id,
             source.resource_id(),
+            ring_idx,
         )?;
         if let ctrl::BltSubmit::Fence(fence_id) = outcome {
+            crate::ddi::stage_trace::stamp(
+                helios_kmd_logic::stage_trace::G_SUBMIT,
+                helios_kmd_logic::stage_trace::KIND_FENCE,
+                fence_id,
+                t_submit,
+            );
             self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
         }
         Ok(outcome)
@@ -1559,6 +1703,7 @@ impl VenusClient {
         let blt = &mut self.present_blits[blt_index];
         blt.last_wire_fence_id = fence_id;
         blt.submit_count = blt.submit_count.saturating_add(1);
+        crate::ddi::copy_queue::note_submit(blt.route, blt.route_why);
         let run_probe = if adapter.present_probe()
             && blt.submit_count >= PRESENT_PROBE_AFTER_SUBMITS
             && !blt.probe_done
@@ -1618,8 +1763,9 @@ impl VenusClient {
         stream_boundary: u64,
     ) -> Result<u64, VirtioError> {
         let blt_index = self.validate_prepared_present_blt(prepared)?;
-        let command_buffer_id = prepared.command_buffer_id;
-        let submit = self.encode_command_buffer_submit(command_buffer_id);
+        let (submit, ring_idx) = self.encode_present_blt_submit(adapter, blt_index);
+        // `StageTrace` (G_SUBMIT): taken before the descriptor can reach the host; 0 when off.
+        let t_submit = crate::ddi::stage_trace::now_if_on();
         let fence_id = ctrl::submit_venus_async_windowed_blt(
             self.passive(),
             adapter,
@@ -1627,7 +1773,14 @@ impl VenusClient {
             submit.as_slice()?,
             token,
             stream_boundary,
+            ring_idx,
         )?;
+        crate::ddi::stage_trace::stamp(
+            helios_kmd_logic::stage_trace::G_SUBMIT,
+            helios_kmd_logic::stage_trace::KIND_FENCE,
+            fence_id,
+            t_submit,
+        );
         self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
         Ok(fence_id)
     }
@@ -1693,6 +1846,10 @@ impl VenusClient {
             return Err(e);
         }
         self.destroy_fence(adapter, marker)?;
+        // The main queue's marker does not order the transfer queue (`CopyQueue`): one there too.
+        // The wire-fence waits above already cover every submitted copy; this is the same belt
+        // and braces as the marker, for the queue the copies may have run on.
+        self.copy_queue_marker(adapter, 5_000_000_000)?;
 
         // Blits FIRST, and scoped by BOTH ends. A blit's command buffer is
         // baked against its source image and its destination image/buffer, so
@@ -1943,6 +2100,9 @@ impl VenusClient {
                     submit_count: 0,
                     // No destination buffer to sample.
                     probe_done: true,
+                    // An image destination: family 0 whatever `CopyQueue` says.
+                    route: helios_kmd_logic::copy_queue::Route::Main,
+                    route_why: None,
                 });
                 record_present_cache_high_water(
                     self.present_blits.len(),
@@ -1952,14 +2112,15 @@ impl VenusClient {
                 self.present_blits.len() - 1
             }
         };
-        let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
-        let submit = self.encode_command_buffer_submit(command_buffer_id);
+        // Family 0, ring 1, after any transfer-queue copy of the same source has run.
+        let (submit, ring_idx) = self.encode_present_blt_submit(adapter, blt_index);
         let fence_id = ctrl::submit_venus_async_present(
             self.passive(),
             adapter,
             self.ctx_id(),
             submit.as_slice()?,
             None,
+            ring_idx,
         )?;
         let blt = &mut self.present_blits[blt_index];
         blt.last_wire_fence_id = fence_id;

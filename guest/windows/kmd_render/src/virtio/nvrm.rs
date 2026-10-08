@@ -209,6 +209,89 @@ pub static FENCE_CLOSE_OWED: AtomicU32 = AtomicU32::new(0);
 /// Closes of KMD-owned fence handles the host did not take (`FnCloseErr`).
 pub static FENCE_CLOSE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
+// ---- round-trip statistics --------------------------------------------------------
+//
+// How long the calling thread spent in one forwarded call: from just before the request was
+// queued to just after the reply was in hand, on the interrupt-time clock (100 ns). That is the
+// whole path the interrupt mode changes: the submit and its doorbell, the pre-wait spin, the
+// interrupt, the DPC, the event signal and the wake of the waiter. Atomics only
+// (`helios_kmd_logic::nvrm_rtt`, host tested); the registry is written by
+// `publish_rtt_counters` at PASSIVE from the periodic `Nv*` mirror, never from here.
+//
+// Two classes: `Ioctl` (an RM control: `NvRtt*`) and everything else (`NvRttO*`: open, close,
+// scan-out flip, the pinned registration, listings). A call that got no reply (a timeout, a
+// transport error) is not counted: it has no round trip.
+//
+// Cost: two clock reads and five relaxed atomic operations per call, against a call that costs
+// tens of microseconds.
+
+/// The class of a forwarded call for the round-trip statistics.
+#[derive(Clone, Copy)]
+enum RttClass {
+    Ioctl,
+    Other,
+}
+
+static RTT_IOCTL: helios_kmd_logic::nvrm_rtt::Stats = helios_kmd_logic::nvrm_rtt::Stats::new();
+static RTT_OTHER: helios_kmd_logic::nvrm_rtt::Stats = helios_kmd_logic::nvrm_rtt::Stats::new();
+
+/// `ctrl::raw_roundtrip`, timed. A reply counts one sample in `class`.
+fn timed_roundtrip(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    resp: &mut [u8],
+    timeout_ms: u64,
+    class: RttClass,
+) -> Result<usize, VirtioError> {
+    let start = crate::adapter::foreign_scanout::now_100ns();
+    let result = ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms);
+    if result.is_ok() {
+        let ticks = helios_kmd_logic::nvrm_rtt::elapsed_ticks(
+            start,
+            crate::adapter::foreign_scanout::now_100ns(),
+        );
+        match class {
+            RttClass::Ioctl => RTT_IOCTL.note(ticks),
+            RttClass::Other => RTT_OTHER.note(ticks),
+        }
+    }
+    result
+}
+
+/// Start the round-trip statistics over (a new transport generation: the image and these statics
+/// outlive a `pnputil /restart-device`, and a restart into the other interrupt mode must read as
+/// that mode's numbers).
+pub(crate) fn reset_rtt_counters() {
+    RTT_IOCTL.reset();
+    RTT_OTHER.reset();
+}
+
+/// Mirror the round-trip statistics to the service key. PASSIVE only; from
+/// `publish_nvrm_counters`. Values are in microseconds (mean rounded to nearest); `NvRttB0`..
+/// `NvRttB7` are the histogram of the `Ioctl` class (bounds: `helios_kmd_logic::nvrm_rtt::BOUNDS_US`).
+pub(crate) fn publish_rtt_counters() {
+    use crate::diag::record_named_bytes as rec;
+    let io = RTT_IOCTL.snapshot();
+    rec(b"NvRttN", io.n);
+    rec(b"NvRttMinUs", io.min_us());
+    rec(b"NvRttMeanUs", io.mean_us());
+    rec(b"NvRttMaxUs", io.max_us());
+    rec(b"NvRttB0", io.buckets[0]);
+    rec(b"NvRttB1", io.buckets[1]);
+    rec(b"NvRttB2", io.buckets[2]);
+    rec(b"NvRttB3", io.buckets[3]);
+    rec(b"NvRttB4", io.buckets[4]);
+    rec(b"NvRttB5", io.buckets[5]);
+    rec(b"NvRttB6", io.buckets[6]);
+    rec(b"NvRttB7", io.buckets[7]);
+    let other = RTT_OTHER.snapshot();
+    rec(b"NvRttON", other.n);
+    rec(b"NvRttOMinUs", other.min_us());
+    rec(b"NvRttOMeanUs", other.mean_us());
+    rec(b"NvRttOMaxUs", other.max_us());
+}
+
 /// Why a forward did not reach (or come back from) the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -316,7 +399,7 @@ pub fn forward(
                 // is gone, never a silent untrack).
                 let _ = adapter.with_virtio(|v| v.restore_nvrm_handle(owner, handle, device_type));
             };
-            match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
+            match timed_roundtrip(passive, adapter, req, resp, timeout_ms, RttClass::Other) {
                 Ok(n) => {
                     if n >= MSG_HDR && rd_i32(resp, 8) == Some(0) {
                         if nvrm_fence::is_fence(device_type) {
@@ -428,7 +511,8 @@ pub fn forward(
             // table refuses before the host makes a client nobody tracks.
             let reserved = harden::begin(adapter, owner, hmode, req).map_err(refused)?;
             NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
-            let n = match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
+            let n = match timed_roundtrip(passive, adapter, req, resp, timeout_ms, RttClass::Ioctl)
+            {
                 Ok(n) => n,
                 Err(e) => {
                     harden::after_failed(
@@ -477,12 +561,14 @@ pub fn forward(
                 return Err(refused(Refusal::Forbidden));
             }
             NVRM_FLIPS.fetch_add(1, Ordering::Relaxed);
-            ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)
+            timed_roundtrip(passive, adapter, req, resp, timeout_ms, RttClass::Other)
+                .map_err(Refusal::Transport)
         }
         // GetProcFiles / GetSysFiles: no handle, nothing to track.
         _ => {
             NVRM_OTHER.fetch_add(1, Ordering::Relaxed);
-            ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)
+            timed_roundtrip(passive, adapter, req, resp, timeout_ms, RttClass::Other)
+                .map_err(Refusal::Transport)
         }
     }
 }
@@ -948,7 +1034,7 @@ fn forward_pinned(
     // IoctlReq.deep_ptr_offset@32 deep_len@36 (the caller's were checked empty).
     set_deep(&mut buf, kind, deep_len);
     NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
-    let result = ctrl::raw_roundtrip(passive, adapter, &buf, resp, timeout_ms);
+    let result = timed_roundtrip(passive, adapter, &buf, resp, timeout_ms, RttClass::Other);
     let keep = match &result {
         Ok(n) => {
             *n >= MSG_HDR

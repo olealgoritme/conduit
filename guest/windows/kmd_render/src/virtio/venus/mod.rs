@@ -238,6 +238,16 @@ pub struct PreparedImageCopy {
     pub height: u32,
 }
 
+/// The second queue of the KMD's Venus device: queue 0 of a transfer-only family, bound to
+/// `copy_queue::COPY_RING_IDX`. Exists only when the device was created with it AND
+/// `vkGetDeviceQueue2` bound it, so a submission fenced on that ring always has its queue.
+#[derive(Clone, Copy)]
+pub(super) struct CopyQueue {
+    pub(super) queue_id: VkQueueId,
+    /// Its family and `minImageTransferGranularity`, for `copy_queue::route`.
+    pub(super) device: helios_kmd_logic::copy_queue::Device,
+}
+
 /// Bring-up stage 2: an instance and a physical device exist on the ring.
 ///
 /// Exists only between `VenusRing::into_instance` and `into_device`. Its only
@@ -287,8 +297,14 @@ pub struct VenusClient {
     /// explicit-modifier image; without it the foreign copy path is unavailable
     /// (counted `FcNoExt`) and everything else works as it always did.
     modifier_import_device: bool,
-    /// Graphics queue handle from family 0, queue 0.
+    /// Graphics queue handle from family 0, queue 0, on ring 1.
     queue_id: VkQueueId,
+    /// The `CopyQueue` knob at device creation (`helios_kmd_logic::copy_queue::route` reads it
+    /// for each new Present copy record).
+    copy_knob: helios_kmd_logic::copy_queue::Knob,
+    /// The transfer-only queue (`CopyQueue` 1, a transfer-only family, the device and the queue
+    /// granted), on ring `copy_queue::COPY_RING_IDX`. `None`: every copy runs on `queue_id`.
+    copy_queue: Option<CopyQueue>,
     /// HOST_VISIBLE|HOST_COHERENT memory type chosen during bring-up.
     memory_type_index: MemoryTypeIndex,
     /// Raw VkMemoryPropertyFlags for physical-device memory types.

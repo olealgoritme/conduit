@@ -375,6 +375,10 @@ pub struct HeliosDevice {
     /// refuses a device that never gets one, so a live device always has it.
     pub context: Option<RuntimeContext>,
     pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
+    /// The runtime adapter handle of the open this device was created on (`pfnEscapeCb`'s first
+    /// argument; 0 if the adapter handle was not ours). Valid for the device's lifetime: the
+    /// runtime closes the adapter after destroying the device.
+    pub rt_adapter: usize,
     /// Created once with pfnCreatePagingQueueCb. WDDM 2.x residency is an
     /// explicit per-device list; allocation/patch lists do not make resources
     /// resident.

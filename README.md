@@ -39,6 +39,8 @@ from GPU memory to your screen: no copying, no video compression.
 > RTX 20 and 30 cards, CUDA and video encode in that setup, and Windows guests
 > on other GPUs have not been run.
 
+<p align="center"><b>Linux VM</b></p>
+
 <p align="center">
   <img src="docs/assets/conduit-rtx4070s.png" alt="An RTX 4070 SUPER shared between an Ubuntu host and an Omarchy guest: the host's nvidia-smi lists conduit-backend, the guest shows Conduit's overlay at 1920x1080@240, its own nvidia-smi and vkcube" width="860">
 </p>
@@ -49,6 +51,16 @@ its <code>nvidia-smi</code> lists <code>conduit-backend</code> among the GPU pro
 <code>nvidia-smi</code> (capped at 2 GiB by safe mode), <code>vkcube</code> on the GPU and the
 <code>conduit_gpu</code> module. <code>vkcube</code> prints the driver version as a packed integer, which is why it
 shows <code>-1923923968</code>; the Vulkan driver reports 565.77.0.0.</sub></p>
+
+<p align="center"><b>Windows 11 VM</b></p>
+
+<p align="center">
+  <img src="docs/assets/conduit-win11.jpg" alt="A Windows 11 guest on Conduit: Device Manager lists the Conduit Helios display adapter, GPU-Z next to it, and Unigine Heaven 4.0 running windowed in Direct3D 11 through NVK on the host's RTX 5090 at 192 fps" width="860">
+</p>
+
+<p align="center"><sub>A Windows 11 guest on an RTX 5090. Device Manager shows the <code>Conduit Helios</code>
+display adapter; Unigine Heaven 4.0 runs windowed in Direct3D 11, translated to Vulkan and rendered by
+NVK on the host's GPU (192 fps in this frame). GPU-Z does not recognise the virtual adapter yet.</sub></p>
 
 ### Windows guests
 

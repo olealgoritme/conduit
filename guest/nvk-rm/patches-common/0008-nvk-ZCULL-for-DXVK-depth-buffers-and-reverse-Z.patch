@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Wed, 7 Oct 2026 20:57:37 +0200
+Subject: [PATCH 8/8] nvk: ZCULL for DXVK depth buffers and reverse Z
+
+Two things kept ZCULL from working for D3D11 through DXVK on GB20x:
+
+1. DXVK gives every D3D11 depth texture VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   and NVK only allocates ZCULL storage for depth images written by
+   nothing but depth attachments.  Without storage ZCULL only works in
+   render passes that clear depth; every pass that loads it (DXVK ends a
+   render pass at each barrier, resolve and render target change) runs
+   without.
+
+   Allow TRANSFER_DST (with VK_SHARING_MODE_EXCLUSIVE) and, after a
+   transfer writes such an image outside a render pass (a copy from a
+   buffer or an image, a blit, a resolve, a depth resolve attachment) or
+   after it is acquired from another queue, record an empty render pass
+   that resets its stored ZCULL to the far value of its direction and
+   stores it: a conservative state whatever the depth buffer holds, which
+   the next render passes build up again.
+
+2. SET_ZCULL_DIR_FORMAT was always ZDIR_LESS, so with reverse Z (clear to
+   0.0, GREATER tests), which many D3D11 engines use, ZCULL never culled.
+
+   ZCULL culls in one direction and stored ZCULL must be loaded with the
+   direction it was stored with.  Choose the direction per image, once:
+   the first render pass that records a ZCULL load or store on it picks
+   GREATER for an application clear below 0.5 and LESS otherwise, and the
+   image keeps it, so every LOAD_ZCULL matches its STORE_ZCULL whatever
+   order command buffers are recorded and submitted in.
+   vkCmdClearDepthStencilImage does not choose (DXVK clears every new
+   depth image to 0.0), and a pass that chooses while loading depth resets
+   ZCULL instead of loading it.  Render passes without ZCULL storage take
+   the direction from their clear value.  DONT_CARE seeds the far value
+   of the direction instead of 0.0.
+
+vk_perf_bench (guest/nvk-rm/tests/perf in Conduit), RTX 5090, 2560x1440,
+GPU ms, median of 11, NVIDIA 610.57.04 in brackets: 32 front-to-back
+layers of a 16-iteration ALU shader over a depth image with DXVK's usage,
+split over 8 render passes that load depth 0.162 -> 0.109 (0.102), over 2
+passes 0.111 -> 0.078 (0.079); the same in one pass with reverse Z 0.141
+-> 0.070 (0.071).  Everything else unchanged.  vk_perf_bench -t zcoh
+(depth written by copies from a buffer and an image, a blit and
+vkCmdClearDepthStencilImage between a cleared and a loading render pass,
+both directions, and direction choice cases) passes; without the reset
+after transfers the copy cases draw nothing.  Image hashes of the other
+correctness tests are unchanged.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c |  8 +++
+ src/nouveau/vulkan/nvk_cmd_buffer.h | 21 ++++++++
+ src/nouveau/vulkan/nvk_cmd_clear.c  | 78 +++++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_cmd_draw.c   | 57 ++++++++++++++++++---
+ src/nouveau/vulkan/nvk_cmd_meta.c   | 18 +++++++
+ src/nouveau/vulkan/nvk_image.c      | 12 ++++-
+ src/nouveau/vulkan/nvk_image.h      | 19 +++++++
+ 7 files changed, 205 insertions(+), 8 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 089595e8..efa52d7e 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -883,6 +883,14 @@ nvk_cmd_image_layout_transition(struct nvk_cmd_buffer *cmd,
+           */
+          if (image->zcull.nil.size_B > 0)
+             nvk_cmd_fill_memory_ce(cmd, image->zcull.addr, image->zcull.nil.size_B, 0);
++      } else if (bar->srcQueueFamilyIndex != bar->dstQueueFamilyIndex &&
++                 bar->dstQueueFamilyIndex == cmd->vk.pool->queue_family_index) {
++         /* Acquired from another queue, which may have written it with a
++          * transfer: see nvk_cmd_zcull_reseed()
++          */
++         VK_FROM_HANDLE(nvk_image, image, bar->image);
++         if (image->zcull.nil.size_B > 0)
++            nvk_cmd_zcull_reseed(cmd, image);
+       }
+    }
+ }
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index dceff5ea..e6a5798a 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -254,6 +254,11 @@ struct nvk_graphics_state {
+     * macro.  Anything else that writes them (the draw macros, meta) clears
+     * valid.
+     */
++   /* What the next nvk_CmdBeginRendering() does with ZCULL on behalf of
++    * the driver (enum nvk_zcull_internal)
++    */
++   uint8_t zcull_internal;
++
+    struct nvk_draw_params_state {
+       bool valid;
+       uint32_t first_vertex;
+@@ -566,6 +571,22 @@ void nvk_cmd_copy_image_to_memory_ce(struct nvk_cmd_buffer *cmd,
+ void nvk_cmd_copy_image_ce(struct nvk_cmd_buffer *cmd,
+                            const VkCopyImageInfo2 *pCopyImageInfo);
+ 
++enum nvk_zcull_internal {
++   NVK_ZCULL_INTERNAL_NONE = 0,
++   /* vkCmdClearDepthStencilImage: clears ZCULL, does not choose the image's
++    * ZCULL direction (DXVK clears every new depth image to 0.0, whatever
++    * depth convention the application uses)
++    */
++   NVK_ZCULL_INTERNAL_CLEAR_IMAGE,
++   /* A transfer wrote the depth image outside a render pass: the stored
++    * ZCULL is reset to a conservative state instead of loaded
++    */
++   NVK_ZCULL_INTERNAL_RESEED,
++};
++
++struct nvk_image;
++void nvk_cmd_zcull_reseed(struct nvk_cmd_buffer *cmd, struct nvk_image *image);
++
+ void nvk_meta_resolve_rendering(struct nvk_cmd_buffer *cmd,
+                                 const VkRenderingInfo *pRenderingInfo);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_clear.c b/src/nouveau/vulkan/nvk_cmd_clear.c
+index 8dc92550..e6af1bf8 100644
+--- a/src/nouveau/vulkan/nvk_cmd_clear.c
++++ b/src/nouveau/vulkan/nvk_cmd_clear.c
+@@ -322,7 +322,10 @@ clear_image(struct nvk_cmd_buffer *cmd,
+          if (ranges[r].aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT)
+             render.pStencilAttachment = &vk_att;
+ 
++         if (ranges[r].aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT)
++            cmd->state.gfx.zcull_internal = NVK_ZCULL_INTERNAL_CLEAR_IMAGE;
+          nvk_CmdBeginRendering(nvk_cmd_buffer_to_handle(cmd), &render);
++         cmd->state.gfx.zcull_internal = NVK_ZCULL_INTERNAL_NONE;
+ 
+          const VkRenderingEndInfoKHR end = {
+             .sType = VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR,
+@@ -334,6 +337,81 @@ clear_image(struct nvk_cmd_buffer *cmd,
+    }
+ }
+ 
++/* A transfer (copy, blit, resolve) wrote depth image outside a render pass,
++ * so its stored ZCULL no longer describes it: an empty render pass that
++ * loads the depth attachment resets the stored ZCULL to a conservative
++ * state (NVK_ZCULL_INTERNAL_RESEED) and stores it.  Later render passes
++ * build it up again from their draws.
++ */
++void
++nvk_cmd_zcull_reseed(struct nvk_cmd_buffer *cmd, struct nvk_image *image)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++
++   if (image->zcull.nil.size_B == 0)
++      return;
++
++   /* Only a 3D queue can reset ZCULL.  ZCULL storage with TRANSFER_DST
++    * needs VK_SHARING_MODE_EXCLUSIVE (nvk_image.c), so a write on another
++    * queue reaches the 3D queue through an ownership transfer, whose
++    * acquire barrier resets it (nvk_cmd_image_layout_transition()).
++    */
++   if (!(nvk_cmd_buffer_queue_flags(cmd) & VK_QUEUE_GRAPHICS_BIT))
++      return;
++
++   const VkImageViewUsageCreateInfo view_usage_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
++      .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
++   };
++   const VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .pNext = &view_usage_info,
++      .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
++      .image = nvk_image_to_handle(image),
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = image->vk.format,
++      .subresourceRange = {
++         .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
++         .baseMipLevel = 0,
++         .levelCount = 1,
++         .baseArrayLayer = 0,
++         .layerCount = 1,
++      },
++   };
++
++   struct nvk_image_view view;
++   ASSERTED VkResult result = nvk_image_view_init(dev, &view, &view_info);
++   assert(result == VK_SUCCESS);
++
++   const VkRenderingAttachmentInfo att = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++      .imageView = nvk_image_view_to_handle(&view),
++      .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
++   };
++   const VkRenderingInfo render = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++      .renderArea = {
++         .offset = { 0, 0 },
++         .extent = { image->vk.extent.width, image->vk.extent.height },
++      },
++      .layerCount = 1,
++      .pDepthAttachment = &att,
++   };
++
++   cmd->state.gfx.zcull_internal = NVK_ZCULL_INTERNAL_RESEED;
++   nvk_CmdBeginRendering(nvk_cmd_buffer_to_handle(cmd), &render);
++   cmd->state.gfx.zcull_internal = NVK_ZCULL_INTERNAL_NONE;
++
++   const VkRenderingEndInfoKHR end = {
++      .sType = VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR,
++   };
++   nvk_CmdEndRendering2KHR(nvk_cmd_buffer_to_handle(cmd), &end);
++
++   nvk_image_view_finish(dev, &view);
++}
++
+ static VkFormat
+ vk_packed_int_format_for_size(unsigned size_B)
+ {
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index e82f711c..1d4ba085 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -15,6 +15,7 @@
+ 
+ #include "util/bitpack_helpers.h"
+ #include "util/compiler.h"
++#include "util/u_atomic.h"
+ #include "vk_format.h"
+ #include "vk_render_pass.h"
+ #include "vk_standard_sample_locations.h"
+@@ -1553,6 +1554,47 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+       (zcull_plane ||
+        pRenderingInfo->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR);
+ 
++   /* ZCULL direction: see nvk_zcull_plane::zdir.  Without storage the ZCULL
++    * data lives only for this render pass (it starts with a clear), so the
++    * clear value picks it.  zcull_reseed: reset the stored ZCULL to the far
++    * value of the direction (a conservative state, whatever the depth
++    * buffer holds) instead of loading it.
++    */
++   uint32_t zdir = NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_LESS;
++   bool zcull_reseed = false;
++   if (use_zcull) {
++      const VkRenderingAttachmentInfo *da = pRenderingInfo->pDepthAttachment;
++      const bool app_clear = da->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
++      const enum nvk_zcull_zdir want =
++         (app_clear && da->clearValue.depthStencil.depth < 0.5f) ?
++         NVK_ZCULL_ZDIR_GREATER : NVK_ZCULL_ZDIR_LESS;
++      enum nvk_zcull_zdir dir = want;
++      if (zcull_plane != NULL) {
++         dir = p_atomic_read(&zcull_plane->zdir);
++         if (dir == NVK_ZCULL_ZDIR_UNSET) {
++            if (cmd->state.gfx.zcull_internal == NVK_ZCULL_INTERNAL_CLEAR_IMAGE) {
++               /* A clear without draws: the stored ZCULL says "all depth
++                * is the clear value", which holds in either direction.
++                */
++               dir = want;
++            } else {
++               p_atomic_cmpxchg(&zcull_plane->zdir, NVK_ZCULL_ZDIR_UNSET,
++                                (uint32_t)want);
++               dir = p_atomic_read(&zcull_plane->zdir);
++               /* The stored ZCULL may come from a clear made before the
++                * direction was chosen: don't load it this once.
++                */
++               zcull_reseed = true;
++            }
++         }
++         if (cmd->state.gfx.zcull_internal == NVK_ZCULL_INTERNAL_RESEED)
++            zcull_reseed = true;
++      }
++      zdir = dir == NVK_ZCULL_ZDIR_GREATER ?
++             NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER :
++             NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_LESS;
++   }
++
+    if (use_zcull) {
+       uint32_t start_count = nv_push_dw_count(p);
+       struct nil_zcull zcull_info;
+@@ -1616,10 +1658,7 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+ 
+       VkFormat fmt = render->depth_att.iview->vk.format;
+       P_IMMD(p, NV9097, SET_ZCULL_DIR_FORMAT, {
+-         /* I've tried a variety of depthCompareOp values and depth clear
+-          * values, but the blob seems to always use ZDIR_LESS
+-          */
+-         .zdir = ZDIR_LESS,
++         .zdir = zdir,
+          .zformat = nvk_vk_format_to_zcull_format(fmt),
+       });
+ 
+@@ -1732,8 +1771,14 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+       return;
+ 
+    if (use_zcull) {
+-      float depth = 0.0f;
+-      switch (pRenderingInfo->pDepthAttachment->loadOp) {
++      /* The far value of the direction: "every depth is at least as far as
++       * anything drawn", which culls nothing that the depth test passes
++       */
++      float depth = zdir == NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER ? 0.0f : 1.0f;
++      VkAttachmentLoadOp load_op = pRenderingInfo->pDepthAttachment->loadOp;
++      if (load_op == VK_ATTACHMENT_LOAD_OP_LOAD && zcull_reseed)
++         load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      switch (load_op) {
+          case VK_ATTACHMENT_LOAD_OP_CLEAR:
+             depth =
+                pRenderingInfo->pDepthAttachment->clearValue.depthStencil.depth;
+diff --git a/src/nouveau/vulkan/nvk_cmd_meta.c b/src/nouveau/vulkan/nvk_cmd_meta.c
+index cc4f0b66..26e58473 100644
+--- a/src/nouveau/vulkan/nvk_cmd_meta.c
++++ b/src/nouveau/vulkan/nvk_cmd_meta.c
+@@ -8,6 +8,7 @@
+ #include "nvk_device.h"
+ #include "nvk_entrypoints.h"
+ #include "nvk_image.h"
++#include "nvk_image_view.h"
+ #include "nvk_physical_device.h"
+ 
+ #include "vk_format.h"
+@@ -279,6 +280,9 @@ nvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
+    vk_meta_blit_image2(&cmd->vk, &dev->meta, pBlitImageInfo);
+ 
+    nvk_meta_end_gfx(cmd, &save);
++
++   VK_FROM_HANDLE(nvk_image, dst, pBlitImageInfo->dstImage);
++   nvk_cmd_zcull_reseed(cmd, dst);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -294,6 +298,9 @@ nvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
+    vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);
+ 
+    nvk_meta_end_gfx(cmd, &save);
++
++   VK_FROM_HANDLE(nvk_image, dst, pResolveImageInfo->dstImage);
++   nvk_cmd_zcull_reseed(cmd, dst);
+ }
+ 
+ void
+@@ -308,6 +315,13 @@ nvk_meta_resolve_rendering(struct nvk_cmd_buffer *cmd,
+    vk_meta_resolve_rendering(&cmd->vk, &dev->meta, pRenderingInfo);
+ 
+    nvk_meta_end_gfx(cmd, &save);
++
++   const VkRenderingAttachmentInfo *da = pRenderingInfo->pDepthAttachment;
++   if (da != NULL && da->resolveMode != VK_RESOLVE_MODE_NONE &&
++       da->resolveImageView != VK_NULL_HANDLE) {
++      VK_FROM_HANDLE(nvk_image_view, iview, da->resolveImageView);
++      nvk_cmd_zcull_reseed(cmd, (struct nvk_image *)iview->vk.image);
++   }
+ }
+ 
+ static bool
+@@ -474,6 +488,8 @@ nvk_CmdCopyMemoryToImageKHR(VkCommandBuffer commandBuffer,
+    } else {
+       nvk_cmd_copy_memory_to_image_ce(cmd, pCopyMemoryInfo);
+    }
++
++   nvk_cmd_zcull_reseed(cmd, dst);
+ }
+ 
+ static void
+@@ -520,6 +536,8 @@ nvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
+    } else {
+       nvk_cmd_copy_image_ce(cmd, pCopyImageInfo);
+    }
++
++   nvk_cmd_zcull_reseed(cmd, dst);
+ }
+ 
+ static void
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 44c2c561..af77ee78 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -1102,14 +1102,22 @@ nvk_image_init(struct nvk_device *dev,
+ 
+    /*
+     * We don't know how to update the zcull data if the image is written
+-    * as anything other than a depth attachment
++    * as anything other than a depth attachment.  Transfer writes (copies,
++    * blits, resolves) reset it to a conservative state after the write
++    * (nvk_cmd_zcull_reseed()); D3D11 through DXVK gives every depth
++    * texture TRANSFER_DST, so without it they would never get ZCULL
++    * storage and every render pass that loads depth would run without
++    * ZCULL.
+     */
+    const VkImageUsageFlagBits ZCULL_COMPATIBLE_IMAGE_USAGE =
+-      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | READ_ONLY_IMAGE_USAGE;
++      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++      VK_IMAGE_USAGE_TRANSFER_DST_BIT | READ_ONLY_IMAGE_USAGE;
+ 
+    if ((image->vk.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+        (image->vk.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+        !(image->vk.usage & ~ZCULL_COMPATIBLE_IMAGE_USAGE) &&
++       (!(image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
++        pCreateInfo->sharingMode == VK_SHARING_MODE_EXCLUSIVE) &&
+        !(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
+        image->vk.image_type != VK_IMAGE_TYPE_3D &&
+        image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+diff --git a/src/nouveau/vulkan/nvk_image.h b/src/nouveau/vulkan/nvk_image.h
+index b3330ac1..74a2c2ae 100644
+--- a/src/nouveau/vulkan/nvk_image.h
++++ b/src/nouveau/vulkan/nvk_image.h
+@@ -87,10 +87,29 @@ struct nvk_image_plane {
+    uint64_t host_offset_B;
+ };
+ 
++/* nvk_zcull_plane::zdir */
++enum nvk_zcull_zdir {
++   NVK_ZCULL_ZDIR_UNSET = 0,
++   NVK_ZCULL_ZDIR_LESS,
++   NVK_ZCULL_ZDIR_GREATER,
++};
++
+ struct nvk_zcull_plane {
+    struct nil_zcull nil;
+    uint64_t addr;
+    uint64_t plane_offset_B;
++
++   /* The ZCULL direction (enum nvk_zcull_zdir) every render pass uses with
++    * this storage.  ZCULL culls in one direction only, and stored ZCULL data
++    * must be loaded with the direction it was built with, so the direction
++    * is chosen once, by the first render pass that records a ZCULL load or
++    * store on this image (the depth clear value of an application clear,
++    * LESS otherwise), and never changes: a fixed direction per image keeps
++    * every LOAD_ZCULL consistent with its STORE_ZCULL whatever order the
++    * command buffers are recorded and submitted in.  Set with
++    * p_atomic_cmpxchg (command buffers record on any thread).
++    */
++   uint32_t zdir;
+ };
+ 
+ struct nvk_image {
+-- 
+2.43.0
+

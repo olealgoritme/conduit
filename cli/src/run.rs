@@ -253,6 +253,7 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
             cmd.arg("--venus-guest-blobs");
         }
     }
+    latency_args(&mut cmd);
     // A video-memory cap when this GPU also drives the desktop, and safe mode
     // when asked for (protect.rs).
     crate::protect::apply(&mut cmd);
@@ -297,6 +298,29 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
     Ok(())
 }
 
+/// `backend.latency fence-spin`: conduit-venus's fence threads poll for at
+/// most this long around a fence's expected completion
+/// (docs/research/host-roundtrip-latency.md, phase 3).
+const FENCE_SPIN_US: u32 = 150;
+
+/// `backend.latency` and `backend.cpus` as the backend's `--latency` and
+/// `--cpus` (docs/research/host-roundtrip-latency.md); nothing when unset,
+/// and the backend keeps its default (`all`).
+pub(crate) fn latency_args(cmd: &mut Command) {
+    if let Some(list) = crate::config::backend_latency() {
+        // fence-spin is conduit-venus's alone (`venus_cmd`).
+        let latency: Vec<&str> = list.into_iter().filter(|o| *o != "fence-spin").collect();
+        cmd.arg("--latency").arg(if latency.is_empty() {
+            "off".to_string()
+        } else {
+            latency.join(",")
+        });
+    }
+    if let Some(cpus) = crate::config::backend_cpus() {
+        cmd.arg("--cpus").arg(cpus);
+    }
+}
+
 /// conduit-venus, located for `--venus`, with a build hint when it is missing.
 pub(crate) fn need_venus() -> Result<PathBuf> {
     Tool::Venus.require()
@@ -309,6 +333,21 @@ pub(crate) fn need_venus() -> Result<PathBuf> {
 pub(crate) fn venus_cmd(bin: &Path, sock: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("--socket").arg(sock);
+    // `backend.latency` and `backend.cpus` (docs/research/host-roundtrip-latency.md).
+    // Unset: conduit-venus's defaults (direct fences on, no fence spin).
+    let latency = crate::config::backend_latency();
+    if latency
+        .as_ref()
+        .is_some_and(|l| !l.contains(&"direct-fences"))
+    {
+        cmd.arg("--no-direct-fences");
+    }
+    if latency.as_ref().is_some_and(|l| l.contains(&"fence-spin")) {
+        cmd.arg("--fence-spin-us").arg(FENCE_SPIN_US.to_string());
+    }
+    if let Some(cpus) = crate::config::backend_cpus() {
+        cmd.arg("--cpus").arg(cpus);
+    }
     if let Some(l) = std::env::var_os("CONDUIT_VENUS_LD_LIBRARY_PATH").filter(|l| !l.is_empty()) {
         cmd.env("LD_LIBRARY_PATH", l);
     }

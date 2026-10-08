@@ -1479,6 +1479,59 @@ std::int32_t HeliosDxvkDevice::nvk_present_fence(std::uint32_t* fence_handle,
   });
 }
 
+std::int32_t HeliosDxvkDevice::nvk_present_fence_v3(std::size_t d3d11_resource_ptr,
+                                                    std::uint32_t* fence_handle,
+                                                    std::uint64_t* value,
+                                                    std::uint8_t* copy,
+                                                    std::size_t copy_len) const noexcept {
+  return bridge_guard("nvk_present_fence_v3", std::int32_t(1), [&]() -> std::int32_t {
+    *fence_handle = 0;
+    *value = 0;
+    if (copy_len != sizeof(helios_icd_rm_copy))
+      return 1;
+    std::memset(copy, 0, copy_len);
+    if (!impl)
+      return 1;
+    // helios_icd_interface.h version 6; an older NVK leaves the slot NULL
+    // (the table is zeroed before the ICD fills its prefix): the fence alone.
+    if (!impl->icd.queue_rm_fence_v3) {
+      const VkResult vr = queue_rm_fence(*impl, fence_handle, value);
+      if (vr != VK_SUCCESS || *fence_handle == 0) {
+        *fence_handle = 0;
+        return 1;
+      }
+      return 2;
+    }
+    if (impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !(impl->icd.caps & HELIOS_ICD_CAP_RM_FENCE) || impl->device == nullptr)
+      return 1;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (d3d11_resource_ptr == 0
+     || !texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0) {
+      // Not a texture at offset 0 of its own memory: NVK answers VK_INCOMPLETE.
+      image = VK_NULL_HANDLE;
+      memory = VK_NULL_HANDLE;
+    }
+    helios_icd_rm_copy rc{};
+    const VkQueue queue = impl->device->queues().graphics.queueHandle;
+    impl->device->lockSubmission();
+    const VkResult vr = impl->icd.queue_rm_fence_v3(impl->device->vkd()->device(), queue,
+                                                    memory, image, fence_handle, value, &rc);
+    impl->device->unlockSubmission();
+    if (vr < 0 || *fence_handle == 0) {
+      *fence_handle = 0;
+      return 1;
+    }
+    if (vr != VK_SUCCESS)
+      return 2;
+    std::memcpy(copy, &rc, sizeof(rc));
+    return 0;
+  });
+}
+
 void HeliosDxvkDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept {
   bridge_guard("nvk_rm_fence_close", false, [&]() -> bool {
     if (impl && fence_handle && impl->icd.rm_fence_close && impl->device != nullptr)
