@@ -511,6 +511,7 @@ off and its caller takes the fallback):
 | 0x80 | the Present hook (`ddi/vram_redirect.rs`): every Blt with a VRAM surface is a counted skip |
 | 0x100 | OPT-IN: a foreign copy from a record acquires the producer's semaphore |
 | 0x200 | OPT-IN: the CPU helpers reuse blob views |
+| 0x400 | GDI lookup tables (`LOOKUPTABLE`, CDD's ClearType gamma table) stay Venus blobs; with it clear they come from RM system memory like the staging buffers, so the staging-to-table upload runs on the copy engine (370.1 `GdiSysCpuT` 0x00440142: 10-17 ms on the CPU) |
 
 Two defaults changed with it: the record path's semaphore ACQUIRE is now opt-in (a record's value is
 not guaranteed to be released again, e.g. after a swap chain is recreated, and an acquire that never

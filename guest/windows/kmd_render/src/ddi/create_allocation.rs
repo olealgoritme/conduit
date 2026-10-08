@@ -2929,12 +2929,16 @@ fn build_backing(
             // memory, adopted as a foreign resource of the KMD's own, so the copy engine reaches it
             // by RM object while it sits in segment 2 (`ce_sysmem`). Its paging and CPU view are
             // a standard buffer's (`PresentLinearBuffer`); any refusal: the Venus blob below.
+            // The GDI lookup table CDD uploads from such a buffer (`LOOKUPTABLE`, the ClearType
+            // gamma table) too, so that copy runs on the copy engine (`RvOff` 0x400 keeps it Venus).
             let std_type = (meta.misc_flags >> 24) & 0xF;
             let gdi_type = (meta.misc_flags >> 20) & 0xF;
-            if !primary
-                && std_type == helios_kmd_logic::rm_standard::STD_GDISURFACE
-                && gdi_type == helios_kmd_logic::rm_standard::GDI_STAGING_CPUVISIBLE
-            {
+            if helios_kmd_logic::rm_vidmem::rm_backed_standard(
+                std_type,
+                gdi_type,
+                primary,
+                crate::virtio::rm_client::vidmem::off_mask(),
+            ) {
                 if let Some(rm) = crate::virtio::rm_client::sysmem::try_create_standard(
                     passive,
                     adapter,
