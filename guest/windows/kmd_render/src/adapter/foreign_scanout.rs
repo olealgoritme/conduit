@@ -245,6 +245,8 @@ pub(crate) fn publish_counters() {
         crate::virtio::nvrm::FENCE_CLOSE_ERRORS.load(Ordering::Relaxed),
     );
     crate::virtio::gpu::publish_rm_gate_counters();
+    // `Qd*`: WDDM FIFO depth at SubmitCommand and execution packets' hold times.
+    crate::virtio::gpu::publish_wddm_queue_counters();
     // The host's buffer releases (`Rel*`), written only on a boot that had them on.
     crate::virtio::scanout_release::publish_counters();
 }

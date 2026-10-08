@@ -2091,6 +2091,87 @@ struct WddmPending {
     /// dependency STRICTER — it would install a NEWER `next_wire_fence` — so it is
     /// forbidden rather than merely pointless.
     rebased: bool,
+    /// Interrupt time (100 ns) the entry was queued at SubmitCommand, for the
+    /// queue-depth / hold-time counters (`publish_wddm_queue_counters`).
+    queued_100ns: u64,
+}
+
+// ---- WDDM queue depth and hold time (`Qd*`) -----------------------------------
+//
+// Whether the D3D12-on-NVK HE12 v4 packets (the ExecuteCommandLists batches whose
+// completion waits for their RM fence) are paced by their OWN work or by the
+// adapter-global, head-of-line FIFO: how many entries are pending at each
+// SubmitCommand, and for each popped execution packet how long it waited BEHIND
+// earlier entries before reaching the head, how long it then waited AS HEAD for
+// its own completion, and whether what was ahead of it was another execution
+// packet or something else (a present, DWM's work). Atomics only; mirrored by
+// `publish_wddm_queue_counters`.
+/// `QdMax`: most entries pending at a SubmitCommand (this one included).
+pub static QD_MAX: AtomicU32 = AtomicU32::new(0);
+/// `QdSum` / `QdN`: sum of the pending counts at SubmitCommand, and how many.
+pub static QD_SUM: AtomicU32 = AtomicU32::new(0);
+pub static QD_N: AtomicU32 = AtomicU32::new(0);
+/// `QdExMax`: most entries pending at an execution packet's SubmitCommand.
+pub static QD_EX_MAX: AtomicU32 = AtomicU32::new(0);
+/// `QdExN`: execution packets popped (completed through the FIFO).
+pub static QD_EX_N: AtomicU32 = AtomicU32::new(0);
+/// `QdExOwnUs` / `QdExBhUs`: their summed time as head (own completion) and
+/// behind earlier entries, in microseconds (wrapping u32 sums; read deltas).
+pub static QD_EX_OWN_US: AtomicU32 = AtomicU32::new(0);
+pub static QD_EX_BEHIND_US: AtomicU32 = AtomicU32::new(0);
+/// `QdExBhOth`: execution packets that waited behind a non-execution entry.
+pub static QD_EX_BEHIND_OTHER: AtomicU32 = AtomicU32::new(0);
+/// `QdExO*`: execution packets' as-head time histogram (<50 us, <200 us, <1 ms,
+/// <2 ms, <5 ms, <20 ms, >= 20 ms) and `QdExB*` the behind time histogram.
+pub static QD_EX_OWN_HIST: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+pub static QD_EX_BEHIND_HIST: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+
+fn qd_bucket(us: u64) -> usize {
+    const BOUNDS: [u64; 6] = [50, 200, 1000, 2000, 5000, 20000];
+    BOUNDS.iter().position(|&b| us < b).unwrap_or(BOUNDS.len())
+}
+
+fn qd_now_100ns() -> u64 {
+    let mut qpc_timestamp = 0;
+    // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read legal at any IRQL.
+    unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) }
+}
+
+fn qd_note_submit(pending_after: usize, execution: bool) {
+    let depth = u32::try_from(pending_after).unwrap_or(u32::MAX);
+    QD_MAX.fetch_max(depth, Ordering::Relaxed);
+    if execution {
+        QD_EX_MAX.fetch_max(depth, Ordering::Relaxed);
+    }
+    QD_SUM.fetch_add(depth, Ordering::Relaxed);
+    QD_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Mirror the `Qd*` counters to the registry. PASSIVE only.
+pub fn publish_wddm_queue_counters() {
+    use crate::diag::record_named_bytes as rec;
+    rec(b"QdMax", QD_MAX.load(Ordering::Relaxed));
+    rec(b"QdSum", QD_SUM.load(Ordering::Relaxed));
+    rec(b"QdN", QD_N.load(Ordering::Relaxed));
+    rec(b"QdExMax", QD_EX_MAX.load(Ordering::Relaxed));
+    rec(b"QdExN", QD_EX_N.load(Ordering::Relaxed));
+    rec(b"QdExOwnUs", QD_EX_OWN_US.load(Ordering::Relaxed));
+    rec(b"QdExBhUs", QD_EX_BEHIND_US.load(Ordering::Relaxed));
+    rec(b"QdExBhOth", QD_EX_BEHIND_OTHER.load(Ordering::Relaxed));
+    rec(b"QdExO50", QD_EX_OWN_HIST[0].load(Ordering::Relaxed));
+    rec(b"QdExO200", QD_EX_OWN_HIST[1].load(Ordering::Relaxed));
+    rec(b"QdExO1k", QD_EX_OWN_HIST[2].load(Ordering::Relaxed));
+    rec(b"QdExO2k", QD_EX_OWN_HIST[3].load(Ordering::Relaxed));
+    rec(b"QdExO5k", QD_EX_OWN_HIST[4].load(Ordering::Relaxed));
+    rec(b"QdExO20k", QD_EX_OWN_HIST[5].load(Ordering::Relaxed));
+    rec(b"QdExOBig", QD_EX_OWN_HIST[6].load(Ordering::Relaxed));
+    rec(b"QdExB50", QD_EX_BEHIND_HIST[0].load(Ordering::Relaxed));
+    rec(b"QdExB200", QD_EX_BEHIND_HIST[1].load(Ordering::Relaxed));
+    rec(b"QdExB1k", QD_EX_BEHIND_HIST[2].load(Ordering::Relaxed));
+    rec(b"QdExB2k", QD_EX_BEHIND_HIST[3].load(Ordering::Relaxed));
+    rec(b"QdExB5k", QD_EX_BEHIND_HIST[4].load(Ordering::Relaxed));
+    rec(b"QdExB20k", QD_EX_BEHIND_HIST[5].load(Ordering::Relaxed));
+    rec(b"QdExBBig", QD_EX_BEHIND_HIST[6].load(Ordering::Relaxed));
 }
 
 /// One WDDM submission represents every WindowedBlt terminal for the same
@@ -2570,6 +2651,10 @@ pub struct VirtioGpu {
     /// WDDM submissions pending on venus completion, FIFO (capacity
     /// MAX_WDDM_PENDING, reserved at init).
     wddm_pending: VecDeque<WddmPending>,
+    /// `Qd*`: when the last FIFO entry was popped (100 ns; the next entry
+    /// became head then) and whether it was an execution packet.
+    qd_last_pop_100ns: u64,
+    qd_last_pop_execution: bool,
     /// Bounded two-phase WindowedBlt transactions. Both deques reserve at
     /// StartDevice, so Present/Submit/DPC mutations never allocate under the
     /// virtio spinlock.
@@ -3206,6 +3291,8 @@ impl VirtioGpu {
             next_wire_fence: wire_fence_base,
             wire_fence_base,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
+            qd_last_pop_100ns: 0,
+            qd_last_pop_execution: false,
             windowed_blt: WindowedBltState::new(),
             blt_async: blt_async::BltAsyncState::new(),
             // Snapshotted at transport init like every other knob, so
@@ -8392,8 +8479,10 @@ impl VirtioGpu {
             // the exact terminal prefix.
             && blt_token.is_none()
         {
+            qd_note_submit(1, d3d12);
             return true;
         }
+        qd_note_submit(self.wddm_pending.len() + 1, execution.is_some());
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
             // Losing a pending boundary cannot complete any of its successors.
             // Fail the transport and retain the FIFO until scheduler reset.
@@ -8414,6 +8503,7 @@ impl VirtioGpu {
             head_deadline_100ns: 0,
             rebased: false,
             gdi_seq,
+            queued_100ns: qd_now_100ns(),
         });
         false
     }
@@ -8653,6 +8743,26 @@ impl VirtioGpu {
             let Some(pending) = self.wddm_pending.pop_front() else {
                 return WddmTake::Empty;
             };
+            {
+                // `Qd*`: behind = queued until it became head (the previous pop),
+                // own = head until now.
+                let now = qd_now_100ns();
+                let became_head = pending.queued_100ns.max(self.qd_last_pop_100ns).min(now);
+                if pending.execution.is_some() {
+                    let behind_us = became_head.saturating_sub(pending.queued_100ns) / 10;
+                    let own_us = now.saturating_sub(became_head) / 10;
+                    QD_EX_N.fetch_add(1, Ordering::Relaxed);
+                    QD_EX_OWN_US.fetch_add(own_us as u32, Ordering::Relaxed);
+                    QD_EX_BEHIND_US.fetch_add(behind_us as u32, Ordering::Relaxed);
+                    QD_EX_OWN_HIST[qd_bucket(own_us)].fetch_add(1, Ordering::Relaxed);
+                    QD_EX_BEHIND_HIST[qd_bucket(behind_us)].fetch_add(1, Ordering::Relaxed);
+                    if behind_us != 0 && !self.qd_last_pop_execution {
+                        QD_EX_BEHIND_OTHER.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.qd_last_pop_100ns = now;
+                self.qd_last_pop_execution = pending.execution.is_some();
+            }
             let terminal_prefix = match (blt_token, blt_stream_boundary) {
                 (Some(token), Some(boundary)) => WindowedBltTerminalPrefix::new(token, boundary),
                 _ => None,
