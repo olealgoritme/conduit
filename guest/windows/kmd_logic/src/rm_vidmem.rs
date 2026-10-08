@@ -725,6 +725,49 @@ pub fn foreign_write(
     }
 }
 
+/// `SET_REMAP_COMPONENTS` of a clear: every destination component `CONST_A`, 4-byte components,
+/// one source and one destination component per element (one 32-bit element per pixel; Mesa NVK's
+/// `nvk_cmd_fill_memory_ce` fields).
+pub const CLEAR_COMPONENTS: u32 = 4 | (4 << 4) | (4 << 8) | (4 << 12) | (3 << 16);
+
+/// The push of a clear of `[va, va + pitch * lines)` to the 32-bit `value` (multi-line, pitch-linear,
+/// remap from `CONST_A`): `SET_REMAP_CONST_A/B, COMPONENTS`, `OFFSET_IN_UPPER..LINE_COUNT`,
+/// `LAUNCH_DMA`. The caller appends its release. `LINE_LENGTH_IN` is in 4-byte elements.
+pub fn clear(
+    p: &mut crate::ce_present::Push<'_>,
+    va: u64,
+    pitch: u32,
+    lines: u32,
+    value: u32,
+) -> Result<(), crate::ce_present::PushError> {
+    use crate::ce_present as cp;
+    if pitch == 0 || pitch % 4 != 0 || lines == 0 {
+        return Err(cp::PushError::Shape);
+    }
+    let end = va
+        .checked_add(u64::from(pitch) * u64::from(lines))
+        .ok_or(cp::PushError::Va)?;
+    if end > MAX_VA {
+        return Err(cp::PushError::Va);
+    }
+    p.method(cp::SUBC_CE, cp::CE_SET_REMAP_CONST_A, &[value, value, CLEAR_COMPONENTS])?;
+    p.method(
+        cp::SUBC_CE,
+        cp::CE_OFFSET_IN_UPPER,
+        &[(va >> 32) as u32, va as u32, (va >> 32) as u32, va as u32, pitch, pitch, pitch / 4, lines],
+    )?;
+    p.method(
+        cp::SUBC_CE,
+        cp::CE_LAUNCH_DMA,
+        &[cp::LAUNCH_TRANSFER_NON_PIPELINED
+            | cp::LAUNCH_FLUSH_ENABLE
+            | cp::LAUNCH_SRC_PITCH
+            | cp::LAUNCH_DST_PITCH
+            | cp::LAUNCH_MULTI_LINE
+            | cp::LAUNCH_REMAP_ENABLE],
+    )
+}
+
 /// Direction of a bounce transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -775,7 +818,7 @@ pub fn bounce_copy(vram: &Surface, rect: Rect, dir: Dir) -> Result<CopyRect, Cop
 /// driver checks the list).
 pub const COUNTERS: &[&str] = &[
     // the service (`vidmem.rs`)
-    "RvKnob", "RvOffEff", "RvWaitTmo", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
+    "RvKnob", "RvOffEff", "RvWaitTmo", "RvCleared", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
     "RvBytes", "RvFreed", "RvBring", "RvMs", "RvMsMax", "RvSoft", "RvLeak", "RvOpen", "RvOpenFg",
     "RvOpenLay", "RvOpenPid", "RvOpenNoRm", "RvOpenNoRmPid",
     // the channel side (`ce_vram.rs`)
@@ -978,6 +1021,20 @@ mod tests {
         assert_eq!(c.layout, SurfaceLayout::Pitch);
         assert!(matches!(c.dst_layout, SurfaceLayout::BlockLinear { origin_x_bytes: 20, origin_y: 6, image_height: 910, .. }));
         assert_eq!(foreign_write(&src, r, &bl_plan, map_va(4), 7680, 1908, 910, 1850, 0, Remap::None), Err(CopyError::Rect));
+    }
+
+    #[test]
+    fn clear_push_words() {
+        let mut buf = [0u32; 32];
+        let mut p = crate::ce_present::Push::new(&mut buf);
+        clear(&mut p, map_va(0), 2816, 440, 0xff00_0000).unwrap();
+        let w = p.words().to_vec();
+        assert_eq!(w.len(), 4 + 9 + 2);
+        assert_eq!(&w[1..4], &[0xff00_0000, 0xff00_0000, CLEAR_COMPONENTS]);
+        assert_eq!(&w[5..13], &[(map_va(0) >> 32) as u32, map_va(0) as u32, (map_va(0) >> 32) as u32, map_va(0) as u32, 2816, 2816, 704, 440]);
+        assert_eq!(CLEAR_COMPONENTS, 0x34444);
+        let mut p = crate::ce_present::Push::new(&mut buf);
+        assert!(clear(&mut p, map_va(0), 2817, 1, 0).is_err());
     }
 
     #[test]

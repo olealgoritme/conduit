@@ -212,6 +212,7 @@ static FGN_IMP: AtomicU32 = AtomicU32::new(0);
 static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
 static FGN_WHY: AtomicU32 = AtomicU32::new(0);
 static FGN_WRITE: AtomicU32 = AtomicU32::new(0);
+static CLEARED: AtomicU32 = AtomicU32::new(0);
 
 fn fgn_fail(f: Fail) -> Fail {
     FGN_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -614,6 +615,28 @@ fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, F
     Ok(surface_of(&obj, &m))
 }
 
+/// Clear a new VRAM surface to 0 on the copy engine and wait (at most `XFER_MS`). The caller holds
+/// the channel's I/O and no `book()` guard.
+fn clear_new(io: &Io<'_>, resource_id: u32, va: u64) {
+    let Some(obj) = super::vidmem::lookup(resource_id) else {
+        return;
+    };
+    let lines = (obj.size / u64::from(obj.pitch.max(1))) as u32;
+    let r = ce::submit_build(|push, _gen, done| {
+        rv::clear(push, va, obj.pitch, lines, 0)?;
+        helios_kmd_logic::ce_present::release(push, done)
+    });
+    let ok = match r {
+        Ok(v) => wait(io.passive, v, XFER_MS),
+        Err(_) => false,
+    };
+    if ok {
+        CLEARED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        super::vidmem::clear_failed(resource_id);
+    }
+}
+
 /// Dup `(client, memory)` into the channel's client and map it at a slot's window (VRAM: big pages
 /// first; system memory: the snooped system flags first). The caller holds the channel's I/O.
 fn map_object(
@@ -659,9 +682,16 @@ fn map_object(
     match mapped {
         Ok(g) => {
             MAP_OK.fetch_add(1, Ordering::Relaxed);
-            let mut b = book().ok_or(REENTRY)?;
-            b.maps.insert(slot, resource_id, g.va, len);
-            refresh_any(&b);
+            {
+                let mut b = book().ok_or(REENTRY)?;
+                b.maps.insert(slot, resource_id, g.va, len);
+                refresh_any(&b);
+            }
+            // A VRAM surface's first mapping clears it before any copy can write it (every write
+            // path maps first); RM does not zero video memory on allocation.
+            if !sysmem && super::vidmem::claim_clear(resource_id) {
+                clear_new(io, resource_id, g.va);
+            }
             Ok(g.va)
         }
         Err(f) => {
@@ -987,6 +1017,7 @@ pub(crate) fn publish_counters() {
     rec(b"RvCopy", COPY.load(Ordering::Relaxed));
     rec(b"RvCopyFail", COPY_FAIL.load(Ordering::Relaxed));
     rec(b"RvWaitTmo", WAIT_TMO.load(Ordering::Relaxed));
+    rec(b"RvCleared", CLEARED.load(Ordering::Relaxed));
     if FGN_REC.load(Ordering::Relaxed)
         | FGN_IMP.load(Ordering::Relaxed)
         | FGN_FAIL.load(Ordering::Relaxed)
