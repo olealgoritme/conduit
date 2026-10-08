@@ -1023,6 +1023,7 @@ The canonical Windows build: every finished NVK-on-RM patch in one series.
 | 6 | `patches-windows/0027-0029` | L2-cached sysmem, compression, ZCULL info (`NVK_RM_SYSMEM_CACHED=0`, `NVK_RM_COMPRESSION=0`, `NVK_RM_ZCULL=0`) |
 | 7 | `patches-windows/0035` | H.264 decode on NVDEC (`NVK_EXPERIMENTAL=video`) |
 | 8 | `patches-windows-dxvk/0001-0004` | what DXVK needs |
+| 8a | `patches-windows-dxvk/0005` | window swapchains: composed present by default under a DWM on NVK (`NVK_HELIOS_WSI_COMPOSE=0` = GDI), IMMEDIATE/MAILBOX offered (`MESA_WSI_WIN32_FIFO_ONLY=1` = FIFO only), composed presents on a thread with no CPU wait in `vkQueuePresentKHR` (`MESA_WSI_COMPOSE_THREAD=0` = on the app thread) |
 | 9 | `patches-common/0001-0007` | per-draw cost (shared with the Linux series) |
 
 0023 (S3's Helios ICD interface) is not in this stack: S3 stages its own
