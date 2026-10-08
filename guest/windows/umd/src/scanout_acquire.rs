@@ -146,12 +146,6 @@ pub(crate) fn windowed_blt_snapshot_capable() -> bool {
 /// the registry mutex, read anywhere.
 static ENABLED: AtomicU32 = AtomicU32::new(0);
 
-/// The runtime ADAPTER handle from the most recent `OpenAdapter*`, i.e. the
-/// first argument `pfnEscapeCb` documents (`hAdapter`). Every open in this
-/// process targets the same Helios adapter, so any live runtime adapter
-/// object reaches the same kernel adapter; the value is refreshed on every
-/// open so it always names the newest (longest-lived) object.
-static LAST_RT_ADAPTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-device acquire state. `key` is the `HeliosDevice` pointer value —
 /// identity only, never dereferenced here.
@@ -180,14 +174,6 @@ struct DeviceEntry {
 }
 
 static REGISTRY: Mutex<Vec<DeviceEntry>> = Mutex::new(Vec::new());
-
-/// Record the runtime adapter handle at `OpenAdapter*` time. Called from
-/// `open_adapter_common`.
-pub(crate) fn note_runtime_adapter(h_rt_adapter: *mut core::ffi::c_void) {
-    if !h_rt_adapter.is_null() {
-        LAST_RT_ADAPTER.store(h_rt_adapter as usize, Ordering::Release);
-    }
-}
 
 /// Build and issue one Helios escape through `pfnEscapeCb`.
 ///
@@ -309,7 +295,7 @@ pub(crate) fn windowed_snapshot_idle(dev: &HeliosDevice, resource_id: u32) -> bo
     let Some(context) = dev.context.as_ref() else {
         return false;
     };
-    let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
+    let rt_adapter = dev.rt_adapter;
     if rt_adapter == 0 || dev.kt_callbacks.is_null() {
         return false;
     }
@@ -428,7 +414,7 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
     if dev.kt_callbacks.is_null() {
         return 0;
     }
-    let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
+    let rt_adapter = dev.rt_adapter;
     if rt_adapter == 0 {
         log_error!(
             "scanout-acquire: no runtime adapter handle captured; feature off for this device"
@@ -922,7 +908,7 @@ unsafe fn nvrm_supported_ops(dev: &HeliosDevice) -> u64 {
     let mut ops = NVRM_OPS.load(Ordering::Relaxed);
     if ops == 0 {
         ops = NVRM_OPS_ASKED;
-        let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
+        let rt_adapter = dev.rt_adapter;
         if !dev.kt_callbacks.is_null() && rt_adapter != 0 {
             // SAFETY: HeliosNvrmQueryCaps is plain data; all-zero is valid.
             let mut q: helios_protocol::HeliosNvrmQueryCaps = unsafe { core::mem::zeroed() };
