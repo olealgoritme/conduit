@@ -162,6 +162,7 @@ pub(crate) fn note_arm_dma() {
 /// `DXGK_PRESENTFLAGS`, `src`/`dst` its allocation counts). Counted only with the mode on, and
 /// only for such presents: the question is whether dxgkrnl's independent-flip candidate presents
 /// fail or succeed here. Atomics only.
+#[inline]
 pub(crate) fn note_present_result(flags: u32, src: u32, dst: u32, ok: bool, status: u32) {
     if !mode().is_on() || !helios_kmd_logic::flip_flags::present_is_redirected(flags) {
         return;
@@ -177,6 +178,7 @@ pub(crate) fn note_present_result(flags: u32, src: u32, dst: u32, ok: bool, stat
 
 /// `IdfRedirSkip`: whether this Blt-arm Present (flags `flags`) completes with no copy. Counts
 /// the ones it skips. Atomics only.
+#[inline]
 pub(crate) fn skip_redirected_blt(flags: u32) -> bool {
     if REDIR_SKIP.load(Ordering::Relaxed) == 0 || !idf::redirected_blt(flags) {
         return false;
