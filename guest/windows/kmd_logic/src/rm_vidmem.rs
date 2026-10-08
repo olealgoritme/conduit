@@ -845,7 +845,7 @@ pub const COUNTERS: &[&str] = &[
     "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvBookReent", "RvXfer", "RvXferFail",
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
     // the Present (`ddi/vram_redirect.rs`)
-    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail",
+    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy",
     // foreign NVK sources for GDI commands (`ce_vram.rs`)
     "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy", "RvFgnWrite",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)

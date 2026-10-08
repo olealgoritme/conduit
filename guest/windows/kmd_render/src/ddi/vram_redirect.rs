@@ -69,10 +69,14 @@ static WHY: AtomicU32 = AtomicU32::new(0);
 static READBACK: AtomicU32 = AtomicU32::new(0);
 static UPLOAD: AtomicU32 = AtomicU32::new(0);
 static GDI_FAIL: AtomicU32 = AtomicU32::new(0);
+/// Foreign frames the route refused, copied synchronously instead (`RvBltSync`).
+static SYNC: AtomicU32 = AtomicU32::new(0);
+/// The route's own reason for the last refusal (`CeRtWhy` at that moment, `RvRtWhy`).
+static RT_WHY: AtomicU32 = AtomicU32::new(0);
 
 /// StartDevice (PASSIVE): zero the counters (written only once a VRAM Blt was seen).
 pub(crate) fn reset_for_start() {
-    for c in [&SEEN, &ROUTED, &SKIP, &WHY, &READBACK, &UPLOAD, &GDI_FAIL] {
+    for c in [&SEEN, &ROUTED, &SKIP, &WHY, &READBACK, &UPLOAD, &GDI_FAIL, &SYNC, &RT_WHY] {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -86,6 +90,8 @@ fn publish() {
     rec(b"RvRdBack", READBACK.load(Ordering::Relaxed));
     rec(b"RvUpload", UPLOAD.load(Ordering::Relaxed));
     rec(b"RvGdiFail", GDI_FAIL.load(Ordering::Relaxed));
+    rec(b"RvBltSync", SYNC.load(Ordering::Relaxed));
+    rec(b"RvRtWhy", RT_WHY.load(Ordering::Relaxed));
     vidmem::publish_counters();
 }
 
@@ -243,7 +249,25 @@ pub(crate) unsafe fn blt(
                     maybe_publish(false);
                     Some(Outcome::Routed(t))
                 }
-                None => skip(Why::RouteRefused),
+                None => {
+                    // The route refused (no copy-engine Present record for this frame, the
+                    // channel busy, ...): the destination is GPU-only and has no Venus copy to
+                    // fall back to, so copy the frame on the copy engine now from the image's
+                    // memory (imported by resource id, `ce_vram::foreign_source`), waited for
+                    // here. Without the record there is no acquire of the producer's semaphore:
+                    // DXGI presents after the frame's work is submitted, which is the ordering a
+                    // windowed BLT copy has on this path anyway. 372.1: every Present Blt of
+                    // explorer's composition into its window surface refused (RvBltWhy 1), the
+                    // file list black.
+                    RT_WHY.store(crate::ddi::ce_present_route::last_why(), Ordering::Relaxed);
+                    if sync_foreign(passive, adapter, source.resource_id, src_rect, destination.resource_id, dst_rect, dst.fourcc) {
+                        SYNC.fetch_add(1, Ordering::Relaxed);
+                        maybe_publish(false);
+                        Some(Outcome::Done)
+                    } else {
+                        skip(Why::RouteRefused)
+                    }
+                }
             }
         }
         (Some(_), Some(_)) => {
@@ -366,4 +390,26 @@ pub(crate) unsafe fn blt(
         }
         (None, None) => None,
     }
+}
+
+/// One foreign frame into a VRAM surface on the copy engine, waited for (at most `XFER_MS`).
+fn sync_foreign(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    source: u32,
+    src_rect: Rect,
+    destination: u32,
+    dst_rect: Rect,
+    dst_fourcc: u32,
+) -> bool {
+    let Ok(fs) = ce_vram::foreign_source(passive, adapter, source) else {
+        return false;
+    };
+    let Ok(d) = ce_vram::ce_surface(passive, adapter, destination) else {
+        return false;
+    };
+    let Ok(value) = ce_vram::foreign_copy(&fs, src_rect, &d, dst_rect.left, dst_rect.top, dst_fourcc) else {
+        return false;
+    };
+    ce_vram::wait(passive, value, ce_vram::XFER_MS)
 }
