@@ -1360,15 +1360,42 @@ unsafe fn create_wddm_context(
     // (`DXGK_ENGINE_TYPE_3D`, `NbAsymetricProcessingNodes = 1`), so every queue
     // class maps to node 0 — `DECISIONS.md` D5's "no extra engine nodes" in its
     // DDI form (`DDI_REFERENCE.md` §9.2).
+    //
+    // `Umd12ContextNode=1` (with the KMD's `D3d12Node=1`, which reports a second
+    // 3D node): D3D12 queues on NVK ask for node 1, which the KMD completes
+    // independently of node 0 (DWM, D3D11, presents). A refusal (a KMD with one
+    // node) falls back to node 0, counted.
+    let want_node = if crate::knobs12::umd12_context_node() && dev.engine.is_nvk() { 1 } else { 0 };
     let mut arg = ddi12::D3DDDICB_CREATECONTEXT {
-        NodeOrdinal: 0,
+        NodeOrdinal: want_node,
         EngineAffinity: 0,
         ..Default::default()
     };
     // SAFETY: a non-null callback from the runtime's own table, given the
     // runtime's queue handle and a fully initialised out-struct local. The
     // runtime writes `hContext` and the three windows into it.
-    let hr = unsafe { create_context_cb(h_rt_queue, &mut arg) };
+    let mut hr = unsafe { create_context_cb(h_rt_queue, &mut arg) };
+    if want_node != 0 {
+        if hr < 0 || arg.hContext.is_null() {
+            note_refusal(&L2_REFUSALS.queue_context_node_refused);
+            if budget(&QUEUE_LOG).is_some() {
+                log_error!(
+                    "CreateCommandQueue: CreateContext on node {want_node} hr={:#010x}; node 0 instead \
+                     (is D3d12Node=1 set and the adapter restarted?)",
+                    hr as u32
+                );
+            }
+            arg = ddi12::D3DDDICB_CREATECONTEXT {
+                NodeOrdinal: 0,
+                EngineAffinity: 0,
+                ..Default::default()
+            };
+            // SAFETY: as above.
+            hr = unsafe { create_context_cb(h_rt_queue, &mut arg) };
+        } else {
+            L2_REFUSALS.queue_context_node1.bump();
+        }
+    }
 
     // ⚠ KEPT VERBATIM, and it still reads `arg` rather than the latched
     // [`ContextWindows`] even though FB-1 now stores them. Two reasons, both
@@ -4099,6 +4126,10 @@ pub(crate) struct L2Refusals {
     /// NVK ECLs released without the runtime admission event (diagnostic
     /// `Nvk12AdmitAfterPresentOnly`).
     ecl_admission_skipped: RefusalCounter,
+    /// D3D12 queue contexts created on node 1 (`Umd12ContextNode`).
+    queue_context_node1: RefusalCounter,
+    /// Node 1 was refused (one-node KMD); the queue is on node 0.
+    queue_context_node_refused: RefusalCounter,
     /// `Nvk12EclFencePrefetch`: the next ECL's fence could not be made ahead
     /// (that ECL makes it inline).
     ecl_fence_prefetch_failed: RefusalCounter,
@@ -4202,6 +4233,8 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     command_signature_translation_oom: RefusalCounter::new("CommandSignatureTranslationOom"),
     ecl_nvk_ordered: RefusalCounter::new("EclNvkOrdered"),
     ecl_admission_skipped: RefusalCounter::new("EclAdmissionSkipped"),
+    queue_context_node1: RefusalCounter::new("QueueContextNode1"),
+    queue_context_node_refused: RefusalCounter::new("QueueContextNodeRefused"),
     ecl_fence_prefetch_failed: RefusalCounter::new("EclFencePrefetchFailed"),
 };
 
@@ -4347,6 +4380,8 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.command_signature_translation_oom,
     &L2_REFUSALS.ecl_nvk_ordered,
     &L2_REFUSALS.ecl_admission_skipped,
+    &L2_REFUSALS.queue_context_node1,
+    &L2_REFUSALS.queue_context_node_refused,
     &L2_REFUSALS.ecl_fence_prefetch_failed,
 ];
 
