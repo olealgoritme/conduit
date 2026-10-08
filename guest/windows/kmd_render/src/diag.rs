@@ -1441,6 +1441,10 @@ pub mod knobs {
     /// and a DMA-buffer flip of an unregistered Venus allocation completes as a kept picture
     /// instead of failing (`PBFlip` 0xE6). Read with the other adapter knobs; mirrored as `IdfKnob`.
     pub const INDEP_FLIP: KnobName = KnobName::new(b"IndepFlip");
+    /// `IdfRedirSkip` (default 0; `helios_kmd_logic::independent_flip::KNOB_REDIR_SKIP`): with
+    /// `IndepFlip` on, a Present carrying `RedirectedFlip` on the Blt arm completes with no copy.
+    /// An experiment (docs/independent-flip.md 13.5). Read at StartDevice; counted `IdfRedSkip`.
+    pub const IDF_REDIR_SKIP: KnobName = KnobName::new(b"IdfRedirSkip");
     /// `HwCursor` (default 1): the hardware cursor (`docs/independent-flip.md` section 12,
     /// `helios_kmd_logic::hw_cursor`). 1 reports a 256x256 monochrome / color / masked-color
     /// pointer in `DXGK_DRIVERCAPS` when the host serves it (`NVGPU_CFG_VENUS_CURSOR`), and
