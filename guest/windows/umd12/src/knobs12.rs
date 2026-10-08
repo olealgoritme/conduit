@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 14] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 16] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -318,6 +318,10 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 14] {
         ("Nvk12EclSpinUs", nvk12_ecl_spin_us()),
         // Appended.
         ("Nvk12ScanoutFence", nvk12_scanout_fence() as u32),
+        // Appended. Clamped, as the worker reads it.
+        ("Nvk12WorkerSpinUs", nvk12_worker_spin_us()),
+        // Appended (diagnostic).
+        ("Nvk12AdmitAfterPresentOnly", nvk12_admit_after_present_only() as u32),
     ]
 }
 
@@ -393,6 +397,37 @@ pub(crate) static NVK12_SCANOUT_FENCE: BoolKnob = BoolKnob::new(c"Nvk12ScanoutFe
 
 pub(crate) fn nvk12_scanout_fence() -> bool {
     NVK12_SCANOUT_FENCE.get()
+}
+
+/// `Nvk12WorkerSpinUs`: with `Nvk12EclSync=0`, how long the per-queue worker
+/// polls the engine's execution stream for a handed boundary before blocking
+/// (NVK's blocking wait sees completion only after the RM non-stall event is
+/// relayed from the host). The boundary it signals gates the admission of the
+/// queue's next batch, so this sits on the critical path once per
+/// ExecuteCommandLists. Default 0 (block at once, as before) until measured;
+/// clamped to [`MAX_ECL_SPIN_US`]. Costs up to that much of one core per
+/// boundary while polling. Read once per process.
+pub(crate) static NVK12_WORKER_SPIN_US: DwordKnob = DwordKnob::new(c"Nvk12WorkerSpinUs", 0);
+
+pub(crate) fn nvk12_worker_spin_us() -> u32 {
+    NVK12_WORKER_SPIN_US.get().min(MAX_ECL_SPIN_US)
+}
+
+/// ⛔ DIAGNOSTIC, never a default. `Nvk12AdmitAfterPresentOnly=1`: on NVK,
+/// only the first ExecuteCommandLists of each queue after a Present (or after
+/// queue creation) waits for the runtime admission event; every other batch
+/// is released to the engine at once. The context is still ordered behind
+/// every batch (the app's fence signals stay correct), but a batch no longer
+/// waits for runtime waits queued before it -- a cross-queue Wait or a
+/// flip-model buffer wait that is not right after a Present -- so an app that
+/// relies on those can race. What it measures: how much of the frame is the
+/// per-batch admission round trip (commit-to-admission ~1-2 ms on 398.1).
+/// Counter EclAdmissionSkipped. Read once per process.
+pub(crate) static NVK12_ADMIT_AFTER_PRESENT_ONLY: BoolKnob =
+    BoolKnob::new(c"Nvk12AdmitAfterPresentOnly", false);
+
+pub(crate) fn nvk12_admit_after_present_only() -> bool {
+    NVK12_ADMIT_AFTER_PRESENT_ONLY.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {
