@@ -300,8 +300,18 @@ fn import_foreign(
     };
     let (h_mem, h_virt) = rv::map_handles(slot);
     // 1. The host: the resource's memory as a GEM of the channel client's DRM file.
+    // `RvFgnWhy` of a failed host import: 0x8001_00EE the host does not serve RmResourceImport (config
+    // feature bit 14), 0x8001_00ED the KMD's own gate refused it, 0x8003_00xx the host's errno xx,
+    // 0x8002_00EF no transport.
+    use crate::virtio::rm_resource_import::RiError;
+    use helios_kmd_logic::foreign_errno::Verdict;
     let gem = crate::virtio::rm_resource_import::rm_resource_import_kmd(io.passive, io.adapter, h.drm, resource_id)
-        .map_err(|_| Fail::new(FailKind::Refused, 0xED))?
+        .map_err(|e| match e {
+            RiError::Local(Verdict::Unsupported) => Fail::new(FailKind::Refused, 0xEE),
+            RiError::Local(_) => Fail::new(FailKind::Refused, 0xED),
+            RiError::Host(_, errno) => Fail::new(FailKind::Host, errno & 0xff),
+            RiError::NoTransport => Fail::new(FailKind::Transport, 0xEF),
+        })?
         .gem_handle;
     let r = import_gem(io, h, gem, h_mem);
     // The GEM is only the envelope (our RM handle holds the memory once imported).
