@@ -97,6 +97,8 @@ static SW_MAX: AtomicU32 = AtomicU32::new(0);
 static RETRY: AtomicU32 = AtomicU32::new(0);
 static QUEUE_ON: AtomicU32 = AtomicU32::new(0);
 static Q_BUSY: AtomicU32 = AtomicU32::new(0);
+/// Commands sent on the cursor queue (virtqueue 2).
+static Q_SENT: AtomicU32 = AtomicU32::new(0);
 /// When the current software-cursor episode began (0: none).
 static SW_SINCE: AtomicU64 = AtomicU64::new(0);
 /// When an owed command last failed to reach the queue (0: nothing to retry).
@@ -113,12 +115,56 @@ fn ms_from_100ns(t: u64) -> u32 {
 
 fn bump(c: &AtomicU32) {
     c.fetch_add(1, Ordering::Relaxed);
-    DIRTY.store(1, Ordering::Relaxed);
+    mark_dirty();
 }
 
 fn set(c: &AtomicU32, v: u32) {
     c.store(v, Ordering::Relaxed);
+    mark_dirty();
+}
+
+/// When a mirror pass was last asked for (100 ns), for the once-a-second rate limit.
+static LAST_REQ: AtomicU64 = AtomicU64::new(0);
+
+/// Something moved: mark the block and ask the mirror thread for a pass, at most once a second.
+/// The block used to be written only from the periodic `scanout_trace` dump, which runs on HPD
+/// worker wakes: with a hardware cursor, moving the mouse wakes nothing (no frame changes), so an
+/// idle desktop never published a `Cur*` value (399.1: every one 0 after a minute of shape
+/// changes). The mirror thread writes the block in its base pass (`mirror_thread::run_pass`).
+/// Atomics and `KeSetEvent(Wait = FALSE)` only.
+fn mark_dirty() {
     DIRTY.store(1, Ordering::Relaxed);
+    let now = now_100ns();
+    let last = LAST_REQ.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 10_000_000
+        && LAST_REQ
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        if crate::ddi::mirror_thread::running() {
+            crate::ddi::mirror_thread::request();
+        } else {
+            // `MirrorThread` 0: write it here, once a second at most (the pointer DDIs are
+            // PASSIVE, the same rule the rest of the driver follows without the thread).
+            publish();
+        }
+    }
+}
+
+/// `DxgkDdiSetPointerShape` / `DxgkDdiSetPointerPosition` calls that reached the display half,
+/// counted before anything is decided (the caps included): whether dxgkrnl calls the pointer
+/// DDIs at all. Atomics only.
+static DDI_SHAPE: AtomicU32 = AtomicU32::new(0);
+static DDI_POS: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn note_ddi_shape() {
+    bump(&DDI_SHAPE);
+}
+
+pub(crate) fn note_ddi_position() {
+    DDI_POS.fetch_add(1, Ordering::Relaxed);
+    // Positions arrive at mouse rate: published with the next change, or once a second.
+    mark_dirty();
 }
 
 fn write_block() {
@@ -145,9 +191,13 @@ fn write_block() {
     crate::diag::record_named_bytes(b"CurRetry", r(&RETRY));
     crate::diag::record_named_bytes(b"CurQ", r(&QUEUE_ON));
     crate::diag::record_named_bytes(b"CurQBusy", r(&Q_BUSY));
+    crate::diag::record_named_bytes(b"CurQSent", r(&Q_SENT));
+    crate::diag::record_named_bytes(b"CurDdiS", r(&DDI_SHAPE));
+    crate::diag::record_named_bytes(b"CurDdiP", r(&DDI_POS));
 }
 
-/// From the periodic `scanout_trace` dump: the block, when a count moved. PASSIVE.
+/// The block, when a count moved: from the mirror thread's pass (asked for by [`mark_dirty`]) and
+/// from the periodic `scanout_trace` dump. PASSIVE.
 pub(crate) fn publish() {
     if DIRTY.swap(0, Ordering::Relaxed) != 0 {
         write_block();
@@ -233,7 +283,8 @@ pub(crate) fn reset_for_start(adapter: &AdapterContext, knobs: &crate::adapter::
     CAPS.store(u32::from(caps), Ordering::Relaxed);
     for c in [
         &SHAPE_N, &POS_N, &SHOW, &HIDE, &FMT, &SIZE, &REFUSE, &WHY, &HOST_ERR, &XOR, &RTT_US,
-        &RTT_MAX, &TMO, &GATE_MS, &SW_N, &SW_MS, &SW_MAX, &RETRY, &Q_BUSY,
+        &RTT_MAX, &TMO, &GATE_MS, &SW_N, &SW_MS, &SW_MAX, &RETRY, &Q_BUSY, &Q_SENT, &DDI_SHAPE,
+        &DDI_POS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -362,6 +413,7 @@ pub(crate) unsafe fn set_pointer_position(
         return STATUS_SUCCESS;
     }
     POS_N.fetch_add(1, Ordering::Relaxed);
+    mark_dirty();
     // SAFETY: the flags union's `Value` is its whole word.
     let visible = unsafe { args.Flags.__bindgen_anon_1.Value } & 1 != 0;
     let changed = {
@@ -502,6 +554,8 @@ fn settle(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
             Some(r) => {
                 if matches!(r, Err(VirtioError::QueueFull)) {
                     bump(&Q_BUSY);
+                } else {
+                    bump(&Q_SENT);
                 }
                 r
             }
