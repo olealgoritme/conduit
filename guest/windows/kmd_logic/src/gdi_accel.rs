@@ -1718,6 +1718,24 @@ pub const COUNTERS: &[&str] = &[
     "GdiBadWhy",
     // Final commands of a buffer taken short (CommandSize past the end, the arm complete).
     "GdiTailCut",
+    // Placement of the allocations GDI buffers name (first 8): resource id << 16 | SegmentId << 8 |
+    // times seen; the list's address >> 12 (low 32 bits).
+    "GdiSeg0",
+    "GdiSeg1",
+    "GdiSeg2",
+    "GdiSeg3",
+    "GdiSeg4",
+    "GdiSeg5",
+    "GdiSeg6",
+    "GdiSeg7",
+    "GdiSegPa0",
+    "GdiSegPa1",
+    "GdiSegPa2",
+    "GdiSegPa3",
+    "GdiSegPa4",
+    "GdiSegPa5",
+    "GdiSegPa6",
+    "GdiSegPa7",
     "GdiOpMask",
     "GdiRopMask",
     // Commands executed on the copy engine (BitBlt, ColorFill), on the CPU (GdiFall), not at all

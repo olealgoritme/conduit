@@ -133,6 +133,9 @@ pub(crate) fn note_start(knobs: &crate::adapter::AdapterKnobs) {
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    for s in SEG.iter().chain(SEG_PA.iter()) {
+        s.store(0, Ordering::Relaxed);
+    }
     CAPS.store(caps.reported, Ordering::Relaxed);
     ON.store(u32::from(caps.on), Ordering::Relaxed);
     crate::ddi::gdi_exec::reset_for_start(caps.on);
@@ -159,6 +162,12 @@ pub(crate) fn publish_counters() {
     w(b"GdiBad", BAD.load(Ordering::Relaxed));
     w(b"GdiBadWhy", BAD_WHY.load(Ordering::Relaxed));
     w(b"GdiTailCut", TAIL_CUT.load(Ordering::Relaxed));
+    const SEG_NAMES: [&[u8]; 8] = [b"GdiSeg0", b"GdiSeg1", b"GdiSeg2", b"GdiSeg3", b"GdiSeg4", b"GdiSeg5", b"GdiSeg6", b"GdiSeg7"];
+    const PA_NAMES: [&[u8]; 8] = [b"GdiSegPa0", b"GdiSegPa1", b"GdiSegPa2", b"GdiSegPa3", b"GdiSegPa4", b"GdiSegPa5", b"GdiSegPa6", b"GdiSegPa7"];
+    for i in 0..8 {
+        w(SEG_NAMES[i], SEG[i].load(Ordering::Relaxed));
+        w(PA_NAMES[i], SEG_PA[i].load(Ordering::Relaxed));
+    }
     w(b"GdiOpMask", OP_MASK.load(Ordering::Relaxed));
     w(b"GdiRopMask", ROP_MASK.load(Ordering::Relaxed));
     w(b"GdiDrop", DROP.load(Ordering::Relaxed));
@@ -245,8 +254,20 @@ unsafe fn surface_at(
     if h.is_null() {
         return None;
     }
+    // The list entry's placement as dxgkrnl filled it: `SegmentId` (bits 1..5 of the dword at 8) and
+    // `PhysicalAddress`/`VirtualAddress` (the qword at 16), read raw (the x64 layout, 24 bytes).
+    let placement = if core::mem::size_of::<DXGK_ALLOCATIONLIST>() == 24 {
+        let base = entry as *const DXGK_ALLOCATIONLIST as *const u8;
+        // SAFETY: inside the 24-byte entry just bounds-checked.
+        unsafe { Some(((core::ptr::read_unaligned(base.add(8) as *const u32) >> 1) & 0x1f, core::ptr::read_unaligned(base.add(16) as *const u64))) }
+    } else {
+        None
+    };
     // SAFETY: a handle dxgkrnl round-trips from our OpenAllocation, as for a Present.
     let info = unsafe { crate::ddi::create_allocation::present_alloc_info(Some(adapter), h) }?;
+    if let Some((seg, addr)) = placement {
+        note_placement(info.resource_id, seg, addr);
+    }
     let class = if crate::ddi::gdi_ce_glue::is_vram(info.resource_id) {
         SurfaceClass::Vram
     } else if info.storage == crate::ddi::create_allocation::PresentAllocationStorage::PitchedStandardBuffer {
@@ -286,6 +307,35 @@ unsafe fn surface_at(
         format: info.format,
         kind_bits,
     })
+}
+
+/// Placement census of the allocations GDI buffers name (first 8 resources): resource id << 16 |
+/// SegmentId << 8 | times seen (max 255), and the address dxgkrnl put in the list (>> 12, low 32
+/// bits; GPU VA under GpuMmu, segment address otherwise).
+static SEG: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+static SEG_PA: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+
+fn note_placement(resource_id: u32, seg: u32, addr: u64) {
+    let id = resource_id & 0xffff;
+    if id == 0 {
+        return;
+    }
+    for (i, s) in SEG.iter().enumerate() {
+        let v = s.load(Ordering::Relaxed);
+        if v == 0 {
+            if s.compare_exchange(0, id << 16 | (seg & 0x1f) << 8 | 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                SEG_PA[i].store((addr >> 12) as u32, Ordering::Relaxed);
+                return;
+            }
+            continue;
+        }
+        if v >> 16 == id {
+            let n = (v & 0xff).saturating_add(1).min(0xff);
+            s.store(id << 16 | (seg & 0x1f) << 8 | n, Ordering::Relaxed);
+            SEG_PA[i].store((addr >> 12) as u32, Ordering::Relaxed);
+            return;
+        }
+    }
 }
 
 fn note_opcode(cmd: &Cmd) {
