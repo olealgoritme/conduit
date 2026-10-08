@@ -92,13 +92,26 @@ struct EclWaitStats {
     max_ns: AtomicU64,
     /// Waits the poll settled (no blocking engine wait).
     polled: AtomicU64,
+    /// Wait-time histogram, upper bounds in [`ECL_WAIT_BUCKETS_US`] (last: above).
+    buckets: [AtomicU64; ECL_WAIT_BUCKETS_US.len() + 1],
 }
+
+/// Histogram bucket upper bounds (us). Separates a timer tick per wait
+/// (1-2 ms each, every ECL) from one long wait per frame (a context wait the
+/// admission event sat behind, e.g. a swap-chain buffer DWM has not released).
+const ECL_WAIT_BUCKETS_US: [u64; 6] = [50, 200, 1000, 2000, 5000, 20000];
 
 impl EclWaitStats {
     fn record(&self, elapsed: Duration, polled: bool) {
         let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let total = self.total_ns.fetch_add(ns, Ordering::Relaxed).saturating_add(ns);
         self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        let us = ns / 1000;
+        let bucket = ECL_WAIT_BUCKETS_US
+            .iter()
+            .position(|&bound| us < bound)
+            .unwrap_or(ECL_WAIT_BUCKETS_US.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         let polled_n = if polled {
             NVK_REFUSALS.cpu_wait_polled.bump();
             self.polled.fetch_add(1, Ordering::Relaxed) + 1
@@ -110,12 +123,22 @@ impl EclWaitStats {
         if n == 1 || n % ECL_WAIT_LOG_EVERY == 0 {
             // Window max: reset so each line says something about its own window.
             let max = self.max_ns.swap(0, Ordering::Relaxed);
+            let b: [u64; ECL_WAIT_BUCKETS_US.len() + 1] =
+                core::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));
             log_error!(
                 "NVK ECL CPU wait: {n} waits, avg {} us, window max {} us, polled {polled_n} \
-                 blocked {} (Nvk12EclSpinUs={})",
+                 blocked {}, hist <50us {} <200us {} <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {} \
+                 (Nvk12EclSpinUs={})",
                 total / n / 1000,
                 max / 1000,
                 n - polled_n,
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                b[4],
+                b[5],
+                b[6],
                 crate::knobs12::nvk12_ecl_spin_us(),
             );
         }
@@ -127,6 +150,7 @@ static ECL_WAIT_STATS: EclWaitStats = EclWaitStats {
     total_ns: AtomicU64::new(0),
     max_ns: AtomicU64::new(0),
     polled: AtomicU64::new(0),
+    buckets: [const { AtomicU64::new(0) }; ECL_WAIT_BUCKETS_US.len() + 1],
 };
 
 /// The worker's wait slice: it rechecks its stop flag this often.
