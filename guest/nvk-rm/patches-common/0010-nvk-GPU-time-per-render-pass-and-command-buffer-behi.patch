@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Thu, 8 Oct 2026 14:10:55 +0200
-Subject: [PATCH 10/10] nvk: GPU time per render pass and command buffer behind
+Subject: [PATCH] nvk: GPU time per render pass and command buffer behind
  NVK_PASS_PROFILE
 
 To find what makes a frame GPU-heavy without a vendor profiler: with
@@ -17,9 +17,10 @@ two seconds the 24 heaviest signatures are logged with GPU ms per second,
 us per pass, count and draws per pass; the command-buffer line is the
 whole GPU time, so what no pass explains is compute, copies and clears.
 
-The lines also go to NVK_PASS_PROFILE_FILE, else on Windows to
-C:\ProgramData\Helios\nvk-pass-<pid>.txt (mesa's own log only reaches a
-debugger there).
+The lines also go to a file: NVK_PASS_PROFILE_FILE if set, else on
+Windows %ProgramData%\Helios\nvk-pass-<pid>.txt, falling back to
+%TEMP%\nvk-pass-<pid>.txt (the HELIOS_VK_FRAMETIME rule; mesa's own log
+never reaches a file on Windows).
 
 Each report is a flush of pending writes plus a release, a little GPU time
 per pass: good for finding a 10x, not for measuring 1 %.
@@ -30,10 +31,10 @@ per pass: good for finding a 10x, not for measuring 1 %.
  src/nouveau/vulkan/nvk_cmd_draw.c     |   9 +
  src/nouveau/vulkan/nvk_device.c       |   6 +
  src/nouveau/vulkan/nvk_device.h       |   5 +
- src/nouveau/vulkan/nvk_pass_profile.c | 374 ++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_pass_profile.c | 406 ++++++++++++++++++++++++++
  src/nouveau/vulkan/nvk_pass_profile.h |  28 ++
  src/nouveau/vulkan/nvk_queue.c        |   4 +
- 9 files changed, 438 insertions(+)
+ 9 files changed, 470 insertions(+)
  create mode 100644 src/nouveau/vulkan/nvk_pass_profile.c
  create mode 100644 src/nouveau/vulkan/nvk_pass_profile.h
 
@@ -191,10 +192,10 @@ index 5359e66..a17a5ba 100644
     struct nvk_layer_dispatch_tables layer_dispatch;
 diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
 new file mode 100644
-index 0000000..6d04ecd
+index 0000000..8849711
 --- /dev/null
 +++ b/src/nouveau/vulkan/nvk_pass_profile.c
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,406 @@
 +/*
 + * Copyright © 2026 Conduit contributors
 + * SPDX-License-Identifier: MIT
@@ -215,9 +216,9 @@ index 0000000..6d04ecd
 + * is compressed -- so the line also says how the attachments are laid out.
 + * Every two seconds the heaviest signatures are logged (mesa_logi, GPU ms
 + * per second and per pass, draws per pass), then the totals reset.  The
-+ * lines also go to a file: NVK_PASS_PROFILE_FILE, else on Windows
-+ * C:\ProgramData\Helios\nvk-pass-<pid>.txt (mesa's log there only reaches
-+ * a debugger).
++ * lines also go to a file (prof_open_file: NVK_PASS_PROFILE_FILE, else on
++ * Windows %ProgramData%\Helios, then %TEMP%; mesa's log there only reaches a
++ * debugger).
 + *
 + * Passes nest inside command buffers, so the command-buffer line is the
 + * whole GPU time and the pass lines are a breakdown of it; what is in the
@@ -248,7 +249,7 @@ index 0000000..6d04ecd
 +#include <stdio.h>
 +#include <string.h>
 +#ifdef _WIN32
-+#include <process.h>
++#include <windows.h>
 +#endif
 +
 +#define PROF_SLOTS     16384u
@@ -307,6 +308,49 @@ index 0000000..6d04ecd
 +      fprintf(prof->file, "%s\n", line);
 +}
 +
++/* NVK_PASS_PROFILE_FILE (a full path), else on Windows
++ * %ProgramData%\Helios\nvk-pass-<pid>.txt, else %TEMP%\nvk-pass-<pid>.txt
++ * (the HELIOS_VK_FRAMETIME log's rule: mesa's log never reaches a file on
++ * Windows).  Elsewhere only NVK_PASS_PROFILE_FILE.
++ */
++static FILE *
++prof_open_file(char *path, size_t size)
++{
++   const char *env = os_get_option("NVK_PASS_PROFILE_FILE");
++   if (env != NULL && env[0] != 0) {
++      snprintf(path, size, "%s", env);
++      FILE *f = fopen(path, "a");
++      if (f != NULL)
++         return f;
++      mesa_logw("NVK pass profile: cannot write %s", path);
++   }
++#ifdef _WIN32
++   char dirs[2][MAX_PATH];
++   unsigned dir_count = 0;
++   char pd[MAX_PATH];
++   DWORD n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
++   snprintf(dirs[dir_count++], MAX_PATH, "%s\\Helios",
++            n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData");
++   char tmp[MAX_PATH];
++   n = GetTempPathA(sizeof(tmp), tmp);
++   if (n > 0 && n < sizeof(tmp)) {
++      if (tmp[n - 1] == '\\')
++         tmp[n - 1] = 0;
++      snprintf(dirs[dir_count++], MAX_PATH, "%s", tmp);
++   }
++   for (unsigned i = 0; i < dir_count; i++) {
++      CreateDirectoryA(dirs[i], NULL);
++      snprintf(path, size, "%s\\nvk-pass-%lu.txt", dirs[i],
++               (unsigned long)GetCurrentProcessId());
++      FILE *f = fopen(path, "a");
++      if (f != NULL)
++         return f;
++   }
++#endif
++   path[0] = 0;
++   return NULL;
++}
++
 +void
 +nvk_pass_profile_init(struct nvk_device *dev)
 +{
@@ -331,22 +375,11 @@ index 0000000..6d04ecd
 +   memset(prof->gpu, 0, PROF_SLOTS * sizeof(struct prof_slot_gpu));
 +   simple_mtx_init(&prof->mutex, mtx_plain);
 +   prof->window_start_ns = os_time_get_nano();
-+   const char *path = os_get_option("NVK_PASS_PROFILE_FILE");
-+   char default_path[256];
-+#ifdef _WIN32
-+   if (path == NULL) {
-+      snprintf(default_path, sizeof(default_path),
-+               "C:\\ProgramData\\Helios\\nvk-pass-%d.txt", _getpid());
-+      path = default_path;
-+   }
-+#else
-+   (void)default_path;
-+#endif
-+   if (path != NULL)
-+      prof->file = fopen(path, "a");
++   char path[512] = "";
++   prof->file = prof_open_file(path, sizeof(path));
 +   dev->pass_profile = prof;
 +   prof_log(prof, "NVK pass profile: on (%u slots), file %s", PROF_SLOTS,
-+            prof->file != NULL ? path : "(none)");
++            prof->file != NULL ? path : "(none: no writable folder)");
 +}
 +
 +void
