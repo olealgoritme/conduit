@@ -10,6 +10,7 @@
 #   MESA_BASE       Mesa commit the series applies to (default below)
 #   MESON           meson binary (needs >= 1.4; default: meson in PATH)
 #   MESON_ARGS      extra `meson setup` arguments
+#   BUILDTYPE       meson buildtype (default release, with b_ndebug=true)
 #   RMCLIENT_INCLUDE  directory holding rmclient.h (default: guest/rmclient/include
 #                   in this tree if present; otherwise Mesa uses the copy in
 #                   the patch, which is identical)
@@ -40,8 +41,13 @@ if ! git -C "$MESA_DIR" cat-file -e "$MESA_BASE^{commit}" 2>/dev/null; then
   git -C "$MESA_DIR" fetch --depth 200 origin "$MESA_BASE"
 fi
 
-# 2. Apply the series on a local branch, unless it is already there
-last_subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$(ls "$here"/patches/*.patch | tail -1)")
+# 2. Apply the series on a local branch, unless it is already there:
+#    patches/ (NVK on RM), then patches-common/ (generic NVK patches that
+#    apply on top of the Windows stack as well)
+series=$(ls "$here"/patches/*.patch "$here"/patches-common/*.patch)
+last_patch=$(printf "%s\n" $series | tail -1)
+last_subject=$(awk '/^Subject: /{s = $0; while ((getline l) > 0 && l ~ /^ /) s = s l;
+                    sub(/^Subject: \[PATCH[^]]*\] /, "", s); print s; exit}' "$last_patch")
 if git -C "$MESA_DIR" log --format=%s "$MESA_BASE..HEAD" 2>/dev/null | grep -qxF "$last_subject"; then
   echo "nvk-rm: series already applied in $MESA_DIR"
 else
@@ -50,7 +56,8 @@ else
     exit 1
   fi
   git -C "$MESA_DIR" checkout -B nvk-rm "$MESA_BASE"
-  git -C "$MESA_DIR" am --3way "$here"/patches/*.patch
+  # shellcheck disable=SC2086
+  git -C "$MESA_DIR" am --3way $series
 fi
 
 # 3. Point meson at Conduit's rmclient.h through a throwaway pkg-config file
@@ -69,14 +76,25 @@ fi
 
 # 4. Configure and build only NVK
 cd "$MESA_DIR"
+# Release: -O3, no C asserts (b_ndebug), and NAK (Rust) without debug
+# assertions or overflow checks.  debugoptimized keeps all three on, which
+# costs CPU time per draw and per shader compile (and on Windows an assert
+# is a dialog).  BUILDTYPE=debugoptimized for debugging.
+BUILDTYPE=${BUILDTYPE:-release}
+if [ "$BUILDTYPE" = release ]; then NDEBUG=true; else NDEBUG=false; fi
 if [ ! -f "$BUILD_DIR/build.ninja" ]; then
   # shellcheck disable=SC2086
   "$MESON" setup "$BUILD_DIR" \
     -Dvulkan-drivers=nouveau \
     -Dgallium-drivers= \
     -Dnvk-rm=enabled \
-    -Dbuildtype=debugoptimized \
+    -Dbuildtype="$BUILDTYPE" \
+    -Db_ndebug="$NDEBUG" \
     $MESON_ARGS
+else
+  # Existing build directories from older versions of this script were
+  # debugoptimized; bring them in line.
+  "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG"
 fi
 ninja -C "$BUILD_DIR" \
   src/nouveau/vulkan/libvulkan_nouveau.so \

@@ -1324,19 +1324,23 @@ mod tests {
                 } else if p.extension().is_some_and(|x| x == "rs") {
                     // `diag.rs` spells the KNOB names (`b"FfAsyncWin"`, `b"FfRepeatMs"`), which are
                     // values the driver reads, not counters it writes; the knobs are checked
-                    // for collision with the counters just below.
-                    if p.file_name()
-                        .is_some_and(|n| n == "foreign_flip.rs" || n == "diag.rs")
-                    {
+                    // for collision with the counters just below. ONLY the `KnobName::new(...)`
+                    // lines are let through: a counter literal that strays into `diag.rs` is
+                    // still caught.
+                    if p.file_name().is_some_and(|n| n == "foreign_flip.rs") {
                         continue;
                     }
+                    let is_diag = p.file_name().is_some_and(|n| n == "diag.rs");
                     checked += 1;
                     let text = std::fs::read_to_string(&p).unwrap();
-                    assert!(
-                        !text.contains("b\"Ff"),
-                        "{} writes a counter named Ff*, the foreign flip's prefix",
-                        p.display()
-                    );
+                    for line in text.lines() {
+                        let knob_decl = is_diag && line.contains("KnobName::new(b\"Ff");
+                        assert!(
+                            knob_decl || !line.contains("b\"Ff"),
+                            "{} writes a counter named Ff*, the foreign flip's prefix: {line}",
+                            p.display()
+                        );
+                    }
                 }
             }
         }

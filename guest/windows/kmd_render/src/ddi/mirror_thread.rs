@@ -372,6 +372,8 @@ fn run_pass(mask: u32) -> bool {
         NVS.fetch_add(1, Ordering::Relaxed);
     }
     crate::ddi::stall_diag::publish_counters();
+    // `StgRing` (`StageTrace`): one relaxed load while the knob is 0, rate limited inside.
+    crate::ddi::stage_trace::publish();
     publish_own();
     crate::diag::mirror_end_pass();
     let us = (crate::adapter::foreign_scanout::now_100ns().saturating_sub(t0) / 10)

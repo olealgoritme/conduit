@@ -445,6 +445,11 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // (mcdm-implementation-guidelines.md) requires 0 here. `DirectFlipCaps`
     // service knob (default 0) restores the legacy advertisement for A/B via
     // reg add + devcon restart; value lands in the 0x01D7 diag record bit 2.
+    // STALE PREMISE, corrected for independent flip (docs/independent-flip.md 2.7):
+    // the adapter now has a display half, a flip path and a host scan-out, so a
+    // promoted window IS shown. `IndepFlip` (default 0) advertises this cap, the
+    // aperture DirectFlip flag and FlipIndependent|DdiPresentForIFlip together;
+    // `knobs.direct_flip` already carries it (AdapterKnobs::read).
     let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
     let nb_asymetric_processing_nodes: UINT = 1;

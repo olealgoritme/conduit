@@ -243,8 +243,17 @@ mod tests {
     fn a_reader_never_sees_a_torn_sample() {
         // The writer keeps every field equal to a running number; a reader that ever saw two
         // different values in one sample read a torn cell.
+        //
+        // The writer yields after each store, like the real one (a tick per period, not a write
+        // loop): a writer that rewrites the cell back to back makes nearly every read meet a
+        // write in flight, so the bounded reader misses by design and a fixed number of reads
+        // proves nothing about tearing. The reader runs until it has checked enough samples taken
+        // while the writer was running and has seen the cell change often enough (or a generous
+        // deadline), not for a fixed number of reads.
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
+        const WANT: u64 = 5_000;
+        const MOVED: u64 = 500;
         let c = Arc::new(Snap::new());
         let stop = Arc::new(AtomicBool::new(false));
         let w = {
@@ -254,23 +263,40 @@ mod tests {
                 while !stop.load(Ordering::Relaxed) {
                     assert!(c.write(&[n; FIELDS]));
                     n += 1;
+                    std::thread::yield_now();
                 }
-                n
+                n - 1
             })
         };
-        let mut seen = 0u64;
-        let mut last = 0u64;
-        for _ in 0..200_000 {
-            if let Some(s) = c.read() {
-                assert!(s.iter().all(|x| *x == s[0]), "torn: {s:?}");
-                assert!(s[0] >= last, "went back: {} after {last}", s[0]);
-                last = s[0];
-                seen += 1;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let (mut seen, mut missed, mut last, mut moved) = (0u64, 0u64, 0u64, 0u64);
+        let mut reads = 0u64;
+        while (seen < WANT || moved < MOVED) && std::time::Instant::now() < deadline {
+            reads += 1;
+            if reads % 64 == 0 {
+                // on one processor the writer only runs when the reader lets it
+                std::thread::yield_now();
+            }
+            match c.read() {
+                Some(s) => {
+                    assert!(s.iter().all(|x| *x == s[0]), "torn: {s:?}");
+                    assert!(s[0] >= last, "went back: {} after {last}", s[0]);
+                    if s[0] != last {
+                        moved += 1;
+                    }
+                    last = s[0];
+                    seen += 1;
+                }
+                None => missed += 1,
             }
         }
         stop.store(true, Ordering::Relaxed);
         let written = w.join().unwrap();
-        assert!(seen > 1000 && written > 1, "{seen} {written}");
+        // the reads raced the writes: the writer stored many samples and the reader saw it move
+        assert!(seen >= WANT, "only {seen} good reads ({missed} misses, {written} written)");
+        assert!(moved >= MOVED && written >= moved, "{moved} {written}");
+        // and once the writer is gone the cell holds its last sample, whole
+        assert_eq!(c.read(), Some([written; FIELDS]));
     }
 
     #[test]

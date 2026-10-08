@@ -40,6 +40,10 @@ stress and fallback checks are signed off (see the plan).
 
 ## Where the windowed frame time goes now (the next target)
 
+Per-stage budget of every frame, both present paths, guest and host on one
+clock: [frame stage timing](TRACING.md#frame-stage-timing) (`StageTrace=1`
+in the guest driver, then `stages.sh VM`). The numbers below predate it.
+
 With guest blobs and async Blt the KMD is no longer the cost, but Heaven still
 spends ~1.8 ms in `Present` per frame (interval 4.4 ms). A DxgKrnl ETW trace of
 the same path shows the app thread waiting in dxgkrnl
@@ -66,6 +70,8 @@ Levers, most promising first:
 2. **Host round-trip latency**: measure in the backend/renderer kick →
    vkQueueSubmit → fence → used-ring + interrupt; 0.3-0.8 ms of the round trip
    is overhead beyond the 0.2 ms copy (thread hops, fence-wait thread, irqfd).
+   Measured per frame by frame stage timing (`conduit trace NAME stages`,
+   `guest/windows/ci/vmtest/stages.sh`; [TRACING.md](TRACING.md#frame-stage-timing)).
 3. **MSI-X** instead of INTx for the device (branch `kmd/msix-default`,
    [msi-interrupts.md](../guest/windows/docs/msi-interrupts.md)): cuts
    interrupt-to-DPC time on every completion and every RM call (~55 µs per RM

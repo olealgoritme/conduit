@@ -266,6 +266,10 @@ fn writer(rx: Receiver<Record>, subs_rx: Receiver<Sink>, mut file: Option<Sink>)
 ///   reader hangs up. `stream json` -- the same as JSON Lines.
 /// * `status` -- one line saying what is being traced.
 /// * `file on` / `file off` -- resume or pause the `--trace` file.
+/// * `stages on` / `stages off` / `stages status` -- frame stage timing
+///   (`crate::stage`); `stages dump` -- every stamp since the last dump, as
+///   a binary dump (`conduit_venus::stage::encode_dump`), then the
+///   connection closes.
 fn control(listener: UnixListener, subs: Sender<Sink>) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -316,8 +320,30 @@ fn serve_control(conn: UnixStream, subs: &Sender<Sink>) -> io::Result<()> {
             FILE_REQUEST.store(if *on == "on" { 1 } else { 2 }, Relaxed);
             reply("ok\n".into())
         }
+        ["stages", what @ ("on" | "off" | "status" | "dump")] => stages(&conn, what),
         _ => reply(format!("unknown command {:?}\n", line.trim())),
     }
+}
+
+/// `stages ...` on the control socket.
+#[cfg(feature = "venus")]
+fn stages(mut conn: &UnixStream, what: &str) -> io::Result<()> {
+    use crate::stage;
+    match what {
+        "on" | "off" => {
+            stage::set_on(what == "on");
+            log::info!("stage timing {what}");
+            conn.write_all(b"ok\n")
+        }
+        "status" => conn
+            .write_all(format!("stages {}\n", if stage::on() { "on" } else { "off" }).as_bytes()),
+        _ => conn.write_all(&stage::dump()),
+    }
+}
+
+#[cfg(not(feature = "venus"))]
+fn stages(mut conn: &UnixStream, _what: &str) -> io::Result<()> {
+    conn.write_all(b"unknown command: stage timing needs a backend built with Venus\n")
 }
 
 #[cfg(test)]

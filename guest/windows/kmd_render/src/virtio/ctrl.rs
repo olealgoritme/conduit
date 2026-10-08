@@ -66,7 +66,7 @@ use super::gpu::{
     OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
     CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_CALLS, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT,
     FENCE_WAIT_TABLE_FULL,
-    FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
+    FENCE_WAIT_TIMEOUTS, RING_POPS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::submit_stage::{self, measured};
@@ -226,7 +226,7 @@ pub(crate) fn sleep_ms(_passive: PassiveLevel, ms: u64) {
 /// 15.6 ms-granularity slice on the rare poll-hit, and correctness owns that
 /// trade.
 fn wait_block(
-    _passive: PassiveLevel,
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     block: &WaitBlockRef<'_>,
     total_ms: u64,
@@ -265,8 +265,21 @@ fn wait_block(
             return true;
         }
         bounded.expired(this_slice);
-        // Interrupt-loss tolerance: drain whatever completed.
-        let _ = adapter.with_virtio(|v| v.drain_used());
+        // Interrupt-loss tolerance: drain whatever completed. A drain that TOOK something is a
+        // "rescue": the completion was there and no interrupt (yet) had run the DPC for it. The
+        // count is taken inside the lock hold, so a pop by the DPC on another CPU is not
+        // mistaken for ours. In message mode a run of rescues with no interrupt between them
+        // is how a delivery that does not work is found (`virtio::msi::note_rescue`).
+        let rescued = adapter
+            .with_virtio(|v| {
+                let before = RING_POPS.load(Ordering::Relaxed);
+                v.drain_used();
+                RING_POPS.load(Ordering::Relaxed) != before
+            })
+            .unwrap_or(false);
+        if rescued {
+            super::msi::note_rescue(passive, adapter);
+        }
     }
 }
 
@@ -993,10 +1006,15 @@ pub fn ctx_destroy_within(
                 })
                 .unwrap_or(0)
         });
+        crate::ddi::dwm_restart::note_streams_finalized(finalized);
         if finalized != 0 {
             crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
             adapter.signal_hpd();
         }
+    } else {
+        // The host did not confirm: the stream slots this context closed stay `closing`, and the
+        // consumer claims they carry stay pinned (nothing retries). `DwCtxFail`, and the census.
+        crate::ddi::dwm_restart::note_ctx_destroy_failed();
     }
     result
 }
@@ -1046,10 +1064,14 @@ pub fn destroy_contexts_for_owner(
                     })
                     .unwrap_or(0)
             });
+            crate::ddi::dwm_restart::note_streams_finalized(finalized);
             if finalized != 0 {
                 crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
                 adapter.signal_hpd();
             }
+        } else {
+            // As in `ctx_destroy_within`: unconfirmed, nothing retries.
+            crate::ddi::dwm_restart::note_ctx_destroy_failed();
         }
         destroyed += 1;
     }
@@ -2672,6 +2694,11 @@ pub fn submit_venus_async_scanout(
 
 /// Nonblocking KMD Present-BLT submission.
 ///
+/// `ring_idx` is the ring of the queue the copy's command buffer is submitted to: 1 (family 0,
+/// every copy before `CopyQueue`) or `copy_queue::COPY_RING_IDX` (the transfer queue). The
+/// host's wire fence for a ring is an empty submit on that ring's queue, so only the copy's own
+/// ring orders the fence after it; retirement is per command, so nothing else changes.
+///
 /// Like the scanout copy path, ring_idx=1 makes used-ring retirement represent
 /// GPU completion. Unlike scanout, an ordinary app/DWM BLT must not mark the
 /// physical scanout dirty or wake the display refresh worker. Every tagged
@@ -2684,7 +2711,11 @@ pub fn submit_venus_async_present(
     ctx_id: u32,
     stream: &[u8],
     present_buffer_write: Option<u32>,
+    ring_idx: u32,
 ) -> Result<u64, VirtioError> {
+    if ring_idx == 0 {
+        return Err(VirtioError::DeviceError);
+    }
     measured(Path::Present, |clock| {
         let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
 
@@ -2696,7 +2727,7 @@ pub fn submit_venus_async_present(
             match present_buffer_write {
                 Some(resource_id) => v.enqueue_async_submit_present_buffer(
                     ctx_id,
-                    crate::virtio::gpu::SCANOUT_RING_IDX,
+                    ring_idx,
                     meta,
                     venus,
                     venus_len,
@@ -2704,7 +2735,7 @@ pub fn submit_venus_async_present(
                 ),
                 None => v.enqueue_async_submit(
                     ctx_id,
-                    crate::virtio::gpu::SCANOUT_RING_IDX,
+                    ring_idx,
                     meta,
                     venus,
                     venus_len,
@@ -2738,7 +2769,11 @@ pub fn submit_venus_async_blt(
     stream: &[u8],
     resource_id: u32,
     source_id: u32,
+    ring_idx: u32,
 ) -> Result<BltSubmit, VirtioError> {
+    if ring_idx == 0 {
+        return Err(VirtioError::DeviceError);
+    }
     measured(Path::Blt, |clock| {
         let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
         let queued = display_enqueue(passive, adapter, Path::Blt, clock, move |v| {
@@ -2750,6 +2785,7 @@ pub fn submit_venus_async_blt(
                 venus_len,
                 resource_id,
                 source_id,
+                ring_idx,
             )
         });
         match queued {
@@ -2831,7 +2867,11 @@ pub fn submit_venus_async_windowed_blt(
     stream: &[u8],
     token: u64,
     stream_boundary: u64,
+    ring_idx: u32,
 ) -> Result<u64, VirtioError> {
+    if ring_idx == 0 {
+        return Err(VirtioError::DeviceError);
+    }
     measured(Path::Windowed, |clock| {
         let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream, clock)?;
         display_submit_outcome(display_enqueue(passive, adapter, Path::Windowed, clock, move |v| {
@@ -2843,6 +2883,7 @@ pub fn submit_venus_async_windowed_blt(
                 venus_len,
                 token,
                 stream_boundary,
+                ring_idx,
             )
         }))
     })
