@@ -781,10 +781,15 @@ pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     }
     let (_, k1, w1, h1, a1, f1) = resource_summary(resource1);
     let (_, k2, w2, h2, a2, f2) = resource_summary(resource2);
-    let same = k1 == "tex2d" && k2 == "tex2d" && w1 == w2 && h1 == h2 && f1 == f2 && w1 != 0;
+    // Size: the KMD has no scaler, so the application's buffer must have DWM's primary's extent
+    // (the mode). Format: equal, or (except with 4, the 393.1 rule) two 8-bit scan-out formats,
+    // so an R8G8B8A8 game on the B8G8R8A8 desktop can be promoted.
+    let same_size = k1 == "tex2d" && k2 == "tex2d" && w1 == w2 && h1 == h2 && w1 != 0;
+    let formats_ok = helios_umd_common::format::direct_flip_formats_compatible(f1, f2, mode == 4);
+    let same = same_size && formats_ok;
     let (answer, why) = match mode {
         0 => (false, "DirectFlipSupport=0"),
-        1 | 3 if !kmd_reports_direct_flip() => (false, "dxgkrnl reports no DirectFlip"),
+        1 | 3 | 4 if !kmd_reports_direct_flip() => (false, "dxgkrnl reports no DirectFlip"),
         // 3: resource1 (the app's) must be able to replace resource2 (DWM's primary) on scan-out
         // as is, in a layout the KMD can flip (the stricter rule; it was 1 in driver 388.1, the
         // build whose run never promoted, so 1 is back to the rule measured promoting).
@@ -792,10 +797,12 @@ pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
             Ok(()) => (true, "same scan-out layout"),
             Err(why) => (false, why),
         },
-        // 1 (what promoted in docs/independent-flip.md 11.6) and 2 (the test lever, no dxgkrnl
-        // query): same size and format.
-        _ if same => (true, "same size and format"),
-        _ => (false, "size or format differ"),
+        // 1 (the default; 11.6's rule with scan-out-compatible formats), 4 (11.6's rule as
+        // measured: the same format) and 2 (the test lever, no dxgkrnl query): same size and a
+        // compatible format.
+        _ if same => (true, "same size, scan-out compatible format"),
+        _ if !same_size => (false, "size differs (no scaler: the buffer must cover the mode)"),
+        _ => (false, "formats not scan-out compatible"),
     };
     if !supported.is_null() {
         *supported = answer as ddi::BOOL;
@@ -821,11 +828,12 @@ static D3D11_1_DIRECT_FLIP_ASKED: core::sync::atomic::AtomicUsize =
 /// B8G8R8A8_UNORM, B8G8R8X8_UNORM. sRGB-typed aliases, 10-bit and fp16 are refused there
 /// (`docs/independent-flip.md` 2.4), and a promoted chain the KMD refuses would freeze on its
 /// last frame, so the UMD does not offer them.
-const SCANOUT_DXGI_FORMATS: [u32; 3] = [28, 87, 88];
+const SCANOUT_DXGI_FORMATS: [u32; 3] = helios_umd_common::format::SCANOUT_DXGI_FORMATS;
 
 /// Whether the application's swap-chain buffer `app` can replace DWM's `dwm` on the scan-out
 /// with no conversion: both single-sample, single-mip, single-slice 2-D textures of the same
-/// extent and the same scan-out format. DWM's buffer has the display mode's extent, so this is
+/// extent, in 8-bit scan-out formats (equal, or e.g. R8G8B8A8 against B8G8R8A8: the KMD flips
+/// each buffer in its own format). DWM's buffer has the display mode's extent, so this is
 /// also "the application covers the output at the mode" (there is no scaler: the KMD flips
 /// only a buffer of the mode's extent). `Err` names the first mismatch, for the log.
 unsafe fn scanout_pair_compatible(
@@ -845,11 +853,15 @@ unsafe fn scanout_pair_compatible(
     if a.Width == 0 || a.Width != d.Width || a.Height != d.Height {
         return Err("extent differs");
     }
-    if a.Format != d.Format {
-        return Err("format differs");
-    }
     if !SCANOUT_DXGI_FORMATS.contains(&(a.Format.0 as u32)) {
         return Err("not a scan-out format");
+    }
+    if !helios_umd_common::format::direct_flip_formats_compatible(
+        a.Format.0 as u32,
+        d.Format.0 as u32,
+        false,
+    ) {
+        return Err("format differs");
     }
     if a.SampleDesc.Count != 1 || d.SampleDesc.Count != 1 {
         return Err("multisampled");
