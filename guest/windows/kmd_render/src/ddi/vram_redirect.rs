@@ -80,6 +80,12 @@ static SYNC_WHY: AtomicU32 = AtomicU32::new(0);
 /// Every Present's marker stash as `DxgkDdiPresent` found it (`RvMkNone`: empty, `RvMkRes`: an
 /// RM fence attached at Render, `RvMkStr`: a stream point), and VRAM Blts that reached the route
 /// with no boundary (`RvMkVramNo`).
+/// Every 64th synchronous copy, the pixel at the centre of its destination rectangle read back
+/// after the copy (`RvSyPix`, the last one), how many were sampled (`RvSyPixN`) and how many were
+/// not 0 (`RvSyPixNz`): whether the copy wrote the window's content or zeros.
+static PIX: AtomicU32 = AtomicU32::new(0);
+static PIX_N: AtomicU32 = AtomicU32::new(0);
+static PIX_NZ: AtomicU32 = AtomicU32::new(0);
 static MK_NONE: AtomicU32 = AtomicU32::new(0);
 static MK_RES: AtomicU32 = AtomicU32::new(0);
 static MK_STR: AtomicU32 = AtomicU32::new(0);
@@ -177,6 +183,9 @@ fn publish() {
     rec(b"RvRtWhy", RT_WHY.load(Ordering::Relaxed));
     rec(b"RvSyncTry", SYNC_TRY.load(Ordering::Relaxed));
     rec(b"RvSyncWhy", SYNC_WHY.load(Ordering::Relaxed));
+    rec(b"RvSyPix", PIX.load(Ordering::Relaxed));
+    rec(b"RvSyPixN", PIX_N.load(Ordering::Relaxed));
+    rec(b"RvSyPixNz", PIX_NZ.load(Ordering::Relaxed));
     rec(b"RvMkNone", MK_NONE.load(Ordering::Relaxed));
     rec(b"RvMkRes", MK_RES.load(Ordering::Relaxed));
     rec(b"RvMkStr", MK_STR.load(Ordering::Relaxed));
@@ -468,6 +477,35 @@ fn sync_foreign(
     T_WT.add_since(t);
     if !done {
         return fail(4, 0);
+    }
+    if SYNC_TRY.load(Ordering::Relaxed) % 64 == 1 {
+        let x = (dst_rect.left + dst_rect.right) / 2;
+        let y = (dst_rect.top + dst_rect.bottom) / 2;
+        let mut px = [0u8; 4];
+        let one = Rect {
+            left: x,
+            top: y,
+            right: x + 1,
+            bottom: y + 1,
+        };
+        if ce_vram::transfer(
+            passive,
+            adapter,
+            destination,
+            one,
+            Dir::Readback,
+            &mut px,
+            4,
+        )
+        .is_ok()
+        {
+            let v = u32::from_le_bytes(px);
+            PIX.store(v, Ordering::Relaxed);
+            PIX_N.fetch_add(1, Ordering::Relaxed);
+            if v & 0x00ff_ffff != 0 {
+                PIX_NZ.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
     true
 }
