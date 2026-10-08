@@ -327,7 +327,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -436,6 +436,8 @@ pub(crate) fn publish_counters() {
         w(name, s.load(Ordering::Relaxed));
     }
     w(b"GdiPrbK", PRB_K.load(Ordering::Relaxed));
+    w(b"GdiSrcScan", SRC_SCAN.load(Ordering::Relaxed));
+    w(b"GdiSrcScanK", SRC_SCAN_K.load(Ordering::Relaxed));
     const PRE_NAMES: [&[u8]; 4] = [b"GdiPre0", b"GdiPre1", b"GdiPre2", b"GdiPre3"];
     for (name, s) in PRE_NAMES.iter().zip(PRE.iter()) {
         w(name, s.load(Ordering::Relaxed));
@@ -998,6 +1000,36 @@ static PRB_K: AtomicU32 = AtomicU32::new(0);
 /// The first command into each of the first 4 GPU destinations, BEFORE it runs: resource id << 16
 /// | magenta pixels (the `RvOff` 0x2000 clear) << 8 | RGB-0 pixels, of a row of up to 64 pixels.
 static PRE: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+/// When a probed source row is all RGB 0: the whole source surface, 16 evenly spaced rows across
+/// its full width. Sources scanned | sources with any non-zero pixel << 10 (each to 1023), and the
+/// last scan: resource id << 16 | non-zero rows (of 16) << 8 | source GDI type. Non-zero elsewhere
+/// means the command's rectangle points at an empty part (offset or pitch); all zero means the
+/// surface holds nothing when the command runs.
+static SRC_SCAN: AtomicU32 = AtomicU32::new(0);
+static SRC_SCAN_K: AtomicU32 = AtomicU32::new(0);
+
+fn scan_source(passive: PassiveLevel, adapter: &AdapterContext, src: &Surface, cmd_pitch: u32) {
+    if src.width == 0 || src.height == 0 {
+        return;
+    }
+    let mut rows_nonzero = 0u32;
+    for k in 0..16u32 {
+        let y = (src.height as u64 * k as u64 / 16) as i32;
+        let w = src.width.min(4096) as i32;
+        let Ok(row) = read_window(passive, adapter, src, &Rect::new(0, y, w, y + 1), pitch_of(src, cmd_pitch)) else {
+            continue;
+        };
+        if !all_rgb_zero(&row) {
+            rows_nonzero += 1;
+        }
+    }
+    let _ = SRC_SCAN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let n = ((v & 0x3ff) + 1).min(0x3ff);
+        let nz = ((v >> 10 & 0x3ff) + u32::from(rows_nonzero != 0)).min(0x3ff);
+        Some(n | nz << 10)
+    });
+    SRC_SCAN_K.store((src.resource_id & 0xffff) << 16 | rows_nonzero << 8 | (src.kind_bits & 0xf), Ordering::Relaxed);
+}
 
 /// One row of up to 64 pixels through the middle of `sub` on `s` (surface coordinates).
 fn probe_row(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, sub: &Rect, cmd_pitch: u32) -> Option<Vec<u8>> {
@@ -1057,6 +1089,11 @@ fn probe_after(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
         (Some(src), Some(sw)) => probe_row(passive, adapter, &src, &sw, spc).is_some_and(|r| all_rgb_zero(&r)),
         _ => false,
     };
+    if sz && SRC_SCAN.load(Ordering::Relaxed) & 0x3ff < 64 {
+        if let Some(src) = op.srcs[0] {
+            scan_source(passive, adapter, &src, spc);
+        }
+    }
     let add = 1 | u32::from(dz) << 10 | u32::from(sz) << 20;
     let _ = PRB[i].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         let f = |shift: u32| ((v >> shift) & 0x3ff) + ((add >> shift) & 0x3ff);
