@@ -22,6 +22,7 @@
 //! | `Umd12FormatCaps` | DWORD | `0` — `pfnCheckFormatSupport`'s encoding, as an A/B |
 //! | `Umd12FenceSignalDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnSignalFence` |
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
+//! | `Umd12PipelineLibrary` | DWORD | `true` — explicit `0` refuses pipeline libraries with `E_NOTIMPL` |
 //!
 //! ⭐ **`UmdD3D12` lands here at S5, and not one commit earlier.** A kill switch
 //! for a driver that cannot be reached kills nothing, so declaring it before
@@ -290,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 12] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -311,6 +312,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
         // S5 (NVK on RM). Appended.
         ("Nvk12EclSync", nvk12_ecl_sync()),
         ("Nvk12Present", nvk12_present_mode()),
+        // Appended.
+        ("Umd12PipelineLibrary", UMD12_PIPELINE_LIBRARY.get() as u32),
     ]
 }
 
@@ -364,4 +367,16 @@ pub(crate) fn foreign_import() -> bool {
     *CELL.get_or_init(|| {
         helios_umd_common::knobs::reg_dword(c"ForeignImport").is_some_and(|v| v != 0)
     })
+}
+
+/// `Umd12PipelineLibrary`: the six pipeline-library DDI slots forward to the
+/// engine's `ID3D12PipelineLibrary1` (`forward12::pso`). Absent = ON; explicit
+/// 0 = every slot refuses with `E_NOTIMPL`, the behaviour before the
+/// passthrough, which applications answer by creating PSOs directly.
+///
+/// ⚠ Read once per process.
+pub(crate) static UMD12_PIPELINE_LIBRARY: BoolKnob = BoolKnob::new(c"Umd12PipelineLibrary", true);
+
+pub(crate) fn umd12_pipeline_library() -> bool {
+    UMD12_PIPELINE_LIBRARY.get()
 }
