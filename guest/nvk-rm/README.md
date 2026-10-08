@@ -75,6 +75,7 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 18 | `nvk: NVK_CPU_STATE_TRACKING, read race closed and mixed paths kept safe` | the knob is one atomic word; the upstream VB/IB macro binds clear the CPU's record of the range and a full root table load updates the shadow, so taking either path at any time is safe. No method changes on the default path |
 | 19 | `nvk/rm: free memory and VAs only after the GPU work submitted before the free` | `NVK_RM_DEFER_FREE` (default on on Windows): every flush after an exec ends with a WFI release of a per-context retire counter; a memory or VA free that comes while submitted work is unfinished queues its RM unmap/free until that work has landed (reaped at exec, free and allocation; `NVK_RM_DEFER_FREE_MB`, default 2048, caps the pending bytes). Fixes CS2's Xid 31 FAULT_PDE (a 109 MiB buffer unmapped while shaders still wrote it). Log line at powers of two and a summary at device destruction |
 | 20 | `nvk/rm: a destroyed sync's semaphore slot is reused only after the GPU work` | a destroyed sync's semaphore slot goes back to the pool through 0019's deferred-free queue, so a release still in flight can't land in the next sync given the slot and complete its waits early |
+| 21 | `nvkmd: NVK_DEBUG=vm log names the calling thread` | the thread column of 0017's log is `t<id>(<name>)` with the GetThreadDescription name (dxvk-cs, dxvk-queue, ...), so a capture says which thread freed a memory object |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
