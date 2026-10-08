@@ -238,6 +238,8 @@ struct Payload {
     remap: cp::Remap,
     dst_pitch: u32,
     lines: u32,
+    /// Bytes from the destination's byte 0 to where the source's (0, 0) lands (`DstInfo::x/y`).
+    dst_offset: u64,
 }
 
 /// One destination: the pure record, the pin of its lease set while a descriptor may name it,
@@ -326,6 +328,11 @@ pub(crate) struct DstInfo {
     pub pitch: u32,
     pub dxgi_format: u32,
     pub alloc_size: u64,
+    /// Where the source's pixel (0, 0) lands in the destination (`DstRect` minus `SrcRect`): 0 for
+    /// a Blt into a standard buffer (which must then be the source's size); a window's client
+    /// offset for a Blt into a VRAM redirection surface, which also holds the non-client area.
+    pub x: u32,
+    pub y: u32,
 }
 
 /// The Blt arm's `BltAsync` branch, before `blt_async::try_async`: take the copy-engine route
@@ -537,7 +544,7 @@ fn push_of(p: &Payload, sem_va: u64, src_va: u64, dst_va: u64) -> (cp::Acquire, 
             // `ce_dup`'s source VA already includes the plan's offset (as the shadow mode uses it):
         // adding it again read `offset` bytes too far for a source with a nonzero offset.
         src_va,
-            dst_va,
+            dst_va: dst_va + p.dst_offset,
             src_pitch: p.rec.record.source.pitch,
             dst_pitch: p.dst_pitch,
             line_bytes: p.plan.line_bytes,
@@ -711,7 +718,7 @@ fn decide_present(
         }
     }
     let plan = match view.gen {
-        Some(gen) if view.up => source_facts(gen, &rec, dst),
+        Some(gen) if view.up => source_facts(gen, &rec, dst, vram),
         _ => Err(Why::ChannelDown),
     };
     let destination_ok = if vram {
@@ -749,7 +756,8 @@ fn decide_present(
             plan,
             remap,
             dst_pitch: dst.pitch,
-            lines: dst.height,
+            lines: rec.record.source.height,
+            dst_offset: u64::from(dst.y) * u64::from(dst.pitch) + u64::from(dst.x) * 4,
         },
         boundary,
     ))
@@ -760,6 +768,7 @@ fn source_facts(
     gen: cp::Gen,
     rec: &StashedCeRecord,
     dst: DstInfo,
+    vram: bool,
 ) -> Result<(SourcePlan, cp::Remap), Why> {
     let s = rec.record.source;
     let desc = SourceDesc {
@@ -775,7 +784,18 @@ fn source_facts(
     let plan = cp::source_plan(gen, &desc).map_err(|_| Why::Source)?;
     let dst_fourcc = cp::dst_fourcc_for_dxgi(dst.dxgi_format).ok_or(Why::Format)?;
     let remap = cp::remap_for(s.fourcc, dst_fourcc).map_err(|_| Why::Format)?;
-    if s.width != dst.width || s.height != dst.height || plan.line_bytes > dst.pitch {
+    // A standard buffer takes exactly the source's size at (0, 0). A VRAM window surface takes the
+    // whole source at (x, y) inside it (381.1: Heaven's 1600x900 frames into its window's larger
+    // surface were all `Extent`).
+    let fits = if vram {
+        s.width.checked_add(dst.x).is_some_and(|w| w <= dst.width)
+            && s.height.checked_add(dst.y).is_some_and(|h| h <= dst.height)
+            && u64::from(plan.line_bytes) + u64::from(dst.x) * 4 <= u64::from(dst.pitch)
+    } else {
+        dst.x == 0 && dst.y == 0 && s.width == dst.width && s.height == dst.height
+            && plan.line_bytes <= dst.pitch
+    };
+    if !fits {
         return Err(Why::Extent);
     }
     Ok((plan, remap))
@@ -894,7 +914,7 @@ pub(crate) fn dispatch(adapter: &AdapterContext, token: u64, boundary: u64) -> b
         // `ce_dup`'s source VA already includes the plan's offset (as the shadow mode uses it):
         // adding it again read `offset` bytes too far for a source with a nonzero offset.
         src_va,
-        dst_va,
+        dst_va: dst_va + p.dst_offset,
         src_pitch: p.rec.record.source.pitch,
         dst_pitch: p.dst_pitch,
         line_bytes: p.plan.line_bytes,
