@@ -399,7 +399,15 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // `ddi/present_packet.rs`'s `PresentFlipPrivate` implements the DMA-buffer
     // contract instead, which is the one designed for exactly this hardware.
     let flip_caps: UINT = knobs.flip_caps().reported;
-    let scheduling_caps: UINT = SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
+    // `HwQueuePktCap`: DXGK_VIDSCHCAPS::HwQueuePacketCap, bits 7..10 (after
+    // No64BitAtomics bit 5 and LowIrqlPreemptCommand bit 6; WDK 10.0.26100
+    // d3dkmddi.h), the most DMA packets dxgkrnl queues to a node. 0 leaves the
+    // OS default. A WDDM 2.3+ field: with this driver's 2.1 DDI dxgkrnl may
+    // ignore it. No64BitAtomics stays 0: the GPU's semaphore releases are 64-bit.
+    let scheduling_caps: UINT = SCHEDULINGCAPS_MULTI_ENGINE_AWARE
+        | SCHEDULINGCAPS_PREEMPTION_AWARE
+        | ((knobs.hw_queue_packet_cap & 0xF) << 7);
+    crate::diag::record_named_bytes(b"HwQPktCapV", knobs.hw_queue_packet_cap & 0xF);
     out.set(caps_offset!(PresentationCaps), presentation_caps);
     out.set(caps_offset!(FlipCaps), flip_caps);
     // What was actually advertised, so a knob that silently read as its default

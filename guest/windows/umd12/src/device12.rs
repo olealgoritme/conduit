@@ -339,6 +339,14 @@ pub(crate) unsafe fn create_device(arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0
     // once L2 mints WDDM contexts and L4 honours `pReserveRanges`, and this is
     // where they go.
 
+    // Driver-backed fences, probe 1 (`Umd12FenceVaProbe`, default off): does a
+    // monitored fence on this adapter get a GPU virtual address?
+    if crate::knobs12::umd12_fence_va_probe() {
+        // SAFETY: the device written above, live; its callback table is the
+        // runtime's.
+        unsafe { crate::forward12::nvk12::probe_monitored_fence_va(&*device) };
+    }
+
     // ── 4. Hand it to the runtime ───────────────────────────────────────────
     guard.defuse();
     S_OK

@@ -807,6 +807,58 @@ impl NvkSync {
     }
 }
 
+/// Driver-backed fences, probe 1 (`Umd12FenceVaProbe`): create one monitored
+/// fence through the runtime's kernel callbacks, log the CPU and GPU virtual
+/// addresses dxgkrnl gives it, and destroy it. A GPU VA of 0 means this adapter
+/// does not map monitored fences into the GPU address space, so the D3D12
+/// runtime cannot hand fence placements to CreateFence (and so never calls
+/// pfnSignalFence / pfnWaitForFence); a nonzero one moves the question to what
+/// the runtime itself requires.
+///
+/// # Safety
+/// `dev` is a live device.
+pub(crate) unsafe fn probe_monitored_fence_va(dev: &device12::HeliosD3D12Device) {
+    if dev.kt_callbacks.is_null() {
+        return;
+    }
+    // SAFETY: the device keeps its runtime-owned callback table alive.
+    let kt = unsafe { &*dev.kt_callbacks };
+    let (Some(create_cb), Some(destroy_cb)) =
+        (kt.pfnCreateSynchronizationObject2Cb, kt.pfnDestroySynchronizationObjectCb)
+    else {
+        log_error!("Fence VA probe: no CreateSynchronizationObject2 / Destroy callback");
+        return;
+    };
+    // SAFETY: zero is valid for this plain C struct.
+    let mut args: ddi12::D3DDDICB_CREATESYNCHRONIZATIONOBJECT2 = unsafe { core::mem::zeroed() };
+    args.Info.Type = ddi12::_D3DDDI_SYNCHRONIZATIONOBJECT_TYPE_D3DDDI_MONITORED_FENCE;
+    // SAFETY: runtime callback, runtime device handle, live args.
+    let hr = unsafe { create_cb(dev.h_rt_device.handle, &mut args) };
+    // SAFETY: the monitored-fence arm, filled by the callback on success.
+    let (cpu, gpu) = unsafe {
+        (
+            args.Info.__bindgen_anon_1.MonitoredFence.FenceValueCPUVirtualAddress,
+            args.Info.__bindgen_anon_1.MonitoredFence.FenceValueGPUVirtualAddress,
+        )
+    };
+    log_error!(
+        "Fence VA probe: CreateSynchronizationObject2(monitored fence) hr={:#010x} handle={:#x} \
+         CPU VA {:p} GPU VA {:#x}{}",
+        hr as u32,
+        args.hSyncObject,
+        cpu,
+        gpu,
+        if gpu == 0 { " -- no GPU mapping: the runtime cannot place D3D12 fences" } else { "" },
+    );
+    if hr >= 0 && args.hSyncObject != 0 {
+        // SAFETY: zero is valid for this plain C struct.
+        let mut d: ddi12::D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT = unsafe { core::mem::zeroed() };
+        d.hSyncObject = args.hSyncObject;
+        // SAFETY: runtime callback, runtime device, the object created above.
+        let _ = unsafe { destroy_cb(dev.h_rt_device.handle, &d) };
+    }
+}
+
 impl FenceArm {
     unsafe fn create(dev: &device12::HeliosD3D12Device, engine_queue: usize) -> Option<Self> {
         if dev.kt_callbacks.is_null() {
@@ -841,7 +893,14 @@ impl FenceArm {
             .name("helios-nvk12-ecl".into())
             .spawn(move || worker_main(engine_queue, target, rx, worker_stop))
             .ok()?;
-        log_error!("NVK ECL sync: monitored fence {:#x}, worker started", target.fence);
+        log_error!(
+            "NVK ECL sync: monitored fence {:#x} (CPU VA {:p}, GPU VA {:#x}), worker started",
+            target.fence,
+            // SAFETY: the union arm CreateSynchronizationObject2 filled for a
+            // monitored fence.
+            unsafe { args.Info.__bindgen_anon_1.MonitoredFence.FenceValueCPUVirtualAddress },
+            unsafe { args.Info.__bindgen_anon_1.MonitoredFence.FenceValueGPUVirtualAddress },
+        );
         Some(Self {
             target,
             tx: Mutex::new(Some(tx)),

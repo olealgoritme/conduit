@@ -1413,6 +1413,11 @@ pub mod knobs {
     /// presents, paging): `virtio::gpu::MAX_WDDM_NODES`. Read with the other adapter knobs at
     /// AddAdapter; the node count dxgkrnl got then is kept until the adapter restarts.
     pub const D3D12_NODE: KnobName = KnobName::new(b"D3d12Node");
+    /// `HwQueuePktCap` (default 0 = the OS default): `DXGK_VIDSCHCAPS::HwQueuePacketCap`, the
+    /// most DMA packets dxgkrnl queues to a node at once (4 bits, 1..15). The field exists from
+    /// the WDDM 2.3 DDI on; this driver declares 2.1 (`WddmSurface`), so dxgkrnl may ignore it
+    /// there. Read with the other adapter knobs at AddAdapter; mirrored as `HwQPktCapV`.
+    pub const HW_QUEUE_PACKET_CAP: KnobName = KnobName::new(b"HwQueuePktCap");
     /// `IdfRedirSkip` (default 0; `helios_kmd_logic::independent_flip::KNOB_REDIR_SKIP`): with
     /// `IndepFlip` on, a Present carrying `RedirectedFlip` on the Blt arm completes with no copy.
     /// An experiment (docs/independent-flip.md 13.5). Read at StartDevice; counted `IdfRedSkip`.

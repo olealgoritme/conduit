@@ -260,6 +260,8 @@ pub(crate) struct AdapterKnobs {
     pub gdi_rm_copy_engine: u32,
     /// `D3d12Node` (default off): report a second 3D node for D3D12 contexts.
     pub d3d12_node: bool,
+    /// `HwQueuePktCap` (default 0, the OS default): `HwQueuePacketCap`, clamped to 15.
+    pub hw_queue_packet_cap: u32,
 }
 
 impl AdapterKnobs {
@@ -296,6 +298,7 @@ impl AdapterKnobs {
         gdi_redir_vram: 0,
         gdi_rm_copy_engine: 0,
         d3d12_node: false,
+        hw_queue_packet_cap: 0,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -347,6 +350,7 @@ impl AdapterKnobs {
             gdi_redir_vram: read_config_dword(knobs::REDIR_VRAM, 0),
             gdi_rm_copy_engine: read_config_dword(knobs::RM_COPY_ENGINE, 0),
             d3d12_node: read_config_dword(knobs::D3D12_NODE, 0) != 0,
+            hw_queue_packet_cap: read_config_dword(knobs::HW_QUEUE_PACKET_CAP, 0).min(15),
         }
     }
 
