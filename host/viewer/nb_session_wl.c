@@ -616,6 +616,13 @@ struct nb_wl {
     int       gc_lhx, gc_lhy;   /* ...and in surface (logical) pixels      */
     int       gc_k1000;         /* scale it was laid out at, x1000         */
     uint32_t  gc_gen;
+    /* Stall evidence (logged, see nb_stall_*): pointer motion events, the
+     * compositor's presentation feedback, commits since the last one. */
+    uint64_t  mo_last;          /* last wl_pointer.motion, CLOCK_MONOTONIC */
+    unsigned  mo_streak;        /* consecutive motions < 25 ms apart       */
+    uint64_t  pr_last;          /* last presented/discarded feedback       */
+    unsigned  cm_since_pr;      /* commits since that feedback             */
+    uint64_t  stall_log_ns;     /* rate limit: one stall line a second     */
     uint64_t  gc_tick;
     bool      gc_told_fail;
 };
@@ -725,6 +732,63 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
     w->st_sp_sum = 0; w->st_sp_n = 0;
 }
 
+/*
+ * Stall evidence, logged at most once a second.  The host compositor moves
+ * the pointer and shows the guest's cursor image (wl_pointer.set_cursor), so a
+ * frozen cursor while the user moves the mouse means the compositor (or the
+ * input path into it) stalled, not the guest: these say which.
+ *
+ *  - pointer: motion events stopped for over 250 ms in the middle of a
+ *    movement (8+ motions < 25 ms apart just before), i.e. events queued
+ *    somewhere and arrived late, or the compositor did not run;
+ *  - compositor: no presentation feedback for over 250 ms although frames
+ *    were committed: it is not presenting (a fence it waits on, a stuck
+ *    commit), which also holds a hardware cursor plane on many compositors.
+ */
+static bool nb_stall_may_log(struct nb_wl *w, uint64_t now)
+{
+    if (w->stall_log_ns && now - w->stall_log_ns < 1000000000ull) {
+        return false;
+    }
+    w->stall_log_ns = now;
+    return true;
+}
+
+static void nb_stall_motion(struct nb_wl *w)
+{
+    uint64_t now = nb_mono_ns();
+
+    if (w->mo_last) {
+        uint64_t gap = now - w->mo_last;
+
+        if (gap > 250000000ull && w->mo_streak >= 8 && nb_stall_may_log(w, now)) {
+            nb_log("stall: pointer motion stopped for %llu ms in the middle of a "
+                   "movement (last presentation feedback %llu ms ago, %u commits "
+                   "since)",
+                   (unsigned long long)(gap / 1000000),
+                   w->pr_last ? (unsigned long long)((now - w->pr_last) / 1000000)
+                              : 0ull,
+                   w->cm_since_pr);
+        }
+        w->mo_streak = gap < 25000000ull ? w->mo_streak + 1 : 0;
+    }
+    w->mo_last = now;
+}
+
+static void nb_stall_feedback(struct nb_wl *w)
+{
+    uint64_t now = nb_mono_ns();
+
+    if (w->pr_last && now - w->pr_last > 250000000ull && w->cm_since_pr > 1 &&
+        nb_stall_may_log(w, now)) {
+        nb_log("stall: the compositor gave no presentation feedback for %llu ms "
+               "with %u frames committed meanwhile",
+               (unsigned long long)((now - w->pr_last) / 1000000), w->cm_since_pr);
+    }
+    w->pr_last = now;
+    w->cm_since_pr = 0;
+}
+
 static void nb_stats_commit(struct nb_wl *w, const struct nb_wl_buf *sl)
 {
     uint64_t now = nb_mono_ns();
@@ -734,6 +798,7 @@ static void nb_stats_commit(struct nb_wl *w, const struct nb_wl_buf *sl)
         w->pc_last = NULL;
     }
     w->st_commits++;
+    w->cm_since_pr++;
     if (sl->recv_ns && now >= sl->recv_ns) {
         uint64_t d = now - sl->recv_ns;
 
@@ -3392,6 +3457,7 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
 {
     struct nb_wl *w = d;
     (void)p; (void)t;
+    nb_stall_motion(w);
     if (w->bd_hot >= 0) {
         return;                 /* chrome, not guest input */
     }
@@ -4153,6 +4219,7 @@ static void pres_discarded(void *d, struct wp_presentation_feedback *f)
 {
     struct nb_pres_ctx *pc = d;
 
+    nb_stall_feedback(pc->w);
     /* LATEST-FRAME-WINS, observed: a commit the compositor replaced with a
      * newer one before it ever reached the screen.  Nothing queued it. */
     if (pc->w->pc_last == pc) {
@@ -4177,6 +4244,7 @@ static void pres_presented(void *d, struct wp_presentation_feedback *f,
 
     (void)sh; (void)sl;
     wp_presentation_feedback_destroy(f);
+    nb_stall_feedback(w);
 
     /* virtio-nvgpu --stats: commit -> presented, and sender -> presented. */
     w->st_presented++;
@@ -4957,6 +5025,7 @@ static bool wl_hotkey(struct nb_session *s, unsigned code)
  */
 struct nb_gc_req {
     struct nb_wl *w;
+    uint64_t t_ns;              /* when the import was asked for */
     uint32_t gen;
     uint64_t id;
     uint32_t cw, ch, stride, offset;
@@ -5028,6 +5097,15 @@ static void gc_created(void *data, struct zwp_linux_buffer_params_v1 *params,
     uint64_t oldest = UINT64_MAX;
 
     zwp_linux_buffer_params_v1_destroy(params);
+    {
+        uint64_t now = nb_mono_ns();
+
+        if (r->t_ns && now - r->t_ns > 100000000ull) {
+            nb_log("stall: the guest cursor image took %llu ms to import "
+                   "(zwp_linux_dmabuf create -> created)",
+                   (unsigned long long)((now - r->t_ns) / 1000000));
+        }
+    }
     for (i = 0; i < 4; i++) {
         if (i == w->gc_cur) {
             continue;           /* never the one on screen */
@@ -5132,7 +5210,7 @@ static int wl_cursor(struct nb_session *s, const struct nb_buf_desc *d,
     *r = (struct nb_gc_req){
         .w = w, .gen = w->gc_gen, .id = d->id, .cw = d->width,
         .ch = d->height, .stride = d->stride, .offset = d->offset,
-        .mod = d->modifier, .hx = hx, .hy = hy,
+        .mod = d->modifier, .hx = hx, .hy = hy, .t_ns = nb_mono_ns(),
     };
     zwp_linux_buffer_params_v1_add(pp, d->fd, 0, d->offset, d->stride,
                                    (uint32_t)(d->modifier >> 32),

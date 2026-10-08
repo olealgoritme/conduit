@@ -680,6 +680,9 @@ extern int  nb_seq_usec;      /* cmd.seq carries the sender's CLOCK_MONOTONIC
                                * microseconds (low 32 bits) -- lets --stats
                                * report true send->commit latency            */
 uint64_t nb_mono_ns(void);
+/* Main-loop stall log (nvkvm_broker.c): one iteration's stage times. */
+void nb_stall_note(uint64_t t0, uint64_t t1, uint64_t t2, uint64_t t3,
+                   uint64_t t4, uint64_t t5);
 /* Does the connected client stamp seq with CLOCK_MONOTONIC microseconds?
  * Either configured (--seq-usec) or announced (CMD_CAPS SEQ_USEC). */
 bool nb_sink_seq_usec(const struct nb_sink *s);

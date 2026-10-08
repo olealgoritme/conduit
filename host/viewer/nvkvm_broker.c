@@ -842,6 +842,51 @@ static void nb_release_dropped(struct nb_sink *s, int fd, uint64_t id,
     nb_sink_release(s, id, seq);
 }
 
+/* ── main-loop stall log ───────────────────────────────────────────────── */
+
+/* An iteration that spends this long outside poll() is a stall: input, the
+ * guest's frames and the cursor all wait behind it. */
+#define NB_STALL_LOG_NS 100000000ull
+
+/*
+ * One main-loop iteration's time outside poll(), by stage: `t0` poll
+ * returned, then the client socket (read/flush), accept, the session's
+ * dispatch (display events, frame and cursor imports, commits) and the final
+ * flush, `t5` the end.  Logged when over NB_STALL_LOG_NS, at most once a
+ * second; the ones in between are counted.  Cheap: six clock reads an
+ * iteration, no allocation.
+ */
+void nb_stall_note(uint64_t t0, uint64_t t1, uint64_t t2, uint64_t t3,
+                   uint64_t t4, uint64_t t5)
+{
+    static uint64_t last_log, worst;
+    static unsigned suppressed;
+    uint64_t busy = t5 - t0;
+
+    if (busy < NB_STALL_LOG_NS) {
+        return;
+    }
+    if (busy > worst) {
+        worst = busy;
+    }
+    if (last_log && t5 - last_log < 1000000000ull) {
+        suppressed++;
+        return;
+    }
+    nb_log("stall: main loop busy %llu ms outside poll (wake %llu, client "
+           "%llu, accept %llu, dispatch %llu, flush %llu ms; worst so far "
+           "%llu ms, %u more since the last line)",
+           (unsigned long long)(busy / 1000000),
+           (unsigned long long)((t1 - t0) / 1000000),
+           (unsigned long long)((t2 - t1) / 1000000),
+           (unsigned long long)((t3 - t2) / 1000000),
+           (unsigned long long)((t4 - t3) / 1000000),
+           (unsigned long long)((t5 - t4) / 1000000),
+           (unsigned long long)(worst / 1000000), suppressed);
+    suppressed = 0;
+    last_log = t5;
+}
+
 /* ── clipboard ───────────────────────────────────────────────────────────── */
 
 /* Does this key, with the modifiers currently latched, mean "paste"? */
@@ -3663,6 +3708,11 @@ int main(int argc, char **argv)
 
     for (;;) {
         int n = 0, nsess, r, tmo;
+        /* Main-loop stall log: the time each iteration spends OUTSIDE poll(),
+         * by stage.  Nothing here may block; an iteration over
+         * NB_STALL_LOG_NS is logged with where the time went, at most once a
+         * second (suppressed ones are counted into the next line). */
+        uint64_t t_poll, t_client = 0, t_accept = 0, t_dispatch = 0, t_flush = 0;
 
         pfd[n].fd = sigfd;      pfd[n].events = POLLIN; pfd[n].revents = 0; n++;
         pfd[n].fd = listen_fd;  pfd[n].events = POLLIN; pfd[n].revents = 0; n++;
@@ -3688,6 +3738,7 @@ int main(int argc, char **argv)
             nb_err("poll: %s", strerror(errno));
             break;
         }
+        t_poll = nb_mono_ns();
 
         if (pfd[0].revents) {
             nb_log("signal received; shutting down");
@@ -3695,6 +3746,7 @@ int main(int argc, char **argv)
         }
 
         /* Client first, so a death is noticed before we queue more for it. */
+        t_client = nb_mono_ns();
         if (sink.client_fd >= 0) {
             struct pollfd *cp = &pfd[2];
 
@@ -3719,6 +3771,7 @@ int main(int argc, char **argv)
             }
         }
 
+        t_accept = nb_mono_ns();
         if (pfd[1].revents & POLLIN) {
             struct ucred cred;
             int cfd = accept4(listen_fd, NULL, NULL,
@@ -3748,6 +3801,7 @@ int main(int argc, char **argv)
             }
         }
 
+        t_dispatch = nb_mono_ns();
         r = sess->ops->dispatch(sess, &sink);
         if (r < 0) {
             nb_err("session dispatch failed: %s", strerror(-r));
@@ -3757,9 +3811,12 @@ int main(int argc, char **argv)
             nb_sink_detach(&sink, "the display went away");
             break;
         }
+        t_flush = nb_mono_ns();
         if (sink.client_fd >= 0 && nb_sink_flush(&sink) < 0) {
             nb_sink_detach(&sink, "write failed");
         }
+        nb_stall_note(t_poll, t_client, t_accept, t_dispatch, t_flush,
+                      nb_mono_ns());
 
         /*
          * THE ONE EXIT CHECK, AND IT HAS TO BE HERE.

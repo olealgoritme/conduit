@@ -119,7 +119,18 @@ impl Venus {
             seq: self.cursor_seq,
         };
         self.cursor = Some(id);
+        let t = std::time::Instant::now();
         link.cursor(Some(fd), &u);
+        // The display link never blocks (a full client socket owes the cursor instead); a slow
+        // hand-over here is evidence for a cursor that froze.
+        let took = t.elapsed();
+        if took > std::time::Duration::from_millis(20) {
+            log::warn!(
+                "venus: handing cursor {} to the display took {} ms",
+                self.cursor_seq,
+                took.as_millis()
+            );
+        }
         Ok(Reply::NoData)
     }
 

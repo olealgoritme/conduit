@@ -636,6 +636,11 @@ pub(crate) fn start_viewer(
         }
     }
     let log = logs.join("viewer.log");
+    // Keep the previous viewer's log: a problem seen in one session is usually reported after
+    // the viewer was restarted, and the start truncates the log.
+    if log.exists() {
+        let _ = std::fs::rename(&log, logs.join("viewer.log.prev"));
+    }
     let pid = sys::spawn_detached(&mut cmd, &log, false)?;
     sys::write_pid(&rt.p("viewer.pid"), pid)?;
     let pid = pid as i32;
