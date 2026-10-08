@@ -148,6 +148,97 @@ fn the_pointer_scales_to_the_framebuffer_with_a_button_mask() {
     assert_eq!(out, rfb::pointer_event(held, 799, 0));
 }
 
+#[test]
+fn a_batch_of_motion_is_one_position_owed_until_flushed() {
+    let size = Sizes::console((800, 600));
+    let mut e = InputEncoder::default();
+    let mut out = Vec::new();
+    let mut burst = Vec::new();
+    for i in 1..=500 {
+        burst.push(ev(input::EV_ABS, input::ABS_X, i * 32));
+        burst.push(ev(input::EV_ABS, input::ABS_Y, i * 16));
+        burst.push(syn());
+    }
+    e.events(&burst, size, true, &mut out);
+    assert!(out.is_empty(), "positions are owed, not queued");
+    assert!(e.motion_owed());
+    assert!(e.flush_motion(&mut out));
+    let (x, y) = (
+        InputEncoder::scale(500 * 32, 800),
+        InputEncoder::scale(500 * 16, 600),
+    );
+    assert_eq!(out, rfb::pointer_event(0, x, y), "only the newest position");
+    assert!(!e.motion_owed());
+    out.clear();
+    assert!(!e.flush_motion(&mut out));
+    assert!(out.is_empty());
+
+    // Relative motion accumulates the same way.
+    e.events(
+        &[
+            ev(input::EV_REL, input::REL_X, -3),
+            syn(),
+            ev(input::EV_REL, input::REL_X, -4),
+            syn(),
+        ],
+        size,
+        true,
+        &mut out,
+    );
+    assert!(out.is_empty());
+    e.flush_motion(&mut out);
+    assert_eq!(out, rfb::pointer_event(0, x - 7, y));
+}
+
+#[test]
+fn buttons_and_keys_go_after_the_position_they_were_made_at() {
+    let size = Sizes::console((800, 600));
+    let mut e = InputEncoder::default();
+    let mut out = Vec::new();
+    e.events(
+        &[
+            ev(input::EV_ABS, input::ABS_X, 0),
+            ev(input::EV_ABS, input::ABS_Y, 0),
+            syn(),
+            ev(input::EV_ABS, input::ABS_X, INPUT_ABS_MAX),
+            syn(),
+            ev(input::EV_KEY, BTN_LEFT, 1),
+            syn(),
+            ev(input::EV_ABS, input::ABS_Y, INPUT_ABS_MAX),
+            syn(),
+            ev(input::EV_KEY, 30, 1),
+            syn(),
+            ev(input::EV_ABS, input::ABS_X, 0),
+            syn(),
+        ],
+        size,
+        true,
+        &mut out,
+    );
+    let mut want = rfb::pointer_event(0, 799, 0).to_vec();
+    want.extend_from_slice(&rfb::pointer_event(MASK_LEFT, 799, 0));
+    want.extend_from_slice(&rfb::pointer_event(MASK_LEFT, 799, 599));
+    want.extend_from_slice(&rfb::qemu_key_event(true, 0x61, 0x1e));
+    assert_eq!(out, want);
+    // The last move is owed, with the button still held.
+    out.clear();
+    e.flush_motion(&mut out);
+    assert_eq!(out, rfb::pointer_event(MASK_LEFT, 0, 599));
+    // Letting go of everything sends an owed position first.
+    out.clear();
+    e.events(
+        &[ev(input::EV_ABS, input::ABS_X, INPUT_ABS_MAX), syn()],
+        size,
+        true,
+        &mut out,
+    );
+    e.release_all(true, &mut out);
+    let mut want = rfb::pointer_event(MASK_LEFT, 799, 599).to_vec();
+    want.extend_from_slice(&rfb::qemu_key_event(false, 0x61, 0x1e));
+    want.extend_from_slice(&rfb::pointer_event(0, 799, 599));
+    assert_eq!(out, want);
+}
+
 // -- a fake VNC server ------------------------------------------------------
 
 struct Server {
@@ -705,6 +796,49 @@ fn input_reaches_the_server_while_shown() {
     }
     assert_eq!(got[0], rfb::qemu_key_event(true, 0xffbf, 0x3c));
     assert_eq!(got[1], rfb::pointer_event(0, 99, 0));
+    drop(link);
+    console.stop();
+}
+
+/// A burst of motion reaches QEMU as the newest position, not as a backlog
+/// of every position on the way there.
+#[test]
+fn a_burst_of_motion_reaches_the_server_as_its_newest_position() {
+    let server = Server::new("burst");
+    let (link, _viewer, console) = setup(&server);
+    let mut c = server.accept(100, 50);
+    assert!(matches!(c.request(), Msg::Request { .. }));
+    c.update(&[(0, 0, 0, 0, rfb::ENC_QEMU_EXT_KEY, vec![])]);
+    std::thread::sleep(Duration::from_millis(30));
+    let sink: Arc<dyn ConsoleSink> = console.shared.clone();
+    let mut burst = Vec::new();
+    for i in 0..=1000 {
+        burst.push(ev(input::EV_ABS, input::ABS_X, i * (INPUT_ABS_MAX / 1000)));
+        burst.push(ev(input::EV_ABS, input::ABS_Y, 0));
+        burst.push(syn());
+    }
+    burst.push(ev(input::EV_KEY, 60, 1));
+    burst.push(syn());
+    sink.input(&burst);
+    let mut got = Vec::new();
+    let key = rfb::qemu_key_event(true, 0xffbf, 0x3c).to_vec();
+    while got.last() != Some(&key) {
+        if let Msg::Other(m) = c.msg() {
+            got.push(m);
+        }
+    }
+    assert_eq!(
+        got,
+        [
+            rfb::pointer_event(
+                0,
+                InputEncoder::scale(1000 * (INPUT_ABS_MAX / 1000), 100),
+                0
+            )
+            .to_vec(),
+            key
+        ]
+    );
     drop(link);
     console.stop();
 }

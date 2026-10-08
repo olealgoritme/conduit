@@ -107,6 +107,15 @@ pub type GuestProbe = Box<dyn FnMut() -> bool + Send>;
 /// picture is the console's or, for a guest that takes no Conduit input
 /// ([`crate::display::InputSink::takes_input`]), the guest's own frames at
 /// any size. Relative motion is in pixels of the picture shown.
+///
+/// Motion is coalesced in [`InputEncoder::events`]: a batch's positions
+/// collapse into the newest, which waits as `owed` until the worker sends
+/// it ([`InputEncoder::flush_motion`]) -- and the worker sends it only once
+/// QEMU has read everything before it. A position is a level: the guest's
+/// tablet only ever reports the newest one, so older ones queued in front
+/// of it are latency and nothing else. Buttons, wheel and keys are never
+/// merged or dropped, and a position owed when one of them comes is sent
+/// first, so the order the user made them in is kept.
 #[derive(Default, Debug)]
 pub struct InputEncoder {
     held: BTreeSet<u16>,
@@ -117,6 +126,11 @@ pub struct InputEncoder {
     /// The framebuffer the last pointer message was encoded for.
     fb: (u16, u16),
     moved: bool,
+    /// A position the server has not been sent yet (coalesced motion).
+    owed: bool,
+    /// Inside [`InputEncoder::events`]: a SYN owes the position instead of
+    /// sending it.
+    defer: bool,
 }
 
 /// The sizes one event is encoded against.
@@ -178,15 +192,54 @@ impl InputEncoder {
         )
     }
 
-    fn pointer(&self, mask: u8, out: &mut Vec<u8>) {
+    fn pointer(&mut self, mask: u8, out: &mut Vec<u8>) {
         let (x, y) = self.position();
         out.extend_from_slice(&rfb::pointer_event(mask, x, y));
+        self.owed = false;
+    }
+
+    /// Whether a coalesced position is waiting for [`Self::flush_motion`].
+    pub fn motion_owed(&self) -> bool {
+        self.owed
+    }
+
+    /// Send the owed position, if any; returns whether one went.
+    pub fn flush_motion(&mut self, out: &mut Vec<u8>) -> bool {
+        if !self.owed {
+            return false;
+        }
+        self.pointer(self.buttons, out);
+        true
+    }
+
+    /// A batch of events, with its motion coalesced: what the batch moved
+    /// the pointer to is owed (see [`Self::flush_motion`]), not sent at each
+    /// SYN. Everything else is encoded as [`Self::event`] does.
+    pub fn events(
+        &mut self,
+        evs: &[InputEventEntry],
+        sizes: Sizes,
+        ext_key: bool,
+        out: &mut Vec<u8>,
+    ) {
+        self.defer = true;
+        for e in evs {
+            self.event(e, sizes, ext_key, out);
+        }
+        self.defer = false;
     }
 
     /// One event; `ext_key` is whether the server takes Extended Key Events.
     pub fn event(&mut self, e: &InputEventEntry, sizes: Sizes, ext_key: bool, out: &mut Vec<u8>) {
         self.fb = sizes.fb;
         let (vw, vh) = sizes.view;
+        let motion = matches!(e.ev_type, input::EV_ABS | input::EV_SYN)
+            || (e.ev_type == input::EV_REL && matches!(e.code, input::REL_X | input::REL_Y));
+        if self.owed && !motion {
+            // Whatever comes next lands after the position the user had
+            // reached when they made it.
+            self.flush_motion(out);
+        }
         match e.ev_type {
             input::EV_KEY => {
                 let down = e.value != 0;
@@ -252,7 +305,11 @@ impl InputEncoder {
                 _ => {}
             },
             input::EV_SYN if self.moved => {
-                self.pointer(self.buttons, out);
+                if self.defer {
+                    self.owed = true;
+                } else {
+                    self.pointer(self.buttons, out);
+                }
                 self.moved = false;
             }
             _ => {}
@@ -261,6 +318,7 @@ impl InputEncoder {
 
     /// Let go of every key and button held.
     pub fn release_all(&mut self, ext_key: bool, out: &mut Vec<u8>) {
+        self.flush_motion(out);
         for code in std::mem::take(&mut self.held) {
             Self::key(code, false, ext_key, out);
         }
@@ -723,8 +781,18 @@ impl Worker {
                 if !shown && let Some(view) = self.link.guest_picture_size() {
                     sizes.view = view;
                 }
-                for e in &events {
-                    self.enc.event(e, sizes, s.ext_key, &mut self.out);
+                self.enc.events(&events, sizes, s.ext_key, &mut self.out);
+            }
+            // The newest position goes only once QEMU has read everything
+            // before it. While its main loop is busy (a memory transaction,
+            // a stalled vCPU exit), positions must not pile up in `out` and
+            // the socket: each would be replayed in order afterwards, the
+            // pointer trailing the hand by the whole backlog. The one owed
+            // is sent when the socket drains (POLLOUT below).
+            if self.enc.motion_owed() {
+                self.flush(&mut s.sock)?;
+                if self.out.is_empty() {
+                    self.enc.flush_motion(&mut self.out);
                 }
             }
 
