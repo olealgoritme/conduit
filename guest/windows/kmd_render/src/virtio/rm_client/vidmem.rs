@@ -148,6 +148,10 @@ pub(crate) fn reset_for_start() {
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    for i in 0..NEW_RING {
+        NEW_RES[i].store(0, Ordering::Relaxed);
+        NEW_WH[i].store(0, Ordering::Relaxed);
+    }
     crate::diag::record_named_bytes(b"RvKnob", k);
     if rv::knob_on(k) {
         publish(true);
@@ -155,6 +159,13 @@ pub(crate) fn reset_for_start() {
 }
 
 /// Mirror the counters (PASSIVE), once the service was asked for something.
+/// The last 8 surfaces made (`RvNew0..7`: resource id, `RvNewWH0..7`: width << 16 | height,
+/// slot `n % 8` for the n-th): which resource ids are RM video memory, to match against what DWM
+/// imports and what the Present path writes (`RvDst*`).
+const NEW_RING: usize = 8;
+static NEW_RES: [AtomicU32; NEW_RING] = [const { AtomicU32::new(0) }; NEW_RING];
+static NEW_WH: [AtomicU32; NEW_RING] = [const { AtomicU32::new(0) }; NEW_RING];
+
 pub(crate) fn publish_counters() {
     publish(false);
 }
@@ -183,6 +194,19 @@ fn publish(always: bool) {
     rec(b"RvMsMax", MS_MAX.load(Ordering::Relaxed));
     rec(b"RvSoft", SOFT.load(Ordering::Relaxed));
     rec(b"RvLeak", LEAK.load(Ordering::Relaxed));
+    const NEW_NAMES: [&[u8]; NEW_RING] =
+        [b"RvNew0", b"RvNew1", b"RvNew2", b"RvNew3", b"RvNew4", b"RvNew5", b"RvNew6", b"RvNew7"];
+    const WH_NAMES: [&[u8]; NEW_RING] = [
+        b"RvNewWH0", b"RvNewWH1", b"RvNewWH2", b"RvNewWH3", b"RvNewWH4", b"RvNewWH5", b"RvNewWH6",
+        b"RvNewWH7",
+    ];
+    for i in 0..NEW_RING {
+        let r = NEW_RES[i].load(Ordering::Relaxed);
+        if r != 0 {
+            rec(NEW_NAMES[i], r);
+            rec(WH_NAMES[i], NEW_WH[i].load(Ordering::Relaxed));
+        }
+    }
     super::ce_vram::publish_counters();
 }
 
@@ -242,7 +266,9 @@ pub(crate) fn try_create(
     MS_MAX.fetch_max(ms, Ordering::Relaxed);
     let out = match r {
         Ok(c) => {
-            OK.fetch_add(1, Ordering::Relaxed);
+            let n = OK.fetch_add(1, Ordering::Relaxed) as usize;
+            NEW_RES[n % NEW_RING].store(c.resource_id, Ordering::Relaxed);
+            NEW_WH[n % NEW_RING].store(width << 16 | (height & 0xffff), Ordering::Relaxed);
             Some(c)
         }
         Err(why) => {
