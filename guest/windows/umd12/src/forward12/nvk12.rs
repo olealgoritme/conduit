@@ -254,6 +254,41 @@ fn log_ecl_fence_stats() {
     );
 }
 
+/// Where vkd3d's memory lives, one line per Vulkan memory type it used
+/// (`bridge12::memory_stats`).
+fn log_memory_placement() {
+    let Some(st) = crate::bridge12::memory_stats() else {
+        return;
+    };
+    const TYPES: usize = 32;
+    const CLASSES: [&str; 5] = ["DEFAULT", "UPLOAD", "READBACK", "HVV", "other"];
+    let mib = |b: u64| b / (1024 * 1024);
+    for t in 0..TYPES {
+        let info = st[TYPES + 2 * CLASSES.len() * TYPES + t];
+        if info >> 63 == 0 {
+            continue;
+        }
+        let mut classes = String::new();
+        for (c, name) in CLASSES.iter().enumerate() {
+            let bytes = st[TYPES + c * TYPES + t];
+            let count = st[TYPES + CLASSES.len() * TYPES + c * TYPES + t];
+            if count != 0 {
+                classes.push_str(&format!(" {name} {} MiB ({count})", mib(bytes)));
+            }
+        }
+        log_error!(
+            "vkd3d memory type {t} (heap {}, flags {:#x}): live {} MiB; allocated by request:{classes}",
+            (info >> 32) & 0x7fff_ffff,
+            info & 0xffff_ffff,
+            mib(st[t]),
+        );
+    }
+    log_error!(
+        "vkd3d memory: {} DEVICE_LOCAL requests got a type without DEVICE_LOCAL",
+        st[crate::bridge12::MEMORY_STATS_LEN - 1]
+    );
+}
+
 /// Frames per frame-accounting line.
 const FRAME_LOG_EVERY: u64 = 256;
 
@@ -457,6 +492,10 @@ impl FrameStats {
         drop(acc);
         window.log(&format!("last frames, {total_frames} so far"));
         log_ecl_fence_stats();
+        // After the first frame and every 2048 frames: placement barely moves.
+        if total_frames == 1 || total_frames % (8 * FRAME_LOG_EVERY) == 0 {
+            log_memory_placement();
+        }
     }
 
     /// The process totals, at device teardown.
@@ -465,6 +504,7 @@ impl FrameStats {
         if total.frames != 0 {
             total.log("totals");
             log_ecl_fence_stats();
+            log_memory_placement();
         }
     }
 }
