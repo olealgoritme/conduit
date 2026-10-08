@@ -321,24 +321,41 @@ fn host_features(adapter: &AdapterContext) -> Option<u32> {
 /// Whether `DXGK_DRIVERCAPS` reports the pointer (`query_driver_caps`). Any IRQL the caps query
 /// runs at (PASSIVE). Recorded, so the pointer DDIs follow what dxgkrnl was told.
 pub(crate) fn advertised(adapter: &AdapterContext) -> bool {
-    let knobs = adapter.knobs();
+    // 401.1: the one DRIVERCAPS query reported NO pointer (`CurCapRep` 2: host features known,
+    // but the knob snapshot it read said `HwCursor` 0 and display half off), while StartDevice's
+    // own snapshot said 1 and on. The query does not wait for StartDevice to publish its state,
+    // and the snapshot it found was not the one the rest of the driver runs with. So the
+    // answer no longer depends on which snapshot is visible: the knob is read from the service
+    // key now, and the display half is the published one when there is one, else the service
+    // key's `DisplayHalf` (the same default, 1).
+    let snap = adapter.knobs();
+    let started = adapter.started().is_some();
+    let knob = crate::diag::read_config_dword(crate::diag::knobs::HW_CURSOR, hc::KNOB_ON);
+    let display_half = if started {
+        snap.display_half
+    } else {
+        crate::diag::read_config_dword(crate::diag::knobs::DISPLAY_HALF, 1) != 0
+    };
     let host = host_features(adapter);
-    let caps = hc::advertise(knobs.hw_cursor, knobs.display_half, host);
+    let caps = hc::advertise(knob, display_half, host);
     if u32::from(caps) != CAPS.swap(u32::from(caps), Ordering::Relaxed) {
         DIRTY.store(1, Ordering::Relaxed);
     }
-    // What THIS query told dxgkrnl, kept across StartDevice (the caps query can come before it;
-    // `CurCaps` is recomputed there and is not proof of what dxgkrnl was told): bit 0 a pointer
-    // was reported, bit 1 the host's features were known (the transport was up), bits 4..7 the
-    // knob, bit 8 the display half, bit 9 `SupportSmoothRotation`, bits 16..23 the `PointerCaps`
-    // word reported, bits 24..31 the reported maximum pointer size / 2.
+    // What THIS query told dxgkrnl, kept across StartDevice: bit 0 a pointer was reported, bit 1
+    // the host's features were known, bits 4..7 the knob used, bit 8 the display half used,
+    // bit 9 `SupportSmoothRotation`, bit 10 the snapshot's knob was on, bit 11 the snapshot's
+    // display half was on, bit 12 StartDevice had published (the snapshot was its own), bits
+    // 16..23 the `PointerCaps` word, bits 24..31 the maximum pointer size / 2.
     CAPQ_N.fetch_add(1, Ordering::Relaxed);
     CAPQ_LAST.store(
         u32::from(caps)
             | u32::from(host.is_some()) << 1
-            | (knobs.hw_cursor & 0xF) << 4
-            | u32::from(knobs.display_half) << 8
+            | (knob & 0xF) << 4
+            | u32::from(display_half) << 8
             | u32::from(smooth_rotation()) << 9
+            | u32::from(snap.hw_cursor != hc::KNOB_OFF) << 10
+            | u32::from(snap.display_half) << 11
+            | u32::from(started) << 12
             | if caps {
                 pointer_caps() << 16 | (pointer_max() / 2).min(0xFF) << 24
             } else {
