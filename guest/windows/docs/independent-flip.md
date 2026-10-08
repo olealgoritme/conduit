@@ -1391,3 +1391,30 @@ Next run: R1 alone. Expect `IdfRedNoDst` = `IdfPrRedir`, `IdfRedErr` 0, `IdfRedO
 Flip`, `FfReowned` >= 1 and `FfMoved` / `IdfDirFor` at the application's rate. R4 (`IdfRedirSkip=1`) only matters if `IdfRedErr` is
 still nonzero with `IdfRedSD` showing a destination. If R1 still stays composed with `IdfRedErr` 0, read `IdfRedDma` and `IdfRedFlg`
 and the dwm log's `CheckDirectFlipSupport #` lines next.
+
+### 13.7 393.1: promoted; what stands between it and the default
+
+393.1 R1 (G1, `IndepFlip=1`, `DirectFlipSupport=1`, `d3d11_iflip 40 topmost fg`, 1920x1080@240): PresentMon `Hardware: Independent
+Flip` for all 2394 frames, median 4.02 ms, p99 4.67, max 7.72. `IdfRedOk` = `IdfRedNoDst` = `IdfPrRedir` = 9599, `IdfRedErr` 0,
+`IdfSpaExcl` 9598 (every flip in independent-flip exclusive mode), `IdfRedFlg` 0x2000 (`RedirectedFlip` alone: not even the Blt
+bit), `FfReowned` 1. The no-destination fix (13.6) was the blocker.
+
+The dwm process logged no `CheckDirectFlipSupport` line at all: on this setup DWM does not ask the D3D11 UMD, so
+`DirectFlipSupport` is probably not a door. One run with `DirectFlipSupport=0` settles it; if it still promotes, the UMD knob is
+irrelevant and every safety rule below must live in the KMD.
+
+Before `IndepFlip=1` becomes the default, these rows (each a reboot; 1920x1080@240, then 5120x1440@240):
+
+| risk | what can go wrong | row | pass |
+|---|---|---|---|
+| 10-bit / fp16 swap chains (HDR games) | the KMD refuses `WideFormat` and completes the flip as a kept picture; promoted, DWM draws nothing, so the window freezes on its last frame | `d3d11_iflip 20 topmost fg rgb10`, then `fp16` | composed (dxgkrnl does not promote), or promoted with `IdfKeep` 0. A frozen picture with `IdfRef09` rising is a blocker: then the KMD must not advertise for it, or the UMD/KMD must refuse it earlier |
+| resize inside the app / mode change | buffers of another extent: `Extent` refusal, kept picture | resize Heaven's window to full screen and back; the viewer's fullscreen toggle (mode change) while promoted | demotes and re-promotes; `IdfRef07` stays 0 or transient |
+| alt-tab, Win key, a toast, a window on top | the hand-back to DWM | as R1, then alt-tab out and back three times, open the Start menu, show a notification | `IdfSpaTrans` +2 per round trip, never a black or frozen screen |
+| application exit / kill while promoted | the shown buffer disappears | `taskkill /f` the tool at t=10 s | desktop back within a frame or two, `FfGone` 1 |
+| cursor | software cursor is not drawn while promoted | `HwCursor` default (1) with `cursor` option | cursor visible (section 12) |
+| DMA flips (interval 0, tearing) | an unregistered Venus buffer fails `PBFlip` 0xE6 under `IndepFlip=1` (`IndepFlip=2` keeps it) | `interval0`, then `interval0 tearing` | no `PBFlip` 0xE6; if there is, the default must be 2, not 1 |
+| DWM restart, device restart | the importer's file closes | `taskkill /f /im dwm.exe`; `pnputil /restart-device` | desktop back, promotion again on the next run |
+| a game, not the tool | real swap chains, overlays | one D3D12 title (3DMark Time Spy) and one flip-model D3D11 title, full screen borderless | `Hardware: Independent Flip`, fps not below composed |
+
+The tool now writes its log next to the executable (`d3d11_iflip.txt`, or `log=PATH`): a scheduled task runs in
+`C:\Windows\System32`, where the old current-directory log could not be created, and its stdout is not captured.

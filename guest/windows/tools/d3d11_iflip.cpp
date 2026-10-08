@@ -26,6 +26,9 @@
 //     cursor      keep the mouse cursor visible over the window (default: hidden, so a software
 //                 cursor cannot force composition)
 //     rgba        R8G8B8A8_UNORM back buffers (default B8G8R8A8_UNORM)
+//     rgb10       R10G10B10A2_UNORM back buffers (the KMD cannot scan these out: promoted, the
+//                 picture must not freeze; the safe outcome is that DWM keeps composing)
+//     fp16        R16G16B16A16_FLOAT back buffers (as rgb10)
 //     buffers=N   back buffer count (default 2)
 //     adapter=N   DXGI adapter index (default: the first adapter whose name contains "Helios",
 //                 else the default adapter)
@@ -39,7 +42,10 @@
 // under the output's four corners and centre (anything but this window there is an overlap that
 // forces composition), and once the output's hardware composition support
 // (IDXGIOutput6::CheckHardwareCompositionSupport).
-// Logs to stdout and to d3d11_iflip.txt in the current directory.
+//     log=PATH    write the log there (default: d3d11_iflip.txt next to the executable; a task
+//                 started by the scheduler runs in C:\Windows\System32, where the old
+//                 current-directory log could not be created, and its stdout is not captured)
+// Logs to stdout and to the log file.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
@@ -124,11 +130,27 @@ static const char* ModeName(DXGI_FRAME_PRESENTATION_MODE m) {
 }
 
 int main(int argc, char** argv) {
-  g_log = fopen("d3d11_iflip.txt", "w");
+  {
+    const char* logPath = nullptr;
+    for (int i = 1; i < argc; ++i)
+      if (!strncmp(argv[i], "log=", 4)) logPath = argv[i] + 4;
+    char def[MAX_PATH] = "";
+    if (!logPath) {
+      DWORD n = GetModuleFileNameA(nullptr, def, MAX_PATH);
+      char* slash = n ? strrchr(def, '\\') : nullptr;
+      if (slash && (size_t)(slash + 1 - def) + 16 < sizeof(def)) {
+        strcpy(slash + 1, "d3d11_iflip.txt");
+        logPath = def;
+      } else {
+        logPath = "d3d11_iflip.txt";
+      }
+    }
+    g_log = fopen(logPath, "w");
+  }
   int seconds = 20;
   bool windowed = false, interval0 = false, tearing = false, rgba = false;
   int buffers = 2, adapterIndex = -1;
-  bool topmost = false, takeFg = false, noConsole = false;
+  bool topmost = false, takeFg = false, noConsole = false, rgb10 = false, fp16 = false;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (a[0] >= '0' && a[0] <= '9') seconds = atoi(a);
@@ -140,6 +162,9 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "buffers=", 8)) buffers = atoi(a + 8);
     else if (!strncmp(a, "adapter=", 8)) adapterIndex = atoi(a + 8);
     else if (!strcmp(a, "topmost")) topmost = true;
+    else if (!strcmp(a, "rgb10")) rgb10 = true;
+    else if (!strncmp(a, "log=", 4)) {}
+    else if (!strcmp(a, "fp16")) fp16 = true;
     else if (!strcmp(a, "fg")) takeFg = true;
     else if (!strcmp(a, "noconsole")) noConsole = true;
     else L("unknown option %s", a);
@@ -149,7 +174,8 @@ int main(int argc, char** argv) {
   L("d3d11_iflip pid=%lu seconds=%d %s interval=%d tearing=%d cursor=%s format=%s buffers=%d "
     "topmost=%d fg=%d noconsole=%d",
     GetCurrentProcessId(), seconds, windowed ? "window" : "borderless", interval0 ? 0 : 1, tearing,
-    g_hide_cursor ? "hidden" : "visible", rgba ? "RGBA8" : "BGRA8", buffers, topmost, takeFg,
+    g_hide_cursor ? "hidden" : "visible",
+    fp16 ? "RGBA16F" : rgb10 ? "RGB10A2" : rgba ? "RGBA8" : "BGRA8", buffers, topmost, takeFg,
     noConsole);
   if (noConsole) FreeConsole();
 
@@ -279,7 +305,10 @@ int main(int argc, char** argv) {
   DXGI_SWAP_CHAIN_DESC1 sd = {};
   sd.Width = width;
   sd.Height = height;
-  sd.Format = rgba ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+  sd.Format = fp16    ? DXGI_FORMAT_R16G16B16A16_FLOAT
+              : rgb10 ? DXGI_FORMAT_R10G10B10A2_UNORM
+              : rgba  ? DXGI_FORMAT_R8G8B8A8_UNORM
+                      : DXGI_FORMAT_B8G8R8A8_UNORM;
   sd.SampleDesc.Count = 1;
   sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
   sd.BufferCount = buffers;
