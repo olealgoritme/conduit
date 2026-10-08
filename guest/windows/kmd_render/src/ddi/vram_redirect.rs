@@ -214,6 +214,16 @@ pub(crate) fn reset_for_start() {
         DST_CNT[i].store(0, Ordering::Relaxed);
     }
     DST_MORE.store(0, Ordering::Relaxed);
+    // With the knob on, write the zeros now: the block is otherwise written only once a VRAM Blt
+    // was seen, and a run with none (GDI acceleration off: the redirection surfaces are standard
+    // buffers, not VRAM ones) read the previous boot's values as its own (386.1).
+    if vidmem::knob_on() {
+        use crate::diag::record_named_bytes as rec;
+        for name in [b"RvDst0", b"RvDst1", b"RvDst2", b"RvDst3", b"RvDst4", b"RvDst5", b"RvDst6", b"RvDst7"] {
+            rec(name, 0);
+        }
+        publish();
+    }
 }
 
 fn publish() {
