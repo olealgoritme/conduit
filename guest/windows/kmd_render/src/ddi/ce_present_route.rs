@@ -1014,6 +1014,16 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     refresh_active(&g);
 }
 
+/// From a Present into a VRAM surface (`RedirVram` with the route opted in): retire whatever the
+/// route's copies completed, without spinning. PASSIVE, no lock held. One relaxed load with
+/// nothing in flight.
+pub(crate) fn settle_from_present(passive: PassiveLevel, adapter: &AdapterContext) {
+    if ACTIVE.load(Ordering::Acquire) == 0 || INFL.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    settle(passive, adapter, false);
+}
+
 /// After the WindowedBlt dispatch of the same pass: spin briefly for a copy just submitted
 /// (`ce_route::SETTLE_SPIN_US`; a 1600x900 copy takes 0.2 to 0.35 ms), then let the worker's
 /// timed wait poll the rest. One relaxed load with nothing in flight.
