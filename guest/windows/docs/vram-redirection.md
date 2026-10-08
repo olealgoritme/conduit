@@ -621,6 +621,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiRkIn`, `GdiRgIn` | entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing |
 | `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, jobs claimed by context because the record was missing, the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
 | `GdiChUp`, `GdiCeWhy` | channel bring-ups the executor asked for; why the last CE attempt failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + channel state when it could not come up: 17 cold, 18 disabled, 19 broken, 20 other) |
+| `GdiRdBk`, `GdiThr` | copies from a VRAM surface into a standard buffer (GDI readback); the executor's own thread running (1) or the HPD worker in charge (0) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
@@ -655,6 +656,23 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   VRAM surface (`GdiChUp`), names a failed CE attempt in `GdiCeWhy`, and yields the worker after 2 ms
   of GDI work per pass (`GdiUsMax` 12 ms was one pass of many jobs; a single large CPU operation is
   still one unit). GDI acceleration with `RedirVram` therefore needs `RmCopyEngine=1`.
+* **G1 on hardware (359.1):** the channel came up (`GdiChUp` 1, `CeChan` 1), fills ran on the copy
+  engine (`GdiFillN` = `GdiCeSub` 68), nothing was dropped, but 185 commands ran on the CPU (`GdiWhy` 6,
+  `GdiMask` 0x44: copies touching a staging buffer, and AlphaBlend) through 275 bounce transfers, one of
+  them a 105 ms unit on the HPD worker. Since 360.1:
+  - a SRCCOPY BitBlt and a PATCOPY ColorFill on the CPU path write each destination sub-rectangle
+    straight from the source rectangle (or the color): no read-modify-write of the destination;
+  - every other CPU operation reads only what its sub-rectangles touch: one window per sub-rectangle
+    when they cover less than half their bounding box, and the scaled operations read the source hull
+    of the mapped rectangle (`cpu::scaled_window`), not the whole SrcRect;
+  - the executor runs on its own thread (`ddi/gdi_thread.rs`, started by the first GDI buffer,
+    joined in `stop_hpd`; `GdiThr`), so a slow job no longer holds the HPD worker;
+  - `GdiRdBk` counts copies from a VRAM surface into a standard buffer (a GDI screen or window read).
+  Still open: a copy between a staging buffer and VRAM is a CPU memcpy plus a bounce copy, not one
+  copy-engine copy from the staging buffer's pages (that needs a copy-engine mapping of the staging
+  buffer's system pages, `ce_route::create_dst`'s OS descriptor, which only exists while VidMm holds
+  the buffer in system pages); AlphaBlend cannot run on the copy engine (it has no blend unit) and
+  stays on the CPU.
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.

@@ -58,6 +58,8 @@ static DST_WH: AtomicU32 = AtomicU32::new(0);
 /// wait; 16 + `channel_state` when the channel could not be brought up).
 static CH_UP: AtomicU32 = AtomicU32::new(0);
 static CE_WHY: AtomicU32 = AtomicU32::new(0);
+/// Copies from a VRAM surface into a standard buffer (a GDI readback: a screen or window read).
+static RD_BACK: AtomicU32 = AtomicU32::new(0);
 
 /// The timeline's completed watermark, for [`seq_ready`].
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -103,7 +105,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 pub(crate) fn reset_for_start(_on: bool) {
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -136,6 +138,8 @@ pub(crate) fn publish_counters() {
     w(b"GdiDstWH", DST_WH.load(Ordering::Relaxed));
     w(b"GdiChUp", CH_UP.load(Ordering::Relaxed));
     w(b"GdiCeWhy", CE_WHY.load(Ordering::Relaxed));
+    w(b"GdiRdBk", RD_BACK.load(Ordering::Relaxed));
+    w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
 }
 
 /// The channel up for a job that needs it (a VRAM surface on either side): bring it up when it is
@@ -247,7 +251,7 @@ pub(crate) fn admit(adapter: &AdapterContext, id: u64) -> Option<u64> {
         ga::Admit::Queue { seq } => {
             JOB_N.fetch_add(1, Ordering::Relaxed);
             PENDING.store(1, Ordering::Release);
-            adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::OTHER);
+            kick(adapter);
             Some(seq)
         }
         ga::Admit::Again { seq } => {
@@ -314,12 +318,28 @@ fn now_100ns() -> u64 {
 const JOBS_PER_PASS: usize = 32;
 const PASS_BUDGET_100NS: u64 = 20_000;
 
-/// The HPD worker (PASSIVE): execute admitted jobs in sequence order. With the knob off, or
-/// nothing admitted: one relaxed load.
-pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
-    if !crate::ddi::gdi_accel::on() || PENDING.load(Ordering::Acquire) == 0 {
-        return;
+/// Wake whoever runs the executor: its own thread, or the HPD worker without one. Any IRQL up to
+/// DISPATCH.
+fn kick(adapter: &AdapterContext) {
+    if crate::ddi::gdi_thread::running() {
+        crate::ddi::gdi_thread::kick();
+    } else {
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::OTHER);
     }
+}
+
+/// Execute admitted jobs in sequence order (PASSIVE): from the executor's thread (`on_thread`), or
+/// from the HPD worker while that thread does not run. With the knob off, nothing admitted, or
+/// the other runner in charge: one or two relaxed loads. Returns whether work is left (the pass
+/// yielded on its budget).
+pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread: bool) -> bool {
+    if !crate::ddi::gdi_accel::on()
+        || PENDING.load(Ordering::Acquire) == 0
+        || on_thread != crate::ddi::gdi_thread::running()
+    {
+        return false;
+    }
+    let mut more = false;
     let mut ran = 0usize;
     let pass_t0 = now_100ns();
     let mut channel: Option<bool> = None;
@@ -352,6 +372,10 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         };
         let t0 = now_100ns();
         for op in &ops {
+            if crate::ddi::gdi_thread::stopping() {
+                // StopDevice discharges the job; the rest of its commands are not run.
+                break;
+            }
             if channel.is_none() && needs_channel(op) {
                 channel = Some(ensure_channel(passive, adapter));
             }
@@ -372,13 +396,18 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
         ran += 1;
         if ran >= JOBS_PER_PASS || now_100ns().wrapping_sub(pass_t0) >= PASS_BUDGET_100NS {
-            adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::OTHER);
+            if on_thread {
+                more = true;
+            } else {
+                adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::OTHER);
+            }
             break;
         }
     }
     if ran > 0 {
         crate::ddi::gdi_accel::publish_counters();
     }
+    more
 }
 
 fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
@@ -580,31 +609,119 @@ fn pitch_of(s: &Surface, cmd_pitch: u32) -> u32 {
     }
 }
 
-fn run_cpu(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> Result<(), Why> {
-    let dst = op.dst.ok_or(Why::BadIndex)?;
-    if op.subs.is_empty() {
-        return Ok(());
-    }
-    let (dst_pitch_cmd, src_pitch_cmd) = match op.cmd {
+fn cmd_pitches(cmd: &Cmd) -> (u32, u32) {
+    match *cmd {
         Cmd::BitBlt { dst_pitch, src_pitch, .. } => (dst_pitch, src_pitch),
         Cmd::AlphaBlend { src_pitch, .. }
         | Cmd::StretchBlt { src_pitch, .. }
         | Cmd::TransparentBlt { src_pitch, .. } => (0, src_pitch),
         Cmd::ClearTypeBlend { alpha_pitch, .. } => (0, alpha_pitch),
         _ => (0, 0),
+    }
+}
+
+fn area(r: &Rect) -> u64 {
+    r.width() as u64 * r.height() as u64
+}
+
+/// The CPU path. A plain copy (SRCCOPY BitBlt, not overlapping its own source) or a plain fill
+/// (PATCOPY) writes each destination sub-rectangle straight from the source (or the color): no
+/// read of the destination, one transfer per side per sub-rectangle. Every other operation reads,
+/// computes and writes back; one window per sub-rectangle when the sub-rectangles cover less than
+/// half of their bounding box, else the bounding box once.
+fn run_cpu(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> Result<(), Why> {
+    let dst = op.dst.ok_or(Why::BadIndex)?;
+    if op.subs.is_empty() {
+        return Ok(());
+    }
+    match op.cmd {
+        Cmd::BitBlt { rop, .. } if rop == ga::rop::SRCCOPY && op.why != Some(Why::Overlap) => {
+            return run_cpu_copy(passive, adapter, op, &dst);
+        }
+        Cmd::ColorFill { rop, color, .. } if rop == ga::cfrop::PATCOPY => {
+            return run_cpu_fill(passive, adapter, op, &dst, color);
+        }
+        _ => {}
+    }
+    let bbox = clip_to(&bound(&op.subs), &dst);
+    let covered: u64 = op.subs.iter().map(area).sum();
+    if op.subs.len() > 1 && covered * 2 < area(&bbox) {
+        for sub in &op.subs {
+            run_cpu_window(passive, adapter, op, &dst, core::slice::from_ref(sub))?;
+        }
+        Ok(())
+    } else {
+        run_cpu_window(passive, adapter, op, &dst, &op.subs)
+    }
+}
+
+/// SRCCOPY per sub-rectangle: read the source rectangle, write it to the destination rectangle.
+fn run_cpu_copy(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &Surface) -> Result<(), Why> {
+    let Cmd::BitBlt { src: sr, dst: dr, .. } = op.cmd else {
+        return Err(Why::BadIndex);
     };
-    let dwin = clip_to(&bound(&op.subs), &dst);
+    let src = op.srcs[0].ok_or(Why::BadIndex)?;
+    let (dpc, spc) = cmd_pitches(&op.cmd);
+    let (dpitch, spitch) = (pitch_of(dst, dpc), pitch_of(&src, spc));
+    if src.class == SurfaceClass::Vram && dst.class == SurfaceClass::System {
+        RD_BACK.fetch_add(1, Ordering::Relaxed);
+    }
+    for sub in &op.subs {
+        let d = clip_to(sub, dst);
+        let s = clip_to(&ga::bitblt_src(&d, &dr, &sr), &src);
+        if d.is_empty() || s.width() != d.width() || s.height() != d.height() {
+            continue;
+        }
+        let mut buf = read_window(passive, adapter, &src, &s, spitch)?;
+        write_window(passive, adapter, dst, &d, dpitch, &mut buf)?;
+    }
+    Ok(())
+}
+
+/// PATCOPY per sub-rectangle: the color written, nothing read.
+fn run_cpu_fill(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &Surface, color: u32) -> Result<(), Why> {
+    let dpitch = pitch_of(dst, 0);
+    for sub in &op.subs {
+        let d = clip_to(sub, dst);
+        let bytes = area(&d) * 4;
+        if bytes == 0 {
+            continue;
+        }
+        if bytes > MAX_WINDOW_BYTES {
+            return Err(Why::CpuFailed);
+        }
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(bytes as usize).map_err(|_| Why::CpuFailed)?;
+        let px = color.to_le_bytes();
+        for _ in 0..area(&d) {
+            buf.extend_from_slice(&px);
+        }
+        write_window(passive, adapter, dst, &d, dpitch, &mut buf)?;
+    }
+    Ok(())
+}
+
+/// Read, compute, write back the window bounding `subs`.
+fn run_cpu_window(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    op: &Op,
+    dst: &Surface,
+    subs: &[Rect],
+) -> Result<(), Why> {
+    let (dst_pitch_cmd, src_pitch_cmd) = cmd_pitches(&op.cmd);
+    let dwin = clip_to(&bound(subs), dst);
     if dwin.is_empty() {
         return Ok(());
     }
-    let dpitch = pitch_of(&dst, dst_pitch_cmd);
-    let mut dbuf = read_window(passive, adapter, &dst, &dwin, dpitch)?;
+    let dpitch = pitch_of(dst, dst_pitch_cmd);
+    let mut dbuf = read_window(passive, adapter, dst, &dwin, dpitch)?;
 
-    // The source window (or the alpha surface's for ClearType).
+    // The source window (or the alpha surface's for ClearType): only what these sub-rectangles read.
     let mut sbuf: Option<(Vec<u8>, Rect)> = None;
     if let Some(src) = op.srcs[0] {
         let mut swin = Rect::default();
-        for sub in &op.subs {
+        for sub in subs {
             if let Some(r) = cpu::src_window(&op.cmd, sub) {
                 swin = swin.union(&r);
             }
@@ -640,11 +757,11 @@ fn run_cpu(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> Result<(
             w: r.width(),
             h: r.height(),
         });
-        for sub in &op.subs {
+        for sub in subs {
             cpu::run(&op.cmd, sub, &mut dv, sv.as_ref(), gamma_row.as_ref(), &mut done);
         }
     }
-    write_window(passive, adapter, &dst, &dwin, dpitch, &mut dbuf)
+    write_window(passive, adapter, dst, &dwin, dpitch, &mut dbuf)
 }
 
 /// Clip `r` to the destination surface and to `DstRect`.

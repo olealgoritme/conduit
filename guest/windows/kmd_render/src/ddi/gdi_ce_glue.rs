@@ -41,7 +41,7 @@ pub(crate) fn bring_up(passive: PassiveLevel, adapter: &AdapterContext) -> bool 
 }
 
 /// How often a call that found the channel's I/O held by another thread tries again (1 ms apart).
-const BUSY_TRIES: u32 = 4;
+const BUSY_TRIES: u32 = 10;
 
 /// Is `resource_id` an RM-VRAM-backed surface (`vidmem::lookup`)? Spinlock-only, any IRQL up to
 /// DISPATCH.
