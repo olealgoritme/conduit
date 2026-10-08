@@ -330,14 +330,20 @@ pub(crate) fn advertised(adapter: &AdapterContext) -> bool {
     // What THIS query told dxgkrnl, kept across StartDevice (the caps query can come before it;
     // `CurCaps` is recomputed there and is not proof of what dxgkrnl was told): bit 0 a pointer
     // was reported, bit 1 the host's features were known (the transport was up), bits 4..7 the
-    // knob, bit 8 the display half, bits 16..23 the `PointerCaps` word reported.
+    // knob, bit 8 the display half, bit 9 `SupportSmoothRotation`, bits 16..23 the `PointerCaps`
+    // word reported, bits 24..31 the reported maximum pointer size / 2.
     CAPQ_N.fetch_add(1, Ordering::Relaxed);
     CAPQ_LAST.store(
         u32::from(caps)
             | u32::from(host.is_some()) << 1
             | (knobs.hw_cursor & 0xF) << 4
             | u32::from(knobs.display_half) << 8
-            | if caps { pointer_caps() << 16 } else { 0 },
+            | u32::from(smooth_rotation()) << 9
+            | if caps {
+                pointer_caps() << 16 | (pointer_max() / 2).min(0xFF) << 24
+            } else {
+                0
+            },
         Ordering::Relaxed,
     );
     DIRTY.store(1, Ordering::Relaxed);
@@ -353,6 +359,21 @@ pub(crate) fn pointer_caps() -> u32 {
         0 => hc::POINTER_CAPS,
         m => m,
     }
+}
+
+/// `MaxPointerWidth` / `MaxPointerHeight` to report: `hc::MAX_DIM` (256), or `HwCursorMax`
+/// (nonzero, clamped to 32..=256; 64 is what the virtio-gpu and QXL display-only drivers
+/// report). Shapes stay limited by what dxgkrnl was told. Read with each caps query (PASSIVE).
+pub(crate) fn pointer_max() -> u32 {
+    match crate::diag::read_config_dword(crate::diag::knobs::HW_CURSOR_MAX, 0) {
+        0 => hc::MAX_DIM,
+        m => m.clamp(32, hc::MAX_DIM),
+    }
+}
+
+/// `SmoothRotCaps`: report `DXGK_DRIVERCAPS.SupportSmoothRotation` (default 0).
+pub(crate) fn smooth_rotation() -> bool {
+    crate::diag::read_config_dword(crate::diag::knobs::SMOOTH_ROT_CAPS, 0) != 0
 }
 
 /// `DXGK_DRIVERCAPS` queries and what the last one reported (see [`advertised`]); never reset.
