@@ -769,9 +769,16 @@ pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     let (answer, why) = match mode {
         0 => (false, "DirectFlipSupport=0"),
         _ if mode == 1 && !kmd_reports_direct_flip() => (false, "dxgkrnl reports no DirectFlip"),
-        _ => {
+        1 => {
             // resource1 (the app's) must be able to replace resource2 (DWM's
-            // primary) on scanout as is: same size, same format.
+            // primary) on scanout as is, in a layout the KMD can flip.
+            match scanout_pair_compatible(resource1, resource2) {
+                Ok(()) => (true, "same scan-out layout"),
+                Err(why) => (false, why),
+            }
+        }
+        _ => {
+            // The test lever (2): same size and format, nothing else asked.
             let (_, k1, w1, h1, _, f1) = resource_summary(resource1);
             let (_, k2, w2, h2, _, f2) = resource_summary(resource2);
             if k1 == "tex2d" && k2 == "tex2d" && w1 == w2 && h1 == h2 && f1 == f2 && w1 != 0 {
@@ -790,6 +797,49 @@ pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
             if answer { "yes" } else { "no" }
         );
     }
+}
+
+/// DXGI formats the KMD can put on the scan-out as they are (`ScanoutFormat`): R8G8B8A8_UNORM,
+/// B8G8R8A8_UNORM, B8G8R8X8_UNORM. sRGB-typed aliases, 10-bit and fp16 are refused there
+/// (`docs/independent-flip.md` 2.4), and a promoted chain the KMD refuses would freeze on its
+/// last frame, so the UMD does not offer them.
+const SCANOUT_DXGI_FORMATS: [u32; 3] = [28, 87, 88];
+
+/// Whether the application's swap-chain buffer `app` can replace DWM's `dwm` on the scan-out
+/// with no conversion: both single-sample, single-mip, single-slice 2-D textures of the same
+/// extent and the same scan-out format. DWM's buffer has the display mode's extent, so this is
+/// also "the application covers the output at the mode" (there is no scaler: the KMD flips
+/// only a buffer of the mode's extent). `Err` names the first mismatch, for the log.
+unsafe fn scanout_pair_compatible(
+    app: ddi::D3D10DDI_HRESOURCE,
+    dwm: ddi::D3D10DDI_HRESOURCE,
+) -> Result<(), &'static str> {
+    let desc = |h: ddi::D3D10DDI_HRESOURCE| -> Option<D3D11_TEXTURE2D_DESC> {
+        let r = load_resource(h)?;
+        let t = (*r).cast::<ID3D11Texture2D>().ok()?;
+        let mut d = D3D11_TEXTURE2D_DESC::default();
+        t.GetDesc(&mut d);
+        Some(d)
+    };
+    let (Some(a), Some(d)) = (desc(app), desc(dwm)) else {
+        return Err("not two 2-D textures");
+    };
+    if a.Width == 0 || a.Width != d.Width || a.Height != d.Height {
+        return Err("extent differs");
+    }
+    if a.Format != d.Format {
+        return Err("format differs");
+    }
+    if !SCANOUT_DXGI_FORMATS.contains(&(a.Format.0 as u32)) {
+        return Err("not a scan-out format");
+    }
+    if a.SampleDesc.Count != 1 || d.SampleDesc.Count != 1 {
+        return Err("multisampled");
+    }
+    if a.MipLevels > 1 || a.ArraySize != 1 || d.ArraySize != 1 {
+        return Err("mips or array slices");
+    }
+    Ok(())
 }
 
 /// Does dxgkrnl report DirectFlip support (KMTQAITYPE_DIRECTFLIP_SUPPORT, from
