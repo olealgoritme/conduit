@@ -355,11 +355,11 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
-    for s in RES_SLOTS.iter().chain(SEEN_SLOTS.iter()).chain(PRB.iter()).chain(PRB_SEEN.iter()).chain(PRE.iter()) {
+    for s in RES_SLOTS.iter().chain(SEEN_SLOTS.iter()).chain(PRB.iter()).chain(PRB_SEEN.iter()).chain(PRB_S.iter()).chain(PRB_S_SEEN.iter()).chain(PRE.iter()) {
         s.store(0, Ordering::Relaxed);
     }
     SEEN_N.store(0, Ordering::Relaxed);
@@ -464,6 +464,11 @@ pub(crate) fn publish_counters() {
         w(name, s.load(Ordering::Relaxed));
     }
     w(b"GdiPrbK", PRB_K.load(Ordering::Relaxed));
+    const PRB_S_NAMES: [&[u8]; 7] = [b"GdiPrbS1", b"GdiPrbS2", b"GdiPrbS3", b"GdiPrbS4", b"GdiPrbS5", b"GdiPrbS6", b"GdiPrbS7"];
+    for (name, s) in PRB_S_NAMES.iter().zip(PRB_S.iter()) {
+        w(name, s.load(Ordering::Relaxed));
+    }
+    w(b"GdiPrbSK", PRB_S_K.load(Ordering::Relaxed));
     w(b"GdiSyncN", SYNC_N.load(Ordering::Relaxed));
     w(b"GdiSyncOps", SYNC_OPS.load(Ordering::Relaxed));
     w(b"GdiSrcScan", SRC_SCAN.load(Ordering::Relaxed));
@@ -1027,6 +1032,11 @@ static PRB_SEEN: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
 /// GDI type << 8 | destination GDI type << 12 | source all zero << 16 | engine << 18 (0 CE, 1 CPU,
 /// 2 drop) | plan reason << 20 | DXGK rop enum << 26.
 static PRB_K: AtomicU32 = AtomicU32::new(0);
+/// The same probes for commands into STAGING destinations (`GdiPrbS1..7`, `GdiPrbSK`): whether
+/// what the executor writes into a staging buffer reads back through its CPU view.
+static PRB_S: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+static PRB_S_SEEN: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+static PRB_S_K: AtomicU32 = AtomicU32::new(0);
 /// The first command into each of the first 4 GPU destinations, BEFORE it runs: resource id << 16
 /// | magenta pixels (the `RvOff` 0x2000 clear) << 8 | RGB-0 pixels, of a row of up to 64 pixels.
 static PRE: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
@@ -1101,12 +1111,17 @@ fn probe_before(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
 
 /// After the command: is the destination's row, and the source's matching row, all RGB 0?
 fn probe_after(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
-    let (Some(d), Some(sub)) = (gpu_dst(op), op.subs.first()) else { return };
+    let Some(sub) = op.subs.first() else { return };
+    let (d, prb, seen, key) = match op.dst {
+        Some(d) if matches!(d.class, SurfaceClass::Vram | SurfaceClass::Foreign) => (d, &PRB, &PRB_SEEN, &PRB_K),
+        Some(d) if d.class == SurfaceClass::System => (d, &PRB_S, &PRB_S_SEEN, &PRB_S_K),
+        _ => return,
+    };
     let i = (op.cmd.opcode() as usize).wrapping_sub(1);
-    if i >= PRB.len() {
+    if i >= prb.len() {
         return;
     }
-    let n = PRB_SEEN[i].fetch_add(1, Ordering::Relaxed);
+    let n = seen[i].fetch_add(1, Ordering::Relaxed);
     if n >= 32 && n % 16 != 0 {
         return;
     }
@@ -1125,7 +1140,7 @@ fn probe_after(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
         }
     }
     let add = 1 | u32::from(dz) << 10 | u32::from(sz) << 20;
-    let _ = PRB[i].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+    let _ = prb[i].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         let f = |shift: u32| ((v >> shift) & 0x3ff) + ((add >> shift) & 0x3ff);
         let c = |x: u32| x.min(0x3ff);
         Some(c(f(0)) | c(f(10)) << 10 | c(f(20)) << 20)
@@ -1140,7 +1155,7 @@ fn probe_after(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
             Cmd::BitBlt { rop, .. } | Cmd::ColorFill { rop, .. } => u32::from(rop) & 0x7,
             _ => 0,
         };
-        PRB_K.store(
+        key.store(
             op.cmd.opcode()
                 | class_bit_of(op.srcs[0]) << 4
                 | op.srcs[0].map_or(0, |s| s.kind_bits & 0xf) << 8
