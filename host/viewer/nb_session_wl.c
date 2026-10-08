@@ -573,6 +573,11 @@ struct nb_wl {
     bool     mh_valid;
     unsigned mh_w, mh_h, mh_hz, mh_why;
     uint64_t mh_due_ms;         /* debounced windowed hint, 0 = none        */
+    uint64_t fs_edge_ms;        /* last fullscreen request or edge, 0 = none */
+    bool     mh_guard;          /* --hint-guard                             */
+    bool     mh_held;           /* a hint is held while grabbed             */
+    bool     mh_frozen;         /* the window flapped: no longer followed   */
+    struct nb_hint_hist mh_hist;   /* sizes actually asked, for the guard   */
 
     /* Frame statistics: the title (2/s) and the overlay (4/s). */
     struct nb_fstats fs;
@@ -3048,6 +3053,8 @@ static void wl_resync(struct nb_session *s)
         wl_report_surface(w, w->cont_w, w->cont_h);
     }
     w->mh_valid = false;
+    w->mh_frozen = false;       /* a new client starts with a clean slate */
+    memset(&w->mh_hist, 0, sizeof(w->mh_hist));
     wl_mode_hint(w, true);
     w->stats_active = true;
     w->fs_next_ms = 0;
@@ -3691,6 +3698,9 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
     if (was_fs != w->fullscreen) {
         nb_log("window is %s", w->fullscreen ? "FULLSCREEN (chrome hidden)"
                                              : "windowed");
+        /* The size that came with the edge may be an intermediate one; the
+         * mode hint waits for the window to settle (NB_FS_SETTLE_MS). */
+        w->fs_edge_ms = nb_now_ms_wl();
         /* Report what actually happened, not what we asked for: the client
          * keys a guest mode switch off this flag. */
         if (w->sink) {
@@ -3751,8 +3761,8 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
         /* EV_SURFACE carries the WINDOW (content) size -- not the fitted
          * picture, which in aspect mode is the old mode's aspect and would
          * lock the guest to it -- and the mode hint follows the same size.
-         * Debounced only for a windowed drag in --resize=guest; a fullscreen
-         * edge is one deliberate action and goes at once. */
+         * Debounced for a windowed drag in --resize=guest; a fullscreen edge
+         * waits NB_FS_SETTLE_MS for the size to settle (wl_mode_hint). */
         if (old_w != wd || old_h != ht || was_fs != w->fullscreen) {
             bool now = w->fullscreen || was_fs != w->fullscreen;
 
@@ -4437,6 +4447,16 @@ static void wl_geom_apply(struct nb_wl *w)
 /* ── virtio-nvgpu: mode hints (EV_MODE_HINT) ─────────────────────────────── */
 
 #define NB_HINT_DEBOUNCE_MS 150
+/*
+ * After a fullscreen request or edge, the window's size is not trusted until
+ * it has been quiet this long: a compositor may report an intermediate size
+ * (the old one with the new state, or a tile on the way out), and every hint
+ * is a mode set in the guest -- a fullscreen game loses its flip model on
+ * each one.
+ */
+#define NB_FS_SETTLE_MS     500
+/* A,B,A,B inside this window stops the guest following the window. */
+#define NB_HINT_FLAP_MS     10000
 
 /*
  * What mode should the guest be in?  Decided from HOST state only -- the
@@ -4493,7 +4513,55 @@ static void wl_mode_hint(struct nb_wl *w, bool immediate)
         w->mh_due_ms = 0;       /* a drag that came back where it started */
         return;
     }
-    if (!immediate) {
+    if (why != NVKVM_BROKER_HINT_FIXED) {
+        uint64_t now = nb_now_ms_wl();
+        uint64_t settle = w->fs_edge_ms ? w->fs_edge_ms + NB_FS_SETTLE_MS : 0;
+
+        /* The window flapped (below): it is not followed until the user says
+         * so.  The picture is scaled meanwhile, as for --resize=scale. */
+        if (w->mh_frozen) {
+            w->mh_due_ms = 0;
+            return;
+        }
+        /*
+         * GRABBED: something in the guest owns the mouse -- a game, as a rule
+         * -- and a re-mode under it costs it its flip model, its swapchain and
+         * often a frame of black.  Only fullscreen still asks (the output's
+         * mode is what direct scanout needs); a window that changes size is
+         * scaled into until the grab ends, and then followed.
+         */
+        if (w->mh_guard && w->grabbed &&
+            why != NVKVM_BROKER_HINT_FULLSCREEN) {
+            if (!w->mh_held) {
+                w->mh_held = true;
+                nb_log("mode hint: held while the pointer is grabbed (the "
+                       "guest keeps its mode, the picture is scaled); sent "
+                       "when the grab ends");
+            }
+            w->mh_due_ms = 0;
+            return;
+        }
+        if (!immediate || now < settle) {
+            uint64_t due = now + NB_HINT_DEBOUNCE_MS;
+
+            w->mh_due_ms = due > settle ? due : settle;
+            return;
+        }
+        if (w->mh_guard &&
+            nb_hint_flaps(&w->mh_hist, hw, hh, now, NB_HINT_FLAP_MS)) {
+            w->mh_frozen = true;
+            w->mh_due_ms = 0;
+            nb_log("mode hint: %ux%u NOT sent -- the window flipped between "
+                   "%ux%u and %ux%u within %u s, a guest mode set each time.  "
+                   "No longer following it: the guest keeps %ux%u and the "
+                   "picture is scaled.  CTRL+ALT+R follows again; "
+                   "--hint-guard=off turns this guard off",
+                   hw, hh, w->mh_hist.w[0], w->mh_hist.h[0], hw, hh,
+                   NB_HINT_FLAP_MS / 1000, w->mh_hist.w[0], w->mh_hist.h[0]);
+            return;
+        }
+        nb_hint_note(&w->mh_hist, hw, hh, now);
+    } else if (!immediate) {
         w->mh_due_ms = nb_now_ms_wl() + NB_HINT_DEBOUNCE_MS;
         return;
     }
@@ -4904,7 +4972,10 @@ static void wl_direct_set(struct nb_wl *w, bool on)
     }
     ov_sync(w);
     /* Fullscreen is where 1:1 matters; ask again so a guest that drifted is
-     * put back on the output's exact mode. */
+     * put back on the output's exact mode.  A deliberate toggle, so a flap
+     * freeze ends too. */
+    w->mh_frozen = false;
+    memset(&w->mh_hist, 0, sizeof(w->mh_hist));
     w->mh_valid = false;
     wl_mode_hint(w, true);
     nb_log("direct mode %s: overlay %s, tearing %s%s", on ? "ON" : "off",
@@ -4936,6 +5007,16 @@ static bool wl_hotkey(struct nb_session *s, unsigned code)
         wl_direct_set(w, !w->direct);
         return true;
     case KEY_R:
+        if (w->mh_frozen) {
+            /* After a flap freeze, R first means "follow it again". */
+            w->mh_frozen = false;
+            memset(&w->mh_hist, 0, sizeof(w->mh_hist));
+            nb_log("mode hint: following the window again (CTRL+ALT+R; "
+                   "press again to scale instead)");
+            wl_mode_hint(w, true);
+            wl_display_flush(w->dpy);
+            return true;
+        }
         w->resize_mode = w->resize_mode == NB_RESIZE_GUEST ? NB_RESIZE_SCALE
                                                            : NB_RESIZE_GUEST;
         nb_log("resize: %s", w->resize_mode == NB_RESIZE_GUEST
@@ -5360,6 +5441,11 @@ static int wl_set_grab(struct nb_session *s, bool on)
         }
     }
     w->grabbed = on;
+    /* A hint held while grabbed goes now, debounced like a drag. */
+    if (!on && w->mh_held) {
+        w->mh_held = false;
+        wl_mode_hint(w, false);
+    }
     /* Grabbed, the guest cursor leaves the host pointer; released, it is
      * the host pointer's image again. */
     cur_apply(w, w->last_serial);
@@ -5394,7 +5480,23 @@ static int wl_set_fullscreen(struct nb_session *s, bool on)
     } else {
         xdg_toplevel_unset_fullscreen(w->toplevel);
     }
-    w->fullscreen = on;
+    /*
+     * NOT `w->fullscreen = on` here.  The state is the compositor's to report
+     * (top_configure); setting it early paired the NEW state with the OLD
+     * window size for any hint made before the configure -- leaving
+     * fullscreen asked the guest for the output's size as "follow the window"
+     * -- and hid the edge from top_configure, which keys the hint, the title
+     * bar and the client's fullscreen flag off it.
+     *
+     * An explicit toggle is also the user taking charge again: a flap freeze
+     * ends here.  The hint itself waits for the configure and the settle.
+     */
+    w->fs_edge_ms = nb_now_ms_wl();
+    if (w->mh_frozen) {
+        w->mh_frozen = false;
+        memset(&w->mh_hist, 0, sizeof(w->mh_hist));
+        nb_log("mode hint: following the window again (CTRL+ALT+F)");
+    }
     return 0;
 }
 
@@ -5591,6 +5693,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->direct_hook = cfg->direct_hook;
     w->hint_align = cfg->hint_align ? cfg->hint_align : 1;
     w->resize_mode = cfg->resize_mode;
+    w->mh_guard = cfg->hint_guard;
     w->gc_cur = -1;
     w->snap.direct = -1;
 

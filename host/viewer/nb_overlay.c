@@ -203,6 +203,42 @@ void nb_fs_graph(const struct nb_fstats *f, uint64_t now_ns, unsigned span_ms,
     }
 }
 
+void nb_hint_note(struct nb_hint_hist *hh, unsigned w, unsigned h,
+                  uint64_t now_ms)
+{
+    unsigned i;
+
+    if (hh->n && hh->w[0] == w && hh->h[0] == h) {
+        return;                 /* same size: not a re-mode */
+    }
+    for (i = NB_HINT_HIST - 1; i > 0; i--) {
+        hh->w[i] = hh->w[i - 1];
+        hh->h[i] = hh->h[i - 1];
+        hh->ms[i] = hh->ms[i - 1];
+    }
+    hh->w[0] = w;
+    hh->h[0] = h;
+    hh->ms[0] = now_ms;
+    if (hh->n < NB_HINT_HIST) {
+        hh->n++;
+    }
+}
+
+bool nb_hint_flaps(const struct nb_hint_hist *hh, unsigned w, unsigned h,
+                   uint64_t now_ms, unsigned window_ms)
+{
+    /* newest first: [0]=A [1]=B [2]=A, and now B again */
+    if (hh->n < 3) {
+        return false;
+    }
+    if (hh->w[0] == w && hh->h[0] == h) {
+        return false;           /* not a change */
+    }
+    return hh->w[1] == w && hh->h[1] == h &&
+           hh->w[2] == hh->w[0] && hh->h[2] == hh->h[0] &&
+           now_ms - hh->ms[2] < window_ms;
+}
+
 void nb_fit(int mode, int bw, int bh, int ww, int wh, int *dw, int *dh,
             int *ox, int *oy)
 {

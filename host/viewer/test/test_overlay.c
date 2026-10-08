@@ -119,6 +119,27 @@ int main(void)
     nb_fs_snapshot(&f, t, -1, &s);
     CHECK(!s.frames && s.ft_avg < 0 && s.cp_ms < 0, "empty snapshot");
 
+    /* The mode-hint flap guard: A,B,A,B inside the window trips, a slower
+     * flip, a third size or a repeated size does not. */
+    {
+        struct nb_hint_hist hh;
+
+        memset(&hh, 0, sizeof(hh));
+        nb_hint_note(&hh, 5120, 1440, 1000);
+        CHECK(!nb_hint_flaps(&hh, 1756, 1393, 1100, 10000), "one change");
+        nb_hint_note(&hh, 1756, 1393, 1100);
+        nb_hint_note(&hh, 1756, 1393, 1150);    /* same size: ignored */
+        CHECK(hh.n == 2, "a repeated size is not recorded (%u)", hh.n);
+        CHECK(!nb_hint_flaps(&hh, 5120, 1440, 2000, 10000), "A,B,A is allowed");
+        nb_hint_note(&hh, 5120, 1440, 2000);
+        CHECK(nb_hint_flaps(&hh, 1756, 1393, 3000, 10000), "A,B,A,B trips");
+        CHECK(!nb_hint_flaps(&hh, 1648, 1393, 3000, 10000), "a third size");
+        CHECK(!nb_hint_flaps(&hh, 5120, 1440, 3000, 10000), "no change");
+        CHECK(!nb_hint_flaps(&hh, 1756, 1393, 11000, 10000),
+              "the same flips spread over more than the window");
+        CHECK(!nb_hint_flaps(&hh, 0, 0, 3000, 10000), "restore is a size too");
+    }
+
     printf(fails ? "overlay stats: %d FAILED\n" : "overlay stats tests passed\n",
            fails);
     return fails != 0;

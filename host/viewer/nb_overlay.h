@@ -80,6 +80,25 @@ void nb_fs_graph(const struct nb_fstats *f, uint64_t now_ns, unsigned span_ms,
 void nb_fit(int mode, int bw, int bh, int ww, int wh, int *dw, int *dh,
             int *ox, int *oy);
 
+/*
+ * Mode-hint flap guard.  The sizes the guest was last asked for (a change of
+ * size only: a hint that repeats the previous size is not a re-mode), and
+ * whether asking for w x h now would be the fourth step of an A,B,A,B flip
+ * inside window_ms -- the shape of a window bouncing between two sizes, where
+ * every step is a mode set in the guest.  Pure, so test/test_overlay.c checks
+ * it without a compositor.
+ */
+#define NB_HINT_HIST 3
+struct nb_hint_hist {
+    unsigned n;                 /* valid entries, newest first              */
+    unsigned w[NB_HINT_HIST], h[NB_HINT_HIST];
+    uint64_t ms[NB_HINT_HIST];
+};
+void nb_hint_note(struct nb_hint_hist *hh, unsigned w, unsigned h,
+                  uint64_t now_ms);
+bool nb_hint_flaps(const struct nb_hint_hist *hh, unsigned w, unsigned h,
+                   uint64_t now_ms, unsigned window_ms);
+
 /* The one-line form, for xdg_toplevel.set_title. */
 void nb_fs_title(char *buf, size_t n, const char *base, unsigned mode_w,
                  unsigned mode_h, unsigned refresh_mhz,

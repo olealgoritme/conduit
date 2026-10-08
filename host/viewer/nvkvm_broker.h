@@ -173,6 +173,9 @@ struct nb_config {
     const char *direct_hook;
     unsigned    hint_align;
     int         resize_mode;    /* NB_RESIZE_*: what a windowed resize does */
+    /* Hold window-following hints while the pointer is grabbed, and stop
+     * following a window that flips between two sizes (default on). */
+    bool        hint_guard;
 };
 
 #define NB_RESIZE_SCALE 0       /* scale the full guest picture into the window */

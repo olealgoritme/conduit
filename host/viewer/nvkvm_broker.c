@@ -3118,7 +3118,12 @@ static void usage(void)
 "  --direct-hook CMD    run `CMD on` / `CMD off` (via /bin/sh, not waited for)\n"
 "                       on every direct-mode change, for compositor tuning\n"
 "  --hint-align=N       round hinted widths down to a multiple of N (default 1,\n"
-"                       exact; 8 for a guest that builds CVT modes)\n"
+"                       exact; 8 for a guest that builds CVT modes)\n""  --hint-guard=on|off  on (default): while the pointer is grabbed\n"
+"                       (CTRL+ALT+G) the guest's mode follows only fullscreen,\n"
+"                       not the window, and a window that flips between two\n"
+"                       sizes (A,B,A,B within 10 s) stops being followed, the\n"
+"                       picture is scaled instead; CTRL+ALT+R follows again.\n"
+"                       --resolution=none never asks the guest to re-mode\n"
 "  --stats              log fps and latency once per second\n"
 "  --seq-usec           cmd.seq is the sender's CLOCK_MONOTONIC microseconds\n"
 "                       (low 32 bits); --stats then reports send->commit and\n"
@@ -3332,6 +3337,7 @@ int main(int argc, char **argv)
     cfg.title = "Conduit";
     cfg.overlay_mode = NB_OVERLAY_ALWAYS;
     cfg.hint_align = 1;
+    cfg.hint_guard = true;
     cfg.win_w = 1920;
     cfg.win_h = 1080;
     /* Default allowlist: root, and whoever started the broker. */
@@ -3455,6 +3461,16 @@ int main(int argc, char **argv)
             else if (!strcmp(m, "guest")) { cfg.resize_mode = NB_RESIZE_GUEST; }
             else {
                 nb_err("--resize must be scale or guest");
+                return 2;
+            }
+        }
+        else if (!strncmp(a, "--hint-guard=", 13)) {
+            const char *m = a + 13;
+
+            if (!strcmp(m, "on"))         { cfg.hint_guard = true; }
+            else if (!strcmp(m, "off"))   { cfg.hint_guard = false; }
+            else {
+                nb_err("--hint-guard must be on or off");
                 return 2;
             }
         }
