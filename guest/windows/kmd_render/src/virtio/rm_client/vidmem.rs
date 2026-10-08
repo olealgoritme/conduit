@@ -55,6 +55,9 @@ pub(crate) struct VramObject {
     pub height: u32,
     pub fourcc: u32,
     pub epoch: u64,
+    /// The copy engine has cleared it (RM video memory is not zeroed on allocation: 368.1 showed
+    /// regions nothing drew as fine green/black stripes of stale VRAM).
+    pub cleared: bool,
 }
 
 struct State {
@@ -444,6 +447,7 @@ fn build(
                 height: adopted_layout.height,
                 fourcc: adopted_layout.fourcc,
                 epoch: io.epoch,
+                cleared: false,
             });
         }
         g.bytes = g.bytes.saturating_add(adopted_size);
@@ -572,6 +576,27 @@ pub(crate) fn note_open(
         rec(b"RvOpenLay", OPEN_LAY.fetch_add(1, Ordering::Relaxed) + 1);
     }
     rec(b"RvOpenPid", crate::virtio::nvrm_window::current_pid());
+}
+
+/// Whether `resource_id` still needs its first clear; marks it cleared (the caller clears it now, or
+/// calls [`clear_failed`]). Spinlock only.
+pub(crate) fn claim_clear(resource_id: u32) -> bool {
+    let mut g = STATE.lock();
+    match g.objs.iter_mut().flatten().find(|o| o.resource_id == resource_id) {
+        Some(o) if !o.cleared => {
+            o.cleared = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The clear [`claim_clear`] handed out did not complete: try again at the next mapping.
+pub(crate) fn clear_failed(resource_id: u32) {
+    let mut g = STATE.lock();
+    if let Some(o) = g.objs.iter_mut().flatten().find(|o| o.resource_id == resource_id) {
+        o.cleared = false;
+    }
 }
 
 /// The host resource `resource_id` has been released (`ctrl::release_allocation_resource`): if the

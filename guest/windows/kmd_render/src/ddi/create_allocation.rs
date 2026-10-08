@@ -2904,6 +2904,9 @@ fn build_backing(
                 height,
                 dxgi_format,
             ) {
+                // Clear it now when the copy engine is up and free (best effort, never waits for
+                // the channel: otherwise the first mapping clears it before any write).
+                let _ = crate::virtio::rm_client::ce_vram::ce_surface(passive, adapter, rm.resource_id);
                 return Ok(CreatedBacking {
                     resource_id: rm.resource_id,
                     venus_memory_id: 0,
