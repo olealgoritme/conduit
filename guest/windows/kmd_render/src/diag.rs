@@ -1150,6 +1150,9 @@ pub mod knobs {
     /// `GdiPair` (default 1): staging-to-staging copies with two views (`with_standard_pair`);
     /// 0 keeps them on the CPU path.
     pub const GDI_PAIR: KnobName = KnobName::new(b"GdiPair");
+    /// `GdiOvl` (default 1): an overlapping copy inside one surface (a scroll) as ordered
+    /// copy-engine bands; 0 keeps it on the CPU path.
+    pub const GDI_OVL: KnobName = KnobName::new(b"GdiOvl");
     /// `DXGK_VIDMMCAPS` extra bits (default 0 = the driver's own word). A raw mask OR'd into
     /// `MemoryManagementCaps`; only bit 9 `NonCpuVisiblePrimary` (0x200) is accepted
     /// (`helios_kmd_logic::vidmm_caps`), the rest is dropped and reported in `VmCapsXMsk`. The

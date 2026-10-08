@@ -754,6 +754,57 @@ pub fn scale_coord_mirror(xd: i32, dl: i32, dw: u32, sl: i32, sw: u32, mirror: b
     }
 }
 
+/// An overlapping copy inside one surface (a scroll: `dst` = `src` moved by `(dx, dy)`) as a
+/// sequence of non-overlapping copies that, executed IN ORDER, give the result of copying the whole
+/// rectangle at once: bands of `|dy|` rows taken from the far side of the move (or, for a purely
+/// horizontal move, columns of `|dx|`). Each band's source and destination are disjoint, and no
+/// band reads rows an earlier band wrote. Calls `f(src_band, dst_band)` in execution order; returns
+/// false (calling nothing) when the rectangles differ in size.
+pub fn split_overlap(src: &Rect, dst: &Rect, mut f: impl FnMut(Rect, Rect)) -> bool {
+    if src.width() != dst.width() || src.height() != dst.height() || dst.is_empty() {
+        return false;
+    }
+    let dx = dst.left - src.left;
+    let dy = dst.top - src.top;
+    if !src.overlaps(dst) || (dx == 0 && dy == 0) {
+        if dx != 0 || dy != 0 {
+            f(*src, *dst);
+        }
+        return true;
+    }
+    if dy != 0 {
+        let step = dy.unsigned_abs() as i32;
+        let n = (dst.height() as i32 + step - 1) / step;
+        for i in 0..n {
+            // dy > 0 (down): bottom band first; dy < 0 (up): top band first.
+            let (t, b) = if dy > 0 {
+                let b = dst.bottom - i * step;
+                ((b - step).max(dst.top), b)
+            } else {
+                let t = dst.top + i * step;
+                (t, (t + step).min(dst.bottom))
+            };
+            let d = Rect::new(dst.left, t, dst.right, b);
+            f(d.offset(-dx, -dy), d);
+        }
+    } else {
+        let step = dx.unsigned_abs() as i32;
+        let n = (dst.width() as i32 + step - 1) / step;
+        for i in 0..n {
+            let (l, r) = if dx > 0 {
+                let r = dst.right - i * step;
+                ((r - step).max(dst.left), r)
+            } else {
+                let l = dst.left + i * step;
+                (l, (l + step).min(dst.right))
+            };
+            let d = Rect::new(l, dst.top, r, dst.bottom);
+            f(d.offset(-dx, -dy), d);
+        }
+    }
+    true
+}
+
 /// The source rectangle of a destination sub-rectangle for an unscaled BitBlt (the Learn
 /// formula: `SrcSubRect = SubRect - DstRect.topleft + SrcRect.topleft`).
 pub const fn bitblt_src(sub: &Rect, dst: &Rect, src: &Rect) -> Rect {
@@ -1531,8 +1582,13 @@ pub const COUNTERS: &[&str] = &[
     "GdiFgnCe",
     "GdiFgnFail",
     "GdiFgnWhy",
-    // The bisect switches in force: 1 GdiFgn, 2 GdiFgnAcq, 4 GdiSysCe, 8 GdiPair.
+    // The bisect switches in force: 1 GdiFgn, 2 GdiFgnAcq, 4 GdiSysCe, 8 GdiPair, 16 GdiOvl.
     "GdiPaths",
+    // Overlapping copies inside one surface (scrolls): seen, done as ordered copy-engine bands,
+    // the last refusal (1 shape, 2 view, 3 submit, 4 wait, 5 GdiOvl 0, 6 channel down).
+    "GdiOvlN",
+    "GdiOvlCe",
+    "GdiOvlWhy",
 ];
 
 #[cfg(test)]
@@ -1860,6 +1916,38 @@ mod tests {
         assert!(swaps_rb(&a, &b) && !swaps_rb(&b, &b) && !swaps_rb(&Surface { format: 0, ..b }, &b));
         assert_eq!(rects_per_push(128, FILL_STATE_DWORDS, FILL_RECT_DWORDS), 10);
         assert_eq!(rects_per_push(128, 0, COPY_RECT_DWORDS), 11);
+    }
+
+    /// Executing the bands in order on a model surface equals the copy of the whole rectangle.
+    #[test]
+    fn split_overlap_is_a_scroll() {
+        let w = 23usize;
+        let h = 19usize;
+        for &(dx, dy) in &[(0, 1), (0, -1), (0, 5), (0, -7), (3, 0), (-4, 0), (2, 3), (-3, -2), (1, -6), (0, 0)] {
+            let src = Rect::new(8, 8, 15, 13);
+            let dst = src.offset(dx, dy);
+            let mut img: Vec<u32> = (0..(w * h) as u32).collect();
+            let mut want = img.clone();
+            for y in src.top..src.bottom {
+                for x in src.left..src.right {
+                    want[(y + dy) as usize * w + (x + dx) as usize] = img[y as usize * w + x as usize];
+                }
+            }
+            let mut bands = Vec::new();
+            assert!(split_overlap(&src, &dst, |s, d| bands.push((s, d))));
+            for (s, d) in &bands {
+                assert!(!s.overlaps(d), "{dx},{dy}: band overlaps itself");
+                let rows: Vec<Vec<u32>> = (s.top..s.bottom)
+                    .map(|y| (s.left..s.right).map(|x| img[y as usize * w + x as usize]).collect())
+                    .collect();
+                for (j, y) in (d.top..d.bottom).enumerate() {
+                    for (i, x) in (d.left..d.right).enumerate() {
+                        img[y as usize * w + x as usize] = rows[j][i];
+                    }
+                }
+            }
+            assert_eq!(img, want, "scroll {dx},{dy}");
+        }
     }
 
     #[test]
