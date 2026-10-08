@@ -1713,6 +1713,14 @@ pub const COUNTERS: &[&str] = &[
     "GdiSysSubUs",
     "GdiSysWtUs",
     "GdiSysPx",
+    // Its surfaces: kinds (source kind_bits | destination's << 16), extents (w << 16 | h), resource
+    // ids (source | destination << 16), shape (sub-rects | same buffer << 16 | whole destination
+    // << 17 | same extent << 18).
+    "GdiSysK",
+    "GdiSysSWH",
+    "GdiSysDWH",
+    "GdiSysRes",
+    "GdiSysShape",
     // Foreign NVK images resolved; copies from them done on the copy engine; refused or failed
     // (the last reason: 1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view
     // refused, 6 channel down, 7 memory, 8 destination class, 9 GdiFgn 0).
