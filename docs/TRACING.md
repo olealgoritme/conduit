@@ -165,7 +165,9 @@ are hex strings so they can be grepped for: `grep 0x2080018d run.jsonl`.
 is notified once per batch of replies, right after; that notification and the
 guest's own wakeup are not in these times. An `event`'s `total_us` is how long
 handing the notification to the guest took; `errno` 105 (`ENOBUFS`) on one
-means the guest had no buffer posted for it and it was dropped.
+means the guest had no buffer posted for it: the pump keeps it in its backlog
+and sends it again when the guest posts one (a second `event` record), or
+drops it to the sweep when the backlog is full or off (`CONDUIT_EVENT_BACKLOG=0`).
 
 ### Refusal reasons
 
