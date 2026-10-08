@@ -1,0 +1,673 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 22:28:45 +0200
+Subject: [PATCH] nvk/rm: free memory and VAs only after the GPU work submitted
+ before the free
+
+vkFreeMemory, and an image's VA going away, unmapped the GPU range at
+once.  Vulkan makes that the application's problem, but a free that
+comes while submitted work still uses the memory turns into a GPU MMU
+fault (RM drops the page directory of a freed 2 MiB range: Xid 31
+FAULT_PDE, a shader write) and a lost device.  Counter-Strike 2 through
+DXVK did exactly that: a 109 MiB device-local memory was unmapped
+0.1-0.7 s before the GPU wrote into it, on every launch.  Native
+drivers keep memory alive until the work submitted before the free has
+finished.  So does this, behind NVK_RM_DEFER_FREE (on by default on
+Windows, off elsewhere):
+
+- Every exec context ends each flush after an exec with a WFI semaphore
+  release of a per-context retire counter (no interrupt).
+- A memory object's free, and a VA's free, snapshot for every exec
+  context the counter value that covers what has been submitted; when
+  any is not reached yet, the RM unmap and free are queued and run once
+  all have landed.  Nothing in flight: freed at once, as before.
+- Queued frees are reaped at the next exec, the next free and the next
+  allocation; with more than NVK_RM_DEFER_FREE_MB (default 2048) MiB
+  pending the freeing thread waits for the oldest (2 s at most, then it
+  frees anyway with a warning).  A destroyed context counts as idle; a
+  lost device and device destruction free everything at once.
+
+Statistics: a log line as the count of deferred frees reaches each power
+of two (with the MiB pending), and at device destruction the total, the
+peak MiB pending, cap waits and timeouts.
+
+Not covered: work still queued in the Vulkan runtime's submit thread when
+the free comes (not yet given to the context).
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  42 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c | 348 +++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c |   6 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c |  33 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c  |  22 +-
+ 5 files changed, 442 insertions(+), 9 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 89be7cf2..02bb8664 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -18,6 +18,14 @@
+ 
+ #include "rmclient.h"
+ #include "nvrm/nvrm_api.h"
++#include "util/list.h"
++#include "util/simple_mtx.h"
++#include "c11/threads.h"
++
++/* Exec contexts a device tracks for deferred frees (NVK_RM_DEFER_FREE) */
++#define NVKMD_RM_DEFER_MAX_CTXS 16
++
++struct nvkmd_rm_exec_ctx;
+ 
+ /*
+  * librmclient, loaded at runtime
+@@ -313,6 +321,21 @@ struct nvkmd_rm_dev {
+ 
+    struct nvkmd_rm_sema_pool sema_pool;
+ 
++   /* Deferred frees (NVK_RM_DEFER_FREE, nvkmd_rm_ctx.c): memory objects and
++    * VAs whose RM unmap and free wait until every exec context has finished
++    * the work submitted before the free.  Items in FIFO order.
++    */
++   mtx_t defer_mutex;
++   bool defer_enabled, defer_draining;
++   struct list_head defer_items;
++   uint64_t defer_B, defer_cap_B, defer_max_B;
++   uint64_t defer_count, defer_waits, defer_timeouts;
++   uint32_t defer_gen;
++   struct {
++      struct nvkmd_rm_exec_ctx *ctx;
++      uint32_t gen;
++   } defer_ctxs[NVKMD_RM_DEFER_MAX_CTXS];
++
+    /* Host-visible VRAM (the BAR heap): bytes of CPU-mapped VRAM currently
+     * allocated, against dev_info.bar_size_B.  Every such allocation keeps
+     * one BAR1 mapping for its whole life (under Conduit the mapping sits in
+@@ -728,6 +751,9 @@ struct nvkmd_rm_va {
+ 
+    simple_mtx_t mutex;
+    struct util_dynarray mappings; /* struct nvkmd_rm_mapping */
++
++   /* Freed by its memory object's deferred free: not deferred again */
++   bool no_defer;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(va, rm);
+@@ -808,6 +834,22 @@ VkResult nvkmd_rm_wait_value(struct nvkmd_rm_dev *dev,
+                              volatile uint64_t *value, uint64_t wait_value,
+                              uint64_t abs_timeout_ns);
+ 
++/* Deferred frees (NVK_RM_DEFER_FREE): true when free_now(obj) was queued to
++ * run once the GPU finished everything submitted so far; false when the
++ * caller frees at once (nothing in flight, the feature off, device lost or
++ * being destroyed).  size_B counts against the cap of pending bytes.
++ */
++bool nvkmd_rm_defer_free(struct nvkmd_rm_dev *dev,
++                         void (*free_now)(void *obj), void *obj,
++                         uint64_t size_B);
++/* Runs the deferred frees whose work has finished; try: give up at once if
++ * another thread holds the list.
++ */
++void nvkmd_rm_defer_reap(struct nvkmd_rm_dev *dev, bool try_lock);
++void nvkmd_rm_defer_init(struct nvkmd_rm_dev *dev);
++/* Device destruction: everything left is freed now */
++void nvkmd_rm_defer_finish(struct nvkmd_rm_dev *dev);
++
+ VkResult nvkmd_rm_sema_pool_alloc(struct nvkmd_rm_dev *dev,
+                                   struct vk_object_base *log_obj,
+                                   uint32_t *slot_out,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 1f22d405..2e4c883a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -8,6 +8,10 @@
+ #include "util/log.h"
+ #include "util/os_time.h"
+ #include "util/u_math.h"
++#include "util/u_atomic.h"
++#include "util/u_debug.h"
++#include "util/list.h"
++#include "c11/threads.h"
+ #include "vk_log.h"
+ #include "vk_sync.h"
+ 
+@@ -105,6 +109,17 @@ struct nvkmd_rm_exec_ctx {
+    volatile uint64_t *track_sema;
+    uint64_t track_sema_va;
+    uint64_t track_seqno;
++
++   /* Deferred frees (NVK_RM_DEFER_FREE): every flush after an exec ends
++    * with a WFI semaphore release of retire_pending to retire_sema, so
++    * *retire_sema >= v means all work submitted before retire_pending
++    * became v has finished.  retire_pending is read by other threads.
++    */
++   volatile uint64_t *retire_sema;
++   uint64_t retire_sema_va;
++   uint64_t retire_pending;
++   uint64_t retire_released;
++   int defer_slot;
+    uint32_t get;
+    uint32_t track_head, track_tail;
+    struct {
+@@ -356,6 +371,34 @@ emit_pending_waits(struct nvkmd_rm_exec_ctx *ctx,
+    return emit_sem_ops(ctx, log_obj, op_count, ops);
+ }
+ 
++/* The retire release (deferred frees): WFI, no interrupt (the deferred-free
++ * reaper polls; a CPU wait for it falls back to polling as well).
++ */
++static VkResult
++emit_retire_release(struct nvkmd_rm_exec_ctx *ctx,
++                    struct vk_object_base *log_obj, uint64_t value)
++{
++   VkResult result = wait_ring_space(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const uint32_t slot = ctx->put;
++   uint32_t *p = ctx->push_slots + slot * NVKMD_RM_PUSH_SLOT_DW;
++   uint32_t dw = 0;
++   p[dw++] = host_mthd_incr(NVRM_GPFIFO_SEM_ADDR_LO, 5);
++   p[dw++] = (uint32_t)ctx->retire_sema_va;
++   p[dw++] = (uint32_t)(ctx->retire_sema_va >> 32);
++   p[dw++] = (uint32_t)value;
++   p[dw++] = (uint32_t)(value >> 32);
++   p[dw++] = NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _OPERATION, _RELEASE) |
++             NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _RELEASE_WFI, _EN) |
++             NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _PAYLOAD_SIZE, _64BIT);
++
++   return push_gpfifo_entry(ctx, log_obj,
++                            ctx->push_slots_va + slot * NVKMD_RM_PUSH_SLOT_B,
++                            dw * 4, false);
++}
++
+ static VkResult
+ nvkmd_rm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+                         struct vk_object_base *log_obj)
+@@ -374,6 +417,17 @@ nvkmd_rm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   /* Marked released first: emitting may flush (a full ring), which must
++    * not emit it again.
++    */
++   const uint64_t retire = p_atomic_read(&ctx->retire_pending);
++   if (dev->defer_enabled && retire > ctx->retire_released) {
++      ctx->retire_released = retire;
++      result = emit_retire_release(ctx, log_obj, retire);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
+    if (ctx->kicked_put != ctx->put) {
+       emit_track_release(ctx);
+ 
+@@ -427,11 +481,20 @@ nvkmd_rm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+                        const struct nvkmd_ctx_exec *execs)
+ {
+    struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
++   struct nvkmd_rm_dev *rm_dev = nvkmd_rm_dev(_ctx->dev);
+ 
+    VkResult result = check_lost(ctx, log_obj);
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   /* Deferred frees whose work has finished go now */
++   if (rm_dev->defer_enabled && !list_is_empty(&rm_dev->defer_items))
++      nvkmd_rm_defer_reap(rm_dev, true);
++
++   /* The work below is covered by the next retire release */
++   if (rm_dev->defer_enabled)
++      p_atomic_set(&ctx->retire_pending, ctx->retire_released + 1);
++
+    result = emit_pending_waits(ctx, log_obj);
+    if (result != VK_SUCCESS)
+       return result;
+@@ -649,6 +712,17 @@ nvkmd_rm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_ctx->dev);
+    const struct nvkmd_rm_lib *lib = dev->lib;
+ 
++   /* The context is idle (queues are drained before they go): frees that
++    * waited on it may go, and nothing reads its retire semaphore any more.
++    */
++   if (ctx->defer_slot >= 0) {
++      mtx_lock(&dev->defer_mutex);
++      dev->defer_ctxs[ctx->defer_slot].ctx = NULL;
++      dev->defer_ctxs[ctx->defer_slot].gen = ++dev->defer_gen;
++      mtx_unlock(&dev->defer_mutex);
++      nvkmd_rm_defer_reap(dev, false);
++   }
++
+    if (ctx->h_semsurf_bound != 0) {
+       NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS unbind = {
+          .hChannel = ctx->h_channel,
+@@ -701,6 +775,9 @@ alloc_engine_object(struct nvkmd_rm_exec_ctx *ctx,
+    return result;
+ }
+ 
++static void defer_register_ctx(struct nvkmd_rm_dev *dev,
++                               struct nvkmd_rm_exec_ctx *ctx);
++
+ static VkResult
+ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+                          struct vk_object_base *log_obj,
+@@ -718,6 +795,7 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+ 
+    ctx->base.ops = &nvkmd_rm_exec_ctx_ops;
+    ctx->base.dev = &dev->base;
++   ctx->defer_slot = -1;
+ 
+    /* GPFIFO ring, push slots and the context semaphore: GPU-read system
+     * memory (our own pages).
+@@ -739,6 +817,8 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    ctx->ctx_sema_va = ctx->ring_mem->va->addr + NVKMD_RM_RING_SEMA_OFFSET;
+    ctx->track_sema = ctx->ctx_sema + 1;
+    ctx->track_sema_va = ctx->ctx_sema_va + 8;
++   ctx->retire_sema = ctx->ctx_sema + 2;
++   ctx->retire_sema_va = ctx->ctx_sema_va + 16;
+ 
+    /* Error notifier and USERD.  RM writes the notifier and the GPU writes
+     * GP_GET; we read both and write GP_PUT.  This uses RM-allocated system
+@@ -896,6 +976,8 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+ 
+    ctx->put = ctx->kicked_put = 0;
+ 
++   defer_register_ctx(dev, ctx);
++
+    *ctx_out = &ctx->base;
+ 
+    return VK_SUCCESS;
+@@ -1028,3 +1110,269 @@ nvkmd_rm_create_ctx(struct nvkmd_dev *_dev,
+ 
+    return nvkmd_rm_create_exec_ctx(dev, log_obj, engines, ctx_out);
+ }
++
++/*
++ * Deferred frees (NVK_RM_DEFER_FREE, on by default on Windows)
++ *
++ * vkFreeMemory and an image's VA going away unmapped the GPU range at once.
++ * Vulkan makes that the application's problem, but a free that comes while
++ * submitted work still uses the memory then turns into a GPU MMU fault
++ * (Xid 31 FAULT_PDE: RM drops the page directory of a freed 2 MiB range)
++ * and a lost device.  Native drivers keep memory alive until the work that
++ * was submitted before the free has finished; so does this.
++ *
++ * Each exec context ends every flush after an exec with a WFI semaphore
++ * release of a per-context retire counter.  A free snapshots, for every
++ * context, the counter value that covers what has been submitted, and the
++ * RM unmap and free run once all of them have landed.  Frees are reaped at
++ * the next exec, at the next free and when memory is allocated; if more than
++ * NVK_RM_DEFER_FREE_MB (default 2048) are pending, the freeing thread waits
++ * for the oldest.
++ */
++
++struct nvkmd_rm_defer_item {
++   struct list_head link;
++   void (*free_now)(void *obj);
++   void *obj;
++   uint64_t size_B;
++   uint32_t target_count;
++   struct {
++      uint8_t slot;
++      uint32_t gen;
++      uint64_t value;
++   } targets[NVKMD_RM_DEFER_MAX_CTXS];
++};
++
++void
++nvkmd_rm_defer_init(struct nvkmd_rm_dev *dev)
++{
++#ifdef _WIN32
++   const bool dflt = true;
++#else
++   const bool dflt = false;
++#endif
++   mtx_init(&dev->defer_mutex, mtx_plain);
++   list_inithead(&dev->defer_items);
++   dev->defer_enabled = debug_get_bool_option("NVK_RM_DEFER_FREE", dflt);
++   dev->defer_cap_B =
++      (uint64_t)debug_get_num_option("NVK_RM_DEFER_FREE_MB", 2048) << 20;
++   if (dev->defer_enabled)
++      mesa_logi("NVK: frees wait for the GPU work submitted before them "
++                "(NVK_RM_DEFER_FREE, cap %" PRIu64 " MiB)",
++                dev->defer_cap_B >> 20);
++}
++
++static void
++defer_register_ctx(struct nvkmd_rm_dev *dev, struct nvkmd_rm_exec_ctx *ctx)
++{
++   if (!dev->defer_enabled)
++      return;
++
++   mtx_lock(&dev->defer_mutex);
++   for (int i = 0; i < NVKMD_RM_DEFER_MAX_CTXS; i++) {
++      if (dev->defer_ctxs[i].ctx == NULL) {
++         dev->defer_ctxs[i].ctx = ctx;
++         dev->defer_ctxs[i].gen = ++dev->defer_gen;
++         ctx->defer_slot = i;
++         break;
++      }
++   }
++   mtx_unlock(&dev->defer_mutex);
++
++   if (ctx->defer_slot < 0) {
++      /* Not tracked: frees could not wait for this context's work */
++      mesa_logw("NVK: more than %u exec contexts, deferred frees off",
++                NVKMD_RM_DEFER_MAX_CTXS);
++      dev->defer_enabled = false;
++   }
++}
++
++/* Called with defer_mutex held */
++static bool
++defer_item_done_locked(const struct nvkmd_rm_dev *dev,
++                       const struct nvkmd_rm_defer_item *item)
++{
++   for (uint32_t i = 0; i < item->target_count; i++) {
++      const uint8_t slot = item->targets[i].slot;
++      const struct nvkmd_rm_exec_ctx *ctx = dev->defer_ctxs[slot].ctx;
++      if (ctx == NULL || dev->defer_ctxs[slot].gen != item->targets[i].gen)
++         continue; /* destroyed (idle) */
++      if (p_atomic_read(ctx->retire_sema) < item->targets[i].value)
++         return false;
++   }
++   return true;
++}
++
++static void
++defer_run(struct list_head *done)
++{
++   list_for_each_entry_safe(struct nvkmd_rm_defer_item, item, done, link) {
++      list_del(&item->link);
++      item->free_now(item->obj);
++      FREE(item);
++   }
++}
++
++void
++nvkmd_rm_defer_reap(struct nvkmd_rm_dev *dev, bool try_lock)
++{
++   struct list_head done;
++   list_inithead(&done);
++
++   if (try_lock) {
++      if (mtx_trylock(&dev->defer_mutex) != thrd_success)
++         return;
++   } else {
++      mtx_lock(&dev->defer_mutex);
++   }
++
++   const bool all = dev->defer_draining || nvkmd_rm_dev_lost(dev);
++   list_for_each_entry_safe(struct nvkmd_rm_defer_item, item,
++                            &dev->defer_items, link) {
++      /* FIFO: later items wait on the same or later values */
++      if (!all && !defer_item_done_locked(dev, item))
++         break;
++      list_del(&item->link);
++      dev->defer_B -= item->size_B;
++      list_addtail(&item->link, &done);
++   }
++   mtx_unlock(&dev->defer_mutex);
++
++   /* Outside the lock: a memory object's free frees its VA (not deferred
++    * again) and calls into RM.
++    */
++   defer_run(&done);
++}
++
++/* Waits (without the lock) for the oldest pending free while more than the
++ * cap is pending.
++ */
++static void
++defer_wait_cap(struct nvkmd_rm_dev *dev)
++{
++   while (true) {
++      mtx_lock(&dev->defer_mutex);
++      if (dev->defer_B <= dev->defer_cap_B ||
++          list_is_empty(&dev->defer_items)) {
++         mtx_unlock(&dev->defer_mutex);
++         return;
++      }
++
++      struct nvkmd_rm_defer_item *oldest =
++         list_first_entry(&dev->defer_items, struct nvkmd_rm_defer_item, link);
++      volatile uint64_t *sema = NULL;
++      uint64_t value = 0;
++      for (uint32_t i = 0; i < oldest->target_count; i++) {
++         const uint8_t slot = oldest->targets[i].slot;
++         struct nvkmd_rm_exec_ctx *ctx = dev->defer_ctxs[slot].ctx;
++         if (ctx != NULL && dev->defer_ctxs[slot].gen == oldest->targets[i].gen &&
++             p_atomic_read(ctx->retire_sema) < oldest->targets[i].value) {
++            sema = ctx->retire_sema;
++            value = oldest->targets[i].value;
++            break;
++         }
++      }
++      dev->defer_waits++;
++      mtx_unlock(&dev->defer_mutex);
++
++      if (sema != NULL) {
++         VkResult result =
++            nvkmd_rm_wait_value(dev, sema, value,
++                                os_time_get_absolute_timeout(2000000000ull));
++         if (result != VK_SUCCESS) {
++            /* Never released (no flush after the exec?) or lost: give up on
++             * the oldest rather than hold the thread forever.
++             */
++            mtx_lock(&dev->defer_mutex);
++            struct list_head done;
++            list_inithead(&done);
++            if (!list_is_empty(&dev->defer_items) &&
++                list_first_entry(&dev->defer_items,
++                                 struct nvkmd_rm_defer_item, link) == oldest) {
++               list_del(&oldest->link);
++               dev->defer_B -= oldest->size_B;
++               list_addtail(&oldest->link, &done);
++               dev->defer_timeouts++;
++            }
++            mtx_unlock(&dev->defer_mutex);
++            mesa_logw("NVK: a deferred free waited 2 s for the GPU, freeing "
++                      "it anyway");
++            defer_run(&done);
++         }
++      }
++
++      nvkmd_rm_defer_reap(dev, false);
++   }
++}
++
++bool
++nvkmd_rm_defer_free(struct nvkmd_rm_dev *dev,
++                    void (*free_now)(void *obj), void *obj, uint64_t size_B)
++{
++   if (!dev->defer_enabled || dev->defer_draining || nvkmd_rm_dev_lost(dev))
++      return false;
++
++   struct nvkmd_rm_defer_item *item = CALLOC_STRUCT(nvkmd_rm_defer_item);
++   if (item == NULL)
++      return false;
++
++   mtx_lock(&dev->defer_mutex);
++   for (int i = 0; i < NVKMD_RM_DEFER_MAX_CTXS; i++) {
++      const struct nvkmd_rm_exec_ctx *ctx = dev->defer_ctxs[i].ctx;
++      if (ctx == NULL)
++         continue;
++      const uint64_t value = p_atomic_read(&ctx->retire_pending);
++      if (p_atomic_read(ctx->retire_sema) >= value)
++         continue; /* everything this context was given has finished */
++      item->targets[item->target_count].slot = i;
++      item->targets[item->target_count].gen = dev->defer_ctxs[i].gen;
++      item->targets[item->target_count].value = value;
++      item->target_count++;
++   }
++
++   if (item->target_count == 0) {
++      mtx_unlock(&dev->defer_mutex);
++      FREE(item);
++      return false;
++   }
++
++   item->free_now = free_now;
++   item->obj = obj;
++   item->size_B = size_B;
++   list_addtail(&item->link, &dev->defer_items);
++   dev->defer_B += size_B;
++   dev->defer_max_B = MAX2(dev->defer_max_B, dev->defer_B);
++   const uint64_t n = ++dev->defer_count;
++   const uint64_t pending_B = dev->defer_B;
++   mtx_unlock(&dev->defer_mutex);
++
++   if (util_is_power_of_two_nonzero64(n)) {
++      mesa_logi("NVK: %" PRIu64 " frees deferred until the GPU finished the "
++                "work submitted before them (%" PRIu64 " MiB pending now, "
++                "NVK_RM_DEFER_FREE)", n, pending_B >> 20);
++   }
++
++   nvkmd_rm_defer_reap(dev, false);
++   if (pending_B > dev->defer_cap_B)
++      defer_wait_cap(dev);
++
++   return true;
++}
++
++void
++nvkmd_rm_defer_finish(struct nvkmd_rm_dev *dev)
++{
++   mtx_lock(&dev->defer_mutex);
++   dev->defer_draining = true;
++   mtx_unlock(&dev->defer_mutex);
++
++   nvkmd_rm_defer_reap(dev, false);
++
++   if (dev->defer_count != 0) {
++      mesa_logi("NVK: NVK_RM_DEFER_FREE: %" PRIu64 " frees deferred, at most "
++                "%" PRIu64 " MiB pending, %" PRIu64 " cap waits, %" PRIu64
++                " timeouts", dev->defer_count, dev->defer_max_B >> 20,
++                dev->defer_waits, dev->defer_timeouts);
++   }
++   mtx_destroy(&dev->defer_mutex);
++}
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 98b21550..4bc49800 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -227,6 +227,7 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+                       NVKMD_RM_REPLAY_HEAP_END - NVKMD_RM_REPLAY_HEAP_START);
+ 
+    simple_mtx_init(&dev->sema_pool.mutex, mtx_plain);
++   nvkmd_rm_defer_init(dev);
+    dev->sema_pool.chunks = UTIL_DYNARRAY_INIT;
+    dev->sema_pool.free_slots = UTIL_DYNARRAY_INIT;
+ 
+@@ -279,6 +280,11 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+    nvkmd_rm_rmfence_finish(dev);
+ #endif
+ 
++   /* Deferred frees first (the queues are gone, so nothing is in flight);
++    * frees from here on are immediate.
++    */
++   nvkmd_rm_defer_finish(dev);
++
+    /* Frees memory, so it needs the heaps and the client */
+    nvkmd_rm_sema_pool_finish(dev);
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 104c0eae..08c2e901 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -319,6 +319,10 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    const struct nv_device_info *dev_info = &dev->base.pdev->dev_info;
+    VkResult result;
+ 
++   /* Memory whose deferred free has become due goes first */
++   if (dev->defer_enabled && !list_is_empty(&dev->defer_items))
++      nvkmd_rm_defer_reap(dev, true);
++
+    /* Shared system memory has to be RM's own: OS-descriptor memory is our
+     * process's pages and cannot be handed to another client.
+     */
+@@ -553,14 +557,15 @@ fail_bar:
+ }
+ 
+ static void
+-nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
++nvkmd_rm_mem_free_now(void *obj)
+ {
+-   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
+-   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
+-
+-   nvkmd_mem_check_unlinked(_mem);
++   struct nvkmd_rm_mem *mem = obj;
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(mem->base.dev);
+ 
+-   /* The GPU mapping has to go before the memory object */
++   /* The GPU mapping has to go before the memory object.  This free already
++    * waited for the GPU (or did not need to): the VA goes with it.
++    */
++   nvkmd_rm_va(mem->base.va)->no_defer = true;
+    nvkmd_va_free(mem->base.va);
+ 
+    /* nvidia-drm holds its own reference to the memory for as long as a
+@@ -589,6 +594,22 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+    FREE(mem);
+ }
+ 
++static void
++nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++
++   nvkmd_mem_check_unlinked(_mem);
++
++   /* Not while submitted work may still use it (NVK_RM_DEFER_FREE) */
++   if (nvkmd_rm_defer_free(dev, nvkmd_rm_mem_free_now, mem,
++                           mem->base.size_B))
++      return;
++
++   nvkmd_rm_mem_free_now(mem);
++}
++
+ static VkResult
+ nvkmd_rm_mem_map(struct nvkmd_mem *_mem,
+                  struct vk_object_base *log_obj,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+index 57cf1ac8..de0649a4 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+@@ -338,10 +338,10 @@ unbind_locked(struct nvkmd_rm_dev *dev, struct nvkmd_rm_va *va,
+ }
+ 
+ static void
+-nvkmd_rm_va_free(struct nvkmd_va *_va)
++nvkmd_rm_va_free_now(void *obj)
+ {
+-   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_va->dev);
+-   struct nvkmd_rm_va *va = nvkmd_rm_va(_va);
++   struct nvkmd_rm_va *va = obj;
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(va->base.dev);
+ 
+    simple_mtx_lock(&va->mutex);
+    util_dynarray_foreach(&va->mappings, struct nvkmd_rm_mapping, m)
+@@ -359,6 +359,22 @@ nvkmd_rm_va_free(struct nvkmd_va *_va)
+    FREE(va);
+ }
+ 
++static void
++nvkmd_rm_va_free(struct nvkmd_va *_va)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_va->dev);
++   struct nvkmd_rm_va *va = nvkmd_rm_va(_va);
++
++   /* An image's VA: not unmapped while submitted work may still use it
++    * (NVK_RM_DEFER_FREE).  It holds no memory, so it does not count against
++    * the cap.
++    */
++   if (!va->no_defer && nvkmd_rm_defer_free(dev, nvkmd_rm_va_free_now, va, 0))
++      return;
++
++   nvkmd_rm_va_free_now(va);
++}
++
+ /* GB20x PTE kinds (dev_mmu.h): GB20x has only these and PITCH */
+ #define NVKMD_RM_VA_KIND_GMK              0x06
+ #define NVKMD_RM_VA_KIND_GMK_COMPRESSIBLE 0x08
