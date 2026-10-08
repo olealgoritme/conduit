@@ -340,7 +340,13 @@ fn create_with(
     if ctx == 0 {
         return Err(Why::NoContext);
     }
-    let lay = rs::layout(width, height, dxgi).map_err(|e| e.why())?;
+    // A staging buffer (`force`) is never scanned out: the foreign record's extents, not the scanout's.
+    let lay = if force.is_some() {
+        rs::layout_standard(width, height, dxgi)
+    } else {
+        rs::layout(width, height, dxgi)
+    }
+    .map_err(|e| e.why())?;
     // One deadline for the whole forward part, the wait for another thread's bring-up
     // and the bring-up included.
     let io = Io {

@@ -1460,6 +1460,16 @@ pub const COUNTERS: &[&str] = &[
     // system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down).
     "GdiSysWhy",
     "GdiSysMsk",
+    // Unreachable surfaces: count, the last one's identity (storage << 24 | kind << 16 | foreign
+    // layout << 8 | foreign identity << 9 | direct scanout << 10) and extent.
+    "GdiUnrN",
+    "GdiUnrK",
+    "GdiUnrWH",
+    // The channel bring-up's time outside the jobs (µs), the slowest command's time and signature
+    // (opcode | engine << 4 | dst class << 8 | src class << 12 | sub-rects << 16 | big << 24).
+    "GdiChUpUs",
+    "GdiSlowUs",
+    "GdiSlowOp",
 ];
 
 #[cfg(test)]
