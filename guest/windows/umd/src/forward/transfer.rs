@@ -766,6 +766,19 @@ pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     supported: *mut ddi::BOOL,
 ) {
     let mode = crate::knobs::direct_flip_support();
+    // The default (0) answers no with no work at all: no resource lookup, no formatting, one
+    // bounded log line. DWM may ask on every frame it considers a DirectFlip.
+    if mode == 0 {
+        if !supported.is_null() {
+            *supported = 0;
+        }
+        if D3D11_1_DIRECT_FLIP_ASKED.fetch_add(1, Ordering::Relaxed) == 0 {
+            log_error!(
+                "DDI D3D11.1 CheckDirectFlipSupport: DirectFlipSupport=0 -> no (logged once)"
+            );
+        }
+        return;
+    }
     let (_, k1, w1, h1, a1, f1) = resource_summary(resource1);
     let (_, k2, w2, h2, a2, f2) = resource_summary(resource2);
     let same = k1 == "tex2d" && k2 == "tex2d" && w1 == w2 && h1 == h2 && f1 == f2 && w1 != 0;
@@ -787,10 +800,10 @@ pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     if !supported.is_null() {
         *supported = answer as ddi::BOOL;
     }
-    // Every answer is evidence for the promotion question (who asks, about what, and what it got):
-    // the first 64, then every 256th.
+    // Evidence for the promotion question (who asks, about what, and what it got): the first 64
+    // answers, then one in 4096.
     let n = D3D11_1_DIRECT_FLIP_ASKED.fetch_add(1, Ordering::Relaxed);
-    if n < 64 || n % 256 == 0 {
+    if n < 64 || n % 4096 == 0 {
         log_error!(
             "DDI D3D11.1 CheckDirectFlipSupport #{n}: dwm={} flags=0x{flags:x} mode={mode} \
              app={k1} {w1}x{h1} fmt={f1} slices={a1} dwm_res={k2} {w2}x{h2} fmt={f2} slices={a2} \
