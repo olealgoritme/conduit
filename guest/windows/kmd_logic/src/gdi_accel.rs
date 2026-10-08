@@ -1455,6 +1455,11 @@ pub const COUNTERS: &[&str] = &[
     "GdiSysCe",
     "GdiSysRef",
     "GdiSysFail",
+    // Why the last staging copy was refused (1 staging to staging, 2 the VRAM side, 3 the channel
+    // down, else ce_sysmem's fail word) and every class seen (1 s2s, 2 VRAM side, 4 not
+    // system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down).
+    "GdiSysWhy",
+    "GdiSysMsk",
 ];
 
 #[cfg(test)]

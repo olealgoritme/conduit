@@ -635,6 +635,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiChUp`, `GdiCeWhy` | channel bring-ups the executor asked for; why the last CE attempt failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + channel state when it could not come up: 17 cold, 18 disabled, 19 broken, 20 other) |
 | `GdiRdBk`, `GdiThr` | copies from a VRAM surface into a standard buffer (GDI readback); the executor's own thread running (1) or the HPD worker in charge (0) |
 | `GdiSysCe`, `GdiSysRef`, `GdiSysFail` | copies/fills with a staging buffer on one side done on the copy engine over its system pages; refused (CPU instead); failed after the mapping (CPU instead) |
+| `GdiSysWhy`, `GdiSysMsk` | why the last staging copy was refused (1 staging to staging, 2 the VRAM side's mapping, 3 channel down, else `ce_sysmem`'s fail word: 0x8003_00EA not system-resident, 0x8005_00EB uncovered, 0x8001_00E4 busy, ...), and every class seen (1, 2, 4 not system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
@@ -691,6 +692,10 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   Counters `GdiSysCe` (done on the copy engine, also counted in `GdiBltN`/`GdiFillN`), `GdiSysRef`
   (refused), `GdiSysFail` (failed after the mapping); the V2 side's `RvSysMade`/`RvSysHit`/
   `RvSysRefuse`/`RvSysWhy`.
+* **360.1:** every staging copy was refused (`GdiSysCe` 0, `GdiSysRef` 136) and no `RvSys*` value
+  appeared: `ce_sysmem` mirrors its counters only after a success. Since 361.1 the glue mirrors them
+  after every call, and the refusal is classified in `GdiSysWhy`/`GdiSysMsk`; `GdiRdBk` was counted
+  twice for a refused readback (once before the attempt, once on the CPU path) and is now counted once.
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.
@@ -727,3 +732,79 @@ G0 rows (census only; with the G1 build the same counters plus execution):
 What each G0 outcome means: `GdiCmdN` 0 and `StdNGdiTex` 0 -> Windows ignores the cap here (then 5.5);
 `StdNGdiTex` > 0 and `PBdStd` 4 for Heaven -> the redirection surface is GPU-only, G1 with `RedirVram` is
 the path; adapter fails to start or a bugcheck in RenderKm -> the counters and the code to the lane.
+
+## 11. AlphaBlend on the 2D engine: feasibility
+
+Question: can GDI AlphaBlend (and StretchBlt, TransparentBlt) run on the GPU's 2D engine
+(`FERMI_TWOD_A`, class 0x902D) instead of `gdi_exec`'s CPU path? Research only; nothing built.
+
+### 11.1 Is the class there
+
+* **RM exposes it on both generations, on the graphics engine only.** NVIDIA's open kernel modules list
+  `{ FERMI_TWOD_A, ENG_GR(0) }` in AD102's engine class list and `ENG_GR(0..3)` in GB202's
+  ([g_gpu_class_list.c](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/nvidia/generated/g_gpu_class_list.c),
+  `gpuGetEngClassDescriptorList_AD102` / `_GB202`), next to `ADA_A` / `BLACKWELL_B` (3D) and the
+  compute classes. It is never on a copy engine (`ENG_CE`).
+* **The host allowlist admits it:** `AllowClass::new(0x0000902d, 16, false), // FERMI_TWOD_A` in
+  `host/backend/gen/src/rmallow/v610_57_04.rs`.
+* **Open drivers:** Mesa's gallium nvc0 allocates it (`nouveau_object_new(..., NVC0_2D_CLASS, ...)` in
+  [nvc0_screen.c](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/gallium/drivers/nouveau/nvc0/nvc0_screen.c))
+  and supports chips only up to 0x190 (Ada); NVK does not use the 2D engine at all
+  ([nvk_queue.c](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/nouveau/vulkan/nvk_queue.c) sets
+  up 3D, compute and the inline-to-memory class). So 0x902D on Blackwell has no open user to copy words
+  from; the method list is Mesa's
+  [cl902d.h](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/nouveau/headers/nvidia/classes/cl902d.h).
+
+### 11.2 Can it live on the KMD's channel
+
+No. The KMD's channel (`rm_ce_channel`) runs on an async copy-engine runlist; a 2D object needs a
+channel on the graphics runlist (`ENG_GR`). That means a second channel in the KMD's RM client:
+a GPFIFO channel bound to GR (the same `*_CHANNEL_GPFIFO_*` class, a TSG on the GR runlist), its
+context buffers (RM allocates and promotes the GR context; several MB of video memory), the
+`FERMI_TWOD_A` object on a subchannel, and its own push ring, completion and teardown. That is
+roughly the size of the copy-engine channel work (11.9 of `rm-copy-engine-present.md`) again.
+
+The cost that matters is latency: a GR channel time-slices with the game's graphics channel on the
+one GR engine. A GDI blend submitted while Heaven renders waits for the scheduler's timeslice or a
+preemption (graphics preemption granularity, then a context switch both ways), while the copy-engine
+copies run on an async CE beside the game. A window's text blend would then cost a game frame some
+context-switch time, and the GDI job (and its WDDM fence, the gate of `WddmPending::gdi_seq`) would
+wait for the game. A 3D-engine path (a pixel shader blend) has the same cost and far more state.
+
+### 11.3 What maps
+
+GDI AlphaBlend is `AC_SRC_OVER` only, with `SourceConstantAlpha` (SCA) and optionally `AC_SRC_ALPHA`
+(a premultiplied per-pixel alpha); the KMD's reference is `cpu::blend_pixel`:
+
+| GDI | formula | 2D engine | confidence |
+|---|---|---|---|
+| `AC_SRC_ALPHA`, SCA | `D = S*SCA/255 + D*(1 - Sa*SCA/255)` (S premultiplied) | `SET_OPERATION = BLEND_PREMULT`, `SET_BETA4 = (SCA, SCA, SCA, SCA)`, source format `A8R8G8B8` | the operation and BETA4 exist (cl902d.h); the exact formula and rounding are not in the header: verify against `cpu::blend_pixel` |
+| no `AC_SRC_ALPHA`, SCA | `D = S*SCA/255 + D*(1 - SCA/255)` | the same with source format `X8R8G8B8` (alpha read as 1), or `BLEND_AND` with `SET_BETA1` | as above |
+| SCA 255, no per-pixel alpha | a copy | `SRCCOPY` (or the copy engine, as today) | |
+| stretch (COLORONCOLOR, truncate mapping) | `Xs = truncate((Xd - Dl + 0.5) * Ws/Wd + Sl)` | `SET_PIXELS_FROM_MEMORY_DU_DX/DV_DY` (32.32 fixed point), `SAMPLE_MODE` origin CENTER, filter POINT | close; the rounding of a fractional step against the truncate formula needs a test |
+| mirror | a negative step | not obviously expressible (the steps look unsigned); not advertised anyway (`SupportMirrorStretchBlt` clear) | |
+| TransparentBlt | skip source pixels equal to the key (24-bit compare, or 32 with `HonorAlpha`) | `SET_COLOR_KEY_FORMAT A8R8G8B8`, `SET_COLOR_KEY`, `SET_COLOR_KEY_ENABLE`; whether the key is compared on the source and with which mask is undocumented | low |
+| ClearTypeBlend | per-channel coverage with gamma tables | no | |
+| BitBlt ROP3, fills with ROPs | | `SET_OPERATION = ROP`, `SET_ROP` (with a solid pattern) | the CE does SRCCOPY/PATCOPY already; the other ROPs are rare and not advertised |
+| overlapping scroll in one surface | | `SET_PIXELS_FROM_MEMORY_DIRECTION` and `SAFE_OVERLAP` | would let the KMD take `NoSameBitmapOverlappedBitBlt` back from CDD |
+
+Formats: GDI surfaces are 32 bpp `A8R8G8B8`/`X8R8G8B8`, pitch-linear in RM video memory or in a
+staging buffer's system pages (both already have GPU VAs in the KMD's client: `ce_vram`, `ce_sysmem`),
+which the 2D engine reads and writes with `SET_*_MEMORY_LAYOUT = PITCH`.
+
+### 11.4 Recommendation
+
+**No-go for now; revisit only if 360.1/361.1 show blends to be the cost.** The decision rule:
+
+* go if CPU-path blends (`GdiMask` bit 2, `GdiFall` with the copies now on the copy engine:
+  `GdiSysCe`) still take a large share of `GdiUs` (say above 30%) or keep `GdiUsMax` above a frame
+  period (4 ms at 240 Hz) once the executor is on its own thread and touches only the
+  sub-rectangles;
+* otherwise the CPU path is the better trade: it costs a processor core on the executor's thread and
+  never the game's GR timeslices, and it is bit-exact with the documented formulas.
+
+If it becomes a go, the cheaper first step is not a GR channel: keep the blend on the CPU but feed it
+from the copy engine (read the source and destination windows through `ce_sysmem`/`ce_vram` bounce
+copies in one batch, blend, write back with one copy), which removes the per-row CPU reads of VRAM;
+only then a GR channel with `FERMI_TWOD_A` (BLEND_PREMULT + BETA4 for AlphaBlend, the DU/DV steps for
+StretchBlt), behind its own knob, validated pixel by pixel against `cpu::blend_pixel`.
