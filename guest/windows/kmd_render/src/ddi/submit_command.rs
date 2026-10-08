@@ -330,6 +330,8 @@ pub(crate) fn publish_nvrm_counters() {
     // (`RmSys*` of `ce_sysmem`): their hot paths ask for this pass instead of writing inline.
     crate::ddi::vram_redirect::publish_if_seen();
     crate::ddi::ce_sysmem::publish_if_used();
+    // The CPU-host-aperture map log (`BarApR*`/`BarApP*`).
+    crate::ddi::cpu_host_aperture::publish_map_log();
     // The transfer-only queue for the Present copies (`CopyQueue`): `CqMain` / `CqXfer`, the
     // fallbacks `CqFall` / `CqWhy` / `CqMask`, the queue-switch waits, written once the knob is on.
     crate::ddi::copy_queue::publish_counters();
