@@ -1279,6 +1279,18 @@ pub mod knobs {
     /// other caps knobs at AddAdapter and StartDevice; mirrored as `GdiKnob`/`GdiCaps`.
     /// `docs/vram-redirection.md` section 10.
     pub const GDI_ACCEL: KnobName = KnobName::new(b"GdiAccel");
+    /// `GdiAccel` bisect switches (read at StartDevice with the knob on; mirrored as `GdiPaths`).
+    /// `GdiFgn` (default 1): copies from foreign NVK images on the copy engine; 0 drops them.
+    pub const GDI_FGN: KnobName = KnobName::new(b"GdiFgn");
+    /// `GdiFgnAcq` (default 0): 1 lets such a copy acquire the producer's semaphore (a copy-engine
+    /// acquire cannot time out); 0 copies the image as it is in memory.
+    pub const GDI_FGN_ACQ: KnobName = KnobName::new(b"GdiFgnAcq");
+    /// `GdiSysCe` (default 1): copies and fills over a staging buffer's copy-engine view
+    /// (`ce_sysmem::with_standard`); 0 keeps them on the CPU path.
+    pub const GDI_SYS_CE: KnobName = KnobName::new(b"GdiSysCe");
+    /// `GdiPair` (default 1): staging-to-staging copies with two views (`with_standard_pair`);
+    /// 0 keeps them on the CPU path.
+    pub const GDI_PAIR: KnobName = KnobName::new(b"GdiPair");
     /// `DXGK_VIDMMCAPS` extra bits (default 0 = the driver's own word). A raw mask OR'd into
     /// `MemoryManagementCaps`; only bit 9 `NonCpuVisiblePrimary` (0x200) is accepted
     /// (`helios_kmd_logic::vidmm_caps`), the rest is dropped and reported in `VmCapsXMsk`. The
@@ -1299,6 +1311,9 @@ pub mod knobs {
     /// engine, CPU readers and writers through a bounce buffer (default 0 = off; 1 = on).
     /// `helios_kmd_logic::rm_vidmem`, `docs/vram-redirection.md` 5.3-5.6. Read at StartDevice.
     pub const REDIR_VRAM: KnobName = KnobName::new(b"RedirVram");
+    /// `RedirVram` per-path switches for bisecting (default 0; bits in
+    /// `helios_kmd_logic::rm_vidmem::off`). Read at StartDevice.
+    pub const RV_OFF: KnobName = KnobName::new(b"RvOff");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,

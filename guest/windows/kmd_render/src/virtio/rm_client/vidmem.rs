@@ -72,6 +72,12 @@ static STATE: SpinLock<State> = SpinLock::new(State {
 });
 
 static KNOB: AtomicU32 = AtomicU32::new(UNREAD);
+static OFF: AtomicU32 = AtomicU32::new(0);
+
+/// Whether `RvOff` has `bit` (`rm_vidmem::off`). One relaxed load.
+pub(crate) fn off(bit: u32) -> bool {
+    OFF.load(Ordering::Relaxed) & bit != 0
+}
 static LIVE: AtomicU32 = AtomicU32::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -126,6 +132,9 @@ pub(crate) fn any_live() -> bool {
 pub(crate) fn reset_for_start() {
     let k = crate::diag::read_config_dword(crate::diag::knobs::REDIR_VRAM, rv::KNOB_OFF);
     KNOB.store(k, Ordering::Relaxed);
+    let o = crate::diag::read_config_dword(crate::diag::knobs::RV_OFF, 0);
+    OFF.store(o, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"RvOffEff", o);
     for c in [
         &TRY, &OK, &VENUS, &WHY, &STAGE, &FAIL, &FREED, &BRING, &MS, &MS_MAX, &SOFT, &LEAK, &OPEN,
         &OPEN_FG, &OPEN_LAY,

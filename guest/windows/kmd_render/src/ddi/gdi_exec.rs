@@ -129,7 +129,35 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 
 /// StartDevice (PASSIVE): zero everything, forget the jobs of the previous generation (their
 /// fences went with it).
-pub(crate) fn reset_for_start(_on: bool) {
+/// The bisect switches (`GdiFgn`, `GdiFgnAcq`, `GdiSysCe`, `GdiPair`), bits 0..3 of `PATHS`.
+static PATHS: AtomicU32 = AtomicU32::new(PATH_FGN | PATH_SYS | PATH_PAIR);
+const PATH_FGN: u32 = 1;
+const PATH_FGN_ACQ: u32 = 2;
+const PATH_SYS: u32 = 4;
+const PATH_PAIR: u32 = 8;
+
+fn path(bit: u32) -> bool {
+    PATHS.load(Ordering::Relaxed) & bit != 0
+}
+
+pub(crate) fn reset_for_start(on: bool) {
+    if on {
+        use crate::diag::{knobs, read_config_dword as rd};
+        let mut p = 0;
+        if rd(knobs::GDI_FGN, 1) != 0 {
+            p |= PATH_FGN;
+        }
+        if rd(knobs::GDI_FGN_ACQ, 0) == 1 {
+            p |= PATH_FGN_ACQ;
+        }
+        if rd(knobs::GDI_SYS_CE, 1) != 0 {
+            p |= PATH_SYS;
+        }
+        if rd(knobs::GDI_PAIR, 1) != 0 {
+            p |= PATH_PAIR;
+        }
+        PATHS.store(p, Ordering::Relaxed);
+    }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
         &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY,
@@ -177,6 +205,7 @@ pub(crate) fn publish_counters() {
     w(b"GdiFgnCe", FGN_CE.load(Ordering::Relaxed));
     w(b"GdiFgnFail", FGN_FAIL.load(Ordering::Relaxed));
     w(b"GdiFgnWhy", FGN_WHY.load(Ordering::Relaxed));
+    w(b"GdiPaths", PATHS.load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
 }
 
@@ -199,6 +228,14 @@ fn ensure_channel(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
             CE_WHY.store(16 + s, Ordering::Relaxed);
             false
         }
+    }
+}
+
+/// The executor thread's first act: the channel up before any job asks (`RedirVram` on and the
+/// channel cold). PASSIVE.
+pub(crate) fn warm_up(passive: PassiveLevel, adapter: &AdapterContext) {
+    if crate::ddi::gdi_accel::on() && glue::vram_knob_on() && glue::channel_state() == 1 {
+        let _ = ensure_channel(passive, adapter);
     }
 }
 
@@ -499,10 +536,13 @@ fn run_foreign(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool
         FGN_WHY.store(why, Ordering::Relaxed);
         false
     };
+    if !path(PATH_FGN) {
+        return fail(9);
+    }
     if glue::channel_state() != 0 {
         return fail(6);
     }
-    let Some(fs) = glue::foreign_source(passive, adapter, src.resource_id) else {
+    let Some(fs) = glue::foreign_source(passive, adapter, src.resource_id, path(PATH_FGN_ACQ)) else {
         return fail(1);
     };
     let mut pairs: Vec<(Rect, Rect)> = Vec::new();
@@ -563,7 +603,7 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
         Engine::Cpu => {
             // A copy or fill that touches a staging buffer: the copy engine over its system pages
             // first, the CPU only when that is refused.
-            if op.why == Some(Why::SystemSurface) && run_ce_sys(passive, adapter, op) {
+            if op.why == Some(Why::SystemSurface) && path(PATH_SYS) && run_ce_sys(passive, adapter, op) {
                 SYS_CE.fetch_add(1, Ordering::Relaxed);
                 match op.cmd {
                     Cmd::ColorFill { .. } => FILL_N.fetch_add(1, Ordering::Relaxed),
@@ -753,7 +793,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                         submit_and_wait(passive, op, v, Some(v))
                     })
                 }
-                (SurfaceClass::System, SurfaceClass::System) => {
+                (SurfaceClass::System, SurfaceClass::System) if path(PATH_PAIR) => {
                     // Staging to another staging buffer: both views in one content transaction.
                     let a = (src.resource_id, map_pitch(&src, spc), src.width, src.height);
                     let b = (dst.resource_id, map_pitch(&dst, dpc), dst.width, dst.height);

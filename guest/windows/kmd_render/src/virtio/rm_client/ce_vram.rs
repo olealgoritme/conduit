@@ -46,6 +46,11 @@ pub(crate) const TIMEOUT: Fail = Fail::new(FailKind::Transport, 0xE8);
 /// The channel refused the submit (ring full, no channel, a push it would not build).
 pub(crate) const SUBMIT: Fail = Fail::new(FailKind::Transport, 0xE9);
 
+/// The path is switched off (`RvOff`).
+pub(crate) const DISABLED: Fail = Fail::new(FailKind::Refused, 0xF0);
+
+static WAIT_TMO: AtomicU32 = AtomicU32::new(0);
+
 /// The longest synchronous transfer or copy wait.
 pub(crate) const XFER_MS: u64 = 250;
 /// The I/O allowance of one call (dups, maps, the bounce's allocation).
@@ -172,6 +177,10 @@ fn foreign_source_inner(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<ForeignSource, Fail> {
+    use helios_kmd_logic::rm_vidmem::off;
+    if super::vidmem::off(off::FOREIGN) {
+        return Err(DISABLED);
+    }
     let view = super::ce_route::chan_view();
     let (true, Some(gen)) = (view.up, view.gen) else {
         return Err(super::ce_route::NO_CHANNEL);
@@ -190,12 +199,18 @@ fn foreign_source_inner(
             width: s.width,
             height: s.height,
             fourcc: s.fourcc,
-            acquire: Some(helios_kmd_logic::ce_present::Acquire {
-                va: p.sem_va,
-                value: rec.record.semaphore.value,
-            }),
+            // Opt-in only (`RvOff` 0x100): the record's value may never be released again.
+            acquire: super::vidmem::off(off::FOREIGN_ACQUIRE_ON).then_some(
+                helios_kmd_logic::ce_present::Acquire {
+                    va: p.sem_va,
+                    value: rec.record.semaphore.value,
+                },
+            ),
             chan_gen: chan_gen(),
         });
+    }
+    if super::vidmem::off(off::FOREIGN_IMPORT) {
+        return Err(DISABLED);
     }
     let (layout, size) = adapter
         .with_virtio(|v| v.foreign_record(resource_id))
@@ -300,8 +315,18 @@ fn import_foreign(
     };
     let (h_mem, h_virt) = rv::map_handles(slot);
     // 1. The host: the resource's memory as a GEM of the channel client's DRM file.
+    // `RvFgnWhy` of a failed host import: 0x8001_00EE the host does not serve RmResourceImport (config
+    // feature bit 14), 0x8001_00ED the KMD's own gate refused it, 0x8003_00xx the host's errno xx,
+    // 0x8002_00EF no transport.
+    use crate::virtio::rm_resource_import::RiError;
+    use helios_kmd_logic::foreign_errno::Verdict;
     let gem = crate::virtio::rm_resource_import::rm_resource_import_kmd(io.passive, io.adapter, h.drm, resource_id)
-        .map_err(|_| Fail::new(FailKind::Refused, 0xED))?
+        .map_err(|e| match e {
+            RiError::Local(Verdict::Unsupported) => Fail::new(FailKind::Refused, 0xEE),
+            RiError::Local(_) => Fail::new(FailKind::Refused, 0xED),
+            RiError::Host(_, errno) => Fail::new(FailKind::Host, errno & 0xff),
+            RiError::NoTransport => Fail::new(FailKind::Transport, 0xEF),
+        })?
         .gem_handle;
     let r = import_gem(io, h, gem, h_mem);
     // The GEM is only the envelope (our RM handle holds the memory once imported).
@@ -611,6 +636,11 @@ pub(crate) fn wait(passive: PassiveLevel, value: u64, max_ms: u64) -> bool {
         }
         let t = now();
         if t >= deadline {
+            // A copy of the KMD's own that did not complete in time: the channel may be stuck (an
+            // acquire that never releases, a fault). Nothing more is submitted until the route's
+            // worker tears it down (bounded), which discharges what is queued behind it.
+            WAIT_TMO.fetch_add(1, Ordering::Relaxed);
+            super::ce_route::mark_broken();
             return false;
         }
         if t < start + ce::SPIN_100NS {
@@ -825,6 +855,7 @@ pub(crate) fn publish_counters() {
     rec(b"RvXferMax", XFER_MAX.load(Ordering::Relaxed));
     rec(b"RvCopy", COPY.load(Ordering::Relaxed));
     rec(b"RvCopyFail", COPY_FAIL.load(Ordering::Relaxed));
+    rec(b"RvWaitTmo", WAIT_TMO.load(Ordering::Relaxed));
     if FGN_REC.load(Ordering::Relaxed) | FGN_IMP.load(Ordering::Relaxed) | FGN_FAIL.load(Ordering::Relaxed) != 0 {
         rec(b"RvFgnRec", FGN_REC.load(Ordering::Relaxed));
         rec(b"RvFgnImp", FGN_IMP.load(Ordering::Relaxed));

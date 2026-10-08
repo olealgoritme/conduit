@@ -39,6 +39,31 @@ pub const KNOB_OFF: u32 = 0;
 /// them on the copy engine (with `RmCopyEngine` 1); CPU readers and writers through the bounce.
 pub const KNOB_ON: u32 = 1;
 
+/// `RvOff` (default 0): per-path switches for bisecting `RedirVram` on hardware (a set bit turns
+/// that path OFF, the caller then takes its fallback), plus one opt-in.
+pub mod off {
+    /// `ce_vram::foreign_source` refuses (both the record and the import path).
+    pub const FOREIGN: u32 = 0x1;
+    /// Its import-by-resource-id path refuses (records still serve).
+    pub const FOREIGN_IMPORT: u32 = 0x2;
+    /// `ce_sysmem::with_standard_pair` refuses.
+    pub const PAIR: u32 = 0x8;
+    /// `ce_sysmem::with_standard` (and the pair) refuse: GDI staging copies go to the CPU.
+    pub const SYSMEM: u32 = 0x10;
+    /// GDI staging buffers stay Venus blobs (no RM system memory, `sysmem::try_create_standard`).
+    pub const STAGING_RM: u32 = 0x40;
+    /// The Present hook (`ddi/vram_redirect.rs`) skips every Blt with a VRAM surface (counted).
+    pub const PRESENT_HOOK: u32 = 0x80;
+    /// OPT-IN: the CPU helpers reuse blob views (`build_paging_buffer`). Off by default since 364.1:
+    /// a view kept after its blob left that window range is a cached alias of whatever the host maps
+    /// there next.
+    pub const CPU_VIEWS_ON: u32 = 0x200;
+    /// OPT-IN, not a switch-off: a foreign copy from a record ACQUIREs the producer's semaphore.
+    /// Off by default since 364.1 (a record's semaphore value is not guaranteed to be released
+    /// again, e.g. a recreated swap chain, and an acquire that never releases holds the channel).
+    pub const FOREIGN_ACQUIRE_ON: u32 = 0x100;
+}
+
 /// The knob as read from the service key: anything but 1 is off.
 pub const fn knob_on(v: u32) -> bool {
     v == KNOB_ON
@@ -672,7 +697,7 @@ pub fn bounce_copy(vram: &Surface, rect: Rect, dir: Dir) -> Result<CopyRect, Cop
 /// driver checks the list).
 pub const COUNTERS: &[&str] = &[
     // the service (`vidmem.rs`)
-    "RvKnob", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
+    "RvKnob", "RvOffEff", "RvWaitTmo", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
     "RvBytes", "RvFreed", "RvBring", "RvMs", "RvMsMax", "RvSoft", "RvLeak", "RvOpen", "RvOpenFg",
     "RvOpenLay", "RvOpenPid",
     // the channel side (`ce_vram.rs`)

@@ -59,6 +59,7 @@ enum Why {
     Write = 9,
     Memory = 10,
     UnknownSource = 11,
+    Disabled = 12,
 }
 
 static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -155,6 +156,9 @@ pub(crate) unsafe fn blt(
         return None;
     }
     SEEN.fetch_add(1, Ordering::Relaxed);
+    if vidmem::off(helios_kmd_logic::rm_vidmem::off::PRESENT_HOOK) {
+        return skip(Why::Disabled);
+    }
     let Some((src_rect, dst_rect)) = rects(args, source, destination) else {
         return skip(Why::Rect);
     };

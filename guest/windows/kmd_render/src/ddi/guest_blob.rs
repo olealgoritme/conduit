@@ -511,6 +511,7 @@ pub(crate) fn before_lease_change(
     crate::ddi::ce_present_route::before_lease_change(passive, adapter, guard, resource_id);
     // `RedirVram`: a CE view of the same pages (`ce_sysmem`) goes too (one relaxed load if none).
     crate::ddi::ce_sysmem::before_lease_change(passive, adapter, resource_id);
+    crate::ddi::build_paging_buffer::drop_cpu_view(resource_id);
     let Some(record) = adapter.system_backings.guest_record(resource_id) else {
         return;
     };
@@ -588,6 +589,7 @@ pub(crate) fn destination_gone(
     // The copy-engine route's record of the destination (one relaxed load without one).
     crate::ddi::ce_present_route::destination_gone(passive, adapter, guard, resource_id);
     crate::ddi::ce_sysmem::destination_gone(passive, adapter, resource_id);
+    crate::ddi::build_paging_buffer::drop_cpu_view(resource_id);
     if adapter.system_backings.guest_record(resource_id).is_none() {
         return;
     }

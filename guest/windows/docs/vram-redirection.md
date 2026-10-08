@@ -497,6 +497,32 @@ blob each time; the views are released at StopDevice and StartDevice. Counters p
 which alone would explain ~200 MB/s), `RvCpuHit`, `RvCpuView` (1 leases, 2 blob). Staging -> staging
 between RM-backed buffers should not reach the CPU at all any more (`with_standard_pair`).
 
+After the 364.1 guest hang (windowed Heaven, `RedirVram` 1 + G1), every new path got a bounded wait
+and a switch (`RvOff`, a bit mask read at StartDevice, mirrored `RvOffEff`; a set bit turns the path
+off and its caller takes the fallback):
+
+| bit | path |
+|---|---|
+| 0x1 | `ce_vram::foreign_source` (both the record and the import path) |
+| 0x2 | its import-by-resource-id path only |
+| 0x8 | `ce_sysmem::with_standard_pair` |
+| 0x10 | `ce_sysmem::with_standard` and the pair (GDI staging copies on the CPU) |
+| 0x40 | GDI staging buffers from RM system memory (`sysmem::try_create_standard`) |
+| 0x80 | the Present hook (`ddi/vram_redirect.rs`): every Blt with a VRAM surface is a counted skip |
+| 0x100 | OPT-IN: a foreign copy from a record acquires the producer's semaphore |
+| 0x200 | OPT-IN: the CPU helpers reuse blob views |
+
+Two defaults changed with it: the record path's semaphore ACQUIRE is now opt-in (a record's value is
+not guaranteed to be released again, e.g. after a swap chain is recreated, and an acquire that never
+releases holds the copy engine for every user), and the CPU view reuse is opt-in (a view kept after its
+blob left that window range is a cached alias of whatever the host maps there next; reused views are
+also dropped at every paging change and destroy of their buffer). `ce_vram::wait` now marks the channel
+broken when a copy of the KMD's own does not complete in time (`RvWaitTmo`): nothing more is submitted,
+and the route's worker tears the channel down (bounded) and discharges what queued behind it. The waits
+of the other paths were already bounded: RM I/O by `IO_MS` (2 s) per call inside a bounded section, the
+channel I/O by 250 ms, the copies by `XFER_MS` (250 ms); the content transaction is held only around one
+command's resolve, copies and waits.
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
@@ -780,6 +806,24 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   reads whole bounding windows; a GDI-heavy desktop costs worker time the Present path shares.
 * ClearType's gamma row is read from the `LOOKUPTABLE` surface at `Gamma * pitch` (8 bpp, 512 entries);
   if that surface is not a standard buffer the blend runs without gamma.
+
+### 10.6b Bisect switches (365.1)
+
+364.1 hung the guest under windowed Heaven with every new path on. Each path GDI acceleration added
+in 362-364 has its own service-key switch, read at StartDevice with `GdiAccel=1` and mirrored as
+`GdiPaths` (bit 0 `GdiFgn`, 1 `GdiFgnAcq`, 2 `GdiSysCe`, 3 `GdiPair`):
+
+| knob | default | 0 means |
+|---|---|---|
+| `GdiFgn` | 1 | copies from foreign NVK images are dropped (`GdiFgnWhy` 9) |
+| `GdiFgnAcq` | **0** | a foreign copy does not acquire the producer's semaphore (a copy-engine acquire cannot time out; a value never reached would stall the channel the Present route shares); the image is copied as it is in memory |
+| `GdiSysCe` | 1 | copies and fills over a staging buffer's copy-engine view are not tried; the CPU path runs them |
+| `GdiPair` | 1 | staging-to-staging copies between two buffers run on the CPU |
+
+Every wait of the executor is bounded: the copy-engine waits 100 ms (the job's command is then
+redone on the CPU or dropped), `ce_sysmem`'s channel I/O 250 ms, the RM calls their bounded sections,
+a busy channel 10 retries of 1 ms. The V2 side's switches (foreign import, the CPU view cache) are
+its own (section 5.9).
 
 ### 10.7 Test recipe (main session)
 
