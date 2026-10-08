@@ -535,7 +535,13 @@ fn read_loop(sock: &OwnedFd, shared: &Shared, tx: Sender<Reply>) {
             // The hook takes them here, on this thread, when it can: one
             // thread hop fewer than waking whoever polls the eventfd.
             if !shared.hook.get().is_some_and(|h| h()) {
-                eventfd_signal(shared.event.as_fd());
+                // Signalled under the lock, and only if fences are still
+                // queued: `signalled` resets and takes under the same lock, so
+                // a take that raced this one leaves no stale wakeup behind.
+                let q = shared.fences.lock().unwrap_or_else(|p| p.into_inner());
+                if !q.is_empty() {
+                    eventfd_signal(shared.event.as_fd());
+                }
             }
         } else if tx.send(Ok(m)).is_err() {
             break;
@@ -653,15 +659,21 @@ impl Renderer for IpcClient {
     }
 
     fn signalled(&mut self) -> Result<Vec<Signalled>> {
-        // Reset before taking: a fence queued after the take signals the
-        // eventfd again, so none is left without a wakeup. The opposite order
-        // could swallow one.
+        // Reset and take under the fence lock, which the reader also holds
+        // to signal for fences: the eventfd is then readable exactly when
+        // fences are queued (or the renderer died). A fence queued after the
+        // take signals again, so none is left without a wakeup, and a fence
+        // taken here leaves no wakeup behind for an empty queue.
+        let mut q = self.shared.fences.lock().unwrap_or_else(|p| p.into_inner());
+        // Reset before reading death: the reader marks itself dead and then
+        // signals, so a death after this read still leaves a wakeup.
         eventfd_reset(self.shared.event.as_fd());
         // Death is read before the take: the reader queues every fence it got
         // before marking itself dead, so if it was dead already, this take
         // has all of them.
         let dead = self.is_disconnected();
-        let f = std::mem::take(&mut *self.shared.fences.lock().unwrap_or_else(|p| p.into_inner()));
+        let f = std::mem::take(&mut *q);
+        drop(q);
         if !dead {
             return Ok(f);
         }
