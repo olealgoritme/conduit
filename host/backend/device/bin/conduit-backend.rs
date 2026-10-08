@@ -434,9 +434,61 @@ impl WindowPlacer for VhostWindow {
 enum Watch {
     /// A descriptor, and whether it is a fence: reported once, with its
     /// status, then dropped from the set (docs/SYNC.md).
-    Add(u32, OwnedFd, bool),
+    /// The `Instant` is when it was sent, for the add-latency histogram.
+    Add(u32, OwnedFd, bool, Instant),
     Remove(u32),
 }
+
+/// Wakes the event pump out of `epoll_wait` when the control channel has
+/// something for it (an eventfd in the pump's epoll set). Without it a new
+/// descriptor waits for the pump's next timeout -- up to `SWEEP`, a
+/// millisecond -- before it is watched, and a fence that signals in that window
+/// is reported that late: about half a millisecond per RM fence on average,
+/// and an NVK D3D12 frame has ~20 of them (one per ExecuteCommandLists, HE12
+/// v4). `CONDUIT_PUMP_WAKE=0` restores the timeout-only pump.
+struct PumpWake(OwnedFd);
+
+impl PumpWake {
+    fn new() -> Option<Self> {
+        if std::env::var("CONDUIT_PUMP_WAKE").as_deref() == Ok("0") {
+            log::info!("event pump: wake eventfd off (CONDUIT_PUMP_WAKE=0)");
+            return None;
+        }
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            log::warn!(
+                "event pump: eventfd: {}; new watches wait for the sweep",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn wake(&self) {
+        let one: u64 = 1;
+        // A full counter (EAGAIN) is already a pending wake.
+        let _ = unsafe {
+            libc::write(self.0.as_raw_fd(), (&one as *const u64).cast(), size_of::<u64>())
+        };
+    }
+
+    fn drain(&self) {
+        let mut n: u64 = 0;
+        let _ = unsafe {
+            libc::read(self.0.as_raw_fd(), (&mut n as *mut u64).cast(), size_of::<u64>())
+        };
+    }
+}
+
+/// The epoll tag of the pump's wake eventfd: outside every 32-bit handle.
+const PUMP_WAKE_TAG: u64 = u64::MAX;
+
+/// Send-to-watch latency of fence adds, in microseconds: bucket upper bounds
+/// (the last bucket is open).
+const ADD_LAT_BUCKETS_US: [u64; 5] = [50, 200, 500, 1000, 2000];
+/// Fence adds per add-latency log line.
+const ADD_LAT_LOG_EVERY: u64 = 16384;
 
 /// One `EventReady` message: a bare header naming the descriptor. `status`
 /// is 0, or a fence's error as a negative errno.
@@ -911,6 +963,7 @@ impl PresentedSink for VqReleaseSink {
 /// measured: 500,000 system calls a second).
 fn event_pump(
     rx: Receiver<Watch>,
+    wake: Option<Arc<PumpWake>>,
     vring: VringRwLock,
     mem: GuestMemoryAtomic<GuestMemoryMmap>,
     batch: bool,
@@ -963,12 +1016,53 @@ fn event_pump(
         unsafe { libc::epoll_ctl(epfd.as_raw_fd(), op, fd, &mut ev) }
     };
 
+    if let Some(w) = wake.as_ref() {
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: PUMP_WAKE_TAG,
+        };
+        if unsafe { libc::epoll_ctl(epfd.as_raw_fd(), libc::EPOLL_CTL_ADD, w.0.as_raw_fd(), &mut ev) } != 0 {
+            log::warn!(
+                "event pump: watching the wake eventfd: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    let mut add_lat = [0u64; ADD_LAT_BUCKETS_US.len() + 1];
+    let mut add_lat_n = 0u64;
+    let mut add_lat_max_us = 0u64;
+
     loop {
         // Drain the control channel first: a descriptor closed on the other
         // thread must leave the set before it can be reported again.
         loop {
             match rx.try_recv() {
-                Ok(Watch::Add(handle, fd, fence)) => {
+                Ok(Watch::Add(handle, fd, fence, sent)) => {
+                    if fence {
+                        let us = sent.elapsed().as_micros() as u64;
+                        let b = ADD_LAT_BUCKETS_US
+                            .iter()
+                            .position(|&bound| us < bound)
+                            .unwrap_or(ADD_LAT_BUCKETS_US.len());
+                        add_lat[b] += 1;
+                        add_lat_max_us = add_lat_max_us.max(us);
+                        add_lat_n += 1;
+                        if add_lat_n % ADD_LAT_LOG_EVERY == 0 {
+                            log::info!(
+                                "event pump: {add_lat_n} fence adds, send-to-watch <50us {} <200us {} \
+                                 <500us {} <1ms {} <2ms {} >=2ms {}, max {add_lat_max_us} us (wake {})",
+                                add_lat[0],
+                                add_lat[1],
+                                add_lat[2],
+                                add_lat[3],
+                                add_lat[4],
+                                add_lat[5],
+                                if wake.is_some() { "on" } else { "off" },
+                            );
+                            add_lat = [0; ADD_LAT_BUCKETS_US.len() + 1];
+                            add_lat_max_us = 0;
+                        }
+                    }
                     if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), handle) == 0 {
                         // Edge-triggered misses a descriptor that is already
                         // readable when it is added: a fence made for a value
@@ -1117,7 +1211,15 @@ fn event_pump(
         for ev in events.iter().take(n as usize) {
             // Copied out first: epoll_event is packed, so its field cannot be
             // borrowed.
-            let handle = { ev.u64 } as u32;
+            let tag = { ev.u64 };
+            if tag == PUMP_WAKE_TAG {
+                // The control channel is drained at the top of the loop.
+                if let Some(w) = wake.as_ref() {
+                    w.drain();
+                }
+                continue;
+            }
+            let handle = tag as u32;
             let fence = once.contains(&(handle as u64));
             // Already sent by the sweep above: one EventReady per fence.
             if fence && reported.contains(&(handle as u64)) {
@@ -1338,6 +1440,8 @@ struct NvGpuBackend {
     /// Started on the first message, because the event queue and guest memory
     /// are not known before then.
     watches: Option<Sender<Watch>>,
+    /// The event pump's wake eventfd, written after each batch of sends.
+    watch_wake: Option<Arc<PumpWake>>,
     /// Where display input goes; filled in alongside `watches`.
     input_target: EventTarget,
     /// Whether the guest takes display input: set from the acked features
@@ -1490,6 +1594,7 @@ impl NvGpuBackend {
             // can enumerate the GPU before the shared window exists.
             config,
             watches: None,
+            watch_wake: None,
             input_target,
             input_claims,
             display_link,
@@ -1622,10 +1727,15 @@ impl NvGpuBackend {
             *self.input_target.lock().expect("event target") = Some((vring.clone(), mem.clone()));
             let (tx, rx) = channel();
             let batch = self.latency.event_batch;
+            let wake = PumpWake::new().map(Arc::new);
+            let pump_wake = wake.clone();
             std::thread::Builder::new()
                 .name("nvgpu-events".into())
-                .spawn(move || event_pump(rx, vring, mem, batch))
-                .map(|_| self.watches = Some(tx))
+                .spawn(move || event_pump(rx, pump_wake, vring, mem, batch))
+                .map(|_| {
+                    self.watches = Some(tx);
+                    self.watch_wake = wake;
+                })
                 .unwrap_or_else(|e| log::error!("event pump would not start: {e}"));
         }
         let Some(tx) = self.watches.as_ref() else {
@@ -1651,10 +1761,14 @@ impl NvGpuBackend {
                 handle,
                 unsafe { OwnedFd::from_raw_fd(dup) },
                 fence,
+                Instant::now(),
             ));
         }
         for handle in removed {
             let _ = tx.send(Watch::Remove(handle));
+        }
+        if let Some(w) = self.watch_wake.as_ref() {
+            w.wake();
         }
     }
 
