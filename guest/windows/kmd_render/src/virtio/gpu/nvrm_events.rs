@@ -53,8 +53,8 @@
 
 use super::*;
 use crate::virtio::nvrm::{
-    NVRM_EV_DROPS, NVRM_EV_ERRORS, NVRM_EV_LATCHED, NVRM_EV_LOST, NVRM_EV_OTHER, NVRM_EV_SIGNALS,
-    NVRM_FENCE_ERRORS, NVRM_FENCE_FIRED,
+    NVRM_EV_DROPS, NVRM_EV_ERRORS, NVRM_EV_FULL, NVRM_EV_LATCHED, NVRM_EV_LOST, NVRM_EV_MAX_PASS,
+    NVRM_EV_OTHER, NVRM_EV_SIGNALS, NVRM_FENCE_ERRORS, NVRM_FENCE_FIRED,
 };
 use helios_kmd_logic::nvrm_events::{
     kind_has_no_handle, kind_known, Added, KINDS_ALL, KINDS_SCANOUT_RELEASE, KIND_LOST, KIND_READY,
@@ -83,8 +83,11 @@ const NEVER_ACKED_TAKES_INPUT: u64 = helios_protocol::NVGPU_F_TAKES_INPUT;
 pub(super) const EVENT_QUEUE: u16 = 1;
 /// Small on purpose: `VirtQueue<_, N>::new` returns a by-value slot that grows
 /// with N and sits on the boot stack under `VirtioGpu::init` (see
-/// tools/kmd-frame-sizes.ps1). Events are rare and level-triggered on the host,
-/// so a handful of buffers is plenty.
+/// tools/kmd-frame-sizes.ps1). Under a game they are not rare: the NVK devices'
+/// non-stall event files and the RM fences fill all 16 before the DPC runs
+/// (`NvEvFull`), and the host keeps what finds no buffer and sends it on the
+/// re-post kick (its event backlog) and coalesces a non-stall report the driver
+/// has not read yet. Growing this needs the boot-stack budget measured first.
 const EVENT_QUEUE_SIZE: usize = 16;
 /// Bytes of one posted buffer: room for the 16-byte `EventReady`, the 48-byte
 /// `ScanoutReleased`, and, should a host send one anyway, a short `DisplayMode`
@@ -593,11 +596,16 @@ impl VirtioGpu {
         }
         let mut reposted = false;
         let mut wake_worker = false;
+        let mut taken = 0u32;
         for _ in 0..EVENT_QUEUE_SIZE {
             let Some(ring) = self.nvrm_event_ring.as_mut() else {
                 return wake_worker;
             };
-            match take_event(ring) {
+            let event = take_event(ring);
+            if !matches!(event, Taken::Empty | Taken::Broken) {
+                taken += 1;
+            }
+            match event {
                 Taken::Empty => break,
                 Taken::Ready(handle, status) => {
                     reposted = true;
@@ -634,6 +642,19 @@ impl VirtioGpu {
                     NVRM_EV_ERRORS.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
+            }
+        }
+        if taken != 0 {
+            NVRM_EV_MAX_PASS.fetch_max(taken, Ordering::Relaxed);
+        }
+        // Half the ring or more in one pass: the host was short of buffers, and
+        // one that holds reports it had none for (a backlog) sends them on this
+        // kick rather than at its next sweep. Kicked then even for a pass of
+        // releases and presentation reports, which on their own are not.
+        if taken as usize >= EVENT_QUEUE_SIZE / 2 {
+            reposted = true;
+            if taken as usize == EVENT_QUEUE_SIZE {
+                NVRM_EV_FULL.fetch_add(1, Ordering::Relaxed);
             }
         }
         // A host that serves queue-1 kicks as requests would answer every kick

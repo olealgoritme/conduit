@@ -271,6 +271,15 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvEvErr",
         crate::virtio::nvrm::NVRM_EV_ERRORS.load(Ordering::Relaxed),
     );
+    // Drain passes that emptied a full ring, and the most one pass took.
+    crate::diag::record_named_bytes(
+        b"NvEvFull",
+        crate::virtio::nvrm::NVRM_EV_FULL.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvMaxP",
+        crate::virtio::nvrm::NVRM_EV_MAX_PASS.load(Ordering::Relaxed),
+    );
     // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
     // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
     crate::adapter::foreign_scanout::publish_counters();
