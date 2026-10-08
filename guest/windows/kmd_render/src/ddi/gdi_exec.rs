@@ -327,11 +327,11 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
-    for s in RES_SLOTS.iter().chain(SEEN_SLOTS.iter()) {
+    for s in RES_SLOTS.iter().chain(SEEN_SLOTS.iter()).chain(PRB.iter()).chain(PRB_SEEN.iter()).chain(PRE.iter()) {
         s.store(0, Ordering::Relaxed);
     }
     SEEN_N.store(0, Ordering::Relaxed);
@@ -431,6 +431,15 @@ pub(crate) fn publish_counters() {
     w(b"GdiChkGpuPx", CHK_GPU_PX.load(Ordering::Relaxed));
     w(b"GdiOpaqN", OPAQ_N.load(Ordering::Relaxed));
     w(b"GdiFmtK", FMT_K.load(Ordering::Relaxed));
+    const PRB_NAMES: [&[u8]; 7] = [b"GdiPrb1", b"GdiPrb2", b"GdiPrb3", b"GdiPrb4", b"GdiPrb5", b"GdiPrb6", b"GdiPrb7"];
+    for (name, s) in PRB_NAMES.iter().zip(PRB.iter()) {
+        w(name, s.load(Ordering::Relaxed));
+    }
+    w(b"GdiPrbK", PRB_K.load(Ordering::Relaxed));
+    const PRE_NAMES: [&[u8]; 4] = [b"GdiPre0", b"GdiPre1", b"GdiPre2", b"GdiPre3"];
+    for (name, s) in PRE_NAMES.iter().zip(PRE.iter()) {
+        w(name, s.load(Ordering::Relaxed));
+    }
     w(b"GdiChkWant", CHK_WANT.load(Ordering::Relaxed));
     w(b"GdiPitchMis", PITCH_MIS.load(Ordering::Relaxed));
     w(b"GdiPitchCmd", PITCH_CMD.load(Ordering::Relaxed));
@@ -976,7 +985,110 @@ fn run_foreign_write(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -
     true
 }
 
+// ── content probes (384.1: Explorer's textures and the wallpaper end up RGB 0) ─────────────────
+
+/// Per opcode 1..7 (index opcode - 1): probes made | destination row all RGB 0 after the command
+/// << 10 | source row all RGB 0 << 20 (each saturating at 1023). Only commands into GPU surfaces.
+static PRB: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+static PRB_SEEN: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+/// The last probe whose destination row came out all zero: opcode | source class bit << 4 | source
+/// GDI type << 8 | destination GDI type << 12 | source all zero << 16 | engine << 18 (0 CE, 1 CPU,
+/// 2 drop) | plan reason << 20 | DXGK rop enum << 26.
+static PRB_K: AtomicU32 = AtomicU32::new(0);
+/// The first command into each of the first 4 GPU destinations, BEFORE it runs: resource id << 16
+/// | magenta pixels (the `RvOff` 0x2000 clear) << 8 | RGB-0 pixels, of a row of up to 64 pixels.
+static PRE: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+/// One row of up to 64 pixels through the middle of `sub` on `s` (surface coordinates).
+fn probe_row(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, sub: &Rect, cmd_pitch: u32) -> Option<Vec<u8>> {
+    let r = clip_to(sub, s);
+    if r.is_empty() {
+        return None;
+    }
+    let y = r.top + r.height() / 2;
+    let w = r.width().min(64);
+    let x = r.left + (r.width() - w) / 2;
+    read_window(passive, adapter, s, &Rect::new(x, y, x + w, y + 1), pitch_of(s, cmd_pitch)).ok()
+}
+
+fn rgb_zero(px: &[u8]) -> bool {
+    px[0] == 0 && px[1] == 0 && px[2] == 0
+}
+
+fn all_rgb_zero(row: &[u8]) -> bool {
+    row.chunks_exact(4).all(rgb_zero)
+}
+
+fn gpu_dst(op: &Op) -> Option<Surface> {
+    op.dst.filter(|d| matches!(d.class, SurfaceClass::Vram | SurfaceClass::Foreign))
+}
+
+/// Before the command: the first touch of a GPU destination (did the magenta clear reach it?).
+fn probe_before(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    let (Some(d), Some(sub)) = (gpu_dst(op), op.subs.first()) else { return };
+    let id = d.resource_id & 0xffff;
+    if id == 0 || PRE.iter().any(|s| s.load(Ordering::Relaxed) >> 16 == id) {
+        return;
+    }
+    let Some(slot) = PRE.iter().find(|s| s.load(Ordering::Relaxed) == 0) else { return };
+    let Some(row) = probe_row(passive, adapter, &d, sub, cmd_pitches(&op.cmd).0) else { return };
+    let magenta = row.chunks_exact(4).filter(|p| p[0] == 0xff && p[1] == 0 && p[2] == 0xff).count().min(255) as u32;
+    let zero = row.chunks_exact(4).filter(|p| rgb_zero(p)).count().min(255) as u32;
+    slot.store(id << 16 | magenta << 8 | zero, Ordering::Relaxed);
+}
+
+/// After the command: is the destination's row, and the source's matching row, all RGB 0?
+fn probe_after(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    let (Some(d), Some(sub)) = (gpu_dst(op), op.subs.first()) else { return };
+    let i = (op.cmd.opcode() as usize).wrapping_sub(1);
+    if i >= PRB.len() {
+        return;
+    }
+    let n = PRB_SEEN[i].fetch_add(1, Ordering::Relaxed);
+    if n >= 32 && n % 16 != 0 {
+        return;
+    }
+    let (dpc, spc) = cmd_pitches(&op.cmd);
+    let Some(drow) = probe_row(passive, adapter, &d, sub, dpc) else { return };
+    let dz = all_rgb_zero(&drow);
+    // The source window the command read for the same sub-rectangle (ClearType: its alpha
+    // surface, where all zero means no glyph coverage).
+    let sz = match (op.srcs[0], cpu::src_window(&op.cmd, sub)) {
+        (Some(src), Some(sw)) => probe_row(passive, adapter, &src, &sw, spc).is_some_and(|r| all_rgb_zero(&r)),
+        _ => false,
+    };
+    let add = 1 | u32::from(dz) << 10 | u32::from(sz) << 20;
+    let _ = PRB[i].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let f = |shift: u32| ((v >> shift) & 0x3ff) + ((add >> shift) & 0x3ff);
+        let c = |x: u32| x.min(0x3ff);
+        Some(c(f(0)) | c(f(10)) << 10 | c(f(20)) << 20)
+    });
+    if dz {
+        let eng = match op.engine {
+            Engine::Ce => 0,
+            Engine::Cpu => 1,
+            Engine::Drop => 2,
+        };
+        let rop = match op.cmd {
+            Cmd::BitBlt { rop, .. } | Cmd::ColorFill { rop, .. } => u32::from(rop) & 0x7,
+            _ => 0,
+        };
+        PRB_K.store(
+            op.cmd.opcode()
+                | class_bit_of(op.srcs[0]) << 4
+                | op.srcs[0].map_or(0, |s| s.kind_bits & 0xf) << 8
+                | (d.kind_bits & 0xf) << 12
+                | u32::from(sz) << 16
+                | eng << 18
+                | op.why.map_or(0, |w| w.code()) << 20
+                | rop << 26,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    probe_before(passive, adapter, op);
     if opaque(op) {
         OPAQ_N.fetch_add(1, Ordering::Relaxed);
     }
@@ -988,6 +1100,7 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     if crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed) == drops {
         note_dst_written(op);
     }
+    probe_after(passive, adapter, op);
 }
 
 fn execute_inner(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {

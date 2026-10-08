@@ -738,6 +738,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiFgnRd`, `GdiFgnWb`, `GdiFgnRwF` | windows of foreign NVK images the CPU executor read and wrote back (`Why` 14 `Foreign`: fills, blends, ClearType, ROPs, foreign to foreign), and the transfers that failed |
 | `GdiSeen0..15`, `GdiSeenN` | destinations the parser saw whatever became of the command (first 16): `resource id << 16 \| class bit << 12 \| GDI surface type << 8 \| commands (max 255)`; distinct count (`+ 0x10000` per command to an unlisted one). A window whose surface is absent here gets no GDI commands at all |
 | `GdiChkA0`, `GdiChkAFF`, `GdiChkGpuPx`, `GdiOpaqN`, `GdiFmtK` | of the self-checked pixels in GPU surfaces: alpha 0, alpha 0xff, the last one read (32 bits); commands that wrote an opaque alpha; the last GPU write's formats (source D3DDDIFORMAT \| destination's << 16) |
+| `GdiPrb1..7`, `GdiPrbK`, `GdiPre0..3` | content probes of commands into GPU surfaces (a row of up to 64 pixels through the middle of the first sub-rectangle). `GdiPrb<opcode>`: probes \| destination row all RGB 0 after the command << 10 \| source row (the window the command read) all RGB 0 << 20, each to 1023 (first 32 per opcode, then every 16th). `GdiPrbK`: the last all-zero probe, `opcode \| src class << 4 \| src GDI type << 8 \| dst GDI type << 12 \| src all zero << 16 \| engine << 18 \| Why << 20 \| rop << 26`. `GdiPre<i>`: the first command into each of 4 destinations, before it ran: `resource id << 16 \| magenta pixels << 8 \| RGB-0 pixels` |
 | `GdiSlowRop`, `GdiCpuMsk`, `GdiCpuRop` | the slowest command's reason and ROP (`Why \| rop enum << 8 \| ROP3 << 16`); the reasons of the commands the CPU ran (bit per `Why` code, 1 for none); the last CPU command's reason and ROP |
 | `GdiJobMaxN`, `GdiJobT1..3`, `GdiJobT1Us..3Us` | the slowest job (`GdiUsMax`): its command count and its three slowest commands (signature as `GdiSlowOp`, µs) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
@@ -854,6 +855,13 @@ source carry alpha byte 0, which a compositor that blends the window texture rea
 `GdiChkA0`/`GdiChkAFF` now show the alpha the textures hold; an `X8` source into an `A8` texture
 always gets alpha 0xff (as the windowed Present's `remap_for`), and `GdiOff` 0x40 forces alpha 0xff on
 every GDI write into a GPU surface except AlphaBlend, for the A/B.
+
+**384.1 (`RvOff` 0x2000, magenta clear):** Explorer's list body and the wallpaper are RGB 0, no
+magenta, and GDI writes reach the textures (`GdiRes` decodes to res 83 x10, 88 x9, 92 x27, 98 x8; the
+encoding is `id << 12 | count`). The probes tell apart (a) a zero source (`GdiPrb` source bit with the
+destination bit), (b) a command that writes zero from a nonzero source (destination bit alone, e.g. a
+fill or a ROP), and (c) the clear never reaching the texture (`GdiPre` magenta 0 with zeros before the
+first command).
 
 ### 10.6b Bisect switches (`GdiOff`, since 368.1)
 
