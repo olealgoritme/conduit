@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 17] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 18] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -324,6 +324,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 17] {
         ("Nvk12AdmitAfterPresentOnly", nvk12_admit_after_present_only() as u32),
         // Appended.
         ("Nvk12EclFencePrefetch", nvk12_ecl_fence_prefetch() as u32),
+        // Appended.
+        ("Umd12ContextNode", umd12_context_node() as u32),
     ]
 }
 
@@ -441,6 +443,18 @@ pub(crate) static NVK12_ECL_FENCE_PREFETCH: BoolKnob = BoolKnob::new(c"Nvk12EclF
 
 pub(crate) fn nvk12_ecl_fence_prefetch() -> bool {
     NVK12_ECL_FENCE_PREFETCH.get()
+}
+
+/// `Umd12ContextNode` (default 0): on NVK, D3D12 queue contexts ask for WDDM
+/// node 1, which the KMD reports with `D3d12Node=1` and completes independently
+/// of node 0 (DWM, D3D11, presents): a D3D12 batch held for its RM fence no
+/// longer waits behind a present, nor the desktop behind it. A refusal (one
+/// node) falls back to node 0, counted (QueueContextNodeRefused). Read once per
+/// process.
+pub(crate) static UMD12_CONTEXT_NODE: BoolKnob = BoolKnob::new(c"Umd12ContextNode", false);
+
+pub(crate) fn umd12_context_node() -> bool {
+    UMD12_CONTEXT_NODE.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {
