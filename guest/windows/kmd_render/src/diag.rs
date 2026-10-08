@@ -1476,6 +1476,12 @@ pub mod knobs {
     /// display-only drivers report. Read at each caps query (reboot to apply); `CurCapRep`
     /// bits 16..23 say what was reported.
     pub const HW_CURSOR_CAPS: KnobName = KnobName::new(b"HwCursorCaps");
+    /// `HwCursorMax` (default 0 = 256): `MaxPointerWidth` / `MaxPointerHeight` reported, clamped
+    /// to 32..=256 (64 is the virtio-gpu / QXL display-only drivers' value). A/B lever; reboot.
+    pub const HW_CURSOR_MAX: KnobName = KnobName::new(b"HwCursorMax");
+    /// `SmoothRotCaps` (default 0): report `DXGK_DRIVERCAPS.SupportSmoothRotation` = 1, as those
+    /// drivers do. A/B lever for the hardware cursor; reboot. `CurCapRep` bit 9.
+    pub const SMOOTH_ROT_CAPS: KnobName = KnobName::new(b"SmoothRotCaps");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,
