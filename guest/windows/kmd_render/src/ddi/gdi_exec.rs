@@ -1005,10 +1005,10 @@ fn probe_row(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, sub: 
     if r.is_empty() {
         return None;
     }
-    let y = r.top + r.height() / 2;
+    let y = r.top + (r.height() / 2) as i32;
     let w = r.width().min(64);
-    let x = r.left + (r.width() - w) / 2;
-    read_window(passive, adapter, s, &Rect::new(x, y, x + w, y + 1), pitch_of(s, cmd_pitch)).ok()
+    let x = r.left + ((r.width() - w) / 2) as i32;
+    read_window(passive, adapter, s, &Rect::new(x, y, x + w as i32, y + 1), pitch_of(s, cmd_pitch)).ok()
 }
 
 fn rgb_zero(px: &[u8]) -> bool {
