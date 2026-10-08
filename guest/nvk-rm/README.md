@@ -74,6 +74,7 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 12 | `nvk, nvk/rm: compress separate depth/stencil images on GB20x` | `NVK_RM_COMPRESS_ZS=1` (default off while it is measured, `nvkmd_info::has_zs_compression`): combined depth/stencil formats (D24S8, D32S8X24), which Blackwell splits into separate depth and stencil planes, pass `nvk_image_can_compress`; both planes are compressed in a dedicated allocation (the memory's own VA) and in compressible memory from patch 11 (each plane's own VA). Needs 11. See "Compression outside dedicated allocations" |
 | 13 | `nvk, nvk/rm: a compressible device-local memory type for images on GB20x` | `NVK_RM_COMPRESS_TYPE=1` (default off): a second DEVICE_LOCAL type on the VRAM heap, before the plain one, whose memory is COMPR_ANY. Optimal-tiling images report it (not sparse, protected, host-transfer, external or video); buffers only when transfer-only (the clear buffers vkd3d-proton and DXVK put over image memory), never vertex, index, indirect, uniform, storage or device-address buffers. Needs 11 (and 12 for depth/stencil). See "A compressible memory type (patch 13)" |
 | 15 | `nvk, nvk/rm: compression diagnostics and a clear-on-allocate knob` | `NVK_RM_COMPRESS_CLEAR=1` writes every compressible memory once through its compressible VA at allocation (candidate fix for stale compression state); `NVK_RM_COMPRESS_UPGRADE=0` keeps uncompressed images in compressible memory on kind 0x6; `NVK_RM_COMPRESS_TYPE_SCOPE=attachments` offers patch 13's type only to images that are compressed themselves (against the spec, testing only). All inert unless set. Numbered 15: the build branches have their own 14. See "Corruption with patches 11 and 13" |
+| 16 | `nvk: copy-engine writes with LAUNCH_DMA_DISABLE_PLC` | copy-engine launches that write memory (copies, fills, the copy-engine `vkCmdUpdateBuffer` path, the upload queue) set `DISABLE_PLC`, as RM's memset/scrubber and UVM always do from Turing/Ampere on. `NVK_CE_DISABLE_PLC=1`/`0` forces it; unset it is on exactly when `NVK_RM_COMPRESS_ALL` or `NVK_RM_COMPRESS_TYPE` is, so the default stack is unchanged. Candidate fix for the corruption below |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
@@ -325,6 +326,47 @@ Test matrix (Counter-Strike 2, same spot; patch 15 gives the knobs):
 | C | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_TYPE_SCOPE=attachments` | fixed: something about uncompressed images in compressible memory (4) |
 | D | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_UPGRADE=0` | fixed (with C fixed too): reads or writes of those images through kind 0x8 |
 | E | `NVK_RM_COMPRESS_ALL=1 NVK_RM_COMPRESS_CLEAR=1` | beam gone: stale state (2) was also the beam; beam stays: host reads (1) or I2M (5), and patch 11 stays retired in favour of 13 |
+
+Results on 405.1 (de_dust2 against bots): base correct; A (`TYPE` +
+`CLEAR`) the whole window black; B (`TYPE` + `no_compression`) the model
+still black; C (`TYPE` + `SCOPE=attachments`) correct; E (`ALL` +
+`CLEAR`) the whole screen black. D not run.
+
+Reading: what the 3D engine writes into compressible memory reads back
+fine (render targets, dedicated or in the type); what the copy engine
+writes into it does not. Textures reach memory through copy-engine
+uploads (B keeps them in compressible memory, C moves them out), buffers
+too (patch 11's beam), and A and E add one copy-engine clear to every
+compressible memory, which then stays wrong even where the 3D engine
+renders over it. NVK never sets the copy engine's `LAUNCH_DMA_DISABLE_PLC`,
+while RM (`channel_utils.c` memset and scrub, "for anything after
+Turing") and UVM (`uvm_hal_ampere_ce_plc_mode_c7b5`) set it on every
+launch. Patch 16 sets it. So patch 11's beam is most likely the same
+cause (copy-engine uploads of vertex, index and indirect data), not host
+reads; I2M (`vkCmdUpdateBuffer` up to 2012 bytes) is not a copy-engine
+write and stays a separate open question for 11 only.
+
+Next runs (patch 16 on by itself with either knob):
+
+| run | settings | expect if 16 is the fix |
+|---|---|---|
+| F | `NVK_RM_COMPRESS_TYPE=1` | model correct (16 is on automatically) |
+| G | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_CLEAR=1` | correct, no black window |
+| H | `NVK_RM_COMPRESS_TYPE=1 NVK_CE_DISABLE_PLC=0` | model black again (control) |
+| I | `NVK_RM_COMPRESS_ALL=1` | no beam (if the beam stays: I2M or host reads) |
+| J | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_UPGRADE=0` | fallback if F fails: sampled-only images on 0x6 over compressible memory |
+
+Spec: for a color format `memoryTypeBits` may only depend on the tiling,
+the sparse, protected and split-instance flags, `HOST_TRANSFER` (when
+`identicalMemoryTypeRequirements` is false) and the external handle
+types, so there is no legal way to keep sampled-only color images out of
+the type; depth/stencil formats may differ per format. If 16 fixes the
+copy engine, they do not need to be kept out. `NVK_RM_COMPRESS_UPGRADE=0`
+(0x6 over compressible memory) is legal for RM (only a compressible kind
+over uncompressed memory is changed, and that is downgraded), and is
+consistent as long as those images are only accessed through their own
+VA; vkd3d-proton's and DXVK's clears through the heap's global buffer
+(kind 0x8) would alias it, which Vulkan leaves undefined anyway.
 
 ### GPU time against NVIDIA in D3D11-through-DXVK shapes (patch 8)
 

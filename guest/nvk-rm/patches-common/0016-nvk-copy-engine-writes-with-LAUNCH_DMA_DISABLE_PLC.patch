@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 21:05:31 +0200
+Subject: [PATCH 16/16] nvk: copy-engine writes with LAUNCH_DMA_DISABLE_PLC
+
+NVK's copy-engine launches never set LAUNCH_DMA_DISABLE_PLC, which
+exists from TURING_DMA_COPY_A.  NVIDIA's own copy-engine users set it on
+every launch: RM's channel_utils memset and scrubber ("for anything after
+Turing"), and UVM (uvm_hal_ampere_ce_plc_mode_c7b5).
+
+On GB20x that is what the compression corruption in Counter-Strike 2
+points at.  Everything the 3D engine writes into compressible memory reads
+back fine (dedicated compressed render targets, render targets in
+NVK_RM_COMPRESS_TYPE memory), while every copy-engine write into it reads
+back wrong: textures uploaded into the compressible memory type (one
+model black, still black with NVK_DEBUG=no_compression, fine once
+sampled-only images leave the type), vertex and index buffers uploaded
+into compressible memory with NVK_RM_COMPRESS_ALL (broken geometry), and
+a single copy-engine clear of each compressible memory
+(NVK_RM_COMPRESS_CLEAR) blanks the whole frame, render targets included.
+
+P_NVK_CE_LAUNCH_DMA ORs DISABLE_PLC into the copy-engine launches that
+write memory: image and buffer copies, fills and the copy-engine path of
+vkCmdUpdateBuffer, and the device upload queue's uploads and fills (also
+what NVK_DEBUG=zero_memory and NVK_RM_COMPRESS_CLEAR use).  Barrier,
+semaphore and query launches write no data and are unchanged, and so is
+the GPU-generated copy of vkCmdCopyMemoryIndirectKHR (an immediate
+LAUNCH_DMA from a shader, rare).
+
+NVK_CE_DISABLE_PLC=1 turns it on everywhere, 0 off; unset, it is on
+exactly when NVK_RM_COMPRESS_ALL or NVK_RM_COMPRESS_TYPE is, so the
+default stack is unchanged.  A log line says when it is on.
+---
+ src/nouveau/vulkan/nvk_cmd_copy.c        |  8 ++++----
+ src/nouveau/vulkan/nvk_physical_device.c | 11 +++++++++++
+ src/nouveau/vulkan/nvk_physical_device.h | 19 +++++++++++++++++++
+ src/nouveau/vulkan/nvk_upload_queue.c    |  4 ++--
+ 4 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_copy.c b/src/nouveau/vulkan/nvk_cmd_copy.c
+index c167f15..b06a4b8 100644
+--- a/src/nouveau/vulkan/nvk_cmd_copy.c
++++ b/src/nouveau/vulkan/nvk_cmd_copy.c
+@@ -358,7 +358,7 @@ nouveau_copy_rect(struct nvk_cmd_buffer *cmd,
+          dst_layout = NV90B5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH;
+       }
+ 
+-      P_IMMD(p, NV90B5, LAUNCH_DMA, {
++      P_NVK_CE_LAUNCH_DMA(p, nvk_device_physical(nvk_cmd_buffer_device(cmd))->ce_disable_plc, {
+          .data_transfer_type = data_transfer_type,
+          .multi_line_enable = MULTI_LINE_ENABLE_TRUE,
+          .flush_enable = FLUSH_ENABLE_TRUE,
+@@ -395,7 +395,7 @@ nvk_cmd_copy_memory_ce(struct nvk_cmd_buffer *cmd,
+          P_NV90B5_LINE_LENGTH_IN(p, bytes);
+          P_NV90B5_LINE_COUNT(p, 1);
+ 
+-         P_IMMD(p, NV90B5, LAUNCH_DMA, {
++         P_NVK_CE_LAUNCH_DMA(p, nvk_device_physical(nvk_cmd_buffer_device(cmd))->ce_disable_plc, {
+                 .data_transfer_type = DATA_TRANSFER_TYPE_PIPELINED,
+                 .multi_line_enable = MULTI_LINE_ENABLE_TRUE,
+                 .flush_enable = FLUSH_ENABLE_TRUE,
+@@ -933,7 +933,7 @@ nvk_cmd_fill_memory_ce(struct nvk_cmd_buffer *cmd,
+       P_NV90B5_LINE_LENGTH_IN(p, width);
+       P_NV90B5_LINE_COUNT(p, height);
+ 
+-      P_IMMD(p, NV90B5, LAUNCH_DMA, {
++      P_NVK_CE_LAUNCH_DMA(p, nvk_device_physical(nvk_cmd_buffer_device(cmd))->ce_disable_plc, {
+          .data_transfer_type = DATA_TRANSFER_TYPE_PIPELINED,
+          .multi_line_enable = height > 1,
+          .flush_enable = FLUSH_ENABLE_TRUE,
+@@ -1005,7 +1005,7 @@ nvk_CmdUpdateMemoryKHR(VkCommandBuffer commandBuffer,
+       P_NV90B5_LINE_LENGTH_IN(p, dataSize);
+       P_NV90B5_LINE_COUNT(p, 1);
+ 
+-      P_IMMD(p, NV90B5, LAUNCH_DMA, {
++      P_NVK_CE_LAUNCH_DMA(p, nvk_device_physical(nvk_cmd_buffer_device(cmd))->ce_disable_plc, {
+          .data_transfer_type = DATA_TRANSFER_TYPE_PIPELINED,
+          .multi_line_enable = MULTI_LINE_ENABLE_TRUE,
+          .flush_enable = FLUSH_ENABLE_TRUE,
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 615fd60..29c467c 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -1686,6 +1686,17 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+        * DXVK) pick it for images.  Only images and transfer-only buffers
+        * report it (nvk_image.c, nvk_buffer.c).
+        */
++      /* NVK_CE_DISABLE_PLC: 1 always, 0 never; unset: whenever memory other
++       * than dedicated images may be compressible (NVK_RM_COMPRESS_ALL or
++       * NVK_RM_COMPRESS_TYPE).  The field exists from TURING_DMA_COPY_A.
++       */
++      const char *ce_plc = os_get_option("NVK_CE_DISABLE_PLC");
++      pdev->ce_disable_plc = pdev->info.cls_copy >= 0xc5b5 &&
++         (ce_plc != NULL ? atoi(ce_plc) != 0
++                         : nvkmd->kmd_info.has_compressible_mem);
++      if (pdev->ce_disable_plc)
++         mesa_logi("NVK: copy-engine writes with DISABLE_PLC");
++
+       if (nvkmd->kmd_info.has_compressed_mem_type) {
+          mesa_logi("NVK: memory type %u is compressible VRAM, for images "
+                    "and transfer-only buffers (NVK_RM_COMPRESS_TYPE)",
+diff --git a/src/nouveau/vulkan/nvk_physical_device.h b/src/nouveau/vulkan/nvk_physical_device.h
+index f2d0790..72f63c7 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -64,6 +64,9 @@ struct nvk_physical_device {
+     * has_compressed_mem_type): images and transfer-only buffers only
+     */
+    uint32_t compressed_mem_types;
++
++   /* Copy-engine writes with LAUNCH_DMA_DISABLE_PLC (NVK_CE_DISABLE_PLC) */
++   bool ce_disable_plc;
+    uint8_t mem_heap_count;
+    uint8_t mem_type_count;
+ 
+@@ -124,4 +127,20 @@ VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
+ #define NVK_USE_WSI_PLATFORM
+ #endif
+ 
++/* LAUNCH_DMA of a copy-engine operation that writes memory, with
++ * DISABLE_PLC when disable_plc is set.  NVIDIA's own copy-engine users (RM's
++ * memset and scrubber, UVM) set it on every launch from Turing/Ampere on;
++ * on GB20x, copy-engine writes to compressible memory without it are what
++ * Counter-Strike 2 showed broken with NVK_RM_COMPRESS_ALL/TYPE.  Always two
++ * dwords, as P_IMMD may take.
++ */
++#define P_NVK_CE_LAUNCH_DMA(push, disable_plc, args...) do {              \
++   uint32_t __val;                                                      \
++   V_NV90B5_LAUNCH_DMA(__val, args);                                    \
++   if (disable_plc)                                                     \
++      __val |= 1u << 26; /* NVC5B5_LAUNCH_DMA_DISABLE_PLC_TRUE */        \
++   __push_mthd_size(push, SUBC_NV90B5, NV90B5_LAUNCH_DMA, 0);           \
++   nv_push_val(push, NV90B5_LAUNCH_DMA, __val);                         \
++} while (0)
++
+ #endif
+diff --git a/src/nouveau/vulkan/nvk_upload_queue.c b/src/nouveau/vulkan/nvk_upload_queue.c
+index 6602cd9..92ac494 100644
+--- a/src/nouveau/vulkan/nvk_upload_queue.c
++++ b/src/nouveau/vulkan/nvk_upload_queue.c
+@@ -174,7 +174,7 @@ nvk_upload_queue_upload_locked(struct nvk_device *dev,
+       P_NV90B5_LINE_LENGTH_IN(p, data_size);
+       P_NV90B5_LINE_COUNT(p, 1);
+ 
+-      P_IMMD(p, NV90B5, LAUNCH_DMA, {
++      P_NVK_CE_LAUNCH_DMA(p, nvk_device_physical(dev)->ce_disable_plc, {
+          .data_transfer_type = DATA_TRANSFER_TYPE_NON_PIPELINED,
+          .multi_line_enable = MULTI_LINE_ENABLE_FALSE,
+          .flush_enable = FLUSH_ENABLE_TRUE,
+@@ -254,7 +254,7 @@ nvk_upload_queue_fill_locked(struct nvk_device *dev,
+          .num_dst_components = NUM_DST_COMPONENTS_ONE,
+       });
+ 
+-      P_IMMD(p, NV90B5, LAUNCH_DMA, {
++      P_NVK_CE_LAUNCH_DMA(p, nvk_device_physical(dev)->ce_disable_plc, {
+          .data_transfer_type = DATA_TRANSFER_TYPE_NON_PIPELINED,
+          .multi_line_enable = height > 1,
+          .flush_enable = FLUSH_ENABLE_TRUE,
+-- 
+2.43.0
+
