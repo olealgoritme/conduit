@@ -2281,6 +2281,7 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_position(
         if position.is_null() {
             return STATUS_SUCCESS;
         }
+        crate::ddi::hw_cursor::note_ddi_position();
         // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
         // valid for the call, at PASSIVE.
         unsafe {
@@ -2310,6 +2311,7 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_shape(
         if shape.is_null() {
             return STATUS_SUCCESS;
         }
+        crate::ddi::hw_cursor::note_ddi_shape();
         // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
         // valid for the call, at PASSIVE.
         unsafe {
