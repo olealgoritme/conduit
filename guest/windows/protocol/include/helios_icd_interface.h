@@ -42,8 +42,9 @@ extern "C" {
 #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
 /* The export keeps its name; version 3 only appends entries (and caps 4..6),
  * version 4 appends memory_res_plane1 (and cap 8), version 5 scanout_frame,
- * version 6 queue_rm_fence_v3. */
-#define HELIOS_ICD_INTERFACE_VERSION 6u
+ * version 6 queue_rm_fence_v3, version 7 the ECL fence timeline
+ * (ecl_fence_reserve / ecl_fence_create / ecl_fence_signal). */
+#define HELIOS_ICD_INTERFACE_VERSION 7u
 
 enum helios_icd_backend {
    HELIOS_ICD_BACKEND_VENUS = 1,
@@ -318,6 +319,39 @@ struct helios_icd_api {
                                  VkDeviceMemory memory, VkImage image,
                                  uint32_t *fence_handle, uint64_t *value,
                                  struct helios_icd_rm_copy *copy);
+
+   /* ---- version 7 (size covers it; NULL = not supported) ----------------
+    * RM fences for a point that is RESERVED before the work is submitted
+    * and signalled after it (D3D12 ExecuteCommandLists on NVK: the UMD hands
+    * the fence to the KMD in an HE12 v4 record before the engine's worker
+    * has submitted the batch; guest/windows/docs/rm-fence-marker.md).
+    * Needs HELIOS_ICD_CAP_RM_FENCE.
+    *
+    * `key` names one ECL timeline of the device: any nonzero, 2-aligned
+    * value the caller owns (vkd3d: its d3d12_command_queue). The timelines
+    * are separate from the present timelines of queue_rm_fence, so a
+    * present fence signalled at once on the same VkQueue never overtakes a
+    * reserved value. A device has few timelines (8 in all, presents
+    * included); VK_ERROR_FEATURE_NOT_PRESENT when none is left.
+    *
+    * ecl_fence_reserve: the next value of `key`'s timeline, without
+    *   submitting anything. Cheap after the first call for a key (that one
+    *   makes the timeline: an escape). Values come back strictly increasing
+    *   per key; the caller must signal them in that order.
+    * ecl_fence_create: an RM fence for `value` of `key`'s timeline (one
+    *   SEMSURF_FENCE_CREATE escape). *fence_handle is the caller's, as for
+    *   queue_rm_fence (hand it to the KMD or rm_fence_close it). A fence
+    *   whose value is never signalled fires after the host's 5 s timeout.
+    * ecl_fence_signal: signal `key`'s timeline to `value` on `queue` after
+    *   everything submitted to it so far. The caller holds the queue as
+    *   vkQueueSubmit requires. A reserved value that is never signalled is
+    *   covered by the next larger one. */
+   VkResult (*ecl_fence_reserve)(VkDevice device, uint64_t key,
+                                 uint64_t *value);
+   VkResult (*ecl_fence_create)(VkDevice device, uint64_t key,
+                                uint64_t value, uint32_t *fence_handle);
+   VkResult (*ecl_fence_signal)(VkDevice device, VkQueue queue,
+                                uint64_t key, uint64_t value);
 };
 
 typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);
