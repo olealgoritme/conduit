@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Thu, 8 Oct 2026 16:27:47 +0200
-Subject: [PATCH 11/11] nvk, nvk/rm: compression for images outside dedicated
+Subject: [PATCH 11/13] nvk, nvk/rm: compression for images outside dedicated
  allocations on GB20x
 
 NVK compresses an image only when it has a dedicated allocation, and maps
@@ -10,7 +10,7 @@ vkd3d-proton places every D3D12 resource in a heap, and native engines
 bind their render targets into large allocations, so on RM every render
 target was mapped with the uncompressed generic kind (0x6).
 
-On by default (NVK_RM_COMPRESS_ALL=0 turns it off):
+With NVK_RM_COMPRESS_ALL=1 (default off):
 
 - nvkmd: new NVKMD_MEM_COMPRESSIBLE memory flag and
   nvkmd_info::has_compressible_mem.  NVK asks for it on device-local
@@ -40,7 +40,9 @@ In the VM (RTX 5090, Basemark at 1080p, windowed): Vulkan 268 compressed
 image binds in 11 compressible memories (2565 MiB), none refused,
 calibration 7-9 % faster, demo scene median 20.4 -> 19.2 ms; D3D12
 through vkd3d-proton 67 binds in 6 memories (1971 MiB), frame 21.8 ->
-20.7 ms.  No faults, no device loss.
+20.7 ms.  No faults, no device loss.  Default off again after broken
+geometry in Counter-Strike 2 (D3D11 through DXVK) with it on, while that
+is investigated.
 ---
  src/nouveau/vulkan/nvk_device_memory.c      | 20 +++++++
  src/nouveau/vulkan/nvk_image.c              | 66 +++++++++++++++++++--
@@ -366,7 +368,7 @@ index 8dc582e..f7dbbaf 100644
      * RM declined).  Everything else maps the memory as generic and gives
      * images their kind on their own VA.
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
-index de1f951..56e6241 100644
+index de1f951..fc8e2bc 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
 @@ -426,6 +426,15 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
@@ -376,11 +378,11 @@ index de1f951..56e6241 100644
 +   /* GB20x compression is per physical page (GMMU v3 PTEs carry no
 +    * comptag line), so device-local memory may be allocated compressible
 +    * as a whole and sub-allocated images compressed by their PTE kind
-+    * (nvkmd_rm_mem.c).  NVK_RM_COMPRESS_ALL=0 turns it off.
++    * (nvkmd_rm_mem.c).  Off by default (NVK_RM_COMPRESS_ALL=1 turns it on).
 +    */
 +   pdev->base.kmd_info.has_compressible_mem =
 +      pdev->base.kmd_info.has_compression &&
-+      debug_get_bool_option("NVK_RM_COMPRESS_ALL", true);
++      debug_get_bool_option("NVK_RM_COMPRESS_ALL", false);
 +
     /* VRAM is allocated with 64 KiB pages; system memory BOs get their own
      * 4 KiB bind alignment (nvkmd_mem::bind_align_B).
