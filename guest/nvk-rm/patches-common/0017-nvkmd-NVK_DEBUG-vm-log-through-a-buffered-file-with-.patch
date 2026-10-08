@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 21:41:25 +0200
+Subject: [PATCH 1/2] nvkmd: NVK_DEBUG=vm log through a buffered file, with
+ times and threads
+
+NVK_DEBUG=vm printed VA allocations, frees, binds and unbinds to stderr,
+which a Windows game does not have.  A GPU fault on a stale address
+(Xid 31 FAULT_PDE) needs exactly that history: what owned the faulting
+VA last, and when it went away.
+
+The log now goes to NVK_VM_LOG (a path), else on Windows to
+%TEMP%\nvk-vm-<pid>.log, else stderr; its path is logged once through
+mesa_log.  Each line starts with "NVKVM", the local wall-clock time
+with milliseconds (to line up with the host's Xid messages), the time
+since the log started in microseconds and the thread id, then the
+operation (va+, va-, bind, unbind, mem+, mem-, exec-failed) and the
+range as [0x<10 hex digits>,0x<10 hex digits>) and its size, so a VA
+prefix greps.  mem+ and mem- (memory object creation and destruction,
+with the RM handle that bind lines name) are new.  The comment at the
+top of the writer has an awk one-liner that prints every line whose
+range contains a given address.
+
+Overhead: one mutex and one formatted line per event into a 1 MiB
+buffer, flushed at least every 50 ms of logging, after every free and
+unbind, when a submit fails and at exit.  Nothing changes without
+NVK_DEBUG=vm.
+---
+ src/nouveau/vulkan/nvkmd/nvkmd.c | 223 ++++++++++++++++++++++++++++---
+ 1 file changed, 206 insertions(+), 17 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index 76337144..58bc458c 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -15,14 +15,185 @@
+ #include "util/log.h"
+ #include "util/u_atomic.h"
+ #include "util/u_math.h"
++#include "util/os_time.h"
++#include "util/simple_mtx.h"
++#include "util/u_debug.h"
+ 
+ #include <inttypes.h>
++#include <stdarg.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #ifdef _WIN32
+ #include <windows.h>
++#include <process.h>
++#else
++#include <unistd.h>
++#endif
++
++/* NVK_DEBUG=vm log: every GPU VA allocation, free, bind and unbind, and
++ * every memory object's creation and destruction, one line each, with a
++ * local wall-clock time (to line up with the host's Xid messages), the time
++ * since the log started and the calling thread.  Lines look like
++ *
++ *    NVKVM 19:31:02.417 +12.345678 t1234 va+   [0x3ecc000000,0x3ecc400000) 0x400000 kind 0x6 flags 0x0
++ *    NVKVM 19:31:02.418 +12.346001 t1234 bind  [0x3ecc000000,0x3ecc400000) 0x400000 mem<0xcaf00012>+0x0
++ *    NVKVM 19:31:05.002 +14.930112 t5678 va-   [0x3ecc000000,0x3ecc400000) 0x400000
++ *
++ * with every address as 0x and ten hex digits, so a VA prefix greps.  What
++ * owned a given address X last (awk, X in hex without 0x):
++ *
++ *    awk -v x=3ecc0c2000 '$1 == "NVKVM" { split(substr($6, 2), r, ",");
++ *        lo = strtonum(r[1]); hi = strtonum(substr(r[2], 1, length(r[2]) - 1));
++ *        a = strtonum("0x" x); if (a >= lo && a < hi) print }' nvk-vm-*.log
++ *
++ * The log goes to NVK_VM_LOG if set (a path), else on Windows to
++ * %TEMP%\nvk-vm-<pid>.log, else to stderr.  It is written through a 1 MiB
++ * buffer that is flushed at least every 50 ms of logging, after every free
++ * and unbind (the lines a GPU fault on a stale address needs), when a submit
++ * fails (device lost) and at exit.
++ */
++static struct {
++   simple_mtx_t mutex;
++   bool opened;
++   FILE *fp;
++   uint64_t base_ns;       /* os_time_get_nano() when the log was opened */
++   uint64_t base_wall_ms;  /* local milliseconds since midnight then */
++   uint64_t last_flush_ns;
++} nvkmd_vm_log = { .mutex = SIMPLE_MTX_INITIALIZER };
++
++static uint64_t
++nvkmd_vm_log_local_ms(void)
++{
++#ifdef _WIN32
++   SYSTEMTIME st;
++   GetLocalTime(&st);
++   return ((st.wHour * 60ull + st.wMinute) * 60ull + st.wSecond) * 1000ull +
++          st.wMilliseconds;
++#else
++   struct timespec ts;
++   clock_gettime(CLOCK_REALTIME, &ts);
++   const time_t secs = ts.tv_sec;
++   struct tm tm;
++   localtime_r(&secs, &tm);
++   return ((tm.tm_hour * 60ull + tm.tm_min) * 60ull + tm.tm_sec) * 1000ull +
++          ts.tv_nsec / 1000000;
++#endif
++}
++
++static unsigned
++nvkmd_vm_log_pid(void)
++{
++#ifdef _WIN32
++   return (unsigned)_getpid();
++#else
++   return (unsigned)getpid();
++#endif
++}
++
++static unsigned
++nvkmd_vm_log_tid(void)
++{
++#ifdef _WIN32
++   return (unsigned)GetCurrentThreadId();
++#else
++   return 0;
++#endif
++}
++
++static void
++nvkmd_vm_log_flush(void)
++{
++   simple_mtx_lock(&nvkmd_vm_log.mutex);
++   if (nvkmd_vm_log.fp != NULL)
++      fflush(nvkmd_vm_log.fp);
++   simple_mtx_unlock(&nvkmd_vm_log.mutex);
++}
++
++static void
++nvkmd_vm_log_open_locked(void)
++{
++   nvkmd_vm_log.opened = true;
++
++   char path[1024] = "";
++   const char *env = os_get_option("NVK_VM_LOG");
++   if (env != NULL && env[0] != '\0') {
++      snprintf(path, sizeof(path), "%s", env);
++   } else {
++#ifdef _WIN32
++      const char *tmp = getenv("TEMP");
++      snprintf(path, sizeof(path), "%s\\nvk-vm-%u.log",
++               tmp != NULL ? tmp : ".", nvkmd_vm_log_pid());
+ #endif
++   }
++
++   FILE *fp = path[0] != '\0' ? fopen(path, "w") : NULL;
++   if (fp != NULL) {
++      setvbuf(fp, NULL, _IOFBF, 1 << 20);
++   } else {
++      if (path[0] != '\0')
++         mesa_logw("NVK: cannot open the NVK_DEBUG=vm log %s, using stderr",
++                   path);
++      fp = stderr;
++      snprintf(path, sizeof(path), "stderr");
++   }
++
++   nvkmd_vm_log.fp = fp;
++   nvkmd_vm_log.base_ns = os_time_get_nano();
++   nvkmd_vm_log.base_wall_ms = nvkmd_vm_log_local_ms();
++   nvkmd_vm_log.last_flush_ns = nvkmd_vm_log.base_ns;
++
++   fprintf(fp, "# NVK_DEBUG=vm log, pid %u; columns: NVKVM local-time "
++               "+seconds-since-start thread op [va-start,va-end) size ...\n",
++           nvkmd_vm_log_pid());
++   fflush(fp);
++   mesa_logi("NVK: NVK_DEBUG=vm log in %s", path);
++
++   if (fp != stderr)
++      atexit(nvkmd_vm_log_flush);
++}
++
++static void PRINTFLIKE(2, 3)
++nvkmd_vm_logf(bool flush, const char *fmt, ...)
++{
++   simple_mtx_lock(&nvkmd_vm_log.mutex);
++   if (!nvkmd_vm_log.opened)
++      nvkmd_vm_log_open_locked();
++
++   const uint64_t now_ns = os_time_get_nano();
++   const uint64_t rel_ns = now_ns - nvkmd_vm_log.base_ns;
++   const uint64_t wall_ms =
++      (nvkmd_vm_log.base_wall_ms + rel_ns / 1000000) % (24ull * 3600 * 1000);
++
++   FILE *fp = nvkmd_vm_log.fp;
++   fprintf(fp, "NVKVM %02u:%02u:%02u.%03u +%" PRIu64 ".%06u t%u ",
++           (unsigned)(wall_ms / 3600000), (unsigned)(wall_ms / 60000 % 60),
++           (unsigned)(wall_ms / 1000 % 60), (unsigned)(wall_ms % 1000),
++           rel_ns / 1000000000, (unsigned)(rel_ns / 1000 % 1000000),
++           nvkmd_vm_log_tid());
++
++   va_list args;
++   va_start(args, fmt);
++   vfprintf(fp, fmt, args);
++   va_end(args);
++   fputc('\n', fp);
++
++   if (flush || now_ns - nvkmd_vm_log.last_flush_ns > 50000000ull) {
++      fflush(fp);
++      nvkmd_vm_log.last_flush_ns = now_ns;
++   }
++   simple_mtx_unlock(&nvkmd_vm_log.mutex);
++}
++
++static inline bool
++nvkmd_vm_logging(const struct nvkmd_dev *dev)
++{
++   return unlikely(dev->pdev->debug_flags & NVK_DEBUG_VM);
++}
++
++#define VM_RANGE "[0x%010" PRIx64 ",0x%010" PRIx64 ") 0x%" PRIx64
+ 
+ /* nvkmd_dev::mems misuse: a memory object added twice, removed while not on
+  * the list, or freed while still on it.  Each of these corrupts the list and
+@@ -72,6 +243,13 @@ static void
+ nvkmd_dev_add_mem(struct nvkmd_dev *dev,
+                   struct nvkmd_mem *mem)
+ {
++   if (nvkmd_vm_logging(dev)) {
++      const uint64_t va = mem->va != NULL ? mem->va->addr : 0;
++      nvkmd_vm_logf(false, "mem+  " VM_RANGE " mem<0x%x> flags 0x%x",
++                    va, va + (mem->va != NULL ? mem->va->size_B : 0),
++                    mem->size_B, mem->ops->log_handle(mem), mem->flags);
++   }
++
+    simple_mtx_lock(&dev->mems_mutex);
+    if (nvkmd_mem_on_list(mem))
+       nvkmd_mem_list_misuse(mem, "added to the device's memory list twice");
+@@ -272,10 +450,11 @@ nvkmd_dev_alloc_va(struct nvkmd_dev *dev,
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   if (unlikely(dev->pdev->debug_flags & NVK_DEBUG_VM)) {
++   if (nvkmd_vm_logging(dev)) {
+       const char *sparse = (flags & NVKMD_VA_SPARSE) ? " sparse" : "";
+-      fprintf(stderr, "alloc va [0x%" PRIx64 ", 0x%" PRIx64 ")%s\n",
+-              (*va_out)->addr, (*va_out)->addr + size_B, sparse);
++      nvkmd_vm_logf(false, "va+   " VM_RANGE " kind 0x%x flags 0x%x%s",
++                    (*va_out)->addr, (*va_out)->addr + size_B, size_B,
++                    pte_kind, flags, sparse);
+    }
+ 
+    return VK_SUCCESS;
+@@ -284,10 +463,10 @@ nvkmd_dev_alloc_va(struct nvkmd_dev *dev,
+ void
+ nvkmd_va_free(struct nvkmd_va *va)
+ {
+-   if (unlikely(va->dev->pdev->debug_flags & NVK_DEBUG_VM)) {
++   if (nvkmd_vm_logging(va->dev)) {
+       const char *sparse = (va->flags & NVKMD_VA_SPARSE) ? " sparse" : "";
+-      fprintf(stderr, "free va [0x%" PRIx64 ", 0x%" PRIx64 ")%s\n",
+-              va->addr, va->addr + va->size_B, sparse);
++      nvkmd_vm_logf(true, "va-   " VM_RANGE "%s",
++                    va->addr, va->addr + va->size_B, va->size_B, sparse);
+    }
+ 
+    va->ops->free(va);
+@@ -300,12 +479,10 @@ log_va_bind_mem(struct nvkmd_va *va,
+                 uint64_t mem_offset_B,
+                 uint64_t range_B)
+ {
+-   fprintf(stderr, "bind vma mem<0x%" PRIx32 ">"
+-                   "[0x%" PRIx64 ", 0x%" PRIx64 ") to "
+-                   "[0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+-           mem->ops->log_handle(mem),
+-           mem_offset_B, mem_offset_B + range_B,
+-           va->addr + va_offset_B, va->addr + va_offset_B + range_B);
++   nvkmd_vm_logf(false, "bind  " VM_RANGE " mem<0x%" PRIx32 ">+0x%" PRIx64
++                        " va<0x%010" PRIx64 ">",
++                 va->addr + va_offset_B, va->addr + va_offset_B + range_B,
++                 range_B, mem->ops->log_handle(mem), mem_offset_B, va->addr);
+ }
+ 
+ static inline void
+@@ -313,8 +490,9 @@ log_va_unbind(struct nvkmd_va *va,
+               uint64_t va_offset_B,
+               uint64_t range_B)
+ {
+-   fprintf(stderr, "unbind vma [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+-           va->addr + va_offset_B, va->addr + va_offset_B + range_B);
++   nvkmd_vm_logf(true, "unbind " VM_RANGE " va<0x%010" PRIx64 ">",
++                 va->addr + va_offset_B, va->addr + va_offset_B + range_B,
++                 range_B, va->addr);
+ }
+ 
+ VkResult MUST_CHECK
+@@ -335,7 +513,7 @@ nvkmd_va_bind_mem(struct nvkmd_va *va,
+    assert(mem_offset_B % mem->bind_align_B == 0);
+    assert(range_B % mem->bind_align_B == 0);
+ 
+-   if (unlikely(va->dev->pdev->debug_flags & NVK_DEBUG_VM))
++   if (nvkmd_vm_logging(va->dev))
+       log_va_bind_mem(va, va_offset_B, mem, mem_offset_B, range_B);
+ 
+    return va->ops->bind_mem(va, log_obj, va_offset_B,
+@@ -351,7 +529,7 @@ nvkmd_va_unbind(struct nvkmd_va *va,
+    assert(va_offset_B <= va->size_B);
+    assert(va_offset_B + range_B <= va->size_B);
+ 
+-   if (unlikely(va->dev->pdev->debug_flags & NVK_DEBUG_VM))
++   if (nvkmd_vm_logging(va->dev))
+       log_va_unbind(va, va_offset_B, range_B);
+ 
+    return va->ops->unbind(va, log_obj, va_offset_B, range_B);
+@@ -412,6 +590,10 @@ nvkmd_ctx_exec(struct nvkmd_ctx *ctx,
+    if (result == VK_SUCCESS && sync)
+       result = ctx->ops->sync(ctx, log_obj);
+ 
++   if (result != VK_SUCCESS && nvkmd_vm_logging(ctx->dev)) {
++      nvkmd_vm_logf(true, "exec-failed result %d", (int)result);
++   }
++
+    if ((sync && result != VK_SUCCESS) ||
+        (ctx->dev->pdev->debug_flags & NVK_DEBUG_PUSH_DUMP)) {
+       for (uint32_t i = 0; i < exec_count; i++)
+@@ -445,7 +627,7 @@ nvkmd_ctx_bind(struct nvkmd_ctx *ctx,
+       }
+    }
+ 
+-   if (unlikely(ctx->dev->pdev->debug_flags & NVK_DEBUG_VM)) {
++   if (nvkmd_vm_logging(ctx->dev)) {
+       for (uint32_t i = 0; i < bind_count; i++) {
+          if (binds[i].op == NVKMD_BIND_OP_BIND) {
+             log_va_bind_mem(binds[i].va, binds[i].va_offset_B,
+@@ -475,6 +657,13 @@ nvkmd_mem_unref(struct nvkmd_mem *mem)
+ 
+    nvkmd_dev_remove_mem(mem->dev, mem);
+ 
++   if (nvkmd_vm_logging(mem->dev)) {
++      const uint64_t va = mem->va != NULL ? mem->va->addr : 0;
++      nvkmd_vm_logf(true, "mem-  " VM_RANGE " mem<0x%x>",
++                    va, va + (mem->va != NULL ? mem->va->size_B : 0),
++                    mem->size_B, mem->ops->log_handle(mem));
++   }
++
+    mem->ops->free(mem);
+ }
+ 
