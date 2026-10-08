@@ -298,6 +298,7 @@ fn engine_list9(state: &CommandListState) -> Option<ID3D12GraphicsCommandList9> 
 /// `h_list` must be a handle `queue::create_command_list` returned `S_OK` for and
 /// which `pfnDestroyCommandList` has not been called on.
 unsafe extern "system" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
+    super::nvk12::FRAME_STATS.note_close(h_list.drv_private() as usize);
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3A_REFUSALS.command_list_missing);
@@ -379,6 +380,7 @@ unsafe extern "system" fn reset_command_list(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     arg: *const ddi12::D3D12DDIARG_RESETCOMMANDLIST_0040,
 ) {
+    super::nvk12::FRAME_STATS.note_reset(h_list.drv_private() as usize);
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3A_REFUSALS.command_list_missing);
@@ -559,6 +561,7 @@ unsafe extern "system" fn draw_instanced(
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
     };
+    let started = std::time::Instant::now();
     // SAFETY: `engine()` borrows the list this box owns; all four arguments are
     // by-value `UINT`s the engine records without dereferencing.
     unsafe {
@@ -569,6 +572,7 @@ unsafe extern "system" fn draw_instanced(
             start_instance_location,
         );
     }
+    super::nvk12::FRAME_STATS.note_draw(started.elapsed());
 }
 
 /// `pfnDrawIndexedInstanced` -> `ID3D12GraphicsCommandList::DrawIndexedInstanced`.
@@ -592,6 +596,7 @@ unsafe extern "system" fn draw_indexed_instanced(
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
     };
+    let started = std::time::Instant::now();
     // SAFETY: as `draw_instanced`; five by-value scalars.
     unsafe {
         state.engine().DrawIndexedInstanced(
@@ -602,6 +607,7 @@ unsafe extern "system" fn draw_indexed_instanced(
             start_instance_location,
         );
     }
+    super::nvk12::FRAME_STATS.note_draw(started.elapsed());
 }
 
 /// `pfnDispatch` -> `ID3D12GraphicsCommandList::Dispatch`.

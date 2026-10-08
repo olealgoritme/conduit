@@ -410,6 +410,7 @@ fn log_device_teardown(dev: &HeliosD3D12Device) {
         dev.kt_callbacks,
         dev.engine.venus_context_id(),
     );
+    crate::forward12::nvk12::FRAME_STATS.log_totals();
     crate::log_refusal_summary();
     crate::forward12::noop12::log_noop_hits();
 }
