@@ -96,6 +96,65 @@ fn foreign_copies(passive: PassiveLevel, src: &ForeignSrc, dst: &ce_vram::CeSurf
     }
 }
 
+/// Copies `(src_rect, dst_rect)` pairs from `src` INTO a foreign image and waits for the last;
+/// `0` done, 3 submit, 4 wait.
+fn foreign_writes(passive: PassiveLevel, src: &ce_vram::CeSurface, src_fourcc: u32, dst: &ForeignSrc, pairs: &[(Rect, Rect)]) -> u32 {
+    let mut last = None;
+    for (s, d) in pairs {
+        let (Some(sr), true) = (vrect(*s), d.left >= 0 && d.top >= 0) else {
+            continue;
+        };
+        match ce_vram::foreign_write(src, sr, src_fourcc, &dst.0, d.left as u32, d.top as u32) {
+            Ok(v) => last = Some(v),
+            Err(_) => {
+                if let Some(v) = last {
+                    let _ = wait(passive, v, 100);
+                }
+                return 3;
+            }
+        }
+    }
+    match last {
+        Some(v) if !wait(passive, v, 100) => 4,
+        _ => 0,
+    }
+}
+
+/// A VRAM surface INTO a foreign image. `0` done, else 2 source mapping, 3 submit, 4 wait.
+pub(crate) fn vram_to_foreign(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    src_resource_id: u32,
+    src_fourcc: u32,
+    dst: &ForeignSrc,
+    pairs: &[(Rect, Rect)],
+) -> u32 {
+    let Some(src) = retry_busy(passive, || ce_vram::ce_surface(passive, adapter, src_resource_id)) else {
+        return 2;
+    };
+    foreign_writes(passive, &src, src_fourcc, dst, pairs)
+}
+
+/// A staging buffer INTO a foreign image (the buffer's copy-engine view). `0` done, 5 view refused.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn standard_to_foreign(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    src_resource_id: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    src_fourcc: u32,
+    dst: &ForeignSrc,
+    pairs: &[(Rect, Rect)],
+) -> u32 {
+    let r = crate::ddi::ce_sysmem::with_standard(passive, adapter, src_resource_id, pitch, width, height, |src| {
+        foreign_writes(passive, src, src_fourcc, dst, pairs)
+    });
+    crate::ddi::ce_sysmem::publish_counters();
+    r.unwrap_or(5)
+}
+
 /// A foreign image into a VRAM surface. `0` done, else the failing step (2 destination mapping,
 /// 3 submit, 4 wait).
 pub(crate) fn foreign_to_vram(

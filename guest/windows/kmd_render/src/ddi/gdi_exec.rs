@@ -82,6 +82,9 @@ static SLOW_OP: AtomicU32 = AtomicU32::new(0);
 static FGN_CE: AtomicU32 = AtomicU32::new(0);
 static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
 static FGN_WHY: AtomicU32 = AtomicU32::new(0);
+/// Copies INTO a foreign NVK image done on the copy engine (failures share `GdiFgnFail`, with
+/// `GdiFgnWhy` 16 + the step).
+static FGN_WR: AtomicU32 = AtomicU32::new(0);
 /// Overlapping copies inside one surface (scrolls) seen, done on the copy engine as ordered
 /// non-overlapping bands, and the last refusal (1 not VRAM/staging, 2 view refused, 3 submit,
 /// 4 wait, 5 GdiOvl 0, 6 channel down).
@@ -153,28 +156,12 @@ fn path(bit: u32) -> bool {
 
 pub(crate) fn reset_for_start(on: bool) {
     if on {
-        use crate::diag::{knobs, read_config_dword as rd};
-        let mut p = 0;
-        if rd(knobs::GDI_FGN, 1) != 0 {
-            p |= PATH_FGN;
-        }
-        if rd(knobs::GDI_FGN_ACQ, 0) == 1 {
-            p |= PATH_FGN_ACQ;
-        }
-        if rd(knobs::GDI_SYS_CE, 1) != 0 {
-            p |= PATH_SYS;
-        }
-        if rd(knobs::GDI_PAIR, 1) != 0 {
-            p |= PATH_PAIR;
-        }
-        if rd(knobs::GDI_OVL, 1) != 0 {
-            p |= PATH_OVL;
-        }
-        PATHS.store(p, Ordering::Relaxed);
+        let off = crate::diag::read_config_dword(crate::diag::knobs::GDI_OFF, 0);
+        PATHS.store(ga::paths_from_off(off), Ordering::Relaxed);
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -219,6 +206,7 @@ pub(crate) fn publish_counters() {
     w(b"GdiFgnCe", FGN_CE.load(Ordering::Relaxed));
     w(b"GdiFgnFail", FGN_FAIL.load(Ordering::Relaxed));
     w(b"GdiFgnWhy", FGN_WHY.load(Ordering::Relaxed));
+    w(b"GdiFgnWr", FGN_WR.load(Ordering::Relaxed));
     w(b"GdiPaths", PATHS.load(Ordering::Relaxed));
     w(b"GdiOvlN", OVL_N.load(Ordering::Relaxed));
     w(b"GdiOvlCe", OVL_CE.load(Ordering::Relaxed));
@@ -612,7 +600,65 @@ fn run_foreign(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool
     true
 }
 
+/// A SRCCOPY BitBlt INTO a foreign NVK image from VRAM or a staging buffer, on the copy engine
+/// (`ce_vram::foreign_write`). No CPU fallback: a failure drops the command.
+fn run_foreign_write(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
+    let (Some(dst), Some(src), Cmd::BitBlt { src: sr, dst: dr, .. }) = (op.dst, op.srcs[0], op.cmd) else {
+        return false;
+    };
+    let fail = |why: u32| {
+        FGN_FAIL.fetch_add(1, Ordering::Relaxed);
+        FGN_WHY.store(16 + why, Ordering::Relaxed);
+        false
+    };
+    if !path(PATH_FGN) {
+        return fail(9);
+    }
+    if glue::channel_state() != 0 {
+        return fail(6);
+    }
+    let Some(fd) = glue::foreign_source(passive, adapter, dst.resource_id, path(PATH_FGN_ACQ)) else {
+        return fail(1);
+    };
+    let mut pairs: Vec<(Rect, Rect)> = Vec::new();
+    if pairs.try_reserve_exact(op.subs.len()).is_err() {
+        return fail(7);
+    }
+    for r in &op.subs {
+        let d = clip_to(r, &dst);
+        let s = clip_to(&ga::bitblt_src(&d, &dr, &sr), &src);
+        let d = ga::bitblt_src(&s, &sr, &dr);
+        if !s.is_empty() && s.width() == d.width() && s.height() == d.height() {
+            pairs.push((s, d));
+        }
+    }
+    let fourcc = glue::fourcc_of(src.format);
+    let step = match src.class {
+        SurfaceClass::Vram => glue::vram_to_foreign(passive, adapter, src.resource_id, fourcc, &fd, &pairs),
+        SurfaceClass::System => {
+            let (_, spc) = cmd_pitches(&op.cmd);
+            glue::standard_to_foreign(
+                passive, adapter, src.resource_id, map_pitch(&src, spc), src.width, src.height, fourcc, &fd, &pairs,
+            )
+        }
+        _ => 8,
+    };
+    if step != 0 {
+        return fail(step);
+    }
+    FGN_WR.fetch_add(1, Ordering::Relaxed);
+    BLT_N.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    if op.engine != Engine::Drop && op.dst.is_some_and(|d| d.class == SurfaceClass::Foreign) {
+        if !run_foreign_write(passive, adapter, op) {
+            crate::ddi::gdi_accel::note_why(Why::CeFailed);
+            crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
     if op.engine != Engine::Drop && op.srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign) {
         if !run_foreign(passive, adapter, op) {
             crate::ddi::gdi_accel::note_why(Why::CeFailed);

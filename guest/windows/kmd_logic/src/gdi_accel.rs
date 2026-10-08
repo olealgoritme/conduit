@@ -946,14 +946,17 @@ pub fn plan(cmd: &Cmd, dst: Option<&Surface>, srcs: [Option<&Surface>; 2]) -> (E
         return (Engine::Drop, Some(Why::Unreachable));
     }
     if all.iter().flatten().any(|s| s.class == SurfaceClass::Foreign) {
-        // Only a plain copy FROM the foreign image into a surface the executor writes.
-        let copy_from = matches!(*cmd, Cmd::BitBlt { rop, .. } if rop == rop::SRCCOPY)
-            && srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign)
-            && dst.class != SurfaceClass::Foreign;
-        return match (copy_from, dst.class) {
-            (true, SurfaceClass::Vram) => (Engine::Ce, None),
-            (true, _) => (Engine::Cpu, Some(Why::SystemSurface)),
-            (false, _) => (Engine::Drop, Some(Why::Unreachable)),
+        // Only a plain copy FROM the foreign image into a surface the executor writes, or a plain
+        // copy INTO it from VRAM or a staging buffer (`ce_vram::foreign_write`).
+        let srccopy = matches!(*cmd, Cmd::BitBlt { rop, .. } if rop == rop::SRCCOPY);
+        let src_fgn = srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign);
+        let dst_fgn = dst.class == SurfaceClass::Foreign;
+        return match (srccopy, src_fgn, dst_fgn, dst.class, srcs[0].map(|s| s.class)) {
+            (true, true, false, SurfaceClass::Vram, _) => (Engine::Ce, None),
+            (true, true, false, _, _) => (Engine::Cpu, Some(Why::SystemSurface)),
+            (true, false, true, _, Some(SurfaceClass::Vram)) => (Engine::Ce, None),
+            (true, false, true, _, Some(SurfaceClass::System)) => (Engine::Cpu, Some(Why::SystemSurface)),
+            _ => (Engine::Drop, Some(Why::Unreachable)),
         };
     }
     let all_vram = all.iter().flatten().all(|s| s.class == SurfaceClass::Vram);
@@ -1481,6 +1484,29 @@ impl Timeline {
     }
 }
 
+/// The paths in force (`GdiPaths`: 1 foreign copies, 2 foreign acquire, 4 staging views, 8 two
+/// staging views, 16 scrolls) for a `GdiOff` mask (a set bit turns a path off; bit 1 is the
+/// opt-in of the acquire, off by default).
+pub const fn paths_from_off(off: u32) -> u32 {
+    let mut p = 0;
+    if off & 0x1 == 0 {
+        p |= 1;
+    }
+    if off & 0x2 != 0 {
+        p |= 2;
+    }
+    if off & 0x4 == 0 {
+        p |= 4;
+    }
+    if off & 0x8 == 0 {
+        p |= 8;
+    }
+    if off & 0x10 == 0 {
+        p |= 16;
+    }
+    p
+}
+
 /// How long the executor waits for one copy-engine submission before it discharges the job
 /// (`Why::Timeout`): the fence retires, the destination keeps what it had.
 pub const CE_DEADLINE_MS: u64 = 100;
@@ -1582,7 +1608,8 @@ pub const COUNTERS: &[&str] = &[
     "GdiFgnCe",
     "GdiFgnFail",
     "GdiFgnWhy",
-    // The bisect switches in force: 1 GdiFgn, 2 GdiFgnAcq, 4 GdiSysCe, 8 GdiPair, 16 GdiOvl.
+    // The paths in force (from the GdiOff mask): 1 foreign copies, 2 foreign acquire, 4 staging
+    // views, 8 two staging views, 16 scrolls.
     "GdiPaths",
     // Overlapping copies inside one surface (scrolls): seen, done as ordered copy-engine bands,
     // the last refusal (1 shape, 2 view, 3 submit, 4 wait, 5 GdiOvl 0, 6 channel down).
@@ -1592,6 +1619,9 @@ pub const COUNTERS: &[&str] = &[
     // Commands dropped because a foreign image is in them other than as a SRCCOPY source, and the
     // last one's signature (opcode | foreign dst << 8 | foreign src << 9 | rop << 16).
     "GdiFgnDrop",
+    // Copies INTO a foreign NVK image done on the copy engine (failures: GdiFgnFail, GdiFgnWhy 16 +
+    // the step).
+    "GdiFgnWr",
     "GdiFgnOp",
     // The slowest job: its command count and its three slowest commands (GdiSlowOp signature, µs).
     "GdiJobMaxN",
@@ -1873,7 +1903,9 @@ mod tests {
         let fg = Surface { class: SurfaceClass::Foreign, ..vram(5) };
         assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Ce, None));
         assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&sys), [Some(&fg), None]), (Engine::Cpu, Some(Why::SystemSurface)));
-        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&b), None]), (Engine::Drop, Some(Why::Unreachable)));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&b), None]), (Engine::Ce, None));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&sys), None]), (Engine::Cpu, Some(Why::SystemSurface)));
+        assert_eq!(plan(&bb(rop::SRCCOPY, 0, 1, r, r), Some(&fg), [Some(&fg), None]), (Engine::Drop, Some(Why::Unreachable)));
         assert_eq!(plan(&bb(rop::SRCOR, 0, 1, r, r), Some(&b), [Some(&fg), None]), (Engine::Drop, Some(Why::Unreachable)));
     }
 
@@ -1959,6 +1991,79 @@ mod tests {
                 }
             }
             assert_eq!(img, want, "scroll {dx},{dy}");
+        }
+    }
+
+    #[test]
+    fn gdi_off_mask() {
+        assert_eq!(paths_from_off(0), 0x1D);
+        assert_eq!(paths_from_off(0x1D), 0);
+        assert_eq!(paths_from_off(0x2), 0x1F);
+        assert_eq!(paths_from_off(0x4), 0x19);
+    }
+
+    /// A knob is a service-key value the driver READS; a counter is one it WRITES. The same name
+    /// for both makes the knob read the previous boot's counter (`GdiSysCe` did, 365.1-367.1).
+    /// No knob name of `diag.rs` may appear as a byte-string literal anywhere else in
+    /// `kmd_render`, except the listed historical ones.
+    #[test]
+    fn no_knob_name_is_a_counter_name() {
+        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
+        if !render.exists() {
+            assert!(std::env::var("HELIOS_REQUIRE_NAME_SCAN").map_or(true, |v| v != "1"));
+            return;
+        }
+        // `FlipLat` is the prefix of `FlipLat0..` histogram names; `NvSpinUs` mirrors its own
+        // clamped effective value under the knob's name (an existing pattern, stable because the
+        // mirror equals what the read will return next time).
+        const ALLOWED: &[&str] = &["FlipLat", "NvSpinUs"];
+        fn lits(text: &str) -> Vec<std::string::String> {
+            let mut out = Vec::new();
+            let mut rest = text;
+            while let Some(i) = rest.find("b\"") {
+                let tail = &rest[i + 2..];
+                let Some(end) = tail.find('"') else { break };
+                let n = &tail[..end];
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    out.push(n.into());
+                }
+                rest = &tail[end + 1..];
+            }
+            out
+        }
+        let diag = std::fs::read_to_string(render.join("diag.rs")).unwrap();
+        let mut knobs = Vec::new();
+        let mut rest = diag.as_str();
+        while let Some(i) = rest.find("KnobName::new(b\"") {
+            let tail = &rest[i + "KnobName::new(b\"".len()..];
+            let end = tail.find('"').unwrap();
+            knobs.push(std::string::String::from(&tail[..end]));
+            rest = &tail[end..];
+        }
+        assert!(knobs.len() > 50, "found {} knobs", knobs.len());
+        let mut stack = vec![render.clone()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().map_or(true, |x| x != "rs") {
+                    continue;
+                }
+                let mut text = std::fs::read_to_string(&p).unwrap();
+                if p.ends_with("diag.rs") {
+                    for k in &knobs {
+                        text = text.replace(&std::format!("KnobName::new(b\"{k}\")"), "");
+                    }
+                }
+                for l in lits(&text) {
+                    if knobs.contains(&l) && !ALLOWED.contains(&l.as_str()) {
+                        panic!("{} writes or names {l}, which is also a knob", p.display());
+                    }
+                }
+            }
         }
     }
 

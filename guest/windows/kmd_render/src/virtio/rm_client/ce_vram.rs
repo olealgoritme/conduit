@@ -211,6 +211,7 @@ static FGN_REC: AtomicU32 = AtomicU32::new(0);
 static FGN_IMP: AtomicU32 = AtomicU32::new(0);
 static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
 static FGN_WHY: AtomicU32 = AtomicU32::new(0);
+static FGN_WRITE: AtomicU32 = AtomicU32::new(0);
 
 fn fgn_fail(f: Fail) -> Fail {
     FGN_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -348,6 +349,58 @@ pub(crate) fn foreign_copy(
     match r {
         Ok(v) => {
             COPY.fetch_add(1, Ordering::Relaxed);
+            Ok(v)
+        }
+        Err(_) => {
+            COPY_FAIL.fetch_add(1, Ordering::Relaxed);
+            Err(SUBMIT)
+        }
+    }
+}
+
+/// Copy `src_rect` of `src` (a VRAM surface, or a staging view inside `ce_sysmem::with_standard`;
+/// pixel format `src_fourcc`) INTO the foreign NVK image `dst` ([`foreign_source`]) at
+/// `(dst_x, dst_y)`: a GDI BitBlt whose destination is an app's image. Block-linear by the copy's
+/// destination origin; R/B exchanged when the formats differ. Acquires the producer's semaphore
+/// only when `dst.acquire` is set (opt-in, `RvOff` 0x100: the app's frame is complete before GDI
+/// writes over it). ORDERING: without the acquire the write may land while the app's GPU work is
+/// still writing the same image (GDI on a D3D window's surface is already unordered on bare metal
+/// without a flush); the caller waits for the copy before it returns from the GDI command, so the
+/// app's LATER submissions follow it on the CPU timeline. Submitted now; the completion value
+/// ([`wait`]). Spinlocks only.
+pub(crate) fn foreign_write(
+    src: &CeSurface,
+    src_rect: Rect,
+    src_fourcc: u32,
+    dst: &ForeignSource,
+    dst_x: u32,
+    dst_y: u32,
+) -> Result<u64, Fail> {
+    if src.chan_gen != chan_gen() || dst.chan_gen != chan_gen() {
+        return Err(BAD_SHAPE);
+    }
+    let remap = helios_kmd_logic::ce_present::remap_for(src_fourcc, dst.fourcc).map_err(|_| BAD_SHAPE)?;
+    let copy = rv::foreign_write(
+        &src.surface(),
+        src_rect,
+        &dst.plan,
+        dst.va,
+        dst.pitch,
+        dst.width,
+        dst.height,
+        dst_x,
+        dst_y,
+        remap,
+    )
+    .map_err(|_| BAD_SHAPE)?;
+    let acquire = dst.acquire;
+    let r = ce::submit_build(|push, gen, done| {
+        helios_kmd_logic::ce_present::copy_push(push, gen, acquire, &copy, done)
+    });
+    match r {
+        Ok(v) => {
+            COPY.fetch_add(1, Ordering::Relaxed);
+            FGN_WRITE.fetch_add(1, Ordering::Relaxed);
             Ok(v)
         }
         Err(_) => {
@@ -934,10 +987,16 @@ pub(crate) fn publish_counters() {
     rec(b"RvCopy", COPY.load(Ordering::Relaxed));
     rec(b"RvCopyFail", COPY_FAIL.load(Ordering::Relaxed));
     rec(b"RvWaitTmo", WAIT_TMO.load(Ordering::Relaxed));
-    if FGN_REC.load(Ordering::Relaxed) | FGN_IMP.load(Ordering::Relaxed) | FGN_FAIL.load(Ordering::Relaxed) != 0 {
+    if FGN_REC.load(Ordering::Relaxed)
+        | FGN_IMP.load(Ordering::Relaxed)
+        | FGN_FAIL.load(Ordering::Relaxed)
+        | FGN_WRITE.load(Ordering::Relaxed)
+        != 0
+    {
         rec(b"RvFgnRec", FGN_REC.load(Ordering::Relaxed));
         rec(b"RvFgnImp", FGN_IMP.load(Ordering::Relaxed));
         rec(b"RvFgnFail", FGN_FAIL.load(Ordering::Relaxed));
         rec(b"RvFgnWhy", FGN_WHY.load(Ordering::Relaxed));
+        rec(b"RvFgnWrite", FGN_WRITE.load(Ordering::Relaxed));
     }
 }
