@@ -488,15 +488,19 @@ pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePre
 /// or `HELIOS_NVK_RM_COPY_RECORD=0`) = the 48 / 96-byte fence forms as before.
 pub(crate) static NVK_RM_COPY_RECORD: BoolKnob = BoolKnob::new(c"NvkRmCopyRecord", true);
 
-/// `NvkSkipBltCopy`: 0 (default) = when DXGI hands a windowed NVK present a
-/// destination resource, the UMD copies the frame into it
-/// (`CopySubresourceRegion`) before the WDDM present, as always. 1 (registry,
-/// or `HELIOS_NVK_SKIP_BLT_COPY=1`) = that copy is skipped: the KMD's Blt reads
-/// the present's source (`hSrcAllocation`) itself and writes the same pixels
-/// into the window's surface (`RedirVram`'s copy or route), so the UMD's copy
-/// only doubles the GPU work. An A/B knob: correct only where the KMD's Blt
-/// copies every such present.
-pub(crate) static NVK_SKIP_BLT_COPY: BoolKnob = BoolKnob::new(c"NvkSkipBltCopy", false);
+/// `NvkSkipBltCopy` (`HKLM\\SOFTWARE\\Helios`, or `HELIOS_NVK_SKIP_BLT_COPY`): 1 =
+/// when DXGI hands a windowed NVK present a destination resource, the UMD does
+/// NOT copy the frame into it before the WDDM present; the KMD's Blt reads the
+/// present's source (`hSrcAllocation`) and writes it into the window's surface
+/// at the client offset. 0 = the UMD copies it, as before. Absent: 1 when the
+/// KMD's `RedirVram` is 1 (its service key), else 0.
+///
+/// The UMD's copy goes to (0, 0) of the destination, which with `RedirVram` is
+/// the window's redirection texture including its non-client area, while the
+/// KMD's copy places the frame at the client offset: two writers, and with the
+/// copy-engine route asynchronous the image jumped by the title-bar height at
+/// frame rate (403.1, windowed Heaven; smooth with the copy skipped, no fps
+/// cost in 386.1).
 
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|v| match v.trim() {
@@ -549,10 +553,15 @@ pub(crate) fn direct_flip_support() -> u32 {
     })
 }
 
-/// `NvkSkipBltCopy`, or `HELIOS_NVK_SKIP_BLT_COPY` from the environment.
+/// `NvkSkipBltCopy`: the environment, then the registry, then the KMD's
+/// `RedirVram` (see the note above `env_bool`).
 pub(crate) fn nvk_skip_blt_copy() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
-        env_bool("HELIOS_NVK_SKIP_BLT_COPY").unwrap_or_else(|| NVK_SKIP_BLT_COPY.get())
+        env_bool("HELIOS_NVK_SKIP_BLT_COPY")
+            .or_else(|| helios_umd_common::knobs::reg_dword(c"NvkSkipBltCopy").map(|v| v != 0))
+            .unwrap_or_else(|| {
+                helios_umd_common::knobs::kmd_service_dword(c"RedirVram") == Some(1)
+            })
     })
 }
