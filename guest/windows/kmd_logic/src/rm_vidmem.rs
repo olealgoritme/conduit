@@ -57,11 +57,11 @@ pub mod off {
     pub const LUT_RM: u32 = 0x400;
     /// A new VRAM surface is NOT cleared at its first copy-engine mapping (A/B for the clear).
     pub const CLEAR: u32 = 0x800;
-    /// OPT-IN: an NVK frame into a VRAM window surface takes the copy-engine route (queued, its
-    /// Present completes on the copy's completion) instead of the synchronous copy in the Present.
-    /// Opt-in since 382.1: the route worked but windowed Heaven fell from 411 to 89 fps, the
-    /// completions seen only at the HPD worker's timer-quantum polls.
-    pub const ROUTE_ON: u32 = 0x1000;
+    /// An NVK frame into a VRAM window surface takes the synchronous copy in the Present instead
+    /// of the copy-engine route (queued, ordered after the producer's frame by its semaphore,
+    /// the Present completing on the copy). The route is the default since 384.1 (429 fps against
+    /// the synchronous copy's 434, every frame routed); it was opt-in under the same bit before.
+    pub const ROUTE_OFF: u32 = 0x1000;
     /// DIAGNOSTIC: a new VRAM surface is cleared to opaque magenta instead of 0, so content no
     /// path ever wrote shows as magenta wherever DWM composes the surface.
     pub const CLEAR_MAGENTA: u32 = 0x2000;
