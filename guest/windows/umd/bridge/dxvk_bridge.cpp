@@ -2048,10 +2048,49 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       // rebase inserts a base class into D3D11Device this becomes a compile error
       // instead of a silently mis-offset `this`. R823.
       auto* device = static_cast<dxvk::D3D11Device*>(impl->d3d11);
-      auto* texture = new dxvk::D3D11Texture2D(
-          device, &desc, nullptr,
-          reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(renderer_resource_id)),
-          &importInfo);
+      dxvk::D3D11Texture2D* texture = nullptr;
+      try {
+        texture = new dxvk::D3D11Texture2D(
+            device, &desc, nullptr,
+            reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(renderer_resource_id)),
+            &importInfo);
+      } catch (const dxvk::DxvkError& e) {
+        // DWM on NVK: a surface it cannot import must not take the compositor down (an E_FAIL
+        // here is a device removal, winlogon restarts DWM, Desktop Duplication returns
+        // E_ACCESSDENIED: 367.1 with a KMD GDI texture in RM video memory). Same rule as the
+        // non-importable case above: a blank texture of the same size, logged.
+        if (!(impl->backend != helios_bridge::IcdBackend::Venus && helios_bridge::is_dwm_process()))
+          throw;
+        D3D11_TEXTURE2D_DESC td = { };
+        td.Width = width;
+        td.Height = height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = static_cast<DXGI_FORMAT>(format);
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+        ID3D11Texture2D* placeholder = nullptr;
+        HRESULT phr = device->CreateTexture2D(&td, nullptr, &placeholder);
+        ID3D11Resource* res = nullptr;
+        if (SUCCEEDED(phr) && placeholder) {
+          phr = placeholder->QueryInterface(__uuidof(ID3D11Resource),
+                                            reinterpret_cast<void**>(&res));
+          placeholder->Release();
+        }
+        static std::atomic<std::uint32_t> s_importFallbacks{0};
+        const std::uint32_t n = s_importFallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 512u) == 0) {
+          char msg[320];
+          std::snprintf(msg, sizeof(msg),
+            "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d modifier=0x%016llx stride=%u) on NVK DWM: import failed (%s): blank placeholder hr=0x%08lx (x%u)",
+            renderer_resource_id, width, height, int(foreign),
+            static_cast<unsigned long long>(foreign_modifier), foreign_stride,
+            e.message().c_str(), static_cast<unsigned long>(phr), n);
+          umd_log(msg);
+        }
+        return (SUCCEEDED(phr) && res) ? reinterpret_cast<std::size_t>(res) : std::size_t(0);
+      }
 
       ID3D11Resource* resource = nullptr;
       HRESULT hr = texture->QueryInterface(
