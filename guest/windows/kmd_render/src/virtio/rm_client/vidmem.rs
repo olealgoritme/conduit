@@ -81,6 +81,10 @@ static OFF: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn off(bit: u32) -> bool {
     OFF.load(Ordering::Relaxed) & bit != 0
 }
+/// The whole `RvOff` mask (for `rm_vidmem`'s pure deciders).
+pub(crate) fn off_mask() -> u32 {
+    OFF.load(Ordering::Relaxed)
+}
 static LIVE: AtomicU32 = AtomicU32::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
