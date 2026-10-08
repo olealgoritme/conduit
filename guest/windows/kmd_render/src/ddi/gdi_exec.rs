@@ -72,6 +72,12 @@ static SYS_FAIL: AtomicU32 = AtomicU32::new(0);
 /// uncovered, 16 busy or no channel, 32 RM unsure, 64 other, 128 channel down).
 static SYS_WHY: AtomicU32 = AtomicU32::new(0);
 static SYS_MSK: AtomicU32 = AtomicU32::new(0);
+/// The channel bring-up's own time (µs, outside any job's `GdiUs`), the slowest command's time and
+/// its signature (opcode | engine << 4 | dst class bit << 8 | src class bit << 12 | sub-rects << 16,
+/// at most 255; bit 24: over 1 MPixel).
+static CH_UP_US: AtomicU32 = AtomicU32::new(0);
+static SLOW_US: AtomicU32 = AtomicU32::new(0);
+static SLOW_OP: AtomicU32 = AtomicU32::new(0);
 
 fn sys_refused(why: u32, bit: u32) {
     SYS_WHY.store(why, Ordering::Relaxed);
@@ -122,7 +128,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
 pub(crate) fn reset_for_start(_on: bool) {
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &CH_UP_US, &SLOW_US, &SLOW_OP,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -161,6 +167,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiSysFail", SYS_FAIL.load(Ordering::Relaxed));
     w(b"GdiSysWhy", SYS_WHY.load(Ordering::Relaxed));
     w(b"GdiSysMsk", SYS_MSK.load(Ordering::Relaxed));
+    w(b"GdiChUpUs", CH_UP_US.load(Ordering::Relaxed));
+    w(b"GdiSlowUs", SLOW_US.load(Ordering::Relaxed));
+    w(b"GdiSlowOp", SLOW_OP.load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
 }
 
@@ -171,7 +180,10 @@ fn ensure_channel(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
         0 => true,
         1 => {
             CH_UP.fetch_add(1, Ordering::Relaxed);
-            glue::bring_up(passive, adapter) || {
+            let t0 = now_100ns();
+            let up = glue::bring_up(passive, adapter);
+            CH_UP_US.fetch_add((now_100ns().wrapping_sub(t0) / 10).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+            up || {
                 CE_WHY.store(16 + glue::channel_state(), Ordering::Relaxed);
                 false
             }
@@ -184,7 +196,9 @@ fn ensure_channel(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
 }
 
 fn needs_channel(op: &Op) -> bool {
-    [op.dst, op.srcs[0], op.srcs[1]].iter().flatten().any(|s| s.class == SurfaceClass::Vram)
+    op.engine == Engine::Ce
+        || op.why == Some(Why::SystemSurface)
+        || [op.dst, op.srcs[0], op.srcs[1]].iter().flatten().any(|s| s.class == SurfaceClass::Vram)
 }
 
 fn class_bit(c: SurfaceClass) -> u32 {
@@ -392,6 +406,10 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread
         let Some((seq, ops)) = taken else {
             break;
         };
+        // A cold channel comes up before the job's clock starts (`GdiChUpUs`, not `GdiUs`).
+        if channel.is_none() && ops.iter().any(needs_channel) {
+            channel = Some(ensure_channel(passive, adapter));
+        }
         let t0 = now_100ns();
         for op in &ops {
             if crate::ddi::gdi_thread::stopping() {
@@ -401,7 +419,13 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread
             if channel.is_none() && needs_channel(op) {
                 channel = Some(ensure_channel(passive, adapter));
             }
+            let o0 = now_100ns();
             execute(passive, adapter, op);
+            let ous = (now_100ns().wrapping_sub(o0) / 10).min(u64::from(u32::MAX)) as u32;
+            if ous > SLOW_US.load(Ordering::Relaxed) {
+                SLOW_US.store(ous, Ordering::Relaxed);
+                SLOW_OP.store(op_signature(op), Ordering::Relaxed);
+            }
         }
         let us = (now_100ns().wrapping_sub(t0) / 10).min(u64::from(u32::MAX)) as u32;
         US.fetch_add(us, Ordering::Relaxed);
@@ -430,6 +454,27 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread
         crate::ddi::gdi_accel::publish_counters();
     }
     more
+}
+
+fn class_bit_of(s: Option<Surface>) -> u32 {
+    s.map_or(0, |s| class_bit(s.class))
+}
+
+/// `GdiSlowOp`: opcode | engine << 4 (0 CE, 1 CPU, 2 drop) | dst class << 8 | src class << 12 |
+/// sub-rectangles (at most 255) << 16 | 1 << 24 when the op's destination rectangle is over 1 MPixel.
+fn op_signature(op: &Op) -> u32 {
+    let eng = match op.engine {
+        Engine::Ce => 0,
+        Engine::Cpu => 1,
+        Engine::Drop => 2,
+    };
+    let big = op.subs.iter().map(|r| r.width() as u64 * r.height() as u64).sum::<u64>() > 1 << 20;
+    op.cmd.opcode()
+        | eng << 4
+        | class_bit_of(op.dst) << 8
+        | class_bit_of(op.srcs[0]) << 12
+        | (op.subs.len().min(255) as u32) << 16
+        | u32::from(big) << 24
 }
 
 fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {

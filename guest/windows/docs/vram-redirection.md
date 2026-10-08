@@ -648,6 +648,8 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiRdBk`, `GdiThr` | copies from a VRAM surface into a standard buffer (GDI readback); the executor's own thread running (1) or the HPD worker in charge (0) |
 | `GdiSysCe`, `GdiSysRef`, `GdiSysFail` | copies/fills with a staging buffer on one side done on the copy engine over its system pages; refused (CPU instead); failed after the mapping (CPU instead) |
 | `GdiSysWhy`, `GdiSysMsk` | why the last staging copy was refused (1 staging to staging, 2 the VRAM side's mapping, 3 channel down, else `ce_sysmem`'s fail word: 0x8003_00EA not system-resident, 0x8005_00EB uncovered, 0x8001_00E4 busy, ...), and every class seen (1, 2, 4 not system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down) |
+| `GdiUnrN`, `GdiUnrK`, `GdiUnrWH` | unreachable surfaces resolved; the last one's identity (`storage << 24 \| kind << 16 \| foreign layout << 8 \| foreign identity << 9 \| direct scanout << 10`; storage 0 UMD OPTIMAL image, 1 cross-context image, 2 standard buffer) and extent |
+| `GdiChUpUs`, `GdiSlowUs`, `GdiSlowOp` | the channel bring-up's time, outside every job's `GdiUs`; the slowest command's time and signature (`opcode \| engine << 4 \| dst class << 8 \| src class << 12 \| sub-rects << 16 \| over-1-MPixel << 24`) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
 
 Mirrored at the first RenderKm, every 64th, and after each worker pass that ran a job.
@@ -708,6 +710,17 @@ Mirrored at the first RenderKm, every 64th, and after each worker pass that ran 
   appeared: `ce_sysmem` mirrors its counters only after a success. Since 361.1 the glue mirrors them
   after every call, and the refusal is classified in `GdiSysWhy`/`GdiSysMsk`; `GdiRdBk` was counted
   twice for a refused readback (once before the attempt, once on the CPU path) and is now counted once.
+* **361.1:** staging reaches the copy engine (`GdiSysCe` 212, `GdiBltN` 212, `GdiFall` 7, `GdiSysRef` 2).
+  Decode of the rest: `GdiMask` 0x246 = reasons 1 (ROP), 2 (blend), 6 (staging surface), 9
+  (unreachable surface): the 12 `GdiDrop` are commands on a surface neither VRAM nor a standard
+  buffer (`GdiCls` bit 2/6), most likely a GDI texture left on Venus or a UMD-created DWM texture
+  (CDD presents into DWM's textures under GDI acceleration); `GdiUnrK`/`GdiUnrWH` now say which.
+  `GdiSysMsk` 129 = staging-to-staging (1, the two refusals: two staging views cannot be held at
+  once, those run on the CPU) and channel down (128: a fill into staging before the channel came up,
+  since jobs with only staging surfaces did not ask for it; now they do). `RmSysWhy` 10 = `Extent`:
+  a staging buffer under 64 pixels on a side stays a Venus blob (`rm_client::surface_layout`). The
+  28 ms `GdiUsMax` included the channel's bring-up inside the first job; the bring-up now runs
+  before the job's clock (`GdiChUpUs`), and `GdiSlowUs`/`GdiSlowOp` name the slowest command.
 
 * Never run. Whether Windows 11 26H1 still drives GDI acceleration through CDD for an adapter that
   advertises it late (no other public driver does) is the first thing G0's census answers.

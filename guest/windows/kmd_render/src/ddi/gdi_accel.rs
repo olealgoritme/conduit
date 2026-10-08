@@ -52,6 +52,10 @@ static CTX_FLAGS: AtomicU32 = AtomicU32::new(0);
 /// instead (record missing), and the private sizes seen: RenderGdi/RenderKm's in the low 16 bits,
 /// SubmitCommand's in the high 16; SubmitCommand's UMD prefix size.
 static SUB_N: AtomicU32 = AtomicU32::new(0);
+/// Unreachable surfaces resolved, the last one's identity word and extent.
+static UNR_N: AtomicU32 = AtomicU32::new(0);
+static UNR_K: AtomicU32 = AtomicU32::new(0);
+static UNR_WH: AtomicU32 = AtomicU32::new(0);
 static PRV_OK: AtomicU32 = AtomicU32::new(0);
 static CTX_CLAIM: AtomicU32 = AtomicU32::new(0);
 static PRV_SZ: AtomicU32 = AtomicU32::new(0);
@@ -108,7 +112,7 @@ pub(crate) fn note_start(knob: u32) {
     let caps = ga::resolve_caps(knob);
     for c in [
         &CMD_N, &OP_N, &BAD, &BAD_WHY, &OP_MASK, &ROP_MASK, &DROP, &WHY, &MASK, &RK_IN, &RG_IN, &SUB_N,
-        &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD,
+        &PRV_OK, &CTX_CLAIM, &PRV_SZ, &PRV_UMD, &UNR_N, &UNR_K, &UNR_WH,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -151,6 +155,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiCtxClm", CTX_CLAIM.load(Ordering::Relaxed));
     w(b"GdiPrvSz", PRV_SZ.load(Ordering::Relaxed));
     w(b"GdiPrvUmd", PRV_UMD.load(Ordering::Relaxed));
+    w(b"GdiUnrN", UNR_N.load(Ordering::Relaxed));
+    w(b"GdiUnrK", UNR_K.load(Ordering::Relaxed));
+    w(b"GdiUnrWH", UNR_WH.load(Ordering::Relaxed));
     crate::ddi::gdi_exec::publish_counters();
 }
 
@@ -225,6 +232,18 @@ unsafe fn surface_at(
         // reachable whether VidMm holds it in system pages or in the Venus window.
         SurfaceClass::System
     } else {
+        // Census of what is unreachable: storage << 24 | kind << 16 | foreign layout << 8 |
+        // foreign identity << 9 | direct scanout << 10 (`GdiUnrK`), its extent (`GdiUnrWH`).
+        UNR_N.fetch_add(1, Ordering::Relaxed);
+        UNR_K.store(
+            ((info.storage as u32) << 24)
+                | ((info.kind & 0xff) << 16)
+                | (u32::from(info.foreign.is_some()) << 8)
+                | (u32::from(info.foreign_identity) << 9)
+                | (u32::from(info.direct_scanout) << 10),
+            Ordering::Relaxed,
+        );
+        UNR_WH.store((info.width.min(0xffff) << 16) | info.height.min(0xffff), Ordering::Relaxed);
         SurfaceClass::Unreachable
     };
     Some(Surface {
