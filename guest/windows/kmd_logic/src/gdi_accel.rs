@@ -1869,6 +1869,15 @@ pub const COUNTERS: &[&str] = &[
     "GdiPrb6",
     "GdiPrb7",
     "GdiPrbK",
+    // The same probes for commands into staging destinations (read back through the CPU view).
+    "GdiPrbS1",
+    "GdiPrbS2",
+    "GdiPrbS3",
+    "GdiPrbS4",
+    "GdiPrbS5",
+    "GdiPrbS6",
+    "GdiPrbS7",
+    "GdiPrbSK",
     // Jobs executed synchronously inside RenderGdi/RenderKm (GdiOff 0x80), and their commands.
     "GdiSyncN",
     "GdiSyncOps",
