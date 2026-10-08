@@ -27,6 +27,15 @@
 //!   timeouts for `Nvk12EclSpinUs` (default 2 ms): NVK's own blocking wait
 //!   costs at least a Windows timer tick, once per ECL.
 //!
+//! * **ECL fence** (`Nvk12EclSync=2`). Each ExecuteCommandLists submits an
+//!   `HE12` v4 Render record naming an RM fence the engine reserved for the
+//!   batch (NVK helios_icd_interface v7 `ecl_fence_*`, vkd3d patch 0004), then
+//!   queues the admission event exactly as on Venus. The KMD withholds the
+//!   packet's DMA completion until the fence fires, which the engine's worker
+//!   signals right after the batch. Nothing waits, and the next batch is
+//!   admitted at once (the packet is submitted, not completed). A batch that
+//!   gets no fence, or whose Render is refused, takes the CPU-wait arm.
+//!
 //! The order on the context matters: admission first (it only fires once the
 //! runtime's earlier waits are satisfied, and the engine worker waits for it),
 //! then the fence wait (which needs the engine work admission released).
@@ -153,6 +162,98 @@ static ECL_WAIT_STATS: EclWaitStats = EclWaitStats {
     buckets: [const { AtomicU64::new(0) }; ECL_WAIT_BUCKETS_US.len() + 1],
 };
 
+/// `Nvk12EclSync=2` on this device: the knob asks for ECL fences and both the
+/// ICD (helios_icd_interface v7) and the KMD (HE12 v4 RM fences) serve them.
+/// Without them every batch takes the CPU-wait arm, said once.
+pub(crate) fn ecl_fences_wanted(dev: &device12::HeliosD3D12Device) -> bool {
+    if crate::knobs12::nvk12_ecl_sync() != 2 {
+        return false;
+    }
+    let served = dev.engine.nvk_ecl_fences();
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        if served {
+            log_error!("NVK ECL sync: ECL fences (Nvk12EclSync=2, HE12 v4 records; CPU wait only as fallback)");
+        } else {
+            note_refusal(&NVK_REFUSALS.ecl_fence_not_served);
+            log_error!(
+                "NVK ECL sync: Nvk12EclSync=2 but the ICD or the KMD serves no ECL fences \
+                 (helios_icd_interface < 7, or no HELIOS_ICD_CAP_PRESENT_FENCE_KMD); CPU wait"
+            );
+        }
+    }
+    served
+}
+
+/// What became of one batch's ECL fence (`queue::nvk_complete_fenced`).
+pub(crate) enum EclFenceOutcome {
+    /// The HE12 v4 packet went in; the KMD owns the fence.
+    Submitted,
+    /// The engine made no fence for the batch (CPU-wait fallback).
+    NoFence,
+    /// No packet could be made (CPU-wait fallback; fence closed).
+    Unavailable,
+}
+
+pub(crate) fn note_ecl_fence(outcome: EclFenceOutcome) {
+    match outcome {
+        EclFenceOutcome::Submitted => NVK_REFUSALS.ecl_fence_submitted.bump(),
+        EclFenceOutcome::NoFence => note_refusal(&NVK_REFUSALS.ecl_fence_none),
+        EclFenceOutcome::Unavailable => note_refusal(&NVK_REFUSALS.ecl_fence_unavailable),
+    }
+}
+
+/// The KMD refused an HE12 v4 Render (e.g. its process gate is full: `RmGRef`).
+pub(crate) fn note_ecl_fence_refused(hr: ddi12::HRESULT) {
+    note_refusal(&NVK_REFUSALS.ecl_fence_refused);
+    if let Some(k) = NVK_LOG.first_n_then_every(16, 4096) {
+        log_error!(
+            "NVK ECL fence: HE12 v4 Render refused hr={:#010x}; this batch waits on the CPU (x{})",
+            hr as u32,
+            k + 1
+        );
+    }
+}
+
+/// Close an ECL fence this process still owns (no Render took it).
+pub(crate) fn close_unused_fence(dev: &device12::HeliosD3D12Device, fence: crate::bridge12::EclFence) {
+    NVK_REFUSALS.ecl_fence_closed.bump();
+    dev.engine.nvk_rm_fence_close(fence.handle);
+}
+
+/// The engine's ECL fence counters as one line (mode 2 only).
+fn log_ecl_fence_stats() {
+    if crate::knobs12::nvk12_ecl_sync() != 2 {
+        return;
+    }
+    let st = crate::bridge12::ecl_fence_stats();
+    let signals = st[0];
+    log_error!(
+        "NVK ECL fences: submitted {} no-fence {} refused {} unavailable {} closed {}; engine: \
+         reserved {} made {} create-failed {} signalled {} signal-failed {}; commit-to-signal avg {} us \
+         max {} us, hist <50us {} <200us {} <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {}",
+        NVK_REFUSALS.ecl_fence_submitted.get(),
+        NVK_REFUSALS.ecl_fence_none.get(),
+        NVK_REFUSALS.ecl_fence_refused.get(),
+        NVK_REFUSALS.ecl_fence_unavailable.get(),
+        NVK_REFUSALS.ecl_fence_closed.get(),
+        st[4],
+        st[5],
+        st[6],
+        signals,
+        st[3],
+        if signals != 0 { st[1] / signals } else { 0 },
+        st[2],
+        st[7],
+        st[8],
+        st[9],
+        st[10],
+        st[11],
+        st[12],
+        st[13],
+    );
+}
+
 /// Frames per frame-accounting line.
 const FRAME_LOG_EVERY: u64 = 1024;
 
@@ -236,6 +337,8 @@ impl FrameStats {
         let total_frames = acc.total_frames;
         let last_present_end = acc.last_present_end;
         *acc = FrameAcc { last_present_end, total_frames, ..FrameAcc::EMPTY };
+        drop(acc);
+        log_ecl_fence_stats();
     }
 }
 
@@ -319,9 +422,12 @@ impl NvkSync {
     /// `dev` is the live device of the queue whose engine queue `engine_queue`
     /// is; the engine queue outlives this value (the queue drops it first).
     pub(crate) unsafe fn new(dev: &device12::HeliosD3D12Device, engine_queue: usize) -> Self {
-        if crate::knobs12::nvk12_ecl_sync() != 0 {
+        let mode = crate::knobs12::nvk12_ecl_sync();
+        if mode != 0 {
+            // Mode 2 orders batches with ECL fences (`nvk_complete_fenced`);
+            // this arm is its fallback for a batch that got none.
             note_refusal(&NVK_REFUSALS.cpu_wait_arm);
-            log_error!("NVK ECL sync: CPU wait (Nvk12EclSync=1)");
+            log_error!("NVK ECL sync: CPU wait arm (Nvk12EclSync={mode})");
             return Self { fence: None };
         }
         // SAFETY: forwarded precondition.
@@ -600,6 +706,18 @@ struct NvkRefusals {
     worker_engine_error: RefusalCounter,
     /// SignalSynchronizationObjectFromCpu refused. Expected zero.
     cpu_signal_failed: RefusalCounter,
+    /// Mode 2: HE12 v4 ECL packets submitted (the KMD took the fence).
+    ecl_fence_submitted: RefusalCounter,
+    /// Mode 2: batches the engine made no ECL fence for (CPU-wait fallback).
+    ecl_fence_none: RefusalCounter,
+    /// Mode 2: HE12 v4 Renders the KMD refused (CPU-wait fallback).
+    ecl_fence_refused: RefusalCounter,
+    /// Mode 2: no packet could be made (CPU-wait fallback).
+    ecl_fence_unavailable: RefusalCounter,
+    /// ECL fences closed by this driver (no Render took them).
+    ecl_fence_closed: RefusalCounter,
+    /// Mode 2 asked for, but the ICD or the KMD serves no ECL fences.
+    ecl_fence_not_served: RefusalCounter,
 }
 
 static NVK_REFUSALS: NvkRefusals = NvkRefusals {
@@ -615,6 +733,12 @@ static NVK_REFUSALS: NvkRefusals = NvkRefusals {
     gpu_wait_failed: RefusalCounter::new("Nvk12GpuWaitFailed"),
     worker_engine_error: RefusalCounter::new("Nvk12WorkerEngineError"),
     cpu_signal_failed: RefusalCounter::new("Nvk12CpuSignalFailed"),
+    ecl_fence_submitted: RefusalCounter::new("Nvk12EclFenceSubmitted"),
+    ecl_fence_none: RefusalCounter::new("Nvk12EclFenceNone"),
+    ecl_fence_refused: RefusalCounter::new("Nvk12EclFenceRefused"),
+    ecl_fence_unavailable: RefusalCounter::new("Nvk12EclFenceUnavailable"),
+    ecl_fence_closed: RefusalCounter::new("Nvk12EclFenceClosed"),
+    ecl_fence_not_served: RefusalCounter::new("Nvk12EclFenceNotServed"),
 };
 
 pub(crate) static REFUSALS: &[&RefusalCounter] = &[
@@ -630,4 +754,10 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &NVK_REFUSALS.gpu_wait_failed,
     &NVK_REFUSALS.worker_engine_error,
     &NVK_REFUSALS.cpu_signal_failed,
+    &NVK_REFUSALS.ecl_fence_submitted,
+    &NVK_REFUSALS.ecl_fence_none,
+    &NVK_REFUSALS.ecl_fence_refused,
+    &NVK_REFUSALS.ecl_fence_unavailable,
+    &NVK_REFUSALS.ecl_fence_closed,
+    &NVK_REFUSALS.ecl_fence_not_served,
 ];
