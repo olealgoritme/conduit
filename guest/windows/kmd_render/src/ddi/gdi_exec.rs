@@ -161,6 +161,39 @@ fn note_dst_written(op: &Op) {
         }
     }
 }
+/// Destinations SEEN by the parser, whatever became of the command (up to 16, first come), and
+/// how many distinct ones there were: resource id (low 16) << 16 | class bit << 12 | GDI surface
+/// type << 8 | commands (max 255). Unlike `GdiRes*` (written), a destination whose commands were
+/// dropped or failed is listed too.
+static SEEN_SLOTS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+static SEEN_N: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn note_dst_seen(d: &Surface) {
+    let id = d.resource_id & 0xffff;
+    if id == 0 {
+        return;
+    }
+    let head = id << 16 | class_bit(d.class) << 12 | (d.kind_bits & 0xf) << 8;
+    for s in SEEN_SLOTS.iter() {
+        let v = s.load(Ordering::Relaxed);
+        if v == 0 {
+            if s.compare_exchange(0, head | 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                SEEN_N.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            continue;
+        }
+        if v >> 16 == id {
+            if v & 0xff != 0xff {
+                s.store(v + 1, Ordering::Relaxed);
+            }
+            return;
+        }
+    }
+    // All 16 slots taken by others: count it as distinct-unlisted once per command.
+    SEEN_N.fetch_add(0x1_0000, Ordering::Relaxed);
+}
+
 static OVL_N: AtomicU32 = AtomicU32::new(0);
 static OVL_CE: AtomicU32 = AtomicU32::new(0);
 static OVL_WHY: AtomicU32 = AtomicU32::new(0);
@@ -263,9 +296,10 @@ pub(crate) fn reset_for_start(on: bool) {
     ] {
         c.store(0, Ordering::Relaxed);
     }
-    for s in RES_SLOTS.iter() {
+    for s in RES_SLOTS.iter().chain(SEEN_SLOTS.iter()) {
         s.store(0, Ordering::Relaxed);
     }
+    SEEN_N.store(0, Ordering::Relaxed);
     let old = {
         let mut t = TABLE.lock();
         t.tl.discharge_all();
@@ -344,6 +378,15 @@ pub(crate) fn publish_counters() {
         };
         w(name, s.load(Ordering::Relaxed));
     }
+    const SEEN_NAMES: [&[u8]; 16] = [
+        b"GdiSeen0", b"GdiSeen1", b"GdiSeen2", b"GdiSeen3", b"GdiSeen4", b"GdiSeen5", b"GdiSeen6",
+        b"GdiSeen7", b"GdiSeen8", b"GdiSeen9", b"GdiSeen10", b"GdiSeen11", b"GdiSeen12", b"GdiSeen13",
+        b"GdiSeen14", b"GdiSeen15",
+    ];
+    for (name, s) in SEEN_NAMES.iter().zip(SEEN_SLOTS.iter()) {
+        w(name, s.load(Ordering::Relaxed));
+    }
+    w(b"GdiSeenN", SEEN_N.load(Ordering::Relaxed));
     w(b"GdiChkN", CHK_N.load(Ordering::Relaxed));
     w(b"GdiChkBad", CHK_BAD.load(Ordering::Relaxed));
     w(b"GdiChkK", CHK_K.load(Ordering::Relaxed));
