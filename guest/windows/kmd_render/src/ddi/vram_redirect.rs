@@ -73,10 +73,14 @@ static GDI_FAIL: AtomicU32 = AtomicU32::new(0);
 static SYNC: AtomicU32 = AtomicU32::new(0);
 /// The route's own reason for the last refusal (`CeRtWhy` at that moment, `RvRtWhy`).
 static RT_WHY: AtomicU32 = AtomicU32::new(0);
+/// Synchronous copies tried (`RvSyncTry`) and the last failure: step << 24 | `fail_word` low 24
+/// bits (`RvSyncWhy`; step 1 foreign_source, 2 the destination's mapping, 3 the copy, 4 the wait).
+static SYNC_TRY: AtomicU32 = AtomicU32::new(0);
+static SYNC_WHY: AtomicU32 = AtomicU32::new(0);
 
 /// StartDevice (PASSIVE): zero the counters (written only once a VRAM Blt was seen).
 pub(crate) fn reset_for_start() {
-    for c in [&SEEN, &ROUTED, &SKIP, &WHY, &READBACK, &UPLOAD, &GDI_FAIL, &SYNC, &RT_WHY] {
+    for c in [&SEEN, &ROUTED, &SKIP, &WHY, &READBACK, &UPLOAD, &GDI_FAIL, &SYNC, &RT_WHY, &SYNC_TRY, &SYNC_WHY] {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -92,6 +96,8 @@ fn publish() {
     rec(b"RvGdiFail", GDI_FAIL.load(Ordering::Relaxed));
     rec(b"RvBltSync", SYNC.load(Ordering::Relaxed));
     rec(b"RvRtWhy", RT_WHY.load(Ordering::Relaxed));
+    rec(b"RvSyncTry", SYNC_TRY.load(Ordering::Relaxed));
+    rec(b"RvSyncWhy", SYNC_WHY.load(Ordering::Relaxed));
     vidmem::publish_counters();
 }
 
@@ -402,14 +408,26 @@ fn sync_foreign(
     dst_rect: Rect,
     dst_fourcc: u32,
 ) -> bool {
-    let Ok(fs) = ce_vram::foreign_source(passive, adapter, source) else {
-        return false;
+    use helios_kmd_logic::rm_ce_channel as cc_svc;
+    SYNC_TRY.fetch_add(1, Ordering::Relaxed);
+    let fail = |step: u32, word: u32| {
+        SYNC_WHY.store(step << 24 | (word & 0x00ff_ffff), Ordering::Relaxed);
+        false
     };
-    let Ok(d) = ce_vram::ce_surface(passive, adapter, destination) else {
-        return false;
+    let fs = match ce_vram::foreign_source(passive, adapter, source) {
+        Ok(f) => f,
+        Err(f) => return fail(1, cc_svc::fail_word(f)),
     };
-    let Ok(value) = ce_vram::foreign_copy(&fs, src_rect, &d, dst_rect.left, dst_rect.top, dst_fourcc) else {
-        return false;
+    let d = match ce_vram::ce_surface(passive, adapter, destination) {
+        Ok(d) => d,
+        Err(f) => return fail(2, cc_svc::fail_word(f)),
     };
-    ce_vram::wait(passive, value, ce_vram::XFER_MS)
+    let value = match ce_vram::foreign_copy(&fs, src_rect, &d, dst_rect.left, dst_rect.top, dst_fourcc) {
+        Ok(v) => v,
+        Err(f) => return fail(3, cc_svc::fail_word(f)),
+    };
+    if !ce_vram::wait(passive, value, ce_vram::XFER_MS) {
+        return fail(4, 0);
+    }
+    true
 }
