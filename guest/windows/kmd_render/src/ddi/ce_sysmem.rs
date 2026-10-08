@@ -150,34 +150,78 @@ fn with_standard_inner<R>(
     let Some(guard) = adapter.system_backings.serialize(passive) else {
         return Err(refuse(NOT_SYSTEM));
     };
-    // In system pages (leases): the OS descriptor over them. Not system-resident: the buffer's own
-    // RM object, when the KMD made it from RM system memory (`sysmem::try_create_standard`, a GDI
-    // staging buffer under `RedirVram`): in segment 2 that memory IS its content (the CPU host
-    // aperture maps it), and the content transaction keeps a paging transfer out meanwhile.
-    let s = if guard.snapshot(resource_id).is_some() {
-        surface_locked(passive, adapter, &guard, resource_id, pitch, width, height)?
-    } else if crate::virtio::rm_client::sysmem::object(resource_id).is_some() {
+    let s = resolve(passive, adapter, &guard, resource_id, pitch, width, height, 0)?;
+    let r = f(&s);
+    drop(guard);
+    Ok(r)
+}
+
+/// One standard buffer as `(resource_id, pitch, width, height)`.
+pub(crate) type StdBuf = (u32, u32, u32, u32);
+
+/// [`with_standard`] for TWO standard buffers under one content transaction (a staging -> staging
+/// copy between different buffers). `a == b` gives the same surface twice. `f` must wait for its
+/// copies before it returns. PASSIVE, no lock held.
+pub(crate) fn with_standard_pair<R>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    a: StdBuf,
+    b: StdBuf,
+    f: impl FnOnce(&CeSurface, &CeSurface) -> R,
+) -> Result<R, Fail> {
+    let r = (|| {
+        let Some(guard) = adapter.system_backings.serialize(passive) else {
+            return Err(refuse(NOT_SYSTEM));
+        };
+        let sa = resolve(passive, adapter, &guard, a.0, a.1, a.2, a.3, 0)?;
+        // Resolving `b` must not give back `a`'s descriptor to make room.
+        let sb = resolve(passive, adapter, &guard, b.0, b.1, b.2, b.3, a.0)?;
+        let r = f(&sa, &sb);
+        drop(guard);
+        Ok(r)
+    })();
+    publish_counters();
+    r
+}
+
+/// The copy-engine surface of one standard buffer, the content transaction held: in system pages
+/// (leases), the OS descriptor over them; not system-resident, the buffer's own RM object when the
+/// KMD made it from RM system memory (`sysmem::try_create_standard`, a GDI staging buffer under
+/// `RedirVram`): in segment 2 that memory IS its content (the CPU host aperture maps it), and the
+/// content transaction keeps a paging transfer out meanwhile.
+#[allow(clippy::too_many_arguments)]
+fn resolve(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    guard: &SystemBackingGuard<'_>,
+    resource_id: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    keep: u32,
+) -> Result<CeSurface, Fail> {
+    if guard.snapshot(resource_id).is_some() {
+        return surface_locked(passive, adapter, guard, resource_id, pitch, width, height, keep);
+    }
+    if crate::virtio::rm_client::sysmem::object(resource_id).is_some() {
         if guard.system_copy_invalid(resource_id) {
             return Err(refuse(NOT_SYSTEM));
         }
         let va = ce_vram::ce_object_va(passive, adapter, resource_id).map_err(refuse)?;
         OBJ.fetch_add(1, Ordering::Relaxed);
-        CeSurface {
+        return Ok(CeSurface {
             va,
             pitch,
             width,
             height,
             fourcc: 0,
             chan_gen: ce_vram::chan_gen(),
-        }
-    } else {
-        return Err(refuse(NOT_SYSTEM));
-    };
-    let r = f(&s);
-    drop(guard);
-    Ok(r)
+        });
+    }
+    Err(refuse(NOT_SYSTEM))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn surface_locked(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -186,6 +230,7 @@ fn surface_locked(
     pitch: u32,
     width: u32,
     height: u32,
+    keep: u32,
 ) -> Result<CeSurface, Fail> {
     if guard.system_copy_invalid(resource_id)
         || adapter
@@ -251,7 +296,13 @@ fn surface_locked(
         Some(i) => i as u8,
         None => {
             // Full: give the first one back (not this resource's, freed above).
-            let victim = STATE.lock().slots.iter().flatten().next().map(|e| e.resid);
+            let victim = STATE
+                .lock()
+                .slots
+                .iter()
+                .flatten()
+                .find(|e| keep == 0 || e.resid != keep)
+                .map(|e| e.resid);
             if let Some(v) = victim {
                 free_entry(passive, adapter, v);
             }
