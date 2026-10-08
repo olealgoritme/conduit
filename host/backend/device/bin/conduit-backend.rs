@@ -885,6 +885,62 @@ impl PresentedSink for VqReleaseSink {
     }
 }
 
+/// Reports the event pump could not deliver because the guest had no event
+/// buffer posted, summed into one line per [`StarvedNote::EVERY`].
+///
+/// A line per report was a debug line per millisecond per readable
+/// descriptor while the guest fell behind: about 2000 a second under a
+/// Windows desktop at 240 Hz, 240 MB of log in 27 minutes on a nearly full
+/// disk, written from the pump's own thread.
+struct StarvedNote {
+    count: u64,
+    /// The first few handles seen, for the line.
+    handles: Vec<u32>,
+    since: Instant,
+}
+
+impl StarvedNote {
+    const EVERY: Duration = Duration::from_secs(10);
+    const HANDLES: usize = 8;
+
+    fn new(now: Instant) -> Self {
+        Self {
+            count: 0,
+            handles: Vec::new(),
+            since: now,
+        }
+    }
+
+    fn note(&mut self, handle: u32) {
+        self.count += 1;
+        if self.handles.len() < Self::HANDLES && !self.handles.contains(&handle) {
+            self.handles.push(handle);
+        }
+    }
+
+    /// The summary line, once `EVERY` has passed with something to say.
+    fn take(&mut self, now: Instant) -> Option<String> {
+        let span = now.saturating_duration_since(self.since);
+        if span < Self::EVERY {
+            return None;
+        }
+        self.since = now;
+        if self.count == 0 {
+            return None;
+        }
+        let line = format!(
+            "event pump: {} reports found no event buffer posted in the last {} s \
+             (handles {:?}); the guest reposts slower than the host reports",
+            self.count,
+            span.as_secs(),
+            self.handles
+        );
+        self.count = 0;
+        self.handles.clear();
+        Some(line)
+    }
+}
+
 /// Watch the host's descriptors and tell the guest when one has something to
 /// say.
 ///
@@ -944,6 +1000,7 @@ fn event_pump(
     // When each descriptor was last reported (REPEAT).
     let mut last_report: HashMap<u64, Instant> = HashMap::new();
     let mut last_sweep = Instant::now();
+    let mut starved = StarvedNote::new(last_sweep);
 
     // Edge-triggered. Level-triggered would report a descriptor as readable
     // until the *guest* consumes the event, which happens through an ioctl
@@ -1126,7 +1183,7 @@ fn event_pump(
             };
             if !push_event(&vring, &mem, handle, status, batch.then_some(&mut pass)) {
                 // A fence stays in the set, and the sweep sends it again.
-                log::debug!("event pump: no buffer posted for handle {handle}; dropped");
+                starved.note(handle);
             } else if fence {
                 reported.push(handle as u64);
             } else {
@@ -1134,6 +1191,9 @@ fn event_pump(
             }
         }
         pass.signal(&vring);
+        if let Some(line) = starved.take(Instant::now()) {
+            log::debug!("{line}");
+        }
         // A fence the guest has heard about is done here. Its descriptor
         // stays open until the guest closes the handle.
         for handle in reported {
@@ -2435,6 +2495,42 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn starved_reports_are_one_line_per_interval() {
+        let t0 = std::time::Instant::now();
+        let mut n = super::StarvedNote::new(t0);
+        assert_eq!(
+            n.take(t0 + super::StarvedNote::EVERY),
+            None,
+            "nothing to say"
+        );
+        let t1 = t0 + super::StarvedNote::EVERY;
+        for h in [22, 8, 22, 326, 371, 387, 437, 444, 547, 708, 8] {
+            n.note(h);
+        }
+        assert_eq!(
+            n.take(t1 + std::time::Duration::from_secs(1)),
+            None,
+            "too soon"
+        );
+        let line = n.take(t1 + super::StarvedNote::EVERY).expect("a line");
+        assert!(
+            line.starts_with(
+                "event pump: 11 reports found no event buffer posted in the last 10 s"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains("[22, 8, 326, 371, 387, 437, 444, 547]"),
+            "{line}"
+        );
+        assert_eq!(
+            n.take(t1 + super::StarvedNote::EVERY * 2),
+            None,
+            "counted afresh"
+        );
+    }
+
     use super::*;
 
     #[test]
