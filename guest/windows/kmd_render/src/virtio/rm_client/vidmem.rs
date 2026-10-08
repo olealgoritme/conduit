@@ -652,6 +652,25 @@ pub(crate) fn claim_clear(resource_id: u32) -> bool {
     }
 }
 
+/// Up to `out.len()` live objects whose first clear has not run (never mapped on the copy engine:
+/// the creation-time clear found the channel busy, and nothing has written them since). Their
+/// count. Spinlock only.
+pub(crate) fn uncleared(out: &mut [u32]) -> usize {
+    if !any_live() {
+        return 0;
+    }
+    let g = STATE.lock();
+    let mut n = 0;
+    for o in g.objs.iter().flatten().filter(|o| !o.cleared) {
+        if n == out.len() {
+            break;
+        }
+        out[n] = o.resource_id;
+        n += 1;
+    }
+    n
+}
+
 /// The clear [`claim_clear`] handed out did not complete: try again at the next mapping.
 pub(crate) fn clear_failed(resource_id: u32) {
     let mut g = STATE.lock();

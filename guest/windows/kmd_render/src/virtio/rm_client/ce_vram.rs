@@ -217,6 +217,7 @@ static FGN_WRITE: AtomicU32 = AtomicU32::new(0);
 static CLEARED: AtomicU32 = AtomicU32::new(0);
 static CLR_FAIL: AtomicU32 = AtomicU32::new(0);
 static CLR_SKIP: AtomicU32 = AtomicU32::new(0);
+static CLR_LATE: AtomicU32 = AtomicU32::new(0);
 
 fn fgn_fail(f: Fail) -> Fail {
     FGN_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -635,6 +636,20 @@ fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, F
     let m = book().ok_or(REENTRY)?.maps.find(resource_id).ok_or(BAD_SHAPE)?;
     debug_assert_eq!(m.va, va);
     Ok(surface_of(&obj, &m))
+}
+
+/// HPD worker (PASSIVE, no lock held): map, and so clear, up to 4 VRAM surfaces whose first clear
+/// has not run. A surface nothing ever writes otherwise keeps whatever RM's memory held, which a
+/// diagnostic clear (`RvOff` 0x2000, magenta) never reaches (384.1: Explorer's file list stayed
+/// black, not magenta). Counted `RvClrLate`. One relaxed load with nothing alive.
+pub(crate) fn clear_pending(passive: PassiveLevel, adapter: &AdapterContext) {
+    let mut ids = [0u32; 4];
+    let n = super::vidmem::uncleared(&mut ids);
+    for &id in &ids[..n] {
+        if ce_surface(passive, adapter, id).is_ok() {
+            CLR_LATE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Clear a new VRAM surface to 0 on the copy engine and wait (at most `XFER_MS`). The caller holds
@@ -1153,6 +1168,7 @@ pub(crate) fn publish_counters() {
     rec(b"RvCleared", CLEARED.load(Ordering::Relaxed));
     rec(b"RvClrFail", CLR_FAIL.load(Ordering::Relaxed));
     rec(b"RvClrSkip", CLR_SKIP.load(Ordering::Relaxed));
+    rec(b"RvClrLate", CLR_LATE.load(Ordering::Relaxed));
     if FGN_REC.load(Ordering::Relaxed)
         | FGN_IMP.load(Ordering::Relaxed)
         | FGN_FAIL.load(Ordering::Relaxed)
