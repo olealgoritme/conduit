@@ -731,6 +731,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiChUpUs`, `GdiSlowUs`, `GdiSlowOp` | the channel bring-up's time, outside every job's `GdiUs`; the slowest command's time and signature (`opcode \| engine << 4 \| dst class << 8 \| src class << 12 \| sub-rects << 16 \| over-1-MPixel << 24`) |
 | `GdiFgnN`, `GdiFgnCe`, `GdiFgnFail`, `GdiFgnWhy` | foreign NVK images resolved (`SurfaceClass::Foreign`: UMD optimal image with an RM identity); copies from them done on the copy engine; failed (dropped: the image has no CPU view); the last failing step (1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view refused, 6 channel down, 7 memory, 8 destination class) |
 | `GdiFgnDrop`, `GdiFgnOp` | commands dropped because a foreign image is in them other than as a SRCCOPY source (the plan's drop), and the last one's signature (`opcode \| foreign dst << 8 \| foreign src << 9 \| rop << 16`). Note `GdiFgnN` counts surface RESOLUTIONS (a command naming the image twice counts twice), not commands |
+| `GdiSysUs`, `GdiSysVwUs`, `GdiSysSubUs`, `GdiSysWtUs`, `GdiSysPx` | the slowest staging copy-engine command: total µs, the part until its views were resolved, until its last submit, the wait, its pixels |
 | `GdiSlowRop`, `GdiCpuMsk`, `GdiCpuRop` | the slowest command's reason and ROP (`Why \| rop enum << 8 \| ROP3 << 16`); the reasons of the commands the CPU ran (bit per `Why` code, 1 for none); the last CPU command's reason and ROP |
 | `GdiJobMaxN`, `GdiJobT1..3`, `GdiJobT1Us..3Us` | the slowest job (`GdiUsMax`): its command count and its three slowest commands (signature as `GdiSlowOp`, µs) |
 | `GdiDevN`, `GdiCtxN`, `GdiCtxFl` | GDI devices (`GdiDevice`) and GDI contexts (`GdiContext`) created, counted with the knob off too; the last GDI context's raw `DXGK_CREATECONTEXTFLAGS` (bit 2 `VirtualAddressing`) |
@@ -877,6 +878,14 @@ operations. Since the head after 372.1 (d14580e5):
   of all CPU commands, one bit per `Why` code, bit 0 for none) show which ROP these are:
   `Why | DXGK rop enum << 8 | ROP3 << 16`, where the rop enum is 1 SRCCOPY, 2 SRCINVERT, 3 SRCAND,
   4 SRCOR, 5 ROP3.
+
+**373.1:** `GdiSlowRop` 0x106 (Why 6, SRCCOPY) for the 31-32 ms `0x12211`, and `GdiCpuMsk` without
+bit 6 (0x46 at 1080p; 4 at 5120, which is bit 2 = AlphaBlend only), so the slow copy did NOT run on
+the CPU: it succeeded on the staging copy-engine path (`run_ce_sys`; `GdiSlowOp`'s engine field is the
+plan's, Cpu, before that path). The executor's wait was `ce_vram::wait`: it spins 20 ms and then sleeps
+1 ms, which `KeDelayExecutionThread` rounds up to the ~15.6 ms timer tick, so 31.6 ms reads as a copy
+of just over 20 ms plus one tick. Since this head the GDI executor waits by polling without sleeping
+(its own thread), and `GdiSys*Us` split the slowest such command into view resolution, submit and wait.
 
 Every wait of the executor is bounded: the copy-engine waits 100 ms (the job's command is then
 redone on the CPU or dropped), `ce_sysmem`'s channel I/O 250 ms, the RM calls their bounded sections,

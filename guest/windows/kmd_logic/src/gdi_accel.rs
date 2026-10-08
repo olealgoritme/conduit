@@ -1706,6 +1706,13 @@ pub const COUNTERS: &[&str] = &[
     "GdiSlowRop",
     "GdiCpuMsk",
     "GdiCpuRop",
+    // The slowest staging copy-engine command: total µs, µs to its views, to its last submit, in
+    // the wait, and its pixels.
+    "GdiSysUs",
+    "GdiSysVwUs",
+    "GdiSysSubUs",
+    "GdiSysWtUs",
+    "GdiSysPx",
     // Foreign NVK images resolved; copies from them done on the copy engine; refused or failed
     // (the last reason: 1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view
     // refused, 6 channel down, 7 memory, 8 destination class, 9 GdiFgn 0).

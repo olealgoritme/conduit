@@ -84,6 +84,15 @@ static SLOW_ROP: AtomicU32 = AtomicU32::new(0);
 /// one's [`rop_key`].
 static CPU_MSK: AtomicU32 = AtomicU32::new(0);
 static CPU_ROP: AtomicU32 = AtomicU32::new(0);
+/// The slowest staging copy-engine command (`run_ce_sys`): its total µs, the µs to its views
+/// (`ce_sysmem` resolve), to its last submit, in the wait, and its pixels.
+static SYS_US: AtomicU32 = AtomicU32::new(0);
+static SYS_VW_US: AtomicU32 = AtomicU32::new(0);
+static SYS_SUB_US: AtomicU32 = AtomicU32::new(0);
+static SYS_WT_US: AtomicU32 = AtomicU32::new(0);
+static SYS_PX: AtomicU32 = AtomicU32::new(0);
+/// The last `wait_last`'s µs (read by `run_ce_sys` for its split; executor thread only).
+static LAST_WAIT_US: AtomicU32 = AtomicU32::new(0);
 /// Copies from a foreign NVK image done on the copy engine; failed (dropped); the last failing step.
 static FGN_CE: AtomicU32 = AtomicU32::new(0);
 static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
@@ -236,7 +245,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -286,6 +295,11 @@ pub(crate) fn publish_counters() {
     w(b"GdiSlowRop", SLOW_ROP.load(Ordering::Relaxed));
     w(b"GdiCpuMsk", CPU_MSK.load(Ordering::Relaxed));
     w(b"GdiCpuRop", CPU_ROP.load(Ordering::Relaxed));
+    w(b"GdiSysUs", SYS_US.load(Ordering::Relaxed));
+    w(b"GdiSysVwUs", SYS_VW_US.load(Ordering::Relaxed));
+    w(b"GdiSysSubUs", SYS_SUB_US.load(Ordering::Relaxed));
+    w(b"GdiSysWtUs", SYS_WT_US.load(Ordering::Relaxed));
+    w(b"GdiSysPx", SYS_PX.load(Ordering::Relaxed));
     w(b"GdiFgnCe", FGN_CE.load(Ordering::Relaxed));
     w(b"GdiFgnFail", FGN_FAIL.load(Ordering::Relaxed));
     w(b"GdiFgnWhy", FGN_WHY.load(Ordering::Relaxed));
@@ -1016,9 +1030,21 @@ fn submit_and_wait(passive: PassiveLevel, op: &Op, dv: &CeView, sv: Option<&CeVi
 /// waits for the earlier ones: nothing may be in flight once a caller's transaction ends.
 fn wait_last(passive: PassiveLevel, last: Option<u64>) -> bool {
     match last {
-        None => true,
-        Some(v) => glue::wait(passive, v, ga::CE_DEADLINE_MS),
+        None => {
+            LAST_WAIT_US.store(0, Ordering::Relaxed);
+            true
+        }
+        Some(v) => {
+            let t0 = now_100ns();
+            let ok = glue::wait(passive, v, ga::CE_DEADLINE_MS);
+            LAST_WAIT_US.store(us_since(t0), Ordering::Relaxed);
+            ok
+        }
     }
+}
+
+fn us_since(t0: u64) -> u32 {
+    (now_100ns().wrapping_sub(t0) / 10).min(u64::from(u32::MAX)) as u32
 }
 
 /// The view a staging command addresses its rectangles with: the mapping (made with the authored
@@ -1166,6 +1192,29 @@ fn run_overlap(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool
 /// other side VRAM (or the fill's color). `false`: refused (not system-resident, partial leases,
 /// channel busy, a staging-to-staging copy), the caller takes the CPU path.
 fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
+    let t0 = now_100ns();
+    let view_us = core::cell::Cell::new(0u32);
+    let ok = run_ce_sys_inner(passive, adapter, op, t0, &view_us);
+    let total = us_since(t0);
+    if ok && total > SYS_US.load(Ordering::Relaxed) {
+        let wt = LAST_WAIT_US.load(Ordering::Relaxed);
+        SYS_US.store(total, Ordering::Relaxed);
+        SYS_VW_US.store(view_us.get(), Ordering::Relaxed);
+        SYS_WT_US.store(wt, Ordering::Relaxed);
+        SYS_SUB_US.store(total.saturating_sub(wt).saturating_sub(view_us.get()), Ordering::Relaxed);
+        SYS_PX.store(op.subs.iter().map(|r| area(r)).sum::<u64>().min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+    }
+    ok
+}
+
+fn run_ce_sys_inner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    op: &Op,
+    t0: u64,
+    view_us: &core::cell::Cell<u32>,
+) -> bool {
+    let mark = || view_us.set((now_100ns().wrapping_sub(t0) / 10).min(u64::from(u32::MAX)) as u32);
     let Some(dst) = op.dst else {
         return false;
     };
@@ -1179,6 +1228,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
         Cmd::ColorFill { rop, .. } if rop == ga::cfrop::PATCOPY && dst.class == SurfaceClass::System => {
             let dp = map_pitch(&dst, dpc);
             glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
+                mark();
                 submit_and_wait(passive, op, &addr_view(dv, &dst, dpc), None)
             })
         }
@@ -1196,6 +1246,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                     };
                     let dp = map_pitch(&dst, dpc);
                     glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
+                        mark();
                         submit_and_wait(passive, op, &addr_view(dv, &dst, dpc), Some(&sv))
                     })
                 }
@@ -1207,6 +1258,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                     };
                     let sp = map_pitch(&src, spc);
                     glue::with_standard(passive, adapter, src.resource_id, sp, src.width, src.height, |sv| {
+                        mark();
                         submit_and_wait(passive, op, &dv, Some(&addr_view(sv, &src, spc)))
                     })
                 }
@@ -1215,6 +1267,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                     // and never comes here): one view serves both sides.
                     let p = map_pitch(&dst, dpc);
                     glue::with_standard(passive, adapter, dst.resource_id, p, dst.width, dst.height, |v| {
+                        mark();
                         submit_and_wait(passive, op, &addr_view(v, &dst, dpc), Some(&addr_view(v, &src, spc)))
                     })
                 }
@@ -1223,6 +1276,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                     let a = (src.resource_id, map_pitch(&src, spc), src.width, src.height);
                     let b = (dst.resource_id, map_pitch(&dst, dpc), dst.width, dst.height);
                     glue::with_standard_pair(passive, adapter, a, b, |sv, dv| {
+                        mark();
                         submit_and_wait(passive, op, &addr_view(dv, &dst, dpc), Some(&addr_view(sv, &src, spc)))
                     })
                 }
