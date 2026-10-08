@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 23:17:54 +0200
+Subject: [PATCH] nvkmd: NVK_DEBUG=vm mem- lines carry the freeing call stack
+
+The thread name (0021) says which thread dropped the last reference to
+a memory object, but not why: CS2's faulting 109 MiB buffer is freed on
+DXVK's dxvk-submit thread, which runs the allocator's timed tasks
+(eviction and defragmentation acquire resources there) besides the
+submission itself.  Each mem- line now ends with " stack:" and up to 24
+frames as module+0xoffset (RtlCaptureStackBackTrace, the walker the
+memory-list misuse report already used, now shared), to symbolize
+against helios_umd's PDB or map.  Only with NVK_DEBUG=vm; mem- events
+are rare (30 in a CS2 run).
+---
+ src/nouveau/vulkan/nvkmd/nvkmd.c | 52 +++++++++++++++++++++-----------
+ 1 file changed, 35 insertions(+), 17 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index 315fa83d..11ded2ef 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -243,25 +243,19 @@ nvkmd_vm_logging(const struct nvkmd_dev *dev)
+ 
+ #define VM_RANGE "[0x%010" PRIx64 ",0x%010" PRIx64 ") 0x%" PRIx64
+ 
+-/* nvkmd_dev::mems misuse: a memory object added twice, removed while not on
+- * the list, or freed while still on it.  Each of these corrupts the list and
+- * shows up much later as a crash in an unrelated list_del (an NVK exit crash
+- * under the Helios hand-off ledger did), so it is logged where it happens,
+- * with the stack as module+offset, and the list is left consistent.
++/* The caller's stack as " module+0xoffset" frames into buf (Windows; empty
++ * elsewhere), skipping the innermost `skip` frames.
+  */
+ static void
+-nvkmd_mem_list_misuse(const struct nvkmd_mem *mem, const char *what)
++nvkmd_capture_stack(unsigned skip, unsigned max_frames, char *buf, size_t size)
+ {
+-   static uint32_t reports;
+-   if (p_atomic_inc_return(&reports) > 16)
+-      return;
+-
+-   char frames[512] = "";
++   buf[0] = '\0';
+ #ifdef _WIN32
+-   void *stack[12];
+-   const USHORT n = RtlCaptureStackBackTrace(1, 12, stack, NULL);
++   void *stack[32];
++   const USHORT n = RtlCaptureStackBackTrace(skip, MIN2(max_frames, 32), stack,
++                                             NULL);
+    size_t len = 0;
+-   for (USHORT i = 0; i < n && len < sizeof(frames) - 48; i++) {
++   for (USHORT i = 0; i < n && len + 48 < size; i++) {
+       HMODULE module = NULL;
+       char name[MAX_PATH] = "?";
+       if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+@@ -273,10 +267,29 @@ nvkmd_mem_list_misuse(const struct nvkmd_mem *mem, const char *what)
+             snprintf(name, sizeof(name), "%s", base ? base + 1 : path);
+          }
+       }
+-      len += snprintf(frames + len, sizeof(frames) - len, " %s+0x%" PRIxPTR,
++      len += snprintf(buf + len, size - len, " %s+0x%" PRIxPTR,
+                       name, (uintptr_t)stack[i] - (uintptr_t)module);
+    }
++#else
++   (void)skip; (void)max_frames; (void)size;
+ #endif
++}
++
++/* nvkmd_dev::mems misuse: a memory object added twice, removed while not on
++ * the list, or freed while still on it.  Each of these corrupts the list and
++ * shows up much later as a crash in an unrelated list_del (an NVK exit crash
++ * under the Helios hand-off ledger did), so it is logged where it happens,
++ * with the stack as module+offset, and the list is left consistent.
++ */
++static void
++nvkmd_mem_list_misuse(const struct nvkmd_mem *mem, const char *what)
++{
++   static uint32_t reports;
++   if (p_atomic_inc_return(&reports) > 16)
++      return;
++
++   char frames[512] = "";
++   nvkmd_capture_stack(2, 12, frames, sizeof(frames));
+    mesa_loge("NVK: memory object %p (%" PRIu64 " B, flags 0x%x) %s; "
+              "stack:%s", (void *)mem, mem->size_B, mem->flags, what, frames);
+ }
+@@ -707,9 +720,14 @@ nvkmd_mem_unref(struct nvkmd_mem *mem)
+ 
+    if (nvkmd_vm_logging(mem->dev)) {
+       const uint64_t va = mem->va != NULL ? mem->va->addr : 0;
+-      nvkmd_vm_logf(true, "mem-  " VM_RANGE " mem<0x%x>",
++      /* Who freed it: module+offset frames (symbolize the DXVK ones
++       * against helios_umd's map/PDB)
++       */
++      char frames[1024];
++      nvkmd_capture_stack(1, 24, frames, sizeof(frames));
++      nvkmd_vm_logf(true, "mem-  " VM_RANGE " mem<0x%x> stack:%s",
+                     va, va + (mem->va != NULL ? mem->va->size_B : 0),
+-                    mem->size_B, mem->ops->log_handle(mem));
++                    mem->size_B, mem->ops->log_handle(mem), frames);
+    }
+ 
+    mem->ops->free(mem);
