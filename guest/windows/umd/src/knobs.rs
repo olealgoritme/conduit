@@ -537,9 +537,12 @@ pub(crate) fn nvk_rm_copy_record() -> bool {
 /// 0 = never (the opt-out); 1 (default) = yes when dxgkrnl
 /// reports DirectFlip support for the Helios adapter (KMTQAITYPE_DIRECTFLIP_SUPPORT,
 /// i.e. the KMD's SupportDirectFlip cap) and the two resources have the same
-/// size and format; 2 = yes whenever size and format match (test lever); 3 = as 1, and also only
+/// size and the same format or two 8-bit scan-out formats (an R8G8B8A8 game on the
+/// B8G8R8A8 desktop; `helios_umd_common::format::direct_flip_formats_compatible`); 2 = yes
+/// whenever size and format match that way (test lever); 3 = as 1, and also only
 /// for a pair the KMD can scan out as is (one of R8G8B8A8 / B8G8R8A8 / B8G8R8X8 UNORM, one sample,
-/// one mip, one slice). 3 was briefly the meaning of 1 (driver 388.1).
+/// one mip, one slice). 3 was briefly the meaning of 1 (driver 388.1). 4 = as 1 with the exact
+/// format rule measured on 393.1 (formats must be equal), the A/B for the format relaxation.
 /// Windows decides independent flip and the blt-to-flip swap-effect upgrade
 /// partly from this answer.
 pub(crate) fn direct_flip_support() -> u32 {
