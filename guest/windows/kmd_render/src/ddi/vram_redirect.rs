@@ -85,6 +85,49 @@ static MK_RES: AtomicU32 = AtomicU32::new(0);
 static MK_STR: AtomicU32 = AtomicU32::new(0);
 static MK_VRAM_NO: AtomicU32 = AtomicU32::new(0);
 
+/// One timed stage: summed microseconds, count, maximum (`<name>Us`, `<name>N`, `<name>Max`).
+struct Stage {
+    us: AtomicU32,
+    n: AtomicU32,
+    max: AtomicU32,
+}
+impl Stage {
+    const fn new() -> Self {
+        Self {
+            us: AtomicU32::new(0),
+            n: AtomicU32::new(0),
+            max: AtomicU32::new(0),
+        }
+    }
+    fn add_since(&self, t0: u64) {
+        let us = (crate::ddi::blt_async::now_100ns().saturating_sub(t0) / 10)
+            .min(u64::from(u32::MAX)) as u32;
+        self.us.fetch_add(us, Ordering::Relaxed);
+        self.n.fetch_add(1, Ordering::Relaxed);
+        self.max.fetch_max(us, Ordering::Relaxed);
+    }
+    fn reset(&self) {
+        self.us.store(0, Ordering::Relaxed);
+        self.n.store(0, Ordering::Relaxed);
+        self.max.store(0, Ordering::Relaxed);
+    }
+    fn publish(&self, us: &[u8], n: &[u8], max: &[u8]) {
+        use crate::diag::record_named_bytes as rec;
+        rec(us, self.us.load(Ordering::Relaxed));
+        rec(n, self.n.load(Ordering::Relaxed));
+        rec(max, self.max.load(Ordering::Relaxed));
+    }
+}
+/// Per foreign Present into a VRAM surface: the whole hook (`RvPr*`), the route call (`RvRt*`),
+/// and the synchronous copy's steps: foreign_source (`RvSyFs*`), the destination's mapping
+/// (`RvSyDs*`), the copy's submit (`RvSySub*`), the wait (`RvSyWt*`).
+static T_PR: Stage = Stage::new();
+static T_RT: Stage = Stage::new();
+static T_FS: Stage = Stage::new();
+static T_DS: Stage = Stage::new();
+static T_SUB: Stage = Stage::new();
+static T_WT: Stage = Stage::new();
+
 /// The Present's stash (0 none, 1 resolved RM fence, 2 stream point). Any IRQL.
 pub(crate) fn note_marker(kind: u32) {
     match kind {
@@ -97,8 +140,27 @@ pub(crate) fn note_marker(kind: u32) {
 
 /// StartDevice (PASSIVE): zero the counters (written only once a VRAM Blt was seen).
 pub(crate) fn reset_for_start() {
-    for c in [&SEEN, &ROUTED, &SKIP, &WHY, &READBACK, &UPLOAD, &GDI_FAIL, &SYNC, &RT_WHY, &SYNC_TRY, &SYNC_WHY, &MK_NONE, &MK_RES, &MK_STR, &MK_VRAM_NO] {
+    for c in [
+        &SEEN,
+        &ROUTED,
+        &SKIP,
+        &WHY,
+        &READBACK,
+        &UPLOAD,
+        &GDI_FAIL,
+        &SYNC,
+        &RT_WHY,
+        &SYNC_TRY,
+        &SYNC_WHY,
+        &MK_NONE,
+        &MK_RES,
+        &MK_STR,
+        &MK_VRAM_NO,
+    ] {
         c.store(0, Ordering::Relaxed);
+    }
+    for t in [&T_PR, &T_RT, &T_FS, &T_DS, &T_SUB, &T_WT] {
+        t.reset();
     }
 }
 
@@ -119,6 +181,12 @@ fn publish() {
     rec(b"RvMkRes", MK_RES.load(Ordering::Relaxed));
     rec(b"RvMkStr", MK_STR.load(Ordering::Relaxed));
     rec(b"RvMkVramNo", MK_VRAM_NO.load(Ordering::Relaxed));
+    T_PR.publish(b"RvPrUs", b"RvPrN", b"RvPrMax");
+    T_RT.publish(b"RvRtUs", b"RvRtN", b"RvRtMax");
+    T_FS.publish(b"RvSyFsUs", b"RvSyFsN", b"RvSyFsMax");
+    T_DS.publish(b"RvSyDsUs", b"RvSyDsN", b"RvSyDsMax");
+    T_SUB.publish(b"RvSySubUs", b"RvSySubN", b"RvSySubMax");
+    T_WT.publish(b"RvSyWtUs", b"RvSyWtN", b"RvSyWtMax");
     vidmem::publish_counters();
 }
 
@@ -143,7 +211,11 @@ pub(crate) fn destination_gone(resource_id: u32) {
 }
 
 /// `SrcRect` and `DstRect` of the Present, as pixel rectangles of equal size inside both surfaces.
-fn rects(args: &DXGKARG_PRESENT, src: &PresentAllocInfo, dst: &PresentAllocInfo) -> Option<(Rect, Rect)> {
+fn rects(
+    args: &DXGKARG_PRESENT,
+    src: &PresentAllocInfo,
+    dst: &PresentAllocInfo,
+) -> Option<(Rect, Rect)> {
     let conv = |l: i32, t: i32, ri: i32, b: i32, w: u32, h: u32| -> Option<Rect> {
         if l < 0 || t < 0 || ri <= l || b <= t || ri as u32 > w || b as u32 > h {
             return None;
@@ -209,96 +281,23 @@ pub(crate) unsafe fn blt(
                 && source.storage != PresentAllocationStorage::PitchedStandardBuffer =>
         {
             // The redirected Blt of an NVK-on-RM frame into the GPU-only redirection surface.
-            let Some(fsrc) = crate::virtio::venus::foreign_source_if_enabled(
+            let t_pr = crate::ddi::blt_async::now_100ns();
+            let out = foreign_arm(
+                passive,
                 adapter,
-                source.foreign,
-                source.venus_alloc_size,
-            ) else {
-                return skip(Why::NoForeignSource);
-            };
-            let Some(source_desc) = OptimalPresentImageDesc::new_foreign_dma_buf(
-                source.resource_id,
-                source.width,
-                source.height,
+                args,
+                context,
+                source,
+                destination,
+                dst,
                 source_dxgi,
-                fsrc,
-            ) else {
-                return skip(Why::NoForeignSource);
-            };
-            // The Venus fallback's view of the VRAM surface: the same foreign-import route the
-            // source takes (its layout is the KMD's own record).
-            let dst_layout = helios_kmd_logic::foreign_resource::Layout {
-                width: dst.width,
-                height: dst.height,
-                stride: dst.pitch,
-                offset: 0,
-                fourcc: dst.fourcc,
-                modifier: helios_kmd_logic::foreign_resource::MOD_LINEAR,
-                plane1: None,
-            };
-            let Some(destination_desc) = crate::virtio::venus::foreign_source_if_enabled(
-                adapter,
-                Some(dst_layout),
-                dst.size,
-            )
-            .and_then(|f| {
-                OptimalPresentImageDesc::new_foreign_dma_buf(
-                    destination.resource_id,
-                    destination.width,
-                    destination.height,
-                    destination_dxgi,
-                    f,
-                )
-            })
-            .map(PresentDestinationDesc::OptimalImage) else {
-                return skip(Why::NoDestinationDesc);
-            };
-            // SAFETY: the caller's contract.
-            let token = unsafe {
-                crate::ddi::ce_present_route::try_route_vram(
-                    passive,
-                    adapter,
-                    args,
-                    context,
-                    source_desc,
-                    destination_desc,
-                    crate::ddi::ce_present_route::DstInfo {
-                        resource_id: destination.resource_id,
-                        width: dst.width,
-                        height: dst.height,
-                        pitch: dst.pitch,
-                        dxgi_format: destination_dxgi,
-                        alloc_size: dst.size,
-                    },
-                    boundary,
-                )
-            };
-            match token {
-                Some(t) => {
-                    ROUTED.fetch_add(1, Ordering::Relaxed);
-                    maybe_publish(false);
-                    Some(Outcome::Routed(t))
-                }
-                None => {
-                    // The route refused (no copy-engine Present record for this frame, the
-                    // channel busy, ...): the destination is GPU-only and has no Venus copy to
-                    // fall back to, so copy the frame on the copy engine now from the image's
-                    // memory (imported by resource id, `ce_vram::foreign_source`), waited for
-                    // here. Without the record there is no acquire of the producer's semaphore:
-                    // DXGI presents after the frame's work is submitted, which is the ordering a
-                    // windowed BLT copy has on this path anyway. 372.1: every Present Blt of
-                    // explorer's composition into its window surface refused (RvBltWhy 1), the
-                    // file list black.
-                    RT_WHY.store(crate::ddi::ce_present_route::last_why(), Ordering::Relaxed);
-                    if sync_foreign(passive, adapter, source.resource_id, src_rect, destination.resource_id, dst_rect, dst.fourcc) {
-                        SYNC.fetch_add(1, Ordering::Relaxed);
-                        maybe_publish(false);
-                        Some(Outcome::Done)
-                    } else {
-                        skip(Why::RouteRefused)
-                    }
-                }
-            }
+                destination_dxgi,
+                boundary,
+                src_rect,
+                dst_rect,
+            );
+            T_PR.add_since(t_pr);
+            out
         }
         (Some(_), Some(_)) => {
             if source_dxgi != destination_dxgi {
@@ -310,7 +309,8 @@ pub(crate) unsafe fn blt(
             ) else {
                 return skip(Why::ChannelBusy);
             };
-            let Ok(value) = ce_vram::copy(&s, src_rect, &d, dst_rect.left, dst_rect.top, Remap::None)
+            let Ok(value) =
+                ce_vram::copy(&s, src_rect, &d, dst_rect.left, dst_rect.top, Remap::None)
             else {
                 return skip(Why::Copy);
             };
@@ -322,7 +322,9 @@ pub(crate) unsafe fn blt(
         }
         (None, Some(_)) => {
             // GDI's CPU-written content into the GPU-only surface: the UPLOAD.
-            if source.storage != PresentAllocationStorage::PitchedStandardBuffer || source.pitch == 0 {
+            if source.storage != PresentAllocationStorage::PitchedStandardBuffer
+                || source.pitch == 0
+            {
                 return skip(Why::UnknownSource);
             }
             if source_dxgi != destination_dxgi {
@@ -336,7 +338,8 @@ pub(crate) unsafe fn blt(
                 return skip(Why::Memory);
             }
             buf.resize(span as usize, 0);
-            let offset = u64::from(src_rect.top) * u64::from(source.pitch) + u64::from(src_rect.left) * 4;
+            let offset =
+                u64::from(src_rect.top) * u64::from(source.pitch) + u64::from(src_rect.left) * 4;
             if !crate::ddi::build_paging_buffer::read_standard_buffer(
                 passive,
                 adapter,
@@ -438,20 +441,149 @@ fn sync_foreign(
         SYNC_WHY.store(step << 24 | (word & 0x00ff_ffff), Ordering::Relaxed);
         false
     };
-    let fs = match ce_vram::foreign_source(passive, adapter, source) {
+    let now = crate::ddi::blt_async::now_100ns;
+    let t = now();
+    let fs = ce_vram::foreign_source(passive, adapter, source);
+    T_FS.add_since(t);
+    let fs = match fs {
         Ok(f) => f,
         Err(f) => return fail(1, cc_svc::fail_word(f)),
     };
-    let d = match ce_vram::ce_surface(passive, adapter, destination) {
+    let t = now();
+    let d = ce_vram::ce_surface(passive, adapter, destination);
+    T_DS.add_since(t);
+    let d = match d {
         Ok(d) => d,
         Err(f) => return fail(2, cc_svc::fail_word(f)),
     };
-    let value = match ce_vram::foreign_copy(&fs, src_rect, &d, dst_rect.left, dst_rect.top, dst_fourcc) {
+    let t = now();
+    let value = ce_vram::foreign_copy(&fs, src_rect, &d, dst_rect.left, dst_rect.top, dst_fourcc);
+    T_SUB.add_since(t);
+    let value = match value {
         Ok(v) => v,
         Err(f) => return fail(3, cc_svc::fail_word(f)),
     };
-    if !ce_vram::wait(passive, value, ce_vram::XFER_MS) {
+    let t = now();
+    let done = ce_vram::wait(passive, value, ce_vram::XFER_MS);
+    T_WT.add_since(t);
+    if !done {
         return fail(4, 0);
     }
     true
+}
+
+/// The foreign-source arm of [`blt`]: the route, else the synchronous copy.
+#[allow(clippy::too_many_arguments)]
+unsafe fn foreign_arm(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    args: &DXGKARG_PRESENT,
+    context: Option<&ContextHandleRef<'_>>,
+    source: &PresentAllocInfo,
+    destination: &PresentAllocInfo,
+    dst: vidmem::VramObject,
+    source_dxgi: u32,
+    destination_dxgi: u32,
+    boundary: Option<u64>,
+    src_rect: Rect,
+    dst_rect: Rect,
+) -> Option<Outcome> {
+    let Some(fsrc) = crate::virtio::venus::foreign_source_if_enabled(
+        adapter,
+        source.foreign,
+        source.venus_alloc_size,
+    ) else {
+        return skip(Why::NoForeignSource);
+    };
+    let Some(source_desc) = OptimalPresentImageDesc::new_foreign_dma_buf(
+        source.resource_id,
+        source.width,
+        source.height,
+        source_dxgi,
+        fsrc,
+    ) else {
+        return skip(Why::NoForeignSource);
+    };
+    // The Venus fallback's view of the VRAM surface: the same foreign-import route the
+    // source takes (its layout is the KMD's own record).
+    let dst_layout = helios_kmd_logic::foreign_resource::Layout {
+        width: dst.width,
+        height: dst.height,
+        stride: dst.pitch,
+        offset: 0,
+        fourcc: dst.fourcc,
+        modifier: helios_kmd_logic::foreign_resource::MOD_LINEAR,
+        plane1: None,
+    };
+    let Some(destination_desc) =
+        crate::virtio::venus::foreign_source_if_enabled(adapter, Some(dst_layout), dst.size)
+            .and_then(|f| {
+                OptimalPresentImageDesc::new_foreign_dma_buf(
+                    destination.resource_id,
+                    destination.width,
+                    destination.height,
+                    destination_dxgi,
+                    f,
+                )
+            })
+            .map(PresentDestinationDesc::OptimalImage)
+    else {
+        return skip(Why::NoDestinationDesc);
+    };
+    let t_rt = crate::ddi::blt_async::now_100ns();
+    // SAFETY: the caller's contract.
+    let token = unsafe {
+        crate::ddi::ce_present_route::try_route_vram(
+            passive,
+            adapter,
+            args,
+            context,
+            source_desc,
+            destination_desc,
+            crate::ddi::ce_present_route::DstInfo {
+                resource_id: destination.resource_id,
+                width: dst.width,
+                height: dst.height,
+                pitch: dst.pitch,
+                dxgi_format: destination_dxgi,
+                alloc_size: dst.size,
+            },
+            boundary,
+        )
+    };
+    T_RT.add_since(t_rt);
+    match token {
+        Some(t) => {
+            ROUTED.fetch_add(1, Ordering::Relaxed);
+            maybe_publish(false);
+            Some(Outcome::Routed(t))
+        }
+        None => {
+            // The route refused (no copy-engine Present record for this frame, the
+            // channel busy, ...): the destination is GPU-only and has no Venus copy to
+            // fall back to, so copy the frame on the copy engine now from the image's
+            // memory (imported by resource id, `ce_vram::foreign_source`), waited for
+            // here. Without the record there is no acquire of the producer's semaphore:
+            // DXGI presents after the frame's work is submitted, which is the ordering a
+            // windowed BLT copy has on this path anyway. 372.1: every Present Blt of
+            // explorer's composition into its window surface refused (RvBltWhy 1), the
+            // file list black.
+            RT_WHY.store(crate::ddi::ce_present_route::last_why(), Ordering::Relaxed);
+            if sync_foreign(
+                passive,
+                adapter,
+                source.resource_id,
+                src_rect,
+                destination.resource_id,
+                dst_rect,
+                dst.fourcc,
+            ) {
+                SYNC.fetch_add(1, Ordering::Relaxed);
+                maybe_publish(false);
+                Some(Outcome::Done)
+            } else {
+                skip(Why::RouteRefused)
+            }
+        }
+    }
 }
