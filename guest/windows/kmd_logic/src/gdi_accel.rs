@@ -1854,6 +1854,22 @@ pub const COUNTERS: &[&str] = &[
     "GdiChkGpuPx",
     "GdiOpaqN",
     "GdiFmtK",
+    // Content probes of commands into GPU surfaces, per opcode 1..7: probes | destination row all
+    // RGB 0 after the command << 10 | source row all RGB 0 << 20; the last all-zero probe's
+    // signature; the first command into each of 4 destinations, before it ran: resource id << 16 |
+    // magenta pixels << 8 | RGB-0 pixels (of a row of up to 64).
+    "GdiPrb1",
+    "GdiPrb2",
+    "GdiPrb3",
+    "GdiPrb4",
+    "GdiPrb5",
+    "GdiPrb6",
+    "GdiPrb7",
+    "GdiPrbK",
+    "GdiPre0",
+    "GdiPre1",
+    "GdiPre2",
+    "GdiPre3",
     // Staging commands whose pitch differs from the view's (authored) pitch; the last pair.
     "GdiPitchMis",
     "GdiPitchCmd",
