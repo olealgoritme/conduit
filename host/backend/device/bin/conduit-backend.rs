@@ -1462,6 +1462,10 @@ struct NvGpuBackend {
     /// A request was served since the device was last (re)started. A restart
     /// that finds this set is a guest that rebooted or reloaded its driver.
     served: bool,
+    /// Requests served so far (every queue), and those of the cursor queue (virtqueue 2): the
+    /// evidence that a guest's cursor commands travel there (`cursor queue:` log lines).
+    served_n: u64,
+    cursor_q_n: u64,
     /// The backend has descriptors for the event thread to start or stop
     /// watching. Noted under the lock each request already takes, so a
     /// drain that opened and closed nothing -- nearly all of them -- does not
@@ -1603,6 +1607,8 @@ impl NvGpuBackend {
             readable: Vec::new(),
             writable: Vec::new(),
             served: false,
+            served_n: 0,
+            cursor_q_n: 0,
             watch_dirty: true,
             #[cfg(feature = "venus")]
             gpu_cmd_seen: false,
@@ -1782,6 +1788,8 @@ impl NvGpuBackend {
         #[cfg(feature = "venus")]
         self.venus.held.lock().expect("held chains").clear();
         self.served = false;
+        // A new driver: its first cursor-queue request is logged again.
+        self.cursor_q_n = 0;
         self.input_claims.reset();
         if let Some(link) = self.display_link.as_ref() {
             link.set_release_enabled(false);
@@ -1817,13 +1825,32 @@ impl NvGpuBackend {
         prio: Option<&VringRwLock>,
         mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
     ) -> std::io::Result<()> {
+        let before = self.served_n;
         if let Some(p) = prio
             && self.drain::<TRACE>(p, None, mem)?
         {
             p.signal_used_queue()
                 .map_err(|e| std::io::Error::other(format!("signal used queue: {e}")))?;
         }
+        self.note_cursor_q(self.served_n - before);
         Ok(())
+    }
+
+    /// `n` more requests were served on the cursor queue: log the first, then every 1000th.
+    fn note_cursor_q(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let was = self.cursor_q_n;
+        self.cursor_q_n += n;
+        if was == 0 {
+            log::info!("cursor queue: first request served (virtqueue 2)");
+        } else if was / 1000 != self.cursor_q_n / 1000 {
+            log::info!(
+                "cursor queue: {} requests served (virtqueue 2)",
+                self.cursor_q_n
+            );
+        }
     }
 
     fn drain<const TRACE: bool>(
@@ -1925,6 +1952,7 @@ impl NvGpuBackend {
                         // submit (docs/research/host-roundtrip-latency.md).
                         used |= !self.latency.quiet_held;
                         self.served = true;
+                        self.served_n += 1;
                         self.serve_prio::<TRACE>(prio, mem)?;
                         continue;
                     }
@@ -1954,6 +1982,7 @@ impl NvGpuBackend {
             }
             used = true;
             self.served = true;
+            self.served_n += 1;
             self.serve_prio::<TRACE>(prio, mem)?;
         }
         Ok(used)
@@ -2141,6 +2170,7 @@ impl VhostUserBackendMut for NvGpuBackend {
             vrings.get(CURSOR_QUEUE)
         };
         device::stage::kick();
+        let before = self.served_n;
         let mut used = false;
         if self.event_idx {
             // With EVENT_IDX the guest suppresses notifications, so re-arm and
@@ -2154,6 +2184,9 @@ impl VhostUserBackendMut for NvGpuBackend {
             }
         } else {
             used |= self.process(vring, prio, &mem)?;
+        }
+        if cursor {
+            self.note_cursor_q(self.served_n - before);
         }
         #[cfg(feature = "venus")]
         if !cursor {
