@@ -92,6 +92,17 @@ static FGN_WR: AtomicU32 = AtomicU32::new(0);
 /// `GdiSlowOp`, time in µs).
 static JOB_N_OPS: AtomicU32 = AtomicU32::new(0);
 static JOB_T: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+/// The pixel self-check: after a fill or copy that reported success, one destination pixel is read
+/// back and compared with what the command should have written (the fill's color, the copy's
+/// source pixel; the low 24 bits). Sampled: the first 16 checkable commands, then every 32nd.
+/// Checks made, mismatches, the last mismatch's command (`GdiSlowOp` signature | path << 28: 1 CE,
+/// 2 staging CE view, 3 CPU, 4 scroll bands), the pixel read and the pixel wanted.
+static CHK_SEEN: AtomicU32 = AtomicU32::new(0);
+static CHK_N: AtomicU32 = AtomicU32::new(0);
+static CHK_BAD: AtomicU32 = AtomicU32::new(0);
+static CHK_K: AtomicU32 = AtomicU32::new(0);
+static CHK_GOT: AtomicU32 = AtomicU32::new(0);
+static CHK_WANT: AtomicU32 = AtomicU32::new(0);
 static OVL_N: AtomicU32 = AtomicU32::new(0);
 static OVL_CE: AtomicU32 = AtomicU32::new(0);
 static OVL_WHY: AtomicU32 = AtomicU32::new(0);
@@ -181,7 +192,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -233,6 +244,11 @@ pub(crate) fn publish_counters() {
     w(b"GdiOvlCe", OVL_CE.load(Ordering::Relaxed));
     w(b"GdiOvlWhy", OVL_WHY.load(Ordering::Relaxed));
     w(b"GdiJobMaxN", JOB_N_OPS.load(Ordering::Relaxed));
+    w(b"GdiChkN", CHK_N.load(Ordering::Relaxed));
+    w(b"GdiChkBad", CHK_BAD.load(Ordering::Relaxed));
+    w(b"GdiChkK", CHK_K.load(Ordering::Relaxed));
+    w(b"GdiChkGot", CHK_GOT.load(Ordering::Relaxed));
+    w(b"GdiChkWant", CHK_WANT.load(Ordering::Relaxed));
     w(b"GdiJobT1", JOB_T[0].load(Ordering::Relaxed));
     w(b"GdiJobT1Us", JOB_T[1].load(Ordering::Relaxed));
     w(b"GdiJobT2", JOB_T[2].load(Ordering::Relaxed));
@@ -550,6 +566,61 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, on_thread
     more
 }
 
+/// One pixel of a surface (VRAM through the bounce buffer, a staging buffer through its CPU view).
+fn read_px(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, x: i32, y: i32, cmd_pitch: u32) -> Option<u32> {
+    if x < 0 || y < 0 || x as u32 >= s.width || y as u32 >= s.height {
+        return None;
+    }
+    let mut b = [0u8; 4];
+    let ok = match s.class {
+        SurfaceClass::Vram => glue::vram_read(passive, adapter, s.resource_id, Rect::new(x, y, x + 1, y + 1), &mut b, 4),
+        SurfaceClass::System => {
+            let p = pitch_of(s, cmd_pitch) as u64;
+            glue::std_read(passive, adapter, s.resource_id, y as u64 * p + x as u64 * 4, &mut b)
+        }
+        _ => false,
+    };
+    ok.then(|| u32::from_le_bytes(b))
+}
+
+/// The sampled pixel self-check of a command that reported success (`path`: 1 CE, 2 staging CE
+/// view, 3 CPU, 4 scroll bands). PASSIVE, no lock held.
+fn self_check(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, path: u32) {
+    let (Some(dst), Some(sub)) = (op.dst, op.subs.first()) else {
+        return;
+    };
+    let want = match op.cmd {
+        Cmd::ColorFill { rop, color, .. } if rop == ga::cfrop::PATCOPY => Some(color),
+        Cmd::BitBlt { rop, src: sr, dst: dr, .. } if rop == ga::rop::SRCCOPY && op.why != Some(Why::Overlap) => None
+            .or_else(|| {
+                let src = op.srcs[0]?;
+                let s = ga::bitblt_src(sub, &dr, &sr);
+                let (_, spc) = cmd_pitches(&op.cmd);
+                let v = read_px(passive, adapter, &src, s.left, s.top, spc)?;
+                Some(if ga::swaps_rb(&src, &dst) { (v & 0xff00_ff00) | (v >> 16 & 0xff) | (v & 0xff) << 16 } else { v })
+            }),
+        _ => return,
+    };
+    let n = CHK_SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 16 && n % 32 != 0 {
+        return;
+    }
+    let Some(want) = want else {
+        return;
+    };
+    let (dpc, _) = cmd_pitches(&op.cmd);
+    let Some(got) = read_px(passive, adapter, &dst, sub.left, sub.top, dpc) else {
+        return;
+    };
+    CHK_N.fetch_add(1, Ordering::Relaxed);
+    if (got ^ want) & 0x00ff_ffff != 0 {
+        CHK_BAD.fetch_add(1, Ordering::Relaxed);
+        CHK_K.store(op_signature(op) | path << 28, Ordering::Relaxed);
+        CHK_GOT.store(got, Ordering::Relaxed);
+        CHK_WANT.store(want, Ordering::Relaxed);
+    }
+}
+
 fn class_bit_of(s: Option<Surface>) -> u32 {
     s.map_or(0, |s| class_bit(s.class))
 }
@@ -699,6 +770,7 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
                     Cmd::ColorFill { .. } => FILL_N.fetch_add(1, Ordering::Relaxed),
                     _ => BLT_N.fetch_add(1, Ordering::Relaxed),
                 };
+                self_check(passive, adapter, op, 1);
             } else {
                 crate::ddi::gdi_accel::note_why(Why::CeFailed);
                 run_cpu_counted(passive, adapter, op);
@@ -709,6 +781,7 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
             if run_overlap(passive, adapter, op) {
                 OVL_CE.fetch_add(1, Ordering::Relaxed);
                 BLT_N.fetch_add(1, Ordering::Relaxed);
+                self_check(passive, adapter, op, 4);
             } else {
                 run_cpu_counted(passive, adapter, op);
             }
@@ -736,6 +809,7 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
                     Cmd::ColorFill { .. } => FILL_N.fetch_add(1, Ordering::Relaxed),
                     _ => BLT_N.fetch_add(1, Ordering::Relaxed),
                 };
+                self_check(passive, adapter, op, 2);
             } else {
                 if stage != 0 {
                     note_sys_cpu(op, stage);
@@ -750,6 +824,7 @@ fn run_cpu_counted(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     match run_cpu(passive, adapter, op) {
         Ok(()) => {
             FALL.fetch_add(1, Ordering::Relaxed);
+            self_check(passive, adapter, op, 3);
         }
         Err(why) => {
             crate::ddi::gdi_accel::note_why(why);
