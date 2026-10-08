@@ -96,6 +96,69 @@ static BOOK: SpinLock<Book> = SpinLock::new(Book {
     maps: MapBook::new(),
     bounce: None,
 });
+
+// ---- BOOK, guarded against re-entry ----------------------------------------------------------------
+//
+// 364.1 hung the guest: a guard taken in a `match` scrutinee stayed alive across its arms, an arm took
+// the table again (through `with_io` -> `give_back_stale`) on the same CPU at DISPATCH, and it spun
+// forever. Every access goes through [`book`], which records the owning thread and answers a
+// re-entry with `None` (counted, `RvBookReent`) instead of spinning: the caller fails that call
+// (`REENTRY`) and the guest lives. The rule stays: never hold a guard across I/O or another call
+// into this file (bind the result to a local first, never lock in a `match`/`if let` scrutinee).
+
+#[link(name = "ntoskrnl")]
+extern "system" {
+    fn PsGetCurrentThreadId() -> *mut core::ffi::c_void;
+}
+
+static BOOK_OWNER: AtomicU32 = AtomicU32::new(0);
+static BOOK_REENT: AtomicU32 = AtomicU32::new(0);
+
+/// A re-entrant access to the map table was refused (a bug: a guard held across a call that comes
+/// back into this file).
+pub(crate) const REENTRY: Fail = Fail::new(FailKind::Refused, 0xF1);
+
+struct BookGuard<'a> {
+    inner: crate::sync::SpinLockGuard<'a, Book>,
+}
+
+impl core::ops::Deref for BookGuard<'_> {
+    type Target = Book;
+    fn deref(&self) -> &Book {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for BookGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Book {
+        &mut self.inner
+    }
+}
+
+impl Drop for BookGuard<'_> {
+    fn drop(&mut self) {
+        // Before the inner guard releases the lock (fields drop after this body).
+        BOOK_OWNER.store(0, Ordering::Release);
+    }
+}
+
+fn thread_tag() -> u32 {
+    // SAFETY: a scalar read of the current thread's id; any IRQL.
+    let id = (unsafe { PsGetCurrentThreadId() } as usize) as u32;
+    id | 1
+}
+
+/// The map table, or `None` when this thread already holds it (counted).
+fn book() -> Option<BookGuard<'static>> {
+    let me = thread_tag();
+    if BOOK_OWNER.load(Ordering::Acquire) == me {
+        BOOK_REENT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let inner = BOOK.lock();
+    BOOK_OWNER.store(me, Ordering::Release);
+    Some(BookGuard { inner })
+}
 static CHAN_GEN: AtomicU64 = AtomicU64::new(1);
 /// Nonzero while any mapping or the bounce exists (the teardown hooks' fast exit).
 static ANY: AtomicU32 = AtomicU32::new(0);
@@ -228,7 +291,8 @@ fn foreign_source_inner(
         compressed: false,
     };
     let plan = helios_kmd_logic::ce_present::source_plan(gen, &desc).map_err(|_| BAD_SHAPE)?;
-    let va = match BOOK.lock().maps.find(resource_id) {
+    let found = book().ok_or(REENTRY)?.maps.find(resource_id);
+    let va = match found {
         Some(m) => m.va,
         None => with_io(passive, adapter, |io, h| import_foreign(io, h, resource_id, size, plan.page_kind))?,
     };
@@ -303,11 +367,12 @@ fn import_foreign(
     kind: Option<u32>,
 ) -> Result<u64, Fail> {
     let len = rv::map_len(helios_kmd_logic::round_up_page(size)).ok_or(BAD_SHAPE)?;
-    let slot = match BOOK.lock().maps.plan(resource_id) {
+    let plan = book().ok_or(REENTRY)?.maps.plan(resource_id);
+    let slot = match plan {
         MapPlan::Hit(m) => return Ok(m.va),
         MapPlan::Make { slot, evict } => {
             if let Some(old) = evict {
-                BOOK.lock().maps.remove(old.slot);
+                let _ = book().ok_or(REENTRY)?.maps.remove(old.slot);
                 give_back(io, h, &old);
             }
             slot
@@ -351,7 +416,7 @@ fn import_foreign(
     match mapped {
         Ok(g) => {
             MAP_OK.fetch_add(1, Ordering::Relaxed);
-            let mut b = BOOK.lock();
+            let mut b = book().ok_or(REENTRY)?;
             b.maps.insert(slot, resource_id, g.va, len);
             refresh_any(&b);
             Ok(g.va)
@@ -450,7 +515,7 @@ pub(crate) fn ce_surface(
 /// `resource_id`'s mapping if it exists now (no RM call). Spinlock only, any IRQL up to DISPATCH.
 pub(crate) fn ce_surface_cached(resource_id: u32) -> Option<CeSurface> {
     let obj = super::vidmem::lookup(resource_id)?;
-    let m = BOOK.lock().maps.find(resource_id)?;
+    let m = book()?.maps.find(resource_id)?;
     Some(surface_of(&obj, &m))
 }
 
@@ -471,7 +536,8 @@ fn surface_of(obj: &super::vidmem::VramObject, m: &Mapped) -> CeSurface {
 /// possibly the content transaction (the order is content -> channel I/O); takes the channel's
 /// I/O without waiting (`BUSY`).
 pub(crate) fn ce_object_va(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) -> Result<u64, Fail> {
-    if let Some(m) = BOOK.lock().maps.find(resource_id) {
+    let found = book().ok_or(REENTRY)?.maps.find(resource_id);
+    if let Some(m) = found {
         return Ok(m.va);
     }
     let (client, memory, size, sysmem) = rm_object(resource_id).ok_or(NOT_VRAM)?;
@@ -490,7 +556,7 @@ fn rm_object(resource_id: u32) -> Option<(u32, u32, u64, bool)> {
 fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, Fail> {
     let obj = super::vidmem::lookup(resource_id).ok_or(NOT_VRAM)?;
     let va = map_object(io, h, resource_id, obj.client, obj.memory, obj.size, false)?;
-    let m = BOOK.lock().maps.find(resource_id).ok_or(BAD_SHAPE)?;
+    let m = book().ok_or(REENTRY)?.maps.find(resource_id).ok_or(BAD_SHAPE)?;
     debug_assert_eq!(m.va, va);
     Ok(surface_of(&obj, &m))
 }
@@ -507,12 +573,12 @@ fn map_object(
     sysmem: bool,
 ) -> Result<u64, Fail> {
     let len = rv::map_len(helios_kmd_logic::round_up_page(size)).ok_or(BAD_SHAPE)?;
-    let plan = BOOK.lock().maps.plan(resource_id);
+    let plan = book().ok_or(REENTRY)?.maps.plan(resource_id);
     let slot = match plan {
         MapPlan::Hit(m) => return Ok(m.va),
         MapPlan::Make { slot, evict } => {
             if let Some(old) = evict {
-                BOOK.lock().maps.remove(old.slot);
+                let _ = book().ok_or(REENTRY)?.maps.remove(old.slot);
                 give_back(io, h, &old);
             }
             slot
@@ -540,7 +606,7 @@ fn map_object(
     match mapped {
         Ok(g) => {
             MAP_OK.fetch_add(1, Ordering::Relaxed);
-            let mut b = BOOK.lock();
+            let mut b = book().ok_or(REENTRY)?;
             b.maps.insert(slot, resource_id, g.va, len);
             refresh_any(&b);
             Ok(g.va)
@@ -601,19 +667,23 @@ fn give_back_stale(io: &Io<'_>, h: &Handles) {
         return;
     }
     loop {
-        let Some(m) = BOOK.lock().maps.take_stale() else {
+        let taken = book().and_then(|mut b| b.maps.take_stale());
+        let Some(m) = taken else {
             break;
         };
         give_back(io, h, &m);
     }
-    let b = BOOK.lock();
-    refresh_any(&b);
+    if let Some(b) = book() {
+        refresh_any(&b);
+    }
 }
 
 /// The allocation behind `resource_id` is being destroyed (`vidmem::released`): its mapping is
 /// never used again and goes back at the next pass that holds the channel's I/O. Spinlock only.
 pub(crate) fn object_gone(resource_id: u32) {
-    let mut b = BOOK.lock();
+    let Some(mut b) = book() else {
+        return;
+    };
     if b.maps.mark_stale(resource_id) {
         ANY.store(1, Ordering::Release);
     }
@@ -753,12 +823,14 @@ pub(crate) fn transfer(
 /// The bounce buffer, at least `need` bytes (kept between calls; a larger request replaces it).
 /// The caller holds the channel's I/O and nothing is in flight on the old one (transfers wait).
 fn bounce(io: &Io<'_>, h: &Handles, need: u64) -> Result<Bounce, Fail> {
-    if let Some(b) = BOOK.lock().bounce {
+    let cur = book().ok_or(REENTRY)?.bounce;
+    if let Some(b) = cur {
         if b.len >= need {
             return Ok(b);
         }
     }
-    if let Some(mut old) = BOOK.lock().bounce.take() {
+    let old = book().ok_or(REENTRY)?.bounce.take();
+    if let Some(mut old) = old {
         free_bounce(io, h, &mut old);
     }
     let len = need;
@@ -780,8 +852,8 @@ fn bounce(io: &Io<'_>, h: &Handles, need: u64) -> Result<Bounce, Fail> {
         }
     };
     let b = Bounce { cpu, gpu, len };
-    let mut book = BOOK.lock();
-    book.bounce = Some(b);
+    let mut g = book().ok_or(REENTRY)?;
+    g.bounce = Some(b);
     ANY.store(1, Ordering::Release);
     Ok(b)
 }
@@ -808,12 +880,14 @@ pub(super) fn release_all(io: &Io<'_>, h: &Handles) {
         return;
     }
     loop {
-        let Some(m) = BOOK.lock().maps.take_any() else {
+        let taken = book().and_then(|mut b| b.maps.take_any());
+        let Some(m) = taken else {
             break;
         };
         give_back(io, h, &m);
     }
-    if let Some(mut b) = BOOK.lock().bounce.take() {
+    let bounce = book().and_then(|mut b| b.bounce.take());
+    if let Some(mut b) = bounce {
         free_bounce(io, h, &mut b);
     }
     ANY.store(0, Ordering::Release);
@@ -823,14 +897,17 @@ pub(super) fn release_all(io: &Io<'_>, h: &Handles) {
 /// The transport is about to be retired (`ce_channel::drop_views`): the bounce's kernel view is
 /// unmapped, nothing sent.
 pub(super) fn drop_views() {
-    if let Some(b) = BOOK.lock().bounce.take() {
+    let bounce = book().and_then(|mut b| b.bounce.take());
+    if let Some(b) = bounce {
         ce::kernel_unmap(b.cpu.va, b.cpu.len);
     }
 }
 
 /// The transport is gone (`ce_channel::forget`): the sweep closed the client and everything in it.
 pub(super) fn forget() {
-    let mut b = BOOK.lock();
+    let Some(mut b) = book() else {
+        return;
+    };
     b.maps.clear();
     if b.bounce.take().is_some() {
         ce::note_soft();
@@ -842,7 +919,8 @@ pub(super) fn forget() {
 /// Mirror the counters (PASSIVE); with the service's block.
 pub(crate) fn publish_counters() {
     use crate::diag::record_named_bytes as rec;
-    let live = BOOK.lock().maps.live();
+    let live = book().map_or(0, |b| b.maps.live());
+    rec(b"RvBookReent", BOOK_REENT.load(Ordering::Relaxed));
     rec(b"RvMapOk", MAP_OK.load(Ordering::Relaxed));
     rec(b"RvMapFail", MAP_FAIL.load(Ordering::Relaxed));
     rec(b"RvMapStat", MAP_STAT.load(Ordering::Relaxed));
