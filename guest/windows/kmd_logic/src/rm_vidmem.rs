@@ -883,7 +883,7 @@ pub fn foreign_bounce_copy(
 /// driver checks the list).
 pub const COUNTERS: &[&str] = &[
     // the service (`vidmem.rs`)
-    "RvKnob", "RvOffEff", "RvWaitTmo", "RvCleared", "RvClrFail", "RvClrSkip", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
+    "RvKnob", "RvOffEff", "RvWaitTmo", "RvCleared", "RvClrFail", "RvClrSkip", "RvClrLate", "RvTry", "RvOk", "RvVenus", "RvWhy", "RvStage", "RvFail", "RvState", "RvLive",
     "RvBytes", "RvFreed", "RvBring", "RvMs", "RvMsMax", "RvSoft", "RvLeak", "RvOpen", "RvOpenFg",
     "RvOpenLay", "RvOpenPid", "RvOpenNoRm", "RvOpenNoRmPid",
     // the channel side (`ce_vram.rs`)
