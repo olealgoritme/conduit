@@ -44,6 +44,188 @@ Mesa `main` at **`70c4c018cbe5b78a1db7e9413bc7e511b366fd95`**
 
 Each patch builds on its own.
 
+### Common patches (`patches-common/`): per-draw cost
+
+Generic NVK patches (one also touches the RM backend) that apply on top of
+**both** lineages, unchanged:
+
+- Linux: base + `patches/0001-0017` + `patches-common/*` (`build.sh` does
+  this).
+- Windows: base + `patches/0001-0013` + `patches-windows/*` +
+  `patches-windows-dxvk/*` + `patches-common/*` (`build-windows.sh` does
+  this). Verified with `git am` (no 3-way needed) and by building that
+  stack for Linux and running the tests below natively.
+
+| # | patch | what |
+|---|---|---|
+| 1 | `nvk: direct draws without an MME macro on Turing+` | `vkCmdDraw*`/`DrawIndexed*`/`DrawMulti*` set first vertex, base instance, draw index and view index from the CPU (shadow scratch, `SET_GLOBAL_BASE_*`, root table), only what changed since the last direct draw, then draw with `SET_DRAW_CONTROL_A/B` + `DRAW_*_BEGIN_END_A/B`; indirect, mesh, XFB, multiview draws, meta and generated commands drop the tracking |
+| 2 | `nvk: don't reselect cb0 after binding constant buffers on Turing+` | no `NVK_MME_SELECT_CB0` call after cbuf binds: with the hardware root table nothing loads cb0 through the selector |
+| 3 | `nvk: skip root table loads of dwords the GPU already has` | CPU shadow of the root table (valid bit per dword, per command buffer); a descriptor bind loads only the dwords that changed |
+| 4 | `nvk: skip binding a constant buffer range that is already bound` | per group/slot memory of the bound range; rebinding the same set/offset emits nothing |
+| 5 | `nvk, nvk/rm: let the GPU cache descriptor pools and tables on RM` | new `NVKMD_MEM_GPU_READ_ONLY`, set on descriptor pools and the image/sampler tables; the RM backend maps it GPU-cacheable (it was uncached system memory, so every descriptor set bound was a cbuf fetched across PCIe). RM-specific in effect, generic in form; nouveau ignores the flag |
+| 6 | `nvk: bind vertex and index buffers with plain methods on Turing+` | no `NVK_MME_BIND_VB/IB` for CPU-recorded binds, and the range already bound is skipped |
+| 7 | `nvk: keep what changes per draw in one hardware root table bank` | changing a second 256-byte root table bank between draws costs ~5 ns; the dynamic-offset dword of the dynamic buffer descriptors moves into bank 0 with the draw parameters and `sets[0..3]`. **API-visible**: `NVK_MAX_DYNAMIC_BUFFERS` 64 -> 32, i.e. 16 dynamic UBOs + 16 dynamic SSBOs per layout (NVIDIA: 15 + 16) |
+| 8 | `nvk: ZCULL for DXVK depth buffers and reverse Z` | ZCULL storage also for depth images with `TRANSFER_DST` (DXVK sets it on every D3D11 depth texture; `EXCLUSIVE` sharing only), reset to a conservative state by an empty render pass after a copy, blit or resolve writes them or another queue hands them over; `SET_ZCULL_DIR_FORMAT` per image (GREATER when the first application render pass clears below 0.5, LESS otherwise, never changed afterwards) instead of always LESS. See "GPU time against NVIDIA in D3D11-through-DXVK shapes" |
+| 11 | `nvk, nvk/rm: compression for images outside dedicated allocations on GB20x` | `NVK_RM_COMPRESS_ALL=1` (default off while it is measured): device-local memory that is neither host-visible nor shared nor imported is allocated COMPR_ANY (`NVKMD_MEM_COMPRESSIBLE`, `nvkmd_info::has_compressible_mem`), and a compressible image bound anywhere in it gets its own VA with the compressible GMK kind and `is_compressed`; every other mapping of such memory uses a compressible kind too. Applies after 9-10 of the build branches and without them. See "Compression outside dedicated allocations" |
+
+Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
+
+| test | before | after |
+|---|---|---|
+| plain draws | 1 MME call (`DRAW`, 5 dwords) | 4 methods, 6 dwords, no MME |
+| new dynamic UBO offset | 27 methods, 36 dwords: 5 root loads (12 dwords), cbuf bind, 2 MME calls (`SELECT_CB0`, `DRAW`) | 10 methods, 15 dwords: 1 root dword, cbuf bind, draw |
+| descriptor set switch | 36 methods, 48 dwords: 6 root loads, 2 cbuf binds, 2 MME calls | 16 methods, 24 dwords: 2 root dwords (same bank), 2 cbuf binds, draw |
+| VB + IB bound per draw | 3 MME calls (`BIND_VB`, `BIND_IB`, `DRAW_INDEXED`) | plain methods only when the range changes, 5-dword draw |
+
+GPU ms for 20000 draws (`vk_perf_bench -r 21 -t alu,ubo,desc,rebind,vbib`,
+2560x1440, RTX 5090, median of 3 runs per build, every commit built and
+measured in one session; ratio to NVIDIA 610.57.04 in parentheses):
+
+| after patch | plain draws | dyn. UBO offset | set switch | same set rebound, 2 pipelines | VB+IB per draw |
+|---|---|---|---|---|---|
+| `patches/0017` (before) | 0.509 (2.21x) | 0.667 (5.51x) | 0.712 (4.98x) | 2.258 (0.83x) | 0.808 (4.96x) |
+| 1 direct draws | 0.226 (0.98x) | 0.224 (1.85x) | 0.317 (2.22x) | 1.079 (0.39x) | 0.318 (1.95x) |
+| 2 no cb0 reselect | 0.226 | 0.189 (1.56x) | 0.322 | 1.070 | 0.318 |
+| 3 root shadow | 0.226 | 0.109 (0.90x) | 0.299 (2.09x) | 0.926 | 0.318 |
+| 4 cbuf dedupe | 0.226 | 0.110 | 0.285 (1.99x) | 0.914 (0.33x) | 0.318 |
+| 5 cached descriptors | 0.225 | 0.107 | 0.218 (1.52x) | 0.914 | 0.318 |
+| 6 plain VB/IB binds | 0.226 | 0.107 | 0.219 | 0.913 | 0.156 (0.96x) |
+| 7 root bank layout | 0.226 (0.98x) | 0.108 (0.89x) | 0.178 (1.24x) | 0.915 (0.33x) | 0.156 (0.96x) |
+| NVIDIA | 0.230 | 0.121 | 0.143 | 2.735 | 0.163 |
+
+The GPU is shared with the desktop and VMs, and its clocks follow the
+load: absolute numbers move by up to ~15% between sessions (NVIDIA's set
+switch measured 0.123-0.143 ms), so compare within a table. The other
+categories (ALU, texturing, fill, blend, ZCULL, clears, meshes, dynamic
+UBO meshes, tessellation, terrain, copies) are unchanged, within 1-2%.
+
+Correctness: `BENCH_HASH=1 vk_perf_bench -t ubo,desc,rebind,vbib,dynidx,descupd,params,verify`
+prints image hashes; all are identical before and after the series, and
+every per-draw test (`ubo`, `desc`, `rebind`, `vbib`, `dynidx`, `params`,
+`descupd`) also hashes the same as on NVIDIA's driver. `params` mixes direct, indexed,
+multi-draw and indirect draws with varying first vertex, vertex offset,
+first instance and draw index, 32- and 16-bit index buffers and a clear,
+and repeats a direct draw right after each indirect one (dropping one
+invalidation in the driver changes its hash); `dynidx` indexes dynamic UBO
+arrays in two sets at run time; `descupd` rewrites a descriptor set between
+submits. dEQP-VK is not installed on the host and was not run.
+
+### Compression outside dedicated allocations (patch 11)
+
+NVK compresses an image only in a dedicated allocation. vkd3d-proton
+places every D3D12 resource in a heap and native engines sub-allocate, so
+in the VM every Basemark render target (Vulkan and D3D12) was mapped with
+kind 0x6 (GMK), never 0x8 (GMK compressible).
+
+What GB20x and RM need (open-gpu-kernel-modules 615.78.08):
+
+- GB20x has only GMK (0x6), GMK compressible (0x8) and GMK compressible
+  without PLC (0x9) for block-linear memory, depth included
+  (`mem_mgr_gb202.c`, `mem_mgr_gb202_base.c`).
+- Compression state is per physical page: GB20x uses GMMU format v3,
+  whose PTEs have no comptag line (`virt_mem_allocator_gm107.c` writes
+  comptag lines only for format <= 2; `memmgrGetKindComprForGpu_KERNEL`
+  marks such memory `bPhysBasedComptags`). There is no comptag pool to
+  run out of, and COMPR_ANY costs no extra VRAM.
+- The kind still has to be compressible at allocation time: a mapping
+  whose kind override is compressible over memory whose own kind is not
+  is quietly downgraded to the uncompressed kind (`virtual_mem.c`,
+  "downgrading pteKind ... over uncompressed physical backing"). That is
+  why sub-allocated images stayed 0x6 even with a 0x8 kind.
+- PLC: RM picks 0x8 or 0x9 for the allocation and applies its per-page
+  PLC workaround itself when it writes PTEs; NVK maps images with 0x8 as
+  the dedicated path does.
+
+The patch: NVK asks for `NVKMD_MEM_COMPRESSIBLE` on plain device-local
+allocations (not host-visible, not exported or imported). The RM backend
+allocates those like dedicated image memory (block linear, 32 bpp,
+COMPR_ANY) and keeps the flag only if RM granted compression. At bind
+time a `can_compress` image in such memory gets its own VA with
+`compressed_pte_kind` and `is_compressed` (the draw path already turns
+on color/Z compression from it). Accessing compressible pages through an
+uncompressed kind would read raw compressed data, so every GPU mapping of
+such memory is compressible: the memory's own VA is mapped 0x8 (buffers,
+linear images, ZCULL), and an image VA with kind 0x6
+(sampled-only textures, sparse images, other images NVK does not
+compress) is mapped 0x8 with its 3D compression state left off.
+
+Risks:
+
+- Clients other than the 3D and copy engines reading compressible GMK
+  through the memory's own VA: indirect draw/dispatch arguments and
+  generated command streams read by the front end and PBDMA from
+  buffers in a compressed heap. NVKMS allocates scanout surfaces
+  COMPR_ANY, so hub clients reading compressible GMK is the hardware's
+  normal case, but this is the first thing to check if
+  `NVK_RM_COMPRESS_ALL=1` misrenders or faults.
+- Image/buffer aliasing in one heap: both go through compressible kinds,
+  so reinterpreting the bytes is as undefined as the Vulkan spec says and
+  no more.
+- No CPU access: host-visible types (the BAR heap, system memory) are
+  never made compressible, and host image copies are already excluded by
+  `can_compress`.
+- RM refusing COMPR_ANY: the memory falls back to uncompressed (logged,
+  counted) and images in it stay 0x6.
+
+Logs (`mesa_logi`): the number of compressible memories and MiB as it
+reaches each power of two, image binds that got the compressible kind,
+and a summary at device destruction (memories, MiB, refusals, compressed
+image binds, 0x6 binds made 0x8).
+
+### GPU time against NVIDIA in D3D11-through-DXVK shapes (patch 8)
+
+Measured on the host (RTX 5090, no VM): NVK built from the Windows stack
+(`patches/0001-0013` + `patches-windows/*` + `patches-common/*`) for Linux
+and run with `NVK_RM=1 NVK_UBO_DESC_CBUF=0` (what Windows runs) against
+NVIDIA 610.57.04 on the same GPU, `vk_perf_bench`, GPU timestamps, median
+of 11, 2560x1440.
+
+Every older `vk_perf_bench` category is within ±10% of NVIDIA. The
+gaps appear only in the shapes D3D11 takes through DXVK, which the new
+tests cover:
+
+| test | NVK before | NVK with patch 8 | NVIDIA |
+|---|---|---|---|
+| `zpass`, DXVK depth usage: 32 front-to-back layers over 8 render passes that load depth | 0.162 ms | 0.109 ms | 0.102 ms |
+| same over 2 passes | 0.111 ms | 0.078 ms | 0.079 ms |
+| `zrev`: the 32 layers in one pass with reverse Z (clear 0, GEQUAL) | 0.141 ms | 0.070 ms | 0.071 ms |
+| `cb`: 20000 draws, each a new descriptor-buffer offset, 3 VS + 1 PS cbuffer | 0.144 ms | unchanged | 0.088 ms |
+| `cb`: pixel shader with 256 cbuffer reads, 4 fullscreen passes | 0.991 ms | unchanged | 1.565 ms |
+
+1. **ZCULL storage.** DXVK gives every D3D11 depth texture
+   `TRANSFER_DST`, and NVK allocated ZCULL storage only for images written
+   by nothing but depth attachments. ZCULL then worked only in render
+   passes that clear depth. DXVK ends a render pass at every barrier,
+   resolve or render target change, so most passes load depth.
+2. **ZCULL direction.** `SET_ZCULL_DIR_FORMAT` was always LESS, so ZCULL
+   never culled with reverse Z. Stored ZCULL has to be loaded with the
+   direction it was stored with, so patch 8 fixes the direction per image
+   at its first application render pass. `vkCmdClearDepthStencilImage`
+   does not count, because DXVK clears every new depth image to 0.0 that
+   way.
+3. **Per-draw cbuffer switch** (not fixed, about 10 µs per frame at
+   Heaven's draw counts). The push stream per draw is already minimal
+   (one root table dword and the draw), so the remaining cost is the
+   shader's bindless cbuf loads. Bound cbufs (`NVK_UBO_DESC_CBUF=1`) cost
+   10 ms here, because the MME reads each descriptor from memory. That is
+   why patch 0051 turned them off on Windows.
+
+Correctness: `vk_perf_bench -t zcoh` writes a depth image outside a render
+pass and then checks that a later pass is not culled by stale ZCULL. It
+covers a copy from a buffer, a copy from an image, a blit and
+`vkCmdClearDepthStencilImage`, in both directions, plus three
+direction-choice cases. With patch 8 all 11 cases pass. With the reset after
+transfers left out, the copy cases draw nothing, which shows the test
+catches stale ZCULL. The image hashes of `ubo,desc,rebind,vbib,dynidx,descupd,params,verify,cb`
+are identical before and after. `vk_summary`, `vk_offscreen_test`,
+`vk_compute_test`, `vk_bl_readback`, `vk_bar_test` and `vk_coherence_test`
+pass. No Xid was logged.
+
+Known bad on RM: upstream Mesa MR !44088 (ZCULL save and restore through
+MME DMEM, which includes !44203 and !44414), cherry-picked onto this stack,
+raises Xid 13 `DATA_RAM_ACCESS_OUT_OF_BOUNDS` (ESR 0x404490) in the first
+render pass with ZCULL. Patch 8 uses no MME and no DMEM.
+
 ## Build
 
 ```sh
