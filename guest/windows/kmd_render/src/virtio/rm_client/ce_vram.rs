@@ -668,13 +668,16 @@ fn map_object(
         return Err(f);
     }
     let va = rv::map_va(slot);
+    // System memory: snooped (`MAP_FLAGS_SYSMEM`: CACHE_SNOOP_ENABLE, 4 KiB pages) and NO fallback:
+    // a GDI staging buffer is written by the CPU through a cached view, and an unsnooped copy-engine
+    // read would see stale DRAM under the CPU's dirty lines. VRAM: big pages, then the system flags.
     let (first, second) = if sysmem {
-        (rv::map_flags_second(), rv::map_flags_first())
+        (rv::map_flags_second(), None)
     } else {
-        (rv::map_flags_first(), rv::map_flags_second())
+        (rv::map_flags_first(), Some(rv::map_flags_second()))
     };
     let mut mapped = ce::gpu_map_with(io, h, h_virt, h_dup, va, len, first, None);
-    if let Err(f) = mapped {
+    if let (Err(f), Some(second)) = (mapped, second) {
         if f.kind == FailKind::Rm {
             mapped = ce::gpu_map_with(io, h, h_virt, h_dup, va, len, second, None);
         }

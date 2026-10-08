@@ -103,6 +103,9 @@ static CHK_BAD: AtomicU32 = AtomicU32::new(0);
 static CHK_K: AtomicU32 = AtomicU32::new(0);
 static CHK_GOT: AtomicU32 = AtomicU32::new(0);
 static CHK_WANT: AtomicU32 = AtomicU32::new(0);
+static PITCH_MIS: AtomicU32 = AtomicU32::new(0);
+static PITCH_CMD: AtomicU32 = AtomicU32::new(0);
+static PITCH_AL: AtomicU32 = AtomicU32::new(0);
 static OVL_N: AtomicU32 = AtomicU32::new(0);
 static OVL_CE: AtomicU32 = AtomicU32::new(0);
 static OVL_WHY: AtomicU32 = AtomicU32::new(0);
@@ -192,7 +195,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &CH_UP_US, &SLOW_US, &SLOW_OP, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -249,6 +252,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiChkK", CHK_K.load(Ordering::Relaxed));
     w(b"GdiChkGot", CHK_GOT.load(Ordering::Relaxed));
     w(b"GdiChkWant", CHK_WANT.load(Ordering::Relaxed));
+    w(b"GdiPitchMis", PITCH_MIS.load(Ordering::Relaxed));
+    w(b"GdiPitchCmd", PITCH_CMD.load(Ordering::Relaxed));
+    w(b"GdiPitchAl", PITCH_AL.load(Ordering::Relaxed));
     w(b"GdiJobT1", JOB_T[0].load(Ordering::Relaxed));
     w(b"GdiJobT1Us", JOB_T[1].load(Ordering::Relaxed));
     w(b"GdiJobT2", JOB_T[2].load(Ordering::Relaxed));
@@ -930,6 +936,24 @@ fn wait_last(passive: PassiveLevel, last: Option<u64>) -> bool {
     }
 }
 
+/// The view a staging command addresses its rectangles with: the mapping (made with the authored
+/// pitch, one cache key per buffer) with the COMMAND's pitch when it has one (Learn
+/// `DXGK_GDIARG_BITBLT`: the pitch of a `STAGING_CPUVISIBLE` surface is the command's), provided the
+/// rows still fit the mapping. Counts a disagreement (`GdiPitchMis`, the last pair in
+/// `GdiPitchCmd`/`GdiPitchAl`).
+fn addr_view(v: &CeView, s: &Surface, cmd_pitch: u32) -> CeView {
+    let mut out = *v;
+    if cmd_pitch != 0 && cmd_pitch != v.pitch {
+        PITCH_MIS.fetch_add(1, Ordering::Relaxed);
+        PITCH_CMD.store(cmd_pitch, Ordering::Relaxed);
+        PITCH_AL.store(v.pitch, Ordering::Relaxed);
+        if cmd_pitch >= s.width.saturating_mul(4) && cmd_pitch <= v.pitch {
+            out.pitch = cmd_pitch;
+        }
+    }
+    out
+}
+
 /// The pitch a staging buffer's copy-engine view is made with: the allocation's authored pitch
 /// whenever it has one, so every call names the same descriptor (`ce_sysmem` caches per resource,
 /// pitch and extent); the command's pitch only for a buffer without one.
@@ -1070,7 +1094,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
         Cmd::ColorFill { rop, .. } if rop == ga::cfrop::PATCOPY && dst.class == SurfaceClass::System => {
             let dp = map_pitch(&dst, dpc);
             glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
-                submit_and_wait(passive, op, dv, None)
+                submit_and_wait(passive, op, &addr_view(dv, &dst, dpc), None)
             })
         }
         Cmd::BitBlt { rop, .. } if rop == ga::rop::SRCCOPY => {
@@ -1087,7 +1111,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                     };
                     let dp = map_pitch(&dst, dpc);
                     glue::with_standard(passive, adapter, dst.resource_id, dp, dst.width, dst.height, |dv| {
-                        submit_and_wait(passive, op, dv, Some(&sv))
+                        submit_and_wait(passive, op, &addr_view(dv, &dst, dpc), Some(&sv))
                     })
                 }
                 (SurfaceClass::System, SurfaceClass::Vram) => {
@@ -1098,7 +1122,7 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                     };
                     let sp = map_pitch(&src, spc);
                     glue::with_standard(passive, adapter, src.resource_id, sp, src.width, src.height, |sv| {
-                        submit_and_wait(passive, op, &dv, Some(sv))
+                        submit_and_wait(passive, op, &dv, Some(&addr_view(sv, &src, spc)))
                     })
                 }
                 (SurfaceClass::System, SurfaceClass::System) if src.resource_id == dst.resource_id => {
@@ -1106,14 +1130,16 @@ fn run_ce_sys(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool 
                     // and never comes here): one view serves both sides.
                     let p = map_pitch(&dst, dpc);
                     glue::with_standard(passive, adapter, dst.resource_id, p, dst.width, dst.height, |v| {
-                        submit_and_wait(passive, op, v, Some(v))
+                        submit_and_wait(passive, op, &addr_view(v, &dst, dpc), Some(&addr_view(v, &src, spc)))
                     })
                 }
                 (SurfaceClass::System, SurfaceClass::System) if path(PATH_PAIR) => {
                     // Staging to another staging buffer: both views in one content transaction.
                     let a = (src.resource_id, map_pitch(&src, spc), src.width, src.height);
                     let b = (dst.resource_id, map_pitch(&dst, dpc), dst.width, dst.height);
-                    glue::with_standard_pair(passive, adapter, a, b, |sv, dv| submit_and_wait(passive, op, dv, Some(sv)))
+                    glue::with_standard_pair(passive, adapter, a, b, |sv, dv| {
+                        submit_and_wait(passive, op, &addr_view(dv, &dst, dpc), Some(&addr_view(sv, &src, spc)))
+                    })
                 }
                 _ => {
                     sys_refused(1, 1);
