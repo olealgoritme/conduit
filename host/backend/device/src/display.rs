@@ -47,10 +47,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use protocol::messages::{
-    CursorUpdate, DisplayModeEvent, INPUT_ABS_MAX, InputEventEntry, ScanoutFlip, ScanoutReleased,
-    input,
+    CursorUpdate, DisplayModeEvent, INPUT_ABS_MAX, InputEventEntry, ScanoutFlip, ScanoutPresented,
+    ScanoutReleased, input,
 };
 
+use crate::scanout_presented::PresentedTracker;
 pub use crate::scanout_release::BufKey;
 use crate::scanout_release::ReleaseTracker;
 
@@ -293,6 +294,11 @@ pub mod wire {
     /// import it -- and on an idle guest no new flip comes to replace them.
     /// A backend that does not know it ignores it.
     pub const EV_REFRESH: u16 = 20;
+    /// Conduit: the frame of the ATTACH stamped x reached the screen. y =
+    /// the `wp_presentation_feedback` kind bits, w0/w1 = low/high 32 bits of
+    /// the presentation time in `CLOCK_MONOTONIC` nanoseconds (0 unknown).
+    /// Only from a client with [`CAP_PRESENTED`].
+    pub const EV_PRESENTED: u16 = 21;
 
     pub const F_FULLSCREEN: u16 = 1 << 2;
     /// ATTACH flags: the fd is a sealed memfd to present from shared memory
@@ -316,6 +322,9 @@ pub mod wire {
     /// eventually (one the display refused or dropped at once). Without it a
     /// buffer counts as done for that broker once it was sent another one.
     pub const CAP_RELEASE_SEQ: u32 = 1 << 15;
+    /// Conduit: the broker answers each commit it shows with
+    /// [`EV_PRESENTED`] (docs/SCANOUT.md "Presentation feedback").
+    pub const CAP_PRESENTED: u32 = 1 << 16;
     /// CMD_CAPS bit: a clipboard agent is behind this client.
     pub const CLIENT_CLIPBOARD: u32 = 1 << 0;
     /// CMD_CAPS bit: ATTACH/COMMIT `seq` is our CLOCK_MONOTONIC microseconds.
@@ -1034,6 +1043,15 @@ pub trait ReleaseSink: Send + Sync {
     fn released(&self, r: &[ScanoutReleased]) -> usize;
 }
 
+/// Where `ScanoutPresented` events go: the event queue, in the vhost-user
+/// binary. Called from the link thread; must not block and must not call
+/// back into the link. A presentation report is stale within a frame, so
+/// one that finds no event buffer posted is dropped, never retried.
+pub trait PresentedSink: Send + Sync {
+    /// Deliver `p`. `false`: no buffer was posted, dropped.
+    fn presented(&self, p: &ScanoutPresented) -> bool;
+}
+
 /// What the guest's driver has said about taking Conduit input since the
 /// device last started, shared between the request path (which learns it)
 /// and the input sink (which asks, [`InputSink::takes_input`]). Cleared on
@@ -1269,6 +1287,9 @@ struct LinkState {
     frame_key: Option<BufKey>,
     /// Which buffers clients still read (docs/SCANOUT.md "Buffer release").
     release: ReleaseTracker,
+    /// Which guest flip a client's presentation report names
+    /// (docs/SCANOUT.md "Presentation feedback").
+    presented: PresentedTracker,
     /// The last frame / cursor while nobody wanted them (see [`Parked`]).
     parked_frame: Option<Parked<ScanoutFlip>>,
     parked_cursor: Option<Parked<CursorUpdate>>,
@@ -1303,6 +1324,10 @@ pub struct LinkStats {
     pub resent: AtomicU64,
     /// `ScanoutReleased` events delivered to the guest.
     pub released: AtomicU64,
+    /// `ScanoutPresented` events delivered to the guest.
+    pub presented: AtomicU64,
+    /// `ScanoutPresented` events dropped: no guest event buffer was posted.
+    pub presented_dropped: AtomicU64,
 }
 
 /// The backend's connections to its display clients (brokers): the local
@@ -1334,9 +1359,17 @@ pub struct DisplayLink {
     /// The guest wants `ScanoutReleased` (lock-free check on every flip).
     release_on: AtomicBool,
     release_sink: Mutex<Option<Arc<dyn ReleaseSink>>>,
+    /// The guest wants `ScanoutPresented` (lock-free check per report).
+    presented_on: AtomicBool,
+    presented_sink: Mutex<Option<Arc<dyn PresentedSink>>>,
     /// Guest generations ended so far ([`DisplayLink::guest_gone`]).
     generation: AtomicU64,
     pub stats: LinkStats,
+}
+
+/// Client `c` reports what it shows (`CAP_PRESENTED`).
+fn c_presents(c: &Client) -> bool {
+    c.broker_caps & wire::CAP_PRESENTED != 0
 }
 
 /// The guest's name for a `ScanoutFlip` buffer.
@@ -1409,6 +1442,8 @@ impl DisplayLink {
             console_attached: AtomicBool::new(false),
             release_on: AtomicBool::new(false),
             release_sink: Mutex::new(None),
+            presented_on: AtomicBool::new(false),
+            presented_sink: Mutex::new(None),
             generation: AtomicU64::new(0),
             stats: LinkStats::default(),
         })
@@ -1439,9 +1474,60 @@ impl DisplayLink {
         self.release_on.load(Ordering::Acquire)
     }
 
+    /// Where `ScanoutPresented` events go.
+    pub fn set_presented_sink(&self, sink: Arc<dyn PresentedSink>) {
+        *self.presented_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// The guest acked `NVGPU_F_SCANOUT_PRESENTED` at device start (`true`),
+    /// or the device started or reset without it (`false`).
+    pub fn set_presented_enabled(&self, on: bool) {
+        let mut st = self.state.lock().unwrap();
+        st.presented.set_enabled(on);
+        self.presented_on.store(on, Ordering::Release);
+    }
+
+    /// The guest wants `ScanoutPresented` events.
+    #[inline]
+    pub fn presented_enabled(&self) -> bool {
+        self.presented_on.load(Ordering::Acquire)
+    }
+
+    /// Client `i` reports the frame stamped `stamp` on screen
+    /// (`EV_PRESENTED` from a `CAP_PRESENTED` client): tell the guest which
+    /// flip that was, once per flip.
+    fn client_presented(&self, i: usize, stamp: u32, kind: u32, present_ns: u64) {
+        if !self.presented_enabled() {
+            return;
+        }
+        let ev = {
+            let mut st = self.state.lock().unwrap();
+            if st
+                .clients
+                .get(i)
+                .is_none_or(|c| c.broker_caps & wire::CAP_PRESENTED == 0)
+            {
+                return;
+            }
+            st.presented
+                .presented(i, stamp, kind, present_ns, mono_us() * 1000)
+        };
+        let Some(ev) = ev else { return };
+        let sink = self.presented_sink.lock().unwrap().clone();
+        let took = sink.is_some_and(|s| s.presented(&ev));
+        if took {
+            self.stats.presented.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.presented_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// The guest flipped `key` (`None`: the console): note it, and queue
     /// whatever that frees.
     fn flipped_locked(&self, st: &mut LinkState, key: Option<BufKey>, seq: u64) {
+        if self.presented_enabled() {
+            st.presented.flipped(key, seq);
+        }
         if !self.release_enabled() {
             return;
         }
@@ -1522,6 +1608,7 @@ impl DisplayLink {
 
     /// Client `i` reads nothing any more (gone, or idle).
     fn client_gone_locked(&self, st: &mut LinkState, i: usize) {
+        st.presented.client_gone(i);
         if st.release.enabled() {
             st.release.client_gone(i);
             st.release.collect(Instant::now());
@@ -2004,6 +2091,9 @@ impl DisplayLink {
                 if st.release.enabled() {
                     let key = st.frame_key;
                     st.release.sent(i, key, fd_inode(dmabuf), stamp, reports);
+                }
+                if st.presented.enabled() && c_presents(&st.clients[i]) {
+                    st.presented.sent(i, stamp);
                 }
                 self.stats.sent.fetch_add(1, Ordering::Relaxed);
                 FlipOutcome::Sent
@@ -3130,6 +3220,12 @@ impl DisplayLink {
             EV_RELEASE => {
                 self.client_released(i, (p.w0 as u64) | ((p.w1 as u64) << 32), p.x as u32)
             }
+            EV_PRESENTED => self.client_presented(
+                i,
+                p.x as u32,
+                p.y as u32,
+                (p.w0 as u64) | ((p.w1 as u64) << 32),
+            ),
             EV_FORMAT => {
                 let m = (p.w0 as u64) | ((p.w1 as u64) << 32);
                 if p.x == 1 {
@@ -4924,6 +5020,118 @@ mod tests {
         assert_eq!(link.tick_releases(), None);
         assert_eq!(released(&sink), vec![(10, 1, NOT_SHOWN)]);
         assert_eq!(link.stats.released.load(Ordering::Relaxed), 1);
+    }
+
+    // -- Presentation feedback (docs/SCANOUT.md "Presentation feedback") ----
+
+    struct Presented {
+        got: Mutex<Vec<ScanoutPresented>>,
+        room: Mutex<usize>,
+    }
+
+    impl PresentedSink for Presented {
+        fn presented(&self, p: &ScanoutPresented) -> bool {
+            let mut room = self.room.lock().unwrap();
+            if *room == 0 {
+                return false;
+            }
+            *room -= 1;
+            self.got.lock().unwrap().push(*p);
+            true
+        }
+    }
+
+    fn presenting(link: &DisplayLink) -> Arc<Presented> {
+        let sink = Arc::new(Presented {
+            got: Mutex::new(Vec::new()),
+            room: Mutex::new(usize::MAX),
+        });
+        link.set_presented_sink(sink.clone());
+        link.set_presented_enabled(true);
+        sink
+    }
+
+    fn presented(sink: &Presented) -> Vec<(u32, u64, u32)> {
+        std::mem::take(&mut *sink.got.lock().unwrap())
+            .iter()
+            .map(|p| (p.host_handle, p.seq, p.flags))
+            .collect()
+    }
+
+    fn ev_presented(stamp: u32, kind: u32, t: u64) -> wire::Pkt {
+        pkt(
+            wire::EV_PRESENTED,
+            0,
+            stamp as i32,
+            kind as i32,
+            t as u32,
+            (t >> 32) as u32,
+        )
+    }
+
+    #[test]
+    fn a_presenting_client_completes_each_flip_once() {
+        use protocol::messages::{SCANOUT_PRESENTED_TIMED, SCANOUT_PRESENTED_VSYNC};
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        let sink = presenting(&link);
+        link.adopt(ours);
+        link.hello_for_test(wire::CAP_PRESENTED);
+        let (a, b) = (memfd(), memfd());
+        assert_eq!(link.flip(a.as_raw_fd(), &gflip(1, 10)), FlipOutcome::Sent);
+        let (ca, _) = next_frame(broker.as_raw_fd());
+        assert_eq!(link.flip(b.as_raw_fd(), &gflip(2, 11)), FlipOutcome::Sent);
+        let (cb, _) = next_frame(broker.as_raw_fd());
+        link.note_packet(0, &ev_presented(ca.seq, 1, 5_000_000));
+        assert_eq!(
+            presented(&sink),
+            vec![(10, 1, SCANOUT_PRESENTED_VSYNC | SCANOUT_PRESENTED_TIMED)]
+        );
+        // Again for the same flip, or a stamp nobody sent: nothing.
+        link.note_packet(0, &ev_presented(ca.seq, 1, 5_000_000));
+        link.note_packet(0, &ev_presented(cb.seq.wrapping_add(7), 1, 0));
+        assert!(presented(&sink).is_empty());
+        link.note_packet(0, &ev_presented(cb.seq, 0, 0));
+        assert_eq!(presented(&sink), vec![(11, 2, 0)]);
+        assert_eq!(link.stats.presented.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn presentation_needs_the_guest_ack_and_the_client_cap() {
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        let sink = presenting(&link);
+        link.adopt(ours);
+        // A client that never declared CAP_PRESENTED.
+        link.hello_for_test(0);
+        let a = memfd();
+        link.flip(a.as_raw_fd(), &gflip(1, 10));
+        let (ca, _) = next_frame(broker.as_raw_fd());
+        link.note_packet(0, &ev_presented(ca.seq, 1, 0));
+        assert!(presented(&sink).is_empty());
+        // A guest that did not ack the feature.
+        link.hello_for_test(wire::CAP_PRESENTED);
+        link.set_presented_enabled(false);
+        link.flip(a.as_raw_fd(), &gflip(2, 10));
+        let (ca, _) = next_frame(broker.as_raw_fd());
+        link.note_packet(0, &ev_presented(ca.seq, 1, 0));
+        assert!(presented(&sink).is_empty());
+    }
+
+    #[test]
+    fn a_report_with_no_event_buffer_is_dropped() {
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        let sink = presenting(&link);
+        *sink.room.lock().unwrap() = 0;
+        link.adopt(ours);
+        link.hello_for_test(wire::CAP_PRESENTED);
+        let a = memfd();
+        link.flip(a.as_raw_fd(), &gflip(1, 10));
+        let (ca, _) = next_frame(broker.as_raw_fd());
+        link.note_packet(0, &ev_presented(ca.seq, 1, 0));
+        assert!(presented(&sink).is_empty());
+        assert_eq!(link.stats.presented_dropped.load(Ordering::Relaxed), 1);
     }
 
     /// A memfd's size and seals, to tell the black frame from a guest buffer.

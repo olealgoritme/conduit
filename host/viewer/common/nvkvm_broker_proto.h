@@ -161,6 +161,18 @@ enum {
      * it.
      */
     NVKVM_BROKER_EV_REFRESH = 20,
+
+    /*
+     * EV_PRESENTED (Conduit) -- the frame of the ATTACH whose seq is x reached
+     * the screen.  y = the wp_presentation_feedback kind bits (VSYNC 1,
+     * HW_CLOCK 2, HW_COMPLETION 4, ZERO_COPY 8); w0, w1 = low, high 32 bits
+     * of the presentation time in CLOCK_MONOTONIC nanoseconds, 0 when the
+     * display's presentation clock is another one.  One per commit that was
+     * presented; a commit the display replaced before showing it gets none.
+     * Only from a broker advertising NVKVM_BROKER_CAP_PRESENTED.  A client
+     * that does not know it ignores it.
+     */
+    NVKVM_BROKER_EV_PRESENTED = 21,
 };
 
 #define NVKVM_BROKER_HINT_RESTORE    0u  /* windowed, scaled: configured mode */
@@ -322,6 +334,12 @@ enum {
  * advisory and a client must not rely on getting one per buffer.
  */
 #define NVKVM_BROKER_CAP_RELEASE_SEQ  (1u << 15)
+/*
+ * CAP_PRESENTED (Conduit): the broker answers each commit the display showed
+ * with EV_PRESENTED, so a client can tell its guest when a flip really
+ * reached the screen (docs/SCANOUT.md "Presentation feedback").
+ */
+#define NVKVM_BROKER_CAP_PRESENTED    (1u << 16)
 
 /* BYE reason codes. */
 enum {
