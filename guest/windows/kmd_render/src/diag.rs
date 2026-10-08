@@ -1140,6 +1140,9 @@ pub mod knobs {
     /// engine, CPU readers and writers through a bounce buffer (default 0 = off; 1 = on).
     /// `helios_kmd_logic::rm_vidmem`, `docs/vram-redirection.md` 5.3-5.6. Read at StartDevice.
     pub const REDIR_VRAM: KnobName = KnobName::new(b"RedirVram");
+    /// `RedirVram` per-path switches for bisecting (default 0; bits in
+    /// `helios_kmd_logic::rm_vidmem::off`). Read at StartDevice.
+    pub const RV_OFF: KnobName = KnobName::new(b"RvOff");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,

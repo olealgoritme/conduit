@@ -990,6 +990,10 @@ unsafe fn with_blob_bytes_cached(
     resource_id: u32,
     f: impl FnOnce(*mut u8, u64),
 ) -> bool {
+    if !crate::virtio::rm_client::vidmem::off(helios_kmd_logic::rm_vidmem::off::CPU_VIEWS_ON) {
+        // SAFETY: as the caller's.
+        return unsafe { with_blob_bytes(passive, adapter, resource_id, f) };
+    }
     let t0 = now_us();
     let Ok(prep) = crate::virtio::ctrl::map_blob_prepare(
         passive,
@@ -1069,6 +1073,20 @@ unsafe fn with_blob_bytes_cached(
     CPU_MAP_US.store((t1 - t0).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
     CPU_CPY_US.store((now_us() - t1).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
     true
+}
+
+/// Drop the reused view of `resource_id` (a paging change of its leases, its destroy: the content
+/// transaction is held, so no helper is inside it). PASSIVE. One spinlock when there is none.
+pub(crate) fn drop_cpu_view(resource_id: u32) {
+    let taken = {
+        let mut g = CPU_VIEW_CACHE.lock();
+        let i = g.0.iter().position(|e| e.is_some_and(|e| e.resid == resource_id));
+        i.and_then(|i| g.0[i].take())
+    };
+    if let Some(e) = taken {
+        // SAFETY: made by `with_blob_bytes_cached`; no helper uses it (content transaction).
+        unsafe { MmUnmapIoSpace(e.va as *mut c_void, e.size) };
+    }
 }
 
 /// Unmap every reused view (StopDevice, before the window goes; takes the content transaction so

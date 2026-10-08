@@ -132,6 +132,9 @@ pub(crate) fn with_standard<R>(
     height: u32,
     f: impl FnOnce(&CeSurface) -> R,
 ) -> Result<R, Fail> {
+    if crate::virtio::rm_client::vidmem::off(helios_kmd_logic::rm_vidmem::off::SYSMEM) {
+        return Err(refuse(ce_vram::DISABLED));
+    }
     let r = with_standard_inner(passive, adapter, resource_id, pitch, width, height, f);
     // Every call, refusals included (360.1 wrote nothing on a pure-refusal run).
     publish_counters();
@@ -169,6 +172,10 @@ pub(crate) fn with_standard_pair<R>(
     b: StdBuf,
     f: impl FnOnce(&CeSurface, &CeSurface) -> R,
 ) -> Result<R, Fail> {
+    use helios_kmd_logic::rm_vidmem::off;
+    if crate::virtio::rm_client::vidmem::off(off::SYSMEM | off::PAIR) {
+        return Err(refuse(ce_vram::DISABLED));
+    }
     let r = (|| {
         let Some(guard) = adapter.system_backings.serialize(passive) else {
             return Err(refuse(NOT_SYSTEM));

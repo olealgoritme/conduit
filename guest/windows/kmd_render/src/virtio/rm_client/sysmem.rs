@@ -1105,7 +1105,7 @@ pub(crate) fn try_create_standard(
     height: u32,
     dxgi: u32,
 ) -> Option<Created> {
-    if !super::vidmem::knob_on() {
+    if !super::vidmem::knob_on() || super::vidmem::off(helios_kmd_logic::rm_vidmem::off::STAGING_RM) {
         return None;
     }
     SYS_TRY.fetch_add(1, Ordering::Relaxed);

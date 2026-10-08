@@ -497,6 +497,32 @@ blob each time; the views are released at StopDevice and StartDevice. Counters p
 which alone would explain ~200 MB/s), `RvCpuHit`, `RvCpuView` (1 leases, 2 blob). Staging -> staging
 between RM-backed buffers should not reach the CPU at all any more (`with_standard_pair`).
 
+After the 364.1 guest hang (windowed Heaven, `RedirVram` 1 + G1), every new path got a bounded wait
+and a switch (`RvOff`, a bit mask read at StartDevice, mirrored `RvOffEff`; a set bit turns the path
+off and its caller takes the fallback):
+
+| bit | path |
+|---|---|
+| 0x1 | `ce_vram::foreign_source` (both the record and the import path) |
+| 0x2 | its import-by-resource-id path only |
+| 0x8 | `ce_sysmem::with_standard_pair` |
+| 0x10 | `ce_sysmem::with_standard` and the pair (GDI staging copies on the CPU) |
+| 0x40 | GDI staging buffers from RM system memory (`sysmem::try_create_standard`) |
+| 0x80 | the Present hook (`ddi/vram_redirect.rs`): every Blt with a VRAM surface is a counted skip |
+| 0x100 | OPT-IN: a foreign copy from a record acquires the producer's semaphore |
+| 0x200 | OPT-IN: the CPU helpers reuse blob views |
+
+Two defaults changed with it: the record path's semaphore ACQUIRE is now opt-in (a record's value is
+not guaranteed to be released again, e.g. after a swap chain is recreated, and an acquire that never
+releases holds the copy engine for every user), and the CPU view reuse is opt-in (a view kept after its
+blob left that window range is a cached alias of whatever the host maps there next; reused views are
+also dropped at every paging change and destroy of their buffer). `ce_vram::wait` now marks the channel
+broken when a copy of the KMD's own does not complete in time (`RvWaitTmo`): nothing more is submitted,
+and the route's worker tears the channel down (bounded) and discharges what queued behind it. The waits
+of the other paths were already bounded: RM I/O by `IO_MS` (2 s) per call inside a bounded section, the
+channel I/O by 250 ms, the copies by `XFER_MS` (250 ms); the content transaction is held only around one
+command's resolve, copies and waits.
+
 Known limits: the route's destination table has 8 entries (a VRAM destination destroyed with a copy in
 flight keeps its entry until the generation ends); `ce_vram` maps 16 objects at a time (LRU); a Venus
 DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous upload and readback run on the
