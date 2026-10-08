@@ -290,6 +290,34 @@ const PATH_OVL: u32 = 16;
 const PATH_FGN_WR: u32 = 32;
 /// Every GDI write into a GPU surface sets alpha 0xff (`GdiOff` 0x40 opts in; `ga::opaque_alpha`).
 const PATH_OPAQUE: u32 = 64;
+/// Execute each job synchronously inside RenderGdi/RenderKm, before its fence exists (`GdiOff`
+/// 0x80 opts in; the timing test of the RGB-0 sources).
+const PATH_SYNC: u32 = 128;
+
+static SYNC_N: AtomicU32 = AtomicU32::new(0);
+static SYNC_OPS: AtomicU32 = AtomicU32::new(0);
+
+/// Whether `translate` runs the commands itself (`GdiOff` 0x80).
+pub(crate) fn sync_mode() -> bool {
+    path(PATH_SYNC)
+}
+
+/// The commands of one buffer, executed now on the rendering thread (`GdiOff` 0x80): the staging
+/// sources are read as win32k left them when it built the buffer. The caller then commits no job,
+/// so SubmitCommand gates nothing. PASSIVE.
+pub(crate) fn run_now(passive: PassiveLevel, adapter: &AdapterContext, ops: &[Op]) {
+    let mut channel: Option<bool> = None;
+    for op in ops {
+        if channel.is_none() && needs_channel(op) {
+            channel = Some(ensure_channel(passive, adapter));
+        }
+        execute(passive, adapter, op);
+    }
+    SYNC_N.fetch_add(1, Ordering::Relaxed);
+    SYNC_OPS.fetch_add(ops.len() as u32, Ordering::Relaxed);
+    DIRTY.store(1, Ordering::Relaxed);
+    publish_if_due(false);
+}
 
 /// Whether `op` writes an opaque alpha byte (`ga::opaque_alpha`), counted in `GdiOpaqN`.
 fn opaque(op: &Op) -> bool {
@@ -327,7 +355,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -436,6 +464,8 @@ pub(crate) fn publish_counters() {
         w(name, s.load(Ordering::Relaxed));
     }
     w(b"GdiPrbK", PRB_K.load(Ordering::Relaxed));
+    w(b"GdiSyncN", SYNC_N.load(Ordering::Relaxed));
+    w(b"GdiSyncOps", SYNC_OPS.load(Ordering::Relaxed));
     w(b"GdiSrcScan", SRC_SCAN.load(Ordering::Relaxed));
     w(b"GdiSrcScanK", SRC_SCAN_K.load(Ordering::Relaxed));
     const PRE_NAMES: [&[u8]; 4] = [b"GdiPre0", b"GdiPre1", b"GdiPre2", b"GdiPre3"];

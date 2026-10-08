@@ -522,6 +522,15 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
     // recycles DMA buffers, so the whole private range is cleared first (a stale `HPBL` prefix
     // would gate this buffer's fence on an old copy), then the job record is written. Job 0 (no
     // command to run, or the table refused it) makes SubmitCommand gate nothing.
+    // GdiOff 0x80: run the commands here, on win32k's thread, before the buffer is submitted.
+    if !ops.is_empty() && gx::sync_mode() {
+        if let Some(a) = adapter {
+            // SAFETY: RenderKm / RenderGdi run at PASSIVE_LEVEL.
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            gx::run_now(passive, a, &ops);
+            ops.clear();
+        }
+    }
     let job = if ops.is_empty() {
         0
     } else {

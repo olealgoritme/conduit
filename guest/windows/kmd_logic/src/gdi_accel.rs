@@ -1686,6 +1686,9 @@ pub const fn paths_from_off(off: u32) -> u32 {
     if off & 0x40 != 0 {
         p |= 64;
     }
+    if off & 0x80 != 0 {
+        p |= 128;
+    }
     p
 }
 
@@ -1866,6 +1869,9 @@ pub const COUNTERS: &[&str] = &[
     "GdiPrb6",
     "GdiPrb7",
     "GdiPrbK",
+    // Jobs executed synchronously inside RenderGdi/RenderKm (GdiOff 0x80), and their commands.
+    "GdiSyncN",
+    "GdiSyncOps",
     // A probed all-zero source row: the whole source scanned (16 rows): scans | sources with any
     // non-zero pixel << 10; the last: resource id << 16 | non-zero rows << 8 | GDI type.
     "GdiSrcScan",
@@ -2307,6 +2313,7 @@ mod tests {
         assert_eq!(paths_from_off(0x4), 0x39);
         assert_eq!(paths_from_off(0x20), 0x1D);
         assert_eq!(paths_from_off(0x40), 0x7D);
+        assert_eq!(paths_from_off(0x80), 0xBD);
     }
 
     /// A knob is a service-key value the driver READS; a counter is one it WRITES. The same name
