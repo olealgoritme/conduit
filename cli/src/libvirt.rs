@@ -242,6 +242,52 @@ fn is_spice_dev(e: &Element) -> bool {
 /// and no OpenGL: one VNC server on `console` (the boot console the backend
 /// shows), no SPICE devices, no SPICE audio, no QXL or 3D-accelerated video.
 /// The emulated video device stays: firmware and boot screens draw on it.
+/// chardev id of the QMP monitor the backend sends relative pointer motion
+/// through (`input-send-event`).
+const QMP_ID: &str = "conduit-qmp";
+/// id of the USB tablet once it is Conduit's (see [`take_usb_tablet`]).
+const TABLET_ID: &str = "conduit-tablet";
+
+/// A QMP monitor next to the console socket. Under a viewer grab the backend
+/// moves QEMU's relative (PS/2) mouse through it: a first-person game reads
+/// raw relative motion, and VNC carries only absolute positions to the
+/// tablet. QEMU removes a stale socket file itself.
+fn qmp_args(console: &Path) -> [String; 4] {
+    let sock = console.with_file_name("qmp.sock");
+    [
+        "-chardev".into(),
+        format!(
+            "socket,id={QMP_ID},path={},server=on,wait=off",
+            sock.display()
+        ),
+        "-mon".into(),
+        format!("chardev={QMP_ID},mode=control"),
+    ]
+}
+
+/// The USB tablet, bound to the VGA's console (`display=video0`): the VNC
+/// server (which uses that console) reaches it first, and QMP input with no
+/// device reaches only the unbound ones -- the PS/2 mouse gets the backend's
+/// relative motion *and* its buttons, so a click under a grab never jumps the
+/// pointer back to the tablet's last position. On the command line, after
+/// libvirt's devices, because the binding needs the VGA to exist already
+/// (QEMU skips it silently otherwise).
+fn tablet_arg() -> String {
+    format!("usb-tablet,id={TABLET_ID},bus=usb.0,port=1,display=video0")
+}
+
+/// Take libvirt's `<input type='tablet' bus='usb'>` out (its place is the
+/// command line, [`tablet_arg`]); `true` if there was one.
+fn take_usb_tablet(devices: &mut Element) -> bool {
+    let before = devices.children.len();
+    devices.children.retain(|n| {
+        !matches!(n, XMLNode::Element(e) if e.name == "input"
+            && e.attributes.get("type").map(String::as_str) == Some("tablet")
+            && e.attributes.get("bus").map(String::as_str) == Some("usb"))
+    });
+    devices.children.len() != before
+}
+
 fn edit_display(devices: &mut Element, console: &Path) {
     let first = devices
         .children
@@ -370,6 +416,8 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     }
 
     // <devices>: emulator first; the NVIDIA share (virtiofs tag "nvidia").
+    let moved_tablet;
+    let has_video;
     {
         let devices = child_mut(&mut root, "devices");
         let em = child_mut(devices, "emulator");
@@ -383,6 +431,8 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         devices.children.insert(0, node);
         // Before the share is re-appended, so a new <graphics> keeps its place.
         edit_display(devices, w.console_sock);
+        moved_tablet = take_usb_tablet(devices);
+        has_video = elements(devices).any(|e| e.name == "video");
         devices.children.retain(|n| {
             !matches!(n, XMLNode::Element(e) if e.name == "filesystem"
                 && e.get_child("target").and_then(|t| t.attributes.get("dir")).map(String::as_str) == Some("nvidia"))
@@ -427,11 +477,22 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         .map(|a| a.attributes.get("value").cloned().unwrap_or_default())
         .collect();
     let prev = previous_slot(&values);
+    // The tablet moves to the command line once and stays there.
+    let tablet = has_video
+        && (moved_tablet
+            || values
+                .iter()
+                .any(|v| v.contains(&format!("id={TABLET_ID}"))));
     let mut keep: Vec<Element> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let next = values.get(i + 1).cloned().unwrap_or_default();
-        let ours = (values[i] == "-chardev" || values[i] == "-device") && next.contains(CHARDEV_ID);
+        let ours = match values[i].as_str() {
+            "-chardev" => next.contains(CHARDEV_ID) || next.contains(&format!("id={QMP_ID},")),
+            "-device" => next.contains(CHARDEV_ID) || next.contains(&format!("id={TABLET_ID},")),
+            "-mon" => next.contains(&format!("chardev={QMP_ID},")),
+            _ => false,
+        };
         if ours {
             i += 2;
         } else {
@@ -450,12 +511,17 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     for a in keep {
         cl.children.push(XMLNode::Element(a));
     }
-    for v in [
+    let mut ours = vec![
         "-chardev".to_string(),
         virt::gpu_chardev_arg(w.gpu_sock),
         "-device".into(),
         virt::gpu_device_arg(bus, slot),
-    ] {
+    ];
+    ours.extend(qmp_args(w.console_sock));
+    if tablet {
+        ours.extend(["-device".to_string(), tablet_arg()]);
+    }
+    for v in ours {
         let mut a = el("arg", &[("value", &v)]);
         a.prefix = Some("qemu".into());
         a.namespace = Some(QEMU_NS.into());
@@ -1076,6 +1142,42 @@ mod tests {
     }
 
     #[test]
+    fn the_tablet_moves_to_the_command_line_bound_to_the_display_and_qmp_is_added() {
+        let out = edit(VIRT_INSTALL);
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let dev = root.get_child("devices").unwrap();
+        assert!(
+            !all(dev, "input")
+                .iter()
+                .any(|e| e.attributes.get("type").map(String::as_str) == Some("tablet")),
+            "libvirt's tablet is gone: {out}"
+        );
+        assert!(
+            out.contains("value=\"usb-tablet,id=conduit-tablet,bus=usb.0,port=1,display=video0\""),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "value=\"socket,id=conduit-qmp,path={},server=on,wait=off\"",
+                Path::new(CONSOLE).with_file_name("qmp.sock").display()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("value=\"chardev=conduit-qmp,mode=control\""),
+            "{out}"
+        );
+        // The tablet comes after the GPU, and so after every libvirt device.
+        let gpu = out.find("vhost-user-test-device-pci").unwrap();
+        assert!(out.find("usb-tablet").unwrap() > gpu);
+        // A domain without a tablet does not get one.
+        assert_eq!(edit(&out), out, "idempotent");
+        let none = edit(DOMAIN);
+        assert!(!none.contains("usb-tablet"), "{none}");
+        assert!(none.contains("conduit-qmp"), "{none}");
+    }
+
+    #[test]
     fn idempotent_and_keeps_foreign_args() {
         let with_other = DOMAIN.replace(
             "</domain>",
@@ -1084,7 +1186,16 @@ mod tests {
         let once = edit(&with_other);
         let twice = edit(&once);
         assert_eq!(once, twice);
-        assert_eq!(twice.matches("-chardev").count(), 1);
+        assert_eq!(
+            twice.matches("-chardev").count(),
+            2,
+            "the GPU and QMP: {twice}"
+        );
+        assert_eq!(
+            twice.matches("id=conduit-tablet").count(),
+            0,
+            "no tablet, none added: {twice}"
+        );
         assert_eq!(twice.matches("<qemu:commandline").count(), 1);
         assert_eq!(twice.matches("conduit:vm").count(), 1);
         assert_eq!(twice.matches("<filesystem").count(), 1);
@@ -1143,7 +1254,11 @@ mod tests {
         assert_eq!(m.attributes["heads"], "1");
         assert!(m.attributes.get("vram").is_none(), "{out}");
         assert_eq!(all(&dev, "tpm").len(), 1, "the TPM stays");
-        assert_eq!(all(&dev, "input").len(), 1, "the tablet stays");
+        assert!(all(&dev, "input").is_empty(), "the tablet moved: {out}");
+        assert!(
+            out.contains("usb-tablet,id=conduit-tablet,bus=usb.0,port=1,display=video0"),
+            "to the command line: {out}"
+        );
         assert_eq!(edit(&out), out, "idempotent");
     }
 
