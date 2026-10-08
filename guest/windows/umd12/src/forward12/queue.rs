@@ -1143,6 +1143,7 @@ unsafe extern "system" fn calc_private_command_queue_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATECOMMANDQUEUE_0050,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_queue_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.queue_bad_arg);
     }
@@ -1166,6 +1167,7 @@ unsafe extern "system" fn create_command_queue(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     h_rt_queue: ddi12::D3D12DDI_HRTCOMMANDQUEUE,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_queue");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { Slot::<Boxed<QueueState>>::from_priv(h_queue.drv_private()) })
     else {
@@ -1469,6 +1471,7 @@ unsafe extern "system" fn destroy_command_queue(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
 ) {
+    ddi_time!("destroy_command_queue");
     // SAFETY: the caller guarantees a live handle from `create_command_queue`.
     let Some(slot) = (unsafe { Slot::<Boxed<QueueState>>::from_priv(h_queue.drv_private()) })
     else {
@@ -1561,6 +1564,7 @@ unsafe extern "system" fn calc_private_command_pool_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_POOL_0040,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_pool_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
     }
@@ -1583,6 +1587,7 @@ unsafe extern "system" fn create_command_pool(
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_POOL_0040,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_pool");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { Slot::<Boxed<PoolState>>::from_priv(h_pool.drv_private()) }) else {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
@@ -1621,6 +1626,7 @@ unsafe extern "system" fn reset_command_pool(
     h_device: ddi12::D3D12DDI_HDEVICE,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
+    ddi_time!("reset_command_pool");
     // SAFETY: the runtime supplies live device and pool handles for this call.
     let Some(pool) = (unsafe { pool_state(h_pool) }) else {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
@@ -1663,6 +1669,7 @@ unsafe extern "system" fn destroy_command_pool(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
+    ddi_time!("destroy_command_pool");
     // SAFETY: the caller guarantees a live handle from `create_command_pool`.
     let Some(slot) = (unsafe { Slot::<Boxed<PoolState>>::from_priv(h_pool.drv_private()) }) else {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
@@ -1691,6 +1698,7 @@ unsafe extern "system" fn calc_private_command_recorder_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_RECORDER_0040,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_recorder_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.recorder_bad_arg);
     }
@@ -1708,6 +1716,7 @@ unsafe extern "system" fn create_command_recorder(
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_RECORDER_0040,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_recorder");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { Slot::<Boxed<RecorderState>>::from_priv(h_recorder.drv_private()) })
     else {
@@ -1767,6 +1776,7 @@ unsafe extern "system" fn command_recorder_set_command_pool_as_target(
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
+    ddi_time!("command_recorder_set_command_pool_as_target");
     // SAFETY: the caller guarantees a live handle from `create_command_recorder`.
     let Some(recorder) = (unsafe { recorder_state(h_recorder) }) else {
         note_refusal(&L2_REFUSALS.recorder_bad_arg);
@@ -1950,6 +1960,7 @@ unsafe extern "system" fn destroy_command_recorder(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
 ) {
+    ddi_time!("destroy_command_recorder");
     // SAFETY: the caller guarantees a live handle from `create_command_recorder`.
     let Some(slot) = (unsafe { Slot::<Boxed<RecorderState>>::from_priv(h_recorder.drv_private()) })
     else {
@@ -1985,6 +1996,7 @@ unsafe extern "system" fn calc_private_command_list_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_LIST_0040,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_list_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.command_list_bad_arg);
     }
@@ -2034,6 +2046,7 @@ unsafe extern "system" fn create_command_list(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_rt_list: ddi12::D3D12DDI_HRTCOMMANDLIST,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_list");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
     else {
@@ -2224,6 +2237,7 @@ unsafe extern "system" fn destroy_command_list(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
+    ddi_time!("destroy_command_list");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(slot) = (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
     else {
@@ -2361,6 +2375,7 @@ unsafe extern "system" fn calc_private_command_signature_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_signature_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.command_signature_bad_arg);
     }
@@ -2416,6 +2431,7 @@ unsafe extern "system" fn create_command_signature(
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001,
     h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_signature");
     // SAFETY: the runtime supplied the sized private output block.
     let Some(slot) =
         (unsafe { Slot::<Com<ID3D12CommandSignature>>::from_priv(h_signature.drv_private()) })
@@ -2553,6 +2569,7 @@ unsafe extern "system" fn destroy_command_signature(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
 ) {
+    ddi_time!("destroy_command_signature");
     // SAFETY: the caller guarantees a handle from `pfnCreateCommandSignature`.
     let Some(slot) =
         (unsafe { Slot::<Com<ID3D12CommandSignature>>::from_priv(h_signature.drv_private()) })
@@ -3205,6 +3222,7 @@ unsafe extern "system" fn execute_command_lists(
     count: ddi12::UINT,
     lists: *const ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
+    ddi_time!("execute_command_lists");
     // Per-frame accounting (`nvk12::FrameStats`): the whole DDI, wait included.
     let started = std::time::Instant::now();
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
@@ -3522,6 +3540,7 @@ unsafe fn execute_command_lists_body(
 /// Count and terminate if it is ever invoked: returning would invent a stack
 /// cleanup convention, which corrupts the caller on x86.
 unsafe extern "system" fn queue_unused_slot() -> ! {
+    ddi_time!("queue_unused_slot");
     note_refusal(&L2_REFUSALS.queue_unused_slot_called);
     std::process::abort();
 }
@@ -3530,6 +3549,7 @@ unsafe extern "system" fn queue_unused_slot() -> ! {
 /// the one reason that matters: a shared body could not say *which* of the two
 /// the runtime called, and that is the entire content of the observation.
 unsafe extern "system" fn queue_unused2_slot() -> ! {
+    ddi_time!("queue_unused2_slot");
     note_refusal(&L2_REFUSALS.queue_unused2_slot_called);
     std::process::abort();
 }
@@ -3623,6 +3643,7 @@ unsafe extern "system" fn signal_fence(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     op_arg: *mut ddi12::D3D12DDIARG_FENCE_OPERATION,
 ) {
+    ddi_time!("signal_fence");
     // SAFETY: forwarded unchanged; the caller's guarantee is `fence_operation`'s.
     unsafe { fence_operation(FenceOp::Signal, h_queue, op_arg) }
 
@@ -3674,6 +3695,7 @@ unsafe extern "system" fn wait_for_fence(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     op_arg: *mut ddi12::D3D12DDIARG_FENCE_OPERATION,
 ) {
+    ddi_time!("wait_for_fence");
     // SAFETY: forwarded unchanged; the caller's guarantee is `fence_operation`'s.
     unsafe { fence_operation(FenceOp::Wait, h_queue, op_arg) }
 }

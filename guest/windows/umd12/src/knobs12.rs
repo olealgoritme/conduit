@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 19] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 20] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -328,6 +328,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 19] {
         ("Umd12ContextNode", umd12_context_node() as u32),
         // Appended (probe).
         ("Umd12FenceVaProbe", umd12_fence_va_probe() as u32),
+        // Appended (measurement).
+        ("Umd12DdiTimes", umd12_ddi_times() as u32),
     ]
 }
 
@@ -475,6 +477,17 @@ pub(crate) static UMD12_FENCE_VA_PROBE: BoolKnob = BoolKnob::new(c"Umd12FenceVaP
 
 pub(crate) fn umd12_fence_va_probe() -> bool {
     UMD12_FENCE_VA_PROBE.get()
+}
+
+/// `Umd12DdiTimes` (default 0; measurement): every forwarding DDI adds its
+/// wall time and call count to a per-DDI total (`ddi_time.rs`), and each
+/// frame-time window logs the eight DDIs with the most time per frame. Off:
+/// one relaxed load per DDI call. Read once per process.
+pub(crate) static UMD12_DDI_TIMES: BoolKnob = BoolKnob::new(c"Umd12DdiTimes", false);
+
+#[inline]
+pub(crate) fn umd12_ddi_times() -> bool {
+    UMD12_DDI_TIMES.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {

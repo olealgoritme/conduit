@@ -159,6 +159,7 @@ pub(super) unsafe extern "system" fn update_tile_mappings(
     counts: *const ddi12::UINT,
     flags: ddi12::D3D12DDI_TILE_MAPPING_FLAGS,
 ) {
+    ddi_time!("update_tile_mappings");
     // SAFETY: live private queue block provided by the runtime.
     let Some(queue) = (unsafe { queue_state(h_queue) }) else {
         note_refusal(&L2_REFUSALS.tile_mappings_refused);
@@ -246,6 +247,7 @@ pub(super) unsafe extern "system" fn copy_tile_mappings(
     size: *const ddi12::D3D12DDI_TILE_REGION_SIZE,
     flags: ddi12::D3D12DDI_TILE_MAPPING_FLAGS,
 ) {
+    ddi_time!("copy_tile_mappings");
     // SAFETY: live private queue block from this driver's creation.
     let Some(queue) = (unsafe { queue_state(h_queue) }) else {
         note_refusal(&L2_REFUSALS.tile_mappings_refused);

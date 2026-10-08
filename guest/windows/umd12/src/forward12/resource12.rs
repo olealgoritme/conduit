@@ -1180,6 +1180,7 @@ unsafe extern "system" fn calc_private_heap_and_resource_sizes(
     p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0109,
     h_protected_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
 ) -> ddi12::D3D12DDI_HEAP_AND_RESOURCE_SIZES {
+    ddi_time!("calc_private_heap_and_resource_sizes");
     if !h_protected_session.pDrvPrivate.is_null() {
         note_refusal(&L4_REFUSALS.protected_session_ignored);
     }
@@ -3138,6 +3139,7 @@ unsafe extern "system" fn create_heap_and_resource(
     h_protected_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
 ) -> Hresult {
+    ddi_time!("create_heap_and_resource");
     // ⛔ **Only a slot the paired sizing call ASKED FOR may be cleared**, and
     // this is the single most dangerous line in the lane if it is wrong. Every
     // Create nulls the private blocks of the objects it is creating, so a failed
@@ -3321,6 +3323,7 @@ unsafe extern "system" fn destroy_heap_and_resource(
     h_heap: ddi12::D3D12DDI_HHEAP,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
 ) {
+    ddi_time!("destroy_heap_and_resource");
     let mut seen = false;
 
     // ⛔ **Whether this driver may reclaim `hHeap` is decided by the RESOURCE**,
@@ -3472,6 +3475,7 @@ unsafe extern "system" fn map_heap(
     h_heap: ddi12::D3D12DDI_HHEAP,
     out: *mut *mut c_void,
 ) -> Hresult {
+    ddi_time!("map_heap");
     if out.is_null() {
         note_refusal(&L4_REFUSALS.heap_resource_create_bad_arg);
         return E_INVALIDARG;
@@ -3531,6 +3535,7 @@ unsafe extern "system" fn map_heap(
 /// # Safety
 /// `h_heap` must be a live heap handle that [`map_heap`] returned `S_OK` for.
 unsafe extern "system" fn unmap_heap(_h_device: ddi12::D3D12DDI_HDEVICE, h_heap: ddi12::D3D12DDI_HHEAP) {
+    ddi_time!("unmap_heap");
     // SAFETY: as `map_heap`.
     let Some(state) = (unsafe { heap_state(h_heap) }) else {
         note_refusal(&L4_REFUSALS.resource_handle_unresolved);
@@ -3605,6 +3610,7 @@ unsafe extern "system" fn make_resident(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *mut ddi12::D3D12DDIARG_MAKERESIDENT_0001,
 ) -> Hresult {
+    ddi_time!("make_resident");
     if arg.is_null() {
         note_refusal(&L4_REFUSALS.residency_bad_arg);
         return E_INVALIDARG;
@@ -3645,6 +3651,7 @@ unsafe extern "system" fn evict(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_EVICT,
 ) -> Hresult {
+    ddi_time!("evict");
     if arg.is_null() {
         note_refusal(&L4_REFUSALS.residency_bad_arg);
         return E_INVALIDARG;
@@ -3667,6 +3674,7 @@ unsafe extern "system" fn offer_resources(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_OFFERRESOURCES,
 ) -> Hresult {
+    ddi_time!("offer_resources");
     if arg.is_null() {
         note_refusal(&L4_REFUSALS.residency_bad_arg);
         return E_INVALIDARG;
@@ -3692,6 +3700,7 @@ unsafe extern "system" fn reclaim_resources(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *mut ddi12::D3D12DDIARG_RECLAIMRESOURCES_0001,
 ) -> Hresult {
+    ddi_time!("reclaim_resources");
     if arg.is_null() {
         note_refusal(&L4_REFUSALS.residency_bad_arg);
         return E_INVALIDARG;
@@ -3729,6 +3738,7 @@ unsafe extern "system" fn calc_private_opened_heap_and_resource_sizes(
     _arg: *const ddi12::D3D12DDIARG_OPENHEAP_0003,
     _h_protected_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
 ) -> ddi12::D3D12DDI_HEAP_AND_RESOURCE_SIZES {
+    ddi_time!("calc_private_opened_heap_and_resource_sizes");
     note_refusal(&L4_REFUSALS.open_heap_calc_refused);
     ddi12::D3D12DDI_HEAP_AND_RESOURCE_SIZES {
         Heap: 0,
@@ -3796,6 +3806,7 @@ unsafe extern "system" fn open_heap_and_resource(
     _h_protected_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
     _h_resource: ddi12::D3D12DDI_HRESOURCE,
 ) -> Hresult {
+    ddi_time!("open_heap_and_resource");
     note_refusal(&L4_REFUSALS.open_heap_and_resource_refused);
     E_NOTIMPL
 }
@@ -3938,6 +3949,7 @@ unsafe extern "system" fn check_resource_allocation_info(
     visible_node_mask: ddi12::UINT,
     out: *mut ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022,
 ) {
+    ddi_time!("check_resource_allocation_info");
     if out.is_null() {
         note_refusal(&L4_REFUSALS.heap_resource_create_bad_arg);
         return;
@@ -4044,6 +4056,7 @@ unsafe extern "system" fn check_existing_resource_allocation_info(
     h_resource: ddi12::D3D12DDI_HRESOURCE,
     out: *mut ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022,
 ) {
+    ddi_time!("check_existing_resource_allocation_info");
     if out.is_null() {
         note_refusal(&L4_REFUSALS.heap_resource_create_bad_arg);
         return;
@@ -4129,6 +4142,7 @@ unsafe extern "system" fn check_subresource_info(
     subresource: ddi12::UINT,
     out: *mut ddi12::D3D12DDI_SUBRESOURCE_INFO,
 ) {
+    ddi_time!("check_subresource_info");
     if out.is_null() {
         note_refusal(&L4_REFUSALS.heap_resource_create_bad_arg);
         return;
@@ -4281,6 +4295,7 @@ unsafe extern "system" fn check_resource_virtual_address(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
 ) -> ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS {
+    ddi_time!("check_resource_virtual_address");
     // SAFETY: the runtime passes a resource handle this driver wrote; the borrow
     // ends with this call.
     let Some(resource) = (unsafe { engine_resource(h_resource) }) else {
@@ -4331,6 +4346,7 @@ unsafe extern "system" fn check_resource_allocation_handle(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_resource: ddi12::D3D10DDI_HRESOURCE,
 ) -> ddi12::D3DKMT_HANDLE {
+    ddi_time!("check_resource_allocation_handle");
     // SAFETY: the runtime passes a resource handle this driver wrote; the borrow
     // ends with this call.
     let Some(engine) = (unsafe { engine_resource(h_resource) }) else {

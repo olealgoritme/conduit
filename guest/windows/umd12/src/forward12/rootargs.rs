@@ -483,6 +483,7 @@ unsafe extern "system" fn set_compute_root_signature(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
 ) {
+    ddi_time!("set_compute_root_signature");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe { set_root_signature(Pipeline::Compute, h_list, h_rs) }
 }
@@ -495,6 +496,7 @@ unsafe extern "system" fn set_graphics_root_signature(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
 ) {
+    ddi_time!("set_graphics_root_signature");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe { set_root_signature(Pipeline::Graphics, h_list, h_rs) }
 }
@@ -571,6 +573,7 @@ unsafe extern "system" fn set_compute_root_descriptor_table(
     root_parameter_index: ddi12::UINT,
     base: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("set_compute_root_descriptor_table");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe { set_root_descriptor_table(Pipeline::Compute, h_list, root_parameter_index, base) }
 }
@@ -584,6 +587,7 @@ unsafe extern "system" fn set_graphics_root_descriptor_table(
     root_parameter_index: ddi12::UINT,
     base: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("set_graphics_root_descriptor_table");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe { set_root_descriptor_table(Pipeline::Graphics, h_list, root_parameter_index, base) }
 }
@@ -647,6 +651,7 @@ unsafe extern "system" fn set_compute_root_32bit_constant(
     src_data: ddi12::UINT,
     dest_offset_in_32bit_values: ddi12::UINT,
 ) {
+    ddi_time!("set_compute_root_32bit_constant");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_32bit_constant(
@@ -669,6 +674,7 @@ unsafe extern "system" fn set_graphics_root_32bit_constant(
     src_data: ddi12::UINT,
     dest_offset_in_32bit_values: ddi12::UINT,
 ) {
+    ddi_time!("set_graphics_root_32bit_constant");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_32bit_constant(
@@ -775,6 +781,7 @@ unsafe extern "system" fn set_compute_root_32bit_constants(
     p_src_data: *const core::ffi::c_void,
     dest_offset_in_32bit_values: ddi12::UINT,
 ) {
+    ddi_time!("set_compute_root_32bit_constants");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_32bit_constants(
@@ -799,6 +806,7 @@ unsafe extern "system" fn set_graphics_root_32bit_constants(
     p_src_data: *const core::ffi::c_void,
     dest_offset_in_32bit_values: ddi12::UINT,
 ) {
+    ddi_time!("set_graphics_root_32bit_constants");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_32bit_constants(
@@ -889,6 +897,7 @@ unsafe extern "system" fn set_compute_root_constant_buffer_view(
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
 ) {
+    ddi_time!("set_compute_root_constant_buffer_view");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_buffer_view(
@@ -910,6 +919,7 @@ unsafe extern "system" fn set_graphics_root_constant_buffer_view(
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
 ) {
+    ddi_time!("set_graphics_root_constant_buffer_view");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_buffer_view(
@@ -931,6 +941,7 @@ unsafe extern "system" fn set_compute_root_shader_resource_view(
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
 ) {
+    ddi_time!("set_compute_root_shader_resource_view");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_buffer_view(
@@ -952,6 +963,7 @@ unsafe extern "system" fn set_graphics_root_shader_resource_view(
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
 ) {
+    ddi_time!("set_graphics_root_shader_resource_view");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_buffer_view(
@@ -973,6 +985,7 @@ unsafe extern "system" fn set_compute_root_unordered_access_view(
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
 ) {
+    ddi_time!("set_compute_root_unordered_access_view");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_buffer_view(
@@ -994,6 +1007,7 @@ unsafe extern "system" fn set_graphics_root_unordered_access_view(
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
 ) {
+    ddi_time!("set_graphics_root_unordered_access_view");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         set_root_buffer_view(
@@ -1055,6 +1069,7 @@ unsafe extern "system" fn set_descriptor_heaps(
     num: ddi12::UINT,
     heaps: *mut ddi12::D3D12DDI_HDESCRIPTORHEAP,
 ) {
+    ddi_time!("set_descriptor_heaps");
     // SAFETY: the caller guarantees a live command-list handle.
     let Some(state) = (unsafe { list_state(h_list) }) else {
         return;
@@ -1147,6 +1162,7 @@ unsafe extern "system" fn set_descriptor_heaps(
 /// # Safety
 /// The runtime exclusively borrows a live list for this DDI invocation.
 unsafe extern "system" fn clear_root_arguments(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
+    ddi_time!("clear_root_arguments");
     // SAFETY: the runtime supplies the live list handle for this invocation.
     let Some(state) = (unsafe { list_state(h_list) }) else {
         return;
@@ -1446,6 +1462,7 @@ unsafe extern "system" fn clear_unordered_access_view_uint(
     num_rects: ddi12::UINT,
     p_rects: *const ddi12::D3D12DDI_RECT,
 ) {
+    ddi_time!("clear_unordered_access_view_uint");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         clear_unordered_access_view(
@@ -1473,6 +1490,7 @@ unsafe extern "system" fn clear_unordered_access_view_float(
     num_rects: ddi12::UINT,
     p_rects: *const ddi12::D3D12DDI_RECT,
 ) {
+    ddi_time!("clear_unordered_access_view_float");
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
     unsafe {
         clear_unordered_access_view(
@@ -1509,6 +1527,7 @@ unsafe extern "system" fn clear_render_target_view(
     num_rects: ddi12::UINT,
     p_rects: *const ddi12::D3D12DDI_RECT,
 ) {
+    ddi_time!("clear_render_target_view");
     // SAFETY: the caller guarantees a live command-list handle.
     let Some(state) = (unsafe { list_state(h_list) }) else {
         return;
@@ -1597,6 +1616,7 @@ unsafe extern "system" fn clear_depth_stencil_view(
     num_rects: ddi12::UINT,
     p_rects: *const ddi12::D3D12DDI_RECT,
 ) {
+    ddi_time!("clear_depth_stencil_view");
     // SAFETY: the caller guarantees a live command-list handle.
     let Some(state) = (unsafe { list_state(h_list) }) else {
         return;
@@ -1670,6 +1690,7 @@ unsafe extern "system" fn discard_resource(
     h_resource: ddi12::D3D12DDI_HRESOURCE,
     arg: *const ddi12::D3D12DDIARG_DISCARD_RESOURCE_0003,
 ) {
+    ddi_time!("discard_resource");
     // SAFETY: the caller guarantees a live command-list handle.
     let Some(state) = (unsafe { list_state(h_list) }) else {
         return;
