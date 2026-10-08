@@ -106,6 +106,32 @@ static CHK_WANT: AtomicU32 = AtomicU32::new(0);
 static PITCH_MIS: AtomicU32 = AtomicU32::new(0);
 static PITCH_CMD: AtomicU32 = AtomicU32::new(0);
 static PITCH_AL: AtomicU32 = AtomicU32::new(0);
+/// The destinations commands were executed into (any engine): up to 8 distinct resource ids, each
+/// `resource id << 12 | executed commands (saturating at 4095)` (`GdiRes0`..`GdiRes7`), first come.
+static RES_SLOTS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+
+fn note_dst_written(op: &Op) {
+    let Some(d) = op.dst else { return };
+    let id = d.resource_id & 0xf_ffff;
+    if id == 0 {
+        return;
+    }
+    for s in RES_SLOTS.iter() {
+        let v = s.load(Ordering::Relaxed);
+        if v == 0 {
+            if s.compare_exchange(0, id << 12 | 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                return;
+            }
+            continue;
+        }
+        if v >> 12 == id {
+            if v & 0xfff != 0xfff {
+                s.store(v + 1, Ordering::Relaxed);
+            }
+            return;
+        }
+    }
+}
 static OVL_N: AtomicU32 = AtomicU32::new(0);
 static OVL_CE: AtomicU32 = AtomicU32::new(0);
 static OVL_WHY: AtomicU32 = AtomicU32::new(0);
@@ -206,6 +232,9 @@ pub(crate) fn reset_for_start(on: bool) {
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    for s in RES_SLOTS.iter() {
+        s.store(0, Ordering::Relaxed);
+    }
     let old = {
         let mut t = TABLE.lock();
         t.tl.discharge_all();
@@ -255,6 +284,19 @@ pub(crate) fn publish_counters() {
     w(b"GdiOvlCe", OVL_CE.load(Ordering::Relaxed));
     w(b"GdiOvlWhy", OVL_WHY.load(Ordering::Relaxed));
     w(b"GdiJobMaxN", JOB_N_OPS.load(Ordering::Relaxed));
+    for (i, s) in RES_SLOTS.iter().enumerate() {
+        let name: &[u8] = match i {
+            0 => b"GdiRes0",
+            1 => b"GdiRes1",
+            2 => b"GdiRes2",
+            3 => b"GdiRes3",
+            4 => b"GdiRes4",
+            5 => b"GdiRes5",
+            6 => b"GdiRes6",
+            _ => b"GdiRes7",
+        };
+        w(name, s.load(Ordering::Relaxed));
+    }
     w(b"GdiChkN", CHK_N.load(Ordering::Relaxed));
     w(b"GdiChkBad", CHK_BAD.load(Ordering::Relaxed));
     w(b"GdiChkK", CHK_K.load(Ordering::Relaxed));
@@ -758,6 +800,14 @@ fn run_foreign_write(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -
 }
 
 fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
+    let drops = crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed);
+    execute_inner(passive, adapter, op);
+    if crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed) == drops {
+        note_dst_written(op);
+    }
+}
+
+fn execute_inner(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     if op.engine != Engine::Drop && op.dst.is_some_and(|d| d.class == SurfaceClass::Foreign) {
         if !run_foreign_write(passive, adapter, op) {
             crate::ddi::gdi_accel::note_why(Why::CeFailed);

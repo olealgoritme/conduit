@@ -48,6 +48,8 @@ pub(crate) const SUBMIT: Fail = Fail::new(FailKind::Transport, 0xE9);
 
 /// The path is switched off (`RvOff`).
 pub(crate) const DISABLED: Fail = Fail::new(FailKind::Refused, 0xF0);
+/// A new surface's first clear did not complete: the mapping is not handed out (`RvClrFail`).
+pub(crate) const CLEAR_FAILED: Fail = Fail::new(FailKind::Transport, 0xF2);
 
 static WAIT_TMO: AtomicU32 = AtomicU32::new(0);
 
@@ -213,6 +215,8 @@ static FGN_FAIL: AtomicU32 = AtomicU32::new(0);
 static FGN_WHY: AtomicU32 = AtomicU32::new(0);
 static FGN_WRITE: AtomicU32 = AtomicU32::new(0);
 static CLEARED: AtomicU32 = AtomicU32::new(0);
+static CLR_FAIL: AtomicU32 = AtomicU32::new(0);
+static CLR_SKIP: AtomicU32 = AtomicU32::new(0);
 
 fn fgn_fail(f: Fail) -> Fail {
     FGN_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -616,10 +620,12 @@ fn map_locked(io: &Io<'_>, h: &Handles, resource_id: u32) -> Result<CeSurface, F
 }
 
 /// Clear a new VRAM surface to 0 on the copy engine and wait (at most `XFER_MS`). The caller holds
-/// the channel's I/O and no `book()` guard.
-fn clear_new(io: &Io<'_>, resource_id: u32, va: u64) {
+/// the channel's I/O and no `book()` guard. `false`: the clear did not complete, and the caller
+/// must not hand the mapping out (a write through it, then a retried clear at a later mapping,
+/// would wipe what was drawn).
+fn clear_new(io: &Io<'_>, resource_id: u32, va: u64) -> bool {
     let Some(obj) = super::vidmem::lookup(resource_id) else {
-        return;
+        return true;
     };
     let lines = (obj.size / u64::from(obj.pitch.max(1))) as u32;
     let r = ce::submit_build(|push, _gen, done| {
@@ -633,8 +639,10 @@ fn clear_new(io: &Io<'_>, resource_id: u32, va: u64) {
     if ok {
         CLEARED.fetch_add(1, Ordering::Relaxed);
     } else {
+        CLR_FAIL.fetch_add(1, Ordering::Relaxed);
         super::vidmem::clear_failed(resource_id);
     }
+    ok
 }
 
 /// Dup `(client, memory)` into the channel's client and map it at a slot's window (VRAM: big pages
@@ -690,10 +698,28 @@ fn map_object(
                 b.maps.insert(slot, resource_id, g.va, len);
                 refresh_any(&b);
             }
-            // A VRAM surface's first mapping clears it before any copy can write it (every write
-            // path maps first); RM does not zero video memory on allocation.
+            // A VRAM surface's first mapping clears it before any copy can write it: every path
+            // (ce_surface, ce_object_va, transfer, the foreign copies) maps through here, and the
+            // clear completes before the VA is handed out. RM does not zero video memory on
+            // allocation. Exactly once: `claim_clear` marks it; a clear that did not complete
+            // fails this mapping (dropped again), so nothing is written before a clear that has
+            // completed. `RvOff` 0x800: no clear (A/B).
             if !sysmem && super::vidmem::claim_clear(resource_id) {
-                clear_new(io, resource_id, g.va);
+                if super::vidmem::off(helios_kmd_logic::rm_vidmem::off::CLEAR) {
+                    CLR_SKIP.fetch_add(1, Ordering::Relaxed);
+                } else if !clear_new(io, resource_id, g.va) {
+                    // Separate statements: no `book()` guard may live across `give_back`.
+                    let removed = {
+                        let mut b = book().ok_or(REENTRY)?;
+                        let r = b.maps.find(resource_id).and_then(|m| b.maps.remove(m.slot));
+                        refresh_any(&b);
+                        r
+                    };
+                    if let Some(m) = removed {
+                        give_back(io, h, &m);
+                    }
+                    return Err(CLEAR_FAILED);
+                }
             }
             Ok(g.va)
         }
@@ -1021,6 +1047,8 @@ pub(crate) fn publish_counters() {
     rec(b"RvCopyFail", COPY_FAIL.load(Ordering::Relaxed));
     rec(b"RvWaitTmo", WAIT_TMO.load(Ordering::Relaxed));
     rec(b"RvCleared", CLEARED.load(Ordering::Relaxed));
+    rec(b"RvClrFail", CLR_FAIL.load(Ordering::Relaxed));
+    rec(b"RvClrSkip", CLR_SKIP.load(Ordering::Relaxed));
     if FGN_REC.load(Ordering::Relaxed)
         | FGN_IMP.load(Ordering::Relaxed)
         | FGN_FAIL.load(Ordering::Relaxed)
