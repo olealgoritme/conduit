@@ -5,11 +5,15 @@ Subject: [PATCH] nvk: GPU time per render pass and command buffer behind
  NVK_PASS_PROFILE
 
 To find what makes a frame GPU-heavy without a vendor profiler: with
-NVK_PASS_PROFILE=1 every render pass and every primary graphics command
+NVK_PASS_PROFILE=1 every render pass (vkCmdBeginRendering, and render pass
+objects through the common runtime), every execution of a secondary
+command buffer (timed in the primary by vkCmdExecuteCommands, with its
+draws added to the primary's pass) and every primary graphics command
 buffer gets a slot in a mapped GART ring at record time, and the 3D class
 writes a timestamped report (pipeline location ALL) at its start and its
-end. After submits the CPU harvests finished slots and adds end - begin to
-a per-signature total. A pass's signature is its size, sample count, layer
+end. A harvest thread (every 200 ms, independent of submits and frames)
+adds end - begin to a per-signature total; a final window is written at
+device destruction. A pass's signature is its size, sample count, layer
 and attachment counts and, for the first colour and the depth attachment,
 the format, LINEAR or block-linear, the PTE kind and whether the image is
 compressed, so the log also shows how the attachments are laid out. Every
@@ -26,15 +30,15 @@ Each report is a flush of pending writes plus a release, a little GPU time
 per pass: good for finding a 10x, not for measuring 1 %.
 ---
  src/nouveau/vulkan/meson.build        |   1 +
- src/nouveau/vulkan/nvk_cmd_buffer.c   |   5 +
+ src/nouveau/vulkan/nvk_cmd_buffer.c   |  17 +
  src/nouveau/vulkan/nvk_cmd_buffer.h   |   6 +
  src/nouveau/vulkan/nvk_cmd_draw.c     |   9 +
  src/nouveau/vulkan/nvk_device.c       |   6 +
  src/nouveau/vulkan/nvk_device.h       |   5 +
- src/nouveau/vulkan/nvk_pass_profile.c | 406 ++++++++++++++++++++++++++
- src/nouveau/vulkan/nvk_pass_profile.h |  28 ++
+ src/nouveau/vulkan/nvk_pass_profile.c | 518 ++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_pass_profile.h |  35 ++
  src/nouveau/vulkan/nvk_queue.c        |   4 +
- 9 files changed, 470 insertions(+)
+ 9 files changed, 601 insertions(+)
  create mode 100644 src/nouveau/vulkan/nvk_pass_profile.c
  create mode 100644 src/nouveau/vulkan/nvk_pass_profile.h
 
@@ -51,7 +55,7 @@ index 79b923a..eecfb79 100644
    'nvk_query_pool.h',
    'nvk_queue.c',
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
-index efa52d7..5a56235 100644
+index efa52d7..2de1566 100644
 --- a/src/nouveau/vulkan/nvk_cmd_buffer.c
 +++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
 @@ -3,6 +3,7 @@
@@ -80,6 +84,32 @@ index efa52d7..5a56235 100644
     nvk_cmd_buffer_flush_push(cmd, false);
  
     /* We only need to flush the memory objects we own because, if there are
+@@ -424,6 +429,13 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+    for (uint32_t i = 0; i < commandBufferCount; i++) {
+       VK_FROM_HANDLE(nvk_cmd_buffer, other, pCommandBuffers[i]);
+ 
++      /* NVK_PASS_PROFILE: a report before it (flushed so it precedes the
++       * secondary's pushes) and one after it.
++       */
++      const int32_t prof_slot = nvk_pass_profile_begin_secondary(cmd, other);
++      if (prof_slot >= 0)
++         nvk_cmd_buffer_flush_push(cmd, false);
++
+       /* We only need to copy the pushes.  We do not copy the
+        * nvk_cmd_buffer::bos because that tracks ownership.  Instead, we
+        * depend on the app to not discard secondaries while they are used by a
+@@ -440,6 +452,11 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+       util_dynarray_append_dynarray(&cmd->pushes, &other->pushes);
+ 
+       cmd->prev_subc = nvk_cmd_buffer_last_subchannel(other);
++
++      if (prof_slot >= 0) {
++         nvk_pass_profile_end_secondary(cmd, other, prof_slot);
++         nvk_cmd_buffer_flush_push(cmd, false);
++      }
+    }
+ 
+    /* From the Vulkan 1.3.275 spec:
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
 index e6a5798..3bfa993 100644
 --- a/src/nouveau/vulkan/nvk_cmd_buffer.h
@@ -192,10 +222,10 @@ index 5359e66..a17a5ba 100644
     struct nvk_layer_dispatch_tables layer_dispatch;
 diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
 new file mode 100644
-index 0000000..8849711
+index 0000000..7e3096c
 --- /dev/null
 +++ b/src/nouveau/vulkan/nvk_pass_profile.c
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,518 @@
 +/*
 + * Copyright © 2026 Conduit contributors
 + * SPDX-License-Identifier: MIT
@@ -204,11 +234,15 @@ index 0000000..8849711
 + * timestamps, for finding the passes that make a frame heavy
 + * (NVK_PASS_PROFILE=1; off by default).
 + *
-+ * Each render pass and each primary graphics command buffer gets a record
++ * Each render pass (vkCmdBeginRendering, and render pass objects through the
++ * common runtime), each execution of a secondary command buffer
++ * (vkCmdExecuteCommands, timed in the primary) and each primary graphics
++ * command buffer gets a record
 + * slot in a mapped GART ring when it is recorded: a 16-byte report with a
 + * timestamp written by the 3D class at its start (pipeline location ALL,
 + * after the preceding work) and another at its end.  A command buffer that is
-+ * submitted again rewrites its slots.  After submits the CPU harvests slots
++ * submitted again rewrites its slots.  A harvest thread (every 200 ms, not
++ * tied to submits or frames) harvests slots
 + * whose end report carries the "written" payload, clears it, and adds
 + * end - begin to a per-signature total: the pass's size, sample count,
 + * attachment formats and, for the first colour and the depth attachment,
@@ -236,18 +270,21 @@ index 0000000..8849711
 +
 +#include "nv_push_cl9097.h"
 +
++#include "c11/threads.h"
 +#include "util/log.h"
 +#include "util/os_time.h"
 +#include "util/simple_mtx.h"
 +#include "util/u_atomic.h"
 +#include "util/os_misc.h"
 +#include "util/u_debug.h"
++#include "util/u_math.h"
 +#include "vk_enum_to_str.h"
 +
 +#include <inttypes.h>
 +#include <stdarg.h>
 +#include <stdio.h>
 +#include <string.h>
++#include <time.h>
 +#ifdef _WIN32
 +#include <windows.h>
 +#endif
@@ -255,6 +292,7 @@ index 0000000..8849711
 +#define PROF_SLOTS     16384u
 +#define PROF_SIGS      128u
 +#define PROF_LOG_NS    2000000000ull
++#define PROF_HARVEST_MS 200u
 +#define PROF_PAYLOAD   0x4e564b50u /* "NVKP" */
 +
 +/* One report as the 3D class writes it with STRUCTURE_SIZE_FOUR_WORDS */
@@ -292,8 +330,42 @@ index 0000000..8849711
 +   uint32_t sig_count;
 +   uint64_t window_start_ns;
 +   uint64_t dropped;
++   uint64_t windows;
 +   FILE *file;
++
++   /* The harvest thread (every PROF_HARVEST_MS, a log line every
++    * PROF_LOG_NS), independent of submits and frames.
++    */
++   thrd_t thread;
++   bool thread_started;
++   mtx_t stop_mutex;
++   cnd_t stop_cond;
++   bool stop;
 +};
++
++static void prof_harvest_and_log(struct nvk_pass_profile *prof, bool final);
++
++static int
++prof_thread_main(void *arg)
++{
++   struct nvk_pass_profile *prof = arg;
++   mtx_lock(&prof->stop_mutex);
++   while (!prof->stop) {
++      struct timespec ts;
++      timespec_get(&ts, TIME_UTC);
++      ts.tv_nsec += PROF_HARVEST_MS * 1000000l;
++      ts.tv_sec += ts.tv_nsec / 1000000000l;
++      ts.tv_nsec %= 1000000000l;
++      cnd_timedwait(&prof->stop_cond, &prof->stop_mutex, &ts);
++      if (prof->stop)
++         break;
++      mtx_unlock(&prof->stop_mutex);
++      prof_harvest_and_log(prof, false);
++      mtx_lock(&prof->stop_mutex);
++   }
++   mtx_unlock(&prof->stop_mutex);
++   return 0;
++}
 +
 +static void PRINTFLIKE(2, 3)
 +prof_log(struct nvk_pass_profile *prof, const char *fmt, ...)
@@ -367,6 +439,13 @@ index 0000000..8849711
 +                                 NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,
 +                                 &prof->mem);
 +   if (result != VK_SUCCESS) {
++      char path[512];
++      FILE *f = prof_open_file(path, sizeof(path));
++      if (f != NULL) {
++         fprintf(f, "NVK pass profile: no ring memory for device %p, off\n",
++                 (void *)dev);
++         fclose(f);
++      }
 +      free(prof);
 +      mesa_logw("NVK pass profile: no ring memory");
 +      return;
@@ -378,8 +457,17 @@ index 0000000..8849711
 +   char path[512] = "";
 +   prof->file = prof_open_file(path, sizeof(path));
 +   dev->pass_profile = prof;
-+   prof_log(prof, "NVK pass profile: on (%u slots), file %s", PROF_SLOTS,
++   prof_log(prof, "NVK pass profile: on for device %p (%u slots), file %s",
++            (void *)dev, PROF_SLOTS,
 +            prof->file != NULL ? path : "(none: no writable folder)");
++   if (prof->file != NULL)
++      fflush(prof->file);
++   if (mtx_init(&prof->stop_mutex, mtx_plain) == thrd_success &&
++       cnd_init(&prof->stop_cond) == thrd_success &&
++       thrd_create(&prof->thread, prof_thread_main, prof) == thrd_success)
++      prof->thread_started = true;
++   else
++      prof_log(prof, "NVK pass profile: no harvest thread, harvesting on submits");
 +}
 +
 +void
@@ -388,6 +476,15 @@ index 0000000..8849711
 +   struct nvk_pass_profile *prof = dev->pass_profile;
 +   if (prof == NULL)
 +      return;
++   if (prof->thread_started) {
++      mtx_lock(&prof->stop_mutex);
++      prof->stop = true;
++      cnd_signal(&prof->stop_cond);
++      mtx_unlock(&prof->stop_mutex);
++      thrd_join(prof->thread, NULL);
++   }
++   /* The device is idle here: what is left in the ring is final */
++   prof_harvest_and_log(prof, true);
 +   nvkmd_mem_unref(prof->mem);
 +   if (prof->file != NULL)
 +      fclose(prof->file);
@@ -525,6 +622,8 @@ index 0000000..8849711
 +   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
 +   cmd->pass_profile_slot = -1;
 +   cmd->pass_profile_cmd_slot = -1;
++   cmd->pass_profile_draws = 0;
++   cmd->pass_profile_cmd_draws = 0;
 +   if (likely(dev->pass_profile == NULL) ||
 +       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
 +       !(nvk_cmd_buffer_queue_flags(cmd) & VK_QUEUE_GRAPHICS_BIT))
@@ -543,6 +642,40 @@ index 0000000..8849711
 +   cmd->pass_profile_cmd_slot = -1;
 +}
 +
++/* vkCmdExecuteCommands: each secondary command buffer is timed where the
++ * primary executes it (a slot per execution, so a secondary executed from
++ * many primaries is counted once per execution), and its draws count towards
++ * the primary's open pass and the primary itself.
++ */
++int32_t
++nvk_pass_profile_begin_secondary(struct nvk_cmd_buffer *cmd,
++                                 const struct nvk_cmd_buffer *other)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   if (likely(dev->pass_profile == NULL))
++      return -1;
++   /* Power-of-two draw buckets keep the signature count bounded */
++   const uint32_t draws = other->pass_profile_cmd_draws;
++   char name[96];
++   snprintf(name, sizeof(name), "secondary command buffer, %s%u draws",
++            draws > 1 ? "<=" : "",
++            draws <= 1 ? draws : 1u << util_logbase2_ceil(draws));
++   return prof_begin(cmd, name);
++}
++
++void
++nvk_pass_profile_end_secondary(struct nvk_cmd_buffer *cmd,
++                               const struct nvk_cmd_buffer *other,
++                               int32_t slot)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   if (likely(dev->pass_profile == NULL))
++      return;
++   cmd->pass_profile_draws += other->pass_profile_cmd_draws;
++   cmd->pass_profile_cmd_draws += other->pass_profile_cmd_draws;
++   prof_end(cmd, slot, other->pass_profile_cmd_draws);
++}
++
 +static int
 +prof_sig_cmp(const void *a, const void *b)
 +{
@@ -554,9 +687,15 @@ index 0000000..8849711
 +nvk_pass_profile_poll(struct nvk_device *dev)
 +{
 +   struct nvk_pass_profile *prof = dev->pass_profile;
-+   if (likely(prof == NULL))
++   /* The harvest thread does it; this is only the fallback without one */
++   if (likely(prof == NULL) || prof->thread_started)
 +      return;
++   prof_harvest_and_log(prof, false);
++}
 +
++static void
++prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
++{
 +   simple_mtx_lock(&prof->mutex);
 +   for (uint32_t i = 0; i < PROF_SLOTS; i++) {
 +      volatile struct prof_slot_gpu *s = &prof->gpu[i];
@@ -576,12 +715,15 @@ index 0000000..8849711
 +
 +   const uint64_t now = os_time_get_nano();
 +   const uint64_t window = now - prof->window_start_ns;
-+   if (window >= PROF_LOG_NS) {
++   if (window >= PROF_LOG_NS || (final && window > 0)) {
++      prof->windows++;
 +      struct prof_sig sorted[PROF_SIGS];
 +      memcpy(sorted, prof->sigs, prof->sig_count * sizeof(sorted[0]));
 +      qsort(sorted, prof->sig_count, sizeof(sorted[0]), prof_sig_cmp);
-+      prof_log(prof, "NVK pass profile: %.2f s window, %u signatures, %" PRIu64
-+               " dropped", window / 1e9, prof->sig_count, prof->dropped);
++      prof_log(prof, "NVK pass profile: window %" PRIu64 "%s, %.2f s, %u "
++               "signatures, %" PRIu64 " dropped", prof->windows,
++               final ? " (final)" : "", window / 1e9, prof->sig_count,
++               prof->dropped);
 +      for (uint32_t i = 0; i < prof->sig_count && i < 24; i++) {
 +         if (sorted[i].count == 0)
 +            break;
@@ -604,10 +746,10 @@ index 0000000..8849711
 +}
 diff --git a/src/nouveau/vulkan/nvk_pass_profile.h b/src/nouveau/vulkan/nvk_pass_profile.h
 new file mode 100644
-index 0000000..0043ba5
+index 0000000..efd6c23
 --- /dev/null
 +++ b/src/nouveau/vulkan/nvk_pass_profile.h
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,35 @@
 +/*
 + * Copyright © 2026 Conduit contributors
 + * SPDX-License-Identifier: MIT
@@ -632,7 +774,14 @@ index 0000000..0043ba5
 +void nvk_pass_profile_begin_cmd(struct nvk_cmd_buffer *cmd);
 +void nvk_pass_profile_end_cmd(struct nvk_cmd_buffer *cmd);
 +
-+/* After a submit: harvest finished records, log now and then. */
++/* Around one secondary in vkCmdExecuteCommands (returns its slot) */
++int32_t nvk_pass_profile_begin_secondary(struct nvk_cmd_buffer *cmd,
++                                         const struct nvk_cmd_buffer *other);
++void nvk_pass_profile_end_secondary(struct nvk_cmd_buffer *cmd,
++                                    const struct nvk_cmd_buffer *other,
++                                    int32_t slot);
++
++/* After a submit: harvest and log, only when there is no harvest thread. */
 +void nvk_pass_profile_poll(struct nvk_device *dev);
 +
 +#endif
