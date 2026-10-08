@@ -62,6 +62,9 @@ pub mod off {
     /// Opt-in since 382.1: the route worked but windowed Heaven fell from 411 to 89 fps, the
     /// completions seen only at the HPD worker's timer-quantum polls.
     pub const ROUTE_ON: u32 = 0x1000;
+    /// DIAGNOSTIC: a new VRAM surface is cleared to opaque magenta instead of 0, so content no
+    /// path ever wrote shows as magenta wherever DWM composes the surface.
+    pub const CLEAR_MAGENTA: u32 = 0x2000;
     /// The Present hook (`ddi/vram_redirect.rs`) skips every Blt with a VRAM surface (counted).
     pub const PRESENT_HOOK: u32 = 0x80;
     /// OPT-IN: the CPU helpers reuse blob views (`build_paging_buffer`). Off by default since 364.1:
@@ -887,7 +890,7 @@ pub const COUNTERS: &[&str] = &[
     "RvMapOk", "RvMapFail", "RvMapStat", "RvMapLive", "RvMapGive", "RvBookReent", "RvXfer", "RvXferFail",
     "RvXferWhy", "RvXferUs", "RvXferMax", "RvCopy", "RvCopyFail",
     // the Present (`ddi/vram_redirect.rs`)
-    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy", "RvSyncTry", "RvSyncWhy", "RvMkNone", "RvMkRes", "RvMkStr", "RvMkVramNo", "RvSyPix", "RvSyPixN", "RvSyPixNz", "RvDst0", "RvDst1", "RvDst2", "RvDst3", "RvDst4", "RvDst5", "RvDst6", "RvDst7", "RvDstMore", "RvNew0", "RvNew1", "RvNew2", "RvNew3", "RvNew4", "RvNew5", "RvNew6", "RvNew7", "RvNewWH0", "RvNewWH1", "RvNewWH2", "RvNewWH3", "RvNewWH4", "RvNewWH5", "RvNewWH6", "RvNewWH7", "RvSyDst", "RvSySrc", "RvSyWH", "RvPrUs", "RvPrN", "RvPrMax", "RvRtUs", "RvRtN", "RvRtMax", "RvSyFsUs", "RvSyFsN", "RvSyFsMax", "RvSyDsUs", "RvSyDsN", "RvSyDsMax", "RvSySubUs", "RvSySubN", "RvSySubMax", "RvSyWtUs", "RvSyWtN", "RvSyWtMax",
+    "RvBltSeen", "RvBltRoute", "RvBltSkip", "RvBltWhy", "RvRdBack", "RvUpload", "RvGdiFail", "RvBltSync", "RvRtWhy", "RvSyncTry", "RvSyncWhy", "RvMkNone", "RvMkRes", "RvMkStr", "RvMkVramNo", "RvSyPix", "RvSyPixN", "RvSyPixNz", "RvDst0", "RvDst1", "RvDst2", "RvDst3", "RvDst4", "RvDst5", "RvDst6", "RvDst7", "RvDstMore", "RvPgXfer", "RvPgFill", "RvPgDisc", "RvPgOther", "RvPgLast", "RvNew0", "RvNew1", "RvNew2", "RvNew3", "RvNew4", "RvNew5", "RvNew6", "RvNew7", "RvNewWH0", "RvNewWH1", "RvNewWH2", "RvNewWH3", "RvNewWH4", "RvNewWH5", "RvNewWH6", "RvNewWH7", "RvSyDst", "RvSySrc", "RvSyWH", "RvPrUs", "RvPrN", "RvPrMax", "RvRtUs", "RvRtN", "RvRtMax", "RvSyFsUs", "RvSyFsN", "RvSyFsMax", "RvSyDsUs", "RvSyDsN", "RvSyDsMax", "RvSySubUs", "RvSySubN", "RvSySubMax", "RvSyWtUs", "RvSyWtN", "RvSyWtMax",
     // foreign NVK sources for GDI commands (`ce_vram.rs`)
     "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy", "RvFgnWrite",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
