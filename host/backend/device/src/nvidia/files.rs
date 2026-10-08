@@ -151,7 +151,28 @@ impl NvidiaBackend {
     /// The response is a bare stream of entries with **no message header** --
     /// the driver reads from the first byte of the buffer.
     pub(super) fn handle_get_files(&mut self, tree: FileTree, resp_buf: &mut [u8]) -> usize {
-        let files = tree.collect();
+        let mut files = tree.collect();
+        // A rescan that reads nothing after one that read something is the sandbox losing the
+        // tree (see `sys_files_last`), not the GPU going away: the guest gets the last list.
+        // 383.1: from 07:07:20 on every GET_SYS_FILES read 0 files and 0 render nodes, and every
+        // NVK process started after it could not open its render node, so its imports by
+        // resource id failed ("failed to allocate backing storage" in DWM).
+        {
+            let mut last = match tree {
+                FileTree::Sys => self.sys_files_last.borrow_mut(),
+                FileTree::Proc => self.proc_files_last.borrow_mut(),
+            };
+            if files.is_empty() && !last.is_empty() {
+                log::warn!(
+                    "{}: the rescan read nothing; serving the last list ({} file(s))",
+                    tree.name(),
+                    last.len()
+                );
+                files = last.clone();
+            } else if !files.is_empty() {
+                *last = files.clone();
+            }
+        }
         log::info!("{}: {} file(s)", tree.name(), files.len());
 
         let mut off = 0usize;
@@ -478,11 +499,23 @@ impl NvidiaBackend {
     pub(super) fn write_dri_section(&self, buf: &mut [u8]) -> usize {
         // Without graphics there is no render node to offer, and a guest told
         // of none creates none, whatever it knows about capabilities.
-        let devices = if self.start.caps.has(crate::caps::GRAPHICS) {
+        let mut devices = if self.start.caps.has(crate::caps::GRAPHICS) {
             self.dri_devices()
         } else {
             Vec::new()
         };
+        // As for the files: a rescan that reads nothing after one that read something keeps the
+        // list the guest already numbers its nodes by (overwriting it with nothing made every
+        // later render-node open fail, "invalid device kind 512").
+        if devices.is_empty() && self.start.caps.has(crate::caps::GRAPHICS) {
+            if let Some(prev) = self.dri_given.borrow().as_ref().filter(|p| !p.is_empty()) {
+                log::warn!(
+                    "GET_SYS_FILES: the DRI rescan read nothing; serving the last list ({} device(s))",
+                    prev.len()
+                );
+                devices = prev.clone();
+            }
+        }
         // Kept: the guest numbers nodes by this list, so an open must be
         // resolved against it and not against a fresh scan of sysfs, which
         // came back empty under ten guests' load and refused the open.
