@@ -2108,7 +2108,11 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
         // case above: a blank texture of the same size, logged. Both backends: DWM can be on
         // Venus too (Icd=venus, or DwmIcd=nvk refused by the crash-loop guard after such
         // restarts), and Venus cannot import an RM video memory surface either (368.1, res 23).
-        if (!helios_bridge::is_dwm_process())
+        // Any other process: the same for a foreign (KMD- or NVK-made) surface. Win32 apps
+        // fail-fast on an E_FAIL from a shared open (370.1: Notepad MoBEX, Explorer BEX64 with
+        // RedirVram), and a blank texture is the safer failure; the log says which open it was.
+        const bool dwm = helios_bridge::is_dwm_process();
+        if (!dwm && !foreign)
           throw;
         HRESULT phr = E_FAIL;
         ID3D11Resource* res = blank_ddi_placeholder(device, width, height, format, bind_flags, &phr);
@@ -2117,10 +2121,11 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
         if (n <= 16 || (n % 512u) == 0) {
           char msg[320];
           std::snprintf(msg, sizeof(msg),
-            "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d modifier=0x%016llx stride=%u) on %s DWM: import failed (%s): blank placeholder hr=0x%08lx (x%u)",
+            "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d modifier=0x%016llx stride=%u) on %s %s: import failed (%s): blank placeholder hr=0x%08lx (x%u)",
             renderer_resource_id, width, height, int(foreign),
             static_cast<unsigned long long>(foreign_modifier), foreign_stride,
             impl->backend == helios_bridge::IcdBackend::Venus ? "Venus" : "NVK",
+            dwm ? "DWM" : "app",
             e.message().c_str(), static_cast<unsigned long>(phr), n);
           umd_log(msg);
         }
