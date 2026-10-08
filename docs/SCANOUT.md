@@ -159,7 +159,7 @@ guest cursor plane commit ──CursorUpdate{owner,handle,hot}──► backend 
 
 ```
 DxgkDdiSetPointerShape ──ARGB into a slot of the KMD's cursor blob──► CMD_SET_CURSOR_BLOB{res, rect, stride, offset, hot}
-                                                                        │ GpuCmd (control queue), round trip
+                                                                        │ GpuCmd on the cursor queue (virtqueue 2), round trip
                                                                         ▼
                                   backend venus/cursor.rs: export the blob once (as a scanout) ──► DisplayLink::cursor
                                                                         │ CMD_CURSOR + dma-buf, as above
@@ -202,6 +202,18 @@ struct set_cursor_blob {       /* after the virtio-gpu ctrl header */
   Unref of the cursor's resource and a device reset hide it.
 - The KMD side, its knob (`HwCursor`), counters and the test recipe:
   `guest/windows/docs/independent-flip.md` section 12.
+
+
+**The cursor queue.** A shape change must never wait behind rendering. The backend serves a third
+virtqueue (index 2, like virtio-gpu's cursorq) with the control queue's messages and announces it
+with config `features` bit 20 (`NVGPU_CFG_CURSOR_QUEUE`, set with the Venus cursor). It drains the
+cursor queue first and again after every control request, so a cursor command waits for at most one
+control request, never for the control queue's backlog of Venus `GpuCmd`s. The VMM has to expose the
+queue (QEMU `vhost-user-test-device-pci,num_vqs=3`; the Linux driver finds its two queues and ignores
+the third). The Windows KMD uses it when both hold and its `HwCursorQ` knob is not 0 (`CurQ` 1); it
+polls the queue for the answer (no interrupt). Otherwise the cursor commands stay on the control queue.
+A command that times out is not a refusal: the host runs it late and the KMD keeps the host cursor
+(`CurTmo`); only an error answer leaves the shape to the software cursor.
 
 ## Backend → viewer
 

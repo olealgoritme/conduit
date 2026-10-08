@@ -24,6 +24,12 @@ pub const NUM_QUEUES: usize = 2;
 pub const CONTROL_QUEUE: usize = 0;
 /// Device-initiated notifications to the guest.
 pub const EVENT_QUEUE: usize = 1;
+/// The cursor queue: control-queue messages that must not wait behind Venus
+/// traffic (a Windows guest's `CMD_SET_CURSOR_BLOB`). Served when the VMM
+/// exposes a third queue; announced with
+/// [`protocol::messages::NVGPU_CFG_CURSOR_QUEUE`]. Not in [`NUM_QUEUES`], which
+/// is the Linux driver's contract (it finds two and ignores a third).
+pub const CURSOR_QUEUE: usize = 2;
 
 /// Recommended virtqueue size.
 pub const QUEUE_SIZE: u16 = 256;
@@ -312,6 +318,13 @@ impl VirtioGpuNvConfig {
         self.features |= protocol::messages::NVGPU_CFG_VENUS_CURSOR;
     }
 
+    /// Serve the cursor queue ([`CURSOR_QUEUE`]): sets
+    /// [`protocol::messages::NVGPU_CFG_CURSOR_QUEUE`]. Only with the Venus
+    /// cursor, by a transport that serves the third queue.
+    pub fn set_cursor_queue(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_CURSOR_QUEUE;
+    }
+
     /// Turn host fences into guest fences (docs/SYNC.md): sets
     /// [`protocol::messages::NVGPU_CFG_DRM_FENCES`]. Only by a transport that
     /// delivers one-shot fence watches (`take_watch_updates`); without that
@@ -572,5 +585,11 @@ mod tests {
         );
         // The number the Windows KMD tests (guest/windows/protocol/src/features.rs).
         assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
+        cfg.set_cursor_queue();
+        assert_ne!(
+            { cfg.features } & protocol::messages::NVGPU_CFG_CURSOR_QUEUE,
+            0
+        );
+        assert_eq!(CURSOR_QUEUE, 2);
     }
 }

@@ -87,6 +87,12 @@ pub const NVGPU_CFG_CURSOR: u32 = 1 << 9;
 /// as a blob (docs/SCANOUT.md "Hardware cursor, Windows guests"). The KMD's `HwCursor` follows
 /// it (`helios_kmd_logic::hw_cursor::advertise`).
 pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
+/// `NVGPU_CFG_CURSOR_QUEUE` (config `features` bit 20, only together with
+/// `NVGPU_CFG_VENUS_CURSOR`): the host serves a third virtqueue, the cursor queue, with the
+/// control queue's messages, ahead of the control queue's Venus traffic. The KMD sends its
+/// cursor commands there when the device also has the queue (`kmd_render/src/virtio/gpu/
+/// cursor_ring.rs`) and `HwCursorQ` is not 0.
+pub const NVGPU_CFG_CURSOR_QUEUE: u32 = 1 << 20;
 
 // ── Device status bits (VirtIO spec §2.1) ──────────────────────────────────
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;

@@ -110,8 +110,8 @@ pub struct Paths<'a> {
     pub console_log: &'a Path,
 }
 
-/// The GPU: QEMU 11.1's generic vhost-user device. Two queues (control,
-/// events), the backend's queue size, and the full device config, display
+/// The GPU: QEMU 11.1's generic vhost-user device. Three queues (control,
+/// events, cursor), the backend's queue size, and the full device config, display
 /// fields included (a smaller config_size hides them). `class=0x0380`
 /// (display controller, patch 0007) so a guest's display stack treats it as a
 /// display adapter -- Windows' DXGK does not start one on QEMU's default
@@ -119,7 +119,7 @@ pub struct Paths<'a> {
 /// VGA arbiter would take an interest in. conduit-vmm uses the same class.
 pub fn gpu_device(chardev: &str) -> String {
     format!(
-        "vhost-user-test-device-pci,chardev={chardev},virtio-id={NVGPU_VIRTIO_ID},class=0x0380,num_vqs=2,vq_size=256,config_size={NVGPU_CONFIG_SIZE}"
+        "vhost-user-test-device-pci,chardev={chardev},virtio-id={NVGPU_VIRTIO_ID},class=0x0380,num_vqs=3,vq_size=256,config_size={NVGPU_CONFIG_SIZE}"
     )
 }
 
@@ -334,7 +334,7 @@ mod tests {
             "virtio-net-pci,netdev=net0,mac=02:00:00:00:03:01",
             "vhost-user-fs-pci,chardev=vfs,tag=nvidia",
             "socket,id=nvgpu,path=/run/gpu.sock",
-            "vhost-user-test-device-pci,chardev=nvgpu,virtio-id=45,class=0x0380,num_vqs=2,vq_size=256,config_size=4036",
+            "vhost-user-test-device-pci,chardev=nvgpu,virtio-id=45,class=0x0380,num_vqs=3,vq_size=256,config_size=4036",
             "-qmp unix:/run/qmp.sock,server=on,wait=off",
             "-audiodev pipewire,id=snd0",
             "virtio-sound-pci,audiodev=snd0,streams=2",

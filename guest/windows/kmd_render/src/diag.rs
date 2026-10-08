@@ -1454,6 +1454,12 @@ pub mod knobs {
     /// `RedirVram` per-path switches for bisecting (default 0; bits in
     /// `helios_kmd_logic::rm_vidmem::off`). Read at StartDevice.
     pub const RV_OFF: KnobName = KnobName::new(b"RvOff");
+    /// `HwCursorQ` (default 1): send the hardware cursor's commands on the cursor queue
+    /// (virtqueue 2, `virtio/gpu/cursor_ring.rs`) when the host announces it
+    /// (`NVGPU_CFG_CURSOR_QUEUE`) and the VMM exposes it (`num_vqs=3`), so they never wait behind
+    /// Venus traffic. 0 keeps them on the control queue (the fallback, and the old path). Read at
+    /// StartDevice; mirrored as `CurQ`.
+    pub const HW_CURSOR_Q: KnobName = KnobName::new(b"HwCursorQ");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,

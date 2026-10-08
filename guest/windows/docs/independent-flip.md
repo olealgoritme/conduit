@@ -1190,6 +1190,27 @@ software cursor), `CurWhy` (last reason: 1 flags, 2 size, 3 pitch, 4 hotspot, 5 
 (host commands that failed), `CurXor` (inverting pixels in the last shape). Host: the backend logs `venus: the guest's hardware
 cursor is served (CMD_SET_CURSOR_BLOB)` at start and counts `set_cursor_blob=N` in its teardown `venus: ... command(s)` line.
 
+### 12.3a The cursor queue and timeouts (`HwCursorQ`)
+
+397.1: after Basemark the cursor froze for seconds, then returned. Each shape change was a
+control-queue round trip with a 500 ms timeout, behind every Venus `GpuCmd`; a busy backend made it
+time out, the KMD failed the shape, dxgkrnl fell back to the software cursor and the host image was
+hidden, so the pointer moved only as fast as DWM presented. Two changes:
+
+* a timeout is not a refusal (`hw_cursor::after_failure`): the command is queued and runs late, so
+  the host cursor stays (`CurTmo`); a command that never reached a queue stays owed and is sent again
+  from a later position call, at most every 250 ms (`CurRetry`); only an error answer falls back to
+  software;
+* the commands go on their own virtqueue (`virtio/gpu/cursor_ring.rs`, queue 2), which the backend
+  serves ahead of the control queue (docs/SCANOUT.md "Hardware cursor, Windows guests"). Needs the
+  backend of this change (config bit 20, `NVGPU_CFG_CURSOR_QUEUE`) and `num_vqs=3` on the QEMU
+  device. `HwCursorQ` = 0 keeps the control queue.
+
+Counters: `CurQ` (1 on the cursor queue), `CurQBusy` (a send deferred because the previous command
+was still out), `CurRttUs` / `CurRttMax` (round trip, microseconds), `CurTmo`, `CurRetry`,
+`CurGateMs` (longest wait for another pointer operation's I/O), `CurSwN` / `CurSwMs` / `CurSwMax`
+(software-cursor episodes: a refused shape until the host shows one again).
+
 ### 12.4 Recipe (main runs it; lowest mode first)
 
 Needs the backend and the KMD of this branch (`NVGPU_CFG_VENUS_CURSOR` is new; with an older backend the default knob reports no

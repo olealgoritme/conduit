@@ -61,7 +61,9 @@ use wdk_sys::ntddk::{
 };
 use wdk_sys::{KEVENT, PVOID};
 
+mod cursor_ring;
 mod nvrm_events;
+pub use cursor_ring::CursorPoll;
 mod nvrm_tables;
 mod resource_tables;
 mod rm_gates;
@@ -2386,6 +2388,9 @@ pub struct VirtioGpu {
     /// `EventReady` arrives. `None` if the queue could not be brought up: then
     /// events are unsupported. See `nvrm_events`.
     nvrm_event_ring: Option<Box<nvrm_events::EventRing>>,
+    /// The cursor queue (virtqueue 2, `cursor_ring`): the hardware cursor's commands off the
+    /// control queue. `None` when the host or the VMM has none, or `HwCursorQ` is 0.
+    cursor_ring: Option<Box<cursor_ring::CursorRing>>,
     /// Usermode events registered against RM handles (and `TRANSPORT_LOST`),
     /// reserved at init so no registration allocates under the spinlock. Each
     /// holds an object reference that only a PASSIVE caller may drop: every
@@ -2768,6 +2773,7 @@ impl VirtioGpu {
         msi_granted: u32,
         scanout_release: bool,
         scanout_presented: bool,
+        cursor_queue: bool,
     ) -> Result<Box<Self>, VirtioError> {
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
         // A miniport doesn't own the bus, so config space is reached via the
@@ -2879,6 +2885,15 @@ impl VirtioGpu {
         let nvrm_event_ring = nvrm_events::new_event_ring(passive, &mut transport);
         // 1 when the event queue is up, 0 when RM events are unsupported.
         crate::diag::record_named_bytes(b"NvEvQ", u32::from(nvrm_event_ring.is_some()));
+        // The cursor queue (index 2): only when the caller wants it (`HwCursorQ`), the host
+        // announces it and the device has the queue. No MSI-X vector: it is polled.
+        let cursor_ring = if cursor_queue
+            && cfg_features & helios_protocol::NVGPU_CFG_CURSOR_QUEUE != 0
+        {
+            cursor_ring::new_cursor_ring(passive, &mut transport)
+        } else {
+            None
+        };
         // Message-signalled interrupts: when the OS connected messages instead of
         // the INTx line (`msi_granted != 0`), the device's vectors must be
         // programmed BEFORE DRIVER_OK, for exactly the queues that exist. A device
@@ -3130,6 +3145,7 @@ impl VirtioGpu {
             contexts_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
             nvrm_event_ring,
+            cursor_ring,
             nvrm_events,
             cfg_features,
             scanout_release: scanout_release_on,

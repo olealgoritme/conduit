@@ -512,6 +512,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         msi_granted,
         knobs.display_half,
         crate::ddi::host_flip_done::wants_feature(knobs.flip_done, knobs.display_half),
+        // `HwCursorQ` (default 1): the cursor's own queue when the host and the VMM have it.
+        crate::diag::read_config_dword(crate::diag::knobs::HW_CURSOR_Q, 1) != 0,
     ) {
         Ok(mut gpu) => {
             let Some(generation) = adapter.producer.start_transport() else {
