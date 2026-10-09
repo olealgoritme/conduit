@@ -1,3 +1,4 @@
+# Registered on main; run by hand with workflow_dispatch.
 # Builds the Windows guest stack (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD,
 # loaders, installer) from guest/windows, adapted from Helios's
 # windows-stack.yml (guest/windows/HELIOS.md). Artifacts: the installable
