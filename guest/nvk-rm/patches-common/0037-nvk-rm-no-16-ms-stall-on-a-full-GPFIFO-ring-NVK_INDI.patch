@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 05:34:29 +0200
+Subject: [PATCH] nvk/rm: no 16 ms stall on a full GPFIFO ring,
+ NVK_INDIRECT_PUSH off
+
+vk_gpubench cs2like on 405.17 (Windows guest, RTX 5090): a depth pass of
+up to 500 indirect draw calls took 94-143 us; from 600 calls on it took a
+constant ~16 ms.  With NVK_INDIRECT_PUSH=0 or direct draws it stayed at
+~0.25 us per draw.
+
+NVK_INDIRECT_PUSH puts two GPFIFO entries per indirect call, so ~512
+calls fill the 1024-entry ring inside one submit.  wait_ring_space_n()
+then kicks what is written and polls with os_time_sleep(10), which on
+Windows is Sleep(1): one timer tick, ~15.6 ms at the default resolution,
+for a GPU that freed the ring within microseconds.
+
+- The ring has 4096 entries (64 KiB of entries, 512 KiB of push slots).
+- The wait polls with thrd_yield() for its first 4 ms, then sleeps as
+  before until the existing timeout.
+- NVK_INDIRECT_PUSH is off by default again until it is measured with
+  this; =1 keeps it.
+
+Every submit that waited for ring space paid the same tick before, also
+without NVK_INDIRECT_PUSH (for example a command buffer of many pushes
+behind a busy GPU).
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c          |  9 +++++----
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c | 23 +++++++++++++++++++---
+ 2 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 1089fea6..1bbf6290 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -54,9 +54,10 @@
+ 
+ static uint32_t nvk_mdi_batch(void);
+ 
+-/* NVK_INDIRECT_PUSH (Turing+, default on again since 405.15: 405.13's
+- * Xid 32 was the RM ring flushing inside an incomplete push, fixed by
+- * 0032; =0 is upstream's per-record MME
++/* NVK_INDIRECT_PUSH=1 (Turing+, default off: every indirect call takes two
++ * GPFIFO entries, and before 0037 a pass of more than ~512 calls stalled
++ * 16 ms on the full ring; 405.13's Xid 32 was the ring flushing inside an
++ * incomplete push, fixed by 0032; off is upstream's per-record MME
+  * DMA reads): see nvk_cmd_draw_indirect_pushed().
+  */
+ /* NVK_FS_STATE_TRACKING (default on, =0 always emits it): see
+@@ -80,7 +81,7 @@ nvk_indirect_push(void)
+    static uint32_t state;
+    uint32_t s = p_atomic_read(&state);
+    if (unlikely(s == 0)) {
+-      s = debug_get_bool_option("NVK_INDIRECT_PUSH", true) ? 2 : 1;
++      s = debug_get_bool_option("NVK_INDIRECT_PUSH", false) ? 2 : 1;
+       p_atomic_set(&state, s);
+    }
+    return s == 2;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 7d78849a..c2c1b7a6 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -43,7 +43,11 @@
+  * is reused only when its GPFIFO entry is, i.e. after GP_GET passed it.
+  */
+ 
+-#define NVKMD_RM_GPFIFO_ENTRIES     1024
++/* 4096 (was 1024): NVK_INDIRECT_PUSH makes every indirect draw call two
++ * entries, and a submit that fills the ring has to wait for the GPU in the
++ * middle of it (wait_ring_space_n).
++ */
++#define NVKMD_RM_GPFIFO_ENTRIES     4096
+ #define NVKMD_RM_PUSH_SLOT_DW       32
+ #define NVKMD_RM_PUSH_SLOT_B        (NVKMD_RM_PUSH_SLOT_DW * 4)
+ 
+@@ -215,13 +219,26 @@ wait_ring_space_n(struct nvkmd_rm_exec_ctx *ctx,
+          return result;
+    }
+ 
+-   const uint64_t deadline = os_time_get_nano() + NVKMD_RM_RING_TIMEOUT_NS;
++   const uint64_t start = os_time_get_nano();
++   const uint64_t deadline = start + NVKMD_RM_RING_TIMEOUT_NS;
+    while (ring_free(ctx) < n + 1) {
+       VkResult result = check_channel_error(ctx, log_obj);
+       if (result != VK_SUCCESS)
+          return result;
+ 
+-      if (os_time_get_nano() > deadline) {
++      /* Poll with a yield for the first 4 ms: the GPU usually frees the
++       * ring within microseconds, and os_time_sleep(10) is Sleep(1) on
++       * Windows, which waits a whole timer tick (~15.6 ms by default): a
++       * 600-call depth pass with NVK_INDIRECT_PUSH took 16 ms instead of
++       * 0.15 ms (cs2like, 405.17).
++       */
++      const uint64_t t = os_time_get_nano();
++      if (t - start < 4000000ull) {
++         thrd_yield();
++         continue;
++      }
++
++      if (t > deadline) {
+          return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
+                           "GPFIFO did not drain (put %u, read up to %u, "
+                           "tracking semaphore %" PRIu64 " of %" PRIu64 ")",
+-- 
+2.43.0
+
