@@ -1543,7 +1543,14 @@ static int win_event_wait(void *vctx, int fd, uint32_t timeout_ms)
                                              0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
                                              TIMER_ALL_ACCESS);
     }
-    const int use_timer = hires_timer != NULL && ms != INFINITE && ms <= 50;
+    /* CRM_EVENT_HIRES=0: the wait's own timeout, as before 405.22 (bisecting) */
+    static volatile LONG hires_env = -1;
+    if (hires_env < 0) {
+        char v[8] = { 0 };
+        const DWORD n = GetEnvironmentVariableA("CRM_EVENT_HIRES", v, sizeof(v));
+        InterlockedExchange(&hires_env, (n > 0 && n < sizeof(v) && v[0] == '0') ? 0 : 1);
+    }
+    const int use_timer = hires_env != 0 && hires_timer != NULL && ms != INFINITE && ms <= 50;
     if (use_timer) {
         LARGE_INTEGER due;
         due.QuadPart = -(LONGLONG)ms * 10000; /* 100 ns units, relative */
