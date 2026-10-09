@@ -12,12 +12,12 @@ D3D11 game on DXVK on NVK hit the assert on its first frames.
  1 file changed, 17 insertions(+), 8 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
-index 577f23a..d1c05f6 100644
+index 17dcc9b9..45d5d827 100644
 --- a/src/nouveau/vulkan/nvk_physical_device.c
 +++ b/src/nouveau/vulkan/nvk_physical_device.c
-@@ -4,6 +4,15 @@
-  */
+@@ -5,6 +5,15 @@
  #include "nvk_physical_device.h"
+ #include "util/u_debug.h"
  
 +/* Mesa's Win32 WSI implements no wait_for_present (wsi_WaitForPresentKHR
 + * asserts on it), so VK_KHR_present_id/_wait(2) are not advertised there:
@@ -31,7 +31,7 @@ index 577f23a..d1c05f6 100644
  #include "nak.h"
  #include "nvk_buffer.h"
  #include "nvk_descriptor_types.h"
-@@ -178,10 +187,10 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
+@@ -182,10 +191,10 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
        .KHR_pipeline_executable_properties = true,
        .KHR_pipeline_library = true,
  #ifdef NVK_USE_WSI_PLATFORM
@@ -46,7 +46,7 @@ index 577f23a..d1c05f6 100644
  #endif
        .KHR_push_descriptor = true,
        .KHR_relaxed_block_layout = true,
-@@ -548,10 +557,10 @@ nvk_get_device_features(const struct nv_device_info *info,
+@@ -552,10 +561,10 @@ nvk_get_device_features(const struct nv_device_info *info,
  
  #ifdef NVK_USE_WSI_PLATFORM
        /* VK_KHR_present_id */
@@ -59,7 +59,7 @@ index 577f23a..d1c05f6 100644
  #endif
  
        /* VK_KHR_shader_quad_control */
-@@ -823,10 +832,10 @@ nvk_get_device_features(const struct nv_device_info *info,
+@@ -827,10 +836,10 @@ nvk_get_device_features(const struct nv_device_info *info,
  
  #ifdef NVK_USE_WSI_PLATFORM
        /* VK_KHR_present_id2 */
