@@ -7,6 +7,7 @@ nvkvm-broker-testclient
 nvkvm-broker-relay
 nvkvm-broker-dmabuf-src
 test-utf8
+test-relacc
 test/utf8_extracted.inc
 *.d
 nvgpu-scanout-test

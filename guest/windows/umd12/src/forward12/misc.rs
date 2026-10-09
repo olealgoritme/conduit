@@ -218,6 +218,7 @@ unsafe fn clear_refused_slot(p_drv_private: *mut c_void, bad_slot: &RefusalCount
 unsafe extern "system" fn get_implicit_physical_adapter_mask(
     _h_device: ddi12::D3D12DDI_HDEVICE,
 ) -> ddi12::UINT {
+    ddi_time!("get_implicit_physical_adapter_mask");
     HELIOS_PHYSICAL_ADAPTER_MASK
 }
 
@@ -244,6 +245,7 @@ unsafe extern "system" fn query_node_map(
     num_physical_adapters: ddi12::UINT,
     p_map: *mut ddi12::UINT,
 ) {
+    ddi_time!("query_node_map");
     if p_map.is_null() {
         note_refusal(&UMD12_REFUSALS.node_map_bad_arg);
         return;
@@ -301,6 +303,7 @@ unsafe extern "system" fn retrieve_shader_comment(
     _p_buffer: *mut ddi12::WCHAR,
     character_count_including_null_terminator: *mut ddi12::SIZE_T,
 ) -> ddi12::HRESULT {
+    ddi_time!("retrieve_shader_comment");
     if character_count_including_null_terminator.is_null() {
         note_refusal(&L9_REFUSALS.shader_comment_bad_arg);
     } else {
@@ -392,6 +395,7 @@ unsafe extern "system" fn get_debug_allocation_info(
     p_num_kmt_infos: *mut ddi12::UINT,
     p_kmt_infos: *mut ddi12::D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014,
 ) {
+    ddi_time!("get_debug_allocation_info");
     // ⛔ NO VIRTUAL-ADDRESS INFOS, and 0 is the answer rather than a gap. The
     // struct is `{PhysicalAdapterIndex, StartAddress, EndAddress}` — a range in the
     // *adapter's* GPU virtual address space — and this driver reserves none:
@@ -541,6 +545,7 @@ unsafe extern "system" fn calc_private_scheduling_group_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATESCHEDULINGGROUP_0050,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_scheduling_group_size");
     if arg.is_null() {
         note_refusal(&L9_REFUSALS.scheduling_group_calc_bad_arg);
     }
@@ -569,6 +574,7 @@ unsafe extern "system" fn create_scheduling_group(
     h_group: ddi12::D3D12DDI_HSCHEDULINGGROUP_0050,
     _h_rt_group: ddi12::D3D12DDI_HRTSCHEDULINGGROUP_0050,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_scheduling_group");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     unsafe { clear_refused_slot(h_group.pDrvPrivate, &L9_REFUSALS.scheduling_group_bad_slot) };
     note_refusal(&L9_REFUSALS.scheduling_group_refused);
@@ -596,6 +602,7 @@ unsafe extern "system" fn destroy_scheduling_group(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_group: ddi12::D3D12DDI_HSCHEDULINGGROUP_0050,
 ) {
+    ddi_time!("destroy_scheduling_group");
     note_refusal(&L9_REFUSALS.scheduling_group_destroy_unexpected);
 }
 
@@ -639,6 +646,7 @@ unsafe extern "system" fn enumerate_meta_commands(
     p_num_meta_commands: *mut ddi12::UINT,
     _p_descs: *mut ddi12::D3D12DDIARG_META_COMMAND_DESC,
 ) -> ddi12::HRESULT {
+    ddi_time!("enumerate_meta_commands");
     if p_num_meta_commands.is_null() {
         note_refusal(&L9_REFUSALS.meta_command_enumerate_bad_arg);
         return E_INVALIDARG;
@@ -674,6 +682,7 @@ unsafe extern "system" fn enumerate_meta_command_parameters(
     p_parameter_count: *mut ddi12::UINT,
     _p_parameter_descs: *mut ddi12::D3D12DDIARG_META_COMMAND_PARAMETER_DESC,
 ) -> ddi12::HRESULT {
+    ddi_time!("enumerate_meta_command_parameters");
     if !p_parameter_count.is_null() {
         // SAFETY: non-null per the check; the DDI declares it a writable count
         // the runtime owns for the duration of the call.
@@ -704,6 +713,7 @@ unsafe extern "system" fn calc_private_meta_command_size(
     p_creation_parameters: *const c_void,
     creation_parameters_data_size_in_bytes: ddi12::SIZE_T,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_meta_command_size");
     if creation_parameters_data_size_in_bytes != 0 && p_creation_parameters.is_null() {
         note_refusal(&L9_REFUSALS.meta_command_calc_bad_arg);
     }
@@ -728,6 +738,7 @@ unsafe extern "system" fn create_meta_command(
     h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
     _h_rt_meta_command: ddi12::D3D12DDI_HRTMETACOMMAND_0052,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_meta_command");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     unsafe {
         clear_refused_slot(
@@ -757,6 +768,7 @@ unsafe extern "system" fn destroy_meta_command(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
 ) {
+    ddi_time!("destroy_meta_command");
     note_refusal(&L9_REFUSALS.meta_command_destroy_unexpected);
 }
 
@@ -781,6 +793,7 @@ unsafe extern "system" fn get_meta_command_required_parameter_info(
     _parameter_index: ddi12::UINT,
     p_info: *mut ddi12::D3D12DDIARG_META_COMMAND_REQUIRED_PARAMETER_INFO,
 ) {
+    ddi_time!("get_meta_command_required_parameter_info");
     if p_info.is_null() {
         note_refusal(&L9_REFUSALS.meta_command_required_parameter_bad_arg);
         return;
@@ -816,6 +829,7 @@ unsafe extern "system" fn calc_private_state_object_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_STATE_OBJECT_0054,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_state_object_size");
     if arg.is_null() {
         note_refusal(&L9_REFUSALS.state_object_calc_bad_arg);
     }
@@ -828,6 +842,7 @@ unsafe extern "system" fn calc_private_add_to_state_object_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_ADD_TO_STATE_OBJECT_0072,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_add_to_state_object_size");
     if arg.is_null() {
         note_refusal(&L9_REFUSALS.add_to_state_object_calc_bad_arg);
     }
@@ -855,6 +870,7 @@ unsafe extern "system" fn get_program_identifier(
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     _p_program_name: ddi12::LPCWSTR,
 ) -> ddi12::D3D12DDI_PROGRAM_IDENTIFIER_0108 {
+    ddi_time!("get_program_identifier");
     note_refusal(&L9_REFUSALS.program_identifier_absent);
     ddi12::D3D12DDI_PROGRAM_IDENTIFIER_0108 { OpaqueData: [0; 4] }
 }
@@ -876,6 +892,7 @@ unsafe extern "system" fn get_work_graph_memory_requirements(
     _p_program_name: ddi12::LPCWSTR,
     p_requirements: *mut ddi12::D3D12DDI_WORK_GRAPH_MEMORY_REQUIREMENTS_0108,
 ) {
+    ddi_time!("get_work_graph_memory_requirements");
     if p_requirements.is_null() {
         note_refusal(&L9_REFUSALS.work_graph_memory_bad_arg);
         return;
@@ -929,6 +946,7 @@ unsafe extern "system" fn set_background_processing_mode(
     measurements_action: ddi12::D3D12DDI_MEASUREMENTS_ACTION_0062,
     p_further_measurements_desired: *mut ddi12::BOOL,
 ) {
+    ddi_time!("set_background_processing_mode");
     if !p_further_measurements_desired.is_null() {
         // SAFETY: non-null per the check; the DDI declares it a writable `_Out_`
         // `BOOL*` the runtime owns for the duration of the call.
@@ -976,6 +994,7 @@ unsafe extern "system" fn implicit_shader_cache_control(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _flags: ddi12::D3D12DDI_IMPLICIT_SHADER_CACHE_CONTROL_FLAGS_0080,
 ) {
+    ddi_time!("implicit_shader_cache_control");
     note_refusal(&L9_REFUSALS.implicit_shader_cache_refused);
 }
 
@@ -1052,6 +1071,7 @@ const _: () = assert!(
 /// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
 /// typedef is.
 unsafe extern "system" fn set_marker(_h_list: ddi12::D3D12DDI_HCOMMANDLIST, _marker: ddi12::UINT64) {
+    ddi_time!("set_marker");
     note_refusal(&L9_REFUSALS.marker_dropped);
 }
 
@@ -1090,6 +1110,7 @@ unsafe extern "system" fn set_protected_resource_session(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
 ) {
+    ddi_time!("set_protected_resource_session");
     if h_session.pDrvPrivate.is_null() {
         note_refusal(&L9_REFUSALS.protected_resource_session_none);
         return;
@@ -1165,6 +1186,7 @@ unsafe extern "system" fn write_buffer_immediate(
     p_params: *const ddi12::D3D12DDI_WRITEBUFFERIMMEDIATE_PARAMETER_0032,
     p_modes: *const ddi12::D3D12DDI_WRITEBUFFERIMMEDIATE_MODE_0032,
 ) {
+    ddi_time!("write_buffer_immediate");
     // ⚠ The instrument the caps coherence needs: this slot should be unreachable
     // while `WriteBufferImmediateQueueFlags` reads NONE. Counted first, so that
     // it counts even the degenerate and refused arms below.
@@ -1306,6 +1328,7 @@ unsafe extern "system" fn set_view_instance_mask(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     mask: ddi12::UINT,
 ) {
+    ddi_time!("set_view_instance_mask");
     /// The only mask a single-view-instance device can be given: view instance 0
     /// enabled, nothing else.
     const SINGLE_VIEW_INSTANCE_MASK: ddi12::UINT = 1;
@@ -1342,6 +1365,7 @@ unsafe extern "system" fn initialize_meta_command(
     _p_parameters: *const c_void,
     _parameters_size: ddi12::SIZE_T,
 ) {
+    ddi_time!("initialize_meta_command");
     note_refusal(&L9_REFUSALS.meta_command_initialize_refused);
 }
 
@@ -1357,6 +1381,7 @@ unsafe extern "system" fn execute_meta_command(
     _p_parameters: *const c_void,
     _parameters_size: ddi12::SIZE_T,
 ) {
+    ddi_time!("execute_meta_command");
     note_refusal(&L9_REFUSALS.meta_command_execute_refused);
 }
 
@@ -1402,6 +1427,7 @@ unsafe extern "system" fn rs_set_shading_rate(
     shading_rate: ddi12::D3D12DDI_SHADING_RATE_0062,
     combiners: *const ddi12::D3D12DDI_SHADING_RATE_COMBINER_0062,
 ) {
+    ddi_time!("rs_set_shading_rate");
     // ⛔ **Which of the two conditions failed is tracked separately, because the
     // rate test SHORT-CIRCUITS the combiner scan and only one of them is ever
     // established.** On a coarse rate the loop below never runs and `combiners`
@@ -1470,6 +1496,7 @@ unsafe extern "system" fn rs_set_shading_rate_image(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_image: ddi12::D3D12DDI_HRESOURCE,
 ) {
+    ddi_time!("rs_set_shading_rate_image");
     if h_image.pDrvPrivate.is_null() {
         note_refusal(&L9_REFUSALS.shading_rate_image_none);
         return;
@@ -1515,6 +1542,7 @@ unsafe extern "system" fn dispatch_mesh(
     y: ddi12::UINT,
     z: ddi12::UINT,
 ) {
+    ddi_time!("dispatch_mesh");
     note_refusal(&L9_REFUSALS.dispatch_mesh_refused);
     if let Some(n) = budget(&CL_LOG) {
         log_error!(
@@ -1546,6 +1574,7 @@ unsafe extern "system" fn set_program(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     p_desc: *const ddi12::D3D12DDI_SET_PROGRAM_DESC_0108,
 ) {
+    ddi_time!("set_program");
     note_refusal(&L9_REFUSALS.set_program_refused);
     if let Some(n) = budget(&RT_LOG) {
         let kind = if p_desc.is_null() {
@@ -1576,6 +1605,7 @@ unsafe extern "system" fn dispatch_graph(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     p_desc: *const ddi12::D3D12DDI_DISPATCH_GRAPH_DESC_0108,
 ) {
+    ddi_time!("dispatch_graph");
     note_refusal(&L9_REFUSALS.dispatch_graph_refused);
     if let Some(n) = budget(&RT_LOG) {
         let mode = if p_desc.is_null() {

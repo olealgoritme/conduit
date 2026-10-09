@@ -194,8 +194,12 @@ test-utf8: test/utf8_extracted.inc test/test_utf8.c
 test-overlay: test/test_overlay.c nb_overlay.c nb_placeholder.c nb_overlay.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_overlay.c nb_overlay.c nb_placeholder.c -lm
 
-check: all test-utf8 test-overlay
+test-relacc: test/test_relacc.c nb_relacc.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_relacc.c
+
+check: all test-utf8 test-overlay test-relacc
 	./test-utf8
+	./test-relacc
 	./test-overlay
 	bash selftest.sh
 	python3 test/test_adopted_socket.py ./$(BIN)

@@ -22,6 +22,7 @@ pub mod nvidia;
 pub mod posture;
 pub mod replay;
 pub mod sandbox;
+pub mod scanout_presented;
 pub mod scanout_release;
 pub mod shm;
 pub mod shm_regions;

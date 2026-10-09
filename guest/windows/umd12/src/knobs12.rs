@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 22] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -316,6 +316,22 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
         ("Umd12PipelineLibrary", UMD12_PIPELINE_LIBRARY.get() as u32),
         // Appended. Clamped, as read by the ECL CPU wait.
         ("Nvk12EclSpinUs", nvk12_ecl_spin_us()),
+        // Appended.
+        ("Nvk12ScanoutFence", nvk12_scanout_fence() as u32),
+        // Appended. Clamped, as the worker reads it.
+        ("Nvk12WorkerSpinUs", nvk12_worker_spin_us()),
+        // Appended (diagnostic).
+        ("Nvk12AdmitAfterPresentOnly", nvk12_admit_after_present_only() as u32),
+        // Appended.
+        ("Nvk12EclFencePrefetch", nvk12_ecl_fence_prefetch() as u32),
+        // Appended.
+        ("Umd12ContextNode", umd12_context_node() as u32),
+        // Appended (probe).
+        ("Umd12FenceVaProbe", umd12_fence_va_probe() as u32),
+        // Appended (measurement).
+        ("Umd12DdiTimes", umd12_ddi_times() as u32),
+        ("Umd12WaitSplit", umd12_wait_split() as u32),
+        ("Umd12MergeEcl", umd12_merge_ecl() as u32),
     ]
 }
 
@@ -331,9 +347,9 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
 ///
 /// | value | meaning |
 /// |---:|---|
-/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. Falls back to 1 if the fence cannot be created. The default |
+/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. Falls back to 1 if the fence cannot be created |
 /// | 1 | CPU wait: ExecuteCommandLists returns only after its work completed (2 s cap per call, then it proceeds and counts a timeout) |
-/// | 2 | ECL fence: each ECL submits an `HE12` v4 record naming an RM fence the engine signals after the batch; the KMD withholds the packet's DMA completion until it fires. Nothing waits and batches pipeline. Needs NVK helios_icd_interface v7 and a KMD that takes RM fences in `HE12` v4 (`HELIOS_ICD_CAP_PRESENT_FENCE_KMD`); without them, and for a batch whose fence could not be made or whose Render is refused, it acts as 1 |
+/// | 2 | ECL fence: each ECL submits an `HE12` v4 record naming an RM fence the engine signals after the batch; the KMD withholds the packet's DMA completion until it fires. Nothing waits and batches pipeline. Needs NVK helios_icd_interface v7 and a KMD that takes RM fences in `HE12` v4 (`HELIOS_ICD_CAP_PRESENT_FENCE_KMD`); without them, and for a batch whose fence could not be made or whose Render is refused, it acts as 0. The default |
 ///
 /// Default 0 since 2026-10-08. 1 was the default from 2026-10-06, when 0
 /// deadlocked Basemark GPU DX12 after its first frame: the worker coalesced
@@ -342,7 +358,13 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
 /// signalled in order). Measured on 393.1 (Basemark DX12, 1920x1080 windowed,
 /// 3 loops): 1 = median frame 36.7 ms, CPUBusy 36.6 ms (20 ECLs a frame, each
 /// a ~0.85 ms CPU wait); 0 = median 22.65 ms, CPUBusy 17.9 ms, no deadlock.
-pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 0);
+///
+/// Default 2 since 2026-10-08 (399.1, same scene, 876 frames): 0 = frame
+/// 24.7 ms with 4.6 ms in Present (the scanout present's CPU wait); 2 = 21.4 ms
+/// with 67 us in Present (fenced scanout present). Mode 2 ran clean on 394.1,
+/// 395.1, 396.1 and 399.1 (no fallback batches, RmGErr 0). Its fallback is
+/// mode 0, so a device without ECL fences behaves as before.
+pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 2);
 
 /// `Nvk12Present` (or `HELIOS_NVK_PRESENT` in the process environment): 0 =
 /// automatic (DWM composes the back buffer from its NVK resource id when the
@@ -374,6 +396,124 @@ const MAX_ECL_SPIN_US: u32 = 50_000;
 /// The ECL CPU-wait poll budget in microseconds, clamped. See [`NVK12_ECL_SPIN_US`].
 pub(crate) fn nvk12_ecl_spin_us() -> u32 {
     NVK12_ECL_SPIN_US.get().min(MAX_ECL_SPIN_US)
+}
+
+/// `Nvk12ScanoutFence`: with `Nvk12EclSync=2`, a scanout present (scanout 0,
+/// `Nvk12Present`) hands the KMD (or a thread in NVK) a flip that waits for the
+/// frame's last ECL fence (`scanout_present_fenced`, helios_icd_interface v3)
+/// instead of waiting on the CPU for the queue before flipping. Absent = ON;
+/// 0 = the CPU wait, as before. Without an ECL fence value on the queue, or if
+/// the flip cannot be queued, the present waits on the CPU (counted).
+///
+/// ⚠ The flip now happens after Present returns, so the KMD may still show
+/// image P when DXGI hands it back for rendering (a torn frame at worst with
+/// two buffers; the scanout queue rule is three or more images).
+/// Read once per process.
+pub(crate) static NVK12_SCANOUT_FENCE: BoolKnob = BoolKnob::new(c"Nvk12ScanoutFence", true);
+
+pub(crate) fn nvk12_scanout_fence() -> bool {
+    NVK12_SCANOUT_FENCE.get()
+}
+
+/// `Nvk12WorkerSpinUs`: with `Nvk12EclSync=0`, how long the per-queue worker
+/// polls the engine's execution stream for a handed boundary before blocking
+/// (NVK's blocking wait sees completion only after the RM non-stall event is
+/// relayed from the host). The boundary it signals gates the admission of the
+/// queue's next batch, so this sits on the critical path once per
+/// ExecuteCommandLists. Default 0 (block at once, as before) until measured;
+/// clamped to [`MAX_ECL_SPIN_US`]. Costs up to that much of one core per
+/// boundary while polling. Read once per process.
+pub(crate) static NVK12_WORKER_SPIN_US: DwordKnob = DwordKnob::new(c"Nvk12WorkerSpinUs", 0);
+
+pub(crate) fn nvk12_worker_spin_us() -> u32 {
+    NVK12_WORKER_SPIN_US.get().min(MAX_ECL_SPIN_US)
+}
+
+/// ⛔ DIAGNOSTIC, never a default. `Nvk12AdmitAfterPresentOnly=1`: on NVK,
+/// only the first ExecuteCommandLists of each queue after a Present (or after
+/// queue creation) waits for the runtime admission event; every other batch
+/// is released to the engine at once. The context is still ordered behind
+/// every batch (the app's fence signals stay correct), but a batch no longer
+/// waits for runtime waits queued before it -- a cross-queue Wait or a
+/// flip-model buffer wait that is not right after a Present -- so an app that
+/// relies on those can race. What it measures: how much of the frame is the
+/// per-batch admission round trip (commit-to-admission ~1-2 ms on 398.1).
+/// Counter EclAdmissionSkipped. Read once per process.
+pub(crate) static NVK12_ADMIT_AFTER_PRESENT_ONLY: BoolKnob =
+    BoolKnob::new(c"Nvk12AdmitAfterPresentOnly", false);
+
+pub(crate) fn nvk12_admit_after_present_only() -> bool {
+    NVK12_ADMIT_AFTER_PRESENT_ONLY.get()
+}
+
+/// `Nvk12EclFencePrefetch` (`Nvk12EclSync=2`): after an ECL is admitted, make
+/// the queue's next ECL fence right away (vkd3d patch 0009,
+/// helios_vkd3d_prepare_ecl_fence), so the next ECL's HE12 v4 Render does not
+/// wait for the fence-create escape, a host round trip. Absent = ON; 0 = make
+/// each fence inline, as before. Read once per process.
+pub(crate) static NVK12_ECL_FENCE_PREFETCH: BoolKnob = BoolKnob::new(c"Nvk12EclFencePrefetch", true);
+
+pub(crate) fn nvk12_ecl_fence_prefetch() -> bool {
+    NVK12_ECL_FENCE_PREFETCH.get()
+}
+
+/// `Umd12ContextNode` (default 0): on NVK, D3D12 queue contexts ask for WDDM
+/// node 1, which the KMD reports with `D3d12Node=1` and completes independently
+/// of node 0 (DWM, D3D11, presents): a D3D12 batch held for its RM fence no
+/// longer waits behind a present, nor the desktop behind it. A refusal (one
+/// node) falls back to node 0, counted (QueueContextNodeRefused). Read once per
+/// process.
+pub(crate) static UMD12_CONTEXT_NODE: BoolKnob = BoolKnob::new(c"Umd12ContextNode", false);
+
+pub(crate) fn umd12_context_node() -> bool {
+    UMD12_CONTEXT_NODE.get()
+}
+
+/// `Umd12FenceVaProbe` (default 0; probe, no behaviour change): at device
+/// creation, create one monitored fence through the runtime's kernel callbacks
+/// and log the GPU virtual address dxgkrnl gives it (`nvk12::
+/// probe_monitored_fence_va`). Whether that is nonzero decides the first step of
+/// driver-backed fences (pfnSignalFence / pfnWaitForFence). Read once per
+/// process.
+pub(crate) static UMD12_FENCE_VA_PROBE: BoolKnob = BoolKnob::new(c"Umd12FenceVaProbe", false);
+
+pub(crate) fn umd12_fence_va_probe() -> bool {
+    UMD12_FENCE_VA_PROBE.get()
+}
+
+/// `Umd12DdiTimes` (default 0; measurement): every forwarding DDI adds its
+/// wall time and call count to a per-DDI total (`ddi_time.rs`), and each
+/// frame-time window logs the eight DDIs with the most time per frame. Off:
+/// one relaxed load per DDI call. Read once per process.
+pub(crate) static UMD12_DDI_TIMES: BoolKnob = BoolKnob::new(c"Umd12DdiTimes", false);
+
+#[inline]
+pub(crate) fn umd12_ddi_times() -> bool {
+    UMD12_DDI_TIMES.get()
+}
+
+/// `Umd12WaitSplit` (default 0; measurement): split the presenting thread's
+/// frame into time in this driver's DDIs (on and off the CPU, by blocking DDI)
+/// and time outside it, on and off the CPU (`wait_split.rs`), every 256
+/// frames. Read once per process.
+pub(crate) static UMD12_WAIT_SPLIT: BoolKnob = BoolKnob::new(c"Umd12WaitSplit", false);
+
+#[inline]
+pub(crate) fn umd12_wait_split() -> bool {
+    UMD12_WAIT_SPLIT.get()
+}
+
+/// `Umd12MergeEcl` (default 0; DIAGNOSTIC, unsafe for applications that
+/// signal or wait between ExecuteCommandLists): with `Nvk12EclSync=2`, hold
+/// each ECL's HE12 v4 packet and let the next ECL's fence stand for it, so one
+/// packet completes a run of ECLs (`queue.rs` `MergePending`). Measures what
+/// fewer packets per frame would give; see the type's docs for why it cannot
+/// be made safe without driver-backed fences. Read once per process.
+pub(crate) static UMD12_MERGE_ECL: BoolKnob = BoolKnob::new(c"Umd12MergeEcl", false);
+
+#[inline]
+pub(crate) fn umd12_merge_ecl() -> bool {
+    UMD12_MERGE_ECL.get()
 }
 
 pub(crate) fn nvk12_ecl_sync() -> u32 {

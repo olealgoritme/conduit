@@ -10,7 +10,7 @@
 //! has no RM-fence boundary yet (S4), and an `HE12` record without a stream is
 //! refused at Render. So this driver orders the context itself:
 //!
-//! * **Monitored fence** (`Nvk12EclSync=0`, the default). Each queue owns one
+//! * **Monitored fence** (`Nvk12EclSync=0`, and mode 2's fallback). Each queue owns one
 //!   WDDM monitored fence created through the kernel callbacks. Every NVK
 //!   boundary appends, on the queue's own context, the runtime admission event
 //!   (exactly as on Venus) followed by a GPU wait for the fence to reach the
@@ -27,14 +27,14 @@
 //!   timeouts for `Nvk12EclSpinUs` (default 2 ms): NVK's own blocking wait
 //!   costs at least a Windows timer tick, once per ECL.
 //!
-//! * **ECL fence** (`Nvk12EclSync=2`). Each ExecuteCommandLists submits an
+//! * **ECL fence** (`Nvk12EclSync=2`, the default). Each ExecuteCommandLists submits an
 //!   `HE12` v4 Render record naming an RM fence the engine reserved for the
 //!   batch (NVK helios_icd_interface v7 `ecl_fence_*`, vkd3d patch 0004), then
 //!   queues the admission event exactly as on Venus. The KMD withholds the
 //!   packet's DMA completion until the fence fires, which the engine's worker
 //!   signals right after the batch. Nothing waits, and the next batch is
 //!   admitted at once (the packet is submitted, not completed). A batch that
-//!   gets no fence, or whose Render is refused, takes the CPU-wait arm.
+//!   gets no fence, or whose Render is refused, takes the monitored-fence arm.
 //!
 //! The order on the context matters: admission first (it only fires once the
 //! runtime's earlier waits are satisfied, and the engine worker waits for it),
@@ -71,7 +71,19 @@ const ECL_WAIT_LOG_EVERY: u64 = 4096;
 /// # Safety
 /// `engine_queue` is the live engine queue.
 unsafe fn spin_wait(engine_queue: usize, value: u64) -> Option<Result<bool, ddi12::HRESULT>> {
-    let budget_us = crate::knobs12::nvk12_ecl_spin_us();
+    // SAFETY: forwarded precondition.
+    unsafe { spin_wait_for(engine_queue, value, crate::knobs12::nvk12_ecl_spin_us()) }
+}
+
+/// [`spin_wait`] with an explicit budget (microseconds; 0 = no polling).
+///
+/// # Safety
+/// `engine_queue` is the live engine queue.
+unsafe fn spin_wait_for(
+    engine_queue: usize,
+    value: u64,
+    budget_us: u32,
+) -> Option<Result<bool, ddi12::HRESULT>> {
     if budget_us == 0 {
         return None;
     }
@@ -221,6 +233,65 @@ pub(crate) fn close_unused_fence(dev: &device12::HeliosD3D12Device, fence: crate
     dev.engine.nvk_rm_fence_close(fence.handle);
 }
 
+/// The engine's admission and producer-signal counters (every mode, NVK), and
+/// GPU execution time per batch when the engine measures it
+/// (`HELIOS_VKD3D_GPU_TIMESTAMPS=1`). `frames` = frames so far, for per-frame
+/// figures.
+fn log_engine_timing(frames: u64) {
+    let st = crate::bridge12::ecl_fence_stats();
+    let admits = st[14];
+    if admits != 0 {
+        log_error!(
+            "vkd3d batches: {admits} admitted, commit-to-admission avg {} us, hist <50us {} <200us {} \
+             <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {}; ECL fence admission-to-signal avg {} us; \
+             producer signal inline {} separate {}; ECL fences made ahead {} taken {}",
+            st[15] / admits,
+            st[16],
+            st[17],
+            st[18],
+            st[19],
+            st[20],
+            st[21],
+            st[22],
+            if st[0] != 0 { st[23] / st[0] } else { 0 },
+            st[24],
+            st[25],
+            st[26],
+            st[27],
+        );
+    }
+    let gt = crate::bridge12::gpu_time_stats();
+    let batches = gt[0];
+    if batches != 0 {
+        let f = frames.max(1);
+        log_error!(
+            "GPU timestamps: {batches} batches ({} not read), busy avg {} us/batch ({} us/frame), max {} us; \
+             idle gap before a batch avg {} us ({} us/frame); busy hist <50us {} <200us {} <1ms {} <2ms {} \
+             <5ms {} <20ms {} >=20ms {}; gap hist <50us {} <200us {} <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {}",
+            gt[4],
+            gt[1] / batches / 1000,
+            gt[1] / f / 1000,
+            gt[3] / 1000,
+            gt[2] / batches / 1000,
+            gt[2] / f / 1000,
+            gt[5],
+            gt[6],
+            gt[7],
+            gt[8],
+            gt[9],
+            gt[10],
+            gt[11],
+            gt[12],
+            gt[13],
+            gt[14],
+            gt[15],
+            gt[16],
+            gt[17],
+            gt[18],
+        );
+    }
+}
+
 /// The engine's ECL fence counters as one line (mode 2 only).
 fn log_ecl_fence_stats() {
     if crate::knobs12::nvk12_ecl_sync() != 2 {
@@ -336,6 +407,10 @@ struct FrameSums {
     draws: u64,
     barrier_ns: u64,
     barriers: u64,
+    /// CPU time (kernel + user) of the presenting thread and of the whole
+    /// process during the frame.
+    present_thread_cpu_ns: u64,
+    process_cpu_ns: u64,
 }
 
 impl FrameSums {
@@ -352,6 +427,8 @@ impl FrameSums {
         draws: 0,
         barrier_ns: 0,
         barriers: 0,
+        present_thread_cpu_ns: 0,
+        process_cpu_ns: 0,
     };
 
     fn add(&mut self, o: &Self) {
@@ -367,6 +444,8 @@ impl FrameSums {
         self.draws += o.draws;
         self.barrier_ns += o.barrier_ns;
         self.barriers += o.barriers;
+        self.present_thread_cpu_ns += o.present_thread_cpu_ns;
+        self.process_cpu_ns += o.process_cpu_ns;
     }
 
     fn log(&self, what: &str) {
@@ -376,7 +455,7 @@ impl FrameSums {
         log_error!(
             "D3D12 frame time ({what}, {} frames): frame {} us = ECL {} us ({} calls, of which \
              CPU wait {} us) + Present {} us + outside the driver's queue DDIs {} us; recording \
-             {} us in {} lists (Reset to Close, all threads), of which draws {} us ({}) and \
+             {} us in {} lists (Reset to Close, all threads), of which draws {} us ({}, 1 in 16 timed) and \
              barriers {} us ({})",
             self.frames,
             per(self.frame_ns),
@@ -392,20 +471,72 @@ impl FrameSums {
             per(self.barrier_ns),
             self.barriers / f,
         );
+        // Wall frame vs CPU: what the presenting thread did not spend on the
+        // CPU it spent waiting (a fence, the GPU, a lock); the process figure
+        // is every thread's CPU (recording threads included).
+        log_error!(
+            "D3D12 frame CPU ({what}): presenting thread {} us/frame on the CPU of a {} us frame \
+             ({} us/frame not on the CPU), whole process {} us/frame",
+            per(self.present_thread_cpu_ns),
+            per(self.frame_ns),
+            per(self.frame_ns.saturating_sub(self.present_thread_cpu_ns)),
+            per(self.process_cpu_ns),
+        );
     }
 }
 
 struct FrameAcc {
     last_present_end: Option<Instant>,
+    /// CPU times (100 ns) at the last present: the presenting thread, the
+    /// process.
+    last_thread_cpu: u64,
+    last_process_cpu: u64,
     window: FrameSums,
     total: FrameSums,
+}
+
+/// CPU time (kernel + user, 100 ns units) of the calling thread and of the
+/// process.
+fn cpu_times_100ns() -> (u64, u64) {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, GetProcessTimes, GetThreadTimes,
+    };
+    let ft = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: pseudo-handles of this thread and process; all four out-pointers
+    // are writable locals.
+    let thread = unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) }
+        .map_or(0, |_| ft(k) + ft(u));
+    let (mut c2, mut e2, mut k2, mut u2) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: as above.
+    let process = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c2, &mut e2, &mut k2, &mut u2) }
+        .map_or(0, |_| ft(k2) + ft(u2));
+    (thread, process)
+}
+
+/// `Umd12DdiTimes`: the five DDIs with the most CPU time in the window.
+fn log_ddi_times(frames: u64) {
+    if !crate::knobs12::umd12_ddi_times() {
+        return;
+    }
+    let f = frames.max(1);
+    let mut line = String::new();
+    for (name, ns, calls) in crate::ddi_time::take_top(8) {
+        line.push_str(&format!(" {name} {} us/frame ({} calls/frame, {} ns each);", ns / f / 1000, calls / f, ns / calls.max(1)));
+    }
+    log_error!("D3D12 DDI time (top 8 by time):{line}");
 }
 
 fn ns_of(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// One draw in this many is timed (`FrameStats::draw_start`).
+const DRAW_SAMPLE: u32 = 16;
+
 std::thread_local! {
+    static DRAW_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Command lists this thread is recording, with their Reset time.
     static OPEN_LISTS: std::cell::RefCell<Vec<(usize, Instant)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -448,8 +579,25 @@ impl FrameStats {
         }
     }
 
-    pub(crate) fn note_draw(&self, elapsed: Duration) {
-        self.draw_ns.fetch_add(ns_of(elapsed), Ordering::Relaxed);
+    /// The start of a draw's engine call, timed for one draw in
+    /// `DRAW_SAMPLE` per thread: two `Instant`s on every one of ~50,000 draws a
+    /// frame were ~1 ms of recording CPU a frame for a statistic.
+    #[inline]
+    pub(crate) fn draw_start(&self) -> Option<Instant> {
+        DRAW_TICK.with(|t| {
+            let n = t.get();
+            t.set(n.wrapping_add(1));
+            (n % DRAW_SAMPLE == 0).then(Instant::now)
+        })
+    }
+
+    /// A draw done; `started` from [`Self::draw_start`] (scaled up by the
+    /// sampling rate when it timed this one).
+    #[inline]
+    pub(crate) fn note_draw(&self, started: Option<Instant>) {
+        if let Some(t) = started {
+            self.draw_ns.fetch_add(ns_of(t.elapsed()) * u64::from(DRAW_SAMPLE), Ordering::Relaxed);
+        }
         self.draws.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -460,6 +608,7 @@ impl FrameStats {
 
     /// Close a frame: `started` is the Present DDI's entry.
     pub(crate) fn note_present(&self, started: Instant) {
+        crate::wait_split::on_present();
         let now = Instant::now();
         let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
         let mut frame = FrameSums {
@@ -475,11 +624,18 @@ impl FrameStats {
             draws: take(&self.draws),
             barrier_ns: take(&self.barrier_ns),
             barriers: take(&self.barriers),
+            present_thread_cpu_ns: 0,
+            process_cpu_ns: 0,
         };
+        let (thread_cpu, process_cpu) = cpu_times_100ns();
         let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner());
+        let last_thread = core::mem::replace(&mut acc.last_thread_cpu, thread_cpu);
+        let last_process = core::mem::replace(&mut acc.last_process_cpu, process_cpu);
         let Some(last) = acc.last_present_end.replace(now) else {
             return; // the first present only opens a frame
         };
+        frame.present_thread_cpu_ns = thread_cpu.saturating_sub(last_thread) * 100;
+        frame.process_cpu_ns = process_cpu.saturating_sub(last_process) * 100;
         frame.frame_ns = ns_of(now - last);
         acc.window.add(&frame);
         acc.total.add(&frame);
@@ -491,7 +647,10 @@ impl FrameStats {
         let total_frames = acc.total.frames;
         drop(acc);
         window.log(&format!("last frames, {total_frames} so far"));
+        log_ddi_times(window.frames);
+        super::queue::log_merge_stats(window.frames);
         log_ecl_fence_stats();
+        log_engine_timing(total_frames);
         // After the first frame and every 2048 frames: placement barely moves.
         if total_frames == 1 || total_frames % (8 * FRAME_LOG_EVERY) == 0 {
             log_memory_placement();
@@ -504,6 +663,7 @@ impl FrameStats {
         if total.frames != 0 {
             total.log("totals");
             log_ecl_fence_stats();
+            log_engine_timing(total.frames);
             log_memory_placement();
         }
     }
@@ -521,9 +681,69 @@ pub(crate) static FRAME_STATS: FrameStats = FrameStats {
     barriers: AtomicU64::new(0),
     acc: Mutex::new(FrameAcc {
         last_present_end: None,
+        last_thread_cpu: 0,
+        last_process_cpu: 0,
         window: FrameSums::ZERO,
         total: FrameSums::ZERO,
     }),
+};
+
+/// Mode 0 worker timing: how long each boundary took to be seen after it was
+/// handed over (GPU execution plus the event relay) and how long the CPU
+/// signal of the monitored fence took, logged every 4096 boundaries.
+struct WorkerStats {
+    n: AtomicU64,
+    wait_ns: AtomicU64,
+    signal_ns: AtomicU64,
+    polled: AtomicU64,
+    signal_buckets: [AtomicU64; ECL_WAIT_BUCKETS_US.len() + 1],
+}
+
+impl WorkerStats {
+    fn record(&self, waited: Duration, signal: Duration, polled: bool) {
+        let w = ns_of(waited);
+        let sg = ns_of(signal);
+        self.wait_ns.fetch_add(w, Ordering::Relaxed);
+        self.signal_ns.fetch_add(sg, Ordering::Relaxed);
+        if polled {
+            self.polled.fetch_add(1, Ordering::Relaxed);
+        }
+        let us = sg / 1000;
+        let b = ECL_WAIT_BUCKETS_US
+            .iter()
+            .position(|&bound| us < bound)
+            .unwrap_or(ECL_WAIT_BUCKETS_US.len());
+        self.signal_buckets[b].fetch_add(1, Ordering::Relaxed);
+        let n = self.n.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 4096 == 0 {
+            let sb: [u64; ECL_WAIT_BUCKETS_US.len() + 1] =
+                core::array::from_fn(|i| self.signal_buckets[i].load(Ordering::Relaxed));
+            log_error!(
+                "NVK ECL worker: {n} boundaries, handed-to-seen avg {} us ({} seen by polling, \
+                 Nvk12WorkerSpinUs={}), CPU signal avg {} us, signal hist <50us {} <200us {} <1ms {} \
+                 <2ms {} <5ms {} <20ms {} >=20ms {}",
+                self.wait_ns.load(Ordering::Relaxed) / n / 1000,
+                self.polled.load(Ordering::Relaxed),
+                crate::knobs12::nvk12_worker_spin_us(),
+                self.signal_ns.load(Ordering::Relaxed) / n / 1000,
+                sb[0],
+                sb[1],
+                sb[2],
+                sb[3],
+                sb[4],
+                sb[5],
+                sb[6],
+            );
+        }
+    }
+}
+
+static WORKER_STATS: WorkerStats = WorkerStats {
+    n: AtomicU64::new(0),
+    wait_ns: AtomicU64::new(0),
+    signal_ns: AtomicU64::new(0),
+    polled: AtomicU64::new(0),
+    signal_buckets: [const { AtomicU64::new(0) }; ECL_WAIT_BUCKETS_US.len() + 1],
 };
 
 /// The worker's wait slice: it rechecks its stop flag this often.
@@ -587,9 +807,11 @@ impl NvkSync {
     /// is; the engine queue outlives this value (the queue drops it first).
     pub(crate) unsafe fn new(dev: &device12::HeliosD3D12Device, engine_queue: usize) -> Self {
         let mode = crate::knobs12::nvk12_ecl_sync();
-        if mode != 0 {
-            // Mode 2 orders batches with ECL fences (`nvk_complete_fenced`);
-            // this arm is its fallback for a batch that got none.
+        // Mode 2 orders batches with ECL fences (`nvk_complete_fenced`); this
+        // object is its fallback for a batch that got none, and that fallback
+        // is the monitored-fence arm (mode 0), never the CPU wait: a device
+        // without ECL fences (an older NVK or KMD) runs exactly as mode 0.
+        if mode == 1 {
             note_refusal(&NVK_REFUSALS.cpu_wait_arm);
             log_error!("NVK ECL sync: CPU wait arm (Nvk12EclSync={mode})");
             return Self { fence: None };
@@ -676,6 +898,58 @@ impl NvkSync {
     }
 }
 
+/// Driver-backed fences, probe 1 (`Umd12FenceVaProbe`): create one monitored
+/// fence through the runtime's kernel callbacks, log the CPU and GPU virtual
+/// addresses dxgkrnl gives it, and destroy it. A GPU VA of 0 means this adapter
+/// does not map monitored fences into the GPU address space, so the D3D12
+/// runtime cannot hand fence placements to CreateFence (and so never calls
+/// pfnSignalFence / pfnWaitForFence); a nonzero one moves the question to what
+/// the runtime itself requires.
+///
+/// # Safety
+/// `dev` is a live device.
+pub(crate) unsafe fn probe_monitored_fence_va(dev: &device12::HeliosD3D12Device) {
+    if dev.kt_callbacks.is_null() {
+        return;
+    }
+    // SAFETY: the device keeps its runtime-owned callback table alive.
+    let kt = unsafe { &*dev.kt_callbacks };
+    let (Some(create_cb), Some(destroy_cb)) =
+        (kt.pfnCreateSynchronizationObject2Cb, kt.pfnDestroySynchronizationObjectCb)
+    else {
+        log_error!("Fence VA probe: no CreateSynchronizationObject2 / Destroy callback");
+        return;
+    };
+    // SAFETY: zero is valid for this plain C struct.
+    let mut args: ddi12::D3DDDICB_CREATESYNCHRONIZATIONOBJECT2 = unsafe { core::mem::zeroed() };
+    args.Info.Type = ddi12::_D3DDDI_SYNCHRONIZATIONOBJECT_TYPE_D3DDDI_MONITORED_FENCE;
+    // SAFETY: runtime callback, runtime device handle, live args.
+    let hr = unsafe { create_cb(dev.h_rt_device.handle, &mut args) };
+    // SAFETY: the monitored-fence arm, filled by the callback on success.
+    let (cpu, gpu) = unsafe {
+        (
+            args.Info.__bindgen_anon_1.MonitoredFence.FenceValueCPUVirtualAddress,
+            args.Info.__bindgen_anon_1.MonitoredFence.FenceValueGPUVirtualAddress,
+        )
+    };
+    log_error!(
+        "Fence VA probe: CreateSynchronizationObject2(monitored fence) hr={:#010x} handle={:#x} \
+         CPU VA {:p} GPU VA {:#x}{}",
+        hr as u32,
+        args.hSyncObject,
+        cpu,
+        gpu,
+        if gpu == 0 { " -- no GPU mapping: the runtime cannot place D3D12 fences" } else { "" },
+    );
+    if hr >= 0 && args.hSyncObject != 0 {
+        // SAFETY: zero is valid for this plain C struct.
+        let mut d: ddi12::D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT = unsafe { core::mem::zeroed() };
+        d.hSyncObject = args.hSyncObject;
+        // SAFETY: runtime callback, runtime device, the object created above.
+        let _ = unsafe { destroy_cb(dev.h_rt_device.handle, &d) };
+    }
+}
+
 impl FenceArm {
     unsafe fn create(dev: &device12::HeliosD3D12Device, engine_queue: usize) -> Option<Self> {
         if dev.kt_callbacks.is_null() {
@@ -710,7 +984,14 @@ impl FenceArm {
             .name("helios-nvk12-ecl".into())
             .spawn(move || worker_main(engine_queue, target, rx, worker_stop))
             .ok()?;
-        log_error!("NVK ECL sync: monitored fence {:#x}, worker started", target.fence);
+        log_error!(
+            "NVK ECL sync: monitored fence {:#x} (CPU VA {:p}, GPU VA {:#x}), worker started",
+            target.fence,
+            // SAFETY: the union arm CreateSynchronizationObject2 filled for a
+            // monitored fence.
+            unsafe { args.Info.__bindgen_anon_1.MonitoredFence.FenceValueCPUVirtualAddress },
+            unsafe { args.Info.__bindgen_anon_1.MonitoredFence.FenceValueGPUVirtualAddress },
+        );
         Some(Self {
             target,
             tx: Mutex::new(Some(tx)),
@@ -810,7 +1091,18 @@ fn worker_main(engine_queue: usize, target: SignalTarget, rx: Receiver<u64>, sto
         if value <= signalled {
             continue;
         }
+        let started = Instant::now();
+        // `Nvk12WorkerSpinUs`: poll the execution stream before blocking, so
+        // the boundary is seen without NVK's event relay (host interrupt,
+        // event forwarding, thread wake), which sits on the admission chain of
+        // the next batch.
+        // SAFETY: the queue joins this worker before releasing its engine queue.
+        let polled = unsafe { spin_wait_for(engine_queue, value, crate::knobs12::nvk12_worker_spin_us()) };
+        let mut engine_error = matches!(polled, Some(Err(_)));
         loop {
+            if polled.is_some() {
+                break;
+            }
             // SAFETY: the queue joins this worker before releasing its engine queue.
             match unsafe { crate::bridge12::wait_execution(engine_queue, value, WORKER_SLICE_NS) } {
                 Ok(true) => break,
@@ -820,6 +1112,7 @@ fn worker_main(engine_queue: usize, target: SignalTarget, rx: Receiver<u64>, sto
                     }
                 }
                 Err(hr) => {
+                    engine_error = true;
                     note_refusal(&NVK_REFUSALS.worker_engine_error);
                     if let Some(k) = NVK_LOG.first_n_then_every(16, 4096) {
                         log_error!(
@@ -832,7 +1125,13 @@ fn worker_main(engine_queue: usize, target: SignalTarget, rx: Receiver<u64>, sto
                 }
             }
         }
+        if engine_error && polled.is_some() {
+            note_refusal(&NVK_REFUSALS.worker_engine_error);
+        }
+        let waited = started.elapsed();
+        let signal_started = Instant::now();
         let hr = target.signal(value);
+        WORKER_STATS.record(waited, signal_started.elapsed(), polled.is_some());
         if hr < 0 {
             note_refusal(&NVK_REFUSALS.cpu_signal_failed);
             if let Some(k) = NVK_LOG.first_n_then_every(16, 4096) {

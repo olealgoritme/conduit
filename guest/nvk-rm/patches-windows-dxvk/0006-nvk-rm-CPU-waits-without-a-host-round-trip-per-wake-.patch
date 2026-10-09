@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 23:29:48 +0200
+Subject: [PATCH] nvk/rm: CPU waits without a host round trip per wake; CPU
+ signals wake waiters
+
+Every wake of a CPU wait on the non-stall event was followed by
+crm_event_drain, i.e. NV_ESC_RM_GET_EVENT_DATA: on Windows a synchronous
+escape to the host (~60-100 us; README: 10.4 per frame in Heaven, ~1 ms
+of waiting per frame). NVK allocates that event with
+NV01_EVENT_WITHOUT_EVENT_DATA, and RM queues no data for a dataless event
+(nv_post_event only sets dataless_event_pending, which poll() clears; the
+read always answers "nothing queued"), so the read never found anything.
+It is skipped now for a dataless event; NVK_RM_EVENT_DRAIN=1 reads as
+before. The value in memory still decides; the event is only a wake.
+
+A CPU-side store raises no GPU interrupt, so a thread blocked on the event
+saw it only at the next GPU interrupt or after NVK_RM_WAIT_POLL_MS (10 ms):
+a host signal (vkSignalSemaphore, a CPU-signalled D3D12 fence in
+vkd3d-proton), and the value a VK_SYNC_WAIT_PENDING waiter (the runtime's
+submit thread under wait-before-signal) waits for. Waiters now register
+around their wait loop (before the first read of the value), and a host
+signal, or a submit that raises a pending value while a PENDING waiter
+exists, signals the process's wait handle through librmclient's new
+crm_win_event_kick (no KMD call). NVK_RM_CPU_KICK=0 turns it off; an older
+librmclient without the export behaves as before.
+
+NVK_RM_WAIT_SPIN_US=N (default 0, at most 2000): poll the value for N us
+with pause instructions before blocking, instead of NVK_RM_WAIT_SPIN
+thrd_yield calls, for measuring the wake latency of the event path (~140
+us host event round trip) against spinning.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  30 +++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  | 130 +++++++++++++++++---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c |  40 ++++--
+ 4 files changed, 178 insertions(+), 23 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 77e6424..490b9e2 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -142,6 +142,12 @@ struct nvkmd_rm_lib {
+     * restart).  NULL with an older library.
+     */
+    int32_t (*win_loss_epoch)(void);
++   /* Signals this process's wait handle for event channel event_fd, with
++    * no KMD call, so a CPU-side signal wakes CPU waiters blocked in
++    * event_wait (librmclient crm_win_event_kick).  NULL with an older
++    * library.
++    */
++   int (*win_event_kick)(int event_fd);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -250,6 +256,18 @@ struct nvkmd_rm_dev {
+    int nonstall_fd;
+    /* Set once draining the event failed: poll() is useless then */
+    bool nonstall_undrainable;
++   /* The event carries no data (NV01_EVENT_WITHOUT_EVENT_DATA): there is
++    * nothing for NV_ESC_RM_GET_EVENT_DATA to read, so a wake is not
++    * drained (NVK_RM_EVENT_DRAIN=1 drains anyway).
++    */
++   bool nonstall_dataless;
++   /* Threads in a CPU wait loop (nvkmd_rm_wait_begin()): all of them, and
++    * those waiting for a signal to be submitted (VK_SYNC_WAIT_PENDING),
++    * which only a CPU-side store satisfies.  A CPU signal or a submit
++    * that marks a value pending kicks the event when someone waits.
++    */
++   uint32_t cpu_waiters;
++   uint32_t pending_waiters;
+ 
+    /* Open nvidia-drm node for dma-buf export/import, -1 if none.  On
+     * Windows: the host render node scanout memory is imported on, opened on
+@@ -784,6 +802,18 @@ void nvkmd_rm_sync_mark_pending(struct nvkmd_rm_sync *sync, uint64_t value);
+ VkResult nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+                             uint64_t abs_timeout_ns);
+ 
++/* Brackets a CPU wait loop (before its first check of the value) so a
++ * CPU-side signal knows to kick the event; pending: the loop waits for
++ * VK_SYNC_WAIT_PENDING.  dev may be NULL.
++ */
++void nvkmd_rm_wait_begin(struct nvkmd_rm_dev *dev, bool pending);
++void nvkmd_rm_wait_end(struct nvkmd_rm_dev *dev, bool pending);
++
++/* Wakes CPU waiters after a CPU-side store (a host signal, or a pending
++ * value a VK_SYNC_WAIT_PENDING waiter may be waiting for).
++ */
++void nvkmd_rm_kick_cpu_waiters(struct nvkmd_rm_dev *dev, bool pending_only);
++
+ /* Waits on the CPU until *value >= wait_value or the timeout expires */
+ VkResult nvkmd_rm_wait_value(struct nvkmd_rm_dev *dev,
+                              volatile uint64_t *value, uint64_t wait_value,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index f6f51f4..56ae08a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -114,6 +114,7 @@ nvkmd_rm_dev_init_nonstall_event(struct nvkmd_rm_dev *dev)
+    }
+ 
+    dev->nonstall_fd = fd;
++   dev->nonstall_dataless = (notify & NV01_EVENT_WITHOUT_EVENT_DATA) != 0;
+ }
+ 
+ VkResult
+@@ -336,9 +337,20 @@ nvkmd_rm_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+ #define NVKMD_RM_WAIT_SPIN_ITERS_DEFAULT 64
+ #define NVKMD_RM_WAIT_POLL_MS_DEFAULT    10
+ 
+-/* Tuning/experiments: NVK_RM_WAIT_SPIN (yield iterations before blocking) and
+- * NVK_RM_WAIT_POLL_MS (longest single block on the event). */
++/* Tuning/experiments: NVK_RM_WAIT_SPIN (yield iterations before blocking),
++ * NVK_RM_WAIT_POLL_MS (longest single block on the event),
++ * NVK_RM_WAIT_SPIN_US (when set: poll the value for that many microseconds
++ * with a pause between reads instead of the yields, up to 2000),
++ * NVK_RM_EVENT_DRAIN (1: read the event's data after every wake, as before;
++ * the default skips it for an event without data, where the read is a
++ * synchronous host round trip that finds nothing: ~60-100 us per wake on
++ * Windows, ~10 wakes per frame in a D3D11 game) and NVK_RM_CPU_KICK (0: a
++ * CPU-side signal does not wake event waiters; they find it at the next
++ * GPU interrupt or after NVK_RM_WAIT_POLL_MS).
++ */
+ static uint32_t nvkmd_rm_wait_spin_iters, nvkmd_rm_wait_poll_ms;
++static uint32_t nvkmd_rm_wait_spin_us;
++static bool nvkmd_rm_event_drain, nvkmd_rm_cpu_kick;
+ static void
+ nvkmd_rm_wait_params_init(void)
+ {
+@@ -346,9 +358,81 @@ nvkmd_rm_wait_params_init(void)
+       debug_get_num_option("NVK_RM_WAIT_SPIN", NVKMD_RM_WAIT_SPIN_ITERS_DEFAULT);
+    nvkmd_rm_wait_poll_ms =
+       MAX2(1, debug_get_num_option("NVK_RM_WAIT_POLL_MS", NVKMD_RM_WAIT_POLL_MS_DEFAULT));
++   nvkmd_rm_wait_spin_us =
++      MIN2(debug_get_num_option("NVK_RM_WAIT_SPIN_US", 0), 2000);
++   nvkmd_rm_event_drain = debug_get_bool_option("NVK_RM_EVENT_DRAIN", false);
++   nvkmd_rm_cpu_kick = debug_get_bool_option("NVK_RM_CPU_KICK", true);
++   if (nvkmd_rm_wait_spin_us || nvkmd_rm_event_drain || !nvkmd_rm_cpu_kick)
++      mesa_logi("NVK: CPU waits: spin %u us, event drain %d, CPU kick %d",
++                nvkmd_rm_wait_spin_us, nvkmd_rm_event_drain,
++                nvkmd_rm_cpu_kick);
+ }
+ #define NVKMD_RM_WAIT_SPIN_ITERS nvkmd_rm_wait_spin_iters
+ #define NVKMD_RM_WAIT_POLL_MS    nvkmd_rm_wait_poll_ms
++static once_flag nvkmd_rm_wait_params_once = ONCE_FLAG_INIT;
++#define NVKMD_RM_WAIT_PARAMS() \
++   call_once(&nvkmd_rm_wait_params_once, nvkmd_rm_wait_params_init)
++
++static inline void
++nvkmd_rm_cpu_relax(void)
++{
++#if defined(__x86_64__) || defined(__i386__)
++   __builtin_ia32_pause();
++#endif
++}
++
++/* One microsecond of polling-friendly busy wait: the caller re-reads the
++ * value between steps.
++ */
++static void
++nvkmd_rm_spin_1us(void)
++{
++   const uint64_t end = os_time_get_nano() + 1000;
++   do {
++      for (int i = 0; i < 16; i++)
++         nvkmd_rm_cpu_relax();
++   } while (os_time_get_nano() < end);
++}
++
++void
++nvkmd_rm_wait_begin(struct nvkmd_rm_dev *dev, bool pending)
++{
++   if (dev == NULL)
++      return;
++   /* Sequentially consistent, before the waiter's first read of the value:
++    * a signaller that stores the value and then reads the count either
++    * sees this waiter or is seen by its read.
++    */
++   p_atomic_inc(&dev->cpu_waiters);
++   if (pending)
++      p_atomic_inc(&dev->pending_waiters);
++   __atomic_thread_fence(__ATOMIC_SEQ_CST);
++}
++
++void
++nvkmd_rm_wait_end(struct nvkmd_rm_dev *dev, bool pending)
++{
++   if (dev == NULL)
++      return;
++   if (pending)
++      p_atomic_dec(&dev->pending_waiters);
++   p_atomic_dec(&dev->cpu_waiters);
++}
++
++void
++nvkmd_rm_kick_cpu_waiters(struct nvkmd_rm_dev *dev, bool pending_only)
++{
++   if (dev == NULL || dev->nonstall_fd < 0 || dev->lib->win_event_kick == NULL)
++      return;
++   NVKMD_RM_WAIT_PARAMS();
++   if (!nvkmd_rm_cpu_kick)
++      return;
++   __atomic_thread_fence(__ATOMIC_SEQ_CST);
++   const uint32_t n = pending_only ? p_atomic_read(&dev->pending_waiters)
++                                   : p_atomic_read(&dev->cpu_waiters);
++   if (n != 0)
++      dev->lib->win_event_kick(dev->nonstall_fd);
++}
+ 
+ VkResult
+ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+@@ -365,11 +449,15 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+ 
+    const uint64_t remaining_ns = abs_timeout_ns - now;
+ 
+-   static once_flag params_once = ONCE_FLAG_INIT;
+-   call_once(&params_once, nvkmd_rm_wait_params_init);
++   NVKMD_RM_WAIT_PARAMS();
+ 
+-   if (*iter < NVKMD_RM_WAIT_SPIN_ITERS) {
+-      thrd_yield();
++   const uint32_t spin_iters = nvkmd_rm_wait_spin_us ? nvkmd_rm_wait_spin_us
++                                                     : NVKMD_RM_WAIT_SPIN_ITERS;
++   if (*iter < spin_iters) {
++      if (nvkmd_rm_wait_spin_us)
++         nvkmd_rm_spin_1us();
++      else
++         thrd_yield();
+    } else if (dev != NULL && dev->nonstall_fd >= 0 &&
+               dev->lib->event_wait != NULL &&
+               !p_atomic_read(&dev->nonstall_undrainable)) {
+@@ -381,7 +469,8 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+          /* The transport cannot wait (e.g. -ENOSYS): sleep from now on */
+          mesa_logd("NVK: RM event wait failed (%d); CPU waits sleep", waited);
+          p_atomic_set(&dev->nonstall_undrainable, true);
+-      } else if (waited > 0 && dev->lib->event_drain != NULL) {
++      } else if (waited > 0 && dev->lib->event_drain != NULL &&
++                 (!dev->nonstall_dataless || nvkmd_rm_event_drain)) {
+          struct crm_event_data data[8];
+          int n = dev->lib->event_drain(dev->client, dev->nonstall_fd,
+                                        data, ARRAY_SIZE(data));
+@@ -397,7 +486,7 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+          }
+       }
+    } else {
+-      const uint64_t us = *iter < 4 * NVKMD_RM_WAIT_SPIN_ITERS ? 10 : 200;
++      const uint64_t us = *iter < 4 * spin_iters ? 10 : 200;
+       os_time_sleep(MIN2(us, remaining_ns / 1000 + 1));
+    }
+ 
+@@ -412,16 +501,29 @@ nvkmd_rm_wait_value(struct nvkmd_rm_dev *dev,
+                     uint64_t abs_timeout_ns)
+ {
+    uint32_t iter = 0;
++   VkResult result;
++
++   if (p_atomic_read(value) >= wait_value)
++      return VK_SUCCESS;
++
++   nvkmd_rm_wait_begin(dev, false);
+    while (true) {
+-      if (dev != NULL && nvkmd_rm_dev_lost(dev))
+-         return VK_ERROR_DEVICE_LOST;
+-      if (p_atomic_read(value) >= wait_value)
+-         return VK_SUCCESS;
++      if (dev != NULL && nvkmd_rm_dev_lost(dev)) {
++         result = VK_ERROR_DEVICE_LOST;
++         break;
++      }
++      if (p_atomic_read(value) >= wait_value) {
++         result = VK_SUCCESS;
++         break;
++      }
+ 
+-      VkResult result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns);
++      result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns);
+       if (result != VK_SUCCESS)
+-         return result;
++         break;
+    }
++   nvkmd_rm_wait_end(dev, false);
++
++   return result;
+ }
+ 
+ const struct nvkmd_dev_ops nvkmd_rm_dev_ops = {
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index 57c90f0..7c07109 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -388,6 +388,7 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_scanout_status,         "crm_win_scanout_status",         false);
+    LOAD(win_scanout_wait_released,  "crm_win_scanout_wait_released",  false);
+    LOAD(win_loss_epoch,             "crm_win_loss_epoch",             false);
++   LOAD(win_event_kick,             "crm_win_event_kick",             false);
+ 
+    LOAD(event_wait,   "crm_event_wait",   false);
+    LOAD(alloc_pages,  "crm_alloc_pages",  false);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+index eae5873..6ece9ad 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -115,8 +115,13 @@ nvkmd_rm_sync_mark_pending(struct nvkmd_rm_sync *sync, uint64_t value)
+    uint64_t old = p_atomic_read(&sync->pending);
+    while (old < value) {
+       const uint64_t prev = p_atomic_cmpxchg(&sync->pending, old, value);
+-      if (prev == old)
++      if (prev == old) {
++         /* A VK_SYNC_WAIT_PENDING waiter (the runtime's submit thread) is
++          * woken by no GPU interrupt: kick the event for it.
++          */
++         nvkmd_rm_kick_cpu_waiters(sync->dev, true);
+          break;
++      }
+       old = prev;
+    }
+ }
+@@ -185,6 +190,11 @@ nvkmd_rm_sync_signal(struct vk_device *device, struct vk_sync *_sync,
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    *sync->value = value;
+ 
++   /* A host signal raises no interrupt: wake the event waiters, which
++    * would otherwise see it at the next GPU interrupt or poll timeout.
++    */
++   nvkmd_rm_kick_cpu_waiters(sync->dev, false);
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -222,11 +232,16 @@ nvkmd_rm_sync_wait_many(struct vk_device *device,
+                         uint64_t abs_timeout_ns)
+ {
+    struct nvkmd_rm_dev *dev = vk_device_to_rm_dev(device);
++   const bool pending = (wait_flags & VK_SYNC_WAIT_PENDING) != 0;
+    uint32_t iter = 0;
++   VkResult result;
+ 
++   nvkmd_rm_wait_begin(dev, pending);
+    while (true) {
+-      if (dev != NULL && nvkmd_rm_dev_lost(dev))
+-         return VK_ERROR_DEVICE_LOST;
++      if (dev != NULL && nvkmd_rm_dev_lost(dev)) {
++         result = VK_ERROR_DEVICE_LOST;
++         break;
++      }
+ 
+       bool all = true, any = false;
+       for (uint32_t i = 0; i < wait_count; i++) {
+@@ -236,16 +251,23 @@ nvkmd_rm_sync_wait_many(struct vk_device *device,
+             all = false;
+       }
+ 
+-      if ((wait_flags & VK_SYNC_WAIT_ANY) ? any : all)
+-         return VK_SUCCESS;
++      if ((wait_flags & VK_SYNC_WAIT_ANY) ? any : all) {
++         result = VK_SUCCESS;
++         break;
++      }
+ 
+-      VkResult result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns);
++      result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns);
+       if (result != VK_SUCCESS)
+-         return result;
++         break;
+ 
+-      if (vk_device_is_lost(device))
+-         return VK_ERROR_DEVICE_LOST;
++      if (vk_device_is_lost(device)) {
++         result = VK_ERROR_DEVICE_LOST;
++         break;
++      }
+    }
++   nvkmd_rm_wait_end(dev, pending);
++
++   return result;
+ }
+ 
+ struct vk_sync_type
+-- 
+2.43.0
+

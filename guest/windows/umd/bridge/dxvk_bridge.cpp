@@ -1028,6 +1028,59 @@ namespace helios_handoff {
     return kept;
   }
 
+  // Sleeps ~us microseconds on a per-thread high-resolution waitable timer:
+  // Sleep(1) waits a whole timer tick (~15.6 ms at the default resolution).
+  // Falls back to SwitchToThread when the timer is unavailable.
+  void hires_sleep_us(std::uint32_t us) {
+    static thread_local HANDLE timer = nullptr;
+    static thread_local bool tried = false;
+    if (!tried) {
+      tried = true;
+      timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                     0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                     TIMER_ALL_ACCESS);
+    }
+    if (timer) {
+      LARGE_INTEGER due;
+      due.QuadPart = -static_cast<LONGLONG>(us) * 10;
+      if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(timer, INFINITE);
+        return;
+      }
+    }
+    SwitchToThread();
+  }
+
+  // HELIOS_HANDOFF_SLEEP1=1: the handoff wait sleeps Sleep(1) per
+  // iteration, as before 405.20 (bisecting)
+  bool sleep1() {
+    static const bool on = []() {
+      const char* v = std::getenv("HELIOS_HANDOFF_SLEEP1");
+      return v && v[0] == '1';
+    }();
+    return on;
+  }
+
+  // Handoff waits that slept, logged once a second while there are any
+  std::atomic<std::uint64_t> s_handoff_sleeps{0}, s_handoff_sleep_ns{0};
+  std::atomic<std::int64_t> s_handoff_log_qpc{0};
+
+  void handoff_wait_note(std::uint64_t ns, const LARGE_INTEGER& f, const LARGE_INTEGER& now) {
+    s_handoff_sleeps.fetch_add(1, std::memory_order_relaxed);
+    s_handoff_sleep_ns.fetch_add(ns, std::memory_order_relaxed);
+    std::int64_t last = s_handoff_log_qpc.load(std::memory_order_relaxed);
+    if (now.QuadPart - last < f.QuadPart)
+      return;
+    if (!s_handoff_log_qpc.compare_exchange_strong(last, now.QuadPart))
+      return;
+    const std::uint64_t n = s_handoff_sleeps.exchange(0);
+    const std::uint64_t t = s_handoff_sleep_ns.exchange(0);
+    char msg[128];
+    std::snprintf(msg, sizeof(msg), "handoff waits: %llu sleeps, %.2f ms asleep in the last second or more",
+                  static_cast<unsigned long long>(n), double(t) / 1e6);
+    umd_log(msg);
+  }
+
   bool wait(std::uint32_t, std::uint64_t packed, std::uint64_t timeout_ns) {
     Table* t = table();
     if (!t)
@@ -1064,12 +1117,20 @@ namespace helios_handoff {
         }
         return gone; // gone: done
       }
-      if (spin < 64)
+      if (spin < 64) {
         YieldProcessor();
-      else if (spin < 256)
+      } else if (spin < 256) {
         SwitchToThread();
-      else
+      } else if (sleep1()) {
         Sleep(1);
+      } else {
+        // Was Sleep(1): a ~15.6 ms timer tick per iteration
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        hires_sleep_us(100);
+        QueryPerformanceCounter(&b);
+        handoff_wait_note(std::uint64_t(double(b.QuadPart - a.QuadPart) * 1e9 / double(f.QuadPart)), f, b);
+      }
     }
   }
 

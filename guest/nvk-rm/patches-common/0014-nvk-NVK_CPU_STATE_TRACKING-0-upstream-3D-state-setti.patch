@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 19:47:15 +0200
+Subject: [PATCH] nvk: NVK_CPU_STATE_TRACKING=0, upstream 3D state setting for
+ A/B
+
+patches-common 0001-0006 set Turing+ 3D state from what the CPU knows
+the GPU already has: direct draws without the NVK_MME_DRAW* macros
+(0001), cb0 not reselected after constant buffer binds (0002), root
+table loads of unchanged dwords skipped (0003), binds of an already
+bound constant buffer range skipped (0004), and vertex and index
+buffers bound with plain methods, skipping unchanged ranges (0006).
+
+NVK_CPU_STATE_TRACKING=0 (read once per process) turns all of them off
+and goes back to upstream's paths, so that a rendering bug (wrong
+geometry, wrong constants) can be pinned on them or ruled out with one
+run instead of a rebuild.  On by default; nothing changes without the
+variable.
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 617eb0f..e250e15 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -17,6 +17,7 @@
+ #include "util/bitpack_helpers.h"
+ #include "util/compiler.h"
+ #include "util/u_atomic.h"
++#include "util/u_debug.h"
+ #include "vk_format.h"
+ #include "vk_render_pass.h"
+ #include "vk_standard_sample_locations.h"
+@@ -34,6 +35,16 @@
+ #include "nv_push_clc597.h"
+ #include "nv_push_clc797.h"
+ #include "nv_push_clcb97.h"
++
++/* NVK_CPU_STATE_TRACKING=0 turns off what Conduit's patches-common 0001-0006
++ * know on the CPU about Turing+ 3D state, and goes back to upstream's way of
++ * setting it: draws through the NVK_MME_DRAW* macros (0001), cb0 reselected
++ * after binding constant buffers (0002), every root table load emitted
++ * (0003), every constant buffer bind emitted (0004), and vertex and index
++ * buffers bound through NVK_MME_BIND_VB/IB (0006).  An A/B lever for
++ * rendering bugs; on by default.
++ */
++DEBUG_GET_ONCE_BOOL_OPTION(nvk_cpu_state_tracking, "NVK_CPU_STATE_TRACKING", true)
+ #include "nv_push_clcd97.h"
+ #include "clc7c0.h"
+ #include "clc997.h"
+@@ -796,7 +807,8 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
+    const uint32_t first_tracked_dw =
+       nvk_root_descriptor_offset(dynamic_buffers_0) / 4;
+ 
+-   if (end_dw <= first_tracked_dw) {
++   if (end_dw <= first_tracked_dw ||
++       !debug_get_option_nvk_cpu_state_tracking()) {
+       nvk_cmd_load_gfx_root_desc(cmd, desc, start_dw, end_dw);
+       return;
+    }
+@@ -4443,7 +4455,8 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+             if (ba.size == 0)
+                ba.base_addr = 0;
+ 
+-            if ((group->bound_known & BITFIELD_BIT(c)) &&
++            if (debug_get_option_nvk_cpu_state_tracking() &&
++                (group->bound_known & BITFIELD_BIT(c)) &&
+                 group->bound_addr[c] == ba.base_addr &&
+                 group->bound_size[c] == ba.size)
+                continue;
+@@ -4502,7 +4515,9 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+     * (Turing+), root updates go through SET_ROOT_TABLE_SELECTOR instead and
+     * nothing loads constant buffers through the selector after init.
+     */
+-   if (bound_any_cbuf && !nvk_use_hw_root_table(&pdev->info, true)) {
++   if (bound_any_cbuf &&
++       (!nvk_use_hw_root_table(&pdev->info, true) ||
++        !debug_get_option_nvk_cpu_state_tracking())) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SELECT_CB0));
+       P_INLINE_DATA(p, 0);
+@@ -4614,7 +4629,8 @@ nvk_CmdBindIndexBuffer3KHR(VkCommandBuffer commandBuffer,
+    const VkDeviceAddressRangeKHR addr_range = pInfo->addressRange;
+    assert(addr_range.size <= UINT32_MAX);
+ 
+-   if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
++   if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A &&
++       debug_get_option_nvk_cpu_state_tracking()) {
+       /* What NVK_MME_BIND_IB does, with plain methods */
+       struct nvk_graphics_state *gfx = &cmd->state.gfx;
+       const uint32_t size_B = addr_range.address ? addr_range.size : 0;
+@@ -4776,7 +4792,8 @@ nvk_cmd_bind_vertex_buffer(struct nvk_cmd_buffer *cmd, uint32_t vb_idx,
+    if (vb_idx == 0)
+       cmd->state.gfx.vb0 = addr_range;
+ 
+-   if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
++   if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A &&
++       debug_get_option_nvk_cpu_state_tracking()) {
+       /* What NVK_MME_BIND_VB does, with plain methods */
+       struct nvk_graphics_state *gfx = &cmd->state.gfx;
+       assert(addr_range.size <= UINT32_MAX);
+@@ -5070,7 +5087,8 @@ static inline bool
+ nvk_cmd_can_draw_direct(struct nvk_cmd_buffer *cmd)
+ {
+    return nvk_cmd_buffer_3d_cls(cmd) >= TURING_A &&
+-          cmd->state.gfx.render.view_mask == 0;
++          cmd->state.gfx.render.view_mask == 0 &&
++          debug_get_option_nvk_cpu_state_tracking();
+ }
+ 
+ static void

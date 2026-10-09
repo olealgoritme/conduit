@@ -1,25 +1,72 @@
 # NVK on RM
 
-A first cut of an NVK backend that drives the GPU through NVIDIA's Resource
-Manager (RM, the open kernel modules' `/dev/nvidiactl` interface, forwarded
-by Conduit in a guest) instead of nouveau. It is a patch series against
-upstream Mesa that adds a second implementation of NVK's kernel abstraction,
-`src/nouveau/vulkan/nvkmd/rm/`, next to `nvkmd/nouveau/`. It talks to RM
-through [librmclient](../rmclient), which it loads at runtime.
+An NVK backend that drives the GPU through NVIDIA's Resource Manager (RM,
+the open kernel modules' `/dev/nvidiactl` interface, forwarded by Conduit
+from a guest) instead of nouveau. It is a patch series against upstream Mesa
+that adds a second implementation of NVK's kernel abstraction,
+`src/nouveau/vulkan/nvkmd/rm/`, next to `nvkmd/nouveau/`, and talks to RM
+through [librmclient](../rmclient), loaded at runtime.
 
-Status: **runs on an RTX 5090 (GB202, GSP firmware, RM 610.57.04) in the
-`lab` guest.** `vulkaninfo` enumerates the GPU through NVK, a compute test
-(storage buffer, dispatch, device-local buffer + copy, 5000 back-to-back
-submits) passes, and `vkcube` presents **zero-copy** on the guest desktop
-through Mesa's native X11 (DRI3/Present via Xwayland) and Wayland
-(linux-dmabuf) WSI: the swapchain images stay in VRAM, block-linear with
-NVIDIA DRM format modifiers, and go to the compositor as dma-bufs through
-Conduit's nvidia-drm node (see "Zero-copy presentation"). See "First run"
-and "Zero-copy run" at the end for what was run and what is still open.
-dEQP has not been run yet.
+Status: runs on an RTX 5090 (GB202, GSP firmware).
 
-Experimental and opt-in (`NVK_RM=1`); nothing changes for a guest that does
-not set it. Design background: [docs/research/nvk-rm.md](../../docs/research/nvk-rm.md).
+- **Windows guests:** the rendering driver of the Windows guest stack
+  (driver 22.22.405.24). The Helios D3D11 (DXVK) and D3D12 (vkd3d-proton)
+  UMDs, Vulkan applications and OpenGL (Zink) run on it; RM calls go through
+  the Helios KMD and the virtio transport. The desktop (DWM) and games run
+  on NVK at 240 Hz; Counter-Strike 2 runs at ~330–380 fps at 1080p and
+  ~350 fps at 5120x1440 with bots. Zero-copy presentation through the KMD's
+  scanout.
+- **Linux guests:** opt-in (`NVK_RM=1`), nothing changes for a guest that
+  does not set it. `vulkaninfo`, compute and `vkcube` with zero-copy X11 and
+  Wayland presentation work; dEQP has not been run.
+
+Design background: [docs/research/nvk-rm.md](../../docs/research/nvk-rm.md).
+
+## Series layout
+
+| Directory | What | Used by |
+|---|---|---|
+| `patches/` | the RM backend (0001-0013), and the Linux versions of host-visible VRAM, cached system memory, compression and ZCULL (0014-0017) | Linux: 0001-0017; Windows: 0001-0013 |
+| `patches-windows/` | the Windows build, Win32 WSI, Helios scanout and shared surfaces, RM fences, Zink, NVDEC | Windows |
+| `patches-windows-dxvk/` | what DXVK needs on Windows, CPU waits | Windows |
+| `patches-common/` | generic NVK work (per-draw cost, compression, deferred frees, profiling, wait fixes), applied last | both |
+
+`build.sh` builds the Linux stack, `build-windows.sh` the Windows one
+(cross-compiled; `windows/stage-helios-package.sh` stages it for the driver
+package).
+
+## Knobs
+
+Environment variables of the process; the defaults are the ones in force.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `NVK_INDIRECT_PUSH` | 0 | indirect draw records as inline macro data from the pushbuffer (patch 28); 1 for testing |
+| `NVK_NULL_VB_ZERO_PAGE` | 1 | a null vertex buffer is bound to the 4 KiB zero page instead of address 0 / size 0 (patch 41) |
+| `NVK_ZERO_PAGE_VRAM` | 1 | the zero page (null descriptors) lives in VRAM instead of uncached system memory (patch 41) |
+| `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N caps it at N MiB (patch 30) |
+| `NVK_RM_DEFER_FREE` | 1 on Windows | memory and VA frees wait for the GPU work submitted before them (patch 19) |
+| `NVK_RM_EVENT_GEN` | 1 | CPU waits on librmclient's wake generations (patch 42) |
+| `NVK_RM_WAIT_POLL_MS` | 1 on Windows | the event poll interval of CPU waits (patch 40) |
+| `NVK_FS_STATE_TRACKING` | 1 | fragment shader state emitted only when it changes (patch 34) |
+
+The patch tables below list the A/B and test knobs each patch adds.
+
+## Diagnostics
+
+On Windows the output goes to `%ProgramData%\Helios\` (else `%TEMP%`), one
+file per process.
+
+| Variable | Output |
+|---|---|
+| `NVK_PASS_PROFILE=1` | GPU time per render pass signature, per operation outside render passes and per command buffer, every two seconds, with the shaders each pass used (`nvk-pass-<pid>.txt`, or `NVK_PASS_PROFILE_FILE`) |
+| `NVK_PASS_PROFILE=2` | adds vertex, clipper and pixel shader invocations per pass |
+| `NVK_PASS_PROFILE=3` | adds the ZCULL statistics per pass |
+| `NVK_PASS_PROFILE=4` | adds the 24 most written 3D methods per pass and bind counts |
+| `NVK_PASS_PROFILE=5` | dumps the draws of one render pass matching `NVK_PASS_DUMP`, after `NVK_PASS_DUMP_DELAY_S` (20) s (`nvk-prepass-dump-<pid>.txt`) |
+| `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
+| `NVK_WAIT_STATS=1` | CPU wait counts and times per site, woken and timed-out waits, once a second (`nvk-waits-<pid>.txt`) |
+| `NVK_DEBUG=vm` | VA and memory alloc/free/bind lines with times, threads and freeing call stacks (`NVK_VM_LOG`, else `nvk-vm-<pid>.log` in `%TEMP%`) |
 
 ## Base and patches
 
@@ -41,10 +88,6 @@ Mesa `main` at **`70c4c018cbe5b78a1db7e9413bc7e511b366fd95`**
 | 11 | `nvk/rm: stop polling a non-stall event whose data cannot be read` | a refused `NV_ESC_RM_GET_EVENT_DATA` leaves the event readable for good; waits sleep instead of spinning through refused escapes |
 | 12 | `vulkan/wsi, nvk: wait for rendering before presenting without implicit sync` | `wsi_device::wait_before_present`, set by NVK when the backend has dma-bufs but no sync_file export (RM) |
 | 13 | `nvk/rm: dma-buf export and import through nvidia-drm, DRM format modifiers` | `has_dma_buf` + `has_alloc_tiled` for RM: export/import of RM memory as dma-bufs via `OS_UNIX_EXPORT/IMPORT_OBJECT` and nvidia-drm's GEM import/export; DRM node discovery; `VK_EXT_image_drm_format_modifier` |
-| 14 | `nvk/rm: host-visible VRAM (a BAR heap)` | port of `patches-windows/0022` (feat/nvk-rm-bar-heap) to this series: a DEVICE_LOCAL + HOST_VISIBLE type on a BAR1-mapped VRAM heap (`NVK_RM_BAR_MB`, default 256). Drop it where 0022 is applied. |
-| 15 | `nvk/rm: let the GPU cache coherent host-visible system memory in L2` | host-visible system memory mapped `GPU_CACHEABLE_YES`, L2 sysmem invalidate at the start of every submit (`NVK_RM_SYSMEM_CACHED=0` turns it off); UBOs and vertex buffers in system memory 20-60x faster, on par with NVIDIA |
-| 16 | `nvk/rm: compressible VRAM for images on GB20x` | `has_compression`: dedicated image memory allocated COMPR_ANY (as NVKMS does) and mapped with the compressible GMK kind (`NVK_RM_COMPRESSION=0` off); clears 15x faster, blending on par with NVIDIA |
-| 17 | `nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` | `has_zcull_info` (`NVK_RM_ZCULL=0` off); depth-tested overdraw 3.4x faster, on par with NVIDIA |
 
 Each patch builds on its own.
 
@@ -70,6 +113,37 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 6 | `nvk: bind vertex and index buffers with plain methods on Turing+` | no `NVK_MME_BIND_VB/IB` for CPU-recorded binds, and the range already bound is skipped |
 | 7 | `nvk: keep what changes per draw in one hardware root table bank` | changing a second 256-byte root table bank between draws costs ~5 ns; the dynamic-offset dword of the dynamic buffer descriptors moves into bank 0 with the draw parameters and `sets[0..3]`. **API-visible**: `NVK_MAX_DYNAMIC_BUFFERS` 64 -> 32, i.e. 16 dynamic UBOs + 16 dynamic SSBOs per layout (NVIDIA: 15 + 16) |
 | 8 | `nvk: ZCULL for DXVK depth buffers and reverse Z` | ZCULL storage also for depth images with `TRANSFER_DST` (DXVK sets it on every D3D11 depth texture; `EXCLUSIVE` sharing only), reset to a conservative state by an empty render pass after a copy, blit or resolve writes them or another queue hands them over; `SET_ZCULL_DIR_FORMAT` per image (GREATER when the first application render pass clears below 0.5, LESS otherwise, never changed afterwards) instead of always LESS. See "GPU time against NVIDIA in D3D11-through-DXVK shapes" |
+| 11 | `nvk, nvk/rm: compression for images outside dedicated allocations on GB20x` | `NVK_RM_COMPRESS_ALL=1` (default off): device-local memory that is neither host-visible nor shared nor imported is allocated COMPR_ANY (`NVKMD_MEM_COMPRESSIBLE`, `nvkmd_info::has_compressible_mem`), and a compressible image bound anywhere in it gets its own VA with the compressible GMK kind and `is_compressed`; every other mapping of such memory uses a compressible kind too. Applies after 9-10 of the build branches and without them. See "Compression outside dedicated allocations" |
+| 12 | `nvk, nvk/rm: compress separate depth/stencil images on GB20x` | `NVK_RM_COMPRESS_ZS=1` (default off while it is measured, `nvkmd_info::has_zs_compression`): combined depth/stencil formats (D24S8, D32S8X24), which Blackwell splits into separate depth and stencil planes, pass `nvk_image_can_compress`; both planes are compressed in a dedicated allocation (the memory's own VA) and in compressible memory from patch 11 (each plane's own VA). Needs 11. See "Compression outside dedicated allocations" |
+| 13 | `nvk, nvk/rm: a compressible device-local memory type for images on GB20x` | `NVK_RM_COMPRESS_TYPE=1` (default off): a second DEVICE_LOCAL type on the VRAM heap, before the plain one, whose memory is COMPR_ANY. Optimal-tiling images report it (not sparse, protected, host-transfer, external or video); buffers only when transfer-only (the clear buffers vkd3d-proton and DXVK put over image memory), never vertex, index, indirect, uniform, storage or device-address buffers. Needs 11 (and 12 for depth/stencil). See "A compressible memory type (patch 13)" |
+| 14 | `nvk: NVK_CPU_STATE_TRACKING=0, upstream 3D state setting for A/B` | an A/B lever, no change by default: `NVK_CPU_STATE_TRACKING=0` turns off 1, 2, 3, 4 and 6 (draws and VB/IB binds through the upstream MME macros, cb0 reselected, every root table load and cbuf bind emitted), to pin a rendering bug on them or rule them out without a rebuild. Numbered after the build branches' 9-13 |
+| 15 | `nvk, nvk/rm: compression diagnostics and a clear-on-allocate knob` | `NVK_RM_COMPRESS_CLEAR=1` writes every compressible memory once through its compressible VA at allocation (candidate fix for stale compression state); `NVK_RM_COMPRESS_UPGRADE=0` keeps uncompressed images in compressible memory on kind 0x6; `NVK_RM_COMPRESS_TYPE_SCOPE=attachments` offers patch 13's type only to images that are compressed themselves (against the spec, testing only). All inert unless set. Numbered 15: the build branches have their own 14. See "Corruption with patches 11 and 13" |
+| 17 | `nvkmd: NVK_DEBUG=vm log through a buffered file, with times and threads` | `NVK_DEBUG=vm` writes VA alloc/free/bind/unbind and memory create/destroy lines (`NVKVM <local time> +<s since start> t<thread> <op> [0x<10 hex>,0x<10 hex>) <size> ...`) to `NVK_VM_LOG`, else `%TEMP%\nvk-vm-<pid>.log` on Windows, else stderr; 1 MiB buffer flushed every 50 ms, after every free/unbind, on a failed submit and at exit. Answers what last owned a faulting VA (awk one-liner in `nvkmd.c`). Numbered after `nvk/compress-all`'s 16 |
+| 18 | `nvk: NVK_CPU_STATE_TRACKING, read race closed and mixed paths kept safe` | the knob is one atomic word; the upstream VB/IB macro binds clear the CPU's record of the range and a full root table load updates the shadow, so taking either path at any time is safe. No method changes on the default path |
+| 19 | `nvk/rm: free memory and VAs only after the GPU work submitted before the free` | `NVK_RM_DEFER_FREE` (default on on Windows): every flush after an exec ends with a WFI release of a per-context retire counter; a memory or VA free that comes while submitted work is unfinished queues its RM unmap/free until that work has landed (reaped at exec, free and allocation; `NVK_RM_DEFER_FREE_MB`, default 2048, caps the pending bytes). Fixes CS2's Xid 31 FAULT_PDE (a 109 MiB buffer unmapped while shaders still wrote it). Log line at powers of two and a summary at device destruction |
+| 20 | `nvk/rm: a destroyed sync's semaphore slot is reused only after the GPU work` | a destroyed sync's semaphore slot goes back to the pool through 0019's deferred-free queue, so a release still in flight can't land in the next sync given the slot and complete its waits early |
+| 21 | `nvkmd: NVK_DEBUG=vm log names the calling thread` | the thread column of 0017's log is `t<id>(<name>)` with the GetThreadDescription name (dxvk-cs, dxvk-queue, ...), so a capture says which thread freed a memory object |
+| 22 | `nvkmd: NVK_DEBUG=vm mem- lines carry the freeing call stack` | every `mem-` line of the vm log ends with ` stack:` and up to 24 `module+0xoffset` frames (RtlCaptureStackBackTrace), to symbolize against helios_umd's PDB/map |
+| 23 | `nvk: NVK_PASS_PROFILE times work outside render passes, more signatures` | patch 10's profile also times runs of operations outside render passes (dispatch, indirect dispatch, buffer/image copies, fill, update, image clears, blit, resolve image, resolve at the end of a pass, query reset/copy) with the report on the engine that ran them (3D, compute after `WAIT_FOR_IDLE`, copy engine non-pipelined); meta operations and the driver's own render passes (image clears, resolves, ZCULL reseeds) count towards the operation that records them. Each window: summary (command buffers = render passes + operations + between them), GPU ms/s per operation kind, top 40 signatures with draw calls, draws (multi-draw and indirect `drawCount` counted), indirect calls/draws, queries and barriers per instance; pass signatures add load/store ops and ZCULL storage. `NVK_PASS_PROFILE=2` adds VS/clipper/PS invocations and the four ZCULL statistics per pass. 4096 signatures (hashed), 65536 slots, drops counted per window. Numbered after 405.6's 22 |
+| 24 | `nvk: NVK_MDI_BATCH reads indirect multi-draw records in batches` | `NVK_MDI_BATCH=<n>` (default 0, off; suggested 64, max 204): a `vkCmdDraw[Indexed]Indirect` with `drawCount > 1` is split into calls of at most n records (and 1024 dwords, the MME data FIFO) to new `NVK_MME_DRAW[_INDEXED]_INDIRECT_BATCH` macros that fetch all their records with one `MME_DMA_READ_FIFOED` instead of one read-and-wait per draw; padding of larger strides dropped, `gl_DrawID` continues. Simulator-checked against the per-record loop (identical method streams, no overread). Aimed at CS2's 0.6-0.9 ms 2x MSAA depth pass (DXVK merges `DrawIndexedInstancedIndirect` runs into multi-draws) |
+| 26 | `nvk/rm: descriptor and upload memory in host-visible VRAM` | `NVK_RM_DESC_TABLE_VRAM` / `NVK_RM_UPLOAD_VRAM` (default 1): texture/sampler header tables, descriptor pools (`NVKMD_MEM_GPU_READ_ONLY`) and command buffer upload memory (new `NVKMD_MEM_CPU_WRITE_ONLY`) go to the BAR heap instead of system memory the GPU reads over PCIe; heap full or map refused keeps them in system memory with a warning. App host-visible VRAM that falls back to system memory is now GPU-cacheable. `NVK_RM_SYSMEM_CACHED=desc`/`app` caches only one kind. `NVK_BLACKWELL_MME_MEMBAR=0` drops the sysmembar from Hopper+ indirect-read barriers (A/B). `NVK_DEBUG=vm` `mem+` lines end with vram/bar/sysmem[,cached]. 405.9's 0025 is left out: its two extra MME macros overflowed the MME instruction RAM on GB20x (Xid 13 MACRO on every draw) |
+| 27 | `nvk: shader statistics per pass and per shader, profile counters fixed` | `NVK_PASS_PROFILE` pass lines add the shaders the draws used (VS GPRs/instructions/static cycles, FS GPRs/instructions, calls with FS and with tess/GS, max spills+fills and SLM); `NVK_PASS_PROFILE=2` counters at their own pipeline locations (location ALL was rejected: Xid 69), ZCULL counters at `=3`; `NVK_SHADER_STATS=1` logs every uploaded shader's NAK statistics to `%ProgramData%\Helios\nvk-shaders-<pid>.txt`; `NVK_RM_DESC_TABLE_VRAM`/`NVK_RM_UPLOAD_VRAM` default 0 (BAR VRAM was ~10 fps slower in CS2). No MME change: 2976 dwords on GB20x |
+| 28 | `nvk: indirect draw records through the pushbuffer, MME within its RAM` | `NVK_INDIRECT_PUSH` (default on, `=0` = upstream per-record `MME_DMA_READ_FIFOED`): Turing+ indirect draws take their records as inline macro data from a pushbuffer segment pointing at the indirect buffer; only the first segment after a barrier/event wait/secondary/command buffer start is SYNC_WAIT. Unused macros are empty so the MME total stays within the RAM (0xc00 dwords): 2649 dwords by default, 2988 with `NVK_INDIRECT_PUSH=0 NVK_MDI_BATCH=64`; queue creation fails instead of uploading more. Aimed at CS2's ~28 us per indirect draw (10.3 ms depth prepass) |
+| 29 | `nvk: MME budget 2976 checked before upload, mesh macros only for mesh` | all macros built and their total checked against the known-good 2976 before upload (queue creation fails above it); mesh macros empty unless mesh/task shaders are enabled (DXVK device: 2160 dwords, worst case 2499); `NVK_MME_PACK_INSTR=1` (test) packs macros by instruction like nouveau GL; `NVK_SKIP_DRAWID=1` (test) drops the per-draw draw-index root-table write of indirect draws; `NVK_MDI_BATCH` reads at most 64 dwords on Blackwell (no data FIFO config) |
+| 30 | `nvk/rm: no host-visible VRAM heap by default (NVK_RM_BAR_MB=0)` | the DEVICE_LOCAL \| HOST_VISIBLE type (patch 0022's BAR heap) is off by default: in CS2 it cost ~30 % (DXVK writes its CBs, dynamic and descriptor buffers there through BAR1, the host's shared window; the GPU maps it as ordinary VRAM). `NVK_RM_BAR_MB=-1` restores all of BAR1, N caps it |
+| 31 | `nvk: NVK_INDIRECT_PUSH off by default` | 0028's inline record segments raised Xid 32 in CS2 on 405.13; off by default, `=1` for debugging |
+| 32 | `nvk/rm: nothing between an incomplete push and the one completing it` | the RM exec path waited for ring space per entry; a full ring flushed between an incomplete push (0028's macro call) and its record segment, inserting semaphore/retire/tracking entries into the open method (Xid 32). Runs of incomplete pushes and their completing push now get ring space together. Candidate fix for `NVK_INDIRECT_PUSH=1`, which stays off by default |
+| 33 | `nvk: NVK_PASS_PROFILE=4 method histogram per pass, indirect push on again` | `NVK_PASS_PROFILE=4`: per render pass signature, the 24 most written 3D methods per recorded pass (MME calls by macro name), counted from the pushbuffer at record time; `NVK_INDIRECT_PUSH` default on again (clean with 0032). No MME change (2160 dwords for a DXVK device) |
+| 34 | `nvk: fragment shader state emitted only when it changes, bind counts` | `NVK_FS_STATE_TRACKING` (default on, `=0` = old stream): the subtiling knobs, early-Z, post-Z coverage, ZCULL bounds and shading-rate/anti-alias macro calls after a fragment shader's program are skipped when equal to the last emitted; `NVK_PASS_PROFILE` counts shader binds, FS binds and descriptor binds per pass; `=4` also counts index/vertex buffer binds and indirect calls pointing into system memory or BAR VRAM |
+| 35 | `nvk: NVK_DRAW_SYSVAL_SKIP, draw parameters only for shaders that read them` | `NVK_DRAW_SYSVAL_SKIP=1` (test, default off): the draw macros write first vertex / base instance / draw index to the root table only when a bound shader reads gl_BaseVertex / gl_BaseInstance / gl_DrawID (recorded at descriptor lowering; the hardware IDs already include the bases). MME 2370 dwords for a DXVK device |
+| 36 | `nvk/rm: NVK_RM_TIMESLICE_US and NVK_RM_INTERLEAVE for the context's TSG` | A/B knobs for GR runlist scheduling of each NVK context's TSG: timeslice in us (`NVA06C_CTRL_CMD_SET_TIMESLICE`) and interleave level 0/1/2 (`NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL`, privileged, may be refused). Unset: RM defaults. All NVK GPU waits already use ACQUIRE_SWITCH_TSG |
+| 37 | `nvk/rm: no 16 ms stall on a full GPFIFO ring, NVK_INDIRECT_PUSH off` | GPFIFO ring 1024 -> 4096 entries; the ring-space wait yields for 4 ms before sleeping (os_time_sleep(10) is Sleep(1), a ~15.6 ms tick, on Windows: cs2like passes of >512 indirect calls with NVK_INDIRECT_PUSH took 16 ms); NVK_INDIRECT_PUSH default off again |
+| 38 | `nvk/rm: no timer-tick sleeps in CPU waits, NVK_WAIT_STATS` | the CPU wait fallback (os_time_sleep 10/200 us = Sleep(1), a ~15.6 ms tick on Windows), the full-ring wait and the KMD flip-queue retry sleep on a per-thread high-resolution waitable timer; `NVK_WAIT_STATS=1` logs per-site wait counts/times once a second to `%ProgramData%\Helios\nvk-waits-<pid>.txt` |
+| 39 | `nvk: NVK_PASS_PROFILE=5 dumps one render pass's draws` | after `NVK_PASS_DUMP_DELAY_S` (20) s, the next pass matching `NVK_PASS_DUMP` (default the 2x MSAA D24S8 depth prepass) is dumped per draw call: call parameters, shader hashes, IA/raster/depth-stencil state, IB/VB bindings and vertex attributes, and the indirect records (copied by the copy engine at execution) to `%ProgramData%\Helios\nvk-prepass-dump-<pid>.txt` |
+| 40 | `nvk/rm: 1 ms event poll on Windows, woken and timed-out waits counted` | CPU waits share one non-stall event per process, reset by whichever waiter wakes first, so wakes get lost (CS2: ~42 of ~310 event waits/s timed out at 10 ms). `NVK_RM_WAIT_POLL_MS` defaults to 1 on Windows (librmclient now times short waits with a high-resolution timer); `NVK_WAIT_STATS` counts woken vs timed-out waits |
+| 41 | `nvk: null vertex buffers and the zero page in VRAM` | `NVK_NULL_VB_ZERO_PAGE` (default on): a null vertex buffer (robustness2, DXVK's unused D3D11 slots; every CS2 prepass call has one, stride 0, instance rate, divisor 0) is bound to the zero page (4 KiB) instead of stream address 0 / size 0; `NVK_ZERO_PAGE_VRAM` (default on): the zero page (null descriptors) is VRAM instead of uncached system memory on RM |
+| 42 | `nvk/rm: CPU waits on librmclient wake generations (NVK_RM_EVENT_GEN)` | the shared per-process non-stall event lost wakes (the first waiter to wake resets it under the others; CS2 on 405.22: ~650 of ~900 event waits/s ended by the 1 ms poll). librmclient keeps a wake generation per channel (`crm_win_event_gen`, `crm_win_event_wait_gen`): one thread blocks on the KMD event and, when it fires, moves the generation on and wakes the other waiters through a condition variable; the wait loops read the generation before checking their value and wait for it to move. Default on with a librmclient that has the symbols (older, off Windows or `NVK_RM_EVENT_GEN=0`: the shared-event wait as before) |
+| 43 | `nvk/rm: knobs that undo the 0037 and 0038 wait changes one at a time` | for bisecting the CS2 fullscreen freeze on 405.23 (405.16 good): `NVK_RM_GPFIFO_ENTRIES=1024` (the ring before 0037; power of two 64-4096, default 4096), `NVK_RM_RING_YIELD_MS=0` (no yield phase in the full-ring wait, default 4), `NVK_RM_HIRES_SLEEP=0` (`os_time_sleep` again in the sleep fallback, ring wait and flip-queue retry, as before 0038). With `NVK_RM_WAIT_POLL_MS=10` (0040), `NVK_INDIRECT_PUSH=1` (0037's default), `NVK_RM_EVENT_GEN=0` (0042), librmclient's `CRM_EVENT_HIRES=0` and the UMD bridge's `HELIOS_HANDOFF_SLEEP1=1` every wait change since 405.16 can be undone at run time |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
@@ -112,6 +186,215 @@ and repeats a direct draw right after each indirect one (dropping one
 invalidation in the driver changes its hash); `dynidx` indexes dynamic UBO
 arrays in two sets at run time; `descupd` rewrites a descriptor set between
 submits. dEQP-VK is not installed on the host and was not run.
+
+### Compression outside dedicated allocations (patch 11)
+
+NVK compresses an image only in a dedicated allocation. vkd3d-proton
+places every D3D12 resource in a heap and native engines sub-allocate, so
+in the VM every Basemark render target (Vulkan and D3D12) was mapped with
+kind 0x6 (GMK), never 0x8 (GMK compressible).
+
+What GB20x and RM need (open-gpu-kernel-modules 615.78.08):
+
+- GB20x has only GMK (0x6), GMK compressible (0x8) and GMK compressible
+  without PLC (0x9) for block-linear memory, depth included
+  (`mem_mgr_gb202.c`, `mem_mgr_gb202_base.c`).
+- Compression state is per physical page: GB20x uses GMMU format v3,
+  whose PTEs have no comptag line (`virt_mem_allocator_gm107.c` writes
+  comptag lines only for format <= 2; `memmgrGetKindComprForGpu_KERNEL`
+  marks such memory `bPhysBasedComptags`). There is no comptag pool to
+  run out of, and COMPR_ANY costs no extra VRAM.
+- The kind still has to be compressible at allocation time: a mapping
+  whose kind override is compressible over memory whose own kind is not
+  is quietly downgraded to the uncompressed kind (`virtual_mem.c`,
+  "downgrading pteKind ... over uncompressed physical backing"). That is
+  why sub-allocated images stayed 0x6 even with a 0x8 kind.
+- PLC: RM picks 0x8 or 0x9 for the allocation and applies its per-page
+  PLC workaround itself when it writes PTEs; NVK maps images with 0x8 as
+  the dedicated path does.
+
+The patch: NVK asks for `NVKMD_MEM_COMPRESSIBLE` on plain device-local
+allocations (not host-visible, not exported or imported). The RM backend
+allocates those like dedicated image memory (block linear, 32 bpp,
+COMPR_ANY) and keeps the flag only if RM granted compression. At bind
+time a `can_compress` image in such memory gets its own VA with
+`compressed_pte_kind` and `is_compressed` (the draw path already turns
+on color/Z compression from it). Accessing compressible pages through an
+uncompressed kind would read raw compressed data, so every GPU mapping of
+such memory is compressible: the memory's own VA is mapped 0x8 (buffers,
+linear images, ZCULL), and an image VA with kind 0x6
+(sampled-only textures, sparse images, other images NVK does not
+compress) is mapped 0x8 with its 3D compression state left off.
+
+Risks:
+
+- Clients other than the 3D and copy engines reading compressible GMK
+  through the memory's own VA: indirect draw/dispatch arguments and
+  generated command streams read by the front end and PBDMA from
+  buffers in a compressed heap. NVKMS allocates scanout surfaces
+  COMPR_ANY, so hub clients reading compressible GMK is the hardware's
+  normal case, but this is the first thing to check if
+  something misrenders or faults (`NVK_RM_COMPRESS_ALL=0` to compare).
+  Counter-Strike 2 (D3D11 through DXVK) showed broken geometry with it
+  on, so it is default off again while that is investigated; patch 13 is
+  the safer design.
+- Image/buffer aliasing in one heap: both go through compressible kinds,
+  so reinterpreting the bytes is as undefined as the Vulkan spec says and
+  no more.
+- No CPU access: host-visible types (the BAR heap, system memory) are
+  never made compressible, and host image copies are already excluded by
+  `can_compress`.
+- RM refusing COMPR_ANY: the memory falls back to uncompressed (logged,
+  counted) and images in it stay 0x6.
+
+Logs (`mesa_logi`): the number of compressible memories and MiB as it
+reaches each power of two, image binds that got the compressible kind,
+image plane binds in compressible memory left uncompressed and why (not a
+render target, depth/stencil or storage image; a separate depth/stencil
+plane; other), and a summary at device destruction (memories, MiB,
+refusals, compressed image binds, 0x6 binds made 0x8). The 0x6 -> 0x8
+count also includes every tile bind of a sparse image, which the
+NVK-side breakdown does not see.
+
+Measured in the VM (RTX 5090, Basemark at 1080p, windowed), off against
+on: Vulkan 268 compressed image binds in 11 compressible memories
+(2565 MiB), none refused, calibration 7-9 % faster, demo-scene median
+20.4 -> 19.2 ms; D3D12 (vkd3d-proton) 67 compressed binds in 6 memories
+(1971 MiB), frame 21.8 -> 20.7 ms. No faults or device loss; a compressed
+vkcube renders correctly.
+
+What stays uncompressed (D3D12 had 306 binds made 0x8 against 67
+compressed):
+
+- Sampled-only textures (no `ALLOW_RENDER_TARGET`, `ALLOW_DEPTH_STENCIL`
+  or `ALLOW_UNORDERED_ACCESS`, so vkd3d-proton gives them neither
+  attachment nor storage usage): `nvk_image_can_compress` leaves them
+  out. They are already mapped 0x8, though, so copy-engine and shader
+  writes to them go through the compressible kind; the 3D compression
+  state only matters for attachments. Little to gain.
+- Depth/stencil formats (D24S8, D32S8X24): on Blackwell NVK splits them
+  into separate depth and stencil planes, and `can_compress` rejects
+  every image with more than one plane, dedicated or not. These are the
+  main render targets still left uncompressed. Patch 12
+  (`NVK_RM_COMPRESS_ZS=1`, default off) allows `separate_zs` images: they
+  are never disjoint, each plane gets its own VA in the sub-allocated path
+  and the memory's compressible VA in a dedicated one, NIL computes a
+  compressed kind for both planes, and the draw path sets
+  `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION` from `is_compressed`.
+  `NVK: N depth/stencil images (separate planes) bound compressed` counts
+  them; the "separate depth/stencil planes" figure of the uncompressed
+  breakdown should drop to 0. As compressible images they also prefer a
+  dedicated allocation now (`prefersDedicatedAllocation`), which
+  vkd3d-proton follows for committed resources.
+- Reserved (tiled) resources: sparse, excluded by `can_compress`; every
+  tile bind counts as one 0x6 -> 0x8.
+- Render targets and UAV textures (`COLOR_ATTACHMENT`, `STORAGE`,
+  single-plane depth such as D32/D16), with typeless/mutable formats
+  included: already compressed. GB20x compression is generic, so a format
+  reinterpretation reads the same bytes.
+
+
+### A compressible memory type (patch 13)
+
+Patch 11 makes every plain device-local allocation compressible, buffers
+included. Patch 13 keeps buffers out the way NVIDIA's driver does, with
+a memory type of its own (`NVK_RM_COMPRESS_TYPE=1`; independent of
+`NVK_RM_COMPRESS_ALL`, which should stay off with it).
+
+- Type order: compressible VRAM is type 0, plain VRAM type 1, both on the
+  VRAM heap with the same flags (the spec allows any order for equal
+  flags). vkd3d-proton and DXVK take the lowest type an allocation
+  allows (`vkd3d_try_allocate_device_memory`, DXVK's type iteration).
+- Images: for a color format the spec only lets `memoryTypeBits` depend
+  on the tiling, the sparse, protected and split-instance flags,
+  `HOST_TRANSFER` and the external handle types, not on the usage or
+  format. So every optimal image reports the type, sampled-only textures
+  too; those are mapped 0x8 and not compressed (as with patch 11).
+  Linear, sparse, host-transfer, external and (a small deviation) video
+  images do not.
+- Buffers: a buffer with fewer usage bits may allow more types, so
+  transfer-only buffers report the type and nothing else does. That
+  matters because vkd3d-proton binds a buffer over almost every
+  allocation it sub-allocates (to clear it), and the types it may use are
+  intersected with that buffer's:
+  - D3D12 heaps without `DENY_BUFFERS` (tier-2 mixed heaps,
+    `ALLOW_ALL_BUFFERS_AND_TEXTURES`) get a full-usage global buffer:
+    plain VRAM, **not covered**.
+  - `ALLOW_ONLY_RT_DS_TEXTURES` and `ALLOW_ONLY_NON_RT_DS_TEXTURES` heaps
+    get a `TRANSFER_DST` global buffer (image heap sub-allocation, which
+    vkd3d-proton allows when the driver has no pageable device memory, as
+    NVK does): compressible type, covered.
+  - `ALLOW_ONLY_BUFFERS` heaps: plain VRAM.
+  - Committed textures: dedicated when large (already compressed by
+    patch 0028 when they are render targets, depth or UAVs), otherwise
+    sub-allocated from chunks per heap category with a `TRANSFER_DST`
+    buffer: compressible type, covered.
+  - DXVK: images come from chunks of the type they allow (the
+    compressible one), with at most a transfer-only global buffer;
+    buffers never use it.
+- A dedicated allocation of an image that is not compressed itself is
+  never made compressible: nothing to gain, and Helios may export it with
+  the uncompressed layout.
+
+How much of Basemark D3D12 this covers depends on the heap flags it
+creates (not visible from here): committed and `RT_DS`-only placed render
+targets are covered, render targets placed in tier-2 mixed heaps are not.
+The log tells: `memory type 0 is compressible VRAM`, then patch 11's
+counters (compressible memories and MiB, compressed image binds) against
+the patch 11 run (6 memories, 1971 MiB, 67 binds).
+
+
+### Corruption with patches 11 and 13
+
+Counter-Strike 2 (D3D11 through DXVK), driver 403.1/404.1:
+`NVK_RM_COMPRESS_ALL=1` drew a huge stretched "beam" (vertex or draw
+parameters read wrong); `NVK_RM_COMPRESS_TYPE=1` draws one agent model's
+body black while its mask, trousers and the other models are fine (a
+per-texture fault). Both default off.
+
+Candidates, from the sources:
+
+1. **Host (PBDMA) reads of compressible memory (patch 11 only).** NVK
+   feeds indirect draw and dispatch arguments, draw counts, conditional
+   rendering values and generated commands to the GPU as GPFIFO segments
+   that point into the application's buffer
+   (`nvk_cmd_buffer_push_indirect`): the PBDMA fetches them as pushbuffer
+   data. Neither NVIDIA's driver nor upstream NVK ever puts such buffers
+   in compressible memory (upstream compresses dedicated images only), and
+   nothing says the host fetch path decompresses. Indirect arguments
+   written by a culling compute shader through kind 0x8 and fetched raw
+   would give exactly garbage draws. Patch 13 keeps every buffer except
+   transfer-only ones out of compressible memory, and the beam is gone
+   with it, which fits.
+2. **Stale compression state on reused pages (11 and 13).** On GB20x RM
+   scrubs freed VRAM with copy-engine writes in physical mode
+   (`memmgrScrubRegistryOverrides_GA100` only sets
+   `bUseVasForCeMemoryOps` for SR-IOV heavy), i.e. without a PTE kind,
+   so the compression state of those pages is not reset. A new
+   compressible allocation read before it is written through kind 0x8
+   (or written partially) can then return garbage instead of zeros. NVK
+   does not clear new memory unless asked.
+3. **Sub-allocated compressed render targets or UAVs (13).** New with 13:
+   a compressed image on its own VA in a shared allocation; dedicated
+   compressed images (patch 0028, on by default) have been fine.
+4. **Uncompressed images on kind 0x8 (11 and 13).** Sampled-only
+   textures in compressible memory are mapped 0x8 with compression off in
+   their state; texture headers carry no compression field (only
+   `SECTOR_PROMOTION`), so the descriptor is not the problem, but the
+   copy-engine uploads and texture reads through 0x8 are new.
+5. **I2M (11).** `vkCmdUpdateBuffer` of up to 2012 bytes is written by
+   the 3D class's inline-to-memory DMA, which DXVK uses for small buffer
+   updates. Not ruled out, but patch 13 keeps those buffers out too.
+
+Test matrix (Counter-Strike 2, same spot; patch 15 gives the knobs):
+
+| run | settings | reading |
+|---|---|---|
+| A | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_CLEAR=1` | model fixed: stale compression state (2); keep `CLEAR` as the fix |
+| B | `NVK_RM_COMPRESS_TYPE=1 NVK_DEBUG=no_compression` | fixed: compression of sub-allocated images (3); still black: the memory or kind itself (2 or 4) |
+| C | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_TYPE_SCOPE=attachments` | fixed: something about uncompressed images in compressible memory (4) |
+| D | `NVK_RM_COMPRESS_TYPE=1 NVK_RM_COMPRESS_UPGRADE=0` | fixed (with C fixed too): reads or writes of those images through kind 0x8 |
+| E | `NVK_RM_COMPRESS_ALL=1 NVK_RM_COMPRESS_CLEAR=1` | beam gone: stale state (2) was also the beam; beam stays: host reads (1) or I2M (5), and patch 11 stays retired in favour of 13 |
 
 ### GPU time against NVIDIA in D3D11-through-DXVK shapes (patch 8)
 
@@ -175,19 +458,19 @@ guest/nvk-rm/build.sh /path/to/mesa build-dir
 ```
 
 The script clones Mesa if needed, checks out the base commit on a local
-branch `nvk-rm`, applies `patches/` and then `patches-common/` with `git am`
-(skipped if already applied), points meson at `guest/rmclient/include/rmclient.h` through a
+branch `nvk-rm`, applies the series with `git am` (skipped if already
+applied), points meson at `guest/rmclient/include/rmclient.h` through a
 throwaway `rmclient.pc`, and builds only NVK:
 
 ```sh
 meson setup build-rm -Dvulkan-drivers=nouveau -Dgallium-drivers= \
-    -Dnvk-rm=enabled -Dbuildtype=release -Db_ndebug=true
+    -Dnvk-rm=enabled -Dbuildtype=debugoptimized
 ninja -C build-rm src/nouveau/vulkan/libvulkan_nouveau.so \
     src/nouveau/vulkan/nouveau_devenv_icd.x86_64.json
 ```
 
-By hand: `git am guest/nvk-rm/patches/*.patch guest/nvk-rm/patches-common/*.patch`
-on the base commit, then the two commands above. librmclient is not needed to build (only its header, and
+By hand: `git am guest/nvk-rm/patches/*.patch` on the base commit, then the
+two commands above. librmclient is not needed to build (only its header, and
 a copy is in patch 2).
 
 Build dependencies (Ubuntu 24.04; this is what the host needed on top of its
@@ -198,8 +481,7 @@ libclc-20-dev` (for `mesa_clc`), `libxshmfence-dev`, plus the usual Mesa
 deps (libdrm, libelf, wayland, xcb, glslang, python3-mako/yaml).
 
 Verified on the host: the series applies to the base commit and builds, both
-with `-Dnvk-rm=enabled` and without it (plain nouveau NVK), `patches-common/`
-included.
+with `-Dnvk-rm=enabled` and without it (plain nouveau NVK).
 
 ## Windows build (cross-compiled, first bring-up)
 
@@ -235,6 +517,11 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 53 | `nvk/rm: helios_icd_interface version 6, queue_rm_fence_v3 (the semaphore and copy source of a composed present)` | `queue_rm_fence_v3(device, queue, memory, image, &fence, &value, &copy)`: `queue_rm_fence` plus `struct helios_icd_rm_copy`, the producer's semaphore (root client, `hSemaphoreMem` of the timeline's semaphore surface, `entry * entry_size`, the fence's value) and the presented image's RM memory and `helios_image_layout` (one plane, dedicated, uncompressed, block-linear only with the PTE kind its modifier names). `VK_INCOMPLETE` = the fence without a description. The D3D11 UMD wraps it in the `'HEF3'` record of the copy-engine Present (`guest/windows/docs/rm-copy-engine-present.md` 12) |
 | 54 | `wsi/win32: opt-in per-present frame-time log (HELIOS_VK_FRAMETIME=1)` | PresentMon sees no frames from a native Vulkan app on NVK: the Helios scanout present is a `D3DKMTEscape` (librmclient) and the GDI fallback a `StretchBlt`, so there is no DXGI `Present` and no DxgKrnl present/flip/blit event for the process. With `HELIOS_VK_FRAMETIME=1` each `vkQueuePresentKHR` stores two QPC reads per swapchain in a lock-free ring; a thread writes `%ProgramData%\Helios\vkframes-<pid>.csv` about once a second (`HELIOS_VK_FRAMETIME_DIR` overrides the folder; the rest at swapchain destruction and process exit) with PresentMon v1 column names `Application,ProcessID,SwapChainAddress,Runtime,TimeInSeconds,MsBetweenPresents,MsInPresentAPI,Result`, readable by `guest/windows/ci/vmtest/pmpace.ps1`. Off by default, Windows only |
 | 55 | `wsi/win32: the frame-time log says what it did, and falls back to %TEMP%` | The log starts at `wsi_device_init` (vkEnumeratePhysicalDevices) instead of the first present and writes `vkframes-<pid>.log` next to the CSV: the variable as the environment block (`GetEnvironmentVariableA`) and the CRT see it, the files, each swapchain (size, present mode, images, Helios scanout / DXGI / GDI), the first present, the flush thread starting, totals at exit. An unwritable folder falls back to `%TEMP%`; failures also go to `OutputDebugString` and stderr. No files at all = NVK's WSI never loaded in that process (e.g. the Helios policy sent it to Venus); files without rows = it never presented through NVK |
+| 57 | `nvk/rm, wsi/win32: say where a VK_ERROR_DEVICE_LOST comes from` | The loss-epoch check made sync waits/signals/reads and CPU wait steps return `VK_ERROR_DEVICE_LOST` silently: the first device to see the epoch move now logs it once per process (`NVK: RM device lost: librmclient loss epoch A -> B`). With `HELIOS_VK_FRAMETIME=1`, failing `vkAcquireNextImageKHR` (and its semaphore/fence signal) and `vkQueuePresentKHR` results go to `vkframes-<pid>.log` and `OutputDebugString` (first 32). For Basemark GPU Vulkan's exit -4 before its first present (395.1) |
+| 58 | `wsi/win32, nvk: composed present through a D3D11 flip swap chain (NVK_HELIOS_WSI_COMPOSE=1)` | Opt-in replacement for the GDI path under a DWM on NVK (patch 50): per window a D3D11 device on the Helios adapter (`MESA_WSI_COMPOSE_ADAPTER=<n>` overrides the pick) and a DXGI flip swap chain; each swapchain image is a D3D11 shared texture whose resource id and layout the WSI reads with `D3DKMTOpenResource` (`HeliosWddmOpenIdentity`, `HeliosWddmAllocLayout`) and NVK imports by resource id (patch 31); a present copies the texture into the back buffer and calls `Present` (sync interval 1 for FIFO). Every failure is logged (`MESA-WSI: compose: ...`) and falls back to scanout or GDI. `wsi_common_win32_compose.cpp` |
+| 59 | `wsi/win32, nvk: the composed present writes its own log (helios-wsi-<pid>.log)` | MESA_LOG_FILE output does not appear in the guest: with `NVK_HELIOS_WSI_COMPOSE=1` every composed-path milestone and failure also goes to `%ProgramData%\Helios\helios-wsi-<pid>.log` (`HELIOS_VK_FRAMETIME_DIR` overrides, `%TEMP%` fallback), independent of `HELIOS_VK_FRAMETIME`; failures marked `FAIL` and sent to `OutputDebugString`; a refused import logs the KMD record next to the image's size, row pitch and offset |
+| 60 | `wsi/win32: the composed present waits for the copy at acquire, not at present` | The present ends an event query after the D3D11 copy into the back buffer and returns; acquire waits for the chosen image's copy (outside the swapchain lock, within the app's timeout; an infinite acquire gives up after 2 s with a log line). The immediate context runs under its own lock |
+| 61 | `wsi/win32, util/log: report composed acquire and present failures; MESA_LOG_FILE on Windows` | Mesa honoured `MESA_LOG_FILE` only outside Windows (the file logger setup was under `!DETECT_OS_WINDOWS`), so NVK's errors never reached a file in the guest: Windows now opens it (append). With the composed path in use, every failing acquire/present (and the composed acquire's own failures: no idle image within the timeout with the idle/held counts, an unfinished copy, a broken swapchain) goes to `helios-wsi-<pid>.log`. For Basemark GPU Vulkan exiting before its first present under compose (398.1) |
 | 45 | `nvk/rm: host-visible VRAM has no fixed budget; a full heap falls back to system memory` | Replaces patch 22's 256 MiB budget: the BAR heap is sized from BAR1 (one big page below VRAM so it never reads as a full ReBAR) and is no longer a hard limit. An allocation past the reported size goes to system memory, as one whose CPU map the host refused (patch 25) already did, and neither is charged to the heap. The host's window is the real limit. A full heap used to return `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which DXVK latched in the command buffer it was recording and `vkEndCommandBuffer` then failed. `NVK_RM_BAR_MB` still overrides the reported size (0 = off) |
 | 44 | `nvk/rm: a device whose KMD went away touches none of its mappings` | Windows device loss (a live driver update or device restart under a running NVK process): librmclient registers every KMD view of RM memory in the loss table it shares with the Venus ICD and the Helios UMD (`guest/windows/umd_common/bridge/helios_kmdmap.h`), so a vanished view reads as zero pages, and the loss epoch moves (`crm_win_loss_epoch`, optional). A device records the epoch at creation; once it moves, exec-context flush/exec/wait/signal/sync, every CPU wait step and sync signal/get_value return `VK_ERROR_DEVICE_LOST` before touching a mapping, and new syncs are CPU-only. Fixes the crash in `nvkmd_rm_exec_ctx_flush` writing GP_PUT into a USERD view the KMD had unmapped (323.1, `vulkan_nouveau.dll+0x5dbf61`). After a loss librmclient sends no escape: the process needs restarting to use RM again |
 
@@ -561,6 +848,7 @@ pins another one. `patches-windows-dxvk/` is applied after
 | 2 | no `VK_KHR_present_id`/`present_wait(2)` on Windows | the Win32 WSI has no `wait_for_present`; DXVK uses present wait when offered and hit `assert(swapchain->wait_for_present)` |
 | 3 | R/B swizzle in the GDI present for R8G8B8A8 swapchains | the DIB is BGRA; DXVK picked `R8G8B8A8_UNORM`, so the sky came out orange |
 | 4 | `NVK_RM_WAIT_SPIN`, `NVK_RM_WAIT_POLL_MS` | knobs for measuring the CPU wait path |
+| 6 | CPU waits without a host round trip per wake; CPU signals wake waiters | a wake no longer reads the event's data (`NV_ESC_RM_GET_EVENT_DATA`, a synchronous host escape of ~60-100 us, ~10 per frame in a D3D11 game, that never finds anything: the non-stall event is allocated `NV01_EVENT_WITHOUT_EVENT_DATA`; `NVK_RM_EVENT_DRAIN=1` reads as before); a host signal or a raised pending value kicks the process's wait handle through librmclient's `crm_win_event_kick` instead of waiting for the next GPU interrupt or the 10 ms poll (`NVK_RM_CPU_KICK=0` off); `NVK_RM_WAIT_SPIN_US=N` polls N us before blocking (default 0). Needs librmclient with `crm_win_event_kick` for the kick (older: as before) |
 
 The upstream DXVK 3.1.1 release `d3d11.dll` is quarantined by Windows
 Defender in the guest (a false positive). The fork build is not.
@@ -801,6 +1089,8 @@ The canonical Windows build: every finished NVK-on-RM patch in one series.
 | 6 | `patches-windows/0027-0029` | L2-cached sysmem, compression, ZCULL info (`NVK_RM_SYSMEM_CACHED=0`, `NVK_RM_COMPRESSION=0`, `NVK_RM_ZCULL=0`) |
 | 7 | `patches-windows/0035` | H.264 decode on NVDEC (`NVK_EXPERIMENTAL=video`) |
 | 8 | `patches-windows-dxvk/0001-0004` | what DXVK needs |
+| 8a | `patches-windows-dxvk/0005` | window swapchains: composed present by default under a DWM on NVK (`NVK_HELIOS_WSI_COMPOSE=0` = GDI), IMMEDIATE/MAILBOX offered (`MESA_WSI_WIN32_FIFO_ONLY=1` = FIFO only), composed presents on a thread with no CPU wait in `vkQueuePresentKHR` (`MESA_WSI_COMPOSE_THREAD=0` = on the app thread) |
+| 8b | `patches-windows-dxvk/0006` | CPU wait path: no event-data read per wake (`NVK_RM_EVENT_DRAIN=1` restores it), CPU signals kick waiters (`NVK_RM_CPU_KICK=0` off), `NVK_RM_WAIT_SPIN_US` |
 | 9 | `patches-common/0001-0007` | per-draw cost (shared with the Linux series) |
 
 0023 (S3's Helios ICD interface) is not in this stack: S3 stages its own

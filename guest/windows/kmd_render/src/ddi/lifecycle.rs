@@ -233,6 +233,9 @@ fn start_generation_mirrors() {
     crate::ddi::blt_async::reset_for_start();
     // `GuestBlob` (default 0): the knob read again and mirrored (`GbKnob`), counters zeroed.
     crate::ddi::guest_blob::reset_for_start();
+    // `CopyQueue` (default 0): the knob read again (the Venus bring-up below creates the device
+    // with it) and mirrored (`CqKnob`), the bring-up block reset, the counters zeroed.
+    crate::ddi::copy_queue::reset_for_start();
     // `RmCopyEngine` (default 0): the knob read again and mirrored (`CeKnob`), counters zeroed.
     crate::virtio::rm_client::ce_channel::reset_for_start();
     // The copy-engine Present record (M3c-0): `CeRec*` zeroed.
@@ -245,9 +248,6 @@ fn start_generation_mirrors() {
     crate::virtio::rm_client::vidmem::reset_for_start();
     crate::ddi::vram_redirect::reset_for_start();
     crate::ddi::ce_sysmem::reset_for_start();
-    // `CopyQueue` (default 0): the knob read again (the Venus bring-up below creates the device
-    // with it) and mirrored (`CqKnob`), the bring-up block reset, the counters zeroed.
-    crate::ddi::copy_queue::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();
@@ -504,11 +504,16 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // display half: it serves the foreign scanout sources and the RM ring presenter,
     // which exist only there. A render-only start acks nothing new (the host then keeps
     // no release bookkeeping for this guest).
+    // `FlipDoneHost`: the host's presentation feedback (`NVGPU_F_SCANOUT_PRESENTED`) likewise,
+    // and only with the knob.
     match crate::virtio::VirtioGpu::init(
         passive,
         unsafe { &*dxgkrnl_interface },
         msi_granted,
         knobs.display_half,
+        crate::ddi::host_flip_done::wants_feature(knobs.flip_done, knobs.display_half),
+        // `HwCursorQ` (default 1): the cursor's own queue when the host and the VMM have it.
+        crate::diag::read_config_dword(crate::diag::knobs::HW_CURSOR_Q, 1) != 0,
     ) {
         Ok(mut gpu) => {
             let Some(generation) = adapter.producer.start_transport() else {
@@ -641,6 +646,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // `IndepFlip` (independent flip, stage S-1): the mode this generation counts under, and the
     // `Idf*` block zeroed (`IdfKnob` written, 0 included).
     crate::ddi::indep_flip::reset_for_start(&knobs);
+    // `FlipDoneHost`: the mode this generation runs (off unless the host took the ack), the
+    // `Fdh*` block zeroed (`FdhKnob`, `FdhAck` written).
+    crate::ddi::host_flip_done::reset_for_start(
+        knobs.flip_done,
+        adapter
+            .with_virtio(|v| v.scanout_presented_on())
+            .unwrap_or(false),
+    );
     // `HwCursor`: the caps this generation reports, the `Cur*` block zeroed, the cursor image of
     // the last generation forgotten (its id may name another resource now).
     crate::ddi::hw_cursor::reset_for_start(adapter, &knobs);

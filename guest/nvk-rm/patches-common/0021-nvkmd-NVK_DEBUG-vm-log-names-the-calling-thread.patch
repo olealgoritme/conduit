@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 22:31:02 +0200
+Subject: [PATCH] nvkmd: NVK_DEBUG=vm log names the calling thread
+
+The thread column was only the thread id, so a capture could not say
+which thread freed a memory object (DXVK's queue thread after its
+timeline wait, its CS thread, or the application's).  It is now
+t<id>(<name>) with the name from GetThreadDescription (looked up at run
+time; DXVK names its threads dxvk-cs, dxvk-queue and so on), cached per
+thread once it has one, with spaces, parentheses and anything but
+printable ASCII replaced by '_' so the column stays one field.  A thread
+without a name prints t<id> as before.  Nothing changes without
+NVK_DEBUG=vm.
+---
+ src/nouveau/vulkan/nvkmd/nvkmd.c | 56 +++++++++++++++++++++++++++++---
+ 1 file changed, 52 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index 58bc458c..315fa83d 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -38,7 +38,7 @@
+  * local wall-clock time (to line up with the host's Xid messages), the time
+  * since the log started and the calling thread.  Lines look like
+  *
+- *    NVKVM 19:31:02.417 +12.345678 t1234 va+   [0x3ecc000000,0x3ecc400000) 0x400000 kind 0x6 flags 0x0
++ *    NVKVM 19:31:02.417 +12.345678 t1234(dxvk-cs) va+   [0x3ecc000000,0x3ecc400000) 0x400000 kind 0x6 flags 0x0
+  *    NVKVM 19:31:02.418 +12.346001 t1234 bind  [0x3ecc000000,0x3ecc400000) 0x400000 mem<0xcaf00012>+0x0
+  *    NVKVM 19:31:05.002 +14.930112 t5678 va-   [0x3ecc000000,0x3ecc400000) 0x400000
+  *
+@@ -103,6 +103,52 @@ nvkmd_vm_log_tid(void)
+ #endif
+ }
+ 
++/* The calling thread's name (SetThreadDescription; DXVK names its threads
++ * dxvk-cs, dxvk-queue, dxvk-submit and so on), with every character that
++ * is not printable ASCII or is a space, '(' or ')' replaced by '_', so the
++ * thread column stays one field.  "" when the thread has none (asked again
++ * on its next line, as threads are often named after they start).
++ */
++static const char *
++nvkmd_vm_log_thread_name(void)
++{
++#ifdef _WIN32
++   static _Thread_local char name[48];
++   static _Thread_local bool named;
++   if (named)
++      return name;
++
++   typedef HRESULT (WINAPI *get_desc_fn)(HANDLE, PWSTR *);
++   static get_desc_fn get_desc;
++   static bool looked_up;
++   if (!looked_up) {
++      HMODULE k32 = GetModuleHandleA("kernel32.dll");
++      if (k32 != NULL)
++         get_desc = (get_desc_fn)(void *)GetProcAddress(k32, "GetThreadDescription");
++      looked_up = true;
++   }
++   if (get_desc == NULL)
++      return "";
++
++   PWSTR desc = NULL;
++   if (FAILED(get_desc(GetCurrentThread(), &desc)) || desc == NULL)
++      return "";
++
++   size_t n = 0;
++   for (; desc[n] != 0 && n < sizeof(name) - 1; n++) {
++      const WCHAR c = desc[n];
++      name[n] = (c > 0x20 && c < 0x7f && c != '(' && c != ')') ? (char)c : '_';
++   }
++   name[n] = '\0';
++   LocalFree(desc);
++
++   named = n > 0;
++   return name;
++#else
++   return "";
++#endif
++}
++
+ static void
+ nvkmd_vm_log_flush(void)
+ {
+@@ -146,7 +192,7 @@ nvkmd_vm_log_open_locked(void)
+    nvkmd_vm_log.last_flush_ns = nvkmd_vm_log.base_ns;
+ 
+    fprintf(fp, "# NVK_DEBUG=vm log, pid %u; columns: NVKVM local-time "
+-               "+seconds-since-start thread op [va-start,va-end) size ...\n",
++               "+seconds-since-start t<thread-id>(<name>) op [va-start,va-end) size ...\n",
+            nvkmd_vm_log_pid());
+    fflush(fp);
+    mesa_logi("NVK: NVK_DEBUG=vm log in %s", path);
+@@ -168,11 +214,13 @@ nvkmd_vm_logf(bool flush, const char *fmt, ...)
+       (nvkmd_vm_log.base_wall_ms + rel_ns / 1000000) % (24ull * 3600 * 1000);
+ 
+    FILE *fp = nvkmd_vm_log.fp;
+-   fprintf(fp, "NVKVM %02u:%02u:%02u.%03u +%" PRIu64 ".%06u t%u ",
++   const char *thread_name = nvkmd_vm_log_thread_name();
++   fprintf(fp, "NVKVM %02u:%02u:%02u.%03u +%" PRIu64 ".%06u t%u%s%s%s ",
+            (unsigned)(wall_ms / 3600000), (unsigned)(wall_ms / 60000 % 60),
+            (unsigned)(wall_ms / 1000 % 60), (unsigned)(wall_ms % 1000),
+            rel_ns / 1000000000, (unsigned)(rel_ns / 1000 % 1000000),
+-           nvkmd_vm_log_tid());
++           nvkmd_vm_log_tid(), thread_name[0] ? "(" : "", thread_name,
++           thread_name[0] ? ")" : "");
+ 
+    va_list args;
+    va_start(args, fmt);

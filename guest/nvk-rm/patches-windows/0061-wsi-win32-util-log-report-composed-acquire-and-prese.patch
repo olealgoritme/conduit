@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 15:33:46 +0200
+Subject: [PATCH] wsi/win32, util/log: report composed acquire and present
+ failures; MESA_LOG_FILE on Windows
+
+Basemark GPU Vulkan with NVK_HELIOS_WSI_COMPOSE=1 (398.1) exits after
+3.35 s with 0 presents, and nothing says which call failed: the WSI
+logged no failure, and NVK's own errors (vk_errorf, device loss) go to
+the Mesa log, which never reached a file on Windows.
+
+- util/log: MESA_LOG_FILE was only honoured outside Windows (the whole
+  file logger setup sat under !DETECT_OS_WINDOWS), so on Windows Mesa's
+  log went to stderr and OutputDebugString only. Windows now opens it
+  too, appending.
+- With the composed path in use, every failing WSI call that patch 57
+  reports (acquire, its semaphore/fence signal, present) also goes to
+  helios-wsi-<pid>.log, with or without HELIOS_VK_FRAMETIME (first 64).
+- The composed acquire logs its own failures: no idle image within the
+  timeout (with how many images are idle and held by the application),
+  a copy out of the image not finished in time, and an acquire on a
+  swapchain a failed present broke; a failed composed present logs its
+  VkResult.
+---
+ src/util/log.c                              | 11 ++++++++
+ src/vulkan/wsi/wsi_common_private.h         |  1 +
+ src/vulkan/wsi/wsi_common_win32.cpp         | 30 ++++++++++++++++++---
+ src/vulkan/wsi/wsi_common_win32_compose.cpp |  9 +++++++
+ src/vulkan/wsi/wsi_common_win32_frametime.c |  6 +++++
+ 5 files changed, 54 insertions(+), 3 deletions(-)
+
+diff --git a/src/util/log.c b/src/util/log.c
+index b594a8f8..d299f27a 100644
+--- a/src/util/log.c
++++ b/src/util/log.c
+@@ -161,6 +161,17 @@ mesa_log_init_once(void)
+             fp = fopen(log_file, "w");
+       }
+ 
++      if (fp) {
++         mesa_log_file = fp;
++         mesa_log_control |= MESA_LOG_CONTROL_FILE;
++      }
++   }
++#else
++   /* Windows: MESA_LOG_FILE too (stderr of a GUI process goes nowhere).
++    * Appended, so several devices or modules of one process share it. */
++   {
++      const char *log_file = os_get_option("MESA_LOG_FILE");
++      FILE *fp = log_file ? fopen(log_file, "a") : NULL;
+       if (fp) {
+          mesa_log_file = fp;
+          mesa_log_control |= MESA_LOG_CONTROL_FILE;
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index a349f591..6a8d5c6c 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -442,6 +442,7 @@ void wsi_win32_compose_image_destroy(struct wsi_win32_compose *compose,
+ VkResult wsi_win32_compose_present(struct wsi_win32_compose *compose,
+                                    struct wsi_win32_compose_image *image,
+                                    uint32_t sync_interval);
++bool wsi_win32_compose_in_use(void);
+ VkResult wsi_win32_compose_image_wait(struct wsi_win32_compose *compose,
+                                       struct wsi_win32_compose_image *image,
+                                       uint64_t timeout_ns);
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 7213f7de..f21dff92 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -936,8 +936,11 @@ wsi_win32_queue_present_compose(struct wsi_win32_swapchain *chain,
+       wsi_win32_compose_present(chain->surface->compose, &image->compose,
+                                 chain->compose.sync_interval);
+    chain->compose.presented = true;
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
+       chain->status = result;
++      wsi_win32_compose_log(true, "compose: present of image %u: %d",
++                            (unsigned)(image - chain->images), (int)result);
++   }
+ 
+    mtx_lock(&chain->acquire_mutex);
+    image->state = WSI_IMAGE_IDLE;
+@@ -1316,8 +1319,21 @@ wsi_win32_acquire_composed_image(struct wsi_win32_swapchain *chain,
+    const uint64_t start = os_time_get_nano();
+    VkResult result = wsi_win32_acquire_idle_cpu_image(chain, info,
+                                                       out_image_index);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      uint32_t idle = 0, drawing = 0;
++      mtx_lock(&chain->acquire_mutex);
++      for (uint32_t i = 0; i < chain->base.image_count; i++) {
++         idle += chain->images[i].state == WSI_IMAGE_IDLE;
++         drawing += chain->images[i].state == WSI_IMAGE_DRAWING;
++      }
++      mtx_unlock(&chain->acquire_mutex);
++      wsi_win32_compose_log(true, "compose: acquire (timeout %" PRIu64 " ns) "
++                            "found no idle image: %d; %u idle, %u held by the "
++                            "application, %u images", info->timeout,
++                            (int)result, idle, drawing,
++                            chain->base.image_count);
+       return result;
++   }
+ 
+    struct wsi_win32_image *image = &chain->images[*out_image_index];
+    const uint64_t spent = os_time_get_nano() - start;
+@@ -1325,6 +1341,10 @@ wsi_win32_acquire_composed_image(struct wsi_win32_swapchain *chain,
+                          info->timeout > spent ? info->timeout - spent : 0;
+    result = wsi_win32_compose_image_wait(chain->surface->compose,
+                                          &image->compose, left);
++   if (result != VK_SUCCESS)
++      wsi_win32_compose_log(true, "compose: acquire: the copy out of image %u "
++                            "did not finish within %" PRIu64 " ns: %d",
++                            *out_image_index, left, (int)result);
+    if (result == VK_TIMEOUT || result == VK_NOT_READY) {
+       /* Still being copied within the app's timeout: give it back */
+       mtx_lock(&chain->acquire_mutex);
+@@ -1344,8 +1364,12 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+       (struct wsi_win32_swapchain *)drv_chain;
+ 
+    /* Bail early if the swapchain is broken */
+-   if (chain->status != VK_SUCCESS)
++   if (chain->status != VK_SUCCESS) {
++      if (chain->compose.enabled)
++         wsi_win32_compose_log(true, "compose: acquire on a broken swapchain: %d",
++                               (int)chain->status);
+       return chain->status;
++   }
+ 
+    /* acquire timeout has to be explicitly handled for sw wsi */
+    if (!chain->dxgi && chain->scanout.release)
+diff --git a/src/vulkan/wsi/wsi_common_win32_compose.cpp b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+index 6ec2f2ed..8b54ce93 100644
+--- a/src/vulkan/wsi/wsi_common_win32_compose.cpp
++++ b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+@@ -236,9 +236,18 @@ log_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+    return TRUE;
+ }
+ 
++static bool compose_used;
++
++bool
++wsi_win32_compose_in_use(void)
++{
++   return compose_used;
++}
++
+ void
+ wsi_win32_compose_log(bool failure, const char *fmt, ...)
+ {
++   compose_used = true;
+    InitOnceExecuteOnce(&log_once, log_init, NULL, NULL);
+    char line[1024];
+    va_list ap;
+diff --git a/src/vulkan/wsi/wsi_common_win32_frametime.c b/src/vulkan/wsi/wsi_common_win32_frametime.c
+index 95a1cefe..ef2d78ee 100644
+--- a/src/vulkan/wsi/wsi_common_win32_frametime.c
++++ b/src/vulkan/wsi/wsi_common_win32_frametime.c
+@@ -282,6 +282,12 @@ void
+ wsi_win32_frametime_result(const char *what, VkResult result)
+ {
+    static _Atomic uint32_t count;
++   static _Atomic uint32_t compose_count;
++   /* The composed path's own log gets every failing WSI call too (first 64),
++    * with or without HELIOS_VK_FRAMETIME */
++   if (wsi_win32_compose_in_use() &&
++       atomic_fetch_add(&compose_count, 1) < 64)
++      wsi_win32_compose_log(true, "%s returned %d", what, (int)result);
+    if (!ft.enabled)
+       return;
+    const uint32_t n = atomic_fetch_add(&count, 1);
+-- 
+2.43.0
+

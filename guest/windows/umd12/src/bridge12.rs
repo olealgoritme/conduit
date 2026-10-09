@@ -181,6 +181,18 @@ mod ffi {
         /// NVK only: close an RM fence this process still owns.
         fn nvk_rm_fence_close(self: &HeliosVkd3dDevice, fence_handle: u32);
 
+        /// NVK only: show `resource` on scanout 0 once ECL fence value `value`
+        /// of `queue` fired. 0 = queued.
+        ///
+        /// # Safety
+        /// `resource` and `queue` are borrowed live engine objects of this device.
+        unsafe fn nvk_scanout_present_fenced(
+            self: &HeliosVkd3dDevice,
+            resource: usize,
+            queue: usize,
+            value: u64,
+        ) -> i32;
+
         /// S5, NVK only: wait for the queue's execution stream to reach `value`.
         ///
         /// # Safety
@@ -256,6 +268,15 @@ mod ffi {
 
         /// The engine's memory placement counters; returns how many it wrote.
         fn helios_vkd3d_bridge_memory_stats(out: &mut [u64]) -> u32;
+
+        /// The engine's GPU timestamp counters; returns how many it wrote.
+        fn helios_vkd3d_bridge_gpu_time_stats(out: &mut [u64]) -> u32;
+
+        /// NVK: make the queue's next ECL fence now.
+        ///
+        /// # Safety
+        /// `queue` is a borrowed live engine `ID3D12CommandQueue*`.
+        unsafe fn helios_vkd3d_bridge_prepare_ecl_fence(queue: usize) -> i32;
 
         /// # Safety
         /// All engine objects and API-typed arrays are live for this call.
@@ -666,6 +687,17 @@ impl BridgeDevice12 {
         self.get().is_some_and(|d| d.nvk_ecl_fence_caps() & 3 == 3)
     }
 
+    /// NVK only: queue a scanout flip of `resource` for when ECL fence value
+    /// `value` of `queue` fires. True if queued; false = present another way.
+    ///
+    /// # Safety
+    /// `resource` and `queue` are borrowed live engine objects of this device.
+    pub(crate) unsafe fn nvk_scanout_present_fenced(&self, resource: usize, queue: usize, value: u64) -> bool {
+        // SAFETY: forwarded precondition.
+        self.get()
+            .is_some_and(|d| unsafe { d.nvk_scanout_present_fenced(resource, queue, value) } == 0)
+    }
+
     /// NVK only: close an RM fence this process still owns.
     pub(crate) fn nvk_rm_fence_close(&self, fence_handle: u32) {
         if let Some(d) = self.get() {
@@ -721,9 +753,6 @@ pub(crate) unsafe fn execute_rm(
     }
 }
 
-/// The engine's ECL fence counters (`helios_vkd3d_ecl_fence_stats`): signals,
-/// commit-to-signal sum and max (us), signal failures, values reserved, fences
-/// made, creates failed, then 7 histogram buckets.
 /// The engine's memory placement counters (`helios_vkd3d_memory_stats`, vkd3d
 /// patch 0005), in its layout: live bytes per memory type (32), bytes and
 /// allocations per (request class, type) (5 x 32 each), per-type
@@ -738,9 +767,37 @@ pub(crate) fn memory_stats() -> Option<Box<[u64; MEMORY_STATS_LEN]>> {
 /// Values in [`memory_stats`].
 pub(crate) const MEMORY_STATS_LEN: usize = 385;
 
-pub(crate) fn ecl_fence_stats() -> [u64; 14] {
-    let mut out = [0u64; 14];
+/// The engine's ECL fence counters (`helios_vkd3d_ecl_fence_stats`): signals,
+/// commit-to-signal sum and max (us), signal failures, values reserved, fences
+/// made, creates failed, then 7 histogram buckets; then (vkd3d patch 0006)
+/// admissions, commit-to-admission sum (us), its 7 buckets, the ECL fences'
+/// admission-to-signal sum (us), inline producer signals, separate ones; then
+/// (patch 0009) fences made ahead and those taken. An engine without a patch
+/// leaves its values zero.
+pub(crate) fn ecl_fence_stats() -> [u64; 28] {
+    let mut out = [0u64; 28];
     ffi::helios_vkd3d_bridge_ecl_fence_stats(&mut out);
+    out
+}
+
+/// NVK (vkd3d patch 0009): make `queue`'s next ECL fence now, so that ECL's
+/// HE12 v4 Render does not wait for the fence-create escape.
+///
+/// # Safety
+/// `queue` is a borrowed live engine `ID3D12CommandQueue*`, called under the
+/// queue's execution lock (serialised with its ECLs).
+pub(crate) unsafe fn prepare_ecl_fence(queue: usize) -> bool {
+    // SAFETY: forwarded precondition.
+    unsafe { ffi::helios_vkd3d_bridge_prepare_ecl_fence(queue) >= 0 }
+}
+
+/// The engine's GPU timestamp counters (`helios_vkd3d_gpu_time_stats`, vkd3d
+/// patch 0006, `HELIOS_VKD3D_GPU_TIMESTAMPS=1`): batches, busy sum (ns), idle
+/// gap sum (ns), busy max (ns), unavailable pairs, then busy and gap
+/// histograms (7 buckets each).
+pub(crate) fn gpu_time_stats() -> [u64; 19] {
+    let mut out = [0u64; 19];
+    ffi::helios_vkd3d_bridge_gpu_time_stats(&mut out);
     out
 }
 

@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 01:54:07 +0200
+Subject: [PATCH] nvk: shader statistics per pass and per shader, profile
+ counters fixed
+
+Diagnostics for CS2's depth prepass (4.6-8.6 ms) and shadow pass (~3 ms)
+on GB20x, plus one default change.  No MME macro is added or changed:
+the macros still take 2976 dwords on BLACKWELL_A, as in 405.8 (405.9's
+3303 overflowed the MME instruction RAM).
+
+- NVK_PASS_PROFILE: each render pass line is followed by the shaders its
+  draws used: the largest vertex shader's GPRs, instructions and static
+  cycles, the largest fragment shader's GPRs and instructions, draw calls
+  with a fragment shader and with tessellation or a geometry shader, and
+  the most spills plus fills to memory and local memory (SLM) of any
+  stage.  Counted only when the profile is on.
+- NVK_PASS_PROFILE=2: the vertex shader, clipper and fragment shader
+  invocation counters per pass are reported at their own pipeline
+  locations, as NVK's pipeline statistics queries do.  At location ALL
+  the 3D class rejected them (405.8: Xid 69, SET_REPORT_SEMAPHORE_D data
+  0x0280f002).  The ZCULL counters only with NVK_PASS_PROFILE=3.
+- NVK_SHADER_STATS=1: one line per shader uploaded (compiled or from the
+  disk cache): stage, code hash, size, instructions, GPRs, max warps per
+  SM, static cycles, spills and fills to memory and between register
+  files, SLM and CRS size, and per stage clip/cull/layer, depth writes,
+  early-Z and sample shading, or the workgroup.  To
+  NVK_SHADER_STATS_FILE, else %ProgramData%\Helios\nvk-shaders-<pid>.txt
+  on Windows.
+- NVK_RM_DESC_TABLE_VRAM and NVK_RM_UPLOAD_VRAM default to 0: in CS2 on
+  405.11 descriptor and upload memory in BAR VRAM ran about 10 fps slower
+  than in GPU-cached system memory (32.7/37.6 against 43.8/47.8 fps).
+  =1 keeps them for A/B.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h        |  39 ++++++++
+ src/nouveau/vulkan/nvk_pass_profile.c      |  82 ++++++++++++---
+ src/nouveau/vulkan/nvk_pass_profile.h      |  14 +++
+ src/nouveau/vulkan/nvk_shader.c            | 110 +++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |   3 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c |   4 +-
+ 6 files changed, 235 insertions(+), 17 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index cb8d6f65..0387c4f9 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -352,6 +352,7 @@ struct nvk_cmd_buffer {
+    uint64_t pass_profile_op_groups;
+    uint32_t pass_profile_internal;
+    bool pass_profile_in_pass;
++   bool pass_profile_on;
+    struct nvk_pass_profile_counts pass_profile_pass_counts;
+    struct nvk_pass_profile_counts pass_profile_op_counts;
+    struct nvk_pass_profile_counts pass_profile_cmd_counts;
+@@ -527,6 +528,44 @@ nvk_cmd_profile_count_draws(struct nvk_cmd_buffer *cmd, uint32_t draws,
+          c[i]->ind_draws += draws;
+       }
+    }
++
++   if (likely(!cmd->pass_profile_on))
++      return;
++
++   uint32_t vs_gprs = 0, vs_instrs = 0, vs_cycles = 0, fs_gprs = 0;
++   uint32_t fs_instrs = 0, spills = 0, slm = 0;
++   bool fs = false, tess_gs = false;
++   for (unsigned s = 0; s < ARRAY_SIZE(cmd->state.gfx.shaders); s++) {
++      const struct nvk_shader *sh = cmd->state.gfx.shaders[s];
++      if (sh == NULL)
++         continue;
++      const struct nak_shader_info *info = &sh->info;
++      spills = MAX2(spills, info->num_spills_to_mem + info->num_fills_from_mem);
++      slm = MAX2(slm, info->slm_size);
++      if (s == MESA_SHADER_VERTEX) {
++         vs_gprs = info->num_gprs;
++         vs_instrs = info->num_instrs;
++         vs_cycles = MIN2(info->num_static_cycles, UINT32_MAX);
++      } else if (s == MESA_SHADER_FRAGMENT) {
++         fs = true;
++         fs_gprs = info->num_gprs;
++         fs_instrs = info->num_instrs;
++      } else if (s == MESA_SHADER_TESS_CTRL || s == MESA_SHADER_TESS_EVAL ||
++                 s == MESA_SHADER_GEOMETRY) {
++         tess_gs = true;
++      }
++   }
++   for (unsigned i = 0; i < 3; i++) {
++      c[i]->vs_gprs = MAX2(c[i]->vs_gprs, vs_gprs);
++      c[i]->vs_instrs = MAX2(c[i]->vs_instrs, vs_instrs);
++      c[i]->vs_cycles = MAX2(c[i]->vs_cycles, vs_cycles);
++      c[i]->fs_gprs = MAX2(c[i]->fs_gprs, fs_gprs);
++      c[i]->fs_instrs = MAX2(c[i]->fs_instrs, fs_instrs);
++      c[i]->spills = MAX2(c[i]->spills, spills);
++      c[i]->slm = MAX2(c[i]->slm, slm);
++      c[i]->fs_calls += fs;
++      c[i]->tess_gs_calls += tess_gs;
++   }
+ }
+ 
+ static inline void
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
+index f543f1a5..75891b36 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.c
++++ b/src/nouveau/vulkan/nvk_pass_profile.c
+@@ -111,21 +111,42 @@ struct prof_slot_gpu {
+ 
+ /* NVK_PASS_PROFILE=2: counters sampled at the start and the end of a pass */
+ #define PROF_STATS 8
++/* Each counter is reported at its own pipeline location, as NVK's pipeline
++ * statistics queries do (nvk_3d_stat_queries): at location ALL the 3D class
++ * rejects the report (405.8: Xid 69, SET_REPORT_SEMAPHORE_D data
++ * 0x0280f002).  The ZCULL counters only with NVK_PASS_PROFILE=3.
++ */
++#define PROF_STATS_BASIC 4
+ static const struct {
+    uint32_t report;
++   uint32_t loc;
+    const char *name;
+    bool counter32;
+ } prof_stats[PROF_STATS] = {
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_VS_INVOCATIONS, "vs", false },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_INVOCATIONS, "prims-in", false },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_PRIMITIVES_GENERATED, "prims-out", false },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_PS_INVOCATIONS, "ps", false },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS0, "zc0", true },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS1, "zc1", true },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS2, "zc2", true },
+-   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS3, "zc3", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_VS_INVOCATIONS,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_VERTEX_SHADER, "vs", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_INVOCATIONS,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_VPC, "prims-in", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_CLIPPER_PRIMITIVES_GENERATED,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_VPC, "prims-out", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_PS_INVOCATIONS,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_PIXEL_SHADER, "ps", false },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS0,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_ZCULL, "zc0", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS1,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_ZCULL, "zc1", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS2,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_ZCULL, "zc2", true },
++   { NV9097_SET_REPORT_SEMAPHORE_D_REPORT_ZCULL_STATS3,
++     NV9097_SET_REPORT_SEMAPHORE_D_PIPELINE_LOCATION_ZCULL, "zc3", true },
+ };
+ 
++static unsigned
++prof_stat_count(unsigned level)
++{
++   return level >= 3 ? PROF_STATS : PROF_STATS_BASIC;
++}
++
+ struct prof_stat_gpu {
+    struct prof_report begin[PROF_STATS];
+    struct prof_report end[PROF_STATS];
+@@ -151,6 +172,8 @@ struct prof_sig {
+    uint64_t gpu_ns;
+    uint64_t count;
+    uint64_t calls, draws, ind_calls, ind_draws, queries, barriers;
++   uint64_t fs_calls, tess_gs_calls;
++   uint32_t vs_gprs, vs_instrs, vs_cycles, fs_gprs, fs_instrs, spills, slm;
+    uint64_t stat_count;
+    uint64_t stats[PROF_STATS];
+ };
+@@ -570,9 +593,9 @@ prof_emit_stats(struct nvk_cmd_buffer *cmd, uint32_t stat, bool end)
+                          stat * sizeof(struct prof_stat_gpu) +
+                          (end ? offsetof(struct prof_stat_gpu, end) : 0);
+ 
+-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 2 + PROF_STATS * 5);
+-   P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);
+-   for (unsigned i = 0; i < PROF_STATS; i++) {
++   const unsigned n = prof_stat_count(prof->level);
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, n * 5);
++   for (unsigned i = 0; i < n; i++) {
+       const uint64_t addr = base + i * sizeof(struct prof_report);
+       P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
+       P_NV9097_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
+@@ -580,9 +603,10 @@ prof_emit_stats(struct nvk_cmd_buffer *cmd, uint32_t stat, bool end)
+       P_NV9097_SET_REPORT_SEMAPHORE_C(p, 0);
+       P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
+          .operation = OPERATION_REPORT_ONLY,
+-         .pipeline_location = PIPELINE_LOCATION_ALL,
++         .pipeline_location = prof_stats[i].loc,
+          .report = prof_stats[i].report,
+          .structure_size = STRUCTURE_SIZE_FOUR_WORDS,
++         .flush_disable = true,
+       });
+    }
+ }
+@@ -748,6 +772,7 @@ nvk_pass_profile_end_pass(struct nvk_cmd_buffer *cmd)
+ void
+ nvk_pass_profile_reset_cmd(struct nvk_cmd_buffer *cmd)
+ {
++   cmd->pass_profile_on = nvk_cmd_buffer_device(cmd)->pass_profile != NULL;
+    cmd->pass_profile_slot = -1;
+    cmd->pass_profile_cmd_slot = -1;
+    cmd->pass_profile_op_slot = -1;
+@@ -821,6 +846,15 @@ prof_counts_add(struct nvk_pass_profile_counts *dst,
+    dst->ind_draws += src->ind_draws;
+    dst->queries += src->queries;
+    dst->barriers += src->barriers;
++   dst->vs_gprs = MAX2(dst->vs_gprs, src->vs_gprs);
++   dst->vs_instrs = MAX2(dst->vs_instrs, src->vs_instrs);
++   dst->vs_cycles = MAX2(dst->vs_cycles, src->vs_cycles);
++   dst->fs_gprs = MAX2(dst->fs_gprs, src->fs_gprs);
++   dst->fs_instrs = MAX2(dst->fs_instrs, src->fs_instrs);
++   dst->spills = MAX2(dst->spills, src->spills);
++   dst->slm = MAX2(dst->slm, src->slm);
++   dst->fs_calls += src->fs_calls;
++   dst->tess_gs_calls += src->tess_gs_calls;
+ }
+ 
+ void
+@@ -882,11 +916,19 @@ prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
+    prof_log(prof, "NVK pass profile: %8.2f GPU ms/s %8.1f us each %6" PRIu64
+             "x%s  %s", s->gpu_ns / 1e6 / window_s, s->gpu_ns / 1e3 / n,
+             s->count, extra, s->name);
++   if (s->kind == PROF_KIND_PASS && s->calls > 0) {
++      prof_log(prof, "NVK pass profile:            shaders: vs<=%u gprs "
++               "%u instrs %u cycles, fs<=%u gprs %u instrs in %.1f calls, "
++               "%.1f calls with tess/gs, spills+fills<=%u, slm<=%u B",
++               s->vs_gprs, s->vs_instrs, s->vs_cycles, s->fs_gprs,
++               s->fs_instrs, s->fs_calls / n, s->tess_gs_calls / n,
++               s->spills, s->slm);
++   }
+    if (s->stat_count > 0) {
+       const double sn = (double)s->stat_count;
+       char line[256];
+       int l = 0;
+-      for (unsigned i = 0; i < PROF_STATS && l < (int)sizeof(line); i++)
++      for (unsigned i = 0; i < prof_stat_count(prof->level) && l < (int)sizeof(line); i++)
+          l += snprintf(line + l, sizeof(line) - l, " %s %.0f",
+                        prof_stats[i].name, s->stats[i] / sn);
+       prof_log(prof, "NVK pass profile:            per pass:%s", line);
+@@ -918,9 +960,18 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+       ps->ind_draws += m->counts.ind_draws;
+       ps->queries += m->counts.queries;
+       ps->barriers += m->counts.barriers;
++      ps->fs_calls += m->counts.fs_calls;
++      ps->tess_gs_calls += m->counts.tess_gs_calls;
++      ps->vs_gprs = MAX2(ps->vs_gprs, m->counts.vs_gprs);
++      ps->vs_instrs = MAX2(ps->vs_instrs, m->counts.vs_instrs);
++      ps->vs_cycles = MAX2(ps->vs_cycles, m->counts.vs_cycles);
++      ps->fs_gprs = MAX2(ps->fs_gprs, m->counts.fs_gprs);
++      ps->fs_instrs = MAX2(ps->fs_instrs, m->counts.fs_instrs);
++      ps->spills = MAX2(ps->spills, m->counts.spills);
++      ps->slm = MAX2(ps->slm, m->counts.slm);
+       if (m->stat != 0 && prof->stat_gpu != NULL) {
+          volatile struct prof_stat_gpu *st = &prof->stat_gpu[m->stat - 1];
+-         for (unsigned k = 0; k < PROF_STATS; k++) {
++         for (unsigned k = 0; k < prof_stat_count(prof->level); k++) {
+             uint64_t b, e;
+             if (prof_stats[k].counter32) {
+                b = st->begin[k].payload;
+@@ -1010,6 +1061,9 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+          s->count = 0;
+          s->calls = s->draws = s->ind_calls = s->ind_draws = 0;
+          s->queries = s->barriers = 0;
++         s->fs_calls = s->tess_gs_calls = 0;
++         s->vs_gprs = s->vs_instrs = s->vs_cycles = 0;
++         s->fs_gprs = s->fs_instrs = s->spills = s->slm = 0;
+          s->stat_count = 0;
+          memset(s->stats, 0, sizeof(s->stats));
+       }
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.h b/src/nouveau/vulkan/nvk_pass_profile.h
+index 51bff5b0..66269191 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.h
++++ b/src/nouveau/vulkan/nvk_pass_profile.h
+@@ -27,6 +27,20 @@ struct nvk_pass_profile_counts {
+    uint32_t ind_draws;
+    uint32_t queries;
+    uint32_t barriers;
++   /* Shaders the draws used (maxima over the draws; with NVK_PASS_PROFILE
++    * only): VS registers, instructions and static cycles, spills and fills
++    * to memory and local memory (SLM) of any stage, and the draw calls with
++    * a fragment shader and with tessellation or a geometry shader.
++    */
++   uint32_t vs_gprs;
++   uint32_t vs_instrs;
++   uint32_t vs_cycles;
++   uint32_t fs_gprs;
++   uint32_t fs_instrs;
++   uint32_t spills;
++   uint32_t slm;
++   uint32_t fs_calls;
++   uint32_t tess_gs_calls;
+ };
+ 
+ /* Operations outside render passes, timed as runs of the same kind */
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index 52217226..835fcb11 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -30,6 +30,15 @@
+ 
+ #include "util/mesa-blake3.h"
+ #include "util/u_debug.h"
++#include "util/hash_table.h"
++#include "util/os_misc.h"
++#include "util/simple_mtx.h"
++
++#include <inttypes.h>
++#include <stdio.h>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ #include "cla097.h"
+ #include "clb097.h"
+@@ -683,9 +692,110 @@ nvk_shader_get_shader_size(struct nvk_device *dev, struct nvk_shader *shader,
+    return total_size;
+ }
+ 
++/* NVK_SHADER_STATS=1: one line per shader uploaded (compiled or loaded
++ * from the cache) with NAK's statistics, to NVK_SHADER_STATS_FILE, else on
++ * Windows %ProgramData%\Helios\nvk-shaders-<pid>.txt (then %TEMP%), else
++ * stderr.  The hash is of the shader code, so the same shader is the same
++ * line across runs.  Diagnostics only; off by default.
++ */
++static FILE *
++nvk_shader_stats_file(void)
++{
++   static simple_mtx_t init_mtx = SIMPLE_MTX_INITIALIZER;
++   static FILE *file;
++   static bool done;
++
++   simple_mtx_lock(&init_mtx);
++   if (!done) {
++      done = true;
++      if (debug_get_bool_option("NVK_SHADER_STATS", false)) {
++         const char *path = os_get_option("NVK_SHADER_STATS_FILE");
++         if (path != NULL && path[0] != 0)
++            file = fopen(path, "a");
++#ifdef _WIN32
++         char buf[MAX_PATH];
++         if (file == NULL) {
++            char pd[MAX_PATH];
++            DWORD n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
++            snprintf(buf, sizeof(buf), "%s\\Helios",
++                     n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData");
++            CreateDirectoryA(buf, NULL);
++            snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
++                     "\\nvk-shaders-%lu.txt",
++                     (unsigned long)GetCurrentProcessId());
++            file = fopen(buf, "a");
++         }
++         if (file == NULL) {
++            char tmp[MAX_PATH];
++            DWORD n = GetTempPathA(sizeof(tmp), tmp);
++            if (n > 0 && n < sizeof(tmp)) {
++               snprintf(buf, sizeof(buf), "%snvk-shaders-%lu.txt", tmp,
++                        (unsigned long)GetCurrentProcessId());
++               file = fopen(buf, "a");
++            }
++         }
++#endif
++         if (file == NULL)
++            file = stderr;
++         fprintf(file, "NVK shader stats: stage hash code_B instrs gprs "
++                 "max_warps static_cycles spills_mem fills_mem spills_reg "
++                 "fills_reg slm_B crs_B [stage details]\n");
++         fflush(file);
++      }
++   }
++   simple_mtx_unlock(&init_mtx);
++   return file;
++}
++
++static void
++nvk_shader_log_stats(const struct nvk_shader *shader)
++{
++   FILE *f = nvk_shader_stats_file();
++   if (likely(f == NULL))
++      return;
++
++   const struct nak_shader_info *i = &shader->info;
++   char extra[128] = "";
++   switch (i->stage) {
++   case MESA_SHADER_VERTEX:
++   case MESA_SHADER_TESS_EVAL:
++   case MESA_SHADER_GEOMETRY:
++      snprintf(extra, sizeof(extra), " clip 0x%x cull 0x%x layer %d",
++               i->vtg.clip_enable, i->vtg.cull_enable, i->vtg.writes_layer);
++      break;
++   case MESA_SHADER_FRAGMENT:
++      snprintf(extra, sizeof(extra), " writes_depth %d early_z %d "
++               "sample_shading %d", i->fs.writes_depth,
++               i->fs.early_fragment_tests, i->fs.uses_sample_shading);
++      break;
++   case MESA_SHADER_COMPUTE:
++      snprintf(extra, sizeof(extra), " local %ux%ux%u smem %u",
++               i->cs.local_size[0], i->cs.local_size[1], i->cs.local_size[2],
++               i->cs.smem_size);
++      break;
++   default:
++      break;
++   }
++
++   const uint32_t hash = shader->code_size > 0 ?
++      _mesa_hash_data(shader->code_ptr, shader->code_size) : 0;
++   static simple_mtx_t mtx = SIMPLE_MTX_INITIALIZER;
++   simple_mtx_lock(&mtx);
++   fprintf(f, "NVK shader stats: %s %08x %u %u %u %u %" PRIu64 " %u %u %u "
++           "%u %u %u%s\n", mesa_shader_stage_name(i->stage), hash,
++           shader->code_size, i->num_instrs, i->num_gprs, i->max_warps_per_sm,
++           i->num_static_cycles, i->num_spills_to_mem, i->num_fills_from_mem,
++           i->num_spills_to_reg, i->num_fills_from_reg, i->slm_size,
++           i->crs_size, extra);
++   fflush(f);
++   simple_mtx_unlock(&mtx);
++}
++
+ static VkResult
+ nvk_shader_upload(struct nvk_device *dev, struct nvk_shader *shader)
+ {
++   nvk_shader_log_stats(shader);
++
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+ 
+    const bool has_mesh_gs_sph = shader->info.stage == MESA_SHADER_MESH &&
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 87a2c5ff..75f2f640 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -324,7 +324,8 @@ struct nvkmd_rm_dev {
+     */
+    bool sysmem_cached_desc;
+    bool sysmem_cached_app;
+-   /* NVK_RM_DESC_TABLE_VRAM / NVK_RM_UPLOAD_VRAM (default on): descriptor
++   /* NVK_RM_DESC_TABLE_VRAM=1 / NVK_RM_UPLOAD_VRAM=1 (default off: in CS2
++    * on 405.11 they cost ~10 fps against GPU-cached system memory): descriptor
+     * memory (texture and sampler header tables, descriptor pools) and
+     * command buffer upload memory live in CPU-mapped VRAM (the BAR heap)
+     * instead of system memory the GPU reads across PCIe.
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 22f27f04..b8173f65 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -159,8 +159,8 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+       }
+       dev->sysmem_cached = dev->sysmem_cached_desc || dev->sysmem_cached_app;
+    }
+-   dev->desc_vram = debug_get_bool_option("NVK_RM_DESC_TABLE_VRAM", true);
+-   dev->upload_vram = debug_get_bool_option("NVK_RM_UPLOAD_VRAM", true);
++   dev->desc_vram = debug_get_bool_option("NVK_RM_DESC_TABLE_VRAM", false);
++   dev->upload_vram = debug_get_bool_option("NVK_RM_UPLOAD_VRAM", false);
+ 
+    list_inithead(&dev->base.mems);
+    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+-- 
+2.43.0
+

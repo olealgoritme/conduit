@@ -896,6 +896,45 @@ void HeliosVkd3dDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noe
   });
 }
 
+extern "C" HRESULT helios_vkd3d_create_ecl_fence(ID3D12CommandQueue*, std::uint64_t, std::uint32_t*);
+
+std::int32_t HeliosVkd3dDevice::nvk_scanout_present_fenced(std::size_t resource, std::size_t queue,
+                                                           std::uint64_t value) const noexcept {
+  return helios_bridge::bridge_guard("nvk_scanout_present_fenced12", std::int32_t(-1),
+      [&]() -> std::int32_t {
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm ||
+        !impl->icd.scanout_present_fenced || !(impl->icd.caps & HELIOS_ICD_CAP_RM_FENCE) ||
+        !impl->interop || !resource || !queue || !value)
+      return -1;
+    std::uint64_t vk_memory = 0, memory_offset = 0, memory_size = 0, vk_image = 0, buffer_offset = 0;
+    std::uint32_t memory_type = 0;
+    auto* res = reinterpret_cast<ID3D12Resource*>(resource);
+    if (engine_resource_memory(impl.get(), resource, &vk_memory, &memory_offset, &memory_size,
+                               &memory_type) != HELIOS_VKD3D_IDENTITY_RESOLVED ||
+        memory_offset != 0 ||
+        FAILED(impl->interop->GetVulkanResourceInfo(res, &vk_image, &buffer_offset)) || !vk_image)
+      return -2;
+    std::uint32_t fence = 0;
+    if (FAILED(helios_vkd3d_create_ecl_fence(reinterpret_cast<ID3D12CommandQueue*>(queue), value,
+                                             &fence)) || !fence)
+      return -4;
+    // Takes the fence in every case.
+    const VkResult vr = impl->icd.scanout_present_fenced((VkDevice)impl->vk_device,
+        (VkDeviceMemory)vk_memory, (VkImage)vk_image, fence);
+    if (vr != VK_SUCCESS) {
+      static std::atomic<std::uint32_t> s_fail{0};
+      const std::uint32_t n = s_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "nvk fenced scanout present failed vr=%d (x%u)", int(vr), n);
+        umd_log(msg);
+      }
+      return -3;
+    }
+    return 0;
+  });
+}
+
 void HeliosVkd3dDevice::nvk_scanout_release() const noexcept {
   helios_bridge::bridge_guard("nvk_scanout_release12", false, [&]() -> bool {
     if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm && impl->icd.scanout_release &&
@@ -1453,6 +1492,21 @@ extern "C" HRESULT helios_vkd3d_execute_command_lists_rm(ID3D12CommandQueue*, UI
     std::uint32_t*, std::uint64_t*);
 extern "C" std::uint32_t helios_vkd3d_ecl_fence_stats(std::uint64_t*, std::uint32_t);
 extern "C" std::uint32_t helios_vkd3d_memory_stats(std::uint64_t*, std::uint32_t);
+extern "C" std::uint32_t helios_vkd3d_gpu_time_stats(std::uint64_t*, std::uint32_t);
+extern "C" HRESULT helios_vkd3d_prepare_ecl_fence(ID3D12CommandQueue*);
+
+std::int32_t helios_vkd3d_bridge_prepare_ecl_fence(std::size_t queue) noexcept {
+  return helios_bridge::bridge_guard("prepare_ecl_fence12", std::int32_t(E_FAIL), [&]() -> std::int32_t {
+    return helios_vkd3d_prepare_ecl_fence(reinterpret_cast<ID3D12CommandQueue*>(queue));
+  });
+}
+
+std::uint32_t helios_vkd3d_bridge_gpu_time_stats(rust::Slice<std::uint64_t> out) noexcept {
+  return helios_bridge::bridge_guard("gpu_time_stats12", std::uint32_t(0), [&]() -> std::uint32_t {
+    if (out.size() > UINT_MAX) return 0;
+    return helios_vkd3d_gpu_time_stats(out.data(), static_cast<std::uint32_t>(out.size()));
+  });
+}
 
 std::uint32_t helios_vkd3d_bridge_memory_stats(rust::Slice<std::uint64_t> out) noexcept {
   return helios_bridge::bridge_guard("memory_stats12", std::uint32_t(0), [&]() -> std::uint32_t {

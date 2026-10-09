@@ -140,14 +140,17 @@ pub(crate) struct NotifyOrdered<'a> {
 }
 
 impl WddmNotifyGuard<'_> {
-    pub(crate) fn completed_fence(&self) -> u32 {
-        self.adapter.last_completed_fence.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn set_completed_fence(&self, fence: u32) {
+    pub(crate) fn completed_fence(&self, node: u32) -> u32 {
         self.adapter
             .last_completed_fence
-            .store(fence, Ordering::Release);
+            .get(node as usize)
+            .map_or(0, |f| f.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_completed_fence(&self, node: u32, fence: u32) {
+        if let Some(f) = self.adapter.last_completed_fence.get(node as usize) {
+            f.store(fence, Ordering::Release);
+        }
     }
 
     /// Run `f` against this adapter's transport with the notify lock already

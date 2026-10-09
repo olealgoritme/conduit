@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 17:27:08 +0200
+Subject: [PATCH 12/13] nvk, nvk/rm: compress separate depth/stencil images on
+ GB20x
+
+Blackwell splits combined depth/stencil formats (D24S8, D32S8X24) into
+separate depth and stencil planes, and nvk_image_can_compress rejects
+every image with more than one plane, so on GB20x the depth buffers of
+most D3D games (through DXVK and vkd3d-proton) were never compressed,
+neither in dedicated allocations nor in sub-allocated ones.
+
+The two planes share one allocation (a separate depth/stencil image is
+never disjoint), and GB20x has only generic PTE kinds, so each plane is
+compressed like any other image: in a dedicated allocation through the
+memory's own VA, which is already compressible, and in compressible
+memory (NVK_RM_COMPRESS_ALL) through each plane's own VA with its
+compressed kind.  The draw path already turns on SET_Z_COMPRESSION and
+SET_STENCIL_COMPRESSION together from is_compressed.
+
+New nvkmd_info::has_zs_compression, set by the RM backend with
+NVK_RM_COMPRESS_ZS=1 (default off while it is measured).  A log line
+counts the depth/stencil images bound compressed.
+---
+ src/nouveau/vulkan/nvk_image.c              | 31 +++++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/nvkmd.h            |  5 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |  9 ++++++
+ 3 files changed, 42 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 062ded9..21b3266 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -811,8 +811,17 @@ nvk_image_can_compress(const struct nvk_physical_device *pdev,
+ 
+    /* In similar vein, we currently don't do multiplanar dedicated allocations
+     * so we can't do compression for multi-plane YCbCr images.
++    *
++    * Combined depth/stencil images are two planes on Blackwell (separate
++    * depth and stencil) in one, never disjoint, allocation.  Where the
++    * kernel driver allows it, both planes are compressed: through the
++    * memory's own VA in a dedicated allocation, through their own VAs
++    * otherwise (nvk_image_plane_bind), and the draw path turns on depth and
++    * stencil compression together from is_compressed.
+     */
+-   if (image->plane_count > 1)
++   if (image->plane_count > 1 &&
++       !(image->separate_zs && !image->disjoint &&
++         pdev->nvkmd->kmd_info.has_zs_compression))
+       return false;
+ 
+    /* The API for VK_EXT_image_drm_format_modifier requires that we report the
+@@ -1696,10 +1705,14 @@ nvk_image_plane_bind(struct nvk_device *dev,
+          /* Memory the backend backed with compression resources
+           * (NVKMD_MEM_COMPRESSIBLE): the image is compressed through its
+           * own VA wherever in the memory it is bound.  Only an image's
+-          * single plane: can_compress rules out multi-plane images.
++          * single plane, or both planes of a separate depth/stencil image
++          * (can_compress rules out other multi-plane images).
+           */
++         const bool image_plane = plane == &image->planes[0] ||
++                                  (image->separate_zs &&
++                                   plane == &image->planes[1]);
+          const bool compress = image->can_compress && not_shared &&
+-                               plane == &image->planes[0] &&
++                               image_plane &&
+                                plane->nil.compressed_pte_kind != 0 &&
+                                (mem->mem->flags & NVKMD_MEM_COMPRESSIBLE);
+          const uint8_t pte_kind = compress ? plane->nil.compressed_pte_kind
+@@ -1794,6 +1807,18 @@ nvk_bind_image_memory(struct nvk_device *dev,
+       }
+    }
+ 
++   /* NVK_RM_COMPRESS_ZS: separate depth/stencil images that got compressed */
++   if (image->separate_zs && image->is_compressed) {
++      static uint32_t zs_compressed;
++      const uint32_t n = p_atomic_inc_return(&zs_compressed);
++      if (util_is_power_of_two_nonzero(n)) {
++         mesa_logi("NVK: %u depth/stencil images (separate planes) bound "
++                   "compressed, %s (NVK_RM_COMPRESS_ZS)", n,
++                   mem->dedicated_image == image ? "last dedicated"
++                                                 : "last sub-allocated");
++      }
++   }
++
+    if (image->zcull.nil.size_B > 0) {
+       result = nvk_image_zcull_bind(&image->zcull, mem, offset_B);
+       if (result != VK_SUCCESS)
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index c478eb2..873b6b5 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -145,6 +145,11 @@ struct nvkmd_info {
+     */
+    bool has_compressible_mem;
+ 
++   /** Combined depth/stencil images, which Blackwell splits into separate
++    *  depth and stencil planes, may be compressed (implies has_compression)
++    */
++   bool has_zs_compression;
++
+    /** VRAM may be mapped by the CPU (exposes a host-visible VRAM type) */
+    bool has_host_visible_vram;
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index fc8e2bc..199c1e9 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -435,6 +435,15 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+       pdev->base.kmd_info.has_compression &&
+       debug_get_bool_option("NVK_RM_COMPRESS_ALL", false);
+ 
++   /* Combined depth/stencil formats are two planes on Blackwell, which NVK
++    * leaves uncompressed.  GB20x has only generic kinds, so each plane is
++    * compressed like any other image (nvk_image.c).  Off by default while
++    * it is measured.
++    */
++   pdev->base.kmd_info.has_zs_compression =
++      pdev->base.kmd_info.has_compression &&
++      debug_get_bool_option("NVK_RM_COMPRESS_ZS", false);
++
+    /* VRAM is allocated with 64 KiB pages; system memory BOs get their own
+     * 4 KiB bind alignment (nvkmd_mem::bind_align_B).
+     */
+-- 
+2.43.0
+

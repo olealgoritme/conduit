@@ -1,0 +1,370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 03:25:17 +0200
+Subject: [PATCH] nvk: NVK_PASS_PROFILE=4 method histogram per pass, indirect
+ push on again
+
+CS2 on 405.14 (static scene, NVK_PASS_PROFILE=1): the 2x MSAA depth
+prepass takes 13 ms for 122 draw calls (119.5 indirect, 368.5 draws),
+about 110 us per call, and NVK_INDIRECT_PUSH barely changes it, so the
+per-draw record read is not the main cost.  Something recorded between
+the calls is.
+
+NVK_PASS_PROFILE=4 (diagnostics only, off by default) counts, per render
+pass signature, every method recorded inside the pass: 3D-class methods
+by address (MME macro calls by name, and their parameters), writes to
+other subchannels as one number.  Each pass line is followed by the 24
+most written 3D methods, per recorded pass.  The counts are taken on the
+CPU when the pass is recorded, from the pushbuffer itself, so they show
+what NVK emitted, including what the MME macros were given, but not the
+methods the macros emit on the GPU.  Level 4 also samples the level-2
+counters (VS/clipper/PS invocations); the ZCULL counters stay at level 3
+only.
+
+NVK_INDIRECT_PUSH is on by default again: 405.14 ran it clean (0 Xid)
+with 0032's ring fix, at lower CPU use (0.74-0.94 cores against ~1.6).
+
+No MME macro change: 2160 dwords for a DXVK device, within the 2976
+budget checked at queue creation.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h   |   4 +
+ src/nouveau/vulkan/nvk_cmd_draw.c     |   7 +-
+ src/nouveau/vulkan/nvk_pass_profile.c | 203 +++++++++++++++++++++++++-
+ 3 files changed, 210 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 5ae871bd..ffb26ab6 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -353,6 +353,10 @@ struct nvk_cmd_buffer {
+    uint32_t pass_profile_internal;
+    bool pass_profile_in_pass;
+    bool pass_profile_on;
++   /* NVK_PASS_PROFILE=4: where the open pass's pushes start */
++   uint32_t pass_profile_hist_sig;
++   uint32_t pass_profile_hist_npushes;
++   uint32_t *pass_profile_hist_start;
+ 
+    /* NVK_INDIRECT_PUSH: a no-prefetch indirect record segment was pushed
+     * since the last barrier, so the records of later indirect draws (which
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 8a2464d7..6908705c 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -54,8 +54,9 @@
+ 
+ static uint32_t nvk_mdi_batch(void);
+ 
+-/* NVK_INDIRECT_PUSH=1 (Turing+, default off since 405.13: Xid 32 in CS2;
+- * off is upstream's per-record MME
++/* NVK_INDIRECT_PUSH (Turing+, default on again since 405.15: 405.13's
++ * Xid 32 was the RM ring flushing inside an incomplete push, fixed by
++ * 0032; =0 is upstream's per-record MME
+  * DMA reads): see nvk_cmd_draw_indirect_pushed().
+  */
+ static bool
+@@ -64,7 +65,7 @@ nvk_indirect_push(void)
+    static uint32_t state;
+    uint32_t s = p_atomic_read(&state);
+    if (unlikely(s == 0)) {
+-      s = debug_get_bool_option("NVK_INDIRECT_PUSH", false) ? 2 : 1;
++      s = debug_get_bool_option("NVK_INDIRECT_PUSH", true) ? 2 : 1;
+       p_atomic_set(&state, s);
+    }
+    return s == 2;
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
+index 75891b36..4be05691 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.c
++++ b/src/nouveau/vulkan/nvk_pass_profile.c
+@@ -64,6 +64,7 @@
+ #include "nvkmd/nvkmd.h"
+ 
+ #include "nv_push_cl9097.h"
++#include "nv_push_clcd97.h"
+ #include "nv_push_cl90b5.h"
+ #include "nv_push_cl90c0.h"
+ 
+@@ -144,7 +145,7 @@ static const struct {
+ static unsigned
+ prof_stat_count(unsigned level)
+ {
+-   return level >= 3 ? PROF_STATS : PROF_STATS_BASIC;
++   return level == 3 ? PROF_STATS : PROF_STATS_BASIC;
+ }
+ 
+ struct prof_stat_gpu {
+@@ -165,8 +166,20 @@ struct prof_meta {
+    struct nvk_pass_profile_counts counts;
+ };
+ 
++/* NVK_PASS_PROFILE=4: the methods recorded in a render pass, per
++ * signature: 3D-class methods by address, writes to other subchannels by
++ * subchannel.  Counted on the CPU when the pass is recorded.
++ */
++#define PROF_HIST_3D 8192u /* method address >> 2 */
++struct prof_hist {
++   uint64_t passes;
++   uint64_t other_subc[8];
++   uint32_t mthd[PROF_HIST_3D];
++};
++
+ struct prof_sig {
+    char name[200];
++   struct prof_hist *hist;
+    enum prof_kind kind;
+    enum nvk_pass_profile_op op;
+    uint64_t gpu_ns;
+@@ -178,6 +191,44 @@ struct prof_sig {
+    uint64_t stats[PROF_STATS];
+ };
+ 
++static const char *const prof_mme_names[NVK_MME_COUNT] = {
++   [NVK_MME_SELECT_CB0] = "SELECT_CB0",
++   [NVK_MME_BIND_CBUF_DESC] = "BIND_CBUF_DESC",
++   [NVK_MME_CLEAR] = "CLEAR",
++   [NVK_MME_UPDATE_WINDOW_CLIP] = "UPDATE_WINDOW_CLIP",
++   [NVK_MME_BIND_IB] = "BIND_IB",
++   [NVK_MME_BIND_VB] = "BIND_VB",
++   [NVK_MME_SET_VB_ENABLES] = "SET_VB_ENABLES",
++   [NVK_MME_SET_VB_STRIDE] = "SET_VB_STRIDE",
++   [NVK_MME_SET_TESS_PARAMS] = "SET_TESS_PARAMS",
++   [NVK_MME_SET_SHADING_RATE_CONTROL] = "SET_SHADING_RATE_CONTROL",
++   [NVK_MME_SET_ANTI_ALIAS] = "SET_ANTI_ALIAS",
++   [NVK_MME_DRAW] = "DRAW",
++   [NVK_MME_DRAW_INDEXED] = "DRAW_INDEXED",
++   [NVK_MME_DRAW_INDIRECT] = "DRAW_INDIRECT",
++   [NVK_MME_DRAW_INDEXED_INDIRECT] = "DRAW_INDEXED_INDIRECT",
++   [NVK_MME_DRAW_INDIRECT_COUNT] = "DRAW_INDIRECT_COUNT",
++   [NVK_MME_DRAW_INDEXED_INDIRECT_COUNT] = "DRAW_INDEXED_INDIRECT_COUNT",
++   [NVK_MME_BEGIN_COND_RENDER] = "BEGIN_COND_RENDER",
++   [NVK_MME_ADD_CS_INVOCATIONS] = "ADD_CS_INVOCATIONS",
++   [NVK_MME_WRITE_CS_INVOCATIONS] = "WRITE_CS_INVOCATIONS",
++   [NVK_MME_XFB_COUNTER_LOAD] = "XFB_COUNTER_LOAD",
++   [NVK_MME_XFB_DRAW_INDIRECT] = "XFB_DRAW_INDIRECT",
++   [NVK_MME_SET_PRIV_REG] = "SET_PRIV_REG",
++   [NVK_MME_SET_WRITE_MASK] = "SET_WRITE_MASK",
++   [NVK_MME_SET_CONSERVATIVE_RASTER_STATE] = "SET_CONSERVATIVE_RASTER_STATE",
++   [NVK_MME_SET_VIEWPORT_MIN_MAX_Z] = "SET_VIEWPORT_MIN_MAX_Z",
++   [NVK_MME_SET_Z_CLAMP] = "SET_Z_CLAMP",
++   [NVK_MME_SET_STATISTICS_COUNTERS] = "SET_STATISTICS_COUNTERS",
++   [NVK_MME_DRAW_MESH] = "DRAW_MESH",
++   [NVK_MME_DRAW_MESH_INDIRECT] = "DRAW_MESH_INDIRECT",
++   [NVK_MME_DRAW_MESH_INDIRECT_COUNT] = "DRAW_MESH_INDIRECT_COUNT",
++   [NVK_MME_DRAW_INDIRECT_BATCH] = "DRAW_INDIRECT_BATCH",
++   [NVK_MME_DRAW_INDEXED_INDIRECT_BATCH] = "DRAW_INDEXED_INDIRECT_BATCH",
++   [NVK_MME_DRAW_INDIRECT_INLINE] = "DRAW_INDIRECT_INLINE",
++   [NVK_MME_DRAW_INDEXED_INDIRECT_INLINE] = "DRAW_INDEXED_INDIRECT_INLINE",
++};
++
+ static const char *const prof_op_names[NVK_PASS_PROFILE_OP_COUNT] = {
+    [NVK_PASS_PROFILE_OP_NONE] = "none",
+    [NVK_PASS_PROFILE_OP_DISPATCH] = "dispatch",
+@@ -321,6 +372,10 @@ prof_free(struct nvk_pass_profile *prof)
+       nvkmd_mem_unref(prof->mem);
+    if (prof->sig_ht != NULL)
+       _mesa_hash_table_destroy(prof->sig_ht, NULL);
++   if (prof->sigs != NULL) {
++      for (uint32_t i = 0; i < PROF_SIGS; i++)
++         free(prof->sigs[i].hist);
++   }
+    free(prof->sigs);
+    free(prof->meta);
+    free(prof);
+@@ -689,6 +744,87 @@ nvk_pass_profile_internal_end(struct nvk_cmd_buffer *cmd)
+    cmd->pass_profile_internal--;
+ }
+ 
++/* NVK_PASS_PROFILE=4: count the methods of [p, end) into hist */
++static void
++prof_hist_scan(struct prof_hist *hist, const uint32_t *p, const uint32_t *end)
++{
++   while (p < end) {
++      const uint32_t hdr = *p++;
++      const uint32_t type = NVVAL_GET(hdr, NV906F, DMA, SEC_OP);
++      const uint32_t subc = NVVAL_GET(hdr, NV906F, DMA, METHOD_SUBCHANNEL);
++      const uint32_t mthd = NVVAL_GET(hdr, NV906F, DMA, METHOD_ADDRESS);
++      uint32_t count = NVVAL_GET(hdr, NV906F, DMA, METHOD_COUNT);
++      uint32_t inc;
++      switch (type) {
++      case NV906F_DMA_SEC_OP_IMMD_DATA_METHOD:
++         count = 1;
++         inc = 0;
++         break;
++      case NV906F_DMA_SEC_OP_INC_METHOD:
++         inc = 2; /* every dword */
++         break;
++      case NV906F_DMA_SEC_OP_NON_INC_METHOD:
++         inc = 0;
++         break;
++      case NV906F_DMA_SEC_OP_ONE_INC:
++         inc = 1;
++         break;
++      default:
++         return; /* not something NVK records */
++      }
++      for (uint32_t i = 0; i < count; i++) {
++         const uint32_t m = inc == 2 ? mthd + i :
++                            inc == 1 ? mthd + (i > 0) : mthd;
++         if (subc == SUBC_NV9097)
++            hist->mthd[m % PROF_HIST_3D]++;
++         else
++            hist->other_subc[subc & 7]++;
++      }
++      if (type != NV906F_DMA_SEC_OP_IMMD_DATA_METHOD)
++         p += count;
++   }
++}
++
++static void
++prof_hist_end_pass(struct nvk_cmd_buffer *cmd)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_pass_profile *prof = dev->pass_profile;
++   const uint32_t sig = cmd->pass_profile_hist_sig;
++   cmd->pass_profile_hist_sig = 0;
++   if (sig == 0 || cmd->pass_profile_hist_start == NULL)
++      return;
++
++   simple_mtx_lock(&prof->mutex);
++   struct prof_sig *ps = &prof->sigs[sig - 1];
++   if (ps->hist == NULL)
++      ps->hist = calloc(1, sizeof(*ps->hist));
++   struct prof_hist *hist = ps->hist;
++   if (hist != NULL) {
++      hist->passes++;
++      const uint32_t n = util_dynarray_num_elements(&cmd->pushes,
++                                                    struct nvk_cmd_push);
++      const uint32_t *start = cmd->pass_profile_hist_start;
++      bool in_current = true;
++      for (uint32_t i = cmd->pass_profile_hist_npushes; i < n; i++) {
++         const struct nvk_cmd_push *push =
++            util_dynarray_element(&cmd->pushes, struct nvk_cmd_push, i);
++         if (push->map == NULL || push->range == 0)
++            continue; /* indirect data, not methods */
++         const uint32_t *b = push->map;
++         const uint32_t *e = b + push->range / 4;
++         if (i == cmd->pass_profile_hist_npushes && start >= b && start <= e)
++            b = start;
++         prof_hist_scan(hist, b, e);
++         in_current = false;
++      }
++      const uint32_t *b = in_current ? start : cmd->push.start;
++      if (b >= cmd->push.start && b <= cmd->push.end)
++         prof_hist_scan(hist, b, cmd->push.end);
++   }
++   simple_mtx_unlock(&prof->mutex);
++}
++
+ void
+ nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd,
+                             const VkRenderingInfo *info)
+@@ -749,6 +885,14 @@ nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd,
+       P_INLINE_DATA(p, mask);
+       prof_emit_stats(cmd, stat, false);
+    }
++
++   cmd->pass_profile_hist_sig = 0;
++   if (prof->level >= 4 && cmd->pass_profile_slot >= 0) {
++      cmd->pass_profile_hist_sig = prof->meta[cmd->pass_profile_slot].sig;
++      cmd->pass_profile_hist_npushes =
++         util_dynarray_num_elements(&cmd->pushes, struct nvk_cmd_push);
++      cmd->pass_profile_hist_start = cmd->push.end;
++   }
+ }
+ 
+ void
+@@ -760,6 +904,8 @@ nvk_pass_profile_end_pass(struct nvk_cmd_buffer *cmd)
+    if ((cmd->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT) ||
+        cmd->pass_profile_internal > 0 || !cmd->pass_profile_in_pass)
+       return;
++   if (cmd->pass_profile_hist_sig != 0)
++      prof_hist_end_pass(cmd);
+    if (cmd->pass_profile_stat_slot >= 0) {
+       prof_emit_stats(cmd, cmd->pass_profile_stat_slot, true);
+       cmd->pass_profile_stat_slot = -1;
+@@ -773,6 +919,8 @@ void
+ nvk_pass_profile_reset_cmd(struct nvk_cmd_buffer *cmd)
+ {
+    cmd->pass_profile_on = nvk_cmd_buffer_device(cmd)->pass_profile != NULL;
++   cmd->pass_profile_hist_sig = 0;
++   cmd->pass_profile_hist_start = NULL;
+    cmd->pass_profile_slot = -1;
+    cmd->pass_profile_cmd_slot = -1;
+    cmd->pass_profile_op_slot = -1;
+@@ -889,6 +1037,50 @@ nvk_pass_profile_poll(struct nvk_device *dev)
+    prof_harvest_and_log(prof, false);
+ }
+ 
++static void
++prof_log_hist(struct nvk_pass_profile *prof, const struct prof_hist *h)
++{
++   /* The 24 most written 3D methods, per recorded pass */
++   uint32_t top[24];
++   unsigned ntop = 0;
++   for (uint32_t m = 0; m < PROF_HIST_3D; m++) {
++      if (h->mthd[m] == 0)
++         continue;
++      unsigned pos = ntop;
++      while (pos > 0 && h->mthd[top[pos - 1]] < h->mthd[m])
++         pos--;
++      if (pos >= ARRAY_SIZE(top))
++         continue;
++      if (ntop < ARRAY_SIZE(top))
++         ntop++;
++      memmove(&top[pos + 1], &top[pos], (ntop - 1 - pos) * sizeof(top[0]));
++      top[pos] = m;
++   }
++   const double n = (double)h->passes;
++   uint64_t other = 0;
++   for (unsigned i = 0; i < 8; i++)
++      other += h->other_subc[i];
++   prof_log(prof, "NVK pass profile:            methods per pass (%" PRIu64
++            " passes recorded; other subchannels %.1f):", h->passes,
++            other / n);
++   for (unsigned i = 0; i < ntop; i++) {
++      const uint32_t addr = top[i] << 2;
++      char name[96];
++      if (addr >= NVC597_CALL_MME_MACRO(0) &&
++          addr < NVC597_CALL_MME_MACRO(NVK_MME_COUNT)) {
++         const uint32_t macro = (addr - NVC597_CALL_MME_MACRO(0)) / 8;
++         const bool param = (addr - NVC597_CALL_MME_MACRO(0)) % 8 != 0;
++         snprintf(name, sizeof(name), "%s MME %s",
++                  param ? "param" : "CALL",
++                  prof_mme_names[macro] ? prof_mme_names[macro] : "?");
++      } else {
++         snprintf(name, sizeof(name), "%s", P_PARSE_NVCD97_MTHD(addr));
++      }
++      prof_log(prof, "NVK pass profile:              %9.1f  %04x %s",
++               h->mthd[top[i]] / n, addr, name);
++   }
++}
++
+ static void
+ prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
+              double window_s)
+@@ -924,6 +1116,8 @@ prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
+                s->fs_instrs, s->fs_calls / n, s->tess_gs_calls / n,
+                s->spills, s->slm);
+    }
++   if (s->hist != NULL && s->hist->passes > 0)
++      prof_log_hist(prof, s->hist);
+    if (s->stat_count > 0) {
+       const double sn = (double)s->stat_count;
+       char line[256];
+@@ -1055,6 +1249,13 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+          }
+          free(sorted);
+       }
++      simple_mtx_lock(&prof->mutex);
++      for (uint32_t i = 0; i < sig_count; i++) {
++         struct prof_hist *h = prof->sigs[i].hist;
++         if (h != NULL)
++            memset(h, 0, sizeof(*h));
++      }
++      simple_mtx_unlock(&prof->mutex);
+       for (uint32_t i = 0; i < sig_count; i++) {
+          struct prof_sig *s = &prof->sigs[i];
+          s->gpu_ns = 0;
+-- 
+2.43.0
+

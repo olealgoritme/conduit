@@ -24,7 +24,7 @@ from GPU memory to your screen: no copying, no video compression.
 | Clipboard both ways, sound (speakers + mic) | ✅ |
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
-| Windows VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK, Venus as fallback | experimental, opt-in (`--venus`, driver built by hand: [Windows guests](docs/WINDOWS.md)) |
+| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, driver 22.22.405.24 built by hand: [Windows guests](#windows-guests)) |
 | NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
 > Conduit is early software, tested mainly on an RTX 5090 with Ubuntu 24.04
@@ -64,20 +64,81 @@ NVK on the host's GPU (192 fps in this frame). GPU-Z does not recognise the virt
 
 ### Windows guests
 
-A Windows 11 guest renders through Mesa's NVK driver talking to the host's
-NVIDIA kernel driver (RM) through Conduit ("NVK-on-RM"): the desktop and DWM,
-D3D11 (DXVK) and D3D12 (vkd3d-proton) in the Helios UMDs, Vulkan, and OpenGL
-through Zink, with zero-copy presentation. Venus (Vulkan replayed by the
-host's Vulkan driver) is still there as the fallback for anything the policy
-keeps off NVK, and goes once every workload has an NVK path. Tested only on an
-RTX 5090.
+A Windows 11 guest renders on the host GPU through NVK-on-RM: Mesa's open
+NVK Vulkan driver runs in the guest and talks to the host's NVIDIA kernel
+driver (RM) through Conduit. Tested on an RTX 5090. Guest driver version:
+**22.22.405.24**.
+
+```
+ Windows guest
+   app (D3D11 / D3D12 / Vulkan / OpenGL)
+     → Helios UMDs: D3D11 on DXVK, D3D12 on vkd3d-proton, OpenGL on Zink
+     → NVK-on-RM (Mesa NVK + librmclient)
+     → Helios WDDM KMD (display, flips, cursor, RM calls over virtio)
+ Host
+   conduit-backend: forwards the RM calls to the NVIDIA driver, serves the
+                    display (scanout, EDID, cursor, presentation feedback)
+     → GPU; finished frames go zero-copy as dma-bufs to
+   conduit view (the viewer window) or the stream
+```
+
+The desktop (DWM) and games run on NVK. Venus (Vulkan replayed by the host's
+NVIDIA Vulkan driver in `conduit-venus`) stays as the fallback for processes
+the per-process policy keeps off NVK.
+
+**Results** (RTX 5090, desktop and games on NVK at 240 Hz):
+
+| Counter-Strike 2 | fps |
+|---|---|
+| 1920x1080 | ~330–380 |
+| 5120x1440, with bots | ~350 |
+| lower resolutions | ~400–500 |
+
+**Main knobs** (defaults in force; registry values are `REG_DWORD`, NVK
+settings are environment variables of the process):
+
+| Knob | Default | What it does |
+|---|---|---|
+| `IndepFlip` (KMD service key) | 0 | independent flip for full-screen flip-model windows; 1 turns it on |
+| `DirectFlipSupport` (`HKLM\SOFTWARE\Helios`) | 0 | the D3D11.1 `CheckDirectFlipSupport` answer DWM uses for independent flip; 1 with `IndepFlip=1` |
+| `HwCursor` (KMD service key) | follows `IndepFlip` | the hardware cursor; absent means on with independent flip, off without |
+| `NVK_INDIRECT_PUSH` | 0 | indirect draw records through the pushbuffer |
+| `NVK_NULL_VB_ZERO_PAGE` | 1 | null vertex buffers bound to the zero page |
+| `NVK_ZERO_PAGE_VRAM` | 1 | the zero page (null descriptors) in VRAM |
+| `NVK_RM_BAR_MB` | 0 | host-visible VRAM heap through BAR1; 0 off, -1 all of BAR1, N MiB |
+
+**Diagnostics** (written to `%ProgramData%\Helios\` per process):
+
+| Variable | Output |
+|---|---|
+| `NVK_PASS_PROFILE=1` | GPU time per render pass signature, per operation outside passes and per command buffer, with the shaders each pass used (`nvk-pass-<pid>.txt`) |
+| `NVK_PASS_PROFILE=2` / `3` | adds pipeline statistics (vertex, clipper, pixel invocations) / ZCULL statistics |
+| `NVK_PASS_PROFILE=4` | adds a histogram of the 3D methods written per pass |
+| `NVK_PASS_PROFILE=5` | dumps one render pass's draws (`NVK_PASS_DUMP` picks it) |
+| `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
+| `NVK_WAIT_STATS=1` | CPU wait counts and times per site, once a second (`nvk-waits-<pid>.txt`) |
+
+**Known limitations:**
+
+- The guest has a single display mode, the host monitor's (5120x1440 on the
+  test machine), with no scaling: a game at a lower resolution is not
+  stretched to fill the screen.
+- In games, use the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look.
+- Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):
+  full-screen games are composed by DWM.
+- The driver is test-signed (Secure Boot off, test-signing on), and the guest
+  package is built and installed by hand.
+
+More:
 
 - [docs/WINDOWS.md](docs/WINDOWS.md): set up the VM, build and install the
-  driver package, the opt-ins
-- [docs/NVK-ROADMAP.md](docs/NVK-ROADMAP.md): measured state and what is left
+  driver package, the registry knobs
+- [guest/nvk-rm/README.md](guest/nvk-rm/README.md): the NVK-on-RM patch
+  series and its knobs
+- [docs/NVK-ROADMAP.md](docs/NVK-ROADMAP.md): what is left
 - [docs/SECOND-MACHINE.md](docs/SECOND-MACHINE.md): the whole setup on another
   NVIDIA host
-- [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md#windows-guests-venus): limits
+- [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md#windows-guests): limits
 
 ## What you need
 

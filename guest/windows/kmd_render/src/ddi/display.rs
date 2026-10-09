@@ -57,6 +57,8 @@ static PRESENT_RESULT_TRACE_TICK: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_SRC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DMA_SIZE: AtomicU32 = AtomicU32::new(0);
+/// `DmaBufferPrivateDataSize` of the last Present (for `IdfRedDma`).
+pub static PRESENT_LAST_PRIV_SIZE: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_PATCH_SIZE: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_SRC_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
@@ -201,6 +203,20 @@ pub unsafe extern "C" fn dxgkddi_present(
     let start_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
     crate::ddi::present_foreign::begin_call();
     let status = unsafe { dxgkddi_present_inner(h_context, present, start_100ns) };
+    // `IdfRed*`: what dxgkrnl's independent-flip candidate presents (`RedirectedFlip`) got.
+    if !present.is_null() {
+        crate::ddi::indep_flip::note_present_result(
+            PRESENT_LAST_FLAGS.load(Ordering::Relaxed),
+            PRESENT_LAST_SRC_COUNT.load(Ordering::Relaxed),
+            PRESENT_LAST_DST_COUNT.load(Ordering::Relaxed),
+            (
+                PRESENT_LAST_DMA_SIZE.load(Ordering::Relaxed),
+                PRESENT_LAST_PRIV_SIZE.load(Ordering::Relaxed),
+            ),
+            status == STATUS_SUCCESS,
+            status as u32,
+        );
+    }
     // `DwPrN` / `DwPrFail`: Presents since the last device died (atomics).
     crate::ddi::dwm_restart::note_present(status == STATUS_SUCCESS);
     // Fixed-name telemetry survives the steady-state registry ring flood and
@@ -262,6 +278,7 @@ unsafe fn dxgkddi_present_inner(
     PRESENT_LAST_SRC_COUNT.store(args.NumSrcAllocations, Ordering::Relaxed);
     PRESENT_LAST_DST_COUNT.store(args.NumDstAllocations, Ordering::Relaxed);
     PRESENT_LAST_DMA_SIZE.store(args.DmaSize, Ordering::Relaxed);
+    PRESENT_LAST_PRIV_SIZE.store(args.DmaBufferPrivateDataSize, Ordering::Relaxed);
     PRESENT_LAST_PATCH_SIZE.store(args.PatchLocationListOutSize, Ordering::Relaxed);
     let present_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     PRESENT_LAST_FLAGS.store(present_flags, Ordering::Relaxed);
@@ -523,6 +540,39 @@ unsafe fn dxgkddi_present_inner(
                     dst_info,
                 )
             };
+        }
+        // dxgkrnl's independent-flip candidate presents (`RedirectedFlip` on the Blt arm,
+        // `DdiPresentForIFlip`; only with `IndepFlip`). One with no destination has nothing to
+        // copy: 392.1 failed every one of them `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` at the
+        // Blt arm's DMA check below (dxgkrnl gives it no room), which kept DWM composing. It
+        // completes with no copy. `IdfRedirSkip` = 1 does the same for one with a destination.
+        match crate::ddi::indep_flip::redirected_blt_action(present_flags, args.NumDstAllocations)
+        {
+            helios_kmd_logic::independent_flip::RedirectedBlt::Ordinary => {}
+            helios_kmd_logic::independent_flip::RedirectedBlt::NoDestination => {
+                return unsafe {
+                    present_redirected_no_destination(
+                        args,
+                        present_allocations,
+                        present_stream_boundary,
+                        adapter,
+                        src_info,
+                        dst_info,
+                    )
+                };
+            }
+            helios_kmd_logic::independent_flip::RedirectedBlt::Skip => {
+                return unsafe {
+                    present_blt_no_copy(
+                        args,
+                        present_allocations,
+                        present_stream_boundary,
+                        adapter,
+                        src_info,
+                        dst_info,
+                    )
+                };
+            }
         }
 
         // Level 5 (`KmdRmClient` = 5): a Blt whose destination is the RM system-memory
@@ -1926,6 +1976,89 @@ unsafe fn present_blt_onscanout(
     }
 }
 
+/// An independent-flip candidate present with no destination (`RedirectedFlip`, source only): there
+/// is nothing to copy. With no DMA buffer to write (dxgkrnl's usual offer for these: 392.1 failed
+/// every one on the DMA-size check) it succeeds and writes nothing, so nothing is submitted; with a
+/// buffer big enough for the marker it takes [`present_blt_no_copy`] (the fence-0 marker and the
+/// patch references, so a submitted buffer never carries a stale record); with a buffer too small
+/// for the marker it asks for a bigger one, as every Blt does.
+///
+/// # Safety
+/// As [`present_complete`]; `args` names the Blt arm.
+unsafe fn present_redirected_no_destination(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    present_stream_boundary: Option<u64>,
+    adapter: Option<&AdapterContext>,
+    src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+) -> NTSTATUS {
+    if args.pDmaBuffer.is_null() || args.DmaSize == 0 {
+        PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
+        return STATUS_SUCCESS;
+    }
+    unsafe {
+        present_blt_no_copy(
+            args,
+            present_allocations,
+            present_stream_boundary,
+            adapter,
+            src_info,
+            dst_info,
+        )
+    }
+}
+
+/// A Blt completed with no copy and no host call for `IdfRedirSkip`: the preconditions of
+/// [`present_blt_onscanout`] (a DMA buffer for the marker, the private record, the patch capacity,
+/// so a retry is the ordinary Blt), then [`present_blt_skipped`].
+///
+/// # Safety
+/// As [`present_complete`]; `args` names the Blt arm.
+unsafe fn present_blt_no_copy(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    present_stream_boundary: Option<u64>,
+    adapter: Option<&AdapterContext>,
+    src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+) -> NTSTATUS {
+    let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
+    if args.pDmaBuffer.is_null()
+        || args.DmaSize < bytes
+        || args.pDmaBufferPrivateData.is_null()
+        || (args.DmaBufferPrivateDataSize as usize)
+            < core::mem::size_of::<PresentSubmissionPrivate>()
+    {
+        PRESENT_LAST_STATUS.store(
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
+            Ordering::Relaxed,
+        );
+        return crate::ddi::present_foreign::site(
+            site::BLT_DMA_SMALL,
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+        );
+    }
+    let capacity = match present_allocations.validate_patch_capacity(args) {
+        Ok(capacity) => capacity,
+        Err(status) => {
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return crate::ddi::present_foreign::site(site::BLT_PATCH, status);
+        }
+    };
+    unsafe {
+        present_blt_skipped(
+            args,
+            present_allocations,
+            Some(capacity),
+            present_stream_boundary,
+            adapter,
+            src_info,
+            dst_info,
+        )
+    }
+}
+
 /// The last `PBCpy` this arm wrote: the value changes rarely and the legacy arm's per-Present
 /// registry write is not repeated here.
 static RM_BLT_LAST_CPY: AtomicU32 = AtomicU32::new(0);
@@ -2281,6 +2414,11 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_position(
         if position.is_null() {
             return STATUS_SUCCESS;
         }
+        crate::ddi::hw_cursor::note_ddi_position(
+            // SAFETY: non-null, dxgkrnl's argument for this call; `Value` is the whole word.
+            unsafe { (*position).Flags.__bindgen_anon_1.Value } & 1 != 0,
+            unsafe { (*position).VidPnSourceId },
+        );
         // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
         // valid for the call, at PASSIVE.
         unsafe {
@@ -2310,6 +2448,7 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_shape(
         if shape.is_null() {
             return STATUS_SUCCESS;
         }
+        crate::ddi::hw_cursor::note_ddi_shape();
         // SAFETY: display_half_on proved the handle is our adapter; dxgkrnl's argument is
         // valid for the call, at PASSIVE.
         unsafe {

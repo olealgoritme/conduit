@@ -196,11 +196,14 @@ pub(crate) struct AdapterKnobs {
     /// used unfiltered; [`Self::flip_caps`] applies the accepted-bit mask. Read here, once per
     /// StartDevice, so the caps query reports what the `FlipCapsXEff`/`FlipCapsRep` mirrors say.
     pub flip_caps_x: u32,
-    /// `IndepFlip` (default 0), raw. Its caps are already folded into [`Self::direct_flip`] and
+    /// `IndepFlip` (default `independent_flip::KNOB_DEFAULT`, 0 since 405.9; 1 opts in), raw. Its caps are already folded into [`Self::direct_flip`] and
     /// [`Self::flip_caps_x`] by [`Self::read`] (`helios_kmd_logic::independent_flip::advertise`),
     /// so the caps and segment writers need not know it; [`Self::indep_flip_mode`] is the census.
     pub indep_flip: u32,
-    /// `HwCursor` (default 1), raw (`helios_kmd_logic::hw_cursor::KNOB_*`). Whether the caps
+    /// `FlipDoneHost` (default 0), raw (`helios_kmd_logic::host_flip_done::Mode`): flips retire
+    /// from the host's presentation feedback; also the default `FlipQueueN` (2 when nonzero).
+    pub flip_done: u32,
+    /// `HwCursor` (absent: `hw_cursor::knob_default_for(IndepFlip)`, 1 with independent flip, else 0), raw (`helios_kmd_logic::hw_cursor::KNOB_*`). Whether the caps
     /// report a pointer also depends on the host ([`crate::ddi::hw_cursor::advertised`]).
     pub hw_cursor: u32,
     /// `CrossAdaptCaps` (default 0). Nonzero advertises
@@ -255,6 +258,10 @@ pub(crate) struct AdapterKnobs {
     /// (`gdi_accel::resolve_caps_with`). Their owners read them again at StartDevice.
     pub gdi_redir_vram: u32,
     pub gdi_rm_copy_engine: u32,
+    /// `D3d12Node` (default off): report a second 3D node for D3D12 contexts.
+    pub d3d12_node: bool,
+    /// `HwQueuePktCap` (default 0, the OS default): `HwQueuePacketCap`, clamped to 15.
+    pub hw_queue_packet_cap: u32,
 }
 
 impl AdapterKnobs {
@@ -276,10 +283,28 @@ impl AdapterKnobs {
         present_probe: false,
         foreign_copy: false,
         display_half: true,
-        direct_flip: false,
-        flip_caps_x: 0,
-        indep_flip: 0,
-        hw_cursor: helios_kmd_logic::hw_cursor::KNOB_ON,
+        // `IndepFlip` absent = `KNOB_DEFAULT` (0 since 405.9), folded in by `advertise`.
+        direct_flip: helios_kmd_logic::independent_flip::advertise(
+            helios_kmd_logic::independent_flip::Mode::from_knob(
+                helios_kmd_logic::independent_flip::KNOB_DEFAULT,
+            ),
+            false,
+            0,
+        )
+        .direct_flip,
+        flip_caps_x: helios_kmd_logic::independent_flip::advertise(
+            helios_kmd_logic::independent_flip::Mode::from_knob(
+                helios_kmd_logic::independent_flip::KNOB_DEFAULT,
+            ),
+            false,
+            0,
+        )
+        .flip_caps_x,
+        indep_flip: helios_kmd_logic::independent_flip::KNOB_DEFAULT,
+        flip_done: 0,
+        hw_cursor: helios_kmd_logic::hw_cursor::knob_default_for(
+            helios_kmd_logic::independent_flip::KNOB_DEFAULT,
+        ),
         cross_adapter: false,
         vidmm_caps_x: 0,
         bar_seg_flags: 0x1C,
@@ -289,6 +314,8 @@ impl AdapterKnobs {
         gdi_accel: 0,
         gdi_redir_vram: 0,
         gdi_rm_copy_engine: 0,
+        d3d12_node: false,
+        hw_queue_packet_cap: 0,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -302,9 +329,9 @@ impl AdapterKnobs {
     pub fn read() -> Self {
         use crate::diag::{knobs, read_config_dword};
         use helios_kmd_logic::independent_flip as idf;
-        // `IndepFlip` ORs its caps into what `DirectFlipCaps` and `FlipCapsX` ask for; with it at
-        // 0 (the default) both are exactly the raw values, as before.
-        let indep_flip = read_config_dword(knobs::INDEP_FLIP, 0);
+        // `IndepFlip` ORs its caps into what `DirectFlipCaps` and `FlipCapsX` ask for. Absent, it is
+        // `KNOB_DEFAULT` (0, off); then both are exactly the raw values.
+        let indep_flip = read_config_dword(knobs::INDEP_FLIP, idf::KNOB_DEFAULT);
         let advertised = idf::advertise(
             idf::Mode::from_knob(indep_flip),
             read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
@@ -328,7 +355,12 @@ impl AdapterKnobs {
             direct_flip: advertised.direct_flip,
             flip_caps_x: advertised.flip_caps_x,
             indep_flip,
-            hw_cursor: read_config_dword(knobs::HW_CURSOR, helios_kmd_logic::hw_cursor::KNOB_ON),
+            flip_done: read_config_dword(knobs::FLIP_DONE_HOST, 0),
+            // Absent: on with independent flip, off without (`hw_cursor::knob_default_for`).
+            hw_cursor: read_config_dword(
+                knobs::HW_CURSOR,
+                helios_kmd_logic::hw_cursor::knob_default_for(indep_flip),
+            ),
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             vidmm_caps_x: read_config_dword(knobs::VIDMM_CAPS_EXTRA, 0),
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
@@ -338,6 +370,8 @@ impl AdapterKnobs {
             gdi_accel: read_config_dword(knobs::GDI_ACCEL, 0),
             gdi_redir_vram: read_config_dword(knobs::REDIR_VRAM, 0),
             gdi_rm_copy_engine: read_config_dword(knobs::RM_COPY_ENGINE, 0),
+            d3d12_node: read_config_dword(knobs::D3D12_NODE, 0) != 0,
+            hw_queue_packet_cap: read_config_dword(knobs::HW_QUEUE_PACKET_CAP, 0).min(15),
         }
     }
 
@@ -647,8 +681,9 @@ pub struct AdapterContext {
     /// table with no `isr_status` guard at all and used to rest on statement
     /// order plus a comment.
     started_published: AtomicU32,
-    /// Last fence completed by the bring-up scheduler path.
-    last_completed_fence: AtomicU32,
+    /// Last fence completed, per WDDM node (`D3d12Node`: node 1 carries D3D12
+    /// contexts; every node has its own SubmissionFenceId sequence).
+    last_completed_fence: [AtomicU32; crate::virtio::gpu::MAX_WDDM_NODES],
     /// Serializes DMA_COMPLETED notification and its monotonic fence update.
     /// A DPC can take an older ready fence out of the virtio FIFO while a new
     /// SubmitCommand concurrently takes the immediate-completion path; without
@@ -1321,7 +1356,7 @@ impl AdapterContext {
             ),
             started: UnsafeCell::new(None),
             started_published: AtomicU32::new(0),
-            last_completed_fence: AtomicU32::new(0),
+            last_completed_fence: [const { AtomicU32::new(0) }; crate::virtio::gpu::MAX_WDDM_NODES],
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
             msi_state: AtomicU32::new(0),
@@ -1933,7 +1968,14 @@ impl AdapterContext {
     /// only through [`WddmNotifyGuard`], so advancing the scheduler watermark
     /// statically requires ownership of the notification-lock proof.
     pub(crate) fn completed_fence(&self) -> u32 {
-        self.last_completed_fence.load(Ordering::Acquire)
+        self.completed_fence_node(0)
+    }
+
+    /// [`Self::completed_fence`] of WDDM node `node` (0 for an out-of-range one).
+    pub(crate) fn completed_fence_node(&self, node: u32) -> u32 {
+        self.last_completed_fence
+            .get(node as usize)
+            .map_or(0, |f| f.load(Ordering::Acquire))
     }
 
     /// Install (or clear) the virtio transport under the lock.

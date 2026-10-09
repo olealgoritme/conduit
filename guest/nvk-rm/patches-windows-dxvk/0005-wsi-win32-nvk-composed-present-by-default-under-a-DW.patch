@@ -1,0 +1,337 @@
+From 0921c1261be767479486db39d5d52a1ffae5b279 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 23:51:19 +0200
+Subject: [PATCH] wsi/win32, nvk: composed present by default under a DWM on
+ NVK, IMMEDIATE and MAILBOX, a present thread
+
+vk_gpubench at 2560x1440 presented at 119.5 fps against 407 offscreen: under
+a DWM on NVK every window swapchain took the GDI path (a software WSI
+device: a CPU wait for the frame, a CPU copy, a StretchBlt), FIFO was the
+only present mode, and each frame missed a vblank.
+
+- nvk: NVK_HELIOS_WSI_COMPOSE defaults to on when DWM on NVK composes the
+  desktop (the D3D11 flip swap chain path; =0 goes back to GDI).
+- wsi/win32: with a Helios present path (compose or scanout) the surface
+  offers IMMEDIATE, MAILBOX and FIFO (MESA_WSI_WIN32_FIFO_ONLY=1: FIFO only).
+  Composed: sync interval 0 for IMMEDIATE/MAILBOX, and three DXGI buffers so
+  a frame never waits for DWM to give a back buffer back.
+- wsi/win32: composed presents go to a per-swapchain thread
+  (MESA_WSI_COMPOSE_THREAD, default 1) that waits for the frame's fence,
+  then copies and presents; vkQueuePresentKHR no longer waits for the GPU
+  (gpu_ordered_present skips the common CPU wait). MAILBOX and IMMEDIATE
+  show only the newest queued frame and hand the older ones back unshown.
+- A new swapchain stops its retired predecessor's present thread before the
+  window's DXGI swap chain is resized, and ResizeBuffers runs under the
+  compose lock.
+---
+ src/nouveau/vulkan/nvk_wsi.c                |  19 ++-
+ src/vulkan/wsi/wsi_common_win32.cpp         | 167 +++++++++++++++++++-
+ src/vulkan/wsi/wsi_common_win32_compose.cpp |   4 +
+ 3 files changed, 177 insertions(+), 13 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index 55804816..0684b78e 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -270,16 +270,21 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+    if (dwm_composes)
+       mesa_logi("NVK: DWM on NVK composes this desktop: no scanout swap chains");
+ 
+-   /* Opt-in: window swapchains present through a D3D11 flip swap chain on
+-    * the Helios adapter, their images D3D11 shared textures imported by
+-    * resource id, so DWM composes them (before scanout and GDI) */
+-   if (debug_get_bool_option("NVK_HELIOS_WSI_COMPOSE", false)) {
++   /* Window swapchains present through a D3D11 flip swap chain on the
++    * Helios adapter, their images D3D11 shared textures imported by
++    * resource id, so DWM composes them (before scanout and GDI).  The
++    * default under a DWM on NVK, where the alternative is GDI (a CPU wait,
++    * a CPU copy and a StretchBlt per frame, FIFO only: vk_gpubench alu
++    * 119.5 fps against 407 offscreen).  NVK_HELIOS_WSI_COMPOSE=0 goes back
++    * to GDI there; =1 composes on any desktop.
++    */
++   if (debug_get_bool_option("NVK_HELIOS_WSI_COMPOSE", dwm_composes)) {
+       if (nvkmd_rm_win_shared_import_supported()) {
+          pdev->wsi_device.win32.compose_import = nvk_wsi_compose_import;
+-         wsi_win32_compose_log(false, "NVK: NVK_HELIOS_WSI_COMPOSE=1: window swap chains present "
+-                   "through a D3D11 flip swap chain");
++         wsi_win32_compose_log(false, "NVK: window swap chains present through a D3D11 flip swap "
++                   "chain (NVK_HELIOS_WSI_COMPOSE=0 turns it off)");
+       } else {
+-         wsi_win32_compose_log(true, "NVK: NVK_HELIOS_WSI_COMPOSE=1, but the KMD or librmclient "
++         wsi_win32_compose_log(true, "NVK: composed present wanted, but the KMD or librmclient "
+                    "has no shared-surface import: not composing");
+       }
+    }
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index f21dff92..f5a574cf 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -114,6 +114,8 @@ struct wsi_win32_surface {
+    struct wsi_win32_compose *compose;
+ };
+ 
++#define WSI_WIN32_COMPOSE_QUEUE 8
++
+ struct wsi_win32_swapchain {
+    struct wsi_swapchain         base;
+    IDXGISwapChain3            *dxgi;
+@@ -163,6 +165,20 @@ struct wsi_win32_swapchain {
+       bool enabled;
+       uint32_t sync_interval;
+       bool presented;
++      /* MESA_WSI_COMPOSE_THREAD (default 1): presents go to a thread that
++       * waits for the rendering and then copies and presents, so the
++       * application's vkQueuePresentKHR never waits for the GPU.  The
++       * common present's CPU wait (a software WSI device) is skipped
++       * (gpu_ordered_present).  Queue under acquire_mutex. */
++      bool threaded;
++      bool stop;
++      /* MAILBOX / IMMEDIATE: a newer present replaces queued older ones */
++      bool replace;
++      thrd_t thread;
++      struct u_cnd_monotonic cond;
++      uint32_t q[WSI_WIN32_COMPOSE_QUEUE];
++      uint32_t q_head, q_count;
++      uint64_t dropped;
+    } compose;
+ 
+    struct wsi_win32_image     images[0];
+@@ -476,6 +492,18 @@ static const VkPresentModeKHR present_modes_dxgi[] = {
+    VK_PRESENT_MODE_FIFO_KHR,
+ };
+ 
++/* A software WSI device with a Helios present path (composed or scanout):
++ * neither waits for a vblank unless asked, so IMMEDIATE and MAILBOX are
++ * real; games with V-sync off ask for them and fall back to FIFO (paced)
++ * without.  MESA_WSI_WIN32_FIFO_ONLY=1 restores the FIFO-only list. */
++static bool
++wsi_win32_helios_present_modes(const struct wsi_device *wsi_device)
++{
++   return (wsi_device->win32.compose_import != NULL ||
++           wsi_device->win32.scanout_flip != NULL) &&
++          !debug_get_bool_option("MESA_WSI_WIN32_FIFO_ONLY", false);
++}
++
+ static VkResult
+ wsi_win32_surface_get_present_modes(VkIcdSurfaceBase *surface,
+                                     struct wsi_device *wsi_device,
+@@ -484,7 +512,10 @@ wsi_win32_surface_get_present_modes(VkIcdSurfaceBase *surface,
+ {
+    const VkPresentModeKHR *array;
+    size_t array_size;
+-   if (wsi_device->sw || !wsi_device->win32.get_d3d12_command_queue) {
++   if (wsi_win32_helios_present_modes(wsi_device)) {
++      array = present_modes_dxgi;
++      array_size = ARRAY_SIZE(present_modes_dxgi);
++   } else if (wsi_device->sw || !wsi_device->win32.get_d3d12_command_queue) {
+       array = present_modes_gdi;
+       array_size = ARRAY_SIZE(present_modes_gdi);
+    } else {
+@@ -926,11 +957,11 @@ wsi_win32_compose_configure_image(const struct wsi_swapchain *chain,
+ }
+ 
+ static VkResult
+-wsi_win32_queue_present_compose(struct wsi_win32_swapchain *chain,
+-                                struct wsi_win32_image *image)
++wsi_win32_compose_present_now(struct wsi_win32_swapchain *chain,
++                              struct wsi_win32_image *image)
+ {
+-   /* The rendering has finished (the common present waits for it: the
+-    * driver is a software WSI device) */
++   /* The rendering has finished: the common present waited for it (a
++    * software WSI device), or the present thread did */
+    /* A retired swapchain whose window gave up its D3D11 swap chain */
+    VkResult result = chain->surface->compose == NULL ? VK_ERROR_OUT_OF_DATE_KHR :
+       wsi_win32_compose_present(chain->surface->compose, &image->compose,
+@@ -949,6 +980,91 @@ wsi_win32_queue_present_compose(struct wsi_win32_swapchain *chain,
+    return result;
+ }
+ 
++static int
++wsi_win32_compose_thread(void *data)
++{
++   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)data;
++   const struct wsi_device *wsi = chain->wsi->wsi;
++
++   u_thread_setname("wsi-compose");
++   for (;;) {
++      mtx_lock(&chain->acquire_mutex);
++      while (!chain->compose.stop && chain->compose.q_count == 0)
++         u_cnd_monotonic_wait(&chain->compose.cond, &chain->acquire_mutex);
++      if (chain->compose.stop) {
++         mtx_unlock(&chain->acquire_mutex);
++         break;
++      }
++      uint32_t index = chain->compose.q[chain->compose.q_head];
++      chain->compose.q_head = (chain->compose.q_head + 1) % WSI_WIN32_COMPOSE_QUEUE;
++      chain->compose.q_count--;
++      /* MAILBOX / IMMEDIATE: only the newest queued frame is shown; the
++       * older ones go back to the application unshown */
++      bool dropped = false;
++      while (chain->compose.replace && chain->compose.q_count > 0) {
++         chain->images[index].state = WSI_IMAGE_IDLE;
++         chain->compose.dropped++;
++         dropped = true;
++         index = chain->compose.q[chain->compose.q_head];
++         chain->compose.q_head = (chain->compose.q_head + 1) % WSI_WIN32_COMPOSE_QUEUE;
++         chain->compose.q_count--;
++      }
++      if (dropped)
++         u_cnd_monotonic_broadcast(&chain->acquire_cond);
++      mtx_unlock(&chain->acquire_mutex);
++
++      /* The rendering, on the CPU but off the application's thread: the
++       * D3D11 copy reads the image right after */
++      wsi->WaitForFences(chain->base.device, 1, &chain->base.fences[index],
++                         true, ~0ull);
++      wsi_win32_compose_present_now(chain, &chain->images[index]);
++   }
++   return 0;
++}
++
++static VkResult
++wsi_win32_queue_present_compose(struct wsi_win32_swapchain *chain,
++                                struct wsi_win32_image *image)
++{
++   if (!chain->compose.threaded)
++      return wsi_win32_compose_present_now(chain, image);
++
++   mtx_lock(&chain->acquire_mutex);
++   VkResult result = chain->status;
++   if (result == VK_SUCCESS) {
++      /* Never more than the image count is queued (each image once) */
++      assert(chain->compose.q_count < WSI_WIN32_COMPOSE_QUEUE);
++      image->state = WSI_IMAGE_QUEUED;
++      chain->compose.q[(chain->compose.q_head + chain->compose.q_count) %
++                       WSI_WIN32_COMPOSE_QUEUE] =
++         (uint32_t)(image - chain->images);
++      chain->compose.q_count++;
++      u_cnd_monotonic_signal(&chain->compose.cond);
++   } else {
++      image->state = WSI_IMAGE_IDLE;
++      u_cnd_monotonic_broadcast(&chain->acquire_cond);
++   }
++   mtx_unlock(&chain->acquire_mutex);
++   return result;
++}
++
++static void
++wsi_win32_compose_thread_stop(struct wsi_win32_swapchain *chain)
++{
++   if (!chain->compose.threaded)
++      return;
++   mtx_lock(&chain->acquire_mutex);
++   chain->compose.stop = true;
++   u_cnd_monotonic_signal(&chain->compose.cond);
++   mtx_unlock(&chain->acquire_mutex);
++   thrd_join(chain->compose.thread, NULL);
++   u_cnd_monotonic_destroy(&chain->compose.cond);
++   chain->compose.threaded = false;
++   if (chain->compose.dropped)
++      wsi_win32_compose_log(false, "compose: %" PRIu64 " frames replaced "
++                            "unshown (MAILBOX/IMMEDIATE)", chain->compose.dropped);
++}
++
+ static VkResult
+ wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
+                                 struct wsi_win32_image *image)
+@@ -1126,6 +1242,9 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
+    struct wsi_win32_swapchain *chain =
+       (struct wsi_win32_swapchain *) drv_chain;
+ 
++   /* The present thread finishes its present before the images go away */
++   wsi_win32_compose_thread_stop(chain);
++
+    /* The display goes back to the desktop before the images go away */
+    if (chain->scanout.presented && chain->wsi->wsi->win32.scanout_release)
+       chain->wsi->wsi->win32.scanout_release(chain->base.device);
+@@ -1637,17 +1756,28 @@ wsi_win32_surface_create_swapchain(
+       image_params = &scanout_image_params;
+    struct wsi_base_image_params *fallback_params = image_params;
+ 
++   /* The retired swapchain's present thread must not present into the
++    * window's DXGI swap chain while it is resized below */
++   if (create_info->oldSwapchain != VK_NULL_HANDLE) {
++      VK_FROM_HANDLE(wsi_swapchain, old_chain, create_info->oldSwapchain);
++      wsi_win32_compose_thread_stop((struct wsi_win32_swapchain *)old_chain);
++   }
++
+    /* Composed presentation first when the driver offers it: the window's
+     * D3D11 device and DXGI swap chain must exist before the images */
+    if (wsi_device->win32.compose_import != NULL &&
+        create_info->imageArrayLayers == 1 &&
+        wsi_win32_compose_format_supported(create_info->imageFormat)) {
++      /* Without V-sync a frame must not wait for DWM to give a back
++       * buffer back: three DXGI buffers */
++      const bool vsync = create_info->presentMode == VK_PRESENT_MODE_FIFO_KHR ||
++                         create_info->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+       VkResult cr = wsi_win32_compose_open(&surface->compose,
+                                            (void *)surface->base.hwnd,
+                                            create_info->imageExtent.width,
+                                            create_info->imageExtent.height,
+                                            create_info->imageFormat,
+-                                           num_images);
++                                           vsync ? num_images : MAX2(num_images, 3u));
+       if (cr == VK_SUCCESS)
+          image_params = &compose_image_params;
+       else
+@@ -1701,6 +1831,9 @@ retry:
+       chain->compose.sync_interval =
+          chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR ||
+          chain->base.present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? 1 : 0;
++      chain->compose.replace =
++         chain->base.present_mode == VK_PRESENT_MODE_MAILBOX_KHR ||
++         chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+ 
+    if (image_params->image_type == WSI_IMAGE_TYPE_WIN32_SCANOUT) {
+@@ -1782,6 +1915,28 @@ retry:
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
++   if (chain->compose.enabled &&
++       chain->base.image_count < WSI_WIN32_COMPOSE_QUEUE &&
++       debug_get_bool_option("MESA_WSI_COMPOSE_THREAD", true)) {
++      if (u_cnd_monotonic_init(&chain->compose.cond) == thrd_success) {
++         if (thrd_create(&chain->compose.thread, wsi_win32_compose_thread,
++                         chain) == thrd_success) {
++            chain->compose.threaded = true;
++            /* The thread waits for the rendering, not vkQueuePresentKHR */
++            chain->base.gpu_ordered_present = true;
++         } else {
++            u_cnd_monotonic_destroy(&chain->compose.cond);
++         }
++      }
++      wsi_win32_compose_log(!chain->compose.threaded,
++                            "compose: present mode %d, sync interval %u, %s",
++                            (int)chain->base.present_mode,
++                            chain->compose.sync_interval,
++                            chain->compose.threaded ?
++                               "present thread (no CPU wait in vkQueuePresentKHR)" :
++                               "presenting on the application's thread");
++   }
++
+    wsi_win32_frametime_swapchain(chain,
+                                  chain->dxgi ? "DXGI" :
+                                  chain->compose.enabled ? "Helios compose (D3D11 flip swap chain)" :
+diff --git a/src/vulkan/wsi/wsi_common_win32_compose.cpp b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+index 8b54ce93..dc13a6a2 100644
+--- a/src/vulkan/wsi/wsi_common_win32_compose.cpp
++++ b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+@@ -404,9 +404,13 @@ wsi_win32_compose_open(struct wsi_win32_compose **inout, void *window,
+    if (c && c->hwnd == hwnd && c->swapchain) {
+       /* A new Vulkan swapchain on the same window (resize, format): the
+        * DXGI swap chain stays, with new buffers. */
++      /* Under the lock: a retired swapchain's present thread may still be
++       * presenting into this DXGI swap chain */
++      AcquireSRWLockExclusive(&c->lock);
+       c->context->ClearState();
+       c->context->Flush();
+       HRESULT hr = c->swapchain->ResizeBuffers(buffers, width, height, format, 0);
++      ReleaseSRWLockExclusive(&c->lock);
+       if (FAILED(hr)) {
+          LOGE("ResizeBuffers(%u, %ux%u, format %d) failed: 0x%08lx",
+               buffers, width, height, (int)format, (unsigned long)hr);
+-- 
+2.43.0
+

@@ -115,12 +115,18 @@ Details: [SCANOUT.md](SCANOUT.md), [CLIPBOARD.md](CLIPBOARD.md), [SYNC.md](SYNC.
 
 ## Windows guests (experimental)
 
-With `--venus` the backend also serves Venus: a Windows guest's Vulkan
-command streams (D3D through DXVK / vkd3d-proton, Helios's guest drivers)
-arrive as virtio-gpu commands in `GpuCmd` messages, are checked by the
-backend and executed by `conduit-venus` (`host/venus`), a separate sandboxed
-process running virglrenderer on the host's NVIDIA Vulkan driver. Its scanout
-reaches the viewer as a dma-buf like a Linux guest's. Details:
+A Windows guest runs the Helios WDDM KMD and D3D11/D3D12 UMDs (D3D11 on
+DXVK, D3D12 on vkd3d-proton, OpenGL on Zink) over NVK-on-RM: Mesa's NVK
+driver with librmclient sends RM calls through the KMD and the virtio
+transport to the backend, which forwards them to the host's NVIDIA driver,
+as for a Linux guest. The KMD drives the display (scanout, flips, EDID mode,
+hardware cursor, presentation feedback from the host); frames reach the
+viewer as dma-bufs. With `--venus` the backend also serves Venus, the
+fallback for processes the guest's policy keeps off NVK: their Vulkan
+command streams arrive as virtio-gpu commands in `GpuCmd` messages, are
+checked by the backend and executed by `conduit-venus` (`host/venus`), a
+separate sandboxed process running virglrenderer on the host's NVIDIA Vulkan
+driver. Details:
 [VENUS.md](VENUS.md); setting up a guest: [WINDOWS.md](WINDOWS.md).
 
 ## NVK on RM (experimental)
@@ -146,7 +152,7 @@ supported: the GPU state lives in the host driver. Details:
 
 ## Limits
 
-- NVIDIA only. Linux guests; Windows guests (Venus) are experimental
+- NVIDIA only. Linux guests; Windows guests (NVK-on-RM) are experimental
   ([WINDOWS.md](WINDOWS.md), [ROADMAP.md](ROADMAP.md)).
 - Not hardware isolation; the host NVIDIA driver is trusted.
 - The shared-memory window (`--window-mib`) is sized when the VM starts and

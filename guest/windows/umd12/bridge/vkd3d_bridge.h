@@ -76,6 +76,12 @@ struct HeliosVkd3dDevice {
   std::uint32_t nvk_ecl_fence_caps() const noexcept;
   // NVK only: close an RM fence this process still owns (a refused HE12 v4).
   void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
+  // NVK only: show the texture on scanout 0 once ECL fence value `value` of
+  // `queue` (a borrowed engine ID3D12CommandQueue*) fired: the KMD (or a thread
+  // in the ICD) flips then; nothing waits here. 0 = queued; negative = not
+  // done (no fence or no fenced scanout), and the caller presents another way.
+  std::int32_t nvk_scanout_present_fenced(std::size_t resource, std::size_t queue,
+                                          std::uint64_t value) const noexcept;
 
   // BORROWED — the bridge keeps the owning reference. 0 if not created.
   // The caller must NOT `Release()` this, and on the Rust side must not let a
@@ -237,6 +243,10 @@ std::int32_t helios_vkd3d_bridge_execute_rm(std::size_t queue, rust::Slice<const
 std::uint32_t helios_vkd3d_bridge_ecl_fence_stats(rust::Slice<std::uint64_t> out) noexcept;
 // The engine's memory placement counters (helios_vkd3d_memory_stats); how many it wrote.
 std::uint32_t helios_vkd3d_bridge_memory_stats(rust::Slice<std::uint64_t> out) noexcept;
+// NVK: make the queue's next ECL fence now (helios_vkd3d_prepare_ecl_fence).
+std::int32_t helios_vkd3d_bridge_prepare_ecl_fence(std::size_t queue) noexcept;
+// The engine's GPU timestamp counters (helios_vkd3d_gpu_time_stats); how many it wrote.
+std::uint32_t helios_vkd3d_bridge_gpu_time_stats(rust::Slice<std::uint64_t> out) noexcept;
 
 std::int32_t helios_vkd3d_bridge_update_tiles(std::size_t queue, std::size_t resource,
     std::uint32_t region_count, std::size_t coords, std::size_t sizes, std::size_t heap,

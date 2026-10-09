@@ -1,0 +1,544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 02:22:15 +0200
+Subject: [PATCH] nvk: indirect draw records through the pushbuffer, MME within
+ its RAM
+
+0025 again, without overflowing the MME instruction RAM, plus fewer host
+waits.
+
+CS2 on 405.12 (1080p windowed, NVK_PASS_PROFILE=2): the 2x MSAA depth
+prepass takes 10.3 ms for 114 indirect calls / 365 draws, about 28 us
+per indirect draw, while its work is small (715k vertex shader
+invocations, 523k primitives, 96k fragment shader invocations; 32-GPR
+vertex shader without spills).  The cost is per draw, in the front end:
+on Turing+ every indirect draw is an MME_DMA_READ_FIFOED of its record
+that the front end waits for.
+
+NVK_INDIRECT_PUSH (Turing+, default on; =0 is upstream's per-record DMA
+reads): vkCmdDraw[Indexed]Indirect sends the records to new
+NVK_MME_DRAW[_INDEXED]_INDIRECT_INLINE macros as inline macro data that
+the host fetches from the indirect buffer itself (a pushbuffer segment
+pointing at the records, as NVK does before Turing), up to 1024 record
+dwords per segment.  The first segment after a barrier, event wait,
+secondary or the start of the command buffer is a no-prefetch GPFIFO
+entry (SYNC_WAIT), so it is fetched only after the work that may have
+written the records; later segments until the next barrier may be
+prefetched, since Vulkan requires the records to be written before a
+barrier the draw follows and the host fetches GPFIFO entries in order.
+Padding of larger strides is dropped and gl_DrawID continues.
+
+MME instruction RAM: every macro is uploaded at queue creation.  405.8's
+macros took 2976 dwords and ran; 405.9's 3303 (0025's two macros on top)
+overflowed it on GB20x, and every macro call faulted (Xid 13, ESR
+0x404490 = 0x80000080).  Macros a knob leaves unused are now the
+builder's empty macro (two instructions): with NVK_INDIRECT_PUSH on, the
+per-record DMA macros and NVK_MDI_BATCH's batch macros; with it off, the
+inline macros (and the batch macros unless NVK_MDI_BATCH is set).
+Measured for BLACKWELL_A with the NVK builders on the host:
+
+  NVK_INDIRECT_PUSH=1 (default)        2649 dwords
+  NVK_INDIRECT_PUSH=0                  2649 dwords
+  NVK_INDIRECT_PUSH=0 NVK_MDI_BATCH=64 2988 dwords
+
+The RAM is taken as 0xc00 (3072) dwords, like the MME data RAM and
+consistent with 2976 running and 3303 faulting.  Queue creation fails
+(VK_ERROR_INITIALIZATION_FAILED) rather than uploading more, and the
+total is logged (mesa_logi, and in the NVK_SHADER_STATS file).
+
+Checked in the MME simulator with the real NVK macros for BLACKWELL_A:
+the inline macros' method streams equal the per-record DMA macros' for
+strides of 4/5, 5/6, 8, 16 and 300 dwords and 1-250 draws, with every
+parameter consumed.  Not yet run on hardware.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c |  18 ++-
+ src/nouveau/vulkan/nvk_cmd_buffer.h |  15 +++
+ src/nouveau/vulkan/nvk_cmd_draw.c   | 202 +++++++++++++++++++++++++---
+ src/nouveau/vulkan/nvk_event.c      |   2 +
+ src/nouveau/vulkan/nvk_mme.c        |   2 +
+ src/nouveau/vulkan/nvk_mme.h        |   4 +
+ src/nouveau/vulkan/nvk_shader.c     |  15 +++
+ src/nouveau/vulkan/nvk_shader.h     |   3 +
+ 8 files changed, 241 insertions(+), 20 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index c1a34fcb..0d6e2456 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -233,20 +233,28 @@ nvk_cmd_buffer_new_push(struct nvk_cmd_buffer *cmd)
+ }
+ 
+ void
+-nvk_cmd_buffer_push_indirect(struct nvk_cmd_buffer *cmd,
+-                             uint64_t addr, uint32_t range)
++nvk_cmd_buffer_push_indirect_ext(struct nvk_cmd_buffer *cmd,
++                                 uint64_t addr, uint32_t range,
++                                 bool no_prefetch)
+ {
+    nvk_cmd_buffer_flush_push(cmd, true);
+ 
+    struct nvk_cmd_push push = {
+       .addr = addr,
+       .range = range,
+-      .no_prefetch = true,
++      .no_prefetch = no_prefetch,
+    };
+ 
+    util_dynarray_append(&cmd->pushes, push);
+ }
+ 
++void
++nvk_cmd_buffer_push_indirect(struct nvk_cmd_buffer *cmd,
++                             uint64_t addr, uint32_t range)
++{
++   nvk_cmd_buffer_push_indirect_ext(cmd, addr, range, true);
++}
++
+ VkResult
+ nvk_cmd_buffer_upload_alloc(struct nvk_cmd_buffer *cmd,
+                             uint32_t size, uint32_t alignment,
+@@ -363,6 +371,7 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+ 
+    nvk_reset_cmd_buffer(&cmd->vk, 0);
+    nvk_pass_profile_reset_cmd(cmd);
++   cmd->indirect_push_synced = false;
+ 
+    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+       cmd->state.inherited_pipeline_statistics =
+@@ -453,6 +462,8 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+       util_dynarray_append_dynarray(&cmd->pushes, &other->pushes);
+ 
+       cmd->prev_subc = nvk_cmd_buffer_last_subchannel(other);
++      /* The secondary may hold barriers */
++      cmd->indirect_push_synced = false;
+ 
+       if (prof_slot >= 0) {
+          nvk_pass_profile_end_secondary(cmd, other, prof_slot);
+@@ -937,6 +948,7 @@ nvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
+    nvk_cmd_profile_count_barrier(cmd);
++   cmd->indirect_push_synced = false;
+    nvk_cmd_flush_wait_dep(cmd, pDependencyInfo, true);
+    nvk_cmd_image_layout_transition(cmd, pDependencyInfo);
+    nvk_cmd_invalidate_deps(cmd, 1, pDependencyInfo);
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 0387c4f9..5ae871bd 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -353,6 +353,13 @@ struct nvk_cmd_buffer {
+    uint32_t pass_profile_internal;
+    bool pass_profile_in_pass;
+    bool pass_profile_on;
++
++   /* NVK_INDIRECT_PUSH: a no-prefetch indirect record segment was pushed
++    * since the last barrier, so the records of later indirect draws (which
++    * Vulkan requires to be written before that barrier) can be fetched
++    * without another wait.
++    */
++   bool indirect_push_synced;
+    struct nvk_pass_profile_counts pass_profile_pass_counts;
+    struct nvk_pass_profile_counts pass_profile_op_counts;
+    struct nvk_pass_profile_counts pass_profile_cmd_counts;
+@@ -421,6 +428,14 @@ void
+ nvk_cmd_buffer_push_indirect(struct nvk_cmd_buffer *cmd,
+                              uint64_t addr, uint32_t dw_count);
+ 
++/* no_prefetch false: the host may fetch the segment ahead of the work
++ * before it (only for data known to be final, see indirect_push_synced).
++ */
++void
++nvk_cmd_buffer_push_indirect_ext(struct nvk_cmd_buffer *cmd,
++                                 uint64_t addr, uint32_t range,
++                                 bool no_prefetch);
++
+ void nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                                    const VkCommandBufferBeginInfo *pBeginInfo);
+ void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 97abdf2c..f9c6f536 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -44,6 +44,30 @@
+  * buffers bound through NVK_MME_BIND_VB/IB (0006).  An A/B lever for
+  * rendering bugs; on by default.
+  */
++/* Size of the Turing+ MME instruction RAM in dwords (the unit
++ * LOAD_MME_INSTRUCTION_RAM_POINTER counts in).  Not documented; 0xc00 like
++ * the MME data RAM (MME_TU104_DRAM_COUNT), and consistent with GB20x
++ * running 2976 dwords of macros and faulting on 3303.
++ */
++#define NVK_MME_RAM_DW 0xc00u
++
++static uint32_t nvk_mdi_batch(void);
++
++/* NVK_INDIRECT_PUSH (Turing+, default on; =0 is upstream's per-record MME
++ * DMA reads): see nvk_cmd_draw_indirect_pushed().
++ */
++static bool
++nvk_indirect_push(void)
++{
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      s = debug_get_bool_option("NVK_INDIRECT_PUSH", true) ? 2 : 1;
++      p_atomic_set(&state, s);
++   }
++   return s == 2;
++}
++
+ static bool
+ debug_get_option_nvk_cpu_state_tracking(void)
+ {
+@@ -181,7 +205,8 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
+       .engine_id = 0,
+    });
+ 
+-   for (uint32_t mme = 0, mme_pos = 0; mme < NVK_MME_COUNT; mme++) {
++   uint32_t mme_pos = 0;
++   for (uint32_t mme = 0; mme < NVK_MME_COUNT; mme++) {
+       size_t size;
+       uint32_t *dw = nvk_build_mme(&pdev->info, mme, &size);
+       if (dw == NULL)
+@@ -201,6 +226,31 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
+       mme_pos += num_dw;
+ 
+       free(dw);
++
++      /* The MME instruction RAM holds NVK_MME_RAM_DW dwords: past it,
++       * macros are corrupt and every call faults (405.9).  Never upload
++       * more; fail the queue instead.
++       */
++      if (pdev->info.cls_eng3d >= TURING_A && mme_pos > NVK_MME_RAM_DW) {
++         return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                          "NVK: MME macros need %u dwords, more than the "
++                          "%u of the MME instruction RAM (NVK_MDI_BATCH / "
++                          "NVK_INDIRECT_PUSH macro sets)", mme_pos,
++                          NVK_MME_RAM_DW);
++      }
++   }
++
++   {
++      static bool logged;
++      if (!logged) {
++         logged = true;
++         mesa_logi("NVK: MME macros take %u of %u dwords", mme_pos,
++                   NVK_MME_RAM_DW);
++         nvk_shader_stats_note("NVK: MME macros take %u of %u dwords "
++                               "(NVK_INDIRECT_PUSH %d, NVK_MDI_BATCH %u)",
++                               mme_pos, NVK_MME_RAM_DW, nvk_indirect_push(),
++                               nvk_mdi_batch());
++      }
+    }
+ 
+    if (pdev->info.cls_eng3d >= TURING_A && pdev->info.cls_eng3d < BLACKWELL_A)
+@@ -5528,6 +5578,12 @@ nvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
+ void
+ nvk_mme_draw_indirect(struct mme_builder *b)
+ {
++   /* Unused with NVK_INDIRECT_PUSH: left empty to keep the MME RAM within
++    * its size (nvk_mme_draw_indirect_batch())
++    */
++   if (b->devinfo->cls_eng3d >= TURING_A && nvk_indirect_push())
++      return;
++
+    if (b->devinfo->cls_eng3d >= TURING_A) {
+       struct mme_value64 draw_addr = mme_load_addr64(b);
+       struct mme_value draw_count = mme_load(b);
+@@ -5599,22 +5655,34 @@ nvk_mdi_batch(void)
+    return s - 1;
+ }
+ 
++/* dma: the records come from one MME_DMA_READ_FIFOED (NVK_MDI_BATCH);
++ * else they follow the three parameters as inline macro data
++ * (NVK_INDIRECT_PUSH).
++ */
+ static void
+-nvk_mme_build_draw_indirect_batch(struct mme_builder *b, bool indexed)
++nvk_mme_build_draw_indirect_batch(struct mme_builder *b, bool indexed,
++                                  bool dma)
+ {
+-   /* Only called on Turing+ (nvk_cmd_draw_indirect_batched()) */
++   /* Only called on Turing+ */
+    if (b->devinfo->cls_eng3d < TURING_A)
+       return;
+ 
+-   struct mme_value64 draw_addr = mme_load_addr64(b);
+-   struct mme_value read_dw = mme_load(b);
+-   struct mme_value pad_dw = mme_load(b);
+-   struct mme_value draw = mme_load(b);
+-   struct mme_value draw_end = mme_load(b);
+-
+-   mme_tu104_read_fifoed(b, draw_addr, read_dw);
+-   mme_free_reg64(b, draw_addr);
+-   mme_free_reg(b, read_dw);
++   struct mme_value pad_dw, draw, draw_end;
++   if (dma) {
++      struct mme_value64 draw_addr = mme_load_addr64(b);
++      struct mme_value read_dw = mme_load(b);
++      pad_dw = mme_load(b);
++      draw = mme_load(b);
++      draw_end = mme_load(b);
++
++      mme_tu104_read_fifoed(b, draw_addr, read_dw);
++      mme_free_reg64(b, draw_addr);
++      mme_free_reg(b, read_dw);
++   } else {
++      pad_dw = mme_load(b);
++      draw = mme_load(b);
++      draw_end = mme_load(b);
++   }
+ 
+    struct mme_value first = mme_mov(b, draw);
+    mme_while(b, ult, draw, draw_end) {
+@@ -5637,16 +5705,105 @@ nvk_mme_build_draw_indirect_batch(struct mme_builder *b, bool indexed)
+    }
+ }
+ 
++/* Every macro is uploaded into the MME instruction RAM at queue creation
++ * (nvk_push_draw_state_init()), and the RAM is nearly full: 405.8's macros
++ * take 2976 dwords and were fine, 405.9's 3303 overflowed it on GB20x and
++ * every macro call faulted (Xid 13, ESR 0x404490 = 0x80000080).  So macros
++ * a knob leaves unused are the builder's empty macro (two instructions):
++ * the batch macros unless NVK_MDI_BATCH is on and NVK_INDIRECT_PUSH off,
++ * the inline ones unless NVK_INDIRECT_PUSH is on, and the per-record DMA
++ * macros (NVK_MME_DRAW[_INDEXED]_INDIRECT) on Turing+ when it is on.
++ */
++static bool
++nvk_mdi_batch_active(void)
++{
++   return nvk_mdi_batch() >= 2 && !nvk_indirect_push();
++}
++
+ void
+ nvk_mme_draw_indirect_batch(struct mme_builder *b)
+ {
+-   nvk_mme_build_draw_indirect_batch(b, false);
++   if (nvk_mdi_batch_active())
++      nvk_mme_build_draw_indirect_batch(b, false, true);
+ }
+ 
+ void
+ nvk_mme_draw_indexed_indirect_batch(struct mme_builder *b)
+ {
+-   nvk_mme_build_draw_indirect_batch(b, true);
++   if (nvk_mdi_batch_active())
++      nvk_mme_build_draw_indirect_batch(b, true, true);
++}
++
++void
++nvk_mme_draw_indirect_inline(struct mme_builder *b)
++{
++   if (nvk_indirect_push())
++      nvk_mme_build_draw_indirect_batch(b, false, false);
++}
++
++void
++nvk_mme_draw_indexed_indirect_inline(struct mme_builder *b)
++{
++   if (nvk_indirect_push())
++      nvk_mme_build_draw_indirect_batch(b, true, false);
++}
++
++/* NVK_INDIRECT_PUSH (Turing+, default on): the draw records of
++ * vkCmdDraw[Indexed]Indirect reach the MME as inline macro data that the
++ * host fetches from the indirect buffer itself (a pushbuffer segment
++ * pointing at the records, as NVK does before Turing), instead of an
++ * MME_DMA_READ_FIFOED per draw that the front end waits for: in CS2 that
++ * cost ~28 us per indirect draw in a depth prepass of ~115 indirect calls.
++ *
++ * The first record segment after a barrier (or the start of the command
++ * buffer, or a secondary) is a no-prefetch GPFIFO entry (SYNC_WAIT), so the
++ * host fetches it only after the work before it, which may have written the
++ * records, is done.  Later segments until the next barrier may be
++ * prefetched: Vulkan requires the records an indirect draw reads to be
++ * written before a barrier the draw comes after, and the host fetches
++ * GPFIFO entries in order.  One wait per barrier instead of one memory round
++ * trip per draw.  Segments hold at most NVK_INDIRECT_PUSH_MAX_DW record
++ * dwords; padding of larger strides is dropped and gl_DrawID continues.
++ */
++#define NVK_INDIRECT_PUSH_MAX_DW 1024u
++
++static bool
++nvk_cmd_draw_indirect_pushed(struct nvk_cmd_buffer *cmd, bool indexed,
++                             uint64_t draw_addr, uint32_t draw_count,
++                             uint64_t stride)
++{
++   if (nvk_cmd_buffer_3d_cls(cmd) < TURING_A || !nvk_indirect_push())
++      return false;
++
++   const uint32_t rec_dw = indexed ? 5 : 4;
++   assert(stride % 4 == 0 && stride / 4 >= rec_dw);
++   const uint64_t stride_dw = stride / 4;
++   /* A stride larger than a segment: one record per segment */
++   const uint32_t max_n = stride_dw > NVK_INDIRECT_PUSH_MAX_DW - rec_dw ? 1 :
++      (NVK_INDIRECT_PUSH_MAX_DW - rec_dw) / stride_dw + 1;
++   const uint32_t pad_dw = stride_dw - rec_dw;
++
++   for (uint32_t first = 0; first < draw_count;) {
++      const uint32_t n = MIN2(max_n, draw_count - first);
++      const uint64_t addr = draw_addr + (uint64_t)first * stride;
++      const uint32_t rec_total_dw = n == 1 ? rec_dw :
++                                    (n - 1) * stride_dw + rec_dw;
++
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
++      P_1INC(p, NV9097, CALL_MME_MACRO(indexed ?
++                                       NVK_MME_DRAW_INDEXED_INDIRECT_INLINE :
++                                       NVK_MME_DRAW_INDIRECT_INLINE));
++      P_INLINE_DATA(p, n > 1 ? pad_dw : 0);
++      P_INLINE_DATA(p, first);
++      P_INLINE_DATA(p, first + n);
++      nv_push_update_count(p, rec_total_dw);
++      nvk_cmd_buffer_push_indirect_ext(cmd, addr, rec_total_dw * 4,
++                                       !cmd->indirect_push_synced);
++      cmd->indirect_push_synced = true;
++
++      first += n;
++   }
++   return true;
+ }
+ 
+ /* Returns false when the batch path does not apply (the caller takes the
+@@ -5658,7 +5815,8 @@ nvk_cmd_draw_indirect_batched(struct nvk_cmd_buffer *cmd, bool indexed,
+                               uint64_t stride)
+ {
+    const uint32_t batch = nvk_mdi_batch();
+-   if (batch < 2 || draw_count < 2 || nvk_cmd_buffer_3d_cls(cmd) < TURING_A)
++   if (!nvk_mdi_batch_active() || draw_count < 2 ||
++       nvk_cmd_buffer_3d_cls(cmd) < TURING_A)
+       return false;
+ 
+    const uint32_t rec_dw = indexed ? 5 : 4;
+@@ -5720,7 +5878,10 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+-   if (nvk_cmd_draw_indirect_batched(cmd, false, pInfo->addressRange.address,
++   if (nvk_cmd_draw_indirect_pushed(cmd, false, pInfo->addressRange.address,
++                                    pInfo->drawCount, stride)) {
++      /* NVK_INDIRECT_PUSH */
++   } else if (nvk_cmd_draw_indirect_batched(cmd, false, pInfo->addressRange.address,
+                                      pInfo->drawCount, stride)) {
+       /* NVK_MDI_BATCH */
+    } else if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+@@ -5768,6 +5929,10 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+ void
+ nvk_mme_draw_indexed_indirect(struct mme_builder *b)
+ {
++   /* Unused with NVK_INDIRECT_PUSH (see nvk_mme_draw_indirect()) */
++   if (b->devinfo->cls_eng3d >= TURING_A && nvk_indirect_push())
++      return;
++
+    if (b->devinfo->cls_eng3d >= TURING_A) {
+       struct mme_value64 draw_addr = mme_load_addr64(b);
+       struct mme_value draw_count = mme_load(b);
+@@ -5833,7 +5998,10 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+-   if (nvk_cmd_draw_indirect_batched(cmd, true, pInfo->addressRange.address,
++   if (nvk_cmd_draw_indirect_pushed(cmd, true, pInfo->addressRange.address,
++                                    pInfo->drawCount, stride)) {
++      /* NVK_INDIRECT_PUSH */
++   } else if (nvk_cmd_draw_indirect_batched(cmd, true, pInfo->addressRange.address,
+                                      pInfo->drawCount, stride)) {
+       /* NVK_MDI_BATCH */
+    } else if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+diff --git a/src/nouveau/vulkan/nvk_event.c b/src/nouveau/vulkan/nvk_event.c
+index 44ce2b0d..60b41798 100644
+--- a/src/nouveau/vulkan/nvk_event.c
++++ b/src/nouveau/vulkan/nvk_event.c
+@@ -262,6 +262,8 @@ nvk_CmdWaitEvents2(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
++   cmd->indirect_push_synced = false;
++
+    for (uint32_t i = 0; i < eventCount; i++) {
+       VK_FROM_HANDLE(nvk_event, event, pEvents[i]);
+ 
+diff --git a/src/nouveau/vulkan/nvk_mme.c b/src/nouveau/vulkan/nvk_mme.c
+index bc4ba398..e59611b3 100644
+--- a/src/nouveau/vulkan/nvk_mme.c
++++ b/src/nouveau/vulkan/nvk_mme.c
+@@ -42,6 +42,8 @@ static const nvk_mme_builder_func mme_builders[NVK_MME_COUNT] = {
+    [NVK_MME_DRAW_MESH_INDIRECT_COUNT]      = nvk_mme_draw_mesh_indirect_count,
+    [NVK_MME_DRAW_INDIRECT_BATCH]           = nvk_mme_draw_indirect_batch,
+    [NVK_MME_DRAW_INDEXED_INDIRECT_BATCH]   = nvk_mme_draw_indexed_indirect_batch,
++   [NVK_MME_DRAW_INDIRECT_INLINE]          = nvk_mme_draw_indirect_inline,
++   [NVK_MME_DRAW_INDEXED_INDIRECT_INLINE]  = nvk_mme_draw_indexed_indirect_inline,
+ };
+ 
+ static const struct nvk_mme_test_case *mme_tests[NVK_MME_COUNT] = {
+diff --git a/src/nouveau/vulkan/nvk_mme.h b/src/nouveau/vulkan/nvk_mme.h
+index e2bdea05..761173e8 100644
+--- a/src/nouveau/vulkan/nvk_mme.h
++++ b/src/nouveau/vulkan/nvk_mme.h
+@@ -46,6 +46,8 @@ enum nvk_mme {
+    NVK_MME_DRAW_MESH_INDIRECT_COUNT,
+    NVK_MME_DRAW_INDIRECT_BATCH,
+    NVK_MME_DRAW_INDEXED_INDIRECT_BATCH,
++   NVK_MME_DRAW_INDIRECT_INLINE,
++   NVK_MME_DRAW_INDEXED_INDIRECT_INLINE,
+ 
+    NVK_MME_COUNT,
+ };
+@@ -263,6 +265,8 @@ void nvk_mme_draw_mesh_indirect(struct mme_builder *b);
+ void nvk_mme_draw_mesh_indirect_count(struct mme_builder *b);
+ void nvk_mme_draw_indirect_batch(struct mme_builder *b);
+ void nvk_mme_draw_indexed_indirect_batch(struct mme_builder *b);
++void nvk_mme_draw_indirect_inline(struct mme_builder *b);
++void nvk_mme_draw_indexed_indirect_inline(struct mme_builder *b);
+ 
+ uint32_t nvk_mme_tess_params(mesa_shader_stage stage,
+                              enum nak_ts_domain domain,
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index 835fcb11..d5876cf4 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -35,6 +35,7 @@
+ #include "util/simple_mtx.h"
+ 
+ #include <inttypes.h>
++#include <stdarg.h>
+ #include <stdio.h>
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -747,6 +748,20 @@ nvk_shader_stats_file(void)
+    return file;
+ }
+ 
++void
++nvk_shader_stats_note(const char *fmt, ...)
++{
++   FILE *f = nvk_shader_stats_file();
++   if (likely(f == NULL))
++      return;
++   va_list args;
++   va_start(args, fmt);
++   vfprintf(f, fmt, args);
++   va_end(args);
++   fputc('\n', f);
++   fflush(f);
++}
++
+ static void
+ nvk_shader_log_stats(const struct nvk_shader *shader)
+ {
+diff --git a/src/nouveau/vulkan/nvk_shader.h b/src/nouveau/vulkan/nvk_shader.h
+index 782a7885..53120cfb 100644
+--- a/src/nouveau/vulkan/nvk_shader.h
++++ b/src/nouveau/vulkan/nvk_shader.h
+@@ -140,6 +140,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_shader, vk.base, VkShaderEXT,
+ 
+ extern const struct vk_device_shader_ops nvk_device_shader_ops;
+ 
++/* NVK_SHADER_STATS=1: one more line in its log (no-op otherwise) */
++void nvk_shader_stats_note(const char *fmt, ...) PRINTFLIKE(1, 2);
++
+ uint64_t
+ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev);
+ 
+-- 
+2.43.0
+

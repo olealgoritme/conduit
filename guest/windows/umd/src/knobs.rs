@@ -488,15 +488,19 @@ pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePre
 /// or `HELIOS_NVK_RM_COPY_RECORD=0`) = the 48 / 96-byte fence forms as before.
 pub(crate) static NVK_RM_COPY_RECORD: BoolKnob = BoolKnob::new(c"NvkRmCopyRecord", true);
 
-/// `NvkSkipBltCopy`: 0 (default) = when DXGI hands a windowed NVK present a
-/// destination resource, the UMD copies the frame into it
-/// (`CopySubresourceRegion`) before the WDDM present, as always. 1 (registry,
-/// or `HELIOS_NVK_SKIP_BLT_COPY=1`) = that copy is skipped: the KMD's Blt reads
-/// the present's source (`hSrcAllocation`) itself and writes the same pixels
-/// into the window's surface (`RedirVram`'s copy or route), so the UMD's copy
-/// only doubles the GPU work. An A/B knob: correct only where the KMD's Blt
-/// copies every such present.
-pub(crate) static NVK_SKIP_BLT_COPY: BoolKnob = BoolKnob::new(c"NvkSkipBltCopy", false);
+/// `NvkSkipBltCopy` (`HKLM\\SOFTWARE\\Helios`, or `HELIOS_NVK_SKIP_BLT_COPY`): 1 =
+/// when DXGI hands a windowed NVK present a destination resource, the UMD does
+/// NOT copy the frame into it before the WDDM present; the KMD's Blt reads the
+/// present's source (`hSrcAllocation`) and writes it into the window's surface
+/// at the client offset. 0 = the UMD copies it, as before. Absent: 1 when the
+/// KMD's `RedirVram` is 1 (its service key), else 0.
+///
+/// The UMD's copy goes to (0, 0) of the destination, which with `RedirVram` is
+/// the window's redirection texture including its non-client area, while the
+/// KMD's copy places the frame at the client offset: two writers, and with the
+/// copy-engine route asynchronous the image jumped by the title-bar height at
+/// frame rate (403.1, windowed Heaven; smooth with the copy skipped, no fps
+/// cost in 386.1).
 
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|v| match v.trim() {
@@ -530,10 +534,17 @@ pub(crate) fn nvk_rm_copy_record() -> bool {
 
 /// `DirectFlipSupport` (REG_DWORD), or `HELIOS_DIRECT_FLIP_SUPPORT` from the
 /// process environment: what the D3D11.1 `CheckDirectFlipSupport` DDI answers.
-/// 0 (default) = never (the behaviour before this knob); 1 = yes when dxgkrnl
+/// 0 (default) = never; 1 = yes when dxgkrnl
 /// reports DirectFlip support for the Helios adapter (KMTQAITYPE_DIRECTFLIP_SUPPORT,
 /// i.e. the KMD's SupportDirectFlip cap) and the two resources have the same
-/// size and format; 2 = yes whenever size and format match (test lever).
+/// size and the same format (the 393.1 rule); 2 = yes whenever size and format match (test
+/// lever); 3 = as 1, and also only
+/// for a pair the KMD can scan out as is (one of R8G8B8A8 / B8G8R8A8 / B8G8R8X8 UNORM, one sample,
+/// one mip, one slice). 3 was briefly the meaning of 1 (driver 388.1). 4 = the same as 1
+/// (the exact-format rule; kept for the 405.8 rows). 5 = as 1, but two different 8-bit scan-out
+/// formats also pair (an R8G8B8A8 game on the B8G8R8A8 desktop,
+/// `helios_umd_common::format::direct_flip_formats_compatible`): opt-in, because on 405.8 a
+/// promoted R8G8B8A8 CS2 swap chain froze after one frame (docs/independent-flip.md 13.10).
 /// Windows decides independent flip and the blt-to-flip swap-effect upgrade
 /// partly from this answer.
 pub(crate) fn direct_flip_support() -> u32 {
@@ -543,14 +554,21 @@ pub(crate) fn direct_flip_support() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .or_else(|| helios_umd_common::knobs::reg_dword(c"DirectFlipSupport"))
+            // 0 again (405.9): with 1 and the KMD's `IndepFlip` 1 a promoted CS2 swap chain
+            // froze after one frame (docs/independent-flip.md 13.10). 1 opts in.
             .unwrap_or(0)
     })
 }
 
-/// `NvkSkipBltCopy`, or `HELIOS_NVK_SKIP_BLT_COPY` from the environment.
+/// `NvkSkipBltCopy`: the environment, then the registry, then the KMD's
+/// `RedirVram` (see the note above `env_bool`).
 pub(crate) fn nvk_skip_blt_copy() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
-        env_bool("HELIOS_NVK_SKIP_BLT_COPY").unwrap_or_else(|| NVK_SKIP_BLT_COPY.get())
+        env_bool("HELIOS_NVK_SKIP_BLT_COPY")
+            .or_else(|| helios_umd_common::knobs::reg_dword(c"NvkSkipBltCopy").map(|v| v != 0))
+            .unwrap_or_else(|| {
+                helios_umd_common::knobs::kmd_service_dword(c"RedirVram") == Some(1)
+            })
     })
 }
