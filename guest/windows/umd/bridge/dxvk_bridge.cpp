@@ -1051,6 +1051,16 @@ namespace helios_handoff {
     SwitchToThread();
   }
 
+  // HELIOS_HANDOFF_SLEEP1=1: the handoff wait sleeps Sleep(1) per
+  // iteration, as before 405.20 (bisecting)
+  bool sleep1() {
+    static const bool on = []() {
+      const char* v = std::getenv("HELIOS_HANDOFF_SLEEP1");
+      return v && v[0] == '1';
+    }();
+    return on;
+  }
+
   // Handoff waits that slept, logged once a second while there are any
   std::atomic<std::uint64_t> s_handoff_sleeps{0}, s_handoff_sleep_ns{0};
   std::atomic<std::int64_t> s_handoff_log_qpc{0};
@@ -1111,6 +1121,8 @@ namespace helios_handoff {
         YieldProcessor();
       } else if (spin < 256) {
         SwitchToThread();
+      } else if (sleep1()) {
+        Sleep(1);
       } else {
         // Was Sleep(1): a ~15.6 ms timer tick per iteration
         LARGE_INTEGER a, b;
