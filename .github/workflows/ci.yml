@@ -90,16 +90,16 @@ jobs:
           # The oldest kernels exercise nvgpu_compat.h's fallbacks (own
           # vblank timer, no format info in fb_create, old virtio_find_vqs).
           - distro: ubuntu-24.04
-            image: ubuntu:24.04
+            image: mirror.gcr.io/library/ubuntu:24.04
             headers: linux-headers-generic
           - distro: ubuntu-24.04-hwe
-            image: ubuntu:24.04
+            image: mirror.gcr.io/library/ubuntu:24.04
             headers: linux-headers-generic-hwe-24.04
           - distro: debian-13
-            image: debian:13
+            image: mirror.gcr.io/library/debian:13
             headers: linux-headers-amd64
           - distro: fedora-latest
-            image: fedora:latest
+            image: mirror.gcr.io/library/fedora:latest
             headers: kernel-devel
     steps:
       - name: Install kernel headers and compiler

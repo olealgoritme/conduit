@@ -61,13 +61,13 @@ jobs:
       matrix:
         include:
           - format: deb
-            image: ubuntu:24.04
+            image: mirror.gcr.io/library/ubuntu:24.04
           - format: rpm
-            image: fedora:latest
+            image: mirror.gcr.io/library/fedora:latest
           - format: archlinux
-            image: archlinux:latest
+            image: mirror.gcr.io/library/archlinux:latest
           - format: tarball
-            image: debian:12
+            image: mirror.gcr.io/library/debian:12
     steps:
       - name: Tools the checkout and cache actions need
         run: |
