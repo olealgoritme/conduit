@@ -78,8 +78,10 @@ NVK on the host's GPU (192 fps in this frame). GPU-Z does not recognise the virt
    conduit view win11                                 # the window
    ```
 4. **Install the guest driver.** Download `conduit-windows-gpu-driver-<version>.zip`
-   from the same release into the VM, unzip it, and run `install.ps1` from an
-   **Administrator** PowerShell. The first run turns on test-signing and asks you
+   from the same release into the VM, unzip it, and from an **Administrator**
+   prompt in that folder run `powershell -ExecutionPolicy Bypass -File .\install.ps1`
+   (Windows blocks downloaded scripts otherwise; the script itself turns on
+   test-signing and trusts the driver's test certificate). The first run asks you
    to reboot. Run it again after the reboot, then reboot once more. Device Manager
    then shows **Conduit Helios** and Windows runs at the mode from step 3.
 
