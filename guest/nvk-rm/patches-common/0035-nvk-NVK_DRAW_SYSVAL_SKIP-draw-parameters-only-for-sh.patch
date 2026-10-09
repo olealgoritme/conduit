@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 04:26:04 +0200
+Subject: [PATCH] nvk: NVK_DRAW_SYSVAL_SKIP, draw parameters only for shaders
+ that read them
+
+CS2's depth prepass on 405.16: 30 us per indirect draw without MSAA, 42
+with, ~2000 vertices each, nothing but an index and vertex buffer rebind
+and the draw macro between draws (NVK_PASS_PROFILE=4), geometry in VRAM.
+Per draw the macro (nvk_mme_build_set_draw_params) also updates the
+hardware root table: first vertex, base instance and draw index, each
+through SET_ROOT_TABLE_SELECTOR + LOAD_ROOT_TABLE when it changed, which
+for GPU-culled records is nearly every draw.
+
+The draw parameters reach shaders only through the root table, and only
+for shaders that read gl_BaseVertex/gl_BaseInstance/gl_DrawID: the
+hardware instance and vertex IDs already include the bases
+(SET_GLOBAL_BASE_INSTANCE_INDEX, SET_VERTEX_ID_BASE).  The descriptor
+lowering now records which of the three a shader reads
+(nvk_cbuf_map::draw_sysvals), and with NVK_DRAW_SYSVAL_SKIP=1 (Turing+,
+test knob, default off) the CPU writes the union for the bound shaders to
+a new MME scratch slot on shader changes; the draw macros then write only
+those root table dwords.  The hardware base instance method is always kept
+current; the base instance's root table copy, when needed, is written on
+every such draw, since the method no longer shadows it.  A skipped first
+vertex or draw index keeps its scratch shadow equal to the root table.
+With the knob off the scratch says "all" and the macros behave as before,
+except that the base instance root dword is written per macro draw
+without the compare.
+
+This tells whether root table updates between draws serialise them: if
+DXVK's depth-prepass shaders read none of the three, the macro writes only
+methods.
+
+MME: 2370 dwords for a DXVK device (2769 with NVK_INDIRECT_PUSH=0
+NVK_MDI_BATCH=64), within the 2976 budget.  The MME simulator check of the
+inline against the per-record indirect macros still passes.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c           |   1 +
+ src/nouveau/vulkan/nvk_cmd_buffer.h           |   5 +
+ src/nouveau/vulkan/nvk_cmd_draw.c             | 121 ++++++++++++++++--
+ src/nouveau/vulkan/nvk_mme.h                  |   3 +
+ .../vulkan/nvk_nir_lower_descriptors.c        |   7 +
+ src/nouveau/vulkan/nvk_shader.h               |  11 ++
+ 6 files changed, 139 insertions(+), 9 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index dd7ae0f4..cc5c173d 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -465,6 +465,7 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+       /* The secondary may hold barriers and set any 3D state */
+       cmd->indirect_push_synced = false;
+       cmd->state.gfx.fs_tail_dw_count = 0;
++      cmd->state.gfx.draw_sysvals_emitted = 0;
+ 
+       if (prof_slot >= 0) {
+          nvk_pass_profile_end_secondary(cmd, other, prof_slot);
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index a50f8bc4..1e83da30 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -285,6 +285,10 @@ struct nvk_graphics_state {
+     * (nvk_shader::fs_tail_dw_start) last emitted, 0 dwords if unknown
+     */
+    uint16_t fs_tail_dw_count;
++   /* NVK_DRAW_SYSVAL_SKIP: NVK_MME_SCRATCH_DRAW_SYSVALS as last written
++    * (bit 8 set: known)
++    */
++   uint16_t draw_sysvals_emitted;
+    uint32_t fs_tail_dw[24];
+    struct {
+       uint64_t addr;
+@@ -466,6 +470,7 @@ nvk_cmd_forget_gfx_gpu_state(struct nvk_cmd_buffer *cmd)
+    cmd->state.gfx.vb_known = 0;
+    cmd->state.gfx.ib_known = false;
+    cmd->state.gfx.fs_tail_dw_count = 0;
++   cmd->state.gfx.draw_sysvals_emitted = 0;
+ }
+ void nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 2682eb4b..1089fea6 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -820,6 +820,8 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
+     * consistency.
+     */
+    P_IMMD(p, NV9097, SET_GLOBAL_BASE_INSTANCE_INDEX, 0);
++   P_IMMD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_DRAW_SYSVALS),
++          NVK_DRAW_SYSVALS_ALL);
+    P_MTHD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_CB0_FIRST_VERTEX));
+    P_NV9097_SET_MME_SHADOW_SCRATCH(p, NVK_MME_SCRATCH_CB0_FIRST_VERTEX, 0);
+    P_NV9097_SET_MME_SHADOW_SCRATCH(p, NVK_MME_SCRATCH_CB0_MESH_GROUP_COUNT_X, 0);
+@@ -4665,13 +4667,54 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+    }
+ }
+ 
++/* NVK_DRAW_SYSVAL_SKIP=1 (Turing+, test, default off): tell the draw macros
++ * which root table draw parameters the bound shaders read, so they skip the
++ * rest (nvk_mme_build_set_draw_params).  Off: always ALL.
++ */
++static bool
++nvk_draw_sysval_skip(void)
++{
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      s = debug_get_bool_option("NVK_DRAW_SYSVAL_SKIP", false) ? 2 : 1;
++      p_atomic_set(&state, s);
++   }
++   return s == 2;
++}
++
++static void
++nvk_cmd_flush_draw_sysvals(struct nvk_cmd_buffer *cmd)
++{
++   struct nvk_graphics_state *gfx = &cmd->state.gfx;
++   uint32_t mask = 0;
++   for (mesa_shader_stage s = 0; s < MESA_SHADER_FRAGMENT; s++) {
++      const struct nvk_shader *sh = gfx->shaders[s];
++      if (sh == NULL)
++         continue;
++      const uint32_t v = sh->cbuf_map.draw_sysvals;
++      mask |= (v & NVK_DRAW_SYSVALS_KNOWN) ? (v & NVK_DRAW_SYSVALS_ALL)
++                                           : NVK_DRAW_SYSVALS_ALL;
++   }
++   const uint16_t emitted = 0x100 | mask;
++   if (gfx->draw_sysvals_emitted == emitted)
++      return;
++   gfx->draw_sysvals_emitted = emitted;
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++   P_IMMD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_DRAW_SYSVALS), mask);
++}
++
+ static void
+ nvk_cmd_flush_gfx_state(struct nvk_cmd_buffer *cmd)
+ {
++   const bool shaders_changed = cmd->state.gfx.shaders_dirty != 0;
+    nvk_cmd_buffer_flush_push_descriptors(cmd, &cmd->state.gfx.descriptors);
+    nvk_cmd_flush_gfx_dynamic_state(cmd);
+    nvk_cmd_flush_gfx_shaders(cmd);
+    nvk_cmd_flush_gfx_cbufs(cmd);
++   if (nvk_draw_sysval_skip() && nvk_cmd_buffer_3d_cls(cmd) >= TURING_A &&
++       (shaders_changed || !(cmd->state.gfx.draw_sysvals_emitted & 0x100)))
++      nvk_cmd_flush_draw_sysvals(cmd);
+ 
+    if (NAK_CAN_PRINTF)
+       nvk_cmd_buffer_flush_printf_buffer(cmd, &cmd->state.gfx.descriptors);
+@@ -5068,20 +5111,80 @@ static void
+ nvk_mme_build_set_draw_params(struct mme_builder *b,
+                               const struct mme_draw_params *p)
+ {
+-   nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.vs.base_vertex),
+-                           NVK_MME_SCRATCH_CB0_FIRST_VERTEX,
+-                           p->first_vertex);
+-   nvk_mme_set_cb0_mthd(b, nvk_root_descriptor_offset(draw.vs.base_instance),
+-                        NV9097_SET_GLOBAL_BASE_INSTANCE_INDEX,
+-                        p->first_instance);
++   /* NVK_DRAW_SYSVAL_SKIP: root table draw parameters only for what the
++    * bound shaders read (NVK_MME_SCRATCH_DRAW_SYSVALS, ALL unless the knob is
++    * on).  A skipped first vertex or draw index leaves its scratch shadow
++    * equal to the root table, so a later write compares right.  The base
++    * instance's hardware method is always kept current; its root table copy
++    * is written on every draw that needs it, since nothing shadows it once
++    * the method and the root table can differ.
++    */
++   if (b->devinfo->cls_eng3d >= TURING_A) {
++      struct mme_value sysvals = nvk_mme_load_scratch(b, DRAW_SYSVALS);
++      struct mme_value fv = mme_and(b, sysvals,
++                                    mme_imm(NVK_DRAW_SYSVAL_FIRST_VERTEX));
++      mme_free_reg(b, sysvals);
++      mme_if(b, ine, fv, mme_zero()) {
++         nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.vs.base_vertex),
++                                 NVK_MME_SCRATCH_CB0_FIRST_VERTEX,
++                                 p->first_vertex);
++      }
++      mme_free_reg(b, fv);
++
++      struct mme_value old = mme_state(b, NV9097_SET_GLOBAL_BASE_INSTANCE_INDEX);
++      mme_if(b, ine, old, p->first_instance) {
++         mme_mthd(b, NV9097_SET_GLOBAL_BASE_INSTANCE_INDEX);
++         mme_emit(b, p->first_instance);
++      }
++      mme_free_reg(b, old);
++
++      sysvals = nvk_mme_load_scratch(b, DRAW_SYSVALS);
++      struct mme_value bi = mme_and(b, sysvals,
++                                    mme_imm(NVK_DRAW_SYSVAL_BASE_INSTANCE));
++      mme_free_reg(b, sysvals);
++      mme_if(b, ine, bi, mme_zero()) {
++         uint32_t root_table_selector;
++         V_NVC597_SET_ROOT_TABLE_SELECTOR(root_table_selector, {
++            .root_table = nvk_root_descriptor_offset(draw.vs.base_instance) /
++                          NVK_HW_ROOT_TABLE_SIZE,
++            .offset = nvk_root_descriptor_offset(draw.vs.base_instance) %
++                      NVK_HW_ROOT_TABLE_SIZE,
++         });
++         mme_mthd(b, NVC597_SET_ROOT_TABLE_SELECTOR);
++         mme_emit(b, mme_imm(root_table_selector));
++         mme_mthd(b, NVC597_LOAD_ROOT_TABLE);
++         mme_emit(b, p->first_instance);
++      }
++      mme_free_reg(b, bi);
++   } else {
++      nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.vs.base_vertex),
++                              NVK_MME_SCRATCH_CB0_FIRST_VERTEX,
++                              p->first_vertex);
++      nvk_mme_set_cb0_mthd(b, nvk_root_descriptor_offset(draw.vs.base_instance),
++                           NV9097_SET_GLOBAL_BASE_INSTANCE_INDEX,
++                           p->first_instance);
++   }
+    /* NVK_SKIP_DRAWID=1 (test only, default off; wrong for shaders that
+     * read gl_DrawID, which D3D11 has not): indirect draws do not write the
+     * draw index to the root table, to see what that write costs per draw.
+     */
+    if (!debug_get_bool_option("NVK_SKIP_DRAWID", false)) {
+-      nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.draw_index),
+-                              NVK_MME_SCRATCH_CB0_DRAW_INDEX,
+-                              p->draw_index);
++      if (b->devinfo->cls_eng3d >= TURING_A) {
++         struct mme_value sysvals = nvk_mme_load_scratch(b, DRAW_SYSVALS);
++         struct mme_value di = mme_and(b, sysvals,
++                                       mme_imm(NVK_DRAW_SYSVAL_DRAW_INDEX));
++         mme_free_reg(b, sysvals);
++         mme_if(b, ine, di, mme_zero()) {
++            nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.draw_index),
++                                    NVK_MME_SCRATCH_CB0_DRAW_INDEX,
++                                    p->draw_index);
++         }
++         mme_free_reg(b, di);
++      } else {
++         nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.draw_index),
++                                 NVK_MME_SCRATCH_CB0_DRAW_INDEX,
++                                 p->draw_index);
++      }
+    }
+    nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.view_index),
+                            NVK_MME_SCRATCH_CB0_VIEW_INDEX,
+diff --git a/src/nouveau/vulkan/nvk_mme.h b/src/nouveau/vulkan/nvk_mme.h
+index 727ce3ce..12b11dcd 100644
+--- a/src/nouveau/vulkan/nvk_mme.h
++++ b/src/nouveau/vulkan/nvk_mme.h
+@@ -100,6 +100,9 @@ enum nvk_mme_scratch {
+    /* Shading rate control */
+    NVK_MME_SCRATCH_SHADING_RATE_CONTROL,
+ 
++   /* NVK_DRAW_SYSVAL_* the bound shaders read (NVK_DRAW_SYSVAL_SKIP) */
++   NVK_MME_SCRATCH_DRAW_SYSVALS,
++
+    /* Addres of cb0 */
+    NVK_MME_SCRATCH_CB0_ADDR_HI,
+    NVK_MME_SCRATCH_CB0_ADDR_LO,
+diff --git a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
+index 137d4051..61f8cd69 100644
+--- a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
++++ b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
+@@ -403,6 +403,7 @@ static void
+ build_cbuf_map(nir_shader *nir, struct lower_descriptors_ctx *ctx)
+ {
+    ctx->cbuf_map->cbuf_count = 0;
++   ctx->cbuf_map->draw_sysvals = NVK_DRAW_SYSVALS_KNOWN;
+ 
+    /* Root descriptors always go in cbuf 0 */
+    ctx->cbuf_map->cbufs[ctx->cbuf_map->cbuf_count++] = (struct nvk_cbuf) {
+@@ -1171,12 +1172,18 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
+ 
+    case nir_intrinsic_load_base_vertex:
+    case nir_intrinsic_load_first_vertex:
++      if (ctx->cbuf_map != NULL)
++         ctx->cbuf_map->draw_sysvals |= NVK_DRAW_SYSVAL_FIRST_VERTEX;
+       return lower_sysval_to_root_table(b, intrin, draw.vs.base_vertex, ctx);
+ 
+    case nir_intrinsic_load_base_instance:
++      if (ctx->cbuf_map != NULL)
++         ctx->cbuf_map->draw_sysvals |= NVK_DRAW_SYSVAL_BASE_INSTANCE;
+       return lower_sysval_to_root_table(b, intrin, draw.vs.base_instance, ctx);
+ 
+    case nir_intrinsic_load_draw_id:
++      if (ctx->cbuf_map != NULL)
++         ctx->cbuf_map->draw_sysvals |= NVK_DRAW_SYSVAL_DRAW_INDEX;
+       return lower_sysval_to_root_table(b, intrin, draw.draw_index, ctx);
+ 
+    case nir_intrinsic_load_view_index:
+diff --git a/src/nouveau/vulkan/nvk_shader.h b/src/nouveau/vulkan/nvk_shader.h
+index 10e57dd1..b149d9fa 100644
+--- a/src/nouveau/vulkan/nvk_shader.h
++++ b/src/nouveau/vulkan/nvk_shader.h
+@@ -83,9 +83,20 @@ struct nvk_cbuf {
+ PRAGMA_DIAGNOSTIC_POP
+ static_assert(sizeof(struct nvk_cbuf) == 8, "This struct has no holes");
+ 
++/* nvk_cbuf_map::draw_sysvals: which draw parameters in the root table the
++ * shader reads (lowered from the sysvals in nvk_nir_lower_descriptors.c).
++ * NVK_DRAW_SYSVALS_KNOWN unset means unknown: assume all.
++ */
++#define NVK_DRAW_SYSVAL_FIRST_VERTEX   (1u << 0) /* base_vertex, first_vertex */
++#define NVK_DRAW_SYSVAL_BASE_INSTANCE  (1u << 1)
++#define NVK_DRAW_SYSVAL_DRAW_INDEX     (1u << 2)
++#define NVK_DRAW_SYSVALS_ALL           0x7u
++#define NVK_DRAW_SYSVALS_KNOWN         (1u << 7)
++
+ struct nvk_cbuf_map {
+    uint32_t cbuf_count;
+    struct nvk_cbuf cbufs[16];
++   uint32_t draw_sysvals;
+ };
+ 
+ uint16_t
+-- 
+2.43.0
+
