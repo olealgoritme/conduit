@@ -60,6 +60,8 @@ jobs:
             libllvmspirvlib-20-dev llvm-spirv-20 libclc-20-dev
           python3 -m pip install --break-system-packages "meson>=1.7" ninja
           rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu
+          # Mesa builds outside the checkout, on the default toolchain, not the repo's pinned one
+          (cd "$RUNNER_TEMP" && rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu)
           cargo install --locked bindgen-cli cbindgen
       - name: Build and stage NVK and Zink
         env:
