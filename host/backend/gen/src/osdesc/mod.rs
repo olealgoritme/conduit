@@ -25,14 +25,10 @@
 pub mod v535_129_03;
 pub mod v565_77_00;
 pub mod v580_178_04;
-pub mod v595_71_05;
-pub mod v595_99_02;
 pub mod v595_104_02;
-pub mod v610_43_02;
-pub mod v610_43_03;
+pub mod v595_71_05;
 pub mod v610_57_04;
 pub mod v615_71_09;
-pub mod v615_78_08;
 
 use crate::version::DriverVersion;
 
