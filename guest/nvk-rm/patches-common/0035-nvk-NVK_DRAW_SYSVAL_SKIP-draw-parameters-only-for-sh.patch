@@ -28,6 +28,10 @@ With the knob off the scratch says "all" and the macros behave as before,
 except that the base instance root dword is written per macro draw
 without the compare.
 
+NVK_SHADER_STATS lines of vertex, tessellation and geometry shaders now
+end with draw_sysvals (bit 0 base vertex, 1 base instance, 2 draw index,
+7 known), so a capture shows what DXVK's shaders read.
+
 This tells whether root table updates between draws serialise them: if
 DXVK's depth-prepass shaders read none of the three, the macro writes only
 methods.
@@ -41,8 +45,9 @@ inline against the per-record indirect macros still passes.
  src/nouveau/vulkan/nvk_cmd_draw.c             | 121 ++++++++++++++++--
  src/nouveau/vulkan/nvk_mme.h                  |   3 +
  .../vulkan/nvk_nir_lower_descriptors.c        |   7 +
+ src/nouveau/vulkan/nvk_shader.c               |   8 +-
  src/nouveau/vulkan/nvk_shader.h               |  11 ++
- 6 files changed, 139 insertions(+), 9 deletions(-)
+ 7 files changed, 145 insertions(+), 11 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
 index dd7ae0f4..cc5c173d 100644
@@ -282,6 +287,25 @@ index 137d4051..61f8cd69 100644
        return lower_sysval_to_root_table(b, intrin, draw.draw_index, ctx);
  
     case nir_intrinsic_load_view_index:
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index 9050701c..6780df75 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -775,8 +775,12 @@ nvk_shader_log_stats(const struct nvk_shader *shader)
+    case MESA_SHADER_VERTEX:
+    case MESA_SHADER_TESS_EVAL:
+    case MESA_SHADER_GEOMETRY:
+-      snprintf(extra, sizeof(extra), " clip 0x%x cull 0x%x layer %d",
+-               i->vtg.clip_enable, i->vtg.cull_enable, i->vtg.writes_layer);
++      /* draw_sysvals: bit 0 base/first vertex, 1 base instance, 2 draw
++       * index, 7 known (nvk_cbuf_map::draw_sysvals)
++       */
++      snprintf(extra, sizeof(extra), " clip 0x%x cull 0x%x layer %d "
++               "draw_sysvals 0x%x", i->vtg.clip_enable, i->vtg.cull_enable,
++               i->vtg.writes_layer, shader->cbuf_map.draw_sysvals);
+       break;
+    case MESA_SHADER_FRAGMENT:
+       snprintf(extra, sizeof(extra), " writes_depth %d early_z %d "
 diff --git a/src/nouveau/vulkan/nvk_shader.h b/src/nouveau/vulkan/nvk_shader.h
 index 10e57dd1..b149d9fa 100644
 --- a/src/nouveau/vulkan/nvk_shader.h
