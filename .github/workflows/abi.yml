@@ -1,3 +1,4 @@
+# Registered on main; run by hand with workflow_dispatch.
 # ABI: weekly check for new NVIDIA driver releases.
 #
 # Lists open-gpu-kernel-modules release tags and the driver ABIs gVisor's
