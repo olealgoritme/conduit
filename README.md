@@ -1,6 +1,6 @@
 # <img src="packaging/common/icons/conduit.svg" width="44" align="middle" alt=""> Conduit
 
-**Share your NVIDIA GPU with a virtual machine, and see its desktop on yours, at full speed.**
+**Share your NVIDIA GPU with a virtual machine and see its desktop on yours.**
 
 Conduit lets a Linux VM use your real NVIDIA graphics card (games, Vulkan,
 OpenGL, CUDA, video encoding) while your own desktop keeps using it too. The
