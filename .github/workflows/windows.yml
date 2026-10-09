@@ -62,11 +62,12 @@ jobs:
           rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu
           # Mesa builds outside the checkout, on the default toolchain, not the repo's pinned one
           (cd "$RUNNER_TEMP" && rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu)
-          cargo install --locked bindgen-cli cbindgen
+          # bindgen links libclang when it is built: LLVM 20's, not the runner's default 18
+          LIBCLANG_PATH=/usr/lib/llvm-20/lib cargo install --locked bindgen-cli cbindgen
       - name: Build and stage NVK and Zink
         env:
           MESA_DIR: ${{ runner.temp }}/mesa
-          # bindgen must use LLVM 20's libclang; the runner's default 18 rejects MinGW's mmintrin.h
+          # also for bindgen at run time; LLVM 18's headers reject MinGW's mmintrin.h
           LIBCLANG_PATH: /usr/lib/llvm-20/lib
           JOBS: '4'
           MEMORY_MAX: ''
