@@ -17,6 +17,13 @@ on:
   push:
     branches: [master, main]
   pull_request:
+    # The weekly ABI PR only touches generated tables and runs its own tests
+    # in abi.yml; CI runs on main after it merges.
+    paths-ignore:
+      - 'guest/linux/devinfo/**'
+      - 'guest/linux/rmctrl/**'
+      - 'guest/linux/gen/**'
+      - 'host/backend/gen/**'
   workflow_dispatch:
 
 concurrency:
