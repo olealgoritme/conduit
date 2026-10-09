@@ -242,6 +242,19 @@ conduit view myvm         # open it in a window
 That's it. The VM gets your monitor's resolution and refresh rate
 automatically.
 
+### The dashboard
+
+Run `conduit` on its own for a live dashboard: every VM with its state, display,
+CPU, memory and GPU memory; the host's CPU and RAM; and the GPU's load, power,
+temperature, clocks and VRAM (read through NVML), with a two-minute history.
+One key (or a click) opens, starts, shuts down, reboots, resets, pauses or
+forces off the selected VM, picks its display mode, or shows its logs and
+`conduit doctor`. `?` lists the keys; quitting leaves the VMs running.
+
+<p align="center">
+  <img src="docs/assets/conduit-dashboard.png" alt="The conduit dashboard: three VMs (lab stopped, omarchy and win11 running), the RTX 5090's load, board power and core temperature in large digits, clock, power, temperature and fan bars, VRAM split by VM, a two-minute chart of GPU load, temperature, VRAM and host CPU, and an activity log above a row of action keys" width="860">
+</p>
+
 ### Everyday commands
 
 | Command | What it does |
@@ -257,6 +270,7 @@ automatically.
 | `conduit ssh myvm` | A terminal inside the VM |
 | `conduit logs myvm` | Logs when something goes wrong |
 | `conduit list` | Your VMs |
+| `conduit` | The live dashboard (above) |
 
 > **VM runner:** the package brings its own QEMU 11.1 (in `/opt/conduit`), so
 > it works on systems whose QEMU is too old (for example Ubuntu 24.04). Your

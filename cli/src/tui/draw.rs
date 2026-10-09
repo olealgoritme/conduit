@@ -460,7 +460,7 @@ fn vm_card(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(panel("Details", CYAN), area);
         return;
     };
-    let title = format!("{}", v.name);
+    let title = v.name.clone();
     let block = panel(&title, CYAN);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1184,7 +1184,7 @@ fn splash(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::raw(""));
     let mut t = vec![Span::styled(&tag[..typed], Style::new().fg(FG))];
-    if typed < tag.len() || (app.tick / 4) % 2 == 0 {
+    if typed < tag.len() || (app.tick / 4).is_multiple_of(2) {
         t.push(Span::styled("▌", Style::new().fg(GREEN)));
     }
     lines.push(Line::from(t).centered());

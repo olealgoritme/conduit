@@ -437,6 +437,11 @@ impl App {
             let j = self.jobs.remove(i);
             let secs = j.started.elapsed().as_secs_f32();
             match (&j.log, st.success()) {
+                // `conduit view` returns at once when it hands the window
+                // to a VM that keeps running (a libvirt VM).
+                (Some(_), true) if j.label.starts_with("opening") && secs < 10.0 => {
+                    self.note(Level::Ok, format!("{}: window open", j.vm))
+                }
                 (Some(_), true) if j.label.starts_with("opening") => {
                     self.note(Level::Info, format!("{}: window closed", j.vm))
                 }
@@ -800,8 +805,10 @@ mod tests {
         let (poke, _) = mpsc::channel();
         let (lines_tx, lines_rx) = mpsc::channel();
         let (cap_tx, cap_rx) = mpsc::channel();
-        let mut snap = Snapshot::default();
-        snap.seq = 1;
+        let mut snap = Snapshot {
+            seq: 1,
+            ..Default::default()
+        };
         snap.vms = vec![
             data::Vm {
                 name: "win11".into(),

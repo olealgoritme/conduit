@@ -75,9 +75,10 @@ pub fn start() -> (Shared, std::sync::mpsc::Sender<()>) {
                 let seq = s.seq + 1;
                 *s = Snapshot { seq, ..snap };
             }
-            match rx.recv_timeout(Duration::from_millis(1000)) {
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                _ => {}
+            if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
+                rx.recv_timeout(Duration::from_millis(1000))
+            {
+                break;
             }
         }
     });
