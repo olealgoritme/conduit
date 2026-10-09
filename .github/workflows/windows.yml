@@ -18,6 +18,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # git am in the Mesa/NVK builds commits locally on the runner (never pushed)
+  GIT_AUTHOR_NAME: Conduit CI
+  GIT_AUTHOR_EMAIL: ci@conduit.invalid
+  GIT_COMMITTER_NAME: Conduit CI
+  GIT_COMMITTER_EMAIL: ci@conduit.invalid
   PYTHON_VERSION: '3.12'
   MESON_VERSION: '1.11.2'
   RUST_TOOLCHAIN: nightly-2026-07-14
