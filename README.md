@@ -2,6 +2,10 @@
 
 **Share your NVIDIA GPU with a virtual machine and see its desktop on yours.**
 
+<p align="center">
+  <img src="docs/assets/conduit-dashboard.png" alt="The conduit dashboard: three VMs (lab stopped, omarchy and win11 running), the RTX 5090's load, board power and core temperature in large digits, clock, power, temperature and fan bars, VRAM split by VM, a two-minute chart of GPU load, temperature, VRAM and host CPU, and an activity log above a row of action keys" width="900">
+</p>
+
 Conduit lets a Linux VM use your real NVIDIA graphics card (games, Vulkan,
 OpenGL, CUDA, video encoding) while your own desktop keeps using it too. The
 VM's screen appears as a normal window on your desktop. Frames go straight
@@ -27,17 +31,9 @@ from GPU memory to your screen: no copying, no video compression.
 | Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, driver 22.22.405.24 built by hand: [Windows guests](#windows-guests)) |
 | NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
-> Conduit is early software, tested mainly on an RTX 5090 with Ubuntu 24.04
-> and Hyprland. Expect rough edges. Windows guests are experimental (`--venus`),
-> and the guest driver is test-signed ([docs/WINDOWS.md](docs/WINDOWS.md),
-> [Roadmap](docs/ROADMAP.md)).
->
-> It has also run once on an RTX 4070 SUPER (Ada) with the closed NVIDIA 565.77
-> modules, a Linux guest (Omarchy, Hyprland) and NVIDIA's own user-mode driver:
-> `nvidia-smi`, Vulkan and the desktop on the GPU worked
-> ([what was measured, and what was not](docs/GPU-SUPPORT.md#measured-rtx-4070-super-ada-ad104)).
-> RTX 20 and 30 cards, CUDA and video encode in that setup, and Windows guests
-> on other GPUs have not been run.
+> Early software, tested mainly on an RTX 5090 with Ubuntu 24.04 and Hyprland;
+> also run on an RTX 4070 SUPER ([GPU support](docs/GPU-SUPPORT.md)). Windows
+> guests are experimental and test-signed ([docs/WINDOWS.md](docs/WINDOWS.md)).
 
 <p align="center"><b>Linux VM</b></p>
 
@@ -45,12 +41,7 @@ from GPU memory to your screen: no copying, no video compression.
   <img src="docs/assets/conduit-rtx4070s.png" alt="An RTX 4070 SUPER shared between an Ubuntu host and an Omarchy guest: the host's nvidia-smi lists conduit-backend, the guest shows Conduit's overlay at 1920x1080@240, its own nvidia-smi and vkcube" width="860">
 </p>
 
-<p align="center"><sub>One RTX 4070 SUPER, shared. Top: the Ubuntu 24.04 host (closed NVIDIA 565.77 modules);
-its <code>nvidia-smi</code> lists <code>conduit-backend</code> among the GPU processes. Bottom: an Omarchy
-(Arch, Hyprland) guest with Conduit's overlay (1920x1080@240, about 235 fps), the guest's own
-<code>nvidia-smi</code> (capped at 2 GiB by safe mode), <code>vkcube</code> on the GPU and the
-<code>conduit_gpu</code> module. <code>vkcube</code> prints the driver version as a packed integer, which is why it
-shows <code>-1923923968</code>; the Vulkan driver reports 565.77.0.0.</sub></p>
+<p align="center"><sub>One RTX 4070 SUPER shared between an Ubuntu host (top) and an Omarchy guest running <code>vkcube</code> at 240 Hz (bottom).</sub></p>
 
 <p align="center"><b>Windows 11 VM</b></p>
 
@@ -58,7 +49,7 @@ shows <code>-1923923968</code>; the Vulkan driver reports 565.77.0.0.</sub></p>
   <img src="docs/assets/conduit-win11.jpg" alt="A Windows 11 guest on Conduit on an RTX 5090: the host terminal shows nvidia-smi with conduit-backend and conduit-venus and virsh list with win11 running; below, the guest runs Unigine Heaven 4.0 in Direct3D 11 at 300 fps, and Task Manager shows the Conduit Helios GPU, driver 22.22.405.24" width="860">
 </p>
 
-<p align="center"><sub>Top: the Linux host (<code>nvidia-smi</code> with <code>conduit-backend</code> and <code>conduit-venus</code> on the RTX 5090; <code>virsh list</code> with <code>win11</code> running). Bottom: the Windows 11 guest in the Conduit viewer. Unigine Heaven 4.0 runs windowed in Direct3D 11 at 300 fps, translated to Vulkan and rendered by NVK on the host GPU; Task Manager shows the <code>Conduit Helios</code> GPU, driver 22.22.405.24.</sub></p>
+<p align="center"><sub>A Windows 11 guest on an RTX 5090: Unigine Heaven in Direct3D 11 at 300 fps, rendered by NVK on the host GPU.</sub></p>
 
 ### Windows guests
 
@@ -244,16 +235,8 @@ automatically.
 
 ### The dashboard
 
-Run `conduit` on its own for a live dashboard: every VM with its state, display,
-CPU, memory and GPU memory; the host's CPU and RAM; and the GPU's load, power,
-temperature, clocks and VRAM (read through NVML), with a two-minute history.
-One key (or a click) opens, starts, shuts down, reboots, resets, pauses or
-forces off the selected VM, picks its display mode, or shows its logs and
-`conduit doctor`. `?` lists the keys; quitting leaves the VMs running.
-
-<p align="center">
-  <img src="docs/assets/conduit-dashboard.png" alt="The conduit dashboard: three VMs (lab stopped, omarchy and win11 running), the RTX 5090's load, board power and core temperature in large digits, clock, power, temperature and fan bars, VRAM split by VM, a two-minute chart of GPU load, temperature, VRAM and host CPU, and an activity log above a row of action keys" width="860">
-</p>
+Run `conduit` on its own: every VM, the host and the GPU live, with one-key
+view, start, shutdown, reset and logs (`?` lists the keys).
 
 ### Everyday commands
 
