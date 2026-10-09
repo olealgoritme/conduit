@@ -23,6 +23,8 @@ python "${repo_root}/tools/sync-metadata.py" --check
 series="${repo_root}/icd/patches/series"
 if [[ -f "${series}" ]]; then
   while read -r patch; do
+    # A Windows checkout (core.autocrlf) gives the series CRLF line ends.
+    patch="${patch%$'\r'}"
     [[ -z "${patch}" || "${patch}" == \#* ]] && continue
     patch_file="${repo_root}/icd/patches/${patch}"
     if git -C "${mesa_src}" apply --reverse --check "${patch_file}" 2>/dev/null; then
