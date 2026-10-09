@@ -528,6 +528,47 @@ impl VirtioGpu {
         Ok(())
     }
 
+    /// `BltSupersede`: complete, without their copies, the admitted and undispatched requests
+    /// that a newer admitted, undispatched request into the same destination with the same
+    /// source extent follows (`helios_kmd_logic::blt_async::superseded`). Each goes through
+    /// [`Self::terminal_windowed_blt`] (not successful: the destination keeps what the newer
+    /// copy writes, its Present's fence retires, its source's ledger ticket retires); a copy-engine
+    /// route job left queued for it is pruned by the route. Returns how many went. Spinlock only
+    /// (`virtio_lock`), worker.
+    pub(crate) fn supersede_windowed_blts(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+    ) -> u32 {
+        let queued = |r: &WindowedBltPending| ba::Queued {
+            dst: r.destination_resource_id,
+            src_extent: r.source.extent(),
+            admitted: r.admitted,
+            dispatched: r.dispatched,
+        };
+        let mut n = 0u32;
+        loop {
+            let pending = &self.windowed_blt.pending;
+            let found = (0..pending.len()).find_map(|i| {
+                let older = queued(&pending[i]);
+                pending
+                    .iter()
+                    .skip(i + 1)
+                    .any(|r| ba::superseded(older, queued(r)))
+                    .then(|| (pending[i].token, pending[i].stream_boundary))
+            });
+            let Some((token, boundary)) = found else {
+                break;
+            };
+            self.terminal_windowed_blt(adapter, token, boundary, false);
+            n += 1;
+            // Bounded by the queue (each pass removes one request); a guard all the same.
+            if n as usize >= MAX_WINDOWED_BLT_PENDING {
+                break;
+            }
+        }
+        n
+    }
+
     /// A request left `pending` (terminal, cancelled or abandoned).
     pub(super) fn blt_async_gone(&self, request: &WindowedBltPending) {
         if request.async_blt {
