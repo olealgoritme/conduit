@@ -298,6 +298,7 @@ fn engine_list9(state: &CommandListState) -> Option<ID3D12GraphicsCommandList9> 
 /// `h_list` must be a handle `queue::create_command_list` returned `S_OK` for and
 /// which `pfnDestroyCommandList` has not been called on.
 unsafe extern "system" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
+    ddi_time!("close_command_list");
     super::nvk12::FRAME_STATS.note_close(h_list.drv_private() as usize);
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
@@ -380,6 +381,7 @@ unsafe extern "system" fn reset_command_list(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     arg: *const ddi12::D3D12DDIARG_RESETCOMMANDLIST_0040,
 ) {
+    ddi_time!("reset_command_list");
     super::nvk12::FRAME_STATS.note_reset(h_list.drv_private() as usize);
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
@@ -557,11 +559,12 @@ unsafe extern "system" fn draw_instanced(
     start_vertex_location: ddi12::UINT,
     start_instance_location: ddi12::UINT,
 ) {
+    ddi_time!("draw_instanced");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
     };
-    let started = std::time::Instant::now();
+    let started = super::nvk12::FRAME_STATS.draw_start();
     // SAFETY: `engine()` borrows the list this box owns; all four arguments are
     // by-value `UINT`s the engine records without dereferencing.
     unsafe {
@@ -572,7 +575,7 @@ unsafe extern "system" fn draw_instanced(
             start_instance_location,
         );
     }
-    super::nvk12::FRAME_STATS.note_draw(started.elapsed());
+    super::nvk12::FRAME_STATS.note_draw(started);
 }
 
 /// `pfnDrawIndexedInstanced` -> `ID3D12GraphicsCommandList::DrawIndexedInstanced`.
@@ -592,11 +595,12 @@ unsafe extern "system" fn draw_indexed_instanced(
     base_vertex_location: ddi12::INT,
     start_instance_location: ddi12::UINT,
 ) {
+    ddi_time!("draw_indexed_instanced");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
     };
-    let started = std::time::Instant::now();
+    let started = super::nvk12::FRAME_STATS.draw_start();
     // SAFETY: as `draw_instanced`; five by-value scalars.
     unsafe {
         state.engine().DrawIndexedInstanced(
@@ -607,7 +611,7 @@ unsafe extern "system" fn draw_indexed_instanced(
             start_instance_location,
         );
     }
-    super::nvk12::FRAME_STATS.note_draw(started.elapsed());
+    super::nvk12::FRAME_STATS.note_draw(started);
 }
 
 /// `pfnDispatch` -> `ID3D12GraphicsCommandList::Dispatch`.
@@ -620,6 +624,7 @@ unsafe extern "system" fn dispatch(
     thread_group_count_y: ddi12::UINT,
     thread_group_count_z: ddi12::UINT,
 ) {
+    ddi_time!("dispatch");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -916,6 +921,7 @@ unsafe extern "system" fn ia_set_topology(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     topology: ddi12::D3D12DDI_PRIMITIVE_TOPOLOGY,
 ) {
+    ddi_time!("ia_set_topology");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -969,6 +975,7 @@ unsafe extern "system" fn rs_set_viewports(
     count: ddi12::UINT,
     viewports: *const ddi12::D3D12DDI_VIEWPORT,
 ) {
+    ddi_time!("rs_set_viewports");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1013,6 +1020,7 @@ unsafe extern "system" fn rs_set_scissor_rects(
     count: ddi12::UINT,
     rects: *const ddi12::D3D12DDI_RECT,
 ) {
+    ddi_time!("rs_set_scissor_rects");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1053,6 +1061,7 @@ unsafe extern "system" fn om_set_blend_factor(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     factor: *const ddi12::FLOAT,
 ) {
+    ddi_time!("om_set_blend_factor");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1089,6 +1098,7 @@ unsafe extern "system" fn om_set_stencil_ref(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     stencil_ref: ddi12::UINT,
 ) {
+    ddi_time!("om_set_stencil_ref");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1132,6 +1142,7 @@ unsafe extern "system" fn set_pipeline_state(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_pso: ddi12::D3D12DDI_HPIPELINESTATE,
 ) {
+    ddi_time!("set_pipeline_state");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1233,6 +1244,7 @@ unsafe extern "system" fn om_set_depth_bounds(
     min: ddi12::FLOAT,
     max: ddi12::FLOAT,
 ) {
+    ddi_time!("om_set_depth_bounds");
     if min == DEPTH_BOUNDS_DEFAULT_MIN && max == DEPTH_BOUNDS_DEFAULT_MAX {
         note_refusal(&L3A_REFUSALS.depth_bounds_default_dropped);
         return;
@@ -1270,6 +1282,7 @@ unsafe extern "system" fn set_sample_positions(
     _num_pixels: ddi12::UINT,
     _sample_positions: *mut ddi12::D3D12DDI_SAMPLE_POSITION,
 ) {
+    ddi_time!("set_sample_positions");
     note_refusal(&L3A_REFUSALS.sample_positions_refused);
 }
 
@@ -1295,6 +1308,7 @@ unsafe extern "system" fn om_set_alpha_blend_factor(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _factor: ddi12::FLOAT,
 ) {
+    ddi_time!("om_set_alpha_blend_factor");
     note_refusal(&L3A_REFUSALS.alpha_blend_factor_retired);
 }
 
@@ -1308,6 +1322,7 @@ unsafe extern "system" fn om_set_front_and_back_stencil_ref(
     front: ddi12::UINT,
     back: ddi12::UINT,
 ) {
+    ddi_time!("om_set_front_and_back_stencil_ref");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1345,6 +1360,7 @@ unsafe extern "system" fn rs_set_depth_bias(
     depth_bias_clamp: ddi12::FLOAT,
     slope_scaled_depth_bias: ddi12::FLOAT,
 ) {
+    ddi_time!("rs_set_depth_bias");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1400,6 +1416,7 @@ unsafe extern "system" fn ia_set_index_buffer(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     desc: *const ddi12::D3D12DDI_INDEX_BUFFER_VIEW,
 ) {
+    ddi_time!("ia_set_index_buffer");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1435,6 +1452,7 @@ unsafe extern "system" fn ia_set_vertex_buffers(
     num_views: ddi12::UINT,
     views: *const ddi12::D3D12DDI_VERTEX_BUFFER_VIEW,
 ) {
+    ddi_time!("ia_set_vertex_buffers");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1484,6 +1502,7 @@ unsafe extern "system" fn so_set_targets(
     num_views: ddi12::UINT,
     views: *const ddi12::D3D12DDI_STREAM_OUTPUT_BUFFER_VIEW,
 ) {
+    ddi_time!("so_set_targets");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1547,6 +1566,7 @@ unsafe extern "system" fn om_set_render_targets(
     rts_single_handle: ddi12::BOOL,
     depth_stencil: *const ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
 ) {
+    ddi_time!("om_set_render_targets");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1597,6 +1617,7 @@ unsafe extern "system" fn ia_set_index_buffer_strip_cut_value(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     strip_cut: ddi12::D3D12DDI_INDEX_BUFFER_STRIP_CUT_VALUE,
 ) {
+    ddi_time!("ia_set_index_buffer_strip_cut_value");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1658,6 +1679,7 @@ unsafe extern "system" fn execute_bundle(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_bundle: ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
+    ddi_time!("execute_bundle");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { recording_list(h_list) }) else {
         return;
@@ -1796,6 +1818,7 @@ unsafe extern "system" fn execute_indirect(
     argument_buffer: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
     count_buffer: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
 ) {
+    ddi_time!("execute_indirect");
     // SAFETY: forwarded unchanged; the caller carries `recording_list`'s
     // precondition.
     let Some(state) = (unsafe { recording_list(h_list) }) else {

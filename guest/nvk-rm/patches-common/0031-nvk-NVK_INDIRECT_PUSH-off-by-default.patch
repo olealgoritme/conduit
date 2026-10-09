@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 02:46:58 +0200
+Subject: [PATCH] nvk: NVK_INDIRECT_PUSH off by default
+
+405.13 with NVK_INDIRECT_PUSH=1 (the 0028 default) took CS2 down with
+Xid 32 (invalid pushbuffer stream, intr0 0x00040000) on its channel;
+NVK_INDIRECT_PUSH=0 ran clean at 45.4 fps.  Off by default until the
+inline record segments are fixed; =1 keeps them for debugging.  With it
+off the MME macros are 405.12's set (2160 dwords for a DXVK device).
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index a840c292..8a2464d7 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -54,7 +54,8 @@
+ 
+ static uint32_t nvk_mdi_batch(void);
+ 
+-/* NVK_INDIRECT_PUSH (Turing+, default on; =0 is upstream's per-record MME
++/* NVK_INDIRECT_PUSH=1 (Turing+, default off since 405.13: Xid 32 in CS2;
++ * off is upstream's per-record MME
+  * DMA reads): see nvk_cmd_draw_indirect_pushed().
+  */
+ static bool
+@@ -63,7 +64,7 @@ nvk_indirect_push(void)
+    static uint32_t state;
+    uint32_t s = p_atomic_read(&state);
+    if (unlikely(s == 0)) {
+-      s = debug_get_bool_option("NVK_INDIRECT_PUSH", true) ? 2 : 1;
++      s = debug_get_bool_option("NVK_INDIRECT_PUSH", false) ? 2 : 1;
+       p_atomic_set(&state, s);
+    }
+    return s == 2;
+-- 
+2.43.0
+

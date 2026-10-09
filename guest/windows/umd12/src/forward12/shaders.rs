@@ -1218,6 +1218,7 @@ unsafe extern "system" fn calc_private_shader_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_SHADER_0026,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_shader_size");
     core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T
 }
 
@@ -1229,6 +1230,7 @@ unsafe extern "system" fn calc_private_mesh_shader_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_SHADER_0026,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_mesh_shader_size");
     core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T
 }
 
@@ -1240,6 +1242,7 @@ unsafe extern "system" fn calc_private_geometry_shader_with_stream_output(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_geometry_shader_with_stream_output");
     core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T
 }
 
@@ -1328,6 +1331,7 @@ unsafe extern "system" fn create_geometry_shader_with_stream_output(
     arg: *const ddi12::D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026,
     h_shader: ddi12::D3D12DDI_HSHADER,
 ) {
+    ddi_time!("create_geometry_shader_with_stream_output");
     // SAFETY: the runtime guarantees the private word; clear it before SO
     // validation or allocation can fail, as every shader-create slot requires.
     unsafe { clear_shader_handle(h_shader) };
@@ -1386,6 +1390,7 @@ unsafe extern "system" fn destroy_shader(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_shader: ddi12::D3D12DDI_HSHADER,
 ) {
+    ddi_time!("destroy_shader");
     // SAFETY: the caller guarantees a live slot; `take` empties it, so a second
     // destroy finds `None` rather than double-freeing.
     let Some(slot) = (unsafe { shader_slot(h_shader) }) else {

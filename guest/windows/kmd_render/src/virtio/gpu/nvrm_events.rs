@@ -53,8 +53,8 @@
 
 use super::*;
 use crate::virtio::nvrm::{
-    NVRM_EV_DROPS, NVRM_EV_ERRORS, NVRM_EV_LATCHED, NVRM_EV_LOST, NVRM_EV_OTHER, NVRM_EV_SIGNALS,
-    NVRM_FENCE_ERRORS, NVRM_FENCE_FIRED,
+    NVRM_EV_DROPS, NVRM_EV_ERRORS, NVRM_EV_FULL, NVRM_EV_LATCHED, NVRM_EV_LOST, NVRM_EV_MAX_PASS,
+    NVRM_EV_OTHER, NVRM_EV_SIGNALS, NVRM_FENCE_ERRORS, NVRM_FENCE_FIRED,
 };
 use helios_kmd_logic::nvrm_events::{
     kind_has_no_handle, kind_known, Added, KINDS_ALL, KINDS_SCANOUT_RELEASE, KIND_LOST, KIND_READY,
@@ -62,6 +62,9 @@ use helios_kmd_logic::nvrm_events::{
 };
 use helios_kmd_logic::scanout_release::{
     parse as parse_release, Parsed, Released, MSG_SCANOUT_RELEASED,
+};
+use helios_kmd_logic::host_flip_done::{
+    parse as parse_presented, Parsed as ParsedPresented, Presented, MSG_SCANOUT_PRESENTED,
 };
 use helios_kmd_logic::nvrm_fence::Noted;
 use helios_kmd_logic::rm_fence_present::Attach;
@@ -80,8 +83,11 @@ const NEVER_ACKED_TAKES_INPUT: u64 = helios_protocol::NVGPU_F_TAKES_INPUT;
 pub(super) const EVENT_QUEUE: u16 = 1;
 /// Small on purpose: `VirtQueue<_, N>::new` returns a by-value slot that grows
 /// with N and sits on the boot stack under `VirtioGpu::init` (see
-/// tools/kmd-frame-sizes.ps1). Events are rare and level-triggered on the host,
-/// so a handful of buffers is plenty.
+/// tools/kmd-frame-sizes.ps1). Under a game they are not rare: the NVK devices'
+/// non-stall event files and the RM fences fill all 16 before the DPC runs
+/// (`NvEvFull`), and the host keeps what finds no buffer and sends it on the
+/// re-post kick (its event backlog) and coalesces a non-stall report the driver
+/// has not read yet. Growing this needs the boot-stack budget measured first.
 const EVENT_QUEUE_SIZE: usize = 16;
 /// Bytes of one posted buffer: room for the 16-byte `EventReady`, the 48-byte
 /// `ScanoutReleased`, and, should a host send one anyway, a short `DisplayMode`
@@ -99,8 +105,18 @@ const MSG_EVENT_READY: u32 = 8;
 const _: () = {
     assert!(CONDUIT_REQUIRED_FEATURES & NEVER_ACKED_TAKES_INPUT == 0);
     assert!(CONDUIT_OPTIONAL_FEATURES & NEVER_ACKED_TAKES_INPUT == 0);
-    // The one optional bit is the release event, and the registry's kind for it is the ABI's.
-    assert!(CONDUIT_OPTIONAL_FEATURES == helios_protocol::NVGPU_F_SCANOUT_RELEASE);
+    // The optional bits are the release event and the presentation feedback, and the registry's
+    // kind for the release is the ABI's.
+    assert!(
+        CONDUIT_OPTIONAL_FEATURES
+            == helios_protocol::NVGPU_F_SCANOUT_RELEASE
+                | helios_protocol::NVGPU_F_SCANOUT_PRESENTED
+    );
+    assert!(
+        helios_protocol::NVGPU_F_SCANOUT_PRESENTED == helios_kmd_logic::host_flip_done::FEATURE
+    );
+    assert!(MSG_SCANOUT_PRESENTED == 33);
+    assert!(EVENT_BUF_BYTES >= helios_kmd_logic::host_flip_done::MSG_BYTES);
     assert!(KIND_SCANOUT_RELEASED == helios_protocol::HELIOS_NVRM_EVENT_SCANOUT_RELEASED);
     assert!(KINDS_SCANOUT_RELEASE == helios_protocol::HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE);
     assert!(MSG_SCANOUT_RELEASED == 28);
@@ -180,6 +196,8 @@ enum Taken {
     Ready(u32, i32),
     /// `ScanoutReleased` (message 28), whole.
     Released(Released),
+    /// `ScanoutPresented` (message 33), whole.
+    Presented(Presented),
     /// Some other message (or a short or bad one): dropped.
     Other,
     /// The queue misbehaved: stop draining this pass.
@@ -228,6 +246,14 @@ fn take_event(ring: &mut EventRing) -> Taken {
                 // A short one: counted `RelBad`, then dropped like any other message.
                 Parsed::Short | Parsed::NotRelease => {
                     crate::virtio::scanout_release::REL_BAD.fetch_add(1, Ordering::Relaxed);
+                    Taken::Other
+                }
+            },
+            (true, Some(MSG_SCANOUT_PRESENTED), _, _) => match parse_presented(bytes, len) {
+                ParsedPresented::Presented(p) => Taken::Presented(p),
+                // A short one: counted `FdhBad`, then dropped like any other message.
+                ParsedPresented::Short | ParsedPresented::NotPresented => {
+                    crate::ddi::host_flip_done::note_bad();
                     Taken::Other
                 }
             },
@@ -319,6 +345,12 @@ impl VirtioGpu {
         } else {
             0
         }
+    }
+
+    /// Whether the host's presentation feedback (`NVGPU_F_SCANOUT_PRESENTED`, `FlipDoneHost`) was
+    /// acked and the queue that carries it is up. Fixed for this transport.
+    pub fn scanout_presented_on(&self) -> bool {
+        self.scanout_presented
     }
 
     /// Whether the host's buffer-release event (`NVGPU_F_SCANOUT_RELEASE`) was acked and
@@ -564,11 +596,16 @@ impl VirtioGpu {
         }
         let mut reposted = false;
         let mut wake_worker = false;
+        let mut taken = 0u32;
         for _ in 0..EVENT_QUEUE_SIZE {
             let Some(ring) = self.nvrm_event_ring.as_mut() else {
                 return wake_worker;
             };
-            match take_event(ring) {
+            let event = take_event(ring);
+            if !matches!(event, Taken::Empty | Taken::Broken) {
+                taken += 1;
+            }
+            match event {
                 Taken::Empty => break,
                 Taken::Ready(handle, status) => {
                     reposted = true;
@@ -586,6 +623,17 @@ impl VirtioGpu {
                         NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                Taken::Presented(p) => {
+                    // No kick, as for a release: up to one per frame, and the host only ever
+                    // looks for a posted buffer when it has the next one (a report with none
+                    // posted is dropped there; the flip then retires on the timer fallback).
+                    if self.scanout_presented {
+                        crate::ddi::host_flip_done::on_event(&p);
+                    } else {
+                        crate::ddi::host_flip_done::note_unasked();
+                        NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 Taken::Other => {
                     reposted = true;
                     NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
@@ -594,6 +642,19 @@ impl VirtioGpu {
                     NVRM_EV_ERRORS.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
+            }
+        }
+        if taken != 0 {
+            NVRM_EV_MAX_PASS.fetch_max(taken, Ordering::Relaxed);
+        }
+        // Half the ring or more in one pass: the host was short of buffers, and
+        // one that holds reports it had none for (a backlog) sends them on this
+        // kick rather than at its next sweep. Kicked then even for a pass of
+        // releases and presentation reports, which on their own are not.
+        if taken as usize >= EVENT_QUEUE_SIZE / 2 {
+            reposted = true;
+            if taken as usize == EVENT_QUEUE_SIZE {
+                NVRM_EV_FULL.fetch_add(1, Ordering::Relaxed);
             }
         }
         // A host that serves queue-1 kicks as requests would answer every kick

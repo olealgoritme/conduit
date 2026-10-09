@@ -559,6 +559,7 @@ unsafe extern "system" fn calc_private_element_layout_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATEELEMENTLAYOUT_0010,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_element_layout_size");
     sub_state_private_size()
 }
 
@@ -584,6 +585,7 @@ unsafe extern "system" fn create_element_layout(
     arg: *const ddi12::D3D12DDIARG_CREATEELEMENTLAYOUT_0010,
     h_layout: ddi12::D3D12DDI_HELEMENTLAYOUT,
 ) {
+    ddi_time!("create_element_layout");
     // SAFETY: the caller guarantees the slot word; clearing touches only it.
     unsafe { clear_boxed(h_layout) };
     if arg.is_null() {
@@ -653,6 +655,7 @@ unsafe extern "system" fn destroy_element_layout(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_layout: ddi12::D3D12DDI_HELEMENTLAYOUT,
 ) {
+    ddi_time!("destroy_element_layout");
     // SAFETY: the caller guarantees a live slot; `take` empties it, so a second
     // destroy finds `None` rather than double-freeing.
     if let Some(slot) = unsafe { boxed_slot(h_layout) } {
@@ -669,6 +672,7 @@ unsafe extern "system" fn calc_private_blend_state_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _desc: *const ddi12::D3D12DDI_BLEND_DESC_0010,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_blend_state_size");
     sub_state_private_size()
 }
 
@@ -682,6 +686,7 @@ unsafe extern "system" fn create_blend_state(
     desc: *const ddi12::D3D12DDI_BLEND_DESC_0010,
     h_blend: ddi12::D3D12DDI_HBLENDSTATE,
 ) {
+    ddi_time!("create_blend_state");
     // SAFETY: the caller guarantees the slot word.
     unsafe { clear_boxed(h_blend) };
     if desc.is_null() {
@@ -749,6 +754,7 @@ unsafe extern "system" fn destroy_blend_state(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_blend: ddi12::D3D12DDI_HBLENDSTATE,
 ) {
+    ddi_time!("destroy_blend_state");
     // SAFETY: as `destroy_element_layout`.
     if let Some(slot) = unsafe { boxed_slot(h_blend) } {
         // SAFETY: as above.
@@ -764,6 +770,7 @@ unsafe extern "system" fn calc_private_depth_stencil_state_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _desc: *const ddi12::D3D12DDI_DEPTH_STENCIL_DESC_0095,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_depth_stencil_state_size");
     sub_state_private_size()
 }
 
@@ -805,6 +812,7 @@ unsafe extern "system" fn create_depth_stencil_state(
     desc: *const ddi12::D3D12DDI_DEPTH_STENCIL_DESC_0095,
     h_ds: ddi12::D3D12DDI_HDEPTHSTENCILSTATE,
 ) {
+    ddi_time!("create_depth_stencil_state");
     // SAFETY: the caller guarantees the slot word.
     unsafe { clear_boxed(h_ds) };
     if desc.is_null() {
@@ -875,6 +883,7 @@ unsafe extern "system" fn destroy_depth_stencil_state(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_ds: ddi12::D3D12DDI_HDEPTHSTENCILSTATE,
 ) {
+    ddi_time!("destroy_depth_stencil_state");
     // SAFETY: as `destroy_element_layout`.
     if let Some(slot) = unsafe { boxed_slot(h_ds) } {
         // SAFETY: as above.
@@ -890,6 +899,7 @@ unsafe extern "system" fn calc_private_rasterizer_state_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _desc: *const ddi12::D3D12DDI_RASTERIZER_DESC_0102,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_rasterizer_state_size");
     sub_state_private_size()
 }
 
@@ -915,6 +925,7 @@ unsafe extern "system" fn create_rasterizer_state(
     desc: *const ddi12::D3D12DDI_RASTERIZER_DESC_0102,
     h_rs: ddi12::D3D12DDI_HRASTERIZERSTATE,
 ) {
+    ddi_time!("create_rasterizer_state");
     // SAFETY: the caller guarantees the slot word.
     unsafe { clear_boxed(h_rs) };
     if desc.is_null() {
@@ -985,6 +996,7 @@ unsafe extern "system" fn destroy_rasterizer_state(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_rs: ddi12::D3D12DDI_HRASTERIZERSTATE,
 ) {
+    ddi_time!("destroy_rasterizer_state");
     // SAFETY: as `destroy_element_layout`.
     if let Some(slot) = unsafe { boxed_slot(h_rs) } {
         // SAFETY: as above.
@@ -1022,6 +1034,7 @@ unsafe extern "system" fn calc_private_root_signature_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_ROOT_SIGNATURE_0100,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_root_signature_size");
     core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T
 }
 
@@ -1233,6 +1246,7 @@ unsafe extern "system" fn create_root_signature(
     arg: *const ddi12::D3D12DDIARG_CREATE_ROOT_SIGNATURE_0100,
     h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_root_signature");
     // SAFETY: the caller guarantees the slot word.
     unsafe { clear_com(h_rs) };
     if arg.is_null() {
@@ -1344,6 +1358,7 @@ unsafe extern "system" fn destroy_root_signature(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
 ) {
+    ddi_time!("destroy_root_signature");
     // SAFETY: the caller guarantees a live slot; `release` is idempotent on an
     // already-cleared one, so a double destroy is a no-op rather than a double
     // free.
@@ -1562,6 +1577,7 @@ unsafe extern "system" fn calc_private_pipeline_state_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_STATE_0099,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_pipeline_state_size");
     core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T
 }
 
@@ -1591,6 +1607,7 @@ unsafe extern "system" fn create_pipeline_state(
     h_pso: ddi12::D3D12DDI_HPIPELINESTATE,
     _h_rt_pso: ddi12::D3D12DDI_HRTPIPELINESTATE,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_pipeline_state");
     // SAFETY: the caller guarantees the slot word.
     unsafe { clear_com(h_pso) };
     if arg.is_null() {
@@ -2210,6 +2227,7 @@ unsafe extern "system" fn destroy_pipeline_state(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_pso: ddi12::D3D12DDI_HPIPELINESTATE,
 ) {
+    ddi_time!("destroy_pipeline_state");
     // SAFETY: the caller guarantees a live slot; `release` is idempotent on an
     // already-cleared one.
     if let Some(slot) = unsafe { com_slot::<_, ID3D12PipelineState>(h_pso) } {
@@ -2333,6 +2351,7 @@ unsafe extern "system" fn calc_private_pipeline_library_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_pipeline_library_size");
     core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T
 }
 
@@ -2352,6 +2371,7 @@ unsafe extern "system" fn create_pipeline_library(
     arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010,
     h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_pipeline_library");
     // SAFETY: the caller guarantees the slot word; a failed create leaves it
     // null.
     unsafe { clear_boxed(h_library) };
@@ -2446,6 +2466,7 @@ unsafe extern "system" fn destroy_pipeline_library(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
 ) {
+    ddi_time!("destroy_pipeline_library");
     // SAFETY: the caller guarantees a live slot; `take` empties it, so a
     // second destroy finds `None` rather than double-freeing.
     let taken = unsafe { boxed_slot(h_library) }.and_then(|slot| unsafe { slot.take() });
@@ -2465,6 +2486,7 @@ unsafe extern "system" fn add_pipeline_state_to_library(
     h_pipeline_state: ddi12::D3D12DDI_HPIPELINESTATE,
     pipeline_index: ddi12::UINT,
 ) -> ddi12::HRESULT {
+    ddi_time!("add_pipeline_state_to_library");
     if !crate::knobs12::umd12_pipeline_library() {
         note_refusal(&L6_REFUSALS.pipeline_library_refused);
         return helios_umd_common::hr::E_NOTIMPL;
@@ -2510,6 +2532,7 @@ unsafe extern "system" fn calc_serialized_library_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_serialized_library_size");
     if !crate::knobs12::umd12_pipeline_library() {
         note_refusal(&L6_REFUSALS.pipeline_library_refused);
         return 0;
@@ -2538,6 +2561,7 @@ unsafe extern "system" fn serialize_library(
     h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
     p_blob: *mut c_void,
 ) -> ddi12::HRESULT {
+    ddi_time!("serialize_library");
     if !crate::knobs12::umd12_pipeline_library() {
         note_refusal(&L6_REFUSALS.pipeline_library_refused);
         return helios_umd_common::hr::E_NOTIMPL;

@@ -827,6 +827,7 @@ unsafe extern "system" fn copy_texture_region(
     src_resource: ddi12::D3D12DDIARG_PLACED_RESOURCE,
     src_box: *const ddi12::D3D12DDI_BOX,
 ) {
+    ddi_time!("copy_texture_region");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3C_REFUSALS.command_list_missing);
@@ -925,6 +926,7 @@ unsafe extern "system" fn resource_copy(
     h_dst: ddi12::D3D12DDI_HRESOURCE,
     h_src: ddi12::D3D12DDI_HRESOURCE,
 ) {
+    ddi_time!("resource_copy");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3C_REFUSALS.command_list_missing);
@@ -969,6 +971,7 @@ unsafe extern "system" fn copy_tiles(
     buffer_start_offset_in_bytes: ddi12::UINT64,
     flags: ddi12::D3D12DDI_TILE_COPY_FLAGS,
 ) {
+    ddi_time!("copy_tiles");
     // SAFETY: runtime keeps this driver's list private block live for the call.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3C_REFUSALS.command_list_missing);
@@ -1074,6 +1077,7 @@ unsafe extern "system" fn copy_buffer_region(
     src: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
     src_bytes: ddi12::UINT64,
 ) {
+    ddi_time!("copy_buffer_region");
     // SAFETY: forwarded unchanged; the caller's guarantee is `buffer_region`'s.
     unsafe {
         buffer_region(
@@ -1138,6 +1142,7 @@ unsafe extern "system" fn atomic_copy_buffer_region(
     _src: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
     _src_bytes: ddi12::UINT64,
 ) {
+    ddi_time!("atomic_copy_buffer_region");
     // ⚠ `bump` plus a budgeted line, never `note_refusal`: R911's rule is that an
     // arm which already logs must not also print the whole set summary, or one
     // event produces two records.
@@ -1173,6 +1178,7 @@ unsafe extern "system" fn resource_resolve_subresource(
     src_subresource: ddi12::UINT,
     format: ddi12::DXGI_FORMAT,
 ) {
+    ddi_time!("resource_resolve_subresource");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3C_REFUSALS.command_list_missing);
@@ -1263,6 +1269,7 @@ unsafe extern "system" fn resource_resolve_subresource_region(
     format: ddi12::DXGI_FORMAT,
     resolve_mode: ddi12::D3D12DDI_RESOLVE_MODE,
 ) {
+    ddi_time!("resource_resolve_subresource_region");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3C_REFUSALS.command_list_missing);
@@ -1472,6 +1479,7 @@ unsafe extern "system" fn resource_barrier(
     count: ddi12::UINT,
     barriers: *const ddi12::D3D12DDIARG_RESOURCE_BARRIER_0022,
 ) {
+    ddi_time!("resource_barrier");
     // Per-frame accounting (`nvk12::FrameStats`): time inside this DDI.
     let started = std::time::Instant::now();
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
@@ -1766,6 +1774,7 @@ unsafe extern "system" fn barrier(
     num_barriers: ddi12::UINT32,
     barriers: *const ddi12::D3D12DDIARG_BARRIER_0094,
 ) {
+    ddi_time!("barrier");
     // ⚠ Counted BEFORE anything can fail, because the reading that matters is
     // "did the runtime choose this arm", not "did this arm succeed".
     L3C_REFUSALS.enhanced_barrier_called.bump();
@@ -2132,6 +2141,7 @@ unsafe extern "system" fn begin_query(
     query_type: ddi12::D3D12DDI_QUERY_TYPE,
     index: ddi12::UINT,
 ) {
+    ddi_time!("begin_query");
     // SAFETY: forwarded unchanged; the caller's guarantee is `query_edge`'s.
     unsafe { query_edge(QueryEdge::Begin, h_list, h_heap, query_type, index) };
 }
@@ -2149,6 +2159,7 @@ unsafe extern "system" fn end_query(
     query_type: ddi12::D3D12DDI_QUERY_TYPE,
     index: ddi12::UINT,
 ) {
+    ddi_time!("end_query");
     // SAFETY: forwarded unchanged; the caller's guarantee is `query_edge`'s.
     unsafe { query_edge(QueryEdge::End, h_list, h_heap, query_type, index) };
 }
@@ -2167,6 +2178,7 @@ unsafe extern "system" fn resolve_query_data(
     h_destination_buffer: ddi12::D3D12DDI_HRESOURCE,
     destination_offset: ddi12::UINT64,
 ) {
+    ddi_time!("resolve_query_data");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3C_REFUSALS.command_list_missing);
@@ -2256,6 +2268,7 @@ unsafe extern "system" fn set_predication(
     aligned_buffer_offset: ddi12::UINT64,
     op: ddi12::D3D12DDI_PREDICATION_OP,
 ) {
+    ddi_time!("set_predication");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3C_REFUSALS.command_list_missing);

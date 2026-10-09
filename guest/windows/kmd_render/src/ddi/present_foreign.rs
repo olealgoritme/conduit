@@ -279,6 +279,12 @@ pub(crate) fn site(id: u32, status: NTSTATUS) -> NTSTATUS {
     status
 }
 
+/// The site the current call named so far (0 none). Atomics only.
+#[inline]
+pub(crate) fn call_site() -> u32 {
+    CALL_SITE.load(Ordering::Relaxed)
+}
+
 /// `STATUS_INVALID_PARAMETER` returned from `id`.
 #[inline]
 pub(crate) fn invalid(id: u32) -> NTSTATUS {

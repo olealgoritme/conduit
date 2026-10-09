@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 15:01:57 +0200
+Subject: [PATCH] wsi/win32: the composed present waits for the copy at
+ acquire, not at present
+
+Patch 58's present waited on the CPU for the D3D11 copy out of the image
+into the back buffer before returning, so the copy's latency sat in every
+vkQueuePresentKHR.
+
+The present now only ends an event query after the copy (before Present,
+so the query does not wait for the present's own work) and returns. The
+image is idle at once, as before, but carries copy_pending: acquire picks
+an idle image as for the other CPU-tracked paths and then waits for that
+image's copy, outside the swapchain lock and within the application's
+timeout (VK_TIMEOUT / VK_NOT_READY hand the image back; an infinite
+acquire gives up after 2 s and logs it). The D3D11 immediate context is
+used under a lock of its own, since present and acquire may run on
+different threads.
+---
+ src/vulkan/wsi/wsi_common_private.h         |  4 ++
+ src/vulkan/wsi/wsi_common_win32.cpp         | 32 +++++++++
+ src/vulkan/wsi/wsi_common_win32_compose.cpp | 77 ++++++++++++++++-----
+ 3 files changed, 94 insertions(+), 19 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 5691f813..a349f591 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -426,6 +426,7 @@ struct wsi_win32_compose_image {
+    void *texture;          /* ID3D11Texture2D, shared */
+    void *query;            /* ID3D11Query (event) */
+    uint32_t kmt_resource;  /* D3DKMT handle of our open of it */
++   bool copy_pending;      /* presented; the copy out of it may still run */
+ };
+ bool wsi_win32_compose_format_supported(VkFormat format);
+ VkResult wsi_win32_compose_open(struct wsi_win32_compose **inout, void *hwnd,
+@@ -441,6 +442,9 @@ void wsi_win32_compose_image_destroy(struct wsi_win32_compose *compose,
+ VkResult wsi_win32_compose_present(struct wsi_win32_compose *compose,
+                                    struct wsi_win32_compose_image *image,
+                                    uint32_t sync_interval);
++VkResult wsi_win32_compose_image_wait(struct wsi_win32_compose *compose,
++                                      struct wsi_win32_compose_image *image,
++                                      uint64_t timeout_ns);
+ 
+ bool
+ wsi_cpu_image_needs_buffer_blit(const struct wsi_device *wsi,
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 686eb3f7..7213f7de 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -1305,6 +1305,36 @@ wsi_win32_acquire_released_scanout_image(struct wsi_win32_swapchain *chain,
+    return info->timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
+ }
+ 
++/* Composed present: an idle image, then the wait for the D3D11 copy out
++ * of it (outside the lock; presents go on meanwhile).  The present itself
++ * no longer waits for that copy. */
++static VkResult
++wsi_win32_acquire_composed_image(struct wsi_win32_swapchain *chain,
++                                 const VkAcquireNextImageInfoKHR *info,
++                                 uint32_t *out_image_index)
++{
++   const uint64_t start = os_time_get_nano();
++   VkResult result = wsi_win32_acquire_idle_cpu_image(chain, info,
++                                                      out_image_index);
++   if (result != VK_SUCCESS)
++      return result;
++
++   struct wsi_win32_image *image = &chain->images[*out_image_index];
++   const uint64_t spent = os_time_get_nano() - start;
++   const uint64_t left = info->timeout == UINT64_MAX ? UINT64_MAX :
++                         info->timeout > spent ? info->timeout - spent : 0;
++   result = wsi_win32_compose_image_wait(chain->surface->compose,
++                                         &image->compose, left);
++   if (result == VK_TIMEOUT || result == VK_NOT_READY) {
++      /* Still being copied within the app's timeout: give it back */
++      mtx_lock(&chain->acquire_mutex);
++      image->state = WSI_IMAGE_IDLE;
++      u_cnd_monotonic_broadcast(&chain->acquire_cond);
++      mtx_unlock(&chain->acquire_mutex);
++   }
++   return result;
++}
++
+ static VkResult
+ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+                              const VkAcquireNextImageInfoKHR *info,
+@@ -1320,6 +1350,8 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+    /* acquire timeout has to be explicitly handled for sw wsi */
+    if (!chain->dxgi && chain->scanout.release)
+       return wsi_win32_acquire_released_scanout_image(chain, info, image_index);
++   if (chain->compose.enabled)
++      return wsi_win32_acquire_composed_image(chain, info, image_index);
+    if (!chain->dxgi)
+       return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
+ 
+diff --git a/src/vulkan/wsi/wsi_common_win32_compose.cpp b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+index 5f487db5..6ec2f2ed 100644
+--- a/src/vulkan/wsi/wsi_common_win32_compose.cpp
++++ b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+@@ -168,6 +168,9 @@ struct wsi_win32_compose {
+    WSI_D3DKMT_HANDLE kmt_device;
+    bool first_present_logged;
+    uint32_t present_failures;
++   /* The immediate context is not thread-safe: present and acquire (the
++    * copy's completion) may run on different threads */
++   SRWLOCK lock;
+ };
+ 
+ static struct {
+@@ -411,6 +414,7 @@ wsi_win32_compose_open(struct wsi_win32_compose **inout, void *window,
+       c = (struct wsi_win32_compose *)calloc(1, sizeof(*c));
+       if (!c)
+          return VK_ERROR_OUT_OF_HOST_MEMORY;
++      InitializeSRWLock(&c->lock);
+       *inout = c;
+    }
+    compose_release_device(c);
+@@ -674,9 +678,11 @@ wsi_win32_compose_present(struct wsi_win32_compose *c,
+                           struct wsi_win32_compose_image *img,
+                           uint32_t sync_interval)
+ {
++   AcquireSRWLockExclusive(&c->lock);
+    ID3D11Texture2D *back = NULL;
+    HRESULT hr = c->swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
+    if (FAILED(hr)) {
++      ReleaseSRWLockExclusive(&c->lock);
+       if (c->present_failures++ < 8)
+          LOGE("GetBuffer failed: 0x%08lx", (unsigned long)hr);
+       return hr == DXGI_ERROR_DEVICE_REMOVED ? VK_ERROR_DEVICE_LOST :
+@@ -684,8 +690,15 @@ wsi_win32_compose_present(struct wsi_win32_compose *c,
+    }
+    c->context->CopyResource(back, (ID3D11Texture2D *)img->texture);
+    back->Release();
++   /* The copy out of the image: acquire waits for it before the
++    * application may draw into the image again (compose_image_wait) */
++   if (img->query) {
++      c->context->End((ID3D11Query *)img->query);
++      img->copy_pending = true;
++   }
+ 
+    hr = c->swapchain->Present(sync_interval, 0);
++   ReleaseSRWLockExclusive(&c->lock);
+    if (FAILED(hr)) {
+       if (c->present_failures++ < 8)
+          LOGE("Present(%u) failed: 0x%08lx", sync_interval, (unsigned long)hr);
+@@ -694,28 +707,54 @@ wsi_win32_compose_present(struct wsi_win32_compose *c,
+       return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+ 
+-   /* The application may draw into the image again once acquire hands it
+-    * back: wait for the copy out of it first. */
+-   if (img->query) {
+-      ID3D11Query *q = (ID3D11Query *)img->query;
+-      c->context->End(q);
+-      c->context->Flush();
+-      const ULONGLONG deadline = GetTickCount64() + 2000;
+-      BOOL done = FALSE;
+-      while ((hr = c->context->GetData(q, &done, sizeof(done), 0)) == S_FALSE ||
+-             (hr == S_OK && !done)) {
+-         if (GetTickCount64() > deadline) {
+-            if (c->present_failures++ < 8)
+-               LOGE("the copy into the back buffer did not finish in 2 s");
+-            break;
+-         }
+-         SwitchToThread();
+-      }
+-   }
+-
+    if (!c->first_present_logged) {
+       c->first_present_logged = true;
+       LOGI("first composed present done (sync interval %u)", sync_interval);
+    }
+    return VK_SUCCESS;
+ }
++
++VkResult
++wsi_win32_compose_image_wait(struct wsi_win32_compose *c,
++                             struct wsi_win32_compose_image *img,
++                             uint64_t timeout_ns)
++{
++   if (!img->copy_pending || !img->query || !c)
++      return VK_SUCCESS;
++
++   ID3D11Query *q = (ID3D11Query *)img->query;
++   const ULONGLONG start = GetTickCount64();
++   /* An infinite acquire still gives up on a copy after 2 s: logged, and
++    * the image is handed back rather than hanging the application */
++   const uint64_t limit_ms = timeout_ns == UINT64_MAX ? 2000 : timeout_ns / 1000000;
++   bool flushed = false;
++   for (;;) {
++      BOOL done = FALSE;
++      AcquireSRWLockExclusive(&c->lock);
++      HRESULT hr = c->context->GetData(q, &done, sizeof(done),
++                                       flushed ? D3D11_ASYNC_GETDATA_DONOTFLUSH : 0);
++      ReleaseSRWLockExclusive(&c->lock);
++      flushed = true;
++      if (hr == S_OK && done) {
++         img->copy_pending = false;
++         return VK_SUCCESS;
++      }
++      if (FAILED(hr)) {
++         img->copy_pending = false;
++         if (c->present_failures++ < 8)
++            LOGE("GetData on the copy's query failed: 0x%08lx", (unsigned long)hr);
++         return hr == DXGI_ERROR_DEVICE_REMOVED ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
++      }
++      const ULONGLONG spent = GetTickCount64() - start;
++      if (spent >= limit_ms) {
++         if (timeout_ns == UINT64_MAX) {
++            img->copy_pending = false;
++            if (c->present_failures++ < 8)
++               LOGE("the copy out of a swapchain image did not finish in 2 s");
++            return VK_SUCCESS;
++         }
++         return timeout_ns == 0 ? VK_NOT_READY : VK_TIMEOUT;
++      }
++      SwitchToThread();
++   }
++}
+-- 
+2.43.0
+

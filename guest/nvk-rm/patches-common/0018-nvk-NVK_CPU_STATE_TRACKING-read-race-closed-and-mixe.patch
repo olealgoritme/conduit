@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 21:41:53 +0200
+Subject: [PATCH 2/2] nvk: NVK_CPU_STATE_TRACKING, read race closed and mixed
+ paths kept safe
+
+The knob was read through DEBUG_GET_ONCE_BOOL_OPTION, which stores the
+value and an "initialized" flag as two relaxed stores; a thread racing
+the first read could in principle see the flag without the value and
+take the upstream path once with the tracking on.  The upstream paths
+did not keep the tracking consistent: a vertex or index buffer bound
+through the macro left the CPU's record of the old range, and a root
+table loaded in full left the shadow stale, so a later tracked bind of
+that range or dword could have been skipped wrongly.
+
+- The knob is one atomic word (0 unread, 1 off, 2 on).
+- NVK_MME_BIND_VB/IB clear the stream's (index buffer's) known bit.
+- A full root table load with the tracking off still updates the
+  shadow.
+
+No change on the default path's methods: with the knob unset every
+tracked path is taken exactly as before.
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c | 36 ++++++++++++++++++++++++++++---
+ 1 file changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index e250e158..87332b51 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -44,7 +44,22 @@
+  * buffers bound through NVK_MME_BIND_VB/IB (0006).  An A/B lever for
+  * rendering bugs; on by default.
+  */
+-DEBUG_GET_ONCE_BOOL_OPTION(nvk_cpu_state_tracking, "NVK_CPU_STATE_TRACKING", true)
++static bool
++debug_get_option_nvk_cpu_state_tracking(void)
++{
++   /* 0 until read, then 1 (off) or 2 (on): the value and "already read" are
++    * one word, so no thread can see the second without the first.  Either
++    * answer is safe at any point anyway: the upstream paths below leave the
++    * CPU-side tracking consistent (they clear or update it).
++    */
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      s = debug_get_bool_option("NVK_CPU_STATE_TRACKING", true) ? 2 : 1;
++      p_atomic_set(&state, s);
++   }
++   return s == 2;
++}
+ #include "nv_push_clcd97.h"
+ #include "clc7c0.h"
+ #include "clc997.h"
+@@ -807,9 +822,18 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
+    const uint32_t first_tracked_dw =
+       nvk_root_descriptor_offset(dynamic_buffers_0) / 4;
+ 
+-   if (end_dw <= first_tracked_dw ||
+-       !debug_get_option_nvk_cpu_state_tracking()) {
++   if (end_dw <= first_tracked_dw) {
++      nvk_cmd_load_gfx_root_desc(cmd, desc, start_dw, end_dw);
++      return;
++   }
++
++   if (!debug_get_option_nvk_cpu_state_tracking()) {
++      /* Everything is loaded; the shadow still learns what the GPU has */
+       nvk_cmd_load_gfx_root_desc(cmd, desc, start_dw, end_dw);
++      for (uint32_t i = MAX2(start_dw, first_tracked_dw); i < end_dw; i++) {
++         gfx->root_shadow[i] = root_dw[i];
++         BITSET_SET(gfx->root_shadow_valid, i);
++      }
+       return;
+    }
+ 
+@@ -4671,6 +4695,9 @@ nvk_CmdBindIndexBuffer3KHR(VkCommandBuffer commandBuffer,
+       return;
+    }
+ 
++   /* The macro binds what the CPU-side tracking does not see */
++   cmd->state.gfx.ib_known = false;
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_IB));
+    P_INLINE_DATA(p, addr_range.address >> 32);
+@@ -4817,6 +4844,9 @@ nvk_cmd_bind_vertex_buffer(struct nvk_cmd_buffer *cmd, uint32_t vb_idx,
+       return;
+    }
+ 
++   /* The macro binds what the CPU-side tracking does not see */
++   cmd->state.gfx.vb_known &= ~BITFIELD_BIT(vb_idx);
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_VB));
+    P_INLINE_DATA(p, vb_idx);

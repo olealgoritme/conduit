@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 23:34:13 +0200
+Subject: [PATCH] nvk: NVK_MDI_BATCH reads indirect multi-draw records in
+ batches
+
+On Turing+ NVK_MME_DRAW_INDIRECT and NVK_MME_DRAW_INDEXED_INDIRECT loop
+over drawCount and, for every draw, issue an MME_DMA_READ_FIFOED of that
+one record and wait for it before drawing.  Every draw of an indirect
+multi-draw therefore costs a memory round trip on the front end while the
+rest of the GPU waits for the next draw.  D3D11 games issue long runs of
+DrawIndexedInstancedIndirect on consecutive records (GPU-driven culling
+writes them), and DXVK merges each run into one vkCmdDrawIndexedIndirect
+with drawCount = the run's length.
+
+In CS2 on an RTX 5090 the heaviest render pass is a 2560x1440 2x MSAA
+depth-only pass with about 15 draw calls that takes 620-925 us, at full
+GPU utilisation but 155-183 W of 575: the shape of a front end waiting,
+not of shading or depth bandwidth.  Patch 0023's profile says how many of
+those calls are indirect and how many draws they make.
+
+NVK_MDI_BATCH=<n> (default 0: off, the upstream macros) makes the CPU
+split a vkCmdDraw[Indexed]Indirect with drawCount > 1 into calls of at
+most n records (and at most 1024 dwords, the 4 KiB MME data FIFO), each
+to a new macro, NVK_MME_DRAW[_INDEXED]_INDIRECT_BATCH, which reads all of
+its records with one MME_DMA_READ_FIFOED and draws them from the FIFO,
+dropping the padding of a stride larger than a record.  The read ends at
+the last record's last dword, never past the end of the buffer.  Each
+call passes the index of its first draw, so gl_DrawID is unchanged.  The
+draw body is the upstream one (nvk_mme_build_draw[_indexed]).  n is
+clamped to 204 (1024 dwords of 5-dword records); 64 is the suggested
+value.  Indirect count draws are unchanged (the count is only known on
+the GPU).
+
+Checked in the MME simulator against the per-record loop, with a
+stand-in draw body that emits the five record dwords and the draw index:
+strides of 4/5, 5/6, 8, 16 and 3 dwords more than a record, draw counts
+1-1000 and batch sizes 2-204 give identical method streams, no read past
+the last record and no read over 1024 dwords; 1000 draws at n=64 need 16
+DMA reads instead of 1000.  Not yet measured on hardware: expected to cut
+the per-draw cost of indirect draws from a memory latency to the MME's
+own work, i.e. most of the 0.6-0.9 ms of that pass if its calls are
+indirect multi-draws.
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c | 134 +++++++++++++++++++++++++++++-
+ src/nouveau/vulkan/nvk_mme.c      |   2 +
+ src/nouveau/vulkan/nvk_mme.h      |   4 +
+ 3 files changed, 138 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index acaae264..97abdf2c 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -5564,6 +5564,130 @@ nvk_mme_draw_indirect(struct mme_builder *b)
+    }
+ }
+ 
++/* NVK_MDI_BATCH=<n> (Turing+; 0, the default, is off): an indirect
++ * multi-draw reads its draw records n at a time.
++ *
++ * NVK_MME_DRAW_[INDEXED_]INDIRECT read each record with its own
++ * MME_DMA_READ_FIFOED and wait for it before the draw, so every draw of a
++ * vkCmdDraw[Indexed]Indirect with drawCount > 1 costs a memory round trip
++ * on the front end with the rest of the GPU waiting.  D3D11 games put
++ * hundreds of indirect draws in a row (DXVK merges a run of
++ * DrawIndexedInstancedIndirect calls on consecutive records into one
++ * vkCmdDrawIndexedIndirect).  The batch macros read up to n records with one
++ * MME_DMA_READ_FIFOED and draw them from the data FIFO, dropping the
++ * padding of a stride larger than a record; the CPU splits drawCount into
++ * calls of at most n records and at most NVK_MDI_FIFO_DW dwords (the data
++ * FIFO is 4 KiB, SET_MME_DATA_FIFO_CONFIG).  A read ends at the last
++ * record's last dword, never past it.  gl_DrawID continues across the
++ * calls.
++ */
++#define NVK_MDI_FIFO_DW 1024u
++#define NVK_MDI_BATCH_MAX 204u
++
++static uint32_t
++nvk_mdi_batch(void)
++{
++   /* 0 until read, then the clamped value + 1 */
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      int64_t n = debug_get_num_option("NVK_MDI_BATCH", 0);
++      n = CLAMP(n, 0, NVK_MDI_BATCH_MAX);
++      s = (uint32_t)n + 1;
++      p_atomic_set(&state, s);
++   }
++   return s - 1;
++}
++
++static void
++nvk_mme_build_draw_indirect_batch(struct mme_builder *b, bool indexed)
++{
++   /* Only called on Turing+ (nvk_cmd_draw_indirect_batched()) */
++   if (b->devinfo->cls_eng3d < TURING_A)
++      return;
++
++   struct mme_value64 draw_addr = mme_load_addr64(b);
++   struct mme_value read_dw = mme_load(b);
++   struct mme_value pad_dw = mme_load(b);
++   struct mme_value draw = mme_load(b);
++   struct mme_value draw_end = mme_load(b);
++
++   mme_tu104_read_fifoed(b, draw_addr, read_dw);
++   mme_free_reg64(b, draw_addr);
++   mme_free_reg(b, read_dw);
++
++   struct mme_value first = mme_mov(b, draw);
++   mme_while(b, ult, draw, draw_end) {
++      /* The padding between the previous record and this one */
++      mme_if(b, ine, draw, first) {
++         struct mme_value i = mme_mov(b, mme_zero());
++         mme_while(b, ult, i, pad_dw) {
++            mme_free_reg(b, mme_load(b));
++            mme_add_to(b, i, i, mme_imm(1));
++         }
++         mme_free_reg(b, i);
++      }
++
++      if (indexed)
++         nvk_mme_build_draw_indexed(b, draw);
++      else
++         nvk_mme_build_draw(b, draw);
++
++      mme_add_to(b, draw, draw, mme_imm(1));
++   }
++}
++
++void
++nvk_mme_draw_indirect_batch(struct mme_builder *b)
++{
++   nvk_mme_build_draw_indirect_batch(b, false);
++}
++
++void
++nvk_mme_draw_indexed_indirect_batch(struct mme_builder *b)
++{
++   nvk_mme_build_draw_indirect_batch(b, true);
++}
++
++/* Returns false when the batch path does not apply (the caller takes the
++ * per-record path).
++ */
++static bool
++nvk_cmd_draw_indirect_batched(struct nvk_cmd_buffer *cmd, bool indexed,
++                              uint64_t draw_addr, uint32_t draw_count,
++                              uint64_t stride)
++{
++   const uint32_t batch = nvk_mdi_batch();
++   if (batch < 2 || draw_count < 2 || nvk_cmd_buffer_3d_cls(cmd) < TURING_A)
++      return false;
++
++   const uint32_t rec_dw = indexed ? 5 : 4;
++   assert(stride % 4 == 0 && stride / 4 >= rec_dw);
++   if (stride / 4 > NVK_MDI_FIFO_DW - rec_dw)
++      return false;
++   const uint32_t stride_dw = stride / 4;
++   const uint32_t max_n = MIN2(batch, (NVK_MDI_FIFO_DW - rec_dw) / stride_dw + 1);
++
++   for (uint32_t first = 0; first < draw_count;) {
++      const uint32_t n = MIN2(max_n, draw_count - first);
++      const uint64_t addr = draw_addr + (uint64_t)first * stride;
++
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
++      P_1INC(p, NV9097, CALL_MME_MACRO(indexed ?
++                                       NVK_MME_DRAW_INDEXED_INDIRECT_BATCH :
++                                       NVK_MME_DRAW_INDIRECT_BATCH));
++      P_INLINE_DATA(p, addr >> 32);
++      P_INLINE_DATA(p, addr);
++      P_INLINE_DATA(p, (n - 1) * stride_dw + rec_dw);
++      P_INLINE_DATA(p, stride_dw - rec_dw);
++      P_INLINE_DATA(p, first);
++      P_INLINE_DATA(p, first + n);
++
++      first += n;
++   }
++   return true;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+                         const VkDrawIndirect2InfoKHR* pInfo)
+@@ -5596,7 +5720,10 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+-   if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
++   if (nvk_cmd_draw_indirect_batched(cmd, false, pInfo->addressRange.address,
++                                     pInfo->drawCount, stride)) {
++      /* NVK_MDI_BATCH */
++   } else if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_INDIRECT));
+       uint64_t draw_addr = pInfo->addressRange.address;
+@@ -5706,7 +5833,10 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+-   if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
++   if (nvk_cmd_draw_indirect_batched(cmd, true, pInfo->addressRange.address,
++                                     pInfo->drawCount, stride)) {
++      /* NVK_MDI_BATCH */
++   } else if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_INDEXED_INDIRECT));
+       uint64_t draw_addr = pInfo->addressRange.address;
+diff --git a/src/nouveau/vulkan/nvk_mme.c b/src/nouveau/vulkan/nvk_mme.c
+index 5070bec6..bc4ba398 100644
+--- a/src/nouveau/vulkan/nvk_mme.c
++++ b/src/nouveau/vulkan/nvk_mme.c
+@@ -40,6 +40,8 @@ static const nvk_mme_builder_func mme_builders[NVK_MME_COUNT] = {
+    [NVK_MME_DRAW_MESH]                     = nvk_mme_draw_mesh,
+    [NVK_MME_DRAW_MESH_INDIRECT]            = nvk_mme_draw_mesh_indirect,
+    [NVK_MME_DRAW_MESH_INDIRECT_COUNT]      = nvk_mme_draw_mesh_indirect_count,
++   [NVK_MME_DRAW_INDIRECT_BATCH]           = nvk_mme_draw_indirect_batch,
++   [NVK_MME_DRAW_INDEXED_INDIRECT_BATCH]   = nvk_mme_draw_indexed_indirect_batch,
+ };
+ 
+ static const struct nvk_mme_test_case *mme_tests[NVK_MME_COUNT] = {
+diff --git a/src/nouveau/vulkan/nvk_mme.h b/src/nouveau/vulkan/nvk_mme.h
+index c419fe2b..e2bdea05 100644
+--- a/src/nouveau/vulkan/nvk_mme.h
++++ b/src/nouveau/vulkan/nvk_mme.h
+@@ -44,6 +44,8 @@ enum nvk_mme {
+    NVK_MME_DRAW_MESH,
+    NVK_MME_DRAW_MESH_INDIRECT,
+    NVK_MME_DRAW_MESH_INDIRECT_COUNT,
++   NVK_MME_DRAW_INDIRECT_BATCH,
++   NVK_MME_DRAW_INDEXED_INDIRECT_BATCH,
+ 
+    NVK_MME_COUNT,
+ };
+@@ -259,6 +261,8 @@ void nvk_mme_set_statistics_counters(struct mme_builder *b);
+ void nvk_mme_draw_mesh(struct mme_builder *b);
+ void nvk_mme_draw_mesh_indirect(struct mme_builder *b);
+ void nvk_mme_draw_mesh_indirect_count(struct mme_builder *b);
++void nvk_mme_draw_indirect_batch(struct mme_builder *b);
++void nvk_mme_draw_indexed_indirect_batch(struct mme_builder *b);
+ 
+ uint32_t nvk_mme_tess_params(mesa_shader_stage stage,
+                              enum nak_ts_domain domain,
+-- 
+2.43.0
+

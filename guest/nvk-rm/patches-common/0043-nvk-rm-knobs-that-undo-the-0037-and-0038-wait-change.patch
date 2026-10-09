@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 07:17:46 +0200
+Subject: [PATCH] nvk/rm: knobs that undo the 0037 and 0038 wait changes one at
+ a time
+
+CS2 fullscreen (legacy blt, no independent flip) freezes after its first
+present on 405.23 and worked on 405.16; windowed is fine.  Between them
+the RM path's waits changed (0037, 0038, 0040).  So that one VM session
+can bisect without rebuilds:
+
+- NVK_RM_GPFIFO_ENTRIES=<n> (a power of two, 64 to 4096; default 4096):
+  the ring entries the channel uses; 1024 is the ring before 0037.  The
+  memory layout stays the 4096-entry one.
+- NVK_RM_RING_YIELD_MS=<ms> (default 4): how long a full-ring wait
+  yields before it sleeps; 0 is the wait before 0037.
+- NVK_RM_HIRES_SLEEP=0: nvkmd_rm_sleep_us() is os_time_sleep() again
+  (the CPU-wait sleep fallback, the full-ring wait, the KMD flip-queue
+  retry), as before 0038.
+
+NVK_RM_WAIT_POLL_MS=10 already undoes 0040's NVK half, NVK_INDIRECT_PUSH=1
+the default 0037 changed, NVK_RM_EVENT_GEN=0 patch 0042.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c | 46 ++++++++++++++++++----
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 17 +++++++-
+ 2 files changed, 54 insertions(+), 9 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 481e37ab..387666e1 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -48,6 +48,34 @@
+  * middle of it (wait_ring_space_n).
+  */
+ #define NVKMD_RM_GPFIFO_ENTRIES     4096
++
++/* NVK_RM_GPFIFO_ENTRIES=<n> (a power of two, 64 to 4096; default 4096):
++ * how many of the ring's entries the channel uses, for bisecting (1024 is
++ * the ring before 0037).  The memory layout stays the 4096-entry one.
++ */
++static uint32_t
++nvkmd_rm_gpfifo_entries(void)
++{
++   const int64_t n = debug_get_num_option("NVK_RM_GPFIFO_ENTRIES",
++                                          NVKMD_RM_GPFIFO_ENTRIES);
++   if (n < 64 || n > NVKMD_RM_GPFIFO_ENTRIES ||
++       !util_is_power_of_two_nonzero64(n))
++      return NVKMD_RM_GPFIFO_ENTRIES;
++   return (uint32_t)n;
++}
++
++/* NVK_RM_RING_YIELD_MS=<ms> (default 4; 0 is the wait before 0037): how
++ * long a full-ring wait polls with yields before it sleeps.
++ */
++static uint64_t
++nvkmd_rm_ring_yield_ns(void)
++{
++   static int64_t ms = -1;
++   if (unlikely(p_atomic_read(&ms) < 0))
++      p_atomic_set(&ms, MAX2(0, debug_get_num_option("NVK_RM_RING_YIELD_MS",
++                                                      4)));
++   return (uint64_t)p_atomic_read(&ms) * 1000000ull;
++}
+ #define NVKMD_RM_PUSH_SLOT_DW       32
+ #define NVKMD_RM_PUSH_SLOT_B        (NVKMD_RM_PUSH_SLOT_DW * 4)
+ 
+@@ -102,6 +130,8 @@ struct nvkmd_rm_exec_ctx {
+ 
+    uint32_t put;
+    uint32_t kicked_put;
++   /* Ring entries in use (NVK_RM_GPFIFO_ENTRIES) */
++   uint32_t entries;
+ 
+    /* How far the GPU has read the ring.  GP_GET in USERD is not written
+     * back while the channel runs (it stays 0 on GB202 under GSP), so every
+@@ -193,11 +223,10 @@ ring_free(struct nvkmd_rm_exec_ctx *ctx)
+    while (ctx->track_tail != ctx->track_head &&
+           ctx->track[ctx->track_tail].seqno <= completed) {
+       ctx->get = ctx->track[ctx->track_tail].put;
+-      ctx->track_tail = (ctx->track_tail + 1) % NVKMD_RM_GPFIFO_ENTRIES;
++      ctx->track_tail = (ctx->track_tail + 1) % ctx->entries;
+    }
+ 
+-   return (ctx->get + NVKMD_RM_GPFIFO_ENTRIES - ctx->put - 1) %
+-          NVKMD_RM_GPFIFO_ENTRIES;
++   return (ctx->get + ctx->entries - ctx->put - 1) % ctx->entries;
+ }
+ 
+ /* Room for n entries plus the tracking release a kick appends */
+@@ -235,7 +264,7 @@ wait_ring_space_n(struct nvkmd_rm_exec_ctx *ctx,
+        * 0.15 ms (cs2like, 405.17).
+        */
+       const uint64_t t = os_time_get_nano();
+-      if (t - start < 4000000ull) {
++      if (t - start < nvkmd_rm_ring_yield_ns()) {
+          thrd_yield();
+          continue;
+       }
+@@ -280,7 +309,7 @@ write_gpfifo_entry(struct nvkmd_rm_exec_ctx *ctx,
+       (no_prefetch ? NVRM_DEF(RM_GPFIFO, _GP_ENTRY1, _SYNC, _WAIT) : 0);
+ 
+    ctx->gpfifo[ctx->put] = (uint64_t)entry1 << 32 | entry0;
+-   ctx->put = (ctx->put + 1) % NVKMD_RM_GPFIFO_ENTRIES;
++   ctx->put = (ctx->put + 1) % ctx->entries;
+ }
+ 
+ /* The release that tells us how far the ring has been read; uses the
+@@ -308,7 +337,7 @@ emit_track_release(struct nvkmd_rm_exec_ctx *ctx)
+ 
+    ctx->track[ctx->track_head].seqno = value;
+    ctx->track[ctx->track_head].put = ctx->put;
+-   ctx->track_head = (ctx->track_head + 1) % NVKMD_RM_GPFIFO_ENTRIES;
++   ctx->track_head = (ctx->track_head + 1) % ctx->entries;
+    assert(ctx->track_head != ctx->track_tail);
+ }
+ 
+@@ -551,7 +580,7 @@ nvkmd_rm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+       while (end + 1 < exec_count && execs[end].incomplete)
+          end++;
+       const uint32_t n = end - i + 1;
+-      if (n + 2 > NVKMD_RM_GPFIFO_ENTRIES) {
++      if (n + 2 > ctx->entries) {
+          return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
+                           "%u chained GPFIFO entries do not fit the ring", n);
+       }
+@@ -846,6 +875,7 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    ctx->base.ops = &nvkmd_rm_exec_ctx_ops;
+    ctx->base.dev = &dev->base;
+    ctx->defer_slot = -1;
++   ctx->entries = nvkmd_rm_gpfifo_entries();
+ 
+    /* GPFIFO ring, push slots and the context semaphore: GPU-read system
+     * memory (our own pages).
+@@ -928,7 +958,7 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    NV_CHANNEL_ALLOC_PARAMS chan_params = {
+       .hObjectError = h_ctl,
+       .gpFifoOffset = ctx->gpfifo_va,
+-      .gpFifoEntries = NVKMD_RM_GPFIFO_ENTRIES,
++      .gpFifoEntries = ctx->entries,
+       .hContextShare = ctx->h_ctxshare,
+       .hUserdMemory = { h_ctl },
+       .userdOffset = { NVKMD_RM_CTL_USERD_OFFSET },
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index a738c0c0..2f47d0ad 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -600,11 +600,26 @@ nvkmd_rm_wait_stat(enum nvkmd_rm_wait_site site, uint64_t ns, bool timed_out)
+    }
+ }
+ 
++/* NVK_RM_HIRES_SLEEP=0: os_time_sleep() as before 0038 (Sleep(1), a timer
++ * tick, on Windows), for bisecting.
++ */
++static bool
++nvkmd_rm_hires_sleep(void)
++{
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      s = debug_get_bool_option("NVK_RM_HIRES_SLEEP", true) ? 2 : 1;
++      p_atomic_set(&state, s);
++   }
++   return s == 2;
++}
++
+ void
+ nvkmd_rm_sleep_us(uint64_t us)
+ {
+ #ifdef _WIN32
+-   if (us < 20000) {
++   if (us < 20000 && nvkmd_rm_hires_sleep()) {
+       /* One high-resolution waitable timer per thread (Windows 10 1803+);
+        * without it, yield instead of sleeping a whole tick.
+        */

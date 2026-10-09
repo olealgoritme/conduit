@@ -111,6 +111,13 @@ pub enum MsgType {
     /// device feature [`NVGPU_F_SCANOUT_RELEASE`]. See docs/SCANOUT.md
     /// "Buffer release".
     ScanoutReleased = 28,
+    /// **Host → guest**, on the event queue: a display client reports that a
+    /// flip the guest sent reached the screen (the compositor latched it).
+    /// Payload [`ScanoutPresented`]. Sent only to a guest that acked the
+    /// device feature [`NVGPU_F_SCANOUT_PRESENTED`]. See docs/SCANOUT.md
+    /// "Presentation feedback". 29 and 32 are left alone (32 is proposed for
+    /// the host vblank event).
+    ScanoutPresented = 33,
     /// Guest → host, control queue: one virtio-gpu control command for the
     /// Venus renderer (docs/VENUS.md), laid out as `crate::venus` describes.
     /// The reply is a header and the virtio-gpu response. Served only when
@@ -148,6 +155,7 @@ impl MsgType {
             26 => Self::ClipboardToHost,
             27 => Self::ClipboardRequest,
             28 => Self::ScanoutReleased,
+            33 => Self::ScanoutPresented,
             30 => Self::GpuCmd,
             31 => Self::RmResourceImport,
             _ => return None,
@@ -464,6 +472,16 @@ pub const NVGPU_CFG_GUEST_BLOB: u32 = 1 << 16;
 /// proposed host vblank feature.
 pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 
+/// Device config `features` bit, only together with [`NVGPU_CFG_VENUS_CURSOR`]:
+/// the backend serves a third virtqueue, the cursor queue (index 2, like
+/// virtio-gpu's cursorq), with the same messages as the control queue. A guest
+/// that sends its cursor commands there never waits behind Venus `GpuCmd`
+/// traffic: the backend serves the cursor queue first, between any two control
+/// requests. A guest also needs the VMM to expose the queue (`num_vqs=3`).
+/// Bit 19 is the presentation-feedback virtio feature's (config bit 19 stays
+/// unused), bit 17 the host vblank proposal's.
+pub const NVGPU_CFG_CURSOR_QUEUE: u32 = 1 << 20;
+
 /// A **virtio device feature** the guest acks (like [`NVGPU_CFG_TAKES_INPUT`],
 /// not a config `features` bit; config bit 15 stays unused): the guest wants
 /// `ScanoutReleased` events. The backend offers it in its device features
@@ -571,6 +589,120 @@ pub fn encode_scanout_released(r: &ScanoutReleased, out: &mut [u8]) -> Option<us
     }
     out[16..48].copy_from_slice(&r.to_bytes());
     Some(SCANOUT_RELEASED_MESSAGE_LEN)
+}
+
+/// A **virtio device feature** the guest acks (like [`NVGPU_F_SCANOUT_RELEASE`]; config
+/// `features` bit 19 stays unused): the guest wants `ScanoutPresented` events. The
+/// backend offers it whenever it has a display; a guest that does not ack it never
+/// gets one. Bit 17 is kept for the proposed host vblank feature.
+pub const NVGPU_F_SCANOUT_PRESENTED: u32 = 1 << 19;
+
+/// [`ScanoutPresented::flags`]: the frame was shown through Venus
+/// (`SET_SCANOUT_BLOB` / `RESOURCE_FLUSH`); `host_handle` is its resource id and
+/// `owner_handle` and `seq` are 0. Clear: a `ScanoutFlip` buffer.
+pub const SCANOUT_PRESENTED_RESOURCE: u32 = 1 << 0;
+/// [`ScanoutPresented::flags`]: the presentation was synchronised to the
+/// display's vblank (`wp_presentation_feedback` kind `VSYNC`).
+pub const SCANOUT_PRESENTED_VSYNC: u32 = 1 << 1;
+/// [`ScanoutPresented::flags`]: the guest's buffer itself was scanned out, no
+/// copy (`wp_presentation_feedback` kind `ZERO_COPY`).
+pub const SCANOUT_PRESENTED_ZERO_COPY: u32 = 1 << 2;
+/// [`ScanoutPresented::flags`]: `present_ns` is known (the display client's
+/// presentation clock is `CLOCK_MONOTONIC`, the backend's).
+pub const SCANOUT_PRESENTED_TIMED: u32 = 1 << 3;
+
+/// Event-queue payload for `MsgType::ScanoutPresented`, following a
+/// `MsgHeader` (handle 0, status 0). 48 bytes.
+///
+/// A display client reported that the frame of one guest flip reached the
+/// screen. At most one event per guest flip (the first client to report it;
+/// a flip no client reports, because none was connected or the compositor
+/// replaced it first, gets none). A guest uses it to complete the flip when
+/// the host really showed it, instead of on a timer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanoutPresented {
+    /// 0; one scanout for now.
+    pub scanout: u32,
+    /// `SCANOUT_PRESENTED_*`.
+    pub flags: u32,
+    /// `ScanoutFlip::owner_handle` of the flip; 0 for a Venus resource.
+    pub owner_handle: u32,
+    /// `ScanoutFlip::host_handle`, or the Venus resource id
+    /// ([`SCANOUT_PRESENTED_RESOURCE`]).
+    pub host_handle: u32,
+    /// `ScanoutFlip::seq` of the flip presented; 0 for Venus.
+    pub seq: u64,
+    /// Host `CLOCK_MONOTONIC` nanoseconds at which the frame reached the screen
+    /// (with [`SCANOUT_PRESENTED_TIMED`]; 0 otherwise).
+    pub present_ns: u64,
+    /// Host `CLOCK_MONOTONIC` nanoseconds at which the backend sent this event:
+    /// `sent_ns - present_ns` is the host-side delay, free of any clock offset.
+    pub sent_ns: u64,
+    /// 0.
+    pub reserved: u64,
+}
+
+impl ScanoutPresented {
+    pub fn to_bytes(&self) -> [u8; 48] {
+        let mut o = [0u8; 48];
+        for (i, v) in [
+            self.scanout,
+            self.flags,
+            self.owner_handle,
+            self.host_handle,
+        ]
+        .iter()
+        .enumerate()
+        {
+            o[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        o[16..24].copy_from_slice(&self.seq.to_le_bytes());
+        o[24..32].copy_from_slice(&self.present_ns.to_le_bytes());
+        o[32..40].copy_from_slice(&self.sent_ns.to_le_bytes());
+        o[40..48].copy_from_slice(&self.reserved.to_le_bytes());
+        o
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < 48 {
+            return None;
+        }
+        let w = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let q = |at: usize| (w(at) as u64) | ((w(at + 4) as u64) << 32);
+        Some(Self {
+            scanout: w(0),
+            flags: w(4),
+            owner_handle: w(8),
+            host_handle: w(12),
+            seq: q(16),
+            present_ns: q(24),
+            sent_ns: q(32),
+            reserved: q(40),
+        })
+    }
+}
+
+/// Size of a whole `ScanoutPresented` event-queue message.
+pub const SCANOUT_PRESENTED_MESSAGE_LEN: usize =
+    size_of::<MsgHeader>() + size_of::<ScanoutPresented>();
+
+const _: () = assert!(size_of::<ScanoutPresented>() == 48);
+
+/// Encode one `ScanoutPresented` message (header and payload) into `out`.
+pub fn encode_scanout_presented(p: &ScanoutPresented, out: &mut [u8]) -> Option<usize> {
+    if out.len() < SCANOUT_PRESENTED_MESSAGE_LEN {
+        return None;
+    }
+    let hdr = MsgHeader::ok(MsgType::ScanoutPresented, 0);
+    for (i, v) in [hdr.msg_type, hdr.handle, hdr.status as u32, hdr.padding]
+        .iter()
+        .enumerate()
+    {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    out[16..64].copy_from_slice(&p.to_bytes());
+    Some(SCANOUT_PRESENTED_MESSAGE_LEN)
 }
 
 /// Request payload for `MsgType::RmResourceImport`, following a `MsgHeader`
@@ -1251,9 +1383,15 @@ mod tests {
         assert_eq!(MsgType::GpuCmd as u32, 30);
         assert_eq!(MsgType::RmResourceImport as u32, 31);
         assert_eq!(MsgType::from_u32(32), None);
+        assert_eq!(MsgType::ScanoutPresented as u32, 33);
+        assert_eq!(MsgType::from_u32(33), Some(MsgType::ScanoutPresented));
+        // A device feature like SCANOUT_RELEASE, above every config bit in use
+        // (17 is kept for the host vblank proposal).
+        assert_eq!(NVGPU_F_SCANOUT_PRESENTED, 1 << 19);
         assert_eq!(NVGPU_CFG_RM_RESOURCE_IMPORT, 1 << 14);
         // Bit 17 is the proposed host vblank feature's.
         assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
+        assert_eq!(NVGPU_CFG_CURSOR_QUEUE, 1 << 20);
         let r = RmResourceImport {
             owner_handle: 9,
             resource_id: 50,
@@ -1304,6 +1442,42 @@ mod tests {
         );
         assert_eq!(&buf[40..48], &[0u8; 8]);
         assert_eq!(ScanoutReleased::from_bytes(&buf[16..48]), Some(r));
+    }
+
+    /// Header, then {scanout, flags, owner_handle, host_handle, seq,
+    /// present_ns, sent_ns, 0}: 64 bytes, what the Windows KMD's
+    /// `kmd_logic::flip_done::parse` reads.
+    #[test]
+    fn scanout_presented_encodes_after_a_header() {
+        let p = ScanoutPresented {
+            scanout: 0,
+            flags: SCANOUT_PRESENTED_VSYNC | SCANOUT_PRESENTED_TIMED,
+            owner_handle: 7,
+            host_handle: 0x1234,
+            seq: 0x1_0000_0002,
+            present_ns: 0x0102_0304_0506_0708,
+            sent_ns: 0x0102_0304_0506_0999,
+            reserved: 0,
+        };
+        let mut buf = [0xffu8; 80];
+        assert_eq!(encode_scanout_presented(&p, &mut buf[..63]), None);
+        assert_eq!(encode_scanout_presented(&p, &mut buf), Some(64));
+        assert_eq!(SCANOUT_PRESENTED_MESSAGE_LEN, 64);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 33);
+        assert_eq!(&buf[4..16], &[0u8; 12]);
+        assert_eq!(u32::from_le_bytes(buf[20..24].try_into().unwrap()), 0b1010);
+        assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(buf[28..32].try_into().unwrap()), 0x1234);
+        assert_eq!(
+            u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            0x1_0000_0002
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(&buf[56..64], &[0u8; 8]);
+        assert_eq!(ScanoutPresented::from_bytes(&buf[16..64]), Some(p));
     }
 
     /// The event the guest's event-queue handler decodes: header, then

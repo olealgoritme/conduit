@@ -1346,6 +1346,14 @@ pub mod knobs {
     /// does nothing. Read at every StartDevice; mirrored as `GbKnob`.
     /// `docs/zero-copy-present.md` section 24.12.
     pub const GUEST_BLOB: KnobName = KnobName::new(b"GuestBlob");
+    /// `CopyQueue` (default 0 = the previous behaviour: one queue, family 0). 1: the KMD's Venus
+    /// device also gets a queue on a transfer-only family (chosen from the queue family
+    /// properties, bound to ring 2), and the windowed Present copies a transfer queue can run (a
+    /// plain image-to-buffer copy into a standard buffer or its guest blob, foreign sources
+    /// included) go there instead of waiting for graphics-engine timeslices. 2: as 1, and the
+    /// family-0 queue (format conversions, image destinations) at high global priority. Read at
+    /// every StartDevice (device creation); mirrored as `CqKnob`. `docs/zero-copy-present.md` 24.13.
+    pub const COPY_QUEUE: KnobName = KnobName::new(b"CopyQueue");
     /// `RmCopyEngine` (default 0 = nothing happens: no allocation, no RM message). 1: reserved for
     /// the windowed Present copy on the KMD's own copy-engine channel (M3c; nothing yet). 2: the
     /// channel's hardware self-test, once per transport generation, from the HPD worker. 3: the
@@ -1368,14 +1376,6 @@ pub mod knobs {
     /// sees the producer's boundary ready. Read at StartDevice with the route on; mirrored as
     /// `CeRtDirKnob`. `docs/rm-copy-engine-present.md` section 15.13.
     pub const CE_RT_DIRECT: KnobName = KnobName::new(b"CeRtDirect");
-    /// `CopyQueue` (default 0 = the previous behaviour: one queue, family 0). 1: the KMD's Venus
-    /// device also gets a queue on a transfer-only family (chosen from the queue family
-    /// properties, bound to ring 2), and the windowed Present copies a transfer queue can run (a
-    /// plain image-to-buffer copy into a standard buffer or its guest blob, foreign sources
-    /// included) go there instead of waiting for graphics-engine timeslices. 2: as 1, and the
-    /// family-0 queue (format conversions, image destinations) at high global priority. Read at
-    /// every StartDevice (device creation); mirrored as `CqKnob`. `docs/zero-copy-present.md` 24.13.
-    pub const COPY_QUEUE: KnobName = KnobName::new(b"CopyQueue");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
@@ -1401,6 +1401,28 @@ pub mod knobs {
     /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
     /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
+    /// `IndepFlip` (default 0 again since 405.9, docs/independent-flip.md 13.10; 1 opts in):
+    /// independent flip, stage S-1 (`docs/independent-flip.md` section
+    /// 11, `helios_kmd_logic::independent_flip::Mode`). 0 off; 1 advertise `SupportDirectFlip`,
+    /// the aperture `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip` (OR'd into what
+    /// `DirectFlipCaps` / `FlipCapsX` ask for) and count every flip's verdict (`Idf*`); 2 as 1,
+    /// and a DMA-buffer flip of an unregistered Venus allocation completes as a kept picture
+    /// instead of failing (`PBFlip` 0xE6). Read with the other adapter knobs; mirrored as `IdfKnob`.
+    pub const INDEP_FLIP: KnobName = KnobName::new(b"IndepFlip");
+    /// `D3d12Node` (default 0): 1 reports a second 3D node (ordinal 1) for the D3D12 UMD's
+    /// contexts (`Umd12ContextNode`), completed independently of node 0 (DWM, D3D11,
+    /// presents, paging): `virtio::gpu::MAX_WDDM_NODES`. Read with the other adapter knobs at
+    /// AddAdapter; the node count dxgkrnl got then is kept until the adapter restarts.
+    pub const D3D12_NODE: KnobName = KnobName::new(b"D3d12Node");
+    /// `HwQueuePktCap` (default 0 = the OS default): `DXGK_VIDSCHCAPS::HwQueuePacketCap`, the
+    /// most DMA packets dxgkrnl queues to a node at once (4 bits, 1..15). The field exists from
+    /// the WDDM 2.3 DDI on; this driver declares 2.1 (`WddmSurface`), so dxgkrnl may ignore it
+    /// there. Read with the other adapter knobs at AddAdapter; mirrored as `HwQPktCapV`.
+    pub const HW_QUEUE_PACKET_CAP: KnobName = KnobName::new(b"HwQueuePktCap");
+    /// `IdfRedirSkip` (default 0; `helios_kmd_logic::independent_flip::KNOB_REDIR_SKIP`): with
+    /// `IndepFlip` on, a Present carrying `RedirectedFlip` on the Blt arm completes with no copy.
+    /// An experiment (docs/independent-flip.md 13.5). Read at StartDevice; counted `IdfRedSkip`.
+    pub const IDF_REDIR_SKIP: KnobName = KnobName::new(b"IdfRedirSkip");
     /// `GdiAccel` (default 0 = no GDI hardware acceleration: `PresentationCaps` 0, the word since
     /// 22.22.180.0). 1: report `helios_kmd_logic::gdi_accel::ACCEL_CAPS`
     /// (`SupportKernelModeCommandBuffer` with the `NoSameBitmap*` declines) and translate
@@ -1427,21 +1449,8 @@ pub mod knobs {
     /// the other `AdapterKnobs` at AddAdapter and StartDevice; mirrored as `VmCapsXEff` and
     /// `VmCapsRep` at every start.
     pub const VIDMM_CAPS_EXTRA: KnobName = KnobName::new(b"VidMmCapsX");
-    /// GPU-only GDI surfaces from RM video memory, the redirected Blt into them on the copy
-    /// engine, CPU readers and writers through a bounce buffer (default 0 = off; 1 = on).
-    /// `helios_kmd_logic::rm_vidmem`, `docs/vram-redirection.md` 5.3-5.6. Read at StartDevice.
-    pub const REDIR_VRAM: KnobName = KnobName::new(b"RedirVram");
-    /// `RedirVram` per-path switches for bisecting (default 0; bits in
-    /// `helios_kmd_logic::rm_vidmem::off`). Read at StartDevice.
-    pub const RV_OFF: KnobName = KnobName::new(b"RvOff");
-    /// `IndepFlip` (default 0): independent flip, stage S-1 (`docs/independent-flip.md` section
-    /// 11, `helios_kmd_logic::independent_flip::Mode`). 0 off; 1 advertise `SupportDirectFlip`,
-    /// the aperture `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip` (OR'd into what
-    /// `DirectFlipCaps` / `FlipCapsX` ask for) and count every flip's verdict (`Idf*`); 2 as 1,
-    /// and a DMA-buffer flip of an unregistered Venus allocation completes as a kept picture
-    /// instead of failing (`PBFlip` 0xE6). Read with the other adapter knobs; mirrored as `IdfKnob`.
-    pub const INDEP_FLIP: KnobName = KnobName::new(b"IndepFlip");
-    /// `HwCursor` (default 1): the hardware cursor (`docs/independent-flip.md` section 12,
+    /// `HwCursor` (absent: 1 when `IndepFlip` is on, else 0 as since 404, see
+    /// `hw_cursor::knob_default_for`; an explicit value wins): the hardware cursor (`docs/independent-flip.md` section 12,
     /// `helios_kmd_logic::hw_cursor`). 1 reports a 256x256 monochrome / color / masked-color
     /// pointer in `DXGK_DRIVERCAPS` when the host serves it (`NVGPU_CFG_VENUS_CURSOR`), and
     /// `SetPointerShape` / `SetPointerPosition` drive the host pointer's image; dxgkrnl then
@@ -1450,6 +1459,31 @@ pub mod knobs {
     /// (every shape then fails over to the software cursor on a host without it). Read with the
     /// other adapter knobs (a change applies at the next StartDevice); mirrored as `CurKnob`.
     pub const HW_CURSOR: KnobName = KnobName::new(b"HwCursor");
+    /// GPU-only GDI surfaces from RM video memory, the redirected Blt into them on the copy
+    /// engine, CPU readers and writers through a bounce buffer (default 0 = off; 1 = on).
+    /// `helios_kmd_logic::rm_vidmem`, `docs/vram-redirection.md` 5.3-5.6. Read at StartDevice.
+    pub const REDIR_VRAM: KnobName = KnobName::new(b"RedirVram");
+    /// `RedirVram` per-path switches for bisecting (default 0; bits in
+    /// `helios_kmd_logic::rm_vidmem::off`). Read at StartDevice.
+    pub const RV_OFF: KnobName = KnobName::new(b"RvOff");
+    /// `HwCursorQ` (default 1): send the hardware cursor's commands on the cursor queue
+    /// (virtqueue 2, `virtio/gpu/cursor_ring.rs`) when the host announces it
+    /// (`NVGPU_CFG_CURSOR_QUEUE`) and the VMM exposes it (`num_vqs=3`), so they never wait behind
+    /// Venus traffic. 0 keeps them on the control queue (the fallback, and the old path). Read at
+    /// StartDevice; mirrored as `CurQ`.
+    pub const HW_CURSOR_Q: KnobName = KnobName::new(b"HwCursorQ");
+    /// `HwCursorCaps` (default 0 = monochrome | color | masked color, 7): the
+    /// `DXGK_DRIVERCAPS.PointerCaps` word reported with the pointer, masked to those three bits.
+    /// An A/B lever for "dxgkrnl never calls SetPointerShape": 6 is what the virtio-gpu and QXL
+    /// display-only drivers report. Read at each caps query (reboot to apply); `CurCapRep`
+    /// bits 16..23 say what was reported.
+    pub const HW_CURSOR_CAPS: KnobName = KnobName::new(b"HwCursorCaps");
+    /// `HwCursorMax` (default 0 = 256): `MaxPointerWidth` / `MaxPointerHeight` reported, clamped
+    /// to 32..=256 (64 is the virtio-gpu / QXL display-only drivers' value). A/B lever; reboot.
+    pub const HW_CURSOR_MAX: KnobName = KnobName::new(b"HwCursorMax");
+    /// `SmoothRotCaps` (default 0): report `DXGK_DRIVERCAPS.SupportSmoothRotation` = 1, as those
+    /// drivers do. A/B lever for the hardware cursor; reboot. `CurCapRep` bit 9.
+    pub const SMOOTH_ROT_CAPS: KnobName = KnobName::new(b"SmoothRotCaps");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
     /// advertisement; a Helios flip retires only when its DMA fence completes,
@@ -1459,6 +1493,14 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// `FlipDoneHost` (default 0; `ddi::host_flip_done`, `docs/independent-flip.md` section
+    /// 13). Nonzero acks the host's presentation feedback (`NVGPU_F_SCANOUT_PRESENTED`) and
+    /// retires flips from it: 1 holds a programmed address back from the vsync until the host
+    /// reports it on screen (at most 3 periods), delivers that report's CRTC_VSYNC at once and
+    /// puts the timer between the host's vblanks; 2 only holds (the timer delivers, on its own
+    /// phase). Also makes 2 the default `FlipQueueN`. Read with the other adapter knobs
+    /// (AddAdapter and StartDevice); mirrored as `FdhKnob`, the ack as `FdhAck`.
+    pub const FLIP_DONE_HOST: KnobName = KnobName::new(b"FlipDoneHost");
     /// `FlipAnnounce` (default 2 since the 332.1 hardware rows; 0 = off, the old behaviour): publish a flip's address toward
     /// dxgkrnl AT `SetVidPnSourceAddress` (atomics only, DIRQL) so the very next CRTC_VSYNC tick
     /// retires it (one tick per flip instead of two), while the HPD worker does the real

@@ -1,0 +1,493 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 06:00:56 +0200
+Subject: [PATCH] nvk: NVK_PASS_PROFILE=5 dumps one render pass's draws
+
+vk_gpubench cs2like with CS2's pass shape (indirect calls, rebinding,
+compute-written records, pipelines, descriptor buffers, push constants,
+an alpha-test FS, CS2's vertex layout) runs at 0.28 us per draw on NVK
+(0.19 native), while CS2's depth prepass costs 20-36 us per draw.  To
+replay CS2's exact draw state, NVK_PASS_PROFILE=5 dumps one instance of a
+render pass:
+
+- NVK_PASS_DUMP_DELAY_S (default 20) seconds after device creation, the
+  next pass whose signature contains NVK_PASS_DUMP (default
+  "x2 layers 1, 0 rt z D24_UNORM_S8_UINT", the depth prepass) is dumped;
+- per draw call: the call (draw, draw-indexed or multi-draw with its
+  first draw's parameters; indirect address, drawCount, stride), the
+  vertex and fragment shader code hashes (as in NVK_SHADER_STATS),
+  topology, primitive restart, cull mode, depth test/write/compare,
+  depth bounds, stencil test and depth bias enables, the index buffer
+  (address, size, type), each vertex binding (stride, input rate,
+  divisor, bound address and size) and attribute (binding, format,
+  offset);
+- the indirect records themselves: each call's range is copied by the
+  copy engine into a mapped buffer when the pass executes, and the
+  harvest thread writes them (indexCount, instanceCount, firstIndex,
+  vertexOffset, firstInstance) once a report after the pass has landed.
+
+Written to NVK_PASS_DUMP_FILE, else
+%ProgramData%\Helios\nvk-prepass-dump-<pid>.txt on Windows.  Level 5
+includes levels 1-4.  Off by default; no MME change.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h   |   2 +
+ src/nouveau/vulkan/nvk_cmd_draw.c     |  25 +++
+ src/nouveau/vulkan/nvk_pass_profile.c | 290 ++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_pass_profile.h |   7 +
+ 4 files changed, 324 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 1e83da30..9869fa60 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -363,6 +363,8 @@ struct nvk_cmd_buffer {
+    bool pass_profile_in_pass;
+    bool pass_profile_on;
+    bool pass_profile_buffers;
++   bool pass_profile_dump;
++   uint32_t pass_profile_dump_call;
+    /* NVK_PASS_PROFILE=4: where the open pass's pushes start */
+    uint32_t pass_profile_hist_sig;
+    uint32_t pass_profile_hist_npushes;
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 1bbf6290..6e20d2ad 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -5491,6 +5491,11 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+    nvk_cmd_profile_count_draws(cmd, 1, false);
++   if (unlikely(cmd->pass_profile_dump)) {
++      const uint32_t d[5] = { vertexCount, instanceCount, firstVertex,
++                              firstInstance, 0 };
++      nvk_pass_profile_dump_draw(cmd, 0, 0, 1, 0, d);
++   }
+ 
+    if (nvk_cmd_can_draw_direct(cmd)) {
+       nvk_cmd_draw_direct(cmd, 0, vertexCount, instanceCount,
+@@ -5691,6 +5696,11 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+    nvk_cmd_profile_count_draws(cmd, 1, false);
++   if (unlikely(cmd->pass_profile_dump)) {
++      const uint32_t d[5] = { indexCount, instanceCount, firstIndex,
++                              (uint32_t)vertexOffset, firstInstance };
++      nvk_pass_profile_dump_draw(cmd, 1, 0, 1, 0, d);
++   }
+ 
+    if (nvk_cmd_can_draw_direct(cmd)) {
+       nvk_cmd_draw_indexed_direct(cmd, 0, indexCount, instanceCount,
+@@ -5726,6 +5736,15 @@ nvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+    nvk_cmd_profile_count_draws(cmd, drawCount, false);
++   if (unlikely(cmd->pass_profile_dump)) {
++      /* The first of drawCount draws */
++      const uint32_t d[5] = { pIndexInfo->indexCount, instanceCount,
++                              pIndexInfo->firstIndex,
++                              (uint32_t)(pVertexOffset != NULL ? *pVertexOffset :
++                                         pIndexInfo->vertexOffset),
++                              firstInstance };
++      nvk_pass_profile_dump_draw(cmd, 1, 0, drawCount, 0, d);
++   }
+ 
+    if (nvk_cmd_can_draw_direct(cmd)) {
+       for (uint32_t draw_index = 0; draw_index < drawCount; draw_index++) {
+@@ -6068,6 +6087,9 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+    if (unlikely(cmd->pass_profile_buffers))
+       nvk_pass_profile_note_buffer(cmd, NVK_PASS_PROFILE_BUF_INDIRECT,
+                                    pInfo->addressRange.address);
++   if (unlikely(cmd->pass_profile_dump))
++      nvk_pass_profile_dump_draw(cmd, 2, pInfo->addressRange.address,
++                                 pInfo->drawCount, stride, NULL);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    if (nvk_cmd_draw_indirect_pushed(cmd, false, pInfo->addressRange.address,
+@@ -6191,6 +6213,9 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+    if (unlikely(cmd->pass_profile_buffers))
+       nvk_pass_profile_note_buffer(cmd, NVK_PASS_PROFILE_BUF_INDIRECT,
+                                    pInfo->addressRange.address);
++   if (unlikely(cmd->pass_profile_dump))
++      nvk_pass_profile_dump_draw(cmd, 3, pInfo->addressRange.address,
++                                 pInfo->drawCount, stride, NULL);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    if (nvk_cmd_draw_indirect_pushed(cmd, true, pInfo->addressRange.address,
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
+index 28c77059..218eb143 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.c
++++ b/src/nouveau/vulkan/nvk_pass_profile.c
+@@ -95,6 +95,8 @@
+ #define PROF_LOG_NS     2000000000ull
+ #define PROF_HARVEST_MS 200u
+ #define PROF_PAYLOAD    0x4e564b50u /* "NVKP" */
++#define PROF_DUMP_MEM_B (4u << 20)
++#define PROF_DUMP_PAYLOAD 0x504d5544u /* "DUMP" */
+ 
+ /* One report as the 3D or compute class or the copy engine writes it with a
+  * four-word structure: payload (or a counter's low 32 bits) and timestamp.
+@@ -274,6 +276,22 @@ struct nvk_pass_profile {
+    uint64_t windows;
+    FILE *file;
+ 
++   /* NVK_PASS_PROFILE=5: one render pass dumped (prof_dump_*) */
++   uint32_t dump_state;           /* 0 off/waiting, 1 armed, 2 recording,
++                                   * 3 recorded, 4 written */
++   uint64_t dump_arm_ns;
++   char dump_match[128];
++   struct nvkmd_mem *dump_mem;    /* header + indirect records */
++   uint32_t dump_mem_used;
++   char *dump_text;
++   size_t dump_text_len, dump_text_cap;
++   struct prof_dump_rec {
++      uint32_t text_pos;          /* where in dump_text the records go */
++      uint32_t mem_off, count, stride;
++      bool indexed;
++   } dump_recs[1024];
++   uint32_t dump_rec_count;
++
+    /* The harvest thread (every PROF_HARVEST_MS, a log line every
+     * PROF_LOG_NS), independent of submits and frames.
+     */
+@@ -367,6 +385,9 @@ prof_open_file(char *path, size_t size)
+ static void
+ prof_free(struct nvk_pass_profile *prof)
+ {
++   if (prof->dump_mem != NULL)
++      nvkmd_mem_unref(prof->dump_mem);
++   free(prof->dump_text);
+    if (prof->stat_mem != NULL)
+       nvkmd_mem_unref(prof->stat_mem);
+    if (prof->mem != NULL)
+@@ -427,6 +448,21 @@ nvk_pass_profile_init(struct nvk_device *dev)
+    }
+    prof->gpu = prof->mem->map;
+    memset(prof->gpu, 0, PROF_SLOTS * sizeof(struct prof_slot_gpu));
++   if (level >= 5) {
++      if (nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base, PROF_DUMP_MEM_B,
++                                     0, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,
++                                     &prof->dump_mem) != VK_SUCCESS)
++         prof->dump_mem = NULL;
++      else
++         memset(prof->dump_mem->map, 0, 16);
++      const char *m = os_get_option("NVK_PASS_DUMP");
++      snprintf(prof->dump_match, sizeof(prof->dump_match), "%s",
++               m != NULL && m[0] != 0 ? m :
++               "x2 layers 1, 0 rt z D24_UNORM_S8_UINT");
++      prof->dump_arm_ns = os_time_get_nano() +
++         (uint64_t)debug_get_num_option("NVK_PASS_DUMP_DELAY_S", 20) *
++         1000000000ull;
++   }
+    if (prof->stat_mem != NULL) {
+       prof->stat_gpu = prof->stat_mem->map;
+       memset(prof->stat_gpu, 0, PROF_STAT_SLOTS * sizeof(struct prof_stat_gpu));
+@@ -781,6 +817,255 @@ nvk_pass_profile_note_buffer(struct nvk_cmd_buffer *cmd,
+    }
+ }
+ 
++/* NVK_PASS_PROFILE=5 dump.  NVK_PASS_DUMP_DELAY_S (default 20) seconds
++ * after device creation, the next render pass whose signature contains
++ * NVK_PASS_DUMP (default "x2 layers 1, 0 rt z D24_UNORM_S8_UINT", CS2's
++ * depth prepass) is dumped: per draw call the vertex input, input
++ * assembly, rasterization and depth/stencil state, the bound index and
++ * vertex buffers, the shaders (code hashes) and the call's parameters; the
++ * indirect records are copied by the copy engine into a mapped buffer when
++ * the pass executes and written out by the harvest thread once a report
++ * after the pass says the GPU got there.  Written to NVK_PASS_DUMP_FILE,
++ * else %ProgramData%\Helios\nvk-prepass-dump-<pid>.txt on Windows.
++ */
++
++static void PRINTFLIKE(2, 3)
++prof_dump_printf(struct nvk_pass_profile *prof, const char *fmt, ...)
++{
++   char line[1024];
++   va_list args;
++   va_start(args, fmt);
++   int n = vsnprintf(line, sizeof(line), fmt, args);
++   va_end(args);
++   if (n <= 0)
++      return;
++   n = MIN2(n, (int)sizeof(line) - 1);
++   if (prof->dump_text_len + n + 1 > prof->dump_text_cap) {
++      size_t cap = MAX2(prof->dump_text_cap * 2, 65536);
++      char *t = realloc(prof->dump_text, cap);
++      if (t == NULL)
++         return;
++      prof->dump_text = t;
++      prof->dump_text_cap = cap;
++   }
++   memcpy(prof->dump_text + prof->dump_text_len, line, n);
++   prof->dump_text_len += n;
++   prof->dump_text[prof->dump_text_len] = 0;
++}
++
++static uint32_t
++prof_shader_hash(const struct nvk_shader *sh)
++{
++   if (sh == NULL || sh->code_size == 0)
++      return 0;
++   return _mesa_hash_data(sh->code_ptr, sh->code_size);
++}
++
++static void
++prof_dump_begin(struct nvk_cmd_buffer *cmd, const char *name)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_pass_profile *prof = dev->pass_profile;
++   if (prof->level < 5 || p_atomic_read(&prof->dump_state) != 1)
++      return;
++   if (strstr(name, prof->dump_match) == NULL)
++      return;
++   if (p_atomic_cmpxchg(&prof->dump_state, 1, 2) != 1)
++      return;
++   cmd->pass_profile_dump = true;
++   cmd->pass_profile_dump_call = 0;
++   prof->dump_mem_used = 16;
++   prof->dump_rec_count = 0;
++   prof_dump_printf(prof, "NVK pass dump of \"%s\" (pid %lu)\n", name,
++#ifdef _WIN32
++                    (unsigned long)GetCurrentProcessId()
++#else
++                    0ul
++#endif
++                    );
++}
++
++static const char *
++prof_topology_name(uint32_t t)
++{
++   static const char *const n[] = { "points", "lines", "line-strip", "tris",
++                                    "tri-strip", "tri-fan", "lines-adj",
++                                    "line-strip-adj", "tris-adj",
++                                    "tri-strip-adj", "patches" };
++   return t < ARRAY_SIZE(n) ? n[t] : "?";
++}
++
++void
++nvk_pass_profile_dump_draw(struct nvk_cmd_buffer *cmd, unsigned kind,
++                           uint64_t addr, uint32_t count, uint64_t stride,
++                           const uint32_t *direct)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_pass_profile *prof = dev->pass_profile;
++   if (prof == NULL || !cmd->pass_profile_dump)
++      return;
++   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
++   const struct nvk_graphics_state *gfx = &cmd->state.gfx;
++   static const char *const kinds[] = { "draw", "draw-indexed", "indirect",
++                                        "indexed-indirect" };
++
++   prof_dump_printf(prof, "call %u %s", cmd->pass_profile_dump_call++,
++                    kinds[kind]);
++   if (direct != NULL)
++      prof_dump_printf(prof, " x%u [%u %u %u %d %u]", count, direct[0],
++                       direct[1], direct[2], (int32_t)direct[3], direct[4]);
++   else
++      prof_dump_printf(prof, " addr 0x%" PRIx64 " drawCount %u stride %" PRIu64,
++                       addr, count, stride);
++   prof_dump_printf(prof, " vs %08x fs %08x topo %s restart %d cull 0x%x "
++                    "z test %d write %d op %d bounds %d stencil %d bias %d\n",
++                    prof_shader_hash(gfx->shaders[MESA_SHADER_VERTEX]),
++                    prof_shader_hash(gfx->shaders[MESA_SHADER_FRAGMENT]),
++                    prof_topology_name(dyn->ia.primitive_topology),
++                    dyn->ia.primitive_restart_enable, dyn->rs.cull_mode,
++                    dyn->ds.depth.test_enable, dyn->ds.depth.write_enable,
++                    dyn->ds.depth.compare_op, dyn->ds.depth.bounds_test.enable,
++                    dyn->ds.stencil.test_enable, dyn->rs.depth_bias.enable);
++   if (kind == 1 || kind == 3)
++      prof_dump_printf(prof, "   ib 0x%" PRIx64 " size %u type %d\n",
++                       gfx->ib_addr, gfx->ib_size, (int)gfx->ib_type);
++   if (dyn->vi != NULL) {
++      u_foreach_bit(b, dyn->vi->bindings_valid) {
++         prof_dump_printf(prof, "   binding %u stride %u rate %s divisor %u "
++                          "vb 0x%" PRIx64 " size %u\n", b,
++                          dyn->vi_binding_strides[b],
++                          dyn->vi->bindings[b].input_rate ? "instance" : "vertex",
++                          dyn->vi->bindings[b].divisor,
++                          b < ARRAY_SIZE(gfx->vb) ? gfx->vb[b].addr : 0,
++                          b < ARRAY_SIZE(gfx->vb) ? gfx->vb[b].size : 0);
++      }
++      u_foreach_bit(a, dyn->vi->attributes_valid) {
++         prof_dump_printf(prof, "   attr %u binding %u %s offset %u\n", a,
++                          dyn->vi->attributes[a].binding,
++                          vk_Format_to_str(dyn->vi->attributes[a].format) +
++                          strlen("VK_FORMAT_"),
++                          dyn->vi->attributes[a].offset);
++      }
++   }
++
++   if (addr != 0 && count > 0 && prof->dump_mem != NULL &&
++       prof->dump_rec_count < ARRAY_SIZE(prof->dump_recs)) {
++      const uint64_t eff_stride = count > 1 ? stride : (kind == 3 ? 20 : 16);
++      const uint32_t rec_b = kind == 3 ? 20 : 16;
++      const uint64_t bytes = (uint64_t)(count - 1) * eff_stride + rec_b;
++      if (prof->dump_mem_used + bytes <= PROF_DUMP_MEM_B) {
++         const VkDeviceMemoryCopyKHR region = {
++            .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_COPY_KHR,
++            .srcRange = { .address = addr, .size = bytes },
++            .dstRange = { .address = prof->dump_mem->va->addr +
++                                     prof->dump_mem_used, .size = bytes },
++         };
++         const VkCopyDeviceMemoryInfoKHR info = {
++            .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_INFO_KHR,
++            .regionCount = 1,
++            .pRegions = &region,
++         };
++         nvk_cmd_copy_memory_ce(cmd, &info);
++         prof->dump_recs[prof->dump_rec_count++] = (struct prof_dump_rec) {
++            .text_pos = (uint32_t)prof->dump_text_len,
++            .mem_off = prof->dump_mem_used,
++            .count = count,
++            .stride = (uint32_t)eff_stride,
++            .indexed = kind == 3,
++         };
++         prof->dump_mem_used = align(prof->dump_mem_used + (uint32_t)bytes, 16);
++      }
++   }
++}
++
++static void
++prof_dump_end(struct nvk_cmd_buffer *cmd)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_pass_profile *prof = dev->pass_profile;
++   if (!cmd->pass_profile_dump)
++      return;
++   cmd->pass_profile_dump = false;
++   prof_dump_printf(prof, "end of pass: %u calls\n", cmd->pass_profile_dump_call);
++   if (prof->dump_mem != NULL) {
++      /* After the copies (a subchannel switch waits for the copy engine) */
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
++      P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);
++      P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
++      P_NV9097_SET_REPORT_SEMAPHORE_A(p, prof->dump_mem->va->addr >> 32);
++      P_NV9097_SET_REPORT_SEMAPHORE_B(p, prof->dump_mem->va->addr);
++      P_NV9097_SET_REPORT_SEMAPHORE_C(p, PROF_DUMP_PAYLOAD);
++      P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
++         .operation = OPERATION_RELEASE,
++         .release = RELEASE_AFTER_ALL_PRECEEDING_WRITES_COMPLETE,
++         .pipeline_location = PIPELINE_LOCATION_ALL,
++         .structure_size = STRUCTURE_SIZE_ONE_WORD,
++      });
++   }
++   p_atomic_set(&prof->dump_state, 3);
++}
++
++/* From the harvest thread */
++static void
++prof_dump_poll(struct nvk_pass_profile *prof, uint64_t now)
++{
++   const uint32_t st = p_atomic_read(&prof->dump_state);
++   if (st == 0 && prof->level >= 5 && now >= prof->dump_arm_ns) {
++      p_atomic_set(&prof->dump_state, 1);
++      return;
++   }
++   if (st != 3)
++      return;
++   volatile uint32_t *hdr = prof->dump_mem ? prof->dump_mem->map : NULL;
++   if (hdr != NULL && hdr[0] != PROF_DUMP_PAYLOAD)
++      return;
++
++   char path[512] = "";
++   FILE *f = NULL;
++   const char *env = os_get_option("NVK_PASS_DUMP_FILE");
++   if (env != NULL && env[0] != 0)
++      f = fopen(env, "w");
++#ifdef _WIN32
++   if (f == NULL) {
++      char pd[MAX_PATH];
++      DWORD n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
++      snprintf(path, sizeof(path), "%s\\Helios\\nvk-prepass-dump-%lu.txt",
++               n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData",
++               (unsigned long)GetCurrentProcessId());
++      f = fopen(path, "w");
++   }
++#endif
++   if (f == NULL)
++      f = stderr;
++   size_t pos = 0;
++   for (uint32_t r = 0; r <= prof->dump_rec_count; r++) {
++      const size_t until = r < prof->dump_rec_count ?
++                           prof->dump_recs[r].text_pos : prof->dump_text_len;
++      if (until > pos && prof->dump_text != NULL)
++         fwrite(prof->dump_text + pos, 1, until - pos, f);
++      pos = until;
++      if (r == prof->dump_rec_count || hdr == NULL)
++         continue;
++      const uint8_t *base = (const uint8_t *)hdr + prof->dump_recs[r].mem_off;
++      for (uint32_t i = 0; i < prof->dump_recs[r].count; i++) {
++         const uint32_t *d = (const uint32_t *)(base + (size_t)i *
++                                                prof->dump_recs[r].stride);
++         if (prof->dump_recs[r].indexed)
++            fprintf(f, "   rec %u: indexCount %u instanceCount %u firstIndex %u "
++                    "vertexOffset %d firstInstance %u\n", i, d[0], d[1], d[2],
++                    (int32_t)d[3], d[4]);
++         else
++            fprintf(f, "   rec %u: vertexCount %u instanceCount %u firstVertex %u "
++                    "firstInstance %u\n", i, d[0], d[1], d[2], d[3]);
++      }
++   }
++   if (f != stderr)
++      fclose(f);
++   prof_log(prof, "NVK pass profile: pass dump written to %s",
++            path[0] ? path : (env ? env : "stderr"));
++   p_atomic_set(&prof->dump_state, 4);
++}
++
+ void
+ nvk_pass_profile_internal_begin(struct nvk_cmd_buffer *cmd)
+ {
+@@ -906,6 +1191,7 @@ nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd,
+             MAX2(render->samples, 1), render->layer_count,
+             render->color_att_count, color, depth);
+    cmd->pass_profile_slot = prof_begin(cmd, name, PROF_KIND_PASS);
++   prof_dump_begin(cmd, name);
+    memset(&cmd->pass_profile_pass_counts, 0,
+           sizeof(cmd->pass_profile_pass_counts));
+    cmd->pass_profile_in_pass = true;
+@@ -956,6 +1242,8 @@ nvk_pass_profile_end_pass(struct nvk_cmd_buffer *cmd)
+       return;
+    if (cmd->pass_profile_hist_sig != 0)
+       prof_hist_end_pass(cmd);
++   if (cmd->pass_profile_dump)
++      prof_dump_end(cmd);
+    if (cmd->pass_profile_stat_slot >= 0) {
+       prof_emit_stats(cmd, cmd->pass_profile_stat_slot, true);
+       cmd->pass_profile_stat_slot = -1;
+@@ -971,6 +1259,7 @@ nvk_pass_profile_reset_cmd(struct nvk_cmd_buffer *cmd)
+    cmd->pass_profile_on = nvk_cmd_buffer_device(cmd)->pass_profile != NULL;
+    cmd->pass_profile_hist_sig = 0;
+    cmd->pass_profile_hist_start = NULL;
++   cmd->pass_profile_dump = false;
+    cmd->pass_profile_buffers = cmd->pass_profile_on &&
+       nvk_cmd_buffer_device(cmd)->pass_profile->level >= 4;
+    cmd->pass_profile_slot = -1;
+@@ -1262,6 +1551,7 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+    }
+ 
+    const uint64_t now = os_time_get_nano();
++   prof_dump_poll(prof, now);
+    const uint64_t window = now - prof->window_start_ns;
+    if (window >= PROF_LOG_NS || (final && window > 0)) {
+       const double window_s = window / 1e9;
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.h b/src/nouveau/vulkan/nvk_pass_profile.h
+index 90ae97aa..48b831f3 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.h
++++ b/src/nouveau/vulkan/nvk_pass_profile.h
+@@ -109,6 +109,13 @@ void nvk_pass_profile_op(struct nvk_cmd_buffer *cmd,
+  * clears and ZCULL reseeds): its render passes and operations are part of
+  * the operation that records it, not passes of their own.
+  */
++/* NVK_PASS_PROFILE=5: one render pass's draws dumped (see nvk_pass_profile.c);
++ * kind 0 direct, 1 indexed direct, 2 indirect, 3 indexed indirect
++ */
++void nvk_pass_profile_dump_draw(struct nvk_cmd_buffer *cmd, unsigned kind,
++                                uint64_t addr, uint32_t count, uint64_t stride,
++                                const uint32_t *direct /* 5 dwords or NULL */);
++
+ /* NVK_PASS_PROFILE=4: where a buffer address the draws read lives */
+ void nvk_pass_profile_note_buffer(struct nvk_cmd_buffer *cmd,
+                                   enum nvk_pass_profile_buf kind,
+-- 
+2.43.0
+

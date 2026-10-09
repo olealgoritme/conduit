@@ -271,6 +271,15 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvEvErr",
         crate::virtio::nvrm::NVRM_EV_ERRORS.load(Ordering::Relaxed),
     );
+    // Drain passes that emptied a full ring, and the most one pass took.
+    crate::diag::record_named_bytes(
+        b"NvEvFull",
+        crate::virtio::nvrm::NVRM_EV_FULL.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvMaxP",
+        crate::virtio::nvrm::NVRM_EV_MAX_PASS.load(Ordering::Relaxed),
+    );
     // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
     // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
     crate::adapter::foreign_scanout::publish_counters();
@@ -318,6 +327,12 @@ pub(crate) fn publish_nvrm_counters() {
     crate::ddi::blt_async::publish_counters();
     // The guest-memory blob Blt destination (`GuestBlob`): `Gb*`, written once an event happened.
     crate::ddi::guest_blob::publish_counters();
+    // The DWM-restart block (`Dw*`): device lifecycle, the census of what a dead device left
+    // pinned, the Present / flip / open windows since it died. Only words that changed.
+    crate::ddi::dwm_restart::publish_counters();
+    // The transfer-only queue for the Present copies (`CopyQueue`): `CqMain` / `CqXfer`, the
+    // fallbacks `CqFall` / `CqWhy` / `CqMask`, the queue-switch waits, written once the knob is on.
+    crate::ddi::copy_queue::publish_counters();
     // The copy-engine Present record behind a fenced marker (M3c-0): `CeRec*`, written once a
     // fenced marker was seen.
     crate::ddi::ce_record::publish_counters();
@@ -333,12 +348,6 @@ pub(crate) fn publish_nvrm_counters() {
     // The CPU-host-aperture map log (`BarApR*`/`BarApP*`).
     crate::ddi::cpu_host_aperture::publish_map_log();
     crate::ddi::aperture_pages::publish_counters();
-    // The transfer-only queue for the Present copies (`CopyQueue`): `CqMain` / `CqXfer`, the
-    // fallbacks `CqFall` / `CqWhy` / `CqMask`, the queue-switch waits, written once the knob is on.
-    crate::ddi::copy_queue::publish_counters();
-    // The DWM-restart block (`Dw*`): device lifecycle, the census of what a dead device left
-    // pinned, the Present / flip / open windows since it died. Only words that changed.
-    crate::ddi::dwm_restart::publish_counters();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();
@@ -908,8 +917,10 @@ pub(crate) unsafe fn signal_dma_completed(
     guard: &WddmNotifyGuard<'_>,
     dxgkrnl: &DXGKRNL_INTERFACE,
     fence: u32,
+    // The WDDM node the fence belongs to (`D3d12Node`); fence ids are per node.
+    node: u32,
 ) -> NTSTATUS {
-    let last = guard.completed_fence();
+    let last = guard.completed_fence(node);
     // Sequence comparison remains correct across u32 wrap: a forward id is
     // within the next half of the sequence space; equal/backward is stale. The
     // predicate lives in `helios_kmd_logic` so the wrap arithmetic has a host
@@ -926,12 +937,12 @@ pub(crate) unsafe fn signal_dma_completed(
     // DmaCompleted is the correct arm for DXGK_INTERRUPT_DMA_COMPLETED.
     let completed = unsafe { interrupt.__bindgen_anon_1.DmaCompleted.as_mut() };
     completed.SubmissionFenceId = fence;
-    completed.NodeOrdinal = 0;
+    completed.NodeOrdinal = node;
     completed.EngineOrdinal = 0;
     // SAFETY: fully-initialized packet, live for the call.
     let status = unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) };
     if status == STATUS_SUCCESS {
-        guard.set_completed_fence(fence);
+        guard.set_completed_fence(node, fence);
     }
     status
 }
@@ -963,14 +974,15 @@ unsafe fn signal_dma_preempted_locked(
     guard: &WddmNotifyGuard<'_>,
     dxgkrnl: &DXGKRNL_INTERFACE,
     preempt_fence: u32,
+    node: u32,
 ) -> NTSTATUS {
     let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
     interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_PREEMPTED;
     // SAFETY: DmaPreempted is the correct arm for DXGK_INTERRUPT_DMA_PREEMPTED.
     let preempted = unsafe { interrupt.__bindgen_anon_1.DmaPreempted.as_mut() };
     preempted.PreemptionFenceId = preempt_fence;
-    preempted.LastCompletedFenceId = guard.completed_fence();
-    preempted.NodeOrdinal = 0;
+    preempted.LastCompletedFenceId = guard.completed_fence(node);
+    preempted.NodeOrdinal = node;
     preempted.EngineOrdinal = 0;
     // SAFETY: fully-initialized packet, live for the call.
     unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
@@ -1029,6 +1041,8 @@ fn note_and_maybe_signal(
     trace: Option<&crate::ddi::flush_trace::SubmitTrace>,
     // `GdiAccel`: the GDI job sequence this buffer's fence waits for (`ddi/gdi_exec.rs`).
     gdi_seq: Option<u64>,
+    // The WDDM node the submission is on (`D3d12Node`).
+    node: u32,
 ) -> SubmitAck {
     let Ok(dxgkrnl) = adapter.dxgkrnl() else {
         // Effectively unreachable: dxgkrnl is set at StartDevice and never
@@ -1074,6 +1088,7 @@ fn note_and_maybe_signal(
                     exact_execution,
                     execution_boundary_value,
                     gdi_seq,
+                    node,
                 )
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
@@ -1084,7 +1099,7 @@ fn note_and_maybe_signal(
         let mut disposition = crate::ddi::flush_trace::Disposition::Queued;
         if signal_now {
             // SAFETY: the notification lock is held and dxgkrnl is live.
-            let status = unsafe { signal_dma_completed(guard, dxgkrnl, fence) };
+            let status = unsafe { signal_dma_completed(guard, dxgkrnl, fence, node) };
             disposition = if status == STATUS_SUCCESS {
                 crate::ddi::flush_trace::Disposition::Immediate
             } else {
@@ -1470,6 +1485,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         execution_boundary,
         trace.as_ref(),
         gdi_seq,
+        crate::virtio::gpu::wddm_node_of(submit.NodeOrdinal),
     );
     STATUS_SUCCESS
 }
@@ -1556,6 +1572,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         execution_boundary,
         trace.as_ref(),
         gdi_seq,
+        crate::virtio::gpu::wddm_node_of(submit.NodeOrdinal),
     );
     STATUS_SUCCESS
 }
@@ -1650,6 +1667,9 @@ pub(crate) enum AbandonOutcome<'a> {
 pub(crate) fn abandon_pending_submissions(
     adapter: &AdapterContext,
     outcome: AbandonOutcome<'_>,
+    // `Some(node)`: only that WDDM node's submissions (PreemptCommand,
+    // ResetEngine name one node); `None`: every node (ResetFromTimeout).
+    node: Option<u32>,
 ) -> (u32, NTSTATUS) {
     // Every dropped fence was the only waiter on its scan-out presentation
     // lease. Release them all: a lease whose waiter has been discarded would
@@ -1657,7 +1677,11 @@ pub(crate) fn abandon_pending_submissions(
     // BEFORE the critical section, because ending a lease publishes any withheld
     // primary address and signals the display worker, and neither belongs
     // inside a DISPATCH notification lock.
-    adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Teardown);
+    // Scan-out leases belong to node 0's presents (DWM, D3D11); a node-1-only
+    // abandon (`D3d12Node`) leaves them with the fences still pending there.
+    if node.map_or(true, |n| n == 0) {
+        adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Teardown);
+    }
     // Preemption is the sole replayable scheduler outcome: dxgkrnl resubmits
     // the same private record after it re-establishes residency. Reset and
     // timeout abandon the epoch, so their WindowedBlt readers must be settled
@@ -1667,9 +1691,9 @@ pub(crate) fn abandon_pending_submissions(
         let dropped = guard
             .with_virtio(|o, v| {
                 if retain_for_resubmit {
-                    v.preempt_flush(o)
+                    v.preempt_flush(o, node)
                 } else {
-                    v.terminal_abandon_wddm_epoch(o)
+                    v.terminal_abandon_wddm_epoch(o, node)
                 }
             })
             .unwrap_or(0);
@@ -1684,14 +1708,14 @@ pub(crate) fn abandon_pending_submissions(
                 // SAFETY: the WDDM notification lock serializes this packet with
                 // every DMA_COMPLETED packet; the callback interface is live and
                 // delivery is raised to DIRQL by notify_at_dirql.
-                unsafe { signal_dma_preempted_locked(guard, dxgkrnl, fence) }
+                unsafe { signal_dma_preempted_locked(guard, dxgkrnl, fence, node.unwrap_or(0)) }
             }
             AbandonOutcome::ReportLastAborted { out } => {
                 // Written INSIDE the guard, exactly as before. Do NOT change the
                 // value: whether DXGKARG_RESETENGINE wants the completed
                 // watermark or the first aborted fence is an OPEN QUESTION
                 // against the WDK header, deliberately not resolved here.
-                *out = guard.completed_fence() as UINT;
+                *out = guard.completed_fence(node.unwrap_or(0)) as UINT;
                 STATUS_SUCCESS
             }
         };
@@ -1724,19 +1748,21 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
     // The one-critical-section rationale now lives on
     // `abandon_pending_submissions`, where DxgkDdiResetEngine's reader can see
     // it too.
+    let preempt_node = crate::virtio::gpu::wddm_node_of(preempt.NodeOrdinal);
     let (dropped, status) = abandon_pending_submissions(
         adapter,
         AbandonOutcome::Preempted {
             dxgkrnl,
             fence: preempt.PreemptionFenceId,
         },
+        Some(preempt_node),
     );
     // Breadcrumbs (`PreFence`, `PreLastCmp`, `PreDropped`, `PreStatus`, `PreT`; atomics only,
     // DISPATCH): the 333 wedge began with two preemptions and a scheduler that never submitted
     // again; what the last one was told and what it dropped is the first thing to read.
     crate::ddi::escape_wait::note_preempt(
         preempt.PreemptionFenceId,
-        adapter.completed_fence(),
+        adapter.completed_fence_node(preempt_node),
         dropped,
         status as u32,
     );
@@ -1754,7 +1780,7 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
     // Prevent a DPC from taking a fence out of the pending FIFO while reset is
     // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
     // state; no completion from the abandoned epoch may escape concurrently.
-    let _ = abandon_pending_submissions(adapter, AbandonOutcome::Silent);
+    let _ = abandon_pending_submissions(adapter, AbandonOutcome::Silent, None);
     adapter.with_wddm_notify_lock(|guard| {
         let _ = guard.with_virtio(|order, v| v.purge_all_present_streams_ordered(order));
     });
@@ -2881,6 +2907,9 @@ pub unsafe extern "C" fn dxgkddi_query_current_fence(
     }
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let query = unsafe { &mut *query_current_fence };
+    // NodeOrdinal is dxgkrnl's input (`D3d12Node`: node 1 is the D3D12 node);
+    // read before the struct is cleared.
+    let node = crate::virtio::gpu::wddm_node_of(query.NodeOrdinal);
     unsafe {
         core::ptr::write_bytes(
             query as *mut _ as *mut u8,
@@ -2888,8 +2917,8 @@ pub unsafe extern "C" fn dxgkddi_query_current_fence(
             size_of::<DXGKARG_QUERYCURRENTFENCE>(),
         );
     }
-    query.CurrentFence = adapter.completed_fence();
-    query.NodeOrdinal = 0;
+    query.CurrentFence = adapter.completed_fence_node(node);
+    query.NodeOrdinal = node;
     query.EngineOrdinal = 0;
     STATUS_SUCCESS
 }

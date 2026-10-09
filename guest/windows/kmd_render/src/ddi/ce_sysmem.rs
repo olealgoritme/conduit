@@ -82,6 +82,8 @@ static ANY: AtomicU32 = AtomicU32::new(0);
 static MADE: AtomicU32 = AtomicU32::new(0);
 /// Views made over an aperture surface's recorded pages (`RmSysApV`).
 static AP_VIEWS: AtomicU32 = AtomicU32::new(0);
+/// The longest `aperture_view` call (`RmSysApMax`, µs): a remade descriptor's RM registration.
+static AP_US_MAX: AtomicU32 = AtomicU32::new(0);
 static HIT: AtomicU32 = AtomicU32::new(0);
 static REFUSE: AtomicU32 = AtomicU32::new(0);
 static WHY: AtomicU32 = AtomicU32::new(0);
@@ -132,6 +134,7 @@ pub(crate) fn publish_counters() {
     use crate::diag::record_named_bytes as rec;
     rec(b"RvSysMade", MADE.load(Ordering::Relaxed));
     rec(b"RvSysApV", AP_VIEWS.load(Ordering::Relaxed));
+    rec(b"RvSysApMax", AP_US_MAX.load(Ordering::Relaxed));
     rec(b"RvSysHit", HIT.load(Ordering::Relaxed));
     rec(b"RvSysRefuse", REFUSE.load(Ordering::Relaxed));
     rec(b"RvSysWhy", WHY.load(Ordering::Relaxed));
@@ -237,7 +240,15 @@ fn resolve(
 ) -> Result<CeSurface, Fail> {
     // An aperture GDI surface (`RvOff` 0x4000 off, the default): a view over its recorded pages.
     if crate::ddi::aperture_pages::tracked(resource_id) {
-        return aperture_view(passive, adapter, resource_id, pitch, width, height, keep);
+        // Opt-in (`RvOff` 0x8000): otherwise the executor's CPU path serves it.
+        if !crate::virtio::rm_client::vidmem::off(helios_kmd_logic::rm_vidmem::off::AP_CE_ON) {
+            return Err(refuse(NOT_SYSTEM));
+        }
+        let t0 = crate::ddi::blt_async::now_100ns();
+        let r = aperture_view(passive, adapter, resource_id, pitch, width, height, keep);
+        let us = (crate::ddi::blt_async::now_100ns().saturating_sub(t0) / 10).min(u64::from(u32::MAX)) as u32;
+        AP_US_MAX.fetch_max(us, Ordering::Relaxed);
+        return r;
     }
     if guard.snapshot(resource_id).is_some() {
         return surface_locked(passive, adapter, guard, resource_id, pitch, width, height, keep);

@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 02:48:34 +0200
+Subject: [PATCH] nvk/rm: nothing between an incomplete push and the one
+ completing it
+
+405.13 with NVK_INDIRECT_PUSH=1 took CS2 down with Xid 32 (invalid
+pushbuffer stream).  0028 is the first Turing+ user of "incomplete"
+pushes: a CALL_MME_MACRO whose count covers the draw records ends one
+pushbuffer segment, and the records follow as the next GPFIFO entry,
+pointing at the indirect buffer.
+
+The RM exec path waited for ring space before each entry separately.
+With the 1024-entry ring close to full (CS2's depth prepass alone has
+about 115 indirect calls, two entries each), that wait flushes, and a
+flush appends entries of its own (pending semaphore waits, the retire
+release, the tracking release) right after the incomplete push: the host
+reads their methods as the open macro call's data, and the stream is
+broken.
+
+A run of incomplete pushes and the push that completes it now get their
+ring space together and are written with nothing in between.  Behaviour
+for complete pushes is unchanged.  NVK_INDIRECT_PUSH stays off by
+default until a VM row with it on runs clean.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c | 45 +++++++++++++++++-----
+ 1 file changed, 36 insertions(+), 9 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 2e4c883a..dd14b2a1 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -196,15 +196,16 @@ ring_free(struct nvkmd_rm_exec_ctx *ctx)
+           NVKMD_RM_GPFIFO_ENTRIES;
+ }
+ 
+-/* Room for one entry plus the tracking release a kick appends */
++/* Room for n entries plus the tracking release a kick appends */
+ static VkResult
+-wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
++wait_ring_space_n(struct nvkmd_rm_exec_ctx *ctx,
++                  struct vk_object_base *log_obj, uint32_t n)
+ {
+    VkResult lost = check_lost(ctx, log_obj);
+    if (lost != VK_SUCCESS)
+       return lost;
+ 
+-   if (ring_free(ctx) >= 2)
++   if (ring_free(ctx) >= n + 1)
+       return VK_SUCCESS;
+ 
+    /* The ring is full of entries that may not have been kicked yet */
+@@ -215,7 +216,7 @@ wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
+    }
+ 
+    const uint64_t deadline = os_time_get_nano() + NVKMD_RM_RING_TIMEOUT_NS;
+-   while (ring_free(ctx) < 2) {
++   while (ring_free(ctx) < n + 1) {
+       VkResult result = check_channel_error(ctx, log_obj);
+       if (result != VK_SUCCESS)
+          return result;
+@@ -234,6 +235,12 @@ wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
++{
++   return wait_ring_space_n(ctx, log_obj, 1);
++}
++
+ static void
+ write_gpfifo_entry(struct nvkmd_rm_exec_ctx *ctx,
+                    uint64_t addr, uint32_t size_B, bool no_prefetch)
+@@ -506,14 +513,34 @@ nvkmd_rm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+          return result;
+    }
+ 
+-   /* All entries of a submit are written before GP_PUT moves, so an
+-    * "incomplete" push is simply followed by the next entry.
++   /* An "incomplete" push ends inside a method whose data continues in the
++    * next entry (NVK's pushbuffer segments pointing at indirect draw
++    * records, patch 0028), so nothing may come between them.  Waiting for
++    * ring space one entry at a time could flush in the middle, and a flush
++    * appends its own entries (pending waits, the retire and tracking
++    * releases): the host then reads their methods as the open method's
++    * data (Xid 32, 405.13).  So a run of incomplete pushes and the push
++    * completing it get their ring space together, and are written with
++    * nothing in between.
+     */
+-   for (uint32_t i = 0; i < exec_count; i++) {
+-      result = push_gpfifo_entry(ctx, log_obj, execs[i].addr,
+-                                 execs[i].size_B, execs[i].no_prefetch);
++   for (uint32_t i = 0; i < exec_count;) {
++      uint32_t end = i;
++      while (end + 1 < exec_count && execs[end].incomplete)
++         end++;
++      const uint32_t n = end - i + 1;
++      if (n + 2 > NVKMD_RM_GPFIFO_ENTRIES) {
++         return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
++                          "%u chained GPFIFO entries do not fit the ring", n);
++      }
++
++      result = wait_ring_space_n(ctx, log_obj, n);
+       if (result != VK_SUCCESS)
+          return result;
++
++      for (uint32_t k = i; k <= end; k++)
++         write_gpfifo_entry(ctx, execs[k].addr, execs[k].size_B,
++                            execs[k].no_prefetch);
++      i = end + 1;
+    }
+ 
+    return VK_SUCCESS;
+-- 
+2.43.0
+

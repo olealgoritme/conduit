@@ -67,7 +67,7 @@ RUST_LOG=info "$BACKEND" --socket "$RUN/nvgpu.sock" \
   -chardev socket,id=vfs,path="$RUN/vfs.sock" \
   -device vhost-user-fs-pci,chardev=vfs,tag=nvidia \
   -chardev socket,id=nvgpu,path="$RUN/nvgpu.sock" \
-  -device vhost-user-test-device-pci,chardev=nvgpu,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036
+  -device vhost-user-test-device-pci,chardev=nvgpu,virtio-id=45,num_vqs=3,vq_size=256,config_size=4036
 ```
 
 Why each nvgpu-related argument is there:
@@ -80,16 +80,20 @@ Why each nvgpu-related argument is there:
   - `virtio-id=45` is what the guest driver binds. The virtio spec has
     since given 45 to SPI controllers; `conduit-guest` blacklists the
     guest's `spi_virtio` so it cannot take the device.
-  - `num_vqs=2` gives the control queue and the event queue. The driver
-    fails probe with fewer.
+  - `num_vqs=3` gives the control queue, the event queue and the cursor
+    queue. The Linux driver needs the first two (it fails probe with fewer)
+    and ignores the third; the Windows KMD sends its cursor commands there
+    when the backend announces `NVGPU_CFG_CURSOR_QUEUE`, so they never wait
+    behind Venus traffic. With `num_vqs=2` the KMD keeps them on the
+    control queue.
   - `vq_size=256` is the backend's `QUEUE_SIZE`. The default of 64 also
     works, but it is smaller.
   - `config_size=4036` is `sizeof(struct conduit_gpu_config)`, display
     fields included. A smaller value hides the display fields.
     `config_size=0` turns config reads off, and the guest driver then
     rejects the device.
-  - With patch 0004, `vectors=` defaults to `num_vqs + 1` = 3, which is
-    the same as `conduit-vmm`.
+  - With patch 0004, `vectors=` defaults to `num_vqs + 1` = 4 (the cursor
+    queue takes no interrupt: the guest polls it).
 - The shared memory regions are not given on the command line. QEMU asks
   the backend for them with `GET_SHMEM_CONFIG`. The backend answers shmid 1
   (window, `--window-mib`, default `auto`: the host GPU's BAR1, 32 GiB on an
@@ -155,7 +159,7 @@ device:
     <qemu:arg value='-chardev'/>
     <qemu:arg value='socket,id=conduit-gpu,path=/run/user/1000/conduit/NAME/gpu-libvirt.sock'/>
     <qemu:arg value='-device'/>
-    <qemu:arg value='vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x10'/>
+    <qemu:arg value='vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,num_vqs=3,vq_size=256,config_size=4036,bus=pcie.0,addr=0x10'/>
   </qemu:commandline>
 ```
 

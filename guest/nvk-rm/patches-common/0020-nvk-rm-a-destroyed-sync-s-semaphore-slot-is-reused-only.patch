@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 22:29:49 +0200
+Subject: [PATCH] nvk/rm: a destroyed sync's semaphore slot is reused only
+ after the GPU work
+
+nvkmd_rm_sync_finish handed the sync's 8-byte semaphore slot back to the
+pool at once.  A GPU release into it that is still in flight (a
+semaphore destroyed with a signal pending, a binary moved off it) then
+lands in the next sync given that slot: a late, larger value, and waits
+on that sync complete early.  The slot now goes back through the
+deferred-free queue of NVK_RM_DEFER_FREE (patch 0019), so it is reused
+only once the work submitted before the destroy has finished.  With the
+feature off, nothing in flight, or a lost device, as before.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c | 34 +++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+index eae58736..0f42388d 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -163,13 +163,43 @@ nvkmd_rm_sync_init(struct vk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++struct nvkmd_rm_slot_free {
++   struct nvkmd_rm_dev *dev;
++   uint32_t slot;
++};
++
++static void
++nvkmd_rm_slot_free_now(void *obj)
++{
++   struct nvkmd_rm_slot_free *f = obj;
++   nvkmd_rm_sema_pool_free(f->dev, f->slot);
++   FREE(f);
++}
++
+ static void
+ nvkmd_rm_sync_finish(struct vk_device *device, struct vk_sync *_sync)
+ {
+    struct nvkmd_rm_sync *sync = nvkmd_rm_sync(_sync);
+ 
+-   if (sync->dev != NULL)
+-      nvkmd_rm_sema_pool_free(sync->dev, sync->slot);
++   if (sync->dev == NULL)
++      return;
++
++   /* A GPU release into the slot may still be in flight (a semaphore
++    * destroyed with a signal pending, a binary moved away from it): reused
++    * at once, the slot would give its next sync that late, larger value and
++    * waits on that sync would complete early.  The slot goes back to the
++    * pool once the work submitted so far has finished (NVK_RM_DEFER_FREE).
++    */
++   struct nvkmd_rm_slot_free *f = CALLOC_STRUCT(nvkmd_rm_slot_free);
++   if (f != NULL) {
++      f->dev = sync->dev;
++      f->slot = sync->slot;
++      if (nvkmd_rm_defer_free(sync->dev, nvkmd_rm_slot_free_now, f, 0))
++         return;
++      FREE(f);
++   }
++
++   nvkmd_rm_sema_pool_free(sync->dev, sync->slot);
+ }
+ 
+ static VkResult

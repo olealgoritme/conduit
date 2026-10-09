@@ -72,6 +72,12 @@ pub mod off {
     /// (Explorer's file list and the wallpaper render; black without it); this bit turns it OFF
     /// (the BAR / RM placement and the blob view as before). It opted in before.
     pub const STAGING_APERTURE_OFF: u32 = 0x4000;
+    /// OPT-IN: the copy engine views an aperture GDI surface through an OS descriptor over its
+    /// recorded pages (`ce_sysmem::aperture_view`). Off by default since 397.1: remade whenever
+    /// VidMm moves the surface's pages (an RM registration of every page of a 29 MB staging
+    /// buffer), it is the first suspect for multi-second desktop freezes; without it those
+    /// surfaces take the GDI executor's CPU path (`read_/write_standard_buffer` over the pages).
+    pub const AP_CE_ON: u32 = 0x8000;
     /// The Present hook (`ddi/vram_redirect.rs`) skips every Blt with a VRAM surface (counted).
     pub const PRESENT_HOOK: u32 = 0x80;
     /// OPT-IN: the CPU helpers reuse blob views (`build_paging_buffer`). Off by default since 364.1:
@@ -906,7 +912,7 @@ pub const COUNTERS: &[&str] = &[
     // foreign NVK sources for GDI commands (`ce_vram.rs`)
     "RvFgnRec", "RvFgnImp", "RvFgnFail", "RvFgnWhy", "RvFgnWrite",
     // the CE views of standard buffers (`ddi/ce_sysmem.rs`)
-    "RvSysMade", "RvSysApV", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak", "RvSysObj",
+    "RvSysMade", "RvSysApV", "RvSysApMax", "RvSysHit", "RvSysRefuse", "RvSysWhy", "RvSysFreed", "RvSysLeak", "RvSysObj",
     // the CPU helpers' blob views (`ddi/build_paging_buffer.rs`)
     "RvCpuMapUs", "RvCpuCpyUs", "RvCpuKB", "RvCpuCache", "RvCpuHit", "RvCpuView",
 ];

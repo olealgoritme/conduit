@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 06:09:44 +0200
+Subject: [PATCH] nvk/rm: 1 ms event poll on Windows, woken and timed-out waits
+ counted
+
+NVK_WAIT_STATS in CS2 on 405.20: about 310 event waits a second, 990 ms
+in all, longest ~11 ms, ~42 of them ended by the 10 ms poll timeout
+rather than a wake.
+
+The CPU waits block on the process's one non-stall event, which every
+waiting thread shares and which librmclient resets as soon as a waiter
+wakes.  A thread that read the semaphore value just before a GPU release
+and enters its wait just after another thread's reset misses that wake:
+every release raises NON_STALL_INTERRUPT and the waiters re-check the
+value after every wake or timeout, but the wake itself is gone, so the
+waiter sits out the poll timeout.
+
+Stopgap until the wake is per waiter: NVK_RM_WAIT_POLL_MS defaults to 1
+on Windows (10 elsewhere), and librmclient now times waits of up to 50 ms
+with a high-resolution waitable timer, so the 1 ms poll is 1 ms and not a
+15.6 ms timer tick.  NVK_RM_WAIT_POLL_MS=10 restores the old value.
+
+NVK_WAIT_STATS lines say per site how many waits were woken and how many
+timed out.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 44b23a70..e3cb3955 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -375,7 +375,17 @@ nvkmd_rm_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+  * timeout.
+  */
+ #define NVKMD_RM_WAIT_SPIN_ITERS_DEFAULT 64
++/* 1 ms on Windows: the non-stall event is shared by all waiters of the
++ * process and reset by whichever wakes first, so a waiter can miss its wake
++ * and only see the value at the next poll (CS2 on 405.20: ~42 of ~310 event
++ * waits a second ran into the 10 ms timeout).  librmclient times short
++ * waits with a high-resolution timer, so 1 ms is 1 ms, not a timer tick.
++ */
++#ifdef _WIN32
++#define NVKMD_RM_WAIT_POLL_MS_DEFAULT    1
++#else
+ #define NVKMD_RM_WAIT_POLL_MS_DEFAULT    10
++#endif
+ 
+ /* Tuning/experiments: NVK_RM_WAIT_SPIN (yield iterations before blocking),
+  * NVK_RM_WAIT_POLL_MS (longest single block on the event),
+@@ -517,8 +527,9 @@ nvkmd_rm_wait_stats_thread(void *arg)
+          if (len < (int)sizeof(line))
+             len += snprintf(line + len, sizeof(line) - len,
+                             " %s %" PRIu64 " (%.2f ms, max %.2f ms, %" PRIu64
+-                            " timeouts)", nvkmd_rm_wait_site_names[i], dc,
+-                            dns / 1e6, mx / 1e6, dto);
++                            " woken, %" PRIu64 " timeouts)",
++                            nvkmd_rm_wait_site_names[i], dc, dns / 1e6,
++                            mx / 1e6, dc - dto, dto);
+       }
+       if (any && nvkmd_rm_wait_stats_file != NULL) {
+          fprintf(nvkmd_rm_wait_stats_file, "%s\n", line);
+@@ -562,7 +573,7 @@ nvkmd_rm_wait_stats_init(void)
+    if (nvkmd_rm_wait_stats_file == NULL)
+       nvkmd_rm_wait_stats_file = stderr;
+    fprintf(nvkmd_rm_wait_stats_file, "NVK waits: per second per site: "
+-           "count (total ms, longest ms, timeouts)\n");
++           "count (total ms, longest ms, woken, timeouts)\n");
+    fflush(nvkmd_rm_wait_stats_file);
+    thrd_t t;
+    if (thrd_create(&t, nvkmd_rm_wait_stats_thread, NULL) == thrd_success)
+-- 
+2.43.0
+

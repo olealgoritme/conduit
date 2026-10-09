@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 07:04:37 +0200
+Subject: [PATCH] nvk/rm: CPU waits on librmclient wake generations
+ (NVK_RM_EVENT_GEN)
+
+On Windows every CPU wait of a process shares one manual-reset event per
+channel, and the first waiter to wake resets it under the others.  A
+thread that checked its value just before another thread consumed the
+wake then sleeps out the whole poll timeout: CS2 on 405.22 ended about
+650 of 900 event waits a second by the 1 ms timeout (NVK_WAIT_STATS).
+
+librmclient now keeps a wake generation per event channel
+(crm_win_event_gen, crm_win_event_wait_gen): one waiter blocks on the
+KMD's event, and when it fires moves the generation on and wakes every
+other waiter through a condition variable.  The wait loops in
+nvkmd_rm_wait_value() and nvkmd_rm_sync_wait_many() read the generation
+before they check their values and wait for it to move, so a wake that
+lands after the check is never lost.
+
+Both symbols are optional: with an older librmclient, off Windows, or
+with NVK_RM_EVENT_GEN=0, the shared-event wait stays as it was.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      | 14 ++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  | 42 +++++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |  2 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c |  3 +-
+ 4 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 32db1a97..479cb944 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -156,6 +156,12 @@ struct nvkmd_rm_lib {
+     * library.
+     */
+    int (*win_event_kick)(int event_fd);
++   /* Lost-wakeup-free event waits (librmclient crm_win_event_gen and
++    * crm_win_event_wait_gen): read the wake generation before checking a
++    * value, wait for it to move.  NULL with an older library.
++    */
++   int (*win_event_gen)(int event_fd, uint64_t *gen);
++   int (*win_event_wait_gen)(int event_fd, uint64_t seen, uint32_t timeout_ms);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -881,7 +887,13 @@ void nvkmd_rm_sync_mark_pending(struct nvkmd_rm_sync *sync, uint64_t value);
+  * Returns VK_TIMEOUT once abs_timeout_ns has passed.  dev may be NULL.
+  */
+ VkResult nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+-                            uint64_t abs_timeout_ns);
++                            uint64_t abs_timeout_ns, uint64_t gen);
++
++/* The event's wake generation, read before a CPU wait loop checks its
++ * value each time round and passed to nvkmd_rm_wait_step(), so a wake
++ * that lands after the check is not lost (0 without the event).
++ */
++uint64_t nvkmd_rm_wait_gen(struct nvkmd_rm_dev *dev);
+ 
+ /* Brackets a CPU wait loop (before its first check of the value) so a
+  * CPU-side signal knows to kick the event; pending: the loop waits for
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index e3cb3955..a738c0c0 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -631,9 +631,41 @@ nvkmd_rm_sleep_us(uint64_t us)
+    os_time_sleep(us);
+ }
+ 
++/* NVK_RM_EVENT_GEN (default on with a librmclient that has it): CPU waits
++ * use librmclient's wake generations, which lose no wake when several
++ * threads wait (crm_win_event_wait_gen); =0 is the shared-event wait,
++ * where the first waiter to wake resets the event under the others (CS2 on
++ * 405.22: ~650 of ~900 event waits a second ended by the poll timeout).
++ */
++static bool
++nvkmd_rm_event_gen_on(const struct nvkmd_rm_dev *dev)
++{
++#ifndef _WIN32
++   /* The generation waits exist on Windows only (-ENOSYS elsewhere) */
++   return false;
++#endif
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      s = debug_get_bool_option("NVK_RM_EVENT_GEN", true) ? 2 : 1;
++      p_atomic_set(&state, s);
++   }
++   return s == 2 && dev->lib->win_event_gen != NULL &&
++          dev->lib->win_event_wait_gen != NULL;
++}
++
++uint64_t
++nvkmd_rm_wait_gen(struct nvkmd_rm_dev *dev)
++{
++   uint64_t gen = 0;
++   if (dev != NULL && dev->nonstall_fd >= 0 && nvkmd_rm_event_gen_on(dev))
++      dev->lib->win_event_gen(dev->nonstall_fd, &gen);
++   return gen;
++}
++
+ VkResult
+ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+-                   uint64_t abs_timeout_ns)
++                   uint64_t abs_timeout_ns, uint64_t gen)
+ {
+    /* Nothing will ever signal on a lost device, and every CPU wait polls
+     * memory the KMD may have unmapped. */
+@@ -661,8 +693,9 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+       const uint32_t ms = MIN2(remaining_ns / 1000000 + 1,
+                                NVKMD_RM_WAIT_POLL_MS);
+       const uint64_t t0 = os_time_get_nano();
+-      const int waited = dev->lib->event_wait(dev->client, dev->nonstall_fd,
+-                                              ms);
++      const int waited = nvkmd_rm_event_gen_on(dev) ?
++         dev->lib->win_event_wait_gen(dev->nonstall_fd, gen, ms) :
++         dev->lib->event_wait(dev->client, dev->nonstall_fd, ms);
+       nvkmd_rm_wait_stat(NVKMD_RM_WAIT_SITE_EVENT, os_time_get_nano() - t0,
+                          waited == 0);
+       if (waited < 0) {
+@@ -718,12 +751,13 @@ nvkmd_rm_wait_value(struct nvkmd_rm_dev *dev,
+          result = VK_ERROR_DEVICE_LOST;
+          break;
+       }
++      const uint64_t gen = nvkmd_rm_wait_gen(dev);
+       if (p_atomic_read(value) >= wait_value) {
+          result = VK_SUCCESS;
+          break;
+       }
+ 
+-      result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns);
++      result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns, gen);
+       if (result != VK_SUCCESS)
+          break;
+    }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index 7c07109f..e795be1a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -389,6 +389,8 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_scanout_wait_released,  "crm_win_scanout_wait_released",  false);
+    LOAD(win_loss_epoch,             "crm_win_loss_epoch",             false);
+    LOAD(win_event_kick,             "crm_win_event_kick",             false);
++   LOAD(win_event_gen,              "crm_win_event_gen",              false);
++   LOAD(win_event_wait_gen,         "crm_win_event_wait_gen",         false);
+ 
+    LOAD(event_wait,   "crm_event_wait",   false);
+    LOAD(alloc_pages,  "crm_alloc_pages",  false);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+index 97818d2c..b190ecc5 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -273,6 +273,7 @@ nvkmd_rm_sync_wait_many(struct vk_device *device,
+          break;
+       }
+ 
++      const uint64_t gen = nvkmd_rm_wait_gen(dev);
+       bool all = true, any = false;
+       for (uint32_t i = 0; i < wait_count; i++) {
+          if (wait_satisfied(&waits[i], wait_flags))
+@@ -286,7 +287,7 @@ nvkmd_rm_sync_wait_many(struct vk_device *device,
+          break;
+       }
+ 
+-      result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns);
++      result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns, gen);
+       if (result != VK_SUCCESS)
+          break;
+ 

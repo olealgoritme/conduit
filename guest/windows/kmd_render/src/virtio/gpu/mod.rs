@@ -61,7 +61,9 @@ use wdk_sys::ntddk::{
 };
 use wdk_sys::{KEVENT, PVOID};
 
+mod cursor_ring;
 mod nvrm_events;
+pub use cursor_ring::CursorPoll;
 mod nvrm_tables;
 mod resource_tables;
 mod rm_gates;
@@ -2089,6 +2091,126 @@ struct WddmPending {
     /// dependency STRICTER — it would install a NEWER `next_wire_fence` — so it is
     /// forbidden rather than merely pointless.
     rebased: bool,
+    /// Interrupt time (100 ns) the entry was queued at SubmitCommand, for the
+    /// queue-depth / hold-time counters (`publish_wddm_queue_counters`).
+    queued_100ns: u64,
+    /// The WDDM node it was submitted on (`D3d12Node`); completion is in order
+    /// per node.
+    node: u8,
+}
+
+// ---- WDDM nodes (`D3d12Node`) ---------------------------------------------------
+//
+// With `D3d12Node` = 1 the adapter reports two 3D nodes: node 0 for everything it
+// had before (DWM, D3D11, presents, paging) and node 1 for the D3D12 UMD's
+// contexts (it asks for node 1 at CreateContext, `Umd12ContextNode`). Every node
+// has its own SubmissionFenceId sequence and its own in-order completion, so a
+// D3D12 batch waiting for its RM fence no longer holds back DWM's packets, and a
+// slow present no longer holds back the D3D12 batches behind it: the pending
+// FIFO stays one queue, but each node completes from its own first entry.
+/// Most WDDM nodes this driver can report.
+pub const MAX_WDDM_NODES: usize = 2;
+/// WDDM nodes reported, fixed when the caps were answered (AddAdapter).
+pub static WDDM_NODE_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// Nodes reported now (1 or 2).
+pub fn wddm_node_count() -> u32 {
+    WDDM_NODE_COUNT
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_WDDM_NODES as u32)
+}
+
+/// Whether `node` is one this adapter reported.
+pub fn wddm_node_valid(node: u32) -> bool {
+    node < wddm_node_count()
+}
+
+/// `node` if reported, else 0 (dxgkrnl only names reported nodes; this keeps an
+/// impossible one from indexing past the per-node state).
+pub fn wddm_node_of(node: u32) -> u32 {
+    if wddm_node_valid(node) {
+        node
+    } else {
+        0
+    }
+}
+
+// ---- WDDM queue depth and hold time (`Qd*`) -----------------------------------
+//
+// Whether the D3D12-on-NVK HE12 v4 packets (the ExecuteCommandLists batches whose
+// completion waits for their RM fence) are paced by their OWN work or by the
+// adapter-global, head-of-line FIFO: how many entries are pending at each
+// SubmitCommand, and for each popped execution packet how long it waited BEHIND
+// earlier entries before reaching the head, how long it then waited AS HEAD for
+// its own completion, and whether what was ahead of it was another execution
+// packet or something else (a present, DWM's work). Atomics only; mirrored by
+// `publish_wddm_queue_counters`.
+/// `QdMax`: most entries pending at a SubmitCommand (this one included).
+pub static QD_MAX: AtomicU32 = AtomicU32::new(0);
+/// `QdSum` / `QdN`: sum of the pending counts at SubmitCommand, and how many.
+pub static QD_SUM: AtomicU32 = AtomicU32::new(0);
+pub static QD_N: AtomicU32 = AtomicU32::new(0);
+/// `QdExMax`: most entries pending at an execution packet's SubmitCommand.
+pub static QD_EX_MAX: AtomicU32 = AtomicU32::new(0);
+/// `QdExN`: execution packets popped (completed through the FIFO).
+pub static QD_EX_N: AtomicU32 = AtomicU32::new(0);
+/// `QdExOwnUs` / `QdExBhUs`: their summed time as head (own completion) and
+/// behind earlier entries, in microseconds (wrapping u32 sums; read deltas).
+pub static QD_EX_OWN_US: AtomicU32 = AtomicU32::new(0);
+pub static QD_EX_BEHIND_US: AtomicU32 = AtomicU32::new(0);
+/// `QdExBhOth`: execution packets that waited behind a non-execution entry.
+pub static QD_EX_BEHIND_OTHER: AtomicU32 = AtomicU32::new(0);
+/// `QdExO*`: execution packets' as-head time histogram (<50 us, <200 us, <1 ms,
+/// <2 ms, <5 ms, <20 ms, >= 20 ms) and `QdExB*` the behind time histogram.
+pub static QD_EX_OWN_HIST: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+pub static QD_EX_BEHIND_HIST: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+
+fn qd_bucket(us: u64) -> usize {
+    const BOUNDS: [u64; 6] = [50, 200, 1000, 2000, 5000, 20000];
+    BOUNDS.iter().position(|&b| us < b).unwrap_or(BOUNDS.len())
+}
+
+fn qd_now_100ns() -> u64 {
+    let mut qpc_timestamp = 0;
+    // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read legal at any IRQL.
+    unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) }
+}
+
+fn qd_note_submit(pending_after: usize, execution: bool) {
+    let depth = u32::try_from(pending_after).unwrap_or(u32::MAX);
+    QD_MAX.fetch_max(depth, Ordering::Relaxed);
+    if execution {
+        QD_EX_MAX.fetch_max(depth, Ordering::Relaxed);
+    }
+    QD_SUM.fetch_add(depth, Ordering::Relaxed);
+    QD_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Mirror the `Qd*` counters to the registry. PASSIVE only.
+pub fn publish_wddm_queue_counters() {
+    use crate::diag::record_named_bytes as rec;
+    rec(b"QdMax", QD_MAX.load(Ordering::Relaxed));
+    rec(b"QdSum", QD_SUM.load(Ordering::Relaxed));
+    rec(b"QdN", QD_N.load(Ordering::Relaxed));
+    rec(b"QdExMax", QD_EX_MAX.load(Ordering::Relaxed));
+    rec(b"QdExN", QD_EX_N.load(Ordering::Relaxed));
+    rec(b"QdExOwnUs", QD_EX_OWN_US.load(Ordering::Relaxed));
+    rec(b"QdExBhUs", QD_EX_BEHIND_US.load(Ordering::Relaxed));
+    rec(b"QdExBhOth", QD_EX_BEHIND_OTHER.load(Ordering::Relaxed));
+    rec(b"QdExO50", QD_EX_OWN_HIST[0].load(Ordering::Relaxed));
+    rec(b"QdExO200", QD_EX_OWN_HIST[1].load(Ordering::Relaxed));
+    rec(b"QdExO1k", QD_EX_OWN_HIST[2].load(Ordering::Relaxed));
+    rec(b"QdExO2k", QD_EX_OWN_HIST[3].load(Ordering::Relaxed));
+    rec(b"QdExO5k", QD_EX_OWN_HIST[4].load(Ordering::Relaxed));
+    rec(b"QdExO20k", QD_EX_OWN_HIST[5].load(Ordering::Relaxed));
+    rec(b"QdExOBig", QD_EX_OWN_HIST[6].load(Ordering::Relaxed));
+    rec(b"QdExB50", QD_EX_BEHIND_HIST[0].load(Ordering::Relaxed));
+    rec(b"QdExB200", QD_EX_BEHIND_HIST[1].load(Ordering::Relaxed));
+    rec(b"QdExB1k", QD_EX_BEHIND_HIST[2].load(Ordering::Relaxed));
+    rec(b"QdExB2k", QD_EX_BEHIND_HIST[3].load(Ordering::Relaxed));
+    rec(b"QdExB5k", QD_EX_BEHIND_HIST[4].load(Ordering::Relaxed));
+    rec(b"QdExB20k", QD_EX_BEHIND_HIST[5].load(Ordering::Relaxed));
+    rec(b"QdExBBig", QD_EX_BEHIND_HIST[6].load(Ordering::Relaxed));
 }
 
 /// One WDDM submission represents every WindowedBlt terminal for the same
@@ -2263,6 +2385,11 @@ impl WddmReady {
         self.pending.fence
     }
 
+    /// The WDDM node the fence belongs to (`D3d12Node`).
+    pub fn node(&self) -> u32 {
+        u32::from(self.pending.node)
+    }
+
     /// Whether this fence was released by the `WddmHeadMs` rebase (its tagged
     /// dependency replaced by the conservative wire prefix). Read-only; the flush-gate
     /// trace records it.
@@ -2386,6 +2513,9 @@ pub struct VirtioGpu {
     /// `EventReady` arrives. `None` if the queue could not be brought up: then
     /// events are unsupported. See `nvrm_events`.
     nvrm_event_ring: Option<Box<nvrm_events::EventRing>>,
+    /// The cursor queue (virtqueue 2, `cursor_ring`): the hardware cursor's commands off the
+    /// control queue. `None` when the host or the VMM has none, or `HwCursorQ` is 0.
+    cursor_ring: Option<Box<cursor_ring::CursorRing>>,
     /// Usermode events registered against RM handles (and `TRANSPORT_LOST`),
     /// reserved at init so no registration allocates under the spinlock. Each
     /// holds an object reference that only a PASSIVE caller may drop: every
@@ -2398,6 +2528,10 @@ pub struct VirtioGpu {
     /// up: `ScanoutReleased` messages are consumed (`nvrm_events`) and the consumers of
     /// them (`virtio/scanout_release.rs`) are live. Fixed for the transport's life.
     scanout_release: bool,
+    /// The host's presentation feedback (`NVGPU_F_SCANOUT_PRESENTED`, `FlipDoneHost`) was acked
+    /// AND the event queue is up: `ScanoutPresented` messages go to `ddi::host_flip_done`.
+    /// Fixed for the transport's life.
+    scanout_presented: bool,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
     /// teardown. Starts at 1024 slots and grows (PASSIVE, outside the lock:
@@ -2561,6 +2695,12 @@ pub struct VirtioGpu {
     /// WDDM submissions pending on venus completion, FIFO (capacity
     /// MAX_WDDM_PENDING, reserved at init).
     wddm_pending: VecDeque<WddmPending>,
+    /// `Qd*`: when the last FIFO entry was popped (100 ns; the next entry
+    /// became head then) and whether it was an execution packet.
+    qd_last_pop_100ns: [u64; MAX_WDDM_NODES],
+    qd_last_pop_execution: [bool; MAX_WDDM_NODES],
+    /// The node `take_one_ready_wddm` tries first (alternates).
+    wddm_next_node: u8,
     /// Bounded two-phase WindowedBlt transactions. Both deques reserve at
     /// StartDevice, so Present/Submit/DPC mutations never allocate under the
     /// virtio spinlock.
@@ -2763,6 +2903,8 @@ impl VirtioGpu {
         dxgkrnl: &DXGKRNL_INTERFACE,
         msi_granted: u32,
         scanout_release: bool,
+        scanout_presented: bool,
+        cursor_queue: bool,
     ) -> Result<Box<Self>, VirtioError> {
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
         // A miniport doesn't own the bus, so config space is reached via the
@@ -2805,15 +2947,23 @@ impl VirtioGpu {
         // only with the display half, see `StartDevice`). A device that refuses the
         // larger set is retried once with the required one: an optional feature never
         // costs the transport.
+        // The presentation feedback only with `FlipDoneHost` (the caller's `scanout_presented`).
         let accepted = negotiate_features(
             &mut transport,
-            if scanout_release {
-                CONDUIT_OPTIONAL_FEATURES
-            } else {
-                0
-            },
+            CONDUIT_OPTIONAL_FEATURES
+                & ((if scanout_release {
+                    helios_protocol::NVGPU_F_SCANOUT_RELEASE
+                } else {
+                    0
+                }) | (if scanout_presented {
+                    helios_protocol::NVGPU_F_SCANOUT_PRESENTED
+                } else {
+                    0
+                })),
         )?;
         let scanout_release_acked = accepted & helios_protocol::NVGPU_F_SCANOUT_RELEASE != 0;
+        let scanout_presented_acked =
+            accepted & helios_protocol::NVGPU_F_SCANOUT_PRESENTED != 0;
         // 1 when the host's buffer-release event was acked, 0 when not offered / not wanted.
         crate::diag::record_named_bytes(b"RelAck", u32::from(scanout_release_acked));
 
@@ -2866,6 +3016,15 @@ impl VirtioGpu {
         let nvrm_event_ring = nvrm_events::new_event_ring(passive, &mut transport);
         // 1 when the event queue is up, 0 when RM events are unsupported.
         crate::diag::record_named_bytes(b"NvEvQ", u32::from(nvrm_event_ring.is_some()));
+        // The cursor queue (index 2): only when the caller wants it (`HwCursorQ`), the host
+        // announces it and the device has the queue. No MSI-X vector: it is polled.
+        let cursor_ring = if cursor_queue
+            && cfg_features & helios_protocol::NVGPU_CFG_CURSOR_QUEUE != 0
+        {
+            cursor_ring::new_cursor_ring(passive, &mut transport)
+        } else {
+            None
+        };
         // Message-signalled interrupts: when the OS connected messages instead of
         // the INTx line (`msi_granted != 0`), the device's vectors must be
         // programmed BEFORE DRIVER_OK, for exactly the queues that exist. A device
@@ -3091,6 +3250,8 @@ impl VirtioGpu {
         // stay off. `RelNoQ` = 1 names that case (the host then keeps bookkeeping it can
         // never deliver on; it retries every 2 ms and drops nothing important).
         let scanout_release_on = scanout_release_acked && nvrm_event_ring.is_some();
+        // Likewise the presentation feedback (`FdhAck` says whether it is live).
+        let scanout_presented_on = scanout_presented_acked && nvrm_event_ring.is_some();
         if scanout_release_acked && !scanout_release_on {
             crate::diag::record_named_bytes(b"RelNoQ", 1);
         }
@@ -3115,9 +3276,11 @@ impl VirtioGpu {
             contexts_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
             nvrm_event_ring,
+            cursor_ring,
             nvrm_events,
             cfg_features,
             scanout_release: scanout_release_on,
+            scanout_presented: scanout_presented_on,
             nvrm_handles: Vec::with_capacity(nvrm_limits.handle_bounds.initial),
             nvrm_reserved: 0,
             nvrm_clients: nvrm_tables::new_client_table(),
@@ -3174,6 +3337,9 @@ impl VirtioGpu {
             next_wire_fence: wire_fence_base,
             wire_fence_base,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
+            qd_last_pop_100ns: [0; MAX_WDDM_NODES],
+            qd_last_pop_execution: [false; MAX_WDDM_NODES],
+            wddm_next_node: 0,
             windowed_blt: WindowedBltState::new(),
             blt_async: blt_async::BltAsyncState::new(),
             // Snapshotted at transport init like every other knob, so
@@ -5629,6 +5795,10 @@ impl VirtioGpu {
                                         crate::ddi::stall_diag::note_published(
                                             notify.primary_address,
                                         );
+                                        // `FlipDoneHost`: a kept picture is never reported.
+                                        crate::ddi::host_flip_done::note_kept(
+                                            notify.primary_address,
+                                        );
                                     }
                                     crate::ddi::flip_keep::count(
                                         helios_kmd_logic::flip_completion::KeepWhy::AsyncCopyFailed,
@@ -7875,9 +8045,21 @@ impl VirtioGpu {
     pub fn terminal_abandon_wddm_epoch(
         &mut self,
         _order: &crate::adapter::NotifyOrdered<'_>,
+        // `Some(node)`: only that node's entries (ResetEngine, `D3d12Node`);
+        // `None`: every node (ResetFromTimeout).
+        node: Option<u32>,
     ) -> u32 {
-        let n = self.wddm_pending.len() as u32;
-        while let Some(pending) = self.wddm_pending.pop_front() {
+        let mut n = 0u32;
+        let mut i = 0;
+        while i < self.wddm_pending.len() {
+            if node.is_some_and(|node| u32::from(self.wddm_pending[i].node) != node) {
+                i += 1;
+                continue;
+            }
+            let Some(pending) = self.wddm_pending.remove(i) else {
+                break;
+            };
+            n += 1;
             if let Some(prefix) = pending
                 .blt_token
                 .zip(pending.blt_stream_boundary)
@@ -7885,6 +8067,11 @@ impl VirtioGpu {
             {
                 self.abandon_windowed_blt_wddm_prefix(prefix);
             }
+        }
+        // The WindowedBlt ledger is node 0's (presents); a D3D12-node reset
+        // leaves it.
+        if node.is_some_and(|node| node != 0) {
+            return n;
         }
         while let Some((token, boundary, adapter)) =
             self.windowed_blt.pending.iter().find_map(|request| {
@@ -8069,7 +8256,10 @@ impl VirtioGpu {
         // `GdiAccel`: the GDI job sequence (`ddi/gdi_exec.rs`) this packet's commands are; the
         // fence waits until the executor's watermark reaches it.
         gdi_seq: Option<u64>,
+        // The WDDM node (`D3d12Node`); 0 unless the adapter reports two.
+        node: u32,
     ) -> bool {
+        let node = node.min(MAX_WDDM_NODES as u32 - 1) as u8;
         if self.failed {
             // Transport failure is not producer completion. Let the scheduler
             // reset the failed epoch; never advance its successful watermark.
@@ -8339,7 +8529,7 @@ impl VirtioGpu {
             (None, _) => true,
             _ => false,
         };
-        if self.wddm_pending.is_empty()
+        if !self.wddm_pending.iter().any(|pending| pending.node == node)
             && self.wire_boundary_ready(watermark, domain, wire_boundary)
             && stream_ready
             && execution.map_or(true, |wait| wait.completed())
@@ -8356,8 +8546,13 @@ impl VirtioGpu {
             // the exact terminal prefix.
             && blt_token.is_none()
         {
+            qd_note_submit(1, d3d12);
             return true;
         }
+        qd_note_submit(
+            self.wddm_pending.iter().filter(|pending| pending.node == node).count() + 1,
+            execution.is_some(),
+        );
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
             // Losing a pending boundary cannot complete any of its successors.
             // Fail the transport and retain the FIFO until scheduler reset.
@@ -8378,6 +8573,8 @@ impl VirtioGpu {
             head_deadline_100ns: 0,
             rebased: false,
             gdi_seq,
+            queued_100ns: qd_now_100ns(),
+            node,
         });
         false
     }
@@ -8507,9 +8704,41 @@ impl VirtioGpu {
         if self.failed {
             return WddmTake::BlockedOnProducer;
         }
+        // Each node completes from its own first entry (`D3d12Node`); with one
+        // node this is exactly the old single-head FIFO. The start alternates so
+        // a node that is always ready cannot starve the other within a drain.
+        let nodes = wddm_node_count() as u8;
+        let first = self.wddm_next_node % nodes;
+        self.wddm_next_node = (first + 1) % nodes;
+        let mut blocked = false;
+        for k in 0..nodes {
+            let node = (first + k) % nodes;
+            match self.take_one_ready_wddm_node(node) {
+                WddmTake::Ready(ready) => return WddmTake::Ready(ready),
+                WddmTake::BlockedOnProducer => blocked = true,
+                WddmTake::Empty => {}
+            }
+        }
+        if blocked {
+            WddmTake::BlockedOnProducer
+        } else {
+            WddmTake::Empty
+        }
+    }
+
+    /// The first pending entry of `node`.
+    fn wddm_head_index(&self, node: u8) -> Option<usize> {
+        self.wddm_pending.iter().position(|pending| pending.node == node)
+    }
+
+    /// [`Self::take_one_ready_wddm`] for one node's head.
+    fn take_one_ready_wddm_node(&mut self, node: u8) -> WddmTake {
+        let Some(head_index) = self.wddm_head_index(node) else {
+            return WddmTake::Empty;
+        };
         if self
             .wddm_pending
-            .front()
+            .get(head_index)
             .and_then(|head| head.execution)
             .is_some_and(|wait| !wait.completed())
         {
@@ -8537,7 +8766,7 @@ impl VirtioGpu {
                 hold_until,
                 gdi_seq,
             ) = {
-                let Some(head) = self.wddm_pending.front() else {
+                let Some(head) = self.wddm_pending.get(head_index) else {
                     return WddmTake::Empty;
                 };
                 (
@@ -8570,7 +8799,7 @@ impl VirtioGpu {
             }
             if !stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary)) {
                 WDDM_HEAD_BLOCKED_STREAM.fetch_add(1, Ordering::Relaxed);
-                if pass == 1 && self.rebase_blocked_head(RebaseArm::Stream) {
+                if pass == 1 && self.rebase_blocked_head(RebaseArm::Stream, head_index) {
                     continue;
                 }
                 return WddmTake::BlockedOnProducer;
@@ -8583,7 +8812,7 @@ impl VirtioGpu {
                 _ => false,
             } {
                 WDDM_HEAD_BLOCKED_BLT.fetch_add(1, Ordering::Relaxed);
-                if pass == 1 && self.rebase_blocked_head(RebaseArm::Blt) {
+                if pass == 1 && self.rebase_blocked_head(RebaseArm::Blt, head_index) {
                     continue;
                 }
                 return WddmTake::BlockedOnProducer;
@@ -8614,9 +8843,30 @@ impl VirtioGpu {
                     return WddmTake::BlockedOnProducer;
                 }
             }
-            let Some(pending) = self.wddm_pending.pop_front() else {
+            let Some(pending) = self.wddm_pending.remove(head_index) else {
                 return WddmTake::Empty;
             };
+            {
+                // `Qd*`: behind = queued until it became head (the previous pop),
+                // own = head until now.
+                let now = qd_now_100ns();
+                let n = usize::from(node);
+                let became_head = pending.queued_100ns.max(self.qd_last_pop_100ns[n]).min(now);
+                if pending.execution.is_some() {
+                    let behind_us = became_head.saturating_sub(pending.queued_100ns) / 10;
+                    let own_us = now.saturating_sub(became_head) / 10;
+                    QD_EX_N.fetch_add(1, Ordering::Relaxed);
+                    QD_EX_OWN_US.fetch_add(own_us as u32, Ordering::Relaxed);
+                    QD_EX_BEHIND_US.fetch_add(behind_us as u32, Ordering::Relaxed);
+                    QD_EX_OWN_HIST[qd_bucket(own_us)].fetch_add(1, Ordering::Relaxed);
+                    QD_EX_BEHIND_HIST[qd_bucket(behind_us)].fetch_add(1, Ordering::Relaxed);
+                    if behind_us != 0 && !self.qd_last_pop_execution[n] {
+                        QD_EX_BEHIND_OTHER.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.qd_last_pop_100ns[n] = now;
+                self.qd_last_pop_execution[n] = pending.execution.is_some();
+            }
             let terminal_prefix = match (blt_token, blt_stream_boundary) {
                 (Some(token), Some(boundary)) => WindowedBltTerminalPrefix::new(token, boundary),
                 _ => None,
@@ -8680,12 +8930,12 @@ impl VirtioGpu {
     /// in costs one relaxed `fetch_add` on the path that already writes three of
     /// them, and turns an undiagnosable price tag into an attributed one
     /// (`WfBRebS`/`WfBRebB`, which partition `WfBReb`).
-    fn rebase_blocked_head(&mut self, arm: RebaseArm) -> bool {
+    fn rebase_blocked_head(&mut self, arm: RebaseArm, head_index: usize) -> bool {
         // Exact execution packets must preserve every completion obligation,
         // including a Present copy batched beside the ECL tail.
         if self
             .wddm_pending
-            .front()
+            .get(head_index)
             .is_some_and(|head| head.execution.is_some())
         {
             return false;
@@ -8702,7 +8952,7 @@ impl VirtioGpu {
         // Read before the mutable borrow of the FIFO below.
         let rebase_watermark = self.next_wire_fence;
         let abandoned_prefix = {
-            let Some(head) = self.wddm_pending.front_mut() else {
+            let Some(head) = self.wddm_pending.get_mut(head_index) else {
                 return false;
             };
             // The arm/wait/expire state machine is
@@ -8788,9 +9038,25 @@ impl VirtioGpu {
     /// unfinished DMA buffers with fresh fence ids after the preempt completes;
     /// the underlying venus work keeps executing host-side). Returns the count
     /// dropped.
-    pub fn preempt_flush(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> u32 {
-        let n = self.wddm_pending.len() as u32;
-        self.wddm_pending.clear();
+    pub fn preempt_flush(
+        &mut self,
+        _order: &crate::adapter::NotifyOrdered<'_>,
+        // `Some(node)`: only that node's entries (`D3d12Node`); `None`: all.
+        node: Option<u32>,
+    ) -> u32 {
+        let before = self.wddm_pending.len();
+        match node {
+            None => self.wddm_pending.clear(),
+            Some(node) => self
+                .wddm_pending
+                .retain(|pending| u32::from(pending.node) != node),
+        }
+        let n = (before - self.wddm_pending.len()) as u32;
+        // WindowedBlt admission is node 0's (presents); a D3D12-node preempt
+        // leaves it.
+        if node.is_some_and(|node| node != 0) {
+            return n;
+        }
         // Scheduler residency admission was revoked. A request that has not
         // reached ring 1 must await the resubmitted DMA buffer's exact token;
         // dispatching it merely because its producer happened to retire would

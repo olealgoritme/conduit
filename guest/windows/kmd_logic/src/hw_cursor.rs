@@ -36,7 +36,29 @@ pub const FLAG_MASKED_COLOR: u32 = 1 << 2;
 /// `DXGK_DRIVERCAPS.PointerCaps` with the pointer on: all three.
 pub const POINTER_CAPS: u32 = FLAG_MONOCHROME | FLAG_COLOR | FLAG_MASKED_COLOR;
 
-/// `HwCursor` values. Absent is [`KNOB_ON`].
+/// `HwCursor` when the value is absent: [`KNOB_OFF`] (no pointer reported, dxgkrnl's software
+/// cursor). dxgkrnl has not used the reported pointer on this adapter (403.1: no SetPointerShape
+/// call with the pointer reported), and reporting it cost every shape and visibility change a
+/// blocking round trip and Heaven ten times the hitches. `HwCursor=1` reports it, for
+/// experiments (docs/independent-flip.md 12.3b).
+pub const KNOB_DEFAULT: u32 = KNOB_OFF;
+
+/// `HwCursor` when the value is absent, given the raw `IndepFlip` value: [`KNOB_ON`] when
+/// independent flip is advertised, else [`KNOB_DEFAULT`]. 405.8 rows (CS2 fullscreen, promoted
+/// to independent flip): with no pointer reported the first independent-flip present never
+/// completed (one frame, then frozen); with `HwCursor=1` the same run reached "Hardware:
+/// Independent Flip" at 37.8 fps against 32.8 composed. Without independent flip the composed
+/// desktop keeps 0, where reporting the pointer cost Heaven ten times the hitches. An explicit
+/// `HwCursor` value always wins.
+pub const fn knob_default_for(indep_flip_raw: u32) -> u32 {
+    if indep_flip_raw != 0 {
+        KNOB_ON
+    } else {
+        KNOB_DEFAULT
+    }
+}
+
+/// `HwCursor` values.
 pub const KNOB_OFF: u32 = 0;
 pub const KNOB_ON: u32 = 1;
 /// Advertise even when the host does not say it serves the cursor (bring-up: every shape then
@@ -327,8 +349,52 @@ impl Slots {
     }
 }
 
-/// Counter names (`kmd_render/src/ddi/hw_cursor.rs`), at most 14 characters.
-pub const COUNTERS: [&str; 12] = [
+/// How a cursor command the host did not answer with success failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostFailure {
+    /// The host answered with an error: it cannot serve the command (an old backend).
+    Refused,
+    /// No answer within the timeout. The command is on the queue and the host runs it later (the
+    /// control queue is in order and shared with every Venus `GpuCmd`: a busy backend delays it).
+    Late,
+    /// The command never reached the queue (full, or the transport is going away).
+    NotSent,
+}
+
+/// What the KMD does about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterFailure {
+    /// Leave the shape to dxgkrnl's software cursor (and hide the host image). Only for a refusal:
+    /// the host will never show it.
+    SoftwareCursor,
+    /// Treat it as done: the host shows it when it gets to it. Falling back to software here
+    /// hid a working host cursor and left the pointer to DWM's frames, which froze it for as long
+    /// as the backend was busy (397.1, after Basemark).
+    AssumeTaken,
+    /// Keep the host image as it is and send again later ([`retry_due`]).
+    RetryLater,
+}
+
+pub const fn after_failure(f: HostFailure) -> AfterFailure {
+    match f {
+        HostFailure::Refused => AfterFailure::SoftwareCursor,
+        HostFailure::Late => AfterFailure::AssumeTaken,
+        HostFailure::NotSent => AfterFailure::RetryLater,
+    }
+}
+
+/// A command that was not sent is tried again from a position call at most this often (250 ms):
+/// a position call runs at mouse rate and must not wait on a full queue every time.
+pub const RETRY_AFTER_100NS: u64 = 2_500_000;
+
+/// Whether a position call should try an owed command again (`last_try` 0: never tried).
+pub const fn retry_due(now: u64, last_try: u64) -> bool {
+    last_try == 0 || now.saturating_sub(last_try) >= RETRY_AFTER_100NS
+}
+
+/// Counter names (`kmd_render/src/ddi/hw_cursor.rs`), at most 14 characters, in the order the
+/// driver writes them.
+pub const COUNTERS: [&str; 30] = [
     "CurKnob",
     "CurCaps",
     "CurShapeN",
@@ -341,6 +407,24 @@ pub const COUNTERS: [&str; 12] = [
     "CurWhy",
     "CurHostErr",
     "CurXor",
+    "CurRttUs",  // the last cursor command's round trip, microseconds
+    "CurRttMax", // its maximum
+    "CurTmo",    // commands that timed out (assumed taken: the host runs them late)
+    "CurGateMs", // the longest a shape waited for another pointer operation's I/O, ms
+    "CurSwN",    // software-cursor episodes (a refused shape until the host shows one again)
+    "CurSwMs",   // the last episode's length, ms
+    "CurSwMax",  // the longest, ms
+    "CurRetry",  // commands sent again after one that never reached the queue
+    "CurQ",      // 1: the commands go on the cursor queue (virtqueue 2), 0: the control queue
+    "CurQBusy",  // cursor-queue sends deferred: the previous command was still out
+    "CurQSent",  // commands sent on the cursor queue
+    "CurDdiS",   // DxgkDdiSetPointerShape calls that reached the display half (before the caps)
+    "CurDdiP",   // DxgkDdiSetPointerPosition calls likewise
+    "CurPosVis", // ... of them with Flags.Visible set
+    "CurPosHid", // ... with it clear
+    "CurPosSrc", // the last one's VidPnSourceId
+    "CurCapQn",  // DXGK_DRIVERCAPS queries (never reset)
+    "CurCapRep", // what the last one reported (bit 0 pointer, 1 host known, 4..7 knob, 8 display, 16.. caps)
 ];
 
 #[cfg(test)]
@@ -385,6 +469,18 @@ mod tests {
             "cursor off"
         );
         assert!(advertise(KNOB_ON, true, None), "transport not up: the knob");
+        assert!(
+            !advertise(KNOB_DEFAULT, true, Some(host)),
+            "absent: no pointer reported"
+        );
+        assert!(
+            advertise(knob_default_for(1), true, Some(host)),
+            "absent with independent flip: the pointer is reported"
+        );
+        assert!(
+            !advertise(knob_default_for(0), true, Some(host)),
+            "absent without independent flip: no pointer"
+        );
         assert!(!advertise(KNOB_OFF, true, Some(host)));
         assert!(
             !advertise(KNOB_ON, false, Some(host)),
@@ -526,6 +622,26 @@ mod tests {
             "the image does not fit"
         );
         assert!(Slots::new(u64::MAX, 1024, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn only_a_refusal_falls_back_to_the_software_cursor() {
+        assert_eq!(
+            after_failure(HostFailure::Refused),
+            AfterFailure::SoftwareCursor
+        );
+        assert_eq!(after_failure(HostFailure::Late), AfterFailure::AssumeTaken);
+        assert_eq!(
+            after_failure(HostFailure::NotSent),
+            AfterFailure::RetryLater
+        );
+    }
+
+    #[test]
+    fn a_retry_waits_a_quarter_second() {
+        assert!(retry_due(10, 0));
+        assert!(!retry_due(RETRY_AFTER_100NS, 1));
+        assert!(retry_due(RETRY_AFTER_100NS + 1, 1));
     }
 
     #[test]

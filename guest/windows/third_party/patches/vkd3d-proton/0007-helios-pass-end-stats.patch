@@ -1,0 +1,160 @@
+Helios vkd3d-proton fork: render-pass end statistics by caller
+
+Conduit Basemark D3D12 on NVK: NVK_PASS_PROFILE shows hundreds of Vulkan
+render passes a frame (331 one-draw 960x540 passes, ~11 full G-buffer and
+~34 shadow passes). Which vkd3d calls end them? Applied after 0006.
+
+- d3d12_command_list_end_current_render_pass is a macro naming its caller
+  (__func__, __LINE__); the function is ..._at.
+- HELIOS_VKD3D_PASS_END_STATS=1 (off by default): every call that ends or
+  suspends an ACTIVE pass is counted per caller site, and every pass begun
+  is counted; every two seconds the vkd3d log gets the window's top 24
+  sites ("Helios pass ends: N ends M suspends func:line") and the totals.
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 62921ada..57423e57 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -6716,12 +6716,114 @@ static void d3d12_command_list_end_rendering(struct d3d12_command_list *list)
+     list->rendering_info.state_flags &= ~VKD3D_RENDERING_NEW_INSTANCE_ON_END_RENDERING;
+ }
+ 
+-void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list, bool suspend)
++/* Helios: which calls actually end (or suspend) an active render pass, by
++ * caller function and line (HELIOS_VKD3D_PASS_END_STATS=1, off by default).
++ * Every two seconds the vkd3d log gets the callers that ended passes in that
++ * window, most first, split into ends and suspends, plus the passes begun.
++ * For finding what splits a D3D12 frame into hundreds of Vulkan passes. */
++#define HELIOS_PASS_END_SITES 128u
++static struct
++{
++    pthread_mutex_t lock;
++    int enabled;
++    uint64_t window_start_ns;
++    uint64_t begins;
++    unsigned int count;
++    struct
++    {
++        const char *func;
++        int line;
++        uint64_t ends, suspends;
++    } site[HELIOS_PASS_END_SITES];
++} helios_pass_ends = { PTHREAD_MUTEX_INITIALIZER, -1 };
++
++static bool helios_pass_end_stats_on(void)
++{
++    char env[8];
++    if (helios_pass_ends.enabled < 0)
++        helios_pass_ends.enabled = vkd3d_get_env_var("HELIOS_VKD3D_PASS_END_STATS", env, sizeof(env)) &&
++                env[0] == '1';
++    return helios_pass_ends.enabled > 0;
++}
++
++static int helios_pass_end_cmp(const void *a, const void *b)
++{
++    const uint64_t na = ((const uint64_t *)a)[0], nb = ((const uint64_t *)b)[0];
++    return na < nb ? 1 : na > nb ? -1 : 0;
++}
++
++static void helios_pass_end_log_locked(uint64_t now)
++{
++    uint64_t order[HELIOS_PASS_END_SITES][2];
++    uint64_t total = 0;
++    unsigned int i, n = helios_pass_ends.count;
++    for (i = 0; i < n; i++)
++    {
++        order[i][0] = helios_pass_ends.site[i].ends + helios_pass_ends.site[i].suspends;
++        order[i][1] = i;
++        total += order[i][0];
++    }
++    qsort(order, n, sizeof(order[0]), helios_pass_end_cmp);
++    INFO("Helios pass ends: %.2f s window, %"PRIu64" passes begun, %"PRIu64" ended or suspended.\n",
++            (now - helios_pass_ends.window_start_ns) / 1e9, helios_pass_ends.begins, total);
++    for (i = 0; i < n && i < 24 && order[i][0]; i++)
++    {
++        unsigned int k = (unsigned int)order[i][1];
++        INFO("Helios pass ends: %8"PRIu64" ends %8"PRIu64" suspends  %s:%d\n",
++                helios_pass_ends.site[k].ends, helios_pass_ends.site[k].suspends,
++                helios_pass_ends.site[k].func, helios_pass_ends.site[k].line);
++    }
++    for (i = 0; i < n; i++)
++        helios_pass_ends.site[i].ends = helios_pass_ends.site[i].suspends = 0;
++    helios_pass_ends.begins = 0;
++    helios_pass_ends.window_start_ns = now;
++}
++
++static void helios_pass_end_note(const char *func, int line, bool suspend)
++{
++    uint64_t now = vkd3d_get_current_time_ns();
++    unsigned int i;
++    pthread_mutex_lock(&helios_pass_ends.lock);
++    if (!helios_pass_ends.window_start_ns)
++        helios_pass_ends.window_start_ns = now;
++    for (i = 0; i < helios_pass_ends.count; i++)
++        if (helios_pass_ends.site[i].func == func && helios_pass_ends.site[i].line == line)
++            break;
++    if (i == helios_pass_ends.count && i < HELIOS_PASS_END_SITES)
++    {
++        helios_pass_ends.site[i].func = func;
++        helios_pass_ends.site[i].line = line;
++        helios_pass_ends.count++;
++    }
++    if (i < helios_pass_ends.count)
++    {
++        if (suspend)
++            helios_pass_ends.site[i].suspends++;
++        else
++            helios_pass_ends.site[i].ends++;
++    }
++    if (now - helios_pass_ends.window_start_ns >= 2000000000ull)
++        helios_pass_end_log_locked(now);
++    pthread_mutex_unlock(&helios_pass_ends.lock);
++}
++
++static void helios_pass_begin_note(void)
++{
++    pthread_mutex_lock(&helios_pass_ends.lock);
++    helios_pass_ends.begins++;
++    pthread_mutex_unlock(&helios_pass_ends.lock);
++}
++
++void d3d12_command_list_end_current_render_pass_at(struct d3d12_command_list *list, bool suspend,
++        const char *func, int line)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+     VkMemoryBarrier2 vk_barrier;
+     VkDependencyInfo dep_info;
+ 
++    if ((list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE) && helios_pass_end_stats_on())
++        helios_pass_end_note(func, line, suspend);
++
+     d3d12_command_list_handle_active_queries(list, true);
+ 
+ #ifdef VKD3D_ENABLE_PROFILING
+@@ -9566,6 +9668,8 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+     d3d12_command_list_begin_rendering(list);
+     d3d12_command_list_update_conditional_rendering_state(list, false);
+ 
++    if (helios_pass_end_stats_on())
++        helios_pass_begin_note();
+     list->rendering_info.state_flags |= VKD3D_RENDERING_ACTIVE;
+     list->rendering_info.state_flags &= ~VKD3D_RENDERING_SUSPENDED;
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index b957451d..3814c289 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3692,7 +3692,12 @@ HRESULT d3d12_command_list_create(struct d3d12_device *device,
+ void d3d12_command_list_record_error(struct d3d12_command_list *list, HRESULT hr);
+ bool d3d12_command_list_reset_query(struct d3d12_command_list *list,
+         VkQueryPool vk_pool, uint32_t index);
+-void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list, bool suspend);
++void d3d12_command_list_end_current_render_pass_at(struct d3d12_command_list *list, bool suspend,
++        const char *func, int line);
++/* Helios: every caller is named, for the pass-end statistics
++ * (HELIOS_VKD3D_PASS_END_STATS=1, command.c). */
++#define d3d12_command_list_end_current_render_pass(list, suspend) \
++        d3d12_command_list_end_current_render_pass_at(list, suspend, __func__, __LINE__)
+ void d3d12_command_list_invalidate_all_state(struct d3d12_command_list *list);
+ 
+ void d3d12_command_list_debug_mark_label(struct d3d12_command_list *list, const char *tag,

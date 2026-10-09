@@ -186,6 +186,7 @@ struct win_ctx {
     struct win_ev {
         int fd;
         HANDLE ev;
+        struct win_wake *wake; /* crm_win_event_wait_gen state, never freed */
     } *evs;
     uint32_t n_evs, cap_evs;
 
@@ -253,7 +254,7 @@ static int kmd_status_to_errno(int32_t status)
  * the KMD's verdict in head->status, or a negative errno for a transport
  * failure (an older KMD without the verb answers STATUS_NOT_IMPLEMENTED). */
 /*
- * CRM_WIN_PROF_FILE=path: count and time every escape by kind, from any
+ * CRM_WIN_PROF_FILE=path ("%p" in it becomes the process id): count and time every escape by kind, from any
  * thread, and rewrite `path` with the cumulative table at most once a second
  * (so a killed process still leaves one; diff two snapshots for a rate).
  * Kinds: op (QUERY_CAPS/MMAP, MUNMAP, EVENT_REGISTER, PIN, ...), FORWARD by message type,
@@ -338,11 +339,27 @@ static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size);
 static int nvrm_escape(struct win_ctx *c, void *buf, uint32_t size)
 {
     if (g_prof_on < 0) {
-        const DWORD n = GetEnvironmentVariableA("CRM_WIN_PROF_FILE", g_prof_path, sizeof(g_prof_path));
+        char raw[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableA("CRM_WIN_PROF_FILE", raw, sizeof(raw));
         QueryPerformanceFrequency(&g_prof_freq);
         QueryPerformanceCounter(&g_prof_t0);
         g_prof_last = g_prof_t0;
-        g_prof_on = n > 0 && n < sizeof(g_prof_path);
+        g_prof_on = n > 0 && n < sizeof(raw);
+        if (g_prof_on) {
+            /* "%p" becomes the process id, so one machine-wide setting gives
+             * every process its own table (Steam, the game, DWM). */
+            size_t o = 0;
+            for (DWORD i = 0; i < n && o + 12 < sizeof(g_prof_path); i++) {
+                if (raw[i] == '%' && i + 1 < n && raw[i + 1] == 'p') {
+                    o += (size_t)snprintf(g_prof_path + o, sizeof(g_prof_path) - o, "%lu",
+                                          (unsigned long)GetCurrentProcessId());
+                    i++;
+                } else {
+                    g_prof_path[o++] = raw[i];
+                }
+            }
+            g_prof_path[o] = 0;
+        }
     }
     if (!g_prof_on)
         return nvrm_escape_raw(c, buf, size);
@@ -1411,6 +1428,30 @@ static int win_unmap_memory(void *vctx, int ctl_fd, const struct crm_map_request
     return 0;
 }
 
+/* Per event channel: the wake generation and the waiters on it
+ * (crm_win_event_wait_gen).  Heap allocated so it stays put while `evs`
+ * grows, and never freed: a waiter may still hold it after the channel is
+ * closed. */
+struct win_wake {
+    SRWLOCK lk;
+    CONDITION_VARIABLE cv;
+    volatile LONG64 gen;
+    int has_waiter;  /* a thread blocks on the KMD event for all of them */
+};
+
+static struct win_wake *ev_wake_locked(struct win_ctx *c, uint32_t i)
+{
+    if (!c->evs[i].wake) {
+        struct win_wake *w = calloc(1, sizeof(*w));
+        if (w) {
+            InitializeSRWLock(&w->lk);
+            InitializeConditionVariable(&w->cv);
+        }
+        c->evs[i].wake = w;
+    }
+    return c->evs[i].wake;
+}
+
 /* The event of channel `fd`, created and registered with the KMD on first use. */
 static int ev_get(struct win_ctx *c, int fd, HANDLE *out)
 {
@@ -1442,7 +1483,7 @@ static int ev_get(struct win_ctx *c, int fd, HANDLE *out)
              * signals it at once, so nothing is lost here. */
             r = nvrm_event_call(c, HELIOS_NVRM_OP_EVENT_REGISTER, (uint32_t)fd, ev);
             if (r == 0) {
-                c->evs[c->n_evs++] = (struct win_ev){ .fd = fd, .ev = ev };
+                c->evs[c->n_evs++] = (struct win_ev){ .fd = fd, .ev = ev, .wake = NULL };
                 *out = ev;
             } else {
                 CloseHandle(ev);
@@ -1482,14 +1523,58 @@ static int win_event_wait(void *vctx, int fd, uint32_t timeout_ms)
     if (g_prof_on > 0)
         QueryPerformanceCounter(&t0);
     const ULONGLONG deadline = ms == INFINITE ? 0 : GetTickCount64() + ms;
+    /* Short timeouts end on a high-resolution waitable timer: a wait's own
+     * timeout, like Sleep, only expires on a timer tick (~15.6 ms at the
+     * default resolution), so a 1 ms poll would take a whole tick.  A wake
+     * that is lost (the event is shared by every waiter of the process and
+     * reset by whichever wakes first) then costs about the timeout, not a
+     * tick.  Per thread, created once (Windows 10 1803+; else the old way).
+     */
+#if defined(_MSC_VER)
+#define CRM_THREAD_LOCAL __declspec(thread)
+#else
+#define CRM_THREAD_LOCAL __thread
+#endif
+    static CRM_THREAD_LOCAL HANDLE hires_timer;
+    static CRM_THREAD_LOCAL int hires_tried;
+    if (!hires_tried) {
+        hires_tried = 1;
+        hires_timer = CreateWaitableTimerExW(NULL, NULL,
+                                             0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                             TIMER_ALL_ACCESS);
+    }
+    /* CRM_EVENT_HIRES=0: the wait's own timeout, as before 405.22 (bisecting) */
+    static volatile LONG hires_env = -1;
+    if (hires_env < 0) {
+        char v[8] = { 0 };
+        const DWORD n = GetEnvironmentVariableA("CRM_EVENT_HIRES", v, sizeof(v));
+        InterlockedExchange(&hires_env, (n > 0 && n < sizeof(v) && v[0] == '0') ? 0 : 1);
+    }
+    const int use_timer = hires_env != 0 && hires_timer != NULL && ms != INFINITE && ms <= 50;
+    if (use_timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)ms * 10000; /* 100 ns units, relative */
+        if (!SetWaitableTimer(hires_timer, &due, 0, NULL, NULL, FALSE))
+            return 0;
+    }
     for (;;) {
         DWORD left = ms;
         if (ms != INFINITE) {
             const ULONGLONG now = GetTickCount64();
             left = now >= deadline ? 0 : (DWORD)(deadline - now);
         }
-        HANDLE waits[2] = { ev, c->lost_ev };
-        const DWORD w = WaitForMultipleObjects(c->lost_ev ? 2 : 1, waits, FALSE, left);
+        HANDLE waits[3] = { ev, c->lost_ev, NULL };
+        DWORD nwaits = c->lost_ev ? 2 : 1;
+        if (use_timer) {
+            waits[nwaits] = hires_timer;
+            left = INFINITE;
+        }
+        const DWORD timer_idx = WAIT_OBJECT_0 + nwaits;
+        if (use_timer)
+            nwaits++;
+        DWORD w = WaitForMultipleObjects(nwaits, waits, FALSE, left);
+        if (use_timer && w == timer_idx)
+            w = WAIT_TIMEOUT;
         if (g_prof_on > 0) {
             /* evwait 0x0 = woken by the event, 0x1 = timed out */
             QueryPerformanceCounter(&t1);
@@ -2218,6 +2303,122 @@ int32_t crm_win_loss_epoch(void)
     return (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0);
 }
 
+static struct win_wake *ev_wake(struct win_ctx *c, int fd)
+{
+    struct win_wake *w = NULL;
+    /* Fast path, every CPU wait loop iteration: a shared lookup */
+    AcquireSRWLockShared(&c->lock);
+    for (uint32_t i = 0; i < c->n_evs; i++) {
+        if (c->evs[i].fd == fd) {
+            w = c->evs[i].wake;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&c->lock);
+    if (w)
+        return w;
+    HANDLE ev;
+    if (ev_get(c, fd, &ev) != 0)
+        return NULL;
+    AcquireSRWLockExclusive(&c->lock);
+    for (uint32_t i = 0; i < c->n_evs; i++) {
+        if (c->evs[i].fd == fd) {
+            w = ev_wake_locked(c, i);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&c->lock);
+    return w;
+}
+
+int crm_win_event_gen(int fd, uint64_t *gen)
+{
+    struct win_ctx *c = &g_ctx;
+    if (fd < 0 || !gen)
+        return -EINVAL;
+    struct win_wake *w = ev_wake(c, fd);
+    if (!w)
+        return -ENOMEM;
+    *gen = (uint64_t)InterlockedCompareExchange64(&w->gen, 0, 0);
+    return 0;
+}
+
+int crm_win_event_wait_gen(int fd, uint64_t seen, uint32_t timeout_ms)
+{
+    struct win_ctx *c = &g_ctx;
+    if (fd < 0)
+        return -EINVAL;
+    struct win_wake *w = ev_wake(c, fd);
+    if (!w)
+        return -ENOMEM;
+    LARGE_INTEGER f, t0, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    const int infinite = timeout_ms == 0xFFFFFFFFu;
+    int r = 0;
+    AcquireSRWLockExclusive(&w->lk);
+    for (;;) {
+        if ((uint64_t)w->gen != seen) {
+            r = 1;
+            break;
+        }
+        DWORD left = INFINITE;
+        if (!infinite) {
+            QueryPerformanceCounter(&now);
+            const uint64_t el_ms = (uint64_t)((now.QuadPart - t0.QuadPart) * 1000 / f.QuadPart);
+            if (el_ms >= timeout_ms) {
+                r = 0;
+                break;
+            }
+            left = (DWORD)(timeout_ms - el_ms);
+        }
+        if (!w->has_waiter) {
+            /* This thread waits on the KMD's event for everyone */
+            w->has_waiter = 1;
+            ReleaseSRWLockExclusive(&w->lk);
+            const int ew = win_event_wait(c, fd, infinite ? 0xFFFFFFFFu : left);
+            AcquireSRWLockExclusive(&w->lk);
+            w->has_waiter = 0;
+            if (ew > 0)
+                InterlockedIncrement64(&w->gen);
+            /* Woken: everyone re-checks.  Timed out or failed: let another
+             * waiter take over the event. */
+            WakeAllConditionVariable(&w->cv);
+            if (ew < 0) {
+                r = ew;
+                break;
+            }
+        } else {
+            SleepConditionVariableSRW(&w->cv, &w->lk, left, 0);
+        }
+    }
+    ReleaseSRWLockExclusive(&w->lk);
+    return r;
+}
+
+/* Signals this process's wait handle for event channel `fd` (registered by a
+ * previous crm_event_wait), with no KMD call: a waiter blocked in
+ * win_event_wait wakes and re-reads what it waits for. For a store the CPU
+ * made (a host semaphore signal), which raises no GPU interrupt and so no
+ * host report. The handle is manual reset, so a kick before the waiter
+ * blocks is not lost; a spurious one costs the waiter one wake. Returns 0,
+ * or -ENOENT when no wait has registered `fd` yet (nobody can be blocked). */
+int crm_win_event_kick(int fd)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = -ENOENT;
+    AcquireSRWLockShared(&c->lock);
+    for (uint32_t i = 0; i < c->n_evs; i++) {
+        if (c->evs[i].fd == fd) {
+            SetEvent(c->evs[i].ev);
+            r = 0;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&c->lock);
+    return r;
+}
+
 /* The vectored handler lives in this DLL: take it out when the DLL is
  * unloaded while the process goes on (FreeLibrary; at process exit nothing
  * runs any more). The table entries stay: the Venus ICD or the UMD may still
@@ -2259,6 +2460,14 @@ const struct crm_transport *crm_windows_transport(void) { return NULL; }
 int32_t crm_win_loss_epoch(void) { return 0; }
 
 #include <errno.h>
+
+int crm_win_event_kick(int fd) { (void)fd; return -ENOSYS; }
+int crm_win_event_gen(int fd, uint64_t *gen) { (void)fd; (void)gen; return -ENOSYS; }
+int crm_win_event_wait_gen(int fd, uint64_t seen, uint32_t timeout_ms)
+{
+    (void)fd; (void)seen; (void)timeout_ms;
+    return -ENOSYS;
+}
 
 int crm_win_open_device(uint32_t device_type, int *fd)
 {

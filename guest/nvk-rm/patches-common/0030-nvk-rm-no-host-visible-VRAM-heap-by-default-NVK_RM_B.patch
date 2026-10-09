@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 02:34:40 +0200
+Subject: [PATCH] nvk/rm: no host-visible VRAM heap by default
+ (NVK_RM_BAR_MB=0)
+
+CS2 through DXVK on 405.12 (single-variable rows, 0 Xid): turning the
+BAR heap off (NVK_RM_BAR_MB=0) gave 28.3 -> 36.7 and 34.7 -> 46.3 fps,
++30 % in both pairs; putting NVK's upload memory (22.5 fps) or descriptor
+tables (about -10 fps) in it made things worse.
+
+The GPU side of BAR-heap memory is ordinary VRAM: allocated as vidmem
+with 64 KiB pages and GPU_CACHEABLE (alloc_rm_memory, the only difference
+being that it may be CPU-mapped), and GPU-mapped with big (or huge)
+pages and the generic kind like every VRAM buffer (nvkmd_rm_va_bind_mem);
+no sysmem or peer aperture and no uncached mapping.  What differs is the
+CPU side: DXVK puts its constant, dynamic and descriptor buffers in the
+DEVICE_LOCAL | HOST_VISIBLE type and writes them every draw through
+BAR1, which under Conduit is the host's shared mapping window.  Without
+the type DXVK uses coherent host-visible system memory, which the GPU
+caches in L2 since patch 0027.
+
+NVK_RM_BAR_MB now defaults to 0 (no DEVICE_LOCAL | HOST_VISIBLE type, as
+NVK without ReBAR on nouveau); -1 restores all of BAR1 (the old default),
+N caps the heap at N MiB.  NVK_RM_DESC_TABLE_VRAM / NVK_RM_UPLOAD_VRAM
+need the heap and stay in system memory without it.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index fb592f93..ae1302a8 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -258,11 +258,21 @@ fill_device_info(struct nvkmd_rm_pdev *pdev,
+     * the host sizes to BAR1 and refuses maps from when it is full.  A
+     * refused map, and an allocation past the reported heap size, both put
+     * that allocation in system memory (nvkmd_rm_mem.c), so the heap never
+-    * fails an allocation.  NVK_RM_BAR_MB overrides the reported size for
+-    * testing (0 turns host-visible VRAM off).
++    * fails an allocation.  NVK_RM_BAR_MB sets the reported size: 0 (the
++    * default) turns host-visible VRAM off, -1 is all of BAR1, N caps it at
++    * N MiB.
++    *
++    * Off by default: in CS2 through DXVK (405.12, 2026-10-09) the heap
++    * cost about 30 % (28.3/34.7 fps with it, 36.7/46.3 without).  DXVK
++    * puts its constant, dynamic and descriptor buffers in this type, and
++    * every CPU write to them goes through BAR1, which under Conduit is the
++    * host's shared mapping window; the GPU maps the memory like any other
++    * VRAM (vidmem, 64 KiB pages, GPU-cacheable, nvkmd_rm_va_bind_mem).
++    * Without the type DXVK uses coherent host-visible system memory, which
++    * the GPU caches in L2 (patch 0027).
+     */
+    const uint64_t bar1_B = bar1_KiB * 1024;
+-   const int64_t bar_cap_MB = debug_get_num_option("NVK_RM_BAR_MB", -1);
++   const int64_t bar_cap_MB = debug_get_num_option("NVK_RM_BAR_MB", 0);
+    uint64_t bar_size_B = bar_cap_MB < 0 ? bar1_B :
+                          MIN2((uint64_t)bar_cap_MB << 20, bar1_B);
+    if (info->vram_size_B > NVKMD_RM_BIG_PAGE_SIZE)
+-- 
+2.43.0
+

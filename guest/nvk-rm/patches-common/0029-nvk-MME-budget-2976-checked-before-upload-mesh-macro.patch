@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 02:28:06 +0200
+Subject: [PATCH] nvk: MME budget 2976 checked before upload, mesh macros only
+ for mesh
+
+Follow-up to 0028 for the MME instruction RAM and the per-draw cost.
+
+- The macros are all built first and their total checked against the
+  budget before anything is uploaded; queue creation fails above it.
+  The budget is the known-good 2976 (405.8 ran 2976 dwords, 405.9
+  faulted on every macro call with 3303) until the RAM's real size and
+  unit are known.
+- The three mesh macros are uploaded empty unless the device enabled mesh
+  or task shaders (D3D11 through DXVK never does): 507 dwords on
+  BLACKWELL_A.  Default total for a DXVK device: 2160 dwords
+  (2649 measured without the mesh exclusion); 2988 worst case
+  (NVK_INDIRECT_PUSH=0 NVK_MDI_BATCH=64) without it, 2499 with it.
+- NVK_MME_PACK_INSTR=1 (test only, default off): macros start at
+  instruction rather than dword offsets on Turing+, as nouveau GL does
+  (nvc0_screen.c); if the RAM pointers count instructions, NVK has been
+  using a third of the RAM.
+- NVK_SKIP_DRAWID=1 (test only, default off): indirect draws do not
+  write the draw index to the root table (wrong for shaders reading
+  gl_DrawID; D3D11 has none), to measure that write's share of the
+  ~28 us per indirect draw.
+- NVK_MDI_BATCH reads at most 64 dwords per DMA read on Blackwell, which
+  has no SET_MME_DATA_FIFO_CONFIG and an unknown data FIFO size (1024 on
+  Turing to Hopper, where NVK sets it to 4 KiB).
+
+MME simulator: 0028's inline and per-record macros still give identical
+method streams (58 cases).
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c | 108 ++++++++++++++++++++----------
+ src/nouveau/vulkan/nvk_mme.c      |   8 +++
+ src/nouveau/vulkan/nvk_mme.h      |   3 +
+ 3 files changed, 84 insertions(+), 35 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index f9c6f536..a840c292 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -44,12 +44,13 @@
+  * buffers bound through NVK_MME_BIND_VB/IB (0006).  An A/B lever for
+  * rendering bugs; on by default.
+  */
+-/* Size of the Turing+ MME instruction RAM in dwords (the unit
+- * LOAD_MME_INSTRUCTION_RAM_POINTER counts in).  Not documented; 0xc00 like
+- * the MME data RAM (MME_TU104_DRAM_COUNT), and consistent with GB20x
+- * running 2976 dwords of macros and faulting on 3303.
++/* Budget for the macros in the Turing+ MME instruction RAM, in the units
++ * NVK steps LOAD_MME_INSTRUCTION_RAM_POINTER by (dwords; instructions with
++ * NVK_MME_PACK_INSTR).  The RAM's size is not documented: GB20x ran 2976
++ * dwords of macros (405.8) and faulted on every call with 3303 (405.9), so
++ * the known-good 2976 is the budget until the packing is understood.
+  */
+-#define NVK_MME_RAM_DW 0xc00u
++#define NVK_MME_RAM_DW 2976u
+ 
+ static uint32_t nvk_mdi_batch(void);
+ 
+@@ -205,51 +206,76 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
+       .engine_id = 0,
+    });
+ 
++   /* Build every macro first, then check the total against the budget
++    * before anything is uploaded (see NVK_MME_RAM_DW).  Mesh macros are
++    * empty unless the device enabled mesh or task shaders (D3D11 through
++    * DXVK never does).  NVK_MME_PACK_INSTR=1 (test only, default off)
++    * places macros at instruction instead of dword offsets on Turing+, as
++    * nouveau GL does (nvc0_screen.c).
++    */
++   const bool mesh = dev->vk.enabled_features.meshShader ||
++                     dev->vk.enabled_features.taskShader;
++   const bool pack_instr = pdev->info.cls_eng3d >= TURING_A &&
++      debug_get_bool_option("NVK_MME_PACK_INSTR", false);
++   uint32_t *mme_dw[NVK_MME_COUNT];
++   uint32_t mme_num_dw[NVK_MME_COUNT];
+    uint32_t mme_pos = 0;
+    for (uint32_t mme = 0; mme < NVK_MME_COUNT; mme++) {
+       size_t size;
+-      uint32_t *dw = nvk_build_mme(&pdev->info, mme, &size);
+-      if (dw == NULL)
++      const bool is_mesh = mme == NVK_MME_DRAW_MESH ||
++                           mme == NVK_MME_DRAW_MESH_INDIRECT ||
++                           mme == NVK_MME_DRAW_MESH_INDIRECT_COUNT;
++      mme_dw[mme] = (is_mesh && !mesh) ?
++                    nvk_build_mme_empty(&pdev->info, &size) :
++                    nvk_build_mme(&pdev->info, mme, &size);
++      if (mme_dw[mme] == NULL) {
++         for (uint32_t i = 0; i < mme; i++)
++            free(mme_dw[i]);
+          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+-
++      }
+       assert(size % sizeof(uint32_t) == 0);
+-      const uint32_t num_dw = size / sizeof(uint32_t);
++      mme_num_dw[mme] = size / sizeof(uint32_t);
++      mme_pos += pack_instr ? mme_num_dw[mme] / 3 : mme_num_dw[mme];
++   }
+ 
++   /* Never upload past the budget: past the MME instruction RAM macros are
++    * corrupt and every call faults (405.9).  Fail the queue instead.
++    */
++   if (pdev->info.cls_eng3d >= TURING_A && mme_pos > NVK_MME_RAM_DW) {
++      for (uint32_t i = 0; i < NVK_MME_COUNT; i++)
++         free(mme_dw[i]);
++      return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                       "NVK: MME macros need %u, more than the budget of %u "
++                       "(NVK_MDI_BATCH / NVK_INDIRECT_PUSH macro sets)",
++                       mme_pos, NVK_MME_RAM_DW);
++   }
++
++   mme_pos = 0;
++   for (uint32_t mme = 0; mme < NVK_MME_COUNT; mme++) {
+       P_MTHD(p, NV9097, LOAD_MME_START_ADDRESS_RAM_POINTER);
+       P_NV9097_LOAD_MME_START_ADDRESS_RAM_POINTER(p, mme);
+       P_NV9097_LOAD_MME_START_ADDRESS_RAM(p, mme_pos);
+ 
+       P_1INC(p, NV9097, LOAD_MME_INSTRUCTION_RAM_POINTER);
+       P_NV9097_LOAD_MME_INSTRUCTION_RAM_POINTER(p, mme_pos);
+-      P_INLINE_ARRAY(p, dw, num_dw);
+-
+-      mme_pos += num_dw;
++      P_INLINE_ARRAY(p, mme_dw[mme], mme_num_dw[mme]);
+ 
+-      free(dw);
++      mme_pos += pack_instr ? mme_num_dw[mme] / 3 : mme_num_dw[mme];
+ 
+-      /* The MME instruction RAM holds NVK_MME_RAM_DW dwords: past it,
+-       * macros are corrupt and every call faults (405.9).  Never upload
+-       * more; fail the queue instead.
+-       */
+-      if (pdev->info.cls_eng3d >= TURING_A && mme_pos > NVK_MME_RAM_DW) {
+-         return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+-                          "NVK: MME macros need %u dwords, more than the "
+-                          "%u of the MME instruction RAM (NVK_MDI_BATCH / "
+-                          "NVK_INDIRECT_PUSH macro sets)", mme_pos,
+-                          NVK_MME_RAM_DW);
+-      }
++      free(mme_dw[mme]);
+    }
+ 
+    {
+       static bool logged;
+       if (!logged) {
+          logged = true;
+-         mesa_logi("NVK: MME macros take %u of %u dwords", mme_pos,
+-                   NVK_MME_RAM_DW);
+-         nvk_shader_stats_note("NVK: MME macros take %u of %u dwords "
+-                               "(NVK_INDIRECT_PUSH %d, NVK_MDI_BATCH %u)",
+-                               mme_pos, NVK_MME_RAM_DW, nvk_indirect_push(),
+-                               nvk_mdi_batch());
++         mesa_logi("NVK: MME macros take %u of a %u budget (%s)", mme_pos,
++                   NVK_MME_RAM_DW, pack_instr ? "instructions" : "dwords");
++         nvk_shader_stats_note("NVK: MME macros take %u of a %u budget (%s; "
++                               "NVK_INDIRECT_PUSH %d, NVK_MDI_BATCH %u, "
++                               "mesh %d)", mme_pos, NVK_MME_RAM_DW,
++                               pack_instr ? "instructions" : "dwords",
++                               nvk_indirect_push(), nvk_mdi_batch(), mesh);
+       }
+    }
+ 
+@@ -5001,9 +5027,15 @@ nvk_mme_build_set_draw_params(struct mme_builder *b,
+    nvk_mme_set_cb0_mthd(b, nvk_root_descriptor_offset(draw.vs.base_instance),
+                         NV9097_SET_GLOBAL_BASE_INSTANCE_INDEX,
+                         p->first_instance);
+-   nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.draw_index),
+-                           NVK_MME_SCRATCH_CB0_DRAW_INDEX,
+-                           p->draw_index);
++   /* NVK_SKIP_DRAWID=1 (test only, default off; wrong for shaders that
++    * read gl_DrawID, which D3D11 has not): indirect draws do not write the
++    * draw index to the root table, to see what that write costs per draw.
++    */
++   if (!debug_get_bool_option("NVK_SKIP_DRAWID", false)) {
++      nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.draw_index),
++                              NVK_MME_SCRATCH_CB0_DRAW_INDEX,
++                              p->draw_index);
++   }
+    nvk_mme_set_cb0_scratch(b, nvk_root_descriptor_offset(draw.view_index),
+                            NVK_MME_SCRATCH_CB0_VIEW_INDEX,
+                            mme_zero());
+@@ -5638,6 +5670,7 @@ nvk_mme_draw_indirect(struct mme_builder *b)
+  * calls.
+  */
+ #define NVK_MDI_FIFO_DW 1024u
++#define NVK_MDI_FIFO_DW_BLACKWELL 64u
+ #define NVK_MDI_BATCH_MAX 204u
+ 
+ static uint32_t
+@@ -5821,10 +5854,15 @@ nvk_cmd_draw_indirect_batched(struct nvk_cmd_buffer *cmd, bool indexed,
+ 
+    const uint32_t rec_dw = indexed ? 5 : 4;
+    assert(stride % 4 == 0 && stride / 4 >= rec_dw);
+-   if (stride / 4 > NVK_MDI_FIFO_DW - rec_dw)
++   /* Blackwell has no SET_MME_DATA_FIFO_CONFIG and the size of its data
++    * FIFO is unknown: keep reads small there.
++    */
++   const uint32_t fifo_dw = nvk_cmd_buffer_3d_cls(cmd) >= BLACKWELL_A ?
++                            NVK_MDI_FIFO_DW_BLACKWELL : NVK_MDI_FIFO_DW;
++   if (stride / 4 > fifo_dw - rec_dw)
+       return false;
+    const uint32_t stride_dw = stride / 4;
+-   const uint32_t max_n = MIN2(batch, (NVK_MDI_FIFO_DW - rec_dw) / stride_dw + 1);
++   const uint32_t max_n = MIN2(batch, (fifo_dw - rec_dw) / stride_dw + 1);
+ 
+    for (uint32_t first = 0; first < draw_count;) {
+       const uint32_t n = MIN2(max_n, draw_count - first);
+diff --git a/src/nouveau/vulkan/nvk_mme.c b/src/nouveau/vulkan/nvk_mme.c
+index e59611b3..4441c676 100644
+--- a/src/nouveau/vulkan/nvk_mme.c
++++ b/src/nouveau/vulkan/nvk_mme.c
+@@ -55,6 +55,14 @@ static const struct nvk_mme_test_case *mme_tests[NVK_MME_COUNT] = {
+    [NVK_MME_SET_STATISTICS_COUNTERS]       = nvk_mme_set_statistics_counters_tests,
+ };
+ 
++uint32_t *
++nvk_build_mme_empty(const struct nv_device_info *devinfo, size_t *size_out)
++{
++   struct mme_builder b;
++   mme_builder_init(&b, devinfo);
++   return mme_builder_finish(&b, size_out);
++}
++
+ uint32_t *
+ nvk_build_mme(const struct nv_device_info *devinfo,
+               enum nvk_mme mme, size_t *size_out)
+diff --git a/src/nouveau/vulkan/nvk_mme.h b/src/nouveau/vulkan/nvk_mme.h
+index 761173e8..727ce3ce 100644
+--- a/src/nouveau/vulkan/nvk_mme.h
++++ b/src/nouveau/vulkan/nvk_mme.h
+@@ -231,6 +231,9 @@ typedef void (*nvk_mme_builder_func)(struct mme_builder *b);
+ 
+ uint32_t *nvk_build_mme(const struct nv_device_info *devinfo,
+                         enum nvk_mme mme, size_t *size_out);
++/* A macro that does nothing (two NOPs), for macros a device never calls */
++uint32_t *nvk_build_mme_empty(const struct nv_device_info *devinfo,
++                              size_t *size_out);
+ 
+ void nvk_mme_select_cb0(struct mme_builder *b);
+ void nvk_mme_bind_cbuf_desc(struct mme_builder *b);
+-- 
+2.43.0
+

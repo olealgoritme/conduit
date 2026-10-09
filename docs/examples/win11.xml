@@ -167,7 +167,7 @@
     <qemu:arg value='-chardev'/>
     <qemu:arg value='socket,id=conduit-gpu,path=/run/user/UID/conduit/win11/gpu-libvirt.sock'/>
     <qemu:arg value='-device'/>
-    <qemu:arg value='vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,class=0x0380,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x1e'/>
+    <qemu:arg value='vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,class=0x0380,num_vqs=3,vq_size=256,config_size=4036,bus=pcie.0,addr=0x1e'/>
   </qemu:commandline>
   -->
 </domain>

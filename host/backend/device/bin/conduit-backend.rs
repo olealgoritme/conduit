@@ -14,7 +14,7 @@
 //! ```text
 //! qemu-system-x86_64 \
 //!   -chardev socket,id=nv,path=/tmp/nvgpu.sock \
-//!   -device vhost-user-test-device-pci,chardev=nv,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036 \
+//!   -device vhost-user-test-device-pci,chardev=nv,virtio-id=45,num_vqs=3,vq_size=256,config_size=4036 \
 //!   -object memory-backend-memfd,id=mem,size=8G,share=on -machine q35,memory-backend=mem
 //! ```
 //!
@@ -36,7 +36,9 @@ use device::caps::Caps;
 use device::chain::{
     ReadableAfterWritable, Segment, capacity, sort_chain, writable, write_scattered,
 };
-use device::display::{DisplayLink, DisplayMode, GuestInputClaims, InputSink, ReleaseSink};
+use device::display::{
+    DisplayLink, DisplayMode, GuestInputClaims, InputSink, PresentedSink, ReleaseSink,
+};
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::shm::WindowPlacer;
@@ -47,13 +49,14 @@ use device::shm_regions::{
 };
 #[cfg(feature = "venus")]
 use device::shm_regions::{SHM_ID_VENUS, region_sizes_with_venus};
-use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
+use device::virtio::{CURSOR_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
     DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT,
-    NVGPU_F_SCANOUT_RELEASE, SCANOUT_RELEASED_MESSAGE_LEN, ScanoutReleased, clipboard_mime,
-    encode_clipboard_chunk, encode_display_mode, encode_input_events, encode_scanout_released,
-    input_events_that_fit,
+    NVGPU_F_SCANOUT_PRESENTED, NVGPU_F_SCANOUT_RELEASE, SCANOUT_PRESENTED_MESSAGE_LEN,
+    SCANOUT_RELEASED_MESSAGE_LEN, ScanoutPresented, ScanoutReleased, clipboard_mime,
+    encode_clipboard_chunk, encode_display_mode, encode_input_events, encode_scanout_presented,
+    encode_scanout_released, input_events_that_fit,
 };
 use std::os::fd::{BorrowedFd, RawFd};
 use vhost::vhost_user::message::{
@@ -71,8 +74,11 @@ use vm_memory::{
 };
 
 /// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
-/// error from that call, so offering fewer is fatal before config is read.
-const QUEUE_COUNT: usize = NUM_QUEUES;
+/// error from that call, so offering fewer is fatal before config is read. A
+/// third, the cursor queue, is served when the VMM exposes it (`num_vqs=3`);
+/// the Linux driver finds its two and ignores it.
+const QUEUE_COUNT: usize = NUM_QUEUES + 1;
+const _: () = assert!(CURSOR_QUEUE == NUM_QUEUES);
 /// Largest response we will build for one request.
 const RESP_MAX: usize = 64 * 1024;
 
@@ -839,6 +845,49 @@ impl ReleaseSink for VqReleaseSink {
     }
 }
 
+/// `ScanoutPresented` onto the same event queue: one message into one posted
+/// buffer, or dropped when none is posted (a presentation report is stale
+/// within a frame; the guest falls back to its own timer for that flip).
+impl PresentedSink for VqReleaseSink {
+    fn presented(&self, p: &ScanoutPresented) -> bool {
+        let Some((vring, mem)) = self.target.lock().expect("event target").clone() else {
+            return false;
+        };
+        let guard = mem.memory();
+        let mut vr = vring.get_mut();
+        let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
+            return false;
+        };
+        let Some(chain) = avail.next() else {
+            return false;
+        };
+        let head = chain.head_index();
+        drop(vr);
+        let segs = writable(chain);
+        let mut written = 0u32;
+        if capacity(&segs) >= SCANOUT_PRESENTED_MESSAGE_LEN {
+            let mut msg = [0u8; SCANOUT_PRESENTED_MESSAGE_LEN];
+            let n = encode_scanout_presented(p, &mut msg).expect("sized for it");
+            if let Ok(w) = write_scattered(&*guard, &segs, &msg[..n]) {
+                written = w as u32;
+            }
+        } else if !self
+            .warned_small
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            log::warn!(
+                "display: guest event buffers are {} bytes, too small for ScanoutPresented; dropped",
+                capacity(&segs)
+            );
+        }
+        if vring.add_used(head, written).is_err() {
+            return false;
+        }
+        let _ = vring.signal_used_queue();
+        written != 0
+    }
+}
+
 /// Watch the host's descriptors and tell the guest when one has something to
 /// say.
 ///
@@ -1309,6 +1358,10 @@ struct NvGpuBackend {
     /// A request was served since the device was last (re)started. A restart
     /// that finds this set is a guest that rebooted or reloaded its driver.
     served: bool,
+    /// Requests served so far (every queue), and those of the cursor queue (virtqueue 2): the
+    /// evidence that a guest's cursor commands travel there (`cursor queue:` log lines).
+    served_n: u64,
+    cursor_q_n: u64,
     /// The backend has descriptors for the event thread to start or stop
     /// watching. Noted under the lock each request already takes, so a
     /// drain that opened and closed nothing -- nearly all of them -- does not
@@ -1423,10 +1476,12 @@ impl NvGpuBackend {
             if cursor {
                 config.set_cursor();
             }
-            link.set_release_sink(Arc::new(VqReleaseSink {
+            let sink = Arc::new(VqReleaseSink {
                 target: input_target.clone(),
                 warned_small: std::sync::atomic::AtomicBool::new(false),
-            }));
+            });
+            link.set_release_sink(sink.clone());
+            link.set_presented_sink(sink);
             display_link = Some(link.clone());
             nvidia.set_display(link);
         }
@@ -1447,6 +1502,8 @@ impl NvGpuBackend {
             readable: Vec::new(),
             writable: Vec::new(),
             served: false,
+            served_n: 0,
+            cursor_q_n: 0,
             watch_dirty: true,
             #[cfg(feature = "venus")]
             gpu_cmd_seen: false,
@@ -1487,6 +1544,10 @@ impl NvGpuBackend {
             && venus.enable_cursor()
         {
             self.config.set_venus_cursor();
+            // ...on its own queue, served ahead of the control queue's Venus
+            // traffic (it only works where the VMM has `num_vqs=3`; the guest
+            // checks that the queue exists).
+            self.config.set_cursor_queue();
         }
         self.nvidia.lock().expect("backend mutex").set_venus(venus);
         self.venus.hostmem_len = hostmem_len;
@@ -1613,9 +1674,12 @@ impl NvGpuBackend {
         #[cfg(feature = "venus")]
         self.venus.held.lock().expect("held chains").clear();
         self.served = false;
+        // A new driver: its first cursor-queue request is logged again.
+        self.cursor_q_n = 0;
         self.input_claims.reset();
         if let Some(link) = self.display_link.as_ref() {
             link.set_release_enabled(false);
+            link.set_presented_enabled(false);
         }
     }
 
@@ -1624,23 +1688,64 @@ impl NvGpuBackend {
     /// Whether to trace is decided here, once per drain, and the drain itself
     /// is compiled twice: with tracing off it is exactly the untraced loop,
     /// with no per-request check at all (docs/TRACING.md).
+    /// Serve `vring`. With `prio` (the cursor queue, when `vring` is the
+    /// control queue), `prio` is served first and again after every control
+    /// request, so a cursor command waits for at most one control request,
+    /// never for the queue's whole backlog of Venus traffic.
     fn process(
         &mut self,
         vring: &VringRwLock,
+        prio: Option<&VringRwLock>,
         mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
     ) -> std::io::Result<bool> {
         #[cfg(feature = "trace")]
         if device::trace::enabled() {
-            return self.drain::<true>(vring, mem);
+            return self.drain::<true>(vring, prio, mem);
         }
-        self.drain::<false>(vring, mem)
+        self.drain::<false>(vring, prio, mem)
+    }
+
+    /// Serve the cursor queue now, if it has anything, and tell the guest.
+    fn serve_prio<const TRACE: bool>(
+        &mut self,
+        prio: Option<&VringRwLock>,
+        mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
+    ) -> std::io::Result<()> {
+        let before = self.served_n;
+        if let Some(p) = prio
+            && self.drain::<TRACE>(p, None, mem)?
+        {
+            p.signal_used_queue()
+                .map_err(|e| std::io::Error::other(format!("signal used queue: {e}")))?;
+        }
+        self.note_cursor_q(self.served_n - before);
+        Ok(())
+    }
+
+    /// `n` more requests were served on the cursor queue: log the first, then every 1000th.
+    fn note_cursor_q(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let was = self.cursor_q_n;
+        self.cursor_q_n += n;
+        if was == 0 {
+            log::info!("cursor queue: first request served (virtqueue 2)");
+        } else if was / 1000 != self.cursor_q_n / 1000 {
+            log::info!(
+                "cursor queue: {} requests served (virtqueue 2)",
+                self.cursor_q_n
+            );
+        }
     }
 
     fn drain<const TRACE: bool>(
         &mut self,
         vring: &VringRwLock,
+        prio: Option<&VringRwLock>,
         mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
     ) -> std::io::Result<bool> {
+        self.serve_prio::<TRACE>(prio, mem)?;
         let mut used = false;
         loop {
             let mut guard = vring.get_mut();
@@ -1733,6 +1838,8 @@ impl NvGpuBackend {
                         // submit (docs/research/host-roundtrip-latency.md).
                         used |= !self.latency.quiet_held;
                         self.served = true;
+                        self.served_n += 1;
+                        self.serve_prio::<TRACE>(prio, mem)?;
                         continue;
                     }
                     drop(nvidia);
@@ -1761,6 +1868,8 @@ impl NvGpuBackend {
             }
             used = true;
             self.served = true;
+            self.served_n += 1;
+            self.serve_prio::<TRACE>(prio, mem)?;
         }
         Ok(used)
     }
@@ -1786,8 +1895,9 @@ impl VhostUserBackendMut for NvGpuBackend {
             | u64::from(NVGPU_CFG_TAKES_INPUT)
             // Acked by a guest that wants `ScanoutReleased`; offered only
             // with a display.
+            // Likewise `ScanoutPresented`.
             | if self.display_link.is_some() {
-                u64::from(NVGPU_F_SCANOUT_RELEASE)
+                u64::from(NVGPU_F_SCANOUT_RELEASE) | u64::from(NVGPU_F_SCANOUT_PRESENTED)
             } else {
                 0
             }
@@ -1829,11 +1939,13 @@ impl VhostUserBackendMut for NvGpuBackend {
         }
         self.input_claims.device_started(features);
         let release = features & u64::from(NVGPU_F_SCANOUT_RELEASE) != 0;
+        let presented = features & u64::from(NVGPU_F_SCANOUT_PRESENTED) != 0;
         if let Some(link) = self.display_link.as_ref() {
             link.set_release_enabled(release);
+            link.set_presented_enabled(presented);
         }
         log::info!(
-            "guest driver features {features:#x}: {}{}",
+            "guest driver features {features:#x}: {}{}{}",
             if features & u64::from(NVGPU_CFG_TAKES_INPUT) != 0 {
                 "takes Conduit input"
             } else {
@@ -1841,6 +1953,11 @@ impl VhostUserBackendMut for NvGpuBackend {
             },
             if release {
                 ", wants scanout buffer releases"
+            } else {
+                ""
+            },
+            if presented {
+                ", wants presentation feedback"
             } else {
                 ""
             }
@@ -1929,23 +2046,38 @@ impl VhostUserBackendMut for NvGpuBackend {
             .memory();
 
         let vring = &vrings[device_event as usize];
+        // The cursor queue rides along with every control drain (`process`);
+        // a kick on it alone is served here like any queue, with no
+        // interleaving and no held chains (those are the control queue's).
+        let cursor = device_event as usize == CURSOR_QUEUE;
+        let prio = if cursor {
+            None
+        } else {
+            vrings.get(CURSOR_QUEUE)
+        };
         device::stage::kick();
+        let before = self.served_n;
         let mut used = false;
         if self.event_idx {
             // With EVENT_IDX the guest suppresses notifications, so re-arm and
             // drain again rather than waiting for a kick that will not come.
             loop {
                 vring.disable_notification().ok();
-                used |= self.process(vring, &mem)?;
+                used |= self.process(vring, prio, &mem)?;
                 if !vring.enable_notification().unwrap_or(false) {
                     break;
                 }
             }
         } else {
-            used |= self.process(vring, &mem)?;
+            used |= self.process(vring, prio, &mem)?;
+        }
+        if cursor {
+            self.note_cursor_q(self.served_n - before);
         }
         #[cfg(feature = "venus")]
-        self.venus_complete(vring, &mem);
+        if !cursor {
+            self.venus_complete(vring, &mem);
+        }
         // After serving, not before: a message that opened a descriptor has to
         // have been served for the backend to know about it.
         self.sync_watches(vrings);

@@ -1068,7 +1068,7 @@ mod tests {
         ));
         // 0x1e and 0x1f are taken: the next free slot down is 0x1d.
         assert!(
-            out.contains("vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,class=0x0380,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x1d"),
+            out.contains("vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,class=0x0380,num_vqs=3,vq_size=256,config_size=4036,bus=pcie.0,addr=0x1d"),
             "{out}"
         );
         assert!(out.contains("machine=\"q35\""), "{out}");

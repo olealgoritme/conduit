@@ -539,6 +539,48 @@ pub struct QueueState {
     /// S5: the highest NVK execution boundary committed on this queue (present
     /// waits for it before showing a frame on scanout 0).
     nvk_last_value: std::sync::atomic::AtomicU64,
+    /// `Nvk12EclSync=2`: the highest ECL fence value committed on this queue (a
+    /// fenced scanout present flips when it fires). 0 = none.
+    nvk_last_ecl_fence: std::sync::atomic::AtomicU64,
+    /// `Nvk12AdmitAfterPresentOnly` (diagnostic): the next NVK ECL on this
+    /// queue takes the runtime admission event (set at creation and by each
+    /// Present on the device).
+    nvk_admit_next: std::sync::atomic::AtomicBool,
+    /// The Present epoch this queue last admitted in.
+    nvk_admit_epoch: std::sync::atomic::AtomicU64,
+    /// `Umd12MergeEcl` (diagnostic): the ECL packet not yet submitted (`merge`).
+    merge_pending: Mutex<Option<MergePending>>,
+}
+
+/// `Nvk12AdmitAfterPresentOnly`: every queue of this device admits its next
+/// ECL through the runtime again (called by Present).
+pub(crate) fn nvk_admit_after_present(h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE) {
+    if !crate::knobs12::nvk12_admit_after_present_only() {
+        return;
+    }
+    // SAFETY: Present's live queue handle.
+    if let Some(queue) = unsafe { queue_state(h_queue) } {
+        queue
+            .nvk_admit_next
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    ADMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Bumped by each Present: a queue that has not admitted since admits next.
+static ADMIT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Should this NVK ECL wait for the runtime's admission event? Always, unless
+/// the diagnostic `Nvk12AdmitAfterPresentOnly` is on: then only the first ECL
+/// of each queue after a Present (or after creation) does.
+fn nvk_must_admit(queue: &QueueState) -> bool {
+    if !crate::knobs12::nvk12_admit_after_present_only() {
+        return true;
+    }
+    use std::sync::atomic::Ordering;
+    let epoch = ADMIT_EPOCH.load(Ordering::Acquire);
+    let seen = queue.nvk_admit_epoch.swap(epoch, Ordering::AcqRel);
+    queue.nvk_admit_next.swap(false, Ordering::AcqRel) || seen != epoch
 }
 
 /// Engine allocators materialised for one DDI command pool, indexed by command
@@ -1103,6 +1145,7 @@ unsafe extern "system" fn calc_private_command_queue_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATECOMMANDQUEUE_0050,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_queue_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.queue_bad_arg);
     }
@@ -1126,6 +1169,7 @@ unsafe extern "system" fn create_command_queue(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     h_rt_queue: ddi12::D3D12DDI_HRTCOMMANDQUEUE,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_queue");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { Slot::<Boxed<QueueState>>::from_priv(h_queue.drv_private()) })
     else {
@@ -1257,6 +1301,10 @@ unsafe extern "system" fn create_command_queue(
             execution: Mutex::new(()),
             nvk: std::sync::OnceLock::new(),
             nvk_last_value: std::sync::atomic::AtomicU64::new(0),
+            nvk_last_ecl_fence: std::sync::atomic::AtomicU64::new(0),
+            nvk_admit_next: std::sync::atomic::AtomicBool::new(true),
+            nvk_admit_epoch: std::sync::atomic::AtomicU64::new(0),
+            merge_pending: Mutex::new(None),
         });
     }
     S_OK
@@ -1317,15 +1365,42 @@ unsafe fn create_wddm_context(
     // (`DXGK_ENGINE_TYPE_3D`, `NbAsymetricProcessingNodes = 1`), so every queue
     // class maps to node 0 — `DECISIONS.md` D5's "no extra engine nodes" in its
     // DDI form (`DDI_REFERENCE.md` §9.2).
+    //
+    // `Umd12ContextNode=1` (with the KMD's `D3d12Node=1`, which reports a second
+    // 3D node): D3D12 queues on NVK ask for node 1, which the KMD completes
+    // independently of node 0 (DWM, D3D11, presents). A refusal (a KMD with one
+    // node) falls back to node 0, counted.
+    let want_node = if crate::knobs12::umd12_context_node() && dev.engine.is_nvk() { 1 } else { 0 };
     let mut arg = ddi12::D3DDDICB_CREATECONTEXT {
-        NodeOrdinal: 0,
+        NodeOrdinal: want_node,
         EngineAffinity: 0,
         ..Default::default()
     };
     // SAFETY: a non-null callback from the runtime's own table, given the
     // runtime's queue handle and a fully initialised out-struct local. The
     // runtime writes `hContext` and the three windows into it.
-    let hr = unsafe { create_context_cb(h_rt_queue, &mut arg) };
+    let mut hr = unsafe { create_context_cb(h_rt_queue, &mut arg) };
+    if want_node != 0 {
+        if hr < 0 || arg.hContext.is_null() {
+            note_refusal(&L2_REFUSALS.queue_context_node_refused);
+            if budget(&QUEUE_LOG).is_some() {
+                log_error!(
+                    "CreateCommandQueue: CreateContext on node {want_node} hr={:#010x}; node 0 instead \
+                     (is D3d12Node=1 set and the adapter restarted?)",
+                    hr as u32
+                );
+            }
+            arg = ddi12::D3DDDICB_CREATECONTEXT {
+                NodeOrdinal: 0,
+                EngineAffinity: 0,
+                ..Default::default()
+            };
+            // SAFETY: as above.
+            hr = unsafe { create_context_cb(h_rt_queue, &mut arg) };
+        } else {
+            L2_REFUSALS.queue_context_node1.bump();
+        }
+    }
 
     // ⚠ KEPT VERBATIM, and it still reads `arg` rather than the latched
     // [`ContextWindows`] even though FB-1 now stores them. Two reasons, both
@@ -1399,6 +1474,7 @@ unsafe extern "system" fn destroy_command_queue(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
 ) {
+    ddi_time!("destroy_command_queue");
     // SAFETY: the caller guarantees a live handle from `create_command_queue`.
     let Some(slot) = (unsafe { Slot::<Boxed<QueueState>>::from_priv(h_queue.drv_private()) })
     else {
@@ -1419,6 +1495,12 @@ unsafe extern "system" fn destroy_command_queue(
     // so no new operation can acquire this queue through it.
     // SAFETY: `state` is the live box this call took out of the slot, so its
     // `h_rt_queue` and `h_context` are the pair `create_wddm_context` produced.
+    // `Umd12MergeEcl`: a held packet goes in before the context drains.
+    // SAFETY: the queue's creating device outlives its queues.
+    if let Some(dev) = unsafe { device12::device(state.h_device) } {
+        // SAFETY: the live box taken above; destroy runs on a DDI thread.
+        unsafe { flush_merged(dev, &state, MergeFlush::Destroy) };
+    }
     let hr = unsafe { destroy_wddm_context(&state) };
     // S5: the context is gone (and drained through the NVK fence the worker
     // signals); stop the worker and release the fence before the engine queue.
@@ -1491,6 +1573,7 @@ unsafe extern "system" fn calc_private_command_pool_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_POOL_0040,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_pool_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
     }
@@ -1513,6 +1596,7 @@ unsafe extern "system" fn create_command_pool(
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_POOL_0040,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_pool");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { Slot::<Boxed<PoolState>>::from_priv(h_pool.drv_private()) }) else {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
@@ -1551,6 +1635,7 @@ unsafe extern "system" fn reset_command_pool(
     h_device: ddi12::D3D12DDI_HDEVICE,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
+    ddi_time!("reset_command_pool");
     // SAFETY: the runtime supplies live device and pool handles for this call.
     let Some(pool) = (unsafe { pool_state(h_pool) }) else {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
@@ -1593,6 +1678,7 @@ unsafe extern "system" fn destroy_command_pool(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
+    ddi_time!("destroy_command_pool");
     // SAFETY: the caller guarantees a live handle from `create_command_pool`.
     let Some(slot) = (unsafe { Slot::<Boxed<PoolState>>::from_priv(h_pool.drv_private()) }) else {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
@@ -1621,6 +1707,7 @@ unsafe extern "system" fn calc_private_command_recorder_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_RECORDER_0040,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_recorder_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.recorder_bad_arg);
     }
@@ -1638,6 +1725,7 @@ unsafe extern "system" fn create_command_recorder(
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_RECORDER_0040,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_recorder");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { Slot::<Boxed<RecorderState>>::from_priv(h_recorder.drv_private()) })
     else {
@@ -1697,6 +1785,7 @@ unsafe extern "system" fn command_recorder_set_command_pool_as_target(
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
+    ddi_time!("command_recorder_set_command_pool_as_target");
     // SAFETY: the caller guarantees a live handle from `create_command_recorder`.
     let Some(recorder) = (unsafe { recorder_state(h_recorder) }) else {
         note_refusal(&L2_REFUSALS.recorder_bad_arg);
@@ -1880,6 +1969,7 @@ unsafe extern "system" fn destroy_command_recorder(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
 ) {
+    ddi_time!("destroy_command_recorder");
     // SAFETY: the caller guarantees a live handle from `create_command_recorder`.
     let Some(slot) = (unsafe { Slot::<Boxed<RecorderState>>::from_priv(h_recorder.drv_private()) })
     else {
@@ -1915,6 +2005,7 @@ unsafe extern "system" fn calc_private_command_list_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_LIST_0040,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_list_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.command_list_bad_arg);
     }
@@ -1964,6 +2055,7 @@ unsafe extern "system" fn create_command_list(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_rt_list: ddi12::D3D12DDI_HRTCOMMANDLIST,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_list");
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
     else {
@@ -2154,6 +2246,7 @@ unsafe extern "system" fn destroy_command_list(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
+    ddi_time!("destroy_command_list");
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(slot) = (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
     else {
@@ -2291,6 +2384,7 @@ unsafe extern "system" fn calc_private_command_signature_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001,
 ) -> ddi12::SIZE_T {
+    ddi_time!("calc_private_command_signature_size");
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.command_signature_bad_arg);
     }
@@ -2346,6 +2440,7 @@ unsafe extern "system" fn create_command_signature(
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001,
     h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
 ) -> ddi12::HRESULT {
+    ddi_time!("create_command_signature");
     // SAFETY: the runtime supplied the sized private output block.
     let Some(slot) =
         (unsafe { Slot::<Com<ID3D12CommandSignature>>::from_priv(h_signature.drv_private()) })
@@ -2483,6 +2578,7 @@ unsafe extern "system" fn destroy_command_signature(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
 ) {
+    ddi_time!("destroy_command_signature");
     // SAFETY: the caller guarantees a handle from `pfnCreateCommandSignature`.
     let Some(slot) =
         (unsafe { Slot::<Com<ID3D12CommandSignature>>::from_priv(h_signature.drv_private()) })
@@ -2620,6 +2716,24 @@ pub(crate) enum WddmSubmit {
 /// property, and `umd12` cannot name the bound because it does not depend on
 /// `bytemuck` (`umd12/Cargo.toml` takes `helios_protocol` alone).
 unsafe fn submit_wddm_render<T: Copy>(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    command_record: &T,
+    label: &'static str,
+) -> WddmSubmit {
+    // `Umd12MergeEcl`: a held ECL packet goes in first, in context order.
+    // SAFETY: forwarded precondition (entering DDI thread, live device/queue).
+    unsafe { flush_merged(dev, queue, MergeFlush::Context) };
+    // SAFETY: as above.
+    unsafe { submit_wddm_render_now(dev, queue, command_record, label) }
+}
+
+/// [`submit_wddm_render`] without flushing a held ECL packet first (the flush
+/// itself).
+///
+/// # Safety
+/// As [`submit_wddm_render`].
+unsafe fn submit_wddm_render_now<T: Copy>(
     dev: &device12::HeliosD3D12Device,
     queue: &QueueState,
     command_record: &T,
@@ -2885,6 +2999,9 @@ unsafe fn enqueue_runtime_admission(
     if dev.kt_callbacks.is_null() {
         return Err(E_NOTIMPL);
     }
+    // `Umd12MergeEcl`: a held ECL packet goes in before this signal.
+    // SAFETY: forwarded precondition.
+    unsafe { flush_merged(dev, queue, MergeFlush::Context) };
     // SAFETY: the device keeps its runtime-owned callback table alive.
     let callback =
         unsafe { (*dev.kt_callbacks).pfnSignalSynchronizationObject2Cb }.ok_or(E_NOTIMPL)?;
@@ -2919,9 +3036,10 @@ unsafe fn nvk_complete(
     queue: &QueueState,
     value: u32,
     admission: &AdmissionEvent,
+    must_admit: bool,
 ) -> Result<(), ddi12::HRESULT> {
     // SAFETY: forwarded precondition.
-    unsafe { enqueue_runtime_admission(dev, queue, admission) }?;
+    unsafe { admit(dev, queue, admission, must_admit) }?;
     let engine = queue.engine_queue.as_raw() as usize;
     // SAFETY: the engine queue lives as long as the queue state that owns the sync.
     let sync = queue
@@ -2955,6 +3073,7 @@ unsafe fn nvk_complete_fenced(
     value: u32,
     admission: &AdmissionEvent,
     fence: Option<crate::bridge12::EclFence>,
+    must_admit: bool,
 ) -> Result<bool, ddi12::HRESULT> {
     let Some(fence) = fence else {
         super::nvk12::note_ecl_fence(super::nvk12::EclFenceOutcome::NoFence);
@@ -2999,8 +3118,270 @@ unsafe fn nvk_complete_fenced(
         .fetch_max(u64::from(value), std::sync::atomic::Ordering::AcqRel);
     // SAFETY: same entering thread and exact context as the Render above.
     // SignalAtSubmission is essential: a completion event here deadlocks.
-    unsafe { enqueue_runtime_admission(dev, queue, admission) }?;
+    unsafe { admit(dev, queue, admission, must_admit) }?;
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// `Umd12MergeEcl` (diagnostic): fewer WDDM packets per frame
+// ---------------------------------------------------------------------------
+
+/// Most ECLs one merged packet stands for.
+const MERGE_MAX_ECLS: u32 = 16;
+/// A held packet older than this when the next ECL arrives goes in first.
+const MERGE_MAX_HOLD: Duration = Duration::from_micros(500);
+
+/// The ECL packet held back under `Umd12MergeEcl`: the newest batch's ECL fence,
+/// which fires after every batch it stands for (the engine executes a queue's
+/// batches in order), so one HE12 v4 packet completes them all.
+///
+/// ⛔ A ceiling measurement, never a default. The runtime orders its own
+/// operations on this context (an application's `Signal` / `Wait` on a
+/// runtime-owned fence, DXGI's flip waits) WITHOUT calling this driver: it
+/// calls `pfnSignalFence` / `pfnWaitForFence` only for fences with GPU-VA
+/// placements, which this driver never gets. So a held batch has no packet in
+/// the context when such an operation is queued after it: a `Signal` then fires
+/// before the held batch is done, and a `Wait` no longer holds it back (its GPU
+/// work is released at once, with no admission). Safe merging needs those
+/// operations visible (driver-backed fences); this measures what merging would
+/// give: packets per frame, and the frame time without the per-packet
+/// two-slot turnaround. Flushed at the next packet or signal this driver puts on
+/// the context, at Present, after `MERGE_MAX_ECLS` batches, at the first ECL
+/// after `MERGE_MAX_HOLD`, and at queue destruction.
+pub(crate) struct MergePending {
+    fence: crate::bridge12::EclFence,
+    value: u32,
+    ecls: u32,
+    since: std::time::Instant,
+}
+
+/// Why a held packet went in.
+#[derive(Clone, Copy)]
+pub(crate) enum MergeFlush {
+    /// Another packet or signal of this driver on the context.
+    Context,
+    /// Present.
+    Present,
+    /// `MERGE_MAX_ECLS`.
+    Full,
+    /// `MERGE_MAX_HOLD`.
+    Hold,
+    /// Queue destruction.
+    Destroy,
+}
+
+struct MergeStats {
+    packets: std::sync::atomic::AtomicU64,
+    ecls: std::sync::atomic::AtomicU64,
+    max_ecls: std::sync::atomic::AtomicU64,
+    hold_ns: std::sync::atomic::AtomicU64,
+    max_hold_ns: std::sync::atomic::AtomicU64,
+    by_reason: [std::sync::atomic::AtomicU64; 5],
+    failed: std::sync::atomic::AtomicU64,
+}
+
+static MERGE_STATS: MergeStats = MergeStats {
+    packets: std::sync::atomic::AtomicU64::new(0),
+    ecls: std::sync::atomic::AtomicU64::new(0),
+    max_ecls: std::sync::atomic::AtomicU64::new(0),
+    hold_ns: std::sync::atomic::AtomicU64::new(0),
+    max_hold_ns: std::sync::atomic::AtomicU64::new(0),
+    by_reason: [const { std::sync::atomic::AtomicU64::new(0) }; 5],
+    failed: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// `Umd12MergeEcl`: the merge counters since the last call, per frame
+/// (`frames` in the window), for the frame-time log.
+pub(crate) fn log_merge_stats(frames: u64) {
+    if !crate::knobs12::umd12_merge_ecl() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = &MERGE_STATS;
+    let packets = s.packets.swap(0, Relaxed);
+    let ecls = s.ecls.swap(0, Relaxed);
+    let max = s.max_ecls.swap(0, Relaxed);
+    let hold = s.hold_ns.swap(0, Relaxed);
+    let max_hold = s.max_hold_ns.swap(0, Relaxed);
+    let r: Vec<u64> = s.by_reason.iter().map(|c| c.swap(0, Relaxed)).collect();
+    let f = frames.max(1);
+    log_error!(
+        "D3D12 ECL merge (Umd12MergeEcl, diagnostic): {} packets/frame for {} ECLs/frame \
+         ({:.1} ECLs per packet, max {max}), hold avg {} us max {} us; flushed by context {} \
+         present {} full {} hold {} destroy {}; failed {}",
+        packets / f,
+        ecls / f,
+        ecls as f64 / packets.max(1) as f64,
+        hold / packets.max(1) / 1000,
+        max_hold / 1000,
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        s.failed.load(Relaxed),
+    );
+}
+
+/// `Umd12MergeEcl`: release this batch's GPU work now and hold its packet,
+/// standing for the held one if there is one.
+///
+/// # Safety
+/// As [`nvk_complete`].
+unsafe fn nvk_defer_fenced(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    value: u32,
+    admission: &AdmissionEvent,
+    fence: Option<crate::bridge12::EclFence>,
+) -> Result<(), ddi12::HRESULT> {
+    let Some(fence) = fence else {
+        return Err(E_FAIL);
+    };
+    super::nvk12::note_ecl_fence(super::nvk12::EclFenceOutcome::Submitted);
+    queue
+        .nvk_last_value
+        .fetch_max(u64::from(value), std::sync::atomic::Ordering::AcqRel);
+    // The held packet is older than the hold limit, or full: in first.
+    let take = {
+        let mut held = queue.merge_pending.lock().unwrap_or_else(|p| p.into_inner());
+        match held.as_ref() {
+            Some(p) if p.ecls >= MERGE_MAX_ECLS => held.take().map(|p| (p, MergeFlush::Full)),
+            Some(p) if p.since.elapsed() >= MERGE_MAX_HOLD => held.take().map(|p| (p, MergeFlush::Hold)),
+            _ => None,
+        }
+    };
+    if let Some((p, why)) = take {
+        // SAFETY: forwarded precondition.
+        unsafe { flush_pending(dev, queue, p, why) };
+    }
+    {
+        let mut held = queue.merge_pending.lock().unwrap_or_else(|p| p.into_inner());
+        let next = match held.take() {
+            Some(prev) => {
+                // The new fence fires after the held batch too.
+                super::nvk12::close_unused_fence(dev, prev.fence);
+                MergePending { fence, value, ecls: prev.ecls + 1, since: prev.since }
+            }
+            None => MergePending { fence, value, ecls: 1, since: std::time::Instant::now() },
+        };
+        *held = Some(next);
+    }
+    // No admission: the batch has no packet yet (see `MergePending`).
+    L2_REFUSALS.ecl_admission_skipped.bump();
+    // SAFETY: the owned, live admission event.
+    unsafe { windows::Win32::System::Threading::SetEvent(admission.0) }.map_err(|e| e.code().0)
+}
+
+/// Submit the held ECL packet, if any.
+///
+/// # Safety
+/// Entering DDI thread, live device and queue.
+pub(crate) unsafe fn flush_merged(dev: &device12::HeliosD3D12Device, queue: &QueueState, why: MergeFlush) {
+    if !crate::knobs12::umd12_merge_ecl() {
+        return;
+    }
+    let p = queue.merge_pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(p) = p {
+        // SAFETY: forwarded precondition.
+        unsafe { flush_pending(dev, queue, p, why) };
+    }
+}
+
+/// `Umd12MergeEcl` at Present: submit the queue's held packet.
+///
+/// # Safety
+/// As [`queue_state`]; on the Present DDI thread.
+pub(crate) unsafe fn flush_merged_for_present(h: ddi12::D3D12DDI_HCOMMANDQUEUE) {
+    if !crate::knobs12::umd12_merge_ecl() {
+        return;
+    }
+    // SAFETY: forwarded precondition.
+    let Some(queue) = (unsafe { queue_state(h) }) else {
+        return;
+    };
+    // SAFETY: a live queue implies its live device.
+    if let Some(dev) = unsafe { device12::device(queue.h_device) } {
+        // SAFETY: forwarded precondition.
+        unsafe { flush_merged(dev, queue, MergeFlush::Present) };
+    }
+}
+
+/// # Safety
+/// As [`flush_merged`].
+unsafe fn flush_pending(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    p: MergePending,
+    why: MergeFlush,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let record = helios_protocol::HeliosD3D12SubmitCmdV4 {
+        base: helios_protocol::HeliosD3D12SubmitCmd {
+            magic: helios_protocol::HELIOS_D3D12_SUBMIT_MAGIC,
+            version: helios_protocol::HELIOS_D3D12_SUBMIT_VERSION_V4,
+            ctx_id: 0,
+            value: 0,
+            cookie: 0,
+            gpu_wire_fence: 0,
+        },
+        fence: helios_protocol::HeliosRmFenceTail {
+            rm_fence_handle: p.fence.handle,
+            flags: helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
+            rm_fence_value: p.fence.value,
+        },
+    };
+    let s = &MERGE_STATS;
+    let held = u64::try_from(p.since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    s.packets.fetch_add(1, Relaxed);
+    s.ecls.fetch_add(u64::from(p.ecls), Relaxed);
+    s.max_ecls.fetch_max(u64::from(p.ecls), Relaxed);
+    s.hold_ns.fetch_add(held, Relaxed);
+    s.max_hold_ns.fetch_max(held, Relaxed);
+    s.by_reason[why as usize].fetch_add(1, Relaxed);
+    // SAFETY: forwarded precondition; the held packet must not flush itself.
+    match unsafe { submit_wddm_render_now(dev, queue, &record, "ExecuteCommandLists (merged HE12 v4)") } {
+        WddmSubmit::Submitted => {}
+        WddmSubmit::Refused(_) | WddmSubmit::Unavailable => {
+            // Ordered on the CPU instead, as an unfenced NVK batch is.
+            s.failed.fetch_add(1, Relaxed);
+            super::nvk12::close_unused_fence(dev, p.fence);
+            let engine = queue.engine_queue.as_raw() as usize;
+            // SAFETY: the engine queue lives as long as the queue state.
+            let sync = queue
+                .nvk
+                .get_or_init(|| unsafe { super::nvk12::NvkSync::new(dev, engine) });
+            // SAFETY: forwarded precondition; the queue's own context.
+            if let Err(hr) = unsafe { sync.order_context(dev, queue.h_context, engine, u64::from(p.value)) } {
+                report_ecl_submit_error(queue, hr);
+            }
+        }
+    }
+}
+
+/// Queue the runtime admission event for this NVK batch, or (diagnostic
+/// `Nvk12AdmitAfterPresentOnly`, `must_admit` false) release the engine at
+/// once by setting the event ourselves: the batch then does not wait for
+/// runtime waits queued before it on the context (cross-queue waits,
+/// flip-model buffer waits). Never a default: it is the ceiling of what
+/// skipping the per-batch admission round trip would give.
+///
+/// # Safety
+/// As [`enqueue_runtime_admission`].
+unsafe fn admit(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    admission: &AdmissionEvent,
+    must_admit: bool,
+) -> Result<(), ddi12::HRESULT> {
+    if must_admit {
+        // SAFETY: forwarded precondition.
+        return unsafe { enqueue_runtime_admission(dev, queue, admission) };
+    }
+    L2_REFUSALS.ecl_admission_skipped.bump();
+    // SAFETY: the owned, live admission event.
+    unsafe { windows::Win32::System::Threading::SetEvent(admission.0) }
+        .map_err(|e| e.code().0)
 }
 
 /// S5: does this queue's device run its engine on NVK on RM?
@@ -3023,6 +3404,31 @@ pub(crate) unsafe fn nvk_scanout_present(h: ddi12::D3D12DDI_HCOMMANDQUEUE, resou
     unsafe { queue_state(h) }
         .and_then(|queue| unsafe { device12::device(queue.h_device) })
         .is_some_and(|dev| unsafe { dev.engine.nvk_scanout_present(resource) })
+}
+
+/// `Nvk12EclSync=2`: queue a scanout flip of `resource` for when the last ECL
+/// fence value committed on this queue fires, instead of waiting for the queue
+/// on the CPU. False when this queue has no ECL fence value or the flip could
+/// not be queued (the caller waits and flips as before).
+///
+/// # Safety
+/// As [`queue_state`]; `resource` is a live engine resource of this device.
+pub(crate) unsafe fn nvk_scanout_present_fenced(h: ddi12::D3D12DDI_HCOMMANDQUEUE, resource: usize) -> bool {
+    // SAFETY: forwarded precondition.
+    let Some(queue) = (unsafe { queue_state(h) }) else {
+        return false;
+    };
+    let value = queue
+        .nvk_last_ecl_fence
+        .load(std::sync::atomic::Ordering::Acquire);
+    if value == 0 {
+        return false;
+    }
+    // SAFETY: a live queue implies its live device; the engine queue lives with it.
+    unsafe { device12::device(queue.h_device) }.is_some_and(|dev| unsafe {
+        dev.engine
+            .nvk_scanout_present_fenced(resource, queue.engine_queue.as_raw() as usize, value)
+    })
 }
 
 /// S5: wait on the CPU until every NVK boundary committed on this queue
@@ -3083,6 +3489,7 @@ unsafe extern "system" fn execute_command_lists(
     count: ddi12::UINT,
     lists: *const ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
+    ddi_time!("execute_command_lists");
     // Per-frame accounting (`nvk12::FrameStats`): the whole DDI, wait included.
     let started = std::time::Instant::now();
     // SAFETY: forwarded unchanged; the caller's guarantee is the body's.
@@ -3242,6 +3649,8 @@ unsafe fn execute_command_lists_body(
         .collect();
     // NVK, Nvk12EclSync=2: ask the engine for an ECL fence with the batch.
     let want_fence = dev.engine.is_nvk() && super::nvk12::ecl_fences_wanted(dev);
+    // Diagnostic `Nvk12AdmitAfterPresentOnly`; true otherwise.
+    let must_admit = !dev.engine.is_nvk() || nvk_must_admit(queue);
     // SAFETY: owned list interfaces and event outlive this call. The engine
     // duplicates the event and retains allocator/command-buffer lifetimes.
     let executed = unsafe {
@@ -3274,6 +3683,13 @@ unsafe fn execute_command_lists_body(
     };
     L2_REFUSALS.ecl_forwarded.bump();
     L2_REFUSALS.ecl_exact_boundary.bump();
+    if let Some(fence) = ecl_fence {
+        // The engine signals this value after the batch whatever becomes of the
+        // fence handle, so a scanout present may name it.
+        queue
+            .nvk_last_ecl_fence
+            .fetch_max(fence.value, std::sync::atomic::Ordering::AcqRel);
+    }
     if boundary.0 != 0 {
         if let Some(fence) = ecl_fence {
             // A Venus boundary never comes with an ECL fence; never leak one.
@@ -3281,16 +3697,46 @@ unsafe fn execute_command_lists_body(
         }
     }
     if boundary.0 == 0 {
+        if want_fence && crate::knobs12::umd12_merge_ecl() && ecl_fence.is_some() {
+            // Diagnostic `Umd12MergeEcl`: hold this batch's packet and merge it
+            // with the ones that follow (see `MergePending`).
+            // SAFETY: entering ECL thread, live device/queue, execution lock held.
+            match unsafe { nvk_defer_fenced(dev, queue, boundary.1, &admission, ecl_fence) } {
+                Ok(()) => {
+                    L2_REFUSALS.ecl_nvk_ordered.bump();
+                }
+                Err(hr) => {
+                    note_refusal(&L2_REFUSALS.ecl_admission_failed);
+                    report_ecl_submit_error(queue, hr);
+                }
+            }
+            return;
+        }
         if want_fence {
             // HE12 v4: the KMD withholds this packet's DMA completion until the
             // ECL fence fires, so nothing here waits. `false` = not ordered
             // that way (no fence, or the Render refused it): the CPU wait
             // below orders this batch instead.
             // SAFETY: entering ECL thread, live device/queue, execution lock held.
-            match unsafe { nvk_complete_fenced(dev, queue, boundary.1, &admission, ecl_fence) } {
+            match unsafe {
+                nvk_complete_fenced(dev, queue, boundary.1, &admission, ecl_fence, must_admit)
+            } {
                 Ok(true) => {
                     L2_REFUSALS.ecl_nvk_ordered.bump();
                     note_refusal(&L2_REFUSALS.ecl_admission_queued);
+                    // `Nvk12EclFencePrefetch`: the next ECL's fence now, with
+                    // this batch already admitted, so its Render need not wait
+                    // for the fence-create escape. Still under the execution
+                    // lock, so no other ECL of this queue interleaves.
+                    if crate::knobs12::nvk12_ecl_fence_prefetch() {
+                        // SAFETY: the live engine queue, execution lock held.
+                        let made = unsafe {
+                            crate::bridge12::prepare_ecl_fence(queue.engine_queue.as_raw() as usize)
+                        };
+                        if !made {
+                            note_refusal(&L2_REFUSALS.ecl_fence_prefetch_failed);
+                        }
+                    }
                     return;
                 }
                 Ok(false) => {}
@@ -3304,7 +3750,7 @@ unsafe fn execute_command_lists_body(
         // S5: NVK on RM -- no HE12 record (the KMD knows no NVK stream); the
         // context is ordered behind the boundary by this driver.
         // SAFETY: entering ECL thread, live device/queue, execution lock held.
-        match unsafe { nvk_complete(dev, queue, boundary.1, &admission) } {
+        match unsafe { nvk_complete(dev, queue, boundary.1, &admission, must_admit) } {
             Ok(()) => {
                 L2_REFUSALS.ecl_nvk_ordered.bump();
                 note_refusal(&L2_REFUSALS.ecl_admission_queued);
@@ -3376,6 +3822,7 @@ unsafe fn execute_command_lists_body(
 /// Count and terminate if it is ever invoked: returning would invent a stack
 /// cleanup convention, which corrupts the caller on x86.
 unsafe extern "system" fn queue_unused_slot() -> ! {
+    ddi_time!("queue_unused_slot");
     note_refusal(&L2_REFUSALS.queue_unused_slot_called);
     std::process::abort();
 }
@@ -3384,6 +3831,7 @@ unsafe extern "system" fn queue_unused_slot() -> ! {
 /// the one reason that matters: a shared body could not say *which* of the two
 /// the runtime called, and that is the entire content of the observation.
 unsafe extern "system" fn queue_unused2_slot() -> ! {
+    ddi_time!("queue_unused2_slot");
     note_refusal(&L2_REFUSALS.queue_unused2_slot_called);
     std::process::abort();
 }
@@ -3477,6 +3925,7 @@ unsafe extern "system" fn signal_fence(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     op_arg: *mut ddi12::D3D12DDIARG_FENCE_OPERATION,
 ) {
+    ddi_time!("signal_fence");
     // SAFETY: forwarded unchanged; the caller's guarantee is `fence_operation`'s.
     unsafe { fence_operation(FenceOp::Signal, h_queue, op_arg) }
 
@@ -3528,6 +3977,7 @@ unsafe extern "system" fn wait_for_fence(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     op_arg: *mut ddi12::D3D12DDIARG_FENCE_OPERATION,
 ) {
+    ddi_time!("wait_for_fence");
     // SAFETY: forwarded unchanged; the caller's guarantee is `fence_operation`'s.
     unsafe { fence_operation(FenceOp::Wait, h_queue, op_arg) }
 }
@@ -3977,6 +4427,16 @@ pub(crate) struct L2Refusals {
     command_signature_translation_oom: RefusalCounter,
     /// S5: ECLs on NVK on RM ordered by the driver (no HE12 record).
     ecl_nvk_ordered: RefusalCounter,
+    /// NVK ECLs released without the runtime admission event (diagnostic
+    /// `Nvk12AdmitAfterPresentOnly`).
+    ecl_admission_skipped: RefusalCounter,
+    /// D3D12 queue contexts created on node 1 (`Umd12ContextNode`).
+    queue_context_node1: RefusalCounter,
+    /// Node 1 was refused (one-node KMD); the queue is on node 0.
+    queue_context_node_refused: RefusalCounter,
+    /// `Nvk12EclFencePrefetch`: the next ECL's fence could not be made ahead
+    /// (that ECL makes it inline).
+    ecl_fence_prefetch_failed: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -4076,6 +4536,10 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     tile_mappings_admitted: RefusalCounter::new("TileMappingsAdmitted"),
     command_signature_translation_oom: RefusalCounter::new("CommandSignatureTranslationOom"),
     ecl_nvk_ordered: RefusalCounter::new("EclNvkOrdered"),
+    ecl_admission_skipped: RefusalCounter::new("EclAdmissionSkipped"),
+    queue_context_node1: RefusalCounter::new("QueueContextNode1"),
+    queue_context_node_refused: RefusalCounter::new("QueueContextNodeRefused"),
+    ecl_fence_prefetch_failed: RefusalCounter::new("EclFencePrefetchFailed"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -4219,6 +4683,10 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.present_producer_admitted,
     &L2_REFUSALS.command_signature_translation_oom,
     &L2_REFUSALS.ecl_nvk_ordered,
+    &L2_REFUSALS.ecl_admission_skipped,
+    &L2_REFUSALS.queue_context_node1,
+    &L2_REFUSALS.queue_context_node_refused,
+    &L2_REFUSALS.ecl_fence_prefetch_failed,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

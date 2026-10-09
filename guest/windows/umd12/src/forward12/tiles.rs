@@ -111,7 +111,8 @@ unsafe fn admit_mapping(
     if boundary.0 == 0 {
         // S5: NVK on RM, the same completion as an ECL boundary (queue.rs).
         // SAFETY: entering DDI thread, live device/queue, execution lock held.
-        match unsafe { nvk_complete(dev, queue, boundary.1, &event) } {
+        // Tile mappings always take the runtime admission.
+        match unsafe { nvk_complete(dev, queue, boundary.1, &event, true) } {
             Ok(()) => L2_REFUSALS.tile_mappings_admitted.bump(),
             Err(hr) => mapping_error(queue, hr),
         }
@@ -158,6 +159,7 @@ pub(super) unsafe extern "system" fn update_tile_mappings(
     counts: *const ddi12::UINT,
     flags: ddi12::D3D12DDI_TILE_MAPPING_FLAGS,
 ) {
+    ddi_time!("update_tile_mappings");
     // SAFETY: live private queue block provided by the runtime.
     let Some(queue) = (unsafe { queue_state(h_queue) }) else {
         note_refusal(&L2_REFUSALS.tile_mappings_refused);
@@ -245,6 +247,7 @@ pub(super) unsafe extern "system" fn copy_tile_mappings(
     size: *const ddi12::D3D12DDI_TILE_REGION_SIZE,
     flags: ddi12::D3D12DDI_TILE_MAPPING_FLAGS,
 ) {
+    ddi_time!("copy_tile_mappings");
     // SAFETY: live private queue block from this driver's creation.
     let Some(queue) = (unsafe { queue_state(h_queue) }) else {
         note_refusal(&L2_REFUSALS.tile_mappings_refused);

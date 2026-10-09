@@ -284,9 +284,56 @@ pub fn from_d3dddi(format: u32) -> u32 {
     }
 }
 
+/// DXGI 88 `B8G8R8X8_UNORM`.
+pub const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
+
+/// The DXGI formats the KMD scans out as they are, through either flip arm (`ScanoutFormat`
+/// in `kmd_logic`; `ForeignFlip` takes the matching DRM fourccs ABGR8888 / ARGB8888 /
+/// XRGB8888): R8G8B8A8_UNORM, B8G8R8A8_UNORM, B8G8R8X8_UNORM. sRGB-typed, 10-bit and fp16
+/// formats are refused there (`docs/independent-flip.md` 2.4).
+pub const SCANOUT_DXGI_FORMATS: [u32; 3] = [
+    DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_B8G8R8X8_UNORM,
+];
+
+/// Whether an application's swap-chain buffer of DXGI format `app` may replace DWM's primary of
+/// format `dwm` on the scan-out (the format half of `CheckDirectFlipSupport`). `exact` is the
+/// rule measured promoting on 393.1 (`DirectFlipSupport` 4 keeps it): the same format only.
+/// Otherwise the same format, or two different 8-bit scan-out formats: the KMD shows each flip
+/// with that buffer's own format (the layout record's fourcc travels with the `ScanoutFlip`),
+/// so an R8G8B8A8 game on the B8G8R8A8 desktop needs no conversion. Many games (Source 2
+/// among them) present R8G8B8A8_UNORM while DWM's chain is B8G8R8A8_UNORM, and the exact rule
+/// kept every such game composed.
+pub fn direct_flip_formats_compatible(app: u32, dwm: u32, exact: bool) -> bool {
+    if app == dwm {
+        return app != 0;
+    }
+    !exact && SCANOUT_DXGI_FORMATS.contains(&app) && SCANOUT_DXGI_FORMATS.contains(&dwm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_flip_formats() {
+        // The exact rule (DirectFlipSupport 4, the 393.1 rule): equal formats only.
+        assert!(direct_flip_formats_compatible(87, 87, true));
+        assert!(!direct_flip_formats_compatible(28, 87, true));
+        // The default rule: an RGBA game on the BGRA desktop, and BGRX, are scan-out pairs.
+        assert!(direct_flip_formats_compatible(28, 87, false));
+        assert!(direct_flip_formats_compatible(87, 28, false));
+        assert!(direct_flip_formats_compatible(88, 87, false));
+        // 10-bit, fp16 and sRGB-typed buffers never pair with a different format.
+        for app in [24, 10, 29, 91] {
+            assert!(!direct_flip_formats_compatible(app, 87, false), "{app}");
+        }
+        // An unknown format never pairs, not even with itself.
+        assert!(!direct_flip_formats_compatible(0, 0, false));
+        // Equal non-scan-out formats keep the old answer (the KMD refuses those later).
+        assert!(direct_flip_formats_compatible(24, 24, false));
+    }
 
     // The pre-change predicates, VERBATIM. They are the specification this
     // table is asserted against; do not "tidy" them.

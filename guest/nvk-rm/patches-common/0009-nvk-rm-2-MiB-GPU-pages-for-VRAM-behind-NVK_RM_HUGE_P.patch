@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Thu, 8 Oct 2026 14:10:45 +0200
+Subject: [PATCH 09/10] nvk/rm: 2 MiB GPU pages for VRAM behind
+ NVK_RM_HUGE_PAGES
+
+VRAM was allocated and mapped with 64 KiB pages only; the proprietary
+driver uses 2 MiB pages for large VRAM, and a texture-heavy scene that
+samples gigabytes of images pays in GPU TLB misses with 64 KiB PTEs.
+
+With NVK_RM_HUGE_PAGES=1 (default off while it is measured), VRAM
+allocations of 2 MiB or more that the CPU never maps are allocated with
+NVOS32 PAGE_SIZE_HUGE / ATTR2 PAGE_SIZE_HUGE_2MB, and a bind uses
+NVOS46 PAGE_SIZE_HUGE when the VA, the memory offset and the range are all
+2 MiB granular (big PTEs otherwise, and for the pieces of a cut mapping).
+RM refusing the huge allocation or the huge mapping falls back to 64 KiB
+pages, said once.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  5 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c | 47 ++++++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c  | 41 ++++++++++++++++++-
+ 3 files changed, 87 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index d1b7eb1..a8b219f 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -227,6 +227,8 @@ VkResult nvkmd_rm_enumerate_pdevs(struct vk_object_base *log_obj,
+ #define NVKMD_RM_BIG_PAGE_SIZE         (64u << 10)
+ #define NVKMD_RM_HUGE_PAGE_SIZE        (2ull << 20)
+ 
++bool nvkmd_rm_huge_pages(void);
++
+ struct nvkmd_rm_sema_pool {
+    simple_mtx_t mutex;
+    struct util_dynarray chunks;     /* struct nvkmd_mem * */
+@@ -354,6 +356,9 @@ struct nvkmd_rm_mem {
+    /* System memory the GPU may keep in L2 (see nvkmd_rm_alloc_tiled_mem) */
+    bool gpu_cached;
+ 
++   /* VRAM allocated with 2 MiB pages (NVK_RM_HUGE_PAGES) */
++   bool huge;
++
+    /* For memory backed by our own pages (NV01_MEMORY_SYSTEM_OS_DESCRIPTOR),
+     * the CPU mapping is the allocation itself.
+     */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 8dc582e..2e32ca7 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -201,13 +201,29 @@ pte_kind_is_compressible(const struct nv_device_info *info, uint8_t kind)
+            kind == NVKMD_RM_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE + 1);
+ }
+ 
++/* NVK_RM_HUGE_PAGES (default off while it is measured) */
++bool
++nvkmd_rm_huge_pages(void)
++{
++   static int huge = -1;
++   if (huge < 0) {
++      huge = debug_get_bool_option("NVK_RM_HUGE_PAGES", false);
++      if (huge)
++         mesa_logi("NVK: 2 MiB GPU pages for VRAM (NVK_RM_HUGE_PAGES)");
++   }
++   return huge;
++}
++
+ static VkResult
+ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+                 bool vram, uint64_t size_B, uint64_t align_B, bool can_map,
+-                bool *compressed_inout, uint32_t *h_memory_out)
++                bool *compressed_inout, bool huge, uint32_t *h_memory_out)
+ {
+    const struct nvkmd_rm_lib *lib = dev->lib;
+ 
++   if (huge)
++      align_B = MAX2(align_B, NVKMD_RM_HUGE_PAGE_SIZE);
++
+    NV_MEMORY_ALLOCATION_PARAMS params = {
+       .owner = lib->root(dev->client),
+       .type = NVOS32_TYPE_IMAGE,
+@@ -220,7 +236,8 @@ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+    if (vram) {
+       hclass = NV01_MEMORY_LOCAL_USER;
+       params.attr = NVRM_DEF(OS32, _ATTR, _LOCATION, _VIDMEM) |
+-                    NVRM_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
++                    (huge ? NVRM_DEF(OS32, _ATTR, _PAGE_SIZE, _HUGE)
++                          : NVRM_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG)) |
+                     NVRM_DEF(OS32, _ATTR, _PHYSICALITY, _ALLOW_NONCONTIGUOUS);
+       /* Compressible memory is asked for the way NVKMS does it: block
+        * linear, 32 bpp, COMPR_ANY.  RM then backs it with compression
+@@ -236,6 +253,8 @@ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+       }
+       params.attr2 = NVRM_DEF(OS32, _ATTR2, _ZBC, _PREFER_NO_ZBC) |
+                      NVRM_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES);
++      if (huge)
++         params.attr2 |= NVRM_DEF(OS32, _ATTR2, _PAGE_SIZE_HUGE, _2MB);
+       if (!can_map)
+          params.flags |= NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED;
+    } else {
+@@ -357,11 +376,30 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+     */
+    const bool image_mem = vram && pte_kind_is_compressible(dev_info, pte_kind);
+    bool compressed = image_mem;
++   /* NVK_RM_HUGE_PAGES=1: 2 MiB pages for VRAM of 2 MiB or more that the CPU
++    * never maps (fewer GPU TLB misses on big render targets and textures;
++    * the proprietary driver uses them).  Mappings use huge PTEs where the
++    * range allows (nvkmd_rm_va_bind_mem), big ones elsewhere.
++    */
++   bool huge = vram && !bar && size_B >= NVKMD_RM_HUGE_PAGE_SIZE &&
++               nvkmd_rm_huge_pages();
+    if (vram) {
+       const bool want_compressed = compressed;
+       result = alloc_rm_memory(dev, log_obj, true, size_B, align_B,
+-                               flags & NVKMD_MEM_CAN_MAP, &compressed,
++                               flags & NVKMD_MEM_CAN_MAP, &compressed, huge,
+                                &mem->h_memory);
++      if (result != VK_SUCCESS && huge) {
++         static bool warned;
++         if (!warned) {
++            mesa_logw("NVK: RM refused 2 MiB pages for VRAM, using 64 KiB");
++            warned = true;
++         }
++         huge = false;
++         compressed = want_compressed;
++         result = alloc_rm_memory(dev, log_obj, true, size_B, align_B,
++                                  flags & NVKMD_MEM_CAN_MAP, &compressed,
++                                  false, &mem->h_memory);
++      }
+       if (result == VK_SUCCESS && want_compressed && !compressed) {
+          /* NVK already treats the image as compressed; the uncompressed
+           * kind keeps the memory usable (compression state is ignored).
+@@ -405,13 +443,14 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+          bool no_compr = false;
+          result = alloc_rm_memory(dev, log_obj, false, size_B, align_B,
+                                   flags & NVKMD_MEM_CAN_MAP, &no_compr,
+-                                  &mem->h_memory);
++                                  false, &mem->h_memory);
+       }
+    }
+    if (result != VK_SUCCESS)
+       goto fail_bar;
+ 
+    mem->vram = vram;
++   mem->huge = vram && huge;
+    mem->bar_charged = bar;
+    mem->gpu_cached = !vram && gpu_cacheable;
+    mem->pte_kind = pte_kind;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+index e43b3dc..8f763c9 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+@@ -253,6 +253,20 @@ unmap_range(struct nvkmd_rm_dev *dev, struct nvkmd_rm_va *va,
+                               va->base.addr + m->va_offset_B);
+ }
+ 
++/* A huge-PTE mapping cut into a piece that is no longer 2 MiB granular is
++ * mapped back with big PTEs (NVK_RM_HUGE_PAGES).
++ */
++static void
++fix_huge_part(const struct nvkmd_rm_va *va, struct nvkmd_rm_mapping *m)
++{
++   const uint32_t huge = NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _HUGE);
++   const uint64_t mask = NVKMD_RM_HUGE_PAGE_SIZE - 1;
++   if ((m->flags & huge) != huge)
++      return;
++   if (((va->base.addr + m->va_offset_B) | m->mem_offset_B | m->range_B) & mask)
++      m->flags = (m->flags & ~huge) | NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _BIG);
++}
++
+ /* Unmaps [va_offset_B, va_offset_B + range_B), mapping back the parts of
+  * partially covered mappings.  Called with va->mutex held.
+  */
+@@ -296,6 +310,7 @@ unbind_locked(struct nvkmd_rm_dev *dev, struct nvkmd_rm_va *va,
+       if (m.va_offset_B < start) {
+          struct nvkmd_rm_mapping left = m;
+          left.range_B = start - m.va_offset_B;
++         fix_huge_part(va, &left);
+          if (map_range(dev, va, &left) == 0)
+             util_dynarray_append(&va->mappings, left);
+          else
+@@ -306,6 +321,7 @@ unbind_locked(struct nvkmd_rm_dev *dev, struct nvkmd_rm_va *va,
+          right.va_offset_B = end;
+          right.mem_offset_B = m.mem_offset_B + (end - m.va_offset_B);
+          right.range_B = m_end - end;
++         fix_huge_part(va, &right);
+          if (map_range(dev, va, &right) == 0)
+             util_dynarray_append(&va->mappings, right);
+          else
+@@ -358,8 +374,17 @@ nvkmd_rm_va_bind_mem(struct nvkmd_va *_va,
+ 
+    uint32_t flags = NVRM_DEF(OS46, _FLAGS, _ACCESS, _READ_WRITE) |
+                     NVRM_DEF(OS46, _FLAGS, _DMA_OFFSET_FIXED, _TRUE);
++   /* Huge PTEs where the whole range is 2 MiB granular in both the VA and
++    * the memory (NVK_RM_HUGE_PAGES); RM refusing them falls back to big.
++    */
++   const uint64_t huge_mask = NVKMD_RM_HUGE_PAGE_SIZE - 1;
++   const bool huge = mem->vram && mem->huge &&
++                     va->rm_size_B >= NVKMD_RM_HUGE_PAGE_SIZE &&
++                     !((va->base.addr + va_offset_B) & huge_mask) &&
++                     !(mem_offset_B & huge_mask) && !(range_B & huge_mask);
+    if (mem->vram) {
+-      flags |= NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _BIG);
++      flags |= huge ? NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _HUGE)
++                    : NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _BIG);
+    } else {
+       flags |= NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _4KB) |
+                NVRM_DEF(OS46, _FLAGS, _CACHE_SNOOP, _ENABLE);
+@@ -396,8 +421,20 @@ nvkmd_rm_va_bind_mem(struct nvkmd_va *_va,
+    /* Binding over something replaces it */
+    result = unbind_locked(dev, va, log_obj, va_offset_B, range_B);
+    if (result == VK_SUCCESS) {
++      int ret = map_range(dev, va, &m);
++      if (ret != 0 && huge) {
++         static bool warned;
++         if (!warned) {
++            mesa_logw("NVK: RM refused a 2 MiB-page mapping (%d), using 64 KiB",
++                      ret);
++            warned = true;
++         }
++         m.flags = (m.flags & ~NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _HUGE)) |
++                   NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _BIG);
++         ret = map_range(dev, va, &m);
++      }
+       result = NVKMD_RM_CHECK(dev->lib, log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                              map_range(dev, va, &m), "map memory dma");
++                              ret, "map memory dma");
+    }
+    if (result == VK_SUCCESS)
+       util_dynarray_append(&va->mappings, m);
+-- 
+2.43.0
+

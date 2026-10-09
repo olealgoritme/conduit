@@ -1,6 +1,7 @@
 # Independent flip (direct flip) of flip-model swap chains: KMD design
 
-Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; the rest is design. The decision table of
+Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; flip completion from the host behind
+`FlipDoneHost` (default 0), section 13; the rest is design. The decision table of
 section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
 failure.
 Written against v327 (`225ce42`, branch `kmd/independent-flip-design`). Line numbers are that commit's.
@@ -982,8 +983,8 @@ into one knob and wires the decision table.
 
 | value | caps | census | flip paths |
 |---|---|---|---|
-| 0 (default, absent) | as `DirectFlipCaps` / `FlipCapsX` say, unchanged | off | unchanged |
-| 1 | `SupportDirectFlip` = 1, aperture segment `DirectFlip` = 1, `FlipCaps` OR `FlipIndependent \| DdiPresentForIFlip` (`FlipCapsRep` 0x32) | every flip judged and counted | unchanged |
+| 0 (the opt-out; was the default until 13.8) | as `DirectFlipCaps` / `FlipCapsX` say, unchanged | off | unchanged |
+| 1 (default since 13.8, also absent) | `SupportDirectFlip` = 1, aperture segment `DirectFlip` = 1, `FlipCaps` OR `FlipIndependent \| DdiPresentForIFlip` (`FlipCapsRep` 0x32) | every flip judged and counted | unchanged |
 | 2 | as 1 | as 1 | a DMA-buffer flip of a Venus allocation that is not in the direct-scan-out table completes as a kept picture instead of failing (`PBFlip` 0xE6, now `IdfEnfKeep`) |
 | other | as 1 | as 1 | unchanged (a typo never enforces) |
 
@@ -1189,6 +1190,27 @@ software cursor), `CurWhy` (last reason: 1 flags, 2 size, 3 pitch, 4 hotspot, 5 
 (host commands that failed), `CurXor` (inverting pixels in the last shape). Host: the backend logs `venus: the guest's hardware
 cursor is served (CMD_SET_CURSOR_BLOB)` at start and counts `set_cursor_blob=N` in its teardown `venus: ... command(s)` line.
 
+### 12.3a The cursor queue and timeouts (`HwCursorQ`)
+
+397.1: after Basemark the cursor froze for seconds, then returned. Each shape change was a
+control-queue round trip with a 500 ms timeout, behind every Venus `GpuCmd`; a busy backend made it
+time out, the KMD failed the shape, dxgkrnl fell back to the software cursor and the host image was
+hidden, so the pointer moved only as fast as DWM presented. Two changes:
+
+* a timeout is not a refusal (`hw_cursor::after_failure`): the command is queued and runs late, so
+  the host cursor stays (`CurTmo`); a command that never reached a queue stays owed and is sent again
+  from a later position call, at most every 250 ms (`CurRetry`); only an error answer falls back to
+  software;
+* the commands go on their own virtqueue (`virtio/gpu/cursor_ring.rs`, queue 2), which the backend
+  serves ahead of the control queue (docs/SCANOUT.md "Hardware cursor, Windows guests"). Needs the
+  backend of this change (config bit 20, `NVGPU_CFG_CURSOR_QUEUE`) and `num_vqs=3` on the QEMU
+  device. `HwCursorQ` = 0 keeps the control queue.
+
+Counters: `CurQ` (1 on the cursor queue), `CurQBusy` (a send deferred because the previous command
+was still out), `CurRttUs` / `CurRttMax` (round trip, microseconds), `CurTmo`, `CurRetry`,
+`CurGateMs` (longest wait for another pointer operation's I/O), `CurSwN` / `CurSwMs` / `CurSwMax`
+(software-cursor episodes: a refused shape until the host shows one again).
+
 ### 12.4 Recipe (main runs it; lowest mode first)
 
 Needs the backend and the KMD of this branch (`NVGPU_CFG_VENUS_CURSOR` is new; with an older backend the default knob reports no
@@ -1211,3 +1233,259 @@ premultiplied by the KMD) or 2.
 
 Safety: the knob is the whole surface (`HwCursor=0` and a restart restore the software cursor). A host that stops answering costs
 at most 500 ms per pointer command before that shape falls back to software.
+
+## 13. Flip completion from the host (`FlipDoneHost`)
+
+Branch `kmd/direct-flip-scanout`. Untested on hardware when written.
+
+### 13.1 Where the rest of the plan stood
+
+Checked against the base of this branch before writing anything:
+
+* **The caps and the UMD gate** (S-1, section 11) are in place: `IndepFlip` advertises `SupportDirectFlip`, the aperture
+  `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip`; the UMD's `DirectFlipSupport` answers `CheckDirectFlipSupport`.
+  This branch only tightens the UMD's mode 1 to pairs the KMD can scan out as they are (same extent and format, the format one
+  of R8G8B8A8 / B8G8R8A8 / B8G8R8X8 UNORM, one sample, one mip, one slice; mode 2 stays the size-and-format test lever), so a
+  10-bit or sRGB-typed chain is never promoted into a `WideFormat` refusal and a frozen picture. The stale comment above
+  `SupportDirectFlip` in `query_adapter_info.rs` (2.7) is rewritten.
+* **Application buffers on the scan-out** need no new acceptance rule: `foreign_flip::decide` takes any adopted NVK allocation of
+  the mode's extent in a scan-out format with a KMD-recorded layout (modifier included), whatever the UMD called it, and refuses
+  the rest with a counted reason (`FfRef*`, `IdfRef*`); with independent flip DXGI creates the chain from a `pPrimaryDesc`, so a
+  Venus chain is `MISC_DIRECT_SCANOUT` and takes the direct bind behind the undersize guard (11.6). The hardware runs of 11.6 and
+  12 (`IdfDirFor` 172362, `IdfKeep` 0) are that path working.
+* **Refresh rate**: the modes already include 240 Hz.
+
+What was missing is the completion: a flip retired on the guest's own timer, one tick after the KMD programmed it, whether or not
+the host had shown it, and on a phase unrelated to the host's vblank (`host-vblank-pacing.md` section 1).
+
+### 13.2 What it does
+
+The host side (`docs/SCANOUT.md`, "Presentation feedback"): the viewer's Wayland backend answers every commit the compositor
+presented (`wp_presentation_feedback.presented`) with `EV_PRESENTED` and the ATTACH's stamp; the backend maps the stamp to the guest
+flip it carried and sends `ScanoutPresented` (event queue message 33, virtio feature `NVGPU_F_SCANOUT_PRESENTED`, bit 19) once per
+flip. A report that finds no event buffer is dropped, never retried.
+
+The KMD side (`kmd_logic/src/host_flip_done.rs`, the rules and their host tests; `kmd_render/src/ddi/host_flip_done.rs`, the I/O):
+
+* every address publication records its time and a `seq` floor (one above the highest `ScanoutFlip` minted; the flip that carries
+  the new picture is minted after it). A `ScanoutFlip` report with `seq` at or above the floor confirms the published address; a
+  Venus report confirms it when it names the active scanout resource or the one the host is bound to (the copy path's image);
+* the vsync tick reports the **confirmed** address. A newer published one waits for its report, at most 3 periods (the timer
+  fallback: a discarded commit, a client that does not report). A kept picture is never held (the host is never told). Without a
+  report for 100 ms (static desktop, minimised viewer, no presenting client) the tick reports the published address, as before;
+* `FlipDoneHost=1` also delivers a CRTC_VSYNC from the report itself (unless any vsync went out less than half a period ago),
+  moves the timer's deadline to half a period after the report (only when it is more than an eighth of a period off, so the
+  steady state re-arms nothing), and a tick less than three quarters of a period after a report delivers nothing: the timer only
+  fills in the periods the host is silent in. A simulated 240 Hz run with 10% jitter (`a_simulated_240_hz_run...`) delivers every
+  host vblank and never two vsyncs closer than half a period;
+* `FlipDoneHost=2` is the hold alone (the timer delivers, on its own phase): the A/B for the early vsync;
+* the default `FlipQueueN` becomes 2 under the knob (an explicit `FlipQueueN` wins): with completion up to a period later than the
+  timer's, a depth of 1 would hold the application behind every host present.
+
+Why not a virtio-gpu fence on `RESOURCE_FLUSH` / `SET_SCANOUT_BLOB`: the NVK-on-RM path, which is what games and DWM run on, flips
+with `ScanoutFlip`, not `RESOURCE_FLUSH`; and the control queue answers in order, so a response held for a frame would stall every
+synchronous round trip behind it. The event queue already carries the per-frame `ScanoutReleased` the same way.
+
+### 13.3 Knob and counters
+
+`HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, `FlipDoneHost` (REG_DWORD, at most 14 characters, hence not
+`FlipDoneFromHost`), read with the adapter knobs (AddAdapter and StartDevice):
+
+| value | effect |
+|---|---|
+| absent, 0, other | off: the feature is not acked, the host sends nothing, every hook is one relaxed load, the tick is as before |
+| 1 | ack, hold, early vsync from the report, timer re-phase; default `FlipQueueN` 2 |
+| 2 | ack, hold only; default `FlipQueueN` 2 |
+
+Counters (event-gated: zeros at every StartDevice, then from the periodic dump when one moved; `FdhInact` alone does not make the
+block dirty): `FdhKnob` (the knob), `FdhAck` (1: the host took the ack and the event queue is up; with 0 the mode is forced off),
+`FdhEvN` (reports received), `FdhBad` (short), `FdhUnask` (sent without the ack), `FdhLatch` (reports that confirmed a newly
+published address), `FdhStale` (reports that confirmed nothing new), `FdhVsync` (CRTC_VSYNCs a report delivered), `FdhCoal` (reports
+that left the vsync to the tick), `FdhRephase` (timer re-phases), `FdhTkSkip` (ticks that delivered nothing), `FdhHeld` (ticks that
+reported the confirmed address over a newer published one), `FdhTmo` (ticks that gave up waiting), `FdhKept` (kept pictures
+reported at once), `FdhInact` (ticks with the knob on and no live feedback), `FdhLatUs` / `FdhLatMax` / `FdhLatAvg` (publish to
+report, microseconds, guest clock), `FdhAgeUs` (host-side screen to event-sent delay, microseconds). Host: the backend logs `wants
+presentation feedback` in its `guest driver features` line and counts `presented` / `presented_dropped` in `LinkStats`.
+
+### 13.4 Recipe (main runs it; lowest mode first)
+
+Needs the backend and the viewer of this branch (an older viewer sends no `EV_PRESENTED`: `FdhEvN` stays 0 and everything behaves
+as `FlipDoneHost=0`). Per row: set the values, reboot (the ack is negotiated at StartDevice and the caps at AddAdapter), check
+`FdhKnob`, `FdhAck`, `FlipQueV`, run `d3d11_iflip.exe 20` (borderless, covering the output, interval 1) under PresentMon for 20 s,
+read the counters. Base settings for every row: `IndepFlip=1`, `HKLM\SOFTWARE\Helios` `DirectFlipSupport=1`, `HwCursor` default.
+
+| row | `FlipDoneHost` | expect |
+|---|---|---|
+| P0 | 0 | as 11.6: PresentMon `Hardware: Independent Flip`, about 240 fps, `Fdh*` 0, `FlipQueV` 1 |
+| P1 | 2 | `FdhAck` 1, `FlipQueV` 2, `FdhEvN` and `FdhLatch` near 240/s, `FdhHeld` > 0, `FdhTmo` near 0, `FdhLatAvg` around 1-2 periods (4-8 ms at 240 Hz), `FdhVsync` 0. Still `Hardware: Independent Flip`, fps about 240 |
+| P2 | 1 | as P1, and `FdhVsync` near 240/s, `FdhTkSkip` near 240/s, `FdhRephase` small (only while locking, after a stall or a mode change), `FdhCoal` small; PresentMon `MsBetweenDisplayChange` steadier than P0; `VpVsN`/`VsCnt` still rising (the timer runs) |
+| P3 | 1 | as P2 with `interval0` and `tearing`: no regression against P0 (`IdfArmDma`, fps uncapped as before) |
+| P4 | 1 | desktop idle 10 s, then minimise the viewer for 10 s: `FdhInact` rises, `FdhTmo` stays near 0, the desktop keeps presenting (DWM not stuck) |
+| P5 | 1 | 5120x1440@240, Heaven full screen: as P2 |
+
+Read with every row: the `Idf*` block, `VpVsN`, `VsCnt`, `VsMinGap`, `VsFast` (a re-phase shortens one tick gap: a few `VsFast` per
+lock are expected), `FlipPub`, `FfRttUsMax`, the backend's `presented` / `presented_dropped`. A `presented_dropped` that rises with
+the frame rate means the guest's 16 event buffers are exhausted (releases and reports share them).
+
+Risks, in the order they would show: (1) dxgkrnl retiring flips only by exact address, with a queue depth of 2 and a coalescing
+pending slot (4.4): `FdhTmo` and frozen presents would say so; `FlipQueueN=1` with the knob is the lever. (2) The early vsync from
+the DPC racing the tick on another CPU: at worst two vsyncs a fraction of a period apart, once (`VsFast`). (3) A host that reports
+late (the compositor composites instead of scanning out directly): the hold costs up to a period of latency, `FdhLatAvg` shows
+it; `FlipDoneHost=2` or 0 is the fallback. The knob is the whole surface: 0 and a reboot restore today's behaviour.
+
+### 13.5 First run on 388.1: composed, never promoted, and what to read next
+
+Run: G1 knobs, `IndepFlip=1`, `DirectFlipSupport=1`, `FlipDoneHost` unset, 1920x1080@240, `d3d11_iflip.exe 40` (40 is the run
+time in seconds; with no other option the window is the borderless `WS_POPUP` covering output 0 at its mode, interval 1, 2 BGRA8
+buffers, cursor hidden: the shape 11.6 promoted with), PresentMon 10 s. PresentMon `Composed: Flip` for all 2393 frames, pacing fine
+(median 4.03 ms). `IdfDirFor` 7382, `IdfKeep` 0, every `IdfRef*` / `FfRef*` 0, `FlipQueV` 1, `Fdh*` 0.
+
+Reading:
+
+* `IdfDirFor` alone does not show promotion. With DWM on NVK every flip DWM makes of its own chain is a `ForeignFlip` direct flip:
+  7382 over the 40 s run is about DWM's own rate. The evidence of a hand-over is `IdfSpaTrans` (a `SharedPrimaryTransition`
+  flip), `IdfSpaExcl`, `FfReowned` (the shown allocation changed importer: the application's buffer), `IdfPrRedir` (dxgkrnl's
+  candidate presents) and the tool's own `dxgi_mode` lines (11.6 promoted with `OVERLAY`). None of these were reported.
+* What the docs require (`/steam/refsrc`): the flip-model guide (`win32/desktop-src/direct3ddxgi/for-best-performance--use-dxgi-
+  flip-model.md`, "DirectFlip") names three DirectFlip shapes: buffers equal to the screen with a window covering it (ours), the
+  same with panel fitters, and MPO. Independent flip is then engaged in **any** of them; MPO is one way to stay in it with content on
+  top, not a requirement. `DXGK_FLIPCAPS.FlipIndependent` is mandatory for WDDM 1.3+ drivers (set by `IndepFlip`). The UMD's
+  `CheckDirectFlipSupport` is called by DWM "at least once before DWM attempts to present to a Direct Flip swapchain", again after
+  every mode change or DWM swap-chain re-creation; its checks are MSAA, stereo, swizzle and the same `VidPnSourceId`
+  (`d3d10umddi/nc-d3d10umddi-pfnd3d11_1ddi_checkdirectflipsupport.md`). Nothing documented asks for `SupportMultiPlaneOverlay`, an
+  MPO caps query, `FlipInterval` or immediate-flip caps for a full-screen window, and 11.6 promoted with none of them. Two shipping
+  references (`GpuDrivers/.../GsDevice.cpp`, `graphics-driver-samples` roskmd) set `FlipIndependent` and `DdiPresentForIFlip` and
+  nothing MPO-related for it.
+* What changed between the promoted build (345.1) and 388.1 on this path: (1) **this branch's UMD change**: `DirectFlipSupport=1`
+  had become the stricter scan-out rule (13.1); if DWM's chain or the opened application buffer reports a format outside 28/87/88
+  or anything else the rule refuses, DWM is told no and never promotes. Restored: 1 is again the measured rule (same size and
+  format), the strict rule is now 3. (2) The G1 knobs and the lane F GDI/redirection work, which change how the Blt arm runs; the
+  candidate presents dxgkrnl sends with `DdiPresentForIFlip` (`RedirectedFlip` without `Flip`, 11.6: 957 of them before promotion)
+  take that arm. If they now fail or stall, dxgkrnl has reason to keep the window composed. New counters say: `IdfRedOk`,
+  `IdfRedErr`, `IdfRedSt` (last failing status), `IdfRedSD` (source and destination counts), and the experiment knob
+  `IdfRedirSkip=1` completes them with no copy (`IdfRedSkip`). (3) `HwCursor` defaults to 1 (section 12); a hardware pointer is what
+  bare metal has, so it is not a suspect, but it is one knob to flip if nothing else explains it.
+* The launch: a program started by the task scheduler may not take the foreground (`SetForegroundWindow` fails under the foreground
+  lock), so its console or the taskbar stays the active window. A full-screen window that is not the foreground window can be
+  overlapped by the topmost taskbar and is not treated as full screen. The tool now logs `foreground after start`, and every second
+  `fg=` and `points_on_us=N/5` (which window is under the output's corners and centre), and takes options `topmost`, `fg` (take the
+  foreground: attach to the foreground thread's input and a synthetic key event) and `noconsole`.
+
+Recipe (main runs it; 1920x1080@240; one reboot per knob change; PresentMon 10 s from t=10 s; every row collects: PresentMon
+`PresentMode`, the tool's `foreground after start`, its `fg=` / `points_on_us=` / `dxgi_mode=` lines and `RESULT`, the counters
+`IdfSeen IdfDirFor IdfDirVen IdfKeep IdfSpaTrans IdfSpaExcl IdfSpaFlg IdfPrRedir IdfPrFlg IdfRedOk IdfRedErr IdfRedSt IdfRedSD
+IdfRedSkip FfReowned FfMoved FfProg PBFlip FkKeep`, and from `C:\ProgramData\Helios\` the `dwm` UMD log's
+`CheckDirectFlipSupport #` lines (they now print `dwm=`, both resources' kind, size, format and slices, and the answer):
+
+| row | change from the 13.5 run | read |
+|---|---|---|
+| R1 | the new build only (`DirectFlipSupport=1` is the 345.1 rule again), `d3d11_iflip.exe 40 topmost fg noconsole` | the main row. `fg=1` and `points_on_us=5/5` every second rule out the launch. Promoted: PresentMon `Hardware: Independent Flip`, `dxgi_mode=OVERLAY` (or NONE), `IdfSpaTrans` >= 1, `FfReowned` >= 1 |
+| R2 | as R1 with `DirectFlipSupport=3` | the strict rule: if R1 promotes and R2 does not, the dwm log line names the refused field |
+| R3 | as R1, G1 knobs off (the 345.1 knob set) | if R1 stays composed and R3 promotes, it is the lane F path: read `IdfRedErr` / `IdfRedSt` in R1 |
+| R4 | as R1 with `IdfRedirSkip=1` | only if R1 shows `IdfPrRedir` rising with no promotion, or `IdfRedErr` > 0 |
+| R5 | as R1 with `HwCursor=0` | last: whether the hardware pointer matters |
+| R6 | R1's winner with `FlipDoneHost=2`, then `=1` | 13.4 rows P1 and P2 |
+
+Diagnosis table: no `CheckDirectFlipSupport` line in the dwm log at all means DWM never considered DirectFlip for the window (the
+launch, an overlap, or dxgkrnl's derived support: the tool's `kmt:` lines at start must show `DIRECTFLIP_SUPPORT` and
+`INDEPENDENTFLIP_SUPPORT` = 1); lines answering `no` name why; `yes` with no `IdfSpaTrans` points at dxgkrnl's side (the candidate
+presents: `IdfPrRedir`, `IdfRed*`).
+
+### 13.6 392.1: the candidate presents failed `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER`; fixed
+
+R1 and R3 on 392.1 (`topmost fg noconsole`, `DirectFlipSupport=1`, with and without the G1 knobs) were identical and still
+`Composed: Flip`, but they showed the hand-over starting: `IdfSpaTrans` 2, `FfReowned` 1. Then every candidate present failed:
+`IdfPrRedir` 1981, `IdfRedErr` 1980, `IdfRedOk` 0, `IdfRedSt` 0xC01E0001 = `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER`,
+`IdfRedSD` 0x10000 = one source and **no destination**. A `RedirectedFlip` present without `Flip` takes the Blt arm, whose first
+check refuses a DMA buffer smaller than the 16-byte refresh marker (site `BLT_DMA_SMALL`, 22). dxgkrnl offers these presents no DMA
+room: there is nothing to copy (no destination), so it never retries with a bigger buffer, and the failed present gives it every
+reason to stay composed. Lane F is not involved (R3).
+
+Fix (`helios_kmd_logic::independent_flip::redirected_blt_action`, whenever `IndepFlip` is on, no knob): a candidate present with no
+destination completes with no copy: with no DMA buffer (or `DmaSize` 0) it returns success and writes nothing, so nothing is
+submitted; with room for the marker it takes the no-copy completion (fence-0 marker, patch references) so a submitted buffer never
+carries a stale record. Counted `IdfRedNoDst`. `IdfRedirSkip` = 1 still does the same for candidates that have a destination
+(`IdfRedSkip`); 392.1 showed none. New diagnostics: `IdfRedFlg` (the last candidate's present flags), `IdfRedSite` (the last failing
+one's return site), `IdfRedDma` (`DmaSize << 16 | DmaBufferPrivateDataSize`, each saturated at 0xFFFF).
+
+Next run: R1 alone. Expect `IdfRedNoDst` = `IdfPrRedir`, `IdfRedErr` 0, `IdfRedOk` = `IdfPrRedir`, PresentMon `Hardware: Independent
+Flip`, `FfReowned` >= 1 and `FfMoved` / `IdfDirFor` at the application's rate. R4 (`IdfRedirSkip=1`) only matters if `IdfRedErr` is
+still nonzero with `IdfRedSD` showing a destination. If R1 still stays composed with `IdfRedErr` 0, read `IdfRedDma` and `IdfRedFlg`
+and the dwm log's `CheckDirectFlipSupport #` lines next.
+
+### 13.7 393.1: promoted; what stands between it and the default
+
+393.1 R1 (G1, `IndepFlip=1`, `DirectFlipSupport=1`, `d3d11_iflip 40 topmost fg`, 1920x1080@240): PresentMon `Hardware: Independent
+Flip` for all 2394 frames, median 4.02 ms, p99 4.67, max 7.72. `IdfRedOk` = `IdfRedNoDst` = `IdfPrRedir` = 9599, `IdfRedErr` 0,
+`IdfSpaExcl` 9598 (every flip in independent-flip exclusive mode), `IdfRedFlg` 0x2000 (`RedirectedFlip` alone: not even the Blt
+bit), `FfReowned` 1. The no-destination fix (13.6) was the blocker.
+
+The dwm process logged no `CheckDirectFlipSupport` line at all: on this setup DWM does not ask the D3D11 UMD, so
+`DirectFlipSupport` is probably not a door. One run with `DirectFlipSupport=0` settles it; if it still promotes, the UMD knob is
+irrelevant and every safety rule below must live in the KMD.
+
+Before `IndepFlip=1` becomes the default, these rows (each a reboot; 1920x1080@240, then 5120x1440@240):
+
+| risk | what can go wrong | row | pass |
+|---|---|---|---|
+| 10-bit / fp16 swap chains (HDR games) | the KMD refuses `WideFormat` and completes the flip as a kept picture; promoted, DWM draws nothing, so the window freezes on its last frame | `d3d11_iflip 20 topmost fg rgb10`, then `fp16` | composed (dxgkrnl does not promote), or promoted with `IdfKeep` 0. A frozen picture with `IdfRef09` rising is a blocker: then the KMD must not advertise for it, or the UMD/KMD must refuse it earlier |
+| resize inside the app / mode change | buffers of another extent: `Extent` refusal, kept picture | resize Heaven's window to full screen and back; the viewer's fullscreen toggle (mode change) while promoted | demotes and re-promotes; `IdfRef07` stays 0 or transient |
+| alt-tab, Win key, a toast, a window on top | the hand-back to DWM | as R1, then alt-tab out and back three times, open the Start menu, show a notification | `IdfSpaTrans` +2 per round trip, never a black or frozen screen |
+| application exit / kill while promoted | the shown buffer disappears | `taskkill /f` the tool at t=10 s | desktop back within a frame or two, `FfGone` 1 |
+| cursor | software cursor is not drawn while promoted | `HwCursor` default (1) with `cursor` option | cursor visible (section 12) |
+| DMA flips (interval 0, tearing) | an unregistered Venus buffer fails `PBFlip` 0xE6 under `IndepFlip=1` (`IndepFlip=2` keeps it) | `interval0`, then `interval0 tearing` | no `PBFlip` 0xE6; if there is, the default must be 2, not 1 |
+| DWM restart, device restart | the importer's file closes | `taskkill /f /im dwm.exe`; `pnputil /restart-device` | desktop back, promotion again on the next run |
+| a game, not the tool | real swap chains, overlays | one D3D12 title (3DMark Time Spy) and one flip-model D3D11 title, full screen borderless | `Hardware: Independent Flip`, fps not below composed |
+
+The tool now writes its log next to the executable (`d3d11_iflip.txt`, or `log=PATH`): a scheduled task runs in
+`C:\Windows\System32`, where the old current-directory log could not be created, and its stdout is not captured.
+
+### 13.8 The defaults
+
+After 393.1 / 394.1 (promotion with `IdfRedErr` 0; `DirectFlipSupport=0` stays composed, so DWM does consult the UMD; `rgb10` and
+`fp16` stay composed with `IdfKeep` 0) and the safety rows (`iflip-safety.sh`: alt-tab, Start, a toast, a resize, killing the
+application and `dwm.exe` while promoted, interval 0, tearing), `IndepFlip` defaults to 1 (`independent_flip::KNOB_DEFAULT`) and
+`DirectFlipSupport` to 1. Opt-outs: `IndepFlip` = 0 in the KMD service key (then the UMD answer is no as well: dxgkrnl reports no
+DirectFlip), or `HKLM\SOFTWARE\Helios` `DirectFlipSupport` = 0 to keep the caps but refuse every promotion. `FlipDoneHost` stays 0
+until its own rows (13.4) are measured.
+
+### 13.9 Counter-Strike 2 (D3D11, flip model): why it stays composed, and the rows
+
+Measured on 405.5: CS2 at 2560x1440 presents `Composed: Flip` on the 5120x1440@240 desktop. Three gates hold it there, each
+sufficient on its own:
+
+1. **The defaults.** 405.5 has the S-1 code (the no-destination fix of 13.6 included) but `IndepFlip` and `DirectFlipSupport`
+   both default to 0 there (13.8 landed on `main` only): no `SupportDirectFlip`, no `FlipIndependent`, and the UMD answers no.
+   This branch carries 13.8.
+2. **The extent.** The KMD offers exactly one resolution, the host's (`vidpn.rs`: source and target modes at `display_mode()`,
+   only the refresh varies), and has no scaler (`foreign_flip::decide` refuses `Extent`, the UMD rule compares the two
+   buffers' sizes). A 2560x1440 swap chain in a borderless window covering a 5120x1440 output is stretched by DWM, and
+   `CheckDirectFlipSupport` answers "size differs" for it. A 2560x1440 game is promotable only when the guest mode is
+   2560x1440: the viewer's `--resolution=2560x1440` (fixed hint; the viewer scales the scan-out to its window), or the game
+   at the native 5120x1440. "Fullscreen" (exclusive) in the game cannot switch the guest to 2560x1440 by itself: the mode is
+   not in the list.
+3. **The format.** DWM's primary is B8G8R8A8_UNORM; Source 2 presents R8G8B8A8_UNORM (to confirm from the dwm UMD log
+   line below). The 393.1 rule wanted equal formats. `DirectFlipSupport` 1 now pairs any two of R8G8B8A8 / B8G8R8A8 /
+   B8G8R8X8 UNORM (the KMD flips each buffer in its own format); 4 keeps the exact rule for the A/B.
+
+The `dwm` UMD log (`C:\ProgramData\Helios\`) line `CheckDirectFlipSupport #n: ... app=tex2d WxH fmt=F ... dwm_res=tex2d WxH
+fmt=F -> yes|no (why)` names which gate refused. No line at all: DWM never considered the window (not covering the output,
+an overlay on top, or kmt 19/28 = 0).
+
+Rows (main runs them; one reboot per KMD knob change; CS2 on a bot map, `fps_max 0`, V-sync off, the same spot and 30 s
+of PresentMon `--process_name cs2.exe`; read `PresentMode`, the fps, the dwm log lines above, and `IdfSpaTrans`, `IdfSpaExcl`,
+`IdfDirFor`, `IdfPrRedir`, `IdfRedErr`, `IdfKeep`, `IdfArmDma`, `PBFlip`, `FfReowned`):
+
+| row | build / knobs | guest mode, CS2 video settings | expect |
+|---|---|---|---|
+| C0 | 405.5 as is | 5120x1440, CS2 2560x1440 fullscreen windowed (today) | `Composed: Flip`, 85-120 fps; no `CheckDirectFlipSupport` answer other than `DirectFlipSupport=0` |
+| C1 | this build (defaults on) | as C0 | still `Composed: Flip`; dwm log `-> no (size differs ...)`: gate 2 confirmed |
+| C2 | this build | 5120x1440, CS2 at 5120x1440 fullscreen windowed | `Hardware: Independent Flip`, `IdfSpaExcl` at the flip rate; fps vs C1 shows the render cost of 2x pixels against the composition saved |
+| C3 | this build, `DirectFlipSupport=4` | as C2 | if the log shows `fmt=28` vs `fmt=87`: `Composed: Flip` (`formats not scan-out compatible`), which proves gate 3 |
+| C4 | this build | viewer `--resolution=2560x1440` (guest 2560x1440@240), CS2 2560x1440 fullscreen | `Hardware: Independent Flip`; compare fps with C1 at the same render size: the composed path's cost |
+| C5 | as C4 | C4 with V-sync on in CS2 | about 240 fps, `Hardware: Independent Flip`, `MsBetweenDisplayChange` about 4.17 |
+| C6 | as C4 | `d3d11_iflip 20 topmost fg interval0 tearing` at 2560x1440 | the tool's fps line: above 240 means interval-0 flips under independent flip are not refresh-capped (4.3); about 240 means they are, and CS2 at C4 would be capped at 240 while C1 is not |
+
+Colour check on C2/C4: a red/blue swap on screen means the R8G8B8A8 buffer's layout record carries a BGRA fourcc; `DirectFlipSupport=4`
+is the fallback until it is fixed. Cursor: with `HwCursor` 0 (the 404 default) nothing draws the Windows pointer while
+promoted (4.5); CS2 draws its own crosshair, its menus may show no pointer.
