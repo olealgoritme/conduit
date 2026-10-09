@@ -56,7 +56,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
             bison flex glslang-tools python3-mako python3-yaml python3-packaging \
-            llvm-20-dev libclang-20-dev libclang-cpp20-dev libpolly-20-dev \
+            llvm-20-dev clang-20 libclang-20-dev libclang-cpp20-dev libpolly-20-dev \
             libllvmspirvlib-20-dev llvm-spirv-20 libclc-20-dev
           python3 -m pip install --break-system-packages "meson>=1.7" ninja
           rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu
@@ -69,6 +69,8 @@ jobs:
           MESA_DIR: ${{ runner.temp }}/mesa
           # also for bindgen at run time; LLVM 18's headers reject MinGW's mmintrin.h
           LIBCLANG_PATH: /usr/lib/llvm-20/lib
+          # bindgen takes clang's own header directory from this clang
+          CLANG_PATH: /usr/lib/llvm-20/bin/clang
           JOBS: '4'
           MEMORY_MAX: ''
         run: sh ./guest/nvk-rm/windows/stage-helios-package.sh "$RUNNER_TEMP/helios-nvk"
