@@ -1,0 +1,310 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 05:40:57 +0200
+Subject: [PATCH] nvk/rm: no timer-tick sleeps in CPU waits, NVK_WAIT_STATS
+
+os_time_sleep() on Windows rounds any delay up to Sleep(milliseconds), and
+Sleep(1) waits a whole timer tick, ~15.6 ms at the default resolution.
+0037 removed it from the full-GPFIFO wait; the other RM-path waits:
+
+- nvkmd_rm_wait_step(), the CPU wait behind fences, timeline semaphores
+  and vkQueueWaitIdle: without a usable non-stall event it slept
+  os_time_sleep(10 us) and then os_time_sleep(200 us), each a 15.6 ms
+  tick.  It now sleeps on a per-thread high-resolution waitable timer
+  (nvkmd_rm_sleep_us(); CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, Windows 10
+  1803+, else a yield).  With the event (the normal case) waits block on
+  it, which is unchanged.
+- the full-ring wait sleeps 50 us on that timer after its 4 ms of yields.
+- the KMD flip-queue-full retry sleeps 1 ms on it instead of a tick.
+
+NVK_WAIT_STATS=1 logs once a second, per site (ring-full, event,
+sleep, flip-queue), how many CPU waits there were, their total and
+longest time and how many ended by timeout, to NVK_WAIT_STATS_FILE, else
+%ProgramData%\Helios\nvk-waits-<pid>.txt on Windows.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h        |  21 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c    |   8 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c    | 163 +++++++++++++++++-
+ .../vulkan/nvkmd/rm/nvkmd_rm_rmfence.c        |   5 +-
+ 4 files changed, 194 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 75f2f640..32db1a97 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -397,6 +397,27 @@ NVKMD_DECL_SUBCLASS(dev, rm);
+  */
+ void nvkmd_rm_dev_note_lost(const struct nvkmd_rm_dev *dev, int32_t epoch);
+ 
++/* CPU wait sites, for NVK_WAIT_STATS (nvkmd_rm_dev.c) */
++enum nvkmd_rm_wait_site {
++   NVKMD_RM_WAIT_SITE_RING,        /* GPFIFO ring full (nvkmd_rm_ctx.c) */
++   NVKMD_RM_WAIT_SITE_EVENT,       /* blocked on the non-stall event */
++   NVKMD_RM_WAIT_SITE_SLEEP,       /* sleep fallback without the event */
++   NVKMD_RM_WAIT_SITE_FLIP_QUEUE,  /* KMD flip queue full (nvkmd_rm_rmfence.c) */
++   NVKMD_RM_WAIT_SITE_COUNT,
++};
++
++/* Records one wait of ns nanoseconds at site; timed_out: it ended by its
++ * timeout rather than a wake (event waits).
++ */
++void nvkmd_rm_wait_stat(enum nvkmd_rm_wait_site site, uint64_t ns,
++                        bool timed_out);
++
++/* Sleeps about us microseconds.  On Windows a high-resolution waitable
++ * timer, not Sleep(): os_time_sleep() rounds anything up to Sleep(1 ms),
++ * which waits a whole timer tick (~15.6 ms at the default resolution).
++ */
++void nvkmd_rm_sleep_us(uint64_t us);
++
+ static inline bool
+ nvkmd_rm_dev_lost(const struct nvkmd_rm_dev *dev)
+ {
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index c2c1b7a6..481e37ab 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -221,7 +221,9 @@ wait_ring_space_n(struct nvkmd_rm_exec_ctx *ctx,
+ 
+    const uint64_t start = os_time_get_nano();
+    const uint64_t deadline = start + NVKMD_RM_RING_TIMEOUT_NS;
++   bool waited = false;
+    while (ring_free(ctx) < n + 1) {
++      waited = true;
+       VkResult result = check_channel_error(ctx, log_obj);
+       if (result != VK_SUCCESS)
+          return result;
+@@ -246,9 +248,13 @@ wait_ring_space_n(struct nvkmd_rm_exec_ctx *ctx,
+                           ctx->track_seqno);
+       }
+ 
+-      os_time_sleep(10);
++      nvkmd_rm_sleep_us(50);
+    }
+ 
++   if (waited)
++      nvkmd_rm_wait_stat(NVKMD_RM_WAIT_SITE_RING, os_time_get_nano() - start,
++                         false);
++
+    return VK_SUCCESS;
+ }
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index b8173f65..44b23a70 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -13,6 +13,12 @@
+ #include "util/os_time.h"
+ #include "util/u_debug.h"
+ #include "util/u_math.h"
++#include "util/u_atomic.h"
++#include <stdio.h>
++#include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ #include "vk_log.h"
+ 
+ /* Once per process: which device saw the loss epoch move, and to what */
+@@ -468,6 +474,152 @@ nvkmd_rm_kick_cpu_waiters(struct nvkmd_rm_dev *dev, bool pending_only)
+       dev->lib->win_event_kick(dev->nonstall_fd);
+ }
+ 
++/* NVK_WAIT_STATS=1: per wait site, how many CPU waits there were, how long
++ * they took in all and how many ended by timeout, logged once a second
++ * (only when something waited) to NVK_WAIT_STATS_FILE, else on Windows
++ * %ProgramData%\Helios\nvk-waits-<pid>.txt (then %TEMP%), else stderr.
++ */
++static const char *const nvkmd_rm_wait_site_names[NVKMD_RM_WAIT_SITE_COUNT] = {
++   [NVKMD_RM_WAIT_SITE_RING] = "ring-full",
++   [NVKMD_RM_WAIT_SITE_EVENT] = "event",
++   [NVKMD_RM_WAIT_SITE_SLEEP] = "sleep",
++   [NVKMD_RM_WAIT_SITE_FLIP_QUEUE] = "flip-queue",
++};
++
++static struct {
++   uint64_t count, ns, timeouts, max_ns;
++} nvkmd_rm_wait_stats[NVKMD_RM_WAIT_SITE_COUNT];
++static once_flag nvkmd_rm_wait_stats_once = ONCE_FLAG_INIT;
++static bool nvkmd_rm_wait_stats_on;
++static FILE *nvkmd_rm_wait_stats_file;
++
++static int
++nvkmd_rm_wait_stats_thread(void *arg)
++{
++   (void)arg;
++   uint64_t last[NVKMD_RM_WAIT_SITE_COUNT][3] = { { 0 } };
++   for (;;) {
++      os_time_sleep(1000000);
++      char line[512];
++      int len = snprintf(line, sizeof(line), "NVK waits/s:");
++      bool any = false;
++      for (unsigned i = 0; i < NVKMD_RM_WAIT_SITE_COUNT; i++) {
++         const uint64_t c = p_atomic_read(&nvkmd_rm_wait_stats[i].count);
++         const uint64_t ns = p_atomic_read(&nvkmd_rm_wait_stats[i].ns);
++         const uint64_t to = p_atomic_read(&nvkmd_rm_wait_stats[i].timeouts);
++         const uint64_t mx = p_atomic_xchg(&nvkmd_rm_wait_stats[i].max_ns, 0);
++         const uint64_t dc = c - last[i][0], dns = ns - last[i][1];
++         const uint64_t dto = to - last[i][2];
++         last[i][0] = c; last[i][1] = ns; last[i][2] = to;
++         if (dc == 0)
++            continue;
++         any = true;
++         if (len < (int)sizeof(line))
++            len += snprintf(line + len, sizeof(line) - len,
++                            " %s %" PRIu64 " (%.2f ms, max %.2f ms, %" PRIu64
++                            " timeouts)", nvkmd_rm_wait_site_names[i], dc,
++                            dns / 1e6, mx / 1e6, dto);
++      }
++      if (any && nvkmd_rm_wait_stats_file != NULL) {
++         fprintf(nvkmd_rm_wait_stats_file, "%s\n", line);
++         fflush(nvkmd_rm_wait_stats_file);
++      }
++   }
++   return 0;
++}
++
++static void
++nvkmd_rm_wait_stats_init(void)
++{
++   nvkmd_rm_wait_stats_on = debug_get_bool_option("NVK_WAIT_STATS", false);
++   if (!nvkmd_rm_wait_stats_on)
++      return;
++   const char *path = os_get_option("NVK_WAIT_STATS_FILE");
++   if (path != NULL && path[0] != 0)
++      nvkmd_rm_wait_stats_file = fopen(path, "a");
++#ifdef _WIN32
++   char buf[MAX_PATH];
++   if (nvkmd_rm_wait_stats_file == NULL) {
++      char pd[MAX_PATH];
++      DWORD n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
++      snprintf(buf, sizeof(buf), "%s\\Helios",
++               n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData");
++      CreateDirectoryA(buf, NULL);
++      snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
++               "\\nvk-waits-%lu.txt", (unsigned long)GetCurrentProcessId());
++      nvkmd_rm_wait_stats_file = fopen(buf, "a");
++   }
++   if (nvkmd_rm_wait_stats_file == NULL) {
++      char tmp[MAX_PATH];
++      DWORD n = GetTempPathA(sizeof(tmp), tmp);
++      if (n > 0 && n < sizeof(tmp)) {
++         snprintf(buf, sizeof(buf), "%snvk-waits-%lu.txt", tmp,
++                  (unsigned long)GetCurrentProcessId());
++         nvkmd_rm_wait_stats_file = fopen(buf, "a");
++      }
++   }
++#endif
++   if (nvkmd_rm_wait_stats_file == NULL)
++      nvkmd_rm_wait_stats_file = stderr;
++   fprintf(nvkmd_rm_wait_stats_file, "NVK waits: per second per site: "
++           "count (total ms, longest ms, timeouts)\n");
++   fflush(nvkmd_rm_wait_stats_file);
++   thrd_t t;
++   if (thrd_create(&t, nvkmd_rm_wait_stats_thread, NULL) == thrd_success)
++      thrd_detach(t);
++}
++
++void
++nvkmd_rm_wait_stat(enum nvkmd_rm_wait_site site, uint64_t ns, bool timed_out)
++{
++   call_once(&nvkmd_rm_wait_stats_once, nvkmd_rm_wait_stats_init);
++   if (likely(!nvkmd_rm_wait_stats_on))
++      return;
++   p_atomic_inc(&nvkmd_rm_wait_stats[site].count);
++   p_atomic_add(&nvkmd_rm_wait_stats[site].ns, ns);
++   if (timed_out)
++      p_atomic_inc(&nvkmd_rm_wait_stats[site].timeouts);
++   uint64_t mx = p_atomic_read(&nvkmd_rm_wait_stats[site].max_ns);
++   while (ns > mx) {
++      const uint64_t seen =
++         p_atomic_cmpxchg(&nvkmd_rm_wait_stats[site].max_ns, mx, ns);
++      if (seen == mx)
++         break;
++      mx = seen;
++   }
++}
++
++void
++nvkmd_rm_sleep_us(uint64_t us)
++{
++#ifdef _WIN32
++   if (us < 20000) {
++      /* One high-resolution waitable timer per thread (Windows 10 1803+);
++       * without it, yield instead of sleeping a whole tick.
++       */
++      static __thread HANDLE timer;
++      static __thread bool tried;
++      if (!tried) {
++         tried = true;
++         timer = CreateWaitableTimerExW(NULL, NULL,
++                                        0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
++                                        TIMER_ALL_ACCESS);
++      }
++      if (timer != NULL) {
++         LARGE_INTEGER due;
++         due.QuadPart = -(LONGLONG)(us * 10); /* 100 ns units, relative */
++         if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
++            WaitForSingleObject(timer, INFINITE);
++            return;
++         }
++      }
++      SwitchToThread();
++      return;
++   }
++#endif
++   os_time_sleep(us);
++}
++
+ VkResult
+ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+                    uint64_t abs_timeout_ns)
+@@ -497,8 +649,11 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+               !p_atomic_read(&dev->nonstall_undrainable)) {
+       const uint32_t ms = MIN2(remaining_ns / 1000000 + 1,
+                                NVKMD_RM_WAIT_POLL_MS);
++      const uint64_t t0 = os_time_get_nano();
+       const int waited = dev->lib->event_wait(dev->client, dev->nonstall_fd,
+                                               ms);
++      nvkmd_rm_wait_stat(NVKMD_RM_WAIT_SITE_EVENT, os_time_get_nano() - t0,
++                         waited == 0);
+       if (waited < 0) {
+          /* The transport cannot wait (e.g. -ENOSYS): sleep from now on */
+          mesa_logd("NVK: RM event wait failed (%d); CPU waits sleep", waited);
+@@ -520,8 +675,14 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+          }
+       }
+    } else {
++      /* Was os_time_sleep(): Sleep(1), a whole ~15.6 ms timer tick, on
++       * Windows for both 10 and 200 us.
++       */
+       const uint64_t us = *iter < 4 * spin_iters ? 10 : 200;
+-      os_time_sleep(MIN2(us, remaining_ns / 1000 + 1));
++      const uint64_t t0 = os_time_get_nano();
++      nvkmd_rm_sleep_us(MIN2(us, remaining_ns / 1000 + 1));
++      nvkmd_rm_wait_stat(NVKMD_RM_WAIT_SITE_SLEEP, os_time_get_nano() - t0,
++                         false);
+    }
+ 
+    (*iter)++;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+index 3d28cf68..7ae9ac36 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+@@ -576,9 +576,12 @@ nvkmd_rm_mem_scanout_flip_fenced(struct nvkmd_mem *_mem,
+        */
+       for (uint32_t i = 0; ret == -EAGAIN && i < 8; i++) {
+          p_atomic_inc(&rf->kmd_queue_full);
++         const uint64_t t0 = os_time_get_nano();
+          dev->lib->win_fence_wait(fence, NVKMD_RM_RMFENCE_TIMEOUT_MS);
+          if (i > 0)
+-            os_time_sleep(1000);
++            nvkmd_rm_sleep_us(1000);
++         nvkmd_rm_wait_stat(NVKMD_RM_WAIT_SITE_FLIP_QUEUE,
++                            os_time_get_nano() - t0, false);
+          ret = kmd_source_present_fenced(dev, &flip, fence, &seq);
+       }
+       if (ret == 0) {
+-- 
+2.43.0
+
