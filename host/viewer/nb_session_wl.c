@@ -49,6 +49,7 @@
 
 #include "nvkvm_broker.h"
 #include "nb_overlay.h"
+#include "nb_relacc.h"
 
 #ifndef NB_HAVE_WAYLAND
 
@@ -242,6 +243,7 @@ struct nb_wl {
     struct zwp_locked_pointer_v1                     *lock;
     struct zwp_relative_pointer_manager_v1           *relptr_mgr;
     struct zwp_relative_pointer_v1                   *relptr;
+    struct nb_relacc                                  relacc;  /* sub-pixel carry */
 
     /* Window chrome.  Without this the toplevel is undecorated on Mutter:
      * no title bar, no close button, no resize grips — and the --title we
@@ -3584,9 +3586,13 @@ static void relptr_motion(void *d, struct zwp_relative_pointer_v1 *r,
 {
     struct nb_wl *w = d;
     (void)r; (void)th; (void)tl; (void)dx; (void)dy;
-    /* Unaccelerated deltas: a guest applies its own acceleration. */
+    /* Unaccelerated deltas: a guest applies its own acceleration.  Whole
+     * pixels go now; the fraction is carried (nb_relacc.h). */
     if (w->sink) {
-        nb_sink_rel(w->sink, wl_fixed_to_int(udx), wl_fixed_to_int(udy));
+        int px, py;
+
+        nb_relacc_add(&w->relacc, udx, udy, &px, &py);
+        nb_sink_rel(w->sink, px, py);
     }
 }
 static const struct zwp_relative_pointer_v1_listener relptr_listener = {

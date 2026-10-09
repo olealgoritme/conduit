@@ -34,6 +34,7 @@
 // socket is retried with backoff, for as long as the backend runs.
 
 pub mod keymap;
+pub mod qmp;
 pub mod rfb;
 
 use std::collections::BTreeSet;
@@ -74,6 +75,15 @@ const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const KEY_OK: u16 = 0x160;
 
+/// A console-only event the display link puts in the console's input when
+/// the viewer's grab changes (`value` 1 on, 0 off): relative motion goes to
+/// QEMU's relative mouse while it is on. Never sent to a guest.
+pub const EV_GRAB_MARK: u16 = 0x7f00;
+
+/// Linux button codes past the three RFB has.
+const BTN_SIDE: u16 = 0x113;
+const BTN_EXTRA: u16 = 0x114;
+
 /// RFB pointer button mask bits.
 pub const MASK_LEFT: u8 = 1 << 0;
 pub const MASK_MIDDLE: u8 = 1 << 1;
@@ -107,6 +117,15 @@ pub type GuestProbe = Box<dyn FnMut() -> bool + Send>;
 /// picture is the console's or, for a guest that takes no Conduit input
 /// ([`crate::display::InputSink::takes_input`]), the guest's own frames at
 /// any size. Relative motion is in pixels of the picture shown.
+///
+/// Motion is coalesced in [`InputEncoder::events`]: a batch's positions
+/// collapse into the newest, which waits as `owed` until the worker sends
+/// it ([`InputEncoder::flush_motion`]) -- and the worker sends it only once
+/// QEMU has read everything before it. A position is a level: the guest's
+/// tablet only ever reports the newest one, so older ones queued in front
+/// of it are latency and nothing else. Buttons, wheel and keys are never
+/// merged or dropped, and a position owed when one of them comes is sent
+/// first, so the order the user made them in is kept.
 #[derive(Default, Debug)]
 pub struct InputEncoder {
     held: BTreeSet<u16>,
@@ -117,6 +136,29 @@ pub struct InputEncoder {
     /// The framebuffer the last pointer message was encoded for.
     fb: (u16, u16),
     moved: bool,
+    /// A position the server has not been sent yet (coalesced motion).
+    owed: bool,
+    /// Inside [`InputEncoder::events`]: a SYN owes the position instead of
+    /// sending it.
+    defer: bool,
+    /// Positions superseded before they were sent, since the start.
+    merged: u64,
+    /// Relative motion can go to QEMU's relative mouse (a QMP connection).
+    rel_route: bool,
+    /// The viewer holds a grab (or sent relative motion): motion, buttons and
+    /// wheel go to the relative mouse, as QMP commands in `qmp`.
+    relative: bool,
+    /// Relative motion not yet sent, summed (never dropped).
+    rdx: i64,
+    rdy: i64,
+    rel_moved: bool,
+    rel_owed: bool,
+    /// Relative batches merged into a later one, since the start.
+    rel_merged: u64,
+    /// Buttons held on the relative mouse.
+    qbuttons: BTreeSet<u16>,
+    /// QMP commands for the worker to write.
+    qmp: Vec<u8>,
 }
 
 /// The sizes one event is encoded against.
@@ -178,15 +220,223 @@ impl InputEncoder {
         )
     }
 
-    fn pointer(&self, mask: u8, out: &mut Vec<u8>) {
+    fn pointer(&mut self, mask: u8, out: &mut Vec<u8>) {
         let (x, y) = self.position();
         out.extend_from_slice(&rfb::pointer_event(mask, x, y));
+        self.owed = false;
+    }
+
+    /// Positions superseded by a newer one before they were sent.
+    pub fn merged(&self) -> u64 {
+        self.merged
+    }
+
+    /// Whether relative motion may go to QEMU's relative mouse. Off, it
+    /// moves the absolute position as before.
+    pub fn set_relative_route(&mut self, on: bool) {
+        if self.rel_route && !on {
+            // The connection went, and with it what it held.
+            self.relative = false;
+            self.rdx = 0;
+            self.rdy = 0;
+            self.rel_owed = false;
+            self.rel_moved = false;
+            self.qbuttons.clear();
+            self.qmp.clear();
+        }
+        self.rel_route = on;
+    }
+
+    /// Whether motion now goes to the relative mouse.
+    pub fn relative(&self) -> bool {
+        self.relative
+    }
+
+    /// Relative batches merged into a later one.
+    pub fn rel_merged(&self) -> u64 {
+        self.rel_merged
+    }
+
+    /// Whether summed relative motion waits for [`Self::flush_rel`].
+    pub fn rel_owed(&self) -> bool {
+        self.rel_owed
+    }
+
+    /// Queue the summed relative motion as one QMP command.
+    pub fn flush_rel(&mut self) -> bool {
+        if !self.rel_owed {
+            return false;
+        }
+        self.rel_owed = false;
+        let (dx, dy) = (std::mem::take(&mut self.rdx), std::mem::take(&mut self.rdy));
+        if dx == 0 && dy == 0 {
+            return false;
+        }
+        self.qmp
+            .extend_from_slice(qmp::rel_command(dx, dy).as_bytes());
+        true
+    }
+
+    /// The QMP commands queued so far, for the worker to write.
+    pub fn take_qmp(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.qmp)
+    }
+
+    fn qmp_name(code: u16) -> Option<&'static str> {
+        Some(match code {
+            BTN_LEFT => "left",
+            BTN_RIGHT => "right",
+            BTN_MIDDLE => "middle",
+            BTN_SIDE => "side",
+            BTN_EXTRA => "extra",
+            _ => return None,
+        })
+    }
+
+    fn set_relative(&mut self, on: bool) {
+        if self.relative && !on {
+            self.flush_rel();
+            // Buttons still down on the relative mouse come up there.
+            let up: Vec<(&str, bool)> = std::mem::take(&mut self.qbuttons)
+                .into_iter()
+                .filter_map(|c| Self::qmp_name(c).map(|n| (n, false)))
+                .collect();
+            if !up.is_empty() {
+                self.qmp.extend_from_slice(qmp::btn_command(&up).as_bytes());
+            }
+        }
+        self.relative = on && self.rel_route;
+    }
+
+    /// An event while `relative`; `true` if it was taken here.
+    fn relative_event(&mut self, e: &InputEventEntry) -> bool {
+        match e.ev_type {
+            input::EV_REL => match e.code {
+                input::REL_X => {
+                    self.rdx = self.rdx.saturating_add(e.value as i64);
+                    self.rel_moved = true;
+                    true
+                }
+                input::REL_Y => {
+                    self.rdy = self.rdy.saturating_add(e.value as i64);
+                    self.rel_moved = true;
+                    true
+                }
+                input::REL_WHEEL | input::REL_HWHEEL if e.value != 0 => {
+                    self.flush_rel();
+                    let b = match (e.code, e.value > 0) {
+                        (input::REL_WHEEL, true) => "wheel-up",
+                        (input::REL_WHEEL, false) => "wheel-down",
+                        (_, true) => "wheel-right",
+                        (_, false) => "wheel-left",
+                    };
+                    for _ in 0..e.value.unsigned_abs().min(8) {
+                        self.qmp.extend_from_slice(
+                            qmp::btn_command(&[(b, true), (b, false)]).as_bytes(),
+                        );
+                    }
+                    true
+                }
+                // Hi-res twins and anything else: nothing to send.
+                _ => true,
+            },
+            input::EV_KEY => {
+                let Some(name) = Self::qmp_name(e.code) else {
+                    return false; // keys go to the keyboard, over VNC
+                };
+                let down = e.value != 0;
+                if down {
+                    self.qbuttons.insert(e.code);
+                } else if !self.qbuttons.remove(&e.code) {
+                    // Pressed before the grab, on the tablet: let it go
+                    // there.
+                    return false;
+                }
+                // After the motion that came before it.
+                self.flush_rel();
+                self.qmp
+                    .extend_from_slice(qmp::btn_command(&[(name, down)]).as_bytes());
+                true
+            }
+            input::EV_SYN => {
+                if self.rel_moved {
+                    if self.defer {
+                        if self.rel_owed {
+                            self.rel_merged += 1;
+                        }
+                        self.rel_owed = true;
+                    } else {
+                        self.rel_owed = true;
+                        self.flush_rel();
+                    }
+                    self.rel_moved = false;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a coalesced position is waiting for [`Self::flush_motion`].
+    pub fn motion_owed(&self) -> bool {
+        self.owed
+    }
+
+    /// Send the owed position, if any; returns whether one went.
+    pub fn flush_motion(&mut self, out: &mut Vec<u8>) -> bool {
+        if !self.owed {
+            return false;
+        }
+        self.pointer(self.buttons, out);
+        true
+    }
+
+    /// A batch of events, with its motion coalesced: what the batch moved
+    /// the pointer to is owed (see [`Self::flush_motion`]), not sent at each
+    /// SYN. Everything else is encoded as [`Self::event`] does.
+    pub fn events(
+        &mut self,
+        evs: &[InputEventEntry],
+        sizes: Sizes,
+        ext_key: bool,
+        out: &mut Vec<u8>,
+    ) {
+        self.defer = true;
+        for e in evs {
+            self.event(e, sizes, ext_key, out);
+        }
+        self.defer = false;
     }
 
     /// One event; `ext_key` is whether the server takes Extended Key Events.
     pub fn event(&mut self, e: &InputEventEntry, sizes: Sizes, ext_key: bool, out: &mut Vec<u8>) {
         self.fb = sizes.fb;
         let (vw, vh) = sizes.view;
+        if e.ev_type == EV_GRAB_MARK {
+            self.set_relative(e.value != 0);
+            return;
+        }
+        if self.rel_route {
+            let rel_motion =
+                e.ev_type == input::EV_REL && matches!(e.code, input::REL_X | input::REL_Y);
+            if rel_motion && !self.relative {
+                // Relative motion is only sent under a grab: one that began
+                // before this connection (or this backend) counts too.
+                self.set_relative(true);
+            } else if e.ev_type == input::EV_ABS && self.relative {
+                self.set_relative(false);
+            }
+            if self.relative && self.relative_event(e) {
+                return;
+            }
+        }
+        let motion = matches!(e.ev_type, input::EV_ABS | input::EV_SYN)
+            || (e.ev_type == input::EV_REL && matches!(e.code, input::REL_X | input::REL_Y));
+        if self.owed && !motion {
+            // Whatever comes next lands after the position the user had
+            // reached when they made it.
+            self.flush_motion(out);
+        }
         match e.ev_type {
             input::EV_KEY => {
                 let down = e.value != 0;
@@ -252,7 +502,14 @@ impl InputEncoder {
                 _ => {}
             },
             input::EV_SYN if self.moved => {
-                self.pointer(self.buttons, out);
+                if self.defer {
+                    if self.owed {
+                        self.merged += 1;
+                    }
+                    self.owed = true;
+                } else {
+                    self.pointer(self.buttons, out);
+                }
                 self.moved = false;
             }
             _ => {}
@@ -261,6 +518,13 @@ impl InputEncoder {
 
     /// Let go of every key and button held.
     pub fn release_all(&mut self, ext_key: bool, out: &mut Vec<u8>) {
+        self.flush_motion(out);
+        if self.relative {
+            // Buttons held on the relative mouse come up there; the grab
+            // itself stays.
+            self.set_relative(false);
+            self.relative = true;
+        }
         for code in std::mem::take(&mut self.held) {
             Self::key(code, false, ext_key, out);
         }
@@ -529,6 +793,11 @@ impl Console {
             enc: InputEncoder::default(),
             last_probe: Instant::now(),
             out: Vec::new(),
+            qstats: QueueStats::new(),
+            qmp: None,
+            qmp_out: Vec::new(),
+            qmp_next_try: Instant::now(),
+            qmp_warned: false,
         };
         let thread = std::thread::Builder::new()
             .name("nvgpu-console".into())
@@ -574,6 +843,91 @@ struct Worker {
     enc: InputEncoder,
     last_probe: Instant,
     out: Vec<u8>,
+    qstats: QueueStats,
+    /// QEMU's monitor for relative motion (`qmp`), when it has one.
+    qmp: Option<qmp::Qmp>,
+    qmp_out: Vec<u8>,
+    qmp_next_try: Instant,
+    qmp_warned: bool,
+}
+
+/// How often a missing QMP socket is tried again.
+const QMP_RETRY: Duration = Duration::from_secs(2);
+/// How long the QMP greeting and capabilities may take.
+const QMP_HANDSHAKE: Duration = Duration::from_millis(200);
+
+/// How far behind QEMU's VNC server is with our input, per
+/// [`QueueStats::EVERY`]: the kernel's unsent bytes on the socket (Send-Q)
+/// and ours not yet written, at their highest.
+#[derive(Debug)]
+struct QueueStats {
+    since: Instant,
+    events: u64,
+    merged_before: u64,
+    rel_merged_before: u64,
+    sendq_max: usize,
+    out_max: usize,
+    /// The QMP socket's Send-Q at its highest (relative motion).
+    qmp_sendq_max: usize,
+}
+
+impl QueueStats {
+    const EVERY: Duration = Duration::from_secs(10);
+
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            events: 0,
+            merged_before: 0,
+            rel_merged_before: 0,
+            sendq_max: 0,
+            out_max: 0,
+            qmp_sendq_max: 0,
+        }
+    }
+
+    fn note_queue(&mut self, sendq: usize, out: usize) {
+        self.sendq_max = self.sendq_max.max(sendq);
+        self.out_max = self.out_max.max(out);
+    }
+
+    /// The line, once per `EVERY` that saw input.
+    fn take(&mut self, now: Instant, merged: u64, rel_merged: u64) -> Option<String> {
+        if now.saturating_duration_since(self.since) < Self::EVERY {
+            return None;
+        }
+        let line = (self.events > 0).then(|| {
+            format!(
+                "console: input to QEMU, last {} s: {} events, {} positions coalesced, \
+                 Send-Q max {} bytes, unsent max {} bytes; relative: {} batches summed, \
+                 QMP Send-Q max {} bytes",
+                now.saturating_duration_since(self.since).as_secs(),
+                self.events,
+                merged.saturating_sub(self.merged_before),
+                self.sendq_max,
+                self.out_max,
+                rel_merged.saturating_sub(self.rel_merged_before),
+                self.qmp_sendq_max
+            )
+        });
+        *self = Self::new();
+        self.since = now;
+        self.merged_before = merged;
+        self.rel_merged_before = rel_merged;
+        line
+    }
+}
+
+/// Bytes written to `fd` that the peer has not read yet (`SIOCOUTQ`; for a
+/// unix socket the memory they take, kernel overhead included), 0 if the
+/// kernel will not say.
+pub fn send_queue(fd: RawFd) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: TIOCOUTQ (SIOCOUTQ) writes one int through the pointer.
+    if unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut n) } < 0 {
+        return 0;
+    }
+    n.max(0) as usize
 }
 
 /// One connection's state.
@@ -717,16 +1071,39 @@ impl Worker {
             // the viewer shows: the console's, or the guest's frames for a
             // guest that takes no Conduit input (`DisplayLink::input_to_console`).
             let events = std::mem::take(&mut *self.shared.input.lock().unwrap());
+            self.qmp_connect();
+            self.enc.set_relative_route(self.qmp.is_some());
             if !events.is_empty() {
                 let fb = (self.frames.width, self.frames.height);
                 let mut sizes = Sizes::console(fb);
                 if !shown && let Some(view) = self.link.guest_picture_size() {
                     sizes.view = view;
                 }
-                for e in &events {
-                    self.enc.event(e, sizes, s.ext_key, &mut self.out);
+                self.enc.events(&events, sizes, s.ext_key, &mut self.out);
+                self.qstats.events += events.len() as u64;
+            }
+            if let Some(line) =
+                self.qstats
+                    .take(Instant::now(), self.enc.merged(), self.enc.rel_merged())
+            {
+                log::info!("{line}");
+            }
+            // The newest position goes only once QEMU has read everything
+            // before it. While its main loop is busy (a memory transaction,
+            // a stalled vCPU exit), positions must not pile up in `out` and
+            // the socket: each would be replayed in order afterwards, the
+            // pointer trailing the hand by the whole backlog. The one owed
+            // is sent when the socket drains (POLLOUT below).
+            if self.enc.motion_owed() {
+                self.flush(&mut s.sock)?;
+                if self.out.is_empty() {
+                    self.enc.flush_motion(&mut self.out);
                 }
             }
+
+            // Relative motion: summed while QEMU has not read the last
+            // command, sent as one when it has. Nothing is dropped.
+            self.qmp_pump();
 
             // Ask for the next frame, paced, and only while shown.
             let now = Instant::now();
@@ -753,9 +1130,114 @@ impl Worker {
             if !self.out.is_empty() {
                 events |= libc::POLLOUT;
             }
-            let rev = self.wait(&[(s.sock.as_raw_fd(), events)], timeout);
+            let mut fds = vec![(s.sock.as_raw_fd(), events)];
+            if let Some(q) = self.qmp.as_ref() {
+                let mut ev = libc::POLLIN;
+                if !self.qmp_out.is_empty() {
+                    ev |= libc::POLLOUT;
+                }
+                fds.push((q.sock.as_raw_fd(), ev));
+            }
+            let rev = self.wait(&fds, timeout);
             if rev[0] & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 self.read(&mut s)?;
+            }
+            if rev
+                .get(1)
+                .is_some_and(|r| r & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+                && let Some(q) = self.qmp.as_mut()
+                && let Err(e) = q.drain()
+            {
+                self.qmp_lost(&e);
+            }
+        }
+    }
+
+    /// Connect to QEMU's QMP socket next to the console's, at most every
+    /// `QMP_RETRY`, while there is none.
+    fn qmp_connect(&mut self) {
+        if self.qmp.is_some() || Instant::now() < self.qmp_next_try {
+            return;
+        }
+        self.qmp_next_try = Instant::now() + QMP_RETRY;
+        let path = qmp::path_for(&self.path);
+        match qmp::Qmp::connect(&path, QMP_HANDSHAKE) {
+            Ok(q) => {
+                log::info!(
+                    "console: relative pointer through QMP at {} (under a grab: motion, \
+                     buttons and wheel to QEMU's PS/2 mouse)",
+                    path.display()
+                );
+                self.qmp = Some(q);
+                self.qmp_warned = false;
+            }
+            Err(e) => {
+                if !self.qmp_warned {
+                    log::info!(
+                        "console: no QMP socket at {} ({e}); a grab moves the absolute \
+                         pointer, which first-person games do not read",
+                        path.display()
+                    );
+                    self.qmp_warned = true;
+                }
+            }
+        }
+    }
+
+    fn qmp_lost(&mut self, e: &io::Error) {
+        log::info!("console: QMP connection lost: {e}");
+        self.qmp = None;
+        self.qmp_out.clear();
+        self.enc.set_relative_route(false);
+    }
+
+    /// Write what the encoder queued for QMP, and the summed relative motion
+    /// once what was written before has gone.
+    fn qmp_pump(&mut self) {
+        let Some(q) = self.qmp.as_mut() else {
+            return;
+        };
+        if self.qmp_out.is_empty() && self.enc.rel_owed() {
+            self.enc.flush_rel();
+        }
+        let more = self.enc.take_qmp();
+        self.qmp_out.extend_from_slice(&more);
+        let mut err = None;
+        while !self.qmp_out.is_empty() {
+            match q.sock.write(&self.qmp_out) {
+                Ok(0) => {
+                    err = Some(io::Error::from(io::ErrorKind::WriteZero));
+                    break;
+                }
+                Ok(n) => {
+                    self.qmp_out.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        self.qstats.qmp_sendq_max = self
+            .qstats
+            .qmp_sendq_max
+            .max(send_queue(q.sock.as_raw_fd()) + self.qmp_out.len());
+        if err.is_none() && self.qmp_out.len() > OUT_MAX {
+            err = Some(io::Error::other("QEMU stopped reading QMP"));
+        }
+        if let Some(e) = err {
+            self.qmp_lost(&e);
+        } else if self.enc.rel_owed() && self.qmp_out.is_empty() {
+            // Written at once: the motion summed meanwhile can go now too.
+            self.enc.flush_rel();
+            let more = self.enc.take_qmp();
+            self.qmp_out.extend_from_slice(&more);
+            if let Some(q) = self.qmp.as_mut() {
+                let _ = q.sock.write(&self.qmp_out).map(|n| {
+                    self.qmp_out.drain(..n);
+                });
             }
         }
     }
@@ -772,6 +1254,8 @@ impl Worker {
                 Err(e) => return Err(e),
             }
         }
+        self.qstats
+            .note_queue(send_queue(sock.as_raw_fd()), self.out.len());
         if self.out.len() > OUT_MAX {
             return Err(io::Error::other("the VNC server stopped reading"));
         }

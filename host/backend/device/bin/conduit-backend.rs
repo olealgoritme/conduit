@@ -434,9 +434,89 @@ impl WindowPlacer for VhostWindow {
 enum Watch {
     /// A descriptor, and whether it is a fence: reported once, with its
     /// status, then dropped from the set (docs/SYNC.md).
-    Add(u32, OwnedFd, bool),
+    /// The `Instant` is when it was sent, for the add-latency histogram.
+    Add(u32, OwnedFd, bool, Instant),
     Remove(u32),
 }
+
+/// Wakes the event pump out of `epoll_wait` when the control channel has
+/// something for it (an eventfd in the pump's epoll set). Without it a new
+/// descriptor waits for the pump's next timeout -- up to `SWEEP`, a
+/// millisecond -- before it is watched, and a fence that signals in that window
+/// is reported that late: about half a millisecond per RM fence on average,
+/// and an NVK D3D12 frame has ~20 of them (one per ExecuteCommandLists, HE12
+/// v4). `CONDUIT_PUMP_WAKE=0` restores the timeout-only pump.
+///
+/// It also brings the pump back when the guest kicks the event queue while the
+/// pump holds reports it had no buffer for (`backlog`): the kick follows the
+/// guest re-posting buffers, and the backlog goes out at once rather than at the
+/// next sweep.
+struct PumpWake(OwnedFd, std::sync::atomic::AtomicBool);
+
+impl PumpWake {
+    fn new() -> Option<Self> {
+        if std::env::var("CONDUIT_PUMP_WAKE").as_deref() == Ok("0") {
+            log::info!("event pump: wake eventfd off (CONDUIT_PUMP_WAKE=0)");
+            return None;
+        }
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            log::warn!(
+                "event pump: eventfd: {}; new watches wait for the sweep",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(Self(
+            unsafe { OwnedFd::from_raw_fd(fd) },
+            std::sync::atomic::AtomicBool::new(false),
+        ))
+    }
+
+    /// The guest kicked the event queue: wake the pump if it has reports
+    /// waiting for a buffer.
+    fn buffers_posted(&self) {
+        if self.1.load(std::sync::atomic::Ordering::Acquire) {
+            self.wake();
+        }
+    }
+
+    fn set_backlog(&self, waiting: bool) {
+        self.1.store(waiting, std::sync::atomic::Ordering::Release);
+    }
+
+    fn wake(&self) {
+        let one: u64 = 1;
+        // A full counter (EAGAIN) is already a pending wake.
+        let _ = unsafe {
+            libc::write(
+                self.0.as_raw_fd(),
+                (&one as *const u64).cast(),
+                size_of::<u64>(),
+            )
+        };
+    }
+
+    fn drain(&self) {
+        let mut n: u64 = 0;
+        let _ = unsafe {
+            libc::read(
+                self.0.as_raw_fd(),
+                (&mut n as *mut u64).cast(),
+                size_of::<u64>(),
+            )
+        };
+    }
+}
+
+/// The epoll tag of the pump's wake eventfd: outside every 32-bit handle.
+const PUMP_WAKE_TAG: u64 = u64::MAX;
+
+/// Send-to-watch latency of fence adds, in microseconds: bucket upper bounds
+/// (the last bucket is open).
+const ADD_LAT_BUCKETS_US: [u64; 5] = [50, 200, 500, 1000, 2000];
+/// Fence adds per add-latency log line.
+const ADD_LAT_LOG_EVERY: u64 = 16384;
 
 /// One `EventReady` message: a bare header naming the descriptor. `status`
 /// is 0, or a fence's error as a negative errno.
@@ -619,6 +699,14 @@ impl InputSink for VqInputSink {
     /// Windows KMD may run the event queue (for `EventReady`) but never acks
     /// the bit, and has nowhere to put an `InputEvent`.
     fn takes_input(&mut self) -> bool {
+        // A driver that has said nothing about taking input (the Windows
+        // KMD) takes none whatever its queue does: answered without the
+        // event queue's lock, which the event pump holds hundreds of times a
+        // millisecond under a game. The link thread asks on every packet it
+        // reads, input included.
+        if !self.claims.acked() && !self.claims.linux() {
+            return false;
+        }
         let target = self.target.lock().expect("event target").clone();
         self.posted = match target {
             Some((vring, mem)) => event_buffers_posted(&vring, &mem, self.posted),
@@ -845,6 +933,54 @@ impl ReleaseSink for VqReleaseSink {
     }
 }
 
+/// `ScanoutPresented` off the display link's thread.
+///
+/// The link thread is also the one that routes the viewer's input; a
+/// per-frame report must not take the event queue's lock there, behind the
+/// event pump. It leaves the newest report here and a thread of its own puts
+/// it on the queue. Newest wins: a presentation report is stale within a
+/// frame.
+struct PresentedRelay {
+    slot: std::sync::Mutex<Option<ScanoutPresented>>,
+    ready: std::sync::Condvar,
+}
+
+impl PresentedRelay {
+    fn start(inner: Arc<dyn PresentedSink>) -> std::io::Result<Arc<Self>> {
+        let relay = Arc::new(Self {
+            slot: std::sync::Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+        });
+        let r = relay.clone();
+        std::thread::Builder::new()
+            .name("nvgpu-presented".into())
+            .spawn(move || {
+                loop {
+                    let p = {
+                        let mut slot = r.slot.lock().unwrap();
+                        loop {
+                            if let Some(p) = slot.take() {
+                                break p;
+                            }
+                            slot = r.ready.wait(slot).unwrap();
+                        }
+                    };
+                    inner.presented(&p);
+                }
+            })?;
+        Ok(relay)
+    }
+}
+
+impl PresentedSink for PresentedRelay {
+    /// Never blocks on the event queue; `true` means handed on.
+    fn presented(&self, p: &ScanoutPresented) -> bool {
+        *self.slot.lock().unwrap() = Some(*p);
+        self.ready.notify_one();
+        true
+    }
+}
+
 /// `ScanoutPresented` onto the same event queue: one message into one posted
 /// buffer, or dropped when none is posted (a presentation report is stale
 /// within a frame; the guest falls back to its own timer for that flip).
@@ -888,6 +1024,338 @@ impl PresentedSink for VqReleaseSink {
     }
 }
 
+/// Reports kept for the next buffer the guest posts, at most. Past this the
+/// report is dropped and left to the sweep, as every report was before.
+const BACKLOG_CAP: usize = 1024;
+/// How long an event file's report is held back because the guest has not
+/// read the previous one (`EventReports::coalesce`) before it is sent anyway.
+/// A bound on a wrong estimate of what the guest has read, not a timer anyone
+/// waits on: the guest reads a report within a DPC.
+const COALESCE_MAX: Duration = Duration::from_millis(4);
+/// Seconds between `event pump:` counter lines (only when something moved).
+const PUMP_STATS_EVERY: Duration = Duration::from_secs(10);
+
+/// What became of one report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent {
+    /// On the event queue.
+    Pushed,
+    /// Not sent: the guest has not read this event file's previous report yet,
+    /// and the wake that one brings covers this one too.
+    Coalesced,
+    /// No buffer posted: kept, and sent when the guest posts one.
+    Queued,
+    /// No buffer posted and no room (or `CONDUIT_EVENT_BACKLOG=0`): left to
+    /// the sweep.
+    Dropped,
+}
+
+/// The pump's event-queue counters, per `PUMP_STATS_EVERY`.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+struct PumpStats {
+    fence_pushed: u64,
+    event_pushed: u64,
+    coalesced: u64,
+    /// Coalescing given up after `COALESCE_MAX` (sent anyway).
+    coalesce_expired: u64,
+    /// Reports that found no buffer posted (each counted once).
+    no_buffer: u64,
+    /// Of those, kept for later, and sent from the backlog.
+    queued: u64,
+    from_backlog: u64,
+    /// Of those, dropped: the backlog was full or is off.
+    dropped: u64,
+    backlog_max: usize,
+    /// Longest wait in the backlog, microseconds.
+    wait_max_us: u64,
+}
+
+/// The guest's event-queue buffers in hand at most (posted and not yet
+/// filled), over the last second or two. With every buffer it was given
+/// re-posted as it is read (the Windows KMD's `take_event`, the Linux
+/// driver's event worker), the buffers it holds beyond that are reports it
+/// has not read.
+#[derive(Default)]
+struct RingDepth {
+    cur: u16,
+    prev: u16,
+    since: Option<Instant>,
+}
+
+impl RingDepth {
+    fn note(&mut self, free: u16) -> u16 {
+        let now = Instant::now();
+        if self
+            .since
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+        {
+            self.prev = self.cur;
+            self.cur = 0;
+            self.since = Some(now);
+        }
+        self.cur = self.cur.max(free);
+        self.cur.max(self.prev)
+    }
+}
+
+/// Whether the report that left the event ring at position `pos` (the ring's
+/// `next_avail` just after it) is still unread by the guest, now that the ring
+/// is at `next` with `free` buffers posted and not filled, of the `most` the
+/// guest posts. The guest holds `most - free` filled buffers, the newest
+/// reports, and reads them in order.
+fn report_unread(next: u16, pos: u16, free: u16, most: u16) -> bool {
+    let unread = most.saturating_sub(free);
+    // Reports put on the ring after this one.
+    let after = next.wrapping_sub(pos);
+    after < unread
+}
+
+/// Puts the pump's reports on the event queue, and keeps the ones it has no
+/// buffer for.
+///
+/// A guest has a few buffers posted (16 for the Windows KMD), re-posted from
+/// its interrupt DPC. Under a game the host fills them faster than that DPC
+/// runs: 434,000 reports found none in eleven minutes of Basemark D3D12
+/// (2026-10-08), 97% of them for the NVK devices' non-stall event files, the
+/// rest fences. A fence that finds no buffer waited for the sweep (a
+/// millisecond, then for a buffer again); an event file's report was retried
+/// the same way, each try logged.
+///
+/// Two things here instead:
+///
+/// * **A backlog.** A report with no buffer is kept (one per descriptor) and
+///   sent, in order, as soon as a buffer is posted: on the guest's kick
+///   (`PumpWake::buffers_posted`), and on every pass. `CONDUIT_EVENT_BACKLOG=0`
+///   drops it as before.
+/// * **Coalescing** for event files (not fences). The guest wakes everything
+///   registered on a handle per report, and the woken thread drains the file
+///   through the request queue, all of it. A second report while the guest
+///   has not yet *read* the first wakes nobody new, and only takes a buffer
+///   a fence may need. Whether it has been read is counted off the ring: the
+///   guest re-posts each buffer as it reads it, in order, so the buffers it
+///   holds are the newest reports. `CONDUIT_EVENT_COALESCE=0` sends every
+///   edge.
+struct EventReports {
+    vring: VringRwLock,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    backlog_on: bool,
+    coalesce_on: bool,
+    /// Handles in the order they found no buffer; `queued` says which are
+    /// still owed (a handle closed meanwhile is skipped).
+    order: std::collections::VecDeque<u32>,
+    /// Owed: (fence, status, first queued).
+    queued: HashMap<u32, (bool, i32, Instant)>,
+    /// Event files' last report: the ring position after it, and when.
+    inflight: HashMap<u32, (u16, Instant)>,
+    depth: RingDepth,
+    stats: PumpStats,
+    last: PumpStats,
+    since: Instant,
+    wake: Option<Arc<PumpWake>>,
+}
+
+impl EventReports {
+    fn new(
+        vring: VringRwLock,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        wake: Option<Arc<PumpWake>>,
+    ) -> Self {
+        let off = |name| std::env::var(name).as_deref() == Ok("0");
+        let backlog_on = !off("CONDUIT_EVENT_BACKLOG");
+        let coalesce_on = !off("CONDUIT_EVENT_COALESCE");
+        log::info!(
+            "event pump: backlog {} (cap {BACKLOG_CAP}), coalescing {}",
+            if backlog_on { "on" } else { "off" },
+            if coalesce_on { "on" } else { "off" },
+        );
+        Self {
+            vring,
+            mem,
+            backlog_on,
+            coalesce_on,
+            order: std::collections::VecDeque::new(),
+            queued: HashMap::new(),
+            inflight: HashMap::new(),
+            depth: RingDepth::default(),
+            stats: PumpStats::default(),
+            last: PumpStats::default(),
+            since: Instant::now(),
+            wake,
+        }
+    }
+
+    /// Report `handle` (a fence with its `status`, or an event file).
+    fn report(&mut self, handle: u32, fence: bool, status: i32, pass: Option<&mut Batch>) -> Sent {
+        if self.queued.contains_key(&handle) {
+            // Already owed; one report covers it.
+            return Sent::Queued;
+        }
+        if !fence && self.coalesce(handle) {
+            self.stats.coalesced += 1;
+            return Sent::Coalesced;
+        }
+        // Behind what is owed, not ahead of it.
+        if self.order.is_empty() && self.push(handle, fence, status, pass) {
+            return Sent::Pushed;
+        }
+        self.stats.no_buffer += 1;
+        if !self.backlog_on || self.queued.len() >= BACKLOG_CAP {
+            self.stats.dropped += 1;
+            return Sent::Dropped;
+        }
+        self.queued.insert(handle, (fence, status, Instant::now()));
+        self.order.push_back(handle);
+        self.stats.queued += 1;
+        self.stats.backlog_max = self.stats.backlog_max.max(self.queued.len());
+        if let Some(w) = self.wake.as_ref() {
+            w.set_backlog(true);
+        }
+        Sent::Queued
+    }
+
+    /// Send what is owed while there are buffers. `delivered` gets each handle
+    /// sent and whether it was a fence.
+    fn flush(&mut self, pass: &mut Option<&mut Batch>, delivered: &mut Vec<(u32, bool)>) {
+        while let Some(&handle) = self.order.front() {
+            let Some(&(fence, status, at)) = self.queued.get(&handle) else {
+                self.order.pop_front();
+                continue;
+            };
+            if !self.push(handle, fence, status, pass.as_deref_mut()) {
+                return;
+            }
+            self.order.pop_front();
+            self.queued.remove(&handle);
+            self.stats.from_backlog += 1;
+            self.stats.wait_max_us = self.stats.wait_max_us.max(at.elapsed().as_micros() as u64);
+            delivered.push((handle, fence));
+        }
+        if let Some(w) = self.wake.as_ref() {
+            w.set_backlog(false);
+        }
+    }
+
+    /// Whether anything is owed.
+    fn owed(&self, handle: u32) -> bool {
+        self.queued.contains_key(&handle)
+    }
+
+    /// `handle` was closed: nothing more is owed for it (its number can be
+    /// reused, by a fence that has not fired).
+    fn forget(&mut self, handle: u32) {
+        self.queued.remove(&handle);
+        self.inflight.remove(&handle);
+    }
+
+    fn push(&mut self, handle: u32, fence: bool, status: i32, pass: Option<&mut Batch>) -> bool {
+        if !push_event(&self.vring, &self.mem, handle, status, pass) {
+            return false;
+        }
+        if fence {
+            self.stats.fence_pushed += 1;
+        } else {
+            self.stats.event_pushed += 1;
+            if self.coalesce_on {
+                let pos = self.vring.get_ref().get_queue().next_avail();
+                self.inflight.insert(handle, (pos, Instant::now()));
+            }
+        }
+        true
+    }
+
+    /// Whether event file `handle`'s previous report is still unread, so this
+    /// one can be left out.
+    fn coalesce(&mut self, handle: u32) -> bool {
+        if !self.coalesce_on {
+            return false;
+        }
+        let Some(&(pos, at)) = self.inflight.get(&handle) else {
+            return false;
+        };
+        if at.elapsed() >= COALESCE_MAX {
+            self.inflight.remove(&handle);
+            self.stats.coalesce_expired += 1;
+            return false;
+        }
+        let (next, avail, size) = {
+            let vr = self.vring.get_ref();
+            let q = vr.get_queue();
+            let Ok(avail) = q.avail_idx(&*self.mem.memory(), std::sync::atomic::Ordering::Acquire)
+            else {
+                return false;
+            };
+            (q.next_avail(), avail.0, q.size())
+        };
+        let free = avail.wrapping_sub(next).min(size);
+        let most = self.depth.note(free);
+        report_unread(next, pos, free, most)
+    }
+
+    /// The counter line, every `PUMP_STATS_EVERY` that saw any change.
+    fn log_stats(&mut self) {
+        if self.since.elapsed() < PUMP_STATS_EVERY {
+            return;
+        }
+        self.since = Instant::now();
+        let s = self.stats;
+        if s == self.last {
+            return;
+        }
+        let d = |a: u64, b: u64| a - b;
+        let l = self.last;
+        log::info!(
+            "event pump: last {}s: pushed fence {} event {}, coalesced {} (expired {}), \
+             no buffer {} (queued {}, sent from backlog {}, dropped {}), backlog max {}, \
+             wait max {} us; totals: no buffer {} dropped {} coalesced {}",
+            PUMP_STATS_EVERY.as_secs(),
+            d(s.fence_pushed, l.fence_pushed),
+            d(s.event_pushed, l.event_pushed),
+            d(s.coalesced, l.coalesced),
+            d(s.coalesce_expired, l.coalesce_expired),
+            d(s.no_buffer, l.no_buffer),
+            d(s.queued, l.queued),
+            d(s.from_backlog, l.from_backlog),
+            d(s.dropped, l.dropped),
+            s.backlog_max,
+            s.wait_max_us,
+            s.no_buffer,
+            s.dropped,
+            s.coalesced,
+        );
+        // The maxima are per line.
+        self.stats.backlog_max = self.queued.len();
+        self.stats.wait_max_us = 0;
+        self.last = self.stats;
+    }
+}
+
+/// Whether the sweep asks descriptor `h` now: an event file whose last edge
+/// was coalesced (`recheck`) every sweep; a fence `repeat` after its last
+/// report; an event file the guest was told about `repeat_idle` after it
+/// (nothing new happened on it, or there would have been an edge); anything
+/// never reported, at once.
+fn sweep_due(
+    h: u64,
+    now: Instant,
+    once: &HashSet<u64>,
+    last_report: &HashMap<u64, Instant>,
+    recheck: &HashSet<u64>,
+    repeat: Duration,
+    repeat_idle: Duration,
+) -> bool {
+    if recheck.contains(&h) {
+        return true;
+    }
+    let gap = if once.contains(&h) {
+        repeat
+    } else {
+        repeat_idle
+    };
+    last_report
+        .get(&h)
+        .is_none_or(|&t| now.duration_since(t) >= gap)
+}
+
 /// Watch the host's descriptors and tell the guest when one has something to
 /// say.
 ///
@@ -909,8 +1377,13 @@ impl PresentedSink for VqReleaseSink {
 /// the pass put on the queue, and the sweep asks every descriptor in one
 /// `poll` instead of one `poll` each (about 400 a millisecond under a game,
 /// measured: 500,000 system calls a second).
+///
+/// What goes on the queue goes through [`EventReports`]: a report with no
+/// buffer posted waits for one, and an event file's report the guest has not
+/// read yet is not repeated.
 fn event_pump(
     rx: Receiver<Watch>,
+    wake: Option<Arc<PumpWake>>,
     vring: VringRwLock,
     mem: GuestMemoryAtomic<GuestMemoryMmap>,
     batch: bool,
@@ -929,6 +1402,18 @@ fn event_pump(
     // net for an event the guest woke for and then left queued, which still
     // finds it within this.
     const REPEAT: Duration = Duration::from_millis(10);
+    // The same for an event file the guest was told about and that has had
+    // no edge since. A Windows guest never drains its event files (no
+    // `GET_EVENT_DATA` at all: it takes the report as a wake), so each one
+    // stays readable for as long as it is open, and every NVK device a
+    // process ever made kept costing an EventReady per REPEAT -- 100 a second
+    // per file, for ever, on top of the real edges: about 1700 a second at an
+    // idle desktop after a CS2 session (2026-10-08), vCPU0 at 96 % and Heaven
+    // at a third of its frame rate until the VM was restarted. New events
+    // come as edges, and an edge that was coalesced is re-checked every
+    // SWEEP (`recheck`), so this only paces the safety net for a file
+    // nothing new happened on.
+    const REPEAT_IDLE: Duration = Duration::from_secs(1);
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -946,6 +1431,10 @@ fn event_pump(
     let mut once: HashSet<u64> = HashSet::new();
     // When each descriptor was last reported (REPEAT).
     let mut last_report: HashMap<u64, Instant> = HashMap::new();
+    // Event files whose last edge was coalesced (`Sent::Coalesced`): asked
+    // again every SWEEP until a report goes out, so an edge held back on a
+    // wrong guess of what the guest has read waits COALESCE_MAX at most.
+    let mut recheck: HashSet<u64> = HashSet::new();
     let mut last_sweep = Instant::now();
 
     // Edge-triggered. Level-triggered would report a descriptor as readable
@@ -963,12 +1452,89 @@ fn event_pump(
         unsafe { libc::epoll_ctl(epfd.as_raw_fd(), op, fd, &mut ev) }
     };
 
+    if let Some(w) = wake.as_ref() {
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: PUMP_WAKE_TAG,
+        };
+        if unsafe {
+            libc::epoll_ctl(
+                epfd.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                w.0.as_raw_fd(),
+                &mut ev,
+            )
+        } != 0
+        {
+            log::warn!(
+                "event pump: watching the wake eventfd: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    let mut add_lat = [0u64; ADD_LAT_BUCKETS_US.len() + 1];
+    let mut add_lat_n = 0u64;
+    let mut add_lat_max_us = 0u64;
+    let mut reports = EventReports::new(vring.clone(), mem.clone(), wake.clone());
+    let mut delivered: Vec<(u32, bool)> = Vec::new();
+    // What `EventReports::flush` sent: a fence is done (as below, `reported`),
+    // an event file was reported now.
+    let settle = |delivered: &mut Vec<(u32, bool)>,
+                  watched: &mut HashMap<u64, OwnedFd>,
+                  once: &mut HashSet<u64>,
+                  last_report: &mut HashMap<u64, Instant>,
+                  recheck: &mut HashSet<u64>| {
+        for (handle, fence) in delivered.drain(..) {
+            if fence {
+                once.remove(&(handle as u64));
+                if let Some(fd) = watched.remove(&(handle as u64)) {
+                    ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
+                }
+            } else {
+                last_report.insert(handle as u64, Instant::now());
+                recheck.remove(&(handle as u64));
+            }
+        }
+    };
+    let due_at = |h: u64,
+                  now: Instant,
+                  once: &HashSet<u64>,
+                  last_report: &HashMap<u64, Instant>,
+                  recheck: &HashSet<u64>| {
+        sweep_due(h, now, once, last_report, recheck, REPEAT, REPEAT_IDLE)
+    };
+
     loop {
         // Drain the control channel first: a descriptor closed on the other
         // thread must leave the set before it can be reported again.
         loop {
             match rx.try_recv() {
-                Ok(Watch::Add(handle, fd, fence)) => {
+                Ok(Watch::Add(handle, fd, fence, sent)) => {
+                    if fence {
+                        let us = sent.elapsed().as_micros() as u64;
+                        let b = ADD_LAT_BUCKETS_US
+                            .iter()
+                            .position(|&bound| us < bound)
+                            .unwrap_or(ADD_LAT_BUCKETS_US.len());
+                        add_lat[b] += 1;
+                        add_lat_max_us = add_lat_max_us.max(us);
+                        add_lat_n += 1;
+                        if add_lat_n % ADD_LAT_LOG_EVERY == 0 {
+                            log::info!(
+                                "event pump: {add_lat_n} fence adds, send-to-watch <50us {} <200us {} \
+                                 <500us {} <1ms {} <2ms {} >=2ms {}, max {add_lat_max_us} us (wake {})",
+                                add_lat[0],
+                                add_lat[1],
+                                add_lat[2],
+                                add_lat[3],
+                                add_lat[4],
+                                add_lat[5],
+                                if wake.is_some() { "on" } else { "off" },
+                            );
+                            add_lat = [0; ADD_LAT_BUCKETS_US.len() + 1];
+                            add_lat_max_us = 0;
+                        }
+                    }
                     if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), handle) == 0 {
                         // Edge-triggered misses a descriptor that is already
                         // readable when it is added: a fence made for a value
@@ -982,19 +1548,27 @@ fn event_pump(
                         };
                         let ready = unsafe { libc::poll(&mut pfd, 1, 0) } > 0
                             && pfd.revents & libc::POLLIN != 0;
-                        if ready && fence {
-                            // Reported once and never watched, as the sweep
-                            // would do for a signalled fence.
-                            let status = sync_file_status(fd.as_raw_fd());
-                            if push_event(&vring, &mem, handle, status, batch.then_some(&mut pass))
+                        if ready {
+                            let status = if fence {
+                                sync_file_status(fd.as_raw_fd())
+                            } else {
+                                0
+                            };
+                            match reports.report(handle, fence, status, batch.then_some(&mut pass))
                             {
-                                ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
-                                continue;
+                                // Reported once and never watched, as the sweep
+                                // would do for a signalled fence.
+                                Sent::Pushed if fence => {
+                                    ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
+                                    continue;
+                                }
+                                Sent::Pushed => {
+                                    last_report.insert(handle as u64, Instant::now());
+                                }
+                                // Queued: watched until the backlog sends it.
+                                // Dropped: the sweep finds it.
+                                Sent::Coalesced | Sent::Queued | Sent::Dropped => {}
                             }
-                        }
-                        if ready && push_event(&vring, &mem, handle, 0, batch.then_some(&mut pass))
-                        {
-                            last_report.insert(handle as u64, Instant::now());
                         }
                         watched.insert(handle as u64, fd);
                         if fence {
@@ -1003,8 +1577,10 @@ fn event_pump(
                     }
                 }
                 Ok(Watch::Remove(handle)) => {
+                    reports.forget(handle);
                     once.remove(&(handle as u64));
                     last_report.remove(&(handle as u64));
+                    recheck.remove(&(handle as u64));
                     if let Some(fd) = watched.remove(&(handle as u64)) {
                         ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
                     }
@@ -1013,6 +1589,20 @@ fn event_pump(
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
             }
         }
+
+        // What found no buffer earlier goes first.
+        {
+            let mut p = batch.then_some(&mut pass);
+            reports.flush(&mut p, &mut delivered);
+        }
+        settle(
+            &mut delivered,
+            &mut watched,
+            &mut once,
+            &mut last_report,
+            &mut recheck,
+        );
+        reports.log_stats();
 
         // The safety net: an edge can be missed if a descriptor was already
         // readable when it was added, or if a notification found no buffer
@@ -1028,9 +1618,7 @@ fn event_pump(
                 .keys()
                 .copied()
                 .filter(|h| {
-                    !last_report
-                        .get(h)
-                        .is_some_and(|&t| now.duration_since(t) < REPEAT)
+                    !reports.owed(*h as u32) && due_at(*h, now, &once, &last_report, &recheck)
                 })
                 .collect();
             let mut pfds: Vec<libc::pollfd> = due
@@ -1054,12 +1642,25 @@ fn event_pump(
                     } else {
                         0
                     };
-                    if push_event(&vring, &mem, handle as u32, status, Some(&mut pass)) {
-                        if once.contains(&handle) {
-                            reported.push(handle);
-                        } else {
+                    match reports.report(
+                        handle as u32,
+                        once.contains(&handle),
+                        status,
+                        Some(&mut pass),
+                    ) {
+                        Sent::Pushed if once.contains(&handle) => reported.push(handle),
+                        Sent::Pushed => {
                             last_report.insert(handle, now);
+                            recheck.remove(&handle);
                         }
+                        Sent::Coalesced => {
+                            recheck.insert(handle);
+                        }
+                        // Asked again on the next sweep.
+                        Sent::Dropped => {
+                            last_report.remove(&handle);
+                        }
+                        Sent::Queued => {}
                     }
                 }
             }
@@ -1067,9 +1668,8 @@ fn event_pump(
             let now = Instant::now();
             last_sweep = now;
             for (&handle, fd) in watched.iter() {
-                if last_report
-                    .get(&handle)
-                    .is_some_and(|&t| now.duration_since(t) < REPEAT)
+                if reports.owed(handle as u32)
+                    || !due_at(handle, now, &once, &last_report, &recheck)
                 {
                     continue;
                 }
@@ -1084,12 +1684,19 @@ fn event_pump(
                     } else {
                         0
                     };
-                    if push_event(&vring, &mem, handle as u32, status, None) {
-                        if once.contains(&handle) {
-                            reported.push(handle);
-                        } else {
+                    match reports.report(handle as u32, once.contains(&handle), status, None) {
+                        Sent::Pushed if once.contains(&handle) => reported.push(handle),
+                        Sent::Pushed => {
                             last_report.insert(handle, now);
+                            recheck.remove(&handle);
                         }
+                        Sent::Coalesced => {
+                            recheck.insert(handle);
+                        }
+                        Sent::Dropped => {
+                            last_report.remove(&handle);
+                        }
+                        Sent::Queued => {}
                     }
                 }
             }
@@ -1117,25 +1724,58 @@ fn event_pump(
         for ev in events.iter().take(n as usize) {
             // Copied out first: epoll_event is packed, so its field cannot be
             // borrowed.
-            let handle = { ev.u64 } as u32;
+            let tag = { ev.u64 };
+            if tag == PUMP_WAKE_TAG {
+                // The control channel is drained at the top of the loop.
+                if let Some(w) = wake.as_ref() {
+                    w.drain();
+                }
+                continue;
+            }
+            let handle = tag as u32;
             let fence = once.contains(&(handle as u64));
             // Already sent by the sweep above: one EventReady per fence.
             if fence && reported.contains(&(handle as u64)) {
                 continue;
             }
-            let status = match watched.get(&(handle as u64)) {
-                Some(fd) if fence => sync_file_status(fd.as_raw_fd()),
-                _ => 0,
+            // Closed, or a fence the backlog sent this pass.
+            let Some(fd) = watched.get(&(handle as u64)) else {
+                continue;
             };
-            if !push_event(&vring, &mem, handle, status, batch.then_some(&mut pass)) {
-                // A fence stays in the set, and the sweep sends it again.
-                log::debug!("event pump: no buffer posted for handle {handle}; dropped");
-            } else if fence {
-                reported.push(handle as u64);
+            let status = if fence {
+                sync_file_status(fd.as_raw_fd())
             } else {
-                last_report.insert(handle as u64, Instant::now());
+                0
+            };
+            match reports.report(handle, fence, status, batch.then_some(&mut pass)) {
+                Sent::Pushed if fence => reported.push(handle as u64),
+                Sent::Pushed => {
+                    last_report.insert(handle as u64, Instant::now());
+                    recheck.remove(&(handle as u64));
+                }
+                // Counted (`EventReports`). A coalesced edge is asked again
+                // every sweep until it goes out; a queued one goes out with
+                // the next buffer; a dropped one with the next sweep.
+                Sent::Coalesced => {
+                    recheck.insert(handle as u64);
+                }
+                Sent::Dropped => {
+                    last_report.remove(&(handle as u64));
+                }
+                Sent::Queued => {}
             }
         }
+        {
+            let mut p = batch.then_some(&mut pass);
+            reports.flush(&mut p, &mut delivered);
+        }
+        settle(
+            &mut delivered,
+            &mut watched,
+            &mut once,
+            &mut last_report,
+            &mut recheck,
+        );
         pass.signal(&vring);
         // A fence the guest has heard about is done here. Its descriptor
         // stays open until the guest closes the handle.
@@ -1338,6 +1978,8 @@ struct NvGpuBackend {
     /// Started on the first message, because the event queue and guest memory
     /// are not known before then.
     watches: Option<Sender<Watch>>,
+    /// The event pump's wake eventfd, written after each batch of sends.
+    watch_wake: Option<Arc<PumpWake>>,
     /// Where display input goes; filled in alongside `watches`.
     input_target: EventTarget,
     /// Whether the guest takes display input: set from the acked features
@@ -1481,7 +2123,12 @@ impl NvGpuBackend {
                 warned_small: std::sync::atomic::AtomicBool::new(false),
             });
             link.set_release_sink(sink.clone());
-            link.set_presented_sink(sink);
+            match PresentedRelay::start(sink.clone()) {
+                Ok(relay) => link.set_presented_sink(relay),
+                Err(e) => {
+                    log::warn!("display: presentation reports off ({e}): no thread for them");
+                }
+            }
             display_link = Some(link.clone());
             nvidia.set_display(link);
         }
@@ -1494,6 +2141,7 @@ impl NvGpuBackend {
             // can enumerate the GPU before the shared window exists.
             config,
             watches: None,
+            watch_wake: None,
             input_target,
             input_claims,
             display_link,
@@ -1628,10 +2276,15 @@ impl NvGpuBackend {
             *self.input_target.lock().expect("event target") = Some((vring.clone(), mem.clone()));
             let (tx, rx) = channel();
             let batch = self.latency.event_batch;
+            let wake = PumpWake::new().map(Arc::new);
+            let pump_wake = wake.clone();
             std::thread::Builder::new()
                 .name("nvgpu-events".into())
-                .spawn(move || event_pump(rx, vring, mem, batch))
-                .map(|_| self.watches = Some(tx))
+                .spawn(move || event_pump(rx, pump_wake, vring, mem, batch))
+                .map(|_| {
+                    self.watches = Some(tx);
+                    self.watch_wake = wake;
+                })
                 .unwrap_or_else(|e| log::error!("event pump would not start: {e}"));
         }
         let Some(tx) = self.watches.as_ref() else {
@@ -1657,10 +2310,14 @@ impl NvGpuBackend {
                 handle,
                 unsafe { OwnedFd::from_raw_fd(dup) },
                 fence,
+                Instant::now(),
             ));
         }
         for handle in removed {
             let _ = tx.send(Watch::Remove(handle));
+        }
+        if let Some(w) = self.watch_wake.as_ref() {
+            w.wake();
         }
     }
 
@@ -2034,8 +2691,12 @@ impl VhostUserBackendMut for NvGpuBackend {
         // is dispatched, answered with "unknown message", handed back filled,
         // re-posted by the guest, and kicked again -- 7.4 million times in five
         // seconds, measured, the first time two guests ran at once. The pump
-        // thread owns this queue; a kick on it needs no work here.
+        // thread owns this queue; a kick on it only wakes the pump when it has
+        // reports waiting for a buffer (`EventReports`).
         if device_event as usize == EVENT_QUEUE {
+            if let Some(w) = self.watch_wake.as_ref() {
+                w.buffers_posted();
+            }
             return Ok(());
         }
 
@@ -2510,7 +3171,76 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_event_file_the_guest_was_told_about_is_asked_again_only_when_idle() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, Instant};
+        let (rep, idle) = (Duration::from_millis(10), Duration::from_secs(1));
+        let t0 = Instant::now();
+        let mut once = HashSet::new();
+        let mut last = HashMap::new();
+        let mut recheck = HashSet::new();
+        // Never reported: due.
+        assert!(super::sweep_due(8, t0, &once, &last, &recheck, rep, idle));
+        // An event file reported 20 ms ago is not asked (was: every 10 ms).
+        last.insert(8, t0);
+        let t = t0 + Duration::from_millis(20);
+        assert!(!super::sweep_due(8, t, &once, &last, &recheck, rep, idle));
+        assert!(super::sweep_due(
+            8,
+            t0 + idle,
+            &once,
+            &last,
+            &recheck,
+            rep,
+            idle
+        ));
+        // A coalesced edge is asked every sweep.
+        recheck.insert(8);
+        assert!(super::sweep_due(8, t, &once, &last, &recheck, rep, idle));
+        // A fence keeps the short repeat.
+        once.insert(9);
+        last.insert(9, t0);
+        assert!(!super::sweep_due(
+            9,
+            t0 + Duration::from_millis(5),
+            &once,
+            &last,
+            &recheck,
+            rep,
+            idle
+        ));
+        assert!(super::sweep_due(9, t, &once, &last, &recheck, rep, idle));
+    }
+
     use super::*;
+
+    #[test]
+    fn report_unread_counts_the_guests_filled_buffers() {
+        // 16 posted, all back: everything was read.
+        assert!(!report_unread(100, 100, 16, 16));
+        // The guest holds 3 filled buffers: the last three reports.
+        assert!(report_unread(100, 100, 13, 16)); // the newest
+        assert!(report_unread(100, 98, 13, 16)); // the third newest
+        assert!(!report_unread(100, 97, 13, 16)); // older: read
+        // Across the u16 wrap.
+        assert!(report_unread(1, 0, 14, 16));
+        assert!(!report_unread(1, 65535, 14, 16));
+        // A depth estimate below what is free never says unread.
+        assert!(!report_unread(5, 5, 16, 8));
+    }
+
+    #[test]
+    fn ring_depth_keeps_the_most_seen_over_two_windows() {
+        let mut d = RingDepth::default();
+        assert_eq!(d.note(16), 16);
+        assert_eq!(d.note(3), 16);
+        // A new window keeps the previous one's maximum.
+        d.since = Some(Instant::now() - Duration::from_secs(2));
+        assert_eq!(d.note(4), 16);
+        d.since = Some(Instant::now() - Duration::from_secs(2));
+        assert_eq!(d.note(4), 4);
+    }
 
     #[test]
     fn a_flip_request_gives_its_seq() {
