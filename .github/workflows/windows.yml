@@ -66,6 +66,8 @@ jobs:
       - name: Build and stage NVK and Zink
         env:
           MESA_DIR: ${{ runner.temp }}/mesa
+          # bindgen must use LLVM 20's libclang; the runner's default 18 rejects MinGW's mmintrin.h
+          LIBCLANG_PATH: /usr/lib/llvm-20/lib
           JOBS: '4'
           MEMORY_MAX: ''
         run: sh ./guest/nvk-rm/windows/stage-helios-package.sh "$RUNNER_TEMP/helios-nvk"
