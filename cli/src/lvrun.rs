@@ -99,6 +99,21 @@ pub fn pick_default(mut vms: Vec<(String, Option<std::time::SystemTime>)>) -> De
 }
 
 /// The VM `conduit view` without a NAME opens, saying which when there is a choice.
+/// The VM [`default_vm`] would pick, without saying so (the dashboard).
+pub fn recent_vm() -> Option<String> {
+    let vms = all_names()
+        .into_iter()
+        .map(|n| {
+            let t = last_used(&n);
+            (n, t)
+        })
+        .collect();
+    match pick_default(vms) {
+        DefaultVm::None => None,
+        DefaultVm::Only(n) | DefaultVm::Recent(n, _) => Some(n),
+    }
+}
+
 pub fn default_vm() -> Result<String> {
     let vms = all_names()
         .into_iter()
