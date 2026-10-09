@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 03:31:31 +0200
+Subject: [PATCH] nvk: fragment shader state emitted only when it changes, bind
+ counts
+
+CS2's depth prepass costs ~110 us per draw call with no barrier or
+cache invalidate recorded between the calls.  Every fragment shader bind
+re-emitted, besides the program, SET_SUBTILING_PERF_KNOB_A/B,
+SET_API_MANDATED_EARLY_Z, SET_POST_Z_PS_IMASK, SET_ZCULL_BOUNDS and the
+NVK_MME_SET_SHADING_RATE_CONTROL and NVK_MME_SET_ANTI_ALIAS macros, even
+when they were the same; a pass that alternates between shaders writes
+early-Z and ZCULL bounds state between draws.
+
+NVK_FS_STATE_TRACKING (default on, =0 restores the old stream): the state
+after a fragment shader's program (nvk_shader::fs_tail_dw_start) is
+emitted only when it differs from the last one emitted in the command
+buffer.  Meta operations, generated commands and secondaries forget it
+(nvk_cmd_forget_gfx_gpu_state), so the next bind emits it in full.  The
+macros merge their parameter with other state kept in MME scratch, which
+the skipped call would have left unchanged.
+
+NVK_PASS_PROFILE: each pass's shaders line also counts the shader stage
+programs emitted (and of them fragment shaders) and the descriptor set /
+descriptor buffer offset binds per pass.
+
+Constant buffers bound from CPU-known addresses are already skipped when
+unchanged (0004); with NVK_UBO_DESC_CBUF=0, the Windows default, UBO
+descriptors are not bound through NVK_MME_BIND_CBUF_DESC at all.
+
+No MME macro change: 2160 dwords for a DXVK device.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c   |  5 +++-
+ src/nouveau/vulkan/nvk_cmd_buffer.h   | 28 ++++++++++++++++++++
+ src/nouveau/vulkan/nvk_cmd_draw.c     | 37 +++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_pass_profile.c | 15 ++++++++---
+ src/nouveau/vulkan/nvk_pass_profile.h |  7 +++++
+ src/nouveau/vulkan/nvk_shader.c       |  1 +
+ src/nouveau/vulkan/nvk_shader.h       |  6 +++++
+ 7 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 0d6e2456..dd7ae0f4 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -462,8 +462,9 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+       util_dynarray_append_dynarray(&cmd->pushes, &other->pushes);
+ 
+       cmd->prev_subc = nvk_cmd_buffer_last_subchannel(other);
+-      /* The secondary may hold barriers */
++      /* The secondary may hold barriers and set any 3D state */
+       cmd->indirect_push_synced = false;
++      cmd->state.gfx.fs_tail_dw_count = 0;
+ 
+       if (prof_slot >= 0) {
+          nvk_pass_profile_end_secondary(cmd, other, prof_slot);
+@@ -1146,6 +1147,7 @@ nvk_CmdBindDescriptorSets2KHR(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
+    if (pBindDescriptorSetsInfo->stageFlags & NVK_VK_GRAPHICS_STAGE_BITS) {
++      nvk_cmd_profile_count_desc_bind(cmd);
+       nvk_bind_descriptor_sets(cmd, &cmd->state.gfx.descriptors,
+                                pBindDescriptorSetsInfo);
+    }
+@@ -1212,6 +1214,7 @@ nvk_CmdSetDescriptorBufferOffsets2EXT(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
+    if (pInfo->stageFlags & NVK_VK_GRAPHICS_STAGE_BITS) {
++      nvk_cmd_profile_count_desc_bind(cmd);
+       nvk_set_descriptor_buffer_offsets(cmd, &cmd->state.gfx.descriptors,
+                                         pInfo);
+    }
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index ffb26ab6..d14db9b6 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -281,6 +281,11 @@ struct nvk_graphics_state {
+     * is skipped.  vb_known has a bit per vertex stream.
+     */
+    uint32_t vb_known;
++   /* NVK_FS_STATE_TRACKING: the fragment shader state tail
++    * (nvk_shader::fs_tail_dw_start) last emitted, 0 dwords if unknown
++    */
++   uint16_t fs_tail_dw_count;
++   uint32_t fs_tail_dw[24];
+    struct {
+       uint64_t addr;
+       uint32_t size;
+@@ -459,6 +464,7 @@ nvk_cmd_forget_gfx_gpu_state(struct nvk_cmd_buffer *cmd)
+       cmd->state.gfx.cbuf_groups[g].bound_known = 0;
+    cmd->state.gfx.vb_known = 0;
+    cmd->state.gfx.ib_known = false;
++   cmd->state.gfx.fs_tail_dw_count = 0;
+ }
+ void nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd);
+ 
+@@ -587,6 +593,28 @@ nvk_cmd_profile_count_draws(struct nvk_cmd_buffer *cmd, uint32_t draws,
+    }
+ }
+ 
++static inline void
++nvk_cmd_profile_count_shader_bind(struct nvk_cmd_buffer *cmd, bool fs)
++{
++   struct nvk_pass_profile_counts *c[3] = {
++      &cmd->pass_profile_pass_counts,
++      &cmd->pass_profile_op_counts,
++      &cmd->pass_profile_cmd_counts,
++   };
++   for (unsigned i = 0; i < 3; i++) {
++      c[i]->shader_binds++;
++      c[i]->fs_binds += fs;
++   }
++}
++
++static inline void
++nvk_cmd_profile_count_desc_bind(struct nvk_cmd_buffer *cmd)
++{
++   cmd->pass_profile_pass_counts.desc_binds++;
++   cmd->pass_profile_op_counts.desc_binds++;
++   cmd->pass_profile_cmd_counts.desc_binds++;
++}
++
+ static inline void
+ nvk_cmd_profile_count_query(struct nvk_cmd_buffer *cmd)
+ {
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 6908705c..0d905657 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -59,6 +59,21 @@ static uint32_t nvk_mdi_batch(void);
+  * 0032; =0 is upstream's per-record MME
+  * DMA reads): see nvk_cmd_draw_indirect_pushed().
+  */
++/* NVK_FS_STATE_TRACKING (default on, =0 always emits it): see
++ * nvk_shader::fs_tail_dw_start
++ */
++static bool
++nvk_fs_state_tracking(void)
++{
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      s = debug_get_bool_option("NVK_FS_STATE_TRACKING", true) ? 2 : 1;
++      p_atomic_set(&state, s);
++   }
++   return s == 2;
++}
++
+ static bool
+ nvk_indirect_push(void)
+ {
+@@ -2547,12 +2562,34 @@ nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd)
+ 
+    u_foreach_bit(type, types_dirty) {
+       struct nvk_shader *shader = type_shader[type];
++      nvk_cmd_profile_count_shader_bind(cmd,
++         type == NV9097_SET_PIPELINE_SHADER_TYPE_PIXEL);
+       if (shader == NULL) {
+          struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+          P_IMMD(p, NV9097, SET_PIPELINE_SHADER(type), {
+             .enable  = ENABLE_FALSE,
+             .type    = type,
+          });
++      } else if (type == NV9097_SET_PIPELINE_SHADER_TYPE_PIXEL &&
++                 nvk_fs_state_tracking() && shader->fs_tail_dw_start > 0 &&
++                 shader->push_dw_count - shader->fs_tail_dw_start <=
++                    ARRAY_SIZE(cmd->state.gfx.fs_tail_dw)) {
++         /* The program always; the state after it only when it differs
++          * from what the last fragment shader left (NVK_FS_STATE_TRACKING)
++          */
++         struct nvk_graphics_state *gfx = &cmd->state.gfx;
++         const uint16_t tail_start = shader->fs_tail_dw_start;
++         const uint16_t tail_dw = shader->push_dw_count - tail_start;
++         const bool same = gfx->fs_tail_dw_count == tail_dw &&
++            memcmp(gfx->fs_tail_dw, &shader->push_dw[tail_start],
++                   tail_dw * 4) == 0;
++         const uint16_t emit_dw = same ? tail_start : shader->push_dw_count;
++         struct nv_push *p = nvk_cmd_buffer_push(cmd, emit_dw);
++         nv_push_raw(p, shader->push_dw, emit_dw);
++         if (!same) {
++            memcpy(gfx->fs_tail_dw, &shader->push_dw[tail_start], tail_dw * 4);
++            gfx->fs_tail_dw_count = tail_dw;
++         }
+       } else {
+          struct nv_push *p = nvk_cmd_buffer_push(cmd, shader->push_dw_count);
+          nv_push_raw(p, shader->push_dw, shader->push_dw_count);
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
+index 4be05691..38e1ad28 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.c
++++ b/src/nouveau/vulkan/nvk_pass_profile.c
+@@ -185,7 +185,7 @@ struct prof_sig {
+    uint64_t gpu_ns;
+    uint64_t count;
+    uint64_t calls, draws, ind_calls, ind_draws, queries, barriers;
+-   uint64_t fs_calls, tess_gs_calls;
++   uint64_t fs_calls, tess_gs_calls, shader_binds, fs_binds, desc_binds;
+    uint32_t vs_gprs, vs_instrs, vs_cycles, fs_gprs, fs_instrs, spills, slm;
+    uint64_t stat_count;
+    uint64_t stats[PROF_STATS];
+@@ -1003,6 +1003,9 @@ prof_counts_add(struct nvk_pass_profile_counts *dst,
+    dst->slm = MAX2(dst->slm, src->slm);
+    dst->fs_calls += src->fs_calls;
+    dst->tess_gs_calls += src->tess_gs_calls;
++   dst->shader_binds += src->shader_binds;
++   dst->fs_binds += src->fs_binds;
++   dst->desc_binds += src->desc_binds;
+ }
+ 
+ void
+@@ -1111,10 +1114,12 @@ prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
+    if (s->kind == PROF_KIND_PASS && s->calls > 0) {
+       prof_log(prof, "NVK pass profile:            shaders: vs<=%u gprs "
+                "%u instrs %u cycles, fs<=%u gprs %u instrs in %.1f calls, "
+-               "%.1f calls with tess/gs, spills+fills<=%u, slm<=%u B",
++               "%.1f calls with tess/gs, spills+fills<=%u, slm<=%u B; "
++               "%.1f shader binds (%.1f fs), %.1f descriptor binds",
+                s->vs_gprs, s->vs_instrs, s->vs_cycles, s->fs_gprs,
+                s->fs_instrs, s->fs_calls / n, s->tess_gs_calls / n,
+-               s->spills, s->slm);
++               s->spills, s->slm, s->shader_binds / n, s->fs_binds / n,
++               s->desc_binds / n);
+    }
+    if (s->hist != NULL && s->hist->passes > 0)
+       prof_log_hist(prof, s->hist);
+@@ -1155,6 +1160,9 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+       ps->queries += m->counts.queries;
+       ps->barriers += m->counts.barriers;
+       ps->fs_calls += m->counts.fs_calls;
++      ps->shader_binds += m->counts.shader_binds;
++      ps->fs_binds += m->counts.fs_binds;
++      ps->desc_binds += m->counts.desc_binds;
+       ps->tess_gs_calls += m->counts.tess_gs_calls;
+       ps->vs_gprs = MAX2(ps->vs_gprs, m->counts.vs_gprs);
+       ps->vs_instrs = MAX2(ps->vs_instrs, m->counts.vs_instrs);
+@@ -1263,6 +1271,7 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+          s->calls = s->draws = s->ind_calls = s->ind_draws = 0;
+          s->queries = s->barriers = 0;
+          s->fs_calls = s->tess_gs_calls = 0;
++         s->shader_binds = s->fs_binds = s->desc_binds = 0;
+          s->vs_gprs = s->vs_instrs = s->vs_cycles = 0;
+          s->fs_gprs = s->fs_instrs = s->spills = s->slm = 0;
+          s->stat_count = 0;
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.h b/src/nouveau/vulkan/nvk_pass_profile.h
+index 66269191..fb230d8e 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.h
++++ b/src/nouveau/vulkan/nvk_pass_profile.h
+@@ -41,6 +41,13 @@ struct nvk_pass_profile_counts {
+    uint32_t slm;
+    uint32_t fs_calls;
+    uint32_t tess_gs_calls;
++   /* Shader stage programs emitted (SET_PIPELINE_SHADER + program, per
++    * stage type), of them fragment shaders, and descriptor set / buffer
++    * offset binds (vkCmdBindDescriptorSets*, vkCmdSetDescriptorBufferOffsets*)
++    */
++   uint32_t shader_binds;
++   uint32_t fs_binds;
++   uint32_t desc_binds;
+ };
+ 
+ /* Operations outside render passes, timed as runs of the same kind */
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index d5876cf4..9050701c 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -1072,6 +1072,7 @@ nvk_shader_fill_push(struct nvk_device *dev,
+    } else if (shader->info.stage == MESA_SHADER_FRAGMENT) {
+       max_dw_count += 13;
+ 
++      shader->fs_tail_dw_start = nv_push_dw_count(&push);
+       P_MTHD(p, NVC397, SET_SUBTILING_PERF_KNOB_A);
+       P_NV9097_SET_SUBTILING_PERF_KNOB_A(p, {
+          .fraction_of_spm_register_file_per_subtile         = 0x10,
+diff --git a/src/nouveau/vulkan/nvk_shader.h b/src/nouveau/vulkan/nvk_shader.h
+index 53120cfb..10e57dd1 100644
+--- a/src/nouveau/vulkan/nvk_shader.h
++++ b/src/nouveau/vulkan/nvk_shader.h
+@@ -132,6 +132,12 @@ struct nvk_shader {
+ 
+    uint16_t push_dw_count;
+    uint16_t vtgm_push_dw_count;
++   /* Fragment shaders: push_dw[fs_tail_dw_start, push_dw_count) is the
++    * state that follows the program (subtiling knobs, early-Z, post-Z
++    * coverage, ZCULL bounds, shading rate and anti-alias macros), which
++    * NVK_FS_STATE_TRACKING skips when it equals what was last emitted.
++    */
++   uint16_t fs_tail_dw_start;
+    uint32_t *push_dw;
+ };
+ 
+-- 
+2.43.0
+
