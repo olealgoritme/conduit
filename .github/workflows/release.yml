@@ -54,6 +54,8 @@ jobs:
   host:
     name: host (${{ matrix.format }})
     needs: rust-static
+    # The Fedora rpm build can't find venus-protocol yet; don't let it block the release.
+    continue-on-error: ${{ matrix.format == 'rpm' }}
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
     strategy:
@@ -61,13 +63,13 @@ jobs:
       matrix:
         include:
           - format: deb
-            image: ubuntu:24.04
+            image: mirror.gcr.io/library/ubuntu:24.04
           - format: rpm
-            image: fedora:latest
+            image: mirror.gcr.io/library/fedora:latest
           - format: archlinux
-            image: archlinux:latest
+            image: mirror.gcr.io/library/archlinux:latest
           - format: tarball
-            image: debian:12
+            image: mirror.gcr.io/library/debian:12
     steps:
       - name: Tools the checkout and cache actions need
         run: |

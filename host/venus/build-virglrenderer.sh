@@ -45,12 +45,12 @@ done
 # revision the guest's Mesa was generated from (the pinned submodule) through
 # pkg-config instead of fetching its own v1.1.3 wrap.
 meson setup --reconfigure "$build/venus-protocol" "$tp/venus-protocol" \
-    --prefix "$prefix" -Dwerror=false 2>/dev/null ||
+    --prefix "$prefix" --libdir lib -Dwerror=false 2>/dev/null ||
     meson setup "$build/venus-protocol" "$tp/venus-protocol" \
-        --prefix "$prefix" -Dwerror=false
+        --prefix "$prefix" --libdir lib -Dwerror=false
 ninja -C "$build/venus-protocol" ${JOBS:+-j"$JOBS"} install
 
-export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/share/pkgconfig:$prefix/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/share/pkgconfig:$prefix/lib/x86_64-linux-gnu/pkgconfig:$prefix/lib64/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
 opts=(
     --prefix "$prefix"
