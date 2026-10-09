@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 06:26:35 +0200
+Subject: [PATCH] nvk: null vertex buffers and the zero page in VRAM
+
+NVK_PASS_PROFILE=5 dump of CS2's depth prepass (405.21): every draw call
+binds three vertex streams, the position (stride 12), a per-instance
+R32_UINT stream (stride 4) and binding 2 with no buffer at all
+(robustness2 nullDescriptor, DXVK's null binding for an unused D3D11
+input slot): stride 0, instance rate, divisor 0, read by the vertex
+shader as an R32G32B32A32_UINT attribute.
+
+Mechanism.  On Turing+ NVK binds a null vertex buffer as stream address
+0 with size 0, so every fetch of that attribute is out of bounds.  The
+3D class does not fault on those: it reads the vertex stream substitute
+address instead, which NVK programs once at context init
+(SET_VERTEX_STREAM_SUBSTITUTE) to the device's zero page.  The zero page
+was allocated LOCAL with a CPU map, and on RM mappable memory is our own
+guest system pages, mapped GPU-uncached (volatile; see the placement
+policy in nvkmd_rm_mem.c).  So the null attribute of every vertex of
+every prepass draw was a PCIe read through the guest IOMMU that L2 never
+keeps.  Null image and texel-buffer descriptors (nil_null_descriptor)
+point at the same page, so a null texture read crossed PCIe the same
+way.
+
+CS2 on 405.23 (the 2x MSAA D24S8 prepass): 384 fps, 44-48 us per pass;
+with NVK_NULL_VB_ZERO_PAGE=0 NVK_ZERO_PAGE_VRAM=0 (upstream): 31.8 fps,
+6,930 us per pass.
+
+- NVK_ZERO_PAGE_VRAM (default on; =0 is upstream): the zero page is
+  VRAM the GPU can cache, zeroed through the upload queue at device
+  creation.  This alone moves the substitute reads to VRAM.
+- NVK_NULL_VB_ZERO_PAGE (default on; =0 is upstream): a null vertex
+  buffer is bound to the zero page with a size of 4 KiB, so its fetches
+  are in bounds and never take the substitute path; the attribute still
+  reads zeros.
+
+Regression test: vk_gpubench cs2like nullvb=1 (null descriptors as well:
+nulldesc=1 nullubo=1) needs both knobs off to show the cost.  With only
+NVK_NULL_VB_ZERO_PAGE=0 the substitute address is still the VRAM zero
+page and the draws stay fast (0.28 us per draw either way on 405.23).
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c | 25 +++++++++++++++++++
+ src/nouveau/vulkan/nvk_device.c   | 40 ++++++++++++++++++++++++-------
+ 2 files changed, 57 insertions(+), 8 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 6e20d2ad..0765625a 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -4973,10 +4973,35 @@ const struct nvk_mme_test_case nvk_mme_bind_vb_tests[] = {{
+    .check = nvk_mme_bind_vb_test_check,
+ }, {}};
+ 
++/* NVK_NULL_VB_ZERO_PAGE (default on; =0 is upstream): a null vertex
++ * buffer (robustness2 nullDescriptor, which DXVK binds for unused D3D11
++ * input slots) is bound to the device's zeroed page, 4 KiB, instead of
++ * stream address 0 with size 0.  CS2's depth prepass draws every call with
++ * such a binding (stride 0, instance rate, divisor 0, an RGBA32UI
++ * attribute read by the vertex shader).  The attribute still reads zeros.
++ */
++static bool
++nvk_null_vb_zero_page(void)
++{
++   static uint32_t state;
++   uint32_t s = p_atomic_read(&state);
++   if (unlikely(s == 0)) {
++      s = debug_get_bool_option("NVK_NULL_VB_ZERO_PAGE", true) ? 2 : 1;
++      p_atomic_set(&state, s);
++   }
++   return s == 2;
++}
++
+ void
+ nvk_cmd_bind_vertex_buffer(struct nvk_cmd_buffer *cmd, uint32_t vb_idx,
+                            VkDeviceAddressRangeKHR addr_range)
+ {
++   if (addr_range.address == 0 && nvk_null_vb_zero_page()) {
++      struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++      addr_range.address = dev->zero_page->va->addr;
++      addr_range.size = 0x1000;
++   }
++
+    /* Used for meta save/restore */
+    if (vb_idx == 0)
+       cmd->state.gfx.vb0 = addr_range;
+diff --git a/src/nouveau/vulkan/nvk_device.c b/src/nouveau/vulkan/nvk_device.c
+index 4ad09a30..a32c6cd1 100644
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -275,15 +275,39 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
+       if (result != VK_SUCCESS)
+          goto fail_nvkmd;
+ 
+-      result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &pdev->vk.base,
+-                                          0x1000, 0, NVKMD_MEM_LOCAL,
+-                                          NVKMD_MEM_MAP_WR, &dev->zero_page);
+-      if (result != VK_SUCCESS)
+-         goto fail_upload;
++      /* NVK_ZERO_PAGE_VRAM (default on): the zero page, which null image
++       * and buffer descriptors and null vertex buffers
++       * (NVK_NULL_VB_ZERO_PAGE) read, is VRAM the GPU caches, zeroed
++       * through the upload queue.  Allocated mappable (upstream, =0), it is
++       * system memory on RM, uncached, and every read of a null resource
++       * crosses PCIe.
++       */
++      if (debug_get_bool_option("NVK_ZERO_PAGE_VRAM", true)) {
++         static const uint8_t zeros[0x1000];
++         result = nvkmd_dev_alloc_mem(dev->nvkmd, &pdev->vk.base, 0x1000, 0,
++                                      NVKMD_MEM_LOCAL, &dev->zero_page);
++         if (result != VK_SUCCESS)
++            goto fail_upload;
++         result = nvk_upload_queue_upload(dev, &dev->upload,
++                                          dev->zero_page->va->addr,
++                                          zeros, sizeof(zeros));
++         if (result == VK_SUCCESS)
++            result = nvk_upload_queue_sync(dev, &dev->upload);
++         if (result != VK_SUCCESS) {
++            nvkmd_mem_unref(dev->zero_page);
++            goto fail_upload;
++         }
++      } else {
++         result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &pdev->vk.base,
++                                             0x1000, 0, NVKMD_MEM_LOCAL,
++                                             NVKMD_MEM_MAP_WR, &dev->zero_page);
++         if (result != VK_SUCCESS)
++            goto fail_upload;
+ 
+-      memset(dev->zero_page->map, 0, 0x1000);
+-      nvkmd_mem_sync_map_to_gpu(dev->zero_page, 0, 0x1000);
+-      nvkmd_mem_unmap(dev->zero_page, 0);
++         memset(dev->zero_page->map, 0, 0x1000);
++         nvkmd_mem_sync_map_to_gpu(dev->zero_page, 0, 0x1000);
++         nvkmd_mem_unmap(dev->zero_page, 0);
++      }
+ 
+       result = nvk_descriptor_table_init(dev, &dev->images,
+                                          sizeof(struct nil_descriptor),
