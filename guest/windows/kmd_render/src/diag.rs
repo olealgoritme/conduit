@@ -1339,6 +1339,13 @@ pub mod knobs {
     /// behind it (per-destination order is kept). Clamped to 1..8. Read at every StartDevice;
     /// mirrored as `BltLookKnob`. `docs/zero-copy-present.md` section 24.10.
     pub const BLT_LOOKAHEAD: KnobName = KnobName::new(b"BltLookahead");
+    /// `BltSupersede` (default 1; `helios_kmd_logic::blt_async::SUPERSEDE_DEFAULT`): the HPD worker
+    /// completes, without their copies, queued windowed Blts that a newer queued Blt into the same
+    /// destination with the same source extent follows, so a backlog of copies into one
+    /// redirection surface cannot keep itself alive (`helios_kmd_logic::blt_async::superseded`).
+    /// 0: every queued copy is made in order. Read at every StartDevice; mirrored as
+    /// `BltSuperKnob`, counted in `BltSuperN`.
+    pub const BLT_SUPERSEDE: KnobName = KnobName::new(b"BltSupersede");
     /// `GuestBlob` (default 0 = the previous behaviour). 1: while VidMm holds a KMD standard
     /// Present buffer in system memory, the Blt copy writes those pages through a virtio-gpu
     /// GUEST blob imported into the KMD's Venus device, and the CPU mirror is skipped for it.

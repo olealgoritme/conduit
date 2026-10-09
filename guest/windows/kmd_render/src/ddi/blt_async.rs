@@ -100,6 +100,10 @@ static NOMIR_INVALID: AtomicU32 = AtomicU32::new(0);
 static SRC_BUSY: AtomicU32 = AtomicU32::new(0);
 static LOOKAHEAD: AtomicU32 = AtomicU32::new(ba::LOOKAHEAD_DEFAULT);
 static LOOK_N: AtomicU32 = AtomicU32::new(0);
+/// `BltSupersede` in force (`helios_kmd_logic::blt_async::SUPERSEDE_DEFAULT` until StartDevice
+/// reads it) and the queued copies it completed without a copy (`BltSuperN`).
+static SUPERSEDE: AtomicU32 = AtomicU32::new(ba::SUPERSEDE_DEFAULT);
+static SUPER_N: AtomicU32 = AtomicU32::new(0);
 static ENTRY_SEEN: AtomicU32 = AtomicU32::new(0);
 static ENTRY_DECIDED: AtomicU32 = AtomicU32::new(0);
 static ENTRY_OK: AtomicU32 = AtomicU32::new(0);
@@ -204,6 +208,13 @@ pub(crate) fn reset_for_start() {
     }
     SRC_BUSY.store(0, Ordering::Relaxed);
     LOOK_N.store(0, Ordering::Relaxed);
+    SUPER_N.store(0, Ordering::Relaxed);
+    let supersede = crate::diag::read_config_dword(
+        crate::diag::knobs::BLT_SUPERSEDE,
+        ba::SUPERSEDE_DEFAULT,
+    ) != 0;
+    SUPERSEDE.store(u32::from(supersede), Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"BltSuperKnob", u32::from(supersede));
     let a = read_knob(&ASYNC_KNOB, crate::diag::knobs::BLT_ASYNC);
     let m = read_knob(&NO_MIRROR_KNOB, crate::diag::knobs::BLT_NO_MIRROR);
     let v = read_knob(&VENUS_KNOB, crate::diag::knobs::BLT_ASYNC_VENUS);
@@ -222,6 +233,19 @@ pub(crate) fn reset_for_start() {
 /// relaxed load; the registry is read at StartDevice only (the worker holds a spinlock).
 pub(crate) fn lookahead() -> usize {
     LOOKAHEAD.load(Ordering::Relaxed) as usize
+}
+
+/// Whether the worker completes superseded queued copies without copying them (`BltSupersede`).
+/// One relaxed load; the registry is read at StartDevice only.
+pub(crate) fn supersede_on() -> bool {
+    SUPERSEDE.load(Ordering::Relaxed) != 0
+}
+
+/// The worker completed `n` superseded queued copies without copying them.
+pub(crate) fn note_superseded(n: u32) {
+    if n != 0 {
+        SUPER_N.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 /// The worker dispatched a copy ahead of a front entry that could not go.
@@ -318,6 +342,7 @@ pub(crate) fn publish_counters() {
         | FAILED.load(Ordering::Relaxed)
         | SRC_BUSY.load(Ordering::Relaxed)
         | LOOK_N.load(Ordering::Relaxed)
+        | SUPER_N.load(Ordering::Relaxed)
         | ENTRY_SEEN.load(Ordering::Relaxed)
         | PRES_BLT_N.load(Ordering::Relaxed)
         | PRES_FLIP_N.load(Ordering::Relaxed);
@@ -337,6 +362,7 @@ pub(crate) fn publish_counters() {
     rec(b"BltAsyncBusy", BUSY.load(Ordering::Relaxed));
     rec(b"BltDeferUs", DEFER_US.load(Ordering::Relaxed));
     rec(b"BltDrainN", DRAINS.load(Ordering::Relaxed));
+    rec(b"BltSuperN", SUPER_N.load(Ordering::Relaxed));
     for (name, cell) in LAT_NAMES.iter().zip(LAT.iter()) {
         rec(name, cell.load(Ordering::Relaxed));
     }

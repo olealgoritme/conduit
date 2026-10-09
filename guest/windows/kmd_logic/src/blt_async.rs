@@ -634,6 +634,48 @@ pub struct Cand {
 /// reason: the later frame must not land first). With a window of one this is the old rule.
 /// An entry that cannot go (its producer is slow, its destination is being read) no longer holds
 /// the entries of unrelated destinations behind it.
+/// `BltSupersede` default: 1 (on). 0 is the A/B lever (every queued Blt is copied in order).
+pub const SUPERSEDE_DEFAULT: u32 = 1;
+
+/// One queued windowed Blt as the supersede rule sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Queued {
+    /// The destination resource (DWM's redirection surface of the window).
+    pub dst: u32,
+    /// The source's extent: a windowed Blt copies its whole source to the same place.
+    pub src_extent: (u32, u32),
+    /// SubmitCommand admitted it (its Present's DMA buffer exists and waits for the token).
+    pub admitted: bool,
+    /// The worker submitted its copy.
+    pub dispatched: bool,
+}
+
+/// Whether `older` may complete without its copy because `newer`, presented after it, writes the
+/// same pixels of the same destination: both admitted and not yet dispatched, the same nonzero
+/// destination, the same nonzero source extent. Its Present then retires with the newer copy's
+/// pixels on the destination, as a dropped frame would.
+///
+/// Why: a backlog of queued copies into one redirection surface keeps itself alive. Each copy may
+/// go only when the destination is free (DWM's read of the previous frame retired), and while an
+/// older request names the destination nothing newer can go first; an application with three
+/// frames in flight refills the queue as fast as it drains, so once three are queued (a host
+/// hiccup is enough: a screenshot that holds the viewer's buffers) every frame waits about three
+/// composition periods (405.24: Heaven windowed held at ~96 fps, `BltAsyncInfl` 3 and
+/// `BltDeferUs` ~31 ms per Blt, until a window move drained the queue). Dropping the superseded
+/// copies drains it at once.
+pub const fn superseded(older: Queued, newer: Queued) -> bool {
+    older.dst != 0
+        && older.dst == newer.dst
+        && older.admitted
+        && newer.admitted
+        && !older.dispatched
+        && !newer.dispatched
+        && older.src_extent.0 != 0
+        && older.src_extent.1 != 0
+        && older.src_extent.0 == newer.src_extent.0
+        && older.src_extent.1 == newer.src_extent.1
+}
+
 pub fn pick(window: &[Cand]) -> Option<usize> {
     let mut i = 0;
     while i < window.len() {
@@ -685,6 +727,10 @@ pub const COUNTERS: &[&str] = &[
     "BltDrainN",
     // A source still being read by an earlier copy when its next Present arrived.
     "BltSrcBusy",
+    // Queued copies completed without a copy because a newer one into the same destination was
+    // queued behind them (`BltSupersede`), and the knob in force.
+    "BltSuperN",
+    "BltSuperKnob",
     // Worker lookahead: knob in force, dispatches made ahead of a blocked front entry.
     "BltLookKnob",
     "BltLookN",
@@ -733,6 +779,27 @@ pub const COUNTERS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+
+    fn q(dst: u32, w: u32, admitted: bool, dispatched: bool) -> Queued {
+        Queued { dst, src_extent: (w, 720), admitted, dispatched }
+    }
+
+    #[test]
+    fn a_queued_copy_is_superseded_only_by_a_newer_full_copy_into_its_destination() {
+        assert!(superseded(q(7, 1280, true, false), q(7, 1280, true, false)));
+        // Another destination, another extent, an unadmitted or a dispatched request: never.
+        assert!(!superseded(q(7, 1280, true, false), q(8, 1280, true, false)));
+        assert!(!superseded(q(7, 1280, true, false), q(7, 1600, true, false)));
+        assert!(!superseded(q(7, 1280, false, false), q(7, 1280, true, false)));
+        assert!(!superseded(q(7, 1280, true, false), q(7, 1280, false, false)));
+        assert!(!superseded(q(7, 1280, true, true), q(7, 1280, true, false)));
+        assert!(!superseded(q(7, 1280, true, false), q(7, 1280, true, true)));
+        // No identity or no extent: never.
+        assert!(!superseded(q(0, 1280, true, false), q(0, 1280, true, false)));
+        assert!(!superseded(q(7, 0, true, false), q(7, 0, true, false)));
+        assert_eq!(SUPERSEDE_DEFAULT, 1);
+    }
+
     extern crate std;
     use super::*;
     use std::vec::Vec;

@@ -72,6 +72,12 @@ impl OptimalPresentImageDesc {
         self.resource_id
     }
 
+    /// The image's extent (`BltSupersede`: two windowed Blts of one extent into one destination
+    /// write the same pixels).
+    pub(crate) fn extent(self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// Ordinary UMD-created shared images use the renderer's OPAQUE_FD
     /// transport. Keeping this constructor distinct from the DMA_BUF variant
     /// prevents Present from silently importing one allocation with the other

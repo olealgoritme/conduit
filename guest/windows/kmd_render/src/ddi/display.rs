@@ -2215,6 +2215,15 @@ unsafe fn present_blt_to_rm_primary(
 /// only when both that admission and the producer stream boundary are ready.
 /// There is no timer or producer poll: every promotion/completion signals HPD.
 pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterContext) {
+    // `BltSupersede`: queued copies a newer queued copy into the same destination overwrites
+    // complete without copying, before anything is dispatched (`helios_kmd_logic::blt_async::
+    // superseded`): a backlog cannot hold the application at the composition rate.
+    if crate::ddi::blt_async::supersede_on() {
+        let n = adapter
+            .with_virtio(|v| v.supersede_windowed_blts(adapter))
+            .unwrap_or(0);
+        crate::ddi::blt_async::note_superseded(n);
+    }
     adapter.with_scanout_lifecycle(passive, |lock| {
         let submit = lock.with_venus_client(|client| {
             let request = adapter
