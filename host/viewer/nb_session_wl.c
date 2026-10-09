@@ -509,6 +509,7 @@ struct nb_wl {
      * mode switch, which is not what dragging a window means. */
     int    buf_w, buf_h;
     int    win_w, win_h;
+    int    wnd_w, wnd_h;        /* last WINDOWED content size (0 = none yet) */
     int    surf_w, surf_h;
     /* A FOURTH, and it is the only one EV_SURFACE may ever carry: the window's
      * CONTENT size -- win_* less the decorations we draw.  surf_* cannot serve
@@ -3669,12 +3670,48 @@ static const struct xdg_surface_listener xdg_listener = {
     .configure = xdg_configure,
 };
 
+/*
+ * The content size to use when the window leaves fullscreen and the compositor
+ * either leaves the choice to us (configure 0x0) or offers a shape that is
+ * nothing like the guest's -- a portrait strip for a landscape desktop, which
+ * showed up as a tall, narrow window with the picture letterboxed in the
+ * middle.  The last windowed size is the answer; with none (the window
+ * started fullscreen) it is the guest's aspect at a modest width.
+ */
+static void wl_unfs_size(const struct nb_wl *w, int *wd, int *ht)
+{
+    int bw = w->buf_w > 0 ? w->buf_w : 16;
+    int bh = w->buf_h > 0 ? w->buf_h : 9;
+
+    if (w->wnd_w >= NB_MIN_W && w->wnd_h >= NB_MIN_H) {
+        *wd = w->wnd_w;
+        *ht = w->wnd_h;
+        return;
+    }
+    *wd = bw < 1600 ? bw : 1600;
+    *ht = (int)((long)*wd * bh / bw);
+    if (*ht < NB_MIN_H) {
+        *ht = NB_MIN_H;
+    }
+}
+
+/* True when a window of wd x ht is far from the guest's aspect (over 2:1). */
+static bool wl_odd_aspect(const struct nb_wl *w, int wd, int ht)
+{
+    if (w->buf_w <= 0 || w->buf_h <= 0 || wd <= 0 || ht <= 0) {
+        return false;
+    }
+    return (long)wd * w->buf_h * 2 < (long)ht * w->buf_w ||
+           (long)wd * w->buf_h > (long)ht * w->buf_w * 2;
+}
+
 static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
                           int32_t ht, struct wl_array *states)
 {
     struct nb_wl *w = d;
     uint32_t *st;
     bool was_fs = w->fullscreen;
+    bool left_fs, chosen = false;   /* chosen: wd/ht already content size */
     (void)t;
 
     /*
@@ -3711,11 +3748,29 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
                    "the window title.");
         }
     }
+    left_fs = was_fs && !w->fullscreen;
     if (wd <= 0 || ht <= 0) {
         if (was_fs != w->fullscreen) {
             wl_mode_hint(w, true);
         }
-        return;                 /* "pick your own size" */
+        if (!left_fs || w->maximized) {
+            return;             /* "pick your own size" */
+        }
+        /* Leaving fullscreen with the size left to us: keeping win_w/win_h
+         * would keep the fullscreen (or a stale) shape. */
+        wl_unfs_size(w, &wd, &ht);
+        chosen = true;
+        nb_log("unfullscreen: client picks %dx%d", wd, ht);
+    } else if (left_fs && !w->maximized &&
+               wl_odd_aspect(w, wd, w->tb_mapped ? ht - NB_TB_H : ht)) {
+        int cw, ch;
+
+        wl_unfs_size(w, &cw, &ch);
+        nb_log("unfullscreen: compositor offered %dx%d, using %dx%d", wd, ht,
+               cw, ch);
+        wd = cw;
+        ht = ch;
+        chosen = true;
     }
     /*
      * xdg_toplevel.configure reports the size of the WINDOW GEOMETRY, and our
@@ -3729,7 +3784,7 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
      * ht + 2*NB_TB_H, and dragging the width alone was enough to run the
      * height off the screen.  Observed 2026-08-24.
      */
-    if (w->tb_mapped) {
+    if (w->tb_mapped && !chosen) {
         ht -= NB_TB_H;
     }
     if (ht < NB_MIN_H) {
@@ -3754,6 +3809,10 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
 
         w->win_w = wd;
         w->win_h = ht;
+        if (!w->fullscreen && !w->maximized) {
+            w->wnd_w = wd;
+            w->wnd_h = ht;
+        }
         /* EV_SURFACE carries the WINDOW (content) size -- not the fitted
          * picture, which in aspect mode is the old mode's aspect and would
          * lock the guest to it -- and the mode hint follows the same size.
@@ -5844,6 +5903,9 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     }
     w->win_w = w->surf_w;
     w->win_h = w->surf_h;
+    w->wnd_w = w->win_w;            /* what unfullscreen returns to, until a
+                                     * windowed configure says otherwise */
+    w->wnd_h = w->win_h;
     wl_surface_commit(w->surf);
     wl_display_roundtrip(w->dpy);   /* configure, and the decoration mode */
 
