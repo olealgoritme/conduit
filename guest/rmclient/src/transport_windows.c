@@ -1498,14 +1498,51 @@ static int win_event_wait(void *vctx, int fd, uint32_t timeout_ms)
     if (g_prof_on > 0)
         QueryPerformanceCounter(&t0);
     const ULONGLONG deadline = ms == INFINITE ? 0 : GetTickCount64() + ms;
+    /* Short timeouts end on a high-resolution waitable timer: a wait's own
+     * timeout, like Sleep, only expires on a timer tick (~15.6 ms at the
+     * default resolution), so a 1 ms poll would take a whole tick.  A wake
+     * that is lost (the event is shared by every waiter of the process and
+     * reset by whichever wakes first) then costs about the timeout, not a
+     * tick.  Per thread, created once (Windows 10 1803+; else the old way).
+     */
+#if defined(_MSC_VER)
+#define CRM_THREAD_LOCAL __declspec(thread)
+#else
+#define CRM_THREAD_LOCAL __thread
+#endif
+    static CRM_THREAD_LOCAL HANDLE hires_timer;
+    static CRM_THREAD_LOCAL int hires_tried;
+    if (!hires_tried) {
+        hires_tried = 1;
+        hires_timer = CreateWaitableTimerExW(NULL, NULL,
+                                             0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                             TIMER_ALL_ACCESS);
+    }
+    const int use_timer = hires_timer != NULL && ms != INFINITE && ms <= 50;
+    if (use_timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)ms * 10000; /* 100 ns units, relative */
+        if (!SetWaitableTimer(hires_timer, &due, 0, NULL, NULL, FALSE))
+            return 0;
+    }
     for (;;) {
         DWORD left = ms;
         if (ms != INFINITE) {
             const ULONGLONG now = GetTickCount64();
             left = now >= deadline ? 0 : (DWORD)(deadline - now);
         }
-        HANDLE waits[2] = { ev, c->lost_ev };
-        const DWORD w = WaitForMultipleObjects(c->lost_ev ? 2 : 1, waits, FALSE, left);
+        HANDLE waits[3] = { ev, c->lost_ev, NULL };
+        DWORD nwaits = c->lost_ev ? 2 : 1;
+        if (use_timer) {
+            waits[nwaits] = hires_timer;
+            left = INFINITE;
+        }
+        const DWORD timer_idx = WAIT_OBJECT_0 + nwaits;
+        if (use_timer)
+            nwaits++;
+        DWORD w = WaitForMultipleObjects(nwaits, waits, FALSE, left);
+        if (use_timer && w == timer_idx)
+            w = WAIT_TIMEOUT;
         if (g_prof_on > 0) {
             /* evwait 0x0 = woken by the event, 0x1 = timed out */
             QueryPerformanceCounter(&t1);
