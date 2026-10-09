@@ -74,7 +74,7 @@ jobs:
         working-directory: host/backend
         run: |
           cargo test --locked -p abi
-          cargo test --locked --workspace --features device/vhost-user -- \
+          cargo test --locked --workspace --features device/vhost-user,device/venus -- \
             --skip for_real --skip closing_the_fd --skip repeated_map_unmap
       - name: Build the guest module with the new headers
         id: guest
