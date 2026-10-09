@@ -86,6 +86,7 @@ Generic NVK patches (one also touches the RM backend) that apply on top of
 | 30 | `nvk/rm: no host-visible VRAM heap by default (NVK_RM_BAR_MB=0)` | the DEVICE_LOCAL \| HOST_VISIBLE type (patch 0022's BAR heap) is off by default: in CS2 it cost ~30 % (DXVK writes its CBs, dynamic and descriptor buffers there through BAR1, the host's shared window; the GPU maps it as ordinary VRAM). `NVK_RM_BAR_MB=-1` restores all of BAR1, N caps it |
 | 31 | `nvk: NVK_INDIRECT_PUSH off by default` | 0028's inline record segments raised Xid 32 in CS2 on 405.13; off by default, `=1` for debugging |
 | 32 | `nvk/rm: nothing between an incomplete push and the one completing it` | the RM exec path waited for ring space per entry; a full ring flushed between an incomplete push (0028's macro call) and its record segment, inserting semaphore/retire/tracking entries into the open method (Xid 32). Runs of incomplete pushes and their completing push now get ring space together. Candidate fix for `NVK_INDIRECT_PUSH=1`, which stays off by default |
+| 33 | `nvk: NVK_PASS_PROFILE=4 method histogram per pass, indirect push on again` | `NVK_PASS_PROFILE=4`: per render pass signature, the 24 most written 3D methods per recorded pass (MME calls by macro name), counted from the pushbuffer at record time; `NVK_INDIRECT_PUSH` default on again (clean with 0032). No MME change (2160 dwords for a DXVK device) |
 
 Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
 
