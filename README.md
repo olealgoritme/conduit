@@ -64,6 +64,36 @@ NVK on the host's GPU (192 fps in this frame). GPU-Z does not recognise the virt
 
 ### Windows guests
 
+#### Set up a Windows 11 VM (4 steps)
+
+1. **Host packages.** Install Conduit from the [release](https://github.com/olealgoritme/conduit/releases)
+   (`.deb`, `.rpm` or Arch), plus `ovmf` and `swtpm` for UEFI and TPM 2.0.
+2. **Make the VM.** In virt-manager, create a normal Windows 11 VM (UEFI/OVMF,
+   TPM 2.0, **Secure Boot off**: the guest driver is test-signed) and install
+   Windows. [docs/examples/win11.xml](docs/examples/win11.xml) is a working example.
+3. **Give it Conduit's GPU** (VM shut off), then start it. Windows VMs need `--venus`:
+   ```bash
+   conduit attach win11
+   conduit up win11 --venus --display 5120x1440@240   # your monitor's mode
+   conduit view win11                                 # the window
+   ```
+4. **Install the guest driver.** Download `conduit-windows-gpu-driver-<version>.zip`
+   from the same release into the VM, unzip it, and run `install.ps1` from an
+   **Administrator** PowerShell. The first run turns on test-signing and asks you
+   to reboot. Run it again after the reboot, then reboot once more. Device Manager
+   then shows **Conduit Helios** and Windows runs at the mode from step 3.
+
+**Playing games:** press **Ctrl+Alt+G** in the viewer to grab the mouse (games
+need relative mouse input), and run games at the VM's display mode (e.g.
+5120x1440, "Fullscreen Windowed"). The guest has no scaler, so a lower game
+resolution does not fill the screen. Ctrl+Alt+G again releases the mouse.
+
+More detail (building the driver yourself, knobs, troubleshooting):
+[docs/WINDOWS.md](docs/WINDOWS.md).
+
+#### How it works
+
+
 A Windows 11 guest renders on the host GPU through NVK-on-RM: Mesa's open
 NVK Vulkan driver runs in the guest and talks to the host's NVIDIA kernel
 driver (RM) through Conduit. Tested on an RTX 5090. Guest driver version:
