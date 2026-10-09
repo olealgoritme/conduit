@@ -41,7 +41,7 @@ use std::path::PathBuf;
     name = "conduit",
     version,
     about = "Share your NVIDIA GPU with a Linux VM and see its desktop in a window",
-    after_help = "Start here:\n  conduit setup         guided first run (checks, fixes, first VM)\n  conduit doctor        check this computer\n  conduit create myvm   make a ready-to-use Ubuntu VM\n  conduit view myvm     open it in a window (closing the window shuts it down)"
+    after_help = "Start here:\n  conduit setup         guided first run (checks, fixes, first VM)\n  conduit doctor        check this computer\n  conduit create myvm   make a ready-to-use Ubuntu VM\n  conduit view myvm     open it in a window (closing the window shuts it down)\n  conduit               live dashboard: your VMs, the host and the GPU"
 )]
 struct Cli {
     #[command(subcommand)]
