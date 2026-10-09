@@ -29,15 +29,23 @@ unchanged (0004); with NVK_UBO_DESC_CBUF=0, the Windows default, UBO
 descriptors are not bound through NVK_MME_BIND_CBUF_DESC at all.
 
 No MME macro change: 2160 dwords for a DXVK device.
+
+NVK_PASS_PROFILE=4 also says, per pass, how many index buffer binds,
+vertex buffer binds and indirect draw calls point into system memory and
+into BAR-heap VRAM (the placement of the memory whose own VA holds the
+address, from the device's memory list): 405.15's histogram shows an
+index and a vertex buffer rebind before every indirect call of CS2's
+depth prepass, and with the BAR heap off (0030) host-visible buffers are
+system memory the GPU fetches across PCIe.
 ---
- src/nouveau/vulkan/nvk_cmd_buffer.c   |  5 +++-
- src/nouveau/vulkan/nvk_cmd_buffer.h   | 28 ++++++++++++++++++++
- src/nouveau/vulkan/nvk_cmd_draw.c     | 37 +++++++++++++++++++++++++++
- src/nouveau/vulkan/nvk_pass_profile.c | 15 ++++++++---
- src/nouveau/vulkan/nvk_pass_profile.h |  7 +++++
+ src/nouveau/vulkan/nvk_cmd_buffer.c   |  5 +-
+ src/nouveau/vulkan/nvk_cmd_buffer.h   | 29 +++++++++
+ src/nouveau/vulkan/nvk_cmd_draw.c     | 54 ++++++++++++++++
+ src/nouveau/vulkan/nvk_pass_profile.c | 89 ++++++++++++++++++++++++++-
+ src/nouveau/vulkan/nvk_pass_profile.h | 25 ++++++++
  src/nouveau/vulkan/nvk_shader.c       |  1 +
- src/nouveau/vulkan/nvk_shader.h       |  6 +++++
- 7 files changed, 95 insertions(+), 4 deletions(-)
+ src/nouveau/vulkan/nvk_shader.h       |  6 ++
+ 7 files changed, 205 insertions(+), 4 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
 index 0d6e2456..dd7ae0f4 100644
@@ -71,7 +79,7 @@ index 0d6e2456..dd7ae0f4 100644
                                          pInfo);
     }
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
-index ffb26ab6..d14db9b6 100644
+index ffb26ab6..a50f8bc4 100644
 --- a/src/nouveau/vulkan/nvk_cmd_buffer.h
 +++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
 @@ -281,6 +281,11 @@ struct nvk_graphics_state {
@@ -86,7 +94,15 @@ index ffb26ab6..d14db9b6 100644
     struct {
        uint64_t addr;
        uint32_t size;
-@@ -459,6 +464,7 @@ nvk_cmd_forget_gfx_gpu_state(struct nvk_cmd_buffer *cmd)
+@@ -353,6 +358,7 @@ struct nvk_cmd_buffer {
+    uint32_t pass_profile_internal;
+    bool pass_profile_in_pass;
+    bool pass_profile_on;
++   bool pass_profile_buffers;
+    /* NVK_PASS_PROFILE=4: where the open pass's pushes start */
+    uint32_t pass_profile_hist_sig;
+    uint32_t pass_profile_hist_npushes;
+@@ -459,6 +465,7 @@ nvk_cmd_forget_gfx_gpu_state(struct nvk_cmd_buffer *cmd)
        cmd->state.gfx.cbuf_groups[g].bound_known = 0;
     cmd->state.gfx.vb_known = 0;
     cmd->state.gfx.ib_known = false;
@@ -94,7 +110,7 @@ index ffb26ab6..d14db9b6 100644
  }
  void nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd);
  
-@@ -587,6 +593,28 @@ nvk_cmd_profile_count_draws(struct nvk_cmd_buffer *cmd, uint32_t draws,
+@@ -587,6 +594,28 @@ nvk_cmd_profile_count_draws(struct nvk_cmd_buffer *cmd, uint32_t draws,
     }
  }
  
@@ -124,7 +140,7 @@ index ffb26ab6..d14db9b6 100644
  nvk_cmd_profile_count_query(struct nvk_cmd_buffer *cmd)
  {
 diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
-index 6908705c..0d905657 100644
+index 6908705c..2682eb4b 100644
 --- a/src/nouveau/vulkan/nvk_cmd_draw.c
 +++ b/src/nouveau/vulkan/nvk_cmd_draw.c
 @@ -59,6 +59,21 @@ static uint32_t nvk_mdi_batch(void);
@@ -184,30 +200,153 @@ index 6908705c..0d905657 100644
        } else {
           struct nv_push *p = nvk_cmd_buffer_push(cmd, shader->push_dw_count);
           nv_push_raw(p, shader->push_dw, shader->push_dw_count);
+@@ -4730,6 +4767,10 @@ nvk_CmdBindIndexBuffer3KHR(VkCommandBuffer commandBuffer,
+    const VkDeviceAddressRangeKHR addr_range = pInfo->addressRange;
+    assert(addr_range.size <= UINT32_MAX);
+ 
++   if (unlikely(cmd->pass_profile_buffers))
++      nvk_pass_profile_note_buffer(cmd, NVK_PASS_PROFILE_BUF_INDEX,
++                                   addr_range.address);
++
+    if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A &&
+        debug_get_option_nvk_cpu_state_tracking()) {
+       /* What NVK_MME_BIND_IB does, with plain methods */
+@@ -4896,6 +4937,10 @@ nvk_cmd_bind_vertex_buffer(struct nvk_cmd_buffer *cmd, uint32_t vb_idx,
+    if (vb_idx == 0)
+       cmd->state.gfx.vb0 = addr_range;
+ 
++   if (unlikely(cmd->pass_profile_buffers))
++      nvk_pass_profile_note_buffer(cmd, NVK_PASS_PROFILE_BUF_VERTEX,
++                                   addr_range.address);
++
+    if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A &&
+        debug_get_option_nvk_cpu_state_tracking()) {
+       /* What NVK_MME_BIND_VB does, with plain methods */
+@@ -5916,6 +5961,9 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
++   if (unlikely(cmd->pass_profile_buffers))
++      nvk_pass_profile_note_buffer(cmd, NVK_PASS_PROFILE_BUF_INDIRECT,
++                                   pInfo->addressRange.address);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    if (nvk_cmd_draw_indirect_pushed(cmd, false, pInfo->addressRange.address,
+@@ -6036,6 +6084,9 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
++   if (unlikely(cmd->pass_profile_buffers))
++      nvk_pass_profile_note_buffer(cmd, NVK_PASS_PROFILE_BUF_INDIRECT,
++                                   pInfo->addressRange.address);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    if (nvk_cmd_draw_indirect_pushed(cmd, true, pInfo->addressRange.address,
+@@ -6516,6 +6567,9 @@ nvk_CmdDrawMeshTasksIndirect2EXT(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+    nvk_cmd_profile_count_draws(cmd, pInfo->drawCount, true);
++   if (unlikely(cmd->pass_profile_buffers))
++      nvk_pass_profile_note_buffer(cmd, NVK_PASS_PROFILE_BUF_INDIRECT,
++                                   pInfo->addressRange.address);
+    nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
 diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
-index 4be05691..38e1ad28 100644
+index 4be05691..28c77059 100644
 --- a/src/nouveau/vulkan/nvk_pass_profile.c
 +++ b/src/nouveau/vulkan/nvk_pass_profile.c
-@@ -185,7 +185,7 @@ struct prof_sig {
+@@ -185,7 +185,8 @@ struct prof_sig {
     uint64_t gpu_ns;
     uint64_t count;
     uint64_t calls, draws, ind_calls, ind_draws, queries, barriers;
 -   uint64_t fs_calls, tess_gs_calls;
 +   uint64_t fs_calls, tess_gs_calls, shader_binds, fs_binds, desc_binds;
++   uint64_t buf_binds[3], buf_sysmem[3], buf_bar[3];
     uint32_t vs_gprs, vs_instrs, vs_cycles, fs_gprs, fs_instrs, spills, slm;
     uint64_t stat_count;
     uint64_t stats[PROF_STATS];
-@@ -1003,6 +1003,9 @@ prof_counts_add(struct nvk_pass_profile_counts *dst,
+@@ -731,6 +732,55 @@ nvk_pass_profile_op(struct nvk_cmd_buffer *cmd, enum nvk_pass_profile_op op,
+    cmd->pass_profile_op_slot = prof_begin(cmd, NULL, PROF_KIND_OP);
+ }
+ 
++/* The placement of the memory whose own VA holds addr: buffers are bound
++ * at their memory's VA plus an offset (nvk_buffer.c).  0 VRAM, 1 BAR heap,
++ * 2 system memory, 3 not found.
++ */
++static unsigned
++prof_addr_placement(struct nvkmd_dev *nvkmd, uint64_t addr)
++{
++   unsigned where = 3;
++   simple_mtx_lock(&nvkmd->mems_mutex);
++   list_for_each_entry(struct nvkmd_mem, mem, &nvkmd->mems, link) {
++      if (mem->va == NULL || addr < mem->va->addr ||
++          addr >= mem->va->addr + mem->va->size_B)
++         continue;
++      const char *p = mem->ops->log_placement != NULL ?
++                      mem->ops->log_placement(mem) : NULL;
++      if (p == NULL)
++         where = (mem->flags & NVKMD_MEM_GART) ? 2 : 0;
++      else if (strncmp(p, "sysmem", 6) == 0)
++         where = 2;
++      else if (strcmp(p, "bar") == 0)
++         where = 1;
++      else
++         where = 0;
++      break;
++   }
++   simple_mtx_unlock(&nvkmd->mems_mutex);
++   return where;
++}
++
++void
++nvk_pass_profile_note_buffer(struct nvk_cmd_buffer *cmd,
++                             enum nvk_pass_profile_buf kind, uint64_t addr)
++{
++   if (addr == 0)
++      return;
++   const unsigned where =
++      prof_addr_placement(nvk_cmd_buffer_device(cmd)->nvkmd, addr);
++   struct nvk_pass_profile_counts *c[3] = {
++      &cmd->pass_profile_pass_counts,
++      &cmd->pass_profile_op_counts,
++      &cmd->pass_profile_cmd_counts,
++   };
++   for (unsigned i = 0; i < 3; i++) {
++      c[i]->buf_binds[kind]++;
++      c[i]->buf_sysmem[kind] += where == 2;
++      c[i]->buf_bar[kind] += where == 1;
++   }
++}
++
+ void
+ nvk_pass_profile_internal_begin(struct nvk_cmd_buffer *cmd)
+ {
+@@ -921,6 +971,8 @@ nvk_pass_profile_reset_cmd(struct nvk_cmd_buffer *cmd)
+    cmd->pass_profile_on = nvk_cmd_buffer_device(cmd)->pass_profile != NULL;
+    cmd->pass_profile_hist_sig = 0;
+    cmd->pass_profile_hist_start = NULL;
++   cmd->pass_profile_buffers = cmd->pass_profile_on &&
++      nvk_cmd_buffer_device(cmd)->pass_profile->level >= 4;
+    cmd->pass_profile_slot = -1;
+    cmd->pass_profile_cmd_slot = -1;
+    cmd->pass_profile_op_slot = -1;
+@@ -1003,6 +1055,14 @@ prof_counts_add(struct nvk_pass_profile_counts *dst,
     dst->slm = MAX2(dst->slm, src->slm);
     dst->fs_calls += src->fs_calls;
     dst->tess_gs_calls += src->tess_gs_calls;
 +   dst->shader_binds += src->shader_binds;
 +   dst->fs_binds += src->fs_binds;
 +   dst->desc_binds += src->desc_binds;
++   for (unsigned k = 0; k < 3; k++) {
++      dst->buf_binds[k] += src->buf_binds[k];
++      dst->buf_sysmem[k] += src->buf_sysmem[k];
++      dst->buf_bar[k] += src->buf_bar[k];
++   }
  }
  
  void
-@@ -1111,10 +1114,12 @@ prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
+@@ -1111,10 +1171,21 @@ prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
     if (s->kind == PROF_KIND_PASS && s->calls > 0) {
        prof_log(prof, "NVK pass profile:            shaders: vs<=%u gprs "
                 "%u instrs %u cycles, fs<=%u gprs %u instrs in %.1f calls, "
@@ -219,32 +358,49 @@ index 4be05691..38e1ad28 100644
 -               s->spills, s->slm);
 +               s->spills, s->slm, s->shader_binds / n, s->fs_binds / n,
 +               s->desc_binds / n);
++   }
++   if (s->kind == PROF_KIND_PASS &&
++       (s->buf_binds[0] | s->buf_binds[1] | s->buf_binds[2]) != 0) {
++      prof_log(prof, "NVK pass profile:            buffers per pass: index "
++               "%.1f binds (%.1f sysmem, %.1f bar), vertex %.1f (%.1f, %.1f), "
++               "indirect %.1f calls (%.1f, %.1f)",
++               s->buf_binds[0] / n, s->buf_sysmem[0] / n, s->buf_bar[0] / n,
++               s->buf_binds[1] / n, s->buf_sysmem[1] / n, s->buf_bar[1] / n,
++               s->buf_binds[2] / n, s->buf_sysmem[2] / n, s->buf_bar[2] / n);
     }
     if (s->hist != NULL && s->hist->passes > 0)
        prof_log_hist(prof, s->hist);
-@@ -1155,6 +1160,9 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+@@ -1155,6 +1226,14 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
        ps->queries += m->counts.queries;
        ps->barriers += m->counts.barriers;
        ps->fs_calls += m->counts.fs_calls;
 +      ps->shader_binds += m->counts.shader_binds;
 +      ps->fs_binds += m->counts.fs_binds;
 +      ps->desc_binds += m->counts.desc_binds;
++      for (unsigned k = 0; k < 3; k++) {
++         ps->buf_binds[k] += m->counts.buf_binds[k];
++         ps->buf_sysmem[k] += m->counts.buf_sysmem[k];
++         ps->buf_bar[k] += m->counts.buf_bar[k];
++      }
        ps->tess_gs_calls += m->counts.tess_gs_calls;
        ps->vs_gprs = MAX2(ps->vs_gprs, m->counts.vs_gprs);
        ps->vs_instrs = MAX2(ps->vs_instrs, m->counts.vs_instrs);
-@@ -1263,6 +1271,7 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+@@ -1263,6 +1342,10 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
           s->calls = s->draws = s->ind_calls = s->ind_draws = 0;
           s->queries = s->barriers = 0;
           s->fs_calls = s->tess_gs_calls = 0;
 +         s->shader_binds = s->fs_binds = s->desc_binds = 0;
++         memset(s->buf_binds, 0, sizeof(s->buf_binds));
++         memset(s->buf_sysmem, 0, sizeof(s->buf_sysmem));
++         memset(s->buf_bar, 0, sizeof(s->buf_bar));
           s->vs_gprs = s->vs_instrs = s->vs_cycles = 0;
           s->fs_gprs = s->fs_instrs = s->spills = s->slm = 0;
           s->stat_count = 0;
 diff --git a/src/nouveau/vulkan/nvk_pass_profile.h b/src/nouveau/vulkan/nvk_pass_profile.h
-index 66269191..fb230d8e 100644
+index 66269191..90ae97aa 100644
 --- a/src/nouveau/vulkan/nvk_pass_profile.h
 +++ b/src/nouveau/vulkan/nvk_pass_profile.h
-@@ -41,6 +41,13 @@ struct nvk_pass_profile_counts {
+@@ -41,6 +41,26 @@ struct nvk_pass_profile_counts {
     uint32_t slm;
     uint32_t fs_calls;
     uint32_t tess_gs_calls;
@@ -255,9 +411,34 @@ index 66269191..fb230d8e 100644
 +   uint32_t shader_binds;
 +   uint32_t fs_binds;
 +   uint32_t desc_binds;
++   /* NVK_PASS_PROFILE=4: index buffer binds, vertex buffer binds and
++    * indirect draw calls, and of each how many point into system memory
++    * (cached or not) and into BAR-heap VRAM
++    */
++   uint32_t buf_binds[3];
++   uint32_t buf_sysmem[3];
++   uint32_t buf_bar[3];
++};
++
++enum nvk_pass_profile_buf {
++   NVK_PASS_PROFILE_BUF_INDEX,
++   NVK_PASS_PROFILE_BUF_VERTEX,
++   NVK_PASS_PROFILE_BUF_INDIRECT,
  };
  
  /* Operations outside render passes, timed as runs of the same kind */
+@@ -89,6 +109,11 @@ void nvk_pass_profile_op(struct nvk_cmd_buffer *cmd,
+  * clears and ZCULL reseeds): its render passes and operations are part of
+  * the operation that records it, not passes of their own.
+  */
++/* NVK_PASS_PROFILE=4: where a buffer address the draws read lives */
++void nvk_pass_profile_note_buffer(struct nvk_cmd_buffer *cmd,
++                                  enum nvk_pass_profile_buf kind,
++                                  uint64_t addr);
++
+ void nvk_pass_profile_internal_begin(struct nvk_cmd_buffer *cmd);
+ void nvk_pass_profile_internal_end(struct nvk_cmd_buffer *cmd);
+ 
 diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
 index d5876cf4..9050701c 100644
 --- a/src/nouveau/vulkan/nvk_shader.c
