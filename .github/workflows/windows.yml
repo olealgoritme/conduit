@@ -54,7 +54,7 @@ jobs:
       - name: Install the cross toolchain and Mesa's build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
+          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
             bison flex glslang-tools python3-mako python3-yaml python3-packaging \
             llvm-20-dev libclang-20-dev libclang-cpp20-dev libpolly-20-dev \
             libllvmspirvlib-20-dev llvm-spirv-20 libclc-20-dev
