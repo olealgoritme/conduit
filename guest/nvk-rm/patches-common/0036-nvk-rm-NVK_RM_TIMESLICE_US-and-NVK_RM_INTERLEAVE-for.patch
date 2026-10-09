@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 9 Oct 2026 05:05:41 +0200
+Subject: [PATCH] nvk/rm: NVK_RM_TIMESLICE_US and NVK_RM_INTERLEAVE for the
+ context's TSG
+
+Every NVK execution context is its own TSG on the GR runlist
+(KEPLER_CHANNEL_GROUP_A per context), so DWM composing on NVK, other
+NVK processes and the game share the GR engine by timeslices, with RM's
+default timeslice and LOW interleave level.  CS2's pass timestamps tick
+through any timeslice another TSG holds.  All of NVK's GPU-side waits
+already let the runlist move on (the GPFIFO semaphore waits use
+ACQ_STRICT_GEQ with ACQUIRE_SWITCH_TSG; event waits and query result
+waits set ACQUIRE_SWITCH_ENABLED; the KMD's copy-engine present acquires
+set ACQUIRE_SWITCH_TSG too), so nothing should hold the engine spinning.
+
+For A/B of the scheduling itself:
+
+- NVK_RM_TIMESLICE_US=<us> sets the TSG's timeslice
+  (NVA06C_CTRL_CMD_SET_TIMESLICE, rounded down by RM to what the hardware
+  supports);
+- NVK_RM_INTERLEAVE=0/1/2 sets its interleave level LOW/MEDIUM/HIGH
+  (NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL; RM requires a privileged client
+  and may refuse, which is logged).
+
+Unset, nothing changes.  With NVK_DEBUG=vm the timeslice in effect is
+logged (mesa_logi).
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 39 +++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h | 11 ++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index dd14b2a1..7d78849a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -1001,6 +1001,45 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
++   /* Scheduling of this context's TSG against the other TSGs on the GR
++    * runlist (DWM's, the compositor's, other apps' NVK contexts), for A/B:
++    * NVK_RM_TIMESLICE_US=<us> sets the TSG's timeslice
++    * (NVA06C_CTRL_CMD_SET_TIMESLICE), NVK_RM_INTERLEAVE=0/1/2 its interleave
++    * level (LOW/MEDIUM/HIGH; RM requires a privileged client and may
++    * refuse).  Unset: RM's defaults.  With NVK_DEBUG=vm the timeslice in
++    * effect is logged (mesa_logi).
++    */
++   if (!vdec) {
++      const int64_t ts_us = debug_get_num_option("NVK_RM_TIMESLICE_US", 0);
++      if (ts_us > 0) {
++         NVA06C_CTRL_TIMESLICE_PARAMS ts = { .timesliceUs = (NvU64)ts_us };
++         int ret = lib->control(dev->client, ctx->h_tsg,
++                                NVA06C_CTRL_CMD_SET_TIMESLICE, &ts, sizeof(ts));
++         if (ret != 0)
++            mesa_logw("NVK: SET_TIMESLICE %" PRId64 " us refused (%d)",
++                      ts_us, ret);
++      }
++      const int64_t il = debug_get_num_option("NVK_RM_INTERLEAVE", -1);
++      if (il >= 0 && il <= 2) {
++         NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS lvl = {
++            .tsgInterleaveLevel = (NvU32)il,
++         };
++         int ret = lib->control(dev->client, ctx->h_tsg,
++                                NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL,
++                                &lvl, sizeof(lvl));
++         if (ret != 0)
++            mesa_logw("NVK: SET_INTERLEAVE_LEVEL %" PRId64 " refused (%d)",
++                      il, ret);
++      }
++      if (dev->base.pdev->debug_flags & NVK_DEBUG_VM) {
++         NVA06C_CTRL_TIMESLICE_PARAMS ts = { 0 };
++         int ret = lib->control(dev->client, ctx->h_tsg,
++                                NVA06C_CTRL_CMD_GET_TIMESLICE, &ts, sizeof(ts));
++         mesa_logi("NVK: TSG timeslice %" PRIu64 " us (ret %d)",
++                   (uint64_t)ts.timesliceUs, ret);
++      }
++   }
++
+    ctx->put = ctx->kicked_put = 0;
+ 
+    defer_register_ctx(dev, ctx);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index d132c0e9..a8d43597 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -547,6 +547,17 @@ typedef NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS;
+ #define NVA06F_CTRL_CMD_GPFIFO_SCHEDULE           (0xa06f0103)
+ #define NVA06C_CTRL_CMD_GPFIFO_SCHEDULE           (0xa06c0101)
+ 
++#define NVA06C_CTRL_CMD_SET_TIMESLICE             (0xa06c0103)
++#define NVA06C_CTRL_CMD_GET_TIMESLICE             (0xa06c0104)
++typedef struct NVA06C_CTRL_TIMESLICE_PARAMS {
++   NvU64 timesliceUs NVRM_ALIGN8;
++} NVA06C_CTRL_TIMESLICE_PARAMS;
++
++#define NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL      (0xa06c0107)
++typedef struct NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS {
++   NvU32 tsgInterleaveLevel;
++} NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS;
++
+ #define NVA06F_CTRL_CMD_BIND                      (0xa06f0104)
+ typedef struct NVA06F_CTRL_BIND_PARAMS {
+    NvU32 engineType;
+-- 
+2.43.0
+
