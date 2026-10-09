@@ -1,25 +1,72 @@
 # NVK on RM
 
-A first cut of an NVK backend that drives the GPU through NVIDIA's Resource
-Manager (RM, the open kernel modules' `/dev/nvidiactl` interface, forwarded
-by Conduit in a guest) instead of nouveau. It is a patch series against
-upstream Mesa that adds a second implementation of NVK's kernel abstraction,
-`src/nouveau/vulkan/nvkmd/rm/`, next to `nvkmd/nouveau/`. It talks to RM
-through [librmclient](../rmclient), which it loads at runtime.
+An NVK backend that drives the GPU through NVIDIA's Resource Manager (RM,
+the open kernel modules' `/dev/nvidiactl` interface, forwarded by Conduit
+from a guest) instead of nouveau. It is a patch series against upstream Mesa
+that adds a second implementation of NVK's kernel abstraction,
+`src/nouveau/vulkan/nvkmd/rm/`, next to `nvkmd/nouveau/`, and talks to RM
+through [librmclient](../rmclient), loaded at runtime.
 
-Status: **runs on an RTX 5090 (GB202, GSP firmware, RM 610.57.04) in the
-`lab` guest.** `vulkaninfo` enumerates the GPU through NVK, a compute test
-(storage buffer, dispatch, device-local buffer + copy, 5000 back-to-back
-submits) passes, and `vkcube` presents **zero-copy** on the guest desktop
-through Mesa's native X11 (DRI3/Present via Xwayland) and Wayland
-(linux-dmabuf) WSI: the swapchain images stay in VRAM, block-linear with
-NVIDIA DRM format modifiers, and go to the compositor as dma-bufs through
-Conduit's nvidia-drm node (see "Zero-copy presentation"). See "First run"
-and "Zero-copy run" at the end for what was run and what is still open.
-dEQP has not been run yet.
+Status: runs on an RTX 5090 (GB202, GSP firmware).
 
-Experimental and opt-in (`NVK_RM=1`); nothing changes for a guest that does
-not set it. Design background: [docs/research/nvk-rm.md](../../docs/research/nvk-rm.md).
+- **Windows guests:** the rendering driver of the Windows guest stack
+  (driver 22.22.405.24). The Helios D3D11 (DXVK) and D3D12 (vkd3d-proton)
+  UMDs, Vulkan applications and OpenGL (Zink) run on it; RM calls go through
+  the Helios KMD and the virtio transport. The desktop (DWM) and games run
+  on NVK at 240 Hz; Counter-Strike 2 runs at ~330–380 fps at 1080p and
+  ~350 fps at 5120x1440 with bots. Zero-copy presentation through the KMD's
+  scanout.
+- **Linux guests:** opt-in (`NVK_RM=1`), nothing changes for a guest that
+  does not set it. `vulkaninfo`, compute and `vkcube` with zero-copy X11 and
+  Wayland presentation work; dEQP has not been run.
+
+Design background: [docs/research/nvk-rm.md](../../docs/research/nvk-rm.md).
+
+## Series layout
+
+| Directory | What | Used by |
+|---|---|---|
+| `patches/` | the RM backend (0001-0013), and the Linux versions of host-visible VRAM, cached system memory, compression and ZCULL (0014-0017) | Linux: 0001-0017; Windows: 0001-0013 |
+| `patches-windows/` | the Windows build, Win32 WSI, Helios scanout and shared surfaces, RM fences, Zink, NVDEC | Windows |
+| `patches-windows-dxvk/` | what DXVK needs on Windows, CPU waits | Windows |
+| `patches-common/` | generic NVK work (per-draw cost, compression, deferred frees, profiling, wait fixes), applied last | both |
+
+`build.sh` builds the Linux stack, `build-windows.sh` the Windows one
+(cross-compiled; `windows/stage-helios-package.sh` stages it for the driver
+package).
+
+## Knobs
+
+Environment variables of the process; the defaults are the ones in force.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `NVK_INDIRECT_PUSH` | 0 | indirect draw records as inline macro data from the pushbuffer (patch 28); 1 for testing |
+| `NVK_NULL_VB_ZERO_PAGE` | 1 | a null vertex buffer is bound to the 4 KiB zero page instead of address 0 / size 0 (patch 41) |
+| `NVK_ZERO_PAGE_VRAM` | 1 | the zero page (null descriptors) lives in VRAM instead of uncached system memory (patch 41) |
+| `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N caps it at N MiB (patch 30) |
+| `NVK_RM_DEFER_FREE` | 1 on Windows | memory and VA frees wait for the GPU work submitted before them (patch 19) |
+| `NVK_RM_EVENT_GEN` | 1 | CPU waits on librmclient's wake generations (patch 42) |
+| `NVK_RM_WAIT_POLL_MS` | 1 on Windows | the event poll interval of CPU waits (patch 40) |
+| `NVK_FS_STATE_TRACKING` | 1 | fragment shader state emitted only when it changes (patch 34) |
+
+The patch tables below list the A/B and test knobs each patch adds.
+
+## Diagnostics
+
+On Windows the output goes to `%ProgramData%\Helios\` (else `%TEMP%`), one
+file per process.
+
+| Variable | Output |
+|---|---|
+| `NVK_PASS_PROFILE=1` | GPU time per render pass signature, per operation outside render passes and per command buffer, every two seconds, with the shaders each pass used (`nvk-pass-<pid>.txt`, or `NVK_PASS_PROFILE_FILE`) |
+| `NVK_PASS_PROFILE=2` | adds vertex, clipper and pixel shader invocations per pass |
+| `NVK_PASS_PROFILE=3` | adds the ZCULL statistics per pass |
+| `NVK_PASS_PROFILE=4` | adds the 24 most written 3D methods per pass and bind counts |
+| `NVK_PASS_PROFILE=5` | dumps the draws of one render pass matching `NVK_PASS_DUMP`, after `NVK_PASS_DUMP_DELAY_S` (20) s (`nvk-prepass-dump-<pid>.txt`) |
+| `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
+| `NVK_WAIT_STATS=1` | CPU wait counts and times per site, woken and timed-out waits, once a second (`nvk-waits-<pid>.txt`) |
+| `NVK_DEBUG=vm` | VA and memory alloc/free/bind lines with times, threads and freeing call stacks (`NVK_VM_LOG`, else `nvk-vm-<pid>.log` in `%TEMP%`) |
 
 ## Base and patches
 

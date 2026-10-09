@@ -12,7 +12,7 @@ keeps off NVK. The guest drivers come from Helios
 [VENUS.md](VENUS.md); state and measurements are in
 [NVK-ROADMAP.md](NVK-ROADMAP.md). It is opt-in (`--venus`), tested on one
 machine (RTX 5090, a 5120×1440 240 Hz monitor), and has the limits listed in
-[KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests-venus). For a fresh setup on
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests). For a fresh setup on
 another host, follow [SECOND-MACHINE.md](SECOND-MACHINE.md).
 
 ## Host
@@ -92,7 +92,7 @@ one CCD made no measurable difference.
 
 The driver package is the WDDM KMD, the x64/x86 D3D11 and D3D12 UMDs, NVK on
 RM with librmclient (64- and 32-bit) and Zink. The current version is
-22.22.341.3 (`guest/windows/kmd_render/driver-version.env`, the only place
+22.22.405.24 (`guest/windows/kmd_render/driver-version.env`, the only place
 the version is set). The adapter shows as "Conduit Helios", the monitor as
 "Conduit".
 
@@ -147,8 +147,8 @@ Off by default while new; each one was measured on the test machine
 | Host | `conduit config set venus.guest_blobs true` | the backend serves guest-memory blobs (`--venus-guest-blobs`, [VENUS.md](VENUS.md) "Guest-memory blobs"): Venus copy destinations over the guest's own pages, for the KMD's windowed Present. Applies when the VM's backend next starts. Needs the patched virglrenderer (patch 0002) |
 | Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). Use with `ForeignFlip=1` |
 | Guest, KMD service key | `ForeignFlip` = 1 | the KMD flips the NVK DWM's swap-chain buffers to the scanout itself, zero-copy. Read at adapter start (`pnputil /restart-device`) |
-| Guest, `HKLM\SOFTWARE\Helios` | `DirectFlipSupport` (default 1; or `HELIOS_DIRECT_FLIP_SUPPORT` per process) | the D3D11.1 `CheckDirectFlipSupport` DDI answers yes when dxgkrnl reports DirectFlip for the adapter and size and format match; 3 = as 1 and only for formats the KMD scans out as they are; 2 = whenever size and format match (test lever); 0 = never (the opt-out). DWM uses the answer for independent flip |
-| Guest, KMD service key | `IndepFlip` (default 1; 2 also completes the unregistered DMA flip instead of failing it) | independent flip: a borderless full-screen flip-model window is scanned out from its own buffers ("Hardware: Independent Flip") instead of being composed. Advertises `SupportDirectFlip`, the segment `DirectFlip` flag and `FlipIndependent \| DdiPresentForIFlip`, and counts every flip (`Idf*`); 0 = off (the opt-out). Read at StartDevice; reboot per change. [independent-flip.md](../guest/windows/docs/independent-flip.md) sections 11 and 13 |
+| Guest, `HKLM\SOFTWARE\Helios` | `DirectFlipSupport` (default 0; or `HELIOS_DIRECT_FLIP_SUPPORT` per process) | what the D3D11.1 `CheckDirectFlipSupport` DDI answers, which DWM uses for independent flip: 0 = never; 1 = yes when dxgkrnl reports DirectFlip for the adapter and size and format match; 3 = as 1 and only for formats the KMD scans out as they are; 5 = as 1, and two different 8-bit scan-out formats also pair; 2 = whenever size and format match (test lever). Use 1 together with `IndepFlip=1` |
+| Guest, KMD service key | `IndepFlip` (default 0; 2 also completes the unregistered DMA flip instead of failing it) | independent flip: a borderless full-screen flip-model window is scanned out from its own buffers ("Hardware: Independent Flip") instead of being composed. Advertises `SupportDirectFlip`, the segment `DirectFlip` flag and `FlipIndependent \| DdiPresentForIFlip`, and counts every flip (`Idf*`). Read at StartDevice; reboot per change. `HwCursor`, when not set, follows it (the hardware cursor is on with independent flip, off without). [independent-flip.md](../guest/windows/docs/independent-flip.md) sections 11 and 13 |
 
 On by default, with a way back: `NvkRmFencePresent` (composed NVK presents
 retire on the RM fence; 0, or `HELIOS_NVK_RM_FENCE_PRESENT=0`, restores the
@@ -206,9 +206,11 @@ D3D12).
 
 ## Performance
 
-- Fence latency decides the frame rate; see [VENUS.md](VENUS.md) "Fence
-  latency" for the virglrenderer patch that took Unigine Heaven from 36 to
-  about 150 fps, and for the latency lines both host processes log.
+- NVK's knobs and its diagnostics (`NVK_PASS_PROFILE`, `NVK_SHADER_STATS`,
+  `NVK_WAIT_STATS`) are in [guest/nvk-rm/README.md](../guest/nvk-rm/README.md).
+- For processes on Venus, fence latency decides the frame rate; see
+  [VENUS.md](VENUS.md) "Fence latency" for the virglrenderer patch Venus
+  needs on NVIDIA and the latency lines both host processes log.
 - `guest/windows/tools/scanout_timeline_dump.c` reads the KMD's scanout
   timeline (an escape; it never submits work) to CSV around a workload, to
   see where frame time goes at high refresh rates.

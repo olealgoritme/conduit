@@ -46,9 +46,20 @@ Current limitations, with the intended fix for each. Planned work is in
   (`guest/system/modprobe.conf`); a module built by hand needs the same
   blacklist.
 
-## Windows guests (Venus)
+## Windows guests
 
 Experimental, behind `--venus` ([WINDOWS.md](WINDOWS.md), [VENUS.md](VENUS.md)).
+Rendering is on NVK-on-RM; Venus is the fallback for processes the policy
+keeps off NVK.
+
+- One display mode, the host monitor's (5120x1440 on the test machine), and
+  no scaling: a game at a lower resolution is not stretched to fill the
+  screen.
+- Games need the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look; without
+  it the guest gets absolute tablet positions.
+- Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):
+  full-screen games are composed by DWM. With `IndepFlip=1` the hardware
+  cursor comes on too (`HwCursor` follows `IndepFlip` unless set).
 
 - From a checkout, `make` builds the backend with the `venus` feature but
   not `conduit-venus` (it needs the venus submodules and a local

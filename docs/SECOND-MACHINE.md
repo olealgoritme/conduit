@@ -150,4 +150,4 @@ process back on Venus.
   ([NVK-ROADMAP.md](NVK-ROADMAP.md) "Where it stands"): the windowed blt
   path, recovery after `pnputil /restart-device`, Unigine Heaven x86 OpenGL
   renders a white scene.
-- Other limits: [KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests-venus).
+- Other limits: [KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests).
