@@ -67,6 +67,10 @@ jobs:
         if: steps.gen.outputs.changed == 'true'
         with:
           workspaces: host/backend
+      - name: Format generated code
+        if: steps.gen.outputs.changed == 'true'
+        working-directory: host/backend
+        run: cargo fmt --all
       - name: Test tables and backend
         id: test
         if: steps.gen.outputs.changed == 'true'
