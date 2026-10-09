@@ -186,6 +186,7 @@ struct win_ctx {
     struct win_ev {
         int fd;
         HANDLE ev;
+        struct win_wake *wake; /* crm_win_event_wait_gen state, never freed */
     } *evs;
     uint32_t n_evs, cap_evs;
 
@@ -1427,6 +1428,30 @@ static int win_unmap_memory(void *vctx, int ctl_fd, const struct crm_map_request
     return 0;
 }
 
+/* Per event channel: the wake generation and the waiters on it
+ * (crm_win_event_wait_gen).  Heap allocated so it stays put while `evs`
+ * grows, and never freed: a waiter may still hold it after the channel is
+ * closed. */
+struct win_wake {
+    SRWLOCK lk;
+    CONDITION_VARIABLE cv;
+    volatile LONG64 gen;
+    int has_waiter;  /* a thread blocks on the KMD event for all of them */
+};
+
+static struct win_wake *ev_wake_locked(struct win_ctx *c, uint32_t i)
+{
+    if (!c->evs[i].wake) {
+        struct win_wake *w = calloc(1, sizeof(*w));
+        if (w) {
+            InitializeSRWLock(&w->lk);
+            InitializeConditionVariable(&w->cv);
+        }
+        c->evs[i].wake = w;
+    }
+    return c->evs[i].wake;
+}
+
 /* The event of channel `fd`, created and registered with the KMD on first use. */
 static int ev_get(struct win_ctx *c, int fd, HANDLE *out)
 {
@@ -1458,7 +1483,7 @@ static int ev_get(struct win_ctx *c, int fd, HANDLE *out)
              * signals it at once, so nothing is lost here. */
             r = nvrm_event_call(c, HELIOS_NVRM_OP_EVENT_REGISTER, (uint32_t)fd, ev);
             if (r == 0) {
-                c->evs[c->n_evs++] = (struct win_ev){ .fd = fd, .ev = ev };
+                c->evs[c->n_evs++] = (struct win_ev){ .fd = fd, .ev = ev, .wake = NULL };
                 *out = ev;
             } else {
                 CloseHandle(ev);
@@ -2271,6 +2296,99 @@ int32_t crm_win_loss_epoch(void)
     return (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0);
 }
 
+static struct win_wake *ev_wake(struct win_ctx *c, int fd)
+{
+    struct win_wake *w = NULL;
+    /* Fast path, every CPU wait loop iteration: a shared lookup */
+    AcquireSRWLockShared(&c->lock);
+    for (uint32_t i = 0; i < c->n_evs; i++) {
+        if (c->evs[i].fd == fd) {
+            w = c->evs[i].wake;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&c->lock);
+    if (w)
+        return w;
+    HANDLE ev;
+    if (ev_get(c, fd, &ev) != 0)
+        return NULL;
+    AcquireSRWLockExclusive(&c->lock);
+    for (uint32_t i = 0; i < c->n_evs; i++) {
+        if (c->evs[i].fd == fd) {
+            w = ev_wake_locked(c, i);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&c->lock);
+    return w;
+}
+
+int crm_win_event_gen(int fd, uint64_t *gen)
+{
+    struct win_ctx *c = &g_ctx;
+    if (fd < 0 || !gen)
+        return -EINVAL;
+    struct win_wake *w = ev_wake(c, fd);
+    if (!w)
+        return -ENOMEM;
+    *gen = (uint64_t)InterlockedCompareExchange64(&w->gen, 0, 0);
+    return 0;
+}
+
+int crm_win_event_wait_gen(int fd, uint64_t seen, uint32_t timeout_ms)
+{
+    struct win_ctx *c = &g_ctx;
+    if (fd < 0)
+        return -EINVAL;
+    struct win_wake *w = ev_wake(c, fd);
+    if (!w)
+        return -ENOMEM;
+    LARGE_INTEGER f, t0, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    const int infinite = timeout_ms == 0xFFFFFFFFu;
+    int r = 0;
+    AcquireSRWLockExclusive(&w->lk);
+    for (;;) {
+        if ((uint64_t)w->gen != seen) {
+            r = 1;
+            break;
+        }
+        DWORD left = INFINITE;
+        if (!infinite) {
+            QueryPerformanceCounter(&now);
+            const uint64_t el_ms = (uint64_t)((now.QuadPart - t0.QuadPart) * 1000 / f.QuadPart);
+            if (el_ms >= timeout_ms) {
+                r = 0;
+                break;
+            }
+            left = (DWORD)(timeout_ms - el_ms);
+        }
+        if (!w->has_waiter) {
+            /* This thread waits on the KMD's event for everyone */
+            w->has_waiter = 1;
+            ReleaseSRWLockExclusive(&w->lk);
+            const int ew = win_event_wait(c, fd, infinite ? 0xFFFFFFFFu : left);
+            AcquireSRWLockExclusive(&w->lk);
+            w->has_waiter = 0;
+            if (ew > 0)
+                InterlockedIncrement64(&w->gen);
+            /* Woken: everyone re-checks.  Timed out or failed: let another
+             * waiter take over the event. */
+            WakeAllConditionVariable(&w->cv);
+            if (ew < 0) {
+                r = ew;
+                break;
+            }
+        } else {
+            SleepConditionVariableSRW(&w->cv, &w->lk, left, 0);
+        }
+    }
+    ReleaseSRWLockExclusive(&w->lk);
+    return r;
+}
+
 /* Signals this process's wait handle for event channel `fd` (registered by a
  * previous crm_event_wait), with no KMD call: a waiter blocked in
  * win_event_wait wakes and re-reads what it waits for. For a store the CPU
@@ -2337,6 +2455,12 @@ int32_t crm_win_loss_epoch(void) { return 0; }
 #include <errno.h>
 
 int crm_win_event_kick(int fd) { (void)fd; return -ENOSYS; }
+int crm_win_event_gen(int fd, uint64_t *gen) { (void)fd; (void)gen; return -ENOSYS; }
+int crm_win_event_wait_gen(int fd, uint64_t seen, uint32_t timeout_ms)
+{
+    (void)fd; (void)seen; (void)timeout_ms;
+    return -ENOSYS;
+}
 
 int crm_win_open_device(uint32_t device_type, int *fd)
 {
