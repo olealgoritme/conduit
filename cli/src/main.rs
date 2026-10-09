@@ -24,6 +24,7 @@ mod stages;
 mod stream;
 mod sys;
 mod trace;
+mod tui;
 mod ui;
 mod units;
 mod virt;
@@ -44,7 +45,7 @@ use std::path::PathBuf;
 )]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
     /// `view`: clipboard sharing between your desktop and the VM's
     /// (text; needs conduit-clipboard-agent in the VM, docs/CLIPBOARD.md)
     #[arg(long, global = true, value_enum, default_value_t = run::Clipboard::Both)]
@@ -524,7 +525,21 @@ fn main() {
     run::set_clipboard(cli.clipboard);
     run::set_no_mem_check(cli.no_mem_check);
     run::set_venus(cli.venus);
-    let r = match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        // `conduit` alone: the dashboard on a terminal, the help otherwise.
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            if let Err(e) = tui::run() {
+                ui::report(&e);
+                std::process::exit(1);
+            }
+        } else {
+            use clap::CommandFactory;
+            let _ = Cli::command().print_help();
+        }
+        return;
+    };
+    let r = match cmd {
         Cmd::Create {
             name,
             size,
@@ -804,11 +819,11 @@ mod tests {
         let c = Cli::try_parse_from(["conduit", "view"]).unwrap();
         assert!(matches!(
             c.cmd,
-            Cmd::View {
+            Some(Cmd::View {
                 name: None,
                 mode: None,
                 ..
-            }
+            })
         ));
     }
 
