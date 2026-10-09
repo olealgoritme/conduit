@@ -1346,7 +1346,7 @@ Reading:
   7382 over the 40 s run is about DWM's own rate. The evidence of a hand-over is `IdfSpaTrans` (a `SharedPrimaryTransition`
   flip), `IdfSpaExcl`, `FfReowned` (the shown allocation changed importer: the application's buffer), `IdfPrRedir` (dxgkrnl's
   candidate presents) and the tool's own `dxgi_mode` lines (11.6 promoted with `OVERLAY`). None of these were reported.
-* What the docs require (`/steam/refsrc`): the flip-model guide (`win32/desktop-src/direct3ddxgi/for-best-performance--use-dxgi-
+* What the docs require (Microsoft's Windows docs): the flip-model guide (`win32/desktop-src/direct3ddxgi/for-best-performance--use-dxgi-
   flip-model.md`, "DirectFlip") names three DirectFlip shapes: buffers equal to the screen with a window covering it (ours), the
   same with panel fitters, and MPO. Independent flip is then engaged in **any** of them; MPO is one way to stay in it with content on
   top, not a requirement. `DXGK_FLIPCAPS.FlipIndependent` is mandatory for WDDM 1.3+ drivers (set by `IndepFlip`). The UMD's
