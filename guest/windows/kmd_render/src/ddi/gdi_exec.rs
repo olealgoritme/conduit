@@ -317,6 +317,34 @@ static DROP_SWH: AtomicU32 = AtomicU32::new(0);
 static DROP_DWH: AtomicU32 = AtomicU32::new(0);
 static DROP_O: AtomicU32 = AtomicU32::new(0);
 static DROP_R: AtomicU32 = AtomicU32::new(0);
+/// Commands into a GDI lookup table (`LOOKUPTABLE`, the ClearType gamma table CDD fills once
+/// with a BitBlt): seen | executed without a drop << 16, and the last one's surface kinds
+/// (source | destination << 16), formats, command pitches (source | destination << 16), first
+/// sub-rectangle (w << 16 | h) and source extent (w << 16 | h).
+static LUT_N: AtomicU32 = AtomicU32::new(0);
+static LUT_T: AtomicU32 = AtomicU32::new(0);
+static LUT_F: AtomicU32 = AtomicU32::new(0);
+static LUT_C: AtomicU32 = AtomicU32::new(0);
+static LUT_R: AtomicU32 = AtomicU32::new(0);
+static LUT_SWH: AtomicU32 = AtomicU32::new(0);
+/// Command pitches the CPU executor ignored (the surface is not `STAGING_CPUVISIBLE` /
+/// `EXISTINGSYSMEM`, Learn `DXGK_GDIARG_BITBLT` remarks), and the last one ignored.
+static PITCH_IGN: AtomicU32 = AtomicU32::new(0);
+static PITCH_IGN_V: AtomicU32 = AtomicU32::new(0);
+
+fn note_lut(op: &Op) {
+    let lo16 = |v: u32| v & 0xffff;
+    let (src, dst) = (op.srcs[0], op.dst);
+    let (dpc, spc) = cmd_pitches(&op.cmd);
+    LUT_N.fetch_add(1, Ordering::Relaxed);
+    LUT_T.store(src.map_or(0, |s| lo16(s.kind_bits)) | dst.map_or(0, |d| lo16(d.kind_bits)) << 16, Ordering::Relaxed);
+    LUT_F.store(src.map_or(0, |s| lo16(s.format)) | dst.map_or(0, |d| lo16(d.format)) << 16, Ordering::Relaxed);
+    LUT_C.store(lo16(spc) | lo16(dpc) << 16, Ordering::Relaxed);
+    let r = op.subs.first().copied().unwrap_or_default();
+    LUT_R.store(lo16(r.width()) << 16 | lo16(r.height()), Ordering::Relaxed);
+    LUT_SWH.store(src.map_or(0, |s| lo16(s.width) << 16 | lo16(s.height)), Ordering::Relaxed);
+}
+
 /// The CPU executor's failing step (`GdiDropS` low byte): 1 source window size, 2 source rows
 /// past its pitch, 3 source span, 4 source read, 5 destination write, 6 window size, 7 memory.
 static CPU_STEP: AtomicU32 = AtomicU32::new(0);
@@ -406,7 +434,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &PITCH_IGN, &PITCH_IGN_V,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -549,6 +577,14 @@ pub(crate) fn publish_counters() {
     w(b"GdiDropDWH", DROP_DWH.load(Ordering::Relaxed));
     w(b"GdiDropO", DROP_O.load(Ordering::Relaxed));
     w(b"GdiDropR", DROP_R.load(Ordering::Relaxed));
+    w(b"GdiLutN", LUT_N.load(Ordering::Relaxed));
+    w(b"GdiLutT", LUT_T.load(Ordering::Relaxed));
+    w(b"GdiLutF", LUT_F.load(Ordering::Relaxed));
+    w(b"GdiLutC", LUT_C.load(Ordering::Relaxed));
+    w(b"GdiLutR", LUT_R.load(Ordering::Relaxed));
+    w(b"GdiLutSWH", LUT_SWH.load(Ordering::Relaxed));
+    w(b"GdiPitchIgn", PITCH_IGN.load(Ordering::Relaxed));
+    w(b"GdiPitchIgnV", PITCH_IGN_V.load(Ordering::Relaxed));
 }
 
 /// The channel up for a job that needs it (a VRAM surface on either side): bring it up when it is
@@ -1247,10 +1283,17 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     if let Some(d) = op.dst.filter(|d| matches!(d.class, SurfaceClass::Vram | SurfaceClass::Foreign)) {
         FMT_K.store(op.srcs[0].map_or(0, |s| s.format & 0xffff) | (d.format & 0xffff) << 16, Ordering::Relaxed);
     }
+    let lut = op.dst.is_some_and(|d| ga::is_lookup_table(d.kind_bits));
+    if lut {
+        note_lut(op);
+    }
     let drops = crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed);
     execute_inner(passive, adapter, op);
     if crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed) == drops {
         note_dst_written(op);
+        if lut {
+            LUT_N.fetch_add(1 << 16, Ordering::Relaxed);
+        }
     }
     probe_after(passive, adapter, op);
 }
@@ -1473,7 +1516,7 @@ fn us_since(t0: u64) -> u32 {
 /// `GdiPitchCmd`/`GdiPitchAl`).
 fn addr_view(v: &CeView, s: &Surface, cmd_pitch: u32) -> CeView {
     let mut out = *v;
-    if cmd_pitch != 0 && cmd_pitch != v.pitch {
+    if cmd_pitch != 0 && cmd_pitch != v.pitch && ga::cmd_pitch_applies(s.kind_bits) {
         PITCH_MIS.fetch_add(1, Ordering::Relaxed);
         PITCH_CMD.store(cmd_pitch, Ordering::Relaxed);
         PITCH_AL.store(v.pitch, Ordering::Relaxed);
@@ -1867,10 +1910,18 @@ fn write_window_inner(passive: PassiveLevel, adapter: &AdapterContext, s: &Surfa
     }
 }
 
-/// The CPU stride of a surface for this command: a staging surface's command pitch when the
-/// command carries one (Learn `DXGK_GDIARG_BITBLT` remarks), else the allocation's.
+/// The CPU stride of a surface for this command: the command's pitch for a `STAGING_CPUVISIBLE`
+/// or `EXISTINGSYSMEM` surface when it carries one, else the allocation's. Learn
+/// `DXGK_GDIARG_BITBLT` remarks: the pitches locate the rectangles for those two GDI surface
+/// types only and "should be ignored for other allocation types" (CDD's staging and lookup-table
+/// surfaces, shadows).
 fn pitch_of(s: &Surface, cmd_pitch: u32) -> u32 {
-    if s.class == SurfaceClass::System && cmd_pitch >= s.width.saturating_mul(4) && cmd_pitch != 0 {
+    let applies = ga::cmd_pitch_applies(s.kind_bits);
+    if s.class == SurfaceClass::System && cmd_pitch != 0 && !applies && cmd_pitch != s.pitch {
+        PITCH_IGN.fetch_add(1, Ordering::Relaxed);
+        PITCH_IGN_V.store(cmd_pitch, Ordering::Relaxed);
+    }
+    if s.class == SurfaceClass::System && applies && cmd_pitch >= s.width.saturating_mul(4) && cmd_pitch != 0 {
         cmd_pitch
     } else if s.pitch != 0 {
         s.pitch
