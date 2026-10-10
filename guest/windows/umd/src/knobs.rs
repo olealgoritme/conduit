@@ -558,6 +558,24 @@ pub(crate) fn nvk_rm_fence_present() -> bool {
     })
 }
 
+/// `NvkAsyncPresentFence` (`HKLM\\SOFTWARE\\Helios`, or
+/// `HELIOS_NVK_ASYNC_PRESENT_FENCE`): 1 (default) = a composed NVK present
+/// whose WDDM present carries an RM fence takes that fence for a value reserved
+/// at the Present call and signalled by DXVK's submission thread right after
+/// the frame's submission (helios_icd_interface version 8), so the presenting
+/// thread does not wait for DXVK's command-stream and submission threads
+/// (the SUBMITTED gate). 0 = the gate, then `queue_rm_fence_v3`, as before.
+/// An ICD without version 8 takes the gated path either way.
+pub(crate) static NVK_ASYNC_PRESENT_FENCE: BoolKnob = BoolKnob::new(c"NvkAsyncPresentFence", true);
+
+/// `NvkAsyncPresentFence`, or `HELIOS_NVK_ASYNC_PRESENT_FENCE` from the environment.
+pub(crate) fn nvk_async_present_fence() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_ASYNC_PRESENT_FENCE").unwrap_or_else(|| NVK_ASYNC_PRESENT_FENCE.get())
+    })
+}
+
 /// `NvkRmCopyRecord`, or `HELIOS_NVK_RM_COPY_RECORD` from the environment.
 pub(crate) fn nvk_rm_copy_record() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

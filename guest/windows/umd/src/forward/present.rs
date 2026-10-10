@@ -1554,6 +1554,8 @@ fn dwm_on_nvk_marker() -> bool {
 static NVK_FENCED_PRESENTS: AtomicUsize = AtomicUsize::new(0);
 static NVK_FENCED_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static NVK_MARKER_FENCES: AtomicUsize = AtomicUsize::new(0);
+/// Composed frames whose fence DXVK's submission thread signals (no SUBMITTED gate).
+static NVK_ASYNC_MARKER_FENCES: AtomicUsize = AtomicUsize::new(0);
 /// Composed frames whose fence carried the copy-engine record (`'HEF3'`).
 static NVK_RM_COPY_RECORDS: AtomicUsize = AtomicUsize::new(0);
 /// ... and those that went without one: NVK described nothing (an older NVK,
@@ -1625,6 +1627,43 @@ unsafe fn nvk_present_frame(
     let marker_fences = fences
         && crate::knobs::nvk_rm_fence_present()
         && caps & HELIOS_ICD_CAP_PRESENT_FENCE_KMD != 0;
+
+    // Composed with marker fences: a fence for a value DXVK's submission thread
+    // signals right after the frame, so nothing here waits for the CS and
+    // submission threads. An ICD without that entry (or a device that cannot)
+    // takes the gated path below.
+    if !scanout && marker_fences && crate::knobs::nvk_async_present_fence() {
+        match present_timing::gate(|| nvk_marker_fence_async(dev, blt_source)) {
+            Ok(Some((fence, value, rm_copy))) => {
+                let n = NVK_ASYNC_MARKER_FENCES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n % 4096 == 0 {
+                    log_error!(
+                        "NVK present: {n} WDDM presents carry an RM fence signalled after the \
+                         frame's submission, no SUBMITTED gate (value {value}); copy-engine \
+                         record {} (without {}, refused {})",
+                        NVK_RM_COPY_RECORDS.load(Ordering::Relaxed),
+                        NVK_RM_COPY_NONE.load(Ordering::Relaxed),
+                        NVK_RM_COPY_REFUSED.load(Ordering::Relaxed),
+                    );
+                }
+                return Ok(NvkFrame {
+                    correlation: PresentStreamCorrelation {
+                        rm_fence_handle: fence,
+                        rm_fence_value: value,
+                        rm_copy,
+                        ..PresentStreamCorrelation::default()
+                    },
+                    on_scanout: false,
+                    compose: true,
+                });
+            }
+            Ok(None) => {
+                log_error!("NVK present refused: the frame's submission failed");
+                return Err(E_FAIL);
+            }
+            Err(()) => {}
+        }
+    }
 
     if (scanout && fences) || (!scanout && marker_fences) {
         // Submitted, not complete: the fence is signalled after this on the GPU.
@@ -1719,32 +1758,48 @@ unsafe fn nvk_present_frame(
     Ok(NvkFrame::default())
 }
 
-/// The RM fence of a composed frame's WDDM present, and the copy-engine
-/// Present record behind it when the KMD reads one (QueryCaps bit 37), NVK
-/// has `queue_rm_fence_v3`, `NvkRmCopyRecord` is on and `blt_source` (the
-/// present's source, the image the KMD's Blt reads) is a resource. The record
-/// goes only when it passes every rule the KMD applies
-/// (`helios_protocol::producer_record`); otherwise the fence goes alone, as
-/// before. The caller owns the fence.
-unsafe fn nvk_marker_fence(
+/// [`nvk_marker_fence`] for a fence DXVK's submission thread signals after the
+/// frame (`HeliosDxvkDevice::nvk_present_fence_async`): no SUBMITTED gate
+/// before it. `Err(())`: not available (nothing reserved or flushed; take the
+/// gated path). `Ok(None)`: the frame's flush failed after the reservation.
+unsafe fn nvk_marker_fence_async(
     dev: &HeliosDevice,
     blt_source: ddi::D3D10DDI_HRESOURCE,
-) -> Option<(u32, u64, Option<helios_protocol::HeliosRmFenceTailV3>)> {
+) -> Result<Option<(u32, u64, Option<helios_protocol::HeliosRmFenceTailV3>)>, ()> {
     let wanted = !blt_source.pDrvPrivate.is_null()
         && crate::knobs::nvk_rm_copy_record()
         // SAFETY: `dev` is the live device of this present.
         && unsafe { crate::scanout_acquire::nvrm_rm_fence_tail_v3_capable(dev) };
-    if !wanted {
-        return dev.dxvk.nvk_present_fence().map(|(fence, value)| (fence, value, None));
-    }
-    let src = load_resource(blt_source);
-    let (fence, value, copy) = dev.dxvk.nvk_present_fence_v3(src.as_deref())?;
+    let src = if wanted {
+        load_resource(blt_source)
+    } else {
+        None
+    };
+    let Some((fence, value, copy)) = dev.dxvk.nvk_present_fence_async(src.as_deref())? else {
+        return Ok(None);
+    };
+    let record = if wanted {
+        nvk_copy_record(fence, value, copy)
+    } else {
+        None
+    };
+    Ok(Some((fence, value, record)))
+}
+
+/// The copy-engine Present record for `copy` (what the ICD described for the
+/// fence `fence` at `value`), when it passes every rule the KMD applies; counted
+/// either way (`NVK_RM_COPY_*`).
+fn nvk_copy_record(
+    fence: u32,
+    value: u64,
+    copy: Option<[u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES]>,
+) -> Option<helios_protocol::HeliosRmFenceTailV3> {
     let tail = helios_protocol::HeliosRmFenceTail {
         rm_fence_handle: fence,
         flags: helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
         rm_fence_value: value,
     };
-    let record = match copy.map(|c| helios_protocol::producer_record(&c, &tail)) {
+    match copy.map(|c| helios_protocol::producer_record(&c, &tail)) {
         Some(Ok(record)) => {
             let n = NVK_RM_COPY_RECORDS.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 {
@@ -1787,7 +1842,30 @@ unsafe fn nvk_marker_fence(
             }
             None
         }
-    };
+    }
+}
+
+/// The RM fence of a composed frame's WDDM present, and the copy-engine
+/// Present record behind it when the KMD reads one (QueryCaps bit 37), NVK
+/// has `queue_rm_fence_v3`, `NvkRmCopyRecord` is on and `blt_source` (the
+/// present's source, the image the KMD's Blt reads) is a resource. The record
+/// goes only when it passes every rule the KMD applies
+/// (`helios_protocol::producer_record`); otherwise the fence goes alone, as
+/// before. The caller owns the fence.
+unsafe fn nvk_marker_fence(
+    dev: &HeliosDevice,
+    blt_source: ddi::D3D10DDI_HRESOURCE,
+) -> Option<(u32, u64, Option<helios_protocol::HeliosRmFenceTailV3>)> {
+    let wanted = !blt_source.pDrvPrivate.is_null()
+        && crate::knobs::nvk_rm_copy_record()
+        // SAFETY: `dev` is the live device of this present.
+        && unsafe { crate::scanout_acquire::nvrm_rm_fence_tail_v3_capable(dev) };
+    if !wanted {
+        return dev.dxvk.nvk_present_fence().map(|(fence, value)| (fence, value, None));
+    }
+    let src = load_resource(blt_source);
+    let (fence, value, copy) = dev.dxvk.nvk_present_fence_v3(src.as_deref())?;
+    let record = nvk_copy_record(fence, value, copy);
     Some((fence, value, record))
 }
 

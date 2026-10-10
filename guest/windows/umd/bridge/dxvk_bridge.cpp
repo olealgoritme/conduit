@@ -1593,6 +1593,67 @@ std::int32_t HeliosDxvkDevice::nvk_present_fence_v3(std::size_t d3d11_resource_p
   });
 }
 
+std::int32_t HeliosDxvkDevice::nvk_present_fence_async(std::size_t d3d11_resource_ptr,
+                                                       std::uint32_t* fence_handle,
+                                                       std::uint64_t* value,
+                                                       std::uint8_t* copy,
+                                                       std::size_t copy_len) const noexcept {
+  return bridge_guard("nvk_present_fence_async", std::int32_t(3), [&]() -> std::int32_t {
+    *fence_handle = 0;
+    *value = 0;
+    if (copy_len != sizeof(helios_icd_rm_copy))
+      return 3;
+    std::memset(copy, 0, copy_len);
+    if (!impl || !impl->context || impl->device == nullptr
+     || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !(impl->icd.caps & HELIOS_ICD_CAP_RM_FENCE)
+     || !impl->icd.ecl_fence_reserve || !impl->icd.ecl_fence_create_v3
+     || !impl->icd.ecl_fence_signal)
+      return 3;
+    // This device's present timeline: the address of its bridge state,
+    // 2-aligned, owned for the device's life (vkd3d keys its ECL timelines
+    // with its command queues the same way).
+    const std::uint64_t key = reinterpret_cast<std::uintptr_t>(impl.get()) & ~std::uint64_t(1);
+    const VkDevice vk_device = impl->device->vkd()->device();
+    std::uint64_t v = 0;
+    if (key == 0 || impl->icd.ecl_fence_reserve(vk_device, key, &v) != VK_SUCCESS || v == 0)
+      return 3;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (d3d11_resource_ptr == 0
+     || !texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0) {
+      image = VK_NULL_HANDLE;
+      memory = VK_NULL_HANDLE;
+    }
+    helios_icd_rm_copy rc{};
+    std::uint32_t fence = 0;
+    const VkResult vr = impl->icd.ecl_fence_create_v3(vk_device, key, v, memory, image,
+                                                      &fence, &rc);
+    // A reserved value that is never signalled is covered by the next one.
+    if (vr < 0 || fence == 0)
+      return 3;
+    // The signal follows the frame on the queue; nobody waits for it here.
+    const auto signal = impl->icd.ecl_fence_signal;
+    const VkQueue queue = impl->device->queues().graphics.queueHandle;
+    auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    if (!immediateContext->HeliosSubmitFrameThen([signal, vk_device, queue, key, v] {
+          signal(vk_device, queue, key, v);
+        })) {
+      if (impl->icd.rm_fence_close)
+        impl->icd.rm_fence_close(vk_device, fence);
+      return 1;
+    }
+    *fence_handle = fence;
+    *value = v;
+    if (vr != VK_SUCCESS)
+      return 2;
+    std::memcpy(copy, &rc, sizeof(rc));
+    return 0;
+  });
+}
+
 void HeliosDxvkDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept {
   bridge_guard("nvk_rm_fence_close", false, [&]() -> bool {
     if (impl && fence_handle && impl->icd.rm_fence_close && impl->device != nullptr)

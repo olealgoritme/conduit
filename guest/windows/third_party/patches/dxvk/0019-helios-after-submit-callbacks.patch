@@ -1,0 +1,181 @@
+Helios DXVK fork: run a callback on the submission thread right after a frame's submission
+
+Conduit guest/windows. Applied after 0018 by ci/windows/Build-Driver.ps1.
+
+A composed D3D11 present on NVK hands the KMD an RM fence in its WDDM present
+marker. The fence used to come from NVK's queue_rm_fence, which signals the
+present timeline after what is already submitted to the queue, so the
+presenting thread first waited in HeliosWaitFrameSubmitted until DXVK's CS
+thread had executed the frame's flush and the submission thread had performed
+its vkQueueSubmit (and lockSubmission then waited for the submission queue to
+drain once more). CS2 spent about 9% of its render thread there.
+
+With a fence for a value reserved up front (helios_icd_interface version 8,
+ecl_fence_create_v3), only the timeline signal has to follow the frame on the
+queue, and nobody has to wait for it:
+
+- DxvkCommandList::heliosAfterSubmit / heliosRunAfterSubmit: callbacks the
+  submission thread runs right after the list's vkQueueSubmit succeeded, with
+  the device queue still locked (dropped unrun on a failed submission).
+- DxvkContext::heliosAfterSubmit: attach one to the list being recorded.
+- D3D11ImmediateContext::HeliosSubmitFrameThen: emit a CS command that attaches
+  the callback to the current list, then flush it. The callback runs after the
+  submission that carries everything recorded so far; the presenting thread
+  returns at once.
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 4226b4b7..5019cf8b 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -1214,6 +1214,28 @@ namespace dxvk {
+   }
+ 
+ 
++  bool D3D11ImmediateContext::HeliosSubmitFrameThen(std::function<void ()>&& fn) {
++    D3D10DeviceLock lock = LockContext();
++
++    if (m_device->getDeviceStatus() != VK_SUCCESS)
++      return false;
++
++    // A command that hands `fn` to the command list the CS thread is
++    // recording, then the flush that submits that list: everything the app
++    // recorded since the last flush goes in the same submission, and the
++    // submission thread runs `fn` right after it. A frame already flushed
++    // before this call is earlier on the queue anyway.
++    EmitCs([
++      cFn = std::move(fn)
++    ] (DxvkContext* ctx) mutable {
++      ctx->heliosAfterSubmit(std::move(cFn));
++    });
++
++    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false);
++    return m_device->getDeviceStatus() == VK_SUCCESS;
++  }
++
++
+   bool D3D11ImmediateContext::HeliosWaitFrameSubmitted() {
+     uint64_t sequenceNumber;
+ 
+diff --git a/src/d3d11/d3d11_context_imm.h b/src/d3d11/d3d11_context_imm.h
+index 5201740a..1b5e34b7 100644
+--- a/src/d3d11/d3d11_context_imm.h
++++ b/src/d3d11/d3d11_context_imm.h
+@@ -182,6 +182,20 @@ namespace dxvk {
+      */
+     bool HeliosWaitFrameSubmitted();
+ 
++    /**
++     * \brief Helios: submit the frame and run \p fn after its submission
++     *
++     * The pipelined form of \ref HeliosWaitFrameSubmitted: the CS thread
++     * attaches \p fn to the command list it is recording and this flushes
++     * that list (with whatever the app recorded since its last flush); the
++     * submission thread runs \p fn right after that list's vkQueueSubmit,
++     * holding the queue, so \p fn follows every submission of the frame in
++     * queue order. Nothing here waits for either thread. \p fn is dropped (not run) if the
++     * submission fails. Used to signal a present fence the KMD already holds.
++     * \returns False if the device has failed (nothing was queued)
++     */
++    bool HeliosSubmitFrameThen(std::function<void ()>&& fn);
++
+     /**
+      * \brief Helios: record a present-fence signal on the open command list
+      *
+diff --git a/src/dxvk/dxvk_cmdlist.cpp b/src/dxvk/dxvk_cmdlist.cpp
+index ad4b7ff4..69134154 100644
+--- a/src/dxvk/dxvk_cmdlist.cpp
++++ b/src/dxvk/dxvk_cmdlist.cpp
+@@ -537,6 +537,7 @@ namespace dxvk {
+   void DxvkCommandList::reset() {
+     m_producerWaits.clear();
+     m_producerSignals.clear();
++    m_heliosAfterSubmit.clear();
+     m_handoffWaits.clear();
+     resetCheckpoints();
+ 
+diff --git a/src/dxvk/dxvk_cmdlist.h b/src/dxvk/dxvk_cmdlist.h
+index 69ed72b2..fc5eb09f 100644
+--- a/src/dxvk/dxvk_cmdlist.h
++++ b/src/dxvk/dxvk_cmdlist.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <functional>
+ #include <limits>
+ 
+ #include "dxvk_bind_mask.h"
+@@ -467,6 +468,33 @@ namespace dxvk {
+       for (const auto& operation : m_producerSignals)
+         operation->submitted(success);
+     }
++
++    /**
++     * \brief Helios: runs \p fn on the submission thread right after this
++     * command list's vkQueueSubmit succeeded, with the queue still held
++     *
++     * For work that must follow this submission on the same VkQueue in
++     * queue order (a present fence's timeline signal), from a thread that
++     * must not wait for the submission itself. \p fn must not lock the
++     * submission queue (it already is locked).
++     */
++    void heliosAfterSubmit(std::function<void ()>&& fn) {
++      m_heliosAfterSubmit.push_back(std::move(fn));
++    }
++
++    /**
++     * \brief Helios: runs the \ref heliosAfterSubmit callbacks once
++     *
++     * \param [in] success The submission succeeded; on failure the
++     *   callbacks are dropped without running (the device is lost).
++     */
++    void heliosRunAfterSubmit(bool success) {
++      if (success) {
++        for (auto& fn : m_heliosAfterSubmit)
++          fn();
++      }
++      m_heliosAfterSubmit.clear();
++    }
+     
+     /**
+      * \brief Signals fence
+@@ -1440,6 +1468,7 @@ namespace dxvk {
+     small_vector<HeliosProducerDependency, 4> m_producerWaits;
+     small_vector<std::pair<uint32_t, uint64_t>, 4> m_handoffWaits;
+     small_vector<Rc<HeliosProducerOperation>, 4> m_producerSignals;
++    std::vector<std::function<void ()>> m_heliosAfterSubmit;
+     small_vector<DxvkFenceValuePair, 4> m_signalSemaphores;
+ 
+     small_vector<DxvkCommandSubmissionInfo, 4> m_cmdSubmissions;
+diff --git a/src/dxvk/dxvk_context.h b/src/dxvk/dxvk_context.h
+index 08f9c302..5fb677e5 100644
+--- a/src/dxvk/dxvk_context.h
++++ b/src/dxvk/dxvk_context.h
+@@ -1541,6 +1541,14 @@ namespace dxvk {
+       m_cmd->trackProducer(operation);
+     }
+ 
++    /**
++     * \brief Helios: runs \p fn on the submission thread right after the
++     * current command list is submitted (\ref DxvkCommandList::heliosAfterSubmit)
++     */
++    void heliosAfterSubmit(std::function<void ()>&& fn) {
++      m_cmd->heliosAfterSubmit(std::move(fn));
++    }
++
+     /**
+      * \brief Begins a debug label region
+      *
+diff --git a/src/dxvk/dxvk_queue.cpp b/src/dxvk/dxvk_queue.cpp
+index e304a96f..3a58fda0 100644
+--- a/src/dxvk/dxvk_queue.cpp
++++ b/src/dxvk/dxvk_queue.cpp
+@@ -195,6 +195,9 @@ namespace dxvk {
+             entry.result = entry.submit.cmdList->submit(
+               m_semaphores, m_timelines, trackedSubmitId);
+           entry.timelines = m_timelines;
++
++          // Helios: in queue order after this submission, queue still held.
++          entry.submit.cmdList->heliosRunAfterSubmit(entry.result == VK_SUCCESS);
+         } else if (entry.present.presenter != nullptr) {
+           if (entry.latency.tracker)
+             entry.latency.tracker->notifyQueuePresentBegin(entry.latency.frameId);
