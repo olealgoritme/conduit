@@ -1927,15 +1927,17 @@ pub(crate) unsafe extern "system" fn dxgi_resolve_shared_resource(
     0
 }
 
-/// Submit what this device recorded (every ResolveSharedResource), and when `resource` is
-/// GDI-compatible, on NVK wait until the GPU has finished it: GDI is about to read or draw it
-/// (DXGI calls ResolveSharedResource from `IDXGISurface1::GetDC`; the other caller, a keyed-mutex
-/// release, has its own ordering, `flush_gate`, and does not wait here). The GDI acceleration executor in the KMD reads and writes the image with its
-/// own copy engine; dxgkrnl orders GDI's DMA buffers against this device's only when the device
-/// submits through dxgkrnl, and NVK submits to RM directly, so without the wait GDI could read
-/// the image before the device's last rendering landed (or draw into it and be overwritten by
-/// it): `gdi_interop_probe` round 0 of every process, RichEdit's text in Notepad. Venus devices
-/// submit through dxgkrnl, which orders the GDI work after theirs.
+/// Submit what this device recorded (every ResolveSharedResource), and on NVK wait until the GPU
+/// has finished it unless `resource` is a cross-process shared resource. ResolveSharedResource has
+/// two callers: `IDXGISurface1::GetDC` on a GDI-compatible texture, where GDI reads or draws the
+/// image next, and a keyed-mutex release of a shared resource, whose ordering is `flush_gate`'s
+/// (the shared resources this device holds, `nvk_keyed_resources`). The GDI acceleration executor
+/// in the KMD reads and writes the image with its own copy engine; dxgkrnl orders GDI's DMA
+/// buffers against this device's only when the device submits through dxgkrnl, and NVK submits to
+/// RM directly, so without the wait GDI could read the image before the device's last rendering
+/// landed (or draw into it and be overwritten by it): `gdi_interop_probe` round 0 of every
+/// process, RichEdit's text in Notepad. Venus devices submit through dxgkrnl, which orders the
+/// GDI work after theirs.
 pub(crate) unsafe fn gdi_handoff(h: Hdevice, resource: ddi::D3D10DDI_HRESOURCE) {
     let Some(context) = d3d11_context(h) else {
         return;
@@ -1944,7 +1946,20 @@ pub(crate) unsafe fn gdi_handoff(h: Hdevice, resource: ddi::D3D10DDI_HRESOURCE) 
     let Some(dev) = helios_device(h) else {
         return;
     };
-    if !dev.dxvk.is_nvk() || !resource_gdi_compatible(resource) {
+    if !dev.dxvk.is_nvk() {
+        return;
+    }
+    let key = resource.pDrvPrivate as usize;
+    let shared = lock_ignore_poison(&dev.nvk_keyed_resources).iter().any(|&(k, _)| k == key);
+    static DECISIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if d <= 4 {
+        log_error!(
+            "DDI NVK ResolveSharedResource #{d}: hResource=0x{key:x} shared={shared} gdi_compatible={}",
+            resource_gdi_compatible(resource)
+        );
+    }
+    if shared {
         return;
     }
     let Some(start) = super::transfer::wait_submitted(dev, &context, "GetDC flush wait") else {
