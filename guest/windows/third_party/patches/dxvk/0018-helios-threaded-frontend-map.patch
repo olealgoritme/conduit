@@ -17,8 +17,75 @@ into its two halves:
 - HeliosFrontendInvalidate (worker thread, in replay order): the
   EmitCs(invalidateBuffer) and ThrottleDiscard half of MapBuffer.
 
-Nothing changes for callers that do not use the two entry points.
+- Pre-allocated slices: after the worker replays a discard of a buffer of at
+  most one allocator page, it allocates the buffer's next slice from its own
+  cache and parks it in D3D11Buffer::m_heliosNext (one owned reference,
+  exchanged atomically). The app thread's next discard takes it instead of
+  allocating, so the allocation also leaves the app thread. A fresh slice was
+  never used by the GPU; the buffer releases a parked one on destruction.
 
+Nothing changes for callers that do not use these entry points.
+
+diff --git a/src/d3d11/d3d11_buffer.cpp b/src/d3d11/d3d11_buffer.cpp
+index 41031b95..b70a569a 100644
+--- a/src/d3d11/d3d11_buffer.cpp
++++ b/src/d3d11/d3d11_buffer.cpp
+@@ -124,6 +124,9 @@ namespace dxvk {
+   
+   
+   D3D11Buffer::~D3D11Buffer() {
++    if (auto* next = m_heliosNext.exchange(nullptr))
++      next->decRef();
++
+     if (m_desc.CPUAccessFlags && m_11on12.Resource != nullptr)
+       m_11on12.Resource->Unmap(0, nullptr);
+   }
+diff --git a/src/d3d11/d3d11_buffer.h b/src/d3d11/d3d11_buffer.h
+index 853d261f..829668ad 100644
+--- a/src/d3d11/d3d11_buffer.h
++++ b/src/d3d11/d3d11_buffer.h
+@@ -133,6 +133,33 @@ namespace dxvk {
+       return m_mapPtr;
+     }
+ 
++    /**
++     * \brief Helios threaded front end: pre-allocated discard slices
++     *
++     * The UMD's worker allocates the next slice for a small dynamic buffer
++     * after it replays a discard, so the app thread's next discard only takes
++     * it. One owned reference travels in \c m_heliosNext.
++     */
++    DxvkResourceAllocation* HeliosTakeNextSlice() {
++      return m_heliosNext.exchange(nullptr, std::memory_order_acquire);
++    }
++
++    bool HeliosWantsNextSlice() const {
++      return m_heliosNext.load(std::memory_order_relaxed) == nullptr;
++    }
++
++    void HeliosPutNextSlice(Rc<DxvkResourceAllocation>&& Slice) {
++      DxvkResourceAllocation* ptr = Slice.ptr();
++      ptr->incRef();
++      DxvkResourceAllocation* expected = nullptr;
++      if (!m_heliosNext.compare_exchange_strong(expected, ptr, std::memory_order_release))
++        ptr->decRef();
++    }
++
++    void HeliosSetMapPtr(void* pData) {
++      m_mapPtr = pData;
++    }
++
+     D3D10Buffer* GetD3D10Iface() {
+       return &m_d3d10;
+     }
+@@ -196,6 +223,7 @@ namespace dxvk {
+     uint64_t                      m_seq = 0ull;
+ 
+     void*                         m_mapPtr = nullptr;
++    std::atomic<DxvkResourceAllocation*> m_heliosNext = { nullptr };
+ 
+     D3D11DXGIResource             m_resource;
+     D3D10Buffer                   m_d3d10;
 diff --git a/src/d3d11/d3d11_context.cpp b/src/d3d11/d3d11_context.cpp
 index 568a20ce..5d4638b6 100644
 --- a/src/d3d11/d3d11_context.cpp
@@ -57,10 +124,10 @@ index e55920b8..b61cdef5 100644
  
      DxvkCsChunkRef AllocCsChunk();
 diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
-index 3a090686..03917cb5 100644
+index 3a090686..4226b4b7 100644
 --- a/src/d3d11/d3d11_context_imm.cpp
 +++ b/src/d3d11/d3d11_context_imm.cpp
-@@ -583,6 +583,41 @@ namespace dxvk {
+@@ -583,6 +583,53 @@ namespace dxvk {
    }
    
    
@@ -74,7 +141,17 @@ index 3a090686..03917cb5 100644
 +
 +    helios_feed::mapWriteDiscard();
 +
-+    auto slice = pBuffer->DiscardSlice(&m_heliosFrontendCache);
++    Rc<DxvkResourceAllocation> slice;
++
++    if (auto* next = pBuffer->HeliosTakeNextSlice()) {
++      // Adopt the travelling reference.
++      slice = next;
++      next->decRef();
++      pBuffer->HeliosSetMapPtr(slice->mapPtr());
++    } else {
++      slice = pBuffer->DiscardSlice(&m_heliosFrontendCache);
++    }
++
 +    *ppData = slice->mapPtr();
 +    return slice;
 +  }
@@ -96,6 +173,8 @@ index 3a090686..03917cb5 100644
 +
 +    if (unlikely(bufferSize > DxvkPageAllocator::PageSize))
 +      ThrottleDiscard(bufferSize);
++    else if (pBuffer->HeliosWantsNextSlice())
++      pBuffer->HeliosPutNextSlice(pBuffer->AllocSlice(&m_allocationCache));
 +  }
 +
 +

@@ -113,28 +113,45 @@ struct Stats {
 }
 
 /// The ring, its worker and the coordination around them.
-pub struct CmdQueue {
+/// What every push reads: written only at setup, start and shutdown, so it
+/// stays shared-clean in both cores' caches.
+#[repr(C, align(64))]
+struct Hot {
     buf: *mut u8,
     cap: usize,
-    /// Producer line: published write cursor + the producer's cached view of
-    /// the read cursor. Only the producer writes it.
-    write: Line<AtomicU64>,
+    started: AtomicBool,
+    stop: AtomicBool,
+}
+
+/// The producer's own line: published write cursor + its cached view of the
+/// read cursor.
+#[repr(C, align(64))]
+struct ProducerLine {
+    write: AtomicU64,
     read_cache: AtomicU64,
+}
+
+#[repr(C)]
+pub struct CmdQueue {
+    hot: Hot,
+    prod: ProducerLine,
     /// Consumer line: records before this cursor have run.
     read: Line<AtomicU64>,
     /// The worker announced it is about to park.
     sleeping: Line<AtomicBool>,
+    /// Errors stashed by the worker; read (one relaxed load) on every DDI
+    /// entry, written only on failure.
+    error: Line<AtomicI32>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     worker_thread: std::sync::OnceLock<std::thread::Thread>,
-    started: AtomicBool,
-    stop: AtomicBool,
-    waiters: AtomicUsize,
+    /// Worker-written counters and the waiter count, away from the lines
+    /// above.
+    waiters: Line<AtomicUsize>,
     wait_lock: Mutex<()>,
     wait_cv: Condvar,
     retire: Mutex<VecDeque<Retire>>,
     retire_pending: AtomicBool,
-    error: AtomicI32,
-    stats: Stats,
+    stats: Line<Stats>,
     name: String,
     /// True once waiting for the worker is pointless (process teardown has
     /// killed it): waits return and shutdown does not join.
@@ -176,23 +193,27 @@ impl CmdQueue {
         let buf = unsafe { alloc_zeroed(layout) };
         assert!(!buf.is_null(), "ring allocation failed");
         Arc::new(Self {
-            buf,
-            cap,
-            write: Line(AtomicU64::new(0)),
-            read_cache: AtomicU64::new(0),
+            hot: Hot {
+                buf,
+                cap,
+                started: AtomicBool::new(false),
+                stop: AtomicBool::new(false),
+            },
+            prod: ProducerLine {
+                write: AtomicU64::new(0),
+                read_cache: AtomicU64::new(0),
+            },
             read: Line(AtomicU64::new(0)),
             sleeping: Line(AtomicBool::new(false)),
+            error: Line(AtomicI32::new(0)),
             worker: Mutex::new(None),
             worker_thread: std::sync::OnceLock::new(),
-            started: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-            waiters: AtomicUsize::new(0),
+            waiters: Line(AtomicUsize::new(0)),
             wait_lock: Mutex::new(()),
             wait_cv: Condvar::new(),
             retire: Mutex::new(VecDeque::new()),
             retire_pending: AtomicBool::new(false),
-            error: AtomicI32::new(0),
-            stats: Stats::default(),
+            stats: Line(Stats::default()),
             name: name.to_string(),
             abandoned: std::sync::OnceLock::new(),
             thread_init: std::sync::OnceLock::new(),
@@ -225,17 +246,17 @@ impl CmdQueue {
 
     /// Ring capacity in bytes.
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.hot.cap
     }
 
     /// Largest record (header + closure + extra) a push accepts.
     pub fn max_record(&self) -> usize {
-        self.cap / 4
+        self.hot.cap / 4
     }
 
     /// The cursor past the last published record.
     pub fn written(&self) -> u64 {
-        self.write.0.load(Ordering::Acquire)
+        self.prod.write.load(Ordering::Acquire)
     }
 
     /// The cursor past the last record that has run.
@@ -273,7 +294,7 @@ impl CmdQueue {
     {
         const { assert!(align_of::<F>() <= 8, "record closures must be at most 8-byte aligned") };
         debug_assert!(!self.is_worker(), "push from the worker thread");
-        if self.stop.load(Ordering::Relaxed) {
+        if self.hot.stop.load(Ordering::Relaxed) {
             return Err(PushError::Stopped);
         }
         let extra_off = HEADER_BYTES + round8(size_of::<F>());
@@ -281,38 +302,38 @@ impl CmdQueue {
         if len > self.max_record() {
             return Err(PushError::TooLarge);
         }
-        if !self.started.load(Ordering::Relaxed) {
+        if !self.hot.started.load(Ordering::Relaxed) {
             self.start();
         }
-        let mask = self.cap - 1;
-        let w = self.write.0.load(Ordering::Relaxed);
+        let mask = self.hot.cap - 1;
+        let w = self.prod.write.load(Ordering::Relaxed);
         let pos = (w as usize) & mask;
-        let tail = self.cap - pos;
+        let tail = self.hot.cap - pos;
         let start = if tail < len { w + tail as u64 } else { w };
         let end = start + len as u64;
         // Room: everything before `end - cap` must have been consumed.
-        let need_read = end.saturating_sub(self.cap as u64);
-        if self.read_cache.load(Ordering::Relaxed) < need_read {
+        let need_read = end.saturating_sub(self.hot.cap as u64);
+        if self.prod.read_cache.load(Ordering::Relaxed) < need_read {
             let mut r = self.read.0.load(Ordering::Acquire);
             if r < need_read {
-                self.stats.full_waits.fetch_add(1, Ordering::Relaxed);
+                self.stats.0.full_waits.fetch_add(1, Ordering::Relaxed);
                 self.wait_done(need_read);
                 r = self.read.0.load(Ordering::Acquire);
             }
-            self.read_cache.store(r, Ordering::Relaxed);
+            self.prod.read_cache.store(r, Ordering::Relaxed);
         }
         // SAFETY: [w, end) lies in consumed space (checked above) and only the
         // producer writes there until `write` is published.
         unsafe {
             if start != w && tail >= HEADER_BYTES {
-                (self.buf.add(pos) as *mut Header).write(Header {
+                (self.hot.buf.add(pos) as *mut Header).write(Header {
                     call: None,
                     len: tail as u32,
                     extra_off: 0,
                     extra_len: 0,
                 });
             }
-            let p = self.buf.add((start as usize) & mask);
+            let p = self.hot.buf.add((start as usize) & mask);
             (p as *mut Header).write(Header {
                 call: Some(call_closure::<F>),
                 len: len as u32,
@@ -322,7 +343,7 @@ impl CmdQueue {
             (p.add(HEADER_BYTES) as *mut F).write(f);
             fill(core::slice::from_raw_parts_mut(p.add(extra_off), extra_len));
         }
-        self.write.0.store(end, Ordering::Release);
+        self.prod.write.store(end, Ordering::Release);
         // Cheap check; a wake this misses is caught by the worker's short park
         // timeout and by every waiting path's full kick.
         if self.sleeping.0.load(Ordering::Relaxed) {
@@ -332,7 +353,7 @@ impl CmdQueue {
     }
 
     fn start(self: &Arc<Self>) {
-        if self.started.swap(true, Ordering::AcqRel) {
+        if self.hot.started.swap(true, Ordering::AcqRel) {
             return;
         }
         let q = Arc::clone(self);
@@ -353,7 +374,7 @@ impl CmdQueue {
     fn wake_worker(&self) {
         if self.sleeping.0.swap(false, Ordering::AcqRel) {
             if let Some(t) = self.worker_thread.get() {
-                self.stats.wakes.fetch_add(1, Ordering::Relaxed);
+                self.stats.0.wakes.fetch_add(1, Ordering::Relaxed);
                 t.unpark();
             }
         }
@@ -386,9 +407,9 @@ impl CmdQueue {
             core::hint::spin_loop();
         }
         let mut g = lock(&self.wait_lock);
-        self.waiters.fetch_add(1, Ordering::SeqCst);
+        self.waiters.0.fetch_add(1, Ordering::SeqCst);
         while self.read.0.load(Ordering::SeqCst) < pos {
-            if !self.started.load(Ordering::Acquire) || self.is_abandoned() {
+            if !self.hot.started.load(Ordering::Acquire) || self.is_abandoned() {
                 break; // never started (cannot happen in use) or killed at exit
             }
             self.kick();
@@ -398,7 +419,7 @@ impl CmdQueue {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        self.waiters.0.fetch_sub(1, Ordering::SeqCst);
         drop(g);
         self.note_wait(t0);
         true
@@ -406,15 +427,15 @@ impl CmdQueue {
 
     fn note_wait(&self, t0: Instant) {
         let us = t0.elapsed().as_micros() as u64;
-        self.stats.drain_waits.fetch_add(1, Ordering::Relaxed);
-        self.stats.drain_wait_us.fetch_add(us, Ordering::Relaxed);
-        self.stats.drain_wait_max_us.fetch_max(us, Ordering::Relaxed);
+        self.stats.0.drain_waits.fetch_add(1, Ordering::Relaxed);
+        self.stats.0.drain_wait_us.fetch_add(us, Ordering::Relaxed);
+        self.stats.0.drain_wait_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     /// Wait until every published record has run. Returns true when it had
     /// to wait.
     pub fn drain(&self) -> bool {
-        self.stats.drains.fetch_add(1, Ordering::Relaxed);
+        self.stats.0.drains.fetch_add(1, Ordering::Relaxed);
         self.wait_done(self.written())
     }
 
@@ -425,12 +446,12 @@ impl CmdQueue {
     /// # Safety
     /// `run` must be valid to run on the worker thread or on the caller's.
     pub unsafe fn retire(&self, pos: u64, run: impl FnOnce() + 'static) {
-        if self.read.0.load(Ordering::Acquire) >= pos || self.stop.load(Ordering::Acquire) {
-            self.stats.retire_inline.fetch_add(1, Ordering::Relaxed);
+        if self.read.0.load(Ordering::Acquire) >= pos || self.hot.stop.load(Ordering::Acquire) {
+            self.stats.0.retire_inline.fetch_add(1, Ordering::Relaxed);
             run();
             return;
         }
-        self.stats.retire_queued.fetch_add(1, Ordering::Relaxed);
+        self.stats.0.retire_queued.fetch_add(1, Ordering::Relaxed);
         lock(&self.retire).push_back(Retire {
             pos,
             run: Box::new(run),
@@ -476,13 +497,14 @@ impl CmdQueue {
     /// which error survives when several arrive before the producer reports
     /// them (higher wins; equal keeps the first).
     pub fn stash_error(&self, hr: i32, priority: impl Fn(i32) -> u8) {
-        let mut cur = self.error.load(Ordering::Relaxed);
+        let mut cur = self.error.0.load(Ordering::Relaxed);
         loop {
             if cur != 0 && priority(cur) >= priority(hr) {
                 return;
             }
             match self
                 .error
+                .0
                 .compare_exchange(cur, hr, Ordering::AcqRel, Ordering::Relaxed)
             {
                 Ok(_) => return,
@@ -493,10 +515,10 @@ impl CmdQueue {
 
     /// Take the stashed error, if any (one relaxed load when there is none).
     pub fn take_error(&self) -> Option<i32> {
-        if self.error.load(Ordering::Relaxed) == 0 {
+        if self.error.0.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        match self.error.swap(0, Ordering::AcqRel) {
+        match self.error.0.swap(0, Ordering::AcqRel) {
             0 => None,
             hr => Some(hr),
         }
@@ -508,11 +530,11 @@ impl CmdQueue {
         if self.is_abandoned() {
             // Process teardown: the worker is gone or about to be; joining or
             // replaying DXVK work now would only hang.
-            self.stop.store(true, Ordering::Release);
+            self.hot.stop.store(true, Ordering::Release);
             return;
         }
         self.drain();
-        self.stop.store(true, Ordering::Release);
+        self.hot.stop.store(true, Ordering::Release);
         self.kick();
         if let Some(t) = self.worker_thread.get() {
             t.unpark();
@@ -535,7 +557,7 @@ impl CmdQueue {
 
     /// One bounded line of counters.
     pub fn summary(&self) -> String {
-        let s = &self.stats;
+        let s = &self.stats.0;
         let r = |a: &AtomicU64| a.load(Ordering::Relaxed);
         format!(
             "records={} bytes={} drains={} waits={} wait_us={} wait_max_us={} full_waits={} \
@@ -557,13 +579,13 @@ impl CmdQueue {
     /// Run the next record, if any. Consumer side only.
     unsafe fn run_one(&self) -> bool {
         let r = self.read.0.load(Ordering::Relaxed);
-        let w = self.write.0.load(Ordering::Acquire);
+        let w = self.prod.write.load(Ordering::Acquire);
         if r == w {
             return false;
         }
-        let mask = self.cap - 1;
+        let mask = self.hot.cap - 1;
         let pos = (r as usize) & mask;
-        let tail = self.cap - pos;
+        let tail = self.hot.cap - pos;
         if tail < HEADER_BYTES {
             self.read.0.store(r + tail as u64, Ordering::Release);
             return true;
@@ -571,7 +593,7 @@ impl CmdQueue {
         // SAFETY: [r, w) holds published records; the header at `pos` was
         // written before `write` was released.
         unsafe {
-            let p = self.buf.add(pos);
+            let p = self.hot.buf.add(pos);
             let h = core::ptr::read(p as *const Header);
             if let Some(call) = h.call {
                 call(p.add(HEADER_BYTES), p.add(h.extra_off as usize), h.extra_len as usize);
@@ -585,7 +607,7 @@ impl CmdQueue {
     /// run destructions the worker has passed.
     fn after_batch(&self) {
         fence(Ordering::SeqCst);
-        if self.waiters.load(Ordering::Relaxed) != 0 {
+        if self.waiters.0.load(Ordering::Relaxed) != 0 {
             let _g = lock(&self.wait_lock);
             self.wait_cv.notify_all();
         }
@@ -593,7 +615,7 @@ impl CmdQueue {
     }
 
     fn ring_empty(&self) -> bool {
-        self.read.0.load(Ordering::Relaxed) == self.write.0.load(Ordering::Acquire)
+        self.read.0.load(Ordering::Relaxed) == self.prod.write.load(Ordering::Acquire)
     }
 
     fn worker_main(self: Arc<Self>) {
@@ -605,35 +627,35 @@ impl CmdQueue {
             if unsafe { self.run_one() } {
                 since_check += 1;
                 if since_check >= BATCH {
-                    self.stats.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
+                    self.stats.0.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
                     since_check = 0;
                     self.after_batch();
                 }
                 idle_parks = 0;
                 continue;
             }
-            self.stats.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
+            self.stats.0.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
             since_check = 0;
             self.after_batch();
             let t0 = Instant::now();
-            while self.ring_empty() && t0.elapsed() < WORKER_SPIN && !self.stop.load(Ordering::Relaxed) {
+            while self.ring_empty() && t0.elapsed() < WORKER_SPIN && !self.hot.stop.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
             }
             if !self.ring_empty() {
                 continue;
             }
-            if self.stop.load(Ordering::Acquire) {
+            if self.hot.stop.load(Ordering::Acquire) {
                 break;
             }
             self.sleeping.0.store(true, Ordering::SeqCst);
-            if !self.ring_empty() || self.stop.load(Ordering::SeqCst) || self.retire_pending.load(Ordering::SeqCst) {
+            if !self.ring_empty() || self.hot.stop.load(Ordering::SeqCst) || self.retire_pending.load(Ordering::SeqCst) {
                 self.sleeping.0.store(false, Ordering::Relaxed);
                 if self.retire_pending.load(Ordering::Relaxed) {
                     self.run_retired(false);
                 }
                 continue;
             }
-            self.stats.parks.fetch_add(1, Ordering::Relaxed);
+            self.stats.0.parks.fetch_add(1, Ordering::Relaxed);
             std::thread::park_timeout(match idle_parks {
                 0 => PARK_SHORT,
                 n if n < PARKS_BEFORE_LONG => PARK_MID,
@@ -661,7 +683,7 @@ impl Drop for CmdQueue {
         while unsafe { self.run_one() } {}
         self.run_retired(true);
         // SAFETY: allocated in `new` with the same layout.
-        unsafe { dealloc(self.buf, Layout::from_size_align(self.cap, 64).expect("ring layout")) };
+        unsafe { dealloc(self.hot.buf, Layout::from_size_align(self.hot.cap, 64).expect("ring layout")) };
     }
 }
 
