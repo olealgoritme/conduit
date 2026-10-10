@@ -62,7 +62,7 @@ conduit/
     ├── abi.yml        weekly: new NVIDIA driver release → regenerate ABI
     │                  tables → open a PR
     ├── release.yml    tag → build every package below and attach to the release
-    └── windows.yml    manual only: build the Windows guest stack (artifacts)
+    └── windows.yml    Windows guest stack; on v* tags attaches the driver zip to the release
 ```
 
 ## Release artifacts (built by release.yml on every tag)

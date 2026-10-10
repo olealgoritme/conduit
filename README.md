@@ -67,7 +67,7 @@ from GPU memory to your screen: no copying, no video compression.
    conduit view win11                                 # the window
    ```
 4. **Install the guest driver.** Download `conduit-windows-gpu-driver-<version>.zip`
-   from the same release into the VM, unzip it, and from an **Administrator**
+   (attached to every release; `<version>` is the driver's version) into the VM, unzip it, and from an **Administrator**
    prompt in that folder run `powershell -ExecutionPolicy Bypass -File .\install.ps1`
    (Windows blocks downloaded scripts otherwise; the script itself turns on
    test-signing and trusts the driver's test certificate). The first run asks you
