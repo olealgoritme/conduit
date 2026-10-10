@@ -870,9 +870,26 @@ pub struct Surface {
     pub class: SurfaceClass,
     /// The allocation's D3DDDIFORMAT (0 unknown): picks the byte order of a copy ([`order_of`]).
     pub format: u32,
-    /// Census only: `standard allocation type << 4 | GDI surface type` (each 4 bits) `| RM-backed
-    /// << 8` (a KMD standard buffer whose memory is RM system memory, `ce_sysmem`'s object path).
+    /// `standard allocation type << 4 | GDI surface type` (each 4 bits) `| RM-backed << 8` (a KMD
+    /// standard buffer whose memory is RM system memory, `ce_sysmem`'s object path): the census,
+    /// and which surfaces a command's pitch applies to ([`cmd_pitch_applies`]).
     pub kind_bits: u32,
+}
+
+/// Whether a command's `SrcPitch` / `DstPitch` locates the rectangles of a surface of these
+/// [`Surface::kind_bits`]: only a `STAGING_CPUVISIBLE` or `EXISTINGSYSMEM` GDI surface (Learn
+/// `DXGK_GDIARG_BITBLT` remarks: "Pitch should be ignored for other allocation types"). Every
+/// other surface is addressed with its allocation's pitch.
+pub const fn cmd_pitch_applies(kind_bits: u32) -> bool {
+    use crate::rm_standard::{GDI_EXISTINGSYSMEM, GDI_STAGING_CPUVISIBLE, STD_GDISURFACE};
+    (kind_bits >> 4) & 0xf == STD_GDISURFACE
+        && matches!(kind_bits & 0xf, GDI_STAGING_CPUVISIBLE | GDI_EXISTINGSYSMEM)
+}
+
+/// Whether [`Surface::kind_bits`] name CDD's ClearType gamma table (`LOOKUPTABLE`).
+pub const fn is_lookup_table(kind_bits: u32) -> bool {
+    use crate::rm_standard::{GDI_LOOKUPTABLE, STD_GDISURFACE};
+    (kind_bits >> 4) & 0xf == STD_GDISURFACE && kind_bits & 0xf == GDI_LOOKUPTABLE
 }
 
 /// The byte order of a 32 bpp GDI surface format: `Some(false)` B G R A|X (`A8R8G8B8` 21,
@@ -1811,6 +1828,17 @@ pub const COUNTERS: &[&str] = &[
     "GdiDropDWH",
     "GdiDropO",
     "GdiDropR",
+    // Commands into the ClearType gamma table (LOOKUPTABLE): seen | executed << 16, the last one's
+    // surface kinds, formats, command pitches, first sub-rectangle and source extent; command
+    // pitches ignored (not a STAGING_CPUVISIBLE / EXISTINGSYSMEM surface) and the last one.
+    "GdiLutN",
+    "GdiLutT",
+    "GdiLutF",
+    "GdiLutC",
+    "GdiLutR",
+    "GdiLutSWH",
+    "GdiPitchIgn",
+    "GdiPitchIgnV",
     // Copies and fills with a staging buffer on one side run on the copy engine over the buffer's
     // system pages; refused (the CPU instead); failed after the mapping (the CPU instead).
     "GdiSysCe",
@@ -2577,6 +2605,22 @@ mod tests {
         ] {
             assert_eq!(fill_pixel(r, 0x5A, p, d), f, "{r}");
         }
+    }
+
+    #[test]
+    fn command_pitches_apply_to_cpu_visible_staging_and_existing_sysmem_only() {
+        use crate::rm_standard::STD_GDISURFACE;
+        let k = |gdi: u32| STD_GDISURFACE << 4 | gdi;
+        assert!(cmd_pitch_applies(k(2)));
+        assert!(cmd_pitch_applies(k(5)));
+        assert!(cmd_pitch_applies(k(2) | 0x100));
+        for g in [0, 1, 3, 4, 6, 7, 8] {
+            assert!(!cmd_pitch_applies(k(g)), "gdi {g}");
+        }
+        // A shadow surface (standard type 2) is not a GDI surface whatever the low nibble.
+        assert!(!cmd_pitch_applies(2 << 4 | 2));
+        assert!(is_lookup_table(k(4)));
+        assert!(!is_lookup_table(k(2)) && !is_lookup_table(3 << 4 | 4));
     }
 
     #[test]
