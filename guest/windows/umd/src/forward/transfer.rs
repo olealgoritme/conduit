@@ -622,50 +622,32 @@ pub(crate) fn keyed_flush_wait_forced() -> bool {
     })
 }
 
-/// Wait on the CPU until every command `dev` submitted so far has completed on the GPU: an event
-/// query issued now signals when all earlier work is done (DXVK tracks it with the submission's
-/// fence; on NVK an RM semaphore). `None` when no query could be made. `what` names the caller in
-/// the log.
+/// Wait on the CPU until every command `dev` submitted so far has completed on the GPU. The
+/// immediate context flushes what is recorded and names the newest submission
+/// (`flush_present_copy`); the wait then sleeps on DXVK's submission-fence condition variable,
+/// which the queue's completion thread wakes (`wait_present_copy`), bounded at 5 s. No polling:
+/// the thread is off the CPU until the GPU is done. `None` when the device has no context or the
+/// wait failed (device lost). `what` names the caller in the log.
 pub(crate) unsafe fn wait_submitted(
     dev: &crate::device_funcs::HeliosDevice,
-    context: &ID3D11DeviceContext,
+    _context: &ID3D11DeviceContext,
     what: &str,
 ) -> Option<std::time::Instant> {
-    let device = dev.dxvk.d3d11_device()?;
-    let desc = windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC {
-        Query: windows::Win32::Graphics::Direct3D11::D3D11_QUERY_EVENT,
-        MiscFlags: 0,
-    };
-    let mut query = None;
-    if device.CreateQuery(&desc, Some(&mut query)).is_err() {
-        return None;
-    }
-    let query = query?;
-    context.End(&query);
+    const TIMEOUT_US: u32 = 5_000_000;
     let start = std::time::Instant::now();
-    let mut done: windows::Win32::Foundation::BOOL = Default::default();
-    loop {
-        // Raw HRESULT: S_FALSE (not yet) must not read as success. Flags 0
-        // flushes, so the query itself is submitted.
-        let hr = (Interface::vtable(context).GetData)(
-            Interface::as_raw(context),
-            Interface::as_raw(&query),
-            (&mut done as *mut windows::Win32::Foundation::BOOL).cast(),
-            core::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32,
-            0,
-        );
-        if hr.0 == 0 && done.as_bool() {
-            break;
+    let submission = dev.dxvk.flush_present_copy();
+    if submission == 0 {
+        // Nothing was ever submitted (nothing to wait for), or no context / a failed device
+        // (nothing that could still complete).
+        return Some(start);
+    }
+    match dev.dxvk.wait_present_copy(submission, TIMEOUT_US) {
+        0 => {}
+        1 => log_error!("DDI NVK {what}: GPU not done after 5 s, going on"),
+        r => {
+            log_error!("DDI NVK {what}: submission wait failed ({r})");
+            return None;
         }
-        if hr.0 < 0 {
-            log_error!("DDI NVK {what}: GetData 0x{:08x}", hr.0 as u32);
-            break;
-        }
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            log_error!("DDI NVK {what}: GPU not done after 5 s, going on");
-            break;
-        }
-        std::thread::yield_now();
     }
     Some(start)
 }
