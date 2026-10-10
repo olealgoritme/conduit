@@ -15,10 +15,15 @@ Two sources, two kinds of table (see host/backend/gen/README.md):
       -> devinfo_extract.py --lang c -> guest/linux/devinfo/vX.h
       -> nvgpu_gen.py (newest release only) -> guest/linux/gen/
 
-New modules are added to each table's mod.rs as `pub mod vX;`. Anything a
+Each new release is registered in its table's mod.rs twice: a `pub mod vX;`
+line and an entry in `PROFILES` (what `select` and `supported_versions` read,
+so what makes the release supported), both in ascending order. Anything a
 generator refuses (an unclassified entry) is left out and listed in the
 report, so a person reads it: the PR is a starting point, not a merge-blind
 update.
+
+The CLI's built-in release list (cli/src/host.rs) is rewritten from
+packaging/supported-drivers.sh after the tables are in.
 """
 
 from __future__ import annotations
@@ -108,7 +113,16 @@ def run_to_file(cmd: list[str], dst: Path, cwd: Path) -> str | None:
 
 
 def register(mod_rs: Path, new: Version) -> None:
-    """Add `pub mod vX;` to mod.rs, keeping the version modules sorted."""
+    """Register release `new` in a table's mod.rs: `pub mod` and PROFILES."""
+    add_mod(mod_rs, new)
+    add_profile(mod_rs, new)
+    text = mod_rs.read_text()
+    if len(re.findall(rf"\b{stem(new)}\b", text)) < 2:
+        raise RuntimeError(f"{mod_rs}: {stem(new)} not registered")
+
+
+def add_mod(mod_rs: Path, new: Version) -> None:
+    """Add `pub mod vX;` to mod.rs, in the order `cargo fmt` keeps."""
     text = mod_rs.read_text()
     lines = text.splitlines(keepends=True)
     pat = re.compile(r"^pub mod v(\d+)_(\d+)_(\d+);\s*$")
@@ -120,7 +134,9 @@ def register(mod_rs: Path, new: Version) -> None:
         mod_rs.write_text(entry + text)
         return
     block = [lines[i] for i in idx] + [entry]
-    block.sort(key=lambda l: tuple(int(x) for x in pat.match(l).groups()))
+    # Plain text order, which is the order `cargo fmt` keeps module lines in
+    # (v595_104_02 before v595_71_05); PROFILES is the numeric one.
+    block.sort()
     first, last = idx[0], idx[-1]
     # Only rewrite a contiguous block; otherwise insert after the last one.
     if last - first + 1 == len(idx):
@@ -128,6 +144,59 @@ def register(mod_rs: Path, new: Version) -> None:
     else:
         lines.insert(last + 1, entry)
     mod_rs.write_text("".join(lines))
+
+
+def add_profile(mod_rs: Path, new: Version) -> None:
+    """Add the release's entry to `static PROFILES: ... = &[ ... ];`.
+
+    The tables use one of two shapes, an entry per line
+    (`(DriverVersion::new(a, b, c), &vA_B_C::NAME),`) or a `Profile { .. },`
+    block. The newest existing entry is the template: its version and module
+    name are swapped for the new release's, and the result goes in ascending
+    position. Every generator names its constants the same way for every
+    release, so the template's field names hold.
+    """
+    text = mod_rs.read_text()
+    m = re.search(r"static PROFILES\b[^=]*=\s*&\[\n(.*?)\n\];", text, re.S)
+    if not m:
+        raise RuntimeError(f"{mod_rs}: no PROFILES list")
+    body = m[1]
+    # Split into entries: a line at 4-space indent starts one.
+    entries = re.split(r"\n(?=    [^\s}])", body)
+    stem_re = re.compile(r"\bv(\d+)_(\d+)_(\d+)\b")
+
+    def key(e: str) -> Version:
+        a = stem_re.search(e)
+        return (int(a[1]), int(a[2]), int(a[3]))
+
+    if any(key(e) == new for e in entries):
+        return
+    last = max(entries, key=key)
+    old = key(last)
+    fresh = last.replace(stem(old), stem(new)).replace(
+        f"DriverVersion::new({old[0]}, {old[1]}, {old[2]})",
+        f"DriverVersion::new({new[0]}, {new[1]}, {new[2]})")
+    entries.append(fresh)
+    entries.sort(key=key)
+    mod_rs.write_text(text[:m.start(1)] + "\n".join(entries) + text[m.end(1):])
+
+
+def sync_builtin() -> None:
+    """Rewrite the CLI's built-in release list from supported-drivers.sh.
+
+    cli/src/host.rs keeps a copy for installs without the generated list; a
+    test compares it with the script, so it moves with the tables.
+    """
+    out = subprocess.run(["sh", str(ROOT / "packaging/supported-drivers.sh")],
+                         check=True, capture_output=True, text=True).stdout.split()
+    host_rs = ROOT / "cli/src/host.rs"
+    text = host_rs.read_text()
+    body = "".join(f'    "{v}",\n' for v in out)
+    new, n = re.subn(r"(const BUILT_IN: &\[&str\] = &\[\n).*?(\];)",
+                     lambda m: m[1] + body + m[2], text, flags=re.S)
+    if n != 1:
+        raise RuntimeError(f"{host_rs}: no BUILT_IN list")
+    host_rs.write_text(new)
 
 
 def main() -> int:
@@ -206,6 +275,9 @@ def main() -> int:
                     problems.append(f"`nvgpu_gen.py` {dotted(v)}:\n```\n{r.stderr[-2000:]}\n```")
                 else:
                     added.append(f"guest gen/ regenerated from {dotted(v)}")
+
+    if added:
+        sync_builtin()
 
     lines = ["## NVIDIA ABI update", "", *[f"- {r}" for r in report], ""]
     if added:
