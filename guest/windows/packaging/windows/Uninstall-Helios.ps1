@@ -22,6 +22,7 @@ if (Test-Path -LiteralPath $resolveCompatibilityState -PathType Leaf) {
 Unregister-ScheduledTask -TaskName "HeliosGraphicsProvisioning" -Confirm:$false -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName "HeliosDisplayTopology" -Confirm:$false -ErrorAction SilentlyContinue
 Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "ConduitGpuTray" -Confirm:$false -ErrorAction SilentlyContinue
 Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
 Remove-Item -LiteralPath (Join-Path $env:ProgramFiles "Conduit") -Recurse -Force -ErrorAction SilentlyContinue
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {

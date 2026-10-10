@@ -82,9 +82,12 @@ fn waiting(g: &Gfx, why: Wait) {
     );
     // A quiet ring with a green arc of dots.
     let (cx, cy) = (WIDTH / 2.0, 108.0);
+    let head = (unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() } / 75
+        % 12) as usize;
     for i in 0..12 {
         let t = i as f32 / 12.0 * std::f32::consts::TAU;
-        let alpha = 40 + (i * 18) as u8;
+        let behind = (head + 12 - i) % 12;
+        let alpha = 230u8.saturating_sub((behind * 17) as u8);
         g.fill_circle(
             argb(alpha.min(230), GREEN),
             cx + 20.0 * t.cos(),
@@ -104,7 +107,7 @@ fn waiting(g: &Gfx, why: Wait) {
     let sub = match why {
         Wait::NoChannel => "The feed starts with the VM. Restart it once after `conduit attach`.",
         Wait::Denied => {
-            "Windows denied access to the stats channel. Run the app as administrator once."
+            "Windows denied access to the stats channel. Starting with administrator rights\u{2026}"
         }
         Wait::Quiet => {
             "The host stopped sending readings. It resumes when the VM's helper is back."

@@ -26,6 +26,8 @@ const WM_DATA: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const WM_SHOW: u32 = WM_APP + 3;
 const TIMER: usize = 1;
+/// Repaints the open popup for the waiting animation.
+const ANIM: usize = 2;
 const TRAY_ID: u32 = 1;
 
 const ID_SHOW: usize = 1;
@@ -43,6 +45,8 @@ static MODEL: OnceLock<Mutex<Model>> = OnceLock::new();
 static CHANNEL_STATE: AtomicU8 = AtomicU8::new(CH_WAITING);
 static METRIC_LOAD: AtomicU8 = AtomicU8::new(0);
 static ICON: AtomicIsize = AtomicIsize::new(0);
+/// The app's window, for threads that need to end it.
+static MAIN: AtomicIsize = AtomicIsize::new(0);
 static LAST_FACE: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_HIDE: AtomicU64 = AtomicU64::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -107,6 +111,16 @@ fn reader(hwnd: usize) {
         };
         if h == INVALID_HANDLE_VALUE {
             let denied = unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+            if denied && !sys::elevated() && sys::relaunch_elevated(&exe_path()) {
+                // The elevated copy takes over (the port is admin-only).
+                let h = MAIN.load(Relaxed);
+                if h != 0 {
+                    unsafe { DestroyWindow(h as HWND) };
+                    unsafe { PostMessageW(h as HWND, WM_QUIT, 0, 0) };
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                std::process::exit(0);
+            }
             CHANNEL_STATE.store(if denied { CH_DENIED } else { CH_WAITING }, Relaxed);
             std::thread::sleep(Duration::from_secs(2));
             continue;
@@ -492,6 +506,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_TIMER if wp == ANIM => {
+            if IsWindowVisible(hwnd) != 0 && CHANNEL_STATE.load(Relaxed) != CH_OPEN {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_TIMER => {
             // Catches a feed that went quiet, and keeps the open popup honest.
             refresh_tray(hwnd, false);
@@ -544,7 +564,19 @@ pub fn run() {
     unsafe {
         // One instance per session: a second launch asks the first to show itself.
         let name = wide(MUTEX);
-        let mutex = CreateMutexW(null(), 0, name.as_ptr());
+        let mut mutex = CreateMutexW(null(), 0, name.as_ptr());
+        // An elevated copy started by a hand-off waits for the other to exit.
+        let mut tries = 0;
+        while !mutex.is_null()
+            && GetLastError() == ERROR_ALREADY_EXISTS
+            && sys::elevated()
+            && tries < 25
+        {
+            CloseHandle(mutex);
+            std::thread::sleep(Duration::from_millis(200));
+            mutex = CreateMutexW(null(), 0, name.as_ptr());
+            tries += 1;
+        }
         if !mutex.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
             let cls = wide(CLASS);
             let other = FindWindowW(cls.as_ptr(), null());
@@ -591,7 +623,9 @@ pub fn run() {
             return;
         }
         refresh_tray(hwnd, true);
+        MAIN.store(hwnd as isize, Relaxed);
         SetTimer(hwnd, TIMER, 1000, None);
+        SetTimer(hwnd, ANIM, 70, None);
         let h = hwnd as usize;
         std::thread::spawn(move || reader(h));
 

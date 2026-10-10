@@ -524,7 +524,8 @@ foreach ($extra in @("licenses", "compatibility")) {
     }
 }
 # The Conduit GPU tray app (host GPU stats in the notification area), when the
-# package carries it. It starts at each logon through the machine-wide Run key.
+# package carries it. A logon task starts it for every user with administrator
+# rights (the VirtIO serial port it reads is admin-only) and no UAC prompt.
 $trayPayload = Join-Path $payloadRoot "tray\conduit-gpu-tray.exe"
 if (Test-Path -LiteralPath $trayPayload -PathType Leaf) {
     try {
@@ -533,8 +534,13 @@ if (Test-Path -LiteralPath $trayPayload -PathType Leaf) {
         Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
         New-Item -ItemType Directory -Force -Path $trayDir | Out-Null
         Copy-Item -LiteralPath $trayPayload -Destination $trayExe -Force
-        New-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" `
-            -Value ('"' + $trayExe + '"') -PropertyType String -Force | Out-Null
+        Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute $trayExe
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName "ConduitGpuTray" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName "ConduitGpuTray" -ErrorAction SilentlyContinue
         Write-Host "Installed the Conduit GPU tray app at $trayExe (starts at logon)."
     } catch {
         Write-Warning "The Conduit GPU tray app was not installed: $($_.Exception.Message)"

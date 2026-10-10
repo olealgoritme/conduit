@@ -5,10 +5,7 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Registry::*;
 
-const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 const SETTINGS: &str = r"Software\Conduit\GpuTray";
-pub const VALUE: &str = "ConduitGpuTray";
 
 fn open(root: HKEY, sub: &str, write: bool) -> Option<HKEY> {
     let mut k: HKEY = null_mut();
@@ -73,37 +70,88 @@ fn set(root: HKEY, sub: &str, name: &str, kind: u32, data: &[u8]) -> bool {
     ok
 }
 
-fn bytes_of(s: &str) -> Vec<u8> {
-    wide(s).iter().flat_map(|c| c.to_le_bytes()).collect()
+/// The logon task the installer registers: it starts the app with
+/// administrator rights (the VirtIO serial port is admin-only) and no UAC
+/// prompt, for every user who logs on.
+pub const TASK: &str = "ConduitGpuTray";
+
+fn quiet(cmd: &str, args: &[&str]) -> Option<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new(cmd)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
 }
 
-/// Starts with Windows: a Run entry (this user's or the machine's, which the
-/// installer writes) that Explorer's StartupApproved switch has not turned off.
+fn task_status() -> Option<String> {
+    let o = quiet("schtasks", &["/query", "/tn", TASK, "/fo", "csv", "/nh"])?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Starts with Windows: the logon task exists and is not disabled.
 pub fn autostart_enabled() -> bool {
-    let run = get(HKEY_CURRENT_USER, RUN, VALUE).is_some()
-        || get(HKEY_LOCAL_MACHINE, RUN, VALUE).is_some();
-    let off = get(HKEY_CURRENT_USER, APPROVED, VALUE)
-        .is_some_and(|d| d.first().is_some_and(|b| b & 1 == 1));
-    run && !off
+    task_status().is_some_and(|s| !s.contains("Disabled"))
+}
+
+/// Registers the elevated logon task for `exe` (needs administrator rights).
+pub fn register_task(exe: &str) -> bool {
+    let ps = format!(
+        "$a = New-ScheduledTaskAction -Execute '{exe}'; \
+         $t = New-ScheduledTaskTrigger -AtLogOn; \
+         $p = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\\Users' -RunLevel Highest; \
+         $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew; \
+         Register-ScheduledTask -TaskName '{TASK}' -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null"
+    );
+    quiet(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", &ps],
+    )
+    .is_some_and(|o| o.status.success())
 }
 
 pub fn set_autostart(on: bool, exe: &str) {
-    if on {
-        let has_run = get(HKEY_LOCAL_MACHINE, RUN, VALUE).is_some();
-        if !has_run {
-            set(
-                HKEY_CURRENT_USER,
-                RUN,
-                VALUE,
-                REG_SZ,
-                &bytes_of(&format!("\"{exe}\"")),
-            );
+    if task_status().is_none() {
+        if on {
+            register_task(exe);
         }
+        return;
     }
-    // 02 = enabled, 03 = disabled, then 8 bytes of the disable time (unused).
-    let mut flag = [0u8; 12];
-    flag[0] = if on { 2 } else { 3 };
-    set(HKEY_CURRENT_USER, APPROVED, VALUE, REG_BINARY, &flag);
+    let flag = if on { "/enable" } else { "/disable" };
+    quiet("schtasks", &["/change", "/tn", TASK, flag]);
+}
+
+/// Is this process elevated (an administrator token)?
+pub fn elevated() -> bool {
+    unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+}
+
+/// Starts an elevated copy: through the logon task when it exists (no
+/// prompt), else with one UAC prompt. True when a copy was started.
+pub fn relaunch_elevated(exe: &str) -> bool {
+    if task_status().is_some()
+        && quiet("schtasks", &["/run", "/tn", TASK]).is_some_and(|o| o.status.success())
+    {
+        return true;
+    }
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let verb = wide("runas");
+    let file = wide(exe);
+    let r = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    r as isize > 32
 }
 
 pub fn read_setting(name: &str) -> Option<u32> {
@@ -166,7 +214,13 @@ pub fn promote_tray_icon(exe: &str) -> bool {
         let path = String::from_utf16_lossy(&w)
             .trim_end_matches('\0')
             .to_ascii_lowercase();
-        if path != want {
+        // Explorer writes known folders as their GUID ("{6D80…}\\Conduit\\x.exe"
+        // for Program Files): compare what follows it.
+        let same = match path.strip_prefix('{').and_then(|r| r.split_once('}')) {
+            Some((_, rest)) => want.ends_with(rest),
+            None => path == want,
+        };
+        if !same {
             continue;
         }
         if get(HKEY_CURRENT_USER, &sub, "IsPromoted").is_none() {
