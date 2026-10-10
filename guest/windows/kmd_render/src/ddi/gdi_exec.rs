@@ -9,9 +9,10 @@
 //! 2. `DxgkDdiSubmitCommand` (DISPATCH) reads the id and [`admit`]s it: the first submission gives
 //!    it the next sequence of the [`Timeline`] and wakes the worker; a preempted replay gets the
 //!    same sequence; an id no longer in the table (already executed) gets no wait. A submission
-//!    without the record (RenderGdi's `SubmitCommandVirtual`) admits every unclaimed job of its
-//!    context and waits for the context's newest unfinished job ([`admit_unclaimed`]), which also
-//!    keeps a preempted buffer's resubmission waiting for its job. The WDDM fence
+//!    without the record (RenderGdi's `SubmitCommandVirtual`) admits the job RenderGdi rendered
+//!    into the submitted DMA buffer, found by the buffer's GPU VA, and waits for the context's
+//!    newest unfinished job ([`admit_unclaimed`]), which also keeps a preempted buffer's
+//!    resubmission waiting for its job. The WDDM fence
 //!    of that submission is gated on `completed >= seq` (`WddmPending::gdi_seq`, `virtio/gpu`),
 //!    which [`seq_ready`] answers with one atomic load.
 //! 3. The HPD worker ([`service`], PASSIVE) executes admitted jobs in sequence order: copies and
@@ -261,6 +262,9 @@ struct Job {
     id: u64,
     /// The `hContext` RenderKm/RenderGdi ran on (SubmitCommand's by-context claim).
     ctx: usize,
+    /// The DMA buffer's GPU VA RenderGdi wrote this job's marker into (0 from RenderKm): how a
+    /// record-less submission finds its own job (`gdi_accel::recordless_admit`).
+    dma_va: u64,
     /// `None` until SubmitCommand admits it.
     seq: Option<u64>,
     /// Taken by the worker while it executes (the entry stays, so a replay still waits).
@@ -598,6 +602,9 @@ pub(crate) fn publish_counters() {
     w(b"GdiClmMul", CLAIM_MULTI.load(Ordering::Relaxed));
     w(b"GdiClmMax", CLAIM_MAX.load(Ordering::Relaxed));
     w(b"GdiReGate", REGATE.load(Ordering::Relaxed));
+    w(b"GdiVaHit", VA_HIT.load(Ordering::Relaxed));
+    w(b"GdiVaNone", VA_NONE.load(Ordering::Relaxed));
+    w(b"GdiVaOrph", VA_ORPH.load(Ordering::Relaxed));
     w(b"GdiFreeWait", FREE_WAIT.load(Ordering::Relaxed));
     w(b"GdiFreeTo", FREE_TO.load(Ordering::Relaxed));
     w(b"GdiFreeUns", FREE_UNS.load(Ordering::Relaxed));
@@ -676,8 +683,8 @@ pub(crate) fn seq_ready(seq: u64) -> bool {
 
 /// Insert a job (RenderKm, PASSIVE). Returns its id, or 0 when it could not be stored (the
 /// buffer then carries no job and its fence does not wait: its commands are dropped, counted).
-pub(crate) fn commit(ops: Vec<Op>, ctx: usize) -> u64 {
-    let mut job = Job { id: 0, ctx, seq: None, ops, running: false };
+pub(crate) fn commit(ops: Vec<Op>, ctx: usize, dma_va: u64) -> u64 {
+    let mut job = Job { id: 0, ctx, dma_va, seq: None, ops, running: false };
     let mut orphans: Vec<Job> = Vec::new();
     let id = {
         let mut t = TABLE.lock();
@@ -752,51 +759,105 @@ static CLAIM_MAX: AtomicU32 = AtomicU32::new(0);
 /// the context's outstanding jobs (`GdiReGate`): resubmissions after a preemption, or a buffer
 /// whose job an earlier submission admitted.
 static REGATE: AtomicU32 = AtomicU32::new(0);
+/// Record-less submissions that found their buffer's job by its DMA VA (`GdiVaHit`), ones that
+/// found none once the pairing held (`GdiVaNone`: replays, buffers without a job), and earlier
+/// renders of a submitted buffer dropped as never submitted (`GdiVaOrph`).
+static VA_HIT: AtomicU32 = AtomicU32::new(0);
+static VA_NONE: AtomicU32 = AtomicU32::new(0);
+static VA_ORPH: AtomicU32 = AtomicU32::new(0);
+/// Some record-less submission on this boot found its job by the DMA VA RenderGdi recorded, i.e.
+/// RenderGdi's `DmaBufferGpuVirtualAddress` and SubmitCommandVirtual's `DmaBufferVirtualAddress`
+/// agree here. Until then the record-less rule stays "every unclaimed job of the context".
+static VA_PAIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH): admit EVERY unclaimed
-/// job of the context, oldest first, and gate this submission's fence on the newest outstanding
-/// job of the context (`gdi_accel::context_gate`): the last one admitted here, or, when nothing
-/// was unclaimed, the jobs earlier submissions admitted that the executor has not finished.
+/// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH), for the DMA buffer at
+/// GPU VA `va` of `size` bytes (0: not known): admit the job RenderGdi rendered into that buffer
+/// (`gdi_accel::recordless_admit`), and gate this submission's fence on the newest outstanding job
+/// of the context (`gdi_accel::context_gate`): the one admitted here, or, when the buffer's job
+/// was admitted already, the jobs earlier submissions admitted that the executor has not finished.
 ///
 /// The second case is a preempted buffer coming back: `DxgkDdiPreemptCommand` drops the pending
-/// fence and dxgkrnl resubmits the same DMA buffer under a new fence id, with no record to name
-/// its job. Gated on nothing, the replay's fence retired before the executor ran the job (CDD read
-/// stale readback pixels and reused staging buffers the job still read: half-drawn rows).
+/// fence and dxgkrnl resubmits the same DMA buffer under a new fence id. Its job was admitted by
+/// the first submission; gated on nothing, the replay's fence retired before the executor ran the
+/// job (CDD read stale readback pixels and reused staging buffers the job still read: half-drawn
+/// rows). The WDDM fence FIFO is head-of-line and the context in-order, so waiting for every
+/// outstanding job of the context covers the replay's own.
 ///
-/// dxgkrnl submits a context's DMA buffers in the order it rendered them, and every job of the
-/// context was rendered before this submission, so this buffer's job is among the unclaimed ones
-/// or was admitted by an earlier submission, whose fence retires before this one (the WDDM fence
-/// FIFO is head-of-line). Claiming only the oldest went wrong whenever a rendered job had no
-/// submission of its own (a rendered buffer dxgkrnl did not submit, a submission that is no
-/// RenderGdi buffer): from then on each buffer's fence was gated on the job BEFORE its own, and its
-/// own job was admitted only by the next submission. Its fence retired with its commands still
-/// unexecuted, CDD destroyed the source of the copy (the staging buffer of the ClearType gamma
-/// table's one initialising BitBlt), and the job then read a freed allocation (`GdiLutAp` 0x0D:
-/// created, registered, forgotten). Returns the gate (`None`: nothing of the context outstanding)
-/// and whether any job was admitted here.
-pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize) -> (Option<u64>, bool) {
-    let (gate, n) = {
+/// Rendering runs ahead of submission, so the table can hold jobs of buffers dxgkrnl has not
+/// submitted yet. They stay unclaimed until their own submission: admitted here they ran before
+/// dxgkrnl had done the waits it does ahead of their buffer, and this buffer's fence waited for
+/// work that was not its own. Claiming only the oldest unclaimed job went wrong the other way
+/// whenever a rendered buffer was never submitted (each later fence was gated on the job before
+/// its own; CDD destroyed a copy's source while the job still had to read it, `GdiLutAp` 0x0D).
+/// Until a submission has matched a job by its VA on this boot (`VA_PAIRED`), and for a
+/// submission without a VA, every unclaimed job of the context is admitted as before.
+///
+/// Returns the gate (`None`: nothing of the context outstanding) and whether a job was admitted.
+pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize, va: u64, size: u64) -> (Option<u64>, bool) {
+    let mut orphans = 0u32;
+    let (gate, n, exact) = {
         let mut t = TABLE.lock();
         let mut n = 0u32;
-        loop {
-            let Some(i) = t
-                .jobs
-                .iter()
-                .enumerate()
-                .filter(|(_, j)| j.ctx == ctx && j.seq.is_none())
-                .min_by_key(|(_, j)| j.id)
-                .map(|(i, _)| i)
-            else {
-                break;
-            };
-            let seq = t.tl.next();
-            t.jobs[i].seq = Some(seq);
-            n += 1;
+        let pick = ga::recordless_admit(
+            t.jobs.iter().map(|j| ga::JobView { id: j.id, ctx: j.ctx, claimed: j.seq.is_some(), dma_va: j.dma_va }),
+            ctx,
+            va,
+            size,
+            VA_PAIRED.load(Ordering::Relaxed),
+        );
+        match pick {
+            ga::Recordless::Exact { id } => {
+                // Earlier renders of this buffer were never submitted: out of the table, so a
+                // later replay of the buffer cannot pick one up. Dropped under the lock (plain
+                // nonpaged pool memory, no PASSIVE-only destructor), like `commit`'s orphans.
+                let before = t.jobs.len();
+                t.jobs.retain(|j| {
+                    let view = ga::JobView { id: j.id, ctx: j.ctx, claimed: j.seq.is_some(), dma_va: j.dma_va };
+                    !ga::orphaned_by(&view, id, ctx, va, size)
+                });
+                orphans = (before - t.jobs.len()) as u32;
+                if let Some(i) = t.jobs.iter().position(|j| j.id == id) {
+                    let seq = t.tl.next();
+                    t.jobs[i].seq = Some(seq);
+                    n = 1;
+                }
+            }
+            ga::Recordless::Nothing => {}
+            ga::Recordless::AllUnclaimed => loop {
+                let Some(i) = t
+                    .jobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, j)| j.ctx == ctx && j.seq.is_none())
+                    .min_by_key(|(_, j)| j.id)
+                    .map(|(i, _)| i)
+                else {
+                    break;
+                };
+                let seq = t.tl.next();
+                t.jobs[i].seq = Some(seq);
+                n += 1;
+            },
         }
         // A job the executor is running stays in the table with its sequence until it completes.
         let completed = t.tl.completed;
-        (ga::context_gate(t.jobs.iter().filter(|j| j.ctx == ctx).map(|j| j.seq), completed), n)
+        let gate = ga::context_gate(t.jobs.iter().filter(|j| j.ctx == ctx).map(|j| j.seq), completed);
+        (gate, n, pick)
     };
+    match exact {
+        ga::Recordless::Exact { .. } => {
+            VA_PAIRED.store(true, Ordering::Relaxed);
+            VA_HIT.fetch_add(1, Ordering::Relaxed);
+        }
+        ga::Recordless::Nothing => {
+            VA_NONE.fetch_add(1, Ordering::Relaxed);
+        }
+        ga::Recordless::AllUnclaimed => {}
+    }
+    if orphans != 0 {
+        VA_ORPH.fetch_add(orphans, Ordering::Relaxed);
+        ORPH.fetch_add(orphans, Ordering::Relaxed);
+    }
     if n == 0 {
         if gate.is_some() {
             REGATE.fetch_add(1, Ordering::Relaxed);

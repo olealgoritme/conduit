@@ -1472,6 +1472,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
                 submit.pDmaBufferPrivateData,
                 submit.DmaBufferPrivateDataSize,
                 submit.DmaBufferUmdPrivateDataSize,
+                submit.DmaBufferVirtualAddress,
+                u64::from(submit.DmaBufferSize),
             )
         }
     } else {
@@ -1559,6 +1561,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                 submit.pDmaBufferPrivateData,
                 submit.DmaBufferPrivateDataSize,
                 0,
+                0,
+                0,
             )
         }
     } else {
@@ -1579,9 +1583,9 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
 
 /// `GdiAccel`: the job a RenderKm/RenderGdi buffer names in its private data
 /// (`gdi_accel::Private`, at the start of the KMD's half, or at 0), admitted to the executor;
-/// `Some(seq)` gates the fence. A submission on a GDI context without the record admits every
-/// unclaimed job of that context and waits for the context's outstanding jobs
-/// (`gdi_exec::admit_unclaimed`).
+/// `Some(seq)` gates the fence. A submission on a GDI context without the record admits the job
+/// rendered into its DMA buffer (`dma_va`/`dma_size`, SubmitCommandVirtual's; 0 on the
+/// non-virtual path) and waits for the context's outstanding jobs (`gdi_exec::admit_unclaimed`).
 ///
 /// # Safety
 /// `data` is dxgkrnl's private data of `size` bytes, the KMD's half starting at `umd`.
@@ -1591,6 +1595,8 @@ unsafe fn gdi_job_seq(
     data: *mut c_void,
     size: u32,
     umd: u32,
+    dma_va: u64,
+    dma_size: u64,
 ) -> Option<u64> {
     use helios_kmd_logic::gdi_accel::{Private, PRIVATE_BYTES};
     let gdi_ctx = crate::ddi::gdi_accel::is_gdi_context(h_context as usize);
@@ -1608,10 +1614,11 @@ unsafe fn gdi_job_seq(
     }
     let decoded = job.is_some();
     if !decoded && gdi_ctx {
-        // No record: every unclaimed job of the context, the fence gated on the newest job of the
-        // context the executor has not finished, a preempted buffer's resubmission included
+        // No record: the job rendered into this DMA buffer, the fence gated on the newest job of
+        // the context the executor has not finished, a preempted buffer's resubmission included
         // (`gdi_exec::admit_unclaimed`).
-        let (seq, admitted) = crate::ddi::gdi_exec::admit_unclaimed(adapter, h_context as usize);
+        let (seq, admitted) =
+            crate::ddi::gdi_exec::admit_unclaimed(adapter, h_context as usize, dma_va, dma_size);
         crate::ddi::gdi_accel::note_submit(size, umd, false, admitted);
         return seq;
     }

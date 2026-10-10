@@ -1671,6 +1671,90 @@ pub fn context_gate(seqs: impl IntoIterator<Item = Option<u64>>, completed: u64)
     seqs.into_iter().flatten().filter(|&s| s > completed).max()
 }
 
+/// One job of the table as a record-less submission sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobView {
+    /// Render order: ids grow with every commit.
+    pub id: u64,
+    /// The `hContext` RenderGdi/RenderKm ran on.
+    pub ctx: usize,
+    /// Admitted by an earlier submission.
+    pub claimed: bool,
+    /// The DMA buffer's GPU VA RenderGdi wrote the job's marker into
+    /// (`DXGKARG_RENDERGDI::DmaBufferGpuVirtualAddress`); 0 from RenderKm.
+    pub dma_va: u64,
+}
+
+/// What a record-less submission (`SubmitCommandVirtual` on a GDI context) admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recordless {
+    /// The job RenderGdi rendered into the submitted DMA buffer: the newest unclaimed job of the
+    /// context whose marker lies in the buffer. Unclaimed jobs of the context in the same buffer
+    /// rendered before it are dead: dxgkrnl re-rendered the buffer without submitting them
+    /// ([`orphaned_by`]).
+    Exact { id: u64 },
+    /// No unclaimed job of the context is in the submitted buffer: a preempted buffer's replay
+    /// (its job is claimed already), or a buffer RenderGdi wrote no job into. Nothing is admitted;
+    /// the fence still waits for the context's outstanding jobs ([`context_gate`]).
+    Nothing,
+    /// The submission names no buffer (`va == 0`, the non-virtual SubmitCommand), or no
+    /// submission on this adapter has ever named a rendered buffer (`paired == false`): admit every
+    /// unclaimed job of the context, oldest first.
+    AllUnclaimed,
+}
+
+/// Whether a job marker at `dma_va` lies in the submitted buffer `[va, va + size)` (`size == 0`:
+/// exactly `va`).
+pub const fn in_buffer(dma_va: u64, va: u64, size: u64) -> bool {
+    dma_va != 0 && dma_va >= va && (dma_va - va < size || dma_va == va)
+}
+
+/// The record-less admission rule.
+///
+/// A GDI context's DMA buffers are submitted in the order dxgkrnl rendered them, but rendering
+/// runs ahead of submission: when buffer N is submitted, buffer N + 1 may already have been
+/// rendered, its job sitting unclaimed in the table. Claiming every unclaimed job of the context
+/// (`AllUnclaimed`) then executed job N + 1 before dxgkrnl submitted its buffer, i.e. before the
+/// waits and residency work dxgkrnl does ahead of that submission, and gated buffer N's fence on a
+/// job that was not its own. Claiming only the oldest went wrong the other way (a rendered buffer
+/// dxgkrnl never submitted shifted every later fence onto the job before its own). Pairing by
+/// time cannot work either: a job rendered before the previous submission may still belong to
+/// any later buffer (render-ahead), and buffer N's own job may have been rendered after it.
+///
+/// The submission does name its buffer: `DmaBufferVirtualAddress`, the same GPU VA RenderGdi was
+/// given for it. So the submitted buffer's job is identified exactly; jobs of buffers rendered
+/// ahead stay unclaimed until their own submission. `paired` is the adapter's proof that RenderGdi
+/// and SubmitCommandVirtual agree on that VA (some submission found its job by it); until then the
+/// old rule stays, so a driver/OS combination where the VAs differ keeps today's behavior.
+pub fn recordless_admit(
+    jobs: impl IntoIterator<Item = JobView>,
+    ctx: usize,
+    va: u64,
+    size: u64,
+    paired: bool,
+) -> Recordless {
+    if va == 0 {
+        return Recordless::AllUnclaimed;
+    }
+    let newest = jobs
+        .into_iter()
+        .filter(|j| j.ctx == ctx && !j.claimed && in_buffer(j.dma_va, va, size))
+        .map(|j| j.id)
+        .max();
+    match newest {
+        Some(id) => Recordless::Exact { id },
+        None if paired => Recordless::Nothing,
+        None => Recordless::AllUnclaimed,
+    }
+}
+
+/// After `Recordless::Exact { id }` for buffer `[va, va + size)` on `ctx`: whether `j` is an
+/// earlier render of the same buffer that was never submitted (dropped as an orphan, so a later
+/// replay of the buffer can never pick it up and execute stale commands).
+pub fn orphaned_by(j: &JobView, id: u64, ctx: usize, va: u64, size: u64) -> bool {
+    j.ctx == ctx && !j.claimed && j.id < id && in_buffer(j.dma_va, va, size)
+}
+
 /// The monotonic sequence of submitted jobs and the executor's completed watermark. The executor
 /// runs jobs in sequence order, so "completed >= seq" means "this job and every earlier one are in
 /// their destinations". One per adapter, in the I/O half under a spinlock.
@@ -1864,6 +1948,12 @@ pub const COUNTERS: &[&str] = &[
     "GdiClmMul",
     "GdiClmMax",
     "GdiReGate",
+    // Record-less submissions that found their buffer's job by its DMA VA, ones that found none
+    // after the pairing was established (replays, buffers without a job), and earlier renders of
+    // a submitted buffer dropped as never submitted.
+    "GdiVaHit",
+    "GdiVaNone",
+    "GdiVaOrph",
     // Allocation destroys that waited for queued GDI jobs naming the allocation, waits that ran
     // out, destroys of an allocation a not yet submitted job names, the longest wait (µs).
     "GdiFreeWait",
@@ -2856,6 +2946,94 @@ mod tests {
         jobs.clear();
         // A replay that arrives after the job ran has nothing to wait for.
         assert_eq!(submit(&mut t, &mut jobs), None);
+    }
+
+    fn view(id: u64, ctx: usize, claimed: bool, dma_va: u64) -> JobView {
+        JobView { id, ctx, claimed, dma_va }
+    }
+
+    #[test]
+    fn recordless_admits_exactly_the_submitted_buffers_job() {
+        // Render-ahead: buffers at 0x1000 (job 1) and 0x2000 (job 2) rendered, 0x1000 submitted.
+        let jobs = [view(1, 7, false, 0x1000), view(2, 7, false, 0x2000)];
+        assert_eq!(recordless_admit(jobs, 7, 0x1000, 0x1000, true), Recordless::Exact { id: 1 });
+        // Job 2 is not admitted ahead of its own submission.
+        let jobs = [view(1, 7, true, 0x1000), view(2, 7, false, 0x2000)];
+        assert_eq!(recordless_admit(jobs, 7, 0x2000, 0x1000, true), Recordless::Exact { id: 2 });
+        // Another context's job in a buffer at the same VA is not this context's.
+        let jobs = [view(3, 8, false, 0x1000)];
+        assert_eq!(recordless_admit(jobs, 7, 0x1000, 0x1000, true), Recordless::Nothing);
+    }
+
+    #[test]
+    fn recordless_before_pairing_or_without_va_keeps_the_old_rule() {
+        let jobs = [view(1, 7, false, 0x1000)];
+        assert_eq!(recordless_admit(jobs, 7, 0x9000, 0x1000, false), Recordless::AllUnclaimed);
+        assert_eq!(recordless_admit(jobs, 7, 0, 0, true), Recordless::AllUnclaimed);
+        // Jobs without a VA (RenderKm) never match a buffer.
+        let jobs = [view(1, 7, false, 0)];
+        assert_eq!(recordless_admit(jobs, 7, 0x1000, 0x1000, true), Recordless::Nothing);
+    }
+
+    #[test]
+    fn recordless_rerendered_buffer_takes_the_newest_and_orphans_the_rest() {
+        // 0x1000 rendered (job 1), never submitted, re-rendered (job 3); job 2 elsewhere.
+        let jobs = [view(1, 7, false, 0x1000), view(2, 7, false, 0x5000), view(3, 7, false, 0x1000)];
+        let pick = recordless_admit(jobs, 7, 0x1000, 0x1000, true);
+        assert_eq!(pick, Recordless::Exact { id: 3 });
+        let orphans: Vec<u64> =
+            jobs.iter().filter(|j| orphaned_by(j, 3, 7, 0x1000, 0x1000)).map(|j| j.id).collect();
+        assert_eq!(orphans, vec![1]);
+    }
+
+    #[test]
+    fn in_buffer_bounds() {
+        assert!(in_buffer(0x1000, 0x1000, 0x100));
+        assert!(in_buffer(0x10ff, 0x1000, 0x100));
+        assert!(!in_buffer(0x1100, 0x1000, 0x100));
+        assert!(!in_buffer(0x0fff, 0x1000, 0x100));
+        assert!(in_buffer(0x1000, 0x1000, 0));
+        assert!(!in_buffer(0, 0, 0x100));
+    }
+
+    /// The preempted-replay model of [`a_preempted_replay_stays_gated_on_its_job`] under the
+    /// paired rule: render-ahead, submit, preempt, replay, execute. Each fence waits for its own
+    /// job (and, by `context_gate`, everything outstanding before it), never for a job rendered
+    /// ahead of it, and the replay stays gated.
+    #[test]
+    fn paired_recordless_with_render_ahead_and_a_replay() {
+        let mut t = Timeline::default();
+        // (view, seq)
+        let mut jobs: Vec<(JobView, Option<u64>)> = Vec::new();
+        let submit = |t: &mut Timeline, jobs: &mut Vec<(JobView, Option<u64>)>, va: u64| {
+            let views: Vec<JobView> = jobs.iter().map(|(v, _)| *v).collect();
+            match recordless_admit(views, 7, va, 0x1000, true) {
+                Recordless::Exact { id } => {
+                    jobs.retain(|(v, _)| !orphaned_by(v, id, 7, va, 0x1000));
+                    let j = jobs.iter_mut().find(|(v, _)| v.id == id).unwrap();
+                    j.0.claimed = true;
+                    j.1 = Some(t.next());
+                }
+                Recordless::Nothing => {}
+                Recordless::AllUnclaimed => unreachable!(),
+            }
+            context_gate(jobs.iter().map(|(_, s)| *s), t.completed)
+        };
+        // Buffers A (0x1000) and B (0x2000) rendered before A's submission.
+        jobs.push((view(1, 7, false, 0x1000), None));
+        jobs.push((view(2, 7, false, 0x2000), None));
+        let a = submit(&mut t, &mut jobs, 0x1000);
+        assert_eq!(a, Some(1), "A waits for its own job only");
+        assert_eq!(jobs[1].1, None, "B's job is not admitted ahead of B");
+        // A is preempted; its replay finds nothing unclaimed in A and waits for job 1 still.
+        let replay = submit(&mut t, &mut jobs, 0x1000);
+        assert_eq!(replay, Some(1));
+        // B's submission admits B's job and waits for it.
+        let b = submit(&mut t, &mut jobs, 0x2000);
+        assert_eq!(b, Some(2));
+        t.complete(2);
+        jobs.clear();
+        assert_eq!(submit(&mut t, &mut jobs, 0x2000), None);
     }
 
     #[test]
