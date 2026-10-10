@@ -100,6 +100,17 @@ fn resolve_scanout_mode(
     // ONE value: the constructor validates the extent and generates (or adopts)
     // the matching EDID, so the two cannot disagree.
     let mode = crate::adapter::ScanoutMode::adopt(host_mode, host_edid);
+    // The native mode is described with the adopted EDID's own timing, so it
+    // is the monitor's preferred mode exactly (`kmd_logic::edid::signal_for`).
+    let native = mode
+        .as_ref()
+        .and_then(|m| helios_kmd_logic::edid::native_timing(m.edid()));
+    crate::ddi::mode_list::set_native_timing(native.as_ref());
+    if let Some(n) = native {
+        crate::diag::record_named_bytes(b"EdTimHT", n.htotal);
+        crate::diag::record_named_bytes(b"EdTimVT", n.vtotal);
+        crate::diag::record_named_bytes(b"EdTimClk", n.clock_khz);
+    }
     if mode.is_none() {
         // Invalid identity or fallback metadata must not become a zero EDID
         // attached to a supposedly working display child.

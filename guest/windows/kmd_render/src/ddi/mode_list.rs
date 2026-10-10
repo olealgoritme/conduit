@@ -106,6 +106,33 @@ pub(crate) fn offered(native: (u32, u32)) -> ModeList {
     l
 }
 
+/// The adopted EDID's native timing (width, height, mHz, htotal, vtotal, kHz;
+/// all 0 = none), set once at StartDevice before any VidPN DDI: the native mode
+/// is described with it (`kmd_logic::edid::signal_for`).
+static NATIVE: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+
+pub(crate) fn set_native_timing(t: Option<&helios_kmd_logic::edid::NativeTiming>) {
+    let v = t.map_or([0; 6], |t| {
+        [t.width, t.height, t.refresh_mhz, t.htotal, t.vtotal, t.clock_khz]
+    });
+    for (slot, x) in NATIVE.iter().zip(v) {
+        slot.store(x, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn native_timing() -> Option<helios_kmd_logic::edid::NativeTiming> {
+    let v: [u32; 6] = core::array::from_fn(|i| NATIVE[i].load(Ordering::Relaxed));
+    (v[0] != 0).then_some(helios_kmd_logic::edid::NativeTiming {
+        width: v[0],
+        height: v[1],
+        refresh_mhz: v[2],
+        from_displayid: false,
+        htotal: v[3],
+        vtotal: v[4],
+        clock_khz: v[5],
+    })
+}
+
 /// The newest `DisplayMode` request (packed size) and how many arrived; the
 /// worker publishes them as `HostModeReq`/`HostModeSeq` for the tray.
 static MODE_REQ: AtomicU32 = AtomicU32::new(0);

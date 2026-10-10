@@ -196,19 +196,23 @@ fn video_signal_info(w: u32, h: u32, refresh_mhz: u32) -> D3DKMDT_VIDEO_SIGNAL_I
     // SAFETY: an all-zero VIDEO_SIGNAL_INFO is a valid starting point.
     let mut sig: D3DKMDT_VIDEO_SIGNAL_INFO = unsafe { core::mem::zeroed() };
     sig.VideoStandard = _D3DKMDT_VIDEO_SIGNAL_STANDARD::D3DKMDT_VSS_OTHER;
-    sig.TotalSize.cx = w;
-    sig.TotalSize.cy = h;
-    sig.ActiveSize = sig.TotalSize;
-    // Both frequencies in lowest terms (240/1, not 240000/1000): WDDM compares
-    // mode rationals and DXGI returns them to the application as written.
-    let (v_n, v_d) = helios_kmd_logic::reduce_ratio(u64::from(refresh_mhz), 1000);
-    sig.VSyncFreq.Numerator = v_n as u32;
-    sig.VSyncFreq.Denominator = v_d as u32;
-    // u64 so 5120x2560 at 240 Hz and larger cannot wrap the 32-bit fields.
-    let (h_n, h_d) = helios_kmd_logic::reduce_ratio(u64::from(h) * u64::from(refresh_mhz), 1000);
-    sig.HSyncFreq.Numerator = h_n.min(u64::from(u32::MAX)) as u32;
-    sig.HSyncFreq.Denominator = h_d as u32;
-    sig.PixelRate = ((u64::from(w) * u64::from(h) * u64::from(refresh_mhz)) / 1000) as SIZE_T;
+    // The native mode at the native rate is the EDID's own timing (totals and
+    // pixel clock), so Windows finds the monitor's preferred mode among the
+    // target modes; every other mode has no blanking. Frequencies in lowest
+    // terms (240/1, not 240000/1000): WDDM compares mode rationals and DXGI
+    // returns them to the application as written.
+    let native = crate::ddi::mode_list::native_timing();
+    let s = helios_kmd_logic::edid::signal_for(w, h, refresh_mhz, native.as_ref());
+    sig.TotalSize.cx = s.total_w;
+    sig.TotalSize.cy = s.total_h;
+    sig.ActiveSize.cx = w;
+    sig.ActiveSize.cy = h;
+    // u64 math in signal_for, so 5120x2560 at 240 Hz cannot wrap; clamp to the fields.
+    sig.VSyncFreq.Numerator = s.vsync.0.min(u64::from(u32::MAX)) as u32;
+    sig.VSyncFreq.Denominator = s.vsync.1.min(u64::from(u32::MAX)) as u32;
+    sig.HSyncFreq.Numerator = s.hsync.0.min(u64::from(u32::MAX)) as u32;
+    sig.HSyncFreq.Denominator = s.hsync.1.min(u64::from(u32::MAX)) as u32;
+    sig.PixelRate = s.pixel_hz as SIZE_T;
     // ScanLineOrdering shares a union with the (unused) additional-signal-info
     // bitfield; the whole struct was zeroed, so selecting this arm is a plain
     // union write (safe — only union reads are unsafe).
