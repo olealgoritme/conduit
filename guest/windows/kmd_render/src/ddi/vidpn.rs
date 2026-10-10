@@ -280,22 +280,393 @@ unsafe fn add_source_mode(
 /// valid D3D11 display format. Each mode here is backed by the exact
 /// SetVidPnSourceAddress allocation format; the display copy path converts
 /// A8B8G8R8 into the adapter-owned BGRA scanout image.
+///
+/// One pair per size of `modes` (`kmd_logic::mode_list`), native first.
 unsafe fn add_source_modes(
     iface: *const DXGK_VIDPNSOURCEMODESET_INTERFACE,
     h_set: D3DKMDT_HVIDPNSOURCEMODESET,
-    w: u32,
-    h: u32,
+    modes: &helios_kmd_logic::mode_list::ModeList,
+    native: (u32, u32),
 ) -> NTSTATUS {
-    for pixel_format in [
-        _D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8,
-        _D3DDDIFORMAT::D3DDDIFMT_A8B8G8R8,
-    ] {
-        let status = unsafe { add_source_mode(iface, h_set, w, h, pixel_format) };
-        if !ok(status) {
-            return status;
+    for i in 0..modes.len() {
+        let Some((w, h)) = modes.get(i) else {
+            break;
+        };
+        for pixel_format in [
+            _D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8,
+            _D3DDDIFORMAT::D3DDDIFMT_A8B8G8R8,
+        ] {
+            let status = unsafe { add_source_mode(iface, h_set, w, h, pixel_format) };
+            if let Err(e) = mode_added(status, (w, h) == native) {
+                return e;
+            }
         }
     }
     STATUS_SUCCESS
+}
+
+/// Non-native modes a mode set refused (`pfnAddMode` failed other than
+/// ALREADY_IN_MODESET) and were skipped, this boot (diag `MlAddE`).
+static MODE_ADD_ERRS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The outcome of adding one mode: a failed NATIVE mode stays fatal (nothing
+/// would be left to show), a failed other mode is counted and skipped so one
+/// odd mode cannot cost the whole set. PASSIVE (every VidPN DDI is).
+fn mode_added(st: NTSTATUS, native: bool) -> Result<(), NTSTATUS> {
+    if ok(st) || native {
+        return if ok(st) { Ok(()) } else { Err(st) };
+    }
+    let n = MODE_ADD_ERRS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    rec(b"MlAddE", n);
+    rec(b"MlAddSt", st as u32);
+    Ok(())
+}
+
+/// One target mode per size of `modes` and per offered rate (`refresh_ladder`),
+/// native at the host rate the preferred one.
+unsafe fn add_target_modes(
+    iface: *const DXGK_VIDPNTARGETMODESET_INTERFACE,
+    h_set: D3DKMDT_HVIDPNTARGETMODESET,
+    modes: &helios_kmd_logic::mode_list::ModeList,
+    native: (u32, u32),
+    refresh_mhz: u32,
+) -> NTSTATUS {
+    let (rates, rate_count) = helios_kmd_logic::refresh_ladder(refresh_mhz);
+    for i in 0..modes.len() {
+        let Some((w, h)) = modes.get(i) else {
+            break;
+        };
+        let mut r = 0;
+        while r < rate_count {
+            let preferred = (w, h) == native && r == 0;
+            let status =
+                unsafe { add_single_target_mode(iface, h_set, w, h, rates[r], preferred) };
+            if let Err(e) = mode_added(status, (w, h) == native) {
+                return e;
+            }
+            r += 1;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// Fill and add one monitor source mode. `preferred` marks the monitor's native
+/// mode at the host rate.
+///
+/// # Safety
+/// `iface` is a live `DXGK_MONITORSOURCEMODESET_INTERFACE` for `h_set`.
+unsafe fn add_monitor_mode(
+    iface: &DXGK_MONITORSOURCEMODESET_INTERFACE,
+    h_set: D3DKMDT_HMONITORSOURCEMODESET,
+    w: u32,
+    h: u32,
+    refresh_mhz: u32,
+    preferred: bool,
+) -> NTSTATUS {
+    let (Some(create), Some(add), Some(release)) = (
+        iface.pfnCreateNewModeInfo,
+        iface.pfnAddMode,
+        iface.pfnReleaseModeInfo,
+    ) else {
+        return STATUS_GRAPHICS_INVALID_VIDPN;
+    };
+    let mut mode: *mut D3DKMDT_MONITOR_SOURCE_MODE = null_mut();
+    // SAFETY: valid out-pointer.
+    let st = unsafe { create(h_set, &mut mode) };
+    if !ok(st) || mode.is_null() {
+        return if ok(st) {
+            STATUS_GRAPHICS_INVALID_VIDPN
+        } else {
+            st
+        };
+    }
+    // SAFETY: `mode` is writable.
+    unsafe {
+        (*mode).VideoSignalInfo = video_signal_info(w, h, refresh_mhz);
+        (*mode).ColorBasis = _D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SRGB;
+        (*mode).ColorCoeffDynamicRanges.FirstChannel = 8;
+        (*mode).ColorCoeffDynamicRanges.SecondChannel = 8;
+        (*mode).ColorCoeffDynamicRanges.ThirdChannel = 8;
+        (*mode).ColorCoeffDynamicRanges.FourthChannel = 8;
+        (*mode).Origin = _D3DKMDT_MONITOR_CAPABILITIES_ORIGIN::D3DKMDT_MCO_DRIVER;
+        (*mode).Preference = if preferred {
+            _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED
+        } else {
+            _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_NOTPREFERRED
+        };
+    }
+    // SAFETY: add/release take the mode we filled.
+    let st = unsafe { add(h_set, mode) };
+    if !ok(st) {
+        let _ = unsafe { release(h_set, mode) };
+        if st != STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET {
+            return st;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// Every size of `modes` at every offered rate into a monitor source mode set.
+///
+/// # Safety
+/// As [`add_monitor_mode`].
+unsafe fn add_monitor_modes(
+    iface: &DXGK_MONITORSOURCEMODESET_INTERFACE,
+    h_set: D3DKMDT_HMONITORSOURCEMODESET,
+    modes: &helios_kmd_logic::mode_list::ModeList,
+    native: (u32, u32),
+    refresh_mhz: u32,
+) -> NTSTATUS {
+    let (rates, rate_count) = helios_kmd_logic::refresh_ladder(refresh_mhz);
+    for i in 0..modes.len() {
+        let Some((w, h)) = modes.get(i) else {
+            break;
+        };
+        let mut r = 0;
+        while r < rate_count {
+            let preferred = (w, h) == native && r == 0;
+            let st = unsafe { add_monitor_mode(iface, h_set, w, h, rates[r], preferred) };
+            if let Err(e) = mode_added(st, (w, h) == native) {
+                return e;
+            }
+            r += 1;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+fn list_hash(modes: &helios_kmd_logic::mode_list::ModeList, refresh_mhz: u32) -> u32 {
+    // FNV-1a over the packed sizes and the rate; never 0.
+    let mut h: u32 = 0x811C_9DC5;
+    for &p in modes.packed().iter().chain(core::iter::once(&refresh_mhz)) {
+        for b in p.to_le_bytes() {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+    }
+    h | 1
+}
+
+/// Make sure the monitor's source mode set holds every mode of the list, the way
+/// VirtualBox's WDDM driver does it (`vboxVidPnCheckMonitorModes`): the host's
+/// list can arrive or change after `RecommendMonitorModes` ran, and Windows
+/// hides target modes the monitor does not list. Add-only; a mode the host no
+/// longer lists stays in the monitor set but is no longer offered as a target
+/// mode. Best effort: a failure is recorded and changes nothing else. PASSIVE.
+fn sync_monitor_modes(
+    adapter: &AdapterContext,
+    modes: &helios_kmd_logic::mode_list::ModeList,
+    native: (u32, u32),
+    refresh_mhz: u32,
+) {
+    let hash = list_hash(modes, refresh_mhz);
+    if crate::ddi::mode_list::monitor_synced() == hash {
+        return;
+    }
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        return;
+    };
+    let Some(query) = dxgkrnl.DxgkCbQueryMonitorInterface else {
+        return;
+    };
+    let mut mon: *const DXGK_MONITOR_INTERFACE = null();
+    // SAFETY: PASSIVE (a VidPN DDI); valid out-pointer.
+    let st = unsafe {
+        query(
+            dxgkrnl.DeviceHandle,
+            _DXGK_MONITOR_INTERFACE_VERSION::DXGK_MONITOR_INTERFACE_VERSION_V1,
+            &mut mon,
+        )
+    };
+    if !ok(st) || mon.is_null() {
+        rec(b"MlMonQ", st as u32);
+        return;
+    }
+    // SAFETY: non-null, valid while the adapter is.
+    let mon = unsafe { &*mon };
+    let (Some(acquire), Some(release_set)) = (
+        mon.pfnAcquireMonitorSourceModeSet,
+        mon.pfnReleaseMonitorSourceModeSet,
+    ) else {
+        return;
+    };
+    let mut h_set: D3DKMDT_HMONITORSOURCEMODESET = null_mut();
+    let mut set_iface: *const DXGK_MONITORSOURCEMODESET_INTERFACE = null();
+    // SAFETY: valid out-pointers.
+    let st = unsafe { acquire(dxgkrnl.DeviceHandle, CHILD_UID, &mut h_set, &mut set_iface) };
+    if !ok(st) || set_iface.is_null() {
+        // No monitor yet: RecommendMonitorModes will offer the list when it comes.
+        rec(b"MlMonA", st as u32);
+        return;
+    }
+    // SAFETY: from the acquire above.
+    let st = unsafe { add_monitor_modes(&*set_iface, h_set, modes, native, refresh_mhz) };
+    // SAFETY: releases the set acquired above, once.
+    let _ = unsafe { release_set(dxgkrnl.DeviceHandle, h_set) };
+    rec(b"MlMonS", st as u32);
+    // Best effort: tried once per list, failed or not, so a set that refuses a mode
+    // does not cost every later cofunc call ~200 callbacks (`MlMonS` keeps why).
+    crate::ddi::mode_list::set_monitor_synced(hash);
+}
+
+/// The size of the pinned source mode of `source_id` in this VidPn, if one is
+/// pinned. Read-only: acquires and releases the set.
+///
+/// # Safety
+/// `vidpn`/`h_vidpn` are the live VidPn interface and handle of the current DDI call.
+unsafe fn pinned_source_size(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    source_id: u32,
+) -> Option<(u32, u32)> {
+    let acquire = vidpn.pfnAcquireSourceModeSet?;
+    vidpn.pfnReleaseSourceModeSet?;
+    let mut h_set: D3DKMDT_HVIDPNSOURCEMODESET = null_mut();
+    let mut set_iface: *const DXGK_VIDPNSOURCEMODESET_INTERFACE = null();
+    // SAFETY: valid out-pointers.
+    let st = unsafe { acquire(h_vidpn, source_id, &mut h_set, &mut set_iface) };
+    if !ok(st) || set_iface.is_null() {
+        return None;
+    }
+    let set = SourceModeSet {
+        vidpn,
+        h_vidpn,
+        source_id,
+        h_set,
+        iface: set_iface,
+    };
+    // SAFETY: from the acquire above.
+    let acquire_pinned = unsafe { (*set.iface).pfnAcquirePinnedModeInfo }?;
+    let mut mode: *const D3DKMDT_VIDPN_SOURCE_MODE = null();
+    // SAFETY: valid out-pointer.
+    if !ok(unsafe { acquire_pinned(set.h_set, &mut mode) }) || mode.is_null() {
+        return None;
+    }
+    let held = PinnedSourceMode { set: &set, mode };
+    // SAFETY: a live pinned source mode; Graphics is the arm source modes use.
+    let g = unsafe { &(*held.mode).Format.Graphics };
+    Some((g.PrimSurfSize.cx as u32, g.PrimSurfSize.cy as u32))
+}
+
+/// The active size of the pinned target mode of `target_id`, if one is pinned.
+///
+/// # Safety
+/// As [`pinned_source_size`].
+unsafe fn pinned_target_size(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    target_id: u32,
+) -> Option<(u32, u32)> {
+    let acquire = vidpn.pfnAcquireTargetModeSet?;
+    vidpn.pfnReleaseTargetModeSet?;
+    let mut h_set: D3DKMDT_HVIDPNTARGETMODESET = null_mut();
+    let mut set_iface: *const DXGK_VIDPNTARGETMODESET_INTERFACE = null();
+    // SAFETY: valid out-pointers.
+    let st = unsafe { acquire(h_vidpn, target_id, &mut h_set, &mut set_iface) };
+    if !ok(st) || set_iface.is_null() {
+        return None;
+    }
+    let set = TargetModeSet {
+        vidpn,
+        h_vidpn,
+        target_id,
+        h_set,
+        iface: set_iface,
+    };
+    // SAFETY: from the acquire above.
+    let acquire_pinned = unsafe { (*set.iface).pfnAcquirePinnedModeInfo }?;
+    let mut mode: *const D3DKMDT_VIDPN_TARGET_MODE = null();
+    // SAFETY: valid out-pointer.
+    if !ok(unsafe { acquire_pinned(set.h_set, &mut mode) }) || mode.is_null() {
+        return None;
+    }
+    let held = PinnedTargetMode { set: &set, mode };
+    // SAFETY: a live pinned target mode.
+    let a = unsafe { (*held.mode).VideoSignalInfo.ActiveSize };
+    Some((a.cx as u32, a.cy as u32))
+}
+
+/// The mode rule's view of a path's scaling (`kmd_logic::mode_list::Scaling`):
+/// pinned Identity needs equal sizes; pinned Centered or not pinned yet (the path
+/// advertises both) lets a smaller source sit on a larger target; anything this
+/// driver never advertised is treated as Identity.
+fn path_scaling(p: &D3DKMDT_VIDPN_PRESENT_PATH) -> helios_kmd_logic::mode_list::Scaling {
+    use helios_kmd_logic::mode_list::Scaling;
+    use _D3DKMDT_VIDPN_PRESENT_PATH_SCALING as S;
+    match p.ContentTransformation.Scaling {
+        S::D3DKMDT_VPPS_IDENTITY => Scaling::Identity,
+        S::D3DKMDT_VPPS_CENTERED | S::D3DKMDT_VPPS_UNPINNED | S::D3DKMDT_VPPS_UNINITIALIZED => {
+            Scaling::CenteredOrUnpinned
+        }
+        _ => Scaling::Other,
+    }
+}
+
+/// The scaling of the first path of `h_vidpn`'s topology (ours is the only one);
+/// `None` if it cannot be read.
+///
+/// # Safety
+/// `vidpn`/`h_vidpn` are the live VidPn interface and handle of the current DDI call.
+unsafe fn first_path_scaling(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+) -> Option<helios_kmd_logic::mode_list::Scaling> {
+    let get_topology = vidpn.pfnGetTopology?;
+    let mut h_topo: D3DKMDT_HVIDPNTOPOLOGY = null_mut();
+    let mut topo_iface: *const DXGK_VIDPNTOPOLOGY_INTERFACE = null();
+    // SAFETY: valid out-pointers.
+    let st = unsafe { get_topology(h_vidpn, &mut h_topo, &mut topo_iface) };
+    if !ok(st) || topo_iface.is_null() {
+        return None;
+    }
+    // SAFETY: valid for the call.
+    let topo = unsafe { &*topo_iface };
+    topo.pfnReleasePathInfo?;
+    // SAFETY: live topology for the call; the guard releases the path.
+    let path = unsafe { PathInfo::first(topo, h_topo) }.ok()??;
+    Some(path_scaling(path.get()))
+}
+
+/// `DxgkDdiIsSupportedVidPn`'s check: the desired VidPn's pinned source and
+/// target sizes on our one path are modes of the list and the source fits the
+/// target under the path's scaling (`ModeList::supports`). Anything that cannot be
+/// read is supported, as before.
+///
+/// # Safety
+/// `h_vidpn` is the handle dxgkrnl supplied to the DDI; `witness` is bounded by it.
+pub(crate) unsafe fn vidpn_supported<W: ?Sized>(
+    adapter: &AdapterContext,
+    h_vidpn: D3DKMDT_HVIDPN,
+    witness: &W,
+) -> bool {
+    if h_vidpn.is_null() {
+        return true;
+    }
+    // SAFETY: per the fn contract.
+    let Ok(v) = (unsafe { VidPn::open(adapter, h_vidpn, witness) }) else {
+        return true;
+    };
+    let iface = v.iface();
+    // SAFETY: live interface and handle for the call.
+    let src = unsafe { pinned_source_size(iface, h_vidpn, 0) };
+    // SAFETY: as above.
+    let tgt = unsafe { pinned_target_size(iface, h_vidpn, CHILD_UID) };
+    if src.is_none() && tgt.is_none() {
+        return true;
+    }
+    let native = adapter.display_mode();
+    let list = crate::ddi::mode_list::offered(native);
+    // SAFETY: live interface and handle for the call.
+    let scaling = unsafe { first_path_scaling(iface, h_vidpn) }
+        .unwrap_or(helios_kmd_logic::mode_list::Scaling::CenteredOrUnpinned);
+    let yes = list.is_empty() || list.supports(src, tgt, scaling);
+    if !yes {
+        rec(
+            b"VpISn",
+            src.map_or(0, |(w, h)| helios_kmd_logic::mode_list::pack(w, h)),
+        );
+    }
+    yes
 }
 
 /// Create + add one target mode (size and refresh) into `h_set`. The caller adds
@@ -354,8 +725,8 @@ unsafe fn add_single_target_mode(
     STATUS_SUCCESS
 }
 
-/// `DxgkDdiRecommendMonitorModes` body: publish the single monitor source mode
-/// for the default monitor the OS created for our EDID-less child.
+/// `DxgkDdiRecommendMonitorModes` body: publish the mode list as the monitor's
+/// source modes (the host EDID names only native).
 ///
 /// # Safety
 /// `arg` points to a valid `DXGKARG_RECOMMENDMONITORMODES` for the call.
@@ -376,59 +747,23 @@ pub unsafe fn recommend_monitor_modes(
     }
     // SAFETY: dxgkrnl-provided interface, valid for the call.
     let iface = unsafe { &*a.pMonitorSourceModeSetInterface };
-    let (Some(create), Some(add), Some(release)) = (
-        iface.pfnCreateNewModeInfo,
-        iface.pfnAddMode,
-        iface.pfnReleaseModeInfo,
-    ) else {
-        return STATUS_GRAPHICS_INVALID_VIDPN;
-    };
     let h_set = a.hMonitorSourceModeSet;
-    // The host's rate (preferred) plus 144/120/60 Hz below it, so Windows has
-    // valid fallbacks and Display Settings can list them.
-    let (rates, rate_count) = helios_kmd_logic::refresh_ladder(refresh_mhz);
+    // Every size of the mode list (`ddi::mode_list`: the host's, else native and the
+    // standard modes up to it), each at the host's rate plus 144/120/60 Hz below it,
+    // so Windows has valid fallbacks and Display Settings and games can list them.
+    // Native at the host rate is the preferred one. The rates are the monitor's own
+    // (the host EDID's), the same host output the list's `refresh_mhz` names.
     rec(b"MmRfr", refresh_mhz);
-    let mut i = 0;
-    while i < rate_count {
-        let mut mode: *mut D3DKMDT_MONITOR_SOURCE_MODE = null_mut();
-        // SAFETY: valid out-pointer.
-        let st = unsafe { create(h_set, &mut mode) };
-        if !ok(st) || mode.is_null() {
-            return if ok(st) {
-                STATUS_GRAPHICS_INVALID_VIDPN
-            } else {
-                st
-            };
-        }
-        // SAFETY: `mode` is writable.
-        unsafe {
-            (*mode).VideoSignalInfo = video_signal_info(w, h, rates[i]);
-            (*mode).ColorBasis = _D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SRGB;
-            (*mode).ColorCoeffDynamicRanges.FirstChannel = 8;
-            (*mode).ColorCoeffDynamicRanges.SecondChannel = 8;
-            (*mode).ColorCoeffDynamicRanges.ThirdChannel = 8;
-            (*mode).ColorCoeffDynamicRanges.FourthChannel = 8;
-            (*mode).Origin = _D3DKMDT_MONITOR_CAPABILITIES_ORIGIN::D3DKMDT_MCO_DRIVER;
-            (*mode).Preference = if i == 0 {
-                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED
-            } else {
-                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_NOTPREFERRED
-            };
-        }
-        // SAFETY: add/release take the mode we filled.
-        let st = unsafe { add(h_set, mode) };
-        if !ok(st) {
-            let _ = unsafe { release(h_set, mode) };
-            if st != STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET {
-                // Record the raw pfnAddMode failure so we can tell if the MONITOR
-                // mode is what a callback rejects (the caller legalizes the
-                // escaping status).
-                rec(b"VpMMe", st as u32);
-                return st;
-            }
-        }
-        i += 1;
+    let modes = crate::ddi::mode_list::offered((w, h));
+    // SAFETY: dxgkrnl-provided interface, valid for the call.
+    let st = unsafe { add_monitor_modes(iface, h_set, &modes, (w, h), refresh_mhz) };
+    if !ok(st) {
+        // Record the raw pfnAddMode failure so we can tell if the MONITOR mode is
+        // what a callback rejects (the caller legalizes the escaping status).
+        rec(b"VpMMe", st as u32);
+        return st;
     }
+    crate::ddi::mode_list::set_monitor_synced(list_hash(&modes, refresh_mhz));
     STATUS_SUCCESS
 }
 
@@ -751,6 +1086,9 @@ pub unsafe fn enum_cofunc_modality(
     let (mode_w, mode_h) = adapter.display_mode();
     let mode_refresh_mhz = adapter.display_refresh_mhz();
     rec(b"VpRfr", mode_refresh_mhz);
+    // The sizes offered (`ddi::mode_list`): the host's list, else native and the
+    // standard modes up to it. Native first.
+    let modes = crate::ddi::mode_list::offered((mode_w, mode_h));
 
     // Resolve the VidPn + topology interfaces (nothing held yet → early return).
     // The borrow that bounds the interface: the DDI argument struct, which
@@ -824,6 +1162,15 @@ pub unsafe fn enum_cofunc_modality(
         let p = path.get();
         let source_id = p.VidPnSourceId;
         let target_id = p.VidPnTargetId;
+        // What is pinned on each end restricts the other end to that size (the
+        // scanout shows the source unscaled): read both before rebuilding either.
+        // SAFETY: live VidPn interface and handle for this DDI call.
+        let src_pinned = unsafe { pinned_source_size(vidpn, h_vidpn, source_id) };
+        // SAFETY: as above.
+        let tgt_pinned = unsafe { pinned_target_size(vidpn, h_vidpn, target_id) };
+        // A pinned Identity needs equal sizes; Centered or unpinned (both
+        // advertised below) lets a smaller source sit centred on a larger target.
+        let scaling = path_scaling(p);
 
         // ── source mode set (unless this source is the caller's pivot) ──────
         if !(a.EnumPivotType == _D3DKMDT_ENUMCOFUNCMODALITY_PIVOT_TYPE::D3DKMDT_EPT_VIDPNSOURCE
@@ -887,7 +1234,10 @@ pub unsafe fn enum_cofunc_modality(
                     iface: new_iface,
                 };
                 // SAFETY: live set interface + handle.
-                status = unsafe { add_source_modes(created.iface, created.h_set, mode_w, mode_h) };
+                let sizes = modes.sources_for(tgt_pinned, scaling);
+                status = unsafe {
+                    add_source_modes(created.iface, created.h_set, &sizes, (mode_w, mode_h))
+                };
                 if !ok(status) {
                     stage = CofuncStage::AddSourceModes;
                     break; // `created` drops → released
@@ -968,27 +1318,18 @@ pub unsafe fn enum_cofunc_modality(
                     iface: new_iface,
                 };
                 // SAFETY: live set interface + handle.
-                // One target mode per offered refresh rate, the host's first and
-                // preferred.
-                let (rates, rate_count) = helios_kmd_logic::refresh_ladder(mode_refresh_mhz);
-                status = STATUS_SUCCESS;
-                let mut r = 0;
-                while r < rate_count {
-                    status = unsafe {
-                        add_single_target_mode(
-                            created.iface,
-                            created.h_set,
-                            mode_w,
-                            mode_h,
-                            rates[r],
-                            r == 0,
-                        )
-                    };
-                    if !ok(status) {
-                        break;
-                    }
-                    r += 1;
-                }
+                // One target mode per size and offered refresh rate, native at the
+                // host's rate the preferred one.
+                let sizes = modes.targets_for(src_pinned, scaling);
+                status = unsafe {
+                    add_target_modes(
+                        created.iface,
+                        created.h_set,
+                        &sizes,
+                        (mode_w, mode_h),
+                        mode_refresh_mhz,
+                    )
+                };
                 if !ok(status) {
                     stage = CofuncStage::AddTargetMode;
                     break; // `created` drops → released
@@ -1088,6 +1429,11 @@ pub unsafe fn enum_cofunc_modality(
         status = legalize_vidpn(status);
     }
     rec(b"VpECr", status as u32 & 0xFFFF);
+    // The monitor lists every mode offered, even when the list came after
+    // RecommendMonitorModes (best effort, only when the list changed).
+    if status == STATUS_SUCCESS {
+        sync_monitor_modes(adapter, &modes, (mode_w, mode_h), mode_refresh_mhz);
+    }
     status
 }
 
@@ -1216,6 +1562,7 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
     };
     let mut pinned = 0u32;
     let mut wh = 0u32;
+    let mut usable = false;
     // SAFETY: `iface` came from the acquire above.
     if let Some(acquire_pinned) = unsafe { (*set.iface).pfnAcquirePinnedModeInfo } {
         let mut mode: *const D3DKMDT_VIDPN_SOURCE_MODE = null();
@@ -1229,6 +1576,11 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
             // source modes use (Format is a Copy union — read is unsafe).
             let g = unsafe { &(*held.mode).Format.Graphics };
             wh = ((g.PrimSurfSize.cx as u32) << 16) | (g.PrimSurfSize.cy as u32 & 0xFFFF);
+            // Checked on the raw extent, before packing could wrap it.
+            usable = helios_kmd_logic::mode_list::usable(
+                g.PrimSurfSize.cx as u32,
+                g.PrimSurfSize.cy as u32,
+            );
         }
     }
     // `set` drops here, releasing the source mode set we acquired.
@@ -1236,6 +1588,12 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
 
     rec(b"VpCP", pinned);
     rec(b"VpCW", wh);
+    // The committed source size is the scanout extent from now on (native unless a
+    // mode of the list was chosen): `AdapterContext::scanout_extent`.
+    // A pinned size the driver could never have offered falls back to native.
+    if pinned == 1 {
+        crate::ddi::mode_list::set_committed(if usable { wh } else { 0 });
+    }
 
     // The committed TARGET mode carries the refresh rate. Remember it: the
     // primary surface is described with it (DescribeAllocation) and the vsync
