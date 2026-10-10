@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D null_img;
+layout(set = 0, binding = 2, r32ui) uniform uimageBuffer null_tbuf;
+layout(set = 0, binding = 3, r32ui) uniform uimageBuffer small_tbuf;
+layout(std430, set = 0, binding = 4) buffer NullSsbo { uint v[]; } null_ssbo;
+layout(set = 0, binding = 5, rgba8) uniform image2DArray null_img_arr;
+layout(set = 0, binding = 6, r32ui) uniform uimage2D small_img;
+layout(push_constant) uniform PC { uint phase; uint mode; } pc;
+void main() {
+   switch (pc.mode) {
+   case 1u:
+      imageStore(null_img, ivec2(0, 0), uvec4(0x11111111u));
+      imageStore(null_img, ivec2(1, 0), uvec4(0x11111112u));
+      imageStore(null_img, ivec2(0, 1), uvec4(0x11111113u));
+      imageStore(null_img, ivec2(13, 7), uvec4(0x11111114u));
+      break;
+   case 2u:
+      imageAtomicAdd(null_img, ivec2(0, 0), 0x01010101u);
+      break;
+   case 3u:
+      imageStore(null_tbuf, 0, uvec4(0x22222222u));
+      imageStore(null_tbuf, 3, uvec4(0x22222223u));
+      imageStore(null_tbuf, 300, uvec4(0x22222224u));
+      break;
+   case 4u:
+      imageStore(small_tbuf, 1, uvec4(0x33333333u));
+      imageStore(small_tbuf, 100000, uvec4(0x33333334u));
+      break;
+   case 5u:
+      null_ssbo.v[0] = 0x44444444u;
+      null_ssbo.v[5] = 0x44444445u;
+      break;
+   case 6u:
+      imageStore(null_img_arr, ivec3(0, 0, 0), vec4(1.0, 0.5, 0.25, 1.0));
+      imageStore(null_img_arr, ivec3(2, 1, 0), vec4(1.0));
+      break;
+   case 7u:
+      imageStore(small_img, ivec2(0, 64), uvec4(0x55555555u));
+      imageStore(small_img, ivec2(4096, 0), uvec4(0x55555556u));
+      break;
+   }
+}
