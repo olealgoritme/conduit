@@ -66,7 +66,7 @@ pub struct Snapshot {
     pub gpu: Option<Sample>,
     /// How many NVIDIA GPUs NVML sees (`gpu` is the one the VMs use).
     pub gpus: usize,
-    /// NVML is let go while the dashboard is in the background.
+    /// NVML was let go (the sampler was told to release it).
     pub gpu_released: bool,
     pub driver: String,
     /// The sampler's last failure (a panic), for a note.
@@ -106,7 +106,7 @@ pub fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Starts the sampler; `poke` makes it refresh at once (after an action).
-/// NVML is held open only while `gpu_wanted` (the dashboard has focus): an
+/// NVML is held open only while `gpu_wanted`: an
 /// open NVML keeps the NVIDIA device busy, so the GPU cannot be unbound.
 pub fn start(gpu_wanted: Arc<AtomicBool>) -> (Shared, std::sync::mpsc::Sender<()>) {
     let shared: Shared = Arc::new(Mutex::new(Snapshot::default()));
