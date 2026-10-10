@@ -404,9 +404,11 @@ jobs:
       - name: Build the self-contained installer skeleton
         shell: pwsh
         run: ./guest/windows/ci/windows/Build-Installer.ps1 -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows" -OutputDir "$env:RUNNER_TEMP/helios-installer" -Configuration ${{ matrix.configuration }}
-      - name: Build the GPU tray app
+      - name: Build the GPU tray app and its context menu command
         shell: pwsh
-        run: cargo build --release --locked --manifest-path guest/windows/tools/conduit-gpu-tray/Cargo.toml
+        run: |
+          cargo build --release --locked --manifest-path guest/windows/tools/conduit-gpu-tray/Cargo.toml
+          cargo build --release --locked --manifest-path guest/windows/tools/conduit-shell-menu/Cargo.toml
       - name: Download WinFsp
         shell: pwsh
         run: |
@@ -436,6 +438,7 @@ jobs:
           -CompatibilityArtifact "$env:RUNNER_TEMP/artifacts/compatibility"
           -InstallerArtifact "$env:RUNNER_TEMP/helios-installer"
           -TrayExe "$env:GITHUB_WORKSPACE/guest/windows/tools/conduit-gpu-tray/target/release/conduit-gpu-tray.exe"
+          -ShellMenuDll "$env:GITHUB_WORKSPACE/guest/windows/tools/conduit-shell-menu/target/release/conduit_shell_menu.dll"
           -WinFspMsi "$env:RUNNER_TEMP/winfsp-$env:WINFSP_VERSION.msi"
           -OutputDir "$env:RUNNER_TEMP/helios-package"
           -Configuration '${{ matrix.configuration }}'

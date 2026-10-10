@@ -128,7 +128,7 @@ pub fn mounted_shares() -> Vec<gpu_tray::Share> {
 /// prompt, for every user who logs on.
 pub const TASK: &str = "ConduitGpuTray";
 
-fn quiet(cmd: &str, args: &[&str]) -> Option<std::process::Output> {
+pub fn quiet(cmd: &str, args: &[&str]) -> Option<std::process::Output> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::process::Command::new(cmd)
@@ -220,6 +220,54 @@ pub fn write_setting(name: &str, v: u32) {
         REG_DWORD,
         &v.to_le_bytes(),
     );
+}
+
+/// Does HKCU\`sub` have a subkey whose name starts with `prefix`?
+pub fn user_subkey_starts_with(sub: &str, prefix: &str) -> bool {
+    let Some(k) = open(HKEY_CURRENT_USER, sub, false) else {
+        return false;
+    };
+    let mut found = false;
+    for i in 0.. {
+        let mut name = [0u16; 256];
+        let mut len = name.len() as u32;
+        let r = unsafe {
+            RegEnumKeyExW(
+                k,
+                i,
+                name.as_mut_ptr(),
+                &mut len,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        if r != ERROR_SUCCESS {
+            break;
+        }
+        if String::from_utf16_lossy(&name[..len as usize]).starts_with(prefix) {
+            found = true;
+            break;
+        }
+    }
+    unsafe { RegCloseKey(k) };
+    found
+}
+
+pub fn read_setting_str(name: &str) -> Option<String> {
+    let d = get(HKEY_CURRENT_USER, SETTINGS, name)?;
+    let units: Vec<u16> = d
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+pub fn write_setting_str(name: &str, v: &str) {
+    let bytes: Vec<u8> = wide(v).iter().flat_map(|u| u.to_le_bytes()).collect();
+    set(HKEY_CURRENT_USER, SETTINGS, name, REG_SZ, &bytes);
 }
 
 /// Windows 11 keeps each tray icon's placement under

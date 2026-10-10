@@ -18,12 +18,21 @@ mod launch;
 #[cfg(windows)]
 mod sendto;
 #[cfg(windows)]
+mod shellmenu;
+#[cfg(windows)]
 mod sys;
 #[cfg(windows)]
 mod view;
 
 #[cfg(windows)]
 fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // Explorer's "Send to Conduit host" (conduit_shell_menu.dll) hands the
+    // selection over in a list file.
+    if args.len() == 2 && args[0] == "--send-list" {
+        sendto::send_list(std::path::Path::new(&args[1]));
+        return;
+    }
     app::run();
 }
 

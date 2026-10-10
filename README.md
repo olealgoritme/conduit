@@ -83,8 +83,9 @@ resolution does not fill the screen. Ctrl+Alt+G again releases the mouse.
 starts at logon with no prompt. Its icon shows the host GPU's live temperature
 or load; clicking it opens a popup with load, power and temperature, 60-second
 graphs and VRAM, clock and fan bars. Its Shared folders menu opens the host
-folders mounted as drives, Explorer's **Send to → Conduit host** copies files
-to the default folder, and with **Keep popup open** you can drag files onto the
+folders mounted as drives, Explorer's **Send to Conduit host** (at the top of
+the Windows 11 right-click menu, and under **Send to** in the classic one)
+copies files to the default folder, and with **Keep popup open** you can drag files onto the
 popup ([docs/WINDOWS.md](docs/WINDOWS.md#gpu-stats-tray)).
 
 More detail (building the driver yourself, knobs, troubleshooting):

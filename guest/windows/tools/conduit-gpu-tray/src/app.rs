@@ -5,8 +5,7 @@ use crate::sendto;
 use crate::sys;
 use crate::view::{self, Snapshot, Wait};
 use gpu_tray::{
-    copied_text, default_share, icon_face, path_list, tooltip, IconMetric, LineReader, Model,
-    Share, CHANNEL,
+    copied_text, default_share, icon_face, tooltip, IconMetric, LineReader, Model, Share, CHANNEL,
 };
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{
@@ -176,16 +175,9 @@ fn drop_files(hwnd: HWND, hdrop: HDROP) {
     }
     let h = hwnd as usize;
     std::thread::spawn(move || {
-        let from = path_list(&files);
-        let to = path_list(&[dest.root()]);
-        let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
-        op.wFunc = FO_COPY;
-        op.pFrom = from.as_ptr();
-        op.pTo = to.as_ptr();
-        op.fFlags = (FOF_NOCONFIRMMKDIR | FOF_ALLOWUNDO) as u16;
-        let r = unsafe { SHFileOperationW(&mut op) };
+        let ok = sendto::copy_into(&files, &dest.root());
         *DROP_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some((
-            if r == 0 && op.fAnyOperationsAborted == 0 {
+            if ok {
                 copied_text(files.len(), &dest.name)
             } else {
                 "Copy stopped".to_string()
@@ -836,6 +828,7 @@ pub fn run() {
         }
         refresh_shares();
         refresh_tray(hwnd, true);
+        crate::shellmenu::ensure_registered();
         MAIN.store(hwnd as isize, Relaxed);
         SetTimer(hwnd, TIMER, 1000, None);
         SetTimer(hwnd, ANIM, 70, None);
