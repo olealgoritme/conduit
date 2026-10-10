@@ -30,6 +30,7 @@ pub mod stage;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod userspace;
+pub mod vblank_clock;
 #[cfg(feature = "venus")]
 pub mod venus;
 pub mod virtio;
