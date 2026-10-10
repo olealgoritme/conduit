@@ -751,6 +751,25 @@ void nb_sink_abs(struct nb_sink *s, int x, int y, unsigned w, unsigned h)
     nb_emit(s, NVKVM_BROKER_EV_ABS, x, y, w, h);
 }
 
+void nb_sink_abs_resync(struct nb_sink *s, int x, int y, unsigned w,
+                        unsigned h)
+{
+    if (s->grabbed || !s->focused || !s->pointer_in) {
+        return;
+    }
+    /*
+     * The guest's input core drops an axis value equal to the one it holds,
+     * so a position the guest was sent before is never seen again -- even
+     * after its compositor moved the pointer itself (a re-plugged output
+     * puts it back at the centre).  One pixel beside it first, then the
+     * position: the guest then always ends up where the host pointer is.
+     */
+    if (w > 1) {
+        nb_emit(s, NVKVM_BROKER_EV_ABS, x > 0 ? x - 1 : x + 1, y, w, h);
+    }
+    nb_emit(s, NVKVM_BROKER_EV_ABS, x, y, w, h);
+}
+
 void nb_sink_rel(struct nb_sink *s, int dx, int dy)
 {
     if (!s->grabbed || !s->focused) {
