@@ -141,9 +141,9 @@ settings are environment variables of the process):
 
 **Known limitations:**
 
-- The guest has a single display mode, the host monitor's (5120x1440 on the
-  test machine), with no scaling: a game at a lower resolution is not
-  stretched to fill the screen.
+- The guest exposes one display mode at a time, set by `conduit up --display`,
+  `conduit view NAME WxH@HZ` or the viewer's window size. The driver does not
+  scale, so a game rendering below that mode does not fill the screen.
 - In games, use the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look.
 - Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):
   full-screen games are composed by DWM.
@@ -167,7 +167,7 @@ More:
 |---|---|
 | Host | Linux, x86-64, with KVM (`ls /dev/kvm` works) |
 | GPU | NVIDIA, Turing (RTX 20xx) or newer. Run so far: RTX 5090 (reference), RTX 4070 SUPER (one Linux-guest session) |
-| Host driver | A release Conduit has ABI tables for (535.129.03, 565.77, 580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09; `conduit doctor` lists them). Tested with the **open** kernel modules, 580 or newer; the closed modules and older branches are accepted when the release has tables, with a warning that they are untested |
+| Host driver | A release Conduit has ABI tables for (535.129.03, 565.77, 580.178.04, 595.71.05, 595.99.02, 595.104.02, 610.43.02, 610.43.03, 610.57.04, 615.71.09, 615.78.08; `conduit doctor` lists them). Tested with the **open** kernel modules, 580 or newer; the closed modules and older branches are accepted when the release has tables, with a warning that they are untested |
 | Desktop | Any Wayland desktop (GNOME, KDE, Hyprland, Sway, …) |
 | VM | Linux, kernel 6.4 or newer: Ubuntu 24.04 recommended (`conduit create`); `conduit attach` also sets up Debian and Arch-based VMs (Arch, Omarchy, EndeavourOS, Manjaro). Windows 11: experimental ([docs/WINDOWS.md](docs/WINDOWS.md)) |
 

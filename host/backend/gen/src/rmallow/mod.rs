@@ -33,8 +33,12 @@ pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
 pub mod v595_71_05;
+pub mod v595_99_02;
+pub mod v610_43_02;
+pub mod v610_43_03;
 pub mod v610_57_04;
 pub mod v615_71_09;
+pub mod v615_78_08;
 
 use crate::version::DriverVersion;
 
@@ -256,12 +260,36 @@ static PROFILES: &[Profile] = &[
         gss: || v595_71_05::GSS,
     },
     Profile {
+        version: DriverVersion::new(595, 99, 2),
+        ctrl: || v595_99_02::CTRL,
+        class: || v595_99_02::CLASS,
+        deprec: || v595_99_02::DEPREC,
+        catch_all: || v595_99_02::CATCH_ALL,
+        gss: || v595_99_02::GSS,
+    },
+    Profile {
         version: DriverVersion::new(595, 104, 2),
         ctrl: || v595_104_02::CTRL,
         class: || v595_104_02::CLASS,
         deprec: || v595_104_02::DEPREC,
         catch_all: || v595_104_02::CATCH_ALL,
         gss: || v595_104_02::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(610, 43, 2),
+        ctrl: || v610_43_02::CTRL,
+        class: || v610_43_02::CLASS,
+        deprec: || v610_43_02::DEPREC,
+        catch_all: || v610_43_02::CATCH_ALL,
+        gss: || v610_43_02::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(610, 43, 3),
+        ctrl: || v610_43_03::CTRL,
+        class: || v610_43_03::CLASS,
+        deprec: || v610_43_03::DEPREC,
+        catch_all: || v610_43_03::CATCH_ALL,
+        gss: || v610_43_03::GSS,
     },
     Profile {
         version: DriverVersion::new(610, 57, 4),
@@ -278,6 +306,14 @@ static PROFILES: &[Profile] = &[
         deprec: || v615_71_09::DEPREC,
         catch_all: || v615_71_09::CATCH_ALL,
         gss: || v615_71_09::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(615, 78, 8),
+        ctrl: || v615_78_08::CTRL,
+        class: || v615_78_08::CLASS,
+        deprec: || v615_78_08::DEPREC,
+        catch_all: || v615_78_08::CATCH_ALL,
+        gss: || v615_78_08::GSS,
     },
 ];
 
@@ -528,9 +564,10 @@ mod tests {
 
     #[test]
     fn an_unknown_release_falls_back_and_says_so() {
-        let sel = select(v(615, 80, 0)).unwrap();
+        let sel = select(v(615, 999, 0)).unwrap();
         assert!(!sel.exact);
-        assert!(std::ptr::eq(sel.ctrl, v615_71_09::CTRL));
+        let newest = PROFILES.last().unwrap();
+        assert!(std::ptr::eq(sel.ctrl, (newest.ctrl)()));
         assert!(select(v(500, 0, 0)).is_none());
     }
 

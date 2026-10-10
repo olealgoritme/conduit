@@ -52,9 +52,9 @@ Experimental, behind `--venus` ([WINDOWS.md](WINDOWS.md), [VENUS.md](VENUS.md)).
 Rendering is on NVK-on-RM; Venus is the fallback for processes the policy
 keeps off NVK.
 
-- One display mode, the host monitor's (5120x1440 on the test machine), and
-  no scaling: a game at a lower resolution is not stretched to fill the
-  screen.
+- One display mode at a time, set by `conduit up --display`,
+  `conduit view NAME WxH@HZ` or the viewer's window size. The driver does not
+  scale, so a game rendering below that mode does not fill the screen.
 - Games need the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look; without
   it the guest gets absolute tablet positions.
 - Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):

@@ -43,10 +43,16 @@ releases and opens a PR. By hand:
 .github/scripts/abi_update.py --gvisor ~/src/gvisor --report /tmp/abi.md
 # or one table at a time, against an open-gpu-kernel-modules checkout at the tag:
 host/backend/gen/vidmem_extract.py --ogkm ~/src/ogkm-615.71.09 --version 615.71.09 \
-    > host/backend/gen/src/vidmem/v615_71_09.rs      # then add `pub mod` to mod.rs
+    > host/backend/gen/src/vidmem/v615_71_09.rs      # then add `pub mod` and a `PROFILES` entry to mod.rs
 cd host/backend && cargo test -p abi                  # tables vs. each other and neighbours
 make guest                                            # the guest module with the new headers
 ```
+
+A release is registered in each table's `mod.rs` twice, a `pub mod` line and a
+`PROFILES` entry (ascending); the `abi` crate's `registration` test fails for a
+table file with only one of them. The CLI keeps a built-in copy of the supported
+list (`BUILT_IN` in `cli/src/host.rs`), which a CLI test compares with
+`packaging/supported-drivers.sh`.
 
 `fixtures/*.tsv` are ioctl parameter sizes captured on real hardware;
 `src/fixtures.rs` checks the tables against them.
