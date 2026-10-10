@@ -60,7 +60,7 @@ pub const HELIOS_ESCAPE_QUERY_SCANOUT: u32 = 0x000D;
 /// [`HeliosEscapeMapReadLedger`] and [`HeliosReadLedgerPage`].
 pub const HELIOS_ESCAPE_MAP_READ_LEDGER: u32 = 0x000E;
 /// Register/unregister a PERSISTENT per-device usermode event the KMD signals
-/// on every scanout-read retirement (D4a scanout acquire). Unlike the one-shot
+/// after scanout-read retirements (D4a scanout acquire). Unlike the one-shot
 /// fence events (0x000B/C) this registration survives signals; the consumer is
 /// level-triggered (re-reads the ledger on every wake). See
 /// [`HeliosEscapeScanoutEvent`].

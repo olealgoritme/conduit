@@ -428,6 +428,9 @@ impl AdapterContext {
             // release would otherwise be the first wild use of it.
             unsafe { KeReleaseSpinLock(lock, irql) };
             WITH_VIRTIO_TORN.fetch_add(1, Ordering::Relaxed);
+            // `f` may own a flush token; it retires in its `Drop`, and with
+            // `self` in doubt there is no ledger to broadcast through.
+            drop(f);
             return Err(NotStarted);
         }
         // SAFETY: spinlock-guarded exclusive access to the cell's contents for the
@@ -441,7 +444,13 @@ impl AdapterContext {
                 }
                 Ok(result)
             }
-            None => Err(NotStarted),
+            None => {
+                // The unconsumed closure may own flush tokens, whose `Drop`
+                // retires their ledger reads: drop it before the broadcast
+                // below rather than after it.
+                drop(f);
+                Err(NotStarted)
+            }
         };
         // SAFETY: same address/IRQL pair the acquire above produced.
         unsafe { KeReleaseSpinLock(lock, irql) };

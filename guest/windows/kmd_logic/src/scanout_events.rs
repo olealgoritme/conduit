@@ -269,10 +269,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_signal_pass_keeps_registrations() {
-        // A transport reset signals every entry (`live`) and removes none: a
-        // device that survives the reset keeps its event without having to
-        // notice the reset, and its re-register stays idempotent.
+    fn signal_pass_keeps_registrations() {
+        // `ReadLedger::reset` and every broadcast signal through `live` and
+        // remove nothing (the KMD side cannot be host-tested; this pins the
+        // table half): a device that survives a transport reset keeps its
+        // event, and its re-register stays idempotent.
         let mut t = Table::new();
         t.register(1, 11);
         t.register(2, 21);
