@@ -1,9 +1,12 @@
 //! The Conduit BIOS: the distro's UEFI firmware (edk2 OVMF) rebuilt with the
 //! Conduit boot logo, shipped in the optional `conduit-bios` package
 //! (packaging/bios). `conduit attach` points a VM's <loader> at it when the VM
-//! uses the stock firmware variant it was built to match; the VM's NVRAM vars
-//! file stays as it is (same layout), so boot entries and TPM state carry over.
-//! `conduit detach` puts the original definition back, stock loader included.
+//! uses the stock firmware variant it was built to match (Debian/Ubuntu's
+//! ovmf, the same edk2 build); the VM's NVRAM vars file stays as it is (same
+//! layout), so boot entries and Secure Boot keys carry over. A TPM measures
+//! the firmware (PCR0), so a key sealed to the TPM (BitLocker, LUKS with a TPM
+//! token) asks for its recovery once after the swap ([`TPM_WARNING`]).
+//! `conduit detach` puts the stock loader back.
 
 use std::path::{Path, PathBuf};
 
@@ -21,22 +24,31 @@ const STOCK: &[(&str, &str)] = &[
     ("/usr/share/OVMF/OVMF_CODE_4M.snakeoil.fd", SECBOOT),
 ];
 
-/// Where the package puts the images, in lookup order after $CONDUIT_BIOS_DIR.
+/// Where the package puts the images, in lookup order after $CONDUIT_BIOS_DIR
+/// (which points a development build at packaging/bios/build.sh's output).
 const DIRS: &[&str] = &["/usr/share/conduit/bios", "/opt/conduit/share/conduit/bios"];
+
+/// The directories [`installed_dir`] looks in, in order. Only installed
+/// locations (and an explicit $CONDUIT_BIOS_DIR): a firmware a VM boots from
+/// must not live in a source checkout's build output.
+fn candidates(env: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = env.into_iter().map(PathBuf::from).collect();
+    v.extend(DIRS.iter().map(PathBuf::from));
+    v.push(crate::paths::prefix().join("share/conduit/bios"));
+    v
+}
 
 /// The directory holding the installed Conduit BIOS, if any.
 pub fn installed_dir() -> Option<PathBuf> {
-    let mut v: Vec<PathBuf> = Vec::new();
-    if let Some(d) = std::env::var_os("CONDUIT_BIOS_DIR") {
-        v.push(d.into());
-    }
-    v.extend(DIRS.iter().map(PathBuf::from));
-    v.push(crate::paths::prefix().join("share/conduit/bios"));
-    if let Some(r) = crate::paths::repo_root() {
-        v.push(r.join("target/conduit-bios/out")); // packaging/bios/build.sh
-    }
-    v.into_iter().find(|d| d.join(PLAIN).is_file())
+    candidates(std::env::var_os("CONDUIT_BIOS_DIR"))
+        .into_iter()
+        .find(|d| d.join(PLAIN).is_file())
 }
+
+/// What a firmware swap means for a VM with a TPM.
+pub const TPM_WARNING: &str = "This VM has a TPM, and changing its firmware changes the TPM's boot measurement (PCR0): \
+a disk key sealed to the TPM (BitLocker, LUKS with a TPM2 token) asks for its recovery key once at the next boot. \
+In Windows, suspend BitLocker before restarting the VM: manage-bde -protectors -disable C: -RebootCount 1";
 
 /// The Conduit image matching a stock loader path.
 pub fn image_for(stock: &str) -> Option<&'static str> {
@@ -44,7 +56,7 @@ pub fn image_for(stock: &str) -> Option<&'static str> {
 }
 
 /// Is this loader path a Conduit BIOS image (wherever it is installed)?
-fn is_ours(loader: &str) -> bool {
+pub fn is_ours(loader: &str) -> bool {
     Path::new(loader)
         .file_name()
         .is_some_and(|n| n == PLAIN || n == SECBOOT)
@@ -61,10 +73,26 @@ pub struct Plan {
     pub note: Option<String>,
 }
 
+/// The stock loader a Conduit BIOS loader stands in for: the one an earlier
+/// attach recorded, else the stock image of the same variant.
+pub fn stock_for(cur: &str, recorded: Option<&str>) -> String {
+    recorded
+        .map(str::to_string)
+        .or_else(|| {
+            STOCK
+                .iter()
+                .find(|(_, c)| Path::new(cur).file_name().is_some_and(|n| n == *c))
+                .map(|(s, _)| s.to_string())
+        })
+        .unwrap_or_else(|| STOCK[0].0.to_string())
+}
+
 /// Decide the loader. `loader` is the domain's <loader> path, `pflash`
 /// whether it is a pflash loader, `recorded` the stock path an earlier attach
 /// remembered, `bios` the installed Conduit BIOS directory, and `fits` whether
-/// the installed image may replace a given stock file (`Err` says why not).
+/// the installed image may replace a given stock file (`Err` says why not;
+/// it is asked again for a VM already on the Conduit BIOS, so a missing or
+/// mismatched image puts the stock loader back).
 pub fn plan(
     loader: Option<&str>,
     pflash: bool,
@@ -81,38 +109,37 @@ pub fn plan(
         return none(None); // SeaBIOS, or firmware='efi' without an explicit loader
     };
     if is_ours(cur) {
-        // Attached before: keep it (moved to the current install), or go
-        // back to the stock loader when the package is gone.
-        let stock = recorded
-            .map(str::to_string)
-            .or_else(|| {
-                STOCK
-                    .iter()
-                    .find(|(_, c)| Path::new(cur).file_name().is_some_and(|n| n == *c))
-                    .map(|(s, _)| s.to_string())
-            })
-            .unwrap_or_else(|| STOCK[0].0.to_string());
+        // Attached before: keep it (moved to the current install) while it
+        // still fits, or go back to the stock loader.
+        let stock = stock_for(cur, recorded);
         let name = Path::new(cur)
             .file_name()
             .unwrap()
             .to_string_lossy()
             .to_string();
+        let back = |why: String| Plan {
+            note: Some(format!(
+                "{why}: the VM boots its stock firmware again ({stock})."
+            )),
+            loader: Some(stock.clone()),
+            stock: None,
+        };
         return match bios {
             Some(d) => {
-                let want = d.join(&name).display().to_string();
-                Plan {
-                    loader: (want != cur).then_some(want),
-                    stock: Some(stock),
-                    note: None,
+                let want = d.join(&name);
+                match fits(&stock, &want) {
+                    Ok(()) => {
+                        let want = want.display().to_string();
+                        Plan {
+                            loader: (want != cur).then_some(want),
+                            stock: Some(stock),
+                            note: None,
+                        }
+                    }
+                    Err(why) => back(format!("The Conduit BIOS no longer fits ({why})")),
                 }
             }
-            None => Plan {
-                note: Some(format!(
-                    "The Conduit BIOS is no longer installed: the VM boots its stock firmware again ({stock})."
-                )),
-                loader: Some(stock),
-                stock: None,
-            },
+            None => back("The Conduit BIOS is no longer installed".into()),
         };
     }
     let Some(img) = image_for(cur).filter(|_| pflash) else {
@@ -134,7 +161,7 @@ pub fn plan(
         loader: Some(path.display().to_string()),
         stock: Some(cur.to_string()),
         note: Some(format!(
-            "Boots with the Conduit BIOS ({img}); its NVRAM vars file is kept."
+            "Boots with the Conduit BIOS ({img}); its NVRAM vars file (boot entries, Secure Boot keys) is kept."
         )),
     }
 }
@@ -151,12 +178,74 @@ fn descriptor_dirs() -> Vec<PathBuf> {
     ]
 }
 
-/// The real check behind `fits`. An existing stock file must have the same
-/// size as the Conduit image (same flash layout). With firmware='efi'
-/// libvirt only accepts a loader some firmware descriptor names; the
-/// conduit-bios package installs them (packaging/bios/firmware).
+/// The Ubuntu ovmf build the images were made from: OVMF_VERSION next to
+/// them (packaging/bios/build.sh), else the pin this conduit was built with.
+fn built_for(conduit: &Path) -> String {
+    conduit
+        .parent()
+        .and_then(|d| std::fs::read_to_string(d.join("OVMF_VERSION")).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| pinned_ovmf().to_string())
+}
+
+/// EDK2_DEB_VERSION from packaging/bios/version.sh.
+fn pinned_ovmf() -> &'static str {
+    include_str!("../../packaging/bios/version.sh")
+        .lines()
+        .find_map(|l| l.strip_prefix("EDK2_DEB_VERSION="))
+        .map(str::trim)
+        .expect("packaging/bios/version.sh sets EDK2_DEB_VERSION")
+}
+
+/// The host's ovmf package version (Debian/Ubuntu), if dpkg knows one.
+fn host_ovmf() -> Option<String> {
+    crate::sys::output("dpkg-query", &["-W", "-f=${Version}", "ovmf"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Is the host's stock firmware (ovmf `host`) the edk2 build the Conduit
+/// images were made from (`built`, e.g. 2024.02-2ubuntu0.9)? The same
+/// upstream release and Ubuntu packaging base ("2024.02-2ubuntu"): Ubuntu's
+/// stable updates (0.9 -> 0.10) keep the flash and varstore layout, another
+/// upstream release or Debian's own build (other flags) may not.
+pub fn same_build(host: Option<&str>, built: &str) -> Result<(), String> {
+    let base = |v: &str| {
+        v.find("ubuntu")
+            .map(|i| v[..i + "ubuntu".len()].to_string())
+    };
+    let Some(host) = host else {
+        return Err(
+            "the stock firmware is not Debian/Ubuntu's ovmf package (dpkg does not list it)".into(),
+        );
+    };
+    match (base(host), base(built)) {
+        (Some(h), Some(b)) if h == b => Ok(()),
+        _ => Err(format!(
+            "the stock firmware is ovmf {host}, a different edk2 build than the Conduit BIOS's ({built})"
+        )),
+    }
+}
+
+/// The real check behind `fits`. The Conduit image must exist, the host's
+/// ovmf must be the edk2 build it was made from ([`same_build`]), and an
+/// existing stock file must have the same size (same flash layout). With
+/// firmware='efi' libvirt only accepts a loader some firmware descriptor
+/// names; the conduit-bios package installs them (packaging/bios/firmware).
 pub fn check(stock: &str, conduit: &Path, autoselect: bool) -> Result<(), String> {
+    check_with(stock, conduit, autoselect, host_ovmf().as_deref())
+}
+
+fn check_with(
+    stock: &str,
+    conduit: &Path,
+    autoselect: bool,
+    host: Option<&str>,
+) -> Result<(), String> {
     let c = std::fs::metadata(conduit).map_err(|e| format!("{}: {e}", conduit.display()))?;
+    same_build(host, &built_for(conduit))?;
     if let Ok(s) = std::fs::metadata(stock) {
         if s.len() != c.len() {
             return Err("it does not match the installed Conduit BIOS build (flash size)".into());
@@ -292,6 +381,92 @@ mod tests {
             p.loader.as_deref(),
             Some("/usr/share/OVMF/OVMF_CODE_4M.secboot.fd")
         );
+    }
+
+    #[test]
+    fn reattach_falls_back_to_stock_when_the_image_no_longer_fits() {
+        // A missing image (the package half removed, a moved install) or a
+        // different build: the stock loader comes back, with the reason.
+        let cur = "/usr/share/conduit/bios/conduit-bios.secboot.fd";
+        let rec = Some("/usr/share/OVMF/OVMF_CODE_4M.ms.fd");
+        let p = plan(Some(cur), true, rec, Some(Path::new(DIR)), &no);
+        assert_eq!(p.loader.as_deref(), rec);
+        assert_eq!(p.stock, None);
+        let note = p.note.unwrap();
+        assert!(note.contains("different build"), "{note}");
+        assert!(note.contains("OVMF_CODE_4M.ms.fd"), "{note}");
+        // The real check: an image that is not there does not fit.
+        let gone = Path::new("/nonexistent/conduit-bios/conduit-bios.fd");
+        let p = plan(
+            Some(cur),
+            true,
+            rec,
+            Some(Path::new("/nonexistent/conduit-bios")),
+            &|s, i| check_with(s, i, false, Some("2024.02-2ubuntu0.9")),
+        );
+        assert_eq!(p.loader.as_deref(), rec, "{p:?}");
+        assert!(check_with("/x", gone, false, Some("2024.02-2ubuntu0.9")).is_err());
+    }
+
+    #[test]
+    fn the_bios_is_only_looked_for_where_it_is_installed() {
+        let c = candidates(Some("/dev/bios".into()));
+        assert_eq!(c[0], PathBuf::from("/dev/bios"), "$CONDUIT_BIOS_DIR first");
+        assert!(c.contains(&PathBuf::from("/usr/share/conduit/bios")));
+        assert!(
+            !c.iter().any(|d| d.to_string_lossy().contains("target/")),
+            "no build output of a source checkout: {c:?}"
+        );
+        if let Some(r) = crate::paths::repo_root() {
+            assert!(!candidates(None).iter().any(|d| d.starts_with(&r)), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_same_edk2_build_is_swapped() {
+        let built = "2024.02-2ubuntu0.9";
+        assert_eq!(same_build(Some("2024.02-2ubuntu0.9"), built), Ok(()));
+        assert_eq!(
+            same_build(Some("2024.02-2ubuntu0.11"), built),
+            Ok(()),
+            "an Ubuntu stable update of the same build"
+        );
+        for other in [
+            "2025.02-3ubuntu1",   // a newer Ubuntu release
+            "2024.02-3ubuntu0.1", // another packaging base
+            "2024.02-2",          // Debian's own build
+            "2025.02-8",          // Debian trixie
+        ] {
+            let e = same_build(Some(other), built).unwrap_err();
+            assert!(e.contains(other), "{e}");
+        }
+        assert!(same_build(None, built)
+            .unwrap_err()
+            .contains("not Debian/Ubuntu"));
+        // check() refuses a matching file size from another build.
+        let d = std::env::temp_dir().join(format!("conduit-bios-build-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let img = d.join(PLAIN);
+        let stock = d.join("OVMF_CODE_4M.fd");
+        std::fs::write(&img, [0u8; 64]).unwrap();
+        std::fs::write(&stock, [1u8; 64]).unwrap();
+        std::fs::write(d.join("OVMF_VERSION"), "2024.02-2ubuntu0.9\n").unwrap();
+        let s = stock.to_str().unwrap();
+        assert_eq!(
+            check_with(s, &img, false, Some("2024.02-2ubuntu0.10")),
+            Ok(())
+        );
+        assert!(check_with(s, &img, false, Some("2025.02-8")).is_err());
+        assert!(check_with(s, &img, false, None).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+        // Without OVMF_VERSION (an older package) the compiled-in pin counts.
+        assert!(pinned_ovmf().contains("ubuntu"), "{}", pinned_ovmf());
+    }
+
+    #[test]
+    fn the_tpm_warning_says_what_to_do() {
+        assert!(TPM_WARNING.contains("PCR0"));
+        assert!(TPM_WARNING.contains("manage-bde -protectors -disable C: -RebootCount 1"));
     }
 
     #[test]

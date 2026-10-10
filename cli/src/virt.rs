@@ -199,7 +199,7 @@ impl Virsh {
         let dir = paths::vm_dir(name);
         std::fs::create_dir_all(&dir)?;
         let tmp = dir.join(".libvirt-define.xml");
-        std::fs::write(&tmp, xml)?;
+        sys::write_private(&tmp, xml)?;
         let r = self.run(&["define", "--validate", tmp.to_str().unwrap()]);
         let _ = std::fs::remove_file(&tmp);
         r.map(|_| ())
@@ -685,6 +685,9 @@ pub fn start(name: &str, link: &Link) -> Result<()> {
             ));
         }
     }
+    // An attached VM whose Conduit BIOS image is gone goes back to its stock
+    // firmware first; it would not boot otherwise.
+    crate::libvirt::ensure_firmware(name, link)?;
     v.run(&["start", &link.domain]).map_err(|e| {
         let log = if link.is_system() {
             format!("/var/log/libvirt/qemu/{}.log", link.domain)
