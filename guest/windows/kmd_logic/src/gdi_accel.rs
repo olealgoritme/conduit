@@ -1837,6 +1837,8 @@ pub const COUNTERS: &[&str] = &[
     "GdiLutC",
     "GdiLutR",
     "GdiLutSWH",
+    "GdiLutAp",
+    "GdiLutId",
     "GdiPitchIgn",
     "GdiPitchIgnV",
     // Copies and fills with a staging buffer on one side run on the copy engine over the buffer's

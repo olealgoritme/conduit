@@ -327,6 +327,10 @@ static LUT_F: AtomicU32 = AtomicU32::new(0);
 static LUT_C: AtomicU32 = AtomicU32::new(0);
 static LUT_R: AtomicU32 = AtomicU32::new(0);
 static LUT_SWH: AtomicU32 = AtomicU32::new(0);
+/// The aperture history (`aperture_pages::history`) of the last gamma-table command's source
+/// (low 8 bits) and destination (<< 8), and their resource ids (source | destination << 16).
+static LUT_AP: AtomicU32 = AtomicU32::new(0);
+static LUT_ID: AtomicU32 = AtomicU32::new(0);
 /// Command pitches the CPU executor ignored (the surface is not `STAGING_CPUVISIBLE` /
 /// `EXISTINGSYSMEM`, Learn `DXGK_GDIARG_BITBLT` remarks), and the last one ignored.
 static PITCH_IGN: AtomicU32 = AtomicU32::new(0);
@@ -343,6 +347,9 @@ fn note_lut(op: &Op) {
     let r = op.subs.first().copied().unwrap_or_default();
     LUT_R.store(lo16(r.width()) << 16 | lo16(r.height()), Ordering::Relaxed);
     LUT_SWH.store(src.map_or(0, |s| lo16(s.width) << 16 | lo16(s.height)), Ordering::Relaxed);
+    let hist = |x: Option<Surface>| x.map_or(0, |x| crate::ddi::aperture_pages::history(x.resource_id) & 0xff);
+    LUT_AP.store(hist(src) | hist(dst) << 8, Ordering::Relaxed);
+    LUT_ID.store(src.map_or(0, |s| lo16(s.resource_id)) | dst.map_or(0, |d| lo16(d.resource_id)) << 16, Ordering::Relaxed);
 }
 
 /// The CPU executor's failing step (`GdiDropS` low byte): 1 source window size, 2 source rows
@@ -434,7 +441,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &PITCH_IGN, &PITCH_IGN_V,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &PITCH_IGN, &PITCH_IGN_V,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -583,6 +590,8 @@ pub(crate) fn publish_counters() {
     w(b"GdiLutC", LUT_C.load(Ordering::Relaxed));
     w(b"GdiLutR", LUT_R.load(Ordering::Relaxed));
     w(b"GdiLutSWH", LUT_SWH.load(Ordering::Relaxed));
+    w(b"GdiLutAp", LUT_AP.load(Ordering::Relaxed));
+    w(b"GdiLutId", LUT_ID.load(Ordering::Relaxed));
     w(b"GdiPitchIgn", PITCH_IGN.load(Ordering::Relaxed));
     w(b"GdiPitchIgnV", PITCH_IGN_V.load(Ordering::Relaxed));
 }
