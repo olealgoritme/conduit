@@ -1886,11 +1886,9 @@ pub(crate) unsafe extern "system" fn resolve_shared_resource(
         width,
         height
     );
-    if let Some(context) = d3d11_context(Hdevice {
+    gdi_handoff(Hdevice {
         pDrvPrivate: h as *mut c_void,
-    }) {
-        context.Flush();
-    }
+    });
     0
 }
 
@@ -1913,10 +1911,37 @@ pub(crate) unsafe extern "system" fn dxgi_resolve_shared_resource(
         width,
         height
     );
-    if let Some(context) = d3d11_context(Hdevice {
+    gdi_handoff(Hdevice {
         pDrvPrivate: h_device as *mut c_void,
-    }) {
-        context.Flush();
-    }
+    });
     0
+}
+
+/// GDI is about to read or draw the GDI-compatible `hResource` (DXGI calls ResolveSharedResource
+/// from `IDXGISurface1::GetDC`): submit what this device recorded, and on NVK wait until the GPU
+/// has finished it. The GDI acceleration executor in the KMD reads and writes the image with its
+/// own copy engine; dxgkrnl orders GDI's DMA buffers against this device's only when the device
+/// submits through dxgkrnl, and NVK submits to RM directly, so without the wait GDI could read
+/// the image before the device's last rendering landed (or draw into it and be overwritten by
+/// it): `gdi_interop_probe` round 0 of every process, RichEdit's text in Notepad. Venus devices
+/// submit through dxgkrnl, which orders the GDI work after theirs.
+pub(crate) unsafe fn gdi_handoff(h: Hdevice) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    context.Flush();
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if !dev.dxvk.is_nvk() {
+        return;
+    }
+    let Some(start) = super::transfer::wait_submitted(dev, &context, "GetDC flush wait") else {
+        return;
+    };
+    static WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 4 || n % 1024 == 0 {
+        log_error!("DDI NVK GetDC flush wait #{n}: {} us", start.elapsed().as_micros());
+    }
 }

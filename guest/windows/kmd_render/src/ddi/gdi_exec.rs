@@ -301,6 +301,53 @@ const PATH_DIAG: u32 = 256;
 static SYNC_N: AtomicU32 = AtomicU32::new(0);
 static SYNC_OPS: AtomicU32 = AtomicU32::new(0);
 
+/// The last command the CPU executor dropped (`run_cpu` failed), so a lost command names itself:
+/// its signature (`GdiSlowOp` encoding), the failing step | the `Why` << 8 | the standard
+/// buffer's failing step (`build_paging_buffer::last_std_fail`) << 16, the surfaces' kinds
+/// (`kind_bits`, source low 16 | destination << 16), D3DDDIFORMATs, authored pitches and extents
+/// (w << 16 | h), the command's pitches (source | destination << 16), and its first
+/// sub-rectangle (left << 16 | top, w << 16 | h).
+static DROP_K: AtomicU32 = AtomicU32::new(0);
+static DROP_S: AtomicU32 = AtomicU32::new(0);
+static DROP_T: AtomicU32 = AtomicU32::new(0);
+static DROP_F: AtomicU32 = AtomicU32::new(0);
+static DROP_P: AtomicU32 = AtomicU32::new(0);
+static DROP_C: AtomicU32 = AtomicU32::new(0);
+static DROP_SWH: AtomicU32 = AtomicU32::new(0);
+static DROP_DWH: AtomicU32 = AtomicU32::new(0);
+static DROP_O: AtomicU32 = AtomicU32::new(0);
+static DROP_R: AtomicU32 = AtomicU32::new(0);
+/// The CPU executor's failing step (`GdiDropS` low byte): 1 source window size, 2 source rows
+/// past its pitch, 3 source span, 4 source read, 5 destination write, 6 window size, 7 memory.
+static CPU_STEP: AtomicU32 = AtomicU32::new(0);
+
+fn cpu_step(n: u32) {
+    CPU_STEP.store(n, Ordering::Relaxed);
+}
+
+fn note_drop(op: &Op, why: Why) {
+    let lo16 = |v: u32| v & 0xffff;
+    let wh = |s: Option<Surface>| s.map_or(0, |s| lo16(s.width) << 16 | lo16(s.height));
+    let (src, dst) = (op.srcs[0], op.dst);
+    let (dpc, spc) = cmd_pitches(&op.cmd);
+    DROP_K.store(op_signature(op), Ordering::Relaxed);
+    DROP_S.store(
+        (CPU_STEP.load(Ordering::Relaxed) & 0xff)
+            | why.code() << 8
+            | (crate::ddi::build_paging_buffer::last_std_fail() & 0xff) << 16,
+        Ordering::Relaxed,
+    );
+    DROP_T.store(src.map_or(0, |s| lo16(s.kind_bits)) | dst.map_or(0, |d| lo16(d.kind_bits)) << 16, Ordering::Relaxed);
+    DROP_F.store(src.map_or(0, |s| lo16(s.format)) | dst.map_or(0, |d| lo16(d.format)) << 16, Ordering::Relaxed);
+    DROP_P.store(src.map_or(0, |s| lo16(s.pitch)) | dst.map_or(0, |d| lo16(d.pitch)) << 16, Ordering::Relaxed);
+    DROP_C.store(lo16(spc) | lo16(dpc) << 16, Ordering::Relaxed);
+    DROP_SWH.store(wh(src), Ordering::Relaxed);
+    DROP_DWH.store(wh(dst), Ordering::Relaxed);
+    let r = op.subs.first().copied().unwrap_or_default();
+    DROP_O.store(lo16(r.left as u32) << 16 | lo16(r.top as u32), Ordering::Relaxed);
+    DROP_R.store(lo16(r.width()) << 16 | lo16(r.height()), Ordering::Relaxed);
+}
+
 /// Whether `translate` runs the commands itself (`GdiOff` 0x80).
 pub(crate) fn sync_mode() -> bool {
     path(PATH_SYNC)
@@ -359,7 +406,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -492,6 +539,16 @@ pub(crate) fn publish_counters() {
     w(b"GdiJobT3", JOB_T[4].load(Ordering::Relaxed));
     w(b"GdiJobT3Us", JOB_T[5].load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
+    w(b"GdiDropK", DROP_K.load(Ordering::Relaxed));
+    w(b"GdiDropS", DROP_S.load(Ordering::Relaxed));
+    w(b"GdiDropT", DROP_T.load(Ordering::Relaxed));
+    w(b"GdiDropF", DROP_F.load(Ordering::Relaxed));
+    w(b"GdiDropP", DROP_P.load(Ordering::Relaxed));
+    w(b"GdiDropC", DROP_C.load(Ordering::Relaxed));
+    w(b"GdiDropSWH", DROP_SWH.load(Ordering::Relaxed));
+    w(b"GdiDropDWH", DROP_DWH.load(Ordering::Relaxed));
+    w(b"GdiDropO", DROP_O.load(Ordering::Relaxed));
+    w(b"GdiDropR", DROP_R.load(Ordering::Relaxed));
 }
 
 /// The channel up for a job that needs it (a VRAM surface on either side): bring it up when it is
@@ -1283,12 +1340,14 @@ fn execute_inner(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
 fn run_cpu_counted(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     CPU_MSK.fetch_or(op.why.map_or(1, |w| w.bit()), Ordering::Relaxed);
     CPU_ROP.store(rop_key(op), Ordering::Relaxed);
+    CPU_STEP.store(0, Ordering::Relaxed);
     match run_cpu(passive, adapter, op) {
         Ok(()) => {
             FALL.fetch_add(1, Ordering::Relaxed);
             self_check(passive, adapter, op, 3);
         }
         Err(why) => {
+            note_drop(op, why);
             crate::ddi::gdi_accel::note_why(why);
             crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
         }
@@ -1706,31 +1765,42 @@ fn read_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rec
     let (w, h) = (rect.width() as usize, rect.height() as usize);
     let bytes = (w as u64) * 4 * h as u64;
     if bytes == 0 || bytes > MAX_WINDOW_BYTES {
+        cpu_step(1);
         return Err(Why::CpuFailed);
     }
     let mut out = Vec::new();
-    out.try_reserve_exact(bytes as usize).map_err(|_| Why::CpuFailed)?;
+    out.try_reserve_exact(bytes as usize).map_err(|_| {
+        cpu_step(7);
+        Why::CpuFailed
+    })?;
     out.resize(bytes as usize, 0);
     match s.class {
         SurfaceClass::Vram => {
             if !glue::vram_read(passive, adapter, s.resource_id, *rect, &mut out, w * 4) {
+                cpu_step(4);
                 return Err(Why::CpuFailed);
             }
         }
         SurfaceClass::System => {
             let p = pitch as u64;
             if p < (rect.right as u64) * 4 {
+                cpu_step(2);
                 return Err(Why::OutOfBounds);
             }
             let start = rect.top as u64 * p + rect.left as u64 * 4;
             let span = (h as u64 - 1) * p + w as u64 * 4;
             if span > MAX_WINDOW_BYTES * 2 {
+                cpu_step(3);
                 return Err(Why::CpuFailed);
             }
             let mut tmp = Vec::new();
-            tmp.try_reserve_exact(span as usize).map_err(|_| Why::CpuFailed)?;
+            tmp.try_reserve_exact(span as usize).map_err(|_| {
+                cpu_step(7);
+                Why::CpuFailed
+            })?;
             tmp.resize(span as usize, 0);
             if !glue::std_read(passive, adapter, s.resource_id, start, &mut tmp) {
+                cpu_step(4);
                 return Err(Why::CpuFailed);
             }
             for y in 0..h {
@@ -1743,6 +1813,7 @@ fn read_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rec
                 return Err(Why::Unreachable);
             }
             if !glue::foreign_read(passive, adapter, s.resource_id, *rect, &mut out, w * 4) {
+                cpu_step(4);
                 FGN_RMW_FAIL.fetch_add(1, Ordering::Relaxed);
                 return Err(Why::CpuFailed);
             }
@@ -1754,6 +1825,14 @@ fn read_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rec
 }
 
 fn write_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rect: &Rect, pitch: u32, data: &mut [u8]) -> Result<(), Why> {
+    let r = write_window_inner(passive, adapter, s, rect, pitch, data);
+    if r.is_err() {
+        cpu_step(5);
+    }
+    r
+}
+
+fn write_window_inner(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rect: &Rect, pitch: u32, data: &mut [u8]) -> Result<(), Why> {
     let w = rect.width();
     match s.class {
         SurfaceClass::Vram => {
@@ -1892,10 +1971,14 @@ fn run_cpu_fill(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &
             continue;
         }
         if bytes > MAX_WINDOW_BYTES {
+            cpu_step(6);
             return Err(Why::CpuFailed);
         }
         let mut buf = Vec::new();
-        buf.try_reserve_exact(bytes as usize).map_err(|_| Why::CpuFailed)?;
+        buf.try_reserve_exact(bytes as usize).map_err(|_| {
+            cpu_step(7);
+            Why::CpuFailed
+        })?;
         let px = color.to_le_bytes();
         for _ in 0..area(&d) {
             buf.extend_from_slice(&px);

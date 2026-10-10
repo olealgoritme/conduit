@@ -622,6 +622,54 @@ pub(crate) fn keyed_flush_wait_forced() -> bool {
     })
 }
 
+/// Wait on the CPU until every command `dev` submitted so far has completed on the GPU: an event
+/// query issued now signals when all earlier work is done (DXVK tracks it with the submission's
+/// fence; on NVK an RM semaphore). `None` when no query could be made. `what` names the caller in
+/// the log.
+pub(crate) unsafe fn wait_submitted(
+    dev: &crate::device_funcs::HeliosDevice,
+    context: &ID3D11DeviceContext,
+    what: &str,
+) -> Option<std::time::Instant> {
+    let device = dev.dxvk.d3d11_device()?;
+    let desc = windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC {
+        Query: windows::Win32::Graphics::Direct3D11::D3D11_QUERY_EVENT,
+        MiscFlags: 0,
+    };
+    let mut query = None;
+    if device.CreateQuery(&desc, Some(&mut query)).is_err() {
+        return None;
+    }
+    let query = query?;
+    context.End(&query);
+    let start = std::time::Instant::now();
+    let mut done: windows::Win32::Foundation::BOOL = Default::default();
+    loop {
+        // Raw HRESULT: S_FALSE (not yet) must not read as success. Flags 0
+        // flushes, so the query itself is submitted.
+        let hr = (Interface::vtable(context).GetData)(
+            Interface::as_raw(context),
+            Interface::as_raw(&query),
+            (&mut done as *mut windows::Win32::Foundation::BOOL).cast(),
+            core::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32,
+            0,
+        );
+        if hr.0 == 0 && done.as_bool() {
+            break;
+        }
+        if hr.0 < 0 {
+            log_error!("DDI NVK {what}: GetData 0x{:08x}", hr.0 as u32);
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            log_error!("DDI NVK {what}: GPU not done after 5 s, going on");
+            break;
+        }
+        std::thread::yield_now();
+    }
+    Some(start)
+}
+
 /// NVK with a live keyed-mutex shared resource (docs/shared-surfaces.md §4,
 /// v1): wait on the CPU until every command this device submitted so far has
 /// completed on the GPU. The Microsoft runtime releases a keyed mutex right
@@ -642,46 +690,9 @@ pub(crate) unsafe fn nvk_keyed_flush_wait(h: Hdevice, context: &ID3D11DeviceCont
     {
         return;
     }
-    let Some(device) = dev.dxvk.d3d11_device() else {
+    let Some(start) = wait_submitted(dev, context, "keyed-mutex flush wait") else {
         return;
     };
-    let desc = windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC {
-        Query: windows::Win32::Graphics::Direct3D11::D3D11_QUERY_EVENT,
-        MiscFlags: 0,
-    };
-    let mut query = None;
-    if device.CreateQuery(&desc, Some(&mut query)).is_err() {
-        return;
-    }
-    let Some(query) = query else {
-        return;
-    };
-    context.End(&query);
-    let start = std::time::Instant::now();
-    let mut done: windows::Win32::Foundation::BOOL = Default::default();
-    loop {
-        // Raw HRESULT: S_FALSE (not yet) must not read as success. Flags 0
-        // flushes, so the query itself is submitted.
-        let hr = (Interface::vtable(context).GetData)(
-            Interface::as_raw(context),
-            Interface::as_raw(&query),
-            (&mut done as *mut windows::Win32::Foundation::BOOL).cast(),
-            core::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32,
-            0,
-        );
-        if hr.0 == 0 && done.as_bool() {
-            break;
-        }
-        if hr.0 < 0 {
-            log_error!("DDI NVK keyed-mutex flush wait: GetData 0x{:08x}", hr.0 as u32);
-            break;
-        }
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            log_error!("DDI NVK keyed-mutex flush wait: GPU not done after 5 s, releasing anyway");
-            break;
-        }
-        std::thread::yield_now();
-    }
     let n = NVK_KEYED_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n % 1024 == 0 {
         log_error!(

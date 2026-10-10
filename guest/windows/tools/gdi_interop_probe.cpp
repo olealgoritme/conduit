@@ -27,6 +27,12 @@
 //              PatBlt DSTINVERT, the read-modify-write kind: carets, selection,
 //              GDI text on a D3D surface), then D3D reads the texture back
 //              through a staging copy and checks both boxes went black
+//     gditext: what RichEdit (Notepad's editor) does on its D2D surface: GDI
+//              draws INTO the texture through its DC: ClearType ExtTextOut
+//              (ClearTypeBlend), grey-antialiased text, an AlphaBlend, a
+//              TransparentBlt and a StretchBlt from a DIB; D3D reads the
+//              texture back and the same drawing on a GDI DIB section is the
+//              reference (pixel compare, gdi_text_round<N>.bmp / gdi_text_ref.bmp)
 // Exit code 0 when GDI saw the text in every round.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -55,6 +61,54 @@ static void Pump() {
   while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 }
 
+static void SaveBmp(const char* path, const void* px, UINT w, UINT h, size_t pitch) {
+  FILE* fp = fopen(path, "wb");
+  if (!fp) return;
+  uint32_t sz = w * h * 4;
+  uint8_t hdr[54] = {'B', 'M'};
+  *(uint32_t*)(hdr + 2) = 54 + sz; *(uint32_t*)(hdr + 10) = 54; *(uint32_t*)(hdr + 14) = 40;
+  *(int32_t*)(hdr + 18) = w; *(int32_t*)(hdr + 22) = -(int32_t)h;
+  *(uint16_t*)(hdr + 26) = 1; *(uint16_t*)(hdr + 28) = 32; *(uint32_t*)(hdr + 34) = sz;
+  fwrite(hdr, 1, 54, fp);
+  for (UINT y = 0; y < h; ++y) fwrite((const uint8_t*)px + y * pitch, 1, (size_t)w * 4, fp);
+  fclose(fp);
+}
+
+// gditext: the GDI drawing, the same into the texture's DC and into the reference DIB's DC. The
+// page under it is white (D2D Clear on the texture, FillRect on the DIB).
+static HDC g_src;  // a 32 bpp DIB with a pattern, the source of the blends
+static void GdiTextDraw(HDC dc, int shift) {
+  static const wchar_t kLine[] = L"The quick brown fox jumps over the lazy dog 0123456789";
+  HFONT ct = CreateFontW(-20, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+  HFONT aa = CreateFontW(-20, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+  HGDIOBJ old = SelectObject(dc, ct);
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, RGB(0, 0, 0));
+  ExtTextOutW(dc, 10 + shift, 4, 0, nullptr, kLine, (UINT)wcslen(kLine), nullptr);
+  SetTextColor(dc, RGB(0x20, 0x40, 0xc0));
+  ExtTextOutW(dc, 10 + shift, 30, 0, nullptr, kLine, (UINT)wcslen(kLine), nullptr);
+  // Opaque background (ETO_OPAQUE: a fill, then the text).
+  SetTextColor(dc, RGB(0xff, 0xff, 0xff));
+  SetBkColor(dc, RGB(0x30, 0x30, 0x30));
+  RECT ob{560, 4, 1014, 28};
+  ExtTextOutW(dc, 564, 4, ETO_OPAQUE, &ob, kLine, 30, nullptr);
+  SelectObject(dc, aa);
+  SetTextColor(dc, RGB(0, 0, 0));
+  ExtTextOutW(dc, 10 + shift, 56, 0, nullptr, kLine, (UINT)wcslen(kLine), nullptr);
+  SelectObject(dc, old);
+  DeleteObject(ct);
+  DeleteObject(aa);
+  BLENDFUNCTION bf{AC_SRC_OVER, 0, 160, 0};
+  GdiAlphaBlend(dc, 10, 84, 64, 32, g_src, 0, 0, 64, 32, bf);
+  BLENDFUNCTION bp{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+  GdiAlphaBlend(dc, 90, 84, 64, 32, g_src, 0, 0, 64, 32, bp);
+  GdiTransparentBlt(dc, 170, 84, 64, 32, g_src, 0, 0, 64, 32, RGB(0xff, 0, 0));
+  StretchBlt(dc, 250, 84, 128, 40, g_src, 0, 0, 64, 32, SRCCOPY);
+  BitBlt(dc, 400, 84, 64, 32, g_src, 0, 0, SRCINVERT);
+}
+
 static IDXGIAdapter1* HeliosAdapter() {
   IDXGIFactory1* f = nullptr;
   if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&f))) return nullptr;
@@ -72,7 +126,7 @@ int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   const int rounds = argc > 1 ? atoi(argv[1]) : 8;
   const int fills = argc > 2 ? atoi(argv[2]) : 200;
-  bool warp = false, appWait = false, window = false, gdiDraw = false;
+  bool warp = false, appWait = false, window = false, gdiDraw = false, gdiText = false;
   for (int i = 3; i < argc; ++i) {
     if (strcmp(argv[i], "warp") == 0) warp = true;
     // appwait: the application itself waits for the GPU before GetDC (what
@@ -80,6 +134,7 @@ int main(int argc, char** argv) {
     if (strcmp(argv[i], "appwait") == 0) appWait = true;
     if (strcmp(argv[i], "window") == 0) window = true;
     if (strcmp(argv[i], "gdidraw") == 0) gdiDraw = true;
+    if (strcmp(argv[i], "gditext") == 0) gdiText = true;
   }
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
@@ -156,11 +211,38 @@ int main(int argc, char** argv) {
   }
 
   ID3D11Texture2D* staging = nullptr;
-  if (gdiDraw) {
+  if (gdiDraw || gdiText) {
     D3D11_TEXTURE2D_DESC sd = td;
     sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.MiscFlags = 0;
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) { printf("staging failed\n"); return 2; }
+  }
+
+  // gditext: the blend source and the reference, drawn by GDI into DIB sections.
+  void* refBits = nullptr;
+  if (gdiText) {
+    BITMAPINFO sb{}; sb.bmiHeader.biSize = sizeof(sb.bmiHeader); sb.bmiHeader.biWidth = 64;
+    sb.bmiHeader.biHeight = -32; sb.bmiHeader.biPlanes = 1; sb.bmiHeader.biBitCount = 32;
+    void* sbits = nullptr;
+    HBITMAP sdib = CreateDIBSection(screen, &sb, DIB_RGB_COLORS, &sbits, nullptr, 0);
+    for (int y = 0; y < 32; ++y)
+      for (int x = 0; x < 64; ++x) {
+        // Premultiplied: alpha ramps with x; red where (x / 8 + y / 8) is odd (the transparent key).
+        uint8_t a = (uint8_t)(x * 4);
+        bool key = ((x / 8 + y / 8) & 1) != 0;
+        uint8_t* q = (uint8_t*)sbits + (y * 64 + x) * 4;
+        if (key) { q[0] = 0; q[1] = 0; q[2] = 0xff; q[3] = 0xff; }
+        else { q[0] = (uint8_t)(a * 3 / 4); q[1] = (uint8_t)(a / 2); q[2] = (uint8_t)(a / 4); q[3] = a; }
+      }
+    g_src = CreateCompatibleDC(screen);
+    SelectObject(g_src, sdib);
+    HDC rdc = CreateCompatibleDC(screen);
+    HBITMAP rdib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &refBits, nullptr, 0);
+    SelectObject(rdc, rdib);
+    memset(refBits, 0xff, (size_t)W * H * 4);
+    GdiTextDraw(rdc, 0);
+    GdiFlush();
+    SaveBmp("gdi_text_ref.bmp", refBits, W, H, (size_t)W * 4);
   }
 
   int bad = 0;
@@ -189,6 +271,47 @@ int main(int argc, char** argv) {
       BOOL done = FALSE;
       while (ctx->GetData(q, &done, sizeof(done), 0) != S_OK || !done) Sleep(0);
       q->Release();
+    }
+    if (gdiText) {
+      HDC gdc = nullptr;
+      hr = surf->GetDC(FALSE, &gdc);
+      if (FAILED(hr)) { printf("GetDC hr=0x%08lx\n", hr); return 3; }
+      // The D2D page was white with text at x: paint the page white again through GDI first, so the
+      // comparison is GDI against GDI (a PATCOPY fill: the D2D content under it must not matter).
+      RECT all{0, 0, (LONG)W, (LONG)H};
+      FillRect(gdc, &all, (HBRUSH)GetStockObject(WHITE_BRUSH));
+      GdiTextDraw(gdc, 0);
+      surf->ReleaseDC(nullptr);
+      GdiFlush();
+      Sleep(200);
+      ctx->CopyResource(staging, tex);
+      D3D11_MAPPED_SUBRESOURCE m{};
+      if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) { printf("Map failed\n"); return 3; }
+      char path[64]; snprintf(path, sizeof(path), "gdi_text_round%d.bmp", r);
+      SaveBmp(path, m.pData, W, H, m.RowPitch);
+      // Compare RGB with the reference (alpha differs: GDI leaves it, D2D wrote 0xff).
+      int diff = 0, big = 0, maxd = 0, firstx = -1, firsty = -1;
+      int band[5] = {0, 0, 0, 0, 0};  // rows 0-29 CT black, 30-55 CT blue / opaque, 56-83 AA, 84+ blends
+      for (UINT y = 0; y < H; ++y)
+        for (UINT xx = 0; xx < W; ++xx) {
+          const uint8_t* a = (const uint8_t*)m.pData + (size_t)y * m.RowPitch + (size_t)xx * 4;
+          const uint8_t* b = (const uint8_t*)refBits + ((size_t)y * W + xx) * 4;
+          int d = 0;
+          for (int c = 0; c < 3; ++c) { int e = abs((int)a[c] - (int)b[c]); if (e > d) d = e; }
+          if (d > maxd) maxd = d;
+          if (d > 2) {
+            diff++;
+            if (d > 32) big++;
+            if (firstx < 0) { firstx = (int)xx; firsty = (int)y; }
+            band[y < 30 ? 0 : y < 56 ? 1 : y < 84 ? 2 : 3]++;
+          }
+        }
+      ctx->Unmap(staging, 0);
+      bool ok = diff == 0;
+      if (!ok) bad++;
+      printf("round %d: GDI text vs reference: %d px differ (%d by >32, max %d; CT %d, CT2/opaque %d, AA %d, blends %d; first %d,%d) -> %s\n",
+             r, diff, big, maxd, band[0], band[1], band[2], band[3], firstx, firsty, ok ? "same" : "DIFFERENT");
+      continue;
     }
     if (gdiDraw) {
       HDC gdc = nullptr;
