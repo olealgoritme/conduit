@@ -157,6 +157,7 @@ More:
 - [guest/nvk-rm/README.md](guest/nvk-rm/README.md): the NVK-on-RM patch
   series and its knobs
 - [docs/NVK-ROADMAP.md](docs/NVK-ROADMAP.md): what is left
+- [docs/PERF-ROADMAP.md](docs/PERF-ROADMAP.md): the frame path hop by hop and what to shorten for bare-metal performance
 - [docs/SECOND-MACHINE.md](docs/SECOND-MACHINE.md): the whole setup on another
   NVIDIA host
 - [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md#windows-guests): limits
