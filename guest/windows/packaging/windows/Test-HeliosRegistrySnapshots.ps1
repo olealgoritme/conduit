@@ -143,7 +143,31 @@ try {
     New-ItemProperty -LiteralPath $icdKey -Name "OtherVendor" -Value 88 -PropertyType DWord | Out-Null
     Ensure-HeliosIcdRegistryKey $icdKey
     Assert-True ((Get-Item -LiteralPath $icdKey).GetValue("OtherVendor") -eq 88) "standalone ICD initializer preserves existing values"
-    Write-Host "PASS: real HKCU sequential/serialized/repeated snapshot restoration, unrelated values/subkeys, missing keys, and all three installer registrations."
+
+    # Uninstall cleanup of a package whose D3D9 slot is "<>" (no D3D9 driver:
+    # D3D9On12). The marker names no file; Windows PowerShell's path APIs throw
+    # on its characters, so the cleanup must skip it rather than fail.
+    $removed = Join-Path $root "RemovedPackage"
+    Ensure-HeliosRegistryKey $removed
+    $wowSlots = [string[]]@("<>", "C:\ds\pkg\helios_umd32.dll", "C:\ds\pkg\helios_umd32.dll", "C:\ds\pkg\helios_umd12_32.dll")
+    New-ItemProperty -LiteralPath $removed -Name "UserModeDriverNameWoW" -Value $wowSlots -PropertyType MultiString | Out-Null
+    New-ItemProperty -LiteralPath $removed -Name "UserModeDriverName" -Value ([string[]]@("<>", "C:\other\next_umd.dll", "C:\other\next_umd.dll", "C:\other\next_umd12.dll")) -PropertyType MultiString | Out-Null
+    New-ItemProperty -LiteralPath $removed -Name "InstalledDisplayDrivers" -Value ([string[]]@("helios_umd32", "helios_umd12_32", "next_umd")) -PropertyType MultiString | Out-Null
+    Assert-Snapshot $removed "UserModeDriverNameWoW" ([ordered]@{ exists = $true; kind = "MultiString"; value = $wowSlots })
+    $removalState = [pscustomobject]@{
+        classKey = $removed
+        activeInf = "oem-helios.inf"
+        installedDirect3D = [pscustomobject]@{
+            UserModeDriverNameWoW = [pscustomobject]@{ exists = $true; kind = "MultiString"; value = $wowSlots }
+        }
+    } | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+    Restore-HeliosDirect3DAfterRemoval -State $removalState -CurrentInf "oem-next.inf" -CurrentClassKey $removed -CurrentInfSha256 ""
+    $removedKey = Get-Item -LiteralPath $removed
+    Assert-True ($removedKey.GetValueNames() -notcontains "UserModeDriverNameWoW") "the removed package's WoW64 slots are deleted"
+    Assert-True (@($removedKey.GetValue("UserModeDriverName")).Count -eq 4) "the next driver's native slots survive"
+    $inventoryLeft = @($removedKey.GetValue("InstalledDisplayDrivers"))
+    Assert-True ($inventoryLeft.Count -eq 1 -and $inventoryLeft[0] -ceq "next_umd") "only the removed package's inventory names are pruned"
+    Write-Host "PASS: real HKCU sequential/serialized/repeated snapshot restoration, unrelated values/subkeys, missing keys, all three installer registrations, and removal of a package with a '<>' D3D9 slot."
 } finally {
     # The randomized subtree is the only cleanup target, even on an assertion.
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }

@@ -153,14 +153,27 @@ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLim
 ; TWO user-mode APIs, each built for AMD64 and x86, since stage S5 (docs/dx12/ARCHITECTURE.md 9.1
 ; "Variant B", DECISIONS.md D3):
 ;
-;   helios_umd.dll    - D3D9/D3D10/D3D11, the DXVK-backed driver DWM composites
-;                       on. Slots 0-2.
+;   helios_umd.dll    - D3D10/D3D11, the DXVK-backed driver DWM composites on.
+;                       Slots 1-2.
 ;   helios_umd12.dll  - D3D12, the vkd3d-backed driver. Slot 3 only, and behind
 ;                       the HKLM\SOFTWARE\Helios!UmdD3D12 kill switch, which is
 ;                       enabled by default; UmdD3D12=0 disables new processes.
 ;
 ; UserModeDriverName is a REG_MULTI_SZ indexed by KMTUMDVERSION:
 ; DX9=0, DX10=1, DX11=2, DX12=3.
+;
+; ⛔ Slot 0 (D3D9) is the literal "<>", not a DLL. helios_umd.dll implements
+; no D3D9 DDI (no OpenAdapter export), and "<>" is dxgkrnl's "this adapter has
+; no D3D9 driver" marker: KMTQAITYPE_UMDRIVERNAME for KMTUMDVERSION_DX9 then
+; fails with STATUS_INVALID_PARAMETER, which d3d9.dll answers by running every
+; D3D9 device on this adapter through D3D9On12 (the Windows component
+; d3d9on12.dll) on helios_umd12.dll. With a DLL path in slot 0 instead, d3d9.dll
+; loads it, finds no OpenAdapter, and every IDirect3D9 call on the adapter
+; fails with D3DERR_NOTAVAILABLE (GetDeviceCaps, CheckDeviceType,
+; CheckDeviceFormat, CreateDevice) - apps report that as "no multisample" or
+; "can't set video mode". dxgkrnl treats an empty slot the same way; "<>" is
+; the explicit form. D3D9 thus follows UmdD3D12: with D3D12 disabled, D3D9
+; device creation fails too.
 ; FOUR entries, never six - D3DKMTQueryAdapterInfo(KMTQAITYPE_UMDRIVERNAME)
 ; returns STATUS_INVALID_PARAMETER for versions 4/5 on this adapter, so
 ; DX12_WSA32/DX12_WSA64 must not be written (DECISIONS.md D3).
@@ -173,8 +186,8 @@ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLim
 ; points to separate x86 binaries in the DriverStore. The kernel remains AMD64.
 
 [Helios_DeviceSettings]
-HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd12.dll
-HKR,, UserModeDriverNameWoW,    %REG_MULTI_SZ%, %13%\helios_umd32.dll,%13%\helios_umd32.dll,%13%\helios_umd32.dll,%13%\helios_umd12_32.dll
+HKR,, UserModeDriverName,       %REG_MULTI_SZ%, "<>",%13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd12.dll
+HKR,, UserModeDriverNameWoW,    %REG_MULTI_SZ%, "<>",%13%\helios_umd32.dll,%13%\helios_umd32.dll,%13%\helios_umd12_32.dll
 HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12,helios_umd32,helios_umd12_32
 
 ; ⛔⛔ HardwareInformation.AdapterString is LOAD-BEARING FOR THE VULKAN ICD, and
