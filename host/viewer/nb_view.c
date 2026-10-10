@@ -153,6 +153,12 @@ void nb_view_area(const struct nb_view *v, int ww, int wh, unsigned s120,
     if (wh > 0 && out->y + out->h > wh) { out->h = wh - out->y; }
 }
 
+bool nb_view_has_bars(const struct nb_place *p, int ww, int wh)
+{
+    return p->vis.x != 0 || p->vis.y != 0 || p->vis.w != ww ||
+           p->vis.h != wh;
+}
+
 void nb_view_place(const struct nb_view *v, int bw, int bh, int ww, int wh,
                    unsigned s120, struct nb_place *p)
 {

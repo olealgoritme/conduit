@@ -75,6 +75,7 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
 #include "fractional-scale-v1-client-protocol.h"
 #include "nb_ui.h"
 #include "tearing-control-v1-client-protocol.h"
+#include "single-pixel-buffer-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
@@ -279,6 +280,9 @@ struct nb_wl {
      */
     struct wp_tearing_control_manager_v1 *tearing_mgr;
     struct wp_tearing_control_v1         *tearing;
+    /* The letterbox's black pixel, when the compositor offers it as a
+     * solid colour rather than a buffer to sample (see wl_blk_build()). */
+    struct wp_single_pixel_buffer_manager_v1 *spb_mgr;
 
     /*
      * virtio-nvgpu: --stats.  Per-second fps and latency, all CLOCK_MONOTONIC:
@@ -531,6 +535,9 @@ struct nb_wl {
     bool   grabbed;
     bool   fullscreen;
     bool   configured;
+    /* xdg_toplevel.configure, recorded until xdg_surface.configure. */
+    bool    tc_pending, tc_fs, tc_max;
+    int32_t tc_w, tc_h;
 
     /*
      * virtio-nvgpu VIEWER STATE.
@@ -705,6 +712,7 @@ static void wl_idle_drop(struct nb_wl *w);
 extern const struct wp_presentation_feedback_listener nb_pres_listener;
 /* Forward: virtio-nvgpu viewer pieces, defined after the registry. */
 static void wl_geom_apply(struct nb_wl *w);
+static void top_apply(struct nb_wl *w);
 static void wl_mode_hint(struct nb_wl *w, bool immediate);
 static void ov_sync(struct nb_wl *w);
 static void ov_paint_commit(struct nb_wl *w);
@@ -1279,7 +1287,12 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t t)
  *
  * Returns the resulting surface size in out_w / out_h.
  */
-/* The 1x1 opaque black buffer the main surface shows under a letterbox. */
+/*
+ * The 1x1 opaque black buffer the main surface shows under a letterbox,
+ * stretched over the whole window by the main viewport.  A single-pixel
+ * buffer where the compositor has one (a solid colour it can draw or put on
+ * a plane without sampling a texture), else one pixel of shm.
+ */
 static bool wl_blk_build(struct nb_wl *w)
 {
     struct wl_shm_pool *pool;
@@ -1288,6 +1301,13 @@ static bool wl_blk_build(struct nb_wl *w)
 
     if (w->blk_buf) {
         return true;
+    }
+    if (w->spb_mgr) {
+        w->blk_buf = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
+            w->spb_mgr, 0, 0, 0, UINT32_MAX);
+        if (w->blk_buf) {
+            return true;
+        }
     }
     if (!w->shm) {
         return false;
@@ -1395,8 +1415,7 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
     {
         bool want_sub = w->cs_surf && w->cs_vp && w->win_w > 0 &&
                         w->win_h > 0 &&
-                        (dw != w->win_w || dh != w->win_h || w->off_x ||
-                         w->off_y) &&
+                        nb_view_has_bars(&w->place, w->win_w, w->win_h) &&
                         wl_blk_build(w);
         bool crop = w->place.cropped;
         struct wl_buffer *cur = w->current >= 0 && w->bufs[w->current].valid
@@ -3909,14 +3928,21 @@ static void xdg_configure(void *d, struct xdg_surface *s, uint32_t serial)
 
     xdg_surface_ack_configure(s, serial);
     w->configured = true;
+    if (w->tc_pending) {
+        w->tc_pending = false;
+        top_apply(w);
+    }
     /* Do NOT commit a buffer here: the first real content arrives as an
-     * ATTACH+COMMIT from the client.  An empty commit is enough to make the
-     * surface exist. */
+     * ATTACH+COMMIT from the client.  But the main surface IS committed,
+     * always: that commit is what makes the ack (and the size it acked)
+     * take effect -- see top_configure().  Under a letterbox the main
+     * surface is the black background, so this is cheap; on an exact fit
+     * it re-commits the current frame's state unchanged. */
     tb_update(w, w->win_w > 0 ? w->win_w : w->surf_w);
     bd_layout(w);
     if (w->idle_wanted && w->current < 0) {
         wl_show_idle(w->sess);
-    } else if (w->current < 0) {
+    } else {
         wl_surface_commit(w->surf);
     }
     ov_sync(w);                 /* first configure maps it */
@@ -3960,14 +3986,45 @@ static bool wl_odd_aspect(const struct nb_wl *w, int wd, int ht)
            (long)wd * w->buf_h > (long)ht * w->buf_w * 2;
 }
 
+/*
+ * xdg_toplevel.configure only RECORDS the new state; xdg_configure() applies
+ * it, after xdg_surface.ack_configure.  The order matters: a compositor takes
+ * the acked size as the window's size only on the next commit of the MAIN
+ * surface after the ack.  Applying here commits first and acks after, and in
+ * a letterbox nothing commits the main surface again (the picture is on its
+ * own subsurface) -- so Hyprland kept the old size for the window and placed
+ * the one-pixel black background by it: off to one side, or off screen, with
+ * the desktop showing through the bars.
+ */
 static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
                           int32_t ht, struct wl_array *states)
 {
     struct nb_wl *w = d;
     uint32_t *st;
+    (void)t;
+
+    w->tc_w = wd;
+    w->tc_h = ht;
+    w->tc_fs = false;
+    w->tc_max = false;
+    if (states) {
+        wl_array_for_each(st, states) {
+            if (*st == XDG_TOPLEVEL_STATE_FULLSCREEN) {
+                w->tc_fs = true;
+            } else if (*st == XDG_TOPLEVEL_STATE_MAXIMIZED) {
+                w->tc_max = true;
+            }
+        }
+    }
+    w->tc_pending = true;
+}
+
+/* The toplevel state top_configure() recorded, applied after the ack. */
+static void top_apply(struct nb_wl *w)
+{
+    int32_t wd = w->tc_w, ht = w->tc_h;
     bool was_fs = w->fullscreen;
     bool left_fs, chosen = false;   /* chosen: wd/ht already content size */
-    (void)t;
 
     /*
      * BELIEVE THE COMPOSITOR, not our own request.  Fullscreen and maximized
@@ -3975,17 +4032,8 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
      * double-click on the bar we do not draw), and the title bar has to
      * disappear in fullscreen however it was reached.
      */
-    w->fullscreen = false;
-    w->maximized = false;
-    if (states) {
-        wl_array_for_each(st, states) {
-            if (*st == XDG_TOPLEVEL_STATE_FULLSCREEN) {
-                w->fullscreen = true;
-            } else if (*st == XDG_TOPLEVEL_STATE_MAXIMIZED) {
-                w->maximized = true;
-            }
-        }
-    }
+    w->fullscreen = w->tc_fs;
+    w->maximized = w->tc_max;
     if (was_fs != w->fullscreen) {
         nb_log("window is %s", w->fullscreen ? "FULLSCREEN (chrome hidden)"
                                              : "windowed");
@@ -4673,6 +4721,9 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
         wp_presentation_add_listener(w->presentation, &pres_clock_listener, w);
     } else if (!strcmp(iface, wp_tearing_control_manager_v1_interface.name)) {
         w->tearing_mgr = BIND(wp_tearing_control_manager_v1_interface, 1);
+    } else if (!strcmp(iface,
+                       wp_single_pixel_buffer_manager_v1_interface.name)) {
+        w->spb_mgr = BIND(wp_single_pixel_buffer_manager_v1_interface, 1);
     } else if (!strcmp(iface, wp_fractional_scale_manager_v1_interface.name)) {
         w->frac_mgr = BIND(wp_fractional_scale_manager_v1_interface, 1);
     } else if (!strcmp(iface, wl_data_device_manager_interface.name)) {
@@ -6562,6 +6613,10 @@ static void wl_close_session(struct nb_session *s)
     }
     if (w->blk_px) {
         munmap(w->blk_px, 4);
+    }
+    if (w->spb_mgr) {
+        wp_single_pixel_buffer_manager_v1_destroy(w->spb_mgr);
+        w->spb_mgr = NULL;
     }
     if (w->viewport) {
         wp_viewport_destroy(w->viewport);

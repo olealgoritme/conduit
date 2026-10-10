@@ -1306,10 +1306,20 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             xcb_configure_notify_event_t *c = (void *)ev;
 
             if (c->window == x->win) {
+                bool resized = x->win_w != c->width || x->win_h != c->height;
+
                 x->win_w = c->width;
                 x->win_h = c->height;
                 if (c->width == 0 || c->height == 0) {
                     break;
+                }
+                /* The bars are the window's black background.  The server
+                 * paints it on the exposure a resize makes, but not every
+                 * window manager's resize exposes the whole window (and a
+                 * same-placement relayout clears nothing), so clear it here:
+                 * one request per resize, none per frame. */
+                if (resized) {
+                    xcb_clear_area(x->c, 0, x->win, 0, 0, 0, 0);
                 }
                 if (x->idle_shown && x->current < 0) {
                     x11_show_idle(s);   /* the placeholder is window-sized */
