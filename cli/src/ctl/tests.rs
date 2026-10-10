@@ -17,6 +17,12 @@ struct Faults {
     noisy: bool,
     /// Cut `get` pieces short without saying so (a lost piece).
     short_get: bool,
+    /// Report a different file size after the first `get` piece.
+    grow: bool,
+    /// Announce a 10-byte file in `get` but send the whole (bigger) one.
+    overflow: bool,
+    /// Answer with control characters, escapes and bidi overrides in text.
+    hostile: bool,
 }
 
 #[derive(Default)]
@@ -90,6 +96,9 @@ fn handle(g: &mut Guest, r: Request, f: &Faults) -> Response {
             },
         ),
         Op::Run(a) => {
+            if f.hostile {
+                return Response::err(id, "no\x1b]0;pwned\x07 such\n\u{202e}file");
+            }
             if a.cmd.contains("missing") {
                 return Response::err(id, format!("not found: {}", a.cmd));
             }
@@ -97,6 +106,18 @@ fn handle(g: &mut Guest, r: Request, f: &Faults) -> Response {
             Response::ok(id, &Started { pid: 4242 })
         }
         Op::Stop { .. } => Response::ok(id, &serde_json::json!({})),
+        Op::Apps if f.hostile => Response::ok(
+            id,
+            &Apps {
+                apps: vec![App {
+                    name: format!("Evil\x1b[2J\r\n\u{2028}\u{202e}gpj.exe{}", "x".repeat(5000)),
+                    target: "C:\\a\x07.lnk".into(),
+                    args: vec!["--x\x1b[31m".into(); 1000],
+                    icon: "i\u{0085}".into(),
+                    source: "startmenu\x1b".into(),
+                }],
+            },
+        ),
         Op::Apps => Response::ok(id, &Apps { apps: apps() }),
         Op::Icon { key } => Response::ok(
             id,
@@ -174,11 +195,18 @@ fn handle(g: &mut Guest, r: Request, f: &Faults) -> Response {
                 to = from + 1;
             }
             let eof = to == d.len();
+            let size = if f.overflow {
+                10
+            } else if f.grow && a.offset > 0 {
+                d.len() as u64 + 1
+            } else {
+                d.len() as u64
+            };
             Response::ok(
                 id,
                 &Chunk {
                     data: b64_encode(&d[from..to]),
-                    size: d.len() as u64,
+                    size,
                     eof,
                     sha256: eof.then(|| sha256_hex(d)),
                 },
@@ -631,4 +659,386 @@ fn error_texts_name_the_fix() {
     let m = format!("{:#}", friendly("w", CtlError::Closed));
     assert!(m.contains("closed"), "{m}");
     assert!(AGENT_HINT.contains("conduit attach") && AGENT_HINT.contains("tray"));
+}
+
+// ------------------------------------------------------------ get hardening
+
+fn guest_file(f: Faults, data: &[u8]) -> Client {
+    let (c, g) = pair(f);
+    g.lock()
+        .unwrap()
+        .files
+        .insert("C:\\f".into(), data.to_vec());
+    c
+}
+
+fn names(d: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn get_refuses_a_size_that_changes_mid_copy() {
+    let d = tmpdir("grow");
+    let mut c = guest_file(
+        Faults {
+            grow: true,
+            ..Faults::default()
+        },
+        &vec![3u8; CHUNK * 2 + 5],
+    );
+    let e = c
+        .get_file("C:\\f", &d.join("f"), false, &mut no_progress())
+        .unwrap_err();
+    assert!(
+        matches!(&e, CtlError::Failed(m) if m.contains("changed")),
+        "{e:?}"
+    );
+    assert!(names(&d).is_empty());
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn get_stops_once_the_guest_sends_more_than_it_announced() {
+    let d = tmpdir("overflow");
+    let mut c = guest_file(
+        Faults {
+            overflow: true,
+            ..Faults::default()
+        },
+        &vec![3u8; CHUNK * 3],
+    );
+    let mut most = 0u64;
+    let e = c
+        .get_file("C:\\f", &d.join("f"), false, &mut |n, t| {
+            assert!(n <= t, "{n} of {t} bytes written");
+            most = most.max(n);
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&e, CtlError::Failed(m) if m.contains("more than")),
+        "{e:?}"
+    );
+    assert_eq!(most, 0);
+    assert!(names(&d).is_empty());
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_trickling_guest_hits_the_whole_copy_time_limit() {
+    let d = tmpdir("trickle");
+    let mut c = guest_file(
+        Faults {
+            short_get: true,
+            ..Faults::default()
+        },
+        &vec![1u8; 50_000],
+    );
+    c.budget = Some(Duration::from_millis(30));
+    let t = Instant::now();
+    let e = c
+        .get_file("C:\\f", &d.join("f"), false, &mut no_progress())
+        .unwrap_err();
+    assert!(
+        matches!(&e, CtlError::Failed(m) if m.contains("too slow")),
+        "{e:?}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(5));
+    assert!(names(&d).is_empty());
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn the_default_time_limit_grows_with_the_size() {
+    let (c, _) = pair(Faults::default());
+    assert_eq!(c.budget(0), Duration::from_secs(60));
+    assert_eq!(c.budget(MAX_FILE), Duration::from_secs(60 + 8192));
+}
+
+/// Both ways of holding a received file: `O_TMPFILE` and a named part file.
+fn both(tag: &str, f: impl Fn(&Path, bool)) {
+    for named in [false, true] {
+        let d = tmpdir(&format!("{tag}-{named}"));
+        f(&d, named);
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn a_file_of_the_part_name_that_was_there_is_never_touched() {
+    both("foreign", |d, named| {
+        let foreign = d.join("f.conduit-part");
+        std::fs::write(&foreign, b"mine").unwrap();
+        // A failed copy...
+        let mut c = guest_file(
+            Faults {
+                grow: true,
+                ..Faults::default()
+            },
+            &vec![3u8; CHUNK * 2],
+        );
+        c.no_tmpfile = named;
+        assert!(c
+            .get_file("C:\\f", &d.join("f"), false, &mut no_progress())
+            .is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"mine");
+        // ...and a good one.
+        let mut c = guest_file(Faults::default(), b"data");
+        c.no_tmpfile = named;
+        c.get_file("C:\\f", &d.join("f"), false, &mut no_progress())
+            .unwrap();
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"mine");
+        assert_eq!(names(d), ["f", "f.conduit-part"]);
+    });
+}
+
+#[test]
+fn a_part_file_stays_out_of_sight_and_never_follows_a_symlink() {
+    // O_TMPFILE: nothing has a name until the copy is complete.
+    let d = tmpdir("hidden");
+    let mut c = guest_file(Faults::default(), &vec![1u8; CHUNK * 2 + 1]);
+    let dd = d.clone();
+    c.get_file("C:\\f", &d.join("f"), false, &mut |_, _| {
+        assert!(names(&dd).is_empty())
+    })
+    .unwrap();
+    assert_eq!(names(&d), ["f"]);
+    let _ = std::fs::remove_dir_all(&d);
+    // A named part file is created fresh: a symlink planted at any likely
+    // name is not followed and not removed.
+    let d = tmpdir("nofollow");
+    let victim = d.join("victim");
+    std::fs::write(&victim, b"keep").unwrap();
+    for n in 0..3 {
+        std::os::unix::fs::symlink(
+            &victim,
+            d.join(format!("f.{}-{n}.conduit-part", std::process::id())),
+        )
+        .unwrap();
+    }
+    let mut c = guest_file(Faults::default(), b"data");
+    c.no_tmpfile = true;
+    c.get_file("C:\\f", &d.join("f"), false, &mut no_progress())
+        .unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    assert_eq!(std::fs::read(d.join("f")).unwrap(), b"data");
+    assert_eq!(names(&d).len(), 5);
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_file_that_appears_during_the_copy_is_not_replaced_without_force() {
+    both("race", |d, named| {
+        let dst = d.join("f");
+        let mut c = guest_file(Faults::default(), &vec![1u8; CHUNK + 1]);
+        c.no_tmpfile = named;
+        let e = c
+            .get_file("C:\\f", &dst, false, &mut |n, t| {
+                if n == t {
+                    std::fs::write(&dst, b"theirs").unwrap();
+                }
+            })
+            .unwrap_err();
+        assert!(
+            matches!(&e, CtlError::Failed(m) if m.contains("exists")),
+            "{e:?}"
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), b"theirs");
+        assert_eq!(names(d), ["f"]);
+        // --force replaces it.
+        let mut c = guest_file(Faults::default(), b"new");
+        c.no_tmpfile = named;
+        c.get_file("C:\\f", &dst, true, &mut no_progress()).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        assert_eq!(names(d), ["f"]);
+    });
+}
+
+#[test]
+fn a_dangling_symlink_at_the_target_is_not_followed() {
+    both("dangle", |d, named| {
+        let dst = d.join("f");
+        let away = d.join("away");
+        std::os::unix::fs::symlink(&away, &dst).unwrap();
+        let mut c = guest_file(Faults::default(), b"data");
+        c.no_tmpfile = named;
+        assert!(c
+            .get_file("C:\\f", &dst, false, &mut no_progress())
+            .is_err());
+        assert!(!away.exists());
+        c.get_file("C:\\f", &dst, true, &mut no_progress()).unwrap();
+        assert!(!away.exists());
+        assert!(!dst.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"data");
+    });
+}
+
+// ------------------------------------------------------------ guest text
+
+#[test]
+fn guest_text_is_cleaned_where_it_enters() {
+    assert_eq!(
+        clean("a\x1b[2Jb\r\nc\u{85}d\u{2028}e\u{202e}f\u{2066}g", 100),
+        "a[2Jbcdefg"
+    );
+    assert_eq!(clean("Ærø 日本 ✓", 100), "Ærø 日本 ✓");
+    assert_eq!(clean("abcdef", 3), "abc");
+
+    let (mut c, _) = pair(Faults {
+        hostile: true,
+        ..Faults::default()
+    });
+    let a = &c.apps().unwrap()[0];
+    assert!(a.name.starts_with("Evil[2Jgpj.exe"), "{}", a.name);
+    assert_eq!(a.name.chars().count(), MAX_NAME);
+    assert_eq!(a.target, "C:\\a.lnk");
+    assert_eq!(a.args.len(), MAX_ARGS);
+    assert_eq!(a.args[0], "--x[31m");
+    assert_eq!((a.icon.as_str(), a.source.as_str()), ("i", "startmenu"));
+
+    let e = c.run(RunArgs::default()).unwrap_err();
+    assert_eq!(e, CtlError::Guest("no]0;pwned suchfile".into()));
+    // Even a Guest error made elsewhere prints clean.
+    let raw = CtlError::Guest("x\x1b[31my\n".into());
+    assert_eq!(raw.to_string(), "x[31my");
+    let m = format!("{:#}", friendly("w", raw));
+    assert!(!m.chars().any(unsafe_char), "{m:?}");
+}
+
+#[test]
+fn notification_text_is_escaped_markup() {
+    let a = notify_args("a <b>bold</b> & \x1b[1m\"q\"");
+    assert_eq!(a[4..6], ["--", "conduit"]);
+    assert_eq!(a[6], "a &lt;b&gt;bold&lt;/b&gt; &amp; [1m&quot;q&quot;");
+}
+
+// ------------------------------------------------------------ icons
+
+fn png(w: u32, h: u32, extra: usize) -> Vec<u8> {
+    let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    b.extend(w.to_be_bytes());
+    b.extend(h.to_be_bytes());
+    b.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    b.extend(vec![0u8; extra]);
+    b
+}
+
+fn icon(format: &str, b: &[u8]) -> Icon {
+    Icon {
+        format: format.into(),
+        data: b64_encode(b),
+    }
+}
+
+#[test]
+fn only_small_pngs_become_host_icons() {
+    let ok = png(64, 64, 100);
+    assert_eq!(png_size(&ok), Some((64, 64)));
+    assert_eq!(check_icon(&icon("png", &ok)).unwrap(), ok);
+    assert!(check_icon(&icon("png", &png(256, 256, 0))).is_ok());
+    let svg = b"<svg xmlns='http://www.w3.org/2000/svg'/>";
+    assert!(check_icon(&icon("svg", svg))
+        .unwrap_err()
+        .contains("only PNG"));
+    // An SVG (or anything) labelled png is still refused.
+    assert!(check_icon(&icon("png", svg))
+        .unwrap_err()
+        .contains("not a PNG"));
+    assert!(check_icon(&icon("png", &png(257, 16, 0)))
+        .unwrap_err()
+        .contains("257x16"));
+    assert!(check_icon(&icon("png", &png(0, 16, 0))).is_err());
+    assert!(check_icon(&icon("png", &png(64, 64, MAX_ICON)))
+        .unwrap_err()
+        .contains("too large"));
+    assert!(check_icon(&icon("png", b"")).unwrap_err().contains("empty"));
+    let mut bad_ihdr = ok.clone();
+    bad_ihdr[12..16].copy_from_slice(b"IDAT");
+    assert!(check_icon(&icon("png", &bad_ihdr)).is_err());
+    let damaged = Icon {
+        format: "png".into(),
+        data: "!!!".into(),
+    };
+    assert!(check_icon(&damaged).unwrap_err().contains("damaged"));
+}
+
+// ------------------------------------------------------------ desktop entries
+
+/// A Desktop Entry `Exec=` value as a launcher reads it: key-file unescape,
+/// then the Exec quoting rules.
+fn exec_args(value: &str) -> Vec<String> {
+    let v = keyfile_unescape(value);
+    let (mut out, mut cur, mut it) = (Vec::new(), String::new(), v.chars());
+    let mut quoted = false;
+    let mut has = false;
+    while let Some(c) = it.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                has = true;
+            }
+            '\\' if quoted => cur.push(it.next().unwrap()),
+            ' ' if !quoted => {
+                if has || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                has = false;
+            }
+            '%' => {
+                assert_eq!(it.next(), Some('%'));
+                cur.push('%');
+            }
+            _ => cur.push(c),
+        }
+    }
+    assert!(!quoted);
+    if has || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+#[test]
+fn desktop_entries_escape_then_quote_like_a_launcher_reads_them() {
+    let name = "C:\\Games\\\"Odd\" $HOME `x` 100% \x1b[2J\nName=Evil";
+    let e = desktop_entry(
+        Path::new("/opt/my apps/conduit"),
+        "win11",
+        name,
+        Some(Path::new("/h/ic\\on.png")),
+    );
+    // One line per key: the newline in the guest's name did not add a key.
+    assert_eq!(e.lines().filter(|l| l.starts_with("Name=")).count(), 1);
+    let field = |k: &str| {
+        e.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .unwrap_or_else(|| panic!("{k} in {e}"))
+    };
+    let shown = clean(name, MAX_NAME);
+    assert_eq!(keyfile_unescape(field("Name=")), shown);
+    assert_eq!(keyfile_unescape(field("Icon=")), "/h/ic\\on.png");
+    assert_eq!(
+        exec_args(field("Exec=")),
+        [
+            "/opt/my apps/conduit",
+            "run",
+            "win11",
+            "--start",
+            "--app",
+            shown.as_str()
+        ]
+    );
+    // The literal backslash inside the quoted argument takes four.
+    assert!(field("Exec=").contains("C:\\\\\\\\Games"), "{e}");
+    // `conduit app list` reads the name back as it was.
+    let d = tmpdir("kf");
+    std::fs::write(desktop_file(&d, "win11", name), &e).unwrap();
+    assert_eq!(shortcuts(&d, "win11")[0].0, shown);
+    let _ = std::fs::remove_dir_all(d);
+    assert_eq!(keyfile_escape(" a\tb\\"), "\\sa\\tb\\\\");
+    assert_eq!(keyfile_unescape("\\sa\\tb\\\\"), " a\tb\\");
 }

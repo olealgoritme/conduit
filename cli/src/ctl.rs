@@ -16,7 +16,7 @@ use crate::virt::{self, Link};
 use anyhow::Result;
 use conduit_ctl::{
     b64_decode, b64_encode, App, Apps, Chunk, GetArgs, Icon, Listing, Op, Pong, PutArgs, Request,
-    Response, RunArgs, Sha256, Started, Written, CHUNK, MAX_FILE,
+    Response, RunArgs, Sha256, Started, Written, CHUNK, MAX_FILE, MAX_ICON,
 };
 use serde::de::DeserializeOwned;
 use std::collections::VecDeque;
@@ -57,7 +57,8 @@ impl std::fmt::Display for CtlError {
                 d.as_secs().max(1)
             ),
             CtlError::Closed => f.write_str("the guest closed the control channel"),
-            CtlError::Guest(e) | CtlError::Failed(e) => f.write_str(e),
+            CtlError::Guest(e) => f.write_str(&clean(e, MAX_MSG)),
+            CtlError::Failed(e) => f.write_str(e),
         }
     }
 }
@@ -86,8 +87,56 @@ pub fn friendly(vm: &str, e: CtlError) -> anyhow::Error {
             format!("{vm}: {e}"),
             "The agent restarted or the VM stopped; run the command again",
         ),
-        CtlError::Guest(m) => oops(format!("{vm}: {m}"), ""),
+        CtlError::Guest(m) => oops(format!("{vm}: {}", clean(&m, MAX_MSG)), ""),
         CtlError::Failed(m) => oops(m, ""),
+    }
+}
+
+// ------------------------------------------------------------ guest text
+
+/// The longest guest error message kept.
+pub const MAX_MSG: usize = 1000;
+/// The longest app name kept.
+pub const MAX_NAME: usize = 200;
+/// The longest path, argument or other guest string kept.
+pub const MAX_TEXT: usize = 4096;
+/// The most apps, and arguments per app, taken from one answer.
+pub const MAX_APPS: usize = 10_000;
+pub const MAX_ARGS: usize = 256;
+
+/// Characters guest text must not carry into a terminal, a notification or
+/// a file: control characters (C0, DEL, C1 including U+0085 NEL), the
+/// Unicode line and paragraph separators, and the bidirectional overrides
+/// and isolates that can make text read differently from what it is.
+fn unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{feff}'
+        )
+        || ('\u{202a}'..='\u{202e}').contains(&c)
+        || ('\u{2066}'..='\u{2069}').contains(&c)
+}
+
+/// Guest text made safe to print or store: unsafe characters dropped, at
+/// most `max` characters. Everything the guest sends passes through here
+/// once, where it enters the host.
+pub fn clean(s: &str, max: usize) -> String {
+    s.chars().filter(|&c| !unsafe_char(c)).take(max).collect()
+}
+
+fn clean_app(a: App) -> App {
+    App {
+        name: clean(&a.name, MAX_NAME),
+        target: clean(&a.target, MAX_TEXT),
+        args: a
+            .args
+            .iter()
+            .take(MAX_ARGS)
+            .map(|x| clean(x, MAX_TEXT))
+            .collect(),
+        icon: clean(&a.icon, MAX_TEXT),
+        source: clean(&a.source, 32),
     }
 }
 
@@ -99,6 +148,10 @@ pub struct Client {
     lines: VecDeque<String>,
     /// Never wait longer than this (tests).
     cap: Option<Duration>,
+    /// The whole-copy time limit instead of [`Client::budget`]'s (tests).
+    budget: Option<Duration>,
+    /// Never use `O_TMPFILE` for received files (tests of the fallback).
+    no_tmpfile: bool,
     _lock: Option<sys::Lock>,
 }
 
@@ -159,6 +212,8 @@ impl Client {
             reader: conduit_ctl::LineReader::default(),
             lines: VecDeque::new(),
             cap: None,
+            budget: None,
+            no_tmpfile: false,
             _lock: None,
         }
     }
@@ -220,15 +275,23 @@ impl Client {
     fn ask<T: DeserializeOwned>(&mut self, op: Op, limit: Duration) -> R<T> {
         let r = self.call(op, limit)?;
         if !r.ok {
-            return Err(CtlError::Guest(
-                r.error.unwrap_or_else(|| "the guest refused".into()),
-            ));
+            return Err(CtlError::Guest(clean(
+                r.error.as_deref().unwrap_or("the guest refused"),
+                MAX_MSG,
+            )));
         }
         r.into_body().map_err(CtlError::Failed)
     }
 
     pub fn ping(&mut self) -> R<Pong> {
-        self.ask(Op::Ping, T_PING)
+        let p: Pong = self.ask(Op::Ping, T_PING)?;
+        Ok(Pong {
+            agent: clean(&p.agent, MAX_NAME),
+            os: clean(&p.os, 32),
+            user: clean(&p.user, MAX_NAME),
+            downloads: clean(&p.downloads, MAX_TEXT),
+            ..p
+        })
     }
 
     pub fn run(&mut self, a: RunArgs) -> R<Started> {
@@ -237,7 +300,7 @@ impl Client {
 
     pub fn apps(&mut self) -> R<Vec<App>> {
         let a: Apps = self.ask(Op::Apps, T_APPS)?;
-        Ok(a.apps)
+        Ok(a.apps.into_iter().take(MAX_APPS).map(clean_app).collect())
     }
 
     pub fn icon(&mut self, key: &str) -> R<Icon> {
@@ -245,7 +308,12 @@ impl Client {
     }
 
     pub fn ls(&mut self, path: &str) -> R<Listing> {
-        self.ask(Op::Ls { path: path.into() }, T_FILE)
+        let mut l: Listing = self.ask(Op::Ls { path: path.into() }, T_FILE)?;
+        l.path = clean(&l.path, MAX_TEXT);
+        for e in &mut l.entries {
+            e.name = clean(&e.name, MAX_TEXT);
+        }
+        Ok(l)
     }
 
     /// Copy a local file to the guest; returns where it landed. `done` is
@@ -314,13 +382,19 @@ impl Client {
                             .into(),
                     ));
                 }
-                return Ok(w);
+                return Ok(Written {
+                    path: clean(&w.path, MAX_TEXT),
+                    ..w
+                });
             }
         }
     }
 
-    /// Copy a guest file to `dst` (a file path). Written to a temporary file
-    /// next to it and renamed once the size and checksum agree.
+    /// Copy a guest file to `dst` (a file path). Written to a file nobody
+    /// else can see or name (`O_TMPFILE`, or a fresh `.conduit-part` file
+    /// where the filesystem has no such thing) and put in place only once
+    /// the size and checksum agree; without `force` an existing `dst`, even
+    /// one that appears meanwhile, is never replaced.
     pub fn get_file(
         &mut self,
         remote: &str,
@@ -328,32 +402,27 @@ impl Client {
         force: bool,
         done: &mut dyn FnMut(u64, u64),
     ) -> R<u64> {
-        if dst.exists() && !force {
-            return Err(CtlError::Failed(format!(
-                "{} exists (--force replaces it)",
-                dst.display()
-            )));
+        if !force && dst.symlink_metadata().is_ok() {
+            return Err(exists(dst));
         }
-        let mut tmp = dst.as_os_str().to_owned();
-        tmp.push(".conduit-part");
-        let tmp = PathBuf::from(tmp);
-        let r = self.get_into(remote, &tmp, done);
-        let r = r.and_then(|n| {
-            std::fs::rename(&tmp, dst)
-                .map_err(|e| CtlError::Failed(format!("{}: {e}", dst.display())))?;
-            Ok(n)
-        });
-        if r.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        r
+        let mut part = Part::open(dst, !self.no_tmpfile)?;
+        let n = self.get_into(remote, &mut part.file, dst, done)?;
+        part.commit(dst, force)?;
+        Ok(n)
     }
 
-    fn get_into(&mut self, remote: &str, tmp: &Path, done: &mut dyn FnMut(u64, u64)) -> R<u64> {
-        let mut out = std::fs::File::create(tmp)
-            .map_err(|e| CtlError::Failed(format!("{}: {e}", tmp.display())))?;
+    fn get_into(
+        &mut self,
+        remote: &str,
+        out: &mut std::fs::File,
+        dst: &Path,
+        done: &mut dyn FnMut(u64, u64),
+    ) -> R<u64> {
+        let werr = |e: std::io::Error| CtlError::Failed(format!("{}: {e}", dst.display()));
         let mut hash = Sha256::default();
         let mut offset = 0u64;
+        // The size the first piece announced, and when the copy must end.
+        let mut plan: Option<(u64, Instant)> = None;
         loop {
             let c: Chunk = self.ask(
                 Op::Get(GetArgs {
@@ -363,11 +432,35 @@ impl Client {
                 }),
                 T_FILE,
             )?;
-            if c.size > MAX_FILE {
+            let (size, deadline) = match plan {
+                Some(p) => p,
+                None => {
+                    if c.size > MAX_FILE {
+                        return Err(CtlError::Failed(format!(
+                            "{remote} is {} (the most `conduit cp` moves is {})",
+                            ui::human_bytes(c.size),
+                            ui::human_bytes(MAX_FILE)
+                        )));
+                    }
+                    if let Some(free) = free_bytes(out) {
+                        if free < c.size {
+                            return Err(CtlError::Failed(format!(
+                                "{remote} is {} but {} has only {} free",
+                                ui::human_bytes(c.size),
+                                dst.parent().unwrap_or(dst).display(),
+                                ui::human_bytes(free)
+                            )));
+                        }
+                    }
+                    let p = (c.size, Instant::now() + self.budget(c.size));
+                    plan = Some(p);
+                    p
+                }
+            };
+            if c.size != size {
                 return Err(CtlError::Failed(format!(
-                    "{remote} is {} (the most `conduit cp` moves is {})",
-                    ui::human_bytes(c.size),
-                    ui::human_bytes(MAX_FILE)
+                    "{remote} changed in the guest while it was copied ({size} bytes, now {})",
+                    c.size
                 )));
             }
             let data = b64_decode(&c.data)
@@ -375,16 +468,19 @@ impl Client {
             if data.len() > CHUNK || (data.is_empty() && !c.eof) {
                 return Err(CtlError::Failed("the guest sent a bad piece".into()));
             }
-            out.write_all(&data)
-                .map_err(|e| CtlError::Failed(format!("{}: {e}", tmp.display())))?;
+            if offset + data.len() as u64 > size {
+                return Err(CtlError::Failed(format!(
+                    "the guest sent more than the {size} bytes it announced"
+                )));
+            }
+            out.write_all(&data).map_err(werr)?;
             hash.update(&data);
             offset += data.len() as u64;
-            done(offset, c.size);
+            done(offset, size);
             if c.eof {
-                if offset != c.size {
+                if offset != size {
                     return Err(CtlError::Failed(format!(
-                        "received {offset} of {} bytes",
-                        c.size
+                        "received {offset} of {size} bytes"
                     )));
                 }
                 let want = c.sha256.unwrap_or_default();
@@ -393,9 +489,291 @@ impl Client {
                         "the received file does not match the guest's (checksum differs)".into(),
                     ));
                 }
-                out.sync_all().ok();
+                out.sync_all().map_err(werr)?;
                 return Ok(offset);
             }
+            if Instant::now() > deadline {
+                return Err(CtlError::Failed(format!(
+                    "the copy of {remote} is too slow (only {} of {} after {} s)",
+                    ui::human_bytes(offset),
+                    ui::human_bytes(size),
+                    self.budget(size).as_secs()
+                )));
+            }
+        }
+    }
+
+    /// How long a whole copy of `size` bytes may take: a minute plus 1 MiB/s,
+    /// so a guest that trickles bytes cannot hold the channel for ever.
+    fn budget(&self, size: u64) -> Duration {
+        self.budget
+            .unwrap_or(Duration::from_secs(60 + size / (1 << 20)))
+    }
+}
+
+fn exists(p: &Path) -> CtlError {
+    CtlError::Failed(format!("{} exists (--force replaces it)", p.display()))
+}
+
+/// Free bytes for an unprivileged writer on the filesystem of `f`.
+fn free_bytes(f: &std::fs::File) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid fd and a statvfs to fill.
+    if unsafe { libc::fstatvfs(f.as_raw_fd(), &mut s) } != 0 {
+        return None;
+    }
+    Some((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
+}
+
+fn cpath(p: &Path) -> R<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(p.as_os_str().as_bytes())
+        .map_err(|_| CtlError::Failed(format!("{}: bad file name", p.display())))
+}
+
+/// `renameat2(RENAME_NOREPLACE)`: fails with `EEXIST` when `to` exists.
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (f, t) = (
+        cpath(from).map_err(|_| std::io::ErrorKind::InvalidInput)?,
+        cpath(to).map_err(|_| std::io::ErrorKind::InvalidInput)?,
+    );
+    // SAFETY: two NUL-terminated paths relative to the working directory.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            f.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        // No RENAME_NOREPLACE on this filesystem: link() refuses an existing
+        // name too.
+        Some(libc::EINVAL) | Some(libc::ENOSYS) => {
+            std::fs::hard_link(from, to)?;
+            let _ = std::fs::remove_file(from);
+            Ok(())
+        }
+        _ => Err(e),
+    }
+}
+
+/// A received file until it is complete. Only what this transfer created is
+/// ever deleted.
+struct Part {
+    file: std::fs::File,
+    /// The `.conduit-part` file when the filesystem has no `O_TMPFILE`.
+    named: Option<PathBuf>,
+    _sig: Option<SigCleanup>,
+}
+
+impl Part {
+    fn open(dst: &Path, tmpfile: bool) -> R<Part> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = match dst.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let ferr = |p: &Path, e: std::io::Error| CtlError::Failed(format!("{}: {e}", p.display()));
+        if tmpfile {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_TMPFILE)
+                .open(&dir)
+            {
+                Ok(file) => {
+                    return Ok(Part {
+                        file,
+                        named: None,
+                        _sig: None,
+                    })
+                }
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EOPNOTSUPP) | Some(libc::EISDIR) | Some(libc::EINVAL)
+                    ) => {}
+                Err(e) => return Err(ferr(&dir, e)),
+            }
+        }
+        // A name of our own: never an existing file or a symlink.
+        for n in 0..100u32 {
+            let mut p = dst.as_os_str().to_owned();
+            p.push(format!(".{}-{n}.conduit-part", std::process::id()));
+            let p = PathBuf::from(p);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&p)
+            {
+                Ok(file) => {
+                    let sig = SigCleanup::arm(&p);
+                    return Ok(Part {
+                        file,
+                        named: Some(p),
+                        _sig: sig,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(ferr(&p, e)),
+            }
+        }
+        Err(CtlError::Failed(format!(
+            "cannot make a temporary file next to {}",
+            dst.display()
+        )))
+    }
+
+    /// Put the finished file at `dst`; without `force` an existing `dst` is
+    /// an error, however late it appeared.
+    fn commit(mut self, dst: &Path, force: bool) -> R<()> {
+        let derr = |e: std::io::Error| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => exists(dst),
+            _ => CtlError::Failed(format!("{}: {e}", dst.display())),
+        };
+        match self.named.take() {
+            Some(p) => {
+                let r = if force {
+                    std::fs::rename(&p, dst)
+                } else {
+                    rename_noreplace(&p, dst)
+                };
+                if r.is_err() {
+                    let _ = std::fs::remove_file(&p);
+                }
+                r.map_err(derr)
+            }
+            None => {
+                use std::os::fd::AsRawFd;
+                let proc = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+                let link = |to: &Path| -> std::io::Result<()> {
+                    let (f, t) = (
+                        cpath(&proc).map_err(|_| std::io::ErrorKind::InvalidInput)?,
+                        cpath(to).map_err(|_| std::io::ErrorKind::InvalidInput)?,
+                    );
+                    // SAFETY: NUL-terminated paths; AT_SYMLINK_FOLLOW resolves
+                    // the /proc magic link to the open file.
+                    let r = unsafe {
+                        libc::linkat(
+                            libc::AT_FDCWD,
+                            f.as_ptr(),
+                            libc::AT_FDCWD,
+                            t.as_ptr(),
+                            libc::AT_SYMLINK_FOLLOW,
+                        )
+                    };
+                    if r == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                };
+                if !force {
+                    return link(dst).map_err(derr);
+                }
+                // Link under a fresh name, then rename over `dst`.
+                for n in 0..100u32 {
+                    let mut p = dst.as_os_str().to_owned();
+                    p.push(format!(".{}-{n}.conduit-part", std::process::id()));
+                    let p = PathBuf::from(p);
+                    match link(&p) {
+                        Ok(()) => {
+                            let r = std::fs::rename(&p, dst);
+                            if r.is_err() {
+                                let _ = std::fs::remove_file(&p);
+                            }
+                            return r.map_err(derr);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(derr(e)),
+                    }
+                }
+                Err(exists(dst))
+            }
+        }
+    }
+}
+
+impl Drop for Part {
+    fn drop(&mut self) {
+        if let Some(p) = &self.named {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// The `.conduit-part` file a Ctrl-C (or SIGTERM, SIGHUP) must not leave
+/// behind; only one transfer per process is armed at a time.
+static PART_PATH: std::sync::atomic::AtomicPtr<libc::c_char> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+const PART_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+extern "C" fn part_signal(sig: libc::c_int) {
+    let p = PART_PATH.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: unlink, signal and raise are async-signal-safe; `p` came from
+    // CString::into_raw and is never freed while armed.
+    unsafe {
+        if !p.is_null() {
+            libc::unlink(p);
+        }
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+struct SigCleanup {
+    old: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+impl SigCleanup {
+    fn arm(p: &Path) -> Option<SigCleanup> {
+        let c = cpath(p).ok()?.into_raw();
+        let prev = PART_PATH.compare_exchange(
+            std::ptr::null_mut(),
+            c,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if prev.is_err() {
+            // SAFETY: from into_raw just above.
+            drop(unsafe { std::ffi::CString::from_raw(c) });
+            return None;
+        }
+        let old = PART_SIGNALS
+            .iter()
+            .map(|&s| {
+                // SAFETY: installing our own handler; the old one is restored
+                // on drop.
+                (s, unsafe {
+                    libc::signal(s, part_signal as libc::sighandler_t)
+                })
+            })
+            .collect();
+        Some(SigCleanup { old })
+    }
+}
+
+impl Drop for SigCleanup {
+    fn drop(&mut self) {
+        for &(s, h) in &self.old {
+            // SAFETY: restoring the handler arm() replaced.
+            unsafe { libc::signal(s, h) };
+        }
+        let p = PART_PATH.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+        if !p.is_null() {
+            // SAFETY: from into_raw in arm().
+            drop(unsafe { std::ffi::CString::from_raw(p) });
         }
     }
 }
@@ -669,17 +1047,45 @@ pub fn run(o: RunOpts) -> Result<()> {
         if !std::io::stderr().is_terminal() {
             // Started from a desktop shortcut: nobody sees stderr.
             let _ = std::process::Command::new("notify-send")
-                .args([
-                    "-a",
-                    "conduit",
-                    "-i",
-                    "dialog-error",
-                    &format!("conduit: {e}"),
-                ])
+                .args(notify_args(&format!("{e:#}")))
                 .status();
         }
     }
     r
+}
+
+/// `notify-send` arguments for an error: the body is markup to most
+/// notification servers, so it is escaped (and cleaned, being partly guest
+/// text); `--` keeps it from being read as an option.
+pub fn notify_args(msg: &str) -> Vec<String> {
+    let body = markup_escape(&clean(msg, MAX_MSG));
+    [
+        "-a",
+        "conduit",
+        "-i",
+        "dialog-error",
+        "--",
+        "conduit",
+        &body,
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// Text for the notification body's markup (a subset of Pango/HTML).
+pub fn markup_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\'' => o.push_str("&apos;"),
+            _ => o.push(c),
+        }
+    }
+    o
 }
 
 fn run_inner(o: &RunOpts) -> Result<()> {
@@ -869,23 +1275,74 @@ pub fn exec_quote(s: &str) -> String {
     o
 }
 
-/// The text of a host launcher for a guest app.
+/// A value for a Desktop Entry key (the key-file `string` escapes: `\\`,
+/// `\n`, `\t`, `\r`, and `\s` for a leading space).
+pub fn keyfile_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\r' => o.push_str("\\r"),
+            ' ' if i == 0 => o.push_str("\\s"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
+/// The inverse of [`keyfile_escape`].
+pub fn keyfile_unescape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            o.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('s') => o.push(' '),
+            Some('n') => o.push('\n'),
+            Some('t') => o.push('\t'),
+            Some('r') => o.push('\r'),
+            Some(x) => o.push(x),
+            None => o.push('\\'),
+        }
+    }
+    o
+}
+
+/// The text of a host launcher for a guest app. The name is guest text:
+/// cleaned, then for `Exec=` quoted per the Exec rules and only then
+/// key-file escaped (a reader undoes the key-file escapes first).
 pub fn desktop_entry(conduit: &Path, vm: &str, name: &str, icon: Option<&Path>) -> String {
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('\n', " ");
+    let name = clean(name, MAX_NAME);
+    let esc = keyfile_escape;
     let mut s = String::from("[Desktop Entry]\nType=Application\n");
-    s.push_str(&format!("Name={}\n", esc(name)));
-    s.push_str(&format!("Comment=Runs in the VM {vm} (Conduit)\n"));
+    s.push_str(&format!("Name={}\n", esc(&name)));
     s.push_str(&format!(
-        "Exec={} run {} --start --app {}\n",
-        exec_quote(&conduit.display().to_string()),
-        exec_quote(vm),
-        exec_quote(name)
+        "Comment={}\n",
+        esc(&format!("Runs in the VM {vm} (Conduit)"))
+    ));
+    s.push_str(&format!(
+        "Exec={}\n",
+        esc(&format!(
+            "{} run {} --start --app {}",
+            exec_quote(&conduit.display().to_string()),
+            exec_quote(vm),
+            exec_quote(&name)
+        ))
     ));
     if let Some(i) = icon {
-        s.push_str(&format!("Icon={}\n", i.display()));
+        s.push_str(&format!("Icon={}\n", esc(&i.display().to_string())));
     }
     s.push_str("Terminal=false\nStartupNotify=false\nCategories=Conduit;\n");
-    s.push_str(&format!("X-Conduit-VM={vm}\nX-Conduit-App={}\n", esc(name)));
+    s.push_str(&format!(
+        "X-Conduit-VM={}\nX-Conduit-App={}\n",
+        esc(vm),
+        esc(&name)
+    ));
     s
 }
 
@@ -908,9 +1365,9 @@ pub fn shortcuts(dir: &Path, vm: &str) -> Vec<(String, PathBuf)> {
             text.lines()
                 .find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('=')))
         };
-        if field("X-Conduit-VM") == Some(vm) {
+        if field("X-Conduit-VM").map(keyfile_unescape).as_deref() == Some(vm) {
             if let Some(n) = field("X-Conduit-App") {
-                out.push((n.to_string(), p));
+                out.push((keyfile_unescape(n), p));
             }
         }
     }
@@ -926,6 +1383,48 @@ fn refresh_desktop_db(dir: &Path) {
         .status();
 }
 
+/// The largest icon side taken from a guest, in pixels.
+pub const MAX_ICON_PX: u32 = 256;
+
+/// The width and height in a PNG's IHDR, if `b` starts like a PNG.
+pub fn png_size(b: &[u8]) -> Option<(u32, u32)> {
+    const SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if b.len() < 33 || &b[..8] != SIG || b[8..12] != [0, 0, 0, 13] || &b[12..16] != b"IHDR" {
+        return None;
+    }
+    let be = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    Some((be(16), be(20)))
+}
+
+/// A guest icon checked before it is written to the host: a PNG (only; an
+/// SVG is a document the host's icon loaders would parse), at most
+/// `MAX_ICON` bytes and `MAX_ICON_PX` pixels a side.
+pub fn check_icon(i: &Icon) -> std::result::Result<Vec<u8>, String> {
+    if i.format != "png" {
+        return Err(format!(
+            "the guest sent a {} icon (only PNG is taken)",
+            clean(&i.format, 16)
+        ));
+    }
+    if i.data.len() > MAX_ICON.div_ceil(3) * 4 + 4 {
+        return Err("the guest's icon is too large".into());
+    }
+    let b = b64_decode(&i.data).ok_or("the guest sent a damaged icon")?;
+    if b.is_empty() {
+        return Err("the guest sent an empty icon".into());
+    }
+    if b.len() > MAX_ICON {
+        return Err("the guest's icon is too large".into());
+    }
+    match png_size(&b) {
+        None => Err("the guest's icon is not a PNG".into()),
+        Some((w, h)) if w == 0 || h == 0 || w > MAX_ICON_PX || h > MAX_ICON_PX => Err(format!(
+            "the guest's icon is {w}x{h} (at most {MAX_ICON_PX}x{MAX_ICON_PX} is taken)"
+        )),
+        Some(_) => Ok(b),
+    }
+}
+
 /// Make the host launcher for `name`; returns its path and what could not be
 /// done on the way (no icon, say).
 pub fn add_shortcut(vm: &str, name: &str) -> Result<(PathBuf, Vec<String>)> {
@@ -936,21 +1435,16 @@ pub fn add_shortcut(vm: &str, name: &str) -> Result<(PathBuf, Vec<String>)> {
     let mut icon_path = None;
     if !app.icon.is_empty() {
         match c.icon(&app.icon) {
-            Ok(i) => {
-                let ext = if i.format == "svg" { "svg" } else { "png" };
-                match b64_decode(&i.data) {
-                    Some(bytes) if !bytes.is_empty() => {
-                        let dir = icons_dir();
-                        std::fs::create_dir_all(&dir)?;
-                        let p = dir.join(format!("conduit-{vm}-{}.{ext}", slug(&app.name)));
-                        std::fs::write(&p, bytes)?;
-                        icon_path = Some(p);
-                    }
-                    _ => {
-                        warnings.push("the guest sent an empty icon; the launcher has none".into())
-                    }
+            Ok(i) => match check_icon(&i) {
+                Ok(bytes) => {
+                    let dir = icons_dir();
+                    std::fs::create_dir_all(&dir)?;
+                    let p = dir.join(format!("conduit-{vm}-{}.png", slug(&app.name)));
+                    std::fs::write(&p, bytes)?;
+                    icon_path = Some(p);
                 }
-            }
+                Err(e) => warnings.push(format!("{e}; the launcher has none")),
+            },
             Err(e) => warnings.push(format!("no icon: {e}; the launcher has none")),
         }
     }
