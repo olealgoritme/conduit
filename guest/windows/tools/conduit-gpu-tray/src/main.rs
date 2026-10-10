@@ -30,8 +30,8 @@ fn main() {
     // Explorer's "Send to Conduit host" (conduit_shell_menu.dll) hands the
     // selection over in a list file.
     if args.len() == 2 && args[0] == "--send-list" {
-        sendto::send_list(std::path::Path::new(&args[1]));
-        return;
+        let code = sendto::send_list(std::path::Path::new(&args[1]));
+        std::process::exit(code as i32);
     }
     app::run();
 }

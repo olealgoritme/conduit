@@ -167,7 +167,7 @@ fn waiting(g: &Gfx, why: Wait) {
     let sub = match why {
         Wait::NoChannel => "The feed starts with the VM. Restart it once after `conduit attach`.",
         Wait::Denied => {
-            "Windows denied access to the stats channel. Starting with administrator rights\u{2026}"
+            "The stats channel needs administrator rights: start Conduit GPU as an administrator."
         }
         Wait::Quiet => {
             "The host stopped sending readings. It resumes when the VM's helper is back."

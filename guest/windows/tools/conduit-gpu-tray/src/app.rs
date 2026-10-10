@@ -4,6 +4,7 @@ use crate::gfx::{self, argb, wide, Gfx};
 use crate::sendto;
 use crate::sys;
 use crate::view::{self, Snapshot, Wait};
+use gpu_tray::policy::{on_denied, OnDenied};
 use gpu_tray::{
     copied_text, default_share, icon_face, tooltip, IconMetric, LineReader, Model, Share, CHANNEL,
 };
@@ -32,6 +33,8 @@ const WM_TRAY: u32 = WM_APP + 2;
 const WM_SHOW: u32 = WM_APP + 3;
 /// A drop finished copying; repaint the row's status line.
 const WM_DROPPED: u32 = WM_APP + 4;
+/// End the app (from another thread).
+const WM_CLOSE_APP: u32 = WM_APP + 5;
 const TIMER: usize = 1;
 /// Repaints the open popup for the waiting animation.
 const ANIM: usize = 2;
@@ -71,6 +74,12 @@ static KEEP_OPEN: AtomicBool = AtomicBool::new(false);
 static SHARES: Mutex<Vec<Share>> = Mutex::new(Vec::new());
 /// The shared folders row's message after a drop, and when it was set.
 static DROP_STATUS: Mutex<Option<(String, u64)>> = Mutex::new(None);
+/// The single-instance mutex (closed while a hand-off is under way).
+static MUTEX_HANDLE: AtomicIsize = AtomicIsize::new(0);
+/// A hand-off to an elevated copy was tried (once per run).
+static HANDOFF_TRIED: AtomicBool = AtomicBool::new(false);
+/// How long a started elevated copy has to show its window.
+const HANDOFF_WAIT: Duration = Duration::from_secs(6);
 
 fn model() -> &'static Mutex<Model> {
     MODEL.get_or_init(|| Mutex::new(Model::default()))
@@ -148,16 +157,22 @@ fn open_default_share() {
 }
 
 /// Files dropped on the popup: copy them into the default share (Explorer's
-/// own copy dialog shows progress and asks about name clashes).
+/// own copy dialog shows progress and asks about name clashes). The copy
+/// runs in a `--send-list` helper with the user's normal token: the drop
+/// message may come from any unelevated process, so the elevated tray must
+/// not read the files itself.
 fn drop_files(hwnd: HWND, hdrop: HDROP) {
-    let mut files: Vec<String> = Vec::new();
+    let mut files: Vec<Vec<u16>> = Vec::new();
     unsafe {
         let n = DragQueryFileW(hdrop, u32::MAX, null_mut(), 0);
         for i in 0..n {
             let len = DragQueryFileW(hdrop, i, null_mut(), 0) as usize;
             let mut buf = vec![0u16; len + 1];
             DragQueryFileW(hdrop, i, buf.as_mut_ptr(), buf.len() as u32);
-            files.push(String::from_utf16_lossy(&buf[..len]));
+            buf.truncate(len);
+            if !buf.is_empty() {
+                files.push(buf);
+            }
         }
         DragFinish(hdrop);
     }
@@ -175,12 +190,14 @@ fn drop_files(hwnd: HWND, hdrop: HDROP) {
     }
     let h = hwnd as usize;
     std::thread::spawn(move || {
-        let ok = sendto::copy_into(&files, &dest.root());
+        let code = crate::launch::send_as_user(&files)
+            .ok()
+            .and_then(|c| c.wait());
         *DROP_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some((
-            if ok {
-                copied_text(files.len(), &dest.name)
-            } else {
-                "Copy stopped".to_string()
+            match code {
+                Some(sendto::SENT) => copied_text(files.len(), &dest.name),
+                Some(sendto::NO_SHARE) => "No shared folder is mounted to copy to".into(),
+                _ => "Copy stopped".to_string(),
             },
             tick(),
         ));
@@ -209,14 +226,18 @@ fn reader(hwnd: usize) {
         };
         if h == INVALID_HANDLE_VALUE {
             let denied = unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
-            if denied && !sys::elevated() && sys::relaunch_elevated(&exe_path()) {
-                // The elevated copy takes over (the port is admin-only).
+            if denied
+                && !sys::elevated()
+                && on_denied(sys::elevation(), HANDOFF_TRIED.swap(true, Relaxed))
+                    == OnDenied::HandOff
+                && hand_off()
+            {
+                // The elevated copy took over (the port is admin-only).
                 let h = MAIN.load(Relaxed);
                 if h != 0 {
-                    unsafe { DestroyWindow(h as HWND) };
-                    unsafe { PostMessageW(h as HWND, WM_QUIT, 0, 0) };
+                    unsafe { PostMessageW(h as HWND, WM_CLOSE_APP, 0, 0) };
                 }
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(500));
                 std::process::exit(0);
             }
             CHANNEL_STATE.store(if denied { CH_DENIED } else { CH_WAITING }, Relaxed);
@@ -244,6 +265,57 @@ fn reader(hwnd: usize) {
         CHANNEL_STATE.store(CH_WAITING, Relaxed);
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Another running copy's window (the class is ours; the process is not).
+fn other_instance_window() -> Option<HWND> {
+    let cls = wide(CLASS);
+    let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
+    let mut after: HWND = null_mut();
+    loop {
+        let w = unsafe { FindWindowExW(null_mut(), after, cls.as_ptr(), null()) };
+        if w.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(w, &mut pid) };
+        if pid != me {
+            return Some(w);
+        }
+        after = w;
+    }
+}
+
+/// Hands over to an elevated copy: frees the single-instance mutex for it,
+/// starts it, and counts the hand-off done only when its window shows up
+/// within `HANDOFF_WAIT`. Otherwise this copy takes the mutex back and keeps
+/// running (and says the channel needs administrator rights).
+fn hand_off() -> bool {
+    let m = MUTEX_HANDLE.swap(0, Relaxed);
+    if m != 0 {
+        unsafe { CloseHandle(m as HANDLE) };
+    }
+    if sys::relaunch_elevated(&exe_path()) {
+        let t0 = Instant::now();
+        while t0.elapsed() < HANDOFF_WAIT {
+            if other_instance_window().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let name = wide(MUTEX);
+    let h = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
+    let err = unsafe { GetLastError() };
+    if h.is_null() || err == ERROR_ALREADY_EXISTS {
+        // A copy that started late holds it now: it is the one running.
+        if !h.is_null() {
+            unsafe { CloseHandle(h) };
+        }
+        return true;
+    }
+    MUTEX_HANDLE.store(h as isize, Relaxed);
+    false
 }
 
 // ----------------------------------------------------------------- tray icon
@@ -688,6 +760,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             InvalidateRect(hwnd, null(), 0);
             0
         }
+        WM_CLOSE_APP => {
+            DestroyWindow(hwnd);
+            0
+        }
         WM_DROPFILES => {
             drop_files(hwnd, wp as HDROP);
             0
@@ -759,19 +835,28 @@ pub fn run() {
         // One instance per session: a second launch asks the first to show itself.
         let name = wide(MUTEX);
         let mut mutex = CreateMutexW(null(), 0, name.as_ptr());
-        // An elevated copy started by a hand-off waits for the other to exit.
+        let mut err = GetLastError();
+        // An elevated copy started by a hand-off waits for the other to
+        // let go of the mutex.
         let mut tries = 0;
-        while !mutex.is_null()
-            && GetLastError() == ERROR_ALREADY_EXISTS
-            && sys::elevated()
-            && tries < 25
-        {
+        while !mutex.is_null() && err == ERROR_ALREADY_EXISTS && sys::elevated() && tries < 25 {
             CloseHandle(mutex);
             std::thread::sleep(Duration::from_millis(200));
             mutex = CreateMutexW(null(), 0, name.as_ptr());
+            err = GetLastError();
             tries += 1;
         }
-        if !mutex.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+        // An elevated copy's mutex cannot be opened by an unelevated one
+        // (access denied): that copy is running too.
+        let taken = if mutex.is_null() {
+            err == ERROR_ACCESS_DENIED
+        } else {
+            err == ERROR_ALREADY_EXISTS
+        };
+        if taken {
+            if !mutex.is_null() {
+                CloseHandle(mutex);
+            }
             let cls = wide(CLASS);
             let other = FindWindowW(cls.as_ptr(), null());
             if !other.is_null() {
@@ -816,14 +901,13 @@ pub fn run() {
         if hwnd.is_null() {
             return;
         }
+        MUTEX_HANDLE.store(mutex as isize, Relaxed);
         // Files dragged from Explorer reach this (elevated) window only when
-        // the message filter lets the drop messages through.
+        // the message filter lets the drop messages through (drop_files
+        // copies with the user's token); WM_SHOW lets a second, unelevated
+        // launch open the popup. Nothing else gets through.
         DragAcceptFiles(hwnd, 1);
-        for m in [
-            WM_DROPFILES,
-            WM_COPYDATA,
-            0x0049, /* WM_COPYGLOBALDATA */
-        ] {
+        for m in [WM_DROPFILES, 0x0049 /* WM_COPYGLOBALDATA */, WM_SHOW] {
             ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, null_mut());
         }
         refresh_shares();

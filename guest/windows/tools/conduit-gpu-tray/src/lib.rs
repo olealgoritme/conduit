@@ -4,6 +4,7 @@
 
 pub mod ctl_logic;
 pub mod png;
+pub mod policy;
 pub mod procs;
 pub mod startmenu;
 pub mod steam;
@@ -229,17 +230,6 @@ pub fn default_share(shares: &[Share]) -> Option<&Share> {
         .or_else(|| shares.first())
 }
 
-/// A double-null-terminated path list, as SHFileOperationW takes it.
-pub fn path_list(paths: &[String]) -> Vec<u16> {
-    let mut v: Vec<u16> = Vec::new();
-    for p in paths {
-        v.extend(p.encode_utf16());
-        v.push(0);
-    }
-    v.push(0);
-    v
-}
-
 /// "Copied 3 items to Conduit".
 pub fn copied_text(n: usize, share: &str) -> String {
     format!(
@@ -363,10 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_list_and_text() {
-        let v = path_list(&["C:\\a".into(), "C:\\b c".into()]);
-        assert_eq!(&v[v.len() - 2..], &[0, 0]);
-        assert_eq!(v.iter().filter(|&&c| c == 0).count(), 3);
+    fn copied_texts() {
         assert_eq!(copied_text(1, "Conduit"), "Copied 1 item to Conduit");
         assert_eq!(copied_text(3, "Docs"), "Copied 3 items to Docs");
     }

@@ -277,7 +277,7 @@ fn connection(agent: &Arc<Agent<WinBackend>>, conn: Arc<Conn>, ended: &mut u32) 
 
 /// Appends one line to `%ProgramData%\Conduit\ctl.log` (restarted when it
 /// passes 64 KiB). Only state changes are logged, never requests.
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     use std::io::Write;
     let Some(dir) = std::env::var_os("ProgramData") else {
         return;
