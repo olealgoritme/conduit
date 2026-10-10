@@ -25,6 +25,7 @@
 #define NVKVM_BROKER_H
 
 #include <stdbool.h>
+#include "nb_view.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <poll.h>
@@ -173,6 +174,17 @@ struct nb_config {
     const char *direct_hook;
     unsigned    hint_align;
     int         resize_mode;    /* NB_RESIZE_*: what a windowed resize does */
+    /*
+     * Display settings (nb_view.h): --res, --area, --scale, --filter.  They
+     * are applied over what --view-state restored, and only the ones given
+     * (view_set, NB_VIEW_SET_*) -- so the command line overrides a saved
+     * setting without wiping the others.
+     */
+    struct nb_view view;
+    unsigned    view_set;
+    const char *view_state;     /* settings file, rewritten on every change */
+    const char *vm_shutdown_cmd;/* menu: run via /bin/sh, not waited for    */
+    const char *vm_reboot_cmd;
 };
 
 #define NB_RESIZE_SCALE 0       /* scale the full guest picture into the window */
@@ -393,6 +405,13 @@ bool nb_sink_take_roundtrip(struct nb_sink *s);
 /* Called by session backends.  `code` values are Linux evdev codes on every
  * backend — that is what makes the wire format backend-independent. */
 void nb_sink_key(struct nb_sink *s, unsigned code, bool down);
+/* While the viewer's menu has the keyboard: track the modifiers and finish
+ * consumed chords, forward nothing. */
+void nb_sink_key_latch(struct nb_sink *s, unsigned code, bool down);
+/* Release every key and button the guest believes is down (the menu is
+ * taking input); the modifier latch is kept. */
+void nb_sink_release_keys(struct nb_sink *s);
+void nb_sink_toggle_fullscreen(struct nb_sink *s);
 void nb_sink_btn(struct nb_sink *s, unsigned code, bool down);
 void nb_sink_abs(struct nb_sink *s, int x, int y, unsigned w, unsigned h);
 void nb_sink_rel(struct nb_sink *s, int dx, int dy);
@@ -724,10 +743,19 @@ void nb_placeholder_paint(uint32_t *px, unsigned w, unsigned h,
  * a VMM with no clipboard agent must not be told to prepare a paste. */
 #define NB_CLIENT_HAS_CLIPBOARD (1u << 0)
 
-/* nb_config.scale_mode */
-#define NB_SCALE_NONE    0      /* 1:1, centred, no scaling at all           */
-#define NB_SCALE_STRETCH 1      /* fill the window, ignore aspect, distort   */
-#define NB_SCALE_ASPECT  2      /* as large as fits, aspect kept, black bars */
+/* nb_config.scale_mode: NB_SCALE_* from nb_view.h */
+
+/* Display settings shared by the backends (nb_common.c). */
+void nb_vstore_setup(struct nb_vstore *st, const struct nb_config *cfg);
+void nb_vstore_persist(const struct nb_vstore *st, const struct nb_config *cfg);
+/* nb_res_* follows the store's guest resolution (unless --resolution=none). */
+void nb_view_apply_res(const struct nb_view *v);
+/* The viewer's own hotkeys (CTRL+ALT+key).  NB_VIEW_CH_* bits, label set;
+ * -1 when `code` is not one of them. */
+int  nb_view_hotkey(struct nb_vstore *st, unsigned code, bool shift, int ww,
+                    int wh, unsigned s120, char *label, size_t n);
+/* Run a configured command via /bin/sh, detached. */
+void nb_run_detached(const char *cmd);
 
 /* The same 5x7 font, for the client-side title bar.  Uppercase-only. */
 unsigned nb_placeholder_text_w(const char *s, unsigned scale);

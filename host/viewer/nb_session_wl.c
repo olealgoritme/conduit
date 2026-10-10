@@ -73,6 +73,7 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
 #include "presentation-time-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "nb_ui.h"
 #include "tearing-control-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
@@ -621,6 +622,54 @@ struct nb_wl {
     uint32_t  gc_gen;
     uint64_t  gc_tick;
     bool      gc_told_fail;
+
+    /*
+     * Display settings (nb_view.h) and where they last put the picture.
+     * `place` is what the picture's viewport was given, so the pointer is
+     * mapped through exactly the rectangle that is on screen.
+     */
+    const struct nb_config *cfg;
+    struct nb_vstore vst;
+    struct nb_place  place;
+    bool             vp_src[2];     /* source rect set: [0] main, [1] cs   */
+
+    /* The viewer's own UI layers (nb_ui.h): subsurfaces with shm buffers. */
+    struct nb_ui     ui;
+    struct nb_wl_layer *ly_menu, *ly_note, *ly_btn;
+    uint64_t note_until_ms;         /* notice visible until, 0 = hidden    */
+    char     note_txt[64];
+    double   btn_alpha;             /* the top-edge button's fade, 0..1    */
+    bool     btn_want, btn_hot;
+    uint64_t btn_last_ms, btn_seen_ms;
+    bool     ptr_on_menu, ptr_on_btn;
+    double   ptr_wx, ptr_wy;        /* last pointer, window coordinates     */
+    /* The area outline while the menu is open: 4 edges + 4 corners, one
+     * shared 1x1 green buffer stretched by viewports. */
+    struct wl_surface    *ed_surf[8];
+    struct wl_subsurface *ed_sub[8];
+    struct wp_viewport   *ed_vp[8];
+    struct wl_buffer     *ed_buf;
+    void                 *ed_px;
+    bool                  ed_mapped;
+    struct nb_rect        ed_at;
+    int                   ui_cur;   /* NB_UI_CUR_* shown, -1 = not ours    */
+    bool                  rehint_pending;   /* a mode hint is owed      */
+    uint64_t              rehint_due_ms;    /* ...sent then, 0 = not yet */
+};
+
+/* One UI layer: a desynchronised subsurface of the main surface. */
+struct nb_wl_layer {
+    struct wl_surface    *surf;
+    struct wl_subsurface *sub;
+    struct wp_viewport   *vp;
+    struct wl_buffer     *buf[2];
+    bool                  busy[2];
+    void                 *px;
+    size_t                sz;
+    int                   pw, ph;   /* buffer, physical pixels              */
+    int                   lw, lh;   /* on screen, logical                   */
+    int                   x, y;
+    bool                  mapped, input;
 };
 
 /* Forward: the title bar lives further down, but wl_commit sizes it. */
@@ -652,6 +701,17 @@ static void ov_sync(struct nb_wl *w);
 static void ov_paint_commit(struct nb_wl *w);
 static void wl_title_update(struct nb_wl *w, bool force);
 static bool gc_layout(struct nb_wl *w, bool force);
+/* Forward: the display settings and the viewer's own UI, defined after the
+ * hotkeys. */
+static const struct nb_ui_env *wl_ui_env(struct nb_wl *w);
+static void wl_ui_do(struct nb_wl *w, unsigned bits);
+static void wl_ui_layer_motion(struct nb_wl *w, double lx, double ly);
+static void wl_btn_track(struct nb_wl *w, double wy);
+static void wl_ptr_to_guest(struct nb_wl *w);
+static void wl_ui_reflow(struct nb_wl *w);
+static int  wl_tick_ui(struct nb_wl *w, int next);
+static void wl_menu_set(struct nb_wl *w, bool open);
+static void wl_rehint(struct nb_wl *w);
 
 /* ── virtio-nvgpu: per-frame presentation context and --stats ─────────── */
 
@@ -1294,12 +1354,23 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
         bw = w->win_w > 0 ? w->win_w : 1;
         bh = w->win_h > 0 ? w->win_h : 1;
     }
-    /* The arithmetic lives in nb_overlay.c, where test/test_overlay.c checks
-     * that the whole picture always fits and is centred. */
-    nb_fit(w->scale_mode, bw, bh, w->win_w, w->win_h, &dw, &dh, &ox, &oy);
-    w->fit_w = dw;
-    w->fit_h = dh;
-    bg_layout(w, dw, dh);       /* off_x / off_y: where the picture sits */
+    /*
+     * The arithmetic lives in nb_view.c (test/test_view.c): the output area,
+     * the scale mode, and -- for a picture larger than its area at 1:1 -- the
+     * buffer rectangle that is visible.  dw x dh is what is drawn, at
+     * off_x/off_y; fit_* is the whole picture's size, which is the scale the
+     * guest cursor is drawn at.
+     */
+    nb_view_place(&w->vst.cur, bw, bh, w->win_w, w->win_h, w->scale_120,
+                  &w->place);
+    dw = w->place.vis.w;
+    dh = w->place.vis.h;
+    (void)ox; (void)oy;
+    w->fit_w = w->place.pic.w;
+    w->fit_h = w->place.pic.h;
+    bg_layout(w, dw, dh);
+    w->off_x = w->place.vis.x;
+    w->off_y = w->place.vis.y;
 
     /*
      * WHICH SURFACE CARRIES THE PICTURE -- see cs_surf.  Exact fit: the main
@@ -1309,8 +1380,11 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
      */
     {
         bool want_sub = w->cs_surf && w->cs_vp && w->win_w > 0 &&
-                        w->win_h > 0 && (dw != w->win_w || dh != w->win_h) &&
+                        w->win_h > 0 &&
+                        (dw != w->win_w || dh != w->win_h || w->off_x ||
+                         w->off_y) &&
                         wl_blk_build(w);
+        bool crop = w->place.cropped;
         struct wl_buffer *cur = w->current >= 0 && w->bufs[w->current].valid
                                     ? w->bufs[w->current].buf : NULL;
         struct wl_buffer *show = buf ? buf : cur;
@@ -1321,6 +1395,15 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
         if (want_sub && !w->in_sub) {
             w->in_sub = true;
             switched = true;
+            /* The main surface is about to show a 1x1 buffer: a source rect
+             * left over from a cropped picture would be a protocol error. */
+            if (w->vp_src[0] && w->viewport) {
+                wp_viewport_set_source(w->viewport, wl_fixed_from_int(-1),
+                                       wl_fixed_from_int(-1),
+                                       wl_fixed_from_int(-1),
+                                       wl_fixed_from_int(-1));
+                w->vp_src[0] = false;
+            }
             wl_surface_attach(w->surf, w->blk_buf, 0, 0);
             wl_surface_damage_buffer(w->surf, 0, 0, 1, 1);
             w->main_vw = w->main_vh = 0;
@@ -1350,7 +1433,23 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
             }
         }
         if (vp) {
-            if (dw == bw && dh == bh) {
+            bool *src_on = &w->vp_src[w->in_sub ? 1 : 0];
+
+            /* 1:1 larger than the area: show only the visible part. */
+            if (crop) {
+                wp_viewport_set_source(vp, wl_fixed_from_double(w->place.sx),
+                                       wl_fixed_from_double(w->place.sy),
+                                       wl_fixed_from_double(w->place.sw),
+                                       wl_fixed_from_double(w->place.sh));
+                *src_on = true;
+            } else if (*src_on) {
+                wp_viewport_set_source(vp, wl_fixed_from_int(-1),
+                                       wl_fixed_from_int(-1),
+                                       wl_fixed_from_int(-1),
+                                       wl_fixed_from_int(-1));
+                *src_on = false;
+            }
+            if (dw == bw && dh == bh && !crop) {
                 wp_viewport_set_destination(vp, -1, -1);
             } else {
                 wp_viewport_set_destination(vp, dw, dh);
@@ -2451,8 +2550,9 @@ static void wl_report_surface(struct nb_wl *w, int lw, int lh)
         ph = nb_res_h;
         break;
     default:
-        pw = (unsigned)(((long)lw * s + 60) / 120);
-        ph = (unsigned)(((long)lh * s + 60) / 120);
+        /* Native: the output area in physical pixels -- the window, unless
+         * a smaller area was chosen, which the guest then fills 1:1. */
+        nb_view_guest_mode(&w->vst.cur, lw, lh, s, &pw, &ph);
         break;
     }
 
@@ -2537,6 +2637,24 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
         return;
     }
     cur_build(w);
+    if (w->ui.open && !w->dlg_open) {
+        /* The menu is open: the area editor's handles. */
+        static const int map[NB_UI_CUR_COUNT] = {
+            [NB_UI_CUR_ARROW] = NB_CUR_ARROW, [NB_UI_CUR_MOVE] = NB_CUR_ARROW,
+            [NB_UI_CUR_N] = NB_CUR_NS, [NB_UI_CUR_S] = NB_CUR_NS,
+            [NB_UI_CUR_W] = NB_CUR_EW, [NB_UI_CUR_E] = NB_CUR_EW,
+            [NB_UI_CUR_NW] = NB_CUR_NWSE, [NB_UI_CUR_SE] = NB_CUR_NWSE,
+            [NB_UI_CUR_NE] = NB_CUR_NESW, [NB_UI_CUR_SW] = NB_CUR_NESW,
+            [NB_UI_CUR_TEXT] = NB_CUR_ARROW,
+        };
+        int c = nb_ui_area_cursor(&w->ui);
+        int k = c >= 0 && c < NB_UI_CUR_COUNT ? map[c] : NB_CUR_ARROW;
+
+        w->ui_cur = c;
+        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[k], w->cur_hx[k],
+                              w->cur_hy[k]);
+        return;
+    }
     if (w->dlg_open) {
         /*
          * THE DIALOG IS HOST UI AND ALWAYS HAS A POINTER, exactly like the
@@ -3280,6 +3398,33 @@ static void kbd_key(void *d, struct wl_keyboard *k, uint32_t serial,
         }
         return;
     }
+    /*
+     * THE MENU HAS THE KEYBOARD while it is open: nothing reaches the guest.
+     * The sink still tracks the modifiers, so CTRL+ALT+M closes it and the
+     * chords work again the moment it is gone.
+     */
+    if (w->ui.open && w->sink) {
+        bool down = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+
+        nb_sink_key_latch(w->sink, key, down);
+        if (down && w->sink->ctrl_down && w->sink->alt_down &&
+            (key == KEY_M || key == KEY_F || key == KEY_O)) {
+            if (key == KEY_M) {
+                wl_menu_set(w, false);
+            } else if (key == KEY_F) {
+                nb_sink_toggle_fullscreen(w->sink);
+            } else {
+                wl_ui_do(w, NB_UI_STATS);
+            }
+            return;
+        }
+        if (key != KEY_LEFTCTRL && key != KEY_RIGHTCTRL &&
+            key != KEY_LEFTALT && key != KEY_RIGHTALT) {
+            wl_ui_do(w, nb_ui_key(&w->ui, wl_ui_env(w), key,
+                                  w->sink->shift_down, down));
+        }
+        return;
+    }
     /* wl_keyboard.key carries the evdev code directly — no translation. */
     if (w->sink) {
         nb_sink_key(w->sink, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
@@ -3305,7 +3450,6 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
                       struct wl_surface *s, wl_fixed_t x, wl_fixed_t y)
 {
     struct nb_wl *w = d;
-    (void)x; (void)y;
 
     w->last_serial = serial;
     w->ptr_surf = s;
@@ -3324,6 +3468,24 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
 
             wl_pointer_set_cursor(p, serial, w->cur_surf[c],
                                   w->cur_hx[c], w->cur_hy[c]);
+        }
+        return;
+    }
+    w->ptr_on_menu = s && w->ly_menu && s == w->ly_menu->surf;
+    w->ptr_on_btn = s && w->ly_btn && s == w->ly_btn->surf;
+    if (w->ptr_on_menu || w->ptr_on_btn) {
+        /* Our own UI: an arrow, and nothing reaches the guest. */
+        w->ptr_on_dlg = false;
+        w->ptr_on_tb = false;
+        w->ptr_on_content = false;
+        w->ui_cur = -1;
+        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        if (w->sink) {
+            nb_sink_pointer(w->sink, false);
+        }
+        if (w->ptr_on_btn) {
+            wl_ui_layer_motion(w, wl_fixed_to_double(x),
+                               wl_fixed_to_double(y));
         }
         return;
     }
@@ -3373,6 +3535,17 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial,
 
     w->ptr_on_content = false;
 
+    if (w->ptr_on_menu || w->ptr_on_btn) {
+        if (w->ptr_on_menu) {
+            wl_ui_do(w, nb_ui_panel_leave(&w->ui));
+        }
+        if (w->btn_hot) {
+            w->btn_hot = false;
+            w->btn_last_ms = 0;     /* repaint on the next tick */
+        }
+        w->ptr_on_menu = w->ptr_on_btn = false;
+        return;
+    }
     if (bd_index(w, s) >= 0) {
         w->bd_hot = -1;
         return;
@@ -3420,17 +3593,30 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
         }
         return;                 /* chrome, not guest input */
     }
-    if (w->sink) {
-        int px = wl_fixed_to_int(x), py = wl_fixed_to_int(y);
+    {
+        double wx = wl_fixed_to_double(x), wy = wl_fixed_to_double(y);
 
-        /* Over the letterbox bars the pointer is on the MAIN surface, whose
-         * origin is the window's; the picture starts off_* in.  (The sink
-         * clamps to the picture.) */
-        if (w->in_sub && w->ptr_surf == w->surf) {
-            px -= w->off_x;
-            py -= w->off_y;
+        /*
+         * To WINDOW coordinates.  The main surface is the window; the
+         * picture's subsurface sits at off_*.  Over the bars the pointer is
+         * on the main surface.
+         */
+        if (w->ptr_on_btn || w->ptr_on_menu) {
+            wl_ui_layer_motion(w, wx, wy);      /* layer-local */
+            return;
         }
-        nb_sink_abs(w->sink, px, py, (unsigned)w->surf_w, (unsigned)w->surf_h);
+        if (w->in_sub && w->ptr_surf == w->cs_surf) {
+            wx += w->off_x;
+            wy += w->off_y;
+        }
+        w->ptr_wx = wx;
+        w->ptr_wy = wy;
+        wl_btn_track(w, wy);
+        if (w->ui.open) {
+            wl_ui_do(w, nb_ui_area_motion(&w->ui, wl_ui_env(w), wx, wy));
+            return;
+        }
+        wl_ptr_to_guest(w);
     }
 }
 static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
@@ -3439,6 +3625,26 @@ static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
     struct nb_wl *w = d;
 
     w->last_serial = serial;
+    if (w->ptr_on_btn) {
+        /* The top-edge button: release over it opens the menu. */
+        if (!state) {
+            wl_menu_set(w, !w->ui.open);
+        }
+        return;
+    }
+    if (w->ptr_on_menu) {
+        if (button == BTN_LEFT) {
+            wl_ui_do(w, nb_ui_panel_button(&w->ui, wl_ui_env(w), state != 0));
+        }
+        return;
+    }
+    if (w->ui.open && !w->dlg_open && w->bd_hot < 0 && !w->ptr_on_tb) {
+        /* The menu has the pointer: a drag edits the output area. */
+        if (button == BTN_LEFT) {
+            wl_ui_do(w, nb_ui_area_button(&w->ui, wl_ui_env(w), state != 0));
+        }
+        return;
+    }
     if (w->ptr_on_dlg) {
         /* PRESS ARMS, RELEASE ACTS, same rule as the title bar: none of these
          * four is an action anyone should trigger by a mis-click. */
@@ -3556,7 +3762,14 @@ static void ptr_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t axis,
     int v = wl_fixed_to_int(value);
     (void)p; (void)t;
 
-    if (!w->sink) {
+    if (w->ptr_on_menu) {
+        if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL && v) {
+            wl_ui_do(w, nb_ui_panel_wheel(&w->ui, wl_ui_env(w),
+                                          v > 0 ? 1 : -1));
+        }
+        return;
+    }
+    if (w->ui.open || w->ptr_on_btn || !w->sink) {
         return;
     }
     /* Wayland axis is "down is positive"; evdev REL_WHEEL is "up is positive". */
@@ -3874,6 +4087,7 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
     if (w->ov_mapped) {
         ov_paint_commit(w);     /* follows the window's corner */
     }
+    wl_ui_reflow(w);
 }
 /*
  * xdg_toplevel.close -- the compositor asking us to go away (Alt+F4, a close
@@ -4538,8 +4752,7 @@ static void wl_mode_hint(struct nb_wl *w, bool immediate)
         if (w->win_w <= 0 || w->win_h <= 0) {
             return;
         }
-        hw = (unsigned)(((long)w->win_w * s + 60) / 120);
-        hh = (unsigned)(((long)w->win_h * s + 60) / 120);
+        nb_view_guest_mode(&w->vst.cur, w->win_w, w->win_h, s, &hw, &hh);
         if (w->hint_align > 1) {
             hw -= hw % w->hint_align;
         }
@@ -4860,6 +5073,8 @@ static int wl_tick_viewer(struct nb_wl *w, int next)
     uint64_t now = nb_now_ms_wl();
     bool flush = false;
 
+    next = wl_tick_ui(w, next);
+
     if (w->mh_due_ms) {
         if (now >= w->mh_due_ms) {
             wl_mode_hint(w, true);
@@ -5000,21 +5215,680 @@ static bool wl_hotkey(struct nb_session *s, unsigned code)
     case KEY_D:
         wl_direct_set(w, !w->direct);
         return true;
-    case KEY_R:
-        w->resize_mode = w->resize_mode == NB_RESIZE_GUEST ? NB_RESIZE_SCALE
-                                                           : NB_RESIZE_GUEST;
-        nb_log("resize: %s", w->resize_mode == NB_RESIZE_GUEST
-                   ? "the guest follows the window (CTRL+ALT+R: scale instead)"
-                   : "the guest picture is scaled into the window "
-                     "(CTRL+ALT+R: follow instead)");
-        wl_mode_hint(w, true);
-        if (w->ov_mapped) {
-            ov_paint_commit(w);
-        }
-        wl_display_flush(w->dpy);
+    case KEY_M:
+        wl_menu_set(w, !w->ui.open);
         return true;
-    default:
-        return false;
+    default: {
+        char label[64];
+        int ch = nb_view_hotkey(&w->vst, code, w->sink && w->sink->shift_down,
+                                w->win_w, w->win_h, w->scale_120, label,
+                                sizeof(label));
+        unsigned bits = NB_UI_SAVE | NB_UI_NOTICE | NB_UI_REDRAW;
+
+        if (ch < 0) {
+            return false;
+        }
+        if (ch & NB_VIEW_CH_LAYOUT) {
+            bits |= NB_UI_VIEW;
+        }
+        if (ch & NB_VIEW_CH_RES) {
+            bits |= NB_UI_RES;
+        }
+        snprintf(w->ui.notice, sizeof(w->ui.notice), "%s", label);
+        nb_log("display: %s", label);
+        wl_ui_do(w, bits);
+        return true;
+    }
+    }
+}
+
+/* ── display settings and the viewer's own UI ────────────────────────────── */
+/*
+ * NOTHING HERE IS ON THE FRAME PATH.  The picture stays one buffer on one
+ * surface whose viewport does the scaling; a settings change re-places it
+ * (a viewport destination, a subsurface position) and that is all.  The
+ * menu, the notice and the top-edge button are separate subsurfaces with
+ * their own small shm buffers, painted only when their state changes and
+ * unmapped when not shown -- so with the menu closed nothing extra exists.
+ *
+ * Only core protocol is used for the layers (wl_subcompositor, wl_shm), with
+ * wp_viewporter -- already required for scaling -- to give them crisp
+ * physical-pixel buffers at a fractional output scale.
+ */
+static const struct nb_ui_env *wl_ui_env(struct nb_wl *w)
+{
+    static struct nb_ui_env e;
+
+    e.win_w = w->win_w > 0 ? w->win_w : 1;
+    e.win_h = w->win_h > 0 ? w->win_h : 1;
+    e.s120 = w->viewporter && w->scale_120 ? w->scale_120 : 120;
+    e.buf_w = w->current >= 0 ? w->buf_w : 0;
+    e.buf_h = w->current >= 0 ? w->buf_h : 0;
+    e.stats_on = w->ov_user;
+    e.fullscreen = w->fullscreen;
+    e.nearest_ok = false;       /* a compositor chooses its own filter */
+    e.vm_actions = w->cfg && (w->cfg->vm_shutdown_cmd || w->cfg->vm_reboot_cmd);
+    e.translucent = true;
+    return &e;
+}
+
+static void ly_release(void *data, struct wl_buffer *b)
+{
+    struct nb_wl_layer *L = data;
+
+    for (int i = 0; i < 2; i++) {
+        if (L->buf[i] == b) {
+            L->busy[i] = false;
+        }
+    }
+}
+static const struct wl_buffer_listener ly_buf_listener = {
+    .release = ly_release,
+};
+
+/* The topmost of our UI subsurfaces, so each new one goes above the last. */
+static struct wl_surface *wl_ui_top;
+
+static void wl_place_top(struct nb_wl *w, struct wl_subsurface *sub,
+                         struct wl_surface *sf)
+{
+    struct wl_surface *ref = wl_ui_top ? wl_ui_top
+                           : w->cs_surf ? w->cs_surf : w->surf;
+
+    wl_subsurface_place_above(sub, ref);
+    wl_ui_top = sf;
+}
+
+static struct nb_wl_layer *wl_layer_new(struct nb_wl *w, bool input)
+{
+    struct nb_wl_layer *L;
+
+    if (!w->comp || !w->subcomp || !w->shm) {
+        return NULL;
+    }
+    L = calloc(1, sizeof(*L));
+    if (!L) {
+        return NULL;
+    }
+    L->input = input;
+    L->surf = wl_compositor_create_surface(w->comp);
+    L->sub = L->surf ? wl_subcompositor_get_subsurface(w->subcomp, L->surf,
+                                                       w->surf) : NULL;
+    if (!L->sub) {
+        if (L->surf) {
+            wl_surface_destroy(L->surf);
+        }
+        free(L);
+        return NULL;
+    }
+    wl_place_top(w, L->sub, L->surf);
+    wl_subsurface_set_desync(L->sub);
+    if (w->viewporter) {
+        L->vp = wp_viewporter_get_viewport(w->viewporter, L->surf);
+    }
+    if (!input) {
+        struct wl_region *none = wl_compositor_create_region(w->comp);
+
+        if (none) {
+            wl_surface_set_input_region(L->surf, none);
+            wl_region_destroy(none);
+        }
+    }
+    L->x = L->y = INT32_MIN;
+    return L;
+}
+
+static void wl_layer_drop_buffers(struct nb_wl_layer *L)
+{
+    for (int i = 0; i < 2; i++) {
+        if (L->buf[i]) {
+            wl_buffer_destroy(L->buf[i]);
+            L->buf[i] = NULL;
+        }
+        L->busy[i] = false;
+    }
+    if (L->px) {
+        munmap(L->px, L->sz);
+        L->px = NULL;
+        L->sz = 0;
+    }
+    L->pw = L->ph = 0;
+}
+
+/* A free buffer of pw x ph to paint into; NULL when both are on screen. */
+static uint32_t *wl_layer_begin(struct nb_wl *w, struct nb_wl_layer *L,
+                                int pw, int ph, int *idx)
+{
+    if (pw != L->pw || ph != L->ph) {
+        struct wl_shm_pool *pool;
+        size_t one = (size_t)pw * (size_t)ph * 4;
+        void *px;
+        int fd;
+
+        if (pw <= 0 || ph <= 0 || pw > 8192 || ph > 8192) {
+            return NULL;
+        }
+        if (L->busy[0] || L->busy[1]) {
+            /* Never unmap memory the compositor may still read. */
+            return NULL;
+        }
+        wl_layer_drop_buffers(L);
+        fd = memfd_create("conduit-viewer-ui", MFD_CLOEXEC);
+        if (fd < 0) {
+            return NULL;
+        }
+        if (ftruncate(fd, (off_t)(one * 2)) < 0) {
+            close(fd);
+            return NULL;
+        }
+        px = mmap(NULL, one * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (px == MAP_FAILED) {
+            close(fd);
+            return NULL;
+        }
+        pool = wl_shm_create_pool(w->shm, fd, (int32_t)(one * 2));
+        close(fd);
+        if (!pool) {
+            munmap(px, one * 2);
+            return NULL;
+        }
+        for (int i = 0; i < 2; i++) {
+            L->buf[i] = wl_shm_pool_create_buffer(pool, (int32_t)(one * i),
+                                                  pw, ph, pw * 4,
+                                                  WL_SHM_FORMAT_ARGB8888);
+            if (L->buf[i]) {
+                wl_buffer_add_listener(L->buf[i], &ly_buf_listener, L);
+            }
+        }
+        wl_shm_pool_destroy(pool);
+        L->px = px;
+        L->sz = one * 2;
+        L->pw = pw;
+        L->ph = ph;
+        if (!L->buf[0] || !L->buf[1]) {
+            wl_layer_drop_buffers(L);
+            return NULL;
+        }
+    }
+    *idx = !L->busy[0] ? 0 : !L->busy[1] ? 1 : -1;
+    if (*idx < 0) {
+        return NULL;
+    }
+    return (uint32_t *)((char *)L->px + (size_t)*idx * (size_t)L->pw *
+                        (size_t)L->ph * 4);
+}
+
+static void wl_layer_show(struct nb_wl *w, struct nb_wl_layer *L, int idx,
+                          int x, int y, int lw, int lh)
+{
+    wl_surface_attach(L->surf, L->buf[idx], 0, 0);
+    wl_surface_damage_buffer(L->surf, 0, 0, L->pw, L->ph);
+    if (L->vp) {
+        wp_viewport_set_destination(L->vp, lw, lh);
+    }
+    if (L->input && (lw != L->lw || lh != L->lh || !L->mapped)) {
+        struct wl_region *r = wl_compositor_create_region(w->comp);
+
+        if (r) {
+            wl_region_add(r, 0, 0, lw, lh);
+            wl_surface_set_input_region(L->surf, r);
+            wl_region_destroy(r);
+        }
+    }
+    L->lw = lw;
+    L->lh = lh;
+    wl_surface_commit(L->surf);
+    L->busy[idx] = true;
+    if (x != L->x || y != L->y || !L->mapped) {
+        L->x = x;
+        L->y = y;
+        wl_subsurface_set_position(L->sub, x, y);
+        wl_surface_commit(w->surf);     /* position is the parent's state */
+    }
+    L->mapped = true;
+}
+
+static void wl_layer_hide(struct nb_wl *w, struct nb_wl_layer *L)
+{
+    (void)w;
+    if (!L || !L->mapped) {
+        return;
+    }
+    wl_surface_attach(L->surf, NULL, 0, 0);
+    wl_surface_commit(L->surf);
+    L->mapped = false;
+}
+
+/* ── the notice ── */
+static void wl_note_paint(struct nb_wl *w)
+{
+    const struct nb_ui_env *e = wl_ui_env(w);
+    int lw, lh, pw, ph, idx;
+    uint32_t *px;
+
+    if (!w->ly_note) {
+        w->ly_note = wl_layer_new(w, false);
+        if (!w->ly_note) {
+            return;
+        }
+    }
+    nb_ui_notice_size(w->note_txt, &lw, &lh);
+    pw = nb_ui_phys(lw, e->s120);
+    ph = nb_ui_phys(lh, e->s120);
+    px = wl_layer_begin(w, w->ly_note, pw, ph, &idx);
+    if (!px) {
+        return;
+    }
+    nb_ui_paint_notice(w->note_txt, e->s120, px, pw, ph, pw, false);
+    wl_layer_show(w, w->ly_note, idx, (e->win_w - lw) / 2,
+                  e->win_h > lh + 48 ? 24 : 0, lw, lh);
+}
+
+static void wl_note_show(struct nb_wl *w, const char *txt)
+{
+    snprintf(w->note_txt, sizeof(w->note_txt), "%s", txt);
+    w->note_until_ms = nb_now_ms_wl() + 1600;
+    wl_note_paint(w);
+}
+
+/* ── the menu ── */
+static void wl_menu_paint(struct nb_wl *w)
+{
+    const struct nb_ui_env *e = wl_ui_env(w);
+    struct nb_rect r;
+    int lw, lh, pw, ph, idx;
+    uint32_t *px;
+
+    if (!w->ui.open) {
+        return;
+    }
+    if (!w->ly_menu) {
+        w->ly_menu = wl_layer_new(w, true);
+        if (!w->ly_menu) {
+            return;
+        }
+    }
+    nb_ui_layout(&w->ui, e, &lw, &lh);
+    nb_ui_panel_rect(&w->ui, e, &r);
+    pw = nb_ui_phys(r.w, e->s120);
+    ph = nb_ui_phys(r.h, e->s120);
+    px = wl_layer_begin(w, w->ly_menu, pw, ph, &idx);
+    if (!px) {
+        return;
+    }
+    nb_ui_paint_panel(&w->ui, e, px, pw, ph, pw);
+    wl_layer_show(w, w->ly_menu, idx, r.x, r.y, r.w, r.h);
+}
+
+/* The output area's outline while the menu is open. */
+static void wl_ed_show(struct nb_wl *w, bool on)
+{
+    struct nb_rect a;
+    int i;
+
+    if (!w->viewporter || !w->comp || !w->subcomp || !w->shm) {
+        return;
+    }
+    if (on && !w->ed_buf) {
+        struct wl_shm_pool *pool;
+        uint32_t *px;
+        int fd = memfd_create("conduit-viewer-edge", MFD_CLOEXEC);
+
+        if (fd < 0 || ftruncate(fd, 4) < 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            return;
+        }
+        px = mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (px == MAP_FAILED) {
+            close(fd);
+            return;
+        }
+        *px = 0xff3fb950u;      /* the Conduit green */
+        pool = wl_shm_create_pool(w->shm, fd, 4);
+        close(fd);
+        if (!pool) {
+            munmap(px, 4);
+            return;
+        }
+        w->ed_buf = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4,
+                                              WL_SHM_FORMAT_ARGB8888);
+        wl_shm_pool_destroy(pool);
+        w->ed_px = px;
+        for (i = 0; i < 8 && w->ed_buf; i++) {
+            struct wl_region *none;
+
+            w->ed_surf[i] = wl_compositor_create_surface(w->comp);
+            w->ed_sub[i] = wl_subcompositor_get_subsurface(w->subcomp,
+                                                           w->ed_surf[i],
+                                                           w->surf);
+            wl_place_top(w, w->ed_sub[i], w->ed_surf[i]);
+            wl_subsurface_set_desync(w->ed_sub[i]);
+            w->ed_vp[i] = wp_viewporter_get_viewport(w->viewporter,
+                                                     w->ed_surf[i]);
+            none = wl_compositor_create_region(w->comp);
+            if (none) {
+                wl_surface_set_input_region(w->ed_surf[i], none);
+                wl_region_destroy(none);
+            }
+        }
+        /* The menu goes above the outline. */
+        if (w->ly_menu) {
+            wl_place_top(w, w->ly_menu->sub, w->ly_menu->surf);
+        }
+    }
+    if (!w->ed_buf) {
+        return;
+    }
+    if (!on) {
+        if (w->ed_mapped) {
+            for (i = 0; i < 8; i++) {
+                wl_surface_attach(w->ed_surf[i], NULL, 0, 0);
+                wl_surface_commit(w->ed_surf[i]);
+            }
+            w->ed_mapped = false;
+        }
+        return;
+    }
+    a = w->place.area;
+    if (w->ed_mapped && !memcmp(&a, &w->ed_at, sizeof(a))) {
+        return;
+    }
+    {
+        const int t = 2, c = 12;
+        const int r[8][4] = {
+            { a.x, a.y, a.w, t }, { a.x, a.y + a.h - t, a.w, t },
+            { a.x, a.y, t, a.h }, { a.x + a.w - t, a.y, t, a.h },
+            { a.x, a.y, c, c / 2 }, { a.x + a.w - c, a.y, c, c / 2 },
+            { a.x, a.y + a.h - c / 2, c, c / 2 },
+            { a.x + a.w - c, a.y + a.h - c / 2, c, c / 2 },
+        };
+
+        for (i = 0; i < 8; i++) {
+            wl_subsurface_set_position(w->ed_sub[i], r[i][0], r[i][1]);
+            wp_viewport_set_destination(w->ed_vp[i], r[i][2] > 0 ? r[i][2] : 1,
+                                        r[i][3] > 0 ? r[i][3] : 1);
+            wl_surface_attach(w->ed_surf[i], w->ed_buf, 0, 0);
+            wl_surface_damage_buffer(w->ed_surf[i], 0, 0, 1, 1);
+            wl_surface_commit(w->ed_surf[i]);
+        }
+    }
+    w->ed_at = a;
+    w->ed_mapped = true;
+    wl_surface_commit(w->surf);
+}
+
+/* ── the top-edge button ── */
+static void wl_btn_paint(struct nb_wl *w)
+{
+    const struct nb_ui_env *e = wl_ui_env(w);
+    int lw, lh, pw, ph, idx;
+    uint32_t *px;
+
+    if (w->btn_alpha <= 0.0) {
+        wl_layer_hide(w, w->ly_btn);
+        return;
+    }
+    if (!w->ly_btn) {
+        w->ly_btn = wl_layer_new(w, true);
+        if (!w->ly_btn) {
+            return;
+        }
+    }
+    nb_ui_button_size(&lw, &lh);
+    pw = nb_ui_phys(lw, e->s120);
+    ph = nb_ui_phys(lh, e->s120);
+    px = wl_layer_begin(w, w->ly_btn, pw, ph, &idx);
+    if (!px) {
+        return;
+    }
+    nb_ui_paint_button(e->s120, px, pw, ph, pw, w->btn_alpha, w->btn_hot,
+                       false);
+    wl_layer_show(w, w->ly_btn, idx, (e->win_w - lw) / 2, 4, lw, lh);
+}
+
+static void wl_btn_track(struct nb_wl *w, double wy)
+{
+    uint64_t now = nb_now_ms_wl();
+    bool want = !w->ui.open && !w->grabbed && wy < NB_UI_BUTTON_ZONE;
+
+    if (want) {
+        w->btn_seen_ms = now;
+        if (!w->btn_want) {
+            w->btn_want = true;
+            w->btn_last_ms = 0;
+        }
+    }
+}
+
+static void wl_ui_layer_motion(struct nb_wl *w, double lx, double ly)
+{
+    if (w->ptr_on_menu) {
+        wl_ui_do(w, nb_ui_panel_motion(&w->ui, wl_ui_env(w), lx, ly));
+    } else if (w->ptr_on_btn) {
+        w->btn_seen_ms = nb_now_ms_wl();
+        if (!w->btn_hot) {
+            w->btn_hot = true;
+            wl_btn_paint(w);
+            wl_display_flush(w->dpy);
+        }
+    }
+}
+
+/* The clock half: the notice's timeout and the button's fade. */
+static int wl_tick_ui(struct nb_wl *w, int next)
+{
+    uint64_t now = nb_now_ms_wl();
+    bool flush = false;
+
+    if (w->rehint_due_ms) {
+        if (now >= w->rehint_due_ms) {
+            w->rehint_due_ms = 0;
+            wl_rehint(w);
+            flush = true;
+        } else {
+            next = wl_tick_min(next, w->rehint_due_ms, now);
+        }
+    }
+    if (w->note_until_ms) {
+        if (now >= w->note_until_ms) {
+            w->note_until_ms = 0;
+            wl_layer_hide(w, w->ly_note);
+            flush = true;
+        } else {
+            next = wl_tick_min(next, w->note_until_ms, now);
+        }
+    }
+    /* The button stays while the pointer is near it, then fades. */
+    if (w->btn_want && !w->ptr_on_btn && now - w->btn_seen_ms > 900) {
+        w->btn_want = false;
+        w->btn_last_ms = 0;
+    }
+    if (w->btn_want && (w->ui.open || w->grabbed)) {
+        w->btn_want = false;
+    }
+    {
+        double target = w->btn_want ? 1.0 : 0.0;
+
+        if (w->btn_alpha != target) {
+            double dt = w->btn_last_ms ? (double)(now - w->btn_last_ms) : 16;
+            double step = dt / 160.0;
+
+            w->btn_alpha += target > w->btn_alpha ? step : -step;
+            if ((target > 0 && w->btn_alpha > 1.0) ||
+                (target == 0 && w->btn_alpha < 0.0)) {
+                w->btn_alpha = target;
+            }
+            w->btn_last_ms = now;
+            wl_btn_paint(w);
+            flush = true;
+            if (w->btn_alpha != target) {
+                next = wl_tick_min(next, now + 16, now);
+            }
+        } else {
+            w->btn_last_ms = now;
+        }
+        if (w->btn_want && !w->ptr_on_btn) {
+            next = wl_tick_min(next, w->btn_seen_ms + 901, now);
+        }
+    }
+    if (flush) {
+        wl_display_flush(w->dpy);
+    }
+    return next;
+}
+
+/* The pointer, mapped into the guest through the rectangle on screen. */
+static void wl_ptr_to_guest(struct nb_wl *w)
+{
+    int bw = w->current >= 0 && w->buf_w > 0 ? w->buf_w : w->win_w;
+    int bh = w->current >= 0 && w->buf_h > 0 ? w->buf_h : w->win_h;
+    int gx, gy;
+
+    if (!w->sink || bw <= 0 || bh <= 0) {
+        return;
+    }
+    if (w->current < 0) {
+        nb_view_place(&w->vst.cur, bw, bh, w->win_w, w->win_h, w->scale_120,
+                      &w->place);
+    }
+    nb_view_map(&w->place, bw, bh, w->ptr_wx, w->ptr_wy, &gx, &gy);
+    nb_sink_abs(w->sink, gx, gy, (unsigned)bw, (unsigned)bh);
+}
+
+/* Re-place the picture after a settings change: a viewport and a position. */
+static void wl_relayout(struct nb_wl *w)
+{
+    if (w->viewport && w->current >= 0) {
+        int dw, dh;
+        struct wl_surface *pic = wl_viewport_apply(w, w->buf_w, w->buf_h,
+                                                   NULL, &dw, &dh);
+
+        wl_surface_damage_buffer(pic, 0, 0, w->buf_w, w->buf_h);
+        wl_surface_commit(pic);
+        wl_main_settle(w);
+        if (w->gc_on && gc_layout(w, false)) {
+            cur_apply(w, w->last_serial);
+        }
+        w->surf_w = dw;
+        w->surf_h = dh;
+    }
+    bd_layout(w);
+    if (w->ui.open) {
+        wl_ed_show(w, true);
+    }
+}
+
+/* Ask the guest again: the resolution, or the area a native one follows. */
+static void wl_rehint(struct nb_wl *w)
+{
+    nb_view_apply_res(&w->vst.cur);
+    w->hint_w = w->hint_h = 0;
+    if (w->cont_w > 0 && w->cont_h > 0) {
+        wl_report_surface(w, w->cont_w, w->cont_h);
+    }
+    w->mh_valid = false;
+    wl_mode_hint(w, true);
+}
+
+static void wl_menu_set(struct nb_wl *w, bool open)
+{
+    if (open == w->ui.open) {
+        return;
+    }
+    if (open) {
+        /* The guest stops getting input: release what it holds, and give
+         * the pointer back to the host. */
+        if (w->sink) {
+            if (w->grabbed) {
+                nb_sink_force_ungrab(w->sink);
+            }
+            nb_sink_release_keys(w->sink);
+        }
+        w->btn_want = false;
+        w->btn_alpha = 0;
+        wl_layer_hide(w, w->ly_btn);
+        nb_log("menu: open");
+    } else {
+        nb_log("menu: closed");
+    }
+    wl_ui_do(w, nb_ui_set_open(&w->ui, wl_ui_env(w), open));
+}
+
+static void wl_ui_do(struct nb_wl *w, unsigned bits)
+{
+    if (bits & NB_UI_VIEW) {
+        wl_relayout(w);
+    }
+    /*
+     * A new guest mode is a re-mode in the guest, so it is debounced: held
+     * while an area drag is in progress, then sent once things settle.
+     */
+    if (bits & NB_UI_RES) {
+        w->rehint_pending = true;
+    }
+    if (w->rehint_pending && w->ui.drag < 0) {
+        w->rehint_pending = false;
+        w->rehint_due_ms = nb_now_ms_wl() + 250;
+    }
+    if (bits & NB_UI_SAVE) {
+        nb_vstore_persist(&w->vst, w->cfg);
+    }
+    if (bits & NB_UI_STATS) {
+        w->ov_user = !w->ov_user;
+        ov_sync(w);
+        bits |= NB_UI_REDRAW;
+    }
+    if ((bits & NB_UI_FULLSCREEN) && w->sink) {
+        nb_sink_toggle_fullscreen(w->sink);
+    }
+    if ((bits & NB_UI_VM_SHUTDOWN) && w->cfg) {
+        nb_run_detached(w->cfg->vm_shutdown_cmd);
+    }
+    if ((bits & NB_UI_VM_REBOOT) && w->cfg) {
+        nb_run_detached(w->cfg->vm_reboot_cmd);
+    }
+    if (bits & NB_UI_CLOSE || !w->ui.open) {
+        wl_layer_hide(w, w->ly_menu);
+        wl_ed_show(w, false);
+        if (w->ptr_on_content || w->ui_cur >= 0) {
+            w->ui_cur = -1;
+            cur_apply(w, w->last_serial);
+            if (w->ptr_on_content) {
+                wl_ptr_to_guest(w);
+            }
+        }
+    } else {
+        if (bits & (NB_UI_REDRAW | NB_UI_VIEW)) {
+            wl_menu_paint(w);
+        }
+        wl_ed_show(w, true);
+        if ((bits & NB_UI_CURSOR) && !w->ptr_on_menu) {
+            cur_apply(w, w->last_serial);
+        }
+    }
+    if (bits & NB_UI_NOTICE) {
+        wl_note_show(w, w->ui.notice);
+    }
+    if (w->ov_mapped && (bits & (NB_UI_VIEW | NB_UI_RES))) {
+        ov_paint_commit(w);
+    }
+    wl_display_flush(w->dpy);
+}
+
+/* The window changed size or scale: move what is shown with it. */
+static void wl_ui_reflow(struct nb_wl *w)
+{
+    if (w->ui.open) {
+        wl_menu_paint(w);
+        wl_ed_show(w, true);
+    }
+    if (w->note_until_ms) {
+        wl_note_paint(w);
+    }
+    if (w->ly_btn && w->ly_btn->mapped) {
+        wl_btn_paint(w);
     }
 }
 
@@ -5045,29 +5919,31 @@ struct nb_gc_req {
  * logical hotspot changed, i.e. set_cursor has to be repeated. */
 static bool gc_layout(struct nb_wl *w, bool force)
 {
-    double k = 1.0;
+    double kx = 1.0, ky = 1.0;
     int k1000, lw, lh, hx, hy;
 
     if (w->gc_cur < 0 || !w->gc_surf || !w->gc[w->gc_cur].valid) {
         return false;
     }
-    if (w->buf_w > 0 && w->fit_w > 0) {
-        k = (double)w->fit_w / w->buf_w;
+    /* The picture's own scale, per axis (stretch differs between them), so
+     * the cursor is drawn by the same transform as the frame. */
+    if (w->buf_w > 0 && w->buf_h > 0) {
+        nb_view_cursor_scale(&w->place, w->buf_w, w->buf_h, &kx, &ky);
     }
-    k1000 = (int)(k * 1000.0 + 0.5);
+    k1000 = (int)(kx * 1000.0 + 0.5) * 65536 + (int)(ky * 1000.0 + 0.5);
     if (!force && k1000 == w->gc_k1000) {
         return false;
     }
     w->gc_k1000 = k1000;
-    lw = (int)(w->gc[w->gc_cur].w * k + 0.5);
-    lh = (int)(w->gc[w->gc_cur].h * k + 0.5);
-    hx = (int)(w->gc_hx * k + 0.5);
-    hy = (int)(w->gc_hy * k + 0.5);
+    lw = (int)(w->gc[w->gc_cur].w * kx + 0.5);
+    lh = (int)(w->gc[w->gc_cur].h * ky + 0.5);
+    hx = (int)(w->gc_hx * kx + 0.5);
+    hy = (int)(w->gc_hy * ky + 0.5);
     if (lw < 1) { lw = 1; }
     if (lh < 1) { lh = 1; }
     wl_surface_attach(w->gc_surf, w->gc[w->gc_cur].buf, 0, 0);
     if (w->gc_vp) {
-        if (k1000 == 1000) {
+        if (k1000 == 1000 * 65536 + 1000) {
             wp_viewport_set_destination(w->gc_vp, -1, -1);
         } else {
             wp_viewport_set_destination(w->gc_vp, lw, lh);
@@ -5649,6 +6525,10 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->tb_press = -1;
     w->bd_hot = -1;
     w->scale_mode = cfg->scale_mode;
+    w->cfg = cfg;
+    nb_vstore_setup(&w->vst, cfg);
+    nb_ui_init(&w->ui, &w->vst);
+    w->ui_cur = -1;
     /* virtio-nvgpu viewer state */
     w->ov_mode = cfg->overlay_mode;
     w->ov_user = cfg->overlay_mode != NB_OVERLAY_OFF;

@@ -35,8 +35,8 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
            -D_GNU_SOURCE -I. -Icommon
 LDFLAGS += -Wl,-z,relro,-z,now
 
-OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_overlay.o nb_session_x11.o \
-       nb_session_wl.o nb_session_test.o
+OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_overlay.o nb_view.o nb_ui.o \
+       nb_session_x11.o nb_session_wl.o nb_session_test.o
 
 # ── X11 backend: xcb + DRI3 + Present ─────────────────────────────────────
 # DRI3 is what lets a dma-buf become an X pixmap without a GL context, and
@@ -100,6 +100,19 @@ endif
 endif
 endif
 
+# ── UI text: FreeType + fontconfig ────────────────────────────────────────
+# The menu (Ctrl+Alt+M) and the on-screen notices draw text with FreeType,
+# using whatever sans face fontconfig picks.  Optional: without them the UI
+# falls back to the built-in bitmap font.
+ifeq ($(shell $(PKG_CONFIG) --exists freetype2 fontconfig && echo yes),yes)
+HAVE_FT   = 1
+UI_CFLAGS = -DNB_HAVE_FREETYPE $(shell $(PKG_CONFIG) --cflags freetype2 fontconfig)
+UI_LIBS   = $(shell $(PKG_CONFIG) --libs freetype2 fontconfig)
+CFLAGS   += $(UI_CFLAGS)
+LIBS     += $(UI_LIBS)
+endif
+LIBS     += -lm
+
 ifeq ($(HAVE_X11)$(HAVE_WL),)
 $(warning No display backend will be compiled in: only --backend test will work.)
 $(warning   Wayland: apt install libwayland-dev wayland-protocols)
@@ -132,6 +145,7 @@ report:
 	@echo "  wayland : $(if $(HAVE_WL),yes,NO - install libwayland-dev wayland-protocols)"
 	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling, NO SCALING: install libxcb-render0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
 	@echo "  test    : yes (always)"
+	@echo "  ui text : $(if $(HAVE_FT),freetype + fontconfig,bitmap font only - apt install libfreetype-dev libfontconfig-dev)"
 
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -194,11 +208,19 @@ test-utf8: test/utf8_extracted.inc test/test_utf8.c
 test-overlay: test/test_overlay.c nb_overlay.c nb_placeholder.c nb_overlay.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_overlay.c nb_overlay.c nb_placeholder.c -lm
 
+test-view: test/test_view.c nb_view.c nb_view.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_view.c nb_view.c -lm
+
+test-ui: test/test_ui.c nb_ui.c nb_ui.h nb_view.c nb_view.h nb_placeholder.c
+	$(CC) $(CFLAGS) $(UI_CFLAGS) -I . -o $@ test/test_ui.c nb_ui.c nb_view.c nb_placeholder.c $(UI_LIBS) -lm
+
 test-relacc: test/test_relacc.c nb_relacc.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_relacc.c
 
-check: all test-utf8 test-overlay test-relacc
+check: all test-utf8 test-overlay test-relacc test-view test-ui
 	./test-utf8
+	./test-view
+	./test-ui
 	./test-relacc
 	./test-overlay
 	bash selftest.sh

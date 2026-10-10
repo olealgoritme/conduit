@@ -574,6 +574,60 @@ static void nb_set_grab(struct nb_sink *s, bool on)
     nb_log("grab %s", on ? "ON" : "off");
 }
 
+/* The CTRL+ALT chords the backend may claim. */
+static bool nb_backend_chord(unsigned code)
+{
+    switch (code) {
+    case KEY_O: case KEY_D: case KEY_R: case KEY_S: case KEY_A: case KEY_M:
+    case KEY_P: case KEY_0: case KEY_UP: case KEY_DOWN: case KEY_LEFT:
+    case KEY_RIGHT: case KEY_MINUS: case KEY_EQUAL: case KEY_KPMINUS:
+    case KEY_KPPLUS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void nb_sink_key_latch(struct nb_sink *s, unsigned code, bool down)
+{
+    if (code >= 768) {
+        return;
+    }
+    if (code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL) {
+        s->ctrl_down = down;
+    }
+    if (code == KEY_LEFTALT || code == KEY_RIGHTALT) {
+        s->alt_down = down;
+    }
+    if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT) {
+        s->shift_down = down;
+    }
+    if (!down) {
+        bit_set(s->consumed, code, false);
+    }
+}
+
+void nb_sink_release_keys(struct nb_sink *s)
+{
+    bool c = s->ctrl_down, a = s->alt_down, sh = s->shift_down;
+
+    nb_release_all(s);
+    s->ctrl_down = c;
+    s->alt_down = a;
+    s->shift_down = sh;
+}
+
+void nb_sink_toggle_fullscreen(struct nb_sink *s)
+{
+    if (s->sess->ops->dismiss_dialog && !s->fullscreen) {
+        s->sess->ops->dismiss_dialog(s->sess);
+    }
+    s->fullscreen = !s->fullscreen;
+    if (s->sess->ops->set_fullscreen(s->sess, s->fullscreen) != 0) {
+        s->fullscreen = !s->fullscreen;
+    }
+}
+
 void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
 {
     const struct nb_clip_trigger *trigger;
@@ -594,13 +648,13 @@ void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
     }
 
     /*
-     * virtio-nvgpu: CTRL+ALT+O (overlay), CTRL+ALT+D (direct mode) and
-     * CTRL+ALT+R (resize policy) belong
-     * to the backend that draws the window, and are consumed only when it
+     * virtio-nvgpu: CTRL+ALT+O (overlay), CTRL+ALT+D (direct mode) and the
+     * display settings (S scale, A area, R guest resolution, P profile,
+     * M menu, arrows / - / = custom area, 0 reset) belong to the backend
+     * that draws the window, and are consumed only when it
      * says the chord was its own -- otherwise they reach the guest as before.
      */
-    if (down && s->ctrl_down && s->alt_down &&
-        (code == KEY_O || code == KEY_D || code == KEY_R) &&
+    if (down && s->ctrl_down && s->alt_down && nb_backend_chord(code) &&
         s->sess->ops->hotkey &&
         s->sess->ops->hotkey(s->sess, code)) {
         bit_set(s->consumed, code, true);
@@ -3044,9 +3098,31 @@ static void usage(void)
 "                       numeric UID[:GID], or `auto` to pick a uid nothing\n"
 "                       owns from inside this namespace's uid map\n"
 "  --fullscreen         start fullscreen (CTRL+ALT+F toggles)\n"
-"  --scale MODE         aspect (default) keeps the guest's aspect ratio and\n"
-"                       fills the remainder with black; stretch fills the\n"
-"                       window and distorts; none is 1:1, no scaling\n"
+"  --scale MODE         how the guest picture fills the output area:\n"
+"                         fit      (default; alias aspect) as large as fits,\n"
+"                                  aspect kept, black bars\n"
+"                         stretch  fill the area, aspect ignored\n"
+"                         integer  the largest whole multiple that fits\n"
+"                                  (fit when the guest is larger)\n"
+"                         none     1:1 output pixels, centred (alias centered)\n"
+"  --area AREA          where the picture goes: full (default), 21:9, 16:9,\n"
+"                       16:10, 4:3 (as large as fits, centred), or WxH[+X+Y]\n"
+"                       in output pixels (centred without +X+Y).  Bars are\n"
+"                       black\n"
+"  --res RES            guest resolution: native (default: the output area in\n"
+"                       output pixels) or WxH, asked of the guest with the\n"
+"                       mode hint\n"
+"  --filter F           linear (default) or nearest, for scaled pictures (X11;\n"
+"                       a Wayland compositor picks its own filter)\n"
+"  --view-state FILE    remember the settings above here, and restore them at\n"
+"                       start; --res/--area/--scale/--filter override it\n"
+"  --vm-shutdown-cmd CMD, --vm-reboot-cmd CMD\n"
+"                       commands the menu's Shut down / Restart run (/bin/sh)\n"
+"\n"
+"  Display hotkeys (CTRL+ALT+...): M menu, S scale, A area, R guest\n"
+"  resolution (Native/2560x1440/1920x1080/1600x900/1280x960/custom), P next\n"
+"  profile, arrows move the area (SHIFT: bigger steps), - / = shrink / grow\n"
+"  it, 0 reset.  F fullscreen, G grab, O stats overlay, D direct mode\n"
 "  --persist            keep the window when the VMM disconnects and wait\n"
 "                       for another (default: exit with it)\n"
 "  --clipboard MODE     off (default) | guest-to-host | host-to-guest |\n"
@@ -3107,7 +3183,7 @@ static void usage(void)
 "                       windowed (hidden fullscreen, so the compositor can scan\n"
 "                       out directly) or off (starts hidden).  Direct mode\n"
 "                       hides it.  The window title always carries the numbers\n"
-"  --resize=MODE        what a windowed resize does (CTRL+ALT+R toggles):\n"
+"  --resize=MODE        what a windowed resize does:\n"
 "                       guest (default) asks the guest to switch to the\n"
 "                       window's size (debounced while dragging); scale keeps\n"
 "                       the guest's mode and fits it into the window.\n"
@@ -3320,6 +3396,7 @@ int main(int argc, char **argv)
     cfg.resize_mode = NB_RESIZE_GUEST;    /* the VM follows the window; --resize=scale keeps its mode */
     cfg.backend = "auto";
     cfg.scale_mode = NB_SCALE_ASPECT;   /* preserve aspect, black bars */
+    nb_view_defaults(&cfg.view);
     cfg.socket_mode = 0600;
     cfg.socket_fd = -1;
     cfg.clip_mode = NB_CLIP_OFF;
@@ -3382,6 +3459,9 @@ int main(int argc, char **argv)
                 nb_res_mode = NB_RES_FIXED;
                 nb_res_w = rw;
                 nb_res_h = rh;
+                cfg.view.res_w = rw;
+                cfg.view.res_h = rh;
+                cfg.view_set |= NB_VIEW_SET_RES;
             } else {
                 nb_err("--resolution must be auto, none, or WxH within 1..%u",
                        NVKVM_BROKER_MAX_DIM);
@@ -3516,15 +3596,44 @@ int main(int argc, char **argv)
             }
             cfg.socket_fd = (int)n; }
         else if (!strcmp(a, "--scale")) { NEEDVAL();
-            if (!strcmp(v, "stretch"))     { cfg.scale_mode = NB_SCALE_STRETCH; }
-            else if (!strcmp(v, "aspect")) { cfg.scale_mode = NB_SCALE_ASPECT; }
-            else if (!strcmp(v, "none"))   { cfg.scale_mode = NB_SCALE_NONE; }
-            else {
-                nb_err("--scale must be stretch, aspect or none (not '%s')", v);
+            if (nb_view_parse_scale(v, &cfg.view.scale) != 0) {
+                nb_err("--scale must be fit, stretch, integer or none "
+                       "(not '%s')", v);
                 return 2;
-            } }
+            }
+            cfg.scale_mode = cfg.view.scale;
+            cfg.view_set |= NB_VIEW_SET_SCALE; }
         /* The old boolean pair, kept working because it is in scripts. */
-        else if (!strcmp(a, "--no-scale")) { cfg.scale_mode = NB_SCALE_NONE; }
+        else if (!strcmp(a, "--no-scale")) {
+            cfg.scale_mode = cfg.view.scale = NB_SCALE_NONE;
+            cfg.view_set |= NB_VIEW_SET_SCALE; }
+        else if (!strcmp(a, "--filter")) { NEEDVAL();
+            if (nb_view_parse_filter(v, &cfg.view.filter) != 0) {
+                nb_err("--filter must be linear or nearest (not '%s')", v);
+                return 2;
+            }
+            cfg.view_set |= NB_VIEW_SET_FILTER; }
+        else if (!strcmp(a, "--area")) { NEEDVAL();
+            if (nb_view_parse_area(v, &cfg.view) != 0) {
+                nb_err("--area must be full, 21:9, 16:9, 16:10, 4:3 or "
+                       "WxH[+X+Y] (not '%s')", v);
+                return 2;
+            }
+            cfg.view_set |= NB_VIEW_SET_AREA; }
+        else if (!strcmp(a, "--res")) { NEEDVAL();
+            if (nb_view_parse_res(v, &cfg.view.res_w, &cfg.view.res_h) != 0 ||
+                cfg.view.res_w > NVKVM_BROKER_MAX_DIM ||
+                cfg.view.res_h > NVKVM_BROKER_MAX_DIM) {
+                nb_err("--res must be native or WxH within 1..%u (not '%s')",
+                       NVKVM_BROKER_MAX_DIM, v);
+                return 2;
+            }
+            cfg.view_set |= NB_VIEW_SET_RES; }
+        else if (!strcmp(a, "--view-state")) { NEEDVAL(); cfg.view_state = v; }
+        else if (!strcmp(a, "--vm-shutdown-cmd")) { NEEDVAL();
+            cfg.vm_shutdown_cmd = v; }
+        else if (!strcmp(a, "--vm-reboot-cmd")) { NEEDVAL();
+            cfg.vm_reboot_cmd = v; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else { nb_err("unknown argument: %s", a); usage(); return 2; }
 #undef NEEDVAL
