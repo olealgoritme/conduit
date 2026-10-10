@@ -41,7 +41,10 @@
  *     its mode the connector's preferred one and fires a hotplug event. The
  *     connector carries "hotplug_mode_update" and suggested X/Y, the way
  *     qxl/vmwgfx do, so mutter and KWin apply the preferred mode on hotplug
- *     by themselves (others: `wlr-randr --output Virtual-1 --preferred`).
+ *     by themselves. wlroots compositors and Hyprland re-read modes only on
+ *     disconnect -> connect, so if the head still shows another mode after a
+ *     grace period, the connector is replugged once (nvgpu_replug.h) and a
+ *     "preferred" output rule applies the new mode there too.
  *     The boot mode from config space stays in the list.
  *
  * No dumb buffers either:
@@ -64,11 +67,14 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 #include <linux/input.h>
 #include <linux/rcupdate.h>
+
+#include "nvgpu_replug.h"
 
 /* ───────── wire structs (docs/SCANOUT.md) ───────── */
 
@@ -144,6 +150,11 @@ static_assert(sizeof(struct nvgpu_display_mode_ev) == 16,
 #define NVGPU_KMS_MAX_DIM 16384
 #define NVGPU_KMS_MAX_HZ 1000
 
+/* A replug's disconnect lasts until the master probed, plus this, or at most
+ * NVGPU_REPLUG_OFF_MS when nobody probes. */
+#define NVGPU_REPLUG_KICK_MS 100
+#define NVGPU_REPLUG_OFF_MS 2000
+
 /* Six block-linear GOB heights, LINEAR, and the terminator. */
 #define NVGPU_KMS_MAX_MODIFIERS 8
 
@@ -172,6 +183,11 @@ struct nvgpu_kms {
   bool mode_pending;
   u32 pend_w, pend_h, pend_mhz;
   struct work_struct mode_work;
+
+  /* The replug for compositors that ignore a connected -> connected hotplug
+   * (nvgpu_replug.h): its state under mode_config.mutex, and its timer. */
+  struct nvgpu_replug replug;
+  struct delayed_work replug_work;
 
   /* What the host was last told about the cursor, so a commit that only
    * moved it sends nothing. Commit tails only, ordered per plane. */
@@ -685,10 +701,20 @@ static int nvgpu_kms_get_modes(struct drm_connector *conn) {
   return count;
 }
 
+/* Called under mode_config.mutex, from the master's probe (GETCONNECTOR). */
 static int nvgpu_kms_detect_ctx(struct drm_connector *conn,
                                 struct drm_modeset_acquire_ctx *ctx,
                                 bool force) {
-  return connector_status_connected;
+  struct nvgpu_kms *kms = container_of(conn, struct nvgpu_kms, connector);
+  bool kick;
+
+  if (nvgpu_replug_on_probe(&kms->replug, &kick))
+    return connector_status_connected;
+  /* The compositor saw the disconnect: reconnect once it has dealt with it. */
+  if (kick)
+    mod_delayed_work(system_wq, &kms->replug_work,
+                     msecs_to_jiffies(NVGPU_REPLUG_KICK_MS));
+  return connector_status_disconnected;
 }
 
 static const struct drm_connector_helper_funcs nvgpu_kms_conn_helper_funcs = {
@@ -705,6 +731,71 @@ static const struct drm_connector_funcs nvgpu_kms_conn_funcs = {
 };
 
 /* ───────── dynamic modes ───────── */
+
+/*
+ * How long a compositor has to apply a new preferred mode after the hotplug
+ * before the connector is replugged; 0 never replugs. mutter and KWin apply
+ * it within a few frames.
+ */
+static int nvgpu_mode_replug_ms = 1000;
+module_param_named(mode_replug_ms, nvgpu_mode_replug_ms, int, 0644);
+MODULE_PARM_DESC(mode_replug_ms,
+                 "ms to wait for a compositor to apply a host mode before "
+                 "replugging the connector (0: never)");
+
+/* Whether the head shows the preferred mode. Under mode_config.mutex. */
+static bool nvgpu_kms_mode_applied(struct nvgpu_kms *kms) {
+  struct drm_crtc *crtc = &kms->crtc;
+  const struct drm_crtc_state *cs;
+  bool on, applied;
+
+  drm_modeset_lock(&crtc->mutex, NULL);
+  cs = crtc->state;
+  on = cs && cs->enable;
+  applied = nvgpu_replug_applied(
+      on, on ? cs->mode.hdisplay : 0, on ? cs->mode.vdisplay : 0,
+      on ? drm_mode_vrefresh(&cs->mode) : 0, kms->width, kms->height,
+      kms->refresh_mhz);
+  drm_modeset_unlock(&crtc->mutex);
+  return applied;
+}
+
+static void nvgpu_kms_replug_work(struct work_struct *work) {
+  struct nvgpu_kms *kms =
+      container_of(to_delayed_work(work), struct nvgpu_kms, replug_work);
+  struct drm_device *drm = kms->drm;
+  enum nvgpu_replug_act act;
+  u32 w, h;
+
+  if (READ_ONCE(kms->dead))
+    return;
+  mutex_lock(&drm->mode_config.mutex);
+  act = nvgpu_replug_on_timer(&kms->replug,
+                              kms->replug.stage != NVGPU_REPLUG_WATCH ||
+                                  nvgpu_kms_mode_applied(kms));
+  w = kms->width;
+  h = kms->height;
+  /* The timeout before the hotplug, so the probe's kick is not overridden. */
+  if (act == NVGPU_REPLUG_DISCONNECT)
+    mod_delayed_work(system_wq, &kms->replug_work,
+                     msecs_to_jiffies(NVGPU_REPLUG_OFF_MS));
+  mutex_unlock(&drm->mode_config.mutex);
+
+  switch (act) {
+  case NVGPU_REPLUG_DISCONNECT:
+    dev_info(&kms->dev->vdev->dev,
+             "conduit-gpu: the compositor kept another mode than %ux%u: "
+             "replugging the connector\n",
+             w, h);
+    drm_kms_helper_hotplug_event(drm);
+    break;
+  case NVGPU_REPLUG_RECONNECT:
+    drm_kms_helper_hotplug_event(drm);
+    break;
+  case NVGPU_REPLUG_NOTHING:
+    break;
+  }
+}
 
 /*
  * Apply the newest DisplayMode: it becomes the preferred mode, and a hotplug
@@ -746,6 +837,14 @@ static void nvgpu_kms_mode_work(struct work_struct *work) {
            "changed, hotplug sent\n",
            w, h, mhz / 1000, mhz % 1000);
   drm_kms_helper_hotplug_event(drm);
+
+  if (READ_ONCE(nvgpu_mode_replug_ms) <= 0)
+    return;
+  mutex_lock(&drm->mode_config.mutex);
+  if (nvgpu_replug_on_mode(&kms->replug))
+    mod_delayed_work(system_wq, &kms->replug_work,
+                     msecs_to_jiffies(READ_ONCE(nvgpu_mode_replug_ms)));
+  mutex_unlock(&drm->mode_config.mutex);
 }
 
 /* The event-queue interrupt: record, and leave the rest to the work. */
@@ -874,6 +973,7 @@ static int nvgpu_kms_init(struct nvgpu_dri_dev *dri, struct drm_device *drm) {
   kms->has_cursor = NVGPU_HAVE_CURSOR_HOTSPOT && dev->has_cursor;
   spin_lock_init(&kms->mode_lock);
   INIT_WORK(&kms->mode_work, nvgpu_kms_mode_work);
+  INIT_DELAYED_WORK(&kms->replug_work, nvgpu_kms_replug_work);
   nvgpu_kms_build_modifiers(kms);
 
   ret = drmm_mode_config_init(drm);
@@ -1226,8 +1326,10 @@ static void nvgpu_display_quiesce(struct nvgpu_device *dev) {
   RCU_INIT_POINTER(dev->kms_ev, NULL);
   synchronize_rcu();
   for (i = 0; i < dev->num_dri_devs && i < NVGPU_MAX_DRI_DEVS; i++)
-    if (dev->dri_devs[i].kms)
+    if (dev->dri_devs[i].kms) {
       cancel_work_sync(&dev->dri_devs[i].kms->mode_work);
+      cancel_delayed_work_sync(&dev->dri_devs[i].kms->replug_work);
+    }
   nvgpu_input_destroy(dev);
 }
 
@@ -1274,6 +1376,7 @@ static void nvgpu_kms_fini(struct nvgpu_dri_dev *dri) {
     synchronize_rcu();
   }
   cancel_work_sync(&kms->mode_work);
+  cancel_delayed_work_sync(&kms->replug_work);
   /* Turns the CRTC off: vblank timer stopped, pending events sent. */
   drm_atomic_helper_shutdown(dri->drm);
 #ifndef NVGPU_HAVE_VBLANK_TIMER
