@@ -187,8 +187,9 @@ discards the worker has not passed to DXVK yet and drains above 64 MiB (DXVK's `
 there). A dynamic buffer without a CPU mapping (`D3D11_COMMON_BUFFER_MAP_MODE_NONE`) takes the synchronous map; a
 lost device answers a null pointer and `D3DDDIERR_DEVICEREMOVED` (legal for `Map`).
 
-The pre-renamed slice ring (the worker refills a small per-buffer pool of slices so the app thread does not even
-allocate) is phase 3; phase 1 allocates on the app thread from its own cache.
+Pre-allocated slices: after the worker replays the discard of a buffer of at most one allocator page, it allocates
+that buffer's next slice from its own cache and parks it in the buffer (one reference, exchanged atomically). The
+app thread's next discard takes it and does not allocate; without one it allocates from its own cache.
 
 ### 5.3 UpdateSubresourceUP, CopyResource, CopySubresourceRegion
 
@@ -336,6 +337,23 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 - Host: `cargo test --release --lib -- --ignored --nocapture producer_cost` in `umd_common` measures the ring's
   producer cost (about 15 ns per 64-byte record on the build host, the worker consuming concurrently).
 - CS2 (by the owner): fps and the render-thread profile (`thread-sample.ps1`), worker thread share, `dxvk-cs` share.
+
+### Results so far
+
+`d3d11_drawbench` on 22.22.405.46 (first version, before the cache-line and pre-allocation changes), win11 on
+2 MiB pages, alternating runs in the same package:
+
+| draws/frame | off: µs/frame (µs/draw) | on: µs/frame (µs/draw) |
+|---|---|---|
+| 2000 | 455–469 (0.23) | 587–625 (0.29–0.31) |
+| 4000 | 924–941 (0.23–0.24) | 1230–1267 (0.31–0.32) |
+
+Correct and stable (no errors, worker never behind: `full_waits=0`, no drains besides teardown), but slower on the
+app thread: drawbench's working set stays in cache, so the inline front end costs only ~0.23 µs per draw including
+the runtime, and the discard map's allocation still ran on the app thread. Found and fixed after it: the worker read
+the producer's cursor line on every forward call (the ordering check tested the cursors before the thread), the
+producer-hot fields were not on their own cache lines, and the slice allocation now leaves the app thread. CS2's
+front-end cost is cold-miss bound, which drawbench does not reproduce; it needs its own A/B.
 
 ## 10. Review
 

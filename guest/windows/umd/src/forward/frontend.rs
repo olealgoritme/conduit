@@ -243,7 +243,10 @@ impl Frontend {
     /// immediate context while records are queued.
     #[inline(always)]
     pub(crate) fn order_for_app_thread(&self) {
-        if self.q.done() != self.q.written() && !self.q.is_worker() {
+        // The thread test first: the worker calls this on every forward call,
+        // and reading the producer's cursor line there would bounce that line
+        // between the two cores once per record.
+        if !self.q.is_worker() && self.q.done() != self.q.written() {
             self.sync(SyncReason::SafetyNet);
         }
     }
