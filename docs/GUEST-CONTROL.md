@@ -51,7 +51,7 @@ every request separately, so one bad request cannot stop it.
 | `conduit run VM [--cwd DIR] [--env NAME=VALUE] [--start] [--no-view] -- CMD [ARGS...]` | Starts the program in the user's desktop session. `CMD` is whatever the guest's shell opens: a program, a document, a `.lnk` or `.desktop` file, a `steam://` URL. A running VM without a window gets one (`--no-view` skips that). A VM that is off is not started unless `--start` is given (then the command waits up to 4 minutes for the agent). Prints the process id. |
 | `conduit run VM --app NAME` | Resolves NAME against `conduit apps` (exact name ignoring case, else the start of a name, else part of one; several matches are listed) and starts it. |
 | `conduit apps VM [--json]` | The installed apps: name, where it was found, what `run` will start. |
-| `conduit cp SRC DST [--force]` | One side is `VM:PATH`. `conduit cp f.txt win11:` goes to the guest user's Downloads folder; `win11:C:\Temp\` (trailing separator or an existing folder) keeps the file name; a bare `win11:name.txt` goes to Downloads. A local path containing a colon needs `./` in front. Prints a progress line, checks size and SHA-256 at the end, writes to `NAME.conduit-part` and renames it when everything agrees, and refuses to replace an existing file without `--force`. Files only, up to 8 GiB; for folders and big trees use `conduit share`. |
+| `conduit cp SRC DST [--force]` | One side is `VM:PATH`. `conduit cp f.txt win11:` goes to the guest user's Downloads folder; `win11:C:\Temp\` (trailing separator or an existing folder) keeps the file name; a bare `win11:name.txt` goes to Downloads. A local path containing a colon needs `./` in front. Prints a progress line, checks size and SHA-256 at the end, writes to a new temporary file next to it (`NAME.<n>.conduit-part`) and renames it when everything agrees, and refuses to replace an existing file without `--force`. Files only, up to 8 GiB; for folders and big trees use `conduit share`. |
 | `conduit app add VM NAME` | Writes `~/.local/share/applications/conduit-VM-SLUG.desktop` with the app's icon (fetched from the guest, saved under `~/.local/share/icons/conduit/`). Its `Exec` is `conduit run VM --start --app NAME`, so the launcher also starts the VM. Errors from a launcher show as a desktop notification. |
 | `conduit app rm VM NAME` / `conduit app list VM` | Remove / list the VM's launchers. |
 
@@ -72,7 +72,9 @@ The Conduit GPU tray app (`guest/windows/tools/conduit-gpu-tray`) serves the
 channel (`\\.\Global\org.conduit.ctl.0`); it is the app the installer already
 runs at logon. It runs elevated (the serial port needs it) but starts programs
 with the desktop shell's own, non-elevated token, so games and apps do not run
-as administrator. Apps are the Start Menu shortcuts of all users and of the
+as administrator, and reads, writes and lists files (`cp`, `ls`) while
+impersonating that token, so the host reaches exactly the files the desktop
+user can. Apps are the Start Menu shortcuts of all users and of the
 current user plus Steam games (`libraryfolders.vdf`, `appmanifest_*.acf`, started
 as `steam://rungameid/ID`). The tray menu has a Recent launches submenu with the
 last eight programs; clicking one stops it (shortcuts, documents and `steam://` URLs are handed to the shell, so they have no process of Conduit's to list or stop).

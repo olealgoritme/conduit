@@ -83,6 +83,10 @@ impl Backend for WinBackend {
     fn icon(&self, key: &str) -> Result<Vec<u8>, String> {
         apps::icon(key)
     }
+
+    fn as_user<R>(&self, f: impl FnOnce() -> R) -> Result<R, String> {
+        launch::as_user(f)
+    }
 }
 
 /// A manual-reset event.

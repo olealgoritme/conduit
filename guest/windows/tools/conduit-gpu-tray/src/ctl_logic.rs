@@ -2,6 +2,14 @@
 //! line, run the op, answer with one line that fits `MAX_LINE`. Files are
 //! served here with `std::fs`; what needs the OS (starting programs, icons,
 //! drives) comes through [`Backend`].
+//!
+//! The tray runs elevated, so every file op (`put`, `get`, `ls`) runs inside
+//! [`Backend::as_user`]: on Windows with the desktop user's normal token, so
+//! the host can reach exactly what the user can, and a junction or link a
+//! non-elevated process plants is followed with the user's rights only. A
+//! transfer's temporary file has a fresh name per transfer, is created with
+//! `create_new` (never an existing file or link) and only that file is ever
+//! deleted.
 
 use conduit_ctl::{
     b64_decode, b64_encode, App, Apps, Chunk, Entry, GetArgs, Icon, Listing, Op, Pong, PutArgs,
@@ -12,6 +20,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -33,6 +42,11 @@ pub trait Backend: Send + Sync {
     fn apps(&self) -> Result<Vec<App>, String>;
     /// A PNG, about 64 px square.
     fn icon(&self, key: &str) -> Result<Vec<u8>, String>;
+    /// Runs `f` (file I/O for the host) with the desktop user's normal
+    /// rights; an error when that is not possible, and `f` does not run.
+    fn as_user<R>(&self, f: impl FnOnce() -> R) -> Result<R, String>
+    where
+        Self: Sized;
 }
 
 pub struct Agent<B> {
@@ -105,18 +119,27 @@ impl<B: Backend> Agent<B> {
                     ))
                 }
             }),
-            Op::Put(a) => self
-                .files
-                .put(&a, self.backend.downloads().as_deref())
-                .map(|w| Response::ok(id, &w)),
-            Op::Get(a) => self
-                .files
-                .get(&a, self.backend.downloads().as_deref())
-                .map(|c| Response::ok(id, &c)),
-            Op::Ls { path } => self
-                .files
-                .ls(&path, &self.backend.drives())
-                .map(|l| Response::ok(id, &l)),
+            Op::Put(a) => {
+                let dl = self.backend.downloads();
+                self.backend
+                    .as_user(|| self.files.put(&a, dl.as_deref()))
+                    .and_then(|r| r)
+                    .map(|w| Response::ok(id, &w))
+            }
+            Op::Get(a) => {
+                let dl = self.backend.downloads();
+                self.backend
+                    .as_user(|| self.files.get(&a, dl.as_deref()))
+                    .and_then(|r| r)
+                    .map(|c| Response::ok(id, &c))
+            }
+            Op::Ls { path } => {
+                let drives = self.backend.drives();
+                self.backend
+                    .as_user(|| self.files.ls(&path, &drives))
+                    .and_then(|r| r)
+                    .map(|l| Response::ok(id, &l))
+            }
         };
         r.unwrap_or_else(|e| Response::err(id, e))
     }
@@ -172,11 +195,15 @@ pub fn resolve(p: &str, bare_in: Option<&Path>) -> Result<PathBuf, String> {
     }
 }
 
-fn part_name(target: &Path) -> PathBuf {
+/// The temporary file of one transfer: `<target>.<nonce>.conduit-part`.
+fn part_name(target: &Path, nonce: &str) -> PathBuf {
     let mut s: OsString = target.as_os_str().to_owned();
-    s.push(".conduit-part");
+    s.push(format!(".{nonce}{PART_SUFFIX}"));
     PathBuf::from(s)
 }
+
+/// What every temporary file's name ends with.
+pub const PART_SUFFIX: &str = ".conduit-part";
 
 fn hash_file(p: &Path) -> Result<String, String> {
     let mut f = std::fs::File::open(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
@@ -196,7 +223,9 @@ fn hash_file(p: &Path) -> Result<String, String> {
 // ------------------------------------------------------------------- files
 
 struct PutSession {
+    /// This transfer's own temporary file, open since it was created.
     tmp: PathBuf,
+    file: std::fs::File,
     written: u64,
     size: Option<u64>,
     force: bool,
@@ -213,6 +242,8 @@ struct GetSession {
 pub struct Files {
     puts: Mutex<HashMap<PathBuf, PutSession>>,
     gets: Mutex<HashMap<PathBuf, GetSession>>,
+    /// Numbers the temporary files.
+    next: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -234,8 +265,7 @@ impl Files {
     pub fn put(&self, a: &PutArgs, downloads: Option<&Path>) -> Result<Written, String> {
         let target = resolve(&a.path, downloads)?;
         let session = lock(&self.puts).remove(&target);
-        let tmp = part_name(&target);
-        match self.put_piece(a, &target, &tmp, session) {
+        match self.put_piece(a, &target, session) {
             Ok((s, w)) => {
                 if let Some(s) = s {
                     let mut puts = lock(&self.puts);
@@ -245,6 +275,7 @@ impl Files {
                             .min_by_key(|(_, s)| s.last)
                             .map(|(k, _)| k.clone());
                         if let Some(old) = oldest.and_then(|k| puts.remove(&k)) {
+                            drop(old.file);
                             let _ = std::fs::remove_file(old.tmp);
                         }
                     }
@@ -252,70 +283,119 @@ impl Files {
                 }
                 Ok(w)
             }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
+            Err((e, ours)) => {
+                // Only the temporary file of this transfer goes.
+                if let Some(tmp) = ours {
+                    let _ = std::fs::remove_file(tmp);
+                }
                 Err(e)
             }
         }
     }
 
+    /// A new temporary file next to `target`, never an existing name.
+    fn create_part(&self, target: &Path) -> Result<(PathBuf, std::fs::File), String> {
+        let mut last = None;
+        for _ in 0..8 {
+            let n = self.next.fetch_add(1, Ordering::Relaxed);
+            let tmp = part_name(target, &format!("{}-{n}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(f) => return Ok((tmp, f)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(format!("cannot write {}: {e}", target.display())),
+            }
+        }
+        Err(format!(
+            "cannot write {}: {}",
+            target.display(),
+            last.map_or_else(String::new, |e| e.to_string())
+        ))
+    }
+
+    /// One piece. An error carries the temporary file to remove: this
+    /// transfer's own, never one it did not create.
     fn put_piece(
         &self,
         a: &PutArgs,
         target: &Path,
-        tmp: &Path,
         session: Option<PutSession>,
-    ) -> Result<(Option<PutSession>, Written), String> {
-        let data = decode_piece(&a.data)?;
-        let mut s = if a.offset == 0 {
-            if a.size.is_some_and(|s| s > MAX_FILE) {
-                return Err(format!("file is over the {MAX_FILE} byte limit"));
+    ) -> Result<(Option<PutSession>, Written), (String, Option<PathBuf>)> {
+        let ours = session.as_ref().map(|s| s.tmp.clone());
+        let data = decode_piece(&a.data).map_err(|e| (e, ours.clone()))?;
+        let s = if a.offset == 0 {
+            // A restart: the earlier attempt's file is ours to drop.
+            if let Some(old) = session {
+                drop(old.file);
+                let _ = std::fs::remove_file(&old.tmp);
             }
-            match target.parent() {
-                Some(p) if p.is_dir() => {}
-                Some(p) => return Err(format!("folder does not exist: {}", p.display())),
-                None => return Err(format!("bad path: {}", target.display())),
-            }
-            if target.is_dir() {
-                return Err(format!("{} is a folder", target.display()));
-            }
-            if target.exists() && !a.force {
-                return Err(format!("already exists: {}", target.display()));
-            }
-            std::fs::File::create(tmp)
-                .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
-            PutSession {
-                tmp: tmp.to_path_buf(),
-                written: 0,
-                size: a.size,
-                force: a.force,
-                last: Instant::now(),
-            }
+            self.start_put(a, target).map_err(|e| (e, None))?
         } else {
             let s = session.ok_or_else(|| {
-                format!(
-                    "no transfer of {} in progress (offset {})",
-                    target.display(),
-                    a.offset
+                (
+                    format!(
+                        "no transfer of {} in progress (offset {})",
+                        target.display(),
+                        a.offset
+                    ),
+                    None,
                 )
             })?;
             if a.offset != s.written {
-                return Err(format!(
-                    "unexpected offset {}, expected {}",
-                    a.offset, s.written
+                return Err((
+                    format!("unexpected offset {}, expected {}", a.offset, s.written),
+                    Some(s.tmp),
                 ));
             }
             s
         };
+        let tmp = s.tmp.clone();
+        self.write_piece(a, target, s, &data)
+            .map_err(|e| (e, Some(tmp)))
+    }
+
+    fn start_put(&self, a: &PutArgs, target: &Path) -> Result<PutSession, String> {
+        if a.size.is_some_and(|s| s > MAX_FILE) {
+            return Err(format!("file is over the {MAX_FILE} byte limit"));
+        }
+        match target.parent() {
+            Some(p) if p.is_dir() => {}
+            Some(p) => return Err(format!("folder does not exist: {}", p.display())),
+            None => return Err(format!("bad path: {}", target.display())),
+        }
+        if target.is_dir() {
+            return Err(format!("{} is a folder", target.display()));
+        }
+        if target.exists() && !a.force {
+            return Err(format!("already exists: {}", target.display()));
+        }
+        let (tmp, file) = self.create_part(target)?;
+        Ok(PutSession {
+            tmp,
+            file,
+            written: 0,
+            size: a.size,
+            force: a.force,
+            last: Instant::now(),
+        })
+    }
+
+    fn write_piece(
+        &self,
+        a: &PutArgs,
+        target: &Path,
+        mut s: PutSession,
+        data: &[u8],
+    ) -> Result<(Option<PutSession>, Written), String> {
         if s.written + data.len() as u64 > MAX_FILE {
             return Err(format!("file is over the {MAX_FILE} byte limit"));
         }
         if !data.is_empty() {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(tmp)
-                .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
-            f.write_all(&data)
+            s.file
+                .write_all(data)
                 .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
         }
         s.written += data.len() as u64;
@@ -336,11 +416,22 @@ impl Files {
                 ));
             }
         }
+        s.file
+            .flush()
+            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+        let PutSession {
+            tmp,
+            file,
+            written,
+            force,
+            ..
+        } = s;
+        drop(file);
+        let tmp = tmp.as_path();
         let on_disk = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
-        if on_disk != s.written {
+        if on_disk != written {
             return Err(format!(
-                "temporary file has {on_disk} bytes, expected {}",
-                s.written
+                "temporary file has {on_disk} bytes, expected {written}"
             ));
         }
         let sum = hash_file(tmp)?;
@@ -349,7 +440,7 @@ impl Files {
                 return Err(format!("sha256 mismatch: got {sum}, expected {want}"));
             }
         }
-        if target.exists() && !(a.force || s.force) {
+        if target.exists() && !(a.force || force) {
             return Err(format!("already exists: {}", target.display()));
         }
         std::fs::rename(tmp, target)
@@ -357,7 +448,7 @@ impl Files {
         Ok((
             None,
             Written {
-                size: s.written,
+                size: written,
                 path: target.to_string_lossy().into_owned(),
                 sha256: sum,
             },
@@ -491,6 +582,9 @@ mod tests {
         downloads: Mutex<Option<PathBuf>>,
         stopped: AtomicU32,
         big_apps: bool,
+        /// File ops run through `as_user`, and how many.
+        as_user: AtomicU32,
+        refuse_user: bool,
     }
 
     impl Backend for Fake {
@@ -540,6 +634,25 @@ mod tests {
                 _ => Err("no icon".into()),
             }
         }
+        fn as_user<R>(&self, f: impl FnOnce() -> R) -> Result<R, String> {
+            if self.refuse_user {
+                return Err("no desktop user".into());
+            }
+            self.as_user.fetch_add(1, Ordering::Relaxed);
+            Ok(f())
+        }
+    }
+
+    /// The temporary files in `dir`.
+    fn parts(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(PART_SUFFIX))
+            .collect();
+        v.sort();
+        v
     }
 
     fn agent(dl: Option<&Path>) -> Agent<Fake> {
@@ -679,7 +792,8 @@ mod tests {
         let w = f.put(&put(&target, 0, &data[..400]), None).unwrap();
         assert_eq!(w.size, 400);
         assert!(w.path.is_empty() && w.sha256.is_empty());
-        assert!(part_name(&target).exists() && !target.exists());
+        assert_eq!(parts(t.path()).len(), 1);
+        assert!(!target.exists());
         f.put(&put(&target, 400, &data[400..900]), None).unwrap();
         let mut last = put(&target, 900, &data[900..]);
         last.done = true;
@@ -689,7 +803,7 @@ mod tests {
         assert_eq!((w.size, w.sha256.as_str()), (1000, sum.as_str()));
         assert_eq!(w.path, target.to_string_lossy());
         assert_eq!(std::fs::read(&target).unwrap(), data);
-        assert!(!part_name(&target).exists());
+        assert!(parts(t.path()).is_empty());
         assert!(lock(&f.puts).is_empty());
     }
 
@@ -711,13 +825,13 @@ mod tests {
         let t = TempDir::new("putfail");
         let f = Files::default();
         let target = t.path().join("f.bin");
-        let tmp = part_name(&target);
+        let tmp_gone = || parts(t.path()).is_empty();
 
         // Wrong offset (a lost chunk): refused, temp file removed.
         f.put(&put(&target, 0, b"aaaa"), None).unwrap();
         let e = err_of(f.put(&put(&target, 8, b"bbbb"), None));
         assert_eq!(e, "unexpected offset 8, expected 4");
-        assert!(!tmp.exists() && !target.exists());
+        assert!(tmp_gone() && !target.exists());
         // ...and the transfer is gone: continuing is refused too.
         assert!(err_of(f.put(&put(&target, 4, b"bbbb"), None)).contains("no transfer"));
 
@@ -727,7 +841,7 @@ mod tests {
         a.done = true;
         a.sha256 = Some("00".repeat(32));
         assert!(err_of(f.put(&a, None)).contains("sha256 mismatch"));
-        assert!(!tmp.exists() && !target.exists());
+        assert!(tmp_gone() && !target.exists());
 
         // Size mismatch (size sent with the first piece).
         let mut a = put(&target, 0, b"aaaa");
@@ -736,7 +850,7 @@ mod tests {
         let mut a = put(&target, 4, b"");
         a.done = true;
         assert!(err_of(f.put(&a, None)).contains("size mismatch"));
-        assert!(!tmp.exists() && !target.exists());
+        assert!(tmp_gone() && !target.exists());
 
         // Bad base64 and oversized pieces.
         let mut a = put(&target, 0, b"");
@@ -747,7 +861,7 @@ mod tests {
         let mut a = put(&target, 0, b"x");
         a.size = Some(MAX_FILE + 1);
         assert!(err_of(f.put(&a, None)).contains("limit"));
-        assert!(!tmp.exists());
+        assert!(tmp_gone());
     }
 
     #[test]
@@ -759,7 +873,7 @@ mod tests {
         let e = err_of(f.put(&put(&target, 0, b"new"), None));
         assert!(e.contains("already exists"), "{e}");
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
-        assert!(!part_name(&target).exists());
+        assert!(parts(t.path()).is_empty());
 
         let mut a = put(&target, 0, b"new");
         a.force = true;
@@ -784,11 +898,93 @@ mod tests {
         // A "new process" would have no session; the stale temp file stays.
         let g = Files::default();
         assert!(err_of(g.put(&put(&target, 17, b"x"), None)).contains("no transfer"));
-        std::fs::write(part_name(&target), b"leftover leftover leftover").unwrap();
         let mut a = put(&target, 0, b"fresh");
         a.done = true;
         g.put(&a, None).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
+        // The earlier transfer's file is not this one's to delete.
+        assert_eq!(parts(t.path()).len(), 1);
+    }
+
+    #[test]
+    fn put_never_writes_into_or_deletes_a_planted_temp_file() {
+        let t = TempDir::new("plant");
+        let f = Files::default();
+        let target = t.path().join("f.bin");
+        // Whatever sits at the name the next transfer would pick (a file,
+        // or on Windows a link a lower-privileged process made) is left alone.
+        let planted = part_name(&target, &format!("{}-0", std::process::id()));
+        std::fs::write(&planted, b"planted").unwrap();
+        let mut a = put(&target, 0, b"data");
+        a.done = true;
+        f.put(&a, None).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"data");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted");
+
+        // A refused first piece creates nothing, so it deletes nothing.
+        let e = err_of(f.put(&put(&target, 0, b"x"), None));
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted");
+        // Neither does a stray continuation.
+        assert!(err_of(f.put(&put(&target, 9, b"x"), None)).contains("no transfer"));
+        assert_eq!(parts(t.path()), vec![planted]);
+    }
+
+    #[test]
+    fn file_ops_run_as_the_user() {
+        let t = TempDir::new("asuser");
+        std::fs::write(t.path().join("a.txt"), b"hi").unwrap();
+        let a = agent(Some(t.path()));
+        let get = Op::Get(GetArgs {
+            path: "a.txt".into(),
+            offset: 0,
+            len: 10,
+        });
+        assert!(call(&a, get.clone()).ok);
+        assert!(
+            call(
+                &a,
+                Op::Ls {
+                    path: t.path().to_string_lossy().into_owned()
+                }
+            )
+            .ok
+        );
+        let p = PutArgs {
+            path: "b.txt".into(),
+            data: b64_encode(b"x"),
+            done: true,
+            ..PutArgs::default()
+        };
+        assert!(call(&a, Op::Put(p.clone())).ok);
+        assert_eq!(a.backend.as_user.load(Ordering::Relaxed), 3);
+        assert!(call(&a, Op::Ping).ok);
+        assert_eq!(a.backend.as_user.load(Ordering::Relaxed), 3);
+
+        // Without the user's token nothing is read, listed or written.
+        let f = Fake {
+            refuse_user: true,
+            ..Fake::default()
+        };
+        *lock(&f.downloads) = Some(t.path().to_path_buf());
+        let a = Agent::new(f, "t");
+        let r = call(&a, get);
+        assert_eq!(r.error.as_deref(), Some("no desktop user"));
+        assert!(
+            !call(
+                &a,
+                Op::Ls {
+                    path: t.path().to_string_lossy().into_owned()
+                }
+            )
+            .ok
+        );
+        let p = PutArgs {
+            path: "c.txt".into(),
+            ..p
+        };
+        assert!(!call(&a, Op::Put(p)).ok);
+        assert!(!t.path().join("c.txt").exists());
     }
 
     #[test]
