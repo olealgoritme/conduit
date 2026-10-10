@@ -1,6 +1,7 @@
 # D3D11 threaded front end (UMD worker thread)
 
-Status: design, phase 1 implemented behind `UmdThreadedFrontend` (default off).
+Status: phase 1 implemented behind `UmdThreadedFrontend` (default off), first in package 22.22.405.46; not yet
+measured in the guest.
 
 ## 1. Why
 
@@ -326,7 +327,10 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 ## 9. Measuring
 
 - `d3d11_drawbench` (`guest/windows/tools`): submit µs per frame and µs per draw with the frontend off/on
-  (`HELIOS_D3D11_FRONTEND=0/1` in the same package), default shape `10 2000 2 8 256`, plus a 4000-draw run.
+  (`HELIOS_D3D11_FRONTEND=0/1` in the same package, alternating runs), default shape `10 2000 2 8 256`, plus a
+  4000-draw run.
+- Host: `cargo test --release --lib -- --ignored --nocapture producer_cost` in `umd_common` measures the ring's
+  producer cost (about 15 ns per 64-byte record on the build host, the worker consuming concurrently).
 - CS2 (by the owner): fps and the render-thread profile (`thread-sample.ps1`), worker thread share, `dxvk-cs` share.
 
 ## 10. Review
