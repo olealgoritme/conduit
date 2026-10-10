@@ -2,12 +2,15 @@
 # Builds the Windows guest stack (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD,
 # loaders, installer) from guest/windows, adapted from Helios's
 # windows-stack.yml (guest/windows/HELIOS.md). Artifacts: the installable
-# package per configuration.
+# package per configuration, and the Release driver zip for the GitHub release.
 name: Windows guest driver (Venus)
 
-# Manual only (Actions > Run workflow, or `gh workflow run windows.yml`): a
-# full run takes hours on Windows runners, which bill at twice the rate.
+# Runs on v* tags (the release attaches conduit-windows-gpu-driver-<version>.zip)
+# and by hand (Actions > Run workflow, or `gh workflow run windows.yml`); a full
+# run takes an hour on Windows runners, which bill at twice the rate.
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -437,4 +440,65 @@ jobs:
             ${{ runner.temp }}/helios-package/*.sha256
           if-no-files-found: error
           retention-days: 30
+      # The GitHub release asset: the signed driver package, symbols, licenses,
+      # test certificate and install.ps1 in one folder.
+      - name: Build the release driver zip
+        if: matrix.configuration == 'Release'
+        shell: pwsh
+        run: >-
+          ./guest/windows/ci/windows/New-ReleaseZip.ps1
+          -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows"
+          -DriverArtifact "$env:RUNNER_TEMP/artifacts/driver"
+          -PackageOutputDir "$env:RUNNER_TEMP/helios-package"
+          -OutputDir "$env:RUNNER_TEMP/release-zip"
+          -Version '${{ steps.metadata.outputs.version }}'
+      - uses: actions/upload-artifact@v7
+        if: matrix.configuration == 'Release'
+        with:
+          name: conduit-windows-gpu-driver
+          path: ${{ runner.temp }}/release-zip/*.zip
+          if-no-files-found: error
+          retention-days: 30
 
+  # On a v* tag, attach the driver zip to the GitHub release that release.yml
+  # creates from the same tag (it publishes after the Linux packages are built,
+  # so wait for it) and add the zip to the release's SHA256SUMS.
+  release:
+    name: Attach the driver zip to the release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: conduit-windows-gpu-driver
+          path: zip
+      - name: Wait for the release
+        run: |
+          # release.yml uploads SHA256SUMS together with the packages
+          for _ in $(seq 60); do
+            if gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx SHA256SUMS; then
+              exit 0
+            fi
+            sleep 60
+          done
+          echo "::error::Release $TAG (with SHA256SUMS) did not appear within 60 minutes; check the release workflow, then re-run this job."
+          exit 1
+      - name: Upload the zip and update SHA256SUMS
+        run: |
+          zip=$(ls zip/conduit-windows-gpu-driver-*.zip)
+          name=$(basename "$zip")
+          gh release upload "$TAG" "$zip" --clobber
+          mkdir sums
+          gh release download "$TAG" --pattern SHA256SUMS --dir sums
+          { grep -vF "  $name" sums/SHA256SUMS || true; (cd zip && sha256sum "$name"); } | sort -k2 > sums/new
+          mv sums/new sums/SHA256SUMS
+          gh release upload "$TAG" sums/SHA256SUMS --clobber
+          cat sums/SHA256SUMS

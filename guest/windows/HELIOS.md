@@ -101,6 +101,6 @@ Driver 22.22.297.0 (`kmd_render/driver-version.env`):
 - **Topology.** `packaging/windows/Set-HeliosDisplay.ps1` and a logon task
   make Helios the only active display.
 
-Built by `.github/workflows/windows.yml` (run by hand; Release and Debug,
+Built by `.github/workflows/windows.yml` (on v* tags and by hand; Release and Debug,
 test-signed) or locally in a build VM (`ci/vm/`). Runs in a Windows 11 guest
 on QEMU with `--venus` (Unigine Heaven at about 150 fps on an RTX 5090).
