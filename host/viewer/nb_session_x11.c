@@ -233,6 +233,7 @@ static bool x11_ui_pointer(struct nb_x11 *x, xcb_window_t ev, int ex, int ey,
                            int button, bool down, bool motion);
 static void x11_rehint(struct nb_x11 *x, bool force);
 static void x11_relayout(struct nb_x11 *x);
+static void x11_ed_show(struct nb_x11 *x, bool on);
 
 /* ── small helpers ───────────────────────────────────────────────────────── */
 
@@ -646,6 +647,9 @@ static void x11_place(struct nb_x11 *x, int bw, int bh)
     if (x->con_x != v->x || x->con_y != v->y || x->con_w != v->w ||
         x->con_h != v->h) {
         x11_size_content_at(x, v->x, v->y, v->w, v->h);
+    }
+    if (x->ui.open) {
+        x11_ed_show(x, true);   /* compare-only unless the area moved */
     }
 }
 
@@ -1274,6 +1278,7 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 }
                 x11_rehint(x, false);
                 x11_relayout(x);
+
             }
             break;
         }
@@ -2688,6 +2693,7 @@ static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x)
     e.buf_w = x->current >= 0 ? (int)x->bufs[x->current].w : 0;
     e.buf_h = x->current >= 0 ? (int)x->bufs[x->current].h : 0;
     e.stats_on = false;
+    e.no_stats = true;          /* X11 logs --stats; there is no overlay */
     e.fullscreen = x->fullscreen;
 #ifdef NB_HAVE_XCB_RENDER
     e.nearest_ok = x->pict_fmt != 0;
@@ -3178,7 +3184,18 @@ static int x11_tick_ui(struct nb_x11 *x, int next)
     uint64_t now = x11_now_ms();
     int due;
 
-#define X11_DUE(t) do {         due = (t) > now ? (int)((t) - now) : 0;         next = next < 0 || due < next ? due : next;     } while (0)
+    if (x->cfg && x->cfg->open_menu && x->win_w > 0) {
+        static bool opened;     /* --open-menu: once, when there is a window */
+
+        if (!opened) {
+            opened = true;
+            x11_menu_set(x, true);
+        }
+    }
+#define X11_DUE(t) do { \
+        due = (t) > now ? (int)((t) - now) : 0; \
+        next = next < 0 || due < next ? due : next; \
+    } while (0)
     if (x->rehint_due_ms) {
         if (now >= x->rehint_due_ms) {
             x->rehint_due_ms = 0;

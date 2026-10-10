@@ -712,6 +712,7 @@ static void wl_ui_reflow(struct nb_wl *w);
 static int  wl_tick_ui(struct nb_wl *w, int next);
 static void wl_menu_set(struct nb_wl *w, bool open);
 static void wl_rehint(struct nb_wl *w);
+static void wl_ed_show(struct nb_wl *w, bool on);
 
 /* ── virtio-nvgpu: per-frame presentation context and --stats ─────────── */
 
@@ -1371,6 +1372,9 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
     bg_layout(w, dw, dh);
     w->off_x = w->place.vis.x;
     w->off_y = w->place.vis.y;
+    if (w->ui.open) {
+        wl_ed_show(w, true);    /* compare-only unless the area moved */
+    }
 
     /*
      * WHICH SURFACE CARRIES THE PICTURE -- see cs_surf.  Exact fit: the main
@@ -5880,6 +5884,12 @@ static void wl_ui_do(struct nb_wl *w, unsigned bits)
 /* The window changed size or scale: move what is shown with it. */
 static void wl_ui_reflow(struct nb_wl *w)
 {
+    static bool opened;
+
+    if (!opened && w->cfg && w->cfg->open_menu && w->win_w > 0) {
+        opened = true;
+        wl_menu_set(w, true);
+    }
     if (w->ui.open) {
         wl_menu_paint(w);
         wl_ed_show(w, true);

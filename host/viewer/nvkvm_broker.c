@@ -3118,6 +3118,7 @@ static void usage(void)
 "                       start; --res/--area/--scale/--filter override it\n"
 "  --vm-shutdown-cmd CMD, --vm-reboot-cmd CMD\n"
 "                       commands the menu's Shut down / Restart run (/bin/sh)\n"
+"  --open-menu          start with the menu open (CTRL+ALT+M toggles)\n"
 "\n"
 "  Display hotkeys (CTRL+ALT+...): M menu, S scale, A area, R guest\n"
 "  resolution (Native/2560x1440/1920x1080/1600x900/1280x960/custom), P next\n"
@@ -3630,6 +3631,7 @@ int main(int argc, char **argv)
             }
             cfg.view_set |= NB_VIEW_SET_RES; }
         else if (!strcmp(a, "--view-state")) { NEEDVAL(); cfg.view_state = v; }
+        else if (!strcmp(a, "--open-menu")) { cfg.open_menu = true; }
         else if (!strcmp(a, "--vm-shutdown-cmd")) { NEEDVAL();
             cfg.vm_shutdown_cmd = v; }
         else if (!strcmp(a, "--vm-reboot-cmd")) { NEEDVAL();

@@ -695,7 +695,9 @@ static void build(struct nb_ui *ui, const struct nb_ui_env *env, struct pnt *p)
 
     /* view */
     section(&b, "View");
-    chip(&b, "Stats overlay", NB_UI_ID_STATS, 0, env->stats_on, false);
+    if (!env->no_stats) {
+        chip(&b, "Stats overlay", NB_UI_ID_STATS, 0, env->stats_on, false);
+    }
     chip(&b, "Fullscreen", NB_UI_ID_FULLSCREEN, 0, env->fullscreen, false);
     flow_break(&b);
 

@@ -185,6 +185,7 @@ struct nb_config {
     const char *view_state;     /* settings file, rewritten on every change */
     const char *vm_shutdown_cmd;/* menu: run via /bin/sh, not waited for    */
     const char *vm_reboot_cmd;
+    bool        open_menu;      /* --open-menu: start with the menu open    */
 };
 
 #define NB_RESIZE_SCALE 0       /* scale the full guest picture into the window */

@@ -58,6 +58,7 @@ struct nb_ui_env {
     bool     nearest_ok;        /* this backend can honour the sharp filter */
     bool     vm_actions;        /* shutdown/restart commands are available  */
     bool     translucent;       /* the panel layer can blend (Wayland: yes) */
+    bool     no_stats;          /* this backend has no stats overlay (X11)  */
 };
 
 #define NB_UI_TEXT_MAX 40
