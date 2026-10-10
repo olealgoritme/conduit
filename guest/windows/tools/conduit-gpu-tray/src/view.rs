@@ -2,11 +2,13 @@
 
 use crate::gfx::{argb, Align, Gfx, Rgb};
 use conduit_stats::Reading;
-use gpu_tray::{gib, heat, load_color, temp_color, vram_fraction};
+use gpu_tray::{default_share, gib, heat, load_color, temp_color, vram_fraction, Share};
 
 pub const WIDTH: f32 = 380.0;
-pub const HEIGHT_FULL: f32 = 612.0;
-pub const HEIGHT_WAITING: f32 = 224.0;
+pub const HEIGHT_FULL: f32 = 668.0;
+pub const HEIGHT_WAITING: f32 = 280.0;
+/// The "Shared folders" row at the bottom of the popup.
+const ROW_H: f32 = 44.0;
 
 const BG: Rgb = (16, 18, 20);
 const CARD: Rgb = (24, 27, 31);
@@ -32,6 +34,19 @@ pub struct Snapshot {
     pub load: Vec<f32>,
     pub power_w: Vec<f32>,
     pub temp_c: Vec<f32>,
+    /// Host shared folders mounted here.
+    pub shares: Vec<Share>,
+    /// A line for the shared folders row (a drop's result), for a few seconds.
+    pub status: Option<String>,
+}
+
+fn row_top(s: &Snapshot) -> f32 {
+    height(s) - PAD - ROW_H
+}
+
+/// Is this popup point (logical pixels) on the shared folders row?
+pub fn hit_shares(s: &Snapshot, x: f32, y: f32) -> bool {
+    (PAD..=WIDTH - PAD).contains(&x) && (row_top(s)..=row_top(s) + ROW_H).contains(&y)
 }
 
 pub fn height(s: &Snapshot) -> f32 {
@@ -57,6 +72,51 @@ pub fn draw(g: &Gfx, s: &Snapshot) {
     match &s.reading {
         Some(r) => full(g, r, s),
         None => waiting(g, s.wait),
+    }
+    shares_row(g, s);
+}
+
+/// "Shared folders": opens the default one; files dropped on the popup go there.
+fn shares_row(g: &Gfx, s: &Snapshot) {
+    let (x, y, w) = (PAD, row_top(s), WIDTH - 2.0 * PAD);
+    g.fill_rrect(a(CARD), x, y, w, ROW_H, 10.0);
+    g.stroke_rrect(a(EDGE), 1.0, x + 0.5, y + 0.5, w - 1.0, ROW_H - 1.0, 10.0);
+    // A small folder.
+    g.fill_rrect(argb(200, GREEN), x + 14.0, y + 13.0, 12.0, 6.0, 2.0);
+    g.fill_rrect(a(GREEN), x + 14.0, y + 16.0, 22.0, 15.0, 3.0);
+    g.text(
+        "Shared folders",
+        a(TEXT),
+        12.0,
+        true,
+        Align::Left,
+        false,
+        (x + 46.0, y + 6.0, 180.0, 18.0),
+    );
+    let sub = match (&s.status, default_share(&s.shares)) {
+        (Some(t), _) => t.clone(),
+        (None, Some(d)) => format!("{}  {}   drop files here to copy", d.drive, d.name),
+        (None, None) => "No shared folder mounted yet".to_string(),
+    };
+    g.text(
+        &sub,
+        a(MUTED),
+        10.5,
+        false,
+        Align::Left,
+        false,
+        (x + 46.0, y + 24.0, w - 120.0, 16.0),
+    );
+    if default_share(&s.shares).is_some() {
+        g.text(
+            "Open  \u{203a}",
+            a(GREEN),
+            11.0,
+            true,
+            Align::Right,
+            false,
+            (x + w - 84.0, y + 13.0, 72.0, 18.0),
+        );
     }
 }
 

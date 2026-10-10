@@ -182,6 +182,62 @@ pub fn tooltip(r: Option<&Reading>) -> String {
     s.chars().take(127).collect()
 }
 
+/// A host shared folder mounted in this VM as a drive (`conduit-NAME` tag).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Share {
+    pub name: String,
+    /// "Z:"
+    pub drive: String,
+}
+
+impl Share {
+    /// The folder's root, "Z:\\".
+    pub fn root(&self) -> String {
+        format!("{}\\", self.drive)
+    }
+}
+
+/// The name Conduit gives the folder a VM always has.
+pub const DEFAULT_SHARE: &str = "Conduit";
+
+/// One entry of the mount script's drive map (tag -> "Z:").
+pub fn parse_share(tag: &str, drive: &str) -> Option<Share> {
+    let name = tag.strip_prefix("conduit-").filter(|n| !n.is_empty())?;
+    let mut c = drive.trim().chars();
+    let letter = c.next().filter(char::is_ascii_alphabetic)?;
+    (c.as_str() == ":" || c.as_str().is_empty()).then(|| Share {
+        name: name.to_string(),
+        drive: format!("{}:", letter.to_ascii_uppercase()),
+    })
+}
+
+/// The share "Open default share" and drops go to: `Conduit`, else the first.
+pub fn default_share(shares: &[Share]) -> Option<&Share> {
+    shares
+        .iter()
+        .find(|s| s.name == DEFAULT_SHARE)
+        .or_else(|| shares.first())
+}
+
+/// A double-null-terminated path list, as SHFileOperationW takes it.
+pub fn path_list(paths: &[String]) -> Vec<u16> {
+    let mut v: Vec<u16> = Vec::new();
+    for p in paths {
+        v.extend(p.encode_utf16());
+        v.push(0);
+    }
+    v.push(0);
+    v
+}
+
+/// "Copied 3 items to Conduit".
+pub fn copied_text(n: usize, share: &str) -> String {
+    format!(
+        "Copied {n} item{} to {share}",
+        if n == 1 { "" } else { "s" }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +330,34 @@ mod tests {
             ..Reading::default()
         };
         assert!(icon_face(&empty, IconMetric::Temp).is_none());
+    }
+
+    #[test]
+    fn shares_from_the_drive_map() {
+        let s = parse_share("conduit-Docs", "z:").unwrap();
+        assert_eq!((s.name.as_str(), s.drive.as_str()), ("Docs", "Z:"));
+        assert_eq!(s.root(), "Z:\\");
+        assert!(parse_share("nvidia", "Z:").is_none());
+        assert!(parse_share("conduit-", "Z:").is_none());
+        assert!(parse_share("conduit-A", "").is_none());
+        assert!(parse_share("conduit-A", "ZZ:").is_none());
+    }
+
+    #[test]
+    fn default_share_prefers_conduit() {
+        let a = parse_share("conduit-Games", "Y:").unwrap();
+        let b = parse_share("conduit-Conduit", "Z:").unwrap();
+        assert_eq!(default_share(&[a.clone(), b.clone()]), Some(&b));
+        assert_eq!(default_share(std::slice::from_ref(&a)), Some(&a));
+        assert_eq!(default_share(&[]), None);
+    }
+
+    #[test]
+    fn drop_list_and_text() {
+        let v = path_list(&["C:\\a".into(), "C:\\b c".into()]);
+        assert_eq!(&v[v.len() - 2..], &[0, 0]);
+        assert_eq!(v.iter().filter(|&&c| c == 0).count(), 3);
+        assert_eq!(copied_text(1, "Conduit"), "Copied 1 item to Conduit");
+        assert_eq!(copied_text(3, "Docs"), "Copied 3 items to Docs");
     }
 }

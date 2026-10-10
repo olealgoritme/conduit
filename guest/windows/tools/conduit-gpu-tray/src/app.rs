@@ -3,9 +3,14 @@
 use crate::gfx::{self, argb, wide, Gfx};
 use crate::sys;
 use crate::view::{self, Snapshot, Wait};
-use gpu_tray::{icon_face, tooltip, IconMetric, LineReader, Model, CHANNEL};
+use gpu_tray::{
+    copied_text, default_share, icon_face, path_list, tooltip, IconMetric, LineReader, Model,
+    Share, CHANNEL,
+};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed,
+};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
@@ -25,6 +30,8 @@ const MUTEX: &str = "Local\\ConduitGpuTray";
 const WM_DATA: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const WM_SHOW: u32 = WM_APP + 3;
+/// A drop finished copying; repaint the row's status line.
+const WM_DROPPED: u32 = WM_APP + 4;
 const TIMER: usize = 1;
 /// Repaints the open popup for the waiting animation.
 const ANIM: usize = 2;
@@ -35,6 +42,10 @@ const ID_TEMP: usize = 2;
 const ID_LOAD: usize = 3;
 const ID_AUTOSTART: usize = 4;
 const ID_EXIT: usize = 5;
+const ID_KEEP: usize = 6;
+const ID_OPEN_DEFAULT: usize = 7;
+/// Menu ids of the shared folders submenu: this plus the index.
+const ID_SHARE: usize = 100;
 
 // Channel state, written by the reader thread.
 const CH_WAITING: u8 = 0;
@@ -50,6 +61,12 @@ static MAIN: AtomicIsize = AtomicIsize::new(0);
 static LAST_FACE: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_HIDE: AtomicU64 = AtomicU64::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// Keep the popup open when it loses focus (so files can be dragged onto it).
+static KEEP_OPEN: AtomicBool = AtomicBool::new(false);
+/// Host shared folders mounted here, refreshed once a second.
+static SHARES: Mutex<Vec<Share>> = Mutex::new(Vec::new());
+/// The shared folders row's message after a drop, and when it was set.
+static DROP_STATUS: Mutex<Option<(String, u64)>> = Mutex::new(None);
 
 fn model() -> &'static Mutex<Model> {
     MODEL.get_or_init(|| Mutex::new(Model::default()))
@@ -87,7 +104,91 @@ fn snapshot() -> Snapshot {
         load: m.load.values().collect(),
         power_w: m.power_w.values().collect(),
         temp_c: m.temp_c.values().collect(),
+        shares: SHARES.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        status: DROP_STATUS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(_, at)| tick().saturating_sub(*at) < 6000)
+            .map(|(t, _)| t.clone()),
     }
+}
+
+fn refresh_shares() {
+    *SHARES.lock().unwrap_or_else(|e| e.into_inner()) = sys::mounted_shares();
+}
+
+fn shares() -> Vec<Share> {
+    SHARES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Open a folder in Explorer.
+fn open_folder(path: &str) {
+    unsafe {
+        ShellExecuteW(
+            null_mut(),
+            wide("open").as_ptr(),
+            wide(path).as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+fn open_default_share() {
+    refresh_shares();
+    if let Some(s) = default_share(&shares()) {
+        open_folder(&s.root());
+    }
+}
+
+/// Files dropped on the popup: copy them into the default share (Explorer's
+/// own copy dialog shows progress and asks about name clashes).
+fn drop_files(hwnd: HWND, hdrop: HDROP) {
+    let mut files: Vec<String> = Vec::new();
+    unsafe {
+        let n = DragQueryFileW(hdrop, u32::MAX, null_mut(), 0);
+        for i in 0..n {
+            let len = DragQueryFileW(hdrop, i, null_mut(), 0) as usize;
+            let mut buf = vec![0u16; len + 1];
+            DragQueryFileW(hdrop, i, buf.as_mut_ptr(), buf.len() as u32);
+            files.push(String::from_utf16_lossy(&buf[..len]));
+        }
+        DragFinish(hdrop);
+    }
+    refresh_shares();
+    let status = |t: String| {
+        *DROP_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some((t, tick()));
+    };
+    let Some(dest) = default_share(&shares()).cloned() else {
+        status("No shared folder is mounted to copy to".into());
+        unsafe { InvalidateRect(hwnd, null(), 0) };
+        return;
+    };
+    if files.is_empty() {
+        return;
+    }
+    let h = hwnd as usize;
+    std::thread::spawn(move || {
+        let from = path_list(&files);
+        let to = path_list(&[dest.root()]);
+        let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
+        op.wFunc = FO_COPY;
+        op.pFrom = from.as_ptr();
+        op.pTo = to.as_ptr();
+        op.fFlags = (FOF_NOCONFIRMMKDIR | FOF_ALLOWUNDO) as u16;
+        let r = unsafe { SHFileOperationW(&mut op) };
+        *DROP_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+            if r == 0 && op.fAnyOperationsAborted == 0 {
+                copied_text(files.len(), &dest.name)
+            } else {
+                "Copy stopped".to_string()
+            },
+            tick(),
+        ));
+        unsafe { PostMessageW(h as HWND, WM_DROPPED, 0, 0) };
+    });
 }
 
 // ------------------------------------------------------------ channel reader
@@ -368,6 +469,7 @@ fn show_popup(hwnd: HWND) {
         if IsWindowVisible(hwnd) != 0 {
             return;
         }
+        refresh_shares();
         let snap = snapshot();
         place(hwnd, &snap, None);
         ShowWindow(hwnd, SW_SHOW);
@@ -449,6 +551,33 @@ fn context_menu(hwnd: HWND) {
             );
         };
         add(ID_SHOW, "Show", false);
+        // Shared folders: every mounted share opens in Explorer.
+        refresh_shares();
+        let list = shares();
+        let sub = CreatePopupMenu();
+        for (i, sh) in list.iter().enumerate() {
+            let t = wide(&format!("{}   ({})", sh.name, sh.drive));
+            AppendMenuW(sub, MF_STRING, ID_SHARE + i, t.as_ptr());
+        }
+        if list.is_empty() {
+            let t = wide("None mounted");
+            AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+        }
+        let t = wide("Shared folders");
+        AppendMenuW(m, MF_POPUP, sub as usize, t.as_ptr());
+        let t = wide("Open default share");
+        AppendMenuW(
+            m,
+            MF_STRING | if list.is_empty() { MF_GRAYED } else { 0 },
+            ID_OPEN_DEFAULT,
+            t.as_ptr(),
+        );
+        AppendMenuW(m, MF_SEPARATOR, 0, null());
+        add(
+            ID_KEEP,
+            "Keep popup open (to drop files)",
+            KEEP_OPEN.load(Relaxed),
+        );
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         add(
             ID_TEMP,
@@ -484,6 +613,11 @@ fn context_menu(hwnd: HWND) {
                 sys::write_setting("IconMetric", (cmd as usize == ID_LOAD) as u32);
                 refresh_tray(hwnd, false);
             }
+            ID_KEEP => KEEP_OPEN.store(!KEEP_OPEN.load(Relaxed), Relaxed),
+            ID_OPEN_DEFAULT => open_default_share(),
+            id if id >= ID_SHARE && id - ID_SHARE < list.len() => {
+                open_folder(&list[id - ID_SHARE].root());
+            }
             ID_AUTOSTART => sys::set_autostart(!sys::autostart_enabled(), &exe_path()),
             ID_EXIT => {
                 DestroyWindow(hwnd);
@@ -518,6 +652,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER => {
+            refresh_shares();
             // Catches a feed that went quiet, and keeps the open popup honest.
             refresh_tray(hwnd, false);
             if IsWindowVisible(hwnd) != 0 {
@@ -530,13 +665,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             show_popup(hwnd);
             0
         }
+        WM_DROPPED => {
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_DROPFILES => {
+            drop_files(hwnd, wp as HDROP);
+            0
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = (
+                (lp & 0xFFFF) as i16 as f32,
+                ((lp >> 16) & 0xFFFF) as i16 as f32,
+            );
+            let mut c: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut c);
+            let k = c.right.max(1) as f32 / view::WIDTH;
+            if view::hit_shares(&snapshot(), x / k, y / k) {
+                hide_popup(hwnd);
+                open_default_share();
+            }
+            0
+        }
+        WM_SETCURSOR if (lp & 0xFFFF) as u32 == HTCLIENT => {
+            let mut p = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut p);
+            ScreenToClient(hwnd, &mut p);
+            let mut c: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut c);
+            let k = c.right.max(1) as f32 / view::WIDTH;
+            let over = view::hit_shares(&snapshot(), p.x as f32 / k, p.y as f32 / k)
+                && default_share(&shares()).is_some();
+            let id = if over { IDC_HAND } else { IDC_ARROW };
+            SetCursor(LoadCursorW(null_mut(), id));
+            1
+        }
         WM_PAINT => {
             paint(hwnd);
             0
         }
         WM_ERASEBKGND => 1,
         WM_ACTIVATE => {
-            if (wp & 0xFFFF) as u32 == WA_INACTIVE {
+            if (wp & 0xFFFF) as u32 == WA_INACTIVE && !KEEP_OPEN.load(Relaxed) {
                 hide_popup(hwnd);
             }
             0
@@ -627,6 +797,17 @@ pub fn run() {
         if hwnd.is_null() {
             return;
         }
+        // Files dragged from Explorer reach this (elevated) window only when
+        // the message filter lets the drop messages through.
+        DragAcceptFiles(hwnd, 1);
+        for m in [
+            WM_DROPFILES,
+            WM_COPYDATA,
+            0x0049, /* WM_COPYGLOBALDATA */
+        ] {
+            ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, null_mut());
+        }
+        refresh_shares();
         refresh_tray(hwnd, true);
         MAIN.store(hwnd as isize, Relaxed);
         SetTimer(hwnd, TIMER, 1000, None);

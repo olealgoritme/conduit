@@ -70,6 +70,59 @@ fn set(root: HKEY, sub: &str, name: &str, kind: u32, data: &[u8]) -> bool {
     ok
 }
 
+/// The host shared folders mounted here. The mount task records each tag's
+/// drive letter under HKLM\SOFTWARE\Conduit\ShareDrives; only letters that
+/// are drives right now count.
+pub fn mounted_shares() -> Vec<gpu_tray::Share> {
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+    let Some(k) = open(HKEY_LOCAL_MACHINE, r"SOFTWARE\Conduit\ShareDrives", false) else {
+        return Vec::new();
+    };
+    let present = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0.. {
+        let mut name = [0u16; 128];
+        let mut nlen = name.len() as u32;
+        let mut data = [0u8; 64];
+        let mut dlen = data.len() as u32;
+        let r = unsafe {
+            RegEnumValueW(
+                k,
+                i,
+                name.as_mut_ptr(),
+                &mut nlen,
+                null(),
+                null_mut(),
+                data.as_mut_ptr(),
+                &mut dlen,
+            )
+        };
+        if r == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if r != ERROR_SUCCESS {
+            continue;
+        }
+        let tag = String::from_utf16_lossy(&name[..nlen as usize]);
+        let units: Vec<u16> = data[..(dlen as usize).min(64) / 2 * 2]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        let drive = String::from_utf16_lossy(&units);
+        if let Some(s) = gpu_tray::parse_share(&tag, &drive) {
+            let bit = s.drive.as_bytes()[0] - b'A';
+            if present & (1 << bit) != 0 {
+                out.push(s);
+            }
+        }
+    }
+    unsafe { RegCloseKey(k) };
+    out.sort_by_key(|s| (s.name != gpu_tray::DEFAULT_SHARE, s.name.to_lowercase()));
+    out
+}
+
 /// The logon task the installer registers: it starts the app with
 /// administrator rights (the VirtIO serial port is admin-only) and no UAC
 /// prompt, for every user who logs on.
