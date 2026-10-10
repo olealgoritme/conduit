@@ -178,6 +178,21 @@ enum Cmd {
         /// Closing the window leaves the VM running even if this command started it
         #[arg(long)]
         keep_running: bool,
+        /// Guest resolution: native (the picture area, in screen pixels) or WxH
+        /// (Ctrl+Alt+R cycles presets)
+        #[arg(long, value_name = "native|WxH", value_parser = run::parse_view_res)]
+        res: Option<String>,
+        /// Picture area in the window: full, 21:9, 16:9, 16:10, 4:3, or WxH[+X+Y]
+        /// in screen pixels, centred without +X+Y (Ctrl+Alt+A cycles)
+        #[arg(long, value_name = "AREA", value_parser = run::parse_view_area)]
+        area: Option<String>,
+        /// How the guest picture fills the area: fit (aspect kept, black bars),
+        /// stretch, integer, or none (1:1, centred) (Ctrl+Alt+S cycles)
+        #[arg(long, value_name = "MODE", value_parser = ["fit", "stretch", "integer", "none"])]
+        scale: Option<String>,
+        /// Scaling filter: linear or nearest (X11; on Wayland the compositor picks)
+        #[arg(long, value_name = "F", value_parser = ["linear", "nearest"])]
+        filter: Option<String>,
     },
     /// Shut a VM down cleanly (power button), forced off after the timeout,
     /// and stop everything that belongs to it
@@ -710,8 +725,18 @@ fn main() {
             fullscreen,
             vmm,
             keep_running,
+            res,
+            area,
+            scale,
+            filter,
         } => view_target(name, mode).and_then(|(name, mode)| {
             let m = opt_mode(mode.as_deref())?;
+            run::set_view_opts(run::ViewOpts {
+                res,
+                area,
+                scale,
+                filter,
+            });
             lvrun::mark_used(&name);
             run::view(&name, m, tune_hyprland, fullscreen, vmm, keep_running)
         }),

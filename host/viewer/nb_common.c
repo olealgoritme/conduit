@@ -9,6 +9,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <linux/input-event-codes.h>
 
 #include "nvkvm_broker.h"
 
@@ -362,4 +366,112 @@ struct nb_session *nb_session_open(const struct nb_config *cfg)
     nb_err("  the VMM that is meant to be sandboxed away from the display");
     nb_err("  server — running the BROKER without one defeats the design.");
     return NULL;
+}
+
+/* ── display settings shared by the backends ─────────────────────────────── */
+
+void nb_view_apply_res(const struct nb_view *v)
+{
+    if (nb_res_mode == NB_RES_NONE) {
+        return;                 /* --resolution=none: never suggest */
+    }
+    if (v->res_w && v->res_h) {
+        nb_res_mode = NB_RES_FIXED;
+        nb_res_w = v->res_w;
+        nb_res_h = v->res_h;
+    } else {
+        nb_res_mode = NB_RES_AUTO;
+    }
+}
+
+void nb_vstore_setup(struct nb_vstore *st, const struct nb_config *cfg)
+{
+    char sum[128];
+
+    nb_vstore_init(st);
+    if (cfg->view_state && nb_vstore_load(st, cfg->view_state) != 0) {
+        nb_err("display settings: cannot read %s: %s", cfg->view_state,
+               strerror(errno));
+    }
+    nb_view_override(&st->cur, &cfg->view, cfg->view_set);
+    nb_view_apply_res(&st->cur);
+    nb_view_summary(&st->cur, sum, sizeof(sum));
+    nb_log("display: %s%s%s%s", sum, cfg->view_state ? " (saved in " : "",
+           cfg->view_state ? cfg->view_state : "",
+           cfg->view_state ? ")" : "");
+}
+
+void nb_vstore_persist(const struct nb_vstore *st, const struct nb_config *cfg)
+{
+    int r;
+
+    if (!cfg->view_state) {
+        return;
+    }
+    r = nb_vstore_save(st, cfg->view_state);
+    if (r != 0) {
+        nb_err("display settings: cannot write %s: %s", cfg->view_state,
+               strerror(-r));
+    }
+}
+
+int nb_view_hotkey(struct nb_vstore *st, unsigned code, bool shift, int ww,
+                   int wh, unsigned s120, char *label, size_t n)
+{
+    int step = shift ? 64 : 8;
+
+    switch (code) {
+    case KEY_S:     return (int)nb_view_cycle_scale(st, label, n);
+    case KEY_A:     return (int)nb_view_cycle_area(st, label, n);
+    case KEY_R:     return (int)nb_view_cycle_res(st, label, n);
+    case KEY_P:     return (int)nb_view_cycle_profile(st, label, n);
+    case KEY_0:     return (int)nb_view_reset(st, label, n);
+    case KEY_LEFT:  return (int)nb_view_nudge(st, ww, wh, s120, -step, 0, 0, label, n);
+    case KEY_RIGHT: return (int)nb_view_nudge(st, ww, wh, s120, step, 0, 0, label, n);
+    case KEY_UP:    return (int)nb_view_nudge(st, ww, wh, s120, 0, -step, 0, label, n);
+    case KEY_DOWN:  return (int)nb_view_nudge(st, ww, wh, s120, 0, step, 0, label, n);
+    case KEY_MINUS:
+    case KEY_KPMINUS:
+        return (int)nb_view_nudge(st, ww, wh, s120, 0, 0, -2 * step, label, n);
+    case KEY_EQUAL:
+    case KEY_KPPLUS:
+        return (int)nb_view_nudge(st, ww, wh, s120, 0, 0, 2 * step, label, n);
+    default:
+        return -1;
+    }
+}
+
+void nb_run_detached(const char *cmd)
+{
+    pid_t p;
+
+    if (!cmd || !*cmd) {
+        return;
+    }
+    p = fork();
+    if (p < 0) {
+        nb_err("run: fork: %s", strerror(errno));
+        return;
+    }
+    if (p == 0) {
+        sigset_t none;
+        pid_t q = fork();
+        int fd;
+
+        if (q != 0) {
+            _exit(q < 0 ? 1 : 0);
+        }
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        signal(SIGPIPE, SIG_DFL);
+        fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            dup2(fd, STDIN_FILENO);
+        }
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    while (waitpid(p, NULL, 0) < 0 && errno == EINTR) {
+    }
+    nb_log("ran `%s`", cmd);
 }

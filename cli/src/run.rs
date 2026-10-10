@@ -546,6 +546,93 @@ fn clipboard() -> Clipboard {
     CLIPBOARD.get().copied().unwrap_or(Clipboard::Both)
 }
 
+/// `conduit view --res/--area/--scale/--filter`: display settings handed to
+/// the viewer, overriding what it saved for this VM last time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViewOpts {
+    pub res: Option<String>,
+    pub area: Option<String>,
+    pub scale: Option<String>,
+    pub filter: Option<String>,
+}
+
+impl ViewOpts {
+    /// The viewer's arguments for these settings.
+    pub fn viewer_args(&self) -> Vec<String> {
+        let mut a = Vec::new();
+        for (flag, v) in [
+            ("--res", &self.res),
+            ("--area", &self.area),
+            ("--scale", &self.scale),
+            ("--filter", &self.filter),
+        ] {
+            if let Some(v) = v {
+                a.push(flag.to_string());
+                a.push(v.clone());
+            }
+        }
+        a
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == ViewOpts::default()
+    }
+}
+
+static VIEW_OPTS: std::sync::OnceLock<ViewOpts> = std::sync::OnceLock::new();
+
+pub fn set_view_opts(v: ViewOpts) {
+    let _ = VIEW_OPTS.set(v);
+}
+
+fn view_opts() -> ViewOpts {
+    VIEW_OPTS.get().cloned().unwrap_or_default()
+}
+
+fn parse_wxh(s: &str) -> Option<(u32, u32, &str)> {
+    let (w, rest) = s.split_once(['x', 'X'])?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let (h, tail) = rest.split_at(end);
+    let (w, h): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
+    ((1..=16384).contains(&w) && (1..=16384).contains(&h)).then_some((w, h, tail))
+}
+
+/// `native` or `WxH`.
+pub fn parse_view_res(s: &str) -> std::result::Result<String, String> {
+    if s == "native" || matches!(parse_wxh(s), Some((_, _, ""))) {
+        Ok(s.to_string())
+    } else {
+        Err("expected native or WxH, e.g. 1920x1080".into())
+    }
+}
+
+/// `full`, an aspect preset, or `WxH[+X+Y]`.
+pub fn parse_view_area(s: &str) -> std::result::Result<String, String> {
+    let ok = match s {
+        "full" | "21:9" | "16:9" | "16:10" | "4:3" => true,
+        _ => match parse_wxh(s) {
+            Some((_, _, "")) => true,
+            Some((_, _, tail)) => tail
+                .strip_prefix('+')
+                .and_then(|t| t.split_once('+'))
+                .is_some_and(|(x, y)| x.parse::<u32>().is_ok() && y.parse::<u32>().is_ok()),
+            None => false,
+        },
+    };
+    if ok {
+        Ok(s.to_string())
+    } else {
+        Err("expected full, 21:9, 16:9, 16:10, 4:3 or WxH[+X+Y], e.g. 2560x1080+0+180".into())
+    }
+}
+
+/// Where the viewer keeps this VM's display settings.
+fn view_state_file(name: &str) -> PathBuf {
+    paths::vm_dir(name).join("viewer.conf")
+}
+
 /// The viewer backend for this desktop: Wayland when there is one, else X11.
 fn viewer_session(wayland: bool, x11: bool) -> Option<&'static str> {
     if wayland {
@@ -557,15 +644,13 @@ fn viewer_session(wayland: bool, x11: bool) -> Option<&'static str> {
     }
 }
 
-fn viewer_supports_hook(viewer: &Path) -> bool {
+/// The viewer's `--help`, to see which options this build understands.
+fn viewer_help(viewer: &Path) -> String {
     Command::new(viewer)
         .arg("--help")
         .output()
-        .map(|o| {
-            let s = [o.stdout, o.stderr].concat();
-            String::from_utf8_lossy(&s).contains("--direct-hook")
-        })
-        .unwrap_or(false)
+        .map(|o| String::from_utf8_lossy(&[o.stdout, o.stderr].concat()).into_owned())
+        .unwrap_or_default()
 }
 
 /// Returns true if Hyprland must be tuned for the whole run (old viewer without hook support).
@@ -610,20 +695,40 @@ pub(crate) fn start_viewer(
                 }
             ),
         ])
-        .args([
-            "--present-mode=native",
-            "--scale",
-            "aspect",
-            "--persist",
-            "--stats",
-        ]);
+        .args(["--present-mode=native", "--persist", "--stats"]);
+    let help = viewer_help(viewer);
+    let opts = view_opts();
+    if help.contains("--view-state") {
+        // Settings live with the VM and are restored next time; the flags
+        // given to this command override them.
+        let state = view_state_file(name);
+        if let Some(dir) = state.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        cmd.arg("--view-state").arg(&state).args(opts.viewer_args());
+        if let Ok(me) = std::env::current_exe() {
+            let me = shell_quote(&me.to_string_lossy());
+            let vm = shell_quote(name);
+            cmd.arg("--vm-shutdown-cmd")
+                .arg(format!("{me} shutdown {vm}"))
+                .arg("--vm-reboot-cmd")
+                .arg(format!("{me} reboot {vm}"));
+        }
+    } else {
+        if !opts.is_empty() {
+            ui::warn(
+                "this conduit-viewer is too old for --res/--area/--scale/--filter; ignoring them",
+            );
+        }
+        cmd.args(["--scale", "aspect"]);
+    }
     if fullscreen || std::env::var("CONDUIT_FULLSCREEN").as_deref() == Ok("1") {
         cmd.arg("--fullscreen");
     }
     let mut whole_run = false;
     if let Some(sig) = tune {
         cmd.env("HYPRLAND_INSTANCE_SIGNATURE", sig);
-        if viewer_supports_hook(viewer) {
+        if help.contains("--direct-hook") {
             let me = std::env::current_exe()?;
             let hook = format!(
                 "{} hypr-hook --state {}",
@@ -1515,6 +1620,40 @@ mod clipboard_tests {
         assert_eq!(Clipboard::ToHost.viewer_arg(), "guest-to-host");
         assert_eq!(Clipboard::ToGuest.viewer_arg(), "host-to-guest");
         assert_eq!(Clipboard::Off.viewer_arg(), "off");
+    }
+
+    #[test]
+    fn view_settings_are_checked_and_passed_through() {
+        assert!(parse_view_res("native").is_ok());
+        assert!(parse_view_res("2560x1440").is_ok());
+        assert!(parse_view_res("2560x").is_err());
+        assert!(parse_view_res("0x1080").is_err());
+        assert!(parse_view_res("1920x1080+0+0").is_err());
+        for a in [
+            "full",
+            "21:9",
+            "16:9",
+            "16:10",
+            "4:3",
+            "1440x1080",
+            "2560x1080+0+180",
+        ] {
+            assert!(parse_view_area(a).is_ok(), "{a}");
+        }
+        for a in ["16:8", "1440x", "1440x1080+5", "1440x1080-5-5", "wide"] {
+            assert!(parse_view_area(a).is_err(), "{a}");
+        }
+        let o = ViewOpts {
+            res: Some("1280x960".into()),
+            area: Some("4:3".into()),
+            scale: Some("stretch".into()),
+            filter: None,
+        };
+        assert_eq!(
+            o.viewer_args(),
+            ["--res", "1280x960", "--area", "4:3", "--scale", "stretch"]
+        );
+        assert!(ViewOpts::default().viewer_args().is_empty());
     }
 
     #[test]

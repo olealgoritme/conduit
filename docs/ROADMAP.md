@@ -4,7 +4,7 @@
 - [x] Linux guest renders on the host GPU (Vulkan, GL, CUDA, NVENC)
 - [x] Zero-copy display in a host Wayland window, up to 240 Hz
 - [x] Keyboard, mouse, clipboard and sound
-- [x] The VM follows the window size by default; optional scale-to-fit (Ctrl+Alt+R)
+- [x] The VM follows the window size by default; fixed guest resolutions, picture areas and fit/stretch/integer/1:1 scaling (docs/VIEWER.md)
 - [x] Fullscreen at the monitor's exact mode, direct scanout
 - [x] Hardware cursor
 - [x] Performance overlay (fps, frame times, latency)
