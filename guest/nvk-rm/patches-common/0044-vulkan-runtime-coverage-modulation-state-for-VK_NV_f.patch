@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 10 Oct 2026 12:08:25 +0200
+Subject: [PATCH] vulkan/runtime: coverage modulation state for
+ VK_NV_framebuffer_mixed_samples
+
+VkPipelineCoverageModulationStateCreateInfoNV (mode, table enable,
+table) becomes part of the multisample state, as three dynamic states,
+MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE, _TABLE_ENABLE and _TABLE.
+They are filled from the pipeline (off without the structure) and by
+vkCmdSetCoverageModulationModeNV, vkCmdSetCoverageModulationTableEnableNV
+and vkCmdSetCoverageModulationTableNV, which were empty stubs for
+VK_EXT_shader_object.
+
+No driver reads them yet; NVK's VK_NV_framebuffer_mixed_samples does in
+the next patch.
+---
+ src/vulkan/runtime/vk_graphics_state.c | 74 ++++++++++++++++++++++++++
+ src/vulkan/runtime/vk_graphics_state.h | 40 ++++++++++++++
+ 2 files changed, 114 insertions(+)
+
+diff --git a/src/vulkan/runtime/vk_graphics_state.c b/src/vulkan/runtime/vk_graphics_state.c
+index c341a604..6fafdab7 100644
+--- a/src/vulkan/runtime/vk_graphics_state.c
++++ b/src/vulkan/runtime/vk_graphics_state.c
+@@ -106,6 +106,9 @@ get_dynamic_state_groups(BITSET_WORD *dynamic,
+       BITSET_SET(dynamic, MESA_VK_DYNAMIC_MS_ALPHA_TO_ONE_ENABLE);
+       BITSET_SET(dynamic, MESA_VK_DYNAMIC_MS_SAMPLE_LOCATIONS_ENABLE);
+       BITSET_SET(dynamic, MESA_VK_DYNAMIC_MS_SAMPLE_LOCATIONS);
++      BITSET_SET(dynamic, MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE);
++      BITSET_SET(dynamic, MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE_ENABLE);
++      BITSET_SET(dynamic, MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE);
+    }
+ 
+    if (groups & MESA_VK_GRAPHICS_STATE_DEPTH_STENCIL_BIT) {
+@@ -305,6 +308,9 @@ vk_get_dynamic_graphics_states(BITSET_WORD *dynamic,
+       CASE( ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT, ATTACHMENT_FEEDBACK_LOOP_ENABLE)
+       CASE( DEPTH_CLAMP_RANGE_EXT,        VP_DEPTH_CLAMP_RANGE)
+       CASE( COLOR_BLEND_ADVANCED_EXT,     CB_BLEND_ADVANCED)
++      CASE( COVERAGE_MODULATION_MODE_NV,  MS_COVERAGE_MODULATION_MODE)
++      CASE( COVERAGE_MODULATION_TABLE_ENABLE_NV, MS_COVERAGE_MODULATION_TABLE_ENABLE)
++      CASE( COVERAGE_MODULATION_TABLE_NV, MS_COVERAGE_MODULATION_TABLE)
+       default:
+          UNREACHABLE("Unsupported dynamic graphics state");
+       }
+@@ -789,6 +795,30 @@ vk_multisample_state_init(struct vk_multisample_state *ms,
+    /* These get filled in by vk_multisample_sample_locations_state_init() */
+    ms->sample_locations_enable = false;
+    ms->sample_locations = NULL;
++
++   /* VK_NV_framebuffer_mixed_samples: without the structure, coverage
++    * modulation is off (VK_COVERAGE_MODULATION_MODE_NONE_NV).
++    */
++   const VkPipelineCoverageModulationStateCreateInfoNV *cm_info =
++      vk_find_struct_const(ms_info->pNext,
++                           PIPELINE_COVERAGE_MODULATION_STATE_CREATE_INFO_NV);
++   if (cm_info != NULL) {
++      if (!IS_DYNAMIC(MS_COVERAGE_MODULATION_MODE))
++         ms->coverage_modulation_mode = cm_info->coverageModulationMode;
++      if (!IS_DYNAMIC(MS_COVERAGE_MODULATION_TABLE_ENABLE)) {
++         ms->coverage_modulation_table_enable =
++            cm_info->coverageModulationTableEnable;
++      }
++      if (!IS_DYNAMIC(MS_COVERAGE_MODULATION_TABLE) &&
++          cm_info->coverageModulationTableEnable) {
++         assert(cm_info->coverageModulationTableCount <= MESA_VK_MAX_SAMPLES);
++         ms->coverage_modulation_table_count =
++            MIN2(cm_info->coverageModulationTableCount, MESA_VK_MAX_SAMPLES);
++         typed_memcpy(ms->coverage_modulation_table,
++                      cm_info->pCoverageModulationTable,
++                      ms->coverage_modulation_table_count);
++      }
++   }
+ }
+ 
+ static bool
+@@ -843,6 +873,13 @@ vk_dynamic_graphics_state_init_ms(struct vk_dynamic_graphics_state *dst,
+    dst->ms.alpha_to_coverage_enable = ms->alpha_to_coverage_enable;
+    dst->ms.alpha_to_one_enable = ms->alpha_to_one_enable;
+    dst->ms.sample_locations_enable = ms->sample_locations_enable;
++   dst->ms.coverage_modulation_mode = ms->coverage_modulation_mode;
++   dst->ms.coverage_modulation_table_enable =
++      ms->coverage_modulation_table_enable;
++   dst->ms.coverage_modulation_table_count =
++      ms->coverage_modulation_table_count;
++   typed_memcpy(dst->ms.coverage_modulation_table,
++                ms->coverage_modulation_table, MESA_VK_MAX_SAMPLES);
+ 
+    if (IS_NEEDED(MS_SAMPLE_LOCATIONS) && ms->sample_locations)
+       *dst->ms.sample_locations = *ms->sample_locations;
+@@ -2301,6 +2338,15 @@ vk_dynamic_graphics_state_copy(struct vk_dynamic_graphics_state *dst,
+    COPY_IF_SET(MS_ALPHA_TO_COVERAGE_ENABLE, ms.alpha_to_coverage_enable);
+    COPY_IF_SET(MS_ALPHA_TO_ONE_ENABLE, ms.alpha_to_one_enable);
+    COPY_IF_SET(MS_SAMPLE_LOCATIONS_ENABLE, ms.sample_locations_enable);
++   COPY_IF_SET(MS_COVERAGE_MODULATION_MODE, ms.coverage_modulation_mode);
++   COPY_IF_SET(MS_COVERAGE_MODULATION_TABLE_ENABLE,
++               ms.coverage_modulation_table_enable);
++   if (IS_SET_IN_SRC(MS_COVERAGE_MODULATION_TABLE)) {
++      COPY_MEMBER(MS_COVERAGE_MODULATION_TABLE,
++                  ms.coverage_modulation_table_count);
++      COPY_ARRAY(MS_COVERAGE_MODULATION_TABLE, ms.coverage_modulation_table,
++                 MESA_VK_MAX_SAMPLES);
++   }
+ 
+    if (IS_SET_IN_SRC(MS_SAMPLE_LOCATIONS)) {
+       assert(dst->ms.sample_locations != NULL);
+@@ -3475,6 +3521,11 @@ vk_common_CmdSetCoverageModulationModeNV(
+     VkCommandBuffer                             commandBuffer,
+     VkCoverageModulationModeNV                  coverageModulationMode)
+ {
++   VK_FROM_HANDLE(vk_command_buffer, cmd, commandBuffer);
++   struct vk_dynamic_graphics_state *dyn = &cmd->dynamic_graphics_state;
++
++   SET_DYN_VALUE(dyn, MS_COVERAGE_MODULATION_MODE,
++                 ms.coverage_modulation_mode, coverageModulationMode);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -3482,6 +3533,12 @@ vk_common_CmdSetCoverageModulationTableEnableNV(
+     VkCommandBuffer                             commandBuffer,
+     VkBool32                                    coverageModulationTableEnable)
+ {
++   VK_FROM_HANDLE(vk_command_buffer, cmd, commandBuffer);
++   struct vk_dynamic_graphics_state *dyn = &cmd->dynamic_graphics_state;
++
++   SET_DYN_BOOL(dyn, MS_COVERAGE_MODULATION_TABLE_ENABLE,
++                ms.coverage_modulation_table_enable,
++                coverageModulationTableEnable);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -3490,6 +3547,20 @@ vk_common_CmdSetCoverageModulationTableNV(
+     uint32_t                                    coverageModulationTableCount,
+     const float*                                pCoverageModulationTable)
+ {
++   VK_FROM_HANDLE(vk_command_buffer, cmd, commandBuffer);
++   struct vk_dynamic_graphics_state *dyn = &cmd->dynamic_graphics_state;
++
++   assert(coverageModulationTableCount <= MESA_VK_MAX_SAMPLES);
++   const uint32_t count = MIN2(coverageModulationTableCount,
++                               MESA_VK_MAX_SAMPLES);
++
++   float table[MESA_VK_MAX_SAMPLES] = { 0 };
++   typed_memcpy(table, pCoverageModulationTable, count);
++
++   SET_DYN_VALUE(dyn, MS_COVERAGE_MODULATION_TABLE,
++                 ms.coverage_modulation_table_count, count);
++   SET_DYN_ARRAY(dyn, MS_COVERAGE_MODULATION_TABLE,
++                 ms.coverage_modulation_table, 0, MESA_VK_MAX_SAMPLES, table);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -3562,6 +3633,9 @@ vk_dynamic_graphic_state_to_str(enum mesa_vk_dynamic_graphics_state state)
+       NAME(MS_ALPHA_TO_ONE_ENABLE);
+       NAME(MS_SAMPLE_LOCATIONS_ENABLE);
+       NAME(MS_SAMPLE_LOCATIONS);
++      NAME(MS_COVERAGE_MODULATION_MODE);
++      NAME(MS_COVERAGE_MODULATION_TABLE_ENABLE);
++      NAME(MS_COVERAGE_MODULATION_TABLE);
+       NAME(DS_DEPTH_TEST_ENABLE);
+       NAME(DS_DEPTH_WRITE_ENABLE);
+       NAME(DS_DEPTH_COMPARE_OP);
+diff --git a/src/vulkan/runtime/vk_graphics_state.h b/src/vulkan/runtime/vk_graphics_state.h
+index 1db6dd53..eb20a5f2 100644
+--- a/src/vulkan/runtime/vk_graphics_state.h
++++ b/src/vulkan/runtime/vk_graphics_state.h
+@@ -87,6 +87,9 @@ enum mesa_vk_dynamic_graphics_state {
+    MESA_VK_DYNAMIC_MS_ALPHA_TO_ONE_ENABLE,
+    MESA_VK_DYNAMIC_MS_SAMPLE_LOCATIONS_ENABLE,
+    MESA_VK_DYNAMIC_MS_SAMPLE_LOCATIONS,
++   MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE,
++   MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE_ENABLE,
++   MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE,
+    MESA_VK_DYNAMIC_DS_DEPTH_TEST_ENABLE,
+    MESA_VK_DYNAMIC_DS_DEPTH_WRITE_ENABLE,
+    MESA_VK_DYNAMIC_DS_DEPTH_COMPARE_OP,
+@@ -495,6 +498,18 @@ struct vk_multisample_state {
+     * May be NULL for dynamic sample locations.
+     */
+    const struct vk_sample_locations_state *sample_locations;
++
++   /** VkPipelineCoverageModulationStateCreateInfoNV::coverageModulationMode */
++   VkCoverageModulationModeNV coverage_modulation_mode;
++
++   /** VkPipelineCoverageModulationStateCreateInfoNV::coverageModulationTableEnable */
++   bool coverage_modulation_table_enable;
++
++   /** VkPipelineCoverageModulationStateCreateInfoNV::coverageModulationTableCount */
++   uint32_t coverage_modulation_table_count;
++
++   /** VkPipelineCoverageModulationStateCreateInfoNV::pCoverageModulationTable */
++   float coverage_modulation_table[MESA_VK_MAX_SAMPLES];
+ };
+ 
+ /** Represents the stencil test state for a face */
+@@ -957,6 +972,31 @@ struct vk_dynamic_graphics_state {
+        * MESA_VK_DYNAMIC_MS_SAMPLE_LOCATIONS
+        */
+       struct vk_sample_locations_state *sample_locations;
++
++      /** Coverage modulation mode (VK_NV_framebuffer_mixed_samples)
++       *
++       * MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE
++       */
++      VkCoverageModulationModeNV coverage_modulation_mode;
++
++      /** Coverage modulation table enable
++       *
++       * MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE_ENABLE
++       */
++      bool coverage_modulation_table_enable;
++
++      /** Coverage modulation table entry count
++       *
++       * MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE
++       */
++      uint32_t coverage_modulation_table_count;
++
++      /** Coverage modulation table, indexed by the number of covered
++       * raster samples associated with a color sample minus one
++       *
++       * MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE
++       */
++      float coverage_modulation_table[MESA_VK_MAX_SAMPLES];
+    } ms;
+ 
+    /** Depth stencil state */

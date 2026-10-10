@@ -10,7 +10,7 @@
 //!   the runtime already validated against `PlaneSlice`, so the 10.x/11.0
 //!   readers are forwarded the same pointer.
 //! * `D3DWDDM2_0DDI_RASTERIZER_DESC` appends `ConservativeRasterizationMode` to
-//!   the 11.1 desc (the shared reader already ignores `ForcedSampleCount`).
+//!   the 11.1 desc; `ForcedSampleCount` is forwarded like the 11.1 reader does.
 //!   Conservative rasterization is not advertised, so the mode is always OFF.
 //! * `D3DWDDM2_0DDIARG_CREATEQUERY` appends `ContextType`. One context.
 //! * `PFND3DWDDM2_0DDI_FLUSH` adds a context-type argument. One context.
@@ -84,7 +84,7 @@ pub(crate) unsafe extern "system" fn create_rasterizer_state_wddm2_0(
     h: Hdevice,
     d: *const ddi::D3DWDDM2_0DDI_RASTERIZER_DESC,
     h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
-    hrt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
+    _hrt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
 ) {
     if !d.is_null() && (*d).ConservativeRasterizationMode != 0 {
         if WDDM2_LOG_COUNT.first_n(16).is_some() {
@@ -94,7 +94,12 @@ pub(crate) unsafe extern "system" fn create_rasterizer_state_wddm2_0(
             );
         }
     }
-    create_rasterizer_state(h, d.cast(), h_rs, hrt)
+    let forced = if d.is_null() {
+        0
+    } else {
+        (*d).ForcedSampleCount
+    };
+    create_rasterizer_state_forced(h, d.cast(), forced, h_rs)
 }
 
 pub(crate) unsafe extern "system" fn calc_size_query_wddm2_0(
