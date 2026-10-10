@@ -250,7 +250,7 @@ impl Frontend {
         match unsafe { self.q.push(extra, fill, f) } {
             Ok(pos) => pos,
             // Only after shutdown (the device is being destroyed); the closure
-            // is dropped unrun, which for every record here releases nothing.
+            // is dropped unrun (a discard token releases its slice on drop).
             Err(_) => 0,
         }
     }
@@ -1144,6 +1144,32 @@ unsafe fn write_mapped(mapped: *mut ddi::D3D10DDI_MAPPED_SUBRESOURCE, data: usiz
     }
 }
 
+/// A discarded slice on its way to the worker. `emit` hands it to DXVK in
+/// replay order; a record dropped unrun (queue already shut down) releases it.
+struct DiscardSlice {
+    h: Hdevice,
+    buffer: usize,
+    slice: usize,
+}
+
+impl DiscardSlice {
+    unsafe fn emit(self) {
+        let this = core::mem::ManuallyDrop::new(self);
+        if let Some(dev) = unsafe { helios_device(this.h) } {
+            unsafe { dev.dxvk.fe_emit_invalidate(this.buffer, this.slice) };
+        }
+    }
+}
+
+impl Drop for DiscardSlice {
+    fn drop(&mut self) {
+        // SAFETY: the token was never consumed by `emit`.
+        if let Some(dev) = unsafe { helios_device(self.h) } {
+            unsafe { dev.dxvk.fe_release_slice(self.slice) };
+        }
+    }
+}
+
 /// The dynamic-map slots (`Dynamic{ConstantBuffer,IABuffer,Resource}Map*`):
 /// a dynamic buffer's DISCARD / NO_OVERWRITE map is answered on the app
 /// thread; everything else is synchronous.
@@ -1173,10 +1199,9 @@ unsafe extern "system" fn fe_map_dynamic(
                             fe.stats.split_discard.fetch_add(1, Ordering::Relaxed);
                             write_mapped(mapped, data, bytes);
                             let out = fe.discard_bytes.fetch_add(u64::from(bytes), Ordering::Relaxed) + u64::from(bytes);
+                            let token = DiscardSlice { h, buffer, slice };
                             fe.record0(move |_| {
-                                if let Some(dev) = helios_device(h) {
-                                    dev.dxvk.fe_emit_invalidate(buffer, slice);
-                                }
+                                token.emit();
                                 if let Some(fe) = fe_of(h) {
                                     fe.discard_bytes.fetch_sub(u64::from(bytes), Ordering::Relaxed);
                                 }
