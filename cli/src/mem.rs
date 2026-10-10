@@ -42,6 +42,67 @@ pub fn resident_mib(pid: i32) -> Option<u64> {
     Some(f("RssAnon") + f("RssShmem"))
 }
 
+/// How a running VM's guest RAM is backed on the host, in MiB: from the VMM's
+/// `/proc/PID/status` (`RssShmem`) and `/proc/PID/smaps_rollup`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GuestPages {
+    /// Shared memory resident in the VMM (the guest RAM memfd, mostly).
+    pub shmem_mib: u64,
+    /// Of it, mapped with 2 MiB pages (`ShmemPmdMapped`): only those can be
+    /// 2 MiB pages in the guest's nested page tables too.
+    pub pmd_mib: u64,
+    /// Reserved huge pages (`Shared_Hugetlb` + `Private_Hugetlb`).
+    pub hugetlb_mib: u64,
+    /// Swapped out (`Swap`).
+    pub swap_mib: u64,
+}
+
+/// [`GuestPages`] from the two files' text.
+pub fn parse_guest_pages(status: &str, rollup: &str) -> GuestPages {
+    let f = |t: &str, k| meminfo_field(t, k).unwrap_or(0);
+    GuestPages {
+        shmem_mib: f(status, "RssShmem"),
+        pmd_mib: f(rollup, "ShmemPmdMapped"),
+        hugetlb_mib: f(rollup, "Shared_Hugetlb") + f(rollup, "Private_Hugetlb"),
+        swap_mib: f(rollup, "Swap"),
+    }
+}
+
+/// [`GuestPages`] of the VMM `pid`.
+pub fn guest_pages(pid: i32) -> Option<GuestPages> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    Some(parse_guest_pages(&status, &rollup))
+}
+
+/// Whether the backing is worth a warning, and what to say. Guest RAM on
+/// 4 KiB host pages makes every guest TLB miss a two-level walk through 4 KiB
+/// nested tables: measured on the reference host, a CPU-bound game's render
+/// thread spent its time on cold loads with the whole 16 GiB on 4 KiB pages
+/// (KVM `pages_2m` 0). Swapped guest RAM stalls the guest outright.
+pub fn guest_pages_verdict(p: &GuestPages) -> (bool, String) {
+    let swap = if p.swap_mib >= 256 {
+        format!(", {} MiB swapped out", p.swap_mib)
+    } else {
+        String::new()
+    };
+    if p.hugetlb_mib > 0 {
+        return (
+            !swap.is_empty(),
+            format!("{} MiB on reserved huge pages{swap}", p.hugetlb_mib),
+        );
+    }
+    let total = p.shmem_mib.max(1);
+    let pct = p.pmd_mib.min(total) * 100 / total;
+    (
+        pct < 50 || !swap.is_empty(),
+        format!(
+            "{pct}% of {} MiB on 2 MiB pages, the rest on 4 KiB{swap}",
+            p.shmem_mib
+        ),
+    )
+}
+
 /// What the check decided, for the message.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Budget {
@@ -112,6 +173,46 @@ mod tests {
         assert_eq!(meminfo_field(t, "MemAvailable"), Some(8192));
         assert_eq!(meminfo_field(t, "MemTotal"), Some(64000));
         assert_eq!(meminfo_field(t, "Mem"), None);
+    }
+
+    #[test]
+    fn guest_pages_read_the_vmm_and_warn_on_small_pages() {
+        let status = "Name:\tqemu\nRssShmem:\t15863532 kB\n";
+        let rollup = "Rss:  15863532 kB\nShmemPmdMapped:        0 kB\n\
+                      Shared_Hugetlb:        0 kB\nPrivate_Hugetlb:        0 kB\n\
+                      Swap:            1304456 kB\n";
+        let p = parse_guest_pages(status, rollup);
+        assert_eq!(
+            p,
+            GuestPages {
+                shmem_mib: 15491,
+                pmd_mib: 0,
+                hugetlb_mib: 0,
+                swap_mib: 1273,
+            }
+        );
+        let (warn, text) = guest_pages_verdict(&p);
+        assert!(warn);
+        assert_eq!(
+            text,
+            "0% of 15491 MiB on 2 MiB pages, the rest on 4 KiB, 1273 MiB swapped out"
+        );
+        // Mostly on 2 MiB pages, nothing swapped: fine.
+        let thp = GuestPages {
+            shmem_mib: 16384,
+            pmd_mib: 15000,
+            ..Default::default()
+        };
+        assert!(!guest_pages_verdict(&thp).0);
+        // Reserved huge pages.
+        let huge = GuestPages {
+            hugetlb_mib: 16384,
+            ..Default::default()
+        };
+        assert_eq!(
+            guest_pages_verdict(&huge),
+            (false, "16384 MiB on reserved huge pages".to_string())
+        );
     }
 
     #[test]
