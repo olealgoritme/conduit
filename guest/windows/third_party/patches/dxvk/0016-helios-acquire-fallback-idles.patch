@@ -4,22 +4,43 @@ Conduit guest/windows. Applied after 0015 by ci/windows/Build-Driver.ps1.
 
 The signaler thread starts on the first armed gate and runs until the device
 is destroyed. Without a retirement event it polls the read ledger every 1 ms
-holding timeBeginPeriod(1), also when no gate is armed, so a refused device
-that armed once keeps the process at a 1 ms timer period and 1000 wakeups/s
-for as long as it lives.
+holding timeBeginPeriod(1). After about 100 ms of polls with no gate armed it
+polls every 10 ms and gives the 1 ms period back; armFence wakes it, and the
+next armed gate polls at 1 ms again. A gate counts as armed while its highest
+armed value is above the value last signaled: released gates stay in the map
+until their claim leaves the ledger, so a non-empty map is not "armed". winmm
+is resolved once per thread instead of on every timeBeginPeriod.
 
-After about 100 ms of polls with no gate armed it now polls every 10 ms and
-gives the 1 ms period back; armFence wakes it, and the next armed gate polls
-at 1 ms again. winmm is resolved once per thread instead of on every
-timeBeginPeriod. The event path is unchanged.
+armFence re-reads the gate's ledger claim under the signaler mutex and
+signals what has retired since the caller sampled the ledger. Without that, a
+retirement broadcast between the caller's sample and the gate's creation woke
+a signaler pass that had nothing to release yet, and the gate waited for the
+next wake (the 10 ms event timeout). The event path is otherwise unchanged.
 
 diff --git a/src/dxvk/dxvk_helios_scanout_acquire.cpp b/src/dxvk/dxvk_helios_scanout_acquire.cpp
-index 3d97d967..bb871305 100644
+index 3d97d967..2241593b 100644
 --- a/src/dxvk/dxvk_helios_scanout_acquire.cpp
 +++ b/src/dxvk/dxvk_helios_scanout_acquire.cpp
-@@ -296,6 +296,9 @@ namespace dxvk {
+@@ -295,7 +295,26 @@ namespace dxvk {
+       gate.armTime = high_resolution_clock::now();
      }
  
++    // The caller sampled the ledger before taking this mutex. A read that
++    // retired since then has already been broadcast, possibly to a signaler
++    // pass that ran before this gate existed and found nothing to release; the
++    // next wake would then be the 10 ms timeout. Re-read this claim here, under
++    // the same mutex processRetirements holds, and signal what has retired
++    // now. A vanished claim (or one re-claimed under a new generation) means
++    // every read retired, exactly as in processRetirements.
++    uint64_t nowGeneration = 0u, nowIssued = 0u, nowRetired = 0u;
++    const uint64_t target = helios_acquire::ledgerLookupV2(resid, &nowGeneration, &nowIssued, &nowRetired)
++                         && nowGeneration == generation
++      ? nowRetired
++      : gate.highestArmed;
++
++    if (target > gate.lastSignaled)
++      signalGateLocked(generation, gate, target);
++
      startThreadLocked();
 +    // An idle fallback signaler sleeps up to 10 ms; wake it so this gate is
 +    // polled at 1 ms from the start. No waiter on the event path: a no-op.
@@ -27,7 +48,7 @@ index 3d97d967..bb871305 100644
      return gate.fence;
    }
  
-@@ -357,9 +360,10 @@ namespace dxvk {
+@@ -357,9 +376,10 @@ namespace dxvk {
      /* The no-event fallback polls every 1 ms. Without a raised timer
       * resolution a 1 ms wait rounds up to the system tick (up to 15.6 ms), so
       * the fallback holds a 1 ms period for as long as it polls and gives it
@@ -41,7 +62,7 @@ index 3d97d967..bb871305 100644
      class HeliosFineTimer {
        using PfnPeriod = UINT (WINAPI*)(UINT);
  
-@@ -368,15 +372,18 @@ namespace dxvk {
+@@ -368,15 +388,18 @@ namespace dxvk {
          if (m_on)
            return;
  
@@ -67,7 +88,7 @@ index 3d97d967..bb871305 100644
  
          m_on = m_begin && m_end && m_begin(1u) == 0u;
        }
-@@ -396,6 +403,7 @@ namespace dxvk {
+@@ -396,6 +419,7 @@ namespace dxvk {
        PfnPeriod m_begin = nullptr;
        PfnPeriod m_end   = nullptr;
        bool      m_on    = false;
@@ -75,7 +96,7 @@ index 3d97d967..bb871305 100644
      };
    }
  #endif
-@@ -408,6 +416,9 @@ namespace dxvk {
+@@ -408,6 +432,9 @@ namespace dxvk {
      HeliosFineTimer fineTimer;
  #endif
  
@@ -85,14 +106,27 @@ index 3d97d967..bb871305 100644
      while (true) {
        HANDLE event = nullptr;
  
-@@ -425,11 +436,20 @@ namespace dxvk {
+@@ -425,11 +452,33 @@ namespace dxvk {
            // No registered retirement event (KMD table full, old KMD mid-skew,
            // or not delivered yet): pure level-triggered polling, every 1 ms.
            // The ledger is the truth either way; the event is only a latency
 -          // optimization.
 +          // optimization. After ~100 ms with nothing armed the signaler idles
 +          // at 10 ms and gives the 1 ms timer period back; armFence wakes it.
-+          if (!m_gates.empty())
++          // Armed = a gate still waits for a retirement. Released gates stay in
++          // m_gates until their claim vanishes from the ledger (possibly
++          // never, for a buffer that stays claimed), so the map being
++          // non-empty says nothing about whether polling is needed.
++          bool armed = false;
++
++          for (const auto& entry : m_gates) {
++            if (entry.second.highestArmed > entry.second.lastSignaled) {
++              armed = true;
++              break;
++            }
++          }
++
++          if (armed)
 +            idlePolls = 0u;
 +          else if (idlePolls <= 100u)
 +            idlePolls++;

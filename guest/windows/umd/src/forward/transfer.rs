@@ -308,6 +308,7 @@ pub(crate) unsafe extern "system" fn flush(h: Hdevice) {
         context.Flush();
         super::present::present_timing::ddi_flush_gate(|| flush_gate(h, &context));
     }
+    super::present::retry_scanout_event(h);
 }
 
 static FLUSH_GATE_SENT: [AtomicUsize; 3] =
@@ -622,15 +623,19 @@ pub(crate) fn keyed_flush_wait_forced() -> bool {
     })
 }
 
-/// Wait on the CPU until every command `dev` submitted so far has completed on the GPU: an event
-/// query issued now signals when all earlier work is done (DXVK tracks it with the submission's
-/// fence; on NVK an RM semaphore). `None` when no query could be made. `what` names the caller in
-/// the log.
+/// Wait on the CPU until every command `dev` recorded so far has completed on the GPU. An event
+/// query ended on the immediate context makes the next flush non-empty, which also submits work
+/// the device recorded outside the context's command stream (D3D11 resource initialization, which
+/// an empty flush would skip). `flush_present_copy` then flushes and names that submission, and
+/// the wait sleeps on DXVK's submission-fence condition variable, which the queue's completion
+/// thread wakes (`wait_present_copy`), bounded at 5 s: no polling. `None` when no query could be
+/// made or the wait failed (device lost). `what` names the caller in the log.
 pub(crate) unsafe fn wait_submitted(
     dev: &crate::device_funcs::HeliosDevice,
     context: &ID3D11DeviceContext,
     what: &str,
 ) -> Option<std::time::Instant> {
+    const TIMEOUT_US: u32 = 5_000_000;
     let device = dev.dxvk.d3d11_device()?;
     let desc = windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC {
         Query: windows::Win32::Graphics::Direct3D11::D3D11_QUERY_EVENT,
@@ -641,31 +646,20 @@ pub(crate) unsafe fn wait_submitted(
         return None;
     }
     let query = query?;
-    context.End(&query);
     let start = std::time::Instant::now();
-    let mut done: windows::Win32::Foundation::BOOL = Default::default();
-    loop {
-        // Raw HRESULT: S_FALSE (not yet) must not read as success. Flags 0
-        // flushes, so the query itself is submitted.
-        let hr = (Interface::vtable(context).GetData)(
-            Interface::as_raw(context),
-            Interface::as_raw(&query),
-            (&mut done as *mut windows::Win32::Foundation::BOOL).cast(),
-            core::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32,
-            0,
-        );
-        if hr.0 == 0 && done.as_bool() {
-            break;
+    context.End(&query);
+    let submission = dev.dxvk.flush_present_copy();
+    if submission == 0 {
+        log_error!("DDI NVK {what}: flush failed (device lost?)");
+        return None;
+    }
+    match dev.dxvk.wait_present_copy(submission, TIMEOUT_US) {
+        0 => {}
+        1 => log_error!("DDI NVK {what}: GPU not done after 5 s, going on"),
+        r => {
+            log_error!("DDI NVK {what}: submission wait failed ({r})");
+            return None;
         }
-        if hr.0 < 0 {
-            log_error!("DDI NVK {what}: GetData 0x{:08x}", hr.0 as u32);
-            break;
-        }
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            log_error!("DDI NVK {what}: GPU not done after 5 s, going on");
-            break;
-        }
-        std::thread::yield_now();
     }
     Some(start)
 }

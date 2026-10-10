@@ -1362,8 +1362,13 @@ pub fn resource_flush_async(
     reap_parked(passive, adapter);
     let request = bytes_of(&cmd);
     let response_len = size_of::<VirtioGpuCtrlHdr>();
-    let mut meta =
-        DmaBuffer::new(passive, request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
+    let Some(mut meta) = DmaBuffer::new(passive, request.len() + response_len) else {
+        // The token retires its ledger read in `Drop`; outside `with_virtio`, so
+        // broadcast here instead of at the next transport-lock exit.
+        drop(scanout_flush);
+        adapter.read_ledger.flush_broadcast();
+        return Err(VirtioError::OutOfMemory);
+    };
     meta.as_mut_slice()[..request.len()].copy_from_slice(request);
 
     let queued = adapter.with_virtio(move |v| {

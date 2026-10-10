@@ -1,8 +1,8 @@
 //! D4a scanout-read acquire — the UMD half (FIX-DESIGN-d4a.md §4).
 //!
 //! The KMD keeps a generation-qualified READ LEDGER (one nonpaged page:
-//! `resid`, `generation`, `issued`, and `retired`) and signals a
-//! registered auto-reset event on every retirement. This module is the UMD's
+//! `resid`, `generation`, `issued`, and `retired`) and signals every
+//! registered auto-reset event after retirements. This module is the UMD's
 //! plumbing for that contract:
 //!
 //!   * probe the capability once per process (`HELIOS_ESCAPE_MAP_READ_LEDGER`
@@ -13,7 +13,10 @@
 //!     shape that is correct under every owner-reclaim implementation);
 //!   * create + register one auto-reset event per device
 //!     (`HELIOS_ESCAPE_SCANOUT_EVENT` op REGISTER) and hand it to the DXVK
-//!     engine's per-device signaler thread through the bridge;
+//!     engine's per-device signaler thread through the bridge. A refused
+//!     event is closed and DXVK gets none (it then polls the ledger at 1 ms);
+//!     the device asks again on its presents and flushes
+//!     ([`retry_register`], `helios_umd_common::scanout_event`);
 //!   * export the reader surface (`helios_scanout_*`) the statically linked
 //!     DXVK engine resolves BY NAME from this DLL (dxvk-helios/src/dxvk/
 //!     dxvk_helios_scanout_acquire.cpp) — by-name rather than a link-time
@@ -43,6 +46,8 @@
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+use helios_umd_common::scanout_event::{handoff, RetrySchedule};
 
 use helios_protocol::{
     HeliosEscapeSnapshotStatus, HELIOS_ESCAPE_SNAPSHOT_STATUS, HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS,
@@ -165,12 +170,89 @@ struct DeviceEntry {
     /// KMD-view table (only meaningful with `ledger_va != 0`). Once the epoch
     /// moves the KMD is gone and the view is zeros, so readers skip it.
     loss_epoch: i32,
-    /// Owned auto-reset event handle (0 = creation failed).
+    /// Owned auto-reset event handle the KMD accepted (0 = none: creation
+    /// failed or REGISTER was refused; the DXVK signaler then polls the
+    /// ledger every 1 ms while a gate is armed). Nonzero means registered.
     event: usize,
-    /// Whether the KMD accepted the REGISTER (TABLE_FULL leaves the event
-    /// alive but unsignaled — the DXVK signaler then runs on its 10 ms
-    /// level-triggered timeout alone, which is correct, just slower).
-    event_registered: bool,
+    /// Set while a refused registration waits for its next attempt (only for
+    /// a device with a live ledger mapping). Counted in [`RETRY_PENDING`].
+    retry: Option<RetrySchedule>,
+}
+
+/// Registry entries with `retry` set: the present/flush hook's one relaxed
+/// load ([`retry_register`]) skips the registry while this is 0.
+static RETRY_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// The earliest `retry` due time of any entry ([`now_ms`] clock), so the hook
+/// takes the registry mutex only when some retry is due, not on every
+/// present while one waits. Lowered on every new schedule; a stale low value
+/// only costs one lock that finds nothing due.
+static RETRY_NEXT_DUE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn note_retry_due(due_ms: u64) {
+    RETRY_NEXT_DUE_MS.fetch_min(due_ms, Ordering::Relaxed);
+}
+
+/// Milliseconds since the first call (the retry clock).
+fn now_ms() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Create an auto-reset event, REGISTER it, and keep it only if the KMD
+/// accepted it. Returns the registered handle, 0 when refused (the refused
+/// handle is closed here: an unsignaled event handed to DXVK would put its
+/// signaler on the 10 ms timeout instead of the 1 ms poll).
+///
+/// # Safety
+/// Same contract as [`call_escape`].
+unsafe fn create_and_register(
+    kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
+    rt_adapter: usize,
+    h_rt_device: usize,
+    attempt: &str,
+) -> usize {
+    // Auto-reset: the signaler is level-triggered, every wake re-reads the
+    // ledger, so a lost or coalesced signal is a bounded hiccup, never a hang.
+    // SAFETY: plain kernel32 call; all-null/0 arguments are the documented
+    // anonymous auto-reset unsignaled shape.
+    let event = unsafe { CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null()) } as usize;
+    if event == 0 {
+        log_error!("scanout-acquire: CreateEventW failed ({attempt}) — signaler polls the ledger every 1 ms");
+        return 0;
+    }
+    // SAFETY: the caller's contract; `event` is a live handle in this process.
+    let reply = unsafe {
+        escape_scanout_event(
+            kt_callbacks,
+            rt_adapter,
+            h_rt_device,
+            HELIOS_SCANOUT_ACQ_OP_REGISTER,
+            event,
+        )
+    };
+    let decision = handoff(reply, HELIOS_SCANOUT_ACQ_OK, event);
+    if let Some(closed) = decision.to_close() {
+        match reply {
+            Ok(HELIOS_SCANOUT_ACQ_TABLE_FULL) => log_error!(
+                "scanout-acquire: event REGISTER refused, table full ({attempt}; counted AqRgF) — \
+                 signaler polls the ledger every 1 ms, REGISTER retried on present/flush"
+            ),
+            Ok(state) => log_error!(
+                "scanout-acquire: event REGISTER answered out_state={state} ({attempt}) — \
+                 signaler polls the ledger every 1 ms, REGISTER retried on present/flush"
+            ),
+            Err(hr) => log_error!(
+                "scanout-acquire: event REGISTER escape failed hr=0x{:08x} ({attempt}) — \
+                 signaler polls the ledger every 1 ms, REGISTER retried on present/flush",
+                hr as u32
+            ),
+        }
+        // SAFETY: created above, never shared: the KMD refused it (it took
+        // no reference) and nothing else has seen the handle.
+        unsafe { CloseHandle(closed as *mut core::ffi::c_void) };
+    }
+    decision.delivered()
 }
 
 static REGISTRY: Mutex<Vec<DeviceEntry>> = Mutex::new(Vec::new());
@@ -395,7 +477,9 @@ fn recompute_enabled(entries: &[DeviceEntry]) {
 /// "feature off for this device", counted and logged once.
 ///
 /// Returns the registered auto-reset event handle to hand to the DXVK device's
-/// signaler (0 = none; the signaler then polls on its 10 ms timeout).
+/// signaler (0 = none: creation failed or the KMD refused it; the signaler
+/// then polls the ledger every 1 ms while a gate is armed, and the device
+/// retries the REGISTER on present/flush).
 pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
     if !crate::scanout_acquire_knob() {
         // Kill switch: no escapes, no event, no mapping — bit-identical off.
@@ -558,45 +642,15 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
         }
     };
 
-    // Create + register the per-device retirement event (auto-reset: the
-    // signaler is level-triggered, every wake re-reads the ledger, so a lost
-    // or coalesced signal is a bounded hiccup, never a hang).
-    // SAFETY: plain kernel32 call; all-null/0 arguments are the documented
-    // anonymous auto-reset unsignaled shape.
-    let event = unsafe { CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null()) } as usize;
-    let mut event_registered = false;
-    if event != 0 {
-        // SAFETY: as for the map call; `event` is a live handle in this process.
-        match unsafe {
-            escape_scanout_event(
-                kt_callbacks,
-                rt_adapter,
-                h_rt_device,
-                HELIOS_SCANOUT_ACQ_OP_REGISTER,
-                event,
-            )
-        } {
-            Ok(HELIOS_SCANOUT_ACQ_OK) => event_registered = true,
-            Ok(HELIOS_SCANOUT_ACQ_TABLE_FULL) => {
-                // Counted KMD-side (AqRgF). The signaler runs timeout-only —
-                // correct, just up to 1 ms later per retirement (the DXVK
-                // signaler polls every 1 ms without an event).
-                log_error!(
-                    "scanout-acquire: event table FULL — signaler falls back to 1 ms polling"
-                );
-            }
-            Ok(state) => {
-                log_error!("scanout-acquire: event REGISTER answered out_state={state}");
-            }
-            Err(hr) => {
-                log_error!(
-                    "scanout-acquire: event REGISTER escape failed hr=0x{:08x}",
-                    hr as u32
-                );
-            }
-        }
-    } else {
-        log_error!("scanout-acquire: CreateEventW failed — signaler falls back to 1 ms polling");
+    // Create + register the per-device retirement event. Refused: no event
+    // for DXVK (1 ms ledger polling) and a retry on later presents/flushes,
+    // for a device whose ledger is mapped (without it nothing is ever armed).
+    // SAFETY: as for the map call.
+    let event = unsafe { create_and_register(kt_callbacks, rt_adapter, h_rt_device, "device init") };
+    let retry = (event == 0 && ledger_va != 0).then(|| RetrySchedule::refused_at(now_ms()));
+    if let Some(r) = retry {
+        RETRY_PENDING.fetch_add(1, Ordering::Relaxed);
+        note_retry_due(r.due_ms());
     }
 
     reg.push(DeviceEntry {
@@ -607,18 +661,96 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
         ledger_va,
         loss_epoch,
         event,
-        event_registered,
+        retry,
     });
     recompute_enabled(&reg);
     log_error!(
-        "scanout-acquire: device wired (ledger={} event={} registered={} devices={})",
+        "scanout-acquire: device wired (ledger={} event_registered={} retry={} devices={})",
         (ledger_va != 0) as u32,
         (event != 0) as u32,
-        event_registered as u32,
+        retry.is_some() as u32,
         reg.len()
     );
 
     event
+}
+
+/// Present/flush hook: a device whose REGISTER was refused asks again once its
+/// [`RetrySchedule`] is due, and hands an accepted event to its DXVK signaler
+/// (which then leaves the 1 ms poll for the event). One relaxed load while no
+/// device in the process waits for a retry.
+pub(crate) fn retry_register(dev: &HeliosDevice) {
+    if RETRY_PENDING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let now = now_ms();
+    if now < RETRY_NEXT_DUE_MS.load(Ordering::Relaxed) {
+        return;
+    }
+    let key = dev as *const HeliosDevice as usize;
+    // Pick the attempt under the lock, run the escape outside it (the DXVK
+    // signaler reads the ledger through this mutex every poll), store the
+    // outcome under it again. Only this device's own DDI touches its entry,
+    // and DestroyDevice cannot run concurrently with it.
+    let (kt_callbacks, rt_adapter, h_rt_device) = {
+        let Ok(mut reg) = REGISTRY.lock() else {
+            return;
+        };
+        let picked = match reg.iter_mut().find(|e| e.key == key) {
+            Some(e) => match e.retry.as_mut() {
+                Some(r) if r.due(now) => {
+                    // Not due again until this attempt's outcome reschedules it.
+                    r.refused_again(now);
+                    Some((e.kt_callbacks, e.rt_adapter, e.h_rt_device))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        // The earliest due time of the entries that still wait, after the
+        // reschedule above, and never sooner than one retry interval: a due
+        // device that does not present (an idle one in a multi-device process)
+        // must not send every other device's present through this mutex.
+        let next = reg.iter().filter_map(|e| e.retry.map(|r| r.due_ms())).min().unwrap_or(u64::MAX);
+        RETRY_NEXT_DUE_MS.store(next.max(now + RetrySchedule::FIRST_MS), Ordering::Relaxed);
+        let Some(picked) = picked else {
+            return;
+        };
+        picked
+    };
+    // SAFETY: the callback table and handles belong to this live device (its
+    // DDI is running); teardown removes the entry only inside DestroyDevice.
+    let event = unsafe {
+        create_and_register(
+            kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS,
+            rt_adapter,
+            h_rt_device,
+            "retry",
+        )
+    };
+    {
+        let Ok(mut reg) = REGISTRY.lock() else {
+            return;
+        };
+        let Some(e) = reg.iter_mut().find(|e| e.key == key) else {
+            return;
+        };
+        if event == 0 {
+            // Rescheduled above (backed off); publish its due time.
+            if let Some(r) = e.retry {
+                note_retry_due(r.due_ms());
+            }
+            return;
+        }
+        e.event = event;
+        e.retry = None;
+        RETRY_PENDING.fetch_sub(1, Ordering::Relaxed);
+    }
+    // Outside the registry lock: the DXVK signaler takes its own mutex and
+    // then this registry (`processRetirements`, `armFence`), never the reverse.
+    if dev.dxvk.set_scanout_acquire_event(event) {
+        log_error!("scanout-acquire: event REGISTER accepted on retry — signaler leaves 1 ms polling");
+    }
 }
 
 /// Tear one device out of the acquire machinery. Called from
@@ -643,27 +775,29 @@ pub(crate) fn teardown_for_device(key: usize) {
     // Escapes + CloseHandle outside the lock: no reader can reach the entry
     // any more, and the KMD side is keyed by our h_rt_device owner identity.
     let kt_callbacks = entry.kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS;
+    if entry.retry.is_some() {
+        RETRY_PENDING.fetch_sub(1, Ordering::Relaxed);
+    }
     if entry.event != 0 {
-        if entry.event_registered {
-            // SAFETY: the callback table stays valid for the whole
-            // DestroyDevice DDI, which is where this runs.
-            let unregistered = unsafe {
-                escape_scanout_event(
-                    kt_callbacks,
-                    entry.rt_adapter,
-                    entry.h_rt_device,
-                    HELIOS_SCANOUT_ACQ_OP_UNREGISTER,
-                    entry.event,
-                )
-            };
-            if let Err(hr) = unregistered {
-                // The KMD's owner-keyed reclaim in destroy_device is the
-                // backstop; the failure is logged, not fatal.
-                log_error!(
-                    "scanout-acquire: event UNREGISTER failed hr=0x{:08x} (KMD owner reclaim is the backstop)",
-                    hr as u32
-                );
-            }
+        // A nonzero event is a registered one.
+        // SAFETY: the callback table stays valid for the whole DestroyDevice
+        // DDI, which is where this runs.
+        let unregistered = unsafe {
+            escape_scanout_event(
+                kt_callbacks,
+                entry.rt_adapter,
+                entry.h_rt_device,
+                HELIOS_SCANOUT_ACQ_OP_UNREGISTER,
+                entry.event,
+            )
+        };
+        if let Err(hr) = unregistered {
+            // The KMD's owner-keyed reclaim in destroy_device is the
+            // backstop; the failure is logged, not fatal.
+            log_error!(
+                "scanout-acquire: event UNREGISTER failed hr=0x{:08x} (KMD owner reclaim is the backstop)",
+                hr as u32
+            );
         }
         // SAFETY: `entry.event` is the handle this module created and owns;
         // the DXVK signaler that waited on it joined before the bridge drop

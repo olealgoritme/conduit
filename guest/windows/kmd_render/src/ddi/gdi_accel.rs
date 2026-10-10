@@ -357,6 +357,9 @@ struct Call<'a> {
     p_command: *const c_void,
     command_length: u32,
     p_dma_buffer: &'a mut *mut c_void,
+    /// The DMA buffer's GPU VA (RenderGdi), 0 for RenderKm: the job's identity for a
+    /// record-less SubmitCommandVirtual (`gdi_exec::admit_unclaimed`).
+    dma_va: u64,
     dma_size: u32,
     p_private: *mut c_void,
     private_size: u32,
@@ -379,6 +382,7 @@ pub(crate) unsafe fn render_km(h_context: HANDLE, args: &mut DXGKARG_RENDER) -> 
         p_command: args.pCommand,
         command_length: args.CommandLength,
         p_dma_buffer: &mut args.pDmaBuffer,
+        dma_va: 0,
         dma_size: args.DmaSize,
         p_private: args.pDmaBufferPrivateData,
         private_size: args.DmaBufferPrivateDataSize,
@@ -404,6 +408,7 @@ pub(crate) unsafe fn render_gdi(h_context: HANDLE, args: &mut DXGKARG_RENDERGDI)
         p_command: args.pCommand,
         command_length: args.CommandLength,
         p_dma_buffer: &mut args.pDmaBuffer,
+        dma_va: args.DmaBufferGpuVirtualAddress,
         dma_size: args.DmaSize,
         p_private: args.pDmaBufferPrivateData,
         private_size: args.DmaBufferPrivateDataSize,
@@ -547,7 +552,7 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
     // decorative GpuMmu has nothing to patch (`DxgkDdiPatch` is a no-op), the entries only keep
     // the list honest.
     // RenderGdi (GPU virtual addressing) has no patch list.
-    let Call { p_dma_buffer, p_private, private_size, patch_out, multipass, .. } = args;
+    let Call { p_dma_buffer, dma_va, p_private, private_size, patch_out, multipass, .. } = args;
     if let Some((cursor, room)) = patch_out {
         if nrefs > room as usize || (nrefs > 0 && cursor.is_null()) {
             // Nothing committed yet: dxgkrnl retries with fresh lists and the commands are parsed
@@ -585,13 +590,16 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
         0
     } else {
         let n_ops = ops.len() as u32;
-        let id = gx::commit(ops, h_context as usize);
+        let id = gx::commit(ops, h_context as usize, dma_va);
         if id == 0 {
             DROP.fetch_add(n_ops, Ordering::Relaxed);
             note_why(ga::Why::CpuFailed);
         }
         id
     };
+    // A refill of this DMA buffer: the context's unsubmitted jobs of its earlier fills are dead
+    // (also when this render committed no job).
+    gx::note_render(h_context as usize, dma_va, job);
     let rec = ga::Private { job }.encode();
     PRV_SZ.store((PRV_SZ.load(Ordering::Relaxed) & !0xffff) | private_size.min(0xffff), Ordering::Relaxed);
     if !p_private.is_null() {

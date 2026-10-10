@@ -688,9 +688,10 @@ impl ScanoutFlushToken {
     /// (host OK and host-error arms) or, if `complete` never ran, from `Drop`
     /// (enqueue failure, in-flight table teardown).
     ///
-    /// Legal at PASSIVE and at DISPATCH under `virtio_lock`: atomics, the leaf
-    /// event lock, `KeSetEvent(Wait = FALSE)` — no allocation, no registry
-    /// write, never `wddm_notify_lock`.
+    /// Legal at PASSIVE and at DISPATCH under `virtio_lock`: atomics and the
+    /// ledger's mutation leaf lock only — no allocation, no registry write,
+    /// never `wddm_notify_lock`, no event signal (the retirement marks the
+    /// ledger's broadcast latch; `with_virtio`/`set_virtio` signal on exit).
     fn retire_ledger(&mut self, via_drop: bool) {
         if self.done {
             return;

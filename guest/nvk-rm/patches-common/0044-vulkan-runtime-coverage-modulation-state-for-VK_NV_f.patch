@@ -12,8 +12,8 @@ vkCmdSetCoverageModulationModeNV, vkCmdSetCoverageModulationTableEnableNV
 and vkCmdSetCoverageModulationTableNV, which were empty stubs for
 VK_EXT_shader_object.
 
-No driver reads them yet; NVK's VK_NV_framebuffer_mixed_samples does in
-the next patch.
+No driver reads them yet; NVK's VK_NV_framebuffer_mixed_samples reads the
+mode in the next patch (it modulates linearly and does not use the table).
 ---
  src/vulkan/runtime/vk_graphics_state.c | 74 ++++++++++++++++++++++++++
  src/vulkan/runtime/vk_graphics_state.h | 40 ++++++++++++++

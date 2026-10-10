@@ -164,12 +164,13 @@ struct HeliosEscapeMapReadLedger {
 /* HELIOS_ESCAPE_SCANOUT_EVENT. 32 bytes. PASSIVE, non-blocking.
  *
  * REGISTER: event_handle is a usermode AUTO-RESET event (CreateEvent) of the calling
- * process; the KMD references it (EVENT_MODIFY_STATE, UserMode) and signals it on EVERY
- * scanout-read retirement until unregistered. PERSISTENT: a signal does not consume the
- * registration. The consumer must be level-triggered: wake on the event OR a bounded
- * timeout, re-read the ledger, act on the counters. Lost or coalesced wakeups are then a
- * bounded hiccup, never a hang. Entries are owner-tagged and reclaimed at device destroy and
- * StopDevice. UNREGISTER: same event_handle; the KMD drops the registration and its
+ * process; the KMD references it (EVENT_MODIFY_STATE, UserMode) and signals it after
+ * scanout-read retirements (several may share one signal) until unregistered. PERSISTENT: a
+ * signal does not consume the registration, and a transport reset (Stop/StartDevice) signals
+ * it without dropping it. The consumer must be level-triggered: wake on the event OR a
+ * bounded timeout, re-read the ledger, act on the counters. Lost or coalesced wakeups are
+ * then a bounded hiccup, never a hang. Entries are owner-tagged and reclaimed at device
+ * destroy; one owner holds at most two, and a refusal answers TABLE_FULL. UNREGISTER: same event_handle; the KMD drops the registration and its
  * reference and never signals it again. */
 struct HeliosEscapeScanoutEvent {
    struct HeliosEscapeHeader hdr;

@@ -60,7 +60,7 @@ pub const HELIOS_ESCAPE_QUERY_SCANOUT: u32 = 0x000D;
 /// [`HeliosEscapeMapReadLedger`] and [`HeliosReadLedgerPage`].
 pub const HELIOS_ESCAPE_MAP_READ_LEDGER: u32 = 0x000E;
 /// Register/unregister a PERSISTENT per-device usermode event the KMD signals
-/// on every scanout-read retirement (D4a scanout acquire). Unlike the one-shot
+/// after scanout-read retirements (D4a scanout acquire). Unlike the one-shot
 /// fence events (0x000B/C) this registration survives signals; the consumer is
 /// level-triggered (re-reads the ledger on every wake). See
 /// [`HeliosEscapeScanoutEvent`].
@@ -672,13 +672,15 @@ pub struct HeliosEscapeMapReadLedger {
 ///
 /// REGISTER: `event_handle` is a usermode AUTO-RESET event (CreateEvent) in
 /// the calling process; the KMD references it (ObReferenceObjectByHandle,
-/// EVENT_MODIFY_STATE, UserMode) and signals it on EVERY scanout-read
-/// retirement until unregistered. PERSISTENT: the signal does not consume the
-/// registration. The consumer must be level-triggered — wake (event OR a
-/// bounded timeout), re-read the ledger, act on counter deltas — so lost or
-/// coalesced wakeups are a bounded hiccup, never a hang. Entries are
-/// owner-tagged and reclaimed at device destroy and StopDevice (the two fixes
-/// the one-shot fence-event table lacks).
+/// EVENT_MODIFY_STATE, UserMode) and signals it after scanout-read
+/// retirements (several retirements may share one signal) until
+/// unregistered. PERSISTENT: the signal does not consume the registration,
+/// and a transport reset (Stop/StartDevice) signals it without dropping it.
+/// The consumer must be level-triggered — wake (event OR a bounded timeout),
+/// re-read the ledger, act on counter deltas — so lost or coalesced wakeups
+/// are a bounded hiccup, never a hang. Entries are owner-tagged and reclaimed
+/// at device destroy (the fix the one-shot fence-event table lacks); one
+/// owner holds at most two, and a refusal answers TABLE_FULL.
 ///
 /// UNREGISTER: same `event_handle`; the KMD drops the registration and its
 /// reference and will not signal again.

@@ -1602,9 +1602,9 @@ impl AdapterContext {
         self.primary_scanout_generation
             .fetch_add(1, Ordering::AcqRel);
         // D4a: the read ledger's slots name this generation's resource ids and
-        // its event registrations signal this generation's retire stream —
-        // both die with the binding (signal+deref all, zero the slots; the
-        // page itself and the RD counters survive, see `ReadLedger::reset`).
+        // die with the binding (zero the slots, signal every registered event;
+        // the page, the registrations and the RD counters survive, see
+        // `ReadLedger::reset`).
         // A flush token still in flight retires as an orphan (`RdOrp`), which
         // the reclaim rules make inert by construction.
         self.read_ledger.reset();
@@ -1995,6 +1995,10 @@ impl AdapterContext {
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
         // Dropped here, at PASSIVE_LEVEL, outside the lock.
         drop(old);
+        // The dropped transport's in-flight flush tokens retired their ledger
+        // reads in `Drop`; signal the readers now rather than at the next
+        // transport-lock exit.
+        self.read_ledger.flush_broadcast();
     }
 
     /// The real-RAM paging/page-table segment backing, if it was allocated.
