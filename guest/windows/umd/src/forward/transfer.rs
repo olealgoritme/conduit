@@ -623,24 +623,35 @@ pub(crate) fn keyed_flush_wait_forced() -> bool {
     })
 }
 
-/// Wait on the CPU until every command `dev` submitted so far has completed on the GPU. The
-/// immediate context flushes what is recorded and names the newest submission
-/// (`flush_present_copy`); the wait then sleeps on DXVK's submission-fence condition variable,
-/// which the queue's completion thread wakes (`wait_present_copy`), bounded at 5 s. No polling:
-/// the thread is off the CPU until the GPU is done. `None` when the device has no context or the
-/// wait failed (device lost). `what` names the caller in the log.
+/// Wait on the CPU until every command `dev` recorded so far has completed on the GPU. An event
+/// query ended on the immediate context makes the next flush non-empty, which also submits work
+/// the device recorded outside the context's command stream (D3D11 resource initialization, which
+/// an empty flush would skip). `flush_present_copy` then flushes and names that submission, and
+/// the wait sleeps on DXVK's submission-fence condition variable, which the queue's completion
+/// thread wakes (`wait_present_copy`), bounded at 5 s: no polling. `None` when no query could be
+/// made or the wait failed (device lost). `what` names the caller in the log.
 pub(crate) unsafe fn wait_submitted(
     dev: &crate::device_funcs::HeliosDevice,
-    _context: &ID3D11DeviceContext,
+    context: &ID3D11DeviceContext,
     what: &str,
 ) -> Option<std::time::Instant> {
     const TIMEOUT_US: u32 = 5_000_000;
+    let device = dev.dxvk.d3d11_device()?;
+    let desc = windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC {
+        Query: windows::Win32::Graphics::Direct3D11::D3D11_QUERY_EVENT,
+        MiscFlags: 0,
+    };
+    let mut query = None;
+    if device.CreateQuery(&desc, Some(&mut query)).is_err() {
+        return None;
+    }
+    let query = query?;
     let start = std::time::Instant::now();
+    context.End(&query);
     let submission = dev.dxvk.flush_present_copy();
     if submission == 0 {
-        // Nothing was ever submitted (nothing to wait for), or no context / a failed device
-        // (nothing that could still complete).
-        return Some(start);
+        log_error!("DDI NVK {what}: flush failed (device lost?)");
+        return None;
     }
     match dev.dxvk.wait_present_copy(submission, TIMEOUT_US) {
         0 => {}

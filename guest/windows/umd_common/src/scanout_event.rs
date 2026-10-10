@@ -80,6 +80,11 @@ impl RetrySchedule {
         now_ms >= self.due_ms
     }
 
+    /// When the next attempt is due.
+    pub const fn due_ms(&self) -> u64 {
+        self.due_ms
+    }
+
     /// Another refusal at `now_ms`.
     pub fn refused_again(&mut self, now_ms: u64) {
         self.backoff_ms = self.backoff_ms.saturating_mul(2).min(Self::MAX_MS);

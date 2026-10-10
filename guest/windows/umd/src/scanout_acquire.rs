@@ -183,6 +183,16 @@ struct DeviceEntry {
 /// load ([`retry_register`]) skips the registry while this is 0.
 static RETRY_PENDING: AtomicUsize = AtomicUsize::new(0);
 
+/// The earliest `retry` due time of any entry ([`now_ms`] clock), so the hook
+/// takes the registry mutex only when some retry is due, not on every
+/// present while one waits. Lowered on every new schedule; a stale low value
+/// only costs one lock that finds nothing due.
+static RETRY_NEXT_DUE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn note_retry_due(due_ms: u64) {
+    RETRY_NEXT_DUE_MS.fetch_min(due_ms, Ordering::Relaxed);
+}
+
 /// Milliseconds since the first call (the retry clock).
 fn now_ms() -> u64 {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -638,8 +648,9 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
     // SAFETY: as for the map call.
     let event = unsafe { create_and_register(kt_callbacks, rt_adapter, h_rt_device, "device init") };
     let retry = (event == 0 && ledger_va != 0).then(|| RetrySchedule::refused_at(now_ms()));
-    if retry.is_some() {
+    if let Some(r) = retry {
         RETRY_PENDING.fetch_add(1, Ordering::Relaxed);
+        note_retry_due(r.due_ms());
     }
 
     reg.push(DeviceEntry {
@@ -672,43 +683,65 @@ pub(crate) fn retry_register(dev: &HeliosDevice) {
     if RETRY_PENDING.load(Ordering::Relaxed) == 0 {
         return;
     }
+    let now = now_ms();
+    if now < RETRY_NEXT_DUE_MS.load(Ordering::Relaxed) {
+        return;
+    }
     let key = dev as *const HeliosDevice as usize;
-    let delivered = {
+    // Pick the attempt under the lock, run the escape outside it (the DXVK
+    // signaler reads the ledger through this mutex every poll), store the
+    // outcome under it again. Only this device's own DDI touches its entry,
+    // and DestroyDevice cannot run concurrently with it.
+    let (kt_callbacks, rt_adapter, h_rt_device) = {
+        let Ok(mut reg) = REGISTRY.lock() else {
+            return;
+        };
+        // Recompute the earliest due time from the entries that still wait.
+        let next = reg.iter().filter_map(|e| e.retry.map(|r| r.due_ms())).min().unwrap_or(u64::MAX);
+        RETRY_NEXT_DUE_MS.store(next, Ordering::Relaxed);
+        let Some(e) = reg.iter_mut().find(|e| e.key == key) else {
+            return;
+        };
+        match e.retry.as_mut() {
+            Some(r) if r.due(now) => {
+                // Not due again until this attempt's outcome reschedules it.
+                r.refused_again(now);
+            }
+            _ => return,
+        }
+        (e.kt_callbacks, e.rt_adapter, e.h_rt_device)
+    };
+    // SAFETY: the callback table and handles belong to this live device (its
+    // DDI is running); teardown removes the entry only inside DestroyDevice.
+    let event = unsafe {
+        create_and_register(
+            kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS,
+            rt_adapter,
+            h_rt_device,
+            "retry",
+        )
+    };
+    {
         let Ok(mut reg) = REGISTRY.lock() else {
             return;
         };
         let Some(e) = reg.iter_mut().find(|e| e.key == key) else {
             return;
         };
-        let now = now_ms();
-        match e.retry.as_mut() {
-            Some(r) if r.due(now) => {}
-            _ => return,
-        }
-        // SAFETY: the entry's callback table and handles belong to this live
-        // device (its DDI is running); teardown removes the entry first.
-        let event = unsafe {
-            create_and_register(
-                e.kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS,
-                e.rt_adapter,
-                e.h_rt_device,
-                "retry",
-            )
-        };
         if event == 0 {
-            if let Some(r) = e.retry.as_mut() {
-                r.refused_again(now_ms());
+            // Rescheduled above (backed off); publish its due time.
+            if let Some(r) = e.retry {
+                note_retry_due(r.due_ms());
             }
             return;
         }
         e.event = event;
         e.retry = None;
         RETRY_PENDING.fetch_sub(1, Ordering::Relaxed);
-        event
-    };
+    }
     // Outside the registry lock: the DXVK signaler takes its own mutex and
-    // then this registry (`processRetirements`), never the reverse.
-    if dev.dxvk.set_scanout_acquire_event(delivered) {
+    // then this registry (`processRetirements`, `armFence`), never the reverse.
+    if dev.dxvk.set_scanout_acquire_event(event) {
         log_error!("scanout-acquire: event REGISTER accepted on retry — signaler leaves 1 ms polling");
     }
 }
