@@ -104,10 +104,15 @@ sudo. Attached VMs keep whatever network they had.
 - `<metadata>` `conduit:vm`: marks the domain as Conduit's.
 
 `conduit attach` edits an existing definition instead: the same emulator,
-memfd, CPU, share, metadata and GPU (on the highest free slot of bus 0), and
-the machine type becomes the plain `q35` / `pc` alias (a versioned type such
-as `pc-q35-noble` belongs to the old QEMU). Conduit's QEMU has VNC but no
-SPICE, OpenGL or USB redirection, so attach also changes the display side:
+memfd, CPU, share, metadata and GPU (on the highest free slot of bus 0).
+NUMA cells with `memAccess='private'` become `shared` (the backend maps guest
+memory; attach says so). The machine type stays when Conduit's QEMU has it
+(`-machine help`, cached in `~/.cache/conduit/qemu-machines`), so a pinned
+`pc-q35-8.2` keeps the guest's hardware; a type only the distribution's QEMU
+has (`pc-q35-noble`) becomes the plain `q35` / `pc` alias, and attach prints
+the change. Re-attaching keeps the `<address>` libvirt gave Conduit's
+channels and filesystems. Conduit's QEMU has VNC but no SPICE, OpenGL or USB
+redirection, so attach also changes the display side:
 
 - every `<graphics>` (SPICE, VNC on a port, ...) becomes one
   `<graphics type='vnc' socket='SOCK'/>`: the **boot console**, which the
@@ -123,7 +128,11 @@ SPICE, OpenGL or USB redirection, so attach also changes the display side:
   itself stays: firmware, boot menu and disk-unlock prompt draw on it. Its
   `<resolution>` becomes the host's display mode (as `conduit view` picks it;
   stdvga/bochs also get the video memory for it), so the firmware, its boot
-  logo and Windows' boot and sign-in screens start in that mode;
+  logo and Windows' boot and sign-in screens start in that mode. A mode 4096
+  pixels or more wide (5120x1440) only fits QEMU's EDID as a DisplayID
+  extension: the Conduit BIOS and the guests' display drivers read it, stock
+  OVMF starts in 1280x800 instead. A libvirt without `<resolution>` refuses
+  the definition; attach then defines it without the element and says so;
 - `<loader>`: the **Conduit BIOS** (below) in place of the stock firmware
   when it is installed and the VM uses the matching image;
 - `<tpm>`, the guest agent channel, inputs and everything else are kept.
@@ -144,20 +153,38 @@ descriptors (priority 90, so automatic firmware selection still prefers the
 stock images).
 
 attach switches `<loader>` only from those stock Debian/Ubuntu 4 MB images to
-the matching Conduit image. The `<nvram>` file and its template stay as they
-are (same varstore layout), so boot entries, Secure Boot keys and TPM state
-carry over, and the stock path is kept in the `conduit:vm` metadata. Other
-firmware (SeaBIOS, other distributions' OVMF builds, 2 MB images, AMD SEV) is
-left alone, and attach says so. Without the package attach keeps the stock
-loader and prints a hint; after removing it, attach again puts the stock
-loader back. detach restores the original definition, loader included.
+the matching Conduit image, and only when the host's `ovmf` package is the
+edk2 build the images were made from (same upstream release and Ubuntu
+packaging base, recorded as `OVMF_VERSION` next to the images) and the stock
+file has the same size. The `<nvram>` file and its template stay as they are
+(same varstore layout), so boot entries and Secure Boot keys carry over, and
+the stock path is kept in the `conduit:vm` metadata. Other firmware
+(SeaBIOS, other distributions' OVMF builds, Debian's own edk2 build, 2 MB
+images, AMD SEV) is left alone, and attach says so. That is why the package
+exists only as a .deb (and a tarball for Ubuntu hosts without it): on other
+distributions attach would never use it.
+
+A vTPM measures the firmware into PCR0, so the swap (and detach's swap back)
+changes it: a disk key sealed to the TPM (BitLocker, LUKS with a TPM2 token)
+asks for its recovery key once at the next boot. attach and detach warn when
+the domain has a `<tpm>`; in Windows, suspend BitLocker for one restart
+first: `manage-bde -protectors -disable C: -RebootCount 1`.
+
+Without the package attach keeps the stock loader and prints a hint. A VM on
+a Conduit image that is gone or no longer fits goes back to its stock loader
+on the next `conduit attach`, and `conduit up`/`conduit view` do the same
+before starting it. Removing the package lists the VMs still on it (system
+and session definitions; `packaging/bios/vms-using-bios`), and the tarball's
+`install.sh --uninstall` refuses while there are any, unless `--force`.
 `packaging/build.sh bios` builds it (docs/PACKAGING.md).
 
 A Windows domain also gets the Hyper-V enlightenments it lacks (`vpindex`,
 `runtime`, `synic`, `stimer` with `direct`, `reset`, `frequencies`,
 `tlbflush`, `ipi`, besides virt-manager's `relaxed`, `vapic`, `spinlocks`)
 and `<timer name='hypervclock' present='yes'/>`; settings the domain has stay
-([WINDOWS.md](WINDOWS.md)). attach takes a domain for Windows when its
+([WINDOWS.md](WINDOWS.md)). With the Hyper-V clock turned off
+(`<timer name='hypervclock' present='no'/>`) `stimer` is not added: QEMU
+refuses it without `hv-time`. attach takes a domain for Windows when its
 `<metadata>` names a libosinfo Windows OS (`http://microsoft.com/win/...`,
 what virt-manager records), when it has `<features><hyperv>`, or when the
 running VM's guest agent answers `guest-get-osinfo` with `mswindows`. That is
@@ -166,10 +193,15 @@ decided before anything changes.
 virt-manager can still open the VM's console (it connects to the same
 socket); the Conduit window is the main screen. The
 definition from before the first attach is saved as
-`vms/NAME/libvirt-backup-TIME.xml`; `conduit detach` defines it again (libvirt
-may print elements in another order; the content is the same). Each step is
-validated first, the domain is defined in one `virsh define --validate`, and
-if libvirt refuses it nothing stays changed.
+`vms/NAME/libvirt-backup-TIME.xml` (mode 0600: it can hold graphics
+passwords). `conduit detach` saves the current definition as
+`vms/NAME/libvirt-pre-detach-TIME.xml`, then takes Conduit's parts out of it:
+what attach added goes, and what attach overwrote (machine type, loader,
+emulator, CPU mode, memory backing, NUMA memory access, the SPICE console and
+its devices, the video model, the Hyper-V additions) comes back from the
+backup. Changes made since attach (disks, memory, CPUs, other devices) stay.
+Each step is validated first, the domain is defined in one `virsh define
+--validate`, and if libvirt refuses it nothing stays changed.
 
 ## Guest side (attach)
 
@@ -266,7 +298,7 @@ virt-manager does not check.
 conduit libvirt enable NAME     # Conduit VM -> libvirt domain (create/import do it by default)
 conduit libvirt disable NAME    # remove the domain, units, network unit (the VM stays)
 conduit attach NAME [-c URI] [--guest-later] [--dry-run]
-conduit detach NAME             # VM shut off; the original definition comes back
+conduit detach NAME             # VM shut off; Conduit's parts come out, your changes stay
 conduit doctor NAME             # domain, emulator, AppArmor, sockets, network, backend, guest driver
 conduit status NAME             # libvirt state, helpers, display, viewer
 conduit logs NAME [backend|virtiofsd|viewer]   # QEMU's own log: ~/.cache/libvirt/qemu/log/NAME.log

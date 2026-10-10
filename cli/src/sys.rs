@@ -206,6 +206,24 @@ pub fn stop_pid(file: &Path, expect_comm: &str, what: &str, grace: Duration) {
     let _ = fs::remove_file(file);
 }
 
+/// Write a file only its owner can read (mode 0600, also when it existed
+/// with wider permissions): domain definitions carry VNC/SPICE passwords.
+pub fn write_private(path: &Path, data: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(data.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// Start a program in its own session, output to `log`, and return its pid.
 pub fn spawn_detached(cmd: &mut Command, log: &Path, append: bool) -> Result<u32> {
     let mut opts = OpenOptions::new();

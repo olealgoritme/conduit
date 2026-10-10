@@ -38,7 +38,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
           rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             .
@@ -102,7 +102,8 @@ jobs:
 
       # QEMU takes most of the build time. Cache it per format, per week
       # (rolling images like fedora:latest and archlinux change library
-      # sonames), and per change to the QEMU build script or patches.
+      # sonames), and per change to the QEMU sources/patches or to
+      # packaging/build.sh (prefix, install step, PREFIX/JOBS defaults).
       - name: Cache key
         id: week
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
@@ -111,7 +112,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dist/qemu-root
-          key: qemu-11.1-${{ matrix.format }}-${{ steps.week.outputs.week }}-${{ hashFiles('host/qemu/**') }}
+          key: qemu-11.1-${{ matrix.format }}-${{ steps.week.outputs.week }}-${{ hashFiles('host/qemu/**', 'packaging/build.sh') }}
       - name: Build QEMU 11.1
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: packaging/build.sh qemu
@@ -204,7 +205,7 @@ jobs:
           cp packaging/arch/conduit.install out/
           (cd out && sha256sum -- * > SHA256SUMS)
           ls -l out
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: out/*
           generate_release_notes: true

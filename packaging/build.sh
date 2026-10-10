@@ -16,7 +16,7 @@
 #   packaging/build.sh guest-src [DIR]      DKMS source tree for the guest module
 #   packaging/build.sh bios                 Conduit BIOS firmware     -> dist/bios (packaging/bios/build.sh)
 #   packaging/build.sh package FORMAT       deb | rpm | archlinux | tarball | guest-deb | guest-rpm | guest-arch
-#                                           | bios-deb | bios-rpm | bios-arch | bios-tarball
+#                                           | bios-deb | bios-tarball
 #
 # Environment (all optional):
 #   VERSION            package version (default: git describe, without the leading v)
@@ -300,10 +300,17 @@ cmd_stage() {
 
     # The guest driver packages `conduit create` / `conduit stock-kernel` /
     # `conduit attach` install into VMs (DKMS builds the module there for the
-    # VM's own kernel): the .deb, and the Arch package for Arch guests.
+    # VM's own kernel): the .deb, and the Arch package for Arch guests. A
+    # .deb `package guest-deb` already put in $OUT is reused; otherwise it is
+    # built under $DIST, so staging never adds files to $OUT (each host
+    # package job uploads all of $OUT).
     local gdeb="$OUT/conduit-guest_${v}-1_all.deb" garch="$DIST/guest-arch/conduit-guest.pkg.tar.zst"
-    if [ ! -f "$gdeb" ] && command -v nfpm >/dev/null; then
-        guest_package deb "$gdeb"
+    if [ ! -f "$gdeb" ]; then
+        gdeb="$DIST/guest-deb/conduit-guest_${v}-1_all.deb"
+        if command -v nfpm >/dev/null; then
+            install -d "$DIST/guest-deb"
+            guest_package deb "$gdeb"
+        fi
     fi
     if [ -f "$gdeb" ]; then
         install -D -m0644 "$gdeb" "$o/share/conduit/guest/conduit-guest.deb"
@@ -456,19 +463,21 @@ cmd_bios() {
     WORK_DIR="$DIST/bios-work" JOBS="$JOBS" "$PKG/bios/build.sh" "$DIST/bios"
 }
 
-# The conduit-bios package (deb | rpm | archlinux | tarball) into $OUT.
+# The conduit-bios package (deb | tarball) into $OUT. Debian/Ubuntu only: the
+# images match that ovmf build, and attach uses them for nothing else.
 bios_package() {
     local fmt=$1 v; v=$(bios_version)
     [ -f "$DIST/bios/conduit-bios.fd" ] || die "no firmware in $DIST/bios (run: build.sh bios)"
-    [ "$(cat "$DIST/bios/VERSION")" = "$v" ] || die "$DIST/bios is not version $v (run: build.sh bios)"
+    [ "$(cat "$DIST/bios/VERSION")" = "$v" ] && [ -f "$DIST/bios/OVMF_VERSION" ] \
+        || die "$DIST/bios is not version $v (run: build.sh bios)"
     install -d "$OUT"
     if [ "$fmt" = tarball ]; then
         local t="$DIST/bios-tarball/conduit-bios"
         rm -rf "$DIST/bios-tarball"; install -d "$t/firmware"
         install -m0644 "$DIST/bios/conduit-bios.fd" "$DIST/bios/conduit-bios.secboot.fd" \
-            "$DIST/bios/VERSION" "$DIST/bios/copyright" "$t/"
+            "$DIST/bios/VERSION" "$DIST/bios/OVMF_VERSION" "$DIST/bios/copyright" "$t/"
         install -m0644 "$PKG"/bios/firmware/*.json "$t/firmware/"
-        install -m0755 "$PKG/bios/install.sh" "$t/"
+        install -m0755 "$PKG/bios/install.sh" "$PKG/bios/vms-using-bios" "$t/"
         tar -C "$DIST/bios-tarball" --owner=0 --group=0 --numeric-owner \
             -czf "$OUT/conduit-bios-$v-x86_64.tar.gz" conduit-bios
     else
@@ -518,8 +527,7 @@ cmd_package() {
         command -v nfpm >/dev/null || die "nfpm not found"
         guest_package archlinux "$OUT/"
         ;;
-    bios-deb|bios-rpm|bios-tarball) bios_package "${fmt#bios-}" ;;
-    bios-arch) bios_package archlinux ;;
+    bios-deb|bios-tarball) bios_package "${fmt#bios-}" ;;
     tarball)
         # LINK_DIR=/usr/local/bin stage, plus bundle-libs, must have run first.
         local t="$DIST/tarball/conduit"

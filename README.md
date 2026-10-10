@@ -365,7 +365,8 @@ has no SPICE: attach replaces the VM's SPICE display with Conduit's boot
 console (firmware, boot menu and disk-unlock prompt in the Conduit window),
 started in your display's mode. With the optional `conduit-bios` package
 installed, UEFI VMs on Ubuntu's stock OVMF firmware boot with the Conduit logo
-(their NVRAM vars are kept; [docs/LIBVIRT.md](docs/LIBVIRT.md#conduit-bios)).
+(their NVRAM vars are kept; a TPM-sealed disk key asks for recovery once,
+see [docs/LIBVIRT.md](docs/LIBVIRT.md#conduit-bios)).
 A VM made before this: `conduit libvirt enable myvm` (and `disable` to undo).
 
 The window and the VM have separate lives: closing the window leaves a VM

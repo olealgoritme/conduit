@@ -63,10 +63,12 @@ jobs:
       - name: Toolchain
         if: steps.gen.outputs.changed == 'true'
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.gen.outputs.changed == 'true'
         with:
-          workspaces: host/backend
+          workspaces: |
+            host/backend
+            .
       - name: Format generated code
         if: steps.gen.outputs.changed == 'true'
         working-directory: host/backend
@@ -80,6 +82,11 @@ jobs:
           cargo test --locked -p abi
           cargo test --locked --workspace --features device/vhost-user,device/venus -- \
             --skip for_real --skip closing_the_fd --skip repeated_map_unmap
+      - name: Test the CLI's built-in release list (cli/src/host.rs)
+        id: cli
+        if: steps.gen.outputs.changed == 'true'
+        continue-on-error: true
+        run: cargo test --locked -p conduit -- 'host::'
       - name: Build the guest module with the new headers
         id: guest
         if: steps.gen.outputs.changed == 'true'
@@ -93,7 +100,7 @@ jobs:
       # ---- open / update the PR ------------------------------------------
       - name: Pull request
         if: steps.gen.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
         with:
           token: ${{ secrets.ABI_BOT_TOKEN || github.token }}
           branch: abi/auto
@@ -102,8 +109,9 @@ jobs:
           title: "ABI: NVIDIA ${{ steps.gen.outputs.versions }}"
           body-path: ${{ runner.temp }}/abi-report.md
           labels: abi
-          draft: ${{ steps.test.outcome != 'success' || steps.guest.outcome != 'success' }}
+          draft: ${{ steps.test.outcome != 'success' || steps.cli.outcome != 'success' || steps.guest.outcome != 'success' }}
           add-paths: |
+            cli/src/host.rs
             host/backend/gen/src/**
             guest/linux/rmctrl/**
             guest/linux/devinfo/**

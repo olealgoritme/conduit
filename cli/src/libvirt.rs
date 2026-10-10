@@ -3,7 +3,7 @@
 //!
 //! attach, all validated before anything changes:
 //!   1. backs the domain's definition up to vms/NAME/libvirt-backup-TIME.xml
-//!      (only the first time: that is the original detach restores),
+//!      (only the first time, mode 0600: graphics passwords),
 //!   2. installs the socket-activated GPU backend and virtiofsd units
 //!      (units.rs), and lets libvirtd run Conduit's QEMU (AppArmor),
 //!   3. defines the edited domain in one step (`virsh define --validate`):
@@ -22,8 +22,10 @@
 //! enlightenments in step 3, and step 4 is replaced by a note: the guest
 //! driver there is the Helios package (docs/WINDOWS.md).
 //!
-//! Running it again re-applies the same edit (nothing changes); detach
-//! defines the backup again and removes the units.
+//! Running it again re-applies the same edit (nothing changes). detach saves
+//! the current definition (libvirt-pre-detach-TIME.xml), takes Conduit's
+//! parts out of it ([`undo_domain`]) with what attach overwrote restored from
+//! the backup, and removes the units.
 
 use crate::bios;
 use crate::guest;
@@ -61,6 +63,8 @@ pub struct Wiring<'a> {
     /// The display mode the boot console starts in (the video device's
     /// preferred mode, which the firmware and the Windows boot screens use).
     pub display: Option<(u32, u32)>,
+    /// The machine types Conduit's QEMU has (`-machine help`), when known.
+    pub machines: Option<&'a [String]>,
 }
 
 /// The metadata attribute that remembers the stock loader while the Conduit
@@ -144,7 +148,8 @@ pub fn is_windows(xml: &str) -> bool {
 
 /// Hyper-V enlightenments for Windows guests (docs/WINDOWS.md), with the one
 /// each needs: an enlightenment whose prerequisite the domain turns off is
-/// not added (QEMU would refuse to start).
+/// not added (QEMU would refuse to start). stimer also needs hv-time, the
+/// Hyper-V reference clock (`<timer name='hypervclock'>`, [`add_hyperv`]).
 const HYPERV: &[(&str, Option<&str>)] = &[
     ("relaxed", None),
     ("vapic", None),
@@ -167,10 +172,23 @@ fn is_off(e: &Element) -> bool {
 /// lacks; whatever it already sets (on or off) stays. `<hyperv
 /// mode='passthrough'>` already gives the guest everything and is left alone.
 fn add_hyperv(root: &mut Element) {
+    // hv-stimer needs hv-time: with the Hyper-V clock turned off QEMU refuses
+    // to start ("Hyper-V synthetic timers (hv-stimer) requires Hyper-V clock
+    // source (hv-time)").
+    let no_time = root.get_child("clock").is_some_and(|c| {
+        elements(c).any(|t| {
+            t.name == "timer"
+                && t.attributes.get("name").map(String::as_str) == Some("hypervclock")
+                && t.attributes.get("present").map(String::as_str) == Some("no")
+        })
+    });
     let hv = child_mut(child_mut(root, "features"), "hyperv");
     if hv.attributes.get("mode").map(String::as_str) != Some("passthrough") {
         for (name, needs) in HYPERV {
             if needs.is_some_and(|n| hv.get_child(n).is_some_and(is_off)) {
+                continue;
+            }
+            if *name == "stimer" && no_time {
                 continue;
             }
             match hv.get_mut_child(*name) {
@@ -357,6 +375,14 @@ fn take_usb_tablet(devices: &mut Element) -> bool {
 /// bochs) or display info (virtio) report, so the firmware, the boot logo and
 /// Windows' boot screens start in the VM's native mode. stdvga/bochs also get
 /// enough video memory for one frame of it.
+///
+/// A mode 4096 pixels or more wide or high (5120x1440) does not fit EDID's
+/// detailed timing descriptor; QEMU puts it in a DisplayID extension. The
+/// Conduit BIOS reads that (packaging/bios/patches/0001), and so do the guest
+/// kernels' and Windows' display drivers; stock OVMF does not and starts in
+/// 1280x800, as it would without the element. A libvirt without <resolution>
+/// support refuses the definition, and attach retries without it
+/// ([`without_resolution`]).
 fn set_resolution(model: &mut Element, (x, y): (u32, u32)) {
     let ty = model.attributes.get("type").cloned().unwrap_or_default();
     if !matches!(ty.as_str(), "vga" | "bochs" | "virtio") {
@@ -429,6 +455,13 @@ fn edit_display(devices: &mut Element, console: &Path, display: Option<(u32, u32
     }
 }
 
+/// The `<address>` libvirt assigned a device (its virtio-serial port, PCI
+/// slot), kept when Conduit writes the device again: a moved port or slot is
+/// new hardware to the guest.
+fn address_of(e: &Element) -> Option<XMLNode> {
+    e.get_child("address").cloned().map(XMLNode::Element)
+}
+
 /// A Conduit channel: a virtio-serial port named `name` whose host end is a
 /// unix socket QEMU binds (the stats feed [`conduit_stats::CHANNEL`], the
 /// control channel [`conduit_ctl::CHANNEL`]), plus a virtio-serial controller
@@ -441,6 +474,7 @@ fn add_channel(devices: &mut Element, name: &str, sock: &Path) {
     };
     // Where our channel was, so a second edit changes nothing.
     let at = devices.children.iter().position(ours);
+    let addr = at.and_then(|i| devices.children[i].as_element().and_then(address_of));
     devices.children.retain(|n| !ours(n));
     let has_ctl = elements(devices).any(|e| {
         e.name == "controller"
@@ -456,6 +490,7 @@ fn add_channel(devices: &mut Element, name: &str, sock: &Path) {
         "target",
         &[("type", "virtio"), ("name", name)],
     )));
+    ch.children.extend(addr);
     let at = at.unwrap_or(devices.children.len());
     devices.children.insert(at, XMLNode::Element(ch));
     if !has_ctl {
@@ -467,6 +502,74 @@ fn add_channel(devices: &mut Element, name: &str, sock: &Path) {
             )),
         );
     }
+}
+
+fn domain_machine(root: &Element) -> String {
+    root.get_child("os")
+        .and_then(|o| o.get_child("type"))
+        .and_then(|t| t.attributes.get("machine").cloned())
+        .unwrap_or_default()
+}
+
+fn is_q35(machine: &str) -> bool {
+    machine.contains("q35") || machine.is_empty()
+}
+
+/// The machine type on Conduit's QEMU: the domain's own when that QEMU has it
+/// (a pinned versioned type such as pc-q35-8.2 keeps the guest's hardware as
+/// it was), else the plain alias of the same family (Ubuntu's "pc-q35-noble"
+/// exists only in Ubuntu's QEMU). `machines` is `-machine help` of Conduit's
+/// QEMU; unknown, only the aliases are sure to exist.
+fn pick_machine(cur: &str, machines: Option<&[String]>) -> String {
+    let alias = if is_q35(cur) { "q35" } else { "pc" };
+    if cur == alias || machines.is_some_and(|m| !cur.is_empty() && m.iter().any(|x| x == cur)) {
+        cur.to_string()
+    } else {
+        alias.to_string()
+    }
+}
+
+/// What attach tells the user about its edit of `xml`, besides the GPU.
+pub fn notes(xml: &str, w: &Wiring) -> Vec<String> {
+    let Ok(root) = Element::parse(xml.as_bytes()) else {
+        return Vec::new();
+    };
+    let mut v = Vec::new();
+    let old = domain_machine(&root);
+    let new = pick_machine(&old, w.machines);
+    if old != new && !old.is_empty() {
+        v.push(format!(
+            "Machine type {old} becomes {new}: Conduit's QEMU has no {old}."
+        ));
+    }
+    let private = root
+        .get_child("cpu")
+        .and_then(|c| c.get_child("numa"))
+        .is_some_and(|n| {
+            elements(n).any(|c| {
+                c.name == "cell"
+                    && c.attributes.get("memAccess").map(String::as_str) == Some("private")
+            })
+        });
+    if private {
+        v.push(
+            "NUMA cells with memAccess='private' become shared: the GPU backend maps the guest's memory."
+                .into(),
+        );
+    }
+    let plan = loader_plan(xml, w);
+    if let Some(n) = plan.note {
+        v.push(n);
+    }
+    if plan.loader.is_some() && has_tpm(&root) {
+        v.push(bios::TPM_WARNING.into());
+    }
+    v
+}
+
+fn has_tpm(root: &Element) -> bool {
+    root.get_child("devices")
+        .is_some_and(|d| elements(d).any(|e| e.name == "tpm"))
 }
 
 /// Rewrite a libvirt domain XML for Conduit. Idempotent: applying it to its
@@ -484,21 +587,14 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     ns.put("qemu", QEMU_NS);
     root.namespaces = Some(ns);
 
-    let machine = root
-        .get_child("os")
-        .and_then(|o| o.get_child("type"))
-        .and_then(|t| t.attributes.get("machine").cloned())
-        .unwrap_or_default();
-    let q35 = machine.contains("q35") || machine.is_empty();
-    let bus = if q35 { "pcie.0" } else { "pci.0" };
-    // A versioned machine type belongs to the old emulator (e.g. Ubuntu's
-    // "pc-q35-noble"); Conduit's QEMU takes the plain alias of the same family.
+    let machine = domain_machine(&root);
+    let bus = if is_q35(&machine) { "pcie.0" } else { "pci.0" };
+    let new_machine = pick_machine(&machine, w.machines);
     if let Some(t) = root
         .get_mut_child("os")
         .and_then(|o| o.get_mut_child("type"))
     {
-        t.attributes
-            .insert("machine".into(), if q35 { "q35" } else { "pc" }.into());
+        t.attributes.insert("machine".into(), new_machine);
     }
 
     // <os><loader>: the Conduit BIOS in place of the matching stock firmware.
@@ -570,6 +666,21 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
             "maxphysaddr",
             &[("mode", "passthrough")],
         )));
+        // The GPU maps guest RAM from the backend: every NUMA cell must be
+        // shared memory too (a private cell overrides <access mode='shared'>).
+        for numa in cpu.children.iter_mut().filter_map(|n| match n {
+            XMLNode::Element(e) if e.name == "numa" => Some(e),
+            _ => None,
+        }) {
+            for cell in numa.children.iter_mut().filter_map(|n| match n {
+                XMLNode::Element(e) if e.name == "cell" => Some(e),
+                _ => None,
+            }) {
+                if cell.attributes.get("memAccess").map(String::as_str) == Some("private") {
+                    cell.attributes.insert("memAccess".into(), "shared".into());
+                }
+            }
+        }
         // libvirt wants <cpu> after <features>; it reorders on define anyway.
         root.children.push(XMLNode::Element(cpu));
     }
@@ -592,10 +703,19 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         edit_display(devices, w.console_sock, w.display);
         moved_tablet = take_usb_tablet(devices);
         has_video = elements(devices).any(|e| e.name == "video");
-        devices.children.retain(|n| {
-            !matches!(n, XMLNode::Element(e) if e.name == "filesystem"
-                && e.get_child("target").and_then(|t| t.attributes.get("dir")).map(String::as_str) == Some("nvidia"))
-        });
+        let is_nvidia = |e: &Element| {
+            e.name == "filesystem"
+                && e.get_child("target")
+                    .and_then(|t| t.attributes.get("dir"))
+                    .map(String::as_str)
+                    == Some("nvidia")
+        };
+        let nvidia_addr = elements(devices)
+            .find(|e| is_nvidia(e))
+            .and_then(address_of);
+        devices
+            .children
+            .retain(|n| !matches!(n, XMLNode::Element(e) if is_nvidia(e)));
         let mut fs = el("filesystem", &[("type", "mount")]);
         fs.children.push(XMLNode::Element(el(
             "driver",
@@ -606,6 +726,7 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
             .push(XMLNode::Element(el("source", &[("socket", &sock)])));
         fs.children
             .push(XMLNode::Element(el("target", &[("dir", "nvidia")])));
+        fs.children.extend(nvidia_addr);
         // Before the share is re-appended: each edit leaves the order as it was.
         add_channel(devices, conduit_stats::CHANNEL, w.stats_sock);
         add_channel(devices, conduit_ctl::CHANNEL, w.ctl_sock);
@@ -642,27 +763,7 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     let prev = previous_slot(&values);
     // The tablet moves to the command line once and stays there.
     let tablet = has_video && (moved_tablet || values.iter().any(|v| v.contains(TABLET_ID)));
-    let mut keep: Vec<Element> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let next = values.get(i + 1).cloned().unwrap_or_default();
-        let ours = match values[i].as_str() {
-            "-chardev" => next.contains(CHARDEV_ID) || next.contains(&format!("id={QMP_ID},")),
-            "-device" => {
-                next.contains(CHARDEV_ID)
-                    || next.contains(&format!("id={TABLET_ID},"))
-                    || next.contains(&format!(r#""id":"{TABLET_ID}""#))
-            }
-            "-mon" => next.contains(&format!("chardev={QMP_ID},")),
-            _ => false,
-        };
-        if ours {
-            i += 2;
-        } else {
-            keep.push(args[i].clone());
-            i += 1;
-        }
-    }
+    let keep = foreign_args(&args, &values);
     let slot = pick_slot(&root, prev)?;
     let others: Vec<XMLNode> = cl
         .children
@@ -703,6 +804,32 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     Ok(String::from_utf8(out)?)
 }
 
+/// The `<qemu:arg>`s that are not Conduit's (the GPU, QMP and tablet pairs).
+fn foreign_args(args: &[Element], values: &[String]) -> Vec<Element> {
+    let mut keep: Vec<Element> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let next = values.get(i + 1).cloned().unwrap_or_default();
+        let ours = match values[i].as_str() {
+            "-chardev" => next.contains(CHARDEV_ID) || next.contains(&format!("id={QMP_ID},")),
+            "-device" => {
+                next.contains(CHARDEV_ID)
+                    || next.contains(&format!("id={TABLET_ID},"))
+                    || next.contains(&format!(r#""id":"{TABLET_ID}""#))
+            }
+            "-mon" => next.contains(&format!("chardev={QMP_ID},")),
+            _ => false,
+        };
+        if ours {
+            i += 2;
+        } else {
+            keep.push(args[i].clone());
+            i += 1;
+        }
+    }
+    keep
+}
+
 /// The `<filesystem>` element of one shared folder.
 fn share_fs(w: &Wire) -> Element {
     let mut fs = el("filesystem", &[("type", "mount")]);
@@ -721,14 +848,28 @@ fn share_fs(w: &Wire) -> Element {
 /// Make `<devices>` carry exactly these shared folders: Conduit's
 /// (`conduit-*` targets) are replaced, other filesystems stay as they are.
 fn set_shares(devices: &mut Element, shares: &[Wire]) {
-    devices.children.retain(|n| {
-        !matches!(n, XMLNode::Element(e) if e.name == "filesystem"
-            && e.get_child("target")
-                .and_then(|t| t.attributes.get("dir"))
-                .is_some_and(|d| shares::is_share_tag(d)))
-    });
+    let tag = |e: &Element| {
+        (e.name == "filesystem")
+            .then(|| e.get_child("target")?.attributes.get("dir").cloned())
+            .flatten()
+            .filter(|d| shares::is_share_tag(d))
+    };
+    // A share that stays keeps its address.
+    let addrs: Vec<(String, XMLNode)> = elements(devices)
+        .filter_map(|e| Some((tag(e)?, address_of(e)?)))
+        .collect();
+    devices
+        .children
+        .retain(|n| !matches!(n, XMLNode::Element(e) if tag(e).is_some()));
     for w in shares {
-        devices.children.push(XMLNode::Element(share_fs(w)));
+        let mut fs = share_fs(w);
+        fs.children.extend(
+            addrs
+                .iter()
+                .find(|(t, _)| *t == w.tag)
+                .map(|(_, a)| a.clone()),
+        );
+        devices.children.push(XMLNode::Element(fs));
     }
 }
 
@@ -748,6 +889,495 @@ pub fn apply_shares(xml: &str, shares: &[Wire]) -> Result<String> {
             .write_document_declaration(false),
     )?;
     Ok(String::from_utf8(out)?)
+}
+
+fn parse_domain(xml: &str) -> Result<Element> {
+    let root =
+        Element::parse(xml.as_bytes()).context("libvirt returned XML Conduit cannot read")?;
+    if root.name != "domain" {
+        anyhow::bail!("not a libvirt domain (root element is <{}>)", root.name);
+    }
+    Ok(root)
+}
+
+fn emit(root: &Element) -> Result<String> {
+    let mut out = Vec::new();
+    root.write_with_config(
+        &mut out,
+        EmitterConfig::new()
+            .perform_indent(true)
+            .write_document_declaration(false),
+    )?;
+    Ok(String::from_utf8(out)?)
+}
+
+fn is_conduit_meta(n: &XMLNode) -> bool {
+    matches!(n, XMLNode::Element(e) if e.namespace.as_deref() == Some(META_NS) || e.prefix.as_deref() == Some("conduit"))
+}
+
+fn text(e: &Element) -> String {
+    e.get_text()
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn attr<'a>(e: &'a Element, k: &str) -> Option<&'a str> {
+    e.attributes.get(k).map(String::as_str)
+}
+
+fn remove_empty(root: &mut Element, name: &str) {
+    root.children.retain(|n| {
+        !matches!(n, XMLNode::Element(e) if e.name == name && e.attributes.is_empty()
+            && !e.children.iter().any(|c| c.as_element().is_some()))
+    });
+}
+
+/// The stock loader recorded in Conduit's metadata, if any.
+fn recorded_stock(root: &Element) -> Option<String> {
+    root.get_child("metadata")?
+        .children
+        .iter()
+        .find(|n| is_conduit_meta(n))?
+        .as_element()?
+        .attributes
+        .get(STOCK_LOADER_ATTR)
+        .cloned()
+}
+
+/// Machine types in `qemu-system-x86_64 -machine help` output.
+fn parse_machines(help: &str) -> Vec<String> {
+    help.lines()
+        .filter(|l| !l.starts_with("Supported machines"))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The machine types Conduit's QEMU has, cached per emulator build
+/// (~/.cache/conduit/qemu-machines, keyed by path, size and mtime).
+pub fn qemu_machines(emu: &Path) -> Option<Vec<String>> {
+    let meta = std::fs::metadata(emu).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let key = format!("{} {} {mtime}", emu.display(), meta.len());
+    let cache = paths::cache_dir().join("qemu-machines");
+    if let Ok(s) = std::fs::read_to_string(&cache) {
+        if let Some(rest) = s.strip_prefix(&format!("{key}\n")) {
+            return Some(rest.lines().map(str::to_string).collect());
+        }
+    }
+    let help = sys::output(emu.to_str()?, &["-machine", "help"]).ok()?;
+    let list = parse_machines(&help);
+    if list.is_empty() {
+        return None;
+    }
+    let _ = std::fs::create_dir_all(paths::cache_dir());
+    let _ = std::fs::write(&cache, format!("{key}\n{}\n", list.join("\n")));
+    Some(list)
+}
+
+/// The definition without any video <resolution>, for a libvirt that does
+/// not know the element ([`set_resolution`]).
+pub fn without_resolution(xml: &str) -> Result<String> {
+    let mut root = parse_domain(xml)?;
+    if let Some(d) = root.get_mut_child("devices") {
+        for v in d.children.iter_mut().filter_map(|n| match n {
+            XMLNode::Element(e) if e.name == "video" => Some(e),
+            _ => None,
+        }) {
+            if let Some(m) = v.get_mut_child("model") {
+                m.children
+                    .retain(|c| !matches!(c, XMLNode::Element(r) if r.name == "resolution"));
+            }
+        }
+    }
+    emit(&root)
+}
+
+/// Did libvirt refuse the definition over the video <resolution> (an older
+/// libvirt's schema: "Element model has extra content: resolution")?
+pub fn refused_resolution(err: &str) -> bool {
+    err.contains("resolution")
+}
+
+/// A domain on a Conduit BIOS image that is gone (the package removed): the
+/// definition back on the stock loader, and that loader. `exists` checks a
+/// file; the stock loader is the recorded one ([`bios::stock_for`]).
+pub fn restore_missing_bios(xml: &str, exists: &dyn Fn(&str) -> bool) -> Option<(String, String)> {
+    let mut root = parse_domain(xml).ok()?;
+    let cur = text(root.get_child("os")?.get_child("loader")?);
+    if !bios::is_ours(&cur) || exists(&cur) {
+        return None;
+    }
+    let stock = bios::stock_for(&cur, recorded_stock(&root).as_deref());
+    let loader = root.get_mut_child("os")?.get_mut_child("loader")?;
+    loader.children = vec![XMLNode::Text(stock.clone())];
+    if let Some(md) = root.get_mut_child("metadata") {
+        for n in md.children.iter_mut() {
+            if is_conduit_meta(n) {
+                if let XMLNode::Element(e) = n {
+                    e.attributes.shift_remove(STOCK_LOADER_ATTR);
+                }
+            }
+        }
+    }
+    Some((emit(&root).ok()?, stock))
+}
+
+/// Before `conduit up`/`view` start an attached VM: if its Conduit BIOS
+/// image is gone, put it back on the stock firmware so it boots.
+pub fn ensure_firmware(name: &str, link: &Link) -> Result<()> {
+    if link.kind != Kind::Attached {
+        return Ok(());
+    }
+    let v = link.virsh();
+    let Ok(xml) = v.inactive_xml(&link.domain) else {
+        return Ok(());
+    };
+    let Some((new, stock)) = restore_missing_bios(&xml, &|p| Path::new(p).is_file()) else {
+        return Ok(());
+    };
+    v.define(&new, name).map_err(|e| {
+        oops(
+            format!("{name} boots the Conduit BIOS, which is no longer installed, and libvirt refused the stock firmware: {e:#}"),
+            format!("Run `conduit attach {name}` (or reinstall conduit-bios)"),
+        )
+    })?;
+    ui::warn(format!(
+        "The Conduit BIOS is no longer installed: {name} boots its stock firmware again ({stock})."
+    ));
+    if Element::parse(xml.as_bytes()).is_ok_and(|r| has_tpm(&r)) {
+        ui::warn(bios::TPM_WARNING);
+    }
+    Ok(())
+}
+
+/// The model attach makes of a video model, without the mode it sets.
+fn conduit_model(m: &Element) -> Element {
+    let mut m = m.clone();
+    m.children.retain(|c| match c {
+        XMLNode::Element(a) => a.name != "acceleration" && a.name != "resolution",
+        XMLNode::Text(s) => !s.trim().is_empty(),
+        _ => true,
+    });
+    if attr(&m, "type") == Some("qxl") {
+        m.attributes.retain(|k, _| k == "heads" || k == "primary");
+        m.attributes.insert("type".into(), "virtio".into());
+    }
+    m.attributes.shift_remove("vram");
+    // In-scope namespace declarations differ between the two documents.
+    fn no_ns(e: &mut Element) {
+        e.namespaces = None;
+        for c in e.children.iter_mut() {
+            if let XMLNode::Element(x) = c {
+                no_ns(x);
+            }
+        }
+    }
+    no_ns(&mut m);
+    m
+}
+
+/// detach: the domain as it is now without Conduit's parts -- the inverse of
+/// [`edit_domain`]. What attach overwrote (machine type, loader, emulator,
+/// CPU mode, memory backing, NUMA memory access, the SPICE console and its
+/// devices, the video model, the Hyper-V additions) comes back from
+/// `original`, the definition from before the first attach; everything else
+/// the user changed since (disks, memory, CPUs, other devices) stays.
+/// `console` is the boot console socket attach set.
+pub fn undo_domain(current: &str, original: &str, console: Option<&Path>) -> Result<String> {
+    let mut root = parse_domain(current)?;
+    let orig =
+        parse_domain(original).context("the saved original definition is not a libvirt domain")?;
+    let recorded = recorded_stock(&root);
+
+    // <metadata>
+    if let Some(md) = root.get_mut_child("metadata") {
+        md.children.retain(|n| !is_conduit_meta(n));
+    }
+    if orig.get_child("metadata").is_none() {
+        remove_empty(&mut root, "metadata");
+    }
+
+    // <os>: machine type and loader.
+    let orig_os = orig.get_child("os");
+    if let Some(os) = root.get_mut_child("os") {
+        let m = orig_os
+            .and_then(|o| o.get_child("type"))
+            .and_then(|t| t.attributes.get("machine"));
+        if let (Some(t), Some(m)) = (os.get_mut_child("type"), m) {
+            t.attributes.insert("machine".into(), m.clone());
+        }
+        if let Some(l) = os.get_mut_child("loader") {
+            let cur = text(l);
+            if bios::is_ours(&cur) {
+                let stock = orig_os
+                    .and_then(|o| o.get_child("loader"))
+                    .map(text)
+                    .filter(|s| !s.is_empty() && !bios::is_ours(s))
+                    .unwrap_or_else(|| bios::stock_for(&cur, recorded.as_deref()));
+                l.children = vec![XMLNode::Text(stock)];
+            }
+        }
+    }
+
+    // <memoryBacking>: attach's <source>/<access> out, the original's back.
+    let orig_mb = orig.get_child("memoryBacking");
+    if let Some(mb) = root.get_mut_child("memoryBacking") {
+        let ours = |n: &XMLNode| matches!(n, XMLNode::Element(e) if e.name == "source" || e.name == "access");
+        mb.children.retain(|n| !ours(n));
+        if let Some(o) = orig_mb {
+            mb.children
+                .extend(o.children.iter().filter(|n| ours(n)).cloned());
+        }
+    }
+    if orig_mb.is_none() {
+        remove_empty(&mut root, "memoryBacking");
+    }
+
+    // <cpu>: the original mode attributes, model/vendor/maxphysaddr, and the
+    // NUMA cells' memory access.
+    let orig_cpu = orig.get_child("cpu");
+    if let Some(cpu) = root.get_mut_child("cpu") {
+        for k in ["mode", "check", "migratable"] {
+            match orig_cpu.and_then(|c| c.attributes.get(k)) {
+                Some(v) => {
+                    cpu.attributes.insert(k.into(), v.clone());
+                }
+                None => {
+                    cpu.attributes.shift_remove(k);
+                }
+            }
+        }
+        let replaced = |n: &XMLNode| matches!(n, XMLNode::Element(e) if matches!(e.name.as_str(), "maxphysaddr" | "model" | "vendor"));
+        cpu.children.retain(|n| !replaced(n));
+        if let Some(o) = orig_cpu {
+            cpu.children
+                .extend(o.children.iter().filter(|n| replaced(n)).cloned());
+        }
+        let private: Vec<String> = orig_cpu
+            .and_then(|c| c.get_child("numa"))
+            .map(|n| {
+                elements(n)
+                    .filter(|c| c.name == "cell" && attr(c, "memAccess") == Some("private"))
+                    .filter_map(|c| c.attributes.get("id").cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(numa) = cpu.get_mut_child("numa") {
+            for cell in numa.children.iter_mut().filter_map(|n| match n {
+                XMLNode::Element(e) if e.name == "cell" => Some(e),
+                _ => None,
+            }) {
+                if cell
+                    .attributes
+                    .get("id")
+                    .is_some_and(|id| private.contains(id))
+                {
+                    cell.attributes.insert("memAccess".into(), "private".into());
+                }
+            }
+        }
+    }
+    if orig_cpu.is_none() {
+        remove_empty(&mut root, "cpu");
+    }
+
+    // Hyper-V: the enlightenments (and stimer's direct mode) attach added.
+    let orig_hv = orig
+        .get_child("features")
+        .and_then(|f| f.get_child("hyperv"));
+    if let Some(hv) = root
+        .get_mut_child("features")
+        .and_then(|f| f.get_mut_child("hyperv"))
+    {
+        hv.children.retain(|n| match n {
+            XMLNode::Element(e) => {
+                !HYPERV.iter().any(|(h, _)| *h == e.name)
+                    || orig_hv.is_some_and(|o| o.get_child(e.name.as_str()).is_some())
+            }
+            _ => true,
+        });
+        let direct = orig_hv
+            .and_then(|o| o.get_child("stimer"))
+            .is_some_and(|s| s.get_child("direct").is_some());
+        if let Some(s) = hv.get_mut_child("stimer") {
+            if !direct {
+                s.children
+                    .retain(|c| !matches!(c, XMLNode::Element(d) if d.name == "direct"));
+            }
+        }
+    }
+    if orig_hv.is_none() {
+        if let Some(f) = root.get_mut_child("features") {
+            f.children.retain(|n| {
+                !matches!(n, XMLNode::Element(e) if e.name == "hyperv"
+                    && !e.children.iter().any(|c| c.as_element().is_some()))
+            });
+        }
+        if orig.get_child("features").is_none() {
+            remove_empty(&mut root, "features");
+        }
+    }
+    let orig_clock = orig.get_child("clock");
+    let hvclock = |c: &Element| {
+        elements(c).any(|t| t.name == "timer" && attr(t, "name") == Some("hypervclock"))
+    };
+    if !orig_clock.is_some_and(hvclock) {
+        if let Some(c) = root.get_mut_child("clock") {
+            c.children.retain(|n| {
+                !matches!(n, XMLNode::Element(t) if t.name == "timer"
+                    && attr(t, "name") == Some("hypervclock"))
+            });
+        }
+    }
+    if orig_clock.is_none() {
+        root.children.retain(|n| {
+            !matches!(n, XMLNode::Element(c) if c.name == "clock"
+                && !c.children.iter().any(|x| x.as_element().is_some())
+                && c.attributes.len() == 1 && attr(c, "offset") == Some("localtime"))
+        });
+    }
+
+    // <devices>
+    let orig_dev = orig.get_child("devices");
+    if let Some(dev) = root.get_mut_child("devices") {
+        // Emulator.
+        match orig_dev.and_then(|d| d.get_child("emulator")) {
+            Some(e) => {
+                child_mut(dev, "emulator").children = e.children.clone();
+            }
+            None => dev
+                .children
+                .retain(|n| !matches!(n, XMLNode::Element(e) if e.name == "emulator")),
+        }
+        // The boot console, Conduit's channels and shares.
+        let console = console.map(|c| c.display().to_string());
+        dev.children.retain(|n| {
+            let XMLNode::Element(e) = n else { return true };
+            let ours = match e.name.as_str() {
+                "graphics" => attr(e, "socket").is_some_and(|s| {
+                    Some(s) == console.as_deref()
+                        || s.ends_with("/console.sock")
+                        || s.ends_with("/console/vnc.sock")
+                }),
+                "channel" => e
+                    .get_child("target")
+                    .and_then(|t| attr(t, "name"))
+                    .is_some_and(|t| t == conduit_stats::CHANNEL || t == conduit_ctl::CHANNEL),
+                "filesystem" => e
+                    .get_child("target")
+                    .and_then(|t| attr(t, "dir"))
+                    .is_some_and(|d| d == "nvidia" || shares::is_share_tag(d)),
+                _ => false,
+            };
+            !ours
+        });
+        // The virtio-serial controller attach added, when nothing else uses it.
+        let had_ctl = orig_dev.is_some_and(|d| {
+            elements(d).any(|e| e.name == "controller" && attr(e, "type") == Some("virtio-serial"))
+        });
+        let virtio_users = elements(dev).any(|e| {
+            matches!(e.name.as_str(), "channel" | "console")
+                && e.get_child("target").and_then(|t| attr(t, "type")) == Some("virtio")
+        });
+        if !had_ctl && !virtio_users {
+            dev.children.retain(|n| {
+                !matches!(n, XMLNode::Element(e) if e.name == "controller"
+                    && attr(e, "type") == Some("virtio-serial"))
+            });
+        }
+        if let Some(od) = orig_dev {
+            // What attach took out: the SPICE console and its devices, and
+            // libvirt's USB tablet (it moved to the command line).
+            let has_tablet =
+                elements(dev).any(|e| e.name == "input" && attr(e, "type") == Some("tablet"));
+            for e in elements(od) {
+                let back = matches!(e.name.as_str(), "graphics" | "redirfilter")
+                    || is_spice_dev(e)
+                    || (!has_tablet
+                        && e.name == "input"
+                        && attr(e, "type") == Some("tablet")
+                        && attr(e, "bus") == Some("usb"));
+                if back {
+                    dev.children.push(XMLNode::Element(e.clone()));
+                }
+            }
+            // SPICE audio that became type='none'.
+            for a in dev.children.iter_mut().filter_map(|n| match n {
+                XMLNode::Element(e) if e.name == "audio" && attr(e, "type") == Some("none") => {
+                    Some(e)
+                }
+                _ => None,
+            }) {
+                let was_spice = elements(od).any(|o| {
+                    o.name == "audio"
+                        && attr(o, "type") == Some("spice")
+                        && attr(o, "id") == attr(a, "id")
+                });
+                if was_spice {
+                    a.attributes.insert("type".into(), "spice".into());
+                }
+            }
+            // Video models: the original where attach's change is still all
+            // there is; else (changed since) only attach's <resolution> goes.
+            let orig_models: Vec<Option<&Element>> = elements(od)
+                .filter(|e| e.name == "video")
+                .map(|v| v.get_child("model"))
+                .collect();
+            let videos = dev.children.iter_mut().filter_map(|n| match n {
+                XMLNode::Element(e) if e.name == "video" => Some(e),
+                _ => None,
+            });
+            for (v, om) in videos.zip(orig_models) {
+                let Some(m) = v.get_mut_child("model") else {
+                    continue;
+                };
+                match om {
+                    Some(o) if conduit_model(o) == conduit_model(m) => *m = o.clone(),
+                    Some(o) if o.get_child("resolution").is_none() => m
+                        .children
+                        .retain(|c| !matches!(c, XMLNode::Element(r) if r.name == "resolution")),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // <qemu:commandline>: Conduit's arguments out.
+    let had_cl = elements(&orig).any(|e| e.name == "commandline" && is_qemu(e));
+    if let Some(cl) = root.children.iter_mut().find_map(|n| match n {
+        XMLNode::Element(e) if e.name == "commandline" && is_qemu(e) => Some(e),
+        _ => None,
+    }) {
+        let args: Vec<Element> = elements(cl).filter(|e| e.name == "arg").cloned().collect();
+        let values: Vec<String> = args
+            .iter()
+            .map(|a| a.attributes.get("value").cloned().unwrap_or_default())
+            .collect();
+        let others: Vec<XMLNode> = cl
+            .children
+            .iter()
+            .filter(|n| !matches!(n, XMLNode::Element(e) if e.name == "arg"))
+            .cloned()
+            .collect();
+        cl.children = foreign_args(&args, &values)
+            .into_iter()
+            .map(XMLNode::Element)
+            .collect();
+        cl.children.extend(others);
+    }
+    if !had_cl {
+        root.children.retain(|n| {
+            !matches!(n, XMLNode::Element(e) if e.name == "commandline" && is_qemu(e)
+                && !e.children.iter().any(|c| c.as_element().is_some()))
+        });
+    }
+    emit(&root)
 }
 
 /// Which libvirt has this domain: -c if given, else the session, else the system.
@@ -900,6 +1530,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     };
     let share_wires = shares::wires(&scope, name, &share_list);
     let bios_dir = bios::installed_dir();
+    let machines = qemu_machines(&emu);
     let (mode, _) = crate::mode::detect();
     let wiring = Wiring {
         emulator: &emu,
@@ -914,12 +1545,13 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         bios: bios_dir.as_deref(),
         bios_fits: &bios::check,
         display: Some((mode.width, mode.height)),
+        machines: machines.as_deref(),
     };
     let new_xml = edit_domain(&xml, &wiring)?;
-    let bios_note = loader_plan(&xml, &wiring).note;
+    let edit_notes = notes(&xml, &wiring);
     if dry_run {
         ui::info(format!("libvirt: {uri}; emulator: {}", emu.display()));
-        if let Some(n) = &bios_note {
+        for n in &edit_notes {
             ui::info(n);
         }
         if windows {
@@ -941,7 +1573,12 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     std::fs::create_dir_all(dir.join("logs"))?;
     let old_link = Link::load(name);
     let backup = match old_link.as_ref().and_then(|l| l.backup.clone()).filter(|b| b.is_file()) {
-        Some(b) => b,
+        Some(b) => {
+            // Backups from before they were written private.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o600));
+            b
+        }
         None if already => {
             return Err(oops(
                 format!("{name} already carries Conduit's GPU, but its original definition is not on record"),
@@ -950,7 +1587,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         }
         None => {
             let b = dir.join(format!("libvirt-backup-{}.xml", timestamp()));
-            std::fs::write(&b, &xml).with_context(|| format!("writing {}", b.display()))?;
+            sys::write_private(&b, &xml)?;
             b
         }
     };
@@ -966,7 +1603,15 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         system_apparmor()?;
     }
     units::install(&scope, name, &me).map_err(undo)?;
-    if let Err(e) = v.define(&new_xml, name) {
+    let defined = v.define(&new_xml, name).or_else(|e| {
+        if !refused_resolution(&format!("{e:#}")) || !new_xml.contains("<resolution") {
+            return Err(e);
+        }
+        v.define(&without_resolution(&new_xml)?, name)?;
+        println!("This libvirt has no <resolution> for video devices: the boot console starts in the firmware's default mode.");
+        Ok(())
+    });
+    if let Err(e) = defined {
         return Err(undo(oops(
             format!("libvirt refused the changed definition of {name}: {e:#}"),
             format!(
@@ -994,7 +1639,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         },
         backup.display()
     );
-    if let Some(n) = &bios_note {
+    for n in &edit_notes {
         println!("{n}");
     }
 
@@ -1061,11 +1706,22 @@ pub fn detach(name: &str) -> Result<()> {
             format!("Shut it down first (`conduit down {name}` or in virt-manager), then run this again"),
         ));
     }
-    let xml = std::fs::read_to_string(&backup)?;
-    v.define(&xml, name).map_err(|e| {
+    // The definition as it is now (the user may have changed disks, memory,
+    // devices since attach) minus Conduit's parts; the values attach
+    // overwrote come from the backup. Saved first, so nothing is lost.
+    let current = v.inactive_xml(&link.domain)?;
+    let original = std::fs::read_to_string(&backup)?;
+    let restored = undo_domain(&current, &original, link.console.as_deref())?;
+    let pre = paths::vm_dir(name).join(format!("libvirt-pre-detach-{}.xml", timestamp()));
+    sys::write_private(&pre, &current)?;
+    v.define(&restored, name).map_err(|e| {
         oops(
-            format!("libvirt refused the original definition: {e:#}"),
-            "Nothing was changed",
+            format!("libvirt refused the definition without Conduit's parts: {e:#}"),
+            format!(
+                "Nothing was changed. The definition from before attach is at {}, the current one at {}",
+                backup.display(),
+                pre.display()
+            ),
         )
     })?;
     let scope = link.scope()?;
@@ -1073,10 +1729,29 @@ pub fn detach(name: &str) -> Result<()> {
     virt::remove_desktop_entry(name);
     let _ = std::fs::remove_file(Link::file(name));
     println!(
-        "{name} has its original definition back (from {}). Conduit's guest driver stays installed inside it; it does nothing without the GPU.",
-        backup.display()
+        "Removed Conduit's GPU from {name}; your changes since attach are kept, and what attach had changed is back as it was (from {}). \
+         The definition from just before this is saved at {}. Conduit's guest driver stays installed inside it; it does nothing without the GPU.",
+        backup.display(),
+        pre.display()
     );
+    if firmware_changed(&current, &restored) {
+        ui::warn(bios::TPM_WARNING);
+    }
     Ok(())
+}
+
+/// Did the loader change between two definitions of a domain with a TPM?
+fn firmware_changed(before: &str, after: &str) -> bool {
+    let loader = |x: &str| {
+        Element::parse(x.as_bytes()).ok().and_then(|r| {
+            let l = r.get_child("os")?.get_child("loader").map(text);
+            Some((l, has_tpm(&r)))
+        })
+    };
+    match (loader(before), loader(after)) {
+        (Some((a, tpm)), Some((b, _))) => tpm && a != b,
+        _ => false,
+    }
 }
 
 /// Backup files of a VM, oldest first.
@@ -1167,6 +1842,7 @@ mod tests {
                 bios: None,
                 bios_fits: &fits,
                 display: None,
+                machines: Some(&machines()),
             },
         )
         .unwrap()
@@ -1192,6 +1868,7 @@ mod tests {
                 bios,
                 bios_fits: &fits,
                 display,
+                machines: Some(&machines()),
             },
         )
         .unwrap()
@@ -1539,7 +2216,10 @@ mod tests {
             out.contains("vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,class=0x0380,num_vqs=3,vq_size=256,config_size=4036,bus=pcie.0,addr=0x1d"),
             "{out}"
         );
-        assert!(out.contains("machine=\"q35\""), "{out}");
+        assert!(
+            out.contains("machine=\"pc-q35-8.2\""),
+            "Conduit's QEMU has the pinned type: {out}"
+        );
         assert!(out.contains("myvm.qcow2"));
     }
 
@@ -1865,8 +2545,423 @@ mod tests {
             bios: None,
             bios_fits: &fits,
             display: None,
+            machines: None,
         };
         assert!(edit_domain("<network/>", &w).is_err());
         assert!(edit_domain("not xml", &w).is_err());
+    }
+
+    /// What `qemu-system-x86_64 -machine help` lists (trimmed): QEMU 11.1
+    /// keeps its versioned types back to 8.x, Ubuntu's "noble" ones are not
+    /// upstream.
+    const MACHINE_HELP: &str = "Supported machines are:\n\
+        pc                   Standard PC (i440FX + PIIX, 1996) (alias of pc-i440fx-11.1)\n\
+        pc-i440fx-11.1       Standard PC (i440FX + PIIX, 1996) (default)\n\
+        q35                  Standard PC (Q35 + ICH9, 2009) (alias of pc-q35-11.1)\n\
+        pc-q35-11.1          Standard PC (Q35 + ICH9, 2009)\n\
+        pc-q35-8.2           Standard PC (Q35 + ICH9, 2009)\n\
+        none                 empty machine\n";
+
+    fn machines() -> Vec<String> {
+        parse_machines(MACHINE_HELP)
+    }
+
+    fn wiring_with<'a>(
+        bios: Option<&'a Path>,
+        windows: bool,
+        machines: Option<&'a [String]>,
+        shares: &'a [Wire],
+    ) -> Wiring<'a> {
+        Wiring {
+            emulator: Path::new("/opt/conduit/bin/qemu-system-x86_64"),
+            gpu_sock: Path::new("/run/user/1000/conduit/myvm/gpu-libvirt.sock"),
+            vfs_sock: Path::new("/run/user/1000/conduit/myvm/vfs-libvirt.sock"),
+            console_sock: Path::new(CONSOLE),
+            stats_sock: Path::new(STATS),
+            ctl_sock: Path::new(CTL),
+            vm: "myvm",
+            shares,
+            windows,
+            bios,
+            bios_fits: &fits,
+            display: Some((5120, 1440)),
+            machines,
+        }
+    }
+
+    /// A tree to compare definitions by: no whitespace, no namespace
+    /// declarations, children in a fixed order (libvirt orders devices itself).
+    fn canon(xml: &str) -> String {
+        fn norm(e: &mut Element) {
+            e.namespaces = None;
+            e.children.retain(|n| match n {
+                XMLNode::Text(t) => !t.trim().is_empty(),
+                XMLNode::Comment(_) => false,
+                _ => true,
+            });
+            for c in e.children.iter_mut() {
+                match c {
+                    XMLNode::Element(x) => norm(x),
+                    XMLNode::Text(t) => *t = t.trim().to_string(),
+                    _ => {}
+                }
+            }
+            let key = |n: &XMLNode| match n {
+                XMLNode::Element(x) => emit_el(x),
+                XMLNode::Text(t) => t.clone(),
+                _ => String::new(),
+            };
+            e.children.sort_by_key(key);
+        }
+        fn emit_el(e: &Element) -> String {
+            let mut out = Vec::new();
+            e.write_with_config(
+                &mut out,
+                EmitterConfig::new()
+                    .perform_indent(false)
+                    .write_document_declaration(false),
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        }
+        let mut root = Element::parse(xml.as_bytes()).unwrap();
+        norm(&mut root);
+        emit_el(&root)
+    }
+
+    fn attach_then_detach(orig: &str, windows: bool, bios: Option<&Path>) -> (String, String) {
+        let ws = [Wire {
+            tag: "conduit-Conduit".into(),
+            sock: PathBuf::from("/run/user/1000/conduit/myvm/share-Conduit.sock"),
+        }];
+        let m = machines();
+        let attached = edit_domain(orig, &wiring_with(bios, windows, Some(&m), &ws)).unwrap();
+        let back = undo_domain(&attached, orig, Some(Path::new(CONSOLE))).unwrap();
+        (attached, back)
+    }
+
+    #[test]
+    fn detach_takes_out_exactly_what_attach_put_in() {
+        let noble = DOMAIN.replace("pc-q35-8.2", "pc-q35-noble");
+        let numa = DOMAIN.replace(
+            "<feature policy='require' name='topoext'/>",
+            "<feature policy='require' name='topoext'/><numa><cell id='0' cpus='0-3' memory='8388608' unit='KiB' memAccess='private'/></numa>",
+        );
+        let bios = Path::new("/usr/share/conduit/bios");
+        for (name, x, win, b) in [
+            ("DOMAIN", DOMAIN.to_string(), false, None),
+            ("noble", noble, false, None),
+            ("numa", numa, false, None),
+            ("VIRT_INSTALL", VIRT_INSTALL.to_string(), false, None),
+            ("WIN11", WIN11.to_string(), true, None),
+            ("UEFI", UEFI.to_string(), false, Some(bios)),
+        ] {
+            let (attached, back) = attach_then_detach(&x, win, b);
+            assert_ne!(
+                canon(&attached),
+                canon(&x),
+                "{name}: attach changed nothing"
+            );
+            assert_eq!(canon(&back), canon(&x), "{name}:\n{back}");
+            assert!(!virt::is_ours(&back), "{name}");
+        }
+    }
+
+    #[test]
+    fn detach_keeps_changes_made_after_attach() {
+        // virt-manager after attach: more RAM, a second disk, hugepages, a
+        // CPU topology change and a user's own qemu argument.
+        let user = |x: &str| {
+            x.replace(
+                "<memory unit='KiB'>4194304</memory>",
+                "<memory unit='KiB'>16777216</memory>",
+            )
+            .replace(
+                "<memory unit=\"KiB\">4194304</memory>",
+                "<memory unit=\"KiB\">16777216</memory>",
+            )
+            .replace(
+                "</devices>",
+                "<disk type='file' device='disk'><source file='/var/lib/libvirt/images/data.qcow2'/><target dev='vdb' bus='virtio'/></disk></devices>",
+            )
+        };
+        let (attached, _) = attach_then_detach(VIRT_INSTALL, false, None);
+        let changed = user(&attached);
+        assert!(changed.contains("16777216") && changed.contains("data.qcow2"));
+        let back = undo_domain(&changed, VIRT_INSTALL, Some(Path::new(CONSOLE))).unwrap();
+        assert_eq!(canon(&back), canon(&user(VIRT_INSTALL)), "{back}");
+
+        // The same on a domain with <cpu>/<memoryBacking>: the user's
+        // hugepages and topology stay, attach's memfd/host-passthrough go.
+        let (attached, _) = attach_then_detach(DOMAIN, false, None);
+        let changed = attached
+            .replace("cores=\"4\"", "cores=\"8\"")
+            .replace("<hugepages />", "<hugepages /><nosharepages />");
+        assert!(changed.contains("nosharepages"), "{attached}");
+        let back = undo_domain(&changed, DOMAIN, None).unwrap();
+        let want = DOMAIN
+            .replace("cores='4'", "cores='8'")
+            .replace("<hugepages/>", "<hugepages/><nosharepages/>");
+        assert_eq!(canon(&back), canon(&want), "{back}");
+        let root = Element::parse(back.as_bytes()).unwrap();
+        assert_eq!(
+            root.get_child("cpu").unwrap().attributes["mode"],
+            "host-model"
+        );
+        assert_eq!(
+            root.get_child("os")
+                .unwrap()
+                .get_child("type")
+                .unwrap()
+                .attributes["machine"],
+            "pc-q35-8.2"
+        );
+    }
+
+    #[test]
+    fn detach_puts_the_stock_loader_back() {
+        let bios = Path::new("/usr/share/conduit/bios");
+        let (attached, back) = attach_then_detach(UEFI, false, Some(bios));
+        assert!(attached.contains("conduit-bios.fd"));
+        assert_eq!(
+            os_child(&back, "loader").get_text().unwrap(),
+            "/usr/share/OVMF/OVMF_CODE_4M.fd"
+        );
+        // The nvram the user moved after attach stays where it is now.
+        let moved = attached.replace("myvm_VARS.fd", "myvm_VARS-new.fd");
+        let back = undo_domain(&moved, UEFI, None).unwrap();
+        assert!(back.contains("myvm_VARS-new.fd"), "{back}");
+        assert!(firmware_changed(
+            &attached.replace("</devices>", "<tpm model='tpm-crb'/></devices>"),
+            &back.replace("</devices>", "<tpm model='tpm-crb'/></devices>")
+        ));
+        assert!(
+            !firmware_changed(&attached, &back),
+            "no TPM, nothing to say"
+        );
+    }
+
+    #[test]
+    fn stimer_is_not_added_without_the_hyperv_clock() {
+        let off = WIN11.replace(
+            "<timer name='hpet' present='no'/>",
+            "<timer name='hpet' present='no'/><timer name='hypervclock' present='no'/>",
+        );
+        let out = edit_as(&off, true);
+        let hv = hyperv(&out);
+        assert!(
+            all(&hv, "stimer").is_empty(),
+            "QEMU refuses hv-stimer without hv-time: {out}"
+        );
+        assert_eq!(all(&hv, "synic").len(), 1, "the rest is added: {out}");
+        assert!(out.contains("name=\"hypervclock\" present=\"no\""), "{out}");
+        assert_eq!(edit_as(&out, true), out, "idempotent");
+        // With the clock on (or added by attach), stimer is there.
+        assert_eq!(all(&hyperv(&edit_as(WIN11, true)), "stimer").len(), 1);
+    }
+
+    #[test]
+    fn a_pinned_machine_type_is_kept_when_conduits_qemu_has_it() {
+        assert_eq!(
+            machines(),
+            [
+                "pc",
+                "pc-i440fx-11.1",
+                "q35",
+                "pc-q35-11.1",
+                "pc-q35-8.2",
+                "none"
+            ]
+        );
+        let m = machines();
+        let w = wiring_with(None, false, Some(&m), &[]);
+        let machine =
+            |x: &str| os_child(&edit_domain(x, &w).unwrap(), "type").attributes["machine"].clone();
+        assert_eq!(machine(DOMAIN), "pc-q35-8.2");
+        assert!(notes(DOMAIN, &w)
+            .iter()
+            .all(|n| !n.contains("Machine type")));
+        // Ubuntu's own type is not in Conduit's QEMU: the alias, and a note.
+        let noble = DOMAIN.replace("pc-q35-8.2", "pc-q35-noble");
+        assert_eq!(machine(&noble), "q35");
+        let n = notes(&noble, &w);
+        assert!(
+            n.iter().any(|n| n.contains("pc-q35-noble becomes q35")),
+            "{n:?}"
+        );
+        let old = DOMAIN.replace("pc-q35-8.2", "pc-i440fx-6.2");
+        assert_eq!(machine(&old), "pc");
+        // Unknown machine list: only the aliases are sure to exist.
+        let w = wiring_with(None, false, None, &[]);
+        assert_eq!(
+            os_child(&edit_domain(DOMAIN, &w).unwrap(), "type").attributes["machine"],
+            "q35"
+        );
+    }
+
+    #[test]
+    fn private_numa_cells_become_shared_memory() {
+        let numa = DOMAIN.replace(
+            "<feature policy='require' name='topoext'/>",
+            "<numa><cell id='0' cpus='0-1' memory='4' unit='GiB' memAccess='private'/><cell id='1' cpus='2-3' memory='4' unit='GiB'/></numa>",
+        );
+        let out = edit(&numa);
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let cells = all(
+            root.get_child("cpu").unwrap().get_child("numa").unwrap(),
+            "cell",
+        )
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+        assert_eq!(cells[0].attributes["memAccess"], "shared", "{out}");
+        assert!(!cells[1].attributes.contains_key("memAccess"), "{out}");
+        assert_eq!(edit(&out), out, "idempotent");
+        let m = machines();
+        let n = notes(&numa, &wiring_with(None, false, Some(&m), &[]));
+        assert!(n.iter().any(|n| n.contains("memAccess='private'")), "{n:?}");
+        // detach gives the cell its private memory back.
+        let back = undo_domain(&out, &numa, None).unwrap();
+        assert!(back.contains("memAccess=\"private\""), "{back}");
+    }
+
+    #[test]
+    fn reattach_keeps_the_addresses_libvirt_assigned() {
+        // libvirt gives each channel a virtio-serial port and each
+        // filesystem a PCI slot on define; a second attach keeps them.
+        let ws = [Wire {
+            tag: "conduit-Conduit".into(),
+            sock: PathBuf::from("/s/c.sock"),
+        }];
+        let m = machines();
+        let w = wiring_with(None, false, Some(&m), &ws);
+        let out = edit_domain(VIRT_INSTALL, &w).unwrap();
+        let mut root = Element::parse(out.as_bytes()).unwrap();
+        let dev = root.get_mut_child("devices").unwrap();
+        let mut port = 3;
+        for n in dev.children.iter_mut() {
+            let XMLNode::Element(e) = n else { continue };
+            let addr = match e.name.as_str() {
+                "channel" => {
+                    port += 1;
+                    el(
+                        "address",
+                        &[
+                            ("type", "virtio-serial"),
+                            ("controller", "0"),
+                            ("bus", "0"),
+                            ("port", &port.to_string()),
+                        ],
+                    )
+                }
+                "filesystem" => {
+                    port += 1;
+                    el(
+                        "address",
+                        &[
+                            ("type", "pci"),
+                            ("domain", "0x0000"),
+                            ("bus", "0x0a"),
+                            ("slot", "0x00"),
+                            ("function", &port.to_string()),
+                        ],
+                    )
+                }
+                _ => continue,
+            };
+            e.children.push(XMLNode::Element(addr));
+        }
+        let defined = emit(&root).unwrap();
+        let again = edit_domain(&defined, &w).unwrap();
+        assert_eq!(canon(&again), canon(&defined), "{again}");
+        for p in ["port=\"4\"", "port=\"5\"", "port=\"6\""] {
+            assert!(again.contains(p), "{p}: {again}");
+        }
+        assert_eq!(
+            again
+                .matches("type=\"pci\" domain=\"0x0000\" bus=\"0x0a\"")
+                .count(),
+            2
+        );
+        // A share that goes away takes its address with it.
+        let none = apply_shares(&again, &[]).unwrap();
+        assert_eq!(none.matches("bus=\"0x0a\"").count(), 1, "{none}");
+    }
+
+    #[test]
+    fn a_missing_conduit_bios_goes_back_to_the_stock_loader() {
+        let bios = Path::new("/usr/share/conduit/bios");
+        let attached = edit_bios(UEFI, Some(bios), None);
+        let gone = |_: &str| false;
+        let there = |_: &str| true;
+        assert!(restore_missing_bios(&attached, &there).is_none());
+        let (fixed, stock) = restore_missing_bios(&attached, &gone).unwrap();
+        assert_eq!(stock, "/usr/share/OVMF/OVMF_CODE_4M.fd");
+        assert_eq!(os_child(&fixed, "loader").get_text().unwrap(), stock);
+        assert!(!meta_vm(&fixed).attributes.contains_key("stock-loader"));
+        assert!(
+            virt::is_ours(&fixed),
+            "still attached, only the firmware changed"
+        );
+        // The recorded stock loader wins (an ms.fd VM on the secboot image).
+        let ms = UEFI.replace("OVMF_CODE_4M.fd", "OVMF_CODE_4M.ms.fd");
+        let (_, stock) = restore_missing_bios(&edit_bios(&ms, Some(bios), None), &gone).unwrap();
+        assert_eq!(stock, "/usr/share/OVMF/OVMF_CODE_4M.ms.fd");
+        // Stock firmware, or no loader: nothing to do.
+        assert!(restore_missing_bios(UEFI, &gone).is_none());
+        assert!(restore_missing_bios(DOMAIN, &gone).is_none());
+    }
+
+    #[test]
+    fn a_firmware_swap_on_a_tpm_vm_warns_about_sealed_keys() {
+        let bios = Path::new("/usr/share/conduit/bios");
+        let m = machines();
+        let w = wiring_with(Some(bios), false, Some(&m), &[]);
+        let tpm = UEFI.replace(
+            "</devices>",
+            "<tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm></devices>",
+        );
+        let n = notes(&tpm, &w);
+        assert!(n.iter().any(|n| n == bios::TPM_WARNING), "{n:?}");
+        assert!(
+            !notes(UEFI, &w).iter().any(|n| n.contains("PCR0")),
+            "no TPM"
+        );
+        // Re-attach with the BIOS in place: the firmware does not change.
+        let again = edit_domain(&tpm, &w).unwrap();
+        assert!(!notes(&again, &w).iter().any(|n| n.contains("PCR0")));
+        // No Conduit BIOS installed: nothing changes, nothing to warn about.
+        let w = wiring_with(None, false, Some(&m), &[]);
+        assert!(!notes(&tpm, &w).iter().any(|n| n.contains("PCR0")));
+    }
+
+    #[test]
+    fn backups_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("conduit-backup-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("libvirt-backup-x.xml");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        sys::write_private(&f, "<domain><graphics passwd='secret'/></domain>").unwrap();
+        let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(std::fs::read_to_string(&f).unwrap().contains("secret"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_libvirt_without_video_resolution_gets_the_definition_without_it() {
+        let out = edit_bios(UEFI, None, Some((5120, 1440)));
+        assert!(out.contains("<resolution"));
+        let plain = without_resolution(&out).unwrap();
+        assert!(!plain.contains("resolution"), "{plain}");
+        assert_eq!(canon(&without_resolution(&plain).unwrap()), canon(&plain));
+        assert!(refused_resolution(
+            "error: XML document failed to validate against schema: Element model has extra content: resolution"
+        ));
+        assert!(!refused_resolution(
+            "error: unsupported configuration: maxphysaddr"
+        ));
     }
 }
