@@ -597,6 +597,9 @@ unsafe fn translate(h_context: HANDLE, args: Call<'_>) -> NTSTATUS {
         }
         id
     };
+    // A refill of this DMA buffer: the context's unsubmitted jobs of its earlier fills are dead
+    // (also when this render committed no job).
+    gx::note_render(h_context as usize, dma_va, job);
     let rec = ga::Private { job }.encode();
     PRV_SZ.store((PRV_SZ.load(Ordering::Relaxed) & !0xffff) | private_size.min(0xffff), Ordering::Relaxed);
     if !p_private.is_null() {

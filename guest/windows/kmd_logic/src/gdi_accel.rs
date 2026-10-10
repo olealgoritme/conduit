@@ -1694,12 +1694,14 @@ pub enum Recordless {
     /// ([`orphaned_by`]).
     Exact { id: u64 },
     /// No unclaimed job of the context is in the submitted buffer: a preempted buffer's replay
-    /// (its job is claimed already), or a buffer RenderGdi wrote no job into. Nothing is admitted;
-    /// the fence still waits for the context's outstanding jobs ([`context_gate`]).
-    Nothing,
-    /// The submission names no buffer (`va == 0`, the non-virtual SubmitCommand), or no
-    /// submission on this adapter has ever named a rendered buffer (`paired == false`): admit every
-    /// unclaimed job of the context, oldest first.
+    /// (its job is claimed already), or a buffer RenderGdi wrote no job into. Only the context's
+    /// unclaimed jobs that carry no VA (RenderKm, or a RenderGdi buffer dxgkrnl had not paged in)
+    /// are admitted, oldest first, since no submission could ever name them; the fence still
+    /// waits for the context's outstanding jobs ([`context_gate`]).
+    Unaddressed,
+    /// The submission names no buffer (`va == 0`, the non-virtual SubmitCommand), or the pairing
+    /// is not established yet (`paired == false`): admit every unclaimed job of the context,
+    /// oldest first.
     AllUnclaimed,
 }
 
@@ -1724,8 +1726,9 @@ pub const fn in_buffer(dma_va: u64, va: u64, size: u64) -> bool {
 /// The submission does name its buffer: `DmaBufferVirtualAddress`, the same GPU VA RenderGdi was
 /// given for it. So the submitted buffer's job is identified exactly; jobs of buffers rendered
 /// ahead stay unclaimed until their own submission. `paired` is the adapter's proof that RenderGdi
-/// and SubmitCommandVirtual agree on that VA (some submission found its job by it); until then the
-/// old rule stays, so a driver/OS combination where the VAs differ keeps today's behavior.
+/// and SubmitCommandVirtual agree on that VA ([`PAIRING_HITS`] submissions found their job by it);
+/// until then a submission whose buffer holds no job falls back to the old rule, so a driver/OS
+/// combination where the VAs differ keeps today's behavior.
 pub fn recordless_admit(
     jobs: impl IntoIterator<Item = JobView>,
     ctx: usize,
@@ -1743,9 +1746,23 @@ pub fn recordless_admit(
         .max();
     match newest {
         Some(id) => Recordless::Exact { id },
-        None if paired => Recordless::Nothing,
+        None if paired => Recordless::Unaddressed,
         None => Recordless::AllUnclaimed,
     }
+}
+
+/// Exact VA matches before a buffer without a job stops falling back to "every unclaimed job":
+/// more than one, so a coincidental match between address spaces that do not agree cannot
+/// establish the pairing.
+pub const PAIRING_HITS: u32 = 8;
+
+/// RenderGdi filled the DMA buffer at `dma_va` on `ctx` (committing job `new_id`, or no job: 0).
+/// Whether `j` is an earlier, never-submitted render of that buffer: dxgkrnl cannot refill a buffer
+/// whose contents still wait for submission, so its unclaimed job is dead. Dropped at render time
+/// (PASSIVE), also when the new render commits no job (empty, run synchronously, or refused):
+/// otherwise the refilled buffer's submission would find the dead job in it and run it.
+pub fn superseded_by_render(j: &JobView, ctx: usize, dma_va: u64, new_id: u64) -> bool {
+    dma_va != 0 && j.ctx == ctx && !j.claimed && j.dma_va == dma_va && j.id != new_id
 }
 
 /// After `Recordless::Exact { id }` for buffer `[va, va + size)` on `ctx`: whether `j` is an
@@ -1949,11 +1966,13 @@ pub const COUNTERS: &[&str] = &[
     "GdiClmMax",
     "GdiReGate",
     // Record-less submissions that found their buffer's job by its DMA VA, ones that found none
-    // after the pairing was established (replays, buffers without a job), and earlier renders of
-    // a submitted buffer dropped as never submitted.
+    // after the pairing was established (replays, buffers without a job), earlier renders of a
+    // submitted buffer dropped at submission, and unsubmitted jobs dropped because RenderGdi
+    // refilled their buffer.
     "GdiVaHit",
     "GdiVaNone",
     "GdiVaOrph",
+    "GdiVaSup",
     // Allocation destroys that waited for queued GDI jobs naming the allocation, waits that ran
     // out, destroys of an allocation a not yet submitted job names, the longest wait (µs).
     "GdiFreeWait",
@@ -2962,7 +2981,7 @@ mod tests {
         assert_eq!(recordless_admit(jobs, 7, 0x2000, 0x1000, true), Recordless::Exact { id: 2 });
         // Another context's job in a buffer at the same VA is not this context's.
         let jobs = [view(3, 8, false, 0x1000)];
-        assert_eq!(recordless_admit(jobs, 7, 0x1000, 0x1000, true), Recordless::Nothing);
+        assert_eq!(recordless_admit(jobs, 7, 0x1000, 0x1000, true), Recordless::Unaddressed);
     }
 
     #[test]
@@ -2972,7 +2991,7 @@ mod tests {
         assert_eq!(recordless_admit(jobs, 7, 0, 0, true), Recordless::AllUnclaimed);
         // Jobs without a VA (RenderKm) never match a buffer.
         let jobs = [view(1, 7, false, 0)];
-        assert_eq!(recordless_admit(jobs, 7, 0x1000, 0x1000, true), Recordless::Nothing);
+        assert_eq!(recordless_admit(jobs, 7, 0x1000, 0x1000, true), Recordless::Unaddressed);
     }
 
     #[test]
@@ -2984,6 +3003,36 @@ mod tests {
         let orphans: Vec<u64> =
             jobs.iter().filter(|j| orphaned_by(j, 3, 7, 0x1000, 0x1000)).map(|j| j.id).collect();
         assert_eq!(orphans, vec![1]);
+    }
+
+    #[test]
+    fn a_jobless_refill_supersedes_the_dead_job() {
+        // Job 1 rendered into 0x1000, never submitted; the buffer is refilled with no job (sync
+        // mode or empty). The render drops job 1, so the refill's submission finds nothing.
+        let mut jobs = vec![view(1, 7, false, 0x1000), view(2, 7, false, 0x2000), view(3, 8, false, 0x1000)];
+        jobs.retain(|j| !superseded_by_render(j, 7, 0x1000, 0));
+        assert_eq!(jobs.iter().map(|j| j.id).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(recordless_admit(jobs.iter().copied(), 7, 0x1000, 0x1000, true), Recordless::Unaddressed);
+        // A refill that commits a job keeps the new one.
+        let mut jobs = vec![view(1, 7, false, 0x1000), view(4, 7, false, 0x1000)];
+        jobs.retain(|j| !superseded_by_render(j, 7, 0x1000, 4));
+        assert_eq!(jobs.iter().map(|j| j.id).collect::<Vec<_>>(), vec![4]);
+        // A claimed job is never superseded (its replay must still find it gated).
+        assert!(!superseded_by_render(&view(1, 7, true, 0x1000), 7, 0x1000, 0));
+        // RenderKm (no VA) supersedes nothing.
+        assert!(!superseded_by_render(&view(1, 7, false, 0), 7, 0, 0));
+    }
+
+    #[test]
+    fn pairing_transition() {
+        // Unpaired: a buffer without a job falls back to every unclaimed job; an exact match is
+        // used either way.
+        let jobs = [view(1, 7, false, 0x1000), view(2, 7, false, 0x2000)];
+        assert_eq!(recordless_admit(jobs, 7, 0x3000, 0x1000, false), Recordless::AllUnclaimed);
+        assert_eq!(recordless_admit(jobs, 7, 0x2000, 0x1000, false), Recordless::Exact { id: 2 });
+        // Paired: the same submission admits only jobs no submission can name.
+        assert_eq!(recordless_admit(jobs, 7, 0x3000, 0x1000, true), Recordless::Unaddressed);
+        assert!(PAIRING_HITS > 1);
     }
 
     #[test]
@@ -3014,7 +3063,7 @@ mod tests {
                     j.0.claimed = true;
                     j.1 = Some(t.next());
                 }
-                Recordless::Nothing => {}
+                Recordless::Unaddressed => {}
                 Recordless::AllUnclaimed => unreachable!(),
             }
             context_gate(jobs.iter().map(|(_, s)| *s), t.completed)

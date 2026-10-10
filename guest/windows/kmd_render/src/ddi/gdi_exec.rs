@@ -448,7 +448,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &CLAIM_MULTI, &CLAIM_MAX, &REGATE, &FREE_WAIT, &FREE_TO, &FREE_UNS, &FREE_US, &PITCH_IGN, &PITCH_IGN_V,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &CLAIM_MULTI, &CLAIM_MAX, &REGATE, &VA_HIT, &VA_NONE, &VA_ORPH, &VA_SUPER, &FREE_WAIT, &FREE_TO, &FREE_UNS, &FREE_US, &PITCH_IGN, &PITCH_IGN_V,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -605,6 +605,7 @@ pub(crate) fn publish_counters() {
     w(b"GdiVaHit", VA_HIT.load(Ordering::Relaxed));
     w(b"GdiVaNone", VA_NONE.load(Ordering::Relaxed));
     w(b"GdiVaOrph", VA_ORPH.load(Ordering::Relaxed));
+    w(b"GdiVaSup", VA_SUPER.load(Ordering::Relaxed));
     w(b"GdiFreeWait", FREE_WAIT.load(Ordering::Relaxed));
     w(b"GdiFreeTo", FREE_TO.load(Ordering::Relaxed));
     w(b"GdiFreeUns", FREE_UNS.load(Ordering::Relaxed));
@@ -759,16 +760,64 @@ static CLAIM_MAX: AtomicU32 = AtomicU32::new(0);
 /// the context's outstanding jobs (`GdiReGate`): resubmissions after a preemption, or a buffer
 /// whose job an earlier submission admitted.
 static REGATE: AtomicU32 = AtomicU32::new(0);
-/// Record-less submissions that found their buffer's job by its DMA VA (`GdiVaHit`), ones that
-/// found none once the pairing held (`GdiVaNone`: replays, buffers without a job), and earlier
-/// renders of a submitted buffer dropped as never submitted (`GdiVaOrph`).
+/// Record-less submissions that found their buffer's job by its DMA VA (`GdiVaHit`; at
+/// `gdi_accel::PAIRING_HITS` the pairing holds: RenderGdi's `DmaBufferGpuVirtualAddress` and
+/// SubmitCommandVirtual's `DmaBufferVirtualAddress` agree here), ones that found none once the
+/// pairing held (`GdiVaNone`: replays, buffers without a job), earlier renders of a submitted
+/// buffer dropped at submission (`GdiVaOrph`, expected 0: the render-time drop comes first), and
+/// unsubmitted jobs dropped because RenderGdi refilled their buffer (`GdiVaSup`).
 static VA_HIT: AtomicU32 = AtomicU32::new(0);
 static VA_NONE: AtomicU32 = AtomicU32::new(0);
 static VA_ORPH: AtomicU32 = AtomicU32::new(0);
-/// Some record-less submission on this boot found its job by the DMA VA RenderGdi recorded, i.e.
-/// RenderGdi's `DmaBufferGpuVirtualAddress` and SubmitCommandVirtual's `DmaBufferVirtualAddress`
-/// agree here. Until then the record-less rule stays "every unclaimed job of the context".
-static VA_PAIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static VA_SUPER: AtomicU32 = AtomicU32::new(0);
+
+/// RenderGdi (PASSIVE) filled the DMA buffer at `dma_va` on `ctx`, committing job `new_id` (0: no
+/// job). Drops the context's unclaimed jobs of earlier fills of that buffer
+/// (`gdi_accel::superseded_by_render`): dxgkrnl cannot refill a buffer whose contents still wait
+/// for submission, so those were never submitted, and the refill's submission must not find one.
+pub(crate) fn note_render(ctx: usize, dma_va: u64, new_id: u64) {
+    if dma_va == 0 {
+        return;
+    }
+    let dead: Vec<Job> = {
+        let mut t = TABLE.lock();
+        let mut dead = Vec::new();
+        let n = t
+            .jobs
+            .iter()
+            .filter(|j| {
+                let v = ga::JobView { id: j.id, ctx: j.ctx, claimed: j.seq.is_some(), dma_va: j.dma_va };
+                ga::superseded_by_render(&v, ctx, dma_va, new_id)
+            })
+            .count();
+        if n == 0 {
+            return;
+        }
+        if dead.try_reserve(n).is_err() {
+            // No room to move them out: drop them in place (plain pool memory).
+            t.jobs.retain(|j| {
+                let v = ga::JobView { id: j.id, ctx: j.ctx, claimed: j.seq.is_some(), dma_va: j.dma_va };
+                !ga::superseded_by_render(&v, ctx, dma_va, new_id)
+            });
+        } else {
+            let mut i = 0;
+            while i < t.jobs.len() {
+                let j = &t.jobs[i];
+                let v = ga::JobView { id: j.id, ctx: j.ctx, claimed: j.seq.is_some(), dma_va: j.dma_va };
+                if ga::superseded_by_render(&v, ctx, dma_va, new_id) {
+                    dead.push(t.jobs.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        VA_SUPER.fetch_add(n as u32, Ordering::Relaxed);
+        ORPH.fetch_add(n as u32, Ordering::Relaxed);
+        dead
+    };
+    // Freed outside the table lock, at PASSIVE.
+    drop(dead);
+}
 
 /// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH), for the DMA buffer at
 /// GPU VA `va` of `size` bytes (0: not known): admit the job RenderGdi rendered into that buffer
@@ -789,8 +838,12 @@ static VA_PAIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 /// work that was not its own. Claiming only the oldest unclaimed job went wrong the other way
 /// whenever a rendered buffer was never submitted (each later fence was gated on the job before
 /// its own; CDD destroyed a copy's source while the job still had to read it, `GdiLutAp` 0x0D).
-/// Until a submission has matched a job by its VA on this boot (`VA_PAIRED`), and for a
-/// submission without a VA, every unclaimed job of the context is admitted as before.
+/// Jobs that carry no VA (RenderKm, a RenderGdi buffer not paged in) can never be named by a
+/// submission and are admitted by any record-less submission of their context that finds no job
+/// in its own buffer. Until `gdi_accel::PAIRING_HITS` submissions have matched a job by VA on this
+/// boot, and for a submission without a VA, such a submission admits every unclaimed job of the
+/// context as before. Earlier fills of a buffer are dropped when RenderGdi refills it
+/// ([`note_render`]).
 ///
 /// Returns the gate (`None`: nothing of the context outstanding) and whether a job was admitted.
 pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize, va: u64, size: u64) -> (Option<u64>, bool) {
@@ -803,7 +856,7 @@ pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize, va: u64, siz
             ctx,
             va,
             size,
-            VA_PAIRED.load(Ordering::Relaxed),
+            VA_HIT.load(Ordering::Relaxed) >= ga::PAIRING_HITS,
         );
         match pick {
             ga::Recordless::Exact { id } => {
@@ -822,7 +875,22 @@ pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize, va: u64, siz
                     n = 1;
                 }
             }
-            ga::Recordless::Nothing => {}
+            ga::Recordless::Unaddressed => loop {
+                // Jobs no submission can name (no VA): oldest first, as before the pairing.
+                let Some(i) = t
+                    .jobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, j)| j.ctx == ctx && j.seq.is_none() && j.dma_va == 0)
+                    .min_by_key(|(_, j)| j.id)
+                    .map(|(i, _)| i)
+                else {
+                    break;
+                };
+                let seq = t.tl.next();
+                t.jobs[i].seq = Some(seq);
+                n += 1;
+            },
             ga::Recordless::AllUnclaimed => loop {
                 let Some(i) = t
                     .jobs
@@ -846,10 +914,9 @@ pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize, va: u64, siz
     };
     match exact {
         ga::Recordless::Exact { .. } => {
-            VA_PAIRED.store(true, Ordering::Relaxed);
             VA_HIT.fetch_add(1, Ordering::Relaxed);
         }
-        ga::Recordless::Nothing => {
+        ga::Recordless::Unaddressed => {
             VA_NONE.fetch_add(1, Ordering::Relaxed);
         }
         ga::Recordless::AllUnclaimed => {}
