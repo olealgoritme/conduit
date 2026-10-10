@@ -17,10 +17,16 @@
  *     names the color sample count with VkAttachmentSampleCountInfoAMD;
  *   - a single-sample depth attachment with depth test off and raster 16
  *     (no target-independent rasterization with a depth attachment: the
- *     draw rasterizes at one sample, so every covered pixel is white even
- *     with linear modulation);
- *   - color 1 sample, depth 4 samples, raster 4 (not supported by the
- *     driver: the device must just survive it).
+ *     draw rasterizes at one sample, at the one-sample position, so the
+ *     result must equal a plain single-sample draw pixel for pixel);
+ *   - color 1 sample, depth 4 samples, raster 4, and color 4 samples,
+ *     depth 1 sample, raster 4, with depth clears (not supported by the
+ *     driver: the device must just survive them, every access staying
+ *     inside both images).
+ *
+ * NVK exposes VK_NV_framebuffer_mixed_samples only where driconf
+ * nvk_mixed_samples is on (DXVK); run this test with nvk_mixed_samples=true
+ * in the environment.
  *
  * Prints PASS/FAIL per case and a RESULT line.  Picks the device by name
  * (default "NVK").  A few small draws.
@@ -51,8 +57,8 @@ static VkQueue queue;
 static VkCommandPool pool;
 static VkPipelineLayout layout;
 static VkShaderModule vs_mod, fs_mod;
-static VkImage color_img;
-static VkImageView color_view;
+static VkImage color_img, color4_img;
+static VkImageView color_view, color4_view;
 static VkBuffer readback;
 static uint8_t *readback_map;
 
@@ -89,6 +95,8 @@ static VkImage make_image(VkFormat format, VkSampleCountFlagBits samples, VkImag
 
 struct pipe_desc {
    VkSampleCountFlagBits raster;
+   VkSampleCountFlagBits color_samples;  /* 0: 1 sample */
+   int clear_depth_in_pass;        /* vkCmdClearAttachments on the depth */
    VkFormat depth_format;          /* VK_FORMAT_UNDEFINED: no depth attachment */
    VkSampleCountFlagBits depth_samples;
    VkBool32 depth_test;
@@ -129,7 +137,7 @@ static VkPipeline make_pipeline(const struct pipe_desc *d)
    VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xf };
    VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
       .attachmentCount = 1, .pAttachments = &cba };
-   VkSampleCountFlagBits color_samples = VK_SAMPLE_COUNT_1_BIT;
+   VkSampleCountFlagBits color_samples = d->color_samples ? d->color_samples : VK_SAMPLE_COUNT_1_BIT;
    VkAttachmentSampleCountInfoAMD asc = { VK_STRUCTURE_TYPE_ATTACHMENT_SAMPLE_COUNT_INFO_AMD,
       .colorAttachmentCount = 1, .pColorAttachmentSamples = &color_samples,
       .depthStencilAttachmentSamples = d->depth_format ? d->depth_samples : 0 };
@@ -157,10 +165,14 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, 
 }
 
 /* Draw with `pipe` (in a secondary if `secondary`), read the alpha channel
- * back into `alpha`.  Returns false if the device was lost.
+ * back into `alpha` (single-sample color only).  Returns false if the
+ * device was lost.
  */
 static int run(VkPipeline pipe, const struct pipe_desc *d, int secondary, uint8_t *alpha)
 {
+   const int color4 = d->color_samples == VK_SAMPLE_COUNT_4_BIT;
+   VkImage cimg = color4 ? color4_img : color_img;
+   VkImageView cview = color4 ? color4_view : color_view;
    VkImage depth_img = VK_NULL_HANDLE;
    VkImageView depth_view = VK_NULL_HANDLE;
    if (d->depth_format)
@@ -176,14 +188,14 @@ static int run(VkPipeline pipe, const struct pipe_desc *d, int secondary, uint8_
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
    CHECK(vkBeginCommandBuffer(cb, &cbbi));
 
-   barrier(cb, color_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+   barrier(cb, cimg, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
    if (depth_img)
       barrier(cb, depth_img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
               VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-      .imageView = color_view, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .imageView = cview, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
       .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };
    VkRenderingAttachmentInfo da = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
       .imageView = depth_view, .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
@@ -222,9 +234,16 @@ static int run(VkPipeline pipe, const struct pipe_desc *d, int secondary, uint8_
    } else {
       vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
       vkCmdDraw(cb, 3, 1, 0, 0);
+      if (d->clear_depth_in_pass) {
+         VkClearAttachment ca_d = { VK_IMAGE_ASPECT_DEPTH_BIT, .clearValue.depthStencil.depth = 0.25f };
+         VkClearRect cr = { { { 0, 0 }, { W, H } }, 0, 1 };
+         vkCmdClearAttachments(cb, 1, &ca_d, 1, &cr);
+         vkCmdDraw(cb, 3, 1, 0, 0);
+      }
    }
    vkCmdEndRendering(cb);
 
+   if (!color4) {
    barrier(cb, color_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
            VK_ACCESS_TRANSFER_READ_BIT);
@@ -235,6 +254,7 @@ static int run(VkPipeline pipe, const struct pipe_desc *d, int secondary, uint8_
       .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                         0, 1, &host, 0, NULL, 0, NULL);
+   }
    CHECK(vkEndCommandBuffer(cb));
 
    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -249,7 +269,7 @@ static int run(VkPipeline pipe, const struct pipe_desc *d, int secondary, uint8_
       return 0;
    }
    for (uint32_t i = 0; i < W * H; i++)
-      alpha[i] = readback_map[i * 4 + 3];
+      alpha[i] = color4 ? 0 : readback_map[i * 4 + 3];
    vkDestroyFence(dev, fence, NULL);
    vkFreeCommandBuffers(dev, pool, 1, &cb);
    if (sec)
@@ -322,7 +342,8 @@ int main(int argc, char **argv)
    for (uint32_t i = 0; i < next; i++)
       have |= !strcmp(exts[i].extensionName, VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
    if (!have) {
-      printf("VK_NV_framebuffer_mixed_samples not supported\nRESULT: SKIP\n");
+      printf("VK_NV_framebuffer_mixed_samples not supported (NVK: set nvk_mixed_samples=true)\n"
+             "RESULT: SKIP\n");
       return 0;
    }
    const char *dev_exts[] = { VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME };
@@ -359,6 +380,8 @@ int main(int argc, char **argv)
    color_img = make_image(VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT,
                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                           &color_view, VK_IMAGE_ASPECT_COLOR_BIT);
+   color4_img = make_image(VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_4_BIT,
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &color4_view, VK_IMAGE_ASPECT_COLOR_BIT);
    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = W * H * 4,
       .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
    CHECK(vkCreateBuffer(dev, &bci, NULL, &readback));
@@ -471,21 +494,32 @@ int main(int argc, char **argv)
       vkDestroyPipeline(dev, p, NULL);
    }
 
-   /* Single-sample depth attachment, tests off, raster 16: one sample */
+   /* Single-sample depth attachment, tests off, raster 16: no
+    * target-independent rasterization, so exactly a single-sample draw
+    */
    {
+      static uint8_t ref[W * H];
+      struct pipe_desc r1 = { .raster = VK_SAMPLE_COUNT_1_BIT, .mode = VK_COVERAGE_MODULATION_MODE_NONE_NV };
+      VkPipeline p = make_pipeline(&r1);
+      if (!run(p, &r1, 0, ref))
+         return 2;
+      vkDestroyPipeline(dev, p, NULL);
+
       struct pipe_desc d = { .raster = VK_SAMPLE_COUNT_16_BIT, .depth_format = VK_FORMAT_D32_SFLOAT,
                              .depth_samples = VK_SAMPLE_COUNT_1_BIT,
                              .mode = VK_COVERAGE_MODULATION_MODE_RGBA_NV };
-      VkPipeline p = make_pipeline(&d);
+      p = make_pipeline(&d);
       if (!run(p, &d, 0, alpha))
          return 2;
+      uint32_t diff = 0, ref_covered = 0;
+      for (uint32_t i = 0; i < W * H; i++) {
+         diff += alpha[i] != ref[i];
+         ref_covered += ref[i] != 0;
+      }
       levels(alpha, set, &covered);
-      int partial = 0;
-      for (int a = 1; a < 255; a++)
-         partial += set[a];
-      snprintf(detail, sizeof(detail), "interior %3u, %5u covered, %d partial levels", INTERIOR, covered,
-               partial);
-      report("raster 16, 1x depth attached", covered > 8000 && partial == 0, detail);
+      snprintf(detail, sizeof(detail), "%5u covered (1x draw %5u), %u pixels differ", covered,
+               ref_covered, diff);
+      report("raster 16, 1x depth attached", diff == 0 && ref_covered > 8000, detail);
       vkDestroyPipeline(dev, p, NULL);
    }
 
@@ -493,12 +527,30 @@ int main(int argc, char **argv)
    {
       struct pipe_desc d = { .raster = VK_SAMPLE_COUNT_4_BIT, .depth_format = VK_FORMAT_D32_SFLOAT,
                              .depth_samples = VK_SAMPLE_COUNT_4_BIT, .depth_test = VK_TRUE,
+                             .clear_depth_in_pass = 1,
                              .mode = VK_COVERAGE_MODULATION_MODE_NONE_NV };
       VkPipeline p = make_pipeline(&d);
       int alive = run(p, &d, 0, alpha);
       levels(alpha, set, &covered);
       snprintf(detail, sizeof(detail), "device %s, %5u covered", alive ? "alive" : "LOST", covered);
       report("color 1x, depth 4x, raster 4", alive, detail);
+      if (!alive)
+         return 2;
+      vkDestroyPipeline(dev, p, NULL);
+   }
+
+   /* Color 4 samples, depth 1 sample, raster 4, depth cleared by the
+    * load op and by vkCmdClearAttachments: unsupported, must survive
+    */
+   {
+      struct pipe_desc d = { .raster = VK_SAMPLE_COUNT_4_BIT, .color_samples = VK_SAMPLE_COUNT_4_BIT,
+                             .depth_format = VK_FORMAT_D32_SFLOAT,
+                             .depth_samples = VK_SAMPLE_COUNT_1_BIT, .clear_depth_in_pass = 1,
+                             .mode = VK_COVERAGE_MODULATION_MODE_NONE_NV };
+      VkPipeline p = make_pipeline(&d);
+      int alive = run(p, &d, 0, alpha);
+      snprintf(detail, sizeof(detail), "device %s", alive ? "alive" : "LOST");
+      report("color 4x, depth 1x, raster 4", alive, detail);
       if (!alive)
          return 2;
       vkDestroyPipeline(dev, p, NULL);
