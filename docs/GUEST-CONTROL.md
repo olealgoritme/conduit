@@ -77,6 +77,12 @@ current user plus Steam games (`libraryfolders.vdf`, `appmanifest_*.acf`, starte
 as `steam://rungameid/ID`). The tray menu has a Recent launches submenu with the
 last eight programs; clicking one stops it (shortcuts, documents and `steam://` URLs are handed to the shell, so they have no process of Conduit's to list or stop).
 
+The port stays open for the life of the app. While no host client is
+connected (the CLI connects per request) the VirtIO serial driver fails reads
+with `ERROR_NO_SYSTEM_RESOURCES`; the app asks again every 100 ms instead of
+closing the port, so a command is never sent into a closed port. State changes
+(port opened, closed, open failed) go to `%ProgramData%\Conduit\ctl.log`.
+
 ## Linux guests
 
 `conduit-ctl-agent` (`guest/agent`, Python 3, standard library only) runs as a

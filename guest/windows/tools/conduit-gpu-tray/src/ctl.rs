@@ -2,10 +2,18 @@
 //! virtio-serial port, one JSON request per line in, one reply line out.
 //! The request handling is `gpu_tray::ctl_logic`; this is the port I/O.
 //!
-//! The reader blocks on overlapped I/O (no polling); each request runs on
-//! its own short-lived thread so a slow op never holds up the others, and
-//! replies are written one at a time under a lock. Nothing here runs until
-//! the port exists: before that a slow retry loop is all there is.
+//! The reader blocks on overlapped I/O while a host client is connected;
+//! each request runs on its own short-lived thread so a slow op never holds
+//! up the others, and replies are written one at a time under a lock.
+//! Nothing here runs until the port exists: before that a slow retry loop is
+//! all there is.
+//!
+//! The VirtIO serial driver fails reads and writes with
+//! `ERROR_NO_SYSTEM_RESOURCES` while no host client is connected to the
+//! port's socket (the CLI connects per request). That is not an error of the
+//! port: it stays open, so the host sees the guest end as connected, and the
+//! reader asks again shortly. Closing it instead would drop whatever the
+//! host sends while the port is closed.
 
 use crate::apps::{self, ComGuard};
 use crate::launch;
@@ -26,6 +34,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
 
 /// Requests running at once; more are answered "busy".
 const MAX_INFLIGHT: usize = 8;
+/// How often the reader asks again while no host client is connected.
+const HOST_POLL: Duration = Duration::from_millis(100);
 /// A reply that cannot be written for this long is abandoned.
 const WRITE_TIMEOUT_MS: u32 = 30_000;
 
@@ -186,8 +196,16 @@ impl Conn {
             let chunk = data.len().min(1 << 20);
             match self.io(&ev, true, data.as_ptr() as *mut u8, chunk as u32) {
                 Ok(n) if n > 0 => data = &data[(n as usize).min(data.len())..],
+                Err(ERROR_NO_SYSTEM_RESOURCES) => {
+                    // The host client left before its reply: drop the reply.
+                    return false;
+                }
                 _ => {
+                    // The port is unusable: end the reader too (its read
+                    // completes as cancelled), so `serve` opens it afresh
+                    // instead of listening on a port that never replies.
                     self.broken.store(true, Relaxed);
+                    unsafe { CancelIoEx(self.h, null()) };
                     return false;
                 }
             }
@@ -207,7 +225,7 @@ impl Drop for Inflight<'_> {
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Reads requests until the port fails; true when it carried any.
-fn connection(agent: &Arc<Agent<WinBackend>>, conn: Arc<Conn>) -> bool {
+fn connection(agent: &Arc<Agent<WinBackend>>, conn: Arc<Conn>, ended: &mut u32) -> bool {
     let Some(ev) = Event::new() else {
         return false;
     };
@@ -217,7 +235,18 @@ fn connection(agent: &Arc<Agent<WinBackend>>, conn: Arc<Conn>) -> bool {
     loop {
         let n = match conn.read(&ev, &mut buf) {
             Ok(n) if n > 0 => n as usize,
-            _ => break,
+            Ok(_) => break,
+            Err(ERROR_NO_SYSTEM_RESOURCES) => {
+                // No host client right now. Whatever half-line the last one
+                // left must not run into the next one's first request.
+                lines = LineReader::default();
+                std::thread::sleep(HOST_POLL);
+                continue;
+            }
+            Err(e) => {
+                *ended = e;
+                break;
+            }
         };
         any = true;
         for line in lines.push(&buf[..n]) {
@@ -246,6 +275,35 @@ fn connection(agent: &Arc<Agent<WinBackend>>, conn: Arc<Conn>) -> bool {
     any
 }
 
+/// Appends one line to `%ProgramData%\Conduit\ctl.log` (restarted when it
+/// passes 64 KiB). Only state changes are logged, never requests.
+fn log(msg: &str) {
+    use std::io::Write;
+    let Some(dir) = std::env::var_os("ProgramData") else {
+        return;
+    };
+    let path = PathBuf::from(dir).join("Conduit").join("ctl.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 64 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{} {msg}", stamp());
+    }
+}
+
+/// Seconds since the tray started, for the log.
+fn stamp() -> String {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    format!(
+        "[+{:.1}s]",
+        START.get_or_init(Instant::now).elapsed().as_secs_f32()
+    )
+}
+
 /// Serves the channel for good: the port may not exist yet, may be taken,
 /// may go away (the host side reconnecting, the VM resuming); start over
 /// with a growing pause, up to 15 seconds.
@@ -254,13 +312,30 @@ pub fn serve() {
         WinBackend,
         format!("conduit-tray {}", env!("CARGO_PKG_VERSION")),
     ));
+    stamp();
     let mut pause = Duration::from_secs(1);
+    let mut last_open_err = 0u32;
     loop {
-        if let Ok(conn) = Conn::open() {
-            let t0 = Instant::now();
-            let any = connection(&agent, Arc::new(conn));
-            if any || t0.elapsed() > Duration::from_secs(10) {
-                pause = Duration::from_secs(1);
+        match Conn::open() {
+            Ok(conn) => {
+                log("port opened");
+                last_open_err = 0;
+                let t0 = Instant::now();
+                let mut ended = 0u32;
+                let any = connection(&agent, Arc::new(conn), &mut ended);
+                log(&format!(
+                    "port closed after {:.1}s (carried requests: {any}, read error {ended})",
+                    t0.elapsed().as_secs_f32()
+                ));
+                if any || t0.elapsed() > Duration::from_secs(10) {
+                    pause = Duration::from_secs(1);
+                }
+            }
+            Err(e) => {
+                if e != last_open_err {
+                    log(&format!("opening the port failed: error {e}"));
+                    last_open_err = e;
+                }
             }
         }
         std::thread::sleep(pause);
