@@ -163,6 +163,7 @@ dependencies = [
  "abi",
  "anyhow",
  "clap",
+ "conduit-ctl",
  "conduit-stats",
  "conduit-trace",
  "conduit-venus",
@@ -172,6 +173,14 @@ dependencies = [
  "serde",
  "serde_json",
  "xmltree",
+]
+
+[[package]]
+name = "conduit-ctl"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
