@@ -17,6 +17,7 @@ mod gfx;
 mod launch;
 #[cfg(windows)]
 mod sendto;
+#[cfg(windows)]
 mod sys;
 #[cfg(windows)]
 mod view;
