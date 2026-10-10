@@ -152,6 +152,12 @@ static void ColorAt(DXGI_FORMAT f, const D3D11_MAPPED_SUBRESOURCE& m, int x, int
   case DXGI_FORMAT_R16G16B16A16_FLOAT:
     for (int k = 0; k < 4; k++) out[k] = Half(((const uint16_t*)row)[x * 4 + k]);
     break;
+  case DXGI_FORMAT_R10G10B10A2_UNORM: {
+    uint32_t v = ((const uint32_t*)row)[x];
+    out[0] = (v & 1023) / 1023.0f; out[1] = ((v >> 10) & 1023) / 1023.0f;
+    out[2] = ((v >> 20) & 1023) / 1023.0f; out[3] = (v >> 30) / 3.0f;
+    break;
+  }
   case DXGI_FORMAT_R11G11B10_FLOAT: {
     uint32_t v = ((const uint32_t*)row)[x];
     out[0] = F11(v & 2047); out[1] = F11((v >> 11) & 2047); out[2] = F10(v >> 22); out[3] = 1;
@@ -265,6 +271,10 @@ int main(int argc, char** argv) {
     {8, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT, "8x RGBA8 D32"},
     {8, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, "8x R11G11B10 D24S8"},
     {2, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, "2x RGBA16F D24S8"},
+    {8, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, "8x RGBA16F D32S8"},
+    {8, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT, "8x RGBA32F D32"},
+    {8, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, "8x RGB10A2 D24S8"},
+    {4, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, "4x RGBA32F D32S8"},
   };
   int failedCases = 0;
   for (const Config& cfg : configs) {
@@ -307,8 +317,9 @@ int main(int argc, char** argv) {
     cbData.samples = cfg.samples;
     ctx->UpdateSubresource(cb, 0, nullptr, &cbData, 0, 0);
 
-    const float dTol = cfg.depthDsv == DXGI_FORMAT_D32_FLOAT ? 0.0f : 1.5f / 16777215.0f;
-    const float cTol = cfg.color == DXGI_FORMAT_R8G8B8A8_UNORM ? 0.5f / 255.0f : 1e-6f;
+    const float dTol = cfg.depthDsv != DXGI_FORMAT_D24_UNORM_S8_UINT ? 0.0f : 1.5f / 16777215.0f;
+    const float cTol = cfg.color == DXGI_FORMAT_R8G8B8A8_UNORM ? 0.5f / 255.0f
+                     : cfg.color == DXGI_FORMAT_R10G10B10A2_UNORM ? 0.5f / 1023.0f : 1e-6f;
     // Counters: resolve, box resolve, depth, copy color, copy depth, band
     // (hardware vs box resolve), frame-to-frame.
     unsigned bad[7] = {0}; int firstX[7], firstY[7]; float firstGot[7][4], firstWant[7][4];
@@ -375,14 +386,14 @@ int main(int argc, char** argv) {
               float wd = t >= 0 ? rects[t].d : 0.0f;
               float got[4]; for (int c = 0; c < 4; c++) got[c] = oc[x * 4 + c];
               bool ok = true;
-              for (int c = 0; c < (cfg.color == DXGI_FORMAT_R11G11B10_FLOAT ? 3 : 4); c++) ok &= std::fabs(got[c] - want[c]) <= cTol;
+              for (int c = 0; c < (cfg.color == DXGI_FORMAT_R11G11B10_FLOAT || cfg.color == DXGI_FORMAT_R10G10B10A2_UNORM ? 3 : 4); c++) ok &= std::fabs(got[c] - want[c]) <= cTol;
               if (!ok) note(pass ? 3 : 1, x, y, got, want);
               float gd[4] = {od[x * 2], od[x * 2 + 1], 0, 0}, wdv[4] = {wd, wd, 0, 0};
               if (std::fabs(gd[0] - wd) > dTol || std::fabs(gd[1] - wd) > dTol) note(pass ? 4 : 2, x, y, gd, wdv);
               if (pass == 0) {
                 ColorAt(cfg.color, rbRes.m, x, y, got);
                 ok = true;
-                for (int c = 0; c < (cfg.color == DXGI_FORMAT_R11G11B10_FLOAT ? 3 : 4); c++) ok &= std::fabs(got[c] - want[c]) <= cTol;
+                for (int c = 0; c < (cfg.color == DXGI_FORMAT_R11G11B10_FLOAT || cfg.color == DXGI_FORMAT_R10G10B10A2_UNORM ? 3 : 4); c++) ok &= std::fabs(got[c] - want[c]) <= cTol;
                 if (!ok) note(0, x, y, got, want);
               }
             } else if (pass == 0) {
