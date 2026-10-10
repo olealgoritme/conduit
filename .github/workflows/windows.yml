@@ -91,6 +91,8 @@ jobs:
       matrix:
         configuration: [Release, Debug]
     steps:
+      # The DXVK and vkd3d-proton patches apply to LF sources; keep the checkout LF
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
           submodules: false
