@@ -141,9 +141,9 @@ settings are environment variables of the process):
 
 **Known limitations:**
 
-- The guest has a single display mode, the host monitor's (5120x1440 on the
-  test machine), with no scaling: a game at a lower resolution is not
-  stretched to fill the screen.
+- The guest exposes one display mode at a time, set by `conduit up --display`,
+  `conduit view NAME WxH@HZ` or the viewer's window size. The driver does not
+  scale, so a game rendering below that mode does not fill the screen.
 - In games, use the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look.
 - Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):
   full-screen games are composed by DWM.
