@@ -22,14 +22,15 @@ fi
 # the user-namespace setting (see the script). Never fails the install.
 /usr/lib/conduit-guest/setup || true
 
-# Clipboard: the device node's permissions (70-conduit-clipboard.rules) and the
-# per-session agent. Best effort; none of it may fail the install.
+# Clipboard and control channel: the device nodes' permissions
+# (70-conduit-clipboard.rules, 70-conduit-ctl.rules) and the per-session agents. Best effort; none of it may fail the install.
 if [ "$chroot" = 0 ] && command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=misc --sysname-match=conduit-clipboard 2>/dev/null || true
+    udevadm trigger --subsystem-match=virtio-ports 2>/dev/null || true
 fi
 if command -v systemctl >/dev/null 2>&1; then
-    systemctl --global enable conduit-clipboard.service 2>/dev/null || true
+    systemctl --global enable conduit-clipboard.service conduit-ctl.service 2>/dev/null || true
     # 50-conduit-powerkey.conf: logind rereads its settings on SIGHUP.
     [ "$chroot" = 1 ] || systemctl kill -s HUP systemd-logind 2>/dev/null || true
 fi
