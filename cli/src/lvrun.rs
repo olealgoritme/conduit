@@ -194,7 +194,7 @@ fn write_next_mode(rt: &Rt, mode: Option<Mode>) -> Result<()> {
 }
 
 /// The running backend's mode: Some(Some(m)) display, Some(None) headless.
-fn running_mode(rt: &Rt) -> Option<Option<Mode>> {
+pub(crate) fn running_mode(rt: &Rt) -> Option<Option<Mode>> {
     let s = std::fs::read_to_string(rt.p(MODE)).ok()?;
     let s = s.trim();
     if s == "none" {
@@ -677,6 +677,11 @@ pub fn backend_exec(name: &str) -> Result<()> {
             .arg(rt.display_sock())
             .arg("--display-socket")
             .arg(rt.stream_sock());
+        // The VM's custom modes (`conduit display`), for a backend that
+        // knows the flag: an older one would refuse to start over it.
+        if run::backend_takes(&backend, "--display-modes") {
+            cmd.arg("--display-modes").arg(crate::display::modes_file(name));
+        }
     }
     let level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         if mode.is_some() {

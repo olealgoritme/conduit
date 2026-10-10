@@ -397,8 +397,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // before anything can fail, so the gate's "verify movement, not presence"
     // rule applies to every counter below.
     crate::diag::reset_fault_counters();
-    // No target mode is committed on a fresh start.
+    // No target mode is committed on a fresh start, and no host mode list is known yet.
     adapter.set_committed_refresh_mhz(0);
+    crate::ddi::mode_list::reset_for_start();
     // Diagnostic override of the vsync heartbeat rate (0 = follow the mode).
     let forced_vsync_mhz = crate::diag::read_config_dword(crate::diag::knobs::VSYNC_RATE_MHZ, 0);
     crate::adapter::kobj::VSYNC_RATE_OVERRIDE_MHZ

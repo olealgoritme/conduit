@@ -118,6 +118,15 @@ pub enum MsgType {
     /// "Presentation feedback". 29 and 32 are left alone (32 is proposed for
     /// the host vblank event).
     ScanoutPresented = 33,
+    /// **Host → guest**, on the event queue: the display's whole mode list
+    /// (`crate::modes`): native first, then the standard and custom modes.
+    /// Payload [`DisplayModeListHeader`] followed by `count`
+    /// [`DisplayModeListEntry`]s. Sent when the event queue goes live and on
+    /// every change, only to a guest that acked the device feature
+    /// [`NVGPU_F_MODE_LIST`]. The guest offers exactly these modes (all at
+    /// `refresh_mhz`) and keeps the current preferred mode (`DisplayMode`)
+    /// in front. See docs/SCANOUT.md "Mode list".
+    DisplayModeList = 34,
     /// Guest → host, control queue: one virtio-gpu control command for the
     /// Venus renderer (docs/VENUS.md), laid out as `crate::venus` describes.
     /// The reply is a header and the virtio-gpu response. Served only when
@@ -156,6 +165,7 @@ impl MsgType {
             27 => Self::ClipboardRequest,
             28 => Self::ScanoutReleased,
             33 => Self::ScanoutPresented,
+            34 => Self::DisplayModeList,
             30 => Self::GpuCmd,
             31 => Self::RmResourceImport,
             _ => return None,
@@ -927,6 +937,74 @@ impl DisplayModeEvent {
     }
 }
 
+/// A **virtio device feature** the guest acks (like [`NVGPU_F_SCANOUT_RELEASE`];
+/// config `features` bit 21 stays unused): the guest wants `DisplayModeList`
+/// events. The backend offers it whenever it has a display; a guest that does
+/// not ack it never gets one and builds its own list, as before.
+pub const NVGPU_F_MODE_LIST: u32 = 1 << 21;
+
+/// Event-queue payload for `MsgType::DisplayModeList`, following a
+/// `MsgHeader` (handle 0, status 0), then `count` entries. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayModeListHeader {
+    /// 0; one scanout for now.
+    pub scanout: u32,
+    /// Entries that follow, 1..=[`crate::modes::MODE_LIST_MAX`]. Entry 0 is
+    /// the native mode.
+    pub count: u32,
+    /// The rate of every mode, millihertz.
+    pub refresh_mhz: u32,
+    /// 0.
+    pub flags: u32,
+}
+
+/// One mode of a `DisplayModeList`. 8 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayModeListEntry {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Size of a whole `DisplayModeList` message of `count` entries.
+pub const fn display_mode_list_message_len(count: usize) -> usize {
+    size_of::<MsgHeader>() + size_of::<DisplayModeListHeader>() + count * size_of::<DisplayModeListEntry>()
+}
+
+/// Encode one `DisplayModeList` message into `out`; `None` if `modes` is
+/// empty or over the cap, or `out` is too small.
+pub fn encode_display_mode_list(
+    modes: &[(u32, u32)],
+    refresh_mhz: u32,
+    out: &mut [u8],
+) -> Option<usize> {
+    let n = display_mode_list_message_len(modes.len());
+    if modes.is_empty() || modes.len() > crate::modes::MODE_LIST_MAX || out.len() < n {
+        return None;
+    }
+    let hdr = MsgHeader::ok(MsgType::DisplayModeList, 0);
+    let words = [
+        hdr.msg_type,
+        hdr.handle,
+        hdr.status as u32,
+        hdr.padding,
+        0,
+        modes.len() as u32,
+        refresh_mhz,
+        0,
+    ];
+    for (i, v) in words.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (k, (w, h)) in modes.iter().enumerate() {
+        let at = 32 + k * 8;
+        out[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        out[at + 4..at + 8].copy_from_slice(&h.to_le_bytes());
+    }
+    Some(n)
+}
+
 /// Size of a whole `DisplayMode` event-queue message.
 pub const DISPLAY_MODE_MESSAGE_LEN: usize = size_of::<MsgHeader>() + size_of::<DisplayModeEvent>();
 
@@ -1482,6 +1560,27 @@ mod tests {
 
     /// The event the guest's event-queue handler decodes: header, then
     /// {scanout, width, height, refresh_mhz}.
+    #[test]
+    fn display_mode_list_encodes_after_a_header() {
+        assert_eq!(size_of::<DisplayModeListHeader>(), 16);
+        assert_eq!(size_of::<DisplayModeListEntry>(), 8);
+        assert_eq!(NVGPU_F_MODE_LIST, 1 << 21);
+        assert_eq!(MsgType::DisplayModeList as u32, 34);
+        assert_eq!(MsgType::from_u32(34), Some(MsgType::DisplayModeList));
+        let modes = [(5120, 1440), (1920, 1080)];
+        let mut buf = [0u8; 64];
+        assert_eq!(encode_display_mode_list(&modes, 240_000, &mut buf), Some(48));
+        let w = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        assert_eq!(w(0), 34);
+        assert_eq!((w(16), w(20), w(24), w(28)), (0, 2, 240_000, 0));
+        assert_eq!((w(32), w(36), w(40), w(44)), (5120, 1440, 1920, 1080));
+        assert_eq!(encode_display_mode_list(&modes, 1, &mut buf[..47]), None);
+        assert_eq!(encode_display_mode_list(&[], 1, &mut buf), None);
+        // The largest list fits the Linux guest's event buffer payload
+        // (8 + 8 * 64 bytes after the header).
+        assert!(display_mode_list_message_len(crate::modes::MODE_LIST_MAX) - 16 <= 8 + 8 * 64);
+    }
+
     #[test]
     fn display_mode_encodes_after_a_header() {
         let m = DisplayModeEvent {

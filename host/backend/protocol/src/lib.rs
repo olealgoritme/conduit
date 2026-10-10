@@ -15,7 +15,11 @@
 
 #![no_std]
 
+// Only `modes` allocates (host side: the CLI and the backend).
+extern crate alloc;
+
 pub mod messages;
+pub mod modes;
 pub mod pageruns;
 pub mod segments;
 pub mod venus;

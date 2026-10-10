@@ -1110,6 +1110,7 @@ impl NvidiaBackend {
                 MsgType::ScanoutDisable => "scanout_disable",
                 MsgType::InputEvent => "input_event",
                 MsgType::DisplayMode => "display_mode",
+                MsgType::DisplayModeList => "display_mode_list",
                 MsgType::CursorUpdate => "cursor_update",
                 MsgType::ClipboardFromHost => "clipboard_from_host",
                 MsgType::ScanoutReleased => "scanout_released",
@@ -1145,6 +1146,7 @@ impl NvidiaBackend {
             MsgType::EventReady
             | MsgType::InputEvent
             | MsgType::DisplayMode
+            | MsgType::DisplayModeList
             | MsgType::ClipboardFromHost
             | MsgType::ScanoutReleased
             | MsgType::ScanoutPresented => {
