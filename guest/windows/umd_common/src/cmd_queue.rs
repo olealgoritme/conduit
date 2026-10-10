@@ -541,7 +541,6 @@ impl CmdQueue {
             let h = core::ptr::read(p as *const Header);
             if let Some(call) = h.call {
                 call(p.add(HEADER_BYTES), p.add(h.extra_off as usize), h.extra_len as usize);
-                self.stats.records.fetch_add(1, Ordering::Relaxed);
             }
             self.read.0.store(r + h.len as u64, Ordering::Release);
         }
@@ -572,12 +571,14 @@ impl CmdQueue {
             if unsafe { self.run_one() } {
                 since_check += 1;
                 if since_check >= BATCH {
+                    self.stats.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
                     since_check = 0;
                     self.after_batch();
                 }
                 park_short = true;
                 continue;
             }
+            self.stats.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
             since_check = 0;
             self.after_batch();
             let t0 = Instant::now();
@@ -900,6 +901,36 @@ mod tests {
         let r2 = Arc::clone(&r);
         unsafe { q.retire(u64::MAX, move || r2.store(true, Ordering::Relaxed)) };
         assert!(r.load(Ordering::Relaxed));
+    }
+
+    /// Producer-side cost per record with the worker consuming:
+    /// `cargo test --release --lib -- --ignored --nocapture producer_cost`.
+    #[test]
+    #[ignore]
+    fn producer_cost() {
+        let q = CmdQueue::new(4 << 20, "t-bench");
+        let sink = Arc::new(AtomicU64::new(0));
+        let n = 2_000_000u64;
+        let t0 = Instant::now();
+        for i in 0..n {
+            let s = Arc::as_ptr(&sink) as usize;
+            unsafe {
+                q.push(32, |b| b.fill(i as u8), move |extra: &[u8]| {
+                    (*(s as *const AtomicU64)).fetch_add(extra[0] as u64, Ordering::Relaxed);
+                })
+                .unwrap();
+            }
+        }
+        let push = t0.elapsed();
+        q.drain();
+        let all = t0.elapsed();
+        println!(
+            "push {:.1} ns/record, push+drain {:.1} ns/record, {}",
+            push.as_nanos() as f64 / n as f64,
+            all.as_nanos() as f64 / n as f64,
+            q.summary()
+        );
+        q.shutdown();
     }
 
     #[test]
