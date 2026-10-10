@@ -31,8 +31,12 @@ pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
 pub mod v595_71_05;
+pub mod v595_99_02;
+pub mod v610_43_02;
+pub mod v610_43_03;
 pub mod v610_57_04;
 pub mod v615_71_09;
+pub mod v615_78_08;
 
 use crate::version::DriverVersion;
 
@@ -167,9 +171,24 @@ static PROFILES: &[Profile] = &[
         init: || v595_71_05::INIT,
     },
     Profile {
+        version: DriverVersion::new(595, 99, 2),
+        cmd: || v595_99_02::CMD,
+        init: || v595_99_02::INIT,
+    },
+    Profile {
         version: DriverVersion::new(595, 104, 2),
         cmd: || v595_104_02::CMD,
         init: || v595_104_02::INIT,
+    },
+    Profile {
+        version: DriverVersion::new(610, 43, 2),
+        cmd: || v610_43_02::CMD,
+        init: || v610_43_02::INIT,
+    },
+    Profile {
+        version: DriverVersion::new(610, 43, 3),
+        cmd: || v610_43_03::CMD,
+        init: || v610_43_03::INIT,
     },
     Profile {
         version: DriverVersion::new(610, 57, 4),
@@ -180,6 +199,11 @@ static PROFILES: &[Profile] = &[
         version: DriverVersion::new(615, 71, 9),
         cmd: || v615_71_09::CMD,
         init: || v615_71_09::INIT,
+    },
+    Profile {
+        version: DriverVersion::new(615, 78, 8),
+        cmd: || v615_78_08::CMD,
+        init: || v615_78_08::INIT,
     },
 ];
 
