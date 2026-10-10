@@ -5,7 +5,7 @@
 #
 # Builds icd_smoke.exe, vk_summary.exe, vk_compute_test.exe,
 # vk_offscreen_test.exe, vk_scanout_present.exe, vk_bar_test.exe,
-# vk_coherence_test.exe, vk_bl_readback.exe, vk_video_probe.exe,
+# vk_coherence_test.exe, vk_bl_readback.exe, vk_video_probe.exe, vk_vb_rebind_test.exe,
 # helios_icd_test.exe, vk_rmfence_test.exe and helios_share_test.exe plus their
 # SPIR-V (glslangValidator), and vk_loader_list.exe (what the system Vulkan
 # loader enumerates) and wgl_test.exe (OpenGL through WGL: Zink with app-local
@@ -51,8 +51,11 @@ glslangValidator -V "$tests/triangle.vert" -o "$OUT_DIR/triangle.vert.spv" >/dev
 glslangValidator -V "$tests/triangle.frag" -o "$OUT_DIR/triangle.frag.spv" >/dev/null
 glslangValidator -V "$tests/spin.vert" -o "$OUT_DIR/spin.vert.spv" >/dev/null
 glslangValidator -V "$tests/bar.comp" -o "$OUT_DIR/bar.comp.spv" >/dev/null
+glslangValidator -V --target-env vulkan1.2 --vn vb_rebind_vert "$tests/vb_rebind.vert" \
+  -o "$OUT_DIR/include/vb_rebind_vert.h" >/dev/null
 
-for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_test vk_coherence_test vk_bl_readback vk_video_probe; do
+for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_test vk_coherence_test vk_bl_readback vk_video_probe \
+         vk_vb_rebind_test; do
   "$CC" -O1 -Wall -I"$OUT_DIR/include" "$tests/$t.c" -L"$OUT_DIR" -lvulkan-1 -lm -o "$OUT_DIR/$t.exe"
 done
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/icd_smoke.c" -o "$OUT_DIR/icd_smoke.exe"
