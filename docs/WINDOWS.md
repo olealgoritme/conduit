@@ -193,9 +193,10 @@ with `-WinFspMsi path\to\winfsp.msi`) registers the startup task
 `ConduitShares`, which runs `Mount-ConduitShares.ps1` as SYSTEM from
 `Program Files\Conduit`. The VirtIO-FS service serves one device per process,
 so the script starts one `virtiofs.exe -t conduit-NAME -m X:` for every
-`conduit-*` device that is not mounted yet, rescans every 5 seconds (a folder
-added while Windows runs appears without a reboot), and gives each tag a drive
-letter counting down from Z:, remembered under
+`conduit-*` device that has no such process yet (it reads the `-t` tag from the
+running processes' command lines), stops a second process for the same tag,
+rescans every 5 seconds (a folder added while Windows runs appears without a
+reboot), and gives each tag a drive letter counting down from Z:, remembered under
 `HKLM\SOFTWARE\Conduit\ShareDrives`. The drive's label is the tag
 (`conduit-NAME`), which is what virtiofs reports as the volume name. The log is
 `%ProgramData%\Conduit\shares.log`. A stock `VirtioFsSvc` without `-t` would

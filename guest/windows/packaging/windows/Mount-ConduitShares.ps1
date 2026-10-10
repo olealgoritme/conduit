@@ -3,11 +3,12 @@
 # scanning, so a folder added while Windows runs appears within seconds.
 #
 # The VirtIO-FS service (virtiofs.exe) serves one device per process, so each
-# tag gets its own `virtiofs.exe -t TAG -m X:`. A device that a running
-# virtiofs.exe holds cannot be opened a second time; that is how an already
-# mounted tag is told from a new one. Drive letters count down from Z: and are
-# remembered per tag (HKLM\SOFTWARE\Conduit\ShareDrives), which the tray app
-# also reads.
+# tag gets its own `virtiofs.exe -t TAG -m X:`. The device can be opened any
+# number of times, so an already mounted tag is told from a new one by the
+# command line of the running virtiofs.exe processes: one tag, one process,
+# one drive letter. Extra processes for a tag are stopped. Drive letters count
+# down from Z: and are remembered per tag (HKLM\SOFTWARE\Conduit\ShareDrives),
+# which the tray app also reads.
 param(
     [int]$ScanSeconds = 5,
     [string]$VirtioFsExe = ""
@@ -56,8 +57,8 @@ public static class ConduitFs {
     static readonly Guid VirtFs = new Guid("a1b0cbf2-f488-4b29-b89f-16c78e68c737");
     const uint IOCTL_VIRTFS_GET_VOLUME_NAME = 0x226000;
 
-    // Tags of the virtiofs devices nothing has open (not mounted yet).
-    public static string[] FreeTags() {
+    // Tags of all virtiofs devices.
+    public static string[] Tags() {
         List<string> tags = new List<string>();
         Guid g = VirtFs;
         IntPtr set = SetupDiGetClassDevsW(ref g, IntPtr.Zero, IntPtr.Zero, 0x12);
@@ -75,8 +76,7 @@ public static class ConduitFs {
                     Marshal.WriteInt32(buf, IntPtr.Size == 8 ? 8 : 6);
                     if (!SetupDiGetDeviceInterfaceDetailW(set, ref d, buf, need, out need, IntPtr.Zero)) continue;
                     string path = Marshal.PtrToStringUni(new IntPtr(buf.ToInt64() + 4));
-                    // Exclusive, like virtiofs.exe: fails while a service holds the device.
-                    IntPtr h = CreateFileW(path, 0xC0000000u, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+                    IntPtr h = CreateFileW(path, 0xC0000000u, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
                     if (h == new IntPtr(-1)) continue;
                     try {
                         byte[] name = new byte[512];
@@ -134,7 +134,51 @@ function Get-DriveLetter([string]$Tag) {
     return $null
 }
 
-$started = @{}    # tag -> @{ Process; At }
+# The running virtiofs.exe processes that were given a tag: tag -> list of
+# @{ Pid; Letter }, oldest first.
+function Get-Instances {
+    $by = @{}
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='virtiofs.exe'" -ErrorAction Stop |
+        Sort-Object CreationDate)
+    foreach ($p in $procs) {
+        $cl = [string]$p.CommandLine
+        if ($cl -notmatch '\s-t\s+"?([^\s"]+)') { continue }
+        $tag = $Matches[1]
+        $letter = ""
+        if ($cl -match '\s-m\s+"?([A-Za-z]:)') { $letter = $Matches[1].ToUpperInvariant() }
+        if (-not $by.ContainsKey($tag)) { $by[$tag] = New-Object System.Collections.ArrayList }
+        [void]$by[$tag].Add(@{ Pid = [int]$p.ProcessId; Letter = $letter })
+    }
+    return $by
+}
+
+function Get-Remembered([string]$Tag) {
+    try { return [string](Get-ItemPropertyValue -LiteralPath $regPath -Name $Tag -ErrorAction Stop) } catch { return "" }
+}
+
+# One tag keeps one instance: the one on the remembered letter, else the
+# oldest. The others are stale (an earlier scan mounted the tag again) and go.
+function Remove-StaleInstances($By) {
+    foreach ($tag in @($By.Keys)) {
+        $list = @($By[$tag])
+        $remembered = Get-Remembered $tag
+        $keep = $list | Where-Object { $_.Letter -and $_.Letter -eq $remembered } | Select-Object -First 1
+        if (-not $keep) { $keep = $list[0] }
+        foreach ($i in $list) {
+            if ($i.Pid -eq $keep.Pid) { continue }
+            Write-Log "stopping stale virtiofs.exe for $tag at $($i.Letter) (pid $($i.Pid))"
+            Stop-Process -Id $i.Pid -Force -ErrorAction SilentlyContinue
+        }
+        if ($keep.Letter -and $keep.Letter -ne $remembered) {
+            if (-not (Test-Path -LiteralPath $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+            Set-ItemProperty -LiteralPath $regPath -Name $tag -Value $keep.Letter
+            Write-Log "$tag is mounted at $($keep.Letter) (pid $($keep.Pid))"
+        }
+        $By[$tag] = @($keep)
+    }
+}
+
+$started = @{}    # tag -> time of the last mount attempt
 Write-Log "scanning for conduit-* virtiofs devices every $ScanSeconds s"
 while ($true) {
     try {
@@ -142,15 +186,19 @@ while ($true) {
         if (-not $exe) {
             Write-Log "virtiofs.exe not found (install the VirtIO guest tools: virtio-win-guest-tools)"
         } else {
-            foreach ($tag in [ConduitFs]::FreeTags()) {
+            $instances = Get-Instances
+            Remove-StaleInstances $instances
+            foreach ($tag in [ConduitFs]::Tags()) {
                 if ($tag -notlike "conduit-?*") { continue }
+                if ($instances.ContainsKey($tag)) { continue }
+                # A mount that fails right away is retried every 30 s, not every scan.
                 $prev = $started[$tag]
-                if ($prev -and ((Get-Date) - $prev.At).TotalSeconds -lt 30) { continue }
+                if ($prev -and ((Get-Date) - $prev).TotalSeconds -lt 30) { continue }
+                $started[$tag] = Get-Date
                 $letter = Get-DriveLetter $tag
                 if (-not $letter) { Write-Log "no free drive letter for $tag"; continue }
                 $p = Start-Process -FilePath $exe -ArgumentList @("-t", $tag, "-m", $letter) `
                     -WindowStyle Hidden -PassThru
-                $started[$tag] = @{ Process = $p; At = Get-Date }
                 Write-Log "mounting $tag at $letter (pid $($p.Id))"
             }
         }
