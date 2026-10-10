@@ -50,7 +50,10 @@ random stalls in the guest even when the host looks idle.
    the UMD were all loads of a cold pointer). `conduit doctor NAME` prints how
    much of a running VM's RAM sits on 2 MiB pages.
 3. **Without reserved huge pages**, let shared memory use transparent huge
-   pages. They are best effort and can still be swapped; on a host that has
+   pages (this needs Conduit's QEMU with `host/qemu` patch 0009, which puts the
+   guest-RAM memfd on a 2 MiB boundary; stock QEMU maps it at any 4 KiB
+   boundary, where no huge page fits). They are best effort and can still be
+   swapped; on a host that has
    been up a while most allocations fall back to 4 KiB (check with `conduit
    doctor NAME`, or `grep thp_file_fallback /proc/vmstat`):
 
