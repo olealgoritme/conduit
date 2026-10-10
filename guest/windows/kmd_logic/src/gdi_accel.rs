@@ -1842,6 +1842,12 @@ pub const COUNTERS: &[&str] = &[
     // Record-less GDI submissions that admitted more than one unclaimed job, and the most one did.
     "GdiClmMul",
     "GdiClmMax",
+    // Allocation destroys that waited for queued GDI jobs naming the allocation, waits that ran
+    // out, destroys of an allocation a not yet submitted job names, the longest wait (µs).
+    "GdiFreeWait",
+    "GdiFreeTo",
+    "GdiFreeUns",
+    "GdiFreeUs",
     "GdiPitchIgn",
     "GdiPitchIgnV",
     // Copies and fills with a staging buffer on one side run on the copy engine over the buffer's

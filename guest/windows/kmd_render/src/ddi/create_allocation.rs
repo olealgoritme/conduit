@@ -2300,6 +2300,11 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    // `GdiAccel`: the executor finishes the queued GDI jobs that name it first (one relaxed load
+    // when none is queued).
+    if adapter.is_current_generation(ctx.serial) && crate::ddi::gdi_accel::on() {
+        crate::ddi::gdi_exec::drain_for(passive, adapter, ctx.resource_id);
+    }
     // `RvOff` 0x4000: its system pages are not its content any more (one load otherwise).
     if adapter.is_current_generation(ctx.serial) {
         crate::ddi::aperture_pages::forget(ctx.resource_id);

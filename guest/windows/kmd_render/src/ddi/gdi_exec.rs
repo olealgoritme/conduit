@@ -441,7 +441,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &CLAIM_MULTI, &CLAIM_MAX, &PITCH_IGN, &PITCH_IGN_V,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &CLAIM_MULTI, &CLAIM_MAX, &FREE_WAIT, &FREE_TO, &FREE_UNS, &FREE_US, &PITCH_IGN, &PITCH_IGN_V,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -594,6 +594,10 @@ pub(crate) fn publish_counters() {
     w(b"GdiLutId", LUT_ID.load(Ordering::Relaxed));
     w(b"GdiClmMul", CLAIM_MULTI.load(Ordering::Relaxed));
     w(b"GdiClmMax", CLAIM_MAX.load(Ordering::Relaxed));
+    w(b"GdiFreeWait", FREE_WAIT.load(Ordering::Relaxed));
+    w(b"GdiFreeTo", FREE_TO.load(Ordering::Relaxed));
+    w(b"GdiFreeUns", FREE_UNS.load(Ordering::Relaxed));
+    w(b"GdiFreeUs", FREE_US.load(Ordering::Relaxed));
     w(b"GdiPitchIgn", PITCH_IGN.load(Ordering::Relaxed));
     w(b"GdiPitchIgnV", PITCH_IGN_V.load(Ordering::Relaxed));
 }
@@ -788,6 +792,74 @@ pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize) -> Option<u6
     PENDING.store(1, Ordering::Release);
     kick(adapter);
     last
+}
+
+/// Allocation destroys that waited for queued GDI jobs naming the allocation (`GdiFreeWait`), the
+/// waits that ran out (`GdiFreeTo`), destroys of an allocation named by a job not yet submitted
+/// (`GdiFreeUns`), and the longest wait in µs (`GdiFreeUs`).
+static FREE_WAIT: AtomicU32 = AtomicU32::new(0);
+static FREE_TO: AtomicU32 = AtomicU32::new(0);
+static FREE_UNS: AtomicU32 = AtomicU32::new(0);
+static FREE_US: AtomicU32 = AtomicU32::new(0);
+/// How long a destroy waits for the executor at most.
+const FREE_WAIT_MS: u64 = 500;
+
+fn names(op: &Op, resource_id: u32) -> bool {
+    [op.dst, op.srcs[0], op.srcs[1]].iter().flatten().any(|s| s.resource_id == resource_id)
+}
+
+/// DestroyAllocation of `resource_id` (PASSIVE): first let the executor finish every admitted job
+/// that names it (and the job it is running, whose commands are out of the table).
+///
+/// dxgkrnl destroys an allocation once it holds no reference to it; it does not wait for the
+/// fence of a GDI DMA buffer that named it. CDD frees the staging buffer of the ClearType gamma
+/// table right after submitting the table's initialising BitBlt, before the executor ran it: the
+/// copy then read a freed allocation and the table stayed zero (405.31: `GdiLutAp` 0x0D, the
+/// source created, registered and forgotten before the job ran). The executor only reads and
+/// writes the allocation through its content views (the aperture pages, the blob), which go with
+/// the destroy, so the destroy waits, as one on hardware waits for the GPU to be done with it.
+pub(crate) fn drain_for(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) {
+    if resource_id == 0 || PENDING.load(Ordering::Acquire) == 0 && !any_running() {
+        return;
+    }
+    let target = {
+        let t = TABLE.lock();
+        let mut target: Option<u64> = None;
+        let mut unsubmitted = false;
+        for j in t.jobs.iter() {
+            let named = j.running || j.ops.iter().any(|op| names(op, resource_id));
+            if !named {
+                continue;
+            }
+            match j.seq {
+                Some(seq) if seq > t.tl.completed => target = Some(target.map_or(seq, |x| x.max(seq))),
+                Some(_) => {}
+                None => unsubmitted |= !j.running,
+            }
+        }
+        if unsubmitted {
+            FREE_UNS.fetch_add(1, Ordering::Relaxed);
+        }
+        target
+    };
+    let Some(target) = target else { return };
+    FREE_WAIT.fetch_add(1, Ordering::Relaxed);
+    let t0 = now_100ns();
+    let mut waited = 0u64;
+    while !seq_ready(target) {
+        if waited >= FREE_WAIT_MS {
+            FREE_TO.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        kick(adapter);
+        crate::virtio::ctrl::sleep_ms(passive, 1);
+        waited += 1;
+    }
+    FREE_US.fetch_max(us_since(t0), Ordering::Relaxed);
+}
+
+fn any_running() -> bool {
+    TABLE.lock().jobs.iter().any(|j| j.running)
 }
 
 /// DestroyContext: its unclaimed jobs can never be submitted (dropped, counted as orphans).
