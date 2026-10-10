@@ -45,7 +45,7 @@ VK_ERROR_FEATURE_NOT_PRESENT. NVK_HELIOS_RESID=0 turns resource ids off.
 
 diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
 new file mode 100644
-index 0000000..a1093a1
+index 00000000..a1093a18
 --- /dev/null
 +++ b/src/nouveau/vulkan/helios_icd_interface.h
 @@ -0,0 +1,145 @@
@@ -195,7 +195,7 @@ index 0000000..a1093a1
 +
 +#endif /* HELIOS_ICD_INTERFACE_H */
 diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
-index 122d2f3..9d85aa3 100644
+index 122d2f3f..9d85aa35 100644
 --- a/src/nouveau/vulkan/meson.build
 +++ b/src/nouveau/vulkan/meson.build
 @@ -317,7 +317,8 @@ if not get_option('nvk-rm').disabled()
@@ -209,7 +209,7 @@ index 122d2f3..9d85aa3 100644
  endif
  
 diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
-index 0e13ecf..4df32ee 100644
+index 0e13ecf2..4df32ee2 100644
 --- a/src/nouveau/vulkan/nvk_device_memory.c
 +++ b/src/nouveau/vulkan/nvk_device_memory.c
 @@ -4,6 +4,10 @@
@@ -274,7 +274,7 @@ index 0e13ecf..4df32ee 100644
        align64(pAllocateInfo->allocationSize, alignment);
 diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
 new file mode 100644
-index 0000000..d49d13b
+index 00000000..d49d13b3
 --- /dev/null
 +++ b/src/nouveau/vulkan/nvk_helios.c
 @@ -0,0 +1,240 @@
@@ -519,7 +519,7 @@ index 0000000..d49d13b
 +   return VK_SUCCESS;
 +}
 diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
-index 577f23a..14c3beb 100644
+index 577f23ab..14c3beb1 100644
 --- a/src/nouveau/vulkan/nvk_physical_device.c
 +++ b/src/nouveau/vulkan/nvk_physical_device.c
 @@ -16,6 +16,9 @@
@@ -551,7 +551,7 @@ index 577f23a..14c3beb 100644
     memcpy(properties->driverUUID, instance->driver_build_sha, VK_UUID_SIZE);
  
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-index 5751e9a..e500262 100644
+index c4cb7a2b..501c4cd2 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 @@ -92,6 +92,14 @@ struct nvkmd_rm_lib {
@@ -569,7 +569,7 @@ index 5751e9a..e500262 100644
  };
  
  /* Returns NULL if librmclient cannot be loaded */
-@@ -267,6 +275,14 @@ struct nvkmd_rm_mem {
+@@ -278,6 +286,14 @@ struct nvkmd_rm_mem {
     /* GEM handle on dev->drm_fd once the memory has been exported, 0 before */
     simple_mtx_t export_mutex;
     uint32_t gem_handle;
@@ -584,7 +584,7 @@ index 5751e9a..e500262 100644
  };
  
  NVKMD_DECL_SUBCLASS(mem, rm);
-@@ -379,6 +395,34 @@ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
+@@ -395,6 +411,34 @@ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
                                     uint32_t fourcc, uint64_t modifier);
  /* Gives scanout 0 back to the desktop (no-op without a live source) */
  void nvkmd_rm_dev_scanout_release(struct nvkmd_dev *dev);
@@ -620,7 +620,7 @@ index 5751e9a..e500262 100644
  
  /*
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
-index 9a745b0..e17e7a8 100644
+index 9a745b0b..e17e7a8a 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
 @@ -231,6 +231,12 @@ nvkmd_rm_lib_load(void)
@@ -637,10 +637,10 @@ index 9a745b0..e17e7a8 100644
     LOAD(event_wait,   "crm_event_wait",   false);
     LOAD(alloc_pages,  "crm_alloc_pages",  false);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-index 4fbad77..c58eb58 100644
+index a683868c..6c58ff2f 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-@@ -337,6 +337,9 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+@@ -380,6 +380,9 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
     /* nvidia-drm holds its own reference to the memory for as long as a
      * dma-buf of it is alive; this only drops our GEM name for it.
      */
@@ -651,12 +651,12 @@ index 4fbad77..c58eb58 100644
        nvkmd_rm_close_gem(dev, mem->gem_handle);
     simple_mtx_destroy(&mem->export_mutex);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-index e37dd56..d822535 100644
+index 8152599b..bec2d3eb 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-@@ -372,7 +372,11 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
-    if (ret == 0) {
-       p_atomic_inc(&dev->flips_ok);
+@@ -413,7 +413,11 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+                          "SCANOUT_SET of modifier 0x%016" PRIx64 ": %d (%s)",
+                          modifier, ret, strerror(-ret));
     } else {
 -      p_atomic_inc(&dev->flips_failed);
 +      const uint64_t nfail = p_atomic_inc_return(&dev->flips_failed);
@@ -667,7 +667,7 @@ index e37dd56..d822535 100644
        result = vk_errorf(log_obj, VK_ERROR_SURFACE_LOST_KHR,
                           "ScanoutFlip of GEM %u: %d (%s)", mem->gem_handle,
                           ret, ret < 0 ? strerror(-ret) : "?");
-@@ -391,3 +395,216 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+@@ -432,3 +436,216 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
  
     return result;
  }
@@ -885,7 +885,7 @@ index e37dd56..d822535 100644
 +   mem->helios_res_id = 0;
 +}
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
-index 0ca3e34..068e6de 100644
+index 0ca3e345..068e6de3 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
 @@ -652,6 +652,22 @@ struct nvrm_crm_scanout_source {
@@ -919,6 +919,3 @@ index 0ca3e34..068e6de 100644
  static_assert(sizeof(NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS) == 24, "OS_UNIX_EXPORT_OBJECT_TO_FD");
  static_assert(sizeof(NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS) == 20, "OS_UNIX_IMPORT_OBJECT_FROM_FD");
  static_assert(sizeof(NV0041_CTRL_GET_SURFACE_INFO_PARAMS) == 16, "GET_SURFACE_INFO");
--- 
-2.43.0
-

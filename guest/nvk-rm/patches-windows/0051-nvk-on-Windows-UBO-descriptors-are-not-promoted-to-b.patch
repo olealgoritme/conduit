@@ -29,7 +29,7 @@ keys follow it.
  4 files changed, 29 insertions(+)
 
 diff --git a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
-index 8f2c09b..137d405 100644
+index 93614027..ad6b60de 100644
 --- a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
 +++ b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
 @@ -61,6 +61,7 @@ struct lower_descriptors_ctx {
@@ -51,7 +51,7 @@ index 8f2c09b..137d405 100644
        /* Prior to Turing, indirect cbufs require splitting the pushbuf and
         * pushing bits of the descriptor set.  Doing this every draw call is
         * probably more overhead than it's worth.
-@@ -1570,6 +1575,7 @@ nvk_nir_lower_descriptors(nir_shader *nir,
+@@ -1562,6 +1567,7 @@ nvk_nir_lower_descriptors(nir_shader *nir,
        .indirect_bind =
           shader_flags & VK_SHADER_CREATE_INDIRECT_BINDABLE_BIT_EXT,
        .has_task_shader = (shader_flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) == 0,
@@ -60,7 +60,7 @@ index 8f2c09b..137d405 100644
        .ubo_addr_format = nvk_ubo_addr_format(pdev, rs),
     };
 diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
-index 66d1ea9..45d5d82 100644
+index 14c3beb1..17dcc9b9 100644
 --- a/src/nouveau/vulkan/nvk_physical_device.c
 +++ b/src/nouveau/vulkan/nvk_physical_device.c
 @@ -3,6 +3,7 @@
@@ -69,9 +69,9 @@ index 66d1ea9..45d5d82 100644
  #include "nvk_physical_device.h"
 +#include "util/u_debug.h"
  
- /* Mesa's Win32 WSI implements no wait_for_present (wsi_WaitForPresentKHR
-  * asserts on it), so VK_KHR_present_id/_wait(2) are not advertised there:
-@@ -1625,6 +1626,20 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+ #include "nak.h"
+ #include "nvk_buffer.h"
+@@ -1616,6 +1617,20 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
     pdev->nvkmd = nvkmd;
     pdev->info = nvkmd->dev_info;
     pdev->debug_flags = instance->debug_flags;
@@ -93,7 +93,7 @@ index 66d1ea9..45d5d82 100644
     pdev->nak = nak_compiler_create(&pdev->info);
     if (pdev->nak == NULL) {
 diff --git a/src/nouveau/vulkan/nvk_physical_device.h b/src/nouveau/vulkan/nvk_physical_device.h
-index 65594b6..68e4ab0 100644
+index 65594b63..68e4ab01 100644
 --- a/src/nouveau/vulkan/nvk_physical_device.h
 +++ b/src/nouveau/vulkan/nvk_physical_device.h
 @@ -40,6 +40,13 @@ struct nvk_physical_device {
@@ -111,7 +111,7 @@ index 65594b6..68e4ab0 100644
  
     struct nvkmd_pdev *nvkmd;
 diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
-index f0680fb..5221722 100644
+index f0680fb4..52217226 100644
 --- a/src/nouveau/vulkan/nvk_shader.c
 +++ b/src/nouveau/vulkan/nvk_shader.c
 @@ -82,6 +82,7 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
@@ -122,6 +122,3 @@ index f0680fb..5221722 100644
        | (use_edb_buffer_views ? 1 << 13 : 0)
        | (instance->drirc.misc.ssbo_align_4b ? 1 << 14 : 0)
        | (nak_flags << 48);
--- 
-2.43.0
-
