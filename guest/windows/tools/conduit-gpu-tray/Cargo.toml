@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 # The host's reading line, shared with `conduit _stats`.
 conduit-stats = { path = "../../../../host/stats" }
+# The host<->guest control channel protocol (requests, responses, hashing).
+conduit-ctl = { path = "../../../../host/ctl" }
 # Raw Win32 and GDI+ (antialiased drawing): no GUI framework, no runtime to install.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -27,11 +29,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

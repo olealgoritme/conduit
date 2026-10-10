@@ -47,6 +47,8 @@ const ID_KEEP: usize = 6;
 const ID_OPEN_DEFAULT: usize = 7;
 /// Menu ids of the shared folders submenu: this plus the index.
 const ID_SHARE: usize = 100;
+/// Menu ids of the recent launches submenu: this plus the index.
+const ID_LAUNCH: usize = 300;
 
 // Channel state, written by the reader thread.
 const CH_WAITING: u8 = 0;
@@ -575,6 +577,20 @@ fn context_menu(hwnd: HWND) {
             ID_OPEN_DEFAULT,
             t.as_ptr(),
         );
+        // Programs the host started through the control channel.
+        let launches = crate::launch::recent(8);
+        let sub = CreatePopupMenu();
+        for (i, l) in launches.iter().enumerate() {
+            let t = wide(&l.label);
+            let fl = if l.alive { 0 } else { MF_GRAYED };
+            AppendMenuW(sub, MF_STRING | fl, ID_LAUNCH + i, t.as_ptr());
+        }
+        if launches.is_empty() {
+            let t = wide("None");
+            AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+        }
+        let t = wide("Recent launches (click to stop)");
+        AppendMenuW(m, MF_POPUP, sub as usize, t.as_ptr());
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         add(
             ID_KEEP,
@@ -620,6 +636,9 @@ fn context_menu(hwnd: HWND) {
             ID_OPEN_DEFAULT => open_default_share(),
             id if id >= ID_SHARE && id - ID_SHARE < list.len() => {
                 open_folder(&list[id - ID_SHARE].root());
+            }
+            id if id >= ID_LAUNCH && id - ID_LAUNCH < launches.len() => {
+                let _ = crate::launch::stop(launches[id - ID_LAUNCH].pid);
             }
             ID_AUTOSTART => sys::set_autostart(!sys::autostart_enabled(), &exe_path()),
             ID_EXIT => {
@@ -822,6 +841,7 @@ pub fn run() {
         SetTimer(hwnd, ANIM, 70, None);
         let h = hwnd as usize;
         std::thread::spawn(move || reader(h));
+        std::thread::spawn(crate::ctl::serve);
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {

@@ -8,7 +8,13 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod apps;
+#[cfg(windows)]
+mod ctl;
+#[cfg(windows)]
 mod gfx;
+#[cfg(windows)]
+mod launch;
 #[cfg(windows)]
 mod sendto;
 mod sys;

@@ -2,6 +2,16 @@
 //! line feed, the 60-second history, colours and texts. The Windows shell
 //! (tray icon, popup, channel I/O) is in `main.rs` and its modules.
 
+pub mod ctl_logic;
+pub mod png;
+pub mod procs;
+pub mod startmenu;
+pub mod steam;
+pub mod vdf;
+
+#[cfg(test)]
+mod testutil;
+
 use conduit_stats::Reading;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
