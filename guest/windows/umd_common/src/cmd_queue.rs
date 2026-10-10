@@ -61,7 +61,7 @@ pub const MAX_RING_BYTES: usize = 64 << 20;
 /// Worker spin on an empty ring before it parks.
 const WORKER_SPIN: Duration = Duration::from_micros(20);
 /// A waiter's spin before it sleeps on the condvar.
-const WAITER_SPIN: Duration = Duration::from_micros(30);
+const WAITER_SPIN: Duration = Duration::from_micros(100);
 /// Records between two waiter/destroy checks while the worker is busy.
 const BATCH: u32 = 16;
 /// Park timeouts: the first park after work is short (backstop against a
@@ -135,6 +135,9 @@ pub struct CmdQueue {
     /// True once waiting for the worker is pointless (process teardown has
     /// killed it): waits return and shutdown does not join.
     abandoned: std::sync::OnceLock<fn() -> bool>,
+    /// Captured on the producer thread when the worker starts, applied on the
+    /// worker (the drivers mirror the producer's scheduling priority).
+    thread_init: std::sync::OnceLock<(fn() -> isize, fn(isize))>,
 }
 
 // SAFETY: the ring buffer is written only by the (single, externally
@@ -188,6 +191,7 @@ impl CmdQueue {
             stats: Stats::default(),
             name: name.to_string(),
             abandoned: std::sync::OnceLock::new(),
+            thread_init: std::sync::OnceLock::new(),
         })
     }
 
@@ -196,6 +200,13 @@ impl CmdQueue {
     /// every other thread before DLL teardown runs). Set once.
     pub fn set_abandon_check(&self, check: fn() -> bool) {
         let _ = self.abandoned.set(check);
+    }
+
+    /// Install `capture` (run on the producer thread that starts the worker)
+    /// and `apply` (run first thing on the worker with its result). Set once,
+    /// before the first push.
+    pub fn set_thread_init(&self, capture: fn() -> isize, apply: fn(isize)) {
+        let _ = self.thread_init.set((capture, apply));
     }
 
     fn is_abandoned(&self) -> bool {
@@ -321,9 +332,15 @@ impl CmdQueue {
             return;
         }
         let q = Arc::clone(self);
+        let init = self.thread_init.get().map(|&(capture, apply)| (capture(), apply));
         let handle = std::thread::Builder::new()
             .name(self.name.clone())
-            .spawn(move || q.worker_main())
+            .spawn(move || {
+                if let Some((value, apply)) = init {
+                    apply(value);
+                }
+                q.worker_main()
+            })
             .expect("spawn front-end worker");
         let _ = self.worker_thread.set(handle.thread().clone());
         *lock(&self.worker) = Some(handle);
@@ -869,6 +886,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(3));
             spin_until(|| n.load(Ordering::Relaxed) == round + 1);
         }
+        q.shutdown();
+    }
+
+    #[test]
+    fn thread_init_runs_on_the_worker_with_the_producer_value() {
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let q = CmdQueue::new(MIN_RING_BYTES, "t-init");
+        q.set_thread_init(|| 42, |v| SEEN.store(v as u64, Ordering::Relaxed));
+        unsafe { q.push(0, |_| {}, |_: &[u8]| {}).unwrap() };
+        q.drain();
+        assert_eq!(SEEN.load(Ordering::Relaxed), 42);
         q.shutdown();
     }
 

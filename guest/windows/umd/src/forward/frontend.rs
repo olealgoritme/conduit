@@ -115,10 +115,34 @@ fn dll_shutdown_in_progress() -> bool {
     unsafe { core::mem::transmute::<usize, ShutdownFn>(f)() != 0 }
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentThread() -> *mut c_void;
+    fn GetThreadPriority(thread: *mut c_void) -> i32;
+    fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
+}
+
+/// The starting producer's scheduling priority (games often raise their
+/// render thread's); the worker takes the same so it is not preempted by the
+/// app's own worker threads more than the thread it serves.
+fn producer_priority() -> isize {
+    // SAFETY: pseudo-handle of the calling thread.
+    unsafe { GetThreadPriority(GetCurrentThread()) as isize }
+}
+
+fn apply_priority(priority: isize) {
+    const THREAD_PRIORITY_ERROR_RETURN: isize = 0x7fff_ffff;
+    if priority != THREAD_PRIORITY_ERROR_RETURN {
+        // SAFETY: pseudo-handle of the calling (worker) thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority as i32) };
+    }
+}
+
 impl Frontend {
     pub(crate) fn new() -> Self {
         let q = CmdQueue::new(crate::knobs::frontend_ring_bytes(), "helios-d3d11-frontend");
         q.set_abandon_check(dll_shutdown_in_progress);
+        q.set_thread_init(producer_priority, apply_priority);
         log_error!(
             "D3D11 threaded front end: on (ring {} KiB)",
             q.capacity() / 1024
