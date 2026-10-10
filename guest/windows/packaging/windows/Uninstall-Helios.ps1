@@ -24,6 +24,11 @@ Unregister-ScheduledTask -TaskName "HeliosDisplayTopology" -Confirm:$false -Erro
 Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName "ConduitGpuTray" -Confirm:$false -ErrorAction SilentlyContinue
 Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
+Unregister-ScheduledTask -TaskName "ConduitShares" -Confirm:$false -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='virtiofs.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*conduit-*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Remove-Item -LiteralPath "HKLM:\SOFTWARE\Conduit" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $env:ProgramFiles "Conduit") -Recurse -Force -ErrorAction SilentlyContinue
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
     throw "No package-managed Helios installation was found at $statePath."

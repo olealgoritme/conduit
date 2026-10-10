@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_NAME: &str = "Conduit";
-const MAX_NAME: usize = 32;
+/// A virtiofs tag is at most 36 bytes (the Windows service limit too); the
+/// `conduit-` prefix takes 8.
+const MAX_NAME: usize = 28;
 const TAG_PREFIX: &str = "conduit-";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,10 +393,10 @@ mod tests {
 
     #[test]
     fn names_are_tag_safe() {
-        for ok in ["Conduit", "my_games-2", "a", &"x".repeat(32)] {
+        for ok in ["Conduit", "my_games-2", "a", &"x".repeat(28)] {
             assert!(validate_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "my games", "a/b", "ö", "a:b", &"x".repeat(33)] {
+        for bad in ["", "my games", "a/b", "ö", "a:b", &"x".repeat(29)] {
             assert!(validate_name(bad).is_err(), "{bad}");
         }
     }

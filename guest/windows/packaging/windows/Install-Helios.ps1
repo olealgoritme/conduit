@@ -546,6 +546,22 @@ if (Test-Path -LiteralPath $trayPayload -PathType Leaf) {
         Write-Warning "The Conduit GPU tray app was not installed: $($_.Exception.Message)"
     }
 }
+# Shared folders: WinFsp (from the package's winfsp MSI when missing) and the
+# startup task that mounts the host's conduit-* virtiofs shares as drives.
+$sharesInstaller = Join-Path $bundleRoot "Install-ConduitShares.ps1"
+if (Test-Path -LiteralPath $sharesInstaller -PathType Leaf) {
+    try {
+        $winfspMsi = Get-ChildItem -LiteralPath (Join-Path $payloadRoot "winfsp") -Filter "*.msi" -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($winfspMsi) {
+            & $sharesInstaller -WinFspMsi $winfspMsi.FullName
+        } else {
+            & $sharesInstaller
+        }
+    } catch {
+        Write-Warning "Shared folders were not set up: $($_.Exception.Message)"
+    }
+}
 Write-HeliosJson $state $statePath
 
 Write-Host ""

@@ -37,6 +37,11 @@ env:
   VULKAN_HEADERS_COMMIT: 11d6898377797e07dbd543aaaa367e4465074597
   OPENCL_LOADER_COMMIT: 18fdcd58286376124f938948aa8ed156079c1c16
   OPENCL_HEADERS_COMMIT: 6fe718c31a45fe25151362a72ef041c3a1047cbd
+  # WinFsp, which the VirtIO-FS mounts of shared folders need; the installer
+  # carries the MSI and installs it when the guest has none.
+  WINFSP_VERSION: '2.1.25156'
+  WINFSP_RELEASE: v2.1
+  WINFSP_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
 
 jobs:
   # NVK on RM (Vulkan) and Zink (OpenGL) for the Helios adapter, cross-built
@@ -390,6 +395,13 @@ jobs:
       - name: Build the GPU tray app
         shell: pwsh
         run: cargo build --release --locked --manifest-path guest/windows/tools/conduit-gpu-tray/Cargo.toml
+      - name: Download WinFsp
+        shell: pwsh
+        run: |
+          $msi = "$env:RUNNER_TEMP/winfsp-$env:WINFSP_VERSION.msi"
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/$env:WINFSP_RELEASE/winfsp-$env:WINFSP_VERSION.msi" -OutFile $msi
+          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+          if ($hash -ne $env:WINFSP_SHA256.ToUpperInvariant()) { throw "winfsp-$env:WINFSP_VERSION.msi has SHA-256 $hash, expected $env:WINFSP_SHA256" }
       - name: Read package metadata
         id: metadata
         shell: pwsh
@@ -412,6 +424,7 @@ jobs:
           -CompatibilityArtifact "$env:RUNNER_TEMP/artifacts/compatibility"
           -InstallerArtifact "$env:RUNNER_TEMP/helios-installer"
           -TrayExe "$env:GITHUB_WORKSPACE/guest/windows/tools/conduit-gpu-tray/target/release/conduit-gpu-tray.exe"
+          -WinFspMsi "$env:RUNNER_TEMP/winfsp-$env:WINFSP_VERSION.msi"
           -OutputDir "$env:RUNNER_TEMP/helios-package"
           -Configuration '${{ matrix.configuration }}'
           -Version '${{ steps.metadata.outputs.version }}'
