@@ -1,0 +1,25 @@
+PlatformBmPrintScLib: print only boot failures, not every load/start
+
+BdsDxe printed "BdsDxe: loading Boot0001 ..." and "starting ..." to the
+console for every boot, over the boot logo (and above the Windows boot
+spinner, which keeps the firmware screen). Keep the failure reports only.
+
+--- a/OvmfPkg/Library/PlatformBmPrintScLib/StatusCodeHandler.c
++++ b/OvmfPkg/Library/PlatformBmPrintScLib/StatusCodeHandler.c
+@@ -93,12 +93,11 @@
+   CHAR16                        *DevPathString;
+ 
+   //
+-  // Ignore all status codes that are irrelevant for LoadImage() and
+-  // StartImage() preparations and return codes.
++  // Ignore all status codes other than LoadImage() and StartImage() failures.
++  // The "loading" / "starting" lines for every boot would be drawn over the
++  // boot logo; a failed boot option is still reported.
+   //
+-  if ((Value != mLoadPrep) && (Value != mLoadFail) &&
+-      (Value != mStartPrep) && (Value != mStartFail))
+-  {
++  if ((Value != mLoadFail) && (Value != mStartFail)) {
+     return EFI_SUCCESS;
+   }
+ 

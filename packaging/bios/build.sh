@@ -60,7 +60,8 @@ while read -r p _; do
 done < debian/patches/series
 
 # Conduit's changes: the boot logo (LogoDxe -> BootLogoLib -> BGRT) and the
-# small patches in packaging/bios/patches (firmware mode = the VM's native mode).
+# small patches in packaging/bios/patches (firmware mode = the VM's native mode,
+# no boot progress text over the logo).
 cp "$HERE/Logo.bmp" MdeModulePkg/Logo/Logo.bmp
 for p in "$HERE"/patches/*.patch; do
   patch -p1 --quiet --forward -i "$p"

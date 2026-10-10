@@ -132,10 +132,11 @@ SPICE, OpenGL or USB redirection, so attach also changes the display side:
 
 The optional `conduit-bios` package is UEFI firmware built from edk2 OVMF
 (BSD-2-Clause-Patent; Ubuntu's `edk2` source package and its build flags,
-pinned in `packaging/bios/version.sh`) with two changes: the Conduit mark as
-the boot logo (also the ACPI BGRT logo Windows keeps above its spinner), and
+pinned in `packaging/bios/version.sh`) with three changes: the Conduit mark
+as the boot logo (also the ACPI BGRT logo Windows keeps above its spinner),
 the firmware display starting in the video device's preferred mode, also
-above 4096 pixels wide (`packaging/bios/patches`). It installs
+above 4096 pixels wide, and no "BdsDxe: loading/starting Boot####" lines over
+the logo (failed boot options are still reported; `packaging/bios/patches`). It installs
 `/usr/share/conduit/bios/conduit-bios.fd` (no Secure Boot, like
 `OVMF_CODE_4M.fd`), `conduit-bios.secboot.fd` (Secure Boot + SMM, like
 `OVMF_CODE_4M.secboot.fd`/`.ms.fd`/`.snakeoil.fd`) and libvirt firmware
