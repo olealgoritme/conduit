@@ -870,9 +870,26 @@ pub struct Surface {
     pub class: SurfaceClass,
     /// The allocation's D3DDDIFORMAT (0 unknown): picks the byte order of a copy ([`order_of`]).
     pub format: u32,
-    /// Census only: `standard allocation type << 4 | GDI surface type` (each 4 bits) `| RM-backed
-    /// << 8` (a KMD standard buffer whose memory is RM system memory, `ce_sysmem`'s object path).
+    /// `standard allocation type << 4 | GDI surface type` (each 4 bits) `| RM-backed << 8` (a KMD
+    /// standard buffer whose memory is RM system memory, `ce_sysmem`'s object path): the census,
+    /// and which surfaces a command's pitch applies to ([`cmd_pitch_applies`]).
     pub kind_bits: u32,
+}
+
+/// Whether a command's `SrcPitch` / `DstPitch` locates the rectangles of a surface of these
+/// [`Surface::kind_bits`]: only a `STAGING_CPUVISIBLE` or `EXISTINGSYSMEM` GDI surface (Learn
+/// `DXGK_GDIARG_BITBLT` remarks: "Pitch should be ignored for other allocation types"). Every
+/// other surface is addressed with its allocation's pitch.
+pub const fn cmd_pitch_applies(kind_bits: u32) -> bool {
+    use crate::rm_standard::{GDI_EXISTINGSYSMEM, GDI_STAGING_CPUVISIBLE, STD_GDISURFACE};
+    (kind_bits >> 4) & 0xf == STD_GDISURFACE
+        && matches!(kind_bits & 0xf, GDI_STAGING_CPUVISIBLE | GDI_EXISTINGSYSMEM)
+}
+
+/// Whether [`Surface::kind_bits`] name CDD's ClearType gamma table (`LOOKUPTABLE`).
+pub const fn is_lookup_table(kind_bits: u32) -> bool {
+    use crate::rm_standard::{GDI_LOOKUPTABLE, STD_GDISURFACE};
+    (kind_bits >> 4) & 0xf == STD_GDISURFACE && kind_bits & 0xf == GDI_LOOKUPTABLE
 }
 
 /// The byte order of a 32 bpp GDI surface format: `Some(false)` B G R A|X (`A8R8G8B8` 21,
@@ -1452,14 +1469,24 @@ pub mod cpu {
     /// ClearTypeBlend of one pixel (Learn `DXGK_GDIARG_CLEARTYPEBLEND` remarks). `gamma`: the row
     /// of the gamma surface (512 entries: the gamma table then the inverse table), or `None` for
     /// `D3DKM_INVALID_GAMMA_INDEX`.
+    ///
+    /// The coverage a channel blends with: with a gamma table its own component of A (A.r for
+    /// red, A.g for green, A.b for blue); without one, A.r or A.g for every channel (A.r when the
+    /// color is not darker than the destination, else A.g) and A.b is not used at all: GDI's
+    /// grey-antialiased text sends A = (a, a, 0). Coverage 0 keeps D, 255 takes Color2.
     pub fn cleartype_pixel(d: u32, a: u32, color: u32, color2: u32, gamma: Option<&[u8; 512]>) -> u32 {
         let mut out = d & 0xff00_0000;
         let ar = ch(a, 16);
         let ag = ch(a, 8);
         let ab = ch(a, 0);
-        for (shift, ac) in [(16u32, ar), (8, ag), (0, ab)] {
+        for (shift, own) in [(16u32, ar), (8, ag), (0, ab)] {
             let dc = ch(d, shift);
             let cc = ch(color, shift);
+            let ac = match gamma {
+                Some(_) => own,
+                None if cc >= dc => ar,
+                None => ag,
+            };
             let v = if ac == 0 {
                 dc
             } else if ac == 255 {
@@ -1474,8 +1501,7 @@ pub mod cpu {
                     }
                     None => {
                         // OutputColor.c = D.c + (Color.c - D.c) * (Color.c >= D.c ? A.r : A.g) / 255
-                        let k = if cc >= dc { ar } else { ag };
-                        let v = dc as i32 + ((cc as i32 - dc as i32) * k as i32) / 255;
+                        let v = dc as i32 + ((cc as i32 - dc as i32) * ac as i32) / 255;
                         v.clamp(0, 255) as u32
                     }
                 }
@@ -1789,6 +1815,41 @@ pub const COUNTERS: &[&str] = &[
     // and the executor thread's state (1 running, 0 on the HPD worker).
     "GdiRdBk",
     "GdiThr",
+    // The last command the CPU executor dropped: signature, failing step | Why << 8 | standard
+    // buffer step << 16, surface kinds, formats, authored pitches, the command's pitches, extents
+    // (source, destination) and first sub-rectangle (origin, size).
+    "GdiDropK",
+    "GdiDropS",
+    "GdiDropT",
+    "GdiDropF",
+    "GdiDropP",
+    "GdiDropC",
+    "GdiDropSWH",
+    "GdiDropDWH",
+    "GdiDropO",
+    "GdiDropR",
+    // Commands into the ClearType gamma table (LOOKUPTABLE): seen | executed << 16, the last one's
+    // surface kinds, formats, command pitches, first sub-rectangle and source extent; command
+    // pitches ignored (not a STAGING_CPUVISIBLE / EXISTINGSYSMEM surface) and the last one.
+    "GdiLutN",
+    "GdiLutT",
+    "GdiLutF",
+    "GdiLutC",
+    "GdiLutR",
+    "GdiLutSWH",
+    "GdiLutAp",
+    "GdiLutId",
+    // Record-less GDI submissions that admitted more than one unclaimed job, and the most one did.
+    "GdiClmMul",
+    "GdiClmMax",
+    // Allocation destroys that waited for queued GDI jobs naming the allocation, waits that ran
+    // out, destroys of an allocation a not yet submitted job names, the longest wait (µs).
+    "GdiFreeWait",
+    "GdiFreeTo",
+    "GdiFreeUns",
+    "GdiFreeUs",
+    "GdiPitchIgn",
+    "GdiPitchIgnV",
     // Copies and fills with a staging buffer on one side run on the copy engine over the buffer's
     // system pages; refused (the CPU instead); failed after the mapping (the CPU instead).
     "GdiSysCe",
@@ -2558,6 +2619,22 @@ mod tests {
     }
 
     #[test]
+    fn command_pitches_apply_to_cpu_visible_staging_and_existing_sysmem_only() {
+        use crate::rm_standard::STD_GDISURFACE;
+        let k = |gdi: u32| STD_GDISURFACE << 4 | gdi;
+        assert!(cmd_pitch_applies(k(2)));
+        assert!(cmd_pitch_applies(k(5)));
+        assert!(cmd_pitch_applies(k(2) | 0x100));
+        for g in [0, 1, 3, 4, 6, 7, 8] {
+            assert!(!cmd_pitch_applies(k(g)), "gdi {g}");
+        }
+        // A shadow surface (standard type 2) is not a GDI surface whatever the low nibble.
+        assert!(!cmd_pitch_applies(2 << 4 | 2));
+        assert!(is_lookup_table(k(4)));
+        assert!(!is_lookup_table(k(2)) && !is_lookup_table(3 << 4 | 4));
+    }
+
+    #[test]
     fn blends_follow_the_documented_formulas() {
         // Opaque premultiplied source replaces the destination; a transparent one keeps it.
         assert_eq!(blend_pixel(0xff10_2030, 0xff80_8080, 255, true), 0xff10_2030);
@@ -2570,6 +2647,14 @@ mod tests {
         // ClearType without gamma: zero coverage keeps D, full coverage takes Color2, alpha kept.
         assert_eq!(cleartype_pixel(0x7f11_2233, 0x0000_0000, 0x00ff_ffff, 0x0001_0203, None), 0x7f11_2233);
         assert_eq!(cleartype_pixel(0x7f11_2233, 0x00ff_ffff, 0x00ff_ffff, 0x0001_0203, None), 0x7f01_0203);
+        // Grey-antialiased text (A = (a, a, 0)) blends all three channels with A.r / A.g: black
+        // over white at a = 0x42 is 0xbd in each channel (WARP's GDI gives the same), and full
+        // coverage is Color2 in each.
+        assert_eq!(cleartype_pixel(0xffff_ffff, 0x0042_4200, 0, 0, None), 0xffbd_bdbd);
+        assert_eq!(cleartype_pixel(0xffff_ffff, 0x00ff_ff00, 0, 0, None), 0xff00_0000);
+        // A color not darker than the destination blends with A.r, A.g is not used.
+        assert_eq!(cleartype_pixel(0xff00_0000, 0x0000_ff00, 0x00ff_ffff, 0x00ff_ffff, None), 0xff00_0000);
+        assert_eq!(cleartype_pixel(0xff00_0000, 0x00ff_0000, 0x00ff_ffff, 0x00ff_ffff, None), 0xffff_ffff);
         // With an identity gamma table half coverage lands halfway.
         let mut t = [0u8; 512];
         for i in 0..256 {

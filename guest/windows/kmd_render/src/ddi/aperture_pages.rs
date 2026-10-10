@@ -52,6 +52,49 @@ static WR: AtomicU32 = AtomicU32::new(0);
 static MISS: AtomicU32 = AtomicU32::new(0);
 static FULL: AtomicU32 = AtomicU32::new(0);
 
+/// The history of the CPU-written GDI surfaces (`STAGING_CPUVISIBLE`, `LOOKUPTABLE`), for the GDI
+/// executor's `GdiLutAp`: the last 64 created (resource id | aperture placement << 31), registered
+/// and forgotten resource ids.
+static CREATED: [AtomicU32; 64] = [const { AtomicU32::new(0) }; 64];
+static REGISTERED: [AtomicU32; 64] = [const { AtomicU32::new(0) }; 64];
+static FORGOTTEN: [AtomicU32; 64] = [const { AtomicU32::new(0) }; 64];
+static CREATED_N: AtomicU32 = AtomicU32::new(0);
+static REGISTERED_N: AtomicU32 = AtomicU32::new(0);
+static FORGOTTEN_N: AtomicU32 = AtomicU32::new(0);
+
+fn ring_push(ring: &[AtomicU32; 64], n: &AtomicU32, v: u32) {
+    let i = n.fetch_add(1, Ordering::Relaxed) as usize % ring.len();
+    ring[i].store(v, Ordering::Relaxed);
+}
+
+/// A CPU-written GDI surface was created (`aperture`: placed in the aperture and to be tracked).
+pub(crate) fn note_created(resource_id: u32, aperture: bool) {
+    ring_push(&CREATED, &CREATED_N, resource_id & 0x7fff_ffff | u32::from(aperture) << 31);
+}
+
+/// What the history knows of `resource_id`: 1 created with the aperture placement, 2 created
+/// without it, 4 registered, 8 forgotten, 16 tracked now.
+pub(crate) fn history(resource_id: u32) -> u32 {
+    let id = resource_id & 0x7fff_ffff;
+    let mut h = 0;
+    for e in CREATED.iter() {
+        let v = e.load(Ordering::Relaxed);
+        if v != 0 && v & 0x7fff_ffff == id {
+            h |= if v >> 31 != 0 { 1 } else { 2 };
+        }
+    }
+    if REGISTERED.iter().any(|e| e.load(Ordering::Relaxed) == resource_id) {
+        h |= 4;
+    }
+    if FORGOTTEN.iter().any(|e| e.load(Ordering::Relaxed) == resource_id) {
+        h |= 8;
+    }
+    if tracked(resource_id) {
+        h |= 16;
+    }
+    h
+}
+
 /// Whether it is in force (`RedirVram` on, `RvOff` 0x4000 clear).
 pub(crate) fn on() -> bool {
     crate::virtio::rm_client::vidmem::knob_on()
@@ -90,6 +133,7 @@ pub(crate) fn register(resource_id: u32, size: u64) {
             t[i] = Some(entry);
             ANY.store(1, Ordering::Release);
             REG.fetch_add(1, Ordering::Relaxed);
+            ring_push(&REGISTERED, &REGISTERED_N, resource_id);
         }
         None => {
             FULL.fetch_add(1, Ordering::Relaxed);
@@ -108,6 +152,9 @@ pub(crate) fn forget(resource_id: u32) {
             .find(|e| e.as_ref().is_some_and(|e| e.resource_id == resource_id))
             .and_then(Option::take)
     };
+    if old.is_some() {
+        ring_push(&FORGOTTEN, &FORGOTTEN_N, resource_id);
+    }
     drop(old);
 }
 

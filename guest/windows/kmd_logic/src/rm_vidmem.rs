@@ -1146,6 +1146,34 @@ mod tests {
     }
 
     #[test]
+    fn a_block_linear_foreign_upload_takes_copy_push_not_present_push() {
+        use crate::ce_present::{copy_push, present_push, Acquire, Gen, Push, PushError, Release, SourcePlan};
+        // The GDI executor's write-back into an NVK image (`ce_vram::foreign_transfer`, upload): the
+        // copy's destination is the image's block-linear layout.
+        let bl = SurfaceLayout::BlockLinear { block_height_log2: 4, element_bytes: 4, image_height: 674, origin_x_bytes: 0, origin_y: 0 };
+        let plan = SourcePlan { layout: bl, page_kind: Some(6), line_bytes: 1304 * 4, offset: 0 };
+        let r = Rect { left: 16, top: 10, right: 24, bottom: 30 };
+        let up = foreign_bounce_copy(&plan, map_va(4), 5376, 1304, 674, r, Dir::Upload).unwrap();
+        assert_eq!((up.src_va, up.dst_va, up.layout), (BOUNCE_VA, map_va(4), SurfaceLayout::Pitch));
+        assert!(matches!(up.dst_layout, SurfaceLayout::BlockLinear { origin_x_bytes: 64, origin_y: 10, .. }));
+        let done = Release { va: 0x2000, value: 1, wfi: true, timestamp: false, interrupt: false };
+        let mut buf = [0u32; 64];
+        assert_eq!(
+            present_push(&mut Push::new(&mut buf), Gen::Gb202, Acquire { va: 0x1000, value: 0 }, &up, done),
+            Err(PushError::Shape)
+        );
+        let mut buf = [0u32; 64];
+        let mut p = Push::new(&mut buf);
+        assert_eq!(copy_push(&mut p, Gen::Gb202, None, &up, done), Ok(()));
+        assert!(!p.is_empty());
+        // The readback (image to bounce buffer) stays a pitch destination, which `present_push` takes.
+        let rb = foreign_bounce_copy(&plan, map_va(4), 5376, 1304, 674, r, Dir::Readback).unwrap();
+        assert_eq!(rb.dst_layout, SurfaceLayout::Pitch);
+        let mut buf = [0u32; 64];
+        assert_eq!(present_push(&mut Push::new(&mut buf), Gen::Gb202, Acquire { va: 0x1000, value: 0 }, &rb, done), Ok(()));
+    }
+
+    #[test]
     fn foreign_writes_pitch_by_address_block_linear_by_origin() {
         use crate::ce_present::SourcePlan;
         let src = Surface { va: map_va(3), pitch: 6400, width: 1600, height: 900 };

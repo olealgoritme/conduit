@@ -1026,7 +1026,15 @@ pub(crate) fn foreign_transfer(
             }
             ce::full_barrier();
         }
-        let value = ce::submit_copy(&copy).map_err(|_| SUBMIT)?;
+        // An upload's destination is the image, block-linear when NVK tiled it: `copy_push`, which
+        // takes either destination layout (`submit_copy`'s `present_push` takes pitch ones only).
+        let value = match dir {
+            Dir::Readback => ce::submit_copy(&copy),
+            Dir::Upload => ce::submit_build(|push, gen, done| {
+                helios_kmd_logic::ce_present::copy_push(push, gen, None, &copy, done)
+            }),
+        }
+        .map_err(|_| SUBMIT)?;
         if !wait(io.passive, value, XFER_MS) {
             super::ce_route::mark_broken();
             return Err(TIMEOUT);

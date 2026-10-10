@@ -1113,6 +1113,28 @@ pub(crate) fn release_cpu_views(passive: PassiveLevel, adapter: &AdapterContext)
     drop(guard);
 }
 
+/// Why the last [`read_standard_buffer`] / [`write_standard_buffer`] returned `false` (the GDI
+/// executor's `GdiDropS` bits 16..23): 1 aperture page not mapped, 2 no content transaction, 3 no
+/// lease reader, 4 lease runs, 5 leases short, 6 blob map, 7 blob short (reads); 11 bad shape,
+/// 12 aperture page not mapped, 13 no content transaction, 14 blob map, 15 blob short, 16 lease
+/// mirror (writes).
+static STD_FAIL: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn last_std_fail() -> u32 {
+    STD_FAIL.load(Ordering::Relaxed)
+}
+
+/// Clear [`last_std_fail`] before a GDI command, so a drop does not report a code left by an
+/// earlier command or another caller.
+pub(crate) fn clear_std_fail() {
+    STD_FAIL.store(0, Ordering::Relaxed);
+}
+
+fn std_fail(code: u32) -> bool {
+    STD_FAIL.store(code, Ordering::Relaxed);
+    false
+}
+
 /// `RedirVram` (docs/vram-redirection.md 5.6): copy `out.len()` bytes from offset `offset` of the
 /// KMD standard buffer `resource_id`'s AUTHORITATIVE CPU view into `out`: the system pages VidMm
 /// holds while it has leases that are current (the system copy is not marked invalid), the Venus
@@ -1128,10 +1150,10 @@ pub(crate) fn read_standard_buffer(
 ) -> bool {
     // `RvOff` 0x4000: an aperture GDI surface's content is its system pages.
     if let Some(ok) = crate::ddi::aperture_pages::read(resource_id, offset, out) {
-        return ok;
+        return ok || std_fail(1);
     }
     let Some(guard) = adapter.system_backings.serialize(passive) else {
-        return false;
+        return std_fail(2);
     };
     let want_end = offset.saturating_add(out.len() as u64);
     let invalid = guard.system_copy_invalid(resource_id);
@@ -1144,12 +1166,12 @@ pub(crate) fn read_standard_buffer(
             RD_LEASE.fetch_add(1, Ordering::Relaxed);
             RD_LAST.store(resource_id << 4 | 1, Ordering::Relaxed);
             let Some(reader) = snapshot.reader() else {
-                return false;
+                return std_fail(3);
             };
             let mut runs = alloc::vec::Vec::new();
             let mut vas = alloc::vec::Vec::new();
             if !reader.runs(&mut runs, &mut vas) {
-                return false;
+                return std_fail(4);
             }
             let mut covered = 0u64;
             for (&(run_off, run_len), &va) in runs.iter().zip(vas.iter()) {
@@ -1172,7 +1194,7 @@ pub(crate) fn read_standard_buffer(
             CPU_VIEW.store(1, Ordering::Relaxed);
             CPU_KB.store((out.len() / 1024) as u32, Ordering::Relaxed);
             publish_cpu_counters();
-            return covered == out.len() as u64;
+            return covered == out.len() as u64 || std_fail(5);
         }
     }
     if !invalid {
@@ -1193,7 +1215,10 @@ pub(crate) fn read_standard_buffer(
     CPU_VIEW.store(2, Ordering::Relaxed);
     CPU_KB.store((out.len() / 1024) as u32, Ordering::Relaxed);
     publish_cpu_counters();
-    mapped && ok
+    if !mapped {
+        return std_fail(6);
+    }
+    ok || std_fail(7)
 }
 
 /// `RedirVram` (docs/vram-redirection.md 5.6): write `rows` rows of `row_bytes` bytes (packed in
@@ -1214,24 +1239,26 @@ pub(crate) fn write_standard_buffer(
     let pitch64 = u64::from(pitch);
     let row = u64::from(row_bytes);
     if rows == 0 || row > pitch64 || (data.len() as u64) < row * u64::from(rows) {
-        return false;
+        return std_fail(11);
     }
     let span = pitch64 * u64::from(rows - 1) + row;
     let Some(end) = offset.checked_add(span) else {
-        return false;
+        return std_fail(11);
     };
     if let Some(ok) = crate::ddi::aperture_pages::write(resource_id, offset, pitch, row_bytes, rows, data) {
-        return ok;
+        return ok || std_fail(12);
     }
     let Some(guard) = adapter.system_backings.serialize(passive) else {
-        return false;
+        return std_fail(13);
     };
     let snapshot = guard.snapshot(resource_id);
     let mut ok = false;
+    let mut short = false;
     // SAFETY: PASSIVE; the content transaction is held for the whole copy.
     let mapped = unsafe {
         with_blob_bytes_cached(passive, adapter, resource_id, |blob, len| {
             if end > len {
+                short = true;
                 return;
             }
             for y in 0..u64::from(rows) {
@@ -1252,7 +1279,10 @@ pub(crate) fn write_standard_buffer(
     CPU_VIEW.store(2, Ordering::Relaxed);
     CPU_KB.store((span / 1024) as u32, Ordering::Relaxed);
     publish_cpu_counters();
-    mapped && ok
+    if !mapped {
+        return std_fail(14);
+    }
+    ok || std_fail(if short { 15 } else { 16 })
 }
 
 /// WDDM 2.x `VIRTUAL_TRANSFER` for a Helios blob allocation.

@@ -301,6 +301,88 @@ const PATH_DIAG: u32 = 256;
 static SYNC_N: AtomicU32 = AtomicU32::new(0);
 static SYNC_OPS: AtomicU32 = AtomicU32::new(0);
 
+/// The last command the CPU executor dropped (`run_cpu` failed), so a lost command names itself:
+/// its signature (`GdiSlowOp` encoding), the failing step | the `Why` << 8 | the standard
+/// buffer's failing step (`build_paging_buffer::last_std_fail`) << 16, the surfaces' kinds
+/// (`kind_bits`, source low 16 | destination << 16), D3DDDIFORMATs, authored pitches and extents
+/// (w << 16 | h), the command's pitches (source | destination << 16), and its first
+/// sub-rectangle (left << 16 | top, w << 16 | h).
+static DROP_K: AtomicU32 = AtomicU32::new(0);
+static DROP_S: AtomicU32 = AtomicU32::new(0);
+static DROP_T: AtomicU32 = AtomicU32::new(0);
+static DROP_F: AtomicU32 = AtomicU32::new(0);
+static DROP_P: AtomicU32 = AtomicU32::new(0);
+static DROP_C: AtomicU32 = AtomicU32::new(0);
+static DROP_SWH: AtomicU32 = AtomicU32::new(0);
+static DROP_DWH: AtomicU32 = AtomicU32::new(0);
+static DROP_O: AtomicU32 = AtomicU32::new(0);
+static DROP_R: AtomicU32 = AtomicU32::new(0);
+/// Commands into a GDI lookup table (`LOOKUPTABLE`, the ClearType gamma table CDD fills once
+/// with a BitBlt): seen | executed without a drop << 16, and the last one's surface kinds
+/// (source | destination << 16), formats, command pitches (source | destination << 16), first
+/// sub-rectangle (w << 16 | h) and source extent (w << 16 | h).
+static LUT_N: AtomicU32 = AtomicU32::new(0);
+static LUT_T: AtomicU32 = AtomicU32::new(0);
+static LUT_F: AtomicU32 = AtomicU32::new(0);
+static LUT_C: AtomicU32 = AtomicU32::new(0);
+static LUT_R: AtomicU32 = AtomicU32::new(0);
+static LUT_SWH: AtomicU32 = AtomicU32::new(0);
+/// The aperture history (`aperture_pages::history`) of the last gamma-table command's source
+/// (low 8 bits) and destination (<< 8), and their resource ids (source | destination << 16).
+static LUT_AP: AtomicU32 = AtomicU32::new(0);
+static LUT_ID: AtomicU32 = AtomicU32::new(0);
+/// Command pitches the CPU executor ignored (the surface is not `STAGING_CPUVISIBLE` /
+/// `EXISTINGSYSMEM`, Learn `DXGK_GDIARG_BITBLT` remarks), and the last one ignored.
+static PITCH_IGN: AtomicU32 = AtomicU32::new(0);
+static PITCH_IGN_V: AtomicU32 = AtomicU32::new(0);
+
+fn note_lut(op: &Op) {
+    let lo16 = |v: u32| v & 0xffff;
+    let (src, dst) = (op.srcs[0], op.dst);
+    let (dpc, spc) = cmd_pitches(&op.cmd);
+    LUT_N.fetch_add(1, Ordering::Relaxed);
+    LUT_T.store(src.map_or(0, |s| lo16(s.kind_bits)) | dst.map_or(0, |d| lo16(d.kind_bits)) << 16, Ordering::Relaxed);
+    LUT_F.store(src.map_or(0, |s| lo16(s.format)) | dst.map_or(0, |d| lo16(d.format)) << 16, Ordering::Relaxed);
+    LUT_C.store(lo16(spc) | lo16(dpc) << 16, Ordering::Relaxed);
+    let r = op.subs.first().copied().unwrap_or_default();
+    LUT_R.store(lo16(r.width()) << 16 | lo16(r.height()), Ordering::Relaxed);
+    LUT_SWH.store(src.map_or(0, |s| lo16(s.width) << 16 | lo16(s.height)), Ordering::Relaxed);
+    let hist = |x: Option<Surface>| x.map_or(0, |x| crate::ddi::aperture_pages::history(x.resource_id) & 0xff);
+    LUT_AP.store(hist(src) | hist(dst) << 8, Ordering::Relaxed);
+    LUT_ID.store(src.map_or(0, |s| lo16(s.resource_id)) | dst.map_or(0, |d| lo16(d.resource_id)) << 16, Ordering::Relaxed);
+}
+
+/// The CPU executor's failing step (`GdiDropS` low byte): 1 source window size, 2 source rows
+/// past its pitch, 3 source span, 4 source read, 5 destination write, 6 window size, 7 memory.
+static CPU_STEP: AtomicU32 = AtomicU32::new(0);
+
+fn cpu_step(n: u32) {
+    CPU_STEP.store(n, Ordering::Relaxed);
+}
+
+fn note_drop(op: &Op, why: Why) {
+    let lo16 = |v: u32| v & 0xffff;
+    let wh = |s: Option<Surface>| s.map_or(0, |s| lo16(s.width) << 16 | lo16(s.height));
+    let (src, dst) = (op.srcs[0], op.dst);
+    let (dpc, spc) = cmd_pitches(&op.cmd);
+    DROP_K.store(op_signature(op), Ordering::Relaxed);
+    DROP_S.store(
+        (CPU_STEP.load(Ordering::Relaxed) & 0xff)
+            | why.code() << 8
+            | (crate::ddi::build_paging_buffer::last_std_fail() & 0xff) << 16,
+        Ordering::Relaxed,
+    );
+    DROP_T.store(src.map_or(0, |s| lo16(s.kind_bits)) | dst.map_or(0, |d| lo16(d.kind_bits)) << 16, Ordering::Relaxed);
+    DROP_F.store(src.map_or(0, |s| lo16(s.format)) | dst.map_or(0, |d| lo16(d.format)) << 16, Ordering::Relaxed);
+    DROP_P.store(src.map_or(0, |s| lo16(s.pitch)) | dst.map_or(0, |d| lo16(d.pitch)) << 16, Ordering::Relaxed);
+    DROP_C.store(lo16(spc) | lo16(dpc) << 16, Ordering::Relaxed);
+    DROP_SWH.store(wh(src), Ordering::Relaxed);
+    DROP_DWH.store(wh(dst), Ordering::Relaxed);
+    let r = op.subs.first().copied().unwrap_or_default();
+    DROP_O.store(lo16(r.left as u32) << 16 | lo16(r.top as u32), Ordering::Relaxed);
+    DROP_R.store(lo16(r.width()) << 16 | lo16(r.height()), Ordering::Relaxed);
+}
+
 /// Whether `translate` runs the commands itself (`GdiOff` 0x80).
 pub(crate) fn sync_mode() -> bool {
     path(PATH_SYNC)
@@ -359,7 +441,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &CLAIM_MULTI, &CLAIM_MAX, &FREE_WAIT, &FREE_TO, &FREE_UNS, &FREE_US, &PITCH_IGN, &PITCH_IGN_V,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -492,6 +574,32 @@ pub(crate) fn publish_counters() {
     w(b"GdiJobT3", JOB_T[4].load(Ordering::Relaxed));
     w(b"GdiJobT3Us", JOB_T[5].load(Ordering::Relaxed));
     w(b"GdiThr", u32::from(crate::ddi::gdi_thread::running()));
+    w(b"GdiDropK", DROP_K.load(Ordering::Relaxed));
+    w(b"GdiDropS", DROP_S.load(Ordering::Relaxed));
+    w(b"GdiDropT", DROP_T.load(Ordering::Relaxed));
+    w(b"GdiDropF", DROP_F.load(Ordering::Relaxed));
+    w(b"GdiDropP", DROP_P.load(Ordering::Relaxed));
+    w(b"GdiDropC", DROP_C.load(Ordering::Relaxed));
+    w(b"GdiDropSWH", DROP_SWH.load(Ordering::Relaxed));
+    w(b"GdiDropDWH", DROP_DWH.load(Ordering::Relaxed));
+    w(b"GdiDropO", DROP_O.load(Ordering::Relaxed));
+    w(b"GdiDropR", DROP_R.load(Ordering::Relaxed));
+    w(b"GdiLutN", LUT_N.load(Ordering::Relaxed));
+    w(b"GdiLutT", LUT_T.load(Ordering::Relaxed));
+    w(b"GdiLutF", LUT_F.load(Ordering::Relaxed));
+    w(b"GdiLutC", LUT_C.load(Ordering::Relaxed));
+    w(b"GdiLutR", LUT_R.load(Ordering::Relaxed));
+    w(b"GdiLutSWH", LUT_SWH.load(Ordering::Relaxed));
+    w(b"GdiLutAp", LUT_AP.load(Ordering::Relaxed));
+    w(b"GdiLutId", LUT_ID.load(Ordering::Relaxed));
+    w(b"GdiClmMul", CLAIM_MULTI.load(Ordering::Relaxed));
+    w(b"GdiClmMax", CLAIM_MAX.load(Ordering::Relaxed));
+    w(b"GdiFreeWait", FREE_WAIT.load(Ordering::Relaxed));
+    w(b"GdiFreeTo", FREE_TO.load(Ordering::Relaxed));
+    w(b"GdiFreeUns", FREE_UNS.load(Ordering::Relaxed));
+    w(b"GdiFreeUs", FREE_US.load(Ordering::Relaxed));
+    w(b"GdiPitchIgn", PITCH_IGN.load(Ordering::Relaxed));
+    w(b"GdiPitchIgnV", PITCH_IGN_V.load(Ordering::Relaxed));
 }
 
 /// The channel up for a job that needs it (a VRAM surface on either side): bring it up when it is
@@ -632,13 +740,126 @@ pub(crate) fn admit(adapter: &AdapterContext, id: u64) -> Option<u64> {
     }
 }
 
-/// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH): the context's oldest
-/// unclaimed job. dxgkrnl submits a context's DMA buffers in the order it rendered them, so this
-/// names the buffer being submitted; a preempted replay without its record would claim the next
-/// one instead (counted with the claims, `GdiCtxClm`). `None`: nothing unclaimed.
-pub(crate) fn oldest_unclaimed(ctx: usize) -> Option<u64> {
-    let t = TABLE.lock();
-    t.jobs.iter().filter(|j| j.ctx == ctx && j.seq.is_none()).map(|j| j.id).min()
+/// Submissions on a GDI context without a private record that admitted more than one job, and
+/// the most one admitted (`GdiClmMul`, `GdiClmMax`).
+static CLAIM_MULTI: AtomicU32 = AtomicU32::new(0);
+static CLAIM_MAX: AtomicU32 = AtomicU32::new(0);
+
+/// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH): admit EVERY unclaimed
+/// job of the context, oldest first, and gate this submission's fence on the last one.
+///
+/// dxgkrnl submits a context's DMA buffers in the order it rendered them, and every job of the
+/// context was rendered before this submission, so this buffer's job is among the unclaimed ones
+/// or was admitted by an earlier submission, whose fence retires before this one (the WDDM fence
+/// FIFO is head-of-line). Claiming only the oldest went wrong whenever a rendered job had no
+/// submission of its own (a rendered buffer dxgkrnl did not submit, a submission that is no
+/// RenderGdi buffer): from then on each buffer's fence was gated on the job BEFORE its own, and its
+/// own job was admitted only by the next submission. Its fence retired with its commands still
+/// unexecuted, CDD destroyed the source of the copy (the staging buffer of the ClearType gamma
+/// table's one initialising BitBlt), and the job then read a freed allocation (`GdiLutAp` 0x0D:
+/// created, registered, forgotten). `None`: nothing unclaimed (the earlier gated fences cover it).
+pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize) -> Option<u64> {
+    let (last, n) = {
+        let mut t = TABLE.lock();
+        let mut last = None;
+        let mut n = 0u32;
+        loop {
+            let Some(i) = t
+                .jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, j)| j.ctx == ctx && j.seq.is_none())
+                .min_by_key(|(_, j)| j.id)
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
+            let seq = t.tl.next();
+            t.jobs[i].seq = Some(seq);
+            last = Some(seq);
+            n += 1;
+        }
+        (last, n)
+    };
+    if n == 0 {
+        return None;
+    }
+    JOB_N.fetch_add(n, Ordering::Relaxed);
+    if n > 1 {
+        CLAIM_MULTI.fetch_add(1, Ordering::Relaxed);
+    }
+    CLAIM_MAX.fetch_max(n, Ordering::Relaxed);
+    PENDING.store(1, Ordering::Release);
+    kick(adapter);
+    last
+}
+
+/// Allocation destroys that waited for queued GDI jobs naming the allocation (`GdiFreeWait`), the
+/// waits that ran out (`GdiFreeTo`), destroys of an allocation named by a job not yet submitted
+/// (`GdiFreeUns`), and the longest wait in µs (`GdiFreeUs`).
+static FREE_WAIT: AtomicU32 = AtomicU32::new(0);
+static FREE_TO: AtomicU32 = AtomicU32::new(0);
+static FREE_UNS: AtomicU32 = AtomicU32::new(0);
+static FREE_US: AtomicU32 = AtomicU32::new(0);
+/// How long a destroy waits for the executor at most (wall clock).
+const FREE_WAIT_MS: u64 = 500;
+
+fn names(op: &Op, resource_id: u32) -> bool {
+    [op.dst, op.srcs[0], op.srcs[1]].iter().flatten().any(|s| s.resource_id == resource_id)
+}
+
+/// DestroyAllocation of `resource_id` (PASSIVE): first let the executor finish every admitted job
+/// that names it (and the job it is running, whose commands are out of the table).
+///
+/// dxgkrnl destroys an allocation once it holds no reference to it; it does not wait for the
+/// fence of a GDI DMA buffer that named it. CDD frees the staging buffer of the ClearType gamma
+/// table right after submitting the table's initialising BitBlt, before the executor ran it: the
+/// copy then read a freed allocation and the table stayed zero (405.31: `GdiLutAp` 0x0D, the
+/// source created, registered and forgotten before the job ran). The executor only reads and
+/// writes the allocation through its content views (the aperture pages, the blob), which go with
+/// the destroy, so the destroy waits, as one on hardware waits for the GPU to be done with it.
+pub(crate) fn drain_for(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) {
+    if resource_id == 0 || PENDING.load(Ordering::Acquire) == 0 && !any_running() {
+        return;
+    }
+    let target = {
+        let t = TABLE.lock();
+        let mut target: Option<u64> = None;
+        let mut unsubmitted = false;
+        for j in t.jobs.iter() {
+            let named = j.running || j.ops.iter().any(|op| names(op, resource_id));
+            if !named {
+                continue;
+            }
+            match j.seq {
+                Some(seq) if seq > t.tl.completed => target = Some(target.map_or(seq, |x| x.max(seq))),
+                Some(_) => {}
+                None => unsubmitted |= !j.running,
+            }
+        }
+        if unsubmitted {
+            FREE_UNS.fetch_add(1, Ordering::Relaxed);
+        }
+        target
+    };
+    let Some(target) = target else { return };
+    FREE_WAIT.fetch_add(1, Ordering::Relaxed);
+    let t0 = now_100ns();
+    // Wall clock: `sleep_ms(1)` rounds up to the timer tick (~15.6 ms), so counting sleeps would
+    // stretch the cap up to ~16x.
+    while !seq_ready(target) {
+        if now_100ns().wrapping_sub(t0) >= FREE_WAIT_MS * 10_000 {
+            FREE_TO.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        kick(adapter);
+        crate::virtio::ctrl::sleep_ms(passive, 1);
+    }
+    FREE_US.fetch_max(us_since(t0), Ordering::Relaxed);
+}
+
+fn any_running() -> bool {
+    TABLE.lock().jobs.iter().any(|j| j.running)
 }
 
 /// DestroyContext: its unclaimed jobs can never be submitted (dropped, counted as orphans).
@@ -926,7 +1147,7 @@ fn op_signature(op: &Op) -> u32 {
 }
 
 /// A SRCCOPY BitBlt from a foreign NVK image into VRAM or a staging buffer, on the copy engine.
-/// There is no CPU fallback (the image has no CPU view): a failure drops the command.
+/// `false` (counted in `GdiFgnFail`, the step in `GdiFgnWhy`): the caller runs the CPU path.
 fn run_foreign(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
     let (Some(dst), Some(src), Cmd::BitBlt { src: sr, dst: dr, .. }) = (op.dst, op.srcs[0], op.cmd) else {
         return false;
@@ -976,7 +1197,7 @@ fn run_foreign(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool
 }
 
 /// A SRCCOPY BitBlt INTO a foreign NVK image from VRAM or a staging buffer, on the copy engine
-/// (`ce_vram::foreign_write`). No CPU fallback: a failure drops the command.
+/// (`ce_vram::foreign_write`). `false`: the caller runs the CPU path.
 fn run_foreign_write(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
     let (Some(dst), Some(src), Cmd::BitBlt { src: sr, dst: dr, .. }) = (op.dst, op.srcs[0], op.cmd) else {
         return false;
@@ -1190,27 +1411,38 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     if let Some(d) = op.dst.filter(|d| matches!(d.class, SurfaceClass::Vram | SurfaceClass::Foreign)) {
         FMT_K.store(op.srcs[0].map_or(0, |s| s.format & 0xffff) | (d.format & 0xffff) << 16, Ordering::Relaxed);
     }
+    let lut = op.dst.is_some_and(|d| ga::is_lookup_table(d.kind_bits));
+    if lut {
+        note_lut(op);
+    }
     let drops = crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed);
     execute_inner(passive, adapter, op);
     if crate::ddi::gdi_accel::DROP.load(Ordering::Relaxed) == drops {
         note_dst_written(op);
+        if lut {
+            LUT_N.fetch_add(1 << 16, Ordering::Relaxed);
+        }
     }
     probe_after(passive, adapter, op);
 }
 
 fn execute_inner(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     let fgn_copy = ga::is_foreign_copy(&op.cmd, op.dst.as_ref(), op.srcs[0].as_ref());
+    // A plain copy to or from a foreign NVK image: one copy-engine copy between the image and the
+    // other surface. When the copy engine cannot reach the other surface (a staging buffer outside
+    // guest system pages has no copy-engine view), the CPU path does the copy: it moves the image's
+    // side through the bounce buffer (`read_window` / `write_window`).
     if fgn_copy && op.engine != Engine::Drop && op.dst.is_some_and(|d| d.class == SurfaceClass::Foreign) {
         if !run_foreign_write(passive, adapter, op) {
             crate::ddi::gdi_accel::note_why(Why::CeFailed);
-            crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
+            run_cpu_counted(passive, adapter, op);
         }
         return;
     }
     if fgn_copy && op.engine != Engine::Drop && op.srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign) {
         if !run_foreign(passive, adapter, op) {
             crate::ddi::gdi_accel::note_why(Why::CeFailed);
-            crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
+            run_cpu_counted(passive, adapter, op);
         }
         return;
     }
@@ -1279,12 +1511,15 @@ fn execute_inner(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
 fn run_cpu_counted(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     CPU_MSK.fetch_or(op.why.map_or(1, |w| w.bit()), Ordering::Relaxed);
     CPU_ROP.store(rop_key(op), Ordering::Relaxed);
+    CPU_STEP.store(0, Ordering::Relaxed);
+    crate::ddi::build_paging_buffer::clear_std_fail();
     match run_cpu(passive, adapter, op) {
         Ok(()) => {
             FALL.fetch_add(1, Ordering::Relaxed);
             self_check(passive, adapter, op, 3);
         }
         Err(why) => {
+            note_drop(op, why);
             crate::ddi::gdi_accel::note_why(why);
             crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
         }
@@ -1409,7 +1644,7 @@ fn us_since(t0: u64) -> u32 {
 /// `GdiPitchCmd`/`GdiPitchAl`).
 fn addr_view(v: &CeView, s: &Surface, cmd_pitch: u32) -> CeView {
     let mut out = *v;
-    if cmd_pitch != 0 && cmd_pitch != v.pitch {
+    if cmd_pitch != 0 && cmd_pitch != v.pitch && ga::cmd_pitch_applies(s.kind_bits) {
         PITCH_MIS.fetch_add(1, Ordering::Relaxed);
         PITCH_CMD.store(cmd_pitch, Ordering::Relaxed);
         PITCH_AL.store(v.pitch, Ordering::Relaxed);
@@ -1702,31 +1937,42 @@ fn read_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rec
     let (w, h) = (rect.width() as usize, rect.height() as usize);
     let bytes = (w as u64) * 4 * h as u64;
     if bytes == 0 || bytes > MAX_WINDOW_BYTES {
+        cpu_step(1);
         return Err(Why::CpuFailed);
     }
     let mut out = Vec::new();
-    out.try_reserve_exact(bytes as usize).map_err(|_| Why::CpuFailed)?;
+    out.try_reserve_exact(bytes as usize).map_err(|_| {
+        cpu_step(7);
+        Why::CpuFailed
+    })?;
     out.resize(bytes as usize, 0);
     match s.class {
         SurfaceClass::Vram => {
             if !glue::vram_read(passive, adapter, s.resource_id, *rect, &mut out, w * 4) {
+                cpu_step(4);
                 return Err(Why::CpuFailed);
             }
         }
         SurfaceClass::System => {
             let p = pitch as u64;
             if p < (rect.right as u64) * 4 {
+                cpu_step(2);
                 return Err(Why::OutOfBounds);
             }
             let start = rect.top as u64 * p + rect.left as u64 * 4;
             let span = (h as u64 - 1) * p + w as u64 * 4;
             if span > MAX_WINDOW_BYTES * 2 {
+                cpu_step(3);
                 return Err(Why::CpuFailed);
             }
             let mut tmp = Vec::new();
-            tmp.try_reserve_exact(span as usize).map_err(|_| Why::CpuFailed)?;
+            tmp.try_reserve_exact(span as usize).map_err(|_| {
+                cpu_step(7);
+                Why::CpuFailed
+            })?;
             tmp.resize(span as usize, 0);
             if !glue::std_read(passive, adapter, s.resource_id, start, &mut tmp) {
+                cpu_step(4);
                 return Err(Why::CpuFailed);
             }
             for y in 0..h {
@@ -1739,6 +1985,7 @@ fn read_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rec
                 return Err(Why::Unreachable);
             }
             if !glue::foreign_read(passive, adapter, s.resource_id, *rect, &mut out, w * 4) {
+                cpu_step(4);
                 FGN_RMW_FAIL.fetch_add(1, Ordering::Relaxed);
                 return Err(Why::CpuFailed);
             }
@@ -1750,6 +1997,14 @@ fn read_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rec
 }
 
 fn write_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rect: &Rect, pitch: u32, data: &mut [u8]) -> Result<(), Why> {
+    let r = write_window_inner(passive, adapter, s, rect, pitch, data);
+    if r.is_err() {
+        cpu_step(5);
+    }
+    r
+}
+
+fn write_window_inner(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, rect: &Rect, pitch: u32, data: &mut [u8]) -> Result<(), Why> {
     let w = rect.width();
     match s.class {
         SurfaceClass::Vram => {
@@ -1783,10 +2038,18 @@ fn write_window(passive: PassiveLevel, adapter: &AdapterContext, s: &Surface, re
     }
 }
 
-/// The CPU stride of a surface for this command: a staging surface's command pitch when the
-/// command carries one (Learn `DXGK_GDIARG_BITBLT` remarks), else the allocation's.
+/// The CPU stride of a surface for this command: the command's pitch for a `STAGING_CPUVISIBLE`
+/// or `EXISTINGSYSMEM` surface when it carries one, else the allocation's. Learn
+/// `DXGK_GDIARG_BITBLT` remarks: the pitches locate the rectangles for those two GDI surface
+/// types only and "should be ignored for other allocation types" (CDD's staging and lookup-table
+/// surfaces, shadows).
 fn pitch_of(s: &Surface, cmd_pitch: u32) -> u32 {
-    if s.class == SurfaceClass::System && cmd_pitch >= s.width.saturating_mul(4) && cmd_pitch != 0 {
+    let applies = ga::cmd_pitch_applies(s.kind_bits);
+    if s.class == SurfaceClass::System && cmd_pitch != 0 && !applies && cmd_pitch != s.pitch {
+        PITCH_IGN.fetch_add(1, Ordering::Relaxed);
+        PITCH_IGN_V.store(cmd_pitch, Ordering::Relaxed);
+    }
+    if s.class == SurfaceClass::System && applies && cmd_pitch >= s.width.saturating_mul(4) && cmd_pitch != 0 {
         cmd_pitch
     } else if s.pitch != 0 {
         s.pitch
@@ -1888,10 +2151,14 @@ fn run_cpu_fill(passive: PassiveLevel, adapter: &AdapterContext, op: &Op, dst: &
             continue;
         }
         if bytes > MAX_WINDOW_BYTES {
+            cpu_step(6);
             return Err(Why::CpuFailed);
         }
         let mut buf = Vec::new();
-        buf.try_reserve_exact(bytes as usize).map_err(|_| Why::CpuFailed)?;
+        buf.try_reserve_exact(bytes as usize).map_err(|_| {
+            cpu_step(7);
+            Why::CpuFailed
+        })?;
         let px = color.to_le_bytes();
         for _ in 0..area(&d) {
             buf.extend_from_slice(&px);

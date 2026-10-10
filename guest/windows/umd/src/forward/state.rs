@@ -973,6 +973,20 @@ pub(crate) unsafe fn resource_dimensions(h_res: ddi::D3D10DDI_HRESOURCE) -> (u32
     (desc.Width, desc.Height)
 }
 
+/// Whether the resource is a GDI-compatible texture (`D3D11_RESOURCE_MISC_GDI_COMPATIBLE`):
+/// what `IDXGISurface1::GetDC` works on.
+pub(crate) unsafe fn resource_gdi_compatible(h_res: ddi::D3D10DDI_HRESOURCE) -> bool {
+    let Some(res) = load_resource(h_res) else {
+        return false;
+    };
+    let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
+        return false;
+    };
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    tex.GetDesc(&mut desc);
+    desc.MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32 != 0
+}
+
 pub(crate) unsafe fn resource_sample_count(h_res: ddi::D3D10DDI_HRESOURCE) -> u32 {
     let Some(res) = load_resource(h_res) else {
         return 1;

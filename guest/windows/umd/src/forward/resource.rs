@@ -1878,19 +1878,24 @@ pub(crate) unsafe extern "system" fn resolve_shared_resource(
     };
     let alloc = resource_allocation(resource);
     let (width, height) = resource_dimensions(resource);
-    log_error!(
-        "DDI ResolveSharedResource: hDevice={:p} hResource={:p} alloc=0x{:x} {}x{}",
-        h,
-        h_resource,
-        alloc,
-        width,
-        height
-    );
-    if let Some(context) = d3d11_context(Hdevice {
-        pDrvPrivate: h as *mut c_void,
-    }) {
-        context.Flush();
+    static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 4 || n % 1024 == 0 {
+        log_error!(
+            "DDI ResolveSharedResource #{n}: hDevice={:p} hResource={:p} alloc=0x{:x} {}x{}",
+            h,
+            h_resource,
+            alloc,
+            width,
+            height
+        );
     }
+    gdi_handoff(
+        Hdevice {
+            pDrvPrivate: h as *mut c_void,
+        },
+        resource,
+    );
     0
 }
 
@@ -1913,10 +1918,60 @@ pub(crate) unsafe extern "system" fn dxgi_resolve_shared_resource(
         width,
         height
     );
-    if let Some(context) = d3d11_context(Hdevice {
-        pDrvPrivate: h_device as *mut c_void,
-    }) {
-        context.Flush();
-    }
+    gdi_handoff(
+        Hdevice {
+            pDrvPrivate: h_device as *mut c_void,
+        },
+        resource,
+    );
     0
+}
+
+/// Submit what this device recorded (every ResolveSharedResource), and on NVK wait until the GPU
+/// has finished it. ResolveSharedResource comes from `IDXGISurface1::GetDC` on a GDI-compatible
+/// texture, where GDI reads or draws the image next, and from a keyed-mutex release. The runtime
+/// creates a GDI-compatible texture as a plain shared resource (DDI `MISC_SHARED`, no GDI flag:
+/// 405.29's log, `shared=true gdi_compatible=false`), so the two are not told apart here.
+///
+/// The GDI acceleration executor in the KMD reads and writes the image with its own copy engine;
+/// dxgkrnl orders GDI's DMA buffers against this device's only when the device submits through
+/// dxgkrnl, and NVK submits to RM directly, so without the wait GDI could read the image before
+/// the device's last rendering landed (or draw into it and be overwritten by it):
+/// `gdi_interop_probe` round 0 of every process, RichEdit's text in Notepad. A keyed-mutex
+/// release already completed the device's work at its flush (`flush_gate`'s CPU wait, the
+/// default on NVK), so the wait finds the GPU idle; with the hand-off ledger
+/// (`HELIOS_HANDOFF_LEDGER=1`) a shared resource's hand-off is the ledger's and does not wait.
+/// Venus devices submit through dxgkrnl, which orders the GDI work after theirs.
+pub(crate) unsafe fn gdi_handoff(h: Hdevice, resource: ddi::D3D10DDI_HRESOURCE) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    context.Flush();
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if !dev.dxvk.is_nvk() {
+        return;
+    }
+    let key = resource.pDrvPrivate as usize;
+    let shared = lock_ignore_poison(&dev.nvk_keyed_resources).iter().any(|&(k, _)| k == key);
+    static DECISIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if d <= 4 {
+        log_error!(
+            "DDI NVK ResolveSharedResource #{d}: hResource=0x{key:x} shared={shared} gdi_compatible={}",
+            resource_gdi_compatible(resource)
+        );
+    }
+    if shared && super::transfer::ledger_enabled() {
+        return;
+    }
+    let Some(start) = super::transfer::wait_submitted(dev, &context, "GetDC flush wait") else {
+        return;
+    };
+    static WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 4 || n % 1024 == 0 {
+        log_error!("DDI NVK GetDC flush wait #{n}: {} us", start.elapsed().as_micros());
+    }
 }
