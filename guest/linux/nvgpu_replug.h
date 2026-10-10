@@ -24,6 +24,11 @@
  * that deliberately keeps a fixed mode sees one replug per host change, then
  * applies its fixed mode again.
  *
+ * A head that is off when the grace period ends (DPMS off: a lock screen or
+ * an idle blank) shows no mode at all, and the compositor turns it back on at
+ * whatever mode it kept, without probing. So the watch stays armed: the next
+ * time the head comes on, the grace period starts again from there.
+ *
  * Plain C, no libc: the state machine is the same in the module and in
  * test/replug_test.c. The caller serialises every call (the module holds
  * mode_config.mutex).
@@ -76,30 +81,32 @@ static inline bool nvgpu_replug_on_mode(struct nvgpu_replug *r) {
 }
 
 /*
- * Whether the head shows the preferred mode: same size, and a refresh within
- * a hertz (`cur_hz` is drm_mode_vrefresh()'s whole hertz). A head that is
- * off counts as following: nobody shows anything on it, and whoever turns it
- * on next probes the current list first.
+ * Whether a head that is on shows the preferred mode: same size, and a
+ * refresh within a hertz (`cur_hz` is drm_mode_vrefresh()'s whole hertz).
  */
-static inline bool nvgpu_replug_applied(bool crtc_enabled, u32 cur_w, u32 cur_h,
-                                        u32 cur_hz, u32 want_w, u32 want_h,
-                                        u32 want_mhz) {
+static inline bool nvgpu_replug_applied(u32 cur_w, u32 cur_h, u32 cur_hz,
+                                        u32 want_w, u32 want_h, u32 want_mhz) {
   u32 cur_mhz = cur_hz * 1000;
   u32 diff;
 
-  if (!crtc_enabled)
-    return true;
   if (cur_w != want_w || cur_h != want_h)
     return false;
   diff = cur_mhz > want_mhz ? cur_mhz - want_mhz : want_mhz - cur_mhz;
   return diff < 1000;
 }
 
-/* The timer ran. `applied`: nvgpu_replug_applied() for the head right now. */
+/*
+ * The timer ran. `head_on`: the head is lit (enabled and active); `applied`:
+ * nvgpu_replug_applied() for it. A head that is off keeps the watch armed,
+ * with no timer: the caller restarts the grace period when it comes on
+ * (nvgpu_replug_watching()).
+ */
 static inline enum nvgpu_replug_act
-nvgpu_replug_on_timer(struct nvgpu_replug *r, bool applied) {
+nvgpu_replug_on_timer(struct nvgpu_replug *r, bool head_on, bool applied) {
   switch (r->stage) {
   case NVGPU_REPLUG_WATCH:
+    if (!head_on)
+      return NVGPU_REPLUG_NOTHING;
     if (applied) {
       r->stage = NVGPU_REPLUG_IDLE;
       return NVGPU_REPLUG_NOTHING;
@@ -114,6 +121,11 @@ nvgpu_replug_on_timer(struct nvgpu_replug *r, bool applied) {
   default:
     return NVGPU_REPLUG_NOTHING;
   }
+}
+
+/* Whether a new preferred mode is still waiting to be seen on the head. */
+static inline bool nvgpu_replug_watching(const struct nvgpu_replug *r) {
+  return r->stage == NVGPU_REPLUG_WATCH;
 }
 
 /*
