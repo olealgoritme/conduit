@@ -172,6 +172,19 @@ struct HeliosDxvkDevice {
                                     std::uint64_t* value,
                                     std::uint8_t* copy,
                                     std::size_t copy_len) const noexcept;
+  // nvk_present_fence_v3 without waiting for the frame's submission
+  // (helios_icd_interface.h version 8): the fence names a value reserved on
+  // this device's present ECL timeline now; DXVK's submission thread signals it
+  // right after the submission that carries the frame
+  // (D3D11ImmediateContext::HeliosSubmitFrameThen). Flushes the immediate
+  // context. Returns as nvk_present_fence_v3, plus 3 = not available here (an
+  // ICD without version 8, no RM fences, another backend): nothing was flushed
+  // or reserved, use nvk_present_fence_v3 after the SUBMITTED gate.
+  std::int32_t nvk_present_fence_async(std::size_t d3d11_resource_ptr,
+                                       std::uint32_t* fence_handle,
+                                       std::uint64_t* value,
+                                       std::uint8_t* copy,
+                                       std::size_t copy_len) const noexcept;
   // Close a fence the caller still owns.
   void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
 

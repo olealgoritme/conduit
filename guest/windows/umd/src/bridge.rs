@@ -208,6 +208,19 @@ mod ffi {
             copy: *mut u8,
             copy_len: usize,
         ) -> i32;
+        /// NVK: `nvk_present_fence_v3` for a value reserved now and signalled
+        /// by DXVK's submission thread after the frame (no SUBMITTED gate;
+        /// flushes the immediate context). As `nvk_present_fence_v3`, plus
+        /// 3 = not available here (nothing flushed or reserved).
+        /// # Safety: as `nvk_present_fence_v3`.
+        unsafe fn nvk_present_fence_async(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            fence_handle: *mut u32,
+            value: *mut u64,
+            copy: *mut u8,
+            copy_len: usize,
+        ) -> i32;
         /// NVK: close a fence the caller still owns.
         fn nvk_rm_fence_close(self: &HeliosDxvkDevice, fence_handle: u32);
         /// Flush gate (docs/flush-gate.md): flush, then the point the HEFL
@@ -996,6 +1009,39 @@ impl BridgeDevice {
             0 if fence != 0 => Some((fence, value, Some(copy))),
             2 if fence != 0 => Some((fence, value, None)),
             _ => None,
+        }
+    }
+
+    /// [`Self::nvk_present_fence_v3`] without the SUBMITTED gate before it: the
+    /// fence names a value DXVK's submission thread signals right after the
+    /// frame's submission. `Err(())` when the ICD or the device cannot (no
+    /// version-8 ICD, no RM fences): nothing was flushed or reserved, and the
+    /// caller takes the gated path. `Ok(None)` when it failed after flushing.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn nvk_present_fence_async(
+        &self,
+        res: Option<&ID3D11Resource>,
+    ) -> Result<
+        Option<(
+            u32,
+            u64,
+            Option<[u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES]>,
+        )>,
+        (),
+    > {
+        let d = self.get().ok_or(())?;
+        let (mut fence, mut value) = (0u32, 0u64);
+        let mut copy = [0u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES];
+        let ptr = res.map_or(0, |r| r.as_raw() as usize);
+        // SAFETY: as in `nvk_present_fence_v3`.
+        let r = unsafe {
+            d.nvk_present_fence_async(ptr, &mut fence, &mut value, copy.as_mut_ptr(), copy.len())
+        };
+        match r {
+            0 if fence != 0 => Ok(Some((fence, value, Some(copy)))),
+            2 if fence != 0 => Ok(Some((fence, value, None))),
+            3 => Err(()),
+            _ => Ok(None),
         }
     }
 
