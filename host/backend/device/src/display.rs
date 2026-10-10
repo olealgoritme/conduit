@@ -32,6 +32,12 @@
 //! * The guest's cursor. A `CursorUpdate` from the guest becomes `CMD_CURSOR`
 //!   with the cursor plane's dma-buf; the broker makes it the host pointer's
 //!   image. The last one is kept and re-sent to a broker that (re)connects.
+//! * The mode list ([`ModeCatalog`], docs/SCANOUT.md "Mode list"): native,
+//!   the standard modes up to it and the VM's custom modes. It goes to the
+//!   guest as `DisplayModeList` and to every client with `CAP_MODE_LIST` as
+//!   `CMD_MODES` records; a client edits the custom modes with
+//!   `EV_MODE_EDIT`, and so does `conduit display` through the VM's
+//!   `display-modes` file, which the link re-reads when it changes.
 //! * The clipboard (docs/CLIPBOARD.md). `EV_CLIPBOARD` transfers from the
 //!   broker are reassembled ([`ClipAssembler`]) and handed to the sink, which
 //!   chunks them onto the event queue as `ClipboardFromHost`; the guest's
@@ -121,6 +127,157 @@ impl std::fmt::Display for DisplayMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}x{}@{}", self.width, self.height, self.refresh_hz)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The mode list (protocol::modes), with the VM's custom modes on disk
+// ---------------------------------------------------------------------------
+
+/// The display's mode list: native (the configured mode), the standard modes
+/// up to it, and the custom modes kept in the VM's `display-modes` file
+/// (`protocol::modes`). Every change bumps the generation, which is what the
+/// link compares to know who still needs the new list.
+#[derive(Debug)]
+pub struct ModeCatalog {
+    native: (u32, u32),
+    refresh_mhz: u32,
+    custom: Vec<(u32, u32)>,
+    path: Option<PathBuf>,
+    /// The file as last read: (mtime, size, inode); `None` if absent.
+    stamp: Option<(std::time::SystemTime, u64, u64)>,
+    generation: u64,
+}
+
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len(), m.ino()))
+}
+
+impl ModeCatalog {
+    /// The list for `mode`; custom modes from `path` (absent: none).
+    pub fn new(mode: DisplayMode, path: Option<PathBuf>) -> Self {
+        let mut c = Self {
+            native: (mode.width, mode.height),
+            refresh_mhz: mode.refresh_hz * 1000,
+            custom: Vec::new(),
+            path,
+            stamp: None,
+            generation: 1,
+        };
+        c.read();
+        c
+    }
+
+    fn read(&mut self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        self.stamp = file_stamp(path);
+        self.custom = match std::fs::read_to_string(path) {
+            Ok(t) => protocol::modes::parse_custom(&t),
+            Err(_) => Vec::new(),
+        };
+    }
+
+    /// Re-read the file if it changed since; true if the list changed.
+    pub fn reload(&mut self) -> bool {
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        if file_stamp(&path) == self.stamp {
+            return false;
+        }
+        let before = self.custom.clone();
+        self.read();
+        if self.custom == before {
+            return false;
+        }
+        self.generation += 1;
+        log::info!(
+            "display: custom modes now {} (from {})",
+            fmt_modes(&self.custom),
+            path.display()
+        );
+        true
+    }
+
+    /// Add or remove one custom mode, and write the file. `Ok(true)` if the
+    /// list changed.
+    pub fn edit(&mut self, add: bool, m: (u32, u32)) -> Result<bool, String> {
+        // Someone may have edited the file meanwhile: start from it.
+        self.reload();
+        let next = if add {
+            protocol::modes::add_custom(&self.custom, m).map_err(|e| e.to_string())?
+        } else {
+            match protocol::modes::remove_custom(&self.custom, m) {
+                Some(v) => v,
+                None => return Ok(false),
+            }
+        };
+        if next == self.custom {
+            return Ok(false);
+        }
+        if let Some(path) = &self.path {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, protocol::modes::format_custom(&next))
+                .and_then(|()| std::fs::rename(&tmp, path))
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            self.stamp = file_stamp(path);
+        }
+        self.custom = next;
+        self.generation += 1;
+        log::info!("display: custom modes now {}", fmt_modes(&self.custom));
+        Ok(true)
+    }
+
+    pub fn list(&self) -> Vec<protocol::modes::ModeEntry> {
+        protocol::modes::mode_list(self.native, &self.custom)
+    }
+
+    pub fn sizes(&self) -> Vec<(u32, u32)> {
+        self.list().iter().map(|e| (e.width, e.height)).collect()
+    }
+
+    pub fn refresh_mhz(&self) -> u32 {
+        self.refresh_mhz
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The whole list as `CMD_MODES` records.
+    pub fn records(&self) -> Vec<u8> {
+        let list = self.list();
+        let mut out = Vec::with_capacity(list.len() * wire::CMD_SIZE);
+        for (k, e) in list.iter().enumerate() {
+            let c = wire::Cmd {
+                ty: wire::CMD_MODES,
+                flags: 0,
+                width: e.width,
+                height: e.height,
+                stride: k as u32,
+                offset: list.len() as u32,
+                fourcc: self.refresh_mhz,
+                modifier: self.generation,
+                seq: if e.native { wire::MODE_F_NATIVE } else { 0 }
+                    | if e.custom { wire::MODE_F_CUSTOM } else { 0 },
+            };
+            out.extend_from_slice(&c.encode());
+        }
+        out
+    }
+}
+
+fn fmt_modes(v: &[(u32, u32)]) -> String {
+    if v.is_empty() {
+        return "none".into();
+    }
+    v.iter()
+        .map(|(w, h)| format!("{w}x{h}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +416,14 @@ pub mod wire {
     /// virtio-nvgpu: the guest cursor image; only to a broker with
     /// [`CAP_CURSOR`] (an unknown command ends the connection).
     pub const CMD_CURSOR: u16 = 7;
+    /// Conduit: one mode of the display's mode list; only to a broker with
+    /// [`CAP_MODE_LIST`]. width/height = the mode, stride = its index,
+    /// offset = the list's length, fourcc = refresh mHz, modifier = the
+    /// list's generation, seq = [`MODE_F_NATIVE`] | [`MODE_F_CUSTOM`]. A
+    /// whole list is sent at once, index 0 (native) first.
+    pub const CMD_MODES: u16 = 8;
+    pub const MODE_F_NATIVE: u32 = 1 << 0;
+    pub const MODE_F_CUSTOM: u32 = 1 << 1;
 
     pub const EV_HELLO: u16 = 1;
     pub const EV_SURFACE: u16 = 2;
@@ -299,6 +464,13 @@ pub mod wire {
     /// the presentation time in `CLOCK_MONOTONIC` nanoseconds (0 unknown).
     /// Only from a client with [`CAP_PRESENTED`].
     pub const EV_PRESENTED: u16 = 21;
+    /// Conduit: edit the VM's custom modes. x,y = the mode, w0 =
+    /// [`MODE_EDIT_ADD`] or [`MODE_EDIT_REMOVE`]. The new list follows as
+    /// `CMD_MODES` to every client that takes it. Only from a client with
+    /// [`CAP_MODE_LIST`]; a backend that does not know it ignores it.
+    pub const EV_MODE_EDIT: u16 = 22;
+    pub const MODE_EDIT_ADD: u32 = 1;
+    pub const MODE_EDIT_REMOVE: u32 = 2;
 
     pub const F_FULLSCREEN: u16 = 1 << 2;
     /// ATTACH flags: the fd is a sealed memfd to present from shared memory
@@ -325,6 +497,8 @@ pub mod wire {
     /// Conduit: the broker answers each commit it shows with
     /// [`EV_PRESENTED`] (docs/SCANOUT.md "Presentation feedback").
     pub const CAP_PRESENTED: u32 = 1 << 16;
+    /// Conduit: the broker takes [`CMD_MODES`] and may send [`EV_MODE_EDIT`].
+    pub const CAP_MODE_LIST: u32 = 1 << 17;
     /// CMD_CAPS bit: a clipboard agent is behind this client.
     pub const CLIENT_CLIPBOARD: u32 = 1 << 0;
     /// CMD_CAPS bit: ATTACH/COMMIT `seq` is our CLOCK_MONOTONIC microseconds.
@@ -1031,6 +1205,20 @@ pub trait InputSink: Send {
     fn takes_input(&mut self) -> bool {
         true
     }
+
+    /// Whether the guest takes `DisplayModeList` (it acked
+    /// `NVGPU_F_MODE_LIST` and its event queue is up), and which device
+    /// start that was: a new value means a new guest driver, which needs the
+    /// list again. `None`: no list is sent.
+    fn mode_list_epoch(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Deliver the mode list. `false` if no buffer was posted; retried.
+    fn mode_list(&mut self, modes: &[(u32, u32)], refresh_mhz: u32) -> bool {
+        let _ = (modes, refresh_mhz);
+        true
+    }
 }
 
 /// Where `ScanoutReleased` events go: the event queue, in the vhost-user
@@ -1070,6 +1258,10 @@ pub struct GuestInputClaims {
     /// application's NVK forwards its own `GetSysFiles` (librmclient asks for
     /// it at `crm_open`), so a later one says nothing about the driver.
     other_first: AtomicBool,
+    /// The guest acked `NVGPU_F_MODE_LIST`.
+    mode_list: AtomicBool,
+    /// Device starts so far: which driver a mode list was sent to.
+    epoch: AtomicU64,
 }
 
 impl GuestInputClaims {
@@ -1079,6 +1271,10 @@ impl GuestInputClaims {
         let bit = u64::from(protocol::messages::NVGPU_CFG_TAKES_INPUT);
         self.acked
             .store(acked_features & bit != 0, Ordering::Release);
+        let ml = u64::from(protocol::messages::NVGPU_F_MODE_LIST);
+        self.mode_list
+            .store(acked_features & ml != 0, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.linux.store(false, Ordering::Release);
         self.other_first.store(false, Ordering::Release);
     }
@@ -1104,6 +1300,14 @@ impl GuestInputClaims {
         {
             self.other_first.store(true, Ordering::Release);
         }
+    }
+
+    /// The device start whose driver acked `NVGPU_F_MODE_LIST`, if this
+    /// one's did.
+    pub fn mode_list_epoch(&self) -> Option<u64> {
+        self.mode_list
+            .load(Ordering::Acquire)
+            .then(|| self.epoch.load(Ordering::Acquire))
     }
 
     /// The guest acked `NVGPU_CFG_TAKES_INPUT`.
@@ -1254,6 +1458,8 @@ struct Client {
     clip_out: Option<ClipOut>,
     /// When the last batch of it went, for pacing.
     clip_sent_at: Option<Instant>,
+    /// The mode-list generation this connection was last sent.
+    modes_sent: Option<u64>,
 }
 
 impl Client {
@@ -1364,6 +1570,8 @@ pub struct DisplayLink {
     presented_sink: Mutex<Option<Arc<dyn PresentedSink>>>,
     /// Guest generations ended so far ([`DisplayLink::guest_gone`]).
     generation: AtomicU64,
+    /// The mode list, shared by the guest and every client.
+    modes: Mutex<ModeCatalog>,
     pub stats: LinkStats,
 }
 
@@ -1445,8 +1653,93 @@ impl DisplayLink {
             presented_on: AtomicBool::new(false),
             presented_sink: Mutex::new(None),
             generation: AtomicU64::new(0),
+            modes: Mutex::new(ModeCatalog::new(mode, None)),
             stats: LinkStats::default(),
         })
+    }
+
+    /// Keep the custom modes in `path` (the VM's `display-modes`), read now
+    /// and re-read whenever it changes.
+    pub fn set_modes_file(&self, path: PathBuf) {
+        *self.modes.lock().unwrap() = ModeCatalog::new(self.configured, Some(path));
+    }
+
+    /// The mode list as it is now (tests, logs).
+    pub fn mode_sizes(&self) -> Vec<(u32, u32)> {
+        self.modes.lock().unwrap().sizes()
+    }
+
+    /// Clients owed the current mode list.
+    fn modes_owed(&self) -> bool {
+        let lgen = self.modes.lock().unwrap().generation();
+        let st = self.state.lock().unwrap();
+        st.clients.iter().any(|c| {
+            c.sock.is_some()
+                && c.hello
+                && c.broker_caps & wire::CAP_MODE_LIST != 0
+                && c.modes_sent != Some(lgen)
+        })
+    }
+
+    /// Send the current list to every client that takes it and lacks it. A
+    /// full socket keeps it owed; the list is small and sent whole.
+    fn send_modes(&self) {
+        let (lgen, bytes) = {
+            let m = self.modes.lock().unwrap();
+            (m.generation(), m.records())
+        };
+        let mut st = self.state.lock().unwrap();
+        for (i, c) in st.clients.iter_mut().enumerate() {
+            let Some(sock) = c.sock.clone() else {
+                continue;
+            };
+            if !c.hello || c.broker_caps & wire::CAP_MODE_LIST == 0 || c.modes_sent == Some(lgen) {
+                continue;
+            }
+            match send_records(sock.as_raw_fd(), &bytes, None) {
+                Ok(()) => {
+                    c.modes_sent = Some(lgen);
+                    log::debug!(
+                        "display: mode list ({} modes) sent to client {i}",
+                        bytes.len() / wire::CMD_SIZE
+                    );
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    log::debug!("display: mode list not sent to client {i}: {e}");
+                    c.modes_sent = Some(lgen);
+                }
+            }
+        }
+    }
+
+    /// EV_MODE_EDIT from client `i`.
+    fn edit_modes(&self, i: usize, p: &wire::Pkt) {
+        let caps = self
+            .state
+            .lock()
+            .unwrap()
+            .clients
+            .get(i)
+            .map_or(0, |c| c.broker_caps);
+        if caps & wire::CAP_MODE_LIST == 0 || p.x <= 0 || p.y <= 0 {
+            return;
+        }
+        let add = match p.w0 {
+            wire::MODE_EDIT_ADD => true,
+            wire::MODE_EDIT_REMOVE => false,
+            _ => return,
+        };
+        let m = (p.x as u32, p.y as u32);
+        match self.modes.lock().unwrap().edit(add, m) {
+            Ok(_) => {}
+            Err(e) => log::warn!(
+                "display: client {i} could not {} {}x{}: {e}",
+                if add { "add" } else { "remove" },
+                m.0,
+                m.1
+            ),
+        }
     }
 
     /// Replace the PRIME export used for parked buffers (tests).
@@ -2784,6 +3077,11 @@ impl DisplayLink {
         let mut pending: Vec<InputEventEntry> = Vec::new();
         let mut policy = ModeArbiter::new(self.configured);
         let mut pending_mode: Option<DisplayModeEvent> = None;
+        // The mode list: the (generation, guest epoch) the guest last got,
+        // and when the custom-modes file was last looked at.
+        let mut list_sent: Option<(u64, u64)> = None;
+        let mut modes_checked = Instant::now();
+        const MODES_RECHECK: Duration = Duration::from_secs(1);
         // Host clipboard on its way to the guest: generation, text, offset.
         let mut pending_clip: Option<(u64, Vec<u8>, usize)> = None;
         let mut clip_gen: u64 = 0;
@@ -2923,9 +3221,14 @@ impl DisplayLink {
             // Undeliverable input (no buffer posted) is retried soon rather
             // than on the next packet: a lost key release is a stuck key.
             let clip_waiting = pending_clip.is_some() && !clip_stalled;
+            let list_owed = sink
+                .mode_list_epoch()
+                .is_some_and(|e| list_sent != Some((self.modes.lock().unwrap().generation(), e)));
             let mut timeout = if pending.is_empty() && pending_mode.is_none() && !clip_waiting {
                 if self.clip_owed() {
                     CLIP_BATCH_EVERY.as_millis() as i32
+                } else if list_owed || self.modes_owed() {
+                    20
                 } else if self.cursor_owed() || pending_clip.is_some() {
                     20
                 } else {
@@ -3050,6 +3353,9 @@ impl DisplayLink {
                     if let Some(m) = policy.packet(i, &p) {
                         pending_mode = Some(m);
                     }
+                    if p.ty == wire::EV_MODE_EDIT {
+                        self.edit_modes(i, &p);
+                    }
                     // Gamepads are the guest's whatever is shown: the
                     // console has no gamepad to give them to.
                     if routed_console && p.ty != wire::EV_PAD {
@@ -3088,6 +3394,28 @@ impl DisplayLink {
                     m.refresh_mhz / 1000,
                     m.refresh_mhz % 1000
                 );
+            }
+            if modes_checked.elapsed() >= MODES_RECHECK {
+                modes_checked = Instant::now();
+                self.modes.lock().unwrap().reload();
+            }
+            if self.modes_owed() {
+                self.send_modes();
+            }
+            if let Some(epoch) = sink.mode_list_epoch() {
+                let (lgen, sizes, mhz) = {
+                    let m = self.modes.lock().unwrap();
+                    (m.generation(), m.sizes(), m.refresh_mhz())
+                };
+                if list_sent != Some((lgen, epoch)) && sink.mode_list(&sizes, mhz) {
+                    list_sent = Some((lgen, epoch));
+                    log::info!(
+                        "display: mode list -> guest: {} modes, {}x{} native",
+                        sizes.len(),
+                        sizes[0].0,
+                        sizes[0].1
+                    );
+                }
             }
             if self.clip_resend.swap(false, Ordering::Relaxed) {
                 match latest_clip.as_ref() {
@@ -3266,6 +3594,12 @@ impl DisplayLink {
                 p.y,
                 p.w0,
                 p.w1
+            ),
+            EV_MODE_EDIT => log::info!(
+                "display: client {i} {} custom mode {}x{}",
+                if p.w0 == MODE_EDIT_ADD { "adds" } else { "removes" },
+                p.x,
+                p.y
             ),
             EV_CLOSE => log::info!("display: the user closed the viewer window"),
             EV_BYE => log::info!("display: client {i} says goodbye (reason {})", p.x),
@@ -4641,6 +4975,259 @@ mod tests {
         assert!(wait_for(|| got.lock().unwrap().len() == 7));
         assert!(wait_for(|| link.connected()));
 
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        th.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "nvgpu-modes-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    const NATIVE: DisplayMode = DisplayMode {
+        width: 5120,
+        height: 1440,
+        refresh_hz: 240,
+    };
+
+    #[test]
+    fn the_catalog_reads_edits_and_rereads_the_custom_modes_file() {
+        let dir = tmpdir("catalog");
+        let path = dir.join("display-modes");
+        // No file: native and the standard modes only.
+        let mut c = ModeCatalog::new(NATIVE, Some(path.clone()));
+        assert_eq!(c.sizes()[0], (5120, 1440));
+        assert!(!c.sizes().contains(&(1234, 567)));
+        let g0 = c.generation();
+        assert!(!c.reload());
+
+        assert_eq!(c.edit(true, (1234, 567)), Ok(true));
+        assert!(c.generation() > g0);
+        assert!(c.sizes().contains(&(1234, 567)));
+        assert_eq!(
+            protocol::modes::parse_custom(&std::fs::read_to_string(&path).unwrap()),
+            vec![(1234, 567)]
+        );
+        // Adding it again or removing an absent one changes nothing.
+        let g1 = c.generation();
+        assert_eq!(c.edit(true, (1234, 567)), Ok(false));
+        assert_eq!(c.edit(false, (999, 999)), Ok(false));
+        assert_eq!(c.generation(), g1);
+        assert!(c.edit(true, (10, 10)).is_err());
+
+        // `conduit display --add` edits the file behind its back.
+        std::fs::write(&path, "1234x567\n2000x1000\n").unwrap();
+        // A same-second, same-size rewrite still differs in size here.
+        assert!(c.reload());
+        assert!(c.sizes().contains(&(2000, 1000)));
+        assert!(!c.reload(), "unchanged file: nothing to do");
+
+        assert_eq!(c.edit(false, (1234, 567)), Ok(true));
+        assert!(!c.sizes().contains(&(1234, 567)));
+        assert_eq!(
+            protocol::modes::parse_custom(&std::fs::read_to_string(&path).unwrap()),
+            vec![(2000, 1000)]
+        );
+        // A fresh catalog reads what was written.
+        let c2 = ModeCatalog::new(NATIVE, Some(path.clone()));
+        assert_eq!(c2.sizes(), c.sizes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mode_records_carry_the_whole_list() {
+        let c = ModeCatalog::new(NATIVE, None);
+        let bytes = c.records();
+        let list = c.list();
+        assert_eq!(bytes.len(), list.len() * wire::CMD_SIZE);
+        for (k, chunk) in bytes.chunks(wire::CMD_SIZE).enumerate() {
+            let r = wire::Cmd::decode(chunk.try_into().unwrap());
+            assert_eq!(r.ty, wire::CMD_MODES);
+            assert_eq!(r.flags, 0, "the viewer refuses unknown command flags");
+            assert_eq!((r.width, r.height), (list[k].width, list[k].height));
+            assert_eq!(r.stride, k as u32);
+            assert_eq!(r.offset, list.len() as u32);
+            assert_eq!(r.fourcc, 240_000);
+            assert_eq!(r.modifier, c.generation());
+            assert_eq!(r.seq & wire::MODE_F_NATIVE != 0, k == 0);
+            assert_eq!(&chunk[36..40], &[0u8; 4], "reserved1");
+        }
+    }
+
+    /// Mode lists the guest got, and whether it takes them (epoch).
+    #[derive(Clone, Default)]
+    struct ListSink {
+        lists: Arc<Mutex<Vec<Vec<(u32, u32)>>>>,
+        epoch: Arc<Mutex<Option<u64>>>,
+        full: Arc<AtomicBool>,
+    }
+    impl InputSink for ListSink {
+        fn push(&mut self, events: &[InputEventEntry]) -> usize {
+            events.len()
+        }
+        fn mode_list_epoch(&mut self) -> Option<u64> {
+            *self.epoch.lock().unwrap()
+        }
+        fn mode_list(&mut self, modes: &[(u32, u32)], mhz: u32) -> bool {
+            assert_eq!(mhz, 240_000);
+            if self.full.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.lists.lock().unwrap().push(modes.to_vec());
+            true
+        }
+    }
+
+    fn read_modes(conn: &mut std::os::unix::net::UnixStream) -> Vec<wire::Cmd> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        loop {
+            let mut b = [0u8; wire::CMD_SIZE];
+            conn.read_exact(&mut b).unwrap();
+            let c = wire::Cmd::decode(&b);
+            if c.ty != wire::CMD_MODES {
+                continue; // CAPS, WINDOW, ...
+            }
+            let last = c.stride + 1 == c.offset;
+            out.push(c);
+            if last {
+                return out;
+            }
+        }
+    }
+
+    #[test]
+    fn the_mode_list_reaches_the_guest_and_capable_clients_and_follows_edits() {
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        let dir = tmpdir("link");
+        let path = dir.join("broker.sock");
+        let modes_file = dir.join("display-modes");
+        let listener = UnixListener::bind(&path).unwrap();
+        let link = DisplayLink::with_mode(Some(path.clone()), NATIVE);
+        link.set_modes_file(modes_file.clone());
+        let sink = ListSink::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let th = {
+            let (link, sink, stop) = (link.clone(), sink.clone(), stop.clone());
+            std::thread::spawn(move || link.run(Box::new(sink), &stop))
+        };
+
+        // No guest that takes lists yet: nothing sent.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(sink.lists.lock().unwrap().is_empty());
+        // The guest acks the feature, but has no event buffer posted yet.
+        sink.full.store(true, Ordering::Relaxed);
+        *sink.epoch.lock().unwrap() = Some(1);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(sink.lists.lock().unwrap().is_empty());
+        sink.full.store(false, Ordering::Relaxed);
+        assert!(wait_for(|| sink.lists.lock().unwrap().len() == 1));
+        assert_eq!(sink.lists.lock().unwrap()[0], link.mode_sizes());
+        assert_eq!(sink.lists.lock().unwrap()[0][0], (5120, 1440));
+
+        // A client with CAP_MODE_LIST gets the list right after HELLO.
+        let (mut conn, _) = listener.accept().unwrap();
+        let hello = wire::Pkt {
+            ty: wire::EV_HELLO,
+            w0: 2,
+            w1: wire::CAP_MODE_LIST | wire::CAP_MODE_HINTS,
+            ..Default::default()
+        };
+        conn.write_all(&hello.encode()).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let first = read_modes(&mut conn);
+        assert_eq!(
+            first.iter().map(|c| (c.width, c.height)).collect::<Vec<_>>(),
+            link.mode_sizes()
+        );
+
+        // It adds a custom mode: file written, new list to it and the guest.
+        let add = wire::Pkt {
+            ty: wire::EV_MODE_EDIT,
+            x: 1234,
+            y: 567,
+            w0: wire::MODE_EDIT_ADD,
+            ..Default::default()
+        };
+        conn.write_all(&add.encode()).unwrap();
+        let second = read_modes(&mut conn);
+        let m = second.iter().find(|c| (c.width, c.height) == (1234, 567)).unwrap();
+        assert!(m.seq & wire::MODE_F_CUSTOM != 0);
+        assert!(second[0].modifier > first[0].modifier);
+        assert!(wait_for(|| sink.lists.lock().unwrap().len() == 2));
+        assert!(sink.lists.lock().unwrap()[1].contains(&(1234, 567)));
+        assert_eq!(
+            protocol::modes::parse_custom(&std::fs::read_to_string(&modes_file).unwrap()),
+            vec![(1234, 567)]
+        );
+
+        // `conduit display --rm` edits the file: picked up within a second.
+        std::fs::write(&modes_file, "# none\n").unwrap();
+        let third = read_modes(&mut conn);
+        assert!(!third.iter().any(|c| (c.width, c.height) == (1234, 567)));
+        assert!(wait_for(|| sink.lists.lock().unwrap().len() == 3));
+
+        // A new guest driver (device restarted) gets the list again.
+        *sink.epoch.lock().unwrap() = Some(2);
+        assert!(wait_for(|| sink.lists.lock().unwrap().len() == 4));
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        th.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_client_without_the_cap_gets_no_mode_list_and_cannot_edit() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tmpdir("nocap");
+        let path = dir.join("broker.sock");
+        let modes_file = dir.join("display-modes");
+        let listener = UnixListener::bind(&path).unwrap();
+        let link = DisplayLink::with_mode(Some(path.clone()), NATIVE);
+        link.set_modes_file(modes_file.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let th = {
+            let (link, stop) = (link.clone(), stop.clone());
+            std::thread::spawn(move || link.run(Box::new(ListSink::default()), &stop))
+        };
+        let (mut conn, _) = listener.accept().unwrap();
+        let hello = wire::Pkt {
+            ty: wire::EV_HELLO,
+            w0: 2,
+            w1: wire::CAP_MODE_HINTS,
+            ..Default::default()
+        };
+        conn.write_all(&hello.encode()).unwrap();
+        let add = wire::Pkt {
+            ty: wire::EV_MODE_EDIT,
+            x: 1234,
+            y: 567,
+            w0: wire::MODE_EDIT_ADD,
+            ..Default::default()
+        };
+        conn.write_all(&add.encode()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        conn.set_nonblocking(true).unwrap();
+        let mut b = [0u8; 4096];
+        let n = conn.read(&mut b).unwrap_or(0);
+        for chunk in b[..n].chunks(wire::CMD_SIZE) {
+            if chunk.len() == wire::CMD_SIZE {
+                assert_ne!(wire::Cmd::decode(chunk.try_into().unwrap()).ty, wire::CMD_MODES);
+            }
+        }
+        assert!(!link.mode_sizes().contains(&(1234, 567)));
+        assert!(!modes_file.exists());
         stop.store(true, Ordering::Relaxed);
         drop(conn);
         th.join().unwrap();

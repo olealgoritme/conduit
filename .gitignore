@@ -28,3 +28,4 @@ guest/linux/test/devinfo_test
 guest/linux/test/version_test
 guest/linux/test/escape_test
 guest/linux/test/replug_test
+guest/linux/test/modelist_test

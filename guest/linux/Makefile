@@ -24,7 +24,7 @@ PWD  := $(shell pwd)
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_CONDUIT_GPU=m modules
 
-# Unit tests of the parts that are plain C (nvgpu_pcimap.h, nvgpu_devinfo.h, nvgpu_version.h, nvgpu_escape.h, nvgpu_replug.h),
+# Unit tests of the parts that are plain C (nvgpu_pcimap.h, nvgpu_devinfo.h, nvgpu_version.h, nvgpu_escape.h, nvgpu_replug.h, nvgpu_modelist.h),
 # on the build host.
 HOSTCC ?= cc
 check:
@@ -43,7 +43,10 @@ check:
 	$(HOSTCC) -std=gnu11 -Wall -Wextra -Werror -O2 -fsanitize=address,undefined \
 		-o test/replug_test test/replug_test.c
 	./test/replug_test
+	$(HOSTCC) -std=gnu11 -Wall -Wextra -Werror -O2 -fsanitize=address,undefined \
+		-o test/modelist_test test/modelist_test.c
+	./test/modelist_test
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f test/pcimap_test test/devinfo_test test/version_test test/escape_test test/replug_test
+	rm -f test/pcimap_test test/devinfo_test test/version_test test/escape_test test/replug_test test/modelist_test

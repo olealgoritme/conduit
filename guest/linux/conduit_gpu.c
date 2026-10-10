@@ -104,6 +104,7 @@ extern struct kset *module_kset;
 #define NVGPU_MSG_CLIPBOARD_FROM_HOST 25 /* host -> guest, event queue */
 #define NVGPU_MSG_CLIPBOARD_TO_HOST 26   /* guest -> host, control queue */
 #define NVGPU_MSG_CLIPBOARD_REQUEST 27   /* guest -> host, control queue */
+#define NVGPU_MSG_DISPLAY_MODE_LIST 34   /* host -> guest, event queue */
 
 /* "NVAL": opens the allocation-size section of a GET_SYS_FILES response. */
 #define NVGPU_ALLOC_SIZE_MAGIC 0x4e56414cu
@@ -254,6 +255,12 @@ struct nvgpu_open_resp {
  * "Input"). A feature number, for the feature table below.
  */
 #define NVGPU_F_TAKES_INPUT 12
+
+/*
+ * Device feature bit 21 (protocol NVGPU_F_MODE_LIST): this driver takes the
+ * host's DisplayModeList and offers exactly those modes (nvgpu_modelist.h).
+ */
+#define NVGPU_F_MODE_LIST 21
 
 /*
  * The largest nvidia-drm GEM parameter struct this driver forwards, and the
@@ -1922,6 +1929,8 @@ static void nvgpu_input_batch(struct nvgpu_device *dev, const u8 *p,
                               unsigned int len);
 static void nvgpu_kms_mode_event(struct nvgpu_device *dev, const u8 *p,
                                  unsigned int len);
+static void nvgpu_kms_mode_list_event(struct nvgpu_device *dev, const u8 *p,
+                                      unsigned int len);
 /* Defined with the clipboard device (nvgpu_clipboard.h). Interrupt context. */
 static void nvgpu_clip_event(struct nvgpu_device *dev, const u8 *p,
                              unsigned int len);
@@ -1992,6 +2001,11 @@ static void nvgpu_event_vq_cb(struct virtqueue *vq) {
       nvgpu_kms_mode_event(dev, buf->payload,
                            min_t(unsigned int, len - sizeof(buf->hdr),
                                  sizeof(buf->payload)));
+    else if (len >= sizeof(buf->hdr) &&
+             le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_DISPLAY_MODE_LIST)
+      nvgpu_kms_mode_list_event(dev, buf->payload,
+                                min_t(unsigned int, len - sizeof(buf->hdr),
+                                      sizeof(buf->payload)));
     else if (len >= sizeof(buf->hdr) &&
              le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_CLIPBOARD_FROM_HOST)
       nvgpu_clip_event(dev, buf->payload,
@@ -7035,14 +7049,15 @@ module_param(virtio_id, uint, 0444);
 MODULE_PARM_DESC(virtio_id, "virtio device ID to bind (default 45)");
 
 /*
- * One device feature bit: NVGPU_F_TAKES_INPUT, the driver's "send me input
- * events". What the backend serves travels in config `caps` and `features`;
+ * Device feature bits: NVGPU_F_TAKES_INPUT, the driver's "send me input
+ * events", and NVGPU_F_MODE_LIST, "send me the mode list". What the backend serves travels in config `caps` and `features`;
  * three other feature bits were declared here once, and nothing offered or
  * tested them. A backend that does not offer the bit just leaves it unacked.
  */
 static unsigned int features[] = {
     VIRTIO_F_VERSION_1,
     NVGPU_F_TAKES_INPUT,
+    NVGPU_F_MODE_LIST,
 };
 
 static struct virtio_driver nvgpu_driver = {

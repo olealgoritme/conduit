@@ -74,6 +74,7 @@
 #include <linux/input.h>
 #include <linux/rcupdate.h>
 
+#include "nvgpu_modelist.h"
 #include "nvgpu_replug.h"
 
 /* ───────── wire structs (docs/SCANOUT.md) ───────── */
@@ -174,6 +175,10 @@ struct nvgpu_kms {
   u32 width, height, refresh_mhz;
   /* The mode config space announced, kept in the list whatever happens. */
   u32 boot_w, boot_h, boot_mhz;
+  /* The host's mode list (nvgpu_modelist.h), once one arrived: then the
+   * connector offers exactly it. Under mode_config.mutex. */
+  bool has_list;
+  struct nvgpu_modelist list;
   u64 modifiers[NVGPU_KMS_MAX_MODIFIERS];
   bool has_cursor;
 
@@ -182,6 +187,10 @@ struct nvgpu_kms {
   spinlock_t mode_lock;
   bool mode_pending;
   u32 pend_w, pend_h, pend_mhz;
+  /* A DisplayModeList, likewise; only the newest matters. */
+  bool list_pending;
+  struct nvgpu_modelist pend_list;
+  struct nvgpu_modelist work_list; /* the mode work's own copy */
   struct work_struct mode_work;
 
   /* The replug for compositors that ignore a connected -> connected hotplug
@@ -672,10 +681,41 @@ static struct drm_display_mode *nvgpu_kms_make_mode(struct drm_device *drm,
   return m;
 }
 
+/* With the host's list: exactly its modes, the preferred one first. */
+static int nvgpu_kms_get_list_modes(struct nvgpu_kms *kms,
+                                    struct drm_connector *conn) {
+  u32 mhz = kms->list.refresh_mhz ? kms->list.refresh_mhz : kms->refresh_mhz;
+  struct drm_display_mode *m;
+  int count = 0;
+  u32 i;
+
+  m = nvgpu_kms_make_mode(conn->dev, kms->width, kms->height, kms->refresh_mhz,
+                          true);
+  if (m) {
+    drm_mode_probed_add(conn, m);
+    count++;
+  }
+  for (i = 0; i < kms->list.count; i++) {
+    if (kms->list.w[i] == kms->width && kms->list.h[i] == kms->height &&
+        mhz == kms->refresh_mhz)
+      continue;
+    m = nvgpu_kms_make_mode(conn->dev, kms->list.w[i], kms->list.h[i], mhz,
+                            false);
+    if (m) {
+      drm_mode_probed_add(conn, m);
+      count++;
+    }
+  }
+  return count;
+}
+
 static int nvgpu_kms_get_modes(struct drm_connector *conn) {
   struct nvgpu_kms *kms = container_of(conn, struct nvgpu_kms, connector);
   struct drm_display_mode *m;
   int count;
+
+  if (kms->has_list)
+    return nvgpu_kms_get_list_modes(kms, conn);
 
   /* The standard table up to the larger of the two sizes, for a user who
    * wants less; at 60 Hz, so never mistaken for the preferred one. */
@@ -802,12 +842,46 @@ static void nvgpu_kms_replug_work(struct work_struct *work) {
  * event makes compositors re-probe. Process context, because the probe
  * helpers and the uevent sleep; the event-queue interrupt only records it.
  */
+/*
+ * Apply the newest DisplayModeList: the connector offers exactly it from now
+ * on, and a changed list is a hotplug so compositors (and games' mode menus)
+ * see it. The replug of nvgpu_replug.h is for a changed preferred mode only.
+ */
+static void nvgpu_kms_apply_list(struct nvgpu_kms *kms) {
+  struct drm_device *drm = kms->drm;
+  bool changed;
+
+  spin_lock_irq(&kms->mode_lock);
+  if (!kms->list_pending) {
+    spin_unlock_irq(&kms->mode_lock);
+    return;
+  }
+  kms->list_pending = false;
+  kms->work_list = kms->pend_list;
+  spin_unlock_irq(&kms->mode_lock);
+  if (READ_ONCE(kms->dead))
+    return;
+
+  mutex_lock(&drm->mode_config.mutex);
+  changed = !kms->has_list || !nvgpu_modelist_equal(&kms->list, &kms->work_list);
+  kms->list = kms->work_list;
+  kms->has_list = true;
+  mutex_unlock(&drm->mode_config.mutex);
+  if (!changed)
+    return;
+  dev_info(&kms->dev->vdev->dev,
+           "conduit-gpu: host mode list: %u modes, %ux%u native\n",
+           kms->work_list.count, kms->work_list.w[0], kms->work_list.h[0]);
+  drm_kms_helper_hotplug_event(drm);
+}
+
 static void nvgpu_kms_mode_work(struct work_struct *work) {
   struct nvgpu_kms *kms = container_of(work, struct nvgpu_kms, mode_work);
   struct drm_device *drm = kms->drm;
   u32 w, h, mhz;
   bool changed;
 
+  nvgpu_kms_apply_list(kms);
   spin_lock_irq(&kms->mode_lock);
   if (!kms->mode_pending) {
     spin_unlock_irq(&kms->mode_lock);
@@ -877,6 +951,27 @@ static void nvgpu_kms_mode_event(struct nvgpu_device *dev, const u8 *p,
     kms->mode_pending = true;
     spin_unlock_irqrestore(&kms->mode_lock, flags);
     schedule_work(&kms->mode_work);
+  }
+  rcu_read_unlock();
+}
+
+/* The event-queue interrupt: a DisplayModeList. Parsed straight into the
+ * pending copy; the work applies it. */
+static void nvgpu_kms_mode_list_event(struct nvgpu_device *dev, const u8 *p,
+                                      unsigned int len) {
+  struct nvgpu_kms *kms;
+  unsigned long flags;
+
+  rcu_read_lock();
+  kms = rcu_dereference(dev->kms_ev);
+  if (kms && !READ_ONCE(kms->dead)) {
+    spin_lock_irqsave(&kms->mode_lock, flags);
+    if (nvgpu_modelist_parse(p, len, NVGPU_KMS_MIN_DIM, NVGPU_KMS_MAX_DIM,
+                             NVGPU_KMS_MAX_HZ, &kms->pend_list))
+      kms->list_pending = true;
+    spin_unlock_irqrestore(&kms->mode_lock, flags);
+    if (kms->list_pending)
+      schedule_work(&kms->mode_work);
   }
   rcu_read_unlock();
 }

@@ -23,6 +23,8 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 # errors other than WouldBlock and EOF are retried at once, still so in
 # 0.29), so a closed terminal window left `conduit setup` spinning.
 crossterm = { version = "0.28", features = ["use-dev-tty"] }
+# The display mode list (`conduit display`), shared with the backend.
+protocol = { path = "../host/backend/protocol" }
 # The one parser of the driver version text, and the release type.
 abi = { path = "../host/backend/gen" }
 # The backend's trace format, for `conduit trace` (docs/TRACING.md).

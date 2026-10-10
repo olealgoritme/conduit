@@ -266,6 +266,9 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
             .arg(rt.display_sock())
             .arg("--display-socket")
             .arg(rt.stream_sock());
+        if backend_takes(backend, "--display-modes") {
+            cmd.arg("--display-modes").arg(crate::display::modes_file(&c.name));
+        }
     }
     let level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         if mode.is_some() {
@@ -642,6 +645,17 @@ fn viewer_session(wayland: bool, x11: bool) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Whether this backend build understands `flag` (its `--help` names it):
+/// the CLI and the backend may come from different builds, and the backend
+/// refuses to start over an option it does not know.
+pub(crate) fn backend_takes(backend: &Path, flag: &str) -> bool {
+    Command::new(backend)
+        .arg("--help")
+        .output()
+        .map(|o| String::from_utf8_lossy(&[o.stdout, o.stderr].concat()).contains(flag))
+        .unwrap_or(false)
 }
 
 /// The viewer's `--help`, to see which options this build understands.

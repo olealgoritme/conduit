@@ -53,9 +53,10 @@ use device::virtio::{CURSOR_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, Vir
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
     DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT,
-    NVGPU_F_SCANOUT_PRESENTED, NVGPU_F_SCANOUT_RELEASE, SCANOUT_PRESENTED_MESSAGE_LEN,
+    NVGPU_F_MODE_LIST, NVGPU_F_SCANOUT_PRESENTED, NVGPU_F_SCANOUT_RELEASE, SCANOUT_PRESENTED_MESSAGE_LEN,
     SCANOUT_RELEASED_MESSAGE_LEN, ScanoutPresented, ScanoutReleased, clipboard_mime,
-    encode_clipboard_chunk, encode_display_mode, encode_input_events, encode_scanout_presented,
+    display_mode_list_message_len, encode_clipboard_chunk, encode_display_mode,
+    encode_display_mode_list, encode_input_events, encode_scanout_presented,
     encode_scanout_released, input_events_that_fit,
 };
 use std::os::fd::{BorrowedFd, RawFd};
@@ -120,6 +121,13 @@ struct Args {
     /// dropped without being exported.
     #[arg(long, value_name = "PATH")]
     display_socket: Vec<PathBuf>,
+
+    /// The VM's custom display modes, one WxH per line (docs/SCANOUT.md
+    /// "Mode list"): added to the guest's mode list with native and the
+    /// standard modes, re-read when the file changes, and rewritten when a
+    /// viewer adds or removes one. Absent file: no custom modes.
+    #[arg(long, value_name = "PATH")]
+    display_modes: Option<PathBuf>,
 
     /// Give the guest head a cursor plane whose image the viewer shows as the
     /// host pointer (zero-latency cursor). `off`: the guest compositor draws
@@ -798,6 +806,46 @@ impl InputSink for VqInputSink {
             if let Ok(w) = write_scattered(&*guard, &segs, &msg[..n]) {
                 written = w as u32;
             }
+        }
+        if vring.add_used(head, written).is_err() {
+            return false;
+        }
+        let _ = vring.signal_used_queue();
+        true
+    }
+
+    fn mode_list_epoch(&mut self) -> Option<u64> {
+        let e = self.claims.mode_list_epoch()?;
+        self.target.lock().expect("event target").is_some().then_some(e)
+    }
+
+    fn mode_list(&mut self, modes: &[(u32, u32)], refresh_mhz: u32) -> bool {
+        let Some((vring, mem)) = self.target.lock().expect("event target").clone() else {
+            return true;
+        };
+        let guard = mem.memory();
+        let mut vr = vring.get_mut();
+        let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
+            return false;
+        };
+        let Some(chain) = avail.next() else {
+            return false; // no buffer posted; retried shortly
+        };
+        let head = chain.head_index();
+        drop(vr);
+        let segs = writable(chain);
+        let mut msg = vec![0u8; display_mode_list_message_len(modes.len())];
+        let mut written = 0u32;
+        match encode_display_mode_list(modes, refresh_mhz, &mut msg) {
+            Some(n) if capacity(&segs) >= n => {
+                if let Ok(w) = write_scattered(&*guard, &segs, &msg[..n]) {
+                    written = w as u32;
+                }
+            }
+            _ => log::warn!(
+                "display: the guest's event buffer cannot take a {}-mode list",
+                modes.len()
+            ),
         }
         if vring.add_used(head, written).is_err() {
             return false;
@@ -2554,7 +2602,9 @@ impl VhostUserBackendMut for NvGpuBackend {
             // with a display.
             // Likewise `ScanoutPresented`.
             | if self.display_link.is_some() {
-                u64::from(NVGPU_F_SCANOUT_RELEASE) | u64::from(NVGPU_F_SCANOUT_PRESENTED)
+                u64::from(NVGPU_F_SCANOUT_RELEASE)
+                    | u64::from(NVGPU_F_SCANOUT_PRESENTED)
+                    | u64::from(NVGPU_F_MODE_LIST)
             } else {
                 0
             }
@@ -2602,7 +2652,7 @@ impl VhostUserBackendMut for NvGpuBackend {
             link.set_presented_enabled(presented);
         }
         log::info!(
-            "guest driver features {features:#x}: {}{}{}",
+            "guest driver features {features:#x}: {}{}{}{}",
             if features & u64::from(NVGPU_CFG_TAKES_INPUT) != 0 {
                 "takes Conduit input"
             } else {
@@ -2615,6 +2665,11 @@ impl VhostUserBackendMut for NvGpuBackend {
             },
             if presented {
                 ", wants presentation feedback"
+            } else {
+                ""
+            },
+            if features & u64::from(NVGPU_F_MODE_LIST) != 0 {
+                ", takes the mode list"
             } else {
                 ""
             }
@@ -3001,6 +3056,17 @@ fn main() -> anyhow::Result<()> {
     let display = if args.display.is_some() || !args.display_socket.is_empty() {
         let mode = args.display.unwrap_or(DisplayMode::DEFAULT);
         let link = DisplayLink::with_paths(args.display_socket.clone(), mode);
+        if let Some(p) = &args.display_modes {
+            link.set_modes_file(p.clone());
+        }
+        log::info!(
+            "display: mode list {}",
+            link.mode_sizes()
+                .iter()
+                .map(|(w, h)| format!("{w}x{h}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sink = VqInputSink {
             target: input_target.clone(),

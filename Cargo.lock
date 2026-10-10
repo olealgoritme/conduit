@@ -169,6 +169,7 @@ dependencies = [
  "conduit-venus",
  "crossterm",
  "libc",
+ "protocol",
  "ratatui",
  "serde",
  "serde_json",
