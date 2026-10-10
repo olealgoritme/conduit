@@ -187,6 +187,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     // right; only this one-shot prologue did not.
     stall_diag::hpd_phase(2);
     adapter.config_change_pending.swap(0, Ordering::AcqRel);
+    // The host's boot mode list usually arrived already: this indication covers it,
+    // so a second one from the loop (a needless re-mode at boot) is not owed.
+    // Swapped before indicating for the same reason as the bit above.
+    let _ = crate::ddi::mode_list::take_changed();
     stall_diag::hpd_enter(site::INDICATE);
     indicate_child_status(adapter, true);
     stall_diag::hpd_phase(3);

@@ -11,8 +11,10 @@
 //! The KMD puts every size of the list in the VidPN source and target mode sets
 //! and the monitor's source mode set, so Display Settings and games' fullscreen
 //! menus list them, and keeps a committed non-native size as the scanout extent.
-//! A pinned size on one end of the path restricts the other end to that same
-//! size ([`ModeList::cofunctional`]): the KMD scans out exactly the source size.
+//! A pinned size on one end of the path restricts the other end
+//! ([`ModeList::targets_for`], [`ModeList::sources_for`]): the same size under
+//! Identity scaling, a size that holds the source under Centered. The KMD scans
+//! out exactly the source size; the host shows a smaller one centred or scaled.
 //!
 //! Sizes are stored packed, `(width << 16) | height`, which is also the form the
 //! adapter publishes through atomics (every extent here is at most 16384).
@@ -180,35 +182,81 @@ impl ModeList {
         l
     }
 
-    /// The sizes offered on one end of a path, given what is pinned on the other
-    /// end (`None` = nothing pinned): everything, or exactly the pinned size when
-    /// it is in the list (empty when it is not -- no cofunctional mode exists).
-    pub fn cofunctional(&self, pinned_other: Option<(u32, u32)>) -> Self {
-        match pinned_other {
-            None => *self,
-            Some((w, h)) => {
-                let mut l = Self::EMPTY;
-                if self.contains(w, h) {
-                    l.packed[0] = pack(w, h);
-                    l.len = 1;
-                }
-                l
+    /// Keep the modes `keep` accepts, in order.
+    fn filtered(&self, keep: impl Fn((u32, u32)) -> bool) -> Self {
+        let mut l = Self::EMPTY;
+        for &p in self.packed() {
+            if keep(unpack(p)) {
+                l.packed[l.len] = p;
+                l.len += 1;
             }
+        }
+        l
+    }
+
+    /// The target sizes offered for a pinned source size (`None` = nothing
+    /// pinned). With Identity scaling pinned, exactly the source size; otherwise
+    /// (Centered pinned, or scaling unpinned) every target at least as large in
+    /// both dimensions, since the path advertises Centered and the host shows a
+    /// smaller source centred or scaled. Empty when the source is not a mode of
+    /// the list (no cofunctional target exists).
+    pub fn targets_for(&self, source: Option<(u32, u32)>, scaling: Scaling) -> Self {
+        match source {
+            None => *self,
+            Some(s) if !self.contains(s.0, s.1) => Self::EMPTY,
+            Some(s) => self.filtered(|t| fits(s, t, scaling)),
+        }
+    }
+
+    /// The source sizes offered for a pinned target size: the mirror of
+    /// [`Self::targets_for`] (every source that fits in the target, or exactly
+    /// the target size with Identity pinned).
+    pub fn sources_for(&self, target: Option<(u32, u32)>, scaling: Scaling) -> Self {
+        match target {
+            None => *self,
+            Some(t) if !self.contains(t.0, t.1) => Self::EMPTY,
+            Some(t) => self.filtered(|s| fits(s, t, scaling)),
         }
     }
 
     /// Whether a VidPN with these pinned sizes can be shown: each pinned size is
-    /// in the list, and a pinned source and target agree (the KMD scans out the
-    /// source size unscaled).
-    pub fn supports(&self, source: Option<(u32, u32)>, target: Option<(u32, u32)>) -> bool {
+    /// in the list, and a pinned source fits the pinned target under the path's
+    /// scaling ([`fits`]). The scanout is always the source size.
+    pub fn supports(
+        &self,
+        source: Option<(u32, u32)>,
+        target: Option<(u32, u32)>,
+        scaling: Scaling,
+    ) -> bool {
         let ok = |m: Option<(u32, u32)>| m.is_none_or(|(w, h)| self.contains(w, h));
         if !ok(source) || !ok(target) {
             return false;
         }
         match (source, target) {
-            (Some(s), Some(t)) => s == t,
+            (Some(s), Some(t)) => fits(s, t, scaling),
             _ => true,
         }
+    }
+}
+
+/// A path's content scaling as far as the mode rule cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scaling {
+    /// Pinned Identity: source and target must be the same size.
+    Identity,
+    /// Pinned Centered, or not pinned yet (the path advertises Identity and
+    /// Centered): a source no larger than the target in either dimension.
+    CenteredOrUnpinned,
+    /// Pinned to something this driver never advertised (Stretched,
+    /// AspectRatioCentered, Custom...): treated as Identity, the strictest.
+    Other,
+}
+
+/// Whether source size `s` can be shown on target size `t` under `scaling`.
+pub const fn fits(s: (u32, u32), t: (u32, u32), scaling: Scaling) -> bool {
+    match scaling {
+        Scaling::CenteredOrUnpinned => s.0 <= t.0 && s.1 <= t.1,
+        Scaling::Identity | Scaling::Other => s.0 == t.0 && s.1 == t.1,
     }
 }
 
@@ -218,6 +266,8 @@ pub struct HostList {
     len: usize,
     packed: [u32; MODE_LIST_MAX],
     /// The rate of every mode, millihertz (0 if the host's was out of range).
+    /// Informational: the KMD's VidPN rates come from the monitor's own rate
+    /// (`display_refresh_mhz`, the host EDID), which is the same host output.
     pub refresh_mhz: u32,
 }
 
@@ -333,11 +383,36 @@ mod tests {
 
     #[test]
     fn the_standard_table_is_the_hosts() {
-        // Kept in step with host/backend/protocol/src/modes.rs by hand: same
-        // length, same first and last entries, ascending area within reason.
-        assert_eq!(STANDARD_MODES.len(), 25);
-        assert_eq!(STANDARD_MODES[0], (640, 480));
-        assert_eq!(STANDARD_MODES[24], (5120, 2880));
+        // A literal copy of host/backend/protocol/src/modes.rs STANDARD_MODES:
+        // an edit to one table that misses the other fails here.
+        let host: [(u32, u32); 25] = [
+            (640, 480),
+            (800, 600),
+            (1024, 768),
+            (1280, 720),
+            (1280, 800),
+            (1280, 960),
+            (1280, 1024),
+            (1366, 768),
+            (1440, 900),
+            (1440, 1080),
+            (1600, 900),
+            (1600, 1200),
+            (1680, 1050),
+            (1920, 1080),
+            (1920, 1200),
+            (2560, 1080),
+            (2560, 1440),
+            (2560, 1600),
+            (3440, 1440),
+            (3840, 1080),
+            (3840, 1600),
+            (3840, 2160),
+            (5120, 1440),
+            (5120, 2160),
+            (5120, 2880),
+        ];
+        assert_eq!(STANDARD_MODES, host);
         assert_eq!(FEATURE, 1 << 21);
         assert_eq!(msg_bytes(MODE_LIST_MAX), 416);
     }
@@ -426,22 +501,68 @@ mod tests {
 
     #[test]
     fn a_pinned_size_restricts_the_other_end() {
+        use Scaling::*;
         let l = ModeList::standard(1920, 1080);
-        assert_eq!(l.cofunctional(None), l);
-        assert_eq!(sizes(&l.cofunctional(Some((1280, 720)))), vec![(1280, 720)]);
-        assert!(l.cofunctional(Some((1234, 567))).is_empty());
+        for sc in [Identity, CenteredOrUnpinned, Other] {
+            assert_eq!(l.targets_for(None, sc), l);
+            assert_eq!(l.sources_for(None, sc), l);
+            assert!(l.targets_for(Some((1234, 567)), sc).is_empty());
+            assert!(l.sources_for(Some((1234, 567)), sc).is_empty());
+        }
+        // Identity (and anything never advertised): exactly the pinned size.
+        assert_eq!(sizes(&l.targets_for(Some((1280, 720)), Identity)), vec![(1280, 720)]);
+        assert_eq!(sizes(&l.sources_for(Some((1280, 720)), Other)), vec![(1280, 720)]);
+        // Centered or unpinned: every target that holds the source, native
+        // included; every source the target holds.
+        let t = sizes(&l.targets_for(Some((1280, 720)), CenteredOrUnpinned));
+        assert_eq!(t[0], (1920, 1080));
+        assert!(t.contains(&(1280, 720)) && t.contains(&(1366, 768)));
+        assert!(t.iter().all(|&(w, h)| w >= 1280 && h >= 720));
+        assert!(!t.contains(&(1024, 768)));
+        let s = sizes(&l.sources_for(Some((1280, 1024)), CenteredOrUnpinned));
+        assert!(s.contains(&(1280, 1024)) && s.contains(&(1280, 960)) && s.contains(&(640, 480)));
+        assert!(s.iter().all(|&(w, h)| w <= 1280 && h <= 1024));
+        assert!(!s.contains(&(1366, 768)));
     }
 
     #[test]
     fn supported_vidpns() {
+        use Scaling::*;
         let l = ModeList::standard(1920, 1080);
-        assert!(l.supports(None, None));
-        assert!(l.supports(Some((1280, 720)), None));
-        assert!(l.supports(None, Some((1920, 1080))));
-        assert!(l.supports(Some((1280, 720)), Some((1280, 720))));
-        assert!(!l.supports(Some((1280, 720)), Some((1920, 1080))));
-        assert!(!l.supports(Some((1234, 567)), None));
-        assert!(!l.supports(None, Some((2560, 1440))));
+        for sc in [Identity, CenteredOrUnpinned, Other] {
+            assert!(l.supports(None, None, sc));
+            assert!(l.supports(Some((1280, 720)), None, sc));
+            assert!(l.supports(None, Some((1920, 1080)), sc));
+            assert!(l.supports(Some((1280, 720)), Some((1280, 720)), sc));
+            assert!(!l.supports(Some((1234, 567)), None, sc));
+            assert!(!l.supports(None, Some((2560, 1440)), sc));
+            // A source larger than its target never fits.
+            assert!(!l.supports(Some((1920, 1080)), Some((1280, 720)), sc));
+        }
+        // A smaller source on a larger target: only when it may be centred.
+        assert!(l.supports(Some((1280, 720)), Some((1920, 1080)), CenteredOrUnpinned));
+        assert!(!l.supports(Some((1280, 720)), Some((1920, 1080)), Identity));
+        assert!(!l.supports(Some((1280, 720)), Some((1920, 1080)), Other));
+        // Taller but narrower does not fit.
+        assert!(!l.supports(Some((1280, 1024)), Some((1366, 768)), CenteredOrUnpinned));
+    }
+
+    #[test]
+    fn the_list_is_capped_with_native_first_and_published_copies_too() {
+        // 48 distinct host modes plus a native that is not among them.
+        let modes: std::vec::Vec<(u32, u32)> = (0..48).map(|i| (800 + i, 600)).collect();
+        let b = msg(0, 48, 60_000, &modes);
+        let h = parse(&b, b.len()).unwrap();
+        assert_eq!(h.len(), 48);
+        let l = ModeList::from_host(5120, 1440, &h);
+        assert_eq!(l.len(), MODE_LIST_MAX);
+        assert_eq!(l.get(0), Some((5120, 1440)));
+        assert_eq!(l.get(47), Some((846, 600)), "the host's last one is what falls off");
+        // A published copy longer than the cap keeps the first 48.
+        let long: std::vec::Vec<u32> = (0..60).map(|i| pack(800 + i, 600)).collect();
+        let c = HostList::from_packed(&long, 0);
+        assert_eq!(c.len(), MODE_LIST_MAX);
+        assert_eq!(c.packed()[47], pack(847, 600));
     }
 
     #[test]

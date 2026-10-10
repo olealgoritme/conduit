@@ -36,6 +36,19 @@ pub(crate) fn reset_for_start() {
     CHANGED.store(false, Ordering::Release);
     COMMITTED.store(0, Ordering::Release);
     RECEIVED.store(0, Ordering::Relaxed);
+    MONITOR_SYNCED.store(0, Ordering::Relaxed);
+}
+
+/// The list last added to the monitor's source mode set (a hash, 0 = none), so a
+/// cofunc call adds modes only when the list changed (`vidpn::sync_monitor_modes`).
+static MONITOR_SYNCED: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn monitor_synced() -> u32 {
+    MONITOR_SYNCED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_monitor_synced(hash: u32) {
+    MONITOR_SYNCED.store(hash, Ordering::Relaxed);
 }
 
 /// The event-queue DPC got a `DisplayModeList`. Returns whether it differs from
@@ -46,6 +59,8 @@ pub(crate) fn on_host_list(l: &HostList) -> bool {
         return false;
     }
     SEQ.fetch_add(1, Ordering::AcqRel);
+    // The odd sequence is visible before any field store below.
+    core::sync::atomic::fence(Ordering::Release);
     for (i, p) in l.packed().iter().enumerate() {
         MODES[i].store(*p, Ordering::Relaxed);
     }
@@ -94,9 +109,12 @@ pub(crate) fn take_changed() -> bool {
     CHANGED.swap(false, Ordering::AcqRel)
 }
 
-/// `CommitVidPn` pinned this source size (packed `(w << 16) | h`).
+/// `CommitVidPn` pinned this source size (packed `(w << 16) | h`). A size the
+/// driver could never have offered clears it (native) instead.
 pub(crate) fn set_committed(packed: u32) {
-    COMMITTED.store(packed, Ordering::Release);
+    let (w, h) = mode_list::unpack(packed);
+    let v = if mode_list::usable(w, h) { packed } else { 0 };
+    COMMITTED.store(v, Ordering::Release);
 }
 
 /// The committed source size, packed; 0 = none.

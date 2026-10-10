@@ -650,7 +650,12 @@ impl VirtioGpu {
                     // Rare (boot, and when the VM's modes change): the worker tells
                     // Windows at PASSIVE; the VidPN DDIs read the list from here on.
                     reposted = true;
-                    wake_worker |= crate::ddi::mode_list::on_host_list(&l);
+                    if self.mode_list {
+                        wake_worker |= crate::ddi::mode_list::on_host_list(&l);
+                    } else {
+                        // Never asked for (the feature was not acked): a host bug. Dropped.
+                        NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Taken::Other => {
                     reposted = true;
