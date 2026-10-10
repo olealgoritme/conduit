@@ -433,13 +433,11 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     }
 
     // <cpu mode='host-passthrough'><maxphysaddr mode='passthrough'/>: the
-    // GPU's 64-bit shared-memory BAR needs the host's address width. A
-    // <topology> the VM had is kept.
+    // GPU's 64-bit shared-memory BAR needs the host's address width.
+    // Everything else the VM's <cpu> had (topology, features such as
+    // topoext, cache, numa) is kept.
     {
-        let topo = root
-            .get_child("cpu")
-            .and_then(|c| c.get_child("topology"))
-            .cloned();
+        let old = root.get_child("cpu").cloned();
         root.children
             .retain(|n| !matches!(n, XMLNode::Element(e) if e.name == "cpu"));
         let mut cpu = el(
@@ -450,8 +448,13 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
                 ("migratable", "off"),
             ],
         );
-        if let Some(t) = topo {
-            cpu.children.push(XMLNode::Element(t));
+        if let Some(o) = old {
+            // A host-model or custom CPU's <model>/<vendor> mean nothing in
+            // host-passthrough; drop them and any old <maxphysaddr>.
+            cpu.children.extend(o.children.into_iter().filter(|n| {
+                !matches!(n, XMLNode::Element(e)
+                    if matches!(e.name.as_str(), "maxphysaddr" | "model" | "vendor"))
+            }));
         }
         cpu.children.push(XMLNode::Element(el(
             "maxphysaddr",
@@ -923,7 +926,7 @@ mod tests {
     <source type='file'/>
   </memoryBacking>
   <os><type arch='x86_64' machine='pc-q35-8.2'>hvm</type></os>
-  <cpu mode='host-model' check='partial'><topology sockets='1' cores='4' threads='1'/></cpu>
+  <cpu mode='host-model' check='partial'><model>EPYC</model><topology sockets='1' cores='4' threads='1'/><feature policy='require' name='topoext'/></cpu>
   <devices>
     <disk type='file' device='disk'><source file='/var/lib/libvirt/images/myvm.qcow2'/>
       <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0'/></disk>
@@ -1171,6 +1174,15 @@ mod tests {
         let cpu = root.get_child("cpu").unwrap();
         assert_eq!(cpu.attributes["mode"], "host-passthrough");
         assert!(cpu.get_child("topology").is_some(), "topology kept");
+        assert!(
+            cpu.children.iter().any(|n| matches!(n, XMLNode::Element(e)
+                if e.name == "feature" && e.attributes.get("name").map(String::as_str) == Some("topoext"))),
+            "cpu features kept"
+        );
+        assert!(
+            cpu.get_child("model").is_none(),
+            "no model in host-passthrough"
+        );
         assert_eq!(
             cpu.get_child("maxphysaddr").unwrap().attributes["mode"],
             "passthrough"

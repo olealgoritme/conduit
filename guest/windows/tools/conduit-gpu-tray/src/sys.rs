@@ -120,3 +120,65 @@ pub fn write_setting(name: &str, v: u32) {
         &v.to_le_bytes(),
     );
 }
+
+/// Windows 11 keeps each tray icon's placement under
+/// HKCU\Control Panel\NotifyIconSettings\<id>; IsPromoted=1 shows it next to
+/// the clock instead of in the overflow. Set once, on the first run that
+/// finds this exe's entry without the value, so a later "hide" by the user
+/// sticks. Returns true once the entry was found.
+pub fn promote_tray_icon(exe: &str) -> bool {
+    const ROOT: &str = "Control Panel\\NotifyIconSettings";
+    let Some(k) = open(HKEY_CURRENT_USER, ROOT, false) else {
+        return false;
+    };
+    let mut names = Vec::new();
+    let mut buf = [0u16; 256];
+    for i in 0.. {
+        let mut len = buf.len() as u32;
+        let r = unsafe {
+            RegEnumKeyExW(
+                k,
+                i,
+                buf.as_mut_ptr(),
+                &mut len,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        if r != ERROR_SUCCESS {
+            break;
+        }
+        names.push(String::from_utf16_lossy(&buf[..len as usize]));
+    }
+    unsafe { RegCloseKey(k) };
+    let want = exe.to_ascii_lowercase();
+    for n in names {
+        let sub = format!("{ROOT}\\{n}");
+        let Some(p) = get(HKEY_CURRENT_USER, &sub, "ExecutablePath") else {
+            continue;
+        };
+        let w: Vec<u16> = p
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let path = String::from_utf16_lossy(&w)
+            .trim_end_matches('\0')
+            .to_ascii_lowercase();
+        if path != want {
+            continue;
+        }
+        if get(HKEY_CURRENT_USER, &sub, "IsPromoted").is_none() {
+            set(
+                HKEY_CURRENT_USER,
+                &sub,
+                "IsPromoted",
+                REG_DWORD,
+                &1u32.to_le_bytes(),
+            );
+        }
+        return true;
+    }
+    false
+}

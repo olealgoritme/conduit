@@ -223,6 +223,19 @@ fn refresh_tray(hwnd: HWND, force: bool) {
     unsafe {
         if old == 0 || force {
             Shell_NotifyIconW(NIM_ADD, &nid);
+            // Explorer writes the icon's settings entry shortly after the
+            // first add; promote it to the visible tray once it is there.
+            std::thread::spawn(|| {
+                let mut b = [0u16; 1024];
+                let n = GetModuleFileNameW(null_mut(), b.as_mut_ptr(), b.len() as u32);
+                let exe = String::from_utf16_lossy(&b[..n as usize]);
+                for _ in 0..30 {
+                    if sys::promote_tray_icon(&exe) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            });
         } else {
             Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
@@ -557,6 +570,7 @@ pub fn run() {
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = hinst;
         wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
+        wc.hIcon = logo() as _;
         wc.lpszClassName = cls.as_ptr();
         RegisterClassW(&wc);
         let hwnd = CreateWindowExW(
@@ -587,4 +601,13 @@ pub fn run() {
             DispatchMessageW(&msg);
         }
     }
+}
+
+/// The embedded Conduit icon (resource 1), loaded once at 64 px.
+pub fn logo() -> isize {
+    use std::sync::OnceLock;
+    static LOGO: OnceLock<isize> = OnceLock::new();
+    *LOGO.get_or_init(|| unsafe {
+        LoadImageW(GetModuleHandleW(null()), 1 as _, IMAGE_ICON, 64, 64, 0) as isize
+    })
 }

@@ -123,7 +123,7 @@ fn waiting(g: &Gfx, why: Wait) {
 
 fn full(g: &Gfx, r: &Reading, s: &Snapshot) {
     // Header.
-    g.fill_rrect(a(GREEN), PAD, PAD, 4.0, 36.0, 2.0);
+    g.icon(crate::app::logo(), PAD, PAD, 36.0, 36.0);
     g.text(
         &r.gpu.replace("NVIDIA ", ""),
         a(TEXT),
@@ -131,7 +131,7 @@ fn full(g: &Gfx, r: &Reading, s: &Snapshot) {
         true,
         Align::Left,
         false,
-        (PAD + 12.0, PAD - 3.0, 250.0, 22.0),
+        (PAD + 46.0, PAD - 3.0, 230.0, 22.0),
     );
     let mut sub = format!("Driver {}", r.driver);
     if let Some(p) = r.pstate {
@@ -147,7 +147,7 @@ fn full(g: &Gfx, r: &Reading, s: &Snapshot) {
         false,
         Align::Left,
         false,
-        (PAD + 12.0, PAD + 21.0, 270.0, 16.0),
+        (PAD + 46.0, PAD + 21.0, 250.0, 16.0),
     );
     // LIVE pill.
     let (pw, py) = (54.0, PAD + 2.0);
