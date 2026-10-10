@@ -441,7 +441,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &PITCH_IGN, &PITCH_IGN_V,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &CLAIM_MULTI, &CLAIM_MAX, &PITCH_IGN, &PITCH_IGN_V,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -592,6 +592,8 @@ pub(crate) fn publish_counters() {
     w(b"GdiLutSWH", LUT_SWH.load(Ordering::Relaxed));
     w(b"GdiLutAp", LUT_AP.load(Ordering::Relaxed));
     w(b"GdiLutId", LUT_ID.load(Ordering::Relaxed));
+    w(b"GdiClmMul", CLAIM_MULTI.load(Ordering::Relaxed));
+    w(b"GdiClmMax", CLAIM_MAX.load(Ordering::Relaxed));
     w(b"GdiPitchIgn", PITCH_IGN.load(Ordering::Relaxed));
     w(b"GdiPitchIgnV", PITCH_IGN_V.load(Ordering::Relaxed));
 }
@@ -734,13 +736,58 @@ pub(crate) fn admit(adapter: &AdapterContext, id: u64) -> Option<u64> {
     }
 }
 
-/// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH): the context's oldest
-/// unclaimed job. dxgkrnl submits a context's DMA buffers in the order it rendered them, so this
-/// names the buffer being submitted; a preempted replay without its record would claim the next
-/// one instead (counted with the claims, `GdiCtxClm`). `None`: nothing unclaimed.
-pub(crate) fn oldest_unclaimed(ctx: usize) -> Option<u64> {
-    let t = TABLE.lock();
-    t.jobs.iter().filter(|j| j.ctx == ctx && j.seq.is_none()).map(|j| j.id).min()
+/// Submissions on a GDI context without a private record that admitted more than one job, and
+/// the most one admitted (`GdiClmMul`, `GdiClmMax`).
+static CLAIM_MULTI: AtomicU32 = AtomicU32::new(0);
+static CLAIM_MAX: AtomicU32 = AtomicU32::new(0);
+
+/// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH): admit EVERY unclaimed
+/// job of the context, oldest first, and gate this submission's fence on the last one.
+///
+/// dxgkrnl submits a context's DMA buffers in the order it rendered them, and every job of the
+/// context was rendered before this submission, so this buffer's job is among the unclaimed ones
+/// or was admitted by an earlier submission, whose fence retires before this one (the WDDM fence
+/// FIFO is head-of-line). Claiming only the oldest went wrong whenever a rendered job had no
+/// submission of its own (a rendered buffer dxgkrnl did not submit, a submission that is no
+/// RenderGdi buffer): from then on each buffer's fence was gated on the job BEFORE its own, and its
+/// own job was admitted only by the next submission. Its fence retired with its commands still
+/// unexecuted, CDD destroyed the source of the copy (the staging buffer of the ClearType gamma
+/// table's one initialising BitBlt), and the job then read a freed allocation (`GdiLutAp` 0x0D:
+/// created, registered, forgotten). `None`: nothing unclaimed (the earlier gated fences cover it).
+pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize) -> Option<u64> {
+    let (last, n) = {
+        let mut t = TABLE.lock();
+        let mut last = None;
+        let mut n = 0u32;
+        loop {
+            let Some(i) = t
+                .jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, j)| j.ctx == ctx && j.seq.is_none())
+                .min_by_key(|(_, j)| j.id)
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
+            let seq = t.tl.next();
+            t.jobs[i].seq = Some(seq);
+            last = Some(seq);
+            n += 1;
+        }
+        (last, n)
+    };
+    if n == 0 {
+        return None;
+    }
+    JOB_N.fetch_add(n, Ordering::Relaxed);
+    if n > 1 {
+        CLAIM_MULTI.fetch_add(1, Ordering::Relaxed);
+    }
+    CLAIM_MAX.fetch_max(n, Ordering::Relaxed);
+    PENDING.store(1, Ordering::Release);
+    kick(adapter);
+    last
 }
 
 /// DestroyContext: its unclaimed jobs can never be submitted (dropped, counted as orphans).

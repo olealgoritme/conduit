@@ -1839,6 +1839,9 @@ pub const COUNTERS: &[&str] = &[
     "GdiLutSWH",
     "GdiLutAp",
     "GdiLutId",
+    // Record-less GDI submissions that admitted more than one unclaimed job, and the most one did.
+    "GdiClmMul",
+    "GdiClmMax",
     "GdiPitchIgn",
     "GdiPitchIgnV",
     // Copies and fills with a staging buffer on one side run on the copy engine over the buffer's
