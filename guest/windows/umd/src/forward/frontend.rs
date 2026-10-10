@@ -76,6 +76,9 @@ struct Stats {
 /// its device, like most games at exit, still leaves its counters in the log).
 const PRESENTS_PER_SUMMARY: u64 = 8192;
 
+/// How long the render thread spins at Present before it sleeps.
+const PRESENT_DRAIN_SPIN: std::time::Duration = std::time::Duration::from_millis(4);
+
 /// Outstanding bytes of discarded dynamic-buffer slices the worker has not yet
 /// handed to DXVK (whose `ThrottleDiscard` bounds them from there). Above this
 /// the app thread waits for the worker.
@@ -260,7 +263,19 @@ impl Frontend {
     /// presents the summary goes to the log.
     unsafe fn present_drain(&self, h: Hdevice) {
         let t0 = std::time::Instant::now();
-        unsafe { self.sync_enter(h, SyncReason::Dxgi) };
+        // Spin (no sleep/wake handshake) for the frame's tail: the worker is
+        // normally busy right up to the Present, and the render thread has
+        // nothing else to do until it is done.
+        unsafe {
+            if !self.enter(h) {
+                let i = SyncReason::Dxgi as usize;
+                self.stats.sync[i].fetch_add(1, Ordering::Relaxed);
+                if self.q.drain_spinning(PRESENT_DRAIN_SPIN) {
+                    self.stats.sync_waited[i].fetch_add(1, Ordering::Relaxed);
+                }
+                self.enter(h);
+            }
+        }
         let us = t0.elapsed().as_micros() as u64;
         let s = &self.stats;
         let n = s.presents.fetch_add(1, Ordering::Relaxed) + 1;
