@@ -241,10 +241,10 @@ index 929e0d01..4b6cfbab 100644
      VkExtensionProperties nvRawAccessChains                 = vk::makeExtension(VK_NV_RAW_ACCESS_CHAINS_EXTENSION_NAME);
      VkExtensionProperties nvxBinaryImport                   = vk::makeExtension(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
 diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
-index d0332175..74f47f3d 100644
+index d0332175..04623760 100644
 --- a/src/dxvk/dxvk_graphics.cpp
 +++ b/src/dxvk/dxvk_graphics.cpp
-@@ -353,15 +353,28 @@ namespace dxvk {
+@@ -353,15 +353,31 @@ namespace dxvk {
  
      // Set up multisample state based on shader info as well
      // as rasterization state and render target sample counts.
@@ -274,12 +274,15 @@ index d0332175..74f47f3d 100644
  
 -    if (shaders.fs && shaders.fs->metadata().flags.test(DxvkShaderFlag::HasSampleRateShading)) {
 +    // Vulkan does not allow sample rate shading with mixed samples, and D3D
-+    // leaves it undefined with a forced sample count: shade per pixel then
++    // leaves it undefined with a forced sample count: shade per pixel then.
++    // A shader that reads SV_SampleIndex (SPIR-V SampleId) still implies
++    // sample shading in Vulkan, and NVK, for one, then masks the coverage
++    // input to that sample's bit; that result is as undefined as D3D says.
 +    if (shaders.fs && shaders.fs->metadata().flags.test(DxvkShaderFlag::HasSampleRateShading) && !mixedSamples) {
        msInfo.sampleShadingEnable  = VK_TRUE;
        msInfo.minSampleShading     = 1.0f;
      }
-@@ -387,6 +400,7 @@ namespace dxvk {
+@@ -387,6 +403,7 @@ namespace dxvk {
             && cbInfo.logicOp                  == other.cbInfo.logicOp
             && cbInfo.attachmentCount          == other.cbInfo.attachmentCount
             && msInfo.rasterizationSamples     == other.msInfo.rasterizationSamples
@@ -287,7 +290,7 @@ index d0332175..74f47f3d 100644
             && msInfo.sampleShadingEnable      == other.msInfo.sampleShadingEnable
             && msInfo.minSampleShading         == other.msInfo.minSampleShading
             && msInfo.alphaToCoverageEnable    == other.msInfo.alphaToCoverageEnable
-@@ -429,6 +443,7 @@ namespace dxvk {
+@@ -429,6 +446,7 @@ namespace dxvk {
      hash.add(uint32_t(cbInfo.logicOp));
      hash.add(uint32_t(cbInfo.attachmentCount));
      hash.add(uint32_t(msInfo.rasterizationSamples));
@@ -295,7 +298,7 @@ index d0332175..74f47f3d 100644
      hash.add(uint32_t(msInfo.alphaToCoverageEnable));
      hash.add(uint32_t(msInfo.alphaToOneEnable));
      hash.add(uint32_t(msSampleMask));
-@@ -1320,6 +1335,11 @@ namespace dxvk {
+@@ -1320,6 +1338,11 @@ namespace dxvk {
          // shader in case sample locations are used to avoid UB.
          if (state.useSampleLocations())
            return false;
@@ -307,7 +310,7 @@ index d0332175..74f47f3d 100644
        }
      }
  
-@@ -1724,12 +1744,8 @@ namespace dxvk {
+@@ -1724,12 +1747,8 @@ namespace dxvk {
           << "  conservative:    " << (state.rs.conservativeMode() == VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT ? "no" : "yes") << std::endl;
  
      // Log multisample state
