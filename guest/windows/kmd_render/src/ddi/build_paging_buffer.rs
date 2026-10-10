@@ -1124,6 +1124,12 @@ pub(crate) fn last_std_fail() -> u32 {
     STD_FAIL.load(Ordering::Relaxed)
 }
 
+/// Clear [`last_std_fail`] before a GDI command, so a drop does not report a code left by an
+/// earlier command or another caller.
+pub(crate) fn clear_std_fail() {
+    STD_FAIL.store(0, Ordering::Relaxed);
+}
+
 fn std_fail(code: u32) -> bool {
     STD_FAIL.store(code, Ordering::Relaxed);
     false
