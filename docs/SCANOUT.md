@@ -110,9 +110,12 @@ viewer window/fullscreen change ──EV_MODE_HINT──► backend ModePolicy �
     compositor's condition for direct scanout;
   - windowed, `--resize=guest` (default) → the window's own size, debounced
     150 ms after the last configure of a drag;
-  - windowed, `--resize=scale` (CTRL+ALT+R toggles) → "restore": the
-    configured mode; the viewer fits the **whole** guest picture into whatever
-    window the WM gives (aspect kept, black bars, never cropped or stretched).
+  - windowed, `--resize=scale` → "restore": the configured mode; the viewer
+    places the guest picture per its display settings.
+  - a fixed guest resolution (`--res WxH`, Ctrl+Alt+R, the menu) → that mode,
+    whatever the window; a native one is the picture area's size in buffer
+    pixels (the window unless a smaller area is chosen). See
+    [VIEWER.md](VIEWER.md).
 - **Backend** (`host/backend/device/src/display.rs` `ModePolicy`): turns the hint into a
   `DisplayMode` event, only when it differs from the last one (initially the
   configured mode). `0x0` = configured mode, refresh 0 = configured rate. A
@@ -125,8 +128,8 @@ viewer window/fullscreen change ──EV_MODE_HINT──► backend ModePolicy �
   which is what makes **mutter and KWin** apply the preferred mode on hotplug
   by themselves. A wlroots compositor (labwc) may only re-probe; switch it with
   `wlr-randr --output Virtual-1 --preferred` (or a kanshi profile).
-- Until the guest has switched the viewer scales with aspect (no stretching),
-  and shows the buffer 1:1 (no viewport) once sizes match.
+- Until the guest has switched the viewer scales per its scale mode (fit by
+  default), and shows the buffer 1:1 (no viewport) once sizes match.
 
 ## Hardware cursor
 
@@ -507,10 +510,11 @@ compositor modesets as usual.
 
 ## Viewer (host/viewer, Wayland backend)
 
-- Whenever the guest's mode and the window differ (while the guest is
-  switching, or with `--resize=scale`), the whole guest picture is fitted with
-  aspect. The main surface always covers the whole window (exact fit: it carries the guest
-  buffer; letterbox: it is a black backdrop and the guest buffer sits on a
+- The guest picture is placed per the display settings (picture area, scale
+  mode; [VIEWER.md](VIEWER.md)) through the picture surface's `wp_viewport`
+  (destination, and a source crop for 1:1 larger than the area). The main
+  surface always covers the whole window (exact fit: it carries the guest
+  buffer; anything else: it is a black backdrop and the guest buffer sits on a
   subsurface). Hyprland crops a main surface by the window geometry, so a
   picture surface smaller than the window would show smeared edge columns and
   the desktop behind it.

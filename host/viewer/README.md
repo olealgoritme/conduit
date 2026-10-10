@@ -36,8 +36,8 @@ host/viewer/run-viewer.sh                         # listens on $NVGPU_DISPLAY_SO
 host/viewer/test-standalone.sh 5 240 2560x1440    # no VM: GPU test pattern at 240 Hz
 ```
 
-`conduit-viewer --help` lists the options (`--overlay`, `--resize`,
-`--direct-mode`, `--tearing`, `--stats`, ...). Only the invoking user and root
+`conduit-viewer --help` lists the options (`--res`, `--area`, `--scale`,
+`--overlay`, `--resize`, `--direct-mode`, `--tearing`, `--stats`, ...). Only the invoking user and root
 may connect (SO_PEERCRED; see `--allow-user`).
 
 The window's app id (Wayland) and class (X11) are `conduit-viewer`, for
@@ -51,7 +51,17 @@ compositor window rules.
 | `Ctrl+Alt+G` | grab mouse and keyboard (games); released on focus loss |
 | `Ctrl+Alt+O` | performance overlay |
 | `Ctrl+Alt+D` | direct mode: overlay hidden, tearing allowed, lowest latency |
-| `Ctrl+Alt+R` | the guest's resolution follows the window (default) / its fixed mode is scaled into the window |
+| `Ctrl+Alt+M` | the menu: guest resolution, picture area (drag its edges), scaling, filter, profiles, stats, fullscreen, VM actions |
+| `Ctrl+Alt+R` | next guest resolution: native, 2560x1440, 1920x1080, 1600x900, 1280x960, the last custom one |
+| `Ctrl+Alt+S` | next scale mode: fit, stretch, integer, none |
+| `Ctrl+Alt+A` | next picture area: full, 21:9, 16:9, 16:10, 4:3, custom |
+| `Ctrl+Alt+P` | next saved profile |
+| `Ctrl+Alt+arrows`, `-`, `=` | move, shrink, grow the picture area (`Shift`: bigger steps) |
+| `Ctrl+Alt+0` | reset the display settings |
+
+`--res`, `--area`, `--scale`, `--filter` and `--view-state FILE` set and keep
+these; [`docs/VIEWER.md`](../../docs/VIEWER.md) describes them, the mouse
+mapping and the cost (none on the frame path).
 
 The overlay and the window title show fps, frame times, latency and whether the
 compositor scanned the buffer out directly (`DIRECT`) or composited it. For

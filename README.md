@@ -76,8 +76,10 @@ from GPU memory to your screen: no copying, no video compression.
 
 **Playing games:** press **Ctrl+Alt+G** in the viewer to grab the mouse (games
 need relative mouse input), and run games at the VM's display mode (e.g.
-5120x1440, "Fullscreen Windowed"). The guest has no scaler, so a lower game
-resolution does not fill the screen. Ctrl+Alt+G again releases the mouse.
+5120x1440, "Fullscreen Windowed"). For a lower resolution, set it in the viewer
+(`conduit view myvm --res 1280x960 --scale stretch`, or Ctrl+Alt+M), and the
+viewer scales it to the window ([docs/VIEWER.md](docs/VIEWER.md)). Ctrl+Alt+G
+again releases the mouse.
 
 **Conduit GPU tray.** The driver package also installs a small tray app that
 starts at logon with no prompt. Its icon shows the host GPU's live temperature
@@ -305,7 +307,14 @@ or `packaging/release.sh X.Y.Z`); GitHub then builds every package for that tag.
 | `Ctrl+Alt+G` | Capture the mouse (for games) / release it |
 | `Ctrl+Alt+O` | Performance overlay on/off (fps, frame times, latency) |
 | `Ctrl+Alt+D` | Direct mode: lowest latency (fullscreen, no overlay) |
-| `Ctrl+Alt+R` | Switch between the VM's resolution following the window (default) and scaling a fixed resolution into it |
+| `Ctrl+Alt+M` | Menu: guest resolution, picture area, scaling, profiles, VM restart/shut down |
+| `Ctrl+Alt+R` | Next guest resolution: Native (follows the window), 2560x1440, 1920x1080, 1600x900, 1280x960, your custom one |
+| `Ctrl+Alt+S` / `Ctrl+Alt+A` | Next scale mode (fit, stretch, integer, centered) / picture area (full, 21:9, 16:9, 16:10, 4:3) |
+
+`conduit view myvm --res 1280x960 --scale stretch` runs the VM at 1280x960
+stretched to the window. The settings are saved per VM. See
+[docs/VIEWER.md](docs/VIEWER.md) for all keys, the picture-area editor and
+profiles.
 
 ## Play it from another computer (Moonlight)
 
