@@ -436,7 +436,7 @@ static LEDGER_HANDOFFS: AtomicUsize = AtomicUsize::new(0);
 /// the surface): the hand-off ledger. Off by default until it is verified
 /// across processes; the default is the previous hand-off handling (Venus
 /// producer publication, NVK releaser CPU wait, optional HEFL).
-fn ledger_enabled() -> bool {
+pub(crate) fn ledger_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("HELIOS_HANDOFF_LEDGER").is_ok_and(|v| v == "1"))
 }
