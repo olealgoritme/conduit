@@ -1341,6 +1341,7 @@ fn run_cpu_counted(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     CPU_MSK.fetch_or(op.why.map_or(1, |w| w.bit()), Ordering::Relaxed);
     CPU_ROP.store(rop_key(op), Ordering::Relaxed);
     CPU_STEP.store(0, Ordering::Relaxed);
+    crate::ddi::build_paging_buffer::clear_std_fail();
     match run_cpu(passive, adapter, op) {
         Ok(()) => {
             FALL.fetch_add(1, Ordering::Relaxed);
