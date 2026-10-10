@@ -3,6 +3,7 @@
 mod boot;
 mod config;
 mod create;
+mod ctl;
 mod doctor;
 mod feed;
 mod guest;
@@ -364,6 +365,51 @@ enum Cmd {
         #[command(subcommand)]
         action: ShareCmd,
     },
+    /// Start a program in a VM's desktop, or one of its installed apps
+    /// (guest control channel, docs/GUEST-CONTROL.md)
+    Run {
+        vm: String,
+        /// Working directory in the VM
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<String>,
+        /// Environment variable for the program (repeatable)
+        #[arg(long, value_name = "NAME=VALUE")]
+        env: Vec<String>,
+        /// Run the installed app with this name (see `conduit apps`) instead of a command
+        #[arg(long, value_name = "NAME", conflicts_with = "cmd")]
+        app: Option<String>,
+        /// Start the VM with a window if it is off, and wait until the guest is up
+        #[arg(long)]
+        start: bool,
+        /// Do not open a window on a running VM that has none
+        #[arg(long)]
+        no_view: bool,
+        /// The program and its arguments, after `--`
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// List the apps installed in a running VM (Start Menu and Steam on
+    /// Windows; desktop entries and Steam on Linux)
+    Apps {
+        vm: String,
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Copy a file to or from a running VM: `conduit cp FILE VM:PATH`,
+    /// `conduit cp VM:PATH FILE` (no network; checksum verified)
+    Cp {
+        src: String,
+        dst: String,
+        /// Replace an existing file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Launchers on this desktop for apps in a VM
+    App {
+        #[command(subcommand)]
+        action: AppCmd,
+    },
     /// Take Conduit's GPU off a libvirt VM: restore its original definition
     Detach { name: String },
     /// Make a Conduit VM a libvirt domain (virt-manager, virsh) or stop that
@@ -416,6 +462,21 @@ enum Cmd {
     /// (internal) after the backend stopped with its VM
     #[command(name = "_stopped", hide = true)]
     Stopped { name: String },
+}
+
+#[derive(Subcommand)]
+enum AppCmd {
+    /// Add a host launcher (desktop entry with the app's icon) that starts
+    /// the app in the VM, starting the VM if it is off
+    Add {
+        vm: String,
+        /// The app's name, as `conduit apps` lists it (or the start of it)
+        name: String,
+    },
+    /// Remove a launcher
+    Rm { vm: String, name: String },
+    /// List the VM's launchers
+    List { vm: String },
 }
 
 #[derive(Subcommand)]
@@ -810,6 +871,30 @@ fn main() {
             ShareCmd::Add { vm, dir, name, ro } => shares::add(&vm, &dir, name.as_deref(), ro),
             ShareCmd::Rm { vm, name } => shares::rm(&vm, &name),
             ShareCmd::Ro { vm, name, state } => shares::set_read_only(&vm, &name, state == "on"),
+        },
+        Cmd::Run {
+            vm,
+            cwd,
+            env,
+            app,
+            start,
+            no_view,
+            cmd,
+        } => ctl::run(ctl::RunOpts {
+            vm,
+            cwd,
+            env,
+            app,
+            cmd,
+            start,
+            no_view,
+        }),
+        Cmd::Apps { vm, json } => ctl::apps(&vm, json),
+        Cmd::Cp { src, dst, force } => ctl::cp(&src, &dst, force),
+        Cmd::App { action } => match action {
+            AppCmd::Add { vm, name } => ctl::app_add(&vm, &name),
+            AppCmd::Rm { vm, name } => ctl::app_rm(&vm, &name),
+            AppCmd::List { vm } => ctl::app_list(&vm),
         },
         Cmd::ShareHelper { instance } => lvrun::share_exec(&instance),
         Cmd::Libvirt { action, name } => match action.as_str() {

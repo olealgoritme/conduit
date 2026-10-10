@@ -34,6 +34,12 @@ pub fn warn(msg: impl AsRef<str>) {
     eprintln!("conduit: warning: {}", msg.as_ref());
 }
 
+/// The `Friendly` hint of an error, if it has one.
+pub fn hint_of(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<Friendly>().and_then(|f| f.hint.clone()))
+}
+
 /// Print an error and its causes; a `Friendly` hint goes last.
 pub fn report(err: &anyhow::Error) {
     eprintln!("conduit: error: {err}");
