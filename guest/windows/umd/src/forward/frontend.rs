@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::device_funcs::HELIOS_TAG_DEVICE;
-use core::mem::{size_of, MaybeUninit};
+use core::mem::size_of;
 use helios_umd_common::cmd_queue::CmdQueue;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -74,9 +74,6 @@ const MAX_OUTSTANDING_DISCARD_BYTES: u64 = 64 << 20;
 /// An `UpdateSubresourceUP` payload up to this size is copied into the record;
 /// larger ones take the synchronous path.
 const MAX_UPDATE_PAYLOAD: usize = 64 << 10;
-
-/// Most handles one bind DDI passes (128 shader-resource slots).
-const MAX_BIND_HANDLES: usize = 128;
 
 /// One immediate context's threaded front end. Lives in
 /// `HeliosDevice::frontend`; created at CreateDevice, shut down first thing in
@@ -241,10 +238,13 @@ impl Frontend {
     #[inline(always)]
     unsafe fn record<F: FnOnce(&[u8])>(&self, extra: usize, fill: impl FnOnce(&mut [u8]), f: F) -> u64 {
         if CmdQueue::record_bytes::<F>(extra) > self.q.max_record() {
-            let mut bytes = vec![0u8; extra];
-            fill(&mut bytes);
+            // 8-byte aligned, as record bytes are (`Pack` relies on it).
+            let mut words = vec![0u64; extra.div_ceil(8)];
+            // SAFETY: `words` spans at least `extra` bytes.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, extra) };
+            fill(bytes);
             self.sync(SyncReason::Oversize);
-            f(&bytes);
+            f(bytes);
             return 0;
         }
         match unsafe { self.q.push(extra, fill, f) } {
@@ -284,32 +284,22 @@ pub(crate) unsafe fn fe_of<'a>(h: Hdevice) -> Option<&'a Frontend> {
 // Handle snapshots
 // ---------------------------------------------------------------------------
 
-/// A null handle (`pDrvPrivate == NULL`, "unbind") in a snapshot. Identity
-/// words are pointers or 0, never odd.
-const NULL_WORD: usize = 1;
+use helios_umd_common::cmd_record::{packed, pseudo_handle, snapshot_word, Pack, Unpack, MAX_HANDLES};
 
-/// The identity word behind a handle region, or [`NULL_WORD`].
+/// Most handles one bind DDI passes; larger counts take the synchronous path.
+const MAX_BIND_HANDLES: usize = MAX_HANDLES;
+
+/// The identity word behind a handle region (see `cmd_record`).
 #[inline(always)]
 unsafe fn word(p: *mut c_void) -> usize {
-    if p.is_null() {
-        NULL_WORD
-    } else {
-        // SAFETY: every handle region this UMD sizes starts with its word.
-        unsafe { *(p as *const usize) }
-    }
+    unsafe { snapshot_word(p) }
 }
 
-/// A `pDrvPrivate` for a snapshot word: null for [`NULL_WORD`], else the
-/// word's own address (the region a forward function reads `*pDrvPrivate`
-/// from).
+/// The replay `pDrvPrivate` for a snapshot word held in the caller's frame.
 #[inline(always)]
 fn pseudo(w: *const usize) -> *mut c_void {
-    // SAFETY: `w` points at a live snapshot word.
-    if unsafe { *w } == NULL_WORD {
-        core::ptr::null_mut()
-    } else {
-        w as *mut c_void
-    }
+    // SAFETY: callers pass the address of a live local or record word.
+    unsafe { pseudo_handle(w) }
 }
 
 /// The D3D10/11 DDI handle structs: one `pDrvPrivate` pointer each.
@@ -330,7 +320,8 @@ macro_rules! impl_handle {
                 Self { pDrvPrivate: p }
             }
         }
-        const _: () = assert!(size_of::<ddi::$t>() == size_of::<usize>());
+        // Arrays of these are read and built as arrays of `pDrvPrivate`.
+        const _: () = assert!(size_of::<ddi::$t>() == size_of::<*mut c_void>());
     )+};
 }
 
@@ -362,83 +353,10 @@ fn unsnap<H: Handle>(w: &usize) -> H {
     H::from_p(pseudo(w))
 }
 
-const fn round8(n: usize) -> usize {
-    (n + 7) & !7
-}
-
-/// Bytes a packed array of `n` `T`s occupies in a record's extra area.
-const fn packed<T>(n: usize) -> usize {
-    round8(n * size_of::<T>())
-}
-
-/// Writes arrays into a record's extra bytes, each 8-byte aligned.
-struct Pack<'a> {
-    b: &'a mut [u8],
-    o: usize,
-}
-
-impl<'a> Pack<'a> {
-    fn new(b: &'a mut [u8]) -> Self {
-        Self { b, o: 0 }
-    }
-
-    /// The identity words of `n` handles (all [`NULL_WORD`] for a null array).
-    #[inline(always)]
-    unsafe fn handles<H: Handle>(&mut self, src: *const H, n: usize) {
-        let dst = unsafe { self.b.as_mut_ptr().add(self.o) } as *mut usize;
-        for i in 0..n {
-            let w = if src.is_null() {
-                NULL_WORD
-            } else {
-                unsafe { snap(*src.add(i)) }
-            };
-            unsafe { dst.add(i).write(w) };
-        }
-        self.o += packed::<usize>(n);
-    }
-
-    /// `n` plain values (zeros for a null array).
-    #[inline(always)]
-    unsafe fn copy<T: Copy>(&mut self, src: *const T, n: usize) {
-        let bytes = n * size_of::<T>();
-        if !src.is_null() && bytes != 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(src as *const u8, self.b.as_mut_ptr().add(self.o), bytes)
-            };
-        }
-        self.o += packed::<T>(n);
-    }
-}
-
-/// Reads back what [`Pack`] wrote, in the same order.
-struct Unpack<'a> {
-    b: &'a [u8],
-    o: usize,
-}
-
-impl<'a> Unpack<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Self { b, o: 0 }
-    }
-
-    #[inline(always)]
-    fn words(&mut self, n: usize) -> *const usize {
-        let p = unsafe { self.b.as_ptr().add(self.o) } as *const usize;
-        self.o += packed::<usize>(n);
-        p
-    }
-
-    /// The array, or null when the original pointer was null.
-    #[inline(always)]
-    fn array<T>(&mut self, n: usize, was_null: bool) -> *const T {
-        let p = unsafe { self.b.as_ptr().add(self.o) } as *const T;
-        self.o += packed::<T>(n);
-        if was_null {
-            core::ptr::null()
-        } else {
-            p
-        }
-    }
+/// Pack the snapshot words of `n` handles of type `H`.
+#[inline(always)]
+unsafe fn pack_handles<H: Handle>(p: &mut Pack<'_>, src: *const H, n: usize) {
+    unsafe { p.handles(src.cast::<*mut c_void>(), n) }
 }
 
 /// Run `f` with an array of `n` pseudo-handles over `n` snapshot words, or a
@@ -450,15 +368,9 @@ unsafe fn with_handles<H: Handle, R>(
     was_null: bool,
     f: impl FnOnce(*const H) -> R,
 ) -> R {
-    if was_null {
-        return f(core::ptr::null());
+    unsafe {
+        helios_umd_common::cmd_record::with_pseudo_handles(words, n, was_null, |p| f(p.cast::<H>()))
     }
-    let mut arr: [MaybeUninit<H>; MAX_BIND_HANDLES] = [const { MaybeUninit::uninit() }; MAX_BIND_HANDLES];
-    let n = n.min(MAX_BIND_HANDLES);
-    for (i, slot) in arr.iter_mut().enumerate().take(n) {
-        slot.write(H::from_p(pseudo(unsafe { words.add(i) })));
-    }
-    f(arr.as_ptr() as *const H)
 }
 
 /// Copy four values behind a possibly-null pointer.
@@ -758,7 +670,7 @@ macro_rules! defer_bind {
                 let null = hs.is_null();
                 fe.record(
                     packed::<usize>(n),
-                    |b| Pack::new(b).handles(hs, n),
+                    |b| pack_handles(&mut Pack::new(b), hs, n),
                     move |b| {
                         let words = Unpack::new(b).words(n);
                         with_handles::<ddi::$ht, _>(words, n, null, |p| $orig(h, start, num, p))
@@ -815,7 +727,7 @@ macro_rules! defer_cb1 {
                     packed::<usize>(n) + 2 * packed::<u32>(n),
                     |b| {
                         let mut p = Pack::new(b);
-                        p.handles(bufs, n);
+                        pack_handles(&mut p, bufs, n);
                         p.copy(first, n);
                         p.copy(count, n);
                     },
@@ -864,7 +776,7 @@ unsafe extern "system" fn fe_ia_set_vertex_buffers(
             packed::<usize>(n) + 2 * packed::<u32>(n),
             |b| {
                 let mut p = Pack::new(b);
-                p.handles(bufs, n);
+                pack_handles(&mut p, bufs, n);
                 p.copy(strides, n);
                 p.copy(offsets, n);
             },
@@ -903,7 +815,7 @@ unsafe extern "system" fn fe_so_set_targets(
             packed::<usize>(n) + packed::<u32>(n),
             |b| {
                 let mut p = Pack::new(b);
-                p.handles(bufs, n);
+                pack_handles(&mut p, bufs, n);
                 p.copy(offsets, n);
             },
             move |b| {
@@ -938,7 +850,7 @@ unsafe extern "system" fn fe_cs_set_uavs(
             packed::<usize>(n) + packed::<u32>(n),
             |b| {
                 let mut p = Pack::new(b);
-                p.handles(uavs, n);
+                pack_handles(&mut p, uavs, n);
                 p.copy(counts, n);
             },
             move |b| {
@@ -1031,8 +943,8 @@ unsafe extern "system" fn fe_set_render_targets(
             packed::<usize>(nr) + packed::<usize>(nu) + packed::<u32>(nu),
             |b| {
                 let mut p = Pack::new(b);
-                p.handles(rtvs, nr);
-                p.handles(uavs, nu);
+                pack_handles(&mut p, rtvs, nr);
+                pack_handles(&mut p, uavs, nu);
                 p.copy(uav_counts, nu);
             },
             move |b| {
