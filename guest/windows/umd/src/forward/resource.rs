@@ -1928,16 +1928,20 @@ pub(crate) unsafe extern "system" fn dxgi_resolve_shared_resource(
 }
 
 /// Submit what this device recorded (every ResolveSharedResource), and on NVK wait until the GPU
-/// has finished it unless `resource` is a cross-process shared resource. ResolveSharedResource has
-/// two callers: `IDXGISurface1::GetDC` on a GDI-compatible texture, where GDI reads or draws the
-/// image next, and a keyed-mutex release of a shared resource, whose ordering is `flush_gate`'s
-/// (the shared resources this device holds, `nvk_keyed_resources`). The GDI acceleration executor
-/// in the KMD reads and writes the image with its own copy engine; dxgkrnl orders GDI's DMA
-/// buffers against this device's only when the device submits through dxgkrnl, and NVK submits to
-/// RM directly, so without the wait GDI could read the image before the device's last rendering
-/// landed (or draw into it and be overwritten by it): `gdi_interop_probe` round 0 of every
-/// process, RichEdit's text in Notepad. Venus devices submit through dxgkrnl, which orders the
-/// GDI work after theirs.
+/// has finished it. ResolveSharedResource comes from `IDXGISurface1::GetDC` on a GDI-compatible
+/// texture, where GDI reads or draws the image next, and from a keyed-mutex release. The runtime
+/// creates a GDI-compatible texture as a plain shared resource (DDI `MISC_SHARED`, no GDI flag:
+/// 405.29's log, `shared=true gdi_compatible=false`), so the two are not told apart here.
+///
+/// The GDI acceleration executor in the KMD reads and writes the image with its own copy engine;
+/// dxgkrnl orders GDI's DMA buffers against this device's only when the device submits through
+/// dxgkrnl, and NVK submits to RM directly, so without the wait GDI could read the image before
+/// the device's last rendering landed (or draw into it and be overwritten by it):
+/// `gdi_interop_probe` round 0 of every process, RichEdit's text in Notepad. A keyed-mutex
+/// release already completed the device's work at its flush (`flush_gate`'s CPU wait, the
+/// default on NVK), so the wait finds the GPU idle; with the hand-off ledger
+/// (`HELIOS_HANDOFF_LEDGER=1`) a shared resource's hand-off is the ledger's and does not wait.
+/// Venus devices submit through dxgkrnl, which orders the GDI work after theirs.
 pub(crate) unsafe fn gdi_handoff(h: Hdevice, resource: ddi::D3D10DDI_HRESOURCE) {
     let Some(context) = d3d11_context(h) else {
         return;
@@ -1959,7 +1963,7 @@ pub(crate) unsafe fn gdi_handoff(h: Hdevice, resource: ddi::D3D10DDI_HRESOURCE) 
             resource_gdi_compatible(resource)
         );
     }
-    if shared {
+    if shared && super::transfer::ledger_enabled() {
         return;
     }
     let Some(start) = super::transfer::wait_submitted(dev, &context, "GetDC flush wait") else {
