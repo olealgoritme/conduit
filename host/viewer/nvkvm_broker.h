@@ -444,6 +444,9 @@ void nb_sink_refresh(struct nb_sink *s);
  * here: the backend knows what it last asked for. */
 void nb_sink_mode_hint(struct nb_sink *s, unsigned w, unsigned h,
                        unsigned refresh_mhz, unsigned reason);
+/* EV_MODE_EDIT: add (true) or remove one of the VM's custom modes
+ * (NVKVM_BROKER_CAP_MODE_LIST). */
+void nb_sink_mode_edit(struct nb_sink *s, unsigned w, unsigned h, bool add);
 /* EV_RELEASE of buffer `buf_id` (its dma-buf inode), covering its ATTACHes up
  * to the one whose seq was `seq` (NVKVM_BROKER_CAP_RELEASE_SEQ). */
 void nb_sink_release(struct nb_sink *s, uint64_t buf_id, uint32_t seq);
@@ -619,6 +622,11 @@ struct nb_session_ops {
      * OPTIONAL: NULL means nothing is ever held past its release.
      */
     bool (*hold_release)(struct nb_session *s, uint64_t id, uint32_t seq);
+    /*
+     * NVKVM_BROKER_CAP_MODE_LIST: a new mode list arrived (nb_mode_rx.cur).
+     * OPTIONAL; a backend that advertises the cap repaints its menu here.
+     */
+    void (*modes)(struct nb_session *s);
 };
 
 #define NB_SESSION_CLIP_G2H (1u << 0)
@@ -760,6 +768,14 @@ void nb_view_apply_res(const struct nb_view *v);
  * -1 when `code` is not one of them. */
 int  nb_view_hotkey(struct nb_vstore *st, unsigned code, bool shift, int ww,
                     int wh, unsigned s120, char *label, size_t n);
+/* The display's mode list from the client (CMD_MODES), and the size of the
+ * guest's picture as the backend last saw it (nb_common.c). */
+extern struct nb_modes_rx nb_mode_rx;
+extern unsigned nb_guest_w, nb_guest_h;
+/* The guest's picture is now w x h: remember it, and apply the per-mode rule
+ * (nb_vstore_guest_mode).  NB_VIEW_CH_* bits and a notice label. */
+unsigned nb_guest_mode_changed(struct nb_vstore *st, unsigned w, unsigned h,
+                               char *label, size_t n);
 /* Run a configured command via /bin/sh, detached. */
 void nb_run_detached(const char *cmd);
 

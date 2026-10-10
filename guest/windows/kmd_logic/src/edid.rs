@@ -101,6 +101,55 @@ pub struct NativeTiming {
     /// True when the timing came from a DisplayID extension, false when it is the
     /// base block's first detailed timing.
     pub from_displayid: bool,
+    /// The timing's totals (active + blanking) and pixel clock: what a mode
+    /// matching the monitor's preferred one has to describe exactly (Windows
+    /// resolves the target's preferred mode by the whole signal, not the size).
+    pub htotal: u32,
+    pub vtotal: u32,
+    pub clock_khz: u32,
+}
+
+/// The video signal a mode is described with (`D3DKMDT_VIDEO_SIGNAL_INFO`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Signal {
+    pub total_w: u32,
+    pub total_h: u32,
+    pub pixel_hz: u64,
+    /// Line and frame rates as reduced fractions.
+    pub hsync: (u64, u64),
+    pub vsync: (u64, u64),
+}
+
+/// The signal for `w`x`h` at `refresh_mhz`. The monitor's native mode at its
+/// native rate is described with the EDID's own timing (`native`: totals and
+/// pixel clock), so it is the same mode as the monitor's preferred one: Windows
+/// resolves a target's preferred mode (Display Settings' "recommended", and its
+/// resolution list) by matching the whole signal, and a native target mode with
+/// total = active matched nothing. Every other mode has no blanking (a virtual
+/// head) and its rates follow from the size and refresh.
+pub fn signal_for(w: u32, h: u32, refresh_mhz: u32, native: Option<&NativeTiming>) -> Signal {
+    if let Some(n) = native.filter(|n| {
+        (n.width, n.height, n.refresh_mhz) == (w, h, refresh_mhz)
+            && n.htotal >= w
+            && n.vtotal >= h
+            && n.clock_khz != 0
+    }) {
+        let px = u64::from(n.clock_khz) * 1000;
+        return Signal {
+            total_w: n.htotal,
+            total_h: n.vtotal,
+            pixel_hz: px,
+            hsync: crate::reduce_ratio(px, u64::from(n.htotal)),
+            vsync: crate::reduce_ratio(px, u64::from(n.htotal) * u64::from(n.vtotal)),
+        };
+    }
+    Signal {
+        total_w: w,
+        total_h: h,
+        pixel_hz: u64::from(w) * u64::from(h) * u64::from(refresh_mhz) / 1000,
+        hsync: crate::reduce_ratio(u64::from(h) * u64::from(refresh_mhz), 1000),
+        vsync: crate::reduce_ratio(u64::from(refresh_mhz), 1000),
+    }
 }
 
 /// DisplayID 2.0 data block tag: Type VII Detailed Timing (3-byte pixel clock
@@ -251,6 +300,9 @@ fn timing_from(
         height: u32::try_from(v_active).ok()?,
         refresh_mhz: u32::try_from(refresh_mhz).ok()?,
         from_displayid: false,
+        htotal: u32::try_from(h_active + h_blank).ok()?,
+        vtotal: u32::try_from(v_active + v_blank).ok()?,
+        clock_khz: u32::try_from(clock_khz).ok()?,
     })
 }
 
@@ -347,6 +399,28 @@ mod tests {
         assert_eq!((t.width, t.height), (5120, 1440));
         assert!(t.refresh_mhz.abs_diff(240_000) <= 50, "{}", t.refresh_mhz);
         assert!(t.from_displayid && !base_only.from_displayid);
+        // CVT-RB2 5120x1440@240: 80 pixels and 179 lines of blanking, 2020.512 MHz.
+        assert_eq!((t.htotal, t.vtotal, t.clock_khz), (5200, 1619, 2_020_512));
+        assert_eq!(t.refresh_mhz, 240_000);
+    }
+
+    #[test]
+    fn the_native_mode_is_described_with_the_edid_timing() {
+        let edid = include_bytes!("testdata/edid-5120x1440-240.bin");
+        let n = native_timing(edid).unwrap();
+        let s = signal_for(5120, 1440, 240_000, Some(&n));
+        assert_eq!((s.total_w, s.total_h, s.pixel_hz), (5200, 1619, 2_020_512_000));
+        assert_eq!(s.vsync, (240, 1));
+        assert_eq!(s.hsync, crate::reduce_ratio(2_020_512_000, 5200));
+        // Another size, or native at another rate: no blanking, as before.
+        let o = signal_for(1920, 1080, 240_000, Some(&n));
+        assert_eq!((o.total_w, o.total_h, o.pixel_hz), (1920, 1080, 1920 * 1080 * 240));
+        assert_eq!((o.vsync, o.hsync), ((240, 1), (259_200, 1)));
+        let r = signal_for(5120, 1440, 144_000, Some(&n));
+        assert_eq!((r.total_w, r.total_h), (5120, 1440));
+        assert_eq!(r.vsync, (144, 1));
+        // No EDID timing known: the old description.
+        assert_eq!(signal_for(5120, 1440, 240_000, None).total_w, 5120);
     }
 
     #[test]

@@ -601,6 +601,96 @@ static void test_paint(void)
     nb_ui_force_bitmap_font(false);
 }
 
+static void test_mode_list(void)
+{
+    static const unsigned add[] = { KEY_1, KEY_2, KEY_3, KEY_4, KEY_X,
+                                    KEY_5, KEY_6, KEY_7 };
+    static const unsigned known[] = { KEY_1, KEY_9, KEY_2, KEY_0, KEY_X,
+                                      KEY_1, KEY_0, KEY_8, KEY_0 };
+    struct nb_vstore st;
+    struct nb_ui ui;
+    struct nb_ui_env e = env_of(1920, 1080, 120);
+    struct nb_modes_rx rx;
+    unsigned bits;
+    int i;
+
+    memset(&rx, 0, sizeof(rx));
+    nb_modes_feed(&rx, 5120, 1440, 0, 4, 240000, 1, NB_MODE_NATIVE);
+    nb_modes_feed(&rx, 2560, 1440, 1, 4, 240000, 1, 0);
+    nb_modes_feed(&rx, 1920, 1080, 2, 4, 240000, 1, 0);
+    nb_modes_feed(&rx, 1280, 960, 3, 4, 240000, 1, NB_MODE_CUSTOM);
+    e.modes = &rx.cur;
+    e.buf_w = 5120;
+    e.buf_h = 1440;
+    nb_vstore_init(&st);
+    nb_ui_init(&ui, &st);
+    nb_ui_set_open(&ui, &e, true);
+    nb_ui_layout(&ui, &e, NULL, NULL);
+
+    /* Exactly the backend's modes, no presets. */
+    for (i = 0; i < 4; i++) {
+        CHECK(nb_ui_find(&ui, NB_UI_ID_RES_MODE, i) >= 0, "mode %d listed", i);
+    }
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RES_MODE, 4) < 0, "no fifth mode");
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RES_PRESET, 0) < 0, "no presets");
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RES_MODE_DEL, 3) >= 0, "custom removable");
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RES_MODE_DEL, 2) < 0, "standard is not");
+
+    /* Clicking one asks the guest for it. */
+    bits = click(&ui, &e, NB_UI_ID_RES_MODE, 3);
+    CHECK(bits & NB_UI_RES, "re-hint %#x", bits);
+    CHECK(st.cur.res_w == 1280 && st.cur.res_h == 960, "res set");
+
+    /* Removing a custom mode takes a confirming click. */
+    bits = click(&ui, &e, NB_UI_ID_RES_MODE_DEL, 3);
+    CHECK(!(bits & NB_UI_MODE_DEL), "armed only");
+    bits = click(&ui, &e, NB_UI_ID_RES_MODE_DEL, 3);
+    CHECK((bits & NB_UI_MODE_DEL) && ui.mode_w == 1280 && ui.mode_h == 960,
+          "removed %#x", bits);
+
+    /* Adding: into the VM's list and the guest switches to it. */
+    click(&ui, &e, NB_UI_ID_RES_FIELD, 0);
+    for (i = 0; i < 20; i++) {
+        nb_ui_key(&ui, &e, KEY_BACKSPACE, false, true);
+    }
+    type(&ui, &e, add, 8, false);
+    bits = nb_ui_key(&ui, &e, KEY_ENTER, false, true);
+    CHECK((bits & (NB_UI_MODE_ADD | NB_UI_RES)) == (NB_UI_MODE_ADD | NB_UI_RES),
+          "add bits %#x", bits);
+    CHECK(ui.mode_w == 1234 && ui.mode_h == 567, "the mode to add");
+    CHECK(st.cur.res_w == 1234 && st.nrecent == 0, "switch, no 'recent'");
+    /* A mode already listed is just switched to. */
+    click(&ui, &e, NB_UI_ID_RES_FIELD, 0);
+    for (i = 0; i < 20; i++) {
+        nb_ui_key(&ui, &e, KEY_BACKSPACE, false, true);
+    }
+    type(&ui, &e, known, 9, false);
+    bits = nb_ui_key(&ui, &e, KEY_ENTER, false, true);
+    CHECK(!(bits & NB_UI_MODE_ADD) && (bits & NB_UI_RES), "known %#x", bits);
+
+    /* Rules for the guest's current mode. */
+    e.buf_w = 1280;
+    e.buf_h = 960;
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RULE_DEL, 0) < 0, "no rule yet");
+    click(&ui, &e, NB_UI_ID_AREA, NB_AREA_4_3);
+    click(&ui, &e, NB_UI_ID_SCALE, NB_SCALE_STRETCH);
+    bits = click(&ui, &e, NB_UI_ID_RULE_SAVE, 0);
+    CHECK(bits & NB_UI_SAVE, "saved %#x", bits);
+    CHECK(nb_vstore_rule_find(&st, 1280, 960) == 0, "rule stored");
+    CHECK(st.rule[0].v.area == NB_AREA_4_3 &&
+          st.rule[0].v.scale == NB_SCALE_STRETCH, "rule layout");
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    bits = click(&ui, &e, NB_UI_ID_RULE_DEL, 0);
+    CHECK((bits & NB_UI_SAVE) && st.nrule == 0, "forgotten");
+
+    /* No list (older backend): the presets as before. */
+    e.modes = NULL;
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RES_PRESET, 0) >= 0, "presets back");
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RES_MODE, 0) < 0, "no list");
+}
+
 int main(void)
 {
     test_area_hit();
@@ -610,6 +700,7 @@ int main(void)
     test_vm();
     test_drag();
     test_paint();
+    test_mode_list();
     printf("test_ui: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

@@ -1654,6 +1654,13 @@ impl AdapterContext {
             .refresh_mhz()
     }
 
+    /// The size a flip must have to be scanned out: the source size dxgkrnl last
+    /// committed (a mode from the host's list, `ddi::mode_list`), else native
+    /// ([`Self::display_mode`]). Two atomic loads; no lock.
+    pub fn scanout_extent(&self) -> (u32, u32) {
+        crate::ddi::mode_list::scanout_extent(self.display_mode())
+    }
+
     /// Record the committed target mode's refresh rate (millihertz); 0 clears it.
     pub fn set_committed_refresh_mhz(&self, mhz: u32) {
         self.committed_refresh_mhz.store(mhz, Ordering::Release);

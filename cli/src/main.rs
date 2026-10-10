@@ -5,6 +5,7 @@ mod boot;
 mod config;
 mod create;
 mod ctl;
+mod display;
 mod doctor;
 mod feed;
 mod guest;
@@ -374,6 +375,17 @@ enum Cmd {
         /// Start fullscreen (Ctrl+Alt+F toggles)
         #[arg(long)]
         fullscreen: bool,
+    },
+    /// The display modes a VM offers: native, the standard modes up to it,
+    /// and its custom modes (games list them in their resolution menus)
+    Display {
+        name: String,
+        /// Add a custom mode, e.g. 1280x960 (repeatable)
+        #[arg(long, value_name = "WxH")]
+        add: Vec<String>,
+        /// Remove a custom mode (repeatable)
+        #[arg(long, value_name = "WxH")]
+        rm: Vec<String>,
     },
     /// Shared folders: host directories a libvirt VM sees as drives
     /// (Windows) or under /mnt/conduit (Linux)
@@ -896,6 +908,7 @@ fn main() {
             yuv444,
         }),
         Cmd::Detach { name } => libvirt::detach(&name),
+        Cmd::Display { name, add, rm } => display::run(&name, &add, &rm),
         Cmd::Share { action } => match action {
             ShareCmd::List { vm } => shares::list(&vm),
             ShareCmd::Add {

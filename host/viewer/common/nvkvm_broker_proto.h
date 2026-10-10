@@ -173,7 +173,20 @@ enum {
      * that does not know it ignores it.
      */
     NVKVM_BROKER_EV_PRESENTED = 21,
+
+    /*
+     * EV_MODE_EDIT (Conduit) -- add or remove one of the VM's custom display
+     * modes: x, y = the mode, w0 = NVKVM_BROKER_MODE_EDIT_ADD or _REMOVE.
+     * The client stores it with the VM (the same list `conduit display VM
+     * --add` edits) and sends the new list to every broker as CMD_MODES.
+     * Only from a broker advertising NVKVM_BROKER_CAP_MODE_LIST.  A client
+     * that does not know it ignores it.
+     */
+    NVKVM_BROKER_EV_MODE_EDIT = 22,
 };
+
+#define NVKVM_BROKER_MODE_EDIT_ADD    1u
+#define NVKVM_BROKER_MODE_EDIT_REMOVE 2u
 
 #define NVKVM_BROKER_HINT_RESTORE    0u  /* windowed, scaled: configured mode */
 #define NVKVM_BROKER_HINT_FULLSCREEN 1u  /* the output's own mode             */
@@ -340,6 +353,11 @@ enum {
  * reached the screen (docs/SCANOUT.md "Presentation feedback").
  */
 #define NVKVM_BROKER_CAP_PRESENTED    (1u << 16)
+/*
+ * CAP_MODE_LIST (Conduit): the broker takes CMD_MODES (the display's mode
+ * list, docs/SCANOUT.md "Mode list") and may send EV_MODE_EDIT.
+ */
+#define NVKVM_BROKER_CAP_MODE_LIST    (1u << 17)
 
 /* BYE reason codes. */
 enum {
@@ -493,7 +511,27 @@ enum {
      * hidden (the guest drives a relative pointer the host cannot place).
      */
     NVKVM_BROKER_CMD_CURSOR = 7,
+
+    /*
+     * CMD_MODES (Conduit) -- one mode of the display's mode list: the modes
+     * the guest is offered (native, the standard modes up to it, the VM's
+     * custom modes), all at one rate.  Only to a broker advertising
+     * NVKVM_BROKER_CAP_MODE_LIST.  A whole list is sent at once, in order:
+     *     width, height = the mode
+     *     stride        = its index, 0 .. offset-1 (0 is native)
+     *     offset        = the list's length, 1 .. NVKVM_BROKER_MODES_MAX
+     *     fourcc        = the refresh rate, mHz
+     *     modifier      = the list's generation (one per list)
+     *     seq           = NVKVM_BROKER_MODE_F_* bits
+     * flags, reserved1 and the fd must be absent/zero.  The broker shows the
+     * list once its last record arrived; a list cut short is dropped.
+     */
+    NVKVM_BROKER_CMD_MODES = 8,
 };
+
+#define NVKVM_BROKER_MODES_MAX     64u
+#define NVKVM_BROKER_MODE_F_NATIVE (1u << 0)
+#define NVKVM_BROKER_MODE_F_CUSTOM (1u << 1)
 
 #define NVKVM_BROKER_CURSOR_MAX_DIM 256u
 #define NVKVM_BROKER_CURSOR_HOT_X(seq)   ((seq) & 0xffffu)

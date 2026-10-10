@@ -2533,6 +2533,9 @@ pub struct VirtioGpu {
     /// AND the event queue is up: `ScanoutPresented` messages go to `ddi::host_flip_done`.
     /// Fixed for the transport's life.
     scanout_presented: bool,
+    /// The host's mode list (`NVGPU_F_MODE_LIST`) was acked AND the event queue is up:
+    /// `DisplayModeList` messages go to `ddi::mode_list`. Fixed for the transport's life.
+    mode_list: bool,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
     /// teardown. Starts at 1024 slots and grows (PASSIVE, outside the lock:
@@ -2960,6 +2963,11 @@ impl VirtioGpu {
                     helios_protocol::NVGPU_F_SCANOUT_PRESENTED
                 } else {
                     0
+                }) | (if scanout_release {
+                    // The mode list, like the release event, only with the display half.
+                    helios_protocol::NVGPU_F_MODE_LIST
+                } else {
+                    0
                 })),
         )?;
         let scanout_release_acked = accepted & helios_protocol::NVGPU_F_SCANOUT_RELEASE != 0;
@@ -2967,6 +2975,9 @@ impl VirtioGpu {
             accepted & helios_protocol::NVGPU_F_SCANOUT_PRESENTED != 0;
         // 1 when the host's buffer-release event was acked, 0 when not offered / not wanted.
         crate::diag::record_named_bytes(b"RelAck", u32::from(scanout_release_acked));
+        // 1 when the host's mode list was acked.
+        let mode_list_acked = accepted & helios_protocol::NVGPU_F_MODE_LIST != 0;
+        crate::diag::record_named_bytes(b"MlAck", u32::from(mode_list_acked));
 
         crate::diag::record_named_bytes(b"InitStg", 2); // features negotiated
         // The device only takes `GpuCmd` when the backend runs with `--venus`.
@@ -3251,6 +3262,8 @@ impl VirtioGpu {
         // stay off. `RelNoQ` = 1 names that case (the host then keeps bookkeeping it can
         // never deliver on; it retries every 2 ms and drops nothing important).
         let scanout_release_on = scanout_release_acked && nvrm_event_ring.is_some();
+        // Likewise the mode list.
+        let mode_list_on = mode_list_acked && nvrm_event_ring.is_some();
         // Likewise the presentation feedback (`FdhAck` says whether it is live).
         let scanout_presented_on = scanout_presented_acked && nvrm_event_ring.is_some();
         if scanout_release_acked && !scanout_release_on {
@@ -3282,6 +3295,7 @@ impl VirtioGpu {
             cfg_features,
             scanout_release: scanout_release_on,
             scanout_presented: scanout_presented_on,
+            mode_list: mode_list_on,
             nvrm_handles: Vec::with_capacity(nvrm_limits.handle_bounds.initial),
             nvrm_reserved: 0,
             nvrm_clients: nvrm_tables::new_client_table(),

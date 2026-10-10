@@ -125,9 +125,20 @@ void nb_view_res_str(const struct nb_view *v, char *buf, size_t n);   /* "native
 #define NB_MAX_PROFILES   16
 #define NB_PROFILE_NAME   40
 #define NB_MAX_RECENT     4
+#define NB_MAX_RULES      16
 
 struct nb_profile {
     char           name[NB_PROFILE_NAME];
+    struct nb_view v;
+};
+
+/*
+ * A per-guest-mode rule: while the guest runs at w x h, the picture uses v's
+ * area, scale and filter (its res is not used).  "1280x960 -> 4:3 area,
+ * stretch"; the native mode can have one too ("full, 1:1").
+ */
+struct nb_rule {
+    unsigned       w, h;
     struct nb_view v;
 };
 
@@ -138,6 +149,19 @@ struct nb_vstore {
     int               prof_at;                  /* last loaded, -1 none  */
     unsigned          recent[NB_MAX_RECENT][2]; /* custom resolutions, newest first */
     int               nrecent;
+    struct nb_rule    rule[NB_MAX_RULES];
+    int               nrule;
+    /*
+     * A rule is in force (the guest runs at rule_w x rule_h): cur holds the
+     * rule's layout, base the layout to go back to when the guest leaves
+     * that mode for one without a rule.  The file stores base.
+     */
+    bool              ruled;
+    unsigned          rule_w, rule_h;
+    struct nb_view    base;
+    /* base was taken when the guest arrived at its current mode (so a rule
+     * remembered after editing there comes back to what was before). */
+    bool              base_set;
 };
 
 void nb_vstore_init(struct nb_vstore *st);
@@ -149,6 +173,20 @@ int nb_vstore_save(const struct nb_vstore *st, const char *path);
 /* Parse / format a whole settings text (what load/save use). */
 void nb_vstore_parse(struct nb_vstore *st, const char *text);
 size_t nb_vstore_format(const struct nb_vstore *st, char *buf, size_t n);
+
+/* Per-guest-mode rules.  find: index or -1.  save: cur's area, scale and
+ * filter for w x h (replacing one for the same mode); index or -1 when full.
+ * After a save the rule is in force (the guest runs at that mode). */
+int  nb_vstore_rule_find(const struct nb_vstore *st, unsigned w, unsigned h);
+int  nb_vstore_rule_save(struct nb_vstore *st, unsigned w, unsigned h);
+void nb_vstore_rule_delete(struct nb_vstore *st, int i);
+/*
+ * The guest's picture is now w x h: apply the rule for that mode (keeping
+ * the layout to come back to), or go back to that layout when it has none.
+ * Returns NB_VIEW_CH_LAYOUT when cur's layout changed, with a notice label.
+ */
+unsigned nb_vstore_guest_mode(struct nb_vstore *st, unsigned w, unsigned h,
+                              char *label, size_t n);
 
 /* Remember a custom resolution (not a preset) at the front of `recent`. */
 void nb_vstore_note_res(struct nb_vstore *st, unsigned w, unsigned h);
@@ -177,6 +215,47 @@ unsigned nb_view_nudge(struct nb_vstore *st, int ww, int wh, unsigned s120,
 unsigned nb_view_reset(struct nb_vstore *st, char *label, size_t n);
 /* The one-line summary: "FIT · 16:9 · 1920x1080 · LINEAR" */
 void nb_view_summary(const struct nb_view *v, char *buf, size_t n);
+
+/* ── the display's mode list (CMD_MODES, docs/SCANOUT.md "Mode list") ──── */
+/*
+ * The modes the guest is offered, as the backend sends them: native first,
+ * the standard modes up to it, the VM's custom modes.  One list per VM: the
+ * menu's resolution list and Ctrl+Alt+R walk exactly this.
+ */
+#define NB_MODES_MAX     64
+#define NB_MODE_NATIVE   1u
+#define NB_MODE_CUSTOM   2u
+
+struct nb_modes {
+    unsigned           n;               /* 0: none (an older backend)   */
+    unsigned           w[NB_MODES_MAX], h[NB_MODES_MAX];
+    unsigned           flags[NB_MODES_MAX];
+    unsigned           mhz;
+    unsigned long long gen;
+};
+
+/* Reassembles the records of one list; `cur` is the last complete one. */
+struct nb_modes_rx {
+    struct nb_modes cur;
+    struct nb_modes in;
+    unsigned        next;               /* index expected next          */
+};
+
+/*
+ * One CMD_MODES record.  1: it completed a list, now in rx->cur; 0: more to
+ * come; -1: malformed (bad size or count, out of order, mixed generations):
+ * the list in progress is dropped, rx->cur is kept.
+ */
+int nb_modes_feed(struct nb_modes_rx *rx, unsigned w, unsigned h, unsigned idx,
+                  unsigned count, unsigned mhz, unsigned long long gen,
+                  unsigned flags);
+/* Index of w x h in m, or -1. */
+int nb_modes_find(const struct nb_modes *m, unsigned w, unsigned h);
+/* Ctrl+Alt+R with a list: the guest resolution after the one the guest runs
+ * at (cur_w x cur_h; the list's first when it is not in it), wrapping. */
+unsigned nb_view_cycle_mode(struct nb_vstore *st, const struct nb_modes *m,
+                            unsigned cur_w, unsigned cur_h, char *label,
+                            size_t n);
 
 /* Command-line overrides: which fields the user gave, applied over whatever
  * the settings file restored. */

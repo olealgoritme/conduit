@@ -370,6 +370,23 @@ struct nb_session *nb_session_open(const struct nb_config *cfg)
 
 /* ── display settings shared by the backends ─────────────────────────────── */
 
+struct nb_modes_rx nb_mode_rx;
+unsigned nb_guest_w, nb_guest_h;
+
+unsigned nb_guest_mode_changed(struct nb_vstore *st, unsigned w, unsigned h,
+                               char *label, size_t n)
+{
+    if (label && n) {
+        label[0] = '\0';
+    }
+    if (!w || !h || (w == nb_guest_w && h == nb_guest_h)) {
+        return 0;
+    }
+    nb_guest_w = w;
+    nb_guest_h = h;
+    return nb_vstore_guest_mode(st, w, h, label, n);
+}
+
 void nb_view_apply_res(const struct nb_view *v)
 {
     if (nb_res_mode == NB_RES_NONE) {
@@ -423,7 +440,10 @@ int nb_view_hotkey(struct nb_vstore *st, unsigned code, bool shift, int ww,
     switch (code) {
     case KEY_S:     return (int)nb_view_cycle_scale(st, label, n);
     case KEY_A:     return (int)nb_view_cycle_area(st, label, n);
-    case KEY_R:     return (int)nb_view_cycle_res(st, label, n);
+    case KEY_R:
+        /* The VM's mode list when the backend sent one, else the presets. */
+        return (int)nb_view_cycle_mode(st, &nb_mode_rx.cur, nb_guest_w,
+                                       nb_guest_h, label, n);
     case KEY_P:     return (int)nb_view_cycle_profile(st, label, n);
     case KEY_0:     return (int)nb_view_reset(st, label, n);
     case KEY_LEFT:  return (int)nb_view_nudge(st, ww, wh, s120, -step, 0, 0, label, n);

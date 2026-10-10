@@ -3,6 +3,7 @@
 //! (tray icon, popup, channel I/O) is in `main.rs` and its modules.
 
 pub mod ctl_logic;
+pub mod display_logic;
 pub mod png;
 pub mod policy;
 pub mod procs;

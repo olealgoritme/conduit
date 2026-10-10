@@ -12,6 +12,8 @@ mod apps;
 #[cfg(windows)]
 mod ctl;
 #[cfg(windows)]
+mod display;
+#[cfg(windows)]
 mod gfx;
 #[cfg(windows)]
 mod launch;

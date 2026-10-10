@@ -37,6 +37,8 @@
 #define NB_UI_VM_REBOOT (1u << 8)   /* run the VM restart command            */
 #define NB_UI_CURSOR    (1u << 9)   /* the wanted pointer shape changed      */
 #define NB_UI_NOTICE    (1u << 10)  /* show ui->notice as an on-screen notice */
+#define NB_UI_MODE_ADD  (1u << 11)  /* add ui->mode_w x mode_h to the VM's modes */
+#define NB_UI_MODE_DEL  (1u << 12)  /* remove it from the VM's custom modes  */
 
 /* Pointer shapes the area editor asks for. */
 enum {
@@ -59,10 +61,13 @@ struct nb_ui_env {
     bool     vm_actions;        /* shutdown/restart commands are available  */
     bool     translucent;       /* the panel layer can blend (Wayland: yes) */
     bool     no_stats;          /* this backend has no stats overlay (X11)  */
+    /* The display's mode list from the backend (CMD_MODES); NULL or empty
+     * with an older backend, which leaves the old presets. */
+    const struct nb_modes *modes;
 };
 
 #define NB_UI_TEXT_MAX 40
-#define NB_UI_MAX_ITEMS 96
+#define NB_UI_MAX_ITEMS 160
 
 /* What a panel item is (nb_ui_item.id); arg says which one of a kind. */
 enum {
@@ -83,6 +88,10 @@ enum {
     NB_UI_ID_FULLSCREEN,
     NB_UI_ID_VM_REBOOT,
     NB_UI_ID_VM_SHUTDOWN,
+    NB_UI_ID_RES_MODE,          /* arg: index into env->modes                */
+    NB_UI_ID_RES_MODE_DEL,      /* arg: index into env->modes (a custom one) */
+    NB_UI_ID_RULE_SAVE,         /* remember the layout for the guest's mode  */
+    NB_UI_ID_RULE_DEL,          /* forget it                                 */
 };
 
 /* One clickable thing on the panel, panel CONTENT coordinates (logical; the
@@ -117,6 +126,7 @@ struct nb_ui {
     struct nb_rect drag_r0;     /* the area then, output pixels              */
 
     char   notice[64];          /* text for NB_UI_NOTICE                     */
+    unsigned mode_w, mode_h;    /* the mode for NB_UI_MODE_ADD / _DEL        */
 };
 
 void nb_ui_init(struct nb_ui *ui, struct nb_vstore *st);

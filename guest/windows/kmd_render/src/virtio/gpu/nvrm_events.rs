@@ -8,7 +8,9 @@
 //! the DRIVER posts empty and the HOST fills: `EventReady` (a bare 16-byte
 //! `MsgHeader { msg_type = 8, handle, status, pad }`, "the backend file `handle`
 //! became readable"), and, for a guest that takes input, `InputEvent` /
-//! `DisplayMode` / clipboard messages. This KMD wants only `EventReady`.
+//! `DisplayMode` / clipboard messages. This KMD takes `EventReady`, the scanout
+//! release/presentation reports, `DisplayModeList` (the mode list) and
+//! `DisplayMode` (a mode request, published for the tray to apply).
 //!
 //! # Availability, and the input bit
 //!
@@ -90,10 +92,10 @@ pub(super) const EVENT_QUEUE: u16 = 1;
 /// has not read yet. Growing this needs the boot-stack budget measured first.
 const EVENT_QUEUE_SIZE: usize = 16;
 /// Bytes of one posted buffer: room for the 16-byte `EventReady`, the 48-byte
-/// `ScanoutReleased`, and, should a host send one anyway, a short `DisplayMode`
-/// (anything longer is the host's to truncate or drop; this driver only reads the
-/// header). Divides a page, so no buffer straddles one.
-const EVENT_BUF_BYTES: usize = 256;
+/// `ScanoutReleased` and the whole `DisplayModeList` (416 bytes at its 48-mode cap;
+/// the host writes a list only into a buffer that holds it). Divides a page, so no
+/// buffer straddles one.
+const EVENT_BUF_BYTES: usize = 512;
 
 /// Messages other than `EventReady` after which the queue is no longer kicked on
 /// repost (see `drain_nvrm_events`).
@@ -111,7 +113,11 @@ const _: () = {
         CONDUIT_OPTIONAL_FEATURES
             == helios_protocol::NVGPU_F_SCANOUT_RELEASE
                 | helios_protocol::NVGPU_F_SCANOUT_PRESENTED
+                | helios_protocol::NVGPU_F_MODE_LIST
     );
+    assert!(helios_protocol::NVGPU_F_MODE_LIST == helios_kmd_logic::mode_list::FEATURE);
+    // The largest mode list fits one posted buffer.
+    assert!(EVENT_BUF_BYTES >= helios_kmd_logic::mode_list::msg_bytes(helios_kmd_logic::mode_list::MODE_LIST_MAX));
     assert!(
         helios_protocol::NVGPU_F_SCANOUT_PRESENTED == helios_kmd_logic::host_flip_done::FEATURE
     );
@@ -198,6 +204,10 @@ enum Taken {
     Released(Released),
     /// `ScanoutPresented` (message 33), whole.
     Presented(Presented),
+    /// `DisplayModeList` (message 34), parsed.
+    ModeList(helios_kmd_logic::mode_list::HostList),
+    /// `DisplayMode` (message 23): the size the host's viewer asks for, packed.
+    HostMode(u32),
     /// Some other message (or a short or bad one): dropped.
     Other,
     /// The queue misbehaved: stop draining this pass.
@@ -249,6 +259,18 @@ fn take_event(ring: &mut EventRing) -> Taken {
                     Taken::Other
                 }
             },
+            (true, Some(helios_kmd_logic::mode_list::MSG_DISPLAY_MODE_LIST), _, _) => {
+                match helios_kmd_logic::mode_list::parse(bytes, len) {
+                    Some(l) => Taken::ModeList(l),
+                    None => Taken::Other,
+                }
+            }
+            (true, Some(helios_kmd_logic::mode_list::MSG_DISPLAY_MODE), _, _) => {
+                match helios_kmd_logic::mode_list::parse_display_mode(bytes, len) {
+                    Some(p) => Taken::HostMode(p),
+                    None => Taken::Other,
+                }
+            }
             (true, Some(MSG_SCANOUT_PRESENTED), _, _) => match parse_presented(bytes, len) {
                 ParsedPresented::Presented(p) => Taken::Presented(p),
                 // A short one: counted `FdhBad`, then dropped like any other message.
@@ -633,6 +655,22 @@ impl VirtioGpu {
                         crate::ddi::host_flip_done::note_unasked();
                         NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+                Taken::ModeList(l) => {
+                    // Rare (boot, and when the VM's modes change): the worker tells
+                    // Windows at PASSIVE; the VidPN DDIs read the list from here on.
+                    reposted = true;
+                    if self.mode_list {
+                        wake_worker |= crate::ddi::mode_list::on_host_list(&l);
+                    } else {
+                        // Never asked for (the feature was not acked): a host bug. Dropped.
+                        NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Taken::HostMode(p) => {
+                    // The worker publishes it at PASSIVE for the tray to apply.
+                    reposted = true;
+                    wake_worker |= crate::ddi::mode_list::on_host_mode(p);
                 }
                 Taken::Other => {
                     reposted = true;

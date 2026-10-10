@@ -659,6 +659,11 @@ struct nb_wl {
     int                   ui_cur;   /* NB_UI_CUR_* shown, -1 = not ours    */
     bool                  rehint_pending;   /* a mode hint is owed      */
     uint64_t              rehint_due_ms;    /* ...sent then, 0 = not yet */
+    /* The guest's mode changed and its rule changed the layout (re-placed
+     * from the UI tick, not the frame path), or the mode list changed. */
+    bool                  rule_due;
+    char                  rule_note[64];
+    bool                  modes_dirty;
 };
 
 /* One UI layer: a desynchronised subsurface of the main surface. */
@@ -1579,6 +1584,15 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
     w->buf_w = (int)sl->w;
     w->buf_h = (int)sl->h;
+    /* A new guest mode: its per-mode rule (if any) is applied from the UI
+     * tick; the menu marks the new current mode. */
+    if (sl->w != nb_guest_w || sl->h != nb_guest_h) {
+        if (nb_guest_mode_changed(&w->vst, sl->w, sl->h, w->rule_note,
+                                  sizeof(w->rule_note)) & NB_VIEW_CH_LAYOUT) {
+            w->rule_due = true;
+        }
+        w->modes_dirty = true;
+    }
     /*
      * With a viewport the surface measures the WINDOW, not the buffer, and the
      * compositor scales the guest's frame into it.  That is what makes the
@@ -5225,6 +5239,14 @@ static void wl_direct_set(struct nb_wl *w, bool on)
     wl_display_flush(w->dpy);
 }
 
+/* CMD_MODES completed a new list: the open menu shows it. */
+static void wl_modes(struct nb_session *s)
+{
+    struct nb_wl *w = s->priv;
+
+    w->modes_dirty = true;
+}
+
 static bool wl_hotkey(struct nb_session *s, unsigned code)
 {
     struct nb_wl *w = s->priv;
@@ -5297,6 +5319,7 @@ static const struct nb_ui_env *wl_ui_env(struct nb_wl *w)
     e.nearest_ok = false;       /* a compositor chooses its own filter */
     e.vm_actions = w->cfg && (w->cfg->vm_shutdown_cmd || w->cfg->vm_reboot_cmd);
     e.translucent = true;
+    e.modes = &nb_mode_rx.cur;
     return &e;
 }
 
@@ -5710,6 +5733,21 @@ static int wl_tick_ui(struct nb_wl *w, int next)
     uint64_t now = nb_now_ms_wl();
     bool flush = false;
 
+    if (w->rule_due) {
+        w->rule_due = false;
+        w->modes_dirty = false;
+        snprintf(w->ui.notice, sizeof(w->ui.notice), "%s", w->rule_note);
+        wl_ui_do(w, NB_UI_VIEW | NB_UI_REDRAW |
+                        (w->rule_note[0] ? NB_UI_NOTICE : 0));
+        flush = true;
+    } else if (w->modes_dirty) {
+        w->modes_dirty = false;
+        if (w->ui.open) {
+            wl_ui_do(w, NB_UI_REDRAW);
+            flush = true;
+        }
+    }
+
     if (w->rehint_due_ms) {
         if (now >= w->rehint_due_ms) {
             w->rehint_due_ms = 0;
@@ -5892,6 +5930,10 @@ static void wl_ui_do(struct nb_wl *w, unsigned bits)
     }
     if (bits & NB_UI_SAVE) {
         nb_vstore_persist(&w->vst, w->cfg);
+    }
+    if (bits & (NB_UI_MODE_ADD | NB_UI_MODE_DEL)) {
+        nb_sink_mode_edit(w->sink, w->ui.mode_w, w->ui.mode_h,
+                          (bits & NB_UI_MODE_ADD) != 0);
     }
     if (bits & NB_UI_STATS) {
         w->ov_user = !w->ov_user;
@@ -6868,7 +6910,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     /* virtio-nvgpu: mode hints always; the guest cursor when there is a
      * pointer to put it under and the display takes a LINEAR ARGB8888
      * dma-buf (what the guest's cursor plane is). */
-    s->caps |= NVKVM_BROKER_CAP_MODE_HINTS;
+    s->caps |= NVKVM_BROKER_CAP_MODE_HINTS | NVKVM_BROKER_CAP_MODE_LIST;
     if (w->seat && w->dmabuf && w->dmabuf_ver >= 3 &&
         nb_formats_has(&w->formats, NB_FOURCC_AR24_LOCAL, 0)) {
         s->caps |= NVKVM_BROKER_CAP_CURSOR;
@@ -6973,6 +7015,7 @@ static const struct nb_session_ops wl_ops = {
     .cursor = wl_cursor,
     .hotkey = wl_hotkey,
     .hold_release = wl_hold_release,
+    .modes = wl_modes,
 };
 
 struct nb_session *nb_session_wayland(const struct nb_config *cfg)
