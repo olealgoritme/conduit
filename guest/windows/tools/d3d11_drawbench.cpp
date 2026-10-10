@@ -5,7 +5,14 @@
 // measures is the CPU path: the D3D11 runtime, the UMD and DXVK on the
 // calling thread, plus the frame-pacing wait.
 //
-//   d3d11_drawbench.exe [seconds=10] [draws=2000] [lag=2] [srvs=8] [size=256] [mode=hot|real]
+//   d3d11_drawbench.exe [seconds=10] [draws=2000] [lag=2] [srvs=8] [size=256] [mode=hot|real] [present]
+//
+// `present` renders into a flip-model swap chain (a size x size window) and
+// Presents every frame (sync interval 0) instead of Flush, so the driver's
+// present path runs; it needs the interactive desktop (run-in-session.ps1).
+// Every run ends with the frame-time distribution (end of one frame's Present
+// or Flush to the next): p50/p90/p99/p99.9/max, standard deviation, and a
+// histogram relative to the median -- pacing, not only the average.
 //
 // mode=hot (default) is the loop below with a handful of objects, so every
 // driver structure stays in cache. mode=real resembles a game's front-end
@@ -41,11 +48,14 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 static const char kShader[] = R"(
 cbuffer C : register(b0) { float4 xf; float4 tint; float4 pad[14]; };
@@ -108,6 +118,102 @@ static double thread_cpu_us() {
   return t(k) + t(u);
 }
 
+// --- frame pacing and the optional swap chain ------------------------------
+
+static IDXGISwapChain1 *g_swap = nullptr;
+static ID3D11RenderTargetView *g_backbuffer = nullptr;
+static HWND g_hwnd = nullptr;
+static std::vector<float> g_frame_us;
+static double g_last_frame_end = 0;
+
+static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcA(h, m, w, l); }
+
+static bool create_swapchain(ID3D11Device *dev, int size) {
+  WNDCLASSA wc = {};
+  wc.lpfnWndProc = wndproc;
+  wc.hInstance = GetModuleHandleA(nullptr);
+  wc.lpszClassName = "d3d11_drawbench";
+  RegisterClassA(&wc);
+  RECT r = {0, 0, size, size};
+  AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+  g_hwnd = CreateWindowA("d3d11_drawbench", "d3d11_drawbench", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 50, 50,
+                         r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+  if (!g_hwnd)
+    return false;
+  IDXGIDevice *xd = nullptr;
+  IDXGIAdapter *ad = nullptr;
+  IDXGIFactory2 *f = nullptr;
+  dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&xd);
+  if (xd)
+    xd->GetAdapter(&ad);
+  if (ad)
+    ad->GetParent(__uuidof(IDXGIFactory2), (void **)&f);
+  DXGI_SWAP_CHAIN_DESC1 d = {};
+  d.Width = d.Height = UINT(size);
+  d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  d.SampleDesc.Count = 1;
+  d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+  d.BufferCount = 2;
+  d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  if (f)
+    f->CreateSwapChainForHwnd(dev, g_hwnd, &d, nullptr, nullptr, &g_swap);
+  release(f);
+  release(ad);
+  release(xd);
+  if (!g_swap)
+    return false;
+  ID3D11Texture2D *bb = nullptr;
+  g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
+  if (bb)
+    dev->CreateRenderTargetView(bb, nullptr, &g_backbuffer);
+  release(bb);
+  return g_backbuffer != nullptr;
+}
+
+// End a frame: Present (or Flush) and record the frame time.
+static void end_frame(ID3D11DeviceContext *ctx, LARGE_INTEGER freq) {
+  if (g_swap) {
+    MSG m;
+    while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE))
+      DispatchMessageA(&m);
+    g_swap->Present(0, 0);
+  } else {
+    ctx->Flush();
+  }
+  double t = now_us(freq);
+  if (g_last_frame_end != 0)
+    g_frame_us.push_back(float(t - g_last_frame_end));
+  g_last_frame_end = t;
+}
+
+static void print_pacing() {
+  if (g_frame_us.size() < 2)
+    return;
+  std::vector<float> v = g_frame_us;
+  std::sort(v.begin(), v.end());
+  auto pct = [&](double p) { return v[std::min(v.size() - 1, size_t(p * double(v.size() - 1) + 0.5))]; };
+  double mean = 0, var = 0;
+  for (float x : v)
+    mean += x;
+  mean /= double(v.size());
+  for (float x : v)
+    var += (x - mean) * (x - mean);
+  double sd = std::sqrt(var / double(v.size()));
+  double med = pct(0.5);
+  printf("frametime us: p50 %.0f p90 %.0f p99 %.0f p99.9 %.0f max %.0f mean %.0f sd %.0f (%.1f%% of mean)\n", med,
+         pct(0.9), pct(0.99), pct(0.999), v.back(), mean, sd, 100.0 * sd / mean);
+  const double edges[] = {0.5, 0.9, 1.1, 1.5, 2.0, 4.0};
+  size_t n[7] = {};
+  for (float x : v) {
+    int b = 0;
+    while (b < 6 && x >= edges[b] * med)
+      b++;
+    n[b]++;
+  }
+  printf("frametime histogram (x median): <0.5 %zu  0.5-0.9 %zu  0.9-1.1 %zu  1.1-1.5 %zu  1.5-2 %zu  2-4 %zu  >4 %zu\n",
+         n[0], n[1], n[2], n[3], n[4], n[5], n[6]);
+}
+
 static ID3DBlob *compile_variant(const char *entry, const char *target, int k) {
   char kdef[16];
   snprintf(kdef, sizeof kdef, "%d", k);
@@ -149,6 +255,7 @@ int main(int argc, char **argv) {
   const int nsrv = argc > 4 ? atoi(argv[4]) : 8;
   const int size = argc > 5 ? atoi(argv[5]) : 256;
   const bool real = argc > 6 && strcmp(argv[6], "real") == 0;
+  const bool present = argc > 7 && strcmp(argv[7], "present") == 0;
   if (draws < 1 || lag < 1 || lag > 8 || nsrv < 1 || nsrv > 64 || size < 16) {
     fprintf(stderr, "usage: d3d11_drawbench [seconds] [draws>=1] [lag 1..8] [srvs 1..64] [size>=16]\n");
     return 2;
@@ -163,8 +270,15 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (present && !create_swapchain(dev, size)) {
+    fprintf(stderr, "swap chain creation failed\n");
+    return 1;
+  }
   if (real) {
     int rc = run_real(dev, ctx, seconds, draws, lag, size);
+    print_pacing();
+    release(g_backbuffer);
+    release(g_swap);
     ctx->ClearState();
     release(ctx);
     release(dev);
@@ -261,6 +375,8 @@ int main(int argc, char **argv) {
         Sleep(0);
     }
     double s0 = now_us(freq);
+    if (g_backbuffer) // flip model unbinds the back buffer at Present
+      ctx->OMSetRenderTargets(1, &g_backbuffer, nullptr);
     for (int i = 0; i < draws; i++) {
       D3D11_MAPPED_SUBRESOURCE m;
       if (SUCCEEDED(ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -277,7 +393,7 @@ int main(int argc, char **argv) {
       ctx->Draw(3, 0);
     }
     ctx->End(slot);
-    ctx->Flush();
+    end_frame(ctx, freq);
     double s1 = now_us(freq);
     sum_wait += s0 - w0;
     sec_wait += s0 - w0;
@@ -303,6 +419,9 @@ int main(int argc, char **argv) {
          frames * 1e6 / (t1 - t0), frames * double(draws) * 1e6 / (t1 - t0), sum_submit / frames,
          sum_wait / frames, (cpu1 - cpu0) / frames, sum_submit / frames / draws);
 
+  print_pacing();
+  release(g_backbuffer);
+  release(g_swap);
   for (int i = 0; i < lag; i++)
     release(q[i]);
   for (int i = 0; i < nsrv; i++)
@@ -532,8 +651,9 @@ int run_real(ID3D11Device *dev, ID3D11DeviceContext *ctx, double seconds, int dr
       const Draw &d = seq[size_t(i)];
       if (i % per_rt == 0) {
         int r = (i / per_rt) % NRT;
-        ctx->OMSetRenderTargets(1, &rtv[r], dsv[r]);
-        ctx->ClearRenderTargetView(rtv[r], clear);
+        ID3D11RenderTargetView *target = (r == 0 && g_backbuffer) ? g_backbuffer : rtv[r];
+        ctx->OMSetRenderTargets(1, &target, dsv[r]);
+        ctx->ClearRenderTargetView(target, clear);
         ctx->ClearDepthStencilView(dsv[r], D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
       }
       if (i % 4 == 0) {
@@ -571,7 +691,7 @@ int run_real(ID3D11Device *dev, ID3D11DeviceContext *ctx, double seconds, int dr
       ctx->Draw(3, 0);
     }
     ctx->End(slot);
-    ctx->Flush();
+    end_frame(ctx, freq);
     double s1 = now_us(freq);
     sum_wait += s0 - w0;
     sec_wait += s0 - w0;
