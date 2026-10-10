@@ -643,6 +643,10 @@ struct nb_wl {
     uint64_t btn_last_ms, btn_seen_ms;
     bool     ptr_on_menu, ptr_on_btn;
     double   ptr_wx, ptr_wy;        /* last pointer, window coordinates     */
+    /* The picture the guest pointer was last placed through: when it moves
+     * or changes size under a still pointer, the pointer is sent again. */
+    struct nb_rect ptr_pic;
+    int      ptr_bw, ptr_bh;
     /* The area outline while the menu is open: 4 edges + 4 corners, one
      * shared 1x1 green buffer stretched by viewports. */
     struct wl_surface    *ed_surf[8];
@@ -713,6 +717,7 @@ static void wl_ui_do(struct nb_wl *w, unsigned bits);
 static void wl_ui_layer_motion(struct nb_wl *w, double lx, double ly);
 static void wl_btn_track(struct nb_wl *w, double wy);
 static void wl_ptr_to_guest(struct nb_wl *w);
+static void wl_ptr_follow(struct nb_wl *w);
 static void wl_ui_reflow(struct nb_wl *w);
 static int  wl_tick_ui(struct nb_wl *w, int next);
 static void wl_menu_set(struct nb_wl *w, bool open);
@@ -1669,6 +1674,9 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     bd_layout(w);
     wl_surface_commit(target);
     wl_main_settle(w);          /* the letterbox's parent state, if it moved */
+    if (w->viewport) {
+        wl_ptr_follow(w);       /* compare-only unless the picture moved */
+    }
     wl_display_flush(w->dpy);   /* out NOW: see FLUSH below */
     nb_stats_commit(w, sl);
 
@@ -3544,6 +3552,22 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
     cur_apply(w, serial);
     if (w->sink) {
         nb_sink_pointer(w->sink, true);
+    }
+    /*
+     * Where it entered is a position like any motion's.  A compositor sends
+     * enter alone when the pointer crosses from the bars onto the picture's
+     * subsurface, or when the picture appears under a still pointer; until
+     * the next motion the guest pointer would stay where it was, and a click
+     * land there.
+     */
+    w->ptr_wx = wl_fixed_to_double(x);
+    w->ptr_wy = wl_fixed_to_double(y);
+    if (w->in_sub && s == w->cs_surf) {
+        w->ptr_wx += w->off_x;
+        w->ptr_wy += w->off_y;
+    }
+    if (!w->ui.open) {
+        wl_ptr_to_guest(w);
     }
 }
 static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial,
@@ -5799,6 +5823,35 @@ static void wl_ptr_to_guest(struct nb_wl *w)
     nb_sink_abs(w->sink, gx, gy, (unsigned)bw, (unsigned)bh);
 }
 
+/*
+ * The picture moved or changed size (a new guest mode, scale or area) while
+ * the pointer stayed where it is: the same window point is another guest
+ * pixel now, and the guest may have moved its pointer itself -- a compositor
+ * puts it back at the centre of an output that was replugged for a new mode.
+ * Without this the cursor is drawn under the host pointer while a click lands
+ * wherever the guest left it, until the mouse moves.
+ */
+static void wl_ptr_follow(struct nb_wl *w)
+{
+    int gx, gy;
+
+    if (w->place.pic.x == w->ptr_pic.x && w->place.pic.y == w->ptr_pic.y &&
+        w->place.pic.w == w->ptr_pic.w && w->place.pic.h == w->ptr_pic.h &&
+        w->buf_w == w->ptr_bw && w->buf_h == w->ptr_bh) {
+        return;
+    }
+    w->ptr_pic = w->place.pic;
+    w->ptr_bw = w->buf_w;
+    w->ptr_bh = w->buf_h;
+    if (!w->sink || !w->ptr_on_content || w->ui.open || w->current < 0 ||
+        w->buf_w <= 0 || w->buf_h <= 0) {
+        return;
+    }
+    nb_view_map(&w->place, w->buf_w, w->buf_h, w->ptr_wx, w->ptr_wy, &gx, &gy);
+    nb_sink_abs_resync(w->sink, gx, gy, (unsigned)w->buf_w,
+                       (unsigned)w->buf_h);
+}
+
 /* Re-place the picture after a settings change: a viewport and a position. */
 static void wl_relayout(struct nb_wl *w)
 {
@@ -5815,6 +5868,7 @@ static void wl_relayout(struct nb_wl *w)
         }
         w->surf_w = dw;
         w->surf_h = dh;
+        wl_ptr_follow(w);
     }
     bd_layout(w);
     if (w->ui.open) {

@@ -708,14 +708,22 @@ impl InputTranslator {
         out.push(InputEventEntry::new(input::EV_SYN, input::SYN_REPORT, 0));
     }
 
-    /// Absolute position `v` in `0..range` → `0..=INPUT_ABS_MAX`.
+    /// Absolute position `v` in `0..range` → `0..=INPUT_ABS_MAX`: the centre
+    /// of pixel `v`. libinput (so every Wayland compositor and X11) maps an
+    /// axis value `a` to `a * size / (max - min + 1)`, i.e. the range is
+    /// `INPUT_ABS_MAX + 1` units wide and pixel `p` covers
+    /// `[p, p + 1) * (INPUT_ABS_MAX + 1) / size`. Mapping `v` to its centre
+    /// lands the guest pointer on exactly pixel `v` for any `range` up to
+    /// 32768; spreading `0..range` over `0..=INPUT_ABS_MAX` instead put it a
+    /// pixel short at a dozen columns per screen.
     pub fn scale_abs(v: i32, range: u32) -> i32 {
         let max = INPUT_ABS_MAX as i64;
         if range <= 1 {
             return (v as i64).clamp(0, max) as i32;
         }
-        let v = (v as i64).clamp(0, range as i64 - 1);
-        ((v * max + (range as i64 - 1) / 2) / (range as i64 - 1)).clamp(0, max) as i32
+        let r = range as i64;
+        let v = (v as i64).clamp(0, r - 1);
+        ((2 * v + 1) * (max + 1) / (2 * r)).clamp(0, max) as i32
     }
 
     /// Append the events for one packet to `out`.
@@ -1024,6 +1032,16 @@ impl ModeArbiter {
 
     pub fn current(&self) -> (u32, u32, u32) {
         self.last
+    }
+
+    /// The guest started anew (a reboot, a driver reload): it is back at the
+    /// configured mode, whatever it was told before. The request that rules
+    /// now, if it is another mode -- without this, a client that asked for
+    /// 1920x1080 before the reboot is never asked again and the guest stays
+    /// at the configured mode.
+    pub fn guest_restarted(&mut self) -> Option<DisplayModeEvent> {
+        self.last = self.configured();
+        self.decide(false)
     }
 }
 
@@ -3082,6 +3100,15 @@ impl DisplayLink {
         let mut list_sent: Option<(u64, u64)> = None;
         let mut modes_checked = Instant::now();
         const MODES_RECHECK: Duration = Duration::from_secs(1);
+        // A DisplayMode event is held until the guest of this generation has
+        // shown a frame: before that its driver may not be listening yet (the
+        // Linux module takes events only once its KMS head is registered,
+        // after the event queue is up), and an event it drops is never sent
+        // again. A guest that restarts is back at the configured mode, so
+        // the ruling request is decided again for it. The mode list waits
+        // the same way.
+        let mut gen_seen = self.generation();
+        let mut mode_held = true;
         // Host clipboard on its way to the guest: generation, text, offset.
         let mut pending_clip: Option<(u64, Vec<u8>, usize)> = None;
         let mut clip_gen: u64 = 0;
@@ -3143,6 +3170,25 @@ impl DisplayLink {
         };
 
         while !stop.load(Ordering::Relaxed) {
+            let generation = self.generation();
+            if generation != gen_seen {
+                gen_seen = generation;
+                mode_held = true;
+                pending_mode = policy.guest_restarted();
+                list_sent = None;
+            }
+            if mode_held && self.guest_picture_size().is_some() {
+                mode_held = false;
+                if let Some(m) = pending_mode {
+                    log::info!(
+                        "display: the guest shows frames; asking it for {}x{}@{}.{:03}",
+                        m.width,
+                        m.height,
+                        m.refresh_mhz / 1000,
+                        m.refresh_mhz % 1000
+                    );
+                }
+            }
             console_switch(
                 &mut rd,
                 &mut routed_console,
@@ -3221,15 +3267,21 @@ impl DisplayLink {
             // Undeliverable input (no buffer posted) is retried soon rather
             // than on the next packet: a lost key release is a stuck key.
             let clip_waiting = pending_clip.is_some() && !clip_stalled;
-            let list_owed = sink
-                .mode_list_epoch()
-                .is_some_and(|e| list_sent != Some((self.modes.lock().unwrap().generation(), e)));
-            let mut timeout = if pending.is_empty() && pending_mode.is_none() && !clip_waiting {
+            let list_owed = !mode_held
+                && sink.mode_list_epoch().is_some_and(|e| {
+                    list_sent != Some((self.modes.lock().unwrap().generation(), e))
+                });
+            let mode_waiting = pending_mode.is_some() && !mode_held;
+            let mut timeout = if pending.is_empty() && !mode_waiting && !clip_waiting {
                 if self.clip_owed() {
                     CLIP_BATCH_EVERY.as_millis() as i32
-                } else if list_owed || self.modes_owed() {
-                    20
-                } else if self.cursor_owed() || pending_clip.is_some() {
+                } else if list_owed
+                    || self.modes_owed()
+                    || self.cursor_owed()
+                    || pending_clip.is_some()
+                    || (mode_held && pending_mode.is_some())
+                {
+                    // (A held mode: the guest's first frame is looked for.)
                     20
                 } else {
                     500
@@ -3383,6 +3435,7 @@ impl DisplayLink {
             self.deliver_console(&mut to_console);
             self.deliver(&mut *sink, &mut pending, guest_input, &mut dropped_note);
             if let Some(m) = pending_mode
+                && !mode_held
                 && sink.mode(&m)
             {
                 pending_mode = None;
@@ -3402,7 +3455,7 @@ impl DisplayLink {
             if self.modes_owed() {
                 self.send_modes();
             }
-            if let Some(epoch) = sink.mode_list_epoch() {
+            if let Some(epoch) = sink.mode_list_epoch().filter(|_| !mode_held) {
                 let (lgen, sizes, mhz) = {
                     let m = self.modes.lock().unwrap();
                     (m.generation(), m.sizes(), m.refresh_mhz())
@@ -4006,6 +4059,54 @@ mod tests {
         InputEventEntry::new(t, c, v)
     }
 
+    /// libinput's mapping: axis value `a` of `0..=max` is pixel
+    /// `floor(a * size / (max + 1))`.
+    fn libinput_pixel(a: i32, size: u32) -> u32 {
+        (a as u64 * size as u64 / (INPUT_ABS_MAX as u64 + 1)) as u32
+    }
+
+    #[test]
+    fn absolute_positions_land_on_the_same_guest_pixel() {
+        for size in [
+            1u32, 2, 3, 640, 1280, 1691, 1920, 2560, 3840, 5120, 8192, 16384,
+        ] {
+            for v in 0..size {
+                let a = InputTranslator::scale_abs(v as i32, size);
+                assert!((0..=INPUT_ABS_MAX).contains(&a));
+                if size > 1 {
+                    assert_eq!(libinput_pixel(a, size), v, "pixel {v} of {size}");
+                }
+            }
+            // Outside the window: the nearest edge.
+            if size > 1 {
+                assert_eq!(
+                    libinput_pixel(InputTranslator::scale_abs(-5, size), size),
+                    0
+                );
+                assert_eq!(
+                    libinput_pixel(InputTranslator::scale_abs(size as i32 + 5, size), size),
+                    size - 1
+                );
+            }
+        }
+    }
+
+    /// The boot console maps the same values back onto its framebuffer: a
+    /// viewer pixel stays the same pixel there.
+    #[test]
+    fn absolute_positions_round_trip_through_the_console() {
+        for size in [640u32, 1280, 1691, 1920, 2560, 5120] {
+            for v in 0..size {
+                let a = InputTranslator::scale_abs(v as i32, size);
+                assert_eq!(
+                    crate::console::InputEncoder::scale(a, size as u16) as u32,
+                    v,
+                    "pixel {v} of {size}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn input_translates_to_linux_events() {
         use input::*;
@@ -4031,8 +4132,9 @@ mod tests {
                 ev(EV_SYN, SYN_REPORT, 0),
                 ev(EV_KEY, 0x110, 1),
                 ev(EV_SYN, SYN_REPORT, 0),
-                ev(EV_ABS, ABS_X, INPUT_ABS_MAX),
-                ev(EV_ABS, ABS_Y, 0),
+                // The centres of pixel 1279 of 1280 and pixel 0 of 720.
+                ev(EV_ABS, ABS_X, 32755),
+                ev(EV_ABS, ABS_Y, 22),
                 ev(EV_SYN, SYN_REPORT, 0),
                 ev(EV_REL, REL_X, -3),
                 ev(EV_SYN, SYN_REPORT, 0),
@@ -4096,10 +4198,11 @@ mod tests {
 
     #[test]
     fn absolute_positions_scale_to_the_fixed_range() {
-        assert_eq!(InputTranslator::scale_abs(0, 2560), 0);
-        assert_eq!(InputTranslator::scale_abs(2559, 2560), INPUT_ABS_MAX);
-        assert_eq!(InputTranslator::scale_abs(5000, 2560), INPUT_ABS_MAX);
-        assert_eq!(InputTranslator::scale_abs(-4, 2560), 0);
+        // Pixel centres: 32768 units over 2560 pixels is 12.8 per pixel.
+        assert_eq!(InputTranslator::scale_abs(0, 2560), 6);
+        assert_eq!(InputTranslator::scale_abs(2559, 2560), 32761);
+        assert_eq!(InputTranslator::scale_abs(5000, 2560), 32761);
+        assert_eq!(InputTranslator::scale_abs(-4, 2560), 6);
         let mid = InputTranslator::scale_abs(1280, 2561);
         assert!((mid - INPUT_ABS_MAX / 2).abs() <= 1, "{mid}");
         assert_eq!(InputTranslator::scale_abs(7, 0), 7);
@@ -4741,6 +4844,81 @@ mod tests {
     }
 
     #[test]
+    fn a_restarted_guest_is_asked_again() {
+        let mut a = ModeArbiter::new(DisplayMode::DEFAULT);
+        let hello = |caps| pkt(wire::EV_HELLO, 0, 0, 0, 2, caps);
+        // Nobody asked for anything: a restart needs nothing either.
+        assert_eq!(a.guest_restarted(), None);
+        a.packet(0, &hello(wire::CAP_MODE_HINTS));
+        assert_eq!(mode_of(a.packet(0, &hint(1920, 1080))), Some((1920, 1080)));
+        // Rebooted: back at 2560x1440, so 1920x1080 is news again...
+        assert_eq!(mode_of(a.guest_restarted()), Some((1920, 1080)));
+        assert_eq!(a.current(), (1920, 1080, 240_000));
+        // ...and the same request repeated after it is not.
+        assert_eq!(a.packet(0, &hint(1920, 1080)), None);
+        // A client asking for the configured mode: nothing to re-send.
+        assert_eq!(mode_of(a.packet(0, &hint(2560, 1440))), Some((2560, 1440)));
+        assert_eq!(a.guest_restarted(), None);
+        // Before the guest is back, a request equal to the stale mode still
+        // goes out: the guest is at the configured one.
+        assert_eq!(mode_of(a.packet(0, &hint(1280, 960))), Some((1280, 960)));
+        a.guest_restarted();
+        assert_eq!(mode_of(a.packet(0, &hint(1600, 900))), Some((1600, 900)));
+    }
+
+    /// Records the DisplayMode events the link delivers.
+    struct ModeSink(Arc<Mutex<Vec<(u32, u32)>>>);
+    impl InputSink for ModeSink {
+        fn push(&mut self, events: &[InputEventEntry]) -> usize {
+            events.len()
+        }
+        fn mode(&mut self, m: &DisplayModeEvent) -> bool {
+            self.0.lock().unwrap().push((m.width, m.height));
+            true
+        }
+    }
+
+    #[test]
+    fn modes_wait_for_the_guests_frames_and_follow_a_restart() {
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        link.adopt(ours);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let th = {
+            let (link, got, stop) = (link.clone(), got.clone(), stop.clone());
+            std::thread::spawn(move || link.run(Box::new(ModeSink(got)), &stop))
+        };
+        let send = |p: wire::Pkt| {
+            let b = p.encode();
+            let n = unsafe { libc::send(broker.as_raw_fd(), b.as_ptr().cast(), b.len(), 0) };
+            assert_eq!(n, b.len() as isize);
+        };
+        send(pkt(wire::EV_HELLO, 0, 0, 0, 2, wire::CAP_MODE_HINTS));
+        send(hint(1920, 1080));
+        // No guest frame yet: its driver may not listen; nothing is sent.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(got.lock().unwrap().is_empty());
+        let buf = memfd();
+        link.flip(buf.as_raw_fd(), &flip(1, 2560));
+        assert!(wait_for(|| *got.lock().unwrap() == [(1920, 1080)]));
+        // The guest reboots: asked again once it shows a frame, not before.
+        link.guest_gone("test reset");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(got.lock().unwrap().len(), 1);
+        link.flip(buf.as_raw_fd(), &flip(2, 2560));
+        assert!(wait_for(|| got.lock().unwrap().len() == 2));
+        assert_eq!(got.lock().unwrap()[1], (1920, 1080));
+        // Business as usual afterwards.
+        send(hint(1280, 960));
+        assert!(wait_for(|| got.lock().unwrap().len() == 3));
+        assert_eq!(got.lock().unwrap()[2], (1280, 960));
+        stop.store(true, Ordering::Relaxed);
+        drop(broker);
+        th.join().unwrap();
+    }
+
+    #[test]
     fn the_mode_without_a_viewer_and_between_viewers() {
         let mut a = ModeArbiter::new(DisplayMode::DEFAULT);
         let hello = |caps| pkt(wire::EV_HELLO, 0, 0, 0, 2, caps);
@@ -5124,9 +5302,14 @@ mod tests {
         // No guest that takes lists yet: nothing sent.
         std::thread::sleep(Duration::from_millis(50));
         assert!(sink.lists.lock().unwrap().is_empty());
-        // The guest acks the feature, but has no event buffer posted yet.
-        sink.full.store(true, Ordering::Relaxed);
+        // The guest acks the feature, but has shown no frame yet (its driver
+        // may not listen yet): held.
         *sink.epoch.lock().unwrap() = Some(1);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(sink.lists.lock().unwrap().is_empty());
+        // It shows a frame, but has no event buffer posted yet.
+        sink.full.store(true, Ordering::Relaxed);
+        let _ = link.flip(0, &flip(1, 5120));
         std::thread::sleep(Duration::from_millis(60));
         assert!(sink.lists.lock().unwrap().is_empty());
         sink.full.store(false, Ordering::Relaxed);

@@ -152,6 +152,13 @@ struct nb_x11 {
     int  con_w, con_h;              /* content-window size we last asked for  */
     bool grabbed, fullscreen;
     bool ptr_inside;            /* pointer is over the CONTENT window     */
+    /* The last pointer position over the picture (window coordinates), and
+     * the picture it was mapped through: when the picture moves or changes
+     * size under a still pointer, the position is sent again. */
+    bool ptr_valid;
+    double ptr_wx, ptr_wy;
+    struct nb_rect ptr_pic;
+    int ptr_bw, ptr_bh;
     unsigned hint_w, hint_h;    /* last size we asked the guest to render */
     char      title[128];       /* the plain window name, without status  */
     xcb_cursor_t blank_cursor;  /* shown while the pointer is the guest's */
@@ -639,11 +646,39 @@ static void x11_size_content(struct nb_x11 *x, int w, int h)
  * the scale and crop in its transform otherwise.  Either way it is the one
  * GPU copy the server already makes.
  */
+/*
+ * The picture moved or changed size (a new guest mode, scale or area) while
+ * the pointer stayed put: the same window point is another guest pixel now,
+ * and the guest may have moved its pointer itself (a replugged output puts it
+ * at the centre).  Send the position again, so a click lands under the
+ * cursor and not where the guest left it.
+ */
+static void x11_ptr_follow(struct nb_x11 *x, int bw, int bh)
+{
+    int gx, gy;
+
+    if (x->place.pic.x == x->ptr_pic.x && x->place.pic.y == x->ptr_pic.y &&
+        x->place.pic.w == x->ptr_pic.w && x->place.pic.h == x->ptr_pic.h &&
+        bw == x->ptr_bw && bh == x->ptr_bh) {
+        return;
+    }
+    x->ptr_pic = x->place.pic;
+    x->ptr_bw = bw;
+    x->ptr_bh = bh;
+    if (!x->sink || !x->ptr_inside || !x->ptr_valid || x->ui.open ||
+        bw <= 0 || bh <= 0) {
+        return;
+    }
+    nb_view_map(&x->place, bw, bh, x->ptr_wx, x->ptr_wy, &gx, &gy);
+    nb_sink_abs_resync(x->sink, gx, gy, (unsigned)bw, (unsigned)bh);
+}
+
 static void x11_place(struct nb_x11 *x, int bw, int bh)
 {
     const struct nb_rect *v = &x->place.vis;
 
     nb_view_place(&x->vst.cur, bw, bh, x->win_w, x->win_h, 120, &x->place);
+    x11_ptr_follow(x, bw, bh);
     if (x->con_x != v->x || x->con_y != v->y || x->con_w != v->w ||
         x->con_h != v->h) {
         x11_size_content_at(x, v->x, v->y, v->w, v->h);
@@ -1260,6 +1295,9 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 x->ptr_inside = true;
                 nb_sink_pointer(sink, true);
             }
+            x->ptr_valid = true;
+            x->ptr_wx = wx;
+            x->ptr_wy = wy;
             nb_view_map(&x->place, bw, bh, wx, wy, &gx, &gy);
             nb_sink_abs(sink, gx, gy, (unsigned)bw, (unsigned)bh);
             break;

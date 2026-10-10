@@ -415,6 +415,11 @@ void nb_sink_release_keys(struct nb_sink *s);
 void nb_sink_toggle_fullscreen(struct nb_sink *s);
 void nb_sink_btn(struct nb_sink *s, unsigned code, bool down);
 void nb_sink_abs(struct nb_sink *s, int x, int y, unsigned w, unsigned h);
+/* The same position again, made news to the guest whatever it holds: for a
+ * pointer that did not move while the picture under it did (a new guest
+ * mode, a new scale or area). */
+void nb_sink_abs_resync(struct nb_sink *s, int x, int y, unsigned w,
+                        unsigned h);
 void nb_sink_rel(struct nb_sink *s, int dx, int dy);
 void nb_sink_wheel(struct nb_sink *s, int v, int h);
 void nb_sink_focus(struct nb_sink *s, bool active);

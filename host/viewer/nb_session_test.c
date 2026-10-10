@@ -26,6 +26,7 @@
  *     k <linux-keycode> <0|1>     key up/down
  *     b <linux-btncode> <0|1>     button up/down
  *     a <x> <y>                   absolute motion
+ *     A <x> <y>                   the same position again, as after a re-mode
  *     r <dx> <dy>                 relative motion
  *     w <v> <h>                   wheel
  *     f <0|1>                     focus out/in
@@ -131,6 +132,7 @@ static void test_line(struct nb_session *s, struct nb_sink *sink,
     case 'k': nb_sink_key(sink, (unsigned)a, b != 0); break;
     case 'b': nb_sink_btn(sink, (unsigned)a, b != 0); break;
     case 'a': nb_sink_abs(sink, a, b, s->width, s->height); break;
+    case 'A': nb_sink_abs_resync(sink, a, b, s->width, s->height); break;
     case 'r': nb_sink_rel(sink, a, b); break;
     case 'w': nb_sink_wheel(sink, a, b); break;
     case 'f': nb_sink_focus(sink, a != 0); break;

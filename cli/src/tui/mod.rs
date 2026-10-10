@@ -893,7 +893,6 @@ fn restore() {
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableMouseCapture,
-        crossterm::event::DisableFocusChange,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     );
@@ -933,15 +932,11 @@ pub fn run() -> Result<()> {
     }
     enable_raw_mode()?;
     let _g = Guard;
-    crossterm::execute!(
-        std::io::stdout(),
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        crossterm::event::EnableFocusChange
-    )?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
-    // NVML is let go while the terminal reports the dashboard unfocused.
+    // NVML stays open while the dashboard runs, so the GPU panel keeps
+    // updating while another window (a VM) has the focus.
     let gpu_wanted = Arc::new(AtomicBool::new(true));
     let (shared, poke) = data::start(gpu_wanted.clone());
     let (cap_tx, cap_rx) = mpsc::channel();
@@ -1053,14 +1048,6 @@ pub fn run() -> Result<()> {
                     MouseEventKind::ScrollDown => app.key(KeyCode::Down, KeyModifiers::NONE),
                     _ => {}
                 },
-                Event::FocusLost => {
-                    gpu_wanted.store(false, Ordering::SeqCst);
-                    let _ = app.poke.send(());
-                }
-                Event::FocusGained => {
-                    gpu_wanted.store(true, Ordering::SeqCst);
-                    let _ = app.poke.send(());
-                }
                 Event::Resize(..) => app.dirty = true,
                 _ => {}
             }

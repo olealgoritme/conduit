@@ -197,6 +197,9 @@ struct nvgpu_kms {
    * (nvgpu_replug.h): its state under mode_config.mutex, and its timer. */
   struct nvgpu_replug replug;
   struct delayed_work replug_work;
+  /* When the grace period of the watch ends (jiffies): a timer run from
+   * before the newest restart finds it ahead and leaves it to the next. */
+  unsigned long replug_due;
 
   /* What the host was last told about the cursor, so a commit that only
    * moved it sends nothing. Commit tails only, ordered per plane. */
@@ -564,6 +567,19 @@ static const struct drm_plane_funcs nvgpu_kms_cursor_funcs = {
 /* ───────── CRTC ───────── */
 
 /*
+ * How long a compositor has to apply a new preferred mode after the hotplug
+ * before the connector is replugged; 0 never replugs. mutter and KWin apply
+ * it within a few frames.
+ */
+static int nvgpu_mode_replug_ms = 1000;
+module_param_named(mode_replug_ms, nvgpu_mode_replug_ms, int, 0644);
+MODULE_PARM_DESC(mode_replug_ms,
+                 "ms to wait for a compositor to apply a host mode before "
+                 "replugging the connector (0: never)");
+
+static void nvgpu_kms_replug_arm(struct nvgpu_kms *kms, unsigned int ms);
+
+/*
  * Deliver the flip event: on the next timer vblank for an ordinary flip, at
  * once for an async (tearing) one or when vblank is off. The host was told
  * about the buffer already, in the plane update.
@@ -585,6 +601,22 @@ static void nvgpu_kms_crtc_atomic_flush(struct drm_crtc *crtc,
   spin_unlock_irq(&crtc->dev->event_lock);
 }
 
+/*
+ * The head is lit (a modeset, or DPMS on): if a new preferred mode is still
+ * being watched for -- the head was dark when its grace period ended -- the
+ * compositor has had no chance to show it yet, so the grace period starts
+ * again from here. The commit tail: only a lockless peek and a timer.
+ */
+static void nvgpu_kms_crtc_lit(struct drm_crtc *crtc) {
+  struct nvgpu_kms *kms = container_of(crtc, struct nvgpu_kms, crtc);
+  int ms = READ_ONCE(nvgpu_mode_replug_ms);
+
+  /* Unlocked: a watch that ends meanwhile makes the timer run a no-op. */
+  if (ms > 0 && !READ_ONCE(kms->dead) &&
+      READ_ONCE(kms->replug.stage) == NVGPU_REPLUG_WATCH)
+    nvgpu_kms_replug_arm(kms, ms);
+}
+
 static void nvgpu_kms_crtc_atomic_disable(struct drm_crtc *crtc,
                                           struct nvgpu_atomic_commit *state) {
   struct nvgpu_kms *kms = container_of(crtc, struct nvgpu_kms, crtc);
@@ -596,7 +628,11 @@ static void nvgpu_kms_crtc_atomic_disable(struct drm_crtc *crtc,
 
 #ifdef NVGPU_HAVE_VBLANK_TIMER
 #define NVGPU_KMS_CRTC_VBLANK_FUNCS DRM_CRTC_VBLANK_TIMER_FUNCS
-#define nvgpu_kms_crtc_atomic_enable drm_crtc_vblank_atomic_enable
+static void nvgpu_kms_crtc_atomic_enable(struct drm_crtc *crtc,
+                                         struct nvgpu_atomic_commit *state) {
+  drm_crtc_vblank_atomic_enable(crtc, state);
+  nvgpu_kms_crtc_lit(crtc);
+}
 #else
 /* Before 6.19: the same timer vblank, from nvgpu_compat.h. */
 static int nvgpu_kms_enable_vblank(struct drm_crtc *crtc) {
@@ -623,6 +659,7 @@ static bool nvgpu_kms_get_vblank_timestamp(struct drm_crtc *crtc,
 static void nvgpu_kms_crtc_atomic_enable(struct drm_crtc *crtc,
                                          struct nvgpu_atomic_commit *state) {
   drm_crtc_vblank_on(crtc);
+  nvgpu_kms_crtc_lit(crtc);
 }
 
 #define NVGPU_KMS_CRTC_VBLANK_FUNCS                                            \
@@ -750,8 +787,10 @@ static int nvgpu_kms_detect_ctx(struct drm_connector *conn,
 
   if (nvgpu_replug_on_probe(&kms->replug, &kick))
     return connector_status_connected;
-  /* The compositor saw the disconnect: reconnect once it has dealt with it. */
-  if (kick)
+  /* The compositor saw the disconnect: reconnect once it has dealt with it.
+   * Not once the device is going: the teardown cancelled the timer for good
+   * (nvgpu_display_quiesce() orders this against it). */
+  if (kick && !READ_ONCE(kms->dead))
     mod_delayed_work(system_wq, &kms->replug_work,
                      msecs_to_jiffies(NVGPU_REPLUG_KICK_MS));
   return connector_status_disconnected;
@@ -772,32 +811,34 @@ static const struct drm_connector_funcs nvgpu_kms_conn_funcs = {
 
 /* ───────── dynamic modes ───────── */
 
-/*
- * How long a compositor has to apply a new preferred mode after the hotplug
- * before the connector is replugged; 0 never replugs. mutter and KWin apply
- * it within a few frames.
- */
-static int nvgpu_mode_replug_ms = 1000;
-module_param_named(mode_replug_ms, nvgpu_mode_replug_ms, int, 0644);
-MODULE_PARM_DESC(mode_replug_ms,
-                 "ms to wait for a compositor to apply a host mode before "
-                 "replugging the connector (0: never)");
 
-/* Whether the head shows the preferred mode. Under mode_config.mutex. */
-static bool nvgpu_kms_mode_applied(struct nvgpu_kms *kms) {
+/* Start (or restart) the watch's grace period: `ms` from now. */
+static void nvgpu_kms_replug_arm(struct nvgpu_kms *kms, unsigned int ms) {
+  unsigned long delay = msecs_to_jiffies(ms);
+
+  WRITE_ONCE(kms->replug_due, jiffies + delay);
+  mod_delayed_work(system_wq, &kms->replug_work, delay);
+}
+
+/*
+ * Whether the head is lit, and whether it shows the preferred mode. Lit is
+ * enabled AND active: DPMS off through the legacy property keeps the mode
+ * and clears only "active", and a dark head shows no mode at all. Under
+ * mode_config.mutex.
+ */
+static void nvgpu_kms_head_state(struct nvgpu_kms *kms, bool *on,
+                                 bool *applied) {
   struct drm_crtc *crtc = &kms->crtc;
   const struct drm_crtc_state *cs;
-  bool on, applied;
 
   drm_modeset_lock(&crtc->mutex, NULL);
   cs = crtc->state;
-  on = cs && cs->enable;
-  applied = nvgpu_replug_applied(
-      on, on ? cs->mode.hdisplay : 0, on ? cs->mode.vdisplay : 0,
-      on ? drm_mode_vrefresh(&cs->mode) : 0, kms->width, kms->height,
-      kms->refresh_mhz);
+  *on = cs && cs->enable && cs->active;
+  *applied = *on && nvgpu_replug_applied(cs->mode.hdisplay, cs->mode.vdisplay,
+                                         drm_mode_vrefresh(&cs->mode),
+                                         kms->width, kms->height,
+                                         kms->refresh_mhz);
   drm_modeset_unlock(&crtc->mutex);
-  return applied;
 }
 
 static void nvgpu_kms_replug_work(struct work_struct *work) {
@@ -805,14 +846,22 @@ static void nvgpu_kms_replug_work(struct work_struct *work) {
       container_of(to_delayed_work(work), struct nvgpu_kms, replug_work);
   struct drm_device *drm = kms->drm;
   enum nvgpu_replug_act act;
+  bool on = true, applied = true;
   u32 w, h;
 
   if (READ_ONCE(kms->dead))
     return;
   mutex_lock(&drm->mode_config.mutex);
-  act = nvgpu_replug_on_timer(&kms->replug,
-                              kms->replug.stage != NVGPU_REPLUG_WATCH ||
-                                  nvgpu_kms_mode_applied(kms));
+  if (nvgpu_replug_watching(&kms->replug)) {
+    /* A run from before the newest restart of the grace period (a new host
+     * mode, or the head lit again): the re-armed timer comes later. */
+    if (time_before(jiffies, READ_ONCE(kms->replug_due))) {
+      mutex_unlock(&drm->mode_config.mutex);
+      return;
+    }
+    nvgpu_kms_head_state(kms, &on, &applied);
+  }
+  act = nvgpu_replug_on_timer(&kms->replug, on, applied);
   w = kms->width;
   h = kms->height;
   /* The timeout before the hotplug, so the probe's kick is not overridden. */
@@ -902,6 +951,14 @@ static void nvgpu_kms_mode_work(struct work_struct *work) {
   kms->width = w;
   kms->height = h;
   kms->refresh_mhz = mhz;
+  /*
+   * The watch starts with the new mode, under the same lock: a timer run of
+   * an earlier watch that gets the lock next must find this one, with its
+   * whole grace period ahead, rather than judge the new mode at once.
+   */
+  if (changed && READ_ONCE(nvgpu_mode_replug_ms) > 0 &&
+      nvgpu_replug_on_mode(&kms->replug))
+    nvgpu_kms_replug_arm(kms, READ_ONCE(nvgpu_mode_replug_ms));
   mutex_unlock(&drm->mode_config.mutex);
 
   if (!changed)
@@ -911,14 +968,6 @@ static void nvgpu_kms_mode_work(struct work_struct *work) {
            "changed, hotplug sent\n",
            w, h, mhz / 1000, mhz % 1000);
   drm_kms_helper_hotplug_event(drm);
-
-  if (READ_ONCE(nvgpu_mode_replug_ms) <= 0)
-    return;
-  mutex_lock(&drm->mode_config.mutex);
-  if (nvgpu_replug_on_mode(&kms->replug))
-    mod_delayed_work(system_wq, &kms->replug_work,
-                     msecs_to_jiffies(READ_ONCE(nvgpu_mode_replug_ms)));
-  mutex_unlock(&drm->mode_config.mutex);
 }
 
 /* The event-queue interrupt: record, and leave the rest to the work. */
@@ -961,16 +1010,19 @@ static void nvgpu_kms_mode_list_event(struct nvgpu_device *dev, const u8 *p,
                                       unsigned int len) {
   struct nvgpu_kms *kms;
   unsigned long flags;
+  bool queue = false;
 
   rcu_read_lock();
   kms = rcu_dereference(dev->kms_ev);
   if (kms && !READ_ONCE(kms->dead)) {
     spin_lock_irqsave(&kms->mode_lock, flags);
     if (nvgpu_modelist_parse(p, len, NVGPU_KMS_MIN_DIM, NVGPU_KMS_MAX_DIM,
-                             NVGPU_KMS_MAX_HZ, &kms->pend_list))
+                             NVGPU_KMS_MAX_HZ, &kms->pend_list)) {
       kms->list_pending = true;
+      queue = true;
+    }
     spin_unlock_irqrestore(&kms->mode_lock, flags);
-    if (kms->list_pending)
+    if (queue)
       schedule_work(&kms->mode_work);
   }
   rcu_read_unlock();
@@ -1422,6 +1474,12 @@ static void nvgpu_display_quiesce(struct nvgpu_device *dev) {
   synchronize_rcu();
   for (i = 0; i < dev->num_dri_devs && i < NVGPU_MAX_DRI_DEVS; i++)
     if (dev->dri_devs[i].kms) {
+      struct drm_device *drm = dev->dri_devs[i].kms->drm;
+
+      /* A probe that read `dead` false has armed its kick by the time it
+       * drops this lock; later ones see it true (nvgpu_kms_detect_ctx()). */
+      mutex_lock(&drm->mode_config.mutex);
+      mutex_unlock(&drm->mode_config.mutex);
       cancel_work_sync(&dev->dri_devs[i].kms->mode_work);
       cancel_delayed_work_sync(&dev->dri_devs[i].kms->replug_work);
     }
