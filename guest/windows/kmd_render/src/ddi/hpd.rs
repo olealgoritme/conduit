@@ -322,6 +322,13 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             stall_diag::hpd_enter(site::INDICATE);
             indicate_child_status(adapter, true);
         }
+        // A new mode list from the host (`ddi::mode_list`): the VidPN DDIs offer it on
+        // their next call; the indication asks Windows to look again now.
+        if crate::ddi::mode_list::take_changed() {
+            stall_diag::hpd_enter(site::INDICATE);
+            crate::diag::record_named_bytes(b"MlN", crate::ddi::mode_list::received());
+            indicate_child_status(adapter, true);
+        }
 
         // Expire a foreign scanout source whose owner stopped presenting (and ask
         // for the desktop's restore flush, consumed by the refresh arm below).

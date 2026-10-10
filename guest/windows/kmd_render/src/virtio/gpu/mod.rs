@@ -2960,6 +2960,11 @@ impl VirtioGpu {
                     helios_protocol::NVGPU_F_SCANOUT_PRESENTED
                 } else {
                     0
+                }) | (if scanout_release {
+                    // The mode list, like the release event, only with the display half.
+                    helios_protocol::NVGPU_F_MODE_LIST
+                } else {
+                    0
                 })),
         )?;
         let scanout_release_acked = accepted & helios_protocol::NVGPU_F_SCANOUT_RELEASE != 0;
@@ -2967,6 +2972,11 @@ impl VirtioGpu {
             accepted & helios_protocol::NVGPU_F_SCANOUT_PRESENTED != 0;
         // 1 when the host's buffer-release event was acked, 0 when not offered / not wanted.
         crate::diag::record_named_bytes(b"RelAck", u32::from(scanout_release_acked));
+        // 1 when the host's mode list was acked.
+        crate::diag::record_named_bytes(
+            b"MlAck",
+            u32::from(accepted & helios_protocol::NVGPU_F_MODE_LIST != 0),
+        );
 
         crate::diag::record_named_bytes(b"InitStg", 2); // features negotiated
         // The device only takes `GpuCmd` when the backend runs with `--venus`.

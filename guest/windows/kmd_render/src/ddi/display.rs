@@ -1578,7 +1578,7 @@ unsafe fn dxgkddi_present_inner(
                     registered.is_some(),
                     flip_source.physical_address(),
                     adapter.is_some_and(|a| a.display_half()),
-                    adapter.map_or((0, 0), |a| a.display_mode()),
+                    adapter.map_or((0, 0), |a| a.scanout_extent()),
                 );
             }
         }
@@ -2500,9 +2500,13 @@ pub unsafe extern "C" fn dxgkddi_is_supported_vidpn(
         MAX_PC.fetch_max(pc, Ordering::Relaxed);
         crate::diag::record_named_bytes(b"VpISp", MAX_PC.load(Ordering::Relaxed));
     }
-    // A single source + single target adapter can only ever be handed the
-    // trivial (or empty) VidPn, so accept it.
-    unsafe { (*is_supported).IsVidPnSupported = 1 };
+    // A single source + single target adapter is only ever handed the trivial (or
+    // empty) VidPn; it is supported when its pinned sizes are modes of the list and
+    // agree (`ddi::mode_list`). Anything unreadable is accepted, as before.
+    let supported = unsafe {
+        crate::ddi::vidpn::vidpn_supported(adapter, (*is_supported).hDesiredVidPn, &*is_supported)
+    };
+    unsafe { (*is_supported).IsVidPnSupported = u8::from(supported) as _ };
     STATUS_SUCCESS
 }
 
@@ -3932,7 +3936,9 @@ unsafe fn program_vidpn_source_inner(
     if source.direct_scanout {
         trace.flags |= flags::DIRECT;
     }
-    let (mode_w, mode_h) = adapter.display_mode();
+    // The committed mode's size (native unless dxgkrnl committed another mode of the
+    // list): a primary of any other size is not this mode's and is refused below.
+    let (mode_w, mode_h) = adapter.scanout_extent();
     let width = if source.width != 0 {
         source.width
     } else {
