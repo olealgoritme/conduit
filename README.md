@@ -238,6 +238,11 @@ automatically.
 Run `conduit` on its own: every VM, the host and the GPU live, with one-key
 view, start, shutdown, reset and logs (`?` lists the keys).
 
+Every libvirt VM also shares host folders: `~/Conduit/NAME` is shared from the
+first `conduit attach`, and `conduit share add NAME DIR` (or `F` in the
+dashboard) adds more. Windows guests mount them as drives (Z: downward), Linux
+guests under `/mnt/conduit/NAME`. Details in docs/CLI.md and docs/WINDOWS.md.
+
 ### Everyday commands
 
 | Command | What it does |

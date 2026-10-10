@@ -177,6 +177,35 @@ CPU wait).
   ([packaging README](../guest/windows/packaging/windows/README.md#display-topology);
   `ManageDisplay=0` opts out).
 
+## Shared folders
+
+Every attached VM shares `~/Conduit/NAME` from the host (more with
+`conduit share add`, docs/CLI.md). Each folder is a virtiofs device tagged
+`conduit-NAME`. The guest needs the VirtIO FS driver (virtio-win), the
+VirtIO-FS service binary (`virtiofs.exe`, installed with the virtio-win guest
+tools) and WinFsp. The package installs WinFsp from the MSI it carries when the
+guest has none (the MSI is not kept in the repository: CI downloads the pinned
+release from https://github.com/winfsp/winfsp/releases, checks its SHA-256 and
+passes it to `ci/windows/Assemble-Package.ps1 -WinFspMsi`).
+
+`Install-ConduitShares.ps1` (run by the installer, or by hand as administrator
+with `-WinFspMsi path\to\winfsp.msi`) registers the startup task
+`ConduitShares`, which runs `Mount-ConduitShares.ps1` as SYSTEM from
+`Program Files\Conduit`. The VirtIO-FS service serves one device per process,
+so the script starts one `virtiofs.exe -t conduit-NAME -m X:` for every
+`conduit-*` device that is not mounted yet, rescans every 5 seconds (a folder
+added while Windows runs appears without a reboot), and gives each tag a drive
+letter counting down from Z:, remembered under
+`HKLM\SOFTWARE\Conduit\ShareDrives`. The drive's label is the tag
+(`conduit-NAME`), which is what virtiofs reports as the volume name. The log is
+`%ProgramData%\Conduit\shares.log`. A stock `VirtioFsSvc` without `-t` would
+take the first device, so the installer sets it to manual start.
+
+The tray app lists the mounted folders under Shared folders in its menu (each
+opens in Explorer) and as Open default share, shows a Shared folders row in the
+popup, and copies files dropped on the popup into the default folder. Turn on
+Keep popup open in the menu to drag files onto it from Explorer.
+
 ## GPU stats tray
 
 `conduit attach` adds a virtio-serial channel, `org.conduit.stats.0`, whose host
