@@ -26,7 +26,8 @@ Kernel module for Linux VMs (kernel 6.4 or newer) running on a Conduit host:
 lets NVIDIA's own user-space driver render on the host GPU and provides the
 VM's display, input and clipboard. Built by DKMS for each installed kernel.
 Includes conduit-clipboard-agent, which shares each desktop session's
-clipboard with the host.
+clipboard with the host, and conduit-ctl-agent, which lets the host run
+programs and move files in the session.
 
 %prep
 %autosetup -n conduit-%{version}
@@ -40,8 +41,17 @@ install -D -m0755 guest/agent/conduit-clipboard-agent %{buildroot}%{_bindir}/con
 install -D -m0644 guest/agent/conduit-clipboard.service %{buildroot}%{_userunitdir}/conduit-clipboard.service
 install -D -m0644 guest/agent/conduit-clipboard.desktop %{buildroot}%{_sysconfdir}/xdg/autostart/conduit-clipboard.desktop
 install -D -m0644 guest/agent/70-conduit-clipboard.rules %{buildroot}%{_udevrulesdir}/70-conduit-clipboard.rules
+%{_bindir}/conduit-ctl-agent
+%{_userunitdir}/conduit-ctl.service
+%config(noreplace) %{_sysconfdir}/xdg/autostart/conduit-ctl.desktop
+%{_udevrulesdir}/70-conduit-ctl.rules
+install -D -m0755 guest/agent/conduit-ctl-agent %{buildroot}%{_bindir}/conduit-ctl-agent
+install -D -m0644 guest/agent/conduit-ctl.service %{buildroot}%{_userunitdir}/conduit-ctl.service
+install -D -m0644 guest/agent/conduit-ctl.desktop %{buildroot}%{_sysconfdir}/xdg/autostart/conduit-ctl.desktop
+install -D -m0644 guest/agent/70-conduit-ctl.rules %{buildroot}%{_udevrulesdir}/70-conduit-ctl.rules
 install -D -m0644 guest/power/50-conduit-powerkey.conf %{buildroot}/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf
 install -D -m0644 guest/agent/README.md %{buildroot}%{_docdir}/%{name}/README.clipboard.md
+install -D -m0644 guest/agent/README-ctl.md %{buildroot}%{_docdir}/%{name}/README.ctl.md
 install -D -m0644 guest/system/modules-load.conf %{buildroot}%{_modulesloaddir}/conduit-gpu.conf
 install -D -m0644 guest/system/modprobe.conf %{buildroot}%{_modprobedir}/conduit-gpu.conf
 install -D -m0644 guest/system/60-conduit-userns.conf %{buildroot}%{_sysconfdir}/sysctl.d/60-conduit-userns.conf
@@ -52,7 +62,8 @@ install -D -m0755 guest/system/conduit-guest-setup %{buildroot}%{_prefix}/lib/co
 %{_prefix}/lib/conduit-guest/setup || :
 udevadm control --reload-rules 2>/dev/null || :
 udevadm trigger --subsystem-match=misc --sysname-match=conduit-clipboard 2>/dev/null || :
-systemctl --global enable conduit-clipboard.service 2>/dev/null || :
+udevadm trigger --subsystem-match=virtio-ports 2>/dev/null || :
+systemctl --global enable conduit-clipboard.service conduit-ctl.service 2>/dev/null || :
 dkms add -m %{name} -v %{version} -q 2>/dev/null || :
 for k in /lib/modules/*/build; do
     kver=$(basename "$(dirname "$k")")
@@ -62,7 +73,7 @@ echo "conduit-guest: reboot the VM to load the guest driver (conduit_gpu)."
 
 %preun
 if [ "$1" = 0 ]; then
-    systemctl --global disable conduit-clipboard.service 2>/dev/null || :
+    systemctl --global disable conduit-clipboard.service conduit-ctl.service 2>/dev/null || :
 fi
 dkms remove -m %{name} -v %{version} --all -q 2>/dev/null || :
 
@@ -78,6 +89,7 @@ dkms remove -m %{name} -v %{version} --all -q 2>/dev/null || :
 %config(noreplace) %{_sysconfdir}/sysctl.d/60-conduit-userns.conf
 %{_prefix}/lib/conduit-guest
 %doc %{_docdir}/%{name}/README.clipboard.md
+%doc %{_docdir}/%{name}/README.ctl.md
 
 %changelog
 * Sat Oct 03 2026 Ole Algoritme <olealgoritme@gmail.com> - 0.1.0-1

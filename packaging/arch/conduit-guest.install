@@ -1,6 +1,9 @@
 # pacman install script for the `conduit-guest-dkms` package.
 post_install() {
   /usr/lib/conduit-guest/setup || true
+  # The control channel's port permissions (70-conduit-ctl.rules) for a port that is already there.
+  udevadm control --reload-rules 2>/dev/null || true
+  udevadm trigger --subsystem-match=virtio-ports 2>/dev/null || true
   echo "conduit-guest: reboot the VM to load the guest driver (conduit_gpu)."
 }
 post_upgrade() {

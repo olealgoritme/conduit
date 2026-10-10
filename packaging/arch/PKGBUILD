@@ -82,6 +82,11 @@ package_conduit-guest-dkms() {
   install -Dm0644 guest/agent/conduit-clipboard.service "$pkgdir/usr/lib/systemd/user/conduit-clipboard.service"
   install -Dm0644 guest/agent/conduit-clipboard.desktop "$pkgdir/etc/xdg/autostart/conduit-clipboard.desktop"
   install -Dm0644 guest/agent/70-conduit-clipboard.rules "$pkgdir/usr/lib/udev/rules.d/70-conduit-clipboard.rules"
+  # The control agent, installed the same way.
+  install -Dm0755 guest/agent/conduit-ctl-agent "$pkgdir/usr/bin/conduit-ctl-agent"
+  install -Dm0644 guest/agent/conduit-ctl.service "$pkgdir/usr/lib/systemd/user/conduit-ctl.service"
+  install -Dm0644 guest/agent/conduit-ctl.desktop "$pkgdir/etc/xdg/autostart/conduit-ctl.desktop"
+  install -Dm0644 guest/agent/70-conduit-ctl.rules "$pkgdir/usr/lib/udev/rules.d/70-conduit-ctl.rules"
   install -Dm0644 guest/power/50-conduit-powerkey.conf "$pkgdir/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf"
   install -Dm0644 guest/system/modules-load.conf "$pkgdir/usr/lib/modules-load.d/conduit-gpu.conf"
   install -Dm0644 guest/system/modprobe.conf "$pkgdir/usr/lib/modprobe.d/conduit-gpu.conf"

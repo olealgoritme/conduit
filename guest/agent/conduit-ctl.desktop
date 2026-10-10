@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Conduit control
+Comment=Let the Conduit host run programs and copy files in this session
+Exec=/usr/bin/conduit-ctl-agent
+TryExec=/usr/bin/conduit-ctl-agent
+NoDisplay=true
+Terminal=false
+X-GNOME-Autostart-Phase=Applications
+X-GNOME-AutoRestart=true
+X-KDE-autostart-phase=2

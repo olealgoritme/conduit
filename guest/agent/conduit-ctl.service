@@ -1,0 +1,24 @@
+# Conduit control agent: lets the host run programs, list apps and copy files
+# in this desktop session, through the virtio-serial port org.conduit.ctl.0.
+# Installed by conduit-guest.
+#
+# Enabled for every user by the package (`systemctl --global enable`). It runs
+# when the session starts graphical-session.target (GNOME, KDE, and wlroots
+# compositors started through uwsm or a systemd session). Desktops that do not
+# (XFCE, plain sway/labwc) start it from the XDG autostart entry instead; the
+# agent is single-instance per user, so having both is harmless.
+[Unit]
+Description=Conduit host control (run programs, list apps, copy files)
+Documentation=file:///usr/share/doc/conduit-guest/README.ctl.md
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExists=/dev/virtio-ports/org.conduit.ctl.0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/conduit-ctl-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

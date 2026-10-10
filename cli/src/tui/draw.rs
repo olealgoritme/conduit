@@ -133,6 +133,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Dash => dashboard(f, app, body),
         Tab::Logs => logs(f, app, body),
         Tab::Doctor => doctor(f, app, body),
+        Tab::Apps => apps_tab(f, app, body),
     }
     footer(f, app, foot);
     if let Some(m) = &app.modal {
@@ -249,6 +250,7 @@ fn tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         (Tab::Dash, "Dashboard", "1"),
         (Tab::Logs, "Logs", "2"),
         (Tab::Doctor, "Doctor", "3"),
+        (Tab::Apps, "Apps", "4"),
     ] {
         let on = app.tab == t;
         let text = format!(" {key} {label} ");
@@ -956,7 +958,183 @@ fn doctor(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines).scroll((app.doctor_scroll, 0)), inner);
 }
 
+/// The Apps tab: the selected VM's installed apps.
+fn apps_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    use super::apps::{filtered, unavailable};
+    let Some(vm) = app.snap.vms.get(app.sel).cloned() else {
+        let block = panel("Apps", CYAN);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(Paragraph::new("  No VM selected.").fg(DIM), inner);
+        return;
+    };
+    let spin = SPIN[(app.tick as usize) % SPIN.len()];
+    let title = format!("Apps · {}", vm.name);
+    let block = panel(&title, CYAN);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let note = |f: &mut Frame, text: &str, color: Color| {
+        let mut lines = Vec::new();
+        for (i, l) in text.lines().enumerate() {
+            lines.push(Line::styled(
+                format!("  {l}"),
+                if i == 0 {
+                    Style::new().fg(color).bold()
+                } else {
+                    Style::new().fg(DIM)
+                },
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
+    };
+    if let Some(why) = unavailable(&vm) {
+        note(f, &why, AMBER);
+        return;
+    }
+    let entry = app.apps.vms.get(&vm.name);
+    let (loading, error, loaded, count) = entry.map_or((true, None, None, 0), |e| {
+        (e.loading, e.error.clone(), e.loaded, e.list.len())
+    });
+    if count == 0 {
+        match (&error, loading) {
+            (Some(e), _) => {
+                let retry = if loading {
+                    format!("{spin} trying again…")
+                } else {
+                    "trying again every few seconds · r to retry now".to_string()
+                };
+                note(f, &format!("{e}\n{retry}"), RED);
+            }
+            (None, true) => note(
+                f,
+                &format!("{spin} loading the app list from {}…", vm.name),
+                PINK,
+            ),
+            (None, false) if loaded.is_some() => {
+                note(f, &format!("{} reports no apps", vm.name), AMBER)
+            }
+            _ => note(f, &format!("{spin} loading…"), PINK),
+        }
+        return;
+    }
+    let stale = loading || error.is_some();
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let list = &app.apps.vms[&vm.name].list;
+    let shown = filtered(list, &app.apps.filter);
+    let mut h = vec![Span::styled(
+        format!(" {} of {} apps ", shown.len(), list.len()),
+        Style::new().fg(DIM),
+    )];
+    if app.apps.typing || !app.apps.filter.is_empty() {
+        h.push(Span::styled(
+            format!(
+                " /{}{} ",
+                app.apps.filter,
+                if app.apps.typing { "▏" } else { "" }
+            ),
+            Style::new().fg(BG).bg(AMBER).bold(),
+        ));
+    }
+    if loading {
+        h.push(Span::styled(
+            format!("  {spin} refreshing"),
+            Style::new().fg(PINK),
+        ));
+    } else if let Some(e) = &error {
+        let first = e.lines().next().unwrap_or("");
+        h.push(Span::styled(
+            format!("  ! {first} (showing the last list)"),
+            Style::new().fg(RED),
+        ));
+    } else if let Some(t) = loaded {
+        h.push(Span::styled(
+            format!("  updated {} ago", dur(t.elapsed())),
+            Style::new().fg(EDGE),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(h)), head);
+    let rows = body.height as usize;
+    let sel = app.apps.sel.min(shown.len().saturating_sub(1));
+    app.apps.sel = sel;
+    let start = sel
+        .saturating_sub(rows / 2)
+        .min(shown.len().saturating_sub(rows));
+    let w = body.width as usize;
+    let src_w = 11usize;
+    let name_w = w.saturating_sub(src_w + 4).max(8);
+    let lines: Vec<Line> = shown
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(i, a)| {
+            let name: String = a.name.chars().take(name_w).collect();
+            let src = crate::ctl::source_label(&a.source);
+            let (fg, src_fg) = if stale {
+                (DIM, EDGE)
+            } else {
+                (FG, source_color(&a.source))
+            };
+            let mut st = Style::new().fg(fg);
+            let mut sst = Style::new().fg(src_fg);
+            if i == sel {
+                st = st.bg(Color::Rgb(34, 44, 60)).bold();
+                sst = sst.bg(Color::Rgb(34, 44, 60));
+            }
+            Line::from(vec![
+                Span::styled(if i == sel { " ▸ " } else { "   " }, st.fg(GREEN)),
+                Span::styled(format!("{name:<name_w$}"), st),
+                Span::styled(format!(" {src:<src_w$}"), sst),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), body);
+}
+
+fn source_color(s: &str) -> Color {
+    match s {
+        "steam" => BLUE,
+        "startmenu" => CYAN,
+        "flatpak" => VIOLET,
+        "snap" => PINK,
+        _ => GREEN,
+    }
+}
+
 fn footer(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.tab == Tab::Apps {
+        let items = [
+            ("⏎", "run"),
+            ("a", "add launcher"),
+            ("/", "filter"),
+            ("r", "refresh"),
+            ("←→", "VM"),
+            ("Tab", "tabs"),
+            ("?", "help"),
+            ("q", "back"),
+        ];
+        let mut spans = Vec::new();
+        let mut used = 0u16;
+        for (k, label) in items {
+            let (ks, ls) = (format!(" {k} "), format!(" {label} "));
+            let w = (ks.chars().count() + ls.chars().count() + 1) as u16;
+            if used + w > area.width {
+                break;
+            }
+            used += w;
+            spans.push(Span::styled(ks, Style::new().fg(BG).bg(CYAN).bold()));
+            spans.push(Span::styled(
+                ls,
+                Style::new().fg(FG).bg(Color::Rgb(34, 38, 50)),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let items: &[(&str, &str, Act)] = &[
         ("⏎", "view", Act::View),
         ("s", "start", Act::Up),
@@ -1179,7 +1357,7 @@ fn modal(f: &mut Frame, app: &App, m: &Modal, area: Rect) {
             f.render_widget(Paragraph::new(lines).block(block), r);
         }
         Modal::Help => {
-            let r = centered(area, 64, 23);
+            let r = centered(area, 64, 25);
             f.render_widget(Clear, r);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -1210,6 +1388,7 @@ fn modal(f: &mut Frame, app: &App, m: &Modal, area: Rect) {
                 k("F", "shared folders (a add, d remove, o read-only)"),
                 k("l  2", "logs of the selected VM"),
                 k("D  3", "doctor: check this computer"),
+                k("4", "apps in the VM (⏎ run, a add a launcher, / filter)"),
                 k("Tab 1", "switch tabs / back to the dashboard"),
                 k("q Esc", "back / quit (VMs keep running)"),
                 Line::raw(""),

@@ -1,6 +1,6 @@
 //! Installing Conduit's guest side into a VM Conduit did not build
 //! (`conduit attach`): the conduit-guest package (driver via DKMS, clipboard
-//! agent) and the NVIDIA share setup that `conduit create` puts on its disks.
+//! agent, control agent) and the NVIDIA share setup that `conduit create` puts on its disks.
 //!
 //! Delivered through the QEMU guest agent when the VM runs one
 //! (`virsh qemu-agent-command`: file upload, then guest-exec), otherwise as a
@@ -167,6 +167,14 @@ fi
 run systemctl enable conduit-guest.service conduit-shares.service
 if [ "$DRY" = 0 ]; then
     dkms status conduit-guest || true
+fi
+# The control agent for users already logged in (the package enabled its user
+# unit for the next login). Needs the virtio-serial port, so only a VM that has
+# one starts it; a failure here changes nothing.
+if [ "$DRY" = 0 ] && [ -d /run/systemd/system ] && command -v loginctl >/dev/null 2>&1; then
+    for u in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}'); do
+        systemctl --user -M "$u@" start conduit-ctl.service >/dev/null 2>&1 || true
+    done
 fi
 say "guest side installed. Restart the VM to use Conduit's GPU."
 "##;
@@ -482,5 +490,56 @@ mod tests {
         for (f, _) in super::FILES {
             assert!(s.contains(f), "setup.sh installs {f}");
         }
+    }
+
+    /// The control agent ships in every conduit-guest package (the nfpm .deb
+    /// and Arch package, the .rpm, the AUR PKGBUILD), with the same unit,
+    /// autostart entry and udev rule as the clipboard agent, and is enabled
+    /// and disabled with it.
+    #[test]
+    fn control_agent_is_packaged_like_the_clipboard_agent() {
+        let nfpm = include_str!("../../packaging/nfpm/conduit-guest.yaml");
+        let rpm = include_str!("../../packaging/rpm/conduit-guest.spec");
+        let pkgbuild = include_str!("../../packaging/arch/PKGBUILD");
+        let postinst = include_str!("../../packaging/deb/conduit-guest/postinst");
+        let prerm = include_str!("../../packaging/deb/conduit-guest/prerm");
+        for (what, text) in [("nfpm", nfpm), ("rpm", rpm), ("PKGBUILD", pkgbuild)] {
+            for f in [
+                "conduit-ctl-agent",
+                "conduit-ctl.service",
+                "conduit-ctl.desktop",
+                "70-conduit-ctl.rules",
+            ] {
+                assert!(text.contains(f), "{what} installs {f}");
+                let clip = f
+                    .replace("ctl-agent", "clipboard-agent")
+                    .replace("ctl", "clipboard");
+                assert!(text.contains(&clip), "{what} still installs {clip}");
+            }
+        }
+        assert!(nfpm.contains("/usr/lib/systemd/user/conduit-ctl.service"));
+        assert!(nfpm.contains("/etc/xdg/autostart/conduit-ctl.desktop"));
+        assert!(nfpm.contains("/usr/lib/udev/rules.d/70-conduit-ctl.rules"));
+        assert!(postinst.contains("enable conduit-clipboard.service conduit-ctl.service"));
+        assert!(postinst.contains("--subsystem-match=virtio-ports"));
+        assert!(prerm.contains("disable conduit-clipboard.service conduit-ctl.service"));
+        assert!(rpm.contains("enable conduit-clipboard.service conduit-ctl.service"));
+        assert!(rpm.contains("disable conduit-clipboard.service conduit-ctl.service"));
+    }
+
+    #[test]
+    fn control_agent_files_match_the_port() {
+        let rule = include_str!("../../guest/agent/70-conduit-ctl.rules");
+        assert!(rule.contains(r#"SUBSYSTEM=="virtio-ports""#));
+        assert!(rule.contains(r#"ATTR{name}=="org.conduit.ctl.0""#));
+        assert!(rule.contains(r#"TAG+="uaccess""#));
+        let unit = include_str!("../../guest/agent/conduit-ctl.service");
+        assert!(unit.contains("ExecStart=/usr/bin/conduit-ctl-agent"));
+        assert!(unit.contains("WantedBy=graphical-session.target"));
+        let desk = include_str!("../../guest/agent/conduit-ctl.desktop");
+        assert!(desk.contains("Exec=/usr/bin/conduit-ctl-agent"));
+        let agent = include_str!("../../guest/agent/conduit-ctl-agent");
+        assert!(agent.contains(r#"CHANNEL = "org.conduit.ctl.0""#));
+        assert!(super::SETUP.contains("conduit-ctl.service"));
     }
 }

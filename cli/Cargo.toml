@@ -29,6 +29,8 @@ abi = { path = "../host/backend/gen" }
 conduit-trace = { path = "../host/backend/trace" }
 # The GPU readings line sent to a guest over the stats channel.
 conduit-stats = { path = "../host/stats" }
+# The control channel protocol (`conduit run`, `apps`, `cp`).
+conduit-ctl = { path = "../host/ctl" }
 # The frame stage table and formats, for `conduit trace NAME stages`
 # (docs/TRACING.md "Frame stage timing"); no renderer feature, so only libc.
 conduit-venus = { path = "../host/venus" }

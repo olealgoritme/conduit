@@ -1,0 +1,2143 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""conduit-ctl-agent: the Linux guest end of Conduit's control channel.
+
+The host talks to the guest over the virtio-serial port `org.conduit.ctl.0`
+(guest side: /dev/virtio-ports/org.conduit.ctl.0): one JSON object per line
+in, one per line out. The protocol is host/ctl/src/lib.rs; the operations are
+ping, run, stop, apps, icon, put, get and ls.
+
+The agent runs as a systemd user service (or XDG autostart entry) in the
+user's desktop session, so everything it does is done as that user. Python 3
+standard library only. Never dies on a bad request: every request is answered,
+with `{"id":N,"ok":false,"error":"..."}` when it fails.
+"""
+
+import base64
+import binascii
+import errno
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import pwd
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "1.0"
+PROTO = 1
+CHANNEL = "org.conduit.ctl.0"
+PORT_PATH = "/dev/virtio-ports/" + CHANNEL
+
+MAX_LINE = 4 << 20
+CHUNK = 256 << 10
+MAX_FILE = 8 << 30
+MAX_ICON = 512 << 10
+LS_CAP = 5000
+ICON_PX = 64
+STOP_GRACE = 3.0
+
+_quiet = False
+USE_SYSTEMD_RUN = True
+
+
+def log(msg):
+    if not _quiet:
+        print("conduit-ctl-agent: " + msg, file=sys.stderr, flush=True)
+
+
+class OpError(Exception):
+    """A request that failed for a reason worth telling the host."""
+
+
+# ------------------------------------------------------------------ helpers
+
+def txt(s):
+    """A str safe to put in JSON: undecodable file name bytes become U+FFFD."""
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def run_text(argv, env=None, timeout=3.0, stdin=None):
+    """stdout of a command as text, or None when it fails in any way."""
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL if stdin is None else None,
+                           input=stdin, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout, env=env)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode("utf-8", "replace")
+
+
+def run_bytes(argv, data=None, timeout=10.0, limit=8 << 20):
+    try:
+        r = subprocess.run(argv, input=data,
+                           stdin=subprocess.DEVNULL if data is None else None,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=timeout)
+    except Exception:
+        return None
+    if r.returncode != 0 or not r.stdout or len(r.stdout) > limit:
+        return None
+    return r.stdout
+
+
+def home_dir():
+    h = os.environ.get("HOME")
+    if h and os.path.isdir(h):
+        return h
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return h or "/"
+
+
+def truthy(v):
+    return str(v).strip().lower() == "true"
+
+
+# ------------------------------------------------------------ line framing
+
+class LineReader:
+    """Splits a byte stream into lines. A line longer than max_line is dropped
+    (reported once as ("oversize", head)) and the reader resyncs at the next
+    newline. Lines come out as ("line", bytes)."""
+
+    def __init__(self, max_line=MAX_LINE):
+        self.max_line = max_line
+        self.buf = bytearray()
+        self.skipping = False
+
+    def push(self, data):
+        out = []
+        while data:
+            i = data.find(b"\n")
+            if i < 0:
+                chunk, data, end = data, b"", False
+            else:
+                chunk, data, end = data[:i], data[i + 1:], True
+            if not self.skipping:
+                self.buf += chunk
+                if len(self.buf) > self.max_line:
+                    out.append(("oversize", bytes(self.buf[:512])))
+                    self.buf = bytearray()
+                    self.skipping = True
+            if end:
+                if not self.skipping and self.buf:
+                    out.append(("line", bytes(self.buf)))
+                self.buf = bytearray()
+                self.skipping = False
+        return out
+
+    def reset(self):
+        self.buf = bytearray()
+        self.skipping = False
+
+
+# ------------------------------------------------------ session discovery
+
+IMPORT_KEYS = (
+    "WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_CURRENT_DESKTOP", "XAUTHORITY", "HYPRLAND_INSTANCE_SIGNATURE",
+    "SWAYSOCK", "XDG_SESSION_TYPE", "XDG_SESSION_ID", "XDG_SESSION_DESKTOP",
+    "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "XDG_SEAT", "I3SOCK", "NIRI_SOCKET",
+    "LANG", "LC_ALL", "LC_MESSAGES", "LANGUAGE", "PATH",
+)
+
+COMPOSITORS = (
+    "gnome-shell", "kwin_wayland", "kwin_x11", "plasmashell", "Hyprland",
+    "sway", "labwc", "river", "niri", "wayfire", "mutter", "cosmic-comp",
+    "weston", "xfce4-session", "xfwm4", "Xorg", "Xwayland", "openbox", "i3",
+    "gnome-session-b", "startplasma-wayl", "startplasma-x11", "mate-session",
+    "cinnamon-sessio", "uwsm", "Hyprland-wrapp", "dwl", "hikari", "bspwm",
+)
+
+
+def read_environ(path):
+    """A /proc/PID/environ as a dict; {} when unreadable."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(1 << 20)
+    except OSError:
+        return {}
+    env = {}
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            k, _, v = item.partition(b"=")
+            env[k.decode("utf-8", "replace")] = v.decode("utf-8", "surrogateescape")
+    return env
+
+
+def parse_show_environment(text):
+    """`systemctl --user show-environment`: KEY=value lines ($'..' quoting for odd values)."""
+    env = {}
+    for line in (text or "").splitlines():
+        k, sep, v = line.partition("=")
+        if not sep or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+            continue
+        if v.startswith("$'") and v.endswith("'"):
+            try:
+                v = v[2:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
+            except Exception:
+                continue
+        env[k] = v
+    return env
+
+
+def parse_props(text):
+    """`loginctl show-session -p ..` output: Key=Value lines."""
+    props = {}
+    for line in (text or "").splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            props[k.strip()] = v.strip()
+    return props
+
+
+def children_of(pid, proc="/proc"):
+    """Direct children of a process (needs a kernel with task/N/children, else a scan)."""
+    kids = []
+    try:
+        for tid in os.listdir("%s/%s/task" % (proc, pid)):
+            try:
+                with open("%s/%s/task/%s/children" % (proc, pid, tid)) as f:
+                    kids += [int(x) for x in f.read().split()]
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    if kids:
+        return kids
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return []
+    for n in names:
+        if not n.isdigit():
+            continue
+        try:
+            with open("%s/%s/stat" % (proc, n)) as f:
+                st = f.read()
+            rest = st[st.rindex(")") + 2:].split()
+            if int(rest[1]) == int(pid):
+                kids.append(int(n))
+        except (OSError, ValueError, IndexError):
+            continue
+    return kids
+
+
+def descendants(pid, proc="/proc", limit=64, depth=4):
+    out, frontier = [], [int(pid)]
+    for _ in range(depth):
+        nxt = []
+        for p in frontier:
+            for k in children_of(p, proc):
+                if k not in out and len(out) < limit:
+                    out.append(k)
+                    nxt.append(k)
+        frontier = nxt
+    return out
+
+
+def wayland_valid(name, runtime_dir):
+    if not name:
+        return False
+    path = name if os.path.isabs(name) else os.path.join(runtime_dir, name)
+    return os.path.exists(path)
+
+
+def display_valid(disp, x11_dir):
+    if not disp:
+        return False
+    m = re.match(r"^(?P<host>[^:]*):(?P<n>\d+)", disp)
+    if not m:
+        return False
+    if m.group("host") not in ("", "unix"):
+        return True
+    return os.path.exists(os.path.join(x11_dir, "X" + m.group("n")))
+
+
+def _merge(env, src, runtime_dir, x11_dir):
+    """Copy the keys env still lacks from src; a stale socket name is not taken."""
+    for k in IMPORT_KEYS:
+        v = src.get(k)
+        if not v or env.get(k):
+            continue
+        if k == "WAYLAND_DISPLAY" and not wayland_valid(v, runtime_dir):
+            continue
+        if k == "DISPLAY" and not display_valid(v, x11_dir):
+            continue
+        env[k] = v
+
+
+def scan_sockets(runtime_dir, x11_dir):
+    """What sockets say about the display servers: (wayland name or None, DISPLAY or None)."""
+    wl = disp = None
+    try:
+        names = sorted(n for n in os.listdir(runtime_dir)
+                       if re.match(r"^wayland-\d+$", n))
+        if names:
+            wl = names[0]
+    except OSError:
+        pass
+    try:
+        nums = sorted(int(n[1:]) for n in os.listdir(x11_dir)
+                      if re.match(r"^X\d+$", n))
+        if nums:
+            disp = ":%d" % nums[0]
+    except OSError:
+        pass
+    return wl, disp
+
+
+def discover_session(uid, user, environ=None, proc="/proc", runtime_root="/run/user",
+                     x11_dir="/tmp/.X11-unix", run=run_text):
+    """Find the user's graphical session. Returns a dict:
+    env (session variables), found (a display server is there), user_manager
+    (`systemctl --user` answers), source (what found it). `run(argv, env=)` runs
+    systemctl/loginctl and returns text or None; the file system roots are
+    parameters so tests can use fixtures."""
+    environ = os.environ if environ is None else environ
+    rt = environ.get("XDG_RUNTIME_DIR") or "%s/%s" % (runtime_root, uid)
+    env = {}
+    for k in IMPORT_KEYS:
+        v = environ.get(k)
+        if v:
+            env[k] = v
+    if env.get("WAYLAND_DISPLAY") and not wayland_valid(env["WAYLAND_DISPLAY"], rt):
+        del env["WAYLAND_DISPLAY"]
+    if env.get("DISPLAY") and not display_valid(env["DISPLAY"], x11_dir):
+        del env["DISPLAY"]
+    sources = []
+
+    def graphical():
+        return bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+
+    if graphical():
+        sources.append("env")
+
+    # The user's systemd manager: the compositor usually imports its environment there.
+    sd_env = {"XDG_RUNTIME_DIR": rt}
+    bus = environ.get("DBUS_SESSION_BUS_ADDRESS")
+    sd_env["DBUS_SESSION_BUS_ADDRESS"] = bus or "unix:path=%s/bus" % rt
+    sd_env["PATH"] = environ.get("PATH", "/usr/bin:/bin")
+    out = run(["systemctl", "--user", "show-environment"], env=sd_env)
+    user_manager = out is not None
+    if out:
+        had = graphical()
+        _merge(env, parse_show_environment(out), rt, x11_dir)
+        if graphical() and not had:
+            sources.append("systemd")
+
+    # logind: the user's sessions, their leader and the leader's children.
+    if not graphical():
+        listing = run(["loginctl", "list-sessions", "--no-legend"],
+                      env=sd_env) or ""
+        cands = []
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) < 2 or parts[1] != str(uid):
+                continue
+            props = parse_props(run(
+                ["loginctl", "show-session", parts[0], "-p", "Type", "-p", "Leader",
+                 "-p", "Display", "-p", "State", "-p", "Active", "-p", "Class",
+                 "-p", "Name"], env=sd_env))
+            if props.get("Class") not in ("user", None, ""):
+                continue
+            if props.get("Type") not in ("wayland", "x11", "mir"):
+                continue
+            if props.get("Name") and props["Name"] != user:
+                continue
+            rank = (0 if props.get("Active") == "yes" else 1,
+                    0 if props.get("State") == "active" else 1)
+            cands.append((rank, parts[0], props))
+        cands.sort(key=lambda c: c[0])
+        for _, sid, props in cands:
+            pids = []
+            try:
+                leader = int(props.get("Leader", "0"))
+            except ValueError:
+                leader = 0
+            if leader > 1:
+                pids = [leader] + descendants(leader, proc)
+            for p in pids:
+                _merge(env, read_environ("%s/%s/environ" % (proc, p)), rt, x11_dir)
+            d = props.get("Display")
+            if d and not env.get("DISPLAY") and display_valid(d, x11_dir):
+                env["DISPLAY"] = d
+            if props.get("Type") in ("wayland", "x11") and not env.get("XDG_SESSION_TYPE"):
+                env["XDG_SESSION_TYPE"] = props["Type"]
+            if graphical():
+                sources.append("loginctl")
+                break
+
+    # A process of the user that looks like a compositor or desktop shell.
+    if not graphical():
+        try:
+            pids = sorted(int(n) for n in os.listdir(proc) if n.isdigit())
+        except OSError:
+            pids = []
+        mine = []
+        for p in pids:
+            try:
+                if os.stat("%s/%d" % (proc, p)).st_uid != uid:
+                    continue
+            except OSError:
+                continue
+            mine.append(p)
+        known, others = [], []
+        for p in mine:
+            try:
+                with open("%s/%d/comm" % (proc, p)) as f:
+                    comm = f.read().strip()
+            except OSError:
+                continue
+            (known if comm in COMPOSITORS else others).append(p)
+        for p in known + others[:300]:
+            _merge(env, read_environ("%s/%d/environ" % (proc, p)), rt, x11_dir)
+            if graphical():
+                sources.append("proc")
+                break
+
+    # Sockets in the runtime dir and /tmp/.X11-unix.
+    if not graphical():
+        wl, disp = scan_sockets(rt, x11_dir)
+        if wl:
+            env["WAYLAND_DISPLAY"] = wl
+        if disp:
+            env["DISPLAY"] = disp
+        if graphical():
+            sources.append("sockets")
+
+    env["XDG_RUNTIME_DIR"] = rt
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=%s/bus" % rt
+    if env.get("XDG_SESSION_TYPE") is None:
+        if env.get("WAYLAND_DISPLAY"):
+            env["XDG_SESSION_TYPE"] = "wayland"
+        elif env.get("DISPLAY"):
+            env["XDG_SESSION_TYPE"] = "x11"
+    return {"env": env, "found": graphical(), "user_manager": user_manager,
+            "source": ",".join(sources)}
+
+
+class SessionCache:
+    """discover_session with a short TTL; invalidate() after a failure."""
+
+    def __init__(self, discover, ttl_found=30.0, ttl_missing=2.0):
+        self.discover = discover
+        self.ttl_found = ttl_found
+        self.ttl_missing = ttl_missing
+        self.lock = threading.Lock()
+        self.value = None
+        self.at = 0.0
+
+    def get(self, force=False):
+        with self.lock:
+            ttl = self.ttl_found if self.value and self.value["found"] else self.ttl_missing
+            if force or self.value is None or time.monotonic() - self.at > ttl:
+                try:
+                    self.value = self.discover()
+                except Exception:
+                    log("session discovery failed:\n" + traceback.format_exc())
+                    if self.value is None:
+                        self.value = {"env": {}, "found": False,
+                                      "user_manager": False, "source": ""}
+                self.at = time.monotonic()
+            return self.value
+
+    def invalidate(self):
+        with self.lock:
+            self.at = 0.0
+            self.value = None
+
+
+# ------------------------------------------------------ .desktop entries
+
+def unescape_value(s):
+    out, i = [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            d = s[i + 1]
+            m = {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}.get(d)
+            if m is not None:
+                out.append(m)
+                i += 2
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def parse_desktop(text):
+    """The [Desktop Entry] group of a .desktop file as {key: raw value}."""
+    entry, inside = {}, False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            if inside:
+                break
+            inside = line == "[Desktop Entry]"
+            continue
+        if inside and "=" in line:
+            k, _, v = line.partition("=")
+            entry[k.strip()] = v.strip()
+    return entry
+
+
+def read_desktop(path):
+    try:
+        with open(path, "rb") as f:
+            return parse_desktop(f.read(1 << 20).decode("utf-8", "replace"))
+    except OSError:
+        return None
+
+
+def locale_candidates(env):
+    """The locale names to try for Name[xx], most specific first."""
+    langs = []
+    for v in (env.get("LANGUAGE", "").split(":") if env.get("LC_ALL") is None else []):
+        if v:
+            langs.append(v)
+    for k in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        if env.get(k):
+            langs.append(env[k])
+            break
+    out = []
+    for l in langs:
+        l, _, mod = l.partition("@")
+        l = l.split(".")[0]
+        mod = "@" + mod if mod else ""
+        l += mod
+        if l in ("C", "POSIX", ""):
+            continue
+        l, _, mod = l.partition("@")
+        lang, _, country = l.partition("_")
+        for c in ((lang + "_" + country + "@" + mod) if country and mod else None,
+                  (lang + "_" + country) if country else None,
+                  (lang + "@" + mod) if mod else None, lang):
+            if c and c not in out:
+                out.append(c)
+    return out
+
+
+def localized(entry, key, locales):
+    for l in locales:
+        v = entry.get("%s[%s]" % (key, l))
+        if v:
+            return unescape_value(v)
+    v = entry.get(key)
+    return unescape_value(v) if v else ""
+
+
+def split_exec(s):
+    """An Exec value split into arguments per the Desktop Entry spec (quotes,
+    backslash escapes inside quotes); quotes inside a word are accepted too."""
+    s = unescape_value(s)
+    args, cur, in_arg, q, i = [], [], False, False, 0
+    while i < len(s):
+        c = s[i]
+        if q:
+            if c == "\\" and i + 1 < len(s) and s[i + 1] in '"`$\\':
+                cur.append(s[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                q = False
+            else:
+                cur.append(c)
+        elif c == '"':
+            q, in_arg = True, True
+        elif c in " \t\n":
+            if in_arg:
+                args.append("".join(cur))
+                cur, in_arg = [], False
+        else:
+            cur.append(c)
+            in_arg = True
+        i += 1
+    if in_arg:
+        args.append("".join(cur))
+    return args
+
+
+FILE_CODES = "fFuU"
+
+
+def exec_takes_files(args):
+    return any(re.search(r"%[fFuU]", a.replace("%%", "")) for a in args)
+
+
+def expand_exec(args, name="", icon="", path="", files=()):
+    """Field codes: %f %u (first file), %F %U (all files), %i (--icon X), %c
+    (Name), %k (the .desktop path), %% ; deprecated %d %D %n %N %v %m vanish."""
+    files = list(files)
+    out = []
+    for a in args:
+        if a in ("%F", "%U"):
+            out.extend(files)
+            continue
+        if a == "%i":
+            if icon:
+                out.extend(["--icon", icon])
+            continue
+        res, i, coded = [], 0, False
+        while i < len(a):
+            c = a[i]
+            if c == "%" and i + 1 < len(a):
+                d = a[i + 1]
+                i += 2
+                if d == "%":
+                    res.append("%")
+                    continue
+                coded = True
+                if d in "fu":
+                    res.append(files[0] if files else "")
+                elif d in "FU":
+                    res.append(" ".join(files))
+                elif d == "c":
+                    res.append(name)
+                elif d == "k":
+                    res.append(path)
+            else:
+                res.append(c)
+                i += 1
+        s = "".join(res)
+        if s or not coded:
+            out.append(s)
+    return out
+
+
+TERMINALS = (
+    ("xdg-terminal-exec", []), ("foot", []), ("kitty", []),
+    ("alacritty", ["-e"]), ("gnome-terminal", ["--"]), ("ptyxis", ["--"]),
+    ("konsole", ["-e"]), ("wezterm", ["start", "--"]), ("tilix", ["-e"]),
+    ("xfce4-terminal", ["-x"]), ("xterm", ["-e"]), ("x-terminal-emulator", ["-e"]),
+)
+
+
+def terminal_wrap(argv, path_env):
+    for name, pre in TERMINALS:
+        exe = shutil.which(name, path=path_env)
+        if exe:
+            return [exe] + pre + argv
+    return None
+
+
+def desktop_id(rel):
+    return rel.replace("/", "-")
+
+
+# ------------------------------------------------------------------ steam
+
+def parse_vdf(text):
+    """Valve's KeyValues text format as nested dicts (quoted strings with
+    escapes, braces, // comments)."""
+    toks, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == "/" and text[i:i + 2] == "//":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == '"':
+            i += 1
+            buf = []
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
+                    d = text[i + 1]
+                    buf.append({"n": "\n", "t": "\t", "\\": "\\", '"': '"'}.get(d, "\\" + d))
+                    i += 2
+                else:
+                    buf.append(text[i])
+                    i += 1
+            i += 1
+            toks.append(("s", "".join(buf)))
+        elif c in "{}":
+            toks.append((c, c))
+            i += 1
+        else:
+            j = i
+            while j < n and text[j] not in ' \t\r\n{}"':
+                j += 1
+            toks.append(("s", text[i:j]))
+            i = j
+    pos = 0
+
+    def block():
+        nonlocal pos
+        d = {}
+        while pos < len(toks):
+            kind, val = toks[pos]
+            if kind == "}":
+                pos += 1
+                return d
+            if kind != "s":
+                pos += 1
+                continue
+            pos += 1
+            if pos < len(toks) and toks[pos][0] == "{":
+                pos += 1
+                d[val] = block()
+            elif pos < len(toks) and toks[pos][0] == "s":
+                d[val] = toks[pos][1]
+                pos += 1
+        return d
+
+    return block()
+
+
+STEAM_SKIP_IDS = {"228980"}
+STEAM_SKIP_PREFIXES = ("Steam Linux Runtime", "Proton", "Steamworks")
+
+
+def steam_roots(home):
+    cands = [os.path.join(home, ".steam/steam"),
+             os.path.join(home, ".local/share/Steam"),
+             os.path.join(home, ".steam/root"),
+             os.path.join(home, ".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+             os.path.join(home, ".var/app/com.valvesoftware.Steam/.steam/steam")]
+    out, seen = [], set()
+    for c in cands:
+        if os.path.isdir(os.path.join(c, "steamapps")) or os.path.isdir(os.path.join(c, "config")):
+            r = os.path.realpath(c)
+            if r not in seen:
+                seen.add(r)
+                out.append(c)
+    return out
+
+
+def steam_libraries(root):
+    libs = [root]
+    vdf = os.path.join(root, "steamapps/libraryfolders.vdf")
+    if not os.path.exists(vdf):
+        vdf = os.path.join(root, "config/libraryfolders.vdf")
+    try:
+        with open(vdf, "rb") as f:
+            data = parse_vdf(f.read(4 << 20).decode("utf-8", "replace"))
+    except OSError:
+        return libs
+    top = data.get("libraryfolders") or data.get("LibraryFolders") or {}
+    for k, v in top.items():
+        if not k.isdigit():
+            continue
+        p = v.get("path") if isinstance(v, dict) else v
+        if isinstance(p, str) and p and p not in libs:
+            libs.append(p)
+    return libs
+
+
+def steam_games(home):
+    """[{appid, name}] of the installed Steam games (native and Flatpak Steam)."""
+    games, seen = [], set()
+    for root in steam_roots(home):
+        for lib in steam_libraries(root):
+            for mf in sorted(glob.glob(os.path.join(glob.escape(lib), "steamapps", "appmanifest_*.acf"))):
+                try:
+                    with open(mf, "rb") as f:
+                        acf = parse_vdf(f.read(1 << 20).decode("utf-8", "replace"))
+                except OSError:
+                    continue
+                st = acf.get("AppState") or acf.get("appstate") or {}
+                appid, name = str(st.get("appid", "")), st.get("name", "")
+                if not appid.isdigit() or not name or appid in seen:
+                    continue
+                if appid in STEAM_SKIP_IDS or name.startswith(STEAM_SKIP_PREFIXES):
+                    continue
+                flags = st.get("StateFlags", "")
+                if flags.isdigit() and not int(flags) & 4:
+                    continue  # not fully installed
+                seen.add(appid)
+                games.append({"appid": appid, "name": name})
+    return games
+
+
+def steam_icon_file(home, appid):
+    """A Steam game's icon image from Steam's library cache, if it has one."""
+    for root in steam_roots(home):
+        cache = os.path.join(root, "appcache/librarycache")
+        old = os.path.join(cache, "%s_icon.jpg" % appid)
+        if os.path.isfile(old):
+            return old
+        d = os.path.join(cache, appid)
+        if os.path.isdir(d):
+            try:
+                names = sorted(os.listdir(d))
+            except OSError:
+                names = []
+            for n in names:  # the icon is the one named by its hash
+                if re.match(r"^[0-9a-f]{40}\.(jpg|png)$", n):
+                    return os.path.join(d, n)
+            for n in ("logo.png", "library_600x900.jpg", "header.jpg", "library_header.jpg"):
+                if os.path.isfile(os.path.join(d, n)):
+                    return os.path.join(d, n)
+        for n in ("%s_library_600x900.jpg" % appid, "%s_header.jpg" % appid):
+            if os.path.isfile(os.path.join(cache, n)):
+                return os.path.join(cache, n)
+    return None
+
+
+# ------------------------------------------------------------ icon themes
+
+def parse_ini(text):
+    groups, cur = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            cur = groups.setdefault(line[1:-1], {})
+        elif cur is not None and "=" in line:
+            k, _, v = line.partition("=")
+            cur[k.strip()] = v.strip()
+    return groups
+
+
+def read_ini(path):
+    try:
+        with open(path, "rb") as f:
+            return parse_ini(f.read(1 << 20).decode("utf-8", "replace"))
+    except OSError:
+        return {}
+
+
+def parse_theme_index(root):
+    """index.theme of a theme dir: (inherits, [(subdir, size, scalable)])."""
+    ini = read_ini(os.path.join(root, "index.theme"))
+    head = ini.get("Icon Theme", {})
+    inherits = [x.strip() for x in head.get("Inherits", "").split(",") if x.strip()]
+    dirs = []
+    names = [x.strip() for x in (head.get("Directories", "") + "," + head.get("ScaledDirectories", "")).split(",") if x.strip()]
+    for d in dict.fromkeys(names):
+        sec = ini.get(d, {})
+        try:
+            size = int(sec.get("Size", "0"))
+        except ValueError:
+            size = 0
+        typ = sec.get("Type", "Threshold")
+        if typ == "Scalable":
+            try:
+                size = int(sec.get("MaxSize", size) or size)
+            except ValueError:
+                pass
+        dirs.append((d, size, typ == "Scalable" or d.startswith("scalable")))
+    return inherits, dirs
+
+
+def _size_of(name):
+    m = re.match(r"^(\d+)(x\d+)?(@\d+x?)?$", name)
+    return int(m.group(1)) if m else None
+
+
+def guess_theme_dirs(root):
+    """Directories of a theme without index.theme: SIZExSIZE/context, context/SIZE, scalable."""
+    out = []
+    try:
+        top = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for d1 in top:
+        p1 = os.path.join(root, d1)
+        if not os.path.isdir(p1):
+            continue
+        s1 = _size_of(d1)
+        try:
+            subs = sorted(os.listdir(p1))
+        except OSError:
+            continue
+        if s1 is not None or d1 == "scalable":
+            for d2 in subs:
+                if os.path.isdir(os.path.join(p1, d2)):
+                    out.append(("%s/%s" % (d1, d2), s1 or 0, d1 == "scalable"))
+        else:
+            for d2 in subs:
+                s2 = _size_of(d2)
+                if s2 is not None:
+                    out.append(("%s/%s" % (d1, d2), s2, False))
+                elif d2 == "scalable":
+                    out.append(("%s/%s" % (d1, d2), 0, True))
+    return out
+
+
+def icon_theme_chain(first, bases):
+    """The theme and everything it inherits, then hicolor (always) and a
+    couple of common themes as a last resort."""
+    chain, queue = [], [first] if first else []
+    while queue:
+        t = queue.pop(0)
+        if t in chain:
+            continue
+        chain.append(t)
+        for b in bases:
+            root = os.path.join(b, t)
+            if os.path.isfile(os.path.join(root, "index.theme")):
+                queue.extend(parse_theme_index(root)[0])
+    for t in ("hicolor", "Adwaita", "breeze", "gnome"):
+        if t not in chain:
+            chain.append(t)
+    return chain
+
+
+def find_in_theme(name, theme, bases, want=ICON_PX):
+    """Best file for an icon name in one theme: a PNG of the size nearest at
+    or above `want`, else the largest smaller PNG, else an SVG."""
+    best = None
+    for b in bases:
+        root = os.path.join(b, theme)
+        if not os.path.isdir(root):
+            continue
+        dirs = []
+        if os.path.isfile(os.path.join(root, "index.theme")):
+            dirs = parse_theme_index(root)[1]
+        if not dirs:
+            dirs = guess_theme_dirs(root)
+        for sub, size, scalable in dirs:
+            for ext in ("png", "svg"):
+                p = os.path.join(root, sub, "%s.%s" % (name, ext))
+                if not os.path.isfile(p):
+                    continue
+                if ext == "svg" or scalable:
+                    rank = (2, 0)
+                elif size >= want:
+                    rank = (0, size)
+                else:
+                    rank = (1, -size)
+                if best is None or rank < best[0]:
+                    best = (rank, p)
+    return best[1] if best else None
+
+
+def find_icon(name, theme_chain, bases, pixmaps):
+    name = name.strip()
+    names = [name]
+    base, ext = os.path.splitext(name)
+    if ext.lower() in (".png", ".svg", ".xpm", ".svgz"):
+        names.append(base)
+    for n in names:
+        for theme in theme_chain:
+            p = find_in_theme(n, theme, bases)
+            if p:
+                return p
+    for d in pixmaps:
+        for n in names:
+            for e in ("", ".png", ".svg", ".xpm"):
+                p = os.path.join(d, n + e)
+                if os.path.isfile(p):
+                    return p
+    return None
+
+
+# ---------------------------------------------------------- image handling
+
+def sniff_image(data):
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    head = data[:2048].lstrip()
+    if head[:5] == b"<?xml" or head[:4] == b"<svg" or b"<svg" in data[:2048]:
+        return "svg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:9] == b"/* XPM */":
+        return "xpm"
+    return None
+
+
+def png_size(data):
+    if len(data) >= 24 and data[12:16] == b"IHDR":
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    return None
+
+
+_PY_PILLOW = (
+    "import sys,io\nfrom PIL import Image\n"
+    "im=Image.open(sys.argv[1]);im.load();im=im.convert('RGBA')\n"
+    "im.thumbnail((%d,%d));b=io.BytesIO();im.save(b,'PNG');sys.stdout.buffer.write(b.getvalue())\n" % (ICON_PX, ICON_PX))
+_PY_GDK = (
+    "import sys\nimport gi\ngi.require_version('GdkPixbuf','2.0')\n"
+    "from gi.repository import GdkPixbuf\n"
+    "p=GdkPixbuf.Pixbuf.new_from_file_at_scale(sys.argv[1],%d,%d,True)\n"
+    "ok,b=p.save_to_bufferv('png',[],[]);sys.stdout.buffer.write(b)\n" % (ICON_PX, ICON_PX))
+
+
+def rasterize(data, path, fmt, path_env=None):
+    """A 64 px PNG of an image, with whatever tool this guest has; None when
+    none can. `data` is fed on stdin where the tool allows, else `path`."""
+    px = str(ICON_PX)
+    tools = []
+    which = lambda n: shutil.which(n, path=path_env)
+    if fmt == "svg":
+        if which("rsvg-convert"):
+            tools.append(lambda: run_bytes(
+                [which("rsvg-convert"), "-w", px, "-h", px, "--keep-aspect-ratio", "-f", "png"], data))
+        if which("magick"):
+            tools.append(lambda: run_bytes(
+                [which("magick"), "-background", "none", "-density", "384", "svg:-",
+                 "-resize", px + "x" + px, "png:-"], data))
+        if which("convert"):
+            tools.append(lambda: run_bytes(
+                [which("convert"), "-background", "none", "-density", "384", "svg:-",
+                 "-resize", px + "x" + px, "png:-"], data))
+        if which("inkscape"):
+            tools.append(lambda: run_bytes(
+                [which("inkscape"), "--pipe", "--export-type=png", "--export-width=" + px,
+                 "--export-height=" + px, "--export-filename=-"], data))
+    else:
+        if which("magick"):
+            tools.append(lambda: run_bytes(
+                [which("magick"), "-", "-resize", px + "x" + px + ">", "png:-"], data))
+        if which("convert"):
+            tools.append(lambda: run_bytes(
+                [which("convert"), "-", "-resize", px + "x" + px + ">", "png:-"], data))
+        tools.append(lambda: run_bytes([sys.executable, "-c", _PY_PILLOW, path]))
+    tools.append(lambda: run_bytes([sys.executable, "-c", _PY_GDK, path]))
+    if which("gdk-pixbuf-thumbnailer"):
+        def thumb():
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "o.png")
+                if run_text([which("gdk-pixbuf-thumbnailer"), "-s", px, path, out]) is None:
+                    return None
+                with open(out, "rb") as f:
+                    return f.read()
+        tools.append(thumb)
+    for t in tools:
+        try:
+            out = t()
+        except Exception:
+            out = None
+        if out and sniff_image(out) == "png" and len(out) <= MAX_ICON:
+            return out
+    return None
+
+
+def prepare_icon(path, path_env=None):
+    """(format, bytes) to send for an icon file: a 64 px PNG when a tool is
+    there to make one, else the file's own PNG/SVG; raises OpError otherwise."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(8 << 20)
+    except OSError as e:
+        raise OpError("cannot read icon %s: %s" % (txt(path), e.strerror or e))
+    fmt = sniff_image(data)
+    if fmt is None:
+        raise OpError("unknown image format: %s" % txt(path))
+    if fmt == "png":
+        sz = png_size(data)
+        if sz is None or max(sz) <= ICON_PX:
+            if len(data) > MAX_ICON:
+                raise OpError("icon too large")
+            return "png", data
+        out = rasterize(data, path, fmt, path_env)
+        if out:
+            return "png", out
+        if len(data) <= MAX_ICON:
+            return "png", data
+        raise OpError("icon too large and no tool to shrink it")
+    out = rasterize(data, path, fmt, path_env)
+    if out:
+        return "png", out
+    if fmt == "svg":
+        if len(data) > MAX_ICON:
+            raise OpError("icon too large")
+        return "svg", data
+    raise OpError("no tool to convert a %s icon (install ImageMagick or python3-pil)" % fmt)
+
+
+# ------------------------------------------------------------------ agent
+
+SKIP_ENV = ("INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "MAINPID",
+            "MANAGERPID", "NOTIFY_SOCKET", "WATCHDOG_PID", "WATCHDOG_USEC",
+            "LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES", "MEMORY_PRESSURE_WATCH",
+            "MEMORY_PRESSURE_WRITE", "SYSTEMD_SCOPE")
+
+URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
+class Launch:
+    def __init__(self, pid, popen, unit):
+        self.pid = pid
+        self.popen = popen
+        self.unit = unit
+        self.exited = False
+        self.started = time.time()
+
+
+class Agent:
+    def __init__(self, home=None, environ=None, uid=None, user=None, proc="/proc",
+                 runtime_root="/run/user", x11_dir="/tmp/.X11-unix", system_dirs=True,
+                 run=run_text):
+        self.home = home or home_dir()
+        self.environ = dict(os.environ if environ is None else environ)
+        self.uid = os.getuid() if uid is None else uid
+        if user is None:
+            try:
+                user = pwd.getpwuid(self.uid).pw_name
+            except KeyError:
+                user = self.environ.get("USER") or str(self.uid)
+        self.user = user
+        self.proc, self.runtime_root, self.x11_dir = proc, runtime_root, x11_dir
+        self.run = run
+        self.system_dirs = system_dirs
+        # Where apps and icons live besides the user's and XDG's directories.
+        self.sys_data = ["/usr/local/share", "/usr/share"] if system_dirs else []
+        self.flatpak_exports = ["/var/lib/flatpak/exports/share"] if system_dirs else []
+        self.snap_dirs = ["/var/lib/snapd/desktop"] if system_dirs else []
+        self.pixmaps = ["/usr/share/pixmaps"] if system_dirs else []
+        self.extra_path = [os.path.join(self.home, ".local/bin"), os.path.join(self.home, "bin"),
+                           "/usr/local/bin", "/usr/bin", "/bin", "/var/lib/flatpak/exports/bin",
+                           os.path.join(self.home, ".local/share/flatpak/exports/bin"), "/snap/bin"]
+        self.session = SessionCache(self._discover)
+        self.launches = {}
+        self.launch_lock = threading.Lock()
+        self.launch_seq = 0
+        self.put_lock = threading.Lock()
+        self.puts = {}
+        self.gets = {}
+        self.apps_cache = (0.0, None)
+        self.icon_cache = {}
+        self.theme_cache = (0.0, None)
+
+    # -- session -----------------------------------------------------------
+
+    def _discover(self):
+        return discover_session(self.uid, self.user, self.environ, self.proc,
+                                self.runtime_root, self.x11_dir, self.run)
+
+    def session_env(self):
+        return self.session.get()["env"]
+
+    def launch_env(self, sess, extra):
+        env = {k: v for k, v in self.environ.items() if k not in SKIP_ENV}
+        env.update(sess["env"])
+        env.setdefault("HOME", self.home)
+        env.setdefault("USER", self.user)
+        env.setdefault("LOGNAME", self.user)
+        paths = [p for p in env.get("PATH", "").split(":") if p]
+        for p in self.extra_path:
+            if p not in paths:
+                paths.append(p)
+        env["PATH"] = ":".join(paths)
+        for k, v in (extra or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and k and "=" not in k and "\0" not in k + v:
+                env[k] = v
+        return env
+
+    # -- paths ----------------------------------------------------------------
+
+    def expand(self, p):
+        if p.startswith("~"):
+            if p == "~" or p.startswith("~/"):
+                p = self.home + p[1:]
+            else:
+                p = os.path.expanduser(p)
+        return p
+
+    def user_path(self, p):
+        p = self.expand(p)
+        if not os.path.isabs(p):
+            p = os.path.join(self.home, p)
+        return os.path.normpath(p) if p else p
+
+    def downloads(self):
+        cfg = self.environ.get("XDG_CONFIG_HOME") or os.path.join(self.home, ".config")
+        try:
+            with open(os.path.join(cfg, "user-dirs.dirs"), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = re.match(r'^\s*XDG_DOWNLOAD_DIR\s*=\s*"?([^"\n]*)"?', line)
+                    if m:
+                        d = m.group(1).replace("$HOME", self.home).replace("${HOME}", self.home)
+                        if d and os.path.isabs(d):
+                            return d
+        except OSError:
+            pass
+        return os.path.join(self.home, "Downloads")
+
+    def xdg_data_dirs(self, env):
+        home = env.get("XDG_DATA_HOME") or os.path.join(self.home, ".local/share")
+        dirs = [home] + [d for d in (env.get("XDG_DATA_DIRS") or "").split(":") if d]
+        dirs += self.sys_data + self.flatpak_exports
+        if self.system_dirs:
+            dirs.append(os.path.join(self.home, ".local/share/flatpak/exports/share"))
+        for s in self.snap_dirs:
+            dirs.append(s)
+        out = []
+        for d in dirs:
+            d = d.rstrip("/") or "/"
+            if d not in out:
+                out.append(d)
+        return out
+
+    def app_dirs(self, env):
+        """[(applications dir, source)] in precedence order."""
+        out = []
+        for d in self.xdg_data_dirs(env):
+            if "/flatpak/exports" in d:
+                src = "flatpak"
+            elif "/snapd/" in d or d.startswith("/snap"):
+                src = "snap"
+            else:
+                src = "desktop"
+            out.append((os.path.join(d, "applications"), src))
+        return out
+
+    def icon_bases(self, env):
+        out = [os.path.join(self.home, ".icons")]
+        for d in self.xdg_data_dirs(env):
+            out.append(os.path.join(d, "icons"))
+        return list(dict.fromkeys(out))
+
+    # -- ping ---------------------------------------------------------------
+
+    def op_ping(self, req):
+        sess = self.session.get()
+        return {"proto": PROTO, "agent": "conduit-ctl-agent " + VERSION, "os": "linux",
+                "user": self.user, "session": bool(sess["found"]),
+                "downloads": txt(self.downloads())}
+
+    # -- apps -------------------------------------------------------------
+
+    def desktop_env_names(self, env):
+        return [x.casefold() for x in (env.get("XDG_CURRENT_DESKTOP") or "").split(":") if x]
+
+    def scan_apps(self, env):
+        path_env = env.get("PATH") or self.environ.get("PATH", "/usr/bin:/bin")
+        cur = self.desktop_env_names(env)
+        locales = locale_candidates(env)
+        seen, apps = set(), []
+        count = 0
+        for adir, source in self.app_dirs(env):
+            if not os.path.isdir(adir):
+                continue
+            for dirpath, dirnames, files in os.walk(adir, followlinks=True):
+                dirnames.sort()
+                for fn in sorted(files):
+                    if not fn.endswith(".desktop"):
+                        continue
+                    count += 1
+                    if count > 20000:
+                        break
+                    full = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(full, adir)
+                    did = desktop_id(rel)
+                    if did in seen:
+                        continue
+                    seen.add(did)
+                    e = read_desktop(full)
+                    if not e or e.get("Type", "Application") != "Application":
+                        continue
+                    if truthy(e.get("NoDisplay", "")) or truthy(e.get("Hidden", "")):
+                        continue
+                    if not e.get("Exec") and not truthy(e.get("DBusActivatable", "")):
+                        continue
+                    only = [x.casefold() for x in e.get("OnlyShowIn", "").split(";") if x]
+                    notin = [x.casefold() for x in e.get("NotShowIn", "").split(";") if x]
+                    if cur:
+                        if only and not set(only) & set(cur):
+                            continue
+                        if notin and set(notin) & set(cur):
+                            continue
+                    te = e.get("TryExec")
+                    if te and not self._exists_exec(unescape_value(te), path_env):
+                        continue
+                    name = localized(e, "Name", locales)
+                    if not name:
+                        continue
+                    apps.append({"name": txt(name), "target": txt(full), "args": [],
+                                 "icon": txt(unescape_value(e.get("Icon", ""))),
+                                 "source": source})
+        for g in steam_games(self.home):
+            apps.append({"name": txt(g["name"]), "target": "steam://rungameid/" + g["appid"],
+                         "args": [], "icon": "steam:" + g["appid"], "source": "steam"})
+        apps.sort(key=lambda a: (a["name"].casefold(), a["target"]))
+        return apps
+
+    @staticmethod
+    def _exists_exec(name, path_env):
+        if "/" in name:
+            return os.path.isfile(name) and os.access(name, os.X_OK)
+        return shutil.which(name, path=path_env) is not None
+
+    def op_apps(self, req):
+        at, val = self.apps_cache
+        if val is not None and time.monotonic() - at < 5.0:
+            return {"apps": val}
+        env = dict(self.environ)
+        env.update(self.session_env())
+        apps = self.scan_apps(env)
+        self.apps_cache = (time.monotonic(), apps)
+        return {"apps": apps}
+
+    # -- icon -----------------------------------------------------------------
+
+    def current_icon_theme(self, env):
+        at, val = self.theme_cache
+        if val is not None and time.monotonic() - at < 60:
+            return val
+        cfg = env.get("XDG_CONFIG_HOME") or os.path.join(self.home, ".config")
+        kde = "kde" in (env.get("XDG_CURRENT_DESKTOP") or "").casefold()
+
+        def from_kde():
+            return read_ini(os.path.join(cfg, "kdeglobals")).get("Icons", {}).get("Theme")
+
+        def from_gtk():
+            for v in ("gtk-3.0", "gtk-4.0"):
+                t = read_ini(os.path.join(cfg, v, "settings.ini")).get("Settings", {}).get("gtk-icon-theme-name")
+                if t:
+                    return t.strip("\"'")
+            return None
+
+        def from_gsettings():
+            if not shutil.which("gsettings", path=env.get("PATH")):
+                return None
+            out = self.run(["gsettings", "get", "org.gnome.desktop.interface", "icon-theme"], env=env)
+            t = (out or "").strip().strip("'\"")
+            return t or None
+
+        order = [from_kde, from_gsettings, from_gtk] if kde else [from_gsettings, from_gtk, from_kde]
+        theme = None
+        for f in order:
+            theme = f()
+            if theme:
+                break
+        self.theme_cache = (time.monotonic(), theme)
+        return theme
+
+    def icon_file(self, key):
+        env = dict(self.environ)
+        env.update(self.session_env())
+        if key.startswith("steam:"):
+            appid = key[6:]
+            if not appid.isdigit():
+                raise OpError("bad steam icon key: %s" % txt(key))
+            p = steam_icon_file(self.home, appid)
+            if p:
+                return p
+            key = "steam_icon_" + appid
+        if "/" in key or key.startswith("~"):
+            p = self.expand(key)
+            if os.path.isfile(p):
+                return p
+            raise OpError("no such icon file: %s" % txt(key))
+        bases = self.icon_bases(env)
+        chain = icon_theme_chain(self.current_icon_theme(env), bases)
+        p = find_icon(key, chain, bases, self.pixmaps)
+        if not p:
+            raise OpError("icon not found: %s" % txt(key))
+        return p
+
+    def op_icon(self, req):
+        key = req.get("key")
+        if not isinstance(key, str) or not key:
+            raise OpError("missing icon key")
+        path = self.icon_file(key)
+        try:
+            st = os.stat(path)
+            sig = (path, st.st_mtime_ns, st.st_size)
+        except OSError:
+            sig = (path, 0, 0)
+        hit = self.icon_cache.get(sig)
+        if hit is None:
+            env = dict(self.environ)
+            env.update(self.session_env())
+            hit = prepare_icon(path, env.get("PATH"))
+            if len(self.icon_cache) > 256:
+                self.icon_cache.clear()
+            self.icon_cache[sig] = hit
+        fmt, data = hit
+        return {"format": fmt, "data": base64.b64encode(data).decode("ascii")}
+
+    # -- run / stop ---------------------------------------------------------
+
+    def resolve_exe(self, name, env, cwd):
+        """The executable `name` names (PATH search for a bare name), or None."""
+        name = self.expand(name)
+        if "/" in name:
+            p = name if os.path.isabs(name) else os.path.join(cwd or self.home, name)
+            return p if os.path.isfile(p) and os.access(p, os.X_OK) else None
+        return shutil.which(name, path=env.get("PATH"))
+
+    def op_run(self, req):
+        cmd = req.get("cmd")
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise OpError("empty command")
+        args = req.get("args") or []
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise OpError("args must be a list of strings")
+        cwd = req.get("cwd") or ""
+        if not isinstance(cwd, str):
+            raise OpError("cwd must be a string")
+        extra = req.get("env") or {}
+        if not isinstance(extra, dict):
+            raise OpError("env must be an object")
+        if cwd:
+            cwd = self.user_path(cwd)
+            if not os.path.isdir(cwd):
+                raise OpError("no such directory: %s" % txt(cwd))
+        sess = self.session.get()
+        env = self.launch_env(sess, extra)
+        try:
+            pid = self._run(cmd.strip(), args, cwd, env, sess)
+        except OpError:
+            self.session.invalidate()
+            raise
+        return {"pid": pid}
+
+    def _run(self, cmd, args, cwd, env, sess):
+        if URL_RE.match(cmd) and not os.path.exists(cmd):
+            return self.run_url(cmd, args, cwd, env, sess)
+        path = self.expand(cmd)
+        if path.endswith(".desktop"):
+            if "/" not in path:
+                path = self.find_desktop_id(path, env) or path
+            elif not os.path.isabs(path):
+                path = os.path.join(cwd or self.home, path)
+            if not os.path.isfile(path):
+                raise OpError("not found: %s" % txt(cmd))
+            return self.run_desktop(path, args, cwd, env, sess)
+        exe = self.resolve_exe(cmd, env, cwd)
+        if exe is None:
+            target = path if os.path.isabs(path) else os.path.join(cwd or self.home, path)
+            if "/" in cmd and os.path.exists(target):
+                # A document or folder: hand it to the desktop's opener.
+                return self.run_open(target, cwd, env, sess)
+            raise OpError("not found: %s" % txt(cmd))
+        return self.spawn_chain([[exe] + args], cwd, env, sess)
+
+    def find_desktop_id(self, name, env):
+        for adir, _ in self.app_dirs(env):
+            for cand in (name, name.replace("-", "/", 1)):
+                p = os.path.join(adir, cand)
+                if os.path.isfile(p):
+                    return p
+        return None
+
+    def run_open(self, target, cwd, env, sess):
+        cands = []
+        for argv in (["xdg-open", target], ["gio", "open", target]):
+            exe = shutil.which(argv[0], path=env.get("PATH"))
+            if exe:
+                cands.append([exe] + argv[1:])
+        if not cands:
+            raise OpError("not found: xdg-open")
+        return self.spawn_chain(cands, cwd, env, sess)
+
+    def run_url(self, url, args, cwd, env, sess):
+        cands = []
+        pe = env.get("PATH")
+        if url.lower().startswith("steam:"):
+            steam = shutil.which("steam", path=pe)
+            if steam:
+                cands.append([steam, url])
+            flatpak = shutil.which("flatpak", path=pe)
+            if flatpak and (os.path.isdir(os.path.join(self.home, ".var/app/com.valvesoftware.Steam"))
+                            or os.path.isdir("/var/lib/flatpak/app/com.valvesoftware.Steam")):
+                cands.append([flatpak, "run", "com.valvesoftware.Steam", url])
+        for argv in (["xdg-open", url], ["gio", "open", url]):
+            exe = shutil.which(argv[0], path=pe)
+            if exe:
+                cands.append([exe] + argv[1:])
+        if not cands:
+            raise OpError("not found: xdg-open")
+        return self.spawn_chain(cands, cwd, env, sess)
+
+    def desktop_exec_argv(self, path, entry, args, env):
+        """The command line a .desktop entry's Exec stands for."""
+        if entry.get("Type", "Application") != "Application":
+            raise OpError("not an application: %s" % txt(path))
+        ex = entry.get("Exec")
+        if not ex:
+            raise OpError("no Exec in %s" % txt(path))
+        raw = split_exec(ex)
+        argv = expand_exec(raw, unescape_value(entry.get("Name", "")),
+                           unescape_value(entry.get("Icon", "")), path, args)
+        if args and not exec_takes_files(raw):
+            argv += args
+        if not argv:
+            raise OpError("empty Exec in %s" % txt(path))
+        exe = self.resolve_exe(argv[0], env, entry.get("Path"))
+        if exe is None:
+            raise OpError("not found: %s" % txt(argv[0]))
+        argv[0] = exe
+        if truthy(entry.get("Terminal", "")):
+            wrapped = terminal_wrap(argv, env.get("PATH"))
+            if wrapped is None:
+                raise OpError("not found: terminal emulator (for %s)" % txt(os.path.basename(path)))
+            argv = wrapped
+        return argv
+
+    def run_desktop(self, path, args, cwd, env, sess):
+        entry = read_desktop(path)
+        if entry is None:
+            raise OpError("cannot read %s" % txt(path))
+        pe = env.get("PATH")
+        wd = cwd
+        if not wd and entry.get("Path") and os.path.isdir(entry["Path"]):
+            wd = entry["Path"]
+        cands = []
+        terminal = truthy(entry.get("Terminal", ""))
+        if not terminal:  # gio's own terminal list misses foot, kitty, alacritty
+            gio = shutil.which("gio", path=pe)
+            if gio:
+                cands.append([gio, "launch", path] + args)
+            else:
+                gtk = shutil.which("gtk-launch", path=pe)
+                if gtk:
+                    cands.append([gtk, os.path.basename(path)])
+                else:
+                    dex = shutil.which("dex", path=pe)
+                    if dex:
+                        cands.append([dex, path])
+        errors = []
+        try:
+            cands.append(self.desktop_exec_argv(path, entry, args, env))
+        except OpError as e:
+            errors.append(e)
+        if not cands:
+            raise errors[0]
+        try:
+            return self.spawn_chain(cands, wd, env, sess)
+        except OpError as e:
+            raise errors[0] if errors and "not found" in str(e) and len(cands) == 1 else e
+
+    def spawn_chain(self, candidates, cwd, env, sess):
+        last = None
+        for argv in candidates:
+            try:
+                return self.spawn(argv, cwd, env, sess)
+            except OpError as e:
+                last = e
+        raise last
+
+    def _use_systemd_run(self, sess, env):
+        return (USE_SYSTEMD_RUN and sess.get("user_manager")
+                and shutil.which("systemd-run", path=env.get("PATH")))
+
+    def spawn(self, argv, cwd, env, sess):
+        """Start a command detached in the session; returns its pid. Prefers a
+        transient systemd user scope; falls back to a plain new session."""
+        sd = self._use_systemd_run(sess, env)
+        if sd:
+            with self.launch_lock:
+                self.launch_seq += 1
+                unit = "conduit-run-%d-%d" % (os.getpid(), self.launch_seq)
+            wrapped = [sd, "--user", "--scope", "--collect", "-q", "--unit=" + unit,
+                       "sh", "-c", 'exec "$@" </dev/null >/dev/null 2>&1', "sh"] + argv
+            err = tempfile.TemporaryFile()
+            try:
+                p = subprocess.Popen(wrapped, cwd=cwd or None, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=err,
+                                     start_new_session=True, close_fds=True)
+            except OSError:
+                p = None
+            if p is not None:
+                try:
+                    rc = p.wait(timeout=0.4)
+                except subprocess.TimeoutExpired:
+                    rc = None
+                if rc is None or rc == 0:
+                    err.close()
+                    return self._track(p, unit)
+                err.seek(0)
+                said = err.read(2000).decode("utf-8", "replace").strip()
+                err.close()
+                if not said:
+                    raise OpError("%s exited with status %d" % (os.path.basename(argv[0]), rc))
+                log("systemd-run failed (%s); launching directly" % said.splitlines()[0])
+        try:
+            p = subprocess.Popen(argv, cwd=cwd or None, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True, close_fds=True)
+        except FileNotFoundError:
+            raise OpError("not found: %s" % txt(argv[0]))
+        except PermissionError:
+            raise OpError("permission denied: %s" % txt(argv[0]))
+        except OSError as e:
+            raise OpError("cannot start %s: %s" % (txt(argv[0]), e.strerror or e))
+        try:
+            rc = p.wait(timeout=0.4)
+        except subprocess.TimeoutExpired:
+            rc = None
+        if rc not in (None, 0):
+            raise OpError("%s exited with status %d" % (os.path.basename(argv[0]), rc))
+        return self._track(p, None)
+
+    def _track(self, p, unit):
+        entry = Launch(p.pid, p, unit)
+
+        def reap():
+            try:
+                p.wait()
+            except Exception:
+                pass
+            entry.exited = True
+
+        threading.Thread(target=reap, daemon=True).start()
+        with self.launch_lock:
+            self.launches[p.pid] = entry
+            if len(self.launches) > 256:
+                dead = [k for k, v in self.launches.items() if v.exited and not self._unit_active(v)]
+                for k in sorted(dead, key=lambda k: self.launches[k].started)[:64]:
+                    del self.launches[k]
+        return p.pid
+
+    def _unit_active(self, entry):
+        if not entry.unit:
+            return False
+        out = self.run(["systemctl", "--user", "is-active", entry.unit + ".scope"],
+                       env=self._sd_env(), timeout=2.0)
+        return out is not None and out.strip() in ("active", "activating")
+
+    def _sd_env(self):
+        env = dict(self.environ)
+        env.update(self.session_env())
+        return env
+
+    def _group_alive(self, pid):
+        try:
+            os.killpg(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _signal(self, entry, sig):
+        name = "SIGTERM" if sig == signal.SIGTERM else "SIGKILL"
+        if not entry.exited or self._group_alive(entry.pid):
+            try:
+                os.killpg(entry.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if entry.unit:
+            subprocess.run(["systemctl", "--user", "kill", "--signal=" + name, entry.unit + ".scope"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, env=self._sd_env(), timeout=5.0, check=False)
+
+    def op_stop(self, req):
+        pid = req.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise OpError("bad pid")
+        with self.launch_lock:
+            entry = self.launches.get(pid)
+        if entry is None:
+            raise OpError("pid %d was not started by this agent" % pid)
+
+        def alive():
+            if not entry.exited:
+                return True
+            return self._group_alive(pid) or self._unit_active(entry)
+
+        if not alive():
+            return {}
+        try:
+            self._signal(entry, signal.SIGTERM)
+        except Exception as e:
+            log("stop: %s" % e)
+        deadline = time.monotonic() + STOP_GRACE
+        while time.monotonic() < deadline and alive():
+            time.sleep(0.05)
+        if alive():
+            try:
+                self._signal(entry, signal.SIGKILL)
+            except Exception as e:
+                log("stop: %s" % e)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and alive():
+                time.sleep(0.05)
+        return {}
+
+    # -- files ------------------------------------------------------------
+
+    def put_target(self, path):
+        if not path:
+            raise OpError("empty path")
+        if "/" not in path and not path.startswith("~"):
+            d = self.downloads()
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError as e:
+                raise OpError("cannot create %s: %s" % (txt(d), e.strerror or e))
+            return os.path.join(d, path)
+        return self.user_path(path)
+
+    def op_put(self, req):
+        path = req.get("path")
+        if not isinstance(path, str):
+            raise OpError("missing path")
+        offset = req.get("offset", 0)
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise OpError("bad offset")
+        raw = req.get("data", "")
+        if not isinstance(raw, str):
+            raise OpError("bad data")
+        try:
+            data = base64.b64decode(raw, validate=True)
+        except (binascii.Error, ValueError):
+            raise OpError("data is not valid base64")
+        if len(data) > CHUNK:
+            raise OpError("piece larger than %d bytes" % CHUNK)
+        size = req.get("size")
+        if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
+            raise OpError("bad size")
+        done = bool(req.get("done", False))
+        want_sha = req.get("sha256")
+        if want_sha is not None and not isinstance(want_sha, str):
+            raise OpError("bad sha256")
+        force = bool(req.get("force", False))
+        final = self.put_target(path)
+        tmp = final + ".conduit-part"
+        with self.put_lock:
+            try:
+                return self._put(final, tmp, offset, data, size, done, want_sha, force)
+            except BaseException:
+                self.puts.pop(final, None)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+    def _put(self, final, tmp, offset, data, size, done, want_sha, force):
+        st = self.puts.get(final)
+        if offset == 0:
+            parent = os.path.dirname(final)
+            if not os.path.isdir(parent):
+                raise OpError("no such directory: %s" % txt(parent))
+            if os.path.isdir(final):
+                raise OpError("is a directory: %s" % txt(final))
+            if os.path.lexists(final) and not force:
+                raise OpError("already exists: %s" % txt(final))
+            if size is not None and size > MAX_FILE:
+                raise OpError("file larger than %d bytes" % MAX_FILE)
+            self.puts.pop(final, None)
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(data)
+            except OSError as e:
+                raise OpError("cannot write %s: %s" % (txt(tmp), e.strerror or e))
+            st = {"written": len(data), "hash": hashlib.sha256(data), "size": size}
+            self.puts[final] = st
+            if len(self.puts) > 16:
+                self.puts.pop(next(iter(self.puts)))
+        else:
+            try:
+                actual = os.path.getsize(tmp)
+            except OSError:
+                actual = 0
+            expected = st["written"] if st else actual
+            if offset != expected or actual != expected:
+                raise OpError("unexpected offset %d, expected %d" % (offset, expected if st else actual))
+            if offset + len(data) > MAX_FILE:
+                raise OpError("file larger than %d bytes" % MAX_FILE)
+            if st is None:  # the agent restarted mid-file: hash what is there
+                h = hashlib.sha256()
+                with open(tmp, "rb") as f:
+                    for blk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(blk)
+                st = {"written": actual, "hash": h, "size": size}
+                self.puts[final] = st
+            try:
+                with open(tmp, "ab") as f:
+                    f.write(data)
+            except OSError as e:
+                raise OpError("cannot write %s: %s" % (txt(tmp), e.strerror or e))
+            st["written"] += len(data)
+            st["hash"].update(data)
+            if size is not None:
+                st["size"] = size
+        if not done:
+            return {"size": st["written"], "path": "", "sha256": ""}
+        if st["size"] is not None and st["written"] != st["size"]:
+            raise OpError("size mismatch: got %d bytes, expected %d" % (st["written"], st["size"]))
+        digest = st["hash"].hexdigest()
+        if want_sha and want_sha.strip().lower() != digest:
+            raise OpError("sha256 mismatch: got %s, expected %s" % (digest, want_sha.strip().lower()))
+        if os.path.lexists(final) and not force:
+            raise OpError("already exists: %s" % txt(final))
+        try:
+            os.replace(tmp, final)
+        except OSError as e:
+            raise OpError("cannot move into place: %s" % (e.strerror or e))
+        self.puts.pop(final, None)
+        return {"size": st["written"], "path": txt(final), "sha256": digest}
+
+    def op_get(self, req):
+        path = req.get("path")
+        if not isinstance(path, str) or not path:
+            raise OpError("missing path")
+        offset = req.get("offset", 0)
+        n = req.get("len", 0)
+        for v in (offset, n):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                raise OpError("bad offset or len")
+        n = min(n or CHUNK, CHUNK)
+        full = self.user_path(path)
+        if os.path.isdir(full):
+            raise OpError("not a regular file: %s" % txt(full))
+        try:
+            f = open(full, "rb")
+        except OSError as e:
+            raise OpError("cannot open %s: %s" % (txt(full), e.strerror or e))
+        with f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise OpError("not a regular file: %s" % txt(full))
+            if st.st_size > MAX_FILE:
+                raise OpError("file larger than %d bytes" % MAX_FILE)
+            f.seek(offset)
+            data = f.read(n) if offset < st.st_size else b""
+            eof = offset + len(data) >= st.st_size
+            sig = (st.st_size, st.st_mtime_ns)
+            g = self.gets.get(full)
+            if offset == 0 or g is None or g["sig"] != sig:
+                g = {"sig": sig, "next": 0, "hash": hashlib.sha256()} if offset == 0 else None
+            if g is not None and g["next"] == offset:
+                g["hash"].update(data)
+                g["next"] += len(data)
+                self.gets[full] = g
+                if len(self.gets) > 16:
+                    self.gets.pop(next(iter(self.gets)))
+            else:
+                self.gets.pop(full, None)
+                g = None
+            sha = None
+            if eof:
+                if g is not None and g["next"] == st.st_size:
+                    sha = g["hash"].hexdigest()
+                else:
+                    h = hashlib.sha256()
+                    f.seek(0)
+                    for blk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(blk)
+                    sha = h.hexdigest()
+                self.gets.pop(full, None)
+        return {"data": base64.b64encode(data).decode("ascii"), "size": st.st_size,
+                "eof": eof, "sha256": sha}
+
+    def op_ls(self, req):
+        path = req.get("path", "")
+        if not isinstance(path, str):
+            raise OpError("bad path")
+        full = self.user_path(path) if path else self.home
+        try:
+            it = list(os.scandir(full))
+        except OSError as e:
+            raise OpError("cannot list %s: %s" % (txt(full), e.strerror or e))
+        it.sort(key=lambda e: e.name.casefold())
+        entries = []
+        for e in it[:LS_CAP]:
+            try:
+                st = e.stat()
+                isdir = e.is_dir()
+            except OSError:
+                try:
+                    st = e.stat(follow_symlinks=False)
+                    isdir = False
+                except OSError:
+                    continue
+            entries.append({"name": txt(e.name), "dir": bool(isdir),
+                            "size": 0 if isdir else int(st.st_size),
+                            "mtime": max(0, int(st.st_mtime))})
+        return {"path": txt(full), "entries": entries}
+
+    # -- request handling ------------------------------------------------------
+
+    def handle_line(self, raw):
+        """One request line (bytes, no newline) in, one reply line (bytes with
+        the newline) out. Never raises."""
+        rid = 0
+        try:
+            return self._handle(raw)
+        except BaseException as e:  # noqa: BLE001 - nothing may kill the agent
+            log("internal error:\n" + traceback.format_exc())
+            return self.reply(rid, error="internal error: %s" % type(e).__name__)
+
+    @staticmethod
+    def reply(rid, body=None, error=None):
+        if error is not None:
+            obj = {"id": rid, "ok": False, "error": error}
+        else:
+            obj = {"id": rid, "ok": True}
+            for k, v in (body or {}).items():
+                if k not in ("id", "ok", "error"):
+                    obj[k] = v
+        line = json.dumps(obj, separators=(",", ":")).encode("ascii") + b"\n"
+        if len(line) > MAX_LINE:
+            line = json.dumps({"id": rid, "ok": False, "error": "reply too large"},
+                              separators=(",", ":")).encode("ascii") + b"\n"
+        return line
+
+    def _handle(self, raw):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return self.reply(0, error="request is not valid utf-8")
+        try:
+            req = json.loads(text)
+        except ValueError as e:
+            return self.reply(0, error="bad json: %s" % e)
+        if not isinstance(req, dict):
+            return self.reply(0, error="request is not an object")
+        rid = req.get("id")
+        if not isinstance(rid, int) or isinstance(rid, bool) or rid < 0:
+            return self.reply(0, error="missing id")
+        v = req.get("v")
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            return self.reply(rid, error="missing protocol version")
+        if v > PROTO:
+            return self.reply(rid, error="unsupported protocol version %d" % v)
+        op = req.get("op")
+        fn = getattr(self, "op_" + op, None) if isinstance(op, str) and re.match(r"^[a-z]+$", op) else None
+        if fn is None:
+            return self.reply(rid, error="unknown op: %s" % (txt(op) if isinstance(op, str) else op))
+        try:
+            return self.reply(rid, fn(req))
+        except OpError as e:
+            return self.reply(rid, error=str(e))
+        except Exception as e:  # noqa: BLE001
+            log("op %s failed:\n%s" % (op, traceback.format_exc()))
+            return self.reply(rid, error="internal error: %s: %s" % (type(e).__name__, e))
+
+
+# ----------------------------------------------------------------- server
+
+def find_port():
+    """The control port's device node: the udev symlink, else a /dev/vport*
+    whose sysfs name matches."""
+    if os.path.exists(PORT_PATH):
+        return PORT_PATH
+    for n in glob.glob("/sys/class/virtio-ports/*/name"):
+        try:
+            with open(n) as f:
+                if f.read().strip() == CHANNEL:
+                    return "/dev/" + os.path.basename(os.path.dirname(n))
+        except OSError:
+            continue
+    return PORT_PATH
+
+
+def open_port(path=None):
+    return os.open(path or find_port(), os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+
+
+class Conn:
+    """One open channel: serialized, deadline-bounded writes."""
+
+    def __init__(self, fd, write_timeout=10.0):
+        self.fd = fd
+        self.dead = False
+        self.lock = threading.Lock()
+        self.write_timeout = write_timeout
+
+    def send(self, data):
+        with self.lock:
+            if self.dead:
+                return False
+            view = memoryview(data)
+            deadline = time.monotonic() + self.write_timeout
+            sent = 0
+            p = select.poll()
+            p.register(self.fd, select.POLLOUT)
+            while sent < len(view):
+                try:
+                    n = os.write(self.fd, view[sent:sent + 65536])
+                    sent += n
+                    continue
+                except (BlockingIOError, InterruptedError):
+                    pass
+                except OSError:
+                    self.dead = True
+                    return False
+                if self.dead or time.monotonic() > deadline:
+                    # A half-written line would corrupt the next reply: drop the channel.
+                    self.dead = True
+                    return False
+                try:
+                    p.poll(200)
+                except OSError:
+                    self.dead = True
+                    return False
+            return True
+
+    def close(self):
+        self.dead = True
+        with self.lock:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+
+
+class Server:
+    def __init__(self, agent, opener=open_port, workers=8, max_inflight=64,
+                 backoff=(0.2, 2.0), write_timeout=10.0):
+        self.agent = agent
+        self.opener = opener
+        self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ctl")
+        self.slots = threading.BoundedSemaphore(max_inflight)
+        self.stop = threading.Event()
+        self.backoff = backoff
+        self.write_timeout = write_timeout
+        self.connections = 0
+
+    def _work(self, conn, raw):
+        try:
+            reply = self.agent.handle_line(raw)
+            if not conn.send(reply):
+                log("dropped a reply: the host is gone")
+        except Exception:  # noqa: BLE001
+            log("worker failed:\n" + traceback.format_exc())
+        finally:
+            self.slots.release()
+
+    def _submit(self, conn, raw):
+        while not self.stop.is_set():
+            if self.slots.acquire(timeout=0.5):
+                break
+        else:
+            return
+        try:
+            self.pool.submit(self._work, conn, raw)
+        except RuntimeError:
+            self.slots.release()
+
+    def serve(self, conn):
+        """Read requests from one open channel until it ends. True if any
+        data arrived."""
+        reader = LineReader()
+        got = False
+        os.set_blocking(conn.fd, False)
+        p = select.poll()
+        p.register(conn.fd, select.POLLIN)
+        while not self.stop.is_set() and not conn.dead:
+            try:
+                events = p.poll(500)
+            except InterruptedError:
+                continue
+            except OSError:
+                return got
+            for _, ev in events:
+                if ev & select.POLLIN:
+                    try:
+                        data = os.read(conn.fd, 1 << 16)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except OSError:
+                        return got
+                    if not data:
+                        return got
+                    got = True
+                    for kind, payload in reader.push(data):
+                        if kind == "line":
+                            self._submit(conn, payload)
+                        else:
+                            m = re.search(rb'"id"\s*:\s*(\d+)', payload)
+                            conn.send(Agent.reply(int(m.group(1)) if m else 0,
+                                                  error="request line too long"))
+                elif ev & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                    return got
+        return got
+
+    def run(self):
+        delay = self.backoff[0]
+        last_err = None
+        while not self.stop.is_set():
+            try:
+                fd = self.opener()
+            except OSError as e:
+                if e.errno != last_err:
+                    log("cannot open the control port: %s" % (e.strerror or e))
+                    last_err = e.errno
+                cap = 15.0 if e.errno == errno.ENOENT else 5.0
+                self.stop.wait(min(delay, cap))
+                delay = min(delay * 2, cap)
+                continue
+            if last_err is not None:
+                log("control port open")
+                last_err = None
+            self.connections += 1
+            conn = Conn(fd, self.write_timeout)
+            try:
+                got = self.serve(conn)
+            except Exception:  # noqa: BLE001
+                log("channel failed:\n" + traceback.format_exc())
+                got = False
+            finally:
+                conn.close()
+            delay = self.backoff[0] if got else min(delay * 2, self.backoff[1])
+            self.stop.wait(delay)
+        self.pool.shutdown(wait=False)
+
+
+# ------------------------------------------------------------------- main
+
+def single_instance(uid):
+    rt = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % uid
+    if not os.path.isdir(rt):
+        rt = "/tmp"
+    path = os.path.join(rt, "conduit-ctl.lock" if rt != "/tmp" else "conduit-ctl-%d.lock" % uid)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def main(argv=None):
+    global _quiet
+    argv = sys.argv[1:] if argv is None else argv
+    if "--version" in argv:
+        print("conduit-ctl-agent " + VERSION)
+        return 0
+    agent = Agent()
+    if "--print-session" in argv:
+        s = agent.session.get()
+        print(json.dumps(s, indent=2, sort_keys=True))
+        return 0 if s["found"] else 1
+    lock = single_instance(agent.uid)
+    if lock is None:
+        log("already running for this user")
+        return 0
+    port = None
+    if "--port" in argv:
+        port = argv[argv.index("--port") + 1]
+    server = Server(agent, (lambda: open_port(port)) if port else open_port)
+
+    def bye(*_):
+        server.stop.set()
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    signal.signal(signal.SIGHUP, bye)
+    log("serving %s" % (port or PORT_PATH))
+    server.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

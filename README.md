@@ -252,6 +252,13 @@ first `conduit attach`, and `conduit share add NAME DIR` (or `F` in the
 dashboard) adds more. Windows guests mount them as drives (Z: downward), Linux
 guests under `/mnt/conduit/NAME`. Details in docs/CLI.md and docs/WINDOWS.md.
 
+A control channel to the guest (no ssh, no network) runs programs and copies
+files: `conduit run myvm -- notepad.exe`, `conduit apps myvm`,
+`conduit cp file myvm:`. `conduit app add myvm "Steam"` puts an app of the VM in
+your host's launcher with its icon, and the dashboard's Apps tab (`4`) starts any
+of them. It works with Windows guests (the tray app) and Linux guests (Ubuntu,
+Debian, Fedora, Arch-based; Wayland or X11). See docs/GUEST-CONTROL.md.
+
 ### Everyday commands
 
 | Command | What it does |

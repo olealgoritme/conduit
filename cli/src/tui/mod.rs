@@ -6,6 +6,7 @@
 //! commands do. `view` and `up` are detached and log to the VM's runtime
 //! folder, so a window opened from here outlives the dashboard.
 
+mod apps;
 mod data;
 mod draw;
 pub(crate) mod nvml;
@@ -39,6 +40,7 @@ pub enum Tab {
     Dash,
     Logs,
     Doctor,
+    Apps,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -142,6 +144,7 @@ pub struct App {
     pub doctor: Vec<String>,
     pub doctor_scroll: u16,
     pub capturing: Option<Tab>,
+    pub apps: apps::AppsTab,
     pub rows: Vec<(Rect, usize)>,
     pub buttons: Vec<(Rect, Act)>,
     pub tabs: Vec<(Rect, Tab)>,
@@ -415,6 +418,12 @@ impl App {
         let _ = self.poke.send(());
     }
 
+    /// The Apps tab for the selected VM.
+    fn show_apps(&mut self) {
+        self.tab = Tab::Apps;
+        self.apps.reset_view();
+    }
+
     /// Fills the Logs or Doctor tab from `conduit logs`/`conduit doctor`.
     fn capture(&mut self, tab: Tab) {
         if self.capturing == Some(tab) {
@@ -431,7 +440,7 @@ impl App {
                 a.extend(["-n".into(), "400".into()]);
                 a
             }
-            Tab::Dash => return,
+            Tab::Dash | Tab::Apps => return,
         };
         self.capturing = Some(tab);
         let tx = self.cap_tx.clone();
@@ -614,6 +623,25 @@ impl App {
             }
             return;
         }
+        if self.tab == Tab::Apps {
+            // Left/Right pick another VM; the list starts at the top.
+            if !self.apps.typing && matches!(code, KeyCode::Left | KeyCode::Right) {
+                let n = self.snap.vms.len();
+                if n > 0 {
+                    self.sel = if code == KeyCode::Left {
+                        (self.sel + n - 1) % n
+                    } else {
+                        (self.sel + 1) % n
+                    };
+                    self.apps.reset_view();
+                }
+                return;
+            }
+            let vm = self.snap.vms.get(self.sel);
+            if self.apps.key(code, vm) {
+                return;
+            }
+        }
         let n = self.snap.vms.len();
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -627,11 +655,13 @@ impl App {
                 Tab::Dash => self.sel = self.sel.saturating_sub(1),
                 Tab::Logs => self.logs_scroll = self.logs_scroll.saturating_add(1),
                 Tab::Doctor => self.doctor_scroll = self.doctor_scroll.saturating_sub(1),
+                Tab::Apps => {}
             },
             KeyCode::Down | KeyCode::Char('j') => match self.tab {
                 Tab::Dash => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
                 Tab::Logs => self.logs_scroll = self.logs_scroll.saturating_sub(1),
                 Tab::Doctor => self.doctor_scroll = self.doctor_scroll.saturating_add(1),
+                Tab::Apps => {}
             },
             KeyCode::PageUp => self.logs_scroll = self.logs_scroll.saturating_add(20),
             KeyCode::PageDown => self.logs_scroll = self.logs_scroll.saturating_sub(20),
@@ -639,9 +669,10 @@ impl App {
                 self.tab = match self.tab {
                     Tab::Dash => Tab::Logs,
                     Tab::Logs => Tab::Doctor,
-                    Tab::Doctor => Tab::Dash,
+                    Tab::Doctor => Tab::Apps,
+                    Tab::Apps => Tab::Dash,
                 };
-                if self.tab != Tab::Dash {
+                if !matches!(self.tab, Tab::Dash | Tab::Apps) {
                     let t = self.tab;
                     self.capture(t);
                 }
@@ -649,6 +680,7 @@ impl App {
             KeyCode::Char('1') => self.tab = Tab::Dash,
             KeyCode::Char('2') => self.act(Act::Logs),
             KeyCode::Char('3') => self.act(Act::Doctor),
+            KeyCode::Char('4') => self.show_apps(),
             KeyCode::Left | KeyCode::Right if self.tab == Tab::Logs => {
                 let k = LOG_SOURCES.len();
                 self.logs_which = if code == KeyCode::Left {
@@ -692,6 +724,7 @@ impl App {
                 Tab::Dash => self.tab = Tab::Dash,
                 Tab::Logs => self.act(Act::Logs),
                 Tab::Doctor => self.act(Act::Doctor),
+                Tab::Apps => self.show_apps(),
             }
             return;
         }
@@ -808,6 +841,7 @@ pub fn run() -> Result<()> {
         doctor: Vec::new(),
         doctor_scroll: 0,
         capturing: None,
+        apps: apps::AppsTab::new(),
         rows: Vec::new(),
         buttons: Vec::new(),
         tabs: Vec::new(),
@@ -849,7 +883,7 @@ pub fn run() -> Result<()> {
                     app.logs_at = Some(Instant::now());
                 }
                 Tab::Doctor => app.doctor = lines,
-                Tab::Dash => {}
+                Tab::Dash | Tab::Apps => {}
             }
             if app.capturing == Some(tab) {
                 app.capturing = None;
@@ -867,6 +901,12 @@ pub fn run() -> Result<()> {
             // The `conduit share` child rewrites the list; follow it.
             *items = crate::shares::load(vm).unwrap_or_default();
             *idx = (*idx).min(items.len().saturating_sub(1));
+        }
+        for (lvl, t) in app.apps.pump() {
+            app.note(lvl, t);
+        }
+        if app.tab == Tab::Apps {
+            app.apps.tick(app.snap.vms.get(app.sel));
         }
         app.reap();
         term.draw(|f| draw::draw(f, &mut app))?;
@@ -959,6 +999,7 @@ mod tests {
             doctor: vec!["ok".into()],
             doctor_scroll: 0,
             capturing: None,
+            apps: apps::AppsTab::new(),
             rows: vec![],
             buttons: vec![],
             tabs: vec![],
@@ -980,7 +1021,7 @@ mod tests {
         for (w, h) in [(20, 8), (80, 24), (120, 40), (240, 70)] {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             let mut a = app();
-            for tab in [Tab::Dash, Tab::Logs, Tab::Doctor] {
+            for tab in [Tab::Dash, Tab::Logs, Tab::Doctor, Tab::Apps] {
                 a.tab = tab;
                 t.draw(|f| draw::draw(f, &mut a)).unwrap();
             }
@@ -1006,6 +1047,45 @@ mod tests {
                 a.modal = Some(m);
                 t.draw(|f| draw::draw(f, &mut a)).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn draws_the_apps_tab_in_every_state() {
+        use ratatui::backend::TestBackend;
+        let mk = |n: &str| conduit_ctl::App {
+            name: n.into(),
+            source: "steam".into(),
+            ..Default::default()
+        };
+        for (w, h) in [(20, 8), (80, 24), (170, 46)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut a = app();
+            a.tab = Tab::Apps;
+            let name = a.snap.vms[0].name.clone();
+            a.snap.vms[0].state = "running".into();
+            a.snap.vms[0].libvirt = Some("qemu:///session".into());
+            // Nothing yet, loading, failed, listed, listed but stale.
+            t.draw(|f| draw::draw(f, &mut a)).unwrap();
+            let e = a.apps.vms.entry(name.clone()).or_default();
+            e.loading = true;
+            t.draw(|f| draw::draw(f, &mut a)).unwrap();
+            let e = a.apps.vms.get_mut(&name).unwrap();
+            e.loading = false;
+            e.error = Some("no answer\nstart the agent".into());
+            t.draw(|f| draw::draw(f, &mut a)).unwrap();
+            let e = a.apps.vms.get_mut(&name).unwrap();
+            e.list = (0..300)
+                .map(|i| mk(&format!("App número {i} 日本")))
+                .collect();
+            t.draw(|f| draw::draw(f, &mut a)).unwrap();
+            a.apps.sel = 299;
+            a.apps.filter = "99".into();
+            a.apps.typing = true;
+            t.draw(|f| draw::draw(f, &mut a)).unwrap();
+            assert!(a.apps.sel < 300);
+            a.snap.vms[0].state = "stopped".into();
+            t.draw(|f| draw::draw(f, &mut a)).unwrap();
         }
     }
 
