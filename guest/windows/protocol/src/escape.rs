@@ -646,7 +646,7 @@ pub const HELIOS_SCANOUT_ACQ_PROBE_ACK: u32 = 1;
 pub const HELIOS_SCANOUT_ACQ_NOT_FOUND: u32 = 2;
 /// REGISTER: the event table is full. Counted KMD-side (`AqRgF`). The caller
 /// still gates its rewrites on the ledger, but with no event its signaler sees
-/// a retirement only on its 10 ms poll: loud, never wedged, and slow.
+/// a retirement only on its 1 ms poll: loud, never wedged.
 pub const HELIOS_SCANOUT_ACQ_TABLE_FULL: u32 = 3;
 
 /// `HELIOS_ESCAPE_MAP_READ_LEDGER`. 40 bytes. PASSIVE, non-blocking.

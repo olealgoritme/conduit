@@ -1,0 +1,111 @@
+Helios DXVK fork: the no-event scanout-acquire signaler idles when nothing is armed
+
+Conduit guest/windows. Applied after 0015 by ci/windows/Build-Driver.ps1.
+
+The signaler thread starts on the first armed gate and runs until the device
+is destroyed. Without a retirement event it polls the read ledger every 1 ms
+holding timeBeginPeriod(1), also when no gate is armed, so a refused device
+that armed once keeps the process at a 1 ms timer period and 1000 wakeups/s
+for as long as it lives.
+
+After about 100 ms of polls with no gate armed it now polls every 10 ms and
+gives the 1 ms period back; armFence wakes it, and the next armed gate polls
+at 1 ms again. winmm is resolved once per thread instead of on every
+timeBeginPeriod. The event path is unchanged.
+
+diff --git a/src/dxvk/dxvk_helios_scanout_acquire.cpp b/src/dxvk/dxvk_helios_scanout_acquire.cpp
+index 3d97d967..bb871305 100644
+--- a/src/dxvk/dxvk_helios_scanout_acquire.cpp
++++ b/src/dxvk/dxvk_helios_scanout_acquire.cpp
+@@ -296,6 +296,9 @@ namespace dxvk {
+     }
+ 
+     startThreadLocked();
++    // An idle fallback signaler sleeps up to 10 ms; wake it so this gate is
++    // polled at 1 ms from the start. No waiter on the event path: a no-op.
++    m_cond.notify_all();
+     return gate.fence;
+   }
+ 
+@@ -357,9 +360,10 @@ namespace dxvk {
+     /* The no-event fallback polls every 1 ms. Without a raised timer
+      * resolution a 1 ms wait rounds up to the system tick (up to 15.6 ms), so
+      * the fallback holds a 1 ms period for as long as it polls and gives it
+-     * back as soon as the retirement event is registered or the thread ends.
+-     * winmm is resolved at run time: the standalone d3d11.dll build of this
+-     * engine does not link it. */
++     * back when the retirement event is registered, when nothing has been
++     * armed for a while, or when the thread ends. winmm is resolved once, at
++     * run time: the standalone d3d11.dll build of this engine does not link
++     * it. */
+     class HeliosFineTimer {
+       using PfnPeriod = UINT (WINAPI*)(UINT);
+ 
+@@ -368,15 +372,18 @@ namespace dxvk {
+         if (m_on)
+           return;
+ 
+-        HMODULE winmm = LoadLibraryW(L"winmm.dll");
++        if (!m_resolved) {
++          m_resolved = true;
+ 
+-        if (!winmm)
+-          return;
++          HMODULE winmm = LoadLibraryW(L"winmm.dll");
+ 
+-        m_begin = reinterpret_cast<PfnPeriod>(
+-          reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")));
+-        m_end   = reinterpret_cast<PfnPeriod>(
+-          reinterpret_cast<void*>(GetProcAddress(winmm, "timeEndPeriod")));
++          if (winmm) {
++            m_begin = reinterpret_cast<PfnPeriod>(
++              reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")));
++            m_end   = reinterpret_cast<PfnPeriod>(
++              reinterpret_cast<void*>(GetProcAddress(winmm, "timeEndPeriod")));
++          }
++        }
+ 
+         m_on = m_begin && m_end && m_begin(1u) == 0u;
+       }
+@@ -396,6 +403,7 @@ namespace dxvk {
+       PfnPeriod m_begin = nullptr;
+       PfnPeriod m_end   = nullptr;
+       bool      m_on    = false;
++      bool      m_resolved = false;
+     };
+   }
+ #endif
+@@ -408,6 +416,9 @@ namespace dxvk {
+     HeliosFineTimer fineTimer;
+ #endif
+ 
++    // Consecutive fallback polls that found no gate armed.
++    uint32_t idlePolls = 0u;
++
+     while (true) {
+       HANDLE event = nullptr;
+ 
+@@ -425,11 +436,20 @@ namespace dxvk {
+           // No registered retirement event (KMD table full, old KMD mid-skew,
+           // or not delivered yet): pure level-triggered polling, every 1 ms.
+           // The ledger is the truth either way; the event is only a latency
+-          // optimization.
++          // optimization. After ~100 ms with nothing armed the signaler idles
++          // at 10 ms and gives the 1 ms timer period back; armFence wakes it.
++          if (!m_gates.empty())
++            idlePolls = 0u;
++          else if (idlePolls <= 100u)
++            idlePolls++;
++          const bool idle = idlePolls > 100u;
+ #ifdef _WIN32
+-          fineTimer.begin();
++          if (idle)
++            fineTimer.end();
++          else
++            fineTimer.begin();
+ #endif
+-          m_cond.wait_for(lock, std::chrono::milliseconds(1));
++          m_cond.wait_for(lock, std::chrono::milliseconds(idle ? 10 : 1));
+ 
+           if (m_stop)
+             return;
