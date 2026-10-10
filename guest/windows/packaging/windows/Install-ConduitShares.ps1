@@ -21,7 +21,9 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 function Test-WinFsp {
     foreach ($k in @("HKLM:\SOFTWARE\WOW6432Node\WinFsp", "HKLM:\SOFTWARE\WinFsp")) {
-        $dir = (Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue).InstallDir
+        # Strict mode: a missing key or value is an error, so read it guarded.
+        $dir = $null
+        try { $dir = Get-ItemPropertyValue -LiteralPath $k -Name InstallDir -ErrorAction Stop } catch { }
         if ($dir -and (Test-Path -LiteralPath (Join-Path $dir "bin\winfsp-x64.dll"))) { return $true }
     }
     return $false
