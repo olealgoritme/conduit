@@ -20,6 +20,7 @@ mod handles;
 mod bindings;
 mod deferred;
 mod format_caps;
+mod frontend;
 mod layout;
 mod pipeline;
 mod present;
@@ -42,6 +43,11 @@ pub(super) use alloc::{ScanoutGeometry, VenusBacking};
 pub(crate) use bindings::*;
 pub(crate) use deferred::*;
 pub(crate) use format_caps::*;
+pub(crate) use frontend::{
+    frontend_install_11_0, frontend_install_11_1, frontend_install_dxgi, frontend_install_dxgi_1_1,
+    frontend_install_dxgi_1_3, frontend_install_dxgi_1_6_1, frontend_install_wddm1_3,
+    frontend_install_wddm2_3, Frontend,
+};
 pub(super) use handles::{Boxed, Com, ComHandle, DdiHandle, Slot};
 pub(crate) use layout::*;
 pub(crate) use pipeline::*;

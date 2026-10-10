@@ -15,16 +15,69 @@ use contract::{query_spec, QueryError};
 /// aliases copy ONLY the first word (deferred.rs); Begin/End/SetPredication use
 /// only that COM identity. GetData is absent from DC tables, and its explicit
 /// immediate-context check precedes every read of this metadata.
+///
+/// The two position words belong to the threaded front end
+/// (`docs/d3d11-threaded-frontend.md` §5.4): the ring position past the latest
+/// recorded `QueryBegin`/`QueryEnd`, and past the latest queued GetData flush. Both are read and written only by immediate-context calls
+/// (`QueryEnd`, `QueryGetData`), which the runtime serialises, so they are
+/// plain words, split in halves to keep the region 4-byte aligned on x86.
 #[repr(C)]
 struct QueryPrivate {
     com_raw: usize,
     ddi_query: ddi::D3D10DDI_QUERY,
+    end_pos: [u32; 2],
+    hint_pos: [u32; 2],
+}
+
+fn split_pos(pos: u64) -> [u32; 2] {
+    [pos as u32, (pos >> 32) as u32]
+}
+
+fn join_pos(words: [u32; 2]) -> u64 {
+    u64::from(words[0]) | (u64::from(words[1]) << 32)
+}
+
+/// The front end's `End` position of an immediate query handle (0 = none).
+pub(crate) unsafe fn query_end_pos(h_query: ddi::D3D10DDI_HQUERY) -> u64 {
+    let p = h_query.pDrvPrivate.cast::<QueryPrivate>();
+    if p.is_null() {
+        return 0;
+    }
+    join_pos(unsafe { (*p).end_pos })
+}
+
+pub(crate) unsafe fn set_query_end_pos(h_query: ddi::D3D10DDI_HQUERY, pos: u64) {
+    let p = h_query.pDrvPrivate.cast::<QueryPrivate>();
+    if !p.is_null() {
+        unsafe { (*p).end_pos = split_pos(pos) };
+    }
+}
+
+/// Ring position past the latest deferred GetData flush queued for the query
+/// (0 = none).
+pub(crate) unsafe fn query_hint_pos(h_query: ddi::D3D10DDI_HQUERY) -> u64 {
+    let p = h_query.pDrvPrivate.cast::<QueryPrivate>();
+    if p.is_null() {
+        return 0;
+    }
+    join_pos(unsafe { (*p).hint_pos })
+}
+
+pub(crate) unsafe fn set_query_hint_pos(h_query: ddi::D3D10DDI_HQUERY, pos: u64) {
+    let p = h_query.pDrvPrivate.cast::<QueryPrivate>();
+    if !p.is_null() {
+        unsafe { (*p).hint_pos = split_pos(pos) };
+    }
 }
 
 const _: () = {
     assert!(core::mem::offset_of!(QueryPrivate, com_raw) == 0);
     assert!(core::mem::offset_of!(QueryPrivate, ddi_query) == core::mem::size_of::<usize>());
-    assert!(core::mem::size_of::<QueryPrivate>() == 2 * core::mem::size_of::<usize>());
+    assert!(
+        core::mem::size_of::<QueryPrivate>()
+            == (2 * core::mem::size_of::<usize>() + 16 + core::mem::align_of::<usize>() - 1)
+                & !(core::mem::align_of::<usize>() - 1)
+    );
     assert!(core::mem::size_of::<ddi::BOOL>() == 4);
     assert!(core::mem::size_of::<ddi::UINT64>() == 8);
     assert!(core::mem::size_of::<ddi::D3D10_DDI_QUERY_DATA_TIMESTAMP_DISJOINT>() == 16);
@@ -211,6 +264,8 @@ pub(crate) unsafe extern "system" fn create_query(
                         .write(QueryPrivate {
                             com_raw: query.into_raw() as usize,
                             ddi_query: a.Query,
+                            end_pos: [0; 2],
+                            hint_pos: [0; 2],
                         });
                 }
                 _ => query_failure(
@@ -323,6 +378,49 @@ pub(crate) unsafe extern "system" fn query_get_data(
     data_size: u32,
     flags: u32,
 ) {
+    // SAFETY: as query_get_data_on; the context is the ordered accessor.
+    unsafe {
+        if let Some(context) = d3d11_context(h) {
+            query_get_data_on(h, &context, h_query, data, data_size, flags);
+        } else if matches!(drv_handle(h), Some(DrvHandle::Device(_))) {
+            query_failure(
+                h,
+                &QUERY_BACKEND_FAILED,
+                "QueryGetData context",
+                E_FAIL,
+                crate::hr::D3DDDIERR_DEVICEREMOVED,
+            );
+        } else {
+            query_failure(
+                h,
+                &QUERY_INVALID_REQUEST,
+                "QueryGetData deferred/invalid context",
+                E_INVALIDARG,
+                crate::hr::D3DDDIERR_DEVICEREMOVED,
+            );
+        }
+    }
+}
+
+/// What [`query_get_data_on`] reported.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetDataOutcome {
+    Ready,
+    Pending,
+    Failed,
+}
+
+/// The body of `pfnQueryGetData` against an explicit immediate context, so the
+/// threaded front end can run it on the app thread without the ordering drain
+/// of [`d3d11_context`] (`docs/d3d11-threaded-frontend.md` §5.4).
+pub(crate) unsafe fn query_get_data_on(
+    h: Hdevice,
+    context: &ID3D11DeviceContext,
+    h_query: ddi::D3D10DDI_HQUERY,
+    data: *mut c_void,
+    data_size: u32,
+    flags: u32,
+) -> GetDataOutcome {
     // SAFETY: metadata belongs only to immediate query slots. The tag check
     // precedes the read; output slices are formed only for the exact validated
     // DDI size, inside the caller's potentially uninitialized runtime buffer.
@@ -337,20 +435,10 @@ pub(crate) unsafe extern "system" fn query_get_data(
                 E_INVALIDARG,
                 crate::hr::D3DDDIERR_DEVICEREMOVED,
             );
-            return;
+            return GetDataOutcome::Failed;
         }
-        let Some(context) = d3d11_context(h) else {
-            query_failure(
-                h,
-                &QUERY_BACKEND_FAILED,
-                "QueryGetData context",
-                E_FAIL,
-                crate::hr::D3DDDIERR_DEVICEREMOVED,
-            );
-            return;
-        };
         let Some(query) = query_async(h, h_query) else {
-            return;
+            return GetDataOutcome::Failed;
         };
         let kind = (*h_query.pDrvPrivate.cast::<QueryPrivate>()).ddi_query;
         let Some(spec) = query_spec(kind) else {
@@ -361,7 +449,7 @@ pub(crate) unsafe extern "system" fn query_get_data(
                 kind,
                 crate::hr::D3DDDIERR_DEVICEREMOVED,
             );
-            return;
+            return GetDataOutcome::Failed;
         };
         if data_size != 0 && (data.is_null() || data_size != spec.ddi_size) {
             query_failure(
@@ -371,7 +459,7 @@ pub(crate) unsafe extern "system" fn query_get_data(
                 E_INVALIDARG,
                 crate::hr::D3DDDIERR_DEVICEREMOVED,
             );
-            return;
+            return GetDataOutcome::Failed;
         }
         let output = if data_size == 0 {
             None
@@ -384,8 +472,8 @@ pub(crate) unsafe extern "system" fn query_get_data(
         let result = contract::get_data(spec, output, flags, |local, size, flags| {
             let pointer = local.map_or(core::ptr::null_mut(), |local| local.as_mut_ptr());
             // Keep raw HRESULT: windows::Result<()> collapses S_FALSE into Ok.
-            (Interface::vtable(&*context).GetData)(
-                Interface::as_raw(&*context),
+            (Interface::vtable(context).GetData)(
+                Interface::as_raw(context),
                 Interface::as_raw(&query),
                 pointer,
                 size,
@@ -394,25 +482,58 @@ pub(crate) unsafe extern "system" fn query_get_data(
             .0
         });
         match result {
-            Ok(()) => {} // S_OK is represented by no SetError callback.
+            Ok(()) => GetDataOutcome::Ready, // S_OK is represented by no SetError callback.
             Err(QueryError::Pending) => {
-                set_runtime_error(h, crate::hr::DXGI_DDI_ERR_WASSTILLDRAWING)
+                set_runtime_error(h, crate::hr::DXGI_DDI_ERR_WASSTILLDRAWING);
+                GetDataOutcome::Pending
             }
-            Err(QueryError::InvalidRequest) => query_failure(
-                h,
-                &QUERY_INVALID_REQUEST,
-                "QueryGetData flags/size",
-                E_INVALIDARG,
-                crate::hr::D3DDDIERR_DEVICEREMOVED,
-            ),
-            Err(QueryError::Backend(hr)) => query_failure(
-                h,
-                &QUERY_BACKEND_FAILED,
-                "QueryGetData backend",
-                hr,
-                crate::hr::D3DDDIERR_DEVICEREMOVED,
-            ),
+            Err(QueryError::InvalidRequest) => {
+                query_failure(
+                    h,
+                    &QUERY_INVALID_REQUEST,
+                    "QueryGetData flags/size",
+                    E_INVALIDARG,
+                    crate::hr::D3DDDIERR_DEVICEREMOVED,
+                );
+                GetDataOutcome::Failed
+            }
+            Err(QueryError::Backend(hr)) => {
+                query_failure(
+                    h,
+                    &QUERY_BACKEND_FAILED,
+                    "QueryGetData backend",
+                    hr,
+                    crate::hr::D3DDDIERR_DEVICEREMOVED,
+                );
+                GetDataOutcome::Failed
+            }
         }
+    }
+}
+
+/// The flush DXVK's `GetData` performs for an unflagged pending read
+/// (`NotifyStall` + `ConsiderFlush`), replayed on the front end's worker:
+/// `GetData(query, nullptr, 0, 0)`. `com_raw` is the query's identity word.
+pub(crate) unsafe fn query_flush_hint(h: Hdevice, com_raw: usize) {
+    // SAFETY: the word is kept alive by the front end's destruction ordering.
+    unsafe {
+        let Some(context) = d3d11_context(h) else {
+            return;
+        };
+        let mut word = com_raw;
+        let h_query = ddi::D3D10DDI_HQUERY {
+            pDrvPrivate: (&mut word as *mut usize).cast(),
+        };
+        let Some(query) = load_com::<ID3D11Query>(h_query) else {
+            return;
+        };
+        let _ = (Interface::vtable(&*context).GetData)(
+            Interface::as_raw(&*context),
+            Interface::as_raw(&*query),
+            core::ptr::null_mut(),
+            0,
+            0,
+        );
     }
 }
 

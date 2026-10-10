@@ -46,6 +46,17 @@ struct HeliosDxvkDevice {
   // The bridge gives it only to that exact deferred context's bounded cache;
   // the list's origin check rejects a cross-DC handoff, and false means the
   // caller still owns and releases the command-list reference.
+  // Threaded front end (docs/d3d11-threaded-frontend.md §5.2). The buffer
+  // address is a live `ID3D11Buffer*` of a CPU-writable buffer, borrowed.
+  // fe_map_discard runs on the app thread: it returns an owned slice token
+  // and its mapped pointer in `*data`; token 0 with `*data == 1` means the
+  // buffer has no CPU mapping, token 0 otherwise that the device is lost. The token is consumed
+  // exactly once, by fe_emit_invalidate on the worker (in replay order) or by
+  // fe_release_slice. fe_buffer_map_ptr is the WRITE_NO_OVERWRITE answer.
+  std::size_t fe_map_discard(std::size_t buffer_ptr, std::size_t* data) const noexcept;
+  std::size_t fe_buffer_map_ptr(std::size_t buffer_ptr) const noexcept;
+  void fe_emit_invalidate(std::size_t buffer_ptr, std::size_t slice) const noexcept;
+  void fe_release_slice(std::size_t slice) const noexcept;
   bool recycle_deferred_command_list(
       std::size_t deferred_context_ptr,
       std::size_t command_list_ptr) const noexcept;
