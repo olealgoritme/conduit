@@ -16,14 +16,10 @@ name: ci
 on:
   push:
     branches: [master, main]
+  # Every pull request, generated-table-only ones (the weekly ABI PR) too:
+  # the jobs here are the required checks, and a skipped workflow never
+  # reports them.
   pull_request:
-    # The weekly ABI PR only touches generated tables and runs its own tests
-    # in abi.yml; CI runs on main after it merges.
-    paths-ignore:
-      - 'guest/linux/devinfo/**'
-      - 'guest/linux/rmctrl/**'
-      - 'guest/linux/gen/**'
-      - 'host/backend/gen/**'
   workflow_dispatch:
 
 concurrency:
@@ -71,7 +67,7 @@ jobs:
       # pinned in rust-toolchain.toml (with rustfmt and clippy).
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ matrix.dir }}
       - name: fmt
@@ -188,7 +184,7 @@ jobs:
             libssl-dev libegl-dev libgl-dev libgbm-dev pkg-config
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: host/stream
       - name: fmt
@@ -219,9 +215,17 @@ jobs:
         with:
           fetch-depth: 0 # build.sh derives the version from tags
       - name: actionlint
+        # A pinned release, checked against its published SHA-256.
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          ./actionlint -color
+          tgz="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tgz"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
       - name: shellcheck
         run: |
           shellcheck -S warning \

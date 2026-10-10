@@ -300,10 +300,17 @@ cmd_stage() {
 
     # The guest driver packages `conduit create` / `conduit stock-kernel` /
     # `conduit attach` install into VMs (DKMS builds the module there for the
-    # VM's own kernel): the .deb, and the Arch package for Arch guests.
+    # VM's own kernel): the .deb, and the Arch package for Arch guests. A
+    # .deb `package guest-deb` already put in $OUT is reused; otherwise it is
+    # built under $DIST, so staging never adds files to $OUT (each host
+    # package job uploads all of $OUT).
     local gdeb="$OUT/conduit-guest_${v}-1_all.deb" garch="$DIST/guest-arch/conduit-guest.pkg.tar.zst"
-    if [ ! -f "$gdeb" ] && command -v nfpm >/dev/null; then
-        guest_package deb "$gdeb"
+    if [ ! -f "$gdeb" ]; then
+        gdeb="$DIST/guest-deb/conduit-guest_${v}-1_all.deb"
+        if command -v nfpm >/dev/null; then
+            install -d "$DIST/guest-deb"
+            guest_package deb "$gdeb"
+        fi
     fi
     if [ -f "$gdeb" ]; then
         install -D -m0644 "$gdeb" "$o/share/conduit/guest/conduit-guest.deb"

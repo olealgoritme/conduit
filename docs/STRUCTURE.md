@@ -78,6 +78,7 @@ conduit/
 | `conduit-bios_B-1_all.deb` / `conduit-bios-B-1.noarch.rpm` / `conduit-bios-B-1-any.pkg.tar.zst` / `conduit-bios-B-x86_64.tar.gz` | host, optional | Conduit BIOS: edk2 OVMF with the Conduit boot logo, for `conduit attach` (B = edk2 build + revision, `packaging/bios/version.sh`; bios.yml, cached) |
 | `flake.nix` | NixOS | in the repo |
 | `SHA256SUMS` | | checksums of the files above |
+| `conduit-windows-gpu-driver-X.zip`, `SHA256SUMS-windows` | inside a Windows VM | the Windows guest driver (windows.yml) and its checksum |
 
 No release artifact has `conduit-venus` yet: release.yml does not run
 `packaging/build.sh venus` (docs/PACKAGING.md).

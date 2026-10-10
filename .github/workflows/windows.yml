@@ -481,14 +481,16 @@ jobs:
           retention-days: 30
 
   # On a v* tag, attach the driver zip to the GitHub release that release.yml
-  # creates from the same tag (it publishes after the Linux packages are built,
-  # so wait for it) and add the zip to the release's SHA256SUMS.
+  # creates from the same tag (it publishes after the Linux packages are
+  # built, QEMU included on a cache miss, so wait for it), with its checksum
+  # in its own SHA256SUMS-windows: release.yml's SHA256SUMS stays as that
+  # workflow wrote it, whichever of the two finishes last.
   release:
     name: Attach the driver zip to the release
     needs: package
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 200
     permissions:
       contents: write
     env:
@@ -502,23 +504,19 @@ jobs:
           path: zip
       - name: Wait for the release
         run: |
-          # release.yml uploads SHA256SUMS together with the packages
-          for _ in $(seq 60); do
+          # release.yml creates the release in its last job, with SHA256SUMS.
+          for _ in $(seq 180); do
             if gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx SHA256SUMS; then
               exit 0
             fi
             sleep 60
           done
-          echo "::error::Release $TAG (with SHA256SUMS) did not appear within 60 minutes; check the release workflow, then re-run this job."
+          echo "::error::Release $TAG did not appear within 3 hours; check the release workflow, then re-run this job."
           exit 1
-      - name: Upload the zip and update SHA256SUMS
+      - name: Upload the zip and SHA256SUMS-windows
         run: |
           zip=$(ls zip/conduit-windows-gpu-driver-*.zip)
           name=$(basename "$zip")
-          gh release upload "$TAG" "$zip" --clobber
-          mkdir sums
-          gh release download "$TAG" --pattern SHA256SUMS --dir sums
-          { grep -vF "  $name" sums/SHA256SUMS || true; (cd zip && sha256sum "$name"); } | sort -k2 > sums/new
-          mv sums/new sums/SHA256SUMS
-          gh release upload "$TAG" sums/SHA256SUMS --clobber
-          cat sums/SHA256SUMS
+          (cd zip && sha256sum "$name") > SHA256SUMS-windows
+          gh release upload "$TAG" "$zip" SHA256SUMS-windows --clobber
+          cat SHA256SUMS-windows
