@@ -168,7 +168,12 @@ fn build_icon(face: Option<(String, (u8, u8, u8))>) -> Option<isize> {
             } else {
                 (255, 255, 255)
             };
-            let px = if text.len() >= 3 { s * 0.58 } else { s * 0.80 };
+            // As large as fits on one line: two digits at 16 px wrapped at
+            // the old fixed size and showed only the first.
+            let mut px = s * 0.78;
+            while px > 5.0 && g.text_width(&text, px, true) > s * 0.96 {
+                px -= 0.5;
+            }
             g.text(
                 &text,
                 argb(255, ink),
@@ -176,7 +181,7 @@ fn build_icon(face: Option<(String, (u8, u8, u8))>) -> Option<isize> {
                 true,
                 gfx::Align::Center,
                 true,
-                (0.0, 0.0, s, s),
+                (-s, 0.0, 3.0 * s, s),
             );
         }
         None => {

@@ -59,20 +59,6 @@ impl Gfx {
     }
 
     /// Everything drawn afterwards is in units of `s` pixels.
-    /// Draws an icon handle scaled into the rectangle.
-    pub fn icon(&self, icon: isize, x: f32, y: f32, w: f32, h: f32) {
-        if icon == 0 {
-            return;
-        }
-        unsafe {
-            let mut bmp = null_mut();
-            if GdipCreateBitmapFromHICON(icon as _, &mut bmp) == 0 && !bmp.is_null() {
-                GdipDrawImageRect(self.g, bmp as *mut GpImage, x, y, w, h);
-                GdipDisposeImage(bmp as *mut GpImage);
-            }
-        }
-    }
-
     pub fn scale(&self, s: f32) {
         unsafe { GdipScaleWorldTransform(self.g, s, s, 0) };
     }
