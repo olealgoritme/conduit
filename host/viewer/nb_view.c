@@ -655,6 +655,26 @@ void nb_vstore_parse(struct nb_vstore *st, const char *text)
                 st->recent[st->nrecent][1] = h;
                 st->nrecent++;
             }
+        } else if (!strcmp(line, "rule")) {
+            char *bar = strchr(eq + 1, '|');
+            struct nb_rule *ru;
+            unsigned w, h;
+
+            if (!bar || st->nrule >= NB_MAX_RULES) {
+                continue;
+            }
+            *bar = '\0';
+            if (nb_view_parse_res(eq + 1, &w, &h) != 0 || !w || !h ||
+                nb_vstore_rule_find(st, w, h) >= 0) {
+                continue;
+            }
+            ru = &st->rule[st->nrule];
+            ru->w = w;
+            ru->h = h;
+            nb_view_defaults(&ru->v);
+            view_parse_words(&ru->v, bar + 1);
+            ru->v.res_w = ru->v.res_h = 0;
+            st->nrule++;
         } else if (!strcmp(line, "profile")) {
             char *bar = strchr(eq + 1, '|');
             struct nb_profile *pr;
@@ -677,11 +697,28 @@ void nb_vstore_parse(struct nb_vstore *st, const char *text)
     }
 }
 
-size_t nb_vstore_format(const struct nb_vstore *st, char *buf, size_t n)
+/* cur with the layout fields of `lay` (area, scale, filter); res kept. */
+static void take_layout(struct nb_view *dst, const struct nb_view *lay)
+{
+    unsigned rw = dst->res_w, rh = dst->res_h;
+
+    *dst = *lay;
+    dst->res_w = rw;
+    dst->res_h = rh;
+}
+
+size_t nb_vstore_format(const struct nb_vstore *st0, char *buf, size_t n)
 {
     size_t at = 0;
     char a[40], r[24];
     int i;
+    /* While a rule is in force the file keeps the layout under it. */
+    struct nb_vstore stv = *st0;
+    const struct nb_vstore *st = &stv;
+
+    if (stv.ruled) {
+        take_layout(&stv.cur, &stv.base);
+    }
 
 #define PUT(...) do { \
         int k_ = snprintf(buf + at, at < n ? n - at : 0, __VA_ARGS__); \
@@ -708,6 +745,14 @@ size_t nb_vstore_format(const struct nb_vstore *st, char *buf, size_t n)
 
         view_words(&st->prof[i].v, words, sizeof(words));
         PUT("profile=%s|%s\n", st->prof[i].name, words);
+    }
+    for (i = 0; i < st->nrule; i++) {
+        char words[200];
+        struct nb_view t = st->rule[i].v;
+
+        t.res_w = t.res_h = 0;
+        view_words(&t, words, sizeof(words));
+        PUT("rule=%ux%u|%s\n", st->rule[i].w, st->rule[i].h, words);
     }
 #undef PUT
     return at;
@@ -967,6 +1012,178 @@ unsigned nb_view_cycle_res(struct nb_vstore *st, char *label, size_t n)
     } else {
         snprintf(label, n, "Guest resolution: Native");
     }
+    return NB_VIEW_CH_RES;
+}
+
+/* ── per-guest-mode rules ────────────────────────────────────────────── */
+
+int nb_vstore_rule_find(const struct nb_vstore *st, unsigned w, unsigned h)
+{
+    int i;
+
+    for (i = 0; i < st->nrule; i++) {
+        if (st->rule[i].w == w && st->rule[i].h == h) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int nb_vstore_rule_save(struct nb_vstore *st, unsigned w, unsigned h)
+{
+    int i = nb_vstore_rule_find(st, w, h);
+
+    if (!w || !h) {
+        return -1;
+    }
+    if (i < 0) {
+        if (st->nrule >= NB_MAX_RULES) {
+            return -1;
+        }
+        i = st->nrule++;
+    }
+    st->rule[i].w = w;
+    st->rule[i].h = h;
+    st->rule[i].v = st->cur;
+    st->rule[i].v.res_w = st->rule[i].v.res_h = 0;
+    if (!st->ruled && !st->base_set) {
+        st->base = st->cur;
+    }
+    st->base_set = true;
+    st->ruled = true;
+    st->rule_w = w;
+    st->rule_h = h;
+    return i;
+}
+
+void nb_vstore_rule_delete(struct nb_vstore *st, int i)
+{
+    if (i < 0 || i >= st->nrule) {
+        return;
+    }
+    if (st->ruled && st->rule[i].w == st->rule_w &&
+        st->rule[i].h == st->rule_h) {
+        /* The layout in force stays until the next mode change. */
+        st->base = st->cur;
+    }
+    memmove(&st->rule[i], &st->rule[i + 1],
+            (size_t)(st->nrule - i - 1) * sizeof(st->rule[0]));
+    st->nrule--;
+}
+
+static bool same_layout(const struct nb_view *a, const struct nb_view *b)
+{
+    return a->scale == b->scale && a->filter == b->filter &&
+           a->area == b->area && a->cw == b->cw && a->ch == b->ch &&
+           a->cx == b->cx && a->cy == b->cy && a->ccenter == b->ccenter;
+}
+
+unsigned nb_vstore_guest_mode(struct nb_vstore *st, unsigned w, unsigned h,
+                              char *label, size_t n)
+{
+    struct nb_view old = st->cur;
+    int i = nb_vstore_rule_find(st, w, h);
+
+    if (label && n) {
+        label[0] = '\0';
+    }
+    if (i >= 0) {
+        if (st->ruled && st->rule_w == w && st->rule_h == h) {
+            return 0;           /* already in force */
+        }
+        if (!st->ruled) {
+            st->base = st->cur;
+            st->base_set = true;
+        }
+        take_layout(&st->cur, &st->rule[i].v);
+        st->ruled = true;
+        st->rule_w = w;
+        st->rule_h = h;
+        if (label && n) {
+            char a[40];
+
+            nb_view_area_str(&st->cur, a, sizeof(a));
+            snprintf(label, n, "%ux%u: %s, %s", w, h,
+                     st->cur.area == NB_AREA_FULL ? "full" : a,
+                     nb_view_scale_name(st->cur.scale));
+        }
+    } else if (st->ruled) {
+        take_layout(&st->cur, &st->base);
+        st->ruled = false;
+        if (label && n) {
+            snprintf(label, n, "%ux%u: usual picture settings", w, h);
+        }
+    } else {
+        /* A mode without a rule: what the picture looks like on arrival
+         * is what a rule remembered here later comes back to. */
+        st->base = st->cur;
+        st->base_set = true;
+        return 0;
+    }
+    return same_layout(&old, &st->cur) ? 0 : NB_VIEW_CH_LAYOUT;
+}
+
+/* ── the display's mode list ─────────────────────────────────────────── */
+
+int nb_modes_feed(struct nb_modes_rx *rx, unsigned w, unsigned h, unsigned idx,
+                  unsigned count, unsigned mhz, unsigned long long gen,
+                  unsigned flags)
+{
+    struct nb_modes *in = &rx->in;
+
+    if (!count || count > NB_MODES_MAX || idx >= count || !w || !h ||
+        w > 8192 || h > 8192 || (idx == 0) != !!(flags & NB_MODE_NATIVE) ||
+        idx != rx->next ||
+        (idx > 0 && (in->gen != gen || in->n != count || in->mhz != mhz))) {
+        rx->next = 0;
+        /* A record 0 that broke the order starts afresh next time. */
+        return -1;
+    }
+    if (idx == 0) {
+        memset(in, 0, sizeof(*in));
+        in->n = count;
+        in->gen = gen;
+        in->mhz = mhz;
+    }
+    in->w[idx] = w;
+    in->h[idx] = h;
+    in->flags[idx] = flags & (NB_MODE_NATIVE | NB_MODE_CUSTOM);
+    rx->next = idx + 1;
+    if (rx->next < count) {
+        return 0;
+    }
+    rx->cur = *in;
+    rx->next = 0;
+    return 1;
+}
+
+int nb_modes_find(const struct nb_modes *m, unsigned w, unsigned h)
+{
+    unsigned i;
+
+    for (i = 0; m && i < m->n; i++) {
+        if (m->w[i] == w && m->h[i] == h) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+unsigned nb_view_cycle_mode(struct nb_vstore *st, const struct nb_modes *m,
+                            unsigned cur_w, unsigned cur_h, char *label,
+                            size_t n)
+{
+    int at;
+
+    if (!m || !m->n) {
+        return nb_view_cycle_res(st, label, n);
+    }
+    at = nb_modes_find(m, cur_w, cur_h);
+    at = at < 0 ? 0 : (at + 1) % (int)m->n;
+    st->cur.res_w = m->w[at];
+    st->cur.res_h = m->h[at];
+    snprintf(label, n, "Guest resolution: %ux%u%s", m->w[at], m->h[at],
+             (m->flags[at] & NB_MODE_NATIVE) ? " (native)" : "");
     return NB_VIEW_CH_RES;
 }
 

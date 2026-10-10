@@ -131,6 +131,46 @@ viewer window/fullscreen change ──EV_MODE_HINT──► backend ModePolicy �
 - Until the guest has switched the viewer scales per its scale mode (fit by
   default), and shows the buffer 1:1 (no viewport) once sizes match.
 
+## Mode list
+
+One list of modes per VM, the way a physical monitor's EDID lists its modes:
+
+- **native**: the backend's `--display` size, first, at the native rate;
+- the **standard modes** that fit within native in both dimensions
+  (640x480 up to 5120x2880; `protocol::modes::STANDARD_MODES`);
+- the VM's **custom modes**, any size from 64 to 8192 per side, kept one
+  `WxH` per line in `~/.local/share/conduit/vms/VM/display-modes`.
+
+Every mode runs at the native rate. `host/backend/protocol/src/modes.rs` builds
+the list for the backend and the CLI alike (at most 48 modes, custom modes
+never dropped).
+
+```
+conduit display VM --add WxH ─┐                        ┌─DisplayModeList (34)──► guest driver
+viewer menu ──EV_MODE_EDIT────┼─► display-modes file ──► backend ModeCatalog
+                              ┘   (re-read on change)  └─CMD_MODES records ────► every viewer
+```
+
+- **Guest**: event `DisplayModeList` (34), `DisplayModeListHeader{scanout,
+  count, refresh_mhz, flags}` then `count` x `{width, height}`, entry 0
+  native. Sent when the event queue is up, on every change, and again to a
+  restarted driver, only to a guest that acked the device feature
+  `NVGPU_F_MODE_LIST` (bit 21). The Linux module then offers exactly these
+  modes, the current preferred one (`DisplayMode`) first; a changed list is a
+  hotplug. A guest that does not ack it builds its own list, as before.
+- **Viewer**: `CMD_MODES` (8), one record per mode, the whole list at once,
+  only to a broker with `CAP_MODE_LIST` (bit 17); see
+  [broker-protocol.md](../host/viewer/docs/broker-protocol.md). The menu's
+  resolution section and Ctrl+Alt+R walk exactly this list, the guest's
+  current mode marked; a click is an ordinary mode hint. Adding a mode in the
+  menu sends `EV_MODE_EDIT` (22): the backend writes the file and every
+  guest and viewer gets the new list.
+- **Per-mode picture rules** (viewer): "Remember for WxH" keeps the area,
+  scale and filter in force for that guest mode (`rule=WxH|...` in the VM's
+  `viewer.conf`). Whenever the guest's picture changes size the rule for the
+  new mode applies; leaving it for a mode without a rule brings back the
+  layout from before. The pointer mapping follows the picture as always.
+
 ## Hardware cursor
 
 ```

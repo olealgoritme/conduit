@@ -606,7 +606,64 @@ static void build(struct nb_ui *ui, const struct nb_ui_env *env, struct pnt *p)
     }
     b.y += 16;
 
-    /* resolution */
+    /* resolution: the VM's mode list when the backend sends one */
+    if (env->modes && env->modes->n) {
+        const struct nb_modes *m = env->modes;
+        bool any_custom = false;
+
+        section(&b, "Guest resolution");
+        for (i = 0; i < (int)m->n; i++) {
+            snprintf(s, sizeof(s), "%ux%u%s", m->w[i], m->h[i],
+                     (m->flags[i] & NB_MODE_NATIVE) ? " native" : "");
+            chip(&b, s, NB_UI_ID_RES_MODE, i,
+                 env->buf_w == (int)m->w[i] && env->buf_h == (int)m->h[i],
+                 false);
+            any_custom |= (m->flags[i] & NB_MODE_CUSTOM) != 0;
+        }
+        chip(&b, "Match window", NB_UI_ID_RES_NATIVE, 0,
+             !v->res_w || !v->res_h, false);
+        if (any_custom) {
+            hint(&b, "Custom modes (click to remove):");
+            for (i = 0; i < (int)m->n; i++) {
+                bool armed = ui->confirm ==
+                             ((NB_UI_ID_RES_MODE_DEL << 8) | (i & 0xff));
+
+                if (!(m->flags[i] & NB_MODE_CUSTOM)) {
+                    continue;
+                }
+                if (armed) {
+                    snprintf(s, sizeof(s), "Remove %ux%u?", m->w[i], m->h[i]);
+                } else {
+                    snprintf(s, sizeof(s), "x %ux%u", m->w[i], m->h[i]);
+                }
+                chip(&b, s, NB_UI_ID_RES_MODE_DEL, i, armed, false);
+            }
+        }
+        field(&b, NB_UI_ID_RES_FIELD, "Add a mode WxH, Enter");
+        if (env->buf_w > 0 && env->buf_h > 0) {
+            int r = nb_vstore_rule_find(st, (unsigned)env->buf_w,
+                                        (unsigned)env->buf_h);
+
+            if (r >= 0) {
+                char sum[64];
+
+                nb_view_summary(&st->rule[r].v, sum, sizeof(sum));
+                snprintf(s, sizeof(s), "At %dx%d: %s", env->buf_w,
+                         env->buf_h, sum);
+            } else {
+                snprintf(s, sizeof(s), "At %dx%d: the usual picture settings",
+                         env->buf_w, env->buf_h);
+            }
+            hint(&b, s);
+            snprintf(s, sizeof(s), "Remember for %dx%d", env->buf_w,
+                     env->buf_h);
+            chip(&b, s, NB_UI_ID_RULE_SAVE, 0, false, false);
+            if (r >= 0) {
+                chip(&b, "Forget", NB_UI_ID_RULE_DEL, r, false, false);
+            }
+        }
+        goto area;
+    }
     section(&b, "Guest resolution");
     chip(&b, "Native", NB_UI_ID_RES_NATIVE, 0, !v->res_w || !v->res_h, false);
     for (i = 0; i < NB_RES_PRESETS; i++) {
@@ -624,6 +681,7 @@ static void build(struct nb_ui *ui, const struct nb_ui_env *env, struct pnt *p)
     }
     field(&b, NB_UI_ID_RES_FIELD, "Custom WxH, Enter to apply");
 
+area:
     /* area */
     section(&b, "Picture area");
     for (i = NB_AREA_FULL; i < NB_AREA_CUSTOM; i++) {
@@ -910,6 +968,42 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
         v->res_w = nb_res_preset[it->arg][0];
         v->res_h = nb_res_preset[it->arg][1];
         return (bits | res_notice(ui, diff(&old, v))) | NB_UI_REDRAW;
+    case NB_UI_ID_RES_MODE:
+        if (env->modes && it->arg >= 0 && it->arg < (int)env->modes->n) {
+            v->res_w = env->modes->w[it->arg];
+            v->res_h = env->modes->h[it->arg];
+        }
+        return (bits | res_notice(ui, diff(&old, v))) | NB_UI_REDRAW;
+    case NB_UI_ID_RES_MODE_DEL:
+        if (!env->modes || it->arg < 0 || it->arg >= (int)env->modes->n ||
+            !(env->modes->flags[it->arg] & NB_MODE_CUSTOM)) {
+            return bits | NB_UI_REDRAW;
+        }
+        if (ui->confirm != code) {
+            ui->confirm = code;
+            return bits | NB_UI_REDRAW;
+        }
+        ui->confirm = 0;
+        ui->mode_w = env->modes->w[it->arg];
+        ui->mode_h = env->modes->h[it->arg];
+        return noticef(ui, bits | NB_UI_MODE_DEL | NB_UI_REDRAW,
+                       "Removed mode %ux%u", ui->mode_w, ui->mode_h);
+    case NB_UI_ID_RULE_SAVE:
+        if (env->buf_w <= 0 || env->buf_h <= 0 ||
+            nb_vstore_rule_save(st, (unsigned)env->buf_w,
+                                (unsigned)env->buf_h) < 0) {
+            return noticef(ui, bits | NB_UI_REDRAW, "%s",
+                           "Cannot remember more resolutions");
+        }
+        nb_ui_layout(ui, env, NULL, NULL);
+        return noticef(ui, bits | NB_UI_SAVE | NB_UI_REDRAW,
+                       "Remembered for %dx%d", env->buf_w, env->buf_h);
+    case NB_UI_ID_RULE_DEL:
+        nb_vstore_rule_delete(st, it->arg);
+        nb_ui_layout(ui, env, NULL, NULL);
+        return noticef(ui, bits | NB_UI_SAVE | NB_UI_REDRAW,
+                       "Forgot the settings for %dx%d", env->buf_w,
+                       env->buf_h);
     case NB_UI_ID_RES_RECENT:
         if (it->arg < st->nrecent) {
             v->res_w = st->recent[it->arg][0];
@@ -1334,10 +1428,22 @@ unsigned nb_ui_key(struct nb_ui *ui, const struct nb_ui_env *env,
             }
             st->cur.res_w = w;
             st->cur.res_h = h;
-            nb_vstore_note_res(st, w, h);
             ui->focus = 0;
             ui->text[0] = '\0';
             bits = diff(&old, &st->cur) | NB_UI_SAVE | NB_UI_REDRAW;
+            if (env->modes && env->modes->n) {
+                /* Into the VM's mode list (the guest and every viewer get
+                 * it), and the guest switches to it. */
+                if (nb_modes_find(env->modes, w, h) < 0) {
+                    ui->mode_w = w;
+                    ui->mode_h = h;
+                    bits |= NB_UI_MODE_ADD;
+                }
+                nb_ui_layout(ui, env, NULL, NULL);
+                return noticef(ui, bits | NB_UI_RES,
+                               "Guest resolution: %ux%u", w, h);
+            }
+            nb_vstore_note_res(st, w, h);
             nb_ui_layout(ui, env, NULL, NULL);
             return res_notice(ui, bits);
         }

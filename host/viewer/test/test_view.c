@@ -536,6 +536,150 @@ static void test_override(void)
           a.res_w == 1280, "override only what was given");
 }
 
+static void test_rules(void)
+{
+    struct nb_vstore st, back;
+    char label[96], buf[8192];
+    unsigned ch;
+
+    nb_vstore_init(&st);
+    st.cur.scale = NB_SCALE_ASPECT;
+    st.cur.area = NB_AREA_FULL;
+    /* No rule: a mode change changes nothing. */
+    CHECK(nb_vstore_guest_mode(&st, 1280, 960, label, sizeof(label)) == 0,
+          "no rule, no change");
+    CHECK(!st.ruled, "not ruled");
+
+    /* In 1280x960 the user picks 4:3 stretch and remembers it. */
+    st.cur.area = NB_AREA_4_3;
+    st.cur.scale = NB_SCALE_STRETCH;
+    CHECK(nb_vstore_rule_save(&st, 1280, 960) == 0, "rule saved");
+    CHECK(st.ruled && st.rule_w == 1280, "the rule is in force");
+    /* The layout from before the edit (on arrival at 1280x960) is the one
+     * to come back to. */
+    CHECK(st.base.area == NB_AREA_FULL && st.base.scale == NB_SCALE_ASPECT,
+          "base is the arrival layout");
+
+    /* Back to native (no rule): the usual layout comes back. */
+    ch = nb_vstore_guest_mode(&st, 5120, 1440, label, sizeof(label));
+    CHECK(ch == NB_VIEW_CH_LAYOUT, "leaving the ruled mode re-lays out");
+    CHECK(st.cur.area == NB_AREA_FULL && st.cur.scale == NB_SCALE_ASPECT,
+          "usual layout back");
+    CHECK(!st.ruled, "no rule in force");
+
+    /* The guest goes to 1280x960 again: the rule applies by itself. */
+    ch = nb_vstore_guest_mode(&st, 1280, 960, label, sizeof(label));
+    CHECK(ch == NB_VIEW_CH_LAYOUT, "rule applied");
+    CHECK(st.cur.area == NB_AREA_4_3 && st.cur.scale == NB_SCALE_STRETCH,
+          "rule layout");
+    CHECK(strstr(label, "1280x960") != NULL, "label names the mode: %s", label);
+    CHECK(nb_vstore_guest_mode(&st, 1280, 960, label, sizeof(label)) == 0,
+          "same mode again: nothing");
+
+    /* A rule for native too: full, 1:1. */
+    nb_vstore_guest_mode(&st, 5120, 1440, NULL, 0);
+    st.cur.scale = NB_SCALE_NONE;
+    CHECK(nb_vstore_rule_save(&st, 5120, 1440) == 1, "second rule");
+    ch = nb_vstore_guest_mode(&st, 1280, 960, NULL, 0);
+    CHECK(ch == NB_VIEW_CH_LAYOUT && st.cur.scale == NB_SCALE_STRETCH,
+          "rule to rule");
+    ch = nb_vstore_guest_mode(&st, 5120, 1440, NULL, 0);
+    CHECK(ch == NB_VIEW_CH_LAYOUT && st.cur.scale == NB_SCALE_NONE,
+          "native's own rule");
+
+    /* The res setting is never touched by a rule. */
+    st.cur.res_w = 1280;
+    st.cur.res_h = 960;
+    nb_vstore_guest_mode(&st, 1280, 960, NULL, 0);
+    CHECK(st.cur.res_w == 1280 && st.cur.res_h == 960, "res kept");
+
+    /* Saved and read back: rules survive, and the file keeps the base
+     * layout, not the one a rule put in force. */
+    nb_vstore_format(&st, buf, sizeof(buf));
+    CHECK(strstr(buf, "rule=1280x960|") != NULL, "rule line: %s", buf);
+    CHECK(strstr(buf, "rule=5120x1440|") != NULL, "native rule line");
+    nb_vstore_init(&back);
+    nb_vstore_parse(&back, buf);
+    CHECK(back.nrule == 2, "two rules back (%d)", back.nrule);
+    CHECK(back.rule[0].v.area == NB_AREA_4_3 &&
+          back.rule[0].v.scale == NB_SCALE_STRETCH, "rule layout back");
+    CHECK(back.cur.scale == st.base.scale && back.cur.area == st.base.area,
+          "file has the base layout");
+    CHECK(!back.ruled, "a loaded store starts with no rule in force");
+
+    /* Delete: the one in force keeps its layout until the next change. */
+    nb_vstore_rule_delete(&st, nb_vstore_rule_find(&st, 1280, 960));
+    CHECK(st.nrule == 1 && nb_vstore_rule_find(&st, 1280, 960) < 0, "deleted");
+    CHECK(st.cur.scale == NB_SCALE_STRETCH, "layout kept for now");
+
+    /* Malformed lines are skipped; duplicates too. */
+    nb_vstore_init(&back);
+    nb_vstore_parse(&back, "rule=junk|scale=fit\nrule=800x600\n"
+                           "rule=800x600|scale=stretch\nrule=800x600|scale=none\n");
+    CHECK(back.nrule == 1 && back.rule[0].v.scale == NB_SCALE_STRETCH,
+          "one good rule");
+}
+
+static void test_modes(void)
+{
+    struct nb_modes_rx rx;
+    struct nb_vstore st;
+    char label[96];
+    unsigned i;
+
+    memset(&rx, 0, sizeof(rx));
+    /* A three-mode list. */
+    CHECK(nb_modes_feed(&rx, 5120, 1440, 0, 3, 240000, 7, NB_MODE_NATIVE) == 0,
+          "first");
+    CHECK(nb_modes_feed(&rx, 1920, 1080, 1, 3, 240000, 7, 0) == 0, "second");
+    CHECK(rx.cur.n == 0, "not shown before it is complete");
+    CHECK(nb_modes_feed(&rx, 1280, 960, 2, 3, 240000, 7, NB_MODE_CUSTOM) == 1,
+          "complete");
+    CHECK(rx.cur.n == 3 && rx.cur.gen == 7 && rx.cur.mhz == 240000, "list");
+    CHECK(rx.cur.flags[2] == NB_MODE_CUSTOM, "custom flag");
+    CHECK(nb_modes_find(&rx.cur, 1920, 1080) == 1, "find");
+    CHECK(nb_modes_find(&rx.cur, 800, 600) == -1, "not found");
+
+    /* A list cut short and a wrong order are dropped; the old one stays. */
+    CHECK(nb_modes_feed(&rx, 5120, 1440, 0, 2, 240000, 8, NB_MODE_NATIVE) == 0,
+          "new list starts");
+    CHECK(nb_modes_feed(&rx, 1280, 720, 1, 2, 240000, 9, 0) == -1,
+          "mixed generations");
+    CHECK(nb_modes_feed(&rx, 1280, 720, 1, 2, 240000, 8, 0) == -1,
+          "no record 0 since");
+    CHECK(rx.cur.n == 3 && rx.cur.gen == 7, "old list kept");
+    CHECK(nb_modes_feed(&rx, 0, 1440, 0, 2, 1, 9, NB_MODE_NATIVE) == -1, "0 width");
+    CHECK(nb_modes_feed(&rx, 640, 480, 0, NB_MODES_MAX + 1, 1, 9,
+                        NB_MODE_NATIVE) == -1, "count over the cap");
+    CHECK(nb_modes_feed(&rx, 640, 480, 0, 2, 1, 9, 0) == -1,
+          "record 0 must be native");
+    /* And a good one after all that. */
+    CHECK(nb_modes_feed(&rx, 2560, 1440, 0, 1, 144000, 10, NB_MODE_NATIVE) == 1,
+          "a one-mode list");
+    CHECK(rx.cur.n == 1 && rx.cur.w[0] == 2560, "replaced");
+
+    /* Ctrl+Alt+R walks the list from the mode the guest runs at. */
+    memset(&rx, 0, sizeof(rx));
+    nb_modes_feed(&rx, 5120, 1440, 0, 3, 240000, 1, NB_MODE_NATIVE);
+    nb_modes_feed(&rx, 1920, 1080, 1, 3, 240000, 1, 0);
+    nb_modes_feed(&rx, 1280, 960, 2, 3, 240000, 1, 0);
+    nb_vstore_init(&st);
+    CHECK(nb_view_cycle_mode(&st, &rx.cur, 5120, 1440, label, sizeof(label)) ==
+          NB_VIEW_CH_RES && st.cur.res_w == 1920, "native -> next");
+    nb_view_cycle_mode(&st, &rx.cur, 1280, 960, label, sizeof(label));
+    CHECK(st.cur.res_w == 5120 && strstr(label, "native"), "wraps to native");
+    nb_view_cycle_mode(&st, &rx.cur, 999, 999, label, sizeof(label));
+    CHECK(st.cur.res_w == 5120, "unknown current: first");
+    /* Without a list: the old presets. */
+    struct nb_modes none = { 0 };
+    st.cur.res_w = st.cur.res_h = 0;
+    nb_view_cycle_mode(&st, &none, 0, 0, label, sizeof(label));
+    CHECK(st.cur.res_w == nb_res_preset[0][0], "presets without a list");
+    for (i = 0; i < 3; i++) {
+        CHECK(rx.cur.w[i] != 0, "list intact");
+    }
+}
+
 int main(void)
 {
     test_fit();
@@ -551,6 +695,8 @@ int main(void)
     test_store();
     test_cycles();
     test_override();
+    test_rules();
+    test_modes();
     printf("test_view: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

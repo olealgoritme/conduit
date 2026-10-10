@@ -846,6 +846,17 @@ void nb_sink_mode_hint(struct nb_sink *s, unsigned w, unsigned h,
     nb_emit(s, NVKVM_BROKER_EV_MODE_HINT, (int)w, (int)h, refresh_mhz, reason);
 }
 
+void nb_sink_mode_edit(struct nb_sink *s, unsigned w, unsigned h, bool add)
+{
+    if (!s || s->client_fd < 0 ||
+        !(s->sess->caps & NVKVM_BROKER_CAP_MODE_LIST)) {
+        return;
+    }
+    nb_emit(s, NVKVM_BROKER_EV_MODE_EDIT, (int)w, (int)h,
+            add ? NVKVM_BROKER_MODE_EDIT_ADD : NVKVM_BROKER_MODE_EDIT_REMOVE,
+            0);
+}
+
 void nb_sink_refresh(struct nb_sink *s)
 {
     if (s && s->client_fd >= 0) {
@@ -2398,6 +2409,43 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             if (nb_reject_log(s)) {
                 nb_err("CURSOR: the display refused the image: %s",
                        strerror(-r));
+            }
+        }
+        return;
+
+    case NVKVM_BROKER_CMD_MODES:
+        /*
+         * The display's mode list, one record per mode.  Only to a broker
+         * that advertised CAP_MODE_LIST; nothing rides in an fd, flags or
+         * reserved1.  A malformed list is dropped (the last good one stays),
+         * not a disconnect: it only feeds a menu.
+         */
+        if (!(ss->caps & NVKVM_BROKER_CAP_MODE_LIST)) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "MODES sent to a broker that did not offer it");
+            return;
+        }
+        if (fd >= 0 || c->flags != 0 || c->reserved1 != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "MODES carried an fd, flags or reserved1");
+            return;
+        }
+        r = nb_modes_feed(&nb_mode_rx, c->width, c->height, c->stride,
+                          c->offset, c->fourcc, c->modifier, c->seq);
+        if (r < 0) {
+            if (nb_reject_log(s)) {
+                nb_err("MODES: malformed record %u/%u (%ux%u); list dropped",
+                       c->stride, c->offset, c->width, c->height);
+            }
+        } else if (r > 0) {
+            nb_log("the VM offers %u modes, native %ux%u", nb_mode_rx.cur.n,
+                   nb_mode_rx.cur.w[0], nb_mode_rx.cur.h[0]);
+            if (ss->ops->modes) {
+                ss->ops->modes(ss);
             }
         }
         return;
