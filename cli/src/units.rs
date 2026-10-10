@@ -67,6 +67,16 @@ pub fn stats_path(scope: &Scope, vm: &str) -> PathBuf {
     }
 }
 
+/// Where the domain's QEMU listens on the control channel
+/// (`org.conduit.ctl.0`); `conduit run`, `apps` and `cp` connect to it, next
+/// to the stats socket and for the same reason.
+pub fn ctl_path(scope: &Scope, vm: &str) -> PathBuf {
+    match scope {
+        Scope::User => paths::run_dir(vm).join("ctl.sock"),
+        Scope::System { .. } => PathBuf::from(format!("/run/conduit/{vm}/console/ctl.sock")),
+    }
+}
+
 /// `conduit-stats@NAME.service`: feeds the VM's stats channel.
 pub fn stats_unit(vm: &str) -> String {
     format!("conduit-stats@{vm}.service")

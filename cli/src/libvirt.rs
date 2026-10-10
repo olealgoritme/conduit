@@ -46,6 +46,8 @@ pub struct Wiring<'a> {
     pub console_sock: &'a Path,
     /// QEMU's end of the stats channel (`org.conduit.stats.0`) binds here.
     pub stats_sock: &'a Path,
+    /// QEMU's end of the control channel (`org.conduit.ctl.0`) binds here.
+    pub ctl_sock: &'a Path,
     pub vm: &'a str,
     /// The VM's shared folders (virtiofs tags `conduit-*`).
     pub shares: &'a [Wire],
@@ -337,14 +339,15 @@ fn edit_display(devices: &mut Element, console: &Path) {
     }
 }
 
-/// The stats channel: a virtio-serial port whose host end is a unix socket
-/// QEMU binds ([`conduit_stats::CHANNEL`]), plus a virtio-serial controller
+/// A Conduit channel: a virtio-serial port named `name` whose host end is a
+/// unix socket QEMU binds (the stats feed [`conduit_stats::CHANNEL`], the
+/// control channel [`conduit_ctl::CHANNEL`]), plus a virtio-serial controller
 /// when the domain has none.
-fn add_stats_channel(devices: &mut Element, sock: &Path) {
+fn add_channel(devices: &mut Element, name: &str, sock: &Path) {
     let ours = |n: &XMLNode| {
         matches!(n, XMLNode::Element(e) if e.name == "channel"
             && e.get_child("target").and_then(|t| t.attributes.get("name")).map(String::as_str)
-                == Some(conduit_stats::CHANNEL))
+                == Some(name))
     };
     // Where our channel was, so a second edit changes nothing.
     let at = devices.children.iter().position(ours);
@@ -361,7 +364,7 @@ fn add_stats_channel(devices: &mut Element, sock: &Path) {
     )));
     ch.children.push(XMLNode::Element(el(
         "target",
-        &[("type", "virtio"), ("name", conduit_stats::CHANNEL)],
+        &[("type", "virtio"), ("name", name)],
     )));
     let at = at.unwrap_or(devices.children.len());
     devices.children.insert(at, XMLNode::Element(ch));
@@ -500,7 +503,8 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         fs.children
             .push(XMLNode::Element(el("target", &[("dir", "nvidia")])));
         // Before the share is re-appended: each edit leaves the order as it was.
-        add_stats_channel(devices, w.stats_sock);
+        add_channel(devices, conduit_stats::CHANNEL, w.stats_sock);
+        add_channel(devices, conduit_ctl::CHANNEL, w.ctl_sock);
         devices.children.push(XMLNode::Element(fs));
         set_shares(devices, w.shares);
     }
@@ -779,6 +783,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     let vfs = units::socket_path(&scope, name, "virtiofsd");
     let console = units::console_path(&scope, name);
     let stats = units::stats_path(&scope, name);
+    let ctl = units::ctl_path(&scope, name);
     let share_list = if dry_run {
         let l = shares::load(name)?;
         if l.is_empty() && !shares::file(name).is_file() {
@@ -798,6 +803,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
             vfs_sock: &vfs,
             console_sock: &console,
             stats_sock: &stats,
+            ctl_sock: &ctl,
             vm: name,
             shares: &share_wires,
             windows,
@@ -1026,6 +1032,7 @@ mod tests {
 </domain>"#;
 
     const STATS: &str = "/run/user/1000/conduit/myvm/stats.sock";
+    const CTL: &str = "/run/user/1000/conduit/myvm/ctl.sock";
 
     fn edit_as(x: &str, windows: bool) -> String {
         edit_domain(
@@ -1036,6 +1043,7 @@ mod tests {
                 vfs_sock: Path::new("/run/user/1000/conduit/myvm/vfs-libvirt.sock"),
                 console_sock: Path::new(CONSOLE),
                 stats_sock: Path::new(STATS),
+                ctl_sock: Path::new(CTL),
                 vm: "myvm",
                 shares: &[Wire {
                     tag: "conduit-Conduit".into(),
@@ -1390,7 +1398,7 @@ mod tests {
         assert!(all(&dev, "redirfilter").is_empty());
         assert!(all(&dev, "smartcard").is_empty());
         let ch = all(&dev, "channel");
-        assert_eq!(ch.len(), 2, "the guest agent channel stays: {out}");
+        assert_eq!(ch.len(), 3, "the guest agent channel stays: {out}");
         assert!(out.contains("org.qemu.guest_agent.0"), "{out}");
         assert_eq!(ch[0].attributes["type"], "unix");
         assert_eq!(all(&dev, "audio")[0].attributes["type"], "none");
@@ -1480,12 +1488,60 @@ mod tests {
             1,
             "{out}"
         );
+        // The guest agent's, the stats feed's and the control channel's.
         assert_eq!(
             elements(dev).filter(|e| e.name == "channel").count(),
-            2,
+            3,
             "{out}"
         );
         assert!(out.contains("org.qemu.guest_agent.0"));
+    }
+
+    #[test]
+    fn ctl_channel_added_once_next_to_the_stats_channel() {
+        let out = edit(WIN11);
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let dev = root.get_child("devices").unwrap();
+        let named = |n: &str| -> Vec<&Element> {
+            elements(dev)
+                .filter(|e| e.name == "channel")
+                .filter(|e| {
+                    e.get_child("target")
+                        .and_then(|t| t.attributes.get("name"))
+                        .map(String::as_str)
+                        == Some(n)
+                })
+                .collect()
+        };
+        let ctl = named("org.conduit.ctl.0");
+        assert_eq!(ctl.len(), 1, "{out}");
+        assert_eq!(ctl[0].attributes["type"], "unix");
+        let src = ctl[0].get_child("source").unwrap();
+        assert_eq!(src.attributes["mode"], "bind");
+        assert_eq!(src.attributes["path"], CTL);
+        assert_eq!(
+            ctl[0].get_child("target").unwrap().attributes["type"],
+            "virtio"
+        );
+        assert_eq!(named("org.conduit.stats.0").len(), 1, "{out}");
+        // One controller serves both, and a second edit changes nothing.
+        let controllers = elements(dev)
+            .filter(|e| {
+                e.name == "controller"
+                    && e.attributes.get("type").map(String::as_str) == Some("virtio-serial")
+            })
+            .count();
+        assert_eq!(controllers, 1, "{out}");
+        assert_eq!(edit(&out), out, "idempotent");
+        // A domain that already has the stats channel (attached before the
+        // control channel existed) gains only the new one.
+        let at = out.find("org.conduit.ctl.0").unwrap();
+        let from = out[..at].rfind("<channel").unwrap();
+        let to = at + out[at..].find("</channel>").unwrap() + "</channel>".len();
+        let old = format!("{}{}", &out[..from], &out[to..]);
+        assert!(!old.contains("org.conduit.ctl.0"), "{old}");
+        let again = edit(&old);
+        assert!(again.contains("org.conduit.ctl.0"), "{again}");
     }
 
     fn share_targets(xml: &str) -> Vec<String> {
@@ -1540,6 +1596,7 @@ mod tests {
             vfs_sock: Path::new("/v"),
             console_sock: Path::new("/c"),
             stats_sock: Path::new("/t"),
+            ctl_sock: Path::new("/u"),
             vm: "x",
             shares: &[],
             windows: false,
