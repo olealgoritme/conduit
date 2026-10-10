@@ -268,6 +268,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0044 | vulkan/runtime: `VkPipelineCoverageModulationStateCreateInfoNV` and the coverage modulation commands become dynamic state (`MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE`, `_TABLE_ENABLE`, `_TABLE`) |
 | 0045 | `VK_NV_framebuffer_mixed_samples` (Maxwell B+): `rasterizationSamples` above the attachments' sample count turns on the hardware's target-independent rasterization (`SET_TIR`, `SET_ANTI_ALIAS_RASTER`), with merge coverage reduction and coverage modulation (also the extended dynamic state 3 coverage modulation features). What D3D11.1 `ForcedSampleCount` needs with a render target bound: Direct2D's anti-aliased fills (`guest/windows/tools/d2d_tir_probe.cpp`) |
 | 0046 | zink: without a DEVICE_LOCAL \| HOST_VISIBLE type (0030) the descriptor buffers and GL persistent mappings are host-visible coherent system memory (a persistent map of plain VRAM is a staging copy the GPU never sees). `wgl_test.exe` checks readback, compute and a persistent mapping |
+| 0047 | ZCULL only where one culling state describes the depth view: storage only for depth images with one layer and one level, and only in render passes that draw one layer without multiview (see "ZCULL and DXVK depth buffers") |
 
 ## Per-draw cost (common 0001-0007)
 
@@ -302,7 +303,7 @@ right after each indirect one (dropping one invalidation in the driver
 changes its hash); `dynidx` indexes dynamic UBO arrays in two sets at run
 time; `descupd` rewrites a descriptor set between submits.
 
-## ZCULL and DXVK depth buffers (common 0008)
+## ZCULL and DXVK depth buffers (common 0008, 0047)
 
 - **ZCULL storage.** DXVK gives every D3D11 depth texture `TRANSFER_DST`
   and ends a render pass at every barrier, resolve or render target change,
@@ -310,6 +311,15 @@ time; `descupd` rewrites a descriptor set between submits.
   images with `TRANSFER_DST` (`EXCLUSIVE` sharing only), and an empty render
   pass resets it to a conservative state after a copy, blit or resolve
   writes the image or another queue hands it over.
+- **One surface per storage (common 0047).** One ZCULL storage, like the
+  on-chip ZCULL state, describes one 2D depth surface. Depth images with
+  several layers or mip levels get no storage, and render passes that draw
+  several layers (layered rendering, multiview) run without ZCULL;
+  otherwise a pass would load the culling state another layer or level
+  stored and cull fragments that pass its depth test. Their passes that
+  clear depth still use ZCULL within the pass.
+  `guest/windows/tools/d3d11_depth_views_probe.cpp` checks layer views,
+  mip views, a layered pass and re-created targets.
 - **ZCULL direction.** Stored ZCULL has to be loaded with the direction it
   was stored with, so `SET_ZCULL_DIR_FORMAT` is fixed per image at its first
   application render pass (GREATER when it clears below 0.5, LESS otherwise)
