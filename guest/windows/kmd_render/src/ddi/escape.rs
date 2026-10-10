@@ -1063,14 +1063,17 @@ fn escape_map_read_ledger(
 }
 
 /// `HELIOS_ESCAPE_SCANOUT_EVENT` — register/unregister a PERSISTENT per-device
-/// usermode auto-reset event the KMD signals on EVERY scanout-read retirement
-/// (`ReadLedger::retire` broadcast), or answer the capability probe.
+/// usermode auto-reset event the KMD signals after scanout-read retirements
+/// (`ReadLedger::flush_broadcast`, once per transport-lock hold that retired
+/// reads), or answer the capability probe.
 ///
 /// Clones REGISTER_FENCE_EVENT's reference discipline
 /// (`ObReferenceObjectByHandle`, EVENT_MODIFY_STATE, UserMode) with the two
 /// fixes that table lacks: entries are owner-tagged and reclaimed at
 /// DestroyDevice (`ReadLedger::reclaim_events_for_owner`), and Stop/Start
-/// signals + releases them (`ReadLedger::reset`). Unlike 0x000B this
+/// signals them and keeps them (`ReadLedger::reset`). One owner holds at most
+/// `scanout_events::EVENTS_PER_OWNER` (refused as TABLE_FULL beyond that, like
+/// a full table). Unlike 0x000B this
 /// registration SURVIVES its signals; the consumer is level-triggered.
 fn escape_scanout_event(
     adapter: &AdapterContext,
@@ -1115,10 +1118,11 @@ fn escape_scanout_event(
                     dereference_user_event(event);
                     reply(HELIOS_SCANOUT_ACQ_OK)
                 }
-                ScanoutEventReg::TableFull => {
+                ScanoutEventReg::TableFull | ScanoutEventReg::OwnerFull => {
                     // Counted `AqRgF` in register_event. SUCCESS with the
                     // TABLE_FULL state: the caller still gates on the ledger but
-                    // polls it every 1 ms — loud (the counter), never wedged.
+                    // polls it every 1 ms and retries later — loud (the
+                    // counter), never wedged.
                     dereference_user_event(event);
                     reply(HELIOS_SCANOUT_ACQ_TABLE_FULL)
                 }

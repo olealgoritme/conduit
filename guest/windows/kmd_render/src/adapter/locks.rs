@@ -9,8 +9,10 @@
 //! (`adapter/read_ledger.rs`). Each is acquired LAST; nothing may be acquired,
 //! allocated, waited on, logged to the registry, or paged while either is held.
 //! The mutation lock serializes issue, allocation retire, reset, and token
-//! retirement. It is always released before the event-table lock broadcasts
-//! `KeSetEvent(Wait = FALSE)`, so the two leaf locks never nest. They have no
+//! retirement. A retirement only marks a broadcast owed; the event-table lock
+//! broadcasts `KeSetEvent(Wait = FALSE)` after `virtio_lock` is released
+//! (`with_virtio`, `set_virtio`), so the two leaf locks never nest and no
+//! broadcast runs under the transport lock. They have no
 //! accessor here because `crate::sync::SpinLock`'s guard is their whole
 //! discipline.
 
@@ -443,6 +445,11 @@ impl AdapterContext {
         };
         // SAFETY: same address/IRQL pair the acquire above produced.
         unsafe { KeReleaseSpinLock(lock, irql) };
+        // D4a: the read-ledger retirements of this hold (the used-ring drain
+        // retires flush tokens and Blt copies) signal the registered events
+        // here, once, outside the transport lock. One relaxed load when the
+        // hold retired nothing.
+        self.read_ledger.flush_broadcast();
         result
     }
 

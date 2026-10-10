@@ -18,9 +18,14 @@
 //!     spinlock. It is taken after any currently-held adapter lock, and no
 //!     allocation, wait, pageable operation, registry logging, event-table
 //!     lock, or other lock is legal while it is held.
-//!   * `retire` is driven exclusively by [`crate::virtio::ScanoutFlushToken`]
-//!     — completion or `Drop` — at PASSIVE or at DISPATCH under `virtio_lock`.
-//!     It releases `mutation` before broadcasting the retirement event.
+//!   * `retire` runs at PASSIVE or at DISPATCH under `virtio_lock` (flush
+//!     tokens, Blt copies). It signals nothing: it marks the broadcast latch,
+//!     and [`ReadLedger::flush_broadcast`] signals every registered event once
+//!     when the caller leaves `virtio_lock` (`AdapterContext::with_virtio`,
+//!     `set_virtio`): one broadcast per used-ring drain pass, not one per
+//!     retired read, and none under the transport lock.
+//!   * The event table rules (per-owner cap, idempotent re-register, reset
+//!     keeps registrations) are `helios_kmd_logic::scanout_events`.
 //!
 //! The page is allocated ONCE (first StartDevice) and freed only in
 //! `AdapterContext::drop`: user mappings created through the escape can
@@ -30,6 +35,9 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use helios_kmd_logic::scanout_events::{
+    BroadcastLatch, EventEntry, EventTable, Register, EVENT_TABLE_LEN,
+};
 use helios_kmd_logic::scanout_read_ledger::{LedgerTicket, FREE_RESID, NO_SLOT, SLOT_COUNT};
 use helios_protocol::{
     HeliosReadLedgerPage, HeliosReadLedgerSlot, HELIOS_READ_LEDGER_MAGIC, HELIOS_READ_LEDGER_SLOTS,
@@ -42,16 +50,12 @@ use wdk_sys::{KEVENT, PHYSICAL_ADDRESS, PVOID};
 /// its head — the remainder is zero and reserved.
 pub(crate) const LEDGER_PAGE_BYTES: usize = 4096;
 
-/// Retirement-event registrations per adapter: one auto-reset event per
-/// DxvkDevice. Every D3D11 device in every process registers one (dwm alone
-/// holds about a dozen, and the shell, services and helpers hold more), so a
-/// desktop that has been up a while fills a small table, and a game started
-/// after that gets `TABLE_FULL`. A refused device still gates its rewrites of a
-/// buffer the host reads, but its DXVK signaler then sees a retirement only on
-/// its 1 ms poll, so a windowed game whose next frame finds the previous Blt
-/// copy unretired waits up to that poll every frame.
-/// `AqLive` is the occupancy.
-const EVENT_TABLE_LEN: usize = 64;
+// Retirement-event registrations per adapter (`scanout_events::EVENT_TABLE_LEN`):
+// one auto-reset event per DxvkDevice, at most `EVENTS_PER_OWNER` per device.
+// Every D3D11 device in every process registers one (dwm alone holds about a
+// dozen), so a desktop that has been up a while can fill the table; a refused
+// device polls the ledger every 1 ms and retries its REGISTER on present/flush
+// (umd scanout_acquire). `AqLive` is the occupancy.
 
 /// Entries one lock hold drains in [`ReadLedger::drain_events`]: the drained
 /// entries live on the caller's stack, so a full-table reclaim is done in
@@ -88,9 +92,10 @@ static AQ_REGISTERED: AtomicU32 = AtomicU32::new(0);
 /// Registrations live now (`AqLive`): `AqReg` minus every removal. At
 /// `EVENT_TABLE_LEN` the next REGISTER is refused (`AqRgF`).
 static AQ_LIVE: AtomicU32 = AtomicU32::new(0);
-/// Registration refusals: table full, bad handle, bad op (`AqRgF`).
+/// Registration refusals: table full, owner cap, bad handle, bad op (`AqRgF`).
 pub(crate) static AQ_REGISTER_REFUSED: AtomicU32 = AtomicU32::new(0);
-/// Broadcast `KeSetEvent` invocations at retirement (`AqSigB`).
+/// Broadcast `KeSetEvent` invocations (`AqSigB`): one per registered event per
+/// broadcast, and a broadcast per transport-lock exit that retired reads.
 static AQ_SIGNALS: AtomicU32 = AtomicU32::new(0);
 
 /// `n` registrations left the table (`AqLive`). Saturating, so a removal of
@@ -196,33 +201,9 @@ const _: () = {
     assert!(SLOT_COUNT < NO_SLOT as usize);
 };
 
-/// One parked retirement-event registration. Both fields are opaque `usize`
-/// (same rationale as `mapping::Mapping`): the table then needs no `unsafe
-/// impl Send`, and the KEVENT pointer is only ever rebuilt at a use site that
-/// states why it is still alive (the table holds an object reference).
-#[derive(Clone, Copy)]
-struct EventEntry {
-    /// The registering D3D device handle (`DeviceOwner::raw`), for the
-    /// destroy-device reclaim the one-shot fence-event table lacks.
-    owner: usize,
-    /// `*mut KEVENT` from `ObReferenceObjectByHandle`; never 0 for a live
-    /// entry. The entry OWNS one object reference: whoever removes the entry
-    /// must dereference (DeferDelete — removal can run at DISPATCH).
-    event: usize,
-}
-
-/// Outcome of [`ReadLedger::register_event`].
-pub(crate) enum ScanoutEventReg {
-    /// Parked; the table now owns the caller's object reference.
-    Registered,
-    /// This (owner, event) pair is already parked. Idempotent success: the
-    /// caller must drop the reference IT took for this call; the parked one
-    /// stays live.
-    AlreadyRegistered,
-    /// No free entry (counted `AqRgF`). The caller runs ungated — loud, never
-    /// wedged.
-    TableFull,
-}
+/// Outcome of [`ReadLedger::register_event`]: `scanout_events::Register`.
+/// Only [`Register::Registered`] takes the caller's object reference.
+pub(crate) type ScanoutEventReg = Register;
 
 /// KMD-private state behind the read-ledger mutation leaf lock. `next_generation`
 /// belongs to the adapter rather than a transport generation: reset clears the
@@ -266,11 +247,13 @@ pub(crate) struct ReadLedger {
     /// is held; its state is values only and never allocates.
     mutation: crate::sync::SpinLock<LedgerPrivate>,
     /// ⚠ LEAF LOCK (`scanout_event_lock`): acquired after any other lock this
-    /// driver holds — the broadcast runs at DISPATCH under `virtio_lock` from
-    /// the used-ring drain — and NOTHING may be acquired while holding it.
+    /// driver holds (a broadcast can run inside `wddm_notify_lock`, never
+    /// inside `virtio_lock`) and NOTHING may be acquired while holding it.
     /// Held only for table ops plus the ≤64 `KeSetEvent(Wait = FALSE)` calls
     /// of a broadcast. See `adapter/locks.rs` for the documented order.
-    events: crate::sync::SpinLock<[Option<EventEntry>; EVENT_TABLE_LEN]>,
+    events: crate::sync::SpinLock<EventTable<EVENT_TABLE_LEN>>,
+    /// Set by every retirement, taken by [`Self::flush_broadcast`].
+    broadcast_owed: BroadcastLatch,
 }
 
 impl ReadLedger {
@@ -278,7 +261,8 @@ impl ReadLedger {
         Self {
             page_va: AtomicUsize::new(0),
             mutation: crate::sync::SpinLock::new(LedgerPrivate::new()),
-            events: crate::sync::SpinLock::new([None; EVENT_TABLE_LEN]),
+            events: crate::sync::SpinLock::new(EventTable::new()),
+            broadcast_owed: BroadcastLatch::new(),
         }
     }
 
@@ -414,8 +398,9 @@ impl ReadLedger {
         LedgerTicket::NONE
     }
 
-    /// Retire one exact ticket. The mutation lock is released before event
-    /// broadcast; the two leaf locks never nest.
+    /// Retire one exact ticket and mark a broadcast owed. Nothing is signaled
+    /// here: the caller is usually inside `virtio_lock` (the used-ring drain),
+    /// and the signal belongs to [`Self::flush_broadcast`] at that lock's exit.
     pub(crate) fn retire(&self, ticket: LedgerTicket, via_drop: bool) {
         if !ticket.is_claimed() {
             return;
@@ -453,9 +438,9 @@ impl ReadLedger {
             }
         };
         if retired {
-            // Event signaling stays outside the mutation lock. The consumer is
-            // level-triggered and will acquire-load the fully published claim.
-            self.broadcast();
+            // After the mutation lock: a taker of the latch that signals sees
+            // the published counters (the consumers re-read with Acquire).
+            self.broadcast_owed.note_retired();
         }
     }
 
@@ -523,29 +508,29 @@ impl ReadLedger {
         }
     }
 
-    /// Drop every piece of per-transport-generation ledger state: signal +
-    /// dereference all event registrations, zero the slots and the overflow
-    /// word, rewrite the header. PASSIVE_LEVEL
-    /// (`reset_display_publication_state`, Stop/StartDevice).
+    /// Drop every piece of per-transport-generation ledger state: zero the
+    /// slots and the overflow word, rewrite the header, and signal every event
+    /// registration. PASSIVE_LEVEL (`reset_display_publication_state`,
+    /// Stop/StartDevice).
+    ///
+    /// The registrations are KEPT: they belong to devices, which keep their
+    /// ledger mappings across the reset and lose the entry only at their
+    /// DestroyDevice (`reclaim_events_for_owner`) or the adapter's removal
+    /// (`drop_all_event_references`). Dropping them here left every surviving
+    /// device with an event the KMD no longer signaled.
     ///
     /// A token still in flight when this runs is generation-orphaned. Reset
     /// never rewinds the private source, so it cannot touch a new same-resid
     /// claim after the next StartDevice.
     pub(crate) fn reset(&self) {
-        // Take the registrations out under the leaf lock, signal + deref
-        // OUTSIDE it: the signal wakes level-triggered consumers into a
-        // re-read, and the deref must not run under a spinlock we hold.
-        self.drain_events(None, |entry| {
-            // SAFETY: the entry owned one object reference; the KEVENT is
-            // therefore alive. Wait = FALSE; DeferDelete because dropping the
-            // last reference with a plain deref above PASSIVE would run the
-            // object's PASSIVE-only deletion, and this path's IRQL contract
-            // should not silently depend on its two callers.
-            unsafe {
-                KeSetEvent(entry.event as *mut KEVENT, 0, 0);
-                ObDereferenceObjectDeferDelete(entry.event as PVOID);
-            }
-        });
+        self.zero_claims();
+        // After the zeroing: the wake re-reads a ledger whose claims are gone,
+        // which releases every gate armed on them.
+        self.broadcast_owed.note_retired();
+        self.flush_broadcast();
+    }
+
+    fn zero_claims(&self) {
         let mut private = self.mutation.lock();
         let Some(page) = self.page() else {
             return;
@@ -568,56 +553,31 @@ impl ReadLedger {
     /// [`ScanoutEventReg::Registered`] — every other outcome leaves it with
     /// the caller. PASSIVE (escape).
     pub(crate) fn register_event(&self, owner: usize, event: NonNull<KEVENT>) -> ScanoutEventReg {
-        let raw = event.as_ptr() as usize;
-        let mut table = self.events.lock();
-        let mut free = None;
-        let mut i = 0;
-        while i < EVENT_TABLE_LEN {
-            match table[i] {
-                Some(e) if e.owner == owner && e.event == raw => {
-                    return ScanoutEventReg::AlreadyRegistered;
-                }
-                None if free.is_none() => free = Some(i),
-                _ => {}
-            }
-            i += 1;
-        }
-        match free {
-            Some(i) => {
-                table[i] = Some(EventEntry { owner, event: raw });
+        let outcome = self.events.lock().register(owner, event.as_ptr() as usize);
+        match outcome {
+            Register::Registered => {
                 AQ_REGISTERED.fetch_add(1, Ordering::Relaxed);
                 AQ_LIVE.fetch_add(1, Ordering::Relaxed);
-                ScanoutEventReg::Registered
             }
-            None => {
+            Register::AlreadyRegistered => {}
+            Register::OwnerFull | Register::TableFull => {
                 AQ_REGISTER_REFUSED.fetch_add(1, Ordering::Relaxed);
-                ScanoutEventReg::TableFull
             }
         }
+        outcome
     }
 
     /// Remove one registration and drop the reference the table held. Returns
     /// false if nothing matched. PASSIVE (escape).
     pub(crate) fn unregister_event(&self, owner: usize, event: NonNull<KEVENT>) -> bool {
         let raw = event.as_ptr() as usize;
-        let removed = {
-            let mut table = self.events.lock();
-            let mut found = false;
-            let mut i = 0;
-            while i < EVENT_TABLE_LEN {
-                if matches!(table[i], Some(e) if e.owner == owner && e.event == raw) {
-                    table[i] = None;
-                    note_removed(1);
-                    found = true;
-                    break;
-                }
-                i += 1;
-            }
-            found
-        };
+        let removed = self.events.lock().unregister(owner, raw);
         if removed {
+            note_removed(1);
             // SAFETY: the table owned one reference to this live KEVENT; deref
-            // outside the lock, DeferDelete for the same reason as `reset`.
+            // outside the lock. DeferDelete: dropping the last reference with a
+            // plain deref above PASSIVE would run the object's PASSIVE-only
+            // deletion, and this path should not depend on its caller's IRQL.
             unsafe { ObDereferenceObjectDeferDelete(event.as_ptr() as PVOID) };
         }
         removed
@@ -635,9 +595,9 @@ impl ReadLedger {
     }
 
     /// Drop every remaining event reference without signaling. `AdapterContext
-    /// ::drop` only — the table should already be empty (StopDevice reset +
-    /// per-device reclaim), so this is the belt for a registration that landed
-    /// between the last reset and RemoveDevice. PASSIVE.
+    /// ::drop` only — the table should already be empty (every device's
+    /// DestroyDevice reclaimed its own), so this is the belt for a registration
+    /// whose owner reclaim never ran. PASSIVE.
     pub(crate) fn drop_all_event_references(&self) {
         self.drain_events(None, |entry| {
             // SAFETY: the entry owned one object reference; DeferDelete as in
@@ -653,23 +613,7 @@ impl ReadLedger {
     fn drain_events(&self, owner: Option<usize>, mut release: impl FnMut(EventEntry)) {
         loop {
             let mut out = [None; DRAIN_CHUNK];
-            let mut n = 0;
-            {
-                let mut table = self.events.lock();
-                let mut i = 0;
-                while i < EVENT_TABLE_LEN && n < DRAIN_CHUNK {
-                    let matches_owner = match (table[i], owner) {
-                        (Some(_), None) => true,
-                        (Some(e), Some(o)) => e.owner == o,
-                        (None, _) => false,
-                    };
-                    if matches_owner {
-                        out[n] = table[i].take();
-                        n += 1;
-                    }
-                    i += 1;
-                }
-            }
+            let n = self.events.lock().take(owner, &mut out);
             note_removed(n as u32);
             for entry in out.iter().flatten() {
                 release(*entry);
@@ -680,20 +624,25 @@ impl ReadLedger {
         }
     }
 
-    /// Signal every registered event. Runs under the leaf lock at up to
-    /// DISPATCH — `KeSetEvent(Wait = FALSE)` for ≤64 entries, nothing else.
-    fn broadcast(&self) {
-        let table = self.events.lock();
-        let mut i = 0;
-        while i < EVENT_TABLE_LEN {
-            if let Some(e) = table[i] {
-                // SAFETY: the entry holds an object reference, so the KEVENT is
-                // alive regardless of the registering process's fate; Wait =
-                // FALSE keeps this legal at DISPATCH under the leaf lock.
-                unsafe { KeSetEvent(e.event as *mut KEVENT, 0, 0) };
-                AQ_SIGNALS.fetch_add(1, Ordering::Relaxed);
-            }
-            i += 1;
+    /// Signal every registered event once if a retirement (or a reset) owed
+    /// a broadcast since the last one. Called where `virtio_lock` is released
+    /// (`AdapterContext::with_virtio`, `set_virtio`) and by `reset`: legal at
+    /// up to DISPATCH, never under `virtio_lock` or the mutation lock. One
+    /// relaxed load when nothing retired.
+    pub(crate) fn flush_broadcast(&self) {
+        if !self.broadcast_owed.take() {
+            return;
         }
+        let table = self.events.lock();
+        let mut n = 0u32;
+        for e in table.live() {
+            // SAFETY: the entry holds an object reference, so the KEVENT is
+            // alive regardless of the registering process's fate; Wait =
+            // FALSE keeps this legal at DISPATCH under the leaf lock.
+            unsafe { KeSetEvent(e.event as *mut KEVENT, 0, 0) };
+            n += 1;
+        }
+        drop(table);
+        AQ_SIGNALS.fetch_add(n, Ordering::Relaxed);
     }
 }
