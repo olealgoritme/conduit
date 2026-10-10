@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 10 Oct 2026 17:07:28 +0200
+Subject: [PATCH] zink: descriptor buffers and persistent maps stay
+ host-visible without a BAR heap
+
+When no memory type is both DEVICE_LOCAL and HOST_VISIBLE, zink maps
+ZINK_HEAP_DEVICE_LOCAL_VISIBLE to the plain DEVICE_LOCAL types.  Default
+buffers are then CPU-mapped through a staging copy, which works for
+ordinary maps but not for the buffers whose CPU pointer must reach the
+GPU directly:
+
+ - the per-batch and bindless descriptor buffers (ZINK_DESCRIPTOR_MODE_DB,
+   the default on NVK) are created with PIPE_USAGE_DEFAULT and mapped
+   PERSISTENT once; the map lands in a staging buffer that is never copied
+   back, so every descriptor the GPU reads is zero;
+ - GL persistent buffer-storage mappings (GL_MAP_PERSISTENT_BIT without
+   GL_MAP_COHERENT_BIT) have the same problem.
+
+NVK on RM has no such type by default (NVK_RM_BAR_MB=0, patch 0030).
+Every Zink draw and dispatch read null UBO/SSBO/texture descriptors: a
+WGL test cleared but drew nothing, glReadPixels and GL compute returned
+zeros, and Unigine Valley on OpenGL showed a black window.
+ZINK_DESCRIPTORS=lazy or NVK_RM_BAR_MB=-1 each made it render.
+
+screen->no_vis_vram records the missing type, and allocate_bo() places
+descriptor buffers and PIPE_RESOURCE_FLAG_MAP_PERSISTENT buffers that
+would land in that heap in host-visible coherent memory instead.  Other
+default buffers stay in VRAM behind staging uploads.
+---
+ src/gallium/drivers/zink/zink_resource.c | 12 ++++++++++++
+ src/gallium/drivers/zink/zink_screen.c   |  4 +++-
+ src/gallium/drivers/zink/zink_types.h    |  4 ++++
+ 3 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index c37fa55f..f02106f6 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -1052,6 +1052,18 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
+       if (!(vk_domain_from_heap(heap) & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+          heap = zink_heap_from_domain_flags(alloc_info->flags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, alloc_info->aflags);
+    }
++   /* Without a DEVICE_LOCAL | HOST_VISIBLE type (a driver that exposes no BAR
++    * heap) the "visible VRAM" heap is plain VRAM.  That is fine for buffers
++    * that are mapped through a staging copy, but not for the ones whose CPU
++    * pointer must reach the GPU directly: descriptor buffers (persistently
++    * mapped, written every draw) and GL persistent mappings.  A staging copy
++    * of those is never written back, so every descriptor would read as zero.
++    * Put them in host-visible system memory instead.
++    */
++   if (screen->no_vis_vram && heap == ZINK_HEAP_DEVICE_LOCAL_VISIBLE && obj->is_buffer &&
++       (templ->bind & ZINK_BIND_DESCRIPTOR || templ->flags & PIPE_RESOURCE_FLAG_MAP_PERSISTENT))
++      heap = zink_heap_from_domain_flags((alloc_info->flags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) |
++                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, alloc_info->aflags);
+ 
+    VkMemoryDedicatedAllocateInfo ded_alloc_info = {
+       .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index bdce379b..454015b8 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -3763,8 +3763,10 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+          } else {
+             memcpy(screen->heap_map[i], screen->heap_map[ZINK_HEAP_DEVICE_LOCAL], screen->heap_count[ZINK_HEAP_DEVICE_LOCAL]);
+             screen->heap_count[i] = screen->heap_count[ZINK_HEAP_DEVICE_LOCAL];
+-            if (i == ZINK_HEAP_DEVICE_LOCAL_VISIBLE)
++            if (i == ZINK_HEAP_DEVICE_LOCAL_VISIBLE) {
+                maybe_has_rebar = false;
++               screen->no_vis_vram = true;
++            }
+          }
+       }
+    }
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index 9c461cf4..62ca21e0 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1447,6 +1447,10 @@ struct zink_screen {
+    uint8_t heap_map[ZINK_HEAP_MAX][VK_MAX_MEMORY_TYPES];  // mapping from zink heaps to memory type indices
+    uint8_t heap_count[ZINK_HEAP_MAX];  // number of memory types per zink heap
+    bool resizable_bar;
++   /* no memory type is both DEVICE_LOCAL and HOST_VISIBLE: ZINK_HEAP_DEVICE_LOCAL_VISIBLE
++    * then maps to plain device-local types, which the CPU cannot map
++    */
++   bool no_vis_vram;
+ 
+    uint64_t total_video_mem;
+    uint64_t clamp_video_mem;
+-- 
+2.43.0
+

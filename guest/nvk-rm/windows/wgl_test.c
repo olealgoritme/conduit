@@ -2,12 +2,13 @@
  * wgl_test: OpenGL through WGL on the current opengl32.dll (app-local Mesa
  * opengl32 + libgallium_wgl = Zink, or the system opengl32 with the adapter's
  * ICD). Prints the GL strings, checks a rendered frame with glReadPixels,
- * runs a GL 4.3 compute shader and checks its output, then spins a
+ * runs a GL 4.3 compute shader and checks its output, checks that a
+ * persistent (non-coherent) buffer mapping reaches the GPU, then spins a
  * glxgears-like scene for N seconds with swap interval 0 and prints fps.
  *
  *   wgl_test.exe [seconds=5] [width=1280] [height=720]
  *
- * Exit code 0 when the readback and the compute check pass.
+ * Exit code 0 when the readback, compute and persistent-map checks pass.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -27,6 +28,14 @@
 #define GL_MAP_READ_BIT 0x0001
 #define GL_SHADER_STORAGE_BARRIER_BIT 0x00002000
 #define GL_BUFFER_UPDATE_BARRIER_BIT 0x00000200
+#endif
+#ifndef GL_MAP_PERSISTENT_BIT
+#define GL_MAP_WRITE_BIT 0x0002
+#define GL_MAP_PERSISTENT_BIT 0x0040
+#define GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT 0x00004000
+#define GL_COPY_READ_BUFFER 0x8F36
+#define GL_COPY_WRITE_BUFFER 0x8F37
+#define GL_STATIC_DRAW 0x88E4
 #endif
 
 typedef char GLchar;
@@ -51,6 +60,9 @@ typedef void(APIENTRY *PFNMEMORYBARRIER)(GLbitfield);
 typedef void *(APIENTRY *PFNMAPBUFFERRANGE)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
 typedef GLboolean(APIENTRY *PFNUNMAPBUFFER)(GLenum);
 typedef BOOL(WINAPI *PFNWGLSWAPINTERVALEXT)(int);
+typedef void(APIENTRY *PFNBUFFERSTORAGE)(GLenum, GLsizeiptr, const void *, GLbitfield);
+typedef void(APIENTRY *PFNCOPYBUFFERSUBDATA)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr);
+typedef void(APIENTRY *PFNGETBUFFERSUBDATA)(GLenum, GLintptr, GLsizeiptr, void *);
 
 static LRESULT CALLBACK
 wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
@@ -131,6 +143,56 @@ gear(float inner, float outer, float width, int teeth, float depth)
    glVertex3f(r1, 0, width * 0.5f);
    glVertex3f(r1, 0, -width * 0.5f);
    glEnd();
+}
+
+/* A persistent, non-coherent write mapping (GL 4.4 buffer storage): what the
+ * CPU writes must reach the GPU after glMemoryBarrier(CLIENT_MAPPED_BUFFER),
+ * without unmapping.  The GPU copies it to a second buffer, which is read
+ * back.  A driver that backs such a mapping with a staging copy (Zink on a
+ * device without host-visible VRAM did) returns zeros here. */
+static int
+persistent_map_check(void)
+{
+#define GP(t, n) t n = (t)(void *)wglGetProcAddress(#n)
+   GP(PFNGENBUFFERS, glGenBuffers);
+   GP(PFNBINDBUFFER, glBindBuffer);
+   GP(PFNBUFFERDATA, glBufferData);
+   GP(PFNBUFFERSTORAGE, glBufferStorage);
+   GP(PFNCOPYBUFFERSUBDATA, glCopyBufferSubData);
+   GP(PFNGETBUFFERSUBDATA, glGetBufferSubData);
+   GP(PFNMEMORYBARRIER, glMemoryBarrier);
+   GP(PFNMAPBUFFERRANGE, glMapBufferRange);
+   GP(PFNUNMAPBUFFER, glUnmapBuffer);
+#undef GP
+   if (!glBufferStorage || !glCopyBufferSubData || !glGetBufferSubData || !glMemoryBarrier) {
+      printf("persistent map: GL 4.4 entry points missing\n");
+      return 1;
+   }
+   enum { N = 4096 };
+   GLuint b[2];
+   glGenBuffers(2, b);
+   glBindBuffer(GL_COPY_READ_BUFFER, b[0]);
+   glBufferStorage(GL_COPY_READ_BUFFER, N * 4, NULL, GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT);
+   uint32_t *p = glMapBufferRange(GL_COPY_READ_BUFFER, 0, N * 4,
+                                  GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT);
+   if (!p) {
+      printf("persistent map: map failed (0x%x)\n", glGetError());
+      return 1;
+   }
+   for (unsigned i = 0; i < N; i++)
+      p[i] = i * 2654435761u + 1;
+   glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
+   glBindBuffer(GL_COPY_WRITE_BUFFER, b[1]);
+   glBufferData(GL_COPY_WRITE_BUFFER, N * 4, NULL, GL_STATIC_DRAW);
+   glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, N * 4);
+   static uint32_t out[N];
+   glGetBufferSubData(GL_COPY_WRITE_BUFFER, 0, N * 4, out);
+   unsigned bad = 0;
+   for (unsigned i = 0; i < N; i++)
+      bad += out[i] != i * 2654435761u + 1;
+   glUnmapBuffer(GL_COPY_READ_BUFFER);
+   printf("persistent map: %u/%u values correct -> %s\n", N - bad, N, bad ? "FAIL" : "PASS");
+   return bad != 0;
 }
 
 static int
@@ -277,7 +339,10 @@ main(int argc, char **argv)
    /* 2. compute */
    fail |= compute_check();
 
-   /* 3. gears, swap interval 0 */
+   /* 3. persistent mapping */
+   fail |= persistent_map_check();
+
+   /* 4. gears, swap interval 0 */
    PFNWGLSWAPINTERVALEXT swap_interval =
       (PFNWGLSWAPINTERVALEXT)(void *)wglGetProcAddress("wglSwapIntervalEXT");
    if (swap_interval)
