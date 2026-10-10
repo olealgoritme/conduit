@@ -333,6 +333,14 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             crate::diag::record_named_bytes(b"MlN", crate::ddi::mode_list::received());
             indicate_child_status(adapter, true);
         }
+        // The host's viewer asked for a mode: published for the Conduit GPU tray,
+        // which watches these values and applies it in the user's session
+        // (`ChangeDisplaySettingsEx`; a driver cannot switch the desktop itself).
+        // The size first, then the sequence the tray keys on.
+        if let Some((packed, seq)) = crate::ddi::mode_list::take_mode_request() {
+            crate::diag::record_named_bytes(b"HostModeReq", packed);
+            crate::diag::record_named_bytes(b"HostModeSeq", seq);
+        }
 
         // Expire a foreign scanout source whose owner stopped presenting (and ask
         // for the desktop's restore flush, consumed by the refresh arm below).

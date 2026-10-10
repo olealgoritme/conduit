@@ -919,6 +919,8 @@ pub fn run() {
         let h = hwnd as usize;
         std::thread::spawn(move || reader(h));
         std::thread::spawn(crate::ctl::serve);
+        // The host viewer's mode requests, applied to the Conduit display.
+        std::thread::spawn(crate::display::follow);
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {

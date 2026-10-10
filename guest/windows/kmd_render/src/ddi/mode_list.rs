@@ -104,6 +104,42 @@ pub(crate) fn offered(native: (u32, u32)) -> ModeList {
     l
 }
 
+/// The newest `DisplayMode` request (packed size) and how many arrived; the
+/// worker publishes them as `HostModeReq`/`HostModeSeq` for the tray.
+static MODE_REQ: AtomicU32 = AtomicU32::new(0);
+static MODE_REQ_SEQ: AtomicU32 = AtomicU32::new(0);
+static MODE_REQ_NEW: AtomicBool = AtomicBool::new(false);
+
+/// A `DisplayMode` event (DPC): remember it; true = wake the worker.
+pub(crate) fn on_host_mode(packed: u32) -> bool {
+    MODE_REQ.store(packed, Ordering::Relaxed);
+    MODE_REQ_SEQ.fetch_add(1, Ordering::Release);
+    !MODE_REQ_NEW.swap(true, Ordering::AcqRel)
+}
+
+/// Consumed by the HPD worker: the newest request since last asked, with its
+/// sequence number.
+/// The published sequence is `nonce << 16 | count`: the values persist in the
+/// registry across boots while the count restarts, so the nonce (the interrupt
+/// time's low bits at the first request of this boot, never 0) keeps a fresh
+/// request from looking like the last boot's to the tray. PASSIVE.
+pub(crate) fn take_mode_request() -> Option<(u32, u32)> {
+    static NONCE: AtomicU32 = AtomicU32::new(0);
+    if !MODE_REQ_NEW.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+    let mut nonce = NONCE.load(Ordering::Relaxed);
+    if nonce == 0 {
+        let mut qpc = 0u64;
+        // SAFETY: a scalar time read with a valid out-pointer.
+        let t = unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&mut qpc) };
+        nonce = ((t >> 4) as u32 & 0xffff).max(1);
+        NONCE.store(nonce, Ordering::Relaxed);
+    }
+    let seq = MODE_REQ_SEQ.load(Ordering::Acquire) & 0xffff;
+    Some((MODE_REQ.load(Ordering::Relaxed), nonce << 16 | seq))
+}
+
 /// Consumed by the HPD worker: whether a new list arrived since last asked.
 pub(crate) fn take_changed() -> bool {
     CHANGED.swap(false, Ordering::AcqRel)

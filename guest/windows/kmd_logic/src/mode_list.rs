@@ -25,6 +25,12 @@ use crate::{MAX_DISPLAY_EXTENT, MIN_DISPLAY_HEIGHT, MIN_DISPLAY_WIDTH};
 pub const FEATURE: u64 = 1 << 21;
 /// Host `MsgType::DisplayModeList`.
 pub const MSG_DISPLAY_MODE_LIST: u32 = 34;
+/// `DisplayMode` (host -> guest event 23): the mode the host's viewer asks the
+/// guest for (a click in its menu, `--res`, fullscreen). Payload {scanout,
+/// width, height, refresh_mhz}. The KMD cannot switch the desktop itself: it
+/// publishes the request for the user-session agent (the Conduit GPU tray),
+/// which applies it with `ChangeDisplaySettingsEx`.
+pub const MSG_DISPLAY_MODE: u32 = 23;
 /// At most this many modes in a list (host `protocol::modes::MODE_LIST_MAX`).
 pub const MODE_LIST_MAX: usize = 48;
 /// Message header, then the list header (scanout, count, refresh_mhz, flags).
@@ -253,11 +259,18 @@ pub enum Scaling {
 }
 
 /// Whether source size `s` can be shown on target size `t` under `scaling`.
+///
+/// A source no larger than the target in either dimension, whatever the
+/// scaling: the KMD scans out exactly the source size and the host shows it
+/// (centred or scaled by the viewer), so a smaller source on the native target
+/// is always displayable. Windows relies on this: it probes every source mode
+/// on a VidPN that keeps the committed target and its Identity scaling pinned
+/// (IsSupportedVidPn), and prunes each one refused -- with an Identity-only
+/// equal-size rule it pruned everything but native, and Display Settings showed
+/// a single, greyed-out resolution. `scaling` is kept for the callers' sake.
 pub const fn fits(s: (u32, u32), t: (u32, u32), scaling: Scaling) -> bool {
-    match scaling {
-        Scaling::CenteredOrUnpinned => s.0 <= t.0 && s.1 <= t.1,
-        Scaling::Identity | Scaling::Other => s.0 == t.0 && s.1 == t.1,
-    }
+    let _ = scaling;
+    s.0 <= t.0 && s.1 <= t.1
 }
 
 /// A `DisplayModeList` as the host sent it.
@@ -347,6 +360,22 @@ pub fn parse(bytes: &[u8], len: usize) -> Option<HostList> {
         l.len += 1;
     }
     (l.len != 0).then_some(l)
+}
+
+/// A `DisplayMode` message: the requested size, packed. `None` for another
+/// scanout, a short message or an unusable size.
+pub fn parse_display_mode(bytes: &[u8], len: usize) -> Option<u32> {
+    let bytes = bytes.get(..len.min(bytes.len()))?;
+    if le32(bytes, 0)? != MSG_DISPLAY_MODE {
+        return None;
+    }
+    let p = MSG_HEADER_BYTES;
+    if le32(bytes, p)? != 0 {
+        return None;
+    }
+    let (w, h) = (le32(bytes, p + 4)?, le32(bytes, p + 8)?);
+    le32(bytes, p + 12)?;
+    usable(w, h).then(|| pack(w, h))
 }
 
 /// The scanout extent: the committed source size, if one was committed (packed,
@@ -500,6 +529,26 @@ mod tests {
     }
 
     #[test]
+    fn display_mode_requests_parse() {
+        let mut b = [0u8; 32];
+        b[0..4].copy_from_slice(&MSG_DISPLAY_MODE.to_le_bytes());
+        b[20..24].copy_from_slice(&1920u32.to_le_bytes());
+        b[24..28].copy_from_slice(&1080u32.to_le_bytes());
+        b[28..32].copy_from_slice(&240_000u32.to_le_bytes());
+        assert_eq!(parse_display_mode(&b, 32), Some(pack(1920, 1080)));
+        assert_eq!(parse_display_mode(&b, 31), None, "short");
+        let mut o = b;
+        o[16] = 1;
+        assert_eq!(parse_display_mode(&o, 32), None, "another scanout");
+        let mut z = b;
+        z[20..24].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(parse_display_mode(&z, 32), None, "unusable size");
+        let mut t = b;
+        t[0] = 34;
+        assert_eq!(parse_display_mode(&t, 32), None, "another message");
+    }
+
+    #[test]
     fn a_pinned_size_restricts_the_other_end() {
         use Scaling::*;
         let l = ModeList::standard(1920, 1080);
@@ -509,11 +558,20 @@ mod tests {
             assert!(l.targets_for(Some((1234, 567)), sc).is_empty());
             assert!(l.sources_for(Some((1234, 567)), sc).is_empty());
         }
-        // Identity (and anything never advertised): exactly the pinned size.
-        assert_eq!(sizes(&l.targets_for(Some((1280, 720)), Identity)), vec![(1280, 720)]);
-        assert_eq!(sizes(&l.sources_for(Some((1280, 720)), Other)), vec![(1280, 720)]);
-        // Centered or unpinned: every target that holds the source, native
-        // included; every source the target holds.
+        // Any scaling: every target that holds the source, native included;
+        // every source the target holds. (Windows probes source modes with the
+        // target and Identity pinned; an equal-size rule pruned them all.)
+        for sc in [Identity, Other] {
+            assert_eq!(
+                l.targets_for(Some((1280, 720)), sc),
+                l.targets_for(Some((1280, 720)), CenteredOrUnpinned)
+            );
+            assert_eq!(
+                l.sources_for(Some((1920, 1080)), sc),
+                l.sources_for(Some((1920, 1080)), CenteredOrUnpinned)
+            );
+        }
+        assert_eq!(l.sources_for(Some((1920, 1080)), Identity), l, "native holds every mode");
         let t = sizes(&l.targets_for(Some((1280, 720)), CenteredOrUnpinned));
         assert_eq!(t[0], (1920, 1080));
         assert!(t.contains(&(1280, 720)) && t.contains(&(1366, 768)));
@@ -539,10 +597,16 @@ mod tests {
             // A source larger than its target never fits.
             assert!(!l.supports(Some((1920, 1080)), Some((1280, 720)), sc));
         }
-        // A smaller source on a larger target: only when it may be centred.
-        assert!(l.supports(Some((1280, 720)), Some((1920, 1080)), CenteredOrUnpinned));
-        assert!(!l.supports(Some((1280, 720)), Some((1920, 1080)), Identity));
-        assert!(!l.supports(Some((1280, 720)), Some((1920, 1080)), Other));
+        // A smaller source on a larger target, whatever the scaling: the
+        // host shows the source size (Windows' Identity-pinned probe).
+        for sc in [Identity, CenteredOrUnpinned, Other] {
+            assert!(l.supports(Some((1280, 720)), Some((1920, 1080)), sc));
+        }
+        // Every mode of an ultrawide native passes the probe on the native target.
+        let u = ModeList::standard(5120, 1440);
+        for i in 0..u.len() {
+            assert!(u.supports(u.get(i), Some((5120, 1440)), Identity), "{:?}", u.get(i));
+        }
         // Taller but narrower does not fit.
         assert!(!l.supports(Some((1280, 1024)), Some((1366, 768)), CenteredOrUnpinned));
     }

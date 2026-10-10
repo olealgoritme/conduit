@@ -8,7 +8,9 @@
 //! the DRIVER posts empty and the HOST fills: `EventReady` (a bare 16-byte
 //! `MsgHeader { msg_type = 8, handle, status, pad }`, "the backend file `handle`
 //! became readable"), and, for a guest that takes input, `InputEvent` /
-//! `DisplayMode` / clipboard messages. This KMD wants only `EventReady`.
+//! `DisplayMode` / clipboard messages. This KMD takes `EventReady`, the scanout
+//! release/presentation reports, `DisplayModeList` (the mode list) and
+//! `DisplayMode` (a mode request, published for the tray to apply).
 //!
 //! # Availability, and the input bit
 //!
@@ -204,6 +206,8 @@ enum Taken {
     Presented(Presented),
     /// `DisplayModeList` (message 34), parsed.
     ModeList(helios_kmd_logic::mode_list::HostList),
+    /// `DisplayMode` (message 23): the size the host's viewer asks for, packed.
+    HostMode(u32),
     /// Some other message (or a short or bad one): dropped.
     Other,
     /// The queue misbehaved: stop draining this pass.
@@ -258,6 +262,12 @@ fn take_event(ring: &mut EventRing) -> Taken {
             (true, Some(helios_kmd_logic::mode_list::MSG_DISPLAY_MODE_LIST), _, _) => {
                 match helios_kmd_logic::mode_list::parse(bytes, len) {
                     Some(l) => Taken::ModeList(l),
+                    None => Taken::Other,
+                }
+            }
+            (true, Some(helios_kmd_logic::mode_list::MSG_DISPLAY_MODE), _, _) => {
+                match helios_kmd_logic::mode_list::parse_display_mode(bytes, len) {
+                    Some(p) => Taken::HostMode(p),
                     None => Taken::Other,
                 }
             }
@@ -656,6 +666,11 @@ impl VirtioGpu {
                         // Never asked for (the feature was not acked): a host bug. Dropped.
                         NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+                Taken::HostMode(p) => {
+                    // The worker publishes it at PASSIVE for the tray to apply.
+                    reposted = true;
+                    wake_worker |= crate::ddi::mode_list::on_host_mode(p);
                 }
                 Taken::Other => {
                     reposted = true;
