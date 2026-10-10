@@ -269,6 +269,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0045 | `VK_NV_framebuffer_mixed_samples` (Maxwell B+): `rasterizationSamples` above the attachments' sample count turns on the hardware's target-independent rasterization (`SET_TIR`, `SET_ANTI_ALIAS_RASTER`), with merge coverage reduction and coverage modulation (also the extended dynamic state 3 coverage modulation features). What D3D11.1 `ForcedSampleCount` needs with a render target bound: Direct2D's anti-aliased fills (`guest/windows/tools/d2d_tir_probe.cpp`) |
 | 0046 | zink: without a DEVICE_LOCAL \| HOST_VISIBLE type (0030) the descriptor buffers and GL persistent mappings are host-visible coherent system memory (a persistent map of plain VRAM is a staging copy the GPU never sees). `wgl_test.exe` checks readback, compute and a persistent mapping |
 | 0047 | ZCULL only where one culling state describes the depth view: storage only for depth images with one layer and one level, and only in render passes that draw one layer without multiview (see "ZCULL and DXVK depth buffers") |
+| 0048 | util/disk_cache on Windows: a requested single-file or database cache is the multi-file cache in the requested directory (Steam starts games on Mesa drivers with `MESA_DISK_CACHE_SINGLE_FILE=1` and a per-game `MESA_SHADER_CACHE_DIR`, which left them with no shader cache); no read-only Fossilize caches next to it; an uncreatable `MESA_SHADER_CACHE_DIR` falls back to `%LOCALAPPDATA%`. `tests/disk_cache_win_test.c` checks it |
 
 ## Per-draw cost (common 0001-0007)
 
