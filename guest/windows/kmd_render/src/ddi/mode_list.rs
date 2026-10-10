@@ -37,6 +37,8 @@ pub(crate) fn reset_for_start() {
     COMMITTED.store(0, Ordering::Release);
     RECEIVED.store(0, Ordering::Relaxed);
     MONITOR_SYNCED.store(0, Ordering::Relaxed);
+    // A request still pending from before the restart is not replayed.
+    MODE_REQ_NEW.store(false, Ordering::Release);
 }
 
 /// The list last added to the monitor's source mode set (a hash, 0 = none), so a
@@ -119,11 +121,11 @@ pub(crate) fn on_host_mode(packed: u32) -> bool {
 
 /// Consumed by the HPD worker: the newest request since last asked, with its
 /// sequence number.
-/// The published sequence is `nonce << 16 | count`: the values persist in the
-/// registry across boots while the count restarts, so the nonce (the interrupt
-/// time's low bits at the first request of this boot, never 0) keeps a fresh
-/// request from looking like the last boot's to the tray. PASSIVE.
-pub(crate) fn take_mode_request() -> Option<(u32, u32)> {
+/// The `HostMode` value to publish (`kmd_logic::mode_list::host_mode_value`):
+/// the registry keeps it across boots while the count restarts, so the nonce
+/// (the interrupt time's low bits at the first request of this boot, never 0)
+/// keeps a fresh request from looking like the last boot's to the tray. PASSIVE.
+pub(crate) fn take_mode_request() -> Option<u64> {
     static NONCE: AtomicU32 = AtomicU32::new(0);
     if !MODE_REQ_NEW.swap(false, Ordering::AcqRel) {
         return None;
@@ -136,8 +138,12 @@ pub(crate) fn take_mode_request() -> Option<(u32, u32)> {
         nonce = ((t >> 4) as u32 & 0xffff).max(1);
         NONCE.store(nonce, Ordering::Relaxed);
     }
-    let seq = MODE_REQ_SEQ.load(Ordering::Acquire) & 0xffff;
-    Some((MODE_REQ.load(Ordering::Relaxed), nonce << 16 | seq))
+    let count = MODE_REQ_SEQ.load(Ordering::Acquire);
+    Some(helios_kmd_logic::mode_list::host_mode_value(
+        nonce,
+        count,
+        MODE_REQ.load(Ordering::Relaxed),
+    ))
 }
 
 /// Consumed by the HPD worker: whether a new list arrived since last asked.

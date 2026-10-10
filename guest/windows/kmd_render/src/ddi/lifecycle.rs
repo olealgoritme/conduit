@@ -401,7 +401,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     adapter.set_committed_refresh_mhz(0);
     crate::ddi::mode_list::reset_for_start();
     // No host mode request this boot yet (the tray keys on a nonzero sequence).
-    crate::diag::record_named_bytes(b"HostModeSeq", 0);
+    crate::diag::record_named_qword(b"HostMode", 0);
     // Diagnostic override of the vsync heartbeat rate (0 = follow the mode).
     let forced_vsync_mhz = crate::diag::read_config_dword(crate::diag::knobs::VSYNC_RATE_MHZ, 0);
     crate::adapter::kobj::VSYNC_RATE_OVERRIDE_MHZ

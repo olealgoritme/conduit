@@ -378,6 +378,15 @@ pub fn parse_display_mode(bytes: &[u8], len: usize) -> Option<u32> {
     usable(w, h).then(|| pack(w, h))
 }
 
+/// The `HostMode` registry QWORD the KMD publishes for the tray: the request's
+/// sequence (`nonce << 16 | count`, never 0 for a real request: the nonce is at
+/// least 1) in the high half, the packed size in the low half. One value, so
+/// the tray can never read a size and a sequence from different requests.
+pub const fn host_mode_value(nonce: u32, count: u32, packed: u32) -> u64 {
+    let seq = (nonce & 0xffff) << 16 | (count & 0xffff);
+    (seq as u64) << 32 | packed as u64
+}
+
 /// The scanout extent: the committed source size, if one was committed (packed,
 /// 0 = none), else native.
 pub const fn scanout_extent(committed_packed: u32, native: (u32, u32)) -> (u32, u32) {
@@ -526,6 +535,16 @@ mod tests {
         let b = msg(0, 2, 60_000, &[(1920, 1080), (2560, 1440)]);
         let l = ModeList::from_host(1920, 1080, &parse(&b, b.len()).unwrap());
         assert_eq!(sizes(&l), vec![(1920, 1080), (2560, 1440)]);
+    }
+
+    #[test]
+    fn host_mode_values_pack_the_sequence_over_the_size() {
+        let v = host_mode_value(0x1234, 7, pack(1920, 1080));
+        assert_eq!(v >> 32, 0x1234_0007);
+        assert_eq!(v as u32, pack(1920, 1080));
+        // The count wraps inside its 16 bits; the sequence stays nonzero.
+        assert_eq!(host_mode_value(1, 0x1_0000, 5) >> 32, 0x0001_0000);
+        assert_ne!(host_mode_value(1, 0x1_0000, 5) >> 32, 0);
     }
 
     #[test]

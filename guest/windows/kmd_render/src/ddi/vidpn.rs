@@ -586,10 +586,10 @@ unsafe fn pinned_target_size(
     Some((a.cx as u32, a.cy as u32))
 }
 
-/// The mode rule's view of a path's scaling (`kmd_logic::mode_list::Scaling`):
-/// pinned Identity needs equal sizes; pinned Centered or not pinned yet (the path
-/// advertises both) lets a smaller source sit on a larger target; anything this
-/// driver never advertised is treated as Identity.
+/// The mode rule's view of a path's scaling (`kmd_logic::mode_list::Scaling`).
+/// The rule itself accepts a source no larger than the target under any scaling
+/// (`mode_list::fits`: the KMD scans out the source size and the host shows it;
+/// Windows probes source modes with Identity pinned on the committed target).
 fn path_scaling(p: &D3DKMDT_VIDPN_PRESENT_PATH) -> helios_kmd_logic::mode_list::Scaling {
     use helios_kmd_logic::mode_list::Scaling;
     use _D3DKMDT_VIDPN_PRESENT_PATH_SCALING as S;
