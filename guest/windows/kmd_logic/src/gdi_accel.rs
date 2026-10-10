@@ -1452,14 +1452,24 @@ pub mod cpu {
     /// ClearTypeBlend of one pixel (Learn `DXGK_GDIARG_CLEARTYPEBLEND` remarks). `gamma`: the row
     /// of the gamma surface (512 entries: the gamma table then the inverse table), or `None` for
     /// `D3DKM_INVALID_GAMMA_INDEX`.
+    ///
+    /// The coverage a channel blends with: with a gamma table its own component of A (A.r for
+    /// red, A.g for green, A.b for blue); without one, A.r or A.g for every channel (A.r when the
+    /// color is not darker than the destination, else A.g) and A.b is not used at all: GDI's
+    /// grey-antialiased text sends A = (a, a, 0). Coverage 0 keeps D, 255 takes Color2.
     pub fn cleartype_pixel(d: u32, a: u32, color: u32, color2: u32, gamma: Option<&[u8; 512]>) -> u32 {
         let mut out = d & 0xff00_0000;
         let ar = ch(a, 16);
         let ag = ch(a, 8);
         let ab = ch(a, 0);
-        for (shift, ac) in [(16u32, ar), (8, ag), (0, ab)] {
+        for (shift, own) in [(16u32, ar), (8, ag), (0, ab)] {
             let dc = ch(d, shift);
             let cc = ch(color, shift);
+            let ac = match gamma {
+                Some(_) => own,
+                None if cc >= dc => ar,
+                None => ag,
+            };
             let v = if ac == 0 {
                 dc
             } else if ac == 255 {
@@ -1474,8 +1484,7 @@ pub mod cpu {
                     }
                     None => {
                         // OutputColor.c = D.c + (Color.c - D.c) * (Color.c >= D.c ? A.r : A.g) / 255
-                        let k = if cc >= dc { ar } else { ag };
-                        let v = dc as i32 + ((cc as i32 - dc as i32) * k as i32) / 255;
+                        let v = dc as i32 + ((cc as i32 - dc as i32) * ac as i32) / 255;
                         v.clamp(0, 255) as u32
                     }
                 }
@@ -1789,6 +1798,19 @@ pub const COUNTERS: &[&str] = &[
     // and the executor thread's state (1 running, 0 on the HPD worker).
     "GdiRdBk",
     "GdiThr",
+    // The last command the CPU executor dropped: signature, failing step | Why << 8 | standard
+    // buffer step << 16, surface kinds, formats, authored pitches, the command's pitches, extents
+    // (source, destination) and first sub-rectangle (origin, size).
+    "GdiDropK",
+    "GdiDropS",
+    "GdiDropT",
+    "GdiDropF",
+    "GdiDropP",
+    "GdiDropC",
+    "GdiDropSWH",
+    "GdiDropDWH",
+    "GdiDropO",
+    "GdiDropR",
     // Copies and fills with a staging buffer on one side run on the copy engine over the buffer's
     // system pages; refused (the CPU instead); failed after the mapping (the CPU instead).
     "GdiSysCe",
@@ -2570,6 +2592,14 @@ mod tests {
         // ClearType without gamma: zero coverage keeps D, full coverage takes Color2, alpha kept.
         assert_eq!(cleartype_pixel(0x7f11_2233, 0x0000_0000, 0x00ff_ffff, 0x0001_0203, None), 0x7f11_2233);
         assert_eq!(cleartype_pixel(0x7f11_2233, 0x00ff_ffff, 0x00ff_ffff, 0x0001_0203, None), 0x7f01_0203);
+        // Grey-antialiased text (A = (a, a, 0)) blends all three channels with A.r / A.g: black
+        // over white at a = 0x42 is 0xbd in each channel (WARP's GDI gives the same), and full
+        // coverage is Color2 in each.
+        assert_eq!(cleartype_pixel(0xffff_ffff, 0x0042_4200, 0, 0, None), 0xffbd_bdbd);
+        assert_eq!(cleartype_pixel(0xffff_ffff, 0x00ff_ff00, 0, 0, None), 0xff00_0000);
+        // A color not darker than the destination blends with A.r, A.g is not used.
+        assert_eq!(cleartype_pixel(0xff00_0000, 0x0000_ff00, 0x00ff_ffff, 0x00ff_ffff, None), 0xff00_0000);
+        assert_eq!(cleartype_pixel(0xff00_0000, 0x00ff_0000, 0x00ff_ffff, 0x00ff_ffff, None), 0xffff_ffff);
         // With an identity gamma table half coverage lands halfway.
         let mut t = [0u8; 512];
         for i in 0..256 {
