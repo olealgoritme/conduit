@@ -1580,7 +1580,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
 /// `GdiAccel`: the job a RenderKm/RenderGdi buffer names in its private data
 /// (`gdi_accel::Private`, at the start of the KMD's half, or at 0), admitted to the executor;
 /// `Some(seq)` gates the fence. A submission on a GDI context without the record admits every
-/// unclaimed job of that context (`gdi_exec::admit_unclaimed`).
+/// unclaimed job of that context and waits for the context's outstanding jobs
+/// (`gdi_exec::admit_unclaimed`).
 ///
 /// # Safety
 /// `data` is dxgkrnl's private data of `size` bytes, the KMD's half starting at `umd`.
@@ -1607,10 +1608,11 @@ unsafe fn gdi_job_seq(
     }
     let decoded = job.is_some();
     if !decoded && gdi_ctx {
-        // No record: every unclaimed job of the context, the fence gated on the last
+        // No record: every unclaimed job of the context, the fence gated on the newest job of the
+        // context the executor has not finished, a preempted buffer's resubmission included
         // (`gdi_exec::admit_unclaimed`).
-        let seq = crate::ddi::gdi_exec::admit_unclaimed(adapter, h_context as usize);
-        crate::ddi::gdi_accel::note_submit(size, umd, false, seq.is_some());
+        let (seq, admitted) = crate::ddi::gdi_exec::admit_unclaimed(adapter, h_context as usize);
+        crate::ddi::gdi_accel::note_submit(size, umd, false, admitted);
         return seq;
     }
     if decoded {

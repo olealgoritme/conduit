@@ -696,6 +696,10 @@ other value: 0, as before.
    zeroed: a recycled buffer's stale `"HPBL"` Present prefix would otherwise gate this fence on an old copy).
 2. `DxgkDdiSubmitCommand` (DISPATCH): `admit(N)`: first time, the next sequence S and a worker wake; a
    preempted replay, the same S; N already executed and gone, no wait. The WDDM entry carries `gdi_seq` S.
+   On a GpuMmu adapter (RenderGdi, then `SubmitCommandVirtual`) the submission carries no record: it
+   admits every unclaimed job of its context and waits for the newest job of the context the executor
+   has not finished (`gdi_accel::context_gate`), so a buffer dxgkrnl resubmits after a preemption
+   still waits for its job (`GdiReGate`).
 3. HPD worker: jobs in S order. Engine `Ce` (SRCCOPY BitBlt, PATCOPY ColorFill, every surface VRAM): one
    push per 10-11 rectangles through `submit_build`, waited at most 100 ms. Engine `Cpu` (everything else,
    or a CE failure): the bounding window of the sub-rectangles read from each surface (VRAM through the
@@ -726,8 +730,9 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiCls` | surface classes seen: destination bit 0 VRAM, 1 standard buffer, 2 unreachable; sources the same at bits 4-6 |
 | `GdiDstRes`, `GdiDstWH` | last destination's resource id and `w << 16 \| h` |
 | `GdiRkIn`, `GdiRgIn` | entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing |
-| `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, submissions that admitted jobs by context because the record was missing (each admits every unclaimed job of the context and gates its fence on the last), the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
+| `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, submissions that admitted jobs by context because the record was missing (each admits every unclaimed job of the context and gates its fence on the newest job of the context the executor has not finished), the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
 | `GdiClmMul`, `GdiClmMax` | of those, submissions that admitted more than one job (a rendered job without a submission of its own came before), and the most one admitted |
+| `GdiReGate` | record-less submissions on a GDI context that admitted no job but waited for the context's unfinished jobs: mostly a DMA buffer dxgkrnl resubmits after `DxgkDdiPreemptCommand` dropped its pending fence (new fence id, no record, its job admitted by the first submission), also a buffer whose job an earlier submission admitted. Without that wait the resubmitted fence retired before the executor ran the job, and CDD read readback staging and reused staging buffers early |
 | `GdiChUp`, `GdiCeWhy` | channel bring-ups the executor asked for; why the last CE attempt failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + channel state when it could not come up: 17 cold, 18 disabled, 19 broken, 20 other) |
 | `GdiRdBk`, `GdiThr` | copies from a VRAM surface into a standard buffer (GDI readback); the executor's own thread running (1) or the HPD worker in charge (0) |
 | `GdiSysCe`, `GdiSysRef`, `GdiSysFail` | copies/fills with a staging buffer on one side done on the copy engine over its system pages; refused (CPU instead); failed after the mapping (CPU instead) |

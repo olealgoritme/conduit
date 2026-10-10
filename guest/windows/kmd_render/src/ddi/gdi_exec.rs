@@ -8,7 +8,10 @@
 //!    planned. The job id goes into the DMA buffer's private data (`gdi_accel::Private`).
 //! 2. `DxgkDdiSubmitCommand` (DISPATCH) reads the id and [`admit`]s it: the first submission gives
 //!    it the next sequence of the [`Timeline`] and wakes the worker; a preempted replay gets the
-//!    same sequence; an id no longer in the table (already executed) gets no wait. The WDDM fence
+//!    same sequence; an id no longer in the table (already executed) gets no wait. A submission
+//!    without the record (RenderGdi's `SubmitCommandVirtual`) admits every unclaimed job of its
+//!    context and waits for the context's newest unfinished job ([`admit_unclaimed`]), which also
+//!    keeps a preempted buffer's resubmission waiting for its job. The WDDM fence
 //!    of that submission is gated on `completed >= seq` (`WddmPending::gdi_seq`, `virtio/gpu`),
 //!    which [`seq_ready`] answers with one atomic load.
 //! 3. The HPD worker ([`service`], PASSIVE) executes admitted jobs in sequence order: copies and
@@ -441,7 +444,7 @@ pub(crate) fn reset_for_start(on: bool) {
     }
     for c in [
         &BLT_N, &FILL_N, &FALL, &JOB_N, &AGAIN, &DONE, &ORPH, &CE_SUB, &US, &US_MAX, &RECTS, &CLS,
-        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &CLAIM_MULTI, &CLAIM_MAX, &FREE_WAIT, &FREE_TO, &FREE_UNS, &FREE_US, &PITCH_IGN, &PITCH_IGN_V,
+        &DST_RES, &DST_WH, &CH_UP, &CE_WHY, &RD_BACK, &SYS_CE, &SYS_REF, &SYS_FAIL, &SYS_WHY, &SYS_MSK, &SYS_CPU_K, &SYS_CPU_T, &CH_UP_US, &SLOW_US, &SLOW_OP, &SLOW_ROP, &CPU_MSK, &CPU_ROP, &SYS_US, &SYS_VW_US, &SYS_SUB_US, &SYS_WT_US, &SYS_PX, &FGN_RMW_RD, &FGN_RMW_WR, &FGN_RMW_FAIL, &SYS_K, &SYS_SWH, &SYS_DWH, &SYS_RES, &SYS_SHAPE, &FGN_CE, &FGN_FAIL, &FGN_WHY, &FGN_WR, &OVL_N, &OVL_CE, &OVL_WHY, &JOB_N_OPS, &CHK_SEEN, &CHK_N, &CHK_BAD, &CHK_K, &CHK_GOT, &CHK_WANT, &CHK_A0, &CHK_AFF, &CHK_GPU_PX, &OPAQ_N, &FMT_K, &PRB_K, &PRB_S_K, &SYNC_N, &SYNC_OPS, &SRC_SCAN, &SRC_SCAN_K, &PITCH_MIS, &PITCH_CMD, &PITCH_AL, &DROP_K, &DROP_S, &DROP_T, &DROP_F, &DROP_P, &DROP_C, &DROP_SWH, &DROP_DWH, &DROP_O, &DROP_R, &CPU_STEP, &LUT_N, &LUT_T, &LUT_F, &LUT_C, &LUT_R, &LUT_SWH, &LUT_AP, &LUT_ID, &CLAIM_MULTI, &CLAIM_MAX, &REGATE, &FREE_WAIT, &FREE_TO, &FREE_UNS, &FREE_US, &PITCH_IGN, &PITCH_IGN_V,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -594,6 +597,7 @@ pub(crate) fn publish_counters() {
     w(b"GdiLutId", LUT_ID.load(Ordering::Relaxed));
     w(b"GdiClmMul", CLAIM_MULTI.load(Ordering::Relaxed));
     w(b"GdiClmMax", CLAIM_MAX.load(Ordering::Relaxed));
+    w(b"GdiReGate", REGATE.load(Ordering::Relaxed));
     w(b"GdiFreeWait", FREE_WAIT.load(Ordering::Relaxed));
     w(b"GdiFreeTo", FREE_TO.load(Ordering::Relaxed));
     w(b"GdiFreeUns", FREE_UNS.load(Ordering::Relaxed));
@@ -744,9 +748,20 @@ pub(crate) fn admit(adapter: &AdapterContext, id: u64) -> Option<u64> {
 /// the most one admitted (`GdiClmMul`, `GdiClmMax`).
 static CLAIM_MULTI: AtomicU32 = AtomicU32::new(0);
 static CLAIM_MAX: AtomicU32 = AtomicU32::new(0);
+/// Submissions on a GDI context without a private record that admitted no job and were gated on
+/// the context's outstanding jobs (`GdiReGate`): resubmissions after a preemption, or a buffer
+/// whose job an earlier submission admitted.
+static REGATE: AtomicU32 = AtomicU32::new(0);
 
 /// SubmitCommand without a private record, on GDI context `ctx` (DISPATCH): admit EVERY unclaimed
-/// job of the context, oldest first, and gate this submission's fence on the last one.
+/// job of the context, oldest first, and gate this submission's fence on the newest outstanding
+/// job of the context (`gdi_accel::context_gate`): the last one admitted here, or, when nothing
+/// was unclaimed, the jobs earlier submissions admitted that the executor has not finished.
+///
+/// The second case is a preempted buffer coming back: `DxgkDdiPreemptCommand` drops the pending
+/// fence and dxgkrnl resubmits the same DMA buffer under a new fence id, with no record to name
+/// its job. Gated on nothing, the replay's fence retired before the executor ran the job (CDD read
+/// stale readback pixels and reused staging buffers the job still read: half-drawn rows).
 ///
 /// dxgkrnl submits a context's DMA buffers in the order it rendered them, and every job of the
 /// context was rendered before this submission, so this buffer's job is among the unclaimed ones
@@ -757,11 +772,11 @@ static CLAIM_MAX: AtomicU32 = AtomicU32::new(0);
 /// own job was admitted only by the next submission. Its fence retired with its commands still
 /// unexecuted, CDD destroyed the source of the copy (the staging buffer of the ClearType gamma
 /// table's one initialising BitBlt), and the job then read a freed allocation (`GdiLutAp` 0x0D:
-/// created, registered, forgotten). `None`: nothing unclaimed (the earlier gated fences cover it).
-pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize) -> Option<u64> {
-    let (last, n) = {
+/// created, registered, forgotten). Returns the gate (`None`: nothing of the context outstanding)
+/// and whether any job was admitted here.
+pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize) -> (Option<u64>, bool) {
+    let (gate, n) = {
         let mut t = TABLE.lock();
-        let mut last = None;
         let mut n = 0u32;
         loop {
             let Some(i) = t
@@ -776,13 +791,17 @@ pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize) -> Option<u6
             };
             let seq = t.tl.next();
             t.jobs[i].seq = Some(seq);
-            last = Some(seq);
             n += 1;
         }
-        (last, n)
+        // A job the executor is running stays in the table with its sequence until it completes.
+        let completed = t.tl.completed;
+        (ga::context_gate(t.jobs.iter().filter(|j| j.ctx == ctx).map(|j| j.seq), completed), n)
     };
     if n == 0 {
-        return None;
+        if gate.is_some() {
+            REGATE.fetch_add(1, Ordering::Relaxed);
+        }
+        return (gate, false);
     }
     JOB_N.fetch_add(n, Ordering::Relaxed);
     if n > 1 {
@@ -791,7 +810,7 @@ pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize) -> Option<u6
     CLAIM_MAX.fetch_max(n, Ordering::Relaxed);
     PENDING.store(1, Ordering::Release);
     kick(adapter);
-    last
+    (gate, true)
 }
 
 /// Allocation destroys that waited for queued GDI jobs naming the allocation (`GdiFreeWait`), the
