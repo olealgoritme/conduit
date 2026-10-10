@@ -214,7 +214,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // Twice: the second clear and draw follow a draw that left
+  // target-independent rasterization on in the driver.
   int failures = drawForcedSampleCount(dev, ctx, tex, staging, W, H);
+  failures += drawForcedSampleCount(dev, ctx, tex, staging, W, H);
 
   ID2D1Factory1* factory = nullptr;
   D2D1_FACTORY_OPTIONS fo = {};

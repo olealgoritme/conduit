@@ -25,6 +25,12 @@ SET_ANTI_ALIAS for the attachments.  VK_NV_framebuffer_mixed_samples
   target-independent rasterization on with that raster sample count, and
   off otherwise.  The pixel shader's covmask then has one bit per raster
   sample; without sample shading NAK hands it to gl_SampleMaskIn as is.
+- CLEAR_SURFACE with target-independent rasterization on is a class
+  error (GB202: Xid 69, CLEAR_SURFACE 0x19d0, error code 0x124), so it
+  is turned off at every render pass begin (before SET_ANTI_ALIAS and
+  the load-op clears) and before vkCmdClearAttachments; the next draw
+  that wants it turns it back on.  A CPU flag (on at command buffer
+  begin and after secondaries) keeps the off method to once.
 - At queue init: off, coverage reduced to the color samples by the
   affinity map (the extension's merge reduction), alpha to coverage and
   the occlusion sample count on the raster samples (the spec orders
@@ -40,15 +46,83 @@ SET_ANTI_ALIAS for the attachments.  VK_NV_framebuffer_mixed_samples
 The extension requires sampleShadingEnable = VK_FALSE with mixed samples
 and a depth/stencil attachment of rasterizationSamples samples when a
 depth or stencil test is on, so the per-pass sample masks and the
-depth/stencil layout stay as they are.  Draws whose rasterization samples
-match the attachments see one SET_TIR per render pass and nothing else.
+depth/stencil layout stay as they are.  A device without the extension
+enabled emits nothing new.
 ---
- src/nouveau/vulkan/nvk_cmd_draw.c        | 143 ++++++++++++++++++++++-
+ src/nouveau/vulkan/nvk_cmd_buffer.c      |   4 +
+ src/nouveau/vulkan/nvk_cmd_buffer.h      |  11 ++
+ src/nouveau/vulkan/nvk_cmd_clear.c       |  10 +-
+ src/nouveau/vulkan/nvk_cmd_draw.c        | 172 ++++++++++++++++++++++-
  src/nouveau/vulkan/nvk_physical_device.c |   7 +-
- 2 files changed, 143 insertions(+), 7 deletions(-)
+ 5 files changed, 196 insertions(+), 8 deletions(-)
 
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index cc5c173d..05d7bf35 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -466,6 +466,10 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+       cmd->indirect_push_synced = false;
+       cmd->state.gfx.fs_tail_dw_count = 0;
+       cmd->state.gfx.draw_sysvals_emitted = 0;
++      /* The secondary may leave target-independent rasterization on */
++      cmd->state.gfx.tir_maybe_on = true;
++      BITSET_SET(cmd->vk.dynamic_graphics_state.dirty,
++                 MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
+ 
+       if (prof_slot >= 0) {
+          nvk_pass_profile_end_secondary(cmd, other, prof_slot);
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 9869fa60..abade3c9 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -260,6 +260,15 @@ struct nvk_graphics_state {
+     */
+    uint8_t zcull_internal;
+ 
++   /* VK_NV_framebuffer_mixed_samples: target-independent rasterization
++    * (SET_TIR) may be on.  True at command buffer begin and after
++    * secondaries (whatever ran before may have left it on), set when a draw
++    * turns it on, cleared when it is turned off.  CLEAR_SURFACE with it on
++    * is a class error (Xid 69 on GB202), so render pass begins and
++    * vkCmdClearAttachments turn it off first.
++    */
++   bool tir_maybe_on;
++
+    struct nvk_draw_params_state {
+       bool valid;
+       uint32_t first_vertex;
+@@ -452,6 +461,8 @@ nvk_cmd_buffer_push_indirect_ext(struct nvk_cmd_buffer *cmd,
+                                  uint64_t addr, uint32_t range,
+                                  bool no_prefetch);
+ 
++void nvk_cmd_disable_tir(struct nvk_cmd_buffer *cmd);
++
+ void nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                                    const VkCommandBufferBeginInfo *pBeginInfo);
+ void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
+diff --git a/src/nouveau/vulkan/nvk_cmd_clear.c b/src/nouveau/vulkan/nvk_cmd_clear.c
+index bcfe072c..4d666891 100644
+--- a/src/nouveau/vulkan/nvk_cmd_clear.c
++++ b/src/nouveau/vulkan/nvk_cmd_clear.c
+@@ -150,7 +150,15 @@ nvk_CmdClearAttachments(VkCommandBuffer commandBuffer,
+                         const VkClearRect *pRects)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+-   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
++   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
++
++   /* CLEAR_SURFACE is a class error with target-independent rasterization
++    * on; the next draw turns it back on if it wants it.
++    */
++   if (cmd->state.gfx.tir_maybe_on) {
++      nvk_cmd_disable_tir(cmd);
++      BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
++   }
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4 + attachmentCount * 4);
+ 
 diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
-index 0765625a..bbd70c6f 100644
+index 0765625a..9f439c4a 100644
 --- a/src/nouveau/vulkan/nvk_cmd_draw.c
 +++ b/src/nouveau/vulkan/nvk_cmd_draw.c
 @@ -616,6 +616,25 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
@@ -77,7 +151,56 @@ index 0765625a..bbd70c6f 100644
     }
  
     P_IMMD(p, NV9097, SET_WINDOW_ORIGIN, {
-@@ -3959,6 +3978,106 @@ vk_to_nak_sample_location(VkSampleLocationEXT loc)
+@@ -969,6 +988,8 @@ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                               const VkCommandBufferBeginInfo *pBeginInfo)
+ {
+    const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++
++   cmd->state.gfx.tir_maybe_on = true;
+    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 9);
+       P_MTHD(p, NV9097, INVALIDATE_SAMPLER_CACHE_NO_WFI);
+@@ -1116,6 +1137,26 @@ nil_to_nv9097_samples_mode(enum nil_sample_layout sample_layout)
+ 
+ static uint32_t nvk_mme_anti_alias_samples(uint32_t samples);
+ 
++void
++nvk_cmd_disable_tir(struct nvk_cmd_buffer *cmd)
++{
++   const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++
++   if (!cmd->state.gfx.tir_maybe_on)
++      return;
++
++   cmd->state.gfx.tir_maybe_on = false;
++
++   /* Only a device with VK_NV_framebuffer_mixed_samples enabled ever turns
++    * it on; the queue's init state has it off.
++    */
++   if (!dev->vk.enabled_extensions.NV_framebuffer_mixed_samples)
++      return;
++
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++   P_IMMD(p, NVB197, SET_TIR, MODE_DISABLED);
++}
++
+ static void
+ nvk_cmd_set_sample_layout(struct nvk_cmd_buffer *cmd,
+                           enum nil_sample_layout sample_layout)
+@@ -1406,6 +1447,12 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_buffer_dirty_render_pass(cmd);
+ 
++   /* No target-independent rasterization across the SET_ANTI_ALIAS and the
++    * load-op clears below; the first draw that wants it turns it back on
++    * (nvk_flush_mixed_samples(), rasterization samples are dirty).
++    */
++   nvk_cmd_disable_tir(cmd);
++
+    const size_t zcull_count = 47;
+    struct nv_push *p = nvk_cmd_buffer_push(
+       cmd, NVK_MAX_RTS * 12 + 46 + zcull_count
+@@ -3959,6 +4006,107 @@ vk_to_nak_sample_location(VkSampleLocationEXT loc)
     };
  }
  
@@ -135,12 +258,12 @@ index 0765625a..bbd70c6f 100644
 +   const bool mixed = render->samples != 0 &&
 +                      raster_samples > render->samples;
 +
-+   struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
-+
 +   if (!mixed) {
-+      P_IMMD(p, NVB197, SET_TIR, MODE_DISABLED);
++      nvk_cmd_disable_tir(cmd);
 +      return;
 +   }
++
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
 +
 +   P_IMMD(p, NVB197, SET_ANTI_ALIAS_RASTER,
 +          nvk_raster_samples_mode(raster_samples));
@@ -179,12 +302,13 @@ index 0765625a..bbd70c6f 100644
 +   }
 +
 +   P_IMMD(p, NVB197, SET_TIR, MODE_RASTER_N_TARGET_M);
++   cmd->state.gfx.tir_maybe_on = true;
 +}
 +
  static void
  nvk_flush_ms_state(struct nvk_cmd_buffer *cmd)
  {
-@@ -3980,13 +4099,23 @@ nvk_flush_ms_state(struct nvk_cmd_buffer *cmd)
+@@ -3980,13 +4128,23 @@ nvk_flush_ms_state(struct nvk_cmd_buffer *cmd)
           nvk_cmd_set_sample_layout(cmd, nil_choose_sample_layout(samples));
        } else {
           /* Multisample information MAY be missing (rasterizationSamples == 0)
@@ -199,7 +323,7 @@ index 0765625a..bbd70c6f 100644
        }
     }
  
-+   if (nvk_cmd_buffer_3d_cls(cmd) >= MAXWELL_B &&
++   if (nvk_cmd_buffer_device(cmd)->vk.enabled_extensions.NV_framebuffer_mixed_samples &&
 +       (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) ||
 +        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE) ||
 +        BITSET_TEST(dyn->dirty,
@@ -210,7 +334,7 @@ index 0765625a..bbd70c6f 100644
     if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) ||
         BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_ALPHA_TO_ONE_ENABLE)) {
        struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
-@@ -4007,8 +4136,14 @@ nvk_flush_ms_state(struct nvk_cmd_buffer *cmd)
+@@ -4007,8 +4165,14 @@ nvk_flush_ms_state(struct nvk_cmd_buffer *cmd)
           sl = vk_standard_sample_locations_state(samples);
        }
  
