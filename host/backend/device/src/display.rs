@@ -1366,7 +1366,9 @@ fn input_route_forced() -> bool {
     *FORCED.get_or_init(|| {
         let on = std::env::var("CONDUIT_INPUT_ROUTE").as_deref() == Ok("console");
         if on {
-            log::warn!("display: CONDUIT_INPUT_ROUTE=console: all input goes the boot console's way");
+            log::warn!(
+                "display: CONDUIT_INPUT_ROUTE=console: all input goes the boot console's way"
+            );
         }
         on
     })
@@ -6105,7 +6107,11 @@ mod tests {
         let console = Arc::new(Sink::default());
         link.attach_console(console.clone());
         let kbd = Arc::new(Kbd::default());
-        link.attach_virtio_input(Router::new([None, Some(kbd.clone() as Arc<dyn Port>), None]));
+        link.attach_virtio_input(Router::new([
+            None,
+            Some(kbd.clone() as Arc<dyn Port>),
+            None,
+        ]));
         let syn = InputEventEntry::new(input::EV_SYN, input::SYN_REPORT, 0);
         let mut evs = vec![
             InputEventEntry::new(input::EV_KEY, 30, 1),
@@ -6114,7 +6120,10 @@ mod tests {
             syn,
         ];
         link.deliver_console(&mut evs);
-        assert_eq!(*kbd.0.lock().unwrap(), vec![InputEventEntry::new(input::EV_KEY, 30, 1), syn]);
+        assert_eq!(
+            *kbd.0.lock().unwrap(),
+            vec![InputEventEntry::new(input::EV_KEY, 30, 1), syn]
+        );
         // No tablet: the position is the console's (its USB tablet).
         assert_eq!(
             *console.0.lock().unwrap(),

@@ -228,7 +228,9 @@ impl Config {
     pub fn read(&self, offset: u32, size: u32) -> Vec<u8> {
         let b = self.bytes();
         let start = (offset as usize).min(CONFIG_SIZE);
-        let end = (offset as usize).saturating_add(size as usize).min(CONFIG_SIZE);
+        let end = (offset as usize)
+            .saturating_add(size as usize)
+            .min(CONFIG_SIZE);
         b[start..end].to_vec()
     }
 
@@ -424,7 +426,6 @@ impl Router {
                 }
                 if let Some(&k) = self.held.get(&e.code) {
                     // Autorepeat: the guest repeats a held key itself.
-                    let _ = k;
                     return To::Dev(k);
                 }
                 match self.press_target(e.code) {
@@ -665,7 +666,10 @@ mod tests {
         t.write(0, &[CFG_ABS_INFO, input::ABS_Y as u8]);
         let b = t.bytes();
         assert_eq!(b[2], 20);
-        assert_eq!(i32::from_le_bytes(b[12..16].try_into().unwrap()), INPUT_ABS_MAX);
+        assert_eq!(
+            i32::from_le_bytes(b[12..16].try_into().unwrap()),
+            INPUT_ABS_MAX
+        );
 
         let mut k = Config::new(Kind::Keyboard);
         k.write(0, &[CFG_EV_BITS, input::EV_KEY as u8]);
@@ -724,18 +728,18 @@ mod tests {
         ];
         r.route(&mut b);
         let got = m.flat();
-        assert_eq!(got[0], (input::EV_KEY, BTN_LEFT, 1), "the button rides the first report");
+        assert_eq!(
+            got[0],
+            (input::EV_KEY, BTN_LEFT, 1),
+            "the button rides the first report"
+        );
         let reports = got.iter().filter(|e| **e == S).count();
         assert_eq!(reports, 3);
         let (mut sx, mut sy) = (0, 0);
         for &(t, c, v) in &got {
             if t == input::EV_REL {
                 assert!(v.abs() <= REL_STEP_MAX);
-                if c == input::REL_X {
-                    sx += v
-                } else {
-                    sy += v
-                }
+                if c == input::REL_X { sx += v } else { sy += v }
             }
         }
         assert_eq!((sx, sy), (300, -50));
@@ -762,7 +766,11 @@ mod tests {
 
     #[test]
     fn a_key_pressed_on_the_console_is_released_there() {
-        let (m, k, t) = (FakePort::on(), Arc::new(FakePort::default()), FakePort::on());
+        let (m, k, t) = (
+            FakePort::on(),
+            Arc::new(FakePort::default()),
+            FakePort::on(),
+        );
         let mut r = Router::new([
             Some(m as Arc<dyn Port>),
             Some(k.clone() as Arc<dyn Port>),
@@ -772,10 +780,17 @@ mod tests {
         r.route(&mut b);
         assert_eq!(b.len(), 2, "keyboard not ready: the console types");
         k.ready.store(true, Ordering::Relaxed);
-        let mut b = vec![ev(input::EV_KEY, 29, 0), syn(), ev(input::EV_KEY, 56, 1), syn()];
+        let mut b = vec![
+            ev(input::EV_KEY, 29, 0),
+            syn(),
+            ev(input::EV_KEY, 56, 1),
+            syn(),
+        ];
         r.route(&mut b);
         assert_eq!(
-            b.iter().map(|e| (e.ev_type, e.code, e.value)).collect::<Vec<_>>(),
+            b.iter()
+                .map(|e| (e.ev_type, e.code, e.value))
+                .collect::<Vec<_>>(),
             vec![(input::EV_KEY, 29, 0), S]
         );
         assert_eq!(k.flat(), vec![(input::EV_KEY, 56, 1), S]);
@@ -784,13 +799,22 @@ mod tests {
     #[test]
     fn ungrab_releases_mouse_buttons_and_buttons_follow_the_grab() {
         let (mut r, m, _, t) = setup();
-        let mut b = vec![ev(EV_GRAB_MARK, 0, 1), ev(input::EV_KEY, BTN_RIGHT, 1), syn()];
+        let mut b = vec![
+            ev(EV_GRAB_MARK, 0, 1),
+            ev(input::EV_KEY, BTN_RIGHT, 1),
+            syn(),
+        ];
         r.route(&mut b);
         let mut b = vec![ev(EV_GRAB_MARK, 0, 0)];
         r.route(&mut b);
         assert_eq!(
             m.flat(),
-            vec![(input::EV_KEY, BTN_RIGHT, 1), S, (input::EV_KEY, BTN_RIGHT, 0), S]
+            vec![
+                (input::EV_KEY, BTN_RIGHT, 1),
+                S,
+                (input::EV_KEY, BTN_RIGHT, 0),
+                S
+            ]
         );
         // The viewer's own release afterwards finds nothing held: console.
         let mut b = vec![ev(input::EV_KEY, BTN_RIGHT, 0), syn()];

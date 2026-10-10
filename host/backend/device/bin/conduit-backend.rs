@@ -2887,8 +2887,12 @@ fn activated_listeners() -> Activated {
     const SD_LISTEN_FDS_START: RawFd = 3;
     let mut out = Activated::default();
     let (Some(pid), Some(n)) = (
-        std::env::var("LISTEN_PID").ok().and_then(|v| v.parse::<u32>().ok()),
-        std::env::var("LISTEN_FDS").ok().and_then(|v| v.parse::<i32>().ok()),
+        std::env::var("LISTEN_PID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok()),
+        std::env::var("LISTEN_FDS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok()),
     ) else {
         return out;
     };
@@ -2899,8 +2903,7 @@ fn activated_listeners() -> Activated {
         // Only a listening unix stream socket will do.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: fstat on a plain fd number into a local buffer.
-        if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK
-        {
+        if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
             continue;
         }
         let kind = socket_path(fd).and_then(|p| device::vinput::Kind::from_socket_path(&p));
@@ -2910,7 +2913,9 @@ fn activated_listeners() -> Activated {
         match kind {
             Some(k) => out.inputs.push((k, l)),
             None if out.gpu.is_none() => out.gpu = Some(l),
-            None => log::warn!("socket activation: fd {fd} is neither the GPU's nor an input socket"),
+            None => {
+                log::warn!("socket activation: fd {fd} is neither the GPU's nor an input socket")
+            }
         }
     }
     out
@@ -3033,7 +3038,7 @@ fn serve_virtio_input(
     activated: Vec<(device::vinput::Kind, vhost::vhost_user::Listener)>,
     link: Option<&Arc<DisplayLink>>,
 ) -> anyhow::Result<()> {
-    use device::vinput::{Kind, Port, Router};
+    use device::vinput::{Port, Router};
     let mut listeners = activated;
     for (k, p) in &args.input_socket {
         if listeners.iter().any(|(have, _)| have == k) {
@@ -3063,7 +3068,6 @@ fn serve_virtio_input(
          input once the guest's driver runs it",
         names.join(", ")
     );
-    let _ = Kind::ALL;
     link.attach_virtio_input(Router::new(ports));
     Ok(())
 }

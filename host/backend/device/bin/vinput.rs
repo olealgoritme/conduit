@@ -16,7 +16,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 
 use device::chain::{writable, write_scattered};
-use device::vinput::{CONFIG_SIZE, Config, EVENT_QUEUE, Kind, MAX_QUEUE_SIZE, NUM_QUEUES, Port, STATUS_QUEUE};
+use device::vinput::{
+    CONFIG_SIZE, Config, EVENT_QUEUE, Kind, MAX_QUEUE_SIZE, NUM_QUEUES, Port, STATUS_QUEUE,
+};
 use protocol::messages::InputEventEntry;
 use vhost::vhost_user::Listener;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
@@ -132,7 +134,8 @@ impl Port for VhostPort {
             st.dropped += events.len() as u64;
             return;
         }
-        st.backlog.extend(events.iter().map(InputEventEntry::to_bytes));
+        st.backlog
+            .extend(events.iter().map(InputEventEntry::to_bytes));
         st.drain();
     }
 }
@@ -337,15 +340,24 @@ mod tests {
         ];
         p.send(&evs);
         assert_eq!(vq.used().idx().load(), 2);
-        assert_eq!(gm.read_obj::<[u8; 8]>(GuestAddress(0x10_0000)).unwrap(), evs[0].to_bytes());
-        assert_eq!(gm.read_obj::<[u8; 8]>(GuestAddress(0x10_0100)).unwrap(), evs[1].to_bytes());
+        assert_eq!(
+            gm.read_obj::<[u8; 8]>(GuestAddress(0x10_0000)).unwrap(),
+            evs[0].to_bytes()
+        );
+        assert_eq!(
+            gm.read_obj::<[u8; 8]>(GuestAddress(0x10_0100)).unwrap(),
+            evs[1].to_bytes()
+        );
         assert_eq!(p.st.lock().unwrap().backlog.len(), 1);
 
         // The guest hands one buffer back (and kicks).
         vq.add_desc_chains(&[buf(2)], 2).unwrap();
         p.st.lock().unwrap().drain();
         assert_eq!(vq.used().idx().load(), 3);
-        assert_eq!(gm.read_obj::<[u8; 8]>(GuestAddress(0x10_0200)).unwrap(), evs[2].to_bytes());
+        assert_eq!(
+            gm.read_obj::<[u8; 8]>(GuestAddress(0x10_0200)).unwrap(),
+            evs[2].to_bytes()
+        );
         let st = p.st.lock().unwrap();
         assert_eq!((st.sent, st.dropped, st.backlog.len()), (3, 0, 0));
     }
