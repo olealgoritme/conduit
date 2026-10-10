@@ -211,6 +211,30 @@ shortcut `Conduit host.lnk` to its root in the user's SendTo folder, so
 Explorer's **Send to → Conduit host** copies the selection there; it is
 removed when the folder is gone and by `Uninstall-Helios.ps1`.
 
+**Windows 11 context menu.** Windows 11's right-click menu shows Send to only
+under Show more options, so the package also adds **Send to Conduit host**,
+with the Conduit icon, at the top level of the menu for files and folders
+(one or many). It is an `IExplorerCommand` in-process COM server,
+`conduit_shell_menu.dll` (`guest/windows/tools/conduit-shell-menu`), that
+Explorer loads through a sparse package, `ConduitShellMenu.msix` (identity
+`Conduit.ShellMenu`, `desktop4:FileExplorerContextMenus` plus a
+`com:SurrogateServer` class; its external location is `Program Files\Conduit`,
+where the DLL and the tray exe live). The command shows while a Conduit shared
+folder is mounted (`HKLM\SOFTWARE\Conduit\ShareDrives`) and hands the selected
+paths to `conduit-gpu-tray.exe --send-list <file>`, which copies them into the
+default folder with Explorer's copy dialog, as the Send To shortcut does. The
+msix is signed with the package certificate, and its publisher is that
+certificate's subject, so it installs because the installer trusts the
+certificate (`Root`, `TrustedPublisher`). Packages register per user: the tray
+app registers it when it starts (`Add-AppxPackage -Path ... -ExternalLocation
+...`, once per user and package file; the logon task covers every user), and
+`Uninstall-Helios.ps1` removes it for all users. To build it by hand on a
+Windows machine with the SDK: `cargo build --release` in
+`tools/conduit-shell-menu`, then `New-ShellMenuPackage.ps1 -Publisher
+"CN=<signing certificate subject>" -Version <a.b.c.d> -OutFile
+ConduitShellMenu.msix` and `signtool sign /fd SHA256 ...` with that
+certificate.
+
 ## GPU stats tray
 
 **Conduit GPU** is a small tray app (`guest/windows/tools/conduit-gpu-tray`,
@@ -228,10 +252,12 @@ channel is added when the domain is defined, so a VM attached earlier needs
 serial driver (the one the QEMU guest agent uses); the app opens
 `\\.\Global\org.conduit.stats.0`.
 
-**Install and uninstall.** The driver package copies the exe to
+**Install and uninstall.** The driver package copies the exe, the context
+menu's `conduit_shell_menu.dll` and `ConduitShellMenu.msix` to
 `Program Files\Conduit` and registers the logon task `ConduitGpuTray`;
-`Uninstall-Helios.ps1` stops the app and removes the task, the folder and the
-Send to shortcut. Run as administrator without the package, the exe can
+`Uninstall-Helios.ps1` stops the app and removes the task, the folder, the
+Send to shortcut and the context menu package. Run as administrator without
+the package, the exe can
 register the task itself from its menu (Start with Windows).
 
 **Start at logon.** The VirtIO serial port is admin-only, so the app has to

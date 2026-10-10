@@ -1,6 +1,10 @@
 //! Explorer's "Send to > Conduit host": a shortcut to the default share's drive
 //! root in the user's SendTo folder, kept in step with the mounted shares.
 //! Explorer does the copying itself.
+//!
+//! Also the copy behind the Windows 11 context menu's "Send to Conduit host"
+//! (conduit_shell_menu.dll, which starts this exe with `--send-list <file>`)
+//! and behind drops on the popup.
 
 use crate::gfx::wide;
 use std::ffi::c_void;
@@ -133,5 +137,53 @@ pub fn sync(target: Option<&str>, icon_exe: &str) {
     };
     if done {
         *applied = Some(want);
+    }
+}
+
+/// Copy `files` into the folder `dest` ("Z:\\") with Explorer's copy dialog
+/// (progress, name clash questions). False when it failed or was cancelled.
+pub fn copy_into(files: &[String], dest: &str) -> bool {
+    use windows_sys::Win32::UI::Shell::{
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FO_COPY, SHFILEOPSTRUCTW,
+    };
+    let from = gpu_tray::path_list(files);
+    let to = gpu_tray::path_list(&[dest.to_string()]);
+    let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
+    op.wFunc = FO_COPY;
+    op.pFrom = from.as_ptr();
+    op.pTo = to.as_ptr();
+    op.fFlags = (FOF_NOCONFIRMMKDIR | FOF_ALLOWUNDO) as u16;
+    let r = unsafe { SHFileOperationW(&mut op) };
+    r == 0 && op.fAnyOperationsAborted == 0
+}
+
+/// `--send-list <file>`: copy the paths listed in `file` (one per line) into
+/// the default shared folder, then delete the list.
+pub fn send_list(file: &Path) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let _ = std::fs::remove_file(file);
+    let files: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if files.is_empty() {
+        return;
+    }
+    let shares = crate::sys::mounted_shares();
+    match gpu_tray::default_share(&shares) {
+        Some(dest) => {
+            copy_into(&files, &dest.root());
+        }
+        None => unsafe {
+            MessageBoxW(
+                null_mut(),
+                wide("No Conduit shared folder is mounted to copy to.").as_ptr(),
+                wide("Conduit").as_ptr(),
+                MB_OK | MB_ICONWARNING,
+            );
+        },
     }
 }

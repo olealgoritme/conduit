@@ -534,6 +534,26 @@ if (Test-Path -LiteralPath $trayPayload -PathType Leaf) {
         Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
         New-Item -ItemType Directory -Force -Path $trayDir | Out-Null
         Copy-Item -LiteralPath $trayPayload -Destination $trayExe -Force
+        # "Send to Conduit host" in Explorer's Windows 11 context menu: the
+        # command's DLL and the sparse package that registers it, signed with
+        # this package's certificate (trusted above). The tray app registers
+        # the package for each user when it starts (Add-AppxPackage
+        # -ExternalLocation $trayDir), so the logon task covers every user.
+        $menuDll = Join-Path $payloadRoot "tray\conduit_shell_menu.dll"
+        $menuMsix = Join-Path $payloadRoot "tray\ConduitShellMenu.msix"
+        if ((Test-Path -LiteralPath $menuDll -PathType Leaf) -and (Test-Path -LiteralPath $menuMsix -PathType Leaf)) {
+            $menuDllOut = Join-Path $trayDir "conduit_shell_menu.dll"
+            Get-ChildItem -LiteralPath $trayDir -Filter "conduit_shell_menu.dll.*.old" -File -ErrorAction SilentlyContinue |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+            try {
+                Copy-Item -LiteralPath $menuDll -Destination $menuDllOut -Force
+            } catch {
+                # Explorer keeps the loaded DLL open; a loaded DLL can still be renamed.
+                Rename-Item -LiteralPath $menuDllOut -NewName ("conduit_shell_menu.dll.{0}.old" -f [DateTime]::UtcNow.Ticks) -Force
+                Copy-Item -LiteralPath $menuDll -Destination $menuDllOut -Force
+            }
+            Copy-Item -LiteralPath $menuMsix -Destination (Join-Path $trayDir "ConduitShellMenu.msix") -Force
+        }
         Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
         $action = New-ScheduledTaskAction -Execute $trayExe
         $trigger = New-ScheduledTaskTrigger -AtLogOn

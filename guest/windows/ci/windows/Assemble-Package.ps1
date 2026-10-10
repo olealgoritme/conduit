@@ -10,6 +10,10 @@ param(
     # conduit-gpu-tray.exe (tools\conduit-gpu-tray, cargo build --release
     # --target x86_64-pc-windows-gnu); omitted: the package carries no tray app.
     [string]$TrayExe = "",
+    # conduit_shell_menu.dll (tools\conduit-shell-menu, cargo build --release):
+    # "Send to Conduit host" in Explorer's Windows 11 context menu. Needs
+    # -TrayExe; the sparse package that registers it is built and signed here.
+    [string]$ShellMenuDll = "",
     # WinFsp installer (winfsp-*.msi from https://github.com/winfsp/winfsp/releases,
     # not kept in the repository); omitted: the package does not install WinFsp
     # and shared folders need it present already.
@@ -179,6 +183,11 @@ if ($TrayExe) {
     $trayOut = Join-Path $payload "tray\conduit-gpu-tray.exe"
     Copy-Required $TrayExe $trayOut
     Assert-HeliosPeArchitecture $trayOut x64
+    if ($ShellMenuDll) {
+        $shellMenuOut = Join-Path $payload "tray\conduit_shell_menu.dll"
+        Copy-Required $ShellMenuDll $shellMenuOut
+        Assert-HeliosPeArchitecture $shellMenuOut x64
+    }
 }
 
 if ($WinFspMsi) {
@@ -251,6 +260,17 @@ try {
     $signable += @(Get-ChildItem -LiteralPath $mesaOut -Filter "*.dll" -File -Recurse | ForEach-Object FullName)
     $signable += @(Get-ChildItem -LiteralPath (Join-Path $payload "smoke") -Filter "*.exe" -File -Recurse | ForEach-Object FullName)
     foreach ($file in $signable) { Invoke-SignTool $signTool $certificate.Thumbprint $file }
+
+    # The context menu's sparse package: its publisher is this certificate's
+    # subject, so it installs wherever the package certificate is trusted.
+    if ($TrayExe -and $ShellMenuDll) {
+        Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $payload "tray\conduit-gpu-tray.exe")
+        Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $payload "tray\conduit_shell_menu.dll")
+        $shellMenuMsix = Join-Path $payload "tray\ConduitShellMenu.msix"
+        & (Join-Path $RepoRoot "tools\conduit-shell-menu\New-ShellMenuPackage.ps1") -Publisher $subject -Version $Version `
+            -OutFile $shellMenuMsix -MakeAppx (Find-WindowsKitTool "makeappx.exe")
+        Invoke-SignTool $signTool $certificate.Thumbprint $shellMenuMsix
+    }
 } finally {
     Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
 }

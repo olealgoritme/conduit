@@ -36,6 +36,9 @@ Get-CimInstance Win32_Process -Filter "Name='virtiofs.exe'" -ErrorAction Silentl
     Where-Object { $_.CommandLine -like "*conduit-*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Remove-Item -LiteralPath "HKLM:\SOFTWARE\Conduit" -Recurse -Force -ErrorAction SilentlyContinue
+# The Windows 11 context menu's "Send to Conduit host" package, for every user.
+Get-AppxPackage -AllUsers -Name "Conduit.ShellMenu" -ErrorAction SilentlyContinue |
+    Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $env:ProgramFiles "Conduit") -Recurse -Force -ErrorAction SilentlyContinue
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
     throw "No package-managed Helios installation was found at $statePath."
