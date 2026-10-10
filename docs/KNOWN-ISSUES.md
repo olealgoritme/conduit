@@ -69,6 +69,13 @@ keeps off NVK.
   enlightenments, but does not install its guest driver: install the Helios
   package inside the VM by hand ([WINDOWS.md](WINDOWS.md)).
 - The guest driver is test-signed: Secure Boot off, test-signing on.
+- Counter-Strike 2: in some launches a strip of stray geometry (a long brown
+  "beam") comes out of the player model in the main menu and stays for that
+  process; restarting the game clears it. Not reproducible on demand yet;
+  the null-vertex-buffer path (NVK patch 0041) is ruled out by tests.
+- GDI read-back of an app's surface (`GetDC` + `BitBlt` from a D3D11
+  GDI-compatible texture) returns part of the page dark in about 2 of 100
+  attempts.
 - The guest's keyboard and pointer go through the boot console's emulated
   PS/2 keyboard and USB tablet (no gamepads); no clipboard sharing.
 - `virglrenderer` needs Conduit's patch (`host/venus/patches`) for usable
