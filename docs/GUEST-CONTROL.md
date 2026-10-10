@@ -51,8 +51,8 @@ every request separately, so one bad request cannot stop it.
 | `conduit run VM [--cwd DIR] [--env NAME=VALUE] [--start] [--no-view] -- CMD [ARGS...]` | Starts the program in the user's desktop session. `CMD` is whatever the guest's shell opens: a program, a document, a `.lnk` or `.desktop` file, a `steam://` URL. A running VM without a window gets one (`--no-view` skips that). A VM that is off is not started unless `--start` is given (then the command waits up to 4 minutes for the agent). Prints the process id. |
 | `conduit run VM --app NAME` | Resolves NAME against `conduit apps` (exact name ignoring case, else the start of a name, else part of one; several matches are listed) and starts it. |
 | `conduit apps VM [--json]` | The installed apps: name, where it was found, what `run` will start. |
-| `conduit cp SRC DST [--force]` | One side is `VM:PATH`. `conduit cp f.txt win11:` goes to the guest user's Downloads folder; `win11:C:\Temp\` (trailing separator or an existing folder) keeps the file name; a bare `win11:name.txt` goes to Downloads. A local path containing a colon needs `./` in front. Prints a progress line, checks size and SHA-256 at the end, writes to `NAME.conduit-part` and renames it when everything agrees, and refuses to replace an existing file without `--force`. Files only, up to 8 GiB; for folders and big trees use `conduit share`. |
-| `conduit app add VM NAME` | Writes `~/.local/share/applications/conduit-VM-SLUG.desktop` with the app's icon (fetched from the guest, saved under `~/.local/share/icons/conduit/`). Its `Exec` is `conduit run VM --start --app NAME`, so the launcher also starts the VM. Errors from a launcher show as a desktop notification. |
+| `conduit cp SRC DST [--force]` | One side is `VM:PATH`. `conduit cp f.txt win11:` goes to the guest user's Downloads folder; `win11:C:\Temp\` (trailing separator or an existing folder) keeps the file name; a bare `win11:name.txt` goes to Downloads. A local path containing a colon needs `./` in front. Prints a progress line and checks size and SHA-256 at the end. On the host a received file has no name until it is complete (an unnamed `O_TMPFILE`, or a fresh `NAME.PID-N.conduit-part` where the filesystem lacks that), and is linked into place only when everything agrees; a guest that changes the size it announced, sends more than it announced, or trickles slower than about 1 MiB/s (plus a minute) is cut off, and a file bigger than the free space is refused up front. Without `--force` an existing file, even one that appears during the copy, is never replaced. Copies to the guest use `NAME.conduit-part` there the same way. Files only, up to 8 GiB; for folders and big trees use `conduit share`. |
+| `conduit app add VM NAME` | Writes `~/.local/share/applications/conduit-VM-SLUG.desktop` with the app's icon (fetched from the guest and saved under `~/.local/share/icons/conduit/` only if it is a PNG of at most 256x256 and 512 KiB). Its `Exec` is `conduit run VM --start --app NAME`, so the launcher also starts the VM. Errors from a launcher show as a desktop notification. |
 | `conduit app rm VM NAME` / `conduit app list VM` | Remove / list the VM's launchers. |
 
 ## Dashboard
@@ -70,9 +70,10 @@ or not attached says so instead.
 
 The Conduit GPU tray app (`guest/windows/tools/conduit-gpu-tray`) serves the
 channel (`\\.\Global\org.conduit.ctl.0`); it is the app the installer already
-runs at logon. It runs elevated (the serial port needs it) but starts programs
-with the desktop shell's own, non-elevated token, so games and apps do not run
-as administrator. Apps are the Start Menu shortcuts of all users and of the
+runs at logon. Programs start with the desktop shell's own, non-elevated token,
+so games and apps do not run as administrator, and file operations (`put`,
+`get`, `ls`) run as the logged-in user, so a copy reaches only what that user
+can. Apps are the Start Menu shortcuts of all users and of the
 current user plus Steam games (`libraryfolders.vdf`, `appmanifest_*.acf`, started
 as `steam://rungameid/ID`). The tray menu has a Recent launches submenu with the
 last eight programs; clicking one stops it (shortcuts, documents and `steam://` URLs are handed to the shell, so they have no process of Conduit's to list or stop).
@@ -88,8 +89,8 @@ closing the port, so a command is never sent into a closed port. State changes
 `conduit-ctl-agent` (`guest/agent`, Python 3, standard library only) runs as a
 systemd user service (`conduit-ctl.service`, with an XDG autostart entry for
 desktops that start no systemd session) in the user's desktop session. The
-`conduit-guest` package installs it with a udev rule that gives the logged-in
-user the port; `conduit attach` installs that package on Ubuntu/Debian and
+`conduit-guest` package installs it with a udev rule that gives the port to the
+user of the active local session (`uaccess`) and to nobody else; `conduit attach` installs that package on Ubuntu/Debian and
 Arch-based guests (Arch, Omarchy, EndeavourOS, Manjaro), and the `.rpm` carries
 the same files for Fedora. It finds the graphical session (`conduit-ctl-agent
 --print-session` shows what it found) from the user manager, `loginctl` and the
@@ -98,8 +99,19 @@ sessions and X11 work, and starts programs in it. Apps are the `.desktop` files
 of the XDG data directories, Flatpak and Snap exports, and Steam (native and
 Flatpak). Icons come from the icon theme; a bitmap is scaled to 64 px and an
 SVG converted to PNG when the guest has a converter (ImageMagick, rsvg-convert,
-inkscape, Pillow or GdkPixbuf), otherwise the host receives the file as it is
-(an SVG works as a launcher icon).
+inkscape, Pillow or GdkPixbuf). The host takes PNG only, so an app whose icon
+is an SVG the guest cannot convert gets a launcher without one. A failed copy
+into the guest removes only the `.conduit-part` file that copy made; a file of
+that name that was already there is left alone (and the copy refused).
+
+## Files from the guest to the host
+
+The channel only answers the host: nothing in the guest can push a file or a
+command through it. Files go the other way through the default shared folder
+(`conduit share`): on Windows, Explorer's **Send to Conduit host** (in the
+Windows 11 context menu and under Send to) copies the selection into that
+share's drive; on Linux, copy into the mounted share. On the host the files
+appear in the shared folder (`~/Conduit/VM` by default).
 
 ## Security
 
@@ -107,10 +119,16 @@ The channel is a virtio-serial port, reachable only through the QEMU process's
 unix socket, which belongs to the user who runs the VM; nothing listens on the
 guest's network. The agent obeys the host and nothing else, which is no more
 power than the host already has over the VM's disk and memory. In the other
-direction the host never runs or interprets anything the guest sends: app
-names go into a launcher only after escaping, icons are written as plain image
-files, and `cp` writes only to the path the user typed. File copies are
-confined to what the guest user can access.
+direction the host never runs or interprets anything the guest sends. Every
+guest string (app names, paths, arguments, error messages) is cleaned where it
+enters the host: control characters, the Unicode line separators and
+bidirectional overrides are dropped and the length capped, so nothing the guest
+says can move the terminal's cursor or fake a line. In a launcher, the name is
+quoted by the Exec rules and then key-file escaped; in a desktop notification
+it is escaped as markup. Icons are written only after the PNG signature and
+size checks. `cp` writes only to the path the user typed, never through a part
+file someone else made. File copies are confined to what the guest user can
+access.
 
 ## Troubleshooting
 

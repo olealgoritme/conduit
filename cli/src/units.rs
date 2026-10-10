@@ -238,6 +238,26 @@ pub fn service_dropin(scope: &Scope, vm: &str) -> String {
     s
 }
 
+/// Per-share service drop-in: the VM's slice and, for system units, the
+/// sandboxing systemd can add without getting in virtiofsd's way (it must
+/// still reach any folder you share and make its own namespaces).
+pub fn share_service_dropin(scope: &Scope, vm: &str) -> String {
+    let mut s = service_dropin(scope, vm);
+    if matches!(scope, Scope::System { .. }) {
+        s += "NoNewPrivileges=yes\n\
+              ProtectKernelTunables=yes\n\
+              ProtectKernelModules=yes\n\
+              ProtectKernelLogs=yes\n\
+              ProtectControlGroups=yes\n\
+              ProtectClock=yes\n\
+              RestrictRealtime=yes\n\
+              RestrictSUIDSGID=yes\n\
+              LockPersonality=yes\n\
+              RestrictAddressFamilies=AF_UNIX\n";
+    }
+    s
+}
+
 pub fn socket_dropin(scope: &Scope, vm: &str) -> Option<String> {
     match scope {
         Scope::User => None,
@@ -275,6 +295,9 @@ pub fn share_socket_template() -> String {
      DirectoryMode=0700\n\
      Accept=no\n\
      RemoveOnStop=yes\n\
+     # Every VM start triggers it; a few quick restarts must not leave it\n\
+     # failed, or the next start of the VM fails with it.\n\
+     TriggerLimitIntervalSec=0\n\
      \n\
      [Install]\n\
      WantedBy=sockets.target\n"
@@ -289,6 +312,9 @@ pub fn share_service_template(conduit: &Path) -> String {
          Description=Conduit shared folder %i (virtiofsd)\n\
          Requires=conduit-share@%i.socket\n\
          After=conduit-share@%i.socket\n\
+         # Started once per VM start: never rate-limited into a failed state\n\
+         # that would stop the VM from booting.\n\
+         StartLimitIntervalSec=0\n\
          \n\
          [Service]\n\
          Type=simple\n\
@@ -361,7 +387,7 @@ pub fn install_shares(
         put(
             scope,
             &format!("{}.d/conduit.conf", share_unit(vm, sh, "service")),
-            &service_dropin(scope, vm),
+            &share_service_dropin(scope, vm),
         )?;
     }
     for sh in installed_shares(scope, vm) {
@@ -599,7 +625,8 @@ pub fn remove(scope: &Scope, vm: &str) {
 /// Listening, or made to listen again: a helper that failed once (e.g. the
 /// share could not be staged) leaves its socket failed until reset.
 pub fn ensure_listening(scope: &Scope, vm: &str) -> bool {
-    // Shared folders are best effort: the VM starts without them.
+    // QEMU connects to every shared folder's socket at start and the VM
+    // does not boot if one is missing, so each must listen again too.
     for sh in installed_shares(scope, vm) {
         let u = share_unit(vm, &sh, "socket");
         if !systemctl_ok(scope, &["is-active", "--quiet", &u]) {
@@ -835,6 +862,15 @@ mod tests {
         assert!(d.contains("SocketUser=libvirt-qemu"));
         let v = share_service_template(Path::new("/usr/bin/conduit"));
         assert!(v.contains("ExecStart=/usr/bin/conduit _share %i"));
+        // Never rate-limited into a failed state that blocks the VM's boot.
+        assert!(v.contains("\nStartLimitIntervalSec=0\n"), "{v}");
+        let t = share_socket_template();
+        assert!(t.contains("\nTriggerLimitIntervalSec=0\n"), "{t}");
+        let h = share_service_dropin(&sys, "vm1");
+        assert!(h.contains("User=me\n") && h.contains("NoNewPrivileges=yes\n"));
+        assert!(!h.contains("ProtectHome") && !h.contains("ProtectSystem"));
+        let u = share_service_dropin(&Scope::User, "vm1");
+        assert!(!u.contains("NoNewPrivileges"), "{u}");
         assert_eq!(
             share_unit("vm1", "Docs", "socket"),
             "conduit-share@vm1:Docs.socket"

@@ -533,6 +533,10 @@ mod tests {
         assert!(rule.contains(r#"SUBSYSTEM=="virtio-ports""#));
         assert!(rule.contains(r#"ATTR{name}=="org.conduit.ctl.0""#));
         assert!(rule.contains(r#"TAG+="uaccess""#));
+        // The port is a file-access channel into the user's home: only the
+        // active session's user, never a whole group.
+        let rule_lines: String = rule.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(!rule_lines.contains("GROUP=") && !rule_lines.contains("MODE="));
         let unit = include_str!("../../guest/agent/conduit-ctl.service");
         assert!(unit.contains("ExecStart=/usr/bin/conduit-ctl-agent"));
         assert!(unit.contains("WantedBy=graphical-session.target"));

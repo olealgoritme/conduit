@@ -17,7 +17,7 @@ The `conduit-guest` package (deb, Arch, rpm) installs everything:
 | `/usr/bin/conduit-ctl-agent` | the agent |
 | `/usr/lib/systemd/user/conduit-ctl.service` | systemd user unit, enabled globally |
 | `/etc/xdg/autostart/conduit-ctl.desktop` | autostart for desktops without a systemd session (XFCE…) |
-| `/usr/lib/udev/rules.d/70-conduit-ctl.rules` | the port: group `video`, `uaccess` |
+| `/usr/lib/udev/rules.d/70-conduit-ctl.rules` | the port: `uaccess` (the active local session's user) |
 
 Log out and back in (or run `conduit-ctl-agent &` in the session) after the
 first install. Both the unit and the autostart entry may start it; the agent
@@ -51,6 +51,7 @@ is single-instance per user.
   (`conduit attach NAME` on the host, then restart the VM).
 - `Permission denied` on the port: the udev rule is not applied yet
   (`sudo udevadm trigger --subsystem-match=virtio-ports`) or the user is
-  neither on the active seat nor in `video`.
+  not in the active local session (the port follows the seat, like a
+  webcam; a login outside a seat does not get it).
 
 Tests: `python3 -m unittest test_ctl_agent` in this folder.

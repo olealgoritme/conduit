@@ -175,11 +175,12 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
 
     let s = &app.snap;
     let h = &s.host;
-    let gpu = s
-        .gpu
-        .as_ref()
-        .map(|g| g.name.clone())
-        .unwrap_or_else(|| "GPU: NVML not available".into());
+    let gpu = match &s.gpu {
+        Some(g) if s.gpus > 1 => format!("{} (GPU {} of {})", g.name, g.index, s.gpus),
+        Some(g) => g.name.clone(),
+        None if s.gpu_released => "GPU: let go while the dashboard is in the background".into(),
+        None => "GPU: NVML not available".into(),
+    };
     let running = s.vms.iter().filter(|v| v.up()).count();
     let mem_frac = if h.mem_total > 0 {
         h.mem_used as f64 / h.mem_total as f64

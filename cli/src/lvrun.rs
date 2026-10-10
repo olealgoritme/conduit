@@ -754,45 +754,132 @@ pub fn virtiofsd_exec(name: &str) -> Result<()> {
 
 /// `conduit _share VM:SHARE` (conduit-share@VM:SHARE.service): become virtiofsd
 /// for one shared folder on systemd's socket (fd 3).
+///
+/// This must not fail: QEMU connects to every share socket when the VM
+/// starts, and one that nobody serves stops the VM from booting. So whatever
+/// is wrong with the folder (see [`crate::shares::plan_serve`]) is logged
+/// and an empty read-only placeholder is served in its place. The one thing
+/// it cannot work around is a missing virtiofsd, which the VM's NVIDIA share
+/// needs as well.
 pub fn share_exec(instance: &str) -> Result<()> {
-    let (vm, name) = instance.rsplit_once(':').ok_or_else(|| {
-        oops(
-            format!("bad shared folder instance \"{instance}\""),
-            "Expected VM:SHARE",
+    use crate::shares;
+    let (vm, name) = instance.rsplit_once(':').unwrap_or((instance, ""));
+    let valid = crate::vm::check_name(vm).is_ok() && shares::validate_name(name).is_ok();
+    let (log, placeholder) = if valid {
+        (
+            logs_dir(vm).join(format!("share-{name}.log")),
+            shares::placeholder_dir(vm, name),
         )
-    })?;
-    log_to(&logs_dir(vm).join(format!("share-{name}.log")), false)?;
-    let share = crate::shares::load(vm)?
-        .into_iter()
-        .find(|s| s.name == name)
-        .ok_or_else(|| {
-            oops(
-                format!("{vm} has no shared folder \"{name}\""),
-                format!("`conduit share list {vm}` shows them"),
-            )
-        })?;
-    if !Path::new(&share.path).is_dir() {
-        return Err(oops(
-            format!("the shared folder {} does not exist", share.path),
-            format!("Create it, or `conduit share rm {vm} {name}`"),
-        ));
+    } else {
+        (
+            paths::xdg_runtime().join("conduit/share-invalid.log"),
+            paths::xdg_runtime().join("conduit/share-invalid.empty"),
+        )
+    };
+    if let Err(e) = log_to(&log, false) {
+        eprintln!("conduit: {e:#}");
     }
     let vfsd = run::need_virtiofsd()?;
+    let can_ro = crate::qemu::supports_readonly(&vfsd);
+    let mut plan = if valid {
+        shares::plan_serve(
+            vm,
+            name,
+            shares::load(vm),
+            &shares::ServeCtx {
+                can_ro,
+                protect: &shares::protected(),
+                placeholder: &placeholder,
+                default: &shares::default_share(vm),
+            },
+        )
+    } else {
+        shares::Serve {
+            dir: placeholder.clone(),
+            read_only: can_ro,
+            placeholder: Some(format!(
+                "bad shared folder instance \"{instance}\" (VM:SHARE)"
+            )),
+        }
+    };
+    if let Some(why) = &plan.placeholder {
+        eprintln!("conduit: {why}; the VM gets an empty folder in its place");
+        if let Err(e) = shares::make_placeholder(&plan.dir) {
+            // Still serve something: an empty folder of our own in /tmp.
+            eprintln!("conduit: {e:#}");
+            plan.dir = std::env::temp_dir().join(format!("conduit-share-empty-{}", paths::uid()));
+            let _ = shares::make_placeholder(&plan.dir);
+        }
+    }
+    let sandbox = if namespace_sandbox_works(&vfsd, &placeholder) {
+        "--sandbox=namespace"
+    } else {
+        "--sandbox=none"
+    };
     let mut cmd = Command::new(&vfsd);
     cmd.arg("--fd=3")
-        .arg(format!("--shared-dir={}", share.path))
-        .args(["--sandbox=none", "--cache=auto", "--log-level=warn"]);
-    if share.read_only {
-        if !crate::qemu::supports_readonly(&vfsd) {
-            return Err(oops(
-                format!("\"{name}\" is read-only but this virtiofsd has no --readonly"),
-                format!("Update virtiofsd (1.11 or newer) or `conduit share ro {vm} {name} off`"),
-            ));
-        }
+        .arg(format!("--shared-dir={}", plan.dir.display()))
+        .args([sandbox, "--cache=auto", "--log-level=warn"]);
+    if plan.read_only {
         cmd.arg("--readonly");
     }
     let e = cmd.exec();
     Err(e).with_context(|| format!("could not run {}", vfsd.display()))
+}
+
+/// Whether this virtiofsd can enter its namespace sandbox here: unprivileged
+/// user namespaces may be off or restricted (Ubuntu's AppArmor setting). It
+/// is tried for real on a scratch socket, since virtiofsd enters the sandbox
+/// before it waits for QEMU: one that cannot exits at once, and one that only
+/// half works (no uid map, so files would be owned by nobody) warns about
+/// it. Either way the share runs with `--sandbox=none`, as you.
+fn namespace_sandbox_works(vfsd: &Path, scratch: &Path) -> bool {
+    let dir = scratch.with_extension("probe");
+    let sock = dir.with_extension("probe.sock");
+    let log = dir.with_extension("probe.log");
+    let ok = probe_sandbox(vfsd, &dir, &sock, &log);
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_dir(&dir);
+    ok
+}
+
+fn probe_sandbox(vfsd: &Path, dir: &Path, sock: &Path, log: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(sock);
+    let Ok(out) = std::fs::File::create(log) else {
+        return false;
+    };
+    let child = Command::new(vfsd)
+        .arg(format!("--socket-path={}", sock.display()))
+        .arg(format!("--shared-dir={}", dir.display()))
+        .args(["--sandbox=namespace", "--log-level=warn"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(out)
+        .process_group(0)
+        .spawn();
+    let Ok(mut child) = child else {
+        return false;
+    };
+    let exited = sys::wait_for(Duration::from_millis(700), || {
+        !matches!(child.try_wait(), Ok(None))
+    });
+    // SAFETY: the probe's own process group (it may have forked).
+    unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
+    let _ = child.wait();
+    sandbox_probe_ok(exited, &std::fs::read_to_string(log).unwrap_or_default())
+}
+
+/// The verdict on a namespace-sandbox probe: still running, and no warning
+/// or error from virtiofsd's sandbox code.
+fn sandbox_probe_ok(exited: bool, log: &str) -> bool {
+    !exited
+        && !log
+            .lines()
+            .any(|l| l.contains("sandbox") || l.contains("ERROR"))
 }
 
 /// `conduit _stopped NAME` (after the backend): refresh the boot files so a
@@ -833,5 +920,63 @@ pub fn state_word(name: &str) -> String {
                 "stopped".into()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in virtiofsd: a shell script with this body.
+    fn fake_vfsd(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn the_namespace_sandbox_is_used_only_when_it_really_works() {
+        let d = std::env::temp_dir().join(format!("conduit-sandbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let scratch = d.join("share-G.empty");
+        // Waits for QEMU: the sandbox is up.
+        let ok = fake_vfsd(&d, "ok", "exec sleep 5");
+        assert!(namespace_sandbox_works(&ok, &scratch));
+        // Exits at once (no user namespaces).
+        let dies = fake_vfsd(&d, "dies", "echo 'Error entering sandbox' >&2; exit 1");
+        assert!(!namespace_sandbox_works(&dies, &scratch));
+        // Runs, but its sandbox only half works (Ubuntu's restriction).
+        let half = fake_vfsd(
+            &d,
+            "half",
+            "echo '[WARN  virtiofsd::sandbox] Couldn'\\''t set the process uid as root: -1' >&2; exec sleep 5",
+        );
+        assert!(!namespace_sandbox_works(&half, &scratch));
+        assert!(!namespace_sandbox_works(&d.join("missing"), &scratch));
+        // The probe leaves nothing behind.
+        let mut left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["dies", "half", "ok"]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn probe_verdicts() {
+        assert!(sandbox_probe_ok(false, ""));
+        assert!(sandbox_probe_ok(
+            false,
+            "[INFO  virtiofsd] Waiting for vhost-user socket connection...\n"
+        ));
+        assert!(!sandbox_probe_ok(true, ""));
+        assert!(!sandbox_probe_ok(
+            false,
+            "[ERROR virtiofsd] Error entering sandbox: EPERM\n"
+        ));
     }
 }

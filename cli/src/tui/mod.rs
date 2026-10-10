@@ -3,8 +3,10 @@
 //!
 //! Actions run this same program (`conduit view NAME`, `conduit shutdown
 //! NAME`, …) as child processes, so the dashboard does exactly what the
-//! commands do. `view` and `up` are detached and log to the VM's runtime
-//! folder, so a window opened from here outlives the dashboard.
+//! commands do. Every one runs in its own session with its output in a log
+//! file in the VM's runtime folder, so it finishes (and a window opened from
+//! here stays open) after the dashboard quits; the dashboard tails the short
+//! commands' logs into its activity list.
 
 mod apps;
 mod data;
@@ -23,12 +25,13 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant, SystemTime};
 
 pub use data::Snapshot;
 
@@ -118,8 +121,100 @@ struct Job {
     vm: String,
     label: String,
     child: Child,
-    log: Option<std::path::PathBuf>,
+    log: PathBuf,
+    /// A short command (shutdown, pause, share …): its log is tailed into
+    /// the activity list and its VM shows it as busy. Otherwise a detached
+    /// `view` / `up`, whose log is shown only if it fails.
+    tail: Option<LogTail>,
     started: Instant,
+}
+
+/// The new complete lines of a log file, as they are written.
+struct LogTail {
+    file: std::fs::File,
+    part: Vec<u8>,
+}
+
+impl LogTail {
+    fn open(p: &Path) -> Option<LogTail> {
+        Some(LogTail {
+            file: std::fs::File::open(p).ok()?,
+            part: Vec::new(),
+        })
+    }
+
+    /// Lines finished since the last call; with `end`, the unfinished last
+    /// line too. Each is what a terminal would show of it (colours dropped,
+    /// the last `\r`-separated piece).
+    fn lines(&mut self, end: bool) -> Vec<String> {
+        let _ = self.file.read_to_end(&mut self.part);
+        let mut out = Vec::new();
+        let mut take = |l: &[u8]| {
+            let t = strip_ansi(&String::from_utf8_lossy(l));
+            let t = t.rsplit('\r').find(|s| !s.trim().is_empty()).unwrap_or("");
+            if !t.trim().is_empty() {
+                out.push(t.trim_end().to_string());
+            }
+        };
+        while let Some(i) = self.part.iter().position(|&b| b == b'\n') {
+            let l: Vec<u8> = self.part.drain(..=i).collect();
+            take(&l[..i]);
+        }
+        if end && !self.part.is_empty() {
+            let l = std::mem::take(&mut self.part);
+            take(&l);
+        }
+        out
+    }
+}
+
+/// Start `exe ARGS…` in its own session (no terminal signal reaches it and
+/// it outlives the dashboard), stdout and stderr to `log`.
+fn spawn_logged(exe: &str, args: &[String], log: &Path) -> std::io::Result<Child> {
+    if let Some(d) = log.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let file = std::fs::File::create(log)?;
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stderr(file.try_clone()?)
+        .stdout(file);
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
+/// The program to run for actions: the running binary; once an upgrade
+/// replaced it (Linux then reports "PATH (deleted)"), the new file at that
+/// path; else `conduit` on PATH.
+fn exe_path(cur: Option<PathBuf>) -> String {
+    let Some(p) = cur else {
+        return "conduit".into();
+    };
+    if p.exists() {
+        return p.to_string_lossy().into_owned();
+    }
+    let s = p.to_string_lossy();
+    match s.strip_suffix(" (deleted)") {
+        Some(orig) if Path::new(orig).is_file() => orig.to_string(),
+        _ => "conduit".into(),
+    }
+}
+
+/// The panic hook's part: only the thread that owns the terminal restores
+/// it (and reports the panic); a panic on a worker thread is caught there
+/// and shown as a note, and printing it would scribble over the screen.
+fn on_panic(main: std::thread::ThreadId, restore: &dyn Fn(), report: &dyn Fn()) {
+    if std::thread::current().id() == main {
+        restore();
+        report();
+    }
 }
 
 pub struct App {
@@ -149,14 +244,21 @@ pub struct App {
     pub buttons: Vec<(Rect, Act)>,
     pub tabs: Vec<(Rect, Tab)>,
     jobs: Vec<Job>,
-    lines_tx: mpsc::Sender<(Level, String)>,
-    lines_rx: mpsc::Receiver<(Level, String)>,
     cap_tx: mpsc::Sender<(Tab, Vec<String>)>,
     cap_rx: mpsc::Receiver<(Tab, Vec<String>)>,
     logs_at: Option<Instant>,
     last_seq: u64,
     poke: mpsc::Sender<()>,
     quit: bool,
+    /// Something changed since the last frame.
+    dirty: bool,
+    /// The sampler's last error, noted once.
+    last_error: Option<String>,
+    /// mtime of the open Shares modal's `shares.json`.
+    shares_stamp: Option<SystemTime>,
+    /// Commands the tests' App would have run: (vm, args).
+    #[cfg(test)]
+    spawned: Vec<(String, Vec<String>)>,
 }
 
 pub const LOG_SOURCES: [&str; 5] = ["all", "backend", "vm", "venus", "viewer"];
@@ -171,11 +273,12 @@ impl App {
         self.jobs
             .iter()
             .rev()
-            .find(|j| j.vm == vm && j.log.is_none())
+            .find(|j| j.vm == vm && j.tail.is_some())
             .map(|j| j.label.as_str())
     }
 
     pub fn note(&mut self, level: Level, text: impl Into<String>) {
+        self.dirty = true;
         self.notes.push_back(Note {
             at: clock(),
             level,
@@ -186,100 +289,50 @@ impl App {
         }
     }
 
-    /// Our own program; falls back to `conduit` on PATH once the running binary
-    /// was replaced by an upgrade (Linux then reports it as "… (deleted)").
     fn exe() -> String {
-        std::env::current_exe()
-            .ok()
-            .filter(|p| p.exists())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "conduit".into())
+        exe_path(std::env::current_exe().ok())
     }
 
-    /// Runs `conduit ARGS…`; output lines land in the activity log.
+    /// Runs a short `conduit ARGS…` (shutdown, pause, share …); its output
+    /// lines land in the activity list.
     fn run(&mut self, vm: &str, label: &str, args: Vec<String>) {
-        let mut cmd = Command::new(Self::exe());
-        cmd.args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        match cmd.spawn() {
-            Ok(mut child) => {
-                for r in [
-                    child
-                        .stdout
-                        .take()
-                        .map(|r| Box::new(r) as Box<dyn Read + Send>),
-                    child
-                        .stderr
-                        .take()
-                        .map(|r| Box::new(r) as Box<dyn Read + Send>),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    let tx = self.lines_tx.clone();
-                    std::thread::spawn(move || {
-                        for l in BufReader::new(r).split(b'\n').map_while(Result::ok) {
-                            let t = strip_ansi(&String::from_utf8_lossy(&l));
-                            let t = t.rsplit('\r').find(|s| !s.trim().is_empty()).unwrap_or("");
-                            if !t.trim().is_empty() {
-                                let _ = tx.send((Level::Info, t.trim_end().to_string()));
-                            }
-                        }
+        self.start_job(vm, label, args, true);
+    }
+
+    /// Runs a long `conduit ARGS…` (`view`, `up`); its log is shown only
+    /// if it fails.
+    fn detach(&mut self, vm: &str, label: &str, args: Vec<String>) {
+        self.start_job(vm, label, args, false);
+        let _ = self.poke.send(());
+    }
+
+    fn start_job(&mut self, vm: &str, label: &str, args: Vec<String>, tail: bool) {
+        #[cfg(test)]
+        {
+            let _ = tail;
+            self.note(Level::Info, format!("{label} {vm}"));
+            self.spawned.push((vm.into(), args));
+        }
+        #[cfg(not(test))]
+        {
+            let verb = args.first().map(String::as_str).unwrap_or("job");
+            let log = crate::paths::run_dir(vm).join(format!("dashboard-{verb}.log"));
+            match spawn_logged(&Self::exe(), &args, &log) {
+                Ok(child) => {
+                    let ellipsis = if tail { "…" } else { "" };
+                    self.note(Level::Info, format!("{label} {vm}{ellipsis}"));
+                    self.jobs.push(Job {
+                        vm: vm.into(),
+                        label: label.into(),
+                        child,
+                        tail: if tail { LogTail::open(&log) } else { None },
+                        log,
+                        started: Instant::now(),
                     });
                 }
-                self.note(Level::Info, format!("{label} {vm}…"));
-                self.jobs.push(Job {
-                    vm: vm.into(),
-                    label: label.into(),
-                    child,
-                    log: None,
-                    started: Instant::now(),
-                });
+                Err(e) => self.note(Level::Err, format!("could not run conduit: {e}")),
             }
-            Err(e) => self.note(Level::Err, format!("could not run conduit: {e}")),
         }
-    }
-
-    /// Runs `conduit ARGS…` in its own session with output in a log file,
-    /// so it keeps running after the dashboard quits (`view`, `up`).
-    fn detach(&mut self, vm: &str, label: &str, args: Vec<String>) {
-        let log = crate::paths::run_dir(vm).join(format!("dashboard-{}.log", args[0]));
-        let _ = std::fs::create_dir_all(crate::paths::run_dir(vm));
-        let file = match std::fs::File::create(&log) {
-            Ok(f) => f,
-            Err(e) => {
-                self.note(Level::Err, format!("{}: {e}", log.display()));
-                return;
-            }
-        };
-        let err = file.try_clone();
-        let mut cmd = Command::new(Self::exe());
-        cmd.args(&args).stdin(Stdio::null()).stdout(file);
-        if let Ok(e) = err {
-            cmd.stderr(e);
-        }
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        match cmd.spawn() {
-            Ok(child) => {
-                self.note(Level::Info, format!("{label} {vm}"));
-                self.jobs.push(Job {
-                    vm: vm.into(),
-                    label: label.into(),
-                    child,
-                    log: Some(log),
-                    started: Instant::now(),
-                });
-            }
-            Err(e) => self.note(Level::Err, format!("could not run conduit: {e}")),
-        }
-        let _ = self.poke.send(());
     }
 
     fn venus_args(&self, vm: &data::Vm, args: &mut Vec<String>) {
@@ -288,6 +341,7 @@ impl App {
         }
     }
 
+    /// Act on the selected VM.
     pub fn act(&mut self, a: Act) {
         match a {
             Act::Quit => {
@@ -318,6 +372,12 @@ impl App {
             );
             return;
         };
+        self.act_on(a, vm, false);
+    }
+
+    /// Act on `vm`; `confirmed` once the confirmation for a stop was given
+    /// (for the VM it was asked about, whatever is selected by then).
+    fn act_on(&mut self, a: Act, vm: data::Vm, confirmed: bool) {
         let name = vm.name.clone();
         match a {
             Act::Mode => {
@@ -404,7 +464,7 @@ impl App {
                     self.note(Level::Warn, format!("{name} is not running"));
                     return;
                 }
-                if self.modal.is_none() {
+                if !confirmed {
                     self.modal = Some(Modal::Confirm { act: a, vm: name });
                     return;
                 }
@@ -465,15 +525,24 @@ impl App {
 
     fn reap(&mut self) {
         let mut done = Vec::new();
+        let mut lines = Vec::new();
         for (i, j) in self.jobs.iter_mut().enumerate() {
-            if let Ok(Some(st)) = j.child.try_wait() {
+            let st = j.child.try_wait().ok().flatten();
+            if let Some(t) = &mut j.tail {
+                lines.extend(t.lines(st.is_some()));
+            }
+            if let Some(st) = st {
                 done.push((i, st));
             }
+        }
+        for l in lines {
+            self.note(Level::Info, l);
         }
         for (i, st) in done.into_iter().rev() {
             let j = self.jobs.remove(i);
             let secs = j.started.elapsed().as_secs_f32();
-            match (&j.log, st.success()) {
+            let log = j.tail.is_none().then_some(&j.log);
+            match (log, st.success()) {
                 // `conduit view` returns at once when it hands the window
                 // to a VM that keeps running (a libvirt VM).
                 (Some(_), true) if j.label.starts_with("opening") && secs < 10.0 => {
@@ -508,6 +577,13 @@ impl App {
             return;
         }
         self.last_seq = s.seq;
+        self.dirty = true;
+        if s.error != self.last_error {
+            if let Some(e) = &s.error {
+                self.note(Level::Warn, e.clone());
+            }
+            self.last_error = s.error.clone();
+        }
         let push = |q: &mut VecDeque<u64>, v: u64| {
             q.push_back(v);
             while q.len() > HIST {
@@ -538,6 +614,7 @@ impl App {
     }
 
     fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        self.dirty = true;
         if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
             self.quit = true;
             return;
@@ -600,10 +677,16 @@ impl App {
                         }
                     }
                 }
-                Modal::Confirm { act, .. } => match code {
+                Modal::Confirm { act, vm } => match code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                        let a = *act;
-                        self.act(a);
+                        // The VM asked about, not whatever is selected now
+                        // (the sampler may have reordered the list).
+                        let (a, name) = (*act, vm.clone());
+                        self.modal = None;
+                        match self.snap.vms.iter().find(|v| v.name == name).cloned() {
+                            Some(v) => self.act_on(a, v, true),
+                            None => self.note(Level::Warn, format!("{name} is gone")),
+                        }
                     }
                     _ => {
                         self.modal = None;
@@ -712,6 +795,7 @@ impl App {
     }
 
     fn click(&mut self, x: u16, y: u16) {
+        self.dirty = true;
         let p = Position { x, y };
         if self.modal.is_some() {
             if matches!(self.modal, Some(Modal::Help)) {
@@ -737,6 +821,36 @@ impl App {
                 self.act(Act::View);
             }
             self.sel = i;
+        }
+    }
+}
+
+impl App {
+    /// Something on screen moves on its own (a spinner, the intro), so it is
+    /// drawn at the animation rate; otherwise only when something changes.
+    fn animating(&self) -> bool {
+        self.intro > 0
+            || self.capturing.is_some()
+            || self.jobs.iter().any(|j| j.tail.is_some())
+            || (self.tab == Tab::Doctor && self.doctor.is_empty())
+            || (self.tab == Tab::Apps && self.apps.vms.values().any(|e| e.loading))
+    }
+
+    /// The open Shares modal follows `shares.json` when it changes (a
+    /// `conduit share` child rewrites it).
+    fn follow_shares(&mut self) {
+        let Some(Modal::Shares { vm, items, idx, .. }) = &mut self.modal else {
+            self.shares_stamp = None;
+            return;
+        };
+        let stamp = std::fs::metadata(crate::shares::file(vm))
+            .and_then(|m| m.modified())
+            .ok();
+        if stamp != self.shares_stamp {
+            self.shares_stamp = stamp;
+            *items = crate::shares::load(vm).unwrap_or_default();
+            *idx = (*idx).min(items.len().saturating_sub(1));
+            self.dirty = true;
         }
     }
 }
@@ -779,6 +893,7 @@ fn restore() {
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableMouseCapture,
+        crossterm::event::DisableFocusChange,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     );
@@ -804,9 +919,9 @@ fn expand_home(p: &str) -> String {
 /// `conduit` alone.
 pub fn run() -> Result<()> {
     let prev = std::panic::take_hook();
+    let main = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        restore();
-        prev(info);
+        on_panic(main, &restore, &|| prev(info));
     }));
     for s in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
         unsafe {
@@ -818,11 +933,17 @@ pub fn run() -> Result<()> {
     }
     enable_raw_mode()?;
     let _g = Guard;
-    crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        crossterm::event::EnableFocusChange
+    )?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
-    let (shared, poke) = data::start();
-    let (lines_tx, lines_rx) = mpsc::channel();
+    // NVML is let go while the terminal reports the dashboard unfocused.
+    let gpu_wanted = Arc::new(AtomicBool::new(true));
+    let (shared, poke) = data::start(gpu_wanted.clone());
     let (cap_tx, cap_rx) = mpsc::channel();
     let mut app = App {
         snap: Snapshot::default(),
@@ -850,14 +971,17 @@ pub fn run() -> Result<()> {
         buttons: Vec::new(),
         tabs: Vec::new(),
         jobs: Vec::new(),
-        lines_tx,
-        lines_rx,
         cap_tx,
         cap_rx,
         logs_at: None,
         last_seq: 0,
         poke,
         quit: false,
+        dirty: true,
+        last_error: None,
+        shares_stamp: None,
+        #[cfg(test)]
+        spawned: vec![],
     };
     // Select the most recently used VM.
     let first = shared.lock().map(|s| s.clone()).unwrap_or_default();
@@ -876,9 +1000,6 @@ pub fn run() -> Result<()> {
                     app.sel = i;
                 }
             }
-        }
-        while let Ok((lvl, l)) = app.lines_rx.try_recv() {
-            app.note(lvl, l);
         }
         while let Ok((tab, lines)) = app.cap_rx.try_recv() {
             match tab {
@@ -901,11 +1022,7 @@ pub fn run() -> Result<()> {
             app.logs_at = None;
             app.capture(Tab::Logs);
         }
-        if let Some(Modal::Shares { vm, items, idx, .. }) = &mut app.modal {
-            // The `conduit share` child rewrites the list; follow it.
-            *items = crate::shares::load(vm).unwrap_or_default();
-            *idx = (*idx).min(items.len().saturating_sub(1));
-        }
+        app.follow_shares();
         for (lvl, t) in app.apps.pump() {
             app.note(lvl, t);
         }
@@ -913,10 +1030,19 @@ pub fn run() -> Result<()> {
             app.apps.tick(app.snap.vms.get(app.sel));
         }
         app.reap();
-        term.draw(|f| draw::draw(f, &mut app))?;
-        app.tick = app.tick.wrapping_add(1);
-        app.intro = app.intro.saturating_sub(1);
-        let frame = if app.intro > 0 { 45 } else { 100 };
+        let animating = app.animating();
+        if app.dirty || animating {
+            term.draw(|f| draw::draw(f, &mut app))?;
+            app.dirty = false;
+            app.tick = app.tick.wrapping_add(1);
+            app.intro = app.intro.saturating_sub(1);
+        }
+        let frame = match (app.intro > 0, animating) {
+            (true, _) => 45,
+            (false, true) => 100,
+            // Nothing moves: wake for input, a new snapshot or a job's line.
+            (false, false) => 250,
+        };
         if event::poll(Duration::from_millis(frame))? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press && app.intro > 0 => app.intro = 0,
@@ -927,11 +1053,27 @@ pub fn run() -> Result<()> {
                     MouseEventKind::ScrollDown => app.key(KeyCode::Down, KeyModifiers::NONE),
                     _ => {}
                 },
+                Event::FocusLost => {
+                    gpu_wanted.store(false, Ordering::SeqCst);
+                    let _ = app.poke.send(());
+                }
+                Event::FocusGained => {
+                    gpu_wanted.store(true, Ordering::SeqCst);
+                    let _ = app.poke.send(());
+                }
+                Event::Resize(..) => app.dirty = true,
                 _ => {}
             }
         }
     }
+    let running = app.jobs.iter().filter(|j| j.tail.is_some()).count();
     drop(term);
+    drop(_g);
+    if running > 0 {
+        eprintln!(
+            "conduit: {running} command(s) started from the dashboard still running; their output is in dashboard-*.log in the VM's runtime folder"
+        );
+    }
     Ok(())
 }
 
@@ -944,7 +1086,6 @@ mod tests {
     }
     fn app() -> App {
         let (poke, _) = mpsc::channel();
-        let (lines_tx, lines_rx) = mpsc::channel();
         let (cap_tx, cap_rx) = mpsc::channel();
         let mut snap = Snapshot {
             seq: 1,
@@ -1008,14 +1149,16 @@ mod tests {
             buttons: vec![],
             tabs: vec![],
             jobs: vec![],
-            lines_tx,
-            lines_rx,
             cap_tx,
             cap_rx,
             logs_at: None,
             last_seq: 1,
             poke,
             quit: false,
+            dirty: true,
+            last_error: None,
+            shares_stamp: None,
+            spawned: vec![],
         }
     }
 
@@ -1091,6 +1234,161 @@ mod tests {
             a.snap.vms[0].state = "stopped".into();
             t.draw(|f| draw::draw(f, &mut a)).unwrap();
         }
+    }
+
+    #[test]
+    fn a_confirmed_stop_acts_on_the_vm_it_asked_about() {
+        let mut a = app();
+        a.sel = 0;
+        a.key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(
+            matches!(&a.modal, Some(Modal::Confirm { act: Act::Shutdown, vm }) if vm == "win11")
+        );
+        assert!(a.spawned.is_empty(), "nothing runs before the answer");
+        // The list changes under the open question: a new VM sorts first and
+        // the selection now points at another one.
+        let mut other = a.snap.vms[0].clone();
+        other.name = "aaa".into();
+        a.snap.vms.insert(0, other);
+        a.sel = 0;
+        a.key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(a.modal.is_none());
+        assert_eq!(
+            a.spawned,
+            [(
+                "win11".to_string(),
+                vec!["shutdown".to_string(), "win11".to_string()]
+            )]
+        );
+        // A VM that went away meanwhile is not acted on.
+        let mut a = app();
+        a.modal = Some(Modal::Confirm {
+            act: Act::Poweroff,
+            vm: "gone".into(),
+        });
+        a.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(a.spawned.is_empty());
+        assert!(a.notes.iter().any(|n| n.text.contains("gone")));
+        // Anything else cancels.
+        a.modal = Some(Modal::Confirm {
+            act: Act::Reset,
+            vm: "win11".into(),
+        });
+        a.key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(a.modal.is_none() && a.spawned.is_empty());
+    }
+
+    #[test]
+    fn only_the_terminal_thread_restores_it_on_a_panic() {
+        use std::cell::Cell;
+        let main = std::thread::current().id();
+        let (restored, reported) = (Cell::new(0), Cell::new(0));
+        on_panic(main, &|| restored.set(restored.get() + 1), &|| {
+            reported.set(reported.get() + 1)
+        });
+        assert_eq!((restored.get(), reported.get()), (1, 1));
+        let n = std::thread::spawn(move || {
+            let hits = Cell::new(0);
+            on_panic(main, &|| hits.set(hits.get() + 1), &|| {
+                hits.set(hits.get() + 1)
+            });
+            hits.get()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn a_sampler_failure_is_a_note_once() {
+        let mut a = app();
+        let snap = |seq, e: Option<&str>| Snapshot {
+            seq,
+            error: e.map(String::from),
+            ..a.snap.clone()
+        };
+        let (s2, s3, s4) = (
+            snap(2, Some("the sampler failed: x")),
+            snap(3, Some("the sampler failed: x")),
+            snap(4, None),
+        );
+        a.absorb(s2);
+        a.absorb(s3);
+        a.absorb(s4);
+        assert_eq!(
+            a.notes
+                .iter()
+                .filter(|n| n.text.contains("sampler failed"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_program_after_an_upgrade_replaced_it() {
+        let d = std::env::temp_dir().join(format!("conduit-exe-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let bin = d.join("conduit");
+        std::fs::write(&bin, b"").unwrap();
+        let s = bin.display().to_string();
+        assert_eq!(exe_path(Some(bin.clone())), s);
+        assert_eq!(exe_path(Some(PathBuf::from(format!("{s} (deleted)")))), s);
+        assert_eq!(exe_path(Some(d.join("gone (deleted)"))), "conduit");
+        assert_eq!(exe_path(None), "conduit");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn jobs_run_in_their_own_session_and_their_log_is_tailed() {
+        let d = std::env::temp_dir().join(format!("conduit-job-{}", std::process::id()));
+        let log = d.join("dashboard-x.log");
+        let mut child = spawn_logged(
+            "sh",
+            &[
+                "-c".into(),
+                "echo \"sid $(ps -o sid= -p $$ | tr -d ' ') pid $$\"; printf 'a\\033[1mb\\033[0m\\nprog 1\\rprog 2\\nerr\\n' >&2; printf 'no newline'".into(),
+            ],
+            &log,
+        )
+        .unwrap();
+        let mut t = LogTail::open(&log).unwrap();
+        assert!(child.wait().unwrap().success());
+        let lines = t.lines(false);
+        let (sid, pid) = {
+            let w: Vec<&str> = lines[0].split_whitespace().collect();
+            (w[1].to_string(), w[3].to_string())
+        };
+        assert_eq!(sid, pid, "own session: {lines:?}");
+        assert_eq!(lines[1..], ["ab", "prog 2", "err"]);
+        assert_eq!(t.lines(true), ["no newline"]);
+        assert!(t.lines(true).is_empty());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn idle_frames_are_not_redrawn() {
+        let mut a = app();
+        a.intro = 0;
+        assert!(!a.animating());
+        a.capturing = Some(Tab::Doctor);
+        assert!(a.animating());
+        a.capturing = None;
+        a.tab = Tab::Doctor;
+        a.doctor.clear();
+        assert!(a.animating(), "checking… spinner");
+        a.tab = Tab::Dash;
+        a.dirty = false;
+        let s = Snapshot {
+            seq: 9,
+            ..a.snap.clone()
+        };
+        a.absorb(s.clone());
+        assert!(a.dirty, "a new snapshot is drawn");
+        a.dirty = false;
+        a.absorb(s);
+        assert!(!a.dirty, "the same snapshot is not");
+        a.key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(a.dirty);
     }
 
     #[test]

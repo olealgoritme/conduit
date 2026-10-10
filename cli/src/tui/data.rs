@@ -6,13 +6,21 @@
 use super::nvml::{Nvml, Sample};
 use crate::virt::{self, Link};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+/// The longest a virsh call of the sampler may take.
+const VIRSH_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long after NVML failed to open it is tried again.
+const NVML_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default)]
 pub struct Vm {
     pub name: String,
-    /// "running", "paused", "stopped", "undefined", …
+    /// "running", "paused", "stopped", "undefined", "unknown" (libvirt did
+    /// not answer), …
     pub state: String,
     pub libvirt: Option<String>,
     pub windows: bool,
@@ -33,8 +41,10 @@ pub struct Vm {
 impl Vm {
     /// Has a running VM process: running, paused, shutting down.
     pub fn up(&self) -> bool {
-        !matches!(self.state.as_str(), "stopped" | "undefined" | "")
-            && virt::state_is_up(&self.state)
+        !matches!(
+            self.state.as_str(),
+            "stopped" | "undefined" | "unknown" | ""
+        ) && virt::state_is_up(&self.state)
     }
 }
 
@@ -54,26 +64,85 @@ pub struct Snapshot {
     pub vms: Vec<Vm>,
     pub host: Host,
     pub gpu: Option<Sample>,
+    /// How many NVIDIA GPUs NVML sees (`gpu` is the one the VMs use).
+    pub gpus: usize,
+    /// NVML is let go while the dashboard is in the background.
+    pub gpu_released: bool,
     pub driver: String,
+    /// The sampler's last failure (a panic), for a note.
+    pub error: Option<String>,
     /// Bumped on every refresh.
     pub seq: u64,
 }
 
 pub type Shared = Arc<Mutex<Snapshot>>;
 
+/// Keep `slot` open while `want`, closed otherwise; a failed open is tried
+/// again after `retry`.
+fn hold<T>(
+    slot: &mut Option<T>,
+    want: bool,
+    failed: &mut Option<Instant>,
+    retry: Duration,
+    open: impl FnOnce() -> Option<T>,
+) {
+    if !want {
+        *slot = None;
+        *failed = None;
+        return;
+    }
+    if slot.is_none() && failed.is_none_or(|t| t.elapsed() >= retry) {
+        *slot = open();
+        *failed = slot.is_none().then(Instant::now);
+    }
+}
+
+/// What a panic carried, as text.
+pub fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
 /// Starts the sampler; `poke` makes it refresh at once (after an action).
-pub fn start() -> (Shared, std::sync::mpsc::Sender<()>) {
+/// NVML is held open only while `gpu_wanted` (the dashboard has focus): an
+/// open NVML keeps the NVIDIA device busy, so the GPU cannot be unbound.
+pub fn start(gpu_wanted: Arc<AtomicBool>) -> (Shared, std::sync::mpsc::Sender<()>) {
     let shared: Shared = Arc::new(Mutex::new(Snapshot::default()));
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let out = shared.clone();
     std::thread::spawn(move || {
-        let nvml = Nvml::open();
+        let mut nvml: Option<Nvml> = None;
+        let mut failed = None;
         let mut c = Collector::default();
         loop {
-            let snap = c.collect(nvml.as_ref());
+            let want = gpu_wanted.load(Ordering::SeqCst);
+            hold(&mut nvml, want, &mut failed, NVML_RETRY, Nvml::open);
+            let r =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.collect(nvml.as_ref())));
             if let Ok(mut s) = out.lock() {
                 let seq = s.seq + 1;
-                *s = Snapshot { seq, ..snap };
+                *s = match r {
+                    Ok(snap) => Snapshot {
+                        seq,
+                        gpu_released: !want,
+                        ..snap
+                    },
+                    Err(p) => {
+                        c = Collector::default();
+                        Snapshot {
+                            seq,
+                            error: Some(format!("the sampler failed: {}", panic_text(&*p))),
+                            ..s.clone()
+                        }
+                    }
+                };
+            }
+            // After publishing: PCIe throughput samples for ~40 ms and is
+            // shown with the next snapshot.
+            if let Some(n) = &nvml {
+                c.pcie = n.pcie(c.picked);
             }
             if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
                 rx.recv_timeout(Duration::from_millis(1000))
@@ -85,13 +154,112 @@ pub fn start() -> (Shared, std::sync::mpsc::Sender<()>) {
     (shared, tx)
 }
 
+/// Domain states of one libvirt connection, from `virsh list --all` (one
+/// call for every domain): name to state, `shut off` reported as `stopped`.
+pub fn parse_virsh_list(text: &str) -> HashMap<String, String> {
+    let mut lines = text.lines();
+    let mut m = HashMap::new();
+    let Some(head) = lines.find(|l| l.contains("Name") && l.contains("State")) else {
+        return m;
+    };
+    let (Some(n), Some(st)) = (head.find("Name"), head.find("State")) else {
+        return m;
+    };
+    for l in lines {
+        if l.trim_start().starts_with('-') && l.trim().chars().all(|c| c == '-') {
+            continue;
+        }
+        let (Some(name), Some(state)) = (l.get(n..st), l.get(st..)) else {
+            continue;
+        };
+        let (name, state) = (name.trim(), state.trim());
+        if name.is_empty() || state.is_empty() {
+            continue;
+        }
+        let state = if state == "shut off" {
+            "stopped"
+        } else {
+            state
+        };
+        m.insert(name.to_string(), state.to_string());
+    }
+    m
+}
+
+/// The GPU the VMs use: the one holding the most of their memory; else the
+/// one picked before; else the first.
+pub fn pick_gpu(vm_bytes: &[u64], prev: usize) -> usize {
+    match vm_bytes.iter().enumerate().max_by_key(|(_, b)| **b) {
+        Some((i, b)) if *b > 0 => i,
+        _ if prev < vm_bytes.len() => prev,
+        _ => 0,
+    }
+}
+
+/// Where libvirt keeps a domain's persistent definition (its mtime says
+/// when it was last defined).
+fn domain_xml_file(uri: &str, dom: &str) -> PathBuf {
+    if virt::is_system_uri(uri) {
+        PathBuf::from(format!("/etc/libvirt/qemu/{dom}.xml"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| crate::paths::home().join(".config"))
+            .join(format!("libvirt/qemu/{dom}.xml"))
+    }
+}
+
+fn mtime(p: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+fn virsh(uri: &str, args: &[&str]) -> Option<String> {
+    let mut c = std::process::Command::new("virsh");
+    c.env("LC_ALL", "C").args(["-c", uri]).args(args);
+    crate::sys::output_timeout(&mut c, VIRSH_TIMEOUT)
+}
+
+/// Facts from a domain's XML: (windows, MiB, vCPUs).
+type Facts = (bool, Option<u64>, Option<u32>);
+
+fn facts_of(xml: &str) -> Facts {
+    let mem = xml_num(xml, "memory").map(|(n, u)| match u.as_str() {
+        "GiB" | "G" => n * 1024,
+        "MiB" | "M" => n,
+        "B" | "bytes" => n >> 20,
+        _ => n / 1024,
+    });
+    let cpus = xml_num(xml, "vcpu").map(|(n, _)| n as u32);
+    (crate::libvirt::is_windows(xml), mem, cpus)
+}
+
+/// A cached [`Facts`]: read again when the definition's (or the link's)
+/// mtime changes, or every minute when it cannot be seen.
+struct Cached {
+    facts: Facts,
+    stamp: (Option<SystemTime>, Option<SystemTime>),
+    at: Instant,
+}
+
+impl Cached {
+    fn fresh(&self, stamp: (Option<SystemTime>, Option<SystemTime>)) -> bool {
+        stamp == self.stamp && (stamp.0.is_some() || self.at.elapsed() < Duration::from_secs(60))
+    }
+}
+
 #[derive(Default)]
 struct Collector {
     /// pid → (cpu ticks, when) of the last sample.
     ticks: HashMap<i32, (u64, Instant)>,
     cpu_prev: Option<(u64, u64)>,
-    /// Facts from a domain's XML, read once: (windows, MiB, vCPUs).
-    xml: HashMap<String, (bool, Option<u64>, Option<u32>)>,
+    /// Facts from each domain's XML, kept until the definition changes.
+    xml: HashMap<String, Cached>,
+    /// The last states seen per connection, kept when virsh times out.
+    states: HashMap<String, HashMap<String, String>>,
+    /// The GPU shown, and its last PCIe (tx, rx).
+    picked: usize,
+    pcie: (Option<u32>, Option<u32>),
 }
 
 fn read(p: impl AsRef<std::path::Path>) -> String {
@@ -158,8 +326,56 @@ fn xml_num(xml: &str, tag: &str) -> Option<(u64, String)> {
 }
 
 impl Collector {
+    /// Every connection's domain states, one `virsh list --all` each.
+    fn refresh_states(&mut self, uris: &[String]) {
+        for uri in uris {
+            if let Some(t) = virsh(uri, &["list", "--all"]) {
+                self.states.insert(uri.clone(), parse_virsh_list(&t));
+            }
+        }
+        self.states.retain(|u, _| uris.contains(u));
+    }
+
+    fn facts(&mut self, name: &str, l: &Link) -> Facts {
+        let stamp = (
+            mtime(&domain_xml_file(&l.uri, &l.domain)),
+            mtime(&Link::file(name)),
+        );
+        if let Some(c) = self.xml.get(name) {
+            if c.fresh(stamp) {
+                return c.facts;
+            }
+        }
+        let Some(xml) = virsh(&l.uri, &["dumpxml", "--inactive", &l.domain]) else {
+            // Keep what we had; try again next time.
+            return self.xml.get(name).map(|c| c.facts).unwrap_or_default();
+        };
+        let facts = facts_of(&xml);
+        self.xml.insert(
+            name.to_string(),
+            Cached {
+                facts,
+                stamp,
+                at: Instant::now(),
+            },
+        );
+        facts
+    }
+
     fn collect(&mut self, nvml: Option<&Nvml>) -> Snapshot {
-        let gpu = nvml.map(|n| n.sample());
+        let samples: Vec<Sample> = nvml
+            .map(|n| (0..n.count()).map(|i| n.sample_dev(i)).collect())
+            .unwrap_or_default();
+        let names = crate::lvrun::all_names();
+        let links: HashMap<String, Link> = names
+            .iter()
+            .filter_map(|n| Link::load(n).map(|l| (n.clone(), l)))
+            .collect();
+        let mut uris: Vec<String> = links.values().map(|l| l.uri.clone()).collect();
+        uris.sort();
+        uris.dedup();
+        self.refresh_states(&uris);
+        self.xml.retain(|n, _| links.contains_key(n));
         let tck = clk_tck();
         let btime = boot_time();
         let now_unix = std::time::SystemTime::now()
@@ -168,28 +384,29 @@ impl Collector {
             .unwrap_or(0);
         let mut vms = Vec::new();
         let mut seen = Vec::new();
-        for name in crate::lvrun::all_names() {
+        for name in names {
             let mut vm = Vm {
                 name: name.clone(),
                 ..Default::default()
             };
-            let link = Link::load(&name);
-            vm.state = crate::lvrun::state_word(&name);
+            let link = links.get(&name);
+            vm.state = match link {
+                Some(l) => self
+                    .states
+                    .get(&l.uri)
+                    .map(|m| {
+                        m.get(&l.domain)
+                            .cloned()
+                            .unwrap_or_else(|| "undefined".into())
+                    })
+                    .unwrap_or_else(|| "unknown".into()),
+                None => crate::lvrun::state_word(&name),
+            };
             let rt = crate::run::Rt::new(&name).ok();
             let st = rt.as_ref().map(|r| r.state()).unwrap_or_default();
-            if let Some(l) = &link {
+            if let Some(l) = link {
                 vm.libvirt = Some(l.domain.clone());
-                let facts = self.xml.entry(name.clone()).or_insert_with(|| {
-                    let xml = l.virsh().inactive_xml(&l.domain).unwrap_or_default();
-                    let mem = xml_num(&xml, "memory").map(|(n, u)| match u.as_str() {
-                        "GiB" | "G" => n * 1024,
-                        "MiB" | "M" => n,
-                        "B" | "bytes" => n >> 20,
-                        _ => n / 1024,
-                    });
-                    let cpus = xml_num(&xml, "vcpu").map(|(n, _)| n as u32);
-                    (crate::libvirt::is_windows(&xml), mem, cpus)
-                });
+                let facts = self.facts(&name, l);
                 vm.windows = facts.0;
                 vm.ram_mib = facts.1;
                 vm.cpus = facts.2;
@@ -244,24 +461,42 @@ impl Collector {
             vms.push(vm);
         }
         self.ticks.retain(|p, _| seen.contains(p));
-        if let Some(g) = &gpu {
+        // Every GPU's processes count towards their VMs; the one holding
+        // most of the VMs' memory is the one shown.
+        let mut per_gpu = vec![0u64; samples.len()];
+        let mut cmdlines: HashMap<u32, String> = HashMap::new();
+        for (gi, g) in samples.iter().enumerate() {
             for (pid, used) in &g.procs {
-                let cl = cmdline(*pid);
+                let cl = cmdlines.entry(*pid).or_insert_with(|| cmdline(*pid));
                 for vm in vms.iter_mut() {
                     let tag = format!("/conduit/{}/", vm.name);
                     let guest = format!("guest={},", vm.name);
                     if vm.pid == Some(*pid as i32) || cl.contains(&tag) || cl.contains(&guest) {
                         vm.vram += used;
+                        per_gpu[gi] += used;
                         break;
                     }
                 }
             }
         }
+        let gpus = samples.len();
+        let pick = pick_gpu(&per_gpu, self.picked);
+        if pick != self.picked {
+            self.pcie = (None, None);
+        }
+        self.picked = pick;
+        let gpu = samples.into_iter().nth(pick).map(|mut g| {
+            (g.pcie_tx_kbs, g.pcie_rx_kbs) = self.pcie;
+            g
+        });
         Snapshot {
             vms,
             host: self.host(),
             driver: nvml.map(|n| n.driver.clone()).unwrap_or_default(),
             gpu,
+            gpus,
+            gpu_released: false,
+            error: None,
             seq: 0,
         }
     }
@@ -320,6 +555,114 @@ mod tests {
         let xml = "<domain><memory unit='KiB'>16777216</memory><vcpu placement='static'>8</vcpu></domain>";
         assert_eq!(xml_num(xml, "memory"), Some((16777216, "KiB".into())));
         assert_eq!(xml_num(xml, "vcpu").map(|x| x.0), Some(8));
+    }
+
+    #[test]
+    fn one_virsh_list_gives_every_state() {
+        let t = " Id   Name          State\n------------------------------------\n 3    win11         running\n -    lab           shut off\n 7    my vm two     in shutdown\n -    p             paused\n\n";
+        let m = parse_virsh_list(t);
+        assert_eq!(m["win11"], "running");
+        assert_eq!(m["lab"], "stopped");
+        assert_eq!(m["my vm two"], "in shutdown");
+        assert_eq!(m["p"], "paused");
+        assert_eq!(m.len(), 4);
+        assert!(parse_virsh_list("").is_empty());
+        assert!(parse_virsh_list("error: failed to connect").is_empty());
+    }
+
+    #[test]
+    fn the_shown_gpu_is_the_one_the_vms_use() {
+        assert_eq!(pick_gpu(&[], 0), 0);
+        assert_eq!(pick_gpu(&[0, 0], 1), 1);
+        assert_eq!(pick_gpu(&[0, 0], 5), 0);
+        assert_eq!(pick_gpu(&[0, 3 << 30], 0), 1);
+        assert_eq!(pick_gpu(&[5, 3], 1), 0);
+    }
+
+    #[test]
+    fn nvml_is_held_only_while_wanted() {
+        let mut slot = None;
+        let mut failed = None;
+        let opens = std::cell::Cell::new(0);
+        let open = |ok: bool| {
+            opens.set(opens.get() + 1);
+            ok.then_some(1)
+        };
+        hold(
+            &mut slot,
+            true,
+            &mut failed,
+            Duration::from_secs(30),
+            || open(true),
+        );
+        assert_eq!(slot, Some(1));
+        hold(
+            &mut slot,
+            true,
+            &mut failed,
+            Duration::from_secs(30),
+            || open(true),
+        );
+        assert_eq!(opens.get(), 1, "kept open, not opened again");
+        // Focus lost: let go of the GPU.
+        hold(
+            &mut slot,
+            false,
+            &mut failed,
+            Duration::from_secs(30),
+            || open(true),
+        );
+        assert_eq!(slot, None);
+        // A failed open waits before it tries again.
+        hold(
+            &mut slot,
+            true,
+            &mut failed,
+            Duration::from_secs(30),
+            || open(false),
+        );
+        hold(
+            &mut slot,
+            true,
+            &mut failed,
+            Duration::from_secs(30),
+            || open(true),
+        );
+        assert_eq!((slot, opens.get()), (None, 2));
+        hold(&mut slot, true, &mut failed, Duration::ZERO, || open(true));
+        assert_eq!((slot, opens.get()), (Some(1), 3));
+    }
+
+    #[test]
+    fn domain_facts_are_read_again_when_the_definition_changes() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let t1 = t0 + Duration::from_secs(1);
+        let c = Cached {
+            facts: (true, Some(4096), Some(4)),
+            stamp: (Some(t0), Some(t0)),
+            at: Instant::now(),
+        };
+        assert!(c.fresh((Some(t0), Some(t0))));
+        assert!(!c.fresh((Some(t1), Some(t0))), "redefined");
+        assert!(!c.fresh((Some(t0), Some(t1))), "re-attached");
+        let unseen = Cached {
+            stamp: (None, Some(t0)),
+            at: Instant::now() - Duration::from_secs(61),
+            ..c
+        };
+        assert!(!unseen.fresh((None, Some(t0))), "unseen: once a minute");
+        assert_eq!(
+            facts_of("<domain><memory unit='GiB'>8</memory><vcpu>6</vcpu></domain>"),
+            (false, Some(8192), Some(6))
+        );
+    }
+
+    #[test]
+    fn panics_become_text() {
+        let p = std::panic::catch_unwind(|| panic!("boom {}", 1)).unwrap_err();
+        assert_eq!(panic_text(&*p), "boom 1");
+        let p = std::panic::catch_unwind(|| panic!("static")).unwrap_err();
+        assert_eq!(panic_text(&*p), "static");
     }
 
     #[test]

@@ -889,6 +889,46 @@ class FilesTest(Fixture):
         self.assertTrue(out["ok"], out)
         self.assertEqual(rd(t), b"fresh")
 
+    def test_foreign_part_file_is_never_deleted_or_clobbered(self):
+        t = os.path.join(self.home, "f")
+        part = write(t + ".conduit-part", b"user data")
+        # an error before anything was written leaves it alone
+        e = self.err("put", path=t, offset=4, data=b64(b"x"))
+        self.assertIn("unexpected offset", e)
+        self.assertEqual(rd(part), b"user data")
+        # a fresh transfer refuses to replace a part file it did not make
+        out = self.put(t, [b"new"])
+        self.assertFalse(out["ok"])
+        self.assertIn("not made by Conduit", out["error"])
+        self.assertEqual(rd(part), b"user data")
+        self.assertFalse(os.path.exists(t))
+
+    def test_part_symlink_is_not_followed(self):
+        t = os.path.join(self.home, "l")
+        victim = write(os.path.join(self.home, "victim"), b"keep")
+        os.symlink(victim, t + ".conduit-part")
+        out = self.put(t, [b"evil"])
+        self.assertFalse(out["ok"])
+        self.assertEqual(rd(victim), b"keep")
+        self.assertTrue(os.path.islink(t + ".conduit-part"))
+
+    def test_own_part_is_deleted_on_error(self):
+        t = os.path.join(self.home, "o")
+        self.assertTrue(self.call("put", path=t, offset=0, data=b64(b"abc"))["ok"])
+        self.assertTrue(os.path.exists(t + ".conduit-part"))
+        self.err("put", path=t, offset=1, data=b64(b"x"))
+        self.assertFalse(os.path.exists(t + ".conduit-part"))
+
+    def test_put_does_not_replace_a_file_that_appeared_meanwhile(self):
+        t = os.path.join(self.home, "race")
+        self.assertTrue(self.call("put", path=t, offset=0, data=b64(b"abc"))["ok"])
+        write(t, b"theirs")
+        out = self.call("put", path=t, offset=3, data=b64(b"def"), done=True)
+        self.assertFalse(out["ok"])
+        self.assertIn("already exists", out["error"])
+        self.assertEqual(rd(t), b"theirs")
+        self.assertFalse(os.path.exists(t + ".conduit-part"))
+
     def test_continue_after_agent_restart(self):
         t = os.path.join(self.home, "cont")
         self.assertTrue(self.call("put", path=t, offset=0, data=b64(b"abc"))["ok"])
