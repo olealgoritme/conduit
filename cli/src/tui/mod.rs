@@ -186,10 +186,14 @@ impl App {
         }
     }
 
+    /// Our own program; falls back to `conduit` on PATH once the running binary
+    /// was replaced by an upgrade (Linux then reports it as "… (deleted)").
     fn exe() -> String {
         std::env::current_exe()
+            .ok()
+            .filter(|p| p.exists())
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "conduit".into())
+            .unwrap_or_else(|| "conduit".into())
     }
 
     /// Runs `conduit ARGS…`; output lines land in the activity log.
