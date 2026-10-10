@@ -72,6 +72,7 @@ struct nb_session *nb_session_x11(const struct nb_config *cfg)
 #ifdef NB_HAVE_XCB_XINPUT
 #include <xcb/xinput.h>
 #endif
+#include "nb_ui.h"
 
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
 
@@ -168,6 +169,39 @@ struct nb_x11 {
     bool      dlg_mapped;
     int       dlg_hot;          /* hovered row, -1 = none                 */
     bool      cursor_hidden;    /* what the content window currently shows */
+    bool      cursor_dirty;     /* re-apply the policy even if unchanged  */
+
+    /*
+     * Display settings (nb_view.h) and where they last put the picture: the
+     * content child is exactly place.vis, and the pointer is mapped through
+     * the same rectangle.
+     */
+    const struct nb_config *cfg;
+    struct nb_vstore vst;
+    struct nb_place  place;
+    int       con_x, con_y;
+    bool      rehint_pending;
+    uint64_t  rehint_due_ms;
+
+    /* The viewer's own UI (nb_ui.h) on child windows: opaque, so it needs
+     * no compositor and no ARGB visual. */
+    struct nb_ui ui;
+    struct nb_x11_layer {
+        xcb_window_t win;
+        uint32_t    *px;
+        int          w, h, x, y;
+        bool         mapped, input;
+    } ly_menu, ly_note, ly_btn;
+    xcb_window_t ed[8];         /* the area outline while the menu is open */
+    bool      ed_mapped;
+    struct nb_rect ed_at;
+    uint64_t  note_until;
+    char      note_txt[64];
+    double    btn_alpha;
+    bool      btn_want, btn_hot;
+    uint64_t  btn_seen_ms, btn_last_ms;
+    xcb_cursor_t ui_cursor[NB_UI_CUR_COUNT];
+    int       ui_cur;
 };
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
@@ -190,6 +224,15 @@ static void x11_clip_serve(struct nb_x11 *x,
 static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
                              const xcb_selection_notify_event_t *sn);
 static void x11_clip_incr_step(struct nb_x11 *x);
+/* The display settings and the viewer's own UI, defined near the end. */
+static void x11_ui_do(struct nb_x11 *x, unsigned bits);
+static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x);
+static void x11_menu_set(struct nb_x11 *x, bool open);
+static void x11_layer_expose(struct nb_x11 *x, xcb_window_t w);
+static bool x11_ui_pointer(struct nb_x11 *x, xcb_window_t ev, int ex, int ey,
+                           int button, bool down, bool motion);
+static void x11_rehint(struct nb_x11 *x, bool force);
+static void x11_relayout(struct nb_x11 *x);
 
 /* ── small helpers ───────────────────────────────────────────────────────── */
 
@@ -546,21 +589,23 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
     return 0;
 }
 
-static void x11_size_content(struct nb_x11 *x, int w, int h)
+static void x11_size_content_at(struct nb_x11 *x, int px, int py, int w,
+                                int h)
 {
     uint32_t vals[4];
-    int px = (x->win_w - w) / 2, py = (x->win_h - h) / 2;
 
     if (px < 0) { px = 0; }
     if (py < 0) { py = 0; }
     vals[0] = (uint32_t)px;
     vals[1] = (uint32_t)py;
-    vals[2] = (uint32_t)w;
-    vals[3] = (uint32_t)h;
+    vals[2] = (uint32_t)(w > 0 ? w : 1);
+    vals[3] = (uint32_t)(h > 0 ? h : 1);
     xcb_configure_window(x->c, x->content,
                          XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
                          XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
                          vals);
+    x->con_x = px;
+    x->con_y = py;
     x->con_w = w;
     x->con_h = h;
     /*
@@ -572,52 +617,48 @@ static void x11_size_content(struct nb_x11 *x, int w, int h)
     xcb_clear_area(x->c, 0, x->win, 0, 0, 0, 0);
 }
 
+/* Centred, unscaled: the placeholder and the shm tier. */
+static void x11_size_content(struct nb_x11 *x, int w, int h)
+{
+    struct nb_view v;
+
+    nb_view_defaults(&v);
+    v.scale = NB_SCALE_NONE;
+    nb_view_place(&v, w, h, x->win_w, x->win_h, 120, &x->place);
+    x11_size_content_at(x, (x->win_w - w) / 2, (x->win_h - h) / 2, w, h);
+}
+
 /*
  * WHERE THE GUEST'S FRAME GOES IN THE WINDOW.
  *
- * The Wayland backend has wp_viewport and can ask the compositor to scale into
- * an arbitrary rectangle.  X11's Present cannot scale at all -- it blits 1:1 --
- * so a window that is not exactly the guest's mode showed bars on BOTH axes and
- * the guest's picture stayed small until the guest happened to re-mode to match.
- * That made --scale a no-op on this backend and left the result depending on the
- * guest, which is precisely what it should not do.
- *
- * So compute the destination here, the same way Wayland does, and let
- * x11_present_scaled() get the pixels there.
+ * Present cannot scale -- it blits 1:1 -- so the placement (nb_view.c: the
+ * output area, the scale mode, a crop for a 1:1 picture larger than its area)
+ * sizes the content child to the visible rectangle, and x11_draw() gets the
+ * pixels there: Present when the picture is 1:1, one XRender composite with
+ * the scale and crop in its transform otherwise.  Either way it is the one
+ * GPU copy the server already makes.
  */
-static void x11_dest_rect(struct nb_x11 *x, int sw, int sh, int *dw, int *dh)
+static void x11_place(struct nb_x11 *x, int bw, int bh)
 {
-    if (x->scale_mode == NB_SCALE_STRETCH) {
-        *dw = x->win_w; *dh = x->win_h;
-    } else if (x->scale_mode == NB_SCALE_ASPECT &&
-               sw > 0 && sh > 0 && x->win_w > 0 && x->win_h > 0) {
-        /* Largest rectangle of the source's aspect that fits the window. */
-        long by_w = (long)x->win_w * sh;
-        long by_h = (long)x->win_h * sw;
+    const struct nb_rect *v = &x->place.vis;
 
-        if (by_w <= by_h) {         /* width-limited */
-            *dw = x->win_w;
-            *dh = (int)((long)x->win_w * sh / sw);
-        } else {                    /* height-limited */
-            *dh = x->win_h;
-            *dw = (int)((long)x->win_h * sw / sh);
-        }
-    } else {
-        *dw = sw; *dh = sh;         /* NB_SCALE_NONE: 1:1, centred */
+    nb_view_place(&x->vst.cur, bw, bh, x->win_w, x->win_h, 120, &x->place);
+    if (x->con_x != v->x || x->con_y != v->y || x->con_w != v->w ||
+        x->con_h != v->h) {
+        x11_size_content_at(x, v->x, v->y, v->w, v->h);
     }
-    if (*dw < 1) { *dw = 1; }
-    if (*dh < 1) { *dh = 1; }
 }
 
 #ifdef NB_HAVE_XCB_RENDER
-/* Scale one buffer into the content window with the X server's own compositor.
- * Returns false if Render is unusable, so the caller can fall back to Present. */
-static bool x11_render_scaled(struct nb_x11 *x, struct nb_x11_buf *sl,
-                              int dw, int dh)
+/* Scale (and crop) one buffer into the content window with the X server's
+ * own compositor.  Returns false if Render is unusable. */
+static bool x11_render_scaled(struct nb_x11 *x, struct nb_x11_buf *sl)
 {
+    const struct nb_place *p = &x->place;
     xcb_render_picture_t src;
     xcb_render_transform_t tr;
-    static const char filter[] = "bilinear";
+    const char *filter = x->vst.cur.filter == NB_FILTER_NEAREST ? "nearest"
+                                                                 : "bilinear";
 
     if (!x->pict_fmt) {
         return false;
@@ -632,21 +673,57 @@ static bool x11_render_scaled(struct nb_x11 *x, struct nb_x11_buf *sl,
 
     /*
      * The transform maps DESTINATION coordinates back to the SOURCE, so it
-     * carries src/dst, not dst/src.  16.16 fixed point.
+     * carries buffer/picture, plus the crop's origin.  16.16 fixed point.
      */
     memset(&tr, 0, sizeof tr);
-    tr.matrix11 = (xcb_render_fixed_t)(((int64_t)sl->w << 16) / (dw > 0 ? dw : 1));
-    tr.matrix22 = (xcb_render_fixed_t)(((int64_t)sl->h << 16) / (dh > 0 ? dh : 1));
+    tr.matrix11 = (xcb_render_fixed_t)(((int64_t)sl->w << 16) /
+                                       (p->pic.w > 0 ? p->pic.w : 1));
+    tr.matrix22 = (xcb_render_fixed_t)(((int64_t)sl->h << 16) /
+                                       (p->pic.h > 0 ? p->pic.h : 1));
+    tr.matrix13 = (xcb_render_fixed_t)(p->sx * 65536.0);
+    tr.matrix23 = (xcb_render_fixed_t)(p->sy * 65536.0);
     tr.matrix33 = 1 << 16;
     xcb_render_set_picture_transform(x->c, src, tr);
-    xcb_render_set_picture_filter(x->c, src, sizeof filter - 1, filter, 0, NULL);
+    xcb_render_set_picture_filter(x->c, src, (uint16_t)strlen(filter), filter,
+                                  0, NULL);
     xcb_render_composite(x->c, XCB_RENDER_PICT_OP_SRC, src,
                          XCB_RENDER_PICTURE_NONE, x->dst_pic,
-                         0, 0, 0, 0, 0, 0, (uint16_t)dw, (uint16_t)dh);
+                         0, 0, 0, 0, 0, 0, (uint16_t)p->vis.w,
+                         (uint16_t)p->vis.h);
     xcb_render_free_picture(x->c, src);
     return true;
 }
 #endif
+
+/*
+ * Put one dma-buf frame on screen.  Returns 1 when it went by composite (the
+ * buffer is free again at once), 0 when by Present (freed on IdleNotify).
+ */
+static int x11_draw(struct nb_x11 *x, struct nb_x11_buf *sl)
+{
+    x11_place(x, (int)sl->w, (int)sl->h);
+#ifdef NB_HAVE_XCB_RENDER
+    /*
+     * Only when it is actually scaled.  At 1:1 Present is the better path --
+     * it can reach a hardware plane, which a composite never can -- so
+     * scaling costs nothing when nothing needs scaling.
+     */
+    if ((x->place.pic.w != (int)sl->w || x->place.pic.h != (int)sl->h) &&
+        x11_render_scaled(x, sl)) {
+        return 1;
+    }
+#endif
+    /* 1:1; a crop is a negative offset into the content window. */
+    xcb_present_pixmap(x->c, x->content, sl->pixmap, ++x->serial,
+                       XCB_NONE /* valid */, XCB_NONE /* update */,
+                       (int16_t)(x->place.pic.x - x->place.vis.x),
+                       (int16_t)(x->place.pic.y - x->place.vis.y),
+                       XCB_NONE /* target_crtc */,
+                       XCB_NONE /* wait_fence */, XCB_NONE /* idle_fence */,
+                       0 /* options */, 0 /* target_msc: as soon as possible */,
+                       0, 0, 0, NULL);
+    return 0;
+}
 
 static int x11_commit(struct nb_session *s, struct nb_sink *sink)
 {
@@ -671,9 +748,6 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         const uint8_t *src = (const uint8_t *)sl->map + sl->offset;
         unsigned packed = sl->w * 4u;
         uint32_t *tmp = NULL;
-        int dw, dh;
-
-        x11_dest_rect(x, (int)sl->w, (int)sl->h, &dw, &dh);
         if (x->con_w != (int)sl->w || x->con_h != (int)sl->h) {
             /* No scaler on this rung: XRender needs a Picture and there is no
              * pixmap here.  1:1 and centred, which is what "it always works"
@@ -743,40 +817,25 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         return 0;
     }
 
-    {
-        int dw, dh;
-
-        x11_dest_rect(x, (int)sl->w, (int)sl->h, &dw, &dh);
-        if (x->con_w != dw || x->con_h != dh) {
-            x11_size_content(x, dw, dh);
-        }
-#ifdef NB_HAVE_XCB_RENDER
+    if (x11_draw(x, sl)) {
         /*
-         * Only when it is actually a different size.  At 1:1 Present is the
-         * better path -- it can reach a hardware plane, which a composite
-         * never can -- so scaling costs nothing when nothing needs scaling.
+         * PACE A COMPOSITED FRAME ON VBLANK.  There is no PixmapComplete
+         * for a composite, so without this the only pacing left was the
+         * 100 ms watchdog: a scaled X11 window ran the guest at 10 fps.
+         * NotifyMSC completes at the next vblank and arrives as the same
+         * CompleteNotify the Present path paces on.
          */
-        if ((dw != (int)sl->w || dh != (int)sl->h) &&
-            x11_render_scaled(x, sl, dw, dh)) {
-            xcb_flush(x->c);
-            x->current = x->pending;
-            x->pending = -1;
-            x->idle_shown = false;
-            x11_cursor_policy(x);
-            /* Composite copies, so the buffer is free the moment the server
-             * has read it -- there is no PresentIdleNotify coming for it. */
-            nb_sink_release(sink, sl->id, 0);
-            return 0;
-        }
-#endif
+        xcb_present_notify_msc(x->c, x->content, ++x->serial, 0, 1, 0);
+        xcb_flush(x->c);
+        x->current = x->pending;
+        x->pending = -1;
+        x->idle_shown = false;
+        x11_cursor_policy(x);
+        /* Composite copies, so the buffer is free the moment the server
+         * has read it -- there is no PresentIdleNotify coming for it. */
+        nb_sink_release(sink, sl->id, 0);
+        return 0;
     }
-
-    xcb_present_pixmap(x->c, x->content, sl->pixmap, ++x->serial,
-                       XCB_NONE /* valid */, XCB_NONE /* update */,
-                       0, 0, XCB_NONE /* target_crtc */,
-                       XCB_NONE /* wait_fence */, XCB_NONE /* idle_fence */,
-                       0 /* options */, 0 /* target_msc: as soon as possible */,
-                       0, 0, 0, NULL);
     xcb_flush(x->c);
 
     x->current = x->pending;
@@ -854,7 +913,8 @@ static void x11_present_event(struct nb_x11 *x, struct nb_sink *sink,
          * to the screen" is unanswerable from the outside.  Logged on every
          * CHANGE, not every frame, so it stays one line in normal use.
          */
-        if (ce->mode != x->last_mode) {
+        if (ce->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP &&
+            ce->mode != x->last_mode) {
             static const char *modes[] = { "COPY", "FLIP", "SKIP",
                                            "SUBOPTIMAL_COPY" };
 
@@ -1005,6 +1065,7 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             break;
         }
         case XCB_EXPOSE:
+            x11_layer_expose(x, ((xcb_expose_event_t *)ev)->window);
             if (x->dlg_mapped) {
                 x11_dlg_paint(x);
                 break;
@@ -1070,6 +1131,28 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 }
                 break;
             }
+            /* The menu has the keyboard while it is open (see Wayland). */
+            if (x->ui.open) {
+                unsigned code = x11_kc_to_evdev(k->detail);
+                bool down = (ev->response_type & 0x7f) == XCB_KEY_PRESS;
+
+                nb_sink_key_latch(sink, code, down);
+                if (down && sink->ctrl_down && sink->alt_down &&
+                    (code == KEY_M || code == KEY_F)) {
+                    if (code == KEY_M) {
+                        x11_menu_set(x, false);
+                    } else {
+                        nb_sink_toggle_fullscreen(sink);
+                    }
+                    break;
+                }
+                if (code != KEY_LEFTCTRL && code != KEY_RIGHTCTRL &&
+                    code != KEY_LEFTALT && code != KEY_RIGHTALT) {
+                    x11_ui_do(x, nb_ui_key(&x->ui, x11_ui_env(x), code,
+                                           sink->shift_down, down));
+                }
+                break;
+            }
             nb_sink_key(sink, x11_kc_to_evdev(k->detail),
                         (ev->response_type & 0x7f) == XCB_KEY_PRESS);
             break;
@@ -1111,6 +1194,10 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 break;      /* never reaches the guest while the dialog is up */
             }
 
+            if (x11_ui_pointer(x, b->event, b->event_x, b->event_y, (int)d,
+                               down, false)) {
+                break;
+            }
             if (d == 4 || d == 5) {
                 if (down) {
                     nb_sink_wheel(sink, d == 4 ? 1 : -1, 0);
@@ -1130,7 +1217,8 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
         }
         case XCB_MOTION_NOTIFY: {
             xcb_motion_notify_event_t *m = (void *)ev;
-            int cx = m->event_x, cy = m->event_y;
+            double wx = m->event_x, wy = m->event_y;
+            int gx, gy, bw, bh;
 
             if (x->dlg_mapped) {
                 if (m->event == x->dlg) {
@@ -1143,83 +1231,49 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 }
                 break;
             }
-
+            /* The menu, the button, or the area editor while the menu is
+             * open: never the guest. */
+            if (x11_ui_pointer(x, m->event, m->event_x, m->event_y, 0, false,
+                               true)) {
+                break;
+            }
             /*
-             * Map into the CONTENT window, which is the guest's framebuffer.
-             * Motion arrives from whichever window it happened over, and the
-             * content child is letterboxed inside the toplevel -- so reporting
-             * toplevel coordinates against the toplevel size put the guest
-             * pointer at the wrong place by exactly the letterbox offset, and
-             * scaled it wrongly too.
+             * To WINDOW coordinates (the content child selects no events, so
+             * motion normally arrives on the toplevel already), then through
+             * the rectangle the picture is drawn in to a guest pixel.  Over
+             * the bars the pointer rests on the picture's nearest edge.
              */
-            if (m->event != x->content) {
-                cx -= (x->win_w - x->con_w) / 2;
-                cy -= (x->win_h - x->con_h) / 2;
+            if (m->event == x->content) {
+                wx += x->con_x;
+                wy += x->con_y;
             }
-            if (x->con_w <= 0 || x->con_h <= 0) {
+            bw = x->current >= 0 ? (int)x->bufs[x->current].w : x->con_w;
+            bh = x->current >= 0 ? (int)x->bufs[x->current].h : x->con_h;
+            if (bw <= 0 || bh <= 0) {
                 break;
             }
-            if (cx < 0 || cy < 0 || cx >= x->con_w || cy >= x->con_h) {
-                /* Over the letterbox, not over the guest. */
-                if (x->ptr_inside) {
-                    x->ptr_inside = false;
-                    nb_sink_pointer(sink, false);
-                }
-                break;
-            }
-            /* Motion over the content IS the pointer being inside it. */
             if (!x->ptr_inside) {
                 x->ptr_inside = true;
                 nb_sink_pointer(sink, true);
             }
-            nb_sink_abs(sink, cx, cy, (unsigned)x->con_w, (unsigned)x->con_h);
+            nb_view_map(&x->place, bw, bh, wx, wy, &gx, &gy);
+            nb_sink_abs(sink, gx, gy, (unsigned)bw, (unsigned)bh);
             break;
         }
         case XCB_CONFIGURE_NOTIFY: {
             xcb_configure_notify_event_t *c = (void *)ev;
 
             if (c->window == x->win) {
-                unsigned hw, hh;
-
                 x->win_w = c->width;
                 x->win_h = c->height;
-                /*
-                 * ALIGN THE HINT DOWN TO A MULTIPLE OF 8, exactly as the
-                 * Wayland backend does and for the same reason: the guest
-                 * builds its mode with drm_cvt_mode(), whose CVT_H_GRANULARITY
-                 * is 8, so an odd width produces a mode whose stride is not the
-                 * one the framebuffer was allocated with.
-                 *
-                 * MEASURED: dragging the window told the guest "host window is
-                 * 2731x1303" and the picture came back skewed and duplicated
-                 * with bands of stripes -- a classic pitch mismatch, and 2731
-                 * is not a multiple of 8.  Down, never up, so the suggestion
-                 * still fits the window we measured.
-                 */
-                hw = (unsigned)c->width & ~7u;
-                hh = (unsigned)c->height;
-                if (hw == 0 || hh == 0) {
+                if (c->width == 0 || c->height == 0) {
                     break;
                 }
-                /* Idempotent: a configure that did not change the hint is not
-                 * news, and a re-mode the guest does not need is a visible
-                 * flicker at best. */
                 if (x->idle_shown && x->current < 0) {
                     x11_show_idle(s);   /* the placeholder is window-sized */
                 }
-                if (hw == x->hint_w && hh == x->hint_h) {
-                    if (x->con_w > 0 && x->current >= 0) {
-                        x11_size_content(x, x->con_w, x->con_h);
-                    }
-                    break;
-                }
-                x->hint_w = hw;
-                x->hint_h = hh;
-                nb_sink_surface(sink, hw, hh, 0 /* no refresh source */);
-                /* Keep the content window centred in its new parent. */
-                if (x->con_w > 0) {
-                    x11_size_content(x, x->con_w, x->con_h);
-                }
+                x11_rehint(x, false);
+                x11_relayout(x);
             }
             break;
         }
@@ -1374,13 +1428,18 @@ static void x11_cursor_init(struct nb_x11 *x)
  */
 static void x11_cursor_policy(struct nb_x11 *x)
 {
-    bool hide = x->current >= 0 && !x->idle_shown && !x->dlg_mapped;
+    bool hide = x->current >= 0 && !x->idle_shown && !x->dlg_mapped &&
+                !x->ui.open;
     uint32_t v;
 
-    if (!x->blank_cursor || hide == x->cursor_hidden) {
+    if (x->ui.open) {
+        return;                 /* the area editor owns the shape */
+    }
+    if (!x->blank_cursor || (hide == x->cursor_hidden && !x->cursor_dirty)) {
         return;                 /* idempotent: this runs on every frame */
     }
     x->cursor_hidden = hide;
+    x->cursor_dirty = false;
     v = hide ? x->blank_cursor : XCB_CURSOR_NONE;
     xcb_change_window_attributes(x->c, x->content, XCB_CW_CURSOR, &v);
     xcb_flush(x->c);
@@ -1933,6 +1992,10 @@ skip_dmabuf_extensions:
     x->a_utf8        = x11_atom(x->c, "UTF8_STRING");
     snprintf(x->title, sizeof x->title, "%s", cfg->title);
     x->scale_mode = cfg->scale_mode;
+    x->cfg = cfg;
+    nb_vstore_setup(&x->vst, cfg);
+    nb_ui_init(&x->ui, &x->vst);
+    x->ui_cur = -1;
 #ifdef NB_HAVE_XCB_RENDER
     {
         /* One depth-24 format is all the scaler needs; without it we simply
@@ -2502,10 +2565,12 @@ static int x11_tick_pace(struct nb_session *s);
  * transfer that stalls) used to leave the paste chord held and every later
  * fetch -EBUSY.  Same deadline as the Wayland backend, renewed on progress.
  */
+static int x11_tick_ui(struct nb_x11 *x, int next);
+
 static int x11_tick(struct nb_session *s)
 {
     struct nb_x11 *x = s->priv;
-    int next = x11_tick_pace(s);
+    int next = x11_tick_ui(x, x11_tick_pace(s));
     uint64_t now;
     int left;
 
@@ -2604,6 +2669,566 @@ static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
     x->clip_pending_len = 0;
 }
 
+
+/* ── display settings and the viewer's own UI ────────────────────────────── */
+/*
+ * The same model as the Wayland backend (nb_view.c, nb_ui.c); here the menu,
+ * the notice, the top-edge button and the area outline are child windows of
+ * the toplevel, painted opaque with PutImage when their state changes.  No
+ * ARGB visual and no compositor are needed, and with the menu closed none of
+ * them is mapped.  X11 has no per-window scale, so they are drawn at 1x.
+ */
+static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x)
+{
+    static struct nb_ui_env e;
+
+    e.win_w = x->win_w > 0 ? x->win_w : 1;
+    e.win_h = x->win_h > 0 ? x->win_h : 1;
+    e.s120 = 120;
+    e.buf_w = x->current >= 0 ? (int)x->bufs[x->current].w : 0;
+    e.buf_h = x->current >= 0 ? (int)x->bufs[x->current].h : 0;
+    e.stats_on = false;
+    e.fullscreen = x->fullscreen;
+#ifdef NB_HAVE_XCB_RENDER
+    e.nearest_ok = x->pict_fmt != 0;
+#else
+    e.nearest_ok = false;
+#endif
+    e.vm_actions = x->cfg && (x->cfg->vm_shutdown_cmd || x->cfg->vm_reboot_cmd);
+    e.translucent = false;
+    return &e;
+}
+
+static void x11_ui_cursors(struct nb_x11 *x)
+{
+    /* X core cursor-font glyphs: present on every X server. */
+    static const uint16_t glyph[NB_UI_CUR_COUNT] = {
+        [NB_UI_CUR_ARROW] = 68, [NB_UI_CUR_MOVE] = 52,
+        [NB_UI_CUR_N] = 138, [NB_UI_CUR_S] = 16, [NB_UI_CUR_W] = 70,
+        [NB_UI_CUR_E] = 96, [NB_UI_CUR_NW] = 134, [NB_UI_CUR_NE] = 136,
+        [NB_UI_CUR_SW] = 12, [NB_UI_CUR_SE] = 14, [NB_UI_CUR_TEXT] = 152,
+    };
+    xcb_font_t font;
+    int i;
+
+    if (x->ui_cursor[0]) {
+        return;
+    }
+    font = xcb_generate_id(x->c);
+    xcb_open_font(x->c, font, 6, "cursor");
+    for (i = 0; i < NB_UI_CUR_COUNT; i++) {
+        x->ui_cursor[i] = xcb_generate_id(x->c);
+        xcb_create_glyph_cursor(x->c, x->ui_cursor[i], font, font, glyph[i],
+                                (uint16_t)(glyph[i] + 1), 0, 0, 0,
+                                0xffff, 0xffff, 0xffff);
+    }
+    xcb_close_font(x->c, font);
+}
+
+static void x11_ui_cursor_apply(struct nb_x11 *x)
+{
+    int c = nb_ui_area_cursor(&x->ui);
+    uint32_t v;
+
+    x11_ui_cursors(x);
+    if (c < 0 || c >= NB_UI_CUR_COUNT) {
+        c = NB_UI_CUR_ARROW;
+    }
+    if (c == x->ui_cur) {
+        return;
+    }
+    x->ui_cur = c;
+    v = x->ui_cursor[c];
+    xcb_change_window_attributes(x->c, x->win, XCB_CW_CURSOR, &v);
+    xcb_change_window_attributes(x->c, x->content, XCB_CW_CURSOR, &v);
+}
+
+static void x11_layer_put(struct nb_x11 *x, struct nb_x11_layer *L)
+{
+    if (!x->idle_gc) {
+        x->idle_gc = xcb_generate_id(x->c);
+        xcb_create_gc(x->c, x->idle_gc, x->win, 0, NULL);
+    }
+    if (L->px) {
+        x11_blit(x, L->win, x->idle_gc, L->px, L->w, L->h);
+    }
+}
+
+/* Take ownership of px (w x h) and show it at (lx, ly). */
+static void x11_layer_show(struct nb_x11 *x, struct nb_x11_layer *L,
+                           uint32_t *px, int w, int h, int lx, int ly)
+{
+    uint32_t vals[5];
+
+    if (!L->win) {
+        uint32_t m = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+        uint32_t v[2] = { x->screen->black_pixel,
+                          XCB_EVENT_MASK_EXPOSURE |
+                          (L->input ? XCB_EVENT_MASK_BUTTON_PRESS |
+                                      XCB_EVENT_MASK_BUTTON_RELEASE |
+                                      XCB_EVENT_MASK_POINTER_MOTION |
+                                      XCB_EVENT_MASK_LEAVE_WINDOW : 0) };
+
+        L->win = xcb_generate_id(x->c);
+        xcb_create_window(x->c, XCB_COPY_FROM_PARENT, L->win, x->win, 0, 0,
+                          (uint16_t)w, (uint16_t)h, 0,
+                          XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                          x->screen->root_visual, m, v);
+        if (L->input) {
+            uint32_t cur;
+
+            x11_ui_cursors(x);
+            cur = x->ui_cursor[NB_UI_CUR_ARROW];
+            xcb_change_window_attributes(x->c, L->win, XCB_CW_CURSOR, &cur);
+        }
+    }
+    free(L->px);
+    L->px = px;
+    vals[0] = (uint32_t)lx;
+    vals[1] = (uint32_t)ly;
+    vals[2] = (uint32_t)w;
+    vals[3] = (uint32_t)h;
+    vals[4] = XCB_STACK_MODE_ABOVE;
+    xcb_configure_window(x->c, L->win,
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                         XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
+                         XCB_CONFIG_WINDOW_STACK_MODE, vals);
+    L->w = w;
+    L->h = h;
+    L->x = lx;
+    L->y = ly;
+    if (!L->mapped) {
+        xcb_map_window(x->c, L->win);
+        L->mapped = true;
+    }
+    x11_layer_put(x, L);
+}
+
+static void x11_layer_hide(struct nb_x11 *x, struct nb_x11_layer *L)
+{
+    if (L->win && L->mapped) {
+        xcb_unmap_window(x->c, L->win);
+    }
+    L->mapped = false;
+}
+
+static void x11_layer_expose(struct nb_x11 *x, xcb_window_t w)
+{
+    struct nb_x11_layer *ls[3] = { &x->ly_menu, &x->ly_note, &x->ly_btn };
+
+    for (int i = 0; i < 3; i++) {
+        if (ls[i]->win == w && ls[i]->mapped) {
+            x11_layer_put(x, ls[i]);
+        }
+    }
+}
+
+static void x11_note_paint(struct nb_x11 *x)
+{
+    int w, h;
+    uint32_t *px;
+
+    nb_ui_notice_size(x->note_txt, &w, &h);
+    px = calloc((size_t)w * (size_t)h, 4);
+    if (!px) {
+        return;
+    }
+    nb_ui_paint_notice(x->note_txt, 120, px, w, h, w, true);
+    x11_layer_show(x, &x->ly_note, px, w, h, (x->win_w - w) / 2,
+                   x->win_h > h + 48 ? 24 : 0);
+}
+
+static void x11_menu_paint(struct nb_x11 *x)
+{
+    const struct nb_ui_env *e = x11_ui_env(x);
+    struct nb_rect r;
+    int lw, lh;
+    uint32_t *px;
+
+    if (!x->ui.open) {
+        return;
+    }
+    x->ly_menu.input = true;
+    nb_ui_layout(&x->ui, e, &lw, &lh);
+    nb_ui_panel_rect(&x->ui, e, &r);
+    px = calloc((size_t)r.w * (size_t)r.h, 4);
+    if (!px) {
+        return;
+    }
+    nb_ui_paint_panel(&x->ui, e, px, r.w, r.h, r.w);
+    x11_layer_show(x, &x->ly_menu, px, r.w, r.h, r.x, r.y);
+}
+
+static void x11_btn_paint(struct nb_x11 *x)
+{
+    int w, h;
+    uint32_t *px;
+
+    if (x->btn_alpha <= 0.0) {
+        x11_layer_hide(x, &x->ly_btn);
+        return;
+    }
+    x->ly_btn.input = true;
+    nb_ui_button_size(&w, &h);
+    px = calloc((size_t)w * (size_t)h, 4);
+    if (!px) {
+        return;
+    }
+    nb_ui_paint_button(120, px, w, h, w, x->btn_alpha, x->btn_hot, true);
+    x11_layer_show(x, &x->ly_btn, px, w, h, (x->win_w - w) / 2, 4);
+}
+
+/* The output area's outline: eight children with a green background, so
+ * there is nothing to paint at all. */
+static void x11_ed_show(struct nb_x11 *x, bool on)
+{
+    const struct nb_rect *a = &x->place.area;
+    int i;
+
+    if (!on) {
+        if (x->ed_mapped) {
+            for (i = 0; i < 8; i++) {
+                xcb_unmap_window(x->c, x->ed[i]);
+            }
+            x->ed_mapped = false;
+        }
+        return;
+    }
+    if (!x->ed[0]) {
+        for (i = 0; i < 8; i++) {
+            uint32_t v = 0x3fb950;  /* TrueColor: the Conduit green */
+
+            x->ed[i] = xcb_generate_id(x->c);
+            xcb_create_window(x->c, XCB_COPY_FROM_PARENT, x->ed[i], x->win, 0,
+                              0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                              x->screen->root_visual, XCB_CW_BACK_PIXEL, &v);
+        }
+    }
+    if (x->ed_mapped && !memcmp(a, &x->ed_at, sizeof(*a))) {
+        return;
+    }
+    {
+        const int t = 2, c = 12;
+        const int r[8][4] = {
+            { a->x, a->y, a->w, t }, { a->x, a->y + a->h - t, a->w, t },
+            { a->x, a->y, t, a->h }, { a->x + a->w - t, a->y, t, a->h },
+            { a->x, a->y, c, c / 2 }, { a->x + a->w - c, a->y, c, c / 2 },
+            { a->x, a->y + a->h - c / 2, c, c / 2 },
+            { a->x + a->w - c, a->y + a->h - c / 2, c, c / 2 },
+        };
+
+        for (i = 0; i < 8; i++) {
+            uint32_t vals[5] = { (uint32_t)r[i][0], (uint32_t)r[i][1],
+                                 (uint32_t)(r[i][2] > 0 ? r[i][2] : 1),
+                                 (uint32_t)(r[i][3] > 0 ? r[i][3] : 1),
+                                 XCB_STACK_MODE_ABOVE };
+
+            xcb_configure_window(x->c, x->ed[i],
+                                 XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                                 XCB_CONFIG_WINDOW_WIDTH |
+                                 XCB_CONFIG_WINDOW_HEIGHT |
+                                 XCB_CONFIG_WINDOW_STACK_MODE, vals);
+            xcb_map_window(x->c, x->ed[i]);
+        }
+    }
+    x->ed_at = *a;
+    x->ed_mapped = true;
+    /* The menu stays above the outline. */
+    if (x->ly_menu.mapped) {
+        uint32_t st = XCB_STACK_MODE_ABOVE;
+
+        xcb_configure_window(x->c, x->ly_menu.win,
+                             XCB_CONFIG_WINDOW_STACK_MODE, &st);
+    }
+}
+
+/*
+ * Ask the guest for a mode: the fixed resolution, or the output area (the
+ * window, unless a smaller area was chosen).  Widths are aligned down to 8:
+ * the guest builds its mode with drm_cvt_mode(), whose granularity is 8, and
+ * an odd width came back skewed with a pitch mismatch.  Down, never up, so
+ * the suggestion still fits.
+ */
+static void x11_rehint(struct nb_x11 *x, bool force)
+{
+    unsigned hw, hh;
+
+    if (!x->sink || nb_res_mode == NB_RES_NONE) {
+        return;
+    }
+    nb_view_apply_res(&x->vst.cur);
+    if (nb_res_mode == NB_RES_FIXED) {
+        hw = nb_res_w;
+        hh = nb_res_h;
+    } else {
+        nb_view_guest_mode(&x->vst.cur, x->win_w, x->win_h, 120, &hw, &hh);
+        hw &= ~7u;
+    }
+    if (hw == 0 || hh == 0) {
+        return;
+    }
+    /* Idempotent: a re-mode the guest does not need is a visible flicker. */
+    if (!force && hw == x->hint_w && hh == x->hint_h) {
+        return;
+    }
+    x->hint_w = hw;
+    x->hint_h = hh;
+    nb_sink_surface(x->sink, hw, hh, 0 /* no refresh source */);
+}
+
+/* Re-place the picture after a settings or window change, and redraw the
+ * current frame there when it can be (a composite, or a 1:1 Present). */
+static void x11_relayout(struct nb_x11 *x)
+{
+    if (x->current >= 0 && x->bufs[x->current].valid) {
+        struct nb_x11_buf *sl = &x->bufs[x->current];
+
+        if (sl->map) {
+            x11_size_content(x, (int)sl->w, (int)sl->h);
+        } else {
+            /*
+             * Re-place it.  A composite is redrawn from the pixmap (it was
+             * only ever read); a Present is NOT re-issued, because that
+             * buffer's IdleNotify would release it to the guest a second
+             * time -- the next frame lands in the new place instead.
+             */
+            x11_place(x, (int)sl->w, (int)sl->h);
+#ifdef NB_HAVE_XCB_RENDER
+            if (x->place.pic.w != (int)sl->w || x->place.pic.h != (int)sl->h) {
+                x11_render_scaled(x, sl);
+            }
+#endif
+        }
+    }
+    if (x->ui.open) {
+        x11_ed_show(x, true);
+        x11_menu_paint(x);
+    }
+    if (x->note_until) {
+        x11_note_paint(x);
+    }
+    if (x->ly_btn.mapped) {
+        x11_btn_paint(x);
+    }
+    xcb_flush(x->c);
+}
+
+static void x11_menu_set(struct nb_x11 *x, bool open)
+{
+    if (open == x->ui.open) {
+        return;
+    }
+    if (open) {
+        if (x->sink) {
+            if (x->grabbed) {
+                nb_sink_force_ungrab(x->sink);
+            }
+            nb_sink_release_keys(x->sink);
+        }
+        x->btn_want = false;
+        x->btn_alpha = 0;
+        x11_layer_hide(x, &x->ly_btn);
+        nb_log("menu: open");
+    } else {
+        nb_log("menu: closed");
+    }
+    x11_ui_do(x, nb_ui_set_open(&x->ui, x11_ui_env(x), open));
+}
+
+static void x11_ui_do(struct nb_x11 *x, unsigned bits)
+{
+    if (bits & NB_UI_VIEW) {
+        x11_relayout(x);
+    }
+    if (bits & NB_UI_RES) {
+        x->rehint_pending = true;
+    }
+    if (x->rehint_pending && x->ui.drag < 0) {
+        x->rehint_pending = false;
+        x->rehint_due_ms = x11_now_ms() + 250;
+    }
+    if (bits & NB_UI_SAVE) {
+        nb_vstore_persist(&x->vst, x->cfg);
+    }
+    if (bits & NB_UI_STATS) {
+        nb_log("stats overlay: the X11 backend logs --stats instead");
+    }
+    if ((bits & NB_UI_FULLSCREEN) && x->sink) {
+        nb_sink_toggle_fullscreen(x->sink);
+    }
+    if ((bits & NB_UI_VM_SHUTDOWN) && x->cfg) {
+        nb_run_detached(x->cfg->vm_shutdown_cmd);
+    }
+    if ((bits & NB_UI_VM_REBOOT) && x->cfg) {
+        nb_run_detached(x->cfg->vm_reboot_cmd);
+    }
+    if ((bits & NB_UI_CLOSE) || !x->ui.open) {
+        x11_layer_hide(x, &x->ly_menu);
+        x11_ed_show(x, false);
+        if (x->ui_cur >= 0) {
+            uint32_t none = XCB_CURSOR_NONE;
+
+            x->ui_cur = -1;
+            xcb_change_window_attributes(x->c, x->win, XCB_CW_CURSOR, &none);
+            x->cursor_dirty = true;
+            x11_cursor_policy(x);
+        }
+    } else {
+        if (bits & (NB_UI_REDRAW | NB_UI_VIEW)) {
+            x11_menu_paint(x);
+        }
+        x11_ed_show(x, true);
+        x11_ui_cursor_apply(x);
+    }
+    if (bits & NB_UI_NOTICE) {
+        snprintf(x->note_txt, sizeof(x->note_txt), "%s", x->ui.notice);
+        x->note_until = x11_now_ms() + 1600;
+        x11_note_paint(x);
+    }
+    xcb_flush(x->c);
+}
+
+/*
+ * Pointer events for our own UI.  Returns true when the event was ours: over
+ * the menu or the button, or anywhere while the menu is open (the area
+ * editor).  `button` 0 is motion.
+ */
+static bool x11_ui_pointer(struct nb_x11 *x, xcb_window_t ev, int ex, int ey,
+                           int button, bool down, bool motion)
+{
+    const struct nb_ui_env *e = x11_ui_env(x);
+
+    if (x->ly_btn.mapped && ev == x->ly_btn.win) {
+        x->btn_seen_ms = x11_now_ms();
+        if (motion && !x->btn_hot) {
+            x->btn_hot = true;
+            x11_btn_paint(x);
+        } else if (!motion && button == 1 && !down) {
+            x11_menu_set(x, !x->ui.open);
+        }
+        xcb_flush(x->c);
+        return true;
+    }
+    if (x->ly_menu.mapped && ev == x->ly_menu.win) {
+        if (motion) {
+            x11_ui_do(x, nb_ui_panel_motion(&x->ui, e, ex, ey));
+        } else if (button == 1) {
+            x11_ui_do(x, nb_ui_panel_button(&x->ui, e, down));
+        } else if ((button == 4 || button == 5) && down) {
+            x11_ui_do(x, nb_ui_panel_wheel(&x->ui, e, button == 5 ? 1 : -1));
+        }
+        return true;
+    }
+    if (x->btn_hot) {
+        x->btn_hot = false;
+        if (x->ly_btn.mapped) {
+            x11_btn_paint(x);
+        }
+    }
+    if (ev == x->content) {
+        ex += x->con_x;
+        ey += x->con_y;
+    }
+    if (x->ui.open) {
+        if (motion) {
+            x11_ui_do(x, nb_ui_area_motion(&x->ui, e, ex, ey));
+        } else if (button == 1) {
+            x11_ui_do(x, nb_ui_area_button(&x->ui, e, down));
+        }
+        return true;
+    }
+    if (motion && !x->grabbed && ey < NB_UI_BUTTON_ZONE) {
+        x->btn_seen_ms = x11_now_ms();
+        x->btn_want = true;
+    }
+    return false;
+}
+
+static bool x11_hotkey(struct nb_session *s, unsigned code)
+{
+    struct nb_x11 *x = s->priv;
+    char label[64];
+    int ch;
+    unsigned bits = NB_UI_SAVE | NB_UI_NOTICE | NB_UI_REDRAW;
+
+    if (code == KEY_M) {
+        x11_menu_set(x, !x->ui.open);
+        return true;
+    }
+    ch = nb_view_hotkey(&x->vst, code, x->sink && x->sink->shift_down,
+                        x->win_w, x->win_h, 120, label, sizeof(label));
+    if (ch < 0) {
+        return false;           /* O, D: Wayland only; the guest gets them */
+    }
+    if (ch & NB_VIEW_CH_LAYOUT) {
+        bits |= NB_UI_VIEW;
+    }
+    if (ch & NB_VIEW_CH_RES) {
+        bits |= NB_UI_RES;
+    }
+    snprintf(x->ui.notice, sizeof(x->ui.notice), "%s", label);
+    nb_log("display: %s", label);
+    x11_ui_do(x, bits);
+    return true;
+}
+
+/* The clock half: the debounced re-hint, the notice, the button's fade. */
+static int x11_tick_ui(struct nb_x11 *x, int next)
+{
+    uint64_t now = x11_now_ms();
+    int due;
+
+#define X11_DUE(t) do {         due = (t) > now ? (int)((t) - now) : 0;         next = next < 0 || due < next ? due : next;     } while (0)
+    if (x->rehint_due_ms) {
+        if (now >= x->rehint_due_ms) {
+            x->rehint_due_ms = 0;
+            x11_rehint(x, true);
+        } else {
+            X11_DUE(x->rehint_due_ms);
+        }
+    }
+    if (x->note_until) {
+        if (now >= x->note_until) {
+            x->note_until = 0;
+            x11_layer_hide(x, &x->ly_note);
+            xcb_flush(x->c);
+        } else {
+            X11_DUE(x->note_until);
+        }
+    }
+    if (x->btn_want && (x->ui.open || x->grabbed ||
+                        now - x->btn_seen_ms > 900)) {
+        x->btn_want = false;
+    }
+    {
+        double target = x->btn_want ? 1.0 : 0.0;
+
+        if (x->btn_alpha != target) {
+            double dt = x->btn_last_ms && now > x->btn_last_ms
+                            ? (double)(now - x->btn_last_ms) : 16;
+
+            x->btn_alpha += (target > x->btn_alpha ? 1 : -1) * dt / 160.0;
+            if ((target > 0 && x->btn_alpha > 1.0) ||
+                (target == 0 && x->btn_alpha < 0.0)) {
+                x->btn_alpha = target;
+            }
+            x->btn_last_ms = now;
+            x11_btn_paint(x);
+            xcb_flush(x->c);
+            if (x->btn_alpha != target) {
+                X11_DUE(now + 16);
+            }
+        } else {
+            x->btn_last_ms = now;
+        }
+        if (x->btn_want) {
+            X11_DUE(x->btn_seen_ms + 901);
+        }
+    }
+#undef X11_DUE
+    return next;
+}
+
 static const struct nb_session_ops x11_ops = {
     .name = "x11",
     .open = x11_open,
@@ -2620,6 +3245,7 @@ static const struct nb_session_ops x11_ops = {
     .dismiss_dialog = x11_dismiss_dialog,
     .resync = x11_resync,
     .tick = x11_tick,
+    .hotkey = x11_hotkey,
     .notify_clipboard = x11_notify_clipboard,
     .set_clipboard = x11_set_clipboard,
     .fetch_clipboard = x11_fetch_clipboard,
