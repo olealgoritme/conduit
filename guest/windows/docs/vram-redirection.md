@@ -733,7 +733,7 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiSysWhy`, `GdiSysMsk` | why the last staging copy was refused (1 staging to staging, 2 the VRAM side's mapping, 3 channel down, else `ce_sysmem`'s fail word: 0x8003_00EA not system-resident, 0x8005_00EB uncovered, 0x8001_00E4 busy, ...), and every class seen (1, 2, 4 not system-resident, 8 uncovered, 16 busy, 32 RM unsure, 64 other, 128 channel down) |
 | `GdiUnrN`, `GdiUnrK`, `GdiUnrWH` | unreachable surfaces resolved; the last one's identity (`storage << 24 \| kind << 16 \| foreign layout << 8 \| foreign identity << 9 \| direct scanout << 10`; storage 0 UMD OPTIMAL image, 1 cross-context image, 2 standard buffer) and extent |
 | `GdiChUpUs`, `GdiSlowUs`, `GdiSlowOp` | the channel bring-up's time, outside every job's `GdiUs`; the slowest command's time and signature (`opcode \| engine << 4 \| dst class << 8 \| src class << 12 \| sub-rects << 16 \| over-1-MPixel << 24`) |
-| `GdiFgnN`, `GdiFgnCe`, `GdiFgnFail`, `GdiFgnWhy` | foreign NVK images resolved (`SurfaceClass::Foreign`: UMD optimal image with an RM identity); copies from them done on the copy engine; failed (dropped: the image has no CPU view); the last failing step (1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view refused, 6 channel down, 7 memory, 8 destination class) |
+| `GdiFgnN`, `GdiFgnCe`, `GdiFgnFail`, `GdiFgnWhy` | foreign NVK images resolved (`SurfaceClass::Foreign`: UMD optimal image with an RM identity); copies from them done on the copy engine; failed on the copy engine (the command then runs on the CPU, through the bounce buffer); the last failing step (1 no source, 2 destination mapping, 3 submit, 4 wait, 5 staging view refused, 6 channel down, 7 memory, 8 destination class) |
 | `GdiFgnDrop`, `GdiFgnOp` | commands dropped because a foreign image is in them other than as a SRCCOPY source (the plan's drop), and the last one's signature (`opcode \| foreign dst << 8 \| foreign src << 9 \| rop << 16`). Note `GdiFgnN` counts surface RESOLUTIONS (a command naming the image twice counts twice), not commands |
 | `GdiSysUs`, `GdiSysVwUs`, `GdiSysSubUs`, `GdiSysWtUs`, `GdiSysPx` | the slowest staging copy-engine command: total µs, the part until its views were resolved, until its last submit, the wait, its pixels |
 | `GdiSysK`, `GdiSysSWH`, `GdiSysDWH`, `GdiSysRes`, `GdiSysShape` | that command's surfaces: kinds (source `std type << 4 \| GDI type \| RM-backed << 8`, destination's << 16), extents (`w << 16 \| h`), resource ids (source \| destination << 16), shape (sub-rects \| same buffer << 16 \| covers the whole destination << 17 \| same extent << 18) |
@@ -849,8 +849,11 @@ BitBlt with one side a foreign image (and the other VRAM or a staging buffer) ra
 (`GdiFgnDrop`). Such commands, e.g. GDI text and fills on a GDI-compatible D3D surface (`GetDC`), now
 plan as `Why::Foreign` (14) and run on the CPU over windows of the image: `ce_vram::foreign_transfer`
 reads the window through the bounce buffer (R G B images reordered to B G R A), the CPU executor runs
-the command, and the window is written back the same way. No producer acquire, as GDI on a D3D surface
-on bare metal. `GdiOff` 0x1 turns these off with the copies, 0x20 the write-back.
+the command, and the window is written back the same way (a `copy_push`, whose destination may be the
+image's block-linear layout). A plain copy the copy engine cannot do, e.g. into a staging buffer that
+has no copy-engine view because it is not in guest system pages (`GdiFgnWhy` 5), runs on the CPU the
+same way. No producer acquire, as GDI on a D3D surface on bare metal. `GdiOff` 0x1 turns these off
+with the copies, 0x20 the write-back.
 
 **383.1, black wallpaper and Explorer list under G1:** the commands reach and write the textures
 (`GdiRes` lists res 23, 49, 53, 56 with 40/10/8/28 commands, no drops) and the self-check matches,

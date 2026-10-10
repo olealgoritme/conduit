@@ -926,7 +926,7 @@ fn op_signature(op: &Op) -> u32 {
 }
 
 /// A SRCCOPY BitBlt from a foreign NVK image into VRAM or a staging buffer, on the copy engine.
-/// There is no CPU fallback (the image has no CPU view): a failure drops the command.
+/// `false` (counted in `GdiFgnFail`, the step in `GdiFgnWhy`): the caller runs the CPU path.
 fn run_foreign(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
     let (Some(dst), Some(src), Cmd::BitBlt { src: sr, dst: dr, .. }) = (op.dst, op.srcs[0], op.cmd) else {
         return false;
@@ -976,7 +976,7 @@ fn run_foreign(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool
 }
 
 /// A SRCCOPY BitBlt INTO a foreign NVK image from VRAM or a staging buffer, on the copy engine
-/// (`ce_vram::foreign_write`). No CPU fallback: a failure drops the command.
+/// (`ce_vram::foreign_write`). `false`: the caller runs the CPU path.
 fn run_foreign_write(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) -> bool {
     let (Some(dst), Some(src), Cmd::BitBlt { src: sr, dst: dr, .. }) = (op.dst, op.srcs[0], op.cmd) else {
         return false;
@@ -1200,17 +1200,21 @@ fn execute(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
 
 fn execute_inner(passive: PassiveLevel, adapter: &AdapterContext, op: &Op) {
     let fgn_copy = ga::is_foreign_copy(&op.cmd, op.dst.as_ref(), op.srcs[0].as_ref());
+    // A plain copy to or from a foreign NVK image: one copy-engine copy between the image and the
+    // other surface. When the copy engine cannot reach the other surface (a staging buffer outside
+    // guest system pages has no copy-engine view), the CPU path does the copy: it moves the image's
+    // side through the bounce buffer (`read_window` / `write_window`).
     if fgn_copy && op.engine != Engine::Drop && op.dst.is_some_and(|d| d.class == SurfaceClass::Foreign) {
         if !run_foreign_write(passive, adapter, op) {
             crate::ddi::gdi_accel::note_why(Why::CeFailed);
-            crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
+            run_cpu_counted(passive, adapter, op);
         }
         return;
     }
     if fgn_copy && op.engine != Engine::Drop && op.srcs[0].is_some_and(|s| s.class == SurfaceClass::Foreign) {
         if !run_foreign(passive, adapter, op) {
             crate::ddi::gdi_accel::note_why(Why::CeFailed);
-            crate::ddi::gdi_accel::DROP.fetch_add(1, Ordering::Relaxed);
+            run_cpu_counted(passive, adapter, op);
         }
         return;
     }
