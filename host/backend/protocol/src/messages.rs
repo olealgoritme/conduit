@@ -969,7 +969,9 @@ pub struct DisplayModeListEntry {
 
 /// Size of a whole `DisplayModeList` message of `count` entries.
 pub const fn display_mode_list_message_len(count: usize) -> usize {
-    size_of::<MsgHeader>() + size_of::<DisplayModeListHeader>() + count * size_of::<DisplayModeListEntry>()
+    size_of::<MsgHeader>()
+        + size_of::<DisplayModeListHeader>()
+        + count * size_of::<DisplayModeListEntry>()
 }
 
 /// Encode one `DisplayModeList` message into `out`; `None` if `modes` is
@@ -1569,7 +1571,10 @@ mod tests {
         assert_eq!(MsgType::from_u32(34), Some(MsgType::DisplayModeList));
         let modes = [(5120, 1440), (1920, 1080)];
         let mut buf = [0u8; 64];
-        assert_eq!(encode_display_mode_list(&modes, 240_000, &mut buf), Some(48));
+        assert_eq!(
+            encode_display_mode_list(&modes, 240_000, &mut buf),
+            Some(48)
+        );
         let w = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
         assert_eq!(w(0), 34);
         assert_eq!((w(16), w(20), w(24), w(28)), (0, 2, 240_000, 0));

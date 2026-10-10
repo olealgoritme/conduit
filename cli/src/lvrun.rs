@@ -680,7 +680,8 @@ pub fn backend_exec(name: &str) -> Result<()> {
         // The VM's custom modes (`conduit display`), for a backend that
         // knows the flag: an older one would refuse to start over it.
         if run::backend_takes(&backend, "--display-modes") {
-            cmd.arg("--display-modes").arg(crate::display::modes_file(name));
+            cmd.arg("--display-modes")
+                .arg(crate::display::modes_file(name));
         }
     }
     let level = std::env::var("RUST_LOG").unwrap_or_else(|_| {

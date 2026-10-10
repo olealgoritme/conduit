@@ -94,9 +94,7 @@ impl core::error::Error for ModeError {}
 /// at the native rate.
 pub fn parse_wxh(s: &str) -> Result<(u32, u32), ModeError> {
     let s = s.trim();
-    let (a, b) = s
-        .split_once(['x', 'X', '*'])
-        .ok_or(ModeError::Syntax)?;
+    let (a, b) = s.split_once(['x', 'X', '*']).ok_or(ModeError::Syntax)?;
     let num = |t: &str| -> Result<u32, ModeError> {
         let t = t.trim();
         if t.is_empty() || !t.bytes().all(|c| c.is_ascii_digit()) {
@@ -201,7 +199,11 @@ pub fn mode_list(native: (u32, u32), custom: &[(u32, u32)]) -> Vec<ModeEntry> {
     }
     let n_custom = rest.len();
     for &(w, h) in STANDARD_MODES {
-        if w <= nw && h <= nh && (w, h) != native && !rest.iter().any(|e| (e.width, e.height) == (w, h)) {
+        if w <= nw
+            && h <= nh
+            && (w, h) != native
+            && !rest.iter().any(|e| (e.width, e.height) == (w, h))
+        {
             rest.push(ModeEntry {
                 width: w,
                 height: h,
@@ -287,7 +289,15 @@ mod tests {
     #[test]
     fn native_first_then_standard_modes_that_fit_by_area() {
         let l = mode_list((1920, 1080), &[]);
-        assert_eq!(l[0], ModeEntry { width: 1920, height: 1080, native: true, custom: false });
+        assert_eq!(
+            l[0],
+            ModeEntry {
+                width: 1920,
+                height: 1080,
+                native: true,
+                custom: false
+            }
+        );
         assert!(l[1..].iter().all(|e| !e.native && !e.custom));
         assert!(l.iter().all(|e| e.width <= 1920 && e.height <= 1080));
         // 1920x1200 and 1600x1200 do not fit in 1080 lines.
@@ -309,7 +319,14 @@ mod tests {
     fn an_ultrawide_native_offers_the_ultrawide_and_16_9_modes() {
         let l = sizes(&mode_list((5120, 1440), &[]));
         assert_eq!(l[0], (5120, 1440));
-        for m in [(3840, 1080), (3440, 1440), (2560, 1440), (1920, 1080), (1280, 960), (640, 480)] {
+        for m in [
+            (3840, 1080),
+            (3440, 1440),
+            (2560, 1440),
+            (1920, 1080),
+            (1280, 960),
+            (640, 480),
+        ] {
             assert!(l.contains(&m), "{m:?}");
         }
         assert!(!l.contains(&(3840, 2160)));
@@ -317,7 +334,10 @@ mod tests {
 
     #[test]
     fn custom_modes_join_whatever_their_size() {
-        let l = mode_list((1920, 1080), &[(1280, 960), (2560, 1440), (1920, 1080), (1024, 768)]);
+        let l = mode_list(
+            (1920, 1080),
+            &[(1280, 960), (2560, 1440), (1920, 1080), (1024, 768)],
+        );
         let s = sizes(&l);
         assert_eq!(s[0], (1920, 1080));
         assert!(l[0].custom, "native also listed as custom stays removable");

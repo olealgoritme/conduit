@@ -267,7 +267,8 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
             .arg("--display-socket")
             .arg(rt.stream_sock());
         if backend_takes(backend, "--display-modes") {
-            cmd.arg("--display-modes").arg(crate::display::modes_file(&c.name));
+            cmd.arg("--display-modes")
+                .arg(crate::display::modes_file(&c.name));
         }
     }
     let level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
