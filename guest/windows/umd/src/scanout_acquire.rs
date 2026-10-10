@@ -579,9 +579,10 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
             Ok(HELIOS_SCANOUT_ACQ_OK) => event_registered = true,
             Ok(HELIOS_SCANOUT_ACQ_TABLE_FULL) => {
                 // Counted KMD-side (AqRgF). The signaler runs timeout-only —
-                // correct, just up to 10 ms later per retirement.
+                // correct, just up to 1 ms later per retirement (the DXVK
+                // signaler polls every 1 ms without an event).
                 log_error!(
-                    "scanout-acquire: event table FULL — signaler falls back to 10 ms polling"
+                    "scanout-acquire: event table FULL — signaler falls back to 1 ms polling"
                 );
             }
             Ok(state) => {
@@ -595,7 +596,7 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
             }
         }
     } else {
-        log_error!("scanout-acquire: CreateEventW failed — signaler falls back to 10 ms polling");
+        log_error!("scanout-acquire: CreateEventW failed — signaler falls back to 1 ms polling");
     }
 
     reg.push(DeviceEntry {
