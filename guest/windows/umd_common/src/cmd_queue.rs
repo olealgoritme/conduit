@@ -67,7 +67,11 @@ const BATCH: u32 = 16;
 /// Park timeouts: the first park after work is short (backstop against a
 /// wake the producer's relaxed check missed), later ones are long.
 const PARK_SHORT: Duration = Duration::from_millis(1);
+const PARK_MID: Duration = Duration::from_millis(4);
 const PARK_LONG: Duration = Duration::from_millis(50);
+/// Consecutive idle parks before the worker parks for [`PARK_LONG`] (about a
+/// quarter second of idleness at [`PARK_MID`]).
+const PARKS_BEFORE_LONG: u32 = 64;
 
 unsafe fn call_closure<F: FnOnce(&[u8])>(closure: *mut u8, extra: *const u8, extra_len: usize) {
     // SAFETY: `closure` points at an `F` written by `push` and read exactly
@@ -437,6 +441,13 @@ impl CmdQueue {
         self.kick();
     }
 
+    /// Run, on the calling thread, the queued destructions the worker has
+    /// already passed (callers that must not overtake them, e.g. a resource
+    /// destroy that follows destroys of its views).
+    pub fn run_ready_retired(&self) {
+        self.run_retired(false);
+    }
+
     fn run_retired(&self, all: bool) {
         if !self.retire_pending.load(Ordering::Acquire) {
             return;
@@ -510,7 +521,13 @@ impl CmdQueue {
         if let Some(h) = handle {
             let _ = h.join();
         }
-        // Worker never started, or exited: run what is left here.
+        // Worker never started, or exited: run what is left here. (Normally
+        // nothing: the worker empties the ring before it exits and pushes
+        // fail once `stop` is set.)
+        //
+        // ⚠ The join above would hang if this ran under the loader lock
+        // outside process exit (a FreeLibrary teardown): the exiting worker
+        // needs that lock. DestroyDevice is not called from DllMain.
         // SAFETY: nothing else consumes the ring once the worker has exited.
         while unsafe { self.run_one() } {}
         self.run_retired(true);
@@ -582,7 +599,7 @@ impl CmdQueue {
     fn worker_main(self: Arc<Self>) {
         CURRENT_WORKER.with(|c| c.set(Arc::as_ptr(&self) as usize));
         let mut since_check = 0u32;
-        let mut park_short = true;
+        let mut idle_parks = 0u32;
         loop {
             // SAFETY: this is the only consumer.
             if unsafe { self.run_one() } {
@@ -592,7 +609,7 @@ impl CmdQueue {
                     since_check = 0;
                     self.after_batch();
                 }
-                park_short = true;
+                idle_parks = 0;
                 continue;
             }
             self.stats.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
@@ -617,8 +634,12 @@ impl CmdQueue {
                 continue;
             }
             self.stats.parks.fetch_add(1, Ordering::Relaxed);
-            std::thread::park_timeout(if park_short { PARK_SHORT } else { PARK_LONG });
-            park_short = false;
+            std::thread::park_timeout(match idle_parks {
+                0 => PARK_SHORT,
+                n if n < PARKS_BEFORE_LONG => PARK_MID,
+                _ => PARK_LONG,
+            });
+            idle_parks = idle_parks.saturating_add(1);
             self.sleeping.0.store(false, Ordering::Relaxed);
         }
         // SAFETY: still the only consumer.

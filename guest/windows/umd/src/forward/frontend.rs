@@ -225,6 +225,20 @@ impl Frontend {
         }
     }
 
+    /// [`sync`](Self::sync), then report a removal the worker hit while
+    /// draining. Returns true when the device is removed (the caller then
+    /// fails the call, e.g. a Map returns no mapping).
+    #[inline(always)]
+    unsafe fn sync_enter(&self, h: Hdevice, reason: SyncReason) -> bool {
+        unsafe {
+            if self.enter(h) {
+                return true;
+            }
+            self.sync(reason);
+            self.enter(h)
+        }
+    }
+
     /// The safety net in `d3d11_context`: an app-thread path reached the
     /// immediate context while records are queued.
     #[inline(always)]
@@ -1124,6 +1138,7 @@ unsafe fn query_hint(fe: &Frontend, h: Hdevice, q: ddi::D3D10DDI_HQUERY) {
         let w = snap(q);
         let pos = fe.record0(move |_| query_flush_hint(h, w));
         set_query_hint_pos(q, pos);
+        fe.q.kick();
     }
 }
 
@@ -1229,7 +1244,10 @@ unsafe extern "system" fn fe_map_dynamic(
                 }
             }
         }
-        fe.sync(SyncReason::Map);
+        if fe.sync_enter(h, SyncReason::Map) {
+            write_mapped(mapped, 0, 0);
+            return;
+        }
         resource_map(h, res, sub, map_type, flags, mapped)
     }
 }
@@ -1259,13 +1277,10 @@ unsafe extern "system" fn fe_map_sync(
     mapped: *mut ddi::D3D10DDI_MAPPED_SUBRESOURCE,
 ) {
     if let Some(fe) = unsafe { fe_of(h) } {
-        unsafe {
-            if fe.enter(h) {
-                write_mapped(mapped, 0, 0);
-                return;
-            }
+        if unsafe { fe.sync_enter(h, SyncReason::Map) } {
+            unsafe { write_mapped(mapped, 0, 0) };
+            return;
         }
-        fe.sync(SyncReason::Map);
     }
     unsafe { resource_map(h, res, sub, map_type, flags, mapped) }
 }
@@ -1282,14 +1297,13 @@ unsafe extern "system" fn fe_unmap_dynamic(h: Hdevice, res: ddi::D3D10DDI_HRESOU
             return;
         }
     }
-    fe.sync(SyncReason::Unmap);
+    unsafe { fe.sync_enter(h, SyncReason::Unmap) };
     unsafe { resource_unmap(h, res, sub) }
 }
 
 unsafe extern "system" fn fe_unmap_sync(h: Hdevice, res: ddi::D3D10DDI_HRESOURCE, sub: u32) {
     if let Some(fe) = unsafe { fe_of(h) } {
-        unsafe { fe.enter(h) };
-        fe.sync(SyncReason::Unmap);
+        unsafe { fe.sync_enter(h, SyncReason::Unmap) };
     }
     unsafe { resource_unmap(h, res, sub) }
 }
@@ -1394,6 +1408,12 @@ unsafe fn fe_flush_common(fe: &Frontend, h: Hdevice) {
                 context.Flush();
             }
         });
+        // A Flush is often followed by a wait outside the D3D11 API; make sure
+        // a parked worker is not missed by `push`'s cheap wake check.
+        fe.q.kick();
+        // Unlike the inline path, this retry no longer runs after DXVK's
+        // flush; it only re-attempts the scan-out event registration and is
+        // retried at every flush and present.
         super::present::retry_scanout_event(h);
     }
 }
@@ -1434,8 +1454,7 @@ macro_rules! sync_ddi {
         #[allow(clippy::too_many_arguments)]
         unsafe extern "system" fn $name(h: Hdevice $(, $a: $t)*) $(-> $r)? {
             if let Some(fe) = unsafe { fe_of(h) } {
-                unsafe { fe.enter(h) };
-                fe.sync(SyncReason::$reason);
+                unsafe { fe.sync_enter(h, SyncReason::$reason) };
             }
             unsafe { $orig(h $(, $a)*) }
         }
@@ -1456,6 +1475,9 @@ unsafe extern "system" fn fe_destroy_resource(h: Hdevice, res: ddi::D3D10DDI_HRE
         if fe.q.wait_done(fe.q.written()) {
             fe.stats.sync_waited[i].fetch_add(1, Ordering::Relaxed);
         }
+        // Destroys of this resource's views queued before it must not be
+        // overtaken (the worker runs them only at its next batch boundary).
+        fe.q.run_ready_retired();
     }
     unsafe { destroy_resource(h, res) }
 }
@@ -1514,8 +1536,7 @@ macro_rules! sync_dxgi {
             if !arg.is_null() {
                 let h = unsafe { dxgi_device_handle((*arg).hDevice) };
                 if let Some(fe) = unsafe { fe_of(h) } {
-                    unsafe { fe.enter(h) };
-                    fe.sync(SyncReason::Dxgi);
+                    unsafe { fe.sync_enter(h, SyncReason::Dxgi) };
                 }
             }
             unsafe { $orig(arg) }
@@ -1547,6 +1568,9 @@ sync_dxgi!(fe_dxgi_present_mpo1 => dxgi_present_mpo1, DXGI1_6_1_DDI_ARG_PRESENTM
 /// [`frontend_install_11_1`] on >= 11.1 tables, exactly as `install_11_1`
 /// overwrites `install`.
 pub(crate) unsafe fn frontend_install_11_0(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        return;
+    }
     let f = unsafe { &mut *funcs };
     // Deferred.
     f.pfnDraw = Some(fe_draw);
@@ -1649,6 +1673,9 @@ pub(crate) unsafe fn frontend_install_11_0(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS
 }
 
 pub(crate) unsafe fn frontend_install_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        return;
+    }
     unsafe { frontend_install_11_0(funcs.cast()) };
     let f = unsafe { &mut *funcs };
     f.pfnVsSetConstantBuffers = Some(fe_vs_set_constant_buffers1);
@@ -1668,12 +1695,18 @@ pub(crate) unsafe fn frontend_install_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUN
 }
 
 pub(crate) unsafe fn frontend_install_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        return;
+    }
     // The tiled-resource and marker slots reach the context only through
     // `d3d11_context`, whose ordering drain covers them.
     unsafe { frontend_install_11_1(funcs.cast()) };
 }
 
 pub(crate) unsafe fn frontend_install_wddm2_3(funcs: *mut ddi::D3DWDDM2_2DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        return;
+    }
     unsafe { frontend_install_wddm1_3(funcs.cast()) };
     let f = unsafe { &mut *funcs };
     f.pfnFlush = Some(fe_flush_wddm2_0);
@@ -1682,6 +1715,9 @@ pub(crate) unsafe fn frontend_install_wddm2_3(funcs: *mut ddi::D3DWDDM2_2DDI_DEV
 }
 
 pub(crate) unsafe fn frontend_install_dxgi(funcs: *mut ddi::DXGI_DDI_BASE_FUNCTIONS) {
+    if funcs.is_null() {
+        return;
+    }
     let f = unsafe { &mut *funcs };
     f.pfnPresent = Some(fe_dxgi_present);
     f.pfnSetDisplayMode = Some(fe_dxgi_set_display_mode);
@@ -1690,12 +1726,18 @@ pub(crate) unsafe fn frontend_install_dxgi(funcs: *mut ddi::DXGI_DDI_BASE_FUNCTI
 }
 
 pub(crate) unsafe fn frontend_install_dxgi_1_1(funcs: *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS) {
+    if funcs.is_null() {
+        return;
+    }
     unsafe { frontend_install_dxgi(funcs.cast()) };
     let f = unsafe { &mut *funcs };
     f.pfnResolveSharedResource = Some(fe_dxgi_resolve_shared_resource);
 }
 
 pub(crate) unsafe fn frontend_install_dxgi_1_3(funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
+    if funcs.is_null() {
+        return;
+    }
     unsafe { frontend_install_dxgi_1_1(funcs.cast()) };
     let f = unsafe { &mut *funcs };
     f.pfnBlt1 = Some(fe_dxgi_blt1);
@@ -1706,6 +1748,9 @@ pub(crate) unsafe fn frontend_install_dxgi_1_3(funcs: *mut ddi::DXGI1_3_DDI_BASE
 }
 
 pub(crate) unsafe fn frontend_install_dxgi_1_6_1(funcs: *mut ddi::DXGI1_6_1_DDI_BASE_FUNCTIONS) {
+    if funcs.is_null() {
+        return;
+    }
     unsafe { frontend_install_dxgi_1_1(funcs.cast()) };
     let f = unsafe { &mut *funcs };
     f.pfnBlt1 = Some(fe_dxgi_blt1);

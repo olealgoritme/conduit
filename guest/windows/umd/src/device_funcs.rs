@@ -1036,13 +1036,12 @@ pub(crate) unsafe extern "system" fn ddi_destroy_device(h_device: ddi::D3D10DDI_
     log_error!("DDI: DestroyDevice");
     // The threaded front end first: drain, run its queued destructions and
     // stop its worker while the device is fully alive.
-    {
-        let dev = &mut *(h_device.pDrvPrivate as *mut HeliosDevice);
-        if let Some(fe) = dev.frontend.as_ref() {
-            fe.shutdown();
-        }
-        dev.frontend = None;
+    // Shut down through a shared reference: the worker still reads the device
+    // until the join inside `shutdown`.
+    if let Some(fe) = (*(h_device.pDrvPrivate as *const HeliosDevice)).frontend.as_ref() {
+        fe.shutdown();
     }
+    (*(h_device.pDrvPrivate as *mut HeliosDevice)).frontend = None;
     // R911: the nine refusal counters, once per device teardown. Process-global
     // rather than per-device, so this is a running total; the point is that
     // they are READ at all, which the T5 scan-out counters were not.

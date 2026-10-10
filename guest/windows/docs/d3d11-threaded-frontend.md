@@ -102,6 +102,10 @@ Every immediate-context entry point is in exactly one class.
 | **synchronous** | `drain()`, then the unchanged forward call on the app thread | `Map` of everything else (staging, `READ`, `WRITE`, textures), texture `UpdateSubresourceUP`, the DXGI DDIs that order against rendering (`Present`, `Present1`, MPO presents, `Blt`, `Blt1`, `RotateResourceIdentities`, `SetDisplayMode`, `ResolveSharedResource`, offer/reclaim), `Flush` with shared resources, `Discard` of a buffer, `AcquireResource/ReleaseResource`, `CommandListExecute` (phase 1), resource destruction (waits for the worker, then runs on the calling thread); tiled-resource DDIs, markers and video DDIs through the safety net |
 | **device-level** | unchanged, inline, concurrent with the worker | `Create*`, `Open*`, `Calc*`, `Check*`, `RetrieveSubObject`, `RelocateDeviceFuncs`, the free-threaded `RecycleDestroyCommandList` / `RecycleCreate*`, the caps-only DXGI DDIs |
 
+"Synchronous" means the ring is drained, not that the worker is idle: it may still be running queued destructions,
+whose bodies are free-threaded safe (cache mutex, atomics). A resource destroy runs the destructions the worker has
+passed on its own thread first, so a view is never destroyed after its resource.
+
 Device-level calls already run concurrently with the immediate context under `UmdFreeThreaded` (FREETHREADED caps),
 so their thread-safety is not new. Moving immediate-context work from the app thread to the worker does not change
 which data is shared between threads, only which thread does the immediate-context side.
