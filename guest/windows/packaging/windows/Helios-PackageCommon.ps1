@@ -361,3 +361,64 @@ function Get-HeliosPackagePublisher($Package) {
     }
     return "Helios Project"
 }
+
+# Deletes a file, or when it is in use (a DLL Explorer has loaded, an exe
+# still running) has Windows delete it at the next restart. True when it is
+# gone now.
+function Remove-HeliosFileOrScheduleAtReboot([Parameter(Mandatory)][string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    try {
+        Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop
+        return $true
+    } catch {
+        if (-not ("HeliosNative.MoveFile" -as [type])) {
+            Add-Type -Namespace HeliosNative -Name MoveFile -MemberDefinition @"
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool MoveFileExW(string existing, string replacement, int flags);
+"@
+        }
+        # MOVEFILE_DELAY_UNTIL_REBOOT; a folder is removed then too once empty.
+        $items = @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName })
+        $items += @(Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory -ErrorAction SilentlyContinue |
+            Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { $_.FullName })
+        $items += $Path
+        foreach ($item in $items) {
+            if (Test-Path -LiteralPath $item) {
+                # [NullString]: a plain $null would arrive as "" (not NULL).
+                if (-not [HeliosNative.MoveFile]::MoveFileExW($item, [NullString]::Value, 4)) {
+                    Write-Warning ("Could not schedule {0} for removal (error {1})." -f $item, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+                }
+            }
+        }
+        Write-Warning "$Path is in use; Windows removes it at the next restart."
+        return $false
+    }
+}
+
+# C:\ProgramData\Conduit holds the logs the elevated tray and the SYSTEM mount
+# task write: administrators and SYSTEM may change it, users may read it.
+# Mount-ConduitShares.ps1 applies the same rules at every start.
+function Protect-ConduitDataDirectory([string]$Dir = (Join-Path $env:ProgramData "Conduit")) {
+    $dir = $Dir
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $item = Get-Item -LiteralPath $dir -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$dir is a link; remove it and run the installer again."
+    }
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]"S-1-5-32-544")
+    $acl.SetAccessRuleProtection($true, $false)
+    $inherit = [Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"
+    foreach ($rule in @(
+        @("S-1-5-18", "FullControl"),
+        @("S-1-5-32-544", "FullControl"),
+        @("S-1-5-32-545", "ReadAndExecute")
+    )) {
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]$rule[0], $rule[1], $inherit, "None", "Allow")))
+    }
+    Set-Acl -LiteralPath $dir -AclObject $acl
+    # What is already inside takes the folder's rules (links are not followed).
+    & (Join-Path $env:SystemRoot "System32\icacls.exe") (Join-Path $dir "*") /reset /T /L /C /Q | Out-Null
+}

@@ -4,7 +4,8 @@
 //!
 //! Also the copy behind the Windows 11 context menu's "Send to Conduit host"
 //! (conduit_shell_menu.dll, which starts this exe with `--send-list <file>`)
-//! and behind drops on the popup.
+//! and behind drops on the popup (the elevated tray starts the same
+//! `--send-list` copy with the user's normal token).
 
 use crate::gfx::wide;
 use std::ffi::c_void;
@@ -140,42 +141,95 @@ pub fn sync(target: Option<&str>, icon_exe: &str) {
     }
 }
 
-/// Copy `files` into the folder `dest` ("Z:\\") with Explorer's copy dialog
-/// (progress, name clash questions). False when it failed or was cancelled.
-pub fn copy_into(files: &[String], dest: &str) -> bool {
-    use windows_sys::Win32::UI::Shell::{
-        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FO_COPY, SHFILEOPSTRUCTW,
-    };
-    let from = gpu_tray::path_list(files);
-    let to = gpu_tray::path_list(&[dest.to_string()]);
-    let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
-    op.wFunc = FO_COPY;
-    op.pFrom = from.as_ptr();
-    op.pTo = to.as_ptr();
-    op.fFlags = (FOF_NOCONFIRMMKDIR | FOF_ALLOWUNDO) as u16;
-    let r = unsafe { SHFileOperationW(&mut op) };
-    r == 0 && op.fAnyOperationsAborted == 0
+/// How `--send-list` ended (its exit code).
+pub const SENT: u32 = 0;
+pub const STOPPED: u32 = 1;
+pub const NO_SHARE: u32 = 2;
+
+/// A shell item for a file system path. Paths past `MAX_PATH` that do not
+/// parse as they are are tried again with the `\\?\` prefix.
+unsafe fn shell_item(path: &[u16]) -> Option<windows::Win32::UI::Shell::IShellItem> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::SHCreateItemFromParsingName;
+    let mut w = path.to_vec();
+    w.push(0);
+    if let Ok(i) = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None) {
+        return Some(i);
+    }
+    let bs = b'\\' as u16;
+    if path.len() >= 260 && !path.starts_with(&[bs, bs]) {
+        let mut l: Vec<u16> = r"\\?\".encode_utf16().collect();
+        l.extend_from_slice(path);
+        l.push(0);
+        return SHCreateItemFromParsingName(PCWSTR(l.as_ptr()), None).ok();
+    }
+    None
 }
 
-/// `--send-list <file>`: copy the paths listed in `file` (one per line) into
-/// the default shared folder, then delete the list.
-pub fn send_list(file: &Path) {
+/// Copy `files` into the folder `dest` ("Z:\\") with Explorer's copy engine
+/// and dialog (progress, name clash questions; long paths work). False when
+/// it failed, was cancelled, or some item could not be found.
+pub fn copy_into(files: &[Vec<u16>], dest: &str) -> bool {
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    use windows::Win32::UI::Shell::{
+        FileOperation, IFileOperation, FOFX_ADDUNDORECORD, FOF_NOCONFIRMMKDIR,
+    };
+    let _com = crate::apps::ComGuard::new();
+    unsafe {
+        let Ok(op) = CoCreateInstance::<_, IFileOperation>(&FileOperation, None, CLSCTX_ALL) else {
+            return false;
+        };
+        let dest_w: Vec<u16> = dest.encode_utf16().collect();
+        let Some(to) = shell_item(&dest_w) else {
+            return false;
+        };
+        if op
+            .SetOperationFlags(FOF_NOCONFIRMMKDIR | FOFX_ADDUNDORECORD)
+            .is_err()
+        {
+            return false;
+        }
+        let mut all = true;
+        let mut any = false;
+        for f in files {
+            match shell_item(f) {
+                Some(item) if op.CopyItem(&item, &to, None, None).is_ok() => any = true,
+                _ => all = false,
+            }
+        }
+        if !any || op.PerformOperations().is_err() {
+            return false;
+        }
+        all && !op.GetAnyOperationsAborted().is_ok_and(|b| b.as_bool())
+    }
+}
+
+/// `--send-list <file>`: copy the paths listed in `file` (see
+/// `gpu_tray::policy::parse_send_list`) into the default shared folder. The
+/// list is deleted afterwards only when it is one of ours
+/// (`%TEMP%\conduit-send-*.txt`). The exit code is `SENT`, `STOPPED` or
+/// `NO_SHARE`.
+pub fn send_list(file: &Path) -> u32 {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
-    let text = std::fs::read_to_string(file).unwrap_or_default();
-    let _ = std::fs::remove_file(file);
-    let files: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
+    let bytes = std::fs::read(file).unwrap_or_default();
+    if gpu_tray::policy::send_list_deletable(
+        &file.to_string_lossy(),
+        &std::env::temp_dir().to_string_lossy(),
+    ) {
+        let _ = std::fs::remove_file(file);
+    }
+    let files = gpu_tray::policy::parse_send_list(&bytes);
     if files.is_empty() {
-        return;
+        return SENT;
     }
     let shares = crate::sys::mounted_shares();
     match gpu_tray::default_share(&shares) {
         Some(dest) => {
-            copy_into(&files, &dest.root());
+            if copy_into(&files, &dest.root()) {
+                SENT
+            } else {
+                STOPPED
+            }
         }
         None => unsafe {
             MessageBoxW(
@@ -184,6 +238,7 @@ pub fn send_list(file: &Path) {
                 wide("Conduit").as_ptr(),
                 MB_OK | MB_ICONWARNING,
             );
+            NO_SHARE
         },
     }
 }

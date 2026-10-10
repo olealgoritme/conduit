@@ -183,6 +183,23 @@ if ($TrayExe) {
     $trayOut = Join-Path $payload "tray\conduit-gpu-tray.exe"
     Copy-Required $TrayExe $trayOut
     Assert-HeliosPeArchitecture $trayOut x64
+    # The exe's icon (resource 1, build.rs) is what the tray, its windows and
+    # the context menu command show; a build without it must not ship.
+    Add-Type -Namespace ConduitPe -Name Res -MemberDefinition @"
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
+[DllImport("kernel32.dll")]
+public static extern bool FreeLibrary(IntPtr module);
+"@
+    $module = [ConduitPe.Res]::LoadLibraryExW($trayOut, [IntPtr]::Zero, 0x22) # LOAD_LIBRARY_AS_DATAFILE | AS_IMAGE_RESOURCE
+    if ($module -eq [IntPtr]::Zero) { throw "Cannot load $trayOut to check its resources." }
+    try {
+        if ([ConduitPe.Res]::FindResourceW($module, [IntPtr]1, [IntPtr]14) -eq [IntPtr]::Zero) { # RT_GROUP_ICON
+            throw "$trayOut has no icon resource 1 (build.rs could not compile res/app.rc)."
+        }
+    } finally { [void][ConduitPe.Res]::FreeLibrary($module) }
     if ($ShellMenuDll) {
         $shellMenuOut = Join-Path $payload "tray\conduit_shell_menu.dll"
         Copy-Required $ShellMenuDll $shellMenuOut

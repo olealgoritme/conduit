@@ -83,6 +83,10 @@ impl Backend for WinBackend {
     fn icon(&self, key: &str) -> Result<Vec<u8>, String> {
         apps::icon(key)
     }
+
+    fn as_user<R>(&self, f: impl FnOnce() -> R) -> Result<R, String> {
+        launch::as_user(f)
+    }
 }
 
 /// A manual-reset event.
@@ -277,7 +281,7 @@ fn connection(agent: &Arc<Agent<WinBackend>>, conn: Arc<Conn>, ended: &mut u32) 
 
 /// Appends one line to `%ProgramData%\Conduit\ctl.log` (restarted when it
 /// passes 64 KiB). Only state changes are logged, never requests.
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     use std::io::Write;
     let Some(dir) = std::env::var_os("ProgramData") else {
         return;

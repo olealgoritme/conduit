@@ -528,42 +528,62 @@ foreach ($extra in @("licenses", "compatibility")) {
 # rights (the VirtIO serial port it reads is admin-only) and no UAC prompt.
 $trayPayload = Join-Path $payloadRoot "tray\conduit-gpu-tray.exe"
 if (Test-Path -LiteralPath $trayPayload -PathType Leaf) {
+    $trayDir = Join-Path $env:ProgramFiles "Conduit"
+    $trayExe = Join-Path $trayDir "conduit-gpu-tray.exe"
+    $trayInstalled = $false
     try {
-        $trayDir = Join-Path $env:ProgramFiles "Conduit"
-        $trayExe = Join-Path $trayDir "conduit-gpu-tray.exe"
         Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
+        # Older tray versions registered the context menu package through
+        # PowerShell; a registration still running would race the new files.
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { [string]$_.CommandLine -like "*Conduit.ShellMenu*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         New-Item -ItemType Directory -Force -Path $trayDir | Out-Null
         Copy-Item -LiteralPath $trayPayload -Destination $trayExe -Force
-        # "Send to Conduit host" in Explorer's Windows 11 context menu: the
-        # command's DLL and the sparse package that registers it, signed with
-        # this package's certificate (trusted above). The tray app registers
-        # the package for each user when it starts (Add-AppxPackage
-        # -ExternalLocation $trayDir), so the logon task covers every user.
-        $menuDll = Join-Path $payloadRoot "tray\conduit_shell_menu.dll"
-        $menuMsix = Join-Path $payloadRoot "tray\ConduitShellMenu.msix"
-        if ((Test-Path -LiteralPath $menuDll -PathType Leaf) -and (Test-Path -LiteralPath $menuMsix -PathType Leaf)) {
-            $menuDllOut = Join-Path $trayDir "conduit_shell_menu.dll"
-            Get-ChildItem -LiteralPath $trayDir -Filter "conduit_shell_menu.dll.*.old" -File -ErrorAction SilentlyContinue |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-            try {
-                Copy-Item -LiteralPath $menuDll -Destination $menuDllOut -Force
-            } catch {
-                # Explorer keeps the loaded DLL open; a loaded DLL can still be renamed.
-                Rename-Item -LiteralPath $menuDllOut -NewName ("conduit_shell_menu.dll.{0}.old" -f [DateTime]::UtcNow.Ticks) -Force
-                Copy-Item -LiteralPath $menuDll -Destination $menuDllOut -Force
-            }
-            Copy-Item -LiteralPath $menuMsix -Destination (Join-Path $trayDir "ConduitShellMenu.msix") -Force
-        }
+        Protect-ConduitDataDirectory
         Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
         $action = New-ScheduledTaskAction -Execute $trayExe
         $trigger = New-ScheduledTaskTrigger -AtLogOn
         $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+        # Parallel: each user who logs on gets a copy, even while another
+        # user's copy runs (IgnoreNew would skip the second user).
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Parallel
         Register-ScheduledTask -TaskName "ConduitGpuTray" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-        Start-ScheduledTask -TaskName "ConduitGpuTray" -ErrorAction SilentlyContinue
-        Write-Host "Installed the Conduit GPU tray app at $trayExe (starts at logon)."
+        $trayInstalled = $true
     } catch {
         Write-Warning "The Conduit GPU tray app was not installed: $($_.Exception.Message)"
+    }
+    # "Send to Conduit host" in Explorer's Windows 11 context menu: the
+    # command's DLL and the sparse package that registers it, signed with this
+    # package's certificate (trusted above). The tray app registers the
+    # package for each user when it starts (with $trayDir as the package's
+    # external location), so the logon task covers every user. Optional: the
+    # tray works without it.
+    if ($trayInstalled) {
+        try {
+            $menuDll = Join-Path $payloadRoot "tray\conduit_shell_menu.dll"
+            $menuMsix = Join-Path $payloadRoot "tray\ConduitShellMenu.msix"
+            if ((Test-Path -LiteralPath $menuDll -PathType Leaf) -and (Test-Path -LiteralPath $menuMsix -PathType Leaf)) {
+                $menuDllOut = Join-Path $trayDir "conduit_shell_menu.dll"
+                Get-ChildItem -LiteralPath $trayDir -Filter "conduit_shell_menu.dll.*.old" -File -ErrorAction SilentlyContinue |
+                    ForEach-Object { [void](Remove-HeliosFileOrScheduleAtReboot $_.FullName) }
+                try {
+                    Copy-Item -LiteralPath $menuDll -Destination $menuDllOut -Force
+                } catch {
+                    # Explorer keeps the loaded DLL open; a loaded DLL can still
+                    # be renamed, and goes at the next restart.
+                    $old = Join-Path $trayDir ("conduit_shell_menu.dll.{0}.old" -f [DateTime]::UtcNow.Ticks)
+                    Rename-Item -LiteralPath $menuDllOut -NewName (Split-Path -Leaf $old) -Force
+                    Copy-Item -LiteralPath $menuDll -Destination $menuDllOut -Force
+                    [void](Remove-HeliosFileOrScheduleAtReboot $old)
+                }
+                Copy-Item -LiteralPath $menuMsix -Destination (Join-Path $trayDir "ConduitShellMenu.msix") -Force
+            }
+        } catch {
+            Write-Warning "The context menu command was not installed (the tray app was): $($_.Exception.Message)"
+        }
+        Start-ScheduledTask -TaskName "ConduitGpuTray" -ErrorAction SilentlyContinue
+        Write-Host "Installed the Conduit GPU tray app at $trayExe (starts at logon)."
     }
 }
 # Shared folders: WinFsp (from the package's winfsp MSI when missing) and the

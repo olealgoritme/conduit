@@ -51,7 +51,7 @@ every request separately, so one bad request cannot stop it.
 | `conduit run VM [--cwd DIR] [--env NAME=VALUE] [--start] [--no-view] -- CMD [ARGS...]` | Starts the program in the user's desktop session. `CMD` is whatever the guest's shell opens: a program, a document, a `.lnk` or `.desktop` file, a `steam://` URL. A running VM without a window gets one (`--no-view` skips that). A VM that is off is not started unless `--start` is given (then the command waits up to 4 minutes for the agent). Prints the process id. |
 | `conduit run VM --app NAME` | Resolves NAME against `conduit apps` (exact name ignoring case, else the start of a name, else part of one; several matches are listed) and starts it. |
 | `conduit apps VM [--json]` | The installed apps: name, where it was found, what `run` will start. |
-| `conduit cp SRC DST [--force]` | One side is `VM:PATH`. `conduit cp f.txt win11:` goes to the guest user's Downloads folder; `win11:C:\Temp\` (trailing separator or an existing folder) keeps the file name; a bare `win11:name.txt` goes to Downloads. A local path containing a colon needs `./` in front. Prints a progress line and checks size and SHA-256 at the end. On the host a received file has no name until it is complete (an unnamed `O_TMPFILE`, or a fresh `NAME.PID-N.conduit-part` where the filesystem lacks that), and is linked into place only when everything agrees; a guest that changes the size it announced, sends more than it announced, or trickles slower than about 1 MiB/s (plus a minute) is cut off, and a file bigger than the free space is refused up front. Without `--force` an existing file, even one that appears during the copy, is never replaced. Copies to the guest use `NAME.conduit-part` there the same way. Files only, up to 8 GiB; for folders and big trees use `conduit share`. |
+| `conduit cp SRC DST [--force]` | One side is `VM:PATH`. `conduit cp f.txt win11:` goes to the guest user's Downloads folder; `win11:C:\Temp\` (trailing separator or an existing folder) keeps the file name; a bare `win11:name.txt` goes to Downloads. A local path containing a colon needs `./` in front. Prints a progress line and checks size and SHA-256 at the end. On the host a received file has no name until it is complete (an unnamed `O_TMPFILE`, or a fresh `NAME.PID-N.conduit-part` where the filesystem lacks that), and is linked into place only when everything agrees; a guest that changes the size it announced, sends more than it announced, or trickles slower than about 1 MiB/s (plus a minute) is cut off, and a file bigger than the free space is refused up front. Without `--force` an existing file, even one that appears during the copy, is never replaced. Copies to the guest write a new temporary file there (`NAME.<n>.conduit-part` on Windows) and rename it the same way. Files only, up to 8 GiB; for folders and big trees use `conduit share`. |
 | `conduit app add VM NAME` | Writes `~/.local/share/applications/conduit-VM-SLUG.desktop` with the app's icon (fetched from the guest and saved under `~/.local/share/icons/conduit/` only if it is a PNG of at most 256x256 and 512 KiB). Its `Exec` is `conduit run VM --start --app NAME`, so the launcher also starts the VM. Errors from a launcher show as a desktop notification. |
 | `conduit app rm VM NAME` / `conduit app list VM` | Remove / list the VM's launchers. |
 
@@ -70,10 +70,11 @@ or not attached says so instead.
 
 The Conduit GPU tray app (`guest/windows/tools/conduit-gpu-tray`) serves the
 channel (`\\.\Global\org.conduit.ctl.0`); it is the app the installer already
-runs at logon. Programs start with the desktop shell's own, non-elevated token,
-so games and apps do not run as administrator, and file operations (`put`,
-`get`, `ls`) run as the logged-in user, so a copy reaches only what that user
-can. Apps are the Start Menu shortcuts of all users and of the
+runs at logon. It runs elevated (the serial port needs it) but starts programs
+with the desktop shell's own, non-elevated token, so games and apps do not run
+as administrator, and reads, writes and lists files (`cp`, `ls`) while
+impersonating that token, so the host reaches exactly the files the desktop
+user can. Apps are the Start Menu shortcuts of all users and of the
 current user plus Steam games (`libraryfolders.vdf`, `appmanifest_*.acf`, started
 as `steam://rungameid/ID`). The tray menu has a Recent launches submenu with the
 last eight programs; clicking one stops it (shortcuts, documents and `steam://` URLs are handed to the shell, so they have no process of Conduit's to list or stop).

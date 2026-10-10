@@ -14,6 +14,10 @@ Assert-HeliosAdministrator
 Write-HeliosProgress 5 "Preparing to remove Helios"
 $stateRoot = Join-Path $env:ProgramData "Helios"
 $statePath = Join-Path $stateRoot "install-state.json"
+# Checked before anything is touched: without the state nothing is removed.
+if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+    throw "No package-managed Helios installation was found at $statePath."
+}
 $resolveCompatibilityState = Join-Path $stateRoot "compatibility\DaVinci Resolve\install-state.json"
 if (Test-Path -LiteralPath $resolveCompatibilityState -PathType Leaf) {
     Write-Warning "DaVinci Resolve compatibility remains installed and has an independent rollback state."
@@ -21,6 +25,11 @@ if (Test-Path -LiteralPath $resolveCompatibilityState -PathType Leaf) {
 }
 Unregister-ScheduledTask -TaskName "HeliosGraphicsProvisioning" -Confirm:$false -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName "HeliosDisplayTopology" -Confirm:$false -ErrorAction SilentlyContinue
+
+# Conduit: the tray app, the context menu command and the shared folders.
+# Intentionally left in place: WinFsp and the VirtIO guest tools (other
+# software may use them; uninstall them from Settings > Apps if not), and the
+# host folders themselves (they live on the host).
 Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName "ConduitGpuTray" -Confirm:$false -ErrorAction SilentlyContinue
 Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -31,18 +40,32 @@ $profileDirs = @(Get-ChildItem -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT
 $profileDirs | Where-Object { $_ } | Sort-Object -Unique | ForEach-Object {
     Remove-Item -LiteralPath (Join-Path $_ "AppData\Roaming\Microsoft\Windows\SendTo\Conduit host.lnk") -Force -ErrorAction SilentlyContinue
 }
+# The mount loop first, so it cannot start virtiofs.exe again behind us.
+Stop-ScheduledTask -TaskName "ConduitShares" -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { [string]$_.CommandLine -like "*Mount-ConduitShares.ps1*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Unregister-ScheduledTask -TaskName "ConduitShares" -Confirm:$false -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name='virtiofs.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like "*conduit-*" } |
+    Where-Object { [string]$_.CommandLine -like "*conduit-*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+# The stock VirtIO-FS service's start mode, as it was before Conduit set it
+# to manual.
+$virtioFsStart = $null
+try { $virtioFsStart = [string](Get-ItemPropertyValue -LiteralPath "HKLM:\SOFTWARE\Conduit" -Name "VirtioFsSvcStartMode" -ErrorAction Stop) } catch { }
+if ($virtioFsStart -and (Get-Service -Name "VirtioFsSvc" -ErrorAction SilentlyContinue)) {
+    try { Set-Service -Name "VirtioFsSvc" -StartupType $virtioFsStart } catch {
+        Write-Warning "Could not set VirtioFsSvc back to $virtioFsStart start: $($_.Exception.Message)"
+    }
+}
 Remove-Item -LiteralPath "HKLM:\SOFTWARE\Conduit" -Recurse -Force -ErrorAction SilentlyContinue
 # The Windows 11 context menu's "Send to Conduit host" package, for every user.
 Get-AppxPackage -AllUsers -Name "Conduit.ShellMenu" -ErrorAction SilentlyContinue |
     Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath (Join-Path $env:ProgramFiles "Conduit") -Recurse -Force -ErrorAction SilentlyContinue
-if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
-    throw "No package-managed Helios installation was found at $statePath."
-}
+# Explorer may still hold conduit_shell_menu.dll (and older *.old copies):
+# whatever is in use goes at the next restart.
+[void](Remove-HeliosFileOrScheduleAtReboot (Join-Path $env:ProgramFiles "Conduit"))
+Remove-Item -LiteralPath (Join-Path $env:ProgramData "Conduit") -Recurse -Force -ErrorAction SilentlyContinue
 $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
 
 $vulkanRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"

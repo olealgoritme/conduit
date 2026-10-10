@@ -204,7 +204,11 @@ take the first device, so the installer sets it to manual start.
 
 The tray app lists the mounted folders under Shared folders in its menu (each
 opens in Explorer) and as Open default share, shows a Shared folders row in the
-popup, and copies files dropped on the popup into the default folder. Turn on
+popup, and copies files dropped on the popup into the default folder (in a
+helper started with the user's normal, non-elevated token). A drive letter
+counts as a share only while the volume on it is that share (virtiofs file
+system, the tag as its label). The mounts belong to SYSTEM, so every user of
+the VM sees the shared folders, with the same access to the host folders. Turn on
 Keep popup open in the menu to drag files onto it from Explorer. While the
 default folder (`Conduit`) has a drive letter, the tray app also keeps a
 shortcut `Conduit host.lnk` to its root in the user's SendTo folder, so
@@ -226,9 +230,11 @@ default folder with Explorer's copy dialog, as the Send To shortcut does. The
 msix is signed with the package certificate, and its publisher is that
 certificate's subject, so it installs because the installer trusts the
 certificate (`Root`, `TrustedPublisher`). Packages register per user: the tray
-app registers it when it starts (`Add-AppxPackage -Path ... -ExternalLocation
-...`, once per user and package file; the logon task covers every user), and
-`Uninstall-Helios.ps1` removes it for all users. To build it by hand on a
+app registers it when it starts (through the Windows package manager API with
+the install folder as the external location, once per user and package file;
+the logon task covers every user), and `Uninstall-Helios.ps1` removes it for
+all users. The command starts the tray exe without handing it any of the
+host process's handles. To build it by hand on a
 Windows machine with the SDK: `cargo build --release` in
 `tools/conduit-shell-menu`, then `New-ShellMenuPackage.ps1 -Publisher
 "CN=<signing certificate subject>" -Version <a.b.c.d> -OutFile
@@ -238,7 +244,7 @@ certificate.
 ## GPU stats tray
 
 **Conduit GPU** is a small tray app (`guest/windows/tools/conduit-gpu-tray`,
-built for `x86_64-pc-windows-gnu`, about 350 KB, no runtime) that shows the
+built for `x86_64-pc-windows-gnu`, under 1 MB, no runtime) that shows the
 host GPU's state inside the VM.
 
 **Data path.** `conduit attach` adds a virtio-serial channel,
@@ -263,8 +269,13 @@ register the task itself from its menu (Start with Windows).
 **Start at logon.** The VirtIO serial port is admin-only, so the app has to
 run elevated. The task `ConduitGpuTray` runs it at every logon with the
 highest privileges for members of `BUILTIN\Users`, which starts it elevated
-without a UAC prompt. Started by hand without administrator rights, the app
-relaunches itself through that task (one UAC prompt if the task is missing).
+without a UAC prompt for administrators, one copy per user session. Started by
+hand by an administrator without elevation, the app relaunches itself through
+that task (one UAC prompt if the task is missing) and exits once the elevated
+copy's window is up; if none shows within a few seconds it keeps running. A
+standard user's copy stays up and says the stats channel needs administrator
+rights. Start with Windows registers the task only for the exe in
+`Program Files\Conduit`.
 On Windows 11 the first run pins the tray icon next to the clock
 (`HKCU\Control Panel\NotifyIconSettings`, `IsPromoted`); hiding it afterwards
 sticks.

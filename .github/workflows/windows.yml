@@ -114,6 +114,12 @@ jobs:
       - name: Check registry snapshot preservation (Windows PowerShell)
         shell: powershell
         run: ./guest/windows/packaging/windows/Test-HeliosRegistrySnapshots.ps1
+      - name: Check the Conduit package scripts (PowerShell 7)
+        shell: pwsh
+        run: ./guest/windows/packaging/windows/Test-ConduitPackaging.ps1
+      - name: Check the Conduit package scripts (Windows PowerShell)
+        shell: powershell
+        run: ./guest/windows/packaging/windows/Test-ConduitPackaging.ps1
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -407,6 +413,12 @@ jobs:
       - name: Build the GPU tray app and its context menu command
         shell: pwsh
         run: |
+          # The exe's icon resource (build.rs) is compiled with the Windows
+          # SDK's rc.exe; CI=true makes a missing compiler a build error.
+          $rc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\rc.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $rc) { throw "rc.exe (Windows SDK) not found: the tray exe needs its icon resource" }
+          $env:RC = $rc.FullName
           cargo build --release --locked --manifest-path guest/windows/tools/conduit-gpu-tray/Cargo.toml
           cargo build --release --locked --manifest-path guest/windows/tools/conduit-shell-menu/Cargo.toml
       - name: Download WinFsp

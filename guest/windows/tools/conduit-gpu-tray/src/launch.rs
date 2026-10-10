@@ -34,6 +34,7 @@ use windows_sys::Win32::Storage::FileSystem::SearchPathW;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::JobObjects::*;
+use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
@@ -147,7 +148,7 @@ fn enable_impersonate_privilege() {
 }
 
 /// A primary copy of the desktop shell's (non-elevated) token.
-struct ShellToken(HANDLE);
+pub struct ShellToken(HANDLE);
 
 impl ShellToken {
     fn get() -> Result<ShellToken, String> {
@@ -240,6 +241,152 @@ fn find_on_path(name: &str, ext: &str) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf16_lossy(
         &buf[..len as usize],
     )))
+}
+
+/// The SID bytes of `token`'s user.
+fn token_user(token: HANDLE) -> Option<Vec<u8>> {
+    unsafe {
+        let mut n = 0u32;
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut n);
+        if n == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n as usize];
+        if GetTokenInformation(token, TokenUser, buf.as_mut_ptr() as *mut c_void, n, &mut n) == 0 {
+            return None;
+        }
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let sid = tu.User.Sid;
+        if IsValidSid(sid) == 0 {
+            return None;
+        }
+        let len = GetLengthSid(sid) as usize;
+        Some(std::slice::from_raw_parts(sid as *const u8, len).to_vec())
+    }
+}
+
+fn own_user() -> Option<Vec<u8>> {
+    unsafe {
+        let mut t: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut t) == 0 {
+            return None;
+        }
+        let u = token_user(t);
+        CloseHandle(t);
+        u
+    }
+}
+
+/// Runs `f` with the desktop user's normal token: the calling thread
+/// impersonates the shell's token for the call (only when this process is
+/// elevated; otherwise it already has the user's rights). Errors when there
+/// is no shell of this same user to take the token from; `f` does not run.
+pub fn as_user<R>(f: impl FnOnce() -> R) -> Result<R, String> {
+    if !token_elevated() {
+        return Ok(f());
+    }
+    let t = ShellToken::get()?;
+    match (token_user(t.0), own_user()) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => return Err("the desktop shell belongs to another user".into()),
+    }
+    if unsafe { ImpersonateLoggedOnUser(t.0) } == 0 {
+        return Err(format!("cannot take the user's token: {}", last_error()));
+    }
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            // Carrying on with the wrong token is never an option.
+            if unsafe { RevertToSelf() } == 0 {
+                std::process::abort();
+            }
+        }
+    }
+    let _revert = Revert;
+    Ok(f())
+}
+
+/// A started helper's process handle.
+pub struct Child(HANDLE);
+
+impl Child {
+    /// Waits for the process; its exit code.
+    pub fn wait(&self) -> Option<u32> {
+        unsafe {
+            WaitForSingleObject(self.0, INFINITE);
+            let mut code = 0u32;
+            (GetExitCodeProcess(self.0, &mut code) != 0).then_some(code)
+        }
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Starts this exe with `--send-list` on a new list file of `paths`, with
+/// the desktop user's normal token, so the copy has the user's rights only
+/// (a drop on the elevated popup must not read what the user cannot).
+pub fn send_as_user(paths: &[Vec<u16>]) -> Result<Child, String> {
+    let token = if token_elevated() {
+        enable_impersonate_privilege();
+        Some(ShellToken::get()?)
+    } else {
+        None
+    };
+    let env = base_env(token.as_ref());
+    let temp = env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("TEMP"))
+        .map(|(_, v)| PathBuf::from(v))
+        .unwrap_or_else(std::env::temp_dir);
+    let list = temp.join(format!(
+        "{}{}-{}.txt",
+        gpu_tray::policy::SEND_LIST_PREFIX,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let bytes = gpu_tray::policy::send_list_bytes(paths);
+    as_user(|| {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&list)
+            .and_then(|mut f| f.write_all(&bytes))
+    })?
+    .map_err(|e| format!("cannot write {}: {e}", list.display()))?;
+    let mut exe = vec![0u16; 32768];
+    let n = unsafe { GetModuleFileNameW(null_mut(), exe.as_mut_ptr(), exe.len() as u32) } as usize;
+    let exe = PathBuf::from(String::from_utf16_lossy(&exe[..n]));
+    let line = command_line(
+        &exe.to_string_lossy(),
+        &[
+            "--send-list".to_string(),
+            list.to_string_lossy().into_owned(),
+        ],
+    );
+    let started = create(
+        token.as_ref(),
+        &exe,
+        &line,
+        None,
+        env_block(env, &Default::default()),
+    );
+    match started {
+        Ok(s) => {
+            resume(s.thread);
+            Ok(Child(s.process))
+        }
+        Err(e) => {
+            let _ = as_user(|| std::fs::remove_file(&list));
+            Err(e)
+        }
+    }
 }
 
 /// The file `cmd` names. A bare name is looked up like a shell would
