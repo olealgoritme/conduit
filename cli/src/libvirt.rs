@@ -43,6 +43,8 @@ pub struct Wiring<'a> {
     pub vfs_sock: &'a Path,
     /// QEMU's VNC server (the boot console) listens here.
     pub console_sock: &'a Path,
+    /// QEMU's end of the stats channel (`org.conduit.stats.0`) binds here.
+    pub stats_sock: &'a Path,
     pub vm: &'a str,
     /// A Windows guest ([`is_windows`]): add the Hyper-V enlightenments.
     pub windows: bool,
@@ -332,6 +334,45 @@ fn edit_display(devices: &mut Element, console: &Path) {
     }
 }
 
+/// The stats channel: a virtio-serial port whose host end is a unix socket
+/// QEMU binds ([`conduit_stats::CHANNEL`]), plus a virtio-serial controller
+/// when the domain has none.
+fn add_stats_channel(devices: &mut Element, sock: &Path) {
+    let ours = |n: &XMLNode| {
+        matches!(n, XMLNode::Element(e) if e.name == "channel"
+            && e.get_child("target").and_then(|t| t.attributes.get("name")).map(String::as_str)
+                == Some(conduit_stats::CHANNEL))
+    };
+    // Where our channel was, so a second edit changes nothing.
+    let at = devices.children.iter().position(ours);
+    devices.children.retain(|n| !ours(n));
+    let has_ctl = elements(devices).any(|e| {
+        e.name == "controller"
+            && e.attributes.get("type").map(String::as_str) == Some("virtio-serial")
+    });
+    let mut ch = el("channel", &[("type", "unix")]);
+    let path = sock.display().to_string();
+    ch.children.push(XMLNode::Element(el(
+        "source",
+        &[("mode", "bind"), ("path", &path)],
+    )));
+    ch.children.push(XMLNode::Element(el(
+        "target",
+        &[("type", "virtio"), ("name", conduit_stats::CHANNEL)],
+    )));
+    let at = at.unwrap_or(devices.children.len());
+    devices.children.insert(at, XMLNode::Element(ch));
+    if !has_ctl {
+        devices.children.insert(
+            at,
+            XMLNode::Element(el(
+                "controller",
+                &[("type", "virtio-serial"), ("index", "0")],
+            )),
+        );
+    }
+}
+
 /// Rewrite a libvirt domain XML for Conduit. Idempotent: applying it to its
 /// own output changes nothing.
 pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
@@ -452,6 +493,8 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
             .push(XMLNode::Element(el("source", &[("socket", &sock)])));
         fs.children
             .push(XMLNode::Element(el("target", &[("dir", "nvidia")])));
+        // Before the share is re-appended: each edit leaves the order as it was.
+        add_stats_channel(devices, w.stats_sock);
         devices.children.push(XMLNode::Element(fs));
     }
 
@@ -681,6 +724,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     let gpu = units::socket_path(&scope, name, "backend");
     let vfs = units::socket_path(&scope, name, "virtiofsd");
     let console = units::console_path(&scope, name);
+    let stats = units::stats_path(&scope, name);
     let new_xml = edit_domain(
         &xml,
         &Wiring {
@@ -688,6 +732,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
             gpu_sock: &gpu,
             vfs_sock: &vfs,
             console_sock: &console,
+            stats_sock: &stats,
             vm: name,
             windows,
         },
@@ -914,6 +959,8 @@ mod tests {
   </devices>
 </domain>"#;
 
+    const STATS: &str = "/run/user/1000/conduit/myvm/stats.sock";
+
     fn edit_as(x: &str, windows: bool) -> String {
         edit_domain(
             x,
@@ -922,6 +969,7 @@ mod tests {
                 gpu_sock: Path::new("/run/user/1000/conduit/myvm/gpu-libvirt.sock"),
                 vfs_sock: Path::new("/run/user/1000/conduit/myvm/vfs-libvirt.sock"),
                 console_sock: Path::new(CONSOLE),
+                stats_sock: Path::new(STATS),
                 vm: "myvm",
                 windows,
             },
@@ -1263,7 +1311,8 @@ mod tests {
         assert!(all(&dev, "redirfilter").is_empty());
         assert!(all(&dev, "smartcard").is_empty());
         let ch = all(&dev, "channel");
-        assert_eq!(ch.len(), 1, "the guest agent channel stays: {out}");
+        assert_eq!(ch.len(), 2, "the guest agent channel stays: {out}");
+        assert!(out.contains("org.qemu.guest_agent.0"), "{out}");
         assert_eq!(ch[0].attributes["type"], "unix");
         assert_eq!(all(&dev, "audio")[0].attributes["type"], "none");
         assert_eq!(all(&dev, "sound").len(), 1, "the sound card stays");
@@ -1302,12 +1351,72 @@ mod tests {
     }
 
     #[test]
+    fn stats_channel_added_once_with_a_controller() {
+        let out = edit(WIN11);
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let dev = root.get_child("devices").unwrap();
+        let chans: Vec<_> = elements(dev)
+            .filter(|e| e.name == "channel")
+            .filter(|e| {
+                e.get_child("target")
+                    .unwrap()
+                    .attributes
+                    .get("name")
+                    .map(String::as_str)
+                    == Some("org.conduit.stats.0")
+            })
+            .collect();
+        assert_eq!(chans.len(), 1, "{out}");
+        assert_eq!(chans[0].attributes["type"], "unix");
+        let src = chans[0].get_child("source").unwrap();
+        assert_eq!(src.attributes["mode"], "bind");
+        assert_eq!(src.attributes["path"], STATS);
+        assert_eq!(
+            chans[0].get_child("target").unwrap().attributes["type"],
+            "virtio"
+        );
+        let ctl = |d: &Element| {
+            elements(d)
+                .filter(|e| {
+                    e.name == "controller"
+                        && e.attributes.get("type").map(String::as_str) == Some("virtio-serial")
+                })
+                .count()
+        };
+        assert_eq!(ctl(dev), 1, "{out}");
+        assert_eq!(edit(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn stats_channel_keeps_an_existing_controller_and_other_channels() {
+        let x = "<domain type='kvm'><name>a</name><devices>\
+            <controller type='virtio-serial' index='0'/>\
+            <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>\
+            </devices></domain>";
+        let out = edit(x);
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let dev = root.get_child("devices").unwrap();
+        assert_eq!(
+            elements(dev).filter(|e| e.name == "controller").count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(
+            elements(dev).filter(|e| e.name == "channel").count(),
+            2,
+            "{out}"
+        );
+        assert!(out.contains("org.qemu.guest_agent.0"));
+    }
+
+    #[test]
     fn rejects_non_domain() {
         let w = Wiring {
             emulator: Path::new("/q"),
             gpu_sock: Path::new("/s"),
             vfs_sock: Path::new("/v"),
             console_sock: Path::new("/c"),
+            stats_sock: Path::new("/t"),
             vm: "x",
             windows: false,
         };

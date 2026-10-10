@@ -7,6 +7,9 @@ param(
     [Parameter(Mandatory)][string]$LoadersArtifact,
     [Parameter(Mandatory)][string]$CompatibilityArtifact,
     [Parameter(Mandatory)][string]$InstallerArtifact,
+    # conduit-gpu-tray.exe (tools\conduit-gpu-tray, cargo build --release
+    # --target x86_64-pc-windows-gnu); omitted: the package carries no tray app.
+    [string]$TrayExe = "",
     [Parameter(Mandatory)][string]$OutputDir,
     [Parameter(Mandatory)][string]$Version,
     [Parameter(Mandatory)][ValidateSet("Debug", "Release")][string]$Configuration,
@@ -166,6 +169,12 @@ foreach ($probe in @("vulkan-smoke.exe", "vulkan-wsi-probe.exe", "opengl-smoke.e
 foreach ($probe in Get-ChildItem -LiteralPath (Join-Path $payload "smoke") -Filter "*.exe" -File -Recurse) {
     $architecture = if ($probe.Directory.Name -eq "x86") { "x86" } else { "x64" }
     Assert-HeliosPeArchitecture $probe.FullName $architecture
+}
+
+if ($TrayExe) {
+    $trayOut = Join-Path $payload "tray\conduit-gpu-tray.exe"
+    Copy-Required $TrayExe $trayOut
+    Assert-HeliosPeArchitecture $trayOut x64
 }
 
 $resolveCompatibilityOut = Join-Path $stagingRoot "compatibility\DaVinci Resolve"

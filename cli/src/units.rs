@@ -55,6 +55,50 @@ pub fn socket_path(scope: &Scope, vm: &str, helper: &str) -> PathBuf {
     }
 }
 
+/// Where the domain's QEMU listens on the stats channel
+/// (`org.conduit.stats.0`, a virtio-serial port); `conduit _stats` connects
+/// to it. QEMU creates the socket, so the folder must be one it can write to:
+/// the VM's runtime folder for a session domain, the console folder (see
+/// [`console_tmpfiles`]) for a system one.
+pub fn stats_path(scope: &Scope, vm: &str) -> PathBuf {
+    match scope {
+        Scope::User => paths::run_dir(vm).join("stats.sock"),
+        Scope::System { .. } => PathBuf::from(format!("/run/conduit/{vm}/console/stats.sock")),
+    }
+}
+
+/// `conduit-stats@NAME.service`: feeds the VM's stats channel.
+pub fn stats_unit(vm: &str) -> String {
+    format!("conduit-stats@{vm}.service")
+}
+
+/// The template unit for the stats feed. It is not socket-activated (QEMU,
+/// not the helper, owns the socket): it runs from login/boot and waits for the
+/// VM's socket to appear.
+pub fn stats_template(scope: &Scope, conduit: &Path) -> String {
+    let target = match scope {
+        Scope::User => "default.target",
+        Scope::System { .. } => "multi-user.target",
+    };
+    format!(
+        "# Installed by `conduit` (libvirt integration). Regenerated on `conduit libvirt enable`/`attach`.\n\
+         [Unit]\n\
+         Description=Conduit GPU stats feed for VM %i\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} _stats %i\n\
+         Restart=always\n\
+         RestartSec=5\n\
+         OOMScoreAdjust={oom}\n\
+         \n\
+         [Install]\n\
+         WantedBy={target}\n",
+        exe = conduit.display(),
+        oom = scope::OOM_SCORE_ADJ,
+    )
+}
+
 /// Where the domain's QEMU listens with its VNC server (the boot console:
 /// firmware, boot menu, disk-unlock prompt). QEMU creates this socket and the
 /// backend connects to it (`--console-vnc`), the other way round from the
@@ -323,6 +367,16 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
             )?;
         }
     }
+    put(
+        scope,
+        "conduit-stats@.service",
+        &stats_template(scope, conduit),
+    )?;
+    put(
+        scope,
+        &format!("{}.d/conduit.conf", stats_unit(vm)),
+        &service_dropin(scope, vm),
+    )?;
     if let Scope::System {
         user, qemu_user, ..
     } = scope
@@ -345,6 +399,10 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
     let mut a = vec!["enable", "--now"];
     a.extend(socks.iter().map(String::as_str));
     systemctl(scope, &a).context("could not start the VM's helper sockets")?;
+    // The stats feed is best effort: the VM works without it.
+    if let Err(e) = systemctl(scope, &["enable", "--now", &stats_unit(vm)]) {
+        eprintln!("conduit: could not start the GPU stats feed: {e:#}");
+    }
     Ok(())
 }
 
@@ -354,6 +412,8 @@ pub fn remove(scope: &Scope, vm: &str) {
     let mut a = vec!["disable", "--now"];
     a.extend(socks.iter().map(String::as_str));
     let _ = systemctl(scope, &a);
+    let _ = systemctl(scope, &["disable", "--now", &stats_unit(vm)]);
+    rm(scope, &format!("{}.d/conduit.conf", stats_unit(vm)));
     for h in HELPERS {
         let _ = systemctl(scope, &["stop", &unit(h, vm, "service")]);
         rm(scope, &format!("{}.d/conduit.conf", unit(h, vm, "service")));
@@ -507,6 +567,14 @@ pub fn remove_net(vm: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_feed_unit() {
+        let v = stats_template(&Scope::User, Path::new("/usr/bin/conduit"));
+        assert!(v.contains("ExecStart=/usr/bin/conduit _stats %i"));
+        assert!(v.contains("WantedBy=default.target"));
+        assert!(stats_path(&Scope::User, "w").ends_with("conduit/w/stats.sock"));
+    }
 
     #[test]
     fn user_socket_lives_in_the_runtime_dir() {

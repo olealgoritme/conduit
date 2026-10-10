@@ -600,6 +600,11 @@ fn log_to(file: &Path, append: bool) -> Result<()> {
     Ok(())
 }
 
+/// The libvirt URI a VM of Conduit's was attached through.
+pub fn link_uri(name: &str) -> Result<String> {
+    Ok(need_link(name)?.uri)
+}
+
 fn need_link(name: &str) -> Result<Link> {
     Link::load(name).ok_or_else(|| {
         oops(

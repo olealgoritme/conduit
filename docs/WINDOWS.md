@@ -177,6 +177,28 @@ CPU wait).
   ([packaging README](../guest/windows/packaging/windows/README.md#display-topology);
   `ManageDisplay=0` opts out).
 
+## GPU stats tray
+
+`conduit attach` adds a virtio-serial channel, `org.conduit.stats.0`, whose host
+end is a unix socket QEMU binds (`stats.sock` in the VM's runtime folder), and
+installs `conduit-stats@NAME.service`. That unit runs `conduit _stats NAME`:
+once a second it writes one JSON line of the host GPU's NVML readings (name,
+driver, temperature, load, VRAM, clocks, power, fan, P-state, PCIe, encoder) to
+the socket, and reconnects when the VM restarts. The channel is added when
+the domain is defined, so a VM attached earlier needs `conduit attach NAME`
+again and one cold restart. The guest needs the VirtIO serial driver (the one
+the QEMU guest agent uses).
+
+The package installs **Conduit GPU** (`guest/windows/tools/conduit-gpu-tray`,
+built for `x86_64-pc-windows-gnu`, about 350 KB, no runtime) to
+`Program Files\Conduit` and starts it at logon through the machine Run key. It
+reads `\\.\Global\org.conduit.stats.0`, shows the temperature (or load) as a
+colour-coded number in the tray, and opens a popup on click: load, power and
+temperature, 60-second graphs and VRAM, clock, power and fan bars. The
+right-click menu has Show, which metric the icon shows, Start with Windows,
+and Exit. Until the first line arrives the popup says "Waiting for Conduit host
+feed".
+
 ## Registry knobs
 
 KMD knobs are `REG_DWORD` values under

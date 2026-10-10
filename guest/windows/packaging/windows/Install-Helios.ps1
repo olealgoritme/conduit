@@ -523,6 +523,23 @@ foreach ($extra in @("licenses", "compatibility")) {
         Copy-HeliosTreeIfChanged $extraSource (Join-Path $stateRoot $extra)
     }
 }
+# The Conduit GPU tray app (host GPU stats in the notification area), when the
+# package carries it. It starts at each logon through the machine-wide Run key.
+$trayPayload = Join-Path $payloadRoot "tray\conduit-gpu-tray.exe"
+if (Test-Path -LiteralPath $trayPayload -PathType Leaf) {
+    try {
+        $trayDir = Join-Path $env:ProgramFiles "Conduit"
+        $trayExe = Join-Path $trayDir "conduit-gpu-tray.exe"
+        Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
+        New-Item -ItemType Directory -Force -Path $trayDir | Out-Null
+        Copy-Item -LiteralPath $trayPayload -Destination $trayExe -Force
+        New-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" `
+            -Value ('"' + $trayExe + '"') -PropertyType String -Force | Out-Null
+        Write-Host "Installed the Conduit GPU tray app at $trayExe (starts at logon)."
+    } catch {
+        Write-Warning "The Conduit GPU tray app was not installed: $($_.Exception.Message)"
+    }
+}
 Write-HeliosJson $state $statePath
 
 Write-Host ""

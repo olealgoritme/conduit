@@ -4,6 +4,7 @@ mod boot;
 mod config;
 mod create;
 mod doctor;
+mod feed;
 mod guest;
 mod host;
 mod hypr;
@@ -399,6 +400,9 @@ enum Cmd {
     /// (internal) conduit-virtiofsd@NAME.service: become virtiofsd
     #[command(name = "_virtiofsd", hide = true)]
     Virtiofsd { name: String },
+    /// (internal) conduit-stats@NAME.service: feed GPU readings to the VM
+    #[command(name = "_stats", hide = true)]
+    Stats { name: String },
     /// (internal) after the backend stopped with its VM
     #[command(name = "_stopped", hide = true)]
     Stopped { name: String },
@@ -799,6 +803,7 @@ fn main() {
         Cmd::Doctor { name: Some(n) } => std::process::exit(doctor::run_vm(&n)),
         Cmd::Backend { name } => lvrun::backend_exec(&name),
         Cmd::Virtiofsd { name } => lvrun::virtiofsd_exec(&name),
+        Cmd::Stats { name } => feed::run(&name),
         Cmd::Stopped { name } => lvrun::stopped(&name),
         Cmd::HyprHook { action, state } => hypr::hook(&action, &state),
         Cmd::Watch { name } => run::watch(&name),

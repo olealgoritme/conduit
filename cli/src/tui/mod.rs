@@ -8,7 +8,7 @@
 
 mod data;
 mod draw;
-mod nvml;
+pub(crate) mod nvml;
 
 use anyhow::Result;
 use crossterm::event::{
