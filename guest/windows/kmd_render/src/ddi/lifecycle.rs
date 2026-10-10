@@ -275,6 +275,7 @@ fn start_generation_mirrors() {
     crate::ddi::flip_lat::start_generation();
     crate::ddi::stage_trace::start_generation();
     crate::ddi::flip_announce::start_generation();
+    crate::ddi::immediate_flip::start_generation();
     crate::ddi::stall_diag::start_generation();
     // The round-trip statistics of forwarded RM calls start over: this generation's `NvRtt*`.
     crate::virtio::nvrm::reset_rtt_counters();

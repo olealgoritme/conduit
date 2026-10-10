@@ -1556,6 +1556,11 @@ pub mod knobs {
     /// an announce the retire still waits for the worker's publication (one tick earlier on
     /// average). Read at every StartDevice.
     pub const FLIP_EARLY_WAKE: KnobName = KnobName::new(b"FlipEarlyWake");
+    /// `ImmFlip` (default 3): immediate (tearing) flips are sent to the host without the
+    /// `ForeignFlip` presenter's minimum interval (bit 0) and retired by a `CRTC_VSYNC` reported
+    /// as soon as their address is published, not by the next vsync tick (bit 1); 0 is the old
+    /// behaviour. `helios_kmd_logic::immediate_flip`. Read at every StartDevice.
+    pub const IMM_FLIP: KnobName = KnobName::new(b"ImmFlip");
     /// `FlipLat` (default 1 = on, 0 = off): the flip retire latency / inter-flip interval /
     /// vblank utilisation measurement (`FlipLat*`, `IfGap*`, `FlipP99Us`, `VbUsed`,
     /// `VsLate*`): atomics in the DDI and the tick, mirrored once a second. Read at every

@@ -2706,6 +2706,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         // written for ("compiles, links, ships, and either deadlocks at DISPATCH
         // on a KEVENT wait or calls MmAllocateContiguousMemory above APC_LEVEL").
         crate::ddi::scanout_trace::note_ddi_split(true);
+        // `ImmFlip`: whether the flip this puts in the pending slot is immediate (atomics only).
+        crate::ddi::immediate_flip::note_mmio(primary_flags);
         // `swap`, not `store`, purely so the overwritten value is observable:
         // this slot holds ONE pending handle, so dxgkrnl flipping faster than
         // the PASSIVE worker drains silently discards every intermediate
@@ -2830,6 +2832,8 @@ pub(crate) unsafe fn arm_dma_flip_programming(
         return false;
     }
     let _ticket = adapter.raise_programming_gate();
+    // `ImmFlip`: a DMA-buffer flip is an interval-0 (immediate) flip; recorded before the slot.
+    crate::ddi::immediate_flip::note_dma_arm();
     let previous = adapter
         .pending_vidpn_allocation
         .swap(h_alloc as usize, Ordering::AcqRel);
@@ -3125,11 +3129,23 @@ pub(crate) fn process_deferred_vidpn_source_address(
         if raw == 0 {
             return None;
         }
-        Some(unsafe { apply_deferred_vidpn_source_address_locked(adapter, lock, raw as HANDLE) })
+        // `ImmFlip`: the slot's immediacy goes with it (`ForeignFlip` reads it in the programming).
+        let immediate = crate::ddi::immediate_flip::begin_programming();
+        let status =
+            unsafe { apply_deferred_vidpn_source_address_locked(adapter, lock, raw as HANDLE) };
+        crate::ddi::immediate_flip::end_programming();
+        Some((status, immediate))
     });
     // The mutex is free again: the `VpDSt` registry write below must not run under a site that
     // says it is held.
     crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_POST);
+    let status = status.map(|(status, immediate)| {
+        // `ImmFlip`: an immediate flip is retired now, not at the next vsync tick.
+        if immediate {
+            crate::ddi::immediate_flip::complete_now(adapter);
+        }
+        status
+    });
     if let Some(status) = status {
         // Changed-only: this is one registry transaction per programmed flip on the worker, between
         // two flips (`HpdMx18`); the status is almost always the same.
