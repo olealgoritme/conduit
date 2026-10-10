@@ -51,6 +51,14 @@ class PtpSysOffsetPrecise(ctypes.Structure):
 PTP_SYS_OFFSET_PRECISE = _IOC(3, "=", 8, ctypes.sizeof(PtpSysOffsetPrecise))
 
 
+class PtpSysOffsetExtended(ctypes.Structure):
+    _fields_ = [("n_samples", ctypes.c_uint32), ("clockid", ctypes.c_int32),
+                ("rsv", ctypes.c_uint32 * 2), ("ts", PtpTime * 3 * 25)]
+
+
+PTP_SYS_OFFSET_EXTENDED = _IOC(3, "=", 9, ctypes.sizeof(PtpSysOffsetExtended))
+
+
 def ns(t):
     return t.sec * 1_000_000_000 + t.nsec
 
@@ -67,10 +75,35 @@ def ptp_kvm_dev():
 
 
 def offset_ns(fd):
-    """host CLOCK_REALTIME - guest CLOCK_REALTIME."""
+    """host CLOCK_REALTIME - guest CLOCK_REALTIME.
+
+    The precise cross timestamp when the guest runs on kvm-clock; otherwise
+    the hypercall's reading between two guest readings, the tightest of 10
+    (its error is half that window, a few microseconds)."""
     p = PtpSysOffsetPrecise()
-    fcntl.ioctl(fd, PTP_SYS_OFFSET_PRECISE, p)
-    return ns(p.device) - ns(p.sys_realtime)
+    try:
+        fcntl.ioctl(fd, PTP_SYS_OFFSET_PRECISE, p)
+        return ns(p.device) - ns(p.sys_realtime)
+    except OSError:
+        pass
+    try:
+        e = PtpSysOffsetExtended()
+        e.n_samples = 10
+        e.clockid = time.CLOCK_REALTIME
+        fcntl.ioctl(fd, PTP_SYS_OFFSET_EXTENDED, e)
+        samples = [tuple(ns(e.ts[i][j]) for j in range(3)) for i in range(e.n_samples)]
+    except OSError:
+        # Read the PTP clock itself (a dynamic POSIX clock) between two
+        # guest readings.
+        clk = ((~fd) << 3) | 3
+        samples = []
+        for _ in range(10):
+            pre = time.clock_gettime_ns(time.CLOCK_REALTIME)
+            dev = time.clock_gettime_ns(clk)
+            post = time.clock_gettime_ns(time.CLOCK_REALTIME)
+            samples.append((pre, dev, post))
+    best = min(samples, key=lambda t: t[2] - t[0])
+    return best[1] - (best[0] + best[2]) // 2
 
 
 def dev_name(fd):
@@ -115,6 +148,7 @@ def main():
     ptp = os.open(ptp_kvm_dev(), os.O_RDWR)
     off = offset_ns(ptp)
     off_at = time.monotonic()
+    print(f"host - guest clock: {off} ns", file=sys.stderr)
     names = {fd: n.replace(",", " ") for _, fd, n in use}
     out = sys.stdout
     out.write("kind,ev_ns,read_ns,value,device\n")
