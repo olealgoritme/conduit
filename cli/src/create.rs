@@ -40,6 +40,18 @@ const GUEST_FILES: &[(&str, &str)] = &[
         include_str!("../assets/guest/90-conduit-nvidia.conf"),
     ),
     (
+        "conduit-shares.sh",
+        include_str!("../assets/guest/conduit-shares.sh"),
+    ),
+    (
+        "conduit-shares.service",
+        include_str!("../assets/guest/conduit-shares.service"),
+    ),
+    (
+        "72-conduit-shares.rules",
+        include_str!("../assets/guest/72-conduit-shares.rules"),
+    ),
+    (
         "10-conduit.network",
         include_str!("../assets/guest/10-conduit.network"),
     ),

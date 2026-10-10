@@ -1,0 +1,47 @@
+[package]
+name = "conduit-gpu-tray"
+version = "0.1.0"
+edition = "2021"
+description = "Conduit GPU stats tray app for Windows guests"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "gpu_tray"
+path = "src/lib.rs"
+
+[[bin]]
+name = "conduit-gpu-tray"
+path = "src/main.rs"
+
+[dependencies]
+# The host's reading line, shared with `conduit _stats`.
+conduit-stats = { path = "../../../../host/stats" }
+# Raw Win32 and GDI+ (antialiased drawing): no GUI framework, no runtime to install.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

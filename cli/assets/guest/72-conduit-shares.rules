@@ -1,0 +1,3 @@
+# A virtiofs device appeared (a shared folder added while the VM runs, or at
+# boot): mount the conduit-* tags.
+ACTION=="bind", SUBSYSTEM=="virtio", DRIVER=="virtiofs", TAG+="systemd", ENV{SYSTEMD_WANTS}+="conduit-shares.service"

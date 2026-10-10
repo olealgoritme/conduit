@@ -55,6 +55,50 @@ pub fn socket_path(scope: &Scope, vm: &str, helper: &str) -> PathBuf {
     }
 }
 
+/// Where the domain's QEMU listens on the stats channel
+/// (`org.conduit.stats.0`, a virtio-serial port); `conduit _stats` connects
+/// to it. QEMU creates the socket, so the folder must be one it can write to:
+/// the VM's runtime folder for a session domain, the console folder (see
+/// [`console_tmpfiles`]) for a system one.
+pub fn stats_path(scope: &Scope, vm: &str) -> PathBuf {
+    match scope {
+        Scope::User => paths::run_dir(vm).join("stats.sock"),
+        Scope::System { .. } => PathBuf::from(format!("/run/conduit/{vm}/console/stats.sock")),
+    }
+}
+
+/// `conduit-stats@NAME.service`: feeds the VM's stats channel.
+pub fn stats_unit(vm: &str) -> String {
+    format!("conduit-stats@{vm}.service")
+}
+
+/// The template unit for the stats feed. It is not socket-activated (QEMU,
+/// not the helper, owns the socket): it runs from login/boot and waits for the
+/// VM's socket to appear.
+pub fn stats_template(scope: &Scope, conduit: &Path) -> String {
+    let target = match scope {
+        Scope::User => "default.target",
+        Scope::System { .. } => "multi-user.target",
+    };
+    format!(
+        "# Installed by `conduit` (libvirt integration). Regenerated on `conduit libvirt enable`/`attach`.\n\
+         [Unit]\n\
+         Description=Conduit GPU stats feed for VM %i\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} _stats %i\n\
+         Restart=always\n\
+         RestartSec=5\n\
+         OOMScoreAdjust={oom}\n\
+         \n\
+         [Install]\n\
+         WantedBy={target}\n",
+        exe = conduit.display(),
+        oom = scope::OOM_SCORE_ADJ,
+    )
+}
+
 /// Where the domain's QEMU listens with its VNC server (the boot console:
 /// firmware, boot menu, disk-unlock prompt). QEMU creates this socket and the
 /// backend connects to it (`--console-vnc`), the other way round from the
@@ -193,6 +237,155 @@ pub fn socket_dropin(scope: &Scope, vm: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------- shared folders
+
+/// `conduit-share@VM:SHARE.KIND`: one virtiofsd per shared folder.
+pub fn share_unit(vm: &str, share: &str, kind: &str) -> String {
+    format!("conduit-share@{vm}:{share}.{kind}")
+}
+
+/// Where a shared folder's virtiofsd listens (what QEMU connects to).
+pub fn share_socket_path(scope: &Scope, vm: &str, share: &str) -> PathBuf {
+    match scope {
+        Scope::User => paths::run_dir(vm).join(format!("share-{share}.sock")),
+        Scope::System { .. } => PathBuf::from(format!("/run/conduit/{vm}/share-{share}.sock")),
+    }
+}
+
+/// The template .socket of a shared folder; the listening path comes from the
+/// per-share drop-in ([`share_socket_dropin`]), since a template cannot split
+/// its `VM:SHARE` instance name.
+pub fn share_socket_template() -> String {
+    "# Installed by `conduit` (shared folders). Regenerated on `conduit attach`/`share`.\n\
+     [Unit]\n\
+     Description=Conduit shared folder socket %i\n\
+     \n\
+     [Socket]\n\
+     SocketMode=0600\n\
+     DirectoryMode=0700\n\
+     Accept=no\n\
+     RemoveOnStop=yes\n\
+     \n\
+     [Install]\n\
+     WantedBy=sockets.target\n"
+        .into()
+}
+
+/// The template .service: `conduit _share VM:SHARE` execs virtiofsd on the socket.
+pub fn share_service_template(conduit: &Path) -> String {
+    format!(
+        "# Installed by `conduit` (shared folders). Regenerated on `conduit attach`/`share`.\n\
+         [Unit]\n\
+         Description=Conduit shared folder %i (virtiofsd)\n\
+         Requires=conduit-share@%i.socket\n\
+         After=conduit-share@%i.socket\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} _share %i\n\
+         # It serves one VM run, then exits; the socket starts it again next time.\n\
+         Restart=no\n\
+         OOMScoreAdjust={oom}\n\
+         TimeoutStopSec=20\n",
+        exe = conduit.display(),
+        oom = scope::OOM_SCORE_ADJ,
+    )
+}
+
+/// Per-share socket drop-in: where it listens (and, for system units, who owns it).
+pub fn share_socket_dropin(scope: &Scope, vm: &str, share: &str) -> String {
+    let mut s = format!(
+        "# Installed by `conduit` for VM {vm}, shared folder {share}.\n[Socket]\nListenStream={}\n",
+        share_socket_path(scope, vm, share).display()
+    );
+    if let Scope::System { qemu_user, .. } = scope {
+        s += &format!("SocketUser={qemu_user}\nDirectoryMode=0755\n");
+    }
+    s
+}
+
+/// Shared folders with units installed for this VM (read from the drop-in folders).
+pub fn installed_shares(scope: &Scope, vm: &str) -> Vec<String> {
+    let dir = match scope {
+        Scope::User => user_unit_dir(),
+        Scope::System { .. } => PathBuf::from(SYSTEM_UNIT_DIR),
+    };
+    let prefix = format!("conduit-share@{vm}:");
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.strip_prefix(&prefix)?
+                .strip_suffix(".socket.d")
+                .map(String::from)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Install the units of these shared folders and start their sockets. The
+/// shares in `keep` are the configured ones; installed ones not in it are
+/// removed unless `busy` says QEMU may still use them.
+pub fn install_shares(
+    scope: &Scope,
+    vm: &str,
+    conduit: &Path,
+    keep: &[String],
+    busy: &dyn Fn(&str) -> bool,
+) -> Result<()> {
+    put(scope, "conduit-share@.socket", &share_socket_template())?;
+    put(
+        scope,
+        "conduit-share@.service",
+        &share_service_template(conduit),
+    )?;
+    for sh in keep {
+        put(
+            scope,
+            &format!("{}.d/conduit.conf", share_unit(vm, sh, "socket")),
+            &share_socket_dropin(scope, vm, sh),
+        )?;
+        put(
+            scope,
+            &format!("{}.d/conduit.conf", share_unit(vm, sh, "service")),
+            &service_dropin(scope, vm),
+        )?;
+    }
+    for sh in installed_shares(scope, vm) {
+        if !keep.contains(&sh) && !busy(&sh) {
+            remove_share(scope, vm, &sh);
+        }
+    }
+    systemctl(scope, &["daemon-reload"])?;
+    for sh in keep {
+        let u = share_unit(vm, sh, "socket");
+        let _ = systemctl(scope, &["reset-failed", &u]);
+        systemctl(scope, &["enable", "--now", &u])
+            .with_context(|| format!("could not start the socket of shared folder {sh}"))?;
+    }
+    Ok(())
+}
+
+/// Stop and forget one shared folder's units.
+pub fn remove_share(scope: &Scope, vm: &str, share: &str) {
+    let _ = systemctl(
+        scope,
+        &["disable", "--now", &share_unit(vm, share, "socket")],
+    );
+    let _ = systemctl(scope, &["stop", &share_unit(vm, share, "service")]);
+    rm(
+        scope,
+        &format!("{}.d/conduit.conf", share_unit(vm, share, "socket")),
+    );
+    rm(
+        scope,
+        &format!("{}.d/conduit.conf", share_unit(vm, share, "service")),
+    );
+}
+
 fn user_unit_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -323,6 +516,16 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
             )?;
         }
     }
+    put(
+        scope,
+        "conduit-stats@.service",
+        &stats_template(scope, conduit),
+    )?;
+    put(
+        scope,
+        &format!("{}.d/conduit.conf", stats_unit(vm)),
+        &service_dropin(scope, vm),
+    )?;
     if let Scope::System {
         user, qemu_user, ..
     } = scope
@@ -345,6 +548,16 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
     let mut a = vec!["enable", "--now"];
     a.extend(socks.iter().map(String::as_str));
     systemctl(scope, &a).context("could not start the VM's helper sockets")?;
+    // The stats feed is best effort: the VM works without it.
+    if let Err(e) = systemctl(scope, &["enable", "--now", &stats_unit(vm)]) {
+        eprintln!("conduit: could not start the GPU stats feed: {e:#}");
+    }
+    // Shared folders: the default one on first attach, then every configured one.
+    let names: Vec<String> = crate::shares::load_or_init(vm)?
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    install_shares(scope, vm, conduit, &names, &|_| false)?;
     Ok(())
 }
 
@@ -354,6 +567,11 @@ pub fn remove(scope: &Scope, vm: &str) {
     let mut a = vec!["disable", "--now"];
     a.extend(socks.iter().map(String::as_str));
     let _ = systemctl(scope, &a);
+    let _ = systemctl(scope, &["disable", "--now", &stats_unit(vm)]);
+    rm(scope, &format!("{}.d/conduit.conf", stats_unit(vm)));
+    for sh in installed_shares(scope, vm) {
+        remove_share(scope, vm, &sh);
+    }
     for h in HELPERS {
         let _ = systemctl(scope, &["stop", &unit(h, vm, "service")]);
         rm(scope, &format!("{}.d/conduit.conf", unit(h, vm, "service")));
@@ -371,6 +589,14 @@ pub fn remove(scope: &Scope, vm: &str) {
 /// Listening, or made to listen again: a helper that failed once (e.g. the
 /// share could not be staged) leaves its socket failed until reset.
 pub fn ensure_listening(scope: &Scope, vm: &str) -> bool {
+    // Shared folders are best effort: the VM starts without them.
+    for sh in installed_shares(scope, vm) {
+        let u = share_unit(vm, &sh, "socket");
+        if !systemctl_ok(scope, &["is-active", "--quiet", &u]) {
+            let _ = systemctl(scope, &["reset-failed", &u]);
+            let _ = systemctl(scope, &["start", &u]);
+        }
+    }
     if listening(scope, vm) {
         return true;
     }
@@ -509,6 +735,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stats_feed_unit() {
+        let v = stats_template(&Scope::User, Path::new("/usr/bin/conduit"));
+        assert!(v.contains("ExecStart=/usr/bin/conduit _stats %i"));
+        assert!(v.contains("WantedBy=default.target"));
+        assert!(stats_path(&Scope::User, "w").ends_with("conduit/w/stats.sock"));
+    }
+
+    #[test]
     fn user_socket_lives_in_the_runtime_dir() {
         let t = socket_template(&Scope::User, "backend");
         assert!(
@@ -573,6 +807,27 @@ mod tests {
         assert!(
             t.contains("d /run/conduit/x/console 2750 libvirt-qemu ana -"),
             "{t}"
+        );
+    }
+
+    #[test]
+    fn share_units_listen_per_share() {
+        let d = share_socket_dropin(&Scope::User, "vm1", "Docs");
+        assert!(d.contains("ListenStream=") && d.contains("vm1/share-Docs.sock"));
+        let sys = Scope::System {
+            user: "me".into(),
+            uid: 1000,
+            home: PathBuf::from("/home/me"),
+            qemu_user: "libvirt-qemu".into(),
+        };
+        let d = share_socket_dropin(&sys, "vm1", "Docs");
+        assert!(d.contains("ListenStream=/run/conduit/vm1/share-Docs.sock"));
+        assert!(d.contains("SocketUser=libvirt-qemu"));
+        let v = share_service_template(Path::new("/usr/bin/conduit"));
+        assert!(v.contains("ExecStart=/usr/bin/conduit _share %i"));
+        assert_eq!(
+            share_unit("vm1", "Docs", "socket"),
+            "conduit-share@vm1:Docs.socket"
         );
     }
 

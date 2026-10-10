@@ -523,6 +523,45 @@ foreach ($extra in @("licenses", "compatibility")) {
         Copy-HeliosTreeIfChanged $extraSource (Join-Path $stateRoot $extra)
     }
 }
+# The Conduit GPU tray app (host GPU stats in the notification area), when the
+# package carries it. A logon task starts it for every user with administrator
+# rights (the VirtIO serial port it reads is admin-only) and no UAC prompt.
+$trayPayload = Join-Path $payloadRoot "tray\conduit-gpu-tray.exe"
+if (Test-Path -LiteralPath $trayPayload -PathType Leaf) {
+    try {
+        $trayDir = Join-Path $env:ProgramFiles "Conduit"
+        $trayExe = Join-Path $trayDir "conduit-gpu-tray.exe"
+        Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
+        New-Item -ItemType Directory -Force -Path $trayDir | Out-Null
+        Copy-Item -LiteralPath $trayPayload -Destination $trayExe -Force
+        Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute $trayExe
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName "ConduitGpuTray" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName "ConduitGpuTray" -ErrorAction SilentlyContinue
+        Write-Host "Installed the Conduit GPU tray app at $trayExe (starts at logon)."
+    } catch {
+        Write-Warning "The Conduit GPU tray app was not installed: $($_.Exception.Message)"
+    }
+}
+# Shared folders: WinFsp (from the package's winfsp MSI when missing) and the
+# startup task that mounts the host's conduit-* virtiofs shares as drives.
+$sharesInstaller = Join-Path $bundleRoot "Install-ConduitShares.ps1"
+if (Test-Path -LiteralPath $sharesInstaller -PathType Leaf) {
+    try {
+        $winfspMsi = Get-ChildItem -LiteralPath (Join-Path $payloadRoot "winfsp") -Filter "*.msi" -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($winfspMsi) {
+            & $sharesInstaller -WinFspMsi $winfspMsi.FullName
+        } else {
+            & $sharesInstaller
+        }
+    } catch {
+        Write-Warning "Shared folders were not set up: $($_.Exception.Message)"
+    }
+}
 Write-HeliosJson $state $statePath
 
 Write-Host ""

@@ -28,6 +28,7 @@
 use crate::guest;
 use crate::paths;
 use crate::run;
+use crate::shares::{self, Wire};
 use crate::sys;
 use crate::ui::{self, oops};
 use crate::units::{self, Scope};
@@ -43,7 +44,11 @@ pub struct Wiring<'a> {
     pub vfs_sock: &'a Path,
     /// QEMU's VNC server (the boot console) listens here.
     pub console_sock: &'a Path,
+    /// QEMU's end of the stats channel (`org.conduit.stats.0`) binds here.
+    pub stats_sock: &'a Path,
     pub vm: &'a str,
+    /// The VM's shared folders (virtiofs tags `conduit-*`).
+    pub shares: &'a [Wire],
     /// A Windows guest ([`is_windows`]): add the Hyper-V enlightenments.
     pub windows: bool,
 }
@@ -332,6 +337,45 @@ fn edit_display(devices: &mut Element, console: &Path) {
     }
 }
 
+/// The stats channel: a virtio-serial port whose host end is a unix socket
+/// QEMU binds ([`conduit_stats::CHANNEL`]), plus a virtio-serial controller
+/// when the domain has none.
+fn add_stats_channel(devices: &mut Element, sock: &Path) {
+    let ours = |n: &XMLNode| {
+        matches!(n, XMLNode::Element(e) if e.name == "channel"
+            && e.get_child("target").and_then(|t| t.attributes.get("name")).map(String::as_str)
+                == Some(conduit_stats::CHANNEL))
+    };
+    // Where our channel was, so a second edit changes nothing.
+    let at = devices.children.iter().position(ours);
+    devices.children.retain(|n| !ours(n));
+    let has_ctl = elements(devices).any(|e| {
+        e.name == "controller"
+            && e.attributes.get("type").map(String::as_str) == Some("virtio-serial")
+    });
+    let mut ch = el("channel", &[("type", "unix")]);
+    let path = sock.display().to_string();
+    ch.children.push(XMLNode::Element(el(
+        "source",
+        &[("mode", "bind"), ("path", &path)],
+    )));
+    ch.children.push(XMLNode::Element(el(
+        "target",
+        &[("type", "virtio"), ("name", conduit_stats::CHANNEL)],
+    )));
+    let at = at.unwrap_or(devices.children.len());
+    devices.children.insert(at, XMLNode::Element(ch));
+    if !has_ctl {
+        devices.children.insert(
+            at,
+            XMLNode::Element(el(
+                "controller",
+                &[("type", "virtio-serial"), ("index", "0")],
+            )),
+        );
+    }
+}
+
 /// Rewrite a libvirt domain XML for Conduit. Idempotent: applying it to its
 /// own output changes nothing.
 pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
@@ -392,13 +436,11 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     }
 
     // <cpu mode='host-passthrough'><maxphysaddr mode='passthrough'/>: the
-    // GPU's 64-bit shared-memory BAR needs the host's address width. A
-    // <topology> the VM had is kept.
+    // GPU's 64-bit shared-memory BAR needs the host's address width.
+    // Everything else the VM's <cpu> had (topology, features such as
+    // topoext, cache, numa) is kept.
     {
-        let topo = root
-            .get_child("cpu")
-            .and_then(|c| c.get_child("topology"))
-            .cloned();
+        let old = root.get_child("cpu").cloned();
         root.children
             .retain(|n| !matches!(n, XMLNode::Element(e) if e.name == "cpu"));
         let mut cpu = el(
@@ -409,8 +451,13 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
                 ("migratable", "off"),
             ],
         );
-        if let Some(t) = topo {
-            cpu.children.push(XMLNode::Element(t));
+        if let Some(o) = old {
+            // A host-model or custom CPU's <model>/<vendor> mean nothing in
+            // host-passthrough; drop them and any old <maxphysaddr>.
+            cpu.children.extend(o.children.into_iter().filter(|n| {
+                !matches!(n, XMLNode::Element(e)
+                    if matches!(e.name.as_str(), "maxphysaddr" | "model" | "vendor"))
+            }));
         }
         cpu.children.push(XMLNode::Element(el(
             "maxphysaddr",
@@ -452,7 +499,10 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
             .push(XMLNode::Element(el("source", &[("socket", &sock)])));
         fs.children
             .push(XMLNode::Element(el("target", &[("dir", "nvidia")])));
+        // Before the share is re-appended: each edit leaves the order as it was.
+        add_stats_channel(devices, w.stats_sock);
         devices.children.push(XMLNode::Element(fs));
+        set_shares(devices, w.shares);
     }
 
     if w.windows {
@@ -535,6 +585,53 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     cl.children.extend(others); // <qemu:env> after the args, as libvirt writes them
     root.children.push(XMLNode::Element(cl));
 
+    let mut out = Vec::new();
+    root.write_with_config(
+        &mut out,
+        EmitterConfig::new()
+            .perform_indent(true)
+            .write_document_declaration(false),
+    )?;
+    Ok(String::from_utf8(out)?)
+}
+
+/// The `<filesystem>` element of one shared folder.
+fn share_fs(w: &Wire) -> Element {
+    let mut fs = el("filesystem", &[("type", "mount")]);
+    fs.children.push(XMLNode::Element(el(
+        "driver",
+        &[("type", "virtiofs"), ("queue", "1024")],
+    )));
+    let sock = w.sock.display().to_string();
+    fs.children
+        .push(XMLNode::Element(el("source", &[("socket", &sock)])));
+    fs.children
+        .push(XMLNode::Element(el("target", &[("dir", &w.tag)])));
+    fs
+}
+
+/// Make `<devices>` carry exactly these shared folders: Conduit's
+/// (`conduit-*` targets) are replaced, other filesystems stay as they are.
+fn set_shares(devices: &mut Element, shares: &[Wire]) {
+    devices.children.retain(|n| {
+        !matches!(n, XMLNode::Element(e) if e.name == "filesystem"
+            && e.get_child("target")
+                .and_then(|t| t.attributes.get("dir"))
+                .is_some_and(|d| shares::is_share_tag(d)))
+    });
+    for w in shares {
+        devices.children.push(XMLNode::Element(share_fs(w)));
+    }
+}
+
+/// A domain definition with its shared folders set to `shares`, nothing else changed.
+pub fn apply_shares(xml: &str, shares: &[Wire]) -> Result<String> {
+    let mut root =
+        Element::parse(xml.as_bytes()).context("libvirt returned XML Conduit cannot read")?;
+    if root.name != "domain" {
+        anyhow::bail!("not a libvirt domain (root element is <{}>)", root.name);
+    }
+    set_shares(child_mut(&mut root, "devices"), shares);
     let mut out = Vec::new();
     root.write_with_config(
         &mut out,
@@ -681,6 +778,18 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     let gpu = units::socket_path(&scope, name, "backend");
     let vfs = units::socket_path(&scope, name, "virtiofsd");
     let console = units::console_path(&scope, name);
+    let stats = units::stats_path(&scope, name);
+    let share_list = if dry_run {
+        let l = shares::load(name)?;
+        if l.is_empty() && !shares::file(name).is_file() {
+            vec![shares::default_share(name)]
+        } else {
+            l
+        }
+    } else {
+        shares::load_or_init(name)?
+    };
+    let share_wires = shares::wires(&scope, name, &share_list);
     let new_xml = edit_domain(
         &xml,
         &Wiring {
@@ -688,7 +797,9 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
             gpu_sock: &gpu,
             vfs_sock: &vfs,
             console_sock: &console,
+            stats_sock: &stats,
             vm: name,
+            shares: &share_wires,
             windows,
         },
     )?;
@@ -878,7 +989,7 @@ mod tests {
     <source type='file'/>
   </memoryBacking>
   <os><type arch='x86_64' machine='pc-q35-8.2'>hvm</type></os>
-  <cpu mode='host-model' check='partial'><topology sockets='1' cores='4' threads='1'/></cpu>
+  <cpu mode='host-model' check='partial'><model>EPYC</model><topology sockets='1' cores='4' threads='1'/><feature policy='require' name='topoext'/></cpu>
   <devices>
     <disk type='file' device='disk'><source file='/var/lib/libvirt/images/myvm.qcow2'/>
       <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0'/></disk>
@@ -914,6 +1025,8 @@ mod tests {
   </devices>
 </domain>"#;
 
+    const STATS: &str = "/run/user/1000/conduit/myvm/stats.sock";
+
     fn edit_as(x: &str, windows: bool) -> String {
         edit_domain(
             x,
@@ -922,7 +1035,12 @@ mod tests {
                 gpu_sock: Path::new("/run/user/1000/conduit/myvm/gpu-libvirt.sock"),
                 vfs_sock: Path::new("/run/user/1000/conduit/myvm/vfs-libvirt.sock"),
                 console_sock: Path::new(CONSOLE),
+                stats_sock: Path::new(STATS),
                 vm: "myvm",
+                shares: &[Wire {
+                    tag: "conduit-Conduit".into(),
+                    sock: PathBuf::from("/run/user/1000/conduit/myvm/share-Conduit.sock"),
+                }],
                 windows,
             },
         )
@@ -1123,6 +1241,15 @@ mod tests {
         let cpu = root.get_child("cpu").unwrap();
         assert_eq!(cpu.attributes["mode"], "host-passthrough");
         assert!(cpu.get_child("topology").is_some(), "topology kept");
+        assert!(
+            cpu.children.iter().any(|n| matches!(n, XMLNode::Element(e)
+                if e.name == "feature" && e.attributes.get("name").map(String::as_str) == Some("topoext"))),
+            "cpu features kept"
+        );
+        assert!(
+            cpu.get_child("model").is_none(),
+            "no model in host-passthrough"
+        );
         assert_eq!(
             cpu.get_child("maxphysaddr").unwrap().attributes["mode"],
             "passthrough"
@@ -1216,7 +1343,7 @@ mod tests {
         );
         assert_eq!(twice.matches("<qemu:commandline").count(), 1);
         assert_eq!(twice.matches("conduit:vm").count(), 1);
-        assert_eq!(twice.matches("<filesystem").count(), 1);
+        assert_eq!(twice.matches("<filesystem").count(), 2);
         assert!(
             twice.contains("value=\"-s\""),
             "user's own args are kept: {twice}"
@@ -1263,7 +1390,8 @@ mod tests {
         assert!(all(&dev, "redirfilter").is_empty());
         assert!(all(&dev, "smartcard").is_empty());
         let ch = all(&dev, "channel");
-        assert_eq!(ch.len(), 1, "the guest agent channel stays: {out}");
+        assert_eq!(ch.len(), 2, "the guest agent channel stays: {out}");
+        assert!(out.contains("org.qemu.guest_agent.0"), "{out}");
         assert_eq!(ch[0].attributes["type"], "unix");
         assert_eq!(all(&dev, "audio")[0].attributes["type"], "none");
         assert_eq!(all(&dev, "sound").len(), 1, "the sound card stays");
@@ -1302,13 +1430,118 @@ mod tests {
     }
 
     #[test]
+    fn stats_channel_added_once_with_a_controller() {
+        let out = edit(WIN11);
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let dev = root.get_child("devices").unwrap();
+        let chans: Vec<_> = elements(dev)
+            .filter(|e| e.name == "channel")
+            .filter(|e| {
+                e.get_child("target")
+                    .unwrap()
+                    .attributes
+                    .get("name")
+                    .map(String::as_str)
+                    == Some("org.conduit.stats.0")
+            })
+            .collect();
+        assert_eq!(chans.len(), 1, "{out}");
+        assert_eq!(chans[0].attributes["type"], "unix");
+        let src = chans[0].get_child("source").unwrap();
+        assert_eq!(src.attributes["mode"], "bind");
+        assert_eq!(src.attributes["path"], STATS);
+        assert_eq!(
+            chans[0].get_child("target").unwrap().attributes["type"],
+            "virtio"
+        );
+        let ctl = |d: &Element| {
+            elements(d)
+                .filter(|e| {
+                    e.name == "controller"
+                        && e.attributes.get("type").map(String::as_str) == Some("virtio-serial")
+                })
+                .count()
+        };
+        assert_eq!(ctl(dev), 1, "{out}");
+        assert_eq!(edit(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn stats_channel_keeps_an_existing_controller_and_other_channels() {
+        let x = "<domain type='kvm'><name>a</name><devices>\
+            <controller type='virtio-serial' index='0'/>\
+            <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>\
+            </devices></domain>";
+        let out = edit(x);
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let dev = root.get_child("devices").unwrap();
+        assert_eq!(
+            elements(dev).filter(|e| e.name == "controller").count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(
+            elements(dev).filter(|e| e.name == "channel").count(),
+            2,
+            "{out}"
+        );
+        assert!(out.contains("org.qemu.guest_agent.0"));
+    }
+
+    fn share_targets(xml: &str) -> Vec<String> {
+        let root = Element::parse(xml.as_bytes()).unwrap();
+        let devices = root.get_child("devices").unwrap();
+        elements(devices)
+            .filter(|e| e.name == "filesystem")
+            .filter_map(|e| e.get_child("target")?.attributes.get("dir").cloned())
+            .collect()
+    }
+
+    #[test]
+    fn attach_adds_the_default_share_once() {
+        let out = edit(WIN11);
+        assert_eq!(share_targets(&out), ["nvidia", "conduit-Conduit"], "{out}");
+        assert!(out.contains("share-Conduit.sock"));
+        assert_eq!(share_targets(&edit(&out)), ["nvidia", "conduit-Conduit"]);
+    }
+
+    #[test]
+    fn apply_shares_replaces_only_ours() {
+        let with_user_fs = edit(WIN11).replace(
+            "</devices>",
+            "<filesystem type='mount'><driver type='virtiofs'/><source dir='/tmp'/><target dir='hostshare'/></filesystem></devices>",
+        );
+        let ws = [
+            Wire {
+                tag: "conduit-A".into(),
+                sock: PathBuf::from("/s/a.sock"),
+            },
+            Wire {
+                tag: "conduit-B".into(),
+                sock: PathBuf::from("/s/b.sock"),
+            },
+        ];
+        let out = apply_shares(&with_user_fs, &ws).unwrap();
+        assert_eq!(
+            share_targets(&out),
+            ["nvidia", "hostshare", "conduit-A", "conduit-B"],
+            "{out}"
+        );
+        let none = apply_shares(&out, &[]).unwrap();
+        assert_eq!(share_targets(&none), ["nvidia", "hostshare"]);
+        assert!(apply_shares("<network/>", &ws).is_err());
+    }
+
+    #[test]
     fn rejects_non_domain() {
         let w = Wiring {
             emulator: Path::new("/q"),
             gpu_sock: Path::new("/s"),
             vfs_sock: Path::new("/v"),
             console_sock: Path::new("/c"),
+            stats_sock: Path::new("/t"),
             vm: "x",
+            shares: &[],
             windows: false,
         };
         assert!(edit_domain("<network/>", &w).is_err());

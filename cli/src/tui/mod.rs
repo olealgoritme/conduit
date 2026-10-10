@@ -8,7 +8,7 @@
 
 mod data;
 mod draw;
-mod nvml;
+pub(crate) mod nvml;
 
 use anyhow::Result;
 use crossterm::event::{
@@ -51,6 +51,7 @@ pub enum Act {
     Poweroff,
     Pause,
     Mode,
+    Shares,
     Logs,
     Doctor,
     Help,
@@ -68,6 +69,7 @@ impl Act {
             Act::Poweroff => "poweroff",
             Act::Pause => "pause",
             Act::Mode => "mode",
+            Act::Shares => "shares",
             Act::Logs => "logs",
             Act::Doctor => "doctor",
             Act::Help => "help",
@@ -99,6 +101,13 @@ pub enum Modal {
         vm: String,
         items: Vec<(String, String)>,
         idx: usize,
+    },
+    /// The VM's shared folders; `input` is the path being typed for `a`.
+    Shares {
+        vm: String,
+        items: Vec<crate::shares::Share>,
+        idx: usize,
+        input: Option<String>,
     },
     Help,
 }
@@ -332,6 +341,21 @@ impl App {
                     idx,
                 });
             }
+            Act::Shares => {
+                if vm.libvirt.is_none() {
+                    self.note(
+                        Level::Warn,
+                        format!("{name} is not a libvirt VM (`conduit attach {name}` first)"),
+                    );
+                    return;
+                }
+                self.modal = Some(Modal::Shares {
+                    items: crate::shares::load(&name).unwrap_or_default(),
+                    vm: name,
+                    idx: 0,
+                    input: None,
+                });
+            }
             Act::View => {
                 if vm.viewer {
                     self.note(
@@ -505,9 +529,64 @@ impl App {
             self.quit = true;
             return;
         }
+        let mut todo: Option<(String, String, Vec<String>)> = None;
         if let Some(m) = &mut self.modal {
             match m {
                 Modal::Help => self.modal = None,
+                Modal::Shares {
+                    vm,
+                    items,
+                    idx,
+                    input,
+                } => {
+                    let cmd = |what: &str, rest: Vec<String>| {
+                        let mut a = vec!["share".to_string(), what.to_string(), vm.clone()];
+                        a.extend(rest);
+                        (vm.clone(), format!("{what} shared folder on"), a)
+                    };
+                    if let Some(text) = input {
+                        match code {
+                            KeyCode::Esc => *input = None,
+                            KeyCode::Backspace => {
+                                text.pop();
+                            }
+                            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                                text.push(c)
+                            }
+                            KeyCode::Enter => {
+                                let p = text.trim().to_string();
+                                *input = None;
+                                if !p.is_empty() {
+                                    todo = Some(cmd("add", vec![expand_home(&p)]));
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match code {
+                            KeyCode::Up | KeyCode::Char('k') => *idx = idx.saturating_sub(1),
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                *idx = (*idx + 1).min(items.len().saturating_sub(1))
+                            }
+                            KeyCode::Char('a') => *input = Some(String::new()),
+                            KeyCode::Char('d') => {
+                                if let Some(s) = items.get(*idx) {
+                                    todo = Some(cmd("rm", vec![s.name.clone()]));
+                                }
+                            }
+                            KeyCode::Char('o') => {
+                                if let Some(s) = items.get(*idx) {
+                                    let state = if s.read_only { "off" } else { "on" };
+                                    todo = Some(cmd("ro", vec![s.name.clone(), state.into()]));
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('F') => {
+                                self.modal = None
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 Modal::Confirm { act, .. } => match code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                         let a = *act;
@@ -529,6 +608,9 @@ impl App {
                     }
                     _ => self.modal = None,
                 },
+            }
+            if let Some((vm, label, args)) = todo {
+                self.run(&vm, &label, args);
             }
             return;
         }
@@ -585,6 +667,7 @@ impl App {
             KeyCode::Char('f') => self.act(Act::Poweroff),
             KeyCode::Char('p') => self.act(Act::Pause),
             KeyCode::Char('m') => self.act(Act::Mode),
+            KeyCode::Char('F') => self.act(Act::Shares),
             KeyCode::Char('l') => self.act(Act::Logs),
             KeyCode::Char('D') => self.act(Act::Doctor),
             KeyCode::Char('?') | KeyCode::F(1) => self.act(Act::Help),
@@ -669,6 +752,15 @@ struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
         restore();
+    }
+}
+
+/// A typed path: a leading `~/` is the home folder.
+fn expand_home(p: &str) -> String {
+    match p.strip_prefix("~/") {
+        Some(rest) => crate::paths::home().join(rest).display().to_string(),
+        None if p == "~" => crate::paths::home().display().to_string(),
+        None => p.to_string(),
     }
 }
 
@@ -770,6 +862,11 @@ pub fn run() -> Result<()> {
         {
             app.logs_at = None;
             app.capture(Tab::Logs);
+        }
+        if let Some(Modal::Shares { vm, items, idx, .. }) = &mut app.modal {
+            // The `conduit share` child rewrites the list; follow it.
+            *items = crate::shares::load(vm).unwrap_or_default();
+            *idx = (*idx).min(items.len().saturating_sub(1));
         }
         app.reap();
         term.draw(|f| draw::draw(f, &mut app))?;
@@ -898,6 +995,12 @@ mod tests {
                     vm: "win11".into(),
                     items: vec![("1920x1080@240".into(), String::new()); 9],
                     idx: 3,
+                },
+                Modal::Shares {
+                    vm: "win11".into(),
+                    items: vec![crate::shares::default_share("win11")],
+                    idx: 0,
+                    input: Some("~/Doc".into()),
                 },
             ] {
                 a.modal = Some(m);

@@ -600,6 +600,11 @@ fn log_to(file: &Path, append: bool) -> Result<()> {
     Ok(())
 }
 
+/// The libvirt URI a VM of Conduit's was attached through.
+pub fn link_uri(name: &str) -> Result<String> {
+    Ok(need_link(name)?.uri)
+}
+
 fn need_link(name: &str) -> Result<Link> {
     Link::load(name).ok_or_else(|| {
         oops(
@@ -742,6 +747,49 @@ pub fn virtiofsd_exec(name: &str) -> Result<()> {
         eprintln!(
             "conduit: this virtiofsd has no --readonly; the NVIDIA share is writable by the VM"
         );
+    }
+    let e = cmd.exec();
+    Err(e).with_context(|| format!("could not run {}", vfsd.display()))
+}
+
+/// `conduit _share VM:SHARE` (conduit-share@VM:SHARE.service): become virtiofsd
+/// for one shared folder on systemd's socket (fd 3).
+pub fn share_exec(instance: &str) -> Result<()> {
+    let (vm, name) = instance.rsplit_once(':').ok_or_else(|| {
+        oops(
+            format!("bad shared folder instance \"{instance}\""),
+            "Expected VM:SHARE",
+        )
+    })?;
+    log_to(&logs_dir(vm).join(format!("share-{name}.log")), false)?;
+    let share = crate::shares::load(vm)?
+        .into_iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| {
+            oops(
+                format!("{vm} has no shared folder \"{name}\""),
+                format!("`conduit share list {vm}` shows them"),
+            )
+        })?;
+    if !Path::new(&share.path).is_dir() {
+        return Err(oops(
+            format!("the shared folder {} does not exist", share.path),
+            format!("Create it, or `conduit share rm {vm} {name}`"),
+        ));
+    }
+    let vfsd = run::need_virtiofsd()?;
+    let mut cmd = Command::new(&vfsd);
+    cmd.arg("--fd=3")
+        .arg(format!("--shared-dir={}", share.path))
+        .args(["--sandbox=none", "--cache=auto", "--log-level=warn"]);
+    if share.read_only {
+        if !crate::qemu::supports_readonly(&vfsd) {
+            return Err(oops(
+                format!("\"{name}\" is read-only but this virtiofsd has no --readonly"),
+                format!("Update virtiofsd (1.11 or newer) or `conduit share ro {vm} {name} off`"),
+            ));
+        }
+        cmd.arg("--readonly");
     }
     let e = cmd.exec();
     Err(e).with_context(|| format!("could not run {}", vfsd.display()))

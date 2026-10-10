@@ -1,0 +1,10 @@
+[Unit]
+Description=Conduit shared folders from the host (/mnt/conduit)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /usr/local/sbin/conduit-shares
+
+[Install]
+WantedBy=multi-user.target

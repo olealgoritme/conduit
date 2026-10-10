@@ -165,7 +165,12 @@ runs `ldconfig`), the udev rules, `/etc/ld.so.conf.d/zz-conduit-nvidia.conf`
 and the loader paths into the share (`/etc/profile.d/conduit-nvidia.sh`,
 `/etc/environment.d/90-conduit-nvidia.conf`, and the same variables as a
 `# >>> conduit >>>` block in `/etc/environment`, which also reaches a display
-manager's greeter):
+manager's greeter).
+
+It also installs `conduit-shares.service` (with `/usr/local/sbin/conduit-shares`
+and a udev rule): every virtiofs device tagged `conduit-NAME` (the VM's shared
+folders, `conduit share`) is mounted at `/mnt/conduit/NAME`, also when added
+while the VM runs. The loader files above point at:
 
 - the Vulkan ICD and GLVND EGL vendor files from the share;
 - EGL external platforms from the share first, then the distribution's

@@ -27,6 +27,8 @@ crossterm = { version = "0.28", features = ["use-dev-tty"] }
 abi = { path = "../host/backend/gen" }
 # The backend's trace format, for `conduit trace` (docs/TRACING.md).
 conduit-trace = { path = "../host/backend/trace" }
+# The GPU readings line sent to a guest over the stats channel.
+conduit-stats = { path = "../host/stats" }
 # The frame stage table and formats, for `conduit trace NAME stages`
 # (docs/TRACING.md "Frame stage timing"); no renderer feature, so only libc.
 conduit-venus = { path = "../host/venus" }

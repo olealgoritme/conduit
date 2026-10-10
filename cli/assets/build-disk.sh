@@ -136,6 +136,11 @@ install_guest_files() {
   install -m644 "$G/71-conduit-seat.rules" "$MNT/etc/udev/rules.d/71-conduit-seat.rules"
   install -m644 "$G/zz-conduit-nvidia.conf" "$MNT/etc/ld.so.conf.d/zz-conduit-nvidia.conf"
   install -m644 "$G/conduit-nvidia.sh" "$MNT/etc/profile.d/conduit-nvidia.sh"
+  install -d "$MNT/mnt/conduit" "$MNT/usr/local/sbin"
+  install -m755 "$G/conduit-shares.sh" "$MNT/usr/local/sbin/conduit-shares"
+  install -m644 "$G/conduit-shares.service" "$MNT/etc/systemd/system/conduit-shares.service"
+  in_vm systemctl enable conduit-shares.service >/dev/null
+  install -m644 "$G/72-conduit-shares.rules" "$MNT/etc/udev/rules.d/72-conduit-shares.rules"
   install -d "$MNT/etc/environment.d"
   install -m644 "$G/90-conduit-nvidia.conf" "$MNT/etc/environment.d/90-conduit-nvidia.conf"
   # Serial console for `conduit logs NAME vm`: ttyS0 under QEMU, hvc0 built-in.

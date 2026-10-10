@@ -79,6 +79,14 @@ need relative mouse input), and run games at the VM's display mode (e.g.
 5120x1440, "Fullscreen Windowed"). The guest has no scaler, so a lower game
 resolution does not fill the screen. Ctrl+Alt+G again releases the mouse.
 
+**Conduit GPU tray.** The driver package also installs a small tray app that
+starts at logon with no prompt. Its icon shows the host GPU's live temperature
+or load; clicking it opens a popup with load, power and temperature, 60-second
+graphs and VRAM, clock and fan bars. Its Shared folders menu opens the host
+folders mounted as drives, Explorer's **Send to → Conduit host** copies files
+to the default folder, and with **Keep popup open** you can drag files onto the
+popup ([docs/WINDOWS.md](docs/WINDOWS.md#gpu-stats-tray)).
+
 More detail (building the driver yourself, knobs, troubleshooting):
 [docs/WINDOWS.md](docs/WINDOWS.md).
 
@@ -238,6 +246,11 @@ automatically.
 
 Run `conduit` on its own: every VM, the host and the GPU live, with one-key
 view, start, shutdown, reset and logs (`?` lists the keys).
+
+Every libvirt VM also shares host folders: `~/Conduit/NAME` is shared from the
+first `conduit attach`, and `conduit share add NAME DIR` (or `F` in the
+dashboard) adds more. Windows guests mount them as drives (Z: downward), Linux
+guests under `/mnt/conduit/NAME`. Details in docs/CLI.md and docs/WINDOWS.md.
 
 ### Everyday commands
 
