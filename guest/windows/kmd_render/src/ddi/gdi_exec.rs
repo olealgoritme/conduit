@@ -914,7 +914,8 @@ pub(crate) fn admit_unclaimed(adapter: &AdapterContext, ctx: usize, va: u64, siz
     };
     match exact {
         ga::Recordless::Exact { .. } => {
-            VA_HIT.fetch_add(1, Ordering::Relaxed);
+            // Saturating: a wrap would unpair for a few submissions.
+            let _ = VA_HIT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_add(1)));
         }
         ga::Recordless::Unaddressed => {
             VA_NONE.fetch_add(1, Ordering::Relaxed);

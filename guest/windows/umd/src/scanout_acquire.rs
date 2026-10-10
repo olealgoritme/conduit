@@ -696,20 +696,27 @@ pub(crate) fn retry_register(dev: &HeliosDevice) {
         let Ok(mut reg) = REGISTRY.lock() else {
             return;
         };
-        // Recompute the earliest due time from the entries that still wait.
+        let picked = match reg.iter_mut().find(|e| e.key == key) {
+            Some(e) => match e.retry.as_mut() {
+                Some(r) if r.due(now) => {
+                    // Not due again until this attempt's outcome reschedules it.
+                    r.refused_again(now);
+                    Some((e.kt_callbacks, e.rt_adapter, e.h_rt_device))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        // The earliest due time of the entries that still wait, after the
+        // reschedule above, and never sooner than one retry interval: a due
+        // device that does not present (an idle one in a multi-device process)
+        // must not send every other device's present through this mutex.
         let next = reg.iter().filter_map(|e| e.retry.map(|r| r.due_ms())).min().unwrap_or(u64::MAX);
-        RETRY_NEXT_DUE_MS.store(next, Ordering::Relaxed);
-        let Some(e) = reg.iter_mut().find(|e| e.key == key) else {
+        RETRY_NEXT_DUE_MS.store(next.max(now + RetrySchedule::FIRST_MS), Ordering::Relaxed);
+        let Some(picked) = picked else {
             return;
         };
-        match e.retry.as_mut() {
-            Some(r) if r.due(now) => {
-                // Not due again until this attempt's outcome reschedules it.
-                r.refused_again(now);
-            }
-            _ => return,
-        }
-        (e.kt_callbacks, e.rt_adapter, e.h_rt_device)
+        picked
     };
     // SAFETY: the callback table and handles belong to this live device (its
     // DDI is running); teardown removes the entry only inside DestroyDevice.
