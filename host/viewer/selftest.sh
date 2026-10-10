@@ -360,6 +360,27 @@ a 10 20
 '
 check "ABS flows when focused and inside" '[[:space:]]ABS[[:space:]]+flags=-F x=10 y=20' "$CASE_OUT"
 
+# A re-sent position (the picture moved under a still pointer) must reach
+# the guest even when it equals the last one: one pixel beside it first.
+run_case 'f 1
+p 1
+a 10 20
+A 10 20
+'
+check "a resync sends the neighbour pixel" '[[:space:]]ABS[[:space:]]+flags=-F x=9 y=20' "$CASE_OUT"
+check "then the position itself"            '[[:space:]]ABS[[:space:]]+flags=-F x=10 y=20' "$CASE_OUT"
+
+run_case 'f 1
+p 1
+A 0 5
+'
+check "at the left edge the neighbour is to the right" '[[:space:]]ABS[[:space:]]+flags=-F x=1 y=5' "$CASE_OUT"
+
+run_case 'f 1
+A 10 20
+'
+nocheck "no resync while the pointer is outside" '[[:space:]]ABS[[:space:]]' "$CASE_OUT"
+
 # 29=LEFTCTRL 56=LEFTALT 34=G
 run_case 'f 1
 p 1
