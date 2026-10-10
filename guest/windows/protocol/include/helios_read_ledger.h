@@ -137,8 +137,8 @@
 /* UNREGISTER / UNMAP: nothing matched the caller's device. */
 #define HELIOS_SCANOUT_ACQ_NOT_FOUND 2u
 /* REGISTER: the event table is full (KMD counter AqRgF). The caller still gates its rewrites
- * on the ledger, but with no event its signaler sees a retirement only on its 10 ms poll:
- * loud, never wedged, and slow. */
+ * on the ledger, but with no event its signaler sees a retirement only on its 1 ms poll:
+ * loud, never wedged. */
 #define HELIOS_SCANOUT_ACQ_TABLE_FULL 3u
 
 struct HeliosEscapeHeader {

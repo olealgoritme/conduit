@@ -214,3 +214,11 @@ D3D12).
 - `guest/windows/tools/scanout_timeline_dump.c` reads the KMD's scanout
   timeline (an escape; it never submits work) to CSV around a workload, to
   see where frame time goes at high refresh rates.
+- Windowed apps (DWM composes them) learn that their frame was copied to the
+  desktop from a per-device event the KMD signals. The KMD's table holds 64
+  of these (DWM uses about a dozen; most apps one to three). The `AqLive`
+  counter in the KMD service key is how many are in use, `AqRgF` how many
+  registrations were refused. A refused app polls instead: every 1 ms while
+  it has a frame waiting, every 10 ms when idle. Its UMD log
+  (`%ProgramData%\Helios\umd-<pid>.log`) says `event table FULL` when that
+  happens.
