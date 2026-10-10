@@ -11,3 +11,5 @@ test-relacc
 test/utf8_extracted.inc
 *.d
 nvgpu-scanout-test
+test-view
+test-ui
