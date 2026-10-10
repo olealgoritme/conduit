@@ -66,13 +66,23 @@ pub const NVGPU_F_SCANOUT_PRESENTED: u64 = 1 << 19;
 /// comes up and on every change. The KMD acks it with the display half and offers those
 /// modes to Windows (`kmd_logic::mode_list`).
 pub const NVGPU_F_MODE_LIST: u64 = 1 << 21;
+/// `NVGPU_F_EVENT_PACKED` (virtio feature bit 22; config `features` bit 22 stays unused).
+/// The host offers it always. A guest that acks it reads every `EventReady` (8) in an
+/// event-queue buffer: the host packs the reports of one pass of its event thread into as
+/// few buffers as fit, whole 16-byte `MsgHeader`s back to back (used length a multiple of
+/// 16, at most [`EVENT_READY_PER_BUFFER_MAX`] of them, nothing but `EventReady` in such a
+/// buffer), and raises one interrupt per pass. The KMD acks it whenever it runs the event
+/// queue (`nvrm_events`).
+pub const NVGPU_F_EVENT_PACKED: u64 = 1 << 22;
+/// The most `EventReady` messages the host packs into one buffer (`NVGPU_F_EVENT_PACKED`).
+pub const EVENT_READY_PER_BUFFER_MAX: usize = 32;
 /// Conduit device features this driver acks when the device offers them (and, for
 /// `NVGPU_F_SCANOUT_RELEASE`, when the display half is on; for
 /// `NVGPU_F_SCANOUT_PRESENTED`, when also `FlipDoneFromHost` is set; for
-/// `NVGPU_F_MODE_LIST`, with the display half): the optional set, besides
-/// `VIRTIO_F_VERSION_1`.
+/// `NVGPU_F_MODE_LIST`, with the display half; `NVGPU_F_EVENT_PACKED` always): the
+/// optional set, besides `VIRTIO_F_VERSION_1`.
 pub const CONDUIT_OPTIONAL_FEATURES: u64 =
-    NVGPU_F_SCANOUT_RELEASE | NVGPU_F_SCANOUT_PRESENTED | NVGPU_F_MODE_LIST;
+    NVGPU_F_SCANOUT_RELEASE | NVGPU_F_SCANOUT_PRESENTED | NVGPU_F_MODE_LIST | NVGPU_F_EVENT_PACKED;
 
 const _: () = assert!(CONDUIT_OPTIONAL_FEATURES & NVGPU_F_TAKES_INPUT == 0);
 
