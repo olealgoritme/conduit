@@ -3184,6 +3184,21 @@ static int x11_tick_ui(struct nb_x11 *x, int next)
     uint64_t now = x11_now_ms();
     int due;
 
+    /* A new guest mode: apply its per-mode rule (nb_vstore_guest_mode). */
+    if (x->current >= 0) {
+        unsigned bw = x->bufs[x->current].w, bh = x->bufs[x->current].h;
+
+        if (bw != nb_guest_w || bh != nb_guest_h) {
+            unsigned ch = nb_guest_mode_changed(&x->vst, bw, bh, x->ui.notice,
+                                                sizeof(x->ui.notice));
+
+            if (ch & NB_VIEW_CH_LAYOUT) {
+                x11_ui_do(x, NB_UI_VIEW | NB_UI_REDRAW |
+                                 (x->ui.notice[0] ? NB_UI_NOTICE : 0));
+            }
+        }
+    }
+
     if (x->cfg && x->cfg->open_menu && x->win_w > 0) {
         static bool opened;     /* --open-menu: once, when there is a window */
 
