@@ -1,7 +1,6 @@
 # D3D11 threaded front end (UMD worker thread)
 
-Status: phase 1 implemented behind `UmdThreadedFrontend` (default off), first in package 22.22.405.46; not yet
-measured in the guest.
+Status: phase 1, on by default from 22.22.405.48 (`UmdThreadedFrontend=0` turns it off).
 
 ## 1. Why
 
@@ -313,8 +312,8 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 
 ## 7. Knobs and counters
 
-- `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 0 = off (default until validated), 1 = on for every process
-  except dwm.exe, 2 = on including dwm.exe. Process override `HELIOS_D3D11_FRONTEND=0|1`.
+- `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 0 = off, 1 = on for every process except dwm.exe (default
+  from 22.22.405.48), 2 = on including dwm.exe. Process override `HELIOS_D3D11_FRONTEND=0|1`.
 - `UmdFrontendRingKiB` (DWORD, default 4096, clamped 256–65536).
 - One summary line at `DestroyDevice` (and every 4096 drains with `UmdTrace`): records, bytes, sync calls and drains by
   reason, drain wait µs (sum, max), producer full-waits, worker parks/wakes, destroys queued/inline/waited, GetData
@@ -354,6 +353,18 @@ the runtime, and the discard map's allocation still ran on the app thread. Found
 the producer's cursor line on every forward call (the ordering check tested the cursors before the thread), the
 producer-hot fields were not on their own cache lines, and the slice allocation now leaves the app thread. CS2's
 front-end cost is cold-miss bound, which drawbench does not reproduce; it needs its own A/B.
+
+On 22.22.405.47 (with those changes), `present` mode (flip swap chain, Present every frame), two alternations:
+
+| mode | off: µs/draw, frame sd | on: µs/draw, frame sd |
+|---|---|---|
+| real, 2000 draws | 1.08 / 1.00, sd 18% / 12% | 0.95 / 0.90, sd 18% / 12% |
+| hot, 2000 draws | 0.29 / 0.30, sd 14% / 27% | 0.46 / 0.43, sd 11% / 11% |
+
+The game-like load gains 10–14% with unchanged pacing; the cache-hot loop still loses (record and replay cost more
+than the inline path there). CS2 (user test): higher average frame rate with the front end on. The render thread now
+spins (up to 4 ms) instead of sleeping while it waits at Present for the frame's tail, and the worker spins 100 µs
+before parking, so a frame boundary is not a sleep/wake handshake.
 
 ## 10. Review
 

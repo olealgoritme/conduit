@@ -28,7 +28,7 @@
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
-//! | `UmdThreadedFrontend` | DWORD | `0` (threaded D3D11 front end: 1 = all but dwm.exe, 2 = all; env `HELIOS_D3D11_FRONTEND=0/1`) |
+//! | `UmdThreadedFrontend` | DWORD | `1` (threaded D3D11 front end: 0 = off, 1 = all but dwm.exe, 2 = all; env `HELIOS_D3D11_FRONTEND=0/1`) |
 //! | `UmdFrontendRingKiB` | DWORD | `4096` (its command ring, clamped 256..65536) |
 //! | `UmdDdiLevel` | DWORD | `0x10` (D3D11 DDI WDDM1.3; `0x24` adds WDDM2.3) |
 //! | `UmdDdiLevelDwm` | DWORD | `0x10` (the same, dwm.exe only) |
@@ -365,9 +365,9 @@ pub(crate) fn umd_deferred_diagnostics() -> bool {
 }
 
 /// `UmdThreadedFrontend`: the D3D11 threaded front end
-/// (`docs/d3d11-threaded-frontend.md`). 0 (default) = off, 1 = on for every
+/// (`docs/d3d11-threaded-frontend.md`). 0 = off, 1 (default) = on for every
 /// process except dwm.exe, 2 = on including dwm.exe.
-pub(crate) static UMD_THREADED_FRONTEND: DwordKnob = DwordKnob::new(c"UmdThreadedFrontend", 0);
+pub(crate) static UMD_THREADED_FRONTEND: DwordKnob = DwordKnob::new(c"UmdThreadedFrontend", 1);
 
 /// `UmdFrontendRingKiB`: the threaded front end's command ring per immediate
 /// context, KiB.

@@ -59,7 +59,7 @@ pub const MIN_RING_BYTES: usize = 4096;
 pub const MAX_RING_BYTES: usize = 64 << 20;
 
 /// Worker spin on an empty ring before it parks.
-const WORKER_SPIN: Duration = Duration::from_micros(20);
+const WORKER_SPIN: Duration = Duration::from_micros(100);
 /// A waiter's spin before it sleeps on the condvar.
 const WAITER_SPIN: Duration = Duration::from_micros(100);
 /// Records between two waiter/destroy checks while the worker is busy.
@@ -398,12 +398,20 @@ impl CmdQueue {
     /// once (the worker runs records in order, so anything it could wait for
     /// is either done or behind the record it is running).
     pub fn wait_done(&self, pos: u64) -> bool {
+        self.wait_done_spinning(pos, WAITER_SPIN)
+    }
+
+    /// [`wait_done`](Self::wait_done) that spins up to `spin` before it
+    /// sleeps: for a waiter with nothing else to do whose wait is normally
+    /// short (the render thread at Present waiting for the frame's tail), a
+    /// sleep/wake handshake would add its latency to every frame.
+    pub fn wait_done_spinning(&self, pos: u64, spin: Duration) -> bool {
         if self.read.0.load(Ordering::Acquire) >= pos || self.is_worker() {
             return false;
         }
         let t0 = Instant::now();
         self.kick();
-        while t0.elapsed() < WAITER_SPIN {
+        while t0.elapsed() < spin {
             if self.read.0.load(Ordering::Acquire) >= pos {
                 self.note_wait(t0);
                 return true;
@@ -441,6 +449,12 @@ impl CmdQueue {
     pub fn drain(&self) -> bool {
         self.stats.0.drains.fetch_add(1, Ordering::Relaxed);
         self.wait_done(self.written())
+    }
+
+    /// [`drain`](Self::drain) spinning up to `spin` before sleeping.
+    pub fn drain_spinning(&self, spin: Duration) -> bool {
+        self.stats.0.drains.fetch_add(1, Ordering::Relaxed);
+        self.wait_done_spinning(self.written(), spin)
     }
 
     /// Run `run` once the worker has passed `pos` (normally the producer's
