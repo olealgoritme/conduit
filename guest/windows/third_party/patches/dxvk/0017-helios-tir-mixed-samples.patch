@@ -1,0 +1,328 @@
+Helios DXVK fork: D3D11.1 target-independent rasterization on mixed samples
+
+Conduit guest/windows. Applied after 0016 by ci/windows/Build-Driver.ps1.
+
+Direct2D fills complex geometry (the Windows 11 shell's vector icons) with
+target-independent rasterization: ForcedSampleCount 16 in a rasterizer state
+made with CreateRasterizerState1, a single-sample render target, and a pixel
+shader that derives its alpha from the covered samples in SV_Coverage. DXVK
+dropped ForcedSampleCount from D3D11_RASTERIZER_DESC1 (only the DESC2 path
+kept it) and took the rasterization sample count from the render targets
+whenever one was bound, so those draws rasterized at one sample and every
+covered pixel got 1/16 of its coverage (guest/windows/tools/d2d_tir_probe.cpp:
+maximum alpha 16 instead of 255).
+
+- D3D11RasterizerState::PromoteDesc(D3D11_RASTERIZER_DESC1) keeps
+  ForcedSampleCount, as the DESC2 path does.
+- With VK_NV_framebuffer_mixed_samples (NVK on Maxwell B+), the rasterizer
+  state's sample count is used when it is above the render targets' count
+  and neither a depth-stencil target nor sample rate shading is in use
+  (Vulkan does not allow mixed samples with either; D3D leaves both
+  undefined under TIR). DxvkGraphicsPipelineStateInfo::rasterizationSamples()
+  decides for the pipeline's multisample state, the dynamic rasterization
+  samples and the sample locations alike. Such pipelines chain
+  VkAttachmentSampleCountInfoAMD with the render targets' sample count
+  (dynamic rendering assumes the rasterization sample count otherwise),
+  which is part of the fragment output state's key.
+- The D3D11 rasterizer sample count spec constant (sampleinfo / samplepos on
+  the rasterizer) follows.
+
+Without the extension, or with sample counts that match, the rasterization
+sample count is what it was.
+
+diff --git a/src/d3d11/d3d11_context.cpp b/src/d3d11/d3d11_context.cpp
+index 2f10ce3b..5f95e942 100644
+--- a/src/d3d11/d3d11_context.cpp
++++ b/src/d3d11/d3d11_context.cpp
+@@ -3509,13 +3509,20 @@ namespace dxvk {
+     D3D11SpecData specData = {};
+     specData.sampleCount = m_state.om.sampleCount;
+ 
++    uint32_t forcedSampleCount = HeliosDdiScalarIsValid(D3D11HeliosDdiRsState) && m_state.rs.state
++      ? m_state.rs.state->Desc().ForcedSampleCount
++      : 0u;
++
+     if (unlikely(!specData.sampleCount)) {
+-      specData.sampleCount = HeliosDdiScalarIsValid(D3D11HeliosDdiRsState) && m_state.rs.state
+-        ? m_state.rs.state->Desc().ForcedSampleCount
+-        : 0u;
++      specData.sampleCount = forcedSampleCount;
+ 
+       if (!specData.sampleCount)
+         specData.sampleCount = 1u;
++    } else if (unlikely(forcedSampleCount > specData.sampleCount)
++            && m_device->features().nvFramebufferMixedSamples) {
++      // Target-independent rasterization: the rasterizer runs at
++      // the forced sample count (DxvkContext, mixed samples)
++      specData.sampleCount = forcedSampleCount;
+     }
+ 
+     EmitCs([
+diff --git a/src/d3d11/d3d11_rasterizer.cpp b/src/d3d11/d3d11_rasterizer.cpp
+index 558f3e34..6f38a8b5 100644
+--- a/src/d3d11/d3d11_rasterizer.cpp
++++ b/src/d3d11/d3d11_rasterizer.cpp
+@@ -163,7 +163,7 @@ namespace dxvk {
+     dstDesc.ScissorEnable         = pSrcDesc->ScissorEnable;
+     dstDesc.MultisampleEnable     = pSrcDesc->MultisampleEnable;
+     dstDesc.AntialiasedLineEnable = pSrcDesc->AntialiasedLineEnable;
+-    dstDesc.ForcedSampleCount     = 0;
++    dstDesc.ForcedSampleCount     = pSrcDesc->ForcedSampleCount;
+     dstDesc.ConservativeRaster    = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+     return dstDesc;
+   }
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index 3c0150ee..474ac2f4 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -3038,7 +3038,9 @@ namespace dxvk {
+     if (unlikely(rs.sampleCount() != m_state.gp.state.rs.sampleCount())) {
+       m_flags.set(DxvkContextFlag::GpDirtySampleLocations);
+ 
+-      if (!m_state.gp.state.ms.sampleCount())
++      // With mixed samples, the rasterizer state's sample count
++      // also applies with render targets bound
++      if (!m_state.gp.state.ms.sampleCount() || m_device->features().nvFramebufferMixedSamples)
+         m_flags.set(DxvkContextFlag::GpDirtyMultisampleState);
+ 
+       if (!m_features.test(DxvkContextFeature::VariableMultisampleRate))
+@@ -6952,6 +6954,11 @@ namespace dxvk {
+     if (diffFlags.test(DxvkGraphicsPipelineFlag::HasSampleMaskExport))
+       m_flags.set(DxvkContextFlag::GpDirtyMultisampleState);
+ 
++    // Sample rate shading rules out mixed samples (rasterizationSamples())
++    if (diffFlags.test(DxvkGraphicsPipelineFlag::HasSampleRateShading)
++     && m_device->features().nvFramebufferMixedSamples)
++      m_flags.set(DxvkContextFlag::GpDirtyMultisampleState, DxvkContextFlag::GpDirtySampleLocations);
++
+     m_descriptorState.dirtyStages(VK_SHADER_STAGE_ALL_GRAPHICS);
+ 
+     m_flags.set(DxvkContextFlag::GpDirtySpecDataBlock);
+@@ -8145,13 +8152,9 @@ namespace dxvk {
+ 
+       // Infer actual sample count from both the multisample state
+       // and rasterizer state, just like during pipeline creation
+-      VkSampleCountFlagBits sampleCount = VkSampleCountFlagBits(m_state.gp.state.ms.sampleCount());
+-
+-      if (!sampleCount) {
+-        sampleCount = m_state.gp.state.rs.sampleCount()
+-          ? VkSampleCountFlagBits(m_state.gp.state.rs.sampleCount())
+-          : VK_SAMPLE_COUNT_1_BIT;
+-      }
++      VkSampleCountFlagBits sampleCount = m_state.gp.state.rasterizationSamples(
++        m_device->features().nvFramebufferMixedSamples,
++        m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasSampleRateShading));
+ 
+       VkSampleMask sampleMask = m_state.gp.state.ms.sampleMask() & ((1u << sampleCount) - 1u);
+       m_cmd->cmdSetMultisampleState(sampleCount, sampleMask);
+@@ -8173,11 +8176,9 @@ namespace dxvk {
+       // render most of its content with regular sample positions and only draw a small portion
+       // with centered positions, so we would want the default interpretation to use default
+       // sample positions anyway, e.g. for the purpose of copies or resolves.
+-      VkSampleCountFlagBits msSampleCount = VkSampleCountFlagBits(m_state.gp.state.ms.sampleCount());
+-      VkSampleCountFlagBits rsSampleCount = VkSampleCountFlagBits(m_state.gp.state.rs.sampleCount());
+-
+-      if (!msSampleCount)
+-        msSampleCount = rsSampleCount ? rsSampleCount : VK_SAMPLE_COUNT_1_BIT;
++      VkSampleCountFlagBits msSampleCount = m_state.gp.state.rasterizationSamples(
++        m_device->features().nvFramebufferMixedSamples,
++        m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasSampleRateShading));
+ 
+       bool center = m_state.gp.state.useSampleLocations();
+       bool enable = m_device->canUseSampleLocations(msSampleCount);
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 33a41aa6..b2c70f0b 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -78,6 +78,7 @@ namespace dxvk {
+     HANDLE_EXT(khrWin32KeyedMutex);                \
+     HANDLE_EXT(amdBufferMarker);                   \
+     HANDLE_EXT(nvDeviceDiagnosticCheckpoints);     \
++    HANDLE_EXT(nvFramebufferMixedSamples);         \
+     HANDLE_EXT(nvLowLatency2);                     \
+     HANDLE_EXT(nvRawAccessChains);                 \
+     HANDLE_EXT(nvxBinaryImport);                   \
+@@ -1164,6 +1165,10 @@ namespace dxvk {
+       /* Reflex support */
+       ENABLE_EXT(nvLowLatency2, false),
+ 
++      /* D3D11.1 target-independent rasterization: rasterizer
++       * sample count above the render targets' sample count */
++      ENABLE_EXT(nvFramebufferMixedSamples, false),
++
+       /* Raw access chains, improves performance on NV */
+       ENABLE_EXT_FEATURE(nvRawAccessChains, shaderRawAccessChains, false),
+ 
+diff --git a/src/dxvk/dxvk_device_info.h b/src/dxvk/dxvk_device_info.h
+index 929e0d01..4b6cfbab 100644
+--- a/src/dxvk/dxvk_device_info.h
++++ b/src/dxvk/dxvk_device_info.h
+@@ -120,6 +120,7 @@ namespace dxvk {
+     VkBool32                                                  khrWin32KeyedMutex              = VK_FALSE;
+     VkBool32                                                  amdBufferMarker                 = VK_FALSE;
+     VkBool32                                                  nvDeviceDiagnosticCheckpoints   = VK_FALSE;
++    VkBool32                                                  nvFramebufferMixedSamples       = VK_FALSE;
+     VkBool32                                                  nvLowLatency2                   = VK_FALSE;
+     VkPhysicalDeviceRawAccessChainsFeaturesNV                 nvRawAccessChains               = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAW_ACCESS_CHAINS_FEATURES_NV };
+     VkBool32                                                  nvxBinaryImport                 = VK_FALSE;
+@@ -201,6 +202,7 @@ namespace dxvk {
+     VkExtensionProperties khrWin32KeyedMutex                = vk::makeExtension(VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME);
+     VkExtensionProperties amdBufferMarker                   = vk::makeExtension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+     VkExtensionProperties nvDeviceDiagnosticCheckpoints     = vk::makeExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
++    VkExtensionProperties nvFramebufferMixedSamples         = vk::makeExtension(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
+     VkExtensionProperties nvLowLatency2                     = vk::makeExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+     VkExtensionProperties nvRawAccessChains                 = vk::makeExtension(VK_NV_RAW_ACCESS_CHAINS_EXTENSION_NAME);
+     VkExtensionProperties nvxBinaryImport                   = vk::makeExtension(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
+diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
+index d0332175..c1576c7c 100644
+--- a/src/dxvk/dxvk_graphics.cpp
++++ b/src/dxvk/dxvk_graphics.cpp
+@@ -353,15 +353,26 @@ namespace dxvk {
+ 
+     // Set up multisample state based on shader info as well
+     // as rasterization state and render target sample counts.
+-    msInfo.rasterizationSamples = VkSampleCountFlagBits(state.ms.sampleCount());
++    bool sampleRateShading = shaders.fs && shaders.fs->metadata().flags.test(DxvkShaderFlag::HasSampleRateShading);
++    bool mixedSamples = device->features().nvFramebufferMixedSamples;
+ 
+-    if (!msInfo.rasterizationSamples) {
+-      msInfo.rasterizationSamples = state.rs.sampleCount()
+-        ? VkSampleCountFlagBits(state.rs.sampleCount())
+-        : VK_SAMPLE_COUNT_1_BIT;
++    msInfo.rasterizationSamples = state.rasterizationSamples(mixedSamples, sampleRateShading);
++
++    if (state.useMixedSamples(mixedSamples, sampleRateShading)) {
++      // Rasterizing at more samples than the render targets have needs
++      // the attachment sample counts with dynamic rendering, otherwise
++      // they are assumed to match the rasterization sample count.
++      rtMixedSamples = VkSampleCountFlagBits(state.ms.sampleCount());
++
++      for (uint32_t i = 0; i < rtInfo.colorAttachmentCount; i++)
++        rtColorSamples[i] = rtMixedSamples;
++
++      rtSampleInfo.colorAttachmentCount = rtInfo.colorAttachmentCount;
++      rtSampleInfo.pColorAttachmentSamples = rtColorSamples.data();
++      rtSampleInfo.pNext = std::exchange(rtInfo.pNext, &rtSampleInfo);
+     }
+ 
+-    if (shaders.fs && shaders.fs->metadata().flags.test(DxvkShaderFlag::HasSampleRateShading)) {
++    if (sampleRateShading) {
+       msInfo.sampleShadingEnable  = VK_TRUE;
+       msInfo.minSampleShading     = 1.0f;
+     }
+@@ -387,6 +398,7 @@ namespace dxvk {
+            && cbInfo.logicOp                  == other.cbInfo.logicOp
+            && cbInfo.attachmentCount          == other.cbInfo.attachmentCount
+            && msInfo.rasterizationSamples     == other.msInfo.rasterizationSamples
++           && rtMixedSamples                  == other.rtMixedSamples
+            && msInfo.sampleShadingEnable      == other.msInfo.sampleShadingEnable
+            && msInfo.minSampleShading         == other.msInfo.minSampleShading
+            && msInfo.alphaToCoverageEnable    == other.msInfo.alphaToCoverageEnable
+@@ -429,6 +441,7 @@ namespace dxvk {
+     hash.add(uint32_t(cbInfo.logicOp));
+     hash.add(uint32_t(cbInfo.attachmentCount));
+     hash.add(uint32_t(msInfo.rasterizationSamples));
++    hash.add(uint32_t(rtMixedSamples));
+     hash.add(uint32_t(msInfo.alphaToCoverageEnable));
+     hash.add(uint32_t(msInfo.alphaToOneEnable));
+     hash.add(uint32_t(msSampleMask));
+@@ -1724,12 +1737,9 @@ namespace dxvk {
+          << "  conservative:    " << (state.rs.conservativeMode() == VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT ? "no" : "yes") << std::endl;
+ 
+     // Log multisample state
+-    VkSampleCountFlags sampleCount = VK_SAMPLE_COUNT_1_BIT;
+-
+-    if (state.ms.sampleCount())
+-      sampleCount = state.ms.sampleCount();
+-    else if (state.rs.sampleCount())
+-      sampleCount = state.rs.sampleCount();
++    VkSampleCountFlags sampleCount = state.rasterizationSamples(
++      m_device->features().nvFramebufferMixedSamples,
++      m_shaders.fs && m_shaders.fs->metadata().flags.test(DxvkShaderFlag::HasSampleRateShading));
+ 
+     sstr << "Sample count: " << sampleCount << " [0x" << std::hex << state.ms.sampleMask() << std::dec << "]" << std::endl
+          << "  alphaToCoverage: " << (state.ms.enableAlphaToCoverage() ? "yes" : "no") << std::endl;
+diff --git a/src/dxvk/dxvk_graphics.h b/src/dxvk/dxvk_graphics.h
+index dc8a22a6..0e72c73e 100644
+--- a/src/dxvk/dxvk_graphics.h
++++ b/src/dxvk/dxvk_graphics.h
+@@ -111,6 +111,7 @@ namespace dxvk {
+     VkPipelineRenderingCreateInfo                   rtInfo = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+     VkPipelineColorBlendStateCreateInfo             cbInfo = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+     VkPipelineMultisampleStateCreateInfo            msInfo = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++    VkAttachmentSampleCountInfoAMD                  rtSampleInfo = { VK_STRUCTURE_TYPE_ATTACHMENT_SAMPLE_COUNT_INFO_AMD };
+ 
+     VkSampleMask                                    msSampleMask               = 0u;
+     VkBool32                                        cbUseDynamicBlendConstants = VK_FALSE;
+@@ -118,6 +119,11 @@ namespace dxvk {
+ 
+     std::array<VkPipelineColorBlendAttachmentState, MaxNumRenderTargets> cbAttachments  = { };
+     std::array<VkFormat,                            MaxNumRenderTargets> rtColorFormats = { };
++    std::array<VkSampleCountFlagBits,               MaxNumRenderTargets> rtColorSamples = { };
++
++    /// Render target sample count if it is below the
++    /// rasterization sample count (mixed samples), else 0
++    VkSampleCountFlagBits                           rtMixedSamples = VkSampleCountFlagBits(0);
+ 
+     VkImageAspectFlags                              feedbackLoop = 0u;
+ 
+diff --git a/src/dxvk/dxvk_graphics_state.h b/src/dxvk/dxvk_graphics_state.h
+index b467e8d8..9c7fd69a 100644
+--- a/src/dxvk/dxvk_graphics_state.h
++++ b/src/dxvk/dxvk_graphics_state.h
+@@ -703,6 +703,55 @@ namespace dxvk {
+           && rs.sampleCount() == VK_SAMPLE_COUNT_1_BIT;
+     }
+ 
++    /**
++     * \brief Rasterization sample count
++     *
++     * The render targets' sample count, or the rasterizer state's
++     * sample count if no render target is bound. With mixed samples
++     * (VK_NV_framebuffer_mixed_samples), a rasterizer sample count
++     * above the render targets' is used as is: D3D11.1 target-independent
++     * rasterization, e.g. Direct2D's anti-aliased fills with a forced
++     * sample count of 16 and a single-sample render target, whose pixel
++     * shaders derive coverage from SV_Coverage. Vulkan requires that no
++     * depth-stencil attachment and no sample rate shading are in use
++     * then, and D3D leaves both undefined with a forced sample count.
++     * \param [in] mixedSamples Whether mixed samples are supported
++     * \param [in] sampleRateShading Whether the fragment shader runs
++     *    at sample rate
++     * \returns Rasterization sample count
++     */
++    VkSampleCountFlagBits rasterizationSamples(
++            bool                            mixedSamples,
++            bool                            sampleRateShading) const {
++      VkSampleCountFlagBits fbSamples = VkSampleCountFlagBits(ms.sampleCount());
++      VkSampleCountFlagBits rsSamples = VkSampleCountFlagBits(rs.sampleCount());
++
++      if (!fbSamples)
++        return rsSamples ? rsSamples : VK_SAMPLE_COUNT_1_BIT;
++
++      if (mixedSamples && rsSamples > fbSamples && !sampleRateShading
++       && !rt.getDepthStencilFormat())
++        return rsSamples;
++
++      return fbSamples;
++    }
++
++    /**
++     * \brief Checks whether rasterization uses mixed samples
++     *
++     * \param [in] mixedSamples Whether mixed samples are supported
++     * \param [in] sampleRateShading Whether the fragment shader runs
++     *    at sample rate
++     * \returns \c true if more samples are rasterized than the
++     *    render targets have
++     */
++    bool useMixedSamples(
++            bool                            mixedSamples,
++            bool                            sampleRateShading) const {
++      return ms.sampleCount()
++          && rasterizationSamples(mixedSamples, sampleRateShading) > ms.sampleCount();
++    }
++
+     bool writesRenderTarget(
+             uint32_t                        target) const {
+       if (!omBlend[target].colorWriteMask())
