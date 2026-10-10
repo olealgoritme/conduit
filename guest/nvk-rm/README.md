@@ -267,6 +267,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0043 | knobs that undo the wait changes one at a time: `NVK_RM_GPFIFO_ENTRIES`, `NVK_RM_RING_YIELD_MS`, `NVK_RM_HIRES_SLEEP`; with `NVK_RM_WAIT_POLL_MS=10`, `NVK_RM_EVENT_GEN=0`, librmclient's `CRM_EVENT_HIRES=0` and the UMD bridge's `HELIOS_HANDOFF_SLEEP1=1` every wait change can be undone at run time |
 | 0044 | vulkan/runtime: `VkPipelineCoverageModulationStateCreateInfoNV` and the coverage modulation commands become dynamic state (`MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE`, `_TABLE_ENABLE`, `_TABLE`) |
 | 0045 | `VK_NV_framebuffer_mixed_samples` (Maxwell B+): `rasterizationSamples` above the attachments' sample count turns on the hardware's target-independent rasterization (`SET_TIR`, `SET_ANTI_ALIAS_RASTER`), with merge coverage reduction and coverage modulation (also the extended dynamic state 3 coverage modulation features). What D3D11.1 `ForcedSampleCount` needs with a render target bound: Direct2D's anti-aliased fills (`guest/windows/tools/d2d_tir_probe.cpp`) |
+| 0046 | zink: without a DEVICE_LOCAL \| HOST_VISIBLE type (0030) the descriptor buffers and GL persistent mappings are host-visible coherent system memory (a persistent map of plain VRAM is a staging copy the GPU never sees). `wgl_test.exe` checks readback, compute and a persistent mapping |
 
 ## Per-draw cost (common 0001-0007)
 
