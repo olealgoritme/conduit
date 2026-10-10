@@ -76,7 +76,7 @@ fn io_err(e: std::io::Error) -> CtlError {
 }
 
 /// The hint that goes with a failure to get an answer from the agent.
-const AGENT_HINT: &str = "The guest agent must be running in the VM: on Windows the Conduit GPU tray app (check its tray icon), on Linux `systemctl --user status conduit-ctl-agent`.\nThe VM must have been restarted after `conduit attach` added the channel.";
+const AGENT_HINT: &str = "The guest agent must be running in the VM: on Windows the Conduit GPU tray app (check its tray icon), on Linux `systemctl --user status conduit-ctl`.\nThe VM must have been restarted after `conduit attach` added the channel.";
 
 /// A friendly error for the command line.
 pub fn friendly(vm: &str, e: CtlError) -> anyhow::Error {

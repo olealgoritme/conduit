@@ -75,19 +75,25 @@ with the desktop shell's own, non-elevated token, so games and apps do not run
 as administrator. Apps are the Start Menu shortcuts of all users and of the
 current user plus Steam games (`libraryfolders.vdf`, `appmanifest_*.acf`, started
 as `steam://rungameid/ID`). The tray menu has a Recent launches submenu with the
-last eight programs; clicking one stops it.
+last eight programs; clicking one stops it (shortcuts, documents and `steam://` URLs are handed to the shell, so they have no process of Conduit's to list or stop).
 
 ## Linux guests
 
 `conduit-ctl-agent` (`guest/agent`, Python 3, standard library only) runs as a
-systemd user service in the desktop session, installed with the guest setup next
-to the clipboard agent on Ubuntu/Debian and Arch-based guests, with a udev rule
-that gives the logged-in user the port. It finds the graphical session
-(Wayland or X11; GNOME, KDE, Hyprland, Sway and others) and starts programs in
-it. Apps are the `.desktop` files of the XDG data directories, Flatpak and Snap
-exports, and Steam (native and Flatpak). Icons come from the icon theme; an SVG
-is converted to PNG when the guest has a converter, otherwise the host receives
-the SVG.
+systemd user service (`conduit-ctl.service`, with an XDG autostart entry for
+desktops that start no systemd session) in the user's desktop session. The
+`conduit-guest` package installs it with a udev rule that gives the logged-in
+user the port; `conduit attach` installs that package on Ubuntu/Debian and
+Arch-based guests (Arch, Omarchy, EndeavourOS, Manjaro), and the `.rpm` carries
+the same files for Fedora. It finds the graphical session (`conduit-ctl-agent
+--print-session` shows what it found) from the user manager, `loginctl` and the
+compositor's environment, so GNOME, KDE, Hyprland, Sway and other Wayland
+sessions and X11 work, and starts programs in it. Apps are the `.desktop` files
+of the XDG data directories, Flatpak and Snap exports, and Steam (native and
+Flatpak). Icons come from the icon theme; a bitmap is scaled to 64 px and an
+SVG converted to PNG when the guest has a converter (ImageMagick, rsvg-convert,
+inkscape, Pillow or GdkPixbuf), otherwise the host receives the file as it is
+(an SVG works as a launcher icon).
 
 ## Security
 
@@ -109,7 +115,7 @@ confined to what the guest user can access.
 - *did not answer within N s*: the channel exists but no agent answers. On
   Windows check that the Conduit GPU tray is running and is a version with
   control support (reinstall the Windows package). On Linux run
-  `systemctl --user status conduit-ctl-agent` in the VM and check that
+  `systemctl --user status conduit-ctl` in the VM and check that
   `/dev/virtio-ports/org.conduit.ctl.0` exists and is yours.
 - *closed the control channel*: the agent restarted or the VM stopped
   mid-command; run it again.
