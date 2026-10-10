@@ -77,11 +77,14 @@ public static class ThreadSample {
     if (SuspendThread(th) == 0xFFFFFFFF) break;
     bool ok = GetThreadContext(th, ctx);
     long rip = Marshal.ReadInt64(ctx, 0xF8), rsp = Marshal.ReadInt64(ctx, 0x98);
-    IntPtr got; bool rd = ok && ReadProcessMemory(ph, new IntPtr(rsp), stk, STACK, out got);
+    // A shallow stack ends less than STACK bytes above rsp and the full read fails:
+    // retry smaller, so an idle wait near the thread's base still shows its callers.
+    IntPtr got; int len = STACK; bool rd = false;
+    while (ok && !rd && len >= 256) { rd = ReadProcessMemory(ph, new IntPtr(rsp), stk, len, out got); if (!rd) len /= 2; }
     ResumeThread(th);
     if (!ok) continue;
     var s = new List<long> { rip };
-    if (rd) for (int o = 0; o + 8 <= STACK && s.Count < 12; o += 8) {
+    if (rd) for (int o = 0; o + 8 <= len && s.Count < 12; o += 8) {
      long v = BitConverter.ToInt64(stk, o);
      for (int m = 0; m < lo.Length; m++) if (v >= lo[m] && v < hi[m]) { s.Add(v); break; }
     }
