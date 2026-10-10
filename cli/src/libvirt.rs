@@ -25,6 +25,7 @@
 //! Running it again re-applies the same edit (nothing changes); detach
 //! defines the backup again and removes the units.
 
+use crate::bios;
 use crate::guest;
 use crate::paths;
 use crate::run;
@@ -53,6 +54,58 @@ pub struct Wiring<'a> {
     pub shares: &'a [Wire],
     /// A Windows guest ([`is_windows`]): add the Hyper-V enlightenments.
     pub windows: bool,
+    /// The installed Conduit BIOS (bios.rs), and whether its image may stand
+    /// in for a given stock loader (`Err` says why not).
+    pub bios: Option<&'a Path>,
+    pub bios_fits: &'a dyn Fn(&str, &Path, bool) -> std::result::Result<(), String>,
+    /// The display mode the boot console starts in (the video device's
+    /// preferred mode, which the firmware and the Windows boot screens use).
+    pub display: Option<(u32, u32)>,
+}
+
+/// The metadata attribute that remembers the stock loader while the Conduit
+/// BIOS stands in for it.
+const STOCK_LOADER_ATTR: &str = "stock-loader";
+
+/// What happens to the domain's <loader> (bios.rs decides).
+pub fn loader_plan(xml: &str, w: &Wiring) -> bios::Plan {
+    let Ok(root) = Element::parse(xml.as_bytes()) else {
+        return bios::Plan {
+            loader: None,
+            stock: None,
+            note: None,
+        };
+    };
+    let os = root.get_child("os");
+    let loader = os.and_then(|o| o.get_child("loader"));
+    let path = loader
+        .and_then(|l| l.get_text())
+        .map(|t| t.trim().to_string());
+    let pflash = loader
+        .and_then(|l| l.attributes.get("type"))
+        .map(String::as_str)
+        == Some("pflash");
+    let autoselect = os
+        .and_then(|o| o.attributes.get("firmware"))
+        .map(String::as_str)
+        == Some("efi");
+    let recorded = root
+        .get_child("metadata")
+        .and_then(|m| {
+            m.children.iter().find_map(|n| match n {
+                XMLNode::Element(e)
+                    if e.name == "vm"
+                        && (e.namespace.as_deref() == Some(META_NS)
+                            || e.prefix.as_deref() == Some("conduit")) =>
+                {
+                    Some(e)
+                }
+                _ => None,
+            })
+        })
+        .and_then(|v| v.attributes.get(STOCK_LOADER_ATTR).cloned());
+    let fits = |stock: &str, img: &Path| (w.bios_fits)(stock, img, autoselect);
+    bios::plan(path.as_deref(), pflash, recorded.as_deref(), w.bios, &fits)
 }
 
 /// libosinfo's namespace in a domain's <metadata>, where virt-manager and
@@ -300,7 +353,41 @@ fn take_usb_tablet(devices: &mut Element) -> bool {
     devices.children.len() != before
 }
 
-fn edit_display(devices: &mut Element, console: &Path) {
+/// The video device's preferred mode: QEMU's xres/yres, which its EDID (stdvga,
+/// bochs) or display info (virtio) report, so the firmware, the boot logo and
+/// Windows' boot screens start in the VM's native mode. stdvga/bochs also get
+/// enough video memory for one frame of it.
+fn set_resolution(model: &mut Element, (x, y): (u32, u32)) {
+    let ty = model.attributes.get("type").cloned().unwrap_or_default();
+    if !matches!(ty.as_str(), "vga" | "bochs" | "virtio") {
+        return;
+    }
+    model
+        .children
+        .retain(|c| !matches!(c, XMLNode::Element(r) if r.name == "resolution"));
+    model.children.push(XMLNode::Element(el(
+        "resolution",
+        &[("x", &x.to_string()), ("y", &y.to_string())],
+    )));
+    if ty != "virtio" {
+        let mib = (u64::from(x) * u64::from(y) * 4)
+            .div_ceil(1 << 20)
+            .next_power_of_two()
+            .max(16);
+        let have: u64 = model
+            .attributes
+            .get("vram")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if have < mib * 1024 {
+            model
+                .attributes
+                .insert("vram".into(), (mib * 1024).to_string());
+        }
+    }
+}
+
+fn edit_display(devices: &mut Element, console: &Path, display: Option<(u32, u32)>) {
     let first = devices
         .children
         .iter()
@@ -331,6 +418,9 @@ fn edit_display(devices: &mut Element, console: &Path) {
                     if m.attributes.get("type").map(String::as_str) == Some("qxl") {
                         m.attributes.retain(|k, _| k == "heads" || k == "primary");
                         m.attributes.insert("type".into(), "virtio".into());
+                    }
+                    if let Some(d) = display {
+                        set_resolution(m, d);
                     }
                 }
             }
@@ -411,6 +501,17 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
             .insert("machine".into(), if q35 { "q35" } else { "pc" }.into());
     }
 
+    // <os><loader>: the Conduit BIOS in place of the matching stock firmware.
+    let bios_plan = loader_plan(xml, w);
+    if let Some(l) = &bios_plan.loader {
+        if let Some(e) = root
+            .get_mut_child("os")
+            .and_then(|o| o.get_mut_child("loader"))
+        {
+            e.children = vec![XMLNode::Text(l.clone())];
+        }
+    }
+
     // <metadata><conduit:vm .../>
     {
         let md = child_mut(&mut root, "metadata");
@@ -418,6 +519,9 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
             !matches!(n, XMLNode::Element(e) if e.namespace.as_deref() == Some(META_NS) || e.prefix.as_deref() == Some("conduit"))
         });
         let mut v = el("vm", &[("name", w.vm), ("kind", "attached")]);
+        if let Some(stock) = &bios_plan.stock {
+            v.attributes.insert(STOCK_LOADER_ATTR.into(), stock.clone());
+        }
         v.prefix = Some("conduit".into());
         v.namespace = Some(META_NS.into());
         let mut vns = xmltree::Namespace::empty();
@@ -485,7 +589,7 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         let node = devices.children.remove(idx);
         devices.children.insert(0, node);
         // Before the share is re-appended, so a new <graphics> keeps its place.
-        edit_display(devices, w.console_sock);
+        edit_display(devices, w.console_sock, w.display);
         moved_tablet = take_usb_tablet(devices);
         has_video = elements(devices).any(|e| e.name == "video");
         devices.children.retain(|n| {
@@ -795,22 +899,29 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         shares::load_or_init(name)?
     };
     let share_wires = shares::wires(&scope, name, &share_list);
-    let new_xml = edit_domain(
-        &xml,
-        &Wiring {
-            emulator: &emu,
-            gpu_sock: &gpu,
-            vfs_sock: &vfs,
-            console_sock: &console,
-            stats_sock: &stats,
-            ctl_sock: &ctl,
-            vm: name,
-            shares: &share_wires,
-            windows,
-        },
-    )?;
+    let bios_dir = bios::installed_dir();
+    let (mode, _) = crate::mode::detect();
+    let wiring = Wiring {
+        emulator: &emu,
+        gpu_sock: &gpu,
+        vfs_sock: &vfs,
+        console_sock: &console,
+        stats_sock: &stats,
+        ctl_sock: &ctl,
+        vm: name,
+        shares: &share_wires,
+        windows,
+        bios: bios_dir.as_deref(),
+        bios_fits: &bios::check,
+        display: Some((mode.width, mode.height)),
+    };
+    let new_xml = edit_domain(&xml, &wiring)?;
+    let bios_note = loader_plan(&xml, &wiring).note;
     if dry_run {
         ui::info(format!("libvirt: {uri}; emulator: {}", emu.display()));
+        if let Some(n) = &bios_note {
+            ui::info(n);
+        }
         if windows {
             ui::info("a Windows guest: Hyper-V enlightenments added, no Linux guest setup");
         }
@@ -883,6 +994,9 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         },
         backup.display()
     );
+    if let Some(n) = &bios_note {
+        println!("{n}");
+    }
 
     // ---- the guest side
     if windows {
@@ -1050,9 +1164,157 @@ mod tests {
                     sock: PathBuf::from("/run/user/1000/conduit/myvm/share-Conduit.sock"),
                 }],
                 windows,
+                bios: None,
+                bios_fits: &fits,
+                display: None,
             },
         )
         .unwrap()
+    }
+
+    fn fits(_: &str, _: &Path, _: bool) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    fn edit_bios(x: &str, bios: Option<&Path>, display: Option<(u32, u32)>) -> String {
+        edit_domain(
+            x,
+            &Wiring {
+                emulator: Path::new("/opt/conduit/bin/qemu-system-x86_64"),
+                gpu_sock: Path::new("/run/user/1000/conduit/myvm/gpu-libvirt.sock"),
+                vfs_sock: Path::new("/run/user/1000/conduit/myvm/vfs-libvirt.sock"),
+                console_sock: Path::new(CONSOLE),
+                stats_sock: Path::new(STATS),
+                ctl_sock: Path::new(CTL),
+                vm: "myvm",
+                shares: &[],
+                windows: false,
+                bios,
+                bios_fits: &fits,
+                display,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A UEFI VM on Ubuntu's stock OVMF (what virt-manager writes), stdvga.
+    const UEFI: &str = r#"<domain type='kvm'>
+  <name>myvm</name>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='pc-q35-8.2'>hvm</type>
+    <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE_4M.fd</loader>
+    <nvram template='/usr/share/OVMF/OVMF_VARS_4M.fd'>/home/u/.config/libvirt/qemu/nvram/myvm_VARS.fd</nvram>
+  </os>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <video><model type='vga' vram='16384' heads='1' primary='yes'/></video>
+  </devices>
+</domain>"#;
+
+    fn os_child(out: &str, name: &str) -> Element {
+        Element::parse(out.as_bytes())
+            .unwrap()
+            .get_child("os")
+            .unwrap()
+            .get_child(name)
+            .unwrap()
+            .clone()
+    }
+
+    fn meta_vm(out: &str) -> Element {
+        let root = Element::parse(out.as_bytes()).unwrap();
+        root.get_child("metadata")
+            .unwrap()
+            .children
+            .iter()
+            .find_map(|n| n.as_element().filter(|e| e.name == "vm").cloned())
+            .unwrap()
+    }
+
+    #[test]
+    fn the_conduit_bios_replaces_the_matching_stock_loader_and_keeps_the_vars() {
+        let dir = Path::new("/usr/share/conduit/bios");
+        let out = edit_bios(UEFI, Some(dir), None);
+        let loader = os_child(&out, "loader");
+        assert_eq!(
+            loader.get_text().unwrap(),
+            "/usr/share/conduit/bios/conduit-bios.fd"
+        );
+        assert_eq!(loader.attributes["type"], "pflash");
+        let nvram = os_child(&out, "nvram");
+        assert_eq!(
+            nvram.get_text().unwrap(),
+            "/home/u/.config/libvirt/qemu/nvram/myvm_VARS.fd"
+        );
+        assert_eq!(
+            nvram.attributes["template"],
+            "/usr/share/OVMF/OVMF_VARS_4M.fd"
+        );
+        assert_eq!(
+            meta_vm(&out).attributes["stock-loader"],
+            "/usr/share/OVMF/OVMF_CODE_4M.fd"
+        );
+        // Attaching again changes nothing.
+        assert_eq!(edit_bios(&out, Some(dir), None), out);
+        // Without the package the stock loader comes back.
+        let back = edit_bios(&out, None, None);
+        assert_eq!(
+            os_child(&back, "loader").get_text().unwrap(),
+            "/usr/share/OVMF/OVMF_CODE_4M.fd"
+        );
+        assert!(!meta_vm(&back).attributes.contains_key("stock-loader"));
+    }
+
+    #[test]
+    fn other_firmware_and_missing_package_leave_the_loader_alone() {
+        let out = edit_bios(UEFI, None, None);
+        assert_eq!(
+            os_child(&out, "loader").get_text().unwrap(),
+            "/usr/share/OVMF/OVMF_CODE_4M.fd"
+        );
+        let arch = UEFI.replace(
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+        );
+        let out = edit_bios(&arch, Some(Path::new("/usr/share/conduit/bios")), None);
+        assert_eq!(
+            os_child(&out, "loader").get_text().unwrap(),
+            "/usr/share/edk2/x64/OVMF_CODE.4m.fd"
+        );
+        // SeaBIOS: no <loader> at all, none added.
+        let out = edit_bios(DOMAIN, Some(Path::new("/usr/share/conduit/bios")), None);
+        assert!(Element::parse(out.as_bytes())
+            .unwrap()
+            .get_child("os")
+            .unwrap()
+            .get_child("loader")
+            .is_none());
+    }
+
+    #[test]
+    fn the_video_device_starts_in_the_native_mode() {
+        let out = edit_bios(UEFI, None, Some((5120, 1440)));
+        let dev = devices(&out);
+        let m = dev.get_child("video").unwrap().get_child("model").unwrap();
+        let r = m.get_child("resolution").unwrap();
+        assert_eq!(
+            (r.attributes["x"].as_str(), r.attributes["y"].as_str()),
+            ("5120", "1440")
+        );
+        // 5120x1440x4 = 28.1 MiB: 32 MiB of video memory.
+        assert_eq!(m.attributes["vram"], "32768");
+        assert_eq!(edit_bios(&out, None, Some((5120, 1440))), out);
+        // QXL becomes virtio-vga: a resolution, no video memory to size.
+        let out = edit_bios(VIRT_INSTALL, None, Some((1920, 1080)));
+        let m = devices(&out)
+            .get_child("video")
+            .unwrap()
+            .get_child("model")
+            .unwrap()
+            .clone();
+        assert_eq!(m.attributes["type"], "virtio");
+        assert_eq!(m.get_child("resolution").unwrap().attributes["x"], "1920");
+        assert!(!m.attributes.contains_key("vram"));
     }
 
     fn edit(x: &str) -> String {
@@ -1600,6 +1862,9 @@ mod tests {
             vm: "x",
             shares: &[],
             windows: false,
+            bios: None,
+            bios_fits: &fits,
+            display: None,
         };
         assert!(edit_domain("<network/>", &w).is_err());
         assert!(edit_domain("not xml", &w).is_err());

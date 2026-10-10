@@ -9,6 +9,7 @@
 #                packaged with nfpm (deb/rpm/Arch) or as a tarball with its
 #                libraries bundled (Debian 12, the oldest glibc we build on)
 #   guest        conduit-guest DKMS source packages (.deb, .rpm, Arch)
+#   bios         conduit-bios firmware packages (bios.yml, cached)
 #   release      checksums, AUR PKGBUILD, GitHub Release
 #
 # workflow_dispatch builds everything without publishing (artifacts only).
@@ -178,8 +179,11 @@ jobs:
           path: dist/out/*
           if-no-files-found: error
 
+  bios:
+    uses: ./.github/workflows/bios.yml
+
   release:
-    needs: [host, guest]
+    needs: [host, guest, bios]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:

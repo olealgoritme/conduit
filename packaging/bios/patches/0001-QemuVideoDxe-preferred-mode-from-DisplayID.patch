@@ -1,0 +1,60 @@
+QemuVideoDxe: take the preferred mode from the DisplayID extension
+
+QEMU's EDID keeps modes of 4096 pixels or more (e.g. 5120x1440) out of the
+12-bit detailed timing descriptor and puts the preferred mode in a DisplayID
+extension block instead. Read that block too, so the firmware starts in the
+VM's native mode (stdvga/bochs with xres/yres) rather than 1280x800.
+
+--- a/OvmfPkg/QemuVideoDxe/Initialize.c
++++ b/OvmfPkg/QemuVideoDxe/Initialize.c
+@@ -336,16 +336,30 @@
+   if ((Private->Edid[54] == 0x00) &&
+       (Private->Edid[55] == 0x00))
+   {
+-    DEBUG ((
+-      DEBUG_INFO,
+-      "%a: no detailed timing descriptor\n",
+-      __func__
+-      ));
+-    return;
++    //
++    // Modes of 4096 pixels or more do not fit the 12-bit detailed timing
++    // descriptor; QEMU then puts the preferred mode in a DisplayID extension
++    // (third block): Detailed Timings Data Block (tag 0x03), 16-bit sizes.
++    //
++    if ((Private->Edid[126] >= 2) &&
++        (Private->Edid[256] == 0x70) &&
++        (Private->Edid[261] == 0x03) &&
++        (Private->Edid[263] >= 0x14))
++    {
++      *XRes = (Private->Edid[268] | (Private->Edid[269] << 8)) + 1;
++      *YRes = (Private->Edid[276] | (Private->Edid[277] << 8)) + 1;
++    } else {
++      DEBUG ((
++        DEBUG_INFO,
++        "%a: no detailed timing descriptor\n",
++        __func__
++        ));
++      return;
++    }
++  } else {
++    *XRes = Private->Edid[56] | ((Private->Edid[58] & 0xf0) << 4);
++    *YRes = Private->Edid[59] | ((Private->Edid[61] & 0xf0) << 4);
+   }
+-
+-  *XRes = Private->Edid[56] | ((Private->Edid[58] & 0xf0) << 4);
+-  *YRes = Private->Edid[59] | ((Private->Edid[61] & 0xf0) << 4);
+   DEBUG ((
+     DEBUG_INFO,
+     "%a: default resolution: %dx%d\n",
+--- a/OvmfPkg/QemuVideoDxe/Qemu.h
++++ b/OvmfPkg/QemuVideoDxe/Qemu.h
+@@ -116,7 +116,7 @@
+   UINTN                           FrameBufferBltConfigureSize;
+   UINT8                           FrameBufferVramBarIndex;
+ 
+-  UINT8                           Edid[128];
++  UINT8                           Edid[384];
+ } QEMU_VIDEO_PRIVATE_DATA;
+ 
+ ///

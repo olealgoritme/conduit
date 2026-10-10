@@ -120,8 +120,38 @@ SPICE, OpenGL or USB redirection, so attach also changes the display side:
 - `<audio type='spice'>` becomes `type='none'` (the sound card stays, silent);
 - QXL video becomes `virtio` (QXL exists only with SPICE) and
   `<acceleration accel3d>` is dropped (no virgl). The emulated video device
-  itself stays: firmware, boot menu and disk-unlock prompt draw on it.
+  itself stays: firmware, boot menu and disk-unlock prompt draw on it. Its
+  `<resolution>` becomes the host's display mode (as `conduit view` picks it;
+  stdvga/bochs also get the video memory for it), so the firmware, its boot
+  logo and Windows' boot and sign-in screens start in that mode;
+- `<loader>`: the **Conduit BIOS** (below) in place of the stock firmware
+  when it is installed and the VM uses the matching image;
 - `<tpm>`, the guest agent channel, inputs and everything else are kept.
+
+### Conduit BIOS
+
+The optional `conduit-bios` package is UEFI firmware built from edk2 OVMF
+(BSD-2-Clause-Patent; Ubuntu's `edk2` source package and its build flags,
+pinned in `packaging/bios/version.sh`) with three changes: the Conduit mark
+as the boot logo (also the ACPI BGRT logo Windows keeps above its spinner),
+the firmware display starting in the video device's preferred mode, also
+above 4096 pixels wide, and no "BdsDxe: loading/starting Boot####" lines over
+the logo (failed boot options are still reported; `packaging/bios/patches`). It installs
+`/usr/share/conduit/bios/conduit-bios.fd` (no Secure Boot, like
+`OVMF_CODE_4M.fd`), `conduit-bios.secboot.fd` (Secure Boot + SMM, like
+`OVMF_CODE_4M.secboot.fd`/`.ms.fd`/`.snakeoil.fd`) and libvirt firmware
+descriptors (priority 90, so automatic firmware selection still prefers the
+stock images).
+
+attach switches `<loader>` only from those stock Debian/Ubuntu 4 MB images to
+the matching Conduit image. The `<nvram>` file and its template stay as they
+are (same varstore layout), so boot entries, Secure Boot keys and TPM state
+carry over, and the stock path is kept in the `conduit:vm` metadata. Other
+firmware (SeaBIOS, other distributions' OVMF builds, 2 MB images, AMD SEV) is
+left alone, and attach says so. Without the package attach keeps the stock
+loader and prints a hint; after removing it, attach again puts the stock
+loader back. detach restores the original definition, loader included.
+`packaging/build.sh bios` builds it (docs/PACKAGING.md).
 
 A Windows domain also gets the Hyper-V enlightenments it lacks (`vpindex`,
 `runtime`, `synic`, `stimer` with `direct`, `reset`, `frequencies`,

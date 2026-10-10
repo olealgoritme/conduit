@@ -47,15 +47,17 @@ scripts:
   postinstall: "@SCRIPTS@/conduit-postinst"
   preremove: "@SCRIPTS@/conduit-prerm"
 
+# conduit-bios (the boot-logo firmware) matches Debian/Ubuntu's OVMF, so the
+# .deb recommends it; elsewhere `conduit attach` keeps the stock firmware.
 overrides:
   deb:
-    recommends: [apparmor]
+    recommends: [apparmor, conduit-bios]
     suggests: [libvirt-daemon-system, virt-manager]
   rpm:
     recommends: [policycoreutils-python-utils]
-    suggests: [libvirt-daemon, virt-manager]
+    suggests: [libvirt-daemon, virt-manager, conduit-bios]
   archlinux:
-    suggests: [libvirt, virt-manager]
+    suggests: [libvirt, virt-manager, conduit-bios]
 
 rpm:
   summary: Share your NVIDIA GPU with a virtual machine

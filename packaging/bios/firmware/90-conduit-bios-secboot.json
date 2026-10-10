@@ -1,0 +1,33 @@
+{
+    "description": "Conduit BIOS: UEFI firmware for x86_64 with the Conduit boot logo, with Secure Boot, required SMM, empty varstore",
+    "interface-types": [
+        "uefi"
+    ],
+    "mapping": {
+        "device": "flash",
+        "executable": {
+            "filename": "/usr/share/conduit/bios/conduit-bios.secboot.fd",
+            "format": "raw"
+        },
+        "nvram-template": {
+            "filename": "/usr/share/OVMF/OVMF_VARS_4M.fd",
+            "format": "raw"
+        }
+    },
+    "targets": [
+        {
+            "architecture": "x86_64",
+            "machines": [
+                "pc-q35-*"
+            ]
+        }
+    ],
+    "features": [
+        "acpi-s3",
+        "amd-sev",
+        "requires-smm",
+        "secure-boot",
+        "verbose-dynamic"
+    ],
+    "tags": []
+}

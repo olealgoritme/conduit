@@ -14,7 +14,9 @@
 #   packaging/build.sh stage                assemble the install tree -> $STAGE
 #   packaging/build.sh bundle-libs          copy non-glibc .so deps into /opt/conduit/lib (tarball)
 #   packaging/build.sh guest-src [DIR]      DKMS source tree for the guest module
+#   packaging/build.sh bios                 Conduit BIOS firmware     -> dist/bios (packaging/bios/build.sh)
 #   packaging/build.sh package FORMAT       deb | rpm | archlinux | tarball | guest-deb | guest-rpm | guest-arch
+#                                           | bios-deb | bios-rpm | bios-arch | bios-tarball
 #
 # Environment (all optional):
 #   VERSION            package version (default: git describe, without the leading v)
@@ -440,7 +442,41 @@ render_nfpm() {   # template out format
     fi
     sed -e "s|@VERSION@|$v|g" -e "s|@STAGE@|$STAGE|g" -e "s|@ROOT@|$ROOT|g" \
         -e "s|@GUEST_SRC@|$DIST/guest-src/conduit-guest-$v|g" \
-        -e "s|@SCRIPTS@|$DIST/pkgscripts|g" -e "s|\"@DEPENDS@\"|$deps|g" "$tpl" > "$out"
+        -e "s|@SCRIPTS@|$DIST/pkgscripts|g" -e "s|\"@DEPENDS@\"|$deps|g" \
+        -e "s|@BIOS@|$DIST/bios|g" -e "s|@BIOS_VERSION@|$(bios_version)|g" "$tpl" > "$out"
+}
+
+# The Conduit BIOS has its own version (edk2 build + Conduit revision).
+bios_version() {
+    ( . "$PKG/bios/version.sh"; echo "$CONDUIT_BIOS_VERSION" )
+}
+
+# Build tools: build-essential/gcc, nasm, iasl (acpica-tools), uuid-dev, python3, curl.
+cmd_bios() {
+    WORK_DIR="$DIST/bios-work" JOBS="$JOBS" "$PKG/bios/build.sh" "$DIST/bios"
+}
+
+# The conduit-bios package (deb | rpm | archlinux | tarball) into $OUT.
+bios_package() {
+    local fmt=$1 v; v=$(bios_version)
+    [ -f "$DIST/bios/conduit-bios.fd" ] || die "no firmware in $DIST/bios (run: build.sh bios)"
+    [ "$(cat "$DIST/bios/VERSION")" = "$v" ] || die "$DIST/bios is not version $v (run: build.sh bios)"
+    install -d "$OUT"
+    if [ "$fmt" = tarball ]; then
+        local t="$DIST/bios-tarball/conduit-bios"
+        rm -rf "$DIST/bios-tarball"; install -d "$t/firmware"
+        install -m0644 "$DIST/bios/conduit-bios.fd" "$DIST/bios/conduit-bios.secboot.fd" \
+            "$DIST/bios/VERSION" "$DIST/bios/copyright" "$t/"
+        install -m0644 "$PKG"/bios/firmware/*.json "$t/firmware/"
+        install -m0755 "$PKG/bios/install.sh" "$t/"
+        tar -C "$DIST/bios-tarball" --owner=0 --group=0 --numeric-owner \
+            -czf "$OUT/conduit-bios-$v-x86_64.tar.gz" conduit-bios
+    else
+        command -v nfpm >/dev/null || die "nfpm not found"
+        render_nfpm "$PKG/nfpm/conduit-bios.yaml" "$DIST/nfpm-conduit-bios.yaml" ""
+        nfpm package --config "$DIST/nfpm-conduit-bios.yaml" --packager "$fmt" --target "$OUT/" >/dev/null
+    fi
+    log "conduit-bios $v ($fmt) -> $OUT"
 }
 
 render_scripts() {
@@ -482,6 +518,8 @@ cmd_package() {
         command -v nfpm >/dev/null || die "nfpm not found"
         guest_package archlinux "$OUT/"
         ;;
+    bios-deb|bios-rpm|bios-tarball) bios_package "${fmt#bios-}" ;;
+    bios-arch) bios_package archlinux ;;
     tarball)
         # LINK_DIR=/usr/local/bin stage, plus bundle-libs, must have run first.
         local t="$DIST/tarball/conduit"
@@ -509,6 +547,7 @@ main() {
         stream) cmd_stream ;;
         venus) cmd_venus ;;
         qemu) cmd_qemu ;;
+        bios) cmd_bios ;;
         stage) cmd_stage ;;
         bundle-libs) cmd_bundle_libs ;;
         guest-src) cmd_guest_src "$@" ;;

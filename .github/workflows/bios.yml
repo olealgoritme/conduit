@@ -1,0 +1,58 @@
+# Conduit BIOS: edk2 OVMF with the Conduit boot logo (packaging/bios), packaged
+# as conduit-bios (.deb, .rpm, Arch, tarball).
+#
+# Its own workflow because it has its own version (packaging/bios/version.sh,
+# the edk2 build + a Conduit revision) and rarely changes. The firmware is
+# cached per packaging/bios/** content, so the build (a few minutes) runs
+# only when the edk2 pin, the logo, the patches or the build script change.
+# Runs on Ubuntu 24.04, the release the edk2 source package and its flags
+# come from (same compiler and iasl as Ubuntu's own build).
+#
+# release.yml calls it (workflow_call) and attaches the packages.
+name: bios
+
+on:
+  push:
+    branches: [master, main]
+    paths: ['packaging/bios/**', 'packaging/nfpm/conduit-bios.yaml', '.github/workflows/bios.yml']
+  pull_request:
+    paths: ['packaging/bios/**', 'packaging/nfpm/conduit-bios.yaml', '.github/workflows/bios.yml']
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bios:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cache the firmware
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: dist/bios
+          key: conduit-bios-${{ hashFiles('packaging/bios/**') }}
+      - name: Build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential nasm acpica-tools uuid-dev python3 dpkg-dev curl xz-utils
+      - name: Build the Conduit BIOS
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: packaging/build.sh bios
+      - name: Package
+        run: |
+          NFPM_VERSION=2.43.0
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin nfpm
+          for f in bios-deb bios-rpm bios-arch bios-tarball; do packaging/build.sh package "$f"; done
+          dpkg-deb -c dist/out/conduit-bios_*_all.deb | grep -E 'usr/share/conduit/bios/conduit-bios(\.secboot)?\.fd$'
+          dpkg-deb -c dist/out/conduit-bios_*_all.deb | grep usr/share/qemu/firmware/90-conduit-bios.json
+          cat dist/bios/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-bios
+          path: dist/out/*
+          if-no-files-found: error
