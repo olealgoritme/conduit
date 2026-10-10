@@ -45,6 +45,10 @@ if (Test-WinFsp) {
 # started it by hand; do not start it at boot.
 $svc = Get-CimInstance Win32_Service -Filter "Name='VirtioFsSvc'" -ErrorAction SilentlyContinue
 if ($svc -and $svc.StartMode -eq "Auto" -and $svc.PathName -notmatch '\s-t\s') {
+    # Remembered so Uninstall-Helios.ps1 can put it back.
+    $conduitKey = "HKLM:\SOFTWARE\Conduit"
+    if (-not (Test-Path -LiteralPath $conduitKey)) { New-Item -Path $conduitKey -Force | Out-Null }
+    New-ItemProperty -LiteralPath $conduitKey -Name "VirtioFsSvcStartMode" -Value "Automatic" -PropertyType String -Force | Out-Null
     Set-Service -Name "VirtioFsSvc" -StartupType Manual
     Write-Host "VirtioFsSvc (no tag) is set to start manually; Conduit mounts shares itself."
 }

@@ -9,6 +9,13 @@
 # one drive letter. Extra processes for a tag are stopped. Drive letters count
 # down from Z: and are remembered per tag (HKLM\SOFTWARE\Conduit\ShareDrives),
 # which the tray app also reads.
+#
+# Only virtiofs.exe processes that run the expected executable as SYSTEM
+# count as mounts (and only those are ever stopped): one a user started
+# cannot pose as a share or get a share's drive letter taken away.
+#
+# The mounts belong to SYSTEM, so every user of this Windows sees the shared
+# folders as drives, with the same access to the host folders.
 param(
     [int]$ScanSeconds = 5,
     [string]$VirtioFsExe = ""
@@ -20,7 +27,26 @@ $ErrorActionPreference = "Stop"
 $logDir = Join-Path $env:ProgramData "Conduit"
 $logPath = Join-Path $logDir "shares.log"
 $regPath = "HKLM:\SOFTWARE\Conduit\ShareDrives"
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+# The log folder (also the tray's): SYSTEM and administrators may change it,
+# users may read it. A folder a user made beforehand gets these rules too.
+function Protect-DataDirectory([string]$Dir) {
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    if ((Get-Item -LiteralPath $Dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$Dir is a link, not a folder"
+    }
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]"S-1-5-32-544")
+    $acl.SetAccessRuleProtection($true, $false)
+    $inherit = [Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"
+    foreach ($rule in @(@("S-1-5-18", "FullControl"), @("S-1-5-32-544", "FullControl"), @("S-1-5-32-545", "ReadAndExecute"))) {
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]$rule[0], $rule[1], $inherit, "None", "Allow")))
+    }
+    Set-Acl -LiteralPath $Dir -AclObject $acl
+    & (Join-Path $env:SystemRoot "System32\icacls.exe") (Join-Path $Dir "*") /reset /T /L /C /Q | Out-Null
+}
+Protect-DataDirectory $logDir
 if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 256KB) {
     Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
 }
@@ -134,12 +160,25 @@ function Get-DriveLetter([string]$Tag) {
     return $null
 }
 
-# The running virtiofs.exe processes that were given a tag: tag -> list of
-# @{ Pid; Letter }, oldest first.
-function Get-Instances {
+# Is this virtiofs.exe process one of ours: the expected executable, run by
+# SYSTEM?
+function Test-OurInstance($Process, [string]$Exe) {
+    if (-not $Process.ExecutablePath -or
+        -not [string]::Equals([IO.Path]::GetFullPath([string]$Process.ExecutablePath),
+            [IO.Path]::GetFullPath($Exe), [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    # By SID: account names are localized.
+    $owner = Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+    return ($owner -and $owner.ReturnValue -eq 0 -and $owner.Sid -eq "S-1-5-18")
+}
+
+# The running virtiofs.exe processes (ours only, see Test-OurInstance) that
+# were given a tag: tag -> list of @{ Pid; Letter }, oldest first.
+function Get-Instances([string]$Exe) {
     $by = @{}
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='virtiofs.exe'" -ErrorAction Stop |
-        Sort-Object CreationDate)
+        Sort-Object CreationDate | Where-Object { Test-OurInstance $_ $Exe })
     foreach ($p in $procs) {
         $cl = [string]$p.CommandLine
         if ($cl -notmatch '\s-t\s+"?([^\s"]+)') { continue }
@@ -186,7 +225,7 @@ while ($true) {
         if (-not $exe) {
             Write-Log "virtiofs.exe not found (install the VirtIO guest tools: virtio-win-guest-tools)"
         } else {
-            $instances = Get-Instances
+            $instances = Get-Instances $exe
             Remove-StaleInstances $instances
             foreach ($tag in [ConduitFs]::Tags()) {
                 if ($tag -notlike "conduit-?*") { continue }
