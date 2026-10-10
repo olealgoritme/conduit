@@ -48,8 +48,8 @@ pub(crate) const LEDGER_PAGE_BYTES: usize = 4096;
 /// desktop that has been up a while fills a small table, and a game started
 /// after that gets `TABLE_FULL`. A refused device still gates its rewrites of a
 /// buffer the host reads, but its DXVK signaler then sees a retirement only on
-/// its 10 ms timeout: a windowed game whose next frame finds the previous Blt
-/// copy unretired waits for that timeout every frame and locks at 100 fps.
+/// its 1 ms poll, so a windowed game whose next frame finds the previous Blt
+/// copy unretired waits up to that poll every frame.
 /// `AqLive` is the occupancy.
 const EVENT_TABLE_LEN: usize = 64;
 
