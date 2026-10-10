@@ -49,6 +49,7 @@ Assert-True ($uninstall.Contains("VirtioFsSvcStartMode")) "uninstall does not re
 $install = Get-Content -LiteralPath (Join-Path $here "Install-Helios.ps1") -Raw
 Assert-True ($install.Contains("-MultipleInstances Parallel")) "the tray task is not Parallel"
 Assert-True ($install.Contains("The context menu command was not installed (the tray app was)")) "context menu copy failures are not separate"
+Assert-True ($install.Contains("The virtio-input driver was not installed")) "a vioinput failure is not just a warning"
 
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ("conduit-packaging-{0}" -f [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $scratch | Out-Null

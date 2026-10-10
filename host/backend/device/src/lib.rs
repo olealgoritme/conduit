@@ -32,5 +32,6 @@ pub mod trace;
 pub mod userspace;
 #[cfg(feature = "venus")]
 pub mod venus;
+pub mod vinput;
 pub mod virtio;
 pub mod vram;
