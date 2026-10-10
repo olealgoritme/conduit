@@ -102,15 +102,18 @@ packaging/build.sh package guest-deb  # or guest-rpm, guest-arch
 
 # Conduit BIOS (gcc, nasm, iasl/acpica-tools, uuid-dev, python3)
 packaging/build.sh bios               # -> dist/bios
-packaging/build.sh package bios-deb   # or bios-rpm, bios-arch, bios-tarball
+packaging/build.sh package bios-deb   # or bios-tarball (Debian/Ubuntu only: the images match that ovmf)
 ```
 
 The Conduit BIOS (`packaging/bios/build.sh`) downloads Ubuntu's `edk2` source
-package pinned in `packaging/bios/version.sh` (checksums checked), applies its
+package pinned in `packaging/bios/version.sh` (checksums checked;
+`packaging/bios/fetch-src.sh` tries the project's `edk2-src-<version>`
+release assets first, Launchpad second), applies its
 patch series, swaps in `packaging/bios/Logo.bmp` (rendered by
 `make-logo.py`) and `packaging/bios/patches`, and builds `OVMF_CODE_4M.fd` and
 `OVMF_CODE_4M.secboot.fd` with the flags of Ubuntu's `debian/rules`, so the
-images take the stock varstores. Its package version is the edk2 build plus
+images take the stock varstores; `OVMF_VERSION` next to them records the
+Ubuntu ovmf build they match, which attach compares with the host's. Its package version is the edk2 build plus
 `CONDUIT_BIOS_REV`; bump that when the logo, patches or script change, and
 the edk2 pin to follow Ubuntu's `ovmf`.
 
@@ -263,7 +266,7 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 | `ci.yml` | push, PR, manual | fmt/clippy/test per Rust project (backend, VMM, `host/venus` without its `renderer` feature, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora headers plus its plain-C unit tests, viewer `make check`, guest agent unit tests, actionlint, shellcheck, venus submodule pins in `flake.nix` and the RPM spec, DKMS package build |
 | `abi.yml` | Mondays, manual | new open-gpu-kernel-modules tags / gVisor nvproxy ABIs -> `.github/scripts/abi_update.py` runs the `host/backend/gen` generators -> tests -> PR on `abi/auto` (draft if tests fail). Set secret `ABI_BOT_TOKEN` so CI runs on its PRs. |
 | `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers (viewer, stream host, `conduit-venus` from the venus submodules) with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
-| `bios.yml` | changes under `packaging/bios`, called by `release.yml` | the Conduit BIOS on Ubuntu 24.04, cached per `packaging/bios/**` content; conduit-bios .deb/.rpm/.pkg.tar.zst/tarball |
+| `bios.yml` | changes under `packaging/bios`, called by `release.yml` | the Conduit BIOS on Ubuntu 24.04, cached per `packaging/bios/**` content; conduit-bios .deb and tarball; on main, mirrors the pinned edk2 sources as the `edk2-src-<version>` release |
 | `windows.yml` | `v*` tags (the `release` job waits up to 3 hours for the release.yml release, then attaches the driver zip and its checksum as `SHA256SUMS-windows`; `SHA256SUMS` covers release.yml's files) and by hand (about an hour on Windows runners) | the Windows guest stack from `guest/windows` (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD, loaders, installer); the package per configuration as an artifact, and the Release driver folder (`conduit-windows-gpu-driver-<version>.zip`: signed INF/SYS/CAT, UMDs, NVK/Zink files, test certificate, `packaging/windows/install.ps1`) as the release asset. The driver alone also builds in a local Windows VM (`guest/windows/ci/vm/README.md`) |
 
 ## Repository hygiene

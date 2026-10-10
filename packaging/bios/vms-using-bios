@@ -1,0 +1,59 @@
+#!/bin/sh
+# Lists the libvirt VMs whose firmware is the Conduit BIOS: definitions that
+# name /usr/share/conduit/bios/, in the system daemon (/etc/libvirt/qemu) and
+# in every user's session daemon (~/.config/libvirt/qemu). Those VMs do not
+# boot once the images are gone, until `conduit attach` (or `conduit detach`)
+# puts them back on their stock firmware.
+#
+#   vms-using-bios --strict   exit 1 when any VM uses it (install.sh --uninstall)
+#   vms-using-bios remove     the conduit-bios package's prerm: warn, never fail
+#                             (an upgrade, "upgrade ...", says nothing)
+#
+# Env (tests): CONDUIT_LIBVIRT_SYSTEM_DIR, CONDUIT_HOMES (space-separated).
+set -u
+
+BIOS_DIR=/usr/share/conduit/bios/
+SYSTEM_DIR=${CONDUIT_LIBVIRT_SYSTEM_DIR:-/etc/libvirt/qemu}
+
+case "${1:-}" in
+    --strict | remove | purge | "") ;;
+    *) exit 0 ;; # upgrade, failed-upgrade, deconfigure: the images stay
+esac
+
+homes() {
+    if [ -n "${CONDUIT_HOMES+x}" ]; then
+        # shellcheck disable=SC2086 # a space-separated list
+        printf '%s\n' $CONDUIT_HOMES
+    elif command -v getent >/dev/null 2>&1; then
+        getent passwd | cut -d: -f6 | sort -u
+    else
+        cut -d: -f6 /etc/passwd | sort -u
+    fi
+}
+
+found=$(
+    {
+        echo "$SYSTEM_DIR"
+        homes | while IFS= read -r h; do
+            [ -n "$h" ] && echo "$h/.config/libvirt/qemu"
+        done
+    } | while IFS= read -r d; do
+        [ -d "$d" ] || continue
+        grep -l -F "$BIOS_DIR" "$d"/*.xml 2>/dev/null
+    done
+)
+
+[ -n "$found" ] || exit 0
+
+{
+    echo "These libvirt VMs boot the Conduit BIOS from $BIOS_DIR:"
+    echo "$found" | while IFS= read -r f; do
+        echo "  $(basename "$f" .xml)  ($f)"
+    done
+    echo "Without it they do not boot. Run \`conduit attach VM\` (keeps Conduit's GPU,"
+    echo "back on the stock firmware) or \`conduit detach VM\` for each, as the user that owns it."
+    echo "\`conduit up\`/\`conduit view\` also switch a VM back to its stock firmware when the BIOS is missing."
+} >&2
+
+[ "${1:-}" = --strict ] && exit 1
+exit 0

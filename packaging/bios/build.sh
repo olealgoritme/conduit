@@ -18,6 +18,7 @@
 # Env:   WORK_DIR  scratch directory (default: target/conduit-bios)
 #        JOBS      parallel build jobs (default: 4)
 # Needs: gcc, make, nasm, iasl (acpica-tools), uuid-dev, python3, curl, xz.
+# Sources: fetch-src.sh (the project's mirror first, then Launchpad).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,22 +30,11 @@ OUT_DIR="$(realpath -m "${1:-$REPO/target/conduit-bios/out}")"
 WORK_DIR="$(realpath -m "${WORK_DIR:-$REPO/target/conduit-bios}")"
 JOBS="${JOBS:-4}"
 
-LP="https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/edk2/${EDK2_DEB_VERSION}"
 ORIG="edk2_${EDK2_UPSTREAM}.orig.tar.xz"
 DEBIAN="edk2_${EDK2_DEB_VERSION}.debian.tar.xz"
 
 mkdir -p "$WORK_DIR/dl" "$OUT_DIR"
-fetch() {
-  local name="$1" sum="$2"
-  local dst="$WORK_DIR/dl/$name"
-  if [ ! -f "$dst" ] || ! echo "$sum  $dst" | sha256sum -c --status; then
-    curl -fsSL --retry 3 --max-time 600 -o "$dst.part" "$LP/$name"
-    mv "$dst.part" "$dst"
-  fi
-  echo "$sum  $dst" | sha256sum -c --status || { echo "checksum mismatch: $name" >&2; exit 1; }
-}
-fetch "$ORIG" "$EDK2_ORIG_SHA256"
-fetch "$DEBIAN" "$EDK2_DEBIAN_SHA256"
+"$HERE/fetch-src.sh" "$WORK_DIR/dl"
 
 SRC="$WORK_DIR/edk2-${EDK2_DEB_VERSION}"
 rm -rf "$SRC"
@@ -113,5 +103,8 @@ done
 # edk2's licenses (BSD-2-Clause-Patent, plus OpenSSL, Brotli, ...), as Ubuntu lists them.
 cp debian/copyright "$OUT_DIR/copyright"
 echo "$CONDUIT_BIOS_VERSION" > "$OUT_DIR/VERSION"
+# The Ubuntu ovmf build these images match: `conduit attach` swaps a stock
+# loader only when the host's ovmf package is that edk2 build (cli/src/bios.rs).
+echo "$EDK2_DEB_VERSION" > "$OUT_DIR/OVMF_VERSION"
 ( cd "$OUT_DIR" && sha256sum conduit-bios.fd conduit-bios.secboot.fd > SHA256SUMS )
 echo "Conduit BIOS $CONDUIT_BIOS_VERSION -> $OUT_DIR"

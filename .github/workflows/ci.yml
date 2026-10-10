@@ -233,12 +233,15 @@ jobs:
             packaging/tarball/*.sh packaging/deb/*/* \
             guest/system/conduit-guest-setup cli/assets/build-disk.sh \
             packaging/common/icons.sh packaging/test/icons.sh \
-            packaging/bios/build.sh packaging/bios/install.sh
+            packaging/bios/build.sh packaging/bios/install.sh \
+            packaging/bios/fetch-src.sh packaging/bios/vms-using-bios packaging/test/bios-vms.sh
       - name: App icon set
         run: |
           sudo apt-get install -y --no-install-recommends desktop-file-utils
           desktop-file-validate packaging/common/conduit.desktop
           packaging/test/icons.sh
+      - name: Conduit BIOS removal check
+        run: bash packaging/test/bios-vms.sh
       # The RPM spec and the flake fetch the venus submodules themselves
       # (git archive and flake sources leave submodules out).
       - name: Venus submodule pins in flake.nix and conduit.spec

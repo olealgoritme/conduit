@@ -75,7 +75,7 @@ conduit/
 | `conduit-X-1-x86_64.pkg.tar.zst` | Arch, Manjaro | in an Arch container (+ `PKGBUILD` for the AUR) |
 | `conduit-X-x86_64-linux.tar.gz` | everything else | backend, VMM and CLI static (musl); viewer, stream host and QEMU with their libraries (built on Debian 12); `install.sh` |
 | `conduit-guest_X-1_all.deb` / `conduit-guest-X-1.noarch.rpm` / `conduit-guest-X-1-any.pkg.tar.zst` | inside the VM | DKMS source package for the guest module (the Arch one is what `conduit attach` installs on Arch-based guests) |
-| `conduit-bios_B-1_all.deb` / `conduit-bios-B-1.noarch.rpm` / `conduit-bios-B-1-any.pkg.tar.zst` / `conduit-bios-B-x86_64.tar.gz` | host, optional | Conduit BIOS: edk2 OVMF with the Conduit boot logo, for `conduit attach` (B = edk2 build + revision, `packaging/bios/version.sh`; bios.yml, cached) |
+| `conduit-bios_B-1_all.deb` / `conduit-bios-B-x86_64.tar.gz` | Ubuntu host, optional | Conduit BIOS: edk2 OVMF with the Conduit boot logo, for `conduit attach` (B = edk2 build + revision, `packaging/bios/version.sh`; bios.yml, cached) |
 | `flake.nix` | NixOS | in the repo |
 | `SHA256SUMS` | | checksums of the files above |
 | `conduit-windows-gpu-driver-X.zip`, `SHA256SUMS-windows` | inside a Windows VM | the Windows guest driver (windows.yml) and its checksum |

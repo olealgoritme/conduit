@@ -2,7 +2,10 @@
 # Conduit BIOS installer for hosts without the distribution package.
 #
 #   tar xf conduit-bios-*.tar.gz && sudo ./conduit-bios/install.sh
-#   sudo ./conduit-bios/install.sh --uninstall
+#   sudo ./conduit-bios/install.sh --uninstall [--force]
+#
+# --uninstall refuses while libvirt VMs boot from the images (it lists them;
+# vms-using-bios) unless --force is given.
 #
 # Puts the images in /usr/share/conduit/bios. The libvirt firmware descriptors
 # go to /etc/qemu/firmware, only where the stock Debian/Ubuntu OVMF vars
@@ -16,6 +19,10 @@ DESC=/etc/qemu/firmware
 [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo $0" >&2; exit 1; }
 
 if [ "${1:-}" = --uninstall ]; then
+    if [ "${2:-}" != --force ] && ! "$HERE/vms-using-bios" --strict; then
+        echo "Not removed. Switch those VMs back first, or run: sudo $0 --uninstall --force" >&2
+        exit 1
+    fi
     rm -rf "$DIR"
     rm -f "$DESC"/90-conduit-bios*.json
     rmdir /usr/share/conduit "$DESC" 2>/dev/null || true
@@ -25,7 +32,7 @@ fi
 
 echo "Installing the Conduit BIOS $(cat "$HERE/VERSION") to $DIR"
 install -d "$DIR"
-install -m0644 "$HERE/conduit-bios.fd" "$HERE/conduit-bios.secboot.fd" "$HERE/VERSION" "$DIR/"
+install -m0644 "$HERE/conduit-bios.fd" "$HERE/conduit-bios.secboot.fd" "$HERE/VERSION" "$HERE/OVMF_VERSION" "$DIR/"
 if [ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]; then
     install -d "$DESC"
     install -m0644 "$HERE"/firmware/90-conduit-bios*.json "$DESC/"

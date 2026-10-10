@@ -1,5 +1,6 @@
 # Conduit BIOS: edk2 OVMF with the Conduit boot logo (packaging/bios), packaged
-# as conduit-bios (.deb, .rpm, Arch, tarball).
+# as conduit-bios (.deb and tarball: the images match Debian/Ubuntu's ovmf,
+# the only firmware `conduit attach` swaps).
 #
 # Its own workflow because it has its own version (packaging/bios/version.sh,
 # the edk2 build + a Conduit revision) and rarely changes. The firmware is
@@ -7,6 +8,11 @@
 # only when the edk2 pin, the logo, the patches or the build script change.
 # Runs on Ubuntu 24.04, the release the edk2 source package and its flags
 # come from (same compiler and iasl as Ubuntu's own build).
+#
+# The pinned edk2 source tarballs are mirrored as assets of the
+# `edk2-src-<deb version>` release (mirror job, on main), and
+# packaging/bios/fetch-src.sh fetches from there before Launchpad, so a cache
+# miss during a release does not depend on Launchpad.
 #
 # release.yml calls it (workflow_call) and attaches the packages.
 name: bios
@@ -47,12 +53,39 @@ jobs:
           NFPM_VERSION=2.43.0
           curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin nfpm
-          for f in bios-deb bios-rpm bios-arch bios-tarball; do packaging/build.sh package "$f"; done
+          for f in bios-deb bios-tarball; do packaging/build.sh package "$f"; done
           dpkg-deb -c dist/out/conduit-bios_*_all.deb | grep -E 'usr/share/conduit/bios/conduit-bios(\.secboot)?\.fd$'
+          dpkg-deb -c dist/out/conduit-bios_*_all.deb | grep usr/share/conduit/bios/OVMF_VERSION
           dpkg-deb -c dist/out/conduit-bios_*_all.deb | grep usr/share/qemu/firmware/90-conduit-bios.json
+          dpkg-deb --ctrl-tarfile dist/out/conduit-bios_*_all.deb | tar -t | grep -x './prerm'
+          tar -tzf dist/out/conduit-bios-*-x86_64.tar.gz | grep -x conduit-bios/vms-using-bios
           cat dist/bios/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: pkg-bios
           path: dist/out/*
           if-no-files-found: error
+
+  # Mirror the pinned edk2 sources as release assets (once per pin).
+  mirror:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Publish edk2-src-<deb version> if missing
+        run: |
+          . packaging/bios/version.sh
+          tag="edk2-src-${EDK2_DEB_VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is mirrored already"; exit 0
+          fi
+          EDK2_MIRROR="" packaging/bios/fetch-src.sh "$RUNNER_TEMP/edk2"
+          gh release create "$tag" --latest=false --target "$GITHUB_SHA" \
+            --title "edk2 ${EDK2_DEB_VERSION} sources (Conduit BIOS build input)" \
+            --notes "Ubuntu's edk2 ${EDK2_DEB_VERSION} source tarballs, unchanged, for packaging/bios/fetch-src.sh. Checksums: packaging/bios/version.sh." \
+            "$RUNNER_TEMP"/edk2/*.tar.xz
