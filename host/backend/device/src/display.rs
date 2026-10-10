@@ -3105,8 +3105,9 @@ impl DisplayLink {
         // Linux module takes events only once its KMS head is registered,
         // after the event queue is up), and an event it drops is never sent
         // again. A guest that restarts is back at the configured mode, so
-        // the ruling request is decided again for it. The mode list waits
-        // the same way.
+        // the ruling request is decided again for it. (The mode list does not
+        // wait: a guest driver keeps one that comes before its display is
+        // up, so a compositor that starts later reads the whole list.)
         let mut gen_seen = self.generation();
         let mut mode_held = true;
         // Host clipboard on its way to the guest: generation, text, offset.
@@ -3267,10 +3268,9 @@ impl DisplayLink {
             // Undeliverable input (no buffer posted) is retried soon rather
             // than on the next packet: a lost key release is a stuck key.
             let clip_waiting = pending_clip.is_some() && !clip_stalled;
-            let list_owed = !mode_held
-                && sink.mode_list_epoch().is_some_and(|e| {
-                    list_sent != Some((self.modes.lock().unwrap().generation(), e))
-                });
+            let list_owed = sink
+                .mode_list_epoch()
+                .is_some_and(|e| list_sent != Some((self.modes.lock().unwrap().generation(), e)));
             let mode_waiting = pending_mode.is_some() && !mode_held;
             let mut timeout = if pending.is_empty() && !mode_waiting && !clip_waiting {
                 if self.clip_owed() {
@@ -3455,7 +3455,7 @@ impl DisplayLink {
             if self.modes_owed() {
                 self.send_modes();
             }
-            if let Some(epoch) = sink.mode_list_epoch().filter(|_| !mode_held) {
+            if let Some(epoch) = sink.mode_list_epoch() {
                 let (lgen, sizes, mhz) = {
                     let m = self.modes.lock().unwrap();
                     (m.generation(), m.sizes(), m.refresh_mhz())
@@ -3650,7 +3650,11 @@ impl DisplayLink {
             ),
             EV_MODE_EDIT => log::info!(
                 "display: client {i} {} custom mode {}x{}",
-                if p.w0 == MODE_EDIT_ADD { "adds" } else { "removes" },
+                if p.w0 == MODE_EDIT_ADD {
+                    "adds"
+                } else {
+                    "removes"
+                },
                 p.x,
                 p.y
             ),
@@ -5302,14 +5306,11 @@ mod tests {
         // No guest that takes lists yet: nothing sent.
         std::thread::sleep(Duration::from_millis(50));
         assert!(sink.lists.lock().unwrap().is_empty());
-        // The guest acks the feature, but has shown no frame yet (its driver
-        // may not listen yet): held.
-        *sink.epoch.lock().unwrap() = Some(1);
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(sink.lists.lock().unwrap().is_empty());
-        // It shows a frame, but has no event buffer posted yet.
+        // The guest acks the feature (no frame needed: its driver keeps a
+        // list that comes before its display is up), but has no event buffer
+        // posted yet.
         sink.full.store(true, Ordering::Relaxed);
-        let _ = link.flip(0, &flip(1, 5120));
+        *sink.epoch.lock().unwrap() = Some(1);
         std::thread::sleep(Duration::from_millis(60));
         assert!(sink.lists.lock().unwrap().is_empty());
         sink.full.store(false, Ordering::Relaxed);
@@ -5329,7 +5330,10 @@ mod tests {
         conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let first = read_modes(&mut conn);
         assert_eq!(
-            first.iter().map(|c| (c.width, c.height)).collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|c| (c.width, c.height))
+                .collect::<Vec<_>>(),
             link.mode_sizes()
         );
 
@@ -5343,7 +5347,10 @@ mod tests {
         };
         conn.write_all(&add.encode()).unwrap();
         let second = read_modes(&mut conn);
-        let m = second.iter().find(|c| (c.width, c.height) == (1234, 567)).unwrap();
+        let m = second
+            .iter()
+            .find(|c| (c.width, c.height) == (1234, 567))
+            .unwrap();
         assert!(m.seq & wire::MODE_F_CUSTOM != 0);
         assert!(second[0].modifier > first[0].modifier);
         assert!(wait_for(|| sink.lists.lock().unwrap().len() == 2));
@@ -5406,7 +5413,10 @@ mod tests {
         let n = conn.read(&mut b).unwrap_or(0);
         for chunk in b[..n].chunks(wire::CMD_SIZE) {
             if chunk.len() == wire::CMD_SIZE {
-                assert_ne!(wire::Cmd::decode(chunk.try_into().unwrap()).ty, wire::CMD_MODES);
+                assert_ne!(
+                    wire::Cmd::decode(chunk.try_into().unwrap()).ty,
+                    wire::CMD_MODES
+                );
             }
         }
         assert!(!link.mode_sizes().contains(&(1234, 567)));

@@ -1014,7 +1014,15 @@ static void nvgpu_kms_mode_list_event(struct nvgpu_device *dev, const u8 *p,
 
   rcu_read_lock();
   kms = rcu_dereference(dev->kms_ev);
-  if (kms && !READ_ONCE(kms->dead)) {
+  if (!kms) {
+    /* No head yet: kept for it (nvgpu_kms_activate()), so a compositor that
+     * starts later reads the whole list. */
+    spin_lock_irqsave(&dev->early_list_lock, flags);
+    if (nvgpu_modelist_parse(p, len, NVGPU_KMS_MIN_DIM, NVGPU_KMS_MAX_DIM,
+                             NVGPU_KMS_MAX_HZ, &dev->early_list))
+      dev->early_list_valid = true;
+    spin_unlock_irqrestore(&dev->early_list_lock, flags);
+  } else if (!READ_ONCE(kms->dead)) {
     spin_lock_irqsave(&kms->mode_lock, flags);
     if (nvgpu_modelist_parse(p, len, NVGPU_KMS_MIN_DIM, NVGPU_KMS_MAX_DIM,
                              NVGPU_KMS_MAX_HZ, &kms->pend_list)) {
@@ -1450,6 +1458,28 @@ static void nvgpu_kms_activate(struct nvgpu_dri_dev *dri) {
 
   /* DisplayMode events may arrive from here on. */
   rcu_assign_pointer(dev->kms_ev, dri->kms);
+  /* A list that came before: the newer of it and one arriving now wins (an
+   * event after the publish goes to the head's own pending copy). */
+  {
+    struct nvgpu_kms *kms = dri->kms;
+    unsigned long flags;
+    bool queue = false;
+
+    spin_lock_irqsave(&dev->early_list_lock, flags);
+    if (dev->early_list_valid) {
+      dev->early_list_valid = false;
+      spin_lock(&kms->mode_lock);
+      if (!kms->list_pending) {
+        kms->pend_list = dev->early_list;
+        kms->list_pending = true;
+        queue = true;
+      }
+      spin_unlock(&kms->mode_lock);
+    }
+    spin_unlock_irqrestore(&dev->early_list_lock, flags);
+    if (queue)
+      schedule_work(&kms->mode_work);
+  }
 
   if (READ_ONCE(dev->input))
     return;

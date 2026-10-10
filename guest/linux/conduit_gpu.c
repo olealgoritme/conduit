@@ -64,6 +64,7 @@
 #include "nvgpu_rmctrl.h"
 #include "nvgpu_version.h"
 #include "nvgpu_escape.h"
+#include "nvgpu_modelist.h"
 
 /*
  * module_kset lives in kernel/module/sysfs.c and is NOT exported to modules,
@@ -774,6 +775,11 @@ struct nvgpu_device {
   /* The head DisplayMode events go to; RCU-published like `input`, read
    * from the event-queue interrupt. */
   struct nvgpu_kms __rcu *kms_ev;
+  /* A DisplayModeList that arrived before the head was published (the event
+   * queue runs from probe on): handed to the head when it is. */
+  spinlock_t early_list_lock;
+  bool early_list_valid;
+  struct nvgpu_modelist early_list;
   /* /dev/conduit-clipboard (nvgpu_clipboard.h); NULL without one. Read from
    * the event-queue interrupt. */
   struct nvgpu_clip *clip;
@@ -6602,6 +6608,7 @@ static int nvgpu_probe_dev(struct virtio_device *vdev,
   dev->vdev = vdev;
   vdev->priv = dev;
   spin_lock_init(&dev->vq_lock);
+  spin_lock_init(&dev->early_list_lock);
   INIT_LIST_HEAD(&dev->fds);
   spin_lock_init(&dev->fds_lock);
 

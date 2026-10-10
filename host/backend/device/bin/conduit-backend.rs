@@ -53,9 +53,9 @@ use device::virtio::{CURSOR_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, Vir
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
     DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT,
-    NVGPU_F_MODE_LIST, NVGPU_F_SCANOUT_PRESENTED, NVGPU_F_SCANOUT_RELEASE, SCANOUT_PRESENTED_MESSAGE_LEN,
-    SCANOUT_RELEASED_MESSAGE_LEN, ScanoutPresented, ScanoutReleased, clipboard_mime,
-    display_mode_list_message_len, encode_clipboard_chunk, encode_display_mode,
+    NVGPU_F_MODE_LIST, NVGPU_F_SCANOUT_PRESENTED, NVGPU_F_SCANOUT_RELEASE,
+    SCANOUT_PRESENTED_MESSAGE_LEN, SCANOUT_RELEASED_MESSAGE_LEN, ScanoutPresented, ScanoutReleased,
+    clipboard_mime, display_mode_list_message_len, encode_clipboard_chunk, encode_display_mode,
     encode_display_mode_list, encode_input_events, encode_scanout_presented,
     encode_scanout_released, input_events_that_fit,
 };
@@ -816,7 +816,11 @@ impl InputSink for VqInputSink {
 
     fn mode_list_epoch(&mut self) -> Option<u64> {
         let e = self.claims.mode_list_epoch()?;
-        self.target.lock().expect("event target").is_some().then_some(e)
+        self.target
+            .lock()
+            .expect("event target")
+            .is_some()
+            .then_some(e)
     }
 
     fn mode_list(&mut self, modes: &[(u32, u32)], refresh_mhz: u32) -> bool {
