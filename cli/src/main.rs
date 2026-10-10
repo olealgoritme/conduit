@@ -494,6 +494,10 @@ enum ShareCmd {
         /// The VM may read but not write (needs virtiofsd 1.11 or newer)
         #[arg(long)]
         ro: bool,
+        /// Share it even though it is, contains or lies inside a folder
+        /// Conduit protects (/, your home, ~/.config, Conduit's own files)
+        #[arg(long)]
+        force: bool,
     },
     /// Stop sharing a folder
     Rm { vm: String, name: String },
@@ -869,7 +873,13 @@ fn main() {
         Cmd::Detach { name } => libvirt::detach(&name),
         Cmd::Share { action } => match action {
             ShareCmd::List { vm } => shares::list(&vm),
-            ShareCmd::Add { vm, dir, name, ro } => shares::add(&vm, &dir, name.as_deref(), ro),
+            ShareCmd::Add {
+                vm,
+                dir,
+                name,
+                ro,
+                force,
+            } => shares::add(&vm, &dir, name.as_deref(), ro, force),
             ShareCmd::Rm { vm, name } => shares::rm(&vm, &name),
             ShareCmd::Ro { vm, name, state } => shares::set_read_only(&vm, &name, state == "on"),
         },

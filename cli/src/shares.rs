@@ -28,6 +28,10 @@ pub struct Share {
     pub path: String,
     #[serde(default)]
     pub read_only: bool,
+    /// Added with `--force` although it covers a folder Conduit protects
+    /// (see [`refused`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
 }
 
 /// What the domain gets for one folder: its virtiofs tag and socket.
@@ -130,6 +134,7 @@ pub fn default_share(vm: &str) -> Share {
         name: DEFAULT_NAME.into(),
         path: paths::home().join("Conduit").join(vm).display().to_string(),
         read_only: false,
+        force: false,
     }
 }
 
@@ -166,8 +171,68 @@ pub fn device_xml(w: &Wire) -> String {
     )
 }
 
-/// Add a folder to the list (not saved). `dir` must be an existing directory.
-pub fn add_to(list: &mut Vec<Share>, dir: &Path, name: Option<&str>, ro: bool) -> Result<Share> {
+/// A folder a guest must not get, and whether what is inside it is off
+/// limits too.
+#[derive(Clone, Debug)]
+pub struct Protected {
+    pub path: PathBuf,
+    pub inside: bool,
+}
+
+/// What sharing must not expose: the home folder and the configuration
+/// folder (and everything above them), and Conduit's own configuration and
+/// data (where `shares.json` lives) and the systemd user units, inside and
+/// above. A guest that could write any of these could run code on the host
+/// or widen its own shares.
+pub fn protected() -> Vec<Protected> {
+    let config_home = paths::config_dir()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| paths::home().join(".config"));
+    let p = |path: PathBuf, inside| Protected { path, inside };
+    vec![
+        p(PathBuf::from("/"), false),
+        p(paths::home(), false),
+        p(config_home.clone(), false),
+        p(paths::config_dir(), true),
+        p(paths::data_dir(), true),
+        p(config_home.join("systemd"), true),
+    ]
+}
+
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Why sharing `dir` would expose a protected folder, if it would.
+pub fn refused(dir: &Path, protect: &[Protected]) -> Option<String> {
+    let d = canon(dir);
+    for pr in protect {
+        let pp = canon(&pr.path);
+        if pp.starts_with(&d) {
+            return Some(if pp == d {
+                format!("{} is a folder Conduit protects", d.display())
+            } else {
+                format!("{} contains {}", d.display(), pp.display())
+            });
+        }
+        if pr.inside && d.starts_with(&pp) {
+            return Some(format!("{} is inside {}", d.display(), pp.display()));
+        }
+    }
+    None
+}
+
+/// Add a folder to the list (not saved). `dir` must be an existing directory
+/// that exposes nothing [`protected`], unless `force`.
+pub fn add_to(
+    list: &mut Vec<Share>,
+    dir: &Path,
+    name: Option<&str>,
+    ro: bool,
+    force: bool,
+    protect: &[Protected],
+) -> Result<Share> {
     let abs = std::fs::canonicalize(dir).map_err(|_| {
         oops(
             format!("{} does not exist", dir.display()),
@@ -180,6 +245,16 @@ pub fn add_to(list: &mut Vec<Share>, dir: &Path, name: Option<&str>, ro: bool) -
             "Give an existing directory",
         ));
     }
+    let forced = match refused(&abs, protect) {
+        Some(why) if !force => {
+            return Err(oops(
+                format!("will not share {}: {why}", abs.display()),
+                "A guest that can write there can change the host's configuration or its own shares. Share a folder inside your home instead, or add --force if you mean it",
+            ))
+        }
+        Some(_) => true,
+        None => false,
+    };
     let name = name
         .map(String::from)
         .unwrap_or_else(|| name_from_dir(&abs));
@@ -194,9 +269,93 @@ pub fn add_to(list: &mut Vec<Share>, dir: &Path, name: Option<&str>, ro: bool) -
         name,
         path: abs.display().to_string(),
         read_only: ro,
+        force: forced,
     };
     list.push(s.clone());
     Ok(s)
+}
+
+/// What `conduit _share` serves for one folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Serve {
+    pub dir: PathBuf,
+    pub read_only: bool,
+    /// Why the empty placeholder is served instead of the folder.
+    pub placeholder: Option<String>,
+}
+
+/// Decide what `conduit _share VM:NAME` serves. It never refuses: QEMU
+/// cannot start the VM without every share socket answering, so anything
+/// wrong (no such folder in `list`, a list that does not parse, a missing
+/// directory, a protected path that was not added with `--force`, read-only
+/// without `--readonly` support) serves the empty read-only `placeholder`
+/// instead and says why. A missing `default` folder is made again.
+pub struct ServeCtx<'a> {
+    pub can_ro: bool,
+    pub protect: &'a [Protected],
+    pub placeholder: &'a Path,
+    pub default: &'a Share,
+}
+
+pub fn plan_serve(vm: &str, name: &str, list: Result<Vec<Share>>, cx: &ServeCtx) -> Serve {
+    let ServeCtx {
+        can_ro,
+        protect,
+        placeholder,
+        default: d,
+    } = *cx;
+    let empty = |why: String| Serve {
+        dir: placeholder.to_path_buf(),
+        read_only: can_ro,
+        placeholder: Some(why),
+    };
+    let list = match list {
+        Ok(l) => l,
+        Err(e) => return empty(format!("{}: {e:#}", file(vm).display())),
+    };
+    let Some(s) = list.into_iter().find(|s| s.name == name) else {
+        return empty(format!("{vm} has no shared folder \"{name}\""));
+    };
+    if !s.force {
+        if let Some(why) = refused(Path::new(&s.path), protect) {
+            return empty(format!("will not share {}: {why}", s.path));
+        }
+    }
+    let dir = PathBuf::from(&s.path);
+    if !dir.is_dir() {
+        let remade = s.name == d.name && s.path == d.path && std::fs::create_dir_all(&dir).is_ok();
+        if !remade {
+            return empty(format!("the shared folder {} does not exist", s.path));
+        }
+    }
+    if s.read_only && !can_ro {
+        return empty(format!(
+            "\"{name}\" is read-only but this virtiofsd has no --readonly (1.11 or newer has)"
+        ));
+    }
+    Serve {
+        dir,
+        read_only: s.read_only,
+        placeholder: None,
+    }
+}
+
+/// The empty folder served in place of one that cannot be.
+pub fn placeholder_dir(vm: &str, name: &str) -> PathBuf {
+    paths::run_dir(vm).join(format!("share-{name}.empty"))
+}
+
+/// Make `p` an empty folder (anything a guest left there goes), read-only
+/// by mode as well.
+pub fn make_placeholder(p: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if p.symlink_metadata().is_ok() {
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+    }
+    std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o555))?;
+    Ok(())
 }
 
 fn readonly_ok(ro: bool) -> Result<()> {
@@ -244,11 +403,17 @@ pub fn list(vm: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn add(vm: &str, dir: &Path, name: Option<&str>, ro: bool) -> Result<()> {
+pub fn add(vm: &str, dir: &Path, name: Option<&str>, ro: bool, force: bool) -> Result<()> {
     let link = link_for(vm)?;
     readonly_ok(ro)?;
     let mut v = load_or_init(vm)?;
-    let s = add_to(&mut v, dir, name, ro)?;
+    let s = add_to(&mut v, dir, name, ro, force, &protected())?;
+    if s.force {
+        ui::warn(format!(
+            "sharing {} although it exposes a protected folder (--force)",
+            s.path
+        ));
+    }
     save(vm, &v)?;
     let how = apply(&link, vm, &v, Some((&s.name, true)))?;
     println!("Shared {} as \"{}\" ({}). {how}", s.path, s.name, mode(&s));
@@ -425,11 +590,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("conduit-share-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut v = vec![default_share("t")];
-        let s = add_to(&mut v, &dir, Some("Docs"), true).unwrap();
+        let s = add_to(&mut v, &dir, Some("Docs"), true, false, &[]).unwrap();
         assert!(s.read_only && s.name == "Docs");
-        assert!(add_to(&mut v, &dir, Some("docs"), false).is_err());
-        assert!(add_to(&mut v, &dir, Some("bad name"), false).is_err());
-        assert!(add_to(&mut v, &dir.join("missing"), None, false).is_err());
+        assert!(add_to(&mut v, &dir, Some("docs"), false, false, &[]).is_err());
+        assert!(add_to(&mut v, &dir, Some("bad name"), false, false, &[]).is_err());
+        assert!(add_to(&mut v, &dir.join("missing"), None, false, false, &[]).is_err());
         assert_eq!(v.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -446,5 +611,175 @@ mod tests {
         assert!(
             is_share_tag("conduit-Docs") && !is_share_tag("nvidia") && !is_share_tag("conduit-")
         );
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("conduit-shares-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A home with ~/.config/conduit, data and units, as `protected()` lists
+    /// them, under `root`.
+    fn fake_protected(root: &Path) -> Vec<Protected> {
+        let home = root.join("home/me");
+        for d in [
+            ".config/conduit",
+            ".config/systemd/user",
+            ".local/share/conduit/vms/w",
+        ] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(home.join("Games")).unwrap();
+        let p = |path: PathBuf, inside| Protected { path, inside };
+        vec![
+            p(PathBuf::from("/"), false),
+            p(home.clone(), false),
+            p(home.join(".config"), false),
+            p(home.join(".config/conduit"), true),
+            p(home.join(".local/share/conduit"), true),
+            p(home.join(".config/systemd"), true),
+        ]
+    }
+
+    #[test]
+    fn protected_folders_are_refused_unless_forced() {
+        let root = scratch("prot");
+        let pr = fake_protected(&root);
+        let home = root.join("home/me");
+        for bad in [
+            PathBuf::from("/"),
+            root.join("home"),
+            home.clone(),
+            home.join(".config"),
+            home.join(".config/conduit"),
+            home.join(".config/systemd/user"),
+            home.join(".local/share"),
+            home.join(".local/share/conduit/vms/w"),
+        ] {
+            assert!(refused(&bad, &pr).is_some(), "{}", bad.display());
+            let mut v = Vec::new();
+            let e = add_to(&mut v, &bad, Some("x"), false, false, &pr).unwrap_err();
+            assert!(format!("{e:#}").contains("will not share"), "{e:#}");
+            let s = add_to(&mut v, &bad, Some("x"), false, true, &pr).unwrap();
+            assert!(s.force);
+        }
+        assert_eq!(refused(&home.join("Games"), &pr), None);
+        // Above Conduit's data folder is refused too.
+        assert!(refused(&home.join(".local"), &pr).is_some());
+        // A symlink to a protected folder is the folder.
+        let link = root.join("sneaky");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(refused(&link, &pr).is_some());
+        let mut v = Vec::new();
+        let s = add_to(&mut v, &home.join("Games"), None, false, false, &pr).unwrap();
+        assert!(!s.force);
+        // `force` is kept in shares.json only when set.
+        assert!(!render(&v).contains("force"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn share(name: &str, path: &Path) -> Share {
+        Share {
+            name: name.into(),
+            path: path.display().to_string(),
+            read_only: false,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn the_share_helper_serves_a_placeholder_instead_of_failing() {
+        let root = scratch("serve");
+        let pr = fake_protected(&root);
+        let home = root.join("home/me");
+        let ph = root.join("ph");
+        let games = home.join("Games");
+        let good = |l: Vec<Share>| Ok(l);
+        let dflt = share(DEFAULT_NAME, &home.join("Conduit/w"));
+        let cx = |can_ro| ServeCtx {
+            can_ro,
+            protect: &pr,
+            placeholder: &ph,
+            default: &dflt,
+        };
+
+        // The folder itself.
+        let s = plan_serve("w", "G", good(vec![share("G", &games)]), &cx(true));
+        assert_eq!(
+            (s.dir.clone(), s.placeholder.is_none()),
+            (games.clone(), true)
+        );
+
+        // Everything else: the placeholder, read-only, with a reason.
+        let cases: Vec<(Result<Vec<Share>>, bool, &str)> = vec![
+            (Err(anyhow::anyhow!("broken json")), true, "broken json"),
+            (good(vec![share("G", &games)]), true, ""),
+            (good(vec![share("Other", &games)]), true, "no shared folder"),
+            (
+                good(vec![share("G", &root.join("gone"))]),
+                true,
+                "does not exist",
+            ),
+            // shares.json may be guest-writable: a protected path written
+            // into it is refused at start too.
+            (good(vec![share("G", &home)]), true, "will not share"),
+            (
+                good(vec![share("G", Path::new("/"))]),
+                true,
+                "will not share",
+            ),
+            (
+                good(vec![Share {
+                    read_only: true,
+                    ..share("G", &games)
+                }]),
+                false,
+                "--readonly",
+            ),
+        ];
+        for (list, can_ro, why) in cases {
+            if why.is_empty() {
+                continue;
+            }
+            let s = plan_serve("w", "G", list, &cx(can_ro));
+            assert_eq!(s.dir, ph);
+            assert_eq!(s.read_only, can_ro);
+            let w = s.placeholder.unwrap();
+            assert!(w.contains(why), "{w}");
+        }
+        // A share added with --force is served.
+        let forced = Share {
+            force: true,
+            ..share("G", &home)
+        };
+        let s = plan_serve("w", "G", good(vec![forced]), &cx(true));
+        assert_eq!(s.dir, home);
+        // A missing default folder is made again; another missing one is not.
+        let gone = home.join("Conduit/w");
+        assert!(!gone.exists());
+        let s = plan_serve("w", DEFAULT_NAME, good(vec![dflt.clone()]), &cx(true));
+        assert_eq!((s.dir, s.placeholder), (gone.clone(), None));
+        assert!(gone.is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_placeholder_is_emptied_and_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("ph");
+        let ph = root.join("share-G.empty");
+        make_placeholder(&ph).unwrap();
+        std::fs::set_permissions(&ph, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(ph.join("left-by-guest"), b"x").unwrap();
+        make_placeholder(&ph).unwrap();
+        assert_eq!(std::fs::read_dir(&ph).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::metadata(&ph).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        std::fs::set_permissions(&ph, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }
