@@ -726,7 +726,8 @@ so a GDI fence cannot block the adapter-global FIFO forever.
 | `GdiCls` | surface classes seen: destination bit 0 VRAM, 1 standard buffer, 2 unreachable; sources the same at bits 4-6 |
 | `GdiDstRes`, `GdiDstWH` | last destination's resource id and `w << 16 \| h` |
 | `GdiRkIn`, `GdiRgIn` | entries into `DxgkDdiRenderKm` / `DxgkDdiRenderGdi` with the knob on, before any parsing |
-| `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, jobs claimed by context because the record was missing, the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
+| `GdiSubN`, `GdiPrvOk`, `GdiCtxClm`, `GdiPrvSz`, `GdiPrvUmd` | SubmitCommand on a GDI context: submissions, private records decoded, submissions that admitted jobs by context because the record was missing (each admits every unclaimed job of the context and gates its fence on the last), the private sizes (RenderGdi/RenderKm low 16 bits, SubmitCommand high 16), SubmitCommand's UMD prefix size |
+| `GdiClmMul`, `GdiClmMax` | of those, submissions that admitted more than one job (a rendered job without a submission of its own came before), and the most one admitted |
 | `GdiChUp`, `GdiCeWhy` | channel bring-ups the executor asked for; why the last CE attempt failed (1 channel down, 2/3 destination/source mapping, 4 submit, 5 wait, 16 + channel state when it could not come up: 17 cold, 18 disabled, 19 broken, 20 other) |
 | `GdiRdBk`, `GdiThr` | copies from a VRAM surface into a standard buffer (GDI readback); the executor's own thread running (1) or the HPD worker in charge (0) |
 | `GdiSysCe`, `GdiSysRef`, `GdiSysFail` | copies/fills with a staging buffer on one side done on the copy engine over its system pages; refused (CPU instead); failed after the mapping (CPU instead) |
