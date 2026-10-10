@@ -170,7 +170,7 @@ manager's greeter).
 It also installs `conduit-shares.service` (with `/usr/local/sbin/conduit-shares`
 and a udev rule): every virtiofs device tagged `conduit-NAME` (the VM's shared
 folders, `conduit share`) is mounted at `/mnt/conduit/NAME`, also when added
-while the VM runs. What the files do:
+while the VM runs. The loader files above point at:
 
 - the Vulkan ICD and GLVND EGL vendor files from the share;
 - EGL external platforms from the share first, then the distribution's
