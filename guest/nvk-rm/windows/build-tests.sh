@@ -7,7 +7,9 @@
 # vk_offscreen_test.exe, vk_scanout_present.exe, vk_bar_test.exe,
 # vk_coherence_test.exe, vk_bl_readback.exe, vk_video_probe.exe,
 # helios_icd_test.exe, vk_rmfence_test.exe and helios_share_test.exe plus their
-# SPIR-V (glslangValidator), and vk_loader_list.exe (what the system Vulkan
+# SPIR-V (glslangValidator), the self-checking correctness tests
+# vk_zero_page_test.exe, vk_draw_fetch_test.exe, vk_submit_order_test.exe,
+# vk_texture_roundtrip.exe and vk_vertex_formats.exe (SPIR-V built in), and vk_loader_list.exe (what the system Vulkan
 # loader enumerates) and wgl_test.exe (OpenGL through WGL: Zink with app-local
 # opengl32.dll + libgallium_wgl.dll, or the adapter's ICD). MinGW ships no
 # Vulkan import library: one for
@@ -23,6 +25,12 @@
 #   set VK_DIRECT_DRIVER=C:\path\to\vulkan_nouveau.dll
 #   vk_summary.exe & vk_compute_test.exe compute.spv copy & vk_offscreen_test.exe 100
 #   vk_scanout_present.exe 120     (spinning triangle on the scanout, 120 s)
+# The correctness tests pick the device by name (default "NVK", or e.g.
+# "NVIDIA" for the host's driver) and print a RESULT line; under the Helios
+# policy run them with HELIOS_ICD=nvk.  vk_texture_roundtrip and
+# vk_vertex_formats also print hashes that must match a run of the same test
+# on NVIDIA's driver for the same GPU (the same sources build on Linux:
+# cc -I<dir with the generated headers> tests/<test>.c -lvulkan -lpthread).
 # From the desktop session (guest/windows/tools/run-in-session.ps1):
 #   vk_loader_list.exe             (no VK_DIRECT_DRIVER: the registered ICDs)
 #   wgl_test.exe 10 1280 720       (readback, GL 4.3 compute, gears fps)
@@ -51,8 +59,16 @@ glslangValidator -V "$tests/triangle.vert" -o "$OUT_DIR/triangle.vert.spv" >/dev
 glslangValidator -V "$tests/triangle.frag" -o "$OUT_DIR/triangle.frag.spv" >/dev/null
 glslangValidator -V "$tests/spin.vert" -o "$OUT_DIR/spin.vert.spv" >/dev/null
 glslangValidator -V "$tests/bar.comp" -o "$OUT_DIR/bar.comp.spv" >/dev/null
+# SPIR-V the correctness tests embed (header <name>.h, array <name>)
+for s in zero_page_fetch.vert zero_page_write.comp draw_fetch.vert submit_seq.comp \
+         texture_read.comp vertex_formats.vert; do
+  name=$(echo "$s" | tr . _)
+  glslangValidator -V --target-env vulkan1.2 --vn "$name" "$tests/$s" \
+    -o "$OUT_DIR/include/$name.h" >/dev/null
+done
 
-for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_test vk_coherence_test vk_bl_readback vk_video_probe; do
+for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_test vk_coherence_test vk_bl_readback vk_video_probe \
+         vk_zero_page_test vk_draw_fetch_test vk_submit_order_test vk_texture_roundtrip vk_vertex_formats; do
   "$CC" -O1 -Wall -I"$OUT_DIR/include" "$tests/$t.c" -L"$OUT_DIR" -lvulkan-1 -lm -o "$OUT_DIR/$t.exe"
 done
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/icd_smoke.c" -o "$OUT_DIR/icd_smoke.exe"

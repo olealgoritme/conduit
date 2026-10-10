@@ -1,0 +1,12 @@
+#version 450
+layout(local_size_x = 32) in;
+layout(std430, set = 0, binding = 0) buffer R { uint v[]; } r;
+layout(push_constant) uniform PC { uint seq; uint spin; } pc;
+void main() {
+   uint x = pc.seq;
+   for (uint i = 0u; i < pc.spin; i++)
+      x = x * 1664525u + 1013904223u;
+   /* x is never 0xffffffff in practice; keeps the loop alive */
+   if (gl_LocalInvocationIndex == 0u)
+      r.v[pc.seq % 65536u] = (x == 0xffffffffu) ? 0u : pc.seq;
+}
