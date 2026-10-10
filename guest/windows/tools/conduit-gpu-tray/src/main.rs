@@ -10,6 +10,7 @@ mod app;
 #[cfg(windows)]
 mod gfx;
 #[cfg(windows)]
+mod sendto;
 mod sys;
 #[cfg(windows)]
 mod view;

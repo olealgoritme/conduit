@@ -1,6 +1,7 @@
 //! The Win32 shell: tray icon, popup window, the channel reader thread.
 
 use crate::gfx::{self, argb, wide, Gfx};
+use crate::sendto;
 use crate::sys;
 use crate::view::{self, Snapshot, Wait};
 use gpu_tray::{
@@ -60,6 +61,8 @@ static ICON: AtomicIsize = AtomicIsize::new(0);
 static MAIN: AtomicIsize = AtomicIsize::new(0);
 static LAST_FACE: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_HIDE: AtomicU64 = AtomicU64::new(0);
+/// When the Send to shortcut was last checked.
+static LAST_SENDTO: AtomicU64 = AtomicU64::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// Keep the popup open when it loses focus (so files can be dragged onto it).
 static KEEP_OPEN: AtomicBool = AtomicBool::new(false);
@@ -653,6 +656,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER => {
             refresh_shares();
+            if tick().saturating_sub(LAST_SENDTO.load(Relaxed)) >= 10_000 {
+                LAST_SENDTO.store(tick(), Relaxed);
+                let root = default_share(&shares()).map(Share::root);
+                sendto::sync(root.as_deref(), &exe_path());
+            }
             // Catches a feed that went quiet, and keeps the open popup honest.
             refresh_tray(hwnd, false);
             if IsWindowVisible(hwnd) != 0 {

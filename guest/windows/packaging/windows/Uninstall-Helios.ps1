@@ -24,6 +24,13 @@ Unregister-ScheduledTask -TaskName "HeliosDisplayTopology" -Confirm:$false -Erro
 Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName "ConduitGpuTray" -Confirm:$false -ErrorAction SilentlyContinue
 Get-Process -Name "conduit-gpu-tray" -ErrorAction SilentlyContinue | Stop-Process -Force
+# The tray app's Send to shortcut, in every user profile that has one.
+$profileDirs = @(Get-ChildItem -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList" -ErrorAction SilentlyContinue |
+    ForEach-Object { [Environment]::ExpandEnvironmentVariables([string]$_.GetValue("ProfileImagePath")) }) +
+    @(Get-ChildItem -LiteralPath (Join-Path $env:SystemDrive "Users") -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+$profileDirs | Where-Object { $_ } | Sort-Object -Unique | ForEach-Object {
+    Remove-Item -LiteralPath (Join-Path $_ "AppData\Roaming\Microsoft\Windows\SendTo\Conduit host.lnk") -Force -ErrorAction SilentlyContinue
+}
 Unregister-ScheduledTask -TaskName "ConduitShares" -Confirm:$false -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name='virtiofs.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like "*conduit-*" } |

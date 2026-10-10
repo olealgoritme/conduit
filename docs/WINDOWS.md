@@ -204,29 +204,61 @@ take the first device, so the installer sets it to manual start.
 The tray app lists the mounted folders under Shared folders in its menu (each
 opens in Explorer) and as Open default share, shows a Shared folders row in the
 popup, and copies files dropped on the popup into the default folder. Turn on
-Keep popup open in the menu to drag files onto it from Explorer.
+Keep popup open in the menu to drag files onto it from Explorer. While the
+default folder (`Conduit`) has a drive letter, the tray app also keeps a
+shortcut `Conduit host.lnk` to its root in the user's SendTo folder, so
+Explorer's **Send to → Conduit host** copies the selection there; it is
+removed when the folder is gone and by `Uninstall-Helios.ps1`.
 
 ## GPU stats tray
 
-`conduit attach` adds a virtio-serial channel, `org.conduit.stats.0`, whose host
-end is a unix socket QEMU binds (`stats.sock` in the VM's runtime folder), and
-installs `conduit-stats@NAME.service`. That unit runs `conduit _stats NAME`:
-once a second it writes one JSON line of the host GPU's NVML readings (name,
-driver, temperature, load, VRAM, clocks, power, fan, P-state, PCIe, encoder) to
-the socket, and reconnects when the VM restarts. The channel is added when
-the domain is defined, so a VM attached earlier needs `conduit attach NAME`
-again and one cold restart. The guest needs the VirtIO serial driver (the one
-the QEMU guest agent uses).
+**Conduit GPU** is a small tray app (`guest/windows/tools/conduit-gpu-tray`,
+built for `x86_64-pc-windows-gnu`, about 350 KB, no runtime) that shows the
+host GPU's state inside the VM.
 
-The package installs **Conduit GPU** (`guest/windows/tools/conduit-gpu-tray`,
-built for `x86_64-pc-windows-gnu`, about 350 KB, no runtime) to
-`Program Files\Conduit` and starts it at logon through the machine Run key. It
-reads `\\.\Global\org.conduit.stats.0`, shows the temperature (or load) as a
-colour-coded number in the tray, and opens a popup on click: load, power and
-temperature, 60-second graphs and VRAM, clock, power and fan bars. The
-right-click menu has Show, which metric the icon shows, Start with Windows,
-and Exit. Until the first line arrives the popup says "Waiting for Conduit host
-feed".
+**Data path.** `conduit attach` adds a virtio-serial channel,
+`org.conduit.stats.0`, whose host end is a unix socket QEMU binds (`stats.sock`
+in the VM's runtime folder), and installs `conduit-stats@VM.service`. That unit
+runs `conduit _stats VM`: once a second it writes one JSON line of the host
+GPU's NVML readings (name, driver, temperature, load, VRAM, clocks, power, fan,
+P-state, PCIe, encoder) to the socket, and reconnects when the VM restarts. The
+channel is added when the domain is defined, so a VM attached earlier needs
+`conduit attach VM` again and one cold restart. The guest needs the VirtIO
+serial driver (the one the QEMU guest agent uses); the app opens
+`\\.\Global\org.conduit.stats.0`.
+
+**Install and uninstall.** The driver package copies the exe to
+`Program Files\Conduit` and registers the logon task `ConduitGpuTray`;
+`Uninstall-Helios.ps1` stops the app and removes the task, the folder and the
+Send to shortcut. Run as administrator without the package, the exe can
+register the task itself from its menu (Start with Windows).
+
+**Start at logon.** The VirtIO serial port is admin-only, so the app has to
+run elevated. The task `ConduitGpuTray` runs it at every logon with the
+highest privileges for members of `BUILTIN\Users`, which starts it elevated
+without a UAC prompt. Started by hand without administrator rights, the app
+relaunches itself through that task (one UAC prompt if the task is missing).
+On Windows 11 the first run pins the tray icon next to the clock
+(`HKCU\Control Panel\NotifyIconSettings`, `IsPromoted`); hiding it afterwards
+sticks.
+
+**Use.** The icon shows the temperature (or load) as a colour-coded number. A
+click opens a popup: load, power and temperature, 60-second graphs, and VRAM,
+clock, power and fan bars, plus the Shared folders row. The right-click menu
+has Show (which metric the icon shows), the shared folders, Open default share,
+Keep popup open, Start with Windows, and Exit.
+
+**Troubleshooting.** The popup says "Waiting for Conduit host feed" until the
+first line arrives. If it stays:
+
+- On the host, `systemctl --user status conduit-stats@VM` must be active
+  (`systemctl --user enable --now conduit-stats@VM.service` starts it).
+- The VM must have been restarted (cold) after `conduit attach`, which adds the
+  channel; `virsh dumpxml VM` shows `org.conduit.stats.0`.
+- In the guest, the VirtIO serial driver must be installed (Device Manager:
+  "VirtIO Serial Driver" under System devices).
+- "Access denied" means the app is not elevated; start it from the
+  `ConduitGpuTray` task (`schtasks /run /tn ConduitGpuTray`).
 
 ## Registry knobs
 

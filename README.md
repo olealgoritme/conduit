@@ -79,6 +79,14 @@ need relative mouse input), and run games at the VM's display mode (e.g.
 5120x1440, "Fullscreen Windowed"). The guest has no scaler, so a lower game
 resolution does not fill the screen. Ctrl+Alt+G again releases the mouse.
 
+**Conduit GPU tray.** The driver package also installs a small tray app that
+starts at logon with no prompt. Its icon shows the host GPU's live temperature
+or load; clicking it opens a popup with load, power and temperature, 60-second
+graphs and VRAM, clock and fan bars. Its Shared folders menu opens the host
+folders mounted as drives, Explorer's **Send to → Conduit host** copies files
+to the default folder, and with **Keep popup open** you can drag files onto the
+popup ([docs/WINDOWS.md](docs/WINDOWS.md#gpu-stats-tray)).
+
 More detail (building the driver yourself, knobs, troubleshooting):
 [docs/WINDOWS.md](docs/WINDOWS.md).
 
