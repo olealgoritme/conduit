@@ -2176,7 +2176,18 @@ unsafe fn nvk_present_impl_timed(
 
 pub(crate) unsafe extern "system" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     probe_entry_attempt(PresentBoundaryEntry::Present);
+    if !arg.is_null() {
+        retry_scanout_event(dxgi_device_handle((*arg).hDevice));
+    }
     dxgi_present_impl(arg, PresentBoundaryEntry::Present)
+}
+
+/// A device whose scanout-acquire event REGISTER was refused asks again
+/// (`scanout_acquire::retry_register`): one relaxed load in the common case.
+pub(crate) unsafe fn retry_scanout_event(h: Hdevice) {
+    if let Some(dev) = helios_device(h) {
+        crate::scanout_acquire::retry_register(dev);
+    }
 }
 
 /// The common implementation for an ordinary Present and a one-surface
@@ -3454,6 +3465,7 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
     if report_if_removed(dxgi_device_handle(a.hDevice), "Present1") {
         return crate::hr::D3DDDIERR_DEVICEREMOVED;
     }
+    retry_scanout_event(dxgi_device_handle(a.hDevice));
 
     if a.SurfacesToPresent == 1 {
         probe_entry_attempt(PresentBoundaryEntry::Present1Single);

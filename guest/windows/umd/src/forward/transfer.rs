@@ -308,6 +308,7 @@ pub(crate) unsafe extern "system" fn flush(h: Hdevice) {
         context.Flush();
         super::present::present_timing::ddi_flush_gate(|| flush_gate(h, &context));
     }
+    super::present::retry_scanout_event(h);
 }
 
 static FLUSH_GATE_SENT: [AtomicUsize; 3] =
