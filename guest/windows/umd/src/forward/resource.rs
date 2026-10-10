@@ -1878,17 +1878,24 @@ pub(crate) unsafe extern "system" fn resolve_shared_resource(
     };
     let alloc = resource_allocation(resource);
     let (width, height) = resource_dimensions(resource);
-    log_error!(
-        "DDI ResolveSharedResource: hDevice={:p} hResource={:p} alloc=0x{:x} {}x{}",
-        h,
-        h_resource,
-        alloc,
-        width,
-        height
+    static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 4 || n % 1024 == 0 {
+        log_error!(
+            "DDI ResolveSharedResource #{n}: hDevice={:p} hResource={:p} alloc=0x{:x} {}x{}",
+            h,
+            h_resource,
+            alloc,
+            width,
+            height
+        );
+    }
+    gdi_handoff(
+        Hdevice {
+            pDrvPrivate: h as *mut c_void,
+        },
+        resource,
     );
-    gdi_handoff(Hdevice {
-        pDrvPrivate: h as *mut c_void,
-    });
     0
 }
 
@@ -1911,21 +1918,25 @@ pub(crate) unsafe extern "system" fn dxgi_resolve_shared_resource(
         width,
         height
     );
-    gdi_handoff(Hdevice {
-        pDrvPrivate: h_device as *mut c_void,
-    });
+    gdi_handoff(
+        Hdevice {
+            pDrvPrivate: h_device as *mut c_void,
+        },
+        resource,
+    );
     0
 }
 
-/// GDI is about to read or draw the GDI-compatible `hResource` (DXGI calls ResolveSharedResource
-/// from `IDXGISurface1::GetDC`): submit what this device recorded, and on NVK wait until the GPU
-/// has finished it. The GDI acceleration executor in the KMD reads and writes the image with its
+/// Submit what this device recorded (every ResolveSharedResource), and when `resource` is
+/// GDI-compatible, on NVK wait until the GPU has finished it: GDI is about to read or draw it
+/// (DXGI calls ResolveSharedResource from `IDXGISurface1::GetDC`; the other caller, a keyed-mutex
+/// release, has its own ordering, `flush_gate`, and does not wait here). The GDI acceleration executor in the KMD reads and writes the image with its
 /// own copy engine; dxgkrnl orders GDI's DMA buffers against this device's only when the device
 /// submits through dxgkrnl, and NVK submits to RM directly, so without the wait GDI could read
 /// the image before the device's last rendering landed (or draw into it and be overwritten by
 /// it): `gdi_interop_probe` round 0 of every process, RichEdit's text in Notepad. Venus devices
 /// submit through dxgkrnl, which orders the GDI work after theirs.
-pub(crate) unsafe fn gdi_handoff(h: Hdevice) {
+pub(crate) unsafe fn gdi_handoff(h: Hdevice, resource: ddi::D3D10DDI_HRESOURCE) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -1933,7 +1944,7 @@ pub(crate) unsafe fn gdi_handoff(h: Hdevice) {
     let Some(dev) = helios_device(h) else {
         return;
     };
-    if !dev.dxvk.is_nvk() {
+    if !dev.dxvk.is_nvk() || !resource_gdi_compatible(resource) {
         return;
     }
     let Some(start) = super::transfer::wait_submitted(dev, &context, "GetDC flush wait") else {
