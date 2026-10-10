@@ -210,18 +210,11 @@ pub(crate) unsafe extern "system" fn resource_map(
         Some(&mut out),
     ) {
         Ok(()) => {
-            let allocation = resource_allocation(h_resource);
-            let n = MAP_LOG_COUNT.next();
-            if n < 256 || allocation != 0 {
-                trace_line!(
-                    "DDI resource_map ok alloc=0x{:x} sub={} map={} rowPitch={} depthPitch={} pData={:p}",
-                    allocation,
-                    subresource,
-                    map_type,
-                    out.RowPitch,
-                    out.DepthPitch,
-                    out.pData
-                );
+            // Untraced, skip the allocation read (a dependent load into the
+            // resource slot) and the counter: this is the per-draw constant
+            // buffer path (Map DISCARD / NO_OVERWRITE).
+            if crate::trace_enabled() {
+                trace_resource_map(h_resource, subresource, map_type, &out);
             }
             if !mapped.is_null() {
                 (*mapped).pData = out.pData;
@@ -235,6 +228,29 @@ pub(crate) unsafe extern "system" fn resource_map(
                 (*mapped).pData = core::ptr::null_mut();
             }
         }
+    }
+}
+
+/// The `resource_map` trace line (UmdTrace only): the first 256 maps, and
+/// every map of a WDDM-allocated resource.
+unsafe fn trace_resource_map(
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    subresource: u32,
+    map_type: ddi::D3D10_DDI_MAP,
+    out: &D3D11_MAPPED_SUBRESOURCE,
+) {
+    let allocation = resource_allocation(h_resource);
+    let n = MAP_LOG_COUNT.next();
+    if n < 256 || allocation != 0 {
+        trace_line!(
+            "DDI resource_map ok alloc=0x{:x} sub={} map={} rowPitch={} depthPitch={} pData={:p}",
+            allocation,
+            subresource,
+            map_type,
+            out.RowPitch,
+            out.DepthPitch,
+            out.pData
+        );
     }
 }
 
@@ -257,8 +273,10 @@ pub(crate) unsafe extern "system" fn dynamic_cb_map_no_overwrite(
     map_flags: u32,
     mapped: *mut ddi::D3D10DDI_MAPPED_SUBRESOURCE,
 ) {
+    // Every NO_OVERWRITE constant-buffer map comes through here: a load,
+    // not a locked add, once the first hit is recorded.
     static FIRST_HIT: AtomicUsize = AtomicUsize::new(0);
-    if FIRST_HIT.fetch_add(1, Ordering::Relaxed) == 0 {
+    if FIRST_HIT.load(Ordering::Relaxed) == 0 && FIRST_HIT.swap(1, Ordering::Relaxed) == 0 {
         trace_line!(
             "DDI DynamicConstantBufferMapNoOverwrite: first hit sub={} map={}",
             subresource,

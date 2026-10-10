@@ -97,8 +97,12 @@ pub(crate) static BIND_SLOTS_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// is taken anywhere: the runtime holds each handle's reference across the
 /// DDI call by contract, and the handle slot's stored reference lives until
 /// the matching Destroy* DDI.
+///
+/// Only the first `len` slots are written: the SRV collector's array is 128
+/// words, and zeroing all of it on every `*SetShaderResources` (one or two
+/// views, per draw) was a 1 KiB store for nothing.
 pub(crate) struct RawBinds<const N: usize> {
-    slots: [*mut c_void; N],
+    slots: [core::mem::MaybeUninit<*mut c_void>; N],
     len: usize,
 }
 
@@ -112,6 +116,7 @@ impl<const N: usize> RawBinds<N> {
     /// COM. The borrow never drops an element, so no reference is released.
     /// The caller must name the `T` the collected slots actually hold.
     pub(crate) unsafe fn as_com_slice<T: Interface>(&self) -> &[Option<T>] {
+        // The first `len` slots are initialised (`collect_raw` writes each).
         core::slice::from_raw_parts(self.slots.as_ptr().cast::<Option<T>>(), self.len)
     }
 
@@ -119,7 +124,8 @@ impl<const N: usize> RawBinds<N> {
     /// `Option<*const Option<T>>` + `num` instead of a slice.
     ///
     /// SAFETY: as [`RawBinds::as_com_slice`]; additionally the caller must
-    /// keep `self` alive across the context call the pointer is passed to.
+    /// keep `self` alive across the context call the pointer is passed to,
+    /// and pass [`RawBinds::len`] as the count (only that many are written).
     pub(crate) unsafe fn as_com_ptr<T: Interface>(&self) -> *const Option<T> {
         self.slots.as_ptr().cast::<Option<T>>()
     }
@@ -144,19 +150,20 @@ unsafe fn collect_raw<const N: usize, H>(
     word_of: impl Fn(&H) -> usize,
 ) -> RawBinds<N> {
     let mut out = RawBinds {
-        slots: [core::ptr::null_mut(); N],
+        slots: [core::mem::MaybeUninit::uninit(); N],
         len: 0,
     };
     let len = (num as usize).min(N);
     if num as usize > N && BIND_SLOTS_CLAMPED.fetch_add(1, Ordering::Relaxed) == 0 {
         log_error!("DDI bind array clamped: num={num} max={N}");
     }
-    if let Some(slice) = DdiSlice::new(h, len as u32) {
-        for index in 0..len {
-            if let Some(handle) = slice.get(index) {
-                out.slots[index] = word_of(handle) as *mut c_void;
-            }
-        }
+    let slice = DdiSlice::new(h, len as u32);
+    for (index, slot) in out.slots.iter_mut().take(len).enumerate() {
+        let word = slice
+            .as_ref()
+            .and_then(|s| s.get(index))
+            .map_or(0, &word_of);
+        slot.write(word as *mut c_void);
     }
     out.len = len;
     out
