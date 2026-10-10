@@ -1,0 +1,108 @@
+Helios DXVK fork: the scanout-acquire signaler polls every 1 ms without an event
+
+Conduit guest/windows. Applied after 0014 by ci/windows/Build-Driver.ps1.
+
+The helios-acquire signaler normally sleeps on the KMD retirement event. When
+the KMD's event table refused the registration (AqRgF) or no event was
+delivered, it polled the read ledger every 10 ms, so a retirement could reach a
+waiting fence up to 10 ms late. The fallback now polls every 1 ms.
+
+A 1 ms wait only lasts 1 ms with a raised timer resolution, so the fallback
+holds timeBeginPeriod(1) while it polls, and gives it back (timeEndPeriod) when
+an event is registered or the thread ends. The event path is unchanged. winmm
+is resolved at run time, since the standalone d3d11.dll build of this engine
+does not link it.
+
+diff --git a/src/dxvk/dxvk_helios_scanout_acquire.cpp b/src/dxvk/dxvk_helios_scanout_acquire.cpp
+index 1d36970..3d97d96 100644
+--- a/src/dxvk/dxvk_helios_scanout_acquire.cpp
++++ b/src/dxvk/dxvk_helios_scanout_acquire.cpp
+@@ -352,9 +352,62 @@ namespace dxvk {
+   }
+ 
+ 
++#ifdef _WIN32
++  namespace {
++    /* The no-event fallback polls every 1 ms. Without a raised timer
++     * resolution a 1 ms wait rounds up to the system tick (up to 15.6 ms), so
++     * the fallback holds a 1 ms period for as long as it polls and gives it
++     * back as soon as the retirement event is registered or the thread ends.
++     * winmm is resolved at run time: the standalone d3d11.dll build of this
++     * engine does not link it. */
++    class HeliosFineTimer {
++      using PfnPeriod = UINT (WINAPI*)(UINT);
++
++    public:
++      void begin() {
++        if (m_on)
++          return;
++
++        HMODULE winmm = LoadLibraryW(L"winmm.dll");
++
++        if (!winmm)
++          return;
++
++        m_begin = reinterpret_cast<PfnPeriod>(
++          reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")));
++        m_end   = reinterpret_cast<PfnPeriod>(
++          reinterpret_cast<void*>(GetProcAddress(winmm, "timeEndPeriod")));
++
++        m_on = m_begin && m_end && m_begin(1u) == 0u;
++      }
++
++      void end() {
++        if (m_on)
++          m_end(1u);
++
++        m_on = false;
++      }
++
++      ~HeliosFineTimer() {
++        end();
++      }
++
++    private:
++      PfnPeriod m_begin = nullptr;
++      PfnPeriod m_end   = nullptr;
++      bool      m_on    = false;
++    };
++  }
++#endif
++
++
+   void DxvkHeliosScanoutAcquire::run() {
+     env::setThreadName("helios-acquire");
+ 
++#ifdef _WIN32
++    HeliosFineTimer fineTimer;
++#endif
++
+     while (true) {
+       HANDLE event = nullptr;
+ 
+@@ -370,9 +423,13 @@ namespace dxvk {
+ 
+         if (!event) {
+           // No registered retirement event (KMD table full, old KMD mid-skew,
+-          // or not delivered yet): pure level-triggered polling. The ledger
+-          // is the truth either way; the event is only a latency optimization.
+-          m_cond.wait_for(lock, std::chrono::milliseconds(10));
++          // or not delivered yet): pure level-triggered polling, every 1 ms.
++          // The ledger is the truth either way; the event is only a latency
++          // optimization.
++#ifdef _WIN32
++          fineTimer.begin();
++#endif
++          m_cond.wait_for(lock, std::chrono::milliseconds(1));
+ 
+           if (m_stop)
+             return;
+@@ -381,6 +438,8 @@ namespace dxvk {
+ 
+ #ifdef _WIN32
+       if (event) {
++        fineTimer.end();
++
+         // Event OR timeout - LEVEL-TRIGGERED either way (landmine #4): every
+         // wake re-reads the whole ledger, so a lost or coalesced KeSetEvent is
+         // a <=10 ms hiccup, never a hang, and the armed-wait release latency

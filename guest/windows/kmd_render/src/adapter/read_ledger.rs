@@ -42,10 +42,21 @@ use wdk_sys::{KEVENT, PHYSICAL_ADDRESS, PVOID};
 /// its head — the remainder is zero and reserved.
 pub(crate) const LEDGER_PAGE_BYTES: usize = 4096;
 
-/// Retirement-event registrations per adapter. Sized like the fence-event
-/// table's consumers: one auto-reset event per DxvkDevice, a handful of
-/// processes (dwm + apps), with headroom for restart churn.
-const EVENT_TABLE_LEN: usize = 16;
+/// Retirement-event registrations per adapter: one auto-reset event per
+/// DxvkDevice. Every D3D11 device in every process registers one (dwm alone
+/// holds about a dozen, and the shell, services and helpers hold more), so a
+/// desktop that has been up a while fills a small table, and a game started
+/// after that gets `TABLE_FULL`. A refused device still gates its rewrites of a
+/// buffer the host reads, but its DXVK signaler then sees a retirement only on
+/// its 10 ms timeout: a windowed game whose next frame finds the previous Blt
+/// copy unretired waits for that timeout every frame and locks at 100 fps.
+/// `AqLive` is the occupancy.
+const EVENT_TABLE_LEN: usize = 64;
+
+/// Entries one lock hold drains in [`ReadLedger::drain_events`]: the drained
+/// entries live on the caller's stack, so a full-table reclaim is done in
+/// chunks instead of one `EVENT_TABLE_LEN` array.
+const DRAIN_CHUNK: usize = 16;
 
 // ── Counters (§3.4) — unsampled atomics, published by `scanout_trace::dump`,
 // zeroed by `scanout_trace::reset` at StartDevice. Deliberately NOT zeroed by
@@ -74,10 +85,23 @@ static RD_GENERATION_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static RD_MAP_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Event registrations parked (`AqReg`).
 static AQ_REGISTERED: AtomicU32 = AtomicU32::new(0);
+/// Registrations live now (`AqLive`): `AqReg` minus every removal. At
+/// `EVENT_TABLE_LEN` the next REGISTER is refused (`AqRgF`).
+static AQ_LIVE: AtomicU32 = AtomicU32::new(0);
 /// Registration refusals: table full, bad handle, bad op (`AqRgF`).
 pub(crate) static AQ_REGISTER_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Broadcast `KeSetEvent` invocations at retirement (`AqSigB`).
 static AQ_SIGNALS: AtomicU32 = AtomicU32::new(0);
+
+/// `n` registrations left the table (`AqLive`). Saturating, so a removal of
+/// an entry registered before the last `reset_counters` never wraps it.
+fn note_removed(n: u32) {
+    if n != 0 {
+        let _ = AQ_LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(n))
+        });
+    }
+}
 
 /// Mirror the ledger counters into the service key. PASSIVE_LEVEL only —
 /// called from `scanout_trace::dump`.
@@ -91,6 +115,7 @@ pub(crate) fn dump_counters() {
     crate::diag::record_named_bytes(b"RdMapF", RD_MAP_REFUSED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"AqReg", AQ_REGISTERED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"AqRgF", AQ_REGISTER_REFUSED.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"AqLive", AQ_LIVE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"AqSigB", AQ_SIGNALS.load(Ordering::Relaxed));
 }
 
@@ -106,6 +131,7 @@ pub(crate) fn reset_counters() {
         &RD_GENERATION_EXHAUSTED,
         &RD_MAP_REFUSED,
         &AQ_REGISTERED,
+        &AQ_LIVE,
         &AQ_REGISTER_REFUSED,
         &AQ_SIGNALS,
     ] {
@@ -242,7 +268,7 @@ pub(crate) struct ReadLedger {
     /// ⚠ LEAF LOCK (`scanout_event_lock`): acquired after any other lock this
     /// driver holds — the broadcast runs at DISPATCH under `virtio_lock` from
     /// the used-ring drain — and NOTHING may be acquired while holding it.
-    /// Held only for table ops plus the ≤16 `KeSetEvent(Wait = FALSE)` calls
+    /// Held only for table ops plus the ≤64 `KeSetEvent(Wait = FALSE)` calls
     /// of a broadcast. See `adapter/locks.rs` for the documented order.
     events: crate::sync::SpinLock<[Option<EventEntry>; EVENT_TABLE_LEN]>,
 }
@@ -509,8 +535,7 @@ impl ReadLedger {
         // Take the registrations out under the leaf lock, signal + deref
         // OUTSIDE it: the signal wakes level-triggered consumers into a
         // re-read, and the deref must not run under a spinlock we hold.
-        let drained = self.drain_events(None);
-        for entry in drained.iter().flatten() {
+        self.drain_events(None, |entry| {
             // SAFETY: the entry owned one object reference; the KEVENT is
             // therefore alive. Wait = FALSE; DeferDelete because dropping the
             // last reference with a plain deref above PASSIVE would run the
@@ -520,7 +545,7 @@ impl ReadLedger {
                 KeSetEvent(entry.event as *mut KEVENT, 0, 0);
                 ObDereferenceObjectDeferDelete(entry.event as PVOID);
             }
-        }
+        });
         let mut private = self.mutation.lock();
         let Some(page) = self.page() else {
             return;
@@ -561,6 +586,7 @@ impl ReadLedger {
             Some(i) => {
                 table[i] = Some(EventEntry { owner, event: raw });
                 AQ_REGISTERED.fetch_add(1, Ordering::Relaxed);
+                AQ_LIVE.fetch_add(1, Ordering::Relaxed);
                 ScanoutEventReg::Registered
             }
             None => {
@@ -581,6 +607,7 @@ impl ReadLedger {
             while i < EVENT_TABLE_LEN {
                 if matches!(table[i], Some(e) if e.owner == owner && e.event == raw) {
                     table[i] = None;
+                    note_removed(1);
                     found = true;
                     break;
                 }
@@ -600,12 +627,11 @@ impl ReadLedger {
     /// by `owner`. `dxgkddi_destroy_device`, beside `release_blobs_for_owner`;
     /// this is the reclaim the one-shot fence-event table lacks. PASSIVE.
     pub(crate) fn reclaim_events_for_owner(&self, owner: usize) {
-        let drained = self.drain_events(Some(owner));
-        for entry in drained.iter().flatten() {
+        self.drain_events(Some(owner), |entry| {
             // SAFETY: the entry owned one object reference; DeferDelete so the
             // possible last-reference deletion never runs at a raised IRQL.
             unsafe { ObDereferenceObjectDeferDelete(entry.event as PVOID) };
-        }
+        });
     }
 
     /// Drop every remaining event reference without signaling. `AdapterContext
@@ -613,36 +639,49 @@ impl ReadLedger {
     /// per-device reclaim), so this is the belt for a registration that landed
     /// between the last reset and RemoveDevice. PASSIVE.
     pub(crate) fn drop_all_event_references(&self) {
-        let drained = self.drain_events(None);
-        for entry in drained.iter().flatten() {
+        self.drain_events(None, |entry| {
             // SAFETY: the entry owned one object reference; DeferDelete as in
             // every other removal path.
             unsafe { ObDereferenceObjectDeferDelete(entry.event as PVOID) };
-        }
+        });
     }
 
-    /// Take out every entry (or every entry of one owner) under the leaf lock.
-    /// The caller signals/derefs OUTSIDE the lock.
-    fn drain_events(&self, owner: Option<usize>) -> [Option<EventEntry>; EVENT_TABLE_LEN] {
-        let mut out = [None; EVENT_TABLE_LEN];
-        let mut table = self.events.lock();
-        let mut i = 0;
-        while i < EVENT_TABLE_LEN {
-            let matches_owner = match (table[i], owner) {
-                (Some(_), None) => true,
-                (Some(e), Some(o)) => e.owner == o,
-                (None, _) => false,
-            };
-            if matches_owner {
-                out[i] = table[i].take();
+    /// Take out every entry (or every entry of one owner), at most
+    /// `DRAIN_CHUNK` per hold of the leaf lock, and hand each to `release`
+    /// OUTSIDE the lock (the caller signals/derefs there). Repeats until a
+    /// pass finds nothing left to take.
+    fn drain_events(&self, owner: Option<usize>, mut release: impl FnMut(EventEntry)) {
+        loop {
+            let mut out = [None; DRAIN_CHUNK];
+            let mut n = 0;
+            {
+                let mut table = self.events.lock();
+                let mut i = 0;
+                while i < EVENT_TABLE_LEN && n < DRAIN_CHUNK {
+                    let matches_owner = match (table[i], owner) {
+                        (Some(_), None) => true,
+                        (Some(e), Some(o)) => e.owner == o,
+                        (None, _) => false,
+                    };
+                    if matches_owner {
+                        out[n] = table[i].take();
+                        n += 1;
+                    }
+                    i += 1;
+                }
             }
-            i += 1;
+            note_removed(n as u32);
+            for entry in out.iter().flatten() {
+                release(*entry);
+            }
+            if n < DRAIN_CHUNK {
+                return;
+            }
         }
-        out
     }
 
     /// Signal every registered event. Runs under the leaf lock at up to
-    /// DISPATCH — `KeSetEvent(Wait = FALSE)` for ≤16 entries, nothing else.
+    /// DISPATCH — `KeSetEvent(Wait = FALSE)` for ≤64 entries, nothing else.
     fn broadcast(&self) {
         let table = self.events.lock();
         let mut i = 0;

@@ -1117,8 +1117,8 @@ fn escape_scanout_event(
                 }
                 ScanoutEventReg::TableFull => {
                     // Counted `AqRgF` in register_event. SUCCESS with the
-                    // TABLE_FULL state: the caller reads it and runs ungated —
-                    // loud (the counter), never wedged.
+                    // TABLE_FULL state: the caller still gates on the ledger but
+                    // polls it every 10 ms — loud (the counter), never wedged.
                     dereference_user_event(event);
                     reply(HELIOS_SCANOUT_ACQ_TABLE_FULL)
                 }
