@@ -966,6 +966,7 @@ fn footer(f: &mut Frame, app: &mut App, area: Rect) {
         ("f", "force off", Act::Poweroff),
         ("p", "pause", Act::Pause),
         ("m", "mode", Act::Mode),
+        ("F", "shares", Act::Shares),
         ("l", "logs", Act::Logs),
         ("D", "doctor", Act::Doctor),
         ("?", "help", Act::Help),
@@ -1100,8 +1101,85 @@ fn modal(f: &mut Frame, app: &App, m: &Modal, area: Rect) {
             ));
             f.render_widget(Paragraph::new(lines).block(block), r);
         }
+        Modal::Shares {
+            vm,
+            items,
+            idx,
+            input,
+        } => {
+            let r = centered(area, 78, items.len().max(1) as u16 + 7);
+            f.render_widget(Clear, r);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(CYAN))
+                .style(Style::new().bg(PANEL).fg(FG))
+                .title(Line::styled(
+                    format!(" Shared folders of {vm} "),
+                    Style::new().fg(CYAN).bold(),
+                ));
+            let mut lines = vec![Line::styled(
+                " drives in Windows, /mnt/conduit/NAME in Linux",
+                Style::new().fg(DIM),
+            )];
+            if items.is_empty() {
+                lines.push(Line::styled("   none yet: press a", Style::new().fg(DIM)));
+            }
+            let inner = r.width.saturating_sub(2) as usize;
+            for (i, s) in items.iter().enumerate() {
+                let on = i == *idx && input.is_none();
+                let room = inner.saturating_sub(24);
+                let path = if s.path.chars().count() > room {
+                    let tail: String = s.path.chars().rev().take(room.saturating_sub(1)).collect();
+                    format!("…{}", tail.chars().rev().collect::<String>())
+                } else {
+                    s.path.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if on { " ▶ " } else { "   " },
+                        Style::new().fg(GREEN).bold(),
+                    ),
+                    Span::styled(
+                        format!("{:<16}", s.name),
+                        if on {
+                            Style::new().fg(BG).bg(CYAN).bold()
+                        } else {
+                            Style::new().fg(FG)
+                        },
+                    ),
+                    Span::styled(
+                        if s.read_only { " ro " } else { " rw " },
+                        Style::new().fg(if s.read_only { AMBER } else { GREEN }),
+                    ),
+                    Span::styled(format!(" {path}"), Style::new().fg(DIM)),
+                ]));
+            }
+            lines.push(Line::raw(""));
+            match input {
+                Some(t) => {
+                    lines.push(Line::from(vec![
+                        Span::styled(" folder to share: ", Style::new().fg(GREEN).bold()),
+                        Span::styled(t.clone(), Style::new().fg(FG)),
+                        Span::styled("▌", Style::new().fg(GREEN)),
+                    ]));
+                    lines.push(Line::styled(
+                        " type a path · ⏎ share · Esc cancel",
+                        Style::new().fg(EDGE),
+                    ));
+                }
+                None => {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled(
+                        " ↑/↓ choose · a add · d remove · o read-only on/off · Esc close",
+                        Style::new().fg(EDGE),
+                    ));
+                }
+            }
+            f.render_widget(Paragraph::new(lines).block(block), r);
+        }
         Modal::Help => {
-            let r = centered(area, 64, 22);
+            let r = centered(area, 64, 23);
             f.render_widget(Clear, r);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -1129,6 +1207,7 @@ fn modal(f: &mut Frame, app: &App, m: &Modal, area: Rect) {
                 k("f", "force off (pull the plug)"),
                 k("p", "pause / resume"),
                 k("m", "display mode for the next view/start"),
+                k("F", "shared folders (a add, d remove, o read-only)"),
                 k("l  2", "logs of the selected VM"),
                 k("D  3", "doctor: check this computer"),
                 k("Tab 1", "switch tabs / back to the dashboard"),
