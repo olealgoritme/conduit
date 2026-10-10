@@ -137,6 +137,9 @@ pub struct CmdQueue {
     prod: ProducerLine,
     /// Consumer line: records before this cursor have run.
     read: Line<AtomicU64>,
+    /// The consumer's cached view of the write cursor: it reloads the
+    /// producer's line only when it has caught up with this, not per record.
+    write_cache: Line<AtomicU64>,
     /// The worker announced it is about to park.
     sleeping: Line<AtomicBool>,
     /// Errors stashed by the worker; read (one relaxed load) on every DDI
@@ -204,6 +207,7 @@ impl CmdQueue {
                 read_cache: AtomicU64::new(0),
             },
             read: Line(AtomicU64::new(0)),
+            write_cache: Line(AtomicU64::new(0)),
             sleeping: Line(AtomicBool::new(false)),
             error: Line(AtomicI32::new(0)),
             worker: Mutex::new(None),
@@ -579,9 +583,12 @@ impl CmdQueue {
     /// Run the next record, if any. Consumer side only.
     unsafe fn run_one(&self) -> bool {
         let r = self.read.0.load(Ordering::Relaxed);
-        let w = self.prod.write.load(Ordering::Acquire);
-        if r == w {
-            return false;
+        if r == self.write_cache.0.load(Ordering::Relaxed) {
+            let w = self.prod.write.load(Ordering::Acquire);
+            if r == w {
+                return false;
+            }
+            self.write_cache.0.store(w, Ordering::Relaxed);
         }
         let mask = self.hot.cap - 1;
         let pos = (r as usize) & mask;
