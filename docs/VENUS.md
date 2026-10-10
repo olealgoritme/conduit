@@ -2,8 +2,8 @@
 
 How a Windows guest renders on the host GPU: Vulkan calls serialized with the
 Venus protocol, carried over Conduit's device, executed by the host's NVIDIA
-Vulkan driver. D3D9-11 reach Vulkan through DXVK, D3D12 through vkd3d-proton,
-in the guest. The guest driver stack comes from Helios
+Vulkan driver. D3D10/11 reach Vulkan through DXVK, D3D12 through vkd3d-proton,
+and D3D9 through Windows' D3D9On12 on top of the D3D12 driver, in the guest. The guest driver stack comes from Helios
 ([guest/windows/HELIOS.md](../guest/windows/HELIOS.md)).
 
 ```text

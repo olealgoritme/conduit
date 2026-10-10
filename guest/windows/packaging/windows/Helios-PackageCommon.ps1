@@ -228,7 +228,10 @@ function Restore-HeliosDirect3DAfterRemoval(
     $wowSnapshot = $State.installedDirect3D.PSObject.Properties["UserModeDriverNameWoW"]
     if (-not $wowSnapshot -or -not $wowSnapshot.Value.exists) { return }
     $ownedPaths = @($wowSnapshot.Value.value)
-    $ownedNames = @($ownedPaths | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension([string]$_) } | Select-Object -Unique)
+    # "<>" (the D3D9 slot: no D3D9 driver, D3D9On12) names no file, and Windows
+    # PowerShell's path APIs reject its characters.
+    $ownedNames = @($ownedPaths | Where-Object { [string]$_ -ne "<>" } |
+        ForEach-Object { [IO.Path]::GetFileNameWithoutExtension([string]$_) } | Select-Object -Unique)
     $keys = @(@([string]$State.classKey, $CurrentClassKey) | Where-Object { $_ } | Select-Object -Unique)
     foreach ($keyPath in $keys) {
         if ($keyPath -ieq $restoredKey -or -not (Test-Path -LiteralPath $keyPath)) { continue }
@@ -250,7 +253,8 @@ function Restore-HeliosDirect3DAfterRemoval(
             foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW")) {
                 $snapshot = Get-HeliosRegistrySnapshot $keyPath $name
                 if ($snapshot.exists) {
-                    @($snapshot.value) | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension([string]$_) }
+                    @($snapshot.value) | Where-Object { [string]$_ -ne "<>" } |
+                        ForEach-Object { [IO.Path]::GetFileNameWithoutExtension([string]$_) }
                 }
             }
         )

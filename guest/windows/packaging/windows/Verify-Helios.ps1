@@ -78,10 +78,13 @@ try {
 # Registration is indexed by API version, independently for AMD64 and WoW64.
 # Windows loads an absolute DriverStore path from each slot; validate both the
 # selected architecture and installed bytes against the bundle's recorded hash.
+# Slot 0 (D3D9) is dxgkrnl's "no D3D9 driver" marker, which makes d3d9.dll run
+# D3D9 through D3D9On12 on the D3D12 UMD (helios_kmd_render.inx).
+$noDriverSlot = "<>"
 $driverDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($registration in @(
-    @{ name = "UserModeDriverName"; architecture = "x64"; files = @("helios_umd.dll", "helios_umd.dll", "helios_umd.dll", "helios_umd12.dll") },
-    @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @("helios_umd32.dll", "helios_umd32.dll", "helios_umd32.dll", "helios_umd12_32.dll") }
+    @{ name = "UserModeDriverName"; architecture = "x64"; files = @($noDriverSlot, "helios_umd.dll", "helios_umd.dll", "helios_umd12.dll") },
+    @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @($noDriverSlot, "helios_umd32.dll", "helios_umd32.dll", "helios_umd12_32.dll") }
 )) {
     try {
         if (-not $classKey) { throw "No display software key for $($registration.name)." }
@@ -92,13 +95,19 @@ foreach ($registration in @(
         }
         for ($slot = 0; $slot -lt 4; $slot++) {
             $path = [string]$paths[$slot]
+            if ($registration.files[$slot] -eq $noDriverSlot) {
+                if ($path -ne $noDriverSlot) {
+                    throw "$($registration.name) slot $slot must be '$noDriverSlot' (D3D9 through D3D9On12): $path"
+                }
+                continue
+            }
             if (-not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFileName($path) -ine $registration.files[$slot]) {
                 throw "$($registration.name) slot $slot does not select $($registration.files[$slot]): $path"
             }
             Assert-HeliosPeArchitecture $path $registration.architecture
             [void]$driverDirectories.Add((Split-Path -Parent $path))
         }
-        Write-Host "Direct3D 11/12 $($registration.architecture): registered and architecture checked."
+        Write-Host "Direct3D 9 (D3D9On12)/10/11/12 $($registration.architecture): registered and architecture checked."
     } catch { $failures.Add($_.Exception.Message) }
 }
 if ($driverDirectories.Count -ne 1) {
@@ -220,6 +229,13 @@ if ($RunSmokeTests) {
                 exe = "${prefix}d3d12-clear.exe"
                 arguments = @("--expect", "ok")
             }
+            # D3D9 runs through D3D9On12 on the D3D12 UMD, so it shares the
+            # D3D12 kill switch.
+            $tests += [ordered]@{
+                name = "Direct3D 9 $architecture (D3D9On12)"
+                exe = "${prefix}d3d9-smoke.exe"
+                arguments = @()
+            }
         }
     }
     foreach ($test in $tests) {
@@ -244,4 +260,4 @@ if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Error $failure -ErrorAction Continue }
     throw "Helios verification failed with $($failures.Count) problem(s)."
 }
-Write-Host "Helios x64/WoW64 Direct3D 11/12, Vulkan and OpenGL, and x64 OpenCL registrations and files are healthy."
+Write-Host "Helios x64/WoW64 Direct3D 9/11/12, Vulkan and OpenGL, and x64 OpenCL registrations and files are healthy."
