@@ -59,7 +59,7 @@ pub const MIN_RING_BYTES: usize = 4096;
 pub const MAX_RING_BYTES: usize = 64 << 20;
 
 /// Worker spin on an empty ring before it parks.
-const WORKER_SPIN: Duration = Duration::from_micros(20);
+const WORKER_SPIN: Duration = Duration::from_micros(100);
 /// A waiter's spin before it sleeps on the condvar.
 const WAITER_SPIN: Duration = Duration::from_micros(100);
 /// Records between two waiter/destroy checks while the worker is busy.
