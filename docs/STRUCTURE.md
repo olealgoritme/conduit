@@ -51,7 +51,8 @@ conduit/
 ├── packaging/     build.sh (stages and packages everything), release.sh (version
 │                  bump + tag), nfpm/ (deb, rpm, Arch), deb/ and arch/ (install
 │                  scripts, PKGBUILD), rpm/ (spec files), tarball/, dkms/,
-│                  common/ (desktop entry, AppArmor, conduit-integrate)
+│                  common/ (desktop entry, AppArmor, conduit-integrate),
+│                  bios/ (Conduit BIOS: edk2 OVMF build, logo, patches)
 ├── flake.nix      Nix package and app
 ├── docs/          User and contributor documentation; research/: background
 │                  surveys (Windows guest prior art, a thinner Windows path,
@@ -74,6 +75,7 @@ conduit/
 | `conduit-X-1-x86_64.pkg.tar.zst` | Arch, Manjaro | in an Arch container (+ `PKGBUILD` for the AUR) |
 | `conduit-X-x86_64-linux.tar.gz` | everything else | backend, VMM and CLI static (musl); viewer, stream host and QEMU with their libraries (built on Debian 12); `install.sh` |
 | `conduit-guest_X-1_all.deb` / `conduit-guest-X-1.noarch.rpm` / `conduit-guest-X-1-any.pkg.tar.zst` | inside the VM | DKMS source package for the guest module (the Arch one is what `conduit attach` installs on Arch-based guests) |
+| `conduit-bios_B-1_all.deb` / `conduit-bios-B-1.noarch.rpm` / `conduit-bios-B-1-any.pkg.tar.zst` / `conduit-bios-B-x86_64.tar.gz` | host, optional | Conduit BIOS: edk2 OVMF with the Conduit boot logo, for `conduit attach` (B = edk2 build + revision, `packaging/bios/version.sh`; bios.yml, cached) |
 | `flake.nix` | NixOS | in the repo |
 | `SHA256SUMS` | | checksums of the files above |
 

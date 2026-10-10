@@ -228,7 +228,8 @@ jobs:
             packaging/build.sh packaging/supported-drivers.sh packaging/common/conduit-integrate \
             packaging/tarball/*.sh packaging/deb/*/* \
             guest/system/conduit-guest-setup cli/assets/build-disk.sh \
-            packaging/common/icons.sh packaging/test/icons.sh
+            packaging/common/icons.sh packaging/test/icons.sh \
+            packaging/bios/build.sh packaging/bios/install.sh
       - name: App icon set
         run: |
           sudo apt-get install -y --no-install-recommends desktop-file-utils

@@ -1,5 +1,6 @@
 //! conduit: share your NVIDIA GPU with a Linux VM and see its desktop in a window.
 
+mod bios;
 mod boot;
 mod config;
 mod create;

@@ -1,0 +1,56 @@
+# nfpm config for `conduit-bios`: the Conduit BIOS firmware images (edk2 OVMF
+# with the Conduit boot logo, packaging/bios). Rendered by packaging/build.sh
+# `package bios-deb|bios-rpm|bios-arch`; @BIOS@ is packaging/bios/build.sh's
+# output directory. Versioned by the edk2 build (packaging/bios/version.sh),
+# not by Conduit releases, so it only changes when the firmware does.
+name: conduit-bios
+arch: all
+platform: linux
+version: "@BIOS_VERSION@"
+version_schema: none
+release: "1"
+section: misc
+priority: optional
+maintainer: "Ole Algoritme <olealgoritme@gmail.com>"
+description: |
+  Conduit BIOS: UEFI firmware for Conduit VMs.
+  Ubuntu's edk2 OVMF firmware rebuilt with the same flags, with the Conduit
+  boot logo and the firmware display started in the VM's native mode.
+  `conduit attach` uses it for VMs on the matching stock 4 MB OVMF image and
+  keeps their NVRAM vars file.
+vendor: Conduit
+homepage: https://github.com/olealgoritme/conduit
+license: BSD-2-Clause-Patent AND Apache-2.0 AND MIT
+
+contents:
+  - src: "@BIOS@/conduit-bios.fd"
+    dst: /usr/share/conduit/bios/conduit-bios.fd
+  - src: "@BIOS@/conduit-bios.secboot.fd"
+    dst: /usr/share/conduit/bios/conduit-bios.secboot.fd
+  - src: "@BIOS@/VERSION"
+    dst: /usr/share/conduit/bios/VERSION
+  - src: "@BIOS@/copyright"
+    dst: /usr/share/doc/conduit-bios/copyright
+  # Firmware descriptors, so libvirt accepts the images for firmware='efi'
+  # VMs. Priority 90: automatic firmware selection keeps preferring the stock
+  # images (lower numbers). They name Debian/Ubuntu's vars templates, so only
+  # the .deb carries them.
+  - src: "@ROOT@/packaging/bios/firmware/90-conduit-bios.json"
+    dst: /usr/share/qemu/firmware/90-conduit-bios.json
+    packager: deb
+  - src: "@ROOT@/packaging/bios/firmware/90-conduit-bios-secboot.json"
+    dst: /usr/share/qemu/firmware/90-conduit-bios-secboot.json
+    packager: deb
+  - src: "@ROOT@/packaging/bios/firmware/90-conduit-bios-secboot-enrolled.json"
+    dst: /usr/share/qemu/firmware/90-conduit-bios-secboot-enrolled.json
+    packager: deb
+
+overrides:
+  deb:
+    depends: [ovmf]
+
+rpm:
+  summary: Conduit BIOS (UEFI firmware with the Conduit boot logo)
+  group: Applications/Emulators
+deb:
+  compression: zstd
