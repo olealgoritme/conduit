@@ -801,7 +801,7 @@ static FREE_WAIT: AtomicU32 = AtomicU32::new(0);
 static FREE_TO: AtomicU32 = AtomicU32::new(0);
 static FREE_UNS: AtomicU32 = AtomicU32::new(0);
 static FREE_US: AtomicU32 = AtomicU32::new(0);
-/// How long a destroy waits for the executor at most.
+/// How long a destroy waits for the executor at most (wall clock).
 const FREE_WAIT_MS: u64 = 500;
 
 fn names(op: &Op, resource_id: u32) -> bool {
@@ -845,15 +845,15 @@ pub(crate) fn drain_for(passive: PassiveLevel, adapter: &AdapterContext, resourc
     let Some(target) = target else { return };
     FREE_WAIT.fetch_add(1, Ordering::Relaxed);
     let t0 = now_100ns();
-    let mut waited = 0u64;
+    // Wall clock: `sleep_ms(1)` rounds up to the timer tick (~15.6 ms), so counting sleeps would
+    // stretch the cap up to ~16x.
     while !seq_ready(target) {
-        if waited >= FREE_WAIT_MS {
+        if now_100ns().wrapping_sub(t0) >= FREE_WAIT_MS * 10_000 {
             FREE_TO.fetch_add(1, Ordering::Relaxed);
             break;
         }
         kick(adapter);
         crate::virtio::ctrl::sleep_ms(passive, 1);
-        waited += 1;
     }
     FREE_US.fetch_max(us_since(t0), Ordering::Relaxed);
 }
