@@ -2026,6 +2026,8 @@ struct NvGpuBackend {
     /// Started on the first message, because the event queue and guest memory
     /// are not known before then.
     watches: Option<Sender<Watch>>,
+    /// The display link's event target was set (see `sync_watches`).
+    event_target_set: bool,
     /// The event pump's wake eventfd, written after each batch of sends.
     watch_wake: Option<Arc<PumpWake>>,
     /// Where display input goes; filled in alongside `watches`.
@@ -2189,6 +2191,7 @@ impl NvGpuBackend {
             // can enumerate the GPU before the shared window exists.
             config,
             watches: None,
+            event_target_set: false,
             watch_wake: None,
             input_target,
             input_claims,
@@ -2305,6 +2308,19 @@ impl NvGpuBackend {
     /// owns the original and may close it at any time; a watch holding the same
     /// number would then be watching whatever opened next.
     fn sync_watches(&mut self, vrings: &[VringRwLock]) {
+        // The display's event target as soon as the event queue exists, not
+        // only once the first descriptor is watched: a guest that never
+        // watches one (a Windows guest early on) still needs its mode list.
+        if !self.event_target_set
+            && self.display_link.is_some()
+            && let (Some(mem), Some(vring)) = (self.mem.clone(), vrings.get(1))
+        {
+            let mut t = self.input_target.lock().expect("event target");
+            if t.is_none() {
+                *t = Some((vring.clone(), mem));
+            }
+            self.event_target_set = true;
+        }
         if !std::mem::take(&mut self.watch_dirty) && self.watches.is_some() {
             return;
         }
