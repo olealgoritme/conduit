@@ -25,12 +25,93 @@ pub(crate) unsafe extern "system" fn create_rasterizer_state(
     h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
     _hrt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
 ) {
+    create_rasterizer_state_forced(h, desc, 0, h_rs)
+}
+
+/// D3D11.1-interface `pfnCalcPrivateRasterizerStateSize` (same 8-byte
+/// COM-pointer slot as `calc_size_raster`; only the desc type differs).
+pub(crate) unsafe extern "system" fn calc_size_raster_11_1(
+    h: Hdevice,
+    d: *const ddi::D3D11_1_DDI_RASTERIZER_DESC,
+) -> ddi::SIZE_T {
+    calc_size_raster(h, d.cast())
+}
+
+/// D3D11.1-interface `pfnCreateRasterizerState`. `D3D11_1_DDI_RASTERIZER_DESC`
+/// is the 10.x desc with `ForcedSampleCount` appended: the rasterizer sample
+/// count of target-independent rasterization (Direct2D fills anti-aliased
+/// geometry with 16 against a single-sample render target and derives
+/// coverage from SV_Coverage). Dropping it rasterized those fills at one
+/// sample, so every covered pixel got 1/16 of its coverage.
+pub(crate) unsafe extern "system" fn create_rasterizer_state_11_1(
+    h: Hdevice,
+    desc: *const ddi::D3D11_1_DDI_RASTERIZER_DESC,
+    h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
+    _hrt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
+) {
+    let forced = if desc.is_null() {
+        0
+    } else {
+        (*desc).ForcedSampleCount
+    };
+    create_rasterizer_state_forced(h, desc.cast(), forced, h_rs)
+}
+
+/// Create a rasterizer state from the 10.x prefix of a DDI rasterizer desc
+/// and the 11.1 `ForcedSampleCount` (0 for the 10.x/11.0 interfaces).
+pub(crate) unsafe fn create_rasterizer_state_forced(
+    h: Hdevice,
+    desc: *const ddi::D3D10_DDI_RASTERIZER_DESC,
+    forced_sample_count: u32,
+    h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
+) {
     clear_handle(h_rs);
     let Some(device) = d3d11_device(h) else {
         return;
     };
     let d = &*desc;
-    let rd = D3D11_RASTERIZER_DESC {
+    if RASTER_LOG_COUNT.first_n(64).is_some() {
+        log_error!(
+            "DDI CreateRasterizerState fill={} cull={} front_ccw={} depth_clip={} scissor={} msaa={} aaline={} bias={} slope_bias={:.3} forced_samples={}",
+            d.FillMode,
+            d.CullMode,
+            d.FrontCounterClockwise,
+            d.DepthClipEnable,
+            d.ScissorEnable,
+            d.MultisampleEnable,
+            d.AntialiasedLineEnable,
+            d.DepthBias,
+            d.SlopeScaledDepthBias,
+            forced_sample_count
+        );
+    }
+    if forced_sample_count == 0 {
+        let rd = D3D11_RASTERIZER_DESC {
+            FillMode: D3D11_FILL_MODE(d.FillMode),
+            CullMode: D3D11_CULL_MODE(d.CullMode),
+            FrontCounterClockwise: windows::Win32::Foundation::BOOL(d.FrontCounterClockwise),
+            DepthBias: d.DepthBias,
+            DepthBiasClamp: d.DepthBiasClamp,
+            SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+            DepthClipEnable: windows::Win32::Foundation::BOOL(d.DepthClipEnable),
+            ScissorEnable: windows::Win32::Foundation::BOOL(d.ScissorEnable),
+            MultisampleEnable: windows::Win32::Foundation::BOOL(d.MultisampleEnable),
+            AntialiasedLineEnable: windows::Win32::Foundation::BOOL(d.AntialiasedLineEnable),
+        };
+        let mut rs: Option<ID3D11RasterizerState> = None;
+        let created = device.CreateRasterizerState(&rd, Some(&mut rs));
+        if let Err(ref e) = created {
+            log_error!("DDI CreateRasterizerState failed: {e:?}");
+        }
+        finish_create(h, created, rs, |s| store_com(h_rs, s));
+        return;
+    }
+    let Ok(device1) = device.cast::<ID3D11Device1>() else {
+        log_error!("DDI CreateRasterizerState: ID3D11Device1 cast failed");
+        set_runtime_error(h, E_OUTOFMEMORY);
+        return;
+    };
+    let rd = D3D11_RASTERIZER_DESC1 {
         FillMode: D3D11_FILL_MODE(d.FillMode),
         CullMode: D3D11_CULL_MODE(d.CullMode),
         FrontCounterClockwise: windows::Win32::Foundation::BOOL(d.FrontCounterClockwise),
@@ -41,28 +122,37 @@ pub(crate) unsafe extern "system" fn create_rasterizer_state(
         ScissorEnable: windows::Win32::Foundation::BOOL(d.ScissorEnable),
         MultisampleEnable: windows::Win32::Foundation::BOOL(d.MultisampleEnable),
         AntialiasedLineEnable: windows::Win32::Foundation::BOOL(d.AntialiasedLineEnable),
+        ForcedSampleCount: forced_sample_count,
     };
-    if RASTER_LOG_COUNT.first_n(64).is_some() {
+    let mut rs: Option<ID3D11RasterizerState1> = None;
+    let created = device1.CreateRasterizerState1(&rd, Some(&mut rs));
+    if let Err(ref e) = created {
         log_error!(
-            "DDI CreateRasterizerState fill={} cull={} front_ccw={} depth_clip={} scissor={} msaa={} aaline={} bias={} slope_bias={:.3}",
-            d.FillMode,
-            d.CullMode,
-            d.FrontCounterClockwise,
-            d.DepthClipEnable,
-            d.ScissorEnable,
-            d.MultisampleEnable,
-            d.AntialiasedLineEnable,
-            d.DepthBias,
-            d.SlopeScaledDepthBias
+            "DDI CreateRasterizerState1 (forced samples {forced_sample_count}) failed: {e:?}"
         );
     }
-    let mut rs: Option<ID3D11RasterizerState> = None;
-    let created = device.CreateRasterizerState(&rd, Some(&mut rs));
-    if let Err(ref e) = created {
-        log_error!("DDI CreateRasterizerState failed: {e:?}");
-    }
-    finish_create(h, created, rs, |s| store_com(h_rs, s));
+    // `set_rasterizer_state` loads an ID3D11RasterizerState from this slot.
+    let base = match rs {
+        Some(s) => match s.cast::<ID3D11RasterizerState>() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                log_error!("DDI CreateRasterizerState1: ID3D11RasterizerState cast failed: {e:?}");
+                None
+            }
+        },
+        None => None,
+    };
+    finish_create(h, created, base, |s| store_com(h_rs, s));
 }
+
+const _: () = {
+    // The 11.1 desc appends ForcedSampleCount to the 10.x desc; the readers
+    // above take the 10.x prefix of either.
+    assert!(
+        core::mem::offset_of!(ddi::D3D11_1_DDI_RASTERIZER_DESC, ForcedSampleCount)
+            == core::mem::size_of::<ddi::D3D10_DDI_RASTERIZER_DESC>()
+    );
+};
 
 pub(crate) unsafe extern "system" fn set_rasterizer_state(
     h: Hdevice,

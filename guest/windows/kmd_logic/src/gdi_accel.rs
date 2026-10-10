@@ -1652,6 +1652,25 @@ pub enum Admit {
     NoWait,
 }
 
+/// The fence gate of a submission on a GDI context that carries no job record (a
+/// `SubmitCommandVirtual` gets none of RenderGdi's private data): the newest sequence among the
+/// context's admitted jobs the executor has not finished, `seqs` being the sequence of each of
+/// the context's jobs in the table (`None` for one not admitted), read after the submission has
+/// admitted the unclaimed ones. `None`: nothing of the context is outstanding.
+///
+/// dxgkrnl preempts a GDI context whose fence is still pending (`DxgkDdiPreemptCommand`, the
+/// pending fence dropped from the WDDM FIFO) and resubmits the same DMA buffer later under a new
+/// fence id. Its job was admitted by the first submission, so the replay finds nothing unclaimed;
+/// gated on nothing, it took the immediate-signal path (the FIFO had just been emptied) and its
+/// fence retired while the executor had not run the job yet. CDD then read a readback's staging
+/// buffer before the copy landed and reused staging buffers the job still had to read: window
+/// reads returned stale pixels and rows came out half drawn. The contexts are in-order, so a
+/// submission may not retire before any earlier submission of its context, and waiting for every
+/// outstanding job of the context covers the replay's own job, whichever it is.
+pub fn context_gate(seqs: impl IntoIterator<Item = Option<u64>>, completed: u64) -> Option<u64> {
+    seqs.into_iter().flatten().filter(|&s| s > completed).max()
+}
+
 /// The monotonic sequence of submitted jobs and the executor's completed watermark. The executor
 /// runs jobs in sequence order, so "completed >= seq" means "this job and every earlier one are in
 /// their destinations". One per adapter, in the I/O half under a spinlock.
@@ -1839,9 +1858,12 @@ pub const COUNTERS: &[&str] = &[
     "GdiLutSWH",
     "GdiLutAp",
     "GdiLutId",
-    // Record-less GDI submissions that admitted more than one unclaimed job, and the most one did.
+    // Record-less GDI submissions that admitted more than one unclaimed job, and the most one did;
+    // record-less submissions that admitted none and were gated on the context's outstanding jobs
+    // (resubmissions after a preemption, or a buffer whose job an earlier submission admitted).
     "GdiClmMul",
     "GdiClmMax",
+    "GdiReGate",
     // Allocation destroys that waited for queued GDI jobs naming the allocation, waits that ran
     // out, destroys of an allocation a not yet submitted job names, the longest wait (µs).
     "GdiFreeWait",
@@ -2805,6 +2827,47 @@ mod tests {
         assert_eq!(t.completed, a, "past the submitted end is ignored");
         t.discharge_all();
         assert!(t.ready(b));
+    }
+
+    /// A model of one GDI context: render (unclaimed job), submit (record-less: claim every
+    /// unclaimed job, gate on `context_gate`), preempt (pending fences dropped), resubmit, execute.
+    #[test]
+    fn a_preempted_replay_stays_gated_on_its_job() {
+        let mut t = Timeline::default();
+        // The context's jobs: their sequences (None until a submission admits them).
+        let mut jobs: Vec<Option<u64>> = Vec::new();
+        let submit = |t: &mut Timeline, jobs: &mut Vec<Option<u64>>| {
+            for j in jobs.iter_mut().filter(|j| j.is_none()) {
+                *j = Some(t.next());
+            }
+            context_gate(jobs.iter().copied(), t.completed)
+        };
+        // RenderGdi of a readback buffer, its first submission.
+        jobs.push(None);
+        let first = submit(&mut t, &mut jobs);
+        assert_eq!(first, Some(1));
+        // Preempted before the executor ran it: dxgkrnl resubmits the same buffer. Nothing is
+        // unclaimed now, and the replay must still wait for job 1.
+        let replay = submit(&mut t, &mut jobs);
+        assert_eq!(replay, Some(1));
+        assert!(!t.ready(replay.unwrap()));
+        // The executor runs it and retires it from the table.
+        t.complete(1);
+        jobs.clear();
+        // A replay that arrives after the job ran has nothing to wait for.
+        assert_eq!(submit(&mut t, &mut jobs), None);
+    }
+
+    #[test]
+    fn context_gate_is_the_newest_unfinished_sequence() {
+        // Unadmitted jobs gate nothing; finished ones neither.
+        assert_eq!(context_gate([None, None], 0), None);
+        assert_eq!(context_gate([Some(3), Some(4)], 4), None);
+        // Several outstanding (a job claimed ahead by an earlier submission, a replay behind it):
+        // the newest, which the executor reaches only after the others.
+        assert_eq!(context_gate([Some(5), None, Some(7), Some(6)], 4), Some(7));
+        assert_eq!(context_gate([Some(5), Some(6)], 5), Some(6));
+        assert_eq!(context_gate(core::iter::empty::<Option<u64>>(), 9), None);
     }
 
     #[test]

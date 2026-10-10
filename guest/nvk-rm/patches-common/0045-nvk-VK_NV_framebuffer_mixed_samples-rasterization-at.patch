@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 10 Oct 2026 12:08:25 +0200
+Subject: [PATCH] nvk: VK_NV_framebuffer_mixed_samples, rasterization at
+ more samples than the color attachments
+
+Direct2D fills anti-aliased paths (the Windows 11 shell's vector icons,
+complex geometry) with D3D11.1 target-independent rasterization:
+ForcedSampleCount 16 in the rasterizer state with a single-sample render
+target, and a pixel shader that takes its alpha from the number of
+covered samples in SV_Coverage divided by 16.  Vulkan can only express
+that with mixed samples (rasterizationSamples 16, color attachment 1
+sample); without it DXVK rasterizes at the attachment's single sample,
+the coverage has one bit, and every covered pixel gets 1/16 of its alpha
+(a Direct2D test fill: maximum alpha 16 instead of 255).
+
+The hardware has done this since Maxwell B: SET_TIR RASTER_N_TARGET_M
+with SET_ANTI_ALIAS_RASTER giving the raster sample count, next to
+SET_ANTI_ALIAS for the attachments.  VK_NV_framebuffer_mixed_samples
+(Maxwell B+):
+
+- nvk_flush_mixed_samples(), when the rasterization samples or the
+  coverage modulation state change (every render pass begin dirties the
+  former): rasterizationSamples above the attachments' count turns
+  target-independent rasterization on with that raster sample count, and
+  off otherwise.  The pixel shader's covmask then has one bit per raster
+  sample; without sample shading NAK hands it to gl_SampleMaskIn as is.
+- CLEAR_SURFACE with target-independent rasterization on is a class
+  error (GB202: Xid 69, CLEAR_SURFACE 0x19d0, error code 0x124), so it
+  is turned off at every render pass begin (before SET_ANTI_ALIAS and
+  the load-op clears) and before vkCmdClearAttachments; the next draw
+  that wants it turns it back on.  A CPU flag (on at command buffer
+  begin and after secondaries) keeps the off method to once.
+- At queue init: off, coverage reduced to the color samples by the
+  affinity map (the extension's merge reduction), alpha to coverage and
+  the occlusion sample count on the raster samples (the spec orders
+  multisample coverage and sample counting before coverage reduction).
+- Coverage modulation (VkPipelineCoverageModulationStateCreateInfoNV and
+  the extended dynamic state 3 coverage modulation mode, table enable and
+  table, now exposed): SET_TIR_MODULATION component select, the linear
+  function or the 16-entry unorm8 coefficient table.
+- The standard sample positions of the raster sample count go to the
+  hardware; the shader-visible copy keeps NVK_MAX_SAMPLES (8) entries, as
+  sample shading is not allowed with mixed samples.
+
+The extension requires sampleShadingEnable = VK_FALSE with mixed samples
+and a depth/stencil attachment of rasterizationSamples samples when a
+depth or stencil test is on, so the per-pass sample masks and the
+depth/stencil layout stay as they are.  A device without the extension
+enabled emits nothing new.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c      |   4 +
+ src/nouveau/vulkan/nvk_cmd_buffer.h      |  11 ++
+ src/nouveau/vulkan/nvk_cmd_clear.c       |  10 +-
+ src/nouveau/vulkan/nvk_cmd_draw.c        | 172 ++++++++++++++++++++++-
+ src/nouveau/vulkan/nvk_physical_device.c |   7 +-
+ 5 files changed, 196 insertions(+), 8 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index cc5c173d..05d7bf35 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -466,6 +466,10 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+       cmd->indirect_push_synced = false;
+       cmd->state.gfx.fs_tail_dw_count = 0;
+       cmd->state.gfx.draw_sysvals_emitted = 0;
++      /* The secondary may leave target-independent rasterization on */
++      cmd->state.gfx.tir_maybe_on = true;
++      BITSET_SET(cmd->vk.dynamic_graphics_state.dirty,
++                 MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
+ 
+       if (prof_slot >= 0) {
+          nvk_pass_profile_end_secondary(cmd, other, prof_slot);
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 9869fa60..abade3c9 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -260,6 +260,15 @@ struct nvk_graphics_state {
+     */
+    uint8_t zcull_internal;
+ 
++   /* VK_NV_framebuffer_mixed_samples: target-independent rasterization
++    * (SET_TIR) may be on.  True at command buffer begin and after
++    * secondaries (whatever ran before may have left it on), set when a draw
++    * turns it on, cleared when it is turned off.  CLEAR_SURFACE with it on
++    * is a class error (Xid 69 on GB202), so render pass begins and
++    * vkCmdClearAttachments turn it off first.
++    */
++   bool tir_maybe_on;
++
+    struct nvk_draw_params_state {
+       bool valid;
+       uint32_t first_vertex;
+@@ -452,6 +461,8 @@ nvk_cmd_buffer_push_indirect_ext(struct nvk_cmd_buffer *cmd,
+                                  uint64_t addr, uint32_t range,
+                                  bool no_prefetch);
+ 
++void nvk_cmd_disable_tir(struct nvk_cmd_buffer *cmd);
++
+ void nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                                    const VkCommandBufferBeginInfo *pBeginInfo);
+ void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
+diff --git a/src/nouveau/vulkan/nvk_cmd_clear.c b/src/nouveau/vulkan/nvk_cmd_clear.c
+index bcfe072c..4d666891 100644
+--- a/src/nouveau/vulkan/nvk_cmd_clear.c
++++ b/src/nouveau/vulkan/nvk_cmd_clear.c
+@@ -150,7 +150,15 @@ nvk_CmdClearAttachments(VkCommandBuffer commandBuffer,
+                         const VkClearRect *pRects)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+-   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
++   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
++
++   /* CLEAR_SURFACE is a class error with target-independent rasterization
++    * on; the next draw turns it back on if it wants it.
++    */
++   if (cmd->state.gfx.tir_maybe_on) {
++      nvk_cmd_disable_tir(cmd);
++      BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
++   }
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4 + attachmentCount * 4);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 0765625a..9f439c4a 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -616,6 +616,25 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
+       P_IMMD(p, NVB197, SET_POST_PS_INITIAL_COVERAGE, true);
+       P_IMMD(p, NVB197, SET_OFFSET_RENDER_TARGET_INDEX,
+                         BY_VIEWPORT_INDEX_FALSE);
++
++      /* VK_NV_framebuffer_mixed_samples (see nvk_flush_mixed_samples()):
++       * rasterization at more samples than the color attachments have is
++       * the hardware's target-independent rasterization, off until a draw
++       * asks for it.  While it is on, a color sample is covered if any of
++       * the raster samples associated with it is (the extension's merge
++       * reduction), and alpha to coverage and occlusion queries work on the
++       * raster samples, which the spec orders before coverage reduction.
++       */
++      P_IMMD(p, NVB197, SET_TIR, MODE_DISABLED);
++      P_IMMD(p, NVB197, SET_TIR_CONTROL, {
++         .z_pass_pixel_count_use_raster_samples =
++            Z_PASS_PIXEL_COUNT_USE_RASTER_SAMPLES_ENABLE,
++         .alpha_to_coverage_use_raster_samples =
++            ALPHA_TO_COVERAGE_USE_RASTER_SAMPLES_ENABLE,
++         .reduce_coverage = REDUCE_COVERAGE_ENABLE,
++      });
++      P_IMMD(p, NVB197, SET_TIR_MODULATION, COMPONENT_SELECT_NO_MODULATION);
++      P_IMMD(p, NVB197, SET_TIR_MODULATION_FUNCTION, SELECT_LINEAR);
+    }
+ 
+    P_IMMD(p, NV9097, SET_WINDOW_ORIGIN, {
+@@ -969,6 +988,8 @@ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                               const VkCommandBufferBeginInfo *pBeginInfo)
+ {
+    const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++
++   cmd->state.gfx.tir_maybe_on = true;
+    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 9);
+       P_MTHD(p, NV9097, INVALIDATE_SAMPLER_CACHE_NO_WFI);
+@@ -1116,6 +1137,26 @@ nil_to_nv9097_samples_mode(enum nil_sample_layout sample_layout)
+ 
+ static uint32_t nvk_mme_anti_alias_samples(uint32_t samples);
+ 
++void
++nvk_cmd_disable_tir(struct nvk_cmd_buffer *cmd)
++{
++   const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++
++   if (!cmd->state.gfx.tir_maybe_on)
++      return;
++
++   cmd->state.gfx.tir_maybe_on = false;
++
++   /* Only a device with VK_NV_framebuffer_mixed_samples enabled ever turns
++    * it on; the queue's init state has it off.
++    */
++   if (!dev->vk.enabled_extensions.NV_framebuffer_mixed_samples)
++      return;
++
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++   P_IMMD(p, NVB197, SET_TIR, MODE_DISABLED);
++}
++
+ static void
+ nvk_cmd_set_sample_layout(struct nvk_cmd_buffer *cmd,
+                           enum nil_sample_layout sample_layout)
+@@ -1406,6 +1447,12 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_buffer_dirty_render_pass(cmd);
+ 
++   /* No target-independent rasterization across the SET_ANTI_ALIAS and the
++    * load-op clears below; the first draw that wants it turns it back on
++    * (nvk_flush_mixed_samples(), rasterization samples are dirty).
++    */
++   nvk_cmd_disable_tir(cmd);
++
+    const size_t zcull_count = 47;
+    struct nv_push *p = nvk_cmd_buffer_push(
+       cmd, NVK_MAX_RTS * 12 + 46 + zcull_count
+@@ -3959,6 +4006,107 @@ vk_to_nak_sample_location(VkSampleLocationEXT loc)
+    };
+ }
+ 
++static uint32_t
++nvk_raster_samples_mode(uint32_t samples)
++{
++   switch (samples) {
++   case 2:  return NVB197_SET_ANTI_ALIAS_RASTER_SAMPLES_MODE_2X1_D3D;
++   case 4:  return NVB197_SET_ANTI_ALIAS_RASTER_SAMPLES_MODE_2X2;
++   case 8:  return NVB197_SET_ANTI_ALIAS_RASTER_SAMPLES_MODE_4X2_D3D;
++   case 16: return NVB197_SET_ANTI_ALIAS_RASTER_SAMPLES_MODE_4X4;
++   default: return NVB197_SET_ANTI_ALIAS_RASTER_SAMPLES_MODE_1X1;
++   }
++}
++
++static uint32_t
++vk_to_nvb197_tir_modulation(VkCoverageModulationModeNV mode)
++{
++   switch (mode) {
++   case VK_COVERAGE_MODULATION_MODE_RGB_NV:
++      return NVB197_SET_TIR_MODULATION_COMPONENT_SELECT_MODULATE_RGB;
++   case VK_COVERAGE_MODULATION_MODE_ALPHA_NV:
++      return NVB197_SET_TIR_MODULATION_COMPONENT_SELECT_MODULATE_ALPHA_ONLY;
++   case VK_COVERAGE_MODULATION_MODE_RGBA_NV:
++      return NVB197_SET_TIR_MODULATION_COMPONENT_SELECT_MODULATE_RGBA;
++   default:
++      return NVB197_SET_TIR_MODULATION_COMPONENT_SELECT_NO_MODULATION;
++   }
++}
++
++/* VK_NV_framebuffer_mixed_samples: a draw that rasterizes at more samples
++ * than its color attachments have (rasterizationSamples > the attachments'
++ * sample count, which nvk_BeginRendering() programmed with SET_ANTI_ALIAS)
++ * turns on target-independent rasterization: SET_ANTI_ALIAS_RASTER gives
++ * the raster sample count, the pixel shader's coverage input (covmask) has
++ * one bit per raster sample, and color writes see the coverage reduced to
++ * the color samples.  D3D11.1 target-independent rasterization (Direct2D's
++ * anti-aliased fills: ForcedSampleCount 16 with a single-sample render
++ * target) is exactly this.
++ *
++ * The extension requires sampleShadingEnable = VK_FALSE in that case and
++ * a depth/stencil attachment to have rasterizationSamples samples if any
++ * depth or stencil test is on, so the per-pass sample masks (the MME's
++ * SET_ANTI_ALIAS state, from the attachments' count) and the depth/stencil
++ * layout need nothing new.
++ */
++static void
++nvk_flush_mixed_samples(struct nvk_cmd_buffer *cmd)
++{
++   const struct nvk_rendering_state *render = &cmd->state.gfx.render;
++   const struct vk_dynamic_graphics_state *dyn =
++      &cmd->vk.dynamic_graphics_state;
++
++   const uint32_t raster_samples = dyn->ms.rasterization_samples;
++   const bool mixed = render->samples != 0 &&
++                      raster_samples > render->samples;
++
++   if (!mixed) {
++      nvk_cmd_disable_tir(cmd);
++      return;
++   }
++
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
++
++   P_IMMD(p, NVB197, SET_ANTI_ALIAS_RASTER,
++          nvk_raster_samples_mode(raster_samples));
++
++   const uint32_t modulation =
++      vk_to_nvb197_tir_modulation(dyn->ms.coverage_modulation_mode);
++   P_IMMD(p, NVB197, SET_TIR_MODULATION, modulation);
++
++   if (modulation != NVB197_SET_TIR_MODULATION_COMPONENT_SELECT_NO_MODULATION) {
++      const bool table = dyn->ms.coverage_modulation_table_enable;
++      P_IMMD(p, NVB197, SET_TIR_MODULATION_FUNCTION,
++             table ? SELECT_TABLE : SELECT_LINEAR);
++
++      if (table) {
++         /* pCoverageModulationTable[i] is the factor for a color sample
++          * with i + 1 of its associated raster samples covered; the
++          * hardware takes 16 unorm8 coefficients in the same order.
++          */
++         uint8_t coef[16] = { 0 };
++         const uint32_t count = MIN2(dyn->ms.coverage_modulation_table_count,
++                                     ARRAY_SIZE(coef));
++         for (uint32_t i = 0; i < count; i++) {
++            coef[i] = float_to_ubyte(dyn->ms.coverage_modulation_table[i]);
++         }
++
++         P_MTHD(p, NVB197, SET_TIR_MODULATION_COEFFICIENT_TABLE(0));
++         for (uint32_t i = 0; i < 4; i++) {
++            P_NVB197_SET_TIR_MODULATION_COEFFICIENT_TABLE(p, i, {
++               .v0 = coef[i * 4 + 0],
++               .v1 = coef[i * 4 + 1],
++               .v2 = coef[i * 4 + 2],
++               .v3 = coef[i * 4 + 3],
++            });
++         }
++      }
++   }
++
++   P_IMMD(p, NVB197, SET_TIR, MODE_RASTER_N_TARGET_M);
++   cmd->state.gfx.tir_maybe_on = true;
++}
++
+ static void
+ nvk_flush_ms_state(struct nvk_cmd_buffer *cmd)
+ {
+@@ -3980,13 +4128,23 @@ nvk_flush_ms_state(struct nvk_cmd_buffer *cmd)
+          nvk_cmd_set_sample_layout(cmd, nil_choose_sample_layout(samples));
+       } else {
+          /* Multisample information MAY be missing (rasterizationSamples == 0)
+-          * if rasterizer discard is enabled.
++          * if rasterizer discard is enabled.  With
++          * VK_NV_framebuffer_mixed_samples it may be more than the
++          * attachments' sample count (nvk_flush_mixed_samples()).
+           */
+          assert(dyn->ms.rasterization_samples == 0 ||
+-                dyn->ms.rasterization_samples == render->samples);
++                dyn->ms.rasterization_samples >= render->samples);
+       }
+    }
+ 
++   if (nvk_cmd_buffer_device(cmd)->vk.enabled_extensions.NV_framebuffer_mixed_samples &&
++       (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) ||
++        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE) ||
++        BITSET_TEST(dyn->dirty,
++                    MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE_ENABLE) ||
++        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_TABLE)))
++      nvk_flush_mixed_samples(cmd);
++
+    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) ||
+        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_MS_ALPHA_TO_ONE_ENABLE)) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+@@ -4007,8 +4165,14 @@ nvk_flush_ms_state(struct nvk_cmd_buffer *cmd)
+          sl = vk_standard_sample_locations_state(samples);
+       }
+ 
+-      struct nak_sample_location push_sl[NVK_MAX_SAMPLES];
+-      for (uint32_t i = 0; i < sl->per_pixel; i++)
++      /* The shader-visible positions (gl_SamplePosition, interpolation at a
++       * sample index) hold NVK_MAX_SAMPLES; a 16-sample mixed-samples raster
++       * (more than any attachment can have) only programs the hardware's
++       * positions below.  Sample shading, the use of the rest, is not
++       * allowed there.
++       */
++      struct nak_sample_location push_sl[NVK_MAX_SAMPLES] = { 0 };
++      for (uint32_t i = 0; i < MIN2(sl->per_pixel, NVK_MAX_SAMPLES); i++)
+          push_sl[i] = vk_to_nak_sample_location(sl->locations[i]);
+ 
+       nvk_descriptor_state_set_root_array(cmd, &cmd->state.gfx.descriptors,
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 615fd601..ae735fac 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -346,6 +346,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
+       .GOOGLE_user_type = true,
+       .MESA_image_alignment_control = true,
+       .NV_compute_shader_derivatives = info->cls_eng3d >= TURING_A,
++      .NV_framebuffer_mixed_samples = info->cls_eng3d >= MAXWELL_B,
+       .NV_shader_atomic_float16_vector = info->cls_eng3d >= TURING_A,
+       .NV_shader_sm_builtins = true,
+       .NVX_image_view_handle = info->cls_eng3d >= MAXWELL_A, /* needs true bindless descriptors */
+@@ -704,9 +705,9 @@ nvk_get_device_features(const struct nv_device_info *info,
+       .extendedDynamicState3ViewportSwizzle = false,
+       .extendedDynamicState3CoverageToColorEnable = false,
+       .extendedDynamicState3CoverageToColorLocation = false,
+-      .extendedDynamicState3CoverageModulationMode = false,
+-      .extendedDynamicState3CoverageModulationTableEnable = false,
+-      .extendedDynamicState3CoverageModulationTable = false,
++      .extendedDynamicState3CoverageModulationMode = info->cls_eng3d >= MAXWELL_B,
++      .extendedDynamicState3CoverageModulationTableEnable = info->cls_eng3d >= MAXWELL_B,
++      .extendedDynamicState3CoverageModulationTable = info->cls_eng3d >= MAXWELL_B,
+       .extendedDynamicState3CoverageReductionMode = false,
+       .extendedDynamicState3RepresentativeFragmentTestEnable = false,
+       .extendedDynamicState3ShadingRateImageEnable = false,

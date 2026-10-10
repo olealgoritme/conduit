@@ -265,6 +265,8 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0041 | `NVK_NULL_VB_ZERO_PAGE`: a null vertex buffer (robustness2, DXVK's unused D3D11 slots) is bound to the 4 KiB zero page; `NVK_ZERO_PAGE_VRAM`: the zero page (null descriptors) is VRAM instead of uncached system memory on RM |
 | 0042 | `NVK_RM_EVENT_GEN`: librmclient keeps a wake generation per channel (`crm_win_event_gen`, `crm_win_event_wait_gen`); one thread blocks on the KMD event and moves the generation on, waking the other waiters through a condition variable; wait loops read the generation before checking their value. Needs a librmclient with the symbols, else the shared-event wait |
 | 0043 | knobs that undo the wait changes one at a time: `NVK_RM_GPFIFO_ENTRIES`, `NVK_RM_RING_YIELD_MS`, `NVK_RM_HIRES_SLEEP`; with `NVK_RM_WAIT_POLL_MS=10`, `NVK_RM_EVENT_GEN=0`, librmclient's `CRM_EVENT_HIRES=0` and the UMD bridge's `HELIOS_HANDOFF_SLEEP1=1` every wait change can be undone at run time |
+| 0044 | vulkan/runtime: `VkPipelineCoverageModulationStateCreateInfoNV` and the coverage modulation commands become dynamic state (`MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE`, `_TABLE_ENABLE`, `_TABLE`) |
+| 0045 | `VK_NV_framebuffer_mixed_samples` (Maxwell B+): `rasterizationSamples` above the attachments' sample count turns on the hardware's target-independent rasterization (`SET_TIR`, `SET_ANTI_ALIAS_RASTER`), with merge coverage reduction and coverage modulation (also the extended dynamic state 3 coverage modulation features). What D3D11.1 `ForcedSampleCount` needs with a render target bound: Direct2D's anti-aliased fills (`guest/windows/tools/d2d_tir_probe.cpp`) |
 
 ## Per-draw cost (common 0001-0007)
 

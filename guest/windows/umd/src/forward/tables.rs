@@ -268,11 +268,13 @@ pub unsafe fn install_11_1(
     f.pfnClearView = Some(clear_view_11_1);
     // The >=11.1 tables pass D3D11_1_DDI_BLEND_DESC (LogicOpEnable/LogicOp
     // inserted mid-struct) — `install()`'s 10.1-desc handlers misread the
-    // write mask (see create_blend_state_11_1). NOTE the 11.1 rasterizer desc
-    // only APPENDS ForcedSampleCount, so the shared 10.x reader stays valid
-    // for pfnCreateRasterizerState.
+    // write mask (see create_blend_state_11_1). The 11.1 rasterizer desc
+    // APPENDS ForcedSampleCount (target-independent rasterization), which the
+    // 11.1 reader forwards.
     f.pfnCalcPrivateBlendStateSize = Some(calc_size_blend_11_1);
     f.pfnCreateBlendState = Some(create_blend_state_11_1);
+    f.pfnCalcPrivateRasterizerStateSize = Some(calc_size_raster_11_1);
+    f.pfnCreateRasterizerState = Some(create_rasterizer_state_11_1);
     // The >=11.1 shader creates carry TYPED signature entries
     // (D3D11_1DDIARG_SIGNATURE_ENTRY2.RegisterComponentType); forward them so
     // dxbc-spv declares correctly-typed shader I/O instead of assuming
