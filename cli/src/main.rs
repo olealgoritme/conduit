@@ -21,6 +21,7 @@ mod qemu;
 mod run;
 mod scope;
 mod setup;
+mod shares;
 mod stages;
 mod stream;
 mod sys;
@@ -357,6 +358,12 @@ enum Cmd {
         #[arg(long)]
         fullscreen: bool,
     },
+    /// Shared folders: host directories a libvirt VM sees as drives
+    /// (Windows) or under /mnt/conduit (Linux)
+    Share {
+        #[command(subcommand)]
+        action: ShareCmd,
+    },
     /// Take Conduit's GPU off a libvirt VM: restore its original definition
     Detach { name: String },
     /// Make a Conduit VM a libvirt domain (virt-manager, virsh) or stop that
@@ -400,12 +407,41 @@ enum Cmd {
     /// (internal) conduit-virtiofsd@NAME.service: become virtiofsd
     #[command(name = "_virtiofsd", hide = true)]
     Virtiofsd { name: String },
+    /// (internal) conduit-share@VM:SHARE.service: become virtiofsd for a shared folder
+    #[command(name = "_share", hide = true)]
+    ShareHelper { instance: String },
     /// (internal) conduit-stats@NAME.service: feed GPU readings to the VM
     #[command(name = "_stats", hide = true)]
     Stats { name: String },
     /// (internal) after the backend stopped with its VM
     #[command(name = "_stopped", hide = true)]
     Stopped { name: String },
+}
+
+#[derive(Subcommand)]
+enum ShareCmd {
+    /// List a VM's shared folders
+    List { vm: String },
+    /// Share a host directory with a VM (a running VM gets it at once when it can)
+    Add {
+        vm: String,
+        dir: PathBuf,
+        /// Name in the VM (default: the directory's name; letters, digits, _ and -)
+        #[arg(long)]
+        name: Option<String>,
+        /// The VM may read but not write (needs virtiofsd 1.11 or newer)
+        #[arg(long)]
+        ro: bool,
+    },
+    /// Stop sharing a folder
+    Rm { vm: String, name: String },
+    /// Make a folder read-only or writable again (applies at the next VM start)
+    Ro {
+        vm: String,
+        name: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 fn ram_mib(s: &str) -> Result<u64> {
@@ -769,6 +805,13 @@ fn main() {
             yuv444,
         }),
         Cmd::Detach { name } => libvirt::detach(&name),
+        Cmd::Share { action } => match action {
+            ShareCmd::List { vm } => shares::list(&vm),
+            ShareCmd::Add { vm, dir, name, ro } => shares::add(&vm, &dir, name.as_deref(), ro),
+            ShareCmd::Rm { vm, name } => shares::rm(&vm, &name),
+            ShareCmd::Ro { vm, name, state } => shares::set_read_only(&vm, &name, state == "on"),
+        },
+        Cmd::ShareHelper { instance } => lvrun::share_exec(&instance),
         Cmd::Libvirt { action, name } => match action.as_str() {
             "enable" => virt::enable(&name),
             _ => virt::disable(&name),

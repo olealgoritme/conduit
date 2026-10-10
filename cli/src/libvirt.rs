@@ -28,6 +28,7 @@
 use crate::guest;
 use crate::paths;
 use crate::run;
+use crate::shares::{self, Wire};
 use crate::sys;
 use crate::ui::{self, oops};
 use crate::units::{self, Scope};
@@ -46,6 +47,8 @@ pub struct Wiring<'a> {
     /// QEMU's end of the stats channel (`org.conduit.stats.0`) binds here.
     pub stats_sock: &'a Path,
     pub vm: &'a str,
+    /// The VM's shared folders (virtiofs tags `conduit-*`).
+    pub shares: &'a [Wire],
     /// A Windows guest ([`is_windows`]): add the Hyper-V enlightenments.
     pub windows: bool,
 }
@@ -499,6 +502,7 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         // Before the share is re-appended: each edit leaves the order as it was.
         add_stats_channel(devices, w.stats_sock);
         devices.children.push(XMLNode::Element(fs));
+        set_shares(devices, w.shares);
     }
 
     if w.windows {
@@ -581,6 +585,53 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     cl.children.extend(others); // <qemu:env> after the args, as libvirt writes them
     root.children.push(XMLNode::Element(cl));
 
+    let mut out = Vec::new();
+    root.write_with_config(
+        &mut out,
+        EmitterConfig::new()
+            .perform_indent(true)
+            .write_document_declaration(false),
+    )?;
+    Ok(String::from_utf8(out)?)
+}
+
+/// The `<filesystem>` element of one shared folder.
+fn share_fs(w: &Wire) -> Element {
+    let mut fs = el("filesystem", &[("type", "mount")]);
+    fs.children.push(XMLNode::Element(el(
+        "driver",
+        &[("type", "virtiofs"), ("queue", "1024")],
+    )));
+    let sock = w.sock.display().to_string();
+    fs.children
+        .push(XMLNode::Element(el("source", &[("socket", &sock)])));
+    fs.children
+        .push(XMLNode::Element(el("target", &[("dir", &w.tag)])));
+    fs
+}
+
+/// Make `<devices>` carry exactly these shared folders: Conduit's
+/// (`conduit-*` targets) are replaced, other filesystems stay as they are.
+fn set_shares(devices: &mut Element, shares: &[Wire]) {
+    devices.children.retain(|n| {
+        !matches!(n, XMLNode::Element(e) if e.name == "filesystem"
+            && e.get_child("target")
+                .and_then(|t| t.attributes.get("dir"))
+                .is_some_and(|d| shares::is_share_tag(d)))
+    });
+    for w in shares {
+        devices.children.push(XMLNode::Element(share_fs(w)));
+    }
+}
+
+/// A domain definition with its shared folders set to `shares`, nothing else changed.
+pub fn apply_shares(xml: &str, shares: &[Wire]) -> Result<String> {
+    let mut root =
+        Element::parse(xml.as_bytes()).context("libvirt returned XML Conduit cannot read")?;
+    if root.name != "domain" {
+        anyhow::bail!("not a libvirt domain (root element is <{}>)", root.name);
+    }
+    set_shares(child_mut(&mut root, "devices"), shares);
     let mut out = Vec::new();
     root.write_with_config(
         &mut out,
@@ -728,6 +779,17 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     let vfs = units::socket_path(&scope, name, "virtiofsd");
     let console = units::console_path(&scope, name);
     let stats = units::stats_path(&scope, name);
+    let share_list = if dry_run {
+        let l = shares::load(name)?;
+        if l.is_empty() && !shares::file(name).is_file() {
+            vec![shares::default_share(name)]
+        } else {
+            l
+        }
+    } else {
+        shares::load_or_init(name)?
+    };
+    let share_wires = shares::wires(&scope, name, &share_list);
     let new_xml = edit_domain(
         &xml,
         &Wiring {
@@ -737,6 +799,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
             console_sock: &console,
             stats_sock: &stats,
             vm: name,
+            shares: &share_wires,
             windows,
         },
     )?;
@@ -974,6 +1037,10 @@ mod tests {
                 console_sock: Path::new(CONSOLE),
                 stats_sock: Path::new(STATS),
                 vm: "myvm",
+                shares: &[Wire {
+                    tag: "conduit-Conduit".into(),
+                    sock: PathBuf::from("/run/user/1000/conduit/myvm/share-Conduit.sock"),
+                }],
                 windows,
             },
         )
@@ -1276,7 +1343,7 @@ mod tests {
         );
         assert_eq!(twice.matches("<qemu:commandline").count(), 1);
         assert_eq!(twice.matches("conduit:vm").count(), 1);
-        assert_eq!(twice.matches("<filesystem").count(), 1);
+        assert_eq!(twice.matches("<filesystem").count(), 2);
         assert!(
             twice.contains("value=\"-s\""),
             "user's own args are kept: {twice}"
@@ -1421,6 +1488,50 @@ mod tests {
         assert!(out.contains("org.qemu.guest_agent.0"));
     }
 
+    fn share_targets(xml: &str) -> Vec<String> {
+        let root = Element::parse(xml.as_bytes()).unwrap();
+        let devices = root.get_child("devices").unwrap();
+        elements(devices)
+            .filter(|e| e.name == "filesystem")
+            .filter_map(|e| e.get_child("target")?.attributes.get("dir").cloned())
+            .collect()
+    }
+
+    #[test]
+    fn attach_adds_the_default_share_once() {
+        let out = edit(WIN11);
+        assert_eq!(share_targets(&out), ["nvidia", "conduit-Conduit"], "{out}");
+        assert!(out.contains("share-Conduit.sock"));
+        assert_eq!(share_targets(&edit(&out)), ["nvidia", "conduit-Conduit"]);
+    }
+
+    #[test]
+    fn apply_shares_replaces_only_ours() {
+        let with_user_fs = edit(WIN11).replace(
+            "</devices>",
+            "<filesystem type='mount'><driver type='virtiofs'/><source dir='/tmp'/><target dir='hostshare'/></filesystem></devices>",
+        );
+        let ws = [
+            Wire {
+                tag: "conduit-A".into(),
+                sock: PathBuf::from("/s/a.sock"),
+            },
+            Wire {
+                tag: "conduit-B".into(),
+                sock: PathBuf::from("/s/b.sock"),
+            },
+        ];
+        let out = apply_shares(&with_user_fs, &ws).unwrap();
+        assert_eq!(
+            share_targets(&out),
+            ["nvidia", "hostshare", "conduit-A", "conduit-B"],
+            "{out}"
+        );
+        let none = apply_shares(&out, &[]).unwrap();
+        assert_eq!(share_targets(&none), ["nvidia", "hostshare"]);
+        assert!(apply_shares("<network/>", &ws).is_err());
+    }
+
     #[test]
     fn rejects_non_domain() {
         let w = Wiring {
@@ -1430,6 +1541,7 @@ mod tests {
             console_sock: Path::new("/c"),
             stats_sock: Path::new("/t"),
             vm: "x",
+            shares: &[],
             windows: false,
         };
         assert!(edit_domain("<network/>", &w).is_err());

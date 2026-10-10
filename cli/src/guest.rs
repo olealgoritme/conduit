@@ -42,6 +42,18 @@ const FILES: &[(&str, &str)] = &[
         "90-conduit-nvidia.conf",
         include_str!("../assets/guest/90-conduit-nvidia.conf"),
     ),
+    (
+        "conduit-shares.sh",
+        include_str!("../assets/guest/conduit-shares.sh"),
+    ),
+    (
+        "conduit-shares.service",
+        include_str!("../assets/guest/conduit-shares.service"),
+    ),
+    (
+        "72-conduit-shares.rules",
+        include_str!("../assets/guest/72-conduit-shares.rules"),
+    ),
 ];
 
 /// Runs inside the guest as root. Idempotent. Debian/Ubuntu (apt, the .deb)
@@ -133,6 +145,11 @@ run install -m644 "$D/71-conduit-seat.rules" /etc/udev/rules.d/71-conduit-seat.r
 run install -m644 "$D/zz-conduit-nvidia.conf" /etc/ld.so.conf.d/zz-conduit-nvidia.conf
 run install -m644 "$D/conduit-nvidia.sh" /etc/profile.d/conduit-nvidia.sh
 run install -m644 "$D/90-conduit-nvidia.conf" /etc/environment.d/90-conduit-nvidia.conf
+# Shared folders from the host: conduit-* virtiofs tags mount at /mnt/conduit/NAME.
+run install -d /mnt/conduit
+run install -m755 "$D/conduit-shares.sh" /usr/local/sbin/conduit-shares
+run install -m644 "$D/conduit-shares.service" /etc/systemd/system/conduit-shares.service
+run install -m644 "$D/72-conduit-shares.rules" /etc/udev/rules.d/72-conduit-shares.rules
 # environment.d reaches systemd user sessions and profile.d login shells, but a
 # display manager's greeter (SDDM running Hyprland) gets neither; pam_env's
 # /etc/environment reaches every PAM session. Replace our block, keep the rest.
@@ -147,7 +164,7 @@ fi
 if [ -d /run/systemd/system ]; then
     run systemctl daemon-reload
 fi
-run systemctl enable conduit-guest.service
+run systemctl enable conduit-guest.service conduit-shares.service
 if [ "$DRY" = 0 ]; then
     dkms status conduit-guest || true
 fi

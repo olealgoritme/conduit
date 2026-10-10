@@ -307,6 +307,8 @@ pub struct Managed<'a> {
     pub initrd: Option<&'a Path>,
     pub gpu_sock: &'a Path,
     pub vfs_sock: &'a Path,
+    /// Shared folders (virtiofs tags `conduit-*`).
+    pub shares: &'a [crate::shares::Wire],
     pub console_log: &'a Path,
     pub audio: Option<qemu::Audio>,
     pub runtime_dir: &'a Path,
@@ -362,6 +364,16 @@ pub fn managed_xml(c: &VmConfig, m: &Managed) -> String {
     cl += &format!("    <qemu:env name='XDG_RUNTIME_DIR' value='{rt}'/>\n");
     cl += &format!("    <qemu:env name='PIPEWIRE_RUNTIME_DIR' value='{rt}'/>\n");
     cl += &format!("    <qemu:env name='PULSE_SERVER' value='unix:{rt}/pulse/native'/>\n");
+    let shares: String = m
+        .shares
+        .iter()
+        .map(|w| {
+            crate::shares::device_xml(w)
+                .lines()
+                .map(|l| format!("    {l}\n"))
+                .collect::<String>()
+        })
+        .collect();
     format!(
         r#"<domain type='kvm' xmlns:qemu='{QEMU_NS}'>
   <name>{name}</name>
@@ -408,7 +420,7 @@ pub fn managed_xml(c: &VmConfig, m: &Managed) -> String {
       <source socket='{vfs}'/>
       <target dir='nvidia'/>
     </filesystem>
-    <serial type='pty'>
+{shares}    <serial type='pty'>
       <log file='{log}' append='off'/>
       <target port='0'/>
     </serial>
@@ -445,6 +457,11 @@ pub fn build_managed(c: &VmConfig, emulator: &Path) -> Result<String> {
     let b = boot::resolve(c)?;
     let gpu = units::socket_path(&Scope::User, &c.name, "backend");
     let vfs = units::socket_path(&Scope::User, &c.name, "virtiofsd");
+    let share_wires = crate::shares::wires(
+        &Scope::User,
+        &c.name,
+        &crate::shares::load_or_init(&c.name)?,
+    );
     let log = c.logs_dir().join("vm.log");
     let audio = qemu::pick_audio(emulator);
     Ok(managed_xml(
@@ -455,6 +472,7 @@ pub fn build_managed(c: &VmConfig, emulator: &Path) -> Result<String> {
             initrd: b.initrd(),
             gpu_sock: &gpu,
             vfs_sock: &vfs,
+            shares: &share_wires,
             console_log: &log,
             audio,
             runtime_dir: &paths::xdg_runtime(),
@@ -735,6 +753,10 @@ mod tests {
                 initrd: Some(Path::new("/vms/t-1/boot/initrd.img")),
                 gpu_sock: Path::new("/run/user/1000/conduit/t-1/gpu-libvirt.sock"),
                 vfs_sock: Path::new("/run/user/1000/conduit/t-1/vfs-libvirt.sock"),
+                shares: &[crate::shares::Wire {
+                    tag: "conduit-Conduit".into(),
+                    sock: PathBuf::from("/run/user/1000/conduit/t-1/share-Conduit.sock"),
+                }],
                 console_log: Path::new("/vms/t-1/logs/vm.log"),
                 audio: Some(qemu::Audio::PipeWire),
                 runtime_dir: Path::new("/run/user/1000"),
@@ -761,6 +783,8 @@ mod tests {
             "<mac address='02:00:00:00:03:01'/>",
             "<source socket='/run/user/1000/conduit/t-1/vfs-libvirt.sock'/>",
             "<target dir='nvidia'/>",
+            "<source socket='/run/user/1000/conduit/t-1/share-Conduit.sock'/>",
+            "<target dir='conduit-Conduit'/>",
             "socket,id=conduit-gpu,path=/run/user/1000/conduit/t-1/gpu-libvirt.sock",
             "vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,class=0x0380,num_vqs=3,vq_size=256,config_size=4036,bus=pcie.0,addr=0x10",
             "pipewire,id=conduit-snd,out.name=conduit-t-1,in.name=conduit-t-1",
