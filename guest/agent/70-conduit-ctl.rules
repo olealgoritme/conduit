@@ -1,5 +1,6 @@
 # /dev/virtio-ports/org.conduit.ctl.0: the host control channel, for the
-# control agent in the user's desktop session. Group video for logins outside
-# a seat, and uaccess so the active local session's user gets it without any
-# group. The 70- prefix matters: uaccess must be tagged before 73-seat-late.rules.
-SUBSYSTEM=="virtio-ports", ATTR{name}=="org.conduit.ctl.0", GROUP="video", MODE="0660", TAG+="uaccess"
+# control agent in the user's desktop session. uaccess gives it to the user of
+# the active local session only (no group: a group would hand the channel, and
+# with it file access to that user's home, to every member at all times). The
+# 70- prefix matters: uaccess must be tagged before 73-seat-late.rules.
+SUBSYSTEM=="virtio-ports", ATTR{name}=="org.conduit.ctl.0", TAG+="uaccess"

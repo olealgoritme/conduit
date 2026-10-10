@@ -43,6 +43,9 @@ PORT_PATH = "/dev/virtio-ports/" + CHANNEL
 MAX_LINE = 4 << 20
 CHUNK = 256 << 10
 MAX_FILE = 8 << 30
+# Marks a .conduit-part file as made by this agent, so a restarted agent may
+# continue or replace it and never touches a same-named file it did not make.
+PART_XATTR = "user.conduit.part"
 MAX_ICON = 512 << 10
 LS_CAP = 5000
 ICON_PX = 64
@@ -1115,6 +1118,8 @@ class Agent:
         self.launch_seq = 0
         self.put_lock = threading.Lock()
         self.puts = {}
+        # .conduit-part files this agent made (and may therefore delete).
+        self.parts = set()
         self.gets = {}
         self.apps_cache = (0.0, None)
         self.icon_cache = {}
@@ -1714,11 +1719,46 @@ class Agent:
                 return self._put(final, tmp, offset, data, size, done, want_sha, force)
             except BaseException:
                 self.puts.pop(final, None)
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+                # Only a part file this transfer made goes; a file of that
+                # name that was there before is not ours to delete.
+                if tmp in self.parts:
+                    self.parts.discard(tmp)
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
                 raise
+
+    def _own_part(self, tmp):
+        """tmp was made by a Conduit agent: this one, or an earlier run that
+        marked it (a regular file of ours carrying PART_XATTR)."""
+        if tmp in self.parts:
+            return True
+        try:
+            st = os.lstat(tmp)
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        try:
+            return os.getxattr(tmp, PART_XATTR, follow_symlinks=False) == b"1"
+        except (OSError, AttributeError):
+            return False
+
+    def _new_part(self, tmp, data):
+        if os.path.lexists(tmp):
+            if not self._own_part(tmp):
+                raise OpError("%s exists and was not made by Conduit; move it away first" % txt(tmp))
+            os.unlink(tmp)
+            self.parts.discard(tmp)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        self.parts.add(tmp)
+        with os.fdopen(fd, "wb") as f:
+            try:
+                os.setxattr(f.fileno(), PART_XATTR, b"1")
+            except (OSError, AttributeError):
+                pass
+            f.write(data)
 
     def _put(self, final, tmp, offset, data, size, done, want_sha, force):
         st = self.puts.get(final)
@@ -1734,8 +1774,7 @@ class Agent:
                 raise OpError("file larger than %d bytes" % MAX_FILE)
             self.puts.pop(final, None)
             try:
-                with open(tmp, "wb") as f:
-                    f.write(data)
+                self._new_part(tmp, data)
             except OSError as e:
                 raise OpError("cannot write %s: %s" % (txt(tmp), e.strerror or e))
             st = {"written": len(data), "hash": hashlib.sha256(data), "size": size}
@@ -1753,14 +1792,18 @@ class Agent:
             if offset + len(data) > MAX_FILE:
                 raise OpError("file larger than %d bytes" % MAX_FILE)
             if st is None:  # the agent restarted mid-file: hash what is there
+                if not self._own_part(tmp):
+                    raise OpError("unexpected offset %d, expected 0" % offset)
+                self.parts.add(tmp)
                 h = hashlib.sha256()
-                with open(tmp, "rb") as f:
+                with os.fdopen(os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb") as f:
                     for blk in iter(lambda: f.read(1 << 20), b""):
                         h.update(blk)
                 st = {"written": actual, "hash": h, "size": size}
                 self.puts[final] = st
             try:
-                with open(tmp, "ab") as f:
+                fd = os.open(tmp, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
+                with os.fdopen(fd, "ab") as f:
                     f.write(data)
             except OSError as e:
                 raise OpError("cannot write %s: %s" % (txt(tmp), e.strerror or e))
@@ -1778,9 +1821,26 @@ class Agent:
         if os.path.lexists(final) and not force:
             raise OpError("already exists: %s" % txt(final))
         try:
-            os.replace(tmp, final)
+            if force:
+                os.replace(tmp, final)
+            else:
+                # Never replace a file that appeared meanwhile: link fails
+                # on an existing name. Filesystems without hard links fall
+                # back to the checked rename above.
+                try:
+                    os.link(tmp, final, follow_symlinks=False)
+                    os.unlink(tmp)
+                except FileExistsError:
+                    raise OpError("already exists: %s" % txt(final))
+                except OSError as e:
+                    if e.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EMLINK):
+                        raise
+                    os.replace(tmp, final)
+        except OpError:
+            raise
         except OSError as e:
             raise OpError("cannot move into place: %s" % (e.strerror or e))
+        self.parts.discard(tmp)
         self.puts.pop(final, None)
         return {"size": st["written"], "path": txt(final), "sha256": digest}
 
