@@ -516,6 +516,7 @@ fn exists(p: &Path) -> CtlError {
 }
 
 /// Free bytes for an unprivileged writer on the filesystem of `f`.
+#[allow(clippy::unnecessary_cast)] // field types differ between glibc and musl
 fn free_bytes(f: &std::fs::File) -> Option<u64> {
     use std::os::fd::AsRawFd;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };

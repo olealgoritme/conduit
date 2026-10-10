@@ -34,6 +34,8 @@ struct Proc {
 /// One GPU's readings at one moment.
 #[derive(Clone, Debug, Default)]
 pub struct Sample {
+    /// NVML's index of the device.
+    pub index: u32,
     pub name: String,
     pub temp_c: Option<u32>,
     pub util_gpu: Option<u32>,
@@ -55,9 +57,11 @@ pub struct Sample {
     pub procs: Vec<(u32, u64)>,
 }
 
+/// An open NVML. It keeps the NVIDIA device files open, which stops the GPU
+/// from being unbound from its driver; drop it to let go.
 pub struct Nvml {
     lib: *mut c_void,
-    dev: Dev,
+    devs: Vec<Dev>,
     pub driver: String,
 }
 
@@ -88,7 +92,7 @@ impl Nvml {
         }
         let mut n = Nvml {
             lib,
-            dev: std::ptr::null_mut(),
+            devs: Vec::new(),
             driver: String::new(),
         };
         let init = sym!(n, "nvmlInit_v2", extern "C" fn() -> Ret)?;
@@ -100,7 +104,23 @@ impl Nvml {
             "nvmlDeviceGetHandleByIndex_v2",
             extern "C" fn(c_uint, *mut Dev) -> Ret
         )?;
-        if by_index(0, &mut n.dev) != 0 {
+        let mut count: c_uint = 1;
+        if let Some(f) = sym!(
+            n,
+            "nvmlDeviceGetCount_v2",
+            extern "C" fn(*mut c_uint) -> Ret
+        ) {
+            if f(&mut count) != 0 {
+                count = 1;
+            }
+        }
+        for i in 0..count.min(64) {
+            let mut d: Dev = std::ptr::null_mut();
+            if by_index(i, &mut d) == 0 {
+                n.devs.push(d);
+            }
+        }
+        if n.devs.is_empty() {
             return None;
         }
         if let Some(f) = sym!(
@@ -118,22 +138,42 @@ impl Nvml {
         Some(n)
     }
 
-    fn u32_of(&self, f: Option<extern "C" fn(Dev, *mut c_uint) -> Ret>) -> Option<u32> {
-        let mut v: c_uint = 0;
-        (f?(self.dev, &mut v) == 0).then_some(v)
+    /// How many GPUs NVML sees.
+    pub fn count(&self) -> usize {
+        self.devs.len()
     }
 
-    fn clock(
-        &self,
-        f: Option<extern "C" fn(Dev, c_uint, *mut c_uint) -> Ret>,
-        kind: c_uint,
-    ) -> Option<u32> {
-        let mut v: c_uint = 0;
-        (f?(self.dev, kind, &mut v) == 0).then_some(v)
-    }
-
+    /// The first GPU's readings, PCIe throughput included (the stats feed).
     pub fn sample(&self) -> Sample {
-        let mut s = Sample::default();
+        let mut s = self.sample_dev(0);
+        (s.pcie_tx_kbs, s.pcie_rx_kbs) = self.pcie(0);
+        s
+    }
+
+    /// PCIe (tx, rx) in KB/s. Each call samples for about 20 ms, so the
+    /// dashboard reads it apart from the rest.
+    pub fn pcie(&self, i: usize) -> (Option<u32>, Option<u32>) {
+        let Some(&dev) = self.devs.get(i) else {
+            return (None, None);
+        };
+        type Get2 = extern "C" fn(Dev, c_uint, *mut c_uint) -> Ret;
+        let f = sym!(self, "nvmlDeviceGetPcieThroughput", Get2);
+        (clock(dev, f, 0), clock(dev, f, 1))
+    }
+
+    /// One GPU's readings, without PCIe throughput (see [`Nvml::pcie`]).
+    pub fn sample_dev(&self, i: usize) -> Sample {
+        let mut s = Sample {
+            index: i as u32,
+            ..Sample::default()
+        };
+        let Some(&dev) = self.devs.get(i) else {
+            return s;
+        };
+        let u32_of = |f: Option<extern "C" fn(Dev, *mut c_uint) -> Ret>| -> Option<u32> {
+            let mut v: c_uint = 0;
+            (f?(dev, &mut v) == 0).then_some(v)
+        };
         type Get = extern "C" fn(Dev, *mut c_uint) -> Ret;
         type Get2 = extern "C" fn(Dev, c_uint, *mut c_uint) -> Ret;
         if let Some(f) = sym!(
@@ -142,21 +182,21 @@ impl Nvml {
             extern "C" fn(Dev, *mut c_char, c_uint) -> Ret
         ) {
             let mut b = [0 as c_char; 96];
-            if f(self.dev, b.as_mut_ptr(), b.len() as c_uint) == 0 {
+            if f(dev, b.as_mut_ptr(), b.len() as c_uint) == 0 {
                 s.name = unsafe { CStr::from_ptr(b.as_ptr()) }
                     .to_string_lossy()
                     .into_owned();
             }
         }
         // Sensor 0: the GPU core.
-        s.temp_c = self.clock(sym!(self, "nvmlDeviceGetTemperature", Get2), 0);
+        s.temp_c = clock(dev, sym!(self, "nvmlDeviceGetTemperature", Get2), 0);
         if let Some(f) = sym!(
             self,
             "nvmlDeviceGetUtilizationRates",
             extern "C" fn(Dev, *mut Util) -> Ret
         ) {
             let mut u = Util::default();
-            if f(self.dev, &mut u) == 0 {
+            if f(dev, &mut u) == 0 {
                 s.util_gpu = Some(u.gpu);
                 s.util_mem = Some(u.memory);
             }
@@ -167,7 +207,7 @@ impl Nvml {
             extern "C" fn(Dev, *mut Mem) -> Ret
         ) {
             let mut m = Mem::default();
-            if f(self.dev, &mut m) == 0 {
+            if f(dev, &mut m) == 0 {
                 s.vram_used = Some(m.used);
                 s.vram_total = Some(m.total);
             }
@@ -175,24 +215,21 @@ impl Nvml {
         let clk = sym!(self, "nvmlDeviceGetClockInfo", Get2);
         let max = sym!(self, "nvmlDeviceGetMaxClockInfo", Get2);
         // 0 graphics, 2 memory.
-        s.clk_gfx = self.clock(clk, 0);
-        s.clk_mem = self.clock(clk, 2);
-        s.clk_gfx_max = self.clock(max, 0);
-        s.clk_mem_max = self.clock(max, 2);
-        s.power_mw = self.u32_of(sym!(self, "nvmlDeviceGetPowerUsage", Get));
-        s.power_limit_mw = self.u32_of(sym!(self, "nvmlDeviceGetEnforcedPowerLimit", Get));
-        s.fan_pct = self.u32_of(sym!(self, "nvmlDeviceGetFanSpeed", Get));
-        s.pstate = self.u32_of(sym!(self, "nvmlDeviceGetPerformanceState", Get));
-        let pcie = sym!(self, "nvmlDeviceGetPcieThroughput", Get2);
-        s.pcie_tx_kbs = self.clock(pcie, 0);
-        s.pcie_rx_kbs = self.clock(pcie, 1);
+        s.clk_gfx = clock(dev, clk, 0);
+        s.clk_mem = clock(dev, clk, 2);
+        s.clk_gfx_max = clock(dev, max, 0);
+        s.clk_mem_max = clock(dev, max, 2);
+        s.power_mw = u32_of(sym!(self, "nvmlDeviceGetPowerUsage", Get));
+        s.power_limit_mw = u32_of(sym!(self, "nvmlDeviceGetEnforcedPowerLimit", Get));
+        s.fan_pct = u32_of(sym!(self, "nvmlDeviceGetFanSpeed", Get));
+        s.pstate = u32_of(sym!(self, "nvmlDeviceGetPerformanceState", Get));
         if let Some(f) = sym!(
             self,
             "nvmlDeviceGetEncoderUtilization",
             extern "C" fn(Dev, *mut c_uint, *mut c_uint) -> Ret
         ) {
             let (mut u, mut p) = (0, 0);
-            if f(self.dev, &mut u, &mut p) == 0 {
+            if f(dev, &mut u, &mut p) == 0 {
                 s.enc_util = Some(u);
             }
         }
@@ -207,10 +244,8 @@ impl Nvml {
             }
             let f: extern "C" fn(Dev, *mut c_uint, *mut Proc) -> Ret =
                 unsafe { std::mem::transmute(p) };
-            let mut buf = [Proc::default(); 128];
-            let mut n = buf.len() as c_uint;
-            if f(self.dev, &mut n, buf.as_mut_ptr()) == 0 {
-                for p in &buf[..(n as usize).min(buf.len())] {
+            if let Some(list) = processes(|n, buf| f(dev, n, buf)) {
+                for p in &list {
                     // NVML_VALUE_NOT_AVAILABLE is all ones.
                     let used = if p.used == u64::MAX { 0 } else { p.used };
                     match s.procs.iter_mut().find(|(pid, _)| *pid == p.pid) {
@@ -224,11 +259,86 @@ impl Nvml {
     }
 }
 
+fn clock(
+    dev: Dev,
+    f: Option<extern "C" fn(Dev, c_uint, *mut c_uint) -> Ret>,
+    kind: c_uint,
+) -> Option<u32> {
+    let mut v: c_uint = 0;
+    (f?(dev, kind, &mut v) == 0).then_some(v)
+}
+
+/// NVML_ERROR_INSUFFICIENT_SIZE: the buffer was too small; the count says
+/// how many entries there are.
+const INSUFFICIENT_SIZE: Ret = 7;
+
+/// A running-process list through `call(&mut count, buffer)`, growing the
+/// buffer as NVML asks (processes come and go between calls, so a few tries).
+fn processes(mut call: impl FnMut(&mut c_uint, *mut Proc) -> Ret) -> Option<Vec<Proc>> {
+    let mut cap = 128usize;
+    for _ in 0..4 {
+        let mut buf = vec![Proc::default(); cap];
+        let mut n = cap as c_uint;
+        match call(&mut n, buf.as_mut_ptr()) {
+            0 => {
+                buf.truncate((n as usize).min(cap));
+                return Some(buf);
+            }
+            INSUFFICIENT_SIZE => cap = (n as usize + 32).max(cap * 2).min(1 << 16),
+            _ => return None,
+        }
+    }
+    None
+}
+
 impl Drop for Nvml {
     fn drop(&mut self) {
         if let Some(f) = sym!(self, "nvmlShutdown", extern "C" fn() -> Ret) {
             f();
         }
         unsafe { libc::dlclose(self.lib) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake NVML call over `have` processes, honest about sizes.
+    fn fake(have: usize, calls: &mut usize) -> impl FnMut(&mut c_uint, *mut Proc) -> Ret + '_ {
+        move |n, buf| {
+            *calls += 1;
+            if (*n as usize) < have {
+                *n = have as c_uint;
+                return INSUFFICIENT_SIZE;
+            }
+            for i in 0..have {
+                // SAFETY: the caller's buffer holds *n >= have entries.
+                unsafe {
+                    *buf.add(i) = Proc {
+                        pid: i as c_uint + 1,
+                        used: 1,
+                        gi: 0,
+                        ci: 0,
+                    }
+                };
+            }
+            *n = have as c_uint;
+            0
+        }
+    }
+
+    #[test]
+    fn a_long_process_list_is_read_whole() {
+        let mut calls = 0;
+        assert_eq!(processes(fake(5, &mut calls)).unwrap().len(), 5);
+        assert_eq!(calls, 1);
+        let mut calls = 0;
+        let l = processes(fake(300, &mut calls)).unwrap();
+        assert_eq!(l.len(), 300);
+        assert_eq!(l[299].pid, 300);
+        assert_eq!(calls, 2);
+        // Any other error is no list, not a panic.
+        assert!(processes(|_, _| 3).is_none());
     }
 }

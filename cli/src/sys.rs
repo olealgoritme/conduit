@@ -51,6 +51,45 @@ pub fn output(cmd: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run with a deadline: stdout when it exits 0 in time, else None (the
+/// process is killed at the deadline). For callers that must never hang,
+/// like the dashboard's sampler.
+pub fn output_timeout(cmd: &mut Command, limit: Duration) -> Option<String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out, &mut b);
+        let _ = tx.send(b);
+    });
+    let t = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                let left = limit
+                    .saturating_sub(t.elapsed())
+                    .max(Duration::from_millis(50));
+                let b = rx.recv_timeout(left).ok()?;
+                return st
+                    .success()
+                    .then(|| String::from_utf8_lossy(&b).into_owned());
+            }
+            Ok(None) if t.elapsed() < limit => sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Run quietly; true when it exited 0.
 pub fn quiet(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
@@ -356,4 +395,26 @@ pub fn free_bytes(p: &Path) -> Option<u64> {
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0)
         .then(|| s.f_bavail as u64 * s.f_frsize as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_timeout_returns_output_or_gives_up() {
+        let mut ok = Command::new("sh");
+        ok.args(["-c", "echo hi"]);
+        assert_eq!(
+            output_timeout(&mut ok, Duration::from_secs(5)).as_deref(),
+            Some("hi\n")
+        );
+        let mut fails = Command::new("false");
+        assert_eq!(output_timeout(&mut fails, Duration::from_secs(5)), None);
+        let mut hangs = Command::new("sleep");
+        hangs.arg("30");
+        let t = Instant::now();
+        assert_eq!(output_timeout(&mut hangs, Duration::from_millis(100)), None);
+        assert!(t.elapsed() < Duration::from_secs(3));
+    }
 }
