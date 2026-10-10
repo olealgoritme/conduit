@@ -182,6 +182,9 @@ jobs:
 
   bios:
     uses: ./.github/workflows/bios.yml
+    # bios.yml's mirror job publishes the edk2 sources as a release asset.
+    permissions:
+      contents: write
 
   release:
     needs: [host, guest, bios]
