@@ -1,0 +1,143 @@
+Helios DXVK fork: split immediate-context Map(WRITE_DISCARD) for the UMD's threaded front end
+
+Conduit guest/windows. Applied after 0017 by ci/windows/Build-Driver.ps1.
+
+The UMD's threaded front end (guest/windows/docs/d3d11-threaded-frontend.md)
+records the immediate context's calls into a ring and replays them on a UMD
+worker thread, which is then the only thread that enters this context. A
+dynamic buffer's Map(WRITE_DISCARD) must answer the app at once, so it is split
+into its two halves:
+
+- HeliosFrontendDiscard (app thread): DiscardSlice from a second local
+  allocation cache, m_heliosFrontendCache, created like m_allocationCache for
+  immediate contexts. It sets the buffer's current mapped slice, which a later
+  Map(WRITE_NO_OVERWRITE) on the app thread returns, and touches no other
+  context state. A local cache is single-owner state; the worker keeps
+  m_allocationCache.
+- HeliosFrontendInvalidate (worker thread, in replay order): the
+  EmitCs(invalidateBuffer) and ThrottleDiscard half of MapBuffer.
+
+Nothing changes for callers that do not use the two entry points.
+
+diff --git a/src/d3d11/d3d11_context.cpp b/src/d3d11/d3d11_context.cpp
+index 568a20ce..5d4638b6 100644
+--- a/src/d3d11/d3d11_context.cpp
++++ b/src/d3d11/d3d11_context.cpp
+@@ -57,6 +57,15 @@ namespace dxvk {
+         memoryFlags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+     }
+ 
++    if (!IsDeferred) {
++      m_heliosFrontendCache = m_device->createAllocationCache(bufferUsage, memoryFlags);
++
++      if (heliosLocalAllocCacheFallback() && !m_heliosFrontendCache.isUsable()) {
++        m_heliosFrontendCache = m_device->createAllocationCache(bufferUsage,
++          memoryFlags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      }
++    }
++
+     // Determine maximum tess factor based on device options
+     if (!IsDeferred) {
+       int32_t maxTessFactor = int32_t(std::min(m_device->properties().core.properties.limits.maxTessellationGenerationLevel, 64u));
+diff --git a/src/d3d11/d3d11_context.h b/src/d3d11/d3d11_context.h
+index e55920b8..b61cdef5 100644
+--- a/src/d3d11/d3d11_context.h
++++ b/src/d3d11/d3d11_context.h
+@@ -1083,6 +1083,12 @@ namespace dxvk {
+ 
+     DxvkLocalAllocationCache    m_allocationCache;
+ 
++    // Helios threaded front end: the app-thread half of an immediate-context
++    // Map(WRITE_DISCARD) allocates from this cache, the worker thread that
++    // replays the context's calls owns m_allocationCache. A local cache is
++    // single-owner state; frees go to the allocator's shared cache.
++    DxvkLocalAllocationCache    m_heliosFrontendCache;
++
+     D3D11ShaderStageState<Rc<DxvkBuffer>> m_instanceData;
+ 
+     DxvkCsChunkRef AllocCsChunk();
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 3a090686..03917cb5 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -583,6 +583,41 @@ namespace dxvk {
+   }
+   
+   
++  Rc<DxvkResourceAllocation> D3D11ImmediateContext::HeliosFrontendDiscard(
++          D3D11Buffer*                pBuffer,
++          void**                      ppData) {
++    *ppData = nullptr;
++
++    if (unlikely(m_device->getDeviceStatus() != VK_SUCCESS))
++      return nullptr;
++
++    helios_feed::mapWriteDiscard();
++
++    auto slice = pBuffer->DiscardSlice(&m_heliosFrontendCache);
++    *ppData = slice->mapPtr();
++    return slice;
++  }
++
++
++  void D3D11ImmediateContext::HeliosFrontendInvalidate(
++          D3D11Buffer*                pBuffer,
++          Rc<DxvkResourceAllocation>&& Slice) {
++    D3D10DeviceLock lock = LockContext();
++
++    VkDeviceSize bufferSize = pBuffer->Desc()->ByteWidth;
++
++    EmitCs([
++      cBuffer      = pBuffer->GetBuffer(),
++      cBufferSlice = std::move(Slice)
++    ] (DxvkContext* ctx) mutable {
++      ctx->invalidateBuffer(cBuffer, std::move(cBufferSlice));
++    });
++
++    if (unlikely(bufferSize > DxvkPageAllocator::PageSize))
++      ThrottleDiscard(bufferSize);
++  }
++
++
+   HRESULT D3D11ImmediateContext::MapImage(
+           D3D11CommonTexture*         pResource,
+           UINT                        Subresource,
+diff --git a/src/d3d11/d3d11_context_imm.h b/src/d3d11/d3d11_context_imm.h
+index 3edc59b5..5201740a 100644
+--- a/src/d3d11/d3d11_context_imm.h
++++ b/src/d3d11/d3d11_context_imm.h
+@@ -133,6 +133,34 @@ namespace dxvk {
+     // Capture the existing flush boundary once. A vehicle copy retains this
+     // value across pending waits; waiting must never flush or move its target.
+     uint64_t HeliosFlushFrame();
++
++    /**
++     * \brief Helios threaded front end: app-thread half of Map(WRITE_DISCARD)
++     *
++     * The UMD's threaded front end answers a dynamic buffer's discard map on
++     * the app thread and replays everything else on its worker thread, which
++     * is the only thread that otherwise enters this context. This is the
++     * part of MapBuffer(WRITE_DISCARD) that must answer now: a new backing
++     * slice from the front-end allocation cache, made the buffer's current
++     * mapped slice. Touches no context state besides that cache.
++     * \param [in] pBuffer A buffer with a CPU-visible map mode
++     * \param [out] ppData The slice's mapped pointer
++     * \returns The slice, or null when the device is lost
++     */
++    Rc<DxvkResourceAllocation> HeliosFrontendDiscard(
++            D3D11Buffer*                pBuffer,
++            void**                      ppData);
++
++    /**
++     * \brief Helios threaded front end: worker half of Map(WRITE_DISCARD)
++     *
++     * Queues the rename of \c pBuffer to \c Slice for the CS thread, in the
++     * order of the worker's replay, and throttles large discards exactly as
++     * MapBuffer does.
++     */
++    void HeliosFrontendInvalidate(
++            D3D11Buffer*                pBuffer,
++            Rc<DxvkResourceAllocation>&& Slice);
+     VkResult HeliosWaitSubmissionComplete(uint64_t SubmissionId, uint64_t TimeoutUs);
+ 
+     /**

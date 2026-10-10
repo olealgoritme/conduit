@@ -1800,6 +1800,60 @@ void HeliosDxvkDevice::feed_trace_present_callback(
   dxvk::helios_feed::umdPresentCallback(duration_ns);
 }
 
+// Threaded front end: the two halves of a dynamic buffer's Map(WRITE_DISCARD)
+// (third_party/patches/dxvk/0018). The slice token is one manual reference on
+// the DxvkResourceAllocation, handed across the ring as an integer.
+std::size_t HeliosDxvkDevice::fe_map_discard(std::size_t buffer_ptr,
+                                             std::size_t* data) const noexcept {
+  *data = 0;
+  return bridge_guard("fe_map_discard", std::size_t(0), [&]() -> std::size_t {
+    if (!impl || !impl->context || !buffer_ptr)
+      return 0;
+    auto* buffer = static_cast<dxvk::D3D11Buffer*>(reinterpret_cast<ID3D11Buffer*>(buffer_ptr));
+    if (buffer->GetMapMode() == dxvk::D3D11_COMMON_BUFFER_MAP_MODE_NONE) {
+      *data = 1; // not mappable: the caller takes the synchronous map
+      return 0;
+    }
+    void* ptr = nullptr;
+    dxvk::Rc<dxvk::DxvkResourceAllocation> slice =
+      static_cast<dxvk::D3D11ImmediateContext*>(impl->context)->HeliosFrontendDiscard(buffer, &ptr);
+    if (slice == nullptr || !ptr)
+      return 0;
+    slice->incRef();
+    *data = reinterpret_cast<std::size_t>(ptr);
+    return reinterpret_cast<std::size_t>(slice.ptr());
+  });
+}
+
+std::size_t HeliosDxvkDevice::fe_buffer_map_ptr(std::size_t buffer_ptr) const noexcept {
+  if (!buffer_ptr)
+    return 0;
+  auto* buffer = static_cast<dxvk::D3D11Buffer*>(reinterpret_cast<ID3D11Buffer*>(buffer_ptr));
+  return reinterpret_cast<std::size_t>(buffer->GetMapPtr());
+}
+
+void HeliosDxvkDevice::fe_emit_invalidate(std::size_t buffer_ptr, std::size_t slice) const noexcept {
+  bridge_guard("fe_emit_invalidate", 0, [&]() -> int {
+    if (!slice)
+      return 0;
+    auto* allocation = reinterpret_cast<dxvk::DxvkResourceAllocation*>(slice);
+    // Adopt the manual reference: Rc's constructor adds one, decRef drops ours.
+    dxvk::Rc<dxvk::DxvkResourceAllocation> owned(allocation);
+    allocation->decRef();
+    if (!impl || !impl->context || !buffer_ptr)
+      return 0;
+    auto* buffer = static_cast<dxvk::D3D11Buffer*>(reinterpret_cast<ID3D11Buffer*>(buffer_ptr));
+    static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
+      ->HeliosFrontendInvalidate(buffer, std::move(owned));
+    return 0;
+  });
+}
+
+void HeliosDxvkDevice::fe_release_slice(std::size_t slice) const noexcept {
+  if (slice)
+    reinterpret_cast<dxvk::DxvkResourceAllocation*>(slice)->decRef();
+}
+
 bool HeliosDxvkDevice::recycle_deferred_command_list(
     std::size_t deferred_context_ptr,
     std::size_t command_list_ptr) const noexcept {

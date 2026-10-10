@@ -44,6 +44,23 @@ mod ffi {
         fn feed_trace_timestamp_ns(self: &HeliosDxvkDevice) -> u64;
         fn feed_trace_render_callback(self: &HeliosDxvkDevice, duration_ns: u64);
         fn feed_trace_present_callback(self: &HeliosDxvkDevice, duration_ns: u64);
+        /// Threaded front end, `docs/d3d11-threaded-frontend.md` §5.2.
+        ///
+        /// # Safety
+        /// `buffer_ptr` is a live `ID3D11Buffer*` of a CPU-writable buffer.
+        /// The returned slice token (0 = failure) must be consumed exactly once
+        /// by `fe_emit_invalidate` or `fe_release_slice`.
+        unsafe fn fe_map_discard(self: &HeliosDxvkDevice, buffer_ptr: usize, data: *mut usize) -> usize;
+        /// # Safety
+        /// `buffer_ptr` is a live `ID3D11Buffer*`.
+        unsafe fn fe_buffer_map_ptr(self: &HeliosDxvkDevice, buffer_ptr: usize) -> usize;
+        /// # Safety
+        /// `buffer_ptr` is a live `ID3D11Buffer*`; `slice` is a token from
+        /// `fe_map_discard`, consumed here. Worker thread only.
+        unsafe fn fe_emit_invalidate(self: &HeliosDxvkDevice, buffer_ptr: usize, slice: usize);
+        /// # Safety
+        /// `slice` is an unconsumed token from `fe_map_discard`.
+        unsafe fn fe_release_slice(self: &HeliosDxvkDevice, slice: usize);
         /// # Safety
         /// `deferred_context_ptr` is borrowed and live. `command_list_ptr`
         /// transfers one owned COM reference on true; false leaves ownership
@@ -713,6 +730,17 @@ impl PresentStreamCorrelation {
     }
 }
 
+/// What the app-thread half of a front-end discard map produced.
+pub(crate) enum FrontendDiscard {
+    /// A new slice: `slice` is the token the worker hands back to
+    /// `fe_emit_invalidate`, `data` its mapped pointer.
+    Slice { slice: usize, data: usize },
+    /// The buffer has no CPU mapping: take the synchronous map.
+    NotMappable,
+    /// The device is lost.
+    DeviceLost,
+}
+
 /// The DXVK bridge device, with the raw cxx surface sealed off.
 pub struct BridgeDevice {
     inner: cxx::UniquePtr<ffi::HeliosDxvkDevice>,
@@ -758,6 +786,50 @@ impl BridgeDevice {
         // its whole life (see `context_ptr`); ManuallyDrop borrows it.
         (p != 0)
             .then(|| ManuallyDrop::new(unsafe { ID3D11DeviceContext::from_raw(p as *mut c_void) }))
+    }
+
+    /// App-thread half of a dynamic buffer's `Map(WRITE_DISCARD)`.
+    ///
+    /// # Safety
+    /// See the `ffi` declaration.
+    pub(crate) unsafe fn fe_map_discard(&self, buffer_ptr: usize) -> FrontendDiscard {
+        let Some(d) = self.get() else {
+            return FrontendDiscard::DeviceLost;
+        };
+        let mut data = 0usize;
+        let slice = unsafe { d.fe_map_discard(buffer_ptr, &mut data) };
+        match (slice, data) {
+            (0, 1) => FrontendDiscard::NotMappable,
+            (0, _) => FrontendDiscard::DeviceLost,
+            (slice, data) if data > 1 => FrontendDiscard::Slice { slice, data },
+            (slice, _) => {
+                unsafe { d.fe_release_slice(slice) };
+                FrontendDiscard::DeviceLost
+            }
+        }
+    }
+
+    /// # Safety
+    /// See the `ffi` declaration.
+    pub(crate) unsafe fn fe_buffer_map_ptr(&self, buffer_ptr: usize) -> usize {
+        self.get().map_or(0, |d| unsafe { d.fe_buffer_map_ptr(buffer_ptr) })
+    }
+
+    /// # Safety
+    /// See the `ffi` declaration.
+    pub(crate) unsafe fn fe_emit_invalidate(&self, buffer_ptr: usize, slice: usize) {
+        match self.get() {
+            Some(d) => unsafe { d.fe_emit_invalidate(buffer_ptr, slice) },
+            None => {}
+        }
+    }
+
+    /// # Safety
+    /// See the `ffi` declaration.
+    pub(crate) unsafe fn fe_release_slice(&self, slice: usize) {
+        if let Some(d) = self.get() {
+            unsafe { d.fe_release_slice(slice) }
+        }
     }
 
     /// # Safety

@@ -81,7 +81,14 @@ helper devices).
   Spins briefly, then sleeps on a condvar the worker signals after each batch while anyone waits.
 - **Backpressure**: a producer that finds no room waits for the worker (spin, then the same condvar). Memory is bounded
   by the ring; a record larger than a quarter of the ring is never built (the call takes the synchronous path).
-- **Thread identity**: the worker stores its thread id; `is_worker()` is a TEB read + compare.
+- **Thread identity**: `is_worker()` is a thread-local read + compare.
+- **Process exit**: if `DestroyDevice` runs after process termination has killed the worker
+  (`RtlDllShutdownInProgress`), waits return and shutdown neither joins nor replays.
+
+A device gets a front end only when the knob says so, FREETHREADED caps are on (with caps 0 the runtime serialises
+`Create*`/`Destroy*` with the immediate context; a worker would quietly undo that kill switch), and the app did not
+create it with `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`
+(`D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION`).
 
 ## 4. Call classes
 
@@ -91,8 +98,8 @@ Every immediate-context entry point is in exactly one class.
 |---|---|---|
 | **deferred** | snapshot args, push a closure, return | `*SetShader`, `*SetConstantBuffers{,1}`, `*SetShaderResources`, `*SetSamplers`, IA binds, `SetRenderTargets`, viewports/scissors, blend/depth/raster state, `CsSetUnorderedAccessViews`, `SoSetTargets`, `SetPredication`, all draws and dispatches, clears, `Discard`, `ClearView`, copies, resolve, `GenMips`, `CopyStructureCount`, `QueryBegin/End`, buffer `UpdateSubresourceUP`, `Flush` (no shared resources), `CommandListExecute` (phase 2; synchronous in phase 1) |
 | **split** | answer now, defer the rest | `Map(WRITE_DISCARD/NO_OVERWRITE)` of a dynamic buffer and its `Unmap`, `QueryGetData`, object destruction |
-| **synchronous** | `drain()`, then the unchanged forward call on the app thread | `Map` of everything else (staging, `READ`, `WRITE`, textures), texture `UpdateSubresourceUP`, all DXGI DDIs (`Present`, `Present1`, `Blt`, `RotateResourceIdentities`, `SetDisplayMode`, `ResolveSharedResource`, residency, offer/reclaim), `Flush` with shared resources, tiled-resource DDIs, markers, hardware protection, `AcquireResource/ReleaseResource`, shader cache session binds, video DDIs, resource destruction |
-| **device-level** | unchanged, inline, concurrent with the worker | `Create*`, `Open*`, `Calc*`, `Check*`, `RetrieveSubObject`, `RelocateDeviceFuncs` |
+| **synchronous** | `drain()`, then the unchanged forward call on the app thread | `Map` of everything else (staging, `READ`, `WRITE`, textures), texture `UpdateSubresourceUP`, the DXGI DDIs that order against rendering (`Present`, `Present1`, MPO presents, `Blt`, `Blt1`, `RotateResourceIdentities`, `SetDisplayMode`, `ResolveSharedResource`, offer/reclaim), `Flush` with shared resources, `Discard` of a buffer, `AcquireResource/ReleaseResource`, `CommandListExecute` (phase 1), resource destruction (waits for the worker, then runs on the calling thread); tiled-resource DDIs, markers and video DDIs through the safety net |
+| **device-level** | unchanged, inline, concurrent with the worker | `Create*`, `Open*`, `Calc*`, `Check*`, `RetrieveSubObject`, `RelocateDeviceFuncs`, the free-threaded `RecycleDestroyCommandList` / `RecycleCreate*`, the caps-only DXGI DDIs |
 
 Device-level calls already run concurrently with the immediate context under `UmdFreeThreaded` (FREETHREADED caps),
 so their thread-safety is not new. Moving immediate-context work from the app thread to the worker does not change
@@ -102,6 +109,13 @@ which data is shared between threads, only which thread does the immediate-conte
 context) drains the frontend first when it is called on a thread other than the worker. Any immediate-context path
 that was not classified, or that a future change adds, degrades to synchronous instead of racing the worker. The
 deliberate app-thread exceptions (`GetData`, the split map) do not go through it.
+
+Its limits: a drain on a thread that is not the producer does not keep the producer from queueing more afterwards,
+so it only orders the producer thread's own paths; and bridge entry points that use DXVK's immediate context
+directly (`present_frame_gate`, `flush_gate_point`, `handoff_publish`, `rotate_resource_backings`,
+`dxgi_blt_convert`, `publish_present_order`, the present copy/snapshot/vehicle calls, `wait_submitted`) bypass it.
+All of those sit on paths whose wrappers drain explicitly (DXGI, the shared-resource flush), which is the actual
+guarantee; the net is the backstop for the rest.
 
 **Runtime callbacks never run on the worker.** `pfnRenderCb`, `pfnPresentCb`, `pfnAllocateCb/DeallocateCb`,
 `pfnLockCb`, residency callbacks and `pfnEscapeCb` are only called from inside a DDI call on the calling thread; every
@@ -117,12 +131,14 @@ Only the immediate context is threaded. Deferred contexts (DCs) already record o
 `D3D11DeferredContext` through their own funcs tables (`deferred.rs`); those tables are filled independently of the
 device table and get no wrappers. A DC's calls never reach the frontend's ring.
 
-`CommandListExecute` on the immediate context is deferred from phase 2 on (phase 1 drains and runs it inline). The record holds its own reference to the command list
+`CommandListExecute` on the immediate context is deferred from phase 2 on (phase 1 drains and runs it inline, so no
+execute is ever queued when a list is recycled). The record holds its own reference to the command list
 (AddRef at record time, Release after replay), and the frontend remembers the ring position of the latest execute.
 The BUILD_2 recycle path (`RecycleCommandList` on a DC hands an escrowed list to DXVK's cache, which resets it) first
 waits until the worker has passed that position, so a list is never reset while an execute of it is still queued.
-`RecycleDestroyCommandList` / `RecycleCreateCommandList` / `RecycleCreateDeferredContext` on the immediate context are
-synchronous. `DestroyCommandList` goes through the destruction path (§5.5).
+`RecycleDestroyCommandList` / `RecycleCreateCommandList` / `RecycleCreateDeferredContext` are free-threaded and stay
+device-level. `DestroyCommandList` goes through the destruction path (§5.5). `QueryEnd`s inside an executed list do
+not stamp `end_pos`; DXVK's own query reset counter covers that today and must be rechecked with phase 2.
 
 ### 5.2 Map / Unmap
 
@@ -161,6 +177,11 @@ frontend on, the immediate context's `Map` of a dynamic buffer only ever runs on
 `UpdateSubresourceUP` whose destination is a dynamic buffer are routed synchronous, so `m_mapPtr` of a dynamic buffer
 has a single writer at a time.
 
+Slices handed out ahead of the worker are memory the ring does not bound: the app thread counts the bytes of
+discards the worker has not passed to DXVK yet and drains above 64 MiB (DXVK's `ThrottleDiscard` bounds them from
+there). A dynamic buffer without a CPU mapping (`D3D11_COMMON_BUFFER_MAP_MODE_NONE`) takes the synchronous map; a
+lost device answers a null pointer and `D3DDDIERR_DEVICEREMOVED` (legal for `Map`).
+
 The pre-renamed slice ring (the worker refills a small per-buffer pool of slices so the app thread does not even
 allocate) is phase 3; phase 1 allocates on the app thread from its own cache.
 
@@ -179,17 +200,22 @@ allocate) is phase 3; phase 1 allocates on the app thread from its own cache.
 ### 5.4 Queries, predicates, GetData
 
 - `QueryBegin`, `SetPredication`: deferred.
-- `QueryEnd`: deferred; the wrapper stamps the record's end position into the query's own handle region
-  (`QueryPrivate` gains `end_pos`), which only the immediate context reads.
+- `QueryBegin`, `QueryEnd`: deferred; the wrapper stamps the record's end position into the query's own handle
+  region (`QueryPrivate` gains `end_pos`), which only the immediate context reads. Stamping Begin too keeps a GetData
+  from reaching DXVK between a queued Begin and its End (DXVK would answer `DXGI_ERROR_INVALID_CALL`, which the
+  forward code reports as device removed).
 - `QueryGetData` (split, app thread):
-  - if the worker has not yet replayed the query's latest `End` (`done < end_pos`), answer "still drawing"
+  - if the worker has not yet replayed the query's latest `Begin`/`End` (`done < end_pos`), answer "still drawing"
     (`DXGI_DDI_ERR_WASSTILLDRAWING`) without touching DXVK; S_FALSE is always a legal answer and the worker keeps
     making progress on its own;
   - otherwise call DXVK's `GetData` on the app thread **with `DONOTFLUSH`**: DXVK reads the query status lock-free
     from the query object, which its CS thread updates, so this is safe concurrently with the worker;
   - when the app did not pass `DONOTFLUSH` and the answer is pending, the flush DXVK would have done
-    (`NotifyStall` + `ConsiderFlush`) is deferred instead: one "query flush" record per `End` (the region remembers the
-    last end position it hinted for) replays `GetData(query, nullptr, 0, 0)` on the worker.
+    (`NotifyStall` + `ConsiderFlush`) is deferred instead: a "query flush" record replays
+    `GetData(query, nullptr, 0, 0)` on the worker. `ConsiderFlush` may decline (few chunks, submissions in flight),
+    and upstream DXVK recovers because every pending poll asks again, so every unflagged pending poll queues a new
+    hint once the worker has run the previous one (the region remembers the last hint's position): at most one is
+    outstanding per query, and a `while (GetData(q) == S_FALSE) {}` loop keeps asking exactly as it does today.
 - A GetData `S_OK` for an event query still means "all work before End finished on the GPU": DXVK can only report it
   after replaying End, which the worker reaches after every record before it.
 
@@ -222,14 +248,16 @@ before `Create*` returns, and every later record snapshots it. Binding is deferr
 
 ### 5.7 Flush
 
-`pfnFlush` without cross-process shared resources is deferred (the worker calls `ID3D11DeviceContext::Flush`); the
+`pfnFlush` without cross-process shared resources is deferred, and the record calls only
+`ID3D11DeviceContext::Flush` — never the forward `flush`, which re-reads the shared-resource list and could run the
+flush gate (with `pfnRenderCb`) on the worker if another thread opened a shared resource in between. The
 device-removed check and `scanout_acquire::retry_register` stay on the app thread. With shared resources
 (`nvk_keyed_resources` non-empty) the flush gate's ordering is a synchronous contract (the runtime releases the keyed
 mutex right after `pfnFlush` returns, and the gate may call `pfnRenderCb`), so it drains and runs inline.
 
 ### 5.8 Present, SetFullscreen, ResizeBuffers, the KMD present path
 
-All DXGI DDIs drain and run inline. At `Present` the worker has replayed every record of the frame into DXVK, so the
+Every DXGI DDI that orders against rendering drains and runs inline. At `Present` the worker has replayed every record of the frame into DXVK, so the
 present path sees exactly the state it sees today: `present_frame_gate` orders against DXVK's submission, the KMD
 present (Blt / flip / `pfnPresentCb`), the scan-out snapshot, the Helios scan-out acquire (armed by DXVK at submit),
 and the present-stream correlation are unchanged. `SetFullscreen` (`SetDisplayMode`), `ResizeBuffers` (destroys +
@@ -248,11 +276,12 @@ synchronous, so region-keyed registries keep working.
 
 ### 5.10 Errors and device removal
 
-`set_runtime_error` called on the worker (a deferred forward function failing: out of memory, an invalid query handle,
-…) stores the HRESULT in the frontend (device-removed wins over out-of-memory) instead of calling `pfnSetErrorCb`,
-which is only valid inside a DDI call. Every wrapper checks the stash on entry (one relaxed load) and reports it on
-the app thread through the device's `pfnSetErrorCb`; the runtime then fails the API call that is in progress, which is
-the closest legal point. `report_if_removed` in `Flush` and `Present` stays on the app thread, as does every DXGI-level
+`set_runtime_error` called on the worker (a deferred forward function failing) stores the HRESULT in the frontend
+instead of calling `pfnSetErrorCb`, which is only valid inside a DDI call. Every wrapper checks the stash on entry
+(one relaxed load). Most immediate-context DDIs may only report `D3DDDIERR_DEVICEREMOVED` (anything else is a
+critical error to the runtime), so only that is reported, on the app thread through the device's `pfnSetErrorCb`;
+other stashed errors are counted, logged and dropped. In `GetData` and `Map` a stashed removal wins over "still
+drawing" / a mapping. `report_if_removed` in `Flush` and `Present` stays on the app thread, as does every DXGI-level
 removed check.
 
 ### 5.11 Multithreaded apps
@@ -300,7 +329,24 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
   (`HELIOS_D3D11_FRONTEND=0/1` in the same package), default shape `10 2000 2 8 256`, plus a 4000-draw run.
 - CS2 (by the owner): fps and the render-thread profile (`thread-sample.ps1`), worker thread share, `dxvk-cs` share.
 
-## 10. Risks
+## 10. Review
+
+An independent review of this design (before implementation) found, and the design above now handles:
+
+- a deferred `Flush` replaying the forward `flush`, which could run the shared-resource gate (`pfnRenderCb`, the
+  `Cell` command windows) on the worker → the record calls only `ID3D11DeviceContext::Flush` (§5.7);
+- one GetData flush hint per `End` can leave a spinning app hung when `ConsiderFlush` declines → re-hint per pending
+  poll, one outstanding (§5.4);
+- the safety net is not the guarantee (bridge entry points use the context directly) → explicit drains on every DXGI
+  and shared-resource path (§4);
+- a GetData between a queued Begin and its End reported as device removed → Begin stamps too (§5.4);
+- stashed errors other than device removal are not reportable from arbitrary DDIs → dropped and counted (§5.10);
+- discarded slices not bounded by the ring → a 64 MiB outstanding-discard bound; map-mode check; device-lost answer
+  (§5.2);
+- process-exit hang, `DISABLE_EXTRA_THREAD_CREATION`, `UmdFreeThreaded=0` (§3);
+- the recycle DDIs are free-threaded, `Discard` of a host-visible buffer writes `m_mapPtr` (§4, §5.1).
+
+## 11. Risks
 
 - A forward function that keeps hidden per-thread state or calls a runtime callback from a deferred path. Audited:
   the only `thread_local!` is the dcomp vehicle slot (present path, synchronous); callbacks are listed in §4.
