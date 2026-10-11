@@ -30,8 +30,9 @@ another. Each `SYN_REPORT` the viewer sends becomes one report in the guest.
 
 A device takes input only while its guest driver runs it: the event queue
 is live and the driver has posted buffers. Before that, and after a reset
-or a driver unload, its input goes to the boot console. A release always
-goes where its press went, so a key held across a switch never sticks.
+or a driver unload, its input goes to the boot console. A key's repeats
+and its release always go where its press went, so a key held across a
+switch never sticks.
 Losing the grab lets go of the mouse buttons held under it. The viewer
 releases everything on focus loss, and the backend does the same when a
 viewer disconnects.
@@ -69,8 +70,42 @@ Outside socket activation, `--input-socket KIND=PATH` serves one.
   (`guest/windows/ci/windows/Get-VirtioInput.ps1`) and installed by the
   Windows package. By hand: `pnputil /add-driver vioinput.inf /install`.
   The devices appear after the VM's next start.
+  `vioinput` keeps one value per axis until the `SYN_REPORT` and hands the
+  report up only if Windows' HID class has a read waiting. A report with
+  no read waiting loses its motion. The `|dx|` comparison under
+  "Measuring" shows whether any were lost.
 
 ## Measuring
+
+### Report rate
+
+Two tools count reports at each end. Build both with `make input-tools`
+(into `target/input-tools`; `rawcount.exe` needs mingw-w64).
+
+* `host/latency/vmouse.c` creates a uinput mouse and keyboard. It presses
+  Ctrl+Alt+G (the viewer's grab) and moves in circles at a fixed rate, one
+  `SYN_REPORT` per report like a real mouse. Then it presses Ctrl+Alt+G
+  again. Each second it prints the reports sent and their `|dx|` and
+  `|dy|` sums. It needs write access to `/dev/uinput`, and the viewer
+  window must have the focus.
+* `guest/windows/tools/rawcount.c` registers for raw mouse input with
+  `RIDEV_INPUTSINK`, so it counts in the background. Each second it prints
+  the reports Windows delivered, their `|dx|` and `|dy|` sums, the longest
+  gap between two reports, and a count per device. The device names (PS/2
+  mouse, Conduit Mouse, ...) go to stderr when first seen.
+
+```
+# guest, started first
+rawcount.exe 20
+# host, with the viewer focused
+target/input-tools/vmouse 10 1000
+```
+
+Each guest line should match a host line: 1000 reports/s, the same `|dx|`
+and `|dy|`, and the counts on the Conduit Mouse's column. The backend's
+10 s count line shows the same reports on its side.
+
+### Latency
 
 `host/latency/inputlat.py` measures from the viewer's `send()` to the guest
 kernel's event and to the guest's `read()`. It plays a viewer on the VM's
