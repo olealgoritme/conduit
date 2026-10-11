@@ -699,9 +699,9 @@ flip token [H `d3dkmthk.h:664-670`]) and the monitor's colour capability. Each i
   (572); and `DXGK_MULTIPLANEOVERLAYCAPS` / `DXGKARG_GETMULTIPLANEOVERLAYCAPS` (`MaxPlanes`, `MaxRGBPlanes`, `MaxYUVPlanes`, caps bits
   `Rotation`, `RotationWithoutIndependentFlip`, `VerticalFlip`, `HorizontalFlip`, `StretchRGB`, `StretchYUV`, `BilinearFilter`,
   `HighFilter`, `Shared`, `Immediate`, `Plane0ForVirtualModeOnly`; stretch/shrink factors, `:6672-6704`). All [HK].
-* The tree's claim that MPO3 "needs the 3.2 level" (`wddm_surface.rs:19-27`) is a statement about what DWM does at 3.2 (it fails
-  `E_NOTIMPL` on the unimplemented legacy present slot), measured, and is not contradicted by the headers; but the headers show the
-  MPO3 table slots exist from the WDDM 2.1 table on, so **what dxgkrnl requires of a 2.2+ adapter is not in the headers** (section 10.5).
+* `wddm_surface.rs:19-27` records what DWM does at 3.2 (it fails `E_NOTIMPL` on the unimplemented legacy present slot), measured.
+  The MPO3 table slots exist from the WDDM 2.1 table on, and `ScaledFlip` (section 14) fills them at 2.1 for one plane; **what
+  dxgkrnl requires of a 2.2+ adapter is not in the headers** (section 10.5).
 * `MaxOverlays`, overlay plane caps (RGB planes only: `MaxYUVPlanes` and `StretchYUV` stay 0, YUV overlay planes stay unreported
   until the KMD and host can show them; `shared-formats.md` "No overlay planes").
 * The KMD already refuses the first-generation MPO payload by name (`present_packet.rs:770-820`). The user-mode mirror is [H]: `D3DKMT_CHECKMULTIPLANEOVERLAYSUPPORT3`, `D3DKMT_MULTIPLANE_OVERLAY3`, `D3DKMT_PRESENT_MULTIPLANE_
