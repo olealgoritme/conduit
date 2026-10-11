@@ -45,6 +45,13 @@ static FOREIGN_OK: AtomicU32 = AtomicU32::new(0);
 static ANN_ADDR: AtomicU64 = AtomicU64::new(0);
 static ANN_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
+/// The announced, not yet confirmed flip: `(address, allocation handle)`, `(0, 0)` when none.
+/// Any IRQL (atomics).
+pub(crate) fn unconfirmed() -> (u64, usize) {
+    let h = ANN_HANDLE.load(Ordering::Acquire);
+    (ANN_ADDR.load(Ordering::Acquire), h)
+}
+
 /// Resources `ForeignFlip` accepted: `(generation << 32) | resource`, valid while the generation
 /// is [`GEN`]. 16 slots, replaced round robin.
 const TAB_N: usize = 16;

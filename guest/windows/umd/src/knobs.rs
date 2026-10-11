@@ -28,6 +28,8 @@
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
+//! | `UmdThreadedFrontend` | DWORD | `1` (threaded D3D11 front end: 0 = off, 1 = all but dwm.exe, 2 = all; env `HELIOS_D3D11_FRONTEND=0/1`) |
+//! | `UmdFrontendRingKiB` | DWORD | `4096` (its command ring, clamped 256..65536) |
 //! | `UmdDdiLevel` | DWORD | `0x10` (D3D11 DDI WDDM1.3; `0x24` adds WDDM2.3) |
 //! | `UmdDdiLevelDwm` | DWORD | `0x10` (the same, dwm.exe only) |
 //! | `UmdDdiAllowList` | REG_SZ | absent (`;`-separated executables that get WDDM2.3) |
@@ -362,6 +364,38 @@ pub(crate) fn umd_deferred_diagnostics() -> bool {
     UMD_DEFERRED_DIAGNOSTICS.get()
 }
 
+/// `UmdThreadedFrontend`: the D3D11 threaded front end
+/// (`docs/d3d11-threaded-frontend.md`). 0 = off, 1 (default) = on for every
+/// process except dwm.exe, 2 = on including dwm.exe.
+pub(crate) static UMD_THREADED_FRONTEND: DwordKnob = DwordKnob::new(c"UmdThreadedFrontend", 1);
+
+/// `UmdFrontendRingKiB`: the threaded front end's command ring per immediate
+/// context, KiB.
+pub(crate) static UMD_FRONTEND_RING_KIB: DwordKnob = DwordKnob::new(c"UmdFrontendRingKiB", 4096);
+
+/// Whether this process threads its immediate contexts: `HELIOS_D3D11_FRONTEND`
+/// (`0`/`1`) from the process environment wins over [`UMD_THREADED_FRONTEND`].
+/// Read once per process. A device created with
+/// `D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION` never gets one
+/// (checked at CreateDevice).
+pub(crate) fn threaded_frontend() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| match std::env::var("HELIOS_D3D11_FRONTEND").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => match UMD_THREADED_FRONTEND.get() {
+            0 => false,
+            1 => !is_dwm_process(),
+            _ => true,
+        },
+    })
+}
+
+/// [`UMD_FRONTEND_RING_KIB`], clamped, in bytes.
+pub(crate) fn frontend_ring_bytes() -> usize {
+    (UMD_FRONTEND_RING_KIB.get().clamp(256, 65536) as usize) * 1024
+}
+
 // --- NVK on RM (dxvk-on-nvk S3) ----------------------------------------------
 //
 // Which ICD a process runs on is decided in the bridge
@@ -524,6 +558,24 @@ pub(crate) fn nvk_rm_fence_present() -> bool {
     })
 }
 
+/// `NvkAsyncPresentFence` (`HKLM\\SOFTWARE\\Helios`, or
+/// `HELIOS_NVK_ASYNC_PRESENT_FENCE`): 1 (default) = a composed NVK present
+/// whose WDDM present carries an RM fence takes that fence for a value reserved
+/// at the Present call and signalled by DXVK's submission thread right after
+/// the frame's submission (helios_icd_interface version 8), so the presenting
+/// thread does not wait for DXVK's command-stream and submission threads
+/// (the SUBMITTED gate). 0 = the gate, then `queue_rm_fence_v3`, as before.
+/// An ICD without version 8 takes the gated path either way.
+pub(crate) static NVK_ASYNC_PRESENT_FENCE: BoolKnob = BoolKnob::new(c"NvkAsyncPresentFence", true);
+
+/// `NvkAsyncPresentFence`, or `HELIOS_NVK_ASYNC_PRESENT_FENCE` from the environment.
+pub(crate) fn nvk_async_present_fence() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_ASYNC_PRESENT_FENCE").unwrap_or_else(|| NVK_ASYNC_PRESENT_FENCE.get())
+    })
+}
+
 /// `NvkRmCopyRecord`, or `HELIOS_NVK_RM_COPY_RECORD` from the environment.
 pub(crate) fn nvk_rm_copy_record() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -534,7 +586,7 @@ pub(crate) fn nvk_rm_copy_record() -> bool {
 
 /// `DirectFlipSupport` (REG_DWORD), or `HELIOS_DIRECT_FLIP_SUPPORT` from the
 /// process environment: what the D3D11.1 `CheckDirectFlipSupport` DDI answers.
-/// 0 (default) = never; 1 = yes when dxgkrnl
+/// 0 = never; 1 = yes when dxgkrnl
 /// reports DirectFlip support for the Helios adapter (KMTQAITYPE_DIRECTFLIP_SUPPORT,
 /// i.e. the KMD's SupportDirectFlip cap) and the two resources have the same
 /// size and the same format (the 393.1 rule); 2 = yes whenever size and format match (test
@@ -543,8 +595,10 @@ pub(crate) fn nvk_rm_copy_record() -> bool {
 /// one mip, one slice). 3 was briefly the meaning of 1 (driver 388.1). 4 = the same as 1
 /// (the exact-format rule; kept for the 405.8 rows). 5 = as 1, but two different 8-bit scan-out
 /// formats also pair (an R8G8B8A8 game on the B8G8R8A8 desktop,
-/// `helios_umd_common::format::direct_flip_formats_compatible`): opt-in, because on 405.8 a
-/// promoted R8G8B8A8 CS2 swap chain froze after one frame (docs/independent-flip.md 13.10).
+/// `helios_umd_common::format::direct_flip_formats_compatible`): the default since 405.49, so an
+/// R8G8B8A8 game such as CS2 is promoted too. (405.8's freeze of a promoted R8G8B8A8 CS2 swap
+/// chain was the missing hardware pointer, docs/independent-flip.md 13.10; 1 is the strict
+/// equal-format rule.)
 /// Windows decides independent flip and the blt-to-flip swap-effect upgrade
 /// partly from this answer.
 pub(crate) fn direct_flip_support() -> u32 {
@@ -554,9 +608,9 @@ pub(crate) fn direct_flip_support() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .or_else(|| helios_umd_common::knobs::reg_dword(c"DirectFlipSupport"))
-            // 0 again (405.9): with 1 and the KMD's `IndepFlip` 1 a promoted CS2 swap chain
-            // froze after one frame (docs/independent-flip.md 13.10). 1 opts in.
-            .unwrap_or(0)
+            // 5 (405.49), with the KMD's `IndepFlip` 1: full-screen flip-model games, R8G8B8A8
+            // ones included, are promoted instead of composed. 0 opts out, 1 is the strict rule.
+            .unwrap_or(5)
     })
 }
 

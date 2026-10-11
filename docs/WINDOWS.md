@@ -92,7 +92,7 @@ one CCD made no measurable difference.
 
 The driver package is the WDDM KMD, the x64/x86 D3D11 and D3D12 UMDs, NVK on
 RM with librmclient (64- and 32-bit) and Zink. The current version is
-22.22.405.24 (`guest/windows/kmd_render/driver-version.env`, the only place
+22.22.405.63 (`guest/windows/kmd_render/driver-version.env`, the only place
 the version is set). The adapter shows as "Conduit Helios", the monitor as
 "Conduit".
 
@@ -147,12 +147,16 @@ Off by default while new; each one was measured on the test machine
 | Host | `conduit config set venus.guest_blobs true` | the backend serves guest-memory blobs (`--venus-guest-blobs`, [VENUS.md](VENUS.md) "Guest-memory blobs"): Venus copy destinations over the guest's own pages, for the KMD's windowed Present. Applies when the VM's backend next starts. Needs the patched virglrenderer (patch 0002) |
 | Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). Use with `ForeignFlip=1` |
 | Guest, KMD service key | `ForeignFlip` = 1 | the KMD flips the NVK DWM's swap-chain buffers to the scanout itself, zero-copy. Read at adapter start (`pnputil /restart-device`) |
-| Guest, `HKLM\SOFTWARE\Helios` | `DirectFlipSupport` (default 0; or `HELIOS_DIRECT_FLIP_SUPPORT` per process) | what the D3D11.1 `CheckDirectFlipSupport` DDI answers, which DWM uses for independent flip: 0 = never; 1 = yes when dxgkrnl reports DirectFlip for the adapter and size and format match; 3 = as 1 and only for formats the KMD scans out as they are; 5 = as 1, and two different 8-bit scan-out formats also pair; 2 = whenever size and format match (test lever). Use 1 together with `IndepFlip=1` |
-| Guest, KMD service key | `IndepFlip` (default 0; 2 also completes the unregistered DMA flip instead of failing it) | independent flip: a borderless full-screen flip-model window is scanned out from its own buffers ("Hardware: Independent Flip") instead of being composed. Advertises `SupportDirectFlip`, the segment `DirectFlip` flag and `FlipIndependent \| DdiPresentForIFlip`, and counts every flip (`Idf*`). Read at StartDevice; reboot per change. `HwCursor`, when not set, follows it (the hardware cursor is on with independent flip, off without). [independent-flip.md](../guest/windows/docs/independent-flip.md) sections 11 and 13 |
 
-On by default, with a way back: `NvkRmFencePresent` (composed NVK presents
-retire on the RM fence; 0, or `HELIOS_NVK_RM_FENCE_PRESENT=0`, restores the
-CPU wait).
+On by default, with a way back:
+
+| Where | Setting | What it does |
+|---|---|---|
+| Guest, KMD service key | `IndepFlip` (default 1; 0 off; 2 also completes the unregistered DMA flip instead of failing it) | independent flip: a borderless or exclusive full-screen flip-model window is scanned out from its own buffers ("Hardware: Independent Flip") instead of being composed. Advertises `SupportDirectFlip`, the segment `DirectFlip` flag and `FlipIndependent \| DdiPresentForIFlip`, and counts every flip (`Idf*`). Read at StartDevice; reboot per change. `HwCursor`, when not set, follows it (the hardware cursor is on with independent flip, off without). [independent-flip.md](../guest/windows/docs/independent-flip.md) 13.10 |
+| Guest, `HKLM\SOFTWARE\Helios` | `DirectFlipSupport` (default 5; or `HELIOS_DIRECT_FLIP_SUPPORT` per process) | what the D3D11.1 `CheckDirectFlipSupport` DDI answers, which DWM uses for independent flip: 5 = yes when dxgkrnl reports DirectFlip for the adapter and size and format match, two different 8-bit scan-out formats also pairing (an R8G8B8A8 game on the B8G8R8A8 desktop); 1 = the same with equal formats only; 3 = as 1 and only for formats the KMD scans out as they are; 2 = whenever size and format match (test lever); 0 = never |
+| Guest, KMD service key | `ImmFlip` (default 15, a bit mask) | immediate flips (interval 0, `ALLOW_TEARING`, MMIO `FlipImmediate`, and a promoted swap chain's flips) are sent to the host at once (bit 0), retired as soon as their address is published (bit 1), `FlipImmediateMmIo` is reported (bit 2), and promoted flips count as immediate (bit 3). 0 paces them like composed flips. [independent-flip.md](../guest/windows/docs/independent-flip.md) 13.10 |
+| Guest, `HKLM\SOFTWARE\Helios` | `UmdThreadedFrontend` (default 1; or `HELIOS_D3D11_FRONTEND=0/1` per process) | the threaded D3D11 front end: a UMD worker thread replays the immediate context's DDI calls. 1 = every process except dwm.exe, 0 = off, 2 = including dwm.exe. [d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md) |
+| Guest, `HKLM\SOFTWARE\Helios` | `NvkRmFencePresent` (default 1; or `HELIOS_NVK_RM_FENCE_PRESENT`) | composed NVK presents retire on the RM fence; 0 restores the CPU wait |
 
 ## Display
 

@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sun, 11 Oct 2026 00:58:30 +0200
+Subject: [PATCH] util/disk_cache: the multi-file cache stands in for the
+ single-file and database caches on Windows
+
+Only the multi-file cache is implemented on Windows (patches-windows
+0026).  Steam starts every game it runs on a Mesa Vulkan driver with
+MESA_DISK_CACHE_SINGLE_FILE=1 and a per-game MESA_SHADER_CACHE_DIR (its
+shader pre-caching), so on Windows those games opened a single-file
+cache that cannot exist and ran with no shader cache at all: every
+pipeline of every launch was compiled again (Counter-Strike 2 under NVK:
+59 cache entries written in a session, none read).
+
+- On Windows a requested single-file or database cache is the multi-file
+  cache, in the requested directory (logged once).
+- No read-only Fossilize caches next to it on Windows
+  (MESA_DISK_CACHE_COMBINE_RW_WITH_RO_FOZ), which cannot open there.
+- A MESA_SHADER_CACHE_DIR that cannot be created falls back to the
+  default directory (%LOCALAPPDATA%, else %TEMP%) instead of disabling
+  the cache.
+
+Linux builds are unchanged.
+---
+ src/util/disk_cache.c    | 24 +++++++++++++++++++++++-
+ src/util/disk_cache_os.c | 12 ++++++++++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index ff6242a..b3db70e 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -243,6 +243,27 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
+       return NULL;
+    }
+ 
++#if DETECT_OS_WINDOWS
++   /* Only the multi-file cache is implemented on Windows.  Steam asks for
++    * the single-file one (MESA_DISK_CACHE_SINGLE_FILE=1, in its per-game
++    * MESA_SHADER_CACHE_DIR) for every game it starts on a Mesa driver, and a
++    * cache that cannot open is no cache at all: every shader of every launch
++    * was compiled again.  Keep the requested directory, store the entries as
++    * single files.
++    */
++   if (cache_type != DISK_CACHE_MULTI_FILE) {
++      static bool logged;
++      if (!logged) {
++         logged = true;
++         mesa_logi("disk cache: %s cache requested, using the multi-file "
++                   "cache (the only one on Windows)",
++                   cache_type == DISK_CACHE_SINGLE_FILE ? "single-file"
++                                                        : "database");
++      }
++      cache_type = DISK_CACHE_MULTI_FILE;
++   }
++#endif
++
+    max_size_str = os_get_option("MESA_SHADER_CACHE_MAX_SIZE");
+ 
+    if (!max_size_str) {
+@@ -300,7 +321,8 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
+     * cache.  At first we will check cache entry presence in the RO caches and
+     * if entry isn't found there, then we'll fall back to the RW cache.
+     */
+-   if (cache_type != DISK_CACHE_SINGLE_FILE && !cache->path_init_failed &&
++   if (!DETECT_OS_WINDOWS &&
++       cache_type != DISK_CACHE_SINGLE_FILE && !cache->path_init_failed &&
+        debug_get_bool_option("MESA_DISK_CACHE_COMBINE_RW_WITH_RO_FOZ", false)) {
+ 
+       /* Create read-only cache used for sharing prebuilt shaders.
+diff --git a/src/util/disk_cache_os.c b/src/util/disk_cache_os.c
+index 8b31ca1..038cdf7 100644
+--- a/src/util/disk_cache_os.c
++++ b/src/util/disk_cache_os.c
+@@ -106,6 +106,7 @@ disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
+ #endif
+ 
+ #include "util/blob.h"
++#include "util/log.h"
+ #include "util/crc32.h"
+ #include "util/u_debug.h"
+ #include "util/ralloc.h"
+@@ -1235,9 +1236,20 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
+    }
+ 
+    if (path) {
++#if DETECT_OS_WINDOWS
++      /* A directory that cannot be created (Steam's per-game one on a
++       * drive the process may not write) falls back to the user's own.
++       */
++      const char *requested = path;
++      path = concatenate_and_mkdir(mem_ctx, requested, cache_dir_name, mkdir);
++      if (!path)
++         mesa_logw("disk cache: cannot use %s, using the default directory",
++                   requested);
++#else
+       path = concatenate_and_mkdir(mem_ctx, path, cache_dir_name, mkdir);
+       if (!path)
+          return NULL;
++#endif
+    }
+ 
+ #if DETECT_OS_WINDOWS
+-- 
+2.43.0
+

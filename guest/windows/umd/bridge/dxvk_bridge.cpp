@@ -1593,6 +1593,67 @@ std::int32_t HeliosDxvkDevice::nvk_present_fence_v3(std::size_t d3d11_resource_p
   });
 }
 
+std::int32_t HeliosDxvkDevice::nvk_present_fence_async(std::size_t d3d11_resource_ptr,
+                                                       std::uint32_t* fence_handle,
+                                                       std::uint64_t* value,
+                                                       std::uint8_t* copy,
+                                                       std::size_t copy_len) const noexcept {
+  return bridge_guard("nvk_present_fence_async", std::int32_t(3), [&]() -> std::int32_t {
+    *fence_handle = 0;
+    *value = 0;
+    if (copy_len != sizeof(helios_icd_rm_copy))
+      return 3;
+    std::memset(copy, 0, copy_len);
+    if (!impl || !impl->context || impl->device == nullptr
+     || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !(impl->icd.caps & HELIOS_ICD_CAP_RM_FENCE)
+     || !impl->icd.ecl_fence_reserve || !impl->icd.ecl_fence_create_v3
+     || !impl->icd.ecl_fence_signal)
+      return 3;
+    // This device's present timeline: the address of its bridge state,
+    // 2-aligned, owned for the device's life (vkd3d keys its ECL timelines
+    // with its command queues the same way).
+    const std::uint64_t key = reinterpret_cast<std::uintptr_t>(impl.get()) & ~std::uint64_t(1);
+    const VkDevice vk_device = impl->device->vkd()->device();
+    std::uint64_t v = 0;
+    if (key == 0 || impl->icd.ecl_fence_reserve(vk_device, key, &v) != VK_SUCCESS || v == 0)
+      return 3;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (d3d11_resource_ptr == 0
+     || !texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0) {
+      image = VK_NULL_HANDLE;
+      memory = VK_NULL_HANDLE;
+    }
+    helios_icd_rm_copy rc{};
+    std::uint32_t fence = 0;
+    const VkResult vr = impl->icd.ecl_fence_create_v3(vk_device, key, v, memory, image,
+                                                      &fence, &rc);
+    // A reserved value that is never signalled is covered by the next one.
+    if (vr < 0 || fence == 0)
+      return 3;
+    // The signal follows the frame on the queue; nobody waits for it here.
+    const auto signal = impl->icd.ecl_fence_signal;
+    const VkQueue queue = impl->device->queues().graphics.queueHandle;
+    auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    if (!immediateContext->HeliosSubmitFrameThen([signal, vk_device, queue, key, v] {
+          signal(vk_device, queue, key, v);
+        })) {
+      if (impl->icd.rm_fence_close)
+        impl->icd.rm_fence_close(vk_device, fence);
+      return 1;
+    }
+    *fence_handle = fence;
+    *value = v;
+    if (vr != VK_SUCCESS)
+      return 2;
+    std::memcpy(copy, &rc, sizeof(rc));
+    return 0;
+  });
+}
+
 void HeliosDxvkDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept {
   bridge_guard("nvk_rm_fence_close", false, [&]() -> bool {
     if (impl && fence_handle && impl->icd.rm_fence_close && impl->device != nullptr)
@@ -1798,6 +1859,60 @@ void HeliosDxvkDevice::feed_trace_render_callback(
 void HeliosDxvkDevice::feed_trace_present_callback(
     std::uint64_t duration_ns) const noexcept {
   dxvk::helios_feed::umdPresentCallback(duration_ns);
+}
+
+// Threaded front end: the two halves of a dynamic buffer's Map(WRITE_DISCARD)
+// (third_party/patches/dxvk/0018). The slice token is one manual reference on
+// the DxvkResourceAllocation, handed across the ring as an integer.
+std::size_t HeliosDxvkDevice::fe_map_discard(std::size_t buffer_ptr,
+                                             std::size_t* data) const noexcept {
+  *data = 0;
+  return bridge_guard("fe_map_discard", std::size_t(0), [&]() -> std::size_t {
+    if (!impl || !impl->context || !buffer_ptr)
+      return 0;
+    auto* buffer = static_cast<dxvk::D3D11Buffer*>(reinterpret_cast<ID3D11Buffer*>(buffer_ptr));
+    if (buffer->GetMapMode() == dxvk::D3D11_COMMON_BUFFER_MAP_MODE_NONE) {
+      *data = 1; // not mappable: the caller takes the synchronous map
+      return 0;
+    }
+    void* ptr = nullptr;
+    // One owned reference comes back; it becomes the token as is.
+    dxvk::DxvkResourceAllocation* slice =
+      static_cast<dxvk::D3D11ImmediateContext*>(impl->context)->HeliosFrontendDiscard(buffer, &ptr);
+    if (!slice)
+      return 0;
+    *data = reinterpret_cast<std::size_t>(ptr);
+    return reinterpret_cast<std::size_t>(slice);
+  });
+}
+
+std::size_t HeliosDxvkDevice::fe_buffer_map_ptr(std::size_t buffer_ptr) const noexcept {
+  if (!buffer_ptr)
+    return 0;
+  auto* buffer = static_cast<dxvk::D3D11Buffer*>(reinterpret_cast<ID3D11Buffer*>(buffer_ptr));
+  return reinterpret_cast<std::size_t>(buffer->GetMapPtr());
+}
+
+void HeliosDxvkDevice::fe_emit_invalidate(std::size_t buffer_ptr, std::size_t slice) const noexcept {
+  bridge_guard("fe_emit_invalidate", 0, [&]() -> int {
+    if (!slice)
+      return 0;
+    auto* allocation = reinterpret_cast<dxvk::DxvkResourceAllocation*>(slice);
+    // Adopt the manual reference: Rc's constructor adds one, decRef drops ours.
+    dxvk::Rc<dxvk::DxvkResourceAllocation> owned(allocation);
+    allocation->decRef();
+    if (!impl || !impl->context || !buffer_ptr)
+      return 0;
+    auto* buffer = static_cast<dxvk::D3D11Buffer*>(reinterpret_cast<ID3D11Buffer*>(buffer_ptr));
+    static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
+      ->HeliosFrontendInvalidate(buffer, std::move(owned));
+    return 0;
+  });
+}
+
+void HeliosDxvkDevice::fe_release_slice(std::size_t slice) const noexcept {
+  if (slice)
+    reinterpret_cast<dxvk::DxvkResourceAllocation*>(slice)->decRef();
 }
 
 bool HeliosDxvkDevice::recycle_deferred_command_list(

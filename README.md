@@ -28,7 +28,7 @@ from GPU memory to your screen: no copying, no video compression.
 | Clipboard both ways, sound (speakers + mic) | ✅ |
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
-| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, driver 22.22.405.24 built by hand: [Windows guests](#windows-guests)) |
+| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, driver 22.22.405.63 built by hand: [Windows guests](#windows-guests)) |
 | NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
 > Early software, tested mainly on an RTX 5090 with Ubuntu 24.04 and Hyprland;
@@ -99,7 +99,7 @@ More detail (building the driver yourself, knobs, troubleshooting):
 A Windows 11 guest renders on the host GPU through NVK-on-RM: Mesa's open
 NVK Vulkan driver runs in the guest and talks to the host's NVIDIA kernel
 driver (RM) through Conduit. Tested on an RTX 5090. Guest driver version:
-**22.22.405.24**.
+**22.22.405.63**.
 
 ```
  Windows guest
@@ -131,9 +131,11 @@ settings are environment variables of the process):
 
 | Knob | Default | What it does |
 |---|---|---|
-| `IndepFlip` (KMD service key) | 0 | independent flip for full-screen flip-model windows; 1 turns it on |
-| `DirectFlipSupport` (`HKLM\SOFTWARE\Helios`) | 0 | the D3D11.1 `CheckDirectFlipSupport` answer DWM uses for independent flip; 1 with `IndepFlip=1` |
+| `IndepFlip` (KMD service key) | 1 | independent flip for full-screen flip-model windows; 0 turns it off |
+| `DirectFlipSupport` (`HKLM\SOFTWARE\Helios`) | 5 | the D3D11.1 `CheckDirectFlipSupport` answer DWM uses for independent flip; 5 also pairs an R8G8B8A8 game with the B8G8R8A8 desktop, 1 is the equal-format rule, 0 never |
 | `HwCursor` (KMD service key) | follows `IndepFlip` | the hardware cursor; absent means on with independent flip, off without |
+| `ImmFlip` (KMD service key) | 15 | immediate flips (V-sync off, or a promoted swap chain) are neither paced nor held for the vsync tick; 0 paces them like composed flips |
+| `UmdThreadedFrontend` (`HKLM\SOFTWARE\Helios`) | 1 | the threaded D3D11 front end (a UMD worker thread) for every process except dwm.exe; 0 off, 2 includes dwm.exe |
 | `NVK_INDIRECT_PUSH` | 0 | indirect draw records through the pushbuffer |
 | `NVK_NULL_VB_ZERO_PAGE` | 1 | null vertex buffers bound to the zero page |
 | `NVK_ZERO_PAGE_VRAM` | 1 | the zero page (null descriptors) in VRAM |
@@ -152,12 +154,11 @@ settings are environment variables of the process):
 
 **Known limitations:**
 
-- The guest exposes one display mode at a time, set by `conduit up --display`,
-  `conduit view NAME WxH@HZ` or the viewer's window size. The driver does not
-  scale, so a game rendering below that mode does not fill the screen.
+- Every guest display mode runs at the native refresh rate. The guest offers
+  the VM's mode list: native (`conduit up --display`), the standard modes that
+  fit within it, and custom modes (`conduit display VM --add WxH`;
+  [docs/SCANOUT.md](docs/SCANOUT.md) "Mode list").
 - In games, use the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look.
-- Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):
-  full-screen games are composed by DWM.
 - The driver is test-signed (Secure Boot off, test-signing on), and the guest
   package is built and installed by hand.
 
