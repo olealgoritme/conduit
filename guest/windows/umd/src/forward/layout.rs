@@ -236,6 +236,11 @@ pub(crate) unsafe extern "system" fn destroy_element_layout(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             );
+            // Defensive, as for a destroyed VS: forget a released layout object.
+            let bound = dev.owned.bindings.bound_il_com.load(Ordering::Relaxed);
+            if owned.contains(&bound) {
+                dev.owned.bindings.bound_il_com.store(0, Ordering::Relaxed);
+            }
         }
         for cached in &owned {
             // SAFETY: each removed cache value owns one CreateInputLayout
@@ -300,10 +305,7 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((il_raw, vs_to_bind)) = memo.get(gen, lp, vp) {
-        if let Some(context) = d3d11_context(h) {
-            let il = ManuallyDrop::new(ID3D11InputLayout::from_raw(il_raw as *mut c_void));
-            context.IASetInputLayout(&*il);
-        }
+        bind_il_to(h, bindings, il_raw);
         bind_vs_to(h, bindings, vp, vs_to_bind);
         return;
     }
@@ -432,10 +434,7 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
             }
         }
     };
-    if let Some(context) = d3d11_context(h) {
-        let il = ManuallyDrop::new(ID3D11InputLayout::from_raw(il_raw as *mut c_void));
-        context.IASetInputLayout(&*il);
-    }
+    bind_il_to(h, bindings, il_raw);
 
     // VUID-Input-08733: the DDI never provides shader-input component types
     // (RegisterComponentType arrives 0/UNKNOWN — verified against both dwm's
@@ -562,6 +561,20 @@ pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) 
 
 /// Hand `desired` (the runtime's VS `vp` or its input-class variant) to
 /// DXVK's VSSetShader unless it is the one already bound on this context.
+/// Hand `il_raw` to DXVK's IASetInputLayout unless it is what this context
+/// last bound (`bound_il_com`): `bind_input_layout` runs on every draw.
+unsafe fn bind_il_to(h: Hdevice, bindings: &crate::device_funcs::CtxBindings, il_raw: usize) {
+    if bindings.bound_il_com.load(Ordering::Relaxed) == il_raw {
+        return;
+    }
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    let il = ManuallyDrop::new(ID3D11InputLayout::from_raw(il_raw as *mut c_void));
+    context.IASetInputLayout(&*il);
+    bindings.bound_il_com.store(il_raw, Ordering::Relaxed);
+}
+
 unsafe fn bind_vs_to(
     h: Hdevice,
     bindings: &crate::device_funcs::CtxBindings,

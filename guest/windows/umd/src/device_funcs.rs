@@ -265,6 +265,7 @@ impl BridgeOwned {
         self.present_src_cache.get_mut().clear();
         *self.snapshot_rings.get_mut() = SnapshotRingCache::default();
         self.bindings.bound_vs_com.store(0, Ordering::Relaxed);
+        self.bindings.bound_il_com.store(0, Ordering::Relaxed);
         self.ia_gen.fetch_add(1, Ordering::Release);
         match self.caches.get_mut() {
             Ok(caches) => caches.release_owned_com(),
@@ -539,6 +540,12 @@ pub struct CtxBindings {
     /// The VS COM pointer most recently handed to DXVK's VSSetShader (may be
     /// a variant; `current_vs` stays the runtime's own binding).
     pub bound_vs_com: AtomicUsize,
+    /// The `ID3D11InputLayout` most recently handed to DXVK's
+    /// IASetInputLayout by `bind_input_layout`, so a draw with the same
+    /// resolved layout skips the call. Reset wherever `bound_vs_com` is: DXVK
+    /// holds a reference to its bound layout, so the address cannot be reused
+    /// while DXVK still has it bound.
+    pub bound_il_com: AtomicUsize,
     /// Currently-bound per-stage shader COM pointers.
     pub current_vs: AtomicUsize,
     pub current_ps: AtomicUsize,
@@ -596,6 +603,7 @@ impl CtxBindings {
     /// rebinds lazily.
     pub fn reset(&self) {
         self.bound_vs_com.store(0, Ordering::Relaxed);
+        self.bound_il_com.store(0, Ordering::Relaxed);
         self.current_vs.store(0, Ordering::Relaxed);
         self.current_ps.store(0, Ordering::Relaxed);
         self.current_gs.store(0, Ordering::Relaxed);
@@ -639,6 +647,7 @@ impl CtxBindings {
         }
 
         self.bound_vs_com.store(0, Ordering::Relaxed);
+        self.bound_il_com.store(0, Ordering::Relaxed);
         self.current_vs.store(0, Ordering::Relaxed);
         self.current_layout.store(0, Ordering::Relaxed);
     }
@@ -658,9 +667,11 @@ mod tests {
         bindings.current_topology.store(5, Ordering::Relaxed);
         bindings.current_rt0_alloc.store(6, Ordering::Relaxed);
 
+        bindings.bound_il_com.store(7, Ordering::Relaxed);
         bindings.reset_for_deferred_clear_state(false);
 
         assert_eq!(bindings.bound_vs_com.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.bound_il_com.load(Ordering::Relaxed), 0);
         assert_eq!(bindings.current_vs.load(Ordering::Relaxed), 0);
         assert_eq!(bindings.current_layout.load(Ordering::Relaxed), 0);
         assert_eq!(bindings.current_ps.load(Ordering::Relaxed), 4);
