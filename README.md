@@ -135,7 +135,6 @@ settings are environment variables of the process):
 | `DirectFlipSupport` (`HKLM\SOFTWARE\Helios`) | 5 | the D3D11.1 `CheckDirectFlipSupport` answer DWM uses for independent flip; 5 also pairs an R8G8B8A8 game with the B8G8R8A8 desktop, 1 is the equal-format rule, 0 never |
 | `HwCursor` (KMD service key) | follows `IndepFlip` | the hardware cursor; absent means on with independent flip, off without |
 | `ImmFlip` (KMD service key) | 15 | immediate flips (V-sync off, or a promoted swap chain) are neither paced nor held for the vsync tick; 0 paces them like composed flips |
-| `UmdThreadedFrontend` (`HKLM\SOFTWARE\Helios`) | 1 | the threaded D3D11 front end (a UMD worker thread) for every process except dwm.exe; 0 off, 2 includes dwm.exe |
 | `NVK_INDIRECT_PUSH` | 0 | indirect draw records through the pushbuffer |
 | `NVK_NULL_VB_ZERO_PAGE` | 1 | null vertex buffers bound to the zero page |
 | `NVK_ZERO_PAGE_VRAM` | 1 | the zero page (null descriptors) in VRAM |
