@@ -1678,6 +1678,8 @@ unsafe fn dxgkddi_present_inner(
                 flip_allocation,
                 flip_source.physical_address(),
                 snapshot,
+                // `ImmFlip`: the record says whether this flip waits for a retrace.
+                helios_kmd_logic::immediate_flip::interval_is_immediate(args.FlipInterval as u32),
             )
         } {
             crate::diag::record_named_bytes(b"PBFlip", 0xE5);
@@ -2706,7 +2708,7 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         // written for ("compiles, links, ships, and either deadlocks at DISPATCH
         // on a KEVENT wait or calls MmAllocateContiguousMemory above APC_LEVEL").
         crate::ddi::scanout_trace::note_ddi_split(true);
-        // `ImmFlip`: whether the flip this puts in the pending slot is immediate (atomics only).
+        // `ImmFlip` census (atomics only); the flags themselves were recorded on the allocation.
         crate::ddi::immediate_flip::note_mmio(primary_flags);
         // `swap`, not `store`, purely so the overwritten value is observable:
         // this slot holds ONE pending handle, so dxgkrnl flipping faster than
@@ -2780,6 +2782,7 @@ pub(crate) unsafe fn arm_dma_flip_programming(
     primary_address: u64,
     present_epoch: u64,
     snapshot: Option<SnapshotDescriptor>,
+    immediate: bool,
 ) -> bool {
     // Segment and flags are the MMIO path's `DXGKARG_SETVIDPNSOURCEADDRESS`
     // fields, which this contract has no equivalent of. The segment is only
@@ -2822,7 +2825,9 @@ pub(crate) unsafe fn arm_dma_flip_programming(
             h_alloc,
             0,
             primary_address,
-            0,
+            // `ImmFlip`: the flags word records whether the Present's interval was immediate,
+            // on the allocation itself, which the worker reads back with the handle.
+            helios_kmd_logic::immediate_flip::dma_flip_flags(immediate),
             present_epoch,
             frame_watermark,
             snapshot,
@@ -2832,8 +2837,7 @@ pub(crate) unsafe fn arm_dma_flip_programming(
         return false;
     }
     let _ticket = adapter.raise_programming_gate();
-    // `ImmFlip`: a DMA-buffer flip is an interval-0 (immediate) flip; recorded before the slot.
-    crate::ddi::immediate_flip::note_dma_arm();
+    crate::ddi::immediate_flip::note_dma_arm(immediate);
     let previous = adapter
         .pending_vidpn_allocation
         .swap(h_alloc as usize, Ordering::AcqRel);
@@ -3129,20 +3133,25 @@ pub(crate) fn process_deferred_vidpn_source_address(
         if raw == 0 {
             return None;
         }
-        // `ImmFlip`: the slot's immediacy goes with it (`ForeignFlip` reads it in the programming).
-        let immediate = crate::ddi::immediate_flip::begin_programming();
+        // `ImmFlip`: the immediacy the flip recorded on this allocation (`ForeignFlip` reads it
+        // in the programming), and the address published before it.
+        let immediate = crate::ddi::immediate_flip::begin_programming(unsafe {
+            crate::ddi::create_allocation::vidpn_primary_flags(adapter, raw as HANDLE)
+        });
+        let before = adapter.last_primary_address.load(Ordering::Acquire);
         let status =
             unsafe { apply_deferred_vidpn_source_address_locked(adapter, lock, raw as HANDLE) };
         crate::ddi::immediate_flip::end_programming();
-        Some((status, immediate))
+        Some((status, immediate.then_some(before)))
     });
     // The mutex is free again: the `VpDSt` registry write below must not run under a site that
     // says it is held.
     crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_POST);
-    let status = status.map(|(status, immediate)| {
-        // `ImmFlip`: an immediate flip is retired now, not at the next vsync tick.
-        if immediate {
-            crate::ddi::immediate_flip::complete_now(adapter);
+    let status = status.map(|(status, immediate_before)| {
+        // `ImmFlip`: an immediate flip that published its address is retired now, not at the
+        // next vsync tick.
+        if let Some(before) = immediate_before {
+            crate::ddi::immediate_flip::complete_now(adapter, before);
         }
         status
     });

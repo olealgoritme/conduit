@@ -43,11 +43,10 @@ use crate::ScanoutFormat;
 /// the table's verdicts (census). 2: as 1, and enforce the one behaviour change of stage S-2
 /// that is safe without a measurement ([`keeps_unregistered_dma_flip`]). See [`Mode`].
 pub const KNOB_ENABLE: &str = "IndepFlip";
-/// `IndepFlip` when the value is absent: 1 (advertise and count) again since 405.49. On 405.7 and
-/// 405.8 a promoted CS2 swap chain presented one frame and froze; the cause was the missing
-/// hardware pointer, and `HwCursor` now follows `IndepFlip` (`hw_cursor::knob_default_for`).
-/// Games in borderless or exclusive full screen then bypass DWM's composition (and its vsync
-/// pacing) instead of being composed at the synthetic refresh. `IndepFlip` = 0 opts out.
+/// `IndepFlip` when the value is absent: 1 (advertise and count). Games in borderless or exclusive
+/// full screen are then promoted past DWM's composition (and its vsync pacing). A promoted swap
+/// chain needs the hardware pointer, so `HwCursor` follows `IndepFlip`
+/// (`hw_cursor::knob_default_for`). `IndepFlip` = 0 opts out.
 pub const KNOB_DEFAULT: u32 = 1;
 /// Reserved (not read yet): a source the UMD did not create as a primary (`MISC_PRIMARY` clear)
 /// is refused. The census (`IdfUntagged`) says whether it is ever needed.

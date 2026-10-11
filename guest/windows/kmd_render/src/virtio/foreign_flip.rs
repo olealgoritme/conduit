@@ -1046,6 +1046,9 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
         // Nothing of this arm is shown: a held repeat has nothing to repeat.
         drop_held();
     }
+    // `ImmFlip`: whether the frame this pass owes for a programming came from an immediate flip.
+    // Taken with the programming's edge, so a later repeat or resume edge is paced again.
+    let mut owed_imm = false;
     let (mut frame_edge, mut resume_edge) = if holds {
         rm_present::clear_wake_at();
         rm_present::take_edges()
@@ -1058,6 +1061,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
         // picture again, which the repeat gate bounds (`FfRepeatMs`): held edges coalesce into
         // one repeat at the end of the gate, and the worker is woken for it by its timed wait.
         let owed_new = OWED.swap(0, Ordering::AcqRel) != 0;
+        owed_imm = OWED_IMM.swap(0, Ordering::AcqRel) != 0 && owed_new;
         if frame_edge && !owed_new {
             EDGE_HELD.store(1, Ordering::Release);
         }
@@ -1091,7 +1095,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
             rr::flip_interval_100ns(adapter.effective_refresh_mhz()),
             WINDOW.load(Ordering::Acquire) != 0,
         ),
-        OWED_IMM.load(Ordering::Acquire) != 0,
+        owed_imm,
     );
     {
         let mut g = PRES.lock();

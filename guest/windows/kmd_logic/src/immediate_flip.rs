@@ -38,6 +38,27 @@ pub const KNOWN: u32 = NO_PACE | COMPLETE_NOW;
 /// `DXGK_SETVIDPNSOURCEADDRESS_FLAGS.FlipImmediate` (bit 1 of `Value`; WDK `d3dkmddi.h`).
 pub const SVSA_FLIP_IMMEDIATE: u32 = 1 << 1;
 
+/// `D3DDDI_FLIPINTERVAL_IMMEDIATE` (`DXGKARG_PRESENT.FlipInterval`).
+pub const INTERVAL_IMMEDIATE: u32 = 0;
+/// `D3DDDI_FLIPINTERVAL_IMMEDIATE_ALLOW_TEARING` (WDDM 2.1+, `d3dukmdt.h`).
+pub const INTERVAL_IMMEDIATE_ALLOW_TEARING: u32 = 5;
+
+/// Whether a Present's `FlipInterval` asks for a flip that does not wait for a retrace.
+pub const fn interval_is_immediate(flip_interval: u32) -> bool {
+    flip_interval == INTERVAL_IMMEDIATE || flip_interval == INTERVAL_IMMEDIATE_ALLOW_TEARING
+}
+
+/// The flags word a flip records on its allocation (`set_vidpn_primary_address`): the MMIO
+/// flip's own `SetVidPnSourceAddress` flags, or for a DMA-buffer flip [`SVSA_FLIP_IMMEDIATE`]
+/// when its Present's interval was immediate.
+pub const fn dma_flip_flags(immediate: bool) -> u32 {
+    if immediate {
+        SVSA_FLIP_IMMEDIATE
+    } else {
+        0
+    }
+}
+
 /// Counter names (registry mirrors, at most 14 characters).
 pub const COUNTERS: [&str; 6] = [
     "ImmKnob", "ImmDma", "ImmMmio", "ImmProg", "ImmVs", "ImmVsNo",
@@ -99,11 +120,18 @@ pub const fn completes_now(
     Ok(())
 }
 
-/// The immediacy of the pending programming slot after one more flip was put in it. The slot
-/// holds the newest flip only (`pending_vidpn_allocation` coalesces), so its immediacy is the
-/// newest flip's.
-pub const fn pending_after(newest_is_immediate: bool) -> bool {
-    newest_is_immediate
+/// Whether the worker's programming of an allocation is immediate: the flags its flip recorded
+/// on it (per allocation, so a coalesced or re-armed slot keeps the right answer), under the
+/// knob.
+pub const fn programming_is_immediate(mode: u32, recorded_flags: u32) -> bool {
+    mode != 0 && mmio_is_immediate(recorded_flags)
+}
+
+/// Whether the completion vsync is worth sending: the programming published a new address.
+/// (A programming that was deferred, superseded or refused left the previous address, and a
+/// vsync carrying it would retire nothing new.)
+pub const fn published_new(before: u64, after: u64) -> bool {
+    after != 0 && after != before
 }
 
 #[cfg(test)]
@@ -172,9 +200,28 @@ mod tests {
     }
 
     #[test]
-    fn the_pending_slot_follows_the_newest_flip() {
-        assert!(pending_after(true));
-        assert!(!pending_after(false));
+    fn intervals_zero_and_allow_tearing_are_immediate() {
+        assert!(interval_is_immediate(0));
+        assert!(interval_is_immediate(5));
+        for i in 1..=4 {
+            assert!(!interval_is_immediate(i), "interval {i} waits for retraces");
+        }
+        assert!(mmio_is_immediate(dma_flip_flags(true)));
+        assert_eq!(dma_flip_flags(false), 0);
+    }
+
+    #[test]
+    fn the_programming_follows_the_allocations_record_and_the_knob() {
+        assert!(programming_is_immediate(DEFAULT_KNOB, SVSA_FLIP_IMMEDIATE));
+        assert!(!programming_is_immediate(DEFAULT_KNOB, 0));
+        assert!(!programming_is_immediate(0, SVSA_FLIP_IMMEDIATE));
+    }
+
+    #[test]
+    fn a_completion_vsync_needs_a_new_address() {
+        assert!(published_new(0x1000, 0x2000));
+        assert!(!published_new(0x1000, 0x1000), "deferred or refused");
+        assert!(!published_new(0x1000, 0), "nothing published");
     }
 
     #[test]
