@@ -197,8 +197,10 @@ enum Cmd {
         filter: Option<String>,
         /// When frames reach the screen: fullscreen (default: immediate,
         /// tearing allowed, in fullscreen; vsync in a window), immediate
-        /// (also windowed) or vsync. Saved per VM (Ctrl+Alt+M changes it)
-        #[arg(long, value_name = "MODE", value_parser = ["fullscreen", "immediate", "vsync"])]
+        /// (also windowed), vsync, or latch (the newest frame once per
+        /// refresh, committed just before the vblank). Saved per VM
+        /// (Ctrl+Alt+M changes it)
+        #[arg(long, value_name = "MODE", value_parser = ["fullscreen", "immediate", "vsync", "latch"])]
         sync: Option<String>,
     },
     /// Shut a VM down cleanly (power button), forced off after the timeout,
