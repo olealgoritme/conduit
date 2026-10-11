@@ -1522,8 +1522,9 @@ Flips with a sync interval (DWM's composition, V-sync on) are paced and retired 
 an immediate frame at once (tearing) or at its own next vblank is the viewer's choice. The guest waits for neither.
 
 Counters: `ImmKnob`, `ImmDma` / `ImmMmio` (immediate flips armed by each lane), `ImmProg` (immediate programmings taken),
-`ImmVs` (completion vsyncs reported), `ImmVsNo` (immediate programmings without one: nothing new was published, the chain
-was not live, or `FlipDoneHost` holds addresses).
+`ImmVs` (completion vsyncs reported), `ImmVsNo` (immediate programmings without one: nothing new was published (a
+deferred, copied, superseded or refused programming; the tick retires those), the chain was not live, or `FlipDoneHost`
+holds addresses). A high `ImmVsNo` with `ImmVs` 0 and normal `VsTickN` is a programming outcome, not a dead vsync chain.
 
 Rows (lowest mode first; `d3d11_iflip` writes `RESULT_TIMING` lines):
 
