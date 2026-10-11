@@ -1401,7 +1401,7 @@ pub mod knobs {
     /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
     /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
-    /// `IndepFlip` (default 0 again since 405.9, docs/independent-flip.md 13.10; 1 opts in):
+    /// `IndepFlip` (default 1 since 405.49; 0 opts out):
     /// independent flip, stage S-1 (`docs/independent-flip.md` section
     /// 11, `helios_kmd_logic::independent_flip::Mode`). 0 off; 1 advertise `SupportDirectFlip`,
     /// the aperture `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip` (OR'd into what

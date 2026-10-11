@@ -196,7 +196,7 @@ pub(crate) struct AdapterKnobs {
     /// used unfiltered; [`Self::flip_caps`] applies the accepted-bit mask. Read here, once per
     /// StartDevice, so the caps query reports what the `FlipCapsXEff`/`FlipCapsRep` mirrors say.
     pub flip_caps_x: u32,
-    /// `IndepFlip` (default `independent_flip::KNOB_DEFAULT`, 0 since 405.9; 1 opts in), raw. Its caps are already folded into [`Self::direct_flip`] and
+    /// `IndepFlip` (default `independent_flip::KNOB_DEFAULT`, 1 since 405.49; 0 opts out), raw. Its caps are already folded into [`Self::direct_flip`] and
     /// [`Self::flip_caps_x`] by [`Self::read`] (`helios_kmd_logic::independent_flip::advertise`),
     /// so the caps and segment writers need not know it; [`Self::indep_flip_mode`] is the census.
     pub indep_flip: u32,
@@ -283,7 +283,7 @@ impl AdapterKnobs {
         present_probe: false,
         foreign_copy: false,
         display_half: true,
-        // `IndepFlip` absent = `KNOB_DEFAULT` (0 since 405.9), folded in by `advertise`.
+        // `IndepFlip` absent = `KNOB_DEFAULT` (1 since 405.49), folded in by `advertise`.
         direct_flip: helios_kmd_logic::independent_flip::advertise(
             helios_kmd_logic::independent_flip::Mode::from_knob(
                 helios_kmd_logic::independent_flip::KNOB_DEFAULT,

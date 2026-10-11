@@ -1489,3 +1489,35 @@ of PresentMon `--process_name cs2.exe`; read `PresentMode`, the fps, the dwm log
 Colour check on C2/C4: a red/blue swap on screen means the R8G8B8A8 buffer's layout record carries a BGRA fourcc; `DirectFlipSupport=4`
 is the fallback until it is fixed. Cursor: with `HwCursor` 0 (the 404 default) nothing draws the Windows pointer while
 promoted (4.5); CS2 draws its own crosshair, its menus may show no pointer.
+
+### 13.10 The defaults since 405.49: promoted games, unpaced immediate flips
+
+`IndepFlip` defaults to 1 and `DirectFlipSupport` to 5. A flip-model game in borderless or exclusive full screen at the
+mode's size is promoted to independent flip instead of being composed by DWM at the synthetic refresh. That includes an
+R8G8B8A8 swap chain such as CS2's on the B8G8R8A8 desktop. The freeze that turned both defaults off on 405.8 (a promoted CS2
+swap chain showed one frame) had one cause: no hardware pointer was reported. `HwCursor` now follows `IndepFlip`
+(`hw_cursor::knob_default_for`). Opt-outs: `IndepFlip` = 0 in the KMD service key, `DirectFlipSupport` = 0 (never) or 1 (equal
+formats only) in `HKLM\SOFTWARE\Helios`.
+
+`ImmFlip` (KMD service key, default 3; `kmd_logic::immediate_flip`) covers immediate flips: interval 0 (the DMA-buffer
+contract) and MMIO flips with `FlipImmediate`. A game with V-sync off presents these.
+- Bit 0: the `ForeignFlip` presenter sends the frame to the host as soon as the worker takes the programming. There is no
+  3/4-period minimum interval.
+- Bit 1: once the address is published, the worker reports the `CRTC_VSYNC` that retires the flip. It does not wait for the
+  next vsync tick, so with `MaxQueuedFlipOnVSync` 1 the application is not held to one flip per tick.
+
+Flips with a sync interval (DWM's composition, V-sync on) are paced and retired by the tick as before. Whether the host shows
+an immediate frame at once (tearing) or at its own next vblank is the viewer's choice. The guest waits for neither.
+
+Counters: `ImmKnob`, `ImmDma` / `ImmMmio` (immediate flips armed by each lane), `ImmProg` (immediate programmings taken),
+`ImmVs` (completion vsyncs reported), `ImmVsNo` (immediate programmings without one: the chain was not live, `FlipDoneHost`
+holds addresses, or nothing was published).
+
+Rows (lowest mode first; `d3d11_iflip` writes `RESULT_TIMING` lines):
+
+| row | command | pass |
+|---|---|---|
+| I1 | `d3d11_iflip 20 topmost fg tearing interval0` | `DXGI_FEATURE_PRESENT_ALLOW_TEARING=1`, PresentMon `Hardware: Independent Flip`, fps above the refresh, `present_call_us` p99 well under a period, `ImmVs` close to the frame count |
+| I2 | as I1 with `fps=300`, then `fps=200` | `present_interval_us` p99 close to the target interval, no blocking in `present_call_us` |
+| I3 | `d3d11_iflip 20 topmost fg fps=200` (interval 1) | paced by the vsync: `ImmProg` 0, about 200 fps |
+| I4 | CS2 with V-sync off at the mode's size | PresentMon `Hardware: Independent Flip` (or `Independent Flip`), `ImmProg` rising |
