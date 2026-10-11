@@ -280,6 +280,15 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvEvMaxP",
         crate::virtio::nvrm::NVRM_EV_MAX_PASS.load(Ordering::Relaxed),
     );
+    // Packed `EventReady` (`NVGPU_F_EVENT_PACKED`): messages, and the buffers they came in.
+    crate::diag::record_named_bytes(
+        b"NvEvPkM",
+        crate::virtio::nvrm::NVRM_EV_PACKED_MSGS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvPkB",
+        crate::virtio::nvrm::NVRM_EV_PACKED_BUFS.load(Ordering::Relaxed),
+    );
     // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
     // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
     crate::adapter::foreign_scanout::publish_counters();
@@ -1250,7 +1259,7 @@ unsafe fn note_present_private_shape(
 /// `base`/`total` describe the kernel-only DMA private-data buffer dxgkrnl
 /// supplied for this submission.
 unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) {
-    let Some((h_alloc, primary_address, snapshot)) =
+    let Some((h_alloc, primary_address, snapshot, immediate)) =
         (unsafe { crate::ddi::present_packet::PresentFlipPrivate::take(base, total) })
     else {
         // No flip to program. A KEEP record is the Present's skip of a flip the programming path
@@ -1300,6 +1309,7 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
             primary_address,
             epoch,
             snapshot,
+            immediate,
         )
     } {
         crate::ddi::scanout_trace::note_dma_flip_armed();

@@ -431,6 +431,16 @@ unsafe extern "system" fn create_device(
         return E_NOTIMPL;
     };
 
+    // The threaded front end (`docs/d3d11-threaded-frontend.md`): the knob,
+    // FREETHREADED caps (with caps 0 the runtime serialises Create*/Destroy*
+    // with the immediate context, which a worker would quietly undo), and the
+    // app's D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
+    // (`D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION`).
+    const DDI_FLAG_DISABLE_EXTRA_THREAD_CREATION: u32 = 0x1;
+    let threaded_frontend = crate::knobs::threaded_frontend()
+        && crate::umd_free_threaded()
+        && (create.Flags & DDI_FLAG_DISABLE_EXTRA_THREAD_CREATION) == 0;
+
     // 1) Bring up the DXVK device on the Helios venus adapter.
     // BridgeDevice::create folds the old is_null() test into construction, so a
     // stored BridgeDevice is always usable. R815.
@@ -477,6 +487,7 @@ unsafe extern "system" fn create_device(
                 um_callbacks: p_um_callbacks.cast(),
                 negotiated,
                 loss: crate::device_loss::LossWatch::new(),
+                frontend: threaded_frontend.then(forward::Frontend::new),
             },
         );
     }
@@ -549,6 +560,36 @@ unsafe extern "system" fn create_device(
                 device_funcs::fill_dxgi_base_funcs(
                     create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions,
                 );
+            }
+        }
+        // The threaded front end's wrappers go over the filled tables, in the
+        // same level chain, only for a device that has one.
+        if threaded_frontend {
+            match negotiated {
+                NegotiatedInterface::Wddm2_3 => {
+                    forward::frontend_install_wddm2_3(create.__bindgen_anon_1.pWDDM2_2DeviceFuncs);
+                    forward::frontend_install_dxgi_1_6_1(
+                        create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions6_1,
+                    );
+                }
+                NegotiatedInterface::Wddm1_3 => {
+                    forward::frontend_install_wddm1_3(create.__bindgen_anon_1.pWDDM1_3DeviceFuncs);
+                    forward::frontend_install_dxgi_1_3(
+                        create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions4,
+                    );
+                }
+                NegotiatedInterface::D3D11_1 => {
+                    forward::frontend_install_11_1(create.__bindgen_anon_1.p11_1DeviceFuncs);
+                    forward::frontend_install_dxgi_1_1(
+                        create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions2,
+                    );
+                }
+                NegotiatedInterface::D3D11_0 => {
+                    forward::frontend_install_11_0(create.__bindgen_anon_1.p11DeviceFuncs);
+                    forward::frontend_install_dxgi(
+                        create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions,
+                    );
+                }
             }
         }
         // The >=11.1 interfaces fetch sub-object tables (the D3D11.1 video DDI)

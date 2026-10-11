@@ -18,6 +18,9 @@ param(
     # not kept in the repository); omitted: the package does not install WinFsp
     # and shared folders need it present already.
     [string]$WinFspMsi = "",
+    # Red Hat's signed vioinput driver (virtio-input keyboard/mouse/tablet),
+    # staged by Get-VirtioInput.ps1; omitted: the package carries no vioinput.
+    [string]$VirtioInputArtifact = "",
     [Parameter(Mandatory)][string]$OutputDir,
     [Parameter(Mandatory)][string]$Version,
     [Parameter(Mandatory)][ValidateSet("Debug", "Release")][string]$Configuration,
@@ -212,6 +215,16 @@ if ($WinFspMsi) {
     Copy-Required $WinFspMsi (Join-Path $payload "winfsp\$(Split-Path -Leaf $WinFspMsi)")
 }
 
+# Shipped as Red Hat signed them (WHQL catalog): never re-signed here.
+if ($VirtioInputArtifact) {
+    foreach ($name in @("vioinput.inf", "vioinput.cat", "vioinput.sys", "viohidkmdf.sys", "LICENSE-vioinput.txt")) {
+        Copy-Required (Join-Path $VirtioInputArtifact $name) (Join-Path $payload "drivers\vioinput\$name")
+    }
+    foreach ($name in @("vioinput.sys", "viohidkmdf.sys")) {
+        Assert-HeliosPeArchitecture (Join-Path $payload "drivers\vioinput\$name") x64
+    }
+}
+
 $resolveCompatibilityOut = Join-Path $stagingRoot "compatibility\DaVinci Resolve"
 foreach ($name in @(
     "atiadlxx.dll",
@@ -344,6 +357,15 @@ $manifest = [ordered]@{
         compatibility = [ordered]@{ davinciResolve = "App-local AMD ADL detection shim" }
     }
     files = $files
+}
+if ($VirtioInputArtifact) {
+    $driverVer = Select-String -LiteralPath (Join-Path $payload "drivers\vioinput\vioinput.inf") -Pattern '^\s*DriverVer\s*=\s*(.+)$' |
+        Select-Object -First 1
+    $manifest.components["virtioInput"] = [ordered]@{
+        driver = "Red Hat vioinput (virtio-win), WHQL signed"
+        driverVer = if ($driverVer) { $driverVer.Matches[0].Groups[1].Value.Trim() } else { "" }
+        inf = "payload/drivers/vioinput/vioinput.inf"
+    }
 }
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $stagingRoot "manifest.json") -Encoding UTF8
 

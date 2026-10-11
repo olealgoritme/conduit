@@ -1401,7 +1401,7 @@ pub mod knobs {
     /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
     /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
-    /// `IndepFlip` (default 0 again since 405.9, docs/independent-flip.md 13.10; 1 opts in):
+    /// `IndepFlip` (default 1 since 405.49; 0 opts out):
     /// independent flip, stage S-1 (`docs/independent-flip.md` section
     /// 11, `helios_kmd_logic::independent_flip::Mode`). 0 off; 1 advertise `SupportDirectFlip`,
     /// the aperture `DirectFlip` flag and `FlipIndependent | DdiPresentForIFlip` (OR'd into what
@@ -1556,6 +1556,13 @@ pub mod knobs {
     /// an announce the retire still waits for the worker's publication (one tick earlier on
     /// average). Read at every StartDevice.
     pub const FLIP_EARLY_WAKE: KnobName = KnobName::new(b"FlipEarlyWake");
+    /// `ImmFlip` (default 15; bit 3: a promoted swap chain's flips count as immediate whatever
+    /// dxgkrnl asked, `immediate_flip::IFLIP_NOW`): immediate (tearing) flips are sent to the host without the
+    /// `ForeignFlip` presenter's minimum interval (bit 0), retired by a `CRTC_VSYNC` reported as
+    /// soon as their address is published, not by the next vsync tick (bit 1), and the flip caps
+    /// report `FlipImmediateMmIo` so dxgkrnl issues them as such (bit 2); 0 is the old behaviour.
+    /// `helios_kmd_logic::immediate_flip`. Read at every AddAdapter/StartDevice.
+    pub const IMM_FLIP: KnobName = KnobName::new(b"ImmFlip");
     /// `FlipLat` (default 1 = on, 0 = off): the flip retire latency / inter-flip interval /
     /// vblank utilisation measurement (`FlipLat*`, `IfGap*`, `FlipP99Us`, `VbUsed`,
     /// `VsLate*`): atomics in the DDI and the tick, mirrored once a second. Read at every

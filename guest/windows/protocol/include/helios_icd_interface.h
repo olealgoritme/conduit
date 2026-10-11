@@ -43,8 +43,9 @@ extern "C" {
 /* The export keeps its name; version 3 only appends entries (and caps 4..6),
  * version 4 appends memory_res_plane1 (and cap 8), version 5 scanout_frame,
  * version 6 queue_rm_fence_v3, version 7 the ECL fence timeline
- * (ecl_fence_reserve / ecl_fence_create / ecl_fence_signal). */
-#define HELIOS_ICD_INTERFACE_VERSION 7u
+ * (ecl_fence_reserve / ecl_fence_create / ecl_fence_signal), version 8
+ * ecl_fence_create_v3. */
+#define HELIOS_ICD_INTERFACE_VERSION 8u
 
 enum helios_icd_backend {
    HELIOS_ICD_BACKEND_VENUS = 1,
@@ -352,6 +353,19 @@ struct helios_icd_api {
                                 uint64_t value, uint32_t *fence_handle);
    VkResult (*ecl_fence_signal)(VkDevice device, VkQueue queue,
                                 uint64_t key, uint64_t value);
+
+   /* ---- version 8 (size covers it; NULL = not supported) ----------------
+    * ecl_fence_create, plus the copy-engine record of queue_rm_fence_v3 for
+    * `image` (bound at offset 0 of its dedicated `memory`): a composed
+    * present whose fence is reserved at the Present call and signalled by
+    * the engine's submission thread after the frame's work, so the
+    * presenting thread never waits for that submission. Results as for
+    * queue_rm_fence_v3 (VK_SUCCESS with *copy filled, copy->semaphore.value
+    * == value; VK_INCOMPLETE with the fence alone; an error with none). */
+   VkResult (*ecl_fence_create_v3)(VkDevice device, uint64_t key,
+                                   uint64_t value, VkDeviceMemory memory,
+                                   VkImage image, uint32_t *fence_handle,
+                                   struct helios_icd_rm_copy *copy);
 };
 
 typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);

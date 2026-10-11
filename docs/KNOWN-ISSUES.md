@@ -52,14 +52,12 @@ Experimental, behind `--venus` ([WINDOWS.md](WINDOWS.md), [VENUS.md](VENUS.md)).
 Rendering is on NVK-on-RM; Venus is the fallback for processes the policy
 keeps off NVK.
 
-- One display mode at a time, set by `conduit up --display`,
-  `conduit view NAME WxH@HZ` or the viewer's window size. The driver does not
-  scale, so a game rendering below that mode does not fill the screen.
+- Every guest display mode runs at the native refresh rate. The guest offers
+  the VM's mode list: native (`conduit up --display`), the standard modes that
+  fit within it, and custom modes (`conduit display VM --add WxH`;
+  [SCANOUT.md](SCANOUT.md) "Mode list").
 - Games need the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look; without
   it the guest gets absolute tablet positions.
-- Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):
-  full-screen games are composed by DWM. With `IndepFlip=1` the hardware
-  cursor comes on too (`HwCursor` follows `IndepFlip` unless set).
 
 - From a checkout, `make` builds the backend with the `venus` feature but
   not `conduit-venus` (it needs the venus submodules and a local

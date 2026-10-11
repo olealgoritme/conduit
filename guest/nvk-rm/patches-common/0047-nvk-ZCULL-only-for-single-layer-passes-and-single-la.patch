@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 10 Oct 2026 23:32:30 +0200
+Subject: [PATCH] nvk: ZCULL only for single-layer passes and single-layer,
+ single-level depth images
+
+One ZCULL storage, like the on-chip ZCULL state, describes one 2D depth
+surface.  Patch 0008 gives D3D11 depth textures through DXVK ZCULL
+storage, but an image with several mip levels shared one storage across
+them: a render pass on mip 0 loaded the culling state a pass on mip 1
+had stored and culled fragments that pass their own depth test.
+
+- ZCULL storage only for depth images with one layer and one level.
+  Other depth images keep ZCULL within render passes that clear depth.
+- ZCULL only in render passes that draw one layer (or one view).  Array
+  layers and layered passes did not show the problem in tests; this is a
+  precaution, as ZCULL keeps one state per screen tile and nothing keeps
+  layers apart.
+- A pass stores ZCULL at its end only when it set ZCULL up for its depth
+  image; a pass without ZCULL (depth load op NONE) could otherwise store
+  stale culling state over the image's storage.
+
+d3d11_depth_views_probe (Conduit guest/windows/tools), RTX 5090, 1920x1080,
+reverse Z: mip 1 drawn near, then mip 0 loaded and drawn at a depth that
+passes there.  Without this patch the top-left quarter of mip 0 (mip 1's
+area, 518400 pixels) stays unwritten, for D32 and D24S8; with
+NVK_RM_ZCULL=0 and with this patch every texel is right.  Single-level,
+single-layer depth buffers keep ZCULL storage as before.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h |  5 +++++
+ src/nouveau/vulkan/nvk_cmd_draw.c   | 14 +++++++++++---
+ src/nouveau/vulkan/nvk_image.c      |  9 +++++++++
+ 3 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 88f3fcb..9b6dc51 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -238,6 +238,11 @@ struct nvk_rendering_state {
+ 
+    /* True if all the conditions are met to allow rendering to linear */
+    bool linear;
++
++   /* The pass loads or clears the depth image's ZCULL storage, so its end
++    * stores it (nvk_CmdBeginRendering)
++    */
++   bool zcull_store;
+ };
+ 
+ struct nvk_graphics_state {
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 176d50b..0b3bb8d 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -1811,14 +1811,23 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    }
+ 
+    /* TODO: zcull for depth-stencil */
++
++   /* ZCULL keeps one culling state per screen tile, not per layer, so only
++    * passes that draw one layer use it.  A pass over several layers or views
++    * could cull one layer's fragments against depth another layer wrote
++    * (not seen in tests, but nothing keeps the layers apart).
++    */
+    struct nvk_zcull_plane *zcull_plane = nvk_get_zcull_plane(render);
+-   bool use_zcull = pdev->info.has_zcull_info &&
++   bool use_zcull = pdev->info.has_zcull_info && layer_count == 1 &&
+       pRenderingInfo->pDepthAttachment != NULL &&
+       pRenderingInfo->pDepthAttachment->imageView != VK_NULL_HANDLE &&
+       pRenderingInfo->pDepthAttachment->loadOp != VK_ATTACHMENT_LOAD_OP_NONE &&
+       (zcull_plane ||
+        pRenderingInfo->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR);
+ 
++   /* nvk_CmdEndRendering2KHR stores ZCULL only for a pass that set it up */
++   render->zcull_store = use_zcull && zcull_plane != NULL;
++
+    /* ZCULL direction: see nvk_zcull_plane::zdir.  Without storage the ZCULL
+     * data lives only for this render pass (it starts with a clear), so the
+     * clear value picks it.  zcull_reseed: reset the stored ZCULL to the far
+@@ -2158,8 +2167,7 @@ nvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+ 
+    nvk_pass_profile_end_pass(cmd);
+ 
+-   struct nvk_zcull_plane* zcull_plane = nvk_get_zcull_plane(render);
+-   if (zcull_plane &&
++   if (render->zcull_store &&
+        render->depth_att.store_op == VK_ATTACHMENT_STORE_OP_STORE) {
+       /* Like CLEAR_SURFACE, no ZCULL storage with target-independent
+        * rasterization on.  A pass with a depth attachment never turns it on
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 2838956..9895e12 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -1120,6 +1120,14 @@ nvk_image_init(struct nvk_device *dev,
+     * texture TRANSFER_DST, so without it they would never get ZCULL
+     * storage and every render pass that loads depth would run without
+     * ZCULL.
++    *
++    * One ZCULL storage describes one 2D depth surface: the image's only
++    * layer at its only level.  Render passes on other layers or levels would
++    * load the culling state another layer or level stored, and cull
++    * fragments that pass their own depth test.  Arrays (cube and cascade
++    * shadow maps) and images with mip levels get no storage; their render
++    * passes that clear depth still use ZCULL within the pass
++    * (nvk_CmdBeginRendering).
+     */
+    const VkImageUsageFlagBits ZCULL_COMPATIBLE_IMAGE_USAGE =
+       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+@@ -1132,6 +1140,7 @@ nvk_image_init(struct nvk_device *dev,
+         pCreateInfo->sharingMode == VK_SHARING_MODE_EXCLUSIVE) &&
+        !(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
+        image->vk.image_type != VK_IMAGE_TYPE_3D &&
++       image->vk.array_layers == 1 && image->vk.mip_levels == 1 &&
+        image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+        pdev->info.has_zcull_info) {
+       image->zcull.nil = nil_zcull_new(&pdev->info.zcull_info, 0, 0,
+-- 
+2.43.0
+

@@ -429,7 +429,15 @@ unsafe fn finish_command_list_into(
     // RestoreDeferredContextState = FALSE: the runtime's clear-state
     // convention, and what maps DXVK's self-reset onto the recycle flow with
     // zero object churn.
-    match dc_ctx.FinishCommandList(false, Some(&mut cl)) {
+    let finished = dc_ctx.FinishCommandList(false, Some(&mut cl));
+    // FinishCommandList(FALSE) clears the DC's DXVK state (a logical reset
+    // under the Helios fast path): forget what DXVK had bound. Without this
+    // the next list's first draw with the same input layout skips
+    // IASetInputLayout (`bound_il_com` still names it) and draws with none.
+    // The API-level shadows stay: the runtime re-sends only what the app
+    // sets, and the next draw rebinds from them.
+    dc.bindings.forget_dxvk_bindings();
+    match finished {
         Ok(()) => match cl {
             Some(c) => {
                 store_com(h_cl, c);

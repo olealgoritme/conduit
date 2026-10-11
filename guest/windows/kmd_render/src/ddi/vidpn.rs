@@ -326,8 +326,9 @@ fn mode_added(st: NTSTATUS, native: bool) -> Result<(), NTSTATUS> {
     Ok(())
 }
 
-/// One target mode per size of `modes` and per offered rate (`refresh_ladder`),
-/// native at the host rate the preferred one.
+/// One target mode per size of `modes` and offered rate: native at every rate of
+/// the `refresh_ladder` (the host rate the preferred one), every other size at the
+/// host rate only (`mode_list::rate_count_for`).
 unsafe fn add_target_modes(
     iface: *const DXGK_VIDPNTARGETMODESET_INTERFACE,
     h_set: D3DKMDT_HVIDPNTARGETMODESET,
@@ -340,8 +341,10 @@ unsafe fn add_target_modes(
         let Some((w, h)) = modes.get(i) else {
             break;
         };
+        // Native at every ladder rate; other sizes at the host rate only.
+        let count = helios_kmd_logic::mode_list::rate_count_for((w, h), native, rate_count);
         let mut r = 0;
-        while r < rate_count {
+        while r < count {
             let preferred = (w, h) == native && r == 0;
             let status =
                 unsafe { add_single_target_mode(iface, h_set, w, h, rates[r], preferred) };
@@ -426,8 +429,10 @@ unsafe fn add_monitor_modes(
         let Some((w, h)) = modes.get(i) else {
             break;
         };
+        // Native at every ladder rate; other sizes at the host rate only.
+        let count = helios_kmd_logic::mode_list::rate_count_for((w, h), native, rate_count);
         let mut r = 0;
-        while r < rate_count {
+        while r < count {
             let preferred = (w, h) == native && r == 0;
             let st = unsafe { add_monitor_mode(iface, h_set, w, h, rates[r], preferred) };
             if let Err(e) = mode_added(st, (w, h) == native) {
