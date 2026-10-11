@@ -102,6 +102,11 @@ pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 /// cursor commands there when the device also has the queue (`kmd_render/src/virtio/gpu/
 /// cursor_ring.rs`) and `HwCursorQ` is not 0.
 pub const NVGPU_CFG_CURSOR_QUEUE: u32 = 1 << 20;
+/// `NVGPU_CFG_CURSOR_POS` (config `features` bit 22, only together with
+/// `NVGPU_CFG_VENUS_CURSOR`): the host takes `HELIOS_CURSOR_BLOB_F_MOVE` commands, the cursor
+/// hotspot's position, and draws the cursor there itself where the host pointer cannot show it
+/// (under a viewer's mouse grab). Without it the KMD sends no moves.
+pub const NVGPU_CFG_CURSOR_POS: u32 = 1 << 22;
 
 // ── Device status bits (VirtIO spec §2.1) ──────────────────────────────────
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;

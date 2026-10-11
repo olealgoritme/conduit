@@ -55,6 +55,11 @@ pub const VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 pub const HELIOS_CMD_SET_CURSOR_BLOB: u32 = 0x0380;
 /// [`HeliosSetCursorBlob::flags`]: shown. Clear (or resource 0): hidden.
 pub const HELIOS_CURSOR_BLOB_F_VISIBLE: u32 = 1 << 0;
+/// [`HeliosSetCursorBlob::flags`]: a move. Only `x`, `y` count (the hotspot's position, as
+/// `DxgkDdiSetPointerPosition` reports it); every other field is 0 and the host keeps the image,
+/// the hotspot and the visibility. Sent only when the config has `NVGPU_CFG_CURSOR_POS`. The
+/// host's definition is `host/backend/protocol/src/venus.rs` `CURSOR_BLOB_F_MOVE`.
+pub const HELIOS_CURSOR_BLOB_F_MOVE: u32 = 1 << 1;
 
 // ── Response types ────────────────────────────────────────────────────────
 pub const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;

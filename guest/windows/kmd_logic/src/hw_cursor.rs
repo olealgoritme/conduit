@@ -70,11 +70,37 @@ pub const KNOB_FORCE: u32 = 2;
 pub const CFG_CURSOR: u32 = 1 << 9;
 pub const CFG_VENUS: u32 = 1 << 10;
 pub const CFG_VENUS_CURSOR: u32 = 1 << 18;
+pub const CFG_CURSOR_POS: u32 = 1 << 22;
 
 /// The host serves `CMD_SET_CURSOR_BLOB`.
 pub const fn host_serves(features: u32) -> bool {
     let need = CFG_CURSOR | CFG_VENUS | CFG_VENUS_CURSOR;
     features & need == need
+}
+
+/// The host takes moves (`HELIOS_CURSOR_BLOB_F_MOVE`): it draws the cursor itself under a
+/// viewer's grab, where its own pointer is hidden.
+pub const fn host_takes_moves(features: u32) -> bool {
+    host_serves(features) && features & CFG_CURSOR_POS != 0
+}
+
+/// Whether a `DxgkDdiSetPointerPosition` at (`x`, `y`) owes the host a move: the host takes
+/// them, shows the cursor, and was last told a different position (`sent`, `None` when it was
+/// told none since the image was shown).
+pub const fn move_owed(
+    takes_moves: bool,
+    host_shown: bool,
+    sent: Option<(i32, i32)>,
+    x: i32,
+    y: i32,
+) -> bool {
+    if !takes_moves || !host_shown {
+        return false;
+    }
+    match sent {
+        Some((sx, sy)) => sx != x || sy != y,
+        None => true,
+    }
 }
 
 /// Whether `DXGK_DRIVERCAPS` reports a hardware pointer. `host` is the config `features` word,
@@ -394,7 +420,7 @@ pub const fn retry_due(now: u64, last_try: u64) -> bool {
 
 /// Counter names (`kmd_render/src/ddi/hw_cursor.rs`), at most 14 characters, in the order the
 /// driver writes them.
-pub const COUNTERS: [&str; 30] = [
+pub const COUNTERS: [&str; 32] = [
     "CurKnob",
     "CurCaps",
     "CurShapeN",
@@ -407,25 +433,60 @@ pub const COUNTERS: [&str; 30] = [
     "CurWhy",
     "CurHostErr",
     "CurXor",
-    "CurRttUs",  // the last cursor command's round trip, microseconds
-    "CurRttMax", // its maximum
-    "CurTmo",    // commands that timed out (assumed taken: the host runs them late)
-    "CurGateMs", // the longest a shape waited for another pointer operation's I/O, ms
-    "CurSwN",    // software-cursor episodes (a refused shape until the host shows one again)
-    "CurSwMs",   // the last episode's length, ms
-    "CurSwMax",  // the longest, ms
-    "CurRetry",  // commands sent again after one that never reached the queue
-    "CurQ",      // 1: the commands go on the cursor queue (virtqueue 2), 0: the control queue
-    "CurQBusy",  // cursor-queue sends deferred: the previous command was still out
-    "CurQSent",  // commands sent on the cursor queue
-    "CurDdiS",   // DxgkDdiSetPointerShape calls that reached the display half (before the caps)
-    "CurDdiP",   // DxgkDdiSetPointerPosition calls likewise
-    "CurPosVis", // ... of them with Flags.Visible set
-    "CurPosHid", // ... with it clear
-    "CurPosSrc", // the last one's VidPnSourceId
-    "CurCapQn",  // DXGK_DRIVERCAPS queries (never reset)
+    "CurRttUs",    // the last cursor command's round trip, microseconds
+    "CurRttMax",   // its maximum
+    "CurTmo",      // commands that timed out (assumed taken: the host runs them late)
+    "CurGateMs",   // the longest a shape waited for another pointer operation's I/O, ms
+    "CurSwN",      // software-cursor episodes (a refused shape until the host shows one again)
+    "CurSwMs",     // the last episode's length, ms
+    "CurSwMax",    // the longest, ms
+    "CurRetry",    // commands sent again after one that never reached the queue
+    "CurQ",        // 1: the commands go on the cursor queue (virtqueue 2), 0: the control queue
+    "CurQBusy",    // cursor-queue sends deferred: the previous command was still out
+    "CurQSent",    // commands sent on the cursor queue
+    "CurDdiS",     // DxgkDdiSetPointerShape calls that reached the display half (before the caps)
+    "CurDdiP",     // DxgkDdiSetPointerPosition calls likewise
+    "CurPosVis",   // ... of them with Flags.Visible set
+    "CurPosHid",   // ... with it clear
+    "CurPosSrc",   // the last one's VidPnSourceId
+    "CurCapQn",    // DXGK_DRIVERCAPS queries (never reset)
     "CurCapRep", // what the last one reported (bit 0 pointer, 1 host known, 4..7 knob, 8 display, 16.. caps)
+    "CurMoveN", // moves sent (HELIOS_CURSOR_BLOB_F_MOVE; a host that draws the cursor under a grab)
+    "CurMoveSkip", // moves not sent: the cursor queue was still busy (the next position goes)
 ];
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+
+    #[test]
+    fn moves_need_the_host_bit_on_top_of_the_cursor() {
+        let cursor = CFG_CURSOR | CFG_VENUS | CFG_VENUS_CURSOR;
+        assert!(!host_takes_moves(cursor));
+        assert!(host_takes_moves(cursor | CFG_CURSOR_POS));
+        assert!(!host_takes_moves(CFG_CURSOR_POS));
+        assert_eq!(CFG_CURSOR_POS, 1 << 22);
+    }
+
+    #[test]
+    fn a_move_is_owed_only_for_a_new_position_of_a_shown_cursor() {
+        assert!(move_owed(true, true, None, 5, 6));
+        assert!(move_owed(true, true, Some((5, 5)), 5, 6));
+        assert!(!move_owed(true, true, Some((5, 6)), 5, 6));
+        assert!(
+            !move_owed(true, false, None, 5, 6),
+            "hidden: the host draws nothing"
+        );
+        assert!(
+            !move_owed(false, true, None, 5, 6),
+            "an older host: no moves"
+        );
+        assert!(
+            move_owed(true, true, Some((0, 0)), -1, 0),
+            "off the left edge too"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1249,7 +1249,19 @@ pub fn set_cursor_blob_cursorq(
     use crate::virtio::gpu::CursorPoll;
     cmd.hdr = VirtioGpuCtrlHdr::zeroed();
     cmd.hdr.type_ = HELIOS_CMD_SET_CURSOR_BLOB;
-    match adapter.with_virtio(|v| v.cursor_queue_on().then(|| v.cursor_send(bytes_of(&cmd)))) {
+    let send =
+        || adapter.with_virtio(|v| v.cursor_queue_on().then(|| v.cursor_send(bytes_of(&cmd))));
+    let mut sent = send();
+    // A move (`ddi::hw_cursor::send_move`, never waited for) may still be out: give it up to
+    // 2 ms to come back, then send.
+    let t_move = crate::adapter::foreign_scanout::now_100ns();
+    while matches!(sent, Ok(Some(Err(VirtioError::QueueFull))))
+        && crate::adapter::foreign_scanout::now_100ns().saturating_sub(t_move) < 20_000
+    {
+        core::hint::spin_loop();
+        sent = send();
+    }
+    match sent {
         Err(_) => return Some(Err(VirtioError::DeviceError)),
         Ok(None) => return None,
         Ok(Some(Err(e))) => return Some(Err(e)),

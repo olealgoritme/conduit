@@ -1147,9 +1147,13 @@ part of any frame.
   AND/XOR, 0/0 black, 0/1 white, 1/0 transparent, 1/1 invert. An ARGB plane cannot invert, so an inverting pixel is drawn black
   with a white outline on its transparent neighbours (the text I-beam stays visible on dark and light backgrounds).
 * **`DxgkDdiSetPointerPosition`** (PASSIVE, up to the mouse rate): one spinlock and a compare, unless `Flags.Visible` changed;
-  then the image is shown or hidden on the host. **The position never travels**: the host pointer is the cursor (the viewer sets
-  the image as its `wl_pointer` cursor over the guest), so it moves at host rate with no guest latency. X and Y ride along on
-  each command, informational.
+  then the image is shown or hidden on the host. The host pointer is the cursor (the viewer sets the image as its `wl_pointer`
+  cursor over the guest), so it moves at host rate with no guest latency. Under a viewer's mouse grab the host pointer is
+  locked and hidden; a host with `NVGPU_CFG_CURSOR_POS` (bit 22) then draws the image itself, so each new position of a shown
+  cursor also goes to it as a move (`HELIOS_CURSOR_BLOB_F_MOVE`, only X and Y set): on the cursor queue only, never waited for,
+  only while no shape I/O runs (a shape carries X and Y itself). A move that finds the previous command still out polls for
+  300 us, then gives up and the next position goes (`CurMoveN` sent, `CurMoveSkip` given up). A shape that finds a move still
+  out waits up to 2 ms for it.
 * **Failure is the software cursor.** A shape the host cannot take, an image that cannot be made or mapped, a host command that
   fails: `SetPointerShape` answers `STATUS_UNSUCCESSFUL`, and dxgkrnl draws that shape in software, as before (the host image is
   hidden first, so two cursors never show). A host that refuses the command (`RESP_ERR_*`: an old backend under `HwCursor=2`) is not
