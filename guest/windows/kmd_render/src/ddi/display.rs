@@ -1678,6 +1678,8 @@ unsafe fn dxgkddi_present_inner(
                 flip_allocation,
                 flip_source.physical_address(),
                 snapshot,
+                // `ImmFlip`: the record says whether this flip waits for a retrace.
+                helios_kmd_logic::immediate_flip::interval_is_immediate(args.FlipInterval as u32),
             )
         } {
             crate::diag::record_named_bytes(b"PBFlip", 0xE5);
@@ -2706,6 +2708,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         // written for ("compiles, links, ships, and either deadlocks at DISPATCH
         // on a KEVENT wait or calls MmAllocateContiguousMemory above APC_LEVEL").
         crate::ddi::scanout_trace::note_ddi_split(true);
+        // `ImmFlip` census (atomics only); the flags themselves were recorded on the allocation.
+        crate::ddi::immediate_flip::note_mmio(primary_flags);
         // `swap`, not `store`, purely so the overwritten value is observable:
         // this slot holds ONE pending handle, so dxgkrnl flipping faster than
         // the PASSIVE worker drains silently discards every intermediate
@@ -2778,6 +2782,7 @@ pub(crate) unsafe fn arm_dma_flip_programming(
     primary_address: u64,
     present_epoch: u64,
     snapshot: Option<SnapshotDescriptor>,
+    immediate: bool,
 ) -> bool {
     // Segment and flags are the MMIO path's `DXGKARG_SETVIDPNSOURCEADDRESS`
     // fields, which this contract has no equivalent of. The segment is only
@@ -2820,7 +2825,9 @@ pub(crate) unsafe fn arm_dma_flip_programming(
             h_alloc,
             0,
             primary_address,
-            0,
+            // `ImmFlip`: the flags word records whether the Present's interval was immediate,
+            // on the allocation itself, which the worker reads back with the handle.
+            helios_kmd_logic::immediate_flip::dma_flip_flags(immediate),
             present_epoch,
             frame_watermark,
             snapshot,
@@ -2830,6 +2837,7 @@ pub(crate) unsafe fn arm_dma_flip_programming(
         return false;
     }
     let _ticket = adapter.raise_programming_gate();
+    crate::ddi::immediate_flip::note_dma_arm(immediate);
     let previous = adapter
         .pending_vidpn_allocation
         .swap(h_alloc as usize, Ordering::AcqRel);
@@ -3125,11 +3133,27 @@ pub(crate) fn process_deferred_vidpn_source_address(
         if raw == 0 {
             return None;
         }
-        Some(unsafe { apply_deferred_vidpn_source_address_locked(adapter, lock, raw as HANDLE) })
+        // `ImmFlip`: the immediacy the flip recorded on this allocation (`ForeignFlip` reads it
+        // in the programming).
+        let immediate = crate::ddi::immediate_flip::begin_programming(unsafe {
+            crate::ddi::create_allocation::vidpn_primary_flags(adapter, raw as HANDLE)
+        });
+        let status =
+            unsafe { apply_deferred_vidpn_source_address_locked(adapter, lock, raw as HANDLE) };
+        crate::ddi::immediate_flip::end_programming();
+        Some((status, immediate))
     });
     // The mutex is free again: the `VpDSt` registry write below must not run under a site that
     // says it is held.
     crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_POST);
+    let status = status.map(|(status, immediate)| {
+        // `ImmFlip`: an immediate flip that published its address is retired now, not at the
+        // next vsync tick.
+        if immediate {
+            crate::ddi::immediate_flip::complete_now(adapter);
+        }
+        status
+    });
     if let Some(status) = status {
         // Changed-only: this is one registry transaction per programmed flip on the worker, between
         // two flips (`HpdMx18`); the status is almost always the same.
@@ -3963,15 +3987,23 @@ unsafe fn program_vidpn_source_inner(
     // Nothing when the knob is off; no arm below reads it.
     let idf_pending =
         crate::ddi::indep_flip::worker_pre(&source, (width, height), (mode_w, mode_h));
-    if width != mode_w || height != mode_h {
+    // Larger than the mode: never. Smaller: only `ForeignFlip` below shows it (a
+    // full-screen-exclusive application at a size the mode is not; the host scales the frame),
+    // every other arm needs the mode's exact extent.
+    if width > mode_w || height > mode_h {
         return Err(ScanoutReject::Extent);
     }
+    let smaller = width != mode_w || height != mode_h;
     // `KmdRmClient` = 5 (Option B, `docs/kmd-rm-client.md` 14.3 / 15.6): an allocation that
     // adopted the KMD's own RM system memory is shown by a flip of its GEM from the foreign
     // record: no SET_SCANOUT_BLOB, no GPU copy, no dedicated image. Every other allocation
     // (and every allocation with the knob below 5, after one relaxed load) takes the Venus
     // path below, unchanged; a Venus source also withdraws a resident RM source.
-    {
+    if smaller {
+        // Not the sysmem arm's (it needs the mode's extent): it lets go of the screen as for any
+        // source it does not own, before `ForeignFlip` below takes it.
+        crate::virtio::rm_client::sysmem_flip::other_source(adapter);
+    } else {
         use crate::virtio::rm_client::sysmem_flip::{self as rm_flip, Programmed};
         match rm_flip::program(
             adapter,
@@ -4020,6 +4052,10 @@ unsafe fn program_vidpn_source_inner(
         );
         if let Some(p) = idf_pending {
             p.finish(matches!(arm, FfProgrammed::Ok));
+        }
+        if smaller && !matches!(arm, FfProgrammed::Ok) {
+            // A smaller primary `ForeignFlip` did not take: no other arm can show it.
+            return Err(ScanoutReject::Extent);
         }
         match arm {
             FfProgrammed::NotOurs | FfProgrammed::Refused => {

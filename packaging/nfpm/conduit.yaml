@@ -42,6 +42,20 @@ contents:
   - src: "@STAGE@/etc/apparmor.d/abstractions/conduit"
     dst: /etc/apparmor.d/abstractions/conduit
     type: config|noreplace
+  # Host isolation's root part and the polkit rule that lets local users
+  # start and stop it (docs/HOST-TUNING.md).
+  - src: "@STAGE@/usr/lib/systemd/system/conduit-isolation@.service"
+    dst: /usr/lib/systemd/system/conduit-isolation@.service
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: "@STAGE@/usr/share/polkit-1/rules.d/50-conduit-isolation.rules"
+    dst: /usr/share/polkit-1/rules.d/50-conduit-isolation.rules
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
 
 scripts:
   postinstall: "@SCRIPTS@/conduit-postinst"

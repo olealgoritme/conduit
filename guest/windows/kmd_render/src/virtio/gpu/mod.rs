@@ -2536,6 +2536,9 @@ pub struct VirtioGpu {
     /// The host's mode list (`NVGPU_F_MODE_LIST`) was acked AND the event queue is up:
     /// `DisplayModeList` messages go to `ddi::mode_list`. Fixed for the transport's life.
     mode_list: bool,
+    /// The host packs `EventReady` messages (`NVGPU_F_EVENT_PACKED` acked): every one in a
+    /// buffer is read (`nvrm_events::drain_nvrm_events`). Fixed for the transport's life.
+    event_packed: bool,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
     /// teardown. Starts at 1024 slots and grows (PASSIVE, outside the lock:
@@ -2968,7 +2971,9 @@ impl VirtioGpu {
                     helios_protocol::NVGPU_F_MODE_LIST
                 } else {
                     0
-                })),
+                })
+                // Packed `EventReady`: always (`nvrm_events` reads every message in a buffer).
+                | helios_protocol::NVGPU_F_EVENT_PACKED),
         )?;
         let scanout_release_acked = accepted & helios_protocol::NVGPU_F_SCANOUT_RELEASE != 0;
         let scanout_presented_acked =
@@ -2978,6 +2983,9 @@ impl VirtioGpu {
         // 1 when the host's mode list was acked.
         let mode_list_acked = accepted & helios_protocol::NVGPU_F_MODE_LIST != 0;
         crate::diag::record_named_bytes(b"MlAck", u32::from(mode_list_acked));
+        // 1 when the host packs `EventReady` messages (`NVGPU_F_EVENT_PACKED`).
+        let event_packed_acked = accepted & helios_protocol::NVGPU_F_EVENT_PACKED != 0;
+        crate::diag::record_named_bytes(b"EvPkAck", u32::from(event_packed_acked));
 
         crate::diag::record_named_bytes(b"InitStg", 2); // features negotiated
         // The device only takes `GpuCmd` when the backend runs with `--venus`.
@@ -3296,6 +3304,7 @@ impl VirtioGpu {
             scanout_release: scanout_release_on,
             scanout_presented: scanout_presented_on,
             mode_list: mode_list_on,
+            event_packed: event_packed_acked,
             nvrm_handles: Vec::with_capacity(nvrm_limits.handle_bounds.initial),
             nvrm_reserved: 0,
             nvrm_clients: nvrm_tables::new_client_table(),

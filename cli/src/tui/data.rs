@@ -36,6 +36,9 @@ pub struct Vm {
     /// GPU memory of the VM's host processes (QEMU, backend, Venus).
     pub vram: u64,
     pub helpers: Vec<(String, i32)>,
+    /// Host isolation while it runs: `CCD1 8-15,24-31`, or why not
+    /// (hostiso.rs); `None` when nothing is recorded.
+    pub isolation: Option<String>,
 }
 
 impl Vm {
@@ -384,6 +387,7 @@ impl Collector {
             .unwrap_or(0);
         let mut vms = Vec::new();
         let mut seen = Vec::new();
+        let isolation = crate::hostiso::entries();
         for name in names {
             let mut vm = Vm {
                 name: name.clone(),
@@ -441,6 +445,9 @@ impl Collector {
                         st.mode.clone()
                     };
                 }
+            }
+            if vm.up() {
+                vm.isolation = isolation.get(&name).map(crate::hostiso::short);
             }
             if let Some(pid) = vm.pid {
                 if let Some((t, start)) = proc_ticks(pid) {

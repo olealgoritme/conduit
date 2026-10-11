@@ -44,6 +44,25 @@ mod ffi {
         fn feed_trace_timestamp_ns(self: &HeliosDxvkDevice) -> u64;
         fn feed_trace_render_callback(self: &HeliosDxvkDevice, duration_ns: u64);
         fn feed_trace_present_callback(self: &HeliosDxvkDevice, duration_ns: u64);
+        /// Threaded front end, `docs/d3d11-threaded-frontend.md` §5.2.
+        ///
+        /// # Safety
+        /// `buffer_ptr` is a live `ID3D11Buffer*` of a CPU-writable buffer.
+        /// The returned slice token (0 = failure) must be consumed exactly once
+        /// by `fe_emit_invalidate` or `fe_release_slice`.
+        unsafe fn fe_map_discard(self: &HeliosDxvkDevice, buffer_ptr: usize, data: *mut usize) -> usize;
+        /// # Safety
+        /// `buffer_ptr` is a live `ID3D11Buffer*`.
+        unsafe fn fe_buffer_map_ptr(self: &HeliosDxvkDevice, buffer_ptr: usize) -> usize;
+        /// # Safety
+        /// `buffer_ptr` is a live `ID3D11Buffer*`; `slice` is a token from
+        /// `fe_map_discard`, consumed here. Worker thread only.
+        /// `park`: after the rename, pre-allocate the buffer's next discard
+        /// slice for the app thread (small buffers only).
+        unsafe fn fe_emit_invalidate(self: &HeliosDxvkDevice, buffer_ptr: usize, slice: usize, park: bool);
+        /// # Safety
+        /// `slice` is an unconsumed token from `fe_map_discard`.
+        unsafe fn fe_release_slice(self: &HeliosDxvkDevice, slice: usize);
         /// # Safety
         /// `deferred_context_ptr` is borrowed and live. `command_list_ptr`
         /// transfers one owned COM reference on true; false leaves ownership
@@ -184,6 +203,19 @@ mod ffi {
         /// # Safety: `d3d11_resource_ptr` is 0 or a live `ID3D11Resource*`;
         /// every pointer is live writable storage, `copy` of `copy_len` bytes.
         unsafe fn nvk_present_fence_v3(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            fence_handle: *mut u32,
+            value: *mut u64,
+            copy: *mut u8,
+            copy_len: usize,
+        ) -> i32;
+        /// NVK: `nvk_present_fence_v3` for a value reserved now and signalled
+        /// by DXVK's submission thread after the frame (no SUBMITTED gate;
+        /// flushes the immediate context). As `nvk_present_fence_v3`, plus
+        /// 3 = not available here (nothing flushed or reserved).
+        /// # Safety: as `nvk_present_fence_v3`.
+        unsafe fn nvk_present_fence_async(
             self: &HeliosDxvkDevice,
             d3d11_resource_ptr: usize,
             fence_handle: *mut u32,
@@ -382,7 +414,7 @@ mod ffi {
         fn helios_dxvk_create_device(
             luid_low: u32,
             luid_high: i32,
-            timer_resolution: bool,
+            timer_resolution: u32,
         ) -> UniquePtr<HeliosDxvkDevice>;
     }
 }
@@ -713,6 +745,17 @@ impl PresentStreamCorrelation {
     }
 }
 
+/// What the app-thread half of a front-end discard map produced.
+pub(crate) enum FrontendDiscard {
+    /// A new slice: `slice` is the token the worker hands back to
+    /// `fe_emit_invalidate`, `data` its mapped pointer.
+    Slice { slice: usize, data: usize },
+    /// The buffer has no CPU mapping: take the synchronous map.
+    NotMappable,
+    /// The device is lost.
+    DeviceLost,
+}
+
 /// The DXVK bridge device, with the raw cxx surface sealed off.
 pub struct BridgeDevice {
     inner: cxx::UniquePtr<ffi::HeliosDxvkDevice>,
@@ -758,6 +801,50 @@ impl BridgeDevice {
         // its whole life (see `context_ptr`); ManuallyDrop borrows it.
         (p != 0)
             .then(|| ManuallyDrop::new(unsafe { ID3D11DeviceContext::from_raw(p as *mut c_void) }))
+    }
+
+    /// App-thread half of a dynamic buffer's `Map(WRITE_DISCARD)`.
+    ///
+    /// # Safety
+    /// See the `ffi` declaration.
+    pub(crate) unsafe fn fe_map_discard(&self, buffer_ptr: usize) -> FrontendDiscard {
+        let Some(d) = self.get() else {
+            return FrontendDiscard::DeviceLost;
+        };
+        let mut data = 0usize;
+        let slice = unsafe { d.fe_map_discard(buffer_ptr, &mut data) };
+        match (slice, data) {
+            (0, 1) => FrontendDiscard::NotMappable,
+            (0, _) => FrontendDiscard::DeviceLost,
+            (slice, data) if data > 1 => FrontendDiscard::Slice { slice, data },
+            (slice, _) => {
+                unsafe { d.fe_release_slice(slice) };
+                FrontendDiscard::DeviceLost
+            }
+        }
+    }
+
+    /// # Safety
+    /// See the `ffi` declaration.
+    pub(crate) unsafe fn fe_buffer_map_ptr(&self, buffer_ptr: usize) -> usize {
+        self.get().map_or(0, |d| unsafe { d.fe_buffer_map_ptr(buffer_ptr) })
+    }
+
+    /// # Safety
+    /// See the `ffi` declaration.
+    pub(crate) unsafe fn fe_emit_invalidate(&self, buffer_ptr: usize, slice: usize, park: bool) {
+        match self.get() {
+            Some(d) => unsafe { d.fe_emit_invalidate(buffer_ptr, slice, park) },
+            None => {}
+        }
+    }
+
+    /// # Safety
+    /// See the `ffi` declaration.
+    pub(crate) unsafe fn fe_release_slice(&self, slice: usize) {
+        if let Some(d) = self.get() {
+            unsafe { d.fe_release_slice(slice) }
+        }
     }
 
     /// # Safety
@@ -924,6 +1011,39 @@ impl BridgeDevice {
             0 if fence != 0 => Some((fence, value, Some(copy))),
             2 if fence != 0 => Some((fence, value, None)),
             _ => None,
+        }
+    }
+
+    /// [`Self::nvk_present_fence_v3`] without the SUBMITTED gate before it: the
+    /// fence names a value DXVK's submission thread signals right after the
+    /// frame's submission. `Err(())` when the ICD or the device cannot (no
+    /// version-8 ICD, no RM fences): nothing was flushed or reserved, and the
+    /// caller takes the gated path. `Ok(None)` when it failed after flushing.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn nvk_present_fence_async(
+        &self,
+        res: Option<&ID3D11Resource>,
+    ) -> Result<
+        Option<(
+            u32,
+            u64,
+            Option<[u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES]>,
+        )>,
+        (),
+    > {
+        let d = self.get().ok_or(())?;
+        let (mut fence, mut value) = (0u32, 0u64);
+        let mut copy = [0u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES];
+        let ptr = res.map_or(0, |r| r.as_raw() as usize);
+        // SAFETY: as in `nvk_present_fence_v3`.
+        let r = unsafe {
+            d.nvk_present_fence_async(ptr, &mut fence, &mut value, copy.as_mut_ptr(), copy.len())
+        };
+        match r {
+            0 if fence != 0 => Ok(Some((fence, value, Some(copy)))),
+            2 if fence != 0 => Ok(Some((fence, value, None))),
+            3 => Err(()),
+            _ => Ok(None),
         }
     }
 

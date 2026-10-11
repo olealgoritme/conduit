@@ -14,6 +14,8 @@
 #             per-user session daemon too) may start the bundled QEMU.
 #   SELinux:  labels the bundled QEMU qemu_exec_t, so svirt can transition to it.
 #   Desktop:  refreshes the desktop entry and icon caches.
+#   systemd:  reloads units (conduit-isolation@.service); disable stops every
+#             host isolation instance first, which puts the host back.
 set -u
 
 MARK="# added by conduit-integrate"
@@ -61,7 +63,14 @@ refresh_desktop() {
     fi
 }
 
+systemd_on() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
 do_enable() {
+    if systemd_on; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
     if [ -d "$AA" ]; then
         # libvirt regenerates per-VM profiles at VM start, so no reload is
         # needed for the qemu abstraction; virt-aa-helper's profile is static.
@@ -80,6 +89,9 @@ do_enable() {
 }
 
 do_disable() {
+    if systemd_on; then
+        systemctl stop 'conduit-isolation@*.service' 2>/dev/null || true
+    fi
     drop_line "$AA_QEMU"
     drop_line "$AA_HELPER"
     drop_line "$AA_LIBVIRTD"

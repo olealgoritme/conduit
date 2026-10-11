@@ -393,18 +393,16 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // and 6 `FlipImmediateOnHSync` are accepted, for the independent-flip probe S-0a
     // (docs/zero-copy-present.md). It is read once per StartDevice with the rest of
     // `AdapterKnobs`. 0 reports exactly `FlipOnVSyncMmIo`, as before.
-    // ⚠ `FlipImmediateMmIo` is DELIBERATELY NOT SET, and re-adding it is a
-    // regression. It was set on 2026-07-29 to stop dxgkrnl routing immediate
-    // flips down a DMA-buffer contract this driver ignored (defect 0aa), and it
-    // did fix that — but the MMIO contract it opts into requires the flip to be
-    // COMPLETE when `DxgkDdiSetVidPnSourceAddress` returns, and that DDI
-    // arrives at DIRQL where a virtio `SET_SCANOUT_BLOB` round-trip is illegal.
-    // Returning SUCCESS from a DIRQL stash is a lie dxgkrnl acts on: it frees
-    // the previous buffer to the app and issues the next flip while nothing has
-    // been programmed. Measured the same day: 80 dropped binds and 145 of 1245
-    // present markers writing the buffer that was on screen (defect 0ab).
-    // `ddi/present_packet.rs`'s `PresentFlipPrivate` implements the DMA-buffer
-    // contract instead, which is the one designed for exactly this hardware.
+    // `FlipImmediateMmIo` (bit 3) is reported with `ImmFlip` bit 2 (default on,
+    // `helios_kmd_logic::immediate_flip::flip_caps`). Without it dxgkrnl turns a promoted
+    // application's tearing presents into `FlipOnNextVSync` flips (measured on 405.49), and before
+    // independent flip it sent interval-0 flips down the DMA-buffer contract
+    // (`PresentFlipPrivate`), which stays implemented. The MMIO contract treats an immediate flip as
+    // complete when `SetVidPnSourceAddress` returns at DIRQL; the worker programs it a moment later,
+    // so the application may reuse the previous buffer while the host still shows it. For a flip
+    // that asked not to wait for a retrace that is the expected tear (on 2026-07-29, with the copy
+    // path and every flip immediate, it showed as frames written while on screen, defect 0ab).
+    // `ImmFlip` without bit 2 (3) restores the old caps.
     let flip_caps: UINT = knobs.flip_caps().reported;
     // `HwQueuePktCap`: DXGK_VIDSCHCAPS::HwQueuePacketCap, bits 7..10 (after
     // No64BitAtomics bit 5 and LowIrqlPreemptCommand bit 6; WDK 10.0.26100

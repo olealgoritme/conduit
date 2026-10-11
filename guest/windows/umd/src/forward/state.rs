@@ -54,6 +54,13 @@ pub struct ResourceState {
     /// A D3D11.1 video decoder buffer (`DecoderBufferType` != 0): a staging
     /// buffer the runtime maps for the app and `forward/video.rs` reads back.
     pub(crate) decoder_buffer: bool,
+    /// A `D3D11_USAGE_DYNAMIC` buffer the CPU writes: the threaded front end
+    /// answers its DISCARD / NO_OVERWRITE maps on the app thread
+    /// (`docs/d3d11-threaded-frontend.md` §5.2). Read once at store time.
+    pub(crate) dynamic_buffer: bool,
+    /// `ByteWidth` of a buffer (0 for textures): sizes the front end's copy of
+    /// an `UpdateSubresourceUP` payload.
+    pub(crate) byte_width: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -504,6 +511,17 @@ pub(crate) unsafe fn ctx_bindings<'a>(h: Hdevice) -> Option<&'a crate::device_fu
 /// (`hRTCoreLayer` + callbacks from `D3D11DDIARG_CREATEDEFERREDCONTEXT`), per
 /// the WDK contract — never to the parent device's.
 pub(crate) unsafe fn set_runtime_error(h: Hdevice, hr: i32) {
+    // On the threaded front end's worker no DDI call is in progress, so the
+    // callback is not allowed: stash it for the app thread's next DDI entry
+    // (`docs/d3d11-threaded-frontend.md` §5.10).
+    if helios_umd_common::cmd_queue::CmdQueue::on_any_worker() {
+        if let Some(fe) = helios_device(h).and_then(|d| d.frontend.as_ref()) {
+            if fe.is_worker() {
+                fe.stash_error(hr);
+                return;
+            }
+        }
+    }
     let (core_layer, um_callbacks) = match drv_handle(h) {
         Some(DrvHandle::Device(dev)) => (dev.h_rt_core_layer, dev.um_callbacks),
         Some(DrvHandle::Deferred(dc)) => (dc.dc_core_layer, dc.dc_um_callbacks),
@@ -564,9 +582,18 @@ pub(crate) unsafe fn report_if_removed(h: Hdevice, site: &str) -> bool {
 /// context for a device handle, the DC's own DXVK deferred COM context for a
 /// deferred-context handle. Every context forwarder resolves through this, so
 /// one dispatch serves both tables.
+///
+/// With the threaded front end on, a call from any thread but its worker
+/// first drains the worker: the immediate context is then entered in record
+/// order whichever path reaches it (`docs/d3d11-threaded-frontend.md` §4).
 pub(crate) unsafe fn d3d11_context(h: Hdevice) -> Option<ManuallyDrop<ID3D11DeviceContext>> {
     match drv_handle(h)? {
-        DrvHandle::Device(dev) => dev.dxvk.d3d11_context(),
+        DrvHandle::Device(dev) => {
+            if let Some(fe) = dev.frontend.as_ref() {
+                fe.order_for_app_thread();
+            }
+            dev.dxvk.d3d11_context()
+        }
         DrvHandle::Deferred(dc) => {
             let raw = dc.dc.as_ref()?.as_raw();
             // SAFETY: `dc.dc` owns the reference for the DC's whole life;
@@ -715,10 +742,18 @@ pub(crate) unsafe fn store_resource(
     };
     // One QI here instead of one per bind call. The temporary's release is
     // fine: `com_raw` keeps the object alive, which keeps the pointer valid.
-    let buffer_raw = obj
-        .cast::<ID3D11Buffer>()
-        .map(|b| b.as_raw() as usize)
-        .unwrap_or(0);
+    let buffer = obj.cast::<ID3D11Buffer>().ok();
+    let buffer_raw = buffer.as_ref().map_or(0, |b| b.as_raw() as usize);
+    let (dynamic_buffer, byte_width) = buffer.as_ref().map_or((false, 0), |b| {
+        let mut desc = D3D11_BUFFER_DESC::default();
+        b.GetDesc(&mut desc);
+        (
+            desc.Usage == D3D11_USAGE_DYNAMIC
+                && (desc.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE.0 as u32) != 0,
+            desc.ByteWidth,
+        )
+    });
+    drop(buffer);
     slot.store(ResourceState {
         com_raw: obj.into_raw() as usize,
         buffer_raw,
@@ -729,6 +764,8 @@ pub(crate) unsafe fn store_resource(
         present_private,
         snapshot_source,
         decoder_buffer: false,
+        dynamic_buffer,
+        byte_width,
     });
 }
 

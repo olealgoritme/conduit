@@ -46,6 +46,17 @@ struct HeliosDxvkDevice {
   // The bridge gives it only to that exact deferred context's bounded cache;
   // the list's origin check rejects a cross-DC handoff, and false means the
   // caller still owns and releases the command-list reference.
+  // Threaded front end (docs/d3d11-threaded-frontend.md §5.2). The buffer
+  // address is a live `ID3D11Buffer*` of a CPU-writable buffer, borrowed.
+  // fe_map_discard runs on the app thread: it returns an owned slice token
+  // and its mapped pointer in `*data`; token 0 with `*data == 1` means the
+  // buffer has no CPU mapping, token 0 otherwise that the device is lost. The token is consumed
+  // exactly once, by fe_emit_invalidate on the worker (in replay order) or by
+  // fe_release_slice. fe_buffer_map_ptr is the WRITE_NO_OVERWRITE answer.
+  std::size_t fe_map_discard(std::size_t buffer_ptr, std::size_t* data) const noexcept;
+  std::size_t fe_buffer_map_ptr(std::size_t buffer_ptr) const noexcept;
+  void fe_emit_invalidate(std::size_t buffer_ptr, std::size_t slice, bool park) const noexcept;
+  void fe_release_slice(std::size_t slice) const noexcept;
   bool recycle_deferred_command_list(
       std::size_t deferred_context_ptr,
       std::size_t command_list_ptr) const noexcept;
@@ -161,6 +172,19 @@ struct HeliosDxvkDevice {
                                     std::uint64_t* value,
                                     std::uint8_t* copy,
                                     std::size_t copy_len) const noexcept;
+  // nvk_present_fence_v3 without waiting for the frame's submission
+  // (helios_icd_interface.h version 8): the fence names a value reserved on
+  // this device's present ECL timeline now; DXVK's submission thread signals it
+  // right after the submission that carries the frame
+  // (D3D11ImmediateContext::HeliosSubmitFrameThen). Flushes the immediate
+  // context. Returns as nvk_present_fence_v3, plus 3 = not available here (an
+  // ICD without version 8, no RM fences, another backend): nothing was flushed
+  // or reserved, use nvk_present_fence_v3 after the SUBMITTED gate.
+  std::int32_t nvk_present_fence_async(std::size_t d3d11_resource_ptr,
+                                       std::uint32_t* fence_handle,
+                                       std::uint64_t* value,
+                                       std::uint8_t* copy,
+                                       std::size_t copy_len) const noexcept;
   // Close a fence the caller still owns.
   void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
 
@@ -361,4 +385,4 @@ struct HeliosDxvkDevice {
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high,
-    bool timer_resolution);
+    std::uint32_t timer_resolution);

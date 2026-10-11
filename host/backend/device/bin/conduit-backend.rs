@@ -27,11 +27,14 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+
+mod vinput;
 use device::caps::Caps;
 use device::chain::{
     ReadableAfterWritable, Segment, capacity, sort_chain, writable, write_scattered,
@@ -52,12 +55,12 @@ use device::shm_regions::{SHM_ID_VENUS, region_sizes_with_venus};
 use device::virtio::{CURSOR_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
-    DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT,
-    NVGPU_F_MODE_LIST, NVGPU_F_SCANOUT_PRESENTED, NVGPU_F_SCANOUT_RELEASE,
-    SCANOUT_PRESENTED_MESSAGE_LEN, SCANOUT_RELEASED_MESSAGE_LEN, ScanoutPresented, ScanoutReleased,
-    clipboard_mime, display_mode_list_message_len, encode_clipboard_chunk, encode_display_mode,
-    encode_display_mode_list, encode_input_events, encode_scanout_presented,
-    encode_scanout_released, input_events_that_fit,
+    DisplayModeEvent, EVENT_READY_PER_BUFFER_MAX, InputEventEntry, MsgHeader, MsgType,
+    NVGPU_CFG_TAKES_INPUT, NVGPU_F_EVENT_PACKED, NVGPU_F_MODE_LIST, NVGPU_F_SCANOUT_PRESENTED,
+    NVGPU_F_SCANOUT_RELEASE, SCANOUT_PRESENTED_MESSAGE_LEN, SCANOUT_RELEASED_MESSAGE_LEN,
+    ScanoutPresented, ScanoutReleased, clipboard_mime, display_mode_list_message_len,
+    encode_clipboard_chunk, encode_display_mode, encode_display_mode_list, encode_input_events,
+    encode_scanout_presented, encode_scanout_released, input_events_that_fit,
 };
 use std::os::fd::{BorrowedFd, RawFd};
 use vhost::vhost_user::message::{
@@ -146,6 +149,15 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     console_vnc: Option<PathBuf>,
 
+    /// Serve a virtio-input device (QEMU `vhost-user-input-pci`) on this
+    /// socket: KIND=PATH with KIND mouse, keyboard or tablet. Repeatable.
+    /// The display's input goes straight into its event queue while the
+    /// guest's driver runs it (docs/INPUT.md). Under socket activation the
+    /// sockets come from the service manager instead, named
+    /// input-mouse.sock, input-keyboard.sock and input-tablet.sock.
+    #[arg(long, value_name = "KIND=PATH", value_parser = parse_input_socket)]
+    input_socket: Vec<(device::vinput::Kind, PathBuf)>,
+
     /// Start even when the host driver release has no ABI tables of its own,
     /// using the nearest older release's. Expect guests to fail at their first
     /// channel allocation: the allowlist refuses every class whose size
@@ -232,6 +244,14 @@ struct Args {
     /// docs/research/host-roundtrip-latency.md, "Placement".
     #[arg(long, value_name = "LIST")]
     cpus: Option<String>,
+
+    /// The GPU timeslice of each guest channel group, in microseconds
+    /// (docs/HOST-TUNING.md, "GPU time"): `off` or `0` for RM's own (1024), else
+    /// 50..=1024. A short slice keeps the host's display work from waiting
+    /// behind a busy guest. The guest's own SET_TIMESLICE requests are clamped
+    /// to it. CONDUIT_GUEST_TSG_TIMESLICE_US, when set, overrides it.
+    #[arg(long, value_name = "off|US", default_value = "100")]
+    gpu_timeslice_us: device::gpu_sched::GuestSched,
 }
 
 /// `--latency`. `Default` is every option off (what `off` asks for); the
@@ -653,6 +673,35 @@ fn deliver_event(
         }
     }
     written > 0
+}
+
+/// The next buffer the guest posted on the event queue, to pack `EventReady`
+/// messages into (`EventReports::push_packed`). `None` when none is posted. A
+/// buffer too small for one message goes back used and empty, as
+/// `deliver_event` hands it back.
+fn take_event_buffer(
+    vring: &VringRwLock,
+    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+) -> Option<OpenBuf> {
+    let guard = mem.memory();
+    let (head, segs) = {
+        let mut vr = vring.get_mut();
+        let mut avail = vr.get_queue_mut().iter(guard.clone()).ok()?;
+        let chain = avail.next()?;
+        (chain.head_index(), writable(chain))
+    };
+    let cap = packed_capacity(capacity(&segs));
+    if cap == 0 {
+        let _ = vring.add_used(head, 0);
+        let _ = vring.signal_used_queue();
+        return None;
+    }
+    Some(OpenBuf {
+        head,
+        segs,
+        cap,
+        bytes: Vec::with_capacity(cap),
+    })
 }
 
 /// The event queue and guest memory, once the guest has brought them up.
@@ -1120,6 +1169,9 @@ struct PumpStats {
     backlog_max: usize,
     /// Longest wait in the backlog, microseconds.
     wait_max_us: u64,
+    /// Buffers the reports above went out in (`NVGPU_F_EVENT_PACKED`: fewer
+    /// than the reports; otherwise one each).
+    buffers: u64,
 }
 
 /// The guest's event-queue buffers in hand at most (posted and not yet
@@ -1187,6 +1239,24 @@ fn report_unread(next: u16, pos: u16, free: u16, most: u16) -> bool {
 ///   guest re-posts each buffer as it reads it, in order, so the buffers it
 ///   holds are the newest reports. `CONDUIT_EVENT_COALESCE=0` sends every
 ///   edge.
+///
+/// And two that cut what each report costs the guest:
+///
+/// * **Packing** (`NVGPU_F_EVENT_PACKED`, when the guest acked it). One GPU
+///   non-stall interrupt makes every NVK device's event file readable at
+///   once -- dozens of files with a game, DWM and a few desktop apps open,
+///   about 38,000 reports a second under CS2 (2026-10-10) -- and each took a
+///   buffer, an interrupt and a DPC of its own, and emptied the 16-buffer
+///   ring about 250 times a second. Packed, the reports of one pass share
+///   buffers (up to `EVENT_READY_PER_BUFFER_MAX` each) and the pass raises
+///   one interrupt (`end_pass`). `CONDUIT_EVENT_PACK=0` sends one per buffer.
+/// * **No kicks the pump does not need.** The guest kicks the event queue
+///   each time it re-posts buffers, a VM exit each, and the kick only matters
+///   while reports wait for a buffer (`PumpWake::buffers_posted`). With no
+///   backlog the queue is marked `VRING_USED_F_NO_NOTIFY` (or, with
+///   `EVENT_IDX`, its avail event is left behind), and kicks are asked for
+///   again as soon as a report finds no buffer. `CONDUIT_EVENT_KICKS=1`
+///   leaves them on.
 struct EventReports {
     vring: VringRwLock,
     mem: GuestMemoryAtomic<GuestMemoryMmap>,
@@ -1204,6 +1274,45 @@ struct EventReports {
     last: PumpStats,
     since: Instant,
     wake: Option<Arc<PumpWake>>,
+    /// The guest acked `NVGPU_F_EVENT_PACKED` (set at each device start).
+    packed_acked: Arc<AtomicBool>,
+    /// `CONDUIT_EVENT_PACK` is not 0.
+    pack_on: bool,
+    /// Packing this pass: `pack_on` and the guest's ack, read when no buffer
+    /// is open.
+    packed: bool,
+    /// The buffer this pass is packing into, not yet on the used ring.
+    open: Option<OpenBuf>,
+    /// Buffers went on the used ring since the last interrupt.
+    signal_owed: bool,
+    /// `CONDUIT_EVENT_KICKS` is not 1: kicks are asked for only with a backlog.
+    quiet_kicks: bool,
+    /// Whether the queue asks for kicks now, as last set here (`None`:
+    /// unknown, set on the next pass).
+    kicks: Option<bool>,
+}
+
+/// An event-queue buffer being packed with `EventReady` messages
+/// (`NVGPU_F_EVENT_PACKED`): taken off the avail ring, not yet used.
+struct OpenBuf {
+    head: u16,
+    segs: Vec<Segment>,
+    /// Bytes it takes: whole messages, at most `EVENT_READY_PER_BUFFER_MAX`.
+    cap: usize,
+    bytes: Vec<u8>,
+}
+
+impl OpenBuf {
+    fn has_room(&self) -> bool {
+        self.bytes.len() + size_of::<MsgHeader>() <= self.cap
+    }
+}
+
+/// How many bytes of `EventReady` messages a buffer of `capacity` bytes
+/// takes when packed.
+fn packed_capacity(capacity: usize) -> usize {
+    let msg = size_of::<MsgHeader>();
+    capacity.min(EVENT_READY_PER_BUFFER_MAX * msg) / msg * msg
 }
 
 impl EventReports {
@@ -1211,14 +1320,29 @@ impl EventReports {
         vring: VringRwLock,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
         wake: Option<Arc<PumpWake>>,
+        packed_acked: Arc<AtomicBool>,
     ) -> Self {
-        let off = |name| std::env::var(name).as_deref() == Ok("0");
+        let env = |name| std::env::var(name).ok();
+        let off = |name| env(name).as_deref() == Some("0");
         let backlog_on = !off("CONDUIT_EVENT_BACKLOG");
         let coalesce_on = !off("CONDUIT_EVENT_COALESCE");
+        let pack_on = !off("CONDUIT_EVENT_PACK");
+        let quiet_kicks = env("CONDUIT_EVENT_KICKS").as_deref() != Some("1");
         log::info!(
-            "event pump: backlog {} (cap {BACKLOG_CAP}), coalescing {}",
+            "event pump: backlog {} (cap {BACKLOG_CAP}), coalescing {}, packing {}, \
+             guest kicks {}",
             if backlog_on { "on" } else { "off" },
             if coalesce_on { "on" } else { "off" },
+            if pack_on {
+                "on when the guest acks it"
+            } else {
+                "off"
+            },
+            if quiet_kicks {
+                "only with a backlog"
+            } else {
+                "always"
+            },
         );
         Self {
             vring,
@@ -1233,7 +1357,86 @@ impl EventReports {
             last: PumpStats::default(),
             since: Instant::now(),
             wake,
+            packed: pack_on && packed_acked.load(Ordering::Relaxed),
+            packed_acked,
+            pack_on,
+            open: None,
+            signal_owed: false,
+            quiet_kicks,
+            kicks: None,
         }
+    }
+
+    /// The end of a pass of the event thread: the buffer being packed goes on
+    /// the used ring, and the guest gets one interrupt for everything the pass
+    /// put there (with `pass`, as `--latency event-batch` asks, or packed).
+    fn end_pass(&mut self, pass: &mut Batch) {
+        self.close_open();
+        if std::mem::take(&mut self.signal_owed) {
+            pass.pending = true;
+        }
+        pass.signal(&self.vring);
+        self.packed = self.pack_on && self.packed_acked.load(Ordering::Relaxed);
+    }
+
+    /// Put the buffer being packed on the used ring.
+    fn close_open(&mut self) {
+        let Some(b) = self.open.take() else {
+            return;
+        };
+        let written = write_scattered(&*self.mem.memory(), &b.segs, &b.bytes).unwrap_or(0);
+        if self.vring.add_used(b.head, written as u32).is_ok() {
+            self.signal_owed = true;
+        }
+    }
+
+    /// One `EventReady` into the buffer being packed, or into the next one
+    /// posted. False when the guest has posted none.
+    fn push_packed(&mut self, handle: u32, status: i32) -> bool {
+        if self.open.as_ref().is_none_or(|b| !b.has_room()) {
+            self.close_open();
+            let Some(b) = take_event_buffer(&self.vring, &self.mem) else {
+                return false;
+            };
+            self.stats.buffers += 1;
+            self.open = Some(b);
+        }
+        let b = self.open.as_mut().expect("a buffer with room");
+        b.bytes
+            .extend_from_slice(&event_ready_bytes(handle, status));
+        #[cfg(feature = "trace")]
+        if device::trace::enabled() {
+            use device::trace::format::{Call, Kind, Record};
+            device::trace::emit(Record {
+                ts_ns: device::trace::now_ns(),
+                handle,
+                kind: Kind::Event,
+                call: Call::Event,
+                ..Default::default()
+            });
+        }
+        true
+    }
+
+    /// Ask the guest for kicks on the event queue (`on`), or not. A post
+    /// that raced the ask is not missed: the caller flushes before the pass
+    /// ends.
+    fn set_kicks(&mut self, on: bool) {
+        if !self.quiet_kicks || self.kicks == Some(on) {
+            return;
+        }
+        let mut vr = self.vring.get_mut();
+        // The ring's addresses are only the guest's once it is ready; before
+        // that the flags would land at guest address 0.
+        if !vr.get_queue().ready() {
+            return;
+        }
+        let _ = if on {
+            vr.enable_notification().map(drop)
+        } else {
+            vr.disable_notification()
+        };
+        self.kicks = Some(on);
     }
 
     /// Report `handle` (a fence with its `status`, or an event file).
@@ -1262,6 +1465,9 @@ impl EventReports {
         if let Some(w) = self.wake.as_ref() {
             w.set_backlog(true);
         }
+        // The guest's next re-post has to wake the pump. A post that came
+        // before the ask is found by the flush that ends this pass.
+        self.set_kicks(true);
         Sent::Queued
     }
 
@@ -1285,6 +1491,8 @@ impl EventReports {
         if let Some(w) = self.wake.as_ref() {
             w.set_backlog(false);
         }
+        // Nothing waits for a buffer: the guest's re-posts need not kick.
+        self.set_kicks(false);
     }
 
     /// Whether anything is owed.
@@ -1300,7 +1508,14 @@ impl EventReports {
     }
 
     fn push(&mut self, handle: u32, fence: bool, status: i32, pass: Option<&mut Batch>) -> bool {
-        if !push_event(&self.vring, &self.mem, handle, status, pass) {
+        let sent = if self.packed {
+            self.push_packed(handle, status)
+        } else {
+            let sent = push_event(&self.vring, &self.mem, handle, status, pass);
+            self.stats.buffers += u64::from(sent);
+            sent
+        };
+        if !sent {
             return false;
         }
         if fence {
@@ -1356,12 +1571,14 @@ impl EventReports {
         let d = |a: u64, b: u64| a - b;
         let l = self.last;
         log::info!(
-            "event pump: last {}s: pushed fence {} event {}, coalesced {} (expired {}), \
-             no buffer {} (queued {}, sent from backlog {}, dropped {}), backlog max {}, \
-             wait max {} us; totals: no buffer {} dropped {} coalesced {}",
+            "event pump: last {}s: pushed fence {} event {} in {} buffers{}, coalesced {} \
+             (expired {}), no buffer {} (queued {}, sent from backlog {}, dropped {}), \
+             backlog max {}, wait max {} us; totals: no buffer {} dropped {} coalesced {}",
             PUMP_STATS_EVERY.as_secs(),
             d(s.fence_pushed, l.fence_pushed),
             d(s.event_pushed, l.event_pushed),
+            d(s.buffers, l.buffers),
+            if self.packed { " (packed)" } else { "" },
             d(s.coalesced, l.coalesced),
             d(s.coalesce_expired, l.coalesce_expired),
             d(s.no_buffer, l.no_buffer),
@@ -1378,6 +1595,9 @@ impl EventReports {
         self.stats.backlog_max = self.queued.len();
         self.stats.wait_max_us = 0;
         self.last = self.stats;
+        // Set again on the next pass: a guest that re-made the ring (a driver
+        // reload) has the flags of a fresh one.
+        self.kicks = None;
     }
 }
 
@@ -1439,6 +1659,7 @@ fn event_pump(
     vring: VringRwLock,
     mem: GuestMemoryAtomic<GuestMemoryMmap>,
     batch: bool,
+    packed: Arc<AtomicBool>,
 ) {
     let mut pass = Batch::default();
     // How often to re-check a descriptor that is still readable. See the
@@ -1527,7 +1748,7 @@ fn event_pump(
     let mut add_lat = [0u64; ADD_LAT_BUCKETS_US.len() + 1];
     let mut add_lat_n = 0u64;
     let mut add_lat_max_us = 0u64;
-    let mut reports = EventReports::new(vring.clone(), mem.clone(), wake.clone());
+    let mut reports = EventReports::new(vring.clone(), mem.clone(), wake.clone(), packed);
     let mut delivered: Vec<(u32, bool)> = Vec::new();
     // What `EventReports::flush` sent: a fence is done (as below, `reported`),
     // an event file was reported now.
@@ -1754,7 +1975,7 @@ fn event_pump(
             }
         }
 
-        pass.signal(&vring);
+        reports.end_pass(&mut pass);
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
         let n = unsafe {
             libc::epoll_wait(
@@ -1828,7 +2049,7 @@ fn event_pump(
             &mut last_report,
             &mut recheck,
         );
-        pass.signal(&vring);
+        reports.end_pass(&mut pass);
         // A fence the guest has heard about is done here. Its descriptor
         // stays open until the guest closes the handle.
         for handle in reported {
@@ -2034,6 +2255,9 @@ struct NvGpuBackend {
     event_target_set: bool,
     /// The event pump's wake eventfd, written after each batch of sends.
     watch_wake: Option<Arc<PumpWake>>,
+    /// The guest acked `NVGPU_F_EVENT_PACKED`: the event pump packs its
+    /// `EventReady` messages. Set at each device start.
+    event_packed: Arc<AtomicBool>,
     /// Where display input goes; filled in alongside `watches`.
     input_target: EventTarget,
     /// Whether the guest takes display input: set from the acked features
@@ -2120,6 +2344,7 @@ impl NvGpuBackend {
         input_target: EventTarget,
         input_claims: Arc<GuestInputClaims>,
         safe_mode: bool,
+        guest_sched: device::gpu_sched::GuestSched,
     ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
@@ -2157,6 +2382,7 @@ impl NvGpuBackend {
             log::warn!("{what}: starting anyway (--allow-nearest-abi)");
         }
         nvidia.set_caps(caps);
+        nvidia.set_guest_sched(guest_sched);
         nvidia.set_safe_mode(safe_mode);
         nvidia
             .set_vram_limit_mib(vram_limit_mib)
@@ -2197,6 +2423,7 @@ impl NvGpuBackend {
             watches: None,
             event_target_set: false,
             watch_wake: None,
+            event_packed: Arc::new(AtomicBool::new(false)),
             input_target,
             input_claims,
             display_link,
@@ -2346,9 +2573,10 @@ impl NvGpuBackend {
             let batch = self.latency.event_batch;
             let wake = PumpWake::new().map(Arc::new);
             let pump_wake = wake.clone();
+            let packed = self.event_packed.clone();
             std::thread::Builder::new()
                 .name("nvgpu-events".into())
-                .spawn(move || event_pump(rx, pump_wake, vring, mem, batch))
+                .spawn(move || event_pump(rx, pump_wake, vring, mem, batch, packed))
                 .map(|_| {
                     self.watches = Some(tx);
                     self.watch_wake = wake;
@@ -2618,6 +2846,8 @@ impl VhostUserBackendMut for NvGpuBackend {
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             // Acked by a guest that consumes `InputEvent` (the Linux module).
             | u64::from(NVGPU_CFG_TAKES_INPUT)
+            // Acked by a guest that reads every `EventReady` in a buffer.
+            | u64::from(NVGPU_F_EVENT_PACKED)
             // Acked by a guest that wants `ScanoutReleased`; offered only
             // with a display.
             // Likewise `ScanoutPresented`.
@@ -2667,12 +2897,14 @@ impl VhostUserBackendMut for NvGpuBackend {
         self.input_claims.device_started(features);
         let release = features & u64::from(NVGPU_F_SCANOUT_RELEASE) != 0;
         let presented = features & u64::from(NVGPU_F_SCANOUT_PRESENTED) != 0;
+        let packed = features & u64::from(NVGPU_F_EVENT_PACKED) != 0;
+        self.event_packed.store(packed, Ordering::Relaxed);
         if let Some(link) = self.display_link.as_ref() {
             link.set_release_enabled(release);
             link.set_presented_enabled(presented);
         }
         log::info!(
-            "guest driver features {features:#x}: {}{}{}{}",
+            "guest driver features {features:#x}: {}{}{}{}{}",
             if features & u64::from(NVGPU_CFG_TAKES_INPUT) != 0 {
                 "takes Conduit input"
             } else {
@@ -2690,6 +2922,11 @@ impl VhostUserBackendMut for NvGpuBackend {
             },
             if features & u64::from(NVGPU_F_MODE_LIST) != 0 {
                 ", takes the mode list"
+            } else {
+                ""
+            },
+            if packed {
+                ", reads packed event reports"
             } else {
                 ""
             }
@@ -2832,26 +3069,82 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 }
 
-/// The listening socket systemd passes on socket activation (`sd_listen_fds`:
-/// `LISTEN_PID` is this process, `LISTEN_FDS` is 1, the socket is fd 3).
-fn activated_listener() -> Option<vhost::vhost_user::Listener> {
-    const SD_LISTEN_FDS_START: RawFd = 3;
-    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
-    let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
-    if pid != std::process::id() || n != 1 {
-        return None;
-    }
-    // Only a listening unix stream socket will do.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: fstat on a plain fd number into a local buffer.
-    if unsafe { libc::fstat(SD_LISTEN_FDS_START, &mut st) } != 0
-        || st.st_mode & libc::S_IFMT != libc::S_IFSOCK
+fn parse_input_socket(s: &str) -> Result<(device::vinput::Kind, PathBuf), String> {
+    let (k, p) = s
+        .split_once('=')
+        .ok_or_else(|| format!("{s:?}: expected KIND=PATH"))?;
+    let kind = device::vinput::Kind::parse(k)
+        .ok_or_else(|| format!("{k:?}: expected mouse, keyboard or tablet"))?;
+    Ok((kind, PathBuf::from(p)))
+}
+
+/// What systemd passed on socket activation: the GPU's listening socket and
+/// the virtio-input devices' (each told apart by its file name).
+#[derive(Default)]
+struct Activated {
+    gpu: Option<vhost::vhost_user::Listener>,
+    inputs: Vec<(device::vinput::Kind, vhost::vhost_user::Listener)>,
+}
+
+/// The path a listening unix socket is bound to.
+fn socket_path(fd: RawFd) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: getsockname into a local sockaddr_un of the stated length.
+    if unsafe { libc::getsockname(fd, (&raw mut sa).cast(), &mut len) } != 0
+        || sa.sun_family != libc::AF_UNIX as libc::sa_family_t
     {
         return None;
     }
-    // SAFETY: fd 3 is ours: the service manager handed it over and nothing
-    // else in this process owns it.
-    Some(unsafe { vhost::vhost_user::Listener::from_raw_fd(SD_LISTEN_FDS_START) })
+    let path: Vec<u8> = sa
+        .sun_path
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&path)))
+}
+
+/// The listening sockets systemd passes on socket activation (`sd_listen_fds`:
+/// `LISTEN_PID` is this process, the sockets are fd 3 on). The GPU's is the
+/// one whose name is not a virtio-input device's.
+fn activated_listeners() -> Activated {
+    const SD_LISTEN_FDS_START: RawFd = 3;
+    let mut out = Activated::default();
+    let (Some(pid), Some(n)) = (
+        std::env::var("LISTEN_PID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok()),
+        std::env::var("LISTEN_FDS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok()),
+    ) else {
+        return out;
+    };
+    if pid != std::process::id() || !(1..=16).contains(&n) {
+        return out;
+    }
+    for fd in SD_LISTEN_FDS_START..SD_LISTEN_FDS_START + n {
+        // Only a listening unix stream socket will do.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat on a plain fd number into a local buffer.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            continue;
+        }
+        let kind = socket_path(fd).and_then(|p| device::vinput::Kind::from_socket_path(&p));
+        // SAFETY: the fd is ours: the service manager handed it over and
+        // nothing else in this process owns it.
+        let l = unsafe { vhost::vhost_user::Listener::from_raw_fd(fd) };
+        match kind {
+            Some(k) => out.inputs.push((k, l)),
+            None if out.gpu.is_none() => out.gpu = Some(l),
+            None => {
+                log::warn!("socket activation: fd {fd} is neither the GPU's nor an input socket")
+            }
+        }
+    }
+    out
 }
 
 /// The `--trace` file (or `CONDUIT_TRACE`), created and truncated.
@@ -2964,6 +3257,47 @@ fn guest_queues_probe(target: EventTarget) -> device::console::GuestProbe {
     })
 }
 
+/// Start a daemon per virtio-input device (activated sockets, then
+/// `--input-socket` ones), and hand the display link their ports.
+fn serve_virtio_input(
+    args: &Args,
+    activated: Vec<(device::vinput::Kind, vhost::vhost_user::Listener)>,
+    link: Option<&Arc<DisplayLink>>,
+) -> anyhow::Result<()> {
+    use device::vinput::{Port, Router};
+    let mut listeners = activated;
+    for (k, p) in &args.input_socket {
+        if listeners.iter().any(|(have, _)| have == k) {
+            continue;
+        }
+        let _ = std::fs::remove_file(p);
+        let l = vhost::vhost_user::Listener::new(p, true)
+            .map_err(|e| anyhow::anyhow!("--input-socket {}={}: {e}", k.name(), p.display()))?;
+        listeners.push((*k, l));
+    }
+    if listeners.is_empty() {
+        return Ok(());
+    }
+    let Some(link) = link else {
+        log::warn!("virtio-input: no display, so no input to give the devices; not served");
+        return Ok(());
+    };
+    let mut ports: [Option<Arc<dyn Port>>; 3] = [None, None, None];
+    let mut names = Vec::new();
+    for (k, l) in listeners {
+        let port = vinput::serve(k, l)?;
+        ports[k as usize] = Some(port as Arc<dyn Port>);
+        names.push(k.name());
+    }
+    log::info!(
+        "virtio-input: serving {} (QEMU vhost-user-input-pci); each takes the boot console's \
+         input once the guest's driver runs it",
+        names.join(", ")
+    );
+    link.attach_virtio_input(Router::new(ports));
+    Ok(())
+}
+
 /// Like `VhostUserDaemon::serve`: a guest that quits mid-message is a normal end.
 fn disconnect_is_ok(e: vhost_user_backend::Error) -> Result<(), vhost_user_backend::Error> {
     use vhost::vhost_user::Error as VuError;
@@ -2992,7 +3326,10 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     // Before the sandbox, which may not allow the fstat that checks it.
-    let activated = activated_listener();
+    let Activated {
+        gpu: activated,
+        inputs: activated_inputs,
+    } = activated_listeners();
     // Before any device is opened: the host driver judges every guest call by
     // this process's credentials (device::posture).
     device::posture::enforce()?;
@@ -3022,6 +3359,8 @@ fn main() -> anyhow::Result<()> {
             socket_dirs.push(d);
         }
     }
+    // The frame probe's file likewise (`CONDUIT_FRAME_PROBE`; nothing without it).
+    device::frame_probe::init();
     let report = device::sandbox::enter(&device::sandbox::Paths {
         devices: device::sandbox::gpu_nodes(),
         read_only: vec![
@@ -3146,6 +3485,11 @@ fn main() -> anyhow::Result<()> {
         (None, _) => None,
     };
 
+    // The virtio-input devices: served now, so a frontend that connected
+    // already (socket activation queued it) gets its answers. Their input
+    // comes from the display link's console path.
+    serve_virtio_input(&args, activated_inputs, display.as_ref().map(|d| &d.1))?;
+
     let window_len = device::shm_regions::window_len(window_mib)
         .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
     log::info!("window: {window_mib} MiB (shmid {SHM_ID_WINDOW}; {window_why})");
@@ -3169,6 +3513,7 @@ fn main() -> anyhow::Result<()> {
         input_target,
         input_claims,
         safe_mode,
+        device::gpu_sched::GuestSched::effective(args.gpu_timeslice_us),
     )?;
     #[cfg(feature = "venus")]
     if args.venus {
@@ -3453,6 +3798,20 @@ mod tests {
         assert_eq!(a.latency, Latency::default());
     }
 
+    #[test]
+    fn gpu_timeslice_defaults_to_100_us() {
+        use clap::Parser;
+        use device::gpu_sched::GuestSched;
+        let a = Args::try_parse_from(["conduit-backend"]).unwrap();
+        assert_eq!(a.gpu_timeslice_us, GuestSched::default());
+        assert_eq!(a.gpu_timeslice_us.timeslice_us, Some(100));
+        let a = Args::try_parse_from(["conduit-backend", "--gpu-timeslice-us", "off"]).unwrap();
+        assert_eq!(a.gpu_timeslice_us, GuestSched::NONE);
+        let a = Args::try_parse_from(["conduit-backend", "--gpu-timeslice-us", "250"]).unwrap();
+        assert_eq!(a.gpu_timeslice_us.timeslice_us, Some(250));
+        assert!(Args::try_parse_from(["conduit-backend", "--gpu-timeslice-us", "10"]).is_err());
+    }
+
     /// A fence's status rides in the header, signed, as the guest reads it.
     #[test]
     fn event_ready_carries_a_fence_status() {
@@ -3462,6 +3821,237 @@ mod tests {
         assert_eq!(hdr.handle, 42);
         assert_eq!(hdr.status, -libc::ETIMEDOUT);
         assert_eq!(event_ready_bytes(42, 0)[8..12], [0, 0, 0, 0]);
+    }
+
+    /// An event queue of 16 entries in test memory: descriptors at 0x1000,
+    /// avail ring at 0x2000, used ring at 0x3000, buffer `i` (`len` bytes,
+    /// device-writable) at 0x4000 + 0x200 * i.
+    struct TestEventQueue {
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        vring: VringRwLock,
+        posted: u16,
+    }
+
+    impl TestEventQueue {
+        const DESC: u64 = 0x1000;
+        const AVAIL: u64 = 0x2000;
+        const USED: u64 = 0x3000;
+        const BUFS: u64 = 0x4000;
+
+        fn new() -> Self {
+            let gm = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let mem = GuestMemoryAtomic::new(gm);
+            let vring = VringRwLock::new(mem.clone(), 256).unwrap();
+            vring.set_queue_size(16);
+            vring
+                .set_queue_info(Self::DESC, Self::AVAIL, Self::USED)
+                .unwrap();
+            vring.set_queue_ready(true);
+            Self {
+                mem,
+                vring,
+                posted: 0,
+            }
+        }
+
+        /// Post `n` more buffers of `len` bytes, as the guest's driver does.
+        fn post(&mut self, n: u16, len: u32) {
+            let m = self.mem.memory();
+            for _ in 0..n {
+                let slot = self.posted % 16;
+                let d = GuestAddress(Self::DESC + 16 * u64::from(slot));
+                m.write_obj((Self::BUFS + 0x200 * u64::from(slot)).to_le(), d)
+                    .unwrap();
+                m.write_obj(len.to_le(), d.unchecked_add(8)).unwrap();
+                m.write_obj(2u16.to_le(), d.unchecked_add(12)).unwrap(); // WRITE
+                m.write_obj(0u16, d.unchecked_add(14)).unwrap();
+                m.write_obj(
+                    slot.to_le(),
+                    GuestAddress(Self::AVAIL + 4 + 2 * u64::from(slot)),
+                )
+                .unwrap();
+                self.posted = self.posted.wrapping_add(1);
+            }
+            m.write_obj(self.posted.to_le(), GuestAddress(Self::AVAIL + 2))
+                .unwrap();
+        }
+
+        /// The used ring as the guest reads it: (buffer index, length) of
+        /// every entry so far.
+        fn used(&self) -> Vec<(u32, u32)> {
+            let m = self.mem.memory();
+            let n: u16 = m.read_obj(GuestAddress(Self::USED + 2)).unwrap();
+            (0..n)
+                .map(|k| {
+                    let e = GuestAddress(Self::USED + 4 + 8 * u64::from(k % 16));
+                    (
+                        m.read_obj::<u32>(e).unwrap(),
+                        m.read_obj::<u32>(e.unchecked_add(4)).unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        /// The `EventReady` messages in buffer `id`, `len` bytes of them:
+        /// (handle, status) each.
+        fn messages(&self, id: u32, len: u32) -> Vec<(u32, i32)> {
+            let m = self.mem.memory();
+            let mut b = vec![0u8; len as usize];
+            m.read_slice(&mut b, GuestAddress(Self::BUFS + 0x200 * u64::from(id)))
+                .unwrap();
+            b.chunks(16)
+                .map(|c| {
+                    let w = |at: usize| u32::from_le_bytes(c[at..at + 4].try_into().unwrap());
+                    assert_eq!(w(0), MsgType::EventReady as u32);
+                    (w(4), w(8) as i32)
+                })
+                .collect()
+        }
+
+        fn used_flags(&self) -> u16 {
+            self.mem
+                .memory()
+                .read_obj(GuestAddress(Self::USED))
+                .unwrap()
+        }
+
+        fn reports(&self, packed: bool) -> EventReports {
+            EventReports::new(
+                self.vring.clone(),
+                self.mem.clone(),
+                None,
+                Arc::new(AtomicBool::new(packed)),
+            )
+        }
+    }
+
+    #[test]
+    fn a_packed_buffer_takes_whole_messages_up_to_the_cap() {
+        assert_eq!(packed_capacity(512), 512);
+        assert_eq!(packed_capacity(4096), 16 * EVENT_READY_PER_BUFFER_MAX);
+        assert_eq!(packed_capacity(40), 32);
+        assert_eq!(packed_capacity(16), 16);
+        assert_eq!(packed_capacity(15), 0);
+    }
+
+    /// A guest that acked `NVGPU_F_EVENT_PACKED`: the reports of one pass
+    /// share buffers, in order, fences with their status among them, and the
+    /// last buffer goes on the used ring when the pass ends.
+    #[test]
+    fn one_pass_of_reports_is_packed_into_as_few_buffers_as_fit() {
+        let mut q = TestEventQueue::new();
+        q.post(16, 512);
+        let mut r = q.reports(true);
+        let mut pass = Batch::default();
+        for h in 1..=40u32 {
+            let fence = h == 7;
+            let status = if fence { -libc::ETIMEDOUT } else { 0 };
+            assert_eq!(r.report(h, fence, status, None), Sent::Pushed);
+        }
+        // The full buffer is on the used ring (no interrupt yet); the open
+        // one is not the guest's until the pass ends.
+        assert_eq!(q.used(), [(0, 512)]);
+        assert!(!pass.pending);
+        r.end_pass(&mut pass);
+        let used = q.used();
+        assert_eq!(used, [(0, 512), (1, 128)]);
+        let mut all = q.messages(0, 512);
+        all.extend(q.messages(1, 128));
+        let want: Vec<(u32, i32)> = (1..=40u32)
+            .map(|h| (h, if h == 7 { -libc::ETIMEDOUT } else { 0 }))
+            .collect();
+        assert_eq!(all, want);
+        assert_eq!(r.stats.buffers, 2);
+        assert_eq!(r.stats.event_pushed, 39);
+        assert_eq!(r.stats.fence_pushed, 1);
+        assert_eq!(r.stats.no_buffer, 0);
+        // The next pass opens a buffer of its own.
+        assert_eq!(r.report(41, false, 0, None), Sent::Pushed);
+        r.end_pass(&mut pass);
+        assert_eq!(q.used()[2], (2, 16));
+    }
+
+    /// Without the guest's ack, one message per buffer, as before.
+    #[test]
+    fn a_guest_without_the_ack_gets_one_report_per_buffer() {
+        let mut q = TestEventQueue::new();
+        q.post(16, 512);
+        let mut r = q.reports(false);
+        let mut pass = Batch::default();
+        for h in 1..=3u32 {
+            assert_eq!(r.report(h, false, 0, None), Sent::Pushed);
+        }
+        r.end_pass(&mut pass);
+        assert_eq!(q.used(), [(0, 16), (1, 16), (2, 16)]);
+        assert_eq!(q.messages(2, 16), [(3, 0)]);
+        assert_eq!(r.stats.buffers, 3);
+    }
+
+    /// Packed reports that run out of buffers wait in the backlog and go out,
+    /// packed, with the guest's next posts.
+    #[test]
+    fn packed_reports_with_no_buffer_go_out_with_the_next_post() {
+        let mut q = TestEventQueue::new();
+        q.post(1, 512);
+        let mut r = q.reports(true);
+        let mut pass = Batch::default();
+        let mut delivered = Vec::new();
+        for h in 1..=34u32 {
+            r.report(h, false, 0, None);
+        }
+        assert_eq!(r.stats.no_buffer, 2);
+        r.end_pass(&mut pass);
+        assert_eq!(q.used(), [(0, 512)]);
+        q.post(1, 512);
+        let mut p = None;
+        r.flush(&mut p, &mut delivered);
+        r.end_pass(&mut pass);
+        assert_eq!(delivered, [(33, false), (34, false)]);
+        assert_eq!(q.used()[1], (1, 32));
+        assert_eq!(q.messages(1, 32), [(33, 0), (34, 0)]);
+    }
+
+    /// The guest is asked to kick the event queue only while reports wait
+    /// for a buffer.
+    #[test]
+    fn the_guest_kicks_the_event_queue_only_for_a_backlog() {
+        let mut q = TestEventQueue::new();
+        let mut r = q.reports(true);
+        let mut pass = Batch::default();
+        let mut delivered = Vec::new();
+        let mut p = None;
+        assert_eq!(q.used_flags(), 0, "a fresh ring asks for kicks");
+        r.flush(&mut p, &mut delivered);
+        assert_eq!(q.used_flags(), 1, "nothing owed: VRING_USED_F_NO_NOTIFY");
+        // No buffer: the report waits, and the next post must kick.
+        assert_eq!(r.report(5, false, 0, None), Sent::Queued);
+        assert_eq!(q.used_flags(), 0);
+        q.post(4, 512);
+        r.flush(&mut p, &mut delivered);
+        r.end_pass(&mut pass);
+        assert_eq!(delivered, [(5, false)]);
+        assert_eq!(q.used_flags(), 1);
+        // Re-asserted after the stats interval (a ring the guest re-made).
+        q.mem
+            .memory()
+            .write_obj(0u16, GuestAddress(TestEventQueue::USED))
+            .unwrap();
+        r.kicks = None;
+        r.flush(&mut p, &mut delivered);
+        assert_eq!(q.used_flags(), 1);
+    }
+
+    /// A queue the guest has not made ready is never written.
+    #[test]
+    fn kicks_are_left_alone_on_a_queue_that_is_not_ready() {
+        let q = TestEventQueue::new();
+        q.vring.set_queue_ready(false);
+        let mut r = q.reports(true);
+        let mut delivered = Vec::new();
+        let mut p = None;
+        r.flush(&mut p, &mut delivered);
+        assert_eq!(q.used_flags(), 0);
+        assert_eq!(r.kicks, None);
     }
 
     /// SYNC_IOC_FILE_INFO against the real kernel: a signalled sync_file

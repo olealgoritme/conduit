@@ -615,11 +615,17 @@ fn try_direct(adapter: &AdapterContext, token: u64, boundary: u64, dst: u32) {
             let Ok(value) = rio::submit(acquire, &copy) else {
                 return false;
             };
+            // Still under the channel's I/O: no slot can be given back before this lands.
+            rio::note_submitted(&producer.lease, value);
             if let Some(j) = g.jobs.find_mut(token, boundary) {
                 j.state = JobState::Submitted { value, t_submit: now_100ns() };
                 j.direct = true;
                 j.seen = 0;
-                j.prep = Prep::Ready { sem_va: producer.sem_va, src_va: producer.src_va };
+                j.prep = Prep::Ready {
+                    sem_va: producer.sem_va,
+                    src_va: producer.src_va,
+                    lease: producer.lease,
+                };
             }
             if let Some(e) = g.dst(dst) {
                 // No clock yet: it starts when the CPU sees the producer finish (`settle`).
@@ -897,9 +903,15 @@ pub(crate) fn dispatch(adapter: &AdapterContext, token: u64, boundary: u64) -> b
         (_, Err(w), _) => Err(w),
         (_, _, None) => Err(Why::ChannelLost),
         _ if !chan_up => Err(Why::ChannelLost),
-        (Prep::Ready { sem_va, src_va }, Ok(dst_va), Some(c)) => Ok((sem_va, src_va, dst_va, c)),
+        // Prepared on an earlier pass: a later preparation may have given a slot back and re-made
+        // it since (another image, a client-table change), and its VA then maps something else,
+        // or nothing. Only a lease that still holds is submitted.
+        (Prep::Ready { lease, .. }, _, _) if !rio::lease_holds(&lease) => Err(Why::NotReady),
+        (Prep::Ready { sem_va, src_va, lease }, Ok(dst_va), Some(c)) => {
+            Ok((sem_va, src_va, lease, dst_va, c))
+        }
     };
-    let (sem_va, src_va, dst_va, completed) = match ready {
+    let (sem_va, src_va, lease, dst_va, completed) = match ready {
         Ok(v) => v,
         Err(why) => {
             let _ = g.jobs.remove(token, boundary);
@@ -930,6 +942,9 @@ pub(crate) fn dispatch(adapter: &AdapterContext, token: u64, boundary: u64) -> b
     };
     match rio::submit(acquire, &copy) {
         Ok(value) => {
+            // The worker is the only thread that prepares (gives slots back), and this is the
+            // worker: nothing gives these slots back before the note.
+            rio::note_submitted(&lease, value);
             let now = now_100ns();
             if let Some(j) = g.jobs.find_mut(token, boundary) {
                 j.state = JobState::Submitted { value, t_submit: now };
@@ -1409,6 +1424,7 @@ fn prepare(passive: PassiveLevel, adapter: &AdapterContext) {
                     Some(p) => Prep::Ready {
                         sem_va: p.sem_va,
                         src_va: p.src_va,
+                        lease: p.lease,
                     },
                     None => {
                         add_us(&DUP_US, t0);
@@ -1420,6 +1436,7 @@ fn prepare(passive: PassiveLevel, adapter: &AdapterContext) {
                 Ok(p) => Prep::Ready {
                     sem_va: p.sem_va,
                     src_va: p.src_va,
+                    lease: p.lease,
                 },
                 Err(f) if rio::is_busy(&f) => {
                     add_us(&DUP_US, t0);
@@ -1812,8 +1829,9 @@ pub(crate) fn vram_destination_gone(resource_id: u32) {
 }
 
 /// StopDevice (the worker joined) and a StartDevice that finds an old transport, BEFORE the
-/// channel's own `retire_for_stop`: free every destination descriptor nothing can still write
-/// and release the producer dups while the transport answers, on the caller's budget. What is
+/// channel's own `retire_for_stop`: free every destination descriptor nothing can still write,
+/// on the caller's budget (the producer dups go with the channel's teardown right after, which
+/// gives them back only once nothing on the ring can still read them). What is
 /// leaked keeps its pin until [`forget`] (after the transport reset). One relaxed load with
 /// nothing held. PASSIVE.
 pub(crate) fn retire_for_stop(
@@ -1831,7 +1849,6 @@ pub(crate) fn retire_for_stop(
         return;
     }
     free_all_descriptors(passive, adapter, cr::IO_WAIT_MS);
-    rio::release_producers(passive, adapter, *budget, cr::IO_WAIT_MS);
 }
 
 /// The transport is gone (`rm_client::forget`, after the device reset); the jobs died with the

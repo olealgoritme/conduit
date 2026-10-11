@@ -412,6 +412,20 @@ foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW", "InstalledDis
 }
 Write-HeliosJson $state $statePath
 
+# Red Hat's signed vioinput driver for virtio-input keyboards, mice and tablets
+# (PCI 1AF4:1052), when the package carries it. Optional: a failure here must
+# not stop the graphics install. Uninstall leaves it in place, like any other
+# generic device driver the VM's hardware needs.
+$vioinputInf = Join-Path $payloadRoot "drivers\vioinput\vioinput.inf"
+if (Test-Path -LiteralPath $vioinputInf -PathType Leaf) {
+    try {
+        Write-Host "Installing the virtio-input driver (vioinput)..."
+        Invoke-HeliosNative "pnputil.exe" @("/add-driver", $vioinputInf, "/install") -SuccessExitCodes @(0, 259, 3010)
+    } catch {
+        Write-Warning "The virtio-input driver was not installed: $($_.Exception.Message)"
+    }
+}
+
 $vulkanDll = Join-Path $runtimeRoot "mesa\vulkan_virtio.dll"
 Write-HeliosProgress 82 "Registering Vulkan, OpenGL and OpenCL"
 $vulkanJson = [ordered]@{

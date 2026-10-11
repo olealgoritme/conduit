@@ -1034,6 +1034,19 @@ pub fn run_vm(name: &str) -> i32 {
             r.line(Level::Fail, "GPU backend", "not running although the VM is",
                 &format!("Its log: conduit logs {name} backend\nRestart the VM (conduit down {name}; conduit up {name})"));
         }
+        if let Some(pages) = v.qemu_pid(&link.domain).and_then(crate::mem::guest_pages) {
+            let (warn, detail) = crate::mem::guest_pages_verdict(&pages);
+            r.line(
+                if warn { Level::Warn } else { Level::Ok },
+                "Guest RAM pages",
+                &detail,
+                if warn {
+                    "Reserve 2 MiB huge pages at boot and back the VM with them: docs/HOST-TUNING.md, \"Memory\""
+                } else {
+                    ""
+                },
+            );
+        }
         let ver = if let Some(c) = &cfg {
             crate::run::ssh_cmd(c, "root")
                 .args([
@@ -1095,6 +1108,14 @@ pub fn run_vm(name: &str) -> i32 {
                 "Close programs or stop another VM first",
             );
         }
+    }
+    for f in crate::hostiso::findings(name, &xml, &link, virt::state_is_up(&state), &repair) {
+        r.line(
+            if f.warn { Level::Warn } else { Level::Ok },
+            &f.title,
+            &f.detail,
+            &f.fix,
+        );
     }
     let blog = logs.join("backend.log");
     if blog.is_file() {

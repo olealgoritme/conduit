@@ -12,6 +12,20 @@
 //! release/presentation reports, `DisplayModeList` (the mode list) and
 //! `DisplayMode` (a mode request, published for the tray to apply).
 //!
+//! # Packed `EventReady`, and kicks
+//!
+//! The KMD acks `NVGPU_F_EVENT_PACKED` (bit 22): a host that offers it puts the
+//! `EventReady` messages of one pass of its event thread into as few buffers as fit,
+//! whole headers back to back (`helios_kmd_logic::event_ready`), with one interrupt per
+//! pass. One GPU non-stall interrupt makes every NVK device's event file readable at
+//! once, so one buffer per report emptied this 16-buffer ring hundreds of times a
+//! second under a game. [`drain_nvrm_events`] reads every message of such a buffer
+//! (`NvEvPkM` messages in `NvEvPkB` buffers) before posting it again.
+//!
+//! The re-post kick (`transport.notify`) is a VM exit. It goes out only when the queue
+//! asks for one (`should_notify`), and the host asks only while it holds reports it had
+//! no buffer for.
+//!
 //! # Availability, and the input bit
 //!
 //! No feature bit is needed for `EventReady`: the host offers every handle the
@@ -56,7 +70,8 @@
 use super::*;
 use crate::virtio::nvrm::{
     NVRM_EV_DROPS, NVRM_EV_ERRORS, NVRM_EV_FULL, NVRM_EV_LATCHED, NVRM_EV_LOST, NVRM_EV_MAX_PASS,
-    NVRM_EV_OTHER, NVRM_EV_SIGNALS, NVRM_FENCE_ERRORS, NVRM_FENCE_FIRED,
+    NVRM_EV_OTHER, NVRM_EV_PACKED_BUFS, NVRM_EV_PACKED_MSGS, NVRM_EV_SIGNALS, NVRM_FENCE_ERRORS,
+    NVRM_FENCE_FIRED,
 };
 use helios_kmd_logic::nvrm_events::{
     kind_has_no_handle, kind_known, Added, KINDS_ALL, KINDS_SCANOUT_RELEASE, KIND_LOST, KIND_READY,
@@ -89,7 +104,8 @@ pub(super) const EVENT_QUEUE: u16 = 1;
 /// non-stall event files and the RM fences fill all 16 before the DPC runs
 /// (`NvEvFull`), and the host keeps what finds no buffer and sends it on the
 /// re-post kick (its event backlog) and coalesces a non-stall report the driver
-/// has not read yet. Growing this needs the boot-stack budget measured first.
+/// has not read yet; a host that packs (`NVGPU_F_EVENT_PACKED`) puts up to 32
+/// reports in each buffer. Growing this needs the boot-stack budget measured first.
 const EVENT_QUEUE_SIZE: usize = 16;
 /// Bytes of one posted buffer: room for the 16-byte `EventReady`, the 48-byte
 /// `ScanoutReleased` and the whole `DisplayModeList` (416 bytes at its 48-mode cap;
@@ -114,6 +130,20 @@ const _: () = {
             == helios_protocol::NVGPU_F_SCANOUT_RELEASE
                 | helios_protocol::NVGPU_F_SCANOUT_PRESENTED
                 | helios_protocol::NVGPU_F_MODE_LIST
+                | helios_protocol::NVGPU_F_EVENT_PACKED
+    );
+    // Packed `EventReady`: the parser's constants are the ABI's, and a buffer holds the most
+    // the host packs.
+    assert!(helios_protocol::NVGPU_F_EVENT_PACKED == helios_kmd_logic::event_ready::FEATURE);
+    assert!(
+        helios_protocol::EVENT_READY_PER_BUFFER_MAX
+            == helios_kmd_logic::event_ready::PER_BUFFER_MAX
+    );
+    assert!(MSG_EVENT_READY == helios_kmd_logic::event_ready::MSG_EVENT_READY);
+    assert!(
+        EVENT_BUF_BYTES
+            >= helios_kmd_logic::event_ready::PER_BUFFER_MAX
+                * helios_kmd_logic::event_ready::MSG_BYTES
     );
     assert!(helios_protocol::NVGPU_F_MODE_LIST == helios_kmd_logic::mode_list::FEATURE);
     // The largest mode list fits one posted buffer.
@@ -200,6 +230,10 @@ enum Taken {
     /// `EventReady` for this backend handle, with the header `status` (0, or a
     /// fence's error such as `-ETIMEDOUT`).
     Ready(u32, i32),
+    /// `count` (2 or more) `EventReady` messages packed in buffer `slot`
+    /// (`NVGPU_F_EVENT_PACKED`). The buffer is NOT posted again yet: the caller
+    /// reads them out of it (`helios_kmd_logic::event_ready::entry`), then posts it.
+    Packed { slot: usize, count: usize },
     /// `ScanoutReleased` (message 28), whole.
     Released(Released),
     /// `ScanoutPresented` (message 33), whole.
@@ -215,8 +249,9 @@ enum Taken {
 }
 
 /// Take one filled buffer off the queue, read it, and give the buffer straight
-/// back to the host.
-fn take_event(ring: &mut EventRing) -> Taken {
+/// back to the host -- except a buffer of packed `EventReady` messages (`packed`:
+/// the host packs them), which the caller reads and posts ([`Taken::Packed`]).
+fn take_event(ring: &mut EventRing, packed: bool) -> Taken {
     let Some(token) = ring.queue.peek_used() else {
         return Taken::Empty;
     };
@@ -249,7 +284,10 @@ fn take_event(ring: &mut EventRing) -> Taken {
         };
         match (len >= 16, word(0), word(4), word(8)) {
             (true, Some(MSG_EVENT_READY), Some(handle), Some(status)) => {
-                Taken::Ready(handle, status as i32)
+                match helios_kmd_logic::event_ready::count(bytes, len, packed) {
+                    count @ 2.. => Taken::Packed { slot, count },
+                    _ => Taken::Ready(handle, status as i32),
+                }
             }
             (true, Some(MSG_SCANOUT_RELEASED), _, _) => match parse_release(bytes, len) {
                 Parsed::Released(r) => Taken::Released(r),
@@ -282,6 +320,9 @@ fn take_event(ring: &mut EventRing) -> Taken {
             _ => Taken::Other,
         }
     };
+    if matches!(taken, Taken::Packed { .. }) {
+        return taken;
+    }
     if !post_slot(ring, slot) {
         NVRM_EV_ERRORS.fetch_add(1, Ordering::Relaxed);
     }
@@ -583,6 +624,39 @@ impl VirtioGpu {
         wake_worker
     }
 
+    /// The `count` `EventReady` messages packed in event buffer `slot`, each as
+    /// [`Self::deliver_nvrm_ready`]; then the buffer goes back to the host. Each
+    /// message is copied out before it is delivered: the buffer is the driver's until
+    /// it is posted again, last.
+    fn deliver_packed(&mut self, slot: usize, count: usize) -> bool {
+        let mut wake_worker = false;
+        for i in 0..count {
+            let msg = self.nvrm_event_ring.as_ref().and_then(|ring| {
+                let span = ring.bufs.span(slot * EVENT_BUF_BYTES, EVENT_BUF_BYTES)?;
+                // SAFETY: the buffer `take_event` popped and did not post again, so the
+                // device does not write it until `post_slot` below.
+                helios_kmd_logic::event_ready::entry(unsafe { span.as_slice() }, i)
+            });
+            match msg {
+                Some((handle, status)) => {
+                    wake_worker |= self.deliver_nvrm_ready(handle, status);
+                }
+                None => {
+                    NVRM_EV_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        NVRM_EV_PACKED_MSGS.fetch_add(count as u32, Ordering::Relaxed);
+        NVRM_EV_PACKED_BUFS.fetch_add(1, Ordering::Relaxed);
+        if let Some(ring) = self.nvrm_event_ring.as_mut() {
+            if !post_slot(ring, slot) {
+                NVRM_EV_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        wake_worker
+    }
+
     /// One `ScanoutReleased`: retire the flip it names in the book, then wake whoever
     /// waits for it: a user owner's registered `SCANOUT_RELEASED` events, or (the KMD's
     /// own ring presenter) the HPD worker. Allocation-free; leaf lock inside.
@@ -623,7 +697,7 @@ impl VirtioGpu {
             let Some(ring) = self.nvrm_event_ring.as_mut() else {
                 return wake_worker;
             };
-            let event = take_event(ring);
+            let event = take_event(ring, self.event_packed);
             if !matches!(event, Taken::Empty | Taken::Broken) {
                 taken += 1;
             }
@@ -632,6 +706,10 @@ impl VirtioGpu {
                 Taken::Ready(handle, status) => {
                     reposted = true;
                     wake_worker |= self.deliver_nvrm_ready(handle, status);
+                }
+                Taken::Packed { slot, count } => {
+                    reposted = true;
+                    wake_worker |= self.deliver_packed(slot, count);
                 }
                 Taken::Released(release) => {
                     // No kick for the reposted buffer (`reposted` stays as it was): a

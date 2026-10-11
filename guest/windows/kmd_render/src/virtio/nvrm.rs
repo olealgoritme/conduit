@@ -189,6 +189,10 @@ pub static NVRM_EV_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// pass took (`NvEvMaxP`).
 pub static NVRM_EV_FULL: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_MAX_PASS: AtomicU32 = AtomicU32::new(0);
+/// `EventReady` messages that came in buffers holding more than one
+/// (`NVGPU_F_EVENT_PACKED`; `NvEvPkM`), and those buffers (`NvEvPkB`).
+pub static NVRM_EV_PACKED_MSGS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_EV_PACKED_BUFS: AtomicU32 = AtomicU32::new(0);
 /// What a transport found still tracked when it was dropped (handles, mappings and
 /// pins nobody had closed: dxgkrnl normally destroys every device first, so this
 /// is 0), the user views left behind by it (`NvStale`), and how many of those the

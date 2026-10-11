@@ -13,6 +13,8 @@ pub mod chain;
 pub mod console;
 pub mod display;
 pub mod error;
+pub mod frame_probe;
+pub mod gpu_sched;
 pub mod guarded;
 pub mod guestmem;
 pub mod handle_table;
@@ -32,5 +34,6 @@ pub mod trace;
 pub mod userspace;
 #[cfg(feature = "venus")]
 pub mod venus;
+pub mod vinput;
 pub mod virtio;
 pub mod vram;

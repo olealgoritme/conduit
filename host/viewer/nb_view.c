@@ -606,7 +606,57 @@ void nb_vstore_init(struct nb_vstore *st)
 {
     memset(st, 0, sizeof(*st));
     nb_view_defaults(&st->cur);
+    st->sync = NB_SYNC_FULLSCREEN;
     st->prof_at = -1;
+}
+
+/* ── presentation sync ─────────────────────────────────────────────────── */
+
+int nb_sync_parse(const char *s, int *sync)
+{
+    if (!s) {
+        return -1;
+    }
+    if (!strcmp(s, "fullscreen") || !strcmp(s, "auto")) {
+        *sync = NB_SYNC_FULLSCREEN;
+    } else if (!strcmp(s, "immediate") || !strcmp(s, "tearing") ||
+               !strcmp(s, "async")) {
+        *sync = NB_SYNC_IMMEDIATE;
+    } else if (!strcmp(s, "vsync") || !strcmp(s, "fifo")) {
+        *sync = NB_SYNC_VSYNC;
+    } else if (!strcmp(s, "latch") || !strcmp(s, "late-latch") ||
+               !strcmp(s, "latest")) {
+        *sync = NB_SYNC_LATCH;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+const char *nb_sync_name(int sync)
+{
+    switch (sync) {
+    case NB_SYNC_IMMEDIATE: return "immediate";
+    case NB_SYNC_VSYNC:     return "vsync";
+    case NB_SYNC_LATCH:     return "latch";
+    default:                return "fullscreen";
+    }
+}
+
+const char *nb_sync_label(int sync)
+{
+    switch (sync) {
+    case NB_SYNC_IMMEDIATE: return "Always immediate";
+    case NB_SYNC_VSYNC:     return "VSync";
+    case NB_SYNC_LATCH:     return "Latest per refresh";
+    default:                return "Immediate in fullscreen";
+    }
+}
+
+bool nb_sync_immediate(int sync, bool fullscreen)
+{
+    return sync == NB_SYNC_IMMEDIATE ||
+           (sync == NB_SYNC_FULLSCREEN && fullscreen);
 }
 
 static void clean_name(char *dst, size_t n, const char *src)
@@ -697,6 +747,12 @@ void nb_vstore_parse(struct nb_vstore *st, const char *text)
             nb_view_defaults(&pr->v);
             view_parse_words(&pr->v, bar + 1);
             st->nprof++;
+        } else if (!strcmp(line, "sync")) {
+            int v;
+
+            if (nb_sync_parse(eq + 1, &v) == 0) {
+                st->sync = v;
+            }
         } else {
             view_kv(&st->cur, line, eq + 1);
         }
@@ -742,6 +798,9 @@ size_t nb_vstore_format(const struct nb_vstore *st0, char *buf, size_t n)
         t.area = NB_AREA_CUSTOM;
         nb_view_area_str(&t, a, sizeof(a));
         PUT("custom=%s\n", a);
+    }
+    if (st->sync != NB_SYNC_FULLSCREEN) {
+        PUT("sync=%s\n", nb_sync_name(st->sync));
     }
     for (i = 0; i < st->nrecent; i++) {
         PUT("recent=%ux%u\n", st->recent[i][0], st->recent[i][1]);

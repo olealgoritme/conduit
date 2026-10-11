@@ -157,7 +157,7 @@ viewer menu ──EV_MODE_EDIT────┼─► display-modes file ──►
   restarted driver, only to a guest that acked the device feature
   `NVGPU_F_MODE_LIST` (bit 21). The Linux module then offers exactly these
   modes, the current preferred one (`DisplayMode`) first; a changed list is a
-  hotplug. A guest that does not ack it builds its own list, as before.
+  hotplug. A guest that does not ack it builds its own list.
 - **Viewer**: `CMD_MODES` (8), one record per mode, the whole list at once,
   only to a broker with `CAP_MODE_LIST` (bit 17); see
   [broker-protocol.md](../host/viewer/docs/broker-protocol.md). The menu's
@@ -461,7 +461,7 @@ The backend keeps the last request (`EV_MODE_HINT`, or the legacy
    (as it always did when the only viewer closed).
 
 A stream host talking to an older backend (no `CLIENT_IDLE` in `CMD_CAPS`)
-asks for the configured mode at session end instead, as before.
+asks for the configured mode at session end instead.
 
 ## Boot console
 
@@ -516,7 +516,7 @@ QEMU's screen (which QEMU scales onto the tablet's range), relative motion in
 guest-frame pixels. Held keys and buttons are released on the side input
 leaves at every switch; gamepads only ever go to the guest (dropped, with a
 debug line, for one that takes no input). Without `--console-vnc` all input
-goes to the guest as before.
+goes to the guest.
 
 There is no dma-buf behind that screen, so its frames are the one exception to
 zero copy: XRGB8888 in a sealed memfd, sent with the ATTACH flag `F_SHM`
@@ -564,9 +564,18 @@ compositor modesets as usual.
   always|windowed|off`, default always) adds frame time now/avg/p99/max, the
   latency segments, drops, input rate and a 2 s frame-time graph; redrawn ≤4/s
   from a timer, never from the frame path.
-- Direct mode (CTRL+ALT+D, `--direct-mode=on`): overlay hidden, tearing ASYNC,
+- Frames faster than the compositor takes them (an uncapped game with
+  immediate flips) are coalesced, newest wins: a frame is committed only while
+  the compositor socket is not backed up and at most two commits ahead of the
+  pending frame callback (one per 50 ms if callbacks stop). A held frame that
+  a newer one replaces goes back to the guest at once (`host/viewer/nb_pace.h`;
+  `held N` in the `--stats` line).
+- Presentation sync, the fullscreen GPU scaler and what each compositor needs:
+  [VIEWER.md](VIEWER.md#presentation-immediate-vsync-or-latest-per-refresh).
+- Direct mode (CTRL+ALT+D, `--direct-mode=on`): overlay hidden, tearing ASYNC
+  (unless `--sync=vsync`),
   the guest asked again for the output's exact mode, `--direct-hook CMD` run as
-  `CMD on|off`. Off: overlay per `--overlay`, tearing VSYNC.
+  `CMD on|off`. Off: overlay per `--overlay`, tearing per `--sync`.
 
 ## Invariants
 

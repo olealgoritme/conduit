@@ -13,6 +13,7 @@
 #                     (release-minor / release-major / packaging/release.sh X.Y.Z)
 #
 # Single parts: make backend | vmm | cli | viewer | guest | qemu | stream
+# Input measuring tools (docs/INPUT.md): make input-tools -> target/input-tools
 # The guest module builds against this machine's kernel; KDIR=... overrides.
 
 CARGO  ?= cargo
@@ -22,7 +23,7 @@ JOBS   ?= $(shell nproc)
 # feature sets match CI (.github/workflows/ci.yml).
 GPU_TESTS := --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 
-.PHONY: all backend vmm cli viewer guest qemu stream test install package deps clean help dist-stage deb rpm archlinux tarball guest-deb guest-rpm guest-arch install-deb release release-minor release-major
+.PHONY: all backend vmm cli viewer guest qemu stream input-tools test install package deps clean help dist-stage deb rpm archlinux tarball guest-deb guest-rpm guest-arch install-deb release release-minor release-major
 
 all: backend vmm cli viewer guest qemu stream
 	@echo
@@ -53,6 +54,18 @@ qemu:
 	@if [ -x host/qemu/build/qemu-system-x86_64 ]; then \
 		echo "qemu: already built (host/qemu/build); rm -rf host/qemu/build to rebuild"; \
 	else nice -n 10 host/qemu/build-qemu.sh; fi
+
+# host/latency/vmouse (uinput mouse at N Hz) and, with mingw-w64,
+# rawcount.exe (the guest's raw-input report counter).
+MINGW_CC ?= x86_64-w64-mingw32-gcc
+input-tools:
+	mkdir -p target/input-tools
+	$(CC) -O2 -Wall -Wextra -o target/input-tools/vmouse host/latency/vmouse.c -lm
+	@if command -v $(MINGW_CC) >/dev/null; then \
+		echo "$(MINGW_CC) ... rawcount.exe"; \
+		$(MINGW_CC) -O2 -Wall -Wextra -o target/input-tools/rawcount.exe \
+			guest/windows/tools/rawcount.c -luser32; \
+	else echo "input-tools: no $(MINGW_CC); rawcount.exe not built"; fi
 
 test:
 	$(CARGO) test -p conduit

@@ -277,6 +277,20 @@ static void test_clicks(void)
     bits = click(&ui, &e, NB_UI_ID_FULLSCREEN, 0);
     CHECK(bits & NB_UI_FULLSCREEN, "fullscreen");
 
+    /* Presentation sync: one setting per VM, saved, re-applied. */
+    CHECK(nb_ui_find(&ui, NB_UI_ID_SYNC, NB_SYNC_FULLSCREEN) >= 0 &&
+          nb_ui_find(&ui, NB_UI_ID_SYNC, NB_SYNC_IMMEDIATE) >= 0 &&
+          nb_ui_find(&ui, NB_UI_ID_SYNC, NB_SYNC_VSYNC) >= 0, "sync chips");
+    bits = click(&ui, &e, NB_UI_ID_SYNC, NB_SYNC_VSYNC);
+    CHECK(st.sync == NB_SYNC_VSYNC && (bits & NB_UI_SYNC) &&
+          (bits & NB_UI_SAVE) && !(bits & (NB_UI_VIEW | NB_UI_RES)),
+          "vsync bits %#x", bits);
+    CHECK(strstr(ui.notice, "VSync") != NULL, "sync notice '%s'", ui.notice);
+    bits = click(&ui, &e, NB_UI_ID_SYNC, NB_SYNC_VSYNC);
+    CHECK(!(bits & (NB_UI_SYNC | NB_UI_SAVE)), "same sync again: nothing");
+    bits = click(&ui, &e, NB_UI_ID_SYNC, NB_SYNC_FULLSCREEN);
+    CHECK(st.sync == NB_SYNC_FULLSCREEN && (bits & NB_UI_SYNC), "back to default");
+
     /* press on one item, release on another: nothing */
     {
         int a = nb_ui_find(&ui, NB_UI_ID_SCALE, NB_SCALE_INTEGER);

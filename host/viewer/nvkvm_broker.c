@@ -3244,13 +3244,38 @@ static void usage(void)
 "                                 no compositor can refuse.  Slowest, universal\n"
 "  --linear-only        deprecated alias for --present-mode=linear\n"
 "Conduit display options (Wayland backend):\n"
-"  --tearing            always request wp_tearing_control ASYNC\n"
-"  --no-tearing         never request it.  Default: ASYNC in direct mode,\n"
-"                       VSYNC otherwise (the compositor must still allow it)\n"
-"  --overlay=MODE       stats overlay (CTRL+ALT+O toggles): always (default),\n"
-"                       windowed (hidden fullscreen, so the compositor can scan\n"
-"                       out directly) or off (starts hidden).  Direct mode\n"
-"                       hides it.  The window title always carries the numbers\n"
+"  --sync=MODE          when a frame reaches the screen (saved per VM with\n"
+"                       --view-state; the menu, CTRL+ALT+M, changes it):\n"
+"                         fullscreen  (default) immediate in fullscreen: shown\n"
+"                                     the moment it arrives, tearing allowed,\n"
+"                                     no vblank wait; vsync in a window\n"
+"                         immediate   immediate in a window too\n"
+"                         vsync       always wait for the next vblank\n"
+"                         latch       the newest frame once per refresh, committed\n"
+"                                     at a learned point just before the vblank\n"
+"                                     (wp_presentation clock): constant latency,\n"
+"                                     no tearing, no queue (also CONDUIT_VIEWER_SYNC)\n"
+"                       Immediate is wp_tearing_control_v1 ASYNC plus the\n"
+"                       content type \"game\"; on Hyprland the viewer also\n"
+"                       sets its own window's `immediate` property (still\n"
+"                       needs general:allow_tearing = true).  The compositor\n"
+"                       has the last word: see docs/VIEWER.md\n"
+"  --gpu-scale=MODE     auto (default): in fullscreen with immediate\n"
+"                       presentation, a picture that is not 1:1 with the\n"
+"                       output (a game at 1600x900 on a 2560x1440 screen,\n"
+"                       stretched or letterboxed) is scaled by one GPU pass\n"
+"                       into an output-size buffer, so the compositor can\n"
+"                       still tear / scan it out.  A 1:1 picture stays\n"
+"                       zero-copy.  off: the compositor scales it\n"
+"  --render-node PATH   the GPU for --gpu-scale (default: the first render\n"
+"                       node that can import the guest's frames)\n"
+"  --tearing            alias for --sync=immediate\n"
+"  --no-tearing         alias for --sync=vsync\n"
+"  --overlay=MODE       stats overlay (CTRL+ALT+O toggles): windowed (default;\n"
+"                       hidden in fullscreen, so the picture stays alone on the\n"
+"                       output and can tear / be scanned out directly), always\n"
+"                       or off (starts hidden).  Direct mode hides it.  The\n"
+"                       window title always carries the numbers\n"
 "  --resize=MODE        what a windowed resize does:\n"
 "                       guest (default) asks the guest to switch to the\n"
 "                       window's size (debounced while dragging); scale keeps\n"
@@ -3475,7 +3500,23 @@ int main(int argc, char **argv)
     cfg.clip_trigger[2] = (struct nb_clip_trigger){ KEY_INSERT, false, true };
     cfg.n_clip_trigger = 3;
     cfg.title = "Conduit";
-    cfg.overlay_mode = NB_OVERLAY_ALWAYS;
+    /* Windowed: in fullscreen the overlay would sit over the picture, and a
+     * picture that is not alone on the output can neither tear nor be
+     * scanned out.  CTRL+ALT+O still shows it there; the title has the
+     * numbers either way. */
+    cfg.overlay_mode = NB_OVERLAY_WINDOWED;
+    cfg.sync = -1;
+    {
+        /* CONDUIT_VIEWER_SYNC: the --sync mode, for a viewer started by
+         * `conduit view` or a unit; a --sync flag still wins. */
+        const char *e = getenv("CONDUIT_VIEWER_SYNC");
+
+        if (e && *e && nb_sync_parse(e, &cfg.sync) != 0) {
+            nb_err("CONDUIT_VIEWER_SYNC=%s: not fullscreen, immediate, vsync or latch "
+                   "(ignored)", e);
+            cfg.sync = -1;
+        }
+    }
     cfg.hint_align = 1;
     cfg.win_w = 1920;
     cfg.win_h = 1080;
@@ -3570,8 +3611,26 @@ int main(int argc, char **argv)
             }
         }
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
-        else if (!strcmp(a, "--tearing"))    { nb_tearing = 1; }
-        else if (!strcmp(a, "--no-tearing")) { nb_tearing = 0; }
+        else if (!strncmp(a, "--gpu-scale=", 12)) {
+            if (!strcmp(a + 12, "auto"))     { cfg.gpu_scale = NB_GS_AUTO; }
+            else if (!strcmp(a + 12, "off")) { cfg.gpu_scale = NB_GS_OFF; }
+            else {
+                nb_err("--gpu-scale must be auto or off");
+                return 2;
+            }
+        }
+        else if (!strcmp(a, "--render-node")) { NEEDVAL(); cfg.render_node = v; }
+        else if (!strcmp(a, "--tearing"))    { cfg.sync = NB_SYNC_IMMEDIATE; }
+        else if (!strcmp(a, "--no-tearing")) { cfg.sync = NB_SYNC_VSYNC; }
+        else if (!strncmp(a, "--sync=", 7) || !strcmp(a, "--sync")) {
+            const char *m = a[6] == '=' ? a + 7 : NULL;
+
+            if (!m) { NEEDVAL(); m = v; }
+            if (nb_sync_parse(m, &cfg.sync) != 0) {
+                nb_err("--sync must be fullscreen, immediate, vsync or latch");
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--stats"))      { nb_stats = 1; }
         else if (!strcmp(a, "--seq-usec"))   { nb_seq_usec = 1; }
         else if (!strncmp(a, "--overlay=", 10)) {

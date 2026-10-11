@@ -15,7 +15,7 @@
 //!   and its release.
 //! * [`submit`], [`poll`], [`chan_view`], [`mark_broken`]: thin doors to the channel (spinlock
 //!   only, any IRQL up to DISPATCH).
-//! * [`release_producers`], [`teardown_channel`]: the channel's teardown for the route.
+//! * [`teardown_channel`]: the channel's teardown for the route (the producer dups go with it).
 //!
 //! `IO_BUSY` (`ce_channel::try_io`) makes the channel's RM I/O one thread's at a time. The worker
 //! never waits for it; the paging path waits at most `ce_route::IO_WAIT_MS` and then leaves the
@@ -33,7 +33,6 @@ use helios_kmd_logic::ce_present as cp;
 use helios_kmd_logic::ce_route as cr;
 use helios_kmd_logic::rm_ce_channel as cc;
 use helios_kmd_logic::rm_client::{self as rc, Fail, FailKind};
-use helios_kmd_logic::sweep_budget::SweepBudget;
 
 pub(crate) use super::ce_dup::Producer;
 
@@ -145,6 +144,18 @@ pub(crate) fn prep_producer(
 pub(crate) fn cached_producer(rec: &StashedCeRecord) -> Option<Producer> {
     let gen = chan_view().gen?;
     ce_dup::cached_producer(rec, gen, crate::virtio::nvrm_harden::client_generation())
+}
+
+/// Whether both producer slots a job was prepared with still map what they mapped then
+/// (`ce_dup::lease_holds`). Spinlock only.
+pub(crate) fn lease_holds(lease: &helios_kmd_logic::ce_dup::Lease) -> bool {
+    ce_dup::lease_holds(lease)
+}
+
+/// A copy with the VAs of `lease` was submitted and releases `value` (`ce_dup::note_submitted`).
+/// Spinlock only.
+pub(crate) fn note_submitted(lease: &helios_kmd_logic::ce_dup::Lease, value: u64) {
+    ce_dup::note_submitted(lease, value);
 }
 
 /// Take the channel's RM I/O without waiting (`ce_channel::try_io`): while held, no dup is made,
@@ -369,44 +380,17 @@ fn take_io(passive: PassiveLevel, ms: u64) -> bool {
     }
 }
 
-/// Release every producer dup (the channel's teardown, while its client still answers). Waits at
-/// most `wait_io_ms` for the channel's I/O. PASSIVE.
-#[inline(never)]
-pub(crate) fn release_producers(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    budget: SweepBudget,
-    wait_io_ms: u64,
-) {
-    let (Some(h), Some(epoch)) = (ch::handles(), epoch(adapter)) else {
-        return;
-    };
-    if !take_io(passive, wait_io_ms) {
-        return;
-    }
-    let io = Io {
-        passive,
-        adapter,
-        epoch,
-        limit: Some(budget),
-    };
-    ce_dup::release_all(&io, &h);
-    super::ce_vram::release_all(&io, &h);
-    ch::end_io();
-}
-
-/// Tear the channel down for the route (it broke, or a copy never completed): the producer dups
-/// first, then the channel in its own order. The caller freed (or leaked) every destination
-/// descriptor before. From the HPD worker (never waits for `IO_BUSY`). PASSIVE.
+/// Tear the channel down for the route (it broke, or a copy never completed). The caller freed
+/// (or leaked) every destination descriptor before. The producer dups and `ce_vram`'s mappings go
+/// with the channel, in `ce_channel::teardown`'s order: before the channel group only once the
+/// GPU is idle, else right after the group's free stopped the channel. Never before it: a copy
+/// that timed out or was discharged may still be queued on the ring, and a window unmapped under
+/// it is a copy-engine MMU fault (Xid 31, `VIRT_READ`) when it runs. From the HPD worker (never
+/// waits for `IO_BUSY`). PASSIVE.
 #[inline(never)]
 pub(crate) fn teardown_channel(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
     if !ch::try_io() {
         return false;
-    }
-    if let (Some(h), Some(epoch)) = (ch::handles(), epoch(adapter)) {
-        let io = io(passive, adapter, epoch, cc::UNDO_BUDGET_MS);
-        ce_dup::release_all(&io, &h);
-    super::ce_vram::release_all(&io, &h);
     }
     ch::teardown(passive, adapter, ch::budget_ms(cc::UNDO_BUDGET_MS));
     ch::end_io();

@@ -1,0 +1,21 @@
+--- a/system/physmem.c	2026-10-10 23:44:20.802884471 +0200
++++ b/system/physmem.c	2026-10-10 23:44:20.811097754 +0200
+@@ -1737,6 +1737,18 @@
+         block->mr->align = MAX(block->mr->align, QEMU_VMALLOC_ALIGN);
+     }
+ #endif
++    /*
++     * Place small-page file RAM (a shmem memfd, a tmpfs file) like anonymous
++     * RAM and like the memfd behind memory-backend-ram,share=on: on a
++     * QEMU_VMALLOC_ALIGN boundary. Otherwise the mapping lands on any page
++     * boundary, its addresses and file offsets disagree modulo the huge page
++     * size, and neither transparent huge pages nor KVM's huge mappings of the
++     * guest can ever be used for it. Only the address moves; the size is
++     * still rounded to the file's page size.
++     */
++    if (block->page_size < QEMU_VMALLOC_ALIGN && memory >= QEMU_VMALLOC_ALIGN) {
++        block->mr->align = MAX(block->mr->align, QEMU_VMALLOC_ALIGN);
++    }
+ 
+     if (memory < block->page_size) {
+         error_setg(errp, "memory size 0x" RAM_ADDR_FMT " must be equal to "
