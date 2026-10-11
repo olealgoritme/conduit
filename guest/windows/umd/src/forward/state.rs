@@ -11,7 +11,6 @@
 //! Moved verbatim out of `forward.rs` by T8/R1107.
 
 use super::*;
-use helios_umd_common::resource_hot;
 
 // ⚠ `pub`, not `pub(crate)`, for ONE reason and it is a compiler rule, not a
 // design choice: this struct is named as `<H as helios_umd_common::slot::BoxedHandle>::State`
@@ -755,9 +754,8 @@ pub(crate) unsafe fn store_resource(
         )
     });
     drop(buffer);
-    let com_raw = obj.into_raw() as usize;
     slot.store(ResourceState {
-        com_raw,
+        com_raw: obj.into_raw() as usize,
         buffer_raw,
         allocation,
         km_resource,
@@ -769,16 +767,6 @@ pub(crate) unsafe fn store_resource(
         dynamic_buffer,
         byte_width,
     });
-    // The per-draw readers (`load_resource`, the buffer binds) take these
-    // copies from the handle's private memory instead of the box.
-    resource_hot::write(
-        h_res.pDrvPrivate,
-        resource_hot::ResourceHot {
-            com_raw,
-            buffer_raw,
-            flags: 0,
-        },
-    );
 }
 
 /// Marks a just-stored resource as a video decoder buffer.
@@ -787,14 +775,12 @@ pub(crate) unsafe fn mark_decoder_buffer(h_res: ddi::D3D10DDI_HRESOURCE) {
         let state = slot.ptr();
         if !state.is_null() {
             (*state).decoder_buffer = true;
-            resource_hot::set_flag(h_res.pDrvPrivate, resource_hot::FLAG_DECODER_BUFFER);
         }
     }
 }
 
 pub(crate) unsafe fn is_decoder_buffer(h_res: ddi::D3D10DDI_HRESOURCE) -> bool {
-    resource_hot::get(h_res.pDrvPrivate)
-        .is_some_and(|hot| hot.flags & resource_hot::FLAG_DECODER_BUFFER != 0)
+    resource_state(h_res).is_some_and(|s| s.decoder_buffer)
 }
 
 pub(crate) unsafe fn stamp_dxvk_resource_kmt_handles(
@@ -855,14 +841,12 @@ pub(crate) unsafe fn load_resource(
 pub(crate) unsafe fn load_resource_at(
     handle_priv: *mut c_void,
 ) -> Option<ManuallyDrop<ID3D11Resource>> {
-    // The hot copy of `ResourceState::com_raw` (`resource_hot`): one load next
-    // to the runtime's object instead of two through the box.
-    let com_raw = resource_hot::get(handle_priv)?.com_raw;
-    if com_raw == 0 {
+    let state = resource_state_at(handle_priv)?;
+    if state.com_raw == 0 {
         return None;
     }
     Some(ManuallyDrop::new(ID3D11Resource::from_raw(
-        com_raw as *mut c_void,
+        state.com_raw as *mut c_void,
     )))
 }
 
@@ -887,7 +871,7 @@ pub(crate) unsafe fn resource_state_at(handle_priv: *mut c_void) -> Option<&'sta
 /// absent) — for bridge calls that inspect the DXVK image without taking a COM
 /// reference.
 pub(crate) unsafe fn resource_com_raw(h_res: ddi::D3D10DDI_HRESOURCE) -> usize {
-    resource_hot::get(h_res.pDrvPrivate).map_or(0, |hot| hot.com_raw)
+    resource_state(h_res).map_or(0, |s| s.com_raw)
 }
 
 pub(crate) unsafe fn resource_allocation(h_res: ddi::D3D10DDI_HRESOURCE) -> ddi::D3DKMT_HANDLE {
@@ -1267,8 +1251,6 @@ pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE
     // twice. `state` is an owned Box, so the drop at the end of this scope is
     // what frees it -- the explicit `Box::from_raw` is gone.
     if let Some(mut state) = slot.take() {
-        // Empty the hot copies with the cell, before the teardown re-enters.
-        resource_hot::clear(h_res.pDrvPrivate);
         let state = &mut *state;
         let allocation = (*state)
             .allocation

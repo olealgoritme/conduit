@@ -80,7 +80,6 @@ pub mod hr;
 // Typed ABI adapters are portable; only noop::log_backtrace requires Windows.
 pub mod noop;
 pub mod refusals;
-pub mod resource_hot;
 pub mod scanout_event;
 pub mod throttle;
 pub mod window;
