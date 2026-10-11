@@ -746,8 +746,53 @@ static void test_modes(void)
     }
 }
 
+static void test_sync(void)
+{
+    struct nb_vstore st;
+    char buf[4096];
+    int v = -1;
+
+    CHECK(nb_sync_parse("fullscreen", &v) == 0 && v == NB_SYNC_FULLSCREEN,
+          "sync parse fullscreen");
+    CHECK(nb_sync_parse("auto", &v) == 0 && v == NB_SYNC_FULLSCREEN,
+          "sync parse auto");
+    CHECK(nb_sync_parse("immediate", &v) == 0 && v == NB_SYNC_IMMEDIATE,
+          "sync parse immediate");
+    CHECK(nb_sync_parse("tearing", &v) == 0 && v == NB_SYNC_IMMEDIATE,
+          "sync parse tearing");
+    CHECK(nb_sync_parse("vsync", &v) == 0 && v == NB_SYNC_VSYNC,
+          "sync parse vsync");
+    CHECK(nb_sync_parse("sometimes", &v) == -1, "sync parse junk");
+    for (int i = 0; i < NB_SYNC_COUNT; i++) {
+        CHECK(nb_sync_parse(nb_sync_name(i), &v) == 0 && v == i,
+              "sync name round trip %d", i);
+    }
+    /* Immediate in fullscreen only by default; vsync never; immediate always. */
+    CHECK(nb_sync_immediate(NB_SYNC_FULLSCREEN, true), "default fs immediate");
+    CHECK(!nb_sync_immediate(NB_SYNC_FULLSCREEN, false), "default windowed vsync");
+    CHECK(nb_sync_immediate(NB_SYNC_IMMEDIATE, false), "immediate windowed");
+    CHECK(!nb_sync_immediate(NB_SYNC_VSYNC, true), "vsync fullscreen");
+
+    /* Stored per VM; the default writes nothing, so old files stay as they were. */
+    nb_vstore_init(&st);
+    CHECK(st.sync == NB_SYNC_FULLSCREEN, "store default sync");
+    nb_vstore_format(&st, buf, sizeof(buf));
+    CHECK(!strstr(buf, "sync="), "default sync not written");
+    st.sync = NB_SYNC_VSYNC;
+    nb_vstore_format(&st, buf, sizeof(buf));
+    CHECK(strstr(buf, "sync=vsync\n") != NULL, "vsync written");
+    nb_vstore_init(&st);
+    nb_vstore_parse(&st, buf);
+    CHECK(st.sync == NB_SYNC_VSYNC, "vsync read back");
+    nb_vstore_init(&st);
+    nb_vstore_parse(&st, "scale=stretch\nsync=bogus\n");
+    CHECK(st.sync == NB_SYNC_FULLSCREEN && st.cur.scale == NB_SCALE_STRETCH,
+          "bad sync ignored, rest kept");
+}
+
 int main(void)
 {
+    test_sync();
     test_fit();
     test_stretch();
     test_integer();

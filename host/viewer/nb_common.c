@@ -207,7 +207,6 @@ unsigned nb_res_w, nb_res_h;   /* NB_RES_FIXED only */
  * the upstream ladder for debugging. */
 int nb_tier = NB_TIER_NATIVE;
 
-int nb_tearing = -1;   /* auto: ASYNC in direct mode only */
 int nb_stats;
 int nb_seq_usec;
 
@@ -411,6 +410,9 @@ void nb_vstore_setup(struct nb_vstore *st, const struct nb_config *cfg)
                strerror(errno));
     }
     nb_view_override(&st->cur, &cfg->view, cfg->view_set);
+    if (cfg->sync >= 0) {
+        st->sync = cfg->sync;
+    }
     nb_view_apply_res(&st->cur);
     nb_view_summary(&st->cur, sum, sizeof(sum));
     nb_log("display: %s%s%s%s", sum, cfg->view_state ? " (saved in " : "",

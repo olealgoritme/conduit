@@ -116,6 +116,12 @@ struct nb_x11 {
      */
     xcb_atom_t        a_clipboard, a_utf8, a_targets, a_prop, a_incr;
     xcb_atom_t        a_net_wm_name;
+    /* Presentation sync (nb_sync_*): Present with PresentOptionAsync while
+     * immediate, and _NET_WM_BYPASS_COMPOSITOR = 1 in fullscreen so a
+     * compositing manager unredirects the window. */
+    xcb_atom_t        a_bypass;
+    int               bypass_set;       /* -1 never set */
+    bool              imm;
     xcb_timestamp_t   last_time;      /* a REAL event time; X rejects guesses */
     bool              focused;
     char             *src_text;       /* what we serve as CLIPBOARD owner     */
@@ -761,7 +767,10 @@ static int x11_draw(struct nb_x11 *x, struct nb_x11_buf *sl)
                        (int16_t)(x->place.pic.y - x->place.vis.y),
                        XCB_NONE /* target_crtc */,
                        XCB_NONE /* wait_fence */, XCB_NONE /* idle_fence */,
-                       0 /* options */, 0 /* target_msc: as soon as possible */,
+                       /* Immediate: flip now, not at the next vblank (the
+                        * server may still wait where it cannot tear). */
+                       x->imm ? XCB_PRESENT_OPTION_ASYNC : 0,
+                       0 /* target_msc: as soon as possible */,
                        0, 0, 0, NULL);
     return 0;
 }
@@ -1790,6 +1799,29 @@ static int x11_set_grab(struct nb_session *s, bool on)
     return 0;
 }
 
+static void x11_sync_apply(struct nb_x11 *x, const char *why)
+{
+    bool imm = nb_sync_immediate(x->vst.sync, x->fullscreen);
+    int bypass = imm && x->fullscreen ? 1 : 0;
+
+    if (x->a_bypass != XCB_ATOM_NONE && bypass != x->bypass_set) {
+        uint32_t v = (uint32_t)bypass;
+
+        xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_bypass,
+                            XCB_ATOM_CARDINAL, 32, 1, &v);
+        x->bypass_set = bypass;
+        xcb_flush(x->c);
+    }
+    if (imm != x->imm || why) {
+        nb_log("presentation: %s (%s, sync=%s)%s",
+               imm ? "IMMEDIATE (Present async, tearing allowed)" : "vsync",
+               x->fullscreen ? "fullscreen" : "windowed",
+               nb_sync_name(x->vst.sync),
+               bypass ? "; asked the compositor to unredirect the window" : "");
+    }
+    x->imm = imm;
+}
+
 static int x11_set_fullscreen(struct nb_session *s, bool on)
 {
     struct nb_x11 *x = s->priv;
@@ -1817,6 +1849,7 @@ static int x11_set_fullscreen(struct nb_session *s, bool on)
                    XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT, (const char *)&ev);
     xcb_flush(x->c);
     x->fullscreen = on;
+    x11_sync_apply(x, NULL);
     return 0;
 }
 
@@ -2117,6 +2150,7 @@ skip_dmabuf_extensions:
     x11_cursor_init(x);
     xcb_map_window(x->c, x->content);
     xcb_map_window(x->c, x->win);
+    x11_sync_apply(x, "startup");
 
     /*
      * Present event stream: pacing (complete) and buffer release (idle).
@@ -2143,6 +2177,8 @@ skip_dmabuf_extensions:
     x->a_prop      = x11_atom(x->c, "CONDUIT_CLIP");
     x->a_incr      = x11_atom(x->c, "INCR");
     x->a_net_wm_name = x11_atom(x->c, "_NET_WM_NAME");
+    x->a_bypass    = x11_atom(x->c, "_NET_WM_BYPASS_COMPOSITOR");
+    x->bypass_set  = -1;
     if (x->a_wm_proto != XCB_ATOM_NONE && x->a_wm_delete != XCB_ATOM_NONE) {
         xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_wm_proto,
                             XCB_ATOM_ATOM, 32, 1, &x->a_wm_delete);
@@ -2754,6 +2790,7 @@ static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x)
     e.stats_on = false;
     e.no_stats = true;          /* X11 logs --stats; there is no overlay */
     e.fullscreen = x->fullscreen;
+    e.immediate = x->imm;
 #ifdef NB_HAVE_XCB_RENDER
     e.nearest_ok = x->pict_fmt != 0;
 #else
@@ -3117,6 +3154,9 @@ static void x11_ui_do(struct nb_x11 *x, unsigned bits)
     }
     if (bits & NB_UI_STATS) {
         nb_log("stats overlay: the X11 backend logs --stats instead");
+    }
+    if (bits & NB_UI_SYNC) {
+        x11_sync_apply(x, "menu");
     }
     if ((bits & NB_UI_FULLSCREEN) && x->sink) {
         nb_sink_toggle_fullscreen(x->sink);

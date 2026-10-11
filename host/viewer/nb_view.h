@@ -70,6 +70,25 @@ struct nb_view {
 
 struct nb_rect { int x, y, w, h; };
 
+/*
+ * Presentation sync: when the viewer asks the compositor to show a frame the
+ * moment it is committed (tearing, wp_tearing_control_v1 ASYNC) rather than
+ * at the next vblank.  Not part of a layout or a profile: one setting per VM.
+ */
+enum {
+    NB_SYNC_FULLSCREEN = 0,     /* default: immediate in fullscreen, vsync windowed */
+    NB_SYNC_IMMEDIATE,          /* immediate in a window too                 */
+    NB_SYNC_VSYNC,              /* always wait for vblank                    */
+    NB_SYNC_LATCH,              /* newest frame once per refresh, late latch
+                                 * (nb_latch.h)                              */
+    NB_SYNC_COUNT
+};
+int         nb_sync_parse(const char *s, int *sync);  /* fullscreen|auto|immediate|vsync|latch */
+const char *nb_sync_name(int sync);                   /* settings-file / flag form */
+const char *nb_sync_label(int sync);                  /* menu form               */
+/* Whether frames should be presented immediately in this state. */
+bool        nb_sync_immediate(int sync, bool fullscreen);
+
 struct nb_place {
     struct nb_rect area;        /* the output area, window coordinates       */
     struct nb_rect pic;         /* the whole picture; may exceed the area    */
@@ -150,6 +169,7 @@ struct nb_rule {
 
 struct nb_vstore {
     struct nb_view    cur;
+    int               sync;                     /* NB_SYNC_*             */
     struct nb_profile prof[NB_MAX_PROFILES];
     int               nprof;
     int               prof_at;                  /* last loaded, -1 none  */

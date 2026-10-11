@@ -75,6 +75,9 @@ that fades in when the pointer touches the window's top edge. The menu has:
 - **Profiles**: save the current setup under a name (for example
   "CS2 4:3 stretched"), click one to load it, `x` to delete it.
   Ctrl+Alt+P cycles through them.
+- **Presentation**: Immediate in fullscreen (the default), Always immediate,
+  VSync, or Latest per refresh. See
+  [Presentation](#presentation-immediate-vsync-or-latest-per-refresh).
 - **View**: the stats overlay and fullscreen.
 - **Virtual machine**: Restart and Shut down, which run `conduit reboot` and
   `conduit shutdown` for the VM. Both ask for a second click to confirm.
@@ -87,8 +90,9 @@ and a mouse grab is dropped. `Esc` or `Ctrl+Alt+M` closes it.
 
 `conduit view` passes `--view-state ~/.local/share/conduit/vms/NAME/viewer.conf`.
 The viewer restores the settings, profiles and recent resolutions from that
-file at start, and rewrites it on every change. `--res`, `--area`, `--scale`
-and `--filter` given to `conduit view` override only the setting they name.
+file at start, and rewrites it on every change. `--res`, `--area`, `--scale`,
+`--filter` and `--sync` given to `conduit view` override only the setting they
+name. `sync=` appears in the file only when it is not the default.
 The file is plain `key=value` text:
 
 ```
@@ -113,15 +117,131 @@ scale, so it lines up with the picture in `stretch` too.
 `host/viewer/test/test_view.c` checks the mapping for every mode, area and
 output scale.
 
+## Presentation: immediate, vsync or latest per refresh
+
+A game in the VM renders as fast as it can; how soon each frame reaches the
+screen is the viewer's choice (`--sync`, the menu, saved per VM;
+`CONDUIT_VIEWER_SYNC` in the environment, which a `--sync` flag overrides):
+
+| Setting | Fullscreen | Window |
+|---|---|---|
+| `fullscreen` (default) | immediate | vsync |
+| `immediate` | immediate | immediate |
+| `vsync` | vsync | vsync |
+| `latch` | latest per refresh | latest per refresh |
+
+Immediate means the compositor shows a frame the moment it is committed, with
+no wait for the next vblank, so a frame can tear, as with a fullscreen game on
+bare metal. The viewer asks for it with `wp_tearing_control_v1` (ASYNC) and the
+content type `game` (`wp_content_type_v1`). On X11 it presents with
+`PresentOptionAsync` and, in fullscreen, sets `_NET_WM_BYPASS_COMPOSITOR` so a
+compositing manager unredirects the window. The compositor decides in the end;
+the log line `presentation:` and the stats line (`immediate`/`vsync`) say what
+was asked for, and `commit->present` shows what happened (immediate: well
+under a millisecond; vsync on a 240 Hz screen: 4 to 8 ms).
+
+A compositor tears (and scans out directly) only a fullscreen window whose own
+buffer covers the output with nothing on top of it. The viewer keeps that
+shape in fullscreen:
+
+- The guest at the output's mode (a 1:1 picture): the guest's own buffer is
+  the window's only content, as always (zero-copy).
+- Any other picture (a game at 1600x900 on a 5120x1440 screen, stretched,
+  letterboxed or cropped): one GPU pass draws it, scaled, with black bars
+  where the area leaves them, into an output-size buffer
+  (`host/viewer/nb_gpuscale.c`; EGL/GLES2/GBM, loaded only when first
+  needed). The compositor would scale the picture anyway; this moves that
+  pass in front of it. It costs about 50 µs per frame at 5120x1440 on an
+  RTX 5090 (p99 under 0.6 ms) and returns the guest's buffer as soon as the
+  pass is done. Here the Filter setting is the viewer's own (Sharp =
+  nearest neighbour). `--gpu-scale=off` leaves scaling to the compositor;
+  `--render-node` picks the GPU.
+
+**Latest per refresh** (`latch`) commits at most one frame per output
+refresh: the newest complete guest frame, at a fixed point before the vblank
+it is aimed at, without tearing and without a queue (a newer frame replaces a
+waiting one). The vblank clock is the compositor's own presentation feedback
+(`wp_presentation`: timestamp and refresh period). The commit point is
+`vblank - lead - budget - 0.5 ms`: `budget` is the viewer's own cost (the GPU
+scaling pass and the requests, a rolling maximum that decays), and `lead` is
+how long before the vblank this compositor needs a commit to show it there.
+The viewer learns it from the feedback: a commit presented a refresh late
+raises it, commits on time let it sink slowly, so it settles just past the
+compositor's latch point. A compositor that composites right after the
+previous vblank (Hyprland by default) settles near one refresh; one that
+latches late, near its render time. The commit-to-scanout time is then
+constant, so motion follows the guest's frame times rather than the moment
+each frame happened to arrive. With no frame by the commit point the refresh
+shows the previous one. The stats line shows `latch lead ... budget ...
+on-time ... late ... repeats ...`. Direct mode (`Ctrl+Alt+D`) overrides it with
+immediate presentation. In fullscreen the GPU scaling pass applies as with
+immediate.
+
+`CONDUIT_VIEWER_FRAMELOG=FILE` writes one line per frame event, in
+`CLOCK_MONOTONIC` ns, for frame-to-photon analysis: `C seq recv flip commit
+aimed mode` (committed), `P seq present refresh flags` (presented), `D seq`
+(discarded by the compositor) and `X seq recv` (replaced before it was
+committed).
+
+`CONDUIT_VIEWER_GPU_PRIORITY=off|medium|high|realtime` (default `high`) sets
+the EGL context priority the GPU scaling pass asks for
+(`EGL_IMG_context_priority`, or `EGL_NV_context_priority_realtime` for
+`realtime` where the driver has it). The driver decides what it grants; the
+`gpu-scale: ready` log line shows both what was asked for and what the driver
+reports granting.
+
+With `--stats`, the per-second line counts presents the compositor scanned out
+directly (wp_presentation `ZERO_COPY`) and, for a second that was composited,
+lists what on the viewer's side prevents direct scanout: not fullscreen, a
+letterboxed subsurface, a buffer that is not the output's size, a mapped title
+bar, overlay, notice or menu, or a cursor image over the picture. "none on our
+side" means the compositor composited for reasons of its own (its
+configuration, tearing, the buffer format). In fullscreen, a picture with no
+host cursor image (the guest draws its own, and always under grab) sets a
+NULL cursor, so no cursor needs to be composited over it.
+
+In a window, and with VSync, the compositor scales the picture.
+The stats overlay is hidden in fullscreen by default (`--overlay=windowed`)
+for the same reason: drawn over the picture, it makes the compositor
+composite. `Ctrl+Alt+O` still shows it there.
+
+What each desktop needs:
+
+- **Hyprland**: `general:allow_tearing = true` in the config. The viewer sets
+  the `immediate` property on its own window over Hyprland's IPC socket
+  (`setprop pid:N immediate 1 lock`), so no window rule is needed; with
+  VSync it sets it to 0. Hyprland tears only in fullscreen with nothing else
+  on the output (no notification, no overlay layer). Hyprland 0.39 composites
+  a torn frame (no direct scanout while tearing); that takes well under a
+  millisecond.  While it tears, Hyprland repaints only when the window commits, so a
+  software cursor (`WLR_NO_HARDWARE_CURSORS=1`, common with NVIDIA) would move
+  only with guest frames; the viewer commits the current picture again on
+  pointer motion over the fullscreen picture (at most twice per refresh,
+  `cursor nudges` in `--stats`) so the pointer stays smooth on an idle
+  desktop.
+- **KDE Plasma (KWin)**: honours the tearing hint for fullscreen windows.
+- **Sway**: `output * allow_tearing yes`.
+- **GNOME (Mutter)**: does not offer tearing control; frames are shown at
+  vblank, and the fullscreen picture can still be scanned out directly.
+
+**Adaptive sync (VRR).** With immediate presentation it matters little. With
+VSync, or a game below the refresh rate, it removes the judder of a frame
+rate that does not divide the refresh. Hyprland: `misc:vrr = 2` (fullscreen
+windows only) in the config, or for the running session only
+`hyprctl keyword misc:vrr 2` (back to the config's value on reload). KDE:
+Display Configuration, Adaptive sync: Automatic. Sway:
+`output * adaptive_sync on`. The viewer does not change these settings.
+
 ## Cost
 
-Scaling adds no work to the frame path. On Wayland, the guest buffer stays
-on one surface. Its `wp_viewport` destination (plus a source crop for `none`)
-and its subsurface position do the placing, and the compositor scales the
-picture in the composite it does anyway. When the picture exactly fills the
-window, it is on the main surface, as before, so direct scanout in fullscreen
-is unaffected. On X11, a 1:1 picture is presented as before, and a scaled
-picture is one XRender composite, paced on vblank.
+Scaling adds no work to the frame path, except in fullscreen with immediate
+presentation (above). On Wayland, the guest buffer stays on one surface. Its
+`wp_viewport` destination (plus a source crop for `none`) and its subsurface
+position do the placing, and the compositor scales the picture in the
+composite it does anyway. When the picture exactly fills the window, it is on
+the main surface, so direct scanout in fullscreen is unaffected. On X11, a 1:1
+picture is presented with Present, and a scaled picture is one XRender
+composite.
 
 The menu, the notice, the button and the area outline are separate layers:
 `wl_subsurface`s with their own small shm buffers on Wayland, and child

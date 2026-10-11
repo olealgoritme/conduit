@@ -192,9 +192,17 @@ enum Cmd {
         /// stretch, integer, or none (1:1, centred) (Ctrl+Alt+S cycles)
         #[arg(long, value_name = "MODE", value_parser = ["fit", "stretch", "integer", "none"])]
         scale: Option<String>,
-        /// Scaling filter: linear or nearest (X11; on Wayland the compositor picks)
+        /// Scaling filter: linear or nearest (Wayland: in fullscreen when the
+        /// viewer scales on the GPU; otherwise the compositor picks)
         #[arg(long, value_name = "F", value_parser = ["linear", "nearest"])]
         filter: Option<String>,
+        /// When frames reach the screen: fullscreen (default: immediate,
+        /// tearing allowed, in fullscreen; vsync in a window), immediate
+        /// (also windowed), vsync, or latch (the newest frame once per
+        /// refresh, committed just before the vblank). Saved per VM
+        /// (Ctrl+Alt+M changes it)
+        #[arg(long, value_name = "MODE", value_parser = ["fullscreen", "immediate", "vsync", "latch"])]
+        sync: Option<String>,
     },
     /// Shut a VM down cleanly (power button), forced off after the timeout,
     /// and stop everything that belongs to it
@@ -750,6 +758,7 @@ fn main() {
             area,
             scale,
             filter,
+            sync,
         } => view_target(name, mode).and_then(|(name, mode)| {
             let m = opt_mode(mode.as_deref())?;
             run::set_view_opts(run::ViewOpts {
@@ -757,6 +766,7 @@ fn main() {
                 area,
                 scale,
                 filter,
+                sync,
             });
             lvrun::mark_used(&name);
             run::view(&name, m, tune_hyprland, fullscreen, vmm, keep_running)
