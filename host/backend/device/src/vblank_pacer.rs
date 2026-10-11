@@ -64,11 +64,16 @@ pub struct VblankPacer {
     lead_ns: u64,
 }
 
-/// Which client the events follow: a fullscreen client with a live clock,
-/// else the live client with the newest report. Pure.
-fn pick_source(clients: &[ClientClock], now_ns: u64) -> Option<usize> {
+/// Which client the events follow: a fullscreen client with a live clock;
+/// else the current source while it stays live (two windowed viewers on two
+/// outputs must not make the stream hop between their phases); else the live
+/// client with the newest report. Pure.
+fn pick_source(clients: &[ClientClock], current: Option<usize>, now_ns: u64) -> Option<usize> {
     let live = |c: &ClientClock| c.clock.is_live(now_ns);
     if let Some(i) = clients.iter().position(|c| c.fullscreen && live(c)) {
+        return Some(i);
+    }
+    if let Some(i) = current.filter(|&i| clients.get(i).is_some_and(live)) {
         return Some(i);
     }
     clients
@@ -199,7 +204,7 @@ impl VblankPacer {
         if !st.enabled {
             return Plan::Wait;
         }
-        let Some(src) = pick_source(&st.clients, now) else {
+        let Some(src) = pick_source(&st.clients, st.source, now) else {
             return if st.source.take().is_some() {
                 Plan::Idle
             } else {
@@ -232,16 +237,18 @@ impl VblankPacer {
     fn run(&self, sink: &dyn HostVblankSink) {
         loop {
             let now = mono_ns();
-            let plan = {
-                let mut st = self.state.lock().unwrap();
-                self.plan(&mut st, now)
-            };
+            let mut st = self.state.lock().unwrap();
+            let plan = self.plan(&mut st, now);
+            if let Plan::Wait = plan {
+                // Decided and waited under one lock: a report or an ack that arrives in
+                // between wakes this wait instead of being missed for a whole timeout.
+                let _ = self.wake.wait_timeout(st, IDLE_WAIT).unwrap();
+                continue;
+            }
+            drop(st);
             match plan {
                 Plan::Stop => return,
-                Plan::Wait => {
-                    let st = self.state.lock().unwrap();
-                    let _ = self.wake.wait_timeout(st, IDLE_WAIT).unwrap();
-                }
+                Plan::Wait => {}
                 Plan::Idle => {
                     let v = HostVblank {
                         flags: HOST_VBLANK_IDLE,
@@ -338,15 +345,19 @@ mod tests {
         let now = 2_000_000_000;
         let a = fitted(1_000_000_000, 4_166_667, false, now);
         let b = fitted(1_000_100_000, 6_944_444, false, now - 50_000_000);
-        assert_eq!(pick_source(&[a, b], now), Some(0), "newest report");
+        assert_eq!(pick_source(&[a, b], None, now), Some(0), "newest report");
         let a = fitted(1_000_000_000, 4_166_667, false, now);
         let b = fitted(1_000_100_000, 6_944_444, true, now - 50_000_000);
-        assert_eq!(pick_source(&[a, b], now), Some(1), "fullscreen");
+        assert_eq!(pick_source(&[a, b], Some(0), now), Some(1), "fullscreen");
         assert_eq!(
-            pick_source(&[ClientClock::default()], now),
+            pick_source(&[ClientClock::default()], None, now),
             None,
             "nothing fitted"
         );
+        // Two windowed live clients: the current source stays.
+        let a = fitted(1_000_000_000, 4_166_667, false, now);
+        let b = fitted(1_000_100_000, 6_944_444, false, now - 50_000_000);
+        assert_eq!(pick_source(&[a, b], Some(1), now), Some(1), "sticky");
     }
 
     struct Rec(Mutex<Vec<(u64, HostVblank)>>);

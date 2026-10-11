@@ -1086,7 +1086,6 @@ fn deliver_tick_vsync(adapter: &AdapterContext, phys: u64, tick_time_100ns: u64)
             );
         }
         crate::ddi::host_flip_done::note_tick_delivered(tick_time_100ns);
-        crate::ddi::host_vblank::note_tick_delivered(tick_time_100ns);
     }
 }
 

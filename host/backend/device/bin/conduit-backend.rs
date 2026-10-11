@@ -1023,6 +1023,9 @@ fn host_vblank_offered() -> bool {
     *ON.get_or_init(|| std::env::var("CONDUIT_HOST_VBLANK").map_or(true, |v| v.trim() != "0"))
 }
 
+/// Posted event buffers a `HostVblank` leaves to the other event-queue messages.
+const HOST_VBLANK_RESERVE: u16 = 4;
+
 /// `HostVblank` onto the event queue from the pacer's thread: one message
 /// into one posted buffer, or dropped when none is posted (an event is stale
 /// within a vblank; the guest's timer fills in).
@@ -1033,6 +1036,16 @@ impl device::vblank_pacer::HostVblankSink for VqReleaseSink {
         };
         let guard = mem.memory();
         let mut vr = vring.get_mut();
+        // Keep a reserve for fence reports, releases and mode lists: a vblank event only takes
+        // a buffer when more than `HOST_VBLANK_RESERVE` are posted.
+        let posted = {
+            let q = vr.get_queue();
+            q.avail_idx(&*guard, std::sync::atomic::Ordering::Acquire)
+                .map_or(0, |a| a.0.wrapping_sub(q.next_avail()))
+        };
+        if posted <= HOST_VBLANK_RESERVE {
+            return false;
+        }
         let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
             return false;
         };

@@ -201,7 +201,9 @@ impl VblankClock {
             self.locked = locked;
             return Sample::Seeded;
         }
-        let elapsed = (t_ns - self.anchor_ns) as f64 - self.anchor_frac;
+        // Signed: the anchor may sit a fraction of a period after the last report, and a bogus
+        // early report must not underflow. True anchor = anchor_ns - anchor_frac.
+        let elapsed = (t_ns as i64).wrapping_sub(self.anchor_ns as i64) as f64 + self.anchor_frac;
         let n = (elapsed / self.period_ns).round();
         if n < 1.0 {
             self.rejected += 1;
@@ -220,8 +222,13 @@ impl VblankClock {
             self.outliers = if agrees { self.outliers + 1 } else { 1 };
             self.outlier_ns = t_ns;
             if self.outliers >= STEP_AFTER {
+                // A phase step (output re-mode, compositor restart): the period is still
+                // good, so the lattice moves to the new phase and stays locked.
                 self.steps += 1;
+                let locked = self.locked;
                 self.seed(t_ns);
+                self.good = if locked { LOCK_AFTER } else { 0 };
+                self.locked = locked;
                 return Sample::Seeded;
             }
             return Sample::Outlier;

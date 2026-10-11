@@ -756,8 +756,11 @@ impl VirtioGpu {
                     }
                 }
                 Taken::HostVblank(e) => {
-                    // No kick, as for a presentation report: one per host vblank, and the host
-                    // drops an event that finds no buffer (the timer fills in).
+                    // Reposted with the kick rule of the other messages (`reposted`): one per
+                    // host vblank takes a buffer, and a fence report the host held back for want
+                    // of one must not wait for its sweep. The kick goes out only when the host
+                    // asks for it.
+                    reposted = true;
                     if self.host_vblank {
                         crate::ddi::host_vblank::on_event(&e);
                     } else {

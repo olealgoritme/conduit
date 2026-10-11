@@ -112,7 +112,8 @@ pub struct Event {
     pub refresh_mhz: u32,
     /// The host clock when the event was built.
     pub sent_ns: u64,
-    /// `ScanoutFlip.seq` of the flip the newest sample presented, 0 when none or unknown.
+    /// The sparse design: `ScanoutFlip.seq` of the flip the newest sample presented (0 none).
+    /// The per-vblank mode the host sends: the pacer's count of vblanks since `FIRST`.
     pub seq: u64,
     /// Presentations since the previous event that no sample carries.
     pub lost: u32,
@@ -965,21 +966,29 @@ pub const fn tick_delivers(now: u64, last_host: u64, period: u64) -> bool {
     last_host == 0 || now < last_host || now - last_host >= period * 3 / 4
 }
 
-/// The period the events pace at: the host's (from the event's refresh) when it is known and
-/// within 50% of the mode's, else the mode's.
-pub const fn event_period(mode_period: u64, refresh_mhz: u32) -> u64 {
-    if refresh_mhz == 0 {
-        return mode_period;
+/// How far (permille) the host's measured refresh may be from the mode's for its events to
+/// drive the vsync. Further off (the host output runs another rate than the guest's mode, e.g. a
+/// 144 Hz monitor under a 240 Hz mode), the events are ignored and the timer alone paces at the
+/// mode's rate: DWM and dxgkrnl are told the mode's rate, and two rates on one vsync would beat.
+pub const RATE_TOLERANCE_PERMILLE: u64 = 20;
+
+/// Whether an event's refresh (`refresh_mhz`, 0 unknown) lets it drive a vsync of period
+/// `mode_period`: unknown is trusted, else within [`RATE_TOLERANCE_PERMILLE`]. The period both
+/// the event path and the tick use is always the mode's.
+pub const fn rate_matches(mode_period: u64, refresh_mhz: u32) -> bool {
+    if refresh_mhz == 0 || mode_period == 0 {
+        return true;
     }
     let host = vsync_deadline::period_100ns(refresh_mhz);
-    if host == 0 || mode_period == 0 {
-        return mode_period;
+    if host == 0 {
+        return true;
     }
-    if host * 2 < mode_period || host > mode_period * 2 {
-        mode_period
+    let d = if host > mode_period {
+        host - mode_period
     } else {
-        host
-    }
+        mode_period - host
+    };
+    d * 1000 <= mode_period * RATE_TOLERANCE_PERMILLE
 }
 
 /// Edges of the host-vsync jitter histogram (`HvJit0..5`), microseconds of `|gap - period|`
@@ -1009,7 +1018,7 @@ pub const fn jitter_bucket(gap: u64, period: u64) -> Option<usize> {
 }
 
 /// The counters the per-vblank mode writes (`kmd_render/src/ddi/host_vblank.rs`).
-pub const PACE_COUNTERS: [&str; 16] = [
+pub const PACE_COUNTERS: [&str; 17] = [
     "HvKnob",
     "HvAck",
     "HvRecv",
@@ -1020,6 +1029,7 @@ pub const PACE_COUNTERS: [&str; 16] = [
     "HvTkSkip",
     "HvRephase",
     "HvGap2",
+    "HvRateOff",
     "HvJit0",
     "HvJit1",
     "HvJit2",
@@ -2572,22 +2582,16 @@ mod tests {
     }
 
     #[test]
-    fn the_event_period_is_the_hosts_when_it_is_sane() {
-        assert_eq!(event_period(P240, 0), P240);
-        assert_eq!(
-            event_period(P240, 239_960),
-            vsync_deadline::period_100ns(239_960)
+    fn events_drive_the_vsync_only_at_the_modes_rate() {
+        assert!(rate_matches(P240, 0), "unknown: trusted");
+        assert!(rate_matches(P240, 239_960));
+        assert!(rate_matches(P240, 240_000));
+        assert!(
+            !rate_matches(P240, 144_000),
+            "a 144 Hz host under a 240 Hz mode"
         );
-        assert_eq!(
-            event_period(P240, 144_000),
-            vsync_deadline::period_100ns(144_000)
-        );
-        assert_eq!(
-            event_period(P240, 60_000),
-            P240,
-            "more than 2x off: the mode's"
-        );
-        assert_eq!(event_period(P240, 1_000_000), P240);
+        assert!(!rate_matches(P240, 60_000));
+        assert!(!rate_matches(P240, 250_000), "4% off");
     }
 
     #[test]
@@ -2599,6 +2603,6 @@ mod tests {
         assert_eq!(jitter_bucket(P240 + 15_000, P240), Some(5), "1.5 ms");
         assert_eq!(jitter_bucket(2 * P240, P240), None, "a missing vblank");
         assert_eq!(jitter_bucket(0, P240), None);
-        assert_eq!(PACE_COUNTERS.len(), 10 + JIT_EDGES_US.len() + 1);
+        assert_eq!(PACE_COUNTERS.len(), 11 + JIT_EDGES_US.len() + 1);
     }
 }
