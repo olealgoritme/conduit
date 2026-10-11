@@ -95,6 +95,12 @@ void nb_view_place(const struct nb_view *v, int bw, int bh, int ww, int wh,
  * Returns true when the point was over the picture itself.  gx/gy are in
  * 0..bw-1 / 0..bh-1; send them with the range bw x bh.
  */
+/*
+ * True when the drawn picture leaves part of a ww x wh window uncovered:
+ * the bars, which the backend fills with an opaque black background.  False
+ * only for an exact fit, where the picture alone covers the window.
+ */
+bool nb_view_has_bars(const struct nb_place *p, int ww, int wh);
 bool nb_view_map(const struct nb_place *p, int bw, int bh, double wx,
                  double wy, int *gx, int *gy);
 /* The guest pixel -> window scale, per axis (for drawing the guest cursor). */
