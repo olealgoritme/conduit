@@ -1666,11 +1666,11 @@ unsafe fn nvk_present_frame(
     let fences = crate::knobs::nvk_rm_fence() && caps & HELIOS_ICD_CAP_RM_FENCE != 0;
     // A frame DWM samples directly is complete before DWM can see it (the S3 wait below):
     // nothing on DWM's RM channel waits for a fence in the marker.
+    // DWM's own frame too (measured: the transients stayed with only the producers' frames
+    // completed, and went with DWM's as well).
     let must_complete = !scanout
-        && dwm_reads_source
         && crate::knobs::nvk_composed_complete()
-        && !crate::knobs::is_dwm_process()
-        && !nvk_source_is_primary(shown);
+        && (crate::knobs::is_dwm_process() || (dwm_reads_source && !nvk_source_is_primary(shown)));
     if must_complete {
         let n = NVK_COMPOSED_COMPLETE.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n % 4096 == 0 {
