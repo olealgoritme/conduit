@@ -1,0 +1,426 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sun, 11 Oct 2026 01:59:08 +0200
+Subject: [PATCH] nvk/rm: small system memory allocations share pinned slabs
+
+Every system memory allocation on Windows is our own pages registered
+with RM as an OS descriptor: one pin in the Helios KMD, which allows at
+most 256 per process, and a table of page runs the host maps one by one.
+NVK makes many small ones (64 KiB command buffer chunks, descriptor pools,
+query pools, upload streams).  Counter-Strike 2 on its Vulkan renderer
+went past the pin quota (the KMD counted 15950 refused pins); the
+fallback, RM's own system memory, needs a KMD handle for each CPU mapping
+and ran out of those next (3359 refusals), and vkCreateGraphicsPipelines
+and vkCreateDescriptorPool failed with VK_ERROR_MEMORY_MAP_FAILED.
+
+- Allocations of up to 512 KiB that are system memory, not shared, not
+  tiled and not RM-named (NVKMD_RM_MEM_RM_SYSMEM) are ranges of 4 MiB
+  slabs, each one registration: GPU mappings use the slab's RM object at
+  the range's offset, the CPU mapping is the slab's pages at that offset,
+  frees return the range (one empty slab is kept).  A reused range is
+  zeroed, as fresh pages were.  A slab that cannot be registered falls
+  back to the allocation's own memory as before, and no new slab is
+  tried for a second after such a refusal.  Slabs are registered outside
+  the slab lock.
+- A range has no RM object of its own: nvkmd_rm_mem_rm_handles() gives
+  none for it (the Helios copy path then declines, as exports already
+  did for memory backed by our own pages).
+- NVK_RM_SYSMEM_SLABS=0 turns it off.
+- vkCreateDescriptorPool initializes the pool's heap before anything can
+  fail: its error path destroyed the pool and finished a heap that was
+  never initialized (the access violation that followed the failures).
+---
+ src/nouveau/vulkan/nvk_descriptor_set.c    |   7 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  22 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c |   6 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c | 211 ++++++++++++++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c  |   2 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c |   5 +-
+ 6 files changed, 240 insertions(+), 13 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_descriptor_set.c b/src/nouveau/vulkan/nvk_descriptor_set.c
+index 293d8d1..699cbd4 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_set.c
++++ b/src/nouveau/vulkan/nvk_descriptor_set.c
+@@ -643,6 +643,10 @@ nvk_CreateDescriptorPool(VkDevice _device,
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    list_inithead(&pool->sets);
++   /* Initialized before anything can fail: nvk_destroy_descriptor_pool()
++    * finishes the heap on the error paths below too.
++    */
++   util_vma_heap_init(&pool->heap, 0, 0);
+ 
+    const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
+       vk_find_struct_const(pCreateInfo->pNext,
+@@ -713,9 +717,8 @@ nvk_CreateDescriptorPool(VkDevice _device,
+          mem_size = pool->mem->size_B;
+       }
+ 
++      util_vma_heap_finish(&pool->heap);
+       util_vma_heap_init(&pool->heap, HEAP_START, mem_size);
+-   } else {
+-      util_vma_heap_init(&pool->heap, 0, 0);
+    }
+ 
+    pool->mem_size_B = mem_size;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 479cb94..195e67a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -349,6 +349,18 @@ struct nvkmd_rm_dev {
+    struct util_vma_heap heap;
+    struct util_vma_heap replay_heap;
+ 
++   /* Small system memory allocations share pinned slabs (nvkmd_rm_mem.c):
++    * every OS-descriptor allocation is a pin in the KMD (a per-process
++    * quota) and page runs the host maps one by one.
++    */
++   simple_mtx_t slab_mutex;
++   struct list_head slabs;
++   bool slabs_enabled;
++   /* os_time_get_nano() before which no new slab is tried, after a refused
++    * registration; 0 when none was refused
++    */
++   uint64_t slab_refused_until;
++
+    /* NVK_RM_COMPRESS_ALL statistics, logged as they grow and at device
+     * destruction: device-local memories allocated compressible (and their
+     * size), the ones RM refused, image binds that got the compressible
+@@ -445,6 +457,8 @@ VkResult nvkmd_rm_create_dev(struct nvkmd_pdev *pdev,
+  * Memory
+  */
+ 
++struct nvkmd_rm_slab;
++
+ struct nvkmd_rm_mem {
+    struct nvkmd_mem base;
+ 
+@@ -464,6 +478,13 @@ struct nvkmd_rm_mem {
+     */
+    void *os_pages;
+ 
++   /* A range of a shared slab (small system memory): h_memory and os_pages
++    * are the slab's, os_pages already offset to the range, and GPU mappings
++    * add slab_offset_B to their memory offset.  NULL otherwise.
++    */
++   struct nvkmd_rm_slab *slab;
++   uint64_t slab_offset_B;
++
+    /* Host-visible VRAM: the persistent BAR1 mapping made at allocation
+     * time.  Internal and client maps alias it, so mapping and unmapping it
+     * again (per frame, say) costs nothing.
+@@ -927,6 +948,7 @@ void nvkmd_rm_defer_reap(struct nvkmd_rm_dev *dev, bool try_lock);
+ void nvkmd_rm_defer_init(struct nvkmd_rm_dev *dev);
+ /* Device destruction: everything left is freed now */
+ void nvkmd_rm_defer_finish(struct nvkmd_rm_dev *dev);
++void nvkmd_rm_slabs_finish(struct nvkmd_rm_dev *dev);
+ 
+ VkResult nvkmd_rm_sema_pool_alloc(struct nvkmd_rm_dev *dev,
+                                   struct vk_object_base *log_obj,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 2f47d0a..20857ec 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -237,6 +237,9 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    nvkmd_rm_dev_init_nonstall_event(dev);
+ 
+    simple_mtx_init(&dev->heap_mutex, mtx_plain);
++   simple_mtx_init(&dev->slab_mutex, mtx_plain);
++   list_inithead(&dev->slabs);
++   dev->slabs_enabled = debug_get_bool_option("NVK_RM_SYSMEM_SLABS", true);
+ 
+    STATIC_ASSERT(NVKMD_RM_HEAP_START < NVKMD_RM_INTERNAL_START);
+    STATIC_ASSERT(NVKMD_RM_INTERNAL_END < NVKMD_RM_HEAP_END);
+@@ -313,6 +316,9 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+    /* Frees memory, so it needs the heaps and the client */
+    nvkmd_rm_sema_pool_finish(dev);
+ 
++   /* Empty by now (every memory is freed), except for the spare slab */
++   nvkmd_rm_slabs_finish(dev);
++
+    util_vma_heap_finish(&dev->heap);
+    util_vma_heap_finish(&dev->replay_heap);
+    simple_mtx_destroy(&dev->heap_mutex);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 25cdb17..0cecdda 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -10,6 +10,7 @@
+ #include "util/log.h"
+ #include "util/u_atomic.h"
+ #include "util/os_misc.h"
++#include "util/os_time.h"
+ #include "util/u_math.h"
+ #include "vk_log.h"
+ 
+@@ -307,6 +308,177 @@ nvkmd_rm_alloc_mem(struct nvkmd_dev *dev,
+                                    flags, mem_out);
+ }
+ 
++/* Small system memory in shared slabs
++ *
++ * Every system memory allocation NVK makes on Windows is our own pages
++ * registered with RM (alloc_os_pages): one pin in the Helios KMD, which
++ * holds at most a few hundred per process, and a table of page runs that the
++ * host maps into its address space one run at a time.  NVK makes many small
++ * ones (64 KiB command buffer chunks, descriptor pools, query pools, upload
++ * streams), and a native Vulkan application making several thousand ran out
++ * of pins: the fallback, RM's own system memory, needs a KMD handle for each
++ * CPU mapping and ran out of those next, and pipeline and descriptor pool
++ * creation failed with VK_ERROR_MEMORY_MAP_FAILED.
++ *
++ * So allocations up to NVKMD_RM_SLAB_MAX_ALLOC_B share 4 MiB slabs, each one
++ * registration: a range of a slab is mapped on the GPU from the slab's RM
++ * object at its offset, and on the CPU it is the slab's pages at that offset.
++ * Memory that is shared, tiled, VRAM or that RM itself must name by handle
++ * (NVKMD_RM_MEM_RM_SYSMEM) keeps an allocation of its own.
++ * NVK_RM_SYSMEM_SLABS=0 turns this off.
++ */
++#define NVKMD_RM_SLAB_SIZE_B (4ull << 20)
++#define NVKMD_RM_SLAB_MAX_ALLOC_B (512ull << 10)
++/* util_vma_heap answers 0 for "no room": offsets are biased by this */
++#define NVKMD_RM_SLAB_BASE NVKMD_RM_SLAB_SIZE_B
++
++struct nvkmd_rm_slab {
++   struct list_head link;
++   uint32_t h_memory;
++   void *pages;
++   struct util_vma_heap heap;
++   uint32_t live;
++};
++
++static void
++slab_destroy(struct nvkmd_rm_dev *dev, struct nvkmd_rm_slab *slab)
++{
++   list_del(&slab->link);
++   util_vma_heap_finish(&slab->heap);
++   nvkmd_rm_free_memory(dev, slab->h_memory);
++   dev->lib->free_pages(dev->client, slab->pages, NVKMD_RM_SLAB_SIZE_B);
++   FREE(slab);
++}
++
++/* A range in a slab that has room, under slab_mutex; false if none has */
++static bool
++slab_take_locked(struct nvkmd_rm_dev *dev, uint64_t size_B, uint64_t align_B,
++                 struct nvkmd_rm_slab **slab_out, uint64_t *offset_B_out)
++{
++   list_for_each_entry(struct nvkmd_rm_slab, slab, &dev->slabs, link) {
++      const uint64_t addr = util_vma_heap_alloc(&slab->heap, size_B, align_B);
++      if (addr != 0) {
++         slab->live++;
++         *slab_out = slab;
++         *offset_B_out = addr - NVKMD_RM_SLAB_BASE;
++         return true;
++      }
++   }
++   return false;
++}
++
++static VkResult
++slab_alloc(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
++           uint64_t size_B, uint64_t align_B,
++           struct nvkmd_rm_slab **slab_out, uint64_t *offset_B_out)
++{
++   simple_mtx_lock(&dev->slab_mutex);
++   bool found = slab_take_locked(dev, size_B, align_B, slab_out, offset_B_out);
++   /* After a refused registration (the pin quota is spent), new slabs are
++    * not tried again for a while: each attempt is a 4 MiB VirtualAlloc and
++    * a KMD call that would only be refused again.
++    */
++   const bool backoff = !found && dev->slab_refused_until != 0 &&
++                        os_time_get_nano() < dev->slab_refused_until;
++   simple_mtx_unlock(&dev->slab_mutex);
++   if (found)
++      goto zero;
++   if (backoff)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   /* Registered outside the lock: frees on other threads (deferred ones on
++    * submit paths among them) go on meanwhile.
++    */
++   struct nvkmd_rm_slab *slab = CALLOC_STRUCT(nvkmd_rm_slab);
++   if (slab == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   VkResult result = alloc_os_pages(dev, log_obj, NVKMD_RM_SLAB_SIZE_B,
++                                    &slab->h_memory, &slab->pages);
++   if (result != VK_SUCCESS) {
++      FREE(slab);
++      simple_mtx_lock(&dev->slab_mutex);
++      dev->slab_refused_until = os_time_get_nano() + 1000000000ull;
++      simple_mtx_unlock(&dev->slab_mutex);
++      return result;
++   }
++
++   util_vma_heap_init(&slab->heap, NVKMD_RM_SLAB_BASE, NVKMD_RM_SLAB_SIZE_B);
++   slab->heap.alloc_high = false;
++
++   simple_mtx_lock(&dev->slab_mutex);
++   dev->slab_refused_until = 0;
++   /* New slabs go first: older ones fill up again as their ranges are freed */
++   list_add(&slab->link, &dev->slabs);
++   /* Another thread may have freed or added room meanwhile: any slab will do */
++   found = slab_take_locked(dev, size_B, align_B, slab_out, offset_B_out);
++   assert(found);
++   const bool in_new_slab = *slab_out == slab;
++   if (!in_new_slab) {
++      /* The range came from a slab another thread added meanwhile: ours
++       * stays empty, and is freed unless it is the only empty one
++       */
++      bool other_empty = false;
++      list_for_each_entry(struct nvkmd_rm_slab, s, &dev->slabs, link) {
++         if (s != slab && s->live == 0)
++            other_empty = true;
++      }
++      if (other_empty)
++         slab_destroy(dev, slab);
++   }
++   simple_mtx_unlock(&dev->slab_mutex);
++
++   /* A new slab's pages are zero (VirtualAlloc); a range from another one
++    * may have been used before
++    */
++   if (in_new_slab)
++      return VK_SUCCESS;
++
++zero:
++   /* A reused range holds what its last owner left.  Every system memory
++    * allocation used to be fresh, zeroed pages, and applications rely on
++    * that more than the spec allows; a memset of at most 512 KiB costs far
++    * less than the registration it replaces.
++    */
++   memset((char *)(*slab_out)->pages + *offset_B_out, 0, size_B);
++   return VK_SUCCESS;
++}
++
++static void
++slab_free(struct nvkmd_rm_dev *dev, struct nvkmd_rm_slab *slab,
++          uint64_t offset_B, uint64_t size_B)
++{
++   simple_mtx_lock(&dev->slab_mutex);
++
++   util_vma_heap_free(&slab->heap, NVKMD_RM_SLAB_BASE + offset_B, size_B);
++   assert(slab->live > 0);
++   if (--slab->live == 0) {
++      /* Keep one empty slab for the next allocation, free the others */
++      bool other_empty = false;
++      list_for_each_entry(struct nvkmd_rm_slab, s, &dev->slabs, link) {
++         if (s != slab && s->live == 0)
++            other_empty = true;
++      }
++      if (other_empty)
++         slab_destroy(dev, slab);
++   }
++
++   simple_mtx_unlock(&dev->slab_mutex);
++}
++
++void
++nvkmd_rm_slabs_finish(struct nvkmd_rm_dev *dev)
++{
++   list_for_each_entry_safe(struct nvkmd_rm_slab, slab, &dev->slabs, link) {
++      if (slab->live != 0) {
++         mesa_logw("NVK: a system memory slab still holds %u allocations at "
++                   "device destruction", slab->live);
++      }
++      slab_destroy(dev, slab);
++   }
++   simple_mtx_destroy(&dev->slab_mutex);
++}
++
+ VkResult
+ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+                          struct vk_object_base *log_obj,
+@@ -483,7 +655,20 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+          }
+       }
+    }
+-   if (!vram) {
++   bool slab_done = false;
++   if (!vram && dev->slabs_enabled && !force_rm_sysmem &&
++       size_B <= NVKMD_RM_SLAB_MAX_ALLOC_B && pte_kind == 0 &&
++       tile_mode == 0 && !(flags & NVKMD_MEM_SHARED)) {
++      /* A refusal (no pin left for a new slab) falls back to the paths below */
++      if (slab_alloc(dev, log_obj, size_B, align_B, &mem->slab,
++                     &mem->slab_offset_B) == VK_SUCCESS) {
++         mem->h_memory = mem->slab->h_memory;
++         mem->os_pages = (char *)mem->slab->pages + mem->slab_offset_B;
++         result = VK_SUCCESS;
++         slab_done = true;
++      }
++   }
++   if (!vram && !slab_done) {
+       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       if (!force_rm_sysmem) {
+          result = alloc_os_pages(dev, log_obj, size_B,
+@@ -582,9 +767,13 @@ fail_rm:
+    if (mem->bar_map != NULL)
+       dev->lib->unmap_memory(dev->client, dev->h_device, mem->h_memory,
+                              mem->bar_map, size_B, 0);
+-   nvkmd_rm_free_memory(dev, mem->h_memory);
+-   if (mem->os_pages != NULL)
+-      dev->lib->free_pages(dev->client, mem->os_pages, size_B);
++   if (mem->slab != NULL) {
++      slab_free(dev, mem->slab, mem->slab_offset_B, size_B);
++   } else {
++      nvkmd_rm_free_memory(dev, mem->h_memory);
++      if (mem->os_pages != NULL)
++         dev->lib->free_pages(dev->client, mem->os_pages, size_B);
++   }
+ fail_bar:
+    if (bar)
+       bar_release(dev, size_B);
+@@ -622,11 +811,15 @@ nvkmd_rm_mem_free_now(void *obj)
+    if (mem->bar_charged)
+       bar_release(dev, mem->base.size_B);
+ 
+-   nvkmd_rm_free_memory(dev, mem->h_memory);
+-   if (mem->imported && dev->lib->release_handle != NULL)
+-      dev->lib->release_handle(dev->client, mem->h_memory);
+-   if (mem->os_pages != NULL)
+-      dev->lib->free_pages(dev->client, mem->os_pages, mem->base.size_B);
++   if (mem->slab != NULL) {
++      slab_free(dev, mem->slab, mem->slab_offset_B, mem->base.size_B);
++   } else {
++      nvkmd_rm_free_memory(dev, mem->h_memory);
++      if (mem->imported && dev->lib->release_handle != NULL)
++         dev->lib->release_handle(dev->client, mem->h_memory);
++      if (mem->os_pages != NULL)
++         dev->lib->free_pages(dev->client, mem->os_pages, mem->base.size_B);
++   }
+ 
+    FREE(mem);
+ }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+index de0649a..3d168f5 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+@@ -477,7 +477,7 @@ nvkmd_rm_va_bind_mem(struct nvkmd_va *_va,
+       .va_offset_B = va_offset_B,
+       .range_B = range_B,
+       .h_memory = mem->h_memory,
+-      .mem_offset_B = mem_offset_B,
++      .mem_offset_B = mem->slab_offset_B + mem_offset_B,
+       .flags = flags,
+       .kind = kind,
+    };
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index 1b7500b..d68cd90 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -426,7 +426,10 @@ nvkmd_rm_mem_rm_handles(struct nvkmd_mem *_mem, uint32_t *h_client,
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
+ 
+    *h_client = dev->lib->root(dev->client);
+-   *h_memory = mem->h_memory;
++   /* A range of a shared slab has no RM object of its own: the slab's
++    * handle would name the whole slab, so there is none to give
++    */
++   *h_memory = mem->slab != NULL ? 0 : mem->h_memory;
+ }
+ 
+ VkResult
+-- 
+2.43.0
+
