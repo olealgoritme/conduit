@@ -1701,6 +1701,39 @@ GetMultiplaneOverlayCaps: MaxPlanes=1 groups=2`, `DXGI GetMultiplaneOverlayGroup
 Recovery from any of it: `ScaledFlip` = 0 and a reboot (the knob is the whole KMD surface; the UMD caps follow the KMD's
 answer).
 
+### 14.5 `ScaledFlip` = 2: the plane surface at WDDM 2.2
+
+**Measured on 22.22.405.60** (`ScaledFlip` 1, each row after a full reboot, `OverlayTestMode` absent): one DRIVERCAPS reply of
+576 bytes carrying `SupportMultiPlaneOverlay` and `MaxOverlayPlanes` 2 (`SflCapN` 1, `SflCapSz` 576, `SflCapMpo` 2), then 4
+with `SflPlanes` 4; with `SflDdis` 1 the older checks registered and never called (`SflOldChk` 0). In every row kmt 20 = 0,
+`flags=0x0`, no check DDI called. So at WDDM 2.1 dxgkrnl reads the overlay caps and does not act on them: neither the plane count
+nor the older DDIs are the gate.
+
+What points at the WDDM level:
+
+* The user-mode view of a driver's plane caps has a bit for it: `D3DKMT_MULTIPLANE_OVERLAY_CAPS.Version3DDISupport`, "Driver
+  supports the 2.2 MPO DDIs", and the queries `KMTQAITYPE_MPO3DDI_SUPPORT` (43) and `KMTQAITYPE_MPOKERNELCAPS_SUPPORT` (45) exist
+  only in the `>= WDDM2_2` block [H `d3dkmthk.h:1338-1356, 2416-2420`]. User mode (DWM, DXGI) asks whether the driver is a 2.2
+  MPO driver, i.e. one that answers `DxgkDdiGetMultiPlaneOverlayCaps`, "used to retrieve the multiplane overlay capabilities
+  rather than the user mode DDIs" at 2.2 [DDI `nc-d3dkmddi-dxgkddi_getmultiplaneoverlaycaps.md`].
+* This tree measured the other side: at WDDM 3.2 without the plane DDIs, DWM took its Display-Core path and failed with
+  `E_NOTIMPL` in `CDDisplaySwapChain`'s legacy present (`wddm_surface.rs`). DWM's presentation model follows the WDDM level, and
+  the model at 2.2 and above is the plane one. At 2.1 DWM keeps its legacy model, which on 26100 evidently does not use planes.
+* No header or doc says either in so many words [M]; the row below is the test.
+
+What 2.2 changes in the driver (scope):
+
+| area | at 2.2 | in this driver |
+|---|---|---|
+| level sites | `DRIVER_INITIALIZATION_DATA.Version` 0x700A, `DRIVERCAPS.WDDMVersion` and `WDDMDEVICECAPS.WDDMVersion` `DXGKDDI_WDDMv2_2`, GpuMmu as at 2.1 | one run-time value, `wddm_surface::surface()`, read in `DriverEntry`: no partial raise |
+| 2.2 table members [WDK `dispmprt.h:2902-2936`] | hardware-context scheduling (`CreateHwContext` .. `SwitchToHwContextList`, `ResetHwEngine`), periodic frame notification, `SetTimingsFromVidPn`, the `SetTarget*` four, `DisplayDetectControl`, `QueryConnectionChange`, `ExchangePreStartInfo`, `GetMultiPlaneOverlayCaps`, `GetPostCompositionCaps` | registered already: the hardware-context set but `ResetHwEngine`, and `ExchangePreStartInfo`; added: the two caps DDIs; null: the rest. The 3.2 bring-up of this tree started the adapter with those null, so dxgkrnl does not demand them |
+| struct shapes | none new for the KMD | the bindings are the 3.2 shapes already; `DRIVERCAPS` `GammaRampCaps` / `ColorTransformCaps` stays 0 |
+| presentation | DWM presents through the plane path: every desktop flip arrives through `DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3` and retires by `PresentId` | the 14.3 plane flip and completion; with 2.1 only ever exercised by tests, this is the first real use |
+| caps | `DxgkDdiGetMultiPlaneOverlayCaps`: `MaxPlanes` = `MaxRGBPlanes` = `SflPlanes`, `MaxYUVPlanes` 0, `StretchRGB \| BilinearFilter` (+ `Immediate` with `FlipImmediateMmIo`), stretch 8.0, shrink 1.0; `DxgkDdiGetPostCompositionCaps`: 8.0 / 1.0 (floats written as bits) | counters `SflGetCaps`, `SflPostCaps` |
+
+Risk: the adapter not starting at 2.2 (Code 43), or DWM failing on the plane path (black screen, DWM restarts). Recovery is
+`ScaledFlip` = 0 and a reboot (`SflKnob` reads 2 while it is on).
+
 Rows (main runs them; reboot after each KMD knob change; 1920x1080@240 first, then 5120x1440@240; d3d11_iflip from this
 branch, `guest/windows/tools/d3d11_iflip.cpp`):
 
@@ -1715,6 +1748,7 @@ branch, `guest/windows/tools/d3d11_iflip.cpp`):
 | N1 | `ScaledFlip` 1 (`SflPlanes` absent = 2) | the iflip header, then M1 and M2 | `SflCapMpo` 2, `SflCapSz` >= 548; kmt 20 = 1 is the plane count being the rule |
 | N2 | N1 plus `SflDdis` 1 | as N1 | only if N1 stays at kmt 20 = 0: the older check DDIs being the rule (`SflOldChk` shows whether they are called) |
 | N3 | N1 with `SflPlanes` 4 | as N1 | only if N1 and N2 stay at 0: a larger count |
+| W1 | `ScaledFlip` 2 (`SflPlanes`, `SflDdis` absent) | boot, idle desktop 60 s, the iflip header, then M1, M2, M3 | adapter started (cfg 0), `SflKnob` 2, `SflGetCaps` > 0, kmt 20 = 1 and `flags` >= 0x1; desktop flips through the plane DDI (`SflFlip`, `SflVsMpo` rising with DWM, `SflVsErr` 0, `SflBad` 0); M2/M3 `OVERLAY` with `SflScaled` at the app's rate |
 
 If M2 stays composed with `SflChk` 0, DXGI never asked: read the UMD log's caps lines and `flags=`; if `SflChk` rises with
 `SflChkOk` 0, `SflWhy` names the rule that refused.

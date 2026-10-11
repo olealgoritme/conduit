@@ -51,6 +51,8 @@ static CAP_N: AtomicU32 = AtomicU32::new(0);
 static CAP_SZ: AtomicU32 = AtomicU32::new(0);
 static CAP_MPO: AtomicU32 = AtomicU32::new(0);
 static OLD_CHK: AtomicU32 = AtomicU32::new(0);
+static GET_CAPS: AtomicU32 = AtomicU32::new(0);
+static POST_CAPS: AtomicU32 = AtomicU32::new(0);
 /// The `PresentId`s of plane flips, by address.
 static BOOK: sf::PresentBook = sf::PresentBook::new();
 /// Which vsync interrupt types dxgkrnl has enabled: bit 0 `CRTC_VSYNC`, bit 1 the MPO forms.
@@ -88,6 +90,12 @@ pub(crate) fn read_knob_at_driver_entry() {
     DDIS.store(ddis, Ordering::Relaxed);
 }
 
+/// `ScaledFlip` = 2: the adapter reports WDDM 2.2 (`wddm_surface::surface`). Any IRQL; fixed
+/// from `DriverEntry` on.
+pub(crate) fn raises_wddm() -> bool {
+    Mode::from_knob(KNOB.load(Ordering::Relaxed)).raises_wddm()
+}
+
 /// The plane count the caps report (`SflPlanes`). Any IRQL.
 pub(crate) fn planes() -> u32 {
     PLANES.load(Ordering::Relaxed)
@@ -119,7 +127,7 @@ pub(crate) fn reset_for_start() {
     VSYNC_TYPES.store(VS_LEGACY, Ordering::Relaxed);
     for c in [
         &CHK, &CHK_OK, &WHY, &FLIP, &SCALED, &OFF, &BAD, &VS_MPO_N, &VS_BOTH, &PRESENT, &PR_DMA,
-        &LAYER, &VS_ERR, &OLD_CHK,
+        &LAYER, &VS_ERR, &OLD_CHK, &GET_CAPS, &POST_CAPS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -137,7 +145,7 @@ pub(crate) fn publish() {
 
 fn write_block() {
     let r = |c: &AtomicU32| c.load(Ordering::Relaxed);
-    crate::diag::record_named_bytes(b"SflKnob", u32::from(on()));
+    crate::diag::record_named_bytes(b"SflKnob", if raises_wddm() { 2 } else { u32::from(on()) });
     crate::diag::record_named_bytes(b"SflChk", r(&CHK));
     crate::diag::record_named_bytes(b"SflChkOk", r(&CHK_OK));
     crate::diag::record_named_bytes(b"SflWhy", r(&WHY));
@@ -157,6 +165,8 @@ fn write_block() {
     crate::diag::record_named_bytes(b"SflCapN", r(&CAP_N));
     crate::diag::record_named_bytes(b"SflCapSz", r(&CAP_SZ));
     crate::diag::record_named_bytes(b"SflCapMpo", r(&CAP_MPO));
+    crate::diag::record_named_bytes(b"SflGetCaps", r(&GET_CAPS));
+    crate::diag::record_named_bytes(b"SflPostCaps", r(&POST_CAPS));
 }
 
 /// A flip through the legacy `DxgkDdiSetVidPnSourceAddress` (any IRQL; one store).
@@ -588,5 +598,88 @@ pub unsafe extern "C" fn dxgkddi_check_mpo_support2(
     // SAFETY: all-zero is "no limitation reported".
     a.ReturnInfo = unsafe { core::mem::zeroed() };
     bump(&OLD_CHK);
+    STATUS_SUCCESS
+}
+
+/// `DxgkDdiGetMultiPlaneOverlayCaps` (WDDM 2.2 table; registered only with `ScaledFlip` = 2;
+/// PASSIVE): `SflPlanes` RGB planes including the primary, no YUV plane, whole-plane RGB stretch with
+/// bilinear filtering up to `MAX_STRETCH`, no shrink, immediate flips when the flip caps report
+/// `FlipImmediateMmIo`. The floats are written as their bits.
+///
+/// # Safety
+/// Called by dxgkrnl with its argument struct live for the call.
+pub unsafe extern "C" fn dxgkddi_get_mpo_caps(
+    h_adapter: IN_CONST_HANDLE,
+    args: IN_OUT_PDXGKARG_GETMULTIPLANEOVERLAYCAPS,
+) -> NTSTATUS {
+    let p = h_adapter as *const AdapterContext;
+    if p.is_null() || args.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let adapter = unsafe { &*p };
+    let a = unsafe { &mut *args };
+    bump(&GET_CAPS);
+    if !on() || a.VidPnSourceId != 0 {
+        a.MaxPlanes = 0;
+        a.MaxRGBPlanes = 0;
+        a.MaxYUVPlanes = 0;
+        a.OverlayCaps.__bindgen_anon_1.Value = 0;
+        // SAFETY: plain `float` fields; 0.0 is all-zero bits.
+        unsafe {
+            core::ptr::addr_of_mut!(a.MaxStretchFactor)
+                .cast::<u32>()
+                .write_unaligned(0);
+            core::ptr::addr_of_mut!(a.MaxShrinkFactor)
+                .cast::<u32>()
+                .write_unaligned(0);
+        }
+        return STATUS_SUCCESS;
+    }
+    const FLIPCAPS_FLIP_IMMEDIATE_MMIO: u32 = 1 << 3;
+    let immediate = adapter.knobs().flip_caps().reported & FLIPCAPS_FLIP_IMMEDIATE_MMIO != 0;
+    a.MaxPlanes = planes();
+    a.MaxRGBPlanes = planes();
+    a.MaxYUVPlanes = 0;
+    a.OverlayCaps.__bindgen_anon_1.Value = sf::km_overlay_caps(immediate);
+    // SAFETY: plain `float` fields written as their IEEE-754 bits.
+    unsafe {
+        core::ptr::addr_of_mut!(a.MaxStretchFactor)
+            .cast::<u32>()
+            .write_unaligned(sf::MAX_STRETCH_F32_BITS);
+        core::ptr::addr_of_mut!(a.MaxShrinkFactor)
+            .cast::<u32>()
+            .write_unaligned(sf::MAX_SHRINK_F32_BITS);
+    }
+    STATUS_SUCCESS
+}
+
+/// `DxgkDdiGetPostCompositionCaps` (WDDM 2.2 table; registered only with `ScaledFlip` = 2;
+/// PASSIVE): the panel fitter stretches up to `MAX_STRETCH` and never shrinks.
+///
+/// # Safety
+/// Called by dxgkrnl with its argument struct live for the call.
+pub unsafe extern "C" fn dxgkddi_get_post_composition_caps(
+    _h_adapter: IN_CONST_HANDLE,
+    args: IN_OUT_PDXGKARG_GETPOSTCOMPOSITIONCAPS,
+) -> NTSTATUS {
+    if args.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let a = unsafe { &mut *args };
+    bump(&POST_CAPS);
+    let (stretch, shrink) = if on() && a.VidPnSourceId == 0 {
+        (sf::MAX_STRETCH_F32_BITS, sf::MAX_SHRINK_F32_BITS)
+    } else {
+        (0, 0)
+    };
+    // SAFETY: plain `float` fields written as their IEEE-754 bits.
+    unsafe {
+        core::ptr::addr_of_mut!(a.MaxStretchFactor)
+            .cast::<u32>()
+            .write_unaligned(stretch);
+        core::ptr::addr_of_mut!(a.MaxShrinkFactor)
+            .cast::<u32>()
+            .write_unaligned(shrink);
+    }
     STATUS_SUCCESS
 }

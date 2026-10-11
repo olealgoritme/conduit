@@ -1413,8 +1413,9 @@ pub mod knobs {
     /// (`docs/independent-flip.md` section 14, `helios_kmd_logic::scaled_flip`). 1 reports
     /// `SupportMultiPlaneOverlay` with one plane, registers the MPO3 DDIs and retires plane flips by
     /// `PresentId`, so dxgkrnl can flip a full-screen swap chain smaller than the mode straight to
-    /// scan-out (the host scales it). Any other value is off. Read ONCE, in `DriverEntry` (the DDI
-    /// table is built there): a change needs a reboot. Mirrored as `SflKnob`.
+    /// scan-out (the host scales it). 2 = as 1, and the adapter reports WDDM 2.2 with the 2.2 plane
+    /// caps DDIs (`wddm_surface::surface`). Any other value is off. Read ONCE, in `DriverEntry` (the
+    /// DDI table is built there): a change needs a reboot. Mirrored as `SflKnob`.
     pub const SCALED_FLIP: KnobName = KnobName::new(b"ScaledFlip");
     /// `SflPlanes` (default 2, clamped to 1..=4): the `MaxOverlayPlanes` `ScaledFlip` reports
     /// (`helios_kmd_logic::scaled_flip::planes_from_knob`). The host still shows one plane; the

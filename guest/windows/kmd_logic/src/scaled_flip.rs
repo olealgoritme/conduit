@@ -48,24 +48,33 @@ pub const KNOB_DEFAULT: u32 = 0;
 /// What the knob asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// 0, absent or any value but 1: no MPO caps, no MPO DDIs. The driver as before.
+    /// 0, absent or any value but 1 and 2: no MPO caps, no MPO DDIs. The driver as before.
     Off,
-    /// 1: one plane with whole-buffer stretch is advertised, the MPO3 DDIs are registered.
+    /// 1: the plane surface at the production WDDM 2.1 level (the MPO3 DDIs of the 2.1 table,
+    /// caps from the UMD).
     On,
+    /// 2: as 1, and the adapter reports WDDM 2.2 with the 2.2 table's plane caps DDIs
+    /// (`DxgkDdiGetMultiPlaneOverlayCaps`, `DxgkDdiGetPostCompositionCaps`).
+    OnWddm22,
 }
 
 impl Mode {
-    /// Only 1 turns it on: a typo never changes how every flip of the desktop is delivered.
+    /// Only 1 and 2 turn it on: a typo never changes how every flip of the desktop is delivered.
     pub const fn from_knob(v: u32) -> Self {
-        if v == 1 {
-            Self::On
-        } else {
-            Self::Off
+        match v {
+            1 => Self::On,
+            2 => Self::OnWddm22,
+            _ => Self::Off,
         }
     }
 
     pub const fn is_on(self) -> bool {
-        matches!(self, Self::On)
+        matches!(self, Self::On | Self::OnWddm22)
+    }
+
+    /// The adapter reports WDDM 2.2 instead of 2.1.
+    pub const fn raises_wddm(self) -> bool {
+        matches!(self, Self::OnWddm22)
     }
 }
 
@@ -108,6 +117,20 @@ pub const MAX_SHRINK: u32 = 1;
 /// How far, in pixels per edge, a destination may be from the aspect-correct rectangle and still
 /// be taken for it (DWM and the runtime round the centred rectangle their own way).
 pub const ASPECT_SLACK: i32 = 2;
+
+/// `DXGK_MULTIPLANEOVERLAYCAPS` bits the 2.2 caps DDI reports: `StretchRGB` (bit 4) and
+/// `BilinearFilter` (bit 6), plus `Immediate` (bit 9) when immediate flips are reported. No rotation,
+/// mirror, YUV, `Shared` or `Plane0ForVirtualModeOnly`.
+pub const KM_CAPS_STRETCH_RGB: u32 = 1 << 4;
+pub const KM_CAPS_BILINEAR: u32 = 1 << 6;
+pub const KM_CAPS_IMMEDIATE: u32 = 1 << 9;
+pub const fn km_overlay_caps(immediate: bool) -> u32 {
+    KM_CAPS_STRETCH_RGB | KM_CAPS_BILINEAR | if immediate { KM_CAPS_IMMEDIATE } else { 0 }
+}
+/// `MAX_STRETCH` and `MAX_SHRINK` as the IEEE-754 bits of the `float`s the caps DDIs return
+/// (written as bits: no floating-point instruction in the kernel).
+pub const MAX_STRETCH_F32_BITS: u32 = 0x4100_0000; // 8.0
+pub const MAX_SHRINK_F32_BITS: u32 = 0x3F80_0000; // 1.0
 
 /// `D3DDDI_ROTATION_IDENTITY`. 0 (unset) is taken as identity too.
 pub const ROTATION_IDENTITY: u32 = 1;
@@ -624,7 +647,7 @@ impl Default for PresentBook {
 }
 
 /// The counters (`ddi/scaled_flip.rs` writes exactly these, at most 13 characters).
-pub const COUNTERS: [&str; 20] = [
+pub const COUNTERS: [&str; 22] = [
     "SflKnob",
     "SflChk",
     "SflChkOk",
@@ -645,6 +668,8 @@ pub const COUNTERS: [&str; 20] = [
     "SflCapN",
     "SflCapSz",
     "SflCapMpo",
+    "SflGetCaps",
+    "SflPostCaps",
 ];
 
 #[cfg(test)]
@@ -669,6 +694,14 @@ mod tests {
 
     fn both(v: &[(u32, u64)]) -> VsyncReport {
         VsyncReport::Both(ids(v))
+    }
+
+    #[test]
+    fn the_caps_floats_are_the_factors() {
+        assert_eq!(f32::from_bits(MAX_STRETCH_F32_BITS), MAX_STRETCH as f32);
+        assert_eq!(f32::from_bits(MAX_SHRINK_F32_BITS), MAX_SHRINK as f32);
+        assert_eq!(km_overlay_caps(false), 0x50);
+        assert_eq!(km_overlay_caps(true), 0x250);
     }
 
     #[test]
@@ -991,10 +1024,13 @@ mod tests {
     }
 
     #[test]
-    fn only_one_turns_the_knob_on() {
+    fn only_one_and_two_turn_the_knob_on() {
         assert_eq!(Mode::from_knob(KNOB_DEFAULT), Mode::Off);
         assert_eq!(Mode::from_knob(1), Mode::On);
-        for v in [0u32, 2, 3, 0xFFFF_FFFF] {
+        assert!(!Mode::On.raises_wddm());
+        assert_eq!(Mode::from_knob(2), Mode::OnWddm22);
+        assert!(Mode::OnWddm22.is_on() && Mode::OnWddm22.raises_wddm());
+        for v in [0u32, 3, 0xFFFF_FFFF] {
             assert_eq!(Mode::from_knob(v), Mode::Off, "{v}");
         }
     }

@@ -102,7 +102,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // bits and `GetNodeMetadata.GpuMmuSupported` in `query_adapter_info.rs` — which
     // is why all four now read the one `SURFACE` value. The struct ABI we bindgen is
     // the 26100/WDDM-3.2 shape regardless of the level reported here.
-    data.Version = crate::ddi::wddm_surface::SURFACE.ddi_interface_version();
+    data.Version = crate::ddi::wddm_surface::surface().ddi_interface_version();
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────
     data.DxgkDdiAddDevice = Some(ddi::dxgkddi_add_device);
@@ -205,6 +205,13 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
             Some(ddi::scaled_flip::dxgkddi_set_vidpn_source_address_mpo3);
         data.DxgkDdiPostMultiPlaneOverlayPresent =
             Some(ddi::scaled_flip::dxgkddi_post_mpo_present);
+        // `ScaledFlip` = 2 (WDDM 2.2): the 2.2 table's plane caps DDIs, which replace the UMD's
+        // caps at that level.
+        if ddi::scaled_flip::raises_wddm() {
+            data.DxgkDdiGetMultiPlaneOverlayCaps = Some(ddi::scaled_flip::dxgkddi_get_mpo_caps);
+            data.DxgkDdiGetPostCompositionCaps =
+                Some(ddi::scaled_flip::dxgkddi_get_post_composition_caps);
+        }
         // `SflDdis` bit 0: the older check DDIs too, answering "not supported".
         if ddi::scaled_flip::old_checks() {
             data.DxgkDdiCheckMultiPlaneOverlaySupport =

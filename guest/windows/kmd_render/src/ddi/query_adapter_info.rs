@@ -23,7 +23,7 @@ use crate::dxgk::*;
 
 use crate::adapter::{AdapterContext, AdapterKnobs};
 use crate::ddi::gpummu;
-use crate::ddi::wddm_surface::SURFACE;
+use crate::ddi::wddm_surface::surface;
 
 pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     miniport_device_context: *mut c_void,
@@ -249,7 +249,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // One value drives this, DXGKQAITYPE_WDDMDEVICECAPS and DriverEntry's
     // DRIVER_INITIALIZATION_DATA.Version. Dxgkrnl rejects internally
     // inconsistent version/capability surfaces during AddAdapter.
-    let wddm_version = SURFACE.driver_caps_version();
+    let wddm_version = surface().driver_caps_version();
     out.set(caps_offset!(WDDMVersion), wddm_version);
     out.set(
         caps_offset!(
@@ -346,7 +346,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     if knobs.cross_adapter {
         mem_caps |= MEMORYMANAGEMENTCAPS_CROSS_ADAPTER_RESOURCE;
     }
-    if SURFACE.gpu_mmu() {
+    if surface().gpu_mmu() {
         mem_caps |= MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED
             | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
     }
@@ -576,7 +576,7 @@ unsafe fn query_wddm_device_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     // SAFETY: pOutputData points to a DXGK_WDDMDEVICECAPS of sufficient size.
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_WDDMDEVICECAPS) };
     unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
-    caps.WDDMVersion = SURFACE.driver_caps_version();
+    caps.WDDMVersion = surface().driver_caps_version();
     STATUS_SUCCESS
 }
 
@@ -1344,7 +1344,7 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
     // value: a GpuMmu level advertises the GPU-virtual-addressing model, WDDM 1.3
     // stays at the viogpu3d-style surface with no explicit memory model. GpuMmu and
     // IoMmu are mutually exclusive.
-    node.GpuMmuSupported = BOOLEAN::from(SURFACE.gpu_mmu());
+    node.GpuMmuSupported = BOOLEAN::from(surface().gpu_mmu());
     node.IoMmuSupported = 0;
     // WDK requires an empty FriendlyName for standard engines such as 3D;
     // custom names are for DXGK_ENGINE_TYPE_OTHER. Flags stay zeroed.
