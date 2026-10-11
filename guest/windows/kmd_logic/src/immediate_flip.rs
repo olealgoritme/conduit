@@ -169,11 +169,19 @@ pub const fn programming_is_immediate(mode: u32, recorded_flags: u32) -> bool {
             || (mode & IFLIP_NOW != 0 && recorded_flags & SVSA_INDEPENDENT_FLIP_EXCLUSIVE != 0))
 }
 
-/// Whether the completion vsync is worth sending: the programming published a new address.
-/// (A programming that was deferred, superseded or refused left the previous address, and a
-/// vsync carrying it would retire nothing new.)
-pub const fn published_new(before: u64, after: u64) -> bool {
-    after != 0 && after != before
+/// The address a completion vsync carries after an immediate programming, or `None`: the flip's
+/// own address (`flip`) when it is the published one now (`published`) and not the one the
+/// previous completion already carried (`last_done`). Not "the published address changed during
+/// the programming": with `FlipAnnounce` the DDI publishes the address before the worker
+/// programs it, so it never changes there (405.51: every promoted flip took the immediate path
+/// and none got its completion, `ImmVsNo` = `ImmProg`, and they stayed tied to the tick). A
+/// programming that was deferred, superseded or refused left another address published: none.
+pub const fn completion_address(published: u64, flip: u64, last_done: u64) -> Option<u64> {
+    if flip != 0 && published == flip && flip != last_done {
+        Some(flip)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -306,10 +314,20 @@ mod tests {
     }
 
     #[test]
-    fn a_completion_vsync_needs_a_new_address() {
-        assert!(published_new(0x1000, 0x2000));
-        assert!(!published_new(0x1000, 0x1000), "deferred or refused");
-        assert!(!published_new(0x1000, 0), "nothing published");
+    fn a_completion_vsync_carries_the_flips_own_published_address_once() {
+        // Announced at the DDI: published before the programming, still the flip's.
+        assert_eq!(completion_address(0x2000, 0x2000, 0x1000), Some(0x2000));
+        assert_eq!(
+            completion_address(0x2000, 0x2000, 0x2000),
+            None,
+            "already completed"
+        );
+        assert_eq!(
+            completion_address(0x1000, 0x2000, 0x1000),
+            None,
+            "deferred or refused"
+        );
+        assert_eq!(completion_address(0, 0, 0), None);
     }
 
     #[test]

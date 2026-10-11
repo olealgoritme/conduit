@@ -19,7 +19,7 @@
 //! vsyncs reported), `ImmVsNo` (immediate programmings that did not get one: nothing new was
 //! published, the chain was not live, or `FlipDoneHost` holds addresses).
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use helios_kmd_logic::immediate_flip as imf;
 
@@ -37,12 +37,15 @@ static PROG: AtomicU32 = AtomicU32::new(0);
 static VS: AtomicU32 = AtomicU32::new(0);
 static VS_NO: AtomicU32 = AtomicU32::new(0);
 static DIRTY: AtomicU32 = AtomicU32::new(1);
+/// The address the last completion vsync carried.
+static LAST_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// The knob for this start, and zeroed counters. PASSIVE (registry read).
 pub(crate) fn start_generation() {
     let knob = crate::diag::read_config_dword(crate::diag::knobs::IMM_FLIP, imf::DEFAULT_KNOB);
     MODE.store(imf::mode(knob), Ordering::Relaxed);
     CURRENT.store(0, Ordering::Relaxed);
+    LAST_DONE.store(0, Ordering::Relaxed);
     for c in [&DMA, &MMIO, &PROG, &VS, &VS_NO] {
         c.store(0, Ordering::Relaxed);
     }
@@ -107,22 +110,20 @@ pub(crate) fn min_interval(paced_100ns: u64, immediate: bool) -> u64 {
     imf::min_interval(paced_100ns, immediate, mode())
 }
 
-/// After an immediate programming: if it published a new address (`before` was the published
-/// one when it started), report the `CRTC_VSYNC` that retires it now instead of at the next
-/// tick. The worker, after the scan-out lifecycle lock was released (PASSIVE);
+/// After an immediate programming: if the flip's own address (`flip_address`) is the published
+/// one and no completion carried it yet, report the `CRTC_VSYNC` that retires it now instead of
+/// at the next tick (`imf::completion_address`). The worker, after the scan-out lifecycle lock was released (PASSIVE);
 /// `signal_crtc_vsync` raises to DIRQL through `DxgkCbSynchronizeExecution` itself, as from the
 /// tick and from `host_flip_done::service`.
-pub(crate) fn complete_now(adapter: &AdapterContext, before: u64) {
+pub(crate) fn complete_now(adapter: &AdapterContext, flip_address: u64) {
     let live = adapter.display_half()
         && adapter.vsync_armed.load(Ordering::Acquire) != 0
         && adapter.vsync_enabled.load(Ordering::Acquire) != 0;
     let host_holds = crate::ddi::host_flip_done::mode().is_on();
     let published = adapter.last_primary_address.load(Ordering::Acquire);
-    let address = if imf::published_new(before, published) {
-        published
-    } else {
-        0
-    };
+    let address =
+        imf::completion_address(published, flip_address, LAST_DONE.load(Ordering::Relaxed))
+            .unwrap_or(0);
     if imf::completes_now(mode(), true, live, host_holds, address).is_err() {
         bump(&VS_NO);
         return;
@@ -143,6 +144,7 @@ pub(crate) fn complete_now(adapter: &AdapterContext, before: u64) {
         bump(&VS_NO);
         return;
     }
+    LAST_DONE.store(address, Ordering::Relaxed);
     bump(&VS);
     // dxgkrnl may have issued the next flip inside that callback.
     if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
