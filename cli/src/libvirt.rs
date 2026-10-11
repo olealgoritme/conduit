@@ -367,11 +367,27 @@ fn previous_input_slot(args: &[String], kind: &str) -> Option<u8> {
         })
 }
 
+/// The slots that `<qemu:arg>` devices name (`addr=0xNN`): libvirt does not
+/// know them, so [`used_slots`] does not see them.
+fn arg_slots(args: &[Element]) -> Vec<u8> {
+    args.iter()
+        .filter_map(|a| a.attributes.get("value"))
+        .flat_map(|v| v.split([',', '"']).map(str::to_string).collect::<Vec<_>>())
+        .filter_map(|kv| {
+            let v = kv.strip_prefix("addr=")?;
+            let slot = v.split('.').next()?;
+            u8::from_str_radix(slot.trim_start_matches("0x"), 16).ok()
+        })
+        .collect()
+}
+
 /// Slots for the virtio-input devices: each keeps its earlier one if still
-/// free, the rest take the highest free ones below the GPU's.
-fn pick_input_slots(root: &Element, gpu: u8, prev: &[Option<u8>]) -> Result<Vec<u8>> {
+/// free, the rest take the highest free ones below the GPU's. `taken`: slots
+/// other `<qemu:arg>` devices hold.
+fn pick_input_slots(root: &Element, gpu: u8, taken: &[u8], prev: &[Option<u8>]) -> Result<Vec<u8>> {
     let mut used = used_slots(root);
     used.push(gpu);
+    used.extend_from_slice(taken);
     let mut out: Vec<Option<u8>> = Vec::new();
     for p in prev {
         let keep = p.filter(|s| !used.contains(s));
@@ -838,6 +854,7 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     // The tablet moves to the command line once and stays there.
     let tablet = has_video && (moved_tablet || values.iter().any(|v| v.contains(TABLET_ID)));
     let keep = foreign_args(&args, &values);
+    let foreign_slots = arg_slots(&keep);
     let slot = pick_slot(&root, prev)?;
     let others: Vec<XMLNode> = cl
         .children
@@ -864,7 +881,7 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
             .iter()
             .map(|k| previous_input_slot(&values, k))
             .collect();
-        let slots = pick_input_slots(&root, slot, &prev)?;
+        let slots = pick_input_slots(&root, slot, &foreign_slots, &prev)?;
         ours.extend(input_args(w.input_socks, bus, &slots));
     }
     for v in ours {
@@ -2433,6 +2450,37 @@ mod tests {
         // Attach with a backend without them: they go again.
         let without = edit_as(&out, true);
         assert!(!without.contains("conduit-input-"), "{without}");
+    }
+
+    /// A device the user added as a `<qemu:arg>` keeps its slot: libvirt
+    /// does not know it, so the input devices must not take it.
+    #[test]
+    fn virtio_input_slots_avoid_foreign_qemu_arg_devices() {
+        let plain = edit_with_input(VIRT_INSTALL);
+        let args = qemu_args(&plain);
+        let first: Vec<u8> = super::units::INPUT_KINDS
+            .iter()
+            .map(|k| super::previous_input_slot(&args, k).unwrap())
+            .collect();
+        // A foreign device on the slot the mouse took on its own.
+        let foreign = format!(
+            "<qemu:commandline xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>\
+             <qemu:arg value='-device'/>\
+             <qemu:arg value='virtio-net-pci,netdev=n0,bus=pcie.0,addr={:#04x},mac=52:54:00:00:00:01'/>\
+             </qemu:commandline></domain>",
+            first[0]
+        );
+        let src = VIRT_INSTALL.replace("</domain>", &foreign);
+        let out = edit_with_input(&src);
+        let args = qemu_args(&out);
+        assert!(
+            args.iter().any(|a| a.starts_with("virtio-net-pci,")),
+            "{out}"
+        );
+        for k in super::units::INPUT_KINDS {
+            let s = super::previous_input_slot(&args, k).unwrap();
+            assert_ne!(s, first[0], "{k} took the foreign device's slot: {out}");
+        }
     }
 
     #[test]

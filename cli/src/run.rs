@@ -648,9 +648,6 @@ fn viewer_session(wayland: bool, x11: bool) -> Option<&'static str> {
     }
 }
 
-/// Whether this backend build understands `flag` (its `--help` names it):
-/// the CLI and the backend may come from different builds, and the backend
-/// refuses to start over an option it does not know.
 /// Whether a libvirt VM gets the virtio-input devices its backend serves
 /// (docs/INPUT.md): the installed backend knows `--input-socket`, and
 /// `CONDUIT_VIRTIO_INPUT=0` does not turn them off. A backend without them
@@ -662,6 +659,9 @@ pub(crate) fn virtio_input() -> bool {
             .is_some_and(|b| backend_takes(&b, "--input-socket"))
 }
 
+/// Whether this backend build understands `flag` (its `--help` names it):
+/// the CLI and the backend may come from different builds, and the backend
+/// refuses to start over an option it does not know.
 pub(crate) fn backend_takes(backend: &Path, flag: &str) -> bool {
     Command::new(backend)
         .arg("--help")
