@@ -1357,6 +1357,23 @@ pub fn guest_takes_input(event_queue_live: bool, acked_bit: bool, linux_guest: b
     event_queue_live && (acked_bit || linux_guest)
 }
 
+/// `CONDUIT_INPUT_ROUTE=console`: route a guest's input through the boot
+/// console path (its virtio-input devices, else QEMU's emulated ones) even
+/// when the guest takes Conduit input. For measuring the paths against each
+/// other on a Linux guest; read once.
+fn input_route_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        let on = std::env::var("CONDUIT_INPUT_ROUTE").as_deref() == Ok("console");
+        if on {
+            log::warn!(
+                "display: CONDUIT_INPUT_ROUTE=console: all input goes the boot console's way"
+            );
+        }
+        on
+    })
+}
+
 /// The boot console (`crate::console`): where input goes while it is shown,
 /// and how it is told that the mode may have changed.
 pub trait ConsoleSink: Send + Sync {
@@ -1580,6 +1597,9 @@ pub struct DisplayLink {
     console_shown: AtomicBool,
     /// A console is attached ([`DisplayLink::attach_console`]).
     console_attached: AtomicBool,
+    /// The virtio-input devices (`crate::vinput`): they take the console's
+    /// input while their guest driver runs them.
+    vinput: Mutex<Option<crate::vinput::Router>>,
     /// The guest wants `ScanoutReleased` (lock-free check on every flip).
     release_on: AtomicBool,
     release_sink: Mutex<Option<Arc<dyn ReleaseSink>>>,
@@ -1666,6 +1686,7 @@ impl DisplayLink {
             exporter: Mutex::new(Arc::new(real_export)),
             console_shown: AtomicBool::new(false),
             console_attached: AtomicBool::new(false),
+            vinput: Mutex::new(None),
             release_on: AtomicBool::new(false),
             release_sink: Mutex::new(None),
             presented_on: AtomicBool::new(false),
@@ -1808,6 +1829,7 @@ impl DisplayLink {
     /// (`EV_PRESENTED` from a `CAP_PRESENTED` client): tell the guest which
     /// flip that was, once per flip.
     fn client_presented(&self, i: usize, stamp: u32, kind: u32, present_ns: u64) {
+        crate::frame_probe::presented(stamp, present_ns, kind);
         if !self.presented_enabled() {
             return;
         }
@@ -2398,6 +2420,9 @@ impl DisplayLink {
         match send_records(fd, &frame, Some(dmabuf)) {
             Ok(()) => {
                 c.frame_owed = false;
+                if flags & wire::CMD_F_SHM == 0 && crate::frame_probe::on() {
+                    crate::frame_probe::sent(stamp, dmabuf, u64::from(f.offset));
+                }
                 let reports = c.broker_caps & wire::CAP_RELEASE_SEQ != 0;
                 if st.release.enabled() {
                     let key = st.frame_key;
@@ -2823,7 +2848,13 @@ impl DisplayLink {
     /// -- the VM's emulated keyboard and tablet are all such a guest has.
     pub fn input_to_console(&self, guest_takes_input: bool) -> bool {
         self.console_attached.load(Ordering::Acquire)
-            && (self.console_shown() || !guest_takes_input)
+            && (self.console_shown() || !guest_takes_input || input_route_forced())
+    }
+
+    /// Attach the virtio-input devices: from now on the console's input goes
+    /// to them while their guest driver runs them (`crate::vinput::Router`).
+    pub fn attach_virtio_input(&self, router: crate::vinput::Router) {
+        *self.vinput.lock().unwrap() = Some(router);
     }
 
     /// What the viewer shows: the size of the guest's last frame while the
@@ -3524,6 +3555,14 @@ impl DisplayLink {
     fn deliver_console(&self, events: &mut Vec<InputEventEntry>) {
         if events.is_empty() {
             return;
+        }
+        // The virtio-input devices first, on this thread: what they take is
+        // in the guest's event queue before this returns.
+        if let Some(r) = self.vinput.lock().unwrap().as_mut() {
+            r.route(events);
+            if events.is_empty() {
+                return;
+            }
         }
         let console = self.state.lock().unwrap().console.clone();
         if let Some(c) = console {
@@ -6043,6 +6082,57 @@ mod tests {
         link.guest_gone("test reset");
         let (c, f) = next_frame(broker.as_raw_fd());
         assert_black(&c, &f, 1280, 720);
+    }
+
+    /// The console's input goes to a ready virtio-input device first; the
+    /// console gets only what no device takes.
+    #[test]
+    fn console_input_goes_to_ready_virtio_devices_first() {
+        use crate::vinput::{Port, Router};
+        #[derive(Default)]
+        struct Sink(Mutex<Vec<InputEventEntry>>);
+        impl ConsoleSink for Sink {
+            fn input(&self, e: &[InputEventEntry]) {
+                self.0.lock().unwrap().extend_from_slice(e);
+            }
+            fn wake(&self) {}
+        }
+        #[derive(Default)]
+        struct Kbd(Mutex<Vec<InputEventEntry>>);
+        impl Port for Kbd {
+            fn ready(&self) -> bool {
+                true
+            }
+            fn send(&self, e: &[InputEventEntry]) {
+                self.0.lock().unwrap().extend_from_slice(e);
+            }
+        }
+        let link = DisplayLink::new(None);
+        let console = Arc::new(Sink::default());
+        link.attach_console(console.clone());
+        let kbd = Arc::new(Kbd::default());
+        link.attach_virtio_input(Router::new([
+            None,
+            Some(kbd.clone() as Arc<dyn Port>),
+            None,
+        ]));
+        let syn = InputEventEntry::new(input::EV_SYN, input::SYN_REPORT, 0);
+        let mut evs = vec![
+            InputEventEntry::new(input::EV_KEY, 30, 1),
+            syn,
+            InputEventEntry::new(input::EV_ABS, input::ABS_X, 100),
+            syn,
+        ];
+        link.deliver_console(&mut evs);
+        assert_eq!(
+            *kbd.0.lock().unwrap(),
+            vec![InputEventEntry::new(input::EV_KEY, 30, 1), syn]
+        );
+        // No tablet: the position is the console's (its USB tablet).
+        assert_eq!(
+            *console.0.lock().unwrap(),
+            vec![InputEventEntry::new(input::EV_ABS, input::ABS_X, 100), syn]
+        );
     }
 
     /// With a boot console attached, it takes over at once (as on a device

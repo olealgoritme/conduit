@@ -3180,6 +3180,163 @@ mod tests {
         }
     }
 
+    // ── guest TSG timeslice (gpu_sched, sched.rs) ──────────────────────────
+
+    /// A fake RM that answers everything with NV_OK and records each control
+    /// it is sent: (handle, command, the first 8 parameter bytes).
+    #[derive(Clone, Default)]
+    struct SchedHost(std::sync::Arc<std::sync::Mutex<Vec<(u32, u32, u64)>>>);
+
+    impl HostDriver for SchedHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            if request & 0xff == 0x2a && arg.len() >= 32 {
+                let obj = u32::from_le_bytes(arg[4..8].try_into().unwrap());
+                let cmd = u32::from_le_bytes(arg[8..12].try_into().unwrap());
+                let ptr = u64::from_le_bytes(arg[16..24].try_into().unwrap()) as *const u8;
+                let size = u32::from_le_bytes(arg[24..28].try_into().unwrap()) as usize;
+                let mut v = [0u8; 8];
+                // SAFETY: the backend keeps the parameter block alive and at
+                // least `size` bytes long for the duration of the call.
+                unsafe { std::ptr::copy_nonoverlapping(ptr, v.as_mut_ptr(), size.min(8)) };
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((obj, cmd, u64::from_le_bytes(v)));
+            }
+            Ok(())
+        }
+    }
+
+    fn sched_backend(
+        host: &SchedHost,
+        sched: crate::gpu_sched::GuestSched,
+    ) -> (NvidiaBackend, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has tables");
+        be.set_host(Box::new(host.clone()));
+        be.set_guest_sched(sched);
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+        (be, h)
+    }
+
+    fn tsg_alloc(handle: u32) -> Vec<u8> {
+        let mut p = rm_alloc(crate::gpu_sched::TSG_CLASS);
+        p[0..4].copy_from_slice(&0xc1d0_0001u32.to_le_bytes()); // hRoot
+        p[8..12].copy_from_slice(&handle.to_le_bytes()); // hObjectNew
+        p
+    }
+
+    /// With a policy, a TSG the guest makes gets the timeslice, on that TSG,
+    /// as the backend's own control.
+    #[test]
+    fn a_guest_tsg_gets_the_policy() {
+        use crate::gpu_sched::*;
+        let host = SchedHost::default();
+        let (mut be, h) = sched_backend(&host, "250".parse().unwrap());
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_ALLOC,
+            &tsg_alloc(0x5c00_0010),
+            28,
+        );
+        let calls = host.0.lock().unwrap().clone();
+        assert!(
+            calls.contains(&(0x5c00_0010, CMD_SET_TIMESLICE, 250)),
+            "{calls:x?}"
+        );
+        assert_eq!(be.tsg_sched.tsgs, 1);
+        assert_eq!(be.tsg_sched.timeslice_set, 1);
+        // A second TSG: set again, read back only the first time.
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_ALLOC,
+            &tsg_alloc(0x5c00_0011),
+            28,
+        );
+        let n = host
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.0 == 0x5c00_0011)
+            .count();
+        assert_eq!(n, 1, "set timeslice, no read");
+    }
+
+    /// The default policy is 100 us.
+    #[test]
+    fn the_default_policy_sets_100_us() {
+        use crate::gpu_sched::*;
+        let host = SchedHost::default();
+        let (mut be, h) = sched_backend(&host, GuestSched::default());
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_ALLOC,
+            &tsg_alloc(0x5c00_0010),
+            28,
+        );
+        let calls = host.0.lock().unwrap().clone();
+        assert!(
+            calls.contains(&(0x5c00_0010, CMD_SET_TIMESLICE, 100)),
+            "{calls:x?}"
+        );
+    }
+
+    /// Without a policy nothing is added, and other classes never trigger it.
+    #[test]
+    fn no_policy_or_other_class_adds_nothing() {
+        use crate::gpu_sched::*;
+        let host = SchedHost::default();
+        let (mut be, h) = sched_backend(&host, GuestSched::NONE);
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_ALLOC,
+            &tsg_alloc(0x5c00_0010),
+            28,
+        );
+        assert!(host.0.lock().unwrap().is_empty());
+
+        let host = SchedHost::default();
+        let (mut be, h) = sched_backend(&host, GuestSched::default());
+        send_alloc(&mut be, h, 0xc7b7, 0);
+        assert!(host.0.lock().unwrap().is_empty());
+    }
+
+    /// A guest SET_TIMESLICE longer than the policy reaches RM clamped; a
+    /// shorter one, and any one without a policy, as sent.
+    #[test]
+    fn guest_set_timeslice_is_clamped_to_the_policy() {
+        use crate::gpu_sched::*;
+        let ask = |be: &mut NvidiaBackend, h: u64, us: u64| {
+            send_nested_bytes(
+                be,
+                h,
+                abi::ioctl::NV_ESC_RM_CONTROL,
+                &rm_control(CMD_SET_TIMESLICE, 8),
+                &us.to_le_bytes(),
+            );
+        };
+        let host = SchedHost::default();
+        let (mut be, h) = sched_backend(&host, "300".parse().unwrap());
+        ask(&mut be, h, 100_000);
+        ask(&mut be, h, 200);
+        let seen: Vec<u64> = host.0.lock().unwrap().iter().map(|c| c.2).collect();
+        assert_eq!(seen, vec![300, 200]);
+        assert_eq!(be.tsg_sched.guest_clamped, 1);
+
+        let host = SchedHost::default();
+        let (mut be, h) = sched_backend(&host, GuestSched::NONE);
+        ask(&mut be, h, 100_000);
+        let seen: Vec<u64> = host.0.lock().unwrap().iter().map(|c| c.2).collect();
+        assert_eq!(seen, vec![100_000]);
+    }
+
     #[cfg(feature = "trace")]
     mod trace_tests {
         use super::*;

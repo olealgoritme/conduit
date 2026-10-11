@@ -1259,7 +1259,7 @@ unsafe fn note_present_private_shape(
 /// `base`/`total` describe the kernel-only DMA private-data buffer dxgkrnl
 /// supplied for this submission.
 unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) {
-    let Some((h_alloc, primary_address, snapshot)) =
+    let Some((h_alloc, primary_address, snapshot, immediate)) =
         (unsafe { crate::ddi::present_packet::PresentFlipPrivate::take(base, total) })
     else {
         // No flip to program. A KEEP record is the Present's skip of a flip the programming path
@@ -1309,6 +1309,7 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
             primary_address,
             epoch,
             snapshot,
+            immediate,
         )
     } {
         crate::ddi::scanout_trace::note_dma_flip_armed();

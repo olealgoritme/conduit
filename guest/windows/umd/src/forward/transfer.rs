@@ -806,8 +806,8 @@ pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     let (_, k2, w2, h2, a2, f2) = resource_summary(resource2);
     // Size: the KMD has no scaler, so the application's buffer must have DWM's primary's extent
     // (the mode). Format: equal (the 393.1 rule), or with 5 only two 8-bit scan-out formats (an
-    // R8G8B8A8 game on the B8G8R8A8 desktop). 5 is opt-in: a promoted R8G8B8A8 CS2 swap chain
-    // froze after one frame on 405.8 (docs/independent-flip.md 13.10).
+    // R8G8B8A8 game on the B8G8R8A8 desktop; the default since 405.49). 405.8's freeze of a
+    // promoted R8G8B8A8 CS2 swap chain was the missing pointer (docs/independent-flip.md 13.10).
     let same_size = k1 == "tex2d" && k2 == "tex2d" && w1 == w2 && h1 == h2 && w1 != 0;
     let formats_ok = helios_umd_common::format::direct_flip_formats_compatible(f1, f2, mode != 5);
     let same = same_size && formats_ok;

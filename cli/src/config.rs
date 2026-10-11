@@ -6,6 +6,7 @@
 //! | `venus.guest_blobs` | true, false | false: the backend serves guest-memory blobs (docs/VENUS.md "Guest-memory blobs"), Venus copy destinations over the guest's own pages, for the Windows KMD's windowed Present. Opt-in while new. Applies when a VM's backend next starts. |
 //! | `backend.latency` | off, all, or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin | unset: the backend's and conduit-venus's defaults (`all`: the first four); a list is exactly those options (`all,fence-spin` adds the polling fence wait). Round-trip latency options, docs/research/host-roundtrip-latency.md. Applies when a VM's backend next starts. |
 //! | `backend.cpus` | a CPU list such as 0-7,16-23 | unset: the backend and conduit-venus run on any CPU; set: every thread of both stays on these (docs/HOST-TUNING.md). Applies when a VM's backend next starts. |
+//! | `backend.gpu_timeslice_us` | off, 0, or 50..1024 | 100: the GPU timeslice of each guest channel group, in microseconds, so the host's display work waits at most that long behind a busy guest; off (or 0) leaves the driver's own 1024 (docs/HOST-TUNING.md "GPU time"). CONDUIT_GUEST_TSG_TIMESLICE_US in the backend's environment overrides it. Applies when a VM's backend next starts. |
 //! | `gpu.window_mib` | auto, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 | auto: the host GPU's BAR1 (as Resizable BAR on bare metal), clamped to what the guest's 64-bit MMIO window holds, 4096 without a GPU. The shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
 use crate::paths;
@@ -35,6 +36,11 @@ const KEYS: &[(&str, &[&str], &str)] = &[
         "backend.cpus",
         &[],
         "keep the backend and conduit-venus on these host CPUs, from the next backend start (unset: any CPU; a list such as 0-7,16-23)",
+    ),
+    (
+        "backend.gpu_timeslice_us",
+        &["off", "0"],
+        "GPU timeslice of each guest channel group in microseconds, so host display work waits at most that long behind a busy guest, from the next backend start (default 100; off or 0: the driver's own 1024; also any number from 50 to 1024)",
     ),
     (
         "gpu.vram_limit_mib",
@@ -93,6 +99,7 @@ pub fn set(k: &str, v: &str) -> Result<()> {
     let list = match *name {
         "backend.latency" => latency_list(v).is_some(),
         "backend.cpus" => cpu_list(v),
+        "backend.gpu_timeslice_us" => timeslice_us(v).is_some(),
         _ => false,
     };
     if !values.contains(&v) && !number && !list {
@@ -105,6 +112,7 @@ pub fn set(k: &str, v: &str) -> Result<()> {
                     "gpu.vram_limit_mib" => ", or a number of MiB",
                     "backend.latency" => ", or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin",
                     "backend.cpus" => "a CPU list such as 0-7,16-23",
+                    "backend.gpu_timeslice_us" => ", or a number of microseconds from 50 to 1024",
                     _ => "",
                 }
             ),
@@ -233,6 +241,31 @@ pub fn backend_cpus() -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A `backend.gpu_timeslice_us` value as the backend's `--gpu-timeslice-us`:
+/// `off` (also for `0`) or 50..=1024; `None` for anything else.
+fn timeslice_us(v: &str) -> Option<String> {
+    match v {
+        "off" | "0" => Some("off".into()),
+        _ => v
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (50..=1024).contains(n))
+            .map(|n| n.to_string()),
+    }
+}
+
+/// `backend.gpu_timeslice_us` as the backend's `--gpu-timeslice-us`; `None`
+/// when unset (or not a value), and the backend keeps its default (100).
+pub fn backend_gpu_timeslice_us() -> Option<String> {
+    timeslice_of(&load())
+}
+
+fn timeslice_of(m: &Map<String, Value>) -> Option<String> {
+    m.get("backend.gpu_timeslice_us")
+        .and_then(Value::as_str)
+        .and_then(timeslice_us)
+}
+
 /// `gpu.vram_limit_mib`: how the backend's video-memory cap is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VramSetting {
@@ -352,6 +385,26 @@ mod tests {
         for bad in ["", "7-0", "a", "1,", "1-2-3", "0-5000"] {
             assert!(!cpu_list(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn gpu_timeslice_setting() {
+        let mut m = Map::new();
+        assert_eq!(timeslice_of(&m), None, "unset: the backend's default");
+        for (v, want) in [
+            ("off", Some("off")),
+            ("0", Some("off")),
+            ("50", Some("50")),
+            ("100", Some("100")),
+            ("1024", Some("1024")),
+            ("49", None),
+            ("1025", None),
+            ("fast", None),
+        ] {
+            m.insert("backend.gpu_timeslice_us".into(), Value::String(v.into()));
+            assert_eq!(timeslice_of(&m).as_deref(), want, "{v}");
+        }
+        assert!(key("backend.gpu_timeslice_us").is_ok());
     }
 
     #[test]

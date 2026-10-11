@@ -81,7 +81,8 @@ WL_XML = \
   $(WL_PROTO_DIR)/stable/viewporter/viewporter.xml \
   $(WL_PROTO_DIR)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml \
   $(WL_PROTO_DIR)/staging/fractional-scale/fractional-scale-v1.xml \
-  $(WL_PROTO_DIR)/staging/tearing-control/tearing-control-v1.xml
+  $(WL_PROTO_DIR)/staging/tearing-control/tearing-control-v1.xml \
+  $(WL_PROTO_DIR)/staging/single-pixel-buffer/single-pixel-buffer-v1.xml
 
 WL_HDRS = $(notdir $(WL_XML:.xml=-client-protocol.h))
 WL_SRCS = $(notdir $(WL_XML:.xml=-protocol.c))

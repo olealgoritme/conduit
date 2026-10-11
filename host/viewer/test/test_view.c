@@ -343,6 +343,72 @@ static void test_fractional(void)
     }
 }
 
+/*
+ * THE BARS.  Everything in the window outside the drawn picture is the
+ * backend's opaque black background, so the background must exist whenever
+ * the picture leaves a pixel uncovered, and the picture must never reach
+ * outside the window it is drawn in (it would hang off the background).
+ * Checked pixel by pixel on small windows, including a fullscreen window at
+ * a non-native guest mode, for every scale mode, area and output scale.
+ */
+static void test_bars(void)
+{
+    static const unsigned scales[] = { 120, 150, 240 };
+    static const int modes[] = { NB_SCALE_ASPECT, NB_SCALE_STRETCH,
+                                 NB_SCALE_INTEGER, NB_SCALE_NONE };
+    static const int areas[] = { NB_AREA_FULL, NB_AREA_21_9, NB_AREA_16_9,
+                                 NB_AREA_16_10, NB_AREA_4_3 };
+    static const int wins[][2] = { { 512, 144 }, { 192, 108 }, { 160, 90 },
+                                   { 97, 61 } };
+    static const int guests[][2] = { { 512, 144 }, { 192, 108 }, { 128, 96 },
+                                     { 336, 144 }, { 80, 60 }, { 640, 480 } };
+    unsigned si, mi, ai, wi, gi;
+
+    for (si = 0; si < sizeof(scales) / sizeof(scales[0]); si++)
+    for (mi = 0; mi < sizeof(modes) / sizeof(modes[0]); mi++)
+    for (ai = 0; ai < sizeof(areas) / sizeof(areas[0]); ai++)
+    for (wi = 0; wi < sizeof(wins) / sizeof(wins[0]); wi++)
+    for (gi = 0; gi < sizeof(guests) / sizeof(guests[0]); gi++) {
+        struct nb_view v = view(modes[mi], areas[ai]);
+        struct nb_place p;
+        int ww = wins[wi][0], wh = wins[wi][1], x, y, uncovered = 0;
+        char what[96];
+
+        snprintf(what, sizeof(what), "s%u %s area%d win %dx%d guest %dx%d",
+                 scales[si], nb_view_scale_name(modes[mi]), areas[ai], ww, wh,
+                 guests[gi][0], guests[gi][1]);
+        nb_view_place(&v, guests[gi][0], guests[gi][1], ww, wh, scales[si],
+                      &p);
+        CHECK(p.vis.w > 0 && p.vis.h > 0 && p.vis.x >= 0 && p.vis.y >= 0 &&
+              p.vis.x + p.vis.w <= ww && p.vis.y + p.vis.h <= wh,
+              "%s: picture %d,%d %dx%d outside the window", what, p.vis.x,
+              p.vis.y, p.vis.w, p.vis.h);
+        for (y = 0; y < wh; y++) {
+            for (x = 0; x < ww; x++) {
+                if (x < p.vis.x || y < p.vis.y || x >= p.vis.x + p.vis.w ||
+                    y >= p.vis.y + p.vis.h) {
+                    uncovered++;
+                }
+            }
+        }
+        CHECK(nb_view_has_bars(&p, ww, wh) == (uncovered > 0),
+              "%s: has_bars %d but %d uncovered pixels", what,
+              nb_view_has_bars(&p, ww, wh), uncovered);
+    }
+    {
+        /* The reported case: fullscreen 5120x1440, a 21:9 area, a 16:9
+         * guest -- bars on both sides, so the background is needed. */
+        struct nb_view v = view(NB_SCALE_ASPECT, NB_AREA_21_9);
+        struct nb_place p;
+
+        nb_view_place(&v, 1920, 1080, 5120, 1440, 120, &p);
+        CHECK(nb_view_has_bars(&p, 5120, 1440), "21:9 area on 5120x1440");
+        v = view(NB_SCALE_ASPECT, NB_AREA_FULL);
+        nb_view_place(&v, 5120, 1440, 5120, 1440, 120, &p);
+        CHECK(!nb_view_has_bars(&p, 5120, 1440), "native fullscreen: none");
+    }
+}
+
 static void test_guest_mode(void)
 {
     struct nb_view v = view(NB_SCALE_ASPECT, NB_AREA_FULL);
@@ -690,6 +756,7 @@ int main(void)
     test_custom();
     test_clamp();
     test_fractional();
+    test_bars();
     test_guest_mode();
     test_names();
     test_store();

@@ -45,6 +45,10 @@ env:
   WINFSP_VERSION: '2.1.25156'
   WINFSP_RELEASE: v2.1
   WINFSP_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+  # Red Hat's signed vioinput driver (virtio-input keyboard, mouse and tablet),
+  # taken from this virtio-win ISO and shipped unmodified.
+  VIRTIO_WIN_ISO_URL: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso
+  VIRTIO_WIN_ISO_SHA256: 303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d
 
 jobs:
   # NVK on RM (Vulkan) and Zink (OpenGL) for the Helios adapter, cross-built
@@ -428,6 +432,13 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/$env:WINFSP_RELEASE/winfsp-$env:WINFSP_VERSION.msi" -OutFile $msi
           $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
           if ($hash -ne $env:WINFSP_SHA256.ToUpperInvariant()) { throw "winfsp-$env:WINFSP_VERSION.msi has SHA-256 $hash, expected $env:WINFSP_SHA256" }
+      - name: Download the vioinput driver
+        shell: pwsh
+        run: >-
+          ./guest/windows/ci/windows/Get-VirtioInput.ps1
+          -OutputDir "$env:RUNNER_TEMP/artifacts/vioinput"
+          -IsoUrl $env:VIRTIO_WIN_ISO_URL
+          -IsoSha256 $env:VIRTIO_WIN_ISO_SHA256
       - name: Read package metadata
         id: metadata
         shell: pwsh
@@ -452,6 +463,7 @@ jobs:
           -TrayExe "$env:GITHUB_WORKSPACE/guest/windows/tools/conduit-gpu-tray/target/release/conduit-gpu-tray.exe"
           -ShellMenuDll "$env:GITHUB_WORKSPACE/guest/windows/tools/conduit-shell-menu/target/release/conduit_shell_menu.dll"
           -WinFspMsi "$env:RUNNER_TEMP/winfsp-$env:WINFSP_VERSION.msi"
+          -VirtioInputArtifact "$env:RUNNER_TEMP/artifacts/vioinput"
           -OutputDir "$env:RUNNER_TEMP/helios-package"
           -Configuration '${{ matrix.configuration }}'
           -Version '${{ steps.metadata.outputs.version }}'

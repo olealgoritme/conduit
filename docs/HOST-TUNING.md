@@ -170,6 +170,33 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   with `conduit doctor`). `off` removes the limit on a dedicated card, but
   not safe mode's 2 GiB: turn safe mode off too (`gpu.safe_mode false`).
 
+## GPU time: the guest's timeslice
+
+The guest's GPU work and the host's display (the compositor, the viewer's
+scale pass) share the GPU's run list. The driver hands the GPU to each busy
+channel group for a timeslice, 1024 µs by default, so while a game keeps the
+GPU busy, every host frame waits for the guest's slice to run out before it
+is drawn: the picture on the host lags and frames are dropped.
+
+The backend gives every guest channel group a 100 µs timeslice when it is
+created (`NVA06C_CTRL_CMD_SET_TIMESLICE`, an unprivileged RM control), and
+clamps the guest's own timeslice requests to it. When only the guest has
+work it keeps the GPU slice after slice, so its frame rate is not affected;
+when the host has work too, the host waits at most one short slice. The
+backend log states the setting at start (`guest GPU timeslice: ...`), what RM
+read back for the first channel group, and a count at teardown.
+
+```sh
+conduit config set backend.gpu_timeslice_us 100   # the default
+conduit config set backend.gpu_timeslice_us off   # the driver's own (1024 µs)
+```
+
+Values are `off` (or `0`) or 50 to 1024 µs; the setting applies at the next
+backend start (`conduit-backend --gpu-timeslice-us`). For a test,
+`CONDUIT_GUEST_TSG_TIMESLICE_US` in the backend's environment overrides it.
+Shorter slices mean more context switches when both sides have work; below
+50 µs that cost dominates.
+
 ## Measuring
 
 Before trusting a benchmark difference, run it at least three times on a

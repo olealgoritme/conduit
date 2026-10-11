@@ -187,9 +187,75 @@ pub fn socket_template(scope: &Scope, helper: &str) -> String {
     )
 }
 
+/// The virtio-input devices the backend serves, in the order QEMU gets them.
+pub const INPUT_KINDS: [&str; 3] = ["mouse", "keyboard", "tablet"];
+
+/// `conduit-input@NAME.socket`: the listening sockets of the VM's
+/// virtio-input devices, handed to its backend (`Sockets=`).
+pub fn input_unit(vm: &str) -> String {
+    format!("conduit-input@{vm}.socket")
+}
+
+/// Where a virtio-input device's socket listens (QEMU connects to it). The
+/// backend tells the sockets apart by these names.
+pub fn input_socket_path(scope: &Scope, vm: &str, kind: &str) -> PathBuf {
+    match scope {
+        Scope::User => paths::run_dir(vm).join(format!("input-{kind}.sock")),
+        Scope::System { .. } => PathBuf::from(format!("/run/conduit/{vm}/input-{kind}.sock")),
+    }
+}
+
+/// The template .socket of the virtio-input devices: three sockets, and the
+/// backend's service to start (QEMU connects to these before the GPU's).
+pub fn input_socket_template(scope: &Scope) -> String {
+    let dir = match scope {
+        Scope::User => "%t/conduit/%i",
+        Scope::System { .. } => "/run/conduit/%i",
+    };
+    let listen: String = INPUT_KINDS
+        .iter()
+        .map(|k| format!("ListenStream={dir}/input-{k}.sock\n"))
+        .collect();
+    format!(
+        "# Installed by `conduit` (libvirt integration). Regenerated on `conduit libvirt enable`/`attach`.\n\
+         [Unit]\n\
+         Description=Conduit virtio-input sockets for VM %i\n\
+         \n\
+         [Socket]\n\
+         {listen}\
+         Service=conduit-backend@%i.service\n\
+         SocketMode=0600\n\
+         DirectoryMode=0700\n\
+         Accept=no\n\
+         RemoveOnStop=yes\n\
+         \n\
+         [Install]\n\
+         WantedBy=sockets.target\n"
+    )
+}
+
 /// The template .service: `conduit _HELPER NAME` resolves everything at start
 /// (display mode, driver share, logs) and then execs the helper in place.
-pub fn service_template(helper: &str, conduit: &Path) -> String {
+pub fn service_template(helper: &str, conduit: &Path, input: bool) -> String {
+    // The backend also serves the VM's virtio-input devices, whose sockets
+    // are a socket unit of their own (`conduit-input@NAME.socket`): a new
+    // unit can start listening while the VM runs, where adding sockets to
+    // the GPU's would need it restarted, and the backend with it.
+    let sockets = if helper == "backend" && input {
+        "Wants=conduit-input@%i.socket
+After=conduit-input@%i.socket
+"
+        .to_string()
+    } else {
+        String::new()
+    };
+    let inherit = if helper == "backend" && input {
+        "# The virtio-input devices' sockets too (docs/INPUT.md).
+Sockets=conduit-backend@%i.socket conduit-input@%i.socket
+"
+    } else {
+        ""
+    };
     let stop_post = if helper == "backend" {
         format!(
             "# After the VM: refresh its boot files (a kernel updated inside it boots next time).\nExecStopPost=-{} _stopped %i\n",
@@ -204,9 +270,11 @@ pub fn service_template(helper: &str, conduit: &Path) -> String {
          Description=Conduit {desc} for VM %i\n\
          Requires=conduit-{helper}@%i.socket\n\
          After=conduit-{helper}@%i.socket\n\
+         {sockets}\
          \n\
          [Service]\n\
          Type=simple\n\
+         {inherit}\
          ExecStart={exe} _{helper} %i\n\
          {stop_post}\
          # It serves one VM run, then exits; the socket starts it again next time.\n\
@@ -528,6 +596,17 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
     if matches!(scope, Scope::System { .. }) {
         sys::sudo_ready("Installing system units that start Conduit's GPU backend with the VM.")?;
     }
+    let input = crate::run::virtio_input();
+    if input {
+        put(
+            scope,
+            "conduit-input@.socket",
+            &input_socket_template(scope),
+        )?;
+        if let Some(d) = socket_dropin(scope, vm) {
+            put(scope, &format!("{}.d/conduit.conf", input_unit(vm)), &d)?;
+        }
+    }
     for h in HELPERS {
         put(
             scope,
@@ -537,7 +616,7 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
         put(
             scope,
             &format!("conduit-{h}@.service"),
-            &service_template(h, conduit),
+            &service_template(h, conduit, input),
         )?;
         put(
             scope,
@@ -584,6 +663,12 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
     let mut a = vec!["enable", "--now"];
     a.extend(socks.iter().map(String::as_str));
     systemctl(scope, &a).context("could not start the VM's helper sockets")?;
+    if input {
+        let u = input_unit(vm);
+        let _ = systemctl(scope, &["reset-failed", &u]);
+        systemctl(scope, &["enable", "--now", &u])
+            .context("could not start the VM's virtio-input sockets")?;
+    }
     // The stats feed is best effort: the VM works without it.
     if let Err(e) = systemctl(scope, &["enable", "--now", &stats_unit(vm)]) {
         eprintln!("conduit: could not start the GPU stats feed: {e:#}");
@@ -603,6 +688,10 @@ pub fn remove(scope: &Scope, vm: &str) {
     let mut a = vec!["disable", "--now"];
     a.extend(socks.iter().map(String::as_str));
     let _ = systemctl(scope, &a);
+    // On its own: a VM attached before it has no such unit, and systemctl
+    // refuses a whole command over one missing unit.
+    let _ = systemctl(scope, &["disable", "--now", &input_unit(vm)]);
+    rm(scope, &format!("{}.d/conduit.conf", input_unit(vm)));
     let _ = systemctl(scope, &["disable", "--now", &stats_unit(vm)]);
     rm(scope, &format!("{}.d/conduit.conf", stats_unit(vm)));
     for sh in installed_shares(scope, vm) {
@@ -794,14 +883,52 @@ mod tests {
 
     #[test]
     fn service_execs_conduit_and_refreshes_boot_after() {
-        let s = service_template("backend", Path::new("/usr/bin/conduit"));
+        let s = service_template("backend", Path::new("/usr/bin/conduit"), false);
         assert!(s.contains("ExecStart=/usr/bin/conduit _backend %i"), "{s}");
         assert!(s.contains("ExecStopPost=-/usr/bin/conduit _stopped %i"));
         assert!(s.contains("Restart=no"));
         assert!(s.contains("Requires=conduit-backend@%i.socket"));
-        let v = service_template("virtiofsd", Path::new("/usr/bin/conduit"));
+        let v = service_template("virtiofsd", Path::new("/usr/bin/conduit"), true);
         assert!(v.contains("ExecStart=/usr/bin/conduit _virtiofsd %i"));
         assert!(!v.contains("ExecStopPost"));
+        assert!(!s.contains("Sockets=") && !v.contains("Sockets="));
+    }
+
+    /// The backend inherits the virtio-input sockets from their own unit,
+    /// which starts the backend's service on a connection too.
+    #[test]
+    fn the_backend_inherits_the_input_sockets() {
+        let s = service_template("backend", Path::new("/usr/bin/conduit"), true);
+        assert!(
+            s.contains("Sockets=conduit-backend@%i.socket conduit-input@%i.socket"),
+            "{s}"
+        );
+        assert!(s.contains("Wants=conduit-input@%i.socket"));
+        let t = input_socket_template(&Scope::User);
+        for k in INPUT_KINDS {
+            assert!(
+                t.contains(&format!("ListenStream=%t/conduit/%i/input-{k}.sock")),
+                "{t}"
+            );
+        }
+        assert!(t.contains("Service=conduit-backend@%i.service"));
+        let sys = Scope::System {
+            user: "u".into(),
+            uid: 1000,
+            home: PathBuf::from("/home/u"),
+            qemu_user: "libvirt-qemu".into(),
+        };
+        assert!(
+            input_socket_template(&sys).contains("ListenStream=/run/conduit/%i/input-tablet.sock")
+        );
+        assert_eq!(
+            input_socket_path(&sys, "vm1", "mouse"),
+            PathBuf::from("/run/conduit/vm1/input-mouse.sock")
+        );
+        assert!(
+            input_socket_path(&Scope::User, "vm1", "keyboard").ends_with("vm1/input-keyboard.sock")
+        );
+        assert_eq!(input_unit("vm1"), "conduit-input@vm1.socket");
     }
 
     #[test]

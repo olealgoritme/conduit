@@ -9,7 +9,7 @@ use std::time::Duration;
 use windows_sys::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_TEST,
     DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISP_CHANGE_SUCCESSFUL, DEVMODEW,
-    DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
+    DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
 };
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_QWORD};
 
@@ -76,11 +76,18 @@ fn apply(w: u32, h: u32) {
     }
     dm.dmPelsWidth = w;
     dm.dmPelsHeight = h;
-    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+    // Keep the current refresh (normally the display's native rate): a size
+    // changed without a rate lets Windows pick one, and the lowest it lists is
+    // 60 Hz. If the new size has no mode at that rate, Windows chooses.
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
     // Tested first; then applied for this session only (not saved: native
     // again after a restart, until the viewer asks again).
-    // SAFETY: valid device name and mode for both calls.
-    let t = unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), &dm, null_mut(), CDS_TEST, null()) };
+    // SAFETY: valid device name and mode for all calls.
+    let mut t = unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), &dm, null_mut(), CDS_TEST, null()) };
+    if t != DISP_CHANGE_SUCCESSFUL {
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+        t = unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), &dm, null_mut(), CDS_TEST, null()) };
+    }
     let r = if t == DISP_CHANGE_SUCCESSFUL {
         unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), &dm, null_mut(), 0, null()) }
     } else {
@@ -88,7 +95,11 @@ fn apply(w: u32, h: u32) {
     };
     crate::ctl::log(&format!(
         "display: host asked for {w}x{h}: {}",
-        if r == DISP_CHANGE_SUCCESSFUL { "switched".to_string() } else { format!("refused ({r})") }
+        if r == DISP_CHANGE_SUCCESSFUL {
+            format!("switched ({} Hz)", dm.dmDisplayFrequency)
+        } else {
+            format!("refused ({r})")
+        }
     ));
 }
 

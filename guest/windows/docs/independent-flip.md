@@ -1,9 +1,10 @@
 # Independent flip (direct flip) of flip-model swap chains: KMD design
 
-Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; flip completion from the host behind
-`FlipDoneHost` (default 0), section 13; the rest is design. The decision table of
-section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
-failure.
+Status: independent flip is on by default (`IndepFlip` 1, the UMD's `DirectFlipSupport` 5, `HwCursor` following
+`IndepFlip`), and immediate flips are neither paced nor held for the vsync tick (`ImmFlip` 15). Section 13.10 describes
+the defaults, their opt-outs and the test rows. The decision table of section 6 (`kmd_logic/src/independent_flip.rs`) runs
+as a census with `IndepFlip` 1 and enforces with 2; flip completion from the host is behind `FlipDoneHost` (default 0,
+section 13). Sections 0 to 10 are the design; sections 11 to 13 are the build and test records of each stage.
 Written against v327 (`225ce42`, branch `kmd/independent-flip-design`). Line numbers are that commit's.
 **Re-verified (second pass) against the WDK 10.0.26100 miniport headers**: section 1 names them `[HK]`, section 10 holds
 the header facts, and several first-pass statements changed (most importantly `DXGK_FLIPCAPS.FlipIndependent`, which the
@@ -407,16 +408,22 @@ Nothing on the flip arms. In order:
 ### 4.3 Tearing and immediate flips
 
 dxgkrnl issues interval 0 as a DMA flip, with the same `Flags` as a vsync-synchronised one (the census at `query_adapter_info.rs:
-359-370`); `DXGI_PRESENT_ALLOW_TEARING` reaches it as `TrueImmediate` / `IndependentFlipTrueImmediate` [H names]. The KMD
-ignores `FlipImmediate` in `SetVidPnSourceAddress.Flags`; the header offers two relevant caps it does not use:
-`FlipCaps.FlipImmediateMmIo` (bit 3, deliberately clear, 2.2) and `FlipCaps.FlipImmediateOnHSync` (bit 6, "SetVidPnSourceAddress
-FlipImmediate flag with no tearing between HSync intervals", WDDM 2.0), plus, for MPO planes only,
-`DXGK_PLANE_SPECIFIC_INPUT_FLAGS.FlipImmediateNoTearing` (WDDM 2.6) [HK `d3dkmddi.h:1976, 1981, 6284-6300`]. The KMD's behaviour for an immediate flip is "arm the programming, coalesce
-into the one pending slot, newest wins, show at most one flip per refresh period (`rm_refresh::flip_interval_100ns`)". So an
-application presenting at 500 fps with `ALLOW_TEARING` shows at most the refresh rate and is not throttled by it (the DMA
-fence retires behind the programming), which is the right semantics for a viewer that cannot tear a real scan-out anyway.
-**What the host does with an immediate flip is a viewer property** (`docs/SCANOUT.md` "Viewer": direct mode, tearing
-`ASYNC`, a global toggle). A per-flip hint is a host item (section 8).
+359-370`). `DXGI_PRESENT_ALLOW_TEARING` reaches it as `FlipInterval` `IMMEDIATE_ALLOW_TEARING` (5) [H names]. An MMIO flip that
+must not wait for a retrace carries `FlipImmediate` in `SetVidPnSourceAddress.Flags`. `FlipCaps.FlipImmediateMmIo` (bit 3)
+stays clear (2.2), and `FlipImmediateOnHSync` (bit 6) is only reported through `FlipCapsX` [HK `d3dkmddi.h:1976, 1981, 6284-6300`].
+
+An immediate flip is not paced and does not wait for the vsync tick (`ImmFlip`, section 13.10):
+- Each flip records on its allocation whether it is immediate. The Present writes `FlipInterval` 0 or 5 into the DMA flip
+  record; an MMIO flip records its own flags.
+- The `ForeignFlip` presenter sends the frame of an immediate programming at once, with no 3/4-period minimum interval.
+- The worker reports the `CRTC_VSYNC` that retires the flip as soon as the flip's new address is published.
+
+The newest programming still wins the single pending slot, so a frame that is replaced before the worker takes it is never
+shown. A flip retired this way may be retired before the host has shown it, so the application can reuse the previous
+buffer while the host still reads it. That is the tear `ALLOW_TEARING` asks for.
+
+Whether the host shows an immediate frame at once or at its own next vblank is a viewer property (`docs/SCANOUT.md`
+"Viewer": direct mode, tearing `ASYNC`). A per-flip hint is a host item (section 8).
 
 ### 4.4 Pacing, the vsync heartbeat, and 240 Hz  [Derived]
 
@@ -435,6 +442,9 @@ A flip retires when a `CRTC_VSYNC` reports its address. Per tick (4.17 ms at 240
   (`display.rs:1996-1999`, `early_wake`) and the worker publishes within its own latency. **So `FfAsyncWin` is a hard
   prerequisite for more than 120 fps on the MMIO contract.** It is default 0 and unmeasured.
 * **DMA contract:** `arm_dma_flip_programming` wakes the worker immediately (`signal_hpd`, `display.rs:2140`); no tick latency.
+  An immediate flip (interval 0 or 5, or MMIO `FlipImmediate`) is also retired by the worker's own `CRTC_VSYNC` once its
+  address is published (`ImmFlip` bit 1, 13.10), not by the next tick. Every other flip is retired by the tick, as described
+  above.
 * `MaxQueuedFlipOnVSync`: keep 1 at first. A deeper queue (`FlipQueueN`) lets dxgkrnl issue N+1 before N retired; the single
   pending slot then coalesces N away, `last_primary_address` jumps past N, and whether dxgkrnl retires a flip whose address
   was skipped is exactly the unobserved question of `zero-copy-present.md` 13.4 item 1. Try 2 only after the baseline.
@@ -551,7 +561,7 @@ block published once per StartDevice (`zero-copy-present.md` 13.8 rules).
 
 | name | meaning |
 |---|---|
-| knob `IndepFlip` | 0 off (default); 1 census only (the table runs and counts, nothing is enforced); 2 enforce |
+| knob `IndepFlip` | 0 off; 1 census only (the table runs and counts, nothing is enforced; the default); 2 enforce |
 | knob `IdfNeedPrim` | 1: refuse a source not created as a primary |
 | knob `IdfHoldRel` | 1: hold the displayed-address publication until the host released the buffer the flip replaces |
 | `IdfKnob` | bits 0..2 = the three knobs in force |
@@ -962,17 +972,6 @@ claim in `wddm_surface.rs` rests on the measured `E_NOTIMPL` at 3.2 alone.
   created with `DXGK_ALLOCATIONINFOFLAGS2.NotifyEviction` / `NotifyIoMmuUnmap` (`:3861-3862`, `:4854-4876`). For a GpuMmu (WDDMv2) driver such
   as this one the operations dxgkrnl sends are the `>= WDDM2_0` set (`VIRTUAL_TRANSFER`, `VIRTUAL_FILL`, page-table, `NOTIFY_RESIDENCY`,
   `MAP/UNMAP_APERTURE_SEGMENT`); which of them represent eviction in practice is dxgkrnl's, not a named operation.
-p='independent-flip.md'
-s=open(p).read()
-old=s[s.index('Status: DESIGN ONLY.'):s.index('Written against v327')]
-new='''Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; the rest is design. The decision table of
-section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
-failure.
-'''
-s=s.replace(old,new)
-s=s.rstrip()+'\n'+open('/dev/stdin').read()
-open(p,'w').write(s)
-
 ## 11. Stage S-1 as built (`IndepFlip`), the test recipe, and the flip-model upgrade route
 
 Branch `feat/independent-flip`. Main already had the S-0a instruments (`FlipCapsX` as an OR mask, the `IdfSpa*` / `IdfPr*` flag
@@ -1489,3 +1488,56 @@ of PresentMon `--process_name cs2.exe`; read `PresentMode`, the fps, the dwm log
 Colour check on C2/C4: a red/blue swap on screen means the R8G8B8A8 buffer's layout record carries a BGRA fourcc; `DirectFlipSupport=4`
 is the fallback until it is fixed. Cursor: with `HwCursor` 0 (the 404 default) nothing draws the Windows pointer while
 promoted (4.5); CS2 draws its own crosshair, its menus may show no pointer.
+
+### 13.10 The defaults: promoted games, unpaced immediate flips
+
+`IndepFlip` defaults to 1 and `DirectFlipSupport` to 5. A flip-model game in borderless or exclusive full screen at the
+mode's size is promoted to independent flip instead of being composed by DWM at the synthetic refresh. That includes an
+R8G8B8A8 swap chain such as CS2's on the B8G8R8A8 desktop. A promoted swap chain needs a hardware pointer (without one a
+promoted CS2 swap chain showed one frame), so `HwCursor` follows `IndepFlip` (`hw_cursor::knob_default_for`). Opt-outs:
+`IndepFlip` = 0 in the KMD service key, `DirectFlipSupport` = 0 (never) or 1 (equal formats only) in
+`HKLM\SOFTWARE\Helios`.
+
+`ImmFlip` (KMD service key, default 15; `kmd_logic::immediate_flip`) covers immediate flips: a Present with `FlipInterval` 0
+or `IMMEDIATE_ALLOW_TEARING` (carried in the DMA flip record) and MMIO flips with `FlipImmediate`. Each flip records this
+on its allocation, so the coalescing pending slot and its retries read the right answer. A game with V-sync off presents
+these.
+- Bit 0: the `ForeignFlip` presenter sends the frame to the host as soon as the worker takes the programming. There is no
+  3/4-period minimum interval.
+- Bit 1: once the programming has published the flip's new address, the worker reports the `CRTC_VSYNC` that retires the
+  flip. It does not wait for the next vsync tick, so with `MaxQueuedFlipOnVSync` 1 the application is not held to one flip
+  per tick. These vsyncs are not counted in `FlipLat*` / `VbUsed`, which describe the tick.
+- Bit 2: the flip caps report `FlipImmediateMmIo`. Without it dxgkrnl turns a promoted application's `ALLOW_TEARING`
+  presents into `FlipOnNextVSync` flips (`IdfSpaFlg` 0x84, no `FlipImmediate`: the application is held to one flip per
+  refresh, about 8 ms present-to-screen at 240 Hz), and sends a full-screen-exclusive application's interval-0 flips down
+  the DMA-buffer contract, where an NVK buffer outside the direct-scan-out table is completed as a kept picture
+  (`IdfRef06`) and never shown. With it both arrive as MMIO flips with `FlipImmediate`, which `ForeignFlip` programs for
+  any adopted NVK buffer.
+- Bit 3: a promoted swap chain's flip (`IndependentFlipExclusive`) counts as immediate even when dxgkrnl asked for
+  `FlipOnNextVSync`. dxgkrnl issues a promoted application's interval-0 presents without `ALLOW_TEARING` that way; without
+  this bit each such flip waits for the synthetic vsync (CS2: about 130 flips/s for about 207 presents/s, at one- and
+  two-vblank spacing). Retired at publication, every frame goes to the host, and a promoted application with V-sync on is
+  not held to the refresh by the flip queue.
+
+Immediate frames are sent to the host at most once per third of the paced interval (about 1 ms at 240 Hz), so an uncapped
+full-screen application at thousands of frames per second does not flood the viewer.
+
+Flips with a sync interval that are not promoted (DWM's composition) are paced and retired by the tick. Whether the host
+shows an immediate frame at once (tearing) or at its own next vblank is the viewer's choice. The guest waits for neither.
+
+Counters: `ImmKnob`, `ImmDma` / `ImmMmio` (immediate flips armed by each lane), `ImmProg` (immediate programmings taken),
+`ImmVs` (completion vsyncs reported), `ImmVsNo` (immediate programmings without one: nothing new was published (a
+deferred, copied, superseded or refused programming; the tick retires those), the chain was not live, or `FlipDoneHost`
+holds addresses). A high `ImmVsNo` with `ImmVs` 0 and normal `VsTickN` is a programming outcome, not a dead vsync chain.
+
+Rows (lowest mode first; `d3d11_iflip` writes `RESULT_TIMING` lines):
+
+| row | command | pass |
+|---|---|---|
+| I1 | `d3d11_iflip 20 topmost fg tearing interval0` | `DXGI_FEATURE_PRESENT_ALLOW_TEARING=1`, PresentMon `Hardware: Independent Flip`, fps above the refresh, `present_call_us` p99 well under a period, `ImmVs` close to the frame count |
+| I2 | as I1 with `fps=300`, then `fps=200` | `present_interval_us` p99 close to the target interval, no blocking in `present_call_us` |
+| I3 | `d3d11_iflip 20 topmost fg fps=200` (interval 1) | paced by the vsync: `ImmProg` 0, about 200 fps |
+| I4 | CS2 with V-sync off at the mode's size | PresentMon `Hardware: Independent Flip` (or `Independent Flip`), `ImmProg` rising |
+| I5 | I1 with `ImmFlip` = 1 (no completion vsync) | if fps and `present_call_us` match I1, bit 1 buys nothing and may be turned off |
+| I6 | a Vulkan full-screen application on NVK (vkcube or a Vulkan game) | promoted, frames flow (with independent flip reported, NVK primaries take the WDDM flip instead of NVK's scan-out 0) |
+| I7 | the composed desktop: drag windows, move the pointer over Heaven windowed for 60 s | no hitches from the reported pointer (`HwCursor` follows `IndepFlip`), `CurQ` 1 |
