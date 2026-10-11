@@ -200,7 +200,7 @@ configuration, tearing, the buffer format). In fullscreen, a picture with no
 host cursor image (the guest draws its own, and always under grab) sets a
 NULL cursor, so no cursor needs to be composited over it.
 
-In a window, and with VSync, the compositor scales the picture as before.
+In a window, and with VSync, the compositor scales the picture.
 The stats overlay is hidden in fullscreen by default (`--overlay=windowed`)
 for the same reason: drawn over the picture, it makes the compositor
 composite. `Ctrl+Alt+O` still shows it there.
