@@ -91,4 +91,41 @@ static inline uint64_t nb_pace_due_ns(const struct nb_pace *p, uint64_t now)
     return at > now ? at - now : 1;
 }
 
+/*
+ * THE CURSOR NUDGE.  While a compositor tears our window it renders only when
+ * we commit: Hyprland skips its vblank repaint for an actively tearing
+ * output, so a SOFTWARE cursor (WLR_NO_HARDWARE_CURSORS, common on NVIDIA)
+ * is redrawn only with our frames.  With the guest on a hardware cursor an
+ * idle desktop sends 5-50 frames a second and the pointer stutters.  So on
+ * pointer motion (and a cursor image change) over a fullscreen, immediately
+ * presented picture, the current buffer is committed again with a token
+ * damage, at most every `min_ns` and only through the same gate as frames.
+ */
+static inline bool nb_nudge_wanted(bool immediate, bool fullscreen,
+                                   bool cursor_visible, bool have_frame)
+{
+    return immediate && fullscreen && cursor_visible && have_frame;
+}
+
+/* Nudge now?  Else the caller keeps it pending and asks nb_nudge_due_ns(). */
+static inline bool nb_nudge_may(const struct nb_pace *p, uint64_t now,
+                                uint64_t min_ns)
+{
+    return nb_pace_may_commit(p, now) && now - p->last_commit_ns >= min_ns;
+}
+
+/* ns until a pending nudge may go (>= 1), or 0 when an event must open the
+ * gate first (socket full, callback outstanding). */
+static inline uint64_t nb_nudge_due_ns(const struct nb_pace *p, uint64_t now,
+                                       uint64_t min_ns)
+{
+    uint64_t at;
+
+    if (!nb_pace_may_commit(p, now)) {
+        return nb_pace_due_ns(p, now);
+    }
+    at = p->last_commit_ns + min_ns;
+    return at > now ? at - now : 1;
+}
+
 #endif /* NB_PACE_H */

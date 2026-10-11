@@ -164,8 +164,66 @@ static void test_stuck_callback(void)
           NB_PACE_STUCK_NS, "a deadline while held by an overdue callback");
 }
 
+/*
+ * Cursor nudges: 1000 Hz pointer motion over an idle fullscreen picture (no
+ * guest frames), callbacks ~0.5 ms after each commit (tearing).  The cursor
+ * is repainted at the refresh-bounded rate, never held for good, never more
+ * than the gate allows.
+ */
+static void test_cursor_nudge(void)
+{
+    struct nb_pace p = { 0 };
+    uint64_t t, cb_at = 0, min_ns = 500000000000ull / 240000; /* 240 Hz */
+    unsigned nudges = 0, pending = 0;
+    bool armed = false, want_pending = false;
+
+    CHECK(nb_nudge_wanted(true, true, true, true), "nudge: fullscreen immediate");
+    CHECK(!nb_nudge_wanted(false, true, true, true), "no nudge with vsync");
+    CHECK(!nb_nudge_wanted(true, false, true, true), "no nudge windowed");
+    CHECK(!nb_nudge_wanted(true, true, false, true), "no nudge under grab");
+    CHECK(!nb_nudge_wanted(true, true, true, false), "no nudge without a frame");
+
+    for (t = 1; t < 1000 * MS; t += MS / 4) {   /* 4 kHz loop */
+        if (armed && cb_at && t >= cb_at) {
+            armed = false;
+            cb_at = 0;
+            nb_pace_frame_done(&p);
+        }
+        if (t % MS < MS / 4) {
+            want_pending = true;                /* a motion event, 1 kHz */
+        }
+        if (want_pending) {
+            if (nb_nudge_may(&p, t, min_ns)) {
+                bool arm = !armed;
+
+                armed = true;
+                nb_pace_committed(&p, t, arm);
+                if (arm) {
+                    cb_at = t + MS / 2;
+                }
+                nudges++;
+                want_pending = false;
+            } else {
+                pending++;
+                CHECK(nb_nudge_due_ns(&p, t, min_ns) > 0 || armed,
+                      "a held nudge has a way out");
+            }
+        }
+    }
+    CHECK(nudges >= 400 && nudges <= 480,
+          "cursor repainted %u times/s at 240 Hz (~2x refresh)", nudges);
+    CHECK(pending > 0, "faster motion is coalesced");
+
+    /* A full socket holds nudges too, until the flush succeeds. */
+    nb_pace_flushed(&p, true);
+    CHECK(!nb_nudge_may(&p, t + 10 * MS, min_ns), "no nudge while EAGAIN");
+    CHECK(nb_nudge_due_ns(&p, t + 10 * MS, min_ns) == 0, "POLLOUT reopens it");
+    nb_pace_flushed(&p, false);
+}
+
 int main(void)
 {
+    test_cursor_nudge();
     test_vsync_flood();
     test_tearing_flood();
     test_newest_wins();

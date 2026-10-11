@@ -167,7 +167,12 @@ What each desktop needs:
   VSync it sets it to 0. Hyprland tears only in fullscreen with nothing else
   on the output (no notification, no overlay layer). Hyprland 0.39 composites
   a torn frame (no direct scanout while tearing); that takes well under a
-  millisecond.
+  millisecond.  While it tears, Hyprland repaints only when the window commits, so a
+  software cursor (`WLR_NO_HARDWARE_CURSORS=1`, common with NVIDIA) would move
+  only with guest frames; the viewer commits the current picture again on
+  pointer motion over the fullscreen picture (at most twice per refresh,
+  `cursor nudges` in `--stats`) so the pointer stays smooth on an idle
+  desktop.
 - **KDE Plasma (KWin)**: honours the tearing hint for fullscreen windows.
 - **Sway**: `output * allow_tearing yes`.
 - **GNOME (Mutter)**: does not offer tearing control; frames are shown at

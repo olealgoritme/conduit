@@ -541,6 +541,8 @@ struct nb_wl {
      */
     struct nb_pace pace;
     bool     commit_staged;
+    bool     nudge_pending;     /* a cursor nudge the gate held (nb_pace.h) */
+    unsigned st_nudges;
     uint64_t n_reuse_inflight;  /* commits of a buffer the compositor still
                                  * held -- see wl_commit()                     */
 
@@ -912,7 +914,7 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
                "superseded %u | recv->commit avg %.0fus max %.0fus |%s "
                "commit->present avg %.0fus p50 %uus p99 %uus max %.0fus |%s "
                "| present interval avg %.0fus sd %.0fus p50 %uus p99 %uus "
-               "| %s, held %u%s",
+               "| %s, held %u, cursor nudges %u%s",
                w->st_commits / secs, w->st_presented / secs, w->st_zc,
                w->st_discarded,
                w->st_commits ? (double)w->st_rc_sum / w->st_commits / 1e3 : 0.0,
@@ -920,9 +922,11 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
                w->st_cp_n ? (double)w->st_cp_sum / w->st_cp_n / 1e3 : 0.0,
                cp50, cp99, (double)w->st_cp_max / 1e3, sp,
                pi_mean, pi_sd, pi50, pi99,
-               w->tearing_async ? "immediate" : "vsync", w->st_held, gs);
+               w->tearing_async ? "immediate" : "vsync", w->st_held,
+               w->st_nudges, gs);
     }
     w->st_held = 0;
+    w->st_nudges = 0;
     w->st_gs_sum = w->st_gs_max = 0;
     w->st_gs_n = w->st_gs_drop = 0;
     w->st_cp_k = w->st_pi_k = 0;
@@ -2007,6 +2011,7 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
         return 0;
     }
     w->commit_staged = false;
+    w->nudge_pending = false;   /* this frame repaints the cursor too */
 
     /*
      * THE FRAME-GLITCH DETECTOR.
@@ -2263,14 +2268,94 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     return 0;
 }
 
-/* Commit the staged frame the gate held back, if the gate is open now. */
-static void wl_commit_staged(struct nb_wl *w)
+/*
+ * THE CURSOR NUDGE (nb_pace.h): the current picture committed again, so a
+ * compositor that repaints a tearing output only on our commits (Hyprland)
+ * redraws its software cursor at the pointer's new position.  Only over a
+ * fullscreen, immediately presented picture with the host pointer visible,
+ * never faster than twice the refresh, through the same gate as frames.
+ */
+static bool wl_nudge_wanted(const struct nb_wl *w)
 {
-    if (!w->commit_staged || w->pending < 0 || !w->sess || !w->sink ||
-        !nb_pace_may_commit(&w->pace, nb_mono_ns())) {
+    return nb_nudge_wanted(w->tearing_async, w->fullscreen,
+                           w->ptr_on_content && !w->grabbed && !w->ui.open,
+                           w->current >= 0);
+}
+
+static uint64_t wl_nudge_min_ns(const struct nb_wl *w)
+{
+    /* half a refresh period; 1 ms until the refresh is known */
+    return w->refresh_mhz ? 500000000000ull / w->refresh_mhz : 1000000ull;
+}
+
+static void wl_nudge(struct nb_wl *w)
+{
+    uint64_t now = nb_mono_ns();
+    struct wl_surface *sf;
+    struct wl_buffer *b;
+    bool armed = false;
+
+    if (!wl_nudge_wanted(w)) {
+        w->nudge_pending = false;
         return;
     }
-    (void)wl_commit(w->sess, w->sink);
+    if (w->commit_staged && w->pending >= 0) {
+        w->nudge_pending = false;       /* the staged frame repaints anyway */
+        return;
+    }
+    if (!nb_nudge_may(&w->pace, now, wl_nudge_min_ns(w))) {
+        w->nudge_pending = true;
+        return;
+    }
+    if (w->gs_shown) {
+        sf = w->surf;
+        b = w->gt[w->gt_last].buf;
+    } else {
+        const struct nb_wl_buf *sl = &w->bufs[w->current];
+
+        /* Only a buffer the compositor still holds: once released it is the
+         * guest's again and may be half drawn. */
+        if (!sl->valid || !sl->held) {
+            w->nudge_pending = false;
+            return;
+        }
+        sf = w->in_sub ? w->cs_surf : w->surf;
+        b = sl->buf;
+    }
+    if (!sf || !b) {
+        w->nudge_pending = false;
+        return;
+    }
+    wl_surface_attach(sf, b, 0, 0);
+    wl_surface_damage_buffer(sf, 0, 0, 1, 1);
+    if (!w->frame_inflight) {
+        struct wl_callback *cb = wl_surface_frame(sf);
+
+        if (cb) {
+            wl_callback_add_listener(cb, &frame_listener, w);
+            w->frame_inflight = true;
+            armed = true;
+        }
+    }
+    wl_surface_commit(sf);
+    nb_pace_committed(&w->pace, now, armed);
+    nb_pace_flushed(&w->pace, wl_display_flush(w->dpy) < 0 && errno == EAGAIN);
+    w->nudge_pending = false;
+    w->st_nudges++;
+}
+
+/* Commit the staged frame the gate held back, if the gate is open now; else
+ * a cursor nudge that was held. */
+static void wl_commit_staged(struct nb_wl *w)
+{
+    if (w->commit_staged && w->pending >= 0 && w->sess && w->sink &&
+        nb_pace_may_commit(&w->pace, nb_mono_ns())) {
+        (void)wl_commit(w->sess, w->sink);
+        return;
+    }
+    if (w->nudge_pending) {
+        wl_nudge(w);
+    }
 }
 
 /* ── the client-side title bar ───────────────────────────────────────────── */
@@ -3746,8 +3831,11 @@ static int wl_tick(struct nb_session *s)
     r = wl_tick_viewer(w, r);
     /* A staged frame held by an overdue frame callback: look again then. */
     wl_commit_staged(w);
-    if (w->commit_staged && w->pending >= 0) {
-        uint64_t due = nb_pace_due_ns(&w->pace, nb_mono_ns());
+    if ((w->commit_staged && w->pending >= 0) || w->nudge_pending) {
+        uint64_t now = nb_mono_ns();
+        uint64_t due = w->commit_staged && w->pending >= 0
+                           ? nb_pace_due_ns(&w->pace, now)
+                           : nb_nudge_due_ns(&w->pace, now, wl_nudge_min_ns(w));
 
         if (due) {
             int ms = (int)((due + 999999) / 1000000);
@@ -4193,6 +4281,7 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
             return;
         }
         wl_ptr_to_guest(w);
+        wl_nudge(w);            /* the compositor's cursor, while tearing */
     }
 }
 static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
@@ -6821,6 +6910,7 @@ static void gc_show(struct nb_wl *w, int slot, unsigned hx, unsigned hy)
     gc_layout(w, true);
     cur_apply(w, w->last_serial);
     wl_display_flush(w->dpy);
+    wl_nudge(w);                /* a new cursor image needs a repaint too */
 }
 
 static void gc_created(void *data, struct zwp_linux_buffer_params_v1 *params,
