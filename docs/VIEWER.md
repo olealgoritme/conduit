@@ -75,6 +75,8 @@ that fades in when the pointer touches the window's top edge. The menu has:
 - **Profiles**: save the current setup under a name (for example
   "CS2 4:3 stretched"), click one to load it, `x` to delete it.
   Ctrl+Alt+P cycles through them.
+- **Presentation**: Immediate in fullscreen (the default), Always immediate,
+  or VSync. See [Presentation](#presentation-immediate-or-vsync).
 - **View**: the stats overlay and fullscreen.
 - **Virtual machine**: Restart and Shut down, which run `conduit reboot` and
   `conduit shutdown` for the VM. Both ask for a second click to confirm.
@@ -87,8 +89,9 @@ and a mouse grab is dropped. `Esc` or `Ctrl+Alt+M` closes it.
 
 `conduit view` passes `--view-state ~/.local/share/conduit/vms/NAME/viewer.conf`.
 The viewer restores the settings, profiles and recent resolutions from that
-file at start, and rewrites it on every change. `--res`, `--area`, `--scale`
-and `--filter` given to `conduit view` override only the setting they name.
+file at start, and rewrites it on every change. `--res`, `--area`, `--scale`,
+`--filter` and `--sync` given to `conduit view` override only the setting they
+name. `sync=` appears in the file only when it is not the default.
 The file is plain `key=value` text:
 
 ```
@@ -113,15 +116,81 @@ scale, so it lines up with the picture in `stretch` too.
 `host/viewer/test/test_view.c` checks the mapping for every mode, area and
 output scale.
 
+## Presentation: immediate or vsync
+
+A game in the VM renders as fast as it can; how soon each frame reaches the
+screen is the viewer's choice (`--sync`, the menu, saved per VM):
+
+| Setting | Fullscreen | Window |
+|---|---|---|
+| `fullscreen` (default) | immediate | vsync |
+| `immediate` | immediate | immediate |
+| `vsync` | vsync | vsync |
+
+Immediate means the compositor shows a frame the moment it is committed, with
+no wait for the next vblank, so a frame can tear, as with a fullscreen game on
+bare metal. The viewer asks for it with `wp_tearing_control_v1` (ASYNC) and the
+content type `game` (`wp_content_type_v1`). On X11 it presents with
+`PresentOptionAsync` and, in fullscreen, sets `_NET_WM_BYPASS_COMPOSITOR` so a
+compositing manager unredirects the window. The compositor decides in the end;
+the log line `presentation:` and the stats line (`immediate`/`vsync`) say what
+was asked for, and `commit->present` shows what happened (immediate: well
+under a millisecond; vsync on a 240 Hz screen: 4 to 8 ms).
+
+A compositor tears (and scans out directly) only a fullscreen window whose own
+buffer covers the output with nothing on top of it. The viewer keeps that
+shape in fullscreen:
+
+- The guest at the output's mode (a 1:1 picture): the guest's own buffer is
+  the window's only content, as always (zero-copy).
+- Any other picture (a game at 1600x900 on a 5120x1440 screen, stretched,
+  letterboxed or cropped): one GPU pass draws it, scaled, with black bars
+  where the area leaves them, into an output-size buffer
+  (`host/viewer/nb_gpuscale.c`; EGL/GLES2/GBM, loaded only when first
+  needed). The compositor would scale the picture anyway; this moves that
+  pass in front of it. It costs about 50 µs per frame at 5120x1440 on an
+  RTX 5090 (p99 under 0.6 ms) and returns the guest's buffer as soon as the
+  pass is done. Here the Filter setting is the viewer's own (Sharp =
+  nearest neighbour). `--gpu-scale=off` leaves scaling to the compositor;
+  `--render-node` picks the GPU.
+
+In a window, and with VSync, the compositor scales the picture as before.
+The stats overlay is hidden in fullscreen by default (`--overlay=windowed`)
+for the same reason: drawn over the picture, it makes the compositor
+composite. `Ctrl+Alt+O` still shows it there.
+
+What each desktop needs:
+
+- **Hyprland**: `general:allow_tearing = true` in the config. The viewer sets
+  the `immediate` property on its own window over Hyprland's IPC socket
+  (`setprop pid:N immediate 1 lock`), so no window rule is needed; with
+  VSync it sets it to 0. Hyprland tears only in fullscreen with nothing else
+  on the output (no notification, no overlay layer). Hyprland 0.39 composites
+  a torn frame (no direct scanout while tearing); that takes well under a
+  millisecond.
+- **KDE Plasma (KWin)**: honours the tearing hint for fullscreen windows.
+- **Sway**: `output * allow_tearing yes`.
+- **GNOME (Mutter)**: does not offer tearing control; frames are shown at
+  vblank, and the fullscreen picture can still be scanned out directly.
+
+**Adaptive sync (VRR).** With immediate presentation it matters little. With
+VSync, or a game below the refresh rate, it removes the judder of a frame
+rate that does not divide the refresh. Hyprland: `misc:vrr = 2` (fullscreen
+windows only) in the config, or for the running session only
+`hyprctl keyword misc:vrr 2` (back to the config's value on reload). KDE:
+Display Configuration, Adaptive sync: Automatic. Sway:
+`output * adaptive_sync on`. The viewer does not change these settings.
+
 ## Cost
 
-Scaling adds no work to the frame path. On Wayland, the guest buffer stays
-on one surface. Its `wp_viewport` destination (plus a source crop for `none`)
-and its subsurface position do the placing, and the compositor scales the
-picture in the composite it does anyway. When the picture exactly fills the
-window, it is on the main surface, as before, so direct scanout in fullscreen
-is unaffected. On X11, a 1:1 picture is presented as before, and a scaled
-picture is one XRender composite, paced on vblank.
+Scaling adds no work to the frame path, except in fullscreen with immediate
+presentation (above). On Wayland, the guest buffer stays on one surface. Its
+`wp_viewport` destination (plus a source crop for `none`) and its subsurface
+position do the placing, and the compositor scales the picture in the
+composite it does anyway. When the picture exactly fills the window, it is on
+the main surface, so direct scanout in fullscreen is unaffected. On X11, a 1:1
+picture is presented with Present, and a scaled picture is one XRender
+composite.
 
 The menu, the notice, the button and the area outline are separate layers:
 `wl_subsurface`s with their own small shm buffers on Wayland, and child

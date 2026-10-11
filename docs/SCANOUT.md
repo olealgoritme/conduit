@@ -564,9 +564,12 @@ compositor modesets as usual.
   always|windowed|off`, default always) adds frame time now/avg/p99/max, the
   latency segments, drops, input rate and a 2 s frame-time graph; redrawn ≤4/s
   from a timer, never from the frame path.
-- Direct mode (CTRL+ALT+D, `--direct-mode=on`): overlay hidden, tearing ASYNC,
+- Presentation sync, the fullscreen GPU scaler and what each compositor needs:
+  [VIEWER.md](VIEWER.md#presentation-immediate-or-vsync).
+- Direct mode (CTRL+ALT+D, `--direct-mode=on`): overlay hidden, tearing ASYNC
+  (unless `--sync=vsync`),
   the guest asked again for the output's exact mode, `--direct-hook CMD` run as
-  `CMD on|off`. Off: overlay per `--overlay`, tearing VSYNC.
+  `CMD on|off`. Off: overlay per `--overlay`, tearing per `--sync`.
 
 ## Invariants
 

@@ -182,6 +182,9 @@ struct nb_config {
      */
     struct nb_view view;
     unsigned    view_set;
+    int         sync;           /* --sync: NB_SYNC_*, -1 = the saved one    */
+    int         gpu_scale;      /* --gpu-scale: NB_GS_*                     */
+    const char *render_node;    /* --render-node: the scaler's GPU          */
     const char *view_state;     /* settings file, rewritten on every change */
     const char *vm_shutdown_cmd;/* menu: run via /bin/sh, not waited for    */
     const char *vm_reboot_cmd;
@@ -194,6 +197,11 @@ struct nb_config {
 #define NB_OVERLAY_WINDOWED 0   /* default: shown windowed, hidden fullscreen */
 #define NB_OVERLAY_ALWAYS   1   /* also fullscreen (costs direct scanout)    */
 #define NB_OVERLAY_OFF      2   /* starts hidden; CTRL+ALT+O still shows it  */
+
+#define NB_GS_AUTO 0            /* default: scale on the GPU in fullscreen +
+                                 * immediate when the picture is not 1:1     */
+#define NB_GS_OFF  1            /* never: the compositor scales (vsync on
+                                 * compositors that need one buffer to tear) */
 
 /* ── a validated buffer description ──────────────────────────────────────── */
 
@@ -711,8 +719,6 @@ extern int  nb_tier;
 extern bool nb_linear_only;   /* deprecated alias for NB_TIER_LINEAR */
 
 /* virtio-nvgpu viewer knobs (nb_common.c). */
-extern int  nb_tearing;       /* wp_tearing_control: -1 (default) ASYNC only in
-                               * direct mode, 1 always ASYNC, 0 never        */
 extern int  nb_stats;         /* log fps / latency once per second           */
 extern int  nb_seq_usec;      /* cmd.seq carries the sender's CLOCK_MONOTONIC
                                * microseconds (low 32 bits) -- lets --stats

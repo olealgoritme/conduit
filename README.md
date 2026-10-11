@@ -431,6 +431,7 @@ tested setup alone, see [docs/PROVEN-SETUP-CHECK.md](docs/PROVEN-SETUP-CHECK.md)
 | Short stutters or freezes in the VM, benchmark numbers that swing | The host is starving it (swap, builds on its cores): see [host tuning](docs/HOST-TUNING.md) |
 | "not enough free memory" | Close apps or give the VM less RAM; `--no-mem-check` skips the check |
 | Overlay says `COMPOSITED` in fullscreen | Your desktop composites the window; see [direct scanout](docs/SCANOUT.md). On Hyprland: `conduit view myvm --tune-hyprland`, then `Ctrl+Alt+F`, `Ctrl+Alt+D` |
+| A game feels sluggish in fullscreen (`commit->present` of 4 ms or more in the viewer log) | The compositor is waiting for vblank. Check `presentation:` in `vms/NAME/logs/viewer.log` and the desktop's tearing setting (Hyprland: `general:allow_tearing = true`); see [Presentation](docs/VIEWER.md#presentation-immediate-or-vsync) |
 | Stream: "ports are in use" | Another `conduit stream` or Sunshine is running; stop it, or use `--port 48089` |
 | Moonlight: Windows/Super key does nothing | Moonlight settings → *Capture system keyboard shortcuts* → **Always** |
 | Steam window errors | Steam is an X11 app and needs XWayland in the VM's session; open an issue with `conduit logs myvm` |

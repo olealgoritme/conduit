@@ -10,10 +10,12 @@
 #   make check           build, then run selftest.sh
 #   sudo make install    -> /usr/local/bin
 #
-# Note what is NOT here: no libdrm, no EGL, no GL, no libgbm.  The broker turns
+# Note what is NOT linked here: no libdrm, no EGL, no GL, no libgbm.  The broker turns
 # a dma-buf into a wl_buffer or an X pixmap with protocol requests; the import
 # happens in the compositor or the X server.  That is the same property the
-# VMM gains, one process in.
+# VMM gains, one process in.  The one GPU pass there is (nb_gpuscale.c, the
+# fullscreen scaler for a picture that is not 1:1) dlopen()s libEGL, libGLESv2
+# and libgbm at runtime, only when it is first needed.
 #
 # Debian/Ubuntu build deps:
 #   Wayland backend : libwayland-dev wayland-protocols
@@ -35,7 +37,7 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
            -D_GNU_SOURCE -I. -Icommon
 LDFLAGS += -Wl,-z,relro,-z,now
 
-OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_overlay.o nb_view.o nb_ui.o \
+OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_overlay.o nb_view.o nb_ui.o nb_gpuscale.o \
        nb_session_x11.o nb_session_wl.o nb_session_test.o
 
 # ── X11 backend: xcb + DRI3 + Present ─────────────────────────────────────
@@ -82,7 +84,8 @@ WL_XML = \
   $(WL_PROTO_DIR)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml \
   $(WL_PROTO_DIR)/staging/fractional-scale/fractional-scale-v1.xml \
   $(WL_PROTO_DIR)/staging/tearing-control/tearing-control-v1.xml \
-  $(WL_PROTO_DIR)/staging/single-pixel-buffer/single-pixel-buffer-v1.xml
+  $(WL_PROTO_DIR)/staging/single-pixel-buffer/single-pixel-buffer-v1.xml \
+  $(WL_PROTO_DIR)/staging/content-type/content-type-v1.xml
 
 WL_HDRS = $(notdir $(WL_XML:.xml=-client-protocol.h))
 WL_SRCS = $(notdir $(WL_XML:.xml=-protocol.c))
@@ -112,7 +115,7 @@ UI_LIBS   = $(shell $(PKG_CONFIG) --libs freetype2 fontconfig)
 CFLAGS   += $(UI_CFLAGS)
 LIBS     += $(UI_LIBS)
 endif
-LIBS     += -lm
+LIBS     += -lm -ldl
 
 ifeq ($(HAVE_X11)$(HAVE_WL),)
 $(warning No display backend will be compiled in: only --backend test will work.)
@@ -215,11 +218,17 @@ test-view: test/test_view.c nb_view.c nb_view.h
 test-ui: test/test_ui.c nb_ui.c nb_ui.h nb_view.c nb_view.h nb_placeholder.c
 	$(CC) $(CFLAGS) $(UI_CFLAGS) -I . -o $@ test/test_ui.c nb_ui.c nb_view.c nb_placeholder.c $(UI_LIBS) -lm
 
+# The fullscreen scaler on a real GPU, headless (no window).  Skips (77)
+# without a render node, so it is safe on CI.
+test-gpuscale: test/test_gpuscale.c nb_gpuscale.c nb_gpuscale.h
+	$(CC) $(CFLAGS) $(GBM_CFLAGS) -I . -o $@ test/test_gpuscale.c nb_gpuscale.c $(GBM_LIBS) -ldl
+
 test-relacc: test/test_relacc.c nb_relacc.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_relacc.c
 
-check: all test-utf8 test-overlay test-relacc test-view test-ui
+check: all test-utf8 test-overlay test-relacc test-view test-ui $(if $(HAVE_GBM),test-gpuscale,)
 	./test-utf8
+	$(if $(HAVE_GBM),./test-gpuscale || [ $$? = 77 ],)
 	./test-view
 	./test-ui
 	./test-relacc
@@ -244,4 +253,4 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d \
-	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test/utf8_extracted.inc
+	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test/utf8_extracted.inc

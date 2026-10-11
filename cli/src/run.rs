@@ -550,14 +550,16 @@ fn clipboard() -> Clipboard {
     CLIPBOARD.get().copied().unwrap_or(Clipboard::Both)
 }
 
-/// `conduit view --res/--area/--scale/--filter`: display settings handed to
-/// the viewer, overriding what it saved for this VM last time.
+/// `conduit view --res/--area/--scale/--filter/--sync`: display settings
+/// handed to the viewer, overriding what it saved for this VM last time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ViewOpts {
     pub res: Option<String>,
     pub area: Option<String>,
     pub scale: Option<String>,
     pub filter: Option<String>,
+    /// Presentation: fullscreen (immediate there), immediate, vsync.
+    pub sync: Option<String>,
 }
 
 impl ViewOpts {
@@ -569,6 +571,7 @@ impl ViewOpts {
             ("--area", &self.area),
             ("--scale", &self.scale),
             ("--filter", &self.filter),
+            ("--sync", &self.sync),
         ] {
             if let Some(v) = v {
                 a.push(flag.to_string());
@@ -719,6 +722,11 @@ pub(crate) fn start_viewer(
         let state = view_state_file(name);
         if let Some(dir) = state.parent() {
             let _ = std::fs::create_dir_all(dir);
+        }
+        let mut opts = opts;
+        if opts.sync.is_some() && !help.contains("--sync") {
+            ui::warn("this conduit-viewer is too old for --sync; ignoring it");
+            opts.sync = None;
         }
         cmd.arg("--view-state").arg(&state).args(opts.viewer_args());
         if let Ok(me) = std::env::current_exe() {
@@ -1663,10 +1671,11 @@ mod clipboard_tests {
             area: Some("4:3".into()),
             scale: Some("stretch".into()),
             filter: None,
+            sync: Some("vsync".into()),
         };
         assert_eq!(
             o.viewer_args(),
-            ["--res", "1280x960", "--area", "4:3", "--scale", "stretch"]
+            ["--res", "1280x960", "--area", "4:3", "--scale", "stretch", "--sync", "vsync"]
         );
         assert!(ViewOpts::default().viewer_args().is_empty());
     }

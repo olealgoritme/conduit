@@ -751,6 +751,21 @@ area:
     }
     field(&b, NB_UI_ID_PROF_FIELD, "Save current as... (name, Enter)");
 
+    /* presentation */
+    section(&b, env->immediate ? "Presentation (immediate now)"
+                               : "Presentation (vsync now)");
+    {
+        static const int order[NB_SYNC_COUNT] = {
+            NB_SYNC_FULLSCREEN, NB_SYNC_IMMEDIATE, NB_SYNC_VSYNC,
+        };
+
+        for (i = 0; i < NB_SYNC_COUNT; i++) {
+            chip(&b, nb_sync_label(order[i]), NB_UI_ID_SYNC, order[i],
+                 st->sync == order[i], false);
+        }
+    }
+    hint(&b, "Immediate: lowest latency, may tear; needs fullscreen");
+
     /* view */
     section(&b, "View");
     if (!env->no_stats) {
@@ -1059,6 +1074,13 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
         nb_ui_layout(ui, env, NULL, NULL);
         return noticef(ui, bits | NB_UI_SAVE | NB_UI_REDRAW,
                        "Deleted profile: %.40s", s);
+    case NB_UI_ID_SYNC:
+        if (st->sync == it->arg) {
+            return bits | NB_UI_REDRAW;
+        }
+        st->sync = it->arg;
+        return noticef(ui, bits | NB_UI_SYNC | NB_UI_SAVE | NB_UI_REDRAW,
+                       "Presentation: %s", nb_sync_label(it->arg));
     case NB_UI_ID_STATS:
         return bits | NB_UI_STATS | NB_UI_REDRAW;
     case NB_UI_ID_FULLSCREEN:
