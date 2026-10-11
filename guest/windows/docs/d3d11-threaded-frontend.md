@@ -1,6 +1,7 @@
 # D3D11 threaded front end (UMD worker thread)
 
-Status: phase 1, on by default from 22.22.405.48 (`UmdThreadedFrontend=0` turns it off).
+Status: phase 1, off by default (`UmdThreadedFrontend=1` turns it on) while CS2's texture corruption with it on is
+isolated; `UmdFrontendSync` (section 7) takes one call class at a time off the threaded path for that.
 
 ## 1. Why
 
@@ -103,7 +104,9 @@ Every immediate-context entry point is in exactly one class.
 
 "Synchronous" means the ring is drained, not that the worker is idle: it may still be running queued destructions,
 whose bodies are free-threaded safe (cache mutex, atomics). A resource destroy runs the destructions the worker has
-passed on its own thread first, so a view is never destroyed after its resource.
+passed on its own thread first, and waits for any the worker already took out of the queue and is still running
+(`CmdQueue::run_ready_retired` holds the same lock as the worker's batch), so a view is never destroyed after its
+resource.
 
 Device-level calls already run concurrently with the immediate context under `UmdFreeThreaded` (FREETHREADED caps),
 so their thread-safety is not new. Moving immediate-context work from the app thread to the worker does not change
@@ -134,6 +137,11 @@ on the worker it is replaced by a stash.
 Only the immediate context is threaded. Deferred contexts (DCs) already record on the app's own threads into DXVK's
 `D3D11DeferredContext` through their own funcs tables (`deferred.rs`); those tables are filled independently of the
 device table and get no wrappers. A DC's calls never reach the frontend's ring.
+
+`FinishCommandList(FALSE)` clears the DC's DXVK state like `ExecuteCommandList(FALSE)` clears its target's, so both
+reset the context's binding shadows (`CtxBindings::reset_after_command_list_execute`): the draw path skips
+`IASetInputLayout` when `bound_il_com` names the layout DXVK already has, and a stale shadow would leave the next
+list's draws without one.
 
 `CommandListExecute` on the immediate context is deferred from phase 2 on (phase 1 drains and runs it inline, so no
 execute is ever queued when a list is recycled). The record holds its own reference to the command list
@@ -312,9 +320,24 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 
 ## 7. Knobs and counters
 
-- `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 0 = off, 1 = on for every process except dwm.exe (default
-  from 22.22.405.48), 2 = on including dwm.exe. Process override `HELIOS_D3D11_FRONTEND=0|1`.
+- `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 0 = off (default), 1 = on for every process except dwm.exe,
+  2 = on including dwm.exe. Process override `HELIOS_D3D11_FRONTEND=0|1`.
 - `UmdFrontendRingKiB` (DWORD, default 4096, clamped 256–65536).
+- `UmdFrontendSync` (DWORD bitmask, default 0): call classes forced onto the synchronous path, for A/B runs that pin a
+  rendering difference to one mechanism (`umd_common::cmd_record::FrontendSync`; the start-up log line names them):
+
+  | bit | class | what changes |
+  |---|---|---|
+  | 1 | maps | dynamic-buffer DISCARD / NO_OVERWRITE maps drain and use DXVK's own `Map` on the app thread (no split) |
+  | 2 | updates | buffer `UpdateSubresourceUP` drains and runs inline (no payload copy in the ring) |
+  | 4 | destroys | view / state / shader / layout / query / command-list destroys drain and run inline (no retire queue) |
+  | 8 | queries | `QueryGetData` drains, then the unchanged forward call (no early "still drawing", no hint record) |
+  | 16 | no_park | the worker does not pre-allocate a buffer's next discard slice (patch 0018 `PreAllocate`) |
+  | 32 | serial | every record is waited for before its DDI returns: same thread split, no overlap with the app |
+  | 64 | flush | `Flush` drains and runs the forward flush inline |
+
+  127 makes every class synchronous; with `serial` too, the only difference left from front end off is which thread
+  enters DXVK.
 - One summary line at `DestroyDevice` (and every 4096 drains with `UmdTrace`): records, bytes, sync calls and drains by
   reason, drain wait µs (sum, max), producer full-waits, worker parks/wakes, destroys queued/inline/waited, GetData
   early-pending, split maps (discard / no-overwrite), stashed errors.
