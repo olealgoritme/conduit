@@ -564,6 +564,12 @@ compositor modesets as usual.
   always|windowed|off`, default always) adds frame time now/avg/p99/max, the
   latency segments, drops, input rate and a 2 s frame-time graph; redrawn ≤4/s
   from a timer, never from the frame path.
+- Frames faster than the compositor takes them (an uncapped game with
+  immediate flips) are coalesced, newest wins: a frame is committed only while
+  the compositor socket is not backed up and at most two commits ahead of the
+  pending frame callback (one per 50 ms if callbacks stop). A held frame that
+  a newer one replaces goes back to the guest at once (`host/viewer/nb_pace.h`;
+  `held N` in the `--stats` line).
 - Presentation sync, the fullscreen GPU scaler and what each compositor needs:
   [VIEWER.md](VIEWER.md#presentation-immediate-or-vsync).
 - Direct mode (CTRL+ALT+D, `--direct-mode=on`): overlay hidden, tearing ASYNC

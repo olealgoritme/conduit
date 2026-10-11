@@ -54,6 +54,7 @@
 #include "nb_overlay.h"
 #include "nb_relacc.h"
 #include "nb_gpuscale.h"
+#include "nb_pace.h"
 
 #ifndef NB_HAVE_WAYLAND
 
@@ -532,6 +533,14 @@ struct nb_wl {
     int      pending;           /* index of the ATTACHed-but-not-COMMITted buf */
     int      current;           /* index of the buffer the surface holds       */
     bool     frame_inflight;
+    /*
+     * THE COMMIT GATE (nb_pace.h).  A frame the compositor cannot use yet
+     * (socket backed up, enough commits ahead of the frame callback) stays
+     * staged in `pending`; a newer ATTACH replaces it and releases it, and
+     * the staged one goes out when the gate opens (wl_commit_staged()).
+     */
+    struct nb_pace pace;
+    bool     commit_staged;
     uint64_t n_reuse_inflight;  /* commits of a buffer the compositor still
                                  * held -- see wl_commit()                     */
 
@@ -664,6 +673,7 @@ struct nb_wl {
     uint32_t        gt_w, gt_h;
     int             gt_last;
     uint64_t        st_gs_sum, st_gs_max; unsigned st_gs_n, st_gs_drop;
+    unsigned        st_held;        /* commits the gate held back       */
 
     /* The guest's cursor, as the host pointer's image (CMD_CURSOR). */
     struct wl_surface  *gc_surf;
@@ -902,7 +912,7 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
                "superseded %u | recv->commit avg %.0fus max %.0fus |%s "
                "commit->present avg %.0fus p50 %uus p99 %uus max %.0fus |%s "
                "| present interval avg %.0fus sd %.0fus p50 %uus p99 %uus "
-               "| %s%s",
+               "| %s, held %u%s",
                w->st_commits / secs, w->st_presented / secs, w->st_zc,
                w->st_discarded,
                w->st_commits ? (double)w->st_rc_sum / w->st_commits / 1e3 : 0.0,
@@ -910,8 +920,9 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
                w->st_cp_n ? (double)w->st_cp_sum / w->st_cp_n / 1e3 : 0.0,
                cp50, cp99, (double)w->st_cp_max / 1e3, sp,
                pi_mean, pi_sd, pi50, pi99,
-               w->tearing_async ? "immediate" : "vsync", gs);
+               w->tearing_async ? "immediate" : "vsync", w->st_held, gs);
     }
+    w->st_held = 0;
     w->st_gs_sum = w->st_gs_max = 0;
     w->st_gs_n = w->st_gs_drop = 0;
     w->st_cp_k = w->st_pi_k = 0;
@@ -1385,6 +1396,7 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t t)
 
     wl_callback_destroy(cb);
     w->frame_inflight = false;
+    nb_pace_frame_done(&w->pace);
     if (w->sink) {
         w->last_frame_ms = nb_now_ms_wl();
         nb_sink_frame(w->sink);
@@ -1982,6 +1994,19 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
         w->pending = -1;
         return -ENOENT;
     }
+    /*
+     * FLOOD GATE.  Held back, not dropped: the frame stays staged until the
+     * compositor can take it, and a newer one replaces it.  Writing every
+     * frame of a guest flipping at thousands per second fills the compositor
+     * socket, and libwayland makes a full socket a fatal error.
+     */
+    if (!nb_pace_may_commit(&w->pace, nb_mono_ns())) {
+        w->pace.deferred++;
+        w->st_held++;
+        w->commit_staged = true;
+        return 0;
+    }
+    w->commit_staged = false;
 
     /*
      * THE FRAME-GLITCH DETECTOR.
@@ -2120,12 +2145,18 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
             w->pc_last = NULL;
         }
     }
-    if (!w->frame_inflight) {
-        cb = wl_surface_frame(target);
-        if (cb) {
-            wl_callback_add_listener(cb, &frame_listener, w);
-            w->frame_inflight = true;
+    {
+        bool armed_now = false;
+
+        if (!w->frame_inflight) {
+            cb = wl_surface_frame(target);
+            if (cb) {
+                wl_callback_add_listener(cb, &frame_listener, w);
+                w->frame_inflight = true;
+                armed_now = true;
+            }
         }
+        nb_pace_committed(&w->pace, nb_mono_ns(), armed_now);
     }
     /*
      * The letterbox offsets the resize borders hang off are computed by
@@ -2145,7 +2176,8 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     if (w->viewport) {
         wl_ptr_follow(w);       /* compare-only unless the picture moved */
     }
-    wl_display_flush(w->dpy);   /* out NOW: see FLUSH below */
+    nb_pace_flushed(&w->pace, wl_display_flush(w->dpy) < 0 &&
+                              errno == EAGAIN);  /* out NOW: see FLUSH below */
     nb_stats_commit(w, sl);
 
     /*
@@ -2229,6 +2261,16 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
      */
     wl_display_flush(w->dpy);
     return 0;
+}
+
+/* Commit the staged frame the gate held back, if the gate is open now. */
+static void wl_commit_staged(struct nb_wl *w)
+{
+    if (!w->commit_staged || w->pending < 0 || !w->sess || !w->sink ||
+        !nb_pace_may_commit(&w->pace, nb_mono_ns())) {
+        return;
+    }
+    (void)wl_commit(w->sess, w->sink);
 }
 
 /* ── the client-side title bar ───────────────────────────────────────────── */
@@ -3701,7 +3743,21 @@ static int wl_tick(struct nb_session *s)
     struct nb_wl *w = s->priv;
     int r = wl_tick_fetch(w, wl_tick_clip(s));
 
-    return wl_tick_viewer(w, r);
+    r = wl_tick_viewer(w, r);
+    /* A staged frame held by an overdue frame callback: look again then. */
+    wl_commit_staged(w);
+    if (w->commit_staged && w->pending >= 0) {
+        uint64_t due = nb_pace_due_ns(&w->pace, nb_mono_ns());
+
+        if (due) {
+            int ms = (int)((due + 999999) / 1000000);
+
+            if (r < 0 || ms < r) {
+                r = ms;
+            }
+        }
+    }
+    return r;
 }
 
 static int wl_tick_clip(struct nb_session *s)
@@ -6911,6 +6967,7 @@ static int wl_pollfds(struct nb_session *s, struct pollfd *out, int max)
      */
     r = wl_display_flush(w->dpy);
     w->flush_blocked = (r < 0 && errno == EAGAIN);
+    nb_pace_flushed(&w->pace, w->flush_blocked);
 
     out[0].fd = wl_display_get_fd(w->dpy);
     out[0].events = POLLIN | (w->flush_blocked ? POLLOUT : 0);
@@ -6974,13 +7031,15 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
     }
 
     if (w->pfd && (w->pfd->revents & POLLOUT)) {
-        wl_display_flush(w->dpy);
+        nb_pace_flushed(&w->pace, wl_display_flush(w->dpy) < 0 &&
+                                  errno == EAGAIN);
     }
     if (wl_display_prepare_read(w->dpy) != 0) {
         /* Another queue already has events buffered; drain those first. */
         if (wl_display_dispatch_pending(w->dpy) < 0) {
             return -EIO;
         }
+        wl_commit_staged(w);
         return 0;
     }
     if (!readable) {
@@ -6988,6 +7047,7 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
         if (wl_display_dispatch_pending(w->dpy) < 0) {
             return -EIO;
         }
+        wl_commit_staged(w);
         return 0;
     }
     if (wl_display_read_events(w->dpy) < 0) {
@@ -7001,6 +7061,7 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
          * goodbye to the client and tears the session down. */
         return -ECONNRESET;
     }
+    wl_commit_staged(w);        /* a frame callback may have opened the gate */
     return 0;
 }
 

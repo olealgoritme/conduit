@@ -14,3 +14,4 @@ nvgpu-scanout-test
 test-view
 test-ui
 test-gpuscale
+test-pace
