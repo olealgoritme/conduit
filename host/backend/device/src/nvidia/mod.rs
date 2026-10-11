@@ -1115,6 +1115,7 @@ impl NvidiaBackend {
                 MsgType::ClipboardFromHost => "clipboard_from_host",
                 MsgType::ScanoutReleased => "scanout_released",
                 MsgType::ScanoutPresented => "scanout_presented",
+                MsgType::HostVblank => "host_vblank",
                 MsgType::ClipboardToHost => "clipboard_to_host",
                 MsgType::ClipboardRequest => "clipboard_request",
                 MsgType::GpuCmd => "gpu_cmd",
@@ -1149,7 +1150,8 @@ impl NvidiaBackend {
             | MsgType::DisplayModeList
             | MsgType::ClipboardFromHost
             | MsgType::ScanoutReleased
-            | MsgType::ScanoutPresented => {
+            | MsgType::ScanoutPresented
+            | MsgType::HostVblank => {
                 log::warn!(
                     "{msg_type:?} arrived from the guest; that message only travels outward"
                 );

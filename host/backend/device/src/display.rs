@@ -1586,6 +1586,8 @@ pub struct DisplayLink {
     /// The guest wants `ScanoutPresented` (lock-free check per report).
     presented_on: AtomicBool,
     presented_sink: Mutex<Option<Arc<dyn PresentedSink>>>,
+    /// The host vblank pacer (`HostVblank` events, docs/SCANOUT.md "Host vblank").
+    vblank: Arc<crate::vblank_pacer::VblankPacer>,
     /// Guest generations ended so far ([`DisplayLink::guest_gone`]).
     generation: AtomicU64,
     /// The mode list, shared by the guest and every client.
@@ -1670,6 +1672,7 @@ impl DisplayLink {
             release_sink: Mutex::new(None),
             presented_on: AtomicBool::new(false),
             presented_sink: Mutex::new(None),
+            vblank: crate::vblank_pacer::VblankPacer::new(crate::vblank_clock::lead_from_env()),
             generation: AtomicU64::new(0),
             modes: Mutex::new(ModeCatalog::new(mode, None)),
             stats: LinkStats::default(),
@@ -1790,6 +1793,24 @@ impl DisplayLink {
         *self.presented_sink.lock().unwrap() = Some(sink);
     }
 
+    /// Start the vblank pacer's thread, sending to `sink`.
+    pub fn start_host_vblank(&self, sink: Arc<dyn crate::vblank_pacer::HostVblankSink>) {
+        if let Err(e) = self.vblank.start(sink) {
+            log::warn!("display: host vblank events off ({e}): no thread for them");
+        }
+    }
+
+    /// The guest acked `NVGPU_F_HOST_VBLANK` at device start (`true`), or a
+    /// new guest generation did not (`false`).
+    pub fn set_host_vblank_enabled(&self, on: bool) {
+        self.vblank.set_enabled(on);
+    }
+
+    /// `(sent, dropped)` `HostVblank` events.
+    pub fn host_vblank_counts(&self) -> (u64, u64) {
+        self.vblank.counts()
+    }
+
     /// The guest acked `NVGPU_F_SCANOUT_PRESENTED` at device start (`true`),
     /// or the device started or reset without it (`false`).
     pub fn set_presented_enabled(&self, on: bool) {
@@ -1808,6 +1829,8 @@ impl DisplayLink {
     /// (`EV_PRESENTED` from a `CAP_PRESENTED` client): tell the guest which
     /// flip that was, once per flip.
     fn client_presented(&self, i: usize, stamp: u32, kind: u32, present_ns: u64) {
+        // The vblank lattice learns from every report, whoever completes flips.
+        self.vblank.presented(i, kind, present_ns);
         if !self.presented_enabled() {
             return;
         }
@@ -1920,6 +1943,7 @@ impl DisplayLink {
     /// Client `i` reads nothing any more (gone, or idle).
     fn client_gone_locked(&self, st: &mut LinkState, i: usize) {
         st.presented.client_gone(i);
+        self.vblank.client_gone(i);
         if st.release.enabled() {
             st.release.client_gone(i);
             st.release.collect(Instant::now());
@@ -3631,16 +3655,20 @@ impl DisplayLink {
                     );
                 }
             }
-            EV_SURFACE => log::debug!(
-                "display: client {i} window {}x{}{}",
-                p.x,
-                p.y,
-                if p.flags & F_FULLSCREEN != 0 {
-                    " (fullscreen)"
-                } else {
-                    ""
-                }
-            ),
+            EV_SURFACE => {
+                // w0: the host output's refresh in mHz (0 unknown).
+                self.vblank.surface(i, p.flags & F_FULLSCREEN != 0, p.w0);
+                log::debug!(
+                    "display: client {i} window {}x{}{}",
+                    p.x,
+                    p.y,
+                    if p.flags & F_FULLSCREEN != 0 {
+                        " (fullscreen)"
+                    } else {
+                        ""
+                    }
+                )
+            }
             EV_MODE_HINT => log::debug!(
                 "display: client {i} mode hint {}x{} @{} mHz (reason {})",
                 p.x,

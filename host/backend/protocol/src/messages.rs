@@ -115,9 +115,15 @@ pub enum MsgType {
     /// flip the guest sent reached the screen (the compositor latched it).
     /// Payload [`ScanoutPresented`]. Sent only to a guest that acked the
     /// device feature [`NVGPU_F_SCANOUT_PRESENTED`]. See docs/SCANOUT.md
-    /// "Presentation feedback". 29 and 32 are left alone (32 is proposed for
-    /// the host vblank event).
+    /// "Presentation feedback". 29 is left alone.
     ScanoutPresented = 33,
+    /// **Host → guest**, on the event queue: one host display vblank, sent at
+    /// the vblank's predicted instant (minus the backend's lead) by the vblank
+    /// pacer (`device::vblank_clock`). Payload [`HostVblank`]. Sent only to a
+    /// guest that acked [`NVGPU_F_HOST_VBLANK`], and only while a display
+    /// client's presentation reports keep the vblank lattice fitted. See
+    /// docs/SCANOUT.md "Host vblank".
+    HostVblank = 32,
     /// **Host → guest**, on the event queue: the display's whole mode list
     /// (`crate::modes`): native first, then the standard and custom modes.
     /// Payload [`DisplayModeListHeader`] followed by `count`
@@ -165,6 +171,7 @@ impl MsgType {
             27 => Self::ClipboardRequest,
             28 => Self::ScanoutReleased,
             33 => Self::ScanoutPresented,
+            32 => Self::HostVblank,
             34 => Self::DisplayModeList,
             30 => Self::GpuCmd,
             31 => Self::RmResourceImport,
@@ -604,7 +611,7 @@ pub fn encode_scanout_released(r: &ScanoutReleased, out: &mut [u8]) -> Option<us
 /// A **virtio device feature** the guest acks (like [`NVGPU_F_SCANOUT_RELEASE`]; config
 /// `features` bit 19 stays unused): the guest wants `ScanoutPresented` events. The
 /// backend offers it whenever it has a display; a guest that does not ack it never
-/// gets one. Bit 17 is kept for the proposed host vblank feature.
+/// gets one. Bit 17 is [`NVGPU_F_HOST_VBLANK`].
 pub const NVGPU_F_SCANOUT_PRESENTED: u32 = 1 << 19;
 
 /// [`ScanoutPresented::flags`]: the frame was shown through Venus
@@ -691,6 +698,79 @@ impl ScanoutPresented {
             reserved: q(40),
         })
     }
+}
+
+/// A **virtio device feature** the guest acks: the guest wants `HostVblank`
+/// events (its vsync follows the host display's real vblank). Offered whenever
+/// the backend has a display; a guest that does not ack it never gets one.
+pub const NVGPU_F_HOST_VBLANK: u32 = 1 << 17;
+/// [`HostVblank`] wire version (`version`).
+pub const HOST_VBLANK_VERSION: u16 = 1;
+/// [`HostVblank::flags`]: the sample is a vblank-synchronised instant.
+pub const HOST_VBLANK_VSYNC: u32 = 1 << 0;
+/// [`HostVblank::flags`]: the first event after the pacer (re)started.
+pub const HOST_VBLANK_FIRST: u32 = 1 << 4;
+/// [`HostVblank::flags`]: the pacer stops until further notice (no sample).
+pub const HOST_VBLANK_IDLE: u32 = 1 << 5;
+
+/// Event-queue payload for `MsgType::HostVblank`, following a `MsgHeader`
+/// (handle 0, status 0): a 48-byte body and `count` 16-byte samples
+/// `{present_ns, msc}` (the pacer sends one; 0 with [`HOST_VBLANK_IDLE`]).
+/// The layout is the guest's `kmd_logic::host_vblank::parse`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostVblank {
+    /// `HOST_VBLANK_*`.
+    pub flags: u32,
+    /// The output's refresh in mHz as the pacer measured it, 0 unknown.
+    pub refresh_mhz: u32,
+    /// Host `CLOCK_MONOTONIC` nanoseconds at which the event was sent.
+    pub sent_ns: u64,
+    /// Vblanks the pacer sent since it (re)started.
+    pub seq: u64,
+    /// Vblanks skipped since the previous event (no event buffer, a late wake).
+    pub lost: u32,
+    /// Host `CLOCK_MONOTONIC` nanoseconds of the vblank this event stands for
+    /// (the sample; ignored with [`HOST_VBLANK_IDLE`]).
+    pub vblank_ns: u64,
+}
+
+/// Size of a whole `HostVblank` message with one sample.
+pub const HOST_VBLANK_MESSAGE_LEN: usize = size_of::<MsgHeader>() + 48 + 16;
+
+/// Encode one `HostVblank` message into `out`: one sample, or none with
+/// [`HOST_VBLANK_IDLE`]. Returns the length written.
+pub fn encode_host_vblank(v: &HostVblank, out: &mut [u8]) -> Option<usize> {
+    let idle = v.flags & HOST_VBLANK_IDLE != 0;
+    let len = if idle {
+        HOST_VBLANK_MESSAGE_LEN - 16
+    } else {
+        HOST_VBLANK_MESSAGE_LEN
+    };
+    if out.len() < len {
+        return None;
+    }
+    out[..len].fill(0);
+    let hdr = MsgHeader::ok(MsgType::HostVblank, 0);
+    for (i, w) in [hdr.msg_type, hdr.handle, hdr.status as u32, hdr.padding]
+        .iter()
+        .enumerate()
+    {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    let b = 16;
+    out[b..b + 2].copy_from_slice(&HOST_VBLANK_VERSION.to_le_bytes());
+    out[b + 2..b + 4].copy_from_slice(&(if idle { 0u16 } else { 1u16 }).to_le_bytes());
+    // scanout (b + 4) stays 0.
+    out[b + 8..b + 12].copy_from_slice(&v.flags.to_le_bytes());
+    out[b + 12..b + 16].copy_from_slice(&v.refresh_mhz.to_le_bytes());
+    out[b + 16..b + 24].copy_from_slice(&v.sent_ns.to_le_bytes());
+    out[b + 24..b + 32].copy_from_slice(&v.seq.to_le_bytes());
+    out[b + 32..b + 36].copy_from_slice(&v.lost.to_le_bytes());
+    if !idle {
+        out[b + 48..b + 56].copy_from_slice(&v.vblank_ns.to_le_bytes());
+        // msc (b + 56) stays 0: the pacer's vblanks are predicted, not counted.
+    }
+    Some(len)
 }
 
 /// Size of a whole `ScanoutPresented` event-queue message.
@@ -1479,14 +1559,16 @@ mod tests {
         assert_eq!(MsgType::from_u32(29), None);
         assert_eq!(MsgType::GpuCmd as u32, 30);
         assert_eq!(MsgType::RmResourceImport as u32, 31);
-        assert_eq!(MsgType::from_u32(32), None);
+        assert_eq!(MsgType::from_u32(32), Some(MsgType::HostVblank));
         assert_eq!(MsgType::ScanoutPresented as u32, 33);
         assert_eq!(MsgType::from_u32(33), Some(MsgType::ScanoutPresented));
+        assert_eq!(MsgType::HostVblank as u32, 32);
+        assert_eq!(MsgType::from_u32(32), Some(MsgType::HostVblank));
         // A device feature like SCANOUT_RELEASE, above every config bit in use
-        // (17 is kept for the host vblank proposal).
+        // (17 is NVGPU_F_HOST_VBLANK).
         assert_eq!(NVGPU_F_SCANOUT_PRESENTED, 1 << 19);
         assert_eq!(NVGPU_CFG_RM_RESOURCE_IMPORT, 1 << 14);
-        // Bit 17 is the proposed host vblank feature's.
+        assert_eq!(NVGPU_F_HOST_VBLANK, 1 << 17);
         assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
         assert_eq!(NVGPU_CFG_CURSOR_QUEUE, 1 << 20);
         let r = RmResourceImport {
@@ -1748,5 +1830,62 @@ mod tests {
             encode_clipboard_chunk(MsgType::ClipboardFromHost, &c, b"abc", &mut out[..74])
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod host_vblank_tests {
+    use super::*;
+
+    fn r32(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+    fn r64(b: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    }
+
+    /// The layout the guest's `kmd_logic::host_vblank::parse` reads.
+    #[test]
+    fn the_layout_is_the_guests() {
+        let v = HostVblank {
+            flags: HOST_VBLANK_VSYNC | HOST_VBLANK_FIRST,
+            refresh_mhz: 239_960,
+            sent_ns: 1_000_000_123,
+            seq: 7,
+            lost: 2,
+            vblank_ns: 1_000_000_000,
+        };
+        let mut out = [0xAAu8; 128];
+        assert_eq!(encode_host_vblank(&v, &mut out), Some(80));
+        assert_eq!(r32(&out, 0), 32, "type");
+        assert_eq!(r32(&out, 4), 0, "handle");
+        assert_eq!(u16::from_le_bytes([out[16], out[17]]), 1, "version");
+        assert_eq!(u16::from_le_bytes([out[18], out[19]]), 1, "count");
+        assert_eq!(r32(&out, 20), 0, "scanout");
+        assert_eq!(r32(&out, 24), HOST_VBLANK_VSYNC | HOST_VBLANK_FIRST);
+        assert_eq!(r32(&out, 28), 239_960);
+        assert_eq!(r64(&out, 32), 1_000_000_123);
+        assert_eq!(r64(&out, 40), 7);
+        assert_eq!(r32(&out, 48), 2);
+        assert_eq!(r64(&out, 64), 1_000_000_000, "present_ns");
+        assert_eq!(r64(&out, 72), 0, "msc");
+        assert_eq!(out[80], 0xAA, "nothing past the message");
+    }
+
+    #[test]
+    fn idle_carries_no_sample_and_short_buffers_are_refused() {
+        let v = HostVblank {
+            flags: HOST_VBLANK_IDLE,
+            ..Default::default()
+        };
+        let mut out = [0u8; 80];
+        assert_eq!(encode_host_vblank(&v, &mut out), Some(64));
+        assert_eq!(u16::from_le_bytes([out[18], out[19]]), 0);
+        assert_eq!(
+            encode_host_vblank(&HostVblank::default(), &mut [0u8; 79]),
+            None
+        );
+        assert_eq!(NVGPU_F_HOST_VBLANK, 1 << 17);
+        assert_eq!(NVGPU_F_HOST_VBLANK & NVGPU_F_SCANOUT_PRESENTED, 0);
     }
 }

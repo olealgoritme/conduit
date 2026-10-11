@@ -53,12 +53,13 @@ use device::shm_regions::{SHM_ID_VENUS, region_sizes_with_venus};
 use device::virtio::{CURSOR_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
-    DisplayModeEvent, EVENT_READY_PER_BUFFER_MAX, InputEventEntry, MsgHeader, MsgType,
-    NVGPU_CFG_TAKES_INPUT, NVGPU_F_EVENT_PACKED, NVGPU_F_MODE_LIST, NVGPU_F_SCANOUT_PRESENTED,
-    NVGPU_F_SCANOUT_RELEASE, SCANOUT_PRESENTED_MESSAGE_LEN, SCANOUT_RELEASED_MESSAGE_LEN,
-    ScanoutPresented, ScanoutReleased, clipboard_mime, display_mode_list_message_len,
-    encode_clipboard_chunk, encode_display_mode, encode_display_mode_list, encode_input_events,
-    encode_scanout_presented, encode_scanout_released, input_events_that_fit,
+    DisplayModeEvent, EVENT_READY_PER_BUFFER_MAX, HOST_VBLANK_MESSAGE_LEN, HostVblank,
+    InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT, NVGPU_F_EVENT_PACKED,
+    NVGPU_F_HOST_VBLANK, NVGPU_F_MODE_LIST, NVGPU_F_SCANOUT_PRESENTED, NVGPU_F_SCANOUT_RELEASE,
+    SCANOUT_PRESENTED_MESSAGE_LEN, SCANOUT_RELEASED_MESSAGE_LEN, ScanoutPresented, ScanoutReleased,
+    clipboard_mime, display_mode_list_message_len, encode_clipboard_chunk, encode_display_mode,
+    encode_display_mode_list, encode_host_vblank, encode_input_events, encode_scanout_presented,
+    encode_scanout_released, input_events_that_fit,
 };
 use std::os::fd::{BorrowedFd, RawFd};
 use vhost::vhost_user::message::{
@@ -1012,6 +1013,49 @@ impl ReleaseSink for VqReleaseSink {
             let _ = vring.signal_used_queue();
         }
         done
+    }
+}
+
+/// `CONDUIT_HOST_VBLANK=0` keeps the host vblank feature unoffered (the
+/// guest then paces on its own timer). Default: offered with a display.
+fn host_vblank_offered() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CONDUIT_HOST_VBLANK").map_or(true, |v| v.trim() != "0"))
+}
+
+/// `HostVblank` onto the event queue from the pacer's thread: one message
+/// into one posted buffer, or dropped when none is posted (an event is stale
+/// within a vblank; the guest's timer fills in).
+impl device::vblank_pacer::HostVblankSink for VqReleaseSink {
+    fn vblank(&self, v: &HostVblank) -> bool {
+        let Some((vring, mem)) = self.target.lock().expect("event target").clone() else {
+            return false;
+        };
+        let guard = mem.memory();
+        let mut vr = vring.get_mut();
+        let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
+            return false;
+        };
+        let Some(chain) = avail.next() else {
+            return false;
+        };
+        let head = chain.head_index();
+        drop(vr);
+        let segs = writable(chain);
+        let mut written = 0u32;
+        let mut msg = [0u8; HOST_VBLANK_MESSAGE_LEN];
+        if let Some(n) = encode_host_vblank(v, &mut msg) {
+            if capacity(&segs) >= n {
+                if let Ok(w) = write_scattered(&*guard, &segs, &msg[..n]) {
+                    written = w as u32;
+                }
+            }
+        }
+        if vring.add_used(head, written).is_err() {
+            return false;
+        }
+        let _ = vring.signal_used_queue();
+        written != 0
     }
 }
 
@@ -2388,6 +2432,9 @@ impl NvGpuBackend {
                     log::warn!("display: presentation reports off ({e}): no thread for them");
                 }
             }
+            if host_vblank_offered() {
+                link.start_host_vblank(sink.clone());
+            }
             display_link = Some(link.clone());
             nvidia.set_display(link);
         }
@@ -2612,6 +2659,7 @@ impl NvGpuBackend {
         if let Some(link) = self.display_link.as_ref() {
             link.set_release_enabled(false);
             link.set_presented_enabled(false);
+            link.set_host_vblank_enabled(false);
         }
     }
 
@@ -2834,6 +2882,11 @@ impl VhostUserBackendMut for NvGpuBackend {
                 u64::from(NVGPU_F_SCANOUT_RELEASE)
                     | u64::from(NVGPU_F_SCANOUT_PRESENTED)
                     | u64::from(NVGPU_F_MODE_LIST)
+                    | if host_vblank_offered() {
+                        u64::from(NVGPU_F_HOST_VBLANK)
+                    } else {
+                        0
+                    }
             } else {
                 0
             }
@@ -2876,14 +2929,16 @@ impl VhostUserBackendMut for NvGpuBackend {
         self.input_claims.device_started(features);
         let release = features & u64::from(NVGPU_F_SCANOUT_RELEASE) != 0;
         let presented = features & u64::from(NVGPU_F_SCANOUT_PRESENTED) != 0;
+        let host_vblank = features & u64::from(NVGPU_F_HOST_VBLANK) != 0;
         let packed = features & u64::from(NVGPU_F_EVENT_PACKED) != 0;
         self.event_packed.store(packed, Ordering::Relaxed);
         if let Some(link) = self.display_link.as_ref() {
             link.set_release_enabled(release);
             link.set_presented_enabled(presented);
+            link.set_host_vblank_enabled(host_vblank);
         }
         log::info!(
-            "guest driver features {features:#x}: {}{}{}{}{}",
+            "guest driver features {features:#x}: {}{}{}{}{}{}",
             if features & u64::from(NVGPU_CFG_TAKES_INPUT) != 0 {
                 "takes Conduit input"
             } else {
@@ -2896,6 +2951,11 @@ impl VhostUserBackendMut for NvGpuBackend {
             },
             if presented {
                 ", wants presentation feedback"
+            } else {
+                ""
+            },
+            if host_vblank {
+                ", follows the host vblank"
             } else {
                 ""
             },

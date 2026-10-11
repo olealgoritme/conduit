@@ -31,6 +31,7 @@ pub mod stage;
 pub mod trace;
 pub mod userspace;
 pub mod vblank_clock;
+pub mod vblank_pacer;
 #[cfg(feature = "venus")]
 pub mod venus;
 pub mod virtio;
