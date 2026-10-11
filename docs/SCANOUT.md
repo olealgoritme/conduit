@@ -401,7 +401,7 @@ A guest that wants to complete a flip when the host display really showed it
 (the Windows KMD's `FlipDoneHost`, guest/windows/docs/independent-flip.md
 section 13) acks the **virtio device feature** `NVGPU_F_SCANOUT_PRESENTED =
 1 << 19` (offered whenever the backend has a display; config bit 19 stays
-unused, bit 17 is kept for the proposed host vblank feature). Only then does
+unused). Only then does
 it get `ScanoutPresented` events, and only then does the backend keep the
 bookkeeping for them.
 
@@ -439,6 +439,63 @@ Delivery: from the link thread as soon as the report is read, into one posted
 event buffer; with none posted the event is **dropped** (counted,
 `presented_dropped`), never retried, because it is stale within a frame. The
 X11 backend and conduit-stream do not declare the capability.
+
+### Host vblank
+
+A guest that wants its vsync to follow the host display's real vblank (the
+Windows KMD's `HostVblank`, default on) acks the **virtio device feature**
+`NVGPU_F_HOST_VBLANK = 1 << 17`. The feature is offered whenever the backend
+has a display, unless `CONDUIT_HOST_VBLANK=0`. The guest then gets one
+`HostVblank` event per host vblank:
+
+```c
+struct host_vblank {           /* event queue, after the header (msg_type 32, handle 0, status 0) */
+    u16 version;               /* 1 */
+    u16 count;                 /* 1; 0 with IDLE */
+    u32 scanout;               /* 0 */
+    u32 flags;                 /* VSYNC 1, FIRST 16 (new source), IDLE 32 (stops) */
+    u32 refresh_mhz;           /* the measured refresh */
+    u64 sent_ns;               /* host CLOCK_MONOTONIC when sent */
+    u64 seq;                   /* vblanks sent since FIRST */
+    u32 lost;                  /* events dropped since the previous one */
+    u32 reserved;
+    u64 reserved2;
+    u64 present_ns;            /* the sample: the vblank this event stands for */
+    u64 msc;                   /* 0 */
+};
+```
+
+The events come from the backend. Every `EV_PRESENTED` report with the `VSYNC`
+kind feeds a per-client vblank lattice (`device::vblank_clock`): a phase-locked
+loop over the compositor's page-flip timestamps, with the refresh from
+`EV_SURFACE` as the nominal period. The loop locks after 8 consistent reports
+and holds for 10 s after the last one.
+
+The pacer thread (`nvgpu-vblank`) follows one client. A fullscreen client with
+a locked lattice wins; otherwise the client that reported last. The thread
+sleeps until that client's next vblank, minus `CONDUIT_VBLANK_LEAD_US`
+(default 0), using an absolute `clock_nanosleep` with 1 ns timer slack. It then
+puts the event into a posted event buffer, or drops it when no buffer is posted.
+
+There are no events when:
+- there is no display client, or only a stream host;
+- the compositor reports no vsync-synchronised presentations (tearing or direct mode);
+- the last report is older than the hold.
+
+When the stream stops, one `IDLE` event says so. A change of source starts
+again with `FIRST`.
+
+The guest delivers its `CRTC_VSYNC` from each event as it arrives (the DPC,
+after the transport lock). It keeps its own timer half a period off the host's
+phase, so the timer delivers nothing between events and fills in when one is
+missing. This gives the guest's vsync the host's phase and rate, with the
+precision of the host's timer plus the interrupt path, and no beat against the
+host display.
+
+Game presents are not affected: immediate flips never wait for a vsync
+(guest/windows/docs/independent-flip.md 13.10). Counters: guest `Hv*`
+(`HvRecv`, `HvVs`, `HvVsSkip`, `HvTkSkip`, `HvGap2`, `HvJit0..5`, the jitter of
+host-driven vsyncs against the period); backend `host_vblank_counts`.
 
 ### Mode policy with several clients
 

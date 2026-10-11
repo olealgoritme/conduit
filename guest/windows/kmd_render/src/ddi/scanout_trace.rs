@@ -1044,6 +1044,7 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     // The independent-flip census (`Idf*` of `ddi/indep_flip.rs`), when a count moved.
     crate::ddi::indep_flip::publish();
     crate::ddi::host_flip_done::publish();
+    crate::ddi::host_vblank::publish();
     // The hardware cursor (`Cur*` of `ddi/hw_cursor.rs`), when a count moved.
     crate::ddi::hw_cursor::publish();
 

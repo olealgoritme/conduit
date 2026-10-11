@@ -1,8 +1,11 @@
 # Host-feedback display pacing (`HostVblank`)
 
-Status: DESIGN ONLY. Nothing here is wired into the driver, built for the WDK or run. The pure half is
-`kmd_logic/src/host_vblank.rs` (host-tested, `cargo test host_vblank`, see "Verified here"); the host half is a list of requirements
-for the session that owns `host/` (section 6). Branch `kmd/host-vblank-design`, written against v325 (`0221f5f`).
+Status: the per-vblank mode is built (405.49+; `docs/SCANOUT.md` "Host vblank" is the reference). The host fits the vblank
+lattice itself and sends one `HostVblank` per host vblank. The KMD delivers its vsync from each one
+(`kmd_render/src/ddi/host_vblank.rs`, rules in `kmd_logic::host_vblank` "the per-vblank mode"). The rest of this document
+is the sparse-event design with a guest PLL (`kmd_logic::host_vblank::Pll`, tested, not wired). The per-vblank mode replaced
+it for two reasons. A Windows timer fires only on the 0.5 ms clock tick, so a guest PLL would still put its vsync up to
+0.5 ms late (measured: half the ticks 250-500 us late). Host timers and the interrupt path are an order of magnitude tighter.
 
 The goal: let the guest's vblank (`DXGK_INTERRUPT_CRTC_VSYNC`) follow when the host viewer REALLY presented a frame,
 so DWM and applications pace to the true scanout instead of to a free-running timer that beats against it.

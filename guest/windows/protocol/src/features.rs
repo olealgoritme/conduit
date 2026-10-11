@@ -54,11 +54,18 @@ pub const NVGPU_F_TAKES_INPUT: u64 = 1 << 12;
 /// release") is the KMD's use of it.
 pub const NVGPU_F_SCANOUT_RELEASE: u64 = 1 << 15;
 /// `NVGPU_F_SCANOUT_PRESENTED` (virtio feature bit 19; config `features` bit 19 stays
-/// unused, bit 17 is kept for the host vblank proposal). The host offers it whenever it has
+/// unused). The host offers it whenever it has
 /// a display. A guest that acks it gets `MsgType::ScanoutPresented` (33) on the event queue
 /// when a display client reports that a flip reached the screen. The KMD acks it only under
 /// its `FlipDoneFromHost` knob (`kmd_logic::flip_done`, `docs/independent-flip.md` section 13).
 pub const NVGPU_F_SCANOUT_PRESENTED: u64 = 1 << 19;
+/// `NVGPU_F_HOST_VBLANK` (virtio feature bit 17; config `features` bit 17 stays unused). The
+/// host offers it whenever it has a display. A guest that acks it gets `MsgType::HostVblank`
+/// (32) on the event queue at each host display vblank while a display client's presentation
+/// reports keep the host's vblank lattice fitted. The KMD acks it with the display half under
+/// its `HostVblank` knob (default 1) and delivers its vsync from them
+/// (`kmd_logic::host_vblank`, the per-vblank mode).
+pub const NVGPU_F_HOST_VBLANK: u64 = 1 << 17;
 /// `NVGPU_F_MODE_LIST` (virtio feature bit 21; config `features` bit 21 stays unused).
 /// The host offers it whenever it has a display. A guest that acks it gets
 /// `MsgType::DisplayModeList` (34) on the event queue: the virtual monitor's whole mode
@@ -79,10 +86,14 @@ pub const EVENT_READY_PER_BUFFER_MAX: usize = 32;
 /// Conduit device features this driver acks when the device offers them (and, for
 /// `NVGPU_F_SCANOUT_RELEASE`, when the display half is on; for
 /// `NVGPU_F_SCANOUT_PRESENTED`, when also `FlipDoneFromHost` is set; for
-/// `NVGPU_F_MODE_LIST`, with the display half; `NVGPU_F_EVENT_PACKED` always): the
-/// optional set, besides `VIRTIO_F_VERSION_1`.
-pub const CONDUIT_OPTIONAL_FEATURES: u64 =
-    NVGPU_F_SCANOUT_RELEASE | NVGPU_F_SCANOUT_PRESENTED | NVGPU_F_MODE_LIST | NVGPU_F_EVENT_PACKED;
+/// `NVGPU_F_MODE_LIST`, with the display half; for `NVGPU_F_HOST_VBLANK`, with the display
+/// half and `HostVblank`; `NVGPU_F_EVENT_PACKED` always): the optional set, besides
+/// `VIRTIO_F_VERSION_1`.
+pub const CONDUIT_OPTIONAL_FEATURES: u64 = NVGPU_F_SCANOUT_RELEASE
+    | NVGPU_F_SCANOUT_PRESENTED
+    | NVGPU_F_MODE_LIST
+    | NVGPU_F_EVENT_PACKED
+    | NVGPU_F_HOST_VBLANK;
 
 const _: () = assert!(CONDUIT_OPTIONAL_FEATURES & NVGPU_F_TAKES_INPUT == 0);
 

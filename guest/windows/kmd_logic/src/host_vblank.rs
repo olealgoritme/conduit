@@ -1,4 +1,15 @@
-//! Host-feedback display pacing: the pure half. DESIGN SCAFFOLDING, wired into nothing.
+//! Host-feedback display pacing: the pure half.
+//!
+//! WHAT IS WIRED (405.49+, `kmd_render/src/ddi/host_vblank.rs`): the per-vblank mode. The host
+//! backend fits the display's vblank lattice itself (`device::vblank_clock`, from the viewer's
+//! presentation reports) and sends one `HostVblank` per host vblank, with one sample (the vblank's
+//! instant) and the measured refresh. The KMD delivers a `CRTC_VSYNC` from each event as it
+//! arrives ([`delivers`]) and keeps its own timer half a period off the host's phase
+//! ([`rephase`]): the timer keeps ticking (its other periodic duties stay), delivers nothing
+//! between host events, and fills in when the host goes quiet ([`tick_delivers`]). The guest's vsync then has the host's phase and rate, its precision is the
+//! host's timer plus the interrupt path (no 0.5 ms clock-tick quantisation of a guest timer), and
+//! no guest filter is needed. The [`Pll`] below (the sparse-event design of
+//! `docs/host-vblank-pacing.md`) is not used by that path.
 //!
 //! Spec: `docs/host-vblank-pacing.md`. Today the KMD makes `DXGK_INTERRUPT_CRTC_VSYNC` from a
 //! one-shot timer (`vsync_deadline`, `adapter/kobj.rs` `service_vsync_tick`) that knows nothing
@@ -913,6 +924,110 @@ pub const fn scan_position(
 
 // ---- knobs and counters --------------------------------------------------------------
 
+// ---- the per-vblank mode (wired) ------------------------------------------------------
+
+/// `HostVblank` when the value is absent: 1 (ack the feature; follow the host's vblanks while it
+/// sends them). 0: the feature is not acked and the host sends nothing.
+pub const KNOB_DEFAULT: u32 = 1;
+
+/// Whether a host vblank event at `now` delivers a `CRTC_VSYNC`: unless one (from either source)
+/// went out less than half a period ago.
+pub const fn delivers(now: u64, last_vsync: u64, period: u64) -> bool {
+    last_vsync == 0 || now < last_vsync || now - last_vsync >= period / 2
+}
+
+/// The timer deadline a host vblank event at `at` asks for: half a period after it, so the
+/// timer's ticks fall between the host's vblanks (where [`tick_delivers`] says no while events
+/// flow, and yes half a period after a missing one). `None` when the armed `deadline` already has
+/// that phase to within an eighth of a period (the steady state: no re-arm per event), or the
+/// timer is not armed (`deadline` 0).
+pub const fn rephase(at: u64, deadline: u64, period: u64) -> Option<u64> {
+    if deadline == 0 || period == 0 {
+        return None;
+    }
+    let target = at.saturating_add(period / 2);
+    let d = if deadline >= target {
+        (deadline - target) % period
+    } else {
+        (target - deadline) % period
+    };
+    let dist = if d > period - d { period - d } else { d };
+    if dist <= period / 8 {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// Whether the timer's tick at `now` delivers: unless a host event did less than three quarters
+/// of a period ago (a tick racing an event that just re-armed it).
+pub const fn tick_delivers(now: u64, last_host: u64, period: u64) -> bool {
+    last_host == 0 || now < last_host || now - last_host >= period * 3 / 4
+}
+
+/// The period the events pace at: the host's (from the event's refresh) when it is known and
+/// within 50% of the mode's, else the mode's.
+pub const fn event_period(mode_period: u64, refresh_mhz: u32) -> u64 {
+    if refresh_mhz == 0 {
+        return mode_period;
+    }
+    let host = vsync_deadline::period_100ns(refresh_mhz);
+    if host == 0 || mode_period == 0 {
+        return mode_period;
+    }
+    if host * 2 < mode_period || host > mode_period * 2 {
+        mode_period
+    } else {
+        host
+    }
+}
+
+/// Edges of the host-vsync jitter histogram (`HvJit0..5`), microseconds of `|gap - period|`
+/// between two consecutive host-delivered vsyncs.
+pub const JIT_EDGES_US: [u32; 5] = [50, 100, 250, 500, 1_000];
+
+/// The jitter bucket of the gap between two host-delivered vsyncs, or `None` for a gap of a
+/// period and a half or more (a missing host vblank, `HvGap2`) or no previous one.
+pub const fn jitter_bucket(gap: u64, period: u64) -> Option<usize> {
+    if gap == 0 || period == 0 || gap >= period + period / 2 {
+        return None;
+    }
+    let d = if gap > period {
+        gap - period
+    } else {
+        period - gap
+    };
+    let us = d / 10;
+    let mut i = 0;
+    while i < JIT_EDGES_US.len() {
+        if us < JIT_EDGES_US[i] as u64 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    Some(JIT_EDGES_US.len())
+}
+
+/// The counters the per-vblank mode writes (`kmd_render/src/ddi/host_vblank.rs`).
+pub const PACE_COUNTERS: [&str; 16] = [
+    "HvKnob",
+    "HvAck",
+    "HvRecv",
+    "HvBad",
+    "HvIdle",
+    "HvVs",
+    "HvVsSkip",
+    "HvTkSkip",
+    "HvRephase",
+    "HvGap2",
+    "HvJit0",
+    "HvJit1",
+    "HvJit2",
+    "HvJit3",
+    "HvJit4",
+    "HvJit5",
+];
+
 /// Registry knobs (service key, REG_DWORD; read at StartDevice at PASSIVE, mirrored on every read,
 /// 0 included, as `docs/zero-copy-present.md` 13.8 requires).
 pub const KNOBS: [&str; 3] = ["HostVblank", "HostVblLeadUs", "HostVblHoldMs"];
@@ -1210,6 +1325,10 @@ mod tests {
             if let Some(rest) = line.trim().strip_prefix("pub const ") {
                 if let Some((_, shift)) = rest.split_once("= 1 << ") {
                     let n: u32 = shift.trim_end_matches(';').trim().parse().unwrap();
+                    if rest.starts_with("NVGPU_F_HOST_VBLANK:") {
+                        assert_eq!(n, FEATURE_BIT, "{line}");
+                        continue;
+                    }
                     assert_ne!(n, FEATURE_BIT, "{line} already uses bit {FEATURE_BIT}");
                     seen += 1;
                 }
@@ -2333,7 +2452,11 @@ mod tests {
 
     #[test]
     fn counter_names_fit_are_unique_and_collide_with_nothing_else() {
-        let mut names: Vec<std::string::String> = COUNTERS.iter().map(|s| (*s).into()).collect();
+        let mut names: Vec<std::string::String> = COUNTERS
+            .iter()
+            .chain(PACE_COUNTERS.iter().filter(|n| !COUNTERS.contains(n)))
+            .map(|s| (*s).into())
+            .collect();
         for n in &names {
             assert!(n.len() <= 14, "{n} is longer than 14");
             assert!(n.chars().all(|c| c.is_ascii_alphanumeric()), "{n}");
@@ -2342,6 +2465,7 @@ mod tests {
         for k in KNOBS {
             // A knob and a mirror are different names (the knob is a service-key value too).
             assert!(!COUNTERS.contains(&k), "{k} is also a counter");
+            assert!(!PACE_COUNTERS.contains(&k), "{k} is also a counter");
         }
         names.sort();
         let before = names.len();
@@ -2355,6 +2479,10 @@ mod tests {
         }
         for other in crate::stall_diag::COUNTERS {
             assert!(!COUNTERS.contains(&other), "{other} collides");
+            assert!(!PACE_COUNTERS.contains(&other), "{other} collides");
+        }
+        for other in crate::immediate_flip::COUNTERS {
+            assert!(!PACE_COUNTERS.contains(&other), "{other} collides");
         }
         // Nothing in the driver writes or reads a name starting with `Hv` or a knob of ours until
         // the wiring adds its writer (`host_vblank.rs`, which then owns the prefix): a literal in
@@ -2399,5 +2527,78 @@ mod tests {
             }
         }
         assert!(checked > 20);
+    }
+
+    // ---- the per-vblank mode -----------------------------------------------------------
+
+    #[test]
+    fn an_event_delivers_unless_a_vsync_went_out_within_half_a_period() {
+        assert!(delivers(1_000_000, 0, P240));
+        assert!(delivers(1_000_000, 1_000_000 - P240 / 2, P240));
+        assert!(!delivers(1_000_000, 1_000_000 - P240 / 2 + 1, P240));
+        assert!(
+            delivers(5, 10, P240),
+            "a clock that went back never suppresses"
+        );
+    }
+
+    #[test]
+    fn the_timer_ticks_between_events_and_only_fills_in_for_a_missing_one() {
+        // The first event moves an arbitrary phase to half a period after it; later events on
+        // the same lattice ask for nothing (no re-arm per event).
+        let t0 = 10_000_000u64;
+        let first = rephase(t0, t0 + 100, P240).unwrap();
+        assert_eq!(first, t0 + P240 / 2);
+        let mut deadline = first;
+        let mut last_vsync = t0;
+        for k in 1..100u64 {
+            let ev = t0 + k * P240;
+            // The tick between two events delivers nothing.
+            assert!(!tick_delivers(deadline, ev - P240, P240));
+            deadline += P240;
+            assert!(delivers(ev, last_vsync, P240));
+            last_vsync = ev;
+            assert_eq!(rephase(ev, deadline, P240), None, "steady state");
+        }
+        // One event missing: the tick half a period after it should have come delivers, and the
+        // next event (half a period later) delivers too.
+        let last_host = t0 + 99 * P240;
+        let tick = last_host + P240 + P240 / 2;
+        assert!(tick_delivers(tick, last_host, P240));
+        assert!(delivers(last_host + 2 * P240, tick, P240));
+        // A tick racing an event that just came: nothing.
+        assert!(!tick_delivers(last_host + 10, last_host, P240));
+        assert_eq!(rephase(t0, 0, P240), None, "not armed");
+    }
+
+    #[test]
+    fn the_event_period_is_the_hosts_when_it_is_sane() {
+        assert_eq!(event_period(P240, 0), P240);
+        assert_eq!(
+            event_period(P240, 239_960),
+            vsync_deadline::period_100ns(239_960)
+        );
+        assert_eq!(
+            event_period(P240, 144_000),
+            vsync_deadline::period_100ns(144_000)
+        );
+        assert_eq!(
+            event_period(P240, 60_000),
+            P240,
+            "more than 2x off: the mode's"
+        );
+        assert_eq!(event_period(P240, 1_000_000), P240);
+    }
+
+    #[test]
+    fn jitter_buckets() {
+        assert_eq!(jitter_bucket(P240, P240), Some(0));
+        assert_eq!(jitter_bucket(P240 + 400, P240), Some(0), "40 us");
+        assert_eq!(jitter_bucket(P240 - 700, P240), Some(1), "70 us");
+        assert_eq!(jitter_bucket(P240 + 3_000, P240), Some(3), "300 us");
+        assert_eq!(jitter_bucket(P240 + 15_000, P240), Some(5), "1.5 ms");
+        assert_eq!(jitter_bucket(2 * P240, P240), None, "a missing vblank");
+        assert_eq!(jitter_bucket(0, P240), None);
+        assert_eq!(PACE_COUNTERS.len(), 10 + JIT_EDGES_US.len() + 1);
     }
 }

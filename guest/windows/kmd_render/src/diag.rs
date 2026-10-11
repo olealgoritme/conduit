@@ -1562,6 +1562,11 @@ pub mod knobs {
     /// report `FlipImmediateMmIo` so dxgkrnl issues them as such (bit 2); 0 is the old behaviour.
     /// `helios_kmd_logic::immediate_flip`. Read at every AddAdapter/StartDevice.
     pub const IMM_FLIP: KnobName = KnobName::new(b"ImmFlip");
+    /// `HostVblank` (default 1, `helios_kmd_logic::host_vblank::KNOB_DEFAULT`): ack the host's
+    /// vblank events (`NVGPU_F_HOST_VBLANK`) and deliver the vsync from each one as it arrives,
+    /// the timer only filling in when the host is quiet; 0: not acked, the timer alone. Read at
+    /// AddDevice/StartDevice.
+    pub const HOST_VBLANK: KnobName = KnobName::new(b"HostVblank");
     /// `FlipLat` (default 1 = on, 0 = off): the flip retire latency / inter-flip interval /
     /// vblank utilisation measurement (`FlipLat*`, `IfGap*`, `FlipP99Us`, `VbUsed`,
     /// `VsLate*`): atomics in the DDI and the tick, mirrored once a second. Read at every

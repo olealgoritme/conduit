@@ -2533,6 +2533,9 @@ pub struct VirtioGpu {
     /// AND the event queue is up: `ScanoutPresented` messages go to `ddi::host_flip_done`.
     /// Fixed for the transport's life.
     scanout_presented: bool,
+    /// The host vblank events (`NVGPU_F_HOST_VBLANK`, `HostVblank`) were acked AND the event queue
+    /// is up: `HostVblank` messages go to `ddi::host_vblank`. Fixed for the transport's life.
+    host_vblank: bool,
     /// The host's mode list (`NVGPU_F_MODE_LIST`) was acked AND the event queue is up:
     /// `DisplayModeList` messages go to `ddi::mode_list`. Fixed for the transport's life.
     mode_list: bool,
@@ -2911,6 +2914,7 @@ impl VirtioGpu {
         msi_granted: u32,
         scanout_release: bool,
         scanout_presented: bool,
+        host_vblank: bool,
         cursor_queue: bool,
     ) -> Result<Box<Self>, VirtioError> {
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
@@ -2966,6 +2970,10 @@ impl VirtioGpu {
                     helios_protocol::NVGPU_F_SCANOUT_PRESENTED
                 } else {
                     0
+                }) | (if host_vblank {
+                    helios_protocol::NVGPU_F_HOST_VBLANK
+                } else {
+                    0
                 }) | (if scanout_release {
                     // The mode list, like the release event, only with the display half.
                     helios_protocol::NVGPU_F_MODE_LIST
@@ -2978,6 +2986,7 @@ impl VirtioGpu {
         let scanout_release_acked = accepted & helios_protocol::NVGPU_F_SCANOUT_RELEASE != 0;
         let scanout_presented_acked =
             accepted & helios_protocol::NVGPU_F_SCANOUT_PRESENTED != 0;
+        let host_vblank_acked = accepted & helios_protocol::NVGPU_F_HOST_VBLANK != 0;
         // 1 when the host's buffer-release event was acked, 0 when not offered / not wanted.
         crate::diag::record_named_bytes(b"RelAck", u32::from(scanout_release_acked));
         // 1 when the host's mode list was acked.
@@ -3274,6 +3283,8 @@ impl VirtioGpu {
         let mode_list_on = mode_list_acked && nvrm_event_ring.is_some();
         // Likewise the presentation feedback (`FdhAck` says whether it is live).
         let scanout_presented_on = scanout_presented_acked && nvrm_event_ring.is_some();
+        // Likewise the host vblank events (`HvAck` says whether they are live).
+        let host_vblank_on = host_vblank_acked && nvrm_event_ring.is_some();
         if scanout_release_acked && !scanout_release_on {
             crate::diag::record_named_bytes(b"RelNoQ", 1);
         }
@@ -3303,6 +3314,7 @@ impl VirtioGpu {
             cfg_features,
             scanout_release: scanout_release_on,
             scanout_presented: scanout_presented_on,
+            host_vblank: host_vblank_on,
             mode_list: mode_list_on,
             event_packed: event_packed_acked,
             nvrm_handles: Vec::with_capacity(nvrm_limits.handle_bounds.initial),

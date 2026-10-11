@@ -131,7 +131,11 @@ const _: () = {
                 | helios_protocol::NVGPU_F_SCANOUT_PRESENTED
                 | helios_protocol::NVGPU_F_MODE_LIST
                 | helios_protocol::NVGPU_F_EVENT_PACKED
+                | helios_protocol::NVGPU_F_HOST_VBLANK
     );
+    assert!(helios_protocol::NVGPU_F_HOST_VBLANK == helios_kmd_logic::host_vblank::FEATURE);
+    assert!(helios_kmd_logic::host_vblank::MSG_HOST_VBLANK == 32);
+    assert!(EVENT_BUF_BYTES >= helios_kmd_logic::host_vblank::MAX_MSG_BYTES);
     // Packed `EventReady`: the parser's constants are the ABI's, and a buffer holds the most
     // the host packs.
     assert!(helios_protocol::NVGPU_F_EVENT_PACKED == helios_kmd_logic::event_ready::FEATURE);
@@ -238,6 +242,8 @@ enum Taken {
     Released(Released),
     /// `ScanoutPresented` (message 33), whole.
     Presented(Presented),
+    /// `HostVblank` (message 32), parsed.
+    HostVblank(helios_kmd_logic::host_vblank::Event),
     /// `DisplayModeList` (message 34), parsed.
     ModeList(helios_kmd_logic::mode_list::HostList),
     /// `DisplayMode` (message 23): the size the host's viewer asks for, packed.
@@ -307,6 +313,16 @@ fn take_event(ring: &mut EventRing, packed: bool) -> Taken {
                 match helios_kmd_logic::mode_list::parse_display_mode(bytes, len) {
                     Some(p) => Taken::HostMode(p),
                     None => Taken::Other,
+                }
+            }
+            (true, Some(helios_kmd_logic::host_vblank::MSG_HOST_VBLANK), _, _) => {
+                match helios_kmd_logic::host_vblank::parse(bytes, len) {
+                    helios_kmd_logic::host_vblank::Parsed::Event(e) => Taken::HostVblank(e),
+                    // Short, another version, a bad count: counted `HvBad`, then dropped.
+                    _ => {
+                        crate::ddi::host_vblank::note_bad();
+                        Taken::Other
+                    }
                 }
             }
             (true, Some(MSG_SCANOUT_PRESENTED), _, _) => match parse_presented(bytes, len) {
@@ -414,6 +430,11 @@ impl VirtioGpu {
     /// acked and the queue that carries it is up. Fixed for this transport.
     pub fn scanout_presented_on(&self) -> bool {
         self.scanout_presented
+    }
+
+    /// The host vblank events (`NVGPU_F_HOST_VBLANK`) were acked and the event queue is up.
+    pub fn host_vblank_on(&self) -> bool {
+        self.host_vblank
     }
 
     /// Whether the host's buffer-release event (`NVGPU_F_SCANOUT_RELEASE`) was acked and
@@ -731,6 +752,16 @@ impl VirtioGpu {
                         crate::ddi::host_flip_done::on_event(&p);
                     } else {
                         crate::ddi::host_flip_done::note_unasked();
+                        NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Taken::HostVblank(e) => {
+                    // No kick, as for a presentation report: one per host vblank, and the host
+                    // drops an event that finds no buffer (the timer fills in).
+                    if self.host_vblank {
+                        crate::ddi::host_vblank::on_event(&e);
+                    } else {
+                        crate::ddi::host_vblank::note_unasked();
                         NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
                     }
                 }

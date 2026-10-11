@@ -1000,7 +1000,11 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         tick_time_100ns,
         adapter.vsync_period_100ns(),
     );
-    if plan.deliver {
+    // `HostVblank`: no delivery within three quarters of a period of a host-driven vsync (the
+    // timer only fills in when the host is quiet).
+    if plan.deliver
+        && crate::ddi::host_vblank::tick_delivers(tick_time_100ns, adapter.vsync_period_100ns())
+    {
         deliver_tick_vsync(adapter, plan.address, tick_time_100ns);
     }
     // SetVidPnSourceAddress may run inside the synchronized MMIO-flip callback
@@ -1082,6 +1086,7 @@ fn deliver_tick_vsync(adapter: &AdapterContext, phys: u64, tick_time_100ns: u64)
             );
         }
         crate::ddi::host_flip_done::note_tick_delivered(tick_time_100ns);
+        crate::ddi::host_vblank::note_tick_delivered(tick_time_100ns);
     }
 }
 
