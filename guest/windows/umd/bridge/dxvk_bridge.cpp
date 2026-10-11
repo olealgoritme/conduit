@@ -303,22 +303,43 @@ struct ScanoutFormat {
   }
 };
 
+// The process timer request held for the device's lifetime (`UmdTimerRes`):
+// 0 = none, 1 = timeBeginPeriod(1), larger = NtSetTimerResolution(value) in
+// 100 ns units (5000 = 0.5 ms). The first device logs the resolution in force
+// (NtQueryTimerResolution) so a run's log says what its Sleep(1) costs.
 class TimerResolution {
+  using PfnSetRes   = LONG (NTAPI*)(ULONG, BOOLEAN, PULONG);
+  using PfnQueryRes = LONG (NTAPI*)(PULONG, PULONG, PULONG);
+
 public:
-  explicit TimerResolution(bool enabled) noexcept {
-    if (enabled) {
+  explicit TimerResolution(std::uint32_t request) noexcept : request(request) {
+    if (request == 1u) {
       const auto result = timeBeginPeriod(1);
       active = result == TIMERR_NOERROR;
       if (!active)
         record_failure("timeBeginPeriod", result);
+    } else if (request > 1u) {
+      if (auto set = nt_set()) {
+        ULONG actual = 0;
+        const LONG status = set(request, TRUE, &actual);
+        active = status >= 0;
+        if (!active)
+          record_failure("NtSetTimerResolution", static_cast<MMRESULT>(status));
+      }
     }
+    log_once();
   }
 
   ~TimerResolution() {
-    if (active) {
+    if (!active)
+      return;
+    if (request == 1u) {
       const auto result = timeEndPeriod(1);
       if (result != TIMERR_NOERROR)
         record_failure("timeEndPeriod", result);
+    } else if (auto set = nt_set()) {
+      ULONG actual = 0;
+      set(request, FALSE, &actual);
     }
   }
 
@@ -326,7 +347,32 @@ public:
   TimerResolution& operator=(const TimerResolution&) = delete;
 
 private:
+  std::uint32_t request = 0;
   bool active = false;
+
+  static FARPROC ntdll_proc(const char* name) noexcept {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll ? GetProcAddress(ntdll, name) : nullptr;
+  }
+
+  static PfnSetRes nt_set() noexcept {
+    return reinterpret_cast<PfnSetRes>(reinterpret_cast<void*>(ntdll_proc("NtSetTimerResolution")));
+  }
+
+  void log_once() const noexcept {
+    static std::atomic<bool> logged { false };
+    if (logged.exchange(true))
+      return;
+    auto query = reinterpret_cast<PfnQueryRes>(reinterpret_cast<void*>(ntdll_proc("NtQueryTimerResolution")));
+    ULONG coarsest = 0, finest = 0, current = 0;
+    if (!query || query(&coarsest, &finest, &current) < 0)
+      return;
+    char message[192];
+    std::snprintf(message, sizeof(message),
+      "timer-resolution: UmdTimerRes=%u held=%d current=%lu us (coarsest %lu us, finest %lu us)",
+      unsigned(request), int(active), current / 10ul, coarsest / 10ul, finest / 10ul);
+    umd_log(message);
+  }
 
   static void record_failure(const char* operation, MMRESULT result) noexcept {
     static std::atomic<std::uint32_t> failures { 0 };
@@ -339,7 +385,7 @@ private:
 };
 
 struct HeliosDxvkDeviceImpl {
-  explicit HeliosDxvkDeviceImpl(bool timer_enabled) : timer_resolution(timer_enabled) { }
+  explicit HeliosDxvkDeviceImpl(std::uint32_t timer_request) : timer_resolution(timer_request) { }
 
   // Declared first so the request outlives all DXVK workers, including failed initialization.
   TimerResolution timer_resolution;
@@ -3620,7 +3666,7 @@ std::unique_ptr<HeliosDxvkDevice> run_with_stack(F&& fn) {
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high,
-    bool timer_resolution) {
+    std::uint32_t timer_resolution) {
   // R824: configuration delivered as a process-global side effect. One process
   // (dwm) creates several D3D11 devices, so the environment is written once per
   // backend, before that backend's first instance (configure_dxvk_env_once).

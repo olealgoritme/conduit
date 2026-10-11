@@ -401,7 +401,7 @@ mod ffi {
         fn helios_dxvk_create_device(
             luid_low: u32,
             luid_high: i32,
-            timer_resolution: bool,
+            timer_resolution: u32,
         ) -> UniquePtr<HeliosDxvkDevice>;
     }
 }
