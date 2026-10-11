@@ -44,6 +44,8 @@
 //     size=WxH    swap chain (and borderless window) size (default: the output's current mode)
 //     setmode=WxH ChangeDisplaySettingsEx the output to WxH first (CDS_FULLSCREEN, as SDL's
 //                 exclusive full screen does), restored at the end; the window then covers it
+//     counter     clear every frame to a colour encoding its index (R bits 0..7, G 8..15, B 16..23,
+//                 A 255) for the host's CONDUIT_FRAME_PROBE (B8G8R8A8 back buffers)
 //     modes       log the output's DXGI mode list (B8G8R8A8) and the closest match to size=
 //     fps=N       cap the frame rate at N (absolute QPC deadlines, yield then spin); default
 //                 uncapped. With fps=200 / fps=300 on a 240 Hz mode it is the pacing test row.
@@ -164,7 +166,7 @@ int main(int argc, char** argv) {
   }
   int seconds = 20;
   double fpsCap = 0.0;
-  bool exclusive = false, listModes = false;
+  bool exclusive = false, listModes = false, counter = false;
   UINT reqW = 0, reqH = 0, setW = 0, setH = 0;
   bool windowed = false, interval0 = false, tearing = false, rgba = false;
   int buffers = 2, adapterIndex = -1;
@@ -190,6 +192,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "size=", 5)) sscanf(a + 5, "%ux%u", &reqW, &reqH);
     else if (!strncmp(a, "setmode=", 8)) sscanf(a + 8, "%ux%u", &setW, &setH);
     else if (!strcmp(a, "modes")) listModes = true;
+    else if (!strcmp(a, "counter")) counter = true;
     else L("unknown option %s", a);
   }
   if (buffers < 2) buffers = 2;
@@ -451,6 +454,13 @@ int main(int argc, char** argv) {
     // A moving color so a frozen (kept) picture is visible at a glance.
     float c[4] = {0.5f + 0.5f * (float)__builtin_sin(t * 3.0), 0.2f,
                   0.5f + 0.5f * (float)__builtin_cos(t * 2.0), 1.0f};
+    if (counter) {
+      unsigned idx = frames & 0xFFFFFFu;
+      c[0] = (float)(idx & 0xFF) / 255.0f;
+      c[1] = (float)((idx >> 8) & 0xFF) / 255.0f;
+      c[2] = (float)((idx >> 16) & 0xFF) / 255.0f;
+      c[3] = 1.0f;
+    }
     // FLIP_DISCARD: the render target must be rebound to the current buffer every frame.
     ctx->OMSetRenderTargets(1, &rtv, nullptr);
     ctx->ClearRenderTargetView(rtv, c);

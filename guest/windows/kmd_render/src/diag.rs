@@ -1556,7 +1556,8 @@ pub mod knobs {
     /// an announce the retire still waits for the worker's publication (one tick earlier on
     /// average). Read at every StartDevice.
     pub const FLIP_EARLY_WAKE: KnobName = KnobName::new(b"FlipEarlyWake");
-    /// `ImmFlip` (default 7): immediate (tearing) flips are sent to the host without the
+    /// `ImmFlip` (default 15; bit 3: a promoted swap chain's flips count as immediate whatever
+    /// dxgkrnl asked, `immediate_flip::IFLIP_NOW`): immediate (tearing) flips are sent to the host without the
     /// `ForeignFlip` presenter's minimum interval (bit 0), retired by a `CRTC_VSYNC` reported as
     /// soon as their address is published, not by the next vsync tick (bit 1), and the flip caps
     /// report `FlipImmediateMmIo` so dxgkrnl issues them as such (bit 2); 0 is the old behaviour.

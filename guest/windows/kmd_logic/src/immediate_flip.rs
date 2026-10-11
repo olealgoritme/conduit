@@ -39,10 +39,30 @@ pub const COMPLETE_NOW: u32 = 1 << 1;
 /// application may reuse the previous buffer while the host still shows it: the tear
 /// `ALLOW_TEARING` asks for. Flips with a sync interval are untouched.
 pub const ADVERTISE_MMIO: u32 = 1 << 2;
-/// The knob when absent: all three.
-pub const DEFAULT_KNOB: u32 = NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO;
+/// Bit 3: a flip of a PROMOTED swap chain (`SetVidPnSourceAddress` with
+/// `IndependentFlipExclusive`) counts as immediate even when dxgkrnl asked for `FlipOnNextVSync`.
+/// dxgkrnl issues a promoted application's interval-0 presents that way when they do not carry
+/// `ALLOW_TEARING` (CS2 on 405.50: `Hardware: Independent Flip`, sync interval 0, every flip
+/// `FlipOnNextVSync`), and retires them only on this driver's synthetic vsync heartbeat, so it
+/// coalesced the application's 207 presents per second into about 130 flips at irregular one- and
+/// two-vblank spacing. The vblank is ours to define: a promoted flip is shown when the host gets
+/// it, so it is retired then and dxgkrnl issues the next one at once. DWM's own composition is
+/// never `IndependentFlipExclusive` and keeps the heartbeat. The cost: a promoted application
+/// with V-sync ON is no longer held to the refresh by the flip queue (it runs at its render
+/// rate; the host shows the newest frame).
+pub const IFLIP_NOW: u32 = 1 << 3;
+/// The knob when absent: all four.
+pub const DEFAULT_KNOB: u32 = NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO | IFLIP_NOW;
 /// The bits this version knows; others are ignored.
-pub const KNOWN: u32 = NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO;
+pub const KNOWN: u32 = NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO | IFLIP_NOW;
+/// `DXGK_SETVIDPNSOURCEADDRESS_FLAGS.IndependentFlipExclusive` (bit 7; `flip_flags`).
+pub const SVSA_INDEPENDENT_FLIP_EXCLUSIVE: u32 = crate::flip_flags::SPA_INDEPENDENT_FLIP_EXCLUSIVE;
+/// An immediate frame still waits this fraction of the paced interval after the previous host
+/// flip (the paced interval is 3/4 of a period: a quarter period, about 1 ms at 240 Hz). A host
+/// flip per application frame at thousands per second flooded the viewer's Wayland connection
+/// (405.50, about 7000 flips per second from an uncapped full-screen application: the viewer
+/// lost its display); several flips per refresh are all a viewer can use.
+pub const IMMEDIATE_INTERVAL_DIVISOR: u64 = 3;
 /// `DXGK_FLIPCAPS.FlipImmediateMmIo` (bit 3).
 pub const FLIPCAPS_FLIP_IMMEDIATE_MMIO: u32 = 1 << 3;
 
@@ -98,7 +118,7 @@ pub const fn mmio_is_immediate(flags: u32) -> bool {
 /// or 0 for an immediate flip with [`NO_PACE`].
 pub const fn min_interval(paced_100ns: u64, immediate: bool, mode: u32) -> u64 {
     if immediate && mode & NO_PACE != 0 {
-        0
+        paced_100ns / IMMEDIATE_INTERVAL_DIVISOR
     } else {
         paced_100ns
     }
@@ -144,7 +164,9 @@ pub const fn completes_now(
 /// on it (per allocation, so a coalesced or re-armed slot keeps the right answer), under the
 /// knob.
 pub const fn programming_is_immediate(mode: u32, recorded_flags: u32) -> bool {
-    mode != 0 && mmio_is_immediate(recorded_flags)
+    mode != 0
+        && (mmio_is_immediate(recorded_flags)
+            || (mode & IFLIP_NOW != 0 && recorded_flags & SVSA_INDEPENDENT_FLIP_EXCLUSIVE != 0))
 }
 
 /// Whether the completion vsync is worth sending: the programming published a new address.
@@ -160,7 +182,10 @@ mod tests {
 
     #[test]
     fn the_default_is_all_three_and_zero_is_the_old_behaviour() {
-        assert_eq!(mode(DEFAULT_KNOB), NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO);
+        assert_eq!(
+            mode(DEFAULT_KNOB),
+            NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO | IFLIP_NOW
+        );
         assert_eq!(min_interval(31_250, true, mode(0)), 31_250);
         assert_eq!(
             completes_now(mode(0), true, true, false, 0x1000),
@@ -172,7 +197,10 @@ mod tests {
     #[test]
     fn only_immediate_flips_skip_the_pacing() {
         let m = mode(DEFAULT_KNOB);
-        assert_eq!(min_interval(31_250, true, m), 0);
+        assert_eq!(
+            min_interval(31_250, true, m),
+            31_250 / IMMEDIATE_INTERVAL_DIVISOR
+        );
         assert_eq!(
             min_interval(31_250, false, m),
             31_250,
@@ -249,6 +277,32 @@ mod tests {
         assert!(programming_is_immediate(DEFAULT_KNOB, SVSA_FLIP_IMMEDIATE));
         assert!(!programming_is_immediate(DEFAULT_KNOB, 0));
         assert!(!programming_is_immediate(0, SVSA_FLIP_IMMEDIATE));
+    }
+
+    #[test]
+    fn a_promoted_flip_is_immediate_with_bit_three_whatever_dxgkrnl_asked() {
+        let ife_vsync = SVSA_INDEPENDENT_FLIP_EXCLUSIVE | (1 << 2); // IFE | FlipOnNextVSync
+        assert!(programming_is_immediate(DEFAULT_KNOB, ife_vsync));
+        assert!(!programming_is_immediate(
+            NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO,
+            ife_vsync
+        ));
+        assert!(
+            !programming_is_immediate(DEFAULT_KNOB, 1 << 2),
+            "DWM: FlipOnNextVSync alone"
+        );
+        assert!(!programming_is_immediate(DEFAULT_KNOB, 0));
+    }
+
+    #[test]
+    fn immediate_host_sends_are_capped_at_a_fraction_of_the_period() {
+        let paced = 31_250; // 3/4 of a 240 Hz period
+        let m = mode(DEFAULT_KNOB);
+        assert_eq!(min_interval(paced, true, m), 10_416, "about 1 ms");
+        assert!(
+            min_interval(paced, true, m) > 0,
+            "never every application frame"
+        );
     }
 
     #[test]
