@@ -4000,7 +4000,11 @@ unsafe fn program_vidpn_source_inner(
     // record: no SET_SCANOUT_BLOB, no GPU copy, no dedicated image. Every other allocation
     // (and every allocation with the knob below 5, after one relaxed load) takes the Venus
     // path below, unchanged; a Venus source also withdraws a resident RM source.
-    if !smaller {
+    if smaller {
+        // Not the sysmem arm's (it needs the mode's extent): it lets go of the screen as for any
+        // source it does not own, before `ForeignFlip` below takes it.
+        crate::virtio::rm_client::sysmem_flip::other_source(adapter);
+    } else {
         use crate::virtio::rm_client::sysmem_flip::{self as rm_flip, Programmed};
         match rm_flip::program(
             adapter,
