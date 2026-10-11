@@ -30,10 +30,30 @@ pub const NO_PACE: u32 = 1 << 0;
 /// Bit 1: an immediate flip is retired by a `CRTC_VSYNC` reported as soon as its address is
 /// published, not by the next tick.
 pub const COMPLETE_NOW: u32 = 1 << 1;
-/// The knob when absent: both.
-pub const DEFAULT_KNOB: u32 = NO_PACE | COMPLETE_NOW;
+/// Bit 2: report `DXGK_FLIPCAPS.FlipImmediateMmIo`. Without it dxgkrnl turns a promoted
+/// application's tearing presents into `FlipOnNextVSync` MMIO flips (measured on 405.49: every
+/// `ALLOW_TEARING` interval-0 flip of an independent-flip swap chain carried `FlipOnNextVSync`, none
+/// `FlipImmediate`, so the application was held to the refresh). With it the flips arrive with
+/// `FlipImmediate` and take bits 0 and 1. The MMIO contract treats such a flip as done when
+/// `SetVidPnSourceAddress` returns; this driver programs it a moment later from the worker, so the
+/// application may reuse the previous buffer while the host still shows it: the tear
+/// `ALLOW_TEARING` asks for. Flips with a sync interval are untouched.
+pub const ADVERTISE_MMIO: u32 = 1 << 2;
+/// The knob when absent: all three.
+pub const DEFAULT_KNOB: u32 = NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO;
 /// The bits this version knows; others are ignored.
-pub const KNOWN: u32 = NO_PACE | COMPLETE_NOW;
+pub const KNOWN: u32 = NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO;
+/// `DXGK_FLIPCAPS.FlipImmediateMmIo` (bit 3).
+pub const FLIPCAPS_FLIP_IMMEDIATE_MMIO: u32 = 1 << 3;
+
+/// The reported `DXGK_FLIPCAPS` word given the one built from everything else and the raw knob.
+pub const fn flip_caps(reported: u32, knob: u32) -> u32 {
+    if knob & ADVERTISE_MMIO != 0 {
+        reported | FLIPCAPS_FLIP_IMMEDIATE_MMIO
+    } else {
+        reported
+    }
+}
 
 /// `DXGK_SETVIDPNSOURCEADDRESS_FLAGS.FlipImmediate` (bit 1 of `Value`; WDK `d3dkmddi.h`).
 pub const SVSA_FLIP_IMMEDIATE: u32 = 1 << 1;
@@ -139,8 +159,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_is_both_and_zero_is_the_old_behaviour() {
-        assert_eq!(mode(DEFAULT_KNOB), NO_PACE | COMPLETE_NOW);
+    fn the_default_is_all_three_and_zero_is_the_old_behaviour() {
+        assert_eq!(mode(DEFAULT_KNOB), NO_PACE | COMPLETE_NOW | ADVERTISE_MMIO);
         assert_eq!(min_interval(31_250, true, mode(0)), 31_250);
         assert_eq!(
             completes_now(mode(0), true, true, false, 0x1000),
@@ -188,6 +208,20 @@ mod tests {
         assert_eq!(
             completes_now(m, true, true, false, 0),
             Err(NotNow::NoAddress)
+        );
+    }
+
+    #[test]
+    fn bit_two_reports_flip_immediate_mmio_and_nothing_else() {
+        let base =
+            crate::flip_flags::FLIPCAPS_DEFAULT | crate::flip_flags::FLIPCAPS_FLIP_INDEPENDENT;
+        assert_eq!(flip_caps(base, DEFAULT_KNOB), base | (1 << 3));
+        assert_eq!(flip_caps(base, NO_PACE | COMPLETE_NOW), base);
+        assert_eq!(flip_caps(base, 0), base);
+        // Bit 3 is the WDK's FlipImmediateMmIo, not one of the FlipCapsX bits.
+        assert_eq!(
+            FLIPCAPS_FLIP_IMMEDIATE_MMIO & crate::flip_flags::FLIPCAPS_X_ACCEPTED,
+            0
         );
     }
 

@@ -1508,7 +1508,7 @@ swap chain showed one frame) had one cause: no hardware pointer was reported. `H
 (`hw_cursor::knob_default_for`). Opt-outs: `IndepFlip` = 0 in the KMD service key, `DirectFlipSupport` = 0 (never) or 1 (equal
 formats only) in `HKLM\SOFTWARE\Helios`.
 
-`ImmFlip` (KMD service key, default 3; `kmd_logic::immediate_flip`) covers immediate flips: a Present with `FlipInterval` 0
+`ImmFlip` (KMD service key, default 7; `kmd_logic::immediate_flip`) covers immediate flips: a Present with `FlipInterval` 0
 or `IMMEDIATE_ALLOW_TEARING` (carried in the DMA flip record) and MMIO flips with `FlipImmediate`. Each flip records this
 on its allocation, so the coalescing pending slot and its retries read the right answer. A game with V-sync off presents
 these.
@@ -1517,6 +1517,12 @@ these.
 - Bit 1: once the programming has published the flip's new address, the worker reports the `CRTC_VSYNC` that retires the
   flip. It does not wait for the next vsync tick, so with `MaxQueuedFlipOnVSync` 1 the application is not held to one flip
   per tick. These vsyncs are not counted in `FlipLat*` / `VbUsed`, which describe the tick.
+
+- Bit 2: the flip caps report `FlipImmediateMmIo`. Without it dxgkrnl turns a promoted application's `ALLOW_TEARING`
+  presents into `FlipOnNextVSync` flips (405.49: `IdfSpaFlg` 0x84, no `FlipImmediate`, the application held to 240 flips/s
+  and 8 ms present-to-screen), and sends a full-screen-exclusive application's interval-0 flips down the DMA-buffer contract,
+  where an NVK buffer outside the direct-scan-out table is completed as a kept picture (`IdfRef06`) and never shown. With it
+  both arrive as MMIO flips with `FlipImmediate`, which `ForeignFlip` programs for any adopted NVK buffer.
 
 Flips with a sync interval (DWM's composition, V-sync on) are paced and retired by the tick as before. Whether the host shows
 an immediate frame at once (tearing) or at its own next vblank is the viewer's choice. The guest waits for neither.
