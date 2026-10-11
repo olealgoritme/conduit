@@ -3238,6 +3238,8 @@ fn main() -> anyhow::Result<()> {
             socket_dirs.push(d);
         }
     }
+    // The frame probe's file likewise (`CONDUIT_FRAME_PROBE`; nothing without it).
+    device::frame_probe::init();
     let report = device::sandbox::enter(&device::sandbox::Paths {
         devices: device::sandbox::gpu_nodes(),
         read_only: vec![
