@@ -1225,7 +1225,6 @@ pub(crate) unsafe fn vidpn_primary_flags(adapter: &AdapterContext, h: HANDLE) ->
         .map_or(0, |ctx| ctx.vidpn_primary_flags.load(Ordering::Relaxed))
 }
 
-
 /// The venus resource behind an `hAllocation`: `Some(0)` for an unbacked
 /// allocation, `None` for a null/foreign handle or one of an older transport
 /// generation (its `resource_id` names a DIFFERENT live blob now, so a caller

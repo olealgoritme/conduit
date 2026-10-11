@@ -121,8 +121,21 @@ pub(crate) fn complete_now(adapter: &AdapterContext) {
         && adapter.vsync_enabled.load(Ordering::Acquire) != 0;
     let host_holds = crate::ddi::host_flip_done::mode().is_on();
     let published = adapter.last_primary_address.load(Ordering::Acquire);
-    let address =
+    let mut address =
         imf::completion_address(published, LAST_DONE.load(Ordering::Relaxed)).unwrap_or(0);
+    // A newer flip announced at the DDI but not programmed yet is published too: retire it only
+    // if it is immediate itself (a DWM interval-1 flip after the promotion ended keeps the tick).
+    let (announced, handle) = crate::ddi::flip_announce::unconfirmed();
+    if address != 0 && address == announced && handle != 0 {
+        // SAFETY: the handle dxgkrnl supplied to the DDI that announced it; resolved against the
+        // live table (a stale one answers 0 flags).
+        let flags = unsafe {
+            crate::ddi::create_allocation::vidpn_primary_flags(adapter, handle as wdk_sys::HANDLE)
+        };
+        if !imf::programming_is_immediate(mode(), flags) {
+            address = 0;
+        }
+    }
     if imf::completes_now(mode(), true, live, host_holds, address).is_err() {
         bump(&VS_NO);
         return;

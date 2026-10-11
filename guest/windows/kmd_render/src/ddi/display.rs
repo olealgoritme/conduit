@@ -3134,7 +3134,7 @@ pub(crate) fn process_deferred_vidpn_source_address(
             return None;
         }
         // `ImmFlip`: the immediacy the flip recorded on this allocation (`ForeignFlip` reads it
-        // in the programming), and the address published before it.
+        // in the programming).
         let immediate = crate::ddi::immediate_flip::begin_programming(unsafe {
             crate::ddi::create_allocation::vidpn_primary_flags(adapter, raw as HANDLE)
         });
