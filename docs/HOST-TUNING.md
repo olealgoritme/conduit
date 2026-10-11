@@ -145,10 +145,13 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   `-overcommit cpu-pm=on` (libvirt: `<qemu:commandline>`) lets the guest idle
   in place without exits, so a wake is a posted interrupt. The cost: the
   guest's host threads read as 100% busy and nothing else can use those
-  cores while the VM runs, idle or not. A milder knob is KVM's halt polling
-  (`/sys/module/kvm/parameters/halt_poll_ns`, default 200000 ns), which spins
-  an idle vCPU a little before it sleeps. `sudo perf kvm stat live -p
-  $(pgrep -f 'guest=NAME')` shows the exit mix.
+  cores while the VM runs, idle or not; on the reference host it gave CS2 no
+  measurable gain. KVM's halt polling
+  (`/sys/module/kvm/parameters/halt_poll_ns`, default 200000 ns) spins an idle
+  vCPU a little before it sleeps; keep the default: at 2000000 ns CS2's demo
+  playback on the reference host had a lower average and a slowest second
+  about half as fast (the spinning vCPUs cost the busy cores clock speed).
+  `sudo perf kvm stat live -p $(pgrep -f 'guest=NAME')` shows the exit mix.
 
 ## GPU memory: Resizable BAR and the video-memory limit
 
