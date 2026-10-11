@@ -111,6 +111,10 @@ struct Stats {
     drain_wait_us: AtomicU64,
     drain_wait_max_us: AtomicU64,
     full_waits: AtomicU64,
+    full_wait_us: AtomicU64,
+    /// Time the worker spent running records (updated every batch and when
+    /// the ring runs empty).
+    worker_busy_us: AtomicU64,
     parks: AtomicU64,
     wakes: AtomicU64,
     retire_queued: AtomicU64,
@@ -334,7 +338,12 @@ impl CmdQueue {
             let mut r = self.read.0.load(Ordering::Acquire);
             if r < need_read {
                 self.stats.0.full_waits.fetch_add(1, Ordering::Relaxed);
+                let t0 = Instant::now();
                 self.wait_done(need_read);
+                self.stats
+                    .0
+                    .full_wait_us
+                    .fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                 r = self.read.0.load(Ordering::Acquire);
             }
             self.prod.read_cache.store(r, Ordering::Relaxed);
@@ -358,10 +367,15 @@ impl CmdQueue {
             (p.add(HEADER_BYTES) as *mut F).write(f);
             fill(core::slice::from_raw_parts_mut(p.add(extra_off), extra_len));
         }
-        self.prod.write.store(end, Ordering::Release);
-        // Cheap check; a wake this misses is caught by the worker's short park
-        // timeout and by every waiting path's full kick.
-        if self.sleeping.0.load(Ordering::Relaxed) {
+        // SeqCst (a locked exchange on x86, ~20 cycles): the store must be
+        // visible before `sleeping` is read. With a plain release store the
+        // load can pass it (store-load reordering): the worker announces sleep
+        // and still sees the old cursor while this sees `sleeping == false`,
+        // and the record waits out the worker's park (4 ms after the first
+        // idle park, 50 ms after a quarter second) or the next kick. The
+        // worker side is already ordered (SeqCst store, then the re-check).
+        self.prod.write.store(end, Ordering::SeqCst);
+        if self.sleeping.0.load(Ordering::SeqCst) {
             self.wake_worker();
         }
         Ok(end)
@@ -630,6 +644,19 @@ impl CmdQueue {
         self.run_retired(true);
     }
 
+    /// Pushes that found the ring full, and the microseconds they waited
+    /// (cumulative).
+    pub fn full_waits(&self) -> (u64, u64) {
+        let s = &self.stats.0;
+        (s.full_waits.load(Ordering::Relaxed), s.full_wait_us.load(Ordering::Relaxed))
+    }
+
+    /// Microseconds the worker has spent running records (cumulative; lags by
+    /// at most one batch of records).
+    pub fn worker_busy_us(&self) -> u64 {
+        self.stats.0.worker_busy_us.load(Ordering::Relaxed)
+    }
+
     /// One bounded line of counters.
     pub fn summary(&self) -> String {
         let s = &self.stats.0;
@@ -700,18 +727,39 @@ impl CmdQueue {
         CURRENT_WORKER.with(|c| c.set(Arc::as_ptr(&self) as usize));
         let mut since_check = 0u32;
         let mut idle_parks = 0u32;
+        // Start of the current busy stretch (records running).
+        let mut busy_since: Option<Instant> = None;
+        let note_busy = |since: &mut Option<Instant>, keep: bool| {
+            if let Some(t) = since.take() {
+                let now = Instant::now();
+                self.stats
+                    .0
+                    .worker_busy_us
+                    .fetch_add(now.duration_since(t).as_micros() as u64, Ordering::Relaxed);
+                if keep {
+                    *since = Some(now);
+                }
+            }
+        };
         loop {
+            // The clock starts before the first record of a stretch runs.
+            let started = if busy_since.is_none() { Some(Instant::now()) } else { None };
             // SAFETY: this is the only consumer.
             if unsafe { self.run_one() } {
+                if busy_since.is_none() {
+                    busy_since = started;
+                }
                 since_check += 1;
                 if since_check >= BATCH {
                     self.stats.0.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
                     since_check = 0;
+                    note_busy(&mut busy_since, true);
                     self.after_batch();
                 }
                 idle_parks = 0;
                 continue;
             }
+            note_busy(&mut busy_since, false);
             self.stats.0.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
             since_check = 0;
             self.after_batch();
@@ -860,6 +908,44 @@ mod tests {
         q.drain();
         assert_eq!(next.load(Ordering::Relaxed), 3000);
         assert!(q.summary().contains("full_waits="));
+        q.shutdown();
+    }
+
+    #[test]
+    fn a_push_wakes_a_worker_in_a_long_park() {
+        let q = CmdQueue::new(MIN_RING_BYTES, "t-wake");
+        let ran = Arc::new(Mutex::new(None::<Instant>));
+        for _ in 0..5 {
+            // Idle long enough that the worker is in its PARK_LONG naps.
+            std::thread::sleep(Duration::from_millis(300));
+            let r = Arc::clone(&ran);
+            let t0 = Instant::now();
+            unsafe { q.push(0, |_| {}, move |_: &[u8]| *lock(&r) = Some(Instant::now())).unwrap() };
+            spin_until(|| lock(&ran).is_some());
+            let dt = lock(&ran).take().unwrap().duration_since(t0);
+            // A missed wake would wait out the 50 ms park.
+            assert!(dt < Duration::from_millis(25), "record ran {dt:?} after its push");
+        }
+        q.shutdown();
+    }
+
+    #[test]
+    fn full_wait_time_and_worker_busy_time_are_counted() {
+        let q = CmdQueue::new(MIN_RING_BYTES, "t-busy");
+        // Each record sleeps 1 ms and fills a quarter of the ring, so the
+        // producer finds it full and the worker is busy ~20 ms in all.
+        for _ in 0..20 {
+            unsafe {
+                q.push(MIN_RING_BYTES / 4 - 64, |_| {}, |_: &[u8]| std::thread::sleep(Duration::from_millis(1)))
+                    .unwrap();
+            }
+        }
+        q.drain();
+        let (n, us) = q.full_waits();
+        assert!(n > 0, "the producer never found the ring full");
+        assert!(us >= 1000, "full waits took {us} us");
+        // Wait for the worker to account its last stretch (on ring empty).
+        spin_until(|| q.worker_busy_us() >= 20_000);
         q.shutdown();
     }
 
