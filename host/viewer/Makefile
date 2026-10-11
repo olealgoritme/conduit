@@ -226,12 +226,16 @@ test-gpuscale: test/test_gpuscale.c nb_gpuscale.c nb_gpuscale.h
 test-pace: test/test_pace.c nb_pace.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_pace.c
 
+test-latch: test/test_latch.c nb_latch.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_latch.c -lm
+
 test-relacc: test/test_relacc.c nb_relacc.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_relacc.c
 
-check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace $(if $(HAVE_GBM),test-gpuscale,)
+check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace test-latch $(if $(HAVE_GBM),test-gpuscale,)
 	./test-utf8
 	./test-pace
+	./test-latch
 	$(if $(HAVE_GBM),./test-gpuscale || [ $$? = 77 ],)
 	./test-view
 	./test-ui
@@ -257,4 +261,4 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d \
-	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test/utf8_extracted.inc
+	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test/utf8_extracted.inc

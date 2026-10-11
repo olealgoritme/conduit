@@ -756,7 +756,7 @@ area:
                                : "Presentation (vsync now)");
     {
         static const int order[NB_SYNC_COUNT] = {
-            NB_SYNC_FULLSCREEN, NB_SYNC_IMMEDIATE, NB_SYNC_VSYNC,
+            NB_SYNC_FULLSCREEN, NB_SYNC_IMMEDIATE, NB_SYNC_VSYNC, NB_SYNC_LATCH,
         };
 
         for (i = 0; i < NB_SYNC_COUNT; i++) {

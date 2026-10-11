@@ -79,9 +79,11 @@ enum {
     NB_SYNC_FULLSCREEN = 0,     /* default: immediate in fullscreen, vsync windowed */
     NB_SYNC_IMMEDIATE,          /* immediate in a window too                 */
     NB_SYNC_VSYNC,              /* always wait for vblank                    */
+    NB_SYNC_LATCH,              /* newest frame once per refresh, late latch
+                                 * (nb_latch.h)                              */
     NB_SYNC_COUNT
 };
-int         nb_sync_parse(const char *s, int *sync);  /* fullscreen|auto|immediate|vsync */
+int         nb_sync_parse(const char *s, int *sync);  /* fullscreen|auto|immediate|vsync|latch */
 const char *nb_sync_name(int sync);                   /* settings-file / flag form */
 const char *nb_sync_label(int sync);                  /* menu form               */
 /* Whether frames should be presented immediately in this state. */

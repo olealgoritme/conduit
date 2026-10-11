@@ -571,7 +571,7 @@ compositor modesets as usual.
   a newer one replaces goes back to the guest at once (`host/viewer/nb_pace.h`;
   `held N` in the `--stats` line).
 - Presentation sync, the fullscreen GPU scaler and what each compositor needs:
-  [VIEWER.md](VIEWER.md#presentation-immediate-or-vsync).
+  [VIEWER.md](VIEWER.md#presentation-immediate-vsync-or-latest-per-refresh).
 - Direct mode (CTRL+ALT+D, `--direct-mode=on`): overlay hidden, tearing ASYNC
   (unless `--sync=vsync`),
   the guest asked again for the output's exact mode, `--direct-hook CMD` run as

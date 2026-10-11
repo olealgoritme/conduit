@@ -15,3 +15,4 @@ test-view
 test-ui
 test-gpuscale
 test-pace
+test-latch

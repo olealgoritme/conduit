@@ -55,6 +55,8 @@
 #include "nb_relacc.h"
 #include "nb_gpuscale.h"
 #include "nb_pace.h"
+#include "nb_latch.h"
+#include <sys/timerfd.h>
 
 #ifndef NB_HAVE_WAYLAND
 
@@ -541,6 +543,20 @@ struct nb_wl {
      */
     struct nb_pace pace;
     bool     commit_staged;
+    /*
+     * --sync=latch (nb_latch.h): at most one commit per output refresh, the
+     * newest frame, at a learned point before the vblank it is aimed at.  The
+     * window opening is a CLOCK_MONOTONIC timerfd (poll() alone has
+     * millisecond resolution, a quarter of a 240 Hz refresh).
+     */
+    struct nb_latch latch;
+    int      latch_tfd;         /* -1 until first needed                    */
+    bool     latch_armed;
+    int      latch_pfd;         /* index in the pollfds, -1 when not polled */
+    uint64_t latch_open_ns;     /* when the current window opened           */
+    /* CONDUIT_VIEWER_FRAMELOG: one line per frame event (see wl_flog()). */
+    FILE    *flog;
+    uint64_t flog_flush_ns;
     bool     nudge_pending;     /* a cursor nudge the gate held (nb_pace.h) */
     unsigned st_nudges;
     uint64_t n_reuse_inflight;  /* commits of a buffer the compositor still
@@ -808,7 +824,39 @@ struct nb_pres_ctx {
     uint64_t commit_ns;     /* CLOCK_MONOTONIC at wl_surface_commit          */
     uint32_t seq;           /* cmd.seq of the committed frame                */
     uint64_t start_ns;      /* the guest's flip (or our receipt of it)       */
+    uint64_t recv_ns;       /* our receipt of the frame                      */
+    uint64_t aimed;         /* --sync=latch: the vblank it was aimed at       */
 };
+
+/*
+ * CONDUIT_VIEWER_FRAMELOG=FILE: per-frame timing, CLOCK_MONOTONIC ns, for
+ * frame-to-photon analysis (joins with the backend's CONDUIT_FRAME_PROBE log
+ * by seq):
+ *   C seq recv flip commit aimed mode   committed (flip 0 if unstamped, aimed 0
+ *                                       unless --sync=latch; mode i/v/l)
+ *   P seq present refresh flags         wp_presentation presented
+ *   D seq                               discarded (replaced before scanout)
+ *   X seq recv                          staged, replaced before it was committed
+ */
+static void wl_flog(struct nb_wl *w, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void wl_flog(struct nb_wl *w, const char *fmt, ...)
+{
+    va_list ap;
+    uint64_t now;
+
+    if (!w->flog) {
+        return;
+    }
+    va_start(ap, fmt);
+    vfprintf(w->flog, fmt, ap);
+    va_end(ap);
+    now = nb_mono_ns();
+    if (now - w->flog_flush_ns > 1000000000ull) {
+        fflush(w->flog);
+        w->flog_flush_ns = now;
+    }
+}
 
 /*
  * The guest's flip time, from cmd.seq when the client stamps it with its
@@ -863,6 +911,22 @@ static void nb_stats_sample(uint32_t *v, unsigned *k, uint64_t ns)
     }
 }
 
+static bool wl_latch_on(const struct nb_wl *w);
+/* The presentation mode for the stats line; latch mode with its state. */
+static const char *wl_mode_name(const struct nb_wl *w, char *b, size_t n)
+{
+    const struct nb_latch *l = &w->latch;
+
+    if (!wl_latch_on(w)) {
+        return w->tearing_async ? "immediate" : "vsync";
+    }
+    snprintf(b, n, "latch lead %.2fms budget %.2fms on-time %llu late %llu repeats %llu%s",
+             l->lead / 1e6, l->budget / 1e6, (unsigned long long)l->on_time,
+             (unsigned long long)l->late, (unsigned long long)l->repeats,
+             nb_latch_clocked(l) ? "" : " (no vblank clock yet)");
+    return b;
+}
+
 static void nb_stats_flush(struct nb_wl *w, uint64_t now)
 {
     if (!w->st_t0) {
@@ -910,6 +974,8 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
         }
         nb_pct(w->st_cp_s, w->st_cp_k, &cp50, &cp99);
         nb_pct(w->st_pi_s, w->st_pi_k, &pi50, &pi99);
+        char lm[96];
+
         nb_log("stats: commit %.1f fps, presented %.1f fps (%u direct scanout), "
                "superseded %u | recv->commit avg %.0fus max %.0fus |%s "
                "commit->present avg %.0fus p50 %uus p99 %uus max %.0fus |%s "
@@ -922,7 +988,7 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
                w->st_cp_n ? (double)w->st_cp_sum / w->st_cp_n / 1e3 : 0.0,
                cp50, cp99, (double)w->st_cp_max / 1e3, sp,
                pi_mean, pi_sd, pi50, pi99,
-               w->tearing_async ? "immediate" : "vsync", w->st_held,
+               wl_mode_name(w, lm, sizeof(lm)), w->st_held,
                w->st_nudges, gs);
     }
     w->st_held = 0;
@@ -1176,6 +1242,9 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
         struct nb_wl_buf *old = &w->bufs[w->pending];
 
         w->pending = -1;
+        if (old->valid) {
+            wl_flog(w, "X %u %llu\n", old->seq, (unsigned long long)old->recv_ns);
+        }
         if (old->valid && !old->held && w->sink &&
             (s->caps & NVKVM_BROKER_CAP_RELEASE_SEQ)) {
             nb_sink_release(w->sink, old->id, old->seq);
@@ -1407,6 +1476,55 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t t)
     }
 }
 
+/* ── --sync=latch: latest frame per refresh, late latch (nb_latch.h) ────── */
+/* Direct mode (CTRL+ALT+D) is the lowest-latency immediate path and wins. */
+static bool wl_latch_on(const struct nb_wl *w)
+{
+    return w->vst.sync == NB_SYNC_LATCH && !w->direct;
+}
+
+/* May the staged frame be committed now?  The latch window in latch mode
+ * (and never into a full socket), the frame-callback gate otherwise. */
+static bool wl_gate_open(struct nb_wl *w, uint64_t now)
+{
+    if (!wl_latch_on(w)) {
+        return nb_pace_may_commit(&w->pace, now);
+    }
+    if (w->pace.blocked || !nb_latch_may_commit(&w->latch, now)) {
+        return false;
+    }
+    w->latch_open_ns = nb_latch_clocked(&w->latch) ? nb_latch_wake(&w->latch) : now;
+    return true;
+}
+
+/* Arm the timerfd for the next window opening while a frame is staged. */
+static void wl_latch_arm(struct nb_wl *w)
+{
+    uint64_t now, due, at;
+    struct itimerspec its = { 0 };
+
+    if (!wl_latch_on(w)) {
+        return;
+    }
+    now = nb_mono_ns();
+    due = nb_latch_due_ns(&w->latch, now);
+    if (!due) {
+        return;                 /* open now (held only by a full socket) */
+    }
+    if (w->latch_tfd < 0) {
+        w->latch_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (w->latch_tfd < 0) {
+            return;             /* wl_tick's millisecond timeout still runs */
+        }
+    }
+    at = now + due;
+    its.it_value.tv_sec = (time_t)(at / 1000000000ull);
+    its.it_value.tv_nsec = (long)(at % 1000000000ull);
+    if (timerfd_settime(w->latch_tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0) {
+        w->latch_armed = true;
+    }
+}
+
 /*
  * THE ONE PLACE THE VIEWPORT DESTINATION IS DECIDED.
  *
@@ -1615,7 +1733,7 @@ static bool wl_gs_wanted(const struct nb_wl *w, int slot, int pw, int ph)
     const struct nb_wl_buf *sl;
 
     if (w->gs_mode == NB_GS_OFF || w->gs_dead || !w->fullscreen ||
-        !wl_async_wanted(w) || !w->viewport || slot < 0 ||
+        !(wl_async_wanted(w) || wl_latch_on(w)) || !w->viewport || slot < 0 ||
         slot >= NB_MAX_BUFS) {
         return false;
     }
@@ -2004,10 +2122,11 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
      * frame of a guest flipping at thousands per second fills the compositor
      * socket, and libwayland makes a full socket a fatal error.
      */
-    if (!nb_pace_may_commit(&w->pace, nb_mono_ns())) {
+    if (!wl_gate_open(w, nb_mono_ns())) {
         w->pace.deferred++;
         w->st_held++;
         w->commit_staged = true;
+        wl_latch_arm(w);
         return 0;
     }
     w->commit_staged = false;
@@ -2140,6 +2259,7 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
             pc->w = w;
             pc->seq = sl->seq;
             pc->start_ns = fl ? fl : sl->recv_ns;
+            pc->recv_ns = sl->recv_ns;
             wp_presentation_feedback_add_listener(fb, &nb_pres_listener, pc);
             w->pc_last = pc;    /* commit_ns filled in right after commit */
         } else {
@@ -2183,7 +2303,31 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
     nb_pace_flushed(&w->pace, wl_display_flush(w->dpy) < 0 &&
                               errno == EAGAIN);  /* out NOW: see FLUSH below */
-    nb_stats_commit(w, sl);
+    {
+        struct nb_pres_ctx *pc_now = w->pc_last;   /* nb_stats_commit clears it */
+        uint64_t now, aimed = 0;
+
+        nb_stats_commit(w, sl);
+        now = nb_mono_ns();
+
+        if (wl_latch_on(w)) {
+            /* Cost: from the window opening (or the frame's arrival, if it
+             * came later) to the flush -- the GPU scaling pass included. */
+            uint64_t from = w->latch_open_ns > sl->recv_ns ? w->latch_open_ns
+                                                           : sl->recv_ns;
+
+            aimed = nb_latch_committed(&w->latch, now,
+                                       from && now > from ? now - from : 0);
+            if (pc_now) {
+                pc_now->aimed = aimed;
+            }
+        }
+        wl_flog(w, "C %u %llu %llu %llu %llu %c\n", sl->seq,
+                (unsigned long long)sl->recv_ns,
+                (unsigned long long)nb_flip_ns(w, sl),
+                (unsigned long long)now, (unsigned long long)aimed,
+                wl_latch_on(w) ? 'l' : w->tearing_async ? 'i' : 'v');
+    }
 
     /*
      * NOW drop the idle placeholder, and only now.
@@ -2349,9 +2493,12 @@ static void wl_nudge(struct nb_wl *w)
 static void wl_commit_staged(struct nb_wl *w)
 {
     if (w->commit_staged && w->pending >= 0 && w->sess && w->sink &&
-        nb_pace_may_commit(&w->pace, nb_mono_ns())) {
+        wl_gate_open(w, nb_mono_ns())) {
         (void)wl_commit(w->sess, w->sink);
         return;
+    }
+    if (w->commit_staged && w->pending >= 0 && !w->latch_armed) {
+        wl_latch_arm(w);        /* the window moved on: wait for the next one */
     }
     if (w->nudge_pending) {
         wl_nudge(w);
@@ -3845,6 +3992,17 @@ static int wl_tick(struct nb_session *s)
             }
         }
     }
+    if (w->commit_staged && w->pending >= 0 && wl_latch_on(w)) {
+        /* The timerfd is polled only from the next pollfds(): this iteration
+         * gets a millisecond timeout as a backstop. */
+        uint64_t due = nb_latch_due_ns(&w->latch, nb_mono_ns());
+        int ms = (int)((due + 999999) / 1000000);
+
+        wl_latch_arm(w);
+        if (due && (r < 0 || ms < r)) {   /* due 0: a full socket; POLLOUT wakes us */
+            r = ms;
+        }
+    }
     return r;
 }
 
@@ -5134,6 +5292,7 @@ static void pres_discarded(void *d, struct wp_presentation_feedback *f)
     if (pc->w->pc_last == pc) {
         pc->w->pc_last = NULL;
     }
+    wl_flog(pc->w, "D %u\n", pc->seq);
     pc->w->st_discarded++;
     nb_fs_superseded(&pc->w->fs);
     free(pc);
@@ -5153,6 +5312,18 @@ static void pres_presented(void *d, struct wp_presentation_feedback *f,
 
     (void)sh; (void)sl;
     wp_presentation_feedback_destroy(f);
+    if (w->pres_clock == CLOCK_MONOTONIC) {
+        uint64_t tp = ((((uint64_t)tv_sec_hi << 32) | tv_sec_lo) * 1000000000ull) +
+                      tv_nsec;
+
+        /* The vblank clock for --sync=latch, learned in every mode so a
+         * switch to it starts clocked. */
+        nb_latch_presented(&w->latch, tp, refresh,
+                           (flags & WP_PRESENTATION_FEEDBACK_KIND_VSYNC) != 0,
+                           pc->aimed);
+        wl_flog(w, "P %u %llu %u %u\n", pc->seq, (unsigned long long)tp,
+                refresh, flags);
+    }
 
     /* The client's guest completes the flip on this (EV_PRESENTED): the
      * frame is on the screen now, not when it was committed. */
@@ -5508,7 +5679,13 @@ static void wl_title_update(struct nb_wl *w, bool force)
     if (!w->toplevel) {
         return;
     }
-    if (w->stats_active) {
+    /*
+     * No live numbers in the title while fullscreen: nobody sees it there, and
+     * every title change makes the compositor re-run its window rules for us
+     * (Hyprland: all of them, twice a second, logged) -- work on the frame
+     * path's thread of a compositor that is meant to be scanning us out.
+     */
+    if (w->stats_active && !w->fullscreen) {
         nb_fs_title(t, sizeof(t), w->title, (unsigned)w->buf_w,
                     (unsigned)w->buf_h, w->refresh_mhz, &w->snap, flip);
         if (w->snap.frames) {
@@ -5964,8 +6141,8 @@ static void wl_hypr_sync(struct nb_wl *w)
  */
 static bool wl_async_wanted(const struct nb_wl *w)
 {
-    if (w->vst.sync == NB_SYNC_VSYNC) {
-        return false;
+    if (w->vst.sync == NB_SYNC_VSYNC || w->vst.sync == NB_SYNC_LATCH) {
+        return false;           /* latch aims at vblanks: never tear */
     }
     return w->direct || nb_sync_immediate(w->vst.sync, w->fullscreen);
 }
@@ -7083,6 +7260,13 @@ static int wl_pollfds(struct nb_session *s, struct pollfd *out, int max)
             w->send[i].pfd = n++;
         }
     }
+    w->latch_pfd = -1;
+    if (w->latch_armed && w->latch_tfd >= 0 && n < max) {
+        out[n].fd = w->latch_tfd;
+        out[n].events = POLLIN;
+        out[n].revents = 0;
+        w->latch_pfd = n++;
+    }
     return n;
 }
 
@@ -7123,6 +7307,15 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
     if (w->pfd && (w->pfd->revents & POLLOUT)) {
         nb_pace_flushed(&w->pace, wl_display_flush(w->dpy) < 0 &&
                                   errno == EAGAIN);
+    }
+    if (w->pfd && w->latch_pfd > 0 && (w->pfd[w->latch_pfd].revents & POLLIN)) {
+        uint64_t n;
+
+        if (read(w->latch_tfd, &n, sizeof(n)) < 0) {
+            /* EAGAIN: already consumed; nothing else can fail here */
+        }
+        w->latch_armed = false;
+        wl_commit_staged(w);    /* the latch window opened */
     }
     if (wl_display_prepare_read(w->dpy) != 0) {
         /* Another queue already has events buffered; drain those first. */
@@ -7292,6 +7485,14 @@ static void wl_close_session(struct nb_session *s)
 
     if (!w) {
         return;
+    }
+    if (w->latch_tfd >= 0) {
+        close(w->latch_tfd);
+        w->latch_tfd = -1;
+    }
+    if (w->flog) {
+        fclose(w->flog);
+        w->flog = NULL;
     }
     wl_set_grab(s, false);
     if (w->fetch_fd >= 0) {
@@ -7903,6 +8104,22 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
     s->priv = w;
     w->fetch_fd = -1;
     w->fetch_pfd = -1;
+    w->latch_tfd = -1;
+    w->latch_pfd = -1;
+    nb_latch_init(&w->latch);
+    {
+        const char *fl = getenv("CONDUIT_VIEWER_FRAMELOG");
+
+        if (fl && *fl) {
+            w->flog = fopen(fl, "we");
+            if (w->flog) {
+                setvbuf(w->flog, NULL, _IOFBF, 1 << 16);
+                nb_log("frame log: writing %s", fl);
+            } else {
+                nb_log("frame log: %s: %s", fl, strerror(errno));
+            }
+        }
+    }
     for (int i = 0; i < NB_WL_MAX_SENDS; i++) {
         w->send[i].fd = -1;
         w->send[i].pfd = -1;

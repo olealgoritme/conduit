@@ -3251,6 +3251,10 @@ static void usage(void)
 "                                     no vblank wait; vsync in a window\n"
 "                         immediate   immediate in a window too\n"
 "                         vsync       always wait for the next vblank\n"
+"                         latch       the newest frame once per refresh, committed\n"
+"                                     at a learned point just before the vblank\n"
+"                                     (wp_presentation clock): constant latency,\n"
+"                                     no tearing, no queue (also CONDUIT_VIEWER_SYNC)\n"
 "                       Immediate is wp_tearing_control_v1 ASYNC plus the\n"
 "                       content type \"game\"; on Hyprland the viewer also\n"
 "                       sets its own window's `immediate` property (still\n"
@@ -3502,6 +3506,17 @@ int main(int argc, char **argv)
      * numbers either way. */
     cfg.overlay_mode = NB_OVERLAY_WINDOWED;
     cfg.sync = -1;
+    {
+        /* CONDUIT_VIEWER_SYNC: the --sync mode, for a viewer started by
+         * `conduit view` or a unit; a --sync flag still wins. */
+        const char *e = getenv("CONDUIT_VIEWER_SYNC");
+
+        if (e && *e && nb_sync_parse(e, &cfg.sync) != 0) {
+            nb_err("CONDUIT_VIEWER_SYNC=%s: not fullscreen, immediate, vsync or latch "
+                   "(ignored)", e);
+            cfg.sync = -1;
+        }
+    }
     cfg.hint_align = 1;
     cfg.win_w = 1920;
     cfg.win_h = 1080;
@@ -3612,7 +3627,7 @@ int main(int argc, char **argv)
 
             if (!m) { NEEDVAL(); m = v; }
             if (nb_sync_parse(m, &cfg.sync) != 0) {
-                nb_err("--sync must be fullscreen, immediate or vsync");
+                nb_err("--sync must be fullscreen, immediate, vsync or latch");
                 return 2;
             }
         }

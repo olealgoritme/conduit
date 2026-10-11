@@ -624,6 +624,9 @@ int nb_sync_parse(const char *s, int *sync)
         *sync = NB_SYNC_IMMEDIATE;
     } else if (!strcmp(s, "vsync") || !strcmp(s, "fifo")) {
         *sync = NB_SYNC_VSYNC;
+    } else if (!strcmp(s, "latch") || !strcmp(s, "late-latch") ||
+               !strcmp(s, "latest")) {
+        *sync = NB_SYNC_LATCH;
     } else {
         return -1;
     }
@@ -635,6 +638,7 @@ const char *nb_sync_name(int sync)
     switch (sync) {
     case NB_SYNC_IMMEDIATE: return "immediate";
     case NB_SYNC_VSYNC:     return "vsync";
+    case NB_SYNC_LATCH:     return "latch";
     default:                return "fullscreen";
     }
 }
@@ -644,6 +648,7 @@ const char *nb_sync_label(int sync)
     switch (sync) {
     case NB_SYNC_IMMEDIATE: return "Always immediate";
     case NB_SYNC_VSYNC:     return "VSync";
+    case NB_SYNC_LATCH:     return "Latest per refresh";
     default:                return "Immediate in fullscreen";
     }
 }

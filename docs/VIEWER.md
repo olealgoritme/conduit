@@ -76,7 +76,8 @@ that fades in when the pointer touches the window's top edge. The menu has:
   "CS2 4:3 stretched"), click one to load it, `x` to delete it.
   Ctrl+Alt+P cycles through them.
 - **Presentation**: Immediate in fullscreen (the default), Always immediate,
-  or VSync. See [Presentation](#presentation-immediate-or-vsync).
+  VSync, or Latest per refresh. See
+  [Presentation](#presentation-immediate-vsync-or-latest-per-refresh).
 - **View**: the stats overlay and fullscreen.
 - **Virtual machine**: Restart and Shut down, which run `conduit reboot` and
   `conduit shutdown` for the VM. Both ask for a second click to confirm.
@@ -116,16 +117,18 @@ scale, so it lines up with the picture in `stretch` too.
 `host/viewer/test/test_view.c` checks the mapping for every mode, area and
 output scale.
 
-## Presentation: immediate or vsync
+## Presentation: immediate, vsync or latest per refresh
 
 A game in the VM renders as fast as it can; how soon each frame reaches the
-screen is the viewer's choice (`--sync`, the menu, saved per VM):
+screen is the viewer's choice (`--sync`, the menu, saved per VM;
+`CONDUIT_VIEWER_SYNC` in the environment, which a `--sync` flag overrides):
 
 | Setting | Fullscreen | Window |
 |---|---|---|
 | `fullscreen` (default) | immediate | vsync |
 | `immediate` | immediate | immediate |
 | `vsync` | vsync | vsync |
+| `latch` | latest per refresh | latest per refresh |
 
 Immediate means the compositor shows a frame the moment it is committed, with
 no wait for the next vblank, so a frame can tear, as with a fullscreen game on
@@ -153,6 +156,32 @@ shape in fullscreen:
   pass is done. Here the Filter setting is the viewer's own (Sharp =
   nearest neighbour). `--gpu-scale=off` leaves scaling to the compositor;
   `--render-node` picks the GPU.
+
+**Latest per refresh** (`latch`) commits at most one frame per output
+refresh: the newest complete guest frame, at a fixed point before the vblank
+it is aimed at, without tearing and without a queue (a newer frame replaces a
+waiting one). The vblank clock is the compositor's own presentation feedback
+(`wp_presentation`: timestamp and refresh period). The commit point is
+`vblank - lead - budget - 0.5 ms`: `budget` is the viewer's own cost (the GPU
+scaling pass and the requests, a rolling maximum that decays), and `lead` is
+how long before the vblank this compositor needs a commit to show it there.
+The viewer learns it from the feedback: a commit presented a refresh late
+raises it, commits on time let it sink slowly, so it settles just past the
+compositor's latch point. A compositor that composites right after the
+previous vblank (Hyprland by default) settles near one refresh; one that
+latches late, near its render time. The commit-to-scanout time is then
+constant, so motion follows the guest's frame times rather than the moment
+each frame happened to arrive. With no frame by the commit point the refresh
+shows the previous one. The stats line shows `latch lead ... budget ...
+on-time ... late ... repeats ...`. Direct mode (`Ctrl+Alt+D`) overrides it with
+immediate presentation. In fullscreen the GPU scaling pass applies as with
+immediate.
+
+`CONDUIT_VIEWER_FRAMELOG=FILE` writes one line per frame event, in
+`CLOCK_MONOTONIC` ns, for frame-to-photon analysis: `C seq recv flip commit
+aimed mode` (committed), `P seq present refresh flags` (presented), `D seq`
+(discarded by the compositor) and `X seq recv` (replaced before it was
+committed).
 
 In a window, and with VSync, the compositor scales the picture as before.
 The stats overlay is hidden in fullscreen by default (`--overlay=windowed`)
