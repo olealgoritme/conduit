@@ -382,6 +382,8 @@ struct nb_wl {
     bool                     close_asked;
     bool                     ptr_on_dlg;
     bool                     ptr_on_content;   /* over the guest's picture */
+    bool                     cur_img_on;       /* ...and the host pointer shows
+                                                * an image there (not NULL) */
     int                      dlg_hover, dlg_press;
     int                      dlg_px_x, dlg_px_y;
     struct wl_buffer        *tb_buf;
@@ -927,6 +929,52 @@ static const char *wl_mode_name(const struct nb_wl *w, char *b, size_t n)
     return b;
 }
 
+/*
+ * DIRECT SCANOUT, FROM OUR SIDE.  What a compositor needs from a client to
+ * put its buffer on a plane is the same everywhere (wlroots, KWin, Mutter,
+ * Hyprland, X compositors unredirecting): one opaque surface, fullscreen,
+ * nothing mapped above or below it, a buffer exactly the output's size with
+ * no scaling or crop, and no cursor image over it (a software cursor has to
+ * be composited in).  This lists the ones the viewer itself is breaking
+ * right now; "none" means the compositor chose to composite for reasons of
+ * its own (its configuration, tearing, a format it cannot scan out).
+ * Generic by construction: it inspects only our own surface state.
+ */
+static void wl_scanout_blockers(const struct nb_wl *w, char *b, size_t n)
+{
+    size_t k = 0;
+    unsigned s120 = w->viewporter && w->scale_120 ? w->scale_120 : 120;
+    int pw = (int)(((long)w->win_w * s120 + 60) / 120);
+    int ph = (int)(((long)w->win_h * s120 + 60) / 120);
+    int bw = 0, bh = 0;
+
+#define BLK(cond, what) do { if ((cond) && k < n) { \
+        k += (size_t)snprintf(b + k, n - k, "%s%s", k ? ", " : "", what); \
+        if (k >= n) k = n - 1; } } while (0)
+    b[0] = '\0';
+    if (w->gs_shown) {
+        bw = (int)w->gt_w;
+        bh = (int)w->gt_h;
+    } else if (!w->in_sub && w->current >= 0 && w->bufs[w->current].valid) {
+        bw = w->place.cropped ? 0 : (int)w->bufs[w->current].w;
+        bh = w->place.cropped ? 0 : (int)w->bufs[w->current].h;
+    }
+    BLK(!w->fullscreen, "not fullscreen");
+    BLK(w->in_sub, "picture letterboxed on a subsurface");
+    BLK(!w->in_sub && (bw != pw || bh != ph), "buffer is not the output's size");
+    BLK(w->tb_mapped, "title bar mapped");
+    BLK(w->ov_mapped, "stats overlay mapped");
+    BLK(w->ly_note && w->ly_note->mapped, "notice mapped");
+    BLK((w->ly_menu && w->ly_menu->mapped) || w->ui.open || w->dlg_open,
+        "menu or dialog open");
+    BLK(w->ly_btn && w->ly_btn->mapped, "menu button mapped");
+    BLK(w->ptr_on_content && w->cur_img_on, "a cursor image over the picture");
+#undef BLK
+    if (!k) {
+        snprintf(b, n, "none on our side (compositor policy)");
+    }
+}
+
 static void nb_stats_flush(struct nb_wl *w, uint64_t now)
 {
     if (!w->st_t0) {
@@ -976,12 +1024,23 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
         nb_pct(w->st_pi_s, w->st_pi_k, &pi50, &pi99);
         char lm[96];
 
-        nb_log("stats: commit %.1f fps, presented %.1f fps (%u direct scanout), "
-               "superseded %u | recv->commit avg %.0fus max %.0fus |%s "
+        char blk[200] = "";
+
+        /* Only when something was composited: a direct-scanout second
+         * has nothing to explain. */
+        if (w->st_presented > w->st_zc) {
+            char why[180];
+
+            wl_scanout_blockers(w, why, sizeof(why));
+            snprintf(blk, sizeof(blk), " | composited, blockers: %s", why);
+        }
+        nb_log("stats: commit %.1f fps, presented %.1f fps (%u direct scanout, "
+               "%.0f%%), superseded %u | recv->commit avg %.0fus max %.0fus |%s "
                "commit->present avg %.0fus p50 %uus p99 %uus max %.0fus |%s "
                "| present interval avg %.0fus sd %.0fus p50 %uus p99 %uus "
-               "| %s, held %u, cursor nudges %u%s",
+               "| %s, held %u, cursor nudges %u%s%s",
                w->st_commits / secs, w->st_presented / secs, w->st_zc,
+               w->st_presented ? 100.0 * w->st_zc / w->st_presented : 0.0,
                w->st_discarded,
                w->st_commits ? (double)w->st_rc_sum / w->st_commits / 1e3 : 0.0,
                (double)w->st_rc_max / 1e3, sc,
@@ -989,7 +1048,7 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
                cp50, cp99, (double)w->st_cp_max / 1e3, sp,
                pi_mean, pi_sd, pi50, pi99,
                wl_mode_name(w, lm, sizeof(lm)), w->st_held,
-               w->st_nudges, gs);
+               w->st_nudges, gs, blk);
     }
     w->st_held = 0;
     w->st_nudges = 0;
@@ -1761,7 +1820,10 @@ static bool wl_gs_ready(struct nb_wl *w, const struct nb_wl_buf *sl, int pw,
             wl_gs_disable(w, why[0] ? why : "no GPU");
             return false;
         }
-        nb_log("gpu-scale: ready on %s", nb_gs_node(w->gs));
+        nb_log("gpu-scale: ready on %s, GPU context priority %s requested, "
+               "%s granted (CONDUIT_VIEWER_GPU_PRIORITY)", nb_gs_node(w->gs),
+               nb_gs_prio_name(nb_gs_prio_requested(w->gs)),
+               nb_gs_prio_name(nb_gs_prio_granted(w->gs)));
     }
     if (w->gt_w != (uint32_t)pw || w->gt_h != (uint32_t)ph) {
         int k;
@@ -2421,8 +2483,11 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
  */
 static bool wl_nudge_wanted(const struct nb_wl *w)
 {
+    /* No image (NULL cursor, always so under grab): nothing for the
+     * compositor to repaint, and a commit would only cost it work. */
     return nb_nudge_wanted(w->tearing_async, w->fullscreen,
-                           w->ptr_on_content && !w->grabbed && !w->ui.open,
+                           w->ptr_on_content && w->cur_img_on &&
+                           !w->grabbed && !w->ui.open,
                            w->current >= 0);
 }
 
@@ -3431,6 +3496,7 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
         w->ui_cur = c;
         wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[k], w->cur_hx[k],
                               w->cur_hy[k]);
+        w->cur_img_on = true;
         return;
     }
     if (w->dlg_open) {
@@ -3442,6 +3508,7 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
          * to answer it with.
          */
         wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        w->cur_img_on = true;
     } else if (w->current >= 0) {
         /*
          * Guest content.  With a guest cursor plane (CMD_CURSOR) its image IS
@@ -3450,15 +3517,25 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
          * host cannot place, so it is hidden.  Without one the guest
          * composites its own cursor into the frame, and ours must go.
          */
+        /*
+         * NULL, not a transparent image: with no cursor image a compositor
+         * has no cursor plane or software cursor to draw over the picture,
+         * which is one of the conditions for scanning it out directly
+         * (wlroots' wlr_output_is_direct_scanout_allowed() refuses while a
+         * software cursor is visible).  Under grab it is always NULL.
+         */
         if (w->gc_on && !w->grabbed && w->gc_cur >= 0 && w->gc_surf) {
             wl_pointer_set_cursor(w->ptr, serial, w->gc_surf, w->gc_lhx,
                                   w->gc_lhy);
+            w->cur_img_on = true;
         } else {
             wl_pointer_set_cursor(w->ptr, serial, NULL, 0, 0);
+            w->cur_img_on = false;
         }
     } else {
         /* The placeholder.  Nothing is drawing a cursor into it. */
         wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        w->cur_img_on = true;
     }
 }
 

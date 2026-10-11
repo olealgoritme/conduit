@@ -85,4 +85,32 @@ int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
 /* Tests: one pixel of a target, 0xRRGGBB (row y counted from the top). */
 int nb_gs_read(struct nb_gs *g, int target, int x, int y, uint32_t *rgb);
 
+/*
+ * GPU PRIORITY OF THE PASS.  The pass sits between the guest's frame and the
+ * screen on the GPU the guest is loading, so it asks to be scheduled ahead of
+ * it: EGL_IMG_context_priority HIGH by default, EGL_NV_context_priority_
+ * realtime when asked.  The driver decides what it grants (NVIDIA's RM
+ * requires CAP_SYS_NICE for anything above MEDIUM: SET_INTERLEAVE_LEVEL and
+ * MAKE_REALTIME check RS_ACCESS_NICE), and the granted level is read back
+ * with eglQueryContext and reported.
+ *
+ * CONDUIT_VIEWER_GPU_PRIORITY = off | medium | high (default) | realtime.
+ * off and medium both create a context without the attribute.
+ */
+enum nb_gs_prio {
+    NB_GS_PRIO_UNKNOWN = -1,    /* not reported by the driver               */
+    NB_GS_PRIO_LOW = 0,
+    NB_GS_PRIO_MEDIUM,
+    NB_GS_PRIO_HIGH,
+    NB_GS_PRIO_REALTIME,
+};
+
+/* The env value (NULL or empty: the default, HIGH); an unknown word is
+ * reported through *bad and gives the default. */
+enum nb_gs_prio nb_gs_prio_parse(const char *s, bool *bad);
+const char *nb_gs_prio_name(enum nb_gs_prio p);
+/* What was asked for and what the driver says it granted. */
+enum nb_gs_prio nb_gs_prio_requested(const struct nb_gs *g);
+enum nb_gs_prio nb_gs_prio_granted(const struct nb_gs *g);
+
 #endif /* NB_GPUSCALE_H */

@@ -49,6 +49,22 @@ int main(void)
     int fd, sfd;
     unsigned gpu_us = 0;
 
+    /* The priority knob's words: no GPU needed. */
+    {
+        bool bad = true;
+
+        CHECK(nb_gs_prio_parse(NULL, &bad) == NB_GS_PRIO_HIGH && !bad,
+              "default is high");
+        CHECK(nb_gs_prio_parse("", &bad) == NB_GS_PRIO_HIGH && !bad, "empty");
+        CHECK(nb_gs_prio_parse("off", &bad) == NB_GS_PRIO_MEDIUM && !bad, "off");
+        CHECK(nb_gs_prio_parse("MEDIUM", &bad) == NB_GS_PRIO_MEDIUM && !bad,
+              "medium");
+        CHECK(nb_gs_prio_parse("realtime", &bad) == NB_GS_PRIO_REALTIME &&
+              !bad, "realtime");
+        CHECK(nb_gs_prio_parse("bogus", &bad) == NB_GS_PRIO_HIGH && bad,
+              "unknown word -> high, reported");
+        CHECK(!strcmp(nb_gs_prio_name(NB_GS_PRIO_UNKNOWN), "unknown"), "name");
+    }
     if (!node) {
         node = "/dev/dri/renderD128";
     }
@@ -92,9 +108,12 @@ int main(void)
     }
     CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, tg, why, sizeof(why)) ==
           NB_GS_TARGETS, "targets: %s", why);
-    printf("test_gpuscale: target %ux%u %.4s modifier 0x%016llx on %s\n",
+    printf("test_gpuscale: target %ux%u %.4s modifier 0x%016llx on %s, "
+           "context priority requested %s, granted %s\n",
            tg[0].w, tg[0].h, (const char *)&tg[0].fourcc,
-           (unsigned long long)tg[0].modifier, nb_gs_node(g));
+           (unsigned long long)tg[0].modifier, nb_gs_node(g),
+           nb_gs_prio_name(nb_gs_prio_requested(g)),
+           nb_gs_prio_name(nb_gs_prio_granted(g)));
     CHECK(tg[0].w == TW && tg[0].h == TH, "target size");
     sfd = gbm_bo_get_fd(src);
     CHECK(nb_gs_src(g, 3, sfd, SW, SH, gbm_bo_get_stride(src), 0,

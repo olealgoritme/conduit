@@ -183,6 +183,23 @@ aimed mode` (committed), `P seq present refresh flags` (presented), `D seq`
 (discarded by the compositor) and `X seq recv` (replaced before it was
 committed).
 
+`CONDUIT_VIEWER_GPU_PRIORITY=off|medium|high|realtime` (default `high`) sets
+the EGL context priority the GPU scaling pass asks for
+(`EGL_IMG_context_priority`, or `EGL_NV_context_priority_realtime` for
+`realtime` where the driver has it). The driver decides what it grants; the
+`gpu-scale: ready` log line shows both what was asked for and what the driver
+reports granting.
+
+With `--stats`, the per-second line counts presents the compositor scanned out
+directly (wp_presentation `ZERO_COPY`) and, for a second that was composited,
+lists what on the viewer's side prevents direct scanout: not fullscreen, a
+letterboxed subsurface, a buffer that is not the output's size, a mapped title
+bar, overlay, notice or menu, or a cursor image over the picture. "none on our
+side" means the compositor composited for reasons of its own (its
+configuration, tearing, the buffer format). In fullscreen, a picture with no
+host cursor image (the guest draws its own, and always under grab) sets a
+NULL cursor, so no cursor needs to be composited over it.
+
 In a window, and with VSync, the compositor scales the picture as before.
 The stats overlay is hidden in fullscreen by default (`--overlay=windowed`)
 for the same reason: drawn over the picture, it makes the compositor

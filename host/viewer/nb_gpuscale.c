@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <time.h>
@@ -43,6 +44,9 @@ typedef uint64_t EGLTime;
 #define EGL_CONTEXT_CLIENT_VERSION      0x3098
 #define EGL_CONTEXT_PRIORITY_LEVEL_IMG  0x3100
 #define EGL_CONTEXT_PRIORITY_HIGH_IMG   0x3101
+#define EGL_CONTEXT_PRIORITY_MEDIUM_IMG 0x3102
+#define EGL_CONTEXT_PRIORITY_LOW_IMG    0x3103
+#define EGL_CONTEXT_PRIORITY_REALTIME_NV 0x3357
 #define EGL_PLATFORM_GBM_KHR            0x31D7
 #define EGL_LINUX_DMA_BUF_EXT           0x3270
 #define EGL_WIDTH                       0x3057
@@ -117,6 +121,7 @@ struct fns {
     EGLContext (*CreateContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
     EGLBoolean (*DestroyContext)(EGLDisplay, EGLContext);
     EGLBoolean (*MakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+    EGLBoolean (*QueryContext)(EGLDisplay, EGLContext, EGLint, EGLint *);
     EGLint (*GetError)(void);
     EGLImage (*CreateImageKHR)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint *);
     EGLBoolean (*DestroyImageKHR)(EGLDisplay, EGLImage);
@@ -187,6 +192,7 @@ struct nb_gs {
     struct gbm_device *gbm;
     EGLDisplay dpy;
     EGLContext ctx;
+    enum nb_gs_prio prio_req, prio_got;
     GLuint prog;
     GLint u_tex, u_rect;
     struct {
@@ -245,6 +251,7 @@ static bool load(struct nb_gs *g, char *why, size_t n)
     E(CreateContext, "eglCreateContext");
     E(DestroyContext, "eglDestroyContext");
     E(MakeCurrent, "eglMakeCurrent");
+    E(QueryContext, "eglQueryContext");
     E(GetError, "eglGetError");
 #undef E
 #define X(field, name) do { *(void **)&f->field = f->GetProcAddress(name); \
@@ -330,16 +337,76 @@ static bool has_ext(const char *list, const char *ext)
     return false;
 }
 
+enum nb_gs_prio nb_gs_prio_parse(const char *s, bool *bad)
+{
+    static const struct { const char *name; enum nb_gs_prio p; } t[] = {
+        { "off", NB_GS_PRIO_MEDIUM }, { "medium", NB_GS_PRIO_MEDIUM },
+        { "default", NB_GS_PRIO_MEDIUM }, { "high", NB_GS_PRIO_HIGH },
+        { "realtime", NB_GS_PRIO_REALTIME }, { "rt", NB_GS_PRIO_REALTIME },
+    };
+
+    if (bad) {
+        *bad = false;
+    }
+    if (!s || !*s) {
+        return NB_GS_PRIO_HIGH;
+    }
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        if (!strcasecmp(s, t[i].name)) {
+            return t[i].p;
+        }
+    }
+    if (bad) {
+        *bad = true;
+    }
+    return NB_GS_PRIO_HIGH;
+}
+
+const char *nb_gs_prio_name(enum nb_gs_prio p)
+{
+    switch (p) {
+    case NB_GS_PRIO_LOW:      return "low";
+    case NB_GS_PRIO_MEDIUM:   return "medium";
+    case NB_GS_PRIO_HIGH:     return "high";
+    case NB_GS_PRIO_REALTIME: return "realtime";
+    default:                  return "unknown";
+    }
+}
+
+enum nb_gs_prio nb_gs_prio_requested(const struct nb_gs *g)
+{
+    return g ? g->prio_req : NB_GS_PRIO_UNKNOWN;
+}
+
+enum nb_gs_prio nb_gs_prio_granted(const struct nb_gs *g)
+{
+    return g ? g->prio_got : NB_GS_PRIO_UNKNOWN;
+}
+
+static enum nb_gs_prio prio_from_egl(EGLint v)
+{
+    switch (v) {
+    case EGL_CONTEXT_PRIORITY_REALTIME_NV: return NB_GS_PRIO_REALTIME;
+    case EGL_CONTEXT_PRIORITY_HIGH_IMG:    return NB_GS_PRIO_HIGH;
+    case EGL_CONTEXT_PRIORITY_MEDIUM_IMG:  return NB_GS_PRIO_MEDIUM;
+    case EGL_CONTEXT_PRIORITY_LOW_IMG:     return NB_GS_PRIO_LOW;
+    default:                               return NB_GS_PRIO_UNKNOWN;
+    }
+}
+
 /* EGL + context on an open render node.  false with why. */
 static bool egl_up(struct nb_gs *g, char *why, size_t n)
 {
     struct fns *f = &g->f;
     const char *ext;
     EGLint major, minor;
-    EGLint attr_hi[] = { EGL_CONTEXT_CLIENT_VERSION, 2,
+    EGLint attr_pr[] = { EGL_CONTEXT_CLIENT_VERSION, 2,
                          EGL_CONTEXT_PRIORITY_LEVEL_IMG,
                          EGL_CONTEXT_PRIORITY_HIGH_IMG, EGL_NONE };
     EGLint attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    bool bad = false;
+    enum nb_gs_prio want =
+        nb_gs_prio_parse(getenv("CONDUIT_VIEWER_GPU_PRIORITY"), &bad);
 
     g->gbm = f->gbm_create_device(g->drm_fd);
     if (!g->gbm) {
@@ -364,11 +431,31 @@ static bool egl_up(struct nb_gs *g, char *why, size_t n)
         say(why, n, "eglBindAPI(GLES) failed");
         return false;
     }
-    /* High priority where the driver offers it: the pass sits between the
-     * guest's frame and the screen, and shares the GPU with the guest. */
-    if (has_ext(ext, "EGL_IMG_context_priority")) {
+    if (bad) {
+        fprintf(stderr, "conduit-viewer: gpu-scale: CONDUIT_VIEWER_GPU_PRIORITY="
+                "%s is not off|medium|high|realtime; using high\n",
+                getenv("CONDUIT_VIEWER_GPU_PRIORITY"));
+    }
+    /*
+     * Above-normal priority where the driver offers it: the pass sits
+     * between the guest's frame and the screen, and shares the GPU with the
+     * guest.  Realtime first when asked (EGL_NV_context_priority_realtime),
+     * then HIGH, then none: a driver may refuse the attribute outright
+     * instead of granting less.
+     */
+    g->prio_req = want;
+    g->prio_got = NB_GS_PRIO_UNKNOWN;
+    if (want == NB_GS_PRIO_REALTIME &&
+        has_ext(ext, "EGL_NV_context_priority_realtime")) {
+        attr_pr[3] = EGL_CONTEXT_PRIORITY_REALTIME_NV;
         g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT,
-                                  attr_hi);
+                                  attr_pr);
+    }
+    if (!g->ctx && want >= NB_GS_PRIO_HIGH &&
+        has_ext(ext, "EGL_IMG_context_priority")) {
+        attr_pr[3] = EGL_CONTEXT_PRIORITY_HIGH_IMG;
+        g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT,
+                                  attr_pr);
     }
     if (!g->ctx) {
         g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT,
@@ -378,6 +465,18 @@ static bool egl_up(struct nb_gs *g, char *why, size_t n)
                                    g->ctx)) {
         say(why, n, "no GLES2 context on %s (0x%x)", g->node, f->GetError());
         return false;
+    }
+    /* What the driver granted, which the extension says the query reports
+     * (it may be less than asked, silently). */
+    if (has_ext(ext, "EGL_IMG_context_priority")) {
+        EGLint v = 0;
+
+        if (f->QueryContext(g->dpy, g->ctx, EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                            &v)) {
+            g->prio_got = prio_from_egl(v);
+        }
+    } else {
+        g->prio_got = NB_GS_PRIO_MEDIUM;    /* no priorities at all */
     }
     return true;
 }
