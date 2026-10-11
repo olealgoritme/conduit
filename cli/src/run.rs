@@ -648,6 +648,17 @@ fn viewer_session(wayland: bool, x11: bool) -> Option<&'static str> {
     }
 }
 
+/// Whether a libvirt VM gets the virtio-input devices its backend serves
+/// (docs/INPUT.md): the installed backend knows `--input-socket`, and
+/// `CONDUIT_VIRTIO_INPUT=0` does not turn them off. A backend without them
+/// would leave QEMU waiting on sockets nobody answers.
+pub(crate) fn virtio_input() -> bool {
+    std::env::var("CONDUIT_VIRTIO_INPUT").as_deref() != Ok("0")
+        && crate::paths::Tool::Backend
+            .find()
+            .is_some_and(|b| backend_takes(&b, "--input-socket"))
+}
+
 /// Whether this backend build understands `flag` (its `--help` names it):
 /// the CLI and the backend may come from different builds, and the backend
 /// refuses to start over an option it does not know.
