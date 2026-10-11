@@ -270,6 +270,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0046 | zink: without a DEVICE_LOCAL \| HOST_VISIBLE type (0030) the descriptor buffers and GL persistent mappings are host-visible coherent system memory (a persistent map of plain VRAM is a staging copy the GPU never sees). `wgl_test.exe` checks readback, compute and a persistent mapping |
 | 0047 | ZCULL only where one culling state describes the depth view: storage only for depth images with one layer and one level, and only in render passes that draw one layer without multiview (see "ZCULL and DXVK depth buffers") |
 | 0048 | util/disk_cache on Windows: a requested single-file or database cache is the multi-file cache in the requested directory (Steam starts games on Mesa drivers with `MESA_DISK_CACHE_SINGLE_FILE=1` and a per-game `MESA_SHADER_CACHE_DIR`, which left them with no shader cache); no read-only Fossilize caches next to it; an uncreatable `MESA_SHADER_CACHE_DIR` falls back to `%LOCALAPPDATA%`. `tests/disk_cache_win_test.c` checks it |
+| 0049 | RM: system memory allocations up to 512 KiB (not shared, not tiled, not RM-named) are ranges of 4 MiB pinned slabs, one OS-descriptor registration each (the KMD allows 256 per process; native Vulkan engines make thousands of small objects); reused ranges are zeroed; `NVK_RM_SYSMEM_SLABS=0` turns it off. vkCreateDescriptorPool's error path no longer finishes an uninitialized heap. `tests/vk_many_small_allocs.c` checks it |
 
 ## Per-draw cost (common 0001-0007)
 
