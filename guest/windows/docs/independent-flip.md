@@ -1,9 +1,10 @@
 # Independent flip (direct flip) of flip-model swap chains: KMD design
 
-Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; flip completion from the host behind
-`FlipDoneHost` (default 0), section 13; the rest is design. The decision table of
-section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
-failure.
+Status: independent flip is on by default (`IndepFlip` 1, the UMD's `DirectFlipSupport` 5, `HwCursor` following
+`IndepFlip`), and immediate flips are neither paced nor held for the vsync tick (`ImmFlip` 15). Section 13.10 describes
+the defaults, their opt-outs and the test rows. The decision table of section 6 (`kmd_logic/src/independent_flip.rs`) runs
+as a census with `IndepFlip` 1 and enforces with 2; flip completion from the host is behind `FlipDoneHost` (default 0,
+section 13). Sections 0 to 10 are the design; sections 11 to 13 are the build and test records of each stage.
 Written against v327 (`225ce42`, branch `kmd/independent-flip-design`). Line numbers are that commit's.
 **Re-verified (second pass) against the WDK 10.0.26100 miniport headers**: section 1 names them `[HK]`, section 10 holds
 the header facts, and several first-pass statements changed (most importantly `DXGK_FLIPCAPS.FlipIndependent`, which the
@@ -560,7 +561,7 @@ block published once per StartDevice (`zero-copy-present.md` 13.8 rules).
 
 | name | meaning |
 |---|---|
-| knob `IndepFlip` | 0 off (default); 1 census only (the table runs and counts, nothing is enforced); 2 enforce |
+| knob `IndepFlip` | 0 off; 1 census only (the table runs and counts, nothing is enforced; the default); 2 enforce |
 | knob `IdfNeedPrim` | 1: refuse a source not created as a primary |
 | knob `IdfHoldRel` | 1: hold the displayed-address publication until the host released the buffer the flip replaces |
 | `IdfKnob` | bits 0..2 = the three knobs in force |
@@ -971,17 +972,6 @@ claim in `wddm_surface.rs` rests on the measured `E_NOTIMPL` at 3.2 alone.
   created with `DXGK_ALLOCATIONINFOFLAGS2.NotifyEviction` / `NotifyIoMmuUnmap` (`:3861-3862`, `:4854-4876`). For a GpuMmu (WDDMv2) driver such
   as this one the operations dxgkrnl sends are the `>= WDDM2_0` set (`VIRTUAL_TRANSFER`, `VIRTUAL_FILL`, page-table, `NOTIFY_RESIDENCY`,
   `MAP/UNMAP_APERTURE_SEGMENT`); which of them represent eviction in practice is dxgkrnl's, not a named operation.
-p='independent-flip.md'
-s=open(p).read()
-old=s[s.index('Status: DESIGN ONLY.'):s.index('Written against v327')]
-new='''Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; the rest is design. The decision table of
-section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
-failure.
-'''
-s=s.replace(old,new)
-s=s.rstrip()+'\n'+open('/dev/stdin').read()
-open(p,'w').write(s)
-
 ## 11. Stage S-1 as built (`IndepFlip`), the test recipe, and the flip-model upgrade route
 
 Branch `feat/independent-flip`. Main already had the S-0a instruments (`FlipCapsX` as an OR mask, the `IdfSpa*` / `IdfPr*` flag
@@ -1499,14 +1489,14 @@ Colour check on C2/C4: a red/blue swap on screen means the R8G8B8A8 buffer's lay
 is the fallback until it is fixed. Cursor: with `HwCursor` 0 (the 404 default) nothing draws the Windows pointer while
 promoted (4.5); CS2 draws its own crosshair, its menus may show no pointer.
 
-### 13.10 The defaults since 405.49: promoted games, unpaced immediate flips
+### 13.10 The defaults: promoted games, unpaced immediate flips
 
 `IndepFlip` defaults to 1 and `DirectFlipSupport` to 5. A flip-model game in borderless or exclusive full screen at the
 mode's size is promoted to independent flip instead of being composed by DWM at the synthetic refresh. That includes an
-R8G8B8A8 swap chain such as CS2's on the B8G8R8A8 desktop. The freeze that turned both defaults off on 405.8 (a promoted CS2
-swap chain showed one frame) had one cause: no hardware pointer was reported. `HwCursor` now follows `IndepFlip`
-(`hw_cursor::knob_default_for`). Opt-outs: `IndepFlip` = 0 in the KMD service key, `DirectFlipSupport` = 0 (never) or 1 (equal
-formats only) in `HKLM\SOFTWARE\Helios`.
+R8G8B8A8 swap chain such as CS2's on the B8G8R8A8 desktop. A promoted swap chain needs a hardware pointer (without one a
+promoted CS2 swap chain showed one frame), so `HwCursor` follows `IndepFlip` (`hw_cursor::knob_default_for`). Opt-outs:
+`IndepFlip` = 0 in the KMD service key, `DirectFlipSupport` = 0 (never) or 1 (equal formats only) in
+`HKLM\SOFTWARE\Helios`.
 
 `ImmFlip` (KMD service key, default 15; `kmd_logic::immediate_flip`) covers immediate flips: a Present with `FlipInterval` 0
 or `IMMEDIATE_ALLOW_TEARING` (carried in the DMA flip record) and MMIO flips with `FlipImmediate`. Each flip records this
@@ -1517,24 +1507,23 @@ these.
 - Bit 1: once the programming has published the flip's new address, the worker reports the `CRTC_VSYNC` that retires the
   flip. It does not wait for the next vsync tick, so with `MaxQueuedFlipOnVSync` 1 the application is not held to one flip
   per tick. These vsyncs are not counted in `FlipLat*` / `VbUsed`, which describe the tick.
-
 - Bit 2: the flip caps report `FlipImmediateMmIo`. Without it dxgkrnl turns a promoted application's `ALLOW_TEARING`
-  presents into `FlipOnNextVSync` flips (405.49: `IdfSpaFlg` 0x84, no `FlipImmediate`, the application held to 240 flips/s
-  and 8 ms present-to-screen), and sends a full-screen-exclusive application's interval-0 flips down the DMA-buffer contract,
-  where an NVK buffer outside the direct-scan-out table is completed as a kept picture (`IdfRef06`) and never shown. With it
-  both arrive as MMIO flips with `FlipImmediate`, which `ForeignFlip` programs for any adopted NVK buffer.
-
+  presents into `FlipOnNextVSync` flips (`IdfSpaFlg` 0x84, no `FlipImmediate`: the application is held to one flip per
+  refresh, about 8 ms present-to-screen at 240 Hz), and sends a full-screen-exclusive application's interval-0 flips down
+  the DMA-buffer contract, where an NVK buffer outside the direct-scan-out table is completed as a kept picture
+  (`IdfRef06`) and never shown. With it both arrive as MMIO flips with `FlipImmediate`, which `ForeignFlip` programs for
+  any adopted NVK buffer.
 - Bit 3: a promoted swap chain's flip (`IndependentFlipExclusive`) counts as immediate even when dxgkrnl asked for
-  `FlipOnNextVSync`. dxgkrnl issues a promoted application's interval-0 presents without `ALLOW_TEARING` that way (CS2 on
-  405.50: 207 presents/s, about 130 flips/s at one- and two-vblank spacing, because each flip waited for the synthetic
-  vsync). Retired at publication, every frame goes to the host. A promoted application with V-sync on is then not held to
-  the refresh by the flip queue.
+  `FlipOnNextVSync`. dxgkrnl issues a promoted application's interval-0 presents without `ALLOW_TEARING` that way; without
+  this bit each such flip waits for the synthetic vsync (CS2: about 130 flips/s for about 207 presents/s, at one- and
+  two-vblank spacing). Retired at publication, every frame goes to the host, and a promoted application with V-sync on is
+  not held to the refresh by the flip queue.
 
-Immediate frames are sent to the host at most once per third of the paced interval (about 1 ms at 240 Hz): an uncapped
-full-screen application at thousands of frames per second flooded the viewer otherwise.
+Immediate frames are sent to the host at most once per third of the paced interval (about 1 ms at 240 Hz), so an uncapped
+full-screen application at thousands of frames per second does not flood the viewer.
 
-Flips with a sync interval that are not promoted (DWM's composition) are paced and retired by the tick as before. Whether the host shows
-an immediate frame at once (tearing) or at its own next vblank is the viewer's choice. The guest waits for neither.
+Flips with a sync interval that are not promoted (DWM's composition) are paced and retired by the tick. Whether the host
+shows an immediate frame at once (tearing) or at its own next vblank is the viewer's choice. The guest waits for neither.
 
 Counters: `ImmKnob`, `ImmDma` / `ImmMmio` (immediate flips armed by each lane), `ImmProg` (immediate programmings taken),
 `ImmVs` (completion vsyncs reported), `ImmVsNo` (immediate programmings without one: nothing new was published (a
