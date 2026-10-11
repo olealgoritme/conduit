@@ -20,7 +20,15 @@
 //! least recently used out: `ce_dup::Cache`), so a swap chain costs its few dups once.
 //! [`release_all`] gives everything back, youngest first: the channel's teardown calls it before
 //! the channel group when the GPU is idle, right after it when a copy may still be stuck (the
-//! group's free stops the channel), and always before the client's files close.
+//! group's free stops the channel), and always before the client's files close. Nothing else
+//! calls it: a release ahead of that teardown would unmap a window under a copy still queued.
+//!
+//! LIFETIME. No slot is given back while a submitted copy may read it: every submit with a
+//! slot's VA records the copy's completion value on the slot ([`note_submitted`]), and
+//! [`dup_map_record`] gives a slot back (eviction, re-make) only once the channel's completion
+//! reached it; otherwise it answers `ce_route::BUSY` and the job is prepared on a later pass. A
+//! job's VAs carry a `ce_dup::Lease`; [`lease_holds`] tells the dispatch whether its slots still
+//! map what they mapped when the job was prepared.
 //!
 //! LOCKING. `CACHE` is a leaf spinlock over plain data (no I/O under it). Every RM message runs at
 //! PASSIVE with no lock held, by the thread that holds the channel's `IO_BUSY` (the HPD worker in
@@ -50,6 +58,8 @@ pub(crate) struct Producer {
     pub sem_va: u64,
     /// The image: its mapping plus the record's plane offset.
     pub src_va: u64,
+    /// The slots both came from.
+    pub lease: cd::Lease,
 }
 
 static CACHE: SpinLock<Cache> = SpinLock::new(Cache::new());
@@ -64,6 +74,7 @@ static MAP_STAT: AtomicU32 = AtomicU32::new(0);
 static MAP_FLAGS: AtomicU32 = AtomicU32::new(0);
 static FREED: AtomicU32 = AtomicU32::new(0);
 static EVICT: AtomicU32 = AtomicU32::new(0);
+static BUSY_N: AtomicU32 = AtomicU32::new(0);
 
 /// `Layout` failure codes of [`dup_map_record`] (no RM call was made).
 const WHY_SOURCE: u32 = 0x70;
@@ -75,7 +86,8 @@ const WHY_SOURCE_LEN: u32 = 0x72;
 /// with the PTE kind from the record's modifier), and return the VAs of the semaphore ENTRY
 /// (memory VA + record offset) and of the image base (+ record offset). Never fatal: a refusal is
 /// counted and returned. PASSIVE, no lock held, the caller holds the channel's `IO_BUSY`; `h` is
-/// the channel's client (`ce_channel::handles`), `gen` its class generation.
+/// the channel's client (`ce_channel::handles`), `gen` its class generation. `ce_route::BUSY`
+/// when a slot it would give back is still read by a submitted copy (try again later).
 #[inline(never)]
 pub(crate) fn dup_map_record(
     io: &Io<'_>,
@@ -83,6 +95,10 @@ pub(crate) fn dup_map_record(
     rec: &StashedCeRecord,
     gen: Gen,
 ) -> Result<Producer, Fail> {
+    // The completion now: a slot whose copies have all landed may be given back. No channel: 0,
+    // so every slot that was ever read stays (the teardown gives them back).
+    let completed = ce::poll().map_or(0, |p| p.completed);
+    CACHE.lock().set_completed(completed);
     let r = rec.record;
     let (sem, src) = (r.semaphore, r.source);
     let desc = source_desc(rec);
@@ -91,7 +107,7 @@ pub(crate) fn dup_map_record(
     let sem_len = cd::semaphore_map_len(sem.offset)
         .ok_or(Fail::new(FailKind::Layout, WHY_SEMAPHORE_LEN))?;
     let src_len = cd::source_map_len(src.size).ok_or(Fail::new(FailKind::Layout, WHY_SOURCE_LEN))?;
-    let sem_map = slot_for(
+    let (sem_map, sem_id) = slot_for(
         io,
         h,
         Key {
@@ -102,7 +118,7 @@ pub(crate) fn dup_map_record(
             len: sem_len,
         },
     )?;
-    let src_map = slot_for(
+    let (src_map, src_id) = slot_for(
         io,
         h,
         Key {
@@ -119,7 +135,13 @@ pub(crate) fn dup_map_record(
     let src_va = src_map
         .checked_add(plan.offset)
         .ok_or(Fail::new(FailKind::Layout, WHY_SOURCE_LEN))?;
-    Ok(Producer { sem_va, src_va })
+    // Making the source gives back at most a source slot (each kind has its own slots), so the
+    // semaphore's id still names what `sem_map` maps.
+    Ok(Producer {
+        sem_va,
+        src_va,
+        lease: cd::Lease { sem: sem_id, src: src_id },
+    })
 }
 
 /// The record's producer VAs if BOTH its dups are cached under the client table's generation
@@ -135,10 +157,10 @@ pub(crate) fn cached_producer(rec: &StashedCeRecord, gen: Gen, client_gen: u64) 
     let mut c = CACHE.lock();
     c.set_generation(client_gen);
     let hit = |c: &mut cd::Cache, key: Key| match c.plan(&key) {
-        Plan::Hit(e) => Some(e.va),
-        Plan::Make { .. } => None,
+        Plan::Hit(e) => Some((e.va, e.id())),
+        Plan::Make { .. } | Plan::Busy => None,
     };
-    let sem_map = hit(
+    let (sem_map, sem_id) = hit(
         &mut *c,
         Key {
             client: sem.h_client,
@@ -148,7 +170,7 @@ pub(crate) fn cached_producer(rec: &StashedCeRecord, gen: Gen, client_gen: u64) 
             len: sem_len,
         },
     )?;
-    let src_map = hit(
+    let (src_map, src_id) = hit(
         &mut *c,
         Key {
             client: src.h_client,
@@ -161,7 +183,24 @@ pub(crate) fn cached_producer(rec: &StashedCeRecord, gen: Gen, client_gen: u64) 
     Some(Producer {
         sem_va: sem_map.checked_add(sem.offset)?,
         src_va: src_map.checked_add(plan.offset)?,
+        lease: cd::Lease { sem: sem_id, src: src_id },
     })
+}
+
+/// Whether both slots of `lease` still map what they mapped when its VAs were taken (neither was
+/// given back nor re-made since). Spinlock only. The dispatch checks it right before the submit;
+/// slots are given back only by the holder of the channel's `IO_BUSY` (the worker's preparation,
+/// the teardown) and the worker's dispatch, the only other user of a lease, runs on that thread.
+pub(crate) fn lease_holds(lease: &cd::Lease) -> bool {
+    CACHE.lock().holds_lease(lease)
+}
+
+/// A copy with the VAs of `lease` was submitted and releases `value`: its slots are not given
+/// back before the channel's completion reaches `value`. Spinlock only; call it right after the
+/// submit, before anything could plan a give-back (the submitter holds `IO_BUSY`, or is the
+/// worker, which is the only thread that prepares).
+pub(crate) fn note_submitted(lease: &cd::Lease, value: u64) {
+    CACHE.lock().note_submitted(lease, value);
 }
 
 /// The record's image as `ce_present::source_plan` reads it.
@@ -219,9 +258,10 @@ pub(crate) fn is_cached(client: u32, memory: u32) -> bool {
     CACHE.lock().is_cached(client, memory)
 }
 
-/// The mapping of `key`: the cached one, or a new dup + map in the slot the table picks (an
-/// evicted slot is given back first: its handles and window are reused).
-fn slot_for(io: &Io<'_>, h: &Handles, key: Key) -> Result<u64, Fail> {
+/// The mapping of `key` and the slot's id: the cached one, or a new dup + map in the slot the
+/// table picks (an evicted slot is given back first: its handles and window are reused; never one
+/// a submitted copy still reads: `ce_route::BUSY` then).
+fn slot_for(io: &Io<'_>, h: &Handles, key: Key) -> Result<(u64, cd::SlotId), Fail> {
     // A dup made before the client table last changed is never reused (`Cache::set_generation`):
     // the number may name another process's client by now.
     let gen = crate::virtio::nvrm_harden::client_generation();
@@ -231,7 +271,11 @@ fn slot_for(io: &Io<'_>, h: &Handles, key: Key) -> Result<u64, Fail> {
         c.plan(&key)
     };
     let slot = match plan {
-        Plan::Hit(e) => return Ok(e.va),
+        Plan::Hit(e) => return Ok((e.va, e.id())),
+        Plan::Busy => {
+            BUSY_N.fetch_add(1, Ordering::Relaxed);
+            return Err(super::ce_route::BUSY);
+        }
         Plan::Make { slot, evict } => {
             if let Some(old) = evict {
                 CACHE.lock().remove(old.slot);
@@ -267,8 +311,12 @@ fn slot_for(io: &Io<'_>, h: &Handles, key: Key) -> Result<u64, Fail> {
             if key.what == What::Source {
                 MAP_FLAGS.store(cd::map_word(used), Ordering::Relaxed);
             }
-            CACHE.lock().insert(slot, key, g.va, used.flags);
-            Ok(g.va)
+            let id = {
+                let mut c = CACHE.lock();
+                c.insert(slot, key, g.va, used.flags);
+                c.entry(slot).map(|e| e.id()).unwrap_or_default()
+            };
+            Ok((g.va, id))
         }
         Err(f) => {
             MAP_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -349,7 +397,7 @@ pub(super) fn forget() {
 pub(super) fn reset_for_start() {
     for c in [
         &DUP_N, &DUP_OK, &DUP_FAIL, &DUP_STAT, &MAP_OK, &MAP_FAIL, &MAP_STAT, &MAP_FLAGS, &FREED,
-        &EVICT,
+        &EVICT, &BUSY_N,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -378,4 +426,5 @@ fn publish(always: bool) {
     rec(b"CeDupLive", live);
     rec(b"CeDupFree", FREED.load(Ordering::Relaxed));
     rec(b"CeDupEvict", EVICT.load(Ordering::Relaxed));
+    rec(b"CeDupBusy", BUSY_N.load(Ordering::Relaxed));
 }
