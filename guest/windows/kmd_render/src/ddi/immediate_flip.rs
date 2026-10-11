@@ -152,6 +152,13 @@ pub(crate) fn complete_now(adapter: &AdapterContext, flip_address: u64) {
     }
 }
 
+/// The vsync tick delivered a CRTC_VSYNC carrying `address`: the next completion compares with
+/// it, so an immediate flip back to an address only the tick retired still completes at once.
+#[inline]
+pub(crate) fn note_tick_delivered(address: u64) {
+    LAST_DONE.store(address, Ordering::Relaxed);
+}
+
 /// Mirror the counters into the service key when one moved. PASSIVE (the periodic dump).
 pub(crate) fn publish_counters() {
     if DIRTY.swap(0, Ordering::AcqRel) == 0 {
