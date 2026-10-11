@@ -1,12 +1,13 @@
 # D3D11 threaded front end (UMD worker thread)
 
-Status: phase 1, off by default (`UmdThreadedFrontend=1` turns it on) while CS2's texture corruption with it on is
-isolated; `UmdFrontendSync` (section 7) takes one call class at a time off the threaded path for that.
+Status: phase 1, on by default for every process except dwm.exe (`UmdThreadedFrontend=1`; `0` turns it off).
+`UmdFrontendSync` (section 7) takes one call class at a time off the threaded path for A/B runs.
 
 ## 1. Why
 
 CS2 on the win11 guest (PERF-ROADMAP.md §1h) is bound by one thread: `D3D11RenderThread` runs at 99.7% of a core and
-sets the frame rate (~150 fps, 6.6 ms per frame). Per frame on that thread:
+sets the frame rate. With the D3D11 front end inline on that thread (front end off, ~150 fps, 6.6 ms per frame), per
+frame:
 
 | where | ms | share |
 |---|---|---|
@@ -25,8 +26,8 @@ The threaded front end does the same in our UMD: the immediate-context DDI calls
 ring as small closures and a UMD worker thread replays them into the forward layer and DXVK. Only calls that have to
 answer synchronously stay on the app thread.
 
-Target: UMD share on the render thread 46% → 5–10%, frame 6.6 ms → about 4 ms, if the worker (≈3 ms of front-end
-work per frame) and `dxvk-cs` keep up.
+The aim is a UMD share of 5–10% on the render thread and a frame of about 4 ms, as long as the worker (≈3 ms of
+front-end work per frame) and `dxvk-cs` keep up.
 
 ## 2. Where to defer: the DDI boundary
 
@@ -75,9 +76,10 @@ helper devices).
   (the D3D11 device lock, or the app's promise under `D3D11_CREATE_DEVICE_SINGLETHREADED`), so there is one producer
   at a time; the producer state is not thread-local, and the runtime's lock gives the happens-before between
   successive producer threads.
-- **Worker**: pops records in order and calls them, then advances the consumer cursor (`done`). It spins about 20 µs
-  on an empty ring, then parks; the producer unparks it only when it published into a ring the worker announced it
-  is sleeping on (Dekker-style flag + recheck), so a busy frame costs no wakes.
+- **Worker**: pops records in order and calls them, then advances the consumer cursor (`done`). It spins 100 µs on
+  an empty ring, then parks (1 ms, then 4 ms, then 50 ms after a quarter second idle); the producer unparks it only
+  when it published into a ring the worker announced it is sleeping on (Dekker-style flag + recheck: the producer's
+  cursor store is SeqCst, so it is ordered before its read of the flag), so a busy frame costs no wakes.
 - **Waiting for the worker**: `wait_done(pos)` returns once `done >= pos`; `drain()` is `wait_done(write cursor)`.
   Spins briefly, then sleeps on a condvar the worker signals after each batch while anyone waits.
 - **Backpressure**: a producer that finds no room waits for the worker (spin, then the same condvar). Memory is bounded
@@ -150,7 +152,7 @@ The BUILD_2 recycle path (`RecycleCommandList` on a DC hands an escrowed list to
 waits until the worker has passed that position, so a list is never reset while an execute of it is still queued.
 `RecycleDestroyCommandList` / `RecycleCreateCommandList` / `RecycleCreateDeferredContext` are free-threaded and stay
 device-level. `DestroyCommandList` goes through the destruction path (§5.5). `QueryEnd`s inside an executed list do
-not stamp `end_pos`; DXVK's own query reset counter covers that today and must be rechecked with phase 2.
+not stamp `end_pos`; DXVK's own query reset counter covers that; phase 2 has to recheck it.
 
 ### 5.2 Map / Unmap
 
@@ -228,7 +230,7 @@ app thread's next discard takes it and does not allocate; without one it allocat
     `GetData(query, nullptr, 0, 0)` on the worker. `ConsiderFlush` may decline (few chunks, submissions in flight),
     and upstream DXVK recovers because every pending poll asks again, so every unflagged pending poll queues a new
     hint once the worker has run the previous one (the region remembers the last hint's position): at most one is
-    outstanding per query, and a `while (GetData(q) == S_FALSE) {}` loop keeps asking exactly as it does today.
+    outstanding per query, and a `while (GetData(q) == S_FALSE) {}` loop keeps asking exactly as it does with the front end off.
 - A GetData `S_OK` for an event query still means "all work before End finished on the GPU": DXVK can only report it
   after replaying End, which the worker reaches after every record before it.
 
@@ -252,7 +254,7 @@ past every record recorded before it.
   thread is recording a use of it; every record that used it was published before the release that led to the
   destroy, and `P` (read with acquire) covers it.
 - **Device destruction**: `DestroyDevice` drains, runs the remaining queued destroys, stops and joins the worker,
-  then proceeds as today.
+  then proceeds as with the front end off.
 
 ### 5.6 Views and state objects
 
@@ -271,7 +273,7 @@ mutex right after `pfnFlush` returns, and the gate may call `pfnRenderCb`), so i
 ### 5.8 Present, SetFullscreen, ResizeBuffers, the KMD present path
 
 Every DXGI DDI that orders against rendering drains and runs inline. At `Present` the worker has replayed every record of the frame into DXVK, so the
-present path sees exactly the state it sees today: `present_frame_gate` orders against DXVK's submission, the KMD
+present path sees exactly the state it sees with the front end off: `present_frame_gate` orders against DXVK's submission, the KMD
 present (Blt / flip / `pfnPresentCb`), the scan-out snapshot, the Helios scan-out acquire (armed by DXVK at submit),
 and the present-stream correlation are unchanged. `SetFullscreen` (`SetDisplayMode`), `ResizeBuffers` (destroys +
 creates + `RotateResourceIdentities`) are DXGI calls or resource lifetime calls and synchronous.
@@ -320,7 +322,7 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 
 ## 7. Knobs and counters
 
-- `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 0 = off (default), 1 = on for every process except dwm.exe,
+- `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 1 = on for every process except dwm.exe (default), 0 = off,
   2 = on including dwm.exe. Process override `HELIOS_D3D11_FRONTEND=0|1`.
 - `UmdFrontendRingKiB` (DWORD, default 4096, clamped 256–65536).
 - `UmdFrontendSync` (DWORD bitmask, default 0): call classes forced onto the synchronous path, for A/B runs that pin a
@@ -353,12 +355,12 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 
 ## 8. Phases
 
-1. **Core + hot path** (this change): ring + worker + destroy queue + error stash in `umd_common` (host unit tests);
+1. **Core + hot path** (implemented): ring + worker + destroy queue + error stash in `umd_common` (host unit tests);
    deferred draw / bind / state / constant-buffer / clear / copy / query / flush paths; split buffer map; split
-   GetData; synchronous everything else with the `d3d11_context` safety net; DXVK patch 0018. Measure with
-   `d3d11_drawbench`, then CS2.
+   GetData; synchronous everything else with the `d3d11_context` safety net; DXVK patch 0018 (with the worker's
+   pre-allocated discard slices).
 2. Texture `UpdateSubresourceUP` payloads; `CommandListExecute` if CS2 shows it (until then synchronous).
-3. Pre-renamed slice pool for discards; split resource destruction; tune spin/park; consider deferring `Present`.
+3. Split resource destruction; tune spin/park; consider deferring `Present`.
 
 ## 9. Measuring
 
@@ -369,51 +371,45 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
   producer cost (about 15 ns per 64-byte record on the build host, the worker consuming concurrently).
 - CS2 (by the owner): fps and the render-thread profile (`thread-sample.ps1`), worker thread share, `dxvk-cs` share.
 
-### Results so far
+### Results
 
-`d3d11_drawbench` on 22.22.405.46 (first version, before the cache-line and pre-allocation changes), win11 on
-2 MiB pages, alternating runs in the same package:
-
-| draws/frame | off: µs/frame (µs/draw) | on: µs/frame (µs/draw) |
-|---|---|---|
-| 2000 | 455–469 (0.23) | 587–625 (0.29–0.31) |
-| 4000 | 924–941 (0.23–0.24) | 1230–1267 (0.31–0.32) |
-
-Correct and stable (no errors, worker never behind: `full_waits=0`, no drains besides teardown), but slower on the
-app thread: drawbench's working set stays in cache, so the inline front end costs only ~0.23 µs per draw including
-the runtime, and the discard map's allocation still ran on the app thread. Found and fixed after it: the worker read
-the producer's cursor line on every forward call (the ordering check tested the cursors before the thread), the
-producer-hot fields were not on their own cache lines, and the slice allocation now leaves the app thread. CS2's
-front-end cost is cold-miss bound, which drawbench does not reproduce; it needs its own A/B.
-
-On 22.22.405.47 (with those changes), `present` mode (flip swap chain, Present every frame), two alternations:
+`d3d11_drawbench` `present` mode (flip swap chain, Present every frame), win11 on 2 MiB pages, alternating runs in the
+same package:
 
 | mode | off: µs/draw, frame sd | on: µs/draw, frame sd |
 |---|---|---|
 | real, 2000 draws | 1.08 / 1.00, sd 18% / 12% | 0.95 / 0.90, sd 18% / 12% |
 | hot, 2000 draws | 0.29 / 0.30, sd 14% / 27% | 0.46 / 0.43, sd 11% / 11% |
 
-The game-like load gains 10–14% with unchanged pacing; the cache-hot loop still loses (record and replay cost more
-than the inline path there). CS2 (user test): higher average frame rate with the front end on. The render thread now
-spins (up to 4 ms) instead of sleeping while it waits at Present for the frame's tail, and the worker spins 100 µs
-before parking, so a frame boundary is not a sleep/wake handshake.
+The game-like load (`real`: thousands of distinct objects, varied binding order) is 10–14% faster with the front end
+and paces the same; the cache-hot loop is slower (record and replay cost more than the inline path when everything
+stays in cache). CS2's front-end cost is cold-miss bound like `real`.
 
-## 10. Review
+CS2 demo playback (1600x900, alternating runs): 268–272 fps average with the front end, 261–268 fps without; the
+slowest second 142–193 fps with it, 84–99 fps without. The front end evens out the frames more than it raises the
+average.
 
-An independent review of this design (before implementation) found, and the design above now handles:
+At Present the render thread spins (up to 4 ms) instead of sleeping while it waits for the frame's tail, and the
+worker spins 100 µs before parking, so a frame boundary is not a sleep/wake handshake.
 
-- a deferred `Flush` replaying the forward `flush`, which could run the shared-resource gate (`pfnRenderCb`, the
-  `Cell` command windows) on the worker → the record calls only `ID3D11DeviceContext::Flush` (§5.7);
-- one GetData flush hint per `End` can leave a spinning app hung when `ConsiderFlush` declines → re-hint per pending
-  poll, one outstanding (§5.4);
-- the safety net is not the guarantee (bridge entry points use the context directly) → explicit drains on every DXGI
-  and shared-resource path (§4);
-- a GetData between a queued Begin and its End reported as device removed → Begin stamps too (§5.4);
-- stashed errors other than device removal are not reportable from arbitrary DDIs → dropped and counted (§5.10);
-- discarded slices not bounded by the ring → a 64 MiB outstanding-discard bound; map-mode check; device-lost answer
-  (§5.2);
-- process-exit hang, `DISABLE_EXTRA_THREAD_CREATION`, `UmdFreeThreaded=0` (§3);
-- the recycle DDIs are free-threaded, `Discard` of a host-visible buffer writes `m_mapPtr` (§4, §5.1).
+## 10. Invariants
+
+The design above depends on these; each is handled where the section says:
+
+- a deferred `Flush` record calls only `ID3D11DeviceContext::Flush`, never the forward `flush`, which could run the
+  shared-resource gate (`pfnRenderCb`, the `Cell` command windows) on the worker (§5.7);
+- every pending, unflagged GetData poll re-hints a flush, one outstanding per query, so a spinning app cannot hang
+  when `ConsiderFlush` declines (§5.4);
+- the safety net is a backstop, not the guarantee: bridge entry points use the context directly, so every DXGI and
+  shared-resource path drains explicitly (§4);
+- `QueryBegin` stamps its position too, so a GetData between a queued Begin and its End is never reported as device
+  removed (§5.4);
+- only device removal is reported from a stashed error; other stashed errors are counted and dropped (§5.10);
+- discarded slices handed out ahead of the worker are bounded at 64 MiB; the map mode is checked; a lost device
+  answers a null mapping (§5.2);
+- process exit, `DISABLE_EXTRA_THREAD_CREATION` and `UmdFreeThreaded=0` never get or never wait on a worker (§3);
+- the recycle DDIs are free-threaded and stay device-level; `Discard` of a host-visible buffer writes `m_mapPtr` and is
+  synchronous (§4, §5.1).
 
 ## 11. Risks
 
