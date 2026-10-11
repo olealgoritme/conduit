@@ -53,6 +53,7 @@ pub(crate) mod present_foreign;
 pub(crate) mod present_packet;
 pub(crate) mod query_adapter_info;
 pub(crate) mod scanout_timeline;
+pub(crate) mod scaled_flip;
 pub(crate) mod scanout_trace;
 mod scheduler;
 pub(crate) mod segment_table;

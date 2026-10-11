@@ -793,11 +793,10 @@ pub(crate) enum PresentPayload<'a> {
     AllocationList(PresentAllocationList<'a>),
     /// `FlipWithMultiPlaneOverlay` — the `pPresentMultiPlaneOverlayInfo` arm.
     ///
-    /// Unreachable: the driver does not register the MPO3 KMD interface
-    /// (`query_adapter_info.rs`'s cap surface), so dxgkrnl never sets this. It
-    /// is a named variant rather than an assumption so that if it ever arrives,
-    /// the code refuses instead of reinterpreting an MPO struct as an
-    /// allocation array.
+    /// Reached only with `ScaledFlip` on (`ddi::scaled_flip`: one overlay plane
+    /// in the caps). It never yields an allocation list: an MMIO plane flip is
+    /// accepted with nothing generated (the plane DDI carries the allocation),
+    /// anything else is refused, never reinterpreted as an allocation array.
     MultiPlaneOverlay,
 }
 

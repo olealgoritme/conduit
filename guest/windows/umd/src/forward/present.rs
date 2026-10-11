@@ -3269,11 +3269,13 @@ pub(crate) unsafe extern "system" fn dxgi_reclaim_resources(
 // R830 (OWNER DECISION): name the literals, DO NOT change the values.
 // ---------------------------------------------------------------------------
 //
-// Helios advertises MaxPlanes = 16, 16x stretch and shrink, and BILINEAR
-// filtering, while the KMD deliberately does not register the MPO3 interface
-// (query_adapter_info.rs pins the display surface to WDDM 2.1) and dxgi_blt1
-// rejects any stretch with DXGI_ERROR_UNSUPPORTED. So these are caps with no
-// kernel overlay path behind them.
+// Without the KMD's `ScaledFlip` plane (the default) Helios advertises
+// MaxPlanes = 16, 16x stretch and shrink, and BILINEAR filtering, while the
+// KMD reports no overlay plane and registers no multi-plane overlay DDI, and
+// dxgi_blt1 rejects any stretch with DXGI_ERROR_UNSUPPORTED. So these are caps
+// with no kernel overlay path behind them. With the KMD's plane reported
+// (KMTQAITYPE_MULTIPLANEOVERLAY_SUPPORT), `scaled_mpo_groups` replaces them
+// with the one plane the KMD backs (docs/independent-flip.md section 14).
 //
 // The review's own correction stands and is worth keeping visible: the plane
 // count IS already a named constant (DXGI_MPO_MAX_PLANES), and
@@ -3314,6 +3316,47 @@ pub(crate) const HELIOS_MPO_GROUPS: u32 = 1;
 /// there is no filter path behind it.
 pub(crate) const HELIOS_MPO_OVERLAY_CAPS: u32 = RGB | BILINEAR | SHARED | IMMEDIATE;
 
+/// The scaled-direct-flip caps (`ScaledFlip` in the KMD, docs/independent-flip.md section 14):
+/// one plane the host can stretch as a whole, by up to `SCALED_MPO_MAX_STRETCH` per axis
+/// (`helios_kmd_logic::scaled_flip::MAX_STRETCH`) and never shrink, as a plane group and/or a panel
+/// fitter group (`knobs::mpo_caps`). `None` when the KMD reports no overlay plane: the legacy caps.
+fn scaled_mpo_groups() -> Option<&'static [ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS]> {
+    if !crate::forward::transfer::kmd_reports_overlay_plane() {
+        return None;
+    }
+    static GROUPS: std::sync::OnceLock<[ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS; 2]> =
+        std::sync::OnceLock::new();
+    let groups = GROUPS.get_or_init(|| {
+        let plane = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
+            NumPlanes: SCALED_MPO_PLANES,
+            MaxStretchFactor: SCALED_MPO_MAX_STRETCH,
+            MaxShrinkFactor: SCALED_MPO_MAX_SHRINK,
+            OverlayCaps: RGB | BILINEAR | IMMEDIATE,
+            StereoCaps: 0,
+        };
+        let fitter = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
+            OverlayCaps: RGB | BILINEAR | IMMEDIATE | FULLSCREEN_POST_COMPOSITION,
+            ..plane
+        };
+        [plane, fitter]
+    });
+    Some(match crate::knobs::mpo_caps() {
+        1 => &groups[..1],
+        2 => &groups[1..],
+        _ => &groups[..],
+    })
+}
+
+/// The one plane of the scaled-direct-flip caps (`DXGK_DRIVERCAPS.MaxOverlayPlanes` = 1).
+const SCALED_MPO_PLANES: u32 = 1;
+/// The KMD accepts a destination up to 8 times the source per axis.
+const SCALED_MPO_MAX_STRETCH: f32 = 8.0;
+/// The KMD never shrinks (a buffer larger than the mode is refused).
+const SCALED_MPO_MAX_SHRINK: f32 = 1.0;
+/// The panel-fitter group bit.
+const FULLSCREEN_POST_COMPOSITION: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_FULLSCREEN_POST_COMPOSITION
+    as u32;
+
 pub(crate) unsafe extern "system" fn dxgi_get_mpo_caps(
     arg: *mut ddi::DXGI_DDI_ARG_GETMULTIPLANEOVERLAYCAPS,
 ) -> i32 {
@@ -3321,14 +3364,21 @@ pub(crate) unsafe extern "system" fn dxgi_get_mpo_caps(
         return 0;
     }
     let a = &mut *arg;
-    a.MultiplaneOverlayCaps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
-        MaxPlanes: DXGI_MPO_MAX_PLANES,
-        NumCapabilityGroups: HELIOS_MPO_GROUPS,
+    a.MultiplaneOverlayCaps = match scaled_mpo_groups() {
+        Some(groups) => ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
+            MaxPlanes: SCALED_MPO_PLANES,
+            NumCapabilityGroups: groups.len() as u32,
+        },
+        None => ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
+            MaxPlanes: DXGI_MPO_MAX_PLANES,
+            NumCapabilityGroups: HELIOS_MPO_GROUPS,
+        },
     };
     if MPO_LOG_COUNT.first_n(16).is_some() {
         log_error!(
-            "DXGI GetMultiplaneOverlayCaps: MaxPlanes={} groups=1",
-            DXGI_MPO_MAX_PLANES
+            "DXGI GetMultiplaneOverlayCaps: MaxPlanes={} groups={}",
+            a.MultiplaneOverlayCaps.MaxPlanes,
+            a.MultiplaneOverlayCaps.NumCapabilityGroups
         );
     }
     0
@@ -3341,23 +3391,28 @@ pub(crate) unsafe extern "system" fn dxgi_get_mpo_group_caps(
         return 0;
     }
     let a = &mut *arg;
-    a.MultiplaneOverlayGroupCaps = if a.GroupIndex == 0 {
-        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
+    a.MultiplaneOverlayGroupCaps = match scaled_mpo_groups() {
+        Some(groups) => groups
+            .get(a.GroupIndex as usize)
+            .copied()
+            .unwrap_or_default(),
+        None if a.GroupIndex == 0 => ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
             NumPlanes: DXGI_MPO_MAX_PLANES,
             MaxStretchFactor: HELIOS_MPO_MAX_STRETCH,
             MaxShrinkFactor: HELIOS_MPO_MAX_SHRINK,
             OverlayCaps: HELIOS_MPO_OVERLAY_CAPS,
             StereoCaps: 0,
-        }
-    } else {
-        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS::default()
+        },
+        None => ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS::default(),
     };
     if MPO_LOG_COUNT.first_n(16).is_some() {
         log_error!(
-            "DXGI GetMultiplaneOverlayGroupCaps: group={} planes={} caps=0x{:x}",
+            "DXGI GetMultiplaneOverlayGroupCaps: group={} planes={} caps=0x{:x} stretch={} shrink={}",
             a.GroupIndex,
             a.MultiplaneOverlayGroupCaps.NumPlanes,
-            a.MultiplaneOverlayGroupCaps.OverlayCaps
+            a.MultiplaneOverlayGroupCaps.OverlayCaps,
+            a.MultiplaneOverlayGroupCaps.MaxStretchFactor,
+            a.MultiplaneOverlayGroupCaps.MaxShrinkFactor
         );
     }
     0

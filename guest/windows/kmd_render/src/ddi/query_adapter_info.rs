@@ -481,6 +481,27 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // display was an IddCx capture and the KMD scanned out nothing; that premise is gone.)
     let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
+    // `ScaledFlip` (default 0, `ddi::scaled_flip`, docs/independent-flip.md section 14): one
+    // overlay plane, the primary itself, which the host can stretch as a whole. With it dxgkrnl
+    // may flip a full-screen swap chain smaller than the mode instead of composing it; the plane
+    // DDIs (registered in `DriverEntry` under the same knob) refuse every configuration but the
+    // whole buffer shown at the whole output or its aspect-correct rectangle. Immediate plane
+    // flips follow `FlipImmediateMmIo` (bit 3), the queue depth the flip queue's. Each field is
+    // bounds-checked by `VersionedOut` like every other (a short buffer drops it, `CapTrunc`).
+    if crate::ddi::scaled_flip::on() {
+        const FLIPCAPS_FLIP_IMMEDIATE_MMIO: u32 = 1 << 3;
+        let yes: BOOLEAN = 1;
+        out.set(caps_offset!(SupportMultiPlaneOverlay), yes);
+        let planes: UINT = helios_kmd_logic::scaled_flip::MAX_PLANES;
+        out.set(caps_offset!(MaxOverlayPlanes), planes);
+        if flip_caps & FLIPCAPS_FLIP_IMMEDIATE_MMIO != 0 {
+            out.set(caps_offset!(SupportMultiPlaneOverlayImmediateFlip), yes);
+        }
+        out.set(
+            caps_offset!(MaxQueuedMultiPlaneOverlayFlipVSync),
+            max_queued_flip_on_vsync,
+        );
+    }
     // `D3d12Node`: a second 3D node (ordinal 1) for the D3D12 UMD's contexts,
     // completed independently of node 0 (`virtio::gpu`, "WDDM nodes"). The count
     // dxgkrnl gets here is the one every per-node path validates against.

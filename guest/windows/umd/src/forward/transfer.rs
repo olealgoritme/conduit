@@ -926,6 +926,21 @@ pub(crate) fn kmd_reports_independent_flip() -> bool {
     })
 }
 
+const KMTQAITYPE_MULTIPLANEOVERLAY_SUPPORT: u32 = 20;
+
+/// Does dxgkrnl report multi-plane overlay support (KMTQAITYPE_MULTIPLANEOVERLAY_SUPPORT, derived
+/// from the KMD's `SupportMultiPlaneOverlay`, i.e. its `ScaledFlip` knob) for a hardware render
+/// adapter? Asked once per process. Off by default (docs/independent-flip.md section 14).
+pub(crate) fn kmd_reports_overlay_plane() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        // SAFETY: as `kmd_reports_direct_flip`.
+        let r = unsafe { query_adapter_support(KMTQAITYPE_MULTIPLANEOVERLAY_SUPPORT) };
+        log_error!("dxgkrnl MultiPlaneOverlay support = {r}");
+        r
+    })
+}
+
 /// Whether any hardware render adapter answers `kind` (a `KMTQAITYPE_*` whose answer starts
 /// with a BOOL `Supported`) with yes.
 unsafe fn query_adapter_support(kind_query: u32) -> bool {

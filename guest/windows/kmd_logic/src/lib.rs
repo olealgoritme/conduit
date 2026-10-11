@@ -48,6 +48,7 @@ pub mod host_flip_done;
 pub mod host_vblank;
 pub mod hpd_wake;
 pub mod independent_flip;
+pub mod scaled_flip;
 pub mod rm_resource_import;
 pub mod page_runs;
 pub mod rm_client;

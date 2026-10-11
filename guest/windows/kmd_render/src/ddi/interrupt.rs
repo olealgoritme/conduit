@@ -510,6 +510,17 @@ pub unsafe extern "C" fn dxgkddi_control_interrupt(
 ) -> NTSTATUS {
     CONTROL_INT_COUNT.fetch_add(1, Ordering::Relaxed);
     let p = h_adapter as *const AdapterContext;
+    // `ScaledFlip`: the legacy and the multi-plane overlay vsync types share the delivery gate
+    // (`ddi::scaled_flip`). `None` with the knob off: the handling below, unchanged.
+    if !p.is_null() {
+        // SAFETY: dxgkrnl hands our AdapterContext, valid for the device lifetime.
+        let adapter = unsafe { &*p };
+        if let Some(status) =
+            crate::ddi::scaled_flip::control_interrupt(adapter, interrupt_type, enable != 0)
+        {
+            return status;
+        }
+    }
     if !p.is_null()
         && interrupt_type == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC
         // SAFETY: dxgkrnl hands our AdapterContext; `display_half` is a plain bool

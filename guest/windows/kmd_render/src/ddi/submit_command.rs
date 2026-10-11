@@ -855,7 +855,7 @@ unsafe extern "C" fn notify_dma_completed_routine(context: *mut c_void) -> BOOLE
 /// IRQL: hand it to `DxgkCbNotifyInterrupt` from inside a
 /// `DxgkCbSynchronizeExecution` callback (which raises to the device's DIRQL),
 /// then `DxgkCbQueueDpc` so dxgkrnl drains the packet. Callable at <= DIRQL.
-unsafe fn notify_at_dirql(
+pub(crate) unsafe fn notify_at_dirql(
     dxgkrnl: &DXGKRNL_INTERFACE,
     interrupt: &mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
 ) -> NTSTATUS {
@@ -966,6 +966,14 @@ pub(crate) unsafe fn signal_crtc_vsync(
     physical_address: i64,
     target_id: u32,
 ) -> NTSTATUS {
+    // `ScaledFlip` (`ddi::scaled_flip`): while dxgkrnl flips through the plane DDI, the vsync names
+    // the plane flip's `PresentId` instead of the address. `None` (always, with the knob off): the
+    // address form below.
+    if let Some(status) =
+        unsafe { crate::ddi::scaled_flip::signal_vsync(dxgkrnl, physical_address, target_id) }
+    {
+        return status;
+    }
     let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
     interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC;
     // SAFETY: CrtcVsync is the correct union arm for DXGK_INTERRUPT_CRTC_VSYNC.

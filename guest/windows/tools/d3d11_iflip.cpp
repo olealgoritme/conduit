@@ -41,6 +41,10 @@
 //     exclusive   full-screen exclusive (SetFullscreenState TRUE) at size=WxH (default: the current
 //                 mode): Windows switches the output to that mode. ALLOW_TEARING is not allowed in
 //                 exclusive mode, so `tearing` is dropped there; interval0 is immediate anyway.
+//     modeswitch  DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH on the swap chain. Without it DXGI keeps
+//                 the desktop mode on SetFullscreenState (`exclusive`) and the chain is scaled
+//                 (by DWM, or by the display with a hardware-composition plane); with it the output
+//                 switches to the closest listed mode to size=WxH.
 //     size=WxH    swap chain (and borderless window) size (default: the output's current mode)
 //     setmode=WxH ChangeDisplaySettingsEx the output to WxH first (CDS_FULLSCREEN, as SDL's
 //                 exclusive full screen does), restored at the end; the window then covers it
@@ -166,7 +170,7 @@ int main(int argc, char** argv) {
   }
   int seconds = 20;
   double fpsCap = 0.0;
-  bool exclusive = false, listModes = false, counter = false;
+  bool exclusive = false, listModes = false, counter = false, modeSwitch = false;
   UINT reqW = 0, reqH = 0, setW = 0, setH = 0;
   bool windowed = false, interval0 = false, tearing = false, rgba = false;
   int buffers = 2, adapterIndex = -1;
@@ -177,6 +181,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "window")) windowed = true;
     else if (!strcmp(a, "interval0")) interval0 = true;
     else if (!strcmp(a, "tearing")) tearing = true;
+    else if (!strcmp(a, "modeswitch")) modeSwitch = true;
     else if (!strcmp(a, "cursor")) g_hide_cursor = false;
     else if (!strcmp(a, "rgba")) rgba = true;
     else if (!strncmp(a, "buffers=", 8)) buffers = atoi(a + 8);
@@ -380,10 +385,12 @@ int main(int argc, char** argv) {
   sd.BufferCount = buffers;
   sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
   sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-  sd.Flags = tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+  sd.Flags = (tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) |
+             (modeSwitch ? DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH : 0);
   IDXGISwapChain1* sc = nullptr;
   hr = factory->CreateSwapChainForHwnd(dev, hwnd, &sd, nullptr, nullptr, &sc);
-  L("CreateSwapChainForHwnd(FLIP_DISCARD %ux%u) hr=0x%08x", width, height, (unsigned)hr);
+  L("CreateSwapChainForHwnd(FLIP_DISCARD %ux%u flags=0x%x) hr=0x%08x", width, height,
+    (unsigned)sd.Flags, (unsigned)hr);
   if (FAILED(hr)) return 4;
   factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
   IDXGISwapChainMedia* media = nullptr;

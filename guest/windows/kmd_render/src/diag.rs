@@ -1409,6 +1409,13 @@ pub mod knobs {
     /// and a DMA-buffer flip of an unregistered Venus allocation completes as a kept picture
     /// instead of failing (`PBFlip` 0xE6). Read with the other adapter knobs; mirrored as `IdfKnob`.
     pub const INDEP_FLIP: KnobName = KnobName::new(b"IndepFlip");
+    /// `ScaledFlip` (default 0): the single-plane multi-plane overlay surface
+    /// (`docs/independent-flip.md` section 14, `helios_kmd_logic::scaled_flip`). 1 reports
+    /// `SupportMultiPlaneOverlay` with one plane, registers the MPO3 DDIs and retires plane flips by
+    /// `PresentId`, so dxgkrnl can flip a full-screen swap chain smaller than the mode straight to
+    /// scan-out (the host scales it). Any other value is off. Read ONCE, in `DriverEntry` (the DDI
+    /// table is built there): a change needs a reboot. Mirrored as `SflKnob`.
+    pub const SCALED_FLIP: KnobName = KnobName::new(b"ScaledFlip");
     /// `D3d12Node` (default 0): 1 reports a second 3D node (ordinal 1) for the D3D12 UMD's
     /// contexts (`Umd12ContextNode`), completed independently of node 0 (DWM, D3D11,
     /// presents, paging): `virtio::gpu::MAX_WDDM_NODES`. Read with the other adapter knobs at

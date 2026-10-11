@@ -1241,6 +1241,27 @@ pub(crate) unsafe fn allocation_resource_id(adapter: &AdapterContext, h: HANDLE)
     Some(ctx.resource_id)
 }
 
+/// What `ScaledFlip`'s plane check needs of an allocation (`helios_kmd_logic::scaled_flip::
+/// Source`): its extent, its DXGI format and whether it is an adopted foreign (NVK-on-RM)
+/// allocation, the only kind `ForeignFlip` shows at a size other than the mode's. `None` for a
+/// null, foreign-to-this-driver or older-generation handle. DISPATCH-safe (see
+/// [`resolve_current_alloc`]).
+///
+/// # Safety
+/// Same contract as [`scanout_alloc_info`].
+pub(crate) unsafe fn scaled_flip_source(
+    adapter: &AdapterContext,
+    h: HANDLE,
+) -> Option<helios_kmd_logic::scaled_flip::Source> {
+    let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
+    Some(helios_kmd_logic::scaled_flip::Source {
+        width: ctx.width,
+        height: ctx.height,
+        dxgi_format: ctx.dxgi_format,
+        foreign: ctx.foreign.is_some(),
+    })
+}
+
 /// Resolve a primary allocation's `hAllocation` (the CreateAllocation handle
 /// dxgkrnl passes in `SetVidPnSourceAddress`) to its scan-out geometry + layout
 /// for `SET_SCANOUT_BLOB`. Returns `None` for a null/foreign handle or an

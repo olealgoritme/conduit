@@ -1,7 +1,8 @@
 # Independent flip (direct flip) of flip-model swap chains: KMD design
 
-Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 0), see section 11; flip completion from the host behind
-`FlipDoneHost` (default 0), section 13; the rest is design. The decision table of
+Status: stage S-1 IMPLEMENTED behind `IndepFlip` (default 1 since 405.49), see sections 11 and 13.10; flip completion from
+the host behind `FlipDoneHost` (default 0), section 13; scaled direct flip of a swap chain smaller than the mode behind
+`ScaledFlip` (default 0), section 14; the rest is design. The decision table of
 section 6 (`kmd_logic/src/independent_flip.rs`) is now wired as a census, and with `IndepFlip=2` it removes the `PBFlip` 0xE6
 failure.
 Written against v327 (`225ce42`, branch `kmd/independent-flip-design`). Line numbers are that commit's.
@@ -109,11 +110,11 @@ caps without running any application (section 7, S-0).
 | `FlipCaps.FlipInterval` (bit 2, "Support FLIPINTERVAL_TWO, _THREE, _FOUR") | not set | clear | consider in S-2: the driver then holds a flip for 2 to 4 intervals natively (`D3DKMT_FLIPINFOFLAGS.FlipInterval`, [H `:1887-1891`]); today dxgkrnl emulates [M] | [HK `d3dkmddi.h:1975`] |
 | `MaxQueuedFlipOnVSync` | `:408-435`, knob `FlipQueueN` | 1 | 1 first, then 2 (section 4.4) | [T] |
 | `MaxPointerWidth/Height`, `PointerCaps` | not written (the buffer is zero-filled, `:206`) | 0: no hardware pointer | probably needed (section 4.5) | offsets 24, 28, 32; `DXGK_POINTERFLAGS` = Monochrome / Color / MaskedColor [HK `d3dkmddi.h:1689-1702`]; need is [M] |
-| `MaxOverlays` (44), `SupportMultiPlaneOverlay` (540), `MaxOverlayPlanes` (544, `>= WDDM1_3`) and the 2.1 fields `SupportMultiPlaneOverlayImmediateFlip` (569), `CursorScaledWithMultiPlaneOverlayPlane0` (570), `MaxQueuedMultiPlaneOverlayFlipVSync` (572) | not written | 0 | 0 until S-5 | offsets from the header [HK `d3dkmddi.h:2417, 2442, 2448, 2457-2460`]; a host test forbids spelling them in `kmd_render` (`shared-formats.md` section "No overlay planes") |
+| `MaxOverlays` (44), `SupportMultiPlaneOverlay` (540), `MaxOverlayPlanes` (544, `>= WDDM1_3`) and the 2.1 fields `SupportMultiPlaneOverlayImmediateFlip` (569), `CursorScaledWithMultiPlaneOverlayPlane0` (570), `MaxQueuedMultiPlaneOverlayFlipVSync` (572) | `query_adapter_info.rs`, only with `ScaledFlip` | 0 (`ScaledFlip` = 1: one plane, section 14) | not needed for a swap chain at the mode's size | offsets from the header [HK `d3dkmddi.h:2417, 2442, 2448, 2457-2460`]; a host test confines the names to the `ScaledFlip` files (`shared-formats.md`, "No YUV overlay plane") |
 | `MiscCaps` (576, `>= WDDM2_4`) | not written | 0 | 0 | bits `SupportContextlessPresent`, `Detachable`, `VirtualGpuOnly`, ... `CursorDoesNotSupportXorBlendWithMultiPlaneOverlay` [HK `:2464-2503`]; nothing here for flip |
 | `WDDMVersion` / `DRIVER_INITIALIZATION_DATA.Version` | `wddm_surface.rs:64` | 2.1 + GpuMmu | stay 2.1: at 3.2 DWM fails `E_NOTIMPL` because MPO3 is not registered (`wddm_surface.rs:19-27`) | [T]; version values `0x6003` (2.1), `0x700A` (2.2), `0x11007` (3.2) [HK `d3dukmdt.h:41-54`] |
 | `D3DKMDT_VIDPN_SOURCE_MODE` pixel formats | `vidpn.rs:288-292` | `A8R8G8B8`, `A8B8G8R8` | same; 10-bit and fp16 need new source-mode formats (S-4) | [T] |
-| path scaling / rotation support | `vidpn.rs:1016-1052` | identity + centered, rotation identity | same: **no stretch**, so the application's extent must equal the mode | [T] |
+| path scaling / rotation support | `vidpn.rs:1016-1052` | identity + centered, rotation identity | same: the VidPn path never stretches. A swap chain smaller than the mode is scaled by the one-plane overlay surface of section 14 (`ScaledFlip`) or composed | [T] |
 | `QueryVidPnHWCapability` | `display.rs:3803-3824` | all zero | same | [T] |
 
 `DirectFlipCaps` is one knob for two things (the caps bit and the aperture segment flag) and is snapshotted once per
@@ -1466,13 +1467,10 @@ sufficient on its own:
 1. **The defaults.** 405.5 has the S-1 code (the no-destination fix of 13.6 included) but `IndepFlip` and `DirectFlipSupport`
    both default to 0 there (13.8 landed on `main` only): no `SupportDirectFlip`, no `FlipIndependent`, and the UMD answers no.
    This branch carries 13.8.
-2. **The extent.** The KMD offers exactly one resolution, the host's (`vidpn.rs`: source and target modes at `display_mode()`,
-   only the refresh varies), and has no scaler (`foreign_flip::decide` refuses `Extent`, the UMD rule compares the two
-   buffers' sizes). A 2560x1440 swap chain in a borderless window covering a 5120x1440 output is stretched by DWM, and
-   `CheckDirectFlipSupport` answers "size differs" for it. A 2560x1440 game is promotable only when the guest mode is
-   2560x1440: the viewer's `--resolution=2560x1440` (fixed hint; the viewer scales the scan-out to its window), or the game
-   at the native 5120x1440. "Fullscreen" (exclusive) in the game cannot switch the guest to 2560x1440 by itself: the mode is
-   not in the list.
+2. **The extent.** A 2560x1440 swap chain in a borderless window covering a 5120x1440 output is stretched by DWM, and
+   `CheckDirectFlipSupport` answers "size differs" for it. It is promoted when the guest mode is 2560x1440 (the mode list
+   offers it: the game's exclusive full screen with `ALLOW_MODE_SWITCH`, section 14.2, or the viewer's
+   `--resolution=2560x1440`), at the native 5120x1440, or with `ScaledFlip` (section 14), which lets the display scale it.
 3. **The format.** DWM's primary is B8G8R8A8_UNORM; Source 2 presents R8G8B8A8_UNORM (to confirm from the dwm UMD log
    line below). The 393.1 rule wanted equal formats. `DirectFlipSupport` 1 now pairs any two of R8G8B8A8 / B8G8R8A8 /
    B8G8R8X8 UNORM (the KMD flips each buffer in its own format); 4 keeps the exact rule for the A/B.
@@ -1552,3 +1550,154 @@ Rows (lowest mode first; `d3d11_iflip` writes `RESULT_TIMING` lines):
 | I5 | I1 with `ImmFlip` = 1 (no completion vsync) | if fps and `present_call_us` match I1, bit 1 buys nothing and may be turned off |
 | I6 | a Vulkan full-screen application on NVK (vkcube or a Vulkan game) | promoted, frames flow (with independent flip reported, NVK primaries take the WDDM flip instead of NVK's scan-out 0) |
 | I7 | the composed desktop: drag windows, move the pointer over Heaven windowed for 60 s | no hitches from the reported pointer (`HwCursor` follows `IndepFlip`), `CurQ` 1 |
+
+## 14. Scaled direct flip (`ScaledFlip`): a full-screen swap chain smaller than the mode
+
+Independent flip (sections 11 to 13) promotes a swap chain whose buffers have the output mode's size. A full-screen swap
+chain of another size (a 1600x900 game on the 5120x1440 desktop) reaches the screen one of three ways: Windows switches
+the display mode to the swap chain's size (14.2), DWM composes it and stretches it into its own chain every frame (the
+default: `dxgi_mode=COMPOSED`, frames on DWM's vsync grid), or the display scales it in hardware and the swap chain is
+flipped directly (14.1, 14.3). `ScaledFlip` is the third way. The host already shows any frame no larger than the mode
+scaled to the output with its aspect ratio kept and black bars (`ForeignFlip` hands it the buffer at its own size), so
+the KMD only has to let Windows use it.
+
+### 14.1 What Windows checks before it lets the display scale a swap chain
+
+Tags as in section 1; `[WDK]` is the WDK 10.0.26100.0 display header set (`d3dkmddi.h`, `dispmprt.h`, `d3dkmthk.h`,
+`d3dukmdt.h`), `[DDI]` the DDI reference (MicrosoftDocs/windows-driver-docs-ddi, `wdk-ddi-src/content`), `[DOC]` the WDDM
+docs (MicrosoftDocs/windows-driver-docs, `windows-driver-docs-pr/display`) and `[W32]` the Win32 docs (MicrosoftDocs/win32,
+`desktop-src/direct3ddxgi`).
+
+* **Hardware scaling of a full-screen swap chain is the multi-plane overlay surface.** The flip-model guide names the
+  cases where a swap chain bypasses composition: buffers equal to the screen, "DirectFlip with panel fitters: your
+  window client region covers the screen, and your swapchain buffers are within some hardware-dependent scaling factor
+  (for example, 0.25x to 4x) of the screen. The GPU scanout hardware is used to scale your buffer", and DirectFlip with an
+  MPO plane; `IDXGIOutput6::CheckHardwareCompositionSupport` is how an application asks which of these the hardware
+  supports [W32 `for-best-performance--use-dxgi-flip-model.md:45-48, 78`]. Its flags are `FULLSCREEN` 0x1, `WINDOWED` 0x2
+  and `CURSOR_STRETCHED` 0x4 (`dxgi1_6.idl`, mingw-w64 `dxgi1_6.idl:33-38`). How DXGI derives them is not on disk [M]; every
+  piece of the surface it can derive them from is the MPO one below.
+* **The panel fitter is a plane-0 post-composition transform.** `DXGI_DDI_MULTIPLANE_OVERLAY_FLAG_FULLSCREEN_POST_COMPOSITION`:
+  "the plane is to be stretched using panel fitter hardware. This should only be set for plane 0" [DDI
+  `dxgiddi/ne-dxgiddi-dxgi_ddi_multiplane_overlay_flags.md`]. The matching capability bit
+  `DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_FULLSCREEN_POST_COMPOSITION`: "Panel fitter HW can be employed to stretch the
+  surface to match the screen ... The entire allocation must be stretched – no sub rectangles are supported. This must be
+  plane 0 in the Z order. If a HW cursor is supported, the HW cursor will get composed with the desktop plane prior to the
+  stretching" [DDI `dxgiddi/ne-dxgiddi-dxgi_ddi_multiplane_overlay_feature_caps.md`]. In the third-generation KMD DDIs the
+  transform is `DXGK_MULTIPLANE_OVERLAY_POST_COMPOSITION{Flags, SrcRect, DstRect, Rotation}`, "the source rect of the
+  virtual mode" and "the destination rect", with the stretch, centred and aspect-ratio examples [DDI
+  `d3dkmddi/ns-d3dkmddi-_dxgk_multiplane_overlay_post_composition.md`; WDK `d3dkmddi.h:6528-6534`], passed in
+  `DXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3.pPostComposition` and checked through
+  `DXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT3.ppPostComposition` [WDK `d3dkmddi.h:6542-6557, 6789-6804`].
+* **dxgkrnl offers none of it without `SupportMultiPlaneOverlay`.** "If FALSE, the DirectX graphics kernel subsystem will not
+  call multiplane overlay functions" [DDI `d3dkmddi/ns-d3dkmddi-_dxgk_drivercaps.md:181-185`]. `MaxOverlayPlanes` is "the
+  maximum number of overlay planes that can be simultaneously displayed on a single output, including the primary
+  surface" [same, `:219-223`]. `SupportMultiPlaneOverlayImmediateFlip` allows immediate plane flips "as long as the only
+  value changing is the physical address", and `CursorScaledWithMultiPlaneOverlayPlane0` says the cursor is scaled with
+  plane 0 [same, `:241-247`]. All four are `DXGK_DRIVERCAPS` fields from WDDM 1.3 / 2.1 [WDK `d3dkmddi.h:2440-2460`]. The
+  derived user-mode answer is `KMTQAITYPE_MULTIPLANEOVERLAY_SUPPORT` = 20 [H `d3dkmthk.h:2385`]; on 405.52 it reads 0,
+  as do the three hardware-composition flags (`d3d11_iflip` log).
+* **The DDIs at this adapter's WDDM 2.1 level.** The third-generation trio is in the 2.1 table:
+  `DxgkDdiCheckMultiPlaneOverlaySupport3`, `DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3`,
+  `DxgkDdiPostMultiPlaneOverlayPresent` [WDK `dispmprt.h:2893-2895`]; "It must be implemented by WDDM 2.1 and later version
+  drivers that support multi-plane overlays" [DDI `d3dkmddi/nc-d3dkmddi-dxgkddi_checkmultiplaneoverlaysupport3.md`].
+  `DxgkDdiGetMultiPlaneOverlayCaps` and `DxgkDdiGetPostCompositionCaps` ("required for any WDDM 2.2 driver that wants to
+  support post composition scaling") are 2.2 members [WDK `dispmprt.h:2934-2935`; DDI
+  `d3dkmddi/nc-d3dkmddi-dxgkddi_getpostcompositioncaps.md`], and "for WDDM 2.2 drivers, this DDI is used to retrieve the
+  multiplane overlay capabilities rather than the user mode DDIs" [DDI `d3dkmddi/nc-d3dkmddi-dxgkddi_getmultiplaneoverlaycaps.md`].
+  So at 2.1 the plane and panel-fitter capabilities come from the UMD's DXGI `pfnGetMultiplaneOverlayCaps` /
+  `pfnGetMultiplaneOverlayGroupCaps` [DOC `multiplane-overlay-support.md`, "MPO functions implemented by the UMD"], which is
+  why the UMD half of 14.3 exists, and the WDDM level does not have to rise (it cannot without the 3.2 problem of
+  `wddm_surface.rs`).
+* **Flip and completion contract.** Plane flips arrive through the plane DDI ("the primary surface is flipped using
+  DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay when in multiplane overlay mode"; a legacy `SetVidPnSourceAddress` means
+  the driver "should disable all non-primary overlay planes"; a plane missing from a call keeps being displayed; bad data
+  may be failed with `STATUS_INVALID_PARAMETER` [DOC `multiplane-overlay-vidpn-presentation.md`]). Each plane carries a
+  `PresentId`, its allocation and address in `ppContextData[0]` (`DXGK_PRIMARYCONTEXTDATA{hContext, hAllocation, SegmentId,
+  SegmentAddress}`) and `DXGK_PLANE_SPECIFIC_INPUT_FLAGS{Enabled, FlipImmediate, FlipOnNextVSync, SharedPrimaryTransition,
+  IndependentFlipExclusive}` [WDK `d3dkmddi.h:6284-6300, 6480-6512`]. The DDI is "typically called at interrupt level"
+  [DDI `nc-d3dkmddi-dxgkddi_setvidpnsourceaddresswithmultiplaneoverlay3.md`]. Completion is
+  `DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2` (10) with `CrtcVsyncWithMultiPlaneOverlay2{VidPnTargetId, ...,
+  MultiPlaneOverlayVsyncInfoCount, pMultiPlaneOverlayVsyncInfo}` and per plane `DXGK_MULTIPLANE_OVERLAY_VSYNC_INFO2{LayerIndex,
+  PresentId, Flags}`, "a single last completed PresentId for each plane" [WDK `d3dkmddi.h:780-786, 1082-1090`; DOC
+  `hardware-flip-queue.md:242`]; the flip-queue form (18) is WDDM 3.0.
+* **What the hardware must do** for MPO in general: per-plane source and destination clipping, scaling, black outside every
+  plane, atomic latching on the retrace [DOC `multiplane-overlay-hardware-requirements.md`]. With one plane that is: show the
+  source rectangle of the buffer at the destination rectangle, black elsewhere.
+
+### 14.2 Why exclusive full screen at 1600x900 keeps the desktop mode
+
+"To enable the automatic display mode change, you must specify `DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH` in the swap-chain
+description" [W32 `d3d10-graphics-programming-guide-dxgi.md:267`]. A swap chain created without it keeps the desktop
+mode on `SetFullscreenState(TRUE)` and is scaled. `d3d11_iflip exclusive` creates its chain without the flag unless
+`modeswitch` is given, so its "mode now 5120x1440@240" is DXGI doing what the missing flag asks, not a KMD refusal. The KMD
+reports nothing that steers DXGI away from a mode change: no virtual-mode support (`DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION`
+is not answered), path scaling identity and centred (`vidpn.rs`), and the mode list carries the listed sizes. With the
+flag the output switches to the listed mode and the chain is promoted at that mode (on 405.52, a borderless chain at a
+1600x900 desktop reads `OVERLAY` every second). Games that create their chain without the flag are the ones that need
+14.3.
+
+### 14.3 What `ScaledFlip` does
+
+`ScaledFlip` (KMD service key, default 0; read once in `DriverEntry`, a change needs a reboot; mirrored as `SflKnob`). Only
+1 turns it on.
+
+| piece | where | what |
+|---|---|---|
+| caps | `query_adapter_info.rs` | `SupportMultiPlaneOverlay` 1, `MaxOverlayPlanes` 1 (the primary), `SupportMultiPlaneOverlayImmediateFlip` 1 when the flip caps carry `FlipImmediateMmIo` (`ImmFlip` bit 2, default on), `MaxQueuedMultiPlaneOverlayFlipVSync` = the flip queue depth. `CursorScaledWithMultiPlaneOverlayPlane0` stays 0 |
+| DDI table | `lib.rs` | the three 2.1 plane DDIs, only with the knob |
+| check | `scaled_flip.rs` `dxgkddi_check_mpo_support3`, rule `helios_kmd_logic::scaled_flip::check` | supported only for one plane, layer 0, source 0: the whole buffer (`SrcRect` = the allocation's extent) shown at the whole output or at the aspect-correct centred rectangle (2 px slack), directly or through a post-composition transform whose source is the plane's destination at the origin; one of DXGI 28/87/88; no rotation, mirror, alpha blend or non-sRGB colour space; clip containing the destination; no larger than the mode; at most 8x stretch per axis; a buffer smaller than the mode only if it is an NVK (foreign) buffer, the only kind `ForeignFlip` shows at its own size. Anything else is refused and dxgkrnl composes |
+| plane flip | `dxgkddi_set_vidpn_source_address_mpo3` | plane 0 enabled: the legacy flip body (`display::set_vidpn_source_address_common`) with `ppContextData[0]`'s allocation and address and the legacy flags its plane flags stand for (`legacy_flags_of`), so immediacy, `ForeignFlip`, the announce and keep paths and every counter behave as for a legacy flip. Disabled plane: the picture stays, the `PresentId` retires at the next vsync. Other layers: counted (`SflLayer`) and ignored. No output flag is set (no PrePresent, no PostPresent, no conversion) |
+| present | `display.rs` | `DxgkDdiPresent` with `FlipWithMultiPlaneOverlay` and no DMA buffer (MMIO plane flip): success, nothing generated (`SflPresent`); with a DMA buffer: refused as before (`SflPrDma`) |
+| completion | `submit_command::signal_crtc_vsync` -> `scaled_flip::signal_vsync`, `PresentBook` | the newest plane flip's `(address, PresentId)` pairs are kept (16 slots). A vsync that reports address A, while the newest flip came through the plane DDI, is delivered as `CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2`, layer 0, the newest `PresentId` recorded for A (or the last one reported; never going back). After a legacy flip the address form returns; plane flips still unreported are retired once by an extra MPO vsync (`SflVsBoth`). Every completion site (the tick, `ImmFlip`'s publication vsync, `FlipDoneHost`) goes through `signal_crtc_vsync`, so all of them follow |
+| vsync gate | `interrupt.rs` -> `scaled_flip::control_interrupt` | `ControlInterrupt` for `CRTC_VSYNC`, `..._WITH_MULTIPLANE_OVERLAY` and `..._2` opens and closes one delivery gate, open while any is enabled |
+| UMD caps | `umd/src/forward/present.rs`, knob `MpoCaps` (`HKLM\SOFTWARE\Helios`, or `HELIOS_MPO_CAPS`) | when dxgkrnl reports `KMTQAITYPE_MULTIPLANEOVERLAY_SUPPORT`: `MaxPlanes` 1 and, by `MpoCaps`, 0 (default) two groups, a plane group (1 plane, RGB, bilinear, immediate, stretch 8.0, shrink 1.0) and a panel-fitter group (the same plus `FULLSCREEN_POST_COMPOSITION`); 1 the plane group only; 2 the panel-fitter group only. Without the KMD's plane: the legacy caps (16 planes) unchanged |
+| host | none | the frame reaches the host as a `ForeignFlip` of the buffer at its own size; the viewer fits it to the output with its aspect ratio and black bars. No protocol change: the check accepts only destinations the host's fit already shows (the whole buffer at the aspect-correct rectangle; a full-stretch destination is shown with bars too) |
+
+No vsync is added to the game path: an immediate plane flip (`FlipImmediate`) maps to the legacy immediate flip and takes
+`ImmFlip`'s unpaced route, as a promoted swap chain at the mode's size does.
+
+What the screen shows differs from what Windows asked in one case: a destination that asks for a full stretch of a
+16:9 buffer to a 32:9 output is shown 16:9 with bars. Carrying the rectangles to the host (a source and destination
+rectangle per flip) would remove that difference; nothing accepted today needs it.
+
+Counters (`Sfl*`, zeroed at every StartDevice, mirrored from the periodic dump when one moved): `SflKnob`, `SflChk` (Check3
+queries judged), `SflChkOk` (answered supported), `SflWhy` (the last refusal, `scaled_flip::Why`: 1 plane count, 2 layer, 3
+no source, 4 format, 5 source rectangle, 6 rotation, 7 mirror, 8 blend, 9 colour space, 10 clip, 11 destination, 12
+post-composition, 13 too large, 14 not an NVK buffer, 15 stretch), `SflFlip` (plane-0 flips), `SflScaled` (of them, a source
+other than the mode's size), `SflOff` (a plane DDI called with the knob off or no display half), `SflBad` (a plane flip
+refused or unpaired), `SflVsMpo`, `SflVsBoth`, `SflVsErr` (MPO vsyncs delivered, flushes, failed notifications),
+`SflPresent`, `SflPrDma`, `SflLayer`. UMD log lines: `dxgkrnl MultiPlaneOverlay support = true`, `DXGI
+GetMultiplaneOverlayCaps: MaxPlanes=1 groups=2`, `DXGI GetMultiplaneOverlayGroupCaps: group=N ... caps=0x...`.
+
+### 14.4 What is not known, and the rows that settle it
+
+* Which group DXGI wants before it reports `FULLSCREEN` (`MpoCaps` 1 vs 2), and whether it needs `CursorScaledWithMultiPlaneOverlayPlane0`
+  or a hardware cursor for it [M].
+* Whether DWM, once the adapter has a plane, flips its own desktop through the plane DDI every frame (expected: `SflFlip`
+  at the desktop's rate, `SflScaled` 0) and whether the MPO vsync form is accepted (`SflVsErr` 0, no `FkKeep*` growth, the
+  desktop keeps updating). The legacy path remains for flips dxgkrnl issues through `SetVidPnSourceAddress`.
+* Which form a scaled full-screen swap chain arrives in: plane 0 with a scaled destination, or plane 0 at the virtual size
+  with a post-composition transform. The check accepts both.
+
+* Whether `DxgkDdiCheckMultiPlaneOverlaySupport3` passes the same allocation handle `SetVidPnSourceAddress` gets. If every
+  query ends with `SflWhy` 3 (no source), it does not, and the check needs the other handle.
+* Whether dxgkrnl at WDDM 2.1 also wants the first- or second-generation plane DDIs before it starts an adapter that
+  reports a plane. If the adapter does not start (Code 43) with `ScaledFlip` = 1, it does.
+
+Recovery from any of it: `ScaledFlip` = 0 and a reboot (the knob is the whole KMD surface; the UMD caps follow the KMD's
+answer).
+
+Rows (main runs them; reboot after each KMD knob change; 1920x1080@240 first, then 5120x1440@240; d3d11_iflip from this
+branch, `guest/windows/tools/d3d11_iflip.cpp`):
+
+| row | knobs | run | expect |
+|---|---|---|---|
+| M0 | `ScaledFlip` 0 | `exclusive size=1600x900 modeswitch interval0` | mode switches to 1600x900 (`mode now 1600x900@240`), `dxgi_mode=OVERLAY`: 14.2 confirmed |
+| M1 | `ScaledFlip` 1 | idle desktop 60 s, then the app at the mode's size (`topmost fg tearing interval0 fps=300`) | desktop updates; kmt `MULTIPLANEOVERLAY_SUPPORT` 1; `SflFlip` rising with DWM, `SflVsMpo` rising, `SflVsErr` 0, `SflBad` 0; app `OVERLAY` as on 405.52 |
+| M2 | `ScaledFlip` 1 | `topmost fg exclusive size=1600x900 tearing interval0 fps=300` | `hardware composition support ... flags=0x1` or more; `dxgi_mode=OVERLAY`; `SflScaled` rising at about 300/s; picture 16:9 with bars; fps 300, `present_to_screen_us` below the composed row |
+| M3 | as M2 | `topmost fg size=1600x900 tearing interval0 fps=300` (borderless, smaller back buffer) | as M2 |
+| M4 | M2 with `HKLM\SOFTWARE\Helios` `MpoCaps` 1, then 2 | as M2 | which group makes `FULLSCREEN` appear (keep that one as the default) |
+| M5 | `ScaledFlip` 1 | `window` (decorated 1280x720), `rgb10`, `fp16`, a toast and alt-tab during M2 | composed where it must be (`SflWhy` 11, 4), never a frozen or black picture |
+
+If M2 stays composed with `SflChk` 0, DXGI never asked: read the UMD log's caps lines and `flags=`; if `SflChk` rises with
+`SflChkOk` 0, `SflWhy` names the rule that refused.

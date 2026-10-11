@@ -309,9 +309,16 @@ unsafe fn dxgkddi_present_inner(
     // one it initialised.
     let payload = unsafe { PresentPayload::decode(args) };
     let Some(allocation_list) = payload.allocation_list() else {
-        // FlipWithMultiPlaneOverlay: unreachable, because the driver does not
-        // register the MPO3 KMD interface. Refuse rather than reinterpret an MPO
-        // struct as an allocation array.
+        // FlipWithMultiPlaneOverlay. With `ScaledFlip` off it is unreachable (no overlay caps,
+        // dxgkrnl calls no plane DDI). With it on, an MMIO plane flip generates nothing here,
+        // exactly as the Flip arm's MMIO contract below: the plane DDI that follows carries the
+        // allocation (`ddi::scaled_flip`). A plane flip with a DMA buffer is still refused, never
+        // reinterpreted as an allocation array.
+        if crate::ddi::scaled_flip::present_mmio_plane_flip(!args.pDmaBuffer.is_null()) {
+            args.MultipassOffset = 0;
+            PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
+            return STATUS_SUCCESS;
+        }
         crate::diag::record_named_bytes(b"PBmpo", 1);
         PRESENT_LAST_STATUS.store(STATUS_NOT_SUPPORTED as u32, Ordering::Relaxed);
         return crate::ddi::present_foreign::site(site::MPO, STATUS_NOT_SUPPORTED);
@@ -2630,6 +2637,49 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };
+    // `ScaledFlip`: a flip through this DDI means dxgkrnl is not (or no longer) in multi-plane
+    // overlay mode, so the vsync goes back to naming the address (`ddi::scaled_flip`). One atomic
+    // store; nothing reads it with the knob off.
+    crate::ddi::scaled_flip::note_legacy_flip();
+    // Windows names the authoritative desktop primary here. This—not resource
+    // dimensions, OM bindings, process name, or an arbitrary Present call—is the
+    // only allocation the KMD may bind directly or copy into the fallback image.
+    if address.is_null() {
+        // Counted as an entry, as before the plane DDI shared the body below.
+        crate::ddi::scanout_trace::note_ddi_entry();
+        crate::ddi::dwm_restart::note_flip();
+        crate::ddi::scanout_trace::note_ddi_null_arg();
+        return STATUS_SUCCESS;
+    }
+    let h_alloc = unsafe { (*address).hAllocation };
+    let primary_segment = unsafe { (*address).PrimarySegment };
+    let primary_address = unsafe { (*address).PrimaryAddress.QuadPart as u64 };
+    let primary_flags = unsafe { (*address).Flags.__bindgen_anon_1.Value };
+    unsafe {
+        set_vidpn_source_address_common(
+            adapter,
+            h_alloc,
+            primary_segment,
+            primary_address,
+            primary_flags,
+        )
+    }
+}
+
+/// The body of `DxgkDdiSetVidPnSourceAddress`, shared with the plane-0 flip of
+/// `DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3` (`ddi::scaled_flip`), which hands it the
+/// plane's allocation, address and the legacy flags word its plane flags stand for. Any IRQL up
+/// to DIRQL, as the DDI.
+///
+/// # Safety
+/// `h_alloc` is an allocation handle dxgkrnl passed to one of the two flip DDIs.
+pub(crate) unsafe fn set_vidpn_source_address_common(
+    adapter: &AdapterContext,
+    h_alloc: HANDLE,
+    primary_segment: u32,
+    primary_address: u64,
+    primary_flags: u32,
+) -> NTSTATUS {
     // Unsampled, atomics-only, and FIRST — before any refusal below can hide the
     // fact that dxgkrnl called at all. `VpEnt` not moving during a workload is
     // itself the answer to "why is the bind pinned"; every sampled `Sc*` value
@@ -2638,17 +2688,6 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     crate::ddi::scanout_trace::note_ddi_entry();
     // `DwFlipN` / `DwFlipMs`: flips since the last device died (atomics, legal at DIRQL).
     crate::ddi::dwm_restart::note_flip();
-    // Windows names the authoritative desktop primary here. This—not resource
-    // dimensions, OM bindings, process name, or an arbitrary Present call—is the
-    // only allocation the KMD may bind directly or copy into the fallback image.
-    if address.is_null() {
-        crate::ddi::scanout_trace::note_ddi_null_arg();
-        return STATUS_SUCCESS;
-    }
-    let h_alloc = unsafe { (*address).hAllocation };
-    let primary_segment = unsafe { (*address).PrimarySegment };
-    let primary_address = unsafe { (*address).PrimaryAddress.QuadPart as u64 };
-    let primary_flags = unsafe { (*address).Flags.__bindgen_anon_1.Value };
     // S-0a: count the flip flags this DDI ignores (atomics only, legal at DIRQL).
     crate::ddi::scanout_trace::note_set_vidpn_flags(primary_flags);
     // `IndepFlip` census: one MMIO-contract flip (atomics only; nothing when the knob is off).

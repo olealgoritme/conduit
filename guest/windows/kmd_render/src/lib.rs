@@ -72,6 +72,8 @@ pub unsafe extern "system" fn driver_entry(
     kmsg(c"Helios: DriverEntry\n");
     diag::record(0x0D00_0001);
 
+    // `ScaledFlip` decides whether the multi-plane overlay DDIs are in the table; read once, here.
+    ddi::scaled_flip::read_knob_at_driver_entry();
     let mut init = build_ddi_table();
     // SAFETY: pointers are valid for the call; `init` outlives the call on this
     // stack frame, and DxgkInitialize copies what it needs.
@@ -193,6 +195,17 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiCommitVidPn = Some(ddi::traced::commit_vidpn);
     data.DxgkDdiUpdateActiveVidPnPresentPath = Some(ddi::traced::update_active_vidpn_present_path);
     data.DxgkDdiSetVidPnSourceAddress = Some(ddi::traced::set_vidpn_source_address);
+    // `ScaledFlip` (default off, `ddi::scaled_flip`): the WDDM 2.1 table's multi-plane overlay
+    // DDIs, for the one-plane surface `query_adapter_info` then reports. Absent with the knob off,
+    // as before (dxgkrnl calls none of them without `SupportMultiPlaneOverlay` either way).
+    if ddi::scaled_flip::on() {
+        data.DxgkDdiCheckMultiPlaneOverlaySupport3 =
+            Some(ddi::scaled_flip::dxgkddi_check_mpo_support3);
+        data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3 =
+            Some(ddi::scaled_flip::dxgkddi_set_vidpn_source_address_mpo3);
+        data.DxgkDdiPostMultiPlaneOverlayPresent =
+            Some(ddi::scaled_flip::dxgkddi_post_mpo_present);
+    }
     data.DxgkDdiRecommendMonitorModes = Some(ddi::dxgkddi_recommend_monitor_modes);
     data.DxgkDdiQueryVidPnHWCapability = Some(ddi::dxgkddi_query_vidpn_hw_capability);
     data.DxgkDdiGetScanLine = Some(ddi::dxgkddi_get_scan_line);

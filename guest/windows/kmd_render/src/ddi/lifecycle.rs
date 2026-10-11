@@ -661,6 +661,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // `IndepFlip` (independent flip, stage S-1): the mode this generation counts under, and the
     // `Idf*` block zeroed (`IdfKnob` written, 0 included).
     crate::ddi::indep_flip::reset_for_start(&knobs);
+    // `ScaledFlip`: plane-flip `PresentId`s start over with the device; the `Sfl*` block zeroed.
+    crate::ddi::scaled_flip::reset_for_start();
     // `FlipDoneHost`: the mode this generation runs (off unless the host took the ack), the
     // `Fdh*` block zeroed (`FdhKnob`, `FdhAck` written).
     crate::ddi::host_flip_done::reset_for_start(

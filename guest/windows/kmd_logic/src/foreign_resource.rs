@@ -4854,22 +4854,31 @@ mod shared_format_tests {
         assert_eq!(c.refused(), 11);
     }
 
-    // ---- the overlay: never advertised ---------------------------------------------
+    // ---- the overlay: one RGB plane at most -----------------------------------------
 
-    /// The KMD advertises no overlay planes, which is the whole reason NV12 is never
+    /// The KMD advertises no YUV overlay plane, which is the whole reason NV12 is never
     /// scanned out (`docs/shared-formats.md`): dxgkrnl only hands a YUV surface to the
-    /// display hardware through a multi-plane-overlay present, and the KMD neither
-    /// reports `SupportMultiPlaneOverlay` in its caps nor registers the MPO3 DDI
-    /// interface. A static check of the driver's source: no executable line outside the
-    /// one refusal (`ddi/present_packet.rs`, which names the flag only to REFUSE an MPO
-    /// present) mentions a multi-plane-overlay capability, DDI or interface.
+    /// display hardware through a multi-plane-overlay present. By default no plane is
+    /// advertised at all; `ScaledFlip` reports one, the primary, whose check refuses every
+    /// non-32-bit format (`scaled_flip::check`). A static check of the driver's source: no
+    /// executable line outside that surface's files mentions a multi-plane-overlay
+    /// capability or DDI, and the caps report the logic's plane count.
     #[test]
-    fn the_kmd_never_advertises_overlay_planes() {
+    fn overlay_planes_are_named_only_by_the_scaled_flip_surface() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
         if !root.exists() {
             return; // a copy of this crate without its sibling: nothing to scan
         }
-        const FORBIDDEN: [&str; 7] = [
+        // The one-plane surface of `ScaledFlip` (`ddi/scaled_flip.rs`): its DDIs, its caps, their
+        // registration, the present arm that takes an MMIO plane flip and the shared flip body.
+        const ALLOWED: [&str; 5] = [
+            "scaled_flip.rs",
+            "query_adapter_info.rs",
+            "lib.rs",
+            "present_packet.rs",
+            "display.rs",
+        ];
+        const NAMES: [&str; 9] = [
             "SupportMultiPlaneOverlay",
             "MultiPlaneOverlaySupport",
             "SetVidPnSourceAddressWithMultiPlaneOverlay",
@@ -4877,10 +4886,12 @@ mod shared_format_tests {
             "MaxOverlay",
             "MPO3",
             "Mpo3",
+            "MultiPlaneOverlay",
+            "MultiplaneOverlay",
         ];
-        let mut stack = std::vec![root];
+        let mut stack = std::vec![root.clone()];
         let mut checked = 0;
-        let mut allowed_mentions = 0;
+        let mut mentions = 0;
         while let Some(dir) = stack.pop() {
             for e in std::fs::read_dir(&dir).unwrap() {
                 let p = e.unwrap().path();
@@ -4897,34 +4908,29 @@ mod shared_format_tests {
                 for (n, line) in text.lines().enumerate() {
                     let code = line.trim_start();
                     if code.starts_with("//") {
-                        continue; // prose: the doc comments explain why there is none
+                        continue; // prose
                     }
-                    for tok in FORBIDDEN {
-                        assert!(
-                            !code.contains(tok),
-                            "{}:{} names `{tok}`: the KMD must not advertise overlay planes",
-                            p.display(),
-                            n + 1
-                        );
-                    }
-                    // `MultiPlaneOverlay` as a word is allowed in exactly one file, where it
-                    // is the refused arm of the present payload.
-                    if code.contains("MultiPlaneOverlay") || code.contains("MultiplaneOverlay") {
-                        assert_eq!(
-                            name, "present_packet.rs",
-                            "{}:{}: only the present packet may name a multi-plane overlay (to refuse it)",
-                            p.display(),
-                            n + 1
-                        );
-                        allowed_mentions += 1;
+                    for tok in NAMES {
+                        if code.contains(tok) {
+                            assert!(
+                                ALLOWED.contains(&name.as_str()),
+                                "{}:{} names `{tok}` outside the scaled-flip surface",
+                                p.display(),
+                                n + 1
+                            );
+                            mentions += 1;
+                        }
                     }
                 }
             }
         }
         assert!(checked > 20);
-        // The refusal is there: the payload arm exists (`PresentPayload::MultiPlaneOverlay`),
-        // and it never produces an allocation list.
-        assert!(allowed_mentions >= 1);
+        assert!(mentions >= 1);
+        // The plane count the caps report is the logic's: the primary alone, never a YUV plane.
+        assert_eq!(crate::scaled_flip::MAX_PLANES, 1);
+        let caps = std::fs::read_to_string(root.join("ddi/query_adapter_info.rs")).unwrap();
+        assert!(caps.contains("let planes: UINT = helios_kmd_logic::scaled_flip::MAX_PLANES;"));
+        assert!(!caps.contains("MaxYUVPlanes"));
     }
 }
 

@@ -300,20 +300,24 @@ What was built, as three layers; everything is in `guest/windows`, nothing in th
 | level 5 Blt (`rm_blt::order_for_fourcc`) | `None` for every fourcc but the four | `Skip::Layout` | the blt skip counters |
 | level 5 primary (`rm_sysmem::layout`) | only DXGI 28, 87, 88 | `LayoutError::Format` | (creation falls back to Venus) |
 
-**No overlay planes, which is why NV12 is never scanned out.** dxgkrnl hands a YUV surface to the
-display hardware only through a multi-plane-overlay present. The KMD never advertises one: the
-adapter reports WDDM 2.1 + GpuMmu (`wddm_surface.rs`), `DXGK_DRIVERCAPS.SupportMultiPlaneOverlay`
-is never written (it lies past the last field `query_adapter_info.rs` writes, `SupportDirectFlip`,
-and the field-by-field writer would refuse and count a write there), and the MPO3 KMD interface is
-not registered (registering it needs the 3.2 level, where DWM fails with `E_NOTIMPL`:
-`wddm_surface.rs` module docs). A present flagged `FlipWithMultiPlaneOverlay` would be refused
-(`PresentPayload::MultiPlaneOverlay`, `present_packet.rs`). So an NV12 / P010 / P016 (or any other shared-format)
-allocation is only ever opened and sampled, never programmed as a scanout source; if one were, the
-flip arm and the copy path would refuse it by the table above. The test
-`foreign_resource::shared_format_tests::the_kmd_never_advertises_overlay_planes` scans every
-non-comment line of `kmd_render/src` and fails if any names `SupportMultiPlaneOverlay`,
-`CheckMultiPlaneOverlay`, `SetVidPnSourceAddressWithMultiPlaneOverlay`, `MaxOverlay` or `MPO3`, or
-names a multi-plane overlay anywhere but `present_packet.rs` (where it is the refused arm).
+**No YUV overlay plane, which is why NV12 is never scanned out.** dxgkrnl hands a YUV surface to the
+display hardware only through a multi-plane-overlay present. By default the KMD advertises no overlay
+plane at all: `DXGK_DRIVERCAPS.SupportMultiPlaneOverlay` stays 0 and the multi-plane overlay DDIs are
+not in the `DriverEntry` table. With `ScaledFlip` = 1 (`ddi/scaled_flip.rs`, `independent-flip.md`
+section 14) it advertises exactly one plane, the primary, and its `DxgkDdiCheckMultiPlaneOverlaySupport3`
+answers no to every format but the three 32-bit scan-out ones (`helios_kmd_logic::scaled_flip::check`,
+`Why::Format`; the test `yuv_wide_and_unknown_formats_are_refused`), so a YUV, 10-bit or fp16 plane
+stays composed either way. A present flagged `FlipWithMultiPlaneOverlay` never yields an allocation
+array (`PresentPayload::MultiPlaneOverlay`, `present_packet.rs`): with the knob on an MMIO plane flip is
+accepted with nothing generated, otherwise it is refused. So an NV12 / P010 / P016 (or any other
+shared-format) allocation is only ever opened and sampled, never programmed as a scanout source; if one
+were, the flip arm and the copy path would refuse it by the table above. The test
+`foreign_resource::shared_format_tests::overlay_planes_are_named_only_by_the_scaled_flip_surface`
+scans every non-comment line of `kmd_render/src` and fails if a multi-plane overlay name
+(`SupportMultiPlaneOverlay`, `CheckMultiPlaneOverlay`, `SetVidPnSourceAddressWithMultiPlaneOverlay`,
+`MaxOverlay`, `MultiPlaneOverlay`, ...) appears outside the files of that surface (`scaled_flip.rs`,
+`query_adapter_info.rs`, `lib.rs`, `present_packet.rs`, `display.rs`), or if the plane count reported is
+not `scaled_flip::MAX_PLANES`.
 
 **Counters** (service key values, written by the throttled foreign-resource publish; all at most 13
 characters and checked against every other `b"..."` name in `kmd_render` and `kmd_logic`). None is

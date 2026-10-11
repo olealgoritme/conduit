@@ -624,6 +624,24 @@ pub(crate) fn direct_flip_support() -> u32 {
     })
 }
 
+/// `MpoCaps` (REG_DWORD), or `HELIOS_MPO_CAPS` from the process environment: which
+/// multi-plane overlay capability groups the DXGI DDI reports while the KMD reports its one
+/// overlay plane (`ScaledFlip`, docs/independent-flip.md section 14; without it the legacy caps are
+/// reported whatever this says). 0 (default) = two groups, the plane (whole-buffer stretch) and the
+/// panel fitter (`FULLSCREEN_POST_COMPOSITION`); 1 = the plane group only; 2 = the panel fitter
+/// group only. Which group Windows needs before it reports `DXGI_HARDWARE_COMPOSITION_SUPPORT_FLAG_
+/// FULLSCREEN` is not documented; these are the rows that find out.
+pub(crate) fn mpo_caps() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_MPO_CAPS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(|| helios_umd_common::knobs::reg_dword(c"MpoCaps"))
+            .unwrap_or(0)
+    })
+}
+
 /// `NvkSkipBltCopy`: the environment, then the registry, then the KMD's
 /// `RedirVram` (see the note above `env_bool`).
 pub(crate) fn nvk_skip_blt_copy() -> bool {
