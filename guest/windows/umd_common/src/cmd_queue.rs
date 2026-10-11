@@ -16,7 +16,7 @@
 //! Layout of a record (8-byte aligned, never straddling the end of the ring):
 //!
 //! ```text
-//! | Header { call, len, extra_off, extra_len } | closure bytes | extra bytes |
+//! | Header { call, len, extra_len } | closure bytes | extra bytes |
 //! ```
 //!
 //! `call == None` is a pad record covering the tail of the ring. A tail shorter
@@ -36,13 +36,16 @@ use std::time::{Duration, Instant};
 #[repr(align(64))]
 struct Line<T>(T);
 
-type CallFn = unsafe fn(closure: *mut u8, extra: *const u8, extra_len: usize);
+/// Runs the record at `record` (its header first). The closure sits right
+/// after the header and the extra bytes right after the closure; only the
+/// monomorphised call knows the closure's size, so the header does not carry
+/// the extra bytes' offset (16-byte header).
+type CallFn = unsafe fn(record: *mut u8, extra_len: usize);
 
 #[repr(C)]
 struct Header {
     call: Option<CallFn>,
     len: u32,
-    extra_off: u32,
     extra_len: u32,
 }
 
@@ -73,7 +76,9 @@ const PARK_LONG: Duration = Duration::from_millis(50);
 /// quarter second of idleness at [`PARK_MID`]).
 const PARKS_BEFORE_LONG: u32 = 64;
 
-unsafe fn call_closure<F: FnOnce(&[u8])>(closure: *mut u8, extra: *const u8, extra_len: usize) {
+unsafe fn call_closure<F: FnOnce(&[u8])>(record: *mut u8, extra_len: usize) {
+    let closure = unsafe { record.add(HEADER_BYTES) };
+    let extra = unsafe { record.add(HEADER_BYTES + round8(size_of::<F>())) } as *const u8;
     // SAFETY: `closure` points at an `F` written by `push` and read exactly
     // once, here; `extra` spans `extra_len` initialised bytes of the record.
     let f = unsafe { core::ptr::read(closure as *mut F) };
@@ -333,7 +338,6 @@ impl CmdQueue {
                 (self.hot.buf.add(pos) as *mut Header).write(Header {
                     call: None,
                     len: tail as u32,
-                    extra_off: 0,
                     extra_len: 0,
                 });
             }
@@ -341,7 +345,6 @@ impl CmdQueue {
             (p as *mut Header).write(Header {
                 call: Some(call_closure::<F>),
                 len: len as u32,
-                extra_off: extra_off as u32,
                 extra_len: extra_len as u32,
             });
             (p.add(HEADER_BYTES) as *mut F).write(f);
@@ -617,7 +620,7 @@ impl CmdQueue {
             let p = self.hot.buf.add(pos);
             let h = core::ptr::read(p as *const Header);
             if let Some(call) = h.call {
-                call(p.add(HEADER_BYTES), p.add(h.extra_off as usize), h.extra_len as usize);
+                call(p, h.extra_len as usize);
             }
             self.read.0.store(r + h.len as u64, Ordering::Release);
         }
