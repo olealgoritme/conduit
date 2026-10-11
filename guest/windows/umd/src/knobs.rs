@@ -523,6 +523,25 @@ pub(crate) static NVK_RM_FENCE: BoolKnob = BoolKnob::new(c"NvkRmFence", true);
 /// composed frames.
 pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", true);
 
+/// `NvkComposedComplete`: 1 (default) = a composed NVK frame that DWM samples
+/// directly (a flip-model swap chain's own buffer: no DXGI destination for the
+/// KMD to copy into, not a primary that independent flip scans out) is complete
+/// on the GPU before its WDDM present is made: the S3 CPU wait, no RM fence in
+/// the marker. DWM on NVK reads the buffer from its own RM channel, which no
+/// WDDM wait holds, so a fence that retires the present's DMA buffer orders
+/// nothing for it: with short GPU timeslices DWM composed half-drawn Start
+/// menu, taskbar and pane frames. 0 = the frame carries the fence, as a
+/// blt-model frame does (the KMD's copy waits for it).
+pub(crate) static NVK_COMPOSED_COMPLETE: BoolKnob = BoolKnob::new(c"NvkComposedComplete", true);
+
+/// `NvkComposedComplete`, or `HELIOS_NVK_COMPOSED_COMPLETE` from the environment.
+pub(crate) fn nvk_composed_complete() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_COMPOSED_COMPLETE").unwrap_or_else(|| NVK_COMPOSED_COMPLETE.get())
+    })
+}
+
 /// `NvkRmCopyRecord`: 1 (default) = a composed NVK frame whose WDDM present
 /// carries an RM fence also carries the copy-engine Present record (`'HEF3'`,
 /// the 168-byte `HERF` / 192-byte `HEPR`, docs/rm-copy-engine-present.md 12)
