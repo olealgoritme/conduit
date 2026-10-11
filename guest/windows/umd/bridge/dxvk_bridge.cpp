@@ -1832,7 +1832,8 @@ std::size_t HeliosDxvkDevice::fe_buffer_map_ptr(std::size_t buffer_ptr) const no
   return reinterpret_cast<std::size_t>(buffer->GetMapPtr());
 }
 
-void HeliosDxvkDevice::fe_emit_invalidate(std::size_t buffer_ptr, std::size_t slice) const noexcept {
+void HeliosDxvkDevice::fe_emit_invalidate(std::size_t buffer_ptr, std::size_t slice,
+                                          bool park) const noexcept {
   bridge_guard("fe_emit_invalidate", 0, [&]() -> int {
     if (!slice)
       return 0;
@@ -1844,7 +1845,7 @@ void HeliosDxvkDevice::fe_emit_invalidate(std::size_t buffer_ptr, std::size_t sl
       return 0;
     auto* buffer = static_cast<dxvk::D3D11Buffer*>(reinterpret_cast<ID3D11Buffer*>(buffer_ptr));
     static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
-      ->HeliosFrontendInvalidate(buffer, std::move(owned));
+      ->HeliosFrontendInvalidate(buffer, std::move(owned), park);
     return 0;
   });
 }

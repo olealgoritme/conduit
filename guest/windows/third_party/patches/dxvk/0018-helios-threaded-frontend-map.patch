@@ -23,6 +23,7 @@ into its two halves:
   exchanged atomically). The app thread's next discard takes it instead of
   allocating, so the allocation also leaves the app thread. A fresh slice was
   never used by the GPU; the buffer releases a parked one on destruction.
+  The caller can turn this off per discard (PreAllocate = false).
 
 Nothing changes for callers that do not use these entry points.
 
@@ -124,10 +125,10 @@ index e55920b8..b61cdef5 100644
  
      DxvkCsChunkRef AllocCsChunk();
 diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
-index 3a090686..602e44d1 100644
+index 3a090686..983cabb8 100644
 --- a/src/d3d11/d3d11_context_imm.cpp
 +++ b/src/d3d11/d3d11_context_imm.cpp
-@@ -583,6 +583,54 @@ namespace dxvk {
+@@ -583,6 +583,55 @@ namespace dxvk {
    }
    
    
@@ -160,7 +161,8 @@ index 3a090686..602e44d1 100644
 +
 +  void D3D11ImmediateContext::HeliosFrontendInvalidate(
 +          D3D11Buffer*                pBuffer,
-+          Rc<DxvkResourceAllocation>&& Slice) {
++          Rc<DxvkResourceAllocation>&& Slice,
++          bool                        PreAllocate) {
 +    D3D10DeviceLock lock = LockContext();
 +
 +    VkDeviceSize bufferSize = pBuffer->Desc()->ByteWidth;
@@ -174,7 +176,7 @@ index 3a090686..602e44d1 100644
 +
 +    if (unlikely(bufferSize > DxvkPageAllocator::PageSize))
 +      ThrottleDiscard(bufferSize);
-+    else if (pBuffer->HeliosWantsNextSlice())
++    else if (PreAllocate && pBuffer->HeliosWantsNextSlice())
 +      pBuffer->HeliosPutNextSlice(pBuffer->AllocSlice(&m_allocationCache));
 +  }
 +
@@ -183,10 +185,10 @@ index 3a090686..602e44d1 100644
            D3D11CommonTexture*         pResource,
            UINT                        Subresource,
 diff --git a/src/d3d11/d3d11_context_imm.h b/src/d3d11/d3d11_context_imm.h
-index 3edc59b5..9bd89215 100644
+index 3edc59b5..9c2b0262 100644
 --- a/src/d3d11/d3d11_context_imm.h
 +++ b/src/d3d11/d3d11_context_imm.h
-@@ -133,6 +133,35 @@ namespace dxvk {
+@@ -133,6 +133,37 @@ namespace dxvk {
      // Capture the existing flush boundary once. A vehicle copy retains this
      // value across pending waits; waiting must never flush or move its target.
      uint64_t HeliosFlushFrame();
@@ -214,11 +216,13 @@ index 3edc59b5..9bd89215 100644
 +     *
 +     * Queues the rename of \c pBuffer to \c Slice for the CS thread, in the
 +     * order of the worker's replay, and throttles large discards exactly as
-+     * MapBuffer does.
++     * MapBuffer does. With \c PreAllocate, a small buffer's next slice is
++     * allocated here and parked for the app thread's next discard.
 +     */
 +    void HeliosFrontendInvalidate(
 +            D3D11Buffer*                pBuffer,
-+            Rc<DxvkResourceAllocation>&& Slice);
++            Rc<DxvkResourceAllocation>&& Slice,
++            bool                        PreAllocate);
      VkResult HeliosWaitSubmissionComplete(uint64_t SubmissionId, uint64_t TimeoutUs);
  
      /**

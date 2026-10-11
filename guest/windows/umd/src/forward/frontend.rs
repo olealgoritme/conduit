@@ -16,6 +16,7 @@ use super::*;
 use crate::device_funcs::HELIOS_TAG_DEVICE;
 use core::mem::size_of;
 use helios_umd_common::cmd_queue::CmdQueue;
+use helios_umd_common::cmd_record::FrontendSync;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -37,9 +38,12 @@ pub(crate) enum SyncReason {
     Oversize,
     Keyed,
     SafetyNet,
+    Query,
+    Destroy,
+    Flush,
 }
 
-const SYNC_REASONS: [&str; 11] = [
+const SYNC_REASONS: [&str; 14] = [
     "dxgi",
     "map",
     "unmap",
@@ -51,12 +55,15 @@ const SYNC_REASONS: [&str; 11] = [
     "oversize",
     "keyed",
     "safety_net",
+    "query",
+    "destroy",
+    "flush",
 ];
 
 #[derive(Default)]
 struct Stats {
-    sync: [AtomicU64; 11],
-    sync_waited: [AtomicU64; 11],
+    sync: [AtomicU64; 14],
+    sync_waited: [AtomicU64; 14],
     split_discard: AtomicU64,
     split_no_overwrite: AtomicU64,
     discard_waits: AtomicU64,
@@ -95,6 +102,8 @@ pub(crate) struct Frontend {
     q: Arc<CmdQueue>,
     discard_bytes: AtomicU64,
     stats: Stats,
+    /// Call classes `UmdFrontendSync` forces synchronous (A/B isolation).
+    force: FrontendSync,
 }
 
 /// `RtlDllShutdownInProgress`: process teardown has started, other threads
@@ -153,14 +162,17 @@ impl Frontend {
         let q = CmdQueue::new(crate::knobs::frontend_ring_bytes(), "helios-d3d11-frontend");
         q.set_abandon_check(dll_shutdown_in_progress);
         q.set_thread_init(producer_priority, apply_priority);
+        let force = crate::knobs::frontend_sync();
         log_error!(
-            "D3D11 threaded front end: on (ring {} KiB)",
-            q.capacity() / 1024
+            "D3D11 threaded front end: on (ring {} KiB, synchronous classes: {})",
+            q.capacity() / 1024,
+            force.names()
         );
         Self {
             q,
             discard_bytes: AtomicU64::new(0),
             stats: Stats::default(),
+            force,
         }
     }
 
@@ -321,7 +333,12 @@ impl Frontend {
             return 0;
         }
         match unsafe { self.q.push(extra, fill, f) } {
-            Ok(pos) => pos,
+            Ok(pos) => {
+                if self.force.has(FrontendSync::SERIAL) {
+                    self.q.wait_done(pos);
+                }
+                pos
+            }
             // Only after shutdown (the device is being destroyed); the closure
             // is dropped unrun (a discard token releases its slice on drop).
             Err(_) => 0,
@@ -1159,6 +1176,12 @@ unsafe extern "system" fn fe_query_get_data(
         if fe.enter(h) {
             return;
         }
+        if fe.force.has(FrontendSync::QUERIES) {
+            if !fe.sync_enter(h, SyncReason::Query) {
+                query_get_data(h, q, data, data_size, flags);
+            }
+            return;
+        }
         let unflagged = flags & (D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32) == 0;
         if query_end_pos(q) > fe.q.done() {
             fe.stats.getdata_early.fetch_add(1, Ordering::Relaxed);
@@ -1227,10 +1250,11 @@ struct DiscardSlice {
 }
 
 impl DiscardSlice {
-    unsafe fn emit(self) {
+    /// `park`: let the worker pre-allocate the buffer's next slice.
+    unsafe fn emit(self, park: bool) {
         let this = core::mem::ManuallyDrop::new(self);
         if let Some(dev) = unsafe { helios_device(this.h) } {
-            unsafe { dev.dxvk.fe_emit_invalidate(this.buffer, this.slice) };
+            unsafe { dev.dxvk.fe_emit_invalidate(this.buffer, this.slice, park) };
         }
     }
 }
@@ -1263,7 +1287,8 @@ unsafe extern "system" fn fe_map_dynamic(
             write_mapped(mapped, 0, 0);
             return;
         }
-        if let (Some(st), Some(dev)) = (resource_state(res), helios_device(h)) {
+        let split = !fe.force.has(FrontendSync::MAPS);
+        if let (true, Some(st), Some(dev)) = (split, resource_state(res), helios_device(h)) {
             if st.dynamic_buffer && st.buffer_raw != 0 && sub == 0 {
                 let buffer = st.buffer_raw;
                 let bytes = st.byte_width;
@@ -1274,8 +1299,9 @@ unsafe extern "system" fn fe_map_dynamic(
                             write_mapped(mapped, data, bytes);
                             let out = fe.discard_bytes.fetch_add(u64::from(bytes), Ordering::Relaxed) + u64::from(bytes);
                             let token = DiscardSlice { h, buffer, slice };
+                            let park = !fe.force.has(FrontendSync::NO_PARK);
                             fe.record0(move |_| {
-                                token.emit();
+                                token.emit(park);
                                 if let Some(fe) = fe_of(h) {
                                     fe.discard_bytes.fetch_sub(u64::from(bytes), Ordering::Relaxed);
                                 }
@@ -1411,7 +1437,12 @@ macro_rules! defer_update {
             };
             unsafe {
                 fe.enter(h);
-                let Some(len) = update_payload(res, sub, bx, data) else {
+                let payload = if fe.force.has(FrontendSync::UPDATES) {
+                    None
+                } else {
+                    update_payload(res, sub, bx, data)
+                };
+                let Some(len) = payload else {
                     fe.sync(SyncReason::Update);
                     return $orig(h, res, sub, bx, data, row_pitch, depth_pitch $(, $extra)*);
                 };
@@ -1454,6 +1485,11 @@ unsafe fn fe_flush_common(fe: &Frontend, h: Hdevice) {
     unsafe {
         fe.enter(h);
         if report_if_removed(h, "Flush") {
+            return;
+        }
+        if fe.force.has(FrontendSync::FLUSH) {
+            fe.sync(SyncReason::Flush);
+            flush(h);
             return;
         }
         let shared = helios_device(h).is_some_and(|d| !lock_ignore_poison(&d.nvk_keyed_resources).is_empty());
@@ -1555,6 +1591,11 @@ macro_rules! retire_destroy {
                 return unsafe { $orig(h, x) };
             };
             if x.pDrvPrivate.is_null() {
+                return unsafe { $orig(h, x) };
+            }
+            if fe.force.has(FrontendSync::DESTROYS) {
+                fe.sync(SyncReason::Destroy);
+                fe.q.run_ready_retired();
                 return unsafe { $orig(h, x) };
             }
             let pos = fe.q.written();
