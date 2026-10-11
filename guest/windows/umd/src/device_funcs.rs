@@ -645,6 +645,16 @@ impl CtxBindings {
         );
     }
 
+    /// Forget what this context last handed DXVK (VS variant, input layout)
+    /// while keeping the API-level shadows (`current_vs`, `current_layout`):
+    /// for a DXVK-side state clear the runtime did not ask for, such as the
+    /// deferred context's at FinishCommandList(FALSE). The next draw rebinds
+    /// both from the shadows; at worst that is one redundant bind.
+    pub fn forget_dxvk_bindings(&self) {
+        self.bound_vs_com.store(0, Ordering::Relaxed);
+        self.bound_il_com.store(0, Ordering::Relaxed);
+    }
+
     fn reset_for_deferred_clear_state(&self, full_diagnostic_reset: bool) {
         if full_diagnostic_reset {
             self.reset();
@@ -682,6 +692,20 @@ mod tests {
         assert_eq!(bindings.current_ps.load(Ordering::Relaxed), 4);
         assert_eq!(bindings.current_topology.load(Ordering::Relaxed), 5);
         assert_eq!(bindings.current_rt0_alloc.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn forgetting_dxvk_bindings_keeps_the_api_shadows() {
+        let bindings = CtxBindings::default();
+        bindings.bound_vs_com.store(1, Ordering::Relaxed);
+        bindings.bound_il_com.store(7, Ordering::Relaxed);
+        bindings.current_vs.store(2, Ordering::Relaxed);
+        bindings.current_layout.store(3, Ordering::Relaxed);
+        bindings.forget_dxvk_bindings();
+        assert_eq!(bindings.bound_vs_com.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.bound_il_com.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_vs.load(Ordering::Relaxed), 2);
+        assert_eq!(bindings.current_layout.load(Ordering::Relaxed), 3);
     }
 
     #[test]

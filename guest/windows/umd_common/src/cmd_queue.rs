@@ -159,10 +159,12 @@ pub struct CmdQueue {
     wait_cv: Condvar,
     retire: Mutex<VecDeque<Retire>>,
     retire_pending: AtomicBool,
-    /// Held while a thread runs destructions it took out of `retire`, so
-    /// [`CmdQueue::run_ready_retired`] cannot return while the worker is still
-    /// running one it already dequeued.
-    retire_exec: Mutex<()>,
+    /// Destructions taken out of `retire` (counted under its lock) and those
+    /// finished since: [`CmdQueue::run_ready_retired`] waits until every one
+    /// dequeued before it looked has finished. Counters, not a lock held over
+    /// the destroy bodies, so the worker never waits on another thread here.
+    retire_taken: AtomicU64,
+    retire_finished: AtomicU64,
     stats: Line<Stats>,
     name: String,
     /// True once waiting for the worker is pointless (process teardown has
@@ -226,7 +228,8 @@ impl CmdQueue {
             wait_cv: Condvar::new(),
             retire: Mutex::new(VecDeque::new()),
             retire_pending: AtomicBool::new(false),
-            retire_exec: Mutex::new(()),
+            retire_taken: AtomicU64::new(0),
+            retire_finished: AtomicU64::new(0),
             stats: Line(Stats::default()),
             name: name.to_string(),
             abandoned: std::sync::OnceLock::new(),
@@ -490,29 +493,49 @@ impl CmdQueue {
 
     /// Run, on the calling thread, the queued destructions the worker has
     /// already passed (callers that must not overtake them, e.g. a resource
-    /// destroy that follows destroys of its views). Also waits for any the
-    /// worker took out of the queue and is still running: on return, every
-    /// destruction queued at or before [`done`](Self::done) has finished.
+    /// destroy that follows destroys of its views), then wait for any another
+    /// thread (the worker) took out of the queue earlier and is still running:
+    /// on return, every destruction queued at or before [`done`](Self::done)
+    /// has finished. Two loads when there is nothing to run or wait for.
     pub fn run_ready_retired(&self) {
-        let _exec = lock(&self.retire_exec);
-        self.run_retired_locked(false);
-    }
-
-    fn run_retired(&self, all: bool) {
-        if !self.retire_pending.load(Ordering::Acquire) {
+        let taken = if self.retire_pending.load(Ordering::Acquire) {
+            self.run_retired(false)
+        } else {
+            self.retire_taken.load(Ordering::Acquire)
+        };
+        if self.retire_finished.load(Ordering::Acquire) >= taken {
             return;
         }
-        let _exec = lock(&self.retire_exec);
-        self.run_retired_locked(all);
+        // Destroy bodies are short (a cache eviction, a COM release): spin,
+        // then sleep on the waiter condvar the worker signals.
+        let t0 = Instant::now();
+        while t0.elapsed() < WAITER_SPIN {
+            if self.retire_finished.load(Ordering::Acquire) >= taken {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        let mut g = lock(&self.wait_lock);
+        self.waiters.0.fetch_add(1, Ordering::SeqCst);
+        while self.retire_finished.load(Ordering::SeqCst) < taken && !self.is_abandoned() {
+            g = self
+                .wait_cv
+                .wait_timeout(g, PARK_SHORT)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        self.waiters.0.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// Caller holds `retire_exec`.
-    fn run_retired_locked(&self, all: bool) {
+    /// Runs the ready (or, with `all`, every) queued destruction on this
+    /// thread. Returns the dequeue count as of this call, the bound a
+    /// [`run_ready_retired`](Self::run_ready_retired) caller waits for.
+    fn run_retired(&self, all: bool) -> u64 {
         if !self.retire_pending.load(Ordering::Acquire) {
-            return;
+            return self.retire_taken.load(Ordering::Acquire);
         }
         let done = self.read.0.load(Ordering::Acquire);
-        let ready: Vec<Retire> = {
+        let (ready, taken): (Vec<Retire>, u64) = {
             let mut q = lock(&self.retire);
             let mut ready = Vec::new();
             let mut i = 0;
@@ -524,11 +547,25 @@ impl CmdQueue {
                 }
             }
             self.retire_pending.store(!q.is_empty(), Ordering::Release);
-            ready
+            // Under the queue lock: a later caller that takes the lock sees
+            // these as taken and waits for them to finish.
+            let n = ready.len() as u64;
+            (ready, self.retire_taken.fetch_add(n, Ordering::AcqRel) + n)
         };
+        if ready.is_empty() {
+            return taken;
+        }
+        let n = ready.len() as u64;
         for r in ready {
             (r.run)();
         }
+        self.retire_finished.fetch_add(n, Ordering::AcqRel);
+        fence(Ordering::SeqCst);
+        if self.waiters.0.load(Ordering::Relaxed) != 0 {
+            let _g = lock(&self.wait_lock);
+            self.wait_cv.notify_all();
+        }
+        taken
     }
 
     /// Record an error a worker-side call wanted to report. `priority` decides
@@ -1185,6 +1222,56 @@ mod tests {
         q.wait_done(q.written());
         q.run_ready_retired();
         assert!(finished.load(Ordering::Acquire), "returned while a view destroy was still running");
+        q.shutdown();
+    }
+
+    #[test]
+    fn the_worker_never_waits_for_a_destruction_another_thread_runs() {
+        // A streaming thread's resource destroy runs a slow ready destruction
+        // itself; meanwhile another destruction becomes ready and records keep
+        // coming. The worker must keep replaying records (running the new
+        // destruction itself) instead of waiting for the other thread.
+        let q = CmdQueue::new(1 << 16, "t-retire-noblock");
+        let gate1 = gated(&q);
+        let pos = q.written();
+        let in_slow = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&in_slow);
+        unsafe {
+            q.retire(pos, move || {
+                s.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(300));
+            });
+        }
+        // The worker finishes gate 1 (passing `pos`) and blocks in gate 2
+        // before its batch boundary, so the helper is the one to take the
+        // slow destruction.
+        let gate2 = gated(&q);
+        gate1.store(true, Ordering::Release);
+        spin_until(|| q.done() >= pos);
+        let helper = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || q.run_ready_retired())
+        };
+        spin_until(|| in_slow.load(Ordering::Acquire));
+        // A second destruction, ready once gate 2 is passed, and records.
+        unsafe { q.retire(q.written(), || {}) };
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+        unsafe { q.push(0, |_| {}, move |_: &[u8]| r.store(true, Ordering::Release)).unwrap() };
+        let t0 = Instant::now();
+        gate2.store(true, Ordering::Release);
+        // Past the second destruction's batch boundary: the worker's ring
+        // runs empty after the record above, then another record follows.
+        spin_until(|| ran.load(Ordering::Acquire));
+        let p3 = q.written();
+        unsafe { q.push(0, |_| {}, |_: &[u8]| {}).unwrap() };
+        spin_until(|| q.done() >= p3 + 1);
+        let waited = t0.elapsed();
+        assert!(
+            waited < Duration::from_millis(150),
+            "worker blocked {waited:?} behind another thread's destruction"
+        );
+        helper.join().unwrap();
         q.shutdown();
     }
 

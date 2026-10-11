@@ -105,8 +105,8 @@ Every immediate-context entry point is in exactly one class.
 "Synchronous" means the ring is drained, not that the worker is idle: it may still be running queued destructions,
 whose bodies are free-threaded safe (cache mutex, atomics). A resource destroy runs the destructions the worker has
 passed on its own thread first, and waits for any the worker already took out of the queue and is still running
-(`CmdQueue::run_ready_retired` holds the same lock as the worker's batch), so a view is never destroyed after its
-resource.
+(`CmdQueue::run_ready_retired` waits on counters of destructions taken and finished; the worker itself never waits
+for another thread's destruction), so a view is never destroyed after its resource.
 
 Device-level calls already run concurrently with the immediate context under `UmdFreeThreaded` (FREETHREADED caps),
 so their thread-safety is not new. Moving immediate-context work from the app thread to the worker does not change
@@ -138,9 +138,9 @@ Only the immediate context is threaded. Deferred contexts (DCs) already record o
 `D3D11DeferredContext` through their own funcs tables (`deferred.rs`); those tables are filled independently of the
 device table and get no wrappers. A DC's calls never reach the frontend's ring.
 
-`FinishCommandList(FALSE)` clears the DC's DXVK state like `ExecuteCommandList(FALSE)` clears its target's, so both
-reset the context's binding shadows (`CtxBindings::reset_after_command_list_execute`): the draw path skips
-`IASetInputLayout` when `bound_il_com` names the layout DXVK already has, and a stale shadow would leave the next
+`FinishCommandList(FALSE)` clears the DC's DXVK state, so it forgets what the DC last handed DXVK
+(`CtxBindings::forget_dxvk_bindings`: `bound_vs_com`, `bound_il_com`) and keeps the API-level shadows: the draw path
+skips `IASetInputLayout` when `bound_il_com` names the layout DXVK already has, and a stale value would leave the next
 list's draws without one.
 
 `CommandListExecute` on the immediate context is deferred from phase 2 on (phase 1 drains and runs it inline, so no
