@@ -3138,22 +3138,19 @@ pub(crate) fn process_deferred_vidpn_source_address(
         let immediate = crate::ddi::immediate_flip::begin_programming(unsafe {
             crate::ddi::create_allocation::vidpn_primary_flags(adapter, raw as HANDLE)
         });
-        // The flip's own address: its completion vsync carries it once it is the published one.
-        let flip_address =
-            unsafe { crate::ddi::create_allocation::vidpn_primary_address(adapter, raw as HANDLE) };
         let status =
             unsafe { apply_deferred_vidpn_source_address_locked(adapter, lock, raw as HANDLE) };
         crate::ddi::immediate_flip::end_programming();
-        Some((status, immediate.then_some(flip_address)))
+        Some((status, immediate))
     });
     // The mutex is free again: the `VpDSt` registry write below must not run under a site that
     // says it is held.
     crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_POST);
-    let status = status.map(|(status, immediate_flip_address)| {
+    let status = status.map(|(status, immediate)| {
         // `ImmFlip`: an immediate flip that published its address is retired now, not at the
         // next vsync tick.
-        if let Some(flip_address) = immediate_flip_address {
-            crate::ddi::immediate_flip::complete_now(adapter, flip_address);
+        if immediate {
+            crate::ddi::immediate_flip::complete_now(adapter);
         }
         status
     });

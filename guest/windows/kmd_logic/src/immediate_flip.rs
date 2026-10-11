@@ -169,16 +169,16 @@ pub const fn programming_is_immediate(mode: u32, recorded_flags: u32) -> bool {
             || (mode & IFLIP_NOW != 0 && recorded_flags & SVSA_INDEPENDENT_FLIP_EXCLUSIVE != 0))
 }
 
-/// The address a completion vsync carries after an immediate programming, or `None`: the flip's
-/// own address (`flip`) when it is the published one now (`published`) and not the one the
-/// previous completion already carried (`last_done`). Not "the published address changed during
-/// the programming": with `FlipAnnounce` the DDI publishes the address before the worker
-/// programs it, so it never changes there (405.51: every promoted flip took the immediate path
-/// and none got its completion, `ImmVsNo` = `ImmProg`, and they stayed tied to the tick). A
-/// programming that was deferred, superseded or refused left another address published: none.
-pub const fn completion_address(published: u64, flip: u64, last_done: u64) -> Option<u64> {
-    if flip != 0 && published == flip && flip != last_done {
-        Some(flip)
+/// The address a completion vsync carries after an immediate programming, or `None`: the address
+/// published now (`published`) unless the previous completion or tick already carried it
+/// (`last_done`). The newest published address, not the programmed flip's own: at very high frame
+/// rates dxgkrnl issues the next flip while the worker programs this one, the newest one is
+/// published by then, and requiring this flip's address left every such flip to the tick (405.52,
+/// an uncapped 488 fps application: 218 completions for 3036 immediate programmings, 240 flips
+/// per second). A vsync carrying the newest address retires whatever dxgkrnl queued up to it.
+pub const fn completion_address(published: u64, last_done: u64) -> Option<u64> {
+    if published != 0 && published != last_done {
+        Some(published)
     } else {
         None
     }
@@ -314,20 +314,15 @@ mod tests {
     }
 
     #[test]
-    fn a_completion_vsync_carries_the_flips_own_published_address_once() {
-        // Announced at the DDI: published before the programming, still the flip's.
-        assert_eq!(completion_address(0x2000, 0x2000, 0x1000), Some(0x2000));
+    fn a_completion_vsync_carries_the_newest_published_address_once() {
+        assert_eq!(completion_address(0x2000, 0x1000), Some(0x2000));
         assert_eq!(
-            completion_address(0x2000, 0x2000, 0x2000),
-            None,
-            "already completed"
+            completion_address(0x3000, 0x1000),
+            Some(0x3000),
+            "a newer flip overtook"
         );
-        assert_eq!(
-            completion_address(0x1000, 0x2000, 0x1000),
-            None,
-            "deferred or refused"
-        );
-        assert_eq!(completion_address(0, 0, 0), None);
+        assert_eq!(completion_address(0x2000, 0x2000), None, "already carried");
+        assert_eq!(completion_address(0, 0x1000), None);
     }
 
     #[test]
