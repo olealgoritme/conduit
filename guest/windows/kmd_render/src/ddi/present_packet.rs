@@ -81,6 +81,12 @@ const PRESENT_KEEP_MAGIC: u32 = 0x4850_4B50; // "HPKP"
 /// the one designed for hardware that cannot flip synchronously, because the
 /// submission fence puts the completion signal back under driver control.
 ///
+/// With `ImmFlip` bit 2 (default on) the KMD reports `FlipImmediateMmIo` all the same, because
+/// dxgkrnl otherwise turns a promoted application's tearing presents into vsync flips: an
+/// immediate flip is then MMIO, and its early completion is the tear the application asked for.
+/// This contract stays for `ImmFlip` without bit 2 and for any DMA-buffer flip dxgkrnl still
+/// issues.
+///
 /// It lives in the kernel-only `pDmaBufferPrivateData`, never in the DMA buffer
 /// the UMD can see, so the allocation handle it carries is not user-influenced.
 #[repr(C)]
