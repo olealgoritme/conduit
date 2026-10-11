@@ -424,6 +424,8 @@ fn shadow_copy(
     };
     let kicked = ce::now_100ns();
     let value = ce::submit(acquire, &rect).map_err(|_| Skip::Channel)?;
+    // A copy that does not land in time stays on the ring: its slots must outlive it.
+    ce_dup::note_submitted(&producer.lease, value);
     wait_copy(passive, adapter, epoch, &h, s, value, kicked)?;
     COPY_US.store(us_since(kicked), Ordering::Relaxed);
     let t0 = ce::now_100ns();
