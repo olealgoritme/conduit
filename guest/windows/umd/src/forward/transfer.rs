@@ -210,18 +210,11 @@ pub(crate) unsafe extern "system" fn resource_map(
         Some(&mut out),
     ) {
         Ok(()) => {
-            let allocation = resource_allocation(h_resource);
-            let n = MAP_LOG_COUNT.next();
-            if n < 256 || allocation != 0 {
-                trace_line!(
-                    "DDI resource_map ok alloc=0x{:x} sub={} map={} rowPitch={} depthPitch={} pData={:p}",
-                    allocation,
-                    subresource,
-                    map_type,
-                    out.RowPitch,
-                    out.DepthPitch,
-                    out.pData
-                );
+            // Untraced, skip the allocation read (a dependent load into the
+            // resource slot) and the counter: this is the per-draw constant
+            // buffer path (Map DISCARD / NO_OVERWRITE).
+            if crate::trace_enabled() {
+                trace_resource_map(h_resource, subresource, map_type, &out);
             }
             if !mapped.is_null() {
                 (*mapped).pData = out.pData;
@@ -235,6 +228,29 @@ pub(crate) unsafe extern "system" fn resource_map(
                 (*mapped).pData = core::ptr::null_mut();
             }
         }
+    }
+}
+
+/// The `resource_map` trace line (UmdTrace only): the first 256 maps, and
+/// every map of a WDDM-allocated resource.
+unsafe fn trace_resource_map(
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    subresource: u32,
+    map_type: ddi::D3D10_DDI_MAP,
+    out: &D3D11_MAPPED_SUBRESOURCE,
+) {
+    let allocation = resource_allocation(h_resource);
+    let n = MAP_LOG_COUNT.next();
+    if n < 256 || allocation != 0 {
+        trace_line!(
+            "DDI resource_map ok alloc=0x{:x} sub={} map={} rowPitch={} depthPitch={} pData={:p}",
+            allocation,
+            subresource,
+            map_type,
+            out.RowPitch,
+            out.DepthPitch,
+            out.pData
+        );
     }
 }
 
@@ -257,8 +273,10 @@ pub(crate) unsafe extern "system" fn dynamic_cb_map_no_overwrite(
     map_flags: u32,
     mapped: *mut ddi::D3D10DDI_MAPPED_SUBRESOURCE,
 ) {
+    // Every NO_OVERWRITE constant-buffer map comes through here: a load,
+    // not a locked add, once the first hit is recorded.
     static FIRST_HIT: AtomicUsize = AtomicUsize::new(0);
-    if FIRST_HIT.fetch_add(1, Ordering::Relaxed) == 0 {
+    if FIRST_HIT.load(Ordering::Relaxed) == 0 && FIRST_HIT.swap(1, Ordering::Relaxed) == 0 {
         trace_line!(
             "DDI DynamicConstantBufferMapNoOverwrite: first hit sub={} map={}",
             subresource,
@@ -788,8 +806,8 @@ pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     let (_, k2, w2, h2, a2, f2) = resource_summary(resource2);
     // Size: the KMD has no scaler, so the application's buffer must have DWM's primary's extent
     // (the mode). Format: equal (the 393.1 rule), or with 5 only two 8-bit scan-out formats (an
-    // R8G8B8A8 game on the B8G8R8A8 desktop). 5 is opt-in: a promoted R8G8B8A8 CS2 swap chain
-    // froze after one frame on 405.8 (docs/independent-flip.md 13.10).
+    // R8G8B8A8 game on the B8G8R8A8 desktop; the default since 405.49). 405.8's freeze of a
+    // promoted R8G8B8A8 CS2 swap chain was the missing pointer (docs/independent-flip.md 13.10).
     let same_size = k1 == "tex2d" && k2 == "tex2d" && w1 == w2 && h1 == h2 && w1 != 0;
     let formats_ok = helios_umd_common::format::direct_flip_formats_compatible(f1, f2, mode != 5);
     let same = same_size && formats_ok;

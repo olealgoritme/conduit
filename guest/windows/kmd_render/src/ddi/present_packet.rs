@@ -52,6 +52,10 @@ pub(crate) unsafe fn execution_record(
 
 const PRESENT_FLIP_MAGIC: u32 = 0x4850_464C; // "HPFL"
 const PRESENT_FLIP_VERSION: u32 = 1;
+/// `version` bit 31 of a FLIP record: the Present's `FlipInterval` was immediate
+/// (`helios_kmd_logic::immediate_flip::interval_is_immediate`). The record's size and layout do
+/// not change.
+const PRESENT_FLIP_IMMEDIATE: u32 = 1 << 31;
 /// The marker of a KEEP record: same slot and layout as a flip record, `allocation` 0, only
 /// `physical_address` meaningful. See [`PresentFlipPrivate::write_keep`].
 const PRESENT_KEEP_MAGIC: u32 = 0x4850_4B50; // "HPKP"
@@ -76,6 +80,12 @@ const PRESENT_KEEP_MAGIC: u32 = 0x4850_4B50; // "HPKP"
 /// markers writing the buffer that was on screen. The DMA-buffer contract is
 /// the one designed for hardware that cannot flip synchronously, because the
 /// submission fence puts the completion signal back under driver control.
+///
+/// With `ImmFlip` bit 2 (default on) the KMD reports `FlipImmediateMmIo` all the same, because
+/// dxgkrnl otherwise turns a promoted application's tearing presents into vsync flips: an
+/// immediate flip is then MMIO, and its early completion is the tear the application asked for.
+/// This contract stays for `ImmFlip` without bit 2 and for any DMA-buffer flip dxgkrnl still
+/// issues.
 ///
 /// It lives in the kernel-only `pDmaBufferPrivateData`, never in the DMA buffer
 /// the UMD can see, so the allocation handle it carries is not user-influenced.
@@ -123,6 +133,7 @@ impl PresentFlipPrivate {
         allocation: HANDLE,
         physical_address: u64,
         snapshot: Option<SnapshotDescriptor>,
+        immediate: bool,
     ) -> Result<(), NTSTATUS> {
         if private_data.is_null()
             || (private_size as usize)
@@ -146,7 +157,7 @@ impl PresentFlipPrivate {
         });
         let record = PresentFlipPrivate {
             magic: PRESENT_FLIP_MAGIC,
-            version: PRESENT_FLIP_VERSION,
+            version: PRESENT_FLIP_VERSION | if immediate { PRESENT_FLIP_IMMEDIATE } else { 0 },
             allocation: allocation as usize as u64,
             physical_address,
             snap_resid: snap.resource_id,
@@ -275,7 +286,7 @@ impl PresentFlipPrivate {
     pub(crate) unsafe fn take(
         private_data: *mut c_void,
         private_size: u32,
-    ) -> Option<(HANDLE, u64, Option<SnapshotDescriptor>)> {
+    ) -> Option<(HANDLE, u64, Option<SnapshotDescriptor>, bool)> {
         if private_data.is_null()
             || (private_size as usize)
                 < PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
@@ -291,7 +302,9 @@ impl PresentFlipPrivate {
         // SAFETY: size-checked above; unaligned because dxgkrnl makes no
         // alignment promise about the private-data buffer beyond its size.
         let record = unsafe { core::ptr::read_unaligned(slot) };
-        if record.magic != PRESENT_FLIP_MAGIC || record.version != PRESENT_FLIP_VERSION {
+        if record.magic != PRESENT_FLIP_MAGIC
+            || record.version & !PRESENT_FLIP_IMMEDIATE != PRESENT_FLIP_VERSION
+        {
             return None;
         }
         if record.allocation == 0 {
@@ -325,6 +338,7 @@ impl PresentFlipPrivate {
             record.allocation as usize as HANDLE,
             record.physical_address,
             snapshot,
+            record.version & PRESENT_FLIP_IMMEDIATE != 0,
         ))
     }
 }

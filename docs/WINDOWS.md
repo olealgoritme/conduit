@@ -335,6 +335,10 @@ D3D12).
 - `guest/windows/tools/scanout_timeline_dump.c` reads the KMD's scanout
   timeline (an escape; it never submits work) to CSV around a workload, to
   see where frame time goes at high refresh rates.
+- `guest/windows/tools/rawcount.c` counts the mouse reports Windows
+  delivers per second, per device, in the background (raw input). With
+  `host/latency/vmouse.c` it measures the input path's report rate; see
+  [INPUT.md](INPUT.md) "Measuring".
 - Windowed apps (DWM composes them) learn that their frame was copied to the
   desktop from a per-device event the KMD signals. The KMD's table holds 64
   of these (DWM uses about a dozen; most apps one to three). The `AqLive`

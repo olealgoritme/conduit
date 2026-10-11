@@ -48,6 +48,12 @@ DLLs. Vulkan and OpenCL coexist with other vendors through their standard ICD
 registries. OpenGL is registered only on the Helios display adapter software
 key.
 
+The package also carries Red Hat's WHQL-signed `vioinput` driver from virtio-win
+(`payload\drivers\vioinput`, with its license) for virtio-input keyboards, mice
+and tablets (PCI `1AF4:1052`). The installer adds it with
+`pnputil /add-driver ... /install` after the display driver; a failure there is
+only a warning. Uninstall leaves it in place.
+
 If the virtio-gpu device is using Red Hat's `viogpudo` driver, a manual
 `Install-Helios.ps1` run prompts Yes/No (default No; `[y/N]` on a console)
 before uninstalling that driver package. `HeliosSetup.exe` and `-Automatic`

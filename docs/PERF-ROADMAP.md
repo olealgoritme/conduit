@@ -52,7 +52,7 @@ WDDM 2.1 software-scheduler packet pipe.
 |---|---|---|---|---|
 | W1 | GPU semaphore release + nonstall IRQ on host CPU 0 | nvidia.ko | IRQ | – |
 | W2 | RM OS-event fd readable → `nvgpu-events` epoll edge | `conduit-backend.rs:1384 event_pump`, `1188 EventReports::report` | backend event thread | 5–15 µs *(est)*; a fence already reached is found by the **1 ms sweep** |
-| W3 | `EventReady` into one of **16** posted event buffers → `signal_used_queue` (one MSI per event with `event-batch` off) | `deliver_event` bin:615 | same | 1.4 µs irqfd. If all 16 are taken, the event waits for a repost (backlog) |
+| W3 | `EventReady` into one of **16** posted event buffers → `signal_used_queue`. With `NVGPU_F_EVENT_PACKED` acked (KMD 405.45+) the reports of one pump pass share buffers (up to 32 each) and the pass raises one MSI; without it, one buffer and (with `event-batch` off) one MSI per report | `EventReports::push_packed`, `end_pass` | same | 1.4 µs irqfd. A report with no buffer waits in the backlog; the guest is asked to kick the queue only then (`VRING_USED_F_NO_NOTIFY` otherwise) |
 | W4 | guest ISR → DPC `drain_nvrm_events` → `KeSetEvent` (shared per-device nonstall event) | `kmd_render/src/virtio/gpu/nvrm_events.rs`, `ddi/interrupt.rs` | vCPU DPC | ~20–40 µs *(est from NvRtt min 18 µs)* |
 | W5 | librmclient waiter wakes, wakes the other waiters via condvar (`crm_win_event_wait_gen`, TW:2346), each re-reads its semaphore | `transport_windows.c:2346`, `patches/0006 nvkmd_rm_wait_step` + `patches-common/0040/0042` | UMD threads | 10–30 µs *(est)*; **every release wakes every waiter** of the device |
 | | **Total release → waiter running** | | | **~140 µs** *(doc: nvrm-forward-path.md "event round trip 142 µs")*. Bare metal (NVIDIA or nouveau): 5–15 µs |
@@ -127,6 +127,43 @@ Still on Venus in the KMD:
 | vsync timer DPCs | `VsTickN` +240/s, `DpcNoCause` +250/s *(live)* | about 240 DPC + SyncExec per second |
 | event relay | 585 KeSetEvent/s and 323 MSIs/s at idle *(live)*; host trace: 485 `event` requests/s idle | small, but the 16-entry ring overflows (`NvEvFull` +6/s) |
 | GDI accel | `GdiUs`/`GdiCmdN` = **1.8 ms per GDI job** mean, 44 ms max; 1,773 CPU fallbacks *(live)* | blocks the HPD worker / GDI thread; desktop smoothness, not games |
+
+### 1h. CS2 under play: where the frame goes (2026-10-10, 405.42, latency options off)
+
+A 10-minute recording while CS2 was played (nvidia-smi, pidstat of QEMU/backend threads, KMD counters every 10 s, the
+backend log), then a per-thread CPU reading and a 3,000-sample instruction-pointer profile of the busiest thread
+(`guest/windows/tools/thread-sample.ps1`), symbolized against the 405.42 PDBs.
+
+- **Not GPU-bound.** SM busy median 46% (p90 78%), 136 W average. Host CPU about 73% idle.
+- **One guest thread is the frame.** `D3D11RenderThread` (CS2's render thread, which makes every D3D11 call) at
+  **99.7%** of a CPU; `dxvk-cs` 59%, `MainThrd` 56%, 7 `GlobPool` workers about 31% each, `dxvk-queue` 14%. At
+  130–190 fps that is 5–7 ms of render-thread CPU per frame.
+- **Render-thread profile** (share of samples):
+
+  | where | share | notes |
+  |---|---|---|
+  | `helios_umd.dll` (DXVK's D3D11 front end + the DDI forward layer) | 46% | `Map(WRITE_DISCARD)` path ≈ 17% (`D3D11ImmediateContext::Map`, `DxvkBuffer::allocateStorage`, `DxvkResourceAllocationPool::alloc`, `forward::transfer::resource_map`); binding (`SetShaderResources`, `BindShaderResource`, `SetConstantBuffers1`, `GetBufferSlice`) ≈ 8%; `Rc<>` atomics ≈ 2% |
+  | `d3d11.dll` (the Microsoft runtime above the UMD) | 21% | 7% on one load at a function entry (`movsbq 0xc9(%rdx)`, a cold resource object) |
+  | `rendersystemdx11.dll` and other game code | 21% | |
+  | `ntdll.dll` | 9% | `NtAlertThreadByThreadIdEx` 1.9% (waking DXVK's CS thread), `NtWaitForAlertByThreadId` 1.7%, `NtWaitForSingleObject` 1.8% |
+  | `win32u.dll` (D3DKMT syscalls) | 2.3% | |
+
+  The hottest instructions in the UMD and the runtime are almost all the load right after a pointer chase: the thread is
+  bound by memory latency more than by instructions. Guest RAM was **entirely on 4 KiB host pages** (KVM `pages_2m` 0,
+  `ShmemPmdMapped` 0, 1.3 GB of the VMM swapped while the host was short of RAM), so every TLB miss is a two-level
+  4 KiB walk ([HOST-TUNING.md](HOST-TUNING.md), "Memory").
+- **Event relay under play.** `EventReady` about 38,000/s (fences 250–300/s, the rest NVK non-stall event files: one
+  GPU interrupt makes every NVK device's file readable), guest MSIs about 24,000/s, `NvEvFull` 400–500/s, backend
+  "no buffer" about 250/s with backlog waits up to 1–3 ms; `nvgpu-events` 18% of a host CPU. None of it runs on the
+  render thread; it costs DPCs on whichever vCPUs take the interrupts. `NVGPU_F_EVENT_PACKED` and the kick suppression
+  (W3) address the buffers, interrupts and doorbells.
+- **VM exits at a light load** (`perf kvm stat`, 5 s): HLT 12,600/s, MSR 10,600/s, interrupt 13,000/s, hypercall 2,800/s,
+  AVIC incomplete IPI 2,800/s, NPF 2,700/s.
+
+**Budget, render thread, per frame at ~150 fps (6.6 ms):** game ≈ 1.4 ms, D3D11 runtime ≈ 1.4 ms, UMD/DXVK front end
+≈ 3.0 ms, waits and wakes ≈ 0.4 ms, D3DKMT ≈ 0.15 ms. On bare metal NVIDIA's UMD defers most of its work to driver
+threads, so the app thread pays little beyond the runtime; the front end on the app thread and the 4 KiB-page memory
+latency are the gap.
 
 ## 2. Gaps vs bare metal, ranked by expected gain
 

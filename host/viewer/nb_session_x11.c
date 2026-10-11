@@ -73,6 +73,7 @@ struct nb_session *nb_session_x11(const struct nb_config *cfg)
 #include <xcb/xinput.h>
 #endif
 #include "nb_ui.h"
+#include "nb_relacc.h"
 
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
 
@@ -154,6 +155,7 @@ struct nb_x11 {
                                      * nothing completed yet                  */
     uint32_t last_raw_seq;          /* de-dup for double-delivered XI2 raw    */
     int      last_raw_dx, last_raw_dy;
+    struct nb_relacc relacc;   /* sub-pixel carry of raw motion */
     int  win_w, win_h;              /* toplevel size, from ConfigureNotify    */
     int  con_w, con_h;              /* content-window size we last asked for  */
     bool grabbed, fullscreen;
@@ -1360,12 +1362,20 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 int nvals =
                     xcb_input_raw_button_press_axisvalues_raw_length(re);
                 int dx = 0, dy = 0;
+                /* The raw valuators in 1/256 (nb_relacc.h): a mouse
+                 * libinput scales (a known DPI) moves in fractions, which
+                 * the integral part alone dropped. */
+                int32_t fx = 0, fy = 0;
 
                 if (nvals >= 1) {
                     dx = (int)vals[0].integral;
+                    fx = (int32_t)((int64_t)vals[0].integral * 256 +
+                                   (int32_t)(vals[0].frac >> 24));
                 }
                 if (nvals >= 2) {
                     dy = (int)vals[1].integral;
+                    fy = (int32_t)((int64_t)vals[1].integral * 256 +
+                                   (int32_t)(vals[1].frac >> 24));
                 }
                 if (nb_verbose) {
                     nb_log("XI RawMotion seq=%u dev=%u src=%u dx=%d dy=%d",
@@ -1406,6 +1416,7 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 x->last_raw_seq = re->full_sequence;
                 x->last_raw_dx = dx;
                 x->last_raw_dy = dy;
+                nb_relacc_add(&x->relacc, fx, fy, &dx, &dy);
                 nb_sink_rel(sink, dx, dy);
             }
 #endif

@@ -9,6 +9,14 @@
 // things lets it map all of BAR0 read-write. So the backend refuses to start
 // as root or with CAP_SYS_ADMIN, and drops whatever capabilities it has before
 // it opens a device.
+//
+// One exception, on request: CAP_SYS_NICE stays in the PERMITTED set (never
+// the effective one) when the guest-TSG policy needs it (gpu_sched): RM lets
+// a TSG's interleave level be changed only by a caller with CAP_SYS_NICE.
+// The backend raises it for its own SET_INTERLEAVE_LEVEL calls and lowers it
+// straight after, so no guest ioctl is ever made with it effective. It is
+// kept only if the process was started with it (e.g. a file capability
+// `cap_sys_nice+p` on the binary); nothing here grants it.
 
 use std::io;
 
@@ -68,6 +76,12 @@ pub fn refusal(euid: u32, caps: Caps) -> Option<String> {
 /// process an RM administrator, and a test rig can run it as a plain user as
 /// easily as anything else can.
 pub fn enforce() -> anyhow::Result<()> {
+    enforce_keeping_nice(false)
+}
+
+/// [`enforce`], keeping CAP_SYS_NICE permitted (not effective) when
+/// `keep_nice` and the process has it.
+pub fn enforce_keeping_nice(keep_nice: bool) -> anyhow::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     let caps = Caps::current()?;
@@ -79,13 +93,25 @@ pub fn enforce() -> anyhow::Result<()> {
              render node"
         );
     }
-    drop_all()?;
+    let keep = keep_nice && caps.permitted & (1 << crate::gpu_sched::CAP_SYS_NICE) != 0;
+    drop_all(keep)?;
     let after = Caps::current()?;
     log::info!(
         "privileges: uid {euid}, capabilities effective {:#x}, permitted {:#x}, no_new_privs set",
         after.effective,
         after.permitted
     );
+    if keep {
+        log::info!(
+            "CAP_SYS_NICE kept permitted, not effective: raised only for the backend's own \
+             guest-TSG interleave calls"
+        );
+    } else if keep_nice {
+        log::info!(
+            "no CAP_SYS_NICE: RM will refuse the guest-TSG interleave level \
+             (CONDUIT_GUEST_TSG_INTERLEAVE); give the binary cap_sys_nice+p to allow it"
+        );
+    }
     Ok(())
 }
 
@@ -93,7 +119,7 @@ pub fn enforce() -> anyhow::Result<()> {
 /// set no_new_privs. The bounding set is left as it is: changing it takes
 /// CAP_SETPCAP, which this process has just been made not to have, and with
 /// no_new_privs nothing it execs can gain from it.
-fn drop_all() -> io::Result<()> {
+fn drop_all(keep_nice: bool) -> io::Result<()> {
     // SAFETY: prctl with PR_CAP_AMBIENT_CLEAR_ALL takes no pointers.
     let r = unsafe {
         libc::prctl(
@@ -125,7 +151,10 @@ fn drop_all() -> io::Result<()> {
         version: 0x2008_0522,
         pid: 0,
     };
-    let data = [Data::default(); 2];
+    let mut data = [Data::default(); 2];
+    if keep_nice {
+        data[0].permitted = 1 << crate::gpu_sched::CAP_SYS_NICE;
+    }
     // SAFETY: capset reads one header and two data words, which both live for
     // the call; pid 0 is this thread.
     let r = unsafe { libc::syscall(libc::SYS_capset, &header as *const Header, data.as_ptr()) };

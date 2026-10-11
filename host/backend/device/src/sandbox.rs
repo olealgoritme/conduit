@@ -487,6 +487,12 @@ mod seccomp {
             libc::SYS_getrandom,
             libc::SYS_prctl,
             libc::SYS_arch_prctl,
+            // CAP_SYS_NICE raised and lowered around the backend's own TSG
+            // scheduling calls (gpu_sched::NiceRaised). posture leaves at most
+            // that one capability permitted, and no_new_privs is set, so these
+            // can move nothing but it between the permitted and effective sets.
+            libc::SYS_capget,
+            libc::SYS_capset,
             libc::SYS_uname,
             // The same calls under their older numbers. x86-64 keeps both, and
             // which one a libc uses is the libc's business: the backend ships

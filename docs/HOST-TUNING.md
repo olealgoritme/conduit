@@ -43,8 +43,16 @@ random stalls in the guest even when the host looks idle.
    The reserved pages are taken from the host for as long as they are
    reserved, whether the VM runs or not (`sudo sysctl vm.nr_hugepages=0`
    gives them back).
+   This matters most for CPU-bound games: on 4 KiB host pages every guest TLB
+   miss walks two levels of 4 KiB tables, and a game's render thread spends
+   much of its time on such loads (CS2 on the reference host, 16 GiB guest
+   entirely on 4 KiB pages: the hottest instructions of the D3D11 runtime and
+   the UMD were all loads of a cold pointer). `conduit doctor NAME` prints how
+   much of a running VM's RAM sits on 2 MiB pages.
 3. **Without reserved huge pages**, let shared memory use transparent huge
-   pages. They are best effort and can still be swapped:
+   pages. They are best effort and can still be swapped; on a host that has
+   been up a while most allocations fall back to 4 KiB (check with `conduit
+   doctor NAME`, or `grep thp_file_fallback /proc/vmstat`):
 
    ```sh
    echo 'w /sys/kernel/mm/transparent_hugepage/shmem_enabled - - - - within_size' \
@@ -124,6 +132,20 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   (`emulatorpin`), and sharing them there gave millisecond tails. On INTx,
   leave `backend.cpus` unset or keep it clear of the emulator CPUs.
 - **CPU governor**: `performance` avoids clock ramp-up latency.
+- **Idle vCPUs (optional, for a dedicated set of cores).** A game hands work
+  between its threads (render thread, DXVK's CS and submit threads) many
+  thousand times a second. Each hand-off to a thread whose vCPU is idle is a
+  HLT exit on that vCPU and, on AMD with AVIC, an `avic_incomplete_ipi` exit
+  on the waking one (on the reference host at a light load: about 12,000 HLT
+  and 2,800 incomplete-IPI exits a second; under CS2 the render thread spent
+  about 2% of its time in `NtAlertThreadByThreadIdEx`). With pinned vCPUs,
+  `-overcommit cpu-pm=on` (libvirt: `<qemu:commandline>`) lets the guest idle
+  in place without exits, so a wake is a posted interrupt. The cost: the
+  guest's host threads read as 100% busy and nothing else can use those
+  cores while the VM runs, idle or not. A milder knob is KVM's halt polling
+  (`/sys/module/kvm/parameters/halt_poll_ns`, default 200000 ns), which spins
+  an idle vCPU a little before it sleeps. `sudo perf kvm stat live -p
+  $(pgrep -f 'guest=NAME')` shows the exit mix.
 
 ## GPU memory: Resizable BAR and the video-memory limit
 

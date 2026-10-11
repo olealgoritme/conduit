@@ -265,6 +265,7 @@ impl BridgeOwned {
         self.present_src_cache.get_mut().clear();
         *self.snapshot_rings.get_mut() = SnapshotRingCache::default();
         self.bindings.bound_vs_com.store(0, Ordering::Relaxed);
+        self.bindings.bound_il_com.store(0, Ordering::Relaxed);
         self.ia_gen.fetch_add(1, Ordering::Release);
         match self.caches.get_mut() {
             Ok(caches) => caches.release_owned_com(),
@@ -413,6 +414,11 @@ pub struct HeliosDevice {
     /// Device removal when the KMD goes away under this process (see
     /// `device_loss.rs`): the loss epoch at creation.
     pub loss: crate::device_loss::LossWatch,
+    /// The threaded front end of this device's immediate context
+    /// (`docs/d3d11-threaded-frontend.md`), when `UmdThreadedFrontend` gave it
+    /// one. Shut down first in DestroyDevice, while everything its queued
+    /// records and destructions use is still alive.
+    pub frontend: Option<crate::forward::Frontend>,
 }
 
 /// Per-deferred-context UMD state, constructed in-place in the runtime-
@@ -539,6 +545,12 @@ pub struct CtxBindings {
     /// The VS COM pointer most recently handed to DXVK's VSSetShader (may be
     /// a variant; `current_vs` stays the runtime's own binding).
     pub bound_vs_com: AtomicUsize,
+    /// The `ID3D11InputLayout` most recently handed to DXVK's
+    /// IASetInputLayout by `bind_input_layout`, so a draw with the same
+    /// resolved layout skips the call. Reset wherever `bound_vs_com` is: DXVK
+    /// holds a reference to its bound layout, so the address cannot be reused
+    /// while DXVK still has it bound.
+    pub bound_il_com: AtomicUsize,
     /// Currently-bound per-stage shader COM pointers.
     pub current_vs: AtomicUsize,
     pub current_ps: AtomicUsize,
@@ -596,6 +608,7 @@ impl CtxBindings {
     /// rebinds lazily.
     pub fn reset(&self) {
         self.bound_vs_com.store(0, Ordering::Relaxed);
+        self.bound_il_com.store(0, Ordering::Relaxed);
         self.current_vs.store(0, Ordering::Relaxed);
         self.current_ps.store(0, Ordering::Relaxed);
         self.current_gs.store(0, Ordering::Relaxed);
@@ -639,6 +652,7 @@ impl CtxBindings {
         }
 
         self.bound_vs_com.store(0, Ordering::Relaxed);
+        self.bound_il_com.store(0, Ordering::Relaxed);
         self.current_vs.store(0, Ordering::Relaxed);
         self.current_layout.store(0, Ordering::Relaxed);
     }
@@ -658,9 +672,11 @@ mod tests {
         bindings.current_topology.store(5, Ordering::Relaxed);
         bindings.current_rt0_alloc.store(6, Ordering::Relaxed);
 
+        bindings.bound_il_com.store(7, Ordering::Relaxed);
         bindings.reset_for_deferred_clear_state(false);
 
         assert_eq!(bindings.bound_vs_com.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.bound_il_com.load(Ordering::Relaxed), 0);
         assert_eq!(bindings.current_vs.load(Ordering::Relaxed), 0);
         assert_eq!(bindings.current_layout.load(Ordering::Relaxed), 0);
         assert_eq!(bindings.current_ps.load(Ordering::Relaxed), 4);
@@ -1018,6 +1034,14 @@ pub(crate) unsafe extern "system" fn ddi_destroy_device(h_device: ddi::D3D10DDI_
         }
     }
     log_error!("DDI: DestroyDevice");
+    // The threaded front end first: drain, run its queued destructions and
+    // stop its worker while the device is fully alive.
+    // Shut down through a shared reference: the worker still reads the device
+    // until the join inside `shutdown`.
+    if let Some(fe) = (*(h_device.pDrvPrivate as *const HeliosDevice)).frontend.as_ref() {
+        fe.shutdown();
+    }
+    (*(h_device.pDrvPrivate as *mut HeliosDevice)).frontend = None;
     // R911: the nine refusal counters, once per device teardown. Process-global
     // rather than per-device, so this is a running total; the point is that
     // they are READ at all, which the T5 scan-out counters were not.

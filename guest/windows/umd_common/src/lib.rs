@@ -73,6 +73,8 @@
 
 #![deny(deprecated)]
 
+pub mod cmd_queue;
+pub mod cmd_record;
 pub mod format;
 pub mod hr;
 // Typed ABI adapters are portable; only noop::log_backtrace requires Windows.
