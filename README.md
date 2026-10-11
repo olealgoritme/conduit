@@ -29,7 +29,7 @@ from GPU memory to your screen: no copying, no video compression.
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
 | Host isolation: host work and device interrupts kept off a running VM's CPUs (per CCD, P/E cores or NUMA node; on by default, [HOST-TUNING.md](docs/HOST-TUNING.md#cpu-host-isolation)) | ✅ |
-| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, driver 22.22.405.63 built by hand: [Windows guests](#windows-guests)) |
+| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, driver 22.22.405.68 built by hand: [Windows guests](#windows-guests)) |
 | NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
 > Early software, tested mainly on an RTX 5090 with Ubuntu 24.04 and Hyprland;
@@ -100,7 +100,7 @@ More detail (building the driver yourself, knobs, troubleshooting):
 A Windows 11 guest renders on the host GPU through NVK-on-RM: Mesa's open
 NVK Vulkan driver runs in the guest and talks to the host's NVIDIA kernel
 driver (RM) through Conduit. Tested on an RTX 5090. Guest driver version:
-**22.22.405.63**.
+**22.22.405.68**.
 
 ```
  Windows guest
