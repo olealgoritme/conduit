@@ -1,6 +1,6 @@
 # D3D11 threaded front end (UMD worker thread)
 
-Status: phase 1, off by default; `UmdThreadedFrontend=1` turns it on for every process except dwm.exe.
+Status: phase 1, on by default for every process except dwm.exe (`UmdThreadedFrontend=1`; `0` turns it off).
 `UmdFrontendSync` (section 7) takes one call class at a time off the threaded path for A/B runs.
 
 ## 1. Why
@@ -322,7 +322,7 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 
 ## 7. Knobs and counters
 
-- `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 0 = off (default), 1 = on for every process except dwm.exe,
+- `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 1 = on for every process except dwm.exe (default), 0 = off,
   2 = on including dwm.exe. Process override `HELIOS_D3D11_FRONTEND=0|1`.
 - `UmdFrontendRingKiB` (DWORD, default 4096, clamped 256–65536).
 - `UmdFrontendSync` (DWORD bitmask, default 0): call classes forced onto the synchronous path, for A/B runs that pin a
