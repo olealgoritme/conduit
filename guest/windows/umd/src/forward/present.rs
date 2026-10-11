@@ -1524,6 +1524,7 @@ unsafe fn nvk_log_present_source(shown: ddi::D3D10DDI_HRESOURCE) {
 const NVK_PRESENT_WAIT_US: u32 = 2_000_000;
 
 static NVK_SCANOUT_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+static NVK_COMPOSED_COMPLETE: AtomicUsize = AtomicUsize::new(0);
 static NVK_SCANOUT_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static NVK_COMPOSE_PRESENTS: AtomicUsize = AtomicUsize::new(0);
 static NVK_WAIT_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
@@ -1612,10 +1613,17 @@ const HELIOS_ICD_CAP_PRESENT_FENCE_KMD: u32 = 1 << 6;
 /// and the fence follows the copy. 380.1: with `false` there, every windowed
 /// Heaven frame went without a record ("copy-engine record 0 (without 0,
 /// refused 0)") and the KMD's route fell back on every one (`CeRtRecNone`).
+///
+/// `dwm_reads_source`: no DXGI destination (a flip-model swap chain presents its
+/// own buffer, which DWM samples directly). Such a frame, unless it is a
+/// primary, is made complete before the WDDM present (`NvkComposedComplete`):
+/// DWM on NVK samples from its own RM channel, which the fence that retires the
+/// present's DMA buffer does not hold.
 unsafe fn nvk_present_frame(
     h: Hdevice,
     shown: ddi::D3D10DDI_HRESOURCE,
     blt_source: ddi::D3D10DDI_HRESOURCE,
+    dwm_reads_source: bool,
 ) -> Result<NvkFrame, i32> {
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
@@ -1656,7 +1664,24 @@ unsafe fn nvk_present_frame(
     };
     let caps = dev.dxvk.nvk_icd_caps();
     let fences = crate::knobs::nvk_rm_fence() && caps & HELIOS_ICD_CAP_RM_FENCE != 0;
+    // A frame DWM samples directly is complete before DWM can see it (the S3 wait below):
+    // nothing on DWM's RM channel waits for a fence in the marker.
+    let must_complete = !scanout
+        && dwm_reads_source
+        && crate::knobs::nvk_composed_complete()
+        && !crate::knobs::is_dwm_process()
+        && !nvk_source_is_primary(shown);
+    if must_complete {
+        let n = NVK_COMPOSED_COMPLETE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 4096 == 0 {
+            log_error!(
+                "NVK present: {n} composed frames that DWM samples directly completed before \
+                 their present (NvkComposedComplete)"
+            );
+        }
+    }
     let marker_fences = fences
+        && !must_complete
         && crate::knobs::nvk_rm_fence_present()
         && caps & HELIOS_ICD_CAP_PRESENT_FENCE_KMD != 0;
 
@@ -2243,7 +2268,7 @@ unsafe fn nvk_present_impl_timed(
         }
     }
     t.mark(0);
-    let frame = match nvk_present_frame(h, shown, src_h) {
+    let frame = match nvk_present_frame(h, shown, src_h, dst_h.pDrvPrivate.is_null()) {
         Ok(f) => f,
         Err(hr) => return hr,
     };
@@ -3646,7 +3671,7 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
 
     let mut nvk_correlation = PresentStreamCorrelation::default();
     if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
-        match nvk_present_frame(h, src_h, src_h) {
+        match nvk_present_frame(h, src_h, src_h, dst_h.pDrvPrivate.is_null()) {
             Ok(frame) if !nvk_scanout_compose(frame) => return 0,
             Ok(frame) => {
                 nvk_correlation = frame.correlation;
