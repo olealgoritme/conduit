@@ -1475,6 +1475,25 @@ unsafe fn nvk_primary_takes_scanout(shown: ddi::D3D10DDI_HRESOURCE) -> bool {
 
 static NVK_PRIMARY_IFLIP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// The foreign resource id `finish_wddm_tex2d_nvk` gave `shown`'s allocation: `Some(0)` for a
+/// KMD placeholder, `None` when this process did not make it (opened, or no allocation).
+unsafe fn nvk_source_resource_id(shown: ddi::D3D10DDI_HRESOURCE) -> Option<u32> {
+    let alloc = resource_allocation(shown);
+    lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == alloc).map(|e| e.1)
+}
+
+/// `NvkPresent` 0: may DWM compose this frame? Only when DWM imports NVK surfaces and THIS
+/// frame's source has a resource id (the knob's rule is per back buffer). A source this process
+/// did not make falls back to the process-wide record (`NVK_PRESENT_BUFFERS` == 1: every present
+/// buffer it made got an id). One placeholder (a YUV or fp16 overlay swap chain NVK cannot give an
+/// id) must not send every other swap chain of the process to scanout 0: a window-sized frame on
+/// the whole scanout, interleaved with DWM's own flips, is black areas and flicker.
+fn nvk_frame_composes(dwm_composes: bool, source_id: Option<u32>, process_buffers: u8) -> bool {
+    dwm_composes && source_id.map_or(process_buffers == 1, |id| id != 0)
+}
+
+static NVK_PLACEHOLDER_SCANOUT: AtomicUsize = AtomicUsize::new(0);
+
 unsafe fn nvk_log_present_source(shown: ddi::D3D10DDI_HRESOURCE) {
     let alloc = resource_allocation(shown);
     let entry = lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == alloc).copied();
@@ -1618,8 +1637,21 @@ unsafe fn nvk_present_frame(
         1 => true,
         2 => false,
         _ => {
-            nvk_primary_takes_scanout(shown)
-                || !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1)
+            let id = nvk_source_resource_id(shown);
+            let composes = nvk_frame_composes(
+                nvk_dwm_composes(),
+                id,
+                NVK_PRESENT_BUFFERS.load(Ordering::Relaxed),
+            );
+            if !composes && id == Some(0) {
+                let n = NVK_PLACEHOLDER_SCANOUT.fetch_add(1, Ordering::Relaxed);
+                if n == 0 || n % 4096 == 0 {
+                    log_error!(
+                        "NVK present: a source without a resource id goes to scanout 0 (#{n})"
+                    );
+                }
+            }
+            nvk_primary_takes_scanout(shown) || !composes
         }
     };
     let caps = dev.dxvk.nvk_icd_caps();
@@ -3757,6 +3789,27 @@ pub(crate) unsafe extern "system" fn dxgi_check_present_duration_support(
         );
     }
     0
+}
+
+#[cfg(test)]
+mod nvk_frame_composes_tests {
+    use super::nvk_frame_composes;
+
+    #[test]
+    fn the_decision_is_per_source() {
+        // A placeholder elsewhere in the process (2) leaves a source with an id composed.
+        assert!(nvk_frame_composes(true, Some(7), 2));
+        assert!(nvk_frame_composes(true, Some(7), 1));
+        // The placeholder itself cannot be composed.
+        assert!(!nvk_frame_composes(true, Some(0), 1));
+        assert!(!nvk_frame_composes(true, Some(0), 2));
+        // A source this process did not make: the process-wide record decides.
+        assert!(nvk_frame_composes(true, None, 1));
+        assert!(!nvk_frame_composes(true, None, 2));
+        assert!(!nvk_frame_composes(true, None, 0));
+        // DWM that does not import NVK surfaces composes nothing.
+        assert!(!nvk_frame_composes(false, Some(7), 1));
+    }
 }
 
 #[cfg(test)]
