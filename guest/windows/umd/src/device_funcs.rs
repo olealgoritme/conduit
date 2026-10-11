@@ -414,6 +414,11 @@ pub struct HeliosDevice {
     /// Device removal when the KMD goes away under this process (see
     /// `device_loss.rs`): the loss epoch at creation.
     pub loss: crate::device_loss::LossWatch,
+    /// The threaded front end of this device's immediate context
+    /// (`docs/d3d11-threaded-frontend.md`), when `UmdThreadedFrontend` gave it
+    /// one. Shut down first in DestroyDevice, while everything its queued
+    /// records and destructions use is still alive.
+    pub frontend: Option<crate::forward::Frontend>,
 }
 
 /// Per-deferred-context UMD state, constructed in-place in the runtime-
@@ -1029,6 +1034,14 @@ pub(crate) unsafe extern "system" fn ddi_destroy_device(h_device: ddi::D3D10DDI_
         }
     }
     log_error!("DDI: DestroyDevice");
+    // The threaded front end first: drain, run its queued destructions and
+    // stop its worker while the device is fully alive.
+    // Shut down through a shared reference: the worker still reads the device
+    // until the join inside `shutdown`.
+    if let Some(fe) = (*(h_device.pDrvPrivate as *const HeliosDevice)).frontend.as_ref() {
+        fe.shutdown();
+    }
+    (*(h_device.pDrvPrivate as *mut HeliosDevice)).frontend = None;
     // R911: the nine refusal counters, once per device teardown. Process-global
     // rather than per-device, so this is a running total; the point is that
     // they are READ at all, which the T5 scan-out counters were not.

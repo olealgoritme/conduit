@@ -205,6 +205,7 @@ Each patch builds on its own.
 | 0059 | the composed path writes `helios-wsi-<pid>.log` |
 | 0060 | the composed present waits for its copy at acquire, not at present |
 | 0061 | Mesa honours `MESA_LOG_FILE` on Windows; composed acquire/present failures go to `helios-wsi-<pid>.log` |
+| 0062 | `helios_icd_interface` v8, `ecl_fence_create_v3`: the RM fence and copy-engine record of a composed D3D11 present, for a value reserved on an ECL timeline that the submission thread signals after the frame's work, so the presenting thread does not wait for DXVK to submit the frame |
 
 ## `patches-windows-dxvk/`
 

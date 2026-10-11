@@ -28,6 +28,8 @@
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
+//! | `UmdThreadedFrontend` | DWORD | `0` (threaded D3D11 front end: 1 = all but dwm.exe, 2 = all; env `HELIOS_D3D11_FRONTEND=0/1`) |
+//! | `UmdFrontendRingKiB` | DWORD | `4096` (its command ring, clamped 256..65536) |
 //! | `UmdDdiLevel` | DWORD | `0x10` (D3D11 DDI WDDM1.3; `0x24` adds WDDM2.3) |
 //! | `UmdDdiLevelDwm` | DWORD | `0x10` (the same, dwm.exe only) |
 //! | `UmdDdiAllowList` | REG_SZ | absent (`;`-separated executables that get WDDM2.3) |
@@ -362,6 +364,38 @@ pub(crate) fn umd_deferred_diagnostics() -> bool {
     UMD_DEFERRED_DIAGNOSTICS.get()
 }
 
+/// `UmdThreadedFrontend`: the D3D11 threaded front end
+/// (`docs/d3d11-threaded-frontend.md`). 0 (default) = off, 1 = on for every
+/// process except dwm.exe, 2 = on including dwm.exe.
+pub(crate) static UMD_THREADED_FRONTEND: DwordKnob = DwordKnob::new(c"UmdThreadedFrontend", 0);
+
+/// `UmdFrontendRingKiB`: the threaded front end's command ring per immediate
+/// context, KiB.
+pub(crate) static UMD_FRONTEND_RING_KIB: DwordKnob = DwordKnob::new(c"UmdFrontendRingKiB", 4096);
+
+/// Whether this process threads its immediate contexts: `HELIOS_D3D11_FRONTEND`
+/// (`0`/`1`) from the process environment wins over [`UMD_THREADED_FRONTEND`].
+/// Read once per process. A device created with
+/// `D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION` never gets one
+/// (checked at CreateDevice).
+pub(crate) fn threaded_frontend() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| match std::env::var("HELIOS_D3D11_FRONTEND").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => match UMD_THREADED_FRONTEND.get() {
+            0 => false,
+            1 => !is_dwm_process(),
+            _ => true,
+        },
+    })
+}
+
+/// [`UMD_FRONTEND_RING_KIB`], clamped, in bytes.
+pub(crate) fn frontend_ring_bytes() -> usize {
+    (UMD_FRONTEND_RING_KIB.get().clamp(256, 65536) as usize) * 1024
+}
+
 // --- NVK on RM (dxvk-on-nvk S3) ----------------------------------------------
 //
 // Which ICD a process runs on is decided in the bridge
@@ -521,6 +555,24 @@ pub(crate) fn nvk_rm_fence_present() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
         env_bool("HELIOS_NVK_RM_FENCE_PRESENT").unwrap_or_else(|| NVK_RM_FENCE_PRESENT.get())
+    })
+}
+
+/// `NvkAsyncPresentFence` (`HKLM\\SOFTWARE\\Helios`, or
+/// `HELIOS_NVK_ASYNC_PRESENT_FENCE`): 1 (default) = a composed NVK present
+/// whose WDDM present carries an RM fence takes that fence for a value reserved
+/// at the Present call and signalled by DXVK's submission thread right after
+/// the frame's submission (helios_icd_interface version 8), so the presenting
+/// thread does not wait for DXVK's command-stream and submission threads
+/// (the SUBMITTED gate). 0 = the gate, then `queue_rm_fence_v3`, as before.
+/// An ICD without version 8 takes the gated path either way.
+pub(crate) static NVK_ASYNC_PRESENT_FENCE: BoolKnob = BoolKnob::new(c"NvkAsyncPresentFence", true);
+
+/// `NvkAsyncPresentFence`, or `HELIOS_NVK_ASYNC_PRESENT_FENCE` from the environment.
+pub(crate) fn nvk_async_present_fence() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_ASYNC_PRESENT_FENCE").unwrap_or_else(|| NVK_ASYNC_PRESENT_FENCE.get())
     })
 }
 
