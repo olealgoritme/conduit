@@ -236,6 +236,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--caps-clipboard")){ caps_clipboard = 1; }
         else if (!strcmp(a, "--cursor"))       { cursor_mode = 1; }
         else if (!strcmp(a, "--bad-cursor"))   { cursor_mode = 2; }
+        else if (!strcmp(a, "--cursor-pos"))   { cursor_mode = 3; }
+        else if (!strcmp(a, "--bad-cursor-pos")) { cursor_mode = 4; }
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     if (!pw) { pw = 640; }
@@ -352,7 +354,19 @@ int main(int argc, char **argv)
             send_cmd(sock, &c, NULL, 0, sizeof(c));
         }
 
-        if (cursor_mode) {
+        if (cursor_mode >= 3) {
+            /* CMD_CURSOR_POS: a negative x on purpose (off the left edge);
+             * --bad-cursor-pos also sets a field that must be zero. */
+            struct nvkvm_broker_cmd cp = {
+                .type = NVKVM_BROKER_CMD_CURSOR_POS,
+                .width = (uint32_t)-7, .height = 300,
+                .seq = cursor_mode == 4 ? 1 : 0,
+            };
+
+            printf("  -> CURSOR_POS -7,300%s\n",
+                   cursor_mode == 4 ? " (with seq set)" : "");
+            send_cmd(sock, &cp, NULL, 0, sizeof(cp));
+        } else if (cursor_mode) {
             /*
              * virtio-nvgpu CMD_CURSOR: a 64x64 AR24 image with its hotspot
              * packed into seq, then (for --cursor) a hide.  --bad-cursor sends

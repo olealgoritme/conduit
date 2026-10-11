@@ -622,6 +622,22 @@ struct nb_wl {
         struct wl_buffer *buf;
     } gc[4];
     int       gc_cur;           /* slot on the cursor surface, -1 none     */
+    /*
+     * THE GUEST CURSOR UNDER A GRAB (CMD_CURSOR_POS).  The host pointer is
+     * locked and hidden then, so the guest's cursor image is drawn here, on
+     * a subsurface over the picture, where the guest says it is.  Updated at
+     * most once per frame callback of its own surface (newest position
+     * wins), so a mouse at 8 kHz costs the compositor nothing extra.
+     */
+    struct wl_surface    *gcs_surf;
+    struct wl_subsurface *gcs_sub;
+    struct wp_viewport   *gcs_vp;
+    bool      gcs_shown;
+    int       gcs_slot;         /* gc[] slot attached, -1 none             */
+    struct nb_rect gcs_rect;    /* where it sits, window coordinates       */
+    bool      gcs_cb, gcs_dirty;
+    bool      gp_valid;
+    int       gp_x, gp_y;       /* the hotspot, guest frame pixels         */
     bool      gc_on;            /* the guest shows a cursor                */
     unsigned  gc_hx, gc_hy;     /* hotspot, guest pixels                   */
     int       gc_lhx, gc_lhy;   /* ...and in surface (logical) pixels      */
@@ -731,6 +747,7 @@ static int  wl_tick_ui(struct nb_wl *w, int next);
 static void wl_menu_set(struct nb_wl *w, bool open);
 static void wl_rehint(struct nb_wl *w);
 static void wl_ed_show(struct nb_wl *w, bool on);
+static void wl_gcs_update(struct nb_wl *w);
 
 /* ── virtio-nvgpu: per-frame presentation context and --stats ─────────── */
 
@@ -5920,6 +5937,7 @@ static void wl_relayout(struct nb_wl *w)
         w->surf_w = dw;
         w->surf_h = dh;
         wl_ptr_follow(w);
+        wl_gcs_update(w);       /* the picture moved: the cursor with it */
     }
     bd_layout(w);
     if (w->ui.open) {
@@ -6127,6 +6145,7 @@ static void gc_show(struct nb_wl *w, int slot, unsigned hx, unsigned hy)
     gc_layout(w, true);
     cur_apply(w, w->last_serial);
     wl_display_flush(w->dpy);
+    wl_gcs_update(w);           /* a new image under a grab */
 }
 
 static void gc_created(void *data, struct zwp_linux_buffer_params_v1 *params,
@@ -6192,6 +6211,142 @@ static const struct zwp_linux_buffer_params_v1_listener gc_listener = {
     .failed  = gc_failed,
 };
 
+
+/* ── the guest cursor under a grab (CMD_CURSOR_POS) ─────────────────────── */
+
+static void gcs_done(void *data, struct wl_callback *cb, uint32_t t);
+static const struct wl_callback_listener gcs_cb_listener = { .done = gcs_done };
+static void wl_gcs_update(struct nb_wl *w);
+
+static void gcs_done(void *data, struct wl_callback *cb, uint32_t t)
+{
+    struct nb_wl *w = data;
+
+    (void)t;
+    wl_callback_destroy(cb);
+    w->gcs_cb = false;
+    if (w->gcs_dirty) {
+        wl_gcs_update(w);
+    }
+}
+
+static bool wl_gcs_wanted(const struct nb_wl *w)
+{
+    return w->grabbed && w->gc_on && w->gc_cur >= 0 && w->gp_valid &&
+           w->current >= 0 && w->buf_w > 0 && w->buf_h > 0 && w->viewport &&
+           w->subcomp && w->viewporter && w->gc[w->gc_cur].buf;
+}
+
+static void wl_gcs_hide(struct nb_wl *w)
+{
+    if (!w->gcs_shown) {
+        return;
+    }
+    w->gcs_shown = false;
+    w->gcs_slot = -1;
+    wl_surface_attach(w->gcs_surf, NULL, 0, 0);
+    wl_surface_commit(w->gcs_surf);
+    wl_display_flush(w->dpy);
+}
+
+/*
+ * Show / move / hide the drawn guest cursor to match the state.  Compare-only
+ * when nothing changed; a change while the previous one is not on screen yet
+ * (frame callback outstanding) is only recorded and applied on the callback.
+ */
+static void wl_gcs_update(struct nb_wl *w)
+{
+    struct nb_rect r;
+    int slot;
+    bool img, moved;
+
+    if (!wl_gcs_wanted(w)) {
+        w->gcs_dirty = false;
+        wl_gcs_hide(w);
+        return;
+    }
+    if (w->gcs_cb && w->gcs_shown) {
+        w->gcs_dirty = true;
+        return;
+    }
+    w->gcs_dirty = false;
+    slot = w->gc_cur;
+    nb_view_cursor_rect(&w->place, w->buf_w, w->buf_h, w->gp_x, w->gp_y,
+                        (int)w->gc_hx, (int)w->gc_hy, (int)w->gc[slot].w,
+                        (int)w->gc[slot].h, &r);
+    if (!w->gcs_surf) {
+        struct wl_region *none = wl_compositor_create_region(w->comp);
+
+        w->gcs_surf = wl_compositor_create_surface(w->comp);
+        if (!w->gcs_surf) {
+            return;
+        }
+        w->gcs_sub = wl_subcompositor_get_subsurface(w->subcomp, w->gcs_surf,
+                                                     w->surf);
+        w->gcs_vp = wp_viewporter_get_viewport(w->viewporter, w->gcs_surf);
+        if (!w->gcs_sub || !w->gcs_vp) {
+            return;
+        }
+        /* Above everything of the picture; it takes no input, so the
+         * pointer stays on the picture underneath. */
+        wl_subsurface_place_above(w->gcs_sub,
+                                  w->cs_surf ? w->cs_surf : w->surf);
+        wl_subsurface_set_desync(w->gcs_sub);
+        if (none) {
+            wl_surface_set_input_region(w->gcs_surf, none);
+            wl_region_destroy(none);
+        }
+        w->gcs_slot = -1;
+        w->gcs_rect = (struct nb_rect){ INT32_MIN, INT32_MIN, 0, 0 };
+    }
+    img = !w->gcs_shown || w->gcs_slot != slot ||
+          r.w != w->gcs_rect.w || r.h != w->gcs_rect.h;
+    moved = r.x != w->gcs_rect.x || r.y != w->gcs_rect.y;
+    if (!img && !moved) {
+        return;
+    }
+    if (img) {
+        wl_surface_attach(w->gcs_surf, w->gc[slot].buf, 0, 0);
+        wl_surface_damage_buffer(w->gcs_surf, 0, 0, INT32_MAX, INT32_MAX);
+        wp_viewport_set_destination(w->gcs_vp, r.w, r.h);
+        w->gcs_slot = slot;
+    }
+    if (moved) {
+        /* Parent state: it takes effect with the main surface's commit. */
+        wl_subsurface_set_position(w->gcs_sub, r.x, r.y);
+    }
+    w->gcs_rect = r;
+    if (!w->gcs_cb) {
+        struct wl_callback *cb = wl_surface_frame(w->gcs_surf);
+
+        if (cb) {
+            wl_callback_add_listener(cb, &gcs_cb_listener, w);
+            w->gcs_cb = true;
+        }
+    }
+    wl_surface_commit(w->gcs_surf);
+    if (moved) {
+        wl_surface_commit(w->surf);
+    }
+    if (!w->gcs_shown) {
+        w->gcs_shown = true;
+        nb_log("guest cursor: drawn by the viewer under the grab (the host "
+               "pointer is locked and hidden)");
+    }
+    wl_display_flush(w->dpy);
+}
+
+/* ops->cursor_pos */
+static void wl_cursor_pos(struct nb_session *s, int x, int y)
+{
+    struct nb_wl *w = s->priv;
+
+    w->gp_x = x;
+    w->gp_y = y;
+    w->gp_valid = true;
+    wl_gcs_update(w);
+}
+
 static int wl_cursor(struct nb_session *s, const struct nb_buf_desc *d,
                      unsigned hx, unsigned hy)
 {
@@ -6206,6 +6361,7 @@ static int wl_cursor(struct nb_session *s, const struct nb_buf_desc *d,
             w->gc_on = false;
             cur_apply(w, w->last_serial);
             wl_display_flush(w->dpy);
+            wl_gcs_update(w);   /* hidden: off the picture too */
         }
         return 0;
     }
@@ -6461,6 +6617,7 @@ static int wl_set_grab(struct nb_session *s, bool on)
     /* Grabbed, the guest cursor leaves the host pointer; released, it is
      * the host pointer's image again. */
     cur_apply(w, w->last_serial);
+    wl_gcs_update(w);           /* ...and is drawn on the picture meanwhile */
     /* The bar is the only thing on screen that can say how to get out. */
     tb_update(w, w->tb_w > 0 ? w->tb_w : w->win_w);
     /*
@@ -6543,6 +6700,15 @@ static void wl_close_session(struct nb_session *s)
         if (w->gc[i].buf) {
             wl_buffer_destroy(w->gc[i].buf);
         }
+    }
+    if (w->gcs_vp) {
+        wp_viewport_destroy(w->gcs_vp);
+    }
+    if (w->gcs_sub) {
+        wl_subsurface_destroy(w->gcs_sub);
+    }
+    if (w->gcs_surf) {
+        wl_surface_destroy(w->gcs_surf);
     }
     if (w->gc_vp) {
         wp_viewport_destroy(w->gc_vp);
@@ -6969,6 +7135,10 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     if (w->seat && w->dmabuf && w->dmabuf_ver >= 3 &&
         nb_formats_has(&w->formats, NB_FOURCC_AR24_LOCAL, 0)) {
         s->caps |= NVKVM_BROKER_CAP_CURSOR;
+        /* ...and drawn by us under a grab, where the guest says it is. */
+        if (w->subcomp && w->viewporter) {
+            s->caps |= NVKVM_BROKER_CAP_CURSOR_POS;
+        }
     } else {
         nb_log("guest cursor: not offered (needs a pointer and a display that "
                "imports LINEAR ARGB8888 dma-bufs); the guest draws its own");
@@ -7068,6 +7238,7 @@ static const struct nb_session_ops wl_ops = {
     .notify_clipboard = wl_notify_clipboard,
     .fetch_clipboard = wl_fetch_clipboard,
     .cursor = wl_cursor,
+    .cursor_pos = wl_cursor_pos,
     .hotkey = wl_hotkey,
     .hold_release = wl_hold_release,
     .modes = wl_modes,

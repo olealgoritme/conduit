@@ -282,6 +282,30 @@ void nb_view_cursor_scale(const struct nb_place *p, int bw, int bh,
     *ky = bh > 0 && p->pic.h > 0 ? (double)p->pic.h / bh : 1.0;
 }
 
+void nb_view_cursor_rect(const struct nb_place *p, int bw, int bh, int gx,
+                         int gy, int hx, int hy, int cw, int ch,
+                         struct nb_rect *out)
+{
+    double kx, ky, x0, y0, x1, y1;
+
+    nb_view_cursor_scale(p, bw, bh, &kx, &ky);
+    /* The image's corners, mapped like any guest pixel edge. */
+    x0 = p->pic.x + (gx - hx) * kx;
+    y0 = p->pic.y + (gy - hy) * ky;
+    x1 = p->pic.x + (gx - hx + cw) * kx;
+    y1 = p->pic.y + (gy - hy + ch) * ky;
+    out->x = (int)floor(x0 + 0.5);
+    out->y = (int)floor(y0 + 0.5);
+    out->w = (int)floor(x1 + 0.5) - out->x;
+    out->h = (int)floor(y1 + 0.5) - out->y;
+    if (out->w < 1) {
+        out->w = 1;
+    }
+    if (out->h < 1) {
+        out->h = 1;
+    }
+}
+
 bool nb_view_guest_mode(const struct nb_view *v, int ww, int wh, unsigned s120,
                         unsigned *pw, unsigned *ph)
 {

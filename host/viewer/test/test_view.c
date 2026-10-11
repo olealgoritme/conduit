@@ -746,8 +746,47 @@ static void test_modes(void)
     }
 }
 
+/* The drawn guest cursor sits where nb_view_map puts the guest pointer. */
+static void test_cursor_rect(void)
+{
+    struct nb_view v;
+    struct nb_place p;
+    struct nb_rect r;
+    int gx, gy;
+
+    /* 1:1, exact fit: the image's top-left at the hotspot minus hot. */
+    nb_view_defaults(&v);
+    nb_view_place(&v, 1920, 1080, 1920, 1080, 120, &p);
+    nb_view_cursor_rect(&p, 1920, 1080, 100, 200, 3, 4, 32, 32, &r);
+    CHECK(r.x == 97 && r.y == 196 && r.w == 32 && r.h == 32,
+          "1:1 cursor at %d,%d %dx%d", r.x, r.y, r.w, r.h);
+
+    /* 1600x900 stretched over 5120x1440: per-axis scale, both corners. */
+    v.scale = NB_SCALE_STRETCH;
+    nb_view_place(&v, 1600, 900, 5120, 1440, 120, &p);
+    nb_view_cursor_rect(&p, 1600, 900, 800, 450, 0, 0, 32, 32, &r);
+    CHECK(r.x == 2560 && r.y == 720 && r.w == 102 && r.h == 51,
+          "stretched cursor at %d,%d %dx%d", r.x, r.y, r.w, r.h);
+    /* The hotspot maps back to the same guest pixel. */
+    CHECK(nb_view_map(&p, 1600, 900, r.x + 0.5, r.y + 0.5, &gx, &gy) &&
+          gx == 800 && gy == 450, "hotspot round trip %d,%d", gx, gy);
+
+    /* Fit, letterboxed: offset by the bar. */
+    v.scale = NB_SCALE_ASPECT;
+    nb_view_place(&v, 1600, 900, 5120, 1440, 120, &p);
+    nb_view_cursor_rect(&p, 1600, 900, 0, 0, 0, 0, 16, 16, &r);
+    CHECK(r.x == p.pic.x && r.y == p.pic.y && r.x == 1280,
+          "letterboxed cursor at the picture's corner %d,%d", r.x, r.y);
+
+    /* Off the frame's edge (negative position): still placed, never 0x0. */
+    nb_view_cursor_rect(&p, 1600, 900, -5, -5, 0, 0, 1, 1, &r);
+    CHECK(r.w >= 1 && r.h >= 1 && r.x < p.pic.x, "off-edge cursor %d,%d %dx%d",
+          r.x, r.y, r.w, r.h);
+}
+
 int main(void)
 {
+    test_cursor_rect();
     test_fit();
     test_stretch();
     test_integer();

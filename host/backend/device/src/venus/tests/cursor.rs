@@ -221,3 +221,37 @@ fn bad_cursors_are_refused() {
     long.push(0);
     assert_eq!(t.ty(&long), RESP_ERR_UNSPEC);
 }
+
+/// A move ([`CURSOR_BLOB_F_MOVE`]) carries only the position: the display
+/// link keeps it for a viewer that draws the cursor itself, and the image is
+/// untouched. A full update's position is kept too.
+#[test]
+fn a_cursor_move_reaches_the_display_without_touching_the_image() {
+    let mut t = Rig::new();
+    let (link, _broker) = display();
+    assert!(t.venus.enable_cursor());
+    t.ctx(1);
+    assert_eq!(t.blob(1, 10, 2 * SLOT as u64), RESP_OK_NODATA);
+    assert_eq!(
+        t.send_on(&cursor_cmd(10, 32, 32, 0, true), Some(&link))
+            .0
+            .ty,
+        RESP_OK_NODATA
+    );
+    assert_eq!(link.kept_cursor_pos_for_test(), Some((100, -3)));
+    let (_, before) = link.kept_cursor_for_test().unwrap();
+    let mv = SetCursorBlob {
+        hdr: hdr(CMD_SET_CURSOR_BLOB, 0),
+        x: 640,
+        y: 480,
+        flags: CURSOR_BLOB_F_MOVE,
+        ..Default::default()
+    }
+    .to_bytes();
+    assert_eq!(t.send_on(&mv, Some(&link)).0.ty, RESP_OK_NODATA);
+    assert_eq!(link.kept_cursor_pos_for_test(), Some((640, 480)));
+    let (img, after) = link.kept_cursor_for_test().unwrap();
+    assert!(img && after == before, "a move leaves the image alone");
+    assert_eq!(t.venus.cursor_resource(), Some(10));
+    assert_eq!(t.r.exports.lock().unwrap().len(), 1);
+}

@@ -5,9 +5,14 @@
 //! rectangle of it. The blob is exported once, as the scanout's are, and the
 //! image goes to the same display path a Linux guest's cursor plane takes
 //! ([`DisplayLink::cursor`]): `CMD_CURSOR` to every client that takes one,
-//! which shows it as the host pointer's image. The host positions it, so a
-//! move never travels; the guest sends this only when the shape or the
-//! visibility changes. Nothing copies.
+//! which shows it as the host pointer's image, so the host pointer moves
+//! it. A guest that sees [`NVGPU_CFG_CURSOR_POS`] also sends its moves
+//! ([`CURSOR_BLOB_F_MOVE`]); they go to the viewer as `CMD_CURSOR_POS`, for
+//! drawing the cursor under a grab, where the host pointer is hidden.
+//! Nothing copies.
+//!
+//! [`NVGPU_CFG_CURSOR_POS`]: protocol::messages::NVGPU_CFG_CURSOR_POS
+//! [`CURSOR_BLOB_F_MOVE`]: protocol::venus::CURSOR_BLOB_F_MOVE
 
 use super::*;
 use conduit_venus::ScanoutLayout;
@@ -35,6 +40,14 @@ impl Venus {
         }
         if c.scanout_id != 0 {
             return Err(RESP_ERR_INVALID_SCANOUT_ID);
+        }
+        // A move: the hotspot's position, for a viewer that draws the cursor
+        // itself (under a grab the host pointer is locked and hidden).
+        if c.is_move() {
+            if let Some(link) = env.display {
+                link.cursor_pos(c.x, c.y);
+            }
+            return Ok(Reply::NoData);
         }
         if !c.visible() {
             self.hide_cursor(env.display);
@@ -120,6 +133,7 @@ impl Venus {
         };
         self.cursor = Some(id);
         link.cursor(Some(fd), &u);
+        link.cursor_pos(c.x, c.y);
         Ok(Reply::NoData)
     }
 

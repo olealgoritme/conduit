@@ -2432,6 +2432,26 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         }
         return;
 
+    case NVKVM_BROKER_CMD_CURSOR_POS:
+        /* Where the guest's cursor is.  Nothing else rides on it. */
+        if (!ss->ops->cursor_pos || !(ss->caps & NVKVM_BROKER_CAP_CURSOR_POS)) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "CURSOR_POS sent to a broker that did not offer it");
+            return;
+        }
+        if (fd >= 0 || c->flags || c->reserved1 || c->stride || c->offset ||
+            c->fourcc || c->modifier || c->seq) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "CURSOR_POS carried an fd or fields other than x, y");
+            return;
+        }
+        ss->ops->cursor_pos(ss, (int32_t)c->width, (int32_t)c->height);
+        return;
+
     case NVKVM_BROKER_CMD_MODES:
         /*
          * The display's mode list, one record per mode.  Only to a broker

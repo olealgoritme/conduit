@@ -106,6 +106,15 @@ bool nb_view_map(const struct nb_place *p, int bw, int bh, double wx,
 /* The guest pixel -> window scale, per axis (for drawing the guest cursor). */
 void nb_view_cursor_scale(const struct nb_place *p, int bw, int bh,
                           double *kx, double *ky);
+/*
+ * Where the guest's cursor is drawn, window coordinates: a cw x ch image with
+ * its hotspot (hx, hy) at guest pixel (gx, gy), at the picture's per-axis
+ * scale -- the inverse of nb_view_map, so it sits where the guest pointer is.
+ * At least 1x1.
+ */
+void nb_view_cursor_rect(const struct nb_place *p, int bw, int bh, int gx,
+                         int gy, int hx, int hy, int cw, int ch,
+                         struct nb_rect *out);
 /* The mode to ask the guest for: the fixed resolution, or else the output
  * area in output pixels.  Returns true for a fixed one. */
 bool nb_view_guest_mode(const struct nb_view *v, int ww, int wh, unsigned s120,

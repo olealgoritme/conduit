@@ -428,6 +428,15 @@ check   "a CURSOR without an fd hides it"     'TEST cursor: hidden'      "$CASE_
 nocheck "a cursor is not a protocol violation" 'protocol violation'      "$CASE_LOG"
 check   "and the frame still presents"        'TEST commit: .*64x64'     "$CASE_LOG"
 
+run_case '' --present 64x64 --cursor-pos
+check   "a cursor position reaches the display (signed)" 'TEST cursor pos: -7,300' "$CASE_LOG"
+nocheck "a cursor position is not a protocol violation" 'protocol violation' "$CASE_LOG"
+check   "and the frame still presents"        'TEST commit: .*64x64'     "$CASE_LOG"
+
+run_case '' --present 64x64 --bad-cursor-pos
+check   "a cursor position with extra fields is a violation" 'CURSOR_POS carried' "$CASE_LOG"
+nocheck "and it is not applied"               'TEST cursor pos:'         "$CASE_LOG"
+
 run_case '' --present 64x64 --bad-cursor
 check   "a hotspot outside the image is refused" 'CURSOR: 64x64 AR24 hotspot 64,1 is not a cursor' "$CASE_LOG"
 nocheck "and nothing is shown for it"           'TEST cursor: id='       "$CASE_LOG"

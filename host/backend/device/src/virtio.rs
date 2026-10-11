@@ -313,9 +313,11 @@ impl VirtioGpuNvConfig {
     /// Serve a Windows guest's hardware cursor as a Venus blob
     /// (`CMD_SET_CURSOR_BLOB`, docs/SCANOUT.md "Hardware cursor, Windows
     /// guests"): sets [`protocol::messages::NVGPU_CFG_VENUS_CURSOR`]. Only
-    /// with Venus and the cursor plane.
+    /// with Venus and the cursor plane. Its moves too
+    /// ([`protocol::messages::NVGPU_CFG_CURSOR_POS`]).
     pub fn set_venus_cursor(&mut self) {
-        self.features |= protocol::messages::NVGPU_CFG_VENUS_CURSOR;
+        self.features |=
+            protocol::messages::NVGPU_CFG_VENUS_CURSOR | protocol::messages::NVGPU_CFG_CURSOR_POS;
     }
 
     /// Serve the cursor queue ([`CURSOR_QUEUE`]): sets
@@ -581,7 +583,11 @@ mod tests {
         cfg.set_venus_cursor();
         assert_eq!(
             { cfg.features },
-            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_CURSOR | NVGPU_CFG_VENUS | NVGPU_CFG_VENUS_CURSOR
+            FEATURE_RMCTRL_SEGMENTS
+                | NVGPU_CFG_CURSOR
+                | NVGPU_CFG_VENUS
+                | NVGPU_CFG_VENUS_CURSOR
+                | protocol::messages::NVGPU_CFG_CURSOR_POS
         );
         // The number the Windows KMD tests (guest/windows/protocol/src/features.rs).
         assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);

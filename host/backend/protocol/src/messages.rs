@@ -492,6 +492,14 @@ pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 /// unused), bit 17 the host vblank proposal's.
 pub const NVGPU_CFG_CURSOR_QUEUE: u32 = 1 << 20;
 
+/// Device config `features` bit, only together with [`NVGPU_CFG_VENUS_CURSOR`]:
+/// the backend takes [`crate::venus::CURSOR_BLOB_F_MOVE`] cursor commands,
+/// the guest cursor's position, and draws the cursor there where the host
+/// pointer cannot show it (under a viewer's mouse grab). A guest without the
+/// bit sends no moves. Bits 17 and 19 are taken (see
+/// [`NVGPU_CFG_CURSOR_QUEUE`]), 21 is [`NVGPU_F_MODE_LIST`].
+pub const NVGPU_CFG_CURSOR_POS: u32 = 1 << 22;
+
 /// A **virtio device feature** the guest acks (like [`NVGPU_CFG_TAKES_INPUT`],
 /// not a config `features` bit; config bit 15 stays unused): the guest wants
 /// `ScanoutReleased` events. The backend offers it in its device features
@@ -1471,6 +1479,7 @@ mod tests {
         assert_eq!(NVGPU_CFG_RM_RESOURCE_IMPORT, 1 << 14);
         // Bit 17 is the proposed host vblank feature's.
         assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
+        assert_eq!(NVGPU_CFG_CURSOR_POS, 1 << 22);
         assert_eq!(NVGPU_CFG_CURSOR_QUEUE, 1 << 20);
         let r = RmResourceImport {
             owner_handle: 9,

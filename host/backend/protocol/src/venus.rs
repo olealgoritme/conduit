@@ -678,6 +678,13 @@ impl SetScanoutBlob {
 /// hidden, every other field ignored.
 pub const CURSOR_BLOB_F_VISIBLE: u32 = 1 << 0;
 
+/// [`SetCursorBlob::flags`]: a move. Only `x`, `y` count: the cursor
+/// hotspot's position in the scanout's pixels (as `DxgkDdiSetPointerPosition`
+/// reports it); the image, the hotspot and the visibility stay as the last
+/// full command left them. Sent only when the config has
+/// [`crate::messages::NVGPU_CFG_CURSOR_POS`]; every other field is 0.
+pub const CURSOR_BLOB_F_MOVE: u32 = 1 << 1;
+
 /// [`CMD_SET_CURSOR_BLOB`]: show `width` x `height` pixels of blob
 /// `resource_id` at `offset`, `stride` bytes per row, as the host pointer's
 /// image with its hotspot at (`hot_x`, `hot_y`); or hide it. The image is
@@ -711,6 +718,11 @@ impl SetCursorBlob {
 
     pub fn visible(&self) -> bool {
         self.resource_id != 0 && self.flags & CURSOR_BLOB_F_VISIBLE != 0
+    }
+
+    /// A position update ([`CURSOR_BLOB_F_MOVE`]), not an image.
+    pub fn is_move(&self) -> bool {
+        self.flags & CURSOR_BLOB_F_MOVE != 0
     }
 
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
@@ -1081,6 +1093,15 @@ mod tests {
             .visible()
         );
         assert!(!SetCursorBlob { flags: 0, ..c }.visible());
+        assert_eq!(CURSOR_BLOB_F_MOVE, 2);
+        assert!(
+            SetCursorBlob {
+                flags: CURSOR_BLOB_F_MOVE,
+                ..c
+            }
+            .is_move()
+        );
+        assert!(!c.is_move());
     }
 
     #[test]

@@ -23,7 +23,7 @@ contain a bug conditional on it.
 
 | offset | field | notes |
 |---|---|---|
-| 0 | `uint16 type` | `ATTACH` 1, `COMMIT` 2, `WINDOW` 3, `CLIPBOARD` 4, `CAPS` 5, `QUERY_FORMAT` 6, `CURSOR` 7 |
+| 0 | `uint16 type` | `ATTACH` 1, `COMMIT` 2, `WINDOW` 3, `CLIPBOARD` 4, `CAPS` 5, `QUERY_FORMAT` 6, `CURSOR` 7, `MODES` 8, `CURSOR_POS` 9 |
 | 2 | `uint16 flags` | `ATTACH` only: `F_SHM` (bit 0); 0 otherwise |
 | 4 | `uint32 width` | |
 | 8 | `uint32 height` | |
@@ -94,6 +94,7 @@ Capability bits in `HELLO.w1`: `KEYBOARD`, `ABS_POINTER`, `REL_POINTER`,
 |---|---|
 | `CAP_MODE_HINTS` (bit 10) | the broker sends `EV_MODE_HINT` = 17: x,y = the mode the guest should be in, in buffer pixels (0,0 = the client's configured mode), w0 = refresh mHz (0 = configured), w1 = reason (0 restore, 1 fullscreen, 2 window, 3 fixed). On change and at attach; windowed `--resize=guest` hints are debounced 150 ms. A client seeing the bit ignores `EV_SURFACE` for mode decisions. |
 | `CAP_CURSOR` (bit 11) | the broker takes `CMD_CURSOR` = 7: with one dma-buf fd, the guest cursor image (ATTACH's fields; ≤256x256, ARGB8888 only — no opaque-twin substitution — and `seq` = hot_x \| hot_y << 16, inside the image), validated like ATTACH and dropped (not disconnected) when bad; without an fd, hide (all fields 0). Shown as the host pointer's cursor over the guest, hidden under grab. Never send it to a broker without the bit. |
+| `CAP_CURSOR_POS` (bit 18, with `CAP_CURSOR`) | the broker takes `CMD_CURSOR_POS` = 9: width = x, height = y of the guest cursor's hotspot in guest frame pixels (two's complement int32); no fd, every other field zero (else a protocol violation). The broker keeps the newest and draws the `CMD_CURSOR` image there itself while the host pointer cannot show it: under a grab. The Wayland backend sets it (a subsurface over the picture, at the picture's scale, updated at most once per frame callback). |
 | `CMD_CAPS` width bit 1 `CLIENT_SEQ_USEC` | ATTACH/COMMIT `seq` is the client's CLOCK_MONOTONIC µs at the flip; the broker then measures flip → screen. |
 | `CAP_CLIP_LARGE` (bit 12) + `CMD_CAPS` width bit 2 `CLIENT_CLIP_LARGE` | clipboard transfers up to 1 MiB, both directions (otherwise 7 KiB). |
 | `CAP_GAMEPAD` (bit 13) + `CMD_CAPS` width bit 3 `CLIENT_GAMEPAD` | the broker may send `EV_PAD` = 18 (x = evdev code, y = value, w0 = pad << 16 \| evdev type); conduit-stream does, the viewer does not. |

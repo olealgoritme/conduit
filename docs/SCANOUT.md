@@ -223,8 +223,8 @@ struct set_cursor_blob {       /* after the virtio-gpu ctrl header */
     u32 format;                /* VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM (DRM AR24), premultiplied */
     u32 stride, offset;        /* the rectangle in the blob */
     u32 hot_x, hot_y;          /* inside the image */
-    s32 x, y;                  /* informational, as crtc_x/y */
-    u32 flags;                 /* bit 0 VISIBLE; clear = hidden */
+    s32 x, y;                  /* the hotspot's position, scanout pixels */
+    u32 flags;                 /* bit 0 VISIBLE; clear = hidden; bit 1 MOVE */
 };
 ```
 
@@ -240,8 +240,19 @@ struct set_cursor_blob {       /* after the virtio-gpu ctrl header */
   update carries its rectangle. The KMD keeps two slots in one blob and
   writes the one not on screen, so the viewer's import cache (keyed by
   dma-buf and offset) holds both and a change is a re-attach.
-- Sent for a shape or a visibility change, never for a move, as for Linux.
-  A hide (resource 0 or `VISIBLE` clear) is `CMD_CURSOR` without a buffer.
+- Sent for a shape or a visibility change. A hide (resource 0 or `VISIBLE`
+  clear) is `CMD_CURSOR` without a buffer.
+- Moves: with `NVGPU_CFG_CURSOR_POS = 1<<22` (set with the Venus cursor) the
+  KMD also sends each new position while the host shows the cursor, as
+  `flags = MOVE` with only `x`, `y` set (the hotspot, as
+  `DxgkDdiSetPointerPosition` reports it), on the cursor queue only and
+  never waited for (a move that finds the previous command still out waits
+  up to 300 µs, then the next position goes instead; `CurMoveN`,
+  `CurMoveSkip`). The backend keeps the newest and sends it to viewers with
+  `CAP_CURSOR_POS` as `CMD_CURSOR_POS` (coalesced; a full socket gets it
+  later). The viewer draws the image there under a grab, where the host
+  pointer is locked and hidden; otherwise the host pointer still carries
+  it. A full command's `x`, `y` are passed on the same way.
   Unref of the cursor's resource and a device reset hide it.
 - The KMD side, its knob (`HwCursor`), counters and the test recipe:
   `guest/windows/docs/independent-flip.md` section 12.

@@ -358,6 +358,13 @@ enum {
  * list, docs/SCANOUT.md "Mode list") and may send EV_MODE_EDIT.
  */
 #define NVKVM_BROKER_CAP_MODE_LIST    (1u << 17)
+/*
+ * CAP_CURSOR_POS (Conduit): the broker takes CMD_CURSOR_POS and draws the
+ * guest's cursor (the CMD_CURSOR image) at that position itself while the
+ * host pointer cannot show it: under a grab, where the pointer is locked and
+ * hidden.  Only together with CAP_CURSOR.
+ */
+#define NVKVM_BROKER_CAP_CURSOR_POS   (1u << 18)
 
 /* BYE reason codes. */
 enum {
@@ -527,6 +534,16 @@ enum {
      * list once its last record arrived; a list cut short is dropped.
      */
     NVKVM_BROKER_CMD_MODES = 8,
+
+    /*
+     * CMD_CURSOR_POS (Conduit) -- where the guest's cursor hotspot is, in the
+     * pixels of the guest's frame: width = x, height = y, each a two's
+     * complement int32 (the hotspot may sit off the frame's edge).  Every
+     * other field zero, no fd.  Only to a broker advertising
+     * NVKVM_BROKER_CAP_CURSOR_POS.  Sent on each guest cursor move (a backend
+     * may coalesce, newest wins); a broker keeps the last one.
+     */
+    NVKVM_BROKER_CMD_CURSOR_POS = 9,
 };
 
 #define NVKVM_BROKER_MODES_MAX     64u

@@ -627,6 +627,12 @@ struct nb_session_ops {
      * OPTIONAL; a backend that advertises the cap repaints its menu here.
      */
     void (*modes)(struct nb_session *s);
+    /*
+     * NVKVM_BROKER_CAP_CURSOR_POS: the guest put its cursor hotspot at
+     * (x, y), guest frame pixels (CMD_CURSOR_POS).  OPTIONAL; a backend that
+     * advertises the cap draws the cursor there under a grab.
+     */
+    void (*cursor_pos)(struct nb_session *s, int x, int y);
 };
 
 #define NB_SESSION_CLIP_G2H (1u << 0)
