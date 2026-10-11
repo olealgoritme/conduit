@@ -427,4 +427,40 @@ mod tests {
             1
         );
     }
+
+    /// How late the pacer's events leave against the vblank they stand for, on this host, at
+    /// 240 Hz for 2 s (`cargo test -p device --lib pacer_wake_lateness -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn pacer_wake_lateness() {
+        let pacer = VblankPacer::new(Duration::ZERO);
+        let period = 4_166_667u64;
+        let phase = mono_ns() - 40 * period;
+        pacer.surface(0, true, 240_000);
+        for k in 0..40 {
+            pacer.presented(0, KIND_VSYNC, phase + k * period);
+        }
+        pacer.set_enabled(true);
+        let rec = Arc::new(Rec(Mutex::new(Vec::new())));
+        pacer.start(rec.clone()).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        pacer.stop();
+        let mut late: Vec<u64> = rec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, v)| s - v.vblank_ns)
+            .collect();
+        late.sort();
+        let p = |q: f64| late[((late.len() - 1) as f64 * q) as usize] / 1000;
+        println!(
+            "events {} lateness us p50 {} p90 {} p99 {} max {}",
+            late.len(),
+            p(0.5),
+            p(0.9),
+            p(0.99),
+            late[late.len() - 1] / 1000
+        );
+    }
 }
