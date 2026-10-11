@@ -1096,6 +1096,14 @@ pub fn run_vm(name: &str) -> i32 {
             );
         }
     }
+    for f in crate::hostiso::findings(name, &xml, &link, virt::state_is_up(&state), &repair) {
+        r.line(
+            if f.warn { Level::Warn } else { Level::Ok },
+            &f.title,
+            &f.detail,
+            &f.fix,
+        );
+    }
     let blog = logs.join("backend.log");
     if blog.is_file() {
         let t = sys::tail(&blog, 200);

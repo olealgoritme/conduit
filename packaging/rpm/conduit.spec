@@ -88,6 +88,8 @@ fi
 %{_datadir}/applications/conduit.desktop
 %{_datadir}/icons/hicolor/*/apps/conduit.*
 %config(noreplace) %{_sysconfdir}/apparmor.d/abstractions/conduit
+%attr(0644,root,root) %{_prefix}/lib/systemd/system/conduit-isolation@.service
+%attr(0644,root,root) %{_datadir}/polkit-1/rules.d/50-conduit-isolation.rules
 
 %changelog
 * Sat Oct 03 2026 Ole Algoritme <olealgoritme@gmail.com> - 0.1.0-1

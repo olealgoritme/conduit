@@ -102,6 +102,9 @@ sudo. Attached VMs keep whatever network they had.
   `virtio-sound-pci`; libvirt 10.0 has no `<sound model='virtio'>`), with
   `<qemu:env>` pointing QEMU at your runtime folder for PipeWire.
 - `<metadata>` `conduit:vm`: marks the domain as Conduit's.
+- `<cputune>`: with host isolation on (the default), each vCPU pinned 1:1
+  to the VM's cores and `<emulatorpin>` on the host's
+  ([HOST-TUNING.md](HOST-TUNING.md#cpu-host-isolation)).
 
 `conduit attach` edits an existing definition instead: the same emulator,
 memfd, CPU, share, metadata and GPU (on the highest free slot of bus 0).
@@ -110,7 +113,12 @@ memory; attach says so). The machine type stays when Conduit's QEMU has it
 (`-machine help`, cached in `~/.cache/conduit/qemu-machines`), so a pinned
 `pc-q35-8.2` keeps the guest's hardware; a type only the distribution's QEMU
 has (`pc-q35-noble`) becomes the plain `q35` / `pc` alias, and attach prints
-the change. Re-attaching keeps the `<address>` libvirt gave Conduit's
+the change. With host isolation on, a domain without `<vcpupin>`, or with a
+pinning that disagrees with it (spanning CCDs, one thread per core), gets
+the policy's 1:1 pinning, `<emulatorpin>` and `<iothreadpin>` (attach says
+so; a re-attach saves the definition from before as
+`libvirt-pre-pin-TIME.xml`), and detach puts the original pinning back.
+Re-attaching keeps the `<address>` libvirt gave Conduit's
 channels and filesystems. Conduit's QEMU has VNC but no SPICE, OpenGL or USB
 redirection, so attach also changes the display side:
 
@@ -263,13 +271,13 @@ VMs.
 
 | you do | what happens |
 |---|---|
-| virt-manager Run, `virsh start`, `conduit up NAME` | QEMU connects, backend and virtiofsd start |
+| virt-manager Run, `virsh start`, `conduit up NAME` | QEMU connects, backend and virtiofsd start; host isolation applies once the domain runs |
 | `conduit view NAME` | starts the VM if it is off, then opens the window; on a running VM it attaches (the backend re-sends the current frame) |
 | close the window | a VM that `conduit view` started shuts down (unless `--keep-running` or `conduit config set view.close_stops_vm false`); any other keeps running |
 | Pause / `virsh suspend` | vCPUs stop; backend and window stay (the window shows the last frame) |
 | Resume / `virsh resume` | continues |
 | Reboot / `virsh reboot` / `reboot` inside | same QEMU, same backend; the GPU works after it |
-| Shut Down / `virsh shutdown` / `conduit down NAME` | ACPI power-off; QEMU exits; backend and virtiofsd exit; boot files refreshed; the window closes |
+| Shut Down / `virsh shutdown` / `conduit down NAME` | ACPI power-off; QEMU exits; backend and virtiofsd exit; host isolation is reverted; boot files refreshed; the window closes |
 | Force Off / `virsh destroy` / `conduit poweroff NAME` | same, without asking the guest |
 | `conduit pause` / `resume` / `reboot` / `reset` / `shutdown` | the same as the virt-manager buttons (`virsh suspend` / `resume` / `reboot` / `reset` / `shutdown`) |
 

@@ -3,8 +3,9 @@
 A VM that stutters now and then (short freezes, uneven frame times,
 benchmark numbers that swing between runs) is usually starved by the host,
 not slowed by the GPU path. These settings keep the guest's CPUs and memory
-to itself. None of them is required to run Conduit; they matter for smooth
-desktops, games and repeatable benchmarks.
+to itself. Host isolation is on by default; none of the rest is required
+to run Conduit. They matter for smooth desktops, games and repeatable
+benchmarks.
 
 The numbers below are from the reference host (Ryzen 9 7950X, 16 cores /
 32 threads, 32 GB RAM, RTX 5090, a 16 vCPU Windows 11 guest). Scale them to
@@ -101,23 +102,22 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   and one `iothread` used by the virtio disks
   (`<driver ... iothread='1'/>`), both on the host's cores.
 - **Keep host work off the guest's cores.** Pinning only says where the
-  vCPUs may run, not that nothing else runs there. Run heavy host jobs
-  (compilers, other VMs) on the host's cores at low priority:
+  vCPUs may run, not that nothing else runs there. Conduit's host isolation
+  (below, on by default) keeps your session, system services, its own
+  helpers, device interrupts and kernel workqueues off the VM's cores while
+  it runs. Heavy host jobs still compete with the rest of the host; run them
+  at low priority:
 
   ```sh
   taskset -c 0-7,16-23 nice -n 19 cargo build -j8
   ```
-
-  For a hard split, isolate the guest's cores with systemd
-  (`systemctl set-property --runtime user.slice AllowedCPUs=0-7,16-23`,
-  and the same for `system.slice`), or at boot with `isolcpus=`/`nohz_full=`.
-- **Keep the backend and conduit-venus off the guest's cores**, on part of
-  the host's CCD: on the reference host `conduit config set backend.cpus
-  0-3,16-19` (four cores and their SMT siblings; applies at the next backend
-  start). Unpinned, their threads wake mostly on the guest's idle CPUs and
-  preempt a vCPU there. Pinned like this, the GPU copy round trip of a
-  windowed Windows game fell from 441 to 398 µs (p50) on the host and its
-  share of copies under 0.5 ms in the guest rose from 0.5% to 13.5%
+- **Keep the backend and conduit-venus off the guest's cores.** Host
+  isolation does this (their units are in Conduit's slices, which it
+  restricts). `conduit config set backend.cpus 0-3,16-19` narrows them
+  further, to part of the host's cores (four cores and their SMT siblings on
+  the reference host; applies at the next backend start). Unpinned and
+  without isolation, their threads wake mostly on the guest's idle CPUs and
+  preempt a vCPU there
   ([research/host-roundtrip-latency.md](research/host-roundtrip-latency.md)).
   This applies with MSI-X in the guest. A guest on INTx has every completion
   raised by QEMU's main loop, which libvirt pins to the same host CPUs
@@ -125,22 +125,116 @@ Check: `vmstat 2` should show `si`/`so` near 0 while the guest runs, and
   leave `backend.cpus` unset or keep it clear of the emulator CPUs.
 - **CPU governor**: `performance` avoids clock ramp-up latency.
 
-## GPU memory: Resizable BAR and the video-memory limit
+## CPU: host isolation
 
-- **BAR1.** Without Resizable BAR a GeForce exposes 256 MiB of its memory
-  to the CPU, and every guest mapping of GPU memory goes through that window,
-  shared with the host desktop. Turn on Above 4G Decoding and Resizable BAR in
-  the firmware settings for large guest workloads. `conduit doctor` prints the
-  size.
-- **Sharing the card with your desktop.** When the card has a monitor
-  connected and safe mode is on (the default for the closed modules or a
-  branch older than 580), guests get a default video-memory limit so the
-  compositor keeps room. On the open modules 580 or newer nothing is set
-  unless you ask: `conduit config set gpu.vram_limit_mib auto` (or a number
-  of MiB). The limit is the smallest of your number, the display default and,
-  in safe mode, 2 GiB (see [SECURITY.md](SECURITY.md); check what applies
-  with `conduit doctor`). `off` removes the limit on a dedicated card, but
-  not safe mode's 2 GiB: turn safe mode off too (`gpu.safe_mode false`).
+While a libvirt VM runs, Conduit keeps host work off its CPUs: your login
+session and its apps, system services, Conduit's own helpers (backend,
+conduit-venus, virtiofsd), device interrupts and the kernel's unbound
+workqueues run on the CPUs no running VM holds. It is on by default
+(`host.isolation auto`) and applies at every start of the VM, however it was
+started (virt-manager, virsh, `conduit up`/`view`), and is undone when the
+VM stops.
+
+**Which CPUs.** With `auto`:
+
+| CPU | the VM gets | the host keeps |
+|---|---|---|
+| vCPUs pinned 1:1 in the domain (`<vcpupin>`) | those cores (every SMT thread of them) | the rest |
+| several L3 domains (AMD CCDs/CCXs) | the CCD with the larger L3 (X3D), else the one the firmware ranks fastest (`amd_pstate_prefcore_ranking`, ACPI CPPC) | the other CCD(s) |
+| Intel hybrid | P-cores | E-cores |
+| several NUMA nodes | the node without CPU 0 | the other node(s) |
+| one L3, one node | cores from the top | CPU 0 and up |
+
+Placement takes whole cores, as many as the VM has vCPUs, spilling into the
+next domain only when one does not hold the VM. The host always keeps at
+least two whole cores or a quarter of the cores, whichever is more; a VM
+that does not fit is not isolated (`conduit doctor NAME` says why). A
+second VM gets CPUs no other running VM holds.
+
+On the reference host the 16-vCPU guest is pinned to CCD1, so:
+
+```
+conduit doctor win11
+[  ok  ] Host isolation: auto → VM on CCD1 (8-15,24-31), host on 0-7,16-23; applied ✓
+[  ok  ] vCPU pinning: 1:1 on the VM's cores, as host isolation wants
+```
+
+**vCPU pinning.** QEMU's vCPU threads are pinned by libvirt. A domain
+without `<vcpupin>` is pinned live at each start (`virsh vcpupin --live`, and
+`emulatorpin` to the host's CPUs; the definition is not changed). `conduit
+attach NAME` (or `conduit libvirt enable NAME` for a VM Conduit made) writes
+that pinning into the definition: `<vcpupin>` 1:1, `<emulatorpin>` and
+`<iothreadpin>` on the host's CPUs. When the domain's own pinning disagrees
+with the policy (it spans CCDs, or uses one thread of each core), `conduit
+doctor` proposes a re-pin and `conduit attach` applies it, saving the
+definition from before as `vms/NAME/libvirt-pre-pin-TIME.xml`; it applies at
+the next start. `conduit detach` puts the original pinning back.
+
+**What is changed, and what never is.**
+
+- systemd `AllowedCPUs=` (runtime only) on `system.slice`, your login
+  session scopes, and the units of your user manager (apps, terminals,
+  Conduit's slices);
+- every device interrupt's `/proc/irq/N/smp_affinity_list`, and
+  `/proc/irq/default_smp_affinity` for new ones. Per-CPU and kernel-managed
+  interrupts (NVMe and multi-queue NIC queues, spread over all CPUs by their
+  driver) refuse a new affinity and stay as they are;
+- `/sys/devices/virtual/workqueue/cpumask`;
+- irqbalance, when it runs, is stopped while any VM is isolated (it would
+  move the interrupts back) and started again after the last one stops.
+
+A cgroup holding a VM's QEMU, or the libvirt daemon that starts them, is
+never restricted (its vCPU pinning would stop working); `machine.slice`
+(system libvirt's VMs) is never touched. Every value is saved before its
+first change and put back exactly when the last isolated VM stops. A unit or
+scope created while the VM runs, outside the restricted slices, is not
+covered until the next start.
+
+**How it runs.** The backend's unit starts `conduit _isolation start NAME`
+with each VM start; it waits for the domain to run, then:
+
+1. starts `conduit-isolation@UID_CPUS.service` (for example
+   `conduit-isolation@1000_8-15_24-31.service`), a root oneshot unit with
+   `RemainAfterExit=yes` installed by the package, which applies the system
+   part (`conduit _isolation apply`) and keeps its saved values in
+   `/run/conduit-isolation/state.json`. A polkit rule
+   (`/usr/share/polkit-1/rules.d/50-conduit-isolation.rules`) lets a local,
+   active user start and stop exactly these units, so there is no password
+   prompt. The unit checks the instance name and always leaves the host at
+   least one whole core;
+2. restricts your user manager's units (`systemctl --user set-property
+   --runtime`), saving their values in `$XDG_RUNTIME_DIR/conduit/isolation.json`.
+
+It writes one line to `conduit logs NAME backend`, for example
+`host isolation: auto → VM on CCD1 (8-15,24-31), host on 0-7,16-23; applied
+(yours: app.slice, conduit.slice, session.slice; ...)`; the system part logs
+to the journal (`journalctl -u 'conduit-isolation@*'`). The backend's
+`_stopped` step and `conduit down` revert it. Both ends can run twice, and a
+start first reverts what a VM that is no longer running left behind, so a
+crash is cleaned up at the next start at the latest. Without the system
+unit (a source build), only your own processes are moved and `conduit
+doctor` says so.
+
+**Configure or turn it off.**
+
+```sh
+conduit config set host.isolation auto              # the default
+conduit config set host.isolation off               # never
+conduit config set host.isolation 8-15,24-31        # the VM's CPUs, exactly
+conduit config set host.isolation.win11 off         # one VM only
+conduit config unset host.isolation.win11
+```
+
+A CPU list gives the VM exactly those CPUs (plus any it is pinned to outside
+them, so no vCPU shares a CPU with host work). Changes apply at the VM's next
+start. To undo an isolation by hand: `sudo systemctl stop
+'conduit-isolation@*.service'`, then restart the VM or run `conduit down
+NAME`.
+
+`conduit doctor NAME` also warns when host work (`system.slice`, a session
+scope) or a device interrupt can run on the VM's vCPU CPUs while it runs,
+and when isolation is off on a CPU with several L3 domains, P/E cores or
+NUMA nodes, each with the command that fixes it.
 
 ## GPU time: the guest's timeslice
 
@@ -168,6 +262,23 @@ backend start (`conduit-backend --gpu-timeslice-us`). For a test,
 `CONDUIT_GUEST_TSG_TIMESLICE_US` in the backend's environment overrides it.
 Shorter slices mean more context switches when both sides have work; below
 50 µs that cost dominates.
+
+## GPU memory: Resizable BAR and the video-memory limit
+
+- **BAR1.** Without Resizable BAR a GeForce exposes 256 MiB of its memory
+  to the CPU, and every guest mapping of GPU memory goes through that window,
+  shared with the host desktop. Turn on Above 4G Decoding and Resizable BAR in
+  the firmware settings for large guest workloads. `conduit doctor` prints the
+  size.
+- **Sharing the card with your desktop.** When the card has a monitor
+  connected and safe mode is on (the default for the closed modules or a
+  branch older than 580), guests get a default video-memory limit so the
+  compositor keeps room. On the open modules 580 or newer nothing is set
+  unless you ask: `conduit config set gpu.vram_limit_mib auto` (or a number
+  of MiB). The limit is the smallest of your number, the display default and,
+  in safe mode, 2 GiB (see [SECURITY.md](SECURITY.md); check what applies
+  with `conduit doctor`). `off` removes the limit on a dedicated card, but
+  not safe mode's 2 GiB: turn safe mode off too (`gpu.safe_mode false`).
 
 ## Measuring
 

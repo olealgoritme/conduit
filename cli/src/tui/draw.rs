@@ -501,6 +501,14 @@ fn vm_card(f: &mut Frame, app: &App, area: Rect) {
         if !helpers.is_empty() {
             lines.push(kv("helpers", helpers.join(" · "), DIM));
         }
+        // Host isolation (hostiso.rs): the VM's CPUs while it runs.
+        lines.push(match &v.isolation {
+            Some(i) if i == "not applied" || i.ends_with("(partial)") => {
+                kv("isolated", i.clone(), AMBER)
+            }
+            Some(i) => kv("isolated", i.clone(), GREEN),
+            None => kv("isolated", "no", DIM),
+        });
     }
     if let Some(m) = app.modes.get(&v.name) {
         lines.push(kv("next", format!("{m} on view/start"), AMBER));

@@ -1,0 +1,45 @@
+# Conduit host isolation, one instance per running VM: UID_CPUS, the VM
+# owner's uid and the VM's CPUs (conduit-isolation@1000_8-15_24-31.service).
+# While active, system.slice, the login session scopes, device interrupts
+# and the unbound workqueues stay on the CPUs no running VM holds; stopping
+# the last instance puts every saved value back. Started and stopped by
+# `conduit _isolation start|stop` from the VM's backend unit (polkit rule
+# 50-conduit-isolation.rules); never at boot. docs/HOST-TUNING.md
+[Unit]
+Description=Conduit host isolation %i
+Documentation=https://github.com/olealgoritme/conduit/blob/main/docs/HOST-TUNING.md
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/conduit/bin/conduit _isolation apply %i
+ExecStop=/opt/conduit/bin/conduit _isolation revert %i
+TimeoutSec=60
+# The ledger of saved values (/run/conduit-isolation/state.json), shared by
+# every instance and readable by users (`conduit doctor`).
+RuntimeDirectory=conduit-isolation
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0022
+# It writes /proc/irq, /sys/devices/virtual/workqueue and its runtime
+# directory, reads /proc and /sys/fs/cgroup, and talks to systemd.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_ADMIN
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

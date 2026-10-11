@@ -90,6 +90,53 @@ pub fn output_timeout(cmd: &mut Command, limit: Duration) -> Option<String> {
     }
 }
 
+/// Run with a deadline and capture stdout; the error carries stderr, or says
+/// the command was killed at the deadline.
+pub fn output_within(cmd: &str, args: &[&str], limit: Duration) -> Result<String> {
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("could not run {cmd}"))?;
+    let reader = |mut r: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            b
+        })
+    };
+    let out = reader(Box::new(child.stdout.take().unwrap()));
+    let err = reader(Box::new(child.stderr.take().unwrap()));
+    let t = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if t.elapsed() < limit => sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "{cmd} {} did not finish within {} s",
+                    args.join(" "),
+                    limit.as_secs()
+                );
+            }
+        }
+    };
+    let out = out.join().unwrap_or_default();
+    let err = err.join().unwrap_or_default();
+    if !status.success() {
+        anyhow::bail!(
+            "{cmd} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&err).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
 /// Run quietly; true when it exited 0.
 pub fn quiet(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
