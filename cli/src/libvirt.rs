@@ -65,9 +65,25 @@ pub struct Wiring<'a> {
     pub display: Option<(u32, u32)>,
     /// The machine types Conduit's QEMU has (`-machine help`), when known.
     pub machines: Option<&'a [String]>,
+    /// Host isolation's pinning for `<cputune>` (vCPU i -> CPU, and the
+    /// host's CPUs for QEMU's own threads), when the domain's own does not
+    /// agree with it (hostiso.rs).
+    pub pinning: Option<(&'a [u32], &'a crate::hostiso::cpus::CpuSet)>,
     /// The sockets of the virtio-input devices the backend serves, in
     /// [`units::INPUT_KINDS`] order; empty for none (a backend without them).
     pub input_socks: &'a [PathBuf],
+}
+
+/// The metadata attribute that says attach wrote the domain's `<cputune>`
+/// pinning (detach puts the original back).
+const PINNED_ATTR: &str = "pinned";
+
+/// Did an earlier attach write the pinning?
+fn recorded_pinned(root: &Element) -> bool {
+    root.get_child("metadata")
+        .and_then(|m| m.children.iter().find(|n| is_conduit_meta(n)))
+        .and_then(|n| n.as_element())
+        .is_some_and(|e| e.attributes.get(PINNED_ATTR).map(String::as_str) == Some("yes"))
 }
 
 /// The metadata attribute that remembers the stock loader while the Conduit
@@ -698,6 +714,12 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         }
     }
 
+    // <cputune>: host isolation's pinning, when the domain's disagrees.
+    let pinned = recorded_pinned(&root) || w.pinning.is_some();
+    if let Some((vcpus, host)) = w.pinning {
+        crate::hostiso::domain::set_pinning(&mut root, vcpus, host);
+    }
+
     // <metadata><conduit:vm .../>
     {
         let md = child_mut(&mut root, "metadata");
@@ -707,6 +729,9 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         let mut v = el("vm", &[("name", w.vm), ("kind", "attached")]);
         if let Some(stock) = &bios_plan.stock {
             v.attributes.insert(STOCK_LOADER_ATTR.into(), stock.clone());
+        }
+        if pinned {
+            v.attributes.insert(PINNED_ATTR.into(), "yes".into());
         }
         v.prefix = Some("conduit".into());
         v.namespace = Some(META_NS.into());
@@ -1200,6 +1225,11 @@ pub fn undo_domain(current: &str, original: &str, console: Option<&Path>) -> Res
         parse_domain(original).context("the saved original definition is not a libvirt domain")?;
     let recorded = recorded_stock(&root);
 
+    // <cputune>: the original pinning back, when attach wrote it.
+    if recorded_pinned(&root) {
+        crate::hostiso::domain::restore_pinning(&mut root, &orig);
+    }
+
     // <metadata>
     if let Some(md) = root.get_mut_child("metadata") {
         md.children.retain(|n| !is_conduit_meta(n));
@@ -1637,6 +1667,9 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     let bios_dir = bios::installed_dir();
     let machines = qemu_machines(&emu);
     let (mode, _) = crate::mode::detect();
+    let (repin, iso_note) = crate::hostiso::domain::read(&xml)
+        .map(|d| crate::hostiso::definition_pinning(name, &d))
+        .unwrap_or((None, None));
     let input_socks: Vec<PathBuf> = if run::virtio_input() {
         units::INPUT_KINDS
             .iter()
@@ -1659,10 +1692,13 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         bios_fits: &bios::check,
         display: Some((mode.width, mode.height)),
         machines: machines.as_deref(),
+        pinning: repin.as_ref().map(|r| (r.vcpus.as_slice(), &r.host)),
         input_socks: &input_socks,
     };
     let new_xml = edit_domain(&xml, &wiring)?;
-    let edit_notes = notes(&xml, &wiring);
+    let mut edit_notes = notes(&xml, &wiring);
+    edit_notes.extend(repin.as_ref().map(|r| r.note.clone()));
+    edit_notes.extend(iso_note);
     if dry_run {
         ui::info(format!("libvirt: {uri}; emulator: {}", emu.display()));
         for n in &edit_notes {
@@ -1712,6 +1748,15 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         }
         e
     };
+    // A re-pin of a VM attached before: its definition as it was, too.
+    if already && repin.is_some() {
+        let pre = dir.join(format!("libvirt-pre-pin-{}.xml", timestamp()));
+        sys::write_private(&pre, &xml)?;
+        println!(
+            "The definition before the re-pin is saved at {}",
+            pre.display()
+        );
+    }
     virt::allow_libvirtd_exec(&emu)?;
     if matches!(scope, Scope::System { .. }) {
         system_apparmor()?;
@@ -1957,6 +2002,7 @@ mod tests {
                 bios_fits: &fits,
                 display: None,
                 machines: Some(&machines()),
+                pinning: None,
                 input_socks: &[],
             },
         )
@@ -1984,6 +2030,7 @@ mod tests {
                 bios_fits: &fits,
                 display,
                 machines: Some(&machines()),
+                pinning: None,
                 input_socks: &[],
             },
         )
@@ -2757,6 +2804,7 @@ mod tests {
             bios_fits: &fits,
             display: None,
             machines: None,
+            pinning: None,
             input_socks: &[],
         };
         assert!(edit_domain("<network/>", &w).is_err());
@@ -2798,6 +2846,7 @@ mod tests {
             bios_fits: &fits,
             display: Some((5120, 1440)),
             machines,
+            pinning: None,
             input_socks: &[],
         }
     }
@@ -2878,6 +2927,33 @@ mod tests {
             assert_eq!(canon(&back), canon(&x), "{name}:\n{back}");
             assert!(!virt::is_ours(&back), "{name}");
         }
+    }
+
+    #[test]
+    fn attach_pins_for_host_isolation_and_detach_unpins() {
+        use crate::hostiso::cpus::CpuSet;
+        let ws = [];
+        let m = machines();
+        let host = CpuSet::parse("0-7,16-23").unwrap();
+        let pins: Vec<u32> = vec![8, 24, 9, 25];
+        let x = DOMAIN.replace(
+            "</memory>",
+            "</memory>\n  <vcpu placement='static'>4</vcpu>",
+        );
+        let mut w = wiring_with(None, false, Some(&m), &ws);
+        w.pinning = Some((&pins, &host));
+        let attached = edit_domain(&x, &w).unwrap();
+        let d = crate::hostiso::domain::read(&attached).unwrap();
+        assert_eq!(d.pins[0], CpuSet::parse("8"));
+        assert_eq!(d.emulatorpin, Some(host.clone()));
+        assert!(attached.contains("pinned=\"yes\""), "{attached}");
+        // Running attach again with nothing to re-pin keeps the record.
+        w.pinning = None;
+        let again = edit_domain(&attached, &w).unwrap();
+        assert_eq!(canon(&again), canon(&attached));
+        // Detach puts the original (unpinned) <cputune> back.
+        let back = undo_domain(&again, &x, None).unwrap();
+        assert_eq!(canon(&back), canon(&x), "{back}");
     }
 
     #[test]

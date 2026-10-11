@@ -10,6 +10,7 @@ mod doctor;
 mod feed;
 mod guest;
 mod host;
+mod hostiso;
 mod hypr;
 mod latency;
 mod libvirt;
@@ -490,6 +491,14 @@ enum Cmd {
     /// (internal) after the backend stopped with its VM
     #[command(name = "_stopped", hide = true)]
     Stopped { name: String },
+    /// (internal) host isolation: `start|stop NAME` (yours), `apply|revert
+    /// INSTANCE` (root, conduit-isolation@.service)
+    #[command(name = "_isolation", hide = true)]
+    Isolation {
+        #[arg(value_parser = ["start", "stop", "apply", "revert"])]
+        action: String,
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -982,6 +991,14 @@ fn main() {
         Cmd::Virtiofsd { name } => lvrun::virtiofsd_exec(&name),
         Cmd::Stats { name } => feed::run(&name),
         Cmd::Stopped { name } => lvrun::stopped(&name),
+        Cmd::Isolation { action, target } => match action.as_str() {
+            "start" => hostiso::start(&target),
+            "stop" => {
+                hostiso::stop(&target);
+                Ok(())
+            }
+            a => hostiso::helper(a, &target),
+        },
         Cmd::HyprHook { action, state } => hypr::hook(&action, &state),
         Cmd::Watch { name } => run::watch(&name),
     };

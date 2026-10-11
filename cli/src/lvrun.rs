@@ -486,6 +486,7 @@ pub fn after_stop(name: &str, link: &Link) {
     if let Ok(rt) = Rt::new(name) {
         stop_viewer(&rt);
     }
+    crate::hostiso::stop(name);
     // The backend exits when QEMU disconnects; make sure.
     if let Ok(scope) = link.scope() {
         let gone = sys::wait_for(Duration::from_secs(10), || {
@@ -692,6 +693,9 @@ pub fn backend_exec(name: &str) -> Result<()> {
         }
     });
     cmd.env("RUST_LOG", level);
+    // Host isolation once the domain runs (in the background: QEMU waits
+    // for this backend before it can run).
+    crate::hostiso::spawn_start(name, &logs_dir(name).join("backend.log"));
     eprintln!(
         "conduit: starting the GPU backend for {name} (socket activation), display {}",
         mode.map(|m| m.to_string()).unwrap_or_else(|| "none".into())
@@ -895,6 +899,7 @@ pub fn stopped(name: &str) -> Result<()> {
     if let Ok(rt) = Rt::new(name) {
         let _ = std::fs::remove_file(rt.p(MODE));
     }
+    crate::hostiso::stop(name);
     if let Some(l) = Link::load(name) {
         if l.kind == Kind::Managed {
             if let Ok(c) = VmConfig::load(name) {

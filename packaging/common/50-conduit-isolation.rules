@@ -1,0 +1,21 @@
+// Conduit host isolation: a local, active user may start and stop the
+// conduit-isolation@UID_CPUS.service units (one per running VM) without a
+// password. Nothing else. The unit checks its instance name and always
+// leaves the host at least one whole core. docs/HOST-TUNING.md
+polkit.addRule(function(action, subject) {
+    if (action.id != "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (!unit || !/^conduit-isolation@[0-9]+(_[0-9]+(-[0-9]+)?)+\.service$/.test(unit)) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (verb != "start" && verb != "stop") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

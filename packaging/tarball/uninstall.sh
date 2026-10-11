@@ -12,6 +12,8 @@ if [ -x "$PREFIX/libexec/conduit-integrate" ]; then
 fi
 [ "$(readlink /usr/local/bin/conduit 2>/dev/null)" = "$PREFIX/bin/conduit" ] && rm -f /usr/local/bin/conduit
 rm -f /usr/local/share/applications/conduit.desktop /etc/apparmor.d/abstractions/conduit
+rm -f /etc/systemd/system/conduit-isolation@.service /etc/polkit-1/rules.d/50-conduit-isolation.rules
+[ -d /run/systemd/system ] && systemctl daemon-reload 2>/dev/null || true
 rm -f /usr/local/share/icons/hicolor/*/apps/conduit.*
 [ -d /usr/local/share/icons/hicolor ] && command -v gtk-update-icon-cache >/dev/null 2>&1 \
     && gtk-update-icon-cache -q -t -f /usr/local/share/icons/hicolor 2>/dev/null || true
