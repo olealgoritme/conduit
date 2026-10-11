@@ -385,4 +385,4 @@ struct HeliosDxvkDevice {
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high,
-    bool timer_resolution);
+    std::uint32_t timer_resolution);

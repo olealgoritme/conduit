@@ -18,7 +18,8 @@
 //! | Value | Type | Absent |
 //! |---|---|---|
 //! | `UmdTrace` | DWORD | `false` (explicit non-zero enables) |
-//! | `UmdTimerRes` | DWORD | `true` (explicit 0 disables our timer request) |
+//! | `UmdTimerRes` | DWORD | `1` (0 = no timer request, 1 = `timeBeginPeriod(1)`, >= 2 = `NtSetTimerResolution` in 100 ns units, e.g. 5000 = 0.5 ms) |
+//! | `UmdFrameTrace` | DWORD | `0` (non-zero: per-Present timing CSV of the threaded front end, `C:\ProgramData\Helios\frametrace-<pid>.csv`) |
 //! | `FeatureLevel11` | DWORD | `1` |
 //! | `VehicleFlipGateUs` | DWORD | `32000` |
 //! | `ScanoutAcquire` | DWORD | `true` (explicit 0 is the kill switch) |
@@ -82,7 +83,17 @@ pub(crate) static UMD_TRACE: BoolKnob = BoolKnob::new(c"UmdTrace", false);
 /// Native DXGI bypasses DXVK's swapchain timer setup. On 2026-09-12, PassMark's
 /// Venus polling sleeps lasted about 11 ms; a process-local 1 ms request raised
 /// its active DX11 frame rate from about 16 to 31 FPS. Keep 0 for paired A/B runs.
-pub(crate) static UMD_TIMER_RESOLUTION: BoolKnob = BoolKnob::new(c"UmdTimerRes", true);
+///
+/// 0 = no request, 1 = `timeBeginPeriod(1)` (the default), any larger value =
+/// `NtSetTimerResolution(value)` in 100 ns units (5000 = 0.5 ms, the usual
+/// minimum): an A/B lever for game threads that wait in `Sleep(1)`. The
+/// resolution in force is logged once at device creation.
+pub(crate) static UMD_TIMER_RESOLUTION: DwordKnob = DwordKnob::new(c"UmdTimerRes", 1);
+
+/// Per-Present timing trace of the threaded front end (`helios_umd_common::
+/// frame_trace`). Absent/0 = off; non-zero = on. Only devices with the front
+/// end (`UmdThreadedFrontend`) trace.
+pub(crate) static UMD_FRAME_TRACE: DwordKnob = DwordKnob::new(c"UmdFrameTrace", 0);
 
 /// Feature-level profile selector. Absent = 1 (the full FL11 profile).
 pub(crate) static FEATURE_LEVEL_11: DwordKnob = DwordKnob::new(c"FeatureLevel11", 1);
@@ -221,10 +232,10 @@ pub(crate) fn log_knob_inventory() {
     helios_umd_common::log::log_knob_inventory(&resolved_inventory());
 }
 
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 14] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
-        ("UmdTimerRes", UMD_TIMER_RESOLUTION.get() as u32),
+        ("UmdTimerRes", UMD_TIMER_RESOLUTION.get()),
         ("FeatureLevel11", FEATURE_LEVEL_11.get()),
         ("VehicleFlipGateUs", VEHICLE_FLIP_GATE_US.get()),
         ("ScanoutAcquire", SCANOUT_ACQUIRE.get() as u32),
@@ -236,6 +247,7 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
         ("UmdDeferredDiagnostics", UMD_DEFERRED_DIAGNOSTICS.get() as u32),
         ("UmdDdiLevel", UMD_DDI_LEVEL.get()),
         ("UmdDdiLevelDwm", UMD_DDI_LEVEL_DWM.get()),
+        ("UmdFrameTrace", UMD_FRAME_TRACE.get()),
     ]
 }
 

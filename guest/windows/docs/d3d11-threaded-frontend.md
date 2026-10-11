@@ -341,6 +341,15 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 - One summary line at `DestroyDevice` (and every 4096 drains with `UmdTrace`): records, bytes, sync calls and drains by
   reason, drain wait µs (sum, max), producer full-waits, worker parks/wakes, destroys queued/inline/waited, GetData
   early-pending, split maps (discard / no-overwrite), stashed errors.
+- `UmdFrameTrace` (DWORD, default 0): non-zero writes one CSV line per Present of every front-end device to
+  `C:\ProgramData\Helios\frametrace-<pid>.csv` (`umd_common::frame_trace`; a lock-free ring the presenting thread
+  fills, drained by a `helios-frame-trace` thread every 250 ms). Per frame: `qpc_ms` (QPC ms at the Present DDI, the
+  clock of PresentMon's `CPUStartQPCTime` with `--qpc_time_ms`), `interval_ms` (Present to Present on this thread),
+  `present_drain_ms`, `ddi_calls`, and the presenting thread's blocked time by wait point: `sync` (drains of the other
+  synchronous calls, destroys, discard back-pressure), `map` (whole synchronous Map/Unmap, drain and DXVK map
+  included), `getdata`, `flush`, `full` (pushes into a full ring), with counts; `worker_busy_ms` (time the worker ran
+  records) and `blocked_ms` (their sum with the Present drain). `tools/pm-sample-split.py PM.csv --trace FILE`
+  compares them between slow and fast frames.
 
 ## 8. Phases
 
