@@ -241,6 +241,9 @@ pub(super) struct StartSettings {
     /// The video-memory limit in MiB, `None` for none: the number
     /// [`Vram`](crate::vram::Vram) is rebuilt from, its books starting empty.
     pub(super) vram_limit_mib: Option<u64>,
+    /// The guest TSGs' timeslice policy (gpu_sched). None here; the binary
+    /// sets its own (default 100 us).
+    pub(super) sched: crate::gpu_sched::GuestSched,
 }
 
 impl StartSettings {
@@ -257,6 +260,7 @@ impl StartSettings {
             devinfo: None,
             bounds: bounds::Bounds::NORMAL,
             vram_limit_mib: None,
+            sched: crate::gpu_sched::GuestSched::NONE,
         }
     }
 }
@@ -323,6 +327,8 @@ pub struct NvidiaBackend {
     /// somebody made on the command line, and this is RM's own rule. A probe
     /// that regresses needs to say which of the two stopped it.
     allow_refused: std::collections::BTreeMap<String, u64>,
+    /// What the guest-TSG timeslice policy did (sched.rs).
+    tsg_sched: sched::TsgSchedStats,
     /// Where device memory is placed so the guest can address it. `None` until
     /// the transport supplies one, and without it a mapping can be made on the
     /// host but never reached from the guest.
@@ -495,6 +501,7 @@ impl NvidiaBackend {
             uvm_denied: std::collections::HashSet::new(),
             os_events: std::collections::HashMap::new(),
             allow_refused: std::collections::BTreeMap::new(),
+            tsg_sched: sched::TsgSchedStats::default(),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
             rm_controls: std::collections::BTreeMap::new(),
@@ -555,6 +562,11 @@ impl NvidiaBackend {
 
     pub fn caps(&self) -> crate::caps::Caps {
         self.start.caps
+    }
+
+    /// The timeslice policy for the guest's TSGs (gpu_sched).
+    pub fn set_guest_sched(&mut self, sched: crate::gpu_sched::GuestSched) {
+        self.start.sched = sched;
     }
 
     /// Set the guest's video-memory budget. `None` is no limit.
@@ -883,6 +895,7 @@ impl NvidiaBackend {
             self.handles.len(),
             self.active_maps.len()
         );
+        self.tsg_sched.report(&self.start.sched);
         if !self.allow_refused.is_empty() {
             log::warn!(
                 "NvidiaBackend::teardown: refused by the RM allowlist: {}",
@@ -1221,6 +1234,7 @@ pub use rm_import::{RmObject, RmPlacement, SurfaceLayout, Tiling};
 mod rm_resource;
 mod rmctrl;
 mod scanout;
+mod sched;
 mod simple;
 #[cfg(feature = "trace")]
 mod trace;

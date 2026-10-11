@@ -232,6 +232,14 @@ struct Args {
     /// docs/research/host-roundtrip-latency.md, "Placement".
     #[arg(long, value_name = "LIST")]
     cpus: Option<String>,
+
+    /// The GPU timeslice of each guest channel group, in microseconds
+    /// (docs/HOST-TUNING.md, "GPU time"): `off` or `0` for RM's own (1024), else
+    /// 50..=1024. A short slice keeps the host's display work from waiting
+    /// behind a busy guest. The guest's own SET_TIMESLICE requests are clamped
+    /// to it. CONDUIT_GUEST_TSG_TIMESLICE_US, when set, overrides it.
+    #[arg(long, value_name = "off|US", default_value = "100")]
+    gpu_timeslice_us: device::gpu_sched::GuestSched,
 }
 
 /// `--latency`. `Default` is every option off (what `off` asks for); the
@@ -2120,6 +2128,7 @@ impl NvGpuBackend {
         input_target: EventTarget,
         input_claims: Arc<GuestInputClaims>,
         safe_mode: bool,
+        guest_sched: device::gpu_sched::GuestSched,
     ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
@@ -2157,6 +2166,7 @@ impl NvGpuBackend {
             log::warn!("{what}: starting anyway (--allow-nearest-abi)");
         }
         nvidia.set_caps(caps);
+        nvidia.set_guest_sched(guest_sched);
         nvidia.set_safe_mode(safe_mode);
         nvidia
             .set_vram_limit_mib(vram_limit_mib)
@@ -3169,6 +3179,7 @@ fn main() -> anyhow::Result<()> {
         input_target,
         input_claims,
         safe_mode,
+        device::gpu_sched::GuestSched::effective(args.gpu_timeslice_us),
     )?;
     #[cfg(feature = "venus")]
     if args.venus {
@@ -3451,6 +3462,20 @@ mod tests {
         assert_eq!(a.latency, Latency::parse("all").unwrap());
         let a = Args::try_parse_from(["conduit-backend", "--latency", "off"]).unwrap();
         assert_eq!(a.latency, Latency::default());
+    }
+
+    #[test]
+    fn gpu_timeslice_defaults_to_100_us() {
+        use clap::Parser;
+        use device::gpu_sched::GuestSched;
+        let a = Args::try_parse_from(["conduit-backend"]).unwrap();
+        assert_eq!(a.gpu_timeslice_us, GuestSched::default());
+        assert_eq!(a.gpu_timeslice_us.timeslice_us, Some(100));
+        let a = Args::try_parse_from(["conduit-backend", "--gpu-timeslice-us", "off"]).unwrap();
+        assert_eq!(a.gpu_timeslice_us, GuestSched::NONE);
+        let a = Args::try_parse_from(["conduit-backend", "--gpu-timeslice-us", "250"]).unwrap();
+        assert_eq!(a.gpu_timeslice_us.timeslice_us, Some(250));
+        assert!(Args::try_parse_from(["conduit-backend", "--gpu-timeslice-us", "10"]).is_err());
     }
 
     /// A fence's status rides in the header, signed, as the guest reads it.

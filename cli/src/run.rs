@@ -307,9 +307,10 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
 /// (docs/research/host-roundtrip-latency.md, phase 3).
 const FENCE_SPIN_US: u32 = 150;
 
-/// `backend.latency` and `backend.cpus` as the backend's `--latency` and
-/// `--cpus` (docs/research/host-roundtrip-latency.md); nothing when unset,
-/// and the backend keeps its default (`all`).
+/// `backend.latency`, `backend.cpus` and `backend.gpu_timeslice_us` as the
+/// backend's `--latency`, `--cpus` and `--gpu-timeslice-us`
+/// (docs/research/host-roundtrip-latency.md, docs/HOST-TUNING.md); nothing
+/// when unset, and the backend keeps its defaults.
 pub(crate) fn latency_args(cmd: &mut Command) {
     if let Some(list) = crate::config::backend_latency() {
         // fence-spin is conduit-venus's alone (`venus_cmd`).
@@ -322,6 +323,9 @@ pub(crate) fn latency_args(cmd: &mut Command) {
     }
     if let Some(cpus) = crate::config::backend_cpus() {
         cmd.arg("--cpus").arg(cpus);
+    }
+    if let Some(us) = crate::config::backend_gpu_timeslice_us() {
+        cmd.arg("--gpu-timeslice-us").arg(us);
     }
 }
 
