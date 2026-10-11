@@ -325,6 +325,233 @@ mod tests {
         assert_eq!(completion_address(0, 0x1000), None);
     }
 
+    // ---- replay of an uncapped application's present cadence ---------------------------------
+    //
+    // The worker's immediate path, end to end, as `kmd_render` performs it: dxgkrnl hands the
+    // worker one flip at a time (`pending_vidpn_allocation`, one slot), the programming owes the
+    // `ForeignFlip` presenter one frame (`OWED`, one slot: a newer programming replaces a frame
+    // still owed), the presenter sends it to the host no sooner than `min_interval` after the
+    // previous host flip, and the completion vsync carries the published address at once
+    // (`completion_address`). The 240 Hz tick delivers the newest published address on its own
+    // grid and gates nothing on this path.
+
+    extern crate std;
+    use crate::rm_present::{Act, FlipResult, Presenter};
+    use std::vec::Vec;
+
+    const MS: u64 = 10_000;
+    const HZ240_MHZ: u32 = 240_000;
+
+    #[derive(Debug, Default)]
+    struct Replay {
+        /// (frame, host send time) in send order.
+        sent: Vec<(usize, u64)>,
+        /// (frame, the newer frame that replaced it) for every frame never sent.
+        superseded: Vec<(usize, usize)>,
+        /// Completion vsyncs reported by the worker (not the tick).
+        completions: usize,
+    }
+
+    fn paced(pipelined: bool) -> u64 {
+        crate::flip_retire::paced_interval(
+            crate::rm_refresh::flip_interval_100ns(HZ240_MHZ),
+            pipelined,
+        )
+    }
+
+    /// Replays `arrivals` (100 ns, ascending: when each flip reaches the worker) through the
+    /// single owed slot and the presenter; `rtt` is the host round trip the worker spends per
+    /// flip (the synchronous arm).
+    fn replay(arrivals: &[u64], pipelined: bool, rtt: u64) -> Replay {
+        let period = crate::vsync_deadline::period_100ns(HZ240_MHZ);
+        let interval = min_interval(paced(pipelined), true, mode(DEFAULT_KNOB));
+        let mut p = Presenter::new(1);
+        p.set_min_interval(interval);
+        // Registered before the first frame (the registration is its own act).
+        assert_eq!(
+            p.decide(crate::rm_sysmem::flip_inputs(
+                1, true, true, true, false, false
+            )),
+            Act::Register
+        );
+        p.registration(true, 1);
+        let addr = |f: usize| 0x1_0000_0000u64 + (f as u64 % 3) * 0x0200_0000;
+        let mut out = Replay::default();
+        let mut owed: Option<usize> = None;
+        let mut wake: Option<u64> = None;
+        let mut busy_until = 0u64;
+        let mut last_done = 0u64;
+        let mut next_tick = period;
+        let mut published = 0u64;
+        let mut i = 0;
+        loop {
+            // The next event: an arrival, a timed wake of the worker, or a tick.
+            let t_arr = arrivals.get(i).map(|&a| a.max(busy_until));
+            let t_wake = wake.map(|w| w.max(busy_until));
+            let t = match (t_arr, t_wake) {
+                (None, None) => break,
+                (Some(a), None) => a,
+                (None, Some(w)) => w,
+                (Some(a), Some(w)) => a.min(w),
+            };
+            while next_tick <= t {
+                // The tick's CRTC_VSYNC carries the newest published address.
+                last_done = published;
+                next_tick += period;
+            }
+            let mut edge = false;
+            if t_arr == Some(t) {
+                // Programming: published at once, retired by the completion vsync.
+                let f = i;
+                i += 1;
+                published = addr(f);
+                if let Some(old) = owed.replace(f) {
+                    out.superseded.push((old, f));
+                }
+                if let Some(a) = completion_address(published, last_done) {
+                    last_done = a;
+                    out.completions += 1;
+                }
+                edge = true;
+            }
+            wake = None;
+            let act = p.decide(crate::rm_sysmem::flip_inputs(
+                t, true, true, true, edge, false,
+            ));
+            match act {
+                Act::CopyFlip { slot } => {
+                    let f = owed.take().expect("a frame is owed");
+                    out.sent.push((f, t));
+                    p.flipped(slot, true, FlipResult::Shown, t);
+                    busy_until = t + rtt;
+                }
+                Act::WaitUntil(at) => wake = Some(at),
+                Act::Idle => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// The CS2-like cadence `guest/windows/tools/motiontest.cpp` phase 2 presents: a frame
+    /// every 2.37 ms, and once per 15.625 ms one 4.33 ms longer (fast, fast, fast, slow...).
+    fn irregular(seconds: u64) -> Vec<u64> {
+        let (fast, slow, beat) = (23_700u64, 43_300u64, 156_250u64);
+        let mut v = Vec::new();
+        let (mut t, mut tick) = (MS, MS);
+        while t < seconds * 1000 * MS {
+            v.push(t);
+            t += fast;
+            if t - tick >= beat {
+                tick += beat;
+                t += slow;
+            }
+        }
+        v
+    }
+
+    fn assert_every_frame_sent_in_order(r: &Replay, n: usize) {
+        assert!(
+            r.superseded.is_empty(),
+            "merged: {:?}",
+            &r.superseded[..r.superseded.len().min(8)]
+        );
+        assert_eq!(r.sent.len(), n);
+        for (k, (f, _)) in r.sent.iter().enumerate() {
+            assert_eq!(*f, k, "out of order");
+        }
+        assert_eq!(r.completions, n, "every flip completes at programming");
+    }
+
+    #[test]
+    fn an_irregular_cadence_reaches_the_host_frame_for_frame() {
+        let arrivals = irregular(2);
+        let fps = arrivals.len() as u64 / 2;
+        assert!((280..=330).contains(&fps), "{fps} fps");
+        for pipelined in [false, true] {
+            for rtt in [0, 3_000, 10_000] {
+                let r = replay(&arrivals, pipelined, rtt);
+                assert_every_frame_sent_in_order(&r, arrivals.len());
+                // Promptly: each one when it arrives (the gaps are wider than the cap and the
+                // round trip), never at a tick.
+                for (f, at) in &r.sent {
+                    assert!(
+                        at - arrivals[*f] <= rtt,
+                        "frame {f} held {} us",
+                        (at - arrivals[*f]) / 10
+                    );
+                }
+                // The host's spacing is the application's, not a multiple of the refresh.
+                let gaps: Vec<u64> = r.sent.windows(2).map(|w| w[1].1 - w[0].1).collect();
+                let near = |g: u64, c: u64| g.abs_diff(c) < 2_000;
+                let locked = gaps
+                    .iter()
+                    .filter(|&&g| near(g, 83_333) || near(g, 41_667))
+                    .count();
+                assert!(
+                    locked * 10 < gaps.len(),
+                    "{locked} of {} gaps on the refresh grid",
+                    gaps.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_even_six_point_seven_ms_cadence_is_149_fps_end_to_end() {
+        // What motiontest's first copy presented for most of phase 2 (its 15.625 ms clock
+        // started at the program start: one long frame after every short one). All 149 per
+        // second reach the host; a 240 Hz viewer then shows them at 4.17 / 8.33 ms.
+        let arrivals: Vec<u64> = (0..298u64).map(|k| MS + k * 67_000).collect();
+        let r = replay(&arrivals, true, 3_000);
+        assert_every_frame_sent_in_order(&r, arrivals.len());
+    }
+
+    #[test]
+    fn even_cadences_up_to_the_cap_are_sent_frame_for_frame() {
+        for fps in [240u64, 300, 500, 700] {
+            let step = 10_000_000 / fps;
+            let arrivals: Vec<u64> = (0..fps).map(|k| MS + k * step).collect();
+            let r = replay(&arrivals, true, 0);
+            assert_every_frame_sent_in_order(&r, arrivals.len());
+        }
+    }
+
+    #[test]
+    fn only_a_frame_overtaken_within_the_host_send_cap_is_dropped() {
+        // Bursts of three flips 0.3 ms apart every 4 ms: the first of each goes at once, the
+        // second waits for the cap and is overtaken by the third before then, the third goes
+        // at the cap. Never more than the frames overtaken while one was held.
+        let cap = min_interval(paced(true), true, mode(DEFAULT_KNOB));
+        let mut arrivals = Vec::new();
+        for b in 0..100u64 {
+            for k in 0..3u64 {
+                arrivals.push(MS + b * 40_000 + k * 3_000);
+            }
+        }
+        let r = replay(&arrivals, true, 0);
+        assert_eq!(r.sent.len() + r.superseded.len(), arrivals.len());
+        for &(old, newer) in &r.superseded {
+            assert_eq!(newer, old + 1, "replaced by the very next flip");
+            let prev_send = r
+                .sent
+                .iter()
+                .rev()
+                .find(|(f, _)| *f < old)
+                .map(|s| s.1)
+                .unwrap();
+            assert!(
+                arrivals[newer] < prev_send + cap,
+                "{old} was due before {newer} came"
+            );
+        }
+        assert_eq!(r.superseded.len(), 100, "one per burst");
+        for w in r.sent.windows(2) {
+            assert!(w[0].0 < w[1].0);
+            assert!(w[1].1 - w[0].1 >= cap);
+        }
+    }
+
     #[test]
     fn counter_names_fit_and_are_unique() {
         assert!(KNOB.len() <= 14);
