@@ -2373,6 +2373,7 @@ impl NvGpuBackend {
             log::warn!("{what}: starting anyway (--allow-nearest-abi)");
         }
         nvidia.set_caps(caps);
+        nvidia.set_guest_sched(device::gpu_sched::GuestSched::from_env());
         nvidia.set_safe_mode(safe_mode);
         nvidia
             .set_vram_limit_mib(vram_limit_mib)
@@ -3322,7 +3323,10 @@ fn main() -> anyhow::Result<()> {
     } = activated_listeners();
     // Before any device is opened: the host driver judges every guest call by
     // this process's credentials (device::posture).
-    device::posture::enforce()?;
+    // The guest-TSG scheduling policy (device::gpu_sched), read once: posture
+    // keeps CAP_SYS_NICE permitted only when the policy needs it.
+    let guest_sched = device::gpu_sched::GuestSched::from_env();
+    device::posture::enforce_keeping_nice(guest_sched.wants_nice())?;
     log::info!("open file limit {}", device::sandbox::raise_nofile());
 
     // The sandbox, before anything else: Landlock and seccomp cover this
