@@ -635,7 +635,8 @@ struct nb_wl {
     bool      gcs_shown;
     int       gcs_slot;         /* gc[] slot attached, -1 none             */
     struct nb_rect gcs_rect;    /* where it sits, window coordinates       */
-    bool      gcs_cb, gcs_dirty;
+    struct wl_callback *gcs_cb; /* frame callback outstanding, or NULL      */
+    bool      gcs_dirty;
     bool      gp_valid;
     int       gp_x, gp_y;       /* the hotspot, guest frame pixels         */
     bool      gc_on;            /* the guest shows a cursor                */
@@ -6224,7 +6225,10 @@ static void gcs_done(void *data, struct wl_callback *cb, uint32_t t)
 
     (void)t;
     wl_callback_destroy(cb);
-    w->gcs_cb = false;
+    if (cb != w->gcs_cb) {
+        return;                 /* abandoned with a hide */
+    }
+    w->gcs_cb = NULL;
     if (w->gcs_dirty) {
         wl_gcs_update(w);
     }
@@ -6244,6 +6248,12 @@ static void wl_gcs_hide(struct nb_wl *w)
     }
     w->gcs_shown = false;
     w->gcs_slot = -1;
+    /* An unmapped surface may never get its callback: drop it, or the next
+     * show would wait on it forever. */
+    if (w->gcs_cb) {
+        wl_callback_destroy(w->gcs_cb);
+        w->gcs_cb = NULL;
+    }
     wl_surface_attach(w->gcs_surf, NULL, 0, 0);
     wl_surface_commit(w->gcs_surf);
     wl_display_flush(w->dpy);
@@ -6317,11 +6327,9 @@ static void wl_gcs_update(struct nb_wl *w)
     }
     w->gcs_rect = r;
     if (!w->gcs_cb) {
-        struct wl_callback *cb = wl_surface_frame(w->gcs_surf);
-
-        if (cb) {
-            wl_callback_add_listener(cb, &gcs_cb_listener, w);
-            w->gcs_cb = true;
+        w->gcs_cb = wl_surface_frame(w->gcs_surf);
+        if (w->gcs_cb) {
+            wl_callback_add_listener(w->gcs_cb, &gcs_cb_listener, w);
         }
     }
     wl_surface_commit(w->gcs_surf);
@@ -6700,6 +6708,9 @@ static void wl_close_session(struct nb_session *s)
         if (w->gc[i].buf) {
             wl_buffer_destroy(w->gc[i].buf);
         }
+    }
+    if (w->gcs_cb) {
+        wl_callback_destroy(w->gcs_cb);
     }
     if (w->gcs_vp) {
         wp_viewport_destroy(w->gcs_vp);
