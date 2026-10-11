@@ -22,13 +22,23 @@
 # instruction pointer first) for symbolizing on the host, e.g. with the
 # package's PDBs next to the DLLs:
 #   llvm-symbolizer --obj=helios_umd.dll 0x$(printf %x $((0x180000000 + 0xOFFSET)))
+#
+# -Qpc prefixes every raw line with "@<ms>", the QPC time of the sample in
+# milliseconds: the same clock as PresentMon's CPUStartQPCTime (run PresentMon
+# with --qpc_time_ms), so tools/pm-sample-split.py can split the samples into
+# slow and fast frames. Run one sampler per thread, in parallel.
+#
+# "== syscall stubs" names the ntdll/win32u offsets that are system-call stubs
+# (NtDelayExecution = Sleep, NtYieldExecution = SwitchToThread/Sleep(0),
+# NtWaitForAlertByThreadId = SRW lock / condition variable / WaitOnAddress, ...).
 param(
     [Parameter(Mandatory = $true)][string]$Process,
     [string]$Thread = '',
     [int]$Samples = 3000,
     [int]$Seconds = 5,
     [string]$Focus = 'helios_umd.dll',
-    [switch]$Raw
+    [switch]$Raw,
+    [switch]$Qpc
 )
 
 Add-Type -TypeDefinition @"
@@ -46,6 +56,17 @@ public static class ThreadSample {
  [DllImport("ntdll.dll")] static extern int NtQueryInformationThread(IntPtr h, int c, out IntPtr v, int l, IntPtr r);
  [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint p);
  [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint p);
+ [DllImport("kernel32.dll")] static extern bool QueryPerformanceCounter(out long c);
+ [DllImport("kernel32.dll", CharSet = CharSet.Ansi)] static extern IntPtr GetModuleHandleA(string n);
+ [DllImport("kernel32.dll", CharSet = CharSet.Ansi)] static extern IntPtr LoadLibraryA(string n);
+ [DllImport("kernel32.dll", CharSet = CharSet.Ansi)] static extern IntPtr GetProcAddress(IntPtr m, string n);
+ // Address of an export of a system DLL; system DLLs load at the same address
+ // in every process of a boot, so this names stubs in the sampled process.
+ public static long Export(string dll, string name) {
+  IntPtr m = GetModuleHandleA(dll); if (m == IntPtr.Zero) m = LoadLibraryA(dll);
+  if (m == IntPtr.Zero) return 0;
+  return GetProcAddress(m, name).ToInt64();
+ }
  const int QUERY_LIMITED = 0x0800, QUERY = 0x0040, SUSPEND_RESUME = 0x0002, GET_CONTEXT = 0x0008;
  public static string Name(int id) {
   IntPtr h = OpenThread(QUERY_LIMITED, false, id); if (h == IntPtr.Zero) return "";
@@ -58,7 +79,7 @@ public static class ThreadSample {
   IntPtr v; NtQueryInformationThread(h, 9 /* ThreadQuerySetWin32StartAddress */, out v, IntPtr.Size, IntPtr.Zero);
   CloseHandle(h); return v.ToInt64();
  }
- // Each sample: the instruction pointer, then up to 11 stack words that fall in [lo, hi).
+ // Each sample: the QPC time, the instruction pointer, then up to 11 stack words that fall in [lo, hi).
  public static List<long[]> Run(int pid, int tid, int n, long[] lo, long[] hi) {
   const int STACK = 4096, CONTEXT_BYTES = 1232, CONTEXT_CONTROL = 0x100001;
   var res = new List<long[]>();
@@ -75,6 +96,7 @@ public static class ThreadSample {
     for (int k = 0; k < CONTEXT_BYTES; k += 8) Marshal.WriteInt64(ctx, k, 0);
     Marshal.WriteInt32(ctx, 0x30, CONTEXT_CONTROL);
     if (SuspendThread(th) == 0xFFFFFFFF) break;
+    long now; QueryPerformanceCounter(out now);
     bool ok = GetThreadContext(th, ctx);
     long rip = Marshal.ReadInt64(ctx, 0xF8), rsp = Marshal.ReadInt64(ctx, 0x98);
     // A shallow stack ends less than STACK bytes above rsp and the full read fails:
@@ -83,8 +105,8 @@ public static class ThreadSample {
     while (ok && !rd && len >= 256) { rd = ReadProcessMemory(ph, new IntPtr(rsp), stk, len, out got); if (!rd) len /= 2; }
     ResumeThread(th);
     if (!ok) continue;
-    var s = new List<long> { rip };
-    if (rd) for (int o = 0; o + 8 <= len && s.Count < 12; o += 8) {
+    var s = new List<long> { now, rip };
+    if (rd) for (int o = 0; o + 8 <= len && s.Count < 13; o += 8) {
      long v = BitConverter.ToInt64(stk, o);
      for (int m = 0; m < lo.Length; m++) if (v >= lo[m] && v < hi[m]) { s.Add(v); break; }
     }
@@ -134,7 +156,10 @@ else { $tid = ($p.Threads | Where-Object { [ThreadSample]::Name($_.Id) -eq $Thre
 if (-not $tid) { Write-Error "no thread '$Thread' in $Process"; exit 1 }
 
 $lo = [long[]]($mods | ForEach-Object { $_.B }); $hi = [long[]]($mods | ForEach-Object { $_.E })
-$res = [ThreadSample]::Run($p.Id, $tid, $Samples, $lo, $hi)
+$withTime = [ThreadSample]::Run($p.Id, $tid, $Samples, $lo, $hi)
+$qpcFreq = [System.Diagnostics.Stopwatch]::Frequency
+$times = @($withTime | ForEach-Object { $_[0] })
+$res = @($withTime | ForEach-Object { ,($_[1..($_.Count - 1)]) })
 "$Process thread $Thread (tid $tid): $($res.Count) samples"
 '== module (instruction pointer)'
 Top ($res | ForEach-Object { (Where-Addr $_[0]).Split('+')[0] }) 15
@@ -148,10 +173,43 @@ Top ($res | ForEach-Object {
     }) 40
 '== modules anywhere in the sample'
 Top ($res | ForEach-Object { $_ | ForEach-Object { (Where-Addr $_).Split('+')[0] } | Select-Object -Unique }) 15
+'== syscall stubs'
+$stubNames = @(
+    'ntdll.dll:NtWaitForSingleObject', 'ntdll.dll:NtWaitForMultipleObjects', 'ntdll.dll:NtDelayExecution',
+    'ntdll.dll:NtYieldExecution', 'ntdll.dll:NtWaitForAlertByThreadId', 'ntdll.dll:NtAlertThreadByThreadId',
+    'ntdll.dll:NtRemoveIoCompletion', 'ntdll.dll:NtRemoveIoCompletionEx', 'ntdll.dll:NtSignalAndWaitForSingleObject',
+    'ntdll.dll:NtWaitForWorkViaWorkerFactory', 'ntdll.dll:NtWaitForKeyedEvent', 'ntdll.dll:NtReleaseKeyedEvent',
+    'ntdll.dll:NtSetEvent', 'ntdll.dll:NtResetEvent', 'ntdll.dll:NtSetTimerEx', 'ntdll.dll:NtQuerySystemTime',
+    'ntdll.dll:NtFreeVirtualMemory', 'ntdll.dll:NtAllocateVirtualMemory', 'ntdll.dll:NtProtectVirtualMemory',
+    'ntdll.dll:NtQueryVirtualMemory', 'ntdll.dll:NtDeviceIoControlFile', 'ntdll.dll:NtWriteFile', 'ntdll.dll:NtReadFile',
+    'ntdll.dll:NtClose', 'ntdll.dll:NtFlushProcessWriteBuffers', 'ntdll.dll:NtQueryPerformanceCounter',
+    'win32u.dll:NtGdiDdDDIEscape', 'win32u.dll:NtGdiDdDDIPresent', 'win32u.dll:NtGdiDdDDILock2', 'win32u.dll:NtGdiDdDDIUnlock2',
+    'win32u.dll:NtGdiDdDDIWaitForSynchronizationObjectFromCpu', 'win32u.dll:NtGdiDdDDISignalSynchronizationObjectFromCpu',
+    'win32u.dll:NtGdiDdDDIGetDeviceState', 'win32u.dll:NtGdiDdDDIMakeResident', 'win32u.dll:NtGdiDdDDIQueryAdapterInfo',
+    'win32u.dll:NtGdiDdDDISubmitCommand', 'win32u.dll:NtGdiDdDDIRender', 'win32u.dll:NtGdiDdDDICreateAllocation',
+    'win32u.dll:NtGdiDdDDIDestroyAllocation2', 'win32u.dll:NtGdiDdDDIPresentMultiPlaneOverlay3',
+    'win32u.dll:NtGdiDdDDIGetScanLine', 'win32u.dll:NtGdiDdDDIWaitForVerticalBlankEvent2', 'win32u.dll:NtUserGetMessage',
+    'win32u.dll:NtUserPeekMessage', 'win32u.dll:NtUserMsgWaitForMultipleObjectsEx')
+$stubs = foreach ($n in $stubNames) {
+    $dll, $fn = $n.Split(':')
+    $a = [ThreadSample]::Export($dll, $fn)
+    if ($a -ne 0) { [pscustomobject]@{ N = "$dll!$fn"; A = $a; W = (Where-Addr $a) } }
+}
+$seenIp = $res | ForEach-Object { $_[0] } | Sort-Object -Unique
+foreach ($st in $stubs) {
+    $hits = @($seenIp | Where-Object { $_ -ge $st.A -and $_ -lt $st.A + 0x20 })
+    foreach ($h in $hits) { '{0} {1}' -f (Where-Addr $h), $st.N }
+}
 '== module bases'
 $mods | Where-Object { $_.N -match 'helios|d3d11|dxgi|vulkan|rmclient|ntdll|win32u|KERNELBASE' } |
     ForEach-Object { '{0} {1:x}' -f $_.N, $_.B }
 if ($Raw) {
     '== raw'
-    $res | ForEach-Object { ($_ | ForEach-Object { Where-Addr $_ }) -join ' ' }
+    for ($i = 0; $i -lt $res.Count; $i++) {
+        $line = ($res[$i] | ForEach-Object { Where-Addr $_ }) -join ' '
+        if ($Qpc) {
+            $line = [string]::Format([cultureinfo]::InvariantCulture, '@{0:F3} ', $times[$i] * 1000.0 / $qpcFreq) + $line
+        }
+        $line
+    }
 }

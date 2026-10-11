@@ -111,6 +111,10 @@ struct Stats {
     drain_wait_us: AtomicU64,
     drain_wait_max_us: AtomicU64,
     full_waits: AtomicU64,
+    full_wait_us: AtomicU64,
+    /// Time the worker spent running records (updated every batch and when
+    /// the ring runs empty).
+    worker_busy_us: AtomicU64,
     parks: AtomicU64,
     wakes: AtomicU64,
     retire_queued: AtomicU64,
@@ -159,6 +163,12 @@ pub struct CmdQueue {
     wait_cv: Condvar,
     retire: Mutex<VecDeque<Retire>>,
     retire_pending: AtomicBool,
+    /// Destructions taken out of `retire` (counted under its lock) and those
+    /// finished since: [`CmdQueue::run_ready_retired`] waits until every one
+    /// dequeued before it looked has finished. Counters, not a lock held over
+    /// the destroy bodies, so the worker never waits on another thread here.
+    retire_taken: AtomicU64,
+    retire_finished: AtomicU64,
     stats: Line<Stats>,
     name: String,
     /// True once waiting for the worker is pointless (process teardown has
@@ -222,6 +232,8 @@ impl CmdQueue {
             wait_cv: Condvar::new(),
             retire: Mutex::new(VecDeque::new()),
             retire_pending: AtomicBool::new(false),
+            retire_taken: AtomicU64::new(0),
+            retire_finished: AtomicU64::new(0),
             stats: Line(Stats::default()),
             name: name.to_string(),
             abandoned: std::sync::OnceLock::new(),
@@ -326,7 +338,12 @@ impl CmdQueue {
             let mut r = self.read.0.load(Ordering::Acquire);
             if r < need_read {
                 self.stats.0.full_waits.fetch_add(1, Ordering::Relaxed);
+                let t0 = Instant::now();
                 self.wait_done(need_read);
+                self.stats
+                    .0
+                    .full_wait_us
+                    .fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                 r = self.read.0.load(Ordering::Acquire);
             }
             self.prod.read_cache.store(r, Ordering::Relaxed);
@@ -350,10 +367,15 @@ impl CmdQueue {
             (p.add(HEADER_BYTES) as *mut F).write(f);
             fill(core::slice::from_raw_parts_mut(p.add(extra_off), extra_len));
         }
-        self.prod.write.store(end, Ordering::Release);
-        // Cheap check; a wake this misses is caught by the worker's short park
-        // timeout and by every waiting path's full kick.
-        if self.sleeping.0.load(Ordering::Relaxed) {
+        // SeqCst (a locked exchange on x86, ~20 cycles): the store must be
+        // visible before `sleeping` is read. With a plain release store the
+        // load can pass it (store-load reordering): the worker announces sleep
+        // and still sees the old cursor while this sees `sleeping == false`,
+        // and the record waits out the worker's park (4 ms after the first
+        // idle park, 50 ms after a quarter second) or the next kick. The
+        // worker side is already ordered (SeqCst store, then the re-check).
+        self.prod.write.store(end, Ordering::SeqCst);
+        if self.sleeping.0.load(Ordering::SeqCst) {
             self.wake_worker();
         }
         Ok(end)
@@ -485,17 +507,49 @@ impl CmdQueue {
 
     /// Run, on the calling thread, the queued destructions the worker has
     /// already passed (callers that must not overtake them, e.g. a resource
-    /// destroy that follows destroys of its views).
+    /// destroy that follows destroys of its views), then wait for any another
+    /// thread (the worker) took out of the queue earlier and is still running:
+    /// on return, every destruction queued at or before [`done`](Self::done)
+    /// has finished. Two loads when there is nothing to run or wait for.
     pub fn run_ready_retired(&self) {
-        self.run_retired(false);
-    }
-
-    fn run_retired(&self, all: bool) {
-        if !self.retire_pending.load(Ordering::Acquire) {
+        let taken = if self.retire_pending.load(Ordering::Acquire) {
+            self.run_retired(false)
+        } else {
+            self.retire_taken.load(Ordering::Acquire)
+        };
+        if self.retire_finished.load(Ordering::Acquire) >= taken {
             return;
         }
+        // Destroy bodies are short (a cache eviction, a COM release): spin,
+        // then sleep on the waiter condvar the worker signals.
+        let t0 = Instant::now();
+        while t0.elapsed() < WAITER_SPIN {
+            if self.retire_finished.load(Ordering::Acquire) >= taken {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        let mut g = lock(&self.wait_lock);
+        self.waiters.0.fetch_add(1, Ordering::SeqCst);
+        while self.retire_finished.load(Ordering::SeqCst) < taken && !self.is_abandoned() {
+            g = self
+                .wait_cv
+                .wait_timeout(g, PARK_SHORT)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        self.waiters.0.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Runs the ready (or, with `all`, every) queued destruction on this
+    /// thread. Returns the dequeue count as of this call, the bound a
+    /// [`run_ready_retired`](Self::run_ready_retired) caller waits for.
+    fn run_retired(&self, all: bool) -> u64 {
+        if !self.retire_pending.load(Ordering::Acquire) {
+            return self.retire_taken.load(Ordering::Acquire);
+        }
         let done = self.read.0.load(Ordering::Acquire);
-        let ready: Vec<Retire> = {
+        let (ready, taken): (Vec<Retire>, u64) = {
             let mut q = lock(&self.retire);
             let mut ready = Vec::new();
             let mut i = 0;
@@ -507,11 +561,25 @@ impl CmdQueue {
                 }
             }
             self.retire_pending.store(!q.is_empty(), Ordering::Release);
-            ready
+            // Under the queue lock: a later caller that takes the lock sees
+            // these as taken and waits for them to finish.
+            let n = ready.len() as u64;
+            (ready, self.retire_taken.fetch_add(n, Ordering::AcqRel) + n)
         };
+        if ready.is_empty() {
+            return taken;
+        }
+        let n = ready.len() as u64;
         for r in ready {
             (r.run)();
         }
+        self.retire_finished.fetch_add(n, Ordering::AcqRel);
+        fence(Ordering::SeqCst);
+        if self.waiters.0.load(Ordering::Relaxed) != 0 {
+            let _g = lock(&self.wait_lock);
+            self.wait_cv.notify_all();
+        }
+        taken
     }
 
     /// Record an error a worker-side call wanted to report. `priority` decides
@@ -574,6 +642,19 @@ impl CmdQueue {
         // SAFETY: nothing else consumes the ring once the worker has exited.
         while unsafe { self.run_one() } {}
         self.run_retired(true);
+    }
+
+    /// Pushes that found the ring full, and the microseconds they waited
+    /// (cumulative).
+    pub fn full_waits(&self) -> (u64, u64) {
+        let s = &self.stats.0;
+        (s.full_waits.load(Ordering::Relaxed), s.full_wait_us.load(Ordering::Relaxed))
+    }
+
+    /// Microseconds the worker has spent running records (cumulative; lags by
+    /// at most one batch of records).
+    pub fn worker_busy_us(&self) -> u64 {
+        self.stats.0.worker_busy_us.load(Ordering::Relaxed)
     }
 
     /// One bounded line of counters.
@@ -646,18 +727,39 @@ impl CmdQueue {
         CURRENT_WORKER.with(|c| c.set(Arc::as_ptr(&self) as usize));
         let mut since_check = 0u32;
         let mut idle_parks = 0u32;
+        // Start of the current busy stretch (records running).
+        let mut busy_since: Option<Instant> = None;
+        let note_busy = |since: &mut Option<Instant>, keep: bool| {
+            if let Some(t) = since.take() {
+                let now = Instant::now();
+                self.stats
+                    .0
+                    .worker_busy_us
+                    .fetch_add(now.duration_since(t).as_micros() as u64, Ordering::Relaxed);
+                if keep {
+                    *since = Some(now);
+                }
+            }
+        };
         loop {
+            // The clock starts before the first record of a stretch runs.
+            let started = if busy_since.is_none() { Some(Instant::now()) } else { None };
             // SAFETY: this is the only consumer.
             if unsafe { self.run_one() } {
+                if busy_since.is_none() {
+                    busy_since = started;
+                }
                 since_check += 1;
                 if since_check >= BATCH {
                     self.stats.0.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
                     since_check = 0;
+                    note_busy(&mut busy_since, true);
                     self.after_batch();
                 }
                 idle_parks = 0;
                 continue;
             }
+            note_busy(&mut busy_since, false);
             self.stats.0.records.fetch_add(u64::from(since_check), Ordering::Relaxed);
             since_check = 0;
             self.after_batch();
@@ -806,6 +908,44 @@ mod tests {
         q.drain();
         assert_eq!(next.load(Ordering::Relaxed), 3000);
         assert!(q.summary().contains("full_waits="));
+        q.shutdown();
+    }
+
+    #[test]
+    fn a_push_wakes_a_worker_in_a_long_park() {
+        let q = CmdQueue::new(MIN_RING_BYTES, "t-wake");
+        let ran = Arc::new(Mutex::new(None::<Instant>));
+        for _ in 0..5 {
+            // Idle long enough that the worker is in its PARK_LONG naps.
+            std::thread::sleep(Duration::from_millis(300));
+            let r = Arc::clone(&ran);
+            let t0 = Instant::now();
+            unsafe { q.push(0, |_| {}, move |_: &[u8]| *lock(&r) = Some(Instant::now())).unwrap() };
+            spin_until(|| lock(&ran).is_some());
+            let dt = lock(&ran).take().unwrap().duration_since(t0);
+            // A missed wake would wait out the 50 ms park.
+            assert!(dt < Duration::from_millis(25), "record ran {dt:?} after its push");
+        }
+        q.shutdown();
+    }
+
+    #[test]
+    fn full_wait_time_and_worker_busy_time_are_counted() {
+        let q = CmdQueue::new(MIN_RING_BYTES, "t-busy");
+        // Each record sleeps 1 ms and fills a quarter of the ring, so the
+        // producer finds it full and the worker is busy ~20 ms in all.
+        for _ in 0..20 {
+            unsafe {
+                q.push(MIN_RING_BYTES / 4 - 64, |_| {}, |_: &[u8]| std::thread::sleep(Duration::from_millis(1)))
+                    .unwrap();
+            }
+        }
+        q.drain();
+        let (n, us) = q.full_waits();
+        assert!(n > 0, "the producer never found the ring full");
+        assert!(us >= 1000, "full waits took {us} us");
+        // Wait for the worker to account its last stretch (on ring empty).
+        spin_until(|| q.worker_busy_us() >= 20_000);
         q.shutdown();
     }
 
@@ -996,6 +1136,243 @@ mod tests {
         let r2 = Arc::clone(&r);
         unsafe { q.retire(u64::MAX, move || r2.store(true, Ordering::Relaxed)) };
         assert!(r.load(Ordering::Relaxed));
+    }
+
+    /// Blocks the worker on its first record until the returned gate opens,
+    /// so the producer runs ahead of the replay as a game's render thread does.
+    fn gated(q: &Arc<CmdQueue>) -> Arc<AtomicBool> {
+        let gate = Arc::new(AtomicBool::new(false));
+        let g = Arc::clone(&gate);
+        unsafe {
+            q.push(0, |_| {}, move |_: &[u8]| {
+                while !g.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            })
+            .unwrap();
+        }
+        gate
+    }
+
+    #[test]
+    fn replay_sees_recorded_bytes_after_the_app_reuses_its_memory() {
+        // The UpdateSubresourceUP / constant-data class: the app's memory is
+        // rewritten (and freed) right after each call, long before the
+        // worker replays it; every replay must see what the call passed.
+        let q = CmdQueue::new(1 << 16, "t-byvalue");
+        let gate = gated(&q);
+        let bad = Arc::new(AtomicU64::new(0));
+        let mut app = vec![0u8; 256];
+        for i in 0..200u32 {
+            app.iter_mut().for_each(|b| *b = i as u8);
+            let bad = Arc::clone(&bad);
+            unsafe {
+                q.push(
+                    app.len(),
+                    |dst| dst.copy_from_slice(&app),
+                    move |payload: &[u8]| {
+                        if payload.iter().any(|&b| b != i as u8) {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
+                )
+                .unwrap();
+            }
+            app.iter_mut().for_each(|b| *b = 0xa5); // the app reuses its memory
+        }
+        drop(app);
+        gate.store(true, Ordering::Release);
+        q.drain();
+        assert_eq!(bad.load(Ordering::Relaxed), 0);
+        q.shutdown();
+    }
+
+    /// One dynamic buffer the way the front end and DXVK patch 0018 split
+    /// `Map(WRITE_DISCARD)`: `map_ptr` is the app side's current slice
+    /// (`D3D11Buffer::m_mapPtr`, set at map time), `storage` the slice the
+    /// replayed stream sees (`DxvkBuffer`'s storage, set by the replayed
+    /// invalidate), `parked` the next slice the worker pre-allocated.
+    struct ModelBuffer {
+        map_ptr: AtomicUsize,
+        storage: AtomicUsize,
+        parked: AtomicUsize,
+        next_slice: AtomicUsize,
+        slices: Vec<Vec<AtomicU64>>,
+    }
+
+    impl ModelBuffer {
+        fn new(slices: usize, words: usize) -> Self {
+            Self {
+                map_ptr: AtomicUsize::new(0),
+                storage: AtomicUsize::new(0),
+                parked: AtomicUsize::new(usize::MAX),
+                next_slice: AtomicUsize::new(1),
+                slices: (0..slices).map(|_| (0..words).map(|_| AtomicU64::new(0)).collect()).collect(),
+            }
+        }
+
+        /// A fresh slice: never handed out before (DXVK's allocator only
+        /// returns memory the GPU is done with; the model never reuses).
+        fn alloc(&self) -> usize {
+            let s = self.next_slice.fetch_add(1, Ordering::Relaxed);
+            assert!(s < self.slices.len(), "model out of slices");
+            s
+        }
+    }
+
+    fn discard_split_model(park: bool) {
+        let q = CmdQueue::new(1 << 16, "t-discard");
+        let buf = Arc::new(ModelBuffer::new(4096, 8));
+        let bad = Arc::new(AtomicU64::new(0));
+        let draws = Arc::new(AtomicU64::new(0));
+        let gate = gated(&q);
+        let mut words_used = 0usize;
+        for i in 0..2000u64 {
+            // DISCARD every 8 draws (or when the slice is full), NO_OVERWRITE
+            // appends in between: CS2's constant and vertex streams.
+            if i % 8 == 0 || words_used == 8 {
+                let parked = buf.parked.swap(usize::MAX, Ordering::Acquire);
+                let slice = if parked != usize::MAX { parked } else { buf.alloc() };
+                buf.map_ptr.store(slice, Ordering::Relaxed);
+                words_used = 0;
+                let b = Arc::clone(&buf);
+                unsafe {
+                    q.push(0, |_| {}, move |_: &[u8]| {
+                        b.storage.store(slice, Ordering::Relaxed);
+                        if park && b.parked.load(Ordering::Relaxed) == usize::MAX {
+                            let next = b.alloc();
+                            let _ = b.parked.compare_exchange(usize::MAX, next, Ordering::Release, Ordering::Relaxed);
+                        }
+                    })
+                    .unwrap();
+                }
+            }
+            // The app writes through the pointer its map returned...
+            let slice = buf.map_ptr.load(Ordering::Relaxed);
+            let word = words_used;
+            words_used += 1;
+            buf.slices[slice][word].store(i + 1, Ordering::Relaxed);
+            // ...and records a draw that reads that word of whatever the
+            // replayed stream has bound at that point.
+            let (b, bad, draws) = (Arc::clone(&buf), Arc::clone(&bad), Arc::clone(&draws));
+            unsafe {
+                q.push(0, |_| {}, move |_: &[u8]| {
+                    let bound = b.storage.load(Ordering::Relaxed);
+                    if b.slices[bound][word].load(Ordering::Relaxed) != i + 1 {
+                        bad.fetch_add(1, Ordering::Relaxed);
+                    }
+                    draws.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+            }
+            if i == 1000 {
+                gate.store(true, Ordering::Release); // let the replay catch up mid-run
+            }
+        }
+        q.drain();
+        assert_eq!(draws.load(Ordering::Relaxed), 2000);
+        assert_eq!(bad.load(Ordering::Relaxed), 0, "a draw saw another slice's data");
+        q.shutdown();
+    }
+
+    #[test]
+    fn discard_split_keeps_every_draw_on_the_slice_it_wrote() {
+        discard_split_model(false);
+    }
+
+    #[test]
+    fn discard_split_with_parked_slices_keeps_every_draw_on_the_slice_it_wrote() {
+        discard_split_model(true);
+    }
+
+    #[test]
+    fn run_ready_retired_waits_for_a_destruction_the_worker_is_running() {
+        // A resource destroy must not overtake the destroy of one of its
+        // views, even when the worker dequeued that view's destroy first.
+        let q = CmdQueue::new(1 << 16, "t-retire-exec");
+        let gate = gated(&q);
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (s, f) = (Arc::clone(&started), Arc::clone(&finished));
+        unsafe {
+            q.retire(q.written(), move || {
+                s.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(50));
+                f.store(true, Ordering::Release);
+            });
+        }
+        gate.store(true, Ordering::Release);
+        spin_until(|| started.load(Ordering::Acquire));
+        // The resource destroy's order: wait for the worker, then run (or
+        // wait for) the ready destructions.
+        q.wait_done(q.written());
+        q.run_ready_retired();
+        assert!(finished.load(Ordering::Acquire), "returned while a view destroy was still running");
+        q.shutdown();
+    }
+
+    #[test]
+    fn the_worker_never_waits_for_a_destruction_another_thread_runs() {
+        // A streaming thread's resource destroy runs a slow ready destruction
+        // itself; meanwhile another destruction becomes ready and records keep
+        // coming. The worker must keep replaying records (running the new
+        // destruction itself) instead of waiting for the other thread.
+        let q = CmdQueue::new(1 << 16, "t-retire-noblock");
+        let gate1 = gated(&q);
+        let pos = q.written();
+        let in_slow = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&in_slow);
+        unsafe {
+            q.retire(pos, move || {
+                s.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(300));
+            });
+        }
+        // The worker finishes gate 1 (passing `pos`) and blocks in gate 2
+        // before its batch boundary, so the helper is the one to take the
+        // slow destruction.
+        let gate2 = gated(&q);
+        gate1.store(true, Ordering::Release);
+        spin_until(|| q.done() >= pos);
+        let helper = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || q.run_ready_retired())
+        };
+        spin_until(|| in_slow.load(Ordering::Acquire));
+        // A second destruction, ready once gate 2 is passed, and records.
+        unsafe { q.retire(q.written(), || {}) };
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+        unsafe { q.push(0, |_| {}, move |_: &[u8]| r.store(true, Ordering::Release)).unwrap() };
+        let t0 = Instant::now();
+        gate2.store(true, Ordering::Release);
+        // Past the second destruction's batch boundary: the worker's ring
+        // runs empty after the record above, then another record follows.
+        spin_until(|| ran.load(Ordering::Acquire));
+        let p3 = q.written();
+        unsafe { q.push(0, |_| {}, |_: &[u8]| {}).unwrap() };
+        spin_until(|| q.done() >= p3 + 1);
+        let waited = t0.elapsed();
+        assert!(
+            waited < Duration::from_millis(150),
+            "worker blocked {waited:?} behind another thread's destruction"
+        );
+        helper.join().unwrap();
+        q.shutdown();
+    }
+
+    #[test]
+    fn a_waited_push_has_run_when_the_wait_returns() {
+        // The front end's serial A/B mode: push, then wait for that record.
+        let q = CmdQueue::new(MIN_RING_BYTES, "t-serial");
+        let n = Arc::new(AtomicU64::new(0));
+        for i in 0..500u64 {
+            let c = Arc::clone(&n);
+            let pos = unsafe { q.push(0, |_| {}, move |_: &[u8]| { c.fetch_add(1, Ordering::Relaxed); }).unwrap() };
+            q.wait_done(pos);
+            assert_eq!(n.load(Ordering::Relaxed), i + 1);
+        }
+        q.shutdown();
     }
 
     /// Producer-side cost per record with the worker consuming:

@@ -12,7 +12,8 @@
 //! Arrays go into the record's trailing bytes, each starting 8-byte aligned,
 //! written by [`Pack`] and read back in the same order by [`Unpack`].
 //!
-//! Pure `core`: builds and tests on the Linux host.
+//! Pure Rust (`core`, plus `std` strings for a log line): builds and tests on
+//! the Linux host.
 
 use core::ffi::c_void;
 use core::mem::{size_of, MaybeUninit};
@@ -177,6 +178,67 @@ pub unsafe fn with_pseudo_handles<R>(
     f(arr.as_ptr() as *const *mut c_void)
 }
 
+/// Front-end call classes an A/B run can force onto the synchronous path
+/// (`UmdFrontendSync`, a REG_DWORD bitmask; 0 = every class threaded as
+/// designed). Each bit takes one mechanism out of play, so a rendering
+/// difference between front end on and off can be pinned to the class that
+/// causes it without a rebuild.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrontendSync(pub u32);
+
+impl FrontendSync {
+    /// Dynamic-buffer `Map(WRITE_DISCARD / WRITE_NO_OVERWRITE)`: drain, then
+    /// DXVK's own `Map` on the app thread (no split discard).
+    pub const MAPS: u32 = 1 << 0;
+    /// Buffer `UpdateSubresourceUP`: drain and run inline (no payload copy).
+    pub const UPDATES: u32 = 1 << 1;
+    /// View / state / shader / layout / query / command-list destruction:
+    /// drain and destroy inline (no retire queue).
+    pub const DESTROYS: u32 = 1 << 2;
+    /// `QueryGetData`: drain, then the unchanged forward call (no early
+    /// "still drawing", no flush hint record).
+    pub const QUERIES: u32 = 1 << 3;
+    /// No pre-allocated discard slices: the worker's replay of a discard
+    /// does not park the buffer's next slice (DXVK patch 0018).
+    pub const NO_PARK: u32 = 1 << 4;
+    /// Every record is waited for before the DDI returns: the calls still run
+    /// on the worker, in order, but never overlap the app thread. Separates
+    /// "which thread enters DXVK" from "the app runs ahead of the replay".
+    pub const SERIAL: u32 = 1 << 5;
+    /// `Flush`: drain and run the forward flush inline.
+    pub const FLUSH: u32 = 1 << 6;
+    /// Every bit above.
+    pub const ALL: u32 = (1 << 7) - 1;
+
+    pub const fn new(bits: u32) -> Self {
+        Self(bits & Self::ALL)
+    }
+
+    #[inline(always)]
+    pub const fn has(self, bit: u32) -> bool {
+        self.0 & bit != 0
+    }
+
+    /// The set bits by name, for the front end's start-up log line.
+    pub fn names(self) -> String {
+        const NAMES: [(u32, &str); 7] = [
+            (FrontendSync::MAPS, "maps"),
+            (FrontendSync::UPDATES, "updates"),
+            (FrontendSync::DESTROYS, "destroys"),
+            (FrontendSync::QUERIES, "queries"),
+            (FrontendSync::NO_PARK, "no_park"),
+            (FrontendSync::SERIAL, "serial"),
+            (FrontendSync::FLUSH, "flush"),
+        ];
+        let v: Vec<&str> = NAMES.iter().filter(|(b, _)| self.has(*b)).map(|(_, n)| *n).collect();
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(",")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +329,36 @@ mod tests {
             assert_eq!(s as usize % 8, 0);
             assert_eq!(v as usize % 8, 0);
         }
+    }
+
+    #[test]
+    fn frontend_sync_masks_unknown_bits_and_names_the_set_ones() {
+        assert_eq!(FrontendSync::new(0).names(), "none");
+        let f = FrontendSync::new(FrontendSync::MAPS | FrontendSync::SERIAL | 0x8000_0000);
+        assert!(f.has(FrontendSync::MAPS) && f.has(FrontendSync::SERIAL));
+        assert!(!f.has(FrontendSync::UPDATES));
+        assert_eq!(f.0, FrontendSync::MAPS | FrontendSync::SERIAL);
+        assert_eq!(f.names(), "maps,serial");
+        assert_eq!(
+            FrontendSync::new(u32::MAX).names(),
+            "maps,updates,destroys,queries,no_park,serial,flush"
+        );
+    }
+
+    #[test]
+    fn payload_copies_survive_the_app_reusing_its_memory() {
+        // UpdateSubresourceUP, viewports, blend factors: the record owns a
+        // copy, so what the app writes into its own memory after the call
+        // returns never reaches the replay.
+        let mut app = vec![0x11u8; 40];
+        let mut buf = Aligned([0; 512]);
+        let mut p = Pack::new(&mut buf.0);
+        unsafe { p.copy(app.as_ptr(), app.len()) };
+        app.iter_mut().for_each(|b| *b = 0xee);
+        drop(app);
+        let got = Unpack::new(&buf.0).array::<u8>(40, false);
+        let got = unsafe { core::slice::from_raw_parts(got, 40) };
+        assert!(got.iter().all(|&b| b == 0x11));
     }
 
     #[test]

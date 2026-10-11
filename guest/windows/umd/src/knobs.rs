@@ -18,7 +18,8 @@
 //! | Value | Type | Absent |
 //! |---|---|---|
 //! | `UmdTrace` | DWORD | `false` (explicit non-zero enables) |
-//! | `UmdTimerRes` | DWORD | `true` (explicit 0 disables our timer request) |
+//! | `UmdTimerRes` | DWORD | `1` (0 = no timer request, 1 = `timeBeginPeriod(1)`, >= 2 = `NtSetTimerResolution` in 100 ns units, e.g. 5000 = 0.5 ms) |
+//! | `UmdFrameTrace` | DWORD | `0` (non-zero: per-Present timing CSV of the threaded front end, `C:\ProgramData\Helios\frametrace-<pid>.csv`) |
 //! | `FeatureLevel11` | DWORD | `1` |
 //! | `VehicleFlipGateUs` | DWORD | `32000` |
 //! | `ScanoutAcquire` | DWORD | `true` (explicit 0 is the kill switch) |
@@ -28,8 +29,9 @@
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
-//! | `UmdThreadedFrontend` | DWORD | `1` (threaded D3D11 front end: 0 = off, 1 = all but dwm.exe, 2 = all; env `HELIOS_D3D11_FRONTEND=0/1`) |
+//! | `UmdThreadedFrontend` | DWORD | `0` (threaded D3D11 front end: 0 = off, 1 = all but dwm.exe, 2 = all; env `HELIOS_D3D11_FRONTEND=0/1`) |
 //! | `UmdFrontendRingKiB` | DWORD | `4096` (its command ring, clamped 256..65536) |
+//! | `UmdFrontendSync` | DWORD | `0` (front-end call classes forced synchronous, a bitmask for A/B runs: 1 maps, 2 updates, 4 destroys, 8 queries, 16 no parked slices, 32 serial, 64 flush) |
 //! | `UmdDdiLevel` | DWORD | `0x10` (D3D11 DDI WDDM1.3; `0x24` adds WDDM2.3) |
 //! | `UmdDdiLevelDwm` | DWORD | `0x10` (the same, dwm.exe only) |
 //! | `UmdDdiAllowList` | REG_SZ | absent (`;`-separated executables that get WDDM2.3) |
@@ -81,7 +83,17 @@ pub(crate) static UMD_TRACE: BoolKnob = BoolKnob::new(c"UmdTrace", false);
 /// Native DXGI bypasses DXVK's swapchain timer setup. On 2026-09-12, PassMark's
 /// Venus polling sleeps lasted about 11 ms; a process-local 1 ms request raised
 /// its active DX11 frame rate from about 16 to 31 FPS. Keep 0 for paired A/B runs.
-pub(crate) static UMD_TIMER_RESOLUTION: BoolKnob = BoolKnob::new(c"UmdTimerRes", true);
+///
+/// 0 = no request, 1 = `timeBeginPeriod(1)` (the default), any larger value =
+/// `NtSetTimerResolution(value)` in 100 ns units (5000 = 0.5 ms, the usual
+/// minimum): an A/B lever for game threads that wait in `Sleep(1)`. The
+/// resolution in force is logged once at device creation.
+pub(crate) static UMD_TIMER_RESOLUTION: DwordKnob = DwordKnob::new(c"UmdTimerRes", 1);
+
+/// Per-Present timing trace of the threaded front end (`helios_umd_common::
+/// frame_trace`). Absent/0 = off; non-zero = on. Only devices with the front
+/// end (`UmdThreadedFrontend`) trace.
+pub(crate) static UMD_FRAME_TRACE: DwordKnob = DwordKnob::new(c"UmdFrameTrace", 0);
 
 /// Feature-level profile selector. Absent = 1 (the full FL11 profile).
 pub(crate) static FEATURE_LEVEL_11: DwordKnob = DwordKnob::new(c"FeatureLevel11", 1);
@@ -220,10 +232,10 @@ pub(crate) fn log_knob_inventory() {
     helios_umd_common::log::log_knob_inventory(&resolved_inventory());
 }
 
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 14] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
-        ("UmdTimerRes", UMD_TIMER_RESOLUTION.get() as u32),
+        ("UmdTimerRes", UMD_TIMER_RESOLUTION.get()),
         ("FeatureLevel11", FEATURE_LEVEL_11.get()),
         ("VehicleFlipGateUs", VEHICLE_FLIP_GATE_US.get()),
         ("ScanoutAcquire", SCANOUT_ACQUIRE.get() as u32),
@@ -235,6 +247,7 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
         ("UmdDeferredDiagnostics", UMD_DEFERRED_DIAGNOSTICS.get() as u32),
         ("UmdDdiLevel", UMD_DDI_LEVEL.get()),
         ("UmdDdiLevelDwm", UMD_DDI_LEVEL_DWM.get()),
+        ("UmdFrameTrace", UMD_FRAME_TRACE.get()),
     ]
 }
 
@@ -365,9 +378,18 @@ pub(crate) fn umd_deferred_diagnostics() -> bool {
 }
 
 /// `UmdThreadedFrontend`: the D3D11 threaded front end
-/// (`docs/d3d11-threaded-frontend.md`). 0 = off, 1 (default) = on for every
+/// (`docs/d3d11-threaded-frontend.md`). 0 (default) = off, 1 = on for every
 /// process except dwm.exe, 2 = on including dwm.exe.
-pub(crate) static UMD_THREADED_FRONTEND: DwordKnob = DwordKnob::new(c"UmdThreadedFrontend", 1);
+pub(crate) static UMD_THREADED_FRONTEND: DwordKnob = DwordKnob::new(c"UmdThreadedFrontend", 0);
+
+/// `UmdFrontendSync`: front-end call classes forced onto the synchronous path
+/// (`helios_umd_common::cmd_record::FrontendSync`). Read once per process.
+pub(crate) static UMD_FRONTEND_SYNC: DwordKnob = DwordKnob::new(c"UmdFrontendSync", 0);
+
+/// [`UMD_FRONTEND_SYNC`] as a class mask.
+pub(crate) fn frontend_sync() -> helios_umd_common::cmd_record::FrontendSync {
+    helios_umd_common::cmd_record::FrontendSync::new(UMD_FRONTEND_SYNC.get())
+}
 
 /// `UmdFrontendRingKiB`: the threaded front end's command ring per immediate
 /// context, KiB.

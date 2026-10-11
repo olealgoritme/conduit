@@ -16,6 +16,8 @@ use super::*;
 use crate::device_funcs::HELIOS_TAG_DEVICE;
 use core::mem::size_of;
 use helios_umd_common::cmd_queue::CmdQueue;
+use helios_umd_common::cmd_record::FrontendSync;
+use helios_umd_common::frame_trace::{self, Acc, FrameTracer};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -37,9 +39,12 @@ pub(crate) enum SyncReason {
     Oversize,
     Keyed,
     SafetyNet,
+    Query,
+    Destroy,
+    Flush,
 }
 
-const SYNC_REASONS: [&str; 11] = [
+const SYNC_REASONS: [&str; 14] = [
     "dxgi",
     "map",
     "unmap",
@@ -51,12 +56,15 @@ const SYNC_REASONS: [&str; 11] = [
     "oversize",
     "keyed",
     "safety_net",
+    "query",
+    "destroy",
+    "flush",
 ];
 
 #[derive(Default)]
 struct Stats {
-    sync: [AtomicU64; 11],
-    sync_waited: [AtomicU64; 11],
+    sync: [AtomicU64; 14],
+    sync_waited: [AtomicU64; 14],
     split_discard: AtomicU64,
     split_no_overwrite: AtomicU64,
     discard_waits: AtomicU64,
@@ -95,6 +103,10 @@ pub(crate) struct Frontend {
     q: Arc<CmdQueue>,
     discard_bytes: AtomicU64,
     stats: Stats,
+    /// Call classes `UmdFrontendSync` forces synchronous (A/B isolation).
+    force: FrontendSync,
+    /// `UmdFrameTrace`: per-Present timing records.
+    trace: Option<Tracer>,
 }
 
 /// `RtlDllShutdownInProgress`: process teardown has started, other threads
@@ -130,6 +142,74 @@ extern "system" {
     fn GetCurrentThread() -> *mut c_void;
     fn GetThreadPriority(thread: *mut c_void) -> i32;
     fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
+    fn QueryPerformanceCounter(count: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame timing trace (`UmdFrameTrace`)
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+fn qpc() -> u64 {
+    let mut v = 0i64;
+    // SAFETY: plain out-parameter.
+    unsafe { QueryPerformanceCounter(&mut v) };
+    v as u64
+}
+
+fn qpc_freq() -> u64 {
+    let mut v = 0i64;
+    // SAFETY: plain out-parameter.
+    unsafe { QueryPerformanceFrequency(&mut v) };
+    v.max(1) as u64
+}
+
+/// The trace file: `C:\ProgramData\Helios\frametrace-<pid>.csv`, else the
+/// sandbox directory beside it.
+fn open_trace_file() -> Option<Box<dyn std::io::Write + Send>> {
+    let name = format!("frametrace-{}.csv", std::process::id());
+    for dir in [r"C:\ProgramData\Helios", r"C:\ProgramData\Helios\sandbox"] {
+        let path = std::path::Path::new(dir).join(&name);
+        if let Ok(f) = std::fs::File::create(&path) {
+            log_error!("frame trace: writing {}", path.display());
+            return Some(Box::new(std::io::BufWriter::new(f)));
+        }
+    }
+    log_error!("frame trace: no file could be created; trace off");
+    None
+}
+
+thread_local! {
+    /// Timed whole calls the current thread is inside: their drains are part
+    /// of their own time, not of `sync_ms`.
+    static TIMED_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// The device's tracer and the counter frequency.
+struct Tracer {
+    t: FrameTracer,
+    freq: u64,
+}
+
+impl Tracer {
+    fn us_to_ticks(&self, us: u64) -> u64 {
+        (u128::from(us) * u128::from(self.freq) / 1_000_000) as u64
+    }
+}
+
+/// A whole call timed into one category (count + ticks) when tracing.
+struct Timed<'a> {
+    on: Option<(&'a Tracer, Acc, Acc, u64)>,
+}
+
+impl Drop for Timed<'_> {
+    fn drop(&mut self) {
+        if let Some((t, n, ticks, t0)) = self.on {
+            t.t.acc.event(n, ticks, qpc().saturating_sub(t0));
+            TIMED_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
 }
 
 /// The starting producer's scheduling priority (games often raise their
@@ -153,14 +233,39 @@ impl Frontend {
         let q = CmdQueue::new(crate::knobs::frontend_ring_bytes(), "helios-d3d11-frontend");
         q.set_abandon_check(dll_shutdown_in_progress);
         q.set_thread_init(producer_priority, apply_priority);
+        let force = crate::knobs::frontend_sync();
         log_error!(
-            "D3D11 threaded front end: on (ring {} KiB)",
-            q.capacity() / 1024
+            "D3D11 threaded front end: on (ring {} KiB, synchronous classes: {})",
+            q.capacity() / 1024,
+            force.names()
         );
+        let trace = (crate::knobs::UMD_FRAME_TRACE.get() != 0).then(|| {
+            let freq = qpc_freq();
+            let ring = frame_trace::register(freq, std::time::Duration::from_millis(250), open_trace_file);
+            log_error!("frame trace: device {} traced (QPC {} Hz)", ring.dev, freq);
+            Tracer {
+                t: FrameTracer::new(ring),
+                freq,
+            }
+        });
         Self {
             q,
             discard_bytes: AtomicU64::new(0),
             stats: Stats::default(),
+            force,
+            trace,
+        }
+    }
+
+    /// Time the rest of the calling scope as one `n`/`ticks` event (nothing
+    /// when not tracing).
+    #[inline(always)]
+    fn timed(&self, n: Acc, ticks: Acc) -> Timed<'_> {
+        Timed {
+            on: self.trace.as_ref().map(|t| {
+                TIMED_DEPTH.with(|d| d.set(d.get() + 1));
+                (t, n, ticks, qpc())
+            }),
         }
     }
 
@@ -214,6 +319,9 @@ impl Frontend {
     /// DDI; anything else the worker hit is counted and dropped.
     #[inline(always)]
     unsafe fn enter(&self, h: Hdevice) -> bool {
+        if let Some(t) = &self.trace {
+            t.t.acc.add(Acc::DdiCalls, 1);
+        }
         let Some(hr) = self.q.take_error() else {
             return false;
         };
@@ -240,8 +348,14 @@ impl Frontend {
     pub(crate) fn sync(&self, reason: SyncReason) {
         let i = reason as usize;
         self.stats.sync[i].fetch_add(1, Ordering::Relaxed);
+        let t0 = self.trace.as_ref().map(|_| qpc());
         if self.q.drain() {
             self.stats.sync_waited[i].fetch_add(1, Ordering::Relaxed);
+        }
+        if let (Some(t), Some(t0)) = (&self.trace, t0) {
+            if TIMED_DEPTH.with(|d| d.get()) == 0 {
+                t.t.acc.event(Acc::SyncN, Acc::SyncTicks, qpc().saturating_sub(t0));
+            }
         }
     }
 
@@ -263,6 +377,7 @@ impl Frontend {
     /// presents the summary goes to the log.
     unsafe fn present_drain(&self, h: Hdevice) {
         let t0 = std::time::Instant::now();
+        let q0 = self.trace.as_ref().map(|_| qpc());
         // Spin (no sleep/wake handshake) for the frame's tail: the worker is
         // normally busy right up to the Present, and the render thread has
         // nothing else to do until it is done.
@@ -277,6 +392,16 @@ impl Frontend {
             }
         }
         let us = t0.elapsed().as_micros() as u64;
+        if let (Some(t), Some(q0)) = (&self.trace, q0) {
+            let (full_n, full_us) = self.q.full_waits();
+            t.t.present(
+                q0,
+                qpc(),
+                full_n,
+                t.us_to_ticks(full_us),
+                t.us_to_ticks(self.q.worker_busy_us()),
+            );
+        }
         let s = &self.stats;
         let n = s.presents.fetch_add(1, Ordering::Relaxed) + 1;
         s.present_drain_us.fetch_add(us, Ordering::Relaxed);
@@ -321,7 +446,12 @@ impl Frontend {
             return 0;
         }
         match unsafe { self.q.push(extra, fill, f) } {
-            Ok(pos) => pos,
+            Ok(pos) => {
+                if self.force.has(FrontendSync::SERIAL) {
+                    self.q.wait_done(pos);
+                }
+                pos
+            }
             // Only after shutdown (the device is being destroyed); the closure
             // is dropped unrun (a discard token releases its slice on drop).
             Err(_) => 0,
@@ -1154,9 +1284,16 @@ unsafe extern "system" fn fe_query_get_data(
     let Some(fe) = (unsafe { fe_of(h) }) else {
         return unsafe { query_get_data(h, q, data, data_size, flags) };
     };
+    let _t = fe.timed(Acc::GetDataN, Acc::GetDataTicks);
     unsafe {
         // A stashed device removal wins over "still drawing".
         if fe.enter(h) {
+            return;
+        }
+        if fe.force.has(FrontendSync::QUERIES) {
+            if !fe.sync_enter(h, SyncReason::Query) {
+                query_get_data(h, q, data, data_size, flags);
+            }
             return;
         }
         let unflagged = flags & (D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32) == 0;
@@ -1227,10 +1364,11 @@ struct DiscardSlice {
 }
 
 impl DiscardSlice {
-    unsafe fn emit(self) {
+    /// `park`: let the worker pre-allocate the buffer's next slice.
+    unsafe fn emit(self, park: bool) {
         let this = core::mem::ManuallyDrop::new(self);
         if let Some(dev) = unsafe { helios_device(this.h) } {
-            unsafe { dev.dxvk.fe_emit_invalidate(this.buffer, this.slice) };
+            unsafe { dev.dxvk.fe_emit_invalidate(this.buffer, this.slice, park) };
         }
     }
 }
@@ -1263,7 +1401,8 @@ unsafe extern "system" fn fe_map_dynamic(
             write_mapped(mapped, 0, 0);
             return;
         }
-        if let (Some(st), Some(dev)) = (resource_state(res), helios_device(h)) {
+        let split = !fe.force.has(FrontendSync::MAPS);
+        if let (true, Some(st), Some(dev)) = (split, resource_state(res), helios_device(h)) {
             if st.dynamic_buffer && st.buffer_raw != 0 && sub == 0 {
                 let buffer = st.buffer_raw;
                 let bytes = st.byte_width;
@@ -1274,14 +1413,19 @@ unsafe extern "system" fn fe_map_dynamic(
                             write_mapped(mapped, data, bytes);
                             let out = fe.discard_bytes.fetch_add(u64::from(bytes), Ordering::Relaxed) + u64::from(bytes);
                             let token = DiscardSlice { h, buffer, slice };
+                            let park = !fe.force.has(FrontendSync::NO_PARK);
                             fe.record0(move |_| {
-                                token.emit();
+                                token.emit(park);
                                 if let Some(fe) = fe_of(h) {
                                     fe.discard_bytes.fetch_sub(u64::from(bytes), Ordering::Relaxed);
                                 }
                             });
                             if out > MAX_OUTSTANDING_DISCARD_BYTES {
                                 fe.stats.discard_waits.fetch_add(1, Ordering::Relaxed);
+                                if let Some(t) = &fe.trace {
+                                    t.t.acc.add(Acc::DiscardWaitN, 1);
+                                }
+                                let _t = fe.timed(Acc::SyncN, Acc::SyncTicks);
                                 fe.q.drain();
                             }
                             return;
@@ -1303,6 +1447,7 @@ unsafe extern "system" fn fe_map_dynamic(
                 }
             }
         }
+        let _t = fe.timed(Acc::MapN, Acc::MapTicks);
         if fe.sync_enter(h, SyncReason::Map) {
             write_mapped(mapped, 0, 0);
             return;
@@ -1335,7 +1480,9 @@ unsafe extern "system" fn fe_map_sync(
     flags: u32,
     mapped: *mut ddi::D3D10DDI_MAPPED_SUBRESOURCE,
 ) {
-    if let Some(fe) = unsafe { fe_of(h) } {
+    let fe = unsafe { fe_of(h) };
+    let _t = fe.map(|fe| fe.timed(Acc::MapN, Acc::MapTicks));
+    if let Some(fe) = fe {
         if unsafe { fe.sync_enter(h, SyncReason::Map) } {
             unsafe { write_mapped(mapped, 0, 0) };
             return;
@@ -1356,12 +1503,15 @@ unsafe extern "system" fn fe_unmap_dynamic(h: Hdevice, res: ddi::D3D10DDI_HRESOU
             return;
         }
     }
+    let _t = fe.timed(Acc::MapN, Acc::MapTicks);
     unsafe { fe.sync_enter(h, SyncReason::Unmap) };
     unsafe { resource_unmap(h, res, sub) }
 }
 
 unsafe extern "system" fn fe_unmap_sync(h: Hdevice, res: ddi::D3D10DDI_HRESOURCE, sub: u32) {
-    if let Some(fe) = unsafe { fe_of(h) } {
+    let fe = unsafe { fe_of(h) };
+    let _t = fe.map(|fe| fe.timed(Acc::MapN, Acc::MapTicks));
+    if let Some(fe) = fe {
         unsafe { fe.sync_enter(h, SyncReason::Unmap) };
     }
     unsafe { resource_unmap(h, res, sub) }
@@ -1411,7 +1561,12 @@ macro_rules! defer_update {
             };
             unsafe {
                 fe.enter(h);
-                let Some(len) = update_payload(res, sub, bx, data) else {
+                let payload = if fe.force.has(FrontendSync::UPDATES) {
+                    None
+                } else {
+                    update_payload(res, sub, bx, data)
+                };
+                let Some(len) = payload else {
                     fe.sync(SyncReason::Update);
                     return $orig(h, res, sub, bx, data, row_pitch, depth_pitch $(, $extra)*);
                 };
@@ -1451,9 +1606,15 @@ defer_update!(fe_update_subresource_11_1 => resource_update_subresource_11_1(cop
 /// contract (the runtime releases the keyed mutex when `pfnFlush` returns,
 /// and the gate may call `pfnRenderCb`), so it drains and runs inline.
 unsafe fn fe_flush_common(fe: &Frontend, h: Hdevice) {
+    let _t = fe.timed(Acc::FlushN, Acc::FlushTicks);
     unsafe {
         fe.enter(h);
         if report_if_removed(h, "Flush") {
+            return;
+        }
+        if fe.force.has(FrontendSync::FLUSH) {
+            fe.sync(SyncReason::Flush);
+            flush(h);
             return;
         }
         let shared = helios_device(h).is_some_and(|d| !lock_ignore_poison(&d.nvk_keyed_resources).is_empty());
@@ -1528,7 +1689,9 @@ sync_ddi!(fe_acquire_resource_wddm2_1 => acquire_resource_wddm2_1(r: ddi::D3D10D
 /// wait until the worker is past every record recorded so far, then destroy
 /// on this thread. May run on any thread (free-threaded destroy).
 unsafe extern "system" fn fe_destroy_resource(h: Hdevice, res: ddi::D3D10DDI_HRESOURCE) {
-    if let Some(fe) = unsafe { fe_of(h) } {
+    let fe = unsafe { fe_of(h) };
+    let _t = fe.map(|fe| fe.timed(Acc::SyncN, Acc::SyncTicks));
+    if let Some(fe) = fe {
         let i = SyncReason::DestroyResource as usize;
         fe.stats.sync[i].fetch_add(1, Ordering::Relaxed);
         if fe.q.wait_done(fe.q.written()) {
@@ -1555,6 +1718,11 @@ macro_rules! retire_destroy {
                 return unsafe { $orig(h, x) };
             };
             if x.pDrvPrivate.is_null() {
+                return unsafe { $orig(h, x) };
+            }
+            if fe.force.has(FrontendSync::DESTROYS) {
+                fe.sync(SyncReason::Destroy);
+                fe.q.run_ready_retired();
                 return unsafe { $orig(h, x) };
             }
             let pos = fe.q.written();

@@ -55,7 +55,7 @@ struct HeliosDxvkDevice {
   // fe_release_slice. fe_buffer_map_ptr is the WRITE_NO_OVERWRITE answer.
   std::size_t fe_map_discard(std::size_t buffer_ptr, std::size_t* data) const noexcept;
   std::size_t fe_buffer_map_ptr(std::size_t buffer_ptr) const noexcept;
-  void fe_emit_invalidate(std::size_t buffer_ptr, std::size_t slice) const noexcept;
+  void fe_emit_invalidate(std::size_t buffer_ptr, std::size_t slice, bool park) const noexcept;
   void fe_release_slice(std::size_t slice) const noexcept;
   bool recycle_deferred_command_list(
       std::size_t deferred_context_ptr,
@@ -385,4 +385,4 @@ struct HeliosDxvkDevice {
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high,
-    bool timer_resolution);
+    std::uint32_t timer_resolution);
