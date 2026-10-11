@@ -21,7 +21,7 @@
 // firmware, boot loader, a Windows without vioinput -- everything goes to
 // the console as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -284,6 +284,9 @@ pub struct Router {
     grab: bool,
     /// Keys and buttons pressed on a device, by code.
     held: HashMap<u16, Kind>,
+    /// Keys and buttons pressed on the console: their repeats and releases
+    /// stay there, even once a device is ready.
+    console_held: HashSet<u16>,
     /// The report being built per device, until its SYN.
     report: [Vec<InputEventEntry>; 3],
     /// Relative motion of the mouse report being built.
@@ -305,6 +308,7 @@ impl Router {
             ready: [false; 3],
             grab: false,
             held: HashMap::new(),
+            console_held: HashSet::new(),
             report: Default::default(),
             dx: 0,
             dy: 0,
@@ -421,12 +425,21 @@ impl Router {
                             self.report[k as usize].push(*e);
                             To::Dev(k)
                         }
-                        None => To::Console,
+                        None => {
+                            self.console_held.remove(&e.code);
+                            To::Console
+                        }
                     };
                 }
                 if let Some(&k) = self.held.get(&e.code) {
                     // Autorepeat: the guest repeats a held key itself.
                     return To::Dev(k);
+                }
+                if self.console_held.contains(&e.code) {
+                    // A repeat of a key the console holds: a device that
+                    // became ready since must not take it, or the console
+                    // never sees its release.
+                    return To::Console;
                 }
                 match self.press_target(e.code) {
                     To::Dev(k) => {
@@ -438,7 +451,10 @@ impl Router {
                         ));
                         To::Dev(k)
                     }
-                    To::Console => To::Console,
+                    To::Console => {
+                        self.console_held.insert(e.code);
+                        To::Console
+                    }
                 }
             }
             input::EV_REL => match e.code {
@@ -716,6 +732,67 @@ mod tests {
         assert_eq!(m.sends(), 1, "one interrupt per batch");
     }
 
+    /// A 1000 Hz mouse whose reports reach the link in bursts (a scheduling
+    /// hiccup): every host report stays a report of its own in the guest,
+    /// none merged with its neighbour, the motion of each intact.
+    #[test]
+    fn a_burst_of_host_reports_is_not_coalesced() {
+        let (mut r, m, _, _) = setup();
+        let mut b = vec![ev(EV_GRAB_MARK, 0, 1)];
+        for i in 0..64 {
+            b.push(ev(input::EV_REL, input::REL_X, 1 + i % 3));
+            b.push(ev(input::EV_REL, input::REL_Y, -(i % 2)));
+            b.push(syn());
+        }
+        r.route(&mut b);
+        let got = m.flat();
+        assert_eq!(got.iter().filter(|e| **e == S).count(), 64);
+        let mut report = Vec::new();
+        let mut n = 0;
+        for e in got {
+            if e == S {
+                let want_x = 1 + n % 3;
+                let want_y = -(n % 2);
+                let mut x = vec![(input::EV_REL, input::REL_X, want_x)];
+                if want_y != 0 {
+                    x.push((input::EV_REL, input::REL_Y, want_y));
+                }
+                assert_eq!(report, x, "report {n}");
+                report.clear();
+                n += 1;
+            } else {
+                report.push(e);
+            }
+        }
+        assert_eq!(r.stats().mouse_reports, 64);
+        assert_eq!(r.stats().mouse_split, 0);
+    }
+
+    /// vioinput keeps only the last value of an axis before its SYN, so
+    /// motion within one host report goes out as one value per axis.
+    #[test]
+    fn motion_within_one_report_is_one_value_per_axis() {
+        let (mut r, m, _, _) = setup();
+        let mut b = vec![
+            ev(EV_GRAB_MARK, 0, 1),
+            ev(input::EV_REL, input::REL_X, 2),
+            ev(input::EV_REL, input::REL_X, 3),
+            ev(input::EV_REL, input::REL_Y, 1),
+        ];
+        r.route(&mut b);
+        assert!(m.flat().is_empty(), "nothing goes out before the SYN");
+        let mut b = vec![ev(input::EV_REL, input::REL_Y, 1), syn()];
+        r.route(&mut b);
+        assert_eq!(
+            m.flat(),
+            vec![
+                (input::EV_REL, input::REL_X, 5),
+                (input::EV_REL, input::REL_Y, 2),
+                S
+            ]
+        );
+    }
+
     #[test]
     fn a_large_step_is_split_into_reports_that_add_up() {
         let (mut r, m, _, _) = setup();
@@ -794,6 +871,41 @@ mod tests {
             vec![(input::EV_KEY, 29, 0), S]
         );
         assert_eq!(k.flat(), vec![(input::EV_KEY, 56, 1), S]);
+    }
+
+    /// A key held on the console while the keyboard's driver comes up: its
+    /// repeats and its release stay on the console.
+    #[test]
+    fn a_key_held_on_the_console_stays_there_when_the_keyboard_comes_up() {
+        let (m, k, t) = (
+            FakePort::on(),
+            Arc::new(FakePort::default()),
+            FakePort::on(),
+        );
+        let mut r = Router::new([
+            Some(m as Arc<dyn Port>),
+            Some(k.clone() as Arc<dyn Port>),
+            Some(t as Arc<dyn Port>),
+        ]);
+        let mut b = vec![ev(input::EV_KEY, 42, 1), syn()];
+        r.route(&mut b);
+        assert_eq!(b.len(), 2);
+        k.ready.store(true, Ordering::Relaxed);
+        // The viewer's repeat is another press: still the console's.
+        let mut b = vec![
+            ev(input::EV_KEY, 42, 1),
+            syn(),
+            ev(input::EV_KEY, 42, 0),
+            syn(),
+        ];
+        r.route(&mut b);
+        assert_eq!(b.len(), 4);
+        assert!(k.flat().is_empty());
+        // Pressed again after its release: the keyboard's now.
+        let mut b = vec![ev(input::EV_KEY, 42, 1), syn()];
+        r.route(&mut b);
+        assert!(b.is_empty());
+        assert_eq!(k.flat(), vec![(input::EV_KEY, 42, 1), S]);
     }
 
     #[test]
