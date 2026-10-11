@@ -7,13 +7,14 @@
 
 use super::*;
 
-// --- CalcPrivate*Size (all store one COM pointer) ---------------------------
+// --- CalcPrivate*Size (one COM pointer or state box; resources add the hot
+// words of `helios_umd_common::resource_hot`) ---------------------------------
 
 pub(crate) unsafe extern "system" fn calc_size_resource(
     _h: Hdevice,
     _a: *const ddi::D3D11DDIARG_CREATERESOURCE,
 ) -> ddi::SIZE_T {
-    8
+    helios_umd_common::resource_hot::RESOURCE_PRIVATE_SIZE as ddi::SIZE_T
 }
 pub(crate) unsafe extern "system" fn calc_size_rtv(
     _h: Hdevice,
@@ -1861,7 +1862,7 @@ pub(crate) unsafe extern "system" fn calc_size_opened_resource(
     _h: Hdevice,
     _arg: *const ddi::D3D10DDIARG_OPENRESOURCE,
 ) -> ddi::SIZE_T {
-    8
+    helios_umd_common::resource_hot::RESOURCE_PRIVATE_SIZE as ddi::SIZE_T
 }
 
 pub(crate) unsafe extern "system" fn resolve_shared_resource(

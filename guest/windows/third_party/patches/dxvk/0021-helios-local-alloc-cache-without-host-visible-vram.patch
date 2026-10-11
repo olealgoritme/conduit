@@ -1,0 +1,129 @@
+Helios DXVK fork: dynamic-buffer discards from the local allocation cache when there is no host-visible VRAM
+
+Conduit guest/windows. Applied after 0020 by ci/windows/Build-Driver.ps1.
+
+Each D3D11 context keeps a local allocation cache for the discard slices of
+dynamic buffers (Map WRITE_DISCARD). It is created for DEVICE_LOCAL |
+HOST_VISIBLE | HOST_COHERENT memory. NVK over RM exposes no such type by
+default (its BAR heap is off, NVK_RM_BAR_MB=0), so the cache had no memory
+type and createBufferResource skipped it on every discard: it called
+allocateMemory with DEVICE_LOCAL (no type; returned null under the
+allocator's global lock), then again without DEVICE_LOCAL, which
+suballocated from the system-memory mapped pool and created a new
+DxvkResourceAllocation, and the freed slice later took the same lock to go
+back. In CS2 that path was most of the render thread's time under
+D3D11ImmediateContext::Map.
+
+- d3d11: the existing fallback that recreates an unusable cache without
+  DEVICE_LOCAL is on by default (HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK=0
+  turns it off). It changes nothing on a device that has host-visible VRAM;
+  without one, the slices land in the same HOST_VISIBLE system memory as
+  before, now from the cache (no allocator lock, slices recycled as-is
+  through the shared cache). The immediate context logs once which memory
+  the cache uses.
+- dxvk: allocateMemory returns before taking the allocator lock when no
+  memory type matches the request (the types and heaps are fixed at device
+  creation), so the remaining DEVICE_LOCAL-first attempts (discard slices
+  larger than the cache's 128 KiB limit) cost no lock.
+
+diff --git a/src/d3d11/d3d11_context.cpp b/src/d3d11/d3d11_context.cpp
+index 5d4638b6..133e34d1 100644
+--- a/src/d3d11/d3d11_context.cpp
++++ b/src/d3d11/d3d11_context.cpp
+@@ -1,4 +1,5 @@
+ #include <algorithm>
++#include <atomic>
+ 
+ #include "../dxvk/dxvk_helios_producer.h"
+ 
+@@ -52,11 +53,24 @@ namespace dxvk {
+ 
+     m_allocationCache = m_device->createAllocationCache(bufferUsage, memoryFlags);
+ 
+-    if (heliosLocalAllocCacheFallback() && !m_allocationCache.isUsable()) {
++    const bool heliosCacheHadType = m_allocationCache.isUsable();
++
++    if (heliosLocalAllocCacheFallback() && !heliosCacheHadType) {
+       m_allocationCache = m_device->createAllocationCache(bufferUsage,
+         memoryFlags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+     }
+ 
++    if (!IsDeferred) {
++      static std::atomic<bool> s_heliosCacheLogged = { false };
++
++      if (!s_heliosCacheLogged.exchange(true)) {
++        Logger::info(str::format("Helios: D3D11 local allocation cache ",
++          heliosCacheHadType ? "in host-visible VRAM"
++            : m_allocationCache.isUsable() ? "in host-visible system memory (no host-visible VRAM type)"
++            : "unusable (no host-visible VRAM type; HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK=0)"));
++      }
++    }
++
+     if (!IsDeferred) {
+       m_heliosFrontendCache = m_device->createAllocationCache(bufferUsage, memoryFlags);
+ 
+diff --git a/src/d3d11/d3d11_context.h b/src/d3d11/d3d11_context.h
+index b61cdef5..d19f4c88 100644
+--- a/src/d3d11/d3d11_context.h
++++ b/src/d3d11/d3d11_context.h
+@@ -158,17 +158,25 @@ namespace dxvk {
+   }
+ 
+   /**
+-   * \brief Helios D3D11 local-allocation-cache fallback experiment
++   * \brief Helios D3D11 local allocation cache without host-visible VRAM
+    *
+-   * Default OFF. `HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK=1` retries only an
+-   * unusable D3D11 local cache without DEVICE_LOCAL in its cache request.
+-   * The cache is selected once per process; buffer allocation properties and
+-   * the allocator's normal per-allocation fallback remain unchanged.
++   * Default ON. The context's local allocation cache serves the discard
++   * slices of dynamic buffers (Map WRITE_DISCARD) and asks for
++   * DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT memory. A device without such
++   * a memory type (NVK on RM without its BAR heap, a GPU without a BAR
++   * window) leaves that cache with no memory type, so every discard went to
++   * the allocator: a failed DEVICE_LOCAL attempt, then a suballocation from
++   * the system-memory mapped pool and a new allocation object, both under
++   * the allocator's global lock, and the same lock again when the slice is
++   * freed. Those slices land in HOST_VISIBLE system memory either way (the
++   * allocator drops DEVICE_LOCAL when no type has it), so the cache is then
++   * created for that memory instead and discards are served from it.
++   * `HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK=0` keeps the unusable cache.
+    */
+   inline bool heliosLocalAllocCacheFallback() {
+     static const bool enabled = [] {
+       const char* env = std::getenv("HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK");
+-      return env && env[0] == '1' && env[1] == '\0';
++      return !(env && env[0] == '0' && env[1] == '\0');
+     }();
+     return enabled;
+   }
+diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
+index bee66cbd..e55c9a89 100644
+--- a/src/dxvk/dxvk_memory.cpp
++++ b/src/dxvk/dxvk_memory.cpp
+@@ -832,8 +832,6 @@ namespace dxvk {
+   Rc<DxvkResourceAllocation> DxvkMemoryAllocator::allocateMemory(
+     const VkMemoryRequirements&             requirements,
+     const DxvkAllocationInfo&               allocationInfo) {
+-    std::lock_guard<dxvk::mutex> lock(m_mutex);
+-
+     // If we're allocating device-local memory, only consider memory types from
+     // the first reported heap. This way, we avoid falling back to HVV on systems
+     // without resizeable BAR by accident.
+@@ -842,6 +840,15 @@ namespace dxvk {
+     if (memoryTypeMask && (allocationInfo.properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+       memoryTypeMask &= m_memTypes[bit::tzcnt(memoryTypeMask)].heap->memoryTypes;
+ 
++    // Helios: memory types and heaps are fixed at device creation, so a request
++    // no type can satisfy (DEVICE_LOCAL | HOST_VISIBLE on a device without
++    // host-visible VRAM, which callers then retry without DEVICE_LOCAL) fails
++    // here without taking the allocator lock.
++    if (!memoryTypeMask)
++      return nullptr;
++
++    std::lock_guard<dxvk::mutex> lock(m_mutex);
++
+     // Ensure the allocation size is also aligned
+     VkDeviceSize size = align(requirements.size, requirements.alignment);
+ 

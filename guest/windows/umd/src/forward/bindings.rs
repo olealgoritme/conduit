@@ -178,28 +178,28 @@ pub(crate) unsafe fn collect_buffers(
     // `buffer_raw` is the ID3D11Buffer interface pointer pre-cast at
     // `store_resource`; 0 (= a null bind) for a non-buffer resource, which is
     // exactly what the per-call `.cast()` used to produce for one.
-    collect_raw(h, num, |handle| {
-        resource_state_at(handle.pDrvPrivate).map_or(0, |s| s.buffer_raw)
-    })
+    collect_raw(h, num, |handle| buffer_raw_at(handle.pDrvPrivate))
 }
 /// [`collect_buffers`] for the 32 input-assembler vertex-buffer slots.
 pub(crate) unsafe fn collect_vertex_buffers(
     num: u32,
     h: *const ddi::D3D10DDI_HRESOURCE,
 ) -> RawBinds<MAX_VERTEX_BUFFER_BIND_SLOTS> {
-    collect_raw(h, num, |handle| {
-        resource_state_at(handle.pDrvPrivate).map_or(0, |s| s.buffer_raw)
-    })
+    collect_raw(h, num, |handle| buffer_raw_at(handle.pDrvPrivate))
 }
 
 /// The pre-cast `ID3D11Buffer` word of one resource handle (0 for a null
 /// handle or a non-buffer resource), with no `QueryInterface` and no
 /// AddRef/Release.
 pub(crate) unsafe fn buffer_raw_of(h: ddi::D3D10DDI_HRESOURCE) -> usize {
-    if h.pDrvPrivate.is_null() {
-        return 0;
-    }
-    resource_state_at(h.pDrvPrivate).map_or(0, |s| s.buffer_raw)
+    buffer_raw_at(h.pDrvPrivate)
+}
+
+/// `buffer_raw` from the handle's hot words (`resource_hot`), not the box: one
+/// load next to the runtime's object per bound slot.
+#[inline(always)]
+unsafe fn buffer_raw_at(handle_priv: *mut c_void) -> usize {
+    helios_umd_common::resource_hot::get(handle_priv).map_or(0, |hot| hot.buffer_raw)
 }
 
 pub(crate) unsafe fn collect_srvs(
