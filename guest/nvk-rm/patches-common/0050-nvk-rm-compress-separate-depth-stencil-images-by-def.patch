@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sun, 11 Oct 2026 02:27:54 +0200
+Subject: [PATCH] nvk/rm: compress separate depth/stencil images by default
+ (NVK_RM_COMPRESS_ZS)
+
+Blackwell splits D24S8 and D32S8X24 into separate depth and stencil
+planes, and patch 0012 compresses both planes only behind
+NVK_RM_COMPRESS_ZS=1.  D3D games through DXVK and vkd3d-proton use those
+formats for almost every depth buffer, so their depth tests and writes
+ran uncompressed.
+
+RTX 5090, d3d11_gpupass (Conduit guest/windows/tools), 5120x1440, 8x
+MSAA, D24S8, reverse Z, 2000 draws: depth prepass 762 us -> 510 us GPU.
+With it on, d3d11_depth_views_probe (layer, mip, layered and re-created
+views, D32 and D24S8, 1x and 4x) matches in every case, and
+d3d11_msaa_probe matches in its 1x/4x/8x D32 and D24S8 cases (resolves,
+second-part loads, Texture2DMS loads of color and depth).
+
+An image whose separate stencil usage asks for host transfer is not
+compressed (the host copy code reads planes uncompressed); before, only
+the main usage was checked.
+
+On by default; NVK_RM_COMPRESS_ZS=0 turns it off.
+---
+ src/nouveau/vulkan/nvk_image.c              | 10 +++++++---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |  9 ++++++---
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 9895e12..761915b 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -794,8 +794,11 @@ nvk_image_can_compress(const struct nvk_physical_device *pdev,
+    if (!pdev->nvkmd->kmd_info.has_compression)
+       return false;
+ 
+-   /* Our host copy code does not understand compression */
+-   if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT)
++   /* Our host copy code does not understand compression (a separate
++    * stencil usage may ask for host transfer on its own)
++    */
++   if ((image->vk.usage | image->vk.stencil_usage) &
++       VK_IMAGE_USAGE_HOST_TRANSFER_BIT)
+       return false;
+ 
+    /* Our compression strategy depends on dedicated allocations, so we can't
+@@ -1779,7 +1782,8 @@ nvk_image_plane_bind(struct nvk_device *dev,
+       plane->addr = mem->mem->va->addr + offset_B;
+    }
+ 
+-   if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
++   if ((image->vk.usage | image->vk.stencil_usage) &
++       VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
+       plane->host_mem = mem;
+       plane->host_offset_B = offset_B;
+    }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index ae1302a..7b9b5b7 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -461,12 +461,15 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+ 
+    /* Combined depth/stencil formats are two planes on Blackwell, which NVK
+     * leaves uncompressed.  GB20x has only generic kinds, so each plane is
+-    * compressed like any other image (nvk_image.c).  Off by default while
+-    * it is measured.
++    * compressed like any other image (nvk_image.c).  D3D games through DXVK
++    * and vkd3d-proton use D24S8 and D32S8 depth buffers, so without this
++    * their depth tests and writes run at full, uncompressed bandwidth: an
++    * 8x MSAA D24S8 depth prepass at 5120x1440 took 762 us uncompressed and
++    * 510 us compressed.  NVK_RM_COMPRESS_ZS=0 turns it off.
+     */
+    pdev->base.kmd_info.has_zs_compression =
+       pdev->base.kmd_info.has_compression &&
+-      debug_get_bool_option("NVK_RM_COMPRESS_ZS", false);
++      debug_get_bool_option("NVK_RM_COMPRESS_ZS", true);
+ 
+    /* VRAM is allocated with 64 KiB pages; system memory BOs get their own
+     * 4 KiB bind alignment (nvkmd_mem::bind_align_B).
+-- 
+2.43.0
+
