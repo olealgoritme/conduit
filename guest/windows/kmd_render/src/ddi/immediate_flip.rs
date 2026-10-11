@@ -110,20 +110,19 @@ pub(crate) fn min_interval(paced_100ns: u64, immediate: bool) -> u64 {
     imf::min_interval(paced_100ns, immediate, mode())
 }
 
-/// After an immediate programming: if the flip's own address (`flip_address`) is the published
-/// one and no completion carried it yet, report the `CRTC_VSYNC` that retires it now instead of
-/// at the next tick (`imf::completion_address`). The worker, after the scan-out lifecycle lock was released (PASSIVE);
-/// `signal_crtc_vsync` raises to DIRQL through `DxgkCbSynchronizeExecution` itself, as from the
-/// tick and from `host_flip_done::service`.
-pub(crate) fn complete_now(adapter: &AdapterContext, flip_address: u64) {
+/// After an immediate programming: report the `CRTC_VSYNC` that retires the newest published flip
+/// now instead of at the next tick, unless a completion or the tick already carried that address
+/// (`imf::completion_address`). The worker, after the scan-out lifecycle lock was released
+/// (PASSIVE); `signal_crtc_vsync` raises to DIRQL through `DxgkCbSynchronizeExecution` itself, as
+/// from the tick and from `host_flip_done::service`.
+pub(crate) fn complete_now(adapter: &AdapterContext) {
     let live = adapter.display_half()
         && adapter.vsync_armed.load(Ordering::Acquire) != 0
         && adapter.vsync_enabled.load(Ordering::Acquire) != 0;
     let host_holds = crate::ddi::host_flip_done::mode().is_on();
     let published = adapter.last_primary_address.load(Ordering::Acquire);
     let address =
-        imf::completion_address(published, flip_address, LAST_DONE.load(Ordering::Relaxed))
-            .unwrap_or(0);
+        imf::completion_address(published, LAST_DONE.load(Ordering::Relaxed)).unwrap_or(0);
     if imf::completes_now(mode(), true, live, host_holds, address).is_err() {
         bump(&VS_NO);
         return;
