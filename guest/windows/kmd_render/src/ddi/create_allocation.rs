@@ -1225,6 +1225,16 @@ pub(crate) unsafe fn vidpn_primary_flags(adapter: &AdapterContext, h: HANDLE) ->
         .map_or(0, |ctx| ctx.vidpn_primary_flags.load(Ordering::Relaxed))
 }
 
+/// The `PrimaryAddress` the newest flip of `h` recorded on it (0 for an unresolvable handle).
+/// DISPATCH-safe.
+///
+/// # Safety
+/// As [`vidpn_primary_flags`].
+pub(crate) unsafe fn vidpn_primary_address(adapter: &AdapterContext, h: HANDLE) -> u64 {
+    unsafe { resolve_current_alloc(adapter, h) }
+        .map_or(0, |ctx| ctx.vidpn_primary_address.load(Ordering::Acquire))
+}
+
 /// The venus resource behind an `hAllocation`: `Some(0)` for an unbacked
 /// allocation, `None` for a null/foreign handle or one of an older transport
 /// generation (its `resource_id` names a DIFFERENT live blob now, so a caller
