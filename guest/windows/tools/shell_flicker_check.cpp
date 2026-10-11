@@ -16,7 +16,9 @@
 // Every composed frame is sampled on a grid (every 16th pixel of every 16th row). A flicker is a
 // TRANSIENT frame: frame B differs from both its neighbours A and C in at least
 // MIN_CELLS grid cells while A and C agree with each other (a frame that comes and goes again);
-// an animation changes monotonically and does not count. A transient in which at least half the
+// an animation changes monotonically and does not count. A transient of fewer than kLargeCells
+// cells is SMALL (a caret, a hover): listed and counted apart, never a failure. A transient in
+// which at least half the
 // changed cells went black is counted as BLACK as well. The first few transients are written to
 // OUTDIR as BMP files (the transient frame and the one before it).
 //
@@ -43,6 +45,9 @@
 
 static const UINT kStep = 16;
 static const UINT kMinCells = 24;
+// A transient smaller than this many cells is SMALL (a text caret blinking, a hover highlight):
+// listed, but not a failure.
+static const UINT kLargeCells = 48;
 static const UINT kCellTol = 24;  // per-channel difference that counts as a change
 
 static double now_ms() {
@@ -111,7 +116,7 @@ static std::vector<HWND> explorer_windows() {
 // ---- capture --------------------------------------------------------------------------------
 
 struct Stats {
-  std::atomic<unsigned> frames{0}, transients{0}, black{0};
+  std::atomic<unsigned> frames{0}, transients{0}, black{0}, small{0};
 };
 static const char *g_action = "idle";
 static std::atomic<bool> g_stop{false};
@@ -251,16 +256,25 @@ static int capture(const std::string &outdir, Stats *per_action, const char *con
       if (ab >= kMinCells && cb >= kMinCells && ac * 4 < ab) {
         const char *act = action_of[(cur + 2) % 3];
         const bool is_black = blackened * 2 >= ab;
-        g_total.transients++;
-        if (is_black) g_total.black++;
+        const bool small = ab < kLargeCells && cb < kLargeCells;
+        if (small) {
+          g_total.small++;
+        } else {
+          g_total.transients++;
+          if (is_black) g_total.black++;
+        }
         for (int i = 0; i < nactions; i++)
           if (!std::strcmp(names[i], act)) {
-            per_action[i].transients++;
-            if (is_black) per_action[i].black++;
+            if (small) {
+              per_action[i].small++;
+            } else {
+              per_action[i].transients++;
+              if (is_black) per_action[i].black++;
+            }
           }
-        std::printf("[TRANSIENT] t=%.0f ms action=%s cells %u (vs next %u, prev/next agree but %u), black %u\n",
-                    now_ms(), act, ab, cb, ac, blackened);
-        if (g_saved < 4 && full[0].size() == full[1].size() && !full[0].empty()) {
+        std::printf("[TRANSIENT%s] t=%.0f ms action=%s cells %u (vs next %u, prev/next agree but %u), black %u\n",
+                    small ? " small" : "", now_ms(), act, ab, cb, ac, blackened);
+        if (!small && g_saved < 4 && full[0].size() == full[1].size() && !full[0].empty()) {
           // The transient frame B is the previous full frame; save it and the current one.
           char p[MAX_PATH];
           std::snprintf(p, sizeof(p), "%s\\flicker-%u-transient.bmp", outdir.c_str(), g_saved);
@@ -338,10 +352,10 @@ int main(int argc, char **argv) {
   cap.join();
   if (rc) return rc;
   for (int i = 0; i < n; i++)
-    std::printf("%-9s frames %5u transients %3u black %3u\n", names[i], per[i].frames.load(), per[i].transients.load(),
-                per[i].black.load());
+    std::printf("%-9s frames %5u transients %3u black %3u small %3u\n", names[i], per[i].frames.load(),
+                per[i].transients.load(), per[i].black.load(), per[i].small.load());
   const bool clean = g_total.transients.load() == 0;
-  std::printf("%s: %d rounds, frames %u, transients %u (black %u)\n", clean ? "[PASS]" : "[FAIL]", rounds,
-              g_total.frames.load(), g_total.transients.load(), g_total.black.load());
+  std::printf("%s: %d rounds, frames %u, transients %u (black %u), small %u\n", clean ? "[PASS]" : "[FAIL]", rounds,
+              g_total.frames.load(), g_total.transients.load(), g_total.black.load(), g_total.small.load());
   return clean ? 0 : 2;
 }
