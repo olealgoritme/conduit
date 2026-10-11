@@ -38,6 +38,10 @@
 //                 allowed to: SetForegroundWindow fails and the console or the taskbar stays
 //                 active, which keeps the window from being treated as full screen)
 //     noconsole   detach from (and so hide) this program's own console window
+//     exclusive   full-screen exclusive (SetFullscreenState TRUE) at size=WxH (default: the current
+//                 mode): Windows switches the output to that mode. ALLOW_TEARING is not allowed in
+//                 exclusive mode, so `tearing` is dropped there; interval0 is immediate anyway.
+//     size=WxH    swap chain (and borderless window) size (default: the output's current mode)
 //     fps=N       cap the frame rate at N (absolute QPC deadlines, yield then spin); default
 //                 uncapped. With fps=200 / fps=300 on a 240 Hz mode it is the pacing test row.
 // Timing (the RESULT_TIMING lines): the interval between Present calls (p50/p90/p99/max), how long
@@ -157,6 +161,8 @@ int main(int argc, char** argv) {
   }
   int seconds = 20;
   double fpsCap = 0.0;
+  bool exclusive = false;
+  UINT reqW = 0, reqH = 0;
   bool windowed = false, interval0 = false, tearing = false, rgba = false;
   int buffers = 2, adapterIndex = -1;
   bool topmost = false, takeFg = false, noConsole = false, rgb10 = false, fp16 = false;
@@ -177,6 +183,8 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "fg")) takeFg = true;
     else if (!strcmp(a, "noconsole")) noConsole = true;
     else if (!strncmp(a, "fps=", 4)) fpsCap = atof(a + 4);
+    else if (!strcmp(a, "exclusive")) exclusive = true;
+    else if (!strncmp(a, "size=", 5)) sscanf(a + 5, "%ux%u", &reqW, &reqH);
     else L("unknown option %s", a);
   }
   if (buffers < 2) buffers = 2;
@@ -260,8 +268,8 @@ int main(int argc, char** argv) {
     width = 1280;
     height = 720;
   } else {
-    width = target.right - target.left;
-    height = target.bottom - target.top;
+    width = reqW ? reqW : target.right - target.left;
+    height = reqH ? reqH : target.bottom - target.top;
     hwnd = CreateWindowExA(topmost ? WS_EX_TOPMOST : 0, "iflip", "d3d11-iflip", WS_POPUP,
                            target.left, target.top, width, height, nullptr, nullptr, wc.hInstance,
                            nullptr);
@@ -300,6 +308,10 @@ int main(int argc, char** argv) {
   L("D3D11CreateDevice hr=0x%08x level=0x%x", (unsigned)hr, (unsigned)got);
   if (FAILED(hr)) return 3;
 
+  if (exclusive && tearing) {
+    L("exclusive: ALLOW_TEARING is not allowed in full-screen exclusive mode; dropped");
+    tearing = false;
+  }
   if (tearing) {
     IDXGIFactory5* f5 = nullptr;
     BOOL allow = FALSE;
@@ -334,6 +346,24 @@ int main(int argc, char** argv) {
   sc->QueryInterface(__uuidof(IDXGISwapChainMedia), (void**)&media);
   L("IDXGISwapChainMedia %s", media ? "available" : "NOT available");
 
+  if (exclusive) {
+    HRESULT hf = sc->SetFullscreenState(TRUE, nullptr);
+    DXGI_MODE_DESC md = {};
+    md.Width = width;
+    md.Height = height;
+    md.Format = sd.Format;
+    HRESULT ht = sc->ResizeTarget(&md);
+    HRESULT hb = sc->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, sd.Flags);
+    BOOL fs = FALSE;
+    sc->GetFullscreenState(&fs, nullptr);
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm);
+    L("exclusive: SetFullscreenState hr=0x%08x ResizeTarget hr=0x%08x ResizeBuffers hr=0x%08x "
+      "fullscreen=%d mode now %lux%lu@%lu",
+      (unsigned)hf, (unsigned)ht, (unsigned)hb, fs, dm.dmPelsWidth, dm.dmPelsHeight,
+      dm.dmDisplayFrequency);
+  }
   ID3D11Texture2D* bb = nullptr;
   ID3D11RenderTargetView* rtv = nullptr;
   sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
@@ -489,6 +519,7 @@ int main(int argc, char** argv) {
     L("RESULT_TIMING screen_refresh_steps n=%zu two_or_more=%.2f%%", syncGapUs.size(),
       syncGapUs.empty() ? 0.0 : 100.0 * multi / syncGapUs.size());
   }
+  if (exclusive) sc->SetFullscreenState(FALSE, nullptr);
   if (media) media->Release();
   rtv->Release();
   sc->Release();
