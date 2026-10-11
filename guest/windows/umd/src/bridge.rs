@@ -57,7 +57,9 @@ mod ffi {
         /// # Safety
         /// `buffer_ptr` is a live `ID3D11Buffer*`; `slice` is a token from
         /// `fe_map_discard`, consumed here. Worker thread only.
-        unsafe fn fe_emit_invalidate(self: &HeliosDxvkDevice, buffer_ptr: usize, slice: usize);
+        /// `park`: after the rename, pre-allocate the buffer's next discard
+        /// slice for the app thread (small buffers only).
+        unsafe fn fe_emit_invalidate(self: &HeliosDxvkDevice, buffer_ptr: usize, slice: usize, park: bool);
         /// # Safety
         /// `slice` is an unconsumed token from `fe_map_discard`.
         unsafe fn fe_release_slice(self: &HeliosDxvkDevice, slice: usize);
@@ -817,9 +819,9 @@ impl BridgeDevice {
 
     /// # Safety
     /// See the `ffi` declaration.
-    pub(crate) unsafe fn fe_emit_invalidate(&self, buffer_ptr: usize, slice: usize) {
+    pub(crate) unsafe fn fe_emit_invalidate(&self, buffer_ptr: usize, slice: usize, park: bool) {
         match self.get() {
-            Some(d) => unsafe { d.fe_emit_invalidate(buffer_ptr, slice) },
+            Some(d) => unsafe { d.fe_emit_invalidate(buffer_ptr, slice, park) },
             None => {}
         }
     }

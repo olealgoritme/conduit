@@ -159,6 +159,10 @@ pub struct CmdQueue {
     wait_cv: Condvar,
     retire: Mutex<VecDeque<Retire>>,
     retire_pending: AtomicBool,
+    /// Held while a thread runs destructions it took out of `retire`, so
+    /// [`CmdQueue::run_ready_retired`] cannot return while the worker is still
+    /// running one it already dequeued.
+    retire_exec: Mutex<()>,
     stats: Line<Stats>,
     name: String,
     /// True once waiting for the worker is pointless (process teardown has
@@ -222,6 +226,7 @@ impl CmdQueue {
             wait_cv: Condvar::new(),
             retire: Mutex::new(VecDeque::new()),
             retire_pending: AtomicBool::new(false),
+            retire_exec: Mutex::new(()),
             stats: Line(Stats::default()),
             name: name.to_string(),
             abandoned: std::sync::OnceLock::new(),
@@ -485,12 +490,24 @@ impl CmdQueue {
 
     /// Run, on the calling thread, the queued destructions the worker has
     /// already passed (callers that must not overtake them, e.g. a resource
-    /// destroy that follows destroys of its views).
+    /// destroy that follows destroys of its views). Also waits for any the
+    /// worker took out of the queue and is still running: on return, every
+    /// destruction queued at or before [`done`](Self::done) has finished.
     pub fn run_ready_retired(&self) {
-        self.run_retired(false);
+        let _exec = lock(&self.retire_exec);
+        self.run_retired_locked(false);
     }
 
     fn run_retired(&self, all: bool) {
+        if !self.retire_pending.load(Ordering::Acquire) {
+            return;
+        }
+        let _exec = lock(&self.retire_exec);
+        self.run_retired_locked(all);
+    }
+
+    /// Caller holds `retire_exec`.
+    fn run_retired_locked(&self, all: bool) {
         if !self.retire_pending.load(Ordering::Acquire) {
             return;
         }
@@ -996,6 +1013,193 @@ mod tests {
         let r2 = Arc::clone(&r);
         unsafe { q.retire(u64::MAX, move || r2.store(true, Ordering::Relaxed)) };
         assert!(r.load(Ordering::Relaxed));
+    }
+
+    /// Blocks the worker on its first record until the returned gate opens,
+    /// so the producer runs ahead of the replay as a game's render thread does.
+    fn gated(q: &Arc<CmdQueue>) -> Arc<AtomicBool> {
+        let gate = Arc::new(AtomicBool::new(false));
+        let g = Arc::clone(&gate);
+        unsafe {
+            q.push(0, |_| {}, move |_: &[u8]| {
+                while !g.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            })
+            .unwrap();
+        }
+        gate
+    }
+
+    #[test]
+    fn replay_sees_recorded_bytes_after_the_app_reuses_its_memory() {
+        // The UpdateSubresourceUP / constant-data class: the app's memory is
+        // rewritten (and freed) right after each call, long before the
+        // worker replays it; every replay must see what the call passed.
+        let q = CmdQueue::new(1 << 16, "t-byvalue");
+        let gate = gated(&q);
+        let bad = Arc::new(AtomicU64::new(0));
+        let mut app = vec![0u8; 256];
+        for i in 0..200u32 {
+            app.iter_mut().for_each(|b| *b = i as u8);
+            let bad = Arc::clone(&bad);
+            unsafe {
+                q.push(
+                    app.len(),
+                    |dst| dst.copy_from_slice(&app),
+                    move |payload: &[u8]| {
+                        if payload.iter().any(|&b| b != i as u8) {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
+                )
+                .unwrap();
+            }
+            app.iter_mut().for_each(|b| *b = 0xa5); // the app reuses its memory
+        }
+        drop(app);
+        gate.store(true, Ordering::Release);
+        q.drain();
+        assert_eq!(bad.load(Ordering::Relaxed), 0);
+        q.shutdown();
+    }
+
+    /// One dynamic buffer the way the front end and DXVK patch 0018 split
+    /// `Map(WRITE_DISCARD)`: `map_ptr` is the app side's current slice
+    /// (`D3D11Buffer::m_mapPtr`, set at map time), `storage` the slice the
+    /// replayed stream sees (`DxvkBuffer`'s storage, set by the replayed
+    /// invalidate), `parked` the next slice the worker pre-allocated.
+    struct ModelBuffer {
+        map_ptr: AtomicUsize,
+        storage: AtomicUsize,
+        parked: AtomicUsize,
+        next_slice: AtomicUsize,
+        slices: Vec<Vec<AtomicU64>>,
+    }
+
+    impl ModelBuffer {
+        fn new(slices: usize, words: usize) -> Self {
+            Self {
+                map_ptr: AtomicUsize::new(0),
+                storage: AtomicUsize::new(0),
+                parked: AtomicUsize::new(usize::MAX),
+                next_slice: AtomicUsize::new(1),
+                slices: (0..slices).map(|_| (0..words).map(|_| AtomicU64::new(0)).collect()).collect(),
+            }
+        }
+
+        /// A fresh slice: never handed out before (DXVK's allocator only
+        /// returns memory the GPU is done with; the model never reuses).
+        fn alloc(&self) -> usize {
+            let s = self.next_slice.fetch_add(1, Ordering::Relaxed);
+            assert!(s < self.slices.len(), "model out of slices");
+            s
+        }
+    }
+
+    fn discard_split_model(park: bool) {
+        let q = CmdQueue::new(1 << 16, "t-discard");
+        let buf = Arc::new(ModelBuffer::new(4096, 8));
+        let bad = Arc::new(AtomicU64::new(0));
+        let draws = Arc::new(AtomicU64::new(0));
+        let gate = gated(&q);
+        let mut words_used = 0usize;
+        for i in 0..2000u64 {
+            // DISCARD every 8 draws (or when the slice is full), NO_OVERWRITE
+            // appends in between: CS2's constant and vertex streams.
+            if i % 8 == 0 || words_used == 8 {
+                let parked = buf.parked.swap(usize::MAX, Ordering::Acquire);
+                let slice = if parked != usize::MAX { parked } else { buf.alloc() };
+                buf.map_ptr.store(slice, Ordering::Relaxed);
+                words_used = 0;
+                let b = Arc::clone(&buf);
+                unsafe {
+                    q.push(0, |_| {}, move |_: &[u8]| {
+                        b.storage.store(slice, Ordering::Relaxed);
+                        if park && b.parked.load(Ordering::Relaxed) == usize::MAX {
+                            let next = b.alloc();
+                            let _ = b.parked.compare_exchange(usize::MAX, next, Ordering::Release, Ordering::Relaxed);
+                        }
+                    })
+                    .unwrap();
+                }
+            }
+            // The app writes through the pointer its map returned...
+            let slice = buf.map_ptr.load(Ordering::Relaxed);
+            let word = words_used;
+            words_used += 1;
+            buf.slices[slice][word].store(i + 1, Ordering::Relaxed);
+            // ...and records a draw that reads that word of whatever the
+            // replayed stream has bound at that point.
+            let (b, bad, draws) = (Arc::clone(&buf), Arc::clone(&bad), Arc::clone(&draws));
+            unsafe {
+                q.push(0, |_| {}, move |_: &[u8]| {
+                    let bound = b.storage.load(Ordering::Relaxed);
+                    if b.slices[bound][word].load(Ordering::Relaxed) != i + 1 {
+                        bad.fetch_add(1, Ordering::Relaxed);
+                    }
+                    draws.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+            }
+            if i == 1000 {
+                gate.store(true, Ordering::Release); // let the replay catch up mid-run
+            }
+        }
+        q.drain();
+        assert_eq!(draws.load(Ordering::Relaxed), 2000);
+        assert_eq!(bad.load(Ordering::Relaxed), 0, "a draw saw another slice's data");
+        q.shutdown();
+    }
+
+    #[test]
+    fn discard_split_keeps_every_draw_on_the_slice_it_wrote() {
+        discard_split_model(false);
+    }
+
+    #[test]
+    fn discard_split_with_parked_slices_keeps_every_draw_on_the_slice_it_wrote() {
+        discard_split_model(true);
+    }
+
+    #[test]
+    fn run_ready_retired_waits_for_a_destruction_the_worker_is_running() {
+        // A resource destroy must not overtake the destroy of one of its
+        // views, even when the worker dequeued that view's destroy first.
+        let q = CmdQueue::new(1 << 16, "t-retire-exec");
+        let gate = gated(&q);
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (s, f) = (Arc::clone(&started), Arc::clone(&finished));
+        unsafe {
+            q.retire(q.written(), move || {
+                s.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(50));
+                f.store(true, Ordering::Release);
+            });
+        }
+        gate.store(true, Ordering::Release);
+        spin_until(|| started.load(Ordering::Acquire));
+        // The resource destroy's order: wait for the worker, then run (or
+        // wait for) the ready destructions.
+        q.wait_done(q.written());
+        q.run_ready_retired();
+        assert!(finished.load(Ordering::Acquire), "returned while a view destroy was still running");
+        q.shutdown();
+    }
+
+    #[test]
+    fn a_waited_push_has_run_when_the_wait_returns() {
+        // The front end's serial A/B mode: push, then wait for that record.
+        let q = CmdQueue::new(MIN_RING_BYTES, "t-serial");
+        let n = Arc::new(AtomicU64::new(0));
+        for i in 0..500u64 {
+            let c = Arc::clone(&n);
+            let pos = unsafe { q.push(0, |_| {}, move |_: &[u8]| { c.fetch_add(1, Ordering::Relaxed); }).unwrap() };
+            q.wait_done(pos);
+            assert_eq!(n.load(Ordering::Relaxed), i + 1);
+        }
+        q.shutdown();
     }
 
     /// Producer-side cost per record with the worker consuming:
