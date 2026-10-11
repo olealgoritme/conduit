@@ -1,0 +1,99 @@
+From 5a5dcea464b29d68357c50a7147230266eb1a78d Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sun, 11 Oct 2026 23:44:55 +0200
+Subject: [PATCH] nvk/rm: a failed Helios holder context is retried, never
+ latched
+
+A long-lived process (explorer, the shell hosts, DWM) that asked for its
+holder context while the KMD restarted (a live driver update, a
+display-device restart) latched the failure: every later IMPORT_RM was
+refused before it was sent, so every surface it made afterwards was a KMD
+placeholder without a resource id, which DWM on NVK cannot compose (taskbar
+and Start menu frames missing or flickering until the process restarted).
+Retry after 500 ms instead, in get_holder_ctx and after a stale context.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c | 37 ++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index d68cd90..51ca1dc 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -31,6 +31,7 @@
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ #include "util/log.h"
++#include "util/os_time.h"
+ #include "util/u_atomic.h"
+ #include "util/u_debug.h"
+ #include "vk_log.h"
+@@ -519,7 +520,21 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+ 
+ static simple_mtx_t helios_ctx_mutex = SIMPLE_MTX_INITIALIZER;
+ static uint32_t helios_holder_ctx;
+-static bool helios_holder_failed;
++/* When making a holder context last failed (os_time_get_nano), 0 if it did
++ * not.  A failure is retried after HELIOS_HOLDER_RETRY_NS, never latched: a
++ * long-lived process (explorer, the shell hosts, DWM) that asks while the KMD
++ * restarts (a live driver update, a display-device restart) would otherwise
++ * make every later surface a KMD placeholder for the rest of its life.
++ */
++static int64_t helios_holder_failed_ns;
++#define HELIOS_HOLDER_RETRY_NS (500ll * 1000 * 1000)
++
++static bool
++holder_may_try(void)
++{
++   return helios_holder_failed_ns == 0 ||
++          os_time_get_nano() - helios_holder_failed_ns >= HELIOS_HOLDER_RETRY_NS;
++}
+ 
+ bool
+ nvkmd_rm_win_adapter_luid(uint8_t luid[8])
+@@ -589,14 +604,21 @@ static uint32_t
+ get_holder_ctx(const struct nvkmd_rm_lib *lib)
+ {
+    simple_mtx_lock(&helios_ctx_mutex);
+-   if (helios_holder_ctx == 0 && !helios_holder_failed) {
++   if (helios_holder_ctx == 0 && holder_may_try()) {
+       uint32_t ctx = 0;
+       int ret = lib->win_venus_ctx_create(&ctx);
+       if (ret != 0 || ctx == 0) {
+-         helios_holder_failed = true;
+-         mesa_logw("NVK: no Helios holder context (%d), no resource ids", ret);
++         if (helios_holder_failed_ns == 0)
++            mesa_logw("NVK: no Helios holder context (%d), no resource ids for "
++                      "now (retried every %lld ms)", ret,
++                      HELIOS_HOLDER_RETRY_NS / 1000000);
++         helios_holder_failed_ns = os_time_get_nano();
+       } else {
++         if (helios_holder_failed_ns != 0)
++            mesa_logi("NVK: Helios holder context %u made after an earlier "
++                      "failure", ctx);
+          helios_holder_ctx = ctx;
++         helios_holder_failed_ns = 0;
+       }
+    }
+    const uint32_t ctx = helios_holder_ctx;
+@@ -617,14 +639,15 @@ renew_holder_ctx(const struct nvkmd_rm_lib *lib, uint32_t stale)
+    simple_mtx_lock(&helios_ctx_mutex);
+    if (helios_holder_ctx == stale) {
+       helios_holder_ctx = 0;
+-      helios_holder_failed = false;
+       uint32_t ctx = 0;
+       int ret = lib->win_venus_ctx_create(&ctx);
+       if (ret != 0 || ctx == 0) {
+-         helios_holder_failed = true;
++         helios_holder_failed_ns = os_time_get_nano();
+          mesa_logw("NVK: Helios holder context %u went stale and no new one "
+-                   "could be made (%d)", stale, ret);
++                   "could be made yet (%d); retried every %lld ms", stale, ret,
++                   HELIOS_HOLDER_RETRY_NS / 1000000);
+       } else {
++         helios_holder_failed_ns = 0;
+          helios_holder_ctx = ctx;
+          mesa_logi("NVK: Helios holder context %u went stale (KMD restart); "
+                    "now %u", stale, ctx);
+-- 
+2.43.0
+
