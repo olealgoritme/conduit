@@ -71,7 +71,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_RM_DESC_TABLE_VRAM`, `NVK_RM_UPLOAD_VRAM` | 0 | descriptor tables/pools and command upload memory in the BAR heap (needs `NVK_RM_BAR_MB`) (common 26, 27) |
 | `NVK_RM_SYSMEM_CACHED` | 1 | host-visible system memory GPU-cacheable in L2 (`=0` off, `=desc`/`=app` one kind only) |
 | `NVK_RM_COMPRESSION` | 1 | compressible VRAM for images in dedicated allocations on GB20x |
-| `NVK_RM_COMPRESS_ZS` | 1 | compression of separate depth/stencil images (D24S8, D32S8X24 on Blackwell) (common 12, 49) |
+| `NVK_RM_COMPRESS_ZS` | 1 | compression of separate depth/stencil images (D24S8, D32S8X24 on Blackwell) (common 12, 50) |
 | `NVK_RM_COMPRESS_ALL`, `_TYPE` | 0 | compression outside dedicated allocations and as a memory type (see "Compression") |
 | `NVK_RM_COMPRESS_CLEAR`, `_UPGRADE`, `_TYPE_SCOPE` | unset | compression diagnostics (common 15) |
 | `NVK_RM_ZCULL` | 1 | ZCULL from `GR_GET_ZCULL_INFO` |
@@ -269,7 +269,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0044 | vulkan/runtime: `VkPipelineCoverageModulationStateCreateInfoNV` and the coverage modulation commands become dynamic state (`MESA_VK_DYNAMIC_MS_COVERAGE_MODULATION_MODE`, `_TABLE_ENABLE`, `_TABLE`) |
 | 0045 | `VK_NV_framebuffer_mixed_samples` (Maxwell B+): `rasterizationSamples` above the attachments' sample count turns on the hardware's target-independent rasterization (`SET_TIR`, `SET_ANTI_ALIAS_RASTER`), with merge coverage reduction and coverage modulation (also the extended dynamic state 3 coverage modulation features). What D3D11.1 `ForcedSampleCount` needs with a render target bound: Direct2D's anti-aliased fills (`guest/windows/tools/d2d_tir_probe.cpp`) |
 | 0046 | zink: without a DEVICE_LOCAL \| HOST_VISIBLE type (0030) the descriptor buffers and GL persistent mappings are host-visible coherent system memory (a persistent map of plain VRAM is a staging copy the GPU never sees). `wgl_test.exe` checks readback, compute and a persistent mapping |
-| 0049 | `NVK_RM_COMPRESS_ZS` defaults to 1: D24S8/D32S8X24 depth buffers (two planes on Blackwell) are compressed in dedicated allocations; `=0` turns it off |
+| 0050 | `NVK_RM_COMPRESS_ZS` defaults to 1: D24S8/D32S8X24 depth buffers (two planes on Blackwell) are compressed in dedicated allocations; `=0` turns it off |
 
 ## Per-draw cost (common 0001-0007)
 
@@ -360,7 +360,7 @@ writes PTEs; NVK maps images with 0x8.
 |---|---|
 | `NVK_RM_COMPRESSION` (1) | images in dedicated allocations: the memory is COMPR_ANY (block linear, 32 bpp, as NVKMS does) and mapped with the image's compressible kind; if RM declines, the uncompressed GMK kind (`patches-windows/0028`, `patches/0016`) |
 | `NVK_RM_COMPRESS_ALL` (0) | images in sub-allocated memory (common 0011); vkd3d-proton places every D3D12 resource in a heap, so images are rarely dedicated |
-| `NVK_RM_COMPRESS_ZS` (1) | separate depth/stencil images (common 0012; on by default, 0049): Blackwell splits D24S8 and D32S8X24 into planes, which `nvk_image_can_compress` otherwise rejects; both planes are compressed and the draw path sets `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION` from `is_compressed` |
+| `NVK_RM_COMPRESS_ZS` (1) | separate depth/stencil images (common 0012; on by default, 0050): Blackwell splits D24S8 and D32S8X24 into planes, which `nvk_image_can_compress` otherwise rejects; both planes are compressed and the draw path sets `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION` from `is_compressed` |
 | `NVK_RM_COMPRESS_TYPE` (0) | images in a second DEVICE_LOCAL memory type (common 0013) |
 
 `NVK_RM_COMPRESS_ALL`: device-local memory that is neither host-visible,
