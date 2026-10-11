@@ -280,6 +280,15 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvEvMaxP",
         crate::virtio::nvrm::NVRM_EV_MAX_PASS.load(Ordering::Relaxed),
     );
+    // Packed `EventReady` (`NVGPU_F_EVENT_PACKED`): messages, and the buffers they came in.
+    crate::diag::record_named_bytes(
+        b"NvEvPkM",
+        crate::virtio::nvrm::NVRM_EV_PACKED_MSGS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvPkB",
+        crate::virtio::nvrm::NVRM_EV_PACKED_BUFS.load(Ordering::Relaxed),
+    );
     // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
     // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
     crate::adapter::foreign_scanout::publish_counters();

@@ -362,6 +362,22 @@ pub fn parse(bytes: &[u8], len: usize) -> Option<HostList> {
     (l.len != 0).then_some(l)
 }
 
+/// How many rates of the refresh ladder (`refresh_ladder`: the host rate first,
+/// then lower fallbacks) a size is offered at: native gets them all; every other
+/// size only the host rate, as a real high-refresh monitor runs every resolution
+/// at its full rate. Offering the fallbacks there let Windows commit a game's
+/// resolution at 60 Hz (CS2 at 1600x900 capped at 60 fps), and the flip pacing
+/// follows the committed rate.
+pub const fn rate_count_for(size: (u32, u32), native: (u32, u32), ladder_len: usize) -> usize {
+    if size.0 == native.0 && size.1 == native.1 {
+        ladder_len
+    } else if ladder_len == 0 {
+        0
+    } else {
+        1
+    }
+}
+
 /// A `DisplayMode` message: the requested size, packed. `None` for another
 /// scanout, a short message or an unusable size.
 pub fn parse_display_mode(bytes: &[u8], len: usize) -> Option<u32> {
@@ -545,6 +561,16 @@ mod tests {
         // The count wraps inside its 16 bits; the sequence stays nonzero.
         assert_eq!(host_mode_value(1, 0x1_0000, 5) >> 32, 0x0001_0000);
         assert_ne!(host_mode_value(1, 0x1_0000, 5) >> 32, 0);
+    }
+
+    #[test]
+    fn non_native_sizes_run_at_the_host_rate_only() {
+        let (ladder, n) = crate::refresh_ladder(240_000);
+        assert!(n > 1 && ladder[0] == 240_000);
+        assert_eq!(rate_count_for((5120, 1440), (5120, 1440), n), n);
+        assert_eq!(rate_count_for((1600, 900), (5120, 1440), n), 1);
+        assert_eq!(rate_count_for((1366, 768), (5120, 1440), n), 1);
+        assert_eq!(rate_count_for((1600, 900), (5120, 1440), 0), 0);
     }
 
     #[test]

@@ -943,6 +943,23 @@ impl DisplayModeEvent {
 /// not ack it never gets one and builds its own list, as before.
 pub const NVGPU_F_MODE_LIST: u32 = 1 << 21;
 
+/// A **virtio device feature** the guest acks (config `features` bit 22 stays
+/// unused): the guest reads every `EventReady` in an event-queue buffer, not
+/// only the first. The backend then packs the `EventReady` messages of one
+/// pass of its event thread into as few buffers as it can: whole 16-byte
+/// `MsgHeader`s back to back, the used length a multiple of 16, nothing but
+/// `EventReady` in such a buffer. Under a game one GPU non-stall interrupt
+/// makes every NVK device's event file readable at once, each its own
+/// report; one buffer each emptied a 16-buffer ring per interrupt. Offered
+/// always; a guest that does not ack it gets one message per buffer, as
+/// before. See [`EVENT_READY_PER_BUFFER_MAX`].
+pub const NVGPU_F_EVENT_PACKED: u32 = 1 << 22;
+
+/// The most `EventReady` messages the backend packs into one buffer
+/// ([`NVGPU_F_EVENT_PACKED`]), whatever the buffer's size: a guest can size
+/// what it copies out of a buffer by this.
+pub const EVENT_READY_PER_BUFFER_MAX: usize = 32;
+
 /// Event-queue payload for `MsgType::DisplayModeList`, following a
 /// `MsgHeader` (handle 0, status 0), then `count` entries. 16 bytes.
 #[repr(C)]
@@ -1567,6 +1584,7 @@ mod tests {
         assert_eq!(size_of::<DisplayModeListHeader>(), 16);
         assert_eq!(size_of::<DisplayModeListEntry>(), 8);
         assert_eq!(NVGPU_F_MODE_LIST, 1 << 21);
+        assert_eq!(NVGPU_F_EVENT_PACKED, 1 << 22);
         assert_eq!(MsgType::DisplayModeList as u32, 34);
         assert_eq!(MsgType::from_u32(34), Some(MsgType::DisplayModeList));
         let modes = [(5120, 1440), (1920, 1080)];
