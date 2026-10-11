@@ -3988,15 +3988,19 @@ unsafe fn program_vidpn_source_inner(
     // Nothing when the knob is off; no arm below reads it.
     let idf_pending =
         crate::ddi::indep_flip::worker_pre(&source, (width, height), (mode_w, mode_h));
-    if width != mode_w || height != mode_h {
+    // Larger than the mode: never. Smaller: only `ForeignFlip` below shows it (a
+    // full-screen-exclusive application at a size the mode is not; the host scales the frame),
+    // every other arm needs the mode's exact extent.
+    if width > mode_w || height > mode_h {
         return Err(ScanoutReject::Extent);
     }
+    let smaller = width != mode_w || height != mode_h;
     // `KmdRmClient` = 5 (Option B, `docs/kmd-rm-client.md` 14.3 / 15.6): an allocation that
     // adopted the KMD's own RM system memory is shown by a flip of its GEM from the foreign
     // record: no SET_SCANOUT_BLOB, no GPU copy, no dedicated image. Every other allocation
     // (and every allocation with the knob below 5, after one relaxed load) takes the Venus
     // path below, unchanged; a Venus source also withdraws a resident RM source.
-    {
+    if !smaller {
         use crate::virtio::rm_client::sysmem_flip::{self as rm_flip, Programmed};
         match rm_flip::program(
             adapter,
@@ -4045,6 +4049,10 @@ unsafe fn program_vidpn_source_inner(
         );
         if let Some(p) = idf_pending {
             p.finish(matches!(arm, FfProgrammed::Ok));
+        }
+        if smaller && !matches!(arm, FfProgrammed::Ok) {
+            // A smaller primary `ForeignFlip` did not take: no other arm can show it.
+            return Err(ScanoutReject::Extent);
         }
         match arm {
             FfProgrammed::NotOurs | FfProgrammed::Refused => {

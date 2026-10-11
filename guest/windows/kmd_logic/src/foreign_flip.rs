@@ -239,7 +239,12 @@ pub fn decide(f: &Facts) -> Verdict {
     if layout.validate().is_err() {
         return Verdict::Refuse(Why::BadLayout);
     }
-    if (layout.width, layout.height) != f.mode {
+    // A buffer larger than the mode cannot be scanned out. A smaller one can: dxgkrnl flips one
+    // when a full-screen-exclusive application runs at a size the output mode is not (it keeps
+    // the desktop mode and expects the display to scale), and the host scales it (the viewer
+    // fits whatever size a frame has to its window). It used to be refused, completed as a kept
+    // picture, and never shown.
+    if layout.width > f.mode.0 || layout.height > f.mode.1 {
         return Verdict::Refuse(Why::Extent);
     }
     if !f.owner_file.is_some_and(|t| t >= DEVICE_TYPE_DRI_FIRST) {
@@ -551,6 +556,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_buffer_smaller_than_the_mode_is_shown_for_the_host_to_scale() {
+        // A 1920x1080 full-screen-exclusive application on a 5120x1440 desktop.
+        let mut f = facts();
+        f.mode = (5120, 1440);
+        match decide(&f) {
+            Verdict::Take(t) => assert_eq!((t.layout.width, t.layout.height), (1920, 1080)),
+            v => panic!("{v:?}"),
+        }
+    }
+
     fn facts() -> Facts {
         Facts {
             knob: true,
@@ -691,8 +707,16 @@ mod tests {
                 Verdict::Refuse(Why::BadLayout),
             ),
             (
-                "record extent is not the mode's",
-                |f| f.mode = (2560, 1440),
+                "record larger than the mode",
+                |f| f.mode = (1280, 720),
+                Verdict::Refuse(Why::Extent),
+            ),
+            (
+                "record wider than the mode",
+                |f| {
+                    let h = f.record.as_ref().unwrap().layout.height;
+                    f.mode = (64, h);
+                },
                 Verdict::Refuse(Why::Extent),
             ),
             (
@@ -1392,7 +1416,10 @@ mod tests {
             }
         }
         assert!(flips <= 101, "{flips} repeats in 10 s");
-        assert!(flips >= 90, "{flips} repeats in 10 s: the gate starves the picture");
+        assert!(
+            flips >= 90,
+            "{flips} repeats in 10 s: the gate starves the picture"
+        );
     }
 
     #[test]
@@ -1400,13 +1427,20 @@ mod tests {
         assert!(owns_held_wake(5_000, 5_000));
         assert!(!owns_held_wake(0, 0), "nothing was held");
         assert!(!owns_held_wake(5_000, 0), "already cleared");
-        assert!(!owns_held_wake(5_000, 4_000), "another owner's earlier wake");
+        assert!(
+            !owns_held_wake(5_000, 4_000),
+            "another owner's earlier wake"
+        );
     }
 
     #[test]
     fn the_repeat_gate_off_and_clamped() {
         assert_eq!(repeat_gate_100ns(0), 0);
-        assert_eq!(repeat_decide(5, 4, 0), Repeat::Now, "0 = every edge, as before");
+        assert_eq!(
+            repeat_decide(5, 4, 0),
+            Repeat::Now,
+            "0 = every edge, as before"
+        );
         assert_eq!(repeat_gate_100ns(u32::MAX), 100_000_000);
     }
 
