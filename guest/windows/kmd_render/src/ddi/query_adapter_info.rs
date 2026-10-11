@@ -492,7 +492,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         const FLIPCAPS_FLIP_IMMEDIATE_MMIO: u32 = 1 << 3;
         let yes: BOOLEAN = 1;
         out.set(caps_offset!(SupportMultiPlaneOverlay), yes);
-        let planes: UINT = helios_kmd_logic::scaled_flip::MAX_PLANES;
+        let planes: UINT = crate::ddi::scaled_flip::planes();
         out.set(caps_offset!(MaxOverlayPlanes), planes);
         if flip_caps & FLIPCAPS_FLIP_IMMEDIATE_MMIO != 0 {
             out.set(caps_offset!(SupportMultiPlaneOverlayImmediateFlip), yes);
@@ -516,6 +516,17 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         nb_asymetric_processing_nodes,
     );
 
+    // `ScaledFlip`: what this reply carried for the plane (`SflCapN`, `SflCapSz`, `SflCapMpo`), so a
+    // knob that never reached dxgkrnl's caps query is told apart from one dxgkrnl ignored.
+    let planes_written = {
+        let end = offset_of!(DXGK_DRIVERCAPS, MaxOverlayPlanes) + size_of::<UINT>();
+        if crate::ddi::scaled_flip::on() && (args.OutputDataSize as usize) >= end {
+            crate::ddi::scaled_flip::planes()
+        } else {
+            0
+        }
+    };
+    crate::ddi::scaled_flip::note_caps(args.OutputDataSize, planes_written);
     // Recorded from the LOCALS, not read back out of dxgkrnl's buffer. Reading
     // back would need a second pointer into it for no benefit, and a field that
     // `set` skipped would report as 0 rather than as the value this driver

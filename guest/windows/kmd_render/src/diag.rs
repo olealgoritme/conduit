@@ -1416,6 +1416,13 @@ pub mod knobs {
     /// scan-out (the host scales it). Any other value is off. Read ONCE, in `DriverEntry` (the DDI
     /// table is built there): a change needs a reboot. Mirrored as `SflKnob`.
     pub const SCALED_FLIP: KnobName = KnobName::new(b"ScaledFlip");
+    /// `SflPlanes` (default 2, clamped to 1..=4): the `MaxOverlayPlanes` `ScaledFlip` reports
+    /// (`helios_kmd_logic::scaled_flip::planes_from_knob`). The host still shows one plane; the
+    /// check refuses two. Read in `DriverEntry`; mirrored as `SflPlRep`.
+    pub const SFL_PLANES: KnobName = KnobName::new(b"SflPlanes");
+    /// `SflDdis` (default 0): bit 0 also registers the first- and second-generation plane check
+    /// DDIs, which answer "not supported". Read in `DriverEntry`; mirrored as `SflDdisV`.
+    pub const SFL_DDIS: KnobName = KnobName::new(b"SflDdis");
     /// `D3d12Node` (default 0): 1 reports a second 3D node (ordinal 1) for the D3D12 UMD's
     /// contexts (`Umd12ContextNode`), completed independently of node 0 (DWM, D3D11,
     /// presents, paging): `virtio::gpu::MAX_WDDM_NODES`. Read with the other adapter knobs at

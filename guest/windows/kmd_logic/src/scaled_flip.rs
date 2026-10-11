@@ -69,9 +69,35 @@ impl Mode {
     }
 }
 
-/// The planes the adapter reports (`DXGK_DRIVERCAPS.MaxOverlayPlanes`, "including the primary
-/// surface"): the primary alone.
-pub const MAX_PLANES: u32 = 1;
+/// `SflPlanes` (service key, REG_DWORD; read in `DriverEntry` with [`KNOB`]): how many planes the
+/// adapter reports in `DXGK_DRIVERCAPS.MaxOverlayPlanes` ("including the primary surface") and the
+/// UMD in its caps. Whatever the count, the host shows ONE plane: [`check`] accepts a single enabled
+/// plane on any reported layer and refuses every configuration with two. 1 is the primary alone,
+/// which dxgkrnl on 405.59 did not take as overlay support (kmt 20 stayed 0, no plane DDI was
+/// called); 2 (the default) reports one overlay plane on top of it.
+pub const PLANES_KNOB: &str = "SflPlanes";
+pub const PLANES_DEFAULT: u32 = 2;
+/// The most layers the KMD tracks (`SflPlanes` is clamped to it).
+pub const MAX_LAYERS: usize = 4;
+
+/// The plane count for a `SflPlanes` value: 0 (absent) is the default, anything else is clamped
+/// to `1..=MAX_LAYERS`.
+pub const fn planes_from_knob(v: u32) -> u32 {
+    if v == 0 {
+        PLANES_DEFAULT
+    } else if v > MAX_LAYERS as u32 {
+        MAX_LAYERS as u32
+    } else {
+        v
+    }
+}
+
+/// `SflDdis` (service key, REG_DWORD, default 0; read in `DriverEntry`): bit 0 also registers the
+/// first- and second-generation check DDIs (`DxgkDdiCheckMultiPlaneOverlaySupport`,
+/// `...Support2`), which answer "not supported" to every query: a lever for the case where dxgkrnl
+/// wants them present before it takes the plane. No other bit is defined.
+pub const DDIS_KNOB: &str = "SflDdis";
+pub const DDIS_OLD_CHECKS: u32 = 1;
 /// The largest stretch per axis the KMD accepts (the destination at most this many times the
 /// source). The host scales any ratio; the bound keeps a degenerate source (a 64x64 buffer on a
 /// 5120x1440 output) composed. The UMD reports it as `MaxStretchFactor`.
@@ -211,7 +237,7 @@ pub struct Source {
 pub enum Why {
     /// More than one plane, or none and no post-composition transform.
     PlaneCount = 1,
-    /// A plane other than layer 0.
+    /// A layer beyond the planes the adapter reports.
     Layer = 2,
     /// The allocation is not one of this adapter's, or has no extent.
     NoSource = 3,
@@ -267,9 +293,12 @@ const fn rotation_ok(r: u32) -> bool {
 }
 
 /// The rule of `DxgkDdiCheckMultiPlaneOverlaySupport3` for one VidPn source showing a `mode`
-/// output. `planes` pairs each plane with its allocation's facts (`None`: unresolvable).
+/// output with `layers` planes reported. `planes` pairs each ENABLED plane of the query with its
+/// allocation's facts (`None`: unresolvable). One plane, on any reported layer, is the most the host
+/// shows.
 pub fn check(
     mode: (u32, u32),
+    layers: u32,
     planes: &[(Plane, Option<Source>)],
     post: Option<&Post>,
 ) -> Result<Fit, Why> {
@@ -300,7 +329,7 @@ pub fn check(
         ([one], _) => one,
         _ => return Err(Why::PlaneCount),
     };
-    if plane.layer != 0 {
+    if plane.layer >= layers {
         return Err(Why::Layer);
     }
     let Some(s) = source else {
@@ -404,33 +433,65 @@ pub const ANY_ADDRESS: u64 = u64::MAX;
 /// reported as "the last completed").
 pub const BOOK_SLOTS: usize = 16;
 
+/// The `PresentId`s one vsync retires: `(layer, PresentId)` for every layer that has one, the
+/// first `count` entries of `ids`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerIds {
+    pub ids: [(u32, u64); MAX_LAYERS],
+    pub count: usize,
+}
+
+impl LayerIds {
+    const fn empty() -> Self {
+        Self {
+            ids: [(0, 0); MAX_LAYERS],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, layer: u32, id: u64) {
+        if self.count < MAX_LAYERS {
+            self.ids[self.count] = (layer, id);
+            self.count += 1;
+        }
+    }
+
+    /// The entries in use.
+    pub fn as_slice(&self) -> &[(u32, u64)] {
+        &self.ids[..self.count]
+    }
+}
+
 /// What one vsync reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VsyncReport {
     /// `DXGK_INTERRUPT_CRTC_VSYNC` with the address, as without the knob.
     Legacy,
-    /// `DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2`, layer 0, this `PresentId`.
-    Mpo { present_id: u64 },
-    /// Both: dxgkrnl went back to the legacy flip DDI while MPO flips were still unreported.
-    Both { present_id: u64 },
+    /// `DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2` with these per-layer `PresentId`s.
+    Mpo(LayerIds),
+    /// Both: dxgkrnl went back to the legacy flip DDI while plane flips were still unreported;
+    /// these retire them, then the legacy vsync follows.
+    Both(LayerIds),
 }
 
-/// `(address, PresentId)` of the newest MPO3 flips, written by the flip DDI and read by the vsync.
+/// `(layer, address, PresentId)` of the newest plane flips, written by the flip DDI and read by the
+/// vsync.
 ///
 /// One writer at a time: dxgkrnl issues a VidPn source's flips one after the other (the DDI runs
 /// under its interrupt synchronization). Readers are lock-free: a seqlock over the slots, with a
-/// bounded number of retries, so a reader at DIRQL never spins on a writer it interrupted on the
-/// same processor (it reports the previous `PresentId` again instead).
+/// bounded number of retries, so a reader never spins on a writer that interrupted it on the same
+/// processor (it reports the previous `PresentId`s again instead).
 pub struct PresentBook {
     seq: AtomicU32,
     next: AtomicU32,
+    layer: [AtomicU32; BOOK_SLOTS],
     addr: [AtomicU64; BOOK_SLOTS],
     id: [AtomicU64; BOOK_SLOTS],
-    /// The newest `PresentId` recorded.
-    newest: AtomicU64,
-    /// The newest `PresentId` reported (never goes back).
-    reported: AtomicU64,
-    /// The newest flip came through the MPO3 DDI (cleared by a legacy `SetVidPnSourceAddress`).
+    /// The newest `PresentId` recorded, per layer.
+    newest: [AtomicU64; MAX_LAYERS],
+    /// The newest `PresentId` reported, per layer (never goes back).
+    reported: [AtomicU64; MAX_LAYERS],
+    /// The newest flip came through the plane DDI (cleared by a legacy `SetVidPnSourceAddress`).
     mpo_active: AtomicBool,
 }
 
@@ -441,10 +502,11 @@ impl PresentBook {
         Self {
             seq: AtomicU32::new(0),
             next: AtomicU32::new(0),
+            layer: [const { AtomicU32::new(0) }; BOOK_SLOTS],
             addr: [const { AtomicU64::new(0) }; BOOK_SLOTS],
             id: [const { AtomicU64::new(0) }; BOOK_SLOTS],
-            newest: AtomicU64::new(0),
-            reported: AtomicU64::new(0),
+            newest: [const { AtomicU64::new(0) }; MAX_LAYERS],
+            reported: [const { AtomicU64::new(0) }; MAX_LAYERS],
             mpo_active: AtomicBool::new(false),
         }
     }
@@ -453,30 +515,38 @@ impl PresentBook {
     pub fn reset(&self) {
         self.seq.fetch_add(1, Ordering::AcqRel);
         for i in 0..BOOK_SLOTS {
+            self.layer[i].store(0, Ordering::Relaxed);
             self.addr[i].store(0, Ordering::Relaxed);
             self.id[i].store(0, Ordering::Relaxed);
         }
+        for l in 0..MAX_LAYERS {
+            self.newest[l].store(0, Ordering::Relaxed);
+            self.reported[l].store(0, Ordering::Relaxed);
+        }
         self.next.store(0, Ordering::Relaxed);
-        self.newest.store(0, Ordering::Relaxed);
-        self.reported.store(0, Ordering::Relaxed);
         self.mpo_active.store(false, Ordering::Relaxed);
         self.seq.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// An MPO3 flip of plane 0 to `address` (or [`ANY_ADDRESS`]) with `present_id`.
-    pub fn record(&self, address: u64, present_id: u64) {
+    /// A plane flip of `layer` to `address` (or [`ANY_ADDRESS`]) with `present_id`. A layer beyond
+    /// [`MAX_LAYERS`] is ignored.
+    pub fn record(&self, layer: u32, address: u64, present_id: u64) {
+        if layer as usize >= MAX_LAYERS {
+            return;
+        }
         self.seq.fetch_add(1, Ordering::AcqRel); // odd: writing
         let slot = self.next.load(Ordering::Relaxed) as usize % BOOK_SLOTS;
+        self.layer[slot].store(layer, Ordering::Relaxed);
         self.addr[slot].store(address, Ordering::Relaxed);
         self.id[slot].store(present_id, Ordering::Relaxed);
         self.next
             .store((slot as u32 + 1) % BOOK_SLOTS as u32, Ordering::Relaxed);
-        self.newest.fetch_max(present_id, Ordering::Relaxed);
+        self.newest[layer as usize].fetch_max(present_id, Ordering::Relaxed);
         self.mpo_active.store(true, Ordering::Relaxed);
         self.seq.fetch_add(1, Ordering::AcqRel); // even: done
     }
 
-    /// A flip through the legacy `DxgkDdiSetVidPnSourceAddress`: dxgkrnl left MPO mode.
+    /// A flip through the legacy `DxgkDdiSetVidPnSourceAddress`: dxgkrnl left plane mode.
     pub fn legacy_flip(&self) {
         self.mpo_active.store(false, Ordering::Release);
     }
@@ -485,55 +555,64 @@ impl PresentBook {
         self.mpo_active.load(Ordering::Acquire)
     }
 
-    /// The newest `PresentId` recorded for `address` (or for [`ANY_ADDRESS`]); `None` when there
-    /// is none or the slots kept changing under the reader.
-    fn lookup(&self, address: u64) -> Option<u64> {
+    /// Per layer, the newest `PresentId` recorded for `address` (or for [`ANY_ADDRESS`]); `None`
+    /// when the slots kept changing under the reader.
+    fn lookup(&self, address: u64) -> Option<[u64; MAX_LAYERS]> {
         for _ in 0..READ_TRIES {
             let s1 = self.seq.load(Ordering::Acquire);
             if s1 & 1 != 0 {
                 core::hint::spin_loop();
                 continue;
             }
-            let mut best: Option<u64> = None;
+            let mut best = [0u64; MAX_LAYERS];
             for i in 0..BOOK_SLOTS {
                 let id = self.id[i].load(Ordering::Relaxed);
                 if id == 0 {
                     continue;
                 }
                 let a = self.addr[i].load(Ordering::Relaxed);
-                if a == address || a == ANY_ADDRESS {
-                    best = Some(best.map_or(id, |b: u64| b.max(id)));
+                let l = self.layer[i].load(Ordering::Relaxed) as usize;
+                if l < MAX_LAYERS && (a == address || a == ANY_ADDRESS) {
+                    best[l] = best[l].max(id);
                 }
             }
             if self.seq.load(Ordering::Acquire) == s1 {
-                return best;
+                return Some(best);
             }
         }
         None
     }
 
-    /// What the vsync that reports `address` delivers. Updates the reported `PresentId`.
+    /// What the vsync that reports `address` delivers. Updates the reported `PresentId`s.
     pub fn on_vsync(&self, address: u64) -> VsyncReport {
+        let mut out = LayerIds::empty();
         if self.mpo_active() {
-            let found = self.lookup(address);
-            let prev = match found {
-                Some(id) => self.reported.fetch_max(id, Ordering::AcqRel),
-                None => self.reported.load(Ordering::Acquire),
-            };
-            let id = found.map_or(prev, |f| f.max(prev));
-            return if id == 0 {
-                // No MPO flip was ever retired: nothing to name yet.
+            let found = self.lookup(address).unwrap_or([0; MAX_LAYERS]);
+            for (l, f) in found.iter().enumerate() {
+                let prev = self.reported[l].fetch_max(*f, Ordering::AcqRel);
+                let id = prev.max(*f);
+                if id != 0 {
+                    out.push(l as u32, id);
+                }
+            }
+            return if out.count == 0 {
+                // No plane flip was ever retired: nothing to name yet.
                 VsyncReport::Legacy
             } else {
-                VsyncReport::Mpo { present_id: id }
+                VsyncReport::Mpo(out)
             };
         }
-        let newest = self.newest.load(Ordering::Acquire);
-        let prev = self.reported.fetch_max(newest, Ordering::AcqRel);
-        if newest > prev {
-            VsyncReport::Both { present_id: newest }
-        } else {
+        for l in 0..MAX_LAYERS {
+            let newest = self.newest[l].load(Ordering::Acquire);
+            let prev = self.reported[l].fetch_max(newest, Ordering::AcqRel);
+            if newest > prev {
+                out.push(l as u32, newest);
+            }
+        }
+        if out.count == 0 {
             VsyncReport::Legacy
+        } else {
+            VsyncReport::Both(out)
         }
     }
 }
@@ -545,7 +624,7 @@ impl Default for PresentBook {
 }
 
 /// The counters (`ddi/scaled_flip.rs` writes exactly these, at most 13 characters).
-pub const COUNTERS: [&str; 14] = [
+pub const COUNTERS: [&str; 20] = [
     "SflKnob",
     "SflChk",
     "SflChkOk",
@@ -560,6 +639,12 @@ pub const COUNTERS: [&str; 14] = [
     "SflPrDma",
     "SflLayer",
     "SflVsErr",
+    "SflPlRep",
+    "SflDdisV",
+    "SflOldChk",
+    "SflCapN",
+    "SflCapSz",
+    "SflCapMpo",
 ];
 
 #[cfg(test)]
@@ -569,6 +654,47 @@ mod tests {
     use std::vec::Vec;
 
     const MODE: (u32, u32) = (5120, 1440);
+
+    fn ids(v: &[(u32, u64)]) -> LayerIds {
+        let mut l = LayerIds::empty();
+        for &(layer, id) in v {
+            l.push(layer, id);
+        }
+        l
+    }
+
+    fn mpo(v: &[(u32, u64)]) -> VsyncReport {
+        VsyncReport::Mpo(ids(v))
+    }
+
+    fn both(v: &[(u32, u64)]) -> VsyncReport {
+        VsyncReport::Both(ids(v))
+    }
+
+    #[test]
+    fn the_plane_count_knob_defaults_to_two_and_is_clamped() {
+        assert_eq!(planes_from_knob(0), PLANES_DEFAULT);
+        assert_eq!(PLANES_DEFAULT, 2);
+        assert_eq!(planes_from_knob(1), 1);
+        assert_eq!(planes_from_knob(3), 3);
+        assert_eq!(planes_from_knob(99), MAX_LAYERS as u32);
+    }
+
+    #[test]
+    fn each_layer_retires_its_own_present_ids() {
+        let b = PresentBook::new();
+        // The desktop on layer 0 is disabled (retires at the next vsync), the game on layer 1.
+        b.record(0, ANY_ADDRESS, 40);
+        b.record(1, 0x7000, 41);
+        assert_eq!(b.on_vsync(0x7000), mpo(&[(0, 40), (1, 41)]));
+        b.record(1, 0x8000, 42);
+        // Still the old buffer on screen: layer 1 repeats 41.
+        assert_eq!(b.on_vsync(0x7000), mpo(&[(0, 40), (1, 41)]));
+        assert_eq!(b.on_vsync(0x8000), mpo(&[(0, 40), (1, 42)]));
+        // A layer beyond the tracked ones is ignored.
+        b.record(MAX_LAYERS as u32, 0x8000, 99);
+        assert_eq!(b.on_vsync(0x8000), mpo(&[(0, 40), (1, 42)]));
+    }
 
     fn plane(src: Rect, dst: Rect) -> Plane {
         Plane {
@@ -615,7 +741,7 @@ mod tests {
     fn the_desktop_plane_at_the_mode_is_supported_unscaled() {
         let p = plane(Rect::sized(5120, 1440), Rect::sized(5120, 1440));
         assert_eq!(
-            check(MODE, &[(p, nvk(5120, 1440))], None),
+            check(MODE, 2, &[(p, nvk(5120, 1440))], None),
             Ok(Fit { scaled: false })
         );
         // A Venus allocation at the mode is fine too (every arm shows the mode's extent).
@@ -623,7 +749,10 @@ mod tests {
             foreign: false,
             ..nvk(5120, 1440).unwrap()
         });
-        assert_eq!(check(MODE, &[(p, venus)], None), Ok(Fit { scaled: false }));
+        assert_eq!(
+            check(MODE, 2, &[(p, venus)], None),
+            Ok(Fit { scaled: false })
+        );
     }
 
     #[test]
@@ -635,7 +764,7 @@ mod tests {
             Rect::new(1281, 0, 3839, 1440),
         ] {
             assert_eq!(
-                check(MODE, &[(plane(src, dst), nvk(1600, 900))], None),
+                check(MODE, 2, &[(plane(src, dst), nvk(1600, 900))], None),
                 Ok(Fit { scaled: true }),
                 "{dst:?}"
             );
@@ -648,13 +777,13 @@ mod tests {
         // 1:1 in the middle of the output.
         let centred = Rect::new(1760, 270, 3360, 1170);
         assert_eq!(
-            check(MODE, &[(plane(src, centred), nvk(1600, 900))], None),
+            check(MODE, 2, &[(plane(src, centred), nvk(1600, 900))], None),
             Err(Why::DstRect)
         );
         // A window-sized overlay somewhere on the desktop.
         let window = Rect::new(100, 100, 1700, 1000);
         assert_eq!(
-            check(MODE, &[(plane(src, window), nvk(1600, 900))], None),
+            check(MODE, 2, &[(plane(src, window), nvk(1600, 900))], None),
             Err(Why::DstRect)
         );
     }
@@ -662,7 +791,10 @@ mod tests {
     #[test]
     fn only_the_whole_buffer_may_be_the_source() {
         let p = plane(Rect::new(0, 0, 1600, 800), Rect::sized(5120, 1440));
-        assert_eq!(check(MODE, &[(p, nvk(1600, 900))], None), Err(Why::SrcRect));
+        assert_eq!(
+            check(MODE, 2, &[(p, nvk(1600, 900))], None),
+            Err(Why::SrcRect)
+        );
     }
 
     #[test]
@@ -678,7 +810,7 @@ mod tests {
                 dxgi_format: fmt,
                 ..nvk(1600, 900).unwrap()
             });
-            assert_eq!(check(MODE, &[(p, s)], None), Err(Why::Format), "{fmt}");
+            assert_eq!(check(MODE, 2, &[(p, s)], None), Err(Why::Format), "{fmt}");
         }
     }
 
@@ -689,6 +821,7 @@ mod tests {
         assert_eq!(
             check(
                 MODE,
+                2,
                 &[(
                     Plane {
                         rotation: 2,
@@ -701,20 +834,21 @@ mod tests {
             Err(Why::Rotation)
         );
         assert_eq!(
-            check(MODE, &[(Plane { flags: 1, ..base }, s)], None),
+            check(MODE, 2, &[(Plane { flags: 1, ..base }, s)], None),
             Err(Why::Mirror)
         );
         assert_eq!(
-            check(MODE, &[(Plane { flags: 4, ..base }, s)], None),
+            check(MODE, 2, &[(Plane { flags: 4, ..base }, s)], None),
             Err(Why::Mirror)
         );
         assert_eq!(
-            check(MODE, &[(Plane { blend: 1, ..base }, s)], None),
+            check(MODE, 2, &[(Plane { blend: 1, ..base }, s)], None),
             Err(Why::Blend)
         );
         assert_eq!(
             check(
                 MODE,
+                2,
                 &[(
                     Plane {
                         color_space: 12,
@@ -730,10 +864,11 @@ mod tests {
             clip: Rect::new(0, 0, 2560, 1440),
             ..base
         };
-        assert_eq!(check(MODE, &[(clipped, s)], None), Err(Why::Clip));
+        assert_eq!(check(MODE, 2, &[(clipped, s)], None), Err(Why::Clip));
         // Rotation 0 (unset) is identity.
         assert!(check(
             MODE,
+            2,
             &[(
                 Plane {
                     rotation: 0,
@@ -747,26 +882,32 @@ mod tests {
     }
 
     #[test]
-    fn more_than_one_plane_or_another_layer_is_refused() {
+    fn more_than_one_plane_or_an_unreported_layer_is_refused() {
         let p = plane(Rect::sized(1600, 900), Rect::sized(5120, 1440));
         let s = nvk(1600, 900);
         assert_eq!(
-            check(MODE, &[(p, s), (Plane { layer: 1, ..p }, s)], None),
+            check(MODE, 2, &[(p, s), (Plane { layer: 1, ..p }, s)], None),
             Err(Why::PlaneCount)
         );
         assert_eq!(
-            check(MODE, &[(Plane { layer: 1, ..p }, s)], None),
+            check(MODE, 2, &[(Plane { layer: 2, ..p }, s)], None),
             Err(Why::Layer)
         );
-        assert_eq!(check(MODE, &[], None), Err(Why::PlaneCount));
-        assert_eq!(check(MODE, &[(p, None)], None), Err(Why::NoSource));
+        assert_eq!(
+            check(MODE, 1, &[(Plane { layer: 1, ..p }, s)], None),
+            Err(Why::Layer)
+        );
+        // The one enabled plane may be the overlay layer (the desktop plane disabled).
+        assert!(check(MODE, 2, &[(Plane { layer: 1, ..p }, s)], None).is_ok());
+        assert_eq!(check(MODE, 2, &[], None), Err(Why::PlaneCount));
+        assert_eq!(check(MODE, 2, &[(p, None)], None), Err(Why::NoSource));
     }
 
     #[test]
     fn larger_than_the_mode_never() {
         let p = plane(Rect::sized(5200, 1440), Rect::sized(5120, 1440));
         assert_eq!(
-            check(MODE, &[(p, nvk(5200, 1440))], None),
+            check(MODE, 2, &[(p, nvk(5200, 1440))], None),
             Err(Why::TooLarge)
         );
     }
@@ -778,15 +919,18 @@ mod tests {
             foreign: false,
             ..nvk(1600, 900).unwrap()
         });
-        assert_eq!(check(MODE, &[(p, venus)], None), Err(Why::NotForeign));
+        assert_eq!(check(MODE, 2, &[(p, venus)], None), Err(Why::NotForeign));
     }
 
     #[test]
     fn a_tiny_buffer_is_beyond_the_stretch_bound() {
         let p = plane(Rect::sized(320, 90), Rect::sized(5120, 1440));
-        assert_eq!(check(MODE, &[(p, nvk(320, 90))], None), Err(Why::Stretch));
+        assert_eq!(
+            check(MODE, 2, &[(p, nvk(320, 90))], None),
+            Err(Why::Stretch)
+        );
         let p = plane(Rect::sized(640, 180), Rect::sized(5120, 1440));
-        assert!(check(MODE, &[(p, nvk(640, 180))], None).is_ok());
+        assert!(check(MODE, 2, &[(p, nvk(640, 180))], None).is_ok());
     }
 
     #[test]
@@ -800,30 +944,30 @@ mod tests {
         };
         let p = plane(virt, virt);
         assert_eq!(
-            check(MODE, &[(p, nvk(1600, 900))], Some(&post)),
+            check(MODE, 2, &[(p, nvk(1600, 900))], Some(&post)),
             Ok(Fit { scaled: true })
         );
         // The query of the transform alone.
-        assert_eq!(check(MODE, &[], Some(&post)), Ok(Fit { scaled: true }));
+        assert_eq!(check(MODE, 2, &[], Some(&post)), Ok(Fit { scaled: true }));
         // A plane that does not fill the virtual mode.
         let half = plane(virt, Rect::sized(800, 900));
         assert_eq!(
-            check(MODE, &[(half, nvk(1600, 900))], Some(&post)),
+            check(MODE, 2, &[(half, nvk(1600, 900))], Some(&post)),
             Err(Why::PostRect)
         );
         // A transform that mirrors or is not at the origin.
         let mirrored = Post { flags: 1, ..post };
-        assert_eq!(check(MODE, &[], Some(&mirrored)), Err(Why::PostRect));
+        assert_eq!(check(MODE, 2, &[], Some(&mirrored)), Err(Why::PostRect));
         let shifted = Post {
             src: Rect::new(10, 0, 1610, 900),
             ..post
         };
-        assert_eq!(check(MODE, &[], Some(&shifted)), Err(Why::PostRect));
+        assert_eq!(check(MODE, 2, &[], Some(&shifted)), Err(Why::PostRect));
         let bigger = Post {
             src: Rect::sized(6000, 1440),
             ..post
         };
-        assert_eq!(check(MODE, &[], Some(&bigger)), Err(Why::PostRect));
+        assert_eq!(check(MODE, 2, &[], Some(&bigger)), Err(Why::PostRect));
     }
 
     #[test]
@@ -859,67 +1003,67 @@ mod tests {
     fn the_book_reports_the_newest_present_id_of_the_shown_address() {
         let b = PresentBook::new();
         assert_eq!(b.on_vsync(0x1000), VsyncReport::Legacy, "no MPO flip yet");
-        b.record(0x1000, 10);
-        b.record(0x2000, 11);
+        b.record(0, 0x1000, 10);
+        b.record(0, 0x2000, 11);
         // The vsync still shows the first buffer.
-        assert_eq!(b.on_vsync(0x1000), VsyncReport::Mpo { present_id: 10 });
+        assert_eq!(b.on_vsync(0x1000), mpo(&[(0, 10)]));
         // The second is shown.
-        assert_eq!(b.on_vsync(0x2000), VsyncReport::Mpo { present_id: 11 });
+        assert_eq!(b.on_vsync(0x2000), mpo(&[(0, 11)]));
         // A swap chain of two: the first address again, a newer id.
-        b.record(0x1000, 12);
-        assert_eq!(b.on_vsync(0x1000), VsyncReport::Mpo { present_id: 12 });
+        b.record(0, 0x1000, 12);
+        assert_eq!(b.on_vsync(0x1000), mpo(&[(0, 12)]));
     }
 
     #[test]
     fn the_reported_present_id_never_goes_back() {
         let b = PresentBook::new();
-        b.record(0x1000, 10);
-        b.record(0x2000, 11);
-        assert_eq!(b.on_vsync(0x2000), VsyncReport::Mpo { present_id: 11 });
+        b.record(0, 0x1000, 10);
+        b.record(0, 0x2000, 11);
+        assert_eq!(b.on_vsync(0x2000), mpo(&[(0, 11)]));
         // A late vsync carrying the older address re-reports 11, not 10.
-        assert_eq!(b.on_vsync(0x1000), VsyncReport::Mpo { present_id: 11 });
+        assert_eq!(b.on_vsync(0x1000), mpo(&[(0, 11)]));
         // An address the book does not know repeats the last report.
-        assert_eq!(b.on_vsync(0x9999), VsyncReport::Mpo { present_id: 11 });
+        assert_eq!(b.on_vsync(0x9999), mpo(&[(0, 11)]));
     }
 
     #[test]
     fn a_disabled_plane_retires_at_the_next_vsync() {
         let b = PresentBook::new();
-        b.record(0x1000, 5);
-        assert_eq!(b.on_vsync(0x1000), VsyncReport::Mpo { present_id: 5 });
-        b.record(ANY_ADDRESS, 6);
-        assert_eq!(b.on_vsync(0x1000), VsyncReport::Mpo { present_id: 6 });
+        b.record(0, 0x1000, 5);
+        assert_eq!(b.on_vsync(0x1000), mpo(&[(0, 5)]));
+        b.record(0, ANY_ADDRESS, 6);
+        assert_eq!(b.on_vsync(0x1000), mpo(&[(0, 6)]));
     }
 
     #[test]
     fn leaving_mpo_mode_flushes_the_unreported_ids_once() {
         let b = PresentBook::new();
-        b.record(0x1000, 20);
-        b.record(0x2000, 21);
+        b.record(0, 0x1000, 20);
+        b.record(0, 0x2000, 21);
         b.legacy_flip();
         assert!(!b.mpo_active());
-        assert_eq!(b.on_vsync(0x3000), VsyncReport::Both { present_id: 21 });
+        assert_eq!(b.on_vsync(0x3000), both(&[(0, 21)]));
         assert_eq!(b.on_vsync(0x3000), VsyncReport::Legacy);
         // Back in MPO mode.
-        b.record(0x1000, 22);
-        assert_eq!(b.on_vsync(0x1000), VsyncReport::Mpo { present_id: 22 });
+        b.record(0, 0x1000, 22);
+        assert_eq!(b.on_vsync(0x1000), mpo(&[(0, 22)]));
     }
 
     #[test]
     fn more_flips_than_slots_keep_the_newest() {
         let b = PresentBook::new();
         for i in 0..(BOOK_SLOTS as u64 * 3) {
-            b.record(0x1000 + (i % 3) * 0x1000, 100 + i);
+            b.record(0, 0x1000 + (i % 3) * 0x1000, 100 + i);
         }
         let last = 100 + BOOK_SLOTS as u64 * 3 - 1;
         let last_addr = 0x1000 + ((BOOK_SLOTS as u64 * 3 - 1) % 3) * 0x1000;
-        assert_eq!(b.on_vsync(last_addr), VsyncReport::Mpo { present_id: last });
+        assert_eq!(b.on_vsync(last_addr), mpo(&[(0, last)]));
     }
 
     #[test]
     fn reset_forgets_everything() {
         let b = PresentBook::new();
-        b.record(0x1000, 7);
+        b.record(0, 0x1000, 7);
         b.reset();
         assert!(!b.mpo_active());
         assert_eq!(b.on_vsync(0x1000), VsyncReport::Legacy);
@@ -934,15 +1078,18 @@ mod tests {
             std::thread::spawn(move || {
                 // Even ids at 0x1000, odd ids at 0x2000.
                 for id in 1..20_000u64 {
-                    b.record(if id % 2 == 0 { 0x1000 } else { 0x2000 }, id);
+                    b.record(0, if id % 2 == 0 { 0x1000 } else { 0x2000 }, id);
                 }
             })
         };
         let mut seen: Vec<u64> = Vec::new();
         for _ in 0..20_000 {
-            if let Some(id) = b.lookup(0x1000) {
-                assert_eq!(id % 2, 0, "id {id} is not one of 0x1000's");
-                seen.push(id);
+            if let Some(ids) = b.lookup(0x1000) {
+                let id = ids[0];
+                if id != 0 {
+                    assert_eq!(id % 2, 0, "id {id} is not one of 0x1000's");
+                    seen.push(id);
+                }
             }
         }
         w.join().unwrap();

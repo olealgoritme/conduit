@@ -40,6 +40,17 @@ use crate::dxgk::*;
 
 /// The knob as read in `DriverEntry` (raw).
 static KNOB: AtomicU32 = AtomicU32::new(0);
+/// `SflPlanes` as read in `DriverEntry` (the count reported, `sf::planes_from_knob`).
+static PLANES: AtomicU32 = AtomicU32::new(sf::PLANES_DEFAULT);
+/// `SflDdis` as read in `DriverEntry` (raw).
+static DDIS: AtomicU32 = AtomicU32::new(0);
+/// The DRIVERCAPS replies: how many, the buffer size of the last, and the plane count it carried
+/// (0: the knob was off or the field did not fit). Not zeroed at StartDevice: dxgkrnl may ask
+/// before it.
+static CAP_N: AtomicU32 = AtomicU32::new(0);
+static CAP_SZ: AtomicU32 = AtomicU32::new(0);
+static CAP_MPO: AtomicU32 = AtomicU32::new(0);
+static OLD_CHK: AtomicU32 = AtomicU32::new(0);
 /// The `PresentId`s of plane flips, by address.
 static BOOK: sf::PresentBook = sf::PresentBook::new();
 /// Which vsync interrupt types dxgkrnl has enabled: bit 0 `CRTC_VSYNC`, bit 1 the MPO forms.
@@ -71,6 +82,29 @@ fn bump(c: &AtomicU32) {
 pub(crate) fn read_knob_at_driver_entry() {
     let v = crate::diag::read_config_dword(crate::diag::knobs::SCALED_FLIP, sf::KNOB_DEFAULT);
     KNOB.store(v, Ordering::Relaxed);
+    let planes = crate::diag::read_config_dword(crate::diag::knobs::SFL_PLANES, 0);
+    PLANES.store(sf::planes_from_knob(planes), Ordering::Relaxed);
+    let ddis = crate::diag::read_config_dword(crate::diag::knobs::SFL_DDIS, 0);
+    DDIS.store(ddis, Ordering::Relaxed);
+}
+
+/// The plane count the caps report (`SflPlanes`). Any IRQL.
+pub(crate) fn planes() -> u32 {
+    PLANES.load(Ordering::Relaxed)
+}
+
+/// Whether the first- and second-generation check DDIs are registered too (`SflDdis` bit 0).
+pub(crate) fn old_checks() -> bool {
+    on() && DDIS.load(Ordering::Relaxed) & sf::DDIS_OLD_CHECKS != 0
+}
+
+/// A `DXGKQAITYPE_DRIVERCAPS` reply: `size` is the buffer dxgkrnl gave, `planes` the
+/// `MaxOverlayPlanes` written into it (0 when not written). PASSIVE; atomics, mirrored by the dump.
+pub(crate) fn note_caps(size: u32, planes: u32) {
+    CAP_N.fetch_add(1, Ordering::Relaxed);
+    CAP_SZ.store(size, Ordering::Relaxed);
+    CAP_MPO.store(planes, Ordering::Relaxed);
+    DIRTY.store(1, Ordering::Relaxed);
 }
 
 /// Whether the surface is on for this driver load. Any IRQL.
@@ -85,7 +119,7 @@ pub(crate) fn reset_for_start() {
     VSYNC_TYPES.store(VS_LEGACY, Ordering::Relaxed);
     for c in [
         &CHK, &CHK_OK, &WHY, &FLIP, &SCALED, &OFF, &BAD, &VS_MPO_N, &VS_BOTH, &PRESENT, &PR_DMA,
-        &LAYER, &VS_ERR,
+        &LAYER, &VS_ERR, &OLD_CHK,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -117,6 +151,12 @@ fn write_block() {
     crate::diag::record_named_bytes(b"SflPrDma", r(&PR_DMA));
     crate::diag::record_named_bytes(b"SflLayer", r(&LAYER));
     crate::diag::record_named_bytes(b"SflVsErr", r(&VS_ERR));
+    crate::diag::record_named_bytes(b"SflPlRep", if on() { planes() } else { 0 });
+    crate::diag::record_named_bytes(b"SflDdisV", r(&DDIS));
+    crate::diag::record_named_bytes(b"SflOldChk", r(&OLD_CHK));
+    crate::diag::record_named_bytes(b"SflCapN", r(&CAP_N));
+    crate::diag::record_named_bytes(b"SflCapSz", r(&CAP_SZ));
+    crate::diag::record_named_bytes(b"SflCapMpo", r(&CAP_MPO));
 }
 
 /// A flip through the legacy `DxgkDdiSetVidPnSourceAddress` (any IRQL; one store).
@@ -197,28 +237,32 @@ pub(crate) unsafe fn signal_vsync(
     }
     match BOOK.on_vsync(physical_address as u64) {
         VsyncReport::Legacy => None,
-        VsyncReport::Mpo { present_id } => {
+        VsyncReport::Mpo(ids) => {
             bump(&VS_MPO_N);
-            Some(unsafe { notify_mpo_vsync(dxgkrnl, present_id, target_id) })
+            Some(unsafe { notify_mpo_vsync(dxgkrnl, ids.as_slice(), target_id) })
         }
-        VsyncReport::Both { present_id } => {
+        VsyncReport::Both(ids) => {
             bump(&VS_BOTH);
-            let _ = unsafe { notify_mpo_vsync(dxgkrnl, present_id, target_id) };
+            let _ = unsafe { notify_mpo_vsync(dxgkrnl, ids.as_slice(), target_id) };
             None
         }
     }
 }
 
-/// `DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2` with one entry: layer 0, `present_id`.
+/// `DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2` with one entry per layer of `ids`.
 unsafe fn notify_mpo_vsync(
     dxgkrnl: &DXGKRNL_INTERFACE,
-    present_id: u64,
+    ids: &[(u32, u64)],
     target_id: u32,
 ) -> NTSTATUS {
     // SAFETY: all-zero is a valid value of both plain-data structs.
-    let mut info = unsafe { core::mem::zeroed::<DXGK_MULTIPLANE_OVERLAY_VSYNC_INFO2>() };
-    info.LayerIndex = 0;
-    info.PresentId = present_id;
+    let mut info =
+        unsafe { core::mem::zeroed::<[DXGK_MULTIPLANE_OVERLAY_VSYNC_INFO2; sf::MAX_LAYERS]>() };
+    let n = ids.len().min(sf::MAX_LAYERS);
+    for (slot, &(layer, id)) in info.iter_mut().zip(ids.iter()) {
+        slot.LayerIndex = layer;
+        slot.PresentId = id;
+    }
     let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
     interrupt.InterruptType =
         _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2;
@@ -230,8 +274,8 @@ unsafe fn notify_mpo_vsync(
             .as_mut()
     };
     vsync.VidPnTargetId = target_id;
-    vsync.MultiPlaneOverlayVsyncInfoCount = 1;
-    vsync.pMultiPlaneOverlayVsyncInfo = &mut info;
+    vsync.MultiPlaneOverlayVsyncInfoCount = n as u32;
+    vsync.pMultiPlaneOverlayVsyncInfo = info.as_mut_ptr();
     // SAFETY: fully initialised packet; `info` outlives the synchronous notification.
     let status = unsafe { crate::ddi::submit_command::notify_at_dirql(dxgkrnl, &mut interrupt) };
     if status != STATUS_SUCCESS {
@@ -358,7 +402,12 @@ unsafe fn judge_query(
         }
         _ => return Err(sf::Why::PostRect),
     };
-    sf::check(adapter.scanout_extent(), &planes[..count], post.as_ref())
+    sf::check(
+        adapter.scanout_extent(),
+        self::planes(),
+        &planes[..count],
+        post.as_ref(),
+    )
 }
 
 const fn plane_of_default() -> Plane {
@@ -413,6 +462,9 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_mpo3(
         return STATUS_INVALID_PARAMETER;
     }
     let mut status = STATUS_SUCCESS;
+    // The host shows one plane: the first enabled plane of the call is the one flipped. The check
+    // refused every configuration with two, so a second is unexpected; it is retired, not shown.
+    let mut shown = false;
     for i in 0..a.PlaneCount as usize {
         // SAFETY: `ppPlanes` holds `PlaneCount` pointers.
         let pp = unsafe { *a.ppPlanes.add(i) };
@@ -422,16 +474,19 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_mpo3(
         let plane = unsafe { &mut *pp };
         // No conversion to immediate, no PostPresent wanted.
         plane.OutputFlags.__bindgen_anon_1.Value = 0;
-        if plane.LayerIndex != 0 {
-            // `MaxOverlayPlanes` is 1: dxgkrnl has no other layer to flip.
-            bump(&LAYER);
-            continue;
-        }
+        let layer = plane.LayerIndex;
         // SAFETY: POD union of a bitfield struct and a `UINT` `Value`.
         let input = unsafe { plane.InputFlags.__bindgen_anon_1.Value };
-        if input & sf::plane_input::ENABLED == 0 {
-            BOOK.record(ANY_ADDRESS, plane.PresentId);
+        if input & sf::plane_input::ENABLED == 0 || shown || layer >= planes() {
+            if input & sf::plane_input::ENABLED != 0 {
+                // A second enabled plane, or a layer beyond the reported planes.
+                bump(&BAD);
+            }
+            BOOK.record(layer, ANY_ADDRESS, plane.PresentId);
             continue;
+        }
+        if layer != 0 {
+            bump(&LAYER);
         }
         if plane.ContextCount == 0 || plane.ppContextData.is_null() {
             bump(&BAD);
@@ -465,7 +520,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_mpo3(
         }
         bump(&FLIP);
         // Recorded first: an immediate flip may be retired before the shared body returns.
-        BOOK.record(address, plane.PresentId);
+        BOOK.record(layer, address, plane.PresentId);
+        shown = true;
         let s = unsafe {
             crate::ddi::display::set_vidpn_source_address_common(
                 adapter,
@@ -492,5 +548,45 @@ pub unsafe extern "C" fn dxgkddi_post_mpo_present(
     _h_adapter: IN_CONST_HANDLE,
     _args: IN_CONST_PDXGKARG_POSTMULTIPLANEOVERLAYPRESENT,
 ) -> NTSTATUS {
+    STATUS_SUCCESS
+}
+
+/// `DxgkDdiCheckMultiPlaneOverlaySupport` (first generation; registered only with `SflDdis` bit 0).
+/// Always "not supported": this adapter's configurations are judged by the third-generation check.
+///
+/// # Safety
+/// Called by dxgkrnl with its argument struct live for the call.
+pub unsafe extern "C" fn dxgkddi_check_mpo_support(
+    _h_adapter: IN_CONST_HANDLE,
+    args: IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT,
+) -> NTSTATUS {
+    if args.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let a = unsafe { &mut *args };
+    a.Supported = 0;
+    // SAFETY: all-zero is "no limitation reported".
+    a.ReturnInfo = unsafe { core::mem::zeroed() };
+    bump(&OLD_CHK);
+    STATUS_SUCCESS
+}
+
+/// `DxgkDdiCheckMultiPlaneOverlaySupport2` (second generation; registered only with `SflDdis`
+/// bit 0). Always "not supported", as [`dxgkddi_check_mpo_support`].
+///
+/// # Safety
+/// Called by dxgkrnl with its argument struct live for the call.
+pub unsafe extern "C" fn dxgkddi_check_mpo_support2(
+    _h_adapter: IN_CONST_HANDLE,
+    args: IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT2,
+) -> NTSTATUS {
+    if args.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let a = unsafe { &mut *args };
+    a.Supported = 0;
+    // SAFETY: all-zero is "no limitation reported".
+    a.ReturnInfo = unsafe { core::mem::zeroed() };
+    bump(&OLD_CHK);
     STATUS_SUCCESS
 }

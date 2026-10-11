@@ -4926,10 +4926,11 @@ mod shared_format_tests {
         }
         assert!(checked > 20);
         assert!(mentions >= 1);
-        // The plane count the caps report is the logic's: the primary alone, never a YUV plane.
-        assert_eq!(crate::scaled_flip::MAX_PLANES, 1);
+        // The plane count the caps report is the scaled-flip surface's (`SflPlanes`, at most
+        // `MAX_LAYERS`), and no YUV plane is ever reported (the check refuses YUV on every layer).
+        assert!(crate::scaled_flip::planes_from_knob(u32::MAX) as usize <= crate::scaled_flip::MAX_LAYERS);
         let caps = std::fs::read_to_string(root.join("ddi/query_adapter_info.rs")).unwrap();
-        assert!(caps.contains("let planes: UINT = helios_kmd_logic::scaled_flip::MAX_PLANES;"));
+        assert!(caps.contains("let planes: UINT = crate::ddi::scaled_flip::planes();"));
         assert!(!caps.contains("MaxYUVPlanes"));
     }
 }

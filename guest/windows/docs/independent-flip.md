@@ -1643,14 +1643,14 @@ flag the output switches to the listed mode and the chain is promoted at that mo
 
 | piece | where | what |
 |---|---|---|
-| caps | `query_adapter_info.rs` | `SupportMultiPlaneOverlay` 1, `MaxOverlayPlanes` 1 (the primary), `SupportMultiPlaneOverlayImmediateFlip` 1 when the flip caps carry `FlipImmediateMmIo` (`ImmFlip` bit 2, default on), `MaxQueuedMultiPlaneOverlayFlipVSync` = the flip queue depth. `CursorScaledWithMultiPlaneOverlayPlane0` stays 0 |
-| DDI table | `lib.rs` | the three 2.1 plane DDIs, only with the knob |
-| check | `scaled_flip.rs` `dxgkddi_check_mpo_support3`, rule `helios_kmd_logic::scaled_flip::check` | supported only for one plane, layer 0, source 0: the whole buffer (`SrcRect` = the allocation's extent) shown at the whole output or at the aspect-correct centred rectangle (2 px slack), directly or through a post-composition transform whose source is the plane's destination at the origin; one of DXGI 28/87/88; no rotation, mirror, alpha blend or non-sRGB colour space; clip containing the destination; no larger than the mode; at most 8x stretch per axis; a buffer smaller than the mode only if it is an NVK (foreign) buffer, the only kind `ForeignFlip` shows at its own size. Anything else is refused and dxgkrnl composes |
-| plane flip | `dxgkddi_set_vidpn_source_address_mpo3` | plane 0 enabled: the legacy flip body (`display::set_vidpn_source_address_common`) with `ppContextData[0]`'s allocation and address and the legacy flags its plane flags stand for (`legacy_flags_of`), so immediacy, `ForeignFlip`, the announce and keep paths and every counter behave as for a legacy flip. Disabled plane: the picture stays, the `PresentId` retires at the next vsync. Other layers: counted (`SflLayer`) and ignored. No output flag is set (no PrePresent, no PostPresent, no conversion) |
+| caps | `query_adapter_info.rs` | `SupportMultiPlaneOverlay` 1, `MaxOverlayPlanes` = `SflPlanes` (default 2: the primary and one overlay plane; 1..4), `SupportMultiPlaneOverlayImmediateFlip` 1 when the flip caps carry `FlipImmediateMmIo` (`ImmFlip` bit 2, default on), `MaxQueuedMultiPlaneOverlayFlipVSync` = the flip queue depth. `CursorScaledWithMultiPlaneOverlayPlane0` stays 0. Each reply is counted (`SflCapN`, `SflCapSz` = the buffer size dxgkrnl gave, `SflCapMpo` = the plane count written, 0 if it did not fit) |
+| DDI table | `lib.rs` | the three 2.1 plane DDIs, only with the knob; with `SflDdis` bit 0 also the first- and second-generation check DDIs, which answer "not supported" (`SflOldChk`) |
+| check | `scaled_flip.rs` `dxgkddi_check_mpo_support3`, rule `helios_kmd_logic::scaled_flip::check` | supported only for one enabled plane, on any reported layer (the desktop's layer 0, or an overlay layer with the desktop disabled), source 0: the whole buffer (`SrcRect` = the allocation's extent) shown at the whole output or at the aspect-correct centred rectangle (2 px slack), directly or through a post-composition transform whose source is the plane's destination at the origin; one of DXGI 28/87/88; no rotation, mirror, alpha blend or non-sRGB colour space; clip containing the destination; no larger than the mode; at most 8x stretch per axis; a buffer smaller than the mode only if it is an NVK (foreign) buffer, the only kind `ForeignFlip` shows at its own size. Anything else is refused and dxgkrnl composes |
+| plane flip | `dxgkddi_set_vidpn_source_address_mpo3` | the first enabled plane of the call: the legacy flip body (`display::set_vidpn_source_address_common`) with `ppContextData[0]`'s allocation and address and the legacy flags its plane flags stand for (`legacy_flags_of`), so immediacy, `ForeignFlip`, the announce and keep paths and every counter behave as for a legacy flip. Disabled plane (or an unexpected second enabled one, `SflBad`): the picture stays, its `PresentId` retires at the next vsync. A flip shown from a layer other than 0 is counted (`SflLayer`). No output flag is set (no PrePresent, no PostPresent, no conversion) |
 | present | `display.rs` | `DxgkDdiPresent` with `FlipWithMultiPlaneOverlay` and no DMA buffer (MMIO plane flip): success, nothing generated (`SflPresent`); with a DMA buffer: refused as before (`SflPrDma`) |
-| completion | `submit_command::signal_crtc_vsync` -> `scaled_flip::signal_vsync`, `PresentBook` | the newest plane flip's `(address, PresentId)` pairs are kept (16 slots). A vsync that reports address A, while the newest flip came through the plane DDI, is delivered as `CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2`, layer 0, the newest `PresentId` recorded for A (or the last one reported; never going back). After a legacy flip the address form returns; plane flips still unreported are retired once by an extra MPO vsync (`SflVsBoth`). Every completion site (the tick, `ImmFlip`'s publication vsync, `FlipDoneHost`) goes through `signal_crtc_vsync`, so all of them follow |
+| completion | `submit_command::signal_crtc_vsync` -> `scaled_flip::signal_vsync`, `PresentBook` | the newest plane flip's `(address, PresentId)` pairs are kept (16 slots). A vsync that reports address A, while the newest flip came through the plane DDI, is delivered as `CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2` with one entry per layer: the newest `PresentId` recorded for A on that layer (a disabled layer's newest, or the last one reported; never going back). After a legacy flip the address form returns; plane flips still unreported are retired once by an extra MPO vsync (`SflVsBoth`). Every completion site (the tick, `ImmFlip`'s publication vsync, `FlipDoneHost`) goes through `signal_crtc_vsync`, so all of them follow |
 | vsync gate | `interrupt.rs` -> `scaled_flip::control_interrupt` | `ControlInterrupt` for `CRTC_VSYNC`, `..._WITH_MULTIPLANE_OVERLAY` and `..._2` opens and closes one delivery gate, open while any is enabled |
-| UMD caps | `umd/src/forward/present.rs`, knob `MpoCaps` (`HKLM\SOFTWARE\Helios`, or `HELIOS_MPO_CAPS`) | when dxgkrnl reports `KMTQAITYPE_MULTIPLANEOVERLAY_SUPPORT`: `MaxPlanes` 1 and, by `MpoCaps`, 0 (default) two groups, a plane group (1 plane, RGB, bilinear, immediate, stretch 8.0, shrink 1.0) and a panel-fitter group (the same plus `FULLSCREEN_POST_COMPOSITION`); 1 the plane group only; 2 the panel-fitter group only. Without the KMD's plane: the legacy caps (16 planes) unchanged |
+| UMD caps | `umd/src/forward/present.rs`, knob `MpoCaps` (`HKLM\SOFTWARE\Helios`, or `HELIOS_MPO_CAPS`) | when dxgkrnl reports `KMTQAITYPE_MULTIPLANEOVERLAY_SUPPORT`: `MaxPlanes` = the KMD's `SflPlanes` (read from the service key) and, by `MpoCaps`, 0 (default) two groups, a plane group (`SflPlanes` planes, RGB, bilinear, immediate, stretch 8.0, shrink 1.0) and a panel-fitter group (the same plus `FULLSCREEN_POST_COMPOSITION`); 1 the plane group only; 2 the panel-fitter group only. Without the KMD's plane: the legacy caps (16 planes) unchanged |
 | host | none | the frame reaches the host as a `ForeignFlip` of the buffer at its own size; the viewer fits it to the output with its aspect ratio and black bars. No protocol change: the check accepts only destinations the host's fit already shows (the whole buffer at the aspect-correct rectangle; a full-stretch destination is shown with bars too) |
 
 No vsync is added to the game path: an immediate plane flip (`FlipImmediate`) maps to the legacy immediate flip and takes
@@ -1666,10 +1666,24 @@ no source, 4 format, 5 source rectangle, 6 rotation, 7 mirror, 8 blend, 9 colour
 post-composition, 13 too large, 14 not an NVK buffer, 15 stretch), `SflFlip` (plane-0 flips), `SflScaled` (of them, a source
 other than the mode's size), `SflOff` (a plane DDI called with the knob off or no display half), `SflBad` (a plane flip
 refused or unpaired), `SflVsMpo`, `SflVsBoth`, `SflVsErr` (MPO vsyncs delivered, flushes, failed notifications),
-`SflPresent`, `SflPrDma`, `SflLayer`. UMD log lines: `dxgkrnl MultiPlaneOverlay support = true`, `DXGI
+`SflPresent`, `SflPrDma`, `SflLayer`, `SflPlRep` (the plane count reported), `SflDdisV` (`SflDdis`), `SflOldChk` (older check
+DDI calls), `SflCapN`, `SflCapSz`, `SflCapMpo` (the DRIVERCAPS replies, above; not zeroed at StartDevice). UMD log lines: `dxgkrnl MultiPlaneOverlay support = true`, `DXGI
 GetMultiplaneOverlayCaps: MaxPlanes=1 groups=2`, `DXGI GetMultiplaneOverlayGroupCaps: group=N ... caps=0x...`.
 
 ### 14.4 What is not known, and the rows that settle it
+
+* **Measured on 22.22.405.59 (`MaxOverlayPlanes` 1):** the adapter started and the desktop ran, but dxgkrnl derived no
+  overlay support (kmt 20 = 0, hardware composition flags 0x0), called no plane DDI (every `Sfl*` counter but `SflKnob` 0)
+  and DXGI never asked the UMD for plane caps. Nothing on disk states dxgkrnl's rule. The headers and docs only describe MPO
+  as more than the primary: the hardware requirements speak of overlapping planes, alpha blending "on a per-plane basis" and
+  "at least one plane [that] must support shrinking and stretching, independent from other planes" [DOC
+  `multiplane-overlay-hardware-requirements.md`], and `RotationWithoutIndependentFlip` describes an overlay plane beside an
+  independent flip [H `d3dkmthk.h:1346`]. So the plane count defaults to 2, the likeliest rule being "an overlay plane
+  besides the primary" [M]. Rows N1..N3 below separate that from the other candidates: the older check DDIs (`SflDdis`),
+  and a caps reply that never carried the fields (`SflCapMpo` 0 or `SflCapSz` below 548, the end of `MaxOverlayPlanes`).
+  The 2.2-only caps DDIs cannot be the rule at 2.1: the adapter reports 2.1 and dxgkrnl reads the 2.1 table.
+* Windows also has a user switch for MPO: `HKLM\SOFTWARE\Microsoft\Windows\Dwm` `OverlayTestMode` = 5 turns overlays off. It
+  must be absent for these rows [M].
 
 * Which group DXGI wants before it reports `FULLSCREEN` (`MpoCaps` 1 vs 2), and whether it needs `CursorScaledWithMultiPlaneOverlayPlane0`
   or a hardware cursor for it [M].
@@ -1698,6 +1712,9 @@ branch, `guest/windows/tools/d3d11_iflip.cpp`):
 | M3 | as M2 | `topmost fg size=1600x900 tearing interval0 fps=300` (borderless, smaller back buffer) | as M2 |
 | M4 | M2 with `HKLM\SOFTWARE\Helios` `MpoCaps` 1, then 2 | as M2 | which group makes `FULLSCREEN` appear (keep that one as the default) |
 | M5 | `ScaledFlip` 1 | `window` (decorated 1280x720), `rgb10`, `fp16`, a toast and alt-tab during M2 | composed where it must be (`SflWhy` 11, 4), never a frozen or black picture |
+| N1 | `ScaledFlip` 1 (`SflPlanes` absent = 2) | the iflip header, then M1 and M2 | `SflCapMpo` 2, `SflCapSz` >= 548; kmt 20 = 1 is the plane count being the rule |
+| N2 | N1 plus `SflDdis` 1 | as N1 | only if N1 stays at kmt 20 = 0: the older check DDIs being the rule (`SflOldChk` shows whether they are called) |
+| N3 | N1 with `SflPlanes` 4 | as N1 | only if N1 and N2 stay at 0: a larger count |
 
 If M2 stays composed with `SflChk` 0, DXGI never asked: read the UMD log's caps lines and `flags=`; if `SflChk` rises with
 `SflChkOk` 0, `SflWhy` names the rule that refused.

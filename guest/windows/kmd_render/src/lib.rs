@@ -205,6 +205,13 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
             Some(ddi::scaled_flip::dxgkddi_set_vidpn_source_address_mpo3);
         data.DxgkDdiPostMultiPlaneOverlayPresent =
             Some(ddi::scaled_flip::dxgkddi_post_mpo_present);
+        // `SflDdis` bit 0: the older check DDIs too, answering "not supported".
+        if ddi::scaled_flip::old_checks() {
+            data.DxgkDdiCheckMultiPlaneOverlaySupport =
+                Some(ddi::scaled_flip::dxgkddi_check_mpo_support);
+            data.DxgkDdiCheckMultiPlaneOverlaySupport2 =
+                Some(ddi::scaled_flip::dxgkddi_check_mpo_support2);
+        }
     }
     data.DxgkDdiRecommendMonitorModes = Some(ddi::dxgkddi_recommend_monitor_modes);
     data.DxgkDdiQueryVidPnHWCapability = Some(ddi::dxgkddi_query_vidpn_hw_capability);

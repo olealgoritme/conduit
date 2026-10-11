@@ -3328,7 +3328,7 @@ fn scaled_mpo_groups() -> Option<&'static [ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROU
         std::sync::OnceLock::new();
     let groups = GROUPS.get_or_init(|| {
         let plane = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
-            NumPlanes: SCALED_MPO_PLANES,
+            NumPlanes: scaled_mpo_planes(),
             MaxStretchFactor: SCALED_MPO_MAX_STRETCH,
             MaxShrinkFactor: SCALED_MPO_MAX_SHRINK,
             OverlayCaps: RGB | BILINEAR | IMMEDIATE,
@@ -3347,8 +3347,17 @@ fn scaled_mpo_groups() -> Option<&'static [ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROU
     })
 }
 
-/// The one plane of the scaled-direct-flip caps (`DXGK_DRIVERCAPS.MaxOverlayPlanes` = 1).
-const SCALED_MPO_PLANES: u32 = 1;
+/// The plane count of the scaled-direct-flip caps: the KMD's `MaxOverlayPlanes`, its service-key
+/// `SflPlanes` (absent: 2; clamped to 1..=4, `helios_kmd_logic::scaled_flip::planes_from_knob`).
+fn scaled_mpo_planes() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        match helios_umd_common::knobs::kmd_service_dword(c"SflPlanes") {
+            None | Some(0) => 2,
+            Some(v) => v.min(4),
+        }
+    })
+}
 /// The KMD accepts a destination up to 8 times the source per axis.
 const SCALED_MPO_MAX_STRETCH: f32 = 8.0;
 /// The KMD never shrinks (a buffer larger than the mode is refused).
@@ -3366,7 +3375,7 @@ pub(crate) unsafe extern "system" fn dxgi_get_mpo_caps(
     let a = &mut *arg;
     a.MultiplaneOverlayCaps = match scaled_mpo_groups() {
         Some(groups) => ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
-            MaxPlanes: SCALED_MPO_PLANES,
+            MaxPlanes: scaled_mpo_planes(),
             NumCapabilityGroups: groups.len() as u32,
         },
         None => ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
