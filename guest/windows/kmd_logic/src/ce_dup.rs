@@ -23,6 +23,15 @@
 //! name them and a slot's leftovers can never collide with another's. Teardown gives the slots
 //! back youngest first ([`Cache::take_youngest`]), the reverse of their making.
 //!
+//! LIFETIME. A slot's mapping is read by every copy submitted with its VA, until that copy's
+//! completion value lands. A slot is therefore given back (evicted, re-made for another kind,
+//! length or client-table generation) only once the channel's completion reached the newest value
+//! of a copy that read it ([`Cache::note_submitted`], [`Cache::set_completed`]); until then
+//! [`Cache::plan`] answers [`Plan::Busy`] instead of a slot to give back, and the caller tries
+//! again later. The VAs a job was prepared with are a [`Lease`] on the slots that made them: the
+//! dispatch submits only while [`Cache::holds`] says both slots still hold what they held then
+//! (a slot given back and re-made in between maps something else, or nothing, at the same VA).
+//!
 //! Nothing here does I/O, reads a clock or takes a lock.
 
 use crate::rm_ce_channel as cc;
@@ -81,8 +90,37 @@ pub struct Entry {
     made: u64,
     /// Last use (eviction takes the least recent).
     used: u64,
+    /// The newest completion value of a copy submitted with this mapping (0: none). The slot is
+    /// busy while the channel's completion is below it.
+    fence: u64,
     /// The client-table generation the dup was made under ([`Cache::set_generation`]).
     gen: u64,
+}
+
+impl Entry {
+    /// Which making of which slot this is: unique for the life of the [`Cache`].
+    pub const fn id(&self) -> SlotId {
+        SlotId { slot: self.slot, made: self.made }
+    }
+
+    /// The newest completion value of a copy submitted with this mapping (0: none).
+    pub const fn fence(&self) -> u64 {
+        self.fence
+    }
+}
+
+/// One making of one slot ([`Entry::id`]): the slot index and its making tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SlotId {
+    pub slot: u8,
+    pub made: u64,
+}
+
+/// The two slots a copy's VAs came from (the producer's semaphore and image).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Lease {
+    pub sem: SlotId,
+    pub src: SlotId,
 }
 
 /// The slots of one kind: sources first, then semaphores.
@@ -115,6 +153,10 @@ pub enum Plan {
     /// Dup and map into `slot`; `evict` must be unmapped and freed first (the slot's handles are
     /// reused).
     Make { slot: u8, evict: Option<Entry> },
+    /// Not mapped, and every slot it could take is still read by a submitted copy (or the slot
+    /// that holds the same object is): nothing may be given back now. Try again once more copies
+    /// completed.
+    Busy,
 }
 
 /// The bounded table of dup'd and mapped producer objects.
@@ -127,6 +169,8 @@ pub struct Cache {
     /// (the number it names may have been freed and re-minted for another process, or the
     /// process may reuse the memory handle): it is re-made, its objects given back first.
     gen: u64,
+    /// The channel's completion value as last told ([`Cache::set_completed`]).
+    completed: u64,
 }
 
 impl Default for Cache {
@@ -137,12 +181,22 @@ impl Default for Cache {
 
 impl Cache {
     pub const fn new() -> Self {
-        Self { slots: [None; SLOTS], tick: 0, gen: 0 }
+        Self { slots: [None; SLOTS], tick: 0, gen: 0, completed: 0 }
     }
 
     /// The client table's generation now. Entries of an older one stop being hits.
     pub fn set_generation(&mut self, gen: u64) {
         self.gen = gen;
+    }
+
+    /// The channel's completion value now: a slot whose copies all completed may be given back.
+    pub fn set_completed(&mut self, completed: u64) {
+        self.completed = completed;
+    }
+
+    /// Whether `e` is still read by a submitted copy.
+    const fn busy(&self, e: &Entry) -> bool {
+        e.fence > self.completed
     }
 
     fn next_tick(&mut self) -> u64 {
@@ -151,7 +205,8 @@ impl Cache {
     }
 
     /// The slot for `key`: a hit (marked used), the slot that held the same object with another
-    /// kind or length (re-made), a free slot of its kind, or the least recently used one.
+    /// kind or length (re-made), a free slot of its kind, or the least recently used one that no
+    /// submitted copy still reads. [`Plan::Busy`] when the slot it needs is still read.
     pub fn plan(&mut self, key: &Key) -> Plan {
         let (lo, hi) = slot_range(key.what);
         let now = self.next_tick();
@@ -160,6 +215,7 @@ impl Cache {
         let mut oldest: Option<(usize, u64)> = None;
         for i in lo..hi {
             let gen = self.gen;
+            let completed = self.completed;
             match &mut self.slots[i] {
                 Some(e) if e.key == *key && e.gen == gen => {
                     e.used = now;
@@ -169,7 +225,8 @@ impl Cache {
                     if e.key.same_object(key) && same.is_none() {
                         same = Some(i);
                     }
-                    if oldest.map_or(true, |(_, u)| e.used < u) {
+                    let busy = e.fence > completed;
+                    if !busy && oldest.map_or(true, |(_, u)| e.used < u) {
                         oldest = Some((i, e.used));
                     }
                 }
@@ -180,15 +237,61 @@ impl Cache {
                 }
             }
         }
-        let i = same.or(free).or(oldest.map(|(i, _)| i)).unwrap_or(lo);
-        Plan::Make { slot: i as u8, evict: self.slots[i] }
+        // The same object's slot is re-made in place (never a second mapping of one object), so
+        // a busy one makes the plan wait.
+        if let Some(i) = same {
+            if self.slots[i].is_some_and(|e| self.busy(&e)) {
+                return Plan::Busy;
+            }
+        }
+        match same.or(free).or(oldest.map(|(i, _)| i)) {
+            Some(i) => Plan::Make { slot: i as u8, evict: self.slots[i] },
+            None => Plan::Busy,
+        }
+    }
+
+    /// The live entry of `slot`, if any.
+    pub fn entry(&self, slot: u8) -> Option<Entry> {
+        self.slots.get(slot as usize).copied().flatten()
+    }
+
+    /// Whether slot `id.slot` still holds its making `id.made` (not given back, not re-made).
+    pub fn holds(&self, id: SlotId) -> bool {
+        self.slots
+            .get(id.slot as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|e| e.made == id.made)
+    }
+
+    /// Whether both slots of `lease` still hold what they held when its VAs were taken.
+    pub fn holds_lease(&self, lease: &Lease) -> bool {
+        self.holds(lease.sem) && self.holds(lease.src)
+    }
+
+    /// A copy that reads the slots of `lease` was submitted and releases `value`: neither slot is
+    /// given back before the channel's completion reaches it. A slot that no longer holds the
+    /// lease's making is left alone (the caller checked [`Cache::holds_lease`] first).
+    pub fn note_submitted(&mut self, lease: &Lease, value: u64) {
+        for id in [lease.sem, lease.src] {
+            if let Some(Some(e)) = self.slots.get_mut(id.slot as usize) {
+                if e.made == id.made {
+                    e.fence = e.fence.max(value);
+                }
+            }
+        }
+    }
+
+    /// Whether any live slot is still read by a submitted copy.
+    pub fn any_busy(&self) -> bool {
+        self.slots.iter().flatten().any(|e| self.busy(e))
     }
 
     /// `slot` now holds `key`, mapped at `va` with `map_flags`.
     pub fn insert(&mut self, slot: u8, key: Key, va: u64, map_flags: u32) {
         let now = self.next_tick();
         if let Some(s) = self.slots.get_mut(slot as usize) {
-            *s = Some(Entry { key, slot, va, map_flags, made: now, used: now, gen: self.gen });
+            *s = Some(Entry { key, slot, va, map_flags, made: now, used: now, fence: 0, gen: self.gen });
         }
     }
 
@@ -334,6 +437,9 @@ pub const COUNTERS: &[&str] = &[
     "CeDupLive",
     "CeDupFree",
     "CeDupEvict",
+    // A slot that had to be given back was still read by a submitted copy: the preparation
+    // waited for a later pass instead (`Plan::Busy`).
+    "CeDupBusy",
 ];
 
 /// The files that write [`COUNTERS`] (relative to `kmd_render/src`).
@@ -523,6 +629,100 @@ mod tests {
         let s = key(0x5c00_00ee, What::Semaphore);
         let Plan::Make { slot, evict: None } = c.plan(&s) else { panic!() };
         assert_eq!(slot, 4);
+    }
+
+    /// Four images cached, the copy engine still reading the least recently used one (the fault
+    /// of 2026-10-11: Xid 31, CE2 VIRT_READ at the base of source slot 1's window, 0x20_1400_0000):
+    /// a fifth image must not take that slot until the copy's completion value landed.
+    #[test]
+    fn a_slot_a_submitted_copy_reads_is_not_given_back_before_its_value_landed() {
+        let mut c = Cache::new();
+        let mut leases = std::vec::Vec::new();
+        for m in 1..=4u32 {
+            let k = key(m, What::Source);
+            let Plan::Make { slot, evict: None } = c.plan(&k) else { panic!() };
+            c.insert(slot, k, slot_va(slot), 0);
+            let Plan::Hit(e) = c.plan(&k) else { panic!() };
+            leases.push(Lease { sem: e.id(), src: e.id() });
+        }
+        // Slot 0 is the least recently used; a copy reading it releases 7, slot 1's releases 8.
+        c.set_completed(5);
+        c.note_submitted(&leases[0], 7);
+        c.note_submitted(&leases[1], 8);
+        assert!(c.any_busy());
+        // The next image takes the oldest slot nothing reads: slot 2.
+        let k5 = key(5, What::Source);
+        let Plan::Make { slot, evict: Some(old) } = c.plan(&k5) else { panic!() };
+        assert_eq!((slot, old.slot), (2, 2));
+        c.insert(slot, k5, slot_va(slot), 0);
+        // ... and with every unread slot used more recently, still never slot 0 or 1.
+        let k6 = key(6, What::Source);
+        let Plan::Make { slot, .. } = c.plan(&k6) else { panic!() };
+        assert_eq!(slot, 3);
+        c.insert(slot, k6, slot_va(slot), 0);
+        let k3 = key(3, What::Source);
+        c.note_submitted(&Lease { sem: c.slots[2].unwrap().id(), src: c.slots[2].unwrap().id() }, 9);
+        c.note_submitted(&Lease { sem: c.slots[3].unwrap().id(), src: c.slots[3].unwrap().id() }, 9);
+        // Every source slot read by a copy in flight: nothing is given back.
+        assert_eq!(c.plan(&k3), Plan::Busy);
+        assert!(c.holds_lease(&leases[0]) && c.holds_lease(&leases[1]));
+        // Slot 0's copy landed: it is the one given back.
+        c.set_completed(7);
+        let Plan::Make { slot, evict: Some(old) } = c.plan(&k3) else { panic!() };
+        assert_eq!((slot, old.key.memory), (0, 1));
+        c.remove(slot);
+        c.insert(slot, k3, slot_va(slot), 0);
+        // A lease taken before the slot was re-made no longer holds: its VA maps another image.
+        assert!(!c.holds_lease(&leases[0]));
+        assert!(c.holds_lease(&leases[1]));
+        // A note for a lease that no longer holds touches nothing.
+        c.note_submitted(&leases[0], 100);
+        assert_eq!(c.slots[0].unwrap().fence(), 0);
+    }
+
+    /// A client-table change (a process exited or started) makes every entry stale; a stale entry
+    /// a copy still reads is re-made only after that copy completed, never under it.
+    #[test]
+    fn a_stale_entry_a_copy_reads_is_remade_only_after_it_completed() {
+        let mut c = Cache::new();
+        c.set_generation(1);
+        let a = key(1, What::Source);
+        let Plan::Make { slot, evict: None } = c.plan(&a) else { panic!() };
+        c.insert(slot, a, slot_va(slot), 0);
+        let Plan::Hit(e) = c.plan(&a) else { panic!() };
+        c.note_submitted(&Lease { sem: e.id(), src: e.id() }, 3);
+        c.set_generation(2);
+        c.set_completed(2);
+        assert_eq!(c.plan(&a), Plan::Busy);
+        // The same object with another length is re-made in place, so it waits too.
+        assert_eq!(c.plan(&Key { len: 8192, ..a }), Plan::Busy);
+        c.set_completed(3);
+        assert!(matches!(c.plan(&a), Plan::Make { slot: 0, evict: Some(_) }));
+        // A hit is never refused: the copy that hits submits a new fence on the same mapping.
+        c.set_generation(2);
+        let b = key(2, What::Semaphore);
+        let Plan::Make { slot, .. } = c.plan(&b) else { panic!() };
+        c.insert(slot, b, slot_va(slot), 0);
+        let Plan::Hit(e) = c.plan(&b) else { panic!() };
+        c.note_submitted(&Lease { sem: e.id(), src: e.id() }, 10);
+        assert!(matches!(c.plan(&b), Plan::Hit(_)));
+    }
+
+    /// The two semaphore slots read by copies in flight: a third timeline waits.
+    #[test]
+    fn semaphores_wait_like_sources() {
+        let mut c = Cache::new();
+        for m in [1u32, 2] {
+            let k = key(m, What::Semaphore);
+            let Plan::Make { slot, evict: None } = c.plan(&k) else { panic!() };
+            c.insert(slot, k, slot_va(slot), 0);
+            let Plan::Hit(e) = c.plan(&k) else { panic!() };
+            c.note_submitted(&Lease { sem: e.id(), src: e.id() }, 4);
+        }
+        assert_eq!(c.plan(&key(3, What::Semaphore)), Plan::Busy);
+        c.set_completed(4);
+        assert!(!c.any_busy());
+        assert!(matches!(c.plan(&key(3, What::Semaphore)), Plan::Make { evict: Some(_), .. }));
     }
 
     #[test]
