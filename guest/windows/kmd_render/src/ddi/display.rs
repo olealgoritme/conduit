@@ -3149,10 +3149,10 @@ pub(crate) fn process_deferred_vidpn_source_address(
     // The mutex is free again: the `VpDSt` registry write below must not run under a site that
     // says it is held.
     crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_POST);
-    let status = status.map(|(status, immediate_before)| {
+    let status = status.map(|(status, immediate_flip_address)| {
         // `ImmFlip`: an immediate flip that published its address is retired now, not at the
         // next vsync tick.
-        if let Some(flip_address) = immediate_before {
+        if let Some(flip_address) = immediate_flip_address {
             crate::ddi::immediate_flip::complete_now(adapter, flip_address);
         }
         status
