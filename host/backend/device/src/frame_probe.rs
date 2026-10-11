@@ -40,6 +40,11 @@ fn probe() -> Option<&'static Probe> {
     .as_ref()
 }
 
+/// Open the probe's file now (before the sandbox, under which no file can be created).
+pub fn init() {
+    let _ = probe();
+}
+
 /// Whether the probe is on (one load).
 pub fn on() -> bool {
     probe().is_some()
