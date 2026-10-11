@@ -38,6 +38,16 @@
 //                 allowed to: SetForegroundWindow fails and the console or the taskbar stays
 //                 active, which keeps the window from being treated as full screen)
 //     noconsole   detach from (and so hide) this program's own console window
+//     exclusive   full-screen exclusive (SetFullscreenState TRUE) at size=WxH (default: the current
+//                 mode): Windows switches the output to that mode. ALLOW_TEARING is not allowed in
+//                 exclusive mode, so `tearing` is dropped there; interval0 is immediate anyway.
+//     size=WxH    swap chain (and borderless window) size (default: the output's current mode)
+//     fps=N       cap the frame rate at N (absolute QPC deadlines, yield then spin); default
+//                 uncapped. With fps=200 / fps=300 on a 240 Hz mode it is the pacing test row.
+// Timing (the RESULT_TIMING lines): the interval between Present calls (p50/p90/p99/max), how long
+// each Present call blocked (a vblank wait shows as a ms-scale p99), and, from
+// GetFrameStatistics, the present-to-screen latency (SyncQPCTime of a present minus the QPC at
+// which it was issued) and the share of screen intervals that are two refreshes or more.
 // Every second it also logs whether the window is the foreground window and which window is
 // under the output's four corners and centre (anything but this window there is an overlap that
 // forces composition), and once the output's hardware composition support
@@ -55,6 +65,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <algorithm>
+#include <vector>
 
 static FILE* g_log = nullptr;
 static void L(const char* fmt, ...) {
@@ -148,6 +160,9 @@ int main(int argc, char** argv) {
     g_log = fopen(logPath, "w");
   }
   int seconds = 20;
+  double fpsCap = 0.0;
+  bool exclusive = false;
+  UINT reqW = 0, reqH = 0;
   bool windowed = false, interval0 = false, tearing = false, rgba = false;
   int buffers = 2, adapterIndex = -1;
   bool topmost = false, takeFg = false, noConsole = false, rgb10 = false, fp16 = false;
@@ -167,6 +182,9 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "fp16")) fp16 = true;
     else if (!strcmp(a, "fg")) takeFg = true;
     else if (!strcmp(a, "noconsole")) noConsole = true;
+    else if (!strncmp(a, "fps=", 4)) fpsCap = atof(a + 4);
+    else if (!strcmp(a, "exclusive")) exclusive = true;
+    else if (!strncmp(a, "size=", 5)) sscanf(a + 5, "%ux%u", &reqW, &reqH);
     else L("unknown option %s", a);
   }
   if (buffers < 2) buffers = 2;
@@ -250,8 +268,8 @@ int main(int argc, char** argv) {
     width = 1280;
     height = 720;
   } else {
-    width = target.right - target.left;
-    height = target.bottom - target.top;
+    width = reqW ? reqW : target.right - target.left;
+    height = reqH ? reqH : target.bottom - target.top;
     hwnd = CreateWindowExA(topmost ? WS_EX_TOPMOST : 0, "iflip", "d3d11-iflip", WS_POPUP,
                            target.left, target.top, width, height, nullptr, nullptr, wc.hInstance,
                            nullptr);
@@ -290,6 +308,10 @@ int main(int argc, char** argv) {
   L("D3D11CreateDevice hr=0x%08x level=0x%x", (unsigned)hr, (unsigned)got);
   if (FAILED(hr)) return 3;
 
+  if (exclusive && tearing) {
+    L("exclusive: ALLOW_TEARING is not allowed in full-screen exclusive mode; dropped");
+    tearing = false;
+  }
   if (tearing) {
     IDXGIFactory5* f5 = nullptr;
     BOOL allow = FALSE;
@@ -324,6 +346,24 @@ int main(int argc, char** argv) {
   sc->QueryInterface(__uuidof(IDXGISwapChainMedia), (void**)&media);
   L("IDXGISwapChainMedia %s", media ? "available" : "NOT available");
 
+  if (exclusive) {
+    HRESULT hf = sc->SetFullscreenState(TRUE, nullptr);
+    DXGI_MODE_DESC md = {};
+    md.Width = width;
+    md.Height = height;
+    md.Format = sd.Format;
+    HRESULT ht = sc->ResizeTarget(&md);
+    HRESULT hb = sc->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, sd.Flags);
+    BOOL fs = FALSE;
+    sc->GetFullscreenState(&fs, nullptr);
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm);
+    L("exclusive: SetFullscreenState hr=0x%08x ResizeTarget hr=0x%08x ResizeBuffers hr=0x%08x "
+      "fullscreen=%d mode now %lux%lu@%lu",
+      (unsigned)hf, (unsigned)ht, (unsigned)hb, fs, dm.dmPelsWidth, dm.dmPelsHeight,
+      dm.dmDisplayFrequency);
+  }
   ID3D11Texture2D* bb = nullptr;
   ID3D11RenderTargetView* rtv = nullptr;
   sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
@@ -338,6 +378,23 @@ int main(int argc, char** argv) {
   unsigned modeCount[5] = {};  // COMPOSED, OVERLAY, NONE, FAILURE, unavailable
   UINT interval = interval0 ? 0 : 1;
   UINT flags = (tearing && interval0) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+  // Timing samples (microseconds).
+  std::vector<double> callUs, gapUs, latUs, syncGapUs;
+  callUs.reserve(1 << 20);
+  gapUs.reserve(1 << 20);
+  latUs.reserve(1 << 20);
+  syncGapUs.reserve(1 << 20);
+  // QPC at which present number n (GetLastPresentCount after it) was issued, by n % ring.
+  const unsigned kRing = 4096;
+  std::vector<long long> issuedAt(kRing, 0);
+  std::vector<unsigned> issuedN(kRing, ~0u);
+  unsigned lastStatCount = 0;
+  long long lastSyncQpc = 0;
+  UINT lastSyncRefresh = 0;
+  long long prevPresentQpc = 0;
+  const double us = 1e6 / double(freq.QuadPart);
+  long long frameTicks = fpsCap > 0 ? (long long)(double(freq.QuadPart) / fpsCap) : 0;
+  long long nextDue = t0.QuadPart;
   MSG msg;
   while (!g_quit) {
     while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -355,8 +412,48 @@ int main(int argc, char** argv) {
     // FLIP_DISCARD: the render target must be rebound to the current buffer every frame.
     ctx->OMSetRenderTargets(1, &rtv, nullptr);
     ctx->ClearRenderTargetView(rtv, c);
+    if (frameTicks) {
+      // Absolute deadlines: yield while more than 2 ms remain, then spin (no Sleep: its granularity
+      // is the system timer resolution, up to 15.6 ms).
+      nextDue += frameTicks;
+      LARGE_INTEGER q;
+      for (;;) {
+        QueryPerformanceCounter(&q);
+        long long left = nextDue - q.QuadPart;
+        if (left <= 0) break;
+        if (left * us > 2000.0) SwitchToThread();
+        else YieldProcessor();
+      }
+      if (q.QuadPart - nextDue > frameTicks) nextDue = q.QuadPart;  // fell behind: no burst
+    }
+    LARGE_INTEGER pa, pb;
+    QueryPerformanceCounter(&pa);
     hr = sc->Present(interval, flags);
+    QueryPerformanceCounter(&pb);
     if (FAILED(hr)) { L("Present hr=0x%08x at frame %u", (unsigned)hr, frames); break; }
+    if (t > 1.0) {  // skip the first second (promotion, warm-up)
+      callUs.push_back(double(pb.QuadPart - pa.QuadPart) * us);
+      if (prevPresentQpc) gapUs.push_back(double(pa.QuadPart - prevPresentQpc) * us);
+    }
+    prevPresentQpc = pa.QuadPart;
+    {
+      UINT n = 0;
+      if (SUCCEEDED(sc->GetLastPresentCount(&n))) {
+        issuedAt[n % kRing] = pa.QuadPart;
+        issuedN[n % kRing] = n;
+      }
+      DXGI_FRAME_STATISTICS fs{};
+      if (SUCCEEDED(sc->GetFrameStatistics(&fs)) && fs.PresentCount != lastStatCount) {
+        lastStatCount = fs.PresentCount;
+        unsigned slot = fs.PresentCount % kRing;
+        if (t > 1.0 && issuedN[slot] == fs.PresentCount && fs.SyncQPCTime.QuadPart > issuedAt[slot])
+          latUs.push_back(double(fs.SyncQPCTime.QuadPart - issuedAt[slot]) * us);
+        if (t > 1.0 && lastSyncQpc && fs.SyncQPCTime.QuadPart > lastSyncQpc && fs.SyncRefreshCount > lastSyncRefresh)
+          syncGapUs.push_back(double(fs.SyncRefreshCount - lastSyncRefresh));
+        lastSyncQpc = fs.SyncQPCTime.QuadPart;
+        lastSyncRefresh = fs.SyncRefreshCount;
+      }
+    }
     frames++;
     framesSec++;
     double dt = double(now.QuadPart - last.QuadPart) / freq.QuadPart;
@@ -400,6 +497,29 @@ int main(int argc, char** argv) {
   double total = double(end.QuadPart - t0.QuadPart) / freq.QuadPart;
   L("RESULT frames=%u seconds=%.1f fps=%.1f COMPOSED=%u OVERLAY=%u NONE=%u FAILURE=%u unavailable=%u",
     frames, total, frames / total, modeCount[0], modeCount[1], modeCount[2], modeCount[3], modeCount[4]);
+  auto pct = [](std::vector<double>& v, double p) -> double {
+    if (v.empty()) return 0.0;
+    size_t i = (size_t)(p * double(v.size() - 1) + 0.5);
+    std::nth_element(v.begin(), v.begin() + i, v.end());
+    return v[i];
+  };
+  auto line = [&](const char* name, std::vector<double>& v) {
+    double mx = v.empty() ? 0.0 : *std::max_element(v.begin(), v.end());
+    double sum = 0;
+    for (double x : v) sum += x;
+    L("RESULT_TIMING %s n=%zu mean=%.1f p50=%.1f p90=%.1f p99=%.1f max=%.1f", name, v.size(),
+      v.empty() ? 0.0 : sum / v.size(), pct(v, 0.5), pct(v, 0.9), pct(v, 0.99), mx);
+  };
+  line("present_interval_us", gapUs);
+  line("present_call_us", callUs);
+  line("present_to_screen_us", latUs);
+  {
+    size_t multi = 0;
+    for (double r : syncGapUs) if (r >= 2.0) multi++;
+    L("RESULT_TIMING screen_refresh_steps n=%zu two_or_more=%.2f%%", syncGapUs.size(),
+      syncGapUs.empty() ? 0.0 : 100.0 * multi / syncGapUs.size());
+  }
+  if (exclusive) sc->SetFullscreenState(FALSE, nullptr);
   if (media) media->Release();
   rtv->Release();
   sc->Release();

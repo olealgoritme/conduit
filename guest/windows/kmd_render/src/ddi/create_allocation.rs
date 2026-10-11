@@ -1213,6 +1213,18 @@ pub(crate) unsafe fn set_vidpn_primary_address(
     true
 }
 
+/// The `SetVidPnSourceAddress` flags the newest flip of `h` recorded on it
+/// (`set_vidpn_primary_address`; for a DMA-buffer flip,
+/// `helios_kmd_logic::immediate_flip::dma_flip_flags`). 0 for an unresolvable handle.
+/// DISPATCH-safe (see [`resolve_current_alloc`]).
+///
+/// # Safety
+/// As [`set_vidpn_primary_address`]: `h` is a handle dxgkrnl supplied.
+pub(crate) unsafe fn vidpn_primary_flags(adapter: &AdapterContext, h: HANDLE) -> u32 {
+    unsafe { resolve_current_alloc(adapter, h) }
+        .map_or(0, |ctx| ctx.vidpn_primary_flags.load(Ordering::Relaxed))
+}
+
 /// The venus resource behind an `hAllocation`: `Some(0)` for an unbacked
 /// allocation, `None` for a null/foreign handle or one of an older transport
 /// generation (its `resource_id` names a DIFFERENT live blob now, so a caller
