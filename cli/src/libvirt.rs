@@ -65,6 +65,9 @@ pub struct Wiring<'a> {
     pub display: Option<(u32, u32)>,
     /// The machine types Conduit's QEMU has (`-machine help`), when known.
     pub machines: Option<&'a [String]>,
+    /// The sockets of the virtio-input devices the backend serves, in
+    /// [`units::INPUT_KINDS`] order; empty for none (a backend without them).
+    pub input_socks: &'a [PathBuf],
 }
 
 /// The metadata attribute that remembers the stock loader while the Conduit
@@ -325,6 +328,93 @@ fn is_spice_dev(e: &Element) -> bool {
 const QMP_ID: &str = "conduit-qmp";
 /// id of the USB tablet once it is Conduit's (see [`take_usb_tablet`]).
 const TABLET_ID: &str = "conduit-tablet";
+/// Prefix of the virtio-input devices' chardev and device ids
+/// (`conduit-input-mouse`, ...).
+const INPUT_ID: &str = "conduit-input-";
+
+/// The virtio-input devices (docs/INPUT.md): `vhost-user-input-pci` on the
+/// backend's sockets, one per kind, each at a fixed slot so the guest sees
+/// the same devices at every boot. QEMU connects to the sockets when it
+/// creates the chardevs, before any device: they belong to a socket unit
+/// of their own (`conduit-input@NAME.socket`), listening from attach on.
+/// The PS/2 keyboard and mouse and the USB tablet stay, for the firmware
+/// and for a guest without a virtio-input driver.
+fn input_args(socks: &[PathBuf], bus: &str, slots: &[u8]) -> Vec<String> {
+    let mut v = Vec::new();
+    for ((kind, sock), slot) in units::INPUT_KINDS.iter().zip(socks).zip(slots) {
+        let id = format!("{INPUT_ID}{kind}");
+        v.push("-chardev".into());
+        v.push(format!("socket,id={id},path={}", sock.display()));
+        v.push("-device".into());
+        v.push(format!(
+            "vhost-user-input-pci,chardev={id},id={id},bus={bus},addr={slot:#04x}"
+        ));
+    }
+    v
+}
+
+/// The slot an earlier attach gave the virtio-input device of `kind`.
+fn previous_input_slot(args: &[String], kind: &str) -> Option<u8> {
+    args.iter()
+        .find(|a| {
+            a.starts_with("vhost-user-input-pci,")
+                && a.contains(&format!("chardev={INPUT_ID}{kind},"))
+        })
+        .and_then(|a| {
+            a.split(',')
+                .find_map(|kv| kv.strip_prefix("addr="))
+                .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        })
+}
+
+/// The slots that `<qemu:arg>` devices name (`addr=0xNN`): libvirt does not
+/// know them, so [`used_slots`] does not see them.
+fn arg_slots(args: &[Element]) -> Vec<u8> {
+    args.iter()
+        .filter_map(|a| a.attributes.get("value"))
+        .flat_map(|v| v.split([',', '"']).map(str::to_string).collect::<Vec<_>>())
+        .filter_map(|kv| {
+            let v = kv.strip_prefix("addr=")?;
+            let slot = v.split('.').next()?;
+            u8::from_str_radix(slot.trim_start_matches("0x"), 16).ok()
+        })
+        .collect()
+}
+
+/// Slots for the virtio-input devices: each keeps its earlier one if still
+/// free, the rest take the highest free ones below the GPU's. `taken`: slots
+/// other `<qemu:arg>` devices hold.
+fn pick_input_slots(root: &Element, gpu: u8, taken: &[u8], prev: &[Option<u8>]) -> Result<Vec<u8>> {
+    let mut used = used_slots(root);
+    used.push(gpu);
+    used.extend_from_slice(taken);
+    let mut out: Vec<Option<u8>> = Vec::new();
+    for p in prev {
+        let keep = p.filter(|s| !used.contains(s));
+        if let Some(s) = keep {
+            used.push(s);
+        }
+        out.push(keep);
+    }
+    out.into_iter()
+        .map(|s| match s {
+            Some(s) => Ok(s),
+            None => {
+                let s = (0x08..=0x1e)
+                    .rev()
+                    .find(|s| !used.contains(s))
+                    .ok_or_else(|| {
+                        oops(
+                            "no free PCI slot on the VM's main bus for the virtio-input devices",
+                            "Remove a device from the VM in virt-manager, then try again",
+                        )
+                    })?;
+                used.push(s);
+                Ok(s)
+            }
+        })
+        .collect()
+}
 
 /// A QMP monitor next to the console socket. Under a viewer grab the backend
 /// moves QEMU's relative (PS/2) mouse through it: a first-person game reads
@@ -764,6 +854,7 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     // The tablet moves to the command line once and stays there.
     let tablet = has_video && (moved_tablet || values.iter().any(|v| v.contains(TABLET_ID)));
     let keep = foreign_args(&args, &values);
+    let foreign_slots = arg_slots(&keep);
     let slot = pick_slot(&root, prev)?;
     let others: Vec<XMLNode> = cl
         .children
@@ -785,6 +876,14 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     if tablet {
         ours.extend(["-device".to_string(), tablet_arg()]);
     }
+    if !w.input_socks.is_empty() {
+        let prev: Vec<Option<u8>> = units::INPUT_KINDS
+            .iter()
+            .map(|k| previous_input_slot(&values, k))
+            .collect();
+        let slots = pick_input_slots(&root, slot, &foreign_slots, &prev)?;
+        ours.extend(input_args(w.input_socks, bus, &slots));
+    }
     for v in ours {
         let mut a = el("arg", &[("value", &v)]);
         a.prefix = Some("qemu".into());
@@ -804,16 +903,22 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
     Ok(String::from_utf8(out)?)
 }
 
-/// The `<qemu:arg>`s that are not Conduit's (the GPU, QMP and tablet pairs).
+/// The `<qemu:arg>`s that are not Conduit's (the GPU, QMP, tablet and
+/// virtio-input pairs).
 fn foreign_args(args: &[Element], values: &[String]) -> Vec<Element> {
     let mut keep: Vec<Element> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let next = values.get(i + 1).cloned().unwrap_or_default();
         let ours = match values[i].as_str() {
-            "-chardev" => next.contains(CHARDEV_ID) || next.contains(&format!("id={QMP_ID},")),
+            "-chardev" => {
+                next.contains(CHARDEV_ID)
+                    || next.contains(&format!("id={QMP_ID},"))
+                    || next.contains(&format!("id={INPUT_ID}"))
+            }
             "-device" => {
                 next.contains(CHARDEV_ID)
+                    || next.contains(&format!("chardev={INPUT_ID}"))
                     || next.contains(&format!("id={TABLET_ID},"))
                     || next.contains(&format!(r#""id":"{TABLET_ID}""#))
             }
@@ -1532,6 +1637,14 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     let bios_dir = bios::installed_dir();
     let machines = qemu_machines(&emu);
     let (mode, _) = crate::mode::detect();
+    let input_socks: Vec<PathBuf> = if run::virtio_input() {
+        units::INPUT_KINDS
+            .iter()
+            .map(|k| units::input_socket_path(&scope, name, k))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let wiring = Wiring {
         emulator: &emu,
         gpu_sock: &gpu,
@@ -1546,6 +1659,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         bios_fits: &bios::check,
         display: Some((mode.width, mode.height)),
         machines: machines.as_deref(),
+        input_socks: &input_socks,
     };
     let new_xml = edit_domain(&xml, &wiring)?;
     let edit_notes = notes(&xml, &wiring);
@@ -1843,6 +1957,7 @@ mod tests {
                 bios_fits: &fits,
                 display: None,
                 machines: Some(&machines()),
+                input_socks: &[],
             },
         )
         .unwrap()
@@ -1869,6 +1984,7 @@ mod tests {
                 bios_fits: &fits,
                 display,
                 machines: Some(&machines()),
+                input_socks: &[],
             },
         )
         .unwrap()
@@ -2272,6 +2388,101 @@ mod tests {
         assert!(none.contains("conduit-qmp"), "{none}");
     }
 
+    fn input_socks() -> Vec<PathBuf> {
+        super::units::INPUT_KINDS
+            .iter()
+            .map(|k| PathBuf::from(format!("/run/user/1000/conduit/myvm/input-{k}.sock")))
+            .collect()
+    }
+
+    fn edit_with_input(x: &str) -> String {
+        let socks = input_socks();
+        let machines = machines();
+        let mut w = wiring_with(None, true, Some(&machines), &[]);
+        w.input_socks = &socks;
+        edit_domain(x, &w).unwrap()
+    }
+
+    /// The three virtio-input devices come after the GPU, on the backend's
+    /// sockets, each at a slot of its own that no libvirt device has; PS/2
+    /// and the tablet stay; a second attach keeps every slot.
+    #[test]
+    fn virtio_input_devices_are_added_on_the_backends_sockets() {
+        let src = VIRT_INSTALL.replace(
+            "</devices>",
+            "<input type='mouse' bus='ps2'/><input type='keyboard' bus='ps2'/></devices>",
+        );
+        let out = edit_with_input(&src);
+        let args = qemu_args(&out);
+        let mut slots = Vec::new();
+        for k in super::units::INPUT_KINDS {
+            let chardev = format!(
+                "socket,id=conduit-input-{k},path=/run/user/1000/conduit/myvm/input-{k}.sock"
+            );
+            let i = args
+                .iter()
+                .position(|a| *a == chardev)
+                .unwrap_or_else(|| panic!("{k}: {out}"));
+            assert_eq!(args[i - 1], "-chardev");
+            assert_eq!(args[i + 1], "-device");
+            let dev = &args[i + 2];
+            assert!(
+                dev.starts_with(&format!("vhost-user-input-pci,chardev=conduit-input-{k},id=conduit-input-{k},bus=pcie.0,addr=0x")),
+                "{dev}"
+            );
+            slots.push(super::previous_input_slot(&args, k).unwrap());
+        }
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let mut used = super::used_slots(&root);
+        used.push(super::previous_slot(&args).unwrap());
+        for s in &slots {
+            assert!(!used.contains(s), "slot {s:#x} taken: {out}");
+            used.push(*s);
+        }
+        // The PS/2 devices libvirt has stay (firmware, boot loaders).
+        assert_eq!(out.matches("bus=\"ps2\"").count(), 2, "{out}");
+        let gpu = out.find("vhost-user-test-device-pci").unwrap();
+        assert!(out.find("vhost-user-input-pci").unwrap() > gpu);
+        // Idempotent: same slots, no duplicates.
+        let again = edit_with_input(&out);
+        assert_eq!(canon(&again), canon(&out));
+        assert_eq!(again.matches("vhost-user-input-pci").count(), 3);
+        // Attach with a backend without them: they go again.
+        let without = edit_as(&out, true);
+        assert!(!without.contains("conduit-input-"), "{without}");
+    }
+
+    /// A device the user added as a `<qemu:arg>` keeps its slot: libvirt
+    /// does not know it, so the input devices must not take it.
+    #[test]
+    fn virtio_input_slots_avoid_foreign_qemu_arg_devices() {
+        let plain = edit_with_input(VIRT_INSTALL);
+        let args = qemu_args(&plain);
+        let first: Vec<u8> = super::units::INPUT_KINDS
+            .iter()
+            .map(|k| super::previous_input_slot(&args, k).unwrap())
+            .collect();
+        // A foreign device on the slot the mouse took on its own.
+        let foreign = format!(
+            "<qemu:commandline xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>\
+             <qemu:arg value='-device'/>\
+             <qemu:arg value='virtio-net-pci,netdev=n0,bus=pcie.0,addr={:#04x},mac=52:54:00:00:00:01'/>\
+             </qemu:commandline></domain>",
+            first[0]
+        );
+        let src = VIRT_INSTALL.replace("</domain>", &foreign);
+        let out = edit_with_input(&src);
+        let args = qemu_args(&out);
+        assert!(
+            args.iter().any(|a| a.starts_with("virtio-net-pci,")),
+            "{out}"
+        );
+        for k in super::units::INPUT_KINDS {
+            let s = super::previous_input_slot(&args, k).unwrap();
+            assert_ne!(s, first[0], "{k} took the foreign device's slot: {out}");
+        }
+    }
+
     #[test]
     fn idempotent_and_keeps_foreign_args() {
         let with_other = DOMAIN.replace(
@@ -2546,6 +2757,7 @@ mod tests {
             bios_fits: &fits,
             display: None,
             machines: None,
+            input_socks: &[],
         };
         assert!(edit_domain("<network/>", &w).is_err());
         assert!(edit_domain("not xml", &w).is_err());
@@ -2586,6 +2798,7 @@ mod tests {
             bios_fits: &fits,
             display: Some((5120, 1440)),
             machines,
+            input_socks: &[],
         }
     }
 

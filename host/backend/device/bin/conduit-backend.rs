@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+
+mod vinput;
 use device::caps::Caps;
 use device::chain::{
     ReadableAfterWritable, Segment, capacity, sort_chain, writable, write_scattered,
@@ -146,6 +148,15 @@ struct Args {
     /// --present-mode=auto or shm shows them).
     #[arg(long, value_name = "PATH")]
     console_vnc: Option<PathBuf>,
+
+    /// Serve a virtio-input device (QEMU `vhost-user-input-pci`) on this
+    /// socket: KIND=PATH with KIND mouse, keyboard or tablet. Repeatable.
+    /// The display's input goes straight into its event queue while the
+    /// guest's driver runs it (docs/INPUT.md). Under socket activation the
+    /// sockets come from the service manager instead, named
+    /// input-mouse.sock, input-keyboard.sock and input-tablet.sock.
+    #[arg(long, value_name = "KIND=PATH", value_parser = parse_input_socket)]
+    input_socket: Vec<(device::vinput::Kind, PathBuf)>,
 
     /// Start even when the host driver release has no ABI tables of its own,
     /// using the nearest older release's. Expect guests to fail at their first
@@ -3048,26 +3059,82 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 }
 
-/// The listening socket systemd passes on socket activation (`sd_listen_fds`:
-/// `LISTEN_PID` is this process, `LISTEN_FDS` is 1, the socket is fd 3).
-fn activated_listener() -> Option<vhost::vhost_user::Listener> {
-    const SD_LISTEN_FDS_START: RawFd = 3;
-    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
-    let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
-    if pid != std::process::id() || n != 1 {
-        return None;
-    }
-    // Only a listening unix stream socket will do.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: fstat on a plain fd number into a local buffer.
-    if unsafe { libc::fstat(SD_LISTEN_FDS_START, &mut st) } != 0
-        || st.st_mode & libc::S_IFMT != libc::S_IFSOCK
+fn parse_input_socket(s: &str) -> Result<(device::vinput::Kind, PathBuf), String> {
+    let (k, p) = s
+        .split_once('=')
+        .ok_or_else(|| format!("{s:?}: expected KIND=PATH"))?;
+    let kind = device::vinput::Kind::parse(k)
+        .ok_or_else(|| format!("{k:?}: expected mouse, keyboard or tablet"))?;
+    Ok((kind, PathBuf::from(p)))
+}
+
+/// What systemd passed on socket activation: the GPU's listening socket and
+/// the virtio-input devices' (each told apart by its file name).
+#[derive(Default)]
+struct Activated {
+    gpu: Option<vhost::vhost_user::Listener>,
+    inputs: Vec<(device::vinput::Kind, vhost::vhost_user::Listener)>,
+}
+
+/// The path a listening unix socket is bound to.
+fn socket_path(fd: RawFd) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: getsockname into a local sockaddr_un of the stated length.
+    if unsafe { libc::getsockname(fd, (&raw mut sa).cast(), &mut len) } != 0
+        || sa.sun_family != libc::AF_UNIX as libc::sa_family_t
     {
         return None;
     }
-    // SAFETY: fd 3 is ours: the service manager handed it over and nothing
-    // else in this process owns it.
-    Some(unsafe { vhost::vhost_user::Listener::from_raw_fd(SD_LISTEN_FDS_START) })
+    let path: Vec<u8> = sa
+        .sun_path
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&path)))
+}
+
+/// The listening sockets systemd passes on socket activation (`sd_listen_fds`:
+/// `LISTEN_PID` is this process, the sockets are fd 3 on). The GPU's is the
+/// one whose name is not a virtio-input device's.
+fn activated_listeners() -> Activated {
+    const SD_LISTEN_FDS_START: RawFd = 3;
+    let mut out = Activated::default();
+    let (Some(pid), Some(n)) = (
+        std::env::var("LISTEN_PID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok()),
+        std::env::var("LISTEN_FDS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok()),
+    ) else {
+        return out;
+    };
+    if pid != std::process::id() || !(1..=16).contains(&n) {
+        return out;
+    }
+    for fd in SD_LISTEN_FDS_START..SD_LISTEN_FDS_START + n {
+        // Only a listening unix stream socket will do.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat on a plain fd number into a local buffer.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            continue;
+        }
+        let kind = socket_path(fd).and_then(|p| device::vinput::Kind::from_socket_path(&p));
+        // SAFETY: the fd is ours: the service manager handed it over and
+        // nothing else in this process owns it.
+        let l = unsafe { vhost::vhost_user::Listener::from_raw_fd(fd) };
+        match kind {
+            Some(k) => out.inputs.push((k, l)),
+            None if out.gpu.is_none() => out.gpu = Some(l),
+            None => {
+                log::warn!("socket activation: fd {fd} is neither the GPU's nor an input socket")
+            }
+        }
+    }
+    out
 }
 
 /// The `--trace` file (or `CONDUIT_TRACE`), created and truncated.
@@ -3180,6 +3247,47 @@ fn guest_queues_probe(target: EventTarget) -> device::console::GuestProbe {
     })
 }
 
+/// Start a daemon per virtio-input device (activated sockets, then
+/// `--input-socket` ones), and hand the display link their ports.
+fn serve_virtio_input(
+    args: &Args,
+    activated: Vec<(device::vinput::Kind, vhost::vhost_user::Listener)>,
+    link: Option<&Arc<DisplayLink>>,
+) -> anyhow::Result<()> {
+    use device::vinput::{Port, Router};
+    let mut listeners = activated;
+    for (k, p) in &args.input_socket {
+        if listeners.iter().any(|(have, _)| have == k) {
+            continue;
+        }
+        let _ = std::fs::remove_file(p);
+        let l = vhost::vhost_user::Listener::new(p, true)
+            .map_err(|e| anyhow::anyhow!("--input-socket {}={}: {e}", k.name(), p.display()))?;
+        listeners.push((*k, l));
+    }
+    if listeners.is_empty() {
+        return Ok(());
+    }
+    let Some(link) = link else {
+        log::warn!("virtio-input: no display, so no input to give the devices; not served");
+        return Ok(());
+    };
+    let mut ports: [Option<Arc<dyn Port>>; 3] = [None, None, None];
+    let mut names = Vec::new();
+    for (k, l) in listeners {
+        let port = vinput::serve(k, l)?;
+        ports[k as usize] = Some(port as Arc<dyn Port>);
+        names.push(k.name());
+    }
+    log::info!(
+        "virtio-input: serving {} (QEMU vhost-user-input-pci); each takes the boot console's \
+         input once the guest's driver runs it",
+        names.join(", ")
+    );
+    link.attach_virtio_input(Router::new(ports));
+    Ok(())
+}
+
 /// Like `VhostUserDaemon::serve`: a guest that quits mid-message is a normal end.
 fn disconnect_is_ok(e: vhost_user_backend::Error) -> Result<(), vhost_user_backend::Error> {
     use vhost::vhost_user::Error as VuError;
@@ -3208,7 +3316,10 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     // Before the sandbox, which may not allow the fstat that checks it.
-    let activated = activated_listener();
+    let Activated {
+        gpu: activated,
+        inputs: activated_inputs,
+    } = activated_listeners();
     // Before any device is opened: the host driver judges every guest call by
     // this process's credentials (device::posture).
     device::posture::enforce()?;
@@ -3363,6 +3474,11 @@ fn main() -> anyhow::Result<()> {
         }
         (None, _) => None,
     };
+
+    // The virtio-input devices: served now, so a frontend that connected
+    // already (socket activation queued it) gets its answers. Their input
+    // comes from the display link's console path.
+    serve_virtio_input(&args, activated_inputs, display.as_ref().map(|d| &d.1))?;
 
     let window_len = device::shm_regions::window_len(window_mib)
         .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
