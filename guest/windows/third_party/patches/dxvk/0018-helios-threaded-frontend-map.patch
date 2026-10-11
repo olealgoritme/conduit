@@ -124,14 +124,14 @@ index e55920b8..b61cdef5 100644
  
      DxvkCsChunkRef AllocCsChunk();
 diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
-index 3a090686..4226b4b7 100644
+index 3a090686..602e44d1 100644
 --- a/src/d3d11/d3d11_context_imm.cpp
 +++ b/src/d3d11/d3d11_context_imm.cpp
-@@ -583,6 +583,53 @@ namespace dxvk {
+@@ -583,6 +583,54 @@ namespace dxvk {
    }
    
    
-+  Rc<DxvkResourceAllocation> D3D11ImmediateContext::HeliosFrontendDiscard(
++  DxvkResourceAllocation* D3D11ImmediateContext::HeliosFrontendDiscard(
 +          D3D11Buffer*                pBuffer,
 +          void**                      ppData) {
 +    *ppData = nullptr;
@@ -141,15 +141,16 @@ index 3a090686..4226b4b7 100644
 +
 +    helios_feed::mapWriteDiscard();
 +
-+    Rc<DxvkResourceAllocation> slice;
++    // The common case takes the slice the worker parked, reference and all,
++    // without touching any reference count.
++    DxvkResourceAllocation* slice = pBuffer->HeliosTakeNextSlice();
 +
-+    if (auto* next = pBuffer->HeliosTakeNextSlice()) {
-+      // Adopt the travelling reference.
-+      slice = next;
-+      next->decRef();
++    if (likely(slice != nullptr)) {
 +      pBuffer->HeliosSetMapPtr(slice->mapPtr());
 +    } else {
-+      slice = pBuffer->DiscardSlice(&m_heliosFrontendCache);
++      Rc<DxvkResourceAllocation> fresh = pBuffer->DiscardSlice(&m_heliosFrontendCache);
++      slice = fresh.ptr();
++      slice->incRef();
 +    }
 +
 +    *ppData = slice->mapPtr();
@@ -182,10 +183,10 @@ index 3a090686..4226b4b7 100644
            D3D11CommonTexture*         pResource,
            UINT                        Subresource,
 diff --git a/src/d3d11/d3d11_context_imm.h b/src/d3d11/d3d11_context_imm.h
-index 3edc59b5..5201740a 100644
+index 3edc59b5..9bd89215 100644
 --- a/src/d3d11/d3d11_context_imm.h
 +++ b/src/d3d11/d3d11_context_imm.h
-@@ -133,6 +133,34 @@ namespace dxvk {
+@@ -133,6 +133,35 @@ namespace dxvk {
      // Capture the existing flush boundary once. A vehicle copy retains this
      // value across pending waits; waiting must never flush or move its target.
      uint64_t HeliosFlushFrame();
@@ -201,9 +202,10 @@ index 3edc59b5..5201740a 100644
 +     * mapped slice. Touches no context state besides that cache.
 +     * \param [in] pBuffer A buffer with a CPU-visible map mode
 +     * \param [out] ppData The slice's mapped pointer
-+     * \returns The slice, or null when the device is lost
++     * \returns The slice with one owned reference for the caller, or null
++     *   when the device is lost
 +     */
-+    Rc<DxvkResourceAllocation> HeliosFrontendDiscard(
++    DxvkResourceAllocation* HeliosFrontendDiscard(
 +            D3D11Buffer*                pBuffer,
 +            void**                      ppData);
 +

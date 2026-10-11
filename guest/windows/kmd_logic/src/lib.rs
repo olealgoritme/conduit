@@ -93,6 +93,7 @@ pub mod flip_pend_wd;
 pub mod wait_bound;
 pub mod stage_trace;
 pub mod scanout_events;
+pub mod immediate_flip;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

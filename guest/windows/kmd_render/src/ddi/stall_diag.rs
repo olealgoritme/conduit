@@ -1702,6 +1702,7 @@ pub(crate) fn publish_counters() {
     // announce counters (`docs/kmd-rm-client.md` 15.18.15).
     crate::ddi::flip_lat::publish_counters();
     crate::ddi::flip_announce::publish_counters();
+    crate::ddi::immediate_flip::publish_counters();
     // The escape scope's counters (v334): waits that gave up, the longest escape.
     crate::ddi::escape_wait::publish_counters();
 }

@@ -64,7 +64,20 @@ struct Stats {
     getdata_hints: AtomicU64,
     errors_reported: AtomicU64,
     errors_dropped: AtomicU64,
+    /// The drain at Present: how long the app thread waited for the worker's
+    /// tail of the frame. Buckets <50, <200, <500, <1000, <2000, >=2000 µs.
+    presents: AtomicU64,
+    present_drain_us: AtomicU64,
+    present_drain_max_us: AtomicU64,
+    present_drain_hist: [AtomicU64; 6],
 }
+
+/// Present drains between two summary lines (a process that never destroys
+/// its device, like most games at exit, still leaves its counters in the log).
+const PRESENTS_PER_SUMMARY: u64 = 8192;
+
+/// How long the render thread spins at Present before it sleeps.
+const PRESENT_DRAIN_SPIN: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// Outstanding bytes of discarded dynamic-buffer slices the worker has not yet
 /// handed to DXVK (whose `ThrottleDiscard` bounds them from there). Above this
@@ -168,11 +181,18 @@ impl Frontend {
                 sync.push_str(&format!(" {name}={n}/{}", r(&s.sync_waited[i])));
             }
         }
+        let presents = r(&s.presents).max(1);
+        let hist: Vec<String> = s.present_drain_hist.iter().map(|a| r(a).to_string()).collect();
         format!(
-            "D3D11 front end: {} | sync(calls/waited):{} | discard={} no_overwrite={} discard_waits={} \
+            "D3D11 front end: {} | sync(calls/waited):{} | present drain: n={} avg_us={} max_us={} \
+             hist(<50/<200/<500/<1000/<2000/more)={} | discard={} no_overwrite={} discard_waits={} \
              getdata_early={} getdata_hints={} errors={}/{} dropped",
             self.q.summary(),
             sync,
+            r(&s.presents),
+            r(&s.present_drain_us) / presents,
+            r(&s.present_drain_max_us),
+            hist.join("/"),
             r(&s.split_discard),
             r(&s.split_no_overwrite),
             r(&s.discard_waits),
@@ -236,6 +256,42 @@ impl Frontend {
             }
             self.sync(reason);
             self.enter(h)
+        }
+    }
+
+    /// The drain before a Present, timed; every [`PRESENTS_PER_SUMMARY`]
+    /// presents the summary goes to the log.
+    unsafe fn present_drain(&self, h: Hdevice) {
+        let t0 = std::time::Instant::now();
+        // Spin (no sleep/wake handshake) for the frame's tail: the worker is
+        // normally busy right up to the Present, and the render thread has
+        // nothing else to do until it is done.
+        unsafe {
+            if !self.enter(h) {
+                let i = SyncReason::Dxgi as usize;
+                self.stats.sync[i].fetch_add(1, Ordering::Relaxed);
+                if self.q.drain_spinning(PRESENT_DRAIN_SPIN) {
+                    self.stats.sync_waited[i].fetch_add(1, Ordering::Relaxed);
+                }
+                self.enter(h);
+            }
+        }
+        let us = t0.elapsed().as_micros() as u64;
+        let s = &self.stats;
+        let n = s.presents.fetch_add(1, Ordering::Relaxed) + 1;
+        s.present_drain_us.fetch_add(us, Ordering::Relaxed);
+        s.present_drain_max_us.fetch_max(us, Ordering::Relaxed);
+        let bucket = match us {
+            0..=49 => 0,
+            50..=199 => 1,
+            200..=499 => 2,
+            500..=999 => 3,
+            1000..=1999 => 4,
+            _ => 5,
+        };
+        s.present_drain_hist[bucket].fetch_add(1, Ordering::Relaxed);
+        if n % PRESENTS_PER_SUMMARY == 0 {
+            log_error!("{}", self.summary());
         }
     }
 
@@ -1534,6 +1590,17 @@ retire_destroy!(fe_destroy_command_list => destroy_command_list, D3D11DDI_HCOMMA
 // ---------------------------------------------------------------------------
 
 macro_rules! sync_dxgi {
+    ($name:ident => $orig:ident, $arg:ident, present) => {
+        unsafe extern "system" fn $name(arg: *mut ddi::$arg) -> i32 {
+            if !arg.is_null() {
+                let h = unsafe { dxgi_device_handle((*arg).hDevice) };
+                if let Some(fe) = unsafe { fe_of(h) } {
+                    unsafe { fe.present_drain(h) };
+                }
+            }
+            unsafe { $orig(arg) }
+        }
+    };
     ($name:ident => $orig:ident, $arg:ident) => {
         unsafe extern "system" fn $name(arg: *mut ddi::$arg) -> i32 {
             if !arg.is_null() {
@@ -1547,7 +1614,7 @@ macro_rules! sync_dxgi {
     };
 }
 
-sync_dxgi!(fe_dxgi_present => dxgi_present, DXGI_DDI_ARG_PRESENT);
+sync_dxgi!(fe_dxgi_present => dxgi_present, DXGI_DDI_ARG_PRESENT, present);
 sync_dxgi!(fe_dxgi_set_display_mode => dxgi_set_display_mode, DXGI_DDI_ARG_SETDISPLAYMODE);
 sync_dxgi!(fe_dxgi_rotate_resource_identities => dxgi_rotate_resource_identities, DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES);
 sync_dxgi!(fe_dxgi_blt => dxgi_blt, DXGI_DDI_ARG_BLT);
@@ -1555,12 +1622,12 @@ sync_dxgi!(fe_dxgi_resolve_shared_resource => dxgi_resolve_shared_resource, DXGI
 sync_dxgi!(fe_dxgi_blt1 => dxgi_blt1, DXGI_DDI_ARG_BLT1);
 sync_dxgi!(fe_dxgi_offer_resources => dxgi_offer_resources, DXGI_DDI_ARG_OFFERRESOURCES);
 sync_dxgi!(fe_dxgi_reclaim_resources => dxgi_reclaim_resources, DXGI_DDI_ARG_RECLAIMRESOURCES);
-sync_dxgi!(fe_dxgi_present_mpo => dxgi_present_mpo, DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY);
-sync_dxgi!(fe_dxgi_present1 => dxgi_present1, DXGI_DDI_ARG_PRESENT1);
-sync_dxgi!(fe_dxgi_present1_6_1 => dxgi_present1_6_1, DXGI1_6_1_DDI_ARG_PRESENT);
+sync_dxgi!(fe_dxgi_present_mpo => dxgi_present_mpo, DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY, present);
+sync_dxgi!(fe_dxgi_present1 => dxgi_present1, DXGI_DDI_ARG_PRESENT1, present);
+sync_dxgi!(fe_dxgi_present1_6_1 => dxgi_present1_6_1, DXGI1_6_1_DDI_ARG_PRESENT, present);
 sync_dxgi!(fe_dxgi_offer_resources1 => dxgi_offer_resources1, DXGI_DDI_ARG_OFFERRESOURCES1);
 sync_dxgi!(fe_dxgi_reclaim_resources1 => dxgi_reclaim_resources1, DXGI_DDI_ARG_RECLAIMRESOURCES1);
-sync_dxgi!(fe_dxgi_present_mpo1 => dxgi_present_mpo1, DXGI1_6_1_DDI_ARG_PRESENTMULTIPLANEOVERLAY);
+sync_dxgi!(fe_dxgi_present_mpo1 => dxgi_present_mpo1, DXGI1_6_1_DDI_ARG_PRESENTMULTIPLANEOVERLAY, present);
 
 // ---------------------------------------------------------------------------
 // Table installation (after the normal install chain, only for a device with

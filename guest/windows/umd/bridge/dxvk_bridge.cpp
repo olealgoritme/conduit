@@ -1876,13 +1876,13 @@ std::size_t HeliosDxvkDevice::fe_map_discard(std::size_t buffer_ptr,
       return 0;
     }
     void* ptr = nullptr;
-    dxvk::Rc<dxvk::DxvkResourceAllocation> slice =
+    // One owned reference comes back; it becomes the token as is.
+    dxvk::DxvkResourceAllocation* slice =
       static_cast<dxvk::D3D11ImmediateContext*>(impl->context)->HeliosFrontendDiscard(buffer, &ptr);
-    if (slice == nullptr || !ptr)
+    if (!slice)
       return 0;
-    slice->incRef();
     *data = reinterpret_cast<std::size_t>(ptr);
-    return reinterpret_cast<std::size_t>(slice.ptr());
+    return reinterpret_cast<std::size_t>(slice);
   });
 }
 

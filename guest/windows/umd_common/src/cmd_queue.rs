@@ -16,7 +16,7 @@
 //! Layout of a record (8-byte aligned, never straddling the end of the ring):
 //!
 //! ```text
-//! | Header { call, len, extra_off, extra_len } | closure bytes | extra bytes |
+//! | Header { call, len, extra_len } | closure bytes | extra bytes |
 //! ```
 //!
 //! `call == None` is a pad record covering the tail of the ring. A tail shorter
@@ -36,13 +36,16 @@ use std::time::{Duration, Instant};
 #[repr(align(64))]
 struct Line<T>(T);
 
-type CallFn = unsafe fn(closure: *mut u8, extra: *const u8, extra_len: usize);
+/// Runs the record at `record` (its header first). The closure sits right
+/// after the header and the extra bytes right after the closure; only the
+/// monomorphised call knows the closure's size, so the header does not carry
+/// the extra bytes' offset (16-byte header).
+type CallFn = unsafe fn(record: *mut u8, extra_len: usize);
 
 #[repr(C)]
 struct Header {
     call: Option<CallFn>,
     len: u32,
-    extra_off: u32,
     extra_len: u32,
 }
 
@@ -59,7 +62,7 @@ pub const MIN_RING_BYTES: usize = 4096;
 pub const MAX_RING_BYTES: usize = 64 << 20;
 
 /// Worker spin on an empty ring before it parks.
-const WORKER_SPIN: Duration = Duration::from_micros(20);
+const WORKER_SPIN: Duration = Duration::from_micros(100);
 /// A waiter's spin before it sleeps on the condvar.
 const WAITER_SPIN: Duration = Duration::from_micros(100);
 /// Records between two waiter/destroy checks while the worker is busy.
@@ -73,7 +76,9 @@ const PARK_LONG: Duration = Duration::from_millis(50);
 /// quarter second of idleness at [`PARK_MID`]).
 const PARKS_BEFORE_LONG: u32 = 64;
 
-unsafe fn call_closure<F: FnOnce(&[u8])>(closure: *mut u8, extra: *const u8, extra_len: usize) {
+unsafe fn call_closure<F: FnOnce(&[u8])>(record: *mut u8, extra_len: usize) {
+    let closure = unsafe { record.add(HEADER_BYTES) };
+    let extra = unsafe { record.add(HEADER_BYTES + round8(size_of::<F>())) } as *const u8;
     // SAFETY: `closure` points at an `F` written by `push` and read exactly
     // once, here; `extra` spans `extra_len` initialised bytes of the record.
     let f = unsafe { core::ptr::read(closure as *mut F) };
@@ -333,7 +338,6 @@ impl CmdQueue {
                 (self.hot.buf.add(pos) as *mut Header).write(Header {
                     call: None,
                     len: tail as u32,
-                    extra_off: 0,
                     extra_len: 0,
                 });
             }
@@ -341,7 +345,6 @@ impl CmdQueue {
             (p as *mut Header).write(Header {
                 call: Some(call_closure::<F>),
                 len: len as u32,
-                extra_off: extra_off as u32,
                 extra_len: extra_len as u32,
             });
             (p.add(HEADER_BYTES) as *mut F).write(f);
@@ -398,12 +401,20 @@ impl CmdQueue {
     /// once (the worker runs records in order, so anything it could wait for
     /// is either done or behind the record it is running).
     pub fn wait_done(&self, pos: u64) -> bool {
+        self.wait_done_spinning(pos, WAITER_SPIN)
+    }
+
+    /// [`wait_done`](Self::wait_done) that spins up to `spin` before it
+    /// sleeps: for a waiter with nothing else to do whose wait is normally
+    /// short (the render thread at Present waiting for the frame's tail), a
+    /// sleep/wake handshake would add its latency to every frame.
+    pub fn wait_done_spinning(&self, pos: u64, spin: Duration) -> bool {
         if self.read.0.load(Ordering::Acquire) >= pos || self.is_worker() {
             return false;
         }
         let t0 = Instant::now();
         self.kick();
-        while t0.elapsed() < WAITER_SPIN {
+        while t0.elapsed() < spin {
             if self.read.0.load(Ordering::Acquire) >= pos {
                 self.note_wait(t0);
                 return true;
@@ -441,6 +452,12 @@ impl CmdQueue {
     pub fn drain(&self) -> bool {
         self.stats.0.drains.fetch_add(1, Ordering::Relaxed);
         self.wait_done(self.written())
+    }
+
+    /// [`drain`](Self::drain) spinning up to `spin` before sleeping.
+    pub fn drain_spinning(&self, spin: Duration) -> bool {
+        self.stats.0.drains.fetch_add(1, Ordering::Relaxed);
+        self.wait_done_spinning(self.written(), spin)
     }
 
     /// Run `run` once the worker has passed `pos` (normally the producer's
@@ -603,7 +620,7 @@ impl CmdQueue {
             let p = self.hot.buf.add(pos);
             let h = core::ptr::read(p as *const Header);
             if let Some(call) = h.call {
-                call(p.add(HEADER_BYTES), p.add(h.extra_off as usize), h.extra_len as usize);
+                call(p, h.extra_len as usize);
             }
             self.read.0.store(r + h.len as u64, Ordering::Release);
         }

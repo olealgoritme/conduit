@@ -1808,6 +1808,7 @@ impl DisplayLink {
     /// (`EV_PRESENTED` from a `CAP_PRESENTED` client): tell the guest which
     /// flip that was, once per flip.
     fn client_presented(&self, i: usize, stamp: u32, kind: u32, present_ns: u64) {
+        crate::frame_probe::presented(stamp, present_ns, kind);
         if !self.presented_enabled() {
             return;
         }
@@ -2398,6 +2399,9 @@ impl DisplayLink {
         match send_records(fd, &frame, Some(dmabuf)) {
             Ok(()) => {
                 c.frame_owed = false;
+                if flags & wire::CMD_F_SHM == 0 && crate::frame_probe::on() {
+                    crate::frame_probe::sent(stamp, dmabuf, u64::from(f.offset));
+                }
                 let reports = c.broker_caps & wire::CAP_RELEASE_SEQ != 0;
                 if st.release.enabled() {
                     let key = st.frame_key;
