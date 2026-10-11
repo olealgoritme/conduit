@@ -431,12 +431,12 @@ unsafe fn finish_command_list_into(
     // zero object churn.
     let finished = dc_ctx.FinishCommandList(false, Some(&mut cl));
     // FinishCommandList(FALSE) clears the DC's DXVK state (a logical reset
-    // under the Helios fast path), exactly as ExecuteCommandList(FALSE) does
-    // on its target: the DC's shadows of what DXVK has bound reset with it.
-    // Without this the next list's first draw with the same input layout
-    // skips IASetInputLayout (`bound_il_com` still names it) and draws with
-    // none. A spurious reset only costs one redundant bind.
-    dc.bindings.reset_after_command_list_execute();
+    // under the Helios fast path): forget what DXVK had bound. Without this
+    // the next list's first draw with the same input layout skips
+    // IASetInputLayout (`bound_il_com` still names it) and draws with none.
+    // The API-level shadows stay: the runtime re-sends only what the app
+    // sets, and the next draw rebinds from them.
+    dc.bindings.forget_dxvk_bindings();
     match finished {
         Ok(()) => match cl {
             Some(c) => {
