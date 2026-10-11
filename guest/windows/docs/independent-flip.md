@@ -1508,7 +1508,7 @@ swap chain showed one frame) had one cause: no hardware pointer was reported. `H
 (`hw_cursor::knob_default_for`). Opt-outs: `IndepFlip` = 0 in the KMD service key, `DirectFlipSupport` = 0 (never) or 1 (equal
 formats only) in `HKLM\SOFTWARE\Helios`.
 
-`ImmFlip` (KMD service key, default 7; `kmd_logic::immediate_flip`) covers immediate flips: a Present with `FlipInterval` 0
+`ImmFlip` (KMD service key, default 15; `kmd_logic::immediate_flip`) covers immediate flips: a Present with `FlipInterval` 0
 or `IMMEDIATE_ALLOW_TEARING` (carried in the DMA flip record) and MMIO flips with `FlipImmediate`. Each flip records this
 on its allocation, so the coalescing pending slot and its retries read the right answer. A game with V-sync off presents
 these.
@@ -1524,7 +1524,16 @@ these.
   where an NVK buffer outside the direct-scan-out table is completed as a kept picture (`IdfRef06`) and never shown. With it
   both arrive as MMIO flips with `FlipImmediate`, which `ForeignFlip` programs for any adopted NVK buffer.
 
-Flips with a sync interval (DWM's composition, V-sync on) are paced and retired by the tick as before. Whether the host shows
+- Bit 3: a promoted swap chain's flip (`IndependentFlipExclusive`) counts as immediate even when dxgkrnl asked for
+  `FlipOnNextVSync`. dxgkrnl issues a promoted application's interval-0 presents without `ALLOW_TEARING` that way (CS2 on
+  405.50: 207 presents/s, about 130 flips/s at one- and two-vblank spacing, because each flip waited for the synthetic
+  vsync). Retired at publication, every frame goes to the host. A promoted application with V-sync on is then not held to
+  the refresh by the flip queue.
+
+Immediate frames are sent to the host at most once per third of the paced interval (about 1 ms at 240 Hz): an uncapped
+full-screen application at thousands of frames per second flooded the viewer otherwise.
+
+Flips with a sync interval that are not promoted (DWM's composition) are paced and retired by the tick as before. Whether the host shows
 an immediate frame at once (tearing) or at its own next vblank is the viewer's choice. The guest waits for neither.
 
 Counters: `ImmKnob`, `ImmDma` / `ImmMmio` (immediate flips armed by each lane), `ImmProg` (immediate programmings taken),

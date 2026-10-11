@@ -13,6 +13,7 @@ pub mod chain;
 pub mod console;
 pub mod display;
 pub mod error;
+pub mod frame_probe;
 pub mod guarded;
 pub mod guestmem;
 pub mod handle_table;
