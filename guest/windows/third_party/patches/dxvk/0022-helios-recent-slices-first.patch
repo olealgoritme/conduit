@@ -7,9 +7,8 @@ allocation cache, 0021) went into its size class's free list under a mutex,
 and reached a local cache again only once that free list had filled to a
 whole list (256 KiB worth: 1024 slices of 256 B) and moved to the pool. A
 refill therefore handed out slices freed up to a list's worth of frees ago,
-cold in the CPU caches, and the application's writes into a freshly mapped
-slice paid for it (d3d11_mapbench: about as much as the cache saved on the
-allocator lock).
+likely cold in the CPU caches, where the allocator's own path hands back the
+address it freed last.
 
 Each size class of the shared cache now also keeps a lock-free stack of the
 most recently freed allocations, newest first. A free pushes onto it (CAS);
