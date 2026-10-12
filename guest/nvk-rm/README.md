@@ -129,6 +129,16 @@ The composed present writes `helios-wsi-<pid>.log`. No files at all from a
 process means NVK's WSI never loaded in it (the Helios policy sent it to
 Venus); `vkframes` files without rows mean it never presented through NVK.
 
+GPU-bound throughput per stage: `tests/perf/vk_gpu_bound.c` (`make
+vk_gpu_bound` on Linux, `windows/build-tests.sh` for Windows) times ALU,
+FMA, ROP fill and blend into dedicated and placed render targets, texture
+sampling (cached, streaming, page-bound), copy bandwidth, barriers, render
+pass splits, per-submit gaps and a sustained load, all at 3840x2160 with
+GPU timestamps. `guest/windows/tools/d3d12_gpu_bound.cpp` runs the same
+tests through D3D12, plus root CBVs per draw, so the D3D12 path lines up
+with Vulkan test by test; `guest/windows/tools/gpu-bound-run.sh` runs either
+in the guest with `nvidia-smi dmon` watching the host GPU.
+
 ## `patches/`: the RM backend
 
 Each patch builds on its own.
