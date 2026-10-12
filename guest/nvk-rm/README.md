@@ -70,6 +70,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N MiB caps it (common 30) |
 | `NVK_RM_DESC_TABLE_VRAM` | 0 | descriptor tables/pools in CPU-mapped VRAM (common 26, 52) |
 | `NVK_RM_UPLOAD_VRAM` | 0 | command buffer upload memory in CPU-mapped VRAM: `compute` the compute root descriptor tables, `1` all of it (common 26, 52); off by default: a new command pool's first block costs a VRAM allocation and a BAR1 map, and Steel Nomad (D3D12) ran at a third of its speed with `compute` |
+| `NVK_CMD_MEM_CACHE` | 64 | command buffer memory blocks of each kind a device keeps from destroyed and trimmed command pools for new ones; 0 frees them (common 54) |
 | `NVK_RM_SYSMEM_CACHED` | 1 | host-visible system memory GPU-cacheable in L2 (`=0` off, `=desc`/`=app` one kind only) |
 | `NVK_RM_COMPRESSION` | 1 | compressible VRAM for images in dedicated allocations on GB20x |
 | `NVK_RM_COMPRESS_ALL`, `_ZS`, `_TYPE` | 0 | compression outside dedicated allocations, for depth/stencil, and as a memory type (see "Compression") |
@@ -277,6 +278,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0051 | every failed shader and pipeline compile (spirv_to_nir, vkCreateGraphicsPipelines, vkCreateComputePipelines) is one line with the stage, a SPIR-V hash, the VkResult and the module's capabilities and extensions: on Windows appended to `C:\ProgramData\Helios\shader-failures.log` (the ledger the UMDs share) with the SPIR-V saved under `C:\ProgramData\Helios\spirv-failures\`, elsewhere `mesa_logw` |
 | 0052 | RM: a compute dispatch's root descriptor table (`NVKMD_MEM_GPU_LATENCY`, its own upload stream) can be CPU-mapped VRAM, `NVK_RM_UPLOAD_VRAM=compute` (`1` all upload memory; default `0`, none); NVK's own CPU-mapped VRAM has a 256 MiB budget of its own and no longer needs the application's BAR heap |
 | 0053 | NAK: the legalizer's GPR copy of a uniform value serves every later use in its block (an FFMA by two uniform constants made a copy per FFMA, all in one register: a copy -> FFMA chain at a fraction of the FMA rate); `NAK_DEBUG=noucse` makes a copy per use |
+| 0054 | the command buffer memory of destroyed and trimmed command pools stays in a per-device cache (`NVK_CMD_MEM_CACHE` blocks of each kind, default 64; 0 frees them) for the next pools: a new block is an allocation, a GPU VA and a CPU map, host round trips on RM in a guest, and vkd3d-proton makes a command pool per D3D12 command allocator |
 
 ## Per-draw cost (common 0001-0007)
 
