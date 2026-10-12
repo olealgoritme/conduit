@@ -32,6 +32,8 @@
  *   rtpass   256 960x540 draws, each reading the previous one's target:
  *            render pass + layout transition between draws, against the
  *            same draws in one pass                               us/pass
+ *   record   CPU cost of recording 8 command buffers x 64 dispatches per
+ *            frame: pools reused, then a new pool per command buffer
  *   submit   the same GPU work per frame (64 units of ~50 us) split into
  *            1/4/16/64 submits, each signalling a timeline semaphore, 2
  *            frames in flight: wall time vs GPU busy, the idle gap per
@@ -1116,6 +1118,105 @@ test_submit(void)
    CHECK(vkResetDescriptorPool(dev, dpool, 0));
 }
 
+
+/* ------------------------------------------------------------------ */
+/* CPU side of recording: d3d12_gpu_bound's record test in Vulkan.  Per
+ * frame 8 command buffers x 64 tiny dispatches, 2 frames in flight; once
+ * with the pools reset and reused, once with a new pool per command buffer
+ * every frame (what vkd3d-proton does for an app that makes new command
+ * allocators per frame).
+ */
+static void
+test_record(void)
+{
+   struct buf out;
+   make_buffer(&out, 1 << 20);
+   VkDescriptorSet set = make_set(NULL, &out, &out);
+   enum { LISTS = 8, DISPATCHES = 64, INFLIGHT = 2 };
+   for (int fresh = 0; fresh <= 1; fresh++) {
+      VkCommandPool pools[INFLIGHT][LISTS];
+      VkCommandBuffer cmds[INFLIGHT][LISTS];
+      memset(pools, 0, sizeof(pools));
+      uint64_t slot_value[INFLIGHT] = { 0 };
+      double rec_ms = 0, t_measure = 0, pool_ms = 0;
+      int frames = 0, measured = 0;
+      const double t0 = now_ms();
+      for (;;) {
+         const int slot = frames % INFLIGHT;
+         if (slot_value[slot])
+            timeline_wait(slot_value[slot]);
+         if (frames == 8)
+            t_measure = now_ms();
+         if (now_ms() - t0 > 2500 && measured > 8)
+            break;
+         const double r0 = now_ms();
+         double p_ms = 0;
+         for (int k = 0; k < LISTS; k++) {
+            const double p0 = now_ms();
+            if (pools[slot][k] && fresh) {
+               vkDestroyCommandPool(dev, pools[slot][k], NULL);
+               pools[slot][k] = VK_NULL_HANDLE;
+            }
+            if (!pools[slot][k]) {
+               VkCommandPoolCreateInfo pci = {
+                  .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                  .queueFamilyIndex = qfam,
+               };
+               CHECK(vkCreateCommandPool(dev, &pci, NULL, &pools[slot][k]));
+               VkCommandBufferAllocateInfo ai = {
+                  .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                  .commandPool = pools[slot][k],
+                  .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                  .commandBufferCount = 1,
+               };
+               CHECK(vkAllocateCommandBuffers(dev, &ai, &cmds[slot][k]));
+            } else {
+               CHECK(vkResetCommandPool(dev, pools[slot][k], 0));
+            }
+            p_ms += now_ms() - p0;
+            VkCommandBuffer cmd = cmds[slot][k];
+            VkCommandBufferBeginInfo bi = {
+               .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+               .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            };
+            CHECK(vkBeginCommandBuffer(cmd, &bi));
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p_copy);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0,
+                                    1, &set, 0, NULL);
+            for (int d = 0; d < DISPATCHES; d++) {
+               struct pc pc = { { (float)d, 0, 0, 0 }, { 256, d, 0, 0 } };
+               push(cmd, &pc);
+               vkCmdDispatch(cmd, 1, 1, 1);
+            }
+            CHECK(vkEndCommandBuffer(cmd));
+            submit_signal(cmd);
+         }
+         slot_value[slot] = timeline_value;
+         if (frames >= 8) {
+            rec_ms += now_ms() - r0;
+            pool_ms += p_ms;
+            measured++;
+         }
+         frames++;
+      }
+      const double wall = now_ms() - t_measure;
+      CHECK(vkQueueWaitIdle(queue));
+      for (int s = 0; s < INFLIGHT; s++)
+         for (int k = 0; k < LISTS; k++)
+            if (pools[s][k])
+               vkDestroyCommandPool(dev, pools[s][k], NULL);
+      printf("%-34s wall %8.3f ms/frame  record+submit %8.3f ms/frame  "
+             "pools %7.3f ms  %6.2f us/dispatch\n",
+             fresh ? "record new pools" : "record reused pools",
+             wall / measured, rec_ms / measured, pool_ms / measured,
+             rec_ms * 1e3 / measured / (LISTS * DISPATCHES));
+      fflush(stdout);
+   }
+   vkDestroyBuffer(dev, out.buf, NULL);
+   vkFreeMemory(dev, out.mem, NULL);
+   CHECK(vkResetDescriptorPool(dev, dpool, 0));
+}
+
 /* ------------------------------------------------------------------ */
 /* sustained load */
 
@@ -1395,6 +1496,8 @@ main(int argc, char **argv)
       test_barrier();
    if (want(tests, "rtpass"))
       test_rtpass();
+   if (want(tests, "record"))
+      test_record();
    if (want(tests, "submit"))
       test_submit();
    if (want(tests, "sustain"))

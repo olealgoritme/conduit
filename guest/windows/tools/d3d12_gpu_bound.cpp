@@ -30,6 +30,9 @@
 //                                                                 Mdraws/s
 //   record   CPU cost of recording: 8 lists x 64 dispatches per frame with
 //            allocators reused, then new allocators every frame   us/dispatch
+//   cbread   pixel shaders reading 64 constants each from a root CBV  Gread/s
+//   bindless 8 taps from one of 64 textures in a descriptor table, indexed
+//            per draw or per 8x8 block (NonUniformResourceIndex)   Gtap/s
 //   submit   the same GPU work per frame (64 units of ~50 us) in 1/4/16/64
 //            ExecuteCommandLists, one Signal per frame, 2 frames in flight:
 //            wall time vs GPU busy, the idle gap per ExecuteCommandLists
@@ -74,7 +77,7 @@ static double sustain_s = 10.0;
 // constants b0 are its push constants.
 static const char kShaders[] = R"(
 cbuffer PC : register(b0) { float4 p; uint4 u; };
-cbuffer Draw : register(b1) { float4 dpos; float4 dcol; };
+cbuffer Draw : register(b1) { float4 dpos; float4 dcol; float4 big[254]; };
 Texture2D<float4> t : register(t0);
 SamplerState smp : register(s0);
 RWStructuredBuffer<uint4> dst : register(u0);
@@ -140,6 +143,31 @@ float4 ps_blit(float4 fc : SV_Position) : SV_Target {
   return t.SampleLevel(smp, fc.xy * p.xy, 0) * 0.999 + 0.001;
 }
 float4 ps_cb(float4 fc : SV_Position) : SV_Target { return dcol; }
+#ifdef SM51
+// 64 textures in one descriptor table, indexed per draw (uniform) or per
+// 8x8 pixel block (NonUniformResourceIndex), 8 taps each
+Texture2D<float4> tt[64] : register(t0, space1);
+float4 ps_bindless(float4 fc : SV_Position) : SV_Target {
+  uint2 c = uint2(fc.xy);
+  uint idx = u.z != 0 ? (pcg((c.x >> 3u) ^ ((c.y >> 3u) << 12u)) & 63u) : (u.y & 63u);
+  float2 uv = fc.xy * p.xy;
+  float4 s = 0;
+  [unroll] for (int i = 0; i < 8; i++) {
+    if (u.z != 0)
+      s += tt[NonUniformResourceIndex(idx)].SampleLevel(smp, uv + float2(i, 0) * p.zw, 0);
+    else
+      s += tt[idx].SampleLevel(smp, uv + float2(i, 0) * p.zw, 0);
+  }
+  return s;
+}
+#endif
+// u.x cbuffer reads per pixel from the root CBV, uniform (loop-counter) index
+float4 ps_cbread(float4 fc : SV_Position) : SV_Target {
+  float4 s = float4(fc.xy * 0.001, 0, 0);
+  for (uint i = 0; i < u.x; i++)
+    s = s * big[(i * 7u) & 127u] + big[((i * 7u) & 127u) + 1u];
+  return s;
+}
 
 [numthreads(256, 1, 1)]
 void cs_copy(uint3 id : SV_DispatchThreadID) {
@@ -189,12 +217,14 @@ static ID3D12DescriptorHeap* rtv_heap;
 static UINT srv_inc, rtv_inc;
 static const UINT NQUERIES = 1024;
 
-enum { RP_CONST = 0, RP_TABLE = 1, RP_UAV0 = 2, RP_UAV1 = 3, RP_CBV = 4 };
+enum { RP_CONST = 0, RP_TABLE = 1, RP_UAV0 = 2, RP_UAV1 = 3, RP_CBV = 4, RP_TABLE64 = 5 };
 
 static ID3DBlob* compile(const char* entry, const char* target) {
   ID3DBlob* code = nullptr;
   ID3DBlob* err = nullptr;
-  if (FAILED(D3DCompile(kShaders, sizeof(kShaders) - 1, "gpu_bound", nullptr, nullptr, entry, target,
+  static const D3D_SHADER_MACRO sm51[] = { { "SM51", "1" }, { nullptr, nullptr } };
+  const bool is51 = std::strstr(target, "5_1") != nullptr;
+  if (FAILED(D3DCompile(kShaders, sizeof(kShaders) - 1, "gpu_bound", is51 ? sm51 : nullptr, nullptr, entry, target,
                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
     std::printf("D3DCompile %s: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
     std::exit(2);
@@ -419,11 +449,12 @@ static void init_tex(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOUR
 // ---------------------------------------------------------------------------
 // pipelines
 
-static ID3D12PipelineState* gfx(const char* ps, DXGI_FORMAT fmt, bool blend, const char* vs = "vs_fsq") {
+static ID3D12PipelineState* gfx(const char* ps, DXGI_FORMAT fmt, bool blend, const char* vs = "vs_fsq",
+                                 const char* ps_target = "ps_5_0") {
   static ID3DBlob* vsb[2];
   const int vi = std::strcmp(vs, "vs_fsq") ? 1 : 0;
   if (!vsb[vi]) vsb[vi] = compile(vs, "vs_5_0");
-  ID3DBlob* psb = compile(ps, "ps_5_0");
+  ID3DBlob* psb = compile(ps, ps_target);
   D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
   d.pRootSignature = rs;
   d.VS = { vsb[vi]->GetBufferPointer(), vsb[vi]->GetBufferSize() };
@@ -966,6 +997,77 @@ static void test_record() {
   out->Release();
 }
 
+// Shaders that read their constants from a root CBV, as D3D12 engines do:
+// 4 fullscreen passes, 64 dependent cbuffer reads per pixel (uniform index).
+// On NVK, vkd3d-proton turns a root CBV into a push descriptor (bound
+// constant buffer) or a raw GPU address (global memory loads);
+// HELIOS_VKD3D_PUSH_CBV picks the first.
+static void test_cbread() {
+  const UINT size = 256 * 16;
+  ID3D12Resource* cb = buffer(size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                              D3D12_RESOURCE_STATE_GENERIC_READ);
+  float* m = nullptr;
+  D3D12_RANGE none = { 0, 0 };
+  CHECK(cb->Map(0, &none, (void**)&m));
+  for (UINT i = 0; i < size / 4; i++) m[i] = 0.5f + 0.001f * (i % 97);
+  cb->Unmap(0, nullptr);
+  ID3D12Resource* rt = texture(DXGI_FORMAT_R8G8B8A8_UNORM, W, H, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET, false);
+  make_rtv(rt, 0);
+  ID3D12PipelineState* p = gfx("ps_cbread", DXGI_FORMAT_R8G8B8A8_UNORM, false);
+  PC pc = { { 0 }, { 64, 0, 0, 0 } };
+  double t = time_body([&](ID3D12GraphicsCommandList* l) {
+    const float black[4] = { 0, 0, 0, 0 };
+    l->ClearRenderTargetView(rtv(0), black, 0, nullptr);
+    set_target(l, 0, W, H);
+    l->SetPipelineState(p);
+    push(l, pc);
+    l->SetGraphicsRootConstantBufferView(RP_CBV, cb->GetGPUVirtualAddress());
+    for (int i = 0; i < 4; i++) l->DrawInstanced(3, 1, 0, 0);
+  });
+  report("cbread: 64 root-CBV reads/px x4", t, (double)W * H * 4 * 64 / 1e9, "Gread/s");
+  p->Release();
+  rt->Release();
+  cb->Release();
+}
+
+// Bindless sampling: 64 1024^2 RGBA8 textures in one descriptor table, 8 taps
+// per pixel from one texture chosen per draw (uniform index) or per 8x8 block
+// (NonUniformResourceIndex), fullscreen x4.
+static void test_bindless() {
+  std::vector<ID3D12Resource*> texs(64);
+  for (int i = 0; i < 64; i++) {
+    texs[i] = texture(DXGI_FORMAT_R8G8B8A8_UNORM, 1024, 1024, D3D12_RESOURCE_FLAG_NONE,
+                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, false);
+    make_srv(texs[i], 16 + i);
+  }
+  ID3D12Resource* rt = texture(DXGI_FORMAT_R8G8B8A8_UNORM, W, H, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET, false);
+  make_rtv(rt, 0);
+  ID3D12PipelineState* p = gfx("ps_bindless", DXGI_FORMAT_R8G8B8A8_UNORM, false, "vs_fsq", "ps_5_1");
+  const double px = (double)W * H;
+  for (int nonuniform = 0; nonuniform <= 1; nonuniform++) {
+    PC pc = { { 1.0f / 1024, 1.0f / 1024, 2.0f / 1024, 0 }, { 0, 0, (UINT)nonuniform, 0 } };
+    double t = time_body([&](ID3D12GraphicsCommandList* l) {
+      const float black[4] = { 0, 0, 0, 0 };
+      l->ClearRenderTargetView(rtv(0), black, 0, nullptr);
+      set_target(l, 0, W, H);
+      l->SetPipelineState(p);
+      l->SetGraphicsRootDescriptorTable(RP_TABLE64, srv_gpu(16));
+      for (int i = 0; i < 4; i++) {
+        pc.u[1] = i;
+        push(l, pc);
+        l->DrawInstanced(3, 1, 0, 0);
+      }
+    });
+    report(nonuniform ? "bindless 64 tex, per-block index x4" : "bindless 64 tex, per-draw index x4", t,
+           px * 4 * 8 / 1e9, "Gtap/s");
+  }
+  p->Release();
+  rt->Release();
+  for (auto* t : texs) t->Release();
+}
+
 static bool want(const char* tests, const char* t) {
   if (!tests) return true;
   size_t n = std::strlen(t);
@@ -1026,7 +1128,11 @@ int main(int argc, char** argv) {
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   range.NumDescriptors = 1;
-  D3D12_ROOT_PARAMETER rp[5] = {};
+  D3D12_DESCRIPTOR_RANGE range64 = {};
+  range64.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  range64.NumDescriptors = 64;
+  range64.RegisterSpace = 1;
+  D3D12_ROOT_PARAMETER rp[6] = {};
   rp[RP_CONST].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   rp[RP_CONST].Constants.Num32BitValues = 8;
   rp[RP_TABLE].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -1038,6 +1144,9 @@ int main(int argc, char** argv) {
   rp[RP_UAV1].Descriptor.ShaderRegister = 1;
   rp[RP_CBV].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   rp[RP_CBV].Descriptor.ShaderRegister = 1;
+  rp[RP_TABLE64].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  rp[RP_TABLE64].DescriptorTable.NumDescriptorRanges = 1;
+  rp[RP_TABLE64].DescriptorTable.pDescriptorRanges = &range64;
   for (auto& r : rp) r.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_STATIC_SAMPLER_DESC ss = {};
   ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1045,7 +1154,7 @@ int main(int argc, char** argv) {
   ss.MaxLOD = D3D12_FLOAT32_MAX;
   ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC rsd = {};
-  rsd.NumParameters = 5;
+  rsd.NumParameters = 6;
   rsd.pParameters = rp;
   rsd.NumStaticSamplers = 1;
   rsd.pStaticSamplers = &ss;
@@ -1068,10 +1177,11 @@ int main(int argc, char** argv) {
 
   D3D12_DESCRIPTOR_HEAP_DESC dh = {};
   dh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  dh.NumDescriptors = 16;
+  dh.NumDescriptors = 16 + 64;
   dh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   CHECK(dev->CreateDescriptorHeap(&dh, __uuidof(ID3D12DescriptorHeap), (void**)&srv_heap));
   dh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  dh.NumDescriptors = 16;
   dh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
   CHECK(dev->CreateDescriptorHeap(&dh, __uuidof(ID3D12DescriptorHeap), (void**)&rtv_heap));
   srv_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1087,6 +1197,8 @@ int main(int argc, char** argv) {
   if (want(tests, "barrier")) test_barrier();
   if (want(tests, "rtpass")) test_rtpass();
   if (want(tests, "rootcbv")) test_rootcbv();
+  if (want(tests, "cbread")) test_cbread();
+  if (want(tests, "bindless")) test_bindless();
   if (want(tests, "record")) test_record();
   if (want(tests, "submit")) test_submit();
   if (want(tests, "sustain")) test_sustain();
