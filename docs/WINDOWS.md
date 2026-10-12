@@ -145,8 +145,7 @@ Off by default while new; each one was measured on the test machine
 | Where | Setting | What it does |
 |---|---|---|
 | Host | `conduit config set venus.guest_blobs true` | the backend serves guest-memory blobs (`--venus-guest-blobs`, [VENUS.md](VENUS.md) "Guest-memory blobs"): Venus copy destinations over the guest's own pages, for the KMD's windowed Present. Applies when the VM's backend next starts. Needs the patched virglrenderer (patch 0002) |
-| Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). Use with `ForeignFlip=1` |
-| Guest, KMD service key | `ForeignFlip` = 1 | the KMD flips the NVK DWM's swap-chain buffers to the scanout itself, zero-copy. Read at adapter start (`pnputil /restart-device`) |
+| Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). `install.ps1` sets it unless `-VenusDesktop` is given |
 
 On by default, with a way back:
 
@@ -156,6 +155,14 @@ On by default, with a way back:
 | Guest, `HKLM\SOFTWARE\Helios` | `DirectFlipSupport` (default 5; or `HELIOS_DIRECT_FLIP_SUPPORT` per process) | what the D3D11.1 `CheckDirectFlipSupport` DDI answers, which DWM uses for independent flip: 5 = yes when dxgkrnl reports DirectFlip for the adapter and size and format match, two different 8-bit scan-out formats also pairing (an R8G8B8A8 game on the B8G8R8A8 desktop); 1 = the same with equal formats only; 3 = as 1 and only for formats the KMD scans out as they are; 2 = whenever size and format match (test lever); 0 = never |
 | Guest, KMD service key | `ImmFlip` (default 15, a bit mask) | immediate flips (interval 0, `ALLOW_TEARING`, MMIO `FlipImmediate`, and a promoted swap chain's flips) are sent to the host at once (bit 0), retired as soon as their address is published (bit 1), `FlipImmediateMmIo` is reported (bit 2), and promoted flips count as immediate (bit 3). 0 paces them like composed flips. [independent-flip.md](../guest/windows/docs/independent-flip.md) 13.10 |
 | Guest, `HKLM\SOFTWARE\Helios` | `NvkRmFencePresent` (default 1; or `HELIOS_NVK_RM_FENCE_PRESENT`) | composed NVK presents retire on the RM fence; 0 restores the CPU wait |
+| Guest, KMD service key | `ForeignFlip` (default 1; 0 off) | the KMD flips the NVK DWM's swap-chain buffers to the scanout itself, zero-copy (block-linear, NVIDIA modifier). With 0 an NVK DWM's desktop reaches the host as a LINEAR buffer with alpha 0 and shows black. `FlipAnnForeign` and `FfAsyncWin` (2) follow it |
+| Guest, KMD service key | `ForeignCopy` (default 1; 0 off) | the KMD copies a foreign (NVK) Present source into its destination (windowed NVK content composed by the NVK DWM); 0 skips such copies (`FcOff`) |
+| Guest, KMD service key | `BltAsync` (default 1; 0 off) | such a copy returns from the Present without a CPU wait |
+| Guest, KMD service key | `RedirVram` (default 1; 0 off) | CDD's CPU-written GDI surfaces in the aperture segment; the UMD leaves the windowed NVK copy to the KMD (`NvkSkipBltCopy` follows it) |
+| Guest, KMD service key | `MsiMode` (default 2; 1 INTx) | MSI-X interrupts. The INF writes `MSISupported` = 0 at every install, so the first start after an install runs on INTx and the driver asks for MSI-X for the next one; a start that never becomes healthy latches INTx ([msi-interrupts.md](../guest/windows/docs/msi-interrupts.md)) |
+
+These five defaults live in `guest/windows/kmd_logic/src/shipping_defaults.rs`; a fresh install
+needs no KMD service-key values.
 
 ## Display
 

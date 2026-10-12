@@ -78,6 +78,7 @@ pub mod ce_route;
 pub mod hw_cursor;
 pub mod gdi_accel;
 pub mod msi;
+pub mod shipping_defaults;
 pub mod paging;
 pub mod shared_placeholder;
 pub mod restart_flip;
