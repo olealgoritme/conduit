@@ -763,6 +763,10 @@ pub(crate) fn start_viewer(
     if fullscreen || std::env::var("CONDUIT_FULLSCREEN").as_deref() == Ok("1") {
         cmd.arg("--fullscreen");
     }
+    // The GPU of the viewer's GPU pass (`viewer.gpu`, `viewer.gpu.NAME`).
+    if help.contains("--gpu ") {
+        cmd.args(["--gpu", &crate::config::viewer_gpu(name).0]);
+    }
     let mut whole_run = false;
     if let Some(sig) = tune {
         cmd.env("HYPRLAND_INSTANCE_SIGNATURE", sig);

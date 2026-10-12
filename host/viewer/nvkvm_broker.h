@@ -185,6 +185,7 @@ struct nb_config {
     int         sync;           /* --sync: NB_SYNC_*, -1 = the saved one    */
     int         gpu_scale;      /* --gpu-scale: NB_GS_*                     */
     const char *render_node;    /* --render-node: the scaler's GPU          */
+    char        gpu_why[200];   /* what --gpu resolved to, and why          */
     const char *view_state;     /* settings file, rewritten on every change */
     const char *vm_shutdown_cmd;/* menu: run via /bin/sh, not waited for    */
     const char *vm_reboot_cmd;
@@ -537,6 +538,10 @@ struct nb_session_ops {
      * hardcoded list: each backend answers from the set the compositor or X
      * server enumerated at startup. */
     bool (*format_ok)(struct nb_session *s, uint32_t fourcc, uint64_t mod);
+    /* Optional (NULL: no).  A pair format_ok() refused that the backend can
+     * still show by copying it on the GPU into one the display takes
+     * (nb_blit.h).  Asked only after the pair and its opaque twin. */
+    bool (*copy_ok)(struct nb_session *s, uint32_t fourcc, uint64_t mod);
     /* Import an already-validated dma-buf and make it the pending content.
      * Does NOT take ownership of desc->fd.  Returns 0 or -errno. */
     int  (*attach)(struct nb_session *s, const struct nb_buf_desc *desc);

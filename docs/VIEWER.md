@@ -155,7 +155,7 @@ shape in fullscreen:
   RTX 5090 (p99 under 0.6 ms) and returns the guest's buffer as soon as the
   pass is done. Here the Filter setting is the viewer's own (Sharp =
   nearest neighbour). `--gpu-scale=off` leaves scaling to the compositor;
-  `--render-node` picks the GPU.
+  `--gpu` picks the GPU ([below](#the-viewers-gpu)).
 
 **Latest per refresh** (`latch`) commits at most one frame per output
 refresh: the newest complete guest frame, at a fixed point before the vblank
@@ -231,6 +231,52 @@ windows only) in the config, or for the running session only
 `hyprctl keyword misc:vrr 2` (back to the config's value on reload). KDE:
 Display Configuration, Adaptive sync: Automatic. Sway:
 `output * adaptive_sync on`. The viewer does not change these settings.
+
+## Direct attach or GPU copy
+
+The guest's frame is attached to the window as it is (zero-copy) whenever
+the compositor takes its (format, modifier) pair: it advertises the pair (or
+its opaque twin, XRGB for ARGB) on `zwp_linux_dmabuf_v1` and imports it.
+When it does not (the compositor runs on another GPU than the guest's, and
+the guest's layout is NVIDIA block-linear while the compositor lists only
+its own GPU's modifiers and LINEAR, or the compositor refuses a pair it
+advertised), the viewer copies each frame with its GPU pass
+(`host/viewer/nb_gpuscale.c`) into a buffer the compositor does take
+(XRGB8888, a modifier it lists, LINEAR as the last choice), scaled and
+letterboxed to the window, in every window mode. When the GPU pass cannot
+render into any layout the compositor takes (an NVIDIA GPU renders to no
+LINEAR buffer, and a compositor on an integrated GPU takes no NVIDIA
+modifier), it renders into its own memory and reads each frame back into a
+`wl_shm` buffer, which every compositor takes: one copy through system
+memory, about 1.3 ms per frame at 2560x1440. The viewer answers the
+backend's format query yes for such a pair, so no frame is dropped.
+`--gpu-scale=off` turns the GPU pass off, the copy included;
+`--present-mode=linear` and `shm` leave it off (the backend converts
+instead). The log says `GPU copy: ... is not taken by the compositor` once
+per pair, the `--stats` line says `path: direct attach` or `path: GPU copy
+(...) on /dev/dri/renderD...`, and the overlay's last line reads `DIRECT`,
+`GPU COPY` or `GPU SCALE` with the GPU. The decision is
+`host/viewer/nb_blit.h`.
+
+## The viewer's GPU
+
+The GPU pass runs on one GPU, `--gpu` (`viewer.gpu`, `viewer.gpu.NAME`;
+`host/viewer/nb_gpusel.h`):
+
+- `auto` (default): the GPU that imports the guest's frames, trying first the
+  one whose PCI vendor wrote the frame's modifier (the GPU that rendered it,
+  where the frame's memory is), then the others;
+- `dgpu`, `igpu`: the discrete or the integrated GPU, found from PCI facts in
+  sysfs (vendor, slot, video memory), never from card numbers, which can
+  swap between boots: NVIDIA is discrete, Intel at `0000:00:02.0` is
+  integrated, AMD with under 4 GiB of VRAM (an APU's carve-out) is
+  integrated;
+- a render node path.
+
+A chosen GPU that cannot import a frame's layout gives way to one that can.
+`conduit-viewer --resolve-gpu [--gpu VALUE]` prints the render nodes, how
+each is classified and what the value picks; `conduit doctor` shows the same
+and, for a VM, the last `path:` in its viewer log.
 
 ## Cost
 

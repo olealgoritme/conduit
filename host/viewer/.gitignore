@@ -16,3 +16,5 @@ test-ui
 test-gpuscale
 test-pace
 test-latch
+test-blit
+test-gpusel
