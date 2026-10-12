@@ -14,15 +14,25 @@
 //! E_INVALIDARG, and the game stops with "A fatal DirectX error has occurred
 //! (30000000)" -- on Venus and NVK alike.
 //!
+//! The same split applies to the optional shader caps. `d3d11.dll` reads the
+//! `D3D11DDICAPS_SHADER` bits SPECIFIED_STENCIL_REF, TYPED_UAV_LOAD_ADDITIONAL_
+//! FORMATS and ROVS, and the OPTIONS2/OPTIONS3 caps, only from a WDDM 2.0+
+//! interface (they are `D3D11DDI_MINOR_HEADER_VERSION >= 5` additions). Under
+//! WDDM 1.3 it reports them unsupported and refuses every shader whose `SFI0`
+//! flags need one, before the driver is called: Counter-Strike 2's
+//! `bloom_cs` and `mboit_mixed_upsample` compute shaders (typed UAV loads)
+//! failed to create, so bloom and the OIT upsample never ran.
+//!
 //! # Selection, once per process
 //!
 //!  1. `HELIOS_UMD_DDI` (environment): `2.3` / `23` / `0x24` / `36` selects
 //!     WDDM 2.3, `1.3` / `13` / `0x10` / `16` WDDM 1.3. Tests and per-launch.
 //!  2. dwm.exe: `HKLM\SOFTWARE\Helios!UmdDdiLevelDwm` (REG_DWORD, absent 0x10).
 //!     DWM keeps WDDM 1.3 until the new level is proven elsewhere.
-//!  3. `UmdDdiLevel` (REG_DWORD, absent 0x10): 0x24 = WDDM 2.3 everywhere else.
+//!  3. `UmdDdiLevel` (REG_DWORD, absent 0x24): WDDM 2.3 for every other
+//!     process; 0x10 keeps them on WDDM 1.3.
 //!  4. `UmdDdiAllowList` (REG_SZ, executable names separated by `;`): these
-//!     processes get WDDM 2.3 while `UmdDdiLevel` is still 0x10.
+//!     processes get WDDM 2.3 even when `UmdDdiLevel` is 0x10.
 //!
 //! WDDM 2.3 is advertised IN ADDITION to the WDDM 1.3 / 11.1 / 11.0 versions
 //! (highest first); the runtime picks the highest it supports.
@@ -82,7 +92,7 @@ fn decide() -> (DdiLevel, &'static str) {
     }
     let level = crate::knobs::UMD_DDI_LEVEL.get();
     if level == LEVEL_WDDM2_3 {
-        return (DdiLevel::Wddm2_3, "HKLM\\SOFTWARE\\Helios!UmdDdiLevel=0x24");
+        return (DdiLevel::Wddm2_3, "HKLM\\SOFTWARE\\Helios!UmdDdiLevel (absent = 0x24)");
     }
     if level != LEVEL_WDDM1_3 {
         log_error!("UmdDdiLevel=0x{level:x} is not 0x10 or 0x24: WDDM1.3");
@@ -92,7 +102,7 @@ fn decide() -> (DdiLevel, &'static str) {
             return (DdiLevel::Wddm2_3, "HKLM\\SOFTWARE\\Helios!UmdDdiAllowList");
         }
     }
-    (DdiLevel::Wddm1_3, "default")
+    (DdiLevel::Wddm1_3, "HKLM\\SOFTWARE\\Helios!UmdDdiLevel (not 0x24)")
 }
 
 /// The process's level. Computed and logged on first use.

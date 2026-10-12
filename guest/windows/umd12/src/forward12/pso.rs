@@ -1567,6 +1567,43 @@ unsafe fn bytecode_of(
     }
 }
 
+/// One shader-failure ledger line (`helios_umd_common::shader_diag`) per
+/// stage of a pipeline the engine refused: the DXIL/DXBC container's hash and
+/// `SFI0` requirements, and the engine's HRESULT. The ledger is shared with
+/// the D3D11 UMD and NVK; vkd3d-proton's own log has the compiler's words.
+///
+/// # Safety
+/// The handles in `a` must be live shader handles of this DDI call.
+unsafe fn record_pso_failure(a: &ddi12::D3D12DDIARG_CREATE_PIPELINE_STATE_0099, hr: i32) {
+    let reason = format!("engine hr=0x{:08x}", hr as u32);
+    let stages = [
+        ("cs", a.hComputeShader),
+        ("vs", a.hVertexShader),
+        ("ps", a.hPixelShader),
+        ("ds", a.hDomainShader),
+        ("hs", a.hHullShader),
+        ("gs", a.hGeometryShader),
+        ("as", a.hAmplificationShader),
+        ("ms", a.hMeshShader),
+    ];
+    let mut any = false;
+    for (name, h) in stages {
+        if h.pDrvPrivate.is_null() {
+            continue;
+        }
+        // SAFETY: forwarded from the caller.
+        if let Some(state) = unsafe { shaders::shader(h) } {
+            let line = helios_umd_common::shader_diag::record_failure("d3d12", name, &state.container, &reason);
+            log_error!("CreatePipelineState: {line}");
+            any = true;
+        }
+    }
+    if !any {
+        let line = helios_umd_common::shader_diag::record_failure("d3d12", "pso", &[], &reason);
+        log_error!("CreatePipelineState: {line}");
+    }
+}
+
 /// `pfnCalcPrivatePipelineStateSize`.
 ///
 /// One machine word: the slot holds a bare owning `ID3D12PipelineState*`.
@@ -1959,6 +1996,8 @@ unsafe extern "system" fn create_pipeline_state(
                     e.code().0 as u32
                 );
             }
+            // SAFETY: the runtime handed these handles in this call.
+            unsafe { record_pso_failure(a, e.code().0) };
             return e.code().0;
         }
     };

@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 12 Oct 2026 17:01:31 +0200
+Subject: [PATCH] vulkan/runtime: record every failed shader and pipeline
+ compile
+
+A pipeline the driver cannot build is a draw or dispatch the application
+loses, and the only trace was DXVK's or vkd3d-proton's own log, if any.
+spirv_to_nir failures and failed vkCreateGraphicsPipelines /
+vkCreateComputePipelines (other than VK_PIPELINE_COMPILE_REQUIRED) now
+write one line per stage: the stage, an FNV-1a hash of the SPIR-V, the
+VkResult, and the module's OpCapability operands and OpExtension names,
+which is what to compare with the device's SPIR-V capabilities when
+spirv_to_nir refused it.
+
+On Windows the line is appended to C:\ProgramData\Helios\shader-failures.log,
+the ledger the Helios D3D11/D3D12 UMDs share (an empty ledger after a
+session means nothing failed), and the SPIR-V is saved to
+C:\ProgramData\Helios\spirv-failures\<hash>.spv for spirv-val/spirv-dis.
+Elsewhere it is a mesa_logw. At most 256 lines and 64 dumps per process.
+---
+ src/vulkan/runtime/vk_pipeline.c | 164 ++++++++++++++++++++++++++++++-
+ 1 file changed, 163 insertions(+), 1 deletion(-)
+
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index d134e22..a07f8ca 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -46,6 +46,19 @@
+ #include "shader_enums.h"
+ 
+ #include "util/mesa-blake3.h"
++#include "util/log.h"
++#include "util/u_atomic.h"
++#include "util/u_process.h"
++#include "vk_enum_to_str.h"
++
++#include <stdio.h>
++#include <time.h>
++#ifdef _WIN32
++#include <direct.h>
++#include <process.h>
++#else
++#include <unistd.h>
++#endif
+ 
+ struct vk_pipeline_binary {
+    struct vk_object_base base;
+@@ -163,6 +176,145 @@ vk_set_subgroup_size(nir_shader *shader,
+    assert(shader->info.max_subgroup_size >= shader->info.min_subgroup_size);
+ }
+ 
++/* Failed shader and pipeline compiles, made visible.
++ *
++ * A pipeline the driver cannot build is a draw or dispatch the application
++ * loses: DXVK and vkd3d-proton log it in their own files, if at all. Every
++ * failure here becomes one line with the stage, a hash of the SPIR-V, the
++ * VkResult and the SPIR-V's capabilities and extensions (what to compare
++ * with the device's spirv_caps when spirv_to_nir refused it).
++ *
++ * Windows: appended to C:\ProgramData\Helios\shader-failures.log, the ledger
++ * the Helios UMDs share (its line count is the failure count), and the
++ * SPIR-V is saved to C:\ProgramData\Helios\spirv-failures\<hash>.spv for
++ * spirv-val/spirv-dis. Elsewhere: mesa_logw. Bounded per process.
++ */
++#define VK_PIPELINE_FAILURE_LINES 256
++#define VK_PIPELINE_FAILURE_DUMPS 64
++
++static uint64_t
++vk_spirv_fnv1a64(const uint32_t *spirv, size_t size)
++{
++   uint64_t h = 0xcbf29ce484222325ull;
++   const uint8_t *b = (const uint8_t *)spirv;
++   for (size_t i = 0; spirv && i < size; i++) {
++      h ^= b[i];
++      h *= 0x00000100000001b3ull;
++   }
++   return h;
++}
++
++/* "OpCapability operands" and "OpExtension names" of a SPIR-V module. */
++static void
++vk_spirv_caps_exts(const uint32_t *spirv, size_t size,
++                   char *caps, size_t caps_len, char *exts, size_t exts_len)
++{
++   size_t words = size / 4, c = 0, e = 0;
++   caps[0] = exts[0] = '\0';
++   if (!spirv || words < 5 || spirv[0] != 0x07230203)
++      return;
++   for (size_t i = 5; i < words;) {
++      uint32_t op = spirv[i] & 0xffff, wc = spirv[i] >> 16;
++      if (wc == 0 || i + wc > words)
++         break;
++      if (op == 17 /* OpCapability */ && wc >= 2 && c + 12 < caps_len)
++         c += snprintf(caps + c, caps_len - c, "%s%u", c ? "," : "", spirv[i + 1]);
++      else if (op == 10 /* OpExtension */ && wc >= 2 && e + 2 < exts_len) {
++         const char *name = (const char *)&spirv[i + 1];
++         size_t max = (wc - 1) * 4;
++         size_t n = strnlen(name, max);
++         if (e + n + 2 < exts_len)
++            e += snprintf(exts + e, exts_len - e, "%s%.*s", e ? "," : "", (int)n, name);
++      } else if (op == 14 /* OpMemoryModel */ || op == 15 /* OpEntryPoint */) {
++         break; /* capabilities and extensions come first */
++      }
++      i += wc;
++   }
++}
++
++static void
++vk_pipeline_record_failure(const char *what, mesa_shader_stage stage,
++                           const uint32_t *spirv, size_t spirv_size,
++                           VkResult result)
++{
++   static uint32_t lines;
++   if (p_atomic_inc_return(&lines) > VK_PIPELINE_FAILURE_LINES)
++      return;
++
++   char caps[512], exts[512];
++   vk_spirv_caps_exts(spirv, spirv_size, caps, sizeof(caps), exts, sizeof(exts));
++   uint64_t hash = vk_spirv_fnv1a64(spirv, spirv_size);
++   const char *stage_name =
++      stage == MESA_SHADER_NONE ? "pipeline" : _mesa_shader_stage_to_abbrev(stage);
++
++#ifdef _WIN32
++   const char *proc = util_get_process_name();
++   FILE *f = fopen("C:\\ProgramData\\Helios\\shader-failures.log", "ab");
++   if (f) {
++      fprintf(f, "%llu %s pid=%d nvk %s %s spirv=%016llx len=%zu result=%s caps=%s exts=%s\r\n",
++              (unsigned long long)time(NULL), proc ? proc : "?", _getpid(),
++              stage_name, what, (unsigned long long)hash, spirv_size,
++              vk_Result_to_str(result), caps[0] ? caps : "-",
++              exts[0] ? exts : "-");
++      fclose(f);
++   }
++   static uint32_t dumps;
++   if (spirv && spirv_size && p_atomic_inc_return(&dumps) <= VK_PIPELINE_FAILURE_DUMPS) {
++      char path[128];
++      _mkdir("C:\\ProgramData\\Helios\\spirv-failures");
++      snprintf(path, sizeof(path),
++               "C:\\ProgramData\\Helios\\spirv-failures\\%016llx.spv",
++               (unsigned long long)hash);
++      FILE *d = fopen(path, "wb");
++      if (d) {
++         fwrite(spirv, 1, spirv_size, d);
++         fclose(d);
++      }
++   }
++#else
++   mesa_logw("shader failure: nvk %s %s spirv=%016llx len=%zu result=%s caps=%s exts=%s",
++             stage_name, what, (unsigned long long)hash, spirv_size,
++             vk_Result_to_str(result), caps[0] ? caps : "-",
++             exts[0] ? exts : "-");
++#endif
++}
++
++/* The SPIR-V of a pipeline stage, from its module or an inline
++ * VkShaderModuleCreateInfo; NULL for a module identifier or a library. */
++static const uint32_t *
++vk_stage_spirv(const VkPipelineShaderStageCreateInfo *info, size_t *size)
++{
++   VK_FROM_HANDLE(vk_shader_module, module, info->module);
++   if (module != NULL) {
++      *size = module->size;
++      return (const uint32_t *)module->data;
++   }
++   const VkShaderModuleCreateInfo *minfo =
++      vk_find_struct_const(info->pNext, SHADER_MODULE_CREATE_INFO);
++   *size = minfo ? minfo->codeSize : 0;
++   return minfo ? minfo->pCode : NULL;
++}
++
++/* One line per stage of a pipeline the driver failed to create. */
++static void
++vk_pipeline_record_stages_failure(const char *what, uint32_t stage_count,
++                                  const VkPipelineShaderStageCreateInfo *stages,
++                                  VkResult result)
++{
++   if (result == VK_SUCCESS || result == VK_PIPELINE_COMPILE_REQUIRED)
++      return;
++   if (stage_count == 0) {
++      vk_pipeline_record_failure(what, MESA_SHADER_NONE, NULL, 0, result);
++      return;
++   }
++   for (uint32_t i = 0; i < stage_count; i++) {
++      size_t size = 0;
++      const uint32_t *spirv = vk_stage_spirv(&stages[i], &size);
++      vk_pipeline_record_failure(what, vk_to_mesa_shader_stage(stages[i].stage),
++                                 spirv, size, result);
++   }
++}
++
+ VkResult
+ vk_pipeline_shader_stage_to_nir(struct vk_device *device,
+                                 VkPipelineCreateFlags2KHR pipeline_flags,
+@@ -214,8 +366,11 @@ vk_pipeline_shader_stage_to_nir(struct vk_device *device,
+                                      spirv_options, nir_options,
+                                      false /* internal */,
+                                      mem_ctx);
+-   if (nir == NULL)
++   if (nir == NULL) {
++      vk_pipeline_record_failure("spirv_to_nir", stage, spirv_data, spirv_size,
++                                 VK_ERROR_UNKNOWN);
+       return vk_errorf(device, VK_ERROR_UNKNOWN, "spirv_to_nir failed");
++   }
+ 
+    vk_set_subgroup_size(
+       nir, properties->subgroupSize, properties->minSubgroupSize,
+@@ -2275,6 +2430,10 @@ vk_common_CreateGraphicsPipelines(VkDevice _device,
+       if (result == VK_SUCCESS)
+          continue;
+ 
++      vk_pipeline_record_stages_failure("vkCreateGraphicsPipelines",
++                                        pCreateInfos[i].stageCount,
++                                        pCreateInfos[i].pStages, result);
++
+       if (first_error_or_success == VK_SUCCESS)
+          first_error_or_success = result;
+ 
+@@ -2683,6 +2842,9 @@ vk_common_CreateComputePipelines(VkDevice _device,
+       if (result == VK_SUCCESS)
+          continue;
+ 
++      vk_pipeline_record_stages_failure("vkCreateComputePipelines", 1,
++                                        &pCreateInfos[i].stage, result);
++
+       if (first_error_or_success == VK_SUCCESS)
+          first_error_or_success = result;
+ 
+-- 
+2.43.0
+
