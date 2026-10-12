@@ -197,6 +197,8 @@ struct nb_x11 {
     int       con_x, con_y;
     bool      rehint_pending;
     uint64_t  rehint_due_ms;
+    unsigned  mode_ui_due;      /* NB_UI_* bits after a guest mode change */
+    unsigned  logged_w, logged_h;   /* last mode whose first frame was logged */
 
     /* The viewer's own UI (nb_ui.h) on child windows: opaque, so it needs
      * no compositor and no ARGB visual. */
@@ -788,6 +790,20 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         x->pending = -1;
         return -ENOENT;
     }
+    /*
+     * A NEW GUEST MODE: its per-mode rule (nb_vstore_guest_mode) goes into
+     * the layout BEFORE this frame is placed, so the mode's first frame is
+     * already drawn with it.  The notice and the menu follow from the tick.
+     */
+    if (sl->w != nb_guest_w || sl->h != nb_guest_h) {
+        unsigned ch = nb_guest_mode_changed(&x->vst, sl->w, sl->h,
+                                            x->ui.notice, sizeof(x->ui.notice));
+
+        if ((ch & NB_VIEW_CH_LAYOUT) || x->ui.notice[0]) {
+            x->mode_ui_due = NB_UI_REDRAW |
+                             (x->ui.notice[0] ? NB_UI_NOTICE : 0);
+        }
+    }
 
     /*
      * SHM tier: there is no pixmap to present, only bytes to push.  Packed
@@ -867,7 +883,21 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         return 0;
     }
 
-    if (x11_draw(x, sl)) {
+    int composited = x11_draw(x, sl);
+
+    if (sl->w != x->logged_w || sl->h != x->logged_h) {
+        char sum[64];
+
+        x->logged_w = sl->w;
+        x->logged_h = sl->h;
+        /* What the mode's FIRST frame was placed with (the rule, if any,
+         * already in force): checkable from the log. */
+        nb_view_summary(&x->vst.cur, sum, sizeof(sum));
+        nb_log("guest mode %ux%u: first frame %dx%d at %d,%d in %dx%d (%s)",
+               sl->w, sl->h, x->place.vis.w, x->place.vis.h, x->place.vis.x,
+               x->place.vis.y, x->win_w, x->win_h, sum);
+    }
+    if (composited) {
         /*
          * PACE A COMPOSITED FRAME ON VBLANK.  There is no PixmapComplete
          * for a composite, so without this the only pacing left was the
@@ -3139,6 +3169,14 @@ static void x11_menu_set(struct nb_x11 *x, bool open)
 
 static void x11_ui_do(struct nb_x11 *x, unsigned bits)
 {
+    /*
+     * Remembered for the guest mode in force (nb_vstore_auto_rule), once an
+     * area drag is over (its steps are not each written to the file).
+     */
+    if ((bits & (NB_UI_VIEW | NB_UI_SAVE)) && x->ui.drag < 0 &&
+        nb_vstore_auto_rule(&x->vst)) {
+        bits |= NB_UI_SAVE;
+    }
     if (bits & NB_UI_VIEW) {
         x11_relayout(x);
     }
@@ -3283,19 +3321,12 @@ static int x11_tick_ui(struct nb_x11 *x, int next)
     uint64_t now = x11_now_ms();
     int due;
 
-    /* A new guest mode: apply its per-mode rule (nb_vstore_guest_mode). */
-    if (x->current >= 0) {
-        unsigned bw = x->bufs[x->current].w, bh = x->bufs[x->current].h;
+    /* A new guest mode was applied by x11_commit: the notice and menu. */
+    if (x->mode_ui_due) {
+        unsigned bits = x->mode_ui_due;
 
-        if (bw != nb_guest_w || bh != nb_guest_h) {
-            unsigned ch = nb_guest_mode_changed(&x->vst, bw, bh, x->ui.notice,
-                                                sizeof(x->ui.notice));
-
-            if (ch & NB_VIEW_CH_LAYOUT) {
-                x11_ui_do(x, NB_UI_VIEW | NB_UI_REDRAW |
-                                 (x->ui.notice[0] ? NB_UI_NOTICE : 0));
-            }
-        }
+        x->mode_ui_due = 0;
+        x11_ui_do(x, bits);
     }
 
     if (x->cfg && x->cfg->open_menu && x->win_w > 0) {

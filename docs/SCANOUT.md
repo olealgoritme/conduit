@@ -165,11 +165,12 @@ viewer menu ──EV_MODE_EDIT────┼─► display-modes file ──►
   current mode marked; a click is an ordinary mode hint. Adding a mode in the
   menu sends `EV_MODE_EDIT` (22): the backend writes the file and every
   guest and viewer gets the new list.
-- **Per-mode picture rules** (viewer): "Remember for WxH" keeps the area,
-  scale and filter in force for that guest mode (`rule=WxH|...` in the VM's
-  `viewer.conf`). Whenever the guest's picture changes size the rule for the
-  new mode applies; leaving it for a mode without a rule brings back the
-  layout from before. The pointer mapping follows the picture as always.
+- **Per-mode picture settings** (viewer): every change of area, scale or
+  filter is kept for the guest mode in force (`rule=WxH|...` in the VM's
+  `viewer.conf`). When the guest's picture changes size, the new mode's
+  settings, or the default for a mode without its own, apply before its
+  first frame is placed ([VIEWER.md](VIEWER.md#settings-per-guest-mode)).
+  The pointer mapping follows the picture as always.
 
 ## Hardware cursor
 

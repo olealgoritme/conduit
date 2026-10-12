@@ -2480,11 +2480,18 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
     w->buf_w = (int)sl->w;
     w->buf_h = (int)sl->h;
-    /* A new guest mode: its per-mode rule (if any) is applied from the UI
-     * tick; the menu marks the new current mode. */
-    if (sl->w != nb_guest_w || sl->h != nb_guest_h) {
-        if (nb_guest_mode_changed(&w->vst, sl->w, sl->h, w->rule_note,
-                                  sizeof(w->rule_note)) & NB_VIEW_CH_LAYOUT) {
+    /*
+     * A NEW GUEST MODE: its per-mode rule (nb_vstore_guest_mode) goes into
+     * the layout here, before wl_viewport_apply() places this frame, so the
+     * mode's first frame is already shown with it.  The notice and the menu
+     * follow from the UI tick.
+     */
+    bool new_mode = sl->w != nb_guest_w || sl->h != nb_guest_h;
+
+    if (new_mode) {
+        if ((nb_guest_mode_changed(&w->vst, sl->w, sl->h, w->rule_note,
+                                   sizeof(w->rule_note)) & NB_VIEW_CH_LAYOUT) ||
+            w->rule_note[0]) {
             w->rule_due = true;
         }
         w->modes_dirty = true;
@@ -2515,6 +2522,17 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
          */
         target = wl_viewport_apply(w, (int)sl->w, (int)sl->h, sl->buf, true,
                                    &new_w, &new_h);
+        if (new_mode) {
+            char sum[64];
+
+            /* What the mode's FIRST frame was placed with (the rule, if
+             * any, is already in force): checkable from the log. */
+            nb_view_summary(&w->vst.cur, sum, sizeof(sum));
+            nb_log("guest mode %ux%u: first frame %dx%d at %d,%d in %dx%d "
+                   "(%s)%s%s", sl->w, sl->h, w->place.vis.w, w->place.vis.h,
+                   w->place.vis.x, w->place.vis.y, w->win_w, w->win_h, sum,
+                   w->rule_note[0] ? " - " : "", w->rule_note);
+        }
         /* A copy-only frame the GPU pass did not draw (no free output
          * buffer yet, or the pass just failed) has nothing else to show:
          * skipped like a dropped scaled frame, never attached. */
@@ -7244,6 +7262,14 @@ static void wl_menu_set(struct nb_wl *w, bool open)
 
 static void wl_ui_do(struct nb_wl *w, unsigned bits)
 {
+    /*
+     * Remembered for the guest mode in force (nb_vstore_auto_rule), once an
+     * area drag is over (its steps are not each written to the file).
+     */
+    if ((bits & (NB_UI_VIEW | NB_UI_SAVE)) && w->ui.drag < 0 &&
+        nb_vstore_auto_rule(&w->vst)) {
+        bits |= NB_UI_SAVE;
+    }
     if (bits & NB_UI_VIEW) {
         wl_relayout(w);
     }

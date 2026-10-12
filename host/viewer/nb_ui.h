@@ -93,7 +93,8 @@ enum {
     NB_UI_ID_RES_MODE,          /* arg: index into env->modes                */
     NB_UI_ID_RES_MODE_DEL,      /* arg: index into env->modes (a custom one) */
     NB_UI_ID_RULE_SAVE,         /* remember the layout for the guest's mode  */
-    NB_UI_ID_RULE_DEL,          /* forget it                                 */
+    NB_UI_ID_RULE_DEL,          /* arg: index into st->rule: forget it       */
+    NB_UI_ID_RULE_DEFAULT,      /* the current layout becomes the default    */
     NB_UI_ID_SYNC,              /* arg: NB_SYNC_*                            */
 };
 
