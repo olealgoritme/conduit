@@ -304,6 +304,12 @@ Display Configuration, Adaptive sync: Automatic. Sway:
 The guest's frame is attached to the window as it is (zero-copy) whenever
 the compositor takes its (format, modifier) pair: it advertises the pair (or
 its opaque twin, XRGB for ARGB) on `zwp_linux_dmabuf_v1` and imports it.
+A guest frame is always shown opaque, because a guest primary's alpha is
+undefined (a Windows desktop composed by DWM leaves it at zero): an ARGB
+frame is attached as its XRGB twin whenever the compositor advertises the
+twin for that modifier, the picture surface carries an opaque region, shared
+memory frames go out as `WL_SHM_FORMAT_XRGB8888`, the GPU pass writes alpha
+1, and on X11 the picture is a depth-24 window.
 When it does not (the compositor runs on another GPU than the guest's, and
 the guest's layout is NVIDIA block-linear while the compositor lists only
 its own GPU's modifiers and LINEAR, or the compositor refuses a pair it

@@ -170,13 +170,16 @@ run_case '' --present 320x240 --bad-fourcc
 check   "an unadvertised fourcc is rejected" 'is not advertised by this display' "$CASE_LOG"
 nocheck "and does not reach attach"          'TEST attach' "$CASE_LOG"
 
-# The opaque-twin fallback: an alpha format whose twin IS advertised must be
-# accepted and presented as the twin.  HARDENING 3 is not relaxed -- the pair
-# actually handed to the display is still one the display named.
+# The opaque twin: a guest primary's alpha is undefined, so an alpha format
+# whose twin is advertised is presented as the twin, even though the test
+# backend advertises the alpha format too.  HARDENING 3 is not relaxed -- the
+# pair actually handed to the display is still one the display named.
 run_case '' --present 320x240 --alpha-fourcc
-check   "AR24 falls back to its advertised opaque twin XR24" \
+check   "AR24 is presented as its opaque twin XR24" \
         'opaque twin' "$CASE_LOG"
-check   "and the frame is attached, not refused" 'TEST attach' "$CASE_LOG"
+check   "and the frame is attached as XR24, not refused" \
+        'TEST attach: .* XR24 mod=' "$CASE_LOG"
+nocheck "and never as AR24"                      'TEST attach: .* AR24 mod=' "$CASE_LOG"
 nocheck "with no rejection"                      'not advertised by' "$CASE_LOG"
 
 # CMD_QUERY_FORMAT: the VMM must be able to ASK before it commits to zero-copy,
@@ -195,21 +198,22 @@ nocheck "a query is not treated as a protocol violation" \
         'protocol violation' "$CASE_LOG"
 
 # --linear-only: the forcing switch.  The test backend advertises XR24 with
-# LINEAR *and* with MOD_INVALID; under the flag only LINEAR survives, so the
-# advertised set shrinks and an implicit-modifier buffer stops being displayable.
+# LINEAR *and* with MOD_INVALID, and AR24 with LINEAR; under the flag only the
+# LINEAR pairs survive, so the advertised set shrinks and an implicit-modifier
+# buffer stops being displayable.
 # That is how the cross-vendor condition is reproduced on a single-GPU host.
 BROKER_EXTRA=--linear-only
 run_case '' --present 320x240 --query-format
-check   "--linear-only narrows the advertised set to one pair" \
-        'advertises 1 \(format, modifier\) pair' "$CASE_LOG"
+check   "--linear-only narrows the advertised set to the LINEAR pairs" \
+        'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
 check   "and LINEAR itself is still USABLE" \
         'fourcc=XR24 modifier=0x0000000000000000 -> USABLE' "$CASE_OUT"
 check   "and a frame still reaches attach" 'TEST attach' "$CASE_LOG"
 
 BROKER_EXTRA=
 run_case '' --present 320x240 --query-format
-check   "without it, both advertised pairs are kept" \
-        'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
+check   "without it, every advertised pair is kept" \
+        'advertises 3 \(format, modifier\) pairs' "$CASE_LOG"
 
 # TIER 3: a memfd must be accepted and presented through wl_shm.  This is the
 # floor under a display that advertises a modifier it will not import, so it
@@ -220,11 +224,11 @@ check   "without it, both advertised pairs are kept" \
 BROKER_EXTRA=--present-mode=native
 run_case '' --present 320x240
 check   "--present-mode=native keeps every advertised pair" \
-        'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
+        'advertises 3 \(format, modifier\) pairs' "$CASE_LOG"
 BROKER_EXTRA=--present-mode=linear
 run_case '' --present 320x240
 check   "--present-mode=linear narrows to LINEAR alone" \
-        'advertises 1 \(format, modifier\) pair' "$CASE_LOG"
+        'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
 BROKER_EXTRA=--present-mode=shm
 run_case '' --present 320x240
 check   "--present-mode=shm advertises no dma-buf format at all" \
