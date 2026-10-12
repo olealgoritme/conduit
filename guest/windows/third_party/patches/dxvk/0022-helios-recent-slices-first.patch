@@ -18,6 +18,10 @@ holds at most 16 lists' worth (4 MiB); further frees take the free-list path
 as before. A stack nobody takes for a second goes back to the allocator at
 the periodic cleanup, like drained lists.
 
+Without host-visible VRAM this only matters with 0021's opt-in
+(HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK=1): otherwise discard slices do not
+come from a local cache and nothing is cacheable.
+
 diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
 index e55c9a89..7fe60fac 100644
 --- a/src/dxvk/dxvk_memory.cpp
