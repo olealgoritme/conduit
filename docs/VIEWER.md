@@ -72,6 +72,10 @@ that fades in when the pointer touches the window's top edge. The menu has:
   area has a green outline. Drag its edges or corners to resize it, or drag
   inside it to move it, with a live preview. It snaps to the window's centre.
 - **Scaling** and **Filter**.
+- **Remembered modes**: which settings apply at the guest's current mode
+  (its own, or the default), every mode that has its own (click one to
+  forget it), and **Make it the default**, which makes the current mode's
+  settings the default for every mode without its own.
 - **Profiles**: save the current setup under a name (for example
   "CS2 4:3 stretched"), click one to load it, `x` to delete it.
   Ctrl+Alt+P cycles through them.
@@ -85,6 +89,27 @@ that fades in when the pointer touches the window's top edge. The menu has:
 While the menu is open, keyboard and pointer go to the menu and the area
 editor, never to the guest. Keys the guest held are released when it opens,
 and a mouse grab is dropped. `Esc` or `Ctrl+Alt+M` closes it.
+
+## Settings per guest mode
+
+Picture area, scaling and filter are remembered per guest mode, without a
+button. Whatever you change while the guest runs at 1600x900 (a menu click,
+`Ctrl+Alt+S`, `Ctrl+Alt+A`, dragging the area) applies whenever the guest is
+at 1600x900 again; the desktop at 5120x1440 keeps its own. A mode you never
+changed anything in uses the default: the top-level settings of the file
+(the ones `--scale`, `--area` and `--filter` set), Fit in the full window
+unless you changed it. Setting a mode back to the default's values drops its
+own settings, `Ctrl+Alt+0` forgets the current mode's settings (in a mode
+without its own it resets the default to Fit, full window), and **Make it
+the default** in the menu turns the current mode's settings into the default.
+
+The settings of the new mode are applied before its first frame is placed,
+so no frame is shown with the previous mode's scaling. The viewer shows
+`1600x900: Stretch 21:9 (remembered)` (or `... (default)` when it falls
+back) as a notice, and logs `guest mode WxH: first frame ...` with the
+placement it used. A profile with a fixed guest resolution stores its
+picture settings for that mode, so they apply when the guest gets there.
+At most 16 modes keep their own settings; the oldest goes first.
 
 ## Saved per VM
 
@@ -102,7 +127,11 @@ area=4:3
 res=1280x960
 recent=1720x1080
 profile=CS2 4:3 stretched|scale=stretch filter=linear area=4:3 res=1280x960
+rule=1600x900|scale=stretch filter=linear area=21:9 res=native
 ```
+
+The top-level `scale`, `filter` and `area` are the default; each `rule=WxH|`
+line is one mode's own settings.
 
 ## The mouse
 
@@ -140,22 +169,41 @@ the log line `presentation:` and the stats line (`immediate`/`vsync`) say what
 was asked for, and `commit->present` shows what happened (immediate: well
 under a millisecond; vsync on a 240 Hz screen: 4 to 8 ms).
 
-A compositor tears (and scans out directly) only a fullscreen window whose own
-buffer covers the output with nothing on top of it. The viewer keeps that
-shape in fullscreen:
+A compositor scans a window out directly (puts its buffer on a hardware
+plane, no composition) and tears it only when the window is fullscreen and
+its buffer suits a plane. In fullscreen the viewer picks one of two paths
+for each layout:
 
-- The guest at the output's mode (a 1:1 picture): the guest's own buffer is
-  the window's only content, as always (zero-copy).
-- Any other picture (a game at 1600x900 on a 5120x1440 screen, stretched,
-  letterboxed or cropped): one GPU pass draws it, scaled, with black bars
-  where the area leaves them, into an output-size buffer
+- **Zero-copy**: the guest's own dma-buf is the picture. 1:1 (the guest at
+  the output's mode) it is the main surface's buffer as it is. Scaled, it is
+  the same buffer with a `wp_viewport` destination (on the main surface when
+  the picture covers the output, on a subsurface over black bars when it is
+  letterboxed). A compositor that scales on a plane (or promotes the
+  subsurface to an overlay plane) scans it out; one that cannot composites
+  it.
+- **GPU pass**: one pass of the viewer's own draws the picture, scaled and
+  with the bars, into an output-size buffer allocated for scanout
   (`host/viewer/nb_gpuscale.c`; EGL/GLES2/GBM, loaded only when first
-  needed). The compositor would scale the picture anyway; this moves that
-  pass in front of it. It costs about 50 µs per frame at 5120x1440 on an
-  RTX 5090 (p99 under 0.6 ms) and returns the guest's buffer as soon as the
-  pass is done. Here the Filter setting is the viewer's own (Sharp =
-  nearest neighbour). `--gpu-scale=off` leaves scaling to the compositor;
-  `--gpu` picks the GPU ([below](#the-viewers-gpu)).
+  needed), with the modifiers of the compositor's scanout tranche when its
+  dma-buf feedback names one. Every compositor can put that shape on the
+  primary plane and tear it. It costs about 50 µs to 1 ms of GPU time per
+  frame at 5120x1440 plus the wait for it, on the GPU the guest is loading.
+
+A 1:1 picture is always zero-copy, unless the compositor's dma-buf feedback
+(`zwp_linux_dmabuf_v1` version 4, per surface) names a scanout tranche that
+leaves out the guest's format/modifier. Otherwise the protocols do not say in
+advance what a compositor will do with a surface, only afterwards
+(`wp_presentation`: `ZERO_COPY` per frame, and when it was shown), so the
+viewer measures (`host/viewer/nb_scanout.h`). It shows a few dozen frames
+zero-copy; if the compositor scanned them out, it stays there. If not, it
+shows as many through the GPU pass and keeps whichever was scanned out,
+else whichever got frames on screen sooner from their arrival (the pass
+included), with ties going to zero-copy. A layout change (guest mode, window,
+area, scale, filter, presentation mode) measures again. With the Sharp filter
+on a scaled picture the GPU pass is always used, because only the viewer's
+own pass scales nearest-neighbour. `--gpu-scale=on` always uses the pass in
+fullscreen with immediate or latch presentation (no measuring),
+`--gpu-scale=off` never; `--gpu` picks the GPU ([below](#the-viewers-gpu)).
 
 **Latest per refresh** (`latch`) commits at most one frame per output
 refresh: the newest complete guest frame, at a fixed point before the vblank
@@ -191,14 +239,31 @@ the EGL context priority the GPU scaling pass asks for
 reports granting.
 
 With `--stats`, the per-second line counts presents the compositor scanned out
-directly (wp_presentation `ZERO_COPY`) and, for a second that was composited,
-lists what on the viewer's side prevents direct scanout: not fullscreen, a
-letterboxed subsurface, a buffer that is not the output's size, a mapped title
-bar, overlay, notice or menu, or a cursor image over the picture. "none on our
-side" means the compositor composited for reasons of its own (its
-configuration, tearing, the buffer format). In fullscreen, a picture with no
-host cursor image (the guest draws its own, and always under grab) sets a
-NULL cursor, so no cursor needs to be composited over it.
+directly (`N direct scanout`, from wp_presentation `ZERO_COPY`), names the path
+(`path: zero-copy 1:1`, `zero-copy, scaled by a viewport`, `zero-copy,
+letterboxed on a subsurface` or `GPU pass into an output-size buffer`) with
+the reason it was chosen (a rule, or what the measurement found), and, for a
+second that was composited, lists what on the viewer's side prevents direct
+scanout: not fullscreen, a letterboxed subsurface, a buffer that is not the
+output's size, a mapped title bar, overlay, notice or menu, a cursor image
+over the picture, or a guest format/modifier outside the compositor's scanout
+tranche. "none on our side" means the compositor composited for reasons of
+its own (its configuration, tearing, a software cursor). The log also has a
+`scanout path:` line whenever the path or its reason changes, and a `dma-buf
+feedback:` line with the scanout tranche (or that the compositor names none).
+In fullscreen, a picture with no host cursor image (the guest draws its own,
+and always under grab) sets a NULL cursor, so no cursor needs to be
+composited over it.
+
+A session with `WLR_NO_HARDWARE_CURSORS=1` (common with NVIDIA on wlroots-based
+compositors) has every cursor drawn in software, and a visible software cursor
+rules out direct scanout on that output. The viewer reports it (at startup, in
+the blockers and in `conduit doctor`) and changes nothing.
+
+On X11 the per-second line counts Present `FLIP`s (the pixmap went to the CRTC:
+direct scanout), `COPY`s and XRender composites. A flip needs a 1:1 picture
+covering the fullscreen window, unredirected by any compositing manager; the
+blockers say which of these is missing.
 
 In a window, and with VSync, the compositor scales the picture.
 The stats overlay is hidden in fullscreen by default (`--overlay=windowed`)
@@ -213,7 +278,9 @@ What each desktop needs:
   VSync it sets it to 0. Hyprland tears only in fullscreen with nothing else
   on the output (no notification, no overlay layer). Hyprland 0.39 composites
   a torn frame (no direct scanout while tearing); that takes well under a
-  millisecond.  While it tears, Hyprland repaints only when the window commits, so a
+  millisecond. With VSync it scans a fullscreen window out directly when
+  `misc:no_direct_scanout = false` (`render:direct_scanout` in later
+  releases) and no software cursor is drawn on the output.  While it tears, Hyprland repaints only when the window commits, so a
   software cursor (`WLR_NO_HARDWARE_CURSORS=1`, common with NVIDIA) would move
   only with guest frames; the viewer commits the current picture again on
   pointer motion over the fullscreen picture (at most twice per refresh,

@@ -14,8 +14,8 @@
  * opaque output-size buffer on the main surface.  The compositor was going to
  * scale the picture anyway; this moves that pass in front of it.
  *
- * Only used in fullscreen with immediate presentation and a picture that is
- * not already an exact fit; an exact fit stays zero-copy.
+ * Used in fullscreen when the measurement in nb_scanout.h finds it beats
+ * showing the guest's buffer zero-copy (or --gpu-scale=on asks for it).
  *
  * EGL, GLES2 and GBM are loaded with dlopen when the scaler is first wanted,
  * so the viewer still has no link-time dependency on them.
@@ -56,10 +56,14 @@ typedef bool (*nb_gs_fmt_ok)(void *ctx, uint32_t fourcc, uint64_t mod);
 
 /*
  * (Re)allocate the NB_GS_TARGETS output buffers at w x h (physical pixels).
- * Returns the number made (0 on failure, with why).  out[] describes them.
+ * scan_mods/n_scan: the XRGB8888 modifiers of the compositor's scanout
+ * tranche (dma-buf feedback), tried first; none: GBM's own choice for
+ * scanout.  Returns the number made (0 on failure, with why).  out[]
+ * describes them.
  */
 int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
-                  void *ctx, struct nb_gs_target out[NB_GS_TARGETS],
+                  void *ctx, const uint64_t *scan_mods, unsigned n_scan,
+                  struct nb_gs_target out[NB_GS_TARGETS],
                   char *why, size_t n);
 
 /*

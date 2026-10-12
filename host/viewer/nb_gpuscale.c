@@ -178,6 +178,7 @@ struct fns {
     void (*gbm_device_destroy)(struct gbm_device *);
     struct gbm_bo *(*gbm_bo_create)(struct gbm_device *, uint32_t, uint32_t, uint32_t, uint32_t);
     struct gbm_bo *(*gbm_bo_create_with_modifiers)(struct gbm_device *, uint32_t, uint32_t, uint32_t, const uint64_t *, unsigned);
+    struct gbm_bo *(*gbm_bo_create_with_modifiers2)(struct gbm_device *, uint32_t, uint32_t, uint32_t, const uint64_t *, unsigned, uint32_t);
     void (*gbm_bo_destroy)(struct gbm_bo *);
     int (*gbm_bo_get_fd)(struct gbm_bo *);
     uint32_t (*gbm_bo_get_stride)(struct gbm_bo *);
@@ -327,6 +328,9 @@ static bool load(struct nb_gs *g, char *why, size_t n)
 #undef B
     *(void **)&f->gbm_bo_create_with_modifiers =
         sym(g->h_gbm, "gbm_bo_create_with_modifiers");
+    /* Optional (Mesa 21.3+): the same with usage flags. */
+    *(void **)&f->gbm_bo_create_with_modifiers2 =
+        sym(g->h_gbm, "gbm_bo_create_with_modifiers2");
     return true;
 }
 
@@ -848,7 +852,8 @@ int nb_gs_readback(struct nb_gs *g, int target, void *dst)
 }
 
 int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
-                  void *ctx, struct nb_gs_target out[NB_GS_TARGETS],
+                  void *ctx, const uint64_t *scan_mods, unsigned n_scan,
+                  struct nb_gs_target out[NB_GS_TARGETS],
                   char *why, size_t n)
 {
     struct fns *f = &g->f;
@@ -861,6 +866,31 @@ int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
         uint32_t fmt = 0;
         uint64_t mod;
 
+        /*
+         * The compositor's scanout tranche first, when it named one: GBM
+         * picks among exactly the XRGB modifiers a plane takes, so the
+         * output buffer is not only importable but scannable.
+         */
+        if (n_scan && (f->gbm_bo_create_with_modifiers2 ||
+                       f->gbm_bo_create_with_modifiers)) {
+            uint64_t m[32];
+            unsigned k = 0;
+
+            for (unsigned j = 0; j < n_scan && k < 32; j++) {
+                if (!ok || ok(ctx, FMT_XRGB8888, scan_mods[j])) {
+                    m[k++] = scan_mods[j];
+                }
+            }
+            if (k) {
+                fmt = FMT_XRGB8888;
+                bo = f->gbm_bo_create_with_modifiers2
+                         ? f->gbm_bo_create_with_modifiers2(
+                               g->gbm, w, h, fmt, m, k,
+                               GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING)
+                         : f->gbm_bo_create_with_modifiers(g->gbm, w, h, fmt,
+                                                           m, k);
+            }
+        }
         /* Opaque XRGB first (a plane takes it without blending), and only
          * a layout the compositor said it takes. */
         for (int k = 0; k < 2 && !bo; k++) {

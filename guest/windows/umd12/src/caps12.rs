@@ -1039,7 +1039,13 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
     let engine_rovs = native_optional_caps().map_or(0, |o| o.rovs);
     let caps = ddi12::D3D12DDI_SHADER_CAPS_0084 {
         MinPrecision: v::MIN_PRECISION_NONE,
-        DoubleOps: 0,
+        // Engine-backed on every engine this UMD drives: vkd3d-proton reports
+        // DoublePrecisionFloatShaderOps from `shaderFloat64`, which NVK sets
+        // unconditionally (`nvk_physical_device.c`) and the host NVIDIA driver
+        // behind Venus exposes. FALSE is not conservative: the runtime and
+        // applications treat a shader that uses doubles as unsupported, and
+        // `CheckFeatureSupport(DOUBLES)` returns a false negative.
+        DoubleOps: 1,
         ShaderSpecifiedStencilRef: 0,
         // ⚠ The shared constant, for the same reason as `OutputMergerLogicOp`:
         // it is what narrows the per-format `UAV_READS` bit at the bottom of

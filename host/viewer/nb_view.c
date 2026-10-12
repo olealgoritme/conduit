@@ -774,11 +774,12 @@ size_t nb_vstore_format(const struct nb_vstore *st0, char *buf, size_t n)
     size_t at = 0;
     char a[40], r[24];
     int i;
-    /* While a rule is in force the file keeps the layout under it. */
+    /* The top-level layout is the default for modes without a rule (the
+     * rules follow); before the first guest mode it is what is shown. */
     struct nb_vstore stv = *st0;
     const struct nb_vstore *st = &stv;
 
-    if (stv.ruled) {
+    if (stv.base_set) {
         take_layout(&stv.cur, &stv.base);
     }
 
@@ -955,8 +956,36 @@ int nb_vstore_profile_load(struct nb_vstore *st, int i)
     if (i < 0 || i >= st->nprof) {
         return -1;
     }
-    st->cur = st->prof[i].v;
     st->prof_at = i;
+    if (st->prof[i].v.res_w && st->prof[i].v.res_h && st->mode_w &&
+        (st->prof[i].v.res_w != st->mode_w ||
+         st->prof[i].v.res_h != st->mode_h)) {
+        /*
+         * A profile for another guest mode: its layout becomes that mode's
+         * rule, applied with the mode's first frame, and the picture now
+         * keeps its own until the guest has switched.
+         */
+        struct nb_view keep = st->cur;
+        unsigned mw = st->mode_w, mh = st->mode_h;
+        int k = nb_vstore_rule_find(st, st->prof[i].v.res_w,
+                                    st->prof[i].v.res_h);
+
+        if (k < 0 && st->nrule >= NB_MAX_RULES) {
+            memmove(&st->rule[0], &st->rule[1],
+                    (size_t)(st->nrule - 1) * sizeof(st->rule[0]));
+            st->nrule--;
+        }
+        st->cur = st->prof[i].v;
+        st->mode_w = st->mode_h = 0;    /* not the mode in force */
+        nb_vstore_rule_save(st, st->prof[i].v.res_w, st->prof[i].v.res_h);
+        st->mode_w = mw;
+        st->mode_h = mh;
+        keep.res_w = st->prof[i].v.res_w;
+        keep.res_h = st->prof[i].v.res_h;
+        st->cur = keep;
+        return 0;
+    }
+    st->cur = st->prof[i].v;
     return 0;
 }
 
@@ -1111,13 +1140,16 @@ int nb_vstore_rule_save(struct nb_vstore *st, unsigned w, unsigned h)
     st->rule[i].h = h;
     st->rule[i].v = st->cur;
     st->rule[i].v.res_w = st->rule[i].v.res_h = 0;
-    if (!st->ruled && !st->base_set) {
+    if (!st->base_set) {
+        /* No mode seen yet: the default is what was shown until now. */
         st->base = st->cur;
+        st->base_set = true;
     }
-    st->base_set = true;
-    st->ruled = true;
-    st->rule_w = w;
-    st->rule_h = h;
+    if (st->mode_w == w && st->mode_h == h) {
+        st->ruled = true;
+        st->rule_w = w;
+        st->rule_h = h;
+    }
     return i;
 }
 
@@ -1128,8 +1160,9 @@ void nb_vstore_rule_delete(struct nb_vstore *st, int i)
     }
     if (st->ruled && st->rule[i].w == st->rule_w &&
         st->rule[i].h == st->rule_h) {
-        /* The layout in force stays until the next mode change. */
-        st->base = st->cur;
+        /* The guest runs at that mode: back to the default now. */
+        take_layout(&st->cur, &st->base);
+        st->ruled = false;
     }
     memmove(&st->rule[i], &st->rule[i + 1],
             (size_t)(st->nrule - i - 1) * sizeof(st->rule[0]));
@@ -1143,49 +1176,109 @@ static bool same_layout(const struct nb_view *a, const struct nb_view *b)
            a->cx == b->cx && a->cy == b->cy && a->ccenter == b->ccenter;
 }
 
+/* "Stretch, 21:9" / "Fit, full window" / "Fit, 1280x960+0+0". */
+static void layout_label(const struct nb_view *v, char *buf, size_t n)
+{
+    char a[40];
+
+    if (v->area == NB_AREA_CUSTOM) {
+        nb_view_area_str(v, a, sizeof(a));
+    } else {
+        snprintf(a, sizeof(a), "%s", nb_view_area_label(v->area));
+    }
+    snprintf(buf, n, "%s %s%s", nb_view_scale_label(v->scale), a,
+             v->filter == NB_FILTER_NEAREST ? ", sharp" : "");
+}
+
 unsigned nb_vstore_guest_mode(struct nb_vstore *st, unsigned w, unsigned h,
                               char *label, size_t n)
 {
     struct nb_view old = st->cur;
     int i = nb_vstore_rule_find(st, w, h);
+    bool was_ruled = st->ruled;
+    char l[64];
 
     if (label && n) {
         label[0] = '\0';
     }
+    if (!st->base_set) {
+        /* The first mode: what is shown now (the file's settings, any
+         * command-line overrides on top) is the default from here on. */
+        st->base = st->cur;
+        st->base_set = true;
+    }
+    st->mode_w = w;
+    st->mode_h = h;
     if (i >= 0) {
-        if (st->ruled && st->rule_w == w && st->rule_h == h) {
-            return 0;           /* already in force */
-        }
-        if (!st->ruled) {
-            st->base = st->cur;
-            st->base_set = true;
-        }
         take_layout(&st->cur, &st->rule[i].v);
         st->ruled = true;
         st->rule_w = w;
         st->rule_h = h;
         if (label && n) {
-            char a[40];
-
-            nb_view_area_str(&st->cur, a, sizeof(a));
-            snprintf(label, n, "%ux%u: %s, %s", w, h,
-                     st->cur.area == NB_AREA_FULL ? "full" : a,
-                     nb_view_scale_name(st->cur.scale));
-        }
-    } else if (st->ruled) {
-        take_layout(&st->cur, &st->base);
-        st->ruled = false;
-        if (label && n) {
-            snprintf(label, n, "%ux%u: usual picture settings", w, h);
+            layout_label(&st->cur, l, sizeof(l));
+            snprintf(label, n, "%ux%u: %s (remembered)", w, h, l);
         }
     } else {
-        /* A mode without a rule: what the picture looks like on arrival
-         * is what a rule remembered here later comes back to. */
-        st->base = st->cur;
-        st->base_set = true;
-        return 0;
+        take_layout(&st->cur, &st->base);
+        st->ruled = false;
+        if (label && n && (was_ruled || !same_layout(&old, &st->cur))) {
+            layout_label(&st->cur, l, sizeof(l));
+            snprintf(label, n, "%ux%u: %s (default)", w, h, l);
+        }
     }
     return same_layout(&old, &st->cur) ? 0 : NB_VIEW_CH_LAYOUT;
+}
+
+bool nb_vstore_auto_rule(struct nb_vstore *st)
+{
+    int i;
+
+    if (!st->mode_w || !st->mode_h) {
+        return false;           /* no mode yet: cur becomes the default then */
+    }
+    if (!st->base_set) {
+        st->base = st->cur;
+        st->base_set = true;
+        return true;
+    }
+    i = nb_vstore_rule_find(st, st->mode_w, st->mode_h);
+    if (same_layout(&st->cur, &st->base)) {
+        /* The default again: this mode needs no rule of its own. */
+        if (i < 0) {
+            return false;
+        }
+        memmove(&st->rule[i], &st->rule[i + 1],
+                (size_t)(st->nrule - i - 1) * sizeof(st->rule[0]));
+        st->nrule--;
+        st->ruled = false;
+        return true;
+    }
+    if (i >= 0 && same_layout(&st->rule[i].v, &st->cur)) {
+        return false;
+    }
+    if (i < 0 && st->nrule >= NB_MAX_RULES) {
+        /* Full: the oldest rule makes room. */
+        memmove(&st->rule[0], &st->rule[1],
+                (size_t)(st->nrule - 1) * sizeof(st->rule[0]));
+        st->nrule--;
+    }
+    nb_vstore_rule_save(st, st->mode_w, st->mode_h);
+    return true;
+}
+
+void nb_vstore_make_default(struct nb_vstore *st)
+{
+    int i = nb_vstore_rule_find(st, st->mode_w, st->mode_h);
+
+    st->base = st->cur;
+    st->base.res_w = st->base.res_h = 0;
+    st->base_set = true;
+    if (i >= 0) {
+        memmove(&st->rule[i], &st->rule[i + 1],
+                (size_t)(st->nrule - i - 1) * sizeof(st->rule[0]));
+        st->nrule--;
+    }
+    st->ruled = false;
 }
 
 /* ── the display's mode list ─────────────────────────────────────────── */
@@ -1323,10 +1416,25 @@ unsigned nb_view_nudge(struct nb_vstore *st, int ww, int wh, unsigned s120,
 unsigned nb_view_reset(struct nb_vstore *st, char *label, size_t n)
 {
     struct nb_view old = st->cur;
+    int i = st->mode_w ? nb_vstore_rule_find(st, st->mode_w, st->mode_h) : -1;
 
-    nb_view_defaults(&st->cur);
     st->prof_at = -1;
-    snprintf(label, n, "Display settings reset");
+    if (i >= 0) {
+        /* A remembered mode: forget it, back to the default. */
+        nb_vstore_rule_delete(st, i);
+        snprintf(label, n, "%ux%u: back to the default", st->mode_w,
+                 st->mode_h);
+    } else {
+        /* The default itself: back to Fit, full window. */
+        unsigned rw = st->cur.res_w, rh = st->cur.res_h;
+
+        nb_view_defaults(&st->cur);
+        st->cur.res_w = rw;
+        st->cur.res_h = rh;
+        nb_view_defaults(&st->base);
+        st->base_set = true;
+        snprintf(label, n, "Display settings reset");
+    }
     return view_changes(&old, &st->cur) | NB_VIEW_CH_LAYOUT;
 }
 

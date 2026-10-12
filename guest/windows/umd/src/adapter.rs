@@ -448,6 +448,9 @@ unsafe extern "system" fn create_device(
         log_error!("  CreateDevice: DXVK device creation FAILED -> E_FAIL");
         return E_FAIL;
     };
+    if let Some(device) = dxvk.d3d11_device() {
+        crate::caps::audit_engine_caps(&device, negotiated.is_wddm2());
+    }
 
     // 2) Construct our device object in the runtime-allocated private memory
     //    (size came from CalcPrivateDeviceSize). hDrvDevice IS that pointer.

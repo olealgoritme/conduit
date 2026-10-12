@@ -199,10 +199,13 @@ struct nb_config {
 #define NB_OVERLAY_ALWAYS   1   /* also fullscreen (costs direct scanout)    */
 #define NB_OVERLAY_OFF      2   /* starts hidden; CTRL+ALT+O still shows it  */
 
-#define NB_GS_AUTO 0            /* default: scale on the GPU in fullscreen +
-                                 * immediate when the picture is not 1:1     */
+#define NB_GS_AUTO 0            /* default: in fullscreen, measure zero-copy
+                                 * against the GPU pass and keep the better
+                                 * (nb_scanout.h)                            */
 #define NB_GS_OFF  1            /* never: the compositor scales (vsync on
                                  * compositors that need one buffer to tear) */
+#define NB_GS_ON   2            /* always in fullscreen + immediate/latch when
+                                 * the picture is not 1:1, no measuring      */
 
 /* ── a validated buffer description ──────────────────────────────────────── */
 
