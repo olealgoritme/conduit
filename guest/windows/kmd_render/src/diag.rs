@@ -1266,8 +1266,9 @@ pub mod knobs {
     /// (`rm_refresh::TAIL_100NS`, always on) covers what trails it. Read once per transport
     /// generation (`docs/kmd-rm-client.md` 15.16).
     pub const KMD_RM_SYS_POLL_MS: KnobName = KnobName::new(b"KmdRmSysPollMs");
-    /// `ForeignFlip` (default 0 = off: the foreign-allocation flip does not exist and every
-    /// allocation takes the path it took before). Nonzero: a WDDM allocation that adopted an
+    /// `ForeignFlip` (default 1, `helios_kmd_logic::shipping_defaults`; 0 = off: the
+    /// foreign-allocation flip does not exist and every allocation takes the path it took
+    /// before, which shows an NVK DWM's desktop as a black LINEAR buffer). Nonzero: a WDDM allocation that adopted an
     /// RM resource a user-mode device imported (DWM-on-NVK's swap-chain buffers, open identity
     /// FOREIGN) is shown by the KMD's own `ScanoutFlip` of its DRM file and GEM, with the
     /// arbiter's resident source registered under the importing device, instead of
@@ -1310,12 +1311,12 @@ pub mod knobs {
     pub const DISPATCH_BIND: KnobName = KnobName::new(b"DispatchBind");
     /// Per-present probe instrumentation (default 0).
     pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
-    /// `ForeignCopy` (default 0 = OFF; set 1 to use it). The KMD's explicit-modifier copy of
-    /// a foreign (NVK-on-RM) resource into the scan-out image, and the device
-    /// extension tier it needs. 0, the default, is the pre-feature device and import;
+    /// `ForeignCopy` (default 1, `helios_kmd_logic::shipping_defaults`; 0 = off). The KMD's
+    /// explicit-modifier copy of a foreign (NVK-on-RM) resource into the scan-out image, and the
+    /// device extension tier it needs. 0 is the pre-feature device and import;
     /// read at AddAdapter/StartDevice like every knob.
     pub const FOREIGN_COPY: KnobName = KnobName::new(b"ForeignCopy");
-    /// `BltAsync` (default 0 = the previous behaviour). 1: a Blt Present of an adopted foreign
+    /// `BltAsync` (default 1, `helios_kmd_logic::shipping_defaults`; 0 = the CPU wait). 1: a Blt Present of an adopted foreign
     /// (NVK-on-RM) source into a KMD standard buffer returns from `DxgkDdiPresent` without a CPU
     /// wait: the copy is submitted by the DDI, or queued for the HPD worker until the producer's
     /// boundary has been reached, and the Present's DMA fence retires with the copy. Read at every
@@ -1460,7 +1461,8 @@ pub mod knobs {
     /// other adapter knobs (a change applies at the next StartDevice); mirrored as `CurKnob`.
     pub const HW_CURSOR: KnobName = KnobName::new(b"HwCursor");
     /// GPU-only GDI surfaces from RM video memory, the redirected Blt into them on the copy
-    /// engine, CPU readers and writers through a bounce buffer (default 0 = off; 1 = on).
+    /// engine, CPU readers and writers through a bounce buffer (default 1 = on,
+    /// `helios_kmd_logic::shipping_defaults`; 0 = off).
     /// `helios_kmd_logic::rm_vidmem`, `docs/vram-redirection.md` 5.3-5.6. Read at StartDevice.
     pub const REDIR_VRAM: KnobName = KnobName::new(b"RedirVram");
     /// `RedirVram` per-path switches for bisecting (default 0; bits in
@@ -1614,9 +1616,9 @@ pub mod knobs {
     /// `pnputil /restart-device` applies it without a reboot.
     pub const MSI_VECTORS: KnobName = KnobName::new(b"MsiVectors");
 
-    /// `MsiMode` (default 0 = auto). Which interrupt mode the driver asks PnP for
-    /// (`docs/msi-interrupts.md`): 0 = follow the INF / the device key as it stands (INTx in
-    /// this package; a latch lowers it); 1 = INTx always; 2 = MSI-X (raises the key to 1), but
+    /// `MsiMode` (default 2 = MSI-X, `helios_kmd_logic::shipping_defaults`). Which interrupt mode
+    /// the driver asks PnP for (`docs/msi-interrupts.md`): 0 = follow the INF / the device key as
+    /// it stands (the INF writes INTx; a latch lowers it); 1 = INTx always; 2 = MSI-X (raises the key to 1), but
     /// the boot-loop breaker and the latch still win; 3 = MSI-X with no breaker and no latch
     /// (debugging). Realised by `AddDevice` writing the device key's `MSISupported`, so the
     /// FIRST restart after a change writes the key and a SECOND restart (or a reboot) applies

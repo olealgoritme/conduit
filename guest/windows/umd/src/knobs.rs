@@ -568,7 +568,7 @@ pub(crate) static NVK_RM_COPY_RECORD: BoolKnob = BoolKnob::new(c"NvkRmCopyRecord
 /// NOT copy the frame into it before the WDDM present; the KMD's Blt reads the
 /// present's source (`hSrcAllocation`) and writes it into the window's surface
 /// at the client offset. 0 = the UMD copies it, as before. Absent: 1 when the
-/// KMD's `RedirVram` is 1 (its service key), else 0.
+/// KMD's `RedirVram` is 1 or absent (its service key; on by default), else 0.
 ///
 /// The UMD's copy goes to (0, 0) of the destination, which with `RedirVram` is
 /// the window's redirection texture including its non-client area, while the
@@ -663,7 +663,8 @@ pub(crate) fn nvk_skip_blt_copy() -> bool {
         env_bool("HELIOS_NVK_SKIP_BLT_COPY")
             .or_else(|| helios_umd_common::knobs::reg_dword(c"NvkSkipBltCopy").map(|v| v != 0))
             .unwrap_or_else(|| {
-                helios_umd_common::knobs::kmd_service_dword(c"RedirVram") == Some(1)
+                // Absent is on: the KMD's shipped default (`kmd_logic::shipping_defaults`).
+                helios_umd_common::knobs::kmd_service_dword(c"RedirVram").unwrap_or(1) == 1
             })
     })
 }

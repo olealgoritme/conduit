@@ -62,6 +62,7 @@ use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use helios_kmd_logic::flip_pipeline::{self as fp, Ack, Pipeline, Settled};
+use helios_kmd_logic::shipping_defaults as sd;
 use helios_kmd_logic::foreign_flip::{
     self as ff, ref_name, Book, Change, Facts, Target, Verdict, Why,
 };
@@ -383,7 +384,10 @@ fn knob_on() -> bool {
 
 #[inline(never)]
 fn read_knob() -> u32 {
-    let v = crate::diag::read_config_dword(crate::diag::knobs::FOREIGN_FLIP, 0);
+    let v = crate::diag::read_config_dword(
+        crate::diag::knobs::FOREIGN_FLIP,
+        sd::FOREIGN_FLIP,
+    );
     // The window is only meaningful with the arm on; read beside it, once per generation.
     // `FfAsyncWin` defaults to 2 when `FlipAnnounce` is on (the Linux guest's model: the flip is
     // fire-and-forget on the control queue and the retire does not wait for the host); an explicit

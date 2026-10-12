@@ -129,16 +129,15 @@ AddReg = Helios_PCI_MSIX
 ; truth for the shipped default, and a hand-edited or driver-latched value does not outlive an
 ; update. (Earlier packages wrote 0 WITH NOCLOBBER, which is why a later flip of the default to 1
 ; must not use the flag either: it would never reach an install that holds that 0.) What survives
-; an update is the service-key knob MsiMode (1 = force
-; INTx, 2 = MSI-X opt-in, 3 = MSI-X without the breaker): the driver applies it to this value
+; an update is the service-key knob MsiMode (absent = 2, MSI-X with the breaker; 0 = follow
+; this value; 1 = force INTx; 3 = MSI-X without the breaker): the driver applies it to this value
 ; at AddDevice, for the NEXT start (the first restart after a change writes the key, a second
 ; restart or a reboot applies it), and it only ever lowers the value on its own (a latched
 ; start, the boot-loop breaker).
 ;
-; To try MSI-X (docs/msi-interrupts.md, "Minimum safe test procedure"):
-;   reg add "HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render" /v MsiMode /t REG_DWORD /d 2 /f
-;   pnputil /restart-device "<instance id>"      (writes the key; restart again to apply it)
-; Back to INTx: MsiMode = 1 (or delete it and reinstall the package, which writes 0 below).
+; So the first start after an install runs on INTx and the driver asks for MSI-X for the next
+; one (MsiMode absent = 2; docs/msi-interrupts.md).
+; Back to INTx: MsiMode = 1 in the service key.
 ; Recovery from a start that does not come up (no display): in safe mode or offline, set
 ;   reg add "HKLM\SYSTEM\CurrentControlSet\Enum\<instance path>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 0 /f
 ; and MsiMode = 1 in the service key. The driver's boot-loop breaker also latches INTx by
