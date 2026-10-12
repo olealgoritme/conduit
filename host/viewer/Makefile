@@ -235,15 +235,19 @@ test-gpusel: test/test_gpusel.c nb_gpusel.h
 test-blit: test/test_blit.c nb_blit.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_blit.c
 
+test-scanout: test/test_scanout.c nb_scanout.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_scanout.c
+
 test-relacc: test/test_relacc.c nb_relacc.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_relacc.c
 
-check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace test-latch test-blit test-gpusel $(if $(HAVE_GBM),test-gpuscale,)
+check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout $(if $(HAVE_GBM),test-gpuscale,)
 	./test-utf8
 	./test-pace
 	./test-latch
 	./test-blit
 	./test-gpusel
+	./test-scanout
 	$(if $(HAVE_GBM),./test-gpuscale || [ $$? = 77 ],)
 	./test-view
 	./test-ui
@@ -269,4 +273,4 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d \
-	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test/utf8_extracted.inc
+	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test/utf8_extracted.inc

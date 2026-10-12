@@ -106,7 +106,7 @@ int main(void)
         printf("test_gpuscale: SKIP (%s)\n", why);
         return 77;
     }
-    CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, tg, why, sizeof(why)) ==
+    CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
           NB_GS_TARGETS, "targets: %s", why);
     printf("test_gpuscale: target %ux%u %.4s modifier 0x%016llx on %s, "
            "context priority requested %s, granted %s\n",
@@ -185,7 +185,7 @@ int main(void)
               "bottom-left green %08x", mem[160 * TW + 200]);
         CHECK((mem[90 * TW + 440] & 0xffffff) == 0x0000ff,
               "right blue as XRGB %08x", mem[90 * TW + 440]);
-        CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, tg, why, sizeof(why)) ==
+        CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
               NB_GS_TARGETS, "back to dma-buf targets");
     }
     /*
@@ -197,7 +197,7 @@ int main(void)
         unsigned v[500];
 
         if (sscanf(getenv("TEST_GPUSCALE_BENCH"), "%ux%u", &bw, &bh) == 2 &&
-            nb_gs_targets(g, bw, bh, NULL, NULL, tg, why, sizeof(why)) ==
+            nb_gs_targets(g, bw, bh, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
                 NB_GS_TARGETS) {
             for (int i = 0; i < 500; i++) {
                 struct nb_gs_draw d = {

@@ -509,6 +509,29 @@ fn viewer_gpu_line(r: &mut Report, setting: &str, from: &str) {
     }
 }
 
+/// The viewer's frames reach a hardware plane (direct scanout) only while no
+/// software cursor is drawn over them. `WLR_NO_HARDWARE_CURSORS=1` makes a
+/// compositor that honours it (wlroots-based ones) draw every cursor in
+/// software. Reported, not changed: it is often set because hardware cursors
+/// misbehave on that desktop.
+fn scanout_cursor_check(var: Option<&str>) -> Option<(Level, String, String)> {
+    let v = var?.trim();
+    if v.is_empty() || v == "0" {
+        return None;
+    }
+    Some((
+        Level::Warn,
+        format!(
+            "WLR_NO_HARDWARE_CURSORS={v} is set: the compositor may draw the pointer in software"
+        ),
+        "A visible software cursor makes the compositor composite the viewer's frames instead\n\
+         of scanning them out. Over the fullscreen picture the viewer hides the host pointer\n\
+         when the guest draws its own (and under Ctrl+Alt+G). Unset it if hardware cursors\n\
+         work on your desktop. `conduit-viewer --stats` shows `N direct scanout` per second."
+            .to_string(),
+    ))
+}
+
 fn gpu_firmware_off(params: &str) -> bool {
     params.lines().any(|l| {
         l.split_once(':')
@@ -662,6 +685,11 @@ fn collect_host(r: &mut Report) {
     }
 
     viewer_gpu_line(r, &crate::config::viewer_gpu("").0, "viewer.gpu");
+    if let Some((lvl, detail, fix)) =
+        scanout_cursor_check(std::env::var("WLR_NO_HARDWARE_CURSORS").ok().as_deref())
+    {
+        r.line(lvl, "Direct scanout", &detail, &fix);
+    }
 
     let (m, src) = crate::mode::detect();
     r.line(
@@ -1389,6 +1417,17 @@ mod tests {
             Some("GPU copy (x) on /dev/dri/renderD128")
         );
         assert_eq!(last_viewer_path("nothing"), None);
+    }
+
+    #[test]
+    fn software_cursor_env_is_reported_only_when_set() {
+        assert!(scanout_cursor_check(None).is_none());
+        assert!(scanout_cursor_check(Some("")).is_none());
+        assert!(scanout_cursor_check(Some("0")).is_none());
+        let (lvl, detail, fix) = scanout_cursor_check(Some("1")).unwrap();
+        assert_eq!(lvl, Level::Warn);
+        assert!(detail.contains("WLR_NO_HARDWARE_CURSORS=1"));
+        assert!(fix.contains("direct scanout"));
     }
 
     #[test]

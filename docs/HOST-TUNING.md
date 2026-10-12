@@ -291,6 +291,24 @@ backend start (`conduit-backend --gpu-timeslice-us`). For a test,
 Shorter slices mean more context switches when both sides have work; below
 50 µs that cost dominates.
 
+## Display: direct scanout
+
+Every frame the host compositor composites is host GPU work queued with the
+guest's. A frame the compositor scans out directly (its buffer on a hardware
+plane) costs the host GPU nothing. Check it with `conduit-viewer --stats`
+(the viewer log): `N direct scanout` per second, the `path:` the picture
+takes in fullscreen, and the `blockers:` when frames were composited
+([VIEWER.md](VIEWER.md#presentation-immediate-vsync-or-latest-per-refresh)).
+What helps on any desktop:
+
+- fullscreen (`Ctrl+Alt+F`), with the guest at the output's mode (the
+  default in fullscreen) and the full picture area;
+- no overlay, notification or menu over the picture;
+- hardware cursors: `WLR_NO_HARDWARE_CURSORS=1` makes wlroots-based
+  compositors draw the pointer in software, which rules out direct scanout
+  while the pointer is shown (`conduit doctor` reports it);
+- the compositor's own direct-scanout setting, where it has one.
+
 ## GPU memory: Resizable BAR and the video-memory limit
 
 - **BAR1.** Without Resizable BAR a GeForce exposes 256 MiB of its memory
