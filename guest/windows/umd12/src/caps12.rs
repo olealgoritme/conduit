@@ -226,6 +226,8 @@ mod v {
         D3D12DDI_SAMPLER_FEEDBACK_TIER_D3D12DDI_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
     pub(super) const MIN_PRECISION_NONE: D3D12DDI_SHADER_MIN_PRECISION =
         D3D12DDI_SHADER_MIN_PRECISION_D3D12DDI_SHADER_MIN_PRECISION_NONE;
+    pub(super) const MIN_PRECISION_16_BIT: D3D12DDI_SHADER_MIN_PRECISION =
+        D3D12DDI_SHADER_MIN_PRECISION_D3D12DDI_SHADER_MIN_PRECISION_16_BIT;
     pub(super) const WAVE_MMA_NONE: D3D12DDI_WAVE_MMA_TIER =
         D3D12DDI_WAVE_MMA_TIER_D3D12DDI_WAVE_MMA_TIER_NOT_SUPPORTED;
     /// ⛔ `D3D12DDI_EXECUTE_INDIRECT_TIER` has NO zero enumerator: `_1_0 = 10`
@@ -253,6 +255,16 @@ mod v {
         D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_2_RELEASE_0042;
     pub(super) const SM_6_3: D3D12DDI_SHADER_MODEL =
         D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_3_RELEASE_0054;
+    pub(super) const SM_6_4: D3D12DDI_SHADER_MODEL =
+        D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_4_RELEASE_0062;
+    pub(super) const SM_6_5: D3D12DDI_SHADER_MODEL =
+        D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_5_RELEASE_0071;
+    pub(super) const SM_6_6: D3D12DDI_SHADER_MODEL =
+        D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_6_RELEASE_0082;
+    pub(super) const SM_6_7: D3D12DDI_SHADER_MODEL =
+        D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_7_RELEASE_0093;
+    pub(super) const SM_6_8: D3D12DDI_SHADER_MODEL =
+        D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_8_RELEASE_0108;
 
     pub(super) const CAPS_TEXTURE_LAYOUT: D3D12DDICAPS_TYPE =
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_TEXTURE_LAYOUT;
@@ -1037,8 +1049,21 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
     UMD12_REFUSALS.caps_total_lane_count_guess.bump();
     // S5: the engine's own ROV answer (NVK has no fragment shader interlock).
     let engine_rovs = native_optional_caps().map_or(0, |o| o.rovs);
+    // `Umd12EngineShaderCaps`: the engine's 16-bit answers (none otherwise).
+    let (engine_min16, engine_native16) = if crate::knobs12::umd12_engine_shader_caps() {
+        native_optional_caps().map_or((false, false), |o| {
+            // D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT
+            ((o.min_precision & 0x2) != 0, o.native16 != 0)
+        })
+    } else {
+        (false, false)
+    };
     let caps = ddi12::D3D12DDI_SHADER_CAPS_0084 {
-        MinPrecision: v::MIN_PRECISION_NONE,
+        MinPrecision: if engine_min16 {
+            v::MIN_PRECISION_16_BIT
+        } else {
+            v::MIN_PRECISION_NONE
+        },
         // Engine-backed on every engine this UMD drives: vkd3d-proton reports
         // DoublePrecisionFloatShaderOps from `shaderFloat64`, which NVK sets
         // unconditionally (`nvk_physical_device.c`) and the host NVIDIA driver
@@ -1115,7 +1140,7 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
         // SM 6.0 cap, which that same list reports — so raising it contradicts none
         // of them.
         Int64Ops: 1,
-        Native16BitOps: 0,
+        Native16BitOps: engine_native16 as _,
         AtomicInt64OnTypedResource: 0,
         AtomicInt64OnGroupShared: 0,
         DerivativesInMeshAndAmplificationShaders: 0,
@@ -1162,20 +1187,32 @@ unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         D3D_SHADER_MODEL_6_2, D3D_SHADER_MODEL_6_3,
     };
     // API shader-model values and DDI release tokens have different encodings.
-    const MODELS: [(D3D_SHADER_MODEL, ddi12::D3D12DDI_SHADER_MODEL); 5] = [
+    // 6.4 to 6.8 only with `Umd12EngineShaderCaps`, and never past the
+    // engine's highest shader model.
+    const MODELS: [(D3D_SHADER_MODEL, ddi12::D3D12DDI_SHADER_MODEL); 10] = [
         (D3D_SHADER_MODEL_5_1, v::SM_5_1),
         (D3D_SHADER_MODEL_6_0, v::SM_6_0),
         (D3D_SHADER_MODEL_6_1, v::SM_6_1),
         (D3D_SHADER_MODEL_6_2, v::SM_6_2),
         (D3D_SHADER_MODEL_6_3, v::SM_6_3),
+        (D3D_SHADER_MODEL(0x64), v::SM_6_4),
+        (D3D_SHADER_MODEL(0x65), v::SM_6_5),
+        (D3D_SHADER_MODEL(0x66), v::SM_6_6),
+        (D3D_SHADER_MODEL(0x67), v::SM_6_7),
+        (D3D_SHADER_MODEL(0x68), v::SM_6_8),
     ];
+    let table_max: u32 = if crate::knobs12::umd12_engine_shader_caps() {
+        0x68
+    } else {
+        0x63
+    };
 
     let Some(optional) = native_optional_caps() else {
         return E_FAIL;
     };
     let models = &MODELS[..MODELS
         .iter()
-        .take_while(|&&(api, _)| api.0 as u32 <= optional.shader_model)
+        .take_while(|&&(api, _)| api.0 as u32 <= optional.shader_model && api.0 as u32 <= table_max)
         .count()];
 
     let needed = core::mem::size_of::<ddi12::D3D12DDI_D3D12_SHADER_MODELS_DATA_0011>();

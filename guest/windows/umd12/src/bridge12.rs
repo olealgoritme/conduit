@@ -142,6 +142,14 @@ mod ffi {
             device_uuid: &mut [u8],
         ) -> bool;
 
+        /// The engine's OPTIONS.MinPrecisionSupport bits and
+        /// OPTIONS4.Native16BitShaderOpsSupported.
+        fn native_shader_precision(
+            self: &HeliosVkd3dDevice,
+            min_precision: &mut u32,
+            native16: &mut u32,
+        ) -> bool;
+
         /// S5: the ICD under the engine, 1 = Venus, 2 = NVK on RM.
         fn icd_backend(self: &HeliosVkd3dDevice) -> u32;
 
@@ -428,6 +436,10 @@ pub(crate) struct NativeOptionalCaps {
     pub rovs: u32,
     /// S5: the engine's conservative rasterization tier (2 on NVK).
     pub conservative_tier: u32,
+    /// The engine's `OPTIONS.MinPrecisionSupport` bits (2 = 16-bit).
+    pub min_precision: u32,
+    /// The engine's `OPTIONS4.Native16BitShaderOpsSupported`.
+    pub native16: u32,
     pub device_uuid: [u8; 16],
 }
 
@@ -480,7 +492,12 @@ impl BridgeDevice12 {
                 &mut caps.conservative_tier,
                 &mut caps.device_uuid,
             )
-            .then_some(caps)
+            .then_some(())?;
+        // Optional: an engine that cannot answer reports no 16-bit support.
+        let _ = self
+            .get()?
+            .native_shader_precision(&mut caps.min_precision, &mut caps.native16);
+        Some(caps)
     }
 
     fn create_for_caps(luid_low: u32, luid_high: i32) -> Option<Self> {
