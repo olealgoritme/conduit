@@ -13,7 +13,7 @@ arch=(x86_64)
 url="https://github.com/olealgoritme/conduit"
 license=('Apache-2.0' 'BSD-3-Clause' 'GPL-2.0-only' 'MIT')
 makedepends=(git rustup base-devel python ninja meson flex bison file
-             wayland wayland-protocols libxcb mesa openssl
+             wayland wayland-protocols libxcb mesa openssl freetype2 fontconfig
              glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc
              libpulse pipewire
              vulkan-headers vulkan-icd-loader libdrm python-mako python-yaml)
@@ -49,7 +49,7 @@ build() {
 }
 
 package_conduit() {
-  depends=(glibc gcc-libs wayland libxcb glib2 pixman libslirp libseccomp
+  depends=(glibc gcc-libs wayland libxcb freetype2 fontconfig glib2 pixman libslirp libseccomp
            libcap-ng zstd libaio dtc vulkan-icd-loader)
   optdepends=('libvirt: virt-manager/virsh integration (conduit attach)')
   backup=(etc/apparmor.d/abstractions/conduit)
