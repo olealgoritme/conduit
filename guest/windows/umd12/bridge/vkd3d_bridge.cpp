@@ -548,6 +548,25 @@ bool HeliosVkd3dDevice::native_optional_caps(std::uint32_t& maximum_feature_leve
   return true;
 }
 
+bool HeliosVkd3dDevice::native_shader_precision(std::uint32_t& min_precision,
+    std::uint32_t& native16) const noexcept {
+  min_precision = 0;
+  native16 = 0;
+  if (!impl || !impl->d3d12)
+    return false;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  if (FAILED(impl->d3d12->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
+                                              sizeof(options))))
+    return false;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4 = {};
+  if (FAILED(impl->d3d12->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &options4,
+                                              sizeof(options4))))
+    return false;
+  min_precision = static_cast<std::uint32_t>(options.MinPrecisionSupport);
+  native16 = options4.Native16BitShaderOpsSupported ? 1u : 0u;
+  return true;
+}
+
 std::uint32_t HeliosVkd3dDevice::icd_backend() const noexcept {
   return impl ? static_cast<std::uint32_t>(impl->backend) : 0;
 }
