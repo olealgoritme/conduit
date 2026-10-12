@@ -164,6 +164,30 @@ int main(void)
         CHECK(c != 0xff0000 && c != 0x0000ff, "linear blends at the edge %06x",
               c);
     }
+    /* Read-back targets: the same pass, read into XRGB8888 memory (B, G,
+     * R, X bytes), rows top-down. */
+    {
+        static uint32_t mem[TW * TH];
+        struct nb_gs_draw d = {
+            .src_key = 3, .target = 1, .dx = 160, .dy = 0, .dw = 320,
+            .dh = 180, .sx = 0, .sy = 0, .sw = SW, .sh = SH, .nearest = true,
+        };
+
+        CHECK(nb_gs_targets_readback(g, TW, TH, why, sizeof(why)) ==
+              NB_GS_TARGETS, "read-back targets: %s", why);
+        CHECK(nb_gs_draw(g, &d, 1000000, NULL) == 0, "draw read-back");
+        CHECK(nb_gs_readback(g, 1, mem) == 0, "read back");
+        CHECK((mem[90 * TW + 10] & 0xffffff) == 0, "bar black %08x",
+              mem[90 * TW + 10]);
+        CHECK((mem[20 * TW + 200] & 0xffffff) == 0xff0000,
+              "top-left red as XRGB %08x", mem[20 * TW + 200]);
+        CHECK((mem[160 * TW + 200] & 0xffffff) == 0x00ff00,
+              "bottom-left green %08x", mem[160 * TW + 200]);
+        CHECK((mem[90 * TW + 440] & 0xffffff) == 0x0000ff,
+              "right blue as XRGB %08x", mem[90 * TW + 440]);
+        CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, tg, why, sizeof(why)) ==
+              NB_GS_TARGETS, "back to dma-buf targets");
+    }
     /*
      * TEST_GPUSCALE_BENCH=WxH: the per-frame cost at a real output size (a
      * 1600x900-class source stretched over the output), 500 draws.

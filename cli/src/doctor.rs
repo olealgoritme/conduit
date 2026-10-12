@@ -457,6 +457,58 @@ fn gpu_host_lines(r: &mut Report) {
 }
 
 /// Whether `/proc/driver/nvidia/params` shows GPU firmware switched off.
+/// What `conduit-viewer --resolve-gpu` printed: (the GPU, why).
+fn parse_resolve_gpu(out: &str) -> Option<(String, String)> {
+    let gpu = out.lines().find_map(|l| l.strip_prefix("gpu "))?;
+    let why = out
+        .lines()
+        .find_map(|l| l.strip_prefix("why "))
+        .unwrap_or("");
+    Some((gpu.trim().to_string(), why.trim().to_string()))
+}
+
+/// The `path:` the viewer last reported in its `--stats` line: direct
+/// attach, the GPU copy, or the fullscreen GPU pass, and on which GPU.
+fn last_viewer_path(log: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .filter(|l| l.contains("stats: "))
+        .find_map(|l| l.split(" | path: ").nth(1))
+        .map(|p| p.split(" | ").next().unwrap_or(p).trim().to_string())
+}
+
+/// The GPU the viewer copies or scales frames on, as the viewer itself
+/// resolves `viewer.gpu` (PCI facts, not card numbers).
+fn viewer_gpu_line(r: &mut Report, setting: &str, from: &str) {
+    let Some(viewer) = Tool::Viewer.find() else {
+        return;
+    };
+    let out = std::process::Command::new(&viewer)
+        .args(["--resolve-gpu", "--gpu", setting])
+        .output();
+    let Ok(out) = out else { return };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // An older viewer does not know --resolve-gpu: say nothing.
+    let Some((gpu, why)) = parse_resolve_gpu(&text) else {
+        return;
+    };
+    if out.status.success() {
+        r.line(
+            Level::Ok,
+            "Viewer GPU",
+            &format!("{gpu} ({why}; {from}). Frames the compositor takes are attached directly; others are copied on this GPU"),
+            "",
+        );
+    } else {
+        r.line(
+            Level::Warn,
+            "Viewer GPU",
+            &format!("{why} ({from}); the viewer uses auto instead"),
+            "conduit config set viewer.gpu auto   (or dgpu, igpu, a render node)",
+        );
+    }
+}
+
 fn gpu_firmware_off(params: &str) -> bool {
     params.lines().any(|l| {
         l.split_once(':')
@@ -608,6 +660,8 @@ fn collect_host(r: &mut Report) {
         _ => r.line(Level::Warn, "Desktop", "no Wayland session in this terminal",
             "`conduit view` must run from a terminal inside your Wayland desktop (GNOME, KDE,\nHyprland, Sway...). `conduit up` works anywhere."),
     }
+
+    viewer_gpu_line(r, &crate::config::viewer_gpu("").0, "viewer.gpu");
 
     let (m, src) = crate::mode::detect();
     r.line(
@@ -864,6 +918,23 @@ pub fn run_vm(name: &str) -> i32 {
                 "the one installed on the VM's disk (copied out at each start)",
                 "",
             ),
+        }
+    }
+    {
+        let (gpu, from) = crate::config::viewer_gpu(name);
+        viewer_gpu_line(&mut r, &gpu, &from);
+        let log = paths::vm_dir(name).join("logs").join("viewer.log");
+        if let Some(p) = std::fs::read_to_string(&log)
+            .ok()
+            .as_deref()
+            .and_then(last_viewer_path)
+        {
+            r.line(
+                Level::Ok,
+                "Viewer path",
+                &format!("{p} (last --stats line in viewer.log)"),
+                "",
+            );
         }
     }
     for (t, fix) in [
@@ -1296,6 +1367,28 @@ mod tests {
         let ids: Vec<&str> = r.checks.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["kvm", "kvm-access"]);
         assert_eq!((r.fails(), r.warns()), (1, 0));
+    }
+
+    #[test]
+    fn resolve_gpu_output_and_last_path_are_parsed() {
+        let out = "node /dev/dri/renderD128 0000:01:00.0 NVIDIA discrete\n\
+                   gpu /dev/dri/renderD128\nwhy dgpu: /dev/dri/renderD128, NVIDIA discrete\n";
+        assert_eq!(
+            parse_resolve_gpu(out),
+            Some((
+                "/dev/dri/renderD128".into(),
+                "dgpu: /dev/dri/renderD128, NVIDIA discrete".into()
+            ))
+        );
+        assert_eq!(parse_resolve_gpu("usage: ..."), None);
+        let log = "conduit-viewer: stats: commit 60 fps | path: direct attach\n\
+                   conduit-viewer: other\n\
+                   conduit-viewer: stats: commit 5 fps | gpu-scale 5 frames | path: GPU copy (x) on /dev/dri/renderD128 | composited, blockers: y\n";
+        assert_eq!(
+            last_viewer_path(log).as_deref(),
+            Some("GPU copy (x) on /dev/dri/renderD128")
+        );
+        assert_eq!(last_viewer_path("nothing"), None);
     }
 
     #[test]

@@ -37,7 +37,7 @@ host/viewer/test-standalone.sh 5 240 2560x1440    # no VM: GPU test pattern at 2
 ```
 
 `conduit-viewer --help` lists the options (`--res`, `--area`, `--scale`,
-`--overlay`, `--resize`, `--direct-mode`, `--sync`, `--gpu-scale`, `--stats`, ...). Only the invoking user and root
+`--overlay`, `--resize`, `--direct-mode`, `--sync`, `--gpu-scale`, `--gpu`, `--stats`, ...). Only the invoking user and root
 may connect (SO_PEERCRED; see `--allow-user`).
 
 The window's app id (Wayland) and class (X11) are `conduit-viewer`, for

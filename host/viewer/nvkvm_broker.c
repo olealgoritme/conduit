@@ -65,6 +65,7 @@
 #include <sys/vfs.h>
 
 #include "nvkvm_broker.h"
+#include "nb_gpusel.h"
 
 /*
  * The filesystem magic of the anonymous inode every dma-buf lives on.  This is
@@ -1602,8 +1603,12 @@ static void nb_violation(struct nb_sink *s, const char *why)
  * *use_fourcc; false means no description of this buffer is displayable.
  */
 static bool nb_format_resolve(struct nb_session *ss, uint32_t fourcc,
-                              uint64_t modifier, uint32_t *use_fourcc)
+                              uint64_t modifier, uint32_t *use_fourcc,
+                              bool *copy)
 {
+    if (copy) {
+        *copy = false;
+    }
     if (ss->ops->format_ok(ss, fourcc, modifier)) {
         *use_fourcc = fourcc;
         return true;
@@ -1626,6 +1631,18 @@ static bool nb_format_resolve(struct nb_session *ss, uint32_t fourcc,
 
     if (twin && ss->ops->format_ok(ss, twin, modifier)) {
         *use_fourcc = twin;
+        return true;
+    }
+    /*
+     * Last: THE GPU COPY.  The display takes neither description, but the
+     * backend can draw the frame into a buffer it does take (nb_blit.h).
+     * One GPU pass per frame instead of a black window.
+     */
+    if (ss->ops->copy_ok && ss->ops->copy_ok(ss, fourcc, modifier)) {
+        *use_fourcc = fourcc;
+        if (copy) {
+            *copy = true;
+        }
         return true;
     }
     return false;
@@ -1794,7 +1811,8 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             }
             return -EINVAL;
         }
-    } else if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc)) {
+    } else if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc,
+                                  NULL)) {
         if (!nb_reject_log(s)) {
             return -EINVAL;
         }
@@ -2045,7 +2063,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
          * ordinary command layout, which has one.
          */
         uint32_t use = 0;
-        bool ok;
+        bool ok, copy = false;
 
         if (c->reserved1 != 0) {
             if (fd >= 0) {
@@ -2057,7 +2075,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         if (fd >= 0) {
             close(fd);          /* a query carries no buffer; drop any fd */
         }
-        ok = nb_format_resolve(ss, c->fourcc, c->modifier, &use);
+        ok = nb_format_resolve(ss, c->fourcc, c->modifier, &use, &copy);
         /* Asked once per mode change by an honest client -- and once per
          * command by a hostile one, so it shares the reject budget. */
         if (nb_reject_log(s)) {
@@ -2067,7 +2085,9 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                    (unsigned long long)c->modifier,
                    nb_modifier_vendor(c->modifier),
                    ok ? "YES" : "NO",
-                   (ok && use != c->fourcc) ? " (as its opaque twin)" : "");
+                   (ok && use != c->fourcc) ? " (as its opaque twin)"
+                   : copy ? " (by a GPU copy: the display does not take "
+                            "this layout)" : "");
         }
         nb_emit(s, NVKVM_BROKER_EV_FORMAT, ok ? 1 : 0, (int)c->fourcc,
                 (uint32_t)(c->modifier & 0xffffffffu),
@@ -3267,8 +3287,13 @@ static void usage(void)
 "                       into an output-size buffer, so the compositor can\n"
 "                       still tear / scan it out.  A 1:1 picture stays\n"
 "                       zero-copy.  off: the compositor scales it\n"
-"  --render-node PATH   the GPU for --gpu-scale (default: the first render\n"
-"                       node that can import the guest's frames)\n"
+"  --gpu GPU            the GPU of the viewer's GPU pass (copies of frames\n"
+"                       the compositor does not take, and --gpu-scale):\n"
+"                       auto (default: the GPU that imports the frames, the\n"
+"                       one that made them first), dgpu, igpu (from PCI\n"
+"                       facts, not card numbers) or a render node path\n"
+"  --resolve-gpu        print the render nodes and what --gpu picks, exit\n"
+"  --render-node PATH   the same as --gpu PATH\n"
 "  --tearing            alias for --sync=immediate\n"
 "  --no-tearing         alias for --sync=vsync\n"
 "  --overlay=MODE       stats overlay (CTRL+ALT+O toggles): windowed (default;\n"
@@ -3478,6 +3503,8 @@ int main(int argc, char **argv)
     /* We only unlink a path we created ourselves: an adopted or activated
      * socket belongs to whoever handed it over. */
     bool socket_is_ours = true;
+    const char *gpu_want = NULL;    /* --gpu / --render-node */
+    bool resolve_gpu = false;
     bool had_client = false;
     /* Sticky within one loop iteration; see the single exit check at the
      * bottom of the loop for why the check cannot live where the detach
@@ -3619,7 +3646,10 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
-        else if (!strcmp(a, "--render-node")) { NEEDVAL(); cfg.render_node = v; }
+        else if (!strcmp(a, "--render-node")) { NEEDVAL(); gpu_want = v; }
+        else if (!strcmp(a, "--gpu")) { NEEDVAL(); gpu_want = v; }
+        else if (!strncmp(a, "--gpu=", 6)) { gpu_want = a + 6; }
+        else if (!strcmp(a, "--resolve-gpu")) { resolve_gpu = true; }
         else if (!strcmp(a, "--tearing"))    { cfg.sync = NB_SYNC_IMMEDIATE; }
         else if (!strcmp(a, "--no-tearing")) { cfg.sync = NB_SYNC_VSYNC; }
         else if (!strncmp(a, "--sync=", 7) || !strcmp(a, "--sync")) {
@@ -3765,6 +3795,40 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else { nb_err("unknown argument: %s", a); usage(); return 2; }
 #undef NEEDVAL
+    }
+    /*
+     * THE VIEWER'S GPU (nb_gpusel.h), for its GPU pass: the copy of frames
+     * the compositor does not take, and the fullscreen scaler.  dgpu/igpu
+     * become a render node now, from PCI facts; auto stays open and is
+     * decided per frame layout.  A dgpu/igpu this machine lacks falls back
+     * to auto rather than leaving the window black.
+     */
+    {
+        static char gpu_path[64];
+        struct nb_gpu_node nodes[NB_GPU_MAX];
+        int k = nb_gpusel_scan(NULL, nodes, NB_GPU_MAX);
+        bool ok = nb_gpusel_resolve(gpu_want, nodes, k, gpu_path,
+                                    sizeof(gpu_path), cfg.gpu_why,
+                                    sizeof(cfg.gpu_why));
+
+        if (resolve_gpu) {
+            for (int j = 0; j < k; j++) {
+                printf("node %s %s %s %s%s\n", nodes[j].path, nodes[j].slot,
+                       nb_gpu_vendor_name(nodes[j].vendor),
+                       nb_gpu_kind_name(nb_gpu_classify(&nodes[j])),
+                       nodes[j].boot_vga ? " boot-vga" : "");
+            }
+            printf("gpu %s\nwhy %s\n", ok && gpu_path[0] ? gpu_path : "auto",
+                   cfg.gpu_why);
+            return ok ? 0 : 1;
+        }
+        if (!ok) {
+            nb_err("viewer GPU: %s; using auto", cfg.gpu_why);
+            nb_gpusel_resolve("auto", nodes, k, gpu_path, sizeof(gpu_path),
+                              cfg.gpu_why, sizeof(cfg.gpu_why));
+        }
+        cfg.render_node = gpu_path[0] ? gpu_path : NULL;
+        nb_log("viewer GPU: %s", cfg.gpu_why);
     }
     /* --socket is no longer the only way to get a listening socket; the check
      * that matters happens once activation has had its say, below. */

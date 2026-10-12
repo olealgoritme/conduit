@@ -46,6 +46,8 @@ struct nb_gs_target {
 struct nb_gs *nb_gs_open(const char *node, dev_t dev, uint32_t fourcc,
                          uint64_t mod, char *why, size_t n);
 void nb_gs_close(struct nb_gs *g);
+/* Whether this scaler's GPU imports (fourcc, mod) as a source frame. */
+bool nb_gs_can_import(struct nb_gs *g, uint32_t fourcc, uint64_t mod);
 const char *nb_gs_node(const struct nb_gs *g);
 
 /* Formats/modifiers the compositor accepts, for choosing the target layout:
@@ -59,6 +61,17 @@ typedef bool (*nb_gs_fmt_ok)(void *ctx, uint32_t fourcc, uint64_t mod);
 int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
                   void *ctx, struct nb_gs_target out[NB_GS_TARGETS],
                   char *why, size_t n);
+
+/*
+ * The last resort when the compositor takes no layout this GPU can render
+ * to (NVIDIA renders to no LINEAR buffer, and a compositor on another GPU
+ * takes no NVIDIA modifier): plain renderbuffers, each frame read back into
+ * memory the caller hands the compositor as wl_shm (XRGB8888, w*4 stride).
+ */
+int nb_gs_targets_readback(struct nb_gs *g, uint32_t w, uint32_t h,
+                           char *why, size_t n);
+/* After nb_gs_draw into `target`: copy it to dst (w*h*4 bytes). */
+int nb_gs_readback(struct nb_gs *g, int target, void *dst);
 
 /* Source frames, cached by `key` (the backend's buffer slot). */
 int  nb_gs_src(struct nb_gs *g, int key, int fd, uint32_t w, uint32_t h,
