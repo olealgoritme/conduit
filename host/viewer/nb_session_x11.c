@@ -121,6 +121,12 @@ struct nb_x11 {
      * compositing manager unredirects the window. */
     xcb_atom_t        a_bypass;
     int               bypass_set;       /* -1 never set */
+    /* --stats: per second, how frames reached the screen.  Present reports
+     * FLIP (the pixmap went to the CRTC: direct scanout) or COPY per frame;
+     * an XRender composite (a scaled picture) is always a copy. */
+    xcb_atom_t        a_cm;             /* _NET_WM_CM_Sn: a compositing manager */
+    uint64_t          st_t0;            /* ms */
+    unsigned          st_commits, st_flip, st_copy, st_comp;
     bool              imm;
     xcb_timestamp_t   last_time;      /* a REAL event time; X rejects guesses */
     bool              focused;
@@ -745,6 +751,84 @@ static bool x11_render_scaled(struct nb_x11 *x, struct nb_x11_buf *sl)
 #endif
 
 /*
+ * DIRECT SCANOUT ON X11, FROM OUR SIDE.  Present flips (puts the pixmap on
+ * the CRTC) only for a window that covers the screen, unredirected by any
+ * compositing manager, with nothing mapped over it -- and only for a pixmap
+ * of that window's size, so a scaled picture (an XRender composite) is
+ * always a copy.  Lists what the viewer itself is breaking right now.
+ */
+static void x11_scanout_blockers(struct nb_x11 *x, char *b, size_t n)
+{
+    size_t k = 0;
+    bool cm = false;
+
+#define BLK(cond, what) do { if ((cond) && k < n) { \
+        k += (size_t)snprintf(b + k, n - k, "%s%s", k ? ", " : "", what); \
+        if (k >= n) k = n - 1; } } while (0)
+    b[0] = '\0';
+    if (x->a_cm != XCB_ATOM_NONE) {
+        xcb_get_selection_owner_reply_t *r = xcb_get_selection_owner_reply(
+            x->c, xcb_get_selection_owner(x->c, x->a_cm), NULL);
+
+        cm = r && r->owner != XCB_NONE;
+        free(r);
+    }
+    BLK(!x->fullscreen, "not fullscreen");
+    BLK(x->st_comp > 0, "picture scaled (an XRender composite is a copy)");
+    BLK(x->con_w != x->win_w || x->con_h != x->win_h,
+        "picture does not cover the window");
+    BLK(x->dlg_mapped, "dialog mapped");
+    BLK(x->ly_menu.mapped || x->ui.open, "menu open");
+    BLK(x->ly_note.mapped, "notice mapped");
+    BLK(x->ly_btn.mapped, "menu button mapped");
+    BLK(cm && !(x->fullscreen && x->bypass_set == 1),
+        "a compositing manager redirects the window");
+#undef BLK
+    if (!k) {
+        snprintf(b, n, "none on our side (%s)",
+                 cm ? "the compositing manager did not unredirect it"
+                    : "the X server's choice");
+    }
+}
+
+static void x11_stats_flush(struct nb_x11 *x)
+{
+    uint64_t now = x11_now_ms();
+
+    if (!nb_stats) {
+        return;
+    }
+    if (!x->st_t0) {
+        x->st_t0 = now;
+        return;
+    }
+    if (now - x->st_t0 < 1000) {
+        return;
+    }
+    if (x->st_commits || x->st_flip || x->st_copy) {
+        double secs = (double)(now - x->st_t0) / 1e3;
+        unsigned shown = x->st_flip + x->st_copy + x->st_comp;
+        char blk[300] = "";
+
+        if (x->st_flip < shown) {
+            char why[260];
+
+            x11_scanout_blockers(x, why, sizeof(why));
+            snprintf(blk, sizeof(blk), " | composited, blockers: %s", why);
+        }
+        nb_log("stats: commit %.1f fps (%u direct scanout, %.0f%%) | Present "
+               "FLIP %u, COPY %u, XRender composites %u | path: %s, %s%s",
+               x->st_commits / secs, x->st_flip,
+               shown ? 100.0 * x->st_flip / shown : 0.0, x->st_flip,
+               x->st_copy, x->st_comp,
+               x->st_comp ? "scaled by XRender" : "Present 1:1, zero-copy",
+               x->imm ? "immediate" : "vsync", blk);
+    }
+    x->st_t0 = now;
+    x->st_commits = x->st_flip = x->st_copy = x->st_comp = 0;
+}
+
+/*
  * Put one dma-buf frame on screen.  Returns 1 when it went by composite (the
  * buffer is free again at once), 0 when by Present (freed on IdleNotify).
  */
@@ -759,6 +843,7 @@ static int x11_draw(struct nb_x11 *x, struct nb_x11_buf *sl)
      */
     if ((x->place.pic.w != (int)sl->w || x->place.pic.h != (int)sl->h) &&
         x11_render_scaled(x, sl)) {
+        x->st_comp++;
         return 1;
     }
 #endif
@@ -883,6 +968,8 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         return 0;
     }
 
+    x->st_commits++;
+    x11_stats_flush(x);
     int composited = x11_draw(x, sl);
 
     if (sl->w != x->logged_w || sl->h != x->logged_h) {
@@ -993,6 +1080,13 @@ static void x11_present_event(struct nb_x11 *x, struct nb_sink *sink,
          * to the screen" is unanswerable from the outside.  Logged on every
          * CHANGE, not every frame, so it stays one line in normal use.
          */
+        if (ce->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP) {
+            if (ce->mode == XCB_PRESENT_COMPLETE_MODE_FLIP) {
+                x->st_flip++;
+            } else if (ce->mode != XCB_PRESENT_COMPLETE_MODE_SKIP) {
+                x->st_copy++;
+            }
+        }
         if (ce->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP &&
             ce->mode != x->last_mode) {
             static const char *modes[] = { "COPY", "FLIP", "SKIP",
@@ -2208,6 +2302,12 @@ skip_dmabuf_extensions:
     x->a_incr      = x11_atom(x->c, "INCR");
     x->a_net_wm_name = x11_atom(x->c, "_NET_WM_NAME");
     x->a_bypass    = x11_atom(x->c, "_NET_WM_BYPASS_COMPOSITOR");
+    {
+        char cm[32];
+
+        snprintf(cm, sizeof(cm), "_NET_WM_CM_S%d", screen_n);
+        x->a_cm = x11_atom(x->c, cm);
+    }
     x->bypass_set  = -1;
     if (x->a_wm_proto != XCB_ATOM_NONE && x->a_wm_delete != XCB_ATOM_NONE) {
         xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_wm_proto,

@@ -3280,13 +3280,16 @@ static void usage(void)
 "                       sets its own window's `immediate` property (still\n"
 "                       needs general:allow_tearing = true).  The compositor\n"
 "                       has the last word: see docs/VIEWER.md\n"
-"  --gpu-scale=MODE     auto (default): in fullscreen with immediate\n"
-"                       presentation, a picture that is not 1:1 with the\n"
-"                       output (a game at 1600x900 on a 2560x1440 screen,\n"
-"                       stretched or letterboxed) is scaled by one GPU pass\n"
-"                       into an output-size buffer, so the compositor can\n"
-"                       still tear / scan it out.  A 1:1 picture stays\n"
-"                       zero-copy.  off: the compositor scales it\n"
+"  --gpu-scale=MODE     auto (default): in fullscreen, a picture that is not\n"
+"                       1:1 with the output (a game at 1600x900 on a\n"
+"                       2560x1440 screen, stretched or letterboxed) is shown\n"
+"                       zero-copy (the compositor scales the guest's buffer)\n"
+"                       or drawn by one GPU pass into an output-size buffer,\n"
+"                       whichever the compositor scans out directly or\n"
+"                       presents sooner, measured with wp_presentation.  A\n"
+"                       1:1 picture stays zero-copy.  on: always the GPU\n"
+"                       pass in fullscreen with immediate or latch\n"
+"                       presentation.  off: the compositor always scales\n"
 "  --gpu GPU            the GPU of the viewer's GPU pass (copies of frames\n"
 "                       the compositor does not take, and --gpu-scale):\n"
 "                       auto (default: the GPU that imports the frames, the\n"
@@ -3641,8 +3644,9 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "--gpu-scale=", 12)) {
             if (!strcmp(a + 12, "auto"))     { cfg.gpu_scale = NB_GS_AUTO; }
             else if (!strcmp(a + 12, "off")) { cfg.gpu_scale = NB_GS_OFF; }
+            else if (!strcmp(a + 12, "on"))  { cfg.gpu_scale = NB_GS_ON; }
             else {
-                nb_err("--gpu-scale must be auto or off");
+                nb_err("--gpu-scale must be auto, on or off");
                 return 2;
             }
         }
