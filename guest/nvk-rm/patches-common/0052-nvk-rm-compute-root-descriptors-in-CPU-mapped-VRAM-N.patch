@@ -1,4 +1,4 @@
-From 97d100ef179865896acfc913c5a37ab33c9d828b Mon Sep 17 00:00:00 2001
+From 25cea1261a26a91b90625a58d39700882c58fcc8 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 12 Oct 2026 20:24:19 +0200
 Subject: [PATCH] nvk/rm: compute root descriptors in CPU-mapped VRAM
@@ -16,8 +16,12 @@ instead of 1.1 ms (NVIDIA: 0.37 ms).
   dependent point of every use. Command buffers keep a separate upload
   stream for it (nvk_cmd_buffer_upload_alloc_lat), used for the compute
   root descriptor table.
-- RM: NVK_RM_UPLOAD_VRAM=compute (the default) puts that stream in
-  CPU-mapped VRAM; 1 puts all upload memory there, 0 none. NVK's own
+- RM: NVK_RM_UPLOAD_VRAM=compute puts that stream in CPU-mapped VRAM;
+  1 puts all upload memory there; 0, the default, none. Off by default:
+  Steel Nomad (D3D12) scored 1905 with compute against 5252 without, and
+  a new command pool's first latency block costs a VRAM allocation and a
+  BAR1 map, both host round trips (d3d12_gpu_bound "record new
+  allocators": 14.1 against 6.5 ms per frame for 8 new allocators). NVK's own
   CPU-mapped VRAM (these and NVK_RM_DESC_TABLE_VRAM) has a budget of its
   own (256 MiB) and no longer needs the application's BAR heap
   (NVK_RM_BAR_MB) to be advertised; past the budget, or if the map is
@@ -30,10 +34,10 @@ instead of 1.1 ms (NVIDIA: 0.37 ms).
  src/nouveau/vulkan/nvk_cmd_pool.c          | 47 ++++++++++++++++--
  src/nouveau/vulkan/nvk_cmd_pool.h          |  5 ++
  src/nouveau/vulkan/nvkmd/nvkmd.h           |  9 ++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     | 24 ++++++++-
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 11 +++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     | 25 +++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 16 +++++-
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c | 58 +++++++++++++++++++---
- 9 files changed, 193 insertions(+), 15 deletions(-)
+ 9 files changed, 199 insertions(+), 15 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
 index 05d7bf3..b749e64 100644
@@ -160,7 +164,7 @@ index e49b14b..6f2874c 100644
        return result;
  
 diff --git a/src/nouveau/vulkan/nvk_cmd_pool.c b/src/nouveau/vulkan/nvk_cmd_pool.c
-index 6c3f04f..9da1a41 100644
+index 6c3f04f..cab5ebc 100644
 --- a/src/nouveau/vulkan/nvk_cmd_pool.c
 +++ b/src/nouveau/vulkan/nvk_cmd_pool.c
 @@ -10,7 +10,8 @@
@@ -182,7 +186,7 @@ index 6c3f04f..9da1a41 100644
 +   uint32_t flags = force_gart ? NVKMD_MEM_GART
 +                               : NVKMD_MEM_LOCAL | NVKMD_MEM_CPU_WRITE_ONLY;
 +   /* Latency-bound upload memory (compute root descriptors): on RM it goes
-+    * to VRAM through BAR1 by default (NVK_RM_UPLOAD_VRAM=compute).
++    * to VRAM through BAR1 with NVK_RM_UPLOAD_VRAM=compute.
 +    */
 +   if (latency)
 +      flags |= NVKMD_MEM_GPU_LATENCY;
@@ -310,27 +314,28 @@ index 2ea9077..ae87421 100644
  
  #define NVKMD_MEM_PLACEMENT_FLAGS \
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-index 195e67a..9f3e596 100644
+index 195e67a..9d4f6bd 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-@@ -337,7 +337,15 @@ struct nvkmd_rm_dev {
+@@ -337,7 +337,16 @@ struct nvkmd_rm_dev {
      * instead of system memory the GPU reads across PCIe.
      */
     bool desc_vram;
 -   bool upload_vram;
 +   /* NVK_RM_UPLOAD_VRAM: which command buffer upload memory is CPU-mapped
-+    * VRAM.  NVKMD_RM_UPLOAD_VRAM_COMPUTE (the default, "compute"): only
++    * VRAM.  _NONE (0) is the default.  NVKMD_RM_UPLOAD_VRAM_COMPUTE
++    * ("compute"): only
 +    * latency-bound upload memory (NVKMD_MEM_GPU_LATENCY, a compute
 +    * dispatch's root descriptor table, which the dispatch waits for: from
 +    * system memory each serial dispatch costs a few us more, 9.6 against
 +    * 1.1 us per dependent dispatch pair on an RTX 5090).  _ALL (1): all of
-+    * it.  _NONE (0): none.
++    * it.
 +    */
 +   uint8_t upload_vram;
     uint32_t desc_vram_fallbacks;
  
     /* lib->win_loss_epoch() when the device was created; see
-@@ -394,6 +402,13 @@ struct nvkmd_rm_dev {
+@@ -394,6 +403,13 @@ struct nvkmd_rm_dev {
      */
     uint64_t bar_used_B;
  
@@ -344,7 +349,7 @@ index 195e67a..9f3e596 100644
     /* Allocations from the BAR heap whose CPU map failed and which were
      * given system memory instead (nvkmd_rm_mem.c).
      */
-@@ -496,6 +511,8 @@ struct nvkmd_rm_mem {
+@@ -496,6 +512,8 @@ struct nvkmd_rm_mem {
      * map of the VRAM failed.
      */
     bool bar_charged;
@@ -353,7 +358,7 @@ index 195e67a..9f3e596 100644
  
     /* Imported from a dma-buf: h_memory came from
      * NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD and its handle was
-@@ -543,6 +560,11 @@ NVKMD_DECL_SUBCLASS(mem, rm);
+@@ -543,6 +561,11 @@ NVKMD_DECL_SUBCLASS(mem, rm);
   * NV01_MEMORY_SYSTEM instead of our own pages (for memory RM itself writes
   * through a kernel mapping, like channel error notifiers).
   */
@@ -366,18 +371,23 @@ index 195e67a..9f3e596 100644
  
  VkResult nvkmd_rm_alloc_mem(struct nvkmd_dev *dev,
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
-index 20857ec..4d837b6 100644
+index 20857ec..3408839 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
-@@ -166,7 +166,16 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+@@ -166,7 +166,21 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
        dev->sysmem_cached = dev->sysmem_cached_desc || dev->sysmem_cached_app;
     }
     dev->desc_vram = debug_get_bool_option("NVK_RM_DESC_TABLE_VRAM", false);
 -   dev->upload_vram = debug_get_bool_option("NVK_RM_UPLOAD_VRAM", false);
 +   {
-+      /* NVK_RM_UPLOAD_VRAM=compute (default) / 1 (all) / 0 (none) */
++      /* NVK_RM_UPLOAD_VRAM=0 (default, none) / compute / 1 (all).  Not on
++       * by default: Steel Nomad (D3D12) scored 1905 with compute, 5252
++       * without.  A new command pool's first latency block is a VRAM
++       * allocation plus a BAR1 map, both host round trips (~1 ms per pool in
++       * d3d12_gpu_bound's "record new allocators").
++       */
 +      const char *u = os_get_option("NVK_RM_UPLOAD_VRAM");
-+      if (u == NULL || strcmp(u, "compute") == 0)
++      if (u != NULL && strcmp(u, "compute") == 0)
 +         dev->upload_vram = NVKMD_RM_UPLOAD_VRAM_COMPUTE;
 +      else if (debug_get_bool_option("NVK_RM_UPLOAD_VRAM", false))
 +         dev->upload_vram = NVKMD_RM_UPLOAD_VRAM_ALL;
