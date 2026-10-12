@@ -206,11 +206,11 @@ pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists"
 /// OFF means a timed run does no diagnostic atomic RMW at all.
 pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob = BoolKnob::new(c"UmdDeferredDiagnostics", false);
 
-/// D3D11 DDI interface the adapter advertises (`ddi_level.rs`). Absent = 0x10
-/// (D3DWDDM1_3, what every process negotiated before); 0x24 (D3DWDDM2_3)
-/// advertises the WDDM 2.3 D3D11 DDI above it. Never applied to dwm.exe, which
-/// has its own `UmdDdiLevelDwm` (same values, absent = 0x10).
-pub(crate) static UMD_DDI_LEVEL: DwordKnob = DwordKnob::new(c"UmdDdiLevel", 0x10);
+/// D3D11 DDI interface the adapter advertises (`ddi_level.rs`). Absent = 0x24
+/// (D3DWDDM2_3 above the 1.3 / 11.1 / 11.0 interfaces); 0x10 keeps the
+/// process on D3DWDDM1_3. Never applied to dwm.exe, which has its own
+/// `UmdDdiLevelDwm` (same values, absent = 0x10).
+pub(crate) static UMD_DDI_LEVEL: DwordKnob = DwordKnob::new(c"UmdDdiLevel", 0x24);
 
 /// `UmdDdiLevel` for dwm.exe only. Absent = 0x10: DWM keeps the WDDM 1.3 D3D11
 /// DDI until the 2.3 path has been proven in ordinary processes.
