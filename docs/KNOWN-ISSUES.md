@@ -64,8 +64,8 @@ keeps off NVK.
   virglrenderer); build that by hand ([VENUS.md](VENUS.md)). The packages
   have both.
 - `conduit attach` recognizes a Windows VM and adds the Hyper-V
-  enlightenments, but does not install its guest driver: install the Helios
-  package inside the VM by hand ([WINDOWS.md](WINDOWS.md)).
+  enlightenments, but does not install its guest driver: run the release's
+  driver zip `install.ps1` inside the VM ([WINDOWS.md](WINDOWS.md#guest-driver)).
 - The guest driver is test-signed: Secure Boot off, test-signing on.
 - Counter-Strike 2: in some launches a strip of stray geometry (a long brown
   "beam") comes out of the player model in the main menu and stays for that
