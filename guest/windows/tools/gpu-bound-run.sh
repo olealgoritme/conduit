@@ -12,6 +12,7 @@
 #              (default C:/Users/Public/gpubench)
 #   GB_ENV     "K=V K=V ..." set in the guest process (e.g.
 #              "NVK_RM_TIMESLICE_US=1024" or "NVK_RM_HUGE_PAGES=1")
+#   (the vk tool runs with NVK_RM=1 HELIOS_ICD=nvk)
 #   GB_VKICD   guest path of vulkan_nouveau.dll for the vk tool
 #              (VK_DIRECT_DRIVER; default: the Helios package's copy found
 #              under C:/Windows/System32/DriverStore)
@@ -43,7 +44,7 @@ for kv in ${GB_ENV:-}; do
   ps+="\$env:${kv%%=*}='${kv#*=}'; "
 done
 if [ "$tool" = vk ]; then
-  ps+="\$env:NVK_RM='1'; "
+  ps+="\$env:NVK_RM='1'; \$env:HELIOS_ICD='nvk'; "
   if [ -n "${GB_VKICD:-}" ]; then
     ps+="\$env:VK_DIRECT_DRIVER='${GB_VKICD}'; "
   else
@@ -55,10 +56,10 @@ ps+="& .\\$exe $*; \"# exit \$LASTEXITCODE\""
 
 power_capping() {
   timeout 20 nvidia-smi -q -d PERFORMANCE 2>/dev/null |
-    awk -F: '/SW Power Capping/ { gsub(/[^0-9]/, "", $2); print $2; exit }'
+    awk -F: '/SW Power Capping/ && !n++ { gsub(/[^0-9]/, "", $2); print $2 }'
 }
 
-cap0=$(power_capping || echo 0)
+cap0=$(power_capping || true)
 timeout $((tmo + 10)) nvidia-smi dmon -s pucvt -d 1 -o T > "$out/$label.dmon" 2>&1 &
 dmon=$!
 t0=$(date +%s)
@@ -70,7 +71,7 @@ set -e
 t1=$(date +%s)
 kill "$dmon" 2>/dev/null || true
 wait "$dmon" 2>/dev/null || true
-cap1=$(power_capping || echo 0)
+cap1=$(power_capping || true)
 
 {
   echo "# host: $label, ${tool}, $((t1 - t0)) s, ssh exit $rc"
