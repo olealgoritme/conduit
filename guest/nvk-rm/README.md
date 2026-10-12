@@ -276,6 +276,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0050 | RM: separate depth and stencil images (Blackwell's D24S8 and D32S8X24 planes) are compressed by default; `NVK_RM_COMPRESS_ZS=0` turns it off. An image whose separate stencil usage asks for host transfer is not compressed |
 | 0051 | every failed shader and pipeline compile (spirv_to_nir, vkCreateGraphicsPipelines, vkCreateComputePipelines) is one line with the stage, a SPIR-V hash, the VkResult and the module's capabilities and extensions: on Windows appended to `C:\ProgramData\Helios\shader-failures.log` (the ledger the UMDs share) with the SPIR-V saved under `C:\ProgramData\Helios\spirv-failures\`, elsewhere `mesa_logw` |
 | 0052 | RM: a compute dispatch's root descriptor table (`NVKMD_MEM_GPU_LATENCY`, its own upload stream) can be CPU-mapped VRAM, `NVK_RM_UPLOAD_VRAM=compute` (`1` all upload memory; default `0`, none); NVK's own CPU-mapped VRAM has a 256 MiB budget of its own and no longer needs the application's BAR heap |
+| 0053 | NAK: the legalizer's GPR copy of a uniform value serves every later use in its block (an FFMA by two uniform constants made a copy per FFMA, all in one register: a copy -> FFMA chain at a fraction of the FMA rate); `NAK_DEBUG=noucse` makes a copy per use |
 
 ## Per-draw cost (common 0001-0007)
 
