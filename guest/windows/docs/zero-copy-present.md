@@ -519,7 +519,7 @@ What the UMD must change (not done here): `PresentStreamCorrelation::is_complete
 2. **Layout on the host wire.** The 56-byte `RESOURCE_CREATE_BLOB` has no room for the layout; the host
    learns it from the GEM object or from a new message. Needed before the gate opens.
 3. **KMD-driven `ScanoutFlip`** in `program_vidpn_source_inner` (plan 3.6 Option B): read
-   `foreign_layout` for `stride`, `fourcc`, `modifier`. **Done, behind the knob `ForeignFlip` (default off): see
+   `foreign_layout` for `stride`, `fourcc`, `modifier`. **Done, behind the knob `ForeignFlip` (default on): see
    `kmd-rm-client.md` 15.18** (the arbiter's resident source under the importing device, `present_within`, the
    poison of records whose DRM file closed; the wire still names `(owner_handle, GEM)`, so a flip by resource id is a
    host change, 15.18.6).
