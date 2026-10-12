@@ -1,0 +1,163 @@
+Helios DXVK fork: discard slices recycle the most recently freed allocations first, lock-free
+
+Conduit guest/windows. Applied after 0021 by ci/windows/Build-Driver.ps1.
+
+A freed cacheable allocation (a dynamic buffer's discard slice from a local
+allocation cache, 0021) went into its size class's free list under a mutex,
+and reached a local cache again only once that free list had filled to a
+whole list (256 KiB worth: 1024 slices of 256 B) and moved to the pool. A
+refill therefore handed out slices freed up to a list's worth of frees ago,
+cold in the CPU caches, and the application's writes into a freshly mapped
+slice paid for it (d3d11_mapbench: about as much as the cache saved on the
+allocator lock).
+
+Each size class of the shared cache now also keeps a lock-free stack of the
+most recently freed allocations, newest first. A free pushes onto it (CAS);
+a local cache refill takes the whole stack (one exchange) before it looks at
+the full lists. There is no single-element pop, so there is no ABA. A stack
+holds at most 16 lists' worth (4 MiB); further frees take the free-list path
+as before. A stack nobody takes for a second goes back to the allocator at
+the periodic cleanup, like drained lists.
+
+diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
+index e55c9a89..7fe60fac 100644
+--- a/src/dxvk/dxvk_memory.cpp
++++ b/src/dxvk/dxvk_memory.cpp
+@@ -524,6 +524,9 @@ namespace dxvk {
+ 
+ 
+   DxvkSharedAllocationCache::~DxvkSharedAllocationCache() {
++    for (auto& recent : m_recent)
++      m_allocator->freeCachedAllocations(recent.head.exchange(nullptr));
++
+     for (const auto& freeList : m_freeLists)
+       m_allocator->freeCachedAllocations(freeList.head);
+ 
+@@ -536,6 +539,12 @@ namespace dxvk {
+           VkDeviceSize                allocationSize) {
+     uint32_t poolIndex = DxvkLocalAllocationCache::computePoolIndex(allocationSize);
+ 
++    // Helios: the most recently freed allocations first. They are still warm
++    // in the CPU caches, while a full free list holds allocations freed up to
++    // a whole list's worth of frees ago.
++    if (DxvkResourceAllocation* recent = takeRecent(poolIndex))
++      return recent;
++
+     // If there's a list ready for us, take the whole thing
+     std::unique_lock poolLock(m_poolMutex);
+     m_numRequests += 1u;
+@@ -569,6 +578,9 @@ namespace dxvk {
+           DxvkResourceAllocation*     allocation) {
+     uint32_t poolIndex = DxvkLocalAllocationCache::computePoolIndex(allocation->m_size);
+ 
++    if (likely(pushRecent(poolIndex, allocation)))
++      return nullptr;
++
+     { std::unique_lock freeLock(m_freeMutex);
+       auto& list = m_freeLists[poolIndex];
+ 
+@@ -639,6 +651,49 @@ namespace dxvk {
+   }
+ 
+ 
++  DxvkResourceAllocation* DxvkSharedAllocationCache::takeRecent(
++          uint32_t                    poolIndex) {
++    auto& recent = m_recent[poolIndex];
++
++    if (!recent.head.load(std::memory_order_relaxed))
++      return nullptr;
++
++    DxvkResourceAllocation* head = recent.head.exchange(nullptr, std::memory_order_acquire);
++
++    // Frees that land between the exchange and this store are not counted,
++    // so the count can only read low; it is a soft bound, see pushRecent.
++    recent.count.store(0u, std::memory_order_relaxed);
++    recent.takeTime.store(recentTimeNow(), std::memory_order_relaxed);
++    return head;
++  }
++
++
++  bool DxvkSharedAllocationCache::pushRecent(
++          uint32_t                    poolIndex,
++          DxvkResourceAllocation*     allocation) {
++    auto& recent = m_recent[poolIndex];
++
++    // Bound what one size class keeps here when nothing takes it (a size a
++    // scene stopped using): beyond 16 free lists' worth, frees take the
++    // regular free-list path, which balances and frees memory.
++    uint32_t maxCount = uint32_t(16u * PoolCapacityInBytes / allocation->m_size);
++
++    if (recent.count.load(std::memory_order_relaxed) >= maxCount)
++      return false;
++
++    recent.count.fetch_add(1u, std::memory_order_relaxed);
++
++    DxvkResourceAllocation* head = recent.head.load(std::memory_order_relaxed);
++
++    do {
++      allocation->m_nextCached = head;
++    } while (!recent.head.compare_exchange_weak(head, allocation,
++      std::memory_order_release, std::memory_order_relaxed));
++
++    return true;
++  }
++
++
+   DxvkSharedAllocationCacheStats DxvkSharedAllocationCache::getStats() {
+     std::unique_lock poolLock(m_poolMutex);
+ 
+@@ -656,6 +711,23 @@ namespace dxvk {
+ 
+   void DxvkSharedAllocationCache::cleanupUnusedFromLockedAllocator(
+           high_resolution_clock::time_point time) {
++    // Helios: recent allocations nobody took for a second go back to the
++    // allocator, like drained free lists below. The take time starts at 0,
++    // so a stack that was never taken is freed at the first cleanup.
++    const int64_t now = time.time_since_epoch().count();
++    const int64_t second = std::chrono::duration_cast<high_resolution_clock::duration>(
++      std::chrono::seconds(1u)).count();
++
++    for (auto& recent : m_recent) {
++      if (recent.head.load(std::memory_order_relaxed)
++       && now - recent.takeTime.load(std::memory_order_relaxed) >= second) {
++        recent.count.store(0u, std::memory_order_relaxed);
++        recent.takeTime.store(now, std::memory_order_relaxed);
++        m_allocator->freeCachedAllocationsLocked(
++          recent.head.exchange(nullptr, std::memory_order_acquire));
++      }
++    }
++
+     std::unique_lock poolLock(m_poolMutex);
+ 
+     for (auto& pool : m_pools) {
+diff --git a/src/dxvk/dxvk_memory.h b/src/dxvk/dxvk_memory.h
+index d456cc3d..e64f3989 100644
+--- a/src/dxvk/dxvk_memory.h
++++ b/src/dxvk/dxvk_memory.h
+@@ -1023,6 +1023,26 @@ namespace dxvk {
+     VkDeviceSize                m_cacheSize = 0u;
+     VkDeviceSize                m_maxCacheSize = 0u;
+ 
++    // Helios: the most recently freed allocations of each size class, newest
++    // first, handed to a refilling local cache as a whole without waiting
++    // for a free list to fill. Lock-free: frees push (CAS), refills take the
++    // whole stack (exchange), so there is no single-element pop and no ABA.
++    struct alignas(CACHE_LINE_SIZE) RecentStack {
++      std::atomic<DxvkResourceAllocation*> head = { nullptr };
++      std::atomic<uint32_t> count = { 0u };
++      std::atomic<int64_t>  takeTime = { 0 };
++    };
++
++    std::array<RecentStack, PoolCount> m_recent;
++
++    static int64_t recentTimeNow() {
++      return high_resolution_clock::now().time_since_epoch().count();
++    }
++
++    DxvkResourceAllocation* takeRecent(uint32_t poolIndex);
++
++    bool pushRecent(uint32_t poolIndex, DxvkResourceAllocation* allocation);
++
+   };
+ 
+ 
