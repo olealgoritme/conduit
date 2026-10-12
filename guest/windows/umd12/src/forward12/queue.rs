@@ -3096,6 +3096,17 @@ unsafe fn nvk_complete_fenced(
         },
     };
     debug_assert!(record.is_fence_record());
+    // `Nvk12AdmitBeforeRender`: the admission goes in first, so it fires once
+    // everything before this batch on the context was submitted rather than
+    // once this batch's own packet was. If the Render below is refused, the
+    // caller's fallback queues another admission on the same manual-reset
+    // event, which is harmless.
+    let admit_first = crate::knobs12::nvk12_admit_before_render();
+    if admit_first {
+        // SAFETY: same entering thread and exact context as the Render below.
+        unsafe { admit(dev, queue, admission, must_admit) }?;
+        L2_REFUSALS.ecl_admit_before_render.bump();
+    }
     // SAFETY: required runtime callback on the entering DDI thread.
     match unsafe { submit_wddm_render(dev, queue, &record, "ExecuteCommandLists (HE12 v4)") } {
         WddmSubmit::Submitted => {}
@@ -3116,9 +3127,11 @@ unsafe fn nvk_complete_fenced(
     queue
         .nvk_last_value
         .fetch_max(u64::from(value), std::sync::atomic::Ordering::AcqRel);
-    // SAFETY: same entering thread and exact context as the Render above.
-    // SignalAtSubmission is essential: a completion event here deadlocks.
-    unsafe { admit(dev, queue, admission, must_admit) }?;
+    if !admit_first {
+        // SAFETY: same entering thread and exact context as the Render above.
+        // SignalAtSubmission is essential: a completion event here deadlocks.
+        unsafe { admit(dev, queue, admission, must_admit) }?;
+    }
     Ok(true)
 }
 
@@ -4430,6 +4443,9 @@ pub(crate) struct L2Refusals {
     /// NVK ECLs released without the runtime admission event (diagnostic
     /// `Nvk12AdmitAfterPresentOnly`).
     ecl_admission_skipped: RefusalCounter,
+    /// NVK ECLs whose admission was queued before their HE12 v4 Render
+    /// (`Nvk12AdmitBeforeRender`).
+    ecl_admit_before_render: RefusalCounter,
     /// D3D12 queue contexts created on node 1 (`Umd12ContextNode`).
     queue_context_node1: RefusalCounter,
     /// Node 1 was refused (one-node KMD); the queue is on node 0.
@@ -4537,6 +4553,7 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     command_signature_translation_oom: RefusalCounter::new("CommandSignatureTranslationOom"),
     ecl_nvk_ordered: RefusalCounter::new("EclNvkOrdered"),
     ecl_admission_skipped: RefusalCounter::new("EclAdmissionSkipped"),
+    ecl_admit_before_render: RefusalCounter::new("EclAdmitBeforeRender"),
     queue_context_node1: RefusalCounter::new("QueueContextNode1"),
     queue_context_node_refused: RefusalCounter::new("QueueContextNodeRefused"),
     ecl_fence_prefetch_failed: RefusalCounter::new("EclFencePrefetchFailed"),
@@ -4684,6 +4701,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.command_signature_translation_oom,
     &L2_REFUSALS.ecl_nvk_ordered,
     &L2_REFUSALS.ecl_admission_skipped,
+    &L2_REFUSALS.ecl_admit_before_render,
     &L2_REFUSALS.queue_context_node1,
     &L2_REFUSALS.queue_context_node_refused,
     &L2_REFUSALS.ecl_fence_prefetch_failed,
