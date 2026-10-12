@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abi"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "allocator-api2"
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "conduit"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "abi",
  "anyhow",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-trace"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "abi",
  "protocol",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "quote"
