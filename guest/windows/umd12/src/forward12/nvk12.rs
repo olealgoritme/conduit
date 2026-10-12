@@ -24,7 +24,7 @@
 //!   A wait-before-signal pattern (Queue::Wait on a fence the app signals after
 //!   ExecuteCommandLists returns) would deadlock that wait, so it is capped at
 //!   2 s per call and counted. The wait first polls the stream with zero
-//!   timeouts for `Nvk12EclSpinUs` (default 2 ms): NVK's own blocking wait
+//!   timeouts for `Nvk12EclSpinUs` (default 2000 us): NVK's own blocking wait
 //!   costs at least a Windows timer tick, once per ECL.
 //!
 //! * **ECL fence** (`Nvk12EclSync=2`, the default). Each ExecuteCommandLists submits an
