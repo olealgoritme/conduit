@@ -92,7 +92,7 @@ one CCD made no measurable difference.
 
 The driver package is the WDDM KMD, the x64/x86 D3D11 and D3D12 UMDs, NVK on
 RM with librmclient (64- and 32-bit) and Zink. The current version is
-22.22.405.68 (`guest/windows/kmd_render/driver-version.env`, the only place
+22.22.405.77 (`guest/windows/kmd_render/driver-version.env`, the only place
 the version is set). The adapter shows as "Conduit Helios", the monitor as
 "Conduit".
 
