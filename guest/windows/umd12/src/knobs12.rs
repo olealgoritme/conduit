@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 23] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 24] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -334,6 +334,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 23] {
         ("Umd12MergeEcl", umd12_merge_ecl() as u32),
         // Appended.
         ("Umd12EngineShaderCaps", umd12_engine_shader_caps() as u32),
+        // Appended.
+        ("Nvk12AdmitBeforeRender", nvk12_admit_before_render() as u32),
     ]
 }
 
