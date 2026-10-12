@@ -58,10 +58,19 @@ git rev-parse -q --verify "refs/tags/v$new" >/dev/null && {
 echo "Releasing v$new (previous: ${last:-none})"
 # Lock files are synced even when the manifests already carry $new (a bump
 # made by hand): CI and the release build run with --locked.
-for d in . host/backend host/vmm host/stream; do
+# The root lock also lists path dependencies from the other workspaces
+# (abi, protocol, conduit-trace from host/backend), so it is synced last.
+for d in host/backend host/vmm host/stream .; do
   [ "$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$d/Cargo.toml" | head -1)" = "$new" ] ||
     run sed -i "0,/^version *= *\".*\"/s//version = \"$new\"/" "$d/Cargo.toml"
   (cd "$d" && run cargo update -q -w --offline 2>/dev/null || run cargo update -q -w)
+done
+for d in host/backend host/vmm host/stream .; do
+  (cd "$d" && run cargo metadata -q --offline --format-version 1 >/dev/null)
+done
+for d in host/backend host/vmm host/stream .; do
+  [ "$DRY" = 1 ] || (cd "$d" && cargo metadata -q --locked --offline --format-version 1 >/dev/null) || {
+    echo "release: $d/Cargo.lock is still out of date; not tagging" >&2; exit 1; }
 done
 git diff --quiet -- "${VERSIONED[@]}" || run git commit -q -m "Release v$new" -- "${VERSIONED[@]}"
 run git tag -a "v$new" -m "Conduit v$new"
