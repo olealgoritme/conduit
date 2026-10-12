@@ -29,7 +29,7 @@ from GPU memory to your screen: no copying, no video compression.
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
 | Host isolation: host work and device interrupts kept off a running VM's CPUs (per CCD, P/E cores or NUMA node; on by default, [HOST-TUNING.md](docs/HOST-TUNING.md#cpu-host-isolation)) | ✅ |
-| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, driver 22.22.405.77 built by hand: [Windows guests](#windows-guests)) |
+| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, guest driver 22.22.405.84 attached to every release: [Windows guests](#windows-guests)) |
 | NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
 > Early software, tested mainly on an RTX 5090 with Ubuntu 24.04 and Hyprland;
@@ -47,7 +47,7 @@ from GPU memory to your screen: no copying, no video compression.
 <p align="center"><b>Windows 11 VM</b></p>
 
 <p align="center">
-  <img src="docs/assets/conduit-win11.jpg" alt="A Windows 11 guest on Conduit on an RTX 5090: the host terminal shows nvidia-smi with conduit-backend and conduit-venus and virsh list with win11 running; below, the guest runs Unigine Heaven 4.0 in Direct3D 11 at 300 fps, and Task Manager shows the Conduit Helios GPU, driver 22.22.405.24" width="860">
+  <img src="docs/assets/conduit-win11.jpg" alt="A Windows 11 guest on Conduit on an RTX 5090: the host terminal shows nvidia-smi with conduit-backend and conduit-venus and virsh list with win11 running; below, the guest runs Unigine Heaven 4.0 in Direct3D 11 at 300 fps, and Task Manager shows the Conduit Helios GPU" width="860">
 </p>
 
 <p align="center"><sub>A Windows 11 guest on an RTX 5090: Unigine Heaven in Direct3D 11 at 300 fps, rendered by NVK on the host GPU.</sub></p>
@@ -82,7 +82,14 @@ need relative mouse input), and run games at the VM's display mode (e.g.
 viewer scales it to the window ([docs/VIEWER.md](docs/VIEWER.md)). Ctrl+Alt+G
 again releases the mouse.
 
-**Conduit GPU tray.** The driver package also installs a small tray app that
+**Guest extras.** Every release also carries
+`conduit-windows-gpu-setup-<version>.zip`, built from the same driver. Its
+`HeliosSetup.exe`, run once after `install.ps1`, adds the GPU tray below, the
+shared-folder mounts, the logon task that makes the Conduit display the only
+active one, and the virtio-input driver; it keeps the desktop setting
+`install.ps1` wrote ([packaging README](guest/windows/packaging/windows/README.md)).
+
+**Conduit GPU tray.** A small tray app (from the setup package) that
 starts at logon with no prompt. Its icon shows the host GPU's live temperature
 or load; clicking it opens a popup with load, power and temperature, 60-second
 graphs and VRAM, clock and fan bars. Its Shared folders menu opens the host
@@ -100,7 +107,7 @@ More detail (building the driver yourself, knobs, troubleshooting):
 A Windows 11 guest renders on the host GPU through NVK-on-RM: Mesa's open
 NVK Vulkan driver runs in the guest and talks to the host's NVIDIA kernel
 driver (RM) through Conduit. Tested on an RTX 5090. Guest driver version:
-**22.22.405.77**.
+**22.22.405.84**.
 
 ```
  Windows guest
@@ -151,8 +158,7 @@ debug switch or an experiment is in
   fit within it, and custom modes (`conduit display VM --add WxH`;
   [docs/SCANOUT.md](docs/SCANOUT.md) "Mode list").
 - In games, use the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look.
-- The driver is test-signed (Secure Boot off, test-signing on), and the guest
-  package is built and installed by hand.
+- The driver is test-signed (Secure Boot off, test-signing on).
 
 More:
 

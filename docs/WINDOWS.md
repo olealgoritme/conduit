@@ -92,18 +92,32 @@ one CCD made no measurable difference.
 
 The driver package is the WDDM KMD, the x64/x86 D3D11 and D3D12 UMDs, NVK on
 RM with librmclient (64- and 32-bit) and Zink. The current version is
-22.22.405.77 (`guest/windows/kmd_render/driver-version.env`, the only place
+22.22.405.84 (`guest/windows/kmd_render/driver-version.env`, the only place
 the version is set). The adapter shows as "Conduit Helios", the monitor as
 "Conduit".
 
-**First install: the full package.** Build `HeliosSetup.exe` with
-`.github/workflows/windows.yml` (KMD, UMDs, NVK, Zink, the Mesa Venus ICD,
-Khronos loaders) and run it once in the guest
-([guest/windows/packaging/windows/README.md](../guest/windows/packaging/windows/README.md)).
-The first run turns on test-signing and asks for a reboot; run it again after
-the reboot, then reboot once more.
+**Install from a release.** Every release carries
+`conduit-windows-gpu-driver-<version>.zip` (built and test-signed by
+`.github/workflows/windows.yml`). Unzip it in the guest and, from an
+Administrator prompt in that folder:
 
-**Driver updates: the local build VM**
+```bat
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The first run turns on test-signing and asks for a reboot; run it again after
+the reboot (it trusts the package's test certificate, installs the driver and
+sets `DwmIcd=nvk`), then reboot once more. No other registry value needs to be
+set: the code defaults are the recommended configuration
+([Registry knobs](#registry-knobs)). `-VenusDesktop` keeps DWM on Venus.
+
+**Guest extras.** The release's `conduit-windows-gpu-setup-<version>.zip`
+holds `HeliosSetup.exe`, built from the same driver. Run once after
+`install.ps1`, it adds the GPU tray, the shared-folder mounts, the display
+topology task and the virtio-input driver, and keeps `DwmIcd`
+([guest/windows/packaging/windows/README.md](../guest/windows/packaging/windows/README.md)).
+
+**Building the driver yourself: the local build VM**
 ([guest/windows/ci/vm/README.md](../guest/windows/ci/vm/README.md)):
 
 ```sh
@@ -113,8 +127,8 @@ WIN_SSH=user@127.0.0.1 guest/windows/ci/vm/win-build.sh Release
 ```
 
 The package is signed with a development certificate
-(`helios-dev-test.cer`, in the package). In the guest, from an administrator
-prompt:
+(`helios-dev-test.cer`, in the package). Copy `install.ps1` next to it and
+run it as above, or, from an administrator prompt:
 
 ```bat
 bcdedit /set testsigning on
@@ -123,9 +137,8 @@ certutil -addstore -f TrustedPublisher helios-dev-test.cer
 pnputil /add-driver helios_kmd_render.inf /install
 ```
 
-then reboot (or `pnputil /restart-device` on the adapter). pnputil keeps an
-installed driver of the same version: bump `HELIOS_KMD_VERSION` for every
-build installed over an earlier one.
+then reboot. pnputil keeps an installed driver of the same version: bump
+`HELIOS_KMD_VERSION` for every build installed over an earlier one.
 
 **Which driver a process gets.** One policy, read by the UMDs, NVK and Zink
 (`guest/windows/protocol/include/helios_icd_policy.h`), decides per process,
@@ -141,8 +154,8 @@ that off).
 
 Off in the code while new; each one was measured on the test machine
 ([NVK-ROADMAP.md](NVK-ROADMAP.md)). `install.ps1` sets `DwmIcd=nvk` (unless
-run with `-VenusDesktop`); the others are set by hand. Defaults of these and
-every other knob: [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md).
+run with `-VenusDesktop`); `venus.guest_blobs` is a host setting. Defaults of
+these and every other knob: [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md).
 
 | Where | Setting | What it does |
 |---|---|---|

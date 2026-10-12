@@ -10,7 +10,7 @@ through [librmclient](../rmclient), loaded at runtime.
 Status: runs on an RTX 5090 (GB202, GSP firmware).
 
 - **Windows guests:** the rendering driver of the Windows guest stack
-  (driver 22.22.405.24). The Helios D3D11 (DXVK) and D3D12 (vkd3d-proton)
+  (driver 22.22.405.84). The Helios D3D11 (DXVK) and D3D12 (vkd3d-proton)
   UMDs, Vulkan applications and OpenGL (Zink) run on it; RM calls go through
   the Helios KMD and the virtio transport. The desktop (DWM) and games run
   on NVK at 240 Hz; Counter-Strike 2 runs at ~330–380 fps at 1080p and

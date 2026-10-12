@@ -504,13 +504,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # On a v* tag, attach the driver zip to the GitHub release that release.yml
-  # creates from the same tag (it publishes after the Linux packages are
-  # built, QEMU included on a cache miss, so wait for it), with its checksum
-  # in its own SHA256SUMS-windows: release.yml's SHA256SUMS stays as that
-  # workflow wrote it, whichever of the two finishes last.
+  # On a v* tag, attach the driver zip and the full Release package
+  # (HeliosSetup.exe, as conduit-windows-gpu-setup-<version>.zip) to the
+  # GitHub release that release.yml creates from the same tag (it publishes
+  # after the Linux packages are built, QEMU included on a cache miss, so wait
+  # for it), with their checksums in their own SHA256SUMS-windows:
+  # release.yml's SHA256SUMS stays as that workflow wrote it, whichever of the
+  # two finishes last.
   release:
-    name: Attach the driver zip to the release
+    name: Attach the driver zip and the setup package to the release
     needs: package
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
@@ -526,6 +528,11 @@ jobs:
         with:
           name: conduit-windows-gpu-driver
           path: zip
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: helios-windows-x64-*-Release
+          path: setup
+          merge-multiple: true
       - name: Wait for the release
         run: |
           # release.yml creates the release in its last job, with SHA256SUMS.
@@ -537,10 +544,16 @@ jobs:
           done
           echo "::error::Release $TAG did not appear within 3 hours; check the release workflow, then re-run this job."
           exit 1
-      - name: Upload the zip and SHA256SUMS-windows
+      - name: Upload the zips and SHA256SUMS-windows
         run: |
           zip=$(ls zip/conduit-windows-gpu-driver-*.zip)
           name=$(basename "$zip")
-          (cd zip && sha256sum "$name") > SHA256SUMS-windows
-          gh release upload "$TAG" "$zip" SHA256SUMS-windows --clobber
+          version=${name#conduit-windows-gpu-driver-}
+          version=${version%.zip}
+          pkg=$(ls setup/helios-windows-x64-*.zip | grep -v -- '-symbols\.zip$')
+          [ "$(echo "$pkg" | wc -l)" = 1 ] || { echo "::error::expected one setup package, got: $pkg"; exit 1; }
+          setup="conduit-windows-gpu-setup-$version.zip"
+          cp "$pkg" "zip/$setup"
+          (cd zip && sha256sum "$name" "$setup") > SHA256SUMS-windows
+          gh release upload "$TAG" "$zip" "zip/$setup" SHA256SUMS-windows --clobber
           cat SHA256SUMS-windows
