@@ -28,6 +28,8 @@
 //   rootcbv  20000 small draws: one root CBV for all, a new root CBV in an
 //            UPLOAD heap per draw, a new one in a DEFAULT heap per draw
 //                                                                 Mdraws/s
+//   record   CPU cost of recording: 8 lists x 64 dispatches per frame with
+//            allocators reused, then new allocators every frame   us/dispatch
 //   submit   the same GPU work per frame (64 units of ~50 us) in 1/4/16/64
 //            ExecuteCommandLists, one Signal per frame, 2 frames in flight:
 //            wall time vs GPU busy, the idle gap per ExecuteCommandLists
@@ -906,6 +908,64 @@ static void test_sustain() {
   rt->Release();
 }
 
+
+// CPU side of recording: what an engine's render threads pay per dispatch
+// and per command list, the way vkd3d-proton sees it (allocator reset, list
+// reset, root constants + root UAV + Dispatch, Close, ExecuteCommandLists).
+// Per frame 8 lists x 64 tiny dispatches, 2 frames in flight; once with
+// allocators reused frame after frame, once with new allocators and lists
+// every frame (engines that create them per frame).
+static void test_record() {
+  ID3D12Resource* out = buffer(1 << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  const int lists = 8, dispatches = 64, inflight = 2;
+  for (int fresh = 0; fresh <= 1; fresh++) {
+    std::vector<Cmd> cmds(inflight * lists);
+    UINT64 slot_value[2] = { 0, 0 };
+    double rec_ms = 0, t_measure = 0;
+    int frames = 0, measured = 0;
+    const double t0 = now_ms();
+    for (;;) {
+      const int slot = frames % inflight;
+      if (slot_value[slot]) wait_value(slot_value[slot]);
+      if (frames == 8) t_measure = now_ms();
+      if (now_ms() - t0 > 2500 && measured > 8) break;
+      const double r0 = now_ms();
+      for (int k = 0; k < lists; k++) {
+        Cmd& c = cmds[slot * lists + k];
+        if (fresh) c.release();
+        c.begin();
+        c.list->SetPipelineState(p_copy);
+        c.list->SetComputeRootUnorderedAccessView(RP_UAV0, out->GetGPUVirtualAddress());
+        c.list->SetComputeRootUnorderedAccessView(RP_UAV1, out->GetGPUVirtualAddress() + (512 << 10));
+        for (int d = 0; d < dispatches; d++) {
+          PC pc = { { (float)d, 0, 0, 0 }, { 256, (UINT)d, 0, 0 } };
+          push(c.list, pc, true);
+          c.list->Dispatch(1, 1, 1);
+        }
+        c.close();
+        execute(c.list);
+      }
+      const double r1 = now_ms();
+      slot_value[slot] = signal();
+      if (frames >= 8) {
+        rec_ms += r1 - r0;
+        measured++;
+      }
+      frames++;
+    }
+    const double wall = now_ms() - t_measure;
+    wait_value(fence_value);
+    for (auto& c : cmds) c.release();
+    char name[64];
+    std::snprintf(name, sizeof(name), "record %s", fresh ? "new allocators" : "reused allocators");
+    std::printf("%-34s wall %8.3f ms/frame  record+submit %8.3f ms/frame  %6.2f us/dispatch\n", name,
+                wall / measured, rec_ms / measured, rec_ms * 1e3 / measured / (lists * dispatches));
+    std::fflush(stdout);
+  }
+  out->Release();
+}
+
 static bool want(const char* tests, const char* t) {
   if (!tests) return true;
   size_t n = std::strlen(t);
@@ -1027,6 +1087,7 @@ int main(int argc, char** argv) {
   if (want(tests, "barrier")) test_barrier();
   if (want(tests, "rtpass")) test_rtpass();
   if (want(tests, "rootcbv")) test_rootcbv();
+  if (want(tests, "record")) test_record();
   if (want(tests, "submit")) test_submit();
   if (want(tests, "sustain")) test_sustain();
 
