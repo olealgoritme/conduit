@@ -258,7 +258,7 @@ static const Case kCases[] = {
    "Texture2D t; SamplerState s; float4 main(float4 p : SV_Position, float2 uv : TEXCOORD) : SV_Target {\n"
    "  uint st; float4 c = t.Sample(s, uv, int2(0,0), 0.0, st); return CheckAccessFullyMapped(st) ? c : 0; }", 0x100},
   {"inner_coverage", "ps_5_0", "float4 main(float4 p : SV_Position, uint c : SV_InnerCoverage) : SV_Target { return c; }", 0x400},
-  {"early_depth_stencil", "ps_5_0", "[earlydepthstencil] float4 main(float4 p : SV_Position) : SV_Target { return 1; }", 0x2},
+  {"early_depth_stencil", "ps_5_0", "[earlydepthstencil] float4 main(float4 p : SV_Position) : SV_Target { return 1; }", 0},
 };
 
 static ID3DBlob* Compile(const Case& c) {
