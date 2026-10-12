@@ -1609,28 +1609,33 @@ static bool nb_format_resolve(struct nb_session *ss, uint32_t fourcc,
     if (copy) {
         *copy = false;
     }
-    if (ss->ops->format_ok(ss, fourcc, modifier)) {
-        *use_fourcc = fourcc;
-        return true;
-    }
     /*
-     * Try the OPAQUE TWIN of an alpha format.
+     * The OPAQUE TWIN of an alpha format first, the format as asked second.
      *
-     * This is not a relaxation of HARDENING 3: the pair we fall back to must
-     * ITSELF be advertised, so the compositor is still only ever handed
-     * something it said it could import.  What changes is which of two
-     * bit-identical descriptions of the same buffer it gets.
+     * A guest primary's alpha is undefined: a KMS primary plane ignores it,
+     * and a guest driver may leave it at zero (a Windows desktop composed
+     * by DWM does).  Handed over as AR24, a compositor blends with that
+     * alpha and the picture comes out transparent or black; the opaque
+     * region set on the surface is only a hint and does not change the
+     * blend on every compositor.  XR24 is the same bytes with the fourth
+     * channel ignored, so preferring it is correct for any frame and lets
+     * the compositor skip blending altogether.
      *
-     * A guest head flips AR24; the compositor advertises the modifier for XR24
-     * only, because alpha goes through its blend path and block-linear is not
-     * always wired up there.  The bytes are the same either way and a scanout
-     * has no meaningful alpha, so describing it as opaque is both correct and
-     * cheaper for the compositor -- it may skip blending altogether.
+     * This is not a relaxation of HARDENING 3: the pair we use must ITSELF
+     * be advertised, so the compositor is still only ever handed something
+     * it said it could import.  When the twin is not advertised for this
+     * modifier, the format as asked is the fallback (the surface's opaque
+     * region still says it is opaque).  Cursors never come here: they need
+     * their alpha and are checked as the exact pair.
      */
     uint32_t twin = nb_fourcc_opaque_twin(fourcc);
 
     if (twin && ss->ops->format_ok(ss, twin, modifier)) {
         *use_fourcc = twin;
+        return true;
+    }
+    if (ss->ops->format_ok(ss, fourcc, modifier)) {
+        *use_fourcc = fourcc;
         return true;
     }
     /*
@@ -1803,7 +1808,11 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     if (cursor) {
         /* checked above; exact pair checked by the backend */
     } else if (d->is_shm) {
-        if (fourcc != NB_FOURCC_XR24 && fourcc != NB_FOURCC_AR24) {
+        /* Opaque, as for a dma-buf frame: wl_shm always offers XRGB8888,
+         * and a guest primary's alpha is undefined. */
+        if (fourcc == NB_FOURCC_AR24) {
+            fourcc = NB_FOURCC_XR24;
+        } else if (fourcc != NB_FOURCC_XR24) {
             if (nb_reject_log(s)) {
                 nb_err("ATTACH: fourcc %s cannot be presented as shared memory; "
                        "only XR24 and AR24 are mapped to wl_shm formats",
@@ -1839,12 +1848,12 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
 
         if (!told) {
             told = true;
-            nb_log("ATTACH: %s modifier 0x%016llx is not advertised, but its "
-                   "opaque twin %s is — presenting as %s (same bytes; a "
-                   "scanout has no alpha).  Logged once.",
+            nb_log("ATTACH: %s modifier 0x%016llx presented as its opaque "
+                   "twin %s (same bytes; a guest primary's alpha is "
+                   "undefined).  Logged once.",
                    nb_fourcc_name(c->fourcc, fcc),
                    (unsigned long long)c->modifier,
-                   nb_fourcc_name(fourcc, fcc2), nb_fourcc_name(fourcc, fcc2));
+                   nb_fourcc_name(fourcc, fcc2));
         }
     }
     bpp = nb_fourcc_bpp(fourcc);

@@ -312,13 +312,16 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
     s->height = cfg->win_h;
     /*
      * A deliberately SMALL advertised set, so the selftest can prove both
-     * halves of the format gate: XRGB8888 linear and XRGB8888 implicit are
-     * accepted, everything else — including ARGB8888, which a real backend
-     * would take — is rejected.
+     * halves of the format gate: XRGB8888 linear and implicit, and ARGB8888
+     * linear (as a real compositor advertises it), are accepted; everything
+     * else is rejected.  ARGB8888 being advertised is what proves the broker
+     * still presents a frame as its opaque twin XRGB8888 when both are on
+     * offer (a guest primary's alpha is undefined).
      */
     nb_formats_add(&t->formats, NB_FOURCC('X', 'R', '2', '4'), 0);
     nb_formats_add(&t->formats, NB_FOURCC('X', 'R', '2', '4'),
                    NB_DRM_FORMAT_MOD_INVALID);
+    nb_formats_add(&t->formats, NB_FOURCC('A', 'R', '2', '4'), 0);
 
     s->accept_memfd = true;
     s->accept_shm   = true;
