@@ -78,6 +78,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_RM_ZCULL` | 1 | ZCULL from `GR_GET_ZCULL_INFO` |
 | `NVK_RM_HUGE_PAGES` | 0 | 2 MiB GPU pages for CPU-unmapped VRAM of 2 MiB or more (common 9) |
 | `NVK_RM_DEFER_FREE` | 1 on Windows, 0 on Linux | memory and VA frees wait for the GPU work submitted before them (common 19); `NVK_RM_DEFER_FREE_MB` (2048) caps the pending bytes |
+| `NVK_DLSS` | 0 (Windows: registry `Dlss`) | VK_NVX_binary_import for NGX/DLSS (windows 0065, [docs/dlss.md](docs/dlss.md)) |
 | `NVK_RM_VIDEO` | 1 | NVDEC channel for H.264 decode (also needs `-Dvideo-codecs=h264dec` and `NVK_EXPERIMENTAL=video`) |
 | **CPU waits and the GPFIFO ring** | | |
 | `NVK_RM_EVENT_GEN` | 1 | CPU waits on librmclient's wake generations (common 42) |
@@ -171,7 +172,7 @@ Each patch builds on its own.
 |---|---|
 | 0014 | the backend calls neither `mmap` nor `poll`: `crm_event_wait`, `crm_alloc_pages`/`crm_free_pages` (librmclient transport ABI 2; an older librmclient on Linux gets the same code from `nvkmd_rm_lib.c`); `LoadLibrary` of `librmclient.dll` next to the ICD |
 | 0015 | `vk_image::drm_format_mod` exists on every OS (`DRM_FORMAT_MOD_INVALID` on Windows) |
-| 0016 | build without libelf (`nv_cubin_nolibelf.c`, CUDA modules rejected) |
+| 0016 | build without libelf (`nv_cubin_nolibelf.c`, CUDA modules rejected; 0064 replaces it with a parser) |
 | 0017 | driver build id from the Mesa version and module timestamp (`disk_cache_get_function_identifier`) |
 | 0018 | NAK leaves nouveau's winsys and DRM out of its bindings |
 | 0019 | build with the RM backend only: `with_nouveau_drm` (false on Windows) drops the nouveau winsys and `nvkmd/nouveau`; chipset limits in `nouveau_device_limits.[ch]`; the DRM side in `nvkmd_rm_drm.c` (Linux only, stubs otherwise); `VK_EXT_physical_device_drm` and syncobj copies Linux only; empty `<sys/ioccom.h>`; `vulkan_nouveau.dll` with `vulkan_api.def` exports |
@@ -218,6 +219,8 @@ Each patch builds on its own.
 | 0060 | the composed present waits for its copy at acquire, not at present |
 | 0061 | Mesa honours `MESA_LOG_FILE` on Windows; composed acquire/present failures go to `helios-wsi-<pid>.log` |
 | 0062 | `helios_icd_interface` v8, `ecl_fence_create_v3`: the RM fence and copy-engine record of a composed D3D11 present, for a value reserved on an ECL timeline that the submission thread signals after the frame's work, so the presenting thread does not wait for DXVK to submit the frame |
+| 0064 | CUDA cubins parsed without libelf: `nv_cubin_elf.c`, an in-tree ELF64 reader under nv_cubin's interface (replaces 0016's stub that refused every module); bounds-checked, keeps its own copy of the image; `tests/nv_cubin_elf_test.c` (meson test `nv_cubin_elf`) compares it with libelf's `nv_cubin.c` on synthetic and real cubins (see [docs/dlss.md](docs/dlss.md)) |
+| 0065 | `NVK_DLSS=1/0`, else `HKLM\SOFTWARE\Helios` `Dlss` (DWORD), adds or removes `dlss` in `NVK_EXPERIMENTAL` (VK_NVX_binary_import); default off |
 
 ## `patches-windows-dxvk/`
 
