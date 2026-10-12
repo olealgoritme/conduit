@@ -550,8 +550,12 @@ jobs:
           name=$(basename "$zip")
           version=${name#conduit-windows-gpu-driver-}
           version=${version%.zip}
-          pkg=$(ls setup/helios-windows-x64-*.zip | grep -v -- '-symbols\.zip$')
-          [ "$(echo "$pkg" | wc -l)" = 1 ] || { echo "::error::expected one setup package, got: $pkg"; exit 1; }
+          pkgs=()
+          for f in setup/helios-windows-x64-*.zip; do
+            case "$f" in *-symbols.zip) ;; *) pkgs+=("$f") ;; esac
+          done
+          [ "${#pkgs[@]}" = 1 ] || { echo "::error::expected one setup package, got: ${pkgs[*]}"; exit 1; }
+          pkg=${pkgs[0]}
           setup="conduit-windows-gpu-setup-$version.zip"
           cp "$pkg" "zip/$setup"
           (cd zip && sha256sum "$name" "$setup") > SHA256SUMS-windows
