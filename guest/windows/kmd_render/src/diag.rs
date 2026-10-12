@@ -1277,8 +1277,9 @@ pub mod knobs {
     /// old path runs, when the importer's file is gone, the layout is unusable, the host lacks
     /// the import, or `KmdRmClient` is 3 or 4. Read once per transport generation.
     pub const FOREIGN_FLIP: KnobName = KnobName::new(b"ForeignFlip");
-    /// `FfAsyncWin` (default 0 = off: every `ForeignFlip` host flip is a synchronous round trip
-    /// on the HPD worker, as it always was). 1 to 4 (larger is 4), only with `ForeignFlip` on:
+    /// `FfAsyncWin` (default 2 while `FlipAnnounce` is on, which is its default; 0 without it;
+    /// 0 = every `ForeignFlip` host flip is a synchronous round trip on the HPD worker).
+    /// 1 to 4 (larger is 4), only with `ForeignFlip` on:
     /// the host `ScanoutFlip` is SUBMITTED on the control queue without waiting for its reply,
     /// with at most this many in flight; the worker settles the answers when the used-ring drain
     /// wakes it, so programming never waits for the host. Also lets the `SetVidPnSourceAddress`
@@ -1389,8 +1390,9 @@ pub mod knobs {
     pub const BAR_SEG_FLAGS: KnobName = KnobName::new(b"BarSegFlags");
     /// BAR descriptor `BaseAddress` in MiB (default 0).
     pub const BAR_SEG_BASE_MB: KnobName = KnobName::new(b"BarSegBaseMB");
-    /// Reported device-memory capacity in MiB. 0 (default) preserves the proven
-    /// one-GiB capacity of the existing aperture+BAR topology.
+    /// Reported device-memory capacity in MiB. Absent (default): sized from the virtio
+    /// host-visible region at StartDevice (`adapter::VIDMM_VRAM_MB_AUTO`). 0: the legacy
+    /// one-GiB capacity of the aperture+BAR topology.
     pub const VIDMM_VRAM_MB: KnobName = KnobName::new(b"VidMmVramMB");
     /// `DXGK_FLIPCAPS` extra bits (default 0 = the driver's own word, `FlipOnVSyncMmIo`).
     /// A raw `DXGK_FLIPCAPS` bit mask OR'd into it: only bit 4 `FlipIndependent` (0x10), bit 5

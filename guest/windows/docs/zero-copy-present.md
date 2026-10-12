@@ -1153,7 +1153,7 @@ full zero block once per generation even if nothing is ever seen.
 |---|---|---|---|
 | `DiagLevel` | StartDevice (`diag::reread_level`), lazily before | static | `DiagLvl` (new) |
 | `StopFlush` | each StopDevice | not cached | none (behaviour only) |
-| `NvSpinUs` | StartDevice (`ctrl::reread_spin_knob`), lazily before | static (was: once per driver load) | `NvSpinUs` (new) |
+| `NvSpinUs` | StartDevice (`ctrl::reread_spin_knob`), lazily before | static (was: once per driver load) | `NvSpinUsEff` |
 | `NvDupHarden` | StartDevice (`nvrm_harden::reread_mode`), lazily before | static (was: once per driver load) | `NvDupMode` (now on every read) |
 | `AllocCached`, `BindFlushMode`, `DispatchBind`, `PresentProbe`, `ForeignCopy`, `DisplayHalf`, `DirectFlipCaps`, `CrossAdaptCaps`, `BarSegFlags`, `BarSegBaseMB`, `BarSegMode`, `VidMmVramMB`, `SubSpaceWake` | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `AlcC`, `BndFM`, `DspBnd`, `PBPrEn`, `FcKnob`, `DspH`, `BarF`, `BarB`, `BarM` (written at every start); the others none |
 | `DmaGpuFence`, `PresentWmk`, `WddmHoldMs`, `WddmHeadMs` | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` fields / statics | `DmaGfEff`, `PrWmkEff`, `WdHoldEff`, `WdHeadEff` (new) |

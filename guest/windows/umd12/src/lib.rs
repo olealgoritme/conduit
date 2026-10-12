@@ -50,7 +50,7 @@
 //! | **S3** | `build.rs` + bindgen of `d3d12umddi.h` with `layout_tests(true)` + `ddi12.rs`. The layout assertions ARE the deliverable: if it compiles, the ABI is machine-checked. **DONE.** |
 //! | **S4** | `vkd3d_bridge.{h,cpp}` + `bridge12.rs` — `helios_vkd3d_create_device` and the root-signature serializer, reached by a `tools/` probe. **DONE.** |
 //! | **S4b** | The ICD anchor (`helios_icd_anchor_v1`) — one venus ICD module per process. **DONE.** |
-//! | **S5** | INF + slot 3; `umd` **drops** its `OpenAdapter12` export and this one becomes reachable — **all in one commit** — with the `UmdD3D12` kill switch, originally default OFF. |
+//! | **S5** | INF + slot 3; `umd` **drops** its `OpenAdapter12` export and this one becomes reachable — **all in one commit** — with the `UmdD3D12` kill switch (default on; 0 turns D3D12 off). |
 //! | **S6-0** | All 214 device/command-list/queue slots stubbed with counting noops, plus one `install_<lane>()` per lane, so every lane is *substitutive* rather than *additive* (`PARALLEL.md` §3). |
 //! | **S6** | The DDI surface in `forward12/*` across 11 lanes: caps first (H4), then queue, PSO, descriptors, resources, recording, present. |
 //!

@@ -337,7 +337,7 @@ impl AdapterKnobs {
         use crate::diag::{knobs, read_config_dword};
         use helios_kmd_logic::independent_flip as idf;
         // `IndepFlip` ORs its caps into what `DirectFlipCaps` and `FlipCapsX` ask for. Absent, it is
-        // `KNOB_DEFAULT` (0, off); then both are exactly the raw values.
+        // `KNOB_DEFAULT` (1, on); with 0 both are exactly the raw values.
         let indep_flip = read_config_dword(knobs::INDEP_FLIP, idf::KNOB_DEFAULT);
         let advertised = idf::advertise(
             idf::Mode::from_knob(indep_flip),
