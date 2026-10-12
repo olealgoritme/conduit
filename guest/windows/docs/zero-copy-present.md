@@ -652,7 +652,7 @@ in the 38th session inflated the memory requirements of ordinary shared OPTIMAL 
 refusals, DWM failures, Xid 31). So the `CreateDevice` ladder gained a tier 0 (export trio + the one extension,
 no format list) that is tried first **only** when all three hold:
 
-* the `ForeignCopy` knob is 1 (default 0: OFF, see below);
+* the `ForeignCopy` knob is 1 (the default, see below);
 * the adapter is the display half;
 * the host serves `IMPORT_RM` (config features `NVGPU_CFG_RM_IMPORT` and `NVGPU_CFG_VENUS`): otherwise no
   foreign resource can exist and the extension would only add the risk.
@@ -664,7 +664,7 @@ use (`FcNoExt`). `SdgDevX` = 0 now means tier 0.
 
 ### 11.4 Knob and counters
 
-`ForeignCopy` (REG_DWORD in the service key, default 0 = OFF, read like every knob at AddAdapter/StartDevice;
+`ForeignCopy` (REG_DWORD in the service key, default 1 = on (`shipping_defaults.rs`), read like every knob at AddAdapter/StartDevice;
 the device tier is chosen at device creation, so a change needs a device restart): 0 restores the
 previous device and makes a foreign source take the ordinary OPTIMAL import (which the host refuses), for a
 same-boot bisect. `FcKnob` mirrors it.
@@ -2797,7 +2797,7 @@ unverified here (24.8).
 
 ### 24.3 Design
 
-`BltAsync` (default 0): for a foreign source into a standard buffer, `DxgkDdiPresent` never waits for the copy. The route is
+`BltAsync` (default 1, `shipping_defaults.rs`): for a foreign source into a standard buffer, `DxgkDdiPresent` never waits for the copy. The route is
 `helios_kmd_logic::blt_async::decide`:
 
 | situation | route |
