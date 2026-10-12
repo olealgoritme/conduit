@@ -68,7 +68,8 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_MME_PACK_INSTR`, `NVK_SKIP_DRAWID`, `NVK_BLACKWELL_MME_MEMBAR` | 0, 0, 1 | MME/indirect-draw A/B levers (common 26, 29) |
 | **Memory** | | |
 | `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N MiB caps it (common 30) |
-| `NVK_RM_DESC_TABLE_VRAM`, `NVK_RM_UPLOAD_VRAM` | 0 | descriptor tables/pools and command upload memory in the BAR heap (needs `NVK_RM_BAR_MB`) (common 26, 27) |
+| `NVK_RM_DESC_TABLE_VRAM` | 0 | descriptor tables/pools in CPU-mapped VRAM (common 26, 52) |
+| `NVK_RM_UPLOAD_VRAM` | compute | command buffer upload memory in CPU-mapped VRAM: `compute` the compute root descriptor tables, `1` all of it, `0` none (common 26, 52) |
 | `NVK_RM_SYSMEM_CACHED` | 1 | host-visible system memory GPU-cacheable in L2 (`=0` off, `=desc`/`=app` one kind only) |
 | `NVK_RM_COMPRESSION` | 1 | compressible VRAM for images in dedicated allocations on GB20x |
 | `NVK_RM_COMPRESS_ALL`, `_ZS`, `_TYPE` | 0 | compression outside dedicated allocations, for depth/stencil, and as a memory type (see "Compression") |
@@ -274,6 +275,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0049 | RM: system memory allocations up to 512 KiB (not shared, not tiled, not RM-named) are ranges of 4 MiB pinned slabs, one OS-descriptor registration each (the KMD allows 256 per process; native Vulkan engines make thousands of small objects); reused ranges are zeroed; `NVK_RM_SYSMEM_SLABS=0` turns it off. vkCreateDescriptorPool's error path does not finish an uninitialized heap. `tests/vk_many_small_allocs.c` checks it |
 | 0050 | RM: separate depth and stencil images (Blackwell's D24S8 and D32S8X24 planes) are compressed by default; `NVK_RM_COMPRESS_ZS=0` turns it off. An image whose separate stencil usage asks for host transfer is not compressed |
 | 0051 | every failed shader and pipeline compile (spirv_to_nir, vkCreateGraphicsPipelines, vkCreateComputePipelines) is one line with the stage, a SPIR-V hash, the VkResult and the module's capabilities and extensions: on Windows appended to `C:\ProgramData\Helios\shader-failures.log` (the ledger the UMDs share) with the SPIR-V saved under `C:\ProgramData\Helios\spirv-failures\`, elsewhere `mesa_logw` |
+| 0052 | RM: a compute dispatch's root descriptor table (`NVKMD_MEM_GPU_LATENCY`, its own upload stream) is CPU-mapped VRAM, `NVK_RM_UPLOAD_VRAM=compute` (default; `1` all upload memory, `0` none); NVK's own CPU-mapped VRAM has a 256 MiB budget of its own and no longer needs the application's BAR heap |
 
 ## Per-draw cost (common 0001-0007)
 
@@ -790,9 +792,12 @@ the PCIe reads of GPU-cacheable system memory.
 - Only that type lands in the BAR: `nvkmd_info::host_visible_vram_is_pinned`
   makes NVK ask for `NVKMD_MEM_VRAM` for it, while NVK's own
   `LOCAL | CAN_MAP` buffers (push, queries, events, upload) stay in system
-  memory, where the CPU also reads them fast, unless `NVK_RM_UPLOAD_VRAM` /
-  `NVK_RM_DESC_TABLE_VRAM` (default 0) move upload memory and descriptor
-  tables into the heap.
+  memory, where the CPU also reads them fast. The exceptions are NVK's own
+  CPU-mapped VRAM, outside the heap with a 256 MiB budget of its own: the
+  compute root descriptor tables (`NVK_RM_UPLOAD_VRAM=compute`, the
+  default: a dispatch waits for its table, and from system memory each
+  dependent dispatch costs several us more), all upload memory with
+  `NVK_RM_UPLOAD_VRAM=1`, descriptor tables with `NVK_RM_DESC_TABLE_VRAM=1`.
 - Host-visible system memory (`NVK_RM_SYSMEM_CACHED`, default on) is mapped
   GPU-cacheable (`NVOS46_FLAGS_GPU_CACHEABLE_YES`) and every submit starts
   with an L2 sysmem invalidate after its semaphore waits; rings, semaphores,
