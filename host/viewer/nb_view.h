@@ -185,9 +185,12 @@ struct nb_vstore {
     bool              ruled;
     unsigned          rule_w, rule_h;
     struct nb_view    base;
-    /* base was taken when the guest arrived at its current mode (so a rule
-     * remembered after editing there comes back to what was before). */
+    /* base (the default for modes without a rule) is known: taken from
+     * cur when the first guest mode arrives, so the file's settings and any
+     * command-line overrides are the default. */
     bool              base_set;
+    /* The guest mode the picture is shown at now, 0x0 before the first. */
+    unsigned          mode_w, mode_h;
 };
 
 void nb_vstore_init(struct nb_vstore *st);
@@ -213,6 +216,19 @@ void nb_vstore_rule_delete(struct nb_vstore *st, int i);
  */
 unsigned nb_vstore_guest_mode(struct nb_vstore *st, unsigned w, unsigned h,
                               char *label, size_t n);
+
+/*
+ * AUTOMATIC PER-MODE RULES.  Call after any change of cur's layout (scale,
+ * area, custom area, filter): the layout is remembered for the guest mode in
+ * force (mode_w x mode_h), or that mode's rule is dropped when the layout is
+ * the default again.  The oldest rule makes room when the table is full.
+ * Returns true when the store changed (persist it).  Before the first guest
+ * mode nothing is stored: cur then becomes the default.
+ */
+bool nb_vstore_auto_rule(struct nb_vstore *st);
+/* cur's layout becomes the default for every mode without a rule; the
+ * current mode's own rule goes. */
+void nb_vstore_make_default(struct nb_vstore *st);
 
 /* Remember a custom resolution (not a preset) at the front of `recent`. */
 void nb_vstore_note_res(struct nb_vstore *st, unsigned w, unsigned h);

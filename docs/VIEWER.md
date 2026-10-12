@@ -72,6 +72,10 @@ that fades in when the pointer touches the window's top edge. The menu has:
   area has a green outline. Drag its edges or corners to resize it, or drag
   inside it to move it, with a live preview. It snaps to the window's centre.
 - **Scaling** and **Filter**.
+- **Remembered modes**: which settings apply at the guest's current mode
+  (its own, or the default), every mode that has its own (click one to
+  forget it), and **Make it the default**, which makes the current mode's
+  settings the default for every mode without its own.
 - **Profiles**: save the current setup under a name (for example
   "CS2 4:3 stretched"), click one to load it, `x` to delete it.
   Ctrl+Alt+P cycles through them.
@@ -85,6 +89,27 @@ that fades in when the pointer touches the window's top edge. The menu has:
 While the menu is open, keyboard and pointer go to the menu and the area
 editor, never to the guest. Keys the guest held are released when it opens,
 and a mouse grab is dropped. `Esc` or `Ctrl+Alt+M` closes it.
+
+## Settings per guest mode
+
+Picture area, scaling and filter are remembered per guest mode, without a
+button. Whatever you change while the guest runs at 1600x900 (a menu click,
+`Ctrl+Alt+S`, `Ctrl+Alt+A`, dragging the area) applies whenever the guest is
+at 1600x900 again; the desktop at 5120x1440 keeps its own. A mode you never
+changed anything in uses the default: the top-level settings of the file
+(the ones `--scale`, `--area` and `--filter` set), Fit in the full window
+unless you changed it. Setting a mode back to the default's values drops its
+own settings, `Ctrl+Alt+0` forgets the current mode's settings (in a mode
+without its own it resets the default to Fit, full window), and **Make it
+the default** in the menu turns the current mode's settings into the default.
+
+The settings of the new mode are applied before its first frame is placed,
+so no frame is shown with the previous mode's scaling. The viewer shows
+`1600x900: Stretch 21:9 (remembered)` (or `... (default)` when it falls
+back) as a notice, and logs `guest mode WxH: first frame ...` with the
+placement it used. A profile with a fixed guest resolution stores its
+picture settings for that mode, so they apply when the guest gets there.
+At most 16 modes keep their own settings; the oldest goes first.
 
 ## Saved per VM
 
@@ -102,7 +127,11 @@ area=4:3
 res=1280x960
 recent=1720x1080
 profile=CS2 4:3 stretched|scale=stretch filter=linear area=4:3 res=1280x960
+rule=1600x900|scale=stretch filter=linear area=21:9 res=native
 ```
+
+The top-level `scale`, `filter` and `area` are the default; each `rule=WxH|`
+line is one mode's own settings.
 
 ## The mouse
 
