@@ -29,8 +29,8 @@ Classes:
 |---|---:|---:|---:|---:|---:|---:|
 | KMD: service key | 7 | 26 | 26 | 28 | 12 | 99 |
 | UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 17 | 15 | 25 | 8 | 0 | 65 |
-| Environment variables | 8 | 18 | 86 | 24 | 0 | 136 |
-| All | 32 | 59 | 137 | 60 | 12 | 300 |
+| Environment variables | 8 | 18 | 87 | 24 | 0 | 137 |
+| All | 32 | 59 | 138 | 60 | 12 | 301 |
 
 ## What the installation writes
 
@@ -313,7 +313,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `NVK_UBO_DESC_CBUF` | `false` / `true` (differs by read site); 0 on Windows, 1 elsewhere | physical device creation | 1 promotes uniform buffer descriptors to bound constant buffers as upstream NVK does; 0 keeps them as descriptors. | [0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch:88](../guest/nvk-rm/patches-windows/0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch#L88), [0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch:90](../guest/nvk-rm/patches-windows/0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch#L90) |
 | `NVK_ZERO_PAGE_VRAM` | `true` | device creation | 1 places the zero page that null descriptors and buffers read in VRAM; 0 keeps it in system memory. | [0041-nvk-null-vertex-buffers-and-the-zero-page-in-VRAM.patch:94](../guest/nvk-rm/patches-common/0041-nvk-null-vertex-buffers-and-the-zero-page-in-VRAM.patch#L94) |
 
-### Debug / diagnostic (86)
+### Debug / diagnostic (87)
 
 | Name | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|
@@ -321,6 +321,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `HELIOS_DIRECT_FLIP_SUPPORT` | `unset` | once per process | Overrides HKLM\SOFTWARE\Helios DirectFlipSupport for this process (same values: what the CheckDirectFlipSupport DDI answers). | [knobs.rs:648](../guest/windows/umd/src/knobs.rs#L648) |
 | `HELIOS_DISABLE_INTERNAL_SEM_FEEDBACK` | `false` | timeline semaphore creation (Venus ICD) | True disables Venus' feedback slots for internal (non-external) timeline semaphores, so their values are read from the host instead. A bisect switch. | [vn_queue.c:3365](../guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c#L3365) |
 | `HELIOS_DXGI_NO_REDIRECTION` | `unset` | every CreateDevice | When set (any value), the D3D11 UMD's CreateDevice returns DXGI_STATUS_NO_REDIRECTION, making DXGI fall back to its desktop path. A diagnostic. | [adapter.rs:634](../guest/windows/umd/src/adapter.rs#L634) |
+| `HELIOS_DXVK_EVENT_TRACE` | `unset` | once per process | 1: every D3D11 event-query wait on the immediate context is timed at End, CS recording, submission and the first GetData that returns S_OK; the process log gets the mean of each stage every two seconds. Unset: no clock reads. | [0023-helios-event-query-latency-trace.patch:113](../guest/windows/third_party/patches/dxvk/0023-helios-event-query-latency-trace.patch#L113) |
 | `HELIOS_ESCAPE_HW` | `unset` | once per process (Venus ICD) | A value other than 0 makes every Venus escape to the KMD request dxgkrnl's exclusive adapter lock (HardwareAccess=1). Unset: escapes run without it. A kill switch; it re-arms a known deadlock class. | [vn_renderer_helios.c:1493](../guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c#L1493) |
 | `HELIOS_ESCAPE_NO_ADAPTER_SYNC` | `unset` | once per process (Venus ICD) | A value other than 0 drops dxgkrnl adapter synchronization from Venus escapes that would otherwise request it. Unset: the built-in choice per escape. | [vn_renderer_helios.c:1421](../guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c#L1421) |
 | `HELIOS_FENCE_INTERNAL_TIMELINE_LIMIT` | `8` | per probed submission (Venus ICD) | With HELIOS_FENCE_INTERNAL_TIMELINE_SUBMITS on, how many submissions get the probe fence (at least 1). | [vn_queue.c:1517](../guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c#L1517) |
