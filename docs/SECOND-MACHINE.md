@@ -145,7 +145,7 @@ process back on Venus.
   back while they are found. Per-generation details, known gaps and the test
   order: [GPU-SUPPORT.md](GPU-SUPPORT.md).
 - The open items on the reference machine apply too
-  ([NVK-ROADMAP.md](NVK-ROADMAP.md) "Where it stands"): the windowed blt
+  ([NVK-ROADMAP.md](NVK-ROADMAP.md#where-it-stands)): the windowed Present
   path, recovery after `pnputil /restart-device`, Unigine Heaven x86 OpenGL
   renders a white scene.
 - Other limits: [KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests).

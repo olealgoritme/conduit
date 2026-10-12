@@ -1,12 +1,10 @@
 # MSI-X interrupts for the Helios KMD
 
-Status: implemented and shipped OFF. This package's INF writes `MSISupported=0` (INTx, as
-before); MSI-X is an opt-in (`MsiMode=2`, "Minimum safe test procedure") until one hardware run
-passes, and then the default is flipped by changing one INF line ("The flip plan"). The INTx
-fallback, the boot-loop breaker, the polling safety net and the per-vector counters are in the
-package either way. NOT verified on hardware: the KMD could not be compiled or run where this was
-written; everything marked "verify" is a claim that only a boot can confirm. The recovery path
-if a start does not come up is in "Recovery".
+Status: implemented and on by default: `MsiMode` defaults to 2 (`kmd_logic/src/shipping_defaults.rs`),
+so the driver asks PnP for MSI-X although the INF still writes `MSISupported=0`; the breaker and the
+delivery latch put INTx back on a failure; `MsiMode` 1 forces INTx. The INTx fallback, the boot-loop
+breaker, the polling safety net and the per-vector counters are in the package. The sections below
+are the design and test record. The recovery path if a start does not come up is in "Recovery".
 
 ## Why
 
