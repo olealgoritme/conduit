@@ -144,12 +144,24 @@ pub const REQUIRES: &[(u64, &str, &str)] = &[
     (0x4, "UAVS_AT_EVERY_STAGE", "feature level 11_1"),
     (0x8, "64_UAVS", "feature level 11_1"),
     (0x10, "MINIMUM_PRECISION", ""),
-    (0x20, "11_1_DOUBLE_EXTENSIONS", "D3D11DDICAPS_SHADER_DOUBLES + 11.1 DDI"),
+    (
+        0x20,
+        "11_1_DOUBLE_EXTENSIONS",
+        "D3D11DDICAPS_SHADER_DOUBLES + 11.1 DDI",
+    ),
     (0x40, "11_1_SHADER_EXTENSIONS", "11.1 DDI (SAD4)"),
     (0x80, "LEVEL_9_COMPARISON_FILTERING", ""),
     (0x100, "TILED_RESOURCES", "D3D11_OPTIONS1 tiled tier 1+"),
-    (0x200, "STENCIL_REF", "D3D11DDICAPS_SHADER_SPECIFIED_STENCIL_REF (WDDM 2.0+ DDI)"),
-    (0x400, "INNER_COVERAGE", "D3D11_OPTIONS2 conservative tier 3 (WDDM 2.0+ DDI)"),
+    (
+        0x200,
+        "STENCIL_REF",
+        "D3D11DDICAPS_SHADER_SPECIFIED_STENCIL_REF (WDDM 2.0+ DDI)",
+    ),
+    (
+        0x400,
+        "INNER_COVERAGE",
+        "D3D11_OPTIONS2 conservative tier 3 (WDDM 2.0+ DDI)",
+    ),
     (
         0x800,
         "TYPED_UAV_LOAD_ADDITIONAL_FORMATS",
@@ -171,7 +183,11 @@ pub const REQUIRES: &[(u64, &str, &str)] = &[
     (0x200000, "SAMPLER_FEEDBACK", ""),
     (0x400000, "ATOMIC_INT64_ON_TYPED_RESOURCE", ""),
     (0x800000, "ATOMIC_INT64_ON_GROUP_SHARED", ""),
-    (0x1000000, "DERIVATIVES_IN_MESH_AND_AMPLIFICATION_SHADERS", ""),
+    (
+        0x1000000,
+        "DERIVATIVES_IN_MESH_AND_AMPLIFICATION_SHADERS",
+        "",
+    ),
     (0x2000000, "RESOURCE_DESCRIPTOR_HEAP_INDEXING", ""),
     (0x4000000, "SAMPLER_DESCRIPTOR_HEAP_INDEXING", ""),
     (0x8000000, "WAVE_MMA", ""),
@@ -252,7 +268,10 @@ pub fn format_failure(api: &str, stage: &str, code: &[u8], reason: &str, total: 
             (v >> 4) & 0xf,
             v & 0xf,
         ),
-        _ => format!("{api} {stage} hash=? len={} reason={reason} n={total}", code.len()),
+        _ => format!(
+            "{api} {stage} hash=? len={} reason={reason} n={total}",
+            code.len()
+        ),
     }
 }
 
@@ -265,15 +284,6 @@ pub fn record_failure(api: &str, stage: &str, code: &[u8], reason: &str) -> Stri
         ledger_append(&line);
     }
     line
-}
-
-/// Append a non-shader line (a caps mismatch that predicts refusals) to the
-/// ledger. Not counted in [`failure_count`]; bounded like failures.
-pub fn ledger_note(line: &str) {
-    static NOTES: AtomicUsize = AtomicUsize::new(0);
-    if NOTES.fetch_add(1, Ordering::Relaxed) < LEDGER_LINES_PER_PROCESS {
-        ledger_append(line);
-    }
 }
 
 #[cfg(windows)]
@@ -291,7 +301,11 @@ fn ledger_append(line: &str) {
     // One write per line with append semantics: lines from processes that
     // fail at the same moment do not interleave mid-line.
     let path = std::path::Path::new(r"C:\ProgramData\Helios\shader-failures.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = f.write_all(text.as_bytes());
     }
 }
@@ -335,7 +349,10 @@ mod tests {
         assert_eq!(info.stage, Some(Stage::Compute));
         assert_eq!((info.major, info.minor), (5, 0));
         assert_eq!(info.hash_hex(), "ab".repeat(16));
-        assert_eq!(requires_names(info.requires), "TYPED_UAV_LOAD_ADDITIONAL_FORMATS");
+        assert_eq!(
+            requires_names(info.requires),
+            "TYPED_UAV_LOAD_ADDITIONAL_FORMATS"
+        );
         assert_eq!(
             required_caps(info.requires),
             vec!["D3D11DDICAPS_SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS (WDDM 2.0+ DDI)"]
@@ -355,7 +372,10 @@ mod tests {
     #[test]
     fn names_unknown_bits() {
         assert_eq!(requires_names(0), "-");
-        assert_eq!(requires_names(0x1 | 0x2000), "DOUBLES|VIEWPORT_AND_RT_ARRAY_INDEX_FROM_ANY_SHADER_FEEDING_RASTERIZER");
+        assert_eq!(
+            requires_names(0x1 | 0x2000),
+            "DOUBLES|VIEWPORT_AND_RT_ARRAY_INDEX_FROM_ANY_SHADER_FEEDING_RASTERIZER"
+        );
         assert_eq!(requires_names(1 << 40), "0x10000000000");
     }
 
@@ -363,12 +383,24 @@ mod tests {
     fn formats_a_ledger_line() {
         let b = container(0x1000, 0x0000_0050);
         let line = format_failure("d3d11", "ps", &b, "engine", 3);
-        assert_eq!(line, format!("d3d11 ps hash={} sm=5.0 requires=ROVS reason=engine n=3", "ab".repeat(16)));
+        assert_eq!(
+            line,
+            format!(
+                "d3d11 ps hash={} sm=5.0 requires=ROVS reason=engine n=3",
+                "ab".repeat(16)
+            )
+        );
         assert!(format_failure("d3d11", "vs", &[1, 2, 3], "x", 1).contains("hash=? len=3"));
         // A raw cs_5_0 token stream, as the D3D11 DDI passes it.
         let mut tokens = 0x0005_0050u32.to_le_bytes().to_vec();
         tokens.extend_from_slice(&2u32.to_le_bytes());
         let line = format_failure("d3d11", "cs", &tokens, "engine", 1);
-        assert_eq!(line, format!("d3d11 cs tokens={:016x} len=8 sm=5.0 reason=engine n=1", fnv1a64(&tokens)));
+        assert_eq!(
+            line,
+            format!(
+                "d3d11 cs tokens={:016x} len=8 sm=5.0 reason=engine n=1",
+                fnv1a64(&tokens)
+            )
+        );
     }
 }

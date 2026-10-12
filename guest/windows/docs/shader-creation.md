@@ -32,8 +32,9 @@ one of those features: Counter-Strike 2's `bloom_cs`, `fxaa_cs`,
 UAV loads.
 
 Each created device compares the advertised caps with what its engine (DXVK's
-`CheckFeatureSupport`) backs and logs `CreateDevice: shader caps ...`; any
-difference is also a `d3d11-caps` line in the ledger below.
+`CheckFeatureSupport`) backs and logs `CreateDevice: shader caps ...` and one
+`caps mismatch` line per difference in the UMD log. dwm.exe (WDDM 1.3 on
+purpose) logs the typed-UAV-load and OPTIONS3 differences as expected.
 
 ## 2. The engine and the Vulkan driver: the ledger
 

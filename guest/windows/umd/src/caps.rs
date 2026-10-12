@@ -358,10 +358,12 @@ pub(crate) fn engine_caps_mismatches(advertised: EngineShaderCaps, engine: Engin
 }
 
 /// Compare the adapter caps with the engine of a freshly created device and
-/// log every difference (`engine_caps_mismatches`), each also as a
-/// `d3d11-caps` line in the shader-failure ledger: a hidden cap predicts
-/// runtime refusals no DDI call will ever show. Once per device; not on a hot
-/// path.
+/// log every difference (`engine_caps_mismatches`) in the UMD log: a hidden
+/// cap predicts runtime refusals no DDI call will ever show. Not a ledger line:
+/// the shader-failure ledger records only shaders and pipelines that actually
+/// failed, and dwm.exe stays on WDDM 1.3 on purpose (`UmdDdiLevelDwm`), where
+/// the WDDM 2.0+ caps are expected to read as hidden. Once per device; not on a
+/// hot path.
 pub(crate) fn audit_engine_caps(device: &windows::Win32::Graphics::Direct3D11::ID3D11Device, wddm2: bool) -> usize {
     use windows::Win32::Graphics::Direct3D11::*;
     fn get<T: Default>(device: &ID3D11Device, f: D3D11_FEATURE) -> Option<T> {
@@ -406,7 +408,6 @@ pub(crate) fn audit_engine_caps(device: &windows::Win32::Graphics::Direct3D11::I
     );
     for l in &lines {
         log_error!("  CreateDevice: caps mismatch: {l}");
-        helios_umd_common::shader_diag::ledger_note(&format!("d3d11-caps {l}"));
     }
     lines.len()
 }
