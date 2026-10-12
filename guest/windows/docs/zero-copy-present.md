@@ -1474,16 +1474,17 @@ Which counters support which: 1 `PwrN`/`PwrUid` (child D3), `InitStg`, `StVio`; 
 
 ### 15.4 The hotfix (v327): the v326 behaviour changes behind knobs that default to v325
 
-All read at every StartDevice from the service key (DWORD), mirrored with the value in force:
+All read at every StartDevice from the service key (DWORD), mirrored with the value in force. The defaults in force
+(`VsPowerMode` 1 and `VsWatchdog` 1, the v326 behaviour) are generated into [WINDOWS-KNOBS.md](../../../docs/WINDOWS-KNOBS.md):
 
 | knob | default | meaning | mirror |
 | --- | --- | --- | --- |
-| `VsPowerMode` | 0 | 0 = v325: ANY non-D0 `DxgkDdiSetPowerState` of ANY uid quiesces the heartbeat; 1 = v326: adapter only | `VsPwrEff` |
-| `VsWatchdog` | 0 | 0 = off (v325); 1 = revive an armed-but-silent heartbeat; 2 = also re-arm a quiesced one while the adapter is in D0 (v326) | `VsWdgEff` |
+| `VsPowerMode` | 1 | 0 = v325: ANY non-D0 `DxgkDdiSetPowerState` of ANY uid quiesces the heartbeat; 1 = v326: adapter only | `VsPwrEff` |
+| `VsWatchdog` | 1 | 0 = off (v325); 1 = revive an armed-but-silent heartbeat; 2 = also re-arm a quiesced one while the adapter is in D0 (v326) | `VsWdgEff` |
 | `VsIdleWake` | 0 | 1 = the worker wakes 4 times a second while the heartbeat is armed (v326); needs `VsWatchdog` above 0 | `VsIdlEff` |
 | `VsWdTimer` | 1 | 1 = the independent 250 ms watchdog timer (19.3) runs; 0 = off (KMD 328). Re-arms an ARMED silent heartbeat whatever `VsWatchdog` says; never resurrects a quiesced one | `VsWdTmEff` |
 
-With the defaults the vsync/power/wait behaviour is v325's: the HPD worker waits exactly as it did (infinite when nothing is
+With `VsPowerMode` 0, `VsWatchdog` 0 and `VsIdleWake` 0 the vsync/power/wait behaviour is v325's: the HPD worker waits exactly as it did (infinite when nothing is
 due), nothing arms the heartbeat but StartDevice and a D0 call, and a child's D3 stops it. Kept from v326 because they are
 not on the restart/mode-set path and not implicated: `FfRepeatMs` gating, the dump pacing, the stale held wake fix, the
 signal-by-cause counters, the coalesced windowed-Blt signal, the new counters. Statics: `VS_REF_AT` and `HpdN` /

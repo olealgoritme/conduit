@@ -22,13 +22,16 @@ fix/text-glyphs only adds a CPU fallback in `gdi_exec.rs`. 405.27 adds the DXVK 
 
 ### State of this VM that matters for the numbers
 
+These are the measured VM's values, set by hand; several differ from the code
+defaults, which [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md) lists.
+
 | setting | value | effect |
 |---|---|---|
 | backend `--latency` | **off** on the measured setup (`backend.latency off`), conduit-venus `--no-direct-fences` | All four round-trip options are off: `quiet-held`, `fused-submit`, `direct-fences`, `event-batch`. This brings back about 10,000 event-thread MSIs/s under a game (vs about 1,400 with `event-batch`) and adds about 25 µs to every Venus fence return *(doc)* |
 | `backend.cpus` | unset | Backend and venus threads float onto the vCPUs' cores *(doc: row D is −43 µs p50 per host round trip)* |
 | KMD interrupts | **MSI-X** (`MsiMode=2`, `MsiModeEff=2`, `MsiVec=2`, `MsiGrant=3`) | Set by hand in this VM. The INF default is still INTx (`MSISupported=0`) |
 | windowed copy | `RmCopyEngine=1` (KMD RM copy-engine channel, `CeChanUp=1`), `BltAsync=1`, `ForeignCopy=1`, `GuestBlob=0`, `CopyQueue=0`, `RedirVram=1` | The windowed copy can take the RM copy-engine route. The Venus ring-1 fallback stays on family 0 (graphics) |
-| flips | `ForeignFlip=1`, `FfAsyncWin=2`, `IndepFlip=0`, `DirectFlipSupport` absent (0) | Every app is DWM-composed |
+| flips | `ForeignFlip=1`, `FfAsyncWin=2`, `IndepFlip=0`, `DirectFlipSupport` absent (the code default) | Every app is DWM-composed |
 | GDI | `GdiAccel=1` | GDI jobs run on the HPD/GDI thread |
 | UMD | `Icd=venus` but `DwmIcd=nvk` (DWM marker, so everything follows NVK) | Venus is still loaded as the fallback ICD |
 

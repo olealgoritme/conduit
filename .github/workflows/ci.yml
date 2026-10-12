@@ -7,7 +7,8 @@
 #   stream        conduit-stream (network streaming): fmt, clippy, tests
 #   guest-agent   the guest clipboard agent's unit tests (Python, Xvfb)
 #   packaging     shellcheck the packaging scripts, check the venus submodule pins
-#                 in flake.nix and the RPM spec, build the DKMS source package
+#                 in flake.nix and the RPM spec, check that docs/WINDOWS-KNOBS.md
+#                 matches the code, build the DKMS source package
 #
 # Nothing here needs an NVIDIA GPU. Tests that open /dev/nvidiactl are skipped
 # by name (the --skip filters in the rust job); they run on the developer rig instead.
@@ -214,6 +215,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # build.sh derives the version from tags
+      - name: Windows knob reference
+        # docs/WINDOWS-KNOBS.md is generated from the code: fails when a knob in
+        # code has no description, a description names a knob that is gone, or
+        # the doc is stale (rerun guest/windows/tools/gen-windows-knobs.py).
+        run: python3 guest/windows/tools/gen-windows-knobs.py --check
       - name: actionlint
         # A pinned release, checked against its published SHA-256.
         env:
