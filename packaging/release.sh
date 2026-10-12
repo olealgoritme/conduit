@@ -56,13 +56,14 @@ git rev-parse -q --verify "refs/tags/v$new" >/dev/null && {
   echo "release: v$new already exists" >&2; exit 1; }
 
 echo "Releasing v$new (previous: ${last:-none})"
-if [ "$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)" != "$new" ]; then
-  for d in . host/backend host/vmm host/stream; do
+# Lock files are synced even when the manifests already carry $new (a bump
+# made by hand): CI and the release build run with --locked.
+for d in . host/backend host/vmm host/stream; do
+  [ "$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$d/Cargo.toml" | head -1)" = "$new" ] ||
     run sed -i "0,/^version *= *\".*\"/s//version = \"$new\"/" "$d/Cargo.toml"
-    (cd "$d" && run cargo update -q -w --offline 2>/dev/null || run cargo update -q -w)
-  done
-  run git commit -q -m "Release v$new" -- "${VERSIONED[@]}"
-fi
+  (cd "$d" && run cargo update -q -w --offline 2>/dev/null || run cargo update -q -w)
+done
+git diff --quiet -- "${VERSIONED[@]}" || run git commit -q -m "Release v$new" -- "${VERSIONED[@]}"
 run git tag -a "v$new" -m "Conduit v$new"
 run git push -q origin main "v$new"
 echo "Pushed v$new. Packages: https://github.com/olealgoritme/conduit/actions/workflows/release.yml"
