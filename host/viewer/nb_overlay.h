@@ -94,6 +94,8 @@ struct nb_ov_info {
     bool     guest_resize;      /* --resize=guest                           */
     bool     flip_known;
     bool     host_cursor;       /* the guest cursor is the host pointer     */
+    const char *path;           /* "DIRECT", "GPU COPY", "GPU SCALE"; NULL - */
+    const char *gpu;            /* the viewer's GPU (render node), NULL -   */
 };
 void nb_ov_size(unsigned scale, unsigned *w, unsigned *h);
 void nb_ov_paint(uint32_t *px, unsigned w, unsigned h, unsigned scale,

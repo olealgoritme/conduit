@@ -56,6 +56,7 @@
 #include "nb_gpuscale.h"
 #include "nb_pace.h"
 #include "nb_latch.h"
+#include "nb_blit.h"
 #include <sys/timerfd.h>
 
 #ifndef NB_HAVE_WAYLAND
@@ -180,6 +181,10 @@ struct nb_wl_buf {
     uint64_t  recv_ns;              /* virtio-nvgpu: when its ATTACH arrived  */
     int       fd;                   /* dup of the dma-buf for the fullscreen
                                      * scaler, -1 none (shm)                 */
+    /* COPY-ONLY: the compositor does not take this layout, so there is no
+     * wl_buffer (buf NULL) and every frame goes through the GPU pass
+     * (nb_blit.h). */
+    bool      copy;
 };
 
 /* Distinct pairs whose importability we remember.  Two occur in practice:
@@ -692,8 +697,22 @@ struct nb_wl {
     } gt[NB_GS_TARGETS];
     uint32_t        gt_w, gt_h;
     int             gt_last;
+    /* READ-BACK targets: the compositor takes no layout the scaler's GPU
+     * renders to, so each frame is read back into this shm (nb_gpuscale.h
+     * nb_gs_targets_readback).  gt_want_rb: the compositor refused the
+     * dma-buf targets, use read-back from the next allocation. */
+    bool            gt_rb, gt_want_rb;
+    void           *gt_shm;
+    size_t          gt_shm_sz;
     uint64_t        st_gs_sum, st_gs_max; unsigned st_gs_n, st_gs_drop;
     unsigned        st_held;        /* commits the gate held back       */
+    /* The GPU copy for layouts the compositor does not take (nb_blit.h):
+     * what the viewer's GPU said per pair, and frames copied this second. */
+#define NB_COPY_CACHE 8
+    struct { uint32_t fourcc; uint64_t mod; bool ok; } copy_v[NB_COPY_CACHE];
+    unsigned        copy_n;
+    unsigned        st_copy;
+    bool            copy_told;
 
     /* The guest's cursor, as the host pointer's image (CMD_CURSOR). */
     struct wl_surface  *gc_surf;
@@ -999,13 +1018,20 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
         uint32_t cp50, cp99, pi50, pi99;
         double pi_mean = 0, pi_sd = 0;
         unsigned i;
-        char gs[96] = "";
+        char gs[200] = "";
 
         if (w->st_gs_n || w->st_gs_drop) {
             snprintf(gs, sizeof(gs), " | gpu-scale %u frames, pass avg %.0fus "
-                     "max %lluus, %u dropped", w->st_gs_n,
+                     "max %lluus, %u dropped | path: %s on %s%s", w->st_gs_n,
                      w->st_gs_n ? (double)w->st_gs_sum / w->st_gs_n : 0.0,
-                     (unsigned long long)w->st_gs_max, w->st_gs_drop);
+                     (unsigned long long)w->st_gs_max, w->st_gs_drop,
+                     w->st_copy ? "GPU copy (the compositor does not take "
+                                  "the guest's format/modifier)"
+                                : "GPU pass (fullscreen scaler)",
+                     w->gs ? nb_gs_node(w->gs) : "?",
+                     w->gt_rb ? ", read back into shared memory" : "");
+        } else if (w->st_commits) {
+            snprintf(gs, sizeof(gs), " | path: direct attach");
         }
 
         for (i = 0; i < w->st_pi_k; i++) {
@@ -1054,6 +1080,7 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
     w->st_nudges = 0;
     w->st_gs_sum = w->st_gs_max = 0;
     w->st_gs_n = w->st_gs_drop = 0;
+    w->st_copy = 0;
     w->st_cp_k = w->st_pi_k = 0;
     w->st_t0 = now;
     w->st_commits = w->st_presented = w->st_discarded = w->st_zc = 0;
@@ -1193,6 +1220,63 @@ static bool wl_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
                nb_formats_has(&w->formats, fourcc, NB_DRM_FORMAT_MOD_INVALID);
     }
     return nb_formats_has(&w->formats, fourcc, mod);
+}
+
+/*
+ * ops->copy_ok: can the GPU pass show this pair although the compositor does
+ * not take it?  The scaler is opened on the first question (it dlopen()s
+ * EGL/GBM), on --render-node or the first render node that imports the pair;
+ * the verdict is cached per pair.
+ */
+static bool wl_copy_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
+{
+    struct nb_wl *w = s->priv;
+    char why[200] = "";
+    bool ok;
+
+    if (!nb_copy_allowed((nb_tier == NB_TIER_AUTO || nb_tier == NB_TIER_NATIVE)
+                             && !nb_linear_only,
+                         w->gs_mode != NB_GS_OFF, w->gs_dead,
+                         w->viewport != NULL, w->dmabuf != NULL)) {
+        return false;
+    }
+    for (unsigned i = 0; i < w->copy_n; i++) {
+        if (w->copy_v[i].fourcc == fourcc && w->copy_v[i].mod == mod) {
+            return w->copy_v[i].ok;
+        }
+    }
+    if (!w->gs) {
+        const char *node = w->cfg ? w->cfg->render_node : NULL;
+
+        w->gs = nb_gs_open(node, 0, fourcc, mod, why, sizeof(why));
+        if (!w->gs && node) {
+            /* The chosen GPU cannot import this layout: any GPU that can,
+             * rather than a black window. */
+            nb_err("viewer GPU: %s (--gpu / viewer.gpu); trying the others",
+                   why);
+            w->gs = nb_gs_open(NULL, 0, fourcc, mod, why, sizeof(why));
+        }
+        if (w->gs) {
+            nb_log("gpu-scale: ready on %s, GPU context priority %s "
+                   "requested, %s granted (CONDUIT_VIEWER_GPU_PRIORITY)",
+                   nb_gs_node(w->gs),
+                   nb_gs_prio_name(nb_gs_prio_requested(w->gs)),
+                   nb_gs_prio_name(nb_gs_prio_granted(w->gs)));
+        }
+    }
+    ok = w->gs && nb_gs_can_import(w->gs, fourcc, mod);
+    nb_log("GPU copy: %.4s modifier 0x%016llx %s", (const char *)&fourcc,
+           (unsigned long long)mod,
+           ok ? "is not taken by the compositor; the viewer's GPU pass "
+                "copies these frames into a buffer it does take"
+              : why[0] ? why : "cannot be imported by the viewer's GPU either");
+    if (w->copy_n < NB_COPY_CACHE) {
+        w->copy_v[w->copy_n].fourcc = fourcc;
+        w->copy_v[w->copy_n].mod = mod;
+        w->copy_v[w->copy_n].ok = ok;
+        w->copy_n++;
+    }
+    return ok;
 }
 
 /* ── ops: attach / commit ────────────────────────────────────────────────── */
@@ -1406,6 +1490,51 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
         wl_buffer_add_listener(sb, &buf_listener, &w->bufs[victim]);
         w->pending = victim;
         return 0;
+    }
+
+    /*
+     * DIRECT OR COPY (nb_blit.h).  A pair the compositor does not advertise,
+     * or advertised and then refused on import, is shown through the GPU
+     * pass when the viewer's GPU imports it: no wl_buffer is made of it.
+     */
+    {
+        bool adv = wl_format_ok(s, d->fourcc, d->modifier);
+        int ps0 = adv ? wl_pair_slot(w, d->fourcc, d->modifier, false) : -1;
+        int proven = ps0 >= 0 ? w->proven[ps0].state : 0;
+        enum nb_att how = nb_att_decide(adv, proven, false);
+
+        if (how != NB_ATT_DIRECT) {
+            how = nb_att_decide(adv, proven,
+                                wl_copy_ok(s, d->fourcc, d->modifier));
+        }
+        if (how == NB_ATT_REJECT) {
+            return -EINVAL;
+        }
+        if (how == NB_ATT_COPY) {
+            int fd2 = fcntl(d->fd, F_DUPFD_CLOEXEC, 3);
+
+            if (fd2 < 0) {
+                return -errno;
+            }
+            if (!w->copy_told) {
+                w->copy_told = true;
+                nb_log("picture: %.4s modifier 0x%016llx frames are copied by "
+                       "the GPU pass (the compositor %s this layout), in "
+                       "every window mode", (const char *)&d->fourcc,
+                       (unsigned long long)d->modifier,
+                       adv ? "refused" : "does not advertise");
+            }
+            wl_buf_evict(w, victim);
+            w->bufs[victim] = (struct nb_wl_buf){
+                .valid = true, .id = d->id, .buf = NULL, .copy = true,
+                .w = d->width, .h = d->height, .stride = d->stride,
+                .offset = d->offset, .fourcc = d->fourcc,
+                .modifier = d->modifier, .used = w->tick, .owner = w,
+                .seq = d->seq, .recv_ns = d->recv_ns, .fd = fd2,
+            };
+            w->pending = victim;
+            return 0;
+        }
     }
 
     /*
@@ -1736,9 +1865,16 @@ static void gt_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
         return;
     }
     t->failed = true;
-    nb_err("gpu-scale: the compositor refused the scaler's buffer; the "
-           "compositor scales the picture instead");
-    if (t->owner) {
+    if (t->owner && !t->owner->gt_want_rb) {
+        /* Not the end: the same pass, read back into shared memory, which
+         * every compositor takes. */
+        nb_err("gpu-scale: the compositor refused the scaler's dma-buf; "
+               "reading the pass back into shared memory instead");
+        t->owner->gt_want_rb = true;
+        t->owner->gt_w = 0;     /* reallocate at the next frame */
+    } else if (t->owner) {
+        nb_err("gpu-scale: the compositor refused the scaler's buffer; the "
+               "compositor scales the picture instead");
         t->owner->gs_dead = true;
     }
 }
@@ -1755,7 +1891,60 @@ static void gt_drop(struct nb_wl *w)
         }
         w->gt[i] = (struct nb_wl_gt){ .owner = w, .gen = w->gt[i].gen + 1 };
     }
+    if (w->gt_shm) {
+        munmap(w->gt_shm, w->gt_shm_sz);
+        w->gt_shm = NULL;
+        w->gt_shm_sz = 0;
+    }
+    w->gt_rb = false;
     w->gt_w = w->gt_h = 0;
+}
+
+/* Read-back targets: NB_GS_TARGETS XRGB8888 wl_shm buffers in one memfd. */
+static bool gt_shm_make(struct nb_wl *w, int pw, int ph)
+{
+    size_t one = (size_t)pw * (size_t)ph * 4u;
+    size_t sz = one * NB_GS_TARGETS;
+    struct wl_shm_pool *pool;
+    int fd;
+
+    if (!w->shm) {
+        return false;
+    }
+    fd = memfd_create("conduit-viewer-copy", MFD_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    if (ftruncate(fd, (off_t)sz) < 0) {
+        close(fd);
+        return false;
+    }
+    w->gt_shm = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (w->gt_shm == MAP_FAILED) {
+        w->gt_shm = NULL;
+        close(fd);
+        return false;
+    }
+    w->gt_shm_sz = sz;
+    pool = wl_shm_create_pool(w->shm, fd, (int32_t)sz);
+    close(fd);
+    if (!pool) {
+        return false;
+    }
+    for (int i = 0; i < NB_GS_TARGETS; i++) {
+        w->gt[i].buf = wl_shm_pool_create_buffer(pool, (int32_t)(one * i),
+                                                 pw, ph, pw * 4,
+                                                 WL_SHM_FORMAT_XRGB8888);
+        if (!w->gt[i].buf) {
+            wl_shm_pool_destroy(pool);
+            return false;
+        }
+        wl_buffer_add_listener(w->gt[i].buf, &gt_listener, &w->gt[i]);
+        w->gt[i].ready = true;
+    }
+    wl_shm_pool_destroy(pool);
+    w->gt_rb = true;
+    return true;
 }
 
 static void wl_gs_close(struct nb_wl *w)
@@ -1790,19 +1979,25 @@ static void wl_gs_disable(struct nb_wl *w, const char *why)
 static bool wl_gs_wanted(const struct nb_wl *w, int slot, int pw, int ph)
 {
     const struct nb_wl_buf *sl;
+    bool exact;
 
-    if (w->gs_mode == NB_GS_OFF || w->gs_dead || !w->fullscreen ||
-        !(wl_async_wanted(w) || wl_latch_on(w)) || !w->viewport || slot < 0 ||
-        slot >= NB_MAX_BUFS) {
+    if (slot < 0 || slot >= NB_MAX_BUFS) {
         return false;
     }
     sl = &w->bufs[slot];
     if (!sl->valid || sl->fd < 0) {
         return false;
     }
-    return !((int)sl->w == pw && (int)sl->h == ph && !w->place.cropped &&
-             w->place.vis.x == 0 && w->place.vis.y == 0 &&
-             w->place.vis.w == w->win_w && w->place.vis.h == w->win_h);
+    exact = (int)sl->w == pw && (int)sl->h == ph && !w->place.cropped &&
+            w->place.vis.x == 0 && w->place.vis.y == 0 &&
+            w->place.vis.w == w->win_w && w->place.vis.h == w->win_h;
+    /* A copy-only frame (nb_blit.h) in every window mode; otherwise the
+     * fullscreen scaler's own conditions. */
+    return nb_frame_uses_gpu(sl->copy,
+                             w->gs_mode != NB_GS_OFF && !w->gs_dead &&
+                                 w->viewport != NULL,
+                             w->fullscreen,
+                             wl_async_wanted(w) || wl_latch_on(w), exact);
 }
 
 /* Make sure the scaler and its targets exist at pw x ph.  false: not now
@@ -1829,11 +2024,33 @@ static bool wl_gs_ready(struct nb_wl *w, const struct nb_wl_buf *sl, int pw,
         int k;
 
         gt_drop(w);
-        k = nb_gs_targets(w->gs, (uint32_t)pw, (uint32_t)ph, gs_fmt_ok, w, tg,
-                          why, sizeof(why));
+        k = w->gt_want_rb ? 0
+                          : nb_gs_targets(w->gs, (uint32_t)pw, (uint32_t)ph,
+                                          gs_fmt_ok, w, tg, why, sizeof(why));
         if (k != NB_GS_TARGETS) {
-            wl_gs_disable(w, why[0] ? why : "no output buffers");
-            return false;
+            /*
+             * No dma-buf layout this GPU renders to that the compositor
+             * takes (an NVIDIA GPU and a compositor on another GPU): the
+             * pass into plain renderbuffers, read back into wl_shm.
+             */
+            char why2[200] = "";
+
+            if (nb_gs_targets_readback(w->gs, (uint32_t)pw, (uint32_t)ph,
+                                       why2, sizeof(why2)) != NB_GS_TARGETS ||
+                !gt_shm_make(w, pw, ph)) {
+                gt_drop(w);
+                wl_gs_disable(w, why2[0] ? why2 : why[0] ? why
+                                                         : "no output buffers");
+                return false;
+            }
+            w->gt_w = (uint32_t)pw;
+            w->gt_h = (uint32_t)ph;
+            nb_log("gpu-scale: %dx%d read-back targets in shared memory on %s "
+                   "(%s): one copy through memory per frame", pw, ph,
+                   nb_gs_node(w->gs),
+                   w->gt_want_rb ? "the compositor refused the dma-buf ones"
+                                 : why[0] ? why : "no dma-buf target");
+            return true;
         }
         for (int i = 0; i < NB_GS_TARGETS; i++) {
             struct zwp_linux_buffer_params_v1 *pp =
@@ -1921,8 +2138,21 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
                                          : "the GPU pass failed");
         return -1;
     }
+    if (w->gt_rb && w->gt_shm) {
+        uint64_t r0 = nb_mono_ns();
+
+        if (nb_gs_readback(w->gs, t, (char *)w->gt_shm +
+                           (size_t)t * (w->gt_shm_sz / NB_GS_TARGETS)) < 0) {
+            wl_gs_disable(w, "the read-back failed");
+            return -1;
+        }
+        gpu_us += (unsigned)((nb_mono_ns() - r0) / 1000u);  /* in the cost */
+    }
     w->st_gs_sum += gpu_us;
     w->st_gs_n++;
+    if (sl->copy) {
+        w->st_copy++;
+    }
     if (gpu_us > w->st_gs_max) {
         w->st_gs_max = gpu_us;
     }
@@ -1951,16 +2181,20 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
         w->gs_shown = true;
         w->frame_inflight = false;
         nb_log("picture: GPU-scaled into a %dx%d buffer on the main surface "
-               "(guest %ux%u -> %dx%d at %d,%d%s): fullscreen + immediate, "
-               "so the compositor can tear / scan it out", pw, ph, sl->w,
+               "(guest %ux%u -> %dx%d at %d,%d%s): %s", pw, ph, sl->w,
                sl->h, d.dw, d.dh, d.dx, d.dy,
-               d.nearest ? ", sharp" : "");
+               d.nearest ? ", sharp" : "",
+               sl->copy ? "a copy, because the compositor does not take the "
+                          "guest's format/modifier"
+                        : "fullscreen + immediate, so the compositor can "
+                          "tear / scan it out");
     }
     return 1;
 }
 
 static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
                                             struct wl_buffer *buf,
+                                            bool new_frame,
                                             int *out_w, int *out_h)
 {
     /*
@@ -2003,7 +2237,7 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
      */
     bool left_gs = false;
     {
-        int slot = buf ? w->pending : w->current;
+        int slot = new_frame ? w->pending : w->current;
         unsigned s120 = w->viewporter && w->scale_120 ? w->scale_120 : 120;
         int pw = (int)(((long)w->win_w * s120 + 60) / 120);
         int ph = (int)(((long)w->win_h * s120 + 60) / 120);
@@ -2167,7 +2401,8 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     if (w->probe_bad_pending) {
         w->probe_bad_pending = false;
         nb_sink_format_verdict(sink, w->probe_bad_fourcc, w->probe_bad_mod,
-                               false);
+                               wl_copy_ok(s, w->probe_bad_fourcc,
+                                          w->probe_bad_mod));
     }
 
     if (w->pending < 0) {
@@ -2278,9 +2513,12 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
          * Whether the guest is asked to re-mode is wl_mode_hint()'s business
          * (fullscreen: the output's mode); this is what is shown meanwhile.
          */
-        target = wl_viewport_apply(w, (int)sl->w, (int)sl->h, sl->buf,
+        target = wl_viewport_apply(w, (int)sl->w, (int)sl->h, sl->buf, true,
                                    &new_w, &new_h);
-        if (w->gs_dropped) {
+        /* A copy-only frame the GPU pass did not draw (no free output
+         * buffer yet, or the pass just failed) has nothing else to show:
+         * skipped like a dropped scaled frame, never attached. */
+        if (w->gs_dropped || (sl->copy && !w->gs_frame)) {
             /* Every scaler buffer is still on screen or queued: skip this
              * frame (the next one replaces it) and give it back now. */
             if (w->sink && !wl_hold_release(s, sl->id, sl->seq)) {
@@ -4989,7 +5227,7 @@ static void top_apply(struct nb_wl *w)
     if (w->viewport && w->current >= 0) {
         int dw, dh;
         struct wl_surface *pic = wl_viewport_apply(w, w->buf_w, w->buf_h,
-                                                   NULL, &dw, &dh);
+                                                   NULL, false, &dw, &dh);
 
         wl_surface_damage_buffer(pic, 0, 0,
                                  w->gs_frame ? INT32_MAX : w->buf_w,
@@ -5938,6 +6176,18 @@ static void ov_paint_commit(struct nb_wl *w)
     in.guest_resize = w->resize_mode == NB_RESIZE_GUEST;
     in.flip_known = nb_sink_seq_usec(w->sink);
     in.host_cursor = w->gc_on && !w->grabbed;
+    {
+        static char gpu[40];
+        const char *n = w->gs ? strrchr(nb_gs_node(w->gs), '/') : NULL;
+        bool copy = w->current >= 0 && w->bufs[w->current].copy;
+
+        in.path = copy ? "GPU COPY" : w->gs_shown ? "GPU SCALE" : "DIRECT";
+        snprintf(gpu, sizeof(gpu), "%s", n ? n + 1 : "");
+        for (char *p = gpu; *p; p++) {
+            *p = (char)(*p >= 'a' && *p <= 'z' ? *p - 32 : *p);
+        }
+        in.gpu = gpu;
+    }
     cols = (w->ov_w - 8 * w->ov_sc) / w->ov_sc;
     if (cols > sizeof(graph) / sizeof(graph[0])) {
         cols = sizeof(graph) / sizeof(graph[0]);
@@ -6936,7 +7186,7 @@ static void wl_relayout(struct nb_wl *w)
     if (w->viewport && w->current >= 0) {
         int dw, dh;
         struct wl_surface *pic = wl_viewport_apply(w, w->buf_w, w->buf_h,
-                                                   NULL, &dw, &dh);
+                                                   NULL, false, &dw, &dh);
 
         wl_surface_damage_buffer(pic, 0, 0,
                                  w->gs_frame ? INT32_MAX : w->buf_w,
@@ -8150,6 +8400,7 @@ static const struct nb_session_ops wl_ops = {
     .set_grab = wl_set_grab,
     .set_fullscreen = wl_set_fullscreen,
     .format_ok = wl_format_ok,
+    .copy_ok = wl_copy_ok,
     .attach = wl_attach,
     .commit = wl_commit,
     .resize = wl_resize,
