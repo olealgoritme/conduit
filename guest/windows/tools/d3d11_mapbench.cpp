@@ -12,10 +12,11 @@
 // against QPC), so the report is a time budget per call class instead of one
 // frame rate:
 //
-//   stage  calls/frame  ns/call  us/frame  %frame  p99 ns  max us
+//   stage  calls/frame  ns/call  us/frame  %frame  p50 ns  p99 ns  max us
 //
-// plus the CPU time per frame of every thread of the process (DXVK's dxvk-cs,
-// dxvk-submit, dxvk-queue, the UMD front-end worker, ...) by thread name.
+// plus the process's page faults per frame and the CPU time per frame of
+// every thread of the process (DXVK's dxvk-cs, dxvk-submit, dxvk-queue, the
+// UMD front-end worker, ...) by thread name.
 // The GPU work is tiny (one-pixel triangles into a small target), so a run is
 // CPU-bound by construction.
 //
@@ -48,12 +49,13 @@
 //
 // Build (MinGW-w64 on Linux):
 //   x86_64-w64-mingw32-g++ -O2 -static d3d11_mapbench.cpp -o d3d11_mapbench.exe
-//       -ld3d11 -ldxgi -ld3dcompiler
+//       -ld3d11 -ldxgi -ld3dcompiler -lpsapi
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <x86intrin.h>
 
 #include <algorithm>
@@ -101,6 +103,12 @@ static unsigned xorshift(unsigned &s) {
   s ^= s >> 17;
   s ^= s << 5;
   return s;
+}
+
+static unsigned long long page_faults() {
+  PROCESS_MEMORY_COUNTERS pmc = {};
+  pmc.cb = sizeof pmc;
+  return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? pmc.PageFaultCount : 0;
 }
 
 static double qpc_us() {
@@ -297,6 +305,12 @@ struct Ring {
 };
 
 int main(int argc, char **argv) {
+  // A name for thread-sample.ps1 -Thread mapbench-app.
+  typedef HRESULT(WINAPI * SetThreadDescriptionFn)(HANDLE, PCWSTR);
+  if (auto set_desc = (SetThreadDescriptionFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                                      "SetThreadDescription"))
+    set_desc(GetCurrentThread(), L"mapbench-app");
+
   Args a;
   if (!parse(argc, argv, a)) {
     fprintf(stderr,
@@ -519,6 +533,7 @@ int main(int argc, char **argv) {
   double measure_t0 = 0, sec_t = start;
   unsigned long long measure_tsc0 = 0, frame_ticks = 0, sec_ticks = 0;
   std::vector<ThreadCpu> th0;
+  unsigned long long faults0 = 0;
   std::vector<double> frame_us;
 
   for (;;) {
@@ -670,6 +685,7 @@ int main(int argc, char **argv) {
       measure_tsc0 = f1;
       sec_t = now;
       th0 = sample_threads();
+      faults0 = page_faults();
       continue;
     }
     if (!g_measuring)
@@ -694,14 +710,16 @@ int main(int argc, char **argv) {
   const double measure_t1 = qpc_us();
   const unsigned long long measure_tsc1 = __rdtsc();
   std::vector<ThreadCpu> th1 = sample_threads();
+  const unsigned long long faults1 = page_faults();
   const double tick_us = (measure_t1 - measure_t0) / double(measure_tsc1 - measure_tsc0);
   const double nf = double(measured_frames);
   const double frame_mean_us = double(frame_ticks) * tick_us / nf;
 
   printf("\n%lld frames in %.1f s: %.0f fps, frame %.1f us (TSC %.3f GHz)\n", measured_frames,
          (measure_t1 - measure_t0) / 1e6, nf * 1e6 / (measure_t1 - measure_t0), frame_mean_us, 1e-3 / tick_us);
-  printf("%-18s %11s %9s %10s %7s %9s %9s\n", "stage", "calls/frame", "ns/call", "us/frame", "%frame", "p99 ns",
-         "max us");
+  printf("page faults: %.1f per frame (process)\n", double(faults1 - faults0) / nf);
+  printf("%-18s %11s %9s %10s %7s %9s %9s %9s\n", "stage", "calls/frame", "ns/call", "us/frame", "%frame", "p50 ns",
+         "p99 ns", "max us");
   double timed_us = 0;
   for (int s = 0; s < S_COUNT; s++) {
     const Acc &x = g_acc[s];
@@ -709,9 +727,9 @@ int main(int argc, char **argv) {
       continue;
     const double us = double(x.ticks) * tick_us / nf;
     timed_us += us;
-    printf("%-18s %11.1f %9.0f %10.1f %6.1f%% %9.0f %9.1f\n", kStageName[s], double(x.calls) / nf,
+    printf("%-18s %11.1f %9.0f %10.1f %6.1f%% %9.0f %9.0f %9.1f\n", kStageName[s], double(x.calls) / nf,
            double(x.ticks) * tick_us * 1e3 / double(x.calls), us, 100.0 * us / frame_mean_us,
-           x.quantile(0.99) * tick_us * 1e3, double(x.max) * tick_us);
+           x.quantile(0.5) * tick_us * 1e3, x.quantile(0.99) * tick_us * 1e3, double(x.max) * tick_us);
   }
   printf("%-18s %11s %9s %10.1f %6.1f%%\n", "untimed", "", "", frame_mean_us - timed_us,
          100.0 * (frame_mean_us - timed_us) / frame_mean_us);
@@ -732,13 +750,12 @@ int main(int argc, char **argv) {
     double us;
   };
   std::vector<Row> rows;
-  const DWORD self = GetCurrentThreadId();
   for (const ThreadCpu &t1 : th1) {
     double before = 0;
     for (const ThreadCpu &t0 : th0)
       if (t0.tid == t1.tid)
         before = t0.cpu_us;
-    rows.push_back({t1.tid, t1.tid == self ? std::wstring(L"(app thread)") : t1.name, (t1.cpu_us - before) / nf});
+    rows.push_back({t1.tid, t1.name, (t1.cpu_us - before) / nf});
   }
   std::sort(rows.begin(), rows.end(), [](const Row &x, const Row &y) { return x.us > y.us; });
   printf("threads (cpu us/frame, %% of frame):\n");
