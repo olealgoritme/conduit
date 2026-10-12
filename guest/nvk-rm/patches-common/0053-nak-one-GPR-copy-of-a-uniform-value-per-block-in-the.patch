@@ -1,0 +1,184 @@
+From 1a4d16e9508196b1d8fd80e40f7c518a5b18663a Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 12 Oct 2026 20:32:09 +0200
+Subject: [PATCH] nak: one GPR copy of a uniform value per block in the
+ legalizer
+
+An instruction that cannot take a uniform register in a source (FFMA
+with uniform values in both src1 and src2, say: a multiply-add by two
+constants) gets a GPR copy of the uniform value. The legalizer made a
+new copy for every such source, and register allocation then gave those
+short-lived copies all the same register, so a loop of 16 independent
+FFMAs became 16 copy -> FFMA pairs, each FFMA waiting six cycles for its
+copy. SSA values do not change, so one copy now serves every later use
+in the same block.
+
+RTX 5090 (GB202) in a Windows guest, vk_gpu_bound fma (four independent
+vec4 FMA chains by push constants): 50.4 TFLOP/s, NAK_DEBUG=nougpr 66.6,
+NVIDIA 82.0. NAK_DEBUG=noucse restores the copy per use.
+---
+ src/nouveau/compiler/nak/api.rs      |  7 +++
+ src/nouveau/compiler/nak/legalize.rs | 64 +++++++++++++++++++++++++++-
+ 2 files changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 6c558fd..597e963 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -28,6 +28,7 @@ enum DebugFlags {
+     Annotate,
+     NoUgpr,
+     Cycles,
++    NoUcse,
+ }
+ 
+ pub struct Debug {
+@@ -54,6 +55,7 @@ impl Debug {
+                 "annotate" => flags |= 1 << DebugFlags::Annotate as u8,
+                 "nougpr" => flags |= 1 << DebugFlags::NoUgpr as u8,
+                 "cycles" => flags |= 1 << DebugFlags::Cycles as u8,
++                "noucse" => flags |= 1 << DebugFlags::NoUcse as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -91,6 +93,11 @@ pub trait GetDebugFlags {
+     fn cycles(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::Cycles as u8) != 0
+     }
++
++    /// The legalizer makes a new GPR copy of a uniform value for every use
++    fn no_ucse(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::NoUcse as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+diff --git a/src/nouveau/compiler/nak/legalize.rs b/src/nouveau/compiler/nak/legalize.rs
+index 2b8a12c..2978c59 100644
+--- a/src/nouveau/compiler/nak/legalize.rs
++++ b/src/nouveau/compiler/nak/legalize.rs
+@@ -169,12 +169,52 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+         src.src_ref = val.into();
+     }
+ 
++    /// A GPR copy of uniform value `ssa` made earlier in this block, if
++    /// any (LegalizeBuilder reuses them; other builders never do).
++    fn cached_warp_copy(&mut self, _ssa: &SSAValue) -> Option<SSAValue> {
++        None
++    }
++
++    /// Remember that `copy` holds uniform value `ssa` in a GPR.
++    fn note_warp_copy(&mut self, _ssa: SSAValue, _copy: SSAValue) {}
++
+     fn copy_alu_src(
+         &mut self,
+         src: &mut Src,
+         reg_file: RegFile,
+         src_type: SrcType,
+     ) {
++        // A single uniform value copied to a GPR: SSA values never change,
++        // so one copy serves every later use in the block.  Without this an
++        // FFMA whose two sources are uniform gets a copy of its own each
++        // time, and register allocation gives them all one register: a
++        // chain of copy -> FFMA dependencies that runs at a fraction of the
++        // FMA rate (NAK_DEBUG=noucse turns the reuse off).
++        let one_uniform = match &src.src_ref {
++            SrcRef::SSA(vec)
++                if vec.comps() == 1
++                    && vec[0].is_uniform()
++                    && vec[0].file().to_warp() == reg_file
++                    && matches!(
++                        src_type,
++                        SrcType::GPR
++                            | SrcType::ALU
++                            | SrcType::F32
++                            | SrcType::I32
++                            | SrcType::B32
++                    ) =>
++            {
++                Some(vec[0])
++            }
++            _ => None,
++        };
++        if let Some(u) = one_uniform {
++            if let Some(copy) = self.cached_warp_copy(&u) {
++                src.src_ref = copy.into();
++                return;
++            }
++        }
++
+         let val = match src_type {
+             SrcType::GPR
+             | SrcType::ALU
+@@ -198,6 +238,9 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+             std::mem::replace(&mut src.src_ref, val.clone().into());
+         if val.comps() == 1 {
+             self.copy_to(val[0].into(), old_src_ref.into());
++            if let Some(u) = one_uniform {
++                self.note_warp_copy(u, val[0]);
++            }
+         } else {
+             match old_src_ref {
+                 SrcRef::Imm32(u) => {
+@@ -400,6 +443,8 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+ pub struct LegalizeBuilder<'a> {
+     b: SSAInstrBuilder<'a>,
+     const_tracker: &'a mut ConstTracker,
++    /// GPR copies of uniform values made earlier in this block
++    warp_copies: Option<&'a mut FxHashMap<SSAValue, SSAValue>>,
+ }
+ 
+ impl<'a> LegalizeBuilder<'a> {
+@@ -411,6 +456,7 @@ impl<'a> LegalizeBuilder<'a> {
+         LegalizeBuilder {
+             b: SSAInstrBuilder::new(sm, alloc),
+             const_tracker,
++            warp_copies: None,
+         }
+     }
+ 
+@@ -455,7 +501,17 @@ impl<'a> SSABuilder for LegalizeBuilder<'a> {
+     }
+ }
+ 
+-impl LegalizeBuildHelpers for LegalizeBuilder<'_> {}
++impl LegalizeBuildHelpers for LegalizeBuilder<'_> {
++    fn cached_warp_copy(&mut self, ssa: &SSAValue) -> Option<SSAValue> {
++        self.warp_copies.as_ref().and_then(|m| m.get(ssa).copied())
++    }
++
++    fn note_warp_copy(&mut self, ssa: SSAValue, copy: SSAValue) {
++        if let Some(m) = self.warp_copies.as_mut() {
++            m.insert(ssa, copy);
++        }
++    }
++}
+ 
+ fn legalize_instr(
+     sm: &ShaderModelInfo,
+@@ -599,9 +655,12 @@ impl Shader<'_> {
+             let mut pinned: FxHashSet<_> = Default::default();
+             let mut const_tracker = ConstTracker::new();
+ 
++            let ucse = !DEBUG.no_ucse();
+             for (bi, b) in f.blocks.iter_mut().enumerate() {
+                 let bl = live.block_live(bi);
+                 let bu = b.uniform;
++                let mut warp_copies: FxHashMap<SSAValue, SSAValue> =
++                    Default::default();
+ 
+                 let mut instrs = Vec::new();
+                 for (ip, mut instr) in b.instrs.drain(..).enumerate() {
+@@ -622,6 +681,9 @@ impl Shader<'_> {
+                         &mut f.ssa_alloc,
+                         &mut const_tracker,
+                     );
++                    if ucse {
++                        b.warp_copies = Some(&mut warp_copies);
++                    }
+                     legalize_instr(sm, &mut b, bl, bu, &pinned, ip, &mut instr);
+                     b.push_instr(instr);
+                     instrs.append(&mut b.into_vec());
+-- 
+2.43.0
+

@@ -93,7 +93,7 @@ enable Venus automatically for a Windows guest so nobody types `--venus`.
 |---|---|---|
 | Windowed (blit-model) Present copy: KMD `Blt` → Venus copy into the guest blob / redirection surface | the copy engine the KMD could reach first | The KMD's own RM client (already exists, "level 5" lane) submits the copy on an RM copy-engine channel. The copy-engine channel waits on the producer's RM semaphore **on the GPU**, so lever 1 above (no CPU deferral, no worker hop) comes for free, without a new host feature. Destination: the same guest-memory pages, mapped to the GPU through RM (system-memory allocation over guest pages) instead of a Venus blob. |
 | Fallback for processes not on NVK (deny-list, DXR titles, 32-bit cases that fail) | NVK gaps | shrink the deny-list (S6c); DXR waits on NVK ray tracing |
-| The Venus scanout path (`ForeignFlip` off, Venus-DWM) | first working desktop | ForeignFlip with DWM on NVK is the default; drop once restart recovery on NVK is solid |
+| The Venus scanout path (`ForeignFlip` off, Venus-DWM) | first working desktop | ForeignFlip with DWM on NVK (its default in force: [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md)); drop once restart recovery on NVK is solid |
 | Venus fences / ring used by KMD paths (paging, present ready-poll) | built on Venus first | RM fences (S4 done for presents); move the remaining KMD waits to RM semaphores |
 | Host: conduit-venus, virglrenderer patches 0001/0002, `--venus-guest-blobs` | the above | removed with the last row |
 
@@ -171,8 +171,9 @@ restart-device/stress pass is clean.
 - **Host tuning** (swappiness 10, zram, shmem THP within_size, QEMU
   oom_score_adj, iothread pinning; hugepages staged for a host reboot):
   [HOST-TUNING.md](HOST-TUNING.md).
-- **Guest registry**: `HKLM\SOFTWARE\Helios DwmIcd=nvk, DwmNvkMaxStarts=60`;
-  KMD knobs under `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`
+- **Guest registry**: the test VM has `HKLM\SOFTWARE\Helios DwmIcd=nvk,
+  DwmNvkMaxStarts=60` (the code default of `DwmNvkMaxStarts` is 2; every knob
+  and its default: [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md)); KMD knobs under `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`
   (read at StartDevice). Leftover test values: per-app
   `HKCU\Software\Microsoft\DirectX\UserGpuPreferences` (remove).
 - **Branches not on main**: `kmd/msix-default` (MSI-X opt-in),

@@ -1,0 +1,525 @@
+From 25cea1261a26a91b90625a58d39700882c58fcc8 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 12 Oct 2026 20:24:19 +0200
+Subject: [PATCH] nvk/rm: compute root descriptors in CPU-mapped VRAM
+ (NVK_RM_UPLOAD_VRAM=compute)
+
+A compute dispatch's root descriptor table is command buffer upload
+memory, which the RM backend places in system memory the GPU reads
+uncached across PCIe, and the dispatch waits for it. On an RTX 5090 in a
+Windows guest (vk_gpu_bound, 256 dependent 4 MiB copies) a barrier plus
+dispatch cost 9.6 us more than a dispatch alone; with the table in VRAM
+1.1 us (NVIDIA: 0.83 us), and 256 independent dispatches took 0.36 ms
+instead of 1.1 ms (NVIDIA: 0.37 ms).
+
+- NVKMD_MEM_GPU_LATENCY: small CPU-written data the GPU reads at a
+  dependent point of every use. Command buffers keep a separate upload
+  stream for it (nvk_cmd_buffer_upload_alloc_lat), used for the compute
+  root descriptor table.
+- RM: NVK_RM_UPLOAD_VRAM=compute puts that stream in CPU-mapped VRAM;
+  1 puts all upload memory there; 0, the default, none. Off by default:
+  Steel Nomad (D3D12) scored 1905 with compute against 5252 without, and
+  a new command pool's first latency block costs a VRAM allocation and a
+  BAR1 map, both host round trips (d3d12_gpu_bound "record new
+  allocators": 14.1 against 6.5 ms per frame for 8 new allocators). NVK's own
+  CPU-mapped VRAM (these and NVK_RM_DESC_TABLE_VRAM) has a budget of its
+  own (256 MiB) and no longer needs the application's BAR heap
+  (NVK_RM_BAR_MB) to be advertised; past the budget, or if the map is
+  refused, it stays in system memory as before.
+- nouveau ignores the flag.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c        | 40 +++++++++++++++
+ src/nouveau/vulkan/nvk_cmd_buffer.h        |  9 ++++
+ src/nouveau/vulkan/nvk_cmd_dispatch.c      |  5 +-
+ src/nouveau/vulkan/nvk_cmd_pool.c          | 47 ++++++++++++++++--
+ src/nouveau/vulkan/nvk_cmd_pool.h          |  5 ++
+ src/nouveau/vulkan/nvkmd/nvkmd.h           |  9 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     | 25 +++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 16 +++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c | 58 +++++++++++++++++++---
+ 9 files changed, 199 insertions(+), 15 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 05d7bf3..b749e64 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -63,6 +63,7 @@ nvk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+ 
+    nvk_cmd_pool_free_mem_list(pool, &cmd->owned_mem);
+    nvk_cmd_pool_free_gart_mem_list(pool, &cmd->owned_gart_mem);
++   nvk_cmd_pool_free_lat_mem_list(pool, &cmd->owned_lat_mem);
+    nvk_cmd_pool_free_qmd_list(pool, &cmd->owned_qmd);
+    util_dynarray_fini(&cmd->pushes);
+    util_dynarray_fini(&cmd->copy_memory_indirect_temps);
+@@ -98,6 +99,7 @@ nvk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+ 
+    list_inithead(&cmd->owned_mem);
+    list_inithead(&cmd->owned_gart_mem);
++   list_inithead(&cmd->owned_lat_mem);
+    list_inithead(&cmd->owned_qmd);
+    cmd->pushes = UTIL_DYNARRAY_INIT;
+    cmd->copy_memory_indirect_temps = UTIL_DYNARRAY_INIT;
+@@ -124,8 +126,10 @@ nvk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+ 
+    nvk_cmd_pool_free_mem_list(pool, &cmd->owned_mem);
+    nvk_cmd_pool_free_gart_mem_list(pool, &cmd->owned_gart_mem);
++   nvk_cmd_pool_free_lat_mem_list(pool, &cmd->owned_lat_mem);
+    nvk_cmd_pool_free_qmd_list(pool, &cmd->owned_qmd);
+    cmd->upload_mem = NULL;
++   cmd->lat_upload_mem = NULL;
+    cmd->push_mem = NULL;
+    cmd->push_mem_limit = NULL;
+    cmd->push = (struct nv_push) {0};
+@@ -299,6 +303,41 @@ nvk_cmd_buffer_upload_alloc(struct nvk_cmd_buffer *cmd,
+    return VK_SUCCESS;
+ }
+ 
++/* nvk_cmd_buffer_upload_alloc() in latency-bound upload memory
++ * (NVKMD_MEM_GPU_LATENCY): data the GPU reads at a dependent point of every
++ * use, such as a compute dispatch's root descriptor table.  Allocations come
++ * from their own 64 KiB blocks, filled in order.
++ */
++VkResult
++nvk_cmd_buffer_upload_alloc_lat(struct nvk_cmd_buffer *cmd,
++                                uint32_t size, uint32_t alignment,
++                                uint64_t *addr, void **ptr)
++{
++   assert(size % 4 == 0);
++   assert(size <= NVK_CMD_MEM_SIZE);
++
++   uint32_t offset = cmd->lat_upload_offset;
++   if (alignment > 0)
++      offset = align(offset, alignment);
++
++   if (cmd->lat_upload_mem == NULL || size > NVK_CMD_MEM_SIZE - offset) {
++      struct nvk_cmd_mem *mem;
++      VkResult result = nvk_cmd_pool_alloc_lat_mem(nvk_cmd_buffer_pool(cmd),
++                                                   &mem);
++      if (unlikely(result != VK_SUCCESS))
++         return result;
++      list_addtail(&mem->link, &cmd->owned_lat_mem);
++      cmd->lat_upload_mem = mem;
++      offset = 0;
++   }
++
++   *addr = cmd->lat_upload_mem->mem->va->addr + offset;
++   *ptr = (char *)cmd->lat_upload_mem->mem->map + offset;
++   cmd->lat_upload_offset = offset + size;
++
++   return VK_SUCCESS;
++}
++
+ VkResult
+ nvk_cmd_buffer_upload_data(struct nvk_cmd_buffer *cmd,
+                            const void *data, uint32_t size,
+@@ -420,6 +459,7 @@ nvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
+     */
+    flush_mem_list(cmd, &cmd->owned_mem);
+    flush_mem_list(cmd, &cmd->owned_gart_mem);
++   flush_mem_list(cmd, &cmd->owned_lat_mem);
+ 
+    return vk_command_buffer_get_record_result(&cmd->vk);
+ }
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 9b6dc51..4141e30 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -410,6 +410,11 @@ struct nvk_cmd_buffer {
+    struct nvk_cmd_mem *upload_mem;
+    uint32_t upload_offset;
+ 
++   /* Latency-bound upload memory (NVKMD_MEM_GPU_LATENCY), its own list */
++   struct list_head owned_lat_mem;
++   struct nvk_cmd_mem *lat_upload_mem;
++   uint32_t lat_upload_offset;
++
+    struct nvk_cmd_mem *cond_render_mem;
+    /** Array of struct nvk_cmd_mem* */
+    struct util_dynarray copy_memory_indirect_temps;
+@@ -677,6 +682,10 @@ VkResult nvk_cmd_buffer_upload_alloc(struct nvk_cmd_buffer *cmd,
+                                      uint32_t size, uint32_t alignment,
+                                      uint64_t *addr, void **ptr);
+ 
++VkResult nvk_cmd_buffer_upload_alloc_lat(struct nvk_cmd_buffer *cmd,
++                                         uint32_t size, uint32_t alignment,
++                                         uint64_t *addr, void **ptr);
++
+ VkResult nvk_cmd_buffer_upload_data(struct nvk_cmd_buffer *cmd,
+                                     const void *data, uint32_t size,
+                                     uint32_t alignment, uint64_t *addr);
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index e49b14b..6f2874c 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -179,8 +179,9 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+ 
+    void *root_desc_map;
+    uint64_t root_desc_addr;
+-   result = nvk_cmd_buffer_upload_alloc(cmd, root_size, min_cbuf_alignment,
+-                                        &root_desc_addr, &root_desc_map);
++   result = nvk_cmd_buffer_upload_alloc_lat(cmd, root_size,
++                                            min_cbuf_alignment,
++                                            &root_desc_addr, &root_desc_map);
+    if (unlikely(result != VK_SUCCESS))
+       return result;
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_pool.c b/src/nouveau/vulkan/nvk_cmd_pool.c
+index 6c3f04f..cab5ebc 100644
+--- a/src/nouveau/vulkan/nvk_cmd_pool.c
++++ b/src/nouveau/vulkan/nvk_cmd_pool.c
+@@ -10,7 +10,8 @@
+ #include "nvkmd/nvkmd.h"
+ 
+ static VkResult
+-nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, struct nvk_cmd_mem **mem_out)
++nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, bool latency,
++                   struct nvk_cmd_mem **mem_out)
+ {
+    struct nvk_device *dev = nvk_cmd_pool_device(pool);
+    struct nvk_cmd_mem *mem;
+@@ -24,8 +25,13 @@ nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, struct nvk_cmd_me
+    /* Upload memory is only written by the CPU; on RM it may go to VRAM
+     * through BAR1 (NVK_RM_UPLOAD_VRAM).  Pushbuffers (force_gart) stay.
+     */
+-   const uint32_t flags = force_gart ? NVKMD_MEM_GART
+-                                     : NVKMD_MEM_LOCAL | NVKMD_MEM_CPU_WRITE_ONLY;
++   uint32_t flags = force_gart ? NVKMD_MEM_GART
++                               : NVKMD_MEM_LOCAL | NVKMD_MEM_CPU_WRITE_ONLY;
++   /* Latency-bound upload memory (compute root descriptors): on RM it goes
++    * to VRAM through BAR1 with NVK_RM_UPLOAD_VRAM=compute.
++    */
++   if (latency)
++      flags |= NVKMD_MEM_GPU_LATENCY;
+ 
+    result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &pool->vk.base,
+                                        NVK_CMD_MEM_SIZE, 0,
+@@ -103,6 +109,7 @@ nvk_CreateCommandPool(VkDevice _device,
+ 
+    list_inithead(&pool->free_mem);
+    list_inithead(&pool->free_gart_mem);
++   list_inithead(&pool->free_lat_mem);
+    list_inithead(&pool->free_qmd);
+ 
+    *pCmdPool = nvk_cmd_pool_to_handle(pool);
+@@ -123,6 +130,11 @@ nvk_cmd_pool_destroy_mem(struct nvk_cmd_pool *pool)
+ 
+    list_inithead(&pool->free_gart_mem);
+ 
++   list_for_each_entry_safe(struct nvk_cmd_mem, mem, &pool->free_lat_mem, link)
++      nvk_cmd_mem_destroy(pool, mem);
++
++   list_inithead(&pool->free_lat_mem);
++
+    list_for_each_entry_safe(struct nvk_cmd_qmd, qmd, &pool->free_qmd, link)
+       nvk_cmd_qmd_destroy(pool, qmd);
+    list_inithead(&pool->free_qmd);
+@@ -147,7 +159,7 @@ nvk_cmd_pool_alloc_mem(struct nvk_cmd_pool *pool, bool force_gart,
+    if (mem) {
+       list_del(&mem->link);
+    } else {
+-      VkResult result = nvk_cmd_mem_create(pool, force_gart, &mem);
++      VkResult result = nvk_cmd_mem_create(pool, force_gart, false, &mem);
+       if (result != VK_SUCCESS)
+          return result;
+    }
+@@ -160,6 +172,25 @@ nvk_cmd_pool_alloc_mem(struct nvk_cmd_pool *pool, bool force_gart,
+    return VK_SUCCESS;
+ }
+ 
++VkResult
++nvk_cmd_pool_alloc_lat_mem(struct nvk_cmd_pool *pool,
++                           struct nvk_cmd_mem **mem_out)
++{
++   struct nvk_cmd_mem *mem = NULL;
++
++   if (!list_is_empty(&pool->free_lat_mem)) {
++      mem = list_first_entry(&pool->free_lat_mem, struct nvk_cmd_mem, link);
++      list_del(&mem->link);
++   } else {
++      VkResult result = nvk_cmd_mem_create(pool, false, true, &mem);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   *mem_out = mem;
++   return VK_SUCCESS;
++}
++
+ VkResult
+ nvk_cmd_pool_alloc_qmd(struct nvk_cmd_pool *pool,
+                        struct nvk_cmd_qmd **qmd_out)
+@@ -191,6 +222,14 @@ nvk_cmd_pool_free_gart_mem_list(struct nvk_cmd_pool *pool,
+    list_inithead(mem_list);
+ }
+ 
++void
++nvk_cmd_pool_free_lat_mem_list(struct nvk_cmd_pool *pool,
++                               struct list_head *mem_list)
++{
++   list_splicetail(mem_list, &pool->free_lat_mem);
++   list_inithead(mem_list);
++}
++
+ void
+ nvk_cmd_pool_free_qmd_list(struct nvk_cmd_pool *pool,
+                            struct list_head *qmd_list)
+diff --git a/src/nouveau/vulkan/nvk_cmd_pool.h b/src/nouveau/vulkan/nvk_cmd_pool.h
+index 6d556ef..d7cbc45 100644
+--- a/src/nouveau/vulkan/nvk_cmd_pool.h
++++ b/src/nouveau/vulkan/nvk_cmd_pool.h
+@@ -37,6 +37,7 @@ struct nvk_cmd_pool {
+    /** List of nvk_cmd_mem */
+    struct list_head free_mem;
+    struct list_head free_gart_mem;
++   struct list_head free_lat_mem;
+    struct list_head free_qmd;
+ };
+ 
+@@ -52,6 +53,8 @@ nvk_cmd_pool_device(struct nvk_cmd_pool *pool)
+ VkResult nvk_cmd_pool_alloc_mem(struct nvk_cmd_pool *pool,
+                                 bool force_gart,
+                                 struct nvk_cmd_mem **mem_out);
++VkResult nvk_cmd_pool_alloc_lat_mem(struct nvk_cmd_pool *pool,
++                                    struct nvk_cmd_mem **mem_out);
+ VkResult nvk_cmd_pool_alloc_qmd(struct nvk_cmd_pool *pool,
+                                 struct nvk_cmd_qmd **qmd_out);
+ 
+@@ -59,6 +62,8 @@ void nvk_cmd_pool_free_mem_list(struct nvk_cmd_pool *pool,
+                                 struct list_head *mem_list);
+ void nvk_cmd_pool_free_gart_mem_list(struct nvk_cmd_pool *pool,
+                                      struct list_head *mem_list);
++void nvk_cmd_pool_free_lat_mem_list(struct nvk_cmd_pool *pool,
++                                    struct list_head *mem_list);
+ void nvk_cmd_pool_free_qmd_list(struct nvk_cmd_pool *pool,
+                                 struct list_head *mem_list);
+ #endif /* NVK_CMD_POOL_H */
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index 2ea9077..ae87421 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -78,6 +78,15 @@ enum nvkmd_mem_flags {
+     *  place it in CPU-mapped VRAM instead.  Ignored elsewhere.
+     */
+    NVKMD_MEM_CPU_WRITE_ONLY = 1 << 8,
++
++   /** Small CPU-written data the GPU reads at a dependent point of every
++    *  operation that uses it, with the engine waiting on the read (a compute
++    *  dispatch's root descriptor table): read latency matters more than the
++    *  CPU's write bandwidth.  Implies NVKMD_MEM_CPU_WRITE_ONLY.  A backend
++    *  which places mappable memory in system memory may place it in
++    *  CPU-mapped VRAM.  Ignored elsewhere.
++    */
++   NVKMD_MEM_GPU_LATENCY = 1 << 9,
+ };
+ 
+ #define NVKMD_MEM_PLACEMENT_FLAGS \
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 195e67a..9d4f6bd 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -337,7 +337,16 @@ struct nvkmd_rm_dev {
+     * instead of system memory the GPU reads across PCIe.
+     */
+    bool desc_vram;
+-   bool upload_vram;
++   /* NVK_RM_UPLOAD_VRAM: which command buffer upload memory is CPU-mapped
++    * VRAM.  _NONE (0) is the default.  NVKMD_RM_UPLOAD_VRAM_COMPUTE
++    * ("compute"): only
++    * latency-bound upload memory (NVKMD_MEM_GPU_LATENCY, a compute
++    * dispatch's root descriptor table, which the dispatch waits for: from
++    * system memory each serial dispatch costs a few us more, 9.6 against
++    * 1.1 us per dependent dispatch pair on an RTX 5090).  _ALL (1): all of
++    * it.
++    */
++   uint8_t upload_vram;
+    uint32_t desc_vram_fallbacks;
+ 
+    /* lib->win_loss_epoch() when the device was created; see
+@@ -394,6 +403,13 @@ struct nvkmd_rm_dev {
+     */
+    uint64_t bar_used_B;
+ 
++   /* NVK's own CPU-mapped VRAM (descriptor tables, upload memory: the
++    * NVK_RM_DESC_TABLE_VRAM / NVK_RM_UPLOAD_VRAM placements), not charged to
++    * the application's BAR heap, which may not be advertised at all
++    * (NVK_RM_BAR_MB=0, the default).  At most NVKMD_RM_INTERNAL_BAR_B.
++    */
++   uint64_t bar_internal_used_B;
++
+    /* Allocations from the BAR heap whose CPU map failed and which were
+     * given system memory instead (nvkmd_rm_mem.c).
+     */
+@@ -496,6 +512,8 @@ struct nvkmd_rm_mem {
+     * map of the VRAM failed.
+     */
+    bool bar_charged;
++   /* Charged to dev->bar_internal_used_B instead (NVK's own placements) */
++   bool bar_internal;
+ 
+    /* Imported from a dma-buf: h_memory came from
+     * NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD and its handle was
+@@ -543,6 +561,11 @@ NVKMD_DECL_SUBCLASS(mem, rm);
+  * NV01_MEMORY_SYSTEM instead of our own pages (for memory RM itself writes
+  * through a kernel mapping, like channel error notifiers).
+  */
++#define NVKMD_RM_UPLOAD_VRAM_NONE    0
++#define NVKMD_RM_UPLOAD_VRAM_COMPUTE 1
++#define NVKMD_RM_UPLOAD_VRAM_ALL     2
++#define NVKMD_RM_INTERNAL_BAR_B      (256ull << 20)
++
+ #define NVKMD_RM_MEM_RM_SYSMEM ((enum nvkmd_mem_flags)(1u << 30))
+ 
+ VkResult nvkmd_rm_alloc_mem(struct nvkmd_dev *dev,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 20857ec..3408839 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -166,7 +166,21 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+       dev->sysmem_cached = dev->sysmem_cached_desc || dev->sysmem_cached_app;
+    }
+    dev->desc_vram = debug_get_bool_option("NVK_RM_DESC_TABLE_VRAM", false);
+-   dev->upload_vram = debug_get_bool_option("NVK_RM_UPLOAD_VRAM", false);
++   {
++      /* NVK_RM_UPLOAD_VRAM=0 (default, none) / compute / 1 (all).  Not on
++       * by default: Steel Nomad (D3D12) scored 1905 with compute, 5252
++       * without.  A new command pool's first latency block is a VRAM
++       * allocation plus a BAR1 map, both host round trips (~1 ms per pool in
++       * d3d12_gpu_bound's "record new allocators").
++       */
++      const char *u = os_get_option("NVK_RM_UPLOAD_VRAM");
++      if (u != NULL && strcmp(u, "compute") == 0)
++         dev->upload_vram = NVKMD_RM_UPLOAD_VRAM_COMPUTE;
++      else if (debug_get_bool_option("NVK_RM_UPLOAD_VRAM", false))
++         dev->upload_vram = NVKMD_RM_UPLOAD_VRAM_ALL;
++      else
++         dev->upload_vram = NVKMD_RM_UPLOAD_VRAM_NONE;
++   }
+ 
+    list_inithead(&dev->base.mems);
+    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 0cecdda..a6eb2ff 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -92,6 +92,29 @@ bar_release(struct nvkmd_rm_dev *dev, uint64_t size_B)
+    p_atomic_add(&dev->bar_used_B, -(int64_t)size_B);
+ }
+ 
++/* NVK's own CPU-mapped VRAM, against its own budget */
++static bool
++bar_internal_reserve(struct nvkmd_rm_dev *dev, uint64_t size_B)
++{
++   uint64_t used = p_atomic_read(&dev->bar_internal_used_B);
++   for (;;) {
++      if (size_B > NVKMD_RM_INTERNAL_BAR_B ||
++          used > NVKMD_RM_INTERNAL_BAR_B - size_B)
++         return false;
++      const uint64_t seen =
++         p_atomic_cmpxchg(&dev->bar_internal_used_B, used, used + size_B);
++      if (seen == used)
++         return true;
++      used = seen;
++   }
++}
++
++static void
++bar_internal_release(struct nvkmd_rm_dev *dev, uint64_t size_B)
++{
++   p_atomic_add(&dev->bar_internal_used_B, -(int64_t)size_B);
++}
++
+ /* The CPU map of host-visible VRAM failed: say so once per device (and
+  * every time with NVK_DEBUG=vm).  The allocation goes on in system memory.
+  */
+@@ -515,13 +538,19 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+     * a PCIe read through the guest's IOMMU.  If the heap is full or the map
+     * is refused, they stay in system memory as before (logged).
+     */
++   /* These do not need the application's BAR heap to be advertised: they
++    * have a budget of their own (bar_internal_reserve).
++    */
+    const bool want_bar_internal =
+       (flags & NVKMD_MEM_LOCAL) && (flags & NVKMD_MEM_CAN_MAP) &&
+       !(flags & NVKMD_MEM_SHARED) && !force_rm_sysmem &&
+-      dev_info->bar_size_B > 0 && dev_info->vram_size_B > 0 &&
++      dev_info->vram_size_B > 0 &&
+       !(dev->base.pdev->debug_flags & NVK_DEBUG_FORCE_GART) &&
+       (((flags & NVKMD_MEM_GPU_READ_ONLY) && dev->desc_vram) ||
+-       ((flags & NVKMD_MEM_CPU_WRITE_ONLY) && dev->upload_vram));
++       ((flags & NVKMD_MEM_GPU_LATENCY) &&
++        dev->upload_vram >= NVKMD_RM_UPLOAD_VRAM_COMPUTE) ||
++       ((flags & NVKMD_MEM_CPU_WRITE_ONLY) &&
++        dev->upload_vram == NVKMD_RM_UPLOAD_VRAM_ALL));
+    if (want_bar_internal)
+       flags = (flags & ~NVKMD_MEM_LOCAL) | NVKMD_MEM_VRAM;
+ 
+@@ -532,7 +561,8 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+         !(flags & NVKMD_MEM_GPU_READ_ONLY)) ||
+        (dev->sysmem_cached_desc && (flags & NVKMD_MEM_GPU_READ_ONLY))) &&
+       !force_rm_sysmem;
+-   flags &= ~(NVKMD_RM_MEM_RM_SYSMEM | NVKMD_MEM_CPU_WRITE_ONLY);
++   flags &= ~(NVKMD_RM_MEM_RM_SYSMEM | NVKMD_MEM_CPU_WRITE_ONLY |
++              NVKMD_MEM_GPU_LATENCY);
+ 
+    /* Kinds are applied per mapping (the image's own VA).  The layout is only
+     * remembered, for NVKMS if the memory is exported.
+@@ -565,7 +595,13 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    /* The BAR heap: VRAM the CPU maps (see the placement policy) */
+    bool bar = vram && (flags & NVKMD_MEM_VRAM) &&
+               (flags & NVKMD_MEM_CAN_MAP);
+-   if (bar && !bar_reserve(dev, size_B)) {
++   if (bar && want_bar_internal) {
++      if (!bar_internal_reserve(dev, size_B)) {
++         /* NVK's own budget is spent: system memory, as before */
++         bar = false;
++         vram = false;
++      }
++   } else if (bar && !bar_reserve(dev, size_B)) {
+       /* Past the reported heap size: system memory stands in, exactly as for
+        * a refused CPU map.  Never VK_ERROR_OUT_OF_DEVICE_MEMORY: the host
+        * window, not this number, is the real limit.
+@@ -648,7 +684,10 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+             nvkmd_rm_free_memory(dev, mem->h_memory);
+             mem->h_memory = 0;
+             bar_map_failed(dev, size_B, ret);
+-            bar_release(dev, size_B);
++            if (want_bar_internal)
++               bar_internal_release(dev, size_B);
++            else
++               bar_release(dev, size_B);
+             bar = false;
+             vram = false;
+             page_size_B = NVKMD_RM_SYSMEM_PAGE_SIZE;
+@@ -688,7 +727,8 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+ 
+    mem->vram = vram;
+    mem->huge = vram && huge;
+-   mem->bar_charged = bar;
++   mem->bar_charged = bar && !want_bar_internal;
++   mem->bar_internal = bar && want_bar_internal;
+    mem->gpu_cached = !vram && gpu_cacheable;
+    if (want_bar_internal && !vram) {
+       const uint32_t n = p_atomic_inc_return(&dev->desc_vram_fallbacks);
+@@ -775,7 +815,9 @@ fail_rm:
+          dev->lib->free_pages(dev->client, mem->os_pages, size_B);
+    }
+ fail_bar:
+-   if (bar)
++   if (bar && want_bar_internal)
++      bar_internal_release(dev, size_B);
++   else if (bar)
+       bar_release(dev, size_B);
+    FREE(mem);
+ 
+@@ -810,6 +852,8 @@ nvkmd_rm_mem_free_now(void *obj)
+    }
+    if (mem->bar_charged)
+       bar_release(dev, mem->base.size_B);
++   if (mem->bar_internal)
++      bar_internal_release(dev, mem->base.size_B);
+ 
+    if (mem->slab != NULL) {
+       slab_free(dev, mem->slab, mem->slab_offset_B, mem->base.size_B);
+-- 
+2.43.0
+

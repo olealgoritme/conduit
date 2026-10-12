@@ -127,19 +127,11 @@ the per-process policy keeps off NVK.
 | 5120x1440, with bots | ~350 |
 | lower resolutions | ~400–500 |
 
-**Main knobs** (defaults in force; registry values are `REG_DWORD`, NVK
-settings are environment variables of the process):
-
-| Knob | Default | What it does |
-|---|---|---|
-| `IndepFlip` (KMD service key) | 1 | independent flip for full-screen flip-model windows; 0 turns it off |
-| `DirectFlipSupport` (`HKLM\SOFTWARE\Helios`) | 5 | the D3D11.1 `CheckDirectFlipSupport` answer DWM uses for independent flip; 5 also pairs an R8G8B8A8 game with the B8G8R8A8 desktop, 1 is the equal-format rule, 0 never |
-| `HwCursor` (KMD service key) | follows `IndepFlip` | the hardware cursor; absent means on with independent flip, off without |
-| `ImmFlip` (KMD service key) | 15 | immediate flips (V-sync off, or a promoted swap chain) are neither paced nor held for the vsync tick; 0 paces them like composed flips |
-| `NVK_INDIRECT_PUSH` | 0 | indirect draw records through the pushbuffer |
-| `NVK_NULL_VB_ZERO_PAGE` | 1 | null vertex buffers bound to the zero page |
-| `NVK_ZERO_PAGE_VRAM` | 1 | the zero page (null descriptors) in VRAM |
-| `NVK_RM_BAR_MB` | 0 | host-visible VRAM heap through BAR1; 0 off, -1 all of BAR1, N MiB |
+**Knobs.** The recommended configuration is the code defaults: no registry
+value needs to be set beyond what `install.ps1` writes. Every knob of the
+guest driver, its default and whether it is a setting, a tuning value, a
+debug switch or an experiment is in
+[docs/WINDOWS-KNOBS.md](docs/WINDOWS-KNOBS.md), generated from the code.
 
 **Diagnostics** (written to `%ProgramData%\Helios\` per process):
 
@@ -165,7 +157,9 @@ settings are environment variables of the process):
 More:
 
 - [docs/WINDOWS.md](docs/WINDOWS.md): set up the VM, build and install the
-  driver package, the registry knobs
+  driver package
+- [docs/WINDOWS-KNOBS.md](docs/WINDOWS-KNOBS.md): every guest knob, its
+  default and class, generated from the code
 - [guest/nvk-rm/README.md](guest/nvk-rm/README.md): the NVK-on-RM patch
   series and its knobs
 - [docs/NVK-ROADMAP.md](docs/NVK-ROADMAP.md): what is left

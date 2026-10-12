@@ -37,6 +37,7 @@ use helios_kmd_logic::foreign_resource::{AdoptRequest, Layout as FrLayout};
 use helios_kmd_logic::rm_client::{self as rc, Fail, FailKind};
 use helios_kmd_logic::rm_sysmem::{self as rs, Admit, AllocOutcome, FreeOutcome, Svc};
 use helios_kmd_logic::rm_vidmem::{self as rv, VidLayout, Why};
+use helios_kmd_logic::shipping_defaults as sd;
 use helios_kmd_logic::sweep_budget::UNITS_PER_MS;
 
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -125,7 +126,7 @@ pub(crate) fn knob_on() -> bool {
 /// The raw knob value, for the private-data size decision (`GetStandardAllocationDriverData`).
 pub(crate) fn knob() -> u32 {
     match KNOB.load(Ordering::Relaxed) {
-        UNREAD => rv::KNOB_OFF,
+        UNREAD => sd::REDIR_VRAM,
         k => k,
     }
 }
@@ -137,7 +138,7 @@ pub(crate) fn any_live() -> bool {
 
 /// StartDevice (PASSIVE): read the knob, zero the counters; with the knob on, write them.
 pub(crate) fn reset_for_start() {
-    let k = crate::diag::read_config_dword(crate::diag::knobs::REDIR_VRAM, rv::KNOB_OFF);
+    let k = crate::diag::read_config_dword(crate::diag::knobs::REDIR_VRAM, sd::REDIR_VRAM);
     KNOB.store(k, Ordering::Relaxed);
     let o = crate::diag::read_config_dword(crate::diag::knobs::RV_OFF, 0);
     OFF.store(o, Ordering::Relaxed);

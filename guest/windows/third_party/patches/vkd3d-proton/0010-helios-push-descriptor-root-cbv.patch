@@ -1,0 +1,57 @@
+Helios vkd3d-proton fork: root CBVs as push descriptors on NVK with EXT DGC
+
+Conduit, D3D12 on NVK. Applied after 0009.
+
+With VK_EXT_device_generated_commands the fork selects raw GPU addresses
+for every root CBV, so that native ExecuteIndirect can update them: a
+shader then reads its root constant buffer through global memory loads
+instead of a bound constant buffer. Upstream keeps root CBVs as push
+descriptors on NVIDIA hardware ("~15% in some cases") and hoists static
+table CBVs.
+
+- HELIOS_VKD3D_PUSH_CBV=1: root CBVs are push descriptors (and static table
+  CBVs hoisted) as upstream, DGC or not. A command signature that updates a
+  root CBV is then refused (E_NOTIMPL, the existing check). Logged once
+  ("Helios: root CBVs are push descriptors."). Default off.
+
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index c610187..911cd88 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -8122,6 +8122,12 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
+     return supported.supported == VK_TRUE;
+ }
+ 
++static bool vkd3d_helios_push_cbv(void)
++{
++    char env[8];
++    return vkd3d_get_env_var("HELIOS_VKD3D_PUSH_CBV", env, sizeof(env)) && env[0] == '1';
++}
++
+ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *device)
+ {
+     const struct vkd3d_physical_device_info *device_info = &device->device_info;
+@@ -8176,7 +8182,13 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
+      * A push-descriptor CBV cannot be changed by an indirect token. Select the
+      * ordinary raw-address ABI up front, with no private PSO variant or replay.
+      */
+-    if (device_info->device_generated_commands_features.deviceGeneratedCommands ||
++    /* Helios (HELIOS_VKD3D_PUSH_CBV=1): keep root CBVs as push descriptors on
++     * NVIDIA hardware even with EXT DGC, as upstream does. A shader then reads
++     * a root CBV as a bound constant buffer instead of through a raw address
++     * (global memory loads). A command signature that updates a root CBV is
++     * refused (E_NOTIMPL) in that mode. */
++    if ((device_info->device_generated_commands_features.deviceGeneratedCommands &&
++                !vkd3d_helios_push_cbv()) ||
+             VKD3D_CONFIG_FLAG_IS_SET(FORCE_RAW_VA_CBV) ||
+             (device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_NVIDIA &&
+ 	     device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_QUALCOMM))
+@@ -8193,6 +8205,8 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
+ 
+     if (device->device_info.device_generated_commands_features.deviceGeneratedCommands)
+         INFO("Enabling fast paths for advanced ExecuteIndirect() graphics and compute (EXT_dgc).\n");
++    if (!(flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV))
++        INFO("Helios: root CBVs are push descriptors.\n");
+ 
+     if (vkd3d_bindless_supports_mutable_type(device, flags))
+     {

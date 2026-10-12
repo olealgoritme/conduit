@@ -19,6 +19,7 @@ use wdk_sys::{KDPC, KEVENT, KSPIN_LOCK, KTIMER};
 use crate::dxgk::*;
 use crate::error::NotStarted;
 use crate::virtio::VirtioGpu;
+use helios_kmd_logic::shipping_defaults as sd;
 use helios_kmd_logic::DisplayMode;
 
 mod backing;
@@ -164,7 +165,7 @@ pub(crate) struct AdapterKnobs {
     /// steady-state path never waits or maps a frame, and the per-pair
     /// `probe_done` state statically prevents repeated readbacks.
     pub present_probe: bool,
-    /// `ForeignCopy` (default 0 = OFF; set 1 to test). The KMD copy of a foreign (NVK-on-RM)
+    /// `ForeignCopy` (default 1, `helios_kmd_logic::shipping_defaults`). The KMD copy of a foreign (NVK-on-RM)
     /// resource into the LINEAR scan-out image: the explicit-modifier dma-buf
     /// import (`virtio::venus::foreign_copy`) and, with it, the
     /// `VK_EXT_image_drm_format_modifier` device-extension tier of the
@@ -255,7 +256,8 @@ pub(crate) struct AdapterKnobs {
     /// clean. Out-of-range values are refused into `VidVBad` and fall back to
     /// the legacy topology rather than silently collapsing.
     pub vidmm_vram_mb: u32,
-    /// `GdiAccel` (default 0), raw: 1 reports GDI hardware acceleration (`ddi/gdi_accel.rs`).
+    /// `GdiAccel` (default 0), raw: 1 reports GDI hardware acceleration (`ddi/gdi_accel.rs`)
+    /// only together with `RedirVram` 1 and `RmCopyEngine` 1; otherwise it reports nothing.
     /// Read here so the AddAdapter-time caps query and the StartDevice latch agree.
     pub gdi_accel: u32,
     /// `RedirVram` and `RmCopyEngine` as read here, raw: `GdiAccel` = 1 needs both on
@@ -335,7 +337,7 @@ impl AdapterKnobs {
         use crate::diag::{knobs, read_config_dword};
         use helios_kmd_logic::independent_flip as idf;
         // `IndepFlip` ORs its caps into what `DirectFlipCaps` and `FlipCapsX` ask for. Absent, it is
-        // `KNOB_DEFAULT` (0, off); then both are exactly the raw values.
+        // `KNOB_DEFAULT` (1, on); with 0 both are exactly the raw values.
         let indep_flip = read_config_dword(knobs::INDEP_FLIP, idf::KNOB_DEFAULT);
         let advertised = idf::advertise(
             idf::Mode::from_knob(indep_flip),
@@ -355,7 +357,7 @@ impl AdapterKnobs {
             bind_flush_immediate: read_config_dword(knobs::BIND_FLUSH_MODE, 0) == 1,
             dispatch_bind: read_config_dword(knobs::DISPATCH_BIND, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
-            foreign_copy: read_config_dword(knobs::FOREIGN_COPY, 0) != 0,
+            foreign_copy: read_config_dword(knobs::FOREIGN_COPY, sd::FOREIGN_COPY) != 0,
             display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
             direct_flip: advertised.direct_flip,
             flip_caps_x: advertised.flip_caps_x,
@@ -377,7 +379,7 @@ impl AdapterKnobs {
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
             vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
             gdi_accel: read_config_dword(knobs::GDI_ACCEL, 0),
-            gdi_redir_vram: read_config_dword(knobs::REDIR_VRAM, 0),
+            gdi_redir_vram: read_config_dword(knobs::REDIR_VRAM, sd::REDIR_VRAM),
             gdi_rm_copy_engine: read_config_dword(knobs::RM_COPY_ENGINE, 0),
             d3d12_node: read_config_dword(knobs::D3D12_NODE, 0) != 0,
             hw_queue_packet_cap: read_config_dword(knobs::HW_QUEUE_PACKET_CAP, 0).min(15),
