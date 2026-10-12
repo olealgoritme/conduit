@@ -460,7 +460,10 @@ fn gpu_host_lines(r: &mut Report) {
 /// What `conduit-viewer --resolve-gpu` printed: (the GPU, why).
 fn parse_resolve_gpu(out: &str) -> Option<(String, String)> {
     let gpu = out.lines().find_map(|l| l.strip_prefix("gpu "))?;
-    let why = out.lines().find_map(|l| l.strip_prefix("why ")).unwrap_or("");
+    let why = out
+        .lines()
+        .find_map(|l| l.strip_prefix("why "))
+        .unwrap_or("");
     Some((gpu.trim().to_string(), why.trim().to_string()))
 }
 
@@ -921,8 +924,17 @@ pub fn run_vm(name: &str) -> i32 {
         let (gpu, from) = crate::config::viewer_gpu(name);
         viewer_gpu_line(&mut r, &gpu, &from);
         let log = paths::vm_dir(name).join("logs").join("viewer.log");
-        if let Some(p) = std::fs::read_to_string(&log).ok().as_deref().and_then(last_viewer_path) {
-            r.line(Level::Ok, "Viewer path", &format!("{p} (last --stats line in viewer.log)"), "");
+        if let Some(p) = std::fs::read_to_string(&log)
+            .ok()
+            .as_deref()
+            .and_then(last_viewer_path)
+        {
+            r.line(
+                Level::Ok,
+                "Viewer path",
+                &format!("{p} (last --stats line in viewer.log)"),
+                "",
+            );
         }
     }
     for (t, fix) in [
@@ -1363,13 +1375,19 @@ mod tests {
                    gpu /dev/dri/renderD128\nwhy dgpu: /dev/dri/renderD128, NVIDIA discrete\n";
         assert_eq!(
             parse_resolve_gpu(out),
-            Some(("/dev/dri/renderD128".into(), "dgpu: /dev/dri/renderD128, NVIDIA discrete".into()))
+            Some((
+                "/dev/dri/renderD128".into(),
+                "dgpu: /dev/dri/renderD128, NVIDIA discrete".into()
+            ))
         );
         assert_eq!(parse_resolve_gpu("usage: ..."), None);
         let log = "conduit-viewer: stats: commit 60 fps | path: direct attach\n\
                    conduit-viewer: other\n\
                    conduit-viewer: stats: commit 5 fps | gpu-scale 5 frames | path: GPU copy (x) on /dev/dri/renderD128 | composited, blockers: y\n";
-        assert_eq!(last_viewer_path(log).as_deref(), Some("GPU copy (x) on /dev/dri/renderD128"));
+        assert_eq!(
+            last_viewer_path(log).as_deref(),
+            Some("GPU copy (x) on /dev/dri/renderD128")
+        );
         assert_eq!(last_viewer_path("nothing"), None);
     }
 

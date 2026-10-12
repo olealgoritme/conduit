@@ -125,7 +125,9 @@ fn vm_key(k: &str) -> Option<(&'static str, &str)> {
 /// `host.isolation.NAME` for a valid VM name: that VM's override.
 #[cfg(test)]
 fn vm_isolation_key(k: &str) -> Option<&str> {
-    vm_key(k).filter(|(g, _)| *g == "host.isolation.VM").map(|(_, n)| n)
+    vm_key(k)
+        .filter(|(g, _)| *g == "host.isolation.VM")
+        .map(|(_, n)| n)
 }
 
 fn key(k: &str) -> Result<&'static (&'static str, &'static [&'static str], &'static str)> {
@@ -582,9 +584,15 @@ mod tests {
     #[test]
     fn viewer_gpu_setting_and_per_vm_override() {
         let mut m = Map::new();
-        assert_eq!(viewer_gpu_of(&m, "win11"), ("auto".into(), "default".into()));
+        assert_eq!(
+            viewer_gpu_of(&m, "win11"),
+            ("auto".into(), "default".into())
+        );
         m.insert("viewer.gpu".into(), Value::String("igpu".into()));
-        assert_eq!(viewer_gpu_of(&m, "win11"), ("igpu".into(), "viewer.gpu".into()));
+        assert_eq!(
+            viewer_gpu_of(&m, "win11"),
+            ("igpu".into(), "viewer.gpu".into())
+        );
         m.insert("viewer.gpu.win11".into(), Value::String("dgpu".into()));
         assert_eq!(
             viewer_gpu_of(&m, "win11"),
@@ -596,16 +604,28 @@ mod tests {
         for ok in ["auto", "dgpu", "igpu", "/dev/dri/renderD129"] {
             assert!(gpu_value(ok), "{ok}");
         }
-        for bad in ["", "gpu0", "/dev/dri/card0", "/dev/dri/renderD", "/dev/dri/renderD1x"] {
+        for bad in [
+            "",
+            "gpu0",
+            "/dev/dri/card0",
+            "/dev/dri/renderD",
+            "/dev/dri/renderD1x",
+        ] {
             assert!(!gpu_value(bad), "{bad}");
         }
         assert!(key("viewer.gpu").is_ok());
         assert!(key("viewer.gpu.win11").is_ok());
         assert_eq!(vm_key("viewer.gpu.win11"), Some(("viewer.gpu.VM", "win11")));
-        assert_eq!(vm_key("host.isolation.win11"), Some(("host.isolation.VM", "win11")));
+        assert_eq!(
+            vm_key("host.isolation.win11"),
+            Some(("host.isolation.VM", "win11"))
+        );
         assert!(vm_key("viewer.gpu.VM").is_none());
         assert!(vm_key("viewer.gpuX").is_none());
-        assert_eq!(stored_name("viewer.gpu.win11", "viewer.gpu.VM"), "viewer.gpu.win11");
+        assert_eq!(
+            stored_name("viewer.gpu.win11", "viewer.gpu.VM"),
+            "viewer.gpu.win11"
+        );
     }
 
     #[test]
