@@ -1,5 +1,6 @@
 //! A thin, antialiased drawing layer over the GDI+ flat API.
 
+use std::cell::Cell;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::Graphics::GdiPlus::*;
@@ -37,29 +38,43 @@ pub enum Align {
 
 pub struct Gfx {
     g: *mut GpGraphics,
+    /// Device pixels per logical unit (see `scale`).
+    scale: Cell<f32>,
+    /// Drawing onto an opaque surface: text is ClearType and is laid out on
+    /// whole device pixels (font size and position), so it stays crisp.
+    /// Surfaces with alpha (icons) get plain antialiased text instead, since
+    /// ClearType needs known background pixels.
+    crisp: bool,
 }
 
 impl Gfx {
-    fn setup(g: *mut GpGraphics) -> Option<Gfx> {
+    fn setup(g: *mut GpGraphics, crisp: bool) -> Option<Gfx> {
         if g.is_null() {
             return None;
         }
         unsafe {
             GdipSetSmoothingMode(g, 4); // anti-alias
             GdipSetPixelOffsetMode(g, 2); // high quality
-            GdipSetTextRenderingHint(g, 3); // anti-alias, grid fit
+                                          // 5: ClearType, grid fit. 3: grayscale antialias, grid fit.
+            GdipSetTextRenderingHint(g, if crisp { 5 } else { 3 });
         }
-        Some(Gfx { g })
+        Some(Gfx {
+            g,
+            scale: Cell::new(1.0),
+            crisp,
+        })
     }
 
+    /// Draws onto an opaque device context (a window's back buffer).
     pub fn from_hdc(hdc: HDC) -> Option<Gfx> {
         let mut g = null_mut();
         unsafe { GdipCreateFromHDC(hdc, &mut g) };
-        Gfx::setup(g)
+        Gfx::setup(g, true)
     }
 
     /// Everything drawn afterwards is in units of `s` pixels.
     pub fn scale(&self, s: f32) {
+        self.scale.set(s);
         unsafe { GdipScaleWorldTransform(self.g, s, s, 0) };
     }
 
@@ -208,6 +223,65 @@ impl Gfx {
         f
     }
 
+    /// Runs `f` in device pixels (the scale transform lifted) when drawing
+    /// crisp text, in the current units otherwise; `f` gets the factor from
+    /// the current units to its own.
+    fn in_text_space<R>(&self, f: impl FnOnce(f32) -> R) -> R {
+        if !self.crisp {
+            return f(1.0);
+        }
+        let k = self.scale.get();
+        unsafe { GdipResetWorldTransform(self.g) };
+        let r = f(k);
+        unsafe { GdipScaleWorldTransform(self.g, k, k, 0) };
+        r
+    }
+
+    /// The size `text` takes at `px`, in the units of the current transform.
+    fn measure(&self, text: &[u16], px: f32, bold: bool) -> (f32, f32) {
+        let (fam, font) = self.font(px, bold);
+        let fmt = self.format(Align::Left, false);
+        let rect = RectF {
+            X: 0.0,
+            Y: 0.0,
+            Width: 100000.0,
+            Height: 10000.0,
+        };
+        let mut b = RectF {
+            X: 0.0,
+            Y: 0.0,
+            Width: 0.0,
+            Height: 0.0,
+        };
+        unsafe {
+            GdipMeasureString(
+                self.g,
+                text.as_ptr(),
+                (text.len() - 1) as i32,
+                font,
+                &rect,
+                fmt,
+                &mut b,
+                null_mut(),
+                null_mut(),
+            );
+            GdipDeleteStringFormat(fmt);
+            GdipDeleteFont(font);
+            GdipDeleteFontFamily(fam);
+        }
+        (b.Width, b.Height)
+    }
+
+    /// The font size to use for `px` in `in_text_space` units: a whole number
+    /// of device pixels when crisp (fractional sizes blur the hinting).
+    fn text_px(&self, px: f32, k: f32) -> f32 {
+        if self.crisp {
+            (px * k).round().max(1.0)
+        } else {
+            px
+        }
+    }
+
     /// Draw `text` in the box (x, y, w, h); the box's top is the text's top
     /// unless `vcenter`.
     #[allow(clippy::too_many_arguments)]
@@ -222,67 +296,61 @@ impl Gfx {
         (x, y, w, h): (f32, f32, f32, f32),
     ) {
         let t = wide(text);
-        let (fam, font) = self.font(px, bold);
-        let fmt = self.format(align, vcenter);
-        let rect = RectF {
-            X: x,
-            Y: y,
-            Width: w,
-            Height: h,
-        };
-        let mut b = null_mut();
-        unsafe {
-            GdipCreateSolidFill(color, &mut b);
-            GdipDrawString(
-                self.g,
-                t.as_ptr(),
-                (t.len() - 1) as i32,
-                font,
-                &rect,
-                fmt,
-                b as *const GpBrush,
-            );
-            GdipDeleteBrush(b as *mut GpBrush);
-            GdipDeleteStringFormat(fmt);
-            GdipDeleteFont(font);
-            GdipDeleteFontFamily(fam);
-        }
+        self.in_text_space(|k| {
+            let px = self.text_px(px, k);
+            let (fam, font) = self.font(px, bold);
+            let (mut x, mut y, mut w, mut h) = (x * k, y * k, w * k, h * k);
+            let (mut align, mut vcenter) = (align, vcenter);
+            if self.crisp {
+                // Place the text on a whole device pixel: align it here
+                // (GDI+ would centre on a fraction) and draw it left/top.
+                let (tw, th) = self.measure(&t, px, bold);
+                if align == Align::Center {
+                    x += (w - tw) / 2.0;
+                } else if align == Align::Right {
+                    x += w - tw;
+                }
+                if vcenter {
+                    y += (h - th) / 2.0;
+                }
+                x = x.round();
+                y = y.round();
+                w = tw + 4.0;
+                h = th + 4.0;
+                align = Align::Left;
+                vcenter = false;
+            }
+            let fmt = self.format(align, vcenter);
+            let rect = RectF {
+                X: x,
+                Y: y,
+                Width: w,
+                Height: h,
+            };
+            let mut b = null_mut();
+            unsafe {
+                GdipCreateSolidFill(color, &mut b);
+                GdipDrawString(
+                    self.g,
+                    t.as_ptr(),
+                    (t.len() - 1) as i32,
+                    font,
+                    &rect,
+                    fmt,
+                    b as *const GpBrush,
+                );
+                GdipDeleteBrush(b as *mut GpBrush);
+                GdipDeleteStringFormat(fmt);
+                GdipDeleteFont(font);
+                GdipDeleteFontFamily(fam);
+            }
+        });
     }
 
     /// The width `text` takes.
     pub fn text_width(&self, text: &str, px: f32, bold: bool) -> f32 {
         let t = wide(text);
-        let (fam, font) = self.font(px, bold);
-        let fmt = self.format(Align::Left, false);
-        let rect = RectF {
-            X: 0.0,
-            Y: 0.0,
-            Width: 10000.0,
-            Height: 1000.0,
-        };
-        let mut bounds = RectF {
-            X: 0.0,
-            Y: 0.0,
-            Width: 0.0,
-            Height: 0.0,
-        };
-        unsafe {
-            GdipMeasureString(
-                self.g,
-                t.as_ptr(),
-                (t.len() - 1) as i32,
-                font,
-                &rect,
-                fmt,
-                &mut bounds,
-                null_mut(),
-                null_mut(),
-            );
-            GdipDeleteStringFormat(fmt);
-            GdipDeleteFont(font);
-            GdipDeleteFontFamily(fam);
-        }
-        bounds.Width
+        self.in_text_space(|k| self.measure(&t, self.text_px(px, k), bold).0 / k)
     }
 }
 
@@ -304,7 +372,7 @@ pub fn make_icon(size: i32, draw: impl FnOnce(&Gfx)) -> Option<isize> {
         }
         let mut g = null_mut();
         GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut g);
-        if let Some(gfx) = Gfx::setup(g) {
+        if let Some(gfx) = Gfx::setup(g, false) {
             gfx.clear(0);
             draw(&gfx);
             drop(gfx);
