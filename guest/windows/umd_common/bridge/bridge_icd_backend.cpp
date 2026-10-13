@@ -493,6 +493,13 @@ void load_nvk() {
       _putenv_s("NVK_EXPERIMENTAL", experimental);
     }
   }
+  // DLSS (`Dlss` knob, default 0): NVK reads the same registry value itself
+  // and exposes VK_NVX_binary_import; DXVK on Windows drops the NVX
+  // extensions unless HELIOS_DXVK_NVX=1 (third_party/patches/dxvk/0023).
+  DWORD dlss = 0;
+  reg_dword("Dlss", &dlss);
+  if (dlss != 0 && !GetEnvironmentVariableA("HELIOS_DXVK_NVX", nullptr, 0))
+    _putenv_s("HELIOS_DXVK_NVX", "1");
   // LOAD_WITH_ALTERED_SEARCH_PATH: librmclient.dll next to the ICD resolves
   // first (the ICD also loads it by its own path).
   HMODULE m = LoadLibraryExW(c.nvk_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
