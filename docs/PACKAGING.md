@@ -149,6 +149,21 @@ itself so no root or sudo is needed. The build needs `gpg`, `curl` and
 tarball (same sha256) with the same patches on top of nixpkgs' QEMU
 expression.
 
+**Build identity.** Every binary says which build it is.
+`conduit`, `conduit-backend`, `conduit-userspace`, `conduit-viewer`,
+`conduit-vmm`, `conduit-venus` and `conduit-stream` print
+`NAME VERSION (git COMMIT, KIND)` for `--version`; the bundled QEMU prints
+`QEMU emulator version 11.1.2 (conduit VERSION (git COMMIT, KIND), patches N SHA8)`,
+where `N SHA8` is the count and sha256 prefix of `host/qemu/patches/`.
+`packaging/build-id.sh` computes the fields for the Rust build scripts, the
+viewer's Makefile and `build-qemu.sh`: `CONDUIT_VERSION` (`build.sh` exports
+the package version), `CONDUIT_GIT_COMMIT` (default: `HEAD`, `-dirty` with
+uncommitted changes to tracked files) and `CONDUIT_BUILD_KIND` (`release` for
+tag builds, `ci`, `rpm`, `arch`, `nix`, default `local`). `conduit doctor`
+lists them (`Build: ...` lines) and warns when a binary is not from the CLI's
+build, or when QEMU carries another patch set, kind of build or release
+(release.yml caches QEMU per version, so a release's QEMU names its commit).
+
 **CLI.** `cli/src/paths.rs` finds its helpers as `$CONDUIT_PREFIX/bin/<name>`
 (`CONDUIT_PREFIX` defaults to `/opt/conduit`; the flake sets it to its store
 path; `CONDUIT_BACKEND`, `CONDUIT_QEMU`, ... override single tools). libvirt
