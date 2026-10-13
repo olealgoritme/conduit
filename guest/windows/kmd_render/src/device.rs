@@ -164,6 +164,12 @@ impl<'a> ContextHandleRef<'a> {
         Some(device.creator_process)
     }
 
+    /// The context's identity as an opaque token (its `hContext`): what an RM gate is
+    /// keyed by beside the process. Only compared, never dereferenced through it.
+    pub fn token(&self) -> usize {
+        self.context as *const ContextContext as usize
+    }
+
     pub fn execution_stream(&self) -> u32 {
         helios_kmd_logic::execution_completion::stream(
             self.context.execution_stream.load(Ordering::Acquire),
@@ -683,6 +689,31 @@ pub unsafe extern "C" fn dxgkddi_create_context(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
+        // The context's RM gate (`virtio/gpu/rm_gates.rs`) goes with it, as a process's
+        // gates go at DestroyProcess. One load when no gate is open anywhere.
+        if crate::virtio::gpu::rm_gates_open() {
+            // SAFETY: dxgkrnl passes the live hContext CreateContext returned; it is
+            // freed below, after this.
+            if let Some(context) = unsafe { ContextHandleRef::from_raw(h_context) } {
+                if let (Some(adapter), Some(process)) =
+                    (context.adapter(), context.creator_process())
+                {
+                    let token = context.token();
+                    let purged = adapter.with_wddm_notify_lock(|guard| {
+                        guard
+                            .with_virtio(|order, v| {
+                                v.rm_gate_purge_context_ordered(order, process, token)
+                            })
+                            .unwrap_or(0)
+                    });
+                    if purged != 0 {
+                        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+                        // The fences the gate still held are owed a host `Close`.
+                        adapter.signal_hpd();
+                    }
+                }
+            }
+        }
         crate::ddi::gdi_accel::forget_context(h_context as usize);
         crate::ddi::gdi_exec::forget_context(h_context as usize);
         drop(unsafe { Box::from_raw(h_context as *mut ContextContext) });

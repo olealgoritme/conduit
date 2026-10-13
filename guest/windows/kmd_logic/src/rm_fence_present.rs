@@ -9,9 +9,10 @@
 //!   what it was attached to, and whether the KMD owes the host a `Close`;
 //! * [`ScanoutQueue`], carrier (a): the FIFO of `SCANOUT_PRESENT`s waiting for
 //!   their fences, with ready-prefix coalescing;
-//! * [`Gate`], carrier (b): the points of one process's "RM gate", the object a
+//! * [`Gate`], carrier (b): the points of one WDDM context's "RM gate", the object a
 //!   WDDM boundary in the tagged stream namespace names. A point is ready when it
-//!   and every earlier point fired.
+//!   and every earlier point of the gate fired. [`pick_gate`] decides which gate a
+//!   point goes to.
 
 use crate::foreign_scanout::Flip;
 
@@ -307,8 +308,8 @@ impl ScanoutQueue {
 // Carrier (b): the RM gate.
 // ---------------------------------------------------------------------------
 
-/// Points one gate can hold unretired. One per `Present` of the process plus one per
-/// `ExecuteCommandLists` in flight; 128 is a few frames of a busy D3D12 app.
+/// Points one gate can hold unretired. One per `Present` of the context plus one per
+/// `ExecuteCommandLists` in flight on it; 128 is a few frames of a busy D3D12 queue.
 pub const GATE_POINTS: usize = 128;
 /// The first point numbers are 1, 2, ...; a gate refuses past this and the KMD
 /// recycles it when idle, so a boundary value never wraps.
@@ -508,6 +509,153 @@ impl Gate {
     /// Back to the empty state (a recycled or purged gate).
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Which gate a point goes to: one per WDDM context.
+// ---------------------------------------------------------------------------
+//
+// A gate retires its points as a prefix, so every point waits for every point attached
+// to the same gate before it. dxgkrnl runs each WDDM context's queue on its own: a
+// packet of one context can reach the node's hardware queue while an earlier-rendered
+// packet of another context of the same process still waits in its software queue for a
+// slot. If both contexts shared a gate, the dispatched packet could not complete until
+// the undispatched one's fence fired, which needs that packet dispatched: with a 2-slot
+// hardware queue that is a deadlock only dxgkrnl's starvation preemption breaks.
+//
+// So a gate belongs to ONE context, the order the prefix enforces is exactly the order
+// dxgkrnl already imposes (a context's packets are dispatched, admitted and executed in
+// queue order), and a point never waits for another context's point. Ordering between
+// contexts is the runtime's: a queue that consumes another queue's work waits on a
+// monitored fence (`WaitForSynchronizationObjectFromGpu`), which dxgkrnl releases only
+// after the producing packet's DMA fence, i.e. after the producer's gate point fired.
+//
+// Under slot pressure (no gate entry or no stream slot free) the carrier decides:
+//
+// * an `HE12` (D3D12 ExecuteCommandLists) point is refused. That is where two queues of
+//   one process run side by side, so sharing would bring the deadlock back; a refused
+//   v4 record fails the Render and the UMD orders that batch with a CPU wait instead
+//   (slower, visible in `RmGNoGate`, never a stall);
+// * a present or flush-gate point (`HERF` / `HEPR` / `HEFL`) shares a gate of its own
+//   process. Refusing it would leave the present with no boundary at all (released
+//   before its producer finished), and a shared gate is a superset of both contexts'
+//   order, so it is correct; it can couple the contexts' completion again, which is why
+//   it is counted (`RmGShare`). A shared gate belongs to the process (context 0) and
+//   lives until the process exits.
+
+/// Who a gate belongs to: an `hKmdProcess` and one WDDM context of it (`context == 0`:
+/// the process's shared gate). Both are opaque tokens, only compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateOwner {
+    pub process: usize,
+    pub context: usize,
+}
+
+/// One live gate as [`pick_gate`] sees it: its owner and its stream handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateView {
+    pub owner: GateOwner,
+    pub handle: u32,
+}
+
+/// What [`pick_gate`] decided for a point of `(process, context)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatePick {
+    /// Attach to this gate as it is: the context's own, or the one it already bound.
+    Use(usize),
+    /// Open a new gate owned by `(process, context)`.
+    Open,
+    /// No room for a new gate and the carrier may share: attach to this gate of the same
+    /// process, which is (or becomes) the process's shared gate (owner context 0).
+    Share(usize),
+    /// No room, and the carrier may not share or the process has no gate to share.
+    NoRoom,
+}
+
+/// Pick the gate for a point of `context` in `process`. `gates` yields the live gates
+/// as `(index, view)`; `bound` is the stream the context already bound (its
+/// `execution_stream`, 0 = none), `room` whether a gate entry and a stream slot are free,
+/// `may_share` whether the carrier may fall back to a shared gate (presents and flush
+/// gates, not `HE12`).
+///
+/// In order: the gate the context already bound (an `HE12` context's stream is sticky);
+/// the context's own gate; a new one; then, only if `may_share`, the process's shared
+/// gate or any gate of the process, shared from now on; none.
+pub fn pick_gate(
+    gates: impl Iterator<Item = (usize, GateView)> + Clone,
+    process: usize,
+    context: usize,
+    bound: u32,
+    room: bool,
+    may_share: bool,
+) -> GatePick {
+    let mine = gates.filter(move |(_, g)| g.owner.process == process);
+    if bound != 0 {
+        if let Some((i, _)) = mine.clone().find(|(_, g)| g.handle == bound) {
+            return GatePick::Use(i);
+        }
+    }
+    if let Some((i, _)) = mine.clone().find(|(_, g)| g.owner.context == context) {
+        return GatePick::Use(i);
+    }
+    if room {
+        return GatePick::Open;
+    }
+    if !may_share {
+        return GatePick::NoRoom;
+    }
+    if let Some((i, _)) = mine.clone().find(|(_, g)| g.owner.context == 0) {
+        return GatePick::Share(i);
+    }
+    match mine.clone().next() {
+        Some((i, _)) => GatePick::Share(i),
+        None => GatePick::NoRoom,
+    }
+}
+
+/// How many cancelled gate handles [`CancelledGates`] remembers.
+pub const CANCELLED_GATES: usize = 16;
+
+/// The stream handles of the gates cancelled most recently (a context or process purge).
+/// A cancel latches every execution wait already queued that names the gate, but a
+/// packet that reaches `SubmitCommand` after the cancel would create a wait no live gate
+/// can ever observe, and an execution wait is never rebased: it would hold its node's
+/// WDDM FIFO head until a TDR. dxgkrnl does not submit for a destroyed context, so this
+/// is a guard, not a path: such a wait is latched as ended at creation instead (the same
+/// "cancelled" meaning the purge gives it). Handles are generation-qualified, so a slot
+/// reused by a new gate never matches an old entry.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelledGates {
+    handles: [u32; CANCELLED_GATES],
+    next: usize,
+}
+
+impl Default for CancelledGates {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelledGates {
+    pub const fn new() -> Self {
+        Self {
+            handles: [0; CANCELLED_GATES],
+            next: 0,
+        }
+    }
+
+    /// Gate `handle` was cancelled (0 is ignored).
+    pub fn note(&mut self, handle: u32) {
+        if handle == 0 || self.contains(handle) {
+            return;
+        }
+        self.handles[self.next % CANCELLED_GATES] = handle;
+        self.next = (self.next + 1) % CANCELLED_GATES;
+    }
+
+    pub fn contains(&self, handle: u32) -> bool {
+        handle != 0 && self.handles.contains(&handle)
     }
 }
 
@@ -1273,5 +1421,281 @@ mod gate_expiry_tests {
         assert_eq!(clamp_gate_expire_ms(5), GATE_EXPIRE_MIN_MS);
         assert_eq!(clamp_gate_expire_ms(6_000), 6_000);
         assert_eq!(clamp_gate_expire_ms(u32::MAX), GATE_EXPIRE_MAX_MS);
+    }
+}
+
+#[cfg(test)]
+mod gate_per_context_tests {
+    extern crate std;
+    use super::*;
+    use std::vec::Vec;
+
+    const PROC: usize = 0x1000;
+    const CTX_A: usize = 0xa0;
+    const CTX_B: usize = 0xb0;
+
+    fn view(process: usize, context: usize, handle: u32) -> GateView {
+        GateView {
+            owner: GateOwner { process, context },
+            handle,
+        }
+    }
+
+    fn pick(gates: &[GateView], context: usize, bound: u32, room: bool) -> GatePick {
+        pick_gate(
+            gates.iter().copied().enumerate(),
+            PROC,
+            context,
+            bound,
+            room,
+            true,
+        )
+    }
+
+    fn pick_he12(gates: &[GateView], context: usize, bound: u32, room: bool) -> GatePick {
+        pick_gate(
+            gates.iter().copied().enumerate(),
+            PROC,
+            context,
+            bound,
+            room,
+            false,
+        )
+    }
+
+    #[test]
+    fn each_context_gets_its_own_gate() {
+        assert_eq!(pick(&[], CTX_A, 0, true), GatePick::Open);
+        let gates = [view(PROC, CTX_A, 0x41)];
+        assert_eq!(pick(&gates, CTX_A, 0, true), GatePick::Use(0));
+        assert_eq!(pick(&gates, CTX_B, 0, true), GatePick::Open);
+        let gates = [view(PROC, CTX_A, 0x41), view(PROC, CTX_B, 0x42)];
+        assert_eq!(pick(&gates, CTX_B, 0, true), GatePick::Use(1));
+        assert_eq!(pick(&gates, CTX_B, 0x42, false), GatePick::Use(1));
+    }
+
+    #[test]
+    fn another_process_s_gate_is_never_picked() {
+        let gates = [view(0x2000, CTX_A, 0x41), view(0x2000, 0, 0x42)];
+        assert_eq!(pick(&gates, CTX_A, 0, true), GatePick::Open);
+        assert_eq!(pick(&gates, CTX_A, 0x41, false), GatePick::NoRoom);
+    }
+
+    #[test]
+    fn with_no_room_a_context_shares_a_gate_of_its_process() {
+        // No gate of the process: refused, as when the table is full.
+        assert_eq!(pick(&[], CTX_B, 0, false), GatePick::NoRoom);
+        // A's own gate is shared (it becomes the process's gate).
+        let gates = [view(0x2000, CTX_B, 0x40), view(PROC, CTX_A, 0x41)];
+        assert_eq!(pick(&gates, CTX_B, 0, false), GatePick::Share(1));
+        // Once shared (context 0), it is the one shared again, before another own gate.
+        let gates = [view(PROC, CTX_A, 0x41), view(PROC, 0, 0x43)];
+        assert_eq!(pick(&gates, CTX_B, 0, false), GatePick::Share(1));
+        // With room again a context without a stream of its own opens its own gate.
+        assert_eq!(pick(&gates, CTX_B, 0, true), GatePick::Open);
+    }
+
+    #[test]
+    fn cancelled_gates_are_remembered_and_the_oldest_drop_out() {
+        let mut c = CancelledGates::new();
+        assert!(!c.contains(0));
+        c.note(0);
+        assert!(!c.contains(0));
+        c.note(0x41);
+        c.note(0x41);
+        assert!(c.contains(0x41));
+        for h in 0..CANCELLED_GATES as u32 {
+            c.note(0x100 + h);
+        }
+        assert!(
+            !c.contains(0x41),
+            "the oldest is dropped once the ring is full"
+        );
+        assert!(c.contains(0x100) && c.contains(0x100 + CANCELLED_GATES as u32 - 1));
+    }
+
+    #[test]
+    fn an_he12_point_never_shares_a_gate() {
+        // No room: refused, whatever gates the process has; the UMD orders that batch
+        // with a CPU wait instead.
+        let gates = [view(PROC, CTX_A, 0x41), view(PROC, 0, 0x43)];
+        assert_eq!(pick_he12(&gates, CTX_B, 0, false), GatePick::NoRoom);
+        // Its own gate, a bound one and a new one are fine.
+        assert_eq!(pick_he12(&gates, CTX_A, 0, false), GatePick::Use(0));
+        assert_eq!(pick_he12(&gates, CTX_B, 0x43, false), GatePick::Use(1));
+        assert_eq!(pick_he12(&gates, CTX_B, 0, true), GatePick::Open);
+    }
+
+    #[test]
+    fn a_bound_stream_is_kept_even_when_room_comes_back() {
+        // B shared the process gate 0x43 and bound it (HE12): it stays there, so its
+        // sticky execution stream keeps binding.
+        let gates = [view(PROC, CTX_A, 0x41), view(PROC, 0, 0x43)];
+        assert_eq!(pick(&gates, CTX_B, 0x43, true), GatePick::Use(1));
+        // A context bound to its own gate.
+        assert_eq!(pick(&gates, CTX_A, 0x41, true), GatePick::Use(0));
+        // A bound stream that is not a gate of the process (a Venus stream, a purged
+        // gate) is no gate to keep: the usual order applies, and the HE12 caller's
+        // `may_bind_stream` check refuses before anything is taken.
+        assert_eq!(pick(&gates, CTX_B, 0x77, true), GatePick::Open);
+    }
+
+    // ---- The interleaved two-context case ----------------------------------------
+    //
+    // A model of one node: per-context software queues (dxgkrnl dispatches each
+    // context's packets in its own order), a 2-slot hardware queue retired strictly in
+    // order (the KMD's per-node WDDM FIFO), and a batch that runs, so its RM fence
+    // fires, only once its packet is in the hardware queue (admission at dispatch).
+    // A packet leaves the hardware queue when it is the head and its gate point retired.
+
+    #[derive(Clone, Copy, Debug)]
+    struct Packet {
+        context: usize,
+        fence: u32,
+        gate: usize,
+        point: u32,
+    }
+
+    /// Runs the model to a fixed point; returns the fences of the packets that
+    /// completed, in completion order.
+    fn run(per_context: bool, render_order: &[(usize, u32)], first_dispatch: &[u32]) -> Vec<u32> {
+        let mut gates: Vec<(GateOwner, Gate)> = Vec::new();
+        let mut packets: Vec<Packet> = Vec::new();
+        for &(context, fence) in render_order {
+            let key = if per_context { context } else { 0 };
+            let handle = |i: usize| i as u32 + 1;
+            let views: Vec<(usize, GateView)> = gates
+                .iter()
+                .enumerate()
+                .map(|(i, (owner, _))| {
+                    (
+                        i,
+                        GateView {
+                            owner: *owner,
+                            handle: handle(i),
+                        },
+                    )
+                })
+                .collect();
+            let gi = match pick_gate(views.iter().copied(), PROC, key, 0, true, false) {
+                GatePick::Use(i) => i,
+                GatePick::Open => {
+                    gates.push((
+                        GateOwner {
+                            process: PROC,
+                            context: key,
+                        },
+                        Gate::new(),
+                    ));
+                    gates.len() - 1
+                }
+                other => panic!("{other:?}"),
+            };
+            let point = gates[gi].1.attach(fence, false).unwrap();
+            packets.push(Packet {
+                context,
+                fence,
+                gate: gi,
+                point,
+            });
+        }
+        // Software queues, one per context, in render order.
+        let mut software: Vec<Packet> = packets.clone();
+        let mut hardware: Vec<Packet> = Vec::new();
+        // dxgkrnl's worst case: these packets go first, whatever the render order.
+        for f in first_dispatch {
+            let i = software.iter().position(|p| p.fence == *f).unwrap();
+            // Only the head of its context's software queue can be dispatched.
+            assert!(software[..i]
+                .iter()
+                .all(|p| p.context != software[i].context));
+            hardware.push(software.remove(i));
+        }
+        let mut done = Vec::new();
+        loop {
+            let mut moved = false;
+            // Admitted batches run and their fences fire.
+            for p in &hardware {
+                gates[p.gate].1.fire(p.fence);
+            }
+            // The FIFO head retires when its point did.
+            while let Some(head) = hardware.first().copied() {
+                if gates[head.gate].1.retired() < head.point {
+                    break;
+                }
+                hardware.remove(0);
+                done.push(head.fence);
+                moved = true;
+            }
+            // A free slot takes the oldest packet at the head of a context's queue.
+            while hardware.len() < 2 && !software.is_empty() {
+                hardware.push(software.remove(0));
+                moved = true;
+            }
+            if !moved {
+                return done;
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_contexts_do_not_block_each_other() {
+        // Render order: A1, B1, B2, A2. dxgkrnl dispatches B's queue first, so B1 and
+        // B2 hold both slots while A1, rendered before them, waits for one.
+        let order = [(CTX_A, 11), (CTX_B, 21), (CTX_B, 22), (CTX_A, 12)];
+        let done = run(true, &order, &[21, 22]);
+        assert_eq!(done.len(), order.len(), "every packet completes: {done:?}");
+        // B's packets complete on their own fences, before A's are even dispatched.
+        assert_eq!(&done[..2], &[21, 22]);
+    }
+
+    #[test]
+    fn one_gate_for_both_contexts_deadlocks_the_two_slots() {
+        // The same schedule on a shared gate: B1's point waits for A1's, A1 cannot get
+        // a slot while B1 and B2 hold both. Nothing completes. This is the state only
+        // dxgkrnl's starvation preemption used to break.
+        let order = [(CTX_A, 11), (CTX_B, 21), (CTX_B, 22), (CTX_A, 12)];
+        assert!(run(false, &order, &[21, 22]).is_empty());
+    }
+
+    #[test]
+    fn a_context_s_own_order_still_holds() {
+        // Within a context the prefix rule stays: a later point fired first does not
+        // retire before the earlier one.
+        let mut a = Gate::new();
+        let p1 = a.attach(11, false).unwrap();
+        let p2 = a.attach(12, false).unwrap();
+        a.fire(12);
+        assert!(a.retired() < p2);
+        a.fire(11);
+        assert!(a.retired() >= p1 && a.retired() >= p2);
+    }
+
+    #[test]
+    fn interleaved_schedules_never_stall_per_context() {
+        // Every interleaving of two contexts' render order, and every legal first
+        // dispatch pair (heads of the per-context queues), completes everything.
+        let a = [11u32, 12, 13];
+        let b = [21u32, 22, 23];
+        for mask in 0u32..(1 << 6) {
+            if mask.count_ones() != 3 {
+                continue;
+            }
+            let (mut ia, mut ib) = (0, 0);
+            let mut order = Vec::new();
+            for bit in 0..6 {
+                if mask & (1 << bit) != 0 {
+                    order.push((CTX_A, a[ia]));
+                    ia += 1;
+                } else {
+                    order.push((CTX_B, b[ib]));
+                    ib += 1;
+                }
+            }
+            for first in [[11, 12], [21, 22], [11, 21], [21, 11]] {
+                let done = run(true, &order, &first);
+                assert_eq!(done.len(), 6, "order {order:?} first {first:?}: {done:?}");
+            }
+        }
     }
 }

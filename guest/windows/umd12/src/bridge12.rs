@@ -280,6 +280,11 @@ mod ffi {
         /// The engine's GPU timestamp counters; returns how many it wrote.
         fn helios_vkd3d_bridge_gpu_time_stats(out: &mut [u64]) -> u32;
 
+        /// NVK (vkd3d patch 0011): completion hints. `cb` is an
+        /// `unsafe extern "C" fn(*const u32, u32)` (0 = off), `spin_us` the
+        /// worker's poll budget per admission wait (0 = off).
+        fn helios_vkd3d_bridge_set_completion_hint(cb: usize, spin_us: u32);
+
         /// NVK: make the queue's next ECL fence now.
         ///
         /// # Safety
@@ -789,12 +794,23 @@ pub(crate) const MEMORY_STATS_LEN: usize = 385;
 /// made, creates failed, then 7 histogram buckets; then (vkd3d patch 0006)
 /// admissions, commit-to-admission sum (us), its 7 buckets, the ECL fences'
 /// admission-to-signal sum (us), inline producer signals, separate ones; then
-/// (patch 0009) fences made ahead and those taken. An engine without a patch
-/// leaves its values zero.
-pub(crate) fn ecl_fence_stats() -> [u64; 28] {
-    let mut out = [0u64; 28];
+/// (patch 0009) fences made ahead and those taken; then (patch 0011) completion
+/// hint calls, fences named, ring entries overwritten unseen, and the
+/// done-to-admission sum (us) and count. An engine without a patch leaves its
+/// values zero.
+pub(crate) fn ecl_fence_stats() -> [u64; ECL_FENCE_STATS_LEN] {
+    let mut out = [0u64; ECL_FENCE_STATS_LEN];
     ffi::helios_vkd3d_bridge_ecl_fence_stats(&mut out);
     out
+}
+
+/// Values in [`ecl_fence_stats`].
+pub(crate) const ECL_FENCE_STATS_LEN: usize = 33;
+
+/// NVK (vkd3d patch 0011): hand the engine the completion-hint callback and the
+/// worker's poll budget (`cb` 0 or `spin_us` 0: off). Process-wide.
+pub(crate) fn set_completion_hint(cb: usize, spin_us: u32) {
+    ffi::helios_vkd3d_bridge_set_completion_hint(cb, spin_us);
 }
 
 /// NVK (vkd3d patch 0009): make `queue`'s next ECL fence now, so that ECL's

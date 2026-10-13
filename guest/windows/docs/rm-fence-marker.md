@@ -179,7 +179,7 @@ struct HeliosRmFenceTail {
   `HELIOS_NVRM_CAP_PRESENT_FENCE`. `HE12` is carrier (a)-like: the UMD sees `Render`'s
   status, so every refusal leaves the handle the caller's, and everything that can
   still refuse is checked BEFORE the fence is taken: a context's last bound stream must
-  be this process's gate (or none yet; a context that mixed stream and fence `HE12`s is
+  be the gate this point goes to (or none yet; a context that mixed stream and fence `HE12`s is
   refused up front, not after the take), and `Render`'s own argument checks (patch
   lists) come before any parsing of tails.
 * **Refusal rule for `HERF` / `HEPR` (the UMD cannot see it).** Their `Render` returns
@@ -213,14 +213,33 @@ struct HeliosRmFenceTail {
   stays in the existing tagged stream namespace (bit 63 set, generation-qualified 31-bit
   handle, 32-bit value), so every consumer of boundaries keeps working unchanged:
   `merge_stream_boundary`, the windowed-blit and fast-bind staging, `execution_completion`
-  waits, dead-stream discharge. The handle names a per-process "RM gate", a slot of the
+  waits, dead-stream discharge. The handle names a per-context "RM gate", a slot of the
   present-stream table with no Venus context (`ctx_id = 0`, `cookie = 0`, so no marker or
   tag can name it) whose "retired value" is advanced by fences instead of used-ring
   responses. Each attached fence takes the gate's next point `p = 1, 2, ...`; the
   boundary is `encode(gate_handle, p)`. A point is ready when it and every earlier point
   of the gate fired (prefix retirement, so a merged DMA buffer carrying two presents of
-  one process waits for both, and an out-of-order fire never lets a later point read as
+  one context waits for both, and an out-of-order fire never lets a later point read as
   retired before an earlier one).
+* **One gate per WDDM context.** A gate is keyed by the context's `hKmdProcess` and its
+  `hContext`. dxgkrnl dispatches each context's queue on its own, so a gate shared by two
+  contexts (two D3D12 queues of one process, both on node 0) could hold a dispatched
+  packet behind the point of an earlier-rendered packet of the other context that has
+  no hardware-queue slot yet; with two slots per node that deadlocks until dxgkrnl's
+  starvation preemption (whole clock ticks). Per context, the prefix only enforces the
+  order dxgkrnl already imposes on that context. Ordering between contexts is the
+  runtime's: a queue that consumes another queue's work waits on a monitored fence,
+  which dxgkrnl releases only after the producer's DMA fence, i.e. after the producer's
+  point fired. A present's point is in the gate of the context that presents. With no
+  gate entry or stream slot free, an `HE12` point is refused (`RmGNoGate`; the Render
+  fails and the UMD orders that batch with a CPU wait), because sharing would couple two
+  queues again; a present or flush-gate point shares a gate of its own process instead
+  (it becomes the process's gate, counted `RmGShare`), because refusing it would leave
+  the present with no boundary at all. An `HE12` context keeps the gate its execution
+  stream bound. A context's gate is purged at `DestroyContext`, a shared one at
+  `DestroyProcess`; a packet submitted for a gate already purged has its execution wait
+  latched as ended at once (`RmGDeadSub`, a guard: dxgkrnl does not submit for a
+  destroyed context) (`kmd_logic::rm_fence_present::pick_gate`, `CancelledGates`).
 * **Two handles in one DMA buffer.** The private record carries ONE boundary, and a
   process can now put two handles in a buffer (a gate and a registered stream: a fenced
   present beside the CPU-complete marker `(ctx, 0, cookie)`, or a stream beside a
@@ -241,10 +260,10 @@ struct HeliosRmFenceTail {
   pass re-evaluates the WDDM FIFO head, the deferred fast bind and the windowed blit, all
   of which read `scanout_boundary_ready`. The handle is queued for a host `Close` that the
   HPD worker sends (PASSIVE).
-* **Limits.** 8 gates (processes), 128 unretired points per gate (a D3D12 app with more
+* **Limits.** 32 gates (contexts), 128 unretired points per gate (a D3D12 queue with more
   `ExecuteCommandLists` in flight than that has its next v4 record refused: the UMD then
   falls back to a CPU wait plus the `COMPLETE` variant), and a gate refuses past 2^32 - 1025
-  points (about 49 days at 1000 presents/s; it is recycled when its process exits). The
+  points (about 49 days at 1000 presents/s; it is recycled when its context or process goes). The
   KMD holds at most 512 fence handles as its own at a time (attached or owed a close,
   `MAX_NVRM_ATTACHED_FENCES`): a fence leaves its creator's 128-per-process quota when
   the KMD takes it and is counted there instead, so attached fences can neither fill the
@@ -282,7 +301,7 @@ A pending fence of an attached present is released by every path that ends the p
 |---|---|---|
 | fires (any status) | retires | closed by the HPD worker |
 | (a) source released / DRM file closed / device destroyed / process exit / lapse | queued flips dropped unsent | closed (queued for the worker) |
-| (b) device destroyed / process exit | the process's gate is purged like a stream whose owner died: waits that named it are discharged and counted (`RmGCan`), so no DMA fence stays pinned behind a dead process | closed |
+| (b) context destroyed / process exit | the context's gate (at process exit: every gate of the process) is purged like a stream whose owner died: waits that named it are discharged and counted (`RmGCan`), so no DMA fence stays pinned behind a dead process | closed |
 | transport lost or reset (`StopDevice`, TDR reset, failure) | gates and queued flips are purged exactly like Venus streams (`purge_all_present_streams`): the present's wait is DISCHARGED, never treated as satisfied, and counted | the sweep closes every handle on the host (`close_all_on_host`) |
 
 The retire-on-teardown for (b) follows the existing dead-stream rule: a purged stream is
@@ -301,6 +320,50 @@ packet pinned at the head of the adapter-wide FIFO for good (nobody can fire a c
 fence). A Venus stream's execution waits keep their own, unchanged rule. In practice
 dxgkrnl has retired a process's DMA buffers before `DestroyProcess`; this is the net
 under an abnormal exit.
+
+## Completion hints
+
+An `HE12` v4 packet completes when its fence fires, and the fire comes from the host:
+the GPU's semaphore release raises a non-stall interrupt, nvidia-drm's semaphore-surface
+callback signals the sync_file on its work thread, the backend's event thread sends
+`EventReady`, and the KMD's DPC fires the gate point. dxgkrnl keeps about two packets
+per node in flight. The UMD queues a batch's admission event (SignalAtSubmission) ahead
+of its packet (`Nvk12AdmitBeforeRender`, default 1), so it fires once everything before
+the batch on the context was submitted, and a batch reaches NVK once the packet three
+ahead of it completed (two ahead with `Nvk12AdmitBeforeRender=0`, where the admission
+follows the batch's own packet). The host leg sits between batches on the GPU whenever
+the batches in between are shorter than the round trip.
+
+With `Nvk12CompletionHint` (UMD, microseconds, default 0 = off) the guest shortcuts that
+leg. vkd3d's queue worker (patch 0011) records, per queue, each batch's ECL fence with
+the producer value the batch signals; while it waits for an admission it polls the
+admission event and the producer timeline (CPU-visible memory the GPU writes right
+after the batch) for up to that budget, and hands the fences of the batches it saw
+finish to the UMD (`umd12/src/forward12/ecl_hint.rs`). The UMD sends them in one
+`HELIOS_ESCAPE_ECL_DONE` (verb `0x0019`, `protocol/src/ecl_done.rs`: header, `count`,
+three out counts, up to 16 handles; 96 bytes) on its own D3DKMT device, opened once per
+process on the adapter that answers the verb.
+
+The KMD (`ddi/escape.rs` `escape_ecl_done`, `rm_gates.rs` `ecl_done_hint`) takes the
+process from the escaping device's `hKmdProcess` and decides per handle under
+`virtio_lock` (`kmd_logic::ecl_done::verdict`): a fence the KMD holds (`KMD_RM`),
+attached to a gate point, created in that process, on a live gate of that process, and
+not fired yet is fired exactly as its first `EventReady` would fire it (the point, the
+stream slot, the execution waits that name it; the handle is owed a `Close`). Anything
+else changes nothing: unknown or closed handles, other processes' fences, fences no
+carrier took yet (the host fire and the early-fire latch cover them), scanout or
+discarded fences, and fences that fired already (`late`). When any fired the escape
+queues the completion DPC, which releases the packets' DMA completions as after an
+`EventReady`, and wakes the worker for the `Close`s. The host's `EventReady` that
+follows is a repeat and is ignored. Host fence handles are never reused within a
+transport (the backend numbers them upward), so a hint that arrives after its fence was
+closed names nothing.
+
+What a hint can do wrong is limited to the hinting process: it completes that process's
+own packets early, so its own fence signals and presents could run ahead of its own
+work. The UMD names a fence only after the producer timeline passed the batch's value,
+which the GPU writes after the batch's work. A KMD without the verb fails the UMD's
+probe and hints stay off.
 
 ## Capability bits
 
@@ -334,6 +397,10 @@ teardown, `RmGRef` markers refused (not owned / not a fence / already attached /
 markers / no gate room or fence quota), `RmGTake` handles of a `HERF` / `HEPR` tail
 taken and closed although no marker was attached (the refusal rule), `PrBndDrop`
 boundaries of two handles that met in one DMA buffer and cost the later present its wait.
+Completion hints: `E12HintEsc` escapes served, `E12HintFire` fences fired on a hint,
+`E12HintLate` named fences that had fired already (the host was first), `E12HintRef`
+named handles refused, `E12HintWhy` the last refusal (1 unknown, 2 not a fence, 3 not
+taken yet, 4 not a gate point, 5 not the caller's).
 Common: `NvFenceCl` (existing) counts every fence handle closed, including the KMD's;
 `FnCloseErr` counts the KMD's closes the host did not take.
 

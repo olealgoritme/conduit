@@ -260,6 +260,22 @@ fn log_engine_timing(frames: u64) {
             st[27],
         );
     }
+    if st[28] != 0 {
+        let h = super::ecl_hint::hint_stats();
+        log_error!(
+            "completion hints: {} calls naming {} fences ({} ring entries overwritten unseen); KMD: {} escapes \
+             ({} failed), fired {} late {} refused {}; batches seen done to next admission avg {} us",
+            st[28],
+            st[29],
+            st[30],
+            h[0],
+            h[1],
+            h[2],
+            h[3],
+            h[4],
+            if st[32] != 0 { st[31] / st[32] } else { 0 },
+        );
+    }
     let gt = crate::bridge12::gpu_time_stats();
     let batches = gt[0];
     if batches != 0 {

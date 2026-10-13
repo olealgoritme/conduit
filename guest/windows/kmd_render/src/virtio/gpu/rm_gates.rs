@@ -4,8 +4,13 @@
 //! namespace, so every consumer of boundaries (WDDM FIFO head, deferred fast bind,
 //! windowed blit, execution waits, dead-stream discharge) works unchanged.
 //!
-//! One gate per process (`hKmdProcess`). A gate is a slot of the present-stream table
-//! with no Venus context (`ctx_id == 0`, `cookie == 0`: nothing that finds streams by
+//! One gate per WDDM context (keyed by the context's `hKmdProcess` and its `hContext`):
+//! a gate retires its points as a prefix, and only the packets of one context are
+//! dispatched by dxgkrnl in the order they were rendered, so a gate shared by two
+//! contexts could hold a dispatched packet behind a point of a packet that cannot get a
+//! hardware-queue slot (`helios_kmd_logic::rm_fence_present::pick_gate` has the whole
+//! argument and the fallback under slot pressure). A gate is a slot of the present-stream
+//! table with no Venus context (`ctx_id == 0`, `cookie == 0`: nothing that finds streams by
 //! context or cookie can name it, and its owner is [`DeviceOwner::KMD_RM`], which no
 //! escape can present), whose retired value is advanced by [`Gate::fire`] instead of
 //! by used-ring responses. The point rules (prefix retirement, early fire, bounds) are
@@ -18,14 +23,22 @@
 use super::nvrm_tables::{FenceClaim, FenceRefusal};
 use super::*;
 use helios_kmd_logic::nvrm_fence::NVGPU_CFG_DRM_FENCES;
-use helios_kmd_logic::rm_fence_present::{Attach, Gate, GateError, GATE_POINTS};
+use helios_kmd_logic::rm_fence_present::{
+    pick_gate, Attach, Gate, GateError, GateOwner, GatePick, GateView, GATE_POINTS,
+};
 
-/// Most processes with a live gate at once. A gate lives until its process exits, and each takes
-/// one of the 64 present-stream slots. 8 was too few once every NVK process presents with an RM
-/// fence (`DwmIcd=nvk` and the NVK desktop): 376.1 had about 15 explorer.exe processes plus DWM,
-/// Notepad and Heaven, and every present of a process past the eighth was refused `NoRoom`
-/// (`RmGRef` 11851 = `RmGTake`), so its Blt reached the copy-engine route with no boundary
-/// (`CeRtWhy` 1 on every one). 32 leaves half the stream slots to Venus streams.
+/// The completion-hint verdict, re-exported for the escape.
+pub use helios_kmd_logic::ecl_done::Verdict as EclVerdict;
+
+/// Most gates live at once (one per WDDM context that attached a fence; a context's gate lives
+/// until the context is destroyed, a shared gate until its process exits), and each takes one of
+/// the 64 present-stream slots. With no gate free an `HE12` point is refused (`RmGNoGate`) and a
+/// present or flush-gate point shares a gate of its own process (`RmGShare`). 8 was too few once
+/// every NVK process presents with an RM fence (`DwmIcd=nvk` and the NVK desktop): 376.1 had
+/// about 15 explorer.exe processes plus DWM, Notepad and Heaven, and every present of a process
+/// past the eighth was refused `NoRoom` (`RmGRef` 11851 = `RmGTake`), so its Blt reached the
+/// copy-engine route with no boundary (`CeRtWhy` 1 on every one). 32 leaves half the stream
+/// slots to Venus streams.
 pub(super) const MAX_RM_GATES: usize = 32;
 const _: () = assert!(MAX_RM_GATES <= u8::MAX as usize);
 const _: () = assert!(MAX_RM_GATES <= helios_kmd_logic::present_stream::MAX_STREAMS / 2);
@@ -53,6 +66,27 @@ pub static RMG_EXPIRE_MS: AtomicU32 = AtomicU32::new(0);
 /// (`RmGWhyMsk`, bit `1 << (code - 1)`).
 pub static RMG_WHY: AtomicU32 = AtomicU32::new(0);
 pub static RMG_WHY_MASK: AtomicU32 = AtomicU32::new(0);
+/// Completion hints (`HELIOS_ESCAPE_ECL_DONE`, `helios_kmd_logic::ecl_done`): escapes
+/// served (`E12HintEsc`), named fences this KMD fired on the hint (`E12HintFire`), named
+/// fences that had fired already, i.e. the host's `EventReady` was first (`E12HintLate`),
+/// named handles refused (`E12HintRef`) and the last refusal's reason (`E12HintWhy`:
+/// 1 unknown, 2 not a fence, 3 not taken yet, 4 not a gate point, 5 not the caller's).
+pub static ECL_HINT_ESCAPES: AtomicU32 = AtomicU32::new(0);
+pub static ECL_HINT_FIRED: AtomicU32 = AtomicU32::new(0);
+pub static ECL_HINT_LATE: AtomicU32 = AtomicU32::new(0);
+pub static ECL_HINT_REFUSED: AtomicU32 = AtomicU32::new(0);
+pub static ECL_HINT_WHY: AtomicU32 = AtomicU32::new(0);
+/// Present / flush-gate points that went to a gate shared by several contexts of a process
+/// because no gate or stream slot was free for the context's own (`RmGShare`). A shared gate
+/// can couple the contexts' DMA completion again.
+pub static RMG_SHARED: AtomicU32 = AtomicU32::new(0);
+/// Points refused because no gate or stream slot was free for the context's own gate and
+/// the carrier may not share (`HE12`) or the process has no gate (`RmGNoGate`; also
+/// `RmGWhy` 4).
+pub static RMG_NO_GATE: AtomicU32 = AtomicU32::new(0);
+/// Execution waits created at `SubmitCommand` for a gate that was already cancelled, latched
+/// as ended at once (`RmGDeadSub`; a guard, expected 0: see `CancelledGates`).
+pub static RMG_DEAD_SUBMIT: AtomicU32 = AtomicU32::new(0);
 /// Gates open now (a count, not a counter): `DestroyProcess` reads it before it
 /// touches the adapter, so a process exit with no gate open costs one load.
 static RMG_OPEN: AtomicU32 = AtomicU32::new(0);
@@ -79,13 +113,22 @@ pub fn publish_rm_gate_counters() {
     rec(b"RmGateMsEff", RMG_EXPIRE_MS.load(Ordering::Relaxed));
     rec(b"RmGWhy", RMG_WHY.load(Ordering::Relaxed));
     rec(b"RmGWhyMsk", RMG_WHY_MASK.load(Ordering::Relaxed));
+    rec(b"E12HintEsc", ECL_HINT_ESCAPES.load(Ordering::Relaxed));
+    rec(b"E12HintFire", ECL_HINT_FIRED.load(Ordering::Relaxed));
+    rec(b"E12HintLate", ECL_HINT_LATE.load(Ordering::Relaxed));
+    rec(b"E12HintRef", ECL_HINT_REFUSED.load(Ordering::Relaxed));
+    rec(b"E12HintWhy", ECL_HINT_WHY.load(Ordering::Relaxed));
+    rec(b"RmGShare", RMG_SHARED.load(Ordering::Relaxed));
+    rec(b"RmGNoGate", RMG_NO_GATE.load(Ordering::Relaxed));
+    rec(b"RmGDeadSub", RMG_DEAD_SUBMIT.load(Ordering::Relaxed));
 }
 
-/// One gate: the process it belongs to, the present-stream slot that carries its
-/// boundary, and its points.
+/// One gate: the process and context it belongs to (context 0: shared by the process's
+/// contexts), the present-stream slot that carries its boundary, and its points.
 pub(super) struct RmGateSlot {
     in_use: bool,
     process: usize,
+    context: usize,
     stream_index: usize,
     gate: Gate,
 }
@@ -95,6 +138,7 @@ impl RmGateSlot {
         Self {
             in_use: false,
             process: 0,
+            context: 0,
             stream_index: 0,
             gate: Gate::new(),
         }
@@ -157,20 +201,49 @@ impl VirtioGpu {
             && self.cfg_features & NVGPU_CFG_DRM_FENCES != 0
     }
 
-    fn rm_gate_of(&self, process: usize) -> Option<usize> {
-        self.rm_gates
+    /// A free present-stream slot a gate can take.
+    fn rm_gate_free_stream(&self) -> Option<usize> {
+        self.present_streams
             .iter()
-            .position(|g| g.in_use && g.process == process)
+            .position(|slot| !slot.live && slot.generation < PRESENT_STREAM_GENERATION_MAX)
     }
 
-    /// Open the gate of `process`: a free gate entry and a free stream slot.
-    fn rm_gate_open(&mut self, process: usize) -> Option<usize> {
-        let gi = self.rm_gates.iter().position(|g| !g.in_use)?;
-        let (si, _) = self
-            .present_streams
+    /// Which gate a point of `context` in `process` goes to; `bound` is the stream the
+    /// context already bound (0 = none), `may_share` whether the carrier may fall back to
+    /// a shared gate (not `HE12`). Read-only.
+    fn rm_gate_pick(
+        &self,
+        process: usize,
+        context: usize,
+        bound: u32,
+        may_share: bool,
+    ) -> GatePick {
+        let room = self.rm_gates.iter().any(|g| !g.in_use) && self.rm_gate_free_stream().is_some();
+        let streams = &self.present_streams;
+        let gates = self
+            .rm_gates
             .iter()
             .enumerate()
-            .find(|(_, slot)| !slot.live && slot.generation < PRESENT_STREAM_GENERATION_MAX)?;
+            .filter(|(_, g)| g.in_use)
+            .map(move |(i, g)| {
+                (
+                    i,
+                    GateView {
+                        owner: GateOwner {
+                            process: g.process,
+                            context: g.context,
+                        },
+                        handle: streams[g.stream_index].handle(g.stream_index),
+                    },
+                )
+            });
+        pick_gate(gates, process, context, bound, room, may_share)
+    }
+
+    /// Open a gate owned by `(process, context)`: a free gate entry and a free stream slot.
+    fn rm_gate_open(&mut self, process: usize, context: usize) -> Option<usize> {
+        let gi = self.rm_gates.iter().position(|g| !g.in_use)?;
+        let si = self.rm_gate_free_stream()?;
         let generation = self.present_streams[si].generation + 1;
         self.present_streams[si] = PresentStreamSlot {
             live: true,
@@ -190,15 +263,18 @@ impl VirtioGpu {
         let g = &mut self.rm_gates[gi];
         g.in_use = true;
         g.process = process;
+        g.context = context;
         g.stream_index = si;
         g.gate.reset();
         RMG_OPEN.fetch_add(1, Ordering::AcqRel);
         Some(gi)
     }
 
-    /// Attach fence `fence` of `process` as the next point of the process's gate and
-    /// return the boundary naming it. The ownership rule is `FenceClaim::Process`:
-    /// a fence recorded as created in this process, not already the KMD's.
+    /// Attach fence `fence` of `process`, carried by a packet of WDDM context `context`
+    /// whose bound execution stream is `bound` (0 = none), as the next point of the gate
+    /// [`Self::rm_gate_pick`] names (normally the context's own) and return the boundary
+    /// naming it. The ownership rule is `FenceClaim::Process`: a fence recorded as
+    /// created in this process, not already the KMD's.
     ///
     /// Nothing changes on a refusal: the claim is probed read-only BEFORE a gate and a
     /// stream slot are taken (a junk handle must not open a gate that lasts until
@@ -210,6 +286,9 @@ impl VirtioGpu {
         &mut self,
         fence: u32,
         process: usize,
+        context: usize,
+        bound: u32,
+        may_share: bool,
     ) -> Result<GateAttached, GateRefusal> {
         let refuse_code = |why: GateRefusal, code: u32| {
             RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -232,12 +311,20 @@ impl VirtioGpu {
         if let Err(why) = self.fence_claimable(FenceClaim::Process(process), fence) {
             return refuse(gate_refusal(why));
         }
-        let (gi, opened) = match self.rm_gate_of(process) {
-            Some(gi) => (gi, false),
-            None => match self.rm_gate_open(process) {
-                Some(gi) => (gi, true),
-                None => return refuse(GateRefusal::NoRoom),
+        let (gi, opened, shared) = match self.rm_gate_pick(process, context, bound, may_share) {
+            GatePick::Use(gi) => (gi, false, false),
+            GatePick::Share(gi) => (gi, false, true),
+            GatePick::Open => match self.rm_gate_open(process, context) {
+                Some(gi) => (gi, true, false),
+                None => {
+                    RMG_NO_GATE.fetch_add(1, Ordering::Relaxed);
+                    return refuse(GateRefusal::NoRoom);
+                }
             },
+            GatePick::NoRoom => {
+                RMG_NO_GATE.fetch_add(1, Ordering::Relaxed);
+                return refuse(GateRefusal::NoRoom);
+            }
         };
         {
             let gate = &self.rm_gates[gi].gate;
@@ -272,6 +359,11 @@ impl VirtioGpu {
             }
         };
         RMG_ATTACHED.fetch_add(1, Ordering::Relaxed);
+        if shared {
+            // From now on the gate is the process's: no context's teardown purges it.
+            self.rm_gates[gi].context = 0;
+            RMG_SHARED.fetch_add(1, Ordering::Relaxed);
+        }
         let mut wake_worker = false;
         if let Some(status) = early {
             RMG_EARLY.fetch_add(1, Ordering::Relaxed);
@@ -291,10 +383,16 @@ impl VirtioGpu {
         })
     }
 
-    /// The stream handle of `process`'s gate, if it has one open: what a context that
-    /// already bound a boundary must match (`execution_completion::may_bind_stream`).
-    pub fn rm_gate_stream_handle(&self, process: usize) -> Option<u32> {
-        let gi = self.rm_gate_of(process)?;
+    /// The stream handle of the gate a point of `context` in `process` (bound stream
+    /// `bound`) would attach to, if that gate is open already (`None`: a new gate would be
+    /// opened, or none is free): what a context that already bound a boundary must match
+    /// (`execution_completion::may_bind_stream`).
+    /// Only `HE12` asks, so the pick never shares.
+    pub fn rm_gate_stream_handle(&self, process: usize, context: usize, bound: u32) -> Option<u32> {
+        let gi = match self.rm_gate_pick(process, context, bound, false) {
+            GatePick::Use(gi) | GatePick::Share(gi) => gi,
+            GatePick::Open | GatePick::NoRoom => return None,
+        };
         let si = self.rm_gates[gi].stream_index;
         Some(self.present_streams[si].handle(si))
     }
@@ -358,6 +456,45 @@ impl VirtioGpu {
         self.fence_want_close(fence);
     }
 
+    /// A completion hint (`HELIOS_ESCAPE_ECL_DONE`) from process `process` (its
+    /// `hKmdProcess`) for fence `fence`: the UMD saw the batch the fence stands for finish.
+    /// A fence the KMD holds for a gate of that process and that has not fired is fired now,
+    /// exactly as its first `EventReady` would fire it (the gate point, the stream slot,
+    /// the waits that name it; the handle is owed a `Close`); the host's `EventReady`
+    /// that follows is a repeat. Anything else changes nothing
+    /// (`helios_kmd_logic::ecl_done::verdict`). Under `virtio_lock`; the caller wakes the
+    /// worker for the `Close` and asks for the completion DPC when it fired any.
+    pub fn ecl_done_hint(&mut self, process: usize, fence: u32) -> EclVerdict {
+        use helios_kmd_logic::ecl_done::{verdict, Named, Refused};
+        if self.failed || fence == 0 {
+            return EclVerdict::Refused(Refused::Unknown);
+        }
+        let idx = self.nvrm_handle_index(fence);
+        let named = self
+            .fence_hint_view(idx)
+            .map(|(is_fence, kmd_owned, meta)| Named {
+                is_fence,
+                kmd_owned,
+                meta,
+                gate_process: match meta.attached() {
+                    Attach::Gate(g) => self
+                        .rm_gates
+                        .get(usize::from(g))
+                        .filter(|slot| slot.in_use)
+                        .map(|slot| slot.process),
+                    _ => None,
+                },
+            });
+        let v = verdict(named, process);
+        if let EclVerdict::Fire(gi) = v {
+            // `verdict` saw it unfired in this same lock hold, so this is its first fire.
+            if let super::nvrm_tables::FenceFire::Fired(_) = self.fence_note_fired_at(idx, 0) {
+                self.rm_gate_fire(gi, fence, 0);
+            }
+        }
+        v
+    }
+
     /// The worker's pass over the gates (PASSIVE, `virtio_lock`): every point whose fence has
     /// not fired `limit_ms` after it was attached is declared fired (its `EventReady` was lost:
     /// the host's own fence timeout is 5 s and fires with an error status), its handle queued for
@@ -405,7 +542,9 @@ impl VirtioGpu {
         self.rm_gates[gi].gate.reset();
         self.rm_gates[gi].in_use = false;
         self.rm_gates[gi].process = 0;
+        self.rm_gates[gi].context = 0;
         if self.present_streams[si].live {
+            self.rm_gates_cancelled.note(handle);
             self.retire_present_stream_slot(si);
             // An execution (HE12 v4) wait that named this gate: nobody will ever fire
             // its fences (they were just handed to the closer), and an execution
@@ -425,25 +564,73 @@ impl VirtioGpu {
         pending
     }
 
-    /// `DestroyProcess`: the process's gate goes, and every wait that named it is
-    /// discharged (a dead boundary is a cancellation, never success: the same rule as
-    /// a stream whose owner died). Needs the notification ordering proof, like
-    /// `purge_present_streams_for_owner`. Returns the points that were pending; the
-    /// caller then prompts the completion DPC and wakes the HPD worker.
+    /// `DestroyProcess`: every gate of the process goes (its contexts' and its shared
+    /// one), and every wait that named them is discharged (a dead boundary is a
+    /// cancellation, never success: the same rule as a stream whose owner died). Needs
+    /// the notification ordering proof, like `purge_present_streams_for_owner`. Returns
+    /// the points that were pending; the caller then prompts the completion DPC and
+    /// wakes the HPD worker.
     pub fn rm_gate_purge_process_ordered(
         &mut self,
         order: &crate::adapter::NotifyOrdered<'_>,
         process: usize,
     ) -> u32 {
-        let Some(gi) = self.rm_gate_of(process) else {
+        self.rm_gate_purge_where(order, |g| g.process == process)
+    }
+
+    /// `DestroyContext`: the context's own gate goes, as at `DestroyProcess`. A gate the
+    /// context's process shares (context 0) stays until the process exits. dxgkrnl
+    /// destroys a context once its packets are done, so normally nothing is pending;
+    /// a present marker stashed and never presented is, and its fence is closed here.
+    pub fn rm_gate_purge_context_ordered(
+        &mut self,
+        order: &crate::adapter::NotifyOrdered<'_>,
+        process: usize,
+        context: usize,
+    ) -> u32 {
+        if context == 0 {
             return 0;
-        };
-        let pending = self.rm_gate_cancel(gi);
+        }
+        self.rm_gate_purge_where(order, |g| g.process == process && g.context == context)
+    }
+
+    fn rm_gate_purge_where(
+        &mut self,
+        order: &crate::adapter::NotifyOrdered<'_>,
+        which: impl Fn(&RmGateSlot) -> bool,
+    ) -> u32 {
+        let mut pending = 0u32;
+        let mut any = false;
+        for gi in 0..self.rm_gates.len() {
+            if self.rm_gates[gi].in_use && which(&self.rm_gates[gi]) {
+                pending = pending.saturating_add(self.rm_gate_cancel(gi));
+                any = true;
+            }
+        }
+        if !any {
+            return 0;
+        }
         let _ = self.discharge_dead_present_stream_waits(order);
         self.cancel_dead_undispatched_windowed_blt();
         // A gate with nothing pending can still have had boundaries in submitted
         // DMA buffers: report at least 1 so the caller prompts the DPC.
         pending.max(1)
+    }
+
+    /// `SubmitCommand` created an execution wait for stream `handle` that is not live: if
+    /// it was a gate this KMD cancelled, latch the wait as ended now (nothing will ever
+    /// fire it, and an execution wait is never rebased). Returns whether it did.
+    pub(super) fn rm_gate_latch_dead_submit(
+        &self,
+        wait: &mut helios_kmd_logic::execution_completion::Wait,
+        handle: u32,
+    ) -> bool {
+        if !self.rm_gates_cancelled.contains(handle) {
+            return false;
+        }
+        wait.observe(handle, u32::MAX);
+        RMG_DEAD_SUBMIT.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Transport-wide purge (`purge_all_present_streams`): every gate goes. The slots
