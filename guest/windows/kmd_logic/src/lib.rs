@@ -19,6 +19,7 @@
 #![no_std]
 
 pub mod device_lost;
+pub mod ecl_done;
 pub mod edid;
 pub mod event_ready;
 pub mod external_memory;

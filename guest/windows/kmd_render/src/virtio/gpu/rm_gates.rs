@@ -20,6 +20,9 @@ use super::*;
 use helios_kmd_logic::nvrm_fence::NVGPU_CFG_DRM_FENCES;
 use helios_kmd_logic::rm_fence_present::{Attach, Gate, GateError, GATE_POINTS};
 
+/// The completion-hint verdict, re-exported for the escape.
+pub use helios_kmd_logic::ecl_done::Verdict as EclVerdict;
+
 /// Most processes with a live gate at once. A gate lives until its process exits, and each takes
 /// one of the 64 present-stream slots. 8 was too few once every NVK process presents with an RM
 /// fence (`DwmIcd=nvk` and the NVK desktop): 376.1 had about 15 explorer.exe processes plus DWM,
@@ -53,6 +56,16 @@ pub static RMG_EXPIRE_MS: AtomicU32 = AtomicU32::new(0);
 /// (`RmGWhyMsk`, bit `1 << (code - 1)`).
 pub static RMG_WHY: AtomicU32 = AtomicU32::new(0);
 pub static RMG_WHY_MASK: AtomicU32 = AtomicU32::new(0);
+/// Completion hints (`HELIOS_ESCAPE_ECL_DONE`, `helios_kmd_logic::ecl_done`): escapes
+/// served (`E12HintEsc`), named fences this KMD fired on the hint (`E12HintFire`), named
+/// fences that had fired already, i.e. the host's `EventReady` was first (`E12HintLate`),
+/// named handles refused (`E12HintRef`) and the last refusal's reason (`E12HintWhy`:
+/// 1 unknown, 2 not a fence, 3 not taken yet, 4 not a gate point, 5 not the caller's).
+pub static ECL_HINT_ESCAPES: AtomicU32 = AtomicU32::new(0);
+pub static ECL_HINT_FIRED: AtomicU32 = AtomicU32::new(0);
+pub static ECL_HINT_LATE: AtomicU32 = AtomicU32::new(0);
+pub static ECL_HINT_REFUSED: AtomicU32 = AtomicU32::new(0);
+pub static ECL_HINT_WHY: AtomicU32 = AtomicU32::new(0);
 /// Gates open now (a count, not a counter): `DestroyProcess` reads it before it
 /// touches the adapter, so a process exit with no gate open costs one load.
 static RMG_OPEN: AtomicU32 = AtomicU32::new(0);
@@ -79,6 +92,11 @@ pub fn publish_rm_gate_counters() {
     rec(b"RmGateMsEff", RMG_EXPIRE_MS.load(Ordering::Relaxed));
     rec(b"RmGWhy", RMG_WHY.load(Ordering::Relaxed));
     rec(b"RmGWhyMsk", RMG_WHY_MASK.load(Ordering::Relaxed));
+    rec(b"E12HintEsc", ECL_HINT_ESCAPES.load(Ordering::Relaxed));
+    rec(b"E12HintFire", ECL_HINT_FIRED.load(Ordering::Relaxed));
+    rec(b"E12HintLate", ECL_HINT_LATE.load(Ordering::Relaxed));
+    rec(b"E12HintRef", ECL_HINT_REFUSED.load(Ordering::Relaxed));
+    rec(b"E12HintWhy", ECL_HINT_WHY.load(Ordering::Relaxed));
 }
 
 /// One gate: the process it belongs to, the present-stream slot that carries its
@@ -356,6 +374,45 @@ impl VirtioGpu {
             self.rm_gate_sync(gi);
         }
         self.fence_want_close(fence);
+    }
+
+    /// A completion hint (`HELIOS_ESCAPE_ECL_DONE`) from process `process` (its
+    /// `hKmdProcess`) for fence `fence`: the UMD saw the batch the fence stands for finish.
+    /// A fence the KMD holds for that process's gate and that has not fired is fired now,
+    /// exactly as its first `EventReady` would fire it (the gate point, the stream slot,
+    /// the waits that name it; the handle is owed a `Close`); the host's `EventReady`
+    /// that follows is a repeat. Anything else changes nothing
+    /// (`helios_kmd_logic::ecl_done::verdict`). Under `virtio_lock`; the caller wakes the
+    /// worker for the `Close` and asks for the completion DPC when it fired any.
+    pub fn ecl_done_hint(&mut self, process: usize, fence: u32) -> EclVerdict {
+        use helios_kmd_logic::ecl_done::{verdict, Named, Refused};
+        if self.failed || fence == 0 {
+            return EclVerdict::Refused(Refused::Unknown);
+        }
+        let idx = self.nvrm_handle_index(fence);
+        let named = self
+            .fence_hint_view(idx)
+            .map(|(is_fence, kmd_owned, meta)| Named {
+                is_fence,
+                kmd_owned,
+                meta,
+                gate_process: match meta.attached() {
+                    Attach::Gate(g) => self
+                        .rm_gates
+                        .get(usize::from(g))
+                        .filter(|slot| slot.in_use)
+                        .map(|slot| slot.process),
+                    _ => None,
+                },
+            });
+        let v = verdict(named, process);
+        if let EclVerdict::Fire(gi) = v {
+            // `verdict` saw it unfired in this same lock hold, so this is its first fire.
+            if let super::nvrm_tables::FenceFire::Fired(_) = self.fence_note_fired_at(idx, 0) {
+                self.rm_gate_fire(gi, fence, 0);
+            }
+        }
+        v
     }
 
     /// The worker's pass over the gates (PASSIVE, `virtio_lock`): every point whose fence has
