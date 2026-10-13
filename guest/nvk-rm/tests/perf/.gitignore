@@ -1,2 +1,4 @@
 vk_perf_bench
+vk_gpu_bound
 shaders/
+shaders_gb/

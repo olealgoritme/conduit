@@ -2550,14 +2550,13 @@ mod tests {
             assert!(std::env::var("HELIOS_REQUIRE_NAME_SCAN").map_or(true, |v| v != "1"));
             return;
         }
-        // `FlipLat` is the prefix of `FlipLat0..` histogram names; `NvSpinUs` mirrors its own
-        // clamped effective value under the knob's name (an existing pattern, stable because the
-        // mirror equals what the read will return next time).
+        // `FlipLat` is the prefix of `FlipLat0..` histogram names. No knob mirrors its effective
+        // value under its own name (`NvSpinUs` did, as `NvSpinUsEff` now): a value written back
+        // there outlives every later change of the default.
         // The MSI breaker/latch state of `virtio/msi.rs` (on main): deliberate write-and-read-back
         // values, the knob and the state being one registry value by design.
         const ALLOWED: &[&str] = &[
             "FlipLat",
-            "NvSpinUs",
             "MsiBreaker",
             "MsiLatch",
             "MsiLatchOld",

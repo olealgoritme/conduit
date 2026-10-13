@@ -3,7 +3,7 @@ resolver = "3"
 members = ["vmm", "virtio-devices", "pci"]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.8"
 
 [workspace.dependencies]
 vm-memory = { version = "0.18", features = ["backend-mmap"] }

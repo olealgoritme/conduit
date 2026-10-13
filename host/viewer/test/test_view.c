@@ -673,10 +673,10 @@ static void test_rules(void)
           "file has the base layout");
     CHECK(!back.ruled, "a loaded store starts with no rule in force");
 
-    /* Delete: the one in force keeps its layout until the next change. */
+    /* Delete the one in force: back to the default at once. */
     nb_vstore_rule_delete(&st, nb_vstore_rule_find(&st, 1280, 960));
     CHECK(st.nrule == 1 && nb_vstore_rule_find(&st, 1280, 960) < 0, "deleted");
-    CHECK(st.cur.scale == NB_SCALE_STRETCH, "layout kept for now");
+    CHECK(st.cur.scale == st.base.scale && !st.ruled, "default again");
 
     /* Malformed lines are skipped; duplicates too. */
     nb_vstore_init(&back);
@@ -684,6 +684,134 @@ static void test_rules(void)
                            "rule=800x600|scale=stretch\nrule=800x600|scale=none\n");
     CHECK(back.nrule == 1 && back.rule[0].v.scale == NB_SCALE_STRETCH,
           "one good rule");
+}
+
+/*
+ * AUTOMATIC RULES: the user's case.  Desktop at 5120x1440, CS2 at 1600x900
+ * with Stretch + 21:9; each change is remembered for the mode in force.
+ */
+static void test_auto_rules(void)
+{
+    struct nb_vstore st, back;
+    char label[96], buf[4096];
+    unsigned ch;
+
+    nb_vstore_init(&st);
+    /* Before any frame: an edit is the default, nothing remembered. */
+    st.cur.scale = NB_SCALE_ASPECT;
+    CHECK(!nb_vstore_auto_rule(&st) && st.nrule == 0, "no mode, no rule");
+
+    /* Desktop: the default applies, nothing to say. */
+    ch = nb_vstore_guest_mode(&st, 5120, 1440, label, sizeof(label));
+    CHECK(ch == 0 && !label[0] && st.base_set, "desktop, default");
+
+    /* CS2 starts: 1600x900, still the default. */
+    nb_vstore_guest_mode(&st, 1600, 900, label, sizeof(label));
+    CHECK(!st.ruled && st.cur.scale == NB_SCALE_ASPECT, "1600x900 default");
+    /* The user picks Stretch and 21:9 (two changes, each remembered). */
+    st.cur.scale = NB_SCALE_STRETCH;
+    CHECK(nb_vstore_auto_rule(&st), "stretch remembered");
+    st.cur.area = NB_AREA_21_9;
+    CHECK(nb_vstore_auto_rule(&st), "21:9 remembered");
+    CHECK(st.nrule == 1 && st.rule[0].w == 1600 && st.rule[0].h == 900 &&
+          st.rule[0].v.scale == NB_SCALE_STRETCH &&
+          st.rule[0].v.area == NB_AREA_21_9, "one rule for 1600x900");
+    CHECK(!nb_vstore_auto_rule(&st), "unchanged: nothing to store");
+    CHECK(st.base.scale == NB_SCALE_ASPECT && st.base.area == NB_AREA_FULL,
+          "the default untouched");
+
+    /* Back to the desktop: the default, said once. */
+    ch = nb_vstore_guest_mode(&st, 5120, 1440, label, sizeof(label));
+    CHECK(ch == NB_VIEW_CH_LAYOUT && st.cur.scale == NB_SCALE_ASPECT &&
+          st.cur.area == NB_AREA_FULL, "desktop back to the default");
+    CHECK(strstr(label, "5120x1440") && strstr(label, "(default)"),
+          "label %s", label);
+    /* A change on the desktop is the desktop's own. */
+    st.cur.filter = NB_FILTER_NEAREST;
+    CHECK(nb_vstore_auto_rule(&st) && st.nrule == 2, "desktop rule");
+
+    /* CS2 again: its rule on the mode's first frame, with the notice. */
+    ch = nb_vstore_guest_mode(&st, 1600, 900, label, sizeof(label));
+    CHECK(ch == NB_VIEW_CH_LAYOUT && st.cur.scale == NB_SCALE_STRETCH &&
+          st.cur.area == NB_AREA_21_9 && st.cur.filter == NB_FILTER_LINEAR,
+          "1600x900 restored");
+    CHECK(!strcmp(label, "1600x900: Stretch 21:9 (remembered)"), "label %s",
+          label);
+    /* A mode never seen: the default. */
+    nb_vstore_guest_mode(&st, 1920, 1080, label, sizeof(label));
+    CHECK(st.cur.scale == NB_SCALE_ASPECT && st.cur.filter ==
+          NB_FILTER_LINEAR && !st.ruled, "unknown mode: default");
+
+    /* Persisted: the default on top, the rules below; read back, the same
+     * switches give the same pictures. */
+    CHECK(nb_vstore_format(&st, buf, sizeof(buf)) < sizeof(buf), "fits");
+    CHECK(strstr(buf, "scale=fit\n") && strstr(buf, "rule=1600x900|"),
+          "file: %s", buf);
+    nb_vstore_init(&back);
+    nb_vstore_parse(&back, buf);
+    nb_vstore_guest_mode(&back, 5120, 1440, NULL, 0);
+    CHECK(back.cur.filter == NB_FILTER_NEAREST && back.cur.scale ==
+          NB_SCALE_ASPECT, "desktop after a restart");
+    nb_vstore_guest_mode(&back, 1600, 900, NULL, 0);
+    CHECK(back.cur.scale == NB_SCALE_STRETCH && back.cur.area == NB_AREA_21_9,
+          "1600x900 after a restart");
+    nb_vstore_guest_mode(&back, 2560, 1440, NULL, 0);
+    CHECK(back.cur.scale == NB_SCALE_ASPECT && back.cur.area == NB_AREA_FULL,
+          "other mode after a restart");
+
+    /* Setting the default's layout again drops the mode's rule. */
+    nb_vstore_guest_mode(&st, 1600, 900, NULL, 0);
+    st.cur.scale = NB_SCALE_ASPECT;
+    st.cur.area = NB_AREA_FULL;
+    CHECK(nb_vstore_auto_rule(&st) &&
+          nb_vstore_rule_find(&st, 1600, 900) < 0 && !st.ruled,
+          "back to the default: rule dropped");
+
+    /* Reset in a remembered mode forgets it; in a default one resets the
+     * default. */
+    st.cur.scale = NB_SCALE_STRETCH;
+    nb_vstore_auto_rule(&st);
+    ch = nb_view_reset(&st, label, sizeof(label));
+    CHECK(nb_vstore_rule_find(&st, 1600, 900) < 0 &&
+          st.cur.scale == NB_SCALE_ASPECT, "reset forgets: %s", label);
+
+    /* Make default: the current layout for every mode without a rule. */
+    st.cur.scale = NB_SCALE_INTEGER;
+    nb_vstore_auto_rule(&st);
+    nb_vstore_make_default(&st);
+    CHECK(st.base.scale == NB_SCALE_INTEGER &&
+          nb_vstore_rule_find(&st, 1600, 900) < 0, "made default");
+    nb_vstore_guest_mode(&st, 1280, 720, NULL, 0);
+    CHECK(st.cur.scale == NB_SCALE_INTEGER, "default used elsewhere");
+
+    /* A full table: the oldest rule goes. */
+    nb_vstore_init(&st);
+    for (unsigned i = 0; i < NB_MAX_RULES + 2; i++) {
+        nb_vstore_guest_mode(&st, 1000 + i, 700, NULL, 0);
+        st.cur.scale = NB_SCALE_STRETCH;
+        nb_vstore_auto_rule(&st);
+    }
+    CHECK(st.nrule == NB_MAX_RULES && nb_vstore_rule_find(&st, 1000, 700) < 0
+          && nb_vstore_rule_find(&st, 1000 + NB_MAX_RULES + 1, 700) >= 0,
+          "oldest evicted");
+
+    /* A profile for another mode: its layout waits for that mode. */
+    nb_vstore_init(&st);
+    nb_vstore_guest_mode(&st, 5120, 1440, NULL, 0);
+    st.cur.scale = NB_SCALE_STRETCH;
+    st.cur.area = NB_AREA_21_9;
+    st.cur.res_w = 1600;
+    st.cur.res_h = 900;
+    nb_vstore_profile_save(&st, "cs2");
+    st.cur = st.base;
+    st.cur.res_w = st.cur.res_h = 0;
+    nb_vstore_profile_load(&st, 0);
+    CHECK(st.cur.scale == NB_SCALE_ASPECT && st.cur.res_w == 1600,
+          "desktop keeps its picture, the mode hint changes");
+    CHECK(!nb_vstore_auto_rule(&st), "nothing stored for the desktop");
+    nb_vstore_guest_mode(&st, 1600, 900, NULL, 0);
+    CHECK(st.cur.scale == NB_SCALE_STRETCH && st.cur.area == NB_AREA_21_9,
+          "the profile's layout on 1600x900's first frame");
 }
 
 static void test_modes(void)
@@ -808,6 +936,7 @@ int main(void)
     test_cycles();
     test_override();
     test_rules();
+    test_auto_rules();
     test_modes();
     printf("test_view: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;

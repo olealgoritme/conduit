@@ -27,7 +27,7 @@
  *                      which no compositor can refuse
  *   --unadvertised-mod send a modifier no display advertises.  With --shm the
  *                      frame must still be presented: shm carries no modifier
- *   --alpha-fourcc     send AR24 where only its opaque twin XR24 is
+ *   --alpha-fourcc     send AR24 where its opaque twin XR24 is
  *                      advertised: must be ACCEPTED and shown as XR24
  *   --bad-dim          claim dimensions past NVKVM_BROKER_MAX_DIM
  *   --bad-fd           send a pipe instead of a dma-buf
@@ -461,12 +461,12 @@ int main(int argc, char **argv)
                 printf("  -> ATTACH memfd carrying an unadvertised modifier\n");
             }
             if (alpha_fourcc) {
-                /* Only XR24 is advertised by the test backend.  AR24 is the
-                 * same bytes, so the broker must present it as XR24 rather
-                 * than refuse the frame. */
+                /* The test backend advertises AR24 and XR24 (LINEAR).  A
+                 * guest primary's alpha is undefined, so the broker must
+                 * present the frame as the opaque twin XR24. */
                 c.fourcc = FOURCC('A', 'R', '2', '4');
                 printf("  -> ATTACH with AR24, whose opaque twin XR24 is "
-                       "advertised\n");
+                       "advertised too\n");
             }
             if (bad_dim) {
                 c.width = NVKVM_BROKER_MAX_DIM + 1;

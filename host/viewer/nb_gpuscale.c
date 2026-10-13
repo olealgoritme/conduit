@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "nb_gpuscale.h"
+#include "nb_gpusel.h"
 
 /* ── the slice of EGL / GLES2 / GBM used here, spelled locally ────────── */
 
@@ -170,11 +171,14 @@ struct fns {
     void (*DrawArrays)(GLenum, GLint, GLsizei);
     void (*Flush)(void);
     void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+    void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
+    void (*Uniform1f)(GLint, GLfloat);
     /* GBM */
     struct gbm_device *(*gbm_create_device)(int);
     void (*gbm_device_destroy)(struct gbm_device *);
     struct gbm_bo *(*gbm_bo_create)(struct gbm_device *, uint32_t, uint32_t, uint32_t, uint32_t);
     struct gbm_bo *(*gbm_bo_create_with_modifiers)(struct gbm_device *, uint32_t, uint32_t, uint32_t, const uint64_t *, unsigned);
+    struct gbm_bo *(*gbm_bo_create_with_modifiers2)(struct gbm_device *, uint32_t, uint32_t, uint32_t, const uint64_t *, unsigned, uint32_t);
     void (*gbm_bo_destroy)(struct gbm_bo *);
     int (*gbm_bo_get_fd)(struct gbm_bo *);
     uint32_t (*gbm_bo_get_stride)(struct gbm_bo *);
@@ -194,7 +198,8 @@ struct nb_gs {
     EGLContext ctx;
     enum nb_gs_prio prio_req, prio_got;
     GLuint prog;
-    GLint u_tex, u_rect;
+    GLint u_tex, u_rect, u_swap;
+    bool readback;              /* targets are plain renderbuffers, read back */
     struct {
         bool     valid;
         struct gbm_bo *bo;
@@ -307,6 +312,8 @@ static bool load(struct nb_gs *g, char *why, size_t n)
     G(DrawArrays, "glDrawArrays");
     G(Flush, "glFlush");
     G(ReadPixels, "glReadPixels");
+    G(RenderbufferStorage, "glRenderbufferStorage");
+    G(Uniform1f, "glUniform1f");
 #undef G
 #define B(field, name) do { *(void **)&f->field = sym(g->h_gbm, name); \
         if (!f->field) { say(why, n, "libgbm lacks %s", name); return false; } } while (0)
@@ -321,6 +328,9 @@ static bool load(struct nb_gs *g, char *why, size_t n)
 #undef B
     *(void **)&f->gbm_bo_create_with_modifiers =
         sym(g->h_gbm, "gbm_bo_create_with_modifiers");
+    /* Optional (Mesa 21.3+): the same with usage flags. */
+    *(void **)&f->gbm_bo_create_with_modifiers2 =
+        sym(g->h_gbm, "gbm_bo_create_with_modifiers2");
     return true;
 }
 
@@ -514,8 +524,12 @@ static bool prog_up(struct nb_gs *g, char *why, size_t n)
         "#extension GL_OES_EGL_image_external : require\n"
         "precision mediump float;\n"
         "uniform samplerExternalOES u_tex;\n"
+        "uniform float u_swap;\n"
         "varying vec2 v_tc;\n"
-        "void main() { gl_FragColor = vec4(texture2D(u_tex, v_tc).rgb, 1.0); }\n";
+        "void main() {\n"
+        "  vec3 c = texture2D(u_tex, v_tc).rgb;\n"
+        "  gl_FragColor = vec4(mix(c, c.bgr, u_swap), 1.0);\n"
+        "}\n";
     static const GLfloat quad[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
     GLuint v = shader(g, GL_VERTEX_SHADER, vs);
     GLuint fr = shader(g, GL_FRAGMENT_SHADER, fs);
@@ -540,6 +554,7 @@ static bool prog_up(struct nb_gs *g, char *why, size_t n)
     f->UseProgram(g->prog);
     g->u_tex = f->GetUniformLocation(g->prog, "u_tex");
     g->u_rect = f->GetUniformLocation(g->prog, "u_rect");
+    g->u_swap = f->GetUniformLocation(g->prog, "u_swap");
     f->Uniform1i(g->u_tex, 0);
     /* Client-side vertex array: GLES2 allows it, and it is 32 bytes. */
     f->VertexAttribPointer(0, 2, GL_FLOAT, 0, 0, quad);
@@ -690,14 +705,41 @@ struct nb_gs *nb_gs_open(const char *node, dev_t dev, uint32_t fourcc,
             closedir(d);
         }
     }
-    for (int i = 128; i < 136; i++) {
-        snprintf(path, sizeof(path), "/dev/dri/renderD%d", i);
-        if (access(path, F_OK) == 0 && try_node(g, path, fourcc, mod, why, n)) {
-            return g;
+    /*
+     * --gpu auto (nb_gpusel.h): the GPU of the frame's own vendor first --
+     * it made the frame and imports its layout natively -- then the rest,
+     * by PCI facts rather than node numbers.
+     */
+    {
+        struct nb_gpu_node nodes[NB_GPU_MAX];
+        int order[NB_GPU_MAX];
+        int k = nb_gpusel_scan(NULL, nodes, NB_GPU_MAX);
+
+        nb_gpu_order(nodes, k, mod, order);
+        for (int i = 0; i < k; i++) {
+            if (access(nodes[order[i]].path, F_OK) == 0 &&
+                try_node(g, nodes[order[i]].path, fourcc, mod, why, n)) {
+                return g;
+            }
+        }
+        if (!k) {
+            /* No sysfs (a container): the node numbers, in order. */
+            for (int i = 128; i < 136; i++) {
+                snprintf(path, sizeof(path), "/dev/dri/renderD%d", i);
+                if (access(path, F_OK) == 0 &&
+                    try_node(g, path, fourcc, mod, why, n)) {
+                    return g;
+                }
+            }
         }
     }
     nb_gs_close(g);
     return NULL;
+}
+
+bool nb_gs_can_import(struct nb_gs *g, uint32_t fourcc, uint64_t mod)
+{
+    return g && can_import(g, fourcc, mod);
 }
 
 void nb_gs_close(struct nb_gs *g)
@@ -751,27 +793,104 @@ static void targets_free(struct nb_gs *g)
         }
         f->DeleteFramebuffers(1, &g->t[i].fbo);
         f->DeleteRenderbuffers(1, &g->t[i].rb);
-        f->DestroyImageKHR(g->dpy, g->t[i].img);
-        close(g->t[i].fd);
-        f->gbm_bo_destroy(g->t[i].bo);
+        if (g->t[i].img) {
+            f->DestroyImageKHR(g->dpy, g->t[i].img);
+        }
+        if (g->t[i].fd >= 0) {
+            close(g->t[i].fd);
+        }
+        if (g->t[i].bo) {
+            f->gbm_bo_destroy(g->t[i].bo);
+        }
         memset(&g->t[i], 0, sizeof(g->t[i]));
     }
     g->tw = g->th = 0;
 }
 
+int nb_gs_targets_readback(struct nb_gs *g, uint32_t w, uint32_t h,
+                           char *why, size_t n)
+{
+    struct fns *f = &g->f;
+
+    targets_free(g);
+    for (int i = 0; i < NB_GS_TARGETS; i++) {
+        g->t[i].fd = -1;
+        f->GenRenderbuffers(1, &g->t[i].rb);
+        f->BindRenderbuffer(GL_RENDERBUFFER, g->t[i].rb);
+        f->RenderbufferStorage(GL_RENDERBUFFER, 0x8058 /* GL_RGBA8_OES */,
+                               (GLsizei)w, (GLsizei)h);
+        f->GenFramebuffers(1, &g->t[i].fbo);
+        f->BindFramebuffer(GL_FRAMEBUFFER, g->t[i].fbo);
+        f->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_RENDERBUFFER, g->t[i].rb);
+        g->t[i].valid = true;
+        if (f->CheckFramebufferStatus(GL_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE) {
+            say(why, n, "the scaler's read-back framebuffer is incomplete");
+            targets_free(g);
+            return 0;
+        }
+    }
+    g->tw = w;
+    g->th = h;
+    g->readback = true;
+    return NB_GS_TARGETS;
+}
+
+int nb_gs_readback(struct nb_gs *g, int target, void *dst)
+{
+    if (!g->readback || target < 0 || target >= NB_GS_TARGETS ||
+        !g->t[target].valid) {
+        return -EINVAL;
+    }
+    g->f.BindFramebuffer(GL_FRAMEBUFFER, g->t[target].fbo);
+    /* R and B were swapped by the shader, so GL_RGBA bytes are XRGB8888's
+     * B, G, R, X in memory; rows top-down as everywhere here. */
+    g->f.ReadPixels(0, 0, (GLsizei)g->tw, (GLsizei)g->th, 0x1908 /* RGBA */,
+                    0x1401 /* UNSIGNED_BYTE */, dst);
+    return 0;
+}
+
 int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
-                  void *ctx, struct nb_gs_target out[NB_GS_TARGETS],
+                  void *ctx, const uint64_t *scan_mods, unsigned n_scan,
+                  struct nb_gs_target out[NB_GS_TARGETS],
                   char *why, size_t n)
 {
     struct fns *f = &g->f;
     static const uint32_t fmts[2] = { FMT_XRGB8888, FMT_ARGB8888 };
 
     targets_free(g);
+    g->readback = false;
     for (int i = 0; i < NB_GS_TARGETS; i++) {
         struct gbm_bo *bo = NULL;
         uint32_t fmt = 0;
         uint64_t mod;
 
+        /*
+         * The compositor's scanout tranche first, when it named one: GBM
+         * picks among exactly the XRGB modifiers a plane takes, so the
+         * output buffer is not only importable but scannable.
+         */
+        if (n_scan && (f->gbm_bo_create_with_modifiers2 ||
+                       f->gbm_bo_create_with_modifiers)) {
+            uint64_t m[32];
+            unsigned k = 0;
+
+            for (unsigned j = 0; j < n_scan && k < 32; j++) {
+                if (!ok || ok(ctx, FMT_XRGB8888, scan_mods[j])) {
+                    m[k++] = scan_mods[j];
+                }
+            }
+            if (k) {
+                fmt = FMT_XRGB8888;
+                bo = f->gbm_bo_create_with_modifiers2
+                         ? f->gbm_bo_create_with_modifiers2(
+                               g->gbm, w, h, fmt, m, k,
+                               GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING)
+                         : f->gbm_bo_create_with_modifiers(g->gbm, w, h, fmt,
+                                                           m, k);
+            }
+        }
         /* Opaque XRGB first (a plane takes it without blending), and only
          * a layout the compositor said it takes. */
         for (int k = 0; k < 2 && !bo; k++) {
@@ -939,6 +1058,7 @@ int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
     f->Uniform4f(g->u_rect, (GLfloat)(d->sx / g->s[si].w),
                  (GLfloat)(d->sy / g->s[si].h), (GLfloat)(d->sw / g->s[si].w),
                  (GLfloat)(d->sh / g->s[si].h));
+    f->Uniform1f(g->u_swap, g->readback ? 1.0f : 0.0f);
     f->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     t0 = now_ns();
     sync = f->CreateSyncKHR(g->dpy, EGL_SYNC_FENCE_KHR, NULL);

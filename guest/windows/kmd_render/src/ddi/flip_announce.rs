@@ -92,7 +92,7 @@ pub(crate) fn start_generation() {
     // wins (`flip_retire::ann_foreign_default`).
     let foreign_default = fr::ann_foreign_default(crate::diag::read_config_dword(
         crate::diag::knobs::FOREIGN_FLIP,
-        0,
+        helios_kmd_logic::shipping_defaults::FOREIGN_FLIP,
     ));
     FOREIGN_OK.store(
         u32::from(

@@ -317,7 +317,7 @@ The knob is read at StartDevice; recovery is `VidMmCapsX` removed plus `pnputil 
 ### 5.3 The memory: RM vidmem behind a GPU-only allocation (stages V2, V3)
 
 * **Backing.** In `build_backing`, the `KmdOptimalGdiTexture` arm (and any other non-CPU-visible type V1
-  names) gets a new first choice behind knob `RedirVram` (default 0): `rm_client::alloc_memory`
+  names) gets a new first choice behind knob `RedirVram` (default 1): `rm_client::alloc_memory`
   (`NV01_MEMORY_LOCAL_USER`, pitch-linear first, 128-byte aligned pitch as NVK authors it for imports,
   64 KiB pages), exported and imported as a KMD_RM foreign resource (`rm_foreign::import_surface`), adopted
   by the WDDM allocation with a LINEAR layout trailer (the allocation's private data grows to 128 bytes
@@ -411,7 +411,7 @@ next window creation, counted), or `RedirVram` simply requires `DwmIcd=nvk`.
 | GDI `EXISTINGSYSMEM` surfaces under GDI acceleration | the KMD backs them with its own standard buffer instead of the caller's pages, so GDI operations would read and write the wrong bytes | if the census (`StdNGdiSys`) shows them once `GdiAccel` is on: back them with the caller's pages (the allocation arm, this branch) |
 | security | a GPU-only window surface reachable by `RM_DUP_OBJECT` | `NvDupHarden` (the route's `h_client` rule applies to the producer side; the destination is KMD-owned and never handed out as an RM handle, only as a resid to authorized openers) |
 
-### 5.9 V2-V5 as built (`RedirVram`, default 0)
+### 5.9 V2-V5 as built (`RedirVram`, default 1)
 
 | piece | file | what |
 |---|---|---|

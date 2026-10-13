@@ -1,15 +1,15 @@
-# Windows on NVK-on-RM: handoff (2026-10-07)
+# Windows on NVK-on-RM: handoff
 
 Everything a new session needs to continue the Windows work: the goal and the
-bar, what runs today, what was tried (and what did not work), the plan, and how
-things are tested. The staged plan and architecture are in
-[NVK-ROADMAP.md](NVK-ROADMAP.md); the windowed-Present design and the
-guest-blob contract in
-[zero-copy-present.md](../guest/windows/docs/zero-copy-present.md) (24.x) and
-[VENUS.md](VENUS.md) "Guest-memory blobs"; DWM on NVK in
-[dwm-on-nvk.md](dwm-on-nvk.md); the KMD session's own handoff (latency budget, counter traps, MSI-X plan,
-next KMD steps) in
-[kmd-handoff-2026-10.md](../guest/windows/docs/kmd-handoff-2026-10.md); the test scripts in
+bar, what runs, the shipped configuration, what is still open, and how things
+are tested. The stages and architecture are in
+[NVK-ROADMAP.md](NVK-ROADMAP.md); the frame path hop by hop and the
+performance plan in [PERF-ROADMAP.md](PERF-ROADMAP.md); every guest knob and
+its default in [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md); the windowed-Present
+design in [zero-copy-present.md](../guest/windows/docs/zero-copy-present.md)
+and [vram-redirection.md](../guest/windows/docs/vram-redirection.md); DWM on
+NVK in [dwm-on-nvk.md](dwm-on-nvk.md); the KMD design records in
+[guest/windows/docs](../guest/windows/docs/); the test scripts in
 [guest/windows/ci/vmtest](../guest/windows/ci/vmtest/README.md).
 
 ## Goal and the bar
@@ -18,142 +18,153 @@ next KMD steps) in
   Vulkan) on NVK → librmclient → Helios KMD → conduit-backend → nvidia.ko,
   zero-copy, at bare-metal performance. Venus is removed at the end.
 - Desktop: must feel like a Linux guest, smooth at the monitor's 240 Hz.
-- Games: Unigine Heaven D3D11, **windowed 1600x900**, Medium-ish settings,
-  must **easily exceed 400 fps in the first 5 seconds**; the same host, bare
-  metal, shows ~576 (4-500 in the opening).
+- Games: frame rate and frame pacing close to bare metal on the same host.
+  Unigine Heaven D3D11, windowed 1600x900, Medium-ish settings, is the
+  windowed (DWM-composed) reference: the same host, bare metal, shows about
+  576 fps.
 - Performance first, zero-copy from the start, security last.
 
-## What runs today (driver 22.22.343.1, host from main, RTX 5090)
+## What runs
 
-| | Result |
+Guest driver **22.22.405.84**
+([driver-version.env](../guest/windows/kmd_render/driver-version.env)); host
+from main. Setup: RTX 5090, win11 guest at 5120x1440@240.
+
+- The desktop: DWM composes on NVK (`HKLM\SOFTWARE\Helios!DwmIcd=nvk`, written
+  by `install.ps1`); the KMD shows its buffers zero-copy (`ForeignFlip`).
+- Apps: D3D11 (DXVK), D3D12 (vkd3d-proton), Vulkan and OpenGL (Zink) run on
+  NVK, global with a deny-list; Venus is the fallback for processes the policy
+  keeps off NVK.
+- Full-screen flip-model games are scanned out from their own buffers
+  (independent flip, `IndepFlip` 1); windowed apps are composed by DWM.
+
+Measured, code defaults:
+
+| Workload | Result |
 |---|---|
-| Desktop / DWM on NVK (`HKLM\SOFTWARE\Helios DwmIcd=nvk`, KMD `ForeignFlip=1`) | 237 fps at 240 Hz (flip announce, `FlipAnnForeign` default with ForeignFlip, `FfAsyncWin=2`) |
-| Start menu, search, Explorer, Edge, shell sandboxes on NVK | work (Mesa 0048: NAK printer only with `NAK_DEBUG=annotate`) |
-| Heaven D3D11 1600x900, app owns the scanout | 285-511 fps (Mesa 0051) |
-| Heaven D3D11 1600x900 **windowed** (composed), GuestBlob 0 | 214 fps |
-| same, `GuestBlob=1` (host `venus.guest_blobs true`) | **247 fps**, CPU mirror gone (`BltMirrorN 0`), `GbLeak 0` |
-| same, `GuestBlob=1 BltAsync=1 ForeignCopy=1` | 225 fps; KMD Blt DDI 0.135 ms per call (was 1.28 ms) |
-| D3D12 (vkd3d-proton UMD12), Vulkan, OpenGL (Zink) | run on NVK; less measured than D3D11 |
+| Counter-Strike 2, 1920x1080 | ~330-380 fps |
+| Counter-Strike 2, 5120x1440, with bots | ~350 fps |
+| Counter-Strike 2, lower resolutions | ~400-500 fps |
+| 3DMark Steel Nomad (DX12) | score 5823 |
 
-GuestBlob, BltAsync and ForeignCopy are **off by default** in 343.1 until the
-stress and fallback checks are signed off (see the plan).
+## Shipped configuration
 
-## Where the windowed frame time goes now (the next target)
+A fresh install needs no KMD service-key values: the absent value is the
+shipped configuration
+([shipping_defaults.rs](../guest/windows/kmd_logic/src/shipping_defaults.rs)).
+
+| Knob | Default | What it does |
+|---|---|---|
+| `ForeignFlip` | 1 | the KMD flips the NVK DWM's buffers itself (`ScanoutFlip`); `FlipAnnForeign` and `FfAsyncWin` follow it |
+| `ForeignCopy` | 1 | the explicit-modifier copy of a foreign (NVK-on-RM) source |
+| `BltAsync` | 1 | the composed foreign Blt returns without a CPU wait |
+| `RedirVram` | 1 | GPU-only GDI surfaces in RM video memory, the redirected Blt into them on the KMD's RM copy-engine channel; the UMD's `NvkSkipBltCopy` follows it |
+| `MsiMode` | 2 | MSI-X, with the boot-loop breaker and the delivery latch putting INTx back on a failure |
+| `IndepFlip` | 1 | independent flip for full-screen flip-model swap chains; `HwCursor` follows it, the UMD's `DirectFlipSupport` is 5 |
+
+Opt-in, not the default:
+
+- The threaded D3D11 front end (`UmdThreadedFrontend`, 0 by default; PR #90
+  to turn it on by default is a draft).
+- `GuestBlob` (and the host's `venus.guest_blobs`), `RmCopyEngine` (routes
+  the other windowed Present copies through the copy-engine channel),
+  `CopyQueue`,
+  `GdiAccel`, `FlipDoneHost`: experiments, default 0.
+
+Host side, all defaults:
+
+- Guest GPU timeslice 100 µs (`backend.gpu_timeslice_us`), so host display
+  work waits at most one short slice behind a busy guest
+  ([HOST-TUNING.md](HOST-TUNING.md#gpu-time-the-guests-timeslice)).
+- Host isolation on (`host.isolation auto`): host work, device interrupts and
+  kernel workqueues stay off a running libvirt VM's CPUs
+  ([HOST-TUNING.md](HOST-TUNING.md#cpu-host-isolation)).
+- Backend round-trip latency options on (`backend.latency all`).
+- Keyboard and mouse over virtio-input (Conduit Mouse, Keyboard, Tablet,
+  served by the backend; needs the guest's `vioinput` driver)
+  ([INPUT.md](INPUT.md)).
+- The viewer presents immediately in fullscreen and with vsync in a window
+  (`--sync fullscreen`) ([VIEWER.md](VIEWER.md)).
+
+`conduit up`/`view` need `--venus` for a Windows guest (the TUI adds it).
+
+## Where the windowed frame time goes
 
 Per-stage budget of every frame, both present paths, guest and host on one
 clock: [frame stage timing](TRACING.md#frame-stage-timing) (`StageTrace=1`
-in the guest driver, then `stages.sh VM`). The numbers below predate it.
+in the guest driver, then `conduit trace VM stages` or
+`guest/windows/ci/vmtest/stages.sh VM`).
 
-With guest blobs and async Blt the KMD is no longer the cost, but Heaven still
-spends ~1.8 ms in `Present` per frame (interval 4.4 ms). A DxgKrnl ETW trace of
-the same path shows the app thread waiting in dxgkrnl
-(`VIDMM_BEGINCPUACCESS_WAIT`, events 41→42) for the **previous frame's Blt
-packet to retire** before the next redirected Blt may take CPU access:
+A windowed NVK app's Present is a Blt the KMD runs: the source is the app's
+NVK image (the UMD does not copy it, `NvkSkipBltCopy`), the destination the
+window's redirection surface. With `RedirVram` a GDI redirection texture
+lives in RM video memory and the copy into it runs on the KMD's RM
+copy-engine channel ([vram-redirection.md](../guest/windows/docs/vram-redirection.md)
+5.9); a CPU-visible destination takes the Venus copy. dxgkrnl serialises a
+window's next Blt behind the previous Blt packet's retirement, so the Present
+costs a round trip through the guest per frame, where bare metal returns
+after queueing.
 
-- producer wait (deferral until Heaven's GPU work is done): mean **614 µs**
-  (`BltDeferUs / BltAsyncDefer`);
-- copy round trip, KMD submit → completion DPC: 98% in **0.5-1 ms**
-  (`BltAsyncLat2`), of which the GPU copy itself is ~0.2 ms;
-- DMA-completion delivery to dxgkrnl.
+Levers, most promising first (details and code references:
+[PERF-ROADMAP.md](PERF-ROADMAP.md)):
 
-Sum ≈ 1.4-1.7 ms = the Present cost. Bare metal returns from Present after
-queueing; here each frame waits for a GPU round trip through the guest.
-Still to confirm on Heaven itself: per frame Σ(id 42 − id 41) on the app
-thread versus the previous Blt packet's id 178 → 180 span.
+1. Event-driven completion of the copy-engine copy: completion is polled
+   (a settle spin after dispatch, then the HPD worker's 0.5 ms poll).
+2. A non-blocking D3D11 present: the present gate waits for DXVK's CS and
+   submit threads on the app thread.
+3. Host round-trip latency of the completion path (backend event pump,
+   interrupt delivery).
+4. Independent flip already removes the composite for full-screen games; a
+   windowed app keeps the copy.
 
-Levers, most promising first:
-1. **GPU-side dependency on the producer's RM fence** (best done on the KMD's RM copy-engine channel, see "Removing Venus"; a host-side wait inside a Venus command is the interim alternative): submit the copy at
-   Present time; the host queue waits for the producer's fence and starts the
-   copy the moment it is done. Removes the 0.61 ms deferral and the worker hop;
-   the round trip overlaps the producer. Host feature (wait on an RM fence
-   value inside a Venus command). Estimated 4.4 ms → ~3 ms.
-2. **Host round-trip latency**: measure in the backend/renderer kick →
-   vkQueueSubmit → fence → used-ring + interrupt; 0.3-0.8 ms of the round trip
-   is overhead beyond the 0.2 ms copy (thread hops, fence-wait thread, irqfd).
-   Measured per frame by frame stage timing (`conduit trace NAME stages`,
-   `guest/windows/ci/vmtest/stages.sh`; [TRACING.md](TRACING.md#frame-stage-timing)).
-3. **MSI-X** instead of INTx for the device (branch `kmd/msix-default`,
-   [msi-interrupts.md](../guest/windows/docs/msi-interrupts.md)): cuts
-   interrupt-to-DPC time on every completion and every RM call (~55 µs per RM
-   call today). Needs the vhost-user device to expose MSI-X.
-4. dxgkrnl serialises each frame behind the previous copy into the one
-   redirection surface; not changeable from the KMD. The real way around the
-   copy is the flip model (below, parked).
+## Removing Venus: what still uses it
 
-## Removing Venus: what still uses it, and the RM replacement
-
-`conduit up win11 --venus` is still required for Windows guests: the flag
-starts `conduit-venus` in the backend. Apps and DWM run on NVK regardless
-(`DwmIcd=nvk`, per-process policy); Venus is still carried for the pieces
-below. Roadmap stage S6d ("Venus removed") is the end state; this is the
-inventory it needs. Small fix in the meantime: `conduit attach`/`up` should
-enable Venus automatically for a Windows guest so nobody types `--venus`.
+Apps and DWM run on NVK regardless of `--venus`; Venus is still carried for
+the pieces below. Stage S6d ("Venus removed") is the end state.
 
 | Still on Venus | Why it is there | Replacement on NVK/RM |
 |---|---|---|
-| Windowed (blit-model) Present copy: KMD `Blt` → Venus copy into the guest blob / redirection surface | the copy engine the KMD could reach first | The KMD's own RM client (already exists, "level 5" lane) submits the copy on an RM copy-engine channel. The copy-engine channel waits on the producer's RM semaphore **on the GPU**, so lever 1 above (no CPU deferral, no worker hop) comes for free, without a new host feature. Destination: the same guest-memory pages, mapped to the GPU through RM (system-memory allocation over guest pages) instead of a Venus blob. |
-| Fallback for processes not on NVK (deny-list, DXR titles, 32-bit cases that fail) | NVK gaps | shrink the deny-list (S6c); DXR waits on NVK ray tracing |
-| The Venus scanout path (`ForeignFlip` off, Venus-DWM) | first working desktop | ForeignFlip with DWM on NVK is the default; drop once restart recovery on NVK is solid |
-| Venus fences / ring used by KMD paths (paging, present ready-poll) | built on Venus first | RM fences (S4 done for presents); move the remaining KMD waits to RM semaphores |
-| Host: conduit-venus, virglrenderer patches 0001/0002, `--venus-guest-blobs` | the above | removed with the last row |
+| The windowed Present copy into a CPU-visible KMD standard buffer (a destination that is not an RM video-memory surface) | the copy engine the KMD could reach first | the KMD RM copy-engine channel, which already carries the `RedirVram` copies |
+| Processes not on NVK (deny-list, DXR titles, cases that fail) | NVK gaps | shrink the deny-list (S6c); DXR waits on NVK ray tracing |
+| The Venus scanout path (`ForeignFlip` 0, Venus DWM via `install.ps1 -VenusDesktop`) | the first working desktop | `ForeignFlip` with DWM on NVK, the default |
+| Venus fences and ring used by KMD paths (paging copies, the present ready-poll, GuestBlob) | built on Venus first | RM fences and semaphores (presents already retire on RM fences) |
+| Host: conduit-venus, the virglrenderer patches, `--venus-guest-blobs` | the above | removed with the last row |
 
-Open (not done yet): the KMD-side audit that checks this table. Brief: list
-every KMD path that touches Venus (ring/instance bring-up, fences and waits,
-host-visible blobs and the BAR/aperture CPU view, paging copies, present
-buffers, the present ready-poll/worker, scanout image and
-SET_SCANOUT_BLOB/flush, ForeignCopy, snapshot/WindowedBlt, read ledger), and
-judge the RM copy-engine route against the KMD RM client as it stands. Today
-that client has the client/device/subdevice/memory classes and
-export/GEM/ScanoutFlip, but no GPFIFO channels, CE objects or push-buffer
-submission, and the OS-descriptor mapping of guest pages is UNVERIFIED
-([kmd-rm-client.md](../guest/windows/docs/kmd-rm-client.md) 5.3). So the route
-is a new subsystem, not a small step; the audit should size it.
-
-Order: (1) windowed copy on the KMD RM client with a GPU semaphore wait (this
-is also the windowed-performance fix, so it goes first), (2) KMD waits on RM
-fences, (3) deny-list down to DXR, (4) Venus scanout path removed, (5) host
+Order: (1) every windowed copy on the KMD RM copy-engine channel with
+event-driven completion, (2) the remaining KMD waits on RM fences,
+(3) deny-list down to DXR, (4) the Venus scanout path removed, (5) the host
 side removed. Each step keeps Venus as a runtime fallback until the next
-restart-device/stress pass is clean.
+restart-device and stress pass is clean.
 
-## Tried, and what came of it
+## Settled findings
 
-| Tried | Outcome |
+| Finding | Consequence |
 |---|---|
-| `BltNoMirror=1` (skip the KMD CPU mirror) | Stale window: DWM reads the CPU view. Do not use; the guest blob replaced it. |
-| Flip-model upgrade of windowed apps via per-app `HKCU\...\DirectX\UserGpuPreferences` | Inconsistent (some apps), never Heaven: DXGI's game classification gates it (`REASON_NONGAME`). Parked. |
-| KMD's own RM client ("level 5") as the windowed fix | Not the fix (the cost is the dxgkrnl Blt retire); on hold. |
-| Venus fence timing (plain queue-sync fences) | 10 ms → ~1 ms per fence; merged. |
-| NVK UBO-descriptor promotion | Off on Windows (0051): GPU per draw 2.7 → 0.7 µs. |
-| Restart-per-row testing (reboot between A/B rows) | Interrupted in-guest builds twice; use `pnputil /restart-device` rows (blrow.sh) and reboot only for host installs. |
-| Readings without a device restart after changing `FfKnob` etc. | Fake results (knobs are read at StartDevice). Always restart the device per row. |
-| zsh loops splitting `"label K=V"` | Knobs silently not applied; arg-splitting loops live in bash scripts. |
-| `restart-device` | Leaves the display degraded until a reboot (wrong buffer on scanout, zero-copy-present.md 25); deprioritised by the user. |
-| Pagefile unbounded | Grew to 12.7 GB, filled C: twice; fixed at 4096 MB. Dump file on C: (W: dedicated dump was never written). |
-| Display idle timeout | Looked like DWM freezes; power timeouts set to 0 in the guest. |
+| `BltNoMirror=1` leaves the window stale: DWM reads the CPU view of a CPU-visible redirection surface | do not use it; GPU-only surfaces (`RedirVram`) are the way around the CPU view |
+| Flip-model upgrade of windowed apps via per-app `HKCU\...\DirectX\UserGpuPreferences` is gated by DXGI's game classification (`REASON_NONGAME`) | not a route for windowed apps |
+| NVK UBO-descriptor promotion costs GPU time per draw on Windows | off on Windows (Mesa patch 0051) |
+| Most KMD knobs are read at StartDevice | restart the device (or reboot, per the Read column of [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md)) for every A/B row; a reading without it is not a result |
+| zsh does not word-split `"label K=V"` | loops that split arguments live in bash scripts |
+| The display idle timeout looks like a DWM freeze | set the guest's power timeouts to 0 on a test VM |
+| An unbounded pagefile can fill the guest's system drive | fix its size on a test VM |
 
 ## Plan, in order
 
-1. Sign off 343.1: 10-minute window stress (`stressrun.sh`: GbLeak 0, GbStrike
-   0, GbFail flat, no BuildPagingBuffer hang, GbDrainMax ≪ 250 ms), the
-   fallback (host without `--venus-guest-blobs` → GbFeat 0, behaves like
-   GuestBlob 0), restart-device with a live guest blob. Then make GuestBlob +
-   BltAsync + ForeignCopy the defaults (host `venus.guest_blobs` default true).
-2. Heaven DxgKrnl ETW attribution (above), then lever 1 (host waits on the
-   producer's RM fence) with the KMD session; lever 2 measurements; lever 3
-   (MSI-X) A/B.
-3. Stability: restart-device recovery, NVK holder renewal (0052) across a real
-   restart, Explorer repaint after a DWM restart.
-4. Edge video on NVK: a reported 2-2.5 s per-frame stall (older packages; not
-   re-checked on 343.1). Repro `tools/chromium_like.cpp` + `cl_run.ps1` on
-   branch `fix/nvk-browser-video` (d55da5e): Chromium's DComp NV12/BGRA video
-   path with keyed-mutex / shared-fence hand-off, prints SMOOTH or STALLED.
-   Suspect: `NVK_PRESENT_WAIT_US` = 2 s in present.rs timing out on a fence that
-   never signals; the Edge GPU-process log (`C:\ProgramData\Helios\sandbox`)
-   would show "NVK present: frame wait timed out".
-5. Heaven x86 OpenGL (Zink 32-bit) white scene.
-5. Flip-model route for windowed apps (parked), level 5 (on hold), Venus
-   removal (S6d).
-6. Second machine (RTX 4070 SUPER, Ada): a Linux guest on NVIDIA's own
+1. Event-driven completion for the KMD copy-engine copies, then move the
+   remaining windowed copies off the Venus fallback (PERF-ROADMAP T4).
+2. The D3D11 present gate off the app thread, and the threaded front end on
+   by default once its correctness rows pass (PR #90).
+3. Host-paced vblank for the Windows guest (PR #78, draft) and the guest
+   cursor drawn by the viewer under a grab (PR #81, draft).
+4. Stability: recovery after `pnputil /restart-device` (NVK holder renewal,
+   Mesa patch 0052) and Explorer repaint after a DWM restart (the `Dw*`
+   counters, `zero-copy-present.md` "DWM restart and stale Explorer").
+5. Edge video on NVK: check for the per-frame stall reported on older
+   packages. Repro `guest/windows/tools/chromium_like.cpp` (Chromium's DComp
+   NV12/BGRA video path with keyed-mutex / shared-fence hand-off).
+6. Unigine Heaven x86 OpenGL (Zink 32-bit) white scene.
+7. Venus removal (S6d, the order above).
+8. Second machine (RTX 4070 SUPER, Ada): a Linux guest on NVIDIA's own
    user-mode driver runs (closed modules 565.77, see GPU-SUPPORT.md
    "Measured"); NVK on Ada and the Windows guest are untested
    ([SECOND-MACHINE.md](SECOND-MACHINE.md),
@@ -161,35 +172,37 @@ restart-device/stress pass is clean.
 
 ## Where things are
 
-- **Release** `v0.1.5-rc1` (pre-release): host `.deb` from main 5ba86d7, Linux
-  guest `.deb`, `helios-22.22.343.1.zip` (signed driver + `install.ps1`).
-- **Driver builds** run in the win11 VM's W: drive
-  (`guest/windows/ci/vm/win-build.sh`, `WIN_ROOT=W:\s315`, incremental);
-  packages in `W:\s315\out\pkg-<ver>`, 341.3 kept in `Release-341.3`.
-- **Host deploys** are staged (host-deploy4-build.sh) and installed through
-  the cycle script's `PRESTART` hook while the VM is off.
-- **Host tuning** (swappiness 10, zram, shmem THP within_size, QEMU
-  oom_score_adj, iothread pinning; hugepages staged for a host reboot):
-  [HOST-TUNING.md](HOST-TUNING.md).
-- **Guest registry**: `HKLM\SOFTWARE\Helios DwmIcd=nvk, DwmNvkMaxStarts=60`;
-  KMD knobs under `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`
-  (read at StartDevice). Leftover test values: per-app
-  `HKCU\Software\Microsoft\DirectX\UserGpuPreferences` (remove).
-- **Branches not on main**: `kmd/msix-default` (MSI-X opt-in),
-  `kmd/independent-flip-design` (flip design doc), `kmd/std-census`,
-  `kmd/dwm-restart-repaint`, `build/s6-pkg`, and the per-change `kmd/*` lanes
-  already folded into v343.
+- **Releases**: GitHub releases carry the host `.deb`, the Linux guest `.deb`
+  and the signed Windows driver package (`helios-<version>.zip` with
+  `install.ps1`).
+- **Driver builds** run in a Windows build VM from a checkout
+  (`guest/windows/ci/vm/win-build.sh`, set up once with `Setup-BuildVm.ps1`);
+  the version is edited only in `driver-version.env`.
+- **Host deploys** are staged and installed through the cycle script's
+  `PRESTART` hook while the VM is off
+  ([vmtest](../guest/windows/ci/vmtest/README.md)).
+- **Host tuning**: [HOST-TUNING.md](HOST-TUNING.md) (memory, CPU placement,
+  host isolation, the GPU timeslice, direct scanout).
+- **Guest registry**: the recommended configuration is the code defaults
+  plus what `install.ps1` writes ([WINDOWS-KNOBS.md](WINDOWS-KNOBS.md)).
+  Values left from a test keep acting until deleted; KMD knobs live under
+  `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, UMD knobs
+  under `HKLM\SOFTWARE\Helios`.
+- **Open pull requests**: #78 host-paced vblank (draft), #81 cursor position
+  for the viewer (draft), #90 threaded D3D11 front end on by default (draft).
 
 ## Working rules that cost time to learn
 
 - One session drives all VM testing and installs; agents write code and build.
-- Restart win11 only with the cycle script; run the watchdog during any guest
-  work; check host disk space (a full root disk pauses the VM).
+- Restart the test VM only with the cycle script (`win11-cycle.sh`); run the
+  watchdog (`watch-win11.sh`) during any guest work; check host disk space (a
+  full root disk pauses the VM).
 - Never `pkill -f`; kill by PID. Never `New-Item -Force` on an existing
-  registry key (wipes values); use `Set-ItemProperty`.
+  registry key (it wipes the values); use `Set-ItemProperty`.
 - Before any KMD push: kmd_logic tests, the protocol crate tests (scratch copy
   with an empty `[workspace]`), the C ABI check; after every merge, not just
   before the push.
-- Host builds pinned: `taskset -c 0-7,16-23 nice -n 19`, -j4.
+- Keep host builds off the VM's CPUs and at low priority (`taskset`, `nice`,
+  a low `-j`): they share cores with QEMU and the backend.
 - Verify live state before describing it (a rejected command may still have
   run; a fallback to Venus looks like success).

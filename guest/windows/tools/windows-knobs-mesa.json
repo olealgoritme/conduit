@@ -1,0 +1,165 @@
+{
+ "commit": "89bd0676a4e69740d9900fb13561b14acc4997d6",
+ "reads": [
+  {
+   "name": "HELIOS_RELEASE_TRACE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_device_memory.c:807"
+  },
+  {
+   "name": "HELIOS_QUEUE_PERF",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:97"
+  },
+  {
+   "name": "HELIOS_PERF",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:99"
+  },
+  {
+   "name": "HELIOS_QUEUE_PERF_INTERVAL",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:103"
+  },
+  {
+   "name": "HELIOS_PERF_FILE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:119"
+  },
+  {
+   "name": "HELIOS_SUBMIT_SHAPE_TRACE",
+   "default": "false",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:481"
+  },
+  {
+   "name": "HELIOS_FENCE_INTERNAL_TIMELINE_SUBMITS",
+   "default": "false",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:1455"
+  },
+  {
+   "name": "HELIOS_FENCE_INTERNAL_TIMELINE_LIMIT",
+   "default": "8",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:1517"
+  },
+  {
+   "name": "HELIOS_FENCE_INTERNAL_TIMELINE_MS",
+   "default": "2000",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:1533"
+  },
+  {
+   "name": "HELIOS_FOLD_WAIT_ONLY_SUBMIT",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:1596"
+  },
+  {
+   "name": "HELIOS_DISABLE_INTERNAL_SEM_FEEDBACK",
+   "default": "false",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_queue.c:3365"
+  },
+  {
+   "name": "HELIOS_SUBMIT_TRACE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c:1204"
+  },
+  {
+   "name": "HELIOS_ESCAPE_NO_ADAPTER_SYNC",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c:1421"
+  },
+  {
+   "name": "HELIOS_ESCAPE_HW",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c:1493"
+  },
+  {
+   "name": "HELIOS_RELEASE_TRACE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c:2555"
+  },
+  {
+   "name": "HELIOS_PERF",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c:2907"
+  },
+  {
+   "name": "HELIOS_PERF_LIVE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c:2912"
+  },
+  {
+   "name": "HELIOS_PERF_FILE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c:2929"
+  },
+  {
+   "name": "HELIOS_GATE_RESID_FILE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_renderer_helios.c:4326"
+  },
+  {
+   "name": "HELIOS_RING_NOTIFY_EAGER",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/virtio/vulkan/vn_ring.c:51"
+  },
+  {
+   "name": "HELIOS_WSI_PERF",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common.c:82"
+  },
+  {
+   "name": "HELIOS_WSI_PERF_INTERVAL",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common.c:85"
+  },
+  {
+   "name": "HELIOS_WSI_PERF_FILE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common.c:98"
+  },
+  {
+   "name": "HELIOS_WSI_INSURANCE_BLIT",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common.c:148"
+  },
+  {
+   "name": "HELIOS_WSI_ASYNC_PRESENT",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common.c:198"
+  },
+  {
+   "name": "HELIOS_WSI_DIRECT_MAP",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp:123"
+  },
+  {
+   "name": "HELIOS_WSI_PERF",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp:141"
+  },
+  {
+   "name": "HELIOS_WSI_PERF_INTERVAL",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp:144"
+  },
+  {
+   "name": "HELIOS_WSI_PERF_FILE",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp:157"
+  },
+  {
+   "name": "HELIOS_WSI_DCOMP_PRESENT",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp:345"
+  },
+  {
+   "name": "HELIOS_WSI_VEHICLE_WAIT_US",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp:371"
+  },
+  {
+   "name": "HELIOS_WSI_EXTRA_IMAGES",
+   "default": "unset",
+   "source": "guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp:2583"
+  }
+ ]
+}

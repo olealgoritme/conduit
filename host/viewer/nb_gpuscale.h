@@ -14,8 +14,8 @@
  * opaque output-size buffer on the main surface.  The compositor was going to
  * scale the picture anyway; this moves that pass in front of it.
  *
- * Only used in fullscreen with immediate presentation and a picture that is
- * not already an exact fit; an exact fit stays zero-copy.
+ * Used in fullscreen when the measurement in nb_scanout.h finds it beats
+ * showing the guest's buffer zero-copy (or --gpu-scale=on asks for it).
  *
  * EGL, GLES2 and GBM are loaded with dlopen when the scaler is first wanted,
  * so the viewer still has no link-time dependency on them.
@@ -46,6 +46,8 @@ struct nb_gs_target {
 struct nb_gs *nb_gs_open(const char *node, dev_t dev, uint32_t fourcc,
                          uint64_t mod, char *why, size_t n);
 void nb_gs_close(struct nb_gs *g);
+/* Whether this scaler's GPU imports (fourcc, mod) as a source frame. */
+bool nb_gs_can_import(struct nb_gs *g, uint32_t fourcc, uint64_t mod);
 const char *nb_gs_node(const struct nb_gs *g);
 
 /* Formats/modifiers the compositor accepts, for choosing the target layout:
@@ -54,11 +56,26 @@ typedef bool (*nb_gs_fmt_ok)(void *ctx, uint32_t fourcc, uint64_t mod);
 
 /*
  * (Re)allocate the NB_GS_TARGETS output buffers at w x h (physical pixels).
- * Returns the number made (0 on failure, with why).  out[] describes them.
+ * scan_mods/n_scan: the XRGB8888 modifiers of the compositor's scanout
+ * tranche (dma-buf feedback), tried first; none: GBM's own choice for
+ * scanout.  Returns the number made (0 on failure, with why).  out[]
+ * describes them.
  */
 int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
-                  void *ctx, struct nb_gs_target out[NB_GS_TARGETS],
+                  void *ctx, const uint64_t *scan_mods, unsigned n_scan,
+                  struct nb_gs_target out[NB_GS_TARGETS],
                   char *why, size_t n);
+
+/*
+ * The last resort when the compositor takes no layout this GPU can render
+ * to (NVIDIA renders to no LINEAR buffer, and a compositor on another GPU
+ * takes no NVIDIA modifier): plain renderbuffers, each frame read back into
+ * memory the caller hands the compositor as wl_shm (XRGB8888, w*4 stride).
+ */
+int nb_gs_targets_readback(struct nb_gs *g, uint32_t w, uint32_t h,
+                           char *why, size_t n);
+/* After nb_gs_draw into `target`: copy it to dst (w*h*4 bytes). */
+int nb_gs_readback(struct nb_gs *g, int target, void *dst);
 
 /* Source frames, cached by `key` (the backend's buffer slot). */
 int  nb_gs_src(struct nb_gs *g, int key, int fd, uint32_t w, uint32_t h,

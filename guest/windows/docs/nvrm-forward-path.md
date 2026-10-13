@@ -179,7 +179,7 @@ items" 5-10 us, of which the DPC lock consolidation below is NOT included).
 
 ## 6. NOT implemented (risky blind), best expected gain first
 
-1. **MSI-X for the control queue**: DONE as an opt-in (`MsiMode=2`; INF `MSISupported=0`, INTx
+1. **MSI-X for the control queue**: DONE, on by default (`MsiMode` 2; INF `MSISupported=0`, INTx
    fallback and counters; `docs/msi-interrupts.md`). Not verified on hardware: the
    per-call gain (est. 20-35 us from the host side) is measured by `NvRttMeanUs` and
    the `NvRttB*` histogram, A/B against `MsiMode=1`.

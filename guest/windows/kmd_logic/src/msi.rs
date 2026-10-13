@@ -321,12 +321,13 @@ const fn plan_eq(a: &Plan, b: &Plan) -> bool {
 /// key, a second restart (or a reboot) applies it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// 0 (default): follow the INF / the device key as it stands. The driver
+    /// 0: follow the INF / the device key as it stands (the absent knob is 2,
+    /// `crate::shipping_defaults::MSI_MODE`). The driver
     /// only ever LOWERS it on its own (a latched start).
     Auto,
     /// 1: INTx always (the A/B and the escape hatch). Survives a driver update.
     ForceIntx,
-    /// 2: MSI-X (writes the key to 1), but the breaker and the latch still win:
+    /// 2 (default): MSI-X (writes the key to 1), but the breaker and the latch still win:
     /// a start that never became healthy, or a convicted delivery, puts INTx back.
     ForceMsi,
     /// 3: MSI-X, no breaker and no latch: debugging only.

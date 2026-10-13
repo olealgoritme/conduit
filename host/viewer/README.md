@@ -37,7 +37,7 @@ host/viewer/test-standalone.sh 5 240 2560x1440    # no VM: GPU test pattern at 2
 ```
 
 `conduit-viewer --help` lists the options (`--res`, `--area`, `--scale`,
-`--overlay`, `--resize`, `--direct-mode`, `--sync`, `--gpu-scale`, `--stats`, ...). Only the invoking user and root
+`--overlay`, `--resize`, `--direct-mode`, `--sync`, `--gpu-scale=auto|on|off`, `--gpu`, `--stats`, ...). Only the invoking user and root
 may connect (SO_PEERCRED; see `--allow-user`).
 
 The window's app id (Wayland) and class (X11) are `conduit-viewer`, for
@@ -64,5 +64,8 @@ these; [`docs/VIEWER.md`](../../docs/VIEWER.md) describes them, the mouse
 mapping and the cost (none on the frame path).
 
 The overlay and the window title show fps, frame times, latency and whether the
-compositor scanned the buffer out directly (`DIRECT`) or composited it. For
-direct scanout on Hyprland see [`docs/SCANOUT.md`](../../docs/SCANOUT.md).
+compositor scanned the buffer out directly (`DIRECT`) or composited it.
+`--stats` logs, once per second, how many frames were scanned out directly,
+which path the picture takes in fullscreen (zero-copy or the GPU pass, chosen
+by measuring both: `nb_scanout.h`) and what prevents direct scanout; see
+[`docs/VIEWER.md`](../../docs/VIEWER.md).

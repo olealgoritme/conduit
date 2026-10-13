@@ -123,17 +123,15 @@ In this order, checking the desktop after each:
 
 1. Host: `conduit config set venus.guest_blobs true`, then restart the VM's
    backend (`conduit down win11`, `conduit up win11 --venus`).
-2. Guest, as administrator: `ForeignFlip` = 1 (REG_DWORD) under
-   `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, then
-   `pnputil /restart-device` on the adapter (or reboot).
-3. Guest: `DwmIcd` = `nvk` (REG_SZ) under `HKLM\SOFTWARE\Helios`, then
-   reboot. The desktop follows DWM onto NVK.
-4. Independent flip is on by default (`IndepFlip`, `DirectFlipSupport`); to turn it off set
+2. Guest: `DwmIcd` = `nvk` (REG_SZ) under `HKLM\SOFTWARE\Helios` (what
+   `install.ps1` sets unless `-VenusDesktop` is given), then reboot. The
+   desktop follows DWM onto NVK; the KMD flips its buffers itself
+   (`ForeignFlip`, on by default).
+3. Independent flip is on by default (`IndepFlip`, `DirectFlipSupport`); to turn it off set
    `IndepFlip` = 0 in the KMD service key and reboot.
 
 Each is described in [WINDOWS.md](WINDOWS.md) "Opt-ins". To back out: delete
-`DwmIcd` (DWM's crash-loop guard also falls back to Venus on its own), set
-`ForeignFlip` to 0, or `HKLM\SOFTWARE\Helios!Icd` = `venus` to put every
+`DwmIcd` (DWM's crash-loop guard also falls back to Venus on its own), or `HKLM\SOFTWARE\Helios!Icd` = `venus` to put every
 process back on Venus.
 
 ## Caveats
@@ -147,7 +145,7 @@ process back on Venus.
   back while they are found. Per-generation details, known gaps and the test
   order: [GPU-SUPPORT.md](GPU-SUPPORT.md).
 - The open items on the reference machine apply too
-  ([NVK-ROADMAP.md](NVK-ROADMAP.md) "Where it stands"): the windowed blt
+  ([NVK-ROADMAP.md](NVK-ROADMAP.md#where-it-stands)): the windowed Present
   path, recovery after `pnputil /restart-device`, Unigine Heaven x86 OpenGL
   renders a white scene.
 - Other limits: [KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests).

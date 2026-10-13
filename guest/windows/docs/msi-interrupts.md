@@ -1,12 +1,10 @@
 # MSI-X interrupts for the Helios KMD
 
-Status: implemented and shipped OFF. This package's INF writes `MSISupported=0` (INTx, as
-before); MSI-X is an opt-in (`MsiMode=2`, "Minimum safe test procedure") until one hardware run
-passes, and then the default is flipped by changing one INF line ("The flip plan"). The INTx
-fallback, the boot-loop breaker, the polling safety net and the per-vector counters are in the
-package either way. NOT verified on hardware: the KMD could not be compiled or run where this was
-written; everything marked "verify" is a claim that only a boot can confirm. The recovery path
-if a start does not come up is in "Recovery".
+Status: implemented and on by default: `MsiMode` defaults to 2 (`kmd_logic/src/shipping_defaults.rs`),
+so the driver asks PnP for MSI-X although the INF still writes `MSISupported=0`; the breaker and the
+delivery latch put INTx back on a failure; `MsiMode` 1 forces INTx. The INTx fallback, the boot-loop
+breaker, the polling safety net and the per-vector counters are in the package. The sections below
+are the design and test record. The recovery path if a start does not come up is in "Recovery".
 
 ## Why
 
@@ -517,7 +515,7 @@ itself is unchanged code with counters added, and its first test is a boot with
 
 | Knob (service key `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, DWORD) | Values | Applies |
 | --- | --- | --- |
-| `MsiMode` (default 0) | 0 = auto: follow the INF / the device key as it stands (INTx in this package); a latch lowers it. 1 = INTx always. 2 = MSI-X opt-in: raises the key to 1, but the latch and the breaker still win. 3 = MSI-X with no breaker and no latch (debugging only). Unknown values are 0. Never written by the driver; mirrored as `MsiModeEff`. | `AddDevice` writes the device key from it: the first restart after a change writes, a second restart or a reboot applies. Survives driver updates. Going back to 0 leaves the key where the forcing put it. |
+| `MsiMode` (default 2) | 0 = auto: follow the INF / the device key as it stands (the INF writes INTx); a latch lowers it. 1 = INTx always. 2 (default) = MSI-X: raises the key to 1, but the latch and the breaker still win. 3 = MSI-X with no breaker and no latch (debugging only). Unknown values are 0. Never written by the driver; mirrored as `MsiModeEff`. | `AddDevice` writes the device key from it: the first restart after a change writes, a second restart or a reboot applies. Survives driver updates. Going back to 0 leaves the key where the forcing put it. |
 | `MsiLatch` (default 0) | 1 = a start convicted message delivery, could not set vectors up, or the breaker tripped: the next `AddDevice` asks for INTx. The driver sets it (`MsiLatchWhy`: 1 silent rescues, 2 vectors refused, 3 common cfg unmapped, 4 breaker) together with `MsiLatchVer`; a latch of ANOTHER build is stale and cleared at `AddDevice`. Clear it by deleting it (or 0) once the cause is fixed (mode 2 does not clear it); set it to 1 with no `MsiLatchVer` and no `MsiLatchWhy` to force or rehearse the fallback (honoured by every build); an untagged latch WITH a reason 1-4 was written by a pre-tag image and is set aside (`MsiLatchLegacy=1`). A permanent INTx is `MsiMode=1`. | `AddDevice`. |
 | `MsiLatchVer` (default absent) | The build tag of the image that wrote the latch; absent with no reason = the operator's latch. Written by the driver; delete it (and `MsiLatchWhy`) when setting `MsiLatch` by hand. | `AddDevice`. |
 | `MsiLatchLegacy` | Written when a latch is set aside: 1 = it was untagged with a KMD reason (a pre-tag image), 0 = it carried another build's tag. | Written at `AddDevice`. |

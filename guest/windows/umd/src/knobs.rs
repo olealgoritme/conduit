@@ -206,11 +206,11 @@ pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists"
 /// OFF means a timed run does no diagnostic atomic RMW at all.
 pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob = BoolKnob::new(c"UmdDeferredDiagnostics", false);
 
-/// D3D11 DDI interface the adapter advertises (`ddi_level.rs`). Absent = 0x10
-/// (D3DWDDM1_3, what every process negotiated before); 0x24 (D3DWDDM2_3)
-/// advertises the WDDM 2.3 D3D11 DDI above it. Never applied to dwm.exe, which
-/// has its own `UmdDdiLevelDwm` (same values, absent = 0x10).
-pub(crate) static UMD_DDI_LEVEL: DwordKnob = DwordKnob::new(c"UmdDdiLevel", 0x10);
+/// D3D11 DDI interface the adapter advertises (`ddi_level.rs`). Absent = 0x24
+/// (D3DWDDM2_3 above the 1.3 / 11.1 / 11.0 interfaces); 0x10 keeps the
+/// process on D3DWDDM1_3. Never applied to dwm.exe, which has its own
+/// `UmdDdiLevelDwm` (same values, absent = 0x10).
+pub(crate) static UMD_DDI_LEVEL: DwordKnob = DwordKnob::new(c"UmdDdiLevel", 0x24);
 
 /// `UmdDdiLevel` for dwm.exe only. Absent = 0x10: DWM keeps the WDDM 1.3 D3D11
 /// DDI until the 2.3 path has been proven in ordinary processes.
@@ -568,7 +568,7 @@ pub(crate) static NVK_RM_COPY_RECORD: BoolKnob = BoolKnob::new(c"NvkRmCopyRecord
 /// NOT copy the frame into it before the WDDM present; the KMD's Blt reads the
 /// present's source (`hSrcAllocation`) and writes it into the window's surface
 /// at the client offset. 0 = the UMD copies it, as before. Absent: 1 when the
-/// KMD's `RedirVram` is 1 (its service key), else 0.
+/// KMD's `RedirVram` is 1 or absent (its service key; on by default), else 0.
 ///
 /// The UMD's copy goes to (0, 0) of the destination, which with `RedirVram` is
 /// the window's redirection texture including its non-client area, while the
@@ -663,7 +663,8 @@ pub(crate) fn nvk_skip_blt_copy() -> bool {
         env_bool("HELIOS_NVK_SKIP_BLT_COPY")
             .or_else(|| helios_umd_common::knobs::reg_dword(c"NvkSkipBltCopy").map(|v| v != 0))
             .unwrap_or_else(|| {
-                helios_umd_common::knobs::kmd_service_dword(c"RedirVram") == Some(1)
+                // Absent is on: the KMD's shipped default (`kmd_logic::shipping_defaults`).
+                helios_umd_common::knobs::kmd_service_dword(c"RedirVram").unwrap_or(1) == 1
             })
     })
 }

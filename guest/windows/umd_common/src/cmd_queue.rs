@@ -65,6 +65,13 @@ pub const MAX_RING_BYTES: usize = 64 << 20;
 const WORKER_SPIN: Duration = Duration::from_micros(100);
 /// A waiter's spin before it sleeps on the condvar.
 const WAITER_SPIN: Duration = Duration::from_micros(100);
+/// Pause instructions between two looks at the producer's cursor while the
+/// worker waits on an empty ring (`HELIOS_FE_WORKER_POLL_PAUSES` overrides;
+/// 0 or 1 is one pause per look). Each look pulls the producer's cache line
+/// over, so the producer's next push pays a cache-line transfer to publish,
+/// and a worker that keeps up with its producer looks once per record.
+/// Spaced looks let records accumulate and run as a batch.
+const DEFAULT_POLL_PAUSES: u32 = 32;
 /// Records between two waiter/destroy checks while the worker is busy.
 const BATCH: u32 = 16;
 /// Park timeouts: the first park after work is short (backstop against a
@@ -130,6 +137,8 @@ struct Hot {
     cap: usize,
     started: AtomicBool,
     stop: AtomicBool,
+    /// [`DEFAULT_POLL_PAUSES`], fixed at creation.
+    poll_pauses: u32,
 }
 
 /// The producer's own line: published write cursor + its cached view of the
@@ -216,6 +225,10 @@ impl CmdQueue {
                 cap,
                 started: AtomicBool::new(false),
                 stop: AtomicBool::new(false),
+                poll_pauses: std::env::var("HELIOS_FE_WORKER_POLL_PAUSES")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .map_or(DEFAULT_POLL_PAUSES, |n| n.min(4096)),
             },
             prod: ProducerLine {
                 write: AtomicU64::new(0),
@@ -765,7 +778,9 @@ impl CmdQueue {
             self.after_batch();
             let t0 = Instant::now();
             while self.ring_empty() && t0.elapsed() < WORKER_SPIN && !self.hot.stop.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
+                for _ in 0..self.hot.poll_pauses.max(1) {
+                    core::hint::spin_loop();
+                }
             }
             if !self.ring_empty() {
                 continue;

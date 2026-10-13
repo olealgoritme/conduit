@@ -56,6 +56,8 @@
 #include "nb_gpuscale.h"
 #include "nb_pace.h"
 #include "nb_latch.h"
+#include "nb_blit.h"
+#include "nb_scanout.h"
 #include <sys/timerfd.h>
 
 #ifndef NB_HAVE_WAYLAND
@@ -180,12 +182,17 @@ struct nb_wl_buf {
     uint64_t  recv_ns;              /* virtio-nvgpu: when its ATTACH arrived  */
     int       fd;                   /* dup of the dma-buf for the fullscreen
                                      * scaler, -1 none (shm)                 */
+    /* COPY-ONLY: the compositor does not take this layout, so there is no
+     * wl_buffer (buf NULL) and every frame goes through the GPU pass
+     * (nb_blit.h). */
+    bool      copy;
 };
 
 /* Distinct pairs whose importability we remember.  Two occur in practice:
  * the guest's own tiling and the LINEAR fallback. */
 /* DRM_FORMAT_ARGB8888, spelled locally like the XR24 one. */
 #define NB_FOURCC_AR24_LOCAL 0x34325241u
+#define NB_FOURCC_XR24_LOCAL 0x34325258u
 
 #define NB_PROVEN_SLOTS 4
 
@@ -691,9 +698,51 @@ struct nb_wl {
         unsigned gen;               /* bumped on reallocation */
     } gt[NB_GS_TARGETS];
     uint32_t        gt_w, gt_h;
+    unsigned        gt_fb_gen;      /* fb_gen the targets were made for */
     int             gt_last;
+    /* READ-BACK targets: the compositor takes no layout the scaler's GPU
+     * renders to, so each frame is read back into this shm (nb_gpuscale.h
+     * nb_gs_targets_readback).  gt_want_rb: the compositor refused the
+     * dma-buf targets, use read-back from the next allocation. */
+    bool            gt_rb, gt_want_rb;
+    void           *gt_shm;
+    size_t          gt_shm_sz;
     uint64_t        st_gs_sum, st_gs_max; unsigned st_gs_n, st_gs_drop;
     unsigned        st_held;        /* commits the gate held back       */
+    /* The GPU copy for layouts the compositor does not take (nb_blit.h):
+     * what the viewer's GPU said per pair, and frames copied this second. */
+#define NB_COPY_CACHE 8
+    struct { uint32_t fourcc; uint64_t mod; bool ok; } copy_v[NB_COPY_CACHE];
+    unsigned        copy_n;
+    unsigned        st_copy;
+    bool            copy_told;
+    /* Which path a fullscreen frame takes, measured (nb_scanout.h). */
+    struct nb_so    so;
+
+    /*
+     * DMA-BUF FEEDBACK (zwp_linux_dmabuf_v1 v4) for the main surface: the
+     * compositor's tranches, one of them flagged SCANOUT when it could put
+     * this surface on a plane with those formats.  A SECOND binding of the
+     * global, at version 4, used only for get_surface_feedback: the format
+     * set itself still comes from the version 3 binding (w->dmabuf), whose
+     * format/modifier events version 4 no longer sends.
+     */
+    struct zwp_linux_dmabuf_v1          *dmabuf4;
+    struct zwp_linux_dmabuf_feedback_v1 *dfb;
+    void           *fb_tab;         /* the format table, mmap'ed       */
+    size_t          fb_tab_sz;
+    struct nb_so_fmts fb_tr_fmts;   /* the tranche being received      */
+    uint32_t        fb_tr_flags;
+    struct nb_so_fmts fb_pend_scan; /* scanout tranches of this batch  */
+    bool            fb_pend_has;
+    unsigned        fb_pend_tr;
+    struct nb_so_fmts fb_scan;      /* the last complete batch         */
+    bool            fb_has_scan, fb_got;
+    unsigned        fb_tr;
+    unsigned        fb_gen;         /* bumped when the scanout set changes */
+    /* WLR_NO_HARDWARE_CURSORS=1 in our environment: the session draws
+     * cursors in software (reported, never acted on). */
+    bool            env_sw_cursor;
 
     /* The guest's cursor, as the host pointer's image (CMD_CURSOR). */
     struct wl_surface  *gc_surf;
@@ -818,6 +867,10 @@ static void wl_ed_show(struct nb_wl *w, bool on);
 static void wl_hypr_sync(struct nb_wl *w);
 static bool wl_async_wanted(const struct nb_wl *w);
 static void wl_sync_changed(struct nb_wl *w, const char *why);
+/* Forward: the fullscreen path decision (nb_scanout.h), defined with the
+ * scaler. */
+static int wl_guest_scanout(const struct nb_wl *w, const struct nb_wl_buf *sl);
+static const char *wl_so_shape(const struct nb_wl *w);
 
 /* ── virtio-nvgpu: per-frame presentation context and --stats ─────────── */
 
@@ -828,6 +881,8 @@ struct nb_pres_ctx {
     uint64_t start_ns;      /* the guest's flip (or our receipt of it)       */
     uint64_t recv_ns;       /* our receipt of the frame                      */
     uint64_t aimed;         /* --sync=latch: the vblank it was aimed at       */
+    unsigned so_gen;        /* nb_scanout probe generation at commit         */
+    int      so_path;       /* NB_SO_ZC or NB_SO_GPU: how it was shown       */
 };
 
 /*
@@ -969,9 +1024,16 @@ static void wl_scanout_blockers(const struct nb_wl *w, char *b, size_t n)
         "menu or dialog open");
     BLK(w->ly_btn && w->ly_btn->mapped, "menu button mapped");
     BLK(w->ptr_on_content && w->cur_img_on, "a cursor image over the picture");
+    if (!w->gs_shown && w->current >= 0 && w->bufs[w->current].valid &&
+        wl_guest_scanout(w, &w->bufs[w->current]) == 0) {
+        BLK(true, "the guest's format/modifier is not in the compositor's "
+                  "scanout tranche");
+    }
 #undef BLK
     if (!k) {
-        snprintf(b, n, "none on our side (compositor policy)");
+        snprintf(b, n, "none on our side (compositor policy%s)",
+                 w->env_sw_cursor ? "; WLR_NO_HARDWARE_CURSORS is set: a "
+                 "software cursor on the output prevents it" : "");
     }
 }
 
@@ -999,13 +1061,20 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
         uint32_t cp50, cp99, pi50, pi99;
         double pi_mean = 0, pi_sd = 0;
         unsigned i;
-        char gs[96] = "";
+        char gs[200] = "";
 
         if (w->st_gs_n || w->st_gs_drop) {
             snprintf(gs, sizeof(gs), " | gpu-scale %u frames, pass avg %.0fus "
-                     "max %lluus, %u dropped", w->st_gs_n,
+                     "max %lluus, %u dropped | path: %s on %s%s", w->st_gs_n,
                      w->st_gs_n ? (double)w->st_gs_sum / w->st_gs_n : 0.0,
-                     (unsigned long long)w->st_gs_max, w->st_gs_drop);
+                     (unsigned long long)w->st_gs_max, w->st_gs_drop,
+                     w->st_copy ? "GPU copy (the compositor does not take "
+                                  "the guest's format/modifier)"
+                                : "GPU pass (fullscreen scaler)",
+                     w->gs ? nb_gs_node(w->gs) : "?",
+                     w->gt_rb ? ", read back into shared memory" : "");
+        } else if (w->st_commits) {
+            snprintf(gs, sizeof(gs), " | path: direct attach");
         }
 
         for (i = 0; i < w->st_pi_k; i++) {
@@ -1024,21 +1093,24 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
         nb_pct(w->st_pi_s, w->st_pi_k, &pi50, &pi99);
         char lm[96];
 
-        char blk[200] = "";
+        char blk[320] = "";
+        char path[320];
 
         /* Only when something was composited: a direct-scanout second
          * has nothing to explain. */
         if (w->st_presented > w->st_zc) {
-            char why[180];
+            char why[300];
 
             wl_scanout_blockers(w, why, sizeof(why));
             snprintf(blk, sizeof(blk), " | composited, blockers: %s", why);
         }
+        snprintf(path, sizeof(path), " | path: %s [%s: %s]", wl_so_shape(w),
+                 nb_so_phase_name(w->so.phase), w->so.why);
         nb_log("stats: commit %.1f fps, presented %.1f fps (%u direct scanout, "
                "%.0f%%), superseded %u | recv->commit avg %.0fus max %.0fus |%s "
                "commit->present avg %.0fus p50 %uus p99 %uus max %.0fus |%s "
                "| present interval avg %.0fus sd %.0fus p50 %uus p99 %uus "
-               "| %s, held %u, cursor nudges %u%s%s",
+               "| %s, held %u, cursor nudges %u%s%s%s",
                w->st_commits / secs, w->st_presented / secs, w->st_zc,
                w->st_presented ? 100.0 * w->st_zc / w->st_presented : 0.0,
                w->st_discarded,
@@ -1048,12 +1120,13 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
                cp50, cp99, (double)w->st_cp_max / 1e3, sp,
                pi_mean, pi_sd, pi50, pi99,
                wl_mode_name(w, lm, sizeof(lm)), w->st_held,
-               w->st_nudges, gs, blk);
+               w->st_nudges, gs, path, blk);
     }
     w->st_held = 0;
     w->st_nudges = 0;
     w->st_gs_sum = w->st_gs_max = 0;
     w->st_gs_n = w->st_gs_drop = 0;
+    w->st_copy = 0;
     w->st_cp_k = w->st_pi_k = 0;
     w->st_t0 = now;
     w->st_commits = w->st_presented = w->st_discarded = w->st_zc = 0;
@@ -1193,6 +1266,63 @@ static bool wl_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
                nb_formats_has(&w->formats, fourcc, NB_DRM_FORMAT_MOD_INVALID);
     }
     return nb_formats_has(&w->formats, fourcc, mod);
+}
+
+/*
+ * ops->copy_ok: can the GPU pass show this pair although the compositor does
+ * not take it?  The scaler is opened on the first question (it dlopen()s
+ * EGL/GBM), on --render-node or the first render node that imports the pair;
+ * the verdict is cached per pair.
+ */
+static bool wl_copy_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
+{
+    struct nb_wl *w = s->priv;
+    char why[200] = "";
+    bool ok;
+
+    if (!nb_copy_allowed((nb_tier == NB_TIER_AUTO || nb_tier == NB_TIER_NATIVE)
+                             && !nb_linear_only,
+                         w->gs_mode != NB_GS_OFF, w->gs_dead,
+                         w->viewport != NULL, w->dmabuf != NULL)) {
+        return false;
+    }
+    for (unsigned i = 0; i < w->copy_n; i++) {
+        if (w->copy_v[i].fourcc == fourcc && w->copy_v[i].mod == mod) {
+            return w->copy_v[i].ok;
+        }
+    }
+    if (!w->gs) {
+        const char *node = w->cfg ? w->cfg->render_node : NULL;
+
+        w->gs = nb_gs_open(node, 0, fourcc, mod, why, sizeof(why));
+        if (!w->gs && node) {
+            /* The chosen GPU cannot import this layout: any GPU that can,
+             * rather than a black window. */
+            nb_err("viewer GPU: %s (--gpu / viewer.gpu); trying the others",
+                   why);
+            w->gs = nb_gs_open(NULL, 0, fourcc, mod, why, sizeof(why));
+        }
+        if (w->gs) {
+            nb_log("gpu-scale: ready on %s, GPU context priority %s "
+                   "requested, %s granted (CONDUIT_VIEWER_GPU_PRIORITY)",
+                   nb_gs_node(w->gs),
+                   nb_gs_prio_name(nb_gs_prio_requested(w->gs)),
+                   nb_gs_prio_name(nb_gs_prio_granted(w->gs)));
+        }
+    }
+    ok = w->gs && nb_gs_can_import(w->gs, fourcc, mod);
+    nb_log("GPU copy: %.4s modifier 0x%016llx %s", (const char *)&fourcc,
+           (unsigned long long)mod,
+           ok ? "is not taken by the compositor; the viewer's GPU pass "
+                "copies these frames into a buffer it does take"
+              : why[0] ? why : "cannot be imported by the viewer's GPU either");
+    if (w->copy_n < NB_COPY_CACHE) {
+        w->copy_v[w->copy_n].fourcc = fourcc;
+        w->copy_v[w->copy_n].mod = mod;
+        w->copy_v[w->copy_n].ok = ok;
+        w->copy_n++;
+    }
+    return ok;
 }
 
 /* ── ops: attach / commit ────────────────────────────────────────────────── */
@@ -1406,6 +1536,51 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
         wl_buffer_add_listener(sb, &buf_listener, &w->bufs[victim]);
         w->pending = victim;
         return 0;
+    }
+
+    /*
+     * DIRECT OR COPY (nb_blit.h).  A pair the compositor does not advertise,
+     * or advertised and then refused on import, is shown through the GPU
+     * pass when the viewer's GPU imports it: no wl_buffer is made of it.
+     */
+    {
+        bool adv = wl_format_ok(s, d->fourcc, d->modifier);
+        int ps0 = adv ? wl_pair_slot(w, d->fourcc, d->modifier, false) : -1;
+        int proven = ps0 >= 0 ? w->proven[ps0].state : 0;
+        enum nb_att how = nb_att_decide(adv, proven, false);
+
+        if (how != NB_ATT_DIRECT) {
+            how = nb_att_decide(adv, proven,
+                                wl_copy_ok(s, d->fourcc, d->modifier));
+        }
+        if (how == NB_ATT_REJECT) {
+            return -EINVAL;
+        }
+        if (how == NB_ATT_COPY) {
+            int fd2 = fcntl(d->fd, F_DUPFD_CLOEXEC, 3);
+
+            if (fd2 < 0) {
+                return -errno;
+            }
+            if (!w->copy_told) {
+                w->copy_told = true;
+                nb_log("picture: %.4s modifier 0x%016llx frames are copied by "
+                       "the GPU pass (the compositor %s this layout), in "
+                       "every window mode", (const char *)&d->fourcc,
+                       (unsigned long long)d->modifier,
+                       adv ? "refused" : "does not advertise");
+            }
+            wl_buf_evict(w, victim);
+            w->bufs[victim] = (struct nb_wl_buf){
+                .valid = true, .id = d->id, .buf = NULL, .copy = true,
+                .w = d->width, .h = d->height, .stride = d->stride,
+                .offset = d->offset, .fourcc = d->fourcc,
+                .modifier = d->modifier, .used = w->tick, .owner = w,
+                .seq = d->seq, .recv_ns = d->recv_ns, .fd = fd2,
+            };
+            w->pending = victim;
+            return 0;
+        }
     }
 
     /*
@@ -1736,9 +1911,16 @@ static void gt_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
         return;
     }
     t->failed = true;
-    nb_err("gpu-scale: the compositor refused the scaler's buffer; the "
-           "compositor scales the picture instead");
-    if (t->owner) {
+    if (t->owner && !t->owner->gt_want_rb) {
+        /* Not the end: the same pass, read back into shared memory, which
+         * every compositor takes. */
+        nb_err("gpu-scale: the compositor refused the scaler's dma-buf; "
+               "reading the pass back into shared memory instead");
+        t->owner->gt_want_rb = true;
+        t->owner->gt_w = 0;     /* reallocate at the next frame */
+    } else if (t->owner) {
+        nb_err("gpu-scale: the compositor refused the scaler's buffer; the "
+               "compositor scales the picture instead");
         t->owner->gs_dead = true;
     }
 }
@@ -1755,7 +1937,60 @@ static void gt_drop(struct nb_wl *w)
         }
         w->gt[i] = (struct nb_wl_gt){ .owner = w, .gen = w->gt[i].gen + 1 };
     }
+    if (w->gt_shm) {
+        munmap(w->gt_shm, w->gt_shm_sz);
+        w->gt_shm = NULL;
+        w->gt_shm_sz = 0;
+    }
+    w->gt_rb = false;
     w->gt_w = w->gt_h = 0;
+}
+
+/* Read-back targets: NB_GS_TARGETS XRGB8888 wl_shm buffers in one memfd. */
+static bool gt_shm_make(struct nb_wl *w, int pw, int ph)
+{
+    size_t one = (size_t)pw * (size_t)ph * 4u;
+    size_t sz = one * NB_GS_TARGETS;
+    struct wl_shm_pool *pool;
+    int fd;
+
+    if (!w->shm) {
+        return false;
+    }
+    fd = memfd_create("conduit-viewer-copy", MFD_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    if (ftruncate(fd, (off_t)sz) < 0) {
+        close(fd);
+        return false;
+    }
+    w->gt_shm = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (w->gt_shm == MAP_FAILED) {
+        w->gt_shm = NULL;
+        close(fd);
+        return false;
+    }
+    w->gt_shm_sz = sz;
+    pool = wl_shm_create_pool(w->shm, fd, (int32_t)sz);
+    close(fd);
+    if (!pool) {
+        return false;
+    }
+    for (int i = 0; i < NB_GS_TARGETS; i++) {
+        w->gt[i].buf = wl_shm_pool_create_buffer(pool, (int32_t)(one * i),
+                                                 pw, ph, pw * 4,
+                                                 WL_SHM_FORMAT_XRGB8888);
+        if (!w->gt[i].buf) {
+            wl_shm_pool_destroy(pool);
+            return false;
+        }
+        wl_buffer_add_listener(w->gt[i].buf, &gt_listener, &w->gt[i]);
+        w->gt[i].ready = true;
+    }
+    wl_shm_pool_destroy(pool);
+    w->gt_rb = true;
+    return true;
 }
 
 static void wl_gs_close(struct nb_wl *w)
@@ -1783,26 +2018,113 @@ static void wl_gs_disable(struct nb_wl *w, const char *why)
 }
 
 /*
- * Whether this frame goes through the scaler: fullscreen, presented
- * immediately, a dma-buf, and a picture the compositor would otherwise have
- * to scale, crop or letterbox (anything but buffer == window pixels).
+ * Whether the scaler COULD take this frame: fullscreen, a dma-buf, a viewport
+ * to undo, and a scaler that has not failed.  Whether it does is
+ * wl_so_decide()'s call (nb_scanout.h).
  */
-static bool wl_gs_wanted(const struct nb_wl *w, int slot, int pw, int ph)
+static bool wl_gs_eligible(const struct nb_wl *w, int slot, const char **why)
+{
+    const struct nb_wl_buf *sl = slot >= 0 && slot < NB_MAX_BUFS
+                                     ? &w->bufs[slot] : NULL;
+
+    *why = NULL;
+    if (w->gs_mode == NB_GS_OFF) {
+        *why = "--gpu-scale=off";
+    } else if (w->gs_dead) {
+        *why = "the GPU pass failed earlier this session";
+    } else if (!w->viewport) {
+        *why = "no wp_viewporter";
+    } else if (!sl || !sl->valid || sl->fd < 0) {
+        *why = "not a dma-buf frame";
+    }
+    return *why == NULL && w->fullscreen;
+}
+
+/* The picture is the buffer, 1:1, covering the whole window. */
+static bool wl_pic_exact(const struct nb_wl *w, int slot, int pw, int ph)
 {
     const struct nb_wl_buf *sl;
 
-    if (w->gs_mode == NB_GS_OFF || w->gs_dead || !w->fullscreen ||
-        !(wl_async_wanted(w) || wl_latch_on(w)) || !w->viewport || slot < 0 ||
-        slot >= NB_MAX_BUFS) {
+    if (slot < 0 || slot >= NB_MAX_BUFS || !w->bufs[slot].valid) {
         return false;
     }
     sl = &w->bufs[slot];
-    if (!sl->valid || sl->fd < 0) {
-        return false;
+    return (int)sl->w == pw && (int)sl->h == ph && !w->place.cropped &&
+           w->place.vis.x == 0 && w->place.vis.y == 0 &&
+           w->place.vis.w == w->win_w && w->place.vis.h == w->win_h;
+}
+
+/* Feedback verdict on a guest buffer: 1 scanout-capable, 0 not, -1 unknown. */
+static int wl_guest_scanout(const struct nb_wl *w, const struct nb_wl_buf *sl)
+{
+    return nb_so_guest_scanout(&w->fb_scan, w->fb_has_scan, sl->fourcc,
+                               nb_fourcc_opaque_twin(sl->fourcc),
+                               sl->modifier);
+}
+
+static const char *wl_so_shape(const struct nb_wl *w)
+{
+    if (w->gs_shown) {
+        return "GPU pass into an output-size buffer";
     }
-    return !((int)sl->w == pw && (int)sl->h == ph && !w->place.cropped &&
-             w->place.vis.x == 0 && w->place.vis.y == 0 &&
-             w->place.vis.w == w->win_w && w->place.vis.h == w->win_h);
+    if (w->in_sub) {
+        return "zero-copy, letterboxed on a subsurface";
+    }
+    if (w->current >= 0 && w->bufs[w->current].valid &&
+        (int)w->bufs[w->current].w == w->tgt_ow &&
+        (int)w->bufs[w->current].h == w->tgt_oh && !w->place.cropped) {
+        return "zero-copy 1:1";
+    }
+    return "zero-copy, scaled by a viewport";
+}
+
+/*
+ * THE FULLSCREEN PATH DECISION, every frame and every relayout: the inputs
+ * go to nb_so_decide(), which applies the fixed rules and otherwise measures
+ * the zero-copy path against the GPU pass (nb_scanout.h).  The layout key
+ * restarts the measurement when anything that shapes the picture changes.
+ */
+static enum nb_so_path wl_so_decide(struct nb_wl *w, int slot, int pw, int ph)
+{
+    const struct nb_wl_buf *sl = slot >= 0 && slot < NB_MAX_BUFS &&
+                                 w->bufs[slot].valid ? &w->bufs[slot] : NULL;
+    struct nb_so_in in = {0};
+    uint64_t key = 0;
+    enum nb_so_path p;
+
+    in.fullscreen = w->fullscreen;
+    in.gs_ok = wl_gs_eligible(w, slot, &in.gs_off);
+    in.gs_forced = w->gs_mode == NB_GS_ON;
+    in.tear_or_latch = wl_async_wanted(w) || wl_latch_on(w);
+    in.exact = wl_pic_exact(w, slot, pw, ph);
+    in.nearest_scaled = !in.exact &&
+                        w->vst.cur.filter == NB_FILTER_NEAREST;
+    in.can_measure = w->presentation && w->pres_clock != UINT32_MAX;
+    in.guest_scanout = sl ? wl_guest_scanout(w, sl) : -1;
+
+    key = nb_so_mix(key, (uint64_t)w->fullscreen | (uint64_t)wl_async_wanted(w) << 1 |
+                         (uint64_t)wl_latch_on(w) << 2 |
+                         (uint64_t)w->place.cropped << 3 |
+                         (uint64_t)(w->vst.cur.filter & 0xff) << 8 |
+                         (uint64_t)(in.guest_scanout + 1) << 16 |
+                         (uint64_t)(w->gs_mode & 0xff) << 24);
+    key = nb_so_mix(key, (uint64_t)(uint32_t)pw << 32 | (uint32_t)ph);
+    key = nb_so_mix(key, (uint64_t)(uint32_t)w->place.vis.x << 32 |
+                         (uint32_t)w->place.vis.y);
+    key = nb_so_mix(key, (uint64_t)(uint32_t)w->place.vis.w << 32 |
+                         (uint32_t)w->place.vis.h);
+    if (sl) {
+        key = nb_so_mix(key, (uint64_t)sl->w << 32 | sl->h);
+        key = nb_so_mix(key, (uint64_t)sl->fourcc);
+        key = nb_so_mix(key, sl->modifier);
+    }
+    p = nb_so_decide(&w->so, &in, key, nb_mono_ns());
+    if (nb_so_take_change(&w->so)) {
+        nb_log("scanout path: %s [%s] - %s",
+               p == NB_SO_GPU ? "GPU pass" : "zero-copy",
+               nb_so_phase_name(w->so.phase), w->so.why);
+    }
+    return p;
 }
 
 /* Make sure the scaler and its targets exist at pw x ph.  false: not now
@@ -1825,15 +2147,45 @@ static bool wl_gs_ready(struct nb_wl *w, const struct nb_wl_buf *sl, int pw,
                nb_gs_prio_name(nb_gs_prio_requested(w->gs)),
                nb_gs_prio_name(nb_gs_prio_granted(w->gs)));
     }
-    if (w->gt_w != (uint32_t)pw || w->gt_h != (uint32_t)ph) {
+    if (w->gt_w != (uint32_t)pw || w->gt_h != (uint32_t)ph ||
+        w->gt_fb_gen != w->fb_gen) {
+        uint64_t sm[32];
+        unsigned ns = w->fb_has_scan
+                          ? nb_so_fmts_mods(&w->fb_scan, NB_FOURCC_XR24_LOCAL,
+                                            sm, 32)
+                          : 0;
         int k;
 
         gt_drop(w);
-        k = nb_gs_targets(w->gs, (uint32_t)pw, (uint32_t)ph, gs_fmt_ok, w, tg,
-                          why, sizeof(why));
+        w->gt_fb_gen = w->fb_gen;
+        k = w->gt_want_rb ? 0
+                          : nb_gs_targets(w->gs, (uint32_t)pw, (uint32_t)ph,
+                                          gs_fmt_ok, w, sm, ns, tg, why,
+                                          sizeof(why));
         if (k != NB_GS_TARGETS) {
-            wl_gs_disable(w, why[0] ? why : "no output buffers");
-            return false;
+            /*
+             * No dma-buf layout this GPU renders to that the compositor
+             * takes (an NVIDIA GPU and a compositor on another GPU): the
+             * pass into plain renderbuffers, read back into wl_shm.
+             */
+            char why2[200] = "";
+
+            if (nb_gs_targets_readback(w->gs, (uint32_t)pw, (uint32_t)ph,
+                                       why2, sizeof(why2)) != NB_GS_TARGETS ||
+                !gt_shm_make(w, pw, ph)) {
+                gt_drop(w);
+                wl_gs_disable(w, why2[0] ? why2 : why[0] ? why
+                                                         : "no output buffers");
+                return false;
+            }
+            w->gt_w = (uint32_t)pw;
+            w->gt_h = (uint32_t)ph;
+            nb_log("gpu-scale: %dx%d read-back targets in shared memory on %s "
+                   "(%s): one copy through memory per frame", pw, ph,
+                   nb_gs_node(w->gs),
+                   w->gt_want_rb ? "the compositor refused the dma-buf ones"
+                                 : why[0] ? why : "no dma-buf target");
+            return true;
         }
         for (int i = 0; i < NB_GS_TARGETS; i++) {
             struct zwp_linux_buffer_params_v1 *pp =
@@ -1862,10 +2214,14 @@ static bool wl_gs_ready(struct nb_wl *w, const struct nb_wl_buf *sl, int pw,
         }
         w->gt_w = (uint32_t)pw;
         w->gt_h = (uint32_t)ph;
-        nb_log("gpu-scale: %dx%d %.4s modifier 0x%016llx output buffers "
-               "(the compositor answers before the first is used)", pw, ph,
+        nb_log("gpu-scale: %dx%d %.4s modifier 0x%016llx output buffers, "
+               "%s (the compositor answers before the first is used)", pw, ph,
                (const char *)&tg[0].fourcc,
-               (unsigned long long)tg[0].modifier);
+               (unsigned long long)tg[0].modifier,
+               !w->fb_has_scan ? "no scanout tranche to check against"
+               : nb_so_fmts_has(&w->fb_scan, tg[0].fourcc, tg[0].modifier)
+                   ? "in the compositor's scanout tranche"
+                   : "NOT in the compositor's scanout tranche");
         wl_display_flush(w->dpy);
         return false;
     }
@@ -1921,8 +2277,21 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
                                          : "the GPU pass failed");
         return -1;
     }
+    if (w->gt_rb && w->gt_shm) {
+        uint64_t r0 = nb_mono_ns();
+
+        if (nb_gs_readback(w->gs, t, (char *)w->gt_shm +
+                           (size_t)t * (w->gt_shm_sz / NB_GS_TARGETS)) < 0) {
+            wl_gs_disable(w, "the read-back failed");
+            return -1;
+        }
+        gpu_us += (unsigned)((nb_mono_ns() - r0) / 1000u);  /* in the cost */
+    }
     w->st_gs_sum += gpu_us;
     w->st_gs_n++;
+    if (sl->copy) {
+        w->st_copy++;
+    }
     if (gpu_us > w->st_gs_max) {
         w->st_gs_max = gpu_us;
     }
@@ -1951,16 +2320,19 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
         w->gs_shown = true;
         w->frame_inflight = false;
         nb_log("picture: GPU-scaled into a %dx%d buffer on the main surface "
-               "(guest %ux%u -> %dx%d at %d,%d%s): fullscreen + immediate, "
-               "so the compositor can tear / scan it out", pw, ph, sl->w,
+               "(guest %ux%u -> %dx%d at %d,%d%s): %s", pw, ph, sl->w,
                sl->h, d.dw, d.dh, d.dx, d.dy,
-               d.nearest ? ", sharp" : "");
+               d.nearest ? ", sharp" : "",
+               sl->copy ? "a copy, because the compositor does not take the "
+                          "guest's format/modifier"
+                        : w->so.why);
     }
     return 1;
 }
 
 static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
                                             struct wl_buffer *buf,
+                                            bool new_frame,
                                             int *out_w, int *out_h)
 {
     /*
@@ -2003,14 +2375,24 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
      */
     bool left_gs = false;
     {
-        int slot = buf ? w->pending : w->current;
+        int slot = new_frame ? w->pending : w->current;
         unsigned s120 = w->viewporter && w->scale_120 ? w->scale_120 : 120;
         int pw = (int)(((long)w->win_w * s120 + 60) / 120);
         int ph = (int)(((long)w->win_h * s120 + 60) / 120);
 
+        const char *gs_off;
+        bool eligible = wl_gs_eligible(w, slot, &gs_off);
+        enum nb_so_path path = wl_so_decide(w, slot, pw, ph);
+
+        /* A copy-only frame (nb_blit.h) always goes through the pass, in
+         * every window mode; any other only when the decision says so. */
+        bool copy_only = slot >= 0 && slot < NB_MAX_BUFS &&
+                         w->bufs[slot].valid && w->bufs[slot].copy;
+        bool usable = w->gs_mode != NB_GS_OFF && !w->gs_dead && w->viewport;
+
         w->gs_frame = false;
         w->gs_dropped = false;
-        if (wl_gs_wanted(w, slot, pw, ph)) {
+        if ((copy_only && usable) || (eligible && path == NB_SO_GPU)) {
             int r = wl_gs_present(w, slot, pw, ph);
 
             if (r >= 0) {
@@ -2027,9 +2409,7 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
             left_gs = true;
             w->tgt_ow = w->tgt_oh = 0;
             w->main_vw = w->main_vh = 0;
-            nb_log("picture: the compositor scales it again (%s)",
-                   !w->fullscreen ? "windowed" :
-                   !w->tearing_async ? "vsync" : "1:1 or scaler off");
+            nb_log("picture: zero-copy again (%s)", w->so.why);
         }
     }
 
@@ -2167,7 +2547,8 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     if (w->probe_bad_pending) {
         w->probe_bad_pending = false;
         nb_sink_format_verdict(sink, w->probe_bad_fourcc, w->probe_bad_mod,
-                               false);
+                               wl_copy_ok(s, w->probe_bad_fourcc,
+                                          w->probe_bad_mod));
     }
 
     if (w->pending < 0) {
@@ -2245,11 +2626,18 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
     w->buf_w = (int)sl->w;
     w->buf_h = (int)sl->h;
-    /* A new guest mode: its per-mode rule (if any) is applied from the UI
-     * tick; the menu marks the new current mode. */
-    if (sl->w != nb_guest_w || sl->h != nb_guest_h) {
-        if (nb_guest_mode_changed(&w->vst, sl->w, sl->h, w->rule_note,
-                                  sizeof(w->rule_note)) & NB_VIEW_CH_LAYOUT) {
+    /*
+     * A NEW GUEST MODE: its per-mode rule (nb_vstore_guest_mode) goes into
+     * the layout here, before wl_viewport_apply() places this frame, so the
+     * mode's first frame is already shown with it.  The notice and the menu
+     * follow from the UI tick.
+     */
+    bool new_mode = sl->w != nb_guest_w || sl->h != nb_guest_h;
+
+    if (new_mode) {
+        if ((nb_guest_mode_changed(&w->vst, sl->w, sl->h, w->rule_note,
+                                   sizeof(w->rule_note)) & NB_VIEW_CH_LAYOUT) ||
+            w->rule_note[0]) {
             w->rule_due = true;
         }
         w->modes_dirty = true;
@@ -2278,9 +2666,23 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
          * Whether the guest is asked to re-mode is wl_mode_hint()'s business
          * (fullscreen: the output's mode); this is what is shown meanwhile.
          */
-        target = wl_viewport_apply(w, (int)sl->w, (int)sl->h, sl->buf,
+        target = wl_viewport_apply(w, (int)sl->w, (int)sl->h, sl->buf, true,
                                    &new_w, &new_h);
-        if (w->gs_dropped) {
+        if (new_mode) {
+            char sum[64];
+
+            /* What the mode's FIRST frame was placed with (the rule, if
+             * any, is already in force): checkable from the log. */
+            nb_view_summary(&w->vst.cur, sum, sizeof(sum));
+            nb_log("guest mode %ux%u: first frame %dx%d at %d,%d in %dx%d "
+                   "(%s)%s%s", sl->w, sl->h, w->place.vis.w, w->place.vis.h,
+                   w->place.vis.x, w->place.vis.y, w->win_w, w->win_h, sum,
+                   w->rule_note[0] ? " - " : "", w->rule_note);
+        }
+        /* A copy-only frame the GPU pass did not draw (no free output
+         * buffer yet, or the pass just failed) has nothing else to show:
+         * skipped like a dropped scaled frame, never attached. */
+        if (w->gs_dropped || (sl->copy && !w->gs_frame)) {
             /* Every scaler buffer is still on screen or queued: skip this
              * frame (the next one replaces it) and give it back now. */
             if (w->sink && !wl_hold_release(s, sl->id, sl->seq)) {
@@ -2322,6 +2724,8 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
             pc->seq = sl->seq;
             pc->start_ns = fl ? fl : sl->recv_ns;
             pc->recv_ns = sl->recv_ns;
+            pc->so_gen = w->so.gen;
+            pc->so_path = w->gs_frame ? NB_SO_GPU : NB_SO_ZC;
             wp_presentation_feedback_add_listener(fb, &nb_pres_listener, pc);
             w->pc_last = pc;    /* commit_ns filled in right after commit */
         } else {
@@ -4732,6 +5136,143 @@ static const struct wl_seat_listener seat_listener = {
     .capabilities = seat_caps, .name = seat_name,
 };
 
+/* ── zwp_linux_dmabuf_feedback_v1: the main surface's scanout tranche ───── */
+/*
+ * Only the SCANOUT-flagged tranches are kept: they are the compositor saying
+ * "a buffer in one of these layouts could go on a plane as it is".  A
+ * compositor that never names one (it does not hint planes) leaves the
+ * question open, which nb_so_guest_scanout() reports as unknown rather than
+ * no.  Each batch ends with `done` and replaces the previous one.
+ */
+static void fb_table(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                     int32_t fd, uint32_t size)
+{
+    struct nb_wl *w = d;
+    void *m;
+
+    (void)f;
+    if (w->fb_tab) {
+        munmap(w->fb_tab, w->fb_tab_sz);
+        w->fb_tab = NULL;
+        w->fb_tab_sz = 0;
+    }
+    m = size ? mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    close(fd);
+    if (m != MAP_FAILED) {
+        w->fb_tab = m;
+        w->fb_tab_sz = size;
+    }
+}
+static void fb_main_device(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                           struct wl_array *dev)
+{ (void)d; (void)f; (void)dev; }
+static void fb_tr_device(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                         struct wl_array *dev)
+{ (void)d; (void)f; (void)dev; }
+static void fb_tr_formats(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                          struct wl_array *idx)
+{
+    struct nb_wl *w = d;
+    const uint16_t *i;
+    /* The table: 16 bytes per entry, u32 format, u32 padding, u64 modifier. */
+    const uint8_t *tab = w->fb_tab;
+    size_t n = w->fb_tab_sz / 16;
+
+    (void)f;
+    if (!tab) {
+        return;
+    }
+    wl_array_for_each(i, idx) {
+        uint32_t fourcc;
+        uint64_t mod;
+
+        if (*i >= n) {
+            continue;
+        }
+        memcpy(&fourcc, tab + (size_t)*i * 16, 4);
+        memcpy(&mod, tab + (size_t)*i * 16 + 8, 8);
+        /* Only formats a guest frame can have (the rest cannot matter). */
+        if (nb_fourcc_bpp(fourcc)) {
+            nb_so_fmts_add(&w->fb_tr_fmts, fourcc, mod);
+        }
+    }
+}
+static void fb_tr_flags(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                        uint32_t flags)
+{
+    struct nb_wl *w = d;
+
+    (void)f;
+    w->fb_tr_flags = flags;
+}
+static void fb_tr_done(void *d, struct zwp_linux_dmabuf_feedback_v1 *f)
+{
+    struct nb_wl *w = d;
+
+    (void)f;
+    w->fb_pend_tr++;
+    if (w->fb_tr_flags & ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT) {
+        w->fb_pend_has = true;
+        for (unsigned k = 0; k < w->fb_tr_fmts.n; k++) {
+            nb_so_fmts_add(&w->fb_pend_scan, w->fb_tr_fmts.e[k].fourcc,
+                           w->fb_tr_fmts.e[k].mod);
+        }
+    }
+    memset(&w->fb_tr_fmts, 0, sizeof(w->fb_tr_fmts));
+    w->fb_tr_flags = 0;
+}
+static void fb_done(void *d, struct zwp_linux_dmabuf_feedback_v1 *f)
+{
+    struct nb_wl *w = d;
+    bool changed = !w->fb_got || w->fb_has_scan != w->fb_pend_has ||
+                   w->fb_scan.n != w->fb_pend_scan.n ||
+                   memcmp(w->fb_scan.e, w->fb_pend_scan.e,
+                          w->fb_scan.n * sizeof(w->fb_scan.e[0]));
+
+    (void)f;
+    w->fb_got = true;
+    w->fb_has_scan = w->fb_pend_has;
+    w->fb_scan = w->fb_pend_scan;
+    w->fb_tr = w->fb_pend_tr;
+    memset(&w->fb_pend_scan, 0, sizeof(w->fb_pend_scan));
+    w->fb_pend_has = false;
+    w->fb_pend_tr = 0;
+    if (changed) {
+        uint64_t m[4];
+
+        w->fb_gen++;
+        unsigned k = nb_so_fmts_mods(&w->fb_scan, NB_FOURCC_XR24_LOCAL, m, 4);
+
+        if (!w->fb_has_scan) {
+            nb_log("dma-buf feedback: %u tranche%s, none flagged scanout (the "
+                   "compositor gives no plane hint for this surface now)",
+                   w->fb_tr, w->fb_tr == 1 ? "" : "s");
+        } else {
+            char ms[96] = "";
+            size_t o = 0;
+
+            for (unsigned j = 0; j < k && o < sizeof(ms); j++) {
+                o += (size_t)snprintf(ms + o, sizeof(ms) - o, "%s0x%llx",
+                                      j ? ", " : "", (unsigned long long)m[j]);
+            }
+            nb_log("dma-buf feedback: scanout tranche, %u pair%s%s; XR24 "
+                   "modifiers it takes: %s", w->fb_scan.n,
+                   w->fb_scan.n == 1 ? "" : "s",
+                   w->fb_scan.overflowed ? " (truncated)" : "",
+                   k ? ms : "none");
+        }
+    }
+}
+static const struct zwp_linux_dmabuf_feedback_v1_listener dfb_listener = {
+    .done = fb_done,
+    .format_table = fb_table,
+    .main_device = fb_main_device,
+    .tranche_done = fb_tr_done,
+    .tranche_target_device = fb_tr_device,
+    .tranche_formats = fb_tr_formats,
+    .tranche_flags = fb_tr_flags,
+};
+
 /* ── zwp_linux_dmabuf_v1: the advertised format set ──────────────────────── */
 
 static void dmabuf_format(void *d, struct zwp_linux_dmabuf_v1 *z, uint32_t fmt)
@@ -4989,7 +5530,7 @@ static void top_apply(struct nb_wl *w)
     if (w->viewport && w->current >= 0) {
         int dw, dh;
         struct wl_surface *pic = wl_viewport_apply(w, w->buf_w, w->buf_h,
-                                                   NULL, &dw, &dh);
+                                                   NULL, false, &dw, &dh);
 
         wl_surface_damage_buffer(pic, 0, 0,
                                  w->gs_frame ? INT32_MAX : w->buf_w,
@@ -5414,6 +5955,34 @@ static void pres_presented(void *d, struct wp_presentation_feedback *f,
         nb_sink_presented(w->sink, pc->seq, flags, tp);
     }
 
+    /*
+     * The fullscreen path measurement (nb_scanout.h): receive -> on screen,
+     * the GPU pass included when it ran.  A compositor on another clock
+     * (weston: CLOCK_MONOTONIC_RAW) is brought onto ours by reading both
+     * clocks now; the two calls are a microsecond apart.
+     */
+    if (w->pres_clock != UINT32_MAX && pc->recv_ns) {
+        uint64_t t = ((((uint64_t)tv_sec_hi << 32) | tv_sec_lo) *
+                      1000000000ull) + tv_nsec;
+
+        if (w->pres_clock != CLOCK_MONOTONIC) {
+            struct timespec a;
+
+            if (clock_gettime((clockid_t)w->pres_clock, &a) == 0) {
+                uint64_t pn = (uint64_t)a.tv_sec * 1000000000ull +
+                              (uint64_t)a.tv_nsec;
+
+                t = t + nb_mono_ns() - pn;
+            } else {
+                t = 0;
+            }
+        }
+        if (t >= pc->recv_ns) {
+            nb_so_presented(&w->so, pc->so_gen, (enum nb_so_path)pc->so_path,
+                            zc != 0, t - pc->recv_ns);
+        }
+    }
+
     /* virtio-nvgpu --stats: commit -> presented, and sender -> presented. */
     w->st_presented++;
     w->st_zc += (unsigned)zc;
@@ -5610,6 +6179,12 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
         w->dmabuf = wl_registry_bind(r, name, &zwp_linux_dmabuf_v1_interface,
                                      w->dmabuf_ver);
         zwp_linux_dmabuf_v1_add_listener(w->dmabuf, &dmabuf_listener, w);
+        /* And a version 4 binding of the same global for the surface's
+         * dma-buf feedback (scanout tranches); see dmabuf4. */
+        if (ver >= 4) {
+            w->dmabuf4 = wl_registry_bind(r, name,
+                                          &zwp_linux_dmabuf_v1_interface, 4);
+        }
     } else if (!strcmp(iface,
                zwp_keyboard_shortcuts_inhibit_manager_v1_interface.name)) {
         w->inhibit_mgr =
@@ -5938,6 +6513,18 @@ static void ov_paint_commit(struct nb_wl *w)
     in.guest_resize = w->resize_mode == NB_RESIZE_GUEST;
     in.flip_known = nb_sink_seq_usec(w->sink);
     in.host_cursor = w->gc_on && !w->grabbed;
+    {
+        static char gpu[40];
+        const char *n = w->gs ? strrchr(nb_gs_node(w->gs), '/') : NULL;
+        bool copy = w->current >= 0 && w->bufs[w->current].copy;
+
+        in.path = copy ? "GPU COPY" : w->gs_shown ? "GPU SCALE" : "DIRECT";
+        snprintf(gpu, sizeof(gpu), "%s", n ? n + 1 : "");
+        for (char *p = gpu; *p; p++) {
+            *p = (char)(*p >= 'a' && *p <= 'z' ? *p - 32 : *p);
+        }
+        in.gpu = gpu;
+    }
     cols = (w->ov_w - 8 * w->ov_sc) / w->ov_sc;
     if (cols > sizeof(graph) / sizeof(graph[0])) {
         cols = sizeof(graph) / sizeof(graph[0]);
@@ -6936,7 +7523,7 @@ static void wl_relayout(struct nb_wl *w)
     if (w->viewport && w->current >= 0) {
         int dw, dh;
         struct wl_surface *pic = wl_viewport_apply(w, w->buf_w, w->buf_h,
-                                                   NULL, &dw, &dh);
+                                                   NULL, false, &dw, &dh);
 
         wl_surface_damage_buffer(pic, 0, 0,
                                  w->gs_frame ? INT32_MAX : w->buf_w,
@@ -6994,6 +7581,14 @@ static void wl_menu_set(struct nb_wl *w, bool open)
 
 static void wl_ui_do(struct nb_wl *w, unsigned bits)
 {
+    /*
+     * Remembered for the guest mode in force (nb_vstore_auto_rule), once an
+     * area drag is over (its steps are not each written to the file).
+     */
+    if ((bits & (NB_UI_VIEW | NB_UI_SAVE)) && w->ui.drag < 0 &&
+        nb_vstore_auto_rule(&w->vst)) {
+        bits |= NB_UI_SAVE;
+    }
     if (bits & NB_UI_VIEW) {
         wl_relayout(w);
     }
@@ -7598,6 +8193,18 @@ static void wl_close_session(struct nb_session *s)
         wl_buf_destroy(w, i);
     }
     wl_gs_close(w);
+    if (w->dfb) {
+        zwp_linux_dmabuf_feedback_v1_destroy(w->dfb);
+        w->dfb = NULL;
+    }
+    if (w->fb_tab) {
+        munmap(w->fb_tab, w->fb_tab_sz);
+        w->fb_tab = NULL;
+    }
+    if (w->dmabuf4) {
+        zwp_linux_dmabuf_v1_destroy(w->dmabuf4);
+        w->dmabuf4 = NULL;
+    }
     wl_idle_drop(w);
     tb_drop(w);
     ov_drop_buffers(w);
@@ -7763,6 +8370,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->pending = -1;
     w->current = -1;
     w->last_scanout = -1;
+    nb_so_init(&w->so);
     /* 0 is a valid button index, so "none" has to be spelled -1 explicitly:
      * a calloc'd struct would otherwise open with the close button drawn as
      * hovered AND held. */
@@ -7996,6 +8604,28 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
         nb_log("direct mode ON at startup (--direct-mode=on): overlay hidden");
         nb_run_hook(w->direct_hook, "on");
     }
+    if (w->dmabuf4 && w->surf) {
+        w->dfb = zwp_linux_dmabuf_v1_get_surface_feedback(w->dmabuf4, w->surf);
+        if (w->dfb) {
+            zwp_linux_dmabuf_feedback_v1_add_listener(w->dfb, &dfb_listener, w);
+        }
+    } else {
+        nb_log("dma-buf feedback: not offered (zwp_linux_dmabuf_v1 below "
+               "version 4): no scanout tranche to check the guest's format "
+               "against");
+    }
+    {
+        const char *swc = getenv("WLR_NO_HARDWARE_CURSORS");
+
+        w->env_sw_cursor = swc && *swc && strcmp(swc, "0") != 0;
+        if (w->env_sw_cursor) {
+            nb_log("WLR_NO_HARDWARE_CURSORS=%s is set in this session: a "
+                   "compositor that honours it draws the pointer in software, "
+                   "and a visible software cursor rules out direct scanout.  "
+                   "Over the fullscreen picture the viewer hides the host "
+                   "pointer when the guest draws its own (and under grab)", swc);
+        }
+    }
     if (w->viewporter) {
         w->viewport = wp_viewporter_get_viewport(w->viewporter, w->surf);
         if (w->subcomp) {
@@ -8150,6 +8780,7 @@ static const struct nb_session_ops wl_ops = {
     .set_grab = wl_set_grab,
     .set_fullscreen = wl_set_fullscreen,
     .format_ok = wl_format_ok,
+    .copy_ok = wl_copy_ok,
     .attach = wl_attach,
     .commit = wl_commit,
     .resize = wl_resize,

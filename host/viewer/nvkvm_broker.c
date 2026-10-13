@@ -65,6 +65,7 @@
 #include <sys/vfs.h>
 
 #include "nvkvm_broker.h"
+#include "nb_gpusel.h"
 
 /*
  * The filesystem magic of the anonymous inode every dma-buf lives on.  This is
@@ -1602,30 +1603,51 @@ static void nb_violation(struct nb_sink *s, const char *why)
  * *use_fourcc; false means no description of this buffer is displayable.
  */
 static bool nb_format_resolve(struct nb_session *ss, uint32_t fourcc,
-                              uint64_t modifier, uint32_t *use_fourcc)
+                              uint64_t modifier, uint32_t *use_fourcc,
+                              bool *copy)
 {
-    if (ss->ops->format_ok(ss, fourcc, modifier)) {
-        *use_fourcc = fourcc;
-        return true;
+    if (copy) {
+        *copy = false;
     }
     /*
-     * Try the OPAQUE TWIN of an alpha format.
+     * The OPAQUE TWIN of an alpha format first, the format as asked second.
      *
-     * This is not a relaxation of HARDENING 3: the pair we fall back to must
-     * ITSELF be advertised, so the compositor is still only ever handed
-     * something it said it could import.  What changes is which of two
-     * bit-identical descriptions of the same buffer it gets.
+     * A guest primary's alpha is undefined: a KMS primary plane ignores it,
+     * and a guest driver may leave it at zero (a Windows desktop composed
+     * by DWM does).  Handed over as AR24, a compositor blends with that
+     * alpha and the picture comes out transparent or black; the opaque
+     * region set on the surface is only a hint and does not change the
+     * blend on every compositor.  XR24 is the same bytes with the fourth
+     * channel ignored, so preferring it is correct for any frame and lets
+     * the compositor skip blending altogether.
      *
-     * A guest head flips AR24; the compositor advertises the modifier for XR24
-     * only, because alpha goes through its blend path and block-linear is not
-     * always wired up there.  The bytes are the same either way and a scanout
-     * has no meaningful alpha, so describing it as opaque is both correct and
-     * cheaper for the compositor -- it may skip blending altogether.
+     * This is not a relaxation of HARDENING 3: the pair we use must ITSELF
+     * be advertised, so the compositor is still only ever handed something
+     * it said it could import.  When the twin is not advertised for this
+     * modifier, the format as asked is the fallback (the surface's opaque
+     * region still says it is opaque).  Cursors never come here: they need
+     * their alpha and are checked as the exact pair.
      */
     uint32_t twin = nb_fourcc_opaque_twin(fourcc);
 
     if (twin && ss->ops->format_ok(ss, twin, modifier)) {
         *use_fourcc = twin;
+        return true;
+    }
+    if (ss->ops->format_ok(ss, fourcc, modifier)) {
+        *use_fourcc = fourcc;
+        return true;
+    }
+    /*
+     * Last: THE GPU COPY.  The display takes neither description, but the
+     * backend can draw the frame into a buffer it does take (nb_blit.h).
+     * One GPU pass per frame instead of a black window.
+     */
+    if (ss->ops->copy_ok && ss->ops->copy_ok(ss, fourcc, modifier)) {
+        *use_fourcc = fourcc;
+        if (copy) {
+            *copy = true;
+        }
         return true;
     }
     return false;
@@ -1786,7 +1808,11 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     if (cursor) {
         /* checked above; exact pair checked by the backend */
     } else if (d->is_shm) {
-        if (fourcc != NB_FOURCC_XR24 && fourcc != NB_FOURCC_AR24) {
+        /* Opaque, as for a dma-buf frame: wl_shm always offers XRGB8888,
+         * and a guest primary's alpha is undefined. */
+        if (fourcc == NB_FOURCC_AR24) {
+            fourcc = NB_FOURCC_XR24;
+        } else if (fourcc != NB_FOURCC_XR24) {
             if (nb_reject_log(s)) {
                 nb_err("ATTACH: fourcc %s cannot be presented as shared memory; "
                        "only XR24 and AR24 are mapped to wl_shm formats",
@@ -1794,7 +1820,8 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             }
             return -EINVAL;
         }
-    } else if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc)) {
+    } else if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc,
+                                  NULL)) {
         if (!nb_reject_log(s)) {
             return -EINVAL;
         }
@@ -1821,12 +1848,12 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
 
         if (!told) {
             told = true;
-            nb_log("ATTACH: %s modifier 0x%016llx is not advertised, but its "
-                   "opaque twin %s is — presenting as %s (same bytes; a "
-                   "scanout has no alpha).  Logged once.",
+            nb_log("ATTACH: %s modifier 0x%016llx presented as its opaque "
+                   "twin %s (same bytes; a guest primary's alpha is "
+                   "undefined).  Logged once.",
                    nb_fourcc_name(c->fourcc, fcc),
                    (unsigned long long)c->modifier,
-                   nb_fourcc_name(fourcc, fcc2), nb_fourcc_name(fourcc, fcc2));
+                   nb_fourcc_name(fourcc, fcc2));
         }
     }
     bpp = nb_fourcc_bpp(fourcc);
@@ -2045,7 +2072,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
          * ordinary command layout, which has one.
          */
         uint32_t use = 0;
-        bool ok;
+        bool ok, copy = false;
 
         if (c->reserved1 != 0) {
             if (fd >= 0) {
@@ -2057,7 +2084,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         if (fd >= 0) {
             close(fd);          /* a query carries no buffer; drop any fd */
         }
-        ok = nb_format_resolve(ss, c->fourcc, c->modifier, &use);
+        ok = nb_format_resolve(ss, c->fourcc, c->modifier, &use, &copy);
         /* Asked once per mode change by an honest client -- and once per
          * command by a hostile one, so it shares the reject budget. */
         if (nb_reject_log(s)) {
@@ -2067,7 +2094,9 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                    (unsigned long long)c->modifier,
                    nb_modifier_vendor(c->modifier),
                    ok ? "YES" : "NO",
-                   (ok && use != c->fourcc) ? " (as its opaque twin)" : "");
+                   (ok && use != c->fourcc) ? " (as its opaque twin)"
+                   : copy ? " (by a GPU copy: the display does not take "
+                            "this layout)" : "");
         }
         nb_emit(s, NVKVM_BROKER_EV_FORMAT, ok ? 1 : 0, (int)c->fourcc,
                 (uint32_t)(c->modifier & 0xffffffffu),
@@ -3260,15 +3289,23 @@ static void usage(void)
 "                       sets its own window's `immediate` property (still\n"
 "                       needs general:allow_tearing = true).  The compositor\n"
 "                       has the last word: see docs/VIEWER.md\n"
-"  --gpu-scale=MODE     auto (default): in fullscreen with immediate\n"
-"                       presentation, a picture that is not 1:1 with the\n"
-"                       output (a game at 1600x900 on a 2560x1440 screen,\n"
-"                       stretched or letterboxed) is scaled by one GPU pass\n"
-"                       into an output-size buffer, so the compositor can\n"
-"                       still tear / scan it out.  A 1:1 picture stays\n"
-"                       zero-copy.  off: the compositor scales it\n"
-"  --render-node PATH   the GPU for --gpu-scale (default: the first render\n"
-"                       node that can import the guest's frames)\n"
+"  --gpu-scale=MODE     auto (default): in fullscreen, a picture that is not\n"
+"                       1:1 with the output (a game at 1600x900 on a\n"
+"                       2560x1440 screen, stretched or letterboxed) is shown\n"
+"                       zero-copy (the compositor scales the guest's buffer)\n"
+"                       or drawn by one GPU pass into an output-size buffer,\n"
+"                       whichever the compositor scans out directly or\n"
+"                       presents sooner, measured with wp_presentation.  A\n"
+"                       1:1 picture stays zero-copy.  on: always the GPU\n"
+"                       pass in fullscreen with immediate or latch\n"
+"                       presentation.  off: the compositor always scales\n"
+"  --gpu GPU            the GPU of the viewer's GPU pass (copies of frames\n"
+"                       the compositor does not take, and --gpu-scale):\n"
+"                       auto (default: the GPU that imports the frames, the\n"
+"                       one that made them first), dgpu, igpu (from PCI\n"
+"                       facts, not card numbers) or a render node path\n"
+"  --resolve-gpu        print the render nodes and what --gpu picks, exit\n"
+"  --render-node PATH   the same as --gpu PATH\n"
 "  --tearing            alias for --sync=immediate\n"
 "  --no-tearing         alias for --sync=vsync\n"
 "  --overlay=MODE       stats overlay (CTRL+ALT+O toggles): windowed (default;\n"
@@ -3478,6 +3515,8 @@ int main(int argc, char **argv)
     /* We only unlink a path we created ourselves: an adopted or activated
      * socket belongs to whoever handed it over. */
     bool socket_is_ours = true;
+    const char *gpu_want = NULL;    /* --gpu / --render-node */
+    bool resolve_gpu = false;
     bool had_client = false;
     /* Sticky within one loop iteration; see the single exit check at the
      * bottom of the loop for why the check cannot live where the detach
@@ -3614,12 +3653,16 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "--gpu-scale=", 12)) {
             if (!strcmp(a + 12, "auto"))     { cfg.gpu_scale = NB_GS_AUTO; }
             else if (!strcmp(a + 12, "off")) { cfg.gpu_scale = NB_GS_OFF; }
+            else if (!strcmp(a + 12, "on"))  { cfg.gpu_scale = NB_GS_ON; }
             else {
-                nb_err("--gpu-scale must be auto or off");
+                nb_err("--gpu-scale must be auto, on or off");
                 return 2;
             }
         }
-        else if (!strcmp(a, "--render-node")) { NEEDVAL(); cfg.render_node = v; }
+        else if (!strcmp(a, "--render-node")) { NEEDVAL(); gpu_want = v; }
+        else if (!strcmp(a, "--gpu")) { NEEDVAL(); gpu_want = v; }
+        else if (!strncmp(a, "--gpu=", 6)) { gpu_want = a + 6; }
+        else if (!strcmp(a, "--resolve-gpu")) { resolve_gpu = true; }
         else if (!strcmp(a, "--tearing"))    { cfg.sync = NB_SYNC_IMMEDIATE; }
         else if (!strcmp(a, "--no-tearing")) { cfg.sync = NB_SYNC_VSYNC; }
         else if (!strncmp(a, "--sync=", 7) || !strcmp(a, "--sync")) {
@@ -3765,6 +3808,40 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else { nb_err("unknown argument: %s", a); usage(); return 2; }
 #undef NEEDVAL
+    }
+    /*
+     * THE VIEWER'S GPU (nb_gpusel.h), for its GPU pass: the copy of frames
+     * the compositor does not take, and the fullscreen scaler.  dgpu/igpu
+     * become a render node now, from PCI facts; auto stays open and is
+     * decided per frame layout.  A dgpu/igpu this machine lacks falls back
+     * to auto rather than leaving the window black.
+     */
+    {
+        static char gpu_path[64];
+        struct nb_gpu_node nodes[NB_GPU_MAX];
+        int k = nb_gpusel_scan(NULL, nodes, NB_GPU_MAX);
+        bool ok = nb_gpusel_resolve(gpu_want, nodes, k, gpu_path,
+                                    sizeof(gpu_path), cfg.gpu_why,
+                                    sizeof(cfg.gpu_why));
+
+        if (resolve_gpu) {
+            for (int j = 0; j < k; j++) {
+                printf("node %s %s %s %s%s\n", nodes[j].path, nodes[j].slot,
+                       nb_gpu_vendor_name(nodes[j].vendor),
+                       nb_gpu_kind_name(nb_gpu_classify(&nodes[j])),
+                       nodes[j].boot_vga ? " boot-vga" : "");
+            }
+            printf("gpu %s\nwhy %s\n", ok && gpu_path[0] ? gpu_path : "auto",
+                   cfg.gpu_why);
+            return ok ? 0 : 1;
+        }
+        if (!ok) {
+            nb_err("viewer GPU: %s; using auto", cfg.gpu_why);
+            nb_gpusel_resolve("auto", nodes, k, gpu_path, sizeof(gpu_path),
+                              cfg.gpu_why, sizeof(cfg.gpu_why));
+        }
+        cfg.render_node = gpu_path[0] ? gpu_path : NULL;
+        nb_log("viewer GPU: %s", cfg.gpu_why);
     }
     /* --socket is no longer the only way to get a listening socket; the check
      * that matters happens once activation has had its say, below. */

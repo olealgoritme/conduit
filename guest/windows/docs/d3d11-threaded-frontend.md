@@ -325,6 +325,10 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 - `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 0 = off (default), 1 = on for every process except dwm.exe,
   2 = on including dwm.exe. Process override `HELIOS_D3D11_FRONTEND=0|1`.
 - `UmdFrontendRingKiB` (DWORD, default 4096, clamped 256–65536).
+- `HELIOS_FE_WORKER_POLL_PAUSES` (process environment, default 32, max 4096): pause instructions between two looks at
+  the producer's write cursor while the worker waits on an empty ring. Every look pulls the producer's cache line to the
+  worker, and the next push pays a cache-line transfer to publish; spaced looks let records run in batches. 0 or 1 =
+  one pause per look.
 - `UmdFrontendSync` (DWORD bitmask, default 0): call classes forced onto the synchronous path, for A/B runs that pin a
   rendering difference to one mechanism (`umd_common::cmd_record::FrontendSync`; the start-up log line names them):
 
