@@ -559,6 +559,10 @@ cmd_package() {
 main() {
     [ $# -ge 1 ] || { sed -n '2,30p' "$0"; exit 1; }
     local cmd=$1; shift
+    # Every binary built below prints this version in its build identity
+    # (packaging/build-id.sh), the same one the packages carry.
+    CONDUIT_VERSION=${CONDUIT_VERSION:-$(version)}
+    export CONDUIT_VERSION
     case "$cmd" in
         deps) cmd_deps ;;
         rust) cmd_rust ;;
