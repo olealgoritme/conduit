@@ -478,6 +478,19 @@ unsafe fn dxgkddi_escape_inner(
                 .unwrap_or(0);
             escape_attach_resource(passive, adapter, buf, &hdr, owner, process)
         }
+        // Completion hints (`Nvk12CompletionHint`): fences of this process's own gate only,
+        // so the escape needs the device whose `hKmdProcess` names that process.
+        helios_protocol::HELIOS_ESCAPE_ECL_DONE => match owner {
+            Some(_) => {
+                // SAFETY: the runtime supplies our live DeviceContext (non-null: `owner` is
+                // Some) for this Escape.
+                let process = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+                    .map(|d| d.creator_process())
+                    .unwrap_or(0);
+                escape_ecl_done(passive, adapter, buf, &hdr, process)
+            }
+            None => refuse_no_device(),
+        },
         HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf, &hdr),
         HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf, &hdr),
         HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE => escape_query_scanout_timeline(buf, &hdr),
@@ -930,6 +943,75 @@ fn escape_snapshot_status(
         Err(error) => return escape_device_gone(error),
     };
     wire.write_back(&out);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_ESCAPE_ECL_DONE` (`Nvk12CompletionHint`, `docs/rm-fence-marker.md`
+/// "Completion hints"): the D3D12 UMD saw ExecuteCommandLists batches finish and names
+/// their ECL fences. Each one the KMD holds for `process`'s gate and that has not fired
+/// is fired here, as its `EventReady` would fire it; the rest are counted and left
+/// alone. When any fired, the completion DPC is queued (it releases the packets' DMA
+/// completions) and the worker owes their `Close`s. Never fails a well-formed request:
+/// the out fields say what became of each handle. No wait, one `virtio_lock` hold.
+#[inline(never)]
+fn escape_ecl_done(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    process: usize,
+) -> NTSTATUS {
+    use core::sync::atomic::Ordering;
+    use crate::virtio::gpu::{
+        ECL_HINT_ESCAPES, ECL_HINT_FIRED, ECL_HINT_LATE, ECL_HINT_REFUSED, ECL_HINT_WHY,
+    };
+    let mut wire = match EscapeBuf::<helios_protocol::HeliosEclDone>::new(buf, hdr) {
+        Ok(wire) => wire,
+        Err(status) => return status,
+    };
+    let mut req = wire.read();
+    let mut fences = [0u32; helios_protocol::HELIOS_ECL_DONE_MAX];
+    let n = match req.valid_fences() {
+        Some(named) => {
+            fences[..named.len()].copy_from_slice(named);
+            named.len()
+        }
+        None => return STATUS_INVALID_PARAMETER,
+    };
+    if process == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ECL_HINT_ESCAPES.fetch_add(1, Ordering::Relaxed);
+    let tally = adapter.with_virtio(|v| {
+        let mut tally = helios_kmd_logic::ecl_done::Tally::default();
+        for &fence in &fences[..n] {
+            tally.note(v.ecl_done_hint(process, fence));
+        }
+        tally
+    });
+    let tally = match tally {
+        Ok(tally) => tally,
+        Err(error) => return escape_device_gone(error),
+    };
+    if tally.fired != 0 {
+        ECL_HINT_FIRED.fetch_add(tally.fired, Ordering::Relaxed);
+        // The packets these fences gate complete in the DPC, as after an `EventReady`.
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        // Their handles are owed a `Close`: the worker's, or this thread's without one.
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FENCE);
+        crate::virtio::nvrm::service_fences_without_worker(passive, adapter);
+    }
+    if tally.late != 0 {
+        ECL_HINT_LATE.fetch_add(tally.late, Ordering::Relaxed);
+    }
+    if tally.refused != 0 {
+        ECL_HINT_REFUSED.fetch_add(tally.refused, Ordering::Relaxed);
+        ECL_HINT_WHY.store(tally.last_why, Ordering::Relaxed);
+    }
+    req.out_fired = tally.fired;
+    req.out_late = tally.late;
+    req.out_refused = tally.refused;
+    wire.write_back(&req);
     STATUS_SUCCESS
 }
 

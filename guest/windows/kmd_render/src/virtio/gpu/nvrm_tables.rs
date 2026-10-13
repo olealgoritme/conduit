@@ -783,6 +783,16 @@ impl VirtioGpu {
         self.nvrm_fences.note_ready_status(handle, status)
     }
 
+    /// What a completion hint (`HELIOS_ESCAPE_ECL_DONE`) needs of the entry at `idx`:
+    /// whether it is a fence, whether the KMD owns it, and its state. `None` when `idx`
+    /// is `None` or out of range. Read under the virtio lock, with the decision
+    /// (`helios_kmd_logic::ecl_done::verdict`) taken in the same hold.
+    pub(super) fn fence_hint_view(&self, idx: Option<usize>) -> Option<(bool, bool, FenceMeta)> {
+        idx.and_then(|i| self.nvrm_handles.get(i)).map(|s| {
+            (is_fence_type(s.device_type), s.owner == DeviceOwner::KMD_RM, s.fence)
+        })
+    }
+
     /// An `EventReady{handle, status}` for a fence: record that it fired (the first
     /// one only; see `FenceMeta::set_fired`). The caller routes by what it was
     /// attached to.

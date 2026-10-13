@@ -20,6 +20,7 @@
 #![no_std]
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
+pub mod ecl_done;
 pub mod escape;
 pub mod features;
 pub mod flush_gate;
@@ -34,6 +35,7 @@ pub mod rm_fence_v3;
 pub mod virtio_gpu;
 pub mod wddm;
 
+pub use ecl_done::*;
 pub use escape::*;
 pub use features::*;
 pub use flush_gate::*;
