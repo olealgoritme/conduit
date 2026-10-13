@@ -231,11 +231,15 @@ struct HeliosRmFenceTail {
   runtime's: a queue that consumes another queue's work waits on a monitored fence,
   which dxgkrnl releases only after the producer's DMA fence, i.e. after the producer's
   point fired. A present's point is in the gate of the context that presents. With no
-  gate entry or stream slot free, a context shares a gate of its own process (it becomes
-  the process's gate, counted `RmGShare`) before it is refused; an `HE12` context keeps
-  the gate its execution stream bound. A context's gate is purged at `DestroyContext`,
-  a shared one at `DestroyProcess`
-  (`kmd_logic::rm_fence_present::pick_gate`).
+  gate entry or stream slot free, an `HE12` point is refused (`RmGNoGate`; the Render
+  fails and the UMD orders that batch with a CPU wait), because sharing would couple two
+  queues again; a present or flush-gate point shares a gate of its own process instead
+  (it becomes the process's gate, counted `RmGShare`), because refusing it would leave
+  the present with no boundary at all. An `HE12` context keeps the gate its execution
+  stream bound. A context's gate is purged at `DestroyContext`, a shared one at
+  `DestroyProcess`; a packet submitted for a gate already purged has its execution wait
+  latched as ended at once (`RmGDeadSub`, a guard: dxgkrnl does not submit for a
+  destroyed context) (`kmd_logic::rm_fence_present::pick_gate`, `CancelledGates`).
 * **Two handles in one DMA buffer.** The private record carries ONE boundary, and a
   process can now put two handles in a buffer (a gate and a registered stream: a fenced
   present beside the CPU-complete marker `(ctx, 0, cookie)`, or a stream beside a
