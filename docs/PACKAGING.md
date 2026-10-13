@@ -109,8 +109,8 @@ The Conduit BIOS (`packaging/bios/build.sh`) downloads Ubuntu's `edk2` source
 package pinned in `packaging/bios/version.sh` (checksums checked;
 `packaging/bios/fetch-src.sh` tries the project's `edk2-src-<version>`
 release assets first, Launchpad second), applies its
-patch series, swaps in `packaging/bios/Logo.bmp` (rendered by
-`make-logo.py`) and `packaging/bios/patches`, and builds `OVMF_CODE_4M.fd` and
+patch series, swaps in `packaging/bios/Logo.bmp` (the committed output of
+`make-logo.py`, so the build needs no Python imaging libraries) and `packaging/bios/patches`, and builds `OVMF_CODE_4M.fd` and
 `OVMF_CODE_4M.secboot.fd` with the flags of Ubuntu's `debian/rules`, so the
 images take the stock varstores; `OVMF_VERSION` next to them records the
 Ubuntu ovmf build they match, which attach compares with the host's. Its package version is the edk2 build plus
