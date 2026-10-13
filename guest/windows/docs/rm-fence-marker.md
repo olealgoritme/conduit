@@ -302,6 +302,48 @@ fence). A Venus stream's execution waits keep their own, unchanged rule. In prac
 dxgkrnl has retired a process's DMA buffers before `DestroyProcess`; this is the net
 under an abnormal exit.
 
+## Completion hints
+
+An `HE12` v4 packet completes when its fence fires, and the fire comes from the host:
+the GPU's semaphore release raises a non-stall interrupt, nvidia-drm's semaphore-surface
+callback signals the sync_file on its work thread, the backend's event thread sends
+`EventReady`, and the KMD's DPC fires the gate point. dxgkrnl keeps about two packets
+per node in flight and the UMD's admission event (SignalAtSubmission) releases a batch
+only once its packet is submitted, so a batch reaches NVK once the packet two ahead of
+it completed: the host leg sits between batches on the GPU whenever the batch in
+between is shorter than the round trip.
+
+With `Nvk12CompletionHint` (UMD, microseconds, default 0 = off) the guest shortcuts that
+leg. vkd3d's queue worker (patch 0011) records, per queue, each batch's ECL fence with
+the producer value the batch signals; while it waits for an admission it polls the
+admission event and the producer timeline (CPU-visible memory the GPU writes right
+after the batch) for up to that budget, and hands the fences of the batches it saw
+finish to the UMD (`umd12/src/forward12/ecl_hint.rs`). The UMD sends them in one
+`HELIOS_ESCAPE_ECL_DONE` (verb `0x0019`, `protocol/src/ecl_done.rs`: header, `count`,
+three out counts, up to 16 handles; 96 bytes) on its own D3DKMT device, opened once per
+process on the adapter that answers the verb.
+
+The KMD (`ddi/escape.rs` `escape_ecl_done`, `rm_gates.rs` `ecl_done_hint`) takes the
+process from the escaping device's `hKmdProcess` and decides per handle under
+`virtio_lock` (`kmd_logic::ecl_done::verdict`): a fence the KMD holds (`KMD_RM`),
+attached to a gate point, created in that process, on a live gate of that process, and
+not fired yet is fired exactly as its first `EventReady` would fire it (the point, the
+stream slot, the execution waits that name it; the handle is owed a `Close`). Anything
+else changes nothing: unknown or closed handles, other processes' fences, fences no
+carrier took yet (the host fire and the early-fire latch cover them), scanout or
+discarded fences, and fences that fired already (`late`). When any fired the escape
+queues the completion DPC, which releases the packets' DMA completions as after an
+`EventReady`, and wakes the worker for the `Close`s. The host's `EventReady` that
+follows is a repeat and is ignored. Host fence handles are never reused within a
+transport (the backend numbers them upward), so a hint that arrives after its fence was
+closed names nothing.
+
+What a hint can do wrong is limited to the hinting process: it completes that process's
+own packets early, so its own fence signals and presents could run ahead of its own
+work. The UMD names a fence only after the producer timeline passed the batch's value,
+which the GPU writes after the batch's work. A KMD without the verb fails the UMD's
+probe and hints stay off.
+
 ## Capability bits
 
 `HeliosNvrmQueryCaps` has no spare field and keeps its 88 bytes. `supported_ops` is a
@@ -334,6 +376,10 @@ teardown, `RmGRef` markers refused (not owned / not a fence / already attached /
 markers / no gate room or fence quota), `RmGTake` handles of a `HERF` / `HEPR` tail
 taken and closed although no marker was attached (the refusal rule), `PrBndDrop`
 boundaries of two handles that met in one DMA buffer and cost the later present its wait.
+Completion hints: `E12HintEsc` escapes served, `E12HintFire` fences fired on a hint,
+`E12HintLate` named fences that had fired already (the host was first), `E12HintRef`
+named handles refused, `E12HintWhy` the last refusal (1 unknown, 2 not a fence, 3 not
+taken yet, 4 not a gate point, 5 not the caller's).
 Common: `NvFenceCl` (existing) counts every fence handle closed, including the KMD's;
 `FnCloseErr` counts the KMD's closes the host did not take.
 

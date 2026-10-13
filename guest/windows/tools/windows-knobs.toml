@@ -622,6 +622,17 @@ class = "debug"
 read = "once per process"
 effect = "1: on NVK only the first ExecuteCommandLists of each queue after a Present waits for the runtime admission event; other batches go to the engine at once. A measurement of the per-batch admission round trip that can race applications relying on cross-queue waits; never a setting."
 
+[umd.Nvk12AdmitBeforeRender]
+class = "experiment"
+read = "once per process"
+effect = "With Nvk12EclSync=2: 1 queues an ExecuteCommandLists' admission event before its HE12 v4 packet instead of after it, so the batch reaches NVK once everything before it on the context was submitted and three batches can be on the GPU instead of two; runtime waits before the ECL still hold it and signals after it still follow the work. Counter EclAdmitBeforeRender."
+
+[umd.Nvk12CompletionHint]
+class = "experiment"
+read = "once per process"
+effect = "With Nvk12EclSync=2: microseconds vkd3d's queue worker polls, per admission wait, the queue's producer timeline and the admission event; each batch it sees finish has its ECL fence named to the KMD (HELIOS_ESCAPE_ECL_DONE), which completes the batch's packet without waiting for the host's EventReady. 0 = off; off as well when the KMD does not serve the escape. Costs up to that much of one core per wait. Clamped to 20000."
+see = "[rm-fence-marker.md](../guest/windows/docs/rm-fence-marker.md#completion-hints)"
+
 [umd.Nvk12EclFencePrefetch]
 class = "tuning"
 read = "once per process"
