@@ -2663,6 +2663,9 @@ pub struct VirtioGpu {
     /// One RM gate per process that attaches RM fences to WDDM presents; each is
     /// carried by a slot of `present_streams` (`rm_gates.rs`).
     rm_gates: Vec<rm_gates::RmGateSlot>,
+    /// Stream handles of the gates cancelled most recently (`rm_gates.rs`,
+    /// `rm_gate_latch_dead_submit`).
+    rm_gates_cancelled: helios_kmd_logic::rm_fence_present::CancelledGates,
     producer_adapter: usize,
     producer_generation: u32,
     /// Dedicated standard-buffer ownership table. Fixed-length heap storage keeps all
@@ -3331,6 +3334,7 @@ impl VirtioGpu {
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
             present_streams,
             rm_gates,
+            rm_gates_cancelled: helios_kmd_logic::rm_fence_present::CancelledGates::new(),
             producer_adapter: 0,
             producer_generation: 0,
             present_buffer_syncs,
@@ -8298,6 +8302,8 @@ impl VirtioGpu {
                     let slot = self.present_streams[index];
                     if slot.live && slot.handle(index) == handle {
                         wait.observe(handle, slot.progress.completed());
+                    } else {
+                        self.rm_gate_latch_dead_submit(wait, handle);
                     }
                 }
             }

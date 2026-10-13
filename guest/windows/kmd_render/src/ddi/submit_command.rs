@@ -1838,20 +1838,39 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
 // ── Render-path DDIs. ───────────────────────────────────────────────────────
 
 /// The WDDM context a fence-carrying packet belongs to, as the RM gate table keys it: its
-/// token (`ContextHandleRef::token`, 0 = unknown: the process's shared gate) and the
-/// execution stream it already bound (0 = none).
+/// token (`ContextHandleRef::token`, 0 = unknown: the process's shared gate), the
+/// execution stream it already bound (0 = none), and whether the point may go to a gate
+/// shared with the process's other contexts when no gate is free for its own (presents
+/// and flush gates; `HE12` never: see `rm_fence_present::pick_gate`).
 #[derive(Clone, Copy)]
 struct GateKey {
     context: usize,
     bound: u32,
+    may_share: bool,
 }
 
 impl GateKey {
     fn of(context: Option<&crate::device::ContextHandleRef<'_>>) -> Self {
-        context.map_or(Self { context: 0, bound: 0 }, |c| Self {
-            context: c.token(),
-            bound: c.execution_stream(),
-        })
+        context.map_or(
+            Self {
+                context: 0,
+                bound: 0,
+                may_share: true,
+            },
+            |c| Self {
+                context: c.token(),
+                bound: c.execution_stream(),
+                may_share: true,
+            },
+        )
+    }
+
+    /// An `HE12` point: its own gate (or the one its stream bound) or refused.
+    fn exclusive(self) -> Self {
+        Self {
+            may_share: false,
+            ..self
+        }
     }
 }
 
@@ -1875,7 +1894,13 @@ fn attach_rm_fence_marker(
         return Err(GateRefusal::NotFence);
     }
     let attached = match adapter.with_virtio(|v| {
-        v.rm_gate_attach(tail.rm_fence_handle, process, gate_key.context, gate_key.bound)
+        v.rm_gate_attach(
+            tail.rm_fence_handle,
+            process,
+            gate_key.context,
+            gate_key.bound,
+            gate_key.may_share,
+        )
     }) {
         Ok(Ok(attached)) => attached,
         Ok(Err(why)) => return Err(why),
@@ -2267,7 +2292,7 @@ pub unsafe extern "C" fn dxgkddi_render(
                 // merge look at (point numbers of a gate only grow). The gate is the
                 // context's own (`rm_gates.rs`): this queue's points never wait for
                 // another queue's.
-                let gate_key = GateKey::of(Some(context));
+                let gate_key = GateKey::of(Some(context)).exclusive();
                 let bindable = adapter
                     .with_virtio(|v| {
                         helios_kmd_logic::execution_completion::may_bind_stream(

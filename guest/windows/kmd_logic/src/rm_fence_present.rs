@@ -531,11 +531,18 @@ impl Gate {
 // monitored fence (`WaitForSynchronizationObjectFromGpu`), which dxgkrnl releases only
 // after the producing packet's DMA fence, i.e. after the producer's gate point fired.
 //
-// Under slot pressure (no gate entry or no stream slot free) a context shares a gate of
-// its own process instead of being refused: correct (a shared gate is a superset of
-// both contexts' order) but it can block again the way described above, so it is the
-// fallback, counted, never the rule. A shared gate belongs to the process (context 0)
-// and lives until the process exits.
+// Under slot pressure (no gate entry or no stream slot free) the carrier decides:
+//
+// * an `HE12` (D3D12 ExecuteCommandLists) point is refused. That is where two queues of
+//   one process run side by side, so sharing would bring the deadlock back; a refused
+//   v4 record fails the Render and the UMD orders that batch with a CPU wait instead
+//   (slower, visible in `RmGNoGate`, never a stall);
+// * a present or flush-gate point (`HERF` / `HEPR` / `HEFL`) shares a gate of its own
+//   process. Refusing it would leave the present with no boundary at all (released
+//   before its producer finished), and a shared gate is a superset of both contexts'
+//   order, so it is correct; it can couple the contexts' completion again, which is why
+//   it is counted (`RmGShare`). A shared gate belongs to the process (context 0) and
+//   lives until the process exits.
 
 /// Who a gate belongs to: an `hKmdProcess` and one WDDM context of it (`context == 0`:
 /// the process's shared gate). Both are opaque tokens, only compared.
@@ -555,30 +562,33 @@ pub struct GateView {
 /// What [`pick_gate`] decided for a point of `(process, context)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatePick {
-    /// Attach to this gate as it is.
+    /// Attach to this gate as it is: the context's own, or the one it already bound.
     Use(usize),
     /// Open a new gate owned by `(process, context)`.
     Open,
-    /// No room for a new gate: attach to this gate of the same process, which becomes
-    /// the process's shared gate (its owner context becomes 0).
+    /// No room for a new gate and the carrier may share: attach to this gate of the same
+    /// process, which is (or becomes) the process's shared gate (owner context 0).
     Share(usize),
-    /// No room and no gate of the process to share.
+    /// No room, and the carrier may not share or the process has no gate to share.
     NoRoom,
 }
 
 /// Pick the gate for a point of `context` in `process`. `gates` yields the live gates
 /// as `(index, view)`; `bound` is the stream the context already bound (its
-/// `execution_stream`, 0 = none), `room` whether a gate entry and a stream slot are free.
+/// `execution_stream`, 0 = none), `room` whether a gate entry and a stream slot are free,
+/// `may_share` whether the carrier may fall back to a shared gate (presents and flush
+/// gates, not `HE12`).
 ///
-/// In order: the gate the context already bound (an `HE12` context's stream is sticky,
-/// so a context that once shared a gate keeps it); the context's own gate; a new one;
-/// the process's shared gate; any gate of the process, shared from now on; none.
+/// In order: the gate the context already bound (an `HE12` context's stream is sticky);
+/// the context's own gate; a new one; then, only if `may_share`, the process's shared
+/// gate or any gate of the process, shared from now on; none.
 pub fn pick_gate(
     gates: impl Iterator<Item = (usize, GateView)> + Clone,
     process: usize,
     context: usize,
     bound: u32,
     room: bool,
+    may_share: bool,
 ) -> GatePick {
     let mine = gates.filter(move |(_, g)| g.owner.process == process);
     if bound != 0 {
@@ -592,12 +602,60 @@ pub fn pick_gate(
     if room {
         return GatePick::Open;
     }
+    if !may_share {
+        return GatePick::NoRoom;
+    }
     if let Some((i, _)) = mine.clone().find(|(_, g)| g.owner.context == 0) {
-        return GatePick::Use(i);
+        return GatePick::Share(i);
     }
     match mine.clone().next() {
         Some((i, _)) => GatePick::Share(i),
         None => GatePick::NoRoom,
+    }
+}
+
+/// How many cancelled gate handles [`CancelledGates`] remembers.
+pub const CANCELLED_GATES: usize = 16;
+
+/// The stream handles of the gates cancelled most recently (a context or process purge).
+/// A cancel latches every execution wait already queued that names the gate, but a
+/// packet that reaches `SubmitCommand` after the cancel would create a wait no live gate
+/// can ever observe, and an execution wait is never rebased: it would hold its node's
+/// WDDM FIFO head until a TDR. dxgkrnl does not submit for a destroyed context, so this
+/// is a guard, not a path: such a wait is latched as ended at creation instead (the same
+/// "cancelled" meaning the purge gives it). Handles are generation-qualified, so a slot
+/// reused by a new gate never matches an old entry.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelledGates {
+    handles: [u32; CANCELLED_GATES],
+    next: usize,
+}
+
+impl Default for CancelledGates {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelledGates {
+    pub const fn new() -> Self {
+        Self {
+            handles: [0; CANCELLED_GATES],
+            next: 0,
+        }
+    }
+
+    /// Gate `handle` was cancelled (0 is ignored).
+    pub fn note(&mut self, handle: u32) {
+        if handle == 0 || self.contains(handle) {
+            return;
+        }
+        self.handles[self.next % CANCELLED_GATES] = handle;
+        self.next = (self.next + 1) % CANCELLED_GATES;
+    }
+
+    pub fn contains(&self, handle: u32) -> bool {
+        handle != 0 && self.handles.contains(&handle)
     }
 }
 
@@ -1390,6 +1448,18 @@ mod gate_per_context_tests {
             context,
             bound,
             room,
+            true,
+        )
+    }
+
+    fn pick_he12(gates: &[GateView], context: usize, bound: u32, room: bool) -> GatePick {
+        pick_gate(
+            gates.iter().copied().enumerate(),
+            PROC,
+            context,
+            bound,
+            room,
+            false,
         )
     }
 
@@ -1418,11 +1488,42 @@ mod gate_per_context_tests {
         // A's own gate is shared (it becomes the process's gate).
         let gates = [view(0x2000, CTX_B, 0x40), view(PROC, CTX_A, 0x41)];
         assert_eq!(pick(&gates, CTX_B, 0, false), GatePick::Share(1));
-        // Once shared (context 0), it is used as it is, before another own gate.
+        // Once shared (context 0), it is the one shared again, before another own gate.
         let gates = [view(PROC, CTX_A, 0x41), view(PROC, 0, 0x43)];
-        assert_eq!(pick(&gates, CTX_B, 0, false), GatePick::Use(1));
+        assert_eq!(pick(&gates, CTX_B, 0, false), GatePick::Share(1));
         // With room again a context without a stream of its own opens its own gate.
         assert_eq!(pick(&gates, CTX_B, 0, true), GatePick::Open);
+    }
+
+    #[test]
+    fn cancelled_gates_are_remembered_and_the_oldest_drop_out() {
+        let mut c = CancelledGates::new();
+        assert!(!c.contains(0));
+        c.note(0);
+        assert!(!c.contains(0));
+        c.note(0x41);
+        c.note(0x41);
+        assert!(c.contains(0x41));
+        for h in 0..CANCELLED_GATES as u32 {
+            c.note(0x100 + h);
+        }
+        assert!(
+            !c.contains(0x41),
+            "the oldest is dropped once the ring is full"
+        );
+        assert!(c.contains(0x100) && c.contains(0x100 + CANCELLED_GATES as u32 - 1));
+    }
+
+    #[test]
+    fn an_he12_point_never_shares_a_gate() {
+        // No room: refused, whatever gates the process has; the UMD orders that batch
+        // with a CPU wait instead.
+        let gates = [view(PROC, CTX_A, 0x41), view(PROC, 0, 0x43)];
+        assert_eq!(pick_he12(&gates, CTX_B, 0, false), GatePick::NoRoom);
+        // Its own gate, a bound one and a new one are fine.
+        assert_eq!(pick_he12(&gates, CTX_A, 0, false), GatePick::Use(0));
+        assert_eq!(pick_he12(&gates, CTX_B, 0x43, false), GatePick::Use(1));
+        assert_eq!(pick_he12(&gates, CTX_B, 0, true), GatePick::Open);
     }
 
     #[test]
@@ -1476,7 +1577,7 @@ mod gate_per_context_tests {
                     )
                 })
                 .collect();
-            let gi = match pick_gate(views.iter().copied(), PROC, key, 0, true) {
+            let gi = match pick_gate(views.iter().copied(), PROC, key, 0, true, false) {
                 GatePick::Use(i) => i,
                 GatePick::Open => {
                     gates.push((
