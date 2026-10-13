@@ -1,118 +1,47 @@
-#!/usr/bin/env python3
-"""Render the Conduit firmware boot logo (24-bit BMP, black background).
+"""Render the Conduit firmware boot logo packaging/bios/Logo.bmp.
+
+The mark (the geometry of packaging/common/icons/conduit.svg, without the tile)
+as a lit tube with a soft bloom, above a geometric CONDUIT wordmark. The letters
+are drawn from lines and arcs, so no font is needed.
 
 The firmware (OVMF, see build.sh) centers the image on its black screen and
 publishes it as the ACPI BGRT logo, which Windows keeps above its boot spinner.
-Constraints that shape every style:
+What shapes the image:
 
   * 24-bit uncompressed BMP, no alpha: the background is exactly (0,0,0) so the
     image blends into the screen, and every glow fades to exact black before the
     image border.
-  * The firmware centers the image (LogoDxe: EdkiiPlatformLogoDisplayAttributeCenter);
-    Windows draws its spinner at a fixed place below the screen centre (about three
-    quarters of the way down), so a logo should stay within about 480 px of height.
+  * The firmware centers the image (LogoDxe: EdkiiPlatformLogoDisplayAttributeCenter)
+    and Windows draws its spinner at a fixed place below the screen centre (about
+    three quarters of the way down), so the logo stays within 480 px of height.
   * The image sits in the firmware volume (about 9 MB free uncompressed, about
-    1.8 MB free after the volume's LZMA compression), so keep the BMP small.
+    1.8 MB free after the volume's LZMA compression); this one is 0.85 MB raw.
   * It is static; no animation is possible.
 
-Styles (--list prints them):
-  classic   the mark as before: flat gradient "C" ring, two white dots
-  aura      the mark as a lit tube with a soft bloom and depth
-  wordmark  the mark above a geometric "CONDUIT" wordmark
-  flow      neon line art; light trails thread through the C
-  emblem    the mark inside a detailed instrument-dial emblem
-  premium   conic gradient, hairline highlight, floor reflection; dithered
+The build uses the committed Logo.bmp, so building the firmware needs neither
+numpy nor Pillow. Regenerate it after changing this script:
 
-The geometry is that of packaging/common/icons/conduit.svg (without the tile).
-The letters of the wordmark are drawn from lines and arcs, so no font is needed.
-All styles but classic need numpy (pip install numpy pillow).
+    pip install numpy pillow
+    packaging/bios/make-logo.py packaging/bios/Logo.bmp
 
-Usage: make-logo.py [--style NAME] OUT.bmp [HEIGHT]
-       make-logo.py --preview DIR [--style NAME ...]   previews on 5120x1440 and 1920x1080
+Usage: make-logo.py OUT.bmp [HEIGHT]
 """
 import argparse
 import math
-import os
-import sys
 
-from PIL import Image, ImageDraw
+import numpy as np
+from PIL import Image
 
-try:
-    import numpy as np
-except ImportError:  # only the classic style works without numpy
-    np = None
-
-SS = 8  # supersampling factor of the classic style
-CX, CY, R = 128.0, 128.0, 68.0
+R = 68.0
 STROKE = 30.0
 CYAN = (0x22, 0xD3, 0xEE)
 VIOLET = (0xA7, 0x8B, 0xFA)
 DARK = (0x0F, 0x17, 0x2A)
 
 
-def lerp(a, b, t):
-    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
-
-
 # ---------------------------------------------------------------------------
-# classic: PIL only, supersampled
-# ---------------------------------------------------------------------------
-def classic(height=192):
-    size = 256 * SS
-    s = lambda v: v * SS  # noqa: E731
-
-    # Arc from the top-right endpoint (176,79) the long way round to (176,177).
-    a0 = math.atan2(79 - CY, 176 - CX)  # about -45.6 degrees
-    a1 = math.atan2(177 - CY, 176 - CX)  # about +45.6 degrees
-    sweep = (a0 - a1) % (2 * math.pi)  # long way, counter-clockwise on screen
-
-    # Pipe: stroke mask, coloured with a horizontal gradient x 62..196.
-    mask = Image.new("L", (size, size), 0)
-    md = ImageDraw.Draw(mask)
-    steps = 2000
-    for i in range(steps + 1):
-        a = a1 + sweep * i / steps
-        x, y = CX + R * math.cos(a), CY + R * math.sin(a)
-        r = STROKE / 2
-        md.ellipse([s(x - r), s(y - r), s(x + r), s(y + r)], fill=255)
-    grad = Image.new("RGB", (size, size))
-    gd = ImageDraw.Draw(grad)
-    for px in range(size):
-        t = min(max((px / SS - 62) / (196 - 62), 0.0), 1.0)
-        gd.line([(px, 0), (px, size)], fill=lerp(CYAN, VIOLET, t))
-    img = Image.new("RGB", (size, size), (0, 0, 0))
-    img.paste(grad, (0, 0), mask)
-
-    # Flow dots along the pipe: white at 50% opacity, every 16 units of arc.
-    dots = Image.new("L", (size, size), 0)
-    dd = ImageDraw.Draw(dots)
-    length = sweep * R
-    d = 0.0
-    while d <= length + 1e-6:
-        a = a0 - d / R
-        x, y = CX + R * math.cos(a), CY + R * math.sin(a)
-        dd.ellipse([s(x - 2.5), s(y - 2.5), s(x + 2.5), s(y + 2.5)], fill=128)
-        d += 16.0
-    img.paste(Image.new("RGB", (size, size), (255, 255, 255)), (0, 0), dots)
-
-    # Endpoint caps.
-    draw = ImageDraw.Draw(img)
-    for x, y in ((176, 79), (176, 177)):
-        draw.ellipse([s(x - 19), s(y - 19), s(x + 19), s(y + 19)], fill=DARK)
-        draw.ellipse([s(x - 13), s(y - 13), s(x + 13), s(y + 13)], fill=(255, 255, 255))
-
-    # Crop to the mark with a small margin, keep it square, scale down.
-    x0, y0, x1, y1 = (s(v) for v in (CX - R - STROKE / 2 - 10, 79 - 19 - 10, 176 + 19 + 10, 177 + 19 + 10))
-    side = max(x1 - x0, y1 - y0)
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    box = [round(cx - side / 2), round(cy - side / 2), round(cx + side / 2), round(cy + side / 2)]
-    return img.crop(box).resize((height, height), Image.LANCZOS)
-
-
-# ---------------------------------------------------------------------------
-# The other styles: analytic distance fields in floating point (numpy), so edges
-# are exactly anti-aliased at any size and glows/gradients are dithered to 8 bit
-# only once, at the very end.
+# Analytic distance fields in floating point, so edges are exactly anti-aliased
+# at any size and glows/gradients are dithered to 8 bit only once, at the end.
 # ---------------------------------------------------------------------------
 ALPHA = math.radians(45.6)  # half of the C's opening
 
@@ -159,13 +88,8 @@ class Cv:
         self.img = self.img + light
 
 
-def hgrad(cv, x0, x1, tilt=0.0):
-    t = np.clip((cv.X + tilt * cv.Y - x0) / (x1 - x0), 0, 1)[..., None]
-    return col(CYAN) * (1 - t) + col(VIOLET) * t
-
-
-def lgrad(t):
-    t = np.clip(t, 0, 1)[..., None]
+def hgrad(cv, x0, x1):
+    t = np.clip((cv.X - x0) / (x1 - x0), 0, 1)[..., None]
     return col(CYAN) * (1 - t) + col(VIOLET) * t
 
 
@@ -239,7 +163,7 @@ def flow_dots(T, rad=2.5, spacing=16.0):
     return T.cv.cov(d) * T.inside
 
 
-def caps(cv, T, glow=0.0, flat=False):
+def caps(cv, T, glow=0.0):
     """The two white end beads with their dark rims."""
     s = T.s
     white = np.ones(3)
@@ -247,7 +171,7 @@ def caps(cv, T, glow=0.0, flat=False):
         dx, dy = cv.X - tx, cv.Y - ty
         d = np.hypot(dx, dy)
         cv.over(col(DARK), cv.cov(d - 19 * s))
-        bead = white if flat else np.clip(shade(dx, dy, 13 * s, white, 0.55, 0.55, 30, 0.35), 0, 1)
+        bead = np.clip(shade(dx, dy, 13 * s, white, 0.55, 0.55, 30, 0.35), 0, 1)
         cv.over(bead, cv.cov(d - 13 * s))
     if glow:
         m = sum(cv.cov(np.hypot(cv.X - tx, cv.Y - ty) - 13 * s) for tx, ty in T.terminals())
@@ -318,22 +242,7 @@ def wordmark_sd(cv, text, cx, cy, cap, stroke, track):
 
 
 # --- styles ---------------------------------------------------------------------
-def style_aura(height=480):
-    """The mark as a lit tube with a layered bloom."""
-    cv = Cv(266, 266, height)
-    T = Tube(cv, 8, 0, 1.0)
-    g = hgrad(cv, 8 - 66, 8 + 68)
-    layer = g * T.cover[..., None]
-    cv.add(0.55 * cv.blur(layer, 5) + 0.42 * cv.blur(layer, 16) + 0.30 * cv.blur(layer, 34))
-    # dim the ring where it turns away from the light and add a subtle inner edge
-    pipe = np.clip(shade(T.vx, T.vy, T.hw, g, 0.46, 0.80, 36, 0.40), 0, 1)
-    cv.over(pipe, T.cover)
-    cv.over(np.ones(3), 0.55 * flow_dots(T))
-    caps(cv, T, glow=0.55)
-    return finish(cv)
-
-
-def style_wordmark(height=480):
+def logo(height=480):
     """The mark above a geometric CONDUIT wordmark."""
     cv = Cv(330, 270, height)
     acx, acy = 8, -30
@@ -353,281 +262,12 @@ def style_wordmark(height=480):
     return finish(cv)
 
 
-def style_flow(height=480):
-    """Neon line art; trails of light run through the C like data through a conduit."""
-    cv = Cv(612, 266, height)
-    acx = 8
-    T = Tube(cv, acx, 0, 1.0)
-    g = hgrad(cv, acx - 66, acx + 68)
-    ones = np.ones(3)
-
-    # rails: a faint hairline per row plus comets, hidden behind the tube and the beads
-    occl = np.maximum(cv.cov(T.dc - T.hw - 1.5),
-                      sum(cv.cov(np.hypot(cv.X - tx, cv.Y - ty) - 20) for tx, ty in T.terminals()))
-    occl = np.clip(occl, 0, 1)
-    rails = np.zeros((cv.H, cv.W, 3))
-    rows = (-49, -24.5, 0, 24.5, 49)
-    packets = {  # per row: (head x, tail length, strength)
-        -49: [(-250, 120, .9), (-95, 60, .6), (30, 70, .8), (170, 150, 1.0), (290, 70, .7)],
-        -24.5: [(-190, 80, .6), (-30, 110, .75), (120, 55, .55), (255, 130, .8)],
-        0: [(-270, 90, .65), (-140, 150, .9), (10, 80, .6), (95, 60, .7), (220, 110, .9)],
-        24.5: [(-210, 130, .8), (-60, 70, .55), (80, 120, .8), (240, 60, .6)],
-        49: [(-280, 60, .7), (-160, 110, .8), (-20, 90, .7), (140, 70, .9), (265, 110, .85)],
-    }
-    env = np.clip(1 - np.abs(cv.X) / 300.0, 0, 1) ** 1.3
-    for y in rows:
-        dy = np.abs(cv.Y - y)
-        line = cv.cov(dy - 0.45)
-        base = 0.38 * line
-        lit = np.zeros_like(base)
-        for head, tail, st in packets[y]:
-            t = (head - cv.X) / tail  # 0 at the head, 1 at the end of the tail
-            f = np.where((t >= 0) & (t <= 1), (1 - np.clip(t, 0, 1)) ** 2.2, 0)
-            lit = np.maximum(lit, st * f * cv.cov(dy - 0.75))
-            lit = np.maximum(lit, st * cv.cov(np.hypot(cv.X - head, dy) - 1.5))
-        rails += (g * (base + 1.5 * lit)[..., None]) * env[..., None]
-    rails = rails * (1 - occl)[..., None]
-    cv.add(rails + 1.0 * cv.blur(rails, 2.5) + 0.8 * cv.blur(rails, 9))
-
-    # neon tube: dark core, tinted fill, bright edges, a data packet running through
-    cv.over(np.zeros(3), T.cover)
-    cv.over(g * 0.07, T.cover)
-    edge = cv.cov(np.abs(T.dc - T.hw) - 0.9)
-    hot = g * 0.75 + 0.25
-    cv.over(hot, edge)
-    cv.add(0.55 * cv.blur(g * edge[..., None], 3) + 0.45 * cv.blur(g * edge[..., None], 11)
-           + 0.20 * cv.blur(g * edge[..., None], 28))
-    # comets along the centreline, flowing from the lower end round to the upper end
-    from_bot = T.length - T.along
-    cl = np.zeros_like(T.dc)
-    for head, tail, st in ((18, 85, 1.0), (138, 60, .8), (222, 90, .9)):
-        t = (head - from_bot) / tail
-        f = np.where((t >= 0) & (t <= 1), np.exp(-3.0 * np.clip(t, 0, 1)) * (1 - np.clip(t, 0, 1)), 0)
-        cl = np.maximum(cl, st * f)
-        hx, hy = _arc_point(T, head)
-        cl = np.maximum(cl, st * cv.cov(np.hypot(cv.X - hx, cv.Y - hy) - 3.4))
-    cl = cl * T.inside * cv.cov(T.dc - 2.6) * 1.0
-    cv.over(hot, cl * 0.9)
-    cv.add(0.7 * cv.blur(g * cl[..., None], 4))
-    # beads
-    for tx, ty in T.terminals():
-        d = np.hypot(cv.X - tx, cv.Y - ty)
-        cv.over(np.zeros(3), cv.cov(d - 19))
-        ring = cv.cov(np.abs(d - 17.5) - 0.9)
-        cv.over(hot, ring)
-        cv.over(ones, cv.cov(d - 8.5))
-        cv.add(0.7 * cv.blur((cv.cov(np.abs(d - 17.5) - 1.5) * 0.7 + cv.cov(d - 8.5))[..., None] * g, 5))
-    return finish(cv, margin=0.04)
-
-
-def _arc_point(T, from_bot):
-    """Point on the centreline `from_bot` units of arc away from the lower end."""
-    ang = ALPHA + from_bot / T.R
-    return T.acx + T.R * math.cos(ang), T.acy + T.R * math.sin(ang)
-
-
-def style_emblem(height=480):
-    """The mark inside an instrument-dial emblem: ticks, segmented rings, nodes."""
-    cv = Cv(266, 266, height)
-    ones = np.ones(3)
-    g = hgrad(cv, -120, 120)
-    r = np.hypot(cv.X, cv.Y)
-    phi = np.arctan2(cv.Y, cv.X)
-
-    def ring(rad, w, strength=1.0, gap=None):
-        a = cv.cov(np.abs(r - rad) - w / 2)
-        if gap is not None:  # list of (lo, hi) angle spans (degrees) that are drawn
-            m = np.zeros_like(a)
-            for lo, hi in gap:
-                m = np.maximum(m, cv.cov(sd_arc(cv, 0, 0, rad, math.radians(lo), math.radians(hi)) - w / 2))
-            a = m
-        return a * strength
-
-    # soft radial glow behind everything
-    rw = np.clip((128.0 - r) / 30.0, 0, 1)  # the haze ends inside the image, no square edge
-    rw = rw * rw * (3 - 2 * rw)
-    cv.add((0.10 * np.exp(-(r / 78.0) ** 2) + 0.05 * np.exp(-(r / 110.0) ** 2))[..., None] * g * rw[..., None])
-
-    # outer hairline and tick ring
-    cv.over(g, ring(122, 0.9, 0.85))
-    tick_step = math.radians(5)
-    k = np.round(phi / tick_step)
-    dphi = phi - k * tick_step
-    tang = np.abs(r * np.sin(dphi))
-    major = (np.mod(k, 6) == 0)
-    r0 = np.where(major, 103.0, 109.0)
-    rad_out = np.maximum(np.maximum(r0 - r, r - 117.0), 0)
-    tick_d = np.hypot(np.maximum(tang - np.where(major, 0.9, 0.5), 0), rad_out)
-    tick = cv.cov(tick_d) * np.where(major, 0.95, 0.5)
-    cv.over(g, tick)
-
-    # segmented middle ring with nodes at the segment ends
-    spans = [(18, 102), (138, 222), (258, 342)]
-    seg = ring(93, 2.4, 1.0, spans)
-    cv.add(0.5 * cv.blur(g * seg[..., None], 3))
-    cv.over(g, seg)
-    for lo, hi in spans:
-        for a in (lo, hi):
-            x, y = 93 * math.cos(math.radians(a)), 93 * math.sin(math.radians(a))
-            d = np.hypot(cv.X - x, cv.Y - y)
-            cv.over(col(DARK), cv.cov(d - 4.6))
-            cv.over(ones, cv.cov(d - 2.9))
-    # a comet orbiting on the inner hairline ring
-    cv.over(g, ring(80, 0.6, 0.5))
-    head = math.radians(-32)
-    tail = math.radians(150)
-    dth = (head - phi) % (2 * math.pi)
-    f = np.where(dth <= tail, np.exp(-3.2 * dth / tail) * (1 - dth / tail), 0)
-    comet = cv.cov(np.abs(r - 80) - 1.5) * f
-    cv.over(ones * 0.8 + g * 0.2, comet)
-    cv.add(0.6 * cv.blur(g * comet[..., None], 3))
-    hx, hy = 80 * math.cos(head), 80 * math.sin(head)
-    d = np.hypot(cv.X - hx, cv.Y - hy)
-    cv.over(ones, cv.cov(d - 3.2))
-    cv.add(0.6 * cv.blur(cv.cov(d - 3.2)[..., None] * g, 4))
-    # spokes tie the dial to the mark
-    for a in (90, 270, 180):
-        c, s_ = math.cos(math.radians(a)), math.sin(math.radians(a))
-        sdl = sd_seg(cv, 56 * c, 56 * s_, 79 * c, 79 * s_)
-        cv.over(g, cv.cov(sdl - 0.5) * 0.7)
-
-    # the mark
-    sc = 0.74
-    T = Tube(cv, 8 * sc, 0, sc)
-    layer = g * T.cover[..., None]
-    cv.add(0.45 * cv.blur(layer, 3) + 0.30 * cv.blur(layer, 10))
-    cv.over(np.clip(shade(T.vx, T.vy, T.hw, g, 0.46, 0.80, 36, 0.40), 0, 1), T.cover)
-    cv.over(ones, 0.5 * flow_dots(T))
-    caps(cv, T, glow=0.5)
-    return finish(cv, margin=0.03)
-
-
-def style_premium(height=420):
-    """Minimal and premium: conic gradient, hairline highlight, floor reflection."""
-    cv = Cv(250, 250, height)
-    sc, acx, acy = 1.0, 8.0, -40.0
-    T = Tube(cv, acx, acy, sc)
-    t = T.along / T.length
-    g = lgrad(t)
-    # the tube: clean gradient, a hairline highlight on its upper-left, soft shading
-    lit = np.clip((T.vx * LIGHT[0] + T.vy * LIGHT[1]) / T.hw, -1, 1)
-    body = g * (0.82 - 0.18 * lit)[..., None]
-    cv.over(np.clip(body, 0, 1), T.cover)
-    # hairline highlight: a thin bright line inset toward the light
-    off = (T.vx * LIGHT[0] + T.vy * LIGHT[1]) / np.hypot(LIGHT[0], LIGHT[1]) / T.hw
-    hair = np.exp(-((off - 0.55) / 0.07) ** 2) * T.cover * (T.dc < T.hw)
-    cv.over(np.ones(3), 0.38 * np.clip(hair, 0, 1))
-    cv.add(0.22 * cv.blur(g * T.cover[..., None], 6))
-    cv.over(np.ones(3), 0.40 * flow_dots(T, rad=2.2))
-    caps(cv, T, glow=0.35)
-    cv.img = np.clip(cv.img, 0, 1)
-
-    # floor: mirror image below the baseline, fading out, plus a thin light pool
-    base_y = acy + R * sc + STROKE / 2 * sc + 3
-    yb = base_y * cv.k + cv.H / 2 - 0.5
-    rows = np.arange(cv.H)
-    src = np.rint(2 * yb - rows).astype(int)
-    ok = (rows > yb) & (src >= 0)
-    refl = np.zeros_like(cv.img)
-    refl[ok] = cv.img[src[ok]]
-    depth = np.clip((rows - yb) / (cv.k * 74.0), 0, 1)
-    fade = (0.30 * (1 - depth) ** 2.2) * ok
-    refl = cv.blur(refl, 1.3) * fade[:, None, None]
-    pool = np.exp(-(((cv.Y - base_y) / 2.2) ** 2)) * np.exp(-((cv.X / 82.0) ** 4))
-    cv.add(refl + 0.20 * pool[..., None] * lgrad((cv.X + 80) / 160.0))
-    return finish(cv, margin=0.05)
-
-
-STYLES = {
-    "classic": (classic, "flat gradient C ring with two white dots (as before)"),
-    "aura": (style_aura, "lit tube with layered bloom and depth"),
-    "wordmark": (style_wordmark, "mark above a geometric CONDUIT wordmark"),
-    "flow": (style_flow, "neon line art; light trails thread through the C"),
-    "emblem": (style_emblem, "mark inside a detailed instrument-dial emblem"),
-    "premium": (style_premium, "conic gradient, hairline highlight, floor reflection"),
-}
-
-
-def render(style, height=None):
-    fn = STYLES[style][0]
-    if style != "classic" and np is None:
-        sys.exit("make-logo.py: style '%s' needs numpy (pip install numpy)" % style)
-    return fn(height) if height else fn()
-
-
-# ---------------------------------------------------------------------------
-# previews
-# ---------------------------------------------------------------------------
-def mock_frame(logo, w, h):
-    """The logo centred on black, with a stand-in for Windows' boot spinner (a ring
-    of five dots about three quarters of the way down, centred)."""
-    frame = Image.new("RGB", (w, h), (0, 0, 0))
-    frame.paste(logo, ((w - logo.width) // 2, (h - logo.height) // 2))
-    d = ImageDraw.Draw(frame)
-    cx, cy, rad = w / 2, h * 0.75, h * 0.022
-    for i in range(5):
-        a = -math.pi / 2 + i * 2 * math.pi / 5 * 0.82
-        x, y, rr = cx + rad * math.cos(a), cy + rad * math.sin(a), h * (0.0075 - 0.0009 * i)
-        d.ellipse([x - rr, y - rr, x + rr, y + rr], fill=(255, 255, 255))
-    return frame
-
-
-def preview(outdir, styles):
-    from PIL import ImageFont
-    os.makedirs(outdir, exist_ok=True)
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
-    except OSError:
-        font = ImageFont.load_default()
-    wide, hd, crops = [], [], []
-    for name in styles:
-        logo = render(name)
-        for (w, h), tag, acc in (((5120, 1440), "5120x1440", wide), ((1920, 1080), "1920x1080", hd)):
-            fr = mock_frame(logo, w, h)
-            fr.save(os.path.join(outdir, "%s-%s.png" % (name, tag)))
-            acc.append((name, fr))
-        wfr = wide[-1][1]
-        crop = wfr.crop((5120 // 2 - 700, 1440 // 2 - 520, 5120 // 2 + 700, 1440 // 2 + 520))
-        crop.save(os.path.join(outdir, "%s-crop.png" % name))
-        print("%-9s %4dx%-4d BMP %7d bytes" % (name, logo.width, logo.height, logo.width * logo.height * 3 + 54))
-
-    def sheet(items, cols, cell_w, name):
-        ch = round(cell_w * items[0][1].height / items[0][1].width)
-        rows = -(-len(items) // cols)
-        gap, cap = 14, 38
-        sh = Image.new("RGB", (cols * cell_w + (cols + 1) * gap, rows * (ch + cap) + (rows + 1) * gap), (24, 24, 28))
-        d = ImageDraw.Draw(sh)
-        for i, (n, fr) in enumerate(items):
-            x = gap + (i % cols) * (cell_w + gap)
-            y = gap + (i // cols) * (ch + cap + gap)
-            sh.paste(fr.resize((cell_w, ch), Image.LANCZOS), (x, y + cap))
-            d.text((x + 4, y + 6), n, fill=(230, 230, 235), font=font)
-        sh.save(os.path.join(outdir, name))
-
-    sheet(wide, 2, 1280, "sheet.png")
-    sheet(hd, 3, 800, "sheet-1080p.png")
-    sheet([(n, Image.open(os.path.join(outdir, "%s-crop.png" % n))) for n, _ in wide], 3, 800, "sheet-crops.png")
-
-
 def main():
     ap = argparse.ArgumentParser(description="Render the Conduit firmware boot logo.")
-    ap.add_argument("out", nargs="?", help="output .bmp")
-    ap.add_argument("height", nargs="?", type=int, help="image height in pixels (default per style)")
-    ap.add_argument("--style", action="append", choices=list(STYLES), help="design (default: classic)")
-    ap.add_argument("--list", action="store_true", help="list the styles")
-    ap.add_argument("--preview", metavar="DIR", help="write mock boot screens and contact sheets to DIR")
+    ap.add_argument("out", help="output .bmp")
+    ap.add_argument("height", nargs="?", type=int, default=480, help="image height in pixels (default 480)")
     a = ap.parse_args()
-    if a.list:
-        for n, (_, desc) in STYLES.items():
-            print("%-9s %s" % (n, desc))
-        return
-    if a.preview:
-        preview(a.preview, a.style or list(STYLES))
-        return
-    if not a.out:
-        ap.error("OUT.bmp is required")
-    style = (a.style or ["classic"])[0]
-    render(style, a.height).save(a.out, format="BMP")
+    logo(a.height).save(a.out, format="BMP")
 
 
 if __name__ == "__main__":
