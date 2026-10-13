@@ -73,6 +73,12 @@ jobs:
         if: steps.gen.outputs.changed == 'true'
         working-directory: host/backend
         run: cargo fmt --all
+      - name: Refresh the escape-size fixture
+        # fixtures/escape_sizes.tsv is the versions tables written out for the
+        # guest's C test; a new release adds its rows.
+        if: steps.gen.outputs.changed == 'true'
+        working-directory: host/backend
+        run: UPDATE_FIXTURES=1 cargo test --locked -p abi escape_size
       - name: Test tables and backend
         id: test
         if: steps.gen.outputs.changed == 'true'
@@ -113,6 +119,7 @@ jobs:
           add-paths: |
             cli/src/host.rs
             host/backend/gen/src/**
+            host/backend/gen/fixtures/escape_sizes.tsv
             guest/linux/rmctrl/**
             guest/linux/devinfo/**
             guest/linux/gen/**

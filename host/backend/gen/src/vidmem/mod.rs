@@ -257,14 +257,16 @@ mod tests {
     }
 
     /// HEAP_RECLAIMABLE is the index the fork found moving. Here it arrives
-    /// with 595.99.02, and earlier releases must say it is absent rather
+    /// with 595.80 (0x3c; open-gpu-kernel-modules tags 595.58.03 and
+    /// 595.71.05 do not have it, 595.80, 595.84, 595.91.07, 595.99.02 and
+    /// 595.104.02 do), and earlier releases must say it is absent rather
     /// than leave a clamp to guess. The 610 branch forked before it landed
     /// and does not have it either; it returns with 615.
     #[test]
-    fn heap_reclaimable_is_absent_before_595_99() {
+    fn heap_reclaimable_is_absent_before_595_80() {
         for (v, l) in all() {
             let has = l.index("HEAP_RECLAIMABLE").is_some();
-            let expected = v >= DriverVersion::new(595, 99, 2) && v.major != 610;
+            let expected = v >= DriverVersion::new(595, 80, 0) && v.major != 610;
             assert_eq!(has, expected, "{v}");
         }
     }
