@@ -160,6 +160,21 @@ report:
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
+# Build identity for --version, from packaging/build-id.sh (which documents
+# the fields; a tree without it, like the Nix source, takes the same
+# environment variables). build_id.h is rewritten only when the identity
+# changes, so a rebuild at the same commit compiles nothing.
+BUILD_ID := $(shell sh $(CURDIR)/../../packaging/build-id.sh 2>/dev/null | sed -n 's/^id=//p')
+ifeq ($(BUILD_ID),)
+BUILD_ID := $(or $(CONDUIT_VERSION),0.0.0) (git $(or $(CONDUIT_GIT_COMMIT),unknown), $(or $(CONDUIT_BUILD_KIND),local))
+endif
+build_id.h: FORCE
+	@printf '#define CONDUIT_BUILD_ID "%s"\n' '$(BUILD_ID)' > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+nvkvm_broker.o: build_id.h
+.PHONY: FORCE
+FORCE:
+
 # Generated Wayland protocol glue.  Every .o depends on the headers because
 # they are generated, and make has no way to know that otherwise.
 $(OBJS): $(if $(HAVE_WL),$(WL_HDRS),)
@@ -278,5 +293,5 @@ install: $(BIN)
 	install -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
 
 clean:
-	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d \
+	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d build_id.h \
 	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test/utf8_extracted.inc

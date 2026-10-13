@@ -26,6 +26,7 @@ const GPU_SHM_BAR: usize = 2;
 
 const USAGE: &str = "Usage:
   conduit-vmm <config.json>       run a VM (normally started by `conduit up`)
+  conduit-vmm --version           print the version and build
 
 Host networking -- the tap the guest attaches to, and NAT -- is set up
 separately by `conduit up`. conduit-vmm opens a tap that already
@@ -68,6 +69,10 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("conduit-vmm {}", env!("CONDUIT_BUILD_ID"));
+        return Ok(());
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
         return Ok(());

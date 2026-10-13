@@ -87,7 +87,7 @@ const _: () = assert!(CURSOR_QUEUE == NUM_QUEUES);
 const RESP_MAX: usize = 64 * 1024;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Conduit GPU backend (vhost-user)")]
+#[command(version = env!("CONDUIT_BUILD_ID"), about = "Conduit GPU backend (vhost-user)")]
 struct Args {
     /// Unix socket QEMU connects to.
     #[arg(long, default_value = "/tmp/nvgpu.sock")]

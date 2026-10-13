@@ -73,7 +73,7 @@ conduit/
 | `conduit_X-1_amd64.deb` | Ubuntu, Debian, Mint, Pop!_OS | in an Ubuntu 24.04 container |
 | `conduit-X-1.x86_64.rpm` | Fedora, RHEL, openSUSE | in a Fedora container |
 | `conduit-X-1-x86_64.pkg.tar.zst` | Arch, Manjaro | in an Arch container (+ `PKGBUILD` for the AUR) |
-| `conduit-X-x86_64-linux.tar.gz` | everything else | backend, VMM and CLI static (musl); viewer, stream host and QEMU with their libraries (built on Debian 12); `install.sh` |
+| `conduit-X-x86_64-linux.tar.gz` | everything else | CLI static (musl), backend and VMM against glibc 2.34+; viewer, stream host and QEMU with their libraries (built on Debian 12); `install.sh` |
 | `conduit-guest_X-1_all.deb` / `conduit-guest-X-1.noarch.rpm` / `conduit-guest-X-1-any.pkg.tar.zst` | inside the VM | DKMS source package for the guest module (the Arch one is what `conduit attach` installs on Arch-based guests) |
 | `conduit-bios_B-1_all.deb` / `conduit-bios-B-x86_64.tar.gz` | Ubuntu host, optional | Conduit BIOS: edk2 OVMF with the Conduit boot logo, for `conduit attach` (B = edk2 build + revision, `packaging/bios/version.sh`; bios.yml, cached) |
 | `flake.nix` | NixOS | in the repo |

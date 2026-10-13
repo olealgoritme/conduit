@@ -38,7 +38,7 @@ mod tests {
 #[derive(Parser)]
 #[command(
     name = "conduit-stream",
-    version,
+    version = env!("CONDUIT_BUILD_ID"),
     about = "Stream a Conduit VM to Moonlight and Conduit viewers (NVENC)"
 )]
 struct Cli {

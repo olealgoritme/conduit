@@ -1,8 +1,9 @@
 # Release: on a v* tag, build every artifact in docs/STRUCTURE.md and attach
 # them to a GitHub Release. All builds go through packaging/build.sh.
 #
-#   rust-static  backend, VMM and CLI as static musl binaries, built once and
-#                shared by every package (they have no runtime dependencies)
+#   rust-static  the CLI as a static musl binary, the backend and VMM against
+#                glibc (no newer than Debian 12's, build.sh checks), built
+#                once and shared by every package
 #   host         per-format container: viewer, stream host, Venus renderer
 #                (conduit-venus + its virglrenderer, from the host/venus
 #                submodules) and bundled QEMU 11.1 (cached), staged and
@@ -46,7 +47,7 @@ jobs:
             .
             host/backend
             host/vmm
-      - name: Build static binaries
+      - name: Build backend, VMM and CLI
         run: RUST_TARGET=x86_64-unknown-linux-musl packaging/build.sh rust
       - uses: actions/upload-artifact@v4
         with:

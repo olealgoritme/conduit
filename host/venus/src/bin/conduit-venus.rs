@@ -27,6 +27,7 @@ fn usage() -> ExitCode {
         "usage: conduit-venus --socket PATH [--vm NAME] [--no-sandbox] [--no-direct-fences] [--cpus LIST] [--fence-spin-us N]"
     );
     eprintln!("       conduit-venus --sandbox-selftest [--vm NAME]");
+    eprintln!("       conduit-venus --version");
     ExitCode::from(2)
 }
 
@@ -59,6 +60,10 @@ fn main() -> ExitCode {
             },
             Some("-h" | "--help") => {
                 usage();
+                return ExitCode::SUCCESS;
+            }
+            Some("-V" | "--version") => {
+                println!("conduit-venus {}", env!("CONDUIT_BUILD_ID"));
                 return ExitCode::SUCCESS;
             }
             _ => return usage(),

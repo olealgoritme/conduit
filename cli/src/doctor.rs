@@ -845,6 +845,8 @@ fn collect_host(r: &mut Report) {
             "Reinstall the conduit package (in a source checkout: host/qemu/build-qemu.sh)",
         ),
     }
+    build_lines(r);
+
     if !sys::have("virsh") {
         r.line(
             Level::Ok,
@@ -881,6 +883,82 @@ fn collect_host(r: &mut Report) {
             "Only needed for `conduit trace NAME latency` (docs/TRACING.md \"Latency capture\")."
         },
     );
+}
+
+/// Which build each of Conduit's binaries comes from (`--version`,
+/// packaging/build-id.sh), and a warning for any that is not from the same
+/// build as this CLI: a mix of a release and a local build, or of two
+/// commits, is one nobody tested.
+fn build_lines(r: &mut Report) {
+    use crate::buildid::{self, Id};
+    let own = Id::own();
+    let hint = "Install every part from one build: one release's package, or `make install` \
+                in one checkout.";
+    r.line(Level::Ok, "Build: conduit", &own.to_string(), "");
+    let version_of = |p: &Path| {
+        sys::output_within(
+            &p.to_string_lossy(),
+            &["--version"],
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap_or_default()
+    };
+    let parts = [
+        (Tool::Backend, "conduit-backend"),
+        (Tool::Userspace, "conduit-userspace"),
+        (Tool::Viewer, "conduit-viewer"),
+        (Tool::Vmm, "conduit-vmm"),
+        (Tool::Venus, "conduit-venus"),
+        (Tool::Stream, "conduit-stream"),
+    ];
+    for (t, name) in parts {
+        let Some(p) = t.find() else { continue };
+        let title = format!("Build: {name}");
+        match Id::parse(&version_of(&p)) {
+            Some(id) if id.same_build(&own) => r.line(Level::Ok, &title, &id.to_string(), ""),
+            Some(id) => r.line(
+                Level::Warn,
+                &title,
+                &format!("{id} ({}), not the build of this conduit", p.display()),
+                hint,
+            ),
+            None => r.line(
+                Level::Warn,
+                &title,
+                &format!(
+                    "{} names no build (built before build identities)",
+                    p.display()
+                ),
+                hint,
+            ),
+        }
+    }
+    if let Some(q) = Tool::BundledQemu.find() {
+        let title = "Build: QEMU";
+        match buildid::parse_qemu(&version_of(&q)) {
+            Some((id, patches)) => {
+                let what = format!("{id}, patches {patches}");
+                match buildid::qemu_mismatch(&id, &patches, &own, buildid::QEMU_PATCHES) {
+                    None => r.line(Level::Ok, title, &what, ""),
+                    Some(why) => r.line(
+                        Level::Warn,
+                        title,
+                        &format!("{what} ({}): {why}", q.display()),
+                        hint,
+                    ),
+                }
+            }
+            None => r.line(
+                Level::Warn,
+                title,
+                &format!(
+                    "{} names no Conduit build (built before build identities, or not Conduit's QEMU)",
+                    q.display()
+                ),
+                hint,
+            ),
+        }
+    }
 }
 
 pub fn run() -> i32 {
