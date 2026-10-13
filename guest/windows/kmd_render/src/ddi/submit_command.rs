@@ -1837,6 +1837,24 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
 
 // ── Render-path DDIs. ───────────────────────────────────────────────────────
 
+/// The WDDM context a fence-carrying packet belongs to, as the RM gate table keys it: its
+/// token (`ContextHandleRef::token`, 0 = unknown: the process's shared gate) and the
+/// execution stream it already bound (0 = none).
+#[derive(Clone, Copy)]
+struct GateKey {
+    context: usize,
+    bound: u32,
+}
+
+impl GateKey {
+    fn of(context: Option<&crate::device::ContextHandleRef<'_>>) -> Self {
+        context.map_or(Self { context: 0, bound: 0 }, |c| Self {
+            context: c.token(),
+            bound: c.execution_stream(),
+        })
+    }
+}
+
 /// Carrier (b) of `docs/rm-fence-marker.md`: take the RM fence a present record names
 /// over for the KMD and turn it into the marker the Render stashes. Ownership is
 /// "a fence created in the presenting context's process"; a refusal attaches nothing
@@ -1848,6 +1866,7 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
 fn attach_rm_fence_marker(
     adapter: &AdapterContext,
     process: usize,
+    gate_key: GateKey,
     tail: &helios_protocol::HeliosRmFenceTail,
 ) -> Result<crate::adapter::PresentStreamMarker, crate::virtio::gpu::GateRefusal> {
     use crate::virtio::gpu::GateRefusal;
@@ -1855,7 +1874,9 @@ fn attach_rm_fence_marker(
         crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
         return Err(GateRefusal::NotFence);
     }
-    let attached = match adapter.with_virtio(|v| v.rm_gate_attach(tail.rm_fence_handle, process)) {
+    let attached = match adapter.with_virtio(|v| {
+        v.rm_gate_attach(tail.rm_fence_handle, process, gate_key.context, gate_key.bound)
+    }) {
         Ok(Ok(attached)) => attached,
         Ok(Err(why)) => return Err(why),
         Err(_) => return Err(GateRefusal::Unsupported),
@@ -1921,9 +1942,10 @@ fn take_fence_tail(
 fn attach_or_take_fence_tail(
     adapter: &AdapterContext,
     process: usize,
+    gate_key: GateKey,
     tail: &helios_protocol::HeliosRmFenceTail,
 ) -> Option<crate::adapter::PresentStreamMarker> {
-    match attach_rm_fence_marker(adapter, process, tail) {
+    match attach_rm_fence_marker(adapter, process, gate_key, tail) {
         Ok(marker) => Some(marker),
         Err(_) => {
             take_fence_tail(adapter, Some(process), tail);
@@ -2016,7 +2038,7 @@ unsafe fn flush_gate_record(
             .with_virtio(|v| v.flush_stream_marker_boundary(ctx_id, value, cookie, process))
             .ok()
             .flatten(),
-        Carrier::Fence => attach_or_take_fence_tail(adapter, process, &tail)
+        Carrier::Fence => attach_or_take_fence_tail(adapter, process, GateKey::of(context), &tail)
             .map(|marker| marker.rm_boundary)
             .filter(|boundary| *boundary != 0),
     };
@@ -2240,14 +2262,17 @@ pub unsafe extern "C" fn dxgkddi_render(
                 // Attaching is irreversible, and this call's status is what the UMD
                 // sees (a refusal leaves the handle the caller's), so everything
                 // below that can still refuse is checked BEFORE the fence is taken:
-                // the context's last bound stream must be this process's gate (or
-                // none yet), which is all `bind_execution_stream` and the record
-                // merge look at (point numbers of a gate only grow).
+                // the context's last bound stream must be the gate this point goes to
+                // (or none yet), which is all `bind_execution_stream` and the record
+                // merge look at (point numbers of a gate only grow). The gate is the
+                // context's own (`rm_gates.rs`): this queue's points never wait for
+                // another queue's.
+                let gate_key = GateKey::of(Some(context));
                 let bindable = adapter
                     .with_virtio(|v| {
                         helios_kmd_logic::execution_completion::may_bind_stream(
-                            context.execution_stream(),
-                            v.rm_gate_stream_handle(process),
+                            gate_key.bound,
+                            v.rm_gate_stream_handle(process, gate_key.context, gate_key.bound),
                         )
                     })
                     .unwrap_or(false);
@@ -2255,7 +2280,7 @@ pub unsafe extern "C" fn dxgkddi_render(
                     crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
-                let marker = attach_rm_fence_marker(adapter, process, &v4.fence).ok()?;
+                let marker = attach_rm_fence_marker(adapter, process, gate_key, &v4.fence).ok()?;
                 (marker.rm_boundary, 0)
             } else {
                 let command = if cmd_len == size_of::<helios_protocol::HeliosD3D12SubmitCmd>() {
@@ -2459,7 +2484,14 @@ pub unsafe extern "C" fn dxgkddi_render(
                 } else if let Some(tail) = fence_tail {
                     if stream_tail_zero {
                         let marker = creator
-                            .and_then(|process| attach_or_take_fence_tail(adapter, process, &tail));
+                            .and_then(|process| {
+                                attach_or_take_fence_tail(
+                                    adapter,
+                                    process,
+                                    GateKey::of(context.as_ref()),
+                                    &tail,
+                                )
+                            });
                         if let Some(context) = context.as_ref() {
                             // The copy-engine record behind the tail (168-byte form, M3c-0):
                             // parsed, counted, stashed beside the fence; it changes nothing above.
@@ -2667,7 +2699,12 @@ pub unsafe extern "C" fn dxgkddi_render(
                                 && private.present_cookie == 0;
                             if stream_tail_zero {
                                 let marker = creator.and_then(|process| {
-                                    attach_or_take_fence_tail(adapter, process, &tail)
+                                    attach_or_take_fence_tail(
+                                        adapter,
+                                        process,
+                                        GateKey::of(context.as_ref()),
+                                        &tail,
+                                    )
                                 });
                                 if let Some(context) = context.as_ref() {
                                     // The copy-engine record behind the tail (192-byte form,

@@ -179,7 +179,7 @@ struct HeliosRmFenceTail {
   `HELIOS_NVRM_CAP_PRESENT_FENCE`. `HE12` is carrier (a)-like: the UMD sees `Render`'s
   status, so every refusal leaves the handle the caller's, and everything that can
   still refuse is checked BEFORE the fence is taken: a context's last bound stream must
-  be this process's gate (or none yet; a context that mixed stream and fence `HE12`s is
+  be the gate this point goes to (or none yet; a context that mixed stream and fence `HE12`s is
   refused up front, not after the take), and `Render`'s own argument checks (patch
   lists) come before any parsing of tails.
 * **Refusal rule for `HERF` / `HEPR` (the UMD cannot see it).** Their `Render` returns
@@ -213,14 +213,29 @@ struct HeliosRmFenceTail {
   stays in the existing tagged stream namespace (bit 63 set, generation-qualified 31-bit
   handle, 32-bit value), so every consumer of boundaries keeps working unchanged:
   `merge_stream_boundary`, the windowed-blit and fast-bind staging, `execution_completion`
-  waits, dead-stream discharge. The handle names a per-process "RM gate", a slot of the
+  waits, dead-stream discharge. The handle names a per-context "RM gate", a slot of the
   present-stream table with no Venus context (`ctx_id = 0`, `cookie = 0`, so no marker or
   tag can name it) whose "retired value" is advanced by fences instead of used-ring
   responses. Each attached fence takes the gate's next point `p = 1, 2, ...`; the
   boundary is `encode(gate_handle, p)`. A point is ready when it and every earlier point
   of the gate fired (prefix retirement, so a merged DMA buffer carrying two presents of
-  one process waits for both, and an out-of-order fire never lets a later point read as
+  one context waits for both, and an out-of-order fire never lets a later point read as
   retired before an earlier one).
+* **One gate per WDDM context.** A gate is keyed by the context's `hKmdProcess` and its
+  `hContext`. dxgkrnl dispatches each context's queue on its own, so a gate shared by two
+  contexts (two D3D12 queues of one process, both on node 0) could hold a dispatched
+  packet behind the point of an earlier-rendered packet of the other context that has
+  no hardware-queue slot yet; with two slots per node that deadlocks until dxgkrnl's
+  starvation preemption (whole clock ticks). Per context, the prefix only enforces the
+  order dxgkrnl already imposes on that context. Ordering between contexts is the
+  runtime's: a queue that consumes another queue's work waits on a monitored fence,
+  which dxgkrnl releases only after the producer's DMA fence, i.e. after the producer's
+  point fired. A present's point is in the gate of the context that presents. With no
+  gate entry or stream slot free, a context shares a gate of its own process (it becomes
+  the process's gate, counted `RmGShare`) before it is refused; an `HE12` context keeps
+  the gate its execution stream bound. A context's gate is purged at `DestroyContext`,
+  a shared one at `DestroyProcess`
+  (`kmd_logic::rm_fence_present::pick_gate`).
 * **Two handles in one DMA buffer.** The private record carries ONE boundary, and a
   process can now put two handles in a buffer (a gate and a registered stream: a fenced
   present beside the CPU-complete marker `(ctx, 0, cookie)`, or a stream beside a
@@ -241,10 +256,10 @@ struct HeliosRmFenceTail {
   pass re-evaluates the WDDM FIFO head, the deferred fast bind and the windowed blit, all
   of which read `scanout_boundary_ready`. The handle is queued for a host `Close` that the
   HPD worker sends (PASSIVE).
-* **Limits.** 8 gates (processes), 128 unretired points per gate (a D3D12 app with more
+* **Limits.** 32 gates (contexts), 128 unretired points per gate (a D3D12 queue with more
   `ExecuteCommandLists` in flight than that has its next v4 record refused: the UMD then
   falls back to a CPU wait plus the `COMPLETE` variant), and a gate refuses past 2^32 - 1025
-  points (about 49 days at 1000 presents/s; it is recycled when its process exits). The
+  points (about 49 days at 1000 presents/s; it is recycled when its context or process goes). The
   KMD holds at most 512 fence handles as its own at a time (attached or owed a close,
   `MAX_NVRM_ATTACHED_FENCES`): a fence leaves its creator's 128-per-process quota when
   the KMD takes it and is counted there instead, so attached fences can neither fill the
@@ -282,7 +297,7 @@ A pending fence of an attached present is released by every path that ends the p
 |---|---|---|
 | fires (any status) | retires | closed by the HPD worker |
 | (a) source released / DRM file closed / device destroyed / process exit / lapse | queued flips dropped unsent | closed (queued for the worker) |
-| (b) device destroyed / process exit | the process's gate is purged like a stream whose owner died: waits that named it are discharged and counted (`RmGCan`), so no DMA fence stays pinned behind a dead process | closed |
+| (b) context destroyed / process exit | the context's gate (at process exit: every gate of the process) is purged like a stream whose owner died: waits that named it are discharged and counted (`RmGCan`), so no DMA fence stays pinned behind a dead process | closed |
 | transport lost or reset (`StopDevice`, TDR reset, failure) | gates and queued flips are purged exactly like Venus streams (`purge_all_present_streams`): the present's wait is DISCHARGED, never treated as satisfied, and counted | the sweep closes every handle on the host (`close_all_on_host`) |
 
 The retire-on-teardown for (b) follows the existing dead-stream rule: a purged stream is
