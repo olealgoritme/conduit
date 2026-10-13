@@ -343,6 +343,72 @@ static void test_fractional(void)
     }
 }
 
+/*
+ * THE BARS.  Everything in the window outside the drawn picture is the
+ * backend's opaque black background, so the background must exist whenever
+ * the picture leaves a pixel uncovered, and the picture must never reach
+ * outside the window it is drawn in (it would hang off the background).
+ * Checked pixel by pixel on small windows, including a fullscreen window at
+ * a non-native guest mode, for every scale mode, area and output scale.
+ */
+static void test_bars(void)
+{
+    static const unsigned scales[] = { 120, 150, 240 };
+    static const int modes[] = { NB_SCALE_ASPECT, NB_SCALE_STRETCH,
+                                 NB_SCALE_INTEGER, NB_SCALE_NONE };
+    static const int areas[] = { NB_AREA_FULL, NB_AREA_21_9, NB_AREA_16_9,
+                                 NB_AREA_16_10, NB_AREA_4_3 };
+    static const int wins[][2] = { { 512, 144 }, { 192, 108 }, { 160, 90 },
+                                   { 97, 61 } };
+    static const int guests[][2] = { { 512, 144 }, { 192, 108 }, { 128, 96 },
+                                     { 336, 144 }, { 80, 60 }, { 640, 480 } };
+    unsigned si, mi, ai, wi, gi;
+
+    for (si = 0; si < sizeof(scales) / sizeof(scales[0]); si++)
+    for (mi = 0; mi < sizeof(modes) / sizeof(modes[0]); mi++)
+    for (ai = 0; ai < sizeof(areas) / sizeof(areas[0]); ai++)
+    for (wi = 0; wi < sizeof(wins) / sizeof(wins[0]); wi++)
+    for (gi = 0; gi < sizeof(guests) / sizeof(guests[0]); gi++) {
+        struct nb_view v = view(modes[mi], areas[ai]);
+        struct nb_place p;
+        int ww = wins[wi][0], wh = wins[wi][1], x, y, uncovered = 0;
+        char what[96];
+
+        snprintf(what, sizeof(what), "s%u %s area%d win %dx%d guest %dx%d",
+                 scales[si], nb_view_scale_name(modes[mi]), areas[ai], ww, wh,
+                 guests[gi][0], guests[gi][1]);
+        nb_view_place(&v, guests[gi][0], guests[gi][1], ww, wh, scales[si],
+                      &p);
+        CHECK(p.vis.w > 0 && p.vis.h > 0 && p.vis.x >= 0 && p.vis.y >= 0 &&
+              p.vis.x + p.vis.w <= ww && p.vis.y + p.vis.h <= wh,
+              "%s: picture %d,%d %dx%d outside the window", what, p.vis.x,
+              p.vis.y, p.vis.w, p.vis.h);
+        for (y = 0; y < wh; y++) {
+            for (x = 0; x < ww; x++) {
+                if (x < p.vis.x || y < p.vis.y || x >= p.vis.x + p.vis.w ||
+                    y >= p.vis.y + p.vis.h) {
+                    uncovered++;
+                }
+            }
+        }
+        CHECK(nb_view_has_bars(&p, ww, wh) == (uncovered > 0),
+              "%s: has_bars %d but %d uncovered pixels", what,
+              nb_view_has_bars(&p, ww, wh), uncovered);
+    }
+    {
+        /* The reported case: fullscreen 5120x1440, a 21:9 area, a 16:9
+         * guest -- bars on both sides, so the background is needed. */
+        struct nb_view v = view(NB_SCALE_ASPECT, NB_AREA_21_9);
+        struct nb_place p;
+
+        nb_view_place(&v, 1920, 1080, 5120, 1440, 120, &p);
+        CHECK(nb_view_has_bars(&p, 5120, 1440), "21:9 area on 5120x1440");
+        v = view(NB_SCALE_ASPECT, NB_AREA_FULL);
+        nb_view_place(&v, 5120, 1440, 5120, 1440, 120, &p);
+        CHECK(!nb_view_has_bars(&p, 5120, 1440), "native fullscreen: none");
+    }
+}
+
 static void test_guest_mode(void)
 {
     struct nb_view v = view(NB_SCALE_ASPECT, NB_AREA_FULL);
@@ -607,10 +673,10 @@ static void test_rules(void)
           "file has the base layout");
     CHECK(!back.ruled, "a loaded store starts with no rule in force");
 
-    /* Delete: the one in force keeps its layout until the next change. */
+    /* Delete the one in force: back to the default at once. */
     nb_vstore_rule_delete(&st, nb_vstore_rule_find(&st, 1280, 960));
     CHECK(st.nrule == 1 && nb_vstore_rule_find(&st, 1280, 960) < 0, "deleted");
-    CHECK(st.cur.scale == NB_SCALE_STRETCH, "layout kept for now");
+    CHECK(st.cur.scale == st.base.scale && !st.ruled, "default again");
 
     /* Malformed lines are skipped; duplicates too. */
     nb_vstore_init(&back);
@@ -618,6 +684,134 @@ static void test_rules(void)
                            "rule=800x600|scale=stretch\nrule=800x600|scale=none\n");
     CHECK(back.nrule == 1 && back.rule[0].v.scale == NB_SCALE_STRETCH,
           "one good rule");
+}
+
+/*
+ * AUTOMATIC RULES: the user's case.  Desktop at 5120x1440, CS2 at 1600x900
+ * with Stretch + 21:9; each change is remembered for the mode in force.
+ */
+static void test_auto_rules(void)
+{
+    struct nb_vstore st, back;
+    char label[96], buf[4096];
+    unsigned ch;
+
+    nb_vstore_init(&st);
+    /* Before any frame: an edit is the default, nothing remembered. */
+    st.cur.scale = NB_SCALE_ASPECT;
+    CHECK(!nb_vstore_auto_rule(&st) && st.nrule == 0, "no mode, no rule");
+
+    /* Desktop: the default applies, nothing to say. */
+    ch = nb_vstore_guest_mode(&st, 5120, 1440, label, sizeof(label));
+    CHECK(ch == 0 && !label[0] && st.base_set, "desktop, default");
+
+    /* CS2 starts: 1600x900, still the default. */
+    nb_vstore_guest_mode(&st, 1600, 900, label, sizeof(label));
+    CHECK(!st.ruled && st.cur.scale == NB_SCALE_ASPECT, "1600x900 default");
+    /* The user picks Stretch and 21:9 (two changes, each remembered). */
+    st.cur.scale = NB_SCALE_STRETCH;
+    CHECK(nb_vstore_auto_rule(&st), "stretch remembered");
+    st.cur.area = NB_AREA_21_9;
+    CHECK(nb_vstore_auto_rule(&st), "21:9 remembered");
+    CHECK(st.nrule == 1 && st.rule[0].w == 1600 && st.rule[0].h == 900 &&
+          st.rule[0].v.scale == NB_SCALE_STRETCH &&
+          st.rule[0].v.area == NB_AREA_21_9, "one rule for 1600x900");
+    CHECK(!nb_vstore_auto_rule(&st), "unchanged: nothing to store");
+    CHECK(st.base.scale == NB_SCALE_ASPECT && st.base.area == NB_AREA_FULL,
+          "the default untouched");
+
+    /* Back to the desktop: the default, said once. */
+    ch = nb_vstore_guest_mode(&st, 5120, 1440, label, sizeof(label));
+    CHECK(ch == NB_VIEW_CH_LAYOUT && st.cur.scale == NB_SCALE_ASPECT &&
+          st.cur.area == NB_AREA_FULL, "desktop back to the default");
+    CHECK(strstr(label, "5120x1440") && strstr(label, "(default)"),
+          "label %s", label);
+    /* A change on the desktop is the desktop's own. */
+    st.cur.filter = NB_FILTER_NEAREST;
+    CHECK(nb_vstore_auto_rule(&st) && st.nrule == 2, "desktop rule");
+
+    /* CS2 again: its rule on the mode's first frame, with the notice. */
+    ch = nb_vstore_guest_mode(&st, 1600, 900, label, sizeof(label));
+    CHECK(ch == NB_VIEW_CH_LAYOUT && st.cur.scale == NB_SCALE_STRETCH &&
+          st.cur.area == NB_AREA_21_9 && st.cur.filter == NB_FILTER_LINEAR,
+          "1600x900 restored");
+    CHECK(!strcmp(label, "1600x900: Stretch 21:9 (remembered)"), "label %s",
+          label);
+    /* A mode never seen: the default. */
+    nb_vstore_guest_mode(&st, 1920, 1080, label, sizeof(label));
+    CHECK(st.cur.scale == NB_SCALE_ASPECT && st.cur.filter ==
+          NB_FILTER_LINEAR && !st.ruled, "unknown mode: default");
+
+    /* Persisted: the default on top, the rules below; read back, the same
+     * switches give the same pictures. */
+    CHECK(nb_vstore_format(&st, buf, sizeof(buf)) < sizeof(buf), "fits");
+    CHECK(strstr(buf, "scale=fit\n") && strstr(buf, "rule=1600x900|"),
+          "file: %s", buf);
+    nb_vstore_init(&back);
+    nb_vstore_parse(&back, buf);
+    nb_vstore_guest_mode(&back, 5120, 1440, NULL, 0);
+    CHECK(back.cur.filter == NB_FILTER_NEAREST && back.cur.scale ==
+          NB_SCALE_ASPECT, "desktop after a restart");
+    nb_vstore_guest_mode(&back, 1600, 900, NULL, 0);
+    CHECK(back.cur.scale == NB_SCALE_STRETCH && back.cur.area == NB_AREA_21_9,
+          "1600x900 after a restart");
+    nb_vstore_guest_mode(&back, 2560, 1440, NULL, 0);
+    CHECK(back.cur.scale == NB_SCALE_ASPECT && back.cur.area == NB_AREA_FULL,
+          "other mode after a restart");
+
+    /* Setting the default's layout again drops the mode's rule. */
+    nb_vstore_guest_mode(&st, 1600, 900, NULL, 0);
+    st.cur.scale = NB_SCALE_ASPECT;
+    st.cur.area = NB_AREA_FULL;
+    CHECK(nb_vstore_auto_rule(&st) &&
+          nb_vstore_rule_find(&st, 1600, 900) < 0 && !st.ruled,
+          "back to the default: rule dropped");
+
+    /* Reset in a remembered mode forgets it; in a default one resets the
+     * default. */
+    st.cur.scale = NB_SCALE_STRETCH;
+    nb_vstore_auto_rule(&st);
+    ch = nb_view_reset(&st, label, sizeof(label));
+    CHECK(nb_vstore_rule_find(&st, 1600, 900) < 0 &&
+          st.cur.scale == NB_SCALE_ASPECT, "reset forgets: %s", label);
+
+    /* Make default: the current layout for every mode without a rule. */
+    st.cur.scale = NB_SCALE_INTEGER;
+    nb_vstore_auto_rule(&st);
+    nb_vstore_make_default(&st);
+    CHECK(st.base.scale == NB_SCALE_INTEGER &&
+          nb_vstore_rule_find(&st, 1600, 900) < 0, "made default");
+    nb_vstore_guest_mode(&st, 1280, 720, NULL, 0);
+    CHECK(st.cur.scale == NB_SCALE_INTEGER, "default used elsewhere");
+
+    /* A full table: the oldest rule goes. */
+    nb_vstore_init(&st);
+    for (unsigned i = 0; i < NB_MAX_RULES + 2; i++) {
+        nb_vstore_guest_mode(&st, 1000 + i, 700, NULL, 0);
+        st.cur.scale = NB_SCALE_STRETCH;
+        nb_vstore_auto_rule(&st);
+    }
+    CHECK(st.nrule == NB_MAX_RULES && nb_vstore_rule_find(&st, 1000, 700) < 0
+          && nb_vstore_rule_find(&st, 1000 + NB_MAX_RULES + 1, 700) >= 0,
+          "oldest evicted");
+
+    /* A profile for another mode: its layout waits for that mode. */
+    nb_vstore_init(&st);
+    nb_vstore_guest_mode(&st, 5120, 1440, NULL, 0);
+    st.cur.scale = NB_SCALE_STRETCH;
+    st.cur.area = NB_AREA_21_9;
+    st.cur.res_w = 1600;
+    st.cur.res_h = 900;
+    nb_vstore_profile_save(&st, "cs2");
+    st.cur = st.base;
+    st.cur.res_w = st.cur.res_h = 0;
+    nb_vstore_profile_load(&st, 0);
+    CHECK(st.cur.scale == NB_SCALE_ASPECT && st.cur.res_w == 1600,
+          "desktop keeps its picture, the mode hint changes");
+    CHECK(!nb_vstore_auto_rule(&st), "nothing stored for the desktop");
+    nb_vstore_guest_mode(&st, 1600, 900, NULL, 0);
+    CHECK(st.cur.scale == NB_SCALE_STRETCH && st.cur.area == NB_AREA_21_9,
+          "the profile's layout on 1600x900's first frame");
 }
 
 static void test_modes(void)
@@ -680,8 +874,53 @@ static void test_modes(void)
     }
 }
 
+static void test_sync(void)
+{
+    struct nb_vstore st;
+    char buf[4096];
+    int v = -1;
+
+    CHECK(nb_sync_parse("fullscreen", &v) == 0 && v == NB_SYNC_FULLSCREEN,
+          "sync parse fullscreen");
+    CHECK(nb_sync_parse("auto", &v) == 0 && v == NB_SYNC_FULLSCREEN,
+          "sync parse auto");
+    CHECK(nb_sync_parse("immediate", &v) == 0 && v == NB_SYNC_IMMEDIATE,
+          "sync parse immediate");
+    CHECK(nb_sync_parse("tearing", &v) == 0 && v == NB_SYNC_IMMEDIATE,
+          "sync parse tearing");
+    CHECK(nb_sync_parse("vsync", &v) == 0 && v == NB_SYNC_VSYNC,
+          "sync parse vsync");
+    CHECK(nb_sync_parse("sometimes", &v) == -1, "sync parse junk");
+    for (int i = 0; i < NB_SYNC_COUNT; i++) {
+        CHECK(nb_sync_parse(nb_sync_name(i), &v) == 0 && v == i,
+              "sync name round trip %d", i);
+    }
+    /* Immediate in fullscreen only by default; vsync never; immediate always. */
+    CHECK(nb_sync_immediate(NB_SYNC_FULLSCREEN, true), "default fs immediate");
+    CHECK(!nb_sync_immediate(NB_SYNC_FULLSCREEN, false), "default windowed vsync");
+    CHECK(nb_sync_immediate(NB_SYNC_IMMEDIATE, false), "immediate windowed");
+    CHECK(!nb_sync_immediate(NB_SYNC_VSYNC, true), "vsync fullscreen");
+
+    /* Stored per VM; the default writes nothing, so old files stay as they were. */
+    nb_vstore_init(&st);
+    CHECK(st.sync == NB_SYNC_FULLSCREEN, "store default sync");
+    nb_vstore_format(&st, buf, sizeof(buf));
+    CHECK(!strstr(buf, "sync="), "default sync not written");
+    st.sync = NB_SYNC_VSYNC;
+    nb_vstore_format(&st, buf, sizeof(buf));
+    CHECK(strstr(buf, "sync=vsync\n") != NULL, "vsync written");
+    nb_vstore_init(&st);
+    nb_vstore_parse(&st, buf);
+    CHECK(st.sync == NB_SYNC_VSYNC, "vsync read back");
+    nb_vstore_init(&st);
+    nb_vstore_parse(&st, "scale=stretch\nsync=bogus\n");
+    CHECK(st.sync == NB_SYNC_FULLSCREEN && st.cur.scale == NB_SCALE_STRETCH,
+          "bad sync ignored, rest kept");
+}
+
 int main(void)
 {
+    test_sync();
     test_fit();
     test_stretch();
     test_integer();
@@ -690,12 +929,14 @@ int main(void)
     test_custom();
     test_clamp();
     test_fractional();
+    test_bars();
     test_guest_mode();
     test_names();
     test_store();
     test_cycles();
     test_override();
     test_rules();
+    test_auto_rules();
     test_modes();
     printf("test_view: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;

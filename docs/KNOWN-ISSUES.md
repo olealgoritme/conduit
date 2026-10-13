@@ -52,22 +52,20 @@ Experimental, behind `--venus` ([WINDOWS.md](WINDOWS.md), [VENUS.md](VENUS.md)).
 Rendering is on NVK-on-RM; Venus is the fallback for processes the policy
 keeps off NVK.
 
-- One display mode at a time, set by `conduit up --display`,
-  `conduit view NAME WxH@HZ` or the viewer's window size. The driver does not
-  scale, so a game rendering below that mode does not fill the screen.
+- Every guest display mode runs at the native refresh rate. The guest offers
+  the VM's mode list: native (`conduit up --display`), the standard modes that
+  fit within it, and custom modes (`conduit display VM --add WxH`;
+  [SCANOUT.md](SCANOUT.md) "Mode list").
 - Games need the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look; without
   it the guest gets absolute tablet positions.
-- Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):
-  full-screen games are composed by DWM. With `IndepFlip=1` the hardware
-  cursor comes on too (`HwCursor` follows `IndepFlip` unless set).
 
 - From a checkout, `make` builds the backend with the `venus` feature but
   not `conduit-venus` (it needs the venus submodules and a local
   virglrenderer); build that by hand ([VENUS.md](VENUS.md)). The packages
   have both.
 - `conduit attach` recognizes a Windows VM and adds the Hyper-V
-  enlightenments, but does not install its guest driver: install the Helios
-  package inside the VM by hand ([WINDOWS.md](WINDOWS.md)).
+  enlightenments, but does not install its guest driver: run the release's
+  driver zip `install.ps1` inside the VM ([WINDOWS.md](WINDOWS.md#guest-driver)).
 - The guest driver is test-signed: Secure Boot off, test-signing on.
 - Counter-Strike 2: in some launches a strip of stray geometry (a long brown
   "beam") comes out of the player model in the main menu and stays for that

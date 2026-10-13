@@ -1020,13 +1020,16 @@ mod tests {
             assert_eq!(c, [rust as u64], "{needle}");
         }
         // queue_rm_fence_v3 came with version 6; version 7 appended the ECL
-        // fences after it (entries are only ever appended).
-        assert!(ICD_HEADER.contains("#define HELIOS_ICD_INTERFACE_VERSION 7u"));
+        // fences after it, version 8 ecl_fence_create_v3 after those (entries
+        // are only ever appended).
+        assert!(ICD_HEADER.contains("#define HELIOS_ICD_INTERFACE_VERSION 8u"));
         let v3 = ICD_HEADER.find("(*queue_rm_fence_v3)").expect("queue_rm_fence_v3");
         let reserve = ICD_HEADER.find("(*ecl_fence_reserve)").expect("ecl_fence_reserve");
         assert!(v3 < reserve);
         assert!(ICD_HEADER.contains("(*ecl_fence_create)"));
-        assert!(ICD_HEADER.contains("(*ecl_fence_signal)"));
+        let signal = ICD_HEADER.find("(*ecl_fence_signal)").expect("ecl_fence_signal");
+        let create_v3 = ICD_HEADER.find("(*ecl_fence_create_v3)").expect("ecl_fence_create_v3");
+        assert!(reserve < signal && signal < create_v3);
     }
 
     fn icd_copy(r: &HeliosRmFenceTailV3) -> [u8; HELIOS_ICD_RM_COPY_BYTES] {

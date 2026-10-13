@@ -78,6 +78,7 @@ pub mod ce_route;
 pub mod hw_cursor;
 pub mod gdi_accel;
 pub mod msi;
+pub mod shipping_defaults;
 pub mod paging;
 pub mod shared_placeholder;
 pub mod restart_flip;
@@ -93,6 +94,7 @@ pub mod flip_pend_wd;
 pub mod wait_bound;
 pub mod stage_trace;
 pub mod scanout_events;
+pub mod immediate_flip;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

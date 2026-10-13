@@ -49,6 +49,12 @@ struct HeliosVkd3dDevice {
                             std::uint32_t& rovs, std::uint32_t& conservative_tier,
                             rust::Slice<std::uint8_t> device_uuid) const noexcept;
 
+  // The engine's own shader precision answers: OPTIONS.MinPrecisionSupport
+  // (D3D12_SHADER_MIN_PRECISION_SUPPORT bits) and
+  // OPTIONS4.Native16BitShaderOpsSupported (0/1). False if either query fails.
+  bool native_shader_precision(std::uint32_t& min_precision,
+                               std::uint32_t& native16) const noexcept;
+
   // S5 (dxvk-on-nvk). The ICD under the engine: 1 = Venus, 2 = NVK on RM
   // (helios_icd_interface.h's HELIOS_ICD_BACKEND_*).
   std::uint32_t icd_backend() const noexcept;

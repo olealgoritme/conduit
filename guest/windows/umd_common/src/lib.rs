@@ -82,6 +82,7 @@ pub mod hr;
 pub mod noop;
 pub mod refusals;
 pub mod scanout_event;
+pub mod shader_diag;
 pub mod throttle;
 pub mod window;
 

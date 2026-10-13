@@ -50,6 +50,8 @@ pub(crate) struct FeatureProfile {
     pub shader_caps: u32,
     /// `D3DWDDM1_3DDICAPS_D3D11_OPTIONS1` tiled-resource tier flags.
     pub options1: u32,
+    /// `D3DWDDM2_0DDICAPS_D3D11_OPTIONS3` (WDDM 2.0+ DDI only).
+    pub vp_rt_index_any_stage: bool,
     pub msaa: MsaaPolicy,
     pub format: FormatPolicy,
 }
@@ -59,17 +61,37 @@ const LVL_10_1: u32 = 1 << 1;
 const LVL_11_0: u32 = 1 << 2;
 const LVL_11_1: u32 = 1 << 3;
 const LVL_12_0: u32 = 1 << 7;
+pub(crate) const SHADER_DOUBLES: u32 = 0x1;
 const SHADER_COMPUTE: u32 = 0x2;
-const SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS: u32 = 0x20;
+pub(crate) const SHADER_SPECIFIED_STENCIL_REF: u32 = 0x10;
+pub(crate) const SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS: u32 = 0x20;
+pub(crate) const SHADER_ROVS: u32 = 0x40;
 const TILED_RESOURCES_TIER_2_SUPPORTED: u32 = 0x2;
 const FL11_PIPELINE_MASK: u32 = LVL_10_0 | LVL_10_1 | LVL_11_0 | LVL_11_1 | LVL_12_0;
-const FL11_SHADER_CAPS: u32 = SHADER_COMPUTE | SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS;
+/// The optional shader caps. `d3d11.dll` checks every shader's `SFI0` flags
+/// against these at `Create*Shader` and fails the call with `E_INVALIDARG`
+/// before the driver sees it, so a cap the engine backs but this word leaves
+/// out is a shader that silently never exists (CS2's bloom and OIT upsample
+/// compute shaders need TYPED_UAV_LOAD_ADDITIONAL_FORMATS).
+///
+/// Advertised: what DXVK backs on every engine this UMD drives (NVK on RM and
+/// Venus on the host's NVIDIA driver): doubles (`shaderFloat64` +
+/// `shaderInt64`) and typed UAV loads of the additional formats
+/// (`shaderStorageImageReadWithoutFormat`). Withheld: SPECIFIED_STENCIL_REF
+/// (NVK has no `VK_EXT_shader_stencil_export`) and ROVS (NVK has no
+/// `VK_EXT_fragment_shader_interlock`). [`audit_engine_caps`] compares this
+/// word with the engine of each created device and logs any difference.
+///
+/// ⚠ Bits 0x10/0x20/0x40 are read by the runtime only from a WDDM 2.0+ DDI
+/// interface; under WDDM 1.3 it treats them as absent (`ddi_level.rs`).
+const FL11_SHADER_CAPS: u32 = SHADER_DOUBLES | SHADER_COMPUTE | SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS;
 
 /// `FeatureLevel11 = 0`: the proven FL10_0 baseline opt-out.
 const FL10_0: FeatureProfile = FeatureProfile {
     pipeline_mask: LVL_10_0,
     shader_caps: 0,
     options1: 0,
+    vp_rt_index_any_stage: false,
     msaa: MsaaPolicy::SingleSampleOnly,
     format: FormatPolicy::StripMultisampleBits,
 };
@@ -79,6 +101,7 @@ const FL11_0: FeatureProfile = FeatureProfile {
     pipeline_mask: FL11_PIPELINE_MASK,
     shader_caps: FL11_SHADER_CAPS,
     options1: TILED_RESOURCES_TIER_2_SUPPORTED,
+    vp_rt_index_any_stage: true,
     msaa: MsaaPolicy::Full,
     format: FormatPolicy::Unmasked,
 };
@@ -95,6 +118,7 @@ const FL11_PIPELINE_ONLY: FeatureProfile = FeatureProfile {
     pipeline_mask: FL11_PIPELINE_MASK,
     shader_caps: FL11_SHADER_CAPS,
     options1: TILED_RESOURCES_TIER_2_SUPPORTED,
+    vp_rt_index_any_stage: true,
     msaa: MsaaPolicy::SingleSampleOnly,
     format: FormatPolicy::StripMultisampleBits,
 };
@@ -157,6 +181,7 @@ pub(crate) unsafe extern "system" fn get_caps(
         D3D10_2DDICAPS_TYPE_D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT as D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT,
         D3D10_2DDICAPS_TYPE_D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 as D3DWDDM1_3DDICAPS_D3D11_OPTIONS1,
         D3D10_2DDICAPS_TYPE_D3DWDDM1_3DDICAPS_MARKER as D3DWDDM1_3DDICAPS_MARKER,
+        D3D10_2DDICAPS_TYPE_D3DWDDM2_0DDICAPS_D3D11_OPTIONS3 as D3DWDDM2_0DDICAPS_D3D11_OPTIONS3,
         D3D10_2DDICAPS_TYPE_D3DWDDM2_0DDICAPS_GPUVA_CAPS as D3DWDDM2_0DDICAPS_GPUVA_CAPS,
     };
     // The old literals, pinned so the alias swap is provably value-preserving.
@@ -168,6 +193,7 @@ pub(crate) unsafe extern "system" fn get_caps(
     const _: () = assert!(D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT == 134);
     const _: () = assert!(D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 == 136);
     const _: () = assert!(D3DWDDM1_3DDICAPS_MARKER == 137);
+    const _: () = assert!(D3DWDDM2_0DDICAPS_D3D11_OPTIONS3 == 152);
     const _: () = assert!(D3DWDDM2_0DDICAPS_GPUVA_CAPS == 153);
 
     if !args.is_null() {
@@ -200,7 +226,8 @@ pub(crate) unsafe extern "system" fn get_caps(
                 // D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X
                 // is the driver's compute-capability signal; dxvk/venus back
                 // full CS 5.0. FL12_0 additionally requires the D3D11.3 typed
-                // UAV-load additional-formats bit. FL10 profile stays 0 (no
+                // UAV-load additional-formats bit. The optional bits are the
+                // ones FL11_SHADER_CAPS documents. FL10 profile stays 0 (no
                 // optional shader caps).
                 D3D11DDICAPS_SHADER if args.DataSize >= 4 => {
                     let caps = feature_profile().shader_caps;
@@ -250,13 +277,24 @@ pub(crate) unsafe extern "system" fn get_caps(
                 // Queried only by a WDDM 2.x D3D11 device (`ddi_level.rs`).
                 // Non-zero, and 40 bits for the same reason as umd12's
                 // GPUVA_CAPS: kmd_render declares a 40-bit GPU VA and vkd3d
-                // hardcodes 40. The other WDDM 2.x caps (OPTIONS2 = conservative
-                // tier, OPTIONS3, MEMORY_ARCHITECTURE, SHADERCACHE, TEXTURE_LAYOUT,
-                // SWIZZLE_PATTERN) keep the zeroed answer: not supported/discrete.
+                // hardcodes 40. OPTIONS3 is answered above; the other WDDM 2.x caps
+                // (OPTIONS2 = conservative tier, MEMORY_ARCHITECTURE, SHADERCACHE,
+                // TEXTURE_LAYOUT, SWIZZLE_PATTERN) keep the zeroed answer: not
+                // supported/discrete.
                 D3DWDDM2_0DDICAPS_GPUVA_CAPS if args.DataSize >= 4 => {
                     const HELIOS_GPU_VA_BITS: u32 = 40;
                     unsafe { *(args.pData as *mut u32) = HELIOS_GPU_VA_BITS };
                     log_error!("  GetCaps: GPUVA MaxGPUVirtualAddressBitsPerResource={HELIOS_GPU_VA_BITS}");
+                }
+                // D3DWDDM2_0DDI_D3D11_OPTIONS3_DATA: viewport / render-target
+                // array index written by any stage feeding the rasterizer (VS,
+                // DS), not only the GS. Gates SFI0 flag 0x2000 at shader
+                // creation. DXVK backs it with Vulkan 1.2 shaderOutputLayer +
+                // shaderOutputViewportIndex (NVK Maxwell B+, NVIDIA).
+                D3DWDDM2_0DDICAPS_D3D11_OPTIONS3 if args.DataSize >= 4 => {
+                    let v = feature_profile().vp_rt_index_any_stage as u32;
+                    unsafe { *(args.pData as *mut u32) = v };
+                    log_error!("  GetCaps: D3D11_OPTIONS3 VPAndRTArrayIndexFromAnyShaderFeedingRasterizer={v}");
                 }
                 D3DWDDM1_3DDICAPS_MARKER if args.DataSize >= 4 => {
                     const D3DWDDM1_3DDI_MARKER_TYPE_NONE: u32 = 0;
@@ -276,4 +314,144 @@ pub(crate) unsafe extern "system" fn get_caps(
         log_error!("GetCaps: null args");
     }
     S_OK
+}
+
+/// What the engine behind one created device backs, in the caps' terms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EngineShaderCaps {
+    pub shader_caps: u32,
+    pub vp_rt_index_any_stage: bool,
+}
+
+/// One line per difference between what GetCaps advertised and what the
+/// engine backs. Pure, for tests.
+///
+/// * engine backs, caps hide it: the runtime refuses every shader that needs
+///   it before the driver sees it (silent: no DDI call to log).
+/// * caps claim, engine lacks it: the runtime admits shaders the engine then
+///   fails to compile or mis-renders.
+pub(crate) fn engine_caps_mismatches(advertised: EngineShaderCaps, engine: EngineShaderCaps, wddm2: bool) -> Vec<String> {
+    const BITS: &[(u32, &str, bool)] = &[
+        (SHADER_DOUBLES, "DOUBLES", false),
+        (SHADER_SPECIFIED_STENCIL_REF, "SPECIFIED_STENCIL_REF", true),
+        (SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS, "TYPED_UAV_LOAD_ADDITIONAL_FORMATS", true),
+        (SHADER_ROVS, "ROVS", true),
+    ];
+    let mut out = Vec::new();
+    for &(bit, name, needs_wddm2) in BITS {
+        let adv = advertised.shader_caps & bit != 0 && (wddm2 || !needs_wddm2);
+        let eng = engine.shader_caps & bit != 0;
+        if eng && !adv {
+            let why = if advertised.shader_caps & bit != 0 { " (WDDM 1.3 DDI: the runtime ignores the bit)" } else { "" };
+            out.push(format!("engine backs {name}, runtime sees it unsupported{why}: shaders requiring it are refused before the driver"));
+        } else if adv && !eng {
+            out.push(format!("caps claim {name}, engine lacks it: shaders requiring it reach an engine that cannot run them"));
+        }
+    }
+    let adv = advertised.vp_rt_index_any_stage && wddm2;
+    if engine.vp_rt_index_any_stage && !adv {
+        out.push("engine backs VPAndRTArrayIndexFromAnyShaderFeedingRasterizer, runtime sees it unsupported".into());
+    } else if adv && !engine.vp_rt_index_any_stage {
+        out.push("caps claim VPAndRTArrayIndexFromAnyShaderFeedingRasterizer, engine lacks it".into());
+    }
+    out
+}
+
+/// Compare the adapter caps with the engine of a freshly created device and
+/// log every difference (`engine_caps_mismatches`) in the UMD log: a hidden
+/// cap predicts runtime refusals no DDI call will ever show. Not a ledger line:
+/// the shader-failure ledger records only shaders and pipelines that actually
+/// failed, and dwm.exe stays on WDDM 1.3 on purpose (`UmdDdiLevelDwm`), where
+/// the WDDM 2.0+ caps are expected to read as hidden. Once per device; not on a
+/// hot path.
+pub(crate) fn audit_engine_caps(device: &windows::Win32::Graphics::Direct3D11::ID3D11Device, wddm2: bool) -> usize {
+    use windows::Win32::Graphics::Direct3D11::*;
+    fn get<T: Default>(device: &ID3D11Device, f: D3D11_FEATURE) -> Option<T> {
+        let mut data = T::default();
+        unsafe {
+            device
+                .CheckFeatureSupport(f, &mut data as *mut T as *mut core::ffi::c_void, core::mem::size_of::<T>() as u32)
+                .ok()?;
+        }
+        Some(data)
+    }
+    let mut engine = EngineShaderCaps::default();
+    if let Some(d) = get::<D3D11_FEATURE_DATA_DOUBLES>(device, D3D11_FEATURE_DOUBLES) {
+        if d.DoublePrecisionFloatShaderOps.as_bool() {
+            engine.shader_caps |= SHADER_DOUBLES;
+        }
+    }
+    if let Some(o) = get::<D3D11_FEATURE_DATA_D3D11_OPTIONS2>(device, D3D11_FEATURE_D3D11_OPTIONS2) {
+        if o.PSSpecifiedStencilRefSupported.as_bool() {
+            engine.shader_caps |= SHADER_SPECIFIED_STENCIL_REF;
+        }
+        if o.TypedUAVLoadAdditionalFormats.as_bool() {
+            engine.shader_caps |= SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS;
+        }
+        if o.ROVsSupported.as_bool() {
+            engine.shader_caps |= SHADER_ROVS;
+        }
+    }
+    if let Some(o) = get::<D3D11_FEATURE_DATA_D3D11_OPTIONS3>(device, D3D11_FEATURE_D3D11_OPTIONS3) {
+        engine.vp_rt_index_any_stage = o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer.as_bool();
+    }
+    let p = feature_profile();
+    let advertised = EngineShaderCaps { shader_caps: p.shader_caps, vp_rt_index_any_stage: p.vp_rt_index_any_stage };
+    let lines = engine_caps_mismatches(advertised, engine, wddm2);
+    log_error!(
+        "  CreateDevice: shader caps advertised=0x{:x} engine=0x{:x} vp_rt_any advertised={} engine={} wddm2={wddm2} mismatches={}",
+        advertised.shader_caps,
+        engine.shader_caps,
+        advertised.vp_rt_index_any_stage,
+        engine.vp_rt_index_any_stage,
+        lines.len()
+    );
+    for l in &lines {
+        log_error!("  CreateDevice: caps mismatch: {l}");
+    }
+    lines.len()
+}
+
+#[cfg(test)]
+mod engine_caps_tests {
+    use super::*;
+
+    fn caps(shader_caps: u32, vp: bool) -> EngineShaderCaps {
+        EngineShaderCaps { shader_caps, vp_rt_index_any_stage: vp }
+    }
+
+    #[test]
+    fn production_profile_matches_an_nvk_engine_on_wddm2() {
+        // NVK: doubles + typed loads + VP/RT index; no stencil export, no ROV.
+        let nvk = caps(SHADER_DOUBLES | SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS, true);
+        let adv = caps(FL11_0.shader_caps & !SHADER_COMPUTE, FL11_0.vp_rt_index_any_stage);
+        assert!(engine_caps_mismatches(adv, nvk, true).is_empty());
+    }
+
+    #[test]
+    fn wddm13_hides_typed_uav_loads() {
+        let nvk = caps(SHADER_DOUBLES | SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS, true);
+        let adv = caps(FL11_0.shader_caps, true);
+        let m = engine_caps_mismatches(adv, nvk, false);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m[0].contains("TYPED_UAV_LOAD_ADDITIONAL_FORMATS") && m[0].contains("WDDM 1.3"));
+        assert!(m[1].contains("VPAndRTArrayIndex"));
+    }
+
+    #[test]
+    fn venus_extra_features_are_named() {
+        let venus = caps(SHADER_DOUBLES | SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS | SHADER_ROVS | SHADER_SPECIFIED_STENCIL_REF, true);
+        let adv = caps(FL11_0.shader_caps, true);
+        let m = engine_caps_mismatches(adv, venus, true);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m.iter().any(|l| l.contains("ROVS")) && m.iter().any(|l| l.contains("STENCIL_REF")));
+    }
+
+    #[test]
+    fn overclaim_is_named() {
+        let weak = caps(0, false);
+        let m = engine_caps_mismatches(caps(SHADER_DOUBLES, true), weak, true);
+        assert_eq!(m.len(), 2);
+        assert!(m[0].starts_with("caps claim DOUBLES"));
+    }
 }

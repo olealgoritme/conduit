@@ -1,0 +1,39 @@
+Helios DXVK fork: keep empty mapped-pool chunks until the timer or the limits free them
+
+Conduit guest/windows. Applied after 0019 by ci/windows/Build-Driver.ps1.
+
+freeEmptyChunksInPool freed an empty chunk at once when it was smaller than
+the pool's next chunk size. The mapped pool's chunks hold dynamic buffers'
+discard slices, which fill and drain them every few frames, so a chunk could
+be freed and allocated again moments later. On NVK over RM each of those is a
+host round trip (an RM allocation and a mapping into the guest), and the
+allocation happens inside Map(WRITE_DISCARD) on the game's render thread: CS2
+spent about 7% of its render thread under DxvkMemoryAllocator::allocateMemory.
+
+The mapped pool now frees empty chunks only by the existing rules that do not
+depend on the chunk's size: more than four max-size chunks unused, unused for
+20 seconds, or the heap budget. Device-local pools are unchanged.
+
+diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
+index e174bc46..bee66cbd 100644
+--- a/src/dxvk/dxvk_memory.cpp
++++ b/src/dxvk/dxvk_memory.cpp
+@@ -2031,7 +2031,17 @@ namespace dxvk {
+       // Free the chunk if it is smaller than the current chunk size of
+       // the pool, since it is unlikely to be useful for future allocations.
+       // Also free if the pending allocation would exceed the heap budget.
+-      bool shouldFree = chunk.memory.size < pool.nextChunkSize
++      //
++      // Helios: not for the mapped pool. Dynamic buffers (Map DISCARD) fill
++      // and drain its chunks every few frames, and on NVK over RM a chunk
++      // freed here and allocated again a moment later is a host round trip
++      // each way (RM allocation, map into the guest), on the game's render
++      // thread. Mapped chunks go by the unused-memory limit, the 20 s timer
++      // and the budget below instead.
++      const bool smallerThanNext = chunk.memory.size < pool.nextChunkSize
++        && &pool != &type.mappedPool;
++
++      bool shouldFree = smallerThanNext
+         || allocationSize + heapAllocated > heapBudget
+         || allocationSize > heapBudget;
+ 

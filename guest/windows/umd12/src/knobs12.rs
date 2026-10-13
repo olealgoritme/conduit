@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 22] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 23] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -332,6 +332,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 22] {
         ("Umd12DdiTimes", umd12_ddi_times() as u32),
         ("Umd12WaitSplit", umd12_wait_split() as u32),
         ("Umd12MergeEcl", umd12_merge_ecl() as u32),
+        // Appended.
+        ("Umd12EngineShaderCaps", umd12_engine_shader_caps() as u32),
     ]
 }
 
@@ -444,6 +446,22 @@ pub(crate) static NVK12_ADMIT_AFTER_PRESENT_ONLY: BoolKnob =
 
 pub(crate) fn nvk12_admit_after_present_only() -> bool {
     NVK12_ADMIT_AFTER_PRESENT_ONLY.get()
+}
+
+/// `Umd12EngineShaderCaps` (default 0): report the engine's (vkd3d-proton's)
+/// own shader answers instead of the fixed table: the shader models up to
+/// the engine's highest (6.4 to 6.8 added to the list, which otherwise stops
+/// at 6.3), `MinPrecision` 16-bit and `Native16BitOps` when the engine
+/// reports them (`OPTIONS.MinPrecisionSupport`,
+/// `OPTIONS4.Native16BitShaderOpsSupported`). An application then sees what
+/// the same GPU offers its Vulkan path (NVK exposes shaderFloat16/Int16 and
+/// what vkd3d needs for SM 6.6+) and may pick 16-bit or SM 6.6 shader
+/// variants. Read once per process.
+pub(crate) static UMD12_ENGINE_SHADER_CAPS: BoolKnob =
+    BoolKnob::new(c"Umd12EngineShaderCaps", false);
+
+pub(crate) fn umd12_engine_shader_caps() -> bool {
+    UMD12_ENGINE_SHADER_CAPS.get()
 }
 
 /// `Nvk12EclFencePrefetch` (`Nvk12EclSync=2`): after an ECL is admitted, make

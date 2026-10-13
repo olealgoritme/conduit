@@ -70,6 +70,25 @@ struct nb_view {
 
 struct nb_rect { int x, y, w, h; };
 
+/*
+ * Presentation sync: when the viewer asks the compositor to show a frame the
+ * moment it is committed (tearing, wp_tearing_control_v1 ASYNC) rather than
+ * at the next vblank.  Not part of a layout or a profile: one setting per VM.
+ */
+enum {
+    NB_SYNC_FULLSCREEN = 0,     /* default: immediate in fullscreen, vsync windowed */
+    NB_SYNC_IMMEDIATE,          /* immediate in a window too                 */
+    NB_SYNC_VSYNC,              /* always wait for vblank                    */
+    NB_SYNC_LATCH,              /* newest frame once per refresh, late latch
+                                 * (nb_latch.h)                              */
+    NB_SYNC_COUNT
+};
+int         nb_sync_parse(const char *s, int *sync);  /* fullscreen|auto|immediate|vsync|latch */
+const char *nb_sync_name(int sync);                   /* settings-file / flag form */
+const char *nb_sync_label(int sync);                  /* menu form               */
+/* Whether frames should be presented immediately in this state. */
+bool        nb_sync_immediate(int sync, bool fullscreen);
+
 struct nb_place {
     struct nb_rect area;        /* the output area, window coordinates       */
     struct nb_rect pic;         /* the whole picture; may exceed the area    */
@@ -95,6 +114,12 @@ void nb_view_place(const struct nb_view *v, int bw, int bh, int ww, int wh,
  * Returns true when the point was over the picture itself.  gx/gy are in
  * 0..bw-1 / 0..bh-1; send them with the range bw x bh.
  */
+/*
+ * True when the drawn picture leaves part of a ww x wh window uncovered:
+ * the bars, which the backend fills with an opaque black background.  False
+ * only for an exact fit, where the picture alone covers the window.
+ */
+bool nb_view_has_bars(const struct nb_place *p, int ww, int wh);
 bool nb_view_map(const struct nb_place *p, int bw, int bh, double wx,
                  double wy, int *gx, int *gy);
 /* The guest pixel -> window scale, per axis (for drawing the guest cursor). */
@@ -144,6 +169,7 @@ struct nb_rule {
 
 struct nb_vstore {
     struct nb_view    cur;
+    int               sync;                     /* NB_SYNC_*             */
     struct nb_profile prof[NB_MAX_PROFILES];
     int               nprof;
     int               prof_at;                  /* last loaded, -1 none  */
@@ -159,9 +185,12 @@ struct nb_vstore {
     bool              ruled;
     unsigned          rule_w, rule_h;
     struct nb_view    base;
-    /* base was taken when the guest arrived at its current mode (so a rule
-     * remembered after editing there comes back to what was before). */
+    /* base (the default for modes without a rule) is known: taken from
+     * cur when the first guest mode arrives, so the file's settings and any
+     * command-line overrides are the default. */
     bool              base_set;
+    /* The guest mode the picture is shown at now, 0x0 before the first. */
+    unsigned          mode_w, mode_h;
 };
 
 void nb_vstore_init(struct nb_vstore *st);
@@ -187,6 +216,19 @@ void nb_vstore_rule_delete(struct nb_vstore *st, int i);
  */
 unsigned nb_vstore_guest_mode(struct nb_vstore *st, unsigned w, unsigned h,
                               char *label, size_t n);
+
+/*
+ * AUTOMATIC PER-MODE RULES.  Call after any change of cur's layout (scale,
+ * area, custom area, filter): the layout is remembered for the guest mode in
+ * force (mode_w x mode_h), or that mode's rule is dropped when the layout is
+ * the default again.  The oldest rule makes room when the table is full.
+ * Returns true when the store changed (persist it).  Before the first guest
+ * mode nothing is stored: cur then becomes the default.
+ */
+bool nb_vstore_auto_rule(struct nb_vstore *st);
+/* cur's layout becomes the default for every mode without a rule; the
+ * current mode's own rule goes. */
+void nb_vstore_make_default(struct nb_vstore *st);
 
 /* Remember a custom resolution (not a preset) at the front of `recent`. */
 void nb_vstore_note_res(struct nb_vstore *st, unsigned w, unsigned h);

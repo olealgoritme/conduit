@@ -182,6 +182,10 @@ struct nb_config {
      */
     struct nb_view view;
     unsigned    view_set;
+    int         sync;           /* --sync: NB_SYNC_*, -1 = the saved one    */
+    int         gpu_scale;      /* --gpu-scale: NB_GS_*                     */
+    const char *render_node;    /* --render-node: the scaler's GPU          */
+    char        gpu_why[200];   /* what --gpu resolved to, and why          */
     const char *view_state;     /* settings file, rewritten on every change */
     const char *vm_shutdown_cmd;/* menu: run via /bin/sh, not waited for    */
     const char *vm_reboot_cmd;
@@ -194,6 +198,14 @@ struct nb_config {
 #define NB_OVERLAY_WINDOWED 0   /* default: shown windowed, hidden fullscreen */
 #define NB_OVERLAY_ALWAYS   1   /* also fullscreen (costs direct scanout)    */
 #define NB_OVERLAY_OFF      2   /* starts hidden; CTRL+ALT+O still shows it  */
+
+#define NB_GS_AUTO 0            /* default: in fullscreen, measure zero-copy
+                                 * against the GPU pass and keep the better
+                                 * (nb_scanout.h)                            */
+#define NB_GS_OFF  1            /* never: the compositor scales (vsync on
+                                 * compositors that need one buffer to tear) */
+#define NB_GS_ON   2            /* always in fullscreen + immediate/latch when
+                                 * the picture is not 1:1, no measuring      */
 
 /* ── a validated buffer description ──────────────────────────────────────── */
 
@@ -529,6 +541,10 @@ struct nb_session_ops {
      * hardcoded list: each backend answers from the set the compositor or X
      * server enumerated at startup. */
     bool (*format_ok)(struct nb_session *s, uint32_t fourcc, uint64_t mod);
+    /* Optional (NULL: no).  A pair format_ok() refused that the backend can
+     * still show by copying it on the GPU into one the display takes
+     * (nb_blit.h).  Asked only after the pair and its opaque twin. */
+    bool (*copy_ok)(struct nb_session *s, uint32_t fourcc, uint64_t mod);
     /* Import an already-validated dma-buf and make it the pending content.
      * Does NOT take ownership of desc->fd.  Returns 0 or -errno. */
     int  (*attach)(struct nb_session *s, const struct nb_buf_desc *desc);
@@ -711,8 +727,6 @@ extern int  nb_tier;
 extern bool nb_linear_only;   /* deprecated alias for NB_TIER_LINEAR */
 
 /* virtio-nvgpu viewer knobs (nb_common.c). */
-extern int  nb_tearing;       /* wp_tearing_control: -1 (default) ASYNC only in
-                               * direct mode, 1 always ASYNC, 0 never        */
 extern int  nb_stats;         /* log fps / latency once per second           */
 extern int  nb_seq_usec;      /* cmd.seq carries the sender's CLOCK_MONOTONIC
                                * microseconds (low 32 bits) -- lets --stats

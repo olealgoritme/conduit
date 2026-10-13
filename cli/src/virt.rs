@@ -312,6 +312,9 @@ pub struct Managed<'a> {
     pub console_log: &'a Path,
     pub audio: Option<qemu::Audio>,
     pub runtime_dir: &'a Path,
+    /// Host isolation's pinning (vCPU i -> CPU, and the host's CPUs for
+    /// QEMU's own threads), hostiso.rs.
+    pub pinning: Option<(&'a [u32], &'a crate::hostiso::cpus::CpuSet)>,
 }
 
 /// The GPU's -device value, pinned to a PCI slot libvirt leaves alone.
@@ -364,6 +367,17 @@ pub fn managed_xml(c: &VmConfig, m: &Managed) -> String {
     cl += &format!("    <qemu:env name='XDG_RUNTIME_DIR' value='{rt}'/>\n");
     cl += &format!("    <qemu:env name='PIPEWIRE_RUNTIME_DIR' value='{rt}'/>\n");
     cl += &format!("    <qemu:env name='PULSE_SERVER' value='unix:{rt}/pulse/native'/>\n");
+    let cputune = m
+        .pinning
+        .map(|(vcpus, host)| {
+            let mut t = String::from("  <cputune>\n");
+            for (i, c) in vcpus.iter().enumerate() {
+                t += &format!("    <vcpupin vcpu='{i}' cpuset='{c}'/>\n");
+            }
+            t += &format!("    <emulatorpin cpuset='{host}'/>\n  </cputune>\n");
+            t
+        })
+        .unwrap_or_default();
     let shares: String = m
         .shares
         .iter()
@@ -389,7 +403,7 @@ pub fn managed_xml(c: &VmConfig, m: &Managed) -> String {
     <access mode='shared'/>
   </memoryBacking>
   <vcpu placement='static'>{cpus}</vcpu>
-  <os>
+{cputune}  <os>
     <type arch='x86_64' machine='q35'>hvm</type>
 {os}  </os>
   <features>
@@ -464,6 +478,18 @@ pub fn build_managed(c: &VmConfig, emulator: &Path) -> Result<String> {
     );
     let log = c.logs_dir().join("vm.log");
     let audio = qemu::pick_audio(emulator);
+    // Host isolation: pinned so the VM's vCPUs stay on its own cores.
+    let (repin, iso_note) = crate::hostiso::definition_pinning(
+        &c.name,
+        &crate::hostiso::domain::DomainCpus {
+            vcpus: c.cpus,
+            pins: vec![None; c.cpus as usize],
+            ..Default::default()
+        },
+    );
+    if let Some(n) = iso_note {
+        crate::ui::info(n);
+    }
     Ok(managed_xml(
         c,
         &Managed {
@@ -476,6 +502,7 @@ pub fn build_managed(c: &VmConfig, emulator: &Path) -> Result<String> {
             console_log: &log,
             audio,
             runtime_dir: &paths::xdg_runtime(),
+            pinning: repin.as_ref().map(|r| (r.vcpus.as_slice(), &r.host)),
         },
     ))
 }
@@ -763,6 +790,7 @@ mod tests {
                 console_log: Path::new("/vms/t-1/logs/vm.log"),
                 audio: Some(qemu::Audio::PipeWire),
                 runtime_dir: Path::new("/run/user/1000"),
+                pinning: None,
             },
         )
     }
@@ -798,6 +826,32 @@ mod tests {
             assert!(x.contains(want), "missing {want:?} in\n{x}");
         }
         assert!(is_ours(&x));
+    }
+
+    #[test]
+    fn managed_domain_carries_host_isolation_pinning() {
+        let mut c = VmConfig::new("t-1", 4096, 2, 3, "me", "none");
+        c.disk = PathBuf::from("/vms/t-1/disk.img");
+        let host = crate::hostiso::cpus::CpuSet::parse("0-7,16-23").unwrap();
+        let pins = [8, 24];
+        let x = managed_xml(
+            &c,
+            &Managed {
+                emulator: Path::new("/q"),
+                kernel: Path::new("/k"),
+                initrd: None,
+                gpu_sock: Path::new("/g"),
+                vfs_sock: Path::new("/v"),
+                shares: &[],
+                console_log: Path::new("/l"),
+                audio: None,
+                runtime_dir: Path::new("/run/user/1000"),
+                pinning: Some((&pins, &host)),
+            },
+        );
+        let d = crate::hostiso::domain::read(&x).expect("well-formed XML with a <vcpu>");
+        assert_eq!(d.one_cpu_each(), Some(vec![8, 24]));
+        assert_eq!(d.emulatorpin, Some(host));
     }
 
     #[test]

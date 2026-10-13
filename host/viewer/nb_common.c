@@ -61,7 +61,11 @@ uint32_t nb_fourcc_bpp(uint32_t fourcc)
  * XR24 only, and every frame was refused as "not advertised by this display".
  *
  * Substituting is strictly MORE conservative than accepting: XR24 tells the
- * compositor the surface is opaque, so it may skip blending entirely.
+ * compositor the surface is opaque, so it may skip blending entirely.  It is
+ * also the only correct description of a guest primary, whose alpha is
+ * undefined (a Windows desktop composed by DWM leaves it at zero): the broker
+ * PREFERS the twin for every frame whenever the display advertises it, and
+ * falls back to the alpha format only when it does not.
  */
 uint32_t nb_fourcc_opaque_twin(uint32_t fourcc)
 {
@@ -207,7 +211,6 @@ unsigned nb_res_w, nb_res_h;   /* NB_RES_FIXED only */
  * the upstream ladder for debugging. */
 int nb_tier = NB_TIER_NATIVE;
 
-int nb_tearing = -1;   /* auto: ASYNC in direct mode only */
 int nb_stats;
 int nb_seq_usec;
 
@@ -411,6 +414,9 @@ void nb_vstore_setup(struct nb_vstore *st, const struct nb_config *cfg)
                strerror(errno));
     }
     nb_view_override(&st->cur, &cfg->view, cfg->view_set);
+    if (cfg->sync >= 0) {
+        st->sync = cfg->sync;
+    }
     nb_view_apply_res(&st->cur);
     nb_view_summary(&st->cur, sum, sizeof(sum));
     nb_log("display: %s%s%s%s", sum, cfg->view_state ? " (saved in " : "",

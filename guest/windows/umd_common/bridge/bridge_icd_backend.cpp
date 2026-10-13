@@ -202,11 +202,24 @@ void dwm_marker_create() {
   SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, FALSE };
   if (ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sd, nullptr))
     sa.lpSecurityDescriptor = sd;
-  g_dwm_marker = CreateEventA(&sa, TRUE, TRUE, kDwmOnNvkEvent);
+  // Only SYNCHRONIZE is asked for, which the DACL grants everyone. The marker may already
+  // exist: DWM survives a KMD restart or a live driver update and loads the new UMD next to the
+  // old one, whose copy of this module still holds the event. CreateEventA asks for
+  // EVENT_ALL_ACCESS, which the DACL grants only SYSTEM, so opening that existing event failed
+  // ("could not be created") and the marker lived only as long as the old module's handle.
+  g_dwm_marker = CreateEventExA(&sa, kDwmOnNvkEvent, CREATE_EVENT_MANUAL_RESET | CREATE_EVENT_INITIAL_SET,
+                                SYNCHRONIZE);
+  const DWORD err = GetLastError();
   if (sd)
     LocalFree(sd);
-  umd_log(g_dwm_marker ? "icd backend: DWM on NVK: the desktop follows (marker Local\\HeliosDwmOnNvk set)"
-                       : "icd backend: DWM on NVK, but its marker event could not be created");
+  char msg[160];
+  if (g_dwm_marker)
+    std::snprintf(msg, sizeof(msg), "icd backend: DWM on NVK: the desktop follows (marker Local\\HeliosDwmOnNvk %s)",
+                  err == ERROR_ALREADY_EXISTS ? "held, it already existed" : "set");
+  else
+    std::snprintf(msg, sizeof(msg), "icd backend: DWM on NVK, but its marker event could not be created (error %lu)",
+                  static_cast<unsigned long>(err));
+  umd_log(msg);
 }
 
 void dwm_marker_drop() {
@@ -221,6 +234,25 @@ void dwm_marker_drop() {
 // process follow it)?
 [[maybe_unused]] bool desktop_follows_dwm_on_nvk() {
   return helios_policy_desktop_follows_dwm() != 0;
+}
+
+// Why the desktop did NOT follow DWM, for the decision's log line: "" when DwmIcd is not nvk or
+// DesktopFollowsDwm is 0 (nothing to explain), else the marker lookup's outcome. Called once,
+// from decide() (under g_choice_once).
+[[maybe_unused]] const char* desktop_not_following_detail() {
+  static char detail[160];
+  DWORD follow = 1;
+  helios_policy_reg_dword("DesktopFollowsDwm", &follow);
+  char dwm[16];
+  if (follow == 0 || !helios_policy_reg_sz("DwmIcd", dwm, sizeof(dwm)) || _stricmp(dwm, "nvk") != 0)
+    return "";
+  HANDLE h = OpenEventA(SYNCHRONIZE, FALSE, HELIOS_POLICY_DWM_MARKER);
+  const DWORD err = h ? 0 : GetLastError();
+  if (h)
+    CloseHandle(h);
+  std::snprintf(detail, sizeof(detail), " (DwmIcd=nvk, but the DWM marker %s: error %lu)",
+                h ? "appeared since" : "is absent", static_cast<unsigned long>(err));
+  return detail;
 }
 
 bool file_exists(const wchar_t* path) {
@@ -388,7 +420,9 @@ IcdBackendChoice decide() {
     if (!allowed && reg_sz("Icd", mode, sizeof(mode))) {
       lower_ascii(mode);
       if (std::strcmp(mode, "venus") == 0) {
-        c.reason = "HKLM\\SOFTWARE\\Helios!Icd=venus";
+        static char why[256];
+        std::snprintf(why, sizeof(why), "HKLM\\SOFTWARE\\Helios!Icd=venus%s", desktop_not_following_detail());
+        c.reason = why;
         return c;
       }
     }

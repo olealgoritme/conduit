@@ -307,9 +307,10 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
 /// (docs/research/host-roundtrip-latency.md, phase 3).
 const FENCE_SPIN_US: u32 = 150;
 
-/// `backend.latency` and `backend.cpus` as the backend's `--latency` and
-/// `--cpus` (docs/research/host-roundtrip-latency.md); nothing when unset,
-/// and the backend keeps its default (`all`).
+/// `backend.latency`, `backend.cpus` and `backend.gpu_timeslice_us` as the
+/// backend's `--latency`, `--cpus` and `--gpu-timeslice-us`
+/// (docs/research/host-roundtrip-latency.md, docs/HOST-TUNING.md); nothing
+/// when unset, and the backend keeps its defaults.
 pub(crate) fn latency_args(cmd: &mut Command) {
     if let Some(list) = crate::config::backend_latency() {
         // fence-spin is conduit-venus's alone (`venus_cmd`).
@@ -322,6 +323,9 @@ pub(crate) fn latency_args(cmd: &mut Command) {
     }
     if let Some(cpus) = crate::config::backend_cpus() {
         cmd.arg("--cpus").arg(cpus);
+    }
+    if let Some(us) = crate::config::backend_gpu_timeslice_us() {
+        cmd.arg("--gpu-timeslice-us").arg(us);
     }
 }
 
@@ -550,14 +554,16 @@ fn clipboard() -> Clipboard {
     CLIPBOARD.get().copied().unwrap_or(Clipboard::Both)
 }
 
-/// `conduit view --res/--area/--scale/--filter`: display settings handed to
-/// the viewer, overriding what it saved for this VM last time.
+/// `conduit view --res/--area/--scale/--filter/--sync`: display settings
+/// handed to the viewer, overriding what it saved for this VM last time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ViewOpts {
     pub res: Option<String>,
     pub area: Option<String>,
     pub scale: Option<String>,
     pub filter: Option<String>,
+    /// Presentation: fullscreen (immediate there), immediate, vsync.
+    pub sync: Option<String>,
 }
 
 impl ViewOpts {
@@ -569,6 +575,7 @@ impl ViewOpts {
             ("--area", &self.area),
             ("--scale", &self.scale),
             ("--filter", &self.filter),
+            ("--sync", &self.sync),
         ] {
             if let Some(v) = v {
                 a.push(flag.to_string());
@@ -648,6 +655,17 @@ fn viewer_session(wayland: bool, x11: bool) -> Option<&'static str> {
     }
 }
 
+/// Whether a libvirt VM gets the virtio-input devices its backend serves
+/// (docs/INPUT.md): the installed backend knows `--input-socket`, and
+/// `CONDUIT_VIRTIO_INPUT=0` does not turn them off. A backend without them
+/// would leave QEMU waiting on sockets nobody answers.
+pub(crate) fn virtio_input() -> bool {
+    std::env::var("CONDUIT_VIRTIO_INPUT").as_deref() != Ok("0")
+        && crate::paths::Tool::Backend
+            .find()
+            .is_some_and(|b| backend_takes(&b, "--input-socket"))
+}
+
 /// Whether this backend build understands `flag` (its `--help` names it):
 /// the CLI and the backend may come from different builds, and the backend
 /// refuses to start over an option it does not know.
@@ -720,6 +738,11 @@ pub(crate) fn start_viewer(
         if let Some(dir) = state.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        let mut opts = opts;
+        if opts.sync.is_some() && !help.contains("--sync") {
+            ui::warn("this conduit-viewer is too old for --sync; ignoring it");
+            opts.sync = None;
+        }
         cmd.arg("--view-state").arg(&state).args(opts.viewer_args());
         if let Ok(me) = std::env::current_exe() {
             let me = shell_quote(&me.to_string_lossy());
@@ -739,6 +762,10 @@ pub(crate) fn start_viewer(
     }
     if fullscreen || std::env::var("CONDUIT_FULLSCREEN").as_deref() == Ok("1") {
         cmd.arg("--fullscreen");
+    }
+    // The GPU of the viewer's GPU pass (`viewer.gpu`, `viewer.gpu.NAME`).
+    if help.contains("--gpu ") {
+        cmd.args(["--gpu", &crate::config::viewer_gpu(name).0]);
     }
     let mut whole_run = false;
     if let Some(sig) = tune {
@@ -1663,10 +1690,11 @@ mod clipboard_tests {
             area: Some("4:3".into()),
             scale: Some("stretch".into()),
             filter: None,
+            sync: Some("vsync".into()),
         };
         assert_eq!(
             o.viewer_args(),
-            ["--res", "1280x960", "--area", "4:3", "--scale", "stretch"]
+            ["--res", "1280x960", "--area", "4:3", "--scale", "stretch", "--sync", "vsync"]
         );
         assert!(ViewOpts::default().viewer_args().is_empty());
     }

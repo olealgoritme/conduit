@@ -1325,7 +1325,17 @@ of the dup), the scratch likewise (its CPU view, its GPU mapping, its memory). `
 channel group when the GPU is idle (the reverse of their making), right AFTER the group's free when a copy may still run (a
 stuck acquire: the group's free stops the channel), and once more before the client's files close (a no-op when empty). With
 StopDevice's flag up or the budget spent nothing is sent (kernel views are still unmapped) and the client's close takes the
-rest. `drop_views` / `forget` unmap the scratch's kernel view and forget the table at a transport loss.
+rest. `drop_views` / `forget` unmap the scratch's kernel view and forget the table at a transport loss. `undo_all` is the only
+caller of `release_all`: the route's teardown (`ce_route::teardown_channel`) and StopDevice reach it through
+`ce_channel::teardown`, never ahead of it, since a copy that timed out or was discharged may still be queued on the ring.
+
+**Slot lifetime.** A slot is read by every copy submitted with its VA until that copy's completion value lands. Every submit
+records its value on the slots it read (`ce_dup::note_submitted`: the route's dispatch and direct submit, the shadow), and the
+preparation gives a slot back (an LRU eviction, a re-make for another kind, length or client-table generation) only once the
+channel's completion reached that value; otherwise `Cache::plan` answers `Plan::Busy`, the preparation returns `BUSY`
+(`CeDupBusy`) and the job is prepared on a later pass. The VAs a job was prepared with carry a `ce_dup::Lease` (the two slots'
+makings); the dispatch submits only while both slots still hold them (`lease_holds`), else it falls back with `NotReady`: a
+slot re-made after the job was prepared maps another image, or nothing, at the same VA.
 
 ### 14.3 Locking, IRQL, the Present path
 
@@ -1388,6 +1398,7 @@ registry is written by the worker after each attempt and by the channel's publis
 | `CeDupN` / `CeDupOk` / `CeDupFail` / `CeDupStat` | dups sent / confirmed / refused / the last refusal's status |
 | `CeMapOk` / `CeMapFail` / `CeMapStat` / `CeMapFlags` | GPU maps of a dup made / refused after the fallback / the last refusal's status / `kind << 24 | flags` of the last image mapping (0x06080200: big pages with kind 0x06; 0x06080110: the system-memory fallback) |
 | `CeDupLive` / `CeDupFree` / `CeDupEvict` | live slots (`semaphores << 8 | images`) / slots given back / evictions |
+| `CeDupBusy` | preparations that waited because the slot they had to give back was still read by a submitted copy |
 | `CeRecClient` | records the shadow used although the `h_client` rule was not answered |
 
 ### 14.6 Hardware procedure (main session)

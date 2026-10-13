@@ -26,7 +26,9 @@
 //!
 //! # Default, fallback, measurement
 //!
-//! MSI-X is an opt-in in this package (`MsiMode=2`; the INF writes `MSISupported=0`). What happens
+//! MSI-X is the default (`MsiMode` absent = 2, `helios_kmd_logic::shipping_defaults`); the INF
+//! writes `MSISupported=0`, so the first start after an install is INTx and `AddDevice` raises
+//! the key for the next one. What happens
 //! when it does not work is the second half of this file: the per-vector
 //! counters the ISR and DPC feed, the health logic (a "rescue" is a waiter's
 //! polling drain finding a completion no interrupt announced), the polling
@@ -45,6 +47,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use helios_kmd_logic::msi::{self, Health, Mode, Plan};
+use helios_kmd_logic::shipping_defaults as sd;
 
 use super::config::DxgkConfigAccess;
 use super::pci_caps::{map_common_cfg, read_msix_message_control};
@@ -250,7 +253,7 @@ static MSI_SUPPORTED_W: [u16; MSI_SUPPORTED.len()] =
 #[inline(never)]
 pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
     use crate::diag::{knobs, read_config_dword, record_named_bytes as rec};
-    let mode = Mode::from_knob(read_config_dword(knobs::MSI_MODE, 0));
+    let mode = Mode::from_knob(read_config_dword(knobs::MSI_MODE, sd::MSI_MODE));
     // The latch belongs to the build that wrote it (`MsiLatchVer`; none = the operator's).
     // Another build's latch is stale: this build gets one fresh attempt at MSI-X.
     let latch = read_config_dword(knobs::MSI_LATCH, 0) != 0;

@@ -206,11 +206,11 @@ pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists"
 /// OFF means a timed run does no diagnostic atomic RMW at all.
 pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob = BoolKnob::new(c"UmdDeferredDiagnostics", false);
 
-/// D3D11 DDI interface the adapter advertises (`ddi_level.rs`). Absent = 0x10
-/// (D3DWDDM1_3, what every process negotiated before); 0x24 (D3DWDDM2_3)
-/// advertises the WDDM 2.3 D3D11 DDI above it. Never applied to dwm.exe, which
-/// has its own `UmdDdiLevelDwm` (same values, absent = 0x10).
-pub(crate) static UMD_DDI_LEVEL: DwordKnob = DwordKnob::new(c"UmdDdiLevel", 0x10);
+/// D3D11 DDI interface the adapter advertises (`ddi_level.rs`). Absent = 0x24
+/// (D3DWDDM2_3 above the 1.3 / 11.1 / 11.0 interfaces); 0x10 keeps the
+/// process on D3DWDDM1_3. Never applied to dwm.exe, which has its own
+/// `UmdDdiLevelDwm` (same values, absent = 0x10).
+pub(crate) static UMD_DDI_LEVEL: DwordKnob = DwordKnob::new(c"UmdDdiLevel", 0x24);
 
 /// `UmdDdiLevel` for dwm.exe only. Absent = 0x10: DWM keeps the WDDM 1.3 D3D11
 /// DDI until the 2.3 path has been proven in ordinary processes.
@@ -535,6 +535,25 @@ pub(crate) static NVK_RM_FENCE: BoolKnob = BoolKnob::new(c"NvkRmFence", true);
 /// composed frames.
 pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", true);
 
+/// `NvkComposedComplete`: 1 (default) = a composed NVK frame that DWM samples
+/// directly (a flip-model swap chain's own buffer: no DXGI destination for the
+/// KMD to copy into, not a primary that independent flip scans out) is complete
+/// on the GPU before its WDDM present is made: the S3 CPU wait, no RM fence in
+/// the marker. DWM on NVK reads the buffer from its own RM channel, which no
+/// WDDM wait holds, so a fence that retires the present's DMA buffer orders
+/// nothing for it: with short GPU timeslices DWM composed half-drawn Start
+/// menu, taskbar and pane frames. 0 = the frame carries the fence, as a
+/// blt-model frame does (the KMD's copy waits for it).
+pub(crate) static NVK_COMPOSED_COMPLETE: BoolKnob = BoolKnob::new(c"NvkComposedComplete", true);
+
+/// `NvkComposedComplete`, or `HELIOS_NVK_COMPOSED_COMPLETE` from the environment.
+pub(crate) fn nvk_composed_complete() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_COMPOSED_COMPLETE").unwrap_or_else(|| NVK_COMPOSED_COMPLETE.get())
+    })
+}
+
 /// `NvkRmCopyRecord`: 1 (default) = a composed NVK frame whose WDDM present
 /// carries an RM fence also carries the copy-engine Present record (`'HEF3'`,
 /// the 168-byte `HERF` / 192-byte `HEPR`, docs/rm-copy-engine-present.md 12)
@@ -549,7 +568,7 @@ pub(crate) static NVK_RM_COPY_RECORD: BoolKnob = BoolKnob::new(c"NvkRmCopyRecord
 /// NOT copy the frame into it before the WDDM present; the KMD's Blt reads the
 /// present's source (`hSrcAllocation`) and writes it into the window's surface
 /// at the client offset. 0 = the UMD copies it, as before. Absent: 1 when the
-/// KMD's `RedirVram` is 1 (its service key), else 0.
+/// KMD's `RedirVram` is 1 or absent (its service key; on by default), else 0.
 ///
 /// The UMD's copy goes to (0, 0) of the destination, which with `RedirVram` is
 /// the window's redirection texture including its non-client area, while the
@@ -580,6 +599,24 @@ pub(crate) fn nvk_rm_fence_present() -> bool {
     })
 }
 
+/// `NvkAsyncPresentFence` (`HKLM\\SOFTWARE\\Helios`, or
+/// `HELIOS_NVK_ASYNC_PRESENT_FENCE`): 1 (default) = a composed NVK present
+/// whose WDDM present carries an RM fence takes that fence for a value reserved
+/// at the Present call and signalled by DXVK's submission thread right after
+/// the frame's submission (helios_icd_interface version 8), so the presenting
+/// thread does not wait for DXVK's command-stream and submission threads
+/// (the SUBMITTED gate). 0 = the gate, then `queue_rm_fence_v3`, as before.
+/// An ICD without version 8 takes the gated path either way.
+pub(crate) static NVK_ASYNC_PRESENT_FENCE: BoolKnob = BoolKnob::new(c"NvkAsyncPresentFence", true);
+
+/// `NvkAsyncPresentFence`, or `HELIOS_NVK_ASYNC_PRESENT_FENCE` from the environment.
+pub(crate) fn nvk_async_present_fence() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_ASYNC_PRESENT_FENCE").unwrap_or_else(|| NVK_ASYNC_PRESENT_FENCE.get())
+    })
+}
+
 /// `NvkRmCopyRecord`, or `HELIOS_NVK_RM_COPY_RECORD` from the environment.
 pub(crate) fn nvk_rm_copy_record() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -590,7 +627,7 @@ pub(crate) fn nvk_rm_copy_record() -> bool {
 
 /// `DirectFlipSupport` (REG_DWORD), or `HELIOS_DIRECT_FLIP_SUPPORT` from the
 /// process environment: what the D3D11.1 `CheckDirectFlipSupport` DDI answers.
-/// 0 (default) = never; 1 = yes when dxgkrnl
+/// 0 = never; 1 = yes when dxgkrnl
 /// reports DirectFlip support for the Helios adapter (KMTQAITYPE_DIRECTFLIP_SUPPORT,
 /// i.e. the KMD's SupportDirectFlip cap) and the two resources have the same
 /// size and the same format (the 393.1 rule); 2 = yes whenever size and format match (test
@@ -599,8 +636,10 @@ pub(crate) fn nvk_rm_copy_record() -> bool {
 /// one mip, one slice). 3 was briefly the meaning of 1 (driver 388.1). 4 = the same as 1
 /// (the exact-format rule; kept for the 405.8 rows). 5 = as 1, but two different 8-bit scan-out
 /// formats also pair (an R8G8B8A8 game on the B8G8R8A8 desktop,
-/// `helios_umd_common::format::direct_flip_formats_compatible`): opt-in, because on 405.8 a
-/// promoted R8G8B8A8 CS2 swap chain froze after one frame (docs/independent-flip.md 13.10).
+/// `helios_umd_common::format::direct_flip_formats_compatible`): the default since 405.49, so an
+/// R8G8B8A8 game such as CS2 is promoted too. (405.8's freeze of a promoted R8G8B8A8 CS2 swap
+/// chain was the missing hardware pointer, docs/independent-flip.md 13.10; 1 is the strict
+/// equal-format rule.)
 /// Windows decides independent flip and the blt-to-flip swap-effect upgrade
 /// partly from this answer.
 pub(crate) fn direct_flip_support() -> u32 {
@@ -610,9 +649,9 @@ pub(crate) fn direct_flip_support() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .or_else(|| helios_umd_common::knobs::reg_dword(c"DirectFlipSupport"))
-            // 0 again (405.9): with 1 and the KMD's `IndepFlip` 1 a promoted CS2 swap chain
-            // froze after one frame (docs/independent-flip.md 13.10). 1 opts in.
-            .unwrap_or(0)
+            // 5 (405.49), with the KMD's `IndepFlip` 1: full-screen flip-model games, R8G8B8A8
+            // ones included, are promoted instead of composed. 0 opts out, 1 is the strict rule.
+            .unwrap_or(5)
     })
 }
 
@@ -624,7 +663,8 @@ pub(crate) fn nvk_skip_blt_copy() -> bool {
         env_bool("HELIOS_NVK_SKIP_BLT_COPY")
             .or_else(|| helios_umd_common::knobs::reg_dword(c"NvkSkipBltCopy").map(|v| v != 0))
             .unwrap_or_else(|| {
-                helios_umd_common::knobs::kmd_service_dword(c"RedirVram") == Some(1)
+                // Absent is on: the KMD's shipped default (`kmd_logic::shipping_defaults`).
+                helios_umd_common::knobs::kmd_service_dword(c"RedirVram").unwrap_or(1) == 1
             })
     })
 }

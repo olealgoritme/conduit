@@ -514,7 +514,8 @@ const RAW_REPLY_STACK: usize = 1024;
 
 /// `NvSpinUs` as read from the service key (clamped), or `u32::MAX` while unread.
 /// Read at StartDevice ([`reread_spin_knob`]) and, if unread, at the first forward (PASSIVE);
-/// mirrored as `NvSpinUs` on every read.
+/// mirrored as `NvSpinUsEff` on every read (never under the knob's own name: a value written
+/// back there would pin this build's default in the service key forever).
 static NVRM_SPIN_US: AtomicU32 = AtomicU32::new(u32::MAX);
 /// The spin governor's packed state (`helios_kmd_logic::nvrm_fastpath::spin`).
 /// Plain load / store, never a read-modify-write: it is a heuristic, a lost
@@ -539,7 +540,7 @@ fn read_spin_knob() -> u32 {
     let us = crate::diag::read_config_dword(crate::diag::knobs::NV_SPIN_US, spin::BUDGET_US_DEFAULT)
         .min(spin::BUDGET_US_MAX);
     NVRM_SPIN_US.store(us, Ordering::Relaxed);
-    crate::diag::record_named_bytes(b"NvSpinUs", us);
+    crate::diag::record_named_bytes(b"NvSpinUsEff", us);
     us
 }
 

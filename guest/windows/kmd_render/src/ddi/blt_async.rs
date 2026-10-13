@@ -61,6 +61,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_kmd_logic::blt_async::{self as ba, Route, Why};
+use helios_kmd_logic::shipping_defaults as sd;
 use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
 
 use crate::adapter::AdapterContext;
@@ -128,32 +129,32 @@ pub(crate) fn now_100ns() -> u64 {
 }
 
 #[inline(never)]
-fn read_knob(cell: &AtomicU32, name: crate::diag::KnobName) -> bool {
-    let v = crate::diag::read_config_dword(name, 0) != 0;
+fn read_knob(cell: &AtomicU32, name: crate::diag::KnobName, default: u32) -> bool {
+    let v = crate::diag::read_config_dword(name, default) != 0;
     cell.store(v as u32, Ordering::Relaxed);
     v
 }
 
-fn knob(cell: &AtomicU32, name: crate::diag::KnobName) -> bool {
+fn knob(cell: &AtomicU32, name: crate::diag::KnobName, default: u32) -> bool {
     match cell.load(Ordering::Relaxed) {
-        UNREAD => read_knob(cell, name),
+        UNREAD => read_knob(cell, name, default),
         v => v != 0,
     }
 }
 
 /// `BltAsync` is on. One relaxed load once read.
 pub(crate) fn async_on() -> bool {
-    knob(&ASYNC_KNOB, crate::diag::knobs::BLT_ASYNC)
+    knob(&ASYNC_KNOB, crate::diag::knobs::BLT_ASYNC, sd::BLT_ASYNC)
 }
 
 /// `BltNoMirror` is on. One relaxed load once read.
 pub(crate) fn no_mirror_on() -> bool {
-    knob(&NO_MIRROR_KNOB, crate::diag::knobs::BLT_NO_MIRROR)
+    knob(&NO_MIRROR_KNOB, crate::diag::knobs::BLT_NO_MIRROR, 0)
 }
 
 /// `BltAsyncVenus` is on: the knobs also act on Venus-native sources. One relaxed load once read.
 pub(crate) fn async_venus_on() -> bool {
-    knob(&VENUS_KNOB, crate::diag::knobs::BLT_ASYNC_VENUS)
+    knob(&VENUS_KNOB, crate::diag::knobs::BLT_ASYNC_VENUS, 0)
 }
 
 /// A new transport generation: the knobs are read again (a `reg add` + `pnputil /restart-device`
@@ -204,9 +205,10 @@ pub(crate) fn reset_for_start() {
     }
     SRC_BUSY.store(0, Ordering::Relaxed);
     LOOK_N.store(0, Ordering::Relaxed);
-    let a = read_knob(&ASYNC_KNOB, crate::diag::knobs::BLT_ASYNC);
-    let m = read_knob(&NO_MIRROR_KNOB, crate::diag::knobs::BLT_NO_MIRROR);
-    let v = read_knob(&VENUS_KNOB, crate::diag::knobs::BLT_ASYNC_VENUS);
+    // `BltAsync` is on when absent (`shipping_defaults`); the other two are off.
+    let a = read_knob(&ASYNC_KNOB, crate::diag::knobs::BLT_ASYNC, sd::BLT_ASYNC);
+    let m = read_knob(&NO_MIRROR_KNOB, crate::diag::knobs::BLT_NO_MIRROR, 0);
+    let v = read_knob(&VENUS_KNOB, crate::diag::knobs::BLT_ASYNC_VENUS, 0);
     let depth = ba::clamp_lookahead(crate::diag::read_config_dword(
         crate::diag::knobs::BLT_LOOKAHEAD,
         ba::LOOKAHEAD_DEFAULT,

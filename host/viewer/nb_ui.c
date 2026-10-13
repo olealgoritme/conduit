@@ -644,22 +644,32 @@ static void build(struct nb_ui *ui, const struct nb_ui_env *env, struct pnt *p)
             int r = nb_vstore_rule_find(st, (unsigned)env->buf_w,
                                         (unsigned)env->buf_h);
 
-            if (r >= 0) {
-                char sum[64];
-
-                nb_view_summary(&st->rule[r].v, sum, sizeof(sum));
-                snprintf(s, sizeof(s), "At %dx%d: %s", env->buf_w,
-                         env->buf_h, sum);
-            } else {
-                snprintf(s, sizeof(s), "At %dx%d: the usual picture settings",
-                         env->buf_w, env->buf_h);
-            }
+            /*
+             * Picture settings are remembered per guest mode by themselves
+             * (nb_vstore_auto_rule): say which applies here, and list the
+             * remembered modes so one can be forgotten.
+             */
+            snprintf(s, sizeof(s), "At %dx%d: %s", env->buf_w, env->buf_h,
+                     r >= 0 ? "remembered for this mode"
+                            : "the default (changes here are remembered)");
             hint(&b, s);
-            snprintf(s, sizeof(s), "Remember for %dx%d", env->buf_w,
-                     env->buf_h);
-            chip(&b, s, NB_UI_ID_RULE_SAVE, 0, false, false);
             if (r >= 0) {
-                chip(&b, "Forget", NB_UI_ID_RULE_DEL, r, false, false);
+                chip(&b, "Make it the default", NB_UI_ID_RULE_DEFAULT, 0,
+                     false, false);
+            }
+            if (st->nrule > 0) {
+                hint(&b, "Remembered modes (click to forget):");
+                for (i = 0; i < st->nrule; i++) {
+                    char sum[64];
+
+                    nb_view_summary(&st->rule[i].v, sum, sizeof(sum));
+                    snprintf(s, sizeof(s), "x %ux%u %s", st->rule[i].w,
+                             st->rule[i].h, sum);
+                    chip(&b, s, NB_UI_ID_RULE_DEL, i,
+                         st->rule[i].w == (unsigned)env->buf_w &&
+                             st->rule[i].h == (unsigned)env->buf_h,
+                         false);
+                }
             }
         }
         goto area;
@@ -750,6 +760,21 @@ area:
         b.y += UI_FIELD_H + 6;
     }
     field(&b, NB_UI_ID_PROF_FIELD, "Save current as... (name, Enter)");
+
+    /* presentation */
+    section(&b, env->immediate ? "Presentation (immediate now)"
+                               : "Presentation (vsync now)");
+    {
+        static const int order[NB_SYNC_COUNT] = {
+            NB_SYNC_FULLSCREEN, NB_SYNC_IMMEDIATE, NB_SYNC_VSYNC, NB_SYNC_LATCH,
+        };
+
+        for (i = 0; i < NB_SYNC_COUNT; i++) {
+            chip(&b, nb_sync_label(order[i]), NB_UI_ID_SYNC, order[i],
+                 st->sync == order[i], false);
+        }
+    }
+    hint(&b, "Immediate: lowest latency, may tear; needs fullscreen");
 
     /* view */
     section(&b, "View");
@@ -989,6 +1014,7 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
         return noticef(ui, bits | NB_UI_MODE_DEL | NB_UI_REDRAW,
                        "Removed mode %ux%u", ui->mode_w, ui->mode_h);
     case NB_UI_ID_RULE_SAVE:
+        /* Compatibility: settings are remembered by themselves now. */
         if (env->buf_w <= 0 || env->buf_h <= 0 ||
             nb_vstore_rule_save(st, (unsigned)env->buf_w,
                                 (unsigned)env->buf_h) < 0) {
@@ -998,12 +1024,25 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
         nb_ui_layout(ui, env, NULL, NULL);
         return noticef(ui, bits | NB_UI_SAVE | NB_UI_REDRAW,
                        "Remembered for %dx%d", env->buf_w, env->buf_h);
-    case NB_UI_ID_RULE_DEL:
+    case NB_UI_ID_RULE_DEL: {
+        unsigned rw, rh;
+
+        if (it->arg < 0 || it->arg >= st->nrule) {
+            return bits | NB_UI_REDRAW;
+        }
+        rw = st->rule[it->arg].w;
+        rh = st->rule[it->arg].h;
         nb_vstore_rule_delete(st, it->arg);
         nb_ui_layout(ui, env, NULL, NULL);
-        return noticef(ui, bits | NB_UI_SAVE | NB_UI_REDRAW,
-                       "Forgot the settings for %dx%d", env->buf_w,
-                       env->buf_h);
+        /* VIEW: when it was the mode in force, the default applies now. */
+        return noticef(ui, bits | NB_UI_VIEW | NB_UI_SAVE | NB_UI_REDRAW,
+                       "Forgot the settings for %ux%u", rw, rh);
+    }
+    case NB_UI_ID_RULE_DEFAULT:
+        nb_vstore_make_default(st);
+        nb_ui_layout(ui, env, NULL, NULL);
+        return noticef(ui, bits | NB_UI_VIEW | NB_UI_SAVE | NB_UI_REDRAW,
+                       "The default for modes without their own settings");
     case NB_UI_ID_RES_RECENT:
         if (it->arg < st->nrecent) {
             v->res_w = st->recent[it->arg][0];
@@ -1059,6 +1098,13 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
         nb_ui_layout(ui, env, NULL, NULL);
         return noticef(ui, bits | NB_UI_SAVE | NB_UI_REDRAW,
                        "Deleted profile: %.40s", s);
+    case NB_UI_ID_SYNC:
+        if (st->sync == it->arg) {
+            return bits | NB_UI_REDRAW;
+        }
+        st->sync = it->arg;
+        return noticef(ui, bits | NB_UI_SYNC | NB_UI_SAVE | NB_UI_REDRAW,
+                       "Presentation: %s", nb_sync_label(it->arg));
     case NB_UI_ID_STATS:
         return bits | NB_UI_STATS | NB_UI_REDRAW;
     case NB_UI_ID_FULLSCREEN:

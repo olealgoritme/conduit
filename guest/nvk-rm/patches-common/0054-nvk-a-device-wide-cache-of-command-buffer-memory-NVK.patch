@@ -1,0 +1,237 @@
+From 086fd09c0bf7aa828a1016460b347284ccda40a1 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 12 Oct 2026 21:21:04 +0200
+Subject: [PATCH] nvk: a device-wide cache of command buffer memory
+ (NVK_CMD_MEM_CACHE)
+
+The upload, push and latency blocks of a destroyed or trimmed command
+pool go to a per-device cache (NVK_CMD_MEM_CACHE blocks of each kind,
+default 64) and new pools take them from there, instead of freeing them
+and allocating new ones. Each new block is an nvkmd allocation, a GPU VA
+and a CPU map: on RM in a guest, host round trips. vkd3d-proton makes a
+command pool per D3D12 command allocator, so games that create
+allocators per frame paid that every frame. NVK_CMD_MEM_CACHE=0 frees
+them as before.
+---
+ src/nouveau/vulkan/nvk_cmd_pool.c | 93 +++++++++++++++++++++++++++++--
+ src/nouveau/vulkan/nvk_cmd_pool.h | 10 ++++
+ src/nouveau/vulkan/nvk_device.c   |  5 ++
+ src/nouveau/vulkan/nvk_device.h   | 11 ++++
+ 4 files changed, 115 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_pool.c b/src/nouveau/vulkan/nvk_cmd_pool.c
+index cab5ebc..b6100aa 100644
+--- a/src/nouveau/vulkan/nvk_cmd_pool.c
++++ b/src/nouveau/vulkan/nvk_cmd_pool.c
+@@ -8,6 +8,65 @@
+ #include "nvk_entrypoints.h"
+ #include "nvk_physical_device.h"
+ #include "nvkmd/nvkmd.h"
++#include "util/u_debug.h"
++
++/* The device's cache of command buffer memory
++ *
++ * Creating a command buffer memory block is an nvkmd allocation, a GPU VA
++ * and a CPU map: on RM in a guest that is several host round trips, about a
++ * millisecond for the first blocks of a new command pool (d3d12_gpu_bound /
++ * vk_gpu_bound "record new pools"; NVIDIA's driver: microseconds).
++ * vkd3d-proton makes a command pool per D3D12 command allocator, and games
++ * that create allocators per frame pay it every frame.  So the blocks of a
++ * destroyed or trimmed pool go to a per-device cache, NVK_CMD_MEM_CACHE
++ * (default 64) blocks of each kind, and new pools take them from there.  A
++ * pool only gives its blocks back when none of its command buffers is
++ * pending, as for vkResetCommandPool, which reuses them the same way.
++ * NVK_CMD_MEM_CACHE=0 frees them as before.
++ */
++void
++nvk_device_init_cmd_mem_cache(struct nvk_device *dev)
++{
++   simple_mtx_init(&dev->cmd_mem_cache.lock, mtx_plain);
++   for (unsigned k = 0; k < 3; k++) {
++      list_inithead(&dev->cmd_mem_cache.free[k]);
++      dev->cmd_mem_cache.count[k] = 0;
++   }
++   dev->cmd_mem_cache.max =
++      CLAMP(debug_get_num_option("NVK_CMD_MEM_CACHE", 64), 0, 4096);
++}
++
++void
++nvk_device_finish_cmd_mem_cache(struct nvk_device *dev)
++{
++   for (unsigned k = 0; k < 3; k++) {
++      list_for_each_entry_safe(struct nvk_cmd_mem, mem,
++                               &dev->cmd_mem_cache.free[k], link) {
++         nvkmd_mem_unref(mem->mem);
++         vk_free(&dev->vk.alloc, mem);
++      }
++      list_inithead(&dev->cmd_mem_cache.free[k]);
++   }
++   simple_mtx_destroy(&dev->cmd_mem_cache.lock);
++}
++
++static struct nvk_cmd_mem *
++nvk_cmd_mem_cache_take(struct nvk_device *dev, enum nvk_cmd_mem_kind kind)
++{
++   if (dev->cmd_mem_cache.max == 0)
++      return NULL;
++
++   struct nvk_cmd_mem *mem = NULL;
++   simple_mtx_lock(&dev->cmd_mem_cache.lock);
++   if (!list_is_empty(&dev->cmd_mem_cache.free[kind])) {
++      mem = list_first_entry(&dev->cmd_mem_cache.free[kind],
++                             struct nvk_cmd_mem, link);
++      list_del(&mem->link);
++      dev->cmd_mem_cache.count[kind]--;
++   }
++   simple_mtx_unlock(&dev->cmd_mem_cache.lock);
++   return mem;
++}
+ 
+ static VkResult
+ nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, bool latency,
+@@ -17,10 +76,21 @@ nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, bool latency,
+    struct nvk_cmd_mem *mem;
+    VkResult result;
+ 
+-   mem = vk_zalloc(&pool->vk.alloc, sizeof(*mem), 8,
+-                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   const enum nvk_cmd_mem_kind kind = force_gart ? NVK_CMD_MEM_PUSH :
++                                      latency ? NVK_CMD_MEM_LATENCY :
++                                      NVK_CMD_MEM_UPLOAD;
++   mem = nvk_cmd_mem_cache_take(dev, kind);
++   if (mem != NULL) {
++      *mem_out = mem;
++      return VK_SUCCESS;
++   }
++
++   /* The device's allocator: the block may outlive this pool in the cache */
++   mem = vk_zalloc(&dev->vk.alloc, sizeof(*mem), 8,
++                  VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+    if (mem == NULL)
+       return vk_error(pool, VK_ERROR_OUT_OF_HOST_MEMORY);
++   mem->kind = kind;
+ 
+    /* Upload memory is only written by the CPU; on RM it may go to VRAM
+     * through BAR1 (NVK_RM_UPLOAD_VRAM).  Pushbuffers (force_gart) stay.
+@@ -38,7 +108,7 @@ nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, bool latency,
+                                        flags, NVKMD_MEM_MAP_WR,
+                                        &mem->mem);
+    if (result != VK_SUCCESS) {
+-      vk_free(&pool->vk.alloc, mem);
++      vk_free(&dev->vk.alloc, mem);
+       return result;
+    }
+ 
+@@ -46,11 +116,26 @@ nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, bool latency,
+    return VK_SUCCESS;
+ }
+ 
++/* To the device's cache if it has room, else freed */
+ static void
+ nvk_cmd_mem_destroy(struct nvk_cmd_pool *pool, struct nvk_cmd_mem *mem)
+ {
++   struct nvk_device *dev = nvk_cmd_pool_device(pool);
++
++   if (dev->cmd_mem_cache.max > 0) {
++      simple_mtx_lock(&dev->cmd_mem_cache.lock);
++      if (dev->cmd_mem_cache.count[mem->kind] < dev->cmd_mem_cache.max) {
++         list_addtail(&mem->link, &dev->cmd_mem_cache.free[mem->kind]);
++         dev->cmd_mem_cache.count[mem->kind]++;
++         mem = NULL;
++      }
++      simple_mtx_unlock(&dev->cmd_mem_cache.lock);
++      if (mem == NULL)
++         return;
++   }
++
+    nvkmd_mem_unref(mem->mem);
+-   vk_free(&pool->vk.alloc, mem);
++   vk_free(&dev->vk.alloc, mem);
+ }
+ 
+ static VkResult
+diff --git a/src/nouveau/vulkan/nvk_cmd_pool.h b/src/nouveau/vulkan/nvk_cmd_pool.h
+index d7cbc45..e388915 100644
+--- a/src/nouveau/vulkan/nvk_cmd_pool.h
++++ b/src/nouveau/vulkan/nvk_cmd_pool.h
+@@ -14,8 +14,15 @@
+ struct nvkmd_mem;
+ 
+ /* Recyclable command buffer BO, used for both push buffers and upload */
++enum nvk_cmd_mem_kind {
++   NVK_CMD_MEM_UPLOAD,
++   NVK_CMD_MEM_PUSH,
++   NVK_CMD_MEM_LATENCY,
++};
++
+ struct nvk_cmd_mem {
+    struct nvkmd_mem *mem;
++   enum nvk_cmd_mem_kind kind;
+ 
+    /** Link in nvk_cmd_pool::free_bos or nvk_cmd_buffer::bos */
+    struct list_head link;
+@@ -64,6 +71,9 @@ void nvk_cmd_pool_free_gart_mem_list(struct nvk_cmd_pool *pool,
+                                      struct list_head *mem_list);
+ void nvk_cmd_pool_free_lat_mem_list(struct nvk_cmd_pool *pool,
+                                     struct list_head *mem_list);
++void nvk_device_init_cmd_mem_cache(struct nvk_device *dev);
++void nvk_device_finish_cmd_mem_cache(struct nvk_device *dev);
++
+ void nvk_cmd_pool_free_qmd_list(struct nvk_cmd_pool *pool,
+                                 struct list_head *mem_list);
+ #endif /* NVK_CMD_POOL_H */
+diff --git a/src/nouveau/vulkan/nvk_device.c b/src/nouveau/vulkan/nvk_device.c
+index a32c6cd..634328b 100644
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ #include "nvk_device.h"
++#include "nvk_cmd_pool.h"
+ 
+ #include "nvk_cmd_buffer.h"
+ #include "nvk_entrypoints.h"
+@@ -246,6 +247,7 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
+       goto fail_alloc;
+ 
+    init_dispatch_tables(dev);
++   nvk_device_init_cmd_mem_cache(dev);
+ 
+    dev->vk.shader_ops = &nvk_device_shader_ops;
+    dev->vk.check_status = &nvk_device_check_status;
+@@ -505,6 +507,9 @@ nvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+       /* Idle the upload queue before we tear down heaps */
+       nvk_upload_queue_sync(dev, &dev->upload);
+ 
++      /* Every command pool is gone: free the blocks they left behind */
++      nvk_device_finish_cmd_mem_cache(dev);
++
+       nvk_pass_profile_finish(dev);
+ 
+       nvk_slm_area_finish(&dev->slm);
+diff --git a/src/nouveau/vulkan/nvk_device.h b/src/nouveau/vulkan/nvk_device.h
+index a17a5ba..6dc8337 100644
+--- a/src/nouveau/vulkan/nvk_device.h
++++ b/src/nouveau/vulkan/nvk_device.h
+@@ -63,6 +63,17 @@ struct nvk_device {
+    struct nvk_heap shader_heap;
+    struct nvk_heap event_heap;
+    struct nvk_heap qmd_heap;
++
++   /* Command buffer memory of destroyed and trimmed command pools, kept for
++    * the next pool instead of being freed (NVK_CMD_MEM_CACHE blocks of each
++    * kind, see nvk_cmd_pool.c).
++    */
++   struct {
++      simple_mtx_t lock;
++      struct list_head free[3];
++      uint32_t count[3];
++      uint32_t max;
++   } cmd_mem_cache;
+    struct nvk_slm_area slm;
+    struct nvkmd_mem *vab_memory;
+ 
+-- 
+2.43.0
+

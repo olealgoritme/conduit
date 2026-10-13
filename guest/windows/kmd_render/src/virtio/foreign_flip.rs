@@ -62,6 +62,7 @@ use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use helios_kmd_logic::flip_pipeline::{self as fp, Ack, Pipeline, Settled};
+use helios_kmd_logic::shipping_defaults as sd;
 use helios_kmd_logic::foreign_flip::{
     self as ff, ref_name, Book, Change, Facts, Target, Verdict, Why,
 };
@@ -108,6 +109,9 @@ static SHOWN_RESID: AtomicU32 = AtomicU32::new(0);
 /// `rm_present` flags carry can be taken by the level 5 service in the one pass that stands
 /// down, this one cannot be.
 static OWED: AtomicU32 = AtomicU32::new(0);
+/// The newest programming that owes a frame was an immediate flip (`ImmFlip`): its host flip is
+/// not held by the presenter's minimum interval. Set with `OWED`, by every programming.
+static OWED_IMM: AtomicU32 = AtomicU32::new(0);
 /// Programmings taken ([`take`]) and programmings the service pass has served ([`served`]: its
 /// host flip was submitted or done, or nothing is owed any more). `TAKEN != SERVED` is a frame
 /// still owed in the presenter (waiting for its pacing, its window slot, a retry): the part of
@@ -380,7 +384,10 @@ fn knob_on() -> bool {
 
 #[inline(never)]
 fn read_knob() -> u32 {
-    let v = crate::diag::read_config_dword(crate::diag::knobs::FOREIGN_FLIP, 0);
+    let v = crate::diag::read_config_dword(
+        crate::diag::knobs::FOREIGN_FLIP,
+        sd::FOREIGN_FLIP,
+    );
     // The window is only meaningful with the arm on; read beside it, once per generation.
     // `FfAsyncWin` defaults to 2 when `FlipAnnounce` is on (the Linux guest's model: the flip is
     // fire-and-forget on the control queue and the retire does not wait for the host); an explicit
@@ -440,6 +447,7 @@ pub(crate) fn forget() {
     }
     SHOWN_RESID.store(0, Ordering::Release);
     OWED.store(0, Ordering::Release);
+    OWED_IMM.store(0, Ordering::Release);
     TAKEN.store(0, Ordering::Release);
     SERVED.store(0, Ordering::Release);
     YIELDS.store(0, Ordering::Relaxed);
@@ -749,6 +757,10 @@ fn take(
     };
     // A frame is owed for every programming, also of the same allocation again.
     TAKEN.fetch_add(1, Ordering::AcqRel);
+    OWED_IMM.store(
+        u32::from(crate::ddi::immediate_flip::programming_is_immediate()),
+        Ordering::Release,
+    );
     if OWED.swap(1, Ordering::AcqRel) != 0 {
         // The previous programming's frame was still owed: this newer one replaces it.
         COAL.fetch_add(1, Ordering::Relaxed);
@@ -1038,6 +1050,9 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
         // Nothing of this arm is shown: a held repeat has nothing to repeat.
         drop_held();
     }
+    // `ImmFlip`: whether the frame this pass owes for a programming came from an immediate flip.
+    // Taken with the programming's edge, so a later repeat or resume edge is paced again.
+    let mut owed_imm = false;
     let (mut frame_edge, mut resume_edge) = if holds {
         rm_present::clear_wake_at();
         rm_present::take_edges()
@@ -1050,6 +1065,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
         // picture again, which the repeat gate bounds (`FfRepeatMs`): held edges coalesce into
         // one repeat at the end of the gate, and the worker is woken for it by its timed wait.
         let owed_new = OWED.swap(0, Ordering::AcqRel) != 0;
+        owed_imm = OWED_IMM.swap(0, Ordering::AcqRel) != 0 && owed_new;
         if frame_edge && !owed_new {
             EDGE_HELD.store(1, Ordering::Release);
         }
@@ -1077,9 +1093,13 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
             }
         }
     }
-    let interval = helios_kmd_logic::flip_retire::paced_interval(
-        rr::flip_interval_100ns(adapter.effective_refresh_mhz()),
-        WINDOW.load(Ordering::Acquire) != 0,
+    // `ImmFlip`: an immediate flip's frame goes to the host as soon as it is taken.
+    let interval = crate::ddi::immediate_flip::min_interval(
+        helios_kmd_logic::flip_retire::paced_interval(
+            rr::flip_interval_100ns(adapter.effective_refresh_mhz()),
+            WINDOW.load(Ordering::Acquire) != 0,
+        ),
+        owed_imm,
     );
     {
         let mut g = PRES.lock();

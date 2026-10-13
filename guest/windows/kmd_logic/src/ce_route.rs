@@ -376,8 +376,10 @@ pub fn pfns_of_runs(runs: &[crate::guest_blob::Run], out: &mut [u64]) -> Option<
 pub enum Prep {
     /// Not yet looked at.
     Pending,
-    /// The producer's semaphore entry and image base in the channel's VA space.
-    Ready { sem_va: u64, src_va: u64 },
+    /// The producer's semaphore entry and image base in the channel's VA space, and the dup
+    /// cache's slots they came from (`ce_dup::Lease`): the dispatch submits only while both still
+    /// hold that making (`ce_dup::Cache::holds_lease`), else the VAs map something else by now.
+    Ready { sem_va: u64, src_va: u64, lease: crate::ce_dup::Lease },
     /// It could not be made: the dispatch takes the Venus copy.
     Failed(Why),
 }
@@ -1121,7 +1123,7 @@ mod tests {
         assert!(!j.has_room());
         assert!(!j.add(3, 0xa, 7, 0));
         assert_eq!(j.first_pending().map(|x| x.token), Some(1));
-        j.find_mut(1, 0xa).unwrap().prep = Prep::Ready { sem_va: 1, src_va: 2 };
+        j.find_mut(1, 0xa).unwrap().prep = Prep::Ready { sem_va: 1, src_va: 2, lease: crate::ce_dup::Lease::default() };
         assert_eq!(j.first_pending().map(|x| (x.token, x.boundary)), Some((1, 0xb)));
         assert_eq!(j.remove(1, 0xb).map(|x| x.dst), Some(8));
         assert!(j.has_room());

@@ -308,7 +308,7 @@ void nb_fs_title(char *buf, size_t n, const char *base, unsigned mode_w,
 /* ── overlay pixels ─────────────────────────────────────────────────────── */
 
 #define OV_COLS   28            /* characters per line                      */
-#define OV_LINES  12
+#define OV_LINES  13
 #define OV_GRAPH  24            /* graph height, in font pixels             */
 
 /* Premultiplied ARGB8888. */
@@ -390,6 +390,11 @@ void nb_ov_paint(uint32_t *px, unsigned w, unsigned h, unsigned sc,
     snprintf(l, sizeof(l), "INPUT %.0f/S CURSOR %s", s->input_ps,
              in->host_cursor ? "HOST" : "GUEST");
     ov_line(px, w, h, sc, 11, l, OV_FG);
+    /* How frames reach the compositor (nb_blit.h) and on which GPU. */
+    snprintf(l, sizeof(l), "%s%s%s", in->path ? in->path : "-",
+             in->gpu && *in->gpu ? " " : "", in->gpu ? in->gpu : "");
+    ov_line(px, w, h, sc, 12, l,
+            in->path && !strcmp(in->path, "GPU COPY") ? OV_YELLOW : OV_FG);
 
     /* The graph: the worst flip interval per bin over the last 2 s, scaled
      * so the refresh interval sits at 40% height. */

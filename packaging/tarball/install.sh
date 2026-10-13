@@ -43,6 +43,13 @@ if [ -d /etc/apparmor.d ]; then
     install -d /etc/apparmor.d/abstractions
     install -m0644 "$PREFIX/share/conduit/apparmor/conduit" /etc/apparmor.d/abstractions/conduit
 fi
+# Host isolation: the root unit and the polkit rule that lets local users
+# start and stop it (docs/HOST-TUNING.md).
+install -D -m0644 "$PREFIX/share/conduit/conduit-isolation@.service" /etc/systemd/system/conduit-isolation@.service
+if [ -d /etc/polkit-1 ]; then
+    install -d -m0755 /etc/polkit-1/rules.d
+    install -m0644 "$PREFIX/share/conduit/50-conduit-isolation.rules" /etc/polkit-1/rules.d/50-conduit-isolation.rules
+fi
 # The icon set (Icon=conduit), staged by build.sh under $PREFIX/share/icons/hicolor.
 (cd "$PREFIX/share/icons/hicolor" && find . -type f -path '*/apps/conduit.*') | while IFS= read -r f; do
     install -D -m0644 "$PREFIX/share/icons/hicolor/$f" "/usr/local/share/icons/hicolor/$f"

@@ -39,6 +39,7 @@
 #define NB_UI_NOTICE    (1u << 10)  /* show ui->notice as an on-screen notice */
 #define NB_UI_MODE_ADD  (1u << 11)  /* add ui->mode_w x mode_h to the VM's modes */
 #define NB_UI_MODE_DEL  (1u << 12)  /* remove it from the VM's custom modes  */
+#define NB_UI_SYNC      (1u << 13)  /* st->sync changed: re-apply presentation */
 
 /* Pointer shapes the area editor asks for. */
 enum {
@@ -61,6 +62,7 @@ struct nb_ui_env {
     bool     vm_actions;        /* shutdown/restart commands are available  */
     bool     translucent;       /* the panel layer can blend (Wayland: yes) */
     bool     no_stats;          /* this backend has no stats overlay (X11)  */
+    bool     immediate;         /* frames are presented immediately now     */
     /* The display's mode list from the backend (CMD_MODES); NULL or empty
      * with an older backend, which leaves the old presets. */
     const struct nb_modes *modes;
@@ -91,7 +93,9 @@ enum {
     NB_UI_ID_RES_MODE,          /* arg: index into env->modes                */
     NB_UI_ID_RES_MODE_DEL,      /* arg: index into env->modes (a custom one) */
     NB_UI_ID_RULE_SAVE,         /* remember the layout for the guest's mode  */
-    NB_UI_ID_RULE_DEL,          /* forget it                                 */
+    NB_UI_ID_RULE_DEL,          /* arg: index into st->rule: forget it       */
+    NB_UI_ID_RULE_DEFAULT,      /* the current layout becomes the default    */
+    NB_UI_ID_SYNC,              /* arg: NB_SYNC_*                            */
 };
 
 /* One clickable thing on the panel, panel CONTENT coordinates (logical; the

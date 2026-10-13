@@ -73,6 +73,7 @@ struct nb_session *nb_session_x11(const struct nb_config *cfg)
 #include <xcb/xinput.h>
 #endif
 #include "nb_ui.h"
+#include "nb_relacc.h"
 
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
 
@@ -115,6 +116,18 @@ struct nb_x11 {
      */
     xcb_atom_t        a_clipboard, a_utf8, a_targets, a_prop, a_incr;
     xcb_atom_t        a_net_wm_name;
+    /* Presentation sync (nb_sync_*): Present with PresentOptionAsync while
+     * immediate, and _NET_WM_BYPASS_COMPOSITOR = 1 in fullscreen so a
+     * compositing manager unredirects the window. */
+    xcb_atom_t        a_bypass;
+    int               bypass_set;       /* -1 never set */
+    /* --stats: per second, how frames reached the screen.  Present reports
+     * FLIP (the pixmap went to the CRTC: direct scanout) or COPY per frame;
+     * an XRender composite (a scaled picture) is always a copy. */
+    xcb_atom_t        a_cm;             /* _NET_WM_CM_Sn: a compositing manager */
+    uint64_t          st_t0;            /* ms */
+    unsigned          st_commits, st_flip, st_copy, st_comp;
+    bool              imm;
     xcb_timestamp_t   last_time;      /* a REAL event time; X rejects guesses */
     bool              focused;
     char             *src_text;       /* what we serve as CLIPBOARD owner     */
@@ -148,6 +161,7 @@ struct nb_x11 {
                                      * nothing completed yet                  */
     uint32_t last_raw_seq;          /* de-dup for double-delivered XI2 raw    */
     int      last_raw_dx, last_raw_dy;
+    struct nb_relacc relacc;   /* sub-pixel carry of raw motion */
     int  win_w, win_h;              /* toplevel size, from ConfigureNotify    */
     int  con_w, con_h;              /* content-window size we last asked for  */
     bool grabbed, fullscreen;
@@ -189,6 +203,8 @@ struct nb_x11 {
     int       con_x, con_y;
     bool      rehint_pending;
     uint64_t  rehint_due_ms;
+    unsigned  mode_ui_due;      /* NB_UI_* bits after a guest mode change */
+    unsigned  logged_w, logged_h;   /* last mode whose first frame was logged */
 
     /* The viewer's own UI (nb_ui.h) on child windows: opaque, so it needs
      * no compositor and no ARGB visual. */
@@ -735,6 +751,84 @@ static bool x11_render_scaled(struct nb_x11 *x, struct nb_x11_buf *sl)
 #endif
 
 /*
+ * DIRECT SCANOUT ON X11, FROM OUR SIDE.  Present flips (puts the pixmap on
+ * the CRTC) only for a window that covers the screen, unredirected by any
+ * compositing manager, with nothing mapped over it -- and only for a pixmap
+ * of that window's size, so a scaled picture (an XRender composite) is
+ * always a copy.  Lists what the viewer itself is breaking right now.
+ */
+static void x11_scanout_blockers(struct nb_x11 *x, char *b, size_t n)
+{
+    size_t k = 0;
+    bool cm = false;
+
+#define BLK(cond, what) do { if ((cond) && k < n) { \
+        k += (size_t)snprintf(b + k, n - k, "%s%s", k ? ", " : "", what); \
+        if (k >= n) k = n - 1; } } while (0)
+    b[0] = '\0';
+    if (x->a_cm != XCB_ATOM_NONE) {
+        xcb_get_selection_owner_reply_t *r = xcb_get_selection_owner_reply(
+            x->c, xcb_get_selection_owner(x->c, x->a_cm), NULL);
+
+        cm = r && r->owner != XCB_NONE;
+        free(r);
+    }
+    BLK(!x->fullscreen, "not fullscreen");
+    BLK(x->st_comp > 0, "picture scaled (an XRender composite is a copy)");
+    BLK(x->con_w != x->win_w || x->con_h != x->win_h,
+        "picture does not cover the window");
+    BLK(x->dlg_mapped, "dialog mapped");
+    BLK(x->ly_menu.mapped || x->ui.open, "menu open");
+    BLK(x->ly_note.mapped, "notice mapped");
+    BLK(x->ly_btn.mapped, "menu button mapped");
+    BLK(cm && !(x->fullscreen && x->bypass_set == 1),
+        "a compositing manager redirects the window");
+#undef BLK
+    if (!k) {
+        snprintf(b, n, "none on our side (%s)",
+                 cm ? "the compositing manager did not unredirect it"
+                    : "the X server's choice");
+    }
+}
+
+static void x11_stats_flush(struct nb_x11 *x)
+{
+    uint64_t now = x11_now_ms();
+
+    if (!nb_stats) {
+        return;
+    }
+    if (!x->st_t0) {
+        x->st_t0 = now;
+        return;
+    }
+    if (now - x->st_t0 < 1000) {
+        return;
+    }
+    if (x->st_commits || x->st_flip || x->st_copy) {
+        double secs = (double)(now - x->st_t0) / 1e3;
+        unsigned shown = x->st_flip + x->st_copy + x->st_comp;
+        char blk[300] = "";
+
+        if (x->st_flip < shown) {
+            char why[260];
+
+            x11_scanout_blockers(x, why, sizeof(why));
+            snprintf(blk, sizeof(blk), " | composited, blockers: %s", why);
+        }
+        nb_log("stats: commit %.1f fps (%u direct scanout, %.0f%%) | Present "
+               "FLIP %u, COPY %u, XRender composites %u | path: %s, %s%s",
+               x->st_commits / secs, x->st_flip,
+               shown ? 100.0 * x->st_flip / shown : 0.0, x->st_flip,
+               x->st_copy, x->st_comp,
+               x->st_comp ? "scaled by XRender" : "Present 1:1, zero-copy",
+               x->imm ? "immediate" : "vsync", blk);
+    }
+    x->st_t0 = now;
+    x->st_commits = x->st_flip = x->st_copy = x->st_comp = 0;
+}
+
+/*
  * Put one dma-buf frame on screen.  Returns 1 when it went by composite (the
  * buffer is free again at once), 0 when by Present (freed on IdleNotify).
  */
@@ -749,6 +843,7 @@ static int x11_draw(struct nb_x11 *x, struct nb_x11_buf *sl)
      */
     if ((x->place.pic.w != (int)sl->w || x->place.pic.h != (int)sl->h) &&
         x11_render_scaled(x, sl)) {
+        x->st_comp++;
         return 1;
     }
 #endif
@@ -759,7 +854,10 @@ static int x11_draw(struct nb_x11 *x, struct nb_x11_buf *sl)
                        (int16_t)(x->place.pic.y - x->place.vis.y),
                        XCB_NONE /* target_crtc */,
                        XCB_NONE /* wait_fence */, XCB_NONE /* idle_fence */,
-                       0 /* options */, 0 /* target_msc: as soon as possible */,
+                       /* Immediate: flip now, not at the next vblank (the
+                        * server may still wait where it cannot tear). */
+                       x->imm ? XCB_PRESENT_OPTION_ASYNC : 0,
+                       0 /* target_msc: as soon as possible */,
                        0, 0, 0, NULL);
     return 0;
 }
@@ -776,6 +874,20 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
     if (!sl->valid) {
         x->pending = -1;
         return -ENOENT;
+    }
+    /*
+     * A NEW GUEST MODE: its per-mode rule (nb_vstore_guest_mode) goes into
+     * the layout BEFORE this frame is placed, so the mode's first frame is
+     * already drawn with it.  The notice and the menu follow from the tick.
+     */
+    if (sl->w != nb_guest_w || sl->h != nb_guest_h) {
+        unsigned ch = nb_guest_mode_changed(&x->vst, sl->w, sl->h,
+                                            x->ui.notice, sizeof(x->ui.notice));
+
+        if ((ch & NB_VIEW_CH_LAYOUT) || x->ui.notice[0]) {
+            x->mode_ui_due = NB_UI_REDRAW |
+                             (x->ui.notice[0] ? NB_UI_NOTICE : 0);
+        }
     }
 
     /*
@@ -856,7 +968,23 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         return 0;
     }
 
-    if (x11_draw(x, sl)) {
+    x->st_commits++;
+    x11_stats_flush(x);
+    int composited = x11_draw(x, sl);
+
+    if (sl->w != x->logged_w || sl->h != x->logged_h) {
+        char sum[64];
+
+        x->logged_w = sl->w;
+        x->logged_h = sl->h;
+        /* What the mode's FIRST frame was placed with (the rule, if any,
+         * already in force): checkable from the log. */
+        nb_view_summary(&x->vst.cur, sum, sizeof(sum));
+        nb_log("guest mode %ux%u: first frame %dx%d at %d,%d in %dx%d (%s)",
+               sl->w, sl->h, x->place.vis.w, x->place.vis.h, x->place.vis.x,
+               x->place.vis.y, x->win_w, x->win_h, sum);
+    }
+    if (composited) {
         /*
          * PACE A COMPOSITED FRAME ON VBLANK.  There is no PixmapComplete
          * for a composite, so without this the only pacing left was the
@@ -952,6 +1080,13 @@ static void x11_present_event(struct nb_x11 *x, struct nb_sink *sink,
          * to the screen" is unanswerable from the outside.  Logged on every
          * CHANGE, not every frame, so it stays one line in normal use.
          */
+        if (ce->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP) {
+            if (ce->mode == XCB_PRESENT_COMPLETE_MODE_FLIP) {
+                x->st_flip++;
+            } else if (ce->mode != XCB_PRESENT_COMPLETE_MODE_SKIP) {
+                x->st_copy++;
+            }
+        }
         if (ce->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP &&
             ce->mode != x->last_mode) {
             static const char *modes[] = { "COPY", "FLIP", "SKIP",
@@ -1306,10 +1441,20 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             xcb_configure_notify_event_t *c = (void *)ev;
 
             if (c->window == x->win) {
+                bool resized = x->win_w != c->width || x->win_h != c->height;
+
                 x->win_w = c->width;
                 x->win_h = c->height;
                 if (c->width == 0 || c->height == 0) {
                     break;
+                }
+                /* The bars are the window's black background.  The server
+                 * paints it on the exposure a resize makes, but not every
+                 * window manager's resize exposes the whole window (and a
+                 * same-placement relayout clears nothing), so clear it here:
+                 * one request per resize, none per frame. */
+                if (resized) {
+                    xcb_clear_area(x->c, 0, x->win, 0, 0, 0, 0);
                 }
                 if (x->idle_shown && x->current < 0) {
                     x11_show_idle(s);   /* the placeholder is window-sized */
@@ -1341,12 +1486,20 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 int nvals =
                     xcb_input_raw_button_press_axisvalues_raw_length(re);
                 int dx = 0, dy = 0;
+                /* The raw valuators in 1/256 (nb_relacc.h): a mouse
+                 * libinput scales (a known DPI) moves in fractions, which
+                 * the integral part alone dropped. */
+                int32_t fx = 0, fy = 0;
 
                 if (nvals >= 1) {
                     dx = (int)vals[0].integral;
+                    fx = (int32_t)((int64_t)vals[0].integral * 256 +
+                                   (int32_t)(vals[0].frac >> 24));
                 }
                 if (nvals >= 2) {
                     dy = (int)vals[1].integral;
+                    fy = (int32_t)((int64_t)vals[1].integral * 256 +
+                                   (int32_t)(vals[1].frac >> 24));
                 }
                 if (nb_verbose) {
                     nb_log("XI RawMotion seq=%u dev=%u src=%u dx=%d dy=%d",
@@ -1387,6 +1540,7 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 x->last_raw_seq = re->full_sequence;
                 x->last_raw_dx = dx;
                 x->last_raw_dy = dy;
+                nb_relacc_add(&x->relacc, fx, fy, &dx, &dy);
                 nb_sink_rel(sink, dx, dy);
             }
 #endif
@@ -1769,6 +1923,29 @@ static int x11_set_grab(struct nb_session *s, bool on)
     return 0;
 }
 
+static void x11_sync_apply(struct nb_x11 *x, const char *why)
+{
+    bool imm = nb_sync_immediate(x->vst.sync, x->fullscreen);
+    int bypass = imm && x->fullscreen ? 1 : 0;
+
+    if (x->a_bypass != XCB_ATOM_NONE && bypass != x->bypass_set) {
+        uint32_t v = (uint32_t)bypass;
+
+        xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_bypass,
+                            XCB_ATOM_CARDINAL, 32, 1, &v);
+        x->bypass_set = bypass;
+        xcb_flush(x->c);
+    }
+    if (imm != x->imm || why) {
+        nb_log("presentation: %s (%s, sync=%s)%s",
+               imm ? "IMMEDIATE (Present async, tearing allowed)" : "vsync",
+               x->fullscreen ? "fullscreen" : "windowed",
+               nb_sync_name(x->vst.sync),
+               bypass ? "; asked the compositor to unredirect the window" : "");
+    }
+    x->imm = imm;
+}
+
 static int x11_set_fullscreen(struct nb_session *s, bool on)
 {
     struct nb_x11 *x = s->priv;
@@ -1796,6 +1973,7 @@ static int x11_set_fullscreen(struct nb_session *s, bool on)
                    XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT, (const char *)&ev);
     xcb_flush(x->c);
     x->fullscreen = on;
+    x11_sync_apply(x, NULL);
     return 0;
 }
 
@@ -2096,6 +2274,7 @@ skip_dmabuf_extensions:
     x11_cursor_init(x);
     xcb_map_window(x->c, x->content);
     xcb_map_window(x->c, x->win);
+    x11_sync_apply(x, "startup");
 
     /*
      * Present event stream: pacing (complete) and buffer release (idle).
@@ -2122,6 +2301,14 @@ skip_dmabuf_extensions:
     x->a_prop      = x11_atom(x->c, "CONDUIT_CLIP");
     x->a_incr      = x11_atom(x->c, "INCR");
     x->a_net_wm_name = x11_atom(x->c, "_NET_WM_NAME");
+    x->a_bypass    = x11_atom(x->c, "_NET_WM_BYPASS_COMPOSITOR");
+    {
+        char cm[32];
+
+        snprintf(cm, sizeof(cm), "_NET_WM_CM_S%d", screen_n);
+        x->a_cm = x11_atom(x->c, cm);
+    }
+    x->bypass_set  = -1;
     if (x->a_wm_proto != XCB_ATOM_NONE && x->a_wm_delete != XCB_ATOM_NONE) {
         xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_wm_proto,
                             XCB_ATOM_ATOM, 32, 1, &x->a_wm_delete);
@@ -2733,6 +2920,7 @@ static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x)
     e.stats_on = false;
     e.no_stats = true;          /* X11 logs --stats; there is no overlay */
     e.fullscreen = x->fullscreen;
+    e.immediate = x->imm;
 #ifdef NB_HAVE_XCB_RENDER
     e.nearest_ok = x->pict_fmt != 0;
 #else
@@ -3081,6 +3269,14 @@ static void x11_menu_set(struct nb_x11 *x, bool open)
 
 static void x11_ui_do(struct nb_x11 *x, unsigned bits)
 {
+    /*
+     * Remembered for the guest mode in force (nb_vstore_auto_rule), once an
+     * area drag is over (its steps are not each written to the file).
+     */
+    if ((bits & (NB_UI_VIEW | NB_UI_SAVE)) && x->ui.drag < 0 &&
+        nb_vstore_auto_rule(&x->vst)) {
+        bits |= NB_UI_SAVE;
+    }
     if (bits & NB_UI_VIEW) {
         x11_relayout(x);
     }
@@ -3096,6 +3292,9 @@ static void x11_ui_do(struct nb_x11 *x, unsigned bits)
     }
     if (bits & NB_UI_STATS) {
         nb_log("stats overlay: the X11 backend logs --stats instead");
+    }
+    if (bits & NB_UI_SYNC) {
+        x11_sync_apply(x, "menu");
     }
     if ((bits & NB_UI_FULLSCREEN) && x->sink) {
         nb_sink_toggle_fullscreen(x->sink);
@@ -3222,19 +3421,12 @@ static int x11_tick_ui(struct nb_x11 *x, int next)
     uint64_t now = x11_now_ms();
     int due;
 
-    /* A new guest mode: apply its per-mode rule (nb_vstore_guest_mode). */
-    if (x->current >= 0) {
-        unsigned bw = x->bufs[x->current].w, bh = x->bufs[x->current].h;
+    /* A new guest mode was applied by x11_commit: the notice and menu. */
+    if (x->mode_ui_due) {
+        unsigned bits = x->mode_ui_due;
 
-        if (bw != nb_guest_w || bh != nb_guest_h) {
-            unsigned ch = nb_guest_mode_changed(&x->vst, bw, bh, x->ui.notice,
-                                                sizeof(x->ui.notice));
-
-            if (ch & NB_VIEW_CH_LAYOUT) {
-                x11_ui_do(x, NB_UI_VIEW | NB_UI_REDRAW |
-                                 (x->ui.notice[0] ? NB_UI_NOTICE : 0));
-            }
-        }
+        x->mode_ui_due = 0;
+        x11_ui_do(x, bits);
     }
 
     if (x->cfg && x->cfg->open_menu && x->win_w > 0) {

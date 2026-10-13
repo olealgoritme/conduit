@@ -28,8 +28,9 @@ from GPU memory to your screen: no copying, no video compression.
 | Clipboard both ways, sound (speakers + mic) | ✅ |
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
-| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, driver 22.22.405.24 built by hand: [Windows guests](#windows-guests)) |
-| NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
+| Host isolation: host work and device interrupts kept off a running VM's CPUs (per CCD, P/E cores or NUMA node; on by default, [HOST-TUNING.md](docs/HOST-TUNING.md#cpu-host-isolation)) | ✅ |
+| Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, guest driver 22.22.405.84 attached to every release: [Windows guests](#windows-guests)) |
+| NVK (Mesa's open Vulkan driver) on NVIDIA's Resource Manager (the host's NVIDIA driver), in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
 > Early software, tested mainly on an RTX 5090 with Ubuntu 24.04 and Hyprland;
 > also run on an RTX 4070 SUPER ([GPU support](docs/GPU-SUPPORT.md)). Windows
@@ -46,7 +47,7 @@ from GPU memory to your screen: no copying, no video compression.
 <p align="center"><b>Windows 11 VM</b></p>
 
 <p align="center">
-  <img src="docs/assets/conduit-win11.jpg" alt="A Windows 11 guest on Conduit on an RTX 5090: the host terminal shows nvidia-smi with conduit-backend and conduit-venus and virsh list with win11 running; below, the guest runs Unigine Heaven 4.0 in Direct3D 11 at 300 fps, and Task Manager shows the Conduit Helios GPU, driver 22.22.405.24" width="860">
+  <img src="docs/assets/conduit-win11.jpg" alt="A Windows 11 guest on Conduit on an RTX 5090: the host terminal shows nvidia-smi with conduit-backend and conduit-venus and virsh list with win11 running; below, the guest runs Unigine Heaven 4.0 in Direct3D 11 at 300 fps, and Task Manager shows the Conduit Helios GPU" width="860">
 </p>
 
 <p align="center"><sub>A Windows 11 guest on an RTX 5090: Unigine Heaven in Direct3D 11 at 300 fps, rendered by NVK on the host GPU.</sub></p>
@@ -81,7 +82,14 @@ need relative mouse input), and run games at the VM's display mode (e.g.
 viewer scales it to the window ([docs/VIEWER.md](docs/VIEWER.md)). Ctrl+Alt+G
 again releases the mouse.
 
-**Conduit GPU tray.** The driver package also installs a small tray app that
+**Guest extras.** Every release also carries
+`conduit-windows-gpu-setup-<version>.zip`, built from the same driver. Its
+`HeliosSetup.exe`, run once after `install.ps1`, adds the GPU tray below, the
+shared-folder mounts, the logon task that makes the Conduit display the only
+active one, and the virtio-input driver; it keeps the desktop setting
+`install.ps1` wrote ([packaging README](guest/windows/packaging/windows/README.md)).
+
+**Conduit GPU tray.** A small tray app (from the setup package) that
 starts at logon with no prompt. Its icon shows the host GPU's live temperature
 or load; clicking it opens a popup with load, power and temperature, 60-second
 graphs and VRAM, clock and fan bars. Its Shared folders menu opens the host
@@ -99,7 +107,7 @@ More detail (building the driver yourself, knobs, troubleshooting):
 A Windows 11 guest renders on the host GPU through NVK-on-RM: Mesa's open
 NVK Vulkan driver runs in the guest and talks to the host's NVIDIA kernel
 driver (RM) through Conduit. Tested on an RTX 5090. Guest driver version:
-**22.22.405.24**.
+**22.22.405.84**.
 
 ```
  Windows guest
@@ -126,18 +134,11 @@ the per-process policy keeps off NVK.
 | 5120x1440, with bots | ~350 |
 | lower resolutions | ~400–500 |
 
-**Main knobs** (defaults in force; registry values are `REG_DWORD`, NVK
-settings are environment variables of the process):
-
-| Knob | Default | What it does |
-|---|---|---|
-| `IndepFlip` (KMD service key) | 0 | independent flip for full-screen flip-model windows; 1 turns it on |
-| `DirectFlipSupport` (`HKLM\SOFTWARE\Helios`) | 0 | the D3D11.1 `CheckDirectFlipSupport` answer DWM uses for independent flip; 1 with `IndepFlip=1` |
-| `HwCursor` (KMD service key) | follows `IndepFlip` | the hardware cursor; absent means on with independent flip, off without |
-| `NVK_INDIRECT_PUSH` | 0 | indirect draw records through the pushbuffer |
-| `NVK_NULL_VB_ZERO_PAGE` | 1 | null vertex buffers bound to the zero page |
-| `NVK_ZERO_PAGE_VRAM` | 1 | the zero page (null descriptors) in VRAM |
-| `NVK_RM_BAR_MB` | 0 | host-visible VRAM heap through BAR1; 0 off, -1 all of BAR1, N MiB |
+**Knobs.** The recommended configuration is the code defaults: no registry
+value needs to be set beyond what `install.ps1` writes. Every knob of the
+guest driver, its default and whether it is a setting, a tuning value, a
+debug switch or an experiment is in
+[docs/WINDOWS-KNOBS.md](docs/WINDOWS-KNOBS.md), generated from the code.
 
 **Diagnostics** (written to `%ProgramData%\Helios\` per process):
 
@@ -152,19 +153,19 @@ settings are environment variables of the process):
 
 **Known limitations:**
 
-- The guest exposes one display mode at a time, set by `conduit up --display`,
-  `conduit view NAME WxH@HZ` or the viewer's window size. The driver does not
-  scale, so a game rendering below that mode does not fill the screen.
+- Every guest display mode runs at the native refresh rate. The guest offers
+  the VM's mode list: native (`conduit up --display`), the standard modes that
+  fit within it, and custom modes (`conduit display VM --add WxH`;
+  [docs/SCANOUT.md](docs/SCANOUT.md) "Mode list").
 - In games, use the viewer's mouse grab (`Ctrl+Alt+G`) for mouse look.
-- Independent flip is off by default (`IndepFlip=0`, `DirectFlipSupport=0`):
-  full-screen games are composed by DWM.
-- The driver is test-signed (Secure Boot off, test-signing on), and the guest
-  package is built and installed by hand.
+- The driver is test-signed (Secure Boot off, test-signing on).
 
 More:
 
 - [docs/WINDOWS.md](docs/WINDOWS.md): set up the VM, build and install the
-  driver package, the registry knobs
+  driver package
+- [docs/WINDOWS-KNOBS.md](docs/WINDOWS-KNOBS.md): every guest knob, its
+  default and class, generated from the code
 - [guest/nvk-rm/README.md](guest/nvk-rm/README.md): the NVK-on-RM patch
   series and its knobs
 - [docs/NVK-ROADMAP.md](docs/NVK-ROADMAP.md): what is left
@@ -431,6 +432,7 @@ tested setup alone, see [docs/PROVEN-SETUP-CHECK.md](docs/PROVEN-SETUP-CHECK.md)
 | Short stutters or freezes in the VM, benchmark numbers that swing | The host is starving it (swap, builds on its cores): see [host tuning](docs/HOST-TUNING.md) |
 | "not enough free memory" | Close apps or give the VM less RAM; `--no-mem-check` skips the check |
 | Overlay says `COMPOSITED` in fullscreen | Your desktop composites the window; see [direct scanout](docs/SCANOUT.md). On Hyprland: `conduit view myvm --tune-hyprland`, then `Ctrl+Alt+F`, `Ctrl+Alt+D` |
+| A game feels sluggish in fullscreen (`commit->present` of 4 ms or more in the viewer log) | The compositor is waiting for vblank. Check `presentation:` in `vms/NAME/logs/viewer.log` and the desktop's tearing setting (Hyprland: `general:allow_tearing = true`); see [Presentation](docs/VIEWER.md#presentation-immediate-vsync-or-latest-per-refresh) |
 | Stream: "ports are in use" | Another `conduit stream` or Sunshine is running; stop it, or use `--port 48089` |
 | Moonlight: Windows/Super key does nothing | Moonlight settings → *Capture system keyboard shortcuts* → **Always** |
 | Steam window errors | Steam is an X11 app and needs XWayland in the VM's session; open an issue with `conduit logs myvm` |

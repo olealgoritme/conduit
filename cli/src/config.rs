@@ -6,6 +6,11 @@
 //! | `venus.guest_blobs` | true, false | false: the backend serves guest-memory blobs (docs/VENUS.md "Guest-memory blobs"), Venus copy destinations over the guest's own pages, for the Windows KMD's windowed Present. Opt-in while new. Applies when a VM's backend next starts. |
 //! | `backend.latency` | off, all, or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin | unset: the backend's and conduit-venus's defaults (`all`: the first four); a list is exactly those options (`all,fence-spin` adds the polling fence wait). Round-trip latency options, docs/research/host-roundtrip-latency.md. Applies when a VM's backend next starts. |
 //! | `backend.cpus` | a CPU list such as 0-7,16-23 | unset: the backend and conduit-venus run on any CPU; set: every thread of both stays on these (docs/HOST-TUNING.md). Applies when a VM's backend next starts. |
+//! | `backend.gpu_timeslice_us` | off, 0, or 50..1024 | 100: the GPU timeslice of each guest channel group, in microseconds, so the host's display work waits at most that long behind a busy guest; off (or 0) leaves the driver's own 1024 (docs/HOST-TUNING.md "GPU time"). CONDUIT_GUEST_TSG_TIMESLICE_US in the backend's environment overrides it. Applies when a VM's backend next starts. |
+//! | `host.isolation` | auto, off, or a CPU list such as 8-15,24-31 | auto: while a libvirt VM runs, host work (your session, system services, Conduit's own helpers), device interrupts and kernel workqueues stay off its CPUs (docs/HOST-TUNING.md "CPU: host isolation"). auto picks the VM's CPUs from its pinning and the CPU's topology; a list names them. Applies at the VM's next start. |
+//! | `host.isolation.NAME` | auto, off, or a CPU list | unset: `host.isolation`. The same for one VM. |
+//! | `viewer.gpu` | auto, dgpu, igpu, or a render node such as /dev/dri/renderD128 | auto: the GPU the viewer copies or scales frames on when the compositor does not take them as they are (docs/VIEWER.md "The viewer's GPU"): the GPU that imports the guest's frames, the one that made them first. dgpu and igpu are found from PCI facts, not card numbers. Applies when the viewer next opens. |
+//! | `viewer.gpu.NAME` | auto, dgpu, igpu, or a render node | unset: `viewer.gpu`. The same for one VM. |
 //! | `gpu.window_mib` | auto, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 | auto: the host GPU's BAR1 (as Resizable BAR on bare metal), clamped to what the guest's 64-bit MMIO window holds, 4096 without a GPU. The shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
 use crate::paths;
@@ -35,6 +40,31 @@ const KEYS: &[(&str, &[&str], &str)] = &[
         "backend.cpus",
         &[],
         "keep the backend and conduit-venus on these host CPUs, from the next backend start (unset: any CPU; a list such as 0-7,16-23)",
+    ),
+    (
+        "backend.gpu_timeslice_us",
+        &["off", "0"],
+        "GPU timeslice of each guest channel group in microseconds, so host display work waits at most that long behind a busy guest, from the next backend start (default 100; off or 0: the driver's own 1024; also any number from 50 to 1024)",
+    ),
+    (
+        "host.isolation",
+        &["auto", "off"],
+        "keep host work, device interrupts and kernel workqueues off a running libvirt VM's CPUs, from its next start (default auto: CPUs from the VM's pinning and the CPU topology; off; or the VM's CPUs as a list such as 8-15,24-31)",
+    ),
+    (
+        "host.isolation.VM",
+        &["auto", "off"],
+        "host.isolation for the VM called VM (e.g. host.isolation.win11), from its next start (unset: host.isolation)",
+    ),
+    (
+        "viewer.gpu",
+        &["auto", "dgpu", "igpu"],
+        "the GPU the viewer copies or scales frames on when the compositor does not take them as they are, from the viewer's next start (default auto: the GPU that made the frames; dgpu, igpu, or a render node such as /dev/dri/renderD128)",
+    ),
+    (
+        "viewer.gpu.VM",
+        &["auto", "dgpu", "igpu"],
+        "viewer.gpu for the VM called VM (e.g. viewer.gpu.win11) (unset: viewer.gpu)",
     ),
     (
         "gpu.vram_limit_mib",
@@ -75,7 +105,33 @@ fn save(m: &Map<String, Value>) -> Result<()> {
     std::fs::rename(&tmp, &f).with_context(|| format!("saving {}", f.display()))
 }
 
+/// Settings that also take a per-VM override, `BASE.NAME`.
+const PER_VM: &[&str] = &["host.isolation", "viewer.gpu"];
+
+/// `BASE.NAME` for a per-VM base and a valid VM name: (the generic key
+/// `BASE.VM`, the VM's name).
+fn vm_key(k: &str) -> Option<(&'static str, &str)> {
+    PER_VM.iter().find_map(|base| {
+        k.strip_prefix(base)
+            .and_then(|r| r.strip_prefix('.'))
+            .filter(|n| *n != "VM" && crate::vm::check_name(n).is_ok())
+            .map(|n| match *base {
+                "host.isolation" => ("host.isolation.VM", n),
+                _ => ("viewer.gpu.VM", n),
+            })
+    })
+}
+
+/// `host.isolation.NAME` for a valid VM name: that VM's override.
+#[cfg(test)]
+fn vm_isolation_key(k: &str) -> Option<&str> {
+    vm_key(k)
+        .filter(|(g, _)| *g == "host.isolation.VM")
+        .map(|(_, n)| n)
+}
+
 fn key(k: &str) -> Result<&'static (&'static str, &'static [&'static str], &'static str)> {
+    let k = vm_key(k).map(|(g, _)| g).unwrap_or(k);
     KEYS.iter().find(|(n, _, _)| *n == k).ok_or_else(|| {
         oops(
             format!("there is no setting called \"{k}\""),
@@ -87,12 +143,31 @@ fn key(k: &str) -> Result<&'static (&'static str, &'static [&'static str], &'sta
     })
 }
 
+/// The name a key is stored under: itself for a VM's override.
+fn stored_name<'a>(k: &'a str, name: &'static str) -> &'a str {
+    if name.ends_with(".VM") {
+        k
+    } else {
+        name
+    }
+}
+
 pub fn set(k: &str, v: &str) -> Result<()> {
     let (name, values, _) = key(k)?;
+    if name.ends_with(".VM") && vm_key(k).is_none() {
+        let base = name.trim_end_matches(".VM");
+        return Err(oops(
+            format!("\"{k}\" names no VM"),
+            format!("Use {base}.NAME with the VM's name, e.g. {base}.win11"),
+        ));
+    }
     let number = *name == "gpu.vram_limit_mib" && v.parse::<u64>().is_ok_and(|n| n >= 1);
     let list = match *name {
         "backend.latency" => latency_list(v).is_some(),
         "backend.cpus" => cpu_list(v),
+        "backend.gpu_timeslice_us" => timeslice_us(v).is_some(),
+        "host.isolation" | "host.isolation.VM" => isolation_value(v),
+        "viewer.gpu" | "viewer.gpu.VM" => gpu_value(v),
         _ => false,
     };
     if !values.contains(&v) && !number && !list {
@@ -105,6 +180,11 @@ pub fn set(k: &str, v: &str) -> Result<()> {
                     "gpu.vram_limit_mib" => ", or a number of MiB",
                     "backend.latency" => ", or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin",
                     "backend.cpus" => "a CPU list such as 0-7,16-23",
+                    "backend.gpu_timeslice_us" => ", or a number of microseconds from 50 to 1024",
+                    "host.isolation" | "host.isolation.VM" =>
+                        ", or the VM's CPUs as a list such as 8-15,24-31",
+                    "viewer.gpu" | "viewer.gpu.VM" =>
+                        ", or a render node such as /dev/dri/renderD128",
                     _ => "",
                 }
             ),
@@ -116,9 +196,16 @@ pub fn set(k: &str, v: &str) -> Result<()> {
         "false" => Value::Bool(false),
         s => Value::String(s.into()),
     };
+    let name = stored_name(k, name);
     m.insert(name.to_string(), val);
     save(&m)?;
     println!("{name} = {v}");
+    if name.starts_with("host.isolation") {
+        println!("Applies when a VM next starts; `conduit doctor NAME` shows the split.");
+    }
+    if name.starts_with("viewer.gpu") {
+        println!("Applies when the viewer next opens; `conduit doctor` shows the GPU it picks.");
+    }
     Ok(())
 }
 
@@ -134,15 +221,27 @@ pub fn get(k: Option<&str>) -> Result<()> {
     match k {
         Some(k) => {
             let (name, _, desc) = key(k)?;
-            show(name, desc);
+            show(stored_name(k, name), desc);
         }
-        None => KEYS.iter().for_each(|(n, _, d)| show(n, d)),
+        None => {
+            for (n, _, d) in KEYS {
+                if n.ends_with(".VM") {
+                    // The overrides that are set.
+                    for k in m.keys().filter(|k| vm_key(k).is_some_and(|(g, _)| g == *n)) {
+                        show(k, d);
+                    }
+                } else {
+                    show(n, d);
+                }
+            }
+        }
     }
     Ok(())
 }
 
 pub fn unset(k: &str) -> Result<()> {
     let (name, _, _) = key(k)?;
+    let name = &stored_name(k, name);
     let mut m = load();
     m.remove(*name);
     save(&m)?;
@@ -231,6 +330,79 @@ pub fn backend_cpus() -> Option<String> {
         .and_then(Value::as_str)
         .filter(|v| cpu_list(v))
         .map(str::to_owned)
+}
+
+/// A `backend.gpu_timeslice_us` value as the backend's `--gpu-timeslice-us`:
+/// `off` (also for `0`) or 50..=1024; `None` for anything else.
+fn timeslice_us(v: &str) -> Option<String> {
+    match v {
+        "off" | "0" => Some("off".into()),
+        _ => v
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (50..=1024).contains(n))
+            .map(|n| n.to_string()),
+    }
+}
+
+/// `backend.gpu_timeslice_us` as the backend's `--gpu-timeslice-us`; `None`
+/// when unset (or not a value), and the backend keeps its default (100).
+pub fn backend_gpu_timeslice_us() -> Option<String> {
+    timeslice_of(&load())
+}
+
+fn timeslice_of(m: &Map<String, Value>) -> Option<String> {
+    m.get("backend.gpu_timeslice_us")
+        .and_then(Value::as_str)
+        .and_then(timeslice_us)
+}
+
+/// A `host.isolation` value: auto, off, or a non-empty CPU list.
+/// A `viewer.gpu` value: auto, dgpu, igpu or a render node path.
+fn gpu_value(v: &str) -> bool {
+    matches!(v, "auto" | "dgpu" | "igpu")
+        || v.strip_prefix("/dev/dri/renderD")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The `viewer.gpu` setting for a VM and where it came from: its own
+/// `viewer.gpu.NAME`, else `viewer.gpu`, else the default `auto`.
+pub fn viewer_gpu(vm: &str) -> (String, String) {
+    viewer_gpu_of(&load(), vm)
+}
+
+fn viewer_gpu_of(m: &Map<String, Value>, vm: &str) -> (String, String) {
+    let own = format!("viewer.gpu.{vm}");
+    for k in [own.as_str(), "viewer.gpu"] {
+        if let Some(v) = m.get(k).and_then(Value::as_str).filter(|v| gpu_value(v)) {
+            return (v.to_string(), k.to_string());
+        }
+    }
+    ("auto".into(), "default".into())
+}
+
+fn isolation_value(v: &str) -> bool {
+    matches!(v, "auto" | "off") || cpu_list(v)
+}
+
+/// The `host.isolation` setting for a VM and where it came from: its own
+/// `host.isolation.NAME`, else `host.isolation`, else the default `auto`.
+pub fn host_isolation(vm: &str) -> (String, String) {
+    isolation_of(&load(), vm)
+}
+
+fn isolation_of(m: &Map<String, Value>, vm: &str) -> (String, String) {
+    let own = format!("host.isolation.{vm}");
+    for k in [own.as_str(), "host.isolation"] {
+        if let Some(v) = m
+            .get(k)
+            .and_then(Value::as_str)
+            .filter(|v| isolation_value(v))
+        {
+            return (v.to_string(), k.to_string());
+        }
+    }
+    ("auto".into(), "default".into())
 }
 
 /// `gpu.vram_limit_mib`: how the backend's video-memory cap is chosen.
@@ -352,6 +524,108 @@ mod tests {
         for bad in ["", "7-0", "a", "1,", "1-2-3", "0-5000"] {
             assert!(!cpu_list(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn gpu_timeslice_setting() {
+        let mut m = Map::new();
+        assert_eq!(timeslice_of(&m), None, "unset: the backend's default");
+        for (v, want) in [
+            ("off", Some("off")),
+            ("0", Some("off")),
+            ("50", Some("50")),
+            ("100", Some("100")),
+            ("1024", Some("1024")),
+            ("49", None),
+            ("1025", None),
+            ("fast", None),
+        ] {
+            m.insert("backend.gpu_timeslice_us".into(), Value::String(v.into()));
+            assert_eq!(timeslice_of(&m).as_deref(), want, "{v}");
+        }
+        assert!(key("backend.gpu_timeslice_us").is_ok());
+    }
+
+    #[test]
+    fn host_isolation_setting_and_per_vm_override() {
+        let mut m = Map::new();
+        assert_eq!(isolation_of(&m, "win11"), ("auto".into(), "default".into()));
+        m.insert("host.isolation".into(), Value::String("off".into()));
+        assert_eq!(
+            isolation_of(&m, "win11"),
+            ("off".into(), "host.isolation".into())
+        );
+        m.insert(
+            "host.isolation.win11".into(),
+            Value::String("8-15,24-31".into()),
+        );
+        assert_eq!(
+            isolation_of(&m, "win11"),
+            ("8-15,24-31".into(), "host.isolation.win11".into())
+        );
+        assert_eq!(isolation_of(&m, "other").0, "off");
+        // A hand-edited bad value is ignored.
+        m.insert("host.isolation.win11".into(), Value::String("fast".into()));
+        assert_eq!(isolation_of(&m, "win11").0, "off");
+        assert!(key("host.isolation").is_ok());
+        assert!(key("host.isolation.win11").is_ok());
+        assert_eq!(
+            stored_name("host.isolation.win11", "host.isolation.VM"),
+            "host.isolation.win11"
+        );
+        assert!(vm_isolation_key("host.isolation.VM").is_none());
+        assert!(vm_isolation_key("host.isolation.bad name").is_none());
+        for ok in ["auto", "off", "8-15,24-31"] {
+            assert!(isolation_value(ok), "{ok}");
+        }
+        assert!(!isolation_value("on"));
+    }
+
+    #[test]
+    fn viewer_gpu_setting_and_per_vm_override() {
+        let mut m = Map::new();
+        assert_eq!(
+            viewer_gpu_of(&m, "win11"),
+            ("auto".into(), "default".into())
+        );
+        m.insert("viewer.gpu".into(), Value::String("igpu".into()));
+        assert_eq!(
+            viewer_gpu_of(&m, "win11"),
+            ("igpu".into(), "viewer.gpu".into())
+        );
+        m.insert("viewer.gpu.win11".into(), Value::String("dgpu".into()));
+        assert_eq!(
+            viewer_gpu_of(&m, "win11"),
+            ("dgpu".into(), "viewer.gpu.win11".into())
+        );
+        assert_eq!(viewer_gpu_of(&m, "other").0, "igpu");
+        m.insert("viewer.gpu.win11".into(), Value::String("fast".into()));
+        assert_eq!(viewer_gpu_of(&m, "win11").0, "igpu");
+        for ok in ["auto", "dgpu", "igpu", "/dev/dri/renderD129"] {
+            assert!(gpu_value(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "gpu0",
+            "/dev/dri/card0",
+            "/dev/dri/renderD",
+            "/dev/dri/renderD1x",
+        ] {
+            assert!(!gpu_value(bad), "{bad}");
+        }
+        assert!(key("viewer.gpu").is_ok());
+        assert!(key("viewer.gpu.win11").is_ok());
+        assert_eq!(vm_key("viewer.gpu.win11"), Some(("viewer.gpu.VM", "win11")));
+        assert_eq!(
+            vm_key("host.isolation.win11"),
+            Some(("host.isolation.VM", "win11"))
+        );
+        assert!(vm_key("viewer.gpu.VM").is_none());
+        assert!(vm_key("viewer.gpuX").is_none());
+        assert_eq!(
+            stored_name("viewer.gpu.win11", "viewer.gpu.VM"),
+            "viewer.gpu.win11"
+        );
     }
 
     #[test]

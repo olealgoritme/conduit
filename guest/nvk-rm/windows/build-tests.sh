@@ -10,7 +10,9 @@
 # SPIR-V (glslangValidator), the self-checking correctness tests
 # vk_zero_page_test.exe, vk_draw_fetch_test.exe, vk_submit_order_test.exe,
 # vk_texture_roundtrip.exe, vk_vertex_formats.exe and vk_mixed_samples_test.exe
-# (SPIR-V built in), and vk_loader_list.exe (what the system Vulkan
+# (SPIR-V built in), vk_gpu_bound.exe (tests/perf: GPU-bound throughput per
+# stage, the Vulkan twin of guest/windows/tools/d3d12_gpu_bound.cpp), and
+# vk_loader_list.exe (what the system Vulkan
 # loader enumerates) and wgl_test.exe (OpenGL through WGL: Zink with app-local
 # opengl32.dll + libgallium_wgl.dll, or the adapter's ICD). MinGW ships no
 # Vulkan import library: one for
@@ -73,6 +75,9 @@ for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_
          vk_mixed_samples_test; do
   "$CC" -O1 -Wall -I"$OUT_DIR/include" "$tests/$t.c" -L"$OUT_DIR" -lvulkan-1 -lm -o "$OUT_DIR/$t.exe"
 done
+python3 "$tests/perf/gen_gpu_bound_shaders.py" >/dev/null
+"$CC" -O2 -Wall -I"$OUT_DIR/include" "$tests/perf/vk_gpu_bound.c" -L"$OUT_DIR" -lvulkan-1 -lm -static \
+  -o "$OUT_DIR/vk_gpu_bound.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/icd_smoke.c" -o "$OUT_DIR/icd_smoke.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/helios_icd_test.c" -o "$OUT_DIR/helios_icd_test.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_rmfence_test.c" -o "$OUT_DIR/vk_rmfence_test.exe"

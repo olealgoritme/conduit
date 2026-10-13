@@ -277,6 +277,20 @@ static void test_clicks(void)
     bits = click(&ui, &e, NB_UI_ID_FULLSCREEN, 0);
     CHECK(bits & NB_UI_FULLSCREEN, "fullscreen");
 
+    /* Presentation sync: one setting per VM, saved, re-applied. */
+    CHECK(nb_ui_find(&ui, NB_UI_ID_SYNC, NB_SYNC_FULLSCREEN) >= 0 &&
+          nb_ui_find(&ui, NB_UI_ID_SYNC, NB_SYNC_IMMEDIATE) >= 0 &&
+          nb_ui_find(&ui, NB_UI_ID_SYNC, NB_SYNC_VSYNC) >= 0, "sync chips");
+    bits = click(&ui, &e, NB_UI_ID_SYNC, NB_SYNC_VSYNC);
+    CHECK(st.sync == NB_SYNC_VSYNC && (bits & NB_UI_SYNC) &&
+          (bits & NB_UI_SAVE) && !(bits & (NB_UI_VIEW | NB_UI_RES)),
+          "vsync bits %#x", bits);
+    CHECK(strstr(ui.notice, "VSync") != NULL, "sync notice '%s'", ui.notice);
+    bits = click(&ui, &e, NB_UI_ID_SYNC, NB_SYNC_VSYNC);
+    CHECK(!(bits & (NB_UI_SYNC | NB_UI_SAVE)), "same sync again: nothing");
+    bits = click(&ui, &e, NB_UI_ID_SYNC, NB_SYNC_FULLSCREEN);
+    CHECK(st.sync == NB_SYNC_FULLSCREEN && (bits & NB_UI_SYNC), "back to default");
+
     /* press on one item, release on another: nothing */
     {
         int a = nb_ui_find(&ui, NB_UI_ID_SCALE, NB_SCALE_INTEGER);
@@ -673,16 +687,22 @@ static void test_mode_list(void)
     e.buf_h = 960;
     nb_ui_layout(&ui, &e, NULL, NULL);
     CHECK(nb_ui_find(&ui, NB_UI_ID_RULE_DEL, 0) < 0, "no rule yet");
-    click(&ui, &e, NB_UI_ID_AREA, NB_AREA_4_3);
-    click(&ui, &e, NB_UI_ID_SCALE, NB_SCALE_STRETCH);
-    bits = click(&ui, &e, NB_UI_ID_RULE_SAVE, 0);
-    CHECK(bits & NB_UI_SAVE, "saved %#x", bits);
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RULE_SAVE, 0) < 0,
+          "no Remember button: it is automatic");
+    /* The backend runs nb_vstore_auto_rule on every NB_UI_VIEW. */
+    nb_vstore_guest_mode(&st, 1280, 960, NULL, 0);
+    bits = click(&ui, &e, NB_UI_ID_AREA, NB_AREA_4_3);
+    CHECK((bits & NB_UI_VIEW) && nb_vstore_auto_rule(&st), "area: %#x", bits);
+    bits = click(&ui, &e, NB_UI_ID_SCALE, NB_SCALE_STRETCH);
+    CHECK((bits & NB_UI_VIEW) && nb_vstore_auto_rule(&st), "scale: %#x", bits);
     CHECK(nb_vstore_rule_find(&st, 1280, 960) == 0, "rule stored");
     CHECK(st.rule[0].v.area == NB_AREA_4_3 &&
           st.rule[0].v.scale == NB_SCALE_STRETCH, "rule layout");
     nb_ui_layout(&ui, &e, NULL, NULL);
+    CHECK(nb_ui_find(&ui, NB_UI_ID_RULE_DEFAULT, 0) >= 0, "make default");
     bits = click(&ui, &e, NB_UI_ID_RULE_DEL, 0);
-    CHECK((bits & NB_UI_SAVE) && st.nrule == 0, "forgotten");
+    CHECK((bits & (NB_UI_SAVE | NB_UI_VIEW)) == (NB_UI_SAVE | NB_UI_VIEW) &&
+          st.nrule == 0 && st.cur.scale == st.base.scale, "forgotten");
 
     /* No list (older backend): the presets as before. */
     e.modes = NULL;

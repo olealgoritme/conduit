@@ -259,6 +259,7 @@ impl NvidiaBackend {
         self.note_gem_import(payload, &resp_buf[..n]);
         self.note_registrations(payload, &resp_buf[..n]);
         self.note_os_events(payload, &resp_buf[..n]);
+        self.note_tsg(payload, &resp_buf[..n]);
         n
     }
 
@@ -764,6 +765,13 @@ impl NvidiaBackend {
                     let sent = ireq.nested_len;
                     if let Some(why) = self.rm_control_refusal(cmd, declared, sent) {
                         return self.refuse_control(cookie, cmd, why, param_in, resp_buf);
+                    }
+                    // The guest's own SET_TIMESLICE, held to the host's policy
+                    // (gpu_sched): it may shorten its timeslice, not lengthen it.
+                    if let Some(clamped) = self.clamp_guest_timeslice(cmd, param_in) {
+                        return self.dispatch_nested(
+                            cookie, host_fd, request, &clamped, resp_buf, 32, 16, 24, deep_in, None,
+                        );
                     }
                 }
                 self.dispatch_nested(

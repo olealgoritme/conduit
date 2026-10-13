@@ -261,6 +261,9 @@ cmd_qemu() {
 #   $LINK_DIR/conduit -> /opt/conduit/bin/conduit
 #   /usr/share/applications/conduit.desktop (or /usr/local/share/... with LINK_DIR=/usr/local/bin)
 #   /etc/apparmor.d/abstractions/conduit
+#   /usr/lib/systemd/system/conduit-isolation@.service (host isolation, root part)
+#   /usr/share/polkit-1/rules.d/50-conduit-isolation.rules (users may start/stop it)
+#   (both also under /opt/conduit/share/conduit; the tarball installs them in /etc)
 cmd_stage() {
     local o="$STAGE$PREFIX" v; v=$(version)
     log "staging $v into $STAGE"
@@ -328,6 +331,8 @@ cmd_stage() {
     install -m0755 "$PKG/common/conduit-integrate" "$o/libexec/conduit-integrate"
     install -m0644 "$PKG/common/conduit.desktop" "$o/share/conduit/conduit.desktop"
     install -m0644 "$PKG/common/apparmor/conduit" "$o/share/conduit/apparmor/conduit"
+    install -m0644 "$PKG/common/conduit-isolation@.service" "$o/share/conduit/conduit-isolation@.service"
+    install -m0644 "$PKG/common/50-conduit-isolation.rules" "$o/share/conduit/50-conduit-isolation.rules"
     echo "$v" > "$o/VERSION"
 
     # Licenses travel with the binaries (per-component; see docs/STRUCTURE.md).
@@ -347,6 +352,10 @@ cmd_stage() {
     install -m0644 "$PKG/common/conduit.desktop" "$STAGE$share/applications/conduit.desktop"
     install_icons "$STAGE${share%/share}"
     install -m0644 "$PKG/common/apparmor/conduit" "$STAGE/etc/apparmor.d/abstractions/conduit"
+    install -D -m0644 "$PKG/common/conduit-isolation@.service" \
+        "$STAGE/usr/lib/systemd/system/conduit-isolation@.service"
+    install -D -m0644 "$PKG/common/50-conduit-isolation.rules" \
+        "$STAGE/usr/share/polkit-1/rules.d/50-conduit-isolation.rules"
 }
 
 # --------------------------------------------------------- bundle-libs -----

@@ -1,0 +1,125 @@
+From 7f898e86f4893b4b9e8821d673b34c60e5f78ce9 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sun, 11 Oct 2026 01:49:01 +0200
+Subject: [PATCH] nvk/rm: helios_icd_interface version 8, ecl_fence_create_v3
+
+A composed D3D11 present on NVK hands the KMD an RM fence and the
+copy-engine record of the frame's image in its WDDM present marker. The
+fence came from queue_rm_fence_v3, which signals the present timeline
+after what is already submitted to the queue, so the presenting thread
+first had to wait until DXVK's command-stream and submission threads had
+submitted the frame.
+
+ecl_fence_create_v3 makes the fence and the record for a value reserved
+on an ECL timeline (ecl_fence_reserve) that the engine's submission thread
+signals after the frame's work (ecl_fence_signal): the same record as
+queue_rm_fence_v3, for a point that is reserved now and signalled later.
+---
+ src/nouveau/vulkan/helios_icd_interface.h | 18 ++++++++-
+ src/nouveau/vulkan/nvk_helios.c           | 47 +++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
+index c9d71b4..2091904 100644
+--- a/src/nouveau/vulkan/helios_icd_interface.h
++++ b/src/nouveau/vulkan/helios_icd_interface.h
+@@ -43,8 +43,9 @@ extern "C" {
+ /* The export keeps its name; version 3 only appends entries (and caps 4..6),
+  * version 4 appends memory_res_plane1 (and cap 8), version 5 scanout_frame,
+  * version 6 queue_rm_fence_v3, version 7 the ECL fence timeline
+- * (ecl_fence_reserve / ecl_fence_create / ecl_fence_signal). */
+-#define HELIOS_ICD_INTERFACE_VERSION 7u
++ * (ecl_fence_reserve / ecl_fence_create / ecl_fence_signal), version 8
++ * ecl_fence_create_v3. */
++#define HELIOS_ICD_INTERFACE_VERSION 8u
+ 
+ enum helios_icd_backend {
+    HELIOS_ICD_BACKEND_VENUS = 1,
+@@ -352,6 +353,19 @@ struct helios_icd_api {
+                                 uint64_t value, uint32_t *fence_handle);
+    VkResult (*ecl_fence_signal)(VkDevice device, VkQueue queue,
+                                 uint64_t key, uint64_t value);
++
++   /* ---- version 8 (size covers it; NULL = not supported) ----------------
++    * ecl_fence_create, plus the copy-engine record of queue_rm_fence_v3 for
++    * `image` (bound at offset 0 of its dedicated `memory`): a composed
++    * present whose fence is reserved at the Present call and signalled by
++    * the engine's submission thread after the frame's work, so the
++    * presenting thread never waits for that submission. Results as for
++    * queue_rm_fence_v3 (VK_SUCCESS with *copy filled, copy->semaphore.value
++    * == value; VK_INCOMPLETE with the fence alone; an error with none). */
++   VkResult (*ecl_fence_create_v3)(VkDevice device, uint64_t key,
++                                   uint64_t value, VkDeviceMemory memory,
++                                   VkImage image, uint32_t *fence_handle,
++                                   struct helios_icd_rm_copy *copy);
+ };
+ 
+ typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);
+diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
+index 78c895f..9de7121 100644
+--- a/src/nouveau/vulkan/nvk_helios.c
++++ b/src/nouveau/vulkan/nvk_helios.c
+@@ -654,6 +654,52 @@ helios_queue_rm_fence_v3(VkDevice _device, VkQueue _queue,
+    return VK_SUCCESS;
+ }
+ 
++/* helios_icd_interface.h version 8: ecl_fence_create with the copy-engine
++ * record of a composed present (helios_queue_rm_fence_v3's, for a reserved
++ * value of an ECL timeline instead of a point signalled now).
++ */
++static VkResult
++helios_ecl_fence_create_v3(VkDevice _device, uint64_t key, uint64_t value,
++                           VkDeviceMemory _mem, VkImage _image,
++                           uint32_t *fence_handle,
++                           struct helios_icd_rm_copy *copy)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++   VK_FROM_HANDLE(nvk_image, image, _image);
++
++   *fence_handle = 0;
++   if (copy != NULL)
++      memset(copy, 0, sizeof(*copy));
++   if (dev == NULL || key == 0 || (key & 1))
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   struct vk_sync *sync = nvkmd_rm_rmfence_find(dev->nvkmd,
++                                                helios_ecl_key(key));
++   if (sync == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   struct helios_icd_rm_source source;
++   const bool described = copy != NULL && helios_rm_source(mem, image, &source);
++
++   int fence = -1;
++   VkResult result = nvkmd_rm_rmfence_create(dev->nvkmd, &dev->vk.base,
++                                             sync, value, &fence);
++   if (result != VK_SUCCESS)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   *fence_handle = (uint32_t)fence;
++
++   struct helios_icd_rm_semaphore sem = { .value = value };
++   if (!described ||
++       !nvkmd_rm_rmfence_semaphore(dev->nvkmd, sync, &sem.h_client,
++                                   &sem.h_memory, &sem.offset))
++      return VK_INCOMPLETE;
++
++   copy->semaphore = sem;
++   copy->source = source;
++   return VK_SUCCESS;
++}
++
+ static void
+ helios_scanout_release(VkDevice _device)
+ {
+@@ -726,6 +772,7 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+       .ecl_fence_reserve = helios_ecl_fence_reserve,
+       .ecl_fence_create = helios_ecl_fence_create,
+       .ecl_fence_signal = helios_ecl_fence_signal,
++      .ecl_fence_create_v3 = helios_ecl_fence_create_v3,
+    };
+    memcpy(out, &api, cap);
+    return VK_SUCCESS;
+-- 
+2.43.0
+
