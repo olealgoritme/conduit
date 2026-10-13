@@ -468,7 +468,7 @@ pub(crate) fn umd12_engine_shader_caps() -> bool {
     UMD12_ENGINE_SHADER_CAPS.get()
 }
 
-/// `Nvk12AdmitBeforeRender` (`Nvk12EclSync=2`; default 0): queue an ECL's
+/// `Nvk12AdmitBeforeRender` (`Nvk12EclSync=2`; absent = ON): queue an ECL's
 /// admission signal (SignalAtSubmission) before its HE12 v4 Render instead of
 /// after it. The admission then fires once everything queued before the
 /// batch on the context (runtime waits, the previous packets) was submitted,
@@ -477,10 +477,11 @@ pub(crate) fn umd12_engine_shader_caps() -> bool {
 /// Runtime waits queued before the ECL still hold the batch back, and the
 /// packet still withholds its DMA completion until the batch's ECL fence
 /// fires, so the runtime's fence signals and presents after the ECL keep
-/// following the real work. Counter EclAdmitBeforeRender. Read once per
-/// process.
+/// following the real work. 0 queues the admission after the Render, so a
+/// batch waits for its own packet's slot. Counter EclAdmitBeforeRender. Read
+/// once per process.
 pub(crate) static NVK12_ADMIT_BEFORE_RENDER: BoolKnob =
-    BoolKnob::new(c"Nvk12AdmitBeforeRender", false);
+    BoolKnob::new(c"Nvk12AdmitBeforeRender", true);
 
 pub(crate) fn nvk12_admit_before_render() -> bool {
     NVK12_ADMIT_BEFORE_RENDER.get()

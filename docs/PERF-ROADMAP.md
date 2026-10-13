@@ -41,7 +41,7 @@ All of these are defaults; nothing is set by hand.
 | S1 | NVK writes GPFIFO entries, push, semaphore release + `NON_STALL_INTERRUPT` (+ a WFI retire release per flush) | `patches/0006` (`nvkmd_rm_exec_ctx_exec/flush`), `patches-common/0019` |
 | S2 | GP_PUT to USERD, doorbell token to the usermode region | `patches/0006`; the doorbell store goes through the shared window (one KVM memslot); whether it exits is unmeasured |
 | S3 | Mesa submit thread, if a wait-before-signal pattern switched the queue to threaded mode | `vk_queue.c` |
-| S4 | D3D12 only: HE12 Render record per ExecuteCommandLists + KMD admission. A batch reaches NVK once its admission event fires, i.e. once the packet two ahead completed; that packet completes when its ECL fence fire reaches the KMD (W1-W4), or earlier on a completion hint from the engine worker (`Nvk12CompletionHint`, default 0). `Nvk12AdmitBeforeRender` (default 0) admits a batch one packet earlier | `umd12/src/forward12/nvk12.rs`, `queue.rs`, `ecl_hint.rs`; dxgkrnl keeps at most 2 packets in flight per node |
+| S4 | D3D12 only: HE12 Render record per ExecuteCommandLists + KMD admission. A batch reaches NVK once its admission event fires, i.e. once the packet two ahead completed; that packet completes when its ECL fence fire reaches the KMD (W1-W4), or earlier on a completion hint from the engine worker (`Nvk12CompletionHint`, default 0). `Nvk12AdmitBeforeRender` (default 1) admits a batch one packet earlier | `umd12/src/forward12/nvk12.rs`, `queue.rs`, `ecl_hint.rs`; dxgkrnl keeps at most 2 packets in flight per node |
 
 Submission has bare-metal shape for D3D11, Vulkan and GL: no syscall and no
 host hop per submit. D3D12 pays the WDDM software-scheduler packet pipe.
@@ -234,9 +234,9 @@ removes a Venus dependency, **[F]** flip or vblank work.
   DxgKrnl queue-packet ETW.
 
 ### T8a. D3D12: a shorter admission round trip
-- **What.** Two UMD knobs, both default 0 until measured. `Nvk12AdmitBeforeRender`
-  queues a batch's admission ahead of its packet, so three batches can be on the
-  GPU instead of two. `Nvk12CompletionHint` (µs of polling per admission wait)
+- **What.** Two UMD knobs. `Nvk12AdmitBeforeRender` (default 1) queues a batch's
+  admission ahead of its packet, so three batches can be on the GPU instead of
+  two. `Nvk12CompletionHint` (default 0; µs of polling per admission wait)
   lets vkd3d's queue worker read each batch's producer timeline in the guest
   and name the batches it saw finish to the KMD (`HELIOS_ESCAPE_ECL_DONE`), which
   completes their packets without the host leg of the ECL fence (W1-W4):

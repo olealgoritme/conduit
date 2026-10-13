@@ -37,7 +37,8 @@ pub use helios_kmd_logic::ecl_done::Verdict as EclVerdict;
 /// every NVK process presents with an RM fence (`DwmIcd=nvk` and the NVK desktop): 376.1 had
 /// about 15 explorer.exe processes plus DWM, Notepad and Heaven, and every present of a process
 /// past the eighth was refused `NoRoom` (`RmGRef` 11851 = `RmGTake`), so its Blt reached the
-/// copy-engine route with no boundary (`CeRtWhy` 1 on every one). 32 leaves half the stream slots to Venus streams.
+/// copy-engine route with no boundary (`CeRtWhy` 1 on every one). 32 leaves half the stream
+/// slots to Venus streams.
 pub(super) const MAX_RM_GATES: usize = 32;
 const _: () = assert!(MAX_RM_GATES <= u8::MAX as usize);
 const _: () = assert!(MAX_RM_GATES <= helios_kmd_logic::present_stream::MAX_STREAMS / 2);
@@ -457,7 +458,7 @@ impl VirtioGpu {
 
     /// A completion hint (`HELIOS_ESCAPE_ECL_DONE`) from process `process` (its
     /// `hKmdProcess`) for fence `fence`: the UMD saw the batch the fence stands for finish.
-    /// A fence the KMD holds for that process's gate and that has not fired is fired now,
+    /// A fence the KMD holds for a gate of that process and that has not fired is fired now,
     /// exactly as its first `EventReady` would fire it (the gate point, the stream slot,
     /// the waits that name it; the handle is owed a `Close`); the host's `EventReady`
     /// that follows is a repeat. Anything else changes nothing

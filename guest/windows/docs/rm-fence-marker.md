@@ -327,10 +327,12 @@ An `HE12` v4 packet completes when its fence fires, and the fire comes from the 
 the GPU's semaphore release raises a non-stall interrupt, nvidia-drm's semaphore-surface
 callback signals the sync_file on its work thread, the backend's event thread sends
 `EventReady`, and the KMD's DPC fires the gate point. dxgkrnl keeps about two packets
-per node in flight and the UMD's admission event (SignalAtSubmission) releases a batch
-only once its packet is submitted, so a batch reaches NVK once the packet two ahead of
-it completed: the host leg sits between batches on the GPU whenever the batch in
-between is shorter than the round trip.
+per node in flight. The UMD queues a batch's admission event (SignalAtSubmission) ahead
+of its packet (`Nvk12AdmitBeforeRender`, default 1), so it fires once everything before
+the batch on the context was submitted, and a batch reaches NVK once the packet three
+ahead of it completed (two ahead with `Nvk12AdmitBeforeRender=0`, where the admission
+follows the batch's own packet). The host leg sits between batches on the GPU whenever
+the batches in between are shorter than the round trip.
 
 With `Nvk12CompletionHint` (UMD, microseconds, default 0 = off) the guest shortcuts that
 leg. vkd3d's queue worker (patch 0011) records, per queue, each batch's ECL fence with

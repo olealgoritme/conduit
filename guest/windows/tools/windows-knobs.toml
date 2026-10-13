@@ -623,9 +623,10 @@ read = "once per process"
 effect = "1: on NVK only the first ExecuteCommandLists of each queue after a Present waits for the runtime admission event; other batches go to the engine at once. A measurement of the per-batch admission round trip that can race applications relying on cross-queue waits; never a setting."
 
 [umd.Nvk12AdmitBeforeRender]
-class = "experiment"
+class = "tuning"
 read = "once per process"
-effect = "With Nvk12EclSync=2: 1 queues an ExecuteCommandLists' admission event before its HE12 v4 packet instead of after it, so the batch reaches NVK once everything before it on the context was submitted and three batches can be on the GPU instead of two; runtime waits before the ECL still hold it and signals after it still follow the work. Counter EclAdmitBeforeRender."
+effect = "With Nvk12EclSync=2: 1 queues an ExecuteCommandLists' admission event before its HE12 v4 packet, so the batch reaches NVK once everything before it on the context was submitted and three batches can be on the GPU; runtime waits before the ECL still hold it and signals after it still follow the work. 0 queues the admission after the packet, so a batch waits for its own packet's in-flight slot and two batches can be on the GPU. Counter EclAdmitBeforeRender."
+see = "[rm-fence-marker.md](../guest/windows/docs/rm-fence-marker.md#completion-hints)"
 
 [umd.Nvk12CompletionHint]
 class = "experiment"
