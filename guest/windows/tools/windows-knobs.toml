@@ -1273,6 +1273,21 @@ class = "debug"
 read = "surface capability query"
 effect = "1 reports only FIFO as a Win32 present mode; 0 also offers the immediate and mailbox modes."
 
+[env.NAK_GPR_CAP]
+class = "experiment"
+read = "device creation (once per process)"
+effect = "Caps the registers per thread NAK gives every shader stage, counted as the hardware allocates them (and NVK_SHADER_STATS reports them, the 2 reserved GPRs included) and rounded down to a multiple of 8; the pre-RA scheduler schedules for the cap and register allocation spills what does not fit, trading spills for occupancy. Unset, 0 or 256 and up: no cap; below 24 counts as 24. Part of the shader cache key."
+
+[env.NAK_GPR_CAP_CS]
+class = "experiment"
+read = "device creation (once per process)"
+effect = "NAK_GPR_CAP for compute shaders only, overriding NAK_GPR_CAP; 0 leaves compute shaders uncapped."
+
+[env.NAK_GPR_CAP_FS]
+class = "experiment"
+read = "device creation (once per process)"
+effect = "NAK_GPR_CAP for fragment shaders only, overriding NAK_GPR_CAP; 0 leaves fragment shaders uncapped."
+
 [env.NVK_BLACKWELL_MME_MEMBAR]
 class = "debug"
 read = "device creation"

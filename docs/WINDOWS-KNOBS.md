@@ -29,8 +29,8 @@ Classes:
 |---|---:|---:|---:|---:|---:|---:|
 | KMD: service key | 7 | 26 | 26 | 28 | 12 | 99 |
 | UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 17 | 16 | 25 | 9 | 0 | 67 |
-| Environment variables | 8 | 18 | 86 | 24 | 0 | 136 |
-| All | 32 | 60 | 137 | 61 | 12 | 302 |
+| Environment variables | 8 | 18 | 86 | 27 | 0 | 139 |
+| All | 32 | 60 | 137 | 64 | 12 | 305 |
 
 ## What the installation writes
 
@@ -406,7 +406,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `VKD3D_SHADER_CACHE_PATH` | `unset`; unset: the bridge sets it per process | first D3D12 device creation | vkd3d-proton's shader cache folder. When unset, the D3D12 bridge sets it to %LOCALAPPDATA%\Helios\vkd3d, else the temp folder, else 0 (no disk cache); a value already set, 0 included, is kept. | [vkd3d_bridge.cpp:1122](../guest/windows/umd12/bridge/vkd3d_bridge.cpp#L1122) |
 | `ZINK_VULKAN_ICD` | `unset` | once per process | The Vulkan ICD Zink loads on Windows: a DLL path, or loader for the Vulkan loader; unset loads NVK from next to the driver or the Helios install directory. | [0034-zink-load-a-Vulkan-ICD-directly-on-Windows-NVK-on-RM.patch:76](../guest/nvk-rm/patches-windows/0034-zink-load-a-Vulkan-ICD-directly-on-Windows-NVK-on-RM.patch#L76) |
 
-### Experiment, not for users (24)
+### Experiment, not for users (27)
 
 | Name | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|
@@ -419,6 +419,9 @@ Per-process: they act only on the process whose environment carries them (and it
 | `HELIOS_WSI_DIRECT_MAP` | `unset` | first software present (Venus WSI) | A value other than 0 lets a software present hand the image's CPU mapping to GDI directly when the row pitch allows it, instead of copying it first. | [wsi_common_win32.cpp:123](../guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp#L123) |
 | `HELIOS_WSI_EXTRA_IMAGES` | `unset` | swapchain creation (Venus WSI) | With the async software present, adds this many images (0 to 8) beyond what the app asked for. Some engines crash on extra images. Unset: 0. | [wsi_common_win32.cpp:2583](../guest/windows/third_party/mesa/src/vulkan/wsi/wsi_common_win32.cpp#L2583) |
 | `MESA_WSI_SCANOUT_HZ` | `0` | swapchain creation | Caps the rate of FIFO presents on a scanout swap chain to this many Hz. 0 leaves scanout presents unpaced. | [0021-nvk-rm-wsi-Win32-zero-copy-present-by-Helios-scanout.patch:1136](../guest/nvk-rm/patches-windows/0021-nvk-rm-wsi-Win32-zero-copy-present-by-Helios-scanout.patch#L1136) |
+| `NAK_GPR_CAP` | `unset` | device creation (once per process) | Caps the registers per thread NAK gives every shader stage, counted as the hardware allocates them (and NVK_SHADER_STATS reports them, the 2 reserved GPRs included) and rounded down to a multiple of 8; the pre-RA scheduler schedules for the cap and register allocation spills what does not fit, trading spills for occupancy. Unset, 0 or 256 and up: no cap; below 24 counts as 24. Part of the shader cache key. | [0055-nak-NAK_GPR_CAP-an-opt-in-register-cap-that-trades-s.patch:152](../guest/nvk-rm/patches-common/0055-nak-NAK_GPR_CAP-an-opt-in-register-cap-that-trades-s.patch#L152) |
+| `NAK_GPR_CAP_CS` | `unset` | device creation (once per process) | NAK_GPR_CAP for compute shaders only, overriding NAK_GPR_CAP; 0 leaves compute shaders uncapped. | [0055-nak-NAK_GPR_CAP-an-opt-in-register-cap-that-trades-s.patch:153](../guest/nvk-rm/patches-common/0055-nak-NAK_GPR_CAP-an-opt-in-register-cap-that-trades-s.patch#L153) |
+| `NAK_GPR_CAP_FS` | `unset` | device creation (once per process) | NAK_GPR_CAP for fragment shaders only, overriding NAK_GPR_CAP; 0 leaves fragment shaders uncapped. | [0055-nak-NAK_GPR_CAP-an-opt-in-register-cap-that-trades-s.patch:154](../guest/nvk-rm/patches-common/0055-nak-NAK_GPR_CAP-an-opt-in-register-cap-that-trades-s.patch#L154) |
 | `NVK_DRAW_SYSVAL_SKIP` | `false` | device creation | 1 (Turing and later) writes draw parameters into the root table only for the system values the bound shaders read; 0 writes all of them. | [0035-nvk-NVK_DRAW_SYSVAL_SKIP-draw-parameters-only-for-sh.patch:114](../guest/nvk-rm/patches-common/0035-nvk-NVK_DRAW_SYSVAL_SKIP-draw-parameters-only-for-sh.patch#L114) |
 | `NVK_HELIOS_WSI_LINEAR` | `false` | swapchain creation | 1 makes Win32 scanout swap chains linear (NVK renders through a tiled shadow); 0 keeps block-linear scanout images. | [0024-nvk-rm-wsi-block-linear-Win32-scanout-swapchains-wit.patch:103](../guest/nvk-rm/patches-windows/0024-nvk-rm-wsi-block-linear-Win32-scanout-swapchains-wit.patch#L103) |
 | `NVK_INDIRECT_PUSH` | `false` | device creation | 1 (Turing and later) pushes indirect draw records inline through the pushbuffer MME path; 0 uses the standard indirect path. | [0037-nvk-rm-no-16-ms-stall-on-a-full-GPFIFO-ring-NVK_INDI.patch:55](../guest/nvk-rm/patches-common/0037-nvk-rm-no-16-ms-stall-on-a-full-GPFIFO-ring-NVK_INDI.patch#L55) |

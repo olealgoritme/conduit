@@ -1,0 +1,278 @@
+From f49461170b086c2ba9d5a4222403a73573db67c6 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 13 Oct 2026 23:53:23 +0200
+Subject: [PATCH] nak: NAK_GPR_CAP, an opt-in register cap that trades spills
+ for occupancy
+
+NAK spills GPRs only past the hardware maximum, so a shader uses as many
+registers as its schedule needs and occupancy follows: Steel Nomad's big
+compute shaders on GB202 use 200-216 GPRs (8 warps/SM), its lighting
+fragment shaders 136-144 (12 warps/SM).  NVIDIA's compiler trades spills
+and rematerialization for occupancy instead.
+
+NAK_GPR_CAP=N caps the registers per thread of every stage, and
+NAK_GPR_CAP_CS / NAK_GPR_CAP_FS override it for compute and fragment
+shaders (0 there: no cap for that stage).  N counts registers the way the
+hardware allocates them and NVK_SHADER_STATS reports them, including the
+two reserved ones, and is rounded down to the allocation granularity of 8;
+values from 256 up mean no cap, values below 24 become 24.  The pre-RA
+scheduler takes the capped count as its register maximum, so it schedules
+for it, and assign_regs spills what does not fit with spill_values, as it
+does at the hardware maximum.  An OpRegOut keeps the GPRs its sources need.
+The variables are read once per process.
+
+The effective caps are part of nvk_physical_device_compiler_flags (bits
+16-39), which goes into the pipeline cache UUID, the shader binary UUID and
+the disk cache keys, so binaries compiled under another cap are not reused.
+NVK_SHADER_STATS prints the caps in its header when any is set; its gprs,
+max_warps and spill columns are those of the capped result.  Unset, NAK
+compiles as before.
+---
+ src/nouveau/compiler/nak.h                    |   6 +
+ src/nouveau/compiler/nak/assign_regs.rs       |   6 +
+ src/nouveau/compiler/nak/gpr_cap.rs           | 126 ++++++++++++++++++
+ src/nouveau/compiler/nak/lib.rs               |   1 +
+ .../compiler/nak/opt_instr_sched_prepass.rs   |   5 +
+ src/nouveau/vulkan/nvk_shader.c               |  10 ++
+ 6 files changed, 154 insertions(+)
+ create mode 100644 src/nouveau/compiler/nak/gpr_cap.rs
+
+diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
+index abb2509..23898bd 100644
+--- a/src/nouveau/compiler/nak.h
++++ b/src/nouveau/compiler/nak.h
+@@ -27,6 +27,12 @@ void nak_compiler_destroy(struct nak_compiler *nak);
+ 
+ uint64_t nak_debug_flags(const struct nak_compiler *nak);
+ 
++/* NAK_GPR_CAP, NAK_GPR_CAP_CS and NAK_GPR_CAP_FS as NAK applies them, for
++ * cache keys: the compute cap in bits 0-7, fragment in 8-15, other stages in
++ * 16-23, each in registers per thread; 0 is no cap.
++ */
++uint32_t nak_gpr_cap_key(void);
++
+ const struct nir_shader_compiler_options *
+ nak_nir_options(const struct nak_compiler *nak);
+ 
+diff --git a/src/nouveau/compiler/nak/assign_regs.rs b/src/nouveau/compiler/nak/assign_regs.rs
+index bc444fb..e0a71a6 100644
+--- a/src/nouveau/compiler/nak/assign_regs.rs
++++ b/src/nouveau/compiler/nak/assign_regs.rs
+@@ -1416,6 +1416,7 @@ impl AssignRegsBlock {
+ impl Shader<'_> {
+     pub fn assign_regs(&mut self) {
+         assert!(self.functions.len() == 1);
++        let gpr_cap = self.gpr_cap();
+         let f = &mut self.functions[0];
+ 
+         // Convert to CSSA before we spill or assign registers
+@@ -1486,6 +1487,11 @@ impl Shader<'_> {
+             );
+         }
+ 
++        // NAK_GPR_CAP: spill down to the cap instead of the hardware maximum
++        if let Some(cap) = gpr_cap {
++            max_gprs = min(max_gprs, cap);
++        }
++
+         if total_gprs > max_gprs {
+             // If we're spilling GPRs, we need to reserve 2 GPRs for OpParCopy
+             // lowering because it needs to be able lower Mem copies which
+diff --git a/src/nouveau/compiler/nak/gpr_cap.rs b/src/nouveau/compiler/nak/gpr_cap.rs
+new file mode 100644
+index 0000000..4638e8d
+--- /dev/null
++++ b/src/nouveau/compiler/nak/gpr_cap.rs
+@@ -0,0 +1,126 @@
++// Copyright © 2026 Conduit contributors
++// SPDX-License-Identifier: MIT
++
++//! NAK_GPR_CAP: an opt-in limit on the GPRs a shader may use
++//!
++//! NAK normally uses as many GPRs as the program needs and spills only past
++//! the hardware maximum.  With a cap, the pre-RA scheduler schedules for the
++//! capped register count and register allocation spills (through
++//! spill_values) whatever does not fit, trading spills for occupancy.
++//!
++//!   NAK_GPR_CAP=N      cap for every stage
++//!   NAK_GPR_CAP_CS=N   cap for compute shaders (overrides NAK_GPR_CAP)
++//!   NAK_GPR_CAP_FS=N   cap for fragment shaders (overrides NAK_GPR_CAP)
++//!
++//! N counts registers per thread the way the hardware allocates them (and
++//! NVK_SHADER_STATS reports them): including the GPRs the hardware reserves,
++//! rounded down to the allocation granularity of 8.  0, unset, or 256 and
++//! more mean no cap; caps below 24 become 24, the least register allocation
++//! can work with.  The variables are read once per process.
++
++use crate::ir::*;
++
++use std::cmp::max;
++use std::env;
++use std::sync::OnceLock;
++
++/// The least cap: register allocation needs 16 GPRs for any instruction's
++/// vector sources and destinations, 2 for parallel-copy temporaries when it
++/// spills, plus the hardware-reserved GPRs, rounded up to 8.
++const MIN_GPR_CAP: u32 = 24;
++
++#[derive(Clone, Copy, Default)]
++struct GprCaps {
++    compute: u8,
++    fragment: u8,
++    other: u8,
++}
++
++/// Parses one cap variable's value: None if unset or unparsable, Some(0) for
++/// no cap.
++fn parse_cap(var: &str, val: Result<String, env::VarError>) -> Option<u8> {
++    let s = val.ok()?;
++    let s = s.trim();
++    if s.is_empty() {
++        return None;
++    }
++    match s.parse::<u32>() {
++        Ok(0) => Some(0),
++        Ok(n) if n >= 256 => Some(0),
++        Ok(n) => {
++            let n = prev_multiple_of(max(n, MIN_GPR_CAP), 8);
++            Some(n.try_into().unwrap())
++        }
++        Err(_) => {
++            eprintln!("NAK: ignoring {}=\"{}\" (not a number)", var, s);
++            None
++        }
++    }
++}
++
++static GPR_CAPS: OnceLock<GprCaps> = OnceLock::new();
++
++fn gpr_caps() -> GprCaps {
++    *GPR_CAPS.get_or_init(|| {
++        let all =
++            parse_cap("NAK_GPR_CAP", env::var("NAK_GPR_CAP")).unwrap_or(0);
++        let cs = parse_cap("NAK_GPR_CAP_CS", env::var("NAK_GPR_CAP_CS"));
++        let fs = parse_cap("NAK_GPR_CAP_FS", env::var("NAK_GPR_CAP_FS"));
++        GprCaps {
++            compute: cs.unwrap_or(all),
++            fragment: fs.unwrap_or(all),
++            other: all,
++        }
++    })
++}
++
++/// The effective caps, packed for driver cache keys: compute in bits 0-7,
++/// fragment in bits 8-15, every other stage in bits 16-23; 0 is no cap.
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_gpr_cap_key() -> u32 {
++    let c = gpr_caps();
++    u32::from(c.compute)
++        | (u32::from(c.fragment) << 8)
++        | (u32::from(c.other) << 16)
++}
++
++impl Shader<'_> {
++    /// The most GPRs register allocation may use for this shader under
++    /// NAK_GPR_CAP, not counting the hardware-reserved ones, or None without
++    /// a cap for its stage.  OpRegOut needs all of its sources in GPRs at
++    /// once, so the limit never drops below that (plus the parallel-copy
++    /// temporaries).
++    pub fn gpr_cap(&self) -> Option<u32> {
++        let caps = gpr_caps();
++        let cap = match &self.info.stage {
++            ShaderStageInfo::Compute(_) => caps.compute,
++            ShaderStageInfo::Fragment(_) => caps.fragment,
++            _ => caps.other,
++        };
++        if cap == 0 {
++            return None;
++        }
++
++        let hw_reserved = self.sm.hw_reserved_gprs();
++        let mut need = 16;
++        for f in &self.functions {
++            for b in &f.blocks {
++                for instr in b.instrs.iter().rev() {
++                    match &instr.op {
++                        Op::Exit(_) => (),
++                        Op::RegOut(op) => {
++                            need = max(
++                                need,
++                                u32::try_from(op.srcs.len()).unwrap(),
++                            );
++                        }
++                        _ => break,
++                    }
++                }
++            }
++        }
++        let floor = (need + 2 + hw_reserved).next_multiple_of(8);
++
++        Some(max(u32::from(cap), floor) - hw_reserved)
++    }
++}
+diff --git a/src/nouveau/compiler/nak/lib.rs b/src/nouveau/compiler/nak/lib.rs
+index 5f7abd1..9404987 100644
+--- a/src/nouveau/compiler/nak/lib.rs
++++ b/src/nouveau/compiler/nak/lib.rs
+@@ -7,6 +7,7 @@ mod builder;
+ mod calc_instr_deps;
+ mod const_tracker;
+ mod from_nir;
++mod gpr_cap;
+ mod ir;
+ mod legalize;
+ mod liveness;
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+index e086742..af6b99f 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+@@ -1056,6 +1056,11 @@ impl Shader<'_> {
+                 .unwrap(),
+             );
+         }
++        // NAK_GPR_CAP: schedule for the same limit assign_regs spills to
++        if let Some(cap) = self.gpr_cap() {
++            max_regs[RegFile::GPR] =
++                min(max_regs[RegFile::GPR], cap.try_into().unwrap());
++        }
+         max_regs[RegFile::GPR] -= SW_RESERVED_GPRS;
+ 
+         for f in &mut self.functions {
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index 6780df7..8d06b67 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -88,13 +88,17 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+    bool no_cbufs = pdev->debug_flags & NVK_DEBUG_NO_CBUF;
+    bool use_edb_buffer_views = nvk_use_edb_buffer_views(pdev);
+    uint64_t nak_flags = nak_debug_flags(pdev->nak);
++   /* NAK_GPR_CAP*: binaries compiled under another cap are not reused */
++   uint64_t nak_gpr_caps = nak_gpr_cap_key();
+ 
+    assert(nak_flags <= UINT16_MAX);
++   assert(nak_gpr_caps <= 0xffffff);
+ 
+    return (no_cbufs ? 1 << 12 : 0)
+       | (pdev->ubo_desc_cbufs ? 0 : 1 << 15)
+       | (use_edb_buffer_views ? 1 << 13 : 0)
+       | (instance->drirc.misc.ssbo_align_4b ? 1 << 14 : 0)
++      | (nak_gpr_caps << 16)
+       | (nak_flags << 48);
+ }
+ 
+@@ -741,6 +745,12 @@ nvk_shader_stats_file(void)
+          fprintf(file, "NVK shader stats: stage hash code_B instrs gprs "
+                  "max_warps static_cycles spills_mem fills_mem spills_reg "
+                  "fills_reg slm_B crs_B [stage details]\n");
++         uint32_t caps = nak_gpr_cap_key();
++         if (caps != 0) {
++            fprintf(file, "NVK shader stats: NAK_GPR_CAP compute %u "
++                    "fragment %u other %u (0: none)\n", caps & 0xff,
++                    (caps >> 8) & 0xff, (caps >> 16) & 0xff);
++         }
+          fflush(file);
+       }
+    }
+-- 
+2.43.0
+
