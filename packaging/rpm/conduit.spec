@@ -37,6 +37,7 @@ BuildRequires:  rust >= 1.90
 BuildRequires:  gcc gcc-c++ make pkgconf-pkg-config file
 BuildRequires:  python3 ninja-build meson flex bison bzip2 diffutils findutils
 BuildRequires:  wayland-devel wayland-protocols-devel libxcb-devel mesa-libgbm-devel
+BuildRequires:  freetype-devel fontconfig-devel
 BuildRequires:  openssl-devel mesa-libEGL-devel
 BuildRequires:  glib2-devel pixman-devel libslirp-devel libseccomp-devel
 BuildRequires:  pulseaudio-libs-devel pipewire-devel

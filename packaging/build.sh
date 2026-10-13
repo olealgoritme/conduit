@@ -101,6 +101,7 @@ cmd_deps() {
             musl-tools \
             libwayland-dev wayland-protocols libxcb1-dev libxcb-dri3-dev \
             libxcb-present-dev libxcb-render0-dev libxcb-xinput-dev libgbm-dev \
+            libfreetype-dev libfontconfig-dev \
             libssl-dev libegl-dev \
             libglib2.0-dev libpixman-1-dev libslirp-dev libseccomp-dev \
             libcap-ng-dev libzstd-dev libaio-dev libfdt-dev \
@@ -114,6 +115,7 @@ cmd_deps() {
             python3 ninja-build meson flex bison bzip2 diffutils findutils \
             rpm-build \
             wayland-devel wayland-protocols-devel libxcb-devel mesa-libgbm-devel \
+            freetype-devel fontconfig-devel \
             openssl-devel mesa-libEGL-devel \
             glib2-devel pixman-devel libslirp-devel libseccomp-devel \
             libcap-ng-devel libzstd-devel libaio-devel libfdt-devel \
@@ -123,7 +125,7 @@ cmd_deps() {
     arch)
         pacman -Syu --noconfirm --needed \
             base-devel git curl xz file patchelf gnupg python ninja meson flex bison \
-            wayland wayland-protocols libxcb mesa openssl \
+            wayland wayland-protocols libxcb mesa openssl freetype2 fontconfig \
             glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc \
             libpulse pipewire \
             vulkan-headers vulkan-icd-loader libdrm python-mako python-yaml
@@ -193,7 +195,7 @@ cmd_rust() {
 # -------------------------------------------------------------- viewer -----
 cmd_viewer() {
     log "viewer ($VIEWER_BIN_SRC -> conduit-viewer)"
-    make -C "$ROOT/host/viewer" -j"$JOBS" all
+    make -C "$ROOT/host/viewer" -j"$JOBS" REQUIRE_UI_FONT=1 all
     mkdir -p "$DIST/viewer/bin"
     install -m0755 "$ROOT/host/viewer/$VIEWER_BIN_SRC" "$DIST/viewer/bin/conduit-viewer"
 }

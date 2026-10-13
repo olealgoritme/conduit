@@ -163,7 +163,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwayland-dev wayland-protocols libxcb1-dev libxcb-dri3-dev \
-            libxcb-present-dev libxcb-render0-dev libxcb-xinput-dev libgbm-dev python3
+            libxcb-present-dev libxcb-render0-dev libxcb-xinput-dev libgbm-dev libfreetype-dev libfontconfig-dev python3
       - name: make check
         run: make -C host/viewer -j"$(nproc)" check
 
