@@ -117,8 +117,10 @@ LIBS     += $(UI_LIBS)
 endif
 LIBS     += -lm -ldl
 # Release packages must not silently ship the bitmap-font menu.
-ifeq ($(REQUIRE_UI_FONT)$(HAVE_FT),1)
+ifeq ($(REQUIRE_UI_FONT),1)
+ifneq ($(HAVE_FT),1)
 $(error REQUIRE_UI_FONT=1 but freetype2/fontconfig development files are missing (apt install libfreetype-dev libfontconfig-dev))
+endif
 endif
 
 ifeq ($(HAVE_X11)$(HAVE_WL),)
