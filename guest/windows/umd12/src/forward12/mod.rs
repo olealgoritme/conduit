@@ -72,3 +72,5 @@ pub(crate) mod shaders;
 pub(crate) mod identity12;
 // S5 (dxvk-on-nvk): ordering the runtime context behind NVK engine work.
 pub(crate) mod nvk12;
+// `Nvk12CompletionHint`: finished batches named to the KMD from the engine worker.
+pub(crate) mod ecl_hint;

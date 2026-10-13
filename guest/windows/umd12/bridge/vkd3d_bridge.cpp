@@ -1513,6 +1513,15 @@ extern "C" std::uint32_t helios_vkd3d_ecl_fence_stats(std::uint64_t*, std::uint3
 extern "C" std::uint32_t helios_vkd3d_memory_stats(std::uint64_t*, std::uint32_t);
 extern "C" std::uint32_t helios_vkd3d_gpu_time_stats(std::uint64_t*, std::uint32_t);
 extern "C" HRESULT helios_vkd3d_prepare_ecl_fence(ID3D12CommandQueue*);
+typedef void (*helios_vkd3d_completion_hint_fn)(const std::uint32_t*, std::uint32_t);
+extern "C" void helios_vkd3d_set_completion_hint(helios_vkd3d_completion_hint_fn, std::uint32_t);
+
+void helios_vkd3d_bridge_set_completion_hint(std::size_t cb, std::uint32_t spin_us) noexcept {
+  helios_bridge::bridge_guard("set_completion_hint12", 0, [&]() -> int {
+    helios_vkd3d_set_completion_hint(reinterpret_cast<helios_vkd3d_completion_hint_fn>(cb), spin_us);
+    return 0;
+  });
+}
 
 std::int32_t helios_vkd3d_bridge_prepare_ecl_fence(std::size_t queue) noexcept {
   return helios_bridge::bridge_guard("prepare_ecl_fence12", std::int32_t(E_FAIL), [&]() -> std::int32_t {

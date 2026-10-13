@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 24] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 25] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -336,6 +336,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 24] {
         ("Umd12EngineShaderCaps", umd12_engine_shader_caps() as u32),
         // Appended.
         ("Nvk12AdmitBeforeRender", nvk12_admit_before_render() as u32),
+        // Appended.
+        ("Nvk12CompletionHint", nvk12_completion_hint_us()),
     ]
 }
 
@@ -482,6 +484,25 @@ pub(crate) static NVK12_ADMIT_BEFORE_RENDER: BoolKnob =
 
 pub(crate) fn nvk12_admit_before_render() -> bool {
     NVK12_ADMIT_BEFORE_RENDER.get()
+}
+
+/// `Nvk12CompletionHint` (`Nvk12EclSync=2`; default 0 = off): microseconds the
+/// engine's queue worker polls, per admission wait, the queue's producer timeline
+/// (CPU-visible memory the GPU writes after each batch) and the admission event.
+/// Every batch it sees finish has its ECL fence named to the KMD
+/// (`HELIOS_ESCAPE_ECL_DONE`, `forward12/ecl_hint.rs`, vkd3d patch 0011), which
+/// completes the batch's HE12 v4 packet at once instead of when the host's
+/// `EventReady` for the fence arrives; that completion is what admits the batch two
+/// packets later. Costs up to this much of one core per admission wait while
+/// polling. Off when the KMD does not serve the verb. Clamped to
+/// [`MAX_COMPLETION_HINT_US`]. Read once per process.
+pub(crate) static NVK12_COMPLETION_HINT: DwordKnob = DwordKnob::new(c"Nvk12CompletionHint", 0);
+
+/// Upper bound of [`NVK12_COMPLETION_HINT`] (the engine clamps to the same).
+const MAX_COMPLETION_HINT_US: u32 = 20_000;
+
+pub(crate) fn nvk12_completion_hint_us() -> u32 {
+    NVK12_COMPLETION_HINT.get().min(MAX_COMPLETION_HINT_US)
 }
 
 /// `Nvk12EclFencePrefetch` (`Nvk12EclSync=2`): after an ECL is admitted, make

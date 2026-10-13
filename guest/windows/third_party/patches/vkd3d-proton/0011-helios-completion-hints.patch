@@ -1,0 +1,339 @@
+Helios vkd3d-proton fork: completion hints from the queue worker
+
+Conduit, D3D12 on NVK, Nvk12EclSync=2, UMD knob Nvk12CompletionHint.
+Applied after 0010.
+
+An HE12 v4 packet completes when its batch's ECL fence fires, and the fire
+reaches the guest from the host (nvidia-drm's semaphore-surface callback,
+the backend's event thread, the virtio event queue, the KMD's DPC). dxgkrnl
+keeps about two packets in flight per node, so a batch is admitted once
+the packet two ahead of it completed: that round trip sits between two
+batches on the GPU whenever the batch in between is shorter than it.
+
+- helios_vkd3d_set_completion_hint(cb, spin_us): with a callback and a
+  nonzero budget, each commit that reserves an ECL value records the
+  batch's fence with its producer value in a per-queue ring (64 entries,
+  queue_lock). While the worker waits for an admission it polls the
+  admission event and the queue's producer timeline (one memory read on
+  NVK) for up to spin_us, and hands the fences of every batch the timeline
+  passed to cb (at most 16 per call). The UMD names them to the KMD, which
+  completes their packets at once. An entry the worker never looked at
+  before the ring came round again (no admission to wait for meanwhile) is
+  overwritten; its packet waits for the host as before.
+- helios_vkd3d_ecl_fence_stats appends: hint calls, fences named, ring
+  overwrites, and the time from the worker seeing batches finish to the
+  next admission (sum in us and count).
+
+diff --git a/libs/d3d12core/helios_vkd3d.def b/libs/d3d12core/helios_vkd3d.def
+index 935f1f70..6d57722c 100644
+--- a/libs/d3d12core/helios_vkd3d.def
++++ b/libs/d3d12core/helios_vkd3d.def
+@@ -15,3 +15,4 @@ EXPORTS
+     helios_vkd3d_create_ecl_fence
+     helios_vkd3d_gpu_time_stats
+     helios_vkd3d_prepare_ecl_fence
++    helios_vkd3d_set_completion_hint
+diff --git a/libs/vkd3d/helios_producer.h b/libs/vkd3d/helios_producer.h
+index 6b3f5749..821eb432 100644
+--- a/libs/vkd3d/helios_producer.h
++++ b/libs/vkd3d/helios_producer.h
+@@ -106,6 +106,11 @@ static struct
+     uint64_t inline_signals, separate_signals;
+     /* ECL fences made ahead (prepare) and taken by a commit. */
+     uint64_t prepared, prepared_used;
++    /* Completion hints (patch 0011): hint calls, fences named, ring entries
++     * overwritten before the worker looked (left to the host's EventReady);
++     * the time from the worker seeing batches finish to the next admission. */
++    uint64_t hint_calls, hint_fences, hint_dropped;
++    uint64_t done_to_admit_sum_us, done_to_admit_n;
+ } vkd3d_helios_ecl_stats;
+ 
+ static uint64_t vkd3d_helios_qpc_us(int64_t from, int64_t to)
+@@ -171,8 +176,10 @@ static void vkd3d_helios_ecl_note_signal(int64_t commit_qpc, int64_t admit_qpc)
+  * 0006) admissions, commit-to-admission sum (us), its 7 buckets, the ECL
+  * fences' admission-to-signal sum (us), producer signals inline in the
+  * batch's submit, separate producer signal submits; then (patch 0009) ECL
+- * fences made ahead and those a commit took. Returns how many values it
+- * wrote (at most `count`). */
++ * fences made ahead and those a commit took; then (patch 0011) completion
++ * hint calls, fences named, ring entries overwritten unseen, and the
++ * done-to-admission sum (us) and count. Returns how many values it wrote
++ * (at most `count`). */
+ /* NVK on RM: another RM fence for `value` of this queue's ECL timeline (a
+  * value a helios_vkd3d_execute_command_lists_rm returned), e.g. for a scanout
+  * present that must wait for the frame's last batch. *fence is the caller's
+@@ -261,7 +268,7 @@ HRESULT helios_vkd3d_prepare_ecl_fence(ID3D12CommandQueue *iface)
+ uint32_t helios_vkd3d_ecl_fence_stats(uint64_t *out, uint32_t count)
+ {
+ #ifdef _WIN32
+-    uint64_t all[7 + VKD3D_HELIOS_ECL_BUCKETS + 2 + VKD3D_HELIOS_ECL_BUCKETS + 3 + 2];
++    uint64_t all[7 + VKD3D_HELIOS_ECL_BUCKETS + 2 + VKD3D_HELIOS_ECL_BUCKETS + 3 + 2 + 5];
+     uint32_t i, n;
+     all[0] = vkd3d_helios_ecl_stats.signals;
+     all[1] = vkd3d_helios_ecl_stats.sum_us;
+@@ -282,6 +289,11 @@ uint32_t helios_vkd3d_ecl_fence_stats(uint64_t *out, uint32_t count)
+     all[n++] = vkd3d_helios_ecl_stats.separate_signals;
+     all[n++] = vkd3d_helios_ecl_stats.prepared;
+     all[n++] = vkd3d_helios_ecl_stats.prepared_used;
++    all[n++] = vkd3d_helios_ecl_stats.hint_calls;
++    all[n++] = vkd3d_helios_ecl_stats.hint_fences;
++    all[n++] = vkd3d_helios_ecl_stats.hint_dropped;
++    all[n++] = vkd3d_helios_ecl_stats.done_to_admit_sum_us;
++    all[n++] = vkd3d_helios_ecl_stats.done_to_admit_n;
+     n = count < (uint32_t)ARRAY_SIZE(all) ? count : (uint32_t)ARRAY_SIZE(all);
+     if (out)
+         memcpy(out, all, n * sizeof(*out));
+@@ -292,6 +304,111 @@ uint32_t helios_vkd3d_ecl_fence_stats(uint64_t *out, uint32_t count)
+ #endif
+ }
+ 
++/* Completion hints (patch 0011, Conduit Nvk12CompletionHint). An HE12 v4
++ * packet completes when its batch's ECL fence fires, and that fire travels
++ * from the host (nvidia-drm, the backend's event thread, the virtio event
++ * queue, the KMD's DPC). The worker can see the batch finish sooner: the
++ * producer timeline the batch signals is CPU-visible memory. While a worker
++ * waits for an admission it polls that timeline, and for every batch it saw
++ * finish it hands the batch's ECL fence to `cb` (the UMD), which names it to
++ * the KMD (HELIOS_ESCAPE_ECL_DONE); the KMD then completes the packet without
++ * the host round trip, which is what admits the batch two packets later.
++ * `spin_us` bounds the poll per admission wait; 0 or no callback: off. */
++typedef void (*helios_vkd3d_completion_hint_fn)(const uint32_t *fences, uint32_t count);
++#ifdef _WIN32
++static helios_vkd3d_completion_hint_fn vkd3d_helios_hint_cb;
++static uint32_t vkd3d_helios_hint_spin_us;
++
++void helios_vkd3d_set_completion_hint(helios_vkd3d_completion_hint_fn cb, uint32_t spin_us)
++{
++    if (spin_us > 20000) spin_us = 20000;
++    vkd3d_helios_hint_spin_us = cb ? spin_us : 0;
++    vkd3d_helios_hint_cb = spin_us ? cb : NULL;
++    if (vkd3d_helios_hint_cb)
++        INFO("Helios: completion hints on, admission waits poll for %u us.\n", spin_us);
++}
++
++static bool vkd3d_helios_hints_on(void)
++{
++    return vkd3d_helios_hint_cb != NULL;
++}
++
++/* Caller holds queue_lock: remember batch `value`'s ECL fence (0 = not made
++ * yet; vkd3d_helios_hint_set_fence fills it in). A full ring overwrites its
++ * oldest entry (the worker had no admission to wait for since it was made):
++ * that batch's packet waits for the host's EventReady. */
++static void vkd3d_helios_hint_push_locked(struct d3d12_command_queue *queue, uint64_t value, uint32_t fence)
++{
++    uint32_t n = ARRAY_SIZE(queue->helios_hint.value);
++    if (queue->helios_hint.head - queue->helios_hint.tail >= n)
++    {
++        queue->helios_hint.tail++;
++        InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.hint_dropped);
++    }
++    queue->helios_hint.value[queue->helios_hint.head % n] = value;
++    queue->helios_hint.fence[queue->helios_hint.head % n] = fence;
++    queue->helios_hint.head++;
++}
++
++/* The fence of batch `value`, made after its commit. */
++static void vkd3d_helios_hint_set_fence(struct d3d12_command_queue *queue, uint64_t value, uint32_t fence)
++{
++    uint32_t n = ARRAY_SIZE(queue->helios_hint.value), i;
++    pthread_mutex_lock(&queue->queue_lock);
++    for (i = queue->helios_hint.head; i != queue->helios_hint.tail; i--)
++    {
++        if (queue->helios_hint.value[(i - 1) % n] == value)
++        {
++            queue->helios_hint.fence[(i - 1) % n] = fence;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&queue->queue_lock);
++}
++
++/* The worker: name the fences of every batch the producer timeline passed.
++ * One semaphore read when nothing finished since the last call. */
++static void vkd3d_helios_hint_poll(struct d3d12_command_queue *queue)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
++    uint32_t fences[16], n = 0, size = ARRAY_SIZE(queue->helios_hint.value);
++    LARGE_INTEGER qpc;
++    uint64_t done = 0;
++    if (!queue->helios_producer || VK_CALL(vkGetSemaphoreCounterValue(queue->device->vk_device,
++            queue->helios_producer->semaphore, &done)) != VK_SUCCESS || done <= queue->helios_hint_seen)
++        return;
++    queue->helios_hint_seen = done;
++    QueryPerformanceCounter(&qpc);
++    queue->helios_hint_done_qpc = qpc.QuadPart;
++    for (;;)
++    {
++        n = 0;
++        pthread_mutex_lock(&queue->queue_lock);
++        while (queue->helios_hint.tail != queue->helios_hint.head && n < ARRAY_SIZE(fences) &&
++                queue->helios_hint.value[queue->helios_hint.tail % size] <= done)
++        {
++            uint32_t fence = queue->helios_hint.fence[queue->helios_hint.tail % size];
++            if (fence)
++                fences[n++] = fence;
++            queue->helios_hint.tail++;
++        }
++        pthread_mutex_unlock(&queue->queue_lock);
++        if (!n)
++            return;
++        vkd3d_helios_hint_cb(fences, n);
++        InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.hint_calls);
++        InterlockedExchangeAdd64((LONG64 *)&vkd3d_helios_ecl_stats.hint_fences, (LONG64)n);
++        if (n < ARRAY_SIZE(fences))
++            return;
++    }
++}
++#else
++void helios_vkd3d_set_completion_hint(helios_vkd3d_completion_hint_fn cb, uint32_t spin_us)
++{
++    (void)cb; (void)spin_us;
++}
++#endif
++
+ /* Caller owns queue_lock: stream values are reserved at the same commit that
+  * appends work to the FIFO, including concurrent ECL and Present producers. */
+ static bool vkd3d_helios_ensure_stream_locked(struct d3d12_command_queue *queue,
+@@ -372,7 +489,7 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+     struct vkd3d_helios_stream *stream;
+     LARGE_INTEGER qpc;
+     uint32_t prepared_fence = 0;
+-    uint64_t rm_value = 0;
++    uint64_t rm_value = 0, op_value = 0;
+     bool committed = false;
+     if (rm)
+     {
+@@ -398,7 +515,7 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+                 queue->submissions_count + 1, sizeof(*queue->submissions)))
+     {
+         stream = queue->helios_producer;
+-        op->value = ++stream->value;
++        op_value = op->value = ++stream->value;
+         /* Reserved under queue_lock, the lock the worker pops submissions
+          * under: values of this queue's ECL timeline are signalled in the
+          * order they are reserved. The key is this queue, so D3D12 queues
+@@ -421,6 +538,8 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+         }
+         else
+             op->rm_value = 0;
++        if (op->rm_value && vkd3d_helios_hints_on())
++            vkd3d_helios_hint_push_locked(queue, op->value, prepared_fence);
+         if (sub->type == VKD3D_SUBMISSION_BIND_SPARSE)
+             sub->bind_sparse.helios_execution = op;
+         else
+@@ -453,6 +572,8 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+         {
+             rm->fence = fence;
+             rm->value = rm_value;
++            if (vkd3d_helios_hints_on())
++                vkd3d_helios_hint_set_fence(queue, op_value, fence);
+             InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.created);
+         }
+         else
+@@ -494,11 +615,52 @@ static uint32_t vkd3d_helios_admission_spin_us(void)
+ }
+ #endif
+ 
++#ifdef _WIN32
++/* The admission of `op` was seen: note it, and with hints on the time since
++ * the worker last saw batches finish (what the KMD, dxgkrnl's scheduler and
++ * the event took after the hint). */
++static void vkd3d_helios_note_admitted_hinted(struct d3d12_command_queue *queue,
++        struct vkd3d_helios_execution *op)
++{
++    vkd3d_helios_note_admitted(op);
++    if (queue->helios_hint_done_qpc)
++    {
++        InterlockedExchangeAdd64((LONG64 *)&vkd3d_helios_ecl_stats.done_to_admit_sum_us,
++                (LONG64)vkd3d_helios_qpc_us(queue->helios_hint_done_qpc, op->admit_qpc));
++        InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.done_to_admit_n);
++        queue->helios_hint_done_qpc = 0;
++    }
++}
++#endif
++
+ static bool vkd3d_helios_execution_wait(struct d3d12_command_queue *queue,
+         struct vkd3d_helios_execution *op)
+ {
+     if (!op) return true;
+ #ifdef _WIN32
++    if (vkd3d_helios_hints_on())
++    {
++        /* Completion hints: poll the admission event and this queue's
++         * producer timeline (one memory read), naming finished batches'
++         * fences as they finish, for at most the hint budget. The event
++         * first: a batch admitted already goes to the GPU without an escape
++         * in front of it. */
++        uint64_t deadline = vkd3d_get_current_time_ns() + vkd3d_helios_hint_spin_us * 1000ull;
++        unsigned int k;
++        do
++        {
++            for (k = 0; k < 16; k++)
++            {
++                if (WaitForSingleObject(op->admission_event, 0) == WAIT_OBJECT_0)
++                {
++                    vkd3d_helios_note_admitted_hinted(queue, op);
++                    return true;
++                }
++                vkd3d_helios_hint_poll(queue);
++                YieldProcessor();
++            }
++        } while (vkd3d_get_current_time_ns() < deadline);
++    }
+     if (vkd3d_helios_admission_spin_us())
+     {
+         uint64_t deadline = vkd3d_get_current_time_ns() + vkd3d_helios_admission_spin_us() * 1000ull;
+@@ -509,7 +671,7 @@ static bool vkd3d_helios_execution_wait(struct d3d12_command_queue *queue,
+             {
+                 if (WaitForSingleObject(op->admission_event, 0) == WAIT_OBJECT_0)
+                 {
+-                    vkd3d_helios_note_admitted(op);
++                    vkd3d_helios_note_admitted_hinted(queue, op);
+                     return true;
+                 }
+                 YieldProcessor();
+@@ -525,7 +687,7 @@ static bool vkd3d_helios_execution_wait(struct d3d12_command_queue *queue,
+         result = WaitForSingleObject(op->admission_event, 0);
+         if (result == WAIT_OBJECT_0)
+         {
+-            vkd3d_helios_note_admitted(op);
++            vkd3d_helios_note_admitted_hinted(queue, op);
+             return true;
+         }
+         if (result != WAIT_TIMEOUT ||
+@@ -536,7 +698,7 @@ static bool vkd3d_helios_execution_wait(struct d3d12_command_queue *queue,
+         result = WaitForSingleObject(op->admission_event, 100);
+         if (result == WAIT_OBJECT_0)
+         {
+-            vkd3d_helios_note_admitted(op);
++            vkd3d_helios_note_admitted_hinted(queue, op);
+             return true;
+         }
+         if (result != WAIT_TIMEOUT) break;
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 14946c03..11583d4e 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -4051,6 +4051,21 @@ struct d3d12_command_queue
+      * queue_lock. value 0 = none. */
+     uint64_t helios_ecl_prepared_value;
+     uint32_t helios_ecl_prepared_fence;
++    /* Helios: completion hints (patch 0011). The ECL fences of committed
++     * batches, in commit order, with the producer value each batch signals;
++     * under queue_lock. The worker names a batch's fence to the UMD once the
++     * producer timeline passed its value. */
++    struct
++    {
++        uint64_t value[64];
++        uint32_t fence[64];
++        uint32_t head, tail;
++    } helios_hint;
++    /* The producer value the worker last saw (the worker's only). */
++    uint64_t helios_hint_seen;
++    /* QueryPerformanceCounter when the worker last saw batches finish (the
++     * worker's only; 0 = not since the last admission). */
++    int64_t helios_hint_done_qpc;
+ 
+     D3D12_COMMAND_QUEUE_DESC desc;
+ 
