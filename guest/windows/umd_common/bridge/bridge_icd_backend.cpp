@@ -22,6 +22,7 @@
 #include <mutex>
 
 #include "bridge_common.h"  // umd_log
+#include "bridge_dwm_guard.h"
 #include "bridge_icd_backend.h"
 #include "helios_icd_interface.h"
 #include "helios_icd_policy.h"  // protocol/include: shared with NVK
@@ -113,62 +114,119 @@ bool denied(const char* exe, const char** why) {
   return helios_policy_denied(exe, why) != 0;
 }
 
-// DwmIcd=nvk crash-loop guard (docs/dwm-on-nvk.md, "Failure safety"). Windows
-// restarts a DWM that dies; a DWM that dies on NVK at every start would leave
-// the desktop black and, after a few rounds, make Windows give up on the
-// display. %ProgramData%\Helios\dwm-nvk-starts.txt keeps the FILETIMEs of the
-// recent DWM starts that chose NVK, one per line. When DwmNvkMaxStarts
-// (REG_DWORD, default 2, 0 = no guard) of them fall inside the last
-// DwmNvkGuardSeconds (default 600) this start goes to Venus and is not
-// recorded, so NVK is tried again once the window has passed. A DWM that
-// stays up never starts again, so a healthy session never trips it; a test
-// that restarts DWM by hand more often than that sees Venus (delete the file
-// or raise the knob).
-bool dwm_nvk_guard_allows(const char** why) {
-  DWORD max_starts = 2;
-  reg_dword("DwmNvkMaxStarts", &max_starts);
-  if (max_starts == 0)
-    return true;
-  DWORD window_s = 600;
-  reg_dword("DwmNvkGuardSeconds", &window_s);
+// DwmIcd=nvk crash-loop guard (docs/dwm-on-nvk.md 4.1, "Failure safety"). Windows restarts a
+// DWM that dies; a DWM that dies on NVK at every start would leave the desktop black and, after a
+// few rounds, make Windows give up on the display. The decision and the file format live in
+// bridge_dwm_guard.h (host-tested); here are the file, the registry and the clock.
+//
+// %ProgramData%\Helios\dwm-nvk-starts.txt keeps the DWM starts on NVK that have not proved
+// healthy yet. When DwmNvkMaxStarts (REG_DWORD, default 2, 0 = no guard) of them, made by this
+// UMD build in other DWM processes, fall inside the last DwmNvkGuardSeconds (default 600), this
+// start goes to Venus and is not recorded, so NVK is tried again once the window has passed. A
+// DWM that still presents on NVK DwmNvkHealthySeconds (default 30) after its choice deletes the
+// file (note_dwm_nvk_present), so ordinary restarts, a live driver update (which restarts DWM)
+// and a reboot after one never add up to a crash loop; neither do starts of another build.
+constexpr const char kDwmGuardFile[] = "\\Helios\\dwm-nvk-starts.txt";
+
+// This DWM's start is in the file and waits for the healthy mark.
+std::atomic<bool> g_dwm_nvk_pending{false};
+std::atomic<unsigned long long> g_dwm_nvk_chose_at{0};
+std::atomic<unsigned long long> g_dwm_nvk_healthy_ticks{0};
+
+unsigned long long filetime_now() {
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  return (static_cast<unsigned long long>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+void dwm_guard_path(char* path, std::size_t cap) {
   char dir[MAX_PATH];
   const DWORD n = GetEnvironmentVariableA("ProgramData", dir, MAX_PATH);
   if (n == 0 || n >= MAX_PATH - 40)
     std::snprintf(dir, sizeof(dir), "C:\\ProgramData");
+  std::snprintf(path, cap, "%s%s", dir, kDwmGuardFile);
+}
+
+// This UMD's build: its driver-store directory (one per driver package).
+unsigned long long umd_build_id() {
+  HMODULE self = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(&umd_build_id), &self))
+    return 0;
+  wchar_t dir[MAX_PATH];
+  const DWORD len = GetModuleFileNameW(self, dir, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH)
+    return 0;
+  if (wchar_t* slash = std::wcsrchr(dir, L'\\'))
+    slash[1] = 0;
+  return dwm_guard::build_id(dir);
+}
+
+dwm_guard::Start this_dwm_start() {
+  dwm_guard::Start self;
+  self.time = filetime_now();
+  self.pid = GetCurrentProcessId();
+  FILETIME created, exited, kernel, user;
+  if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+    self.created = (static_cast<unsigned long long>(created.dwHighDateTime) << 32) |
+                   created.dwLowDateTime;
+  self.build = umd_build_id();
+  return self;
+}
+
+// This start is on NVK: wait for the healthy mark (note_dwm_nvk_present).
+void dwm_guard_arm(unsigned long long chose_at) {
+  DWORD healthy_s = 30;
+  reg_dword("DwmNvkHealthySeconds", &healthy_s);
+  g_dwm_nvk_healthy_ticks.store(static_cast<unsigned long long>(healthy_s) * dwm_guard::kTicksPerSecond,
+                                std::memory_order_relaxed);
+  g_dwm_nvk_chose_at.store(chose_at, std::memory_order_relaxed);
+  g_dwm_nvk_pending.store(true, std::memory_order_release);
+}
+
+bool dwm_nvk_guard_allows(const char** why) {
+  DWORD max_starts = 2;
+  reg_dword("DwmNvkMaxStarts", &max_starts);
+  dwm_guard::Params p;
+  p.max_starts = max_starts;
+  if (p.max_starts == 0)
+    return true;
+  DWORD window_s = 600;
+  reg_dword("DwmNvkGuardSeconds", &window_s);
+  p.window = static_cast<unsigned long long>(window_s) * dwm_guard::kTicksPerSecond;
   char path[MAX_PATH];
-  std::snprintf(path, sizeof(path), "%s\\Helios\\dwm-nvk-starts.txt", dir);
+  dwm_guard_path(path, sizeof(path));
 
-  FILETIME ft;
-  GetSystemTimeAsFileTime(&ft);
-  const unsigned long long now =
-      (static_cast<unsigned long long>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-  const unsigned long long window = static_cast<unsigned long long>(window_s) * 10000000ull;
-
-  unsigned long long kept[16];
-  std::size_t count = 0;
-  if (FILE* f = std::fopen(path, "r")) {
-    unsigned long long t = 0;
-    while (count < 15 && std::fscanf(f, "%llu", &t) == 1) {
-      if (t <= now && now - t < window)
-        kept[count++] = t;
-    }
+  const dwm_guard::Start self = this_dwm_start();
+  dwm_guard::Start history[dwm_guard::kMaxStarts];
+  std::size_t len = 0;
+  if (FILE* f = std::fopen(path, "rb")) {
+    char text[4096];
+    const std::size_t n = std::fread(text, 1, sizeof(text) - 1, f);
     std::fclose(f);
+    text[n] = 0;
+    len = dwm_guard::parse(text, history, dwm_guard::kMaxStarts);
   }
-  if (count >= max_starts) {
-    static char reason[192];
+  const dwm_guard::Verdict v = dwm_guard::decide(history, len, self, p);
+  if (!v.nvk) {
+    static char reason[MAX_PATH + 192];
     std::snprintf(reason, sizeof(reason),
-                  "DwmIcd=nvk, but %u DWM starts on NVK in the last %u s (crash-loop guard, "
-                  "DwmNvkMaxStarts=%u): Venus",
-                  unsigned(count), unsigned(window_s), unsigned(max_starts));
+                  "DwmIcd=nvk, but %u DWM starts on NVK of this build in the last %u s never got "
+                  "healthy (crash-loop guard, DwmNvkMaxStarts=%u, %s): Venus",
+                  unsigned(v.counted), unsigned(window_s), unsigned(p.max_starts), path);
     *why = reason;
     return false;
   }
-  kept[count++] = now;
-  if (FILE* f = std::fopen(path, "w")) {
-    for (std::size_t i = 0; i < count; i++)
-      std::fprintf(f, "%llu\n", kept[i]);
+  char text[2048];
+  const std::size_t n = dwm_guard::format(v.kept, v.kept_len, text, sizeof(text));
+  FILE* f = n ? std::fopen(path, "wb") : nullptr;
+  if (f && std::fwrite(text, 1, n, f) == n) {
     std::fclose(f);
+    dwm_guard_arm(self.time);
   } else {
+    if (f)
+      std::fclose(f);
     umd_log("icd backend: DwmIcd=nvk crash-loop guard cannot write its file; NVK unguarded");
   }
   return true;
@@ -378,7 +436,10 @@ IcdBackendChoice decide() {
       if (std::strcmp(dwm, "nvk") == 0) {
         const char* why = nullptr;
         if (!dwm_nvk_guard_allows(&why)) {
+          // Venus, unless Venus cannot make DWM's device (dwm_guard_venus_failed): then NVK
+          // after all, so the guard never trades a possible crash loop for a certain one.
           c.reason = why;
+          c.dwm_guard_venus = find_nvk_icd(c.nvk_path, sizeof(c.nvk_path) / sizeof(c.nvk_path[0]));
           return c;
         }
         force_nvk = true;
@@ -461,18 +522,30 @@ std::atomic<bool> g_nvk_failed{false};
 // (explorer, the shell hosts, DWM) comes back to NVK instead of staying on
 // Venus, whose surfaces an NVK DWM cannot compose.
 std::atomic<int32_t> g_nvk_failed_epoch{0};
+// DWM only: the crash-loop guard sent it to Venus, Venus could not make its device, and it runs
+// on NVK after all (dwm_guard_venus_failed).
+std::atomic<bool> g_dwm_guard_overridden{false};
 
-std::once_flag g_nvk_load_once;
+// The process is meant to run on NVK: its choice, or the guard's override.
+bool nvk_chosen(const IcdBackendChoice& c) {
+  return c.backend == IcdBackend::NvkRm || g_dwm_guard_overridden.load(std::memory_order_acquire);
+}
+
+// load_nvk runs once the process is meant to run on NVK, not before: a guarded DWM can move to
+// NVK after its choice.
+std::mutex g_nvk_load_mutex;
+bool g_nvk_load_tried = false;
 HMODULE g_nvk_module = nullptr;
 void* g_nvk_gipa = nullptr;
 PFN_helios_icd_interface_v2 g_nvk_iface = nullptr;
 
 using PfnNegotiate = VkResult(VKAPI_PTR*)(uint32_t*);
 
-void load_nvk() {
+void load_nvk_locked() {
   const IcdBackendChoice& c = icd_backend_choice();
-  if (c.backend != IcdBackend::NvkRm)
+  if (!nvk_chosen(c) || !c.nvk_path[0])
     return;
+  g_nvk_load_tried = true;
   // NVK's RM backend is opt-in inside the ICD (it would otherwise also look
   // for nouveau); this process asked for it.
   if (!GetEnvironmentVariableA("NVK_RM", nullptr, 0))
@@ -529,6 +602,12 @@ void load_nvk() {
   umd_log(msg);
 }
 
+void load_nvk() {
+  std::lock_guard<std::mutex> lock(g_nvk_load_mutex);
+  if (!g_nvk_load_tried)
+    load_nvk_locked();
+}
+
 }  // namespace
 
 const IcdBackendChoice& icd_backend_choice() {
@@ -551,7 +630,8 @@ bool is_dwm_process() {
 
 IcdBackend effective_icd_backend() {
   const IcdBackendChoice& c = icd_backend_choice();
-  if (c.backend == IcdBackend::NvkRm && g_nvk_failed.load(std::memory_order_acquire)) {
+  const bool nvk = nvk_chosen(c);
+  if (nvk && g_nvk_failed.load(std::memory_order_acquire)) {
     const int32_t now = helios_kmdmap_c_epoch();
     const int32_t then = g_nvk_failed_epoch.load(std::memory_order_acquire);
     if (now != then && g_nvk_failed.exchange(false, std::memory_order_acq_rel)) {
@@ -564,9 +644,44 @@ IcdBackend effective_icd_backend() {
         dwm_marker_create();
     }
   }
-  if (c.backend == IcdBackend::NvkRm && !g_nvk_failed.load(std::memory_order_acquire))
+  if (nvk && !g_nvk_failed.load(std::memory_order_acquire))
     return IcdBackend::NvkRm;
   return IcdBackend::Venus;
+}
+
+bool dwm_guard_venus_failed() {
+  const IcdBackendChoice& c = icd_backend_choice();
+  if (!c.dwm_guard_venus || g_nvk_failed.load(std::memory_order_acquire))
+    return false;
+  if (g_dwm_guard_overridden.exchange(true, std::memory_order_acq_rel))
+    return false;
+  umd_log("icd backend: DWM: Venus could not create the device the crash-loop guard sent it to; "
+          "NVK after all (DwmIcd=nvk). If DWM keeps restarting, NVK is failing too: check the "
+          "umd logs of the previous DWM processes");
+  dwm_guard_arm(filetime_now());
+  dwm_marker_create();
+  return true;
+}
+
+void note_dwm_nvk_present() {
+  if (!g_dwm_nvk_pending.load(std::memory_order_acquire))
+    return;
+  const unsigned long long now = filetime_now();
+  if (!dwm_guard::healthy_due(g_dwm_nvk_chose_at.load(std::memory_order_relaxed), now,
+                              g_dwm_nvk_healthy_ticks.load(std::memory_order_relaxed)))
+    return;
+  if (!g_dwm_nvk_pending.exchange(false, std::memory_order_acq_rel))
+    return;
+  char path[MAX_PATH];
+  dwm_guard_path(path, sizeof(path));
+  const bool gone = DeleteFileA(path) || GetLastError() == ERROR_FILE_NOT_FOUND;
+  char msg[MAX_PATH + 128];
+  std::snprintf(msg, sizeof(msg),
+                "icd backend: DWM on NVK is healthy (presenting %llu s after its choice): "
+                "crash-loop guard history %s (%s)",
+                (now - g_dwm_nvk_chose_at.load(std::memory_order_relaxed)) / dwm_guard::kTicksPerSecond,
+                gone ? "cleared" : "could not be deleted", path);
+  umd_log(msg);
 }
 
 void note_nvk_failed(const char* why) {
@@ -580,12 +695,12 @@ void note_nvk_failed(const char* why) {
 }
 
 void* nvk_icd_get_instance_proc_addr() {
-  std::call_once(g_nvk_load_once, load_nvk);
+  load_nvk();
   return g_nvk_gipa;
 }
 
 NvkPolicyScope::NvkPolicyScope() {
-  if (icd_backend_choice().backend != IcdBackend::NvkRm)
+  if (!nvk_chosen(icd_backend_choice()))
     return;
   const DWORD n = GetEnvironmentVariableA("HELIOS_ICD", saved_, sizeof(saved_));
   had_ = n > 0 && n < sizeof(saved_);
@@ -607,7 +722,7 @@ NvkPolicyScope::~NvkPolicyScope() {
 }
 
 const helios_icd_api* nvk_icd_api(helios_icd_api* out) {
-  std::call_once(g_nvk_load_once, load_nvk);
+  load_nvk();
   if (!g_nvk_iface || !out)
     return nullptr;
   std::memset(out, 0, sizeof(*out));

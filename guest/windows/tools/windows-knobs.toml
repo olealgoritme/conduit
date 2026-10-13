@@ -574,19 +574,25 @@ see = "[independent-flip.md](../guest/windows/docs/independent-flip.md)"
 [umd.DwmIcd]
 class = "supported"
 read = "each DWM start (dwm.exe); other processes per process for the desktop-follows rule"
-effect = "nvk: DWM composes the desktop on NVK on RM, whatever Icd and the deny-lists say, guarded by the crash-loop guard (DwmNvkMaxStarts, DwmNvkGuardSeconds). Absent or venus: DWM stays on Venus. install.ps1 sets nvk."
+effect = "nvk: DWM composes the desktop on NVK on RM, whatever Icd and the deny-lists say, guarded by the crash-loop guard (DwmNvkMaxStarts, DwmNvkGuardSeconds, DwmNvkHealthySeconds). Absent or venus: DWM stays on Venus. install.ps1 sets nvk."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.DwmNvkGuardSeconds]
 class = "supported"
 read = "each DWM start with DwmIcd=nvk"
-effect = "The window, in seconds, of the DwmIcd=nvk crash-loop guard: when DwmNvkMaxStarts DWM starts on NVK fall inside it, the next DWM start goes to Venus."
+effect = "The window, in seconds, of the DwmIcd=nvk crash-loop guard: when DwmNvkMaxStarts DWM starts on NVK that never got healthy fall inside it, the next DWM start goes to Venus."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.DwmNvkHealthySeconds]
+class = "supported"
+read = "each DWM start with DwmIcd=nvk"
+effect = "How long, in seconds, a DWM on NVK must keep presenting after its choice to count as healthy: it then clears the crash-loop guard's history (%ProgramData%\\Helios\\dwm-nvk-starts.txt), so restarts and live driver updates never add up to a crash loop. 0 = at its first NVK present."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.DwmNvkMaxStarts]
 class = "supported"
 read = "each DWM start with DwmIcd=nvk"
-effect = "How many DWM starts on NVK within DwmNvkGuardSeconds send the next start to Venus (the crash-loop guard; starts are kept in %ProgramData%\\Helios\\dwm-nvk-starts.txt). 0 disables the guard."
+effect = "How many DWM starts on NVK within DwmNvkGuardSeconds that never got healthy (DwmNvkHealthySeconds) send the next start to Venus (the crash-loop guard; pending starts are kept in %ProgramData%\\Helios\\dwm-nvk-starts.txt; only starts of the installed driver build in other DWM processes count). If Venus then cannot create DWM's device, DWM runs on NVK after all. 0 disables the guard."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.FeatureLevel11]

@@ -1628,6 +1628,10 @@ unsafe fn nvk_present_frame(
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
     };
+    if crate::knobs::is_dwm_process() {
+        // DWM is up on NVK: the crash-loop guard's healthy mark (docs/dwm-on-nvk.md 4.1).
+        crate::bridge::note_dwm_nvk_present();
+    }
     nvk_log_present_source(shown);
     if let Some(context) = d3d11_context(h) {
         context.Flush();

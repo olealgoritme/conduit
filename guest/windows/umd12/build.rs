@@ -389,6 +389,7 @@ fn build_vkd3d_bridge() {
         // into the DLL — the edit appears to have no effect, which is worse than
         // a build failure. `umd/build.rs:258-266` carries the identical list.
         "../umd_common/bridge/bridge_common.h",
+        "../umd_common/bridge/bridge_dwm_guard.h",
         "../umd_common/bridge/bridge_guard.h",
         "../umd_common/bridge/bridge_icd_anchor.cpp",
         "../umd_common/bridge/bridge_icd_anchor.h",

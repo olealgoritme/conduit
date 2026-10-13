@@ -416,7 +416,17 @@ mod ffi {
             luid_high: i32,
             timer_resolution: u32,
         ) -> UniquePtr<HeliosDxvkDevice>;
+
+        /// DWM presents a frame on NVK: the `DwmIcd=nvk` crash-loop guard clears
+        /// its history once this DWM has run `DwmNvkHealthySeconds` on NVK
+        /// (docs/dwm-on-nvk.md 4.1). One atomic load once that happened.
+        fn helios_dwm_nvk_present();
     }
+}
+
+/// DWM presents a frame on NVK (`helios_dwm_nvk_present`).
+pub(crate) fn note_dwm_nvk_present() {
+    ffi::helios_dwm_nvk_present();
 }
 
 // ---------------------------------------------------------------------------
