@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
+    name = "conduit-userspace",
     version = env!("CONDUIT_BUILD_ID"),
     about = "Stage the host NVIDIA user-mode driver for a guest"
 )]
