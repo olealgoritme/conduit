@@ -1,0 +1,234 @@
+Helios DXVK fork: event-query latency trace (HELIOS_DXVK_EVENT_TRACE=1)
+
+Conduit guest/windows. Applied after 0022 by ci/windows/Build-Driver.ps1.
+
+A CPU-bound D3D11 game that limits its frames in flight with an event query
+spins on GetData until the GPU has finished an earlier frame. In CS2 that
+spin is a large share of the render thread (GetData, DxvkEvent::test, the
+game's own timing loop), so the frame time includes the latency from End to
+the event becoming visible, and that latency has several stages: the CS
+thread recording the event signal, the submission thread submitting the
+command list that holds it, and the GPU (with NVK over RM) executing up to
+it.
+
+With HELIOS_DXVK_EVENT_TRACE=1, every D3D11_QUERY_EVENT wait on the
+immediate context is timed (QPC) at End, when the CS thread records the
+signal, after the submission of that command list (0019's after-submit
+callback) and at the first GetData that returns S_OK. Every two seconds the
+process log gets one line with the number of waits, the mean end->ready
+time and its maximum, the mean of each stage (end->cs, cs->submit,
+submit->ready) over the waits that saw all stages, and GetData calls per
+wait. Without the variable there are no clock reads.
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index a6585eb8..486aa676 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -107,6 +107,9 @@ namespace dxvk {
+     auto query = static_cast<D3D11Query*>(pAsync);
+     HRESULT hr = query->GetData(pData, GetDataFlags);
+     helios_feed::getData(hr == S_OK);
++
++    if (unlikely(D3D11Query::HeliosEventTraceEnabled()))
++      query->HeliosTraceGetData(hr);
+     
+     // The DDI's DO_NOT_FLUSH contract forbids submitting partial command
+     // buffers for this query. Preserve it through the API/engine boundary:
+@@ -152,6 +155,9 @@ namespace dxvk {
+     
+     auto query = static_cast<D3D11Query*>(pAsync);
+ 
++    if (unlikely(D3D11Query::HeliosEventTraceEnabled()))
++      query->HeliosTraceEnd();
++
+     if (unlikely(!query->DoEnd())) {
+       EmitCs([cQuery = Com<D3D11Query, false>(query)]
+       (DxvkContext* ctx) {
+diff --git a/src/d3d11/d3d11_query.cpp b/src/d3d11/d3d11_query.cpp
+index 440ccaa7..f45e04bf 100644
+--- a/src/d3d11/d3d11_query.cpp
++++ b/src/d3d11/d3d11_query.cpp
+@@ -2,6 +2,42 @@
+ #include "d3d11_query.h"
+ 
+ namespace dxvk {
++
++  namespace {
++
++    int64_t heliosEventTraceNow() {
++      LARGE_INTEGER t;
++      QueryPerformanceCounter(&t);
++      return t.QuadPart;
++    }
++
++    /**
++     * Process-wide sums of the traced event waits, logged and reset every
++     * two seconds. Waits complete on the immediate context's GetData under
++     * the device's single-threaded use; the mutex keeps the sums whole if
++     * two contexts' queries complete at once.
++     */
++    struct HeliosEventTraceStats {
++      dxvk::mutex mutex;
++      int64_t  freq      = 0;
++      int64_t  lastPrint = 0;
++      uint64_t waits     = 0;
++      uint64_t withStages = 0;
++      int64_t  endToCs   = 0;
++      int64_t  csToSubmit = 0;
++      int64_t  submitToReady = 0;
++      int64_t  endToReady = 0;
++      int64_t  endToReadyMax = 0;
++      uint64_t polls     = 0;
++    };
++
++    HeliosEventTraceStats& heliosEventTraceStats() {
++      static HeliosEventTraceStats stats;
++      return stats;
++    }
++
++  }
++
+   
+   D3D11Query::D3D11Query(
+           D3D11Device*       device,
+@@ -206,6 +242,13 @@ namespace dxvk {
+     switch (m_desc.Query) {
+       case D3D11_QUERY_EVENT:
+         ctx->signalGpuEvent(m_event[0]);
++
++        if (unlikely(HeliosEventTraceEnabled()) && m_heliosEnd.load(std::memory_order_relaxed)) {
++          m_heliosCs.store(heliosEventTraceNow(), std::memory_order_relaxed);
++          ctx->heliosAfterSubmit([cQuery = Com<D3D11Query, false>(this)] {
++            cQuery->m_heliosSubmit.store(heliosEventTraceNow(), std::memory_order_relaxed);
++          });
++        }
+         break;
+       
+       case D3D11_QUERY_TIMESTAMP:
+@@ -341,6 +384,85 @@ namespace dxvk {
+   }
+   
+   
++  bool D3D11Query::HeliosEventTraceEnabled() {
++    static const bool enabled = env::getEnvVar("HELIOS_DXVK_EVENT_TRACE") == "1";
++    return enabled;
++  }
++
++
++  void D3D11Query::HeliosTraceEnd() {
++    if (m_desc.Query != D3D11_QUERY_EVENT)
++      return;
++
++    m_heliosCs.store(0, std::memory_order_relaxed);
++    m_heliosSubmit.store(0, std::memory_order_relaxed);
++    m_heliosPolls = 0u;
++    m_heliosEnd.store(heliosEventTraceNow(), std::memory_order_relaxed);
++  }
++
++
++  void D3D11Query::HeliosTraceGetData(HRESULT hr) {
++    if (m_desc.Query != D3D11_QUERY_EVENT)
++      return;
++
++    const int64_t end = m_heliosEnd.load(std::memory_order_relaxed);
++
++    if (!end)
++      return;
++
++    m_heliosPolls += 1u;
++
++    if (hr != S_OK)
++      return;
++
++    const int64_t now = heliosEventTraceNow();
++    const int64_t cs = m_heliosCs.load(std::memory_order_relaxed);
++    const int64_t submit = m_heliosSubmit.load(std::memory_order_relaxed);
++    m_heliosEnd.store(0, std::memory_order_relaxed);
++
++    auto& st = heliosEventTraceStats();
++    std::lock_guard lock(st.mutex);
++
++    if (!st.freq) {
++      LARGE_INTEGER f;
++      QueryPerformanceFrequency(&f);
++      st.freq = f.QuadPart;
++      st.lastPrint = now;
++    }
++
++    st.waits += 1u;
++    st.polls += m_heliosPolls;
++    st.endToReady += now - end;
++    st.endToReadyMax = std::max(st.endToReadyMax, now - end);
++
++    if (cs >= end && submit >= cs && now >= submit) {
++      st.withStages += 1u;
++      st.endToCs += cs - end;
++      st.csToSubmit += submit - cs;
++      st.submitToReady += now - submit;
++    }
++
++    if (now - st.lastPrint >= 2 * st.freq) {
++      auto us = [&] (int64_t ticks, uint64_t n) {
++        return n ? double(ticks) * 1e6 / double(st.freq) / double(n) : 0.0;
++      };
++
++      Logger::info(str::format("Helios event trace: ", st.waits, " waits, end->ready ",
++        us(st.endToReady, st.waits), " us (max ", us(st.endToReadyMax, 1), "), ",
++        st.withStages, " staged: end->cs ", us(st.endToCs, st.withStages),
++        " us, cs->submit ", us(st.csToSubmit, st.withStages),
++        " us, submit->ready ", us(st.submitToReady, st.withStages),
++        " us; GetData calls per wait ", st.waits ? double(st.polls) / double(st.waits) : 0.0));
++
++      uint64_t keepFreq = st.freq;
++      st.waits = st.withStages = st.polls = 0u;
++      st.endToCs = st.csToSubmit = st.submitToReady = st.endToReady = st.endToReadyMax = 0;
++      st.freq = keepFreq;
++      st.lastPrint = now;
++    }
++  }
++
++
+   UINT64 D3D11Query::GetTimestampQueryFrequency() const {
+     const auto& limits = m_parent->GetDXVKDevice()->properties().core.properties.limits;
+     return uint64_t(1'000'000'000.0f / limits.timestampPeriod);
+diff --git a/src/d3d11/d3d11_query.h b/src/d3d11/d3d11_query.h
+index b990f2ad..7709115d 100644
+--- a/src/d3d11/d3d11_query.h
++++ b/src/d3d11/d3d11_query.h
+@@ -85,6 +85,21 @@ namespace dxvk {
+       return &m_d3d10;
+     }
+ 
++    /**
++     * \brief Helios event-query latency trace (HELIOS_DXVK_EVENT_TRACE=1)
++     *
++     * For D3D11_QUERY_EVENT only, a wait is measured from the End call on
++     * the immediate context, through the CS thread recording the event
++     * signal and the submission thread submitting that command list, to the
++     * first GetData that returns S_OK. The stage sums are logged every two
++     * seconds (D3D11HeliosEventTrace). Off: no clock reads.
++     */
++    static bool HeliosEventTraceEnabled();
++
++    void HeliosTraceEnd();
++
++    void HeliosTraceGetData(HRESULT hr);
++
+     static HRESULT ValidateDesc(const D3D11_QUERY_DESC1* pDesc);
+ 
+     static ID3D11Predicate* AsPredicate(ID3D11Query* pQuery) {
+@@ -113,6 +128,14 @@ namespace dxvk {
+ 
+     std::atomic<uint32_t> m_resetCtr = { 0u };
+ 
++    // Helios event trace (see HeliosEventTraceEnabled): QPC ticks of the
++    // current wait's End (app/replay thread), CS recording and submission;
++    // 0 = not reached yet. m_heliosPolls counts GetData calls of the wait.
++    std::atomic<int64_t> m_heliosEnd    = { 0 };
++    std::atomic<int64_t> m_heliosCs     = { 0 };
++    std::atomic<int64_t> m_heliosSubmit = { 0 };
++    uint32_t             m_heliosPolls  = 0u;
++
+     D3DDestructionNotifier m_destructionNotifier;
+ 
+     UINT64 GetTimestampQueryFrequency() const;

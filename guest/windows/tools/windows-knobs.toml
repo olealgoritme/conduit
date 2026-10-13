@@ -936,6 +936,11 @@ class = "experiment"
 read = "DXVK instance and device creation"
 effect = "Internal: the D3D11 bridge sets it to nvk for a process that runs on NVK on RM and clears it for Venus, before DXVK starts; DXVK then picks the NVK paths. A value set by hand is overwritten."
 
+[env.HELIOS_DXVK_EVENT_TRACE]
+class = "debug"
+read = "once per process"
+effect = "1: every D3D11 event-query wait on the immediate context is timed at End, CS recording, submission and the first GetData that returns S_OK; the process log gets the mean of each stage every two seconds. Unset: no clock reads."
+
 [env.HELIOS_DXVK_FOREIGN_IMPORT]
 class = "experiment"
 read = "DXVK device creation"
