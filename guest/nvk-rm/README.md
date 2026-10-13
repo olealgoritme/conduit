@@ -218,6 +218,7 @@ Each patch builds on its own.
 | 0060 | the composed present waits for its copy at acquire, not at present |
 | 0061 | Mesa honours `MESA_LOG_FILE` on Windows; composed acquire/present failures go to `helios-wsi-<pid>.log` |
 | 0062 | `helios_icd_interface` v8, `ecl_fence_create_v3`: the RM fence and copy-engine record of a composed D3D11 present, for a value reserved on an ECL timeline that the submission thread signals after the frame's work, so the presenting thread does not wait for DXVK to submit the frame |
+| 0064 | driconf `engine_name_match` works without `<regex.h>` (every Windows build): a literal subset of POSIX ERE (`|` alternatives, `^`, `$`, trailing `.*`). Before, no engine rule applied on Windows, so NVK gave vkd3d-proton a 16-byte `minStorageBufferOffsetAlignment` (`nvk_ssbo_align_4b`) and vkd3d dropped its descriptor-buffer path for offset buffers; `nvk_ssbo_align_4b=false` restores that |
 
 ## `patches-windows-dxvk/`
 

@@ -1,0 +1,103 @@
+From 67c943673f5cdea86165a6a48e3d6419ac694d8f Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 12 Oct 2026 23:30:01 +0200
+Subject: [PATCH] util/xmlconfig: engine_name_match without regex.h (Windows)
+
+Builds without <regex.h> (NO_REGEX, every Windows build) stubbed regexec
+to never match, so no driconf engine rule applied on Windows. NVK's
+"vkd3d" rule (nvk_ssbo_align_4b) was among them: NVK reported a 16-byte
+minStorageBufferOffsetAlignment to vkd3d-proton, which then left its
+descriptor-buffer path for mutable descriptor sets with SSBO and typed
+offset buffers (vkd3d_global_descriptor_buffer_init:
+requires_offset_buffer when the alignment is above 4 bytes). On Linux,
+and on NVIDIA's driver (a vkd3d workaround), vkd3d gets 4 bytes.
+
+Without regex.h, engine_name_match now accepts a small subset of POSIX
+extended expressions: alternatives separated by '|', each a literal that
+may start with '^', end with '$' and end with '.*'. Anything else does not
+match, as before. The option's environment override still wins
+(nvk_ssbo_align_4b=false restores 16 bytes for vkd3d).
+---
+ src/util/xmlconfig.c | 63 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/src/util/xmlconfig.c b/src/util/xmlconfig.c
+index a12770d..86c23f0 100644
+--- a/src/util/xmlconfig.c
++++ b/src/util/xmlconfig.c
+@@ -45,12 +45,69 @@
+ #include <sys/stat.h>
+ #endif
+ #ifdef NO_REGEX
+-typedef int regex_t;
++/* Without <regex.h> (Windows builds), engine_name_match is matched by a
++ * small subset of POSIX extended regular expressions instead of never
++ * matching: alternatives separated by '|', each a literal that may start
++ * with '^', end with '$' and end with ".*" (a prefix), e.g. "vkd3d",
++ * "^vkd3d$|DXVK", "UnrealEngine4.*".  Anything else does not match.  Before
++ * this, no engine rule applied on Windows: NVK reported a 16-byte
++ * minStorageBufferOffsetAlignment to vkd3d-proton, which then gave up its
++ * descriptor-buffer path for offset buffers.
++ */
++typedef struct { const char *pattern; } regex_t;
+ #define REG_EXTENDED 0
+ #define REG_NOSUB 0
+ #define REG_NOMATCH 1
+-static inline int regcomp(regex_t *r, const char *s, int f) { return 0; }
+-static inline int regexec(regex_t *r, const char *s, int n, void *p, int f) { return REG_NOMATCH; }
++static inline int regcomp(regex_t *r, const char *s, int f) { r->pattern = s; return 0; }
++static bool
++mini_match_one(const char *p, size_t len, const char *s)
++{
++   bool start = false, end = false, prefix = false;
++   if (len && p[0] == '^') { start = true; p++; len--; }
++   if (len && p[len - 1] == '$') { end = true; len--; }
++   if (len >= 2 && p[len - 2] == '.' && p[len - 1] == '*') { prefix = true; len -= 2; }
++   for (size_t i = 0; i < len; i++)
++      if (strchr("\\.[]()*+?{}|^$", p[i]))
++         return false;
++   const size_t slen = strlen(s);
++   for (size_t at = 0; at + len <= slen; at++) {
++      if (strncmp(s + at, p, len) != 0)
++         continue;
++      if (end && !prefix && at + len != slen)
++         continue;
++      return true;
++   }
++   (void)start;
++   return false;
++}
++static inline int regexec(regex_t *r, const char *s, int n, void *m, int f)
++{
++   const char *p = r->pattern;
++   while (true) {
++      const char *bar = strchr(p, '|');
++      const size_t len = bar ? (size_t)(bar - p) : strlen(p);
++      /* '^' anchors the alternative at the start of the name */
++      if (len && p[0] == '^') {
++         const char *lit = p + 1;
++         size_t llen = len - 1;
++         bool end = llen && lit[llen - 1] == '$';
++         if (end) llen--;
++         bool prefix = llen >= 2 && lit[llen - 2] == '.' && lit[llen - 1] == '*';
++         if (prefix) llen -= 2;
++         bool plain = true;
++         for (size_t i = 0; i < llen; i++)
++            if (strchr("\\.[]()*+?{}|^$", lit[i])) plain = false;
++         if (plain && strncmp(s, lit, llen) == 0 &&
++             (!end || prefix || s[llen] == '\0'))
++            return 0;
++      } else if (mini_match_one(p, len, s)) {
++         return 0;
++      }
++      if (!bar)
++         return REG_NOMATCH;
++      p = bar + 1;
++   }
++}
+ static inline void regfree(regex_t* r) {}
+ #else
+ #include <regex.h>
+-- 
+2.43.0
+
