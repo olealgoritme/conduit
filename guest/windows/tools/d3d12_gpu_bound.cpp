@@ -35,7 +35,12 @@
 //            per draw or per 8x8 block (NonUniformResourceIndex)   Gtap/s
 //   submit   the same GPU work per frame (64 units of ~50 us) in 1/4/16/64
 //            ExecuteCommandLists, one Signal per frame, 2 frames in flight:
-//            wall time vs GPU busy, the idle gap per ExecuteCommandLists
+//            wall time vs GPU busy, the idle gap per ExecuteCommandLists.
+//            Under the Helios D3D12 UMD also its admission counters for the
+//            measured frames (helios_umd12_ecl_stats_v1): batches admitted,
+//            commit-to-admission, and with Nvk12CompletionHint the completion
+//            hints and the time from the worker seeing batches finish to the
+//            next admission (the round trip the hints shorten)
 //   sustain  ~4 ms ALU ExecuteCommandLists back to back for -s seconds
 //            (default 10): GPU time per batch over time
 //
@@ -794,6 +799,44 @@ static UINT calibrate_spin(ID3D12Resource* out, UINT groups, double us) {
   return iters;
 }
 
+// The Helios D3D12 UMD's admission counters (helios_umd12_ecl_stats_v1 in
+// helios_umd12.dll; forward12/ecl_hint.rs documents the layout). Absent with
+// any other driver.
+typedef UINT(__cdecl* PfnEclStats)(UINT64*, UINT);
+static PfnEclStats ecl_stats_fn;
+enum { ECL_STATS_N = 38 };
+struct EclSnap {
+  UINT64 v[ECL_STATS_N];
+  bool ok;
+};
+
+static EclSnap ecl_snap() {
+  EclSnap s = {};
+  s.ok = ecl_stats_fn && ecl_stats_fn(s.v, ECL_STATS_N) == ECL_STATS_N;
+  return s;
+}
+
+static void print_ecl_delta(const EclSnap& a, const EclSnap& b) {
+  if (!a.ok || !b.ok) return;
+  UINT64 d[ECL_STATS_N];
+  for (int i = 0; i < ECL_STATS_N; i++) d[i] = b.v[i] - a.v[i];
+  const UINT64 admits = d[14];
+  if (admits) {
+    const double pct = 100.0 / (double)admits;
+    std::printf("    admission: %llu batches, commit-to-admission avg %.0f us (<50us %.0f%% <200us %.0f%% <1ms %.0f%% "
+                "<2ms %.0f%% >=2ms %.0f%%)\n",
+                (unsigned long long)admits, (double)d[15] / (double)admits, d[16] * pct, d[17] * pct, d[18] * pct,
+                d[19] * pct, (d[20] + d[21] + d[22]) * pct);
+  }
+  if (d[28] || d[33]) {
+    std::printf("    hints: %llu fences named in %llu calls (%llu ring entries overwritten unseen); KMD fired %llu late %llu refused %llu "
+                "(%llu escapes, %llu failed); batches seen done to next admission avg %.0f us\n",
+                (unsigned long long)d[29], (unsigned long long)d[28], (unsigned long long)d[30],
+                (unsigned long long)d[35], (unsigned long long)d[36], (unsigned long long)d[37],
+                (unsigned long long)d[33], (unsigned long long)d[34], d[32] ? (double)d[31] / (double)d[32] : 0.0);
+  }
+}
+
 static void test_submit() {
   ID3D12Resource* out = buffer(1 << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -826,6 +869,7 @@ static void test_submit() {
       }
     }
     UINT64 frame_end[2] = { 0, 0 };
+    EclSnap snap0 = {};
     double busy_sum = 0, gap_sum = 0, t_measure = 0;
     int gap_n = 0, frames = 0, measured = 0;
     UINT64 prev_end = 0;
@@ -836,7 +880,10 @@ static void test_submit() {
         wait_value(frame_end[slot]);
         const UINT64* t = qmap + slot * 128;
         if (frames >= 2 * inflight + 4) {
-          if (measured == 0) t_measure = now_ms();
+          if (measured == 0) {
+            t_measure = now_ms();
+            snap0 = ecl_snap();
+          }
           for (int s = 0; s < nsub; s++) {
             busy_sum += ts_ms(t[2 * s], t[2 * s + 1]);
             if (prev_end) {
@@ -857,12 +904,14 @@ static void test_submit() {
     }
     const double wall = now_ms() - t_measure;
     wait_value(fence_value);
+    const EclSnap snap1 = ecl_snap();
     const double wall_per = wall / std::max(measured - 1, 1);
     const double busy_per = busy_sum / measured;
     char name[64];
     std::snprintf(name, sizeof(name), "submit %2d/frame", nsub);
     std::printf("%-34s wall %8.3f ms/frame  busy %8.3f ms  idle %5.1f%%  gap %7.1f us/submit\n", name, wall_per,
                 busy_per, 100.0 * (1.0 - busy_per / wall_per), gap_n ? gap_sum * 1e3 / gap_n : 0.0);
+    print_ecl_delta(snap0, snap1);
     std::fflush(stdout);
     for (auto& c : cmds) c.release();
   }
@@ -1111,6 +1160,8 @@ int main(int argc, char** argv) {
   DXGI_ADAPTER_DESC1 ad = {};
   adapter->GetDesc1(&ad);
   CHECK(create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&dev));
+  if (HMODULE umd = GetModuleHandleA("helios_umd12.dll"))
+    ecl_stats_fn = (PfnEclStats)(void*)GetProcAddress(umd, "helios_umd12_ecl_stats_v1");
 
   D3D12_COMMAND_QUEUE_DESC qd = {};
   qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -1120,8 +1171,8 @@ int main(int argc, char** argv) {
   UINT64 freq = 0;
   CHECK(queue->GetTimestampFrequency(&freq));
   ts_period_ms = 1e3 / (double)freq;
-  std::printf("# d3d12_gpu_bound: %ls, %ux%u, median of %d, timestamp %llu Hz\n", ad.Description, W, H, reps,
-              (unsigned long long)freq);
+  std::printf("# d3d12_gpu_bound: %ls, %ux%u, median of %d, timestamp %llu Hz%s\n", ad.Description, W, H, reps,
+              (unsigned long long)freq, ecl_stats_fn ? ", Helios admission counters" : "");
 
   // Root signature: 8 root constants b0, a one-SRV table t0, root UAVs u0
   // and u1, a root CBV b1, a static linear wrap sampler s0.
