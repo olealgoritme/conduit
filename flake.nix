@@ -22,7 +22,17 @@
       pkgs = nixpkgs.legacyPackages.${system};
       lib = pkgs.lib;
 
-      version = "${(builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version}+${self.shortRev or "dirty"}";
+      cargoVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      version = "${cargoVersion}+${self.shortRev or "dirty"}";
+
+      # Build identity for every binary's --version (packaging/build-id.sh,
+      # which the flake's source subsets leave out, takes these variables).
+      buildCommit = if self ? rev then builtins.substring 0 10 self.rev else (self.dirtyShortRev or "unknown");
+      buildId = {
+        CONDUIT_VERSION = cargoVersion;
+        CONDUIT_GIT_COMMIT = buildCommit;
+        CONDUIT_BUILD_KIND = "nix";
+      };
 
       # Cargo/make binary names (same variables as packaging/build.sh).
       backendBin = "conduit-backend";
@@ -36,7 +46,7 @@
       rustPkg = args: pkgs.rustPlatform.buildRustPackage ({
         inherit version;
         doCheck = false; # CI runs the tests; some need /dev/nvidiactl
-      } // args);
+      } // buildId // args);
 
       # conduit-venus's Rust sources (host/venus without its submodules): the
       # backend's `venus` feature uses the crate (no virglrenderer), the
@@ -187,6 +197,7 @@
       viewer = pkgs.stdenv.mkDerivation {
         pname = "conduit-viewer";
         inherit version;
+        inherit (buildId) CONDUIT_VERSION CONDUIT_GIT_COMMIT CONDUIT_BUILD_KIND;
         src = ./host/viewer;
         nativeBuildInputs = with pkgs; [ pkg-config wayland-scanner python3 ];
         buildInputs = with pkgs; [
@@ -210,10 +221,23 @@
           (lib.sort lib.lessThan
             (builtins.filter (lib.hasSuffix ".patch")
               (builtins.attrNames (builtins.readDir ./host/qemu/patches)))));
+      # QEMU's --version names the Conduit build and the patch set, as
+      # host/qemu/build-qemu.sh does: "patches COUNT SHA8", the sha256 of the
+      # patches concatenated in order.
+      qemuPkgVersion = "conduit ${cargoVersion} (git ${buildCommit}, nix), patches "
+        + "${toString (builtins.length qemuPatches)} "
+        + builtins.substring 0 8 (builtins.hashString "sha256" (lib.concatMapStrings builtins.readFile qemuPatches));
+      # configureFlagsArray keeps the spaces in the package version.
+      withPkgVersion = o: (o.preConfigure or "") + ''
+        configureFlagsArray+=("--with-pkgversion=${qemuPkgVersion}")
+      '';
       qemu =
         let base = pkgs.qemu_kvm; in
         if lib.versionAtLeast base.version "11.1" then
-          base.overrideAttrs (o: { patches = (o.patches or [ ]) ++ qemuPatches; })
+          base.overrideAttrs (o: {
+            patches = (o.patches or [ ]) ++ qemuPatches;
+            preConfigure = withPkgVersion o;
+          })
         else
           base.overrideAttrs (o: {
             # Same release and checksum as host/qemu/build-qemu.sh.
@@ -224,6 +248,7 @@
             };
             # nixpkgs' patches target its own QEMU version; keep only ours.
             patches = qemuPatches;
+            preConfigure = withPkgVersion o;
           });
 
       conduit = pkgs.runCommand "conduit-${version}"

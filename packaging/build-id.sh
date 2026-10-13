@@ -14,7 +14,8 @@
 #            with "-dirty" when tracked files differ from it; "unknown" outside
 #            a git checkout
 #   kind     $CONDUIT_BUILD_KIND: "release" (release.yml on a v* tag), "ci"
-#            (other CI builds), else "local"
+#            (other release.yml runs), "rpm" / "arch" (the spec and PKGBUILD),
+#            "nix" (flake.nix); else "local"
 #
 # Prints KEY=VALUE lines: version, commit, kind, id ("VERSION (git COMMIT,
 # KIND)") and qemu_patches ("COUNT SHA8" of host/qemu/patches/*.patch, the

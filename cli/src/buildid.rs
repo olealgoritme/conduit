@@ -46,12 +46,17 @@ impl Id {
     }
 
     /// Built from the same commit, the same way. "-dirty" does not count:
-    /// parts of one local build are often built minutes apart.
+    /// parts of one local build are often built minutes apart. A build from
+    /// a source tarball names no commit ("unknown"); then the version has
+    /// to do.
     pub fn same_build(&self, other: &Id) -> bool {
         let base = |c: &str| c.trim_end_matches("-dirty").to_string();
-        self.kind == other.kind
-            && base(&self.commit) == base(&other.commit)
-            && self.commit != "unknown"
+        if self.commit == "unknown" || other.commit == "unknown" {
+            return self.kind == other.kind
+                && self.commit == other.commit
+                && self.version == other.version;
+        }
+        self.kind == other.kind && base(&self.commit) == base(&other.commit)
     }
 }
 
@@ -132,7 +137,10 @@ mod tests {
         assert!(!a.same_build(&c));
         assert!(!a.same_build(&d));
         let u = Id::parse("u 0.1.8 (git unknown, local)").unwrap();
-        assert!(!u.same_build(&u));
+        assert!(u.same_build(&u));
+        assert!(!u.same_build(&a));
+        let u7 = Id::parse("u 0.1.7 (git unknown, local)").unwrap();
+        assert!(!u.same_build(&u7));
     }
 
     #[test]
