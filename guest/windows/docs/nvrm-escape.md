@@ -1252,7 +1252,7 @@ valve.
 | DPC per `EventReady` | ONE scan of the handle table under the virtio lock (`nvrm_handle_index`, shared by the fence-fired mark and the latch); it used to be two per event, up to 16 events per drain. The events registry scan (`signal_handle`) is over at most 1024 registrations. Still `O(table)` and not indexed: at the 16384 bound a scan is tens of microseconds, so an index by handle is the next step if tables are ever near their bound. Also `O(table)` at PASSIVE: `fence_claim_index` counts the attached fences (a counter kept at the attach/close sites would make it `O(1)`), and `nvrm_judge` / `nvrm_handle_device_type` per forwarded ioctl |
 | BAR | the guest must give the device a BAR for all three regions (above-4G decoding); the KMD reads the base from config space |
 | host zones | the host splits the window by caching type; a WC-only workload fills its zone before the byte total (13.1) |
-| `VIDMM_VRAM_MAX_MB` (64 GiB) | region 3 (Venus), not region 1; a Venus window above 64 GiB reads `VidVBad` and disables the VidMm override |
+| `VIDMM_VRAM_MAX_MB` (64 GiB) | the reported device-memory segment is the host GPU's video memory, capped here (`VidVCap`); it is independent of region 3 (Venus), which sizes only the CPU-visible blobs. Only when the Venus device cannot list its heaps does the window length stand in, and a window above 64 GiB then reads `VidVBad` and disables the VidMm override |
 
 ### 13.6 Counters and knobs
 

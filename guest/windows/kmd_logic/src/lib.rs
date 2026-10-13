@@ -38,6 +38,7 @@ pub mod flip_completion;
 pub mod dwm_restart;
 pub mod flip_flags;
 pub mod vidmm_caps;
+pub mod vidmm_vram;
 pub mod rm_vidmem;
 pub mod flip_pipeline;
 pub mod flip_retire;

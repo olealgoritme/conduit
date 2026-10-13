@@ -351,6 +351,7 @@ impl VenusInstance {
         let mut memory_type_flags = [0u32; VK_MAX_MEMORY_TYPES as usize];
         let memory_type_count;
         let memory_type_index;
+        let device_local_heap_bytes;
         {
             let mut w = Writer::new();
             w.header(
@@ -397,7 +398,22 @@ impl VenusInstance {
                     chosen = Some(i);
                 }
             }
-            // Heap array is not needed; leave it unread (reply is one-shot).
+            // The heap array follows: [u32 heapCount][array_size u64][(u64 size, u32 flags) x 16].
+            // The card's video memory is its largest DEVICE_LOCAL heap; the reply is one-shot, so
+            // it is read here or not at all. A short or odd reply only costs this figure.
+            device_local_heap_bytes = (|| -> Result<u64, VirtioError> {
+                let heap_count = r.read_u32()?;
+                let _heap_arr = r.read_u64()?;
+                let mut heaps = [(0u64, 0u32); helios_kmd_logic::vidmm_vram::MAX_MEMORY_HEAPS];
+                for slot in heaps.iter_mut() {
+                    *slot = (r.read_u64()?, r.read_u32()?);
+                }
+                Ok(
+                    helios_kmd_logic::vidmm_vram::device_local_heap_bytes(&heaps, heap_count)
+                        .unwrap_or(0),
+                )
+            })()
+            .unwrap_or(0);
             match chosen {
                 // The index is < type_count by construction of the loop guard,
                 // which is what MemoryTypeIndex asserts.
@@ -473,6 +489,7 @@ impl VenusInstance {
             memory_type_index,
             memory_type_flags,
             memory_type_count,
+            device_local_heap_bytes,
             copy_target_image_id: None,
             owned_linear_images: Vec::new(),
             // Present caches grow fallibly at PASSIVE_LEVEL. Their semantic
