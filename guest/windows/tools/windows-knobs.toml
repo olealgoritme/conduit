@@ -875,9 +875,9 @@ read = "once per process"
 effect = "Kill switch: 1 records an ordinary present's fence signal before the frame's flush so it shares the frame's submission; 0 records it after the flush."
 
 [umd.UmdThreadedFrontend]
-class = "experiment"
+class = "tuning"
 read = "once per process"
-effect = "The D3D11 threaded front end (immediate-context calls recorded into a ring and replayed on a worker): 0 off, 1 on for every process except dwm.exe, 2 on including dwm.exe. HELIOS_D3D11_FRONTEND (0 or 1) overrides it per process."
+effect = "The D3D11 threaded front end (immediate-context calls recorded into a ring and replayed on a worker): 1 on for every process except dwm.exe, 0 off, 2 on including dwm.exe. HELIOS_D3D11_FRONTEND (0 or 1) overrides it per process."
 see = "[d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md)"
 
 [umd.UmdTimerRes]

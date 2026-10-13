@@ -28,9 +28,9 @@ Classes:
 | Location | Supported setting | Performance tuning | Debug / diagnostic | Experiment, not for users | State written by the driver | Total |
 |---|---:|---:|---:|---:|---:|---:|
 | KMD: service key | 7 | 26 | 26 | 28 | 12 | 99 |
-| UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 17 | 15 | 25 | 8 | 0 | 65 |
+| UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 17 | 16 | 25 | 7 | 0 | 65 |
 | Environment variables | 8 | 18 | 86 | 24 | 0 | 136 |
-| All | 32 | 59 | 137 | 60 | 12 | 300 |
+| All | 32 | 60 | 137 | 59 | 12 | 300 |
 
 ## What the installation writes
 
@@ -210,7 +210,7 @@ Read by the D3D11/D3D12 user-mode drivers, their DXVK/vkd3d-proton bridges, the 
 | `UmdD3D12` | REG_DWORD | `1 (on)` | once per process (OpenAdapter12) | The D3D12 kill switch: 0 makes the D3D12 UMD refuse every adapter open (DXGI_ERROR_UNSUPPORTED), as if there were no D3D12 driver. 1 or absent: D3D12 on. | [knobs12.rs:104](../guest/windows/umd12/src/knobs12.rs#L104) |
 | `VideoDdi` | REG_DWORD | `1` | once per process | Which D3D11 devices get the video DDI (decoder and video processor): 0 none, 1 NVK devices (H.264 decode on Vulkan Video), 2 every device (Venus gets the video processor, no decoder). Unless 0, the bridge also sets NVK_EXPERIMENTAL=video for NVK processes. See [d3d11-video-decode.md](../guest/windows/docs/d3d11-video-decode.md). | [knobs.rs:514](../guest/windows/umd/src/knobs.rs#L514), [bridge_icd_backend.cpp:485](../guest/windows/umd_common/bridge/bridge_icd_backend.cpp#L485) |
 
-### Performance tuning (15)
+### Performance tuning (16)
 
 | Name | Type | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|---|
@@ -227,6 +227,7 @@ Read by the D3D11/D3D12 user-mode drivers, their DXVK/vkd3d-proton bridges, the 
 | `UmdCommandLists` | REG_DWORD | `1 (on)` | once per process | 1 (with UmdFreeThreaded on): the D3D11 UMD reports native command lists, so deferred contexts record through DXVK instead of the runtime's emulation. 0: the runtime emulates command lists. | [knobs.rs:197](../guest/windows/umd/src/knobs.rs#L197) |
 | `UmdFreeThreaded` | REG_DWORD | `1 (on)` | once per process | 1: the D3D11 UMD reports FREETHREADED caps, so the runtime stops serializing create and destroy DDIs behind its device lock. 0: threading caps 0 (and no native command lists). | [knobs.rs:172](../guest/windows/umd/src/knobs.rs#L172) |
 | `UmdFrontendRingKiB` | REG_DWORD | `4096` | once per process | The threaded front end's command ring per immediate context, in KiB (clamped to 256..65536). See [d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md). | [knobs.rs:396](../guest/windows/umd/src/knobs.rs#L396) |
+| `UmdThreadedFrontend` | REG_DWORD | `1` | once per process | The D3D11 threaded front end (immediate-context calls recorded into a ring and replayed on a worker): 1 on for every process except dwm.exe, 0 off, 2 on including dwm.exe. HELIOS_D3D11_FRONTEND (0 or 1) overrides it per process. See [d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md). | [knobs.rs:383](../guest/windows/umd/src/knobs.rs#L383) |
 | `UmdTimerRes` | REG_DWORD | `1` | once per process (device creation) | The process timer resolution the D3D11 UMD requests: 0 none, 1 timeBeginPeriod(1), larger values NtSetTimerResolution in 100 ns units (5000 = 0.5 ms). | [knobs.rs:91](../guest/windows/umd/src/knobs.rs#L91) |
 | `VehicleFlipGateUs` | REG_DWORD | `32000` | once per process | Upper bound, in microseconds, of the wait for a DirectComposition vehicle frame copy's host GPU completion before its flip is issued, so a direct flip never scans out a buffer before the copy lands. 0 disables the gate. | [knobs.rs:102](../guest/windows/umd/src/knobs.rs#L102) |
 
@@ -260,7 +261,7 @@ Read by the D3D11/D3D12 user-mode drivers, their DXVK/vkd3d-proton bridges, the 
 | `UmdPresentBatchFold` | REG_DWORD | `1 (on)` | once per process | Kill switch: 1 records an ordinary present's fence signal before the frame's flush so it shares the frame's submission; 0 records it after the flush. | [knobs.rs:147](../guest/windows/umd/src/knobs.rs#L147) |
 | `UmdTrace` | REG_DWORD | `0 (off)` | once per process | 1: per-frame and per-op DDI trace lines of the D3D11 UMD in its log. 0: off. | [knobs.rs:81](../guest/windows/umd/src/knobs.rs#L81) |
 
-### Experiment, not for users (8)
+### Experiment, not for users (7)
 
 | Name | Type | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|---|
@@ -271,7 +272,6 @@ Read by the D3D11/D3D12 user-mode drivers, their DXVK/vkd3d-proton bridges, the 
 | `UmdDdiAllowList` | REG_SZ | `absent` | once per process | Executable names (';'-separated) that get the WDDM 2.3 D3D11 DDI even when UmdDdiLevel is 0x10. | [ddi_level.rs:100](../guest/windows/umd/src/ddi_level.rs#L100) |
 | `UmdDdiLevel` | REG_DWORD | `0x24` | once per process (not dwm.exe) | The D3D11 DDI interface the UMD advertises to every process but DWM: 0x24 WDDM 2.3, 0x10 WDDM 1.3 (other values count as 0x10). HELIOS_UMD_DDI overrides it per process. | [knobs.rs:213](../guest/windows/umd/src/knobs.rs#L213) |
 | `UmdDdiLevelDwm` | REG_DWORD | `0x10` | once per DWM start | UmdDdiLevel for dwm.exe only: 0x10 WDDM 1.3, 0x24 WDDM 2.3. | [knobs.rs:217](../guest/windows/umd/src/knobs.rs#L217) |
-| `UmdThreadedFrontend` | REG_DWORD | `0` | once per process | The D3D11 threaded front end (immediate-context calls recorded into a ring and replayed on a worker): 0 off, 1 on for every process except dwm.exe, 2 on including dwm.exe. HELIOS_D3D11_FRONTEND (0 or 1) overrides it per process. See [d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md). | [knobs.rs:383](../guest/windows/umd/src/knobs.rs#L383) |
 
 ## Environment variables
 

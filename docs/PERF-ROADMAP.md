@@ -28,7 +28,7 @@ All of these are defaults; nothing is set by hand.
 | windowed copy | `RedirVram` 1, `BltAsync` 1, `ForeignCopy` 1; `RmCopyEngine`, `GuestBlob`, `CopyQueue` 0 | GDI redirection textures in RM video memory, written on the KMD's RM copy-engine channel; other destinations take the Venus copy |
 | flips | `ForeignFlip` 1 (`FlipAnnForeign`, `FfAsyncWin` 2 follow it), `IndepFlip` 1, `DirectFlipSupport` 5, `FlipQueueN` 1 | full-screen flip-model swap chains are scanned out from their own buffers; windowed apps are DWM-composed |
 | GDI | `GdiAccel` 0 | no GDI hardware acceleration |
-| D3D11 front end | `UmdThreadedFrontend` 0 | the D3D11 front end runs on the app's thread (PR #90 to turn the threaded front end on by default is a draft) |
+| D3D11 front end | `UmdThreadedFrontend` 1 | the immediate-context calls of every process except dwm.exe are recorded into a ring and replayed on a worker thread |
 | ICD policy | `DwmIcd=nvk` (install.ps1), `Icd` absent | DWM and apps on NVK; Venus is loaded as the fallback ICD |
 | input | virtio-input ([INPUT.md](INPUT.md)) | relative mouse and keyboard reports straight into the guest's event queues |
 
@@ -117,7 +117,7 @@ scanout path when `ForeignFlip` is 0, and GuestBlob.
 ### 1h. CS2 render-thread profile (measurement)
 
 Measured on driver 405.42 with the D3D11 front end inline on the app thread
-(the default) and the backend latency options off, CS2 at ~150 fps: a
+(`UmdThreadedFrontend=0`) and the backend latency options off, CS2 at ~150 fps: a
 10-minute play recording plus a 3,000-sample instruction-pointer profile of
 the busiest thread (`guest/windows/tools/thread-sample.ps1`), symbolized
 against the PDBs.
@@ -149,7 +149,7 @@ kernel) and presents through KMS with plane fences.
 
 | rank | gap | where we pay it |
 |---|---|---|
-| G2 | the D3D11 front end and the SUBMITTED present gate on the app's render thread | 1h, P2/F1; CPU-bound titles (CS2) |
+| G2 | the SUBMITTED present gate on the app's render thread | 1h, P2/F1; CPU-bound titles (CS2) |
 | G3 | the GPU→CPU wake chain wakes every waiter, through a 16-buffer event ring and a 1 ms sweep | 1b; DXVK frame pacing and vkd3d fence waits |
 | G4 | windowed copy completion is polled; the Venus fallback defers on the CPU | P6, P9: dxgkrnl serialises the next Blt behind it |
 | G5 | two RM round trips per present fence (create + close), the close on a serial worker | P3, P10 |
@@ -165,9 +165,8 @@ kernel) and presents through KMS with plane fences.
 The T numbers are stable identifiers (PRs refer to them). Tags: **[V]**
 removes a Venus dependency, **[F]** flip or vblank work.
 
-### T2. A non-blocking D3D11 present and the front end off the app thread
-- **What.** The threaded D3D11 front end on by default (PR #90). Then drop
-  the SUBMITTED gate (`present.rs` → `present_frame_gate` →
+### T2. A non-blocking D3D11 present
+- **What.** Drop the SUBMITTED gate (`present.rs` → `present_frame_gate` →
   `HeliosWaitFrameSubmitted`): reserve the frame's RM fence value at record
   time on the CS thread, hand the KMD a (fence, value) pair it waits on
   GPU-side (copy-engine route) or worker-side (flip), and let `D3DKMT

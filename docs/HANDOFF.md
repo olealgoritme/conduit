@@ -64,8 +64,6 @@ shipped configuration
 
 Opt-in, not the default:
 
-- The threaded D3D11 front end (`UmdThreadedFrontend`, 0 by default; PR #90
-  to turn it on by default is a draft).
 - `GuestBlob` (and the host's `venus.guest_blobs`), `RmCopyEngine` (routes
   the other windowed Present copies through the copy-engine channel),
   `CopyQueue`,
@@ -152,8 +150,7 @@ restart-device and stress pass is clean.
 
 1. Event-driven completion for the KMD copy-engine copies, then move the
    remaining windowed copies off the Venus fallback (PERF-ROADMAP T4).
-2. The D3D11 present gate off the app thread, and the threaded front end on
-   by default once its correctness rows pass (PR #90).
+2. The D3D11 present gate off the app thread.
 3. Host-paced vblank for the Windows guest (PR #78, draft) and the guest
    cursor drawn by the viewer under a grab (PR #81, draft).
 4. Stability: recovery after `pnputil /restart-device` (NVK holder renewal,
