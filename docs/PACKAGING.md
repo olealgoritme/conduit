@@ -9,10 +9,10 @@ layout, so a layout change is made in one place.
 | Path | What |
 |---|---|
 | `/opt/conduit/bin/conduit` | the CLI |
-| `/opt/conduit/bin/conduit-backend` | GPU backend (static musl in release builds) |
+| `/opt/conduit/bin/conduit-backend` | GPU backend (glibc 2.34 or newer) |
 | `/opt/conduit/bin/conduit-userspace` | stages the host's NVIDIA user-space files for the guest (same crate as the backend) |
 | `/opt/conduit/bin/conduit-viewer` | Wayland/X11 viewer |
-| `/opt/conduit/bin/conduit-vmm` | built-in VM runner (static musl in release builds) |
+| `/opt/conduit/bin/conduit-vmm` | built-in VM runner (glibc) |
 | `/opt/conduit/bin/conduit-stream` | stream host for Moonlight and `conduit remote` |
 | `/opt/conduit/bin/qemu-system-x86_64`, `share/qemu/` | bundled QEMU 11.1 |
 | `/opt/conduit/share/conduit/supported-drivers.txt` | driver releases with backend ABI tables (`conduit doctor`) |
@@ -84,7 +84,7 @@ packaging/
 
 ```sh
 sudo packaging/build.sh deps          # apt, dnf or pacman
-packaging/build.sh rust               # static musl; RUST_TARGET=host for a glibc build
+packaging/build.sh rust               # backend + VMM (glibc), CLI (static musl; RUST_TARGET=host for glibc)
 packaging/build.sh viewer
 packaging/build.sh stream
 packaging/build.sh venus              # conduit-venus + virglrenderer (needs the venus submodules; meson, Vulkan and libdrm headers, python3 mako/yaml: `deps` installs them)
@@ -148,6 +148,21 @@ itself so no root or sudo is needed. The build needs `gpg`, `curl` and
 `patch`; `build.sh deps` installs them. The flake builds the same 11.1.2
 tarball (same sha256) with the same patches on top of nixpkgs' QEMU
 expression.
+
+**Build identity.** Every binary says which build it is.
+`conduit`, `conduit-backend`, `conduit-userspace`, `conduit-viewer`,
+`conduit-vmm`, `conduit-venus` and `conduit-stream` print
+`NAME VERSION (git COMMIT, KIND)` for `--version`; the bundled QEMU prints
+`QEMU emulator version 11.1.2 (conduit VERSION (git COMMIT, KIND), patches N SHA8)`,
+where `N SHA8` is the count and sha256 prefix of `host/qemu/patches/`.
+`packaging/build-id.sh` computes the fields for the Rust build scripts, the
+viewer's Makefile and `build-qemu.sh`: `CONDUIT_VERSION` (`build.sh` exports
+the package version), `CONDUIT_GIT_COMMIT` (default: `HEAD`, `-dirty` with
+uncommitted changes to tracked files) and `CONDUIT_BUILD_KIND` (`release` for
+tag builds, `ci`, `rpm`, `arch`, `nix`, default `local`). `conduit doctor`
+lists them (`Build: ...` lines) and warns when a binary is not from the CLI's
+build, or when QEMU carries another patch set, kind of build or release
+(release.yml caches QEMU per version, so a release's QEMU names its commit).
 
 **CLI.** `cli/src/paths.rs` finds its helpers as `$CONDUIT_PREFIX/bin/<name>`
 (`CONDUIT_PREFIX` defaults to `/opt/conduit`; the flake sets it to its store
@@ -265,7 +280,7 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 |---|---|---|
 | `ci.yml` | push, PR, manual | fmt/clippy/test per Rust project (backend, VMM, `host/venus` without its `renderer` feature, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora headers plus its plain-C unit tests, viewer `make check`, guest agent unit tests, actionlint, shellcheck, venus submodule pins in `flake.nix` and the RPM spec, DKMS package build |
 | `abi.yml` | Mondays, manual | new open-gpu-kernel-modules tags / gVisor nvproxy ABIs -> `.github/scripts/abi_update.py` runs the `host/backend/gen` generators -> tests -> PR on `abi/auto` (draft if tests fail). Set secret `ABI_BOT_TOKEN` so CI runs on its PRs. |
-| `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers (viewer, stream host, `conduit-venus` from the venus submodules) with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
+| `release.yml` | tag `v*`, manual | Rust binaries once (static musl CLI, glibc backend and VMM); deb/rpm/Arch/tarball in their own containers (viewer, stream host, `conduit-venus` from the venus submodules) with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
 | `bios.yml` | changes under `packaging/bios`, called by `release.yml` | the Conduit BIOS on Ubuntu 24.04, cached per `packaging/bios/**` content; conduit-bios .deb and tarball; on main, mirrors the pinned edk2 sources as the `edk2-src-<version>` release |
 | `windows.yml` | `v*` tags (the `release` job waits up to 3 hours for the release.yml release, then attaches the driver zip, the setup package and their checksums as `SHA256SUMS-windows`; `SHA256SUMS` covers release.yml's files) and by hand (about an hour on Windows runners) | the Windows guest stack from `guest/windows` (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD, loaders, installer); the package per configuration as an artifact, and the Release driver folder (`conduit-windows-gpu-driver-<version>.zip`: signed INF/SYS/CAT, UMDs, NVK/Zink files, test certificate, `packaging/windows/install.ps1`) and the Release package (`conduit-windows-gpu-setup-<version>.zip`: `HeliosSetup.exe`) as release assets. The driver alone also builds in a local Windows VM (`guest/windows/ci/vm/README.md`) |
 

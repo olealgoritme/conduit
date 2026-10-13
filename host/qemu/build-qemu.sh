@@ -130,10 +130,33 @@ else
   AUDIO_OPTS=(--disable-pipewire --disable-pa --audio-drv-list=)
 fi
 CONF_STAMP="slirp=$SLIRP audio=$AUDIO tpm=enabled"
+
+# Build identity: `qemu-system-x86_64 --version` prints
+#   QEMU emulator version 11.1.2 (conduit VERSION (git COMMIT, KIND), patches N SHA8)
+# from packaging/build-id.sh, the same fields every Conduit binary prints, plus
+# the patch set (count and the first 8 hex digits of the sha256 of the
+# concatenated patches, the tree stamp above). `conduit doctor` compares it
+# with the other installed binaries. It is not part of CONF_STAMP: a new
+# commit only updates the package version (meson configure below), which
+# rebuilds the few files that include qemu-version.h, not the whole tree.
+BUILD_ID_SH="$HERE/../../packaging/build-id.sh"
+if [[ -f "$BUILD_ID_SH" ]]; then
+  CONDUIT_ID="$(sh "$BUILD_ID_SH" | sed -n 's/^id=//p')"
+else
+  CONDUIT_ID="${CONDUIT_VERSION:-0.0.0} (git ${CONDUIT_GIT_COMMIT:-unknown}, ${CONDUIT_BUILD_KIND:-local})"
+fi
+if [[ $PATCHES == 1 ]]; then
+  PATCH_ID="patches $(ls "$HERE"/patches/*.patch | wc -l) ${WANT:0:8}"
+else
+  PATCH_ID="stock"
+fi
+PKGVERSION="conduit $CONDUIT_ID, $PATCH_ID"
+
 cd "$BUILD_DIR"
 if [[ ! -f build.ninja || "$(cat .conduit-configured 2>/dev/null)" != "$CONF_STAMP" ]]; then
   "$SRC_DIR/qemu-$QEMU_VERSION/configure" \
     --prefix="$PREFIX" \
+    --with-pkgversion="$PKGVERSION" \
     --target-list=x86_64-softmmu \
     --without-default-features \
     --enable-kvm \
@@ -152,11 +175,16 @@ if [[ ! -f build.ninja || "$(cat .conduit-configured 2>/dev/null)" != "$CONF_STA
     --disable-docs \
     --disable-werror
   echo "$CONF_STAMP" > .conduit-configured
+elif [[ "$(cat .conduit-pkgversion 2>/dev/null)" != "$PKGVERSION" ]]; then
+  ./pyvenv/bin/meson configure -Dpkgversion="$PKGVERSION" .
 fi
+echo "$PKGVERSION" > .conduit-pkgversion
 
 # ---- build ---------------------------------------------------------------
 nice -n 10 ninja -j "$JOBS"
 ./qemu-system-x86_64 --version
+./qemu-system-x86_64 --version | grep -qF "(conduit $CONDUIT_ID, $PATCH_ID)" \
+  || { echo "build identity missing from qemu-system-x86_64 --version" >&2; exit 1; }
 # QEMU 11.1 names the generic device vhost-user-test-device(-pci).
 ./qemu-system-x86_64 -device help 2>/dev/null \
   | grep -E '"vhost-user-test-device-pci"' \

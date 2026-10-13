@@ -65,7 +65,7 @@ tar -xzf %{SOURCE1} --strip-components=1 -C host/venus/third_party/virglrenderer
 tar -xzf %{SOURCE2} --strip-components=1 -C host/venus/third_party/venus-protocol
 
 %build
-export VERSION=%{version} RUST_TARGET=host JOBS=%{_smp_build_ncpus}
+export VERSION=%{version} RUST_TARGET=host JOBS=%{_smp_build_ncpus} CONDUIT_BUILD_KIND=rpm
 packaging/build.sh rust
 packaging/build.sh viewer
 packaging/build.sh stream

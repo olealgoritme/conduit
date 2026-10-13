@@ -1,8 +1,9 @@
 # Release: on a v* tag, build every artifact in docs/STRUCTURE.md and attach
 # them to a GitHub Release. All builds go through packaging/build.sh.
 #
-#   rust-static  backend, VMM and CLI as static musl binaries, built once and
-#                shared by every package (they have no runtime dependencies)
+#   rust-static  the CLI as a static musl binary, the backend and VMM against
+#                glibc (no newer than Debian 12's, build.sh checks), built
+#                once and shared by every package
 #   host         per-format container: viewer, stream host, Venus renderer
 #                (conduit-venus + its virglrenderer, from the host/venus
 #                submodules) and bundled QEMU 11.1 (cached), staged and
@@ -26,6 +27,8 @@ permissions:
 env:
   # build.sh strips the leading "v". Manual runs get a dev version.
   VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('0.0.0-dev.{0}', github.run_number) }}
+  # Build kind in every binary's --version (packaging/build-id.sh).
+  CONDUIT_BUILD_KIND: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'ci' }}
   NFPM_VERSION: "2.43.0"
 
 jobs:
@@ -44,7 +47,7 @@ jobs:
             .
             host/backend
             host/vmm
-      - name: Build static binaries
+      - name: Build backend, VMM and CLI
         run: RUST_TARGET=x86_64-unknown-linux-musl packaging/build.sh rust
       - uses: actions/upload-artifact@v4
         with:
@@ -102,8 +105,10 @@ jobs:
 
       # QEMU takes most of the build time. Cache it per format, per week
       # (rolling images like fedora:latest and archlinux change library
-      # sonames), and per change to the QEMU sources/patches or to
-      # packaging/build.sh (prefix, install step, PREFIX/JOBS defaults).
+      # sonames), per change to the QEMU sources/patches or to
+      # packaging/build.sh (prefix, install step, PREFIX/JOBS defaults), and
+      # per version: its --version names the Conduit version and commit it
+      # was built from (packaging/build-id.sh), which must be this release's.
       - name: Cache key
         id: week
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
@@ -112,7 +117,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dist/qemu-root
-          key: qemu-11.1-${{ matrix.format }}-${{ steps.week.outputs.week }}-${{ hashFiles('host/qemu/**', 'packaging/build.sh') }}
+          key: qemu-11.1-${{ matrix.format }}-${{ env.VERSION }}-${{ steps.week.outputs.week }}-${{ hashFiles('host/qemu/**', 'packaging/build.sh', 'packaging/build-id.sh') }}
       - name: Build QEMU 11.1
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: packaging/build.sh qemu

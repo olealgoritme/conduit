@@ -46,6 +46,7 @@
 #include <sys/syscall.h>
 #include <linux/capability.h>
 #include "nvkvm_uidmap.h"
+#include "build_id.h"
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -3806,6 +3807,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--vm-reboot-cmd")) { NEEDVAL();
             cfg.vm_reboot_cmd = v; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
+        else if (!strcmp(a, "-V") || !strcmp(a, "--version")) {
+            printf("conduit-viewer %s\n", CONDUIT_BUILD_ID); return 0; }
         else { nb_err("unknown argument: %s", a); usage(); return 2; }
 #undef NEEDVAL
     }

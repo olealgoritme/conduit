@@ -40,7 +40,7 @@ prepare() {
 
 build() {
   cd "$pkgbase"
-  export VERSION=$pkgver RUST_TARGET=host
+  export VERSION=$pkgver RUST_TARGET=host CONDUIT_BUILD_KIND=arch
   packaging/build.sh rust
   packaging/build.sh viewer
   packaging/build.sh stream

@@ -24,7 +24,11 @@ use device::userspace::{
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(about = "Stage the host NVIDIA user-mode driver for a guest")]
+#[command(
+    name = "conduit-userspace",
+    version = env!("CONDUIT_BUILD_ID"),
+    about = "Stage the host NVIDIA user-mode driver for a guest"
+)]
 struct Args {
     /// The driver's file manifest.
     #[arg(long, default_value = DEFAULT_MANIFEST)]

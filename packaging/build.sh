@@ -20,7 +20,8 @@
 #
 # Environment (all optional):
 #   VERSION            package version (default: git describe, without the leading v)
-#   RUST_TARGET        x86_64-unknown-linux-musl (default, static) or "host" (distro builds)
+#   RUST_TARGET        the CLI's target: x86_64-unknown-linux-musl (default, static) or
+#                      "host" (distro builds). The backend and VMM are always glibc.
 #   BUNDLE_QEMU        1 (default) to ship QEMU in /opt/conduit, 0 to leave it out
 #   STAGE              install tree root (default dist/stage)
 #   LINK_DIR           where the `conduit` command symlink goes (default /usr/bin;
@@ -162,10 +163,17 @@ cmd_rust() {
     mkdir -p "$bin"
 
     log "backend ($BACKEND_BIN_SRC -> conduit-backend, $USERSPACE_BIN_SRC -> conduit-userspace)"
-    (cd "$ROOT/host/backend" && cargo build --locked --release "${CARGO_TARGET_ARGS[@]}" \
+    # The backend is always built for the host's glibc target, never musl:
+    # it is the hot path of every guest GPU call, and musl's allocator
+    # (mallocng: one global lock, and an mmap/munmap pair for every
+    # allocation over 128 KiB, each munmap a TLB shootdown across the
+    # backend's threads) and its plain memcpy are far slower there than
+    # glibc's, and the glibc build is the one performance is measured with.
+    # It needs no glibc newer than the oldest one packaged (checked below).
+    (cd "$ROOT/host/backend" && cargo build --locked --release \
         -p "$BACKEND_PKG" --features "$BACKEND_FEATURES" \
         --bin "$BACKEND_BIN_SRC" --bin "$USERSPACE_BIN_SRC")
-    t=$(target_dir "$ROOT/host/backend")/$TARGET_DIR_SUFFIX
+    t=$(target_dir "$ROOT/host/backend")/release
     install -m0755 "$t/$BACKEND_BIN_SRC" "$bin/conduit-backend"
     install -m0755 "$t/$USERSPACE_BIN_SRC" "$bin/conduit-userspace"
 
@@ -184,10 +192,24 @@ cmd_rust() {
     install -m0755 "$t/$CLI_BIN_SRC" "$bin/conduit"
 
     if [ "$RUST_TARGET" != host ]; then
+        # The CLI is static; the backend and the VM runner link glibc on
+        # purpose (see above) and must run on the oldest glibc any package
+        # targets (the tarball's Debian 12). Weak references (Rust's std
+        # probing for newer calls such as pidfd_spawnp) do not count.
+        local glibc_max=${GLIBC_MAX:-2.36} need
         for f in "$bin"/*; do
-            [ "$(basename "$f")" = conduit-vmm ] && continue   # glibc on purpose, see above
-            file "$f" | grep -qE 'statically linked|static-pie linked' \
-                || die "$f is not static"
+            case "$(basename "$f")" in
+            conduit-backend|conduit-userspace|conduit-vmm)
+                need=$(objdump -T "$f" | grep -vE '^[0-9a-f]+ +w ' \
+                    | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+                [ "$(printf '%s\n%s\n' "$need" "$glibc_max" | sort -V | tail -1)" = "$glibc_max" ] \
+                    || die "$f needs glibc $need, newer than $glibc_max"
+                ;;
+            *)
+                file "$f" | grep -qE 'statically linked|static-pie linked' \
+                    || die "$f is not static"
+                ;;
+            esac
         done
     fi
 }
@@ -559,6 +581,10 @@ cmd_package() {
 main() {
     [ $# -ge 1 ] || { sed -n '2,30p' "$0"; exit 1; }
     local cmd=$1; shift
+    # Every binary built below prints this version in its build identity
+    # (packaging/build-id.sh), the same one the packages carry.
+    CONDUIT_VERSION=${CONDUIT_VERSION:-$(version)}
+    export CONDUIT_VERSION
     case "$cmd" in
         deps) cmd_deps ;;
         rust) cmd_rust ;;
