@@ -249,6 +249,9 @@ std::int32_t helios_vkd3d_bridge_execute_rm(std::size_t queue, rust::Slice<const
 std::uint32_t helios_vkd3d_bridge_ecl_fence_stats(rust::Slice<std::uint64_t> out) noexcept;
 // The engine's memory placement counters (helios_vkd3d_memory_stats); how many it wrote.
 std::uint32_t helios_vkd3d_bridge_memory_stats(rust::Slice<std::uint64_t> out) noexcept;
+// NVK: completion hints (helios_vkd3d_set_completion_hint, vkd3d patch 0011).
+void helios_vkd3d_bridge_set_completion_hint(std::size_t cb, std::uint32_t spin_us) noexcept;
+
 // NVK: make the queue's next ECL fence now (helios_vkd3d_prepare_ecl_fence).
 std::int32_t helios_vkd3d_bridge_prepare_ecl_fence(std::size_t queue) noexcept;
 // The engine's GPU timestamp counters (helios_vkd3d_gpu_time_stats); how many it wrote.

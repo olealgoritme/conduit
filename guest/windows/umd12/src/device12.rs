@@ -347,6 +347,10 @@ pub(crate) unsafe fn create_device(arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0
         unsafe { crate::forward12::nvk12::probe_monitored_fence_va(&*device) };
     }
 
+    // `Nvk12CompletionHint`: the engine worker names finished batches to the KMD.
+    // SAFETY: the device written above, live.
+    crate::forward12::ecl_hint::enable_if_wanted(unsafe { &*device });
+
     // ── 4. Hand it to the runtime ───────────────────────────────────────────
     guard.defuse();
     S_OK
