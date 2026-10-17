@@ -116,9 +116,8 @@ Ranked, with code references and how to measure each:
 
 - The windowed Present: event-driven copy-engine completion, dxgkrnl's
   serialisation behind the previous Blt.
-- The D3D11 present gate and front end on the app thread (the threaded front
-  end is opt-in, `UmdThreadedFrontend`; PR #90 to turn it on by default is a
-  draft).
+- The D3D11 present gate on the app thread (the threaded front end,
+  `UmdThreadedFrontend`, is on by default).
 - The GPU→CPU wake chain (one shared non-stall event per device, a 16-buffer
   event ring).
 - Display pacing from the host's presentation feedback (PR #78, draft).

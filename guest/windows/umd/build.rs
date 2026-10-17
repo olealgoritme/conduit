@@ -294,6 +294,7 @@ fn main() {
         // three lines a `bridge_guard.h` edit would leave a stale
         // `helios_dxvk_bridge.lib` linked into the DLL.
         "../umd_common/bridge/bridge_common.h",
+        "../umd_common/bridge/bridge_dwm_guard.h",
         "../umd_common/bridge/bridge_guard.h",
         "../umd_common/bridge/bridge_icd_anchor.cpp",
         "../umd_common/bridge/bridge_icd_anchor.h",

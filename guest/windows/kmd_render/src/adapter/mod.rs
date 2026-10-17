@@ -232,10 +232,12 @@ pub(crate) struct AdapterKnobs {
     /// `crate::ddi::bar_segment::BarSegTopology`; kept raw here so the coerced
     /// value can be reported.
     pub bar_seg_mode: u32,
-    /// `VidMmVramMB`. When absent, StartDevice derives the value from the exact
-    /// virtio host-visible capability length (QEMU `hostmem`). A valid nonzero
-    /// registry value overrides that automatic value; zero explicitly restores
-    /// the legacy topology. The selected value makes the existing BAR-backed
+    /// `VidMmVramMB`. When absent, StartDevice derives the value from the host GPU's
+    /// video memory (the largest device-local heap the Venus bring-up reads, capped at
+    /// 64 GiB; `helios_kmd_logic::vidmm_vram`), and only when the Venus device could not
+    /// tell, from the exact virtio host-visible capability length (QEMU `hostmem`). A
+    /// valid nonzero registry value overrides that automatic value; zero explicitly
+    /// restores the legacy topology. The selected value makes the existing BAR-backed
     /// memory segment report this device-local capacity and opts device-local
     /// Venus tracking allocations into that local segment. Non-local Vulkan
     /// heaps remain in the aperture/shared budget. The programmable CPU aperture
@@ -433,9 +435,10 @@ impl AdapterKnobs {
         let vm = knobs.vidmm_caps(0);
         crate::diag::record_named_bytes(b"VmCapsXEff", vm.effective);
         crate::diag::record_named_bytes(b"VmCapsXMsk", vm.dropped);
-        // VidVram is recorded after StartDevice resolves the absent-value
-        // sentinel from the virtio host-visible capability.
+        // VidVram (and VidVSrc, VidVHeap) are recorded after StartDevice resolves the
+        // absent-value sentinel from the host GPU's memory heap.
         crate::diag::record_named_bytes(b"VidVBad", 0);
+        crate::diag::record_named_bytes(b"VidVCap", 0);
         knobs
     }
 }

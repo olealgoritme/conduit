@@ -96,6 +96,19 @@ RM with librmclient (64- and 32-bit) and Zink. The current version is
 the version is set). The adapter shows as "Conduit Helios", the monitor as
 "Conduit".
 
+**Video memory the guest sees.** The adapter's dedicated video memory (dxdiag,
+Task Manager, DXGI `DedicatedVideoMemory`, the budgets games size textures
+from) is the host GPU's video memory: the largest device-local heap the
+host's Vulkan driver lists, read when the driver starts, up to 64 GiB. An
+RTX 5090 shows about 32 GB. It does not depend on `--venus-hostmem-mib`, which
+sizes only the CPU-visible blob window, and `--vram-limit-mib` does not lower
+it. The figure is accounting: VidMm charges
+each allocation of host GPU memory against it, and the host GPU (or
+`--vram-limit-mib`) decides what can actually be allocated. "Shared memory" is
+Windows' own half-of-RAM figure. `VidMmVramMB` overrides the size
+([Registry knobs](#registry-knobs)); `VidVram`, `VidVSrc` and `VidVHeap` in the
+service key show what the driver chose and from where.
+
 **Install from a release.** Every release carries
 `conduit-windows-gpu-driver-<version>.zip` (built and test-signed by
 `.github/workflows/windows.yml`). Unzip it in the guest and, from an
@@ -160,7 +173,7 @@ these and every other knob: [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md).
 | Where | Setting | What it does |
 |---|---|---|
 | Host | `conduit config set venus.guest_blobs true` | the backend serves guest-memory blobs (`--venus-guest-blobs`, [VENUS.md](VENUS.md) "Guest-memory blobs"): Venus copy destinations over the guest's own pages, for the KMD's windowed Present. Applies when the VM's backend next starts. Needs the patched virglrenderer (patch 0002) |
-| Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). `install.ps1` sets it unless `-VenusDesktop` is given |
+| Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) that never got healthy (presenting on NVK for `DwmNvkHealthySeconds`, 30), and keeps it on NVK when Venus cannot create its device ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). `install.ps1` sets it unless `-VenusDesktop` is given |
 
 On by default, with a way back (the values in [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md)):
 

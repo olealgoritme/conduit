@@ -52,10 +52,24 @@ From `C:\ProgramData\Helios\umd-<dwm pid>.log`:
 
 * `HKLM\SOFTWARE\Helios!DwmIcd` (REG_SZ), read only in `dwm.exe`. `nvk` puts DWM on NVK past `Icd` and
   the deny-lists; `venus` or absent (the default) changes nothing.
-* Crash-loop guard: `%ProgramData%\Helios\dwm-nvk-starts.txt` holds the times of recent DWM starts on
-  NVK. When `DwmNvkMaxStarts` (default 2; 0 = off) starts fall inside `DwmNvkGuardSeconds` (default
-  600), the next start goes to Venus and the log says why. A DWM that stays up never starts again, so a
-  healthy session never trips it, and the window ages out on its own.
+* Crash-loop guard (decision in `umd_common/bridge/bridge_dwm_guard.h`, host test
+  `bridge_dwm_guard_test.cpp`, run by CI). It counts only DWM starts on NVK that **never got healthy**:
+  * `%ProgramData%\Helios\dwm-nvk-starts.txt` holds the pending starts, one per line: the time of
+    the choice, the DWM's pid and creation time, and the UMD build (a hash of the UMD's driver-store
+    folder, which is new for every driver package).
+  * A DWM on NVK that is still presenting `DwmNvkHealthySeconds` (default 30) after its choice deletes
+    the file and logs "DWM on NVK is healthy". Ordinary restarts, the restarts a live driver update
+    causes, and a reboot after either therefore never add up to a crash loop.
+  * A start counts only if the same UMD build made it, in another DWM process (a DWM that loads a new
+    copy of the UMD during a live update is not a restart), inside `DwmNvkGuardSeconds` (default
+    600). Starts of another build are dropped, so installing a new driver starts a fresh history.
+  * When `DwmNvkMaxStarts` (default 2; 0 = off) pending starts count, the next start goes to Venus, is
+    not recorded, and the log says why. The window ages out on its own.
+  * Pending starts survive a reboot: a DWM start that takes the machine down (a bugcheck) still
+    counts on the next boot, where pids often repeat (the creation time tells the processes apart).
+  * **Venus must work for the fallback.** If Venus cannot create the device of a DWM the guard sent to
+    Venus, that DWM moves to NVK after all (`dwm_guard_venus_failed`, logged loudly) instead of failing
+    at every start.
 * Device creation failure on NVK: Venus for this process (existing).
 * **Open: a mixed process.** If a later device of the same DWM fails on NVK, the process is latched to
   Venus while the earlier devices stay on NVK. Decide whether DWM should fail that creation instead, so
@@ -246,7 +260,11 @@ Run each step only in a quiet window agreed with the install agent. Always end w
 * **T5 (after 4.2).** A Venus browser window and a GDI window (notepad) composed by the NVK DWM.
 * **T6 failure.**
   * `NvkIcdPath` pointing at a missing file for one run: DWM on Venus, "no NVK ICD".
-  * Three DWM restarts within 10 min: the third start is Venus by the guard.
+  * Three DWM restarts within 10 min, each before it reached `DwmNvkHealthySeconds`: the third start
+    is Venus by the guard. Restarts of a DWM that ran on NVK longer than that never trip it.
+  * A live driver update, then a reboot within 10 min: DWM stays on NVK.
+  * The guard tripped while Venus cannot create DWM's device: DWM runs on NVK after all ("NVK after
+    all" in its UMD log).
   * A TDR while on NVK: DWM recreates its device.
 * **T7 soak.** 30 min of desktop use: a mode change, the lock screen (LogonUI is deny-listed: a
   Venus surface under an NVK DWM), sleep of the viewer.
