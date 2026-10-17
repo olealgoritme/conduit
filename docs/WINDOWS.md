@@ -160,7 +160,7 @@ these and every other knob: [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md).
 | Where | Setting | What it does |
 |---|---|---|
 | Host | `conduit config set venus.guest_blobs true` | the backend serves guest-memory blobs (`--venus-guest-blobs`, [VENUS.md](VENUS.md) "Guest-memory blobs"): Venus copy destinations over the guest's own pages, for the KMD's windowed Present. Applies when the VM's backend next starts. Needs the patched virglrenderer (patch 0002) |
-| Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). `install.ps1` sets it unless `-VenusDesktop` is given |
+| Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) that never got healthy (presenting on NVK for `DwmNvkHealthySeconds`, 30), and keeps it on NVK when Venus cannot create its device ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). `install.ps1` sets it unless `-VenusDesktop` is given |
 
 On by default, with a way back (the values in [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md)):
 

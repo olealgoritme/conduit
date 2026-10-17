@@ -11,10 +11,13 @@
 //  1. `HELIOS_ICD` in the process environment: `venus` or `nvk` (tests, and a
 //     per-launch override; it skips the deny-list).
 //  1b. dwm.exe only: `HKLM\SOFTWARE\Helios!DwmIcd` (REG_SZ) `nvk` puts DWM on
-//     NVK past `Icd` and the deny-lists, unless the crash-loop guard says DWM
-//     already started on NVK `DwmNvkMaxStarts` (default 2) times in the last
-//     `DwmNvkGuardSeconds` (default 600); `venus` or absent changes nothing
-//     (docs/dwm-on-nvk.md).
+//     NVK past `Icd` and the deny-lists, unless the crash-loop guard finds
+//     `DwmNvkMaxStarts` (default 2) DWM starts on NVK of this UMD build in the
+//     last `DwmNvkGuardSeconds` (default 600) that never got healthy (still
+//     presenting `DwmNvkHealthySeconds`, default 30, after the choice); then
+//     Venus, or NVK after all when Venus cannot create DWM's device
+//     (`dwm_guard_venus_failed`). `venus` or absent changes nothing
+//     (docs/dwm-on-nvk.md 4.1, bridge_dwm_guard.h).
 //  2. `HKLM\SOFTWARE\Helios!Icd` (REG_SZ): `venus` turns NVK off everywhere;
 //     `nvk` or absent selects the global mode below.
 //  3. The deny-list. `HKLM\SOFTWARE\Helios!NvkDenyList` (REG_SZ, executable
@@ -67,8 +70,12 @@ struct IcdBackendChoice {
   const char* reason;
   // The process's executable name (lower case), as matched against the lists.
   char exe[128];
-  // NVK only: the ICD to load.
+  // NVK only: the ICD to load. Also set for a DWM the crash-loop guard sent to
+  // Venus (dwm_guard_venus), for the move back to NVK.
   wchar_t nvk_path[520];
+  // DWM with DwmIcd=nvk on Venus because of the crash-loop guard, with an NVK
+  // ICD to go back to.
+  bool dwm_guard_venus;
 };
 
 /// The process's choice. Thread-safe; computed on first call.
@@ -83,6 +90,19 @@ IcdBackend effective_icd_backend();
 
 /// Latch the process to Venus after an NVK failure. Logs `why`.
 void note_nvk_failed(const char* why);
+
+/// Device creation on Venus failed. True once, for a DWM that the crash-loop
+/// guard sent to Venus while `DwmIcd=nvk` (and NVK has not failed in it): it
+/// moves to NVK, logged, and the caller retries the device there. A guard that
+/// sends DWM to a backend that cannot make its device turns a possible crash
+/// loop into a certain one.
+bool dwm_guard_venus_failed();
+
+/// DWM presents a frame on NVK. Once its NVK start (`DwmIcd=nvk`) is
+/// `DwmNvkHealthySeconds` old, the crash-loop guard's history is cleared: this
+/// DWM works, so the restarts before it were not a crash loop. Cheap after
+/// that (one atomic load).
+void note_dwm_nvk_present();
 
 /// NVK: `vk_icdGetInstanceProcAddr` of the loaded ICD (as `void*`, so this
 /// header needs no Vulkan header), after `vk_icdNegotiateLoaderICDInterfaceVersion`.

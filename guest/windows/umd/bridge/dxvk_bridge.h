@@ -386,3 +386,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high,
     std::uint32_t timer_resolution);
+
+// DWM presents a frame on NVK: feeds the DwmIcd=nvk crash-loop guard's healthy mark
+// (helios_bridge::note_dwm_nvk_present). Matches the cxx bridge signature in src/bridge.rs.
+void helios_dwm_nvk_present();

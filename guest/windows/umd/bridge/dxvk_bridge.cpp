@@ -3761,7 +3761,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
   }
 
   configure_dxvk_env_once(backend);
-  return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
+  auto venus = bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
       "helios_dxvk_create_device", nullptr,
       [&]() -> std::unique_ptr<HeliosDxvkDevice> {
       auto out = std::make_unique<HeliosDxvkDevice>();
@@ -3770,4 +3770,13 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
         return nullptr;
       return out;
   });
+  // DWM sent to Venus by the DwmIcd=nvk crash-loop guard, and Venus cannot make the device:
+  // NVK after all (docs/dwm-on-nvk.md 4.1) rather than a DWM that fails at every start.
+  if (!venus && helios_bridge::dwm_guard_venus_failed())
+    return helios_dxvk_create_device(luid_low, luid_high, timer_resolution);
+  return venus;
+}
+
+void helios_dwm_nvk_present() {
+  helios_bridge::note_dwm_nvk_present();
 }

@@ -6,6 +6,8 @@
 #   viewer        the C viewer's own test suite (`make check`, no display needed)
 #   stream        conduit-stream (network streaming): fmt, clippy, tests
 #   guest-agent   the guest clipboard agent's unit tests (Python, Xvfb)
+#   windows-guest-host  host tests of Windows guest driver logic that needs no
+#                 Windows (the DwmIcd=nvk crash-loop guard's decision)
 #   packaging     shellcheck the packaging scripts, check the venus submodule pins
 #                 in flake.nix and the RPM spec, check that docs/WINDOWS-KNOBS.md
 #                 matches the code, build the DKMS source package
@@ -208,6 +210,18 @@ jobs:
       - name: unittest
         working-directory: guest/agent
         run: python3 -m unittest -v test_agent test_ctl_agent
+
+  windows-guest-host:
+    # Windows guest driver logic kept free of Windows headers so it runs here,
+    # compiled from the same header the UMD builds.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: DWM crash-loop guard (umd_common/bridge/bridge_dwm_guard.h)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -o "$RUNNER_TEMP/dwm_guard_test" guest/windows/umd_common/bridge/bridge_dwm_guard_test.cpp
+          "$RUNNER_TEMP/dwm_guard_test"
 
   packaging:
     runs-on: ubuntu-24.04
