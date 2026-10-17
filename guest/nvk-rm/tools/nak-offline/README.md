@@ -50,9 +50,9 @@ Game shaders are not part of the repository.
 tools=guest/nvk-rm/tools/nak-offline
 $tools/build.sh ~/mesa-nvk-rm build-nak-offline
 B=~/mesa-nvk-rm/build-nak-offline
-$tools/run.sh $B corpus out/base
-NAK_OCC_TARGET=1 $tools/run.sh $B corpus out/occ
-$tools/compare.py --ref corpus --top 20 base=out/base occ=out/occ
+$tools/run.sh $B corpus out/occ
+NAK_OCC_TARGET=0 $tools/run.sh $B corpus out/plain
+$tools/compare.py --ref corpus --top 20 plain=out/plain occ=out/occ
 # NAK's unit tests (hardware tests need a GPU and are skipped)
 $B/src/nouveau/compiler/nak --skip hw_tests:: --skip nvdisasm_tests::
 ```
@@ -75,9 +75,10 @@ then `build.sh MESA_DIR build-dbg` builds into it. A panic aborts the
 `NAK_DEBUG=spill` makes NAK spill nearly everything, which exercises the
 spiller far more than real register pressure does.
 
-## NAK_OCC_TARGET (patches-common/0056): state
+## NAK_OCC_TARGET (patches-common/0056)
 
-Work in progress, off by default.
+On by default; `NAK_OCC_TARGET=0` turns it off (NAK then compiles as
+without the patch).
 
 - **Rematerialization** in the GPR spiller (`spill_remat.rs`). A value whose
   definition is cheap and free of side effects is evicted without a store
@@ -112,8 +113,8 @@ Work in progress, off by default.
   +171 instructions, actual +124). `NAK_OCC_TRACE=1` prints every
   candidate's estimate to stderr. `NAK_GPR_CAP` overrides the target per
   stage.
-- With the knob unset, NAK's output is identical to before (checked on the
-  whole corpus).
+- With `NAK_OCC_TARGET=0`, NAK's output is identical to NAK without the
+  patch (checked on the whole corpus).
 - Correctness, offline: the whole corpus (469 pipelines) compiles without
   an assertion failure on a debug-assertion build with `NAK_OCC_TARGET`
   0 and 1, each with and without `NAK_DEBUG=spill`. NAK's unit tests cover
@@ -121,9 +122,10 @@ Work in progress, off by default.
   reloaded through a UGPR address or a recomputed one, a chain with a
   resident input, UGPR coverage); the 9 host-runnable tests pass.
 
-Offline, on the Steel Nomad corpus (NAK_OCC_TARGET=1 vs off; ref = NVIDIA):
+Offline, on the Steel Nomad corpus (default vs `NAK_OCC_TARGET=0`;
+ref = NVIDIA):
 
-| | off | on | ref |
+| | `=0` | default | ref |
 |---|---|---|---|
 | compute: instructions / code bytes | 69910 / 1118560 | 70416 / 1126656 | — / 1042560 |
 | compute: memory spills / fills | 0 / 0 | 0 / 0 | |
@@ -138,28 +140,27 @@ Offline, on the Steel Nomad corpus (NAK_OCC_TARGET=1 vs off; ref = NVIDIA):
 | 59e22586 (fragment) | 136 / 12 / 7648 | 96 / 20 / 7781 | 128 / 16 |
 | c66d3d62 (fragment) | 136 / 12 / 2837 | 96 / 20 / 2949 | 128 / 16 |
 
-Forcing lower counts with `NAK_GPR_CAP_CS=128` and the knob on:
+Forcing lower counts with `NAK_GPR_CAP_CS=128`:
 88825d04 gets 3024 instructions and 162/105 memory spills/fills, a87cb567
 2607 and 134/87, 2a040240 20587 and 264/201.
 
-Not done yet:
+On an RTX 5090, Steel Nomad DX12 runs without crashes or GPU faults and
+faster than with `NAK_OCC_TARGET=0`.
 
-- No GPU validation: correctness and fps are unmeasured. Driver package
-  22.22.405.100 carries it with the knob off by default, for A/Bs with
-  `NAK_OCC_TARGET=1`.
-- The gain model is conservative but not calibrated against fps.
+Open points:
+
+- The gain model is conservative and not tuned per shader against fps.
 - 88825d04 and a87cb567 stop at 168: 128 needs memory spills there, mostly
   for values that are not rematerializable and are live across the
   shader's outer loop.
 
 ## Next steps
 
-1. fps A/B in Steel Nomad: `NAK_OCC_TARGET=1` vs unset, and
-   `NAK_GPR_CAP_CS`/`NAK_GPR_CAP_FS` points, to calibrate the gain model
-   (saturation, least gain, how many memory spills are tolerable).
+1. Calibrate the gain model with fps A/Bs (`NAK_GPR_CAP_CS`/`NAK_GPR_CAP_FS`
+   points against the default): saturation, least gain, how many memory
+   spills are tolerable.
 2. Spill to shared memory instead of local memory for compute shaders whose
    spare shared memory does not lower occupancy; that would let 88825d04
    and a87cb567 reach 128.
 3. Reload both halves of a vector constant at the same point with one
    64-bit load.
-4. Once validated, make NAK_OCC_TARGET default to 1.

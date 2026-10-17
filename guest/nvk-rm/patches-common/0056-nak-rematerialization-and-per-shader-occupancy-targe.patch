@@ -1,10 +1,10 @@
-From 01045d610cfd1940eb4dd40e8616df9d8691fadd Mon Sep 17 00:00:00 2001
+From 7160220e79973d6a27e4ef2e515a3ccb54251ba2 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Wed, 14 Oct 2026 01:02:43 +0200
 Subject: [PATCH] nak: rematerialization and per-shader occupancy targets
- (NAK_OCC_TARGET, WIP)
+ (NAK_OCC_TARGET)
 
-Experimental, off by default (NAK_OCC_TARGET=1 turns it on).
+On by default; NAK_OCC_TARGET=0 turns both off.
 
 Rematerialization (spill_remat.rs): when spilling GPRs, a value whose
 definition is cheap and side-effect free (copies, integer/float ALU ops,
@@ -41,11 +41,12 @@ Unit tests cover a constant-load component reloaded through a UGPR or a
 recomputed address, a chain with a resident input, and UGPR coverage.
 
 NAK_OCC_TARGET is part of nak_gpr_cap_key (bit 24) and so of the shader
-cache keys.  With NAK_OCC_TARGET unset, output is unchanged.
+cache keys.  With NAK_OCC_TARGET=0, output is the same as without this
+patch.
 ---
  src/nouveau/compiler/nak/api.rs               |   29 +-
  src/nouveau/compiler/nak/assign_regs.rs       |   25 +-
- src/nouveau/compiler/nak/gpr_cap.rs           |   38 +-
+ src/nouveau/compiler/nak/gpr_cap.rs           |   37 +-
  src/nouveau/compiler/nak/lib.rs               |    2 +
  src/nouveau/compiler/nak/liveness.rs          |   11 +
  src/nouveau/compiler/nak/occ_target.rs        |  221 +++
@@ -53,7 +54,7 @@ cache keys.  With NAK_OCC_TARGET unset, output is unchanged.
  src/nouveau/compiler/nak/spill_remat.rs       | 1187 +++++++++++++++++
  src/nouveau/compiler/nak/spill_values.rs      |  446 ++++++-
  src/nouveau/vulkan/nvk_shader.c               |    5 +-
- 10 files changed, 1906 insertions(+), 69 deletions(-)
+ 10 files changed, 1905 insertions(+), 69 deletions(-)
  create mode 100644 src/nouveau/compiler/nak/occ_target.rs
  create mode 100644 src/nouveau/compiler/nak/spill_remat.rs
 
@@ -171,23 +172,22 @@ index e0a71a6..4962473 100644
              // Re-calculate liveness one last time
              live = SimpleLiveness::for_function(f);
 diff --git a/src/nouveau/compiler/nak/gpr_cap.rs b/src/nouveau/compiler/nak/gpr_cap.rs
-index 4638e8d..629aa43 100644
+index 4638e8d..3c7b035 100644
 --- a/src/nouveau/compiler/nak/gpr_cap.rs
 +++ b/src/nouveau/compiler/nak/gpr_cap.rs
-@@ -17,6 +17,12 @@
+@@ -17,6 +17,11 @@
  //! rounded down to the allocation granularity of 8.  0, unset, or 256 and
  //! more mean no cap; caps below 24 become 24, the least register allocation
  //! can work with.  The variables are read once per process.
 +//!
-+//! NAK_OCC_TARGET=1 (default 0 while experimental) turns on
-+//! rematerialization in the spiller and the per-shader occupancy target (see
-+//! occ_target.rs).  A NAK_GPR_CAP for a stage overrides the occupancy target
-+//! of that stage; with NAK_OCC_TARGET=1 the cap's spilling rematerializes
-+//! too.
++//! NAK_OCC_TARGET (default 1) turns on rematerialization in the spiller and
++//! the per-shader occupancy target (see occ_target.rs); 0 turns both off.  A
++//! NAK_GPR_CAP for a stage overrides the occupancy target of that stage;
++//! with NAK_OCC_TARGET on, the cap's spilling rematerializes too.
  
  use crate::ir::*;
  
-@@ -59,6 +65,23 @@ fn parse_cap(var: &str, val: Result<String, env::VarError>) -> Option<u8> {
+@@ -59,6 +64,23 @@ fn parse_cap(var: &str, val: Result<String, env::VarError>) -> Option<u8> {
  }
  
  static GPR_CAPS: OnceLock<GprCaps> = OnceLock::new();
@@ -197,21 +197,21 @@ index 4638e8d..629aa43 100644
 +pub fn occ_target_enabled() -> bool {
 +    let on = OCC_TARGET.get_or_init(|| match env::var("NAK_OCC_TARGET") {
 +        Ok(s) => match s.trim() {
-+            "1" => true,
-+            "" | "0" => false,
++            "" | "1" => true,
++            "0" => false,
 +            other => {
 +                eprintln!("NAK: ignoring NAK_OCC_TARGET=\"{}\" (not 0 or 1)", other);
-+                false
++                true
 +            }
 +        },
-+        Err(_) => false,
++        Err(_) => true,
 +    });
 +    *on
 +}
  
  fn gpr_caps() -> GprCaps {
      *GPR_CAPS.get_or_init(|| {
-@@ -76,12 +99,14 @@ fn gpr_caps() -> GprCaps {
+@@ -76,12 +98,14 @@ fn gpr_caps() -> GprCaps {
  
  /// The effective caps, packed for driver cache keys: compute in bits 0-7,
  /// fragment in bits 8-15, every other stage in bits 16-23; 0 is no cap.
@@ -226,7 +226,7 @@ index 4638e8d..629aa43 100644
  }
  
  impl Shader<'_> {
-@@ -101,6 +126,15 @@ impl Shader<'_> {
+@@ -101,6 +125,15 @@ impl Shader<'_> {
              return None;
          }
  
@@ -242,7 +242,7 @@ index 4638e8d..629aa43 100644
          let hw_reserved = self.sm.hw_reserved_gprs();
          let mut need = 16;
          for f in &self.functions {
-@@ -119,8 +153,6 @@ impl Shader<'_> {
+@@ -119,8 +152,6 @@ impl Shader<'_> {
                  }
              }
          }
