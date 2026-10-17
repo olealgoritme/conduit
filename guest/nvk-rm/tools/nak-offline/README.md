@@ -200,7 +200,7 @@ What is left of the gap in the six fragment shaders (+14.7%): phi copies
 (11%), and integer address arithmetic NAK does in more instructions
 (IADD3 where the reference uses IADD with the `.U32` address forms).
 
-## More knobs (patches-common/0062-0066)
+## More knobs (patches-common/0062-0067)
 
 - **0062 `NAK_PHI_AVOID`** (on): a new value without a register preference
   stays out of the registers the block's phi copies want.  Steel Nomad
@@ -222,6 +222,21 @@ What is left of the gap in the six fragment shaders (+14.7%): phi copies
 - **0066 `NAK_VEC_CSE`** (on): the copies that make a splat (an image store
   of `vec4(x)`) a register vector serve its later uses in the block.  CS2
   compute 0x7e5de6c5 2672 -> 2363 instructions.
+
+- **0067 `NAK_WEAK_MEM`** (off): global, SSBO and image loads and stores
+  that are not coherent, volatile or atomic use the weak memory order
+  instead of `.STRONG.GPU`.  The reference's code for the same shaders uses
+  weak (plain `LDG.E`, order field 0), so its loads can hit in L1; NAK's
+  strong GPU-scope loads all go to L2.  Barriers keep their CCTL write-back
+  and invalidate.  In GPU timing, 2a040240's light path (24 loads, 25 stores
+  per thread) takes 7 times the reference's time; validate with naktest
+  (`wgsync`) and in games before turning it on.
+
+What GPU timing showed beyond instruction counts: loop-heavy compute shaders
+(eee8a710, 7bd2b130) spend about 40% of their inner loop on register copies
+(phi copies around a structurizer state machine) and on BSSY/BSYNC/NOP,
+where the reference's loop has about three copies; better phi coalescing in
+register allocation is the next step there.
 
 NAK knobs that do not fit in `nak_gpr_cap_key()` are in `nak_knobs_key()`,
 which NVK puts into bits 0-11 and 56-63 of its compiler flags.
