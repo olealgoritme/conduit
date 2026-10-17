@@ -1279,6 +1279,31 @@ class = "debug"
 read = "surface capability query"
 effect = "1 reports only FIFO as a Win32 present mode; 0 also offers the immediate and mailbox modes."
 
+[env.NAK_GPR_CAP]
+class = "experiment"
+read = "device creation (once per process)"
+effect = "Caps the registers per thread NAK gives every shader stage, counted as the hardware allocates them (and NVK_SHADER_STATS reports them, the 2 reserved GPRs included) and rounded down to a multiple of 8; the pre-RA scheduler schedules for the cap and register allocation spills what does not fit, trading spills for occupancy. Unset, 0 or 256 and up: no cap; below 24 counts as 24. Part of the shader cache key."
+
+[env.NAK_GPR_CAP_CS]
+class = "experiment"
+read = "device creation (once per process)"
+effect = "NAK_GPR_CAP for compute shaders only, overriding NAK_GPR_CAP; 0 leaves compute shaders uncapped."
+
+[env.NAK_GPR_CAP_FS]
+class = "experiment"
+read = "device creation (once per process)"
+effect = "NAK_GPR_CAP for fragment shaders only, overriding NAK_GPR_CAP; 0 leaves fragment shaders uncapped."
+
+[env.NAK_OCC_TARGET]
+class = "tuning"
+read = "device creation (once per process)"
+effect = "On by default (unset or 1); 0 turns it off. Rematerialization in NAK's GPR spiller (cheap values such as constants, constant-buffer and constant-memory loads, thread/CTA IDs and short ALU chains are recomputed at reloads instead of going to local memory; constant-memory loads through a constant-buffer address reload with one LDG from a UGPR copy of the address) and a per-shader register target: after scheduling, NAK estimates the cost of spilling down to each lower register count that gives more warps per SM (workgroup and shared memory limits included) and uses the one with the best estimated gain, never one that needs more than a few memory spills or any inside a loop. A NAK_GPR_CAP for a stage overrides the target of that stage and then spills with rematerialization. Part of the shader cache key."
+
+[env.NAK_OCC_TRACE]
+class = "debug"
+read = "first shader compile (once per process)"
+effect = "1 prints NAK_OCC_TARGET's estimate for every candidate register count of every shader to stderr (cost, memory spills, gain, rejected or not)."
+
 [env.NVK_BLACKWELL_MME_MEMBAR]
 class = "debug"
 read = "device creation"

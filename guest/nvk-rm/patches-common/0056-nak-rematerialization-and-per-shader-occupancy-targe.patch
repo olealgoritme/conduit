@@ -1,0 +1,2522 @@
+From 7160220e79973d6a27e4ef2e515a3ccb54251ba2 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Wed, 14 Oct 2026 01:02:43 +0200
+Subject: [PATCH] nak: rematerialization and per-shader occupancy targets
+ (NAK_OCC_TARGET)
+
+On by default; NAK_OCC_TARGET=0 turns both off.
+
+Rematerialization (spill_remat.rs): when spilling GPRs, a value whose
+definition is cheap and side-effect free (copies, integer/float ALU ops,
+conversions, invariant system values, cbuf loads, global loads from
+constant memory, one 32-bit component of a vector load) and whose inputs
+are available wherever it is live (immediates, bound cbufs, scalar UGPRs
+whose live range covers it, or other such values recomputed first, up to 3
+levels and 4 instructions) is evicted without a store and recomputed at
+each reload.  Inputs still resident at the reload point are used instead
+of being recomputed.  A reload that needs a temporary register makes room
+for it in the spiller.
+
+Constant-memory loads whose 64-bit address is two words of a bound
+constant buffer (vkd3d-proton's root CBVs) reload with a single
+LDG [rZ + UR]: the address is loaded once into a pinned UGPR pair at the
+start of the uniform entry block and shared by every reload from it, when
+the UGPR file has room for it across the whole shader.
+
+The spiller's eviction choice becomes next-use distance per restore cost,
+values not used in the current loop first, and merge blocks no longer
+refill rematerializable values on incoming edges.
+
+Occupancy target (occ_target.rs): after pre-RA scheduling, the shader's
+occupancy is computed with the workgroup and shared memory limits; for
+each lower register count that gives more warps, a dry run of the spiller
+estimates the loop-weighted cost and the memory spills and fills it needs.
+A count that needs more than 4 memory spills/fills, or any inside a loop,
+is never chosen; of the others, the one with the best estimated gain
+sqrt(min(warps', 32) / min(warps, 32)) / (1 + cost / work), if at least
+1.05, is scheduled for and spilled to.  NAK_GPR_CAP overrides it per
+stage.  NAK_OCC_TRACE=1 prints the estimates.
+
+Unit tests cover a constant-load component reloaded through a UGPR or a
+recomputed address, a chain with a resident input, and UGPR coverage.
+
+NAK_OCC_TARGET is part of nak_gpr_cap_key (bit 24) and so of the shader
+cache keys.  With NAK_OCC_TARGET=0, output is the same as without this
+patch.
+---
+ src/nouveau/compiler/nak/api.rs               |   29 +-
+ src/nouveau/compiler/nak/assign_regs.rs       |   25 +-
+ src/nouveau/compiler/nak/gpr_cap.rs           |   37 +-
+ src/nouveau/compiler/nak/lib.rs               |    2 +
+ src/nouveau/compiler/nak/liveness.rs          |   11 +
+ src/nouveau/compiler/nak/occ_target.rs        |  221 +++
+ .../compiler/nak/opt_instr_sched_prepass.rs   |   11 +-
+ src/nouveau/compiler/nak/spill_remat.rs       | 1187 +++++++++++++++++
+ src/nouveau/compiler/nak/spill_values.rs      |  446 ++++++-
+ src/nouveau/vulkan/nvk_shader.c               |    5 +-
+ 10 files changed, 1905 insertions(+), 69 deletions(-)
+ create mode 100644 src/nouveau/compiler/nak/occ_target.rs
+ create mode 100644 src/nouveau/compiler/nak/spill_remat.rs
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 597e963..c8a6c91 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -6,6 +6,7 @@ use crate::ir::{
+     max_warps_per_sm, ShaderInfo, ShaderIoInfo, ShaderModel, ShaderModelInfo,
+     ShaderStageInfo,
+ };
++use crate::gpr_cap::occ_target_enabled;
+ use crate::sph;
+ 
+ use compiler::bindings::*;
+@@ -539,8 +540,32 @@ fn nak_compile_shader_internal(
+     pass!(s, opt_out);
+     pass!(s, legalize);
+     pass!(s, opt_dce);
+-    pass!(s, opt_instr_sched_prepass);
+-    pass!(s, assign_regs);
++    // NAK_GPR_CAP overrides the occupancy target of its stage
++    let gpr_cap = s.gpr_cap();
++    let occ_target = occ_target_enabled();
++    s.opt_instr_sched_prepass_target(gpr_cap);
++    if DEBUG.print() {
++        eprintln!("NAK IR after opt_instr_sched_prepass:\n{}", &s);
++    }
++    let mut gpr_target = gpr_cap;
++    if occ_target && gpr_cap.is_none() {
++        gpr_target = s.choose_gpr_target();
++        if let Some(t) = gpr_target {
++            // Schedule again for the target so there is less to spill
++            s.opt_instr_sched_prepass_target(Some(t));
++            if DEBUG.print() {
++                eprintln!(
++                    "NAK IR after opt_instr_sched_prepass for {} GPRs:\n{}",
++                    t + s.sm.hw_reserved_gprs(),
++                    &s
++                );
++            }
++        }
++    }
++    s.assign_regs_target(gpr_target, occ_target);
++    if DEBUG.print() {
++        eprintln!("NAK IR after assign_regs:\n{}", &s);
++    }
+     pass!(s, lower_par_copies);
+     pass!(s, lower_copy_swap);
+     if nak.sm >= 70 {
+diff --git a/src/nouveau/compiler/nak/assign_regs.rs b/src/nouveau/compiler/nak/assign_regs.rs
+index e0a71a6..4962473 100644
+--- a/src/nouveau/compiler/nak/assign_regs.rs
++++ b/src/nouveau/compiler/nak/assign_regs.rs
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: MIT
+ 
+ use crate::api::{GetDebugFlags, DEBUG};
++use crate::gpr_cap::occ_target_enabled;
+ use crate::ir::*;
+ use crate::liveness::{BlockLiveness, Liveness, SimpleLiveness};
+ 
+@@ -1414,9 +1415,17 @@ impl AssignRegsBlock {
+ }
+ 
+ impl Shader<'_> {
++    #[allow(dead_code)]
+     pub fn assign_regs(&mut self) {
++        let cap = self.gpr_cap();
++        self.assign_regs_target(cap, occ_target_enabled());
++    }
++
++    /// Register allocation spilling down to @gpr_cap GPRs (not counting the
++    /// hardware-reserved ones) if set, else to the hardware maximum.  With
++    /// @smart, spilling rematerializes (see Function::spill_values).
++    pub fn assign_regs_target(&mut self, gpr_cap: Option<u32>, smart: bool) {
+         assert!(self.functions.len() == 1);
+-        let gpr_cap = self.gpr_cap();
+         let f = &mut self.functions[0];
+ 
+         // Convert to CSSA before we spill or assign registers
+@@ -1433,7 +1442,7 @@ impl Shader<'_> {
+         for file in spill_files {
+             let num_regs = self.sm.num_regs(file);
+             if max_live[file] > num_regs {
+-                f.spill_values(file, num_regs, &mut self.info);
++                f.spill_values(file, num_regs, &mut self.info, false, 0);
+ 
+                 // Re-calculate liveness after we spill
+                 live = SimpleLiveness::for_function(f);
+@@ -1487,7 +1496,8 @@ impl Shader<'_> {
+             );
+         }
+ 
+-        // NAK_GPR_CAP: spill down to the cap instead of the hardware maximum
++        // NAK_GPR_CAP or the occupancy target: spill down to it instead of
++        // the hardware maximum
+         if let Some(cap) = gpr_cap {
+             max_gprs = min(max_gprs, cap);
+         }
+@@ -1500,7 +1510,14 @@ impl Shader<'_> {
+             total_gprs = max_gprs;
+             gpr_limit = total_gprs - u32::from(tmp_gprs);
+ 
+-            f.spill_values(RegFile::GPR, gpr_limit, &mut self.info);
++            let num_ugprs = self.sm.num_regs(RegFile::UGPR);
++            f.spill_values(
++                RegFile::GPR,
++                gpr_limit,
++                &mut self.info,
++                smart,
++                num_ugprs,
++            );
+ 
+             // Re-calculate liveness one last time
+             live = SimpleLiveness::for_function(f);
+diff --git a/src/nouveau/compiler/nak/gpr_cap.rs b/src/nouveau/compiler/nak/gpr_cap.rs
+index 4638e8d..3c7b035 100644
+--- a/src/nouveau/compiler/nak/gpr_cap.rs
++++ b/src/nouveau/compiler/nak/gpr_cap.rs
+@@ -17,6 +17,11 @@
+ //! rounded down to the allocation granularity of 8.  0, unset, or 256 and
+ //! more mean no cap; caps below 24 become 24, the least register allocation
+ //! can work with.  The variables are read once per process.
++//!
++//! NAK_OCC_TARGET (default 1) turns on rematerialization in the spiller and
++//! the per-shader occupancy target (see occ_target.rs); 0 turns both off.  A
++//! NAK_GPR_CAP for a stage overrides the occupancy target of that stage;
++//! with NAK_OCC_TARGET on, the cap's spilling rematerializes too.
+ 
+ use crate::ir::*;
+ 
+@@ -59,6 +64,23 @@ fn parse_cap(var: &str, val: Result<String, env::VarError>) -> Option<u8> {
+ }
+ 
+ static GPR_CAPS: OnceLock<GprCaps> = OnceLock::new();
++static OCC_TARGET: OnceLock<bool> = OnceLock::new();
++
++/// NAK_OCC_TARGET: rematerialization and per-shader occupancy targets
++pub fn occ_target_enabled() -> bool {
++    let on = OCC_TARGET.get_or_init(|| match env::var("NAK_OCC_TARGET") {
++        Ok(s) => match s.trim() {
++            "" | "1" => true,
++            "0" => false,
++            other => {
++                eprintln!("NAK: ignoring NAK_OCC_TARGET=\"{}\" (not 0 or 1)", other);
++                true
++            }
++        },
++        Err(_) => true,
++    });
++    *on
++}
+ 
+ fn gpr_caps() -> GprCaps {
+     *GPR_CAPS.get_or_init(|| {
+@@ -76,12 +98,14 @@ fn gpr_caps() -> GprCaps {
+ 
+ /// The effective caps, packed for driver cache keys: compute in bits 0-7,
+ /// fragment in bits 8-15, every other stage in bits 16-23; 0 is no cap.
++/// Bit 24 is set with NAK_OCC_TARGET on.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nak_gpr_cap_key() -> u32 {
+     let c = gpr_caps();
+     u32::from(c.compute)
+         | (u32::from(c.fragment) << 8)
+         | (u32::from(c.other) << 16)
++        | (u32::from(occ_target_enabled()) << 24)
+ }
+ 
+ impl Shader<'_> {
+@@ -101,6 +125,15 @@ impl Shader<'_> {
+             return None;
+         }
+ 
++        let hw_reserved = self.sm.hw_reserved_gprs();
++        Some(max(u32::from(cap), self.gpr_floor()) - hw_reserved)
++    }
++
++    /// The fewest GPRs, as allocated (with the hardware-reserved ones), that
++    /// register allocation can spill down to for this shader: 16 for any
++    /// instruction's vector operands or all of an OpRegOut's sources, plus 2
++    /// parallel-copy temporaries, rounded up to 8.
++    pub fn gpr_floor(&self) -> u32 {
+         let hw_reserved = self.sm.hw_reserved_gprs();
+         let mut need = 16;
+         for f in &self.functions {
+@@ -119,8 +152,6 @@ impl Shader<'_> {
+                 }
+             }
+         }
+-        let floor = (need + 2 + hw_reserved).next_multiple_of(8);
+-
+-        Some(max(u32::from(cap), floor) - hw_reserved)
++        (need + 2 + hw_reserved).next_multiple_of(8)
+     }
+ }
+diff --git a/src/nouveau/compiler/nak/lib.rs b/src/nouveau/compiler/nak/lib.rs
+index 9404987..4689718 100644
+--- a/src/nouveau/compiler/nak/lib.rs
++++ b/src/nouveau/compiler/nak/lib.rs
+@@ -13,6 +13,7 @@ mod legalize;
+ mod liveness;
+ mod lower_copy_swap;
+ mod lower_par_copies;
++mod occ_target;
+ mod opt_bar_prop;
+ mod opt_copy_prop;
+ mod opt_crs;
+@@ -38,6 +39,7 @@ mod sm70_encode;
+ mod sm75_instr_latencies;
+ mod sm80_instr_latencies;
+ mod sph;
++mod spill_remat;
+ mod spill_values;
+ mod ssa_value;
+ mod to_cssa;
+diff --git a/src/nouveau/compiler/nak/liveness.rs b/src/nouveau/compiler/nak/liveness.rs
+index de87d99..9daad7d 100644
+--- a/src/nouveau/compiler/nak/liveness.rs
++++ b/src/nouveau/compiler/nak/liveness.rs
+@@ -459,6 +459,17 @@ impl NextUseBlockLiveness {
+         }
+     }
+ 
++    /// Returns the IP of the last use of @val inside this block, if any
++    pub fn last_use_in_block(&self, val: &SSAValue) -> Option<usize> {
++        let entry = self.ssa_map.get(val)?;
++        entry
++            .uses
++            .iter()
++            .rev()
++            .find(|u| **u < self.num_instrs)
++            .cloned()
++    }
++
+     /// Returns the IP of the first use of @val which is greater than or equal
+     /// to @ip
+     ///
+diff --git a/src/nouveau/compiler/nak/occ_target.rs b/src/nouveau/compiler/nak/occ_target.rs
+new file mode 100644
+index 0000000..c4c9b23
+--- /dev/null
++++ b/src/nouveau/compiler/nak/occ_target.rs
+@@ -0,0 +1,221 @@
++// Copyright © 2026 Conduit contributors
++// SPDX-License-Identifier: MIT
++
++//! Per-shader occupancy target (NAK_OCC_TARGET)
++//!
++//! The pre-RA scheduler reaches the lowest occupancy cliff it can without
++//! spilling, and register allocation then uses as many GPRs as that
++//! schedule needs.  For shaders whose register demand is inherently high,
++//! occupancy stays low even when a few cheap rematerializations or spills
++//! would buy many more resident warps.
++//!
++//! After scheduling, this pass computes the shader's occupancy as the
++//! hardware does (registers per warp, and for compute shaders whole
++//! workgroups and their shared memory), and for each lower register count
++//! that gives more warps, estimates the cost of spilling down to it with a
++//! dry run of the spiller (rematerialization included, loop-weighted, see
++//! Function::spill_gpr_cost).
++//!
++//! The model is deliberately conservative, since a wrong choice costs more
++//! than a missed one:
++//!
++//!  - A count whose dry run needs more than a handful of memory spills and
++//!    fills, or any inside a loop, is never chosen: local memory traffic is
++//!    what made a plain register cap slower.  Reductions that
++//!    rematerialization alone pays for are what this is for.
++//!  - Of the rest, it picks the count with the best estimated gain, if any
++//!    is at least MIN_GAIN:
++//!
++//!      gain = sqrt(min(warps', S) / min(warps, S)) / (1 + cost / work)
++//!
++//!    where work is the shader's loop-weighted instruction count and S is
++//!    SATURATION_WARPS.  The square root and the saturation stand for the
++//!    diminishing returns of more warps.  The dry run sees the schedule made
++//!    for the natural count; the schedule made for the target needs less
++//!    spill code than that, so the estimate errs high.
++//!
++//! When shared memory or the workgroup size limits occupancy, fewer
++//! registers gain nothing and the shader is left alone.  The chosen count is
++//! then scheduled for and spilled to like NAK_GPR_CAP.
++//!
++//! NAK_OCC_TRACE=1 prints each candidate's estimate to stderr.
++
++use crate::ir::*;
++use crate::liveness::{Liveness, SimpleLiveness};
++use crate::spill_values::{loop_weight, DryCost};
++
++use std::cmp::{max, min};
++use std::env;
++use std::sync::OnceLock;
++
++/// Warps beyond which more occupancy is assumed to gain nothing
++const SATURATION_WARPS: u32 = 32;
++
++/// Least estimated gain worth spilling for
++const MIN_GAIN: f64 = 1.05;
++
++/// Most memory spills and fills (static count) a target may need; none of
++/// them may be inside a loop
++const MAX_MEM_OPS: u32 = 4;
++
++fn occ_trace() -> bool {
++    static TRACE: OnceLock<bool> = OnceLock::new();
++    *TRACE.get_or_init(|| {
++        env::var("NAK_OCC_TRACE").is_ok_and(|v| v.trim() == "1")
++    })
++}
++
++/// True if a dry run's memory spills and fills are few enough
++fn mem_ok(d: &DryCost) -> bool {
++    d.mem_ops <= MAX_MEM_OPS && d.mem_weighted == u64::from(d.mem_ops)
++}
++
++/// Most occupancy cliffs below the natural register count to evaluate
++const MAX_CANDIDATES: usize = 3;
++
++/// Shared memory per SM a compute shader can get, in bytes
++fn smem_per_sm(sm: u8) -> u32 {
++    match sm {
++        0..=69 => 48 * 1024,
++        70..=72 => 96 * 1024,
++        73..=79 => 64 * 1024,
++        80 | 87 => 164 * 1024,
++        90..=109 => 228 * 1024,
++        _ => 100 * 1024,
++    }
++}
++
++/// Most resident CTAs per SM
++fn max_ctas_per_sm(sm: u8) -> u32 {
++    match sm {
++        73..=79 => 16,
++        _ => 32,
++    }
++}
++
++/// Shared memory the hardware reserves per CTA (SM80 and later)
++fn smem_reserved_per_cta(sm: u8) -> u32 {
++    if sm >= 80 {
++        1024
++    } else {
++        0
++    }
++}
++
++impl Shader<'_> {
++    /// Resident warps per SM with @gprs registers per thread (as allocated,
++    /// with the hardware-reserved ones), including the workgroup and shared
++    /// memory limits of compute shaders
++    pub fn occupancy(&self, gprs: u32) -> u32 {
++        let warps = max_warps_per_sm(self.sm, gprs);
++        let ShaderStageInfo::Compute(cs) = &self.info.stage else {
++            return warps;
++        };
++        let threads = u32::from(cs.local_size[0])
++            * u32::from(cs.local_size[1])
++            * u32::from(cs.local_size[2]);
++        let warps_per_cta = max(1, threads.div_ceil(32));
++        let mut ctas = min(max_ctas_per_sm(self.sm.sm()), warps / warps_per_cta);
++        if cs.smem_size > 0 {
++            let per_cta =
++                u32::from(cs.smem_size) + smem_reserved_per_cta(self.sm.sm());
++            ctas = min(ctas, smem_per_sm(self.sm.sm()) / per_cta);
++        }
++        ctas * warps_per_cta
++    }
++
++    /// Chooses the register target for this shader after pre-RA scheduling:
++    /// the most GPRs register allocation may use, not counting the
++    /// hardware-reserved ones, or None to keep the natural count.  The
++    /// function is put in CSSA form (assign_regs does that first anyway).
++    pub fn choose_gpr_target(&mut self) -> Option<u32> {
++        assert!(self.functions.len() == 1);
++        let hw_reserved = self.sm.hw_reserved_gprs();
++        let floor = self.gpr_floor();
++
++        let mut hw_max = self.sm.num_regs(RegFile::GPR);
++        if let ShaderStageInfo::Compute(cs) = &self.info.stage {
++            hw_max = min(
++                hw_max,
++                gpr_limit_from_local_size(&cs.local_size) - hw_reserved,
++            );
++        }
++
++        let f = &mut self.functions[0];
++        f.to_cssa();
++        let live = SimpleLiveness::for_function(f);
++        let max_live = live.calc_max_live(f);
++        let total = max(max_live[RegFile::GPR], 16) + 1;
++        if total > hw_max {
++            // Already spilling
++            return None;
++        }
++        let natural = (total + hw_reserved).next_multiple_of(8);
++        let w0 = self.occupancy(natural);
++
++        // Occupancy cliffs below the natural count
++        let mut cands = Vec::new();
++        let mut a = natural;
++        while a >= floor + 8 && cands.len() < MAX_CANDIDATES {
++            a -= 8;
++            if self.occupancy(a) > self.occupancy(a + 8)
++                && self.occupancy(a) > w0
++            {
++                cands.push(a);
++            }
++        }
++        if cands.is_empty() {
++            return None;
++        }
++
++        let f = &mut self.functions[0];
++        let mut work = 0_u64;
++        let mut num_instrs = 0_u64;
++        for b_idx in 0..f.blocks.len() {
++            let n = u64::try_from(f.blocks[b_idx].instrs.len()).unwrap();
++            num_instrs += n;
++            work += n * loop_weight(f.blocks.loop_depth(b_idx));
++        }
++        let work = max(work, 1) as f64;
++
++        let num_ugprs = self.sm.num_regs(RegFile::UGPR);
++        let sat = |w: u32| f64::from(min(w, SATURATION_WARPS));
++        let mut best: Option<(f64, u32)> = None;
++        for a in cands {
++            let warps = self.occupancy(a);
++            let benefit = (sat(warps) / sat(w0)).sqrt();
++            if benefit <= MIN_GAIN {
++                continue;
++            }
++            // assign_regs reserves 2 GPRs for parallel copies when spilling
++            let limit = a - hw_reserved - 2;
++            let f = &mut self.functions[0];
++            let d = f.spill_gpr_cost(limit, num_ugprs, &mut self.info);
++            let gain = benefit / (1.0 + d.cost as f64 / work);
++            let ok = mem_ok(&d) && gain >= MIN_GAIN;
++            if occ_trace() {
++                eprintln!(
++                    "NAK_OCC_TRACE: {} GPRs {} warps -> {} GPRs {} warps: \
++                     cost {:.1}% of work, {} instrs added of {}, \
++                     {} memory ops ({} weighted), gain {:.3}{}",
++                    natural,
++                    w0,
++                    a,
++                    warps,
++                    100.0 * d.cost as f64 / work,
++                    d.instrs,
++                    num_instrs,
++                    d.mem_ops,
++                    d.mem_weighted,
++                    gain,
++                    if ok { "" } else { " (rejected)" },
++                );
++            }
++            if ok && best.is_none_or(|(g, _)| gain > g) {
++                best = Some((gain, a));
++            }
++        }
++
++        best.map(|(_, a)| a - hw_reserved)
++    }
++}
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+index af6b99f..d2d7904 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+@@ -1039,7 +1039,11 @@ impl Shader<'_> {
+     ///     international conference on Supercomputing (ICS '88). Association
+     ///     for Computing Machinery, New York, NY, USA, 442–452.
+     ///     https://doi.org/10.1145/55364.55407
+-    pub fn opt_instr_sched_prepass(&mut self) {
++    ///
++    /// The schedule is for at most @gpr_target GPRs (not counting the
++    /// hardware-reserved ones), as for NAK_GPR_CAP or the occupancy target;
++    /// None schedules for the hardware maximum.
++    pub fn opt_instr_sched_prepass_target(&mut self, gpr_target: Option<u32>) {
+         if DEBUG.annotate() {
+             self.remove_annotations();
+         }
+@@ -1056,8 +1060,9 @@ impl Shader<'_> {
+                 .unwrap(),
+             );
+         }
+-        // NAK_GPR_CAP: schedule for the same limit assign_regs spills to
+-        if let Some(cap) = self.gpr_cap() {
++        // NAK_GPR_CAP or the occupancy target: schedule for the same limit
++        // assign_regs spills to
++        if let Some(cap) = gpr_target {
+             max_regs[RegFile::GPR] =
+                 min(max_regs[RegFile::GPR], cap.try_into().unwrap());
+         }
+diff --git a/src/nouveau/compiler/nak/spill_remat.rs b/src/nouveau/compiler/nak/spill_remat.rs
+new file mode 100644
+index 0000000..b74852e
+--- /dev/null
++++ b/src/nouveau/compiler/nak/spill_remat.rs
+@@ -0,0 +1,1187 @@
++// Copyright © 2026 Conduit contributors
++// SPDX-License-Identifier: MIT
++
++//! Rematerialization for GPR spilling
++//!
++//! A GPR value whose definition is cheap and whose inputs are available
++//! wherever the value is live does not need to go to local memory when the
++//! spiller evicts it: it is recomputed at each reload instead, and evicting
++//! it costs no store.  This module finds those values and builds the
++//! instructions that recompute them.
++//!
++//! A value is rematerializable when its defining instruction is one of a
++//! small set of side-effect-free operations (copies, integer and float ALU
++//! ops, conversions, invariant system values such as the thread and CTA
++//! IDs, constant-buffer loads with a GPR offset, and global loads from
++//! constant memory) and every source is
++//!
++//!  - an immediate, rZ/pT/pF, or a bound constant buffer reference, which
++//!    are the same everywhere,
++//!  - a scalar UGPR whose live range covers the value's live range, so it
++//!    still holds the same value at any reload point (in strict SSA a
++//!    source that is live at a point where the value is live holds the
++//!    instance the value was computed from), or
++//!  - a GPR value that is itself rematerializable, recomputed into a
++//!    temporary first (a chain of at most a few instructions).
++//!
++//! Recomputing a chain needs temporaries next to the value's own register:
++//! `RematCost::extra` counts the registers a reload needs beyond that one,
++//! and the spiller makes room for them.
++//!
++//! Constant-memory loads through a 64-bit address that comes straight from
++//! a bound constant buffer (vkd3d-proton's root CBVs, loaded through a BDA
++//! pointer in a root constant) are the common case.  Recomputing the
++//! address would take two moves per reload, so instead the address is
++//! loaded once into a pinned UGPR pair at the start of the (uniform) entry
++//! block, shared by every reload from that base, and each reload is a
++//! single `LDG [rZ + UR]`.  That needs room in the UGPR file for the whole
++//! shader; without it, or on hardware without UGPRs, the address is
++//! recomputed.
++
++use crate::ir::*;
++use crate::liveness::{
++    BlockLiveness, Liveness, NextUseLiveness, SimpleLiveness,
++};
++
++use rustc_hash::{FxHashMap, FxHashSet};
++use std::cmp::{max, min};
++
++/// Longest chain of definitions a reload may recompute
++const MAX_DEPTH: u32 = 3;
++
++/// Most instructions one reload may take
++const MAX_INSTRS: u32 = 4;
++
++/// Most registers one reload may need beyond the value's own register
++pub const MAX_EXTRA: u32 = 1;
++
++/// Most constant-buffer addresses kept in pinned UGPR pairs
++const MAX_UBASES: usize = 4;
++
++#[derive(Clone, Copy, Debug, Default)]
++pub struct RematCost {
++    /// Instructions per reload
++    pub instrs: u32,
++    /// Registers a reload needs beyond the value's own register
++    pub extra: u32,
++    /// Estimated cost of a reload in issue slots (memory loads count more)
++    pub cost: u32,
++}
++
++/// The cost of one reload from local memory in the same units as
++/// `RematCost::cost`.  A store (once per spilled value) costs the same.
++pub const MEM_FILL_COST: u32 = 8;
++
++/// System values that are the same wherever a thread reads them
++fn is_invariant_sr(idx: u8) -> bool {
++    matches!(
++        idx,
++        0x00 // SR_LANEID
++            | 0x20..=0x23 // SR_TID, SR_TID.X/Y/Z
++            | 0x25..=0x27 // SR_CTAID.X/Y/Z
++            | 0x38..=0x3c // SR_LANEMASK_*
++    )
++}
++
++pub fn op_cost(op: &Op) -> u32 {
++    match op {
++        Op::Ld(_) => 4,
++        Op::Ldc(_) | Op::S2R(_) => 2,
++        _ => 1,
++    }
++}
++
++/// Clones a rematerializable instruction with every destination cleared.
++/// Returns None for anything not on the list.
++fn clone_op(op: &Op) -> Option<Op> {
++    let op: Op = match op {
++        Op::Copy(op) => OpCopy {
++            dst: Dst::None,
++            src: op.src.clone(),
++        }
++        .into(),
++        Op::S2R(op) => {
++            if !is_invariant_sr(op.idx) {
++                return None;
++            }
++            OpS2R {
++                dst: Dst::None,
++                idx: op.idx,
++            }
++            .into()
++        }
++        Op::IAdd3(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.overflow = [Dst::None, Dst::None];
++            op.into()
++        }
++        Op::Lea(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.overflow = Dst::None;
++            op.into()
++        }
++        Op::Lop3(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.into()
++        }
++        Op::Shf(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.into()
++        }
++        Op::Shl(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.into()
++        }
++        Op::Shr(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.into()
++        }
++        Op::IMnMx(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.into()
++        }
++        Op::Prmt(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.into()
++        }
++        Op::IAbs(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.into()
++        }
++        Op::IMad(op) => OpIMad {
++            dst: Dst::None,
++            srcs: op.srcs.clone(),
++            signed: op.signed,
++        }
++        .into(),
++        Op::IMul(op) => OpIMul {
++            dst: Dst::None,
++            srcs: op.srcs.clone(),
++            signed: op.signed,
++            high: op.high,
++        }
++        .into(),
++        Op::Mov(op) => OpMov {
++            dst: Dst::None,
++            src: op.src.clone(),
++            quad_lanes: op.quad_lanes,
++        }
++        .into(),
++        Op::F2F(op) => OpF2F {
++            dst: Dst::None,
++            src: op.src.clone(),
++            src_type: op.src_type,
++            dst_type: op.dst_type,
++            rnd_mode: op.rnd_mode,
++            ftz: op.ftz,
++            integer_rnd: op.integer_rnd,
++        }
++        .into(),
++        Op::F2FP(op) => OpF2FP {
++            dst: Dst::None,
++            srcs: op.srcs.clone(),
++            rnd_mode: op.rnd_mode,
++        }
++        .into(),
++        Op::I2F(op) => OpI2F {
++            dst: Dst::None,
++            src: op.src.clone(),
++            dst_type: op.dst_type,
++            src_type: op.src_type,
++            rnd_mode: op.rnd_mode,
++        }
++        .into(),
++        Op::I2I(op) => OpI2I {
++            dst: Dst::None,
++            src: op.src.clone(),
++            src_type: op.src_type,
++            dst_type: op.dst_type,
++            saturate: op.saturate,
++            abs: op.abs,
++            neg: op.neg,
++        }
++        .into(),
++        Op::FAdd(op) => OpFAdd {
++            dst: Dst::None,
++            srcs: op.srcs.clone(),
++            saturate: op.saturate,
++            rnd_mode: op.rnd_mode,
++            ftz: op.ftz,
++        }
++        .into(),
++        Op::FMul(op) => OpFMul {
++            dst: Dst::None,
++            srcs: op.srcs.clone(),
++            saturate: op.saturate,
++            rnd_mode: op.rnd_mode,
++            ftz: op.ftz,
++            dnz: op.dnz,
++        }
++        .into(),
++        Op::FFma(op) => OpFFma {
++            dst: Dst::None,
++            srcs: op.srcs.clone(),
++            saturate: op.saturate,
++            rnd_mode: op.rnd_mode,
++            ftz: op.ftz,
++            dnz: op.dnz,
++        }
++        .into(),
++        Op::FMnMx(op) => OpFMnMx {
++            dst: Dst::None,
++            srcs: op.srcs.clone(),
++            min: op.min.clone(),
++            ftz: op.ftz,
++        }
++        .into(),
++        Op::Ldc(op) => {
++            let mut op = op.clone();
++            op.dst = Dst::None;
++            op.into()
++        }
++        Op::Ld(op) => {
++            // Only loads from memory that cannot change while the shader
++            // runs
++            if !matches!(op.access.space, MemSpace::Global(_))
++                || op.access.order != MemOrder::Constant
++            {
++                return None;
++            }
++            OpLd {
++                dst: Dst::None,
++                addr: op.addr.clone(),
++                uniform_addr: op.uniform_addr.clone(),
++                pred: op.pred.clone(),
++                offset: op.offset,
++                stride: op.stride,
++                access: op.access.clone(),
++            }
++            .into()
++        }
++        _ => return None,
++    };
++    Some(op)
++}
++
++/// Sets the main destination of an op made by clone_op
++fn set_dst(op: &mut Op, dst: Dst) {
++    let dsts = op.dsts_as_mut_slice();
++    debug_assert!(dsts.iter().all(|d| d.is_none()));
++    dsts[0] = dst;
++}
++
++/// Builds the template for recomputing `ssa`, defined by `instr`: the
++/// instruction with its destinations cleared, and for a component of a
++/// vector load, a 32-bit load of that component alone.
++fn make_template(instr: &Instr, ssa: SSAValue) -> Option<Op> {
++    if !instr.pred.is_true() || instr.is_uniform() {
++        return None;
++    }
++
++    // The value must be the only GPR destination, except for loads, where
++    // we load just its component
++    let dst = instr.dsts().first()?;
++    let vec = dst.as_ssa()?;
++    let comp = vec.iter().position(|v| *v == ssa)?;
++    if vec.comps() > 1 {
++        let Op::Ld(ld) = &instr.op else {
++            return None;
++        };
++        let bytes = match ld.access.mem_type {
++            MemType::B64 => 8,
++            MemType::B128 => 16,
++            _ => return None,
++        };
++        if usize::from(vec.comps()) * 4 != bytes {
++            return None;
++        }
++        let mut op = clone_op(&instr.op)?;
++        let Op::Ld(new_ld) = &mut op else {
++            unreachable!();
++        };
++        new_ld.access.mem_type = MemType::B32;
++        new_ld.offset += i32::try_from(comp * 4).unwrap();
++        return check_srcs(op);
++    }
++    for d in &instr.dsts()[1..] {
++        // Extra destinations (carry-outs) must be unused predicates: they
++        // are dropped from the copy
++        match d {
++            Dst::None => (),
++            Dst::SSA(v) if v.file() == RegFile::Pred => (),
++            _ => return None,
++        }
++    }
++    check_srcs(clone_op(&instr.op)?)
++}
++
++fn check_srcs(op: Op) -> Option<Op> {
++    for src in op.srcs_as_slice() {
++        match &src.src_ref {
++            SrcRef::Zero | SrcRef::True | SrcRef::False | SrcRef::Imm32(_) => {
++            }
++            SrcRef::CBuf(cb) => {
++                if !matches!(cb.buf, CBuf::Binding(_)) {
++                    return None;
++                }
++            }
++            SrcRef::SSA(vec) => match vec.file() {
++                RegFile::GPR => (),
++                // Uniform vectors cannot be collected in non-uniform control
++                // flow, so only scalars
++                RegFile::UGPR if vec.comps() == 1 => (),
++                _ => return None,
++            },
++            SrcRef::Reg(_) => return None,
++        }
++    }
++    Some(op)
++}
++
++/// A 64-bit address read from a bound constant buffer and kept in a
++/// pinned UGPR pair from the start of the entry block (see the module
++/// documentation)
++struct UBase {
++    cb: CBufRef,
++    /// The pinned pair the reloads read
++    pin: SSARef,
++    /// Set once a reload uses it: only used bases are materialized
++    used: bool,
++}
++
++pub struct Remat {
++    templates: FxHashMap<SSAValue, Op>,
++    costs: FxHashMap<SSAValue, RematCost>,
++    /// Inputs of other values' recomputations: keeping them resident makes
++    /// those reloads cheaper
++    feeds: FxHashSet<SSAValue>,
++    ubases: Vec<UBase>,
++    /// Components of the pinned pairs, to their UBase index
++    ubase_comps: FxHashMap<SSAValue, usize>,
++}
++
++impl Remat {
++    /// An empty set: nothing is rematerialized
++    pub fn none() -> Remat {
++        Remat {
++            templates: Default::default(),
++            costs: Default::default(),
++            feeds: Default::default(),
++            ubases: Vec::new(),
++            ubase_comps: Default::default(),
++        }
++    }
++
++    /// Finds the rematerializable GPR values of `func`.  `live` is the GPR
++    /// next-use liveness the spiller uses, `num_ugprs` the size of the UGPR
++    /// file (0 without UGPRs).
++    pub fn for_function(
++        func: &mut Function,
++        live: &NextUseLiveness,
++        num_ugprs: u32,
++    ) -> Remat {
++        let mut templates = FxHashMap::default();
++        let mut copy_srcs: FxHashSet<SSAValue> = Default::default();
++        let mut has_ugpr = false;
++        for b in func.blocks.iter() {
++            for instr in &b.instrs {
++                match &instr.op {
++                    Op::ParCopy(_) | Op::PhiSrcs(_) | Op::RegOut(_) => {
++                        // Values flowing into these are handled in spill
++                        // space by the spiller; leave them alone
++                        instr.for_each_ssa_use(|ssa| {
++                            copy_srcs.insert(*ssa);
++                        });
++                        continue;
++                    }
++                    _ => (),
++                }
++                let mut gpr_dsts = Vec::new();
++                instr.for_each_ssa_def(|ssa| {
++                    if ssa.file() == RegFile::GPR {
++                        gpr_dsts.push(*ssa);
++                    }
++                });
++                for ssa in gpr_dsts {
++                    if let Some(t) = make_template(instr, ssa) {
++                        has_ugpr |= t.srcs_as_slice().iter().any(|s| {
++                            s.src_ref
++                                .as_ssa()
++                                .is_some_and(|v| v.file() == RegFile::UGPR)
++                        });
++                        templates.insert(ssa, t);
++                    }
++                }
++            }
++        }
++
++        let mut r = Remat {
++            templates,
++            costs: Default::default(),
++            feeds: Default::default(),
++            ubases: Vec::new(),
++            ubase_comps: Default::default(),
++        };
++
++        let ulive = if has_ugpr || num_ugprs > 0 {
++            Some(SimpleLiveness::for_function(func))
++        } else {
++            None
++        };
++        if num_ugprs > 0 && func.blocks[0].uniform {
++            let max_ugprs =
++                ulive.as_ref().unwrap().calc_max_live(func)[RegFile::UGPR];
++            let room = num_ugprs.saturating_sub(max_ugprs) / 2;
++            let room = min(usize::try_from(room).unwrap(), MAX_UBASES);
++            r.find_ubases(func, room);
++        }
++        let func = &*func;
++
++        let cands: Vec<SSAValue> = r.templates.keys().cloned().collect();
++        for ssa in cands {
++            if copy_srcs.contains(&ssa) {
++                continue;
++            }
++            let mut ugprs = Vec::new();
++            let Some((cost, peak)) = r.analyze(ssa, 0, &mut ugprs) else {
++                continue;
++            };
++            let extra = peak - 1;
++            if cost.instrs > MAX_INSTRS || extra > MAX_EXTRA {
++                continue;
++            }
++            if !ugprs.is_empty() {
++                let ulive = ulive.as_ref().unwrap();
++                if !ugprs
++                    .iter()
++                    .all(|u| covers(func, live, ulive, &ssa, u))
++                {
++                    continue;
++                }
++            }
++            for src in r.templates[&ssa].srcs_as_slice() {
++                if let SrcRef::SSA(vec) = &src.src_ref {
++                    if vec.file() == RegFile::GPR {
++                        r.feeds.extend(vec.iter().cloned());
++                    }
++                }
++            }
++            r.costs.insert(
++                ssa,
++                RematCost {
++                    instrs: cost.instrs,
++                    extra,
++                    cost: cost.cost,
++                },
++            );
++        }
++        r
++    }
++
++    /// Instruction count, cost and register peak (counting the value's own
++    /// register) of recomputing `ssa`, or None if it cannot be
++    fn analyze(
++        &self,
++        ssa: SSAValue,
++        depth: u32,
++        ugprs: &mut Vec<SSAValue>,
++    ) -> Option<(RematCost, u32)> {
++        if depth >= MAX_DEPTH {
++            return None;
++        }
++        let t = self.templates.get(&ssa)?;
++        let t_ubase = self.op_ubase(t);
++        let mut cost = RematCost {
++            instrs: 1,
++            extra: 0,
++            cost: op_cost(t),
++        };
++        let mut peak = 1;
++        let mut held = 0;
++        for src in t.srcs_as_slice() {
++            let SrcRef::SSA(vec) = &src.src_ref else {
++                continue;
++            };
++            for c in vec.iter() {
++                if t_ubase.is_some() && self.ubase_comps.contains_key(c) {
++                    // Available everywhere
++                    continue;
++                }
++                if c.file() == RegFile::UGPR {
++                    ugprs.push(*c);
++                    continue;
++                }
++                let (cc, cp) = self.analyze(*c, depth + 1, ugprs)?;
++                cost.instrs += cc.instrs;
++                cost.cost += cc.cost;
++                peak = max(peak, held + cp);
++                held += 1;
++            }
++        }
++        peak = max(peak, held);
++        Some((cost, peak))
++    }
++
++    /// The UBase a template's address comes from, if any
++    fn op_ubase(&self, op: &Op) -> Option<usize> {
++        let Op::Ld(ld) = op else {
++            return None;
++        };
++        let vec = ld.uniform_addr.src_ref.as_ssa()?;
++        self.ubase_comps.get(&vec[0]).cloned()
++    }
++
++    /// The constant-buffer address that a template's 64-bit address is
++    /// read from, if both halves are rematerializable copies of
++    /// consecutive words of one bound constant buffer
++    fn cbuf_addr(&self, op: &Op) -> Option<CBufRef> {
++        let Op::Ld(ld) = op else {
++            return None;
++        };
++        if !ld.uniform_addr.is_zero() || !ld.addr.is_unmodified() {
++            return None;
++        }
++        let vec = ld.addr.src_ref.as_ssa()?;
++        if vec.comps() != 2 || vec.file() != RegFile::GPR {
++            return None;
++        }
++        let mut cbs = [None, None];
++        for c in 0..2 {
++            let Some(Op::Copy(copy)) = self.templates.get(&vec[c]) else {
++                return None;
++            };
++            if !copy.src.is_unmodified() {
++                return None;
++            }
++            let SrcRef::CBuf(cb) = &copy.src.src_ref else {
++                return None;
++            };
++            if !matches!(cb.buf, CBuf::Binding(_)) {
++                return None;
++            }
++            cbs[c] = Some(cb.clone());
++        }
++        let [lo, hi] = cbs.map(|c| c.unwrap());
++        if lo.buf != hi.buf || hi.offset != lo.offset + 4 {
++            return None;
++        }
++        Some(lo)
++    }
++
++    /// Points constant-memory load templates whose address comes from a
++    /// bound constant buffer at a pinned UGPR copy of that address, for at
++    /// most @room distinct addresses
++    fn find_ubases(&mut self, func: &mut Function, room: usize) {
++        let mut keys: Vec<SSAValue> = self.templates.keys().cloned().collect();
++        // Deterministic base order
++        keys.sort_by_key(|v| v.idx());
++        for ssa in keys {
++            let Some(cb) = self.cbuf_addr(&self.templates[&ssa]) else {
++                continue;
++            };
++            let idx = match self.ubases.iter().position(|b| b.cb == cb) {
++                Some(i) => i,
++                None => {
++                    if self.ubases.len() >= room {
++                        continue;
++                    }
++                    let pin = func.ssa_alloc.alloc_vec(RegFile::UGPR, 2);
++                    for c in pin.iter() {
++                        self.ubase_comps.insert(*c, self.ubases.len());
++                    }
++                    self.ubases.push(UBase {
++                        cb,
++                        pin,
++                        used: false,
++                    });
++                    self.ubases.len() - 1
++                }
++            };
++            let Some(Op::Ld(ld)) = self.templates.get_mut(&ssa) else {
++                unreachable!();
++            };
++            ld.addr = Src::ZERO;
++            ld.uniform_addr = self.ubases[idx].pin.clone().into();
++        }
++    }
++
++    /// Materializes the UGPR addresses that reloads use: loads each into a
++    /// pinned pair at the start of the entry block.  Call once, after the
++    /// reloads are generated.
++    pub fn insert_ubases(&self, func: &mut Function) {
++        let mut instrs = Vec::new();
++        for b in &self.ubases {
++            if !b.used {
++                continue;
++            }
++            let u = func.ssa_alloc.alloc_vec(RegFile::UGPR, 2);
++            for c in 0..2_u16 {
++                let mut cb = b.cb.clone();
++                cb.offset += 4 * c;
++                instrs.push(Instr::new(OpCopy {
++                    dst: u[usize::from(c)].into(),
++                    src: cb.into(),
++                }));
++            }
++            instrs.push(Instr::new(OpPin {
++                dst: b.pin.clone().into(),
++                src: u.into(),
++            }));
++        }
++        if instrs.is_empty() {
++            return;
++        }
++        let entry = &mut func.blocks[0];
++        debug_assert!(entry.uniform);
++        debug_assert!(entry.phi_dsts().is_none());
++        entry.instrs.splice(0..0, instrs);
++    }
++
++    pub fn get(&self, ssa: &SSAValue) -> Option<&RematCost> {
++        self.costs.get(ssa)
++    }
++
++    pub fn contains(&self, ssa: &SSAValue) -> bool {
++        self.costs.contains_key(ssa)
++    }
++
++    /// True if @ssa is an input of another value's recomputation
++    pub fn feeds(&self, ssa: &SSAValue) -> bool {
++        self.feeds.contains(ssa)
++    }
++
++    /// Instructions that recompute `ssa` into `dst`, temporaries first.
++    /// A GPR input for which `resident` returns true is used as it is
++    /// instead of being recomputed: the caller guarantees it is live and in
++    /// a register at the insertion point.
++    pub fn instrs(
++        &mut self,
++        ssa: SSAValue,
++        dst: Dst,
++        resident: &dyn Fn(&SSAValue) -> bool,
++        alloc: &mut SSAValueAllocator,
++        out: &mut Vec<Instr>,
++    ) {
++        let mut op = clone_op(&self.templates[&ssa]).unwrap();
++        if let Some(i) = self.op_ubase(&op) {
++            self.ubases[i].used = true;
++        }
++        for src in op.srcs_as_mut_slice() {
++            let SrcRef::SSA(vec) = &src.src_ref else {
++                continue;
++            };
++            if vec.file() != RegFile::GPR {
++                continue;
++            }
++            let comps: Vec<SSAValue> = vec.iter().cloned().collect();
++            let mut new_comps = Vec::new();
++            for c in comps {
++                if resident(&c) {
++                    new_comps.push(c);
++                    continue;
++                }
++                let tmp = alloc.alloc(RegFile::GPR);
++                self.instrs(c, tmp.into(), resident, alloc, out);
++                new_comps.push(tmp);
++            }
++            src.src_ref = SrcRef::SSA(SSARef::new(&new_comps));
++        }
++        set_dst(&mut op, dst);
++        out.push(Instr::new(op));
++    }
++}
++
++/// Returns true if UGPR `u` is live wherever GPR `v` is
++fn covers(
++    func: &Function,
++    live: &NextUseLiveness,
++    ulive: &SimpleLiveness,
++    v: &SSAValue,
++    u: &SSAValue,
++) -> bool {
++    for b_idx in 0..func.blocks.len() {
++        let bv = live.block_live(b_idx);
++        let bu = ulive.block_live(b_idx);
++        if bv.is_live_in(v) && !bu.is_live_in(u) {
++            return false;
++        }
++        if bv.is_live_out(v) {
++            if !bu.is_live_out(u) {
++                return false;
++            }
++        } else if let Some(last) = bv.last_use_in_block(v) {
++            // u's live range in the block is contiguous and starts before
++            // v's (u's definition dominates v's), so it is enough that u is
++            // live at v's last use.
++            let ok = if last == 0 {
++                bu.is_live_in(u)
++            } else {
++                bu.is_live_after_ip(u, last - 1)
++            };
++            if !ok {
++                return false;
++            }
++        }
++    }
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::liveness::NextUseLiveness;
++
++    use compiler::cfg::CFGBuilder;
++    use rustc_hash::FxBuildHasher;
++
++    fn sm120() -> ShaderModelInfo {
++        ShaderModelInfo::new(120, 48)
++    }
++
++    fn access(mem_type: MemType, order: MemOrder) -> MemAccess {
++        MemAccess {
++            mem_type,
++            space: MemSpace::Global(MemAddrType::A64),
++            order,
++            eviction_priority: MemEvictionPriority::Normal,
++        }
++    }
++
++    fn cb(offset: u16) -> CBufRef {
++        CBufRef {
++            buf: CBuf::Binding(0),
++            offset,
++        }
++    }
++
++    /// A small straight-line program builder
++    struct Prog {
++        alloc: SSAValueAllocator,
++        instrs: Vec<Instr>,
++    }
++
++    impl Prog {
++        fn new() -> Prog {
++            Prog {
++                alloc: SSAValueAllocator::new(),
++                instrs: Vec::new(),
++            }
++        }
++
++        fn push(&mut self, op: impl Into<Op>) {
++            self.instrs.push(Instr::new(op));
++        }
++
++        fn copy(&mut self, file: RegFile, src: impl Into<Src>) -> SSAValue {
++            let dst = self.alloc.alloc(file);
++            self.push(OpCopy {
++                dst: dst.into(),
++                src: src.into(),
++            });
++            dst
++        }
++
++        fn iadd(&mut self, a: impl Into<Src>, b: impl Into<Src>) -> SSAValue {
++            let dst = self.alloc.alloc(RegFile::GPR);
++            self.push(OpIAdd3 {
++                dst: dst.into(),
++                overflow: [Dst::None, Dst::None],
++                srcs: [a.into(), b.into(), Src::ZERO],
++            });
++            dst
++        }
++
++        fn ld(
++            &mut self,
++            addr: &SSARef,
++            offset: i32,
++            mem_type: MemType,
++            order: MemOrder,
++        ) -> SSARef {
++            let comps = u8::try_from(mem_type.bits() / 32).unwrap();
++            let dst = self.alloc.alloc_vec(RegFile::GPR, comps);
++            self.push(OpLd {
++                dst: dst.clone().into(),
++                addr: addr.clone().into(),
++                uniform_addr: Src::ZERO,
++                pred: true.into(),
++                offset,
++                stride: OffsetStride::X1,
++                access: access(mem_type, order),
++            });
++            dst
++        }
++
++        fn st(&mut self, addr: &SSARef, data: SSAValue) {
++            self.push(OpSt {
++                addr: addr.clone().into(),
++                data: data.into(),
++                uniform_addr: Src::ZERO,
++                offset: 0,
++                stride: OffsetStride::X1,
++                access: access(MemType::B32, MemOrder::Strong(MemScope::GPU)),
++            });
++        }
++
++        /// The address of a root constant buffer, read from cbuf 0
++        fn addr(&mut self) -> SSARef {
++            let lo = self.copy(RegFile::GPR, cb(0x10));
++            let hi = self.copy(RegFile::GPR, cb(0x14));
++            SSARef::from([lo, hi])
++        }
++
++        /// @n values that can only be spilled to memory (loads that are not
++        /// from constant memory), to make register pressure
++        fn noise(&mut self, addr: &SSARef, n: i32) -> Vec<SSAValue> {
++            (0..n)
++                .map(|i| {
++                    let strong = MemOrder::Strong(MemScope::GPU);
++                    self.ld(addr, 0x100 + 4 * i, MemType::B32, strong)[0]
++                })
++                .collect()
++        }
++
++        /// Sums @vals in order, so they die one by one
++        fn sum(&mut self, vals: &[SSAValue]) -> SSAValue {
++            let mut acc = vals[0];
++            for v in &vals[1..] {
++                acc = self.iadd(acc, *v);
++            }
++            acc
++        }
++
++        fn function(mut self, uniform: bool) -> Function {
++            self.push(OpExit {});
++            let mut cfg = CFGBuilder::<_, _, FxBuildHasher>::new();
++            cfg.add_node(
++                0,
++                BasicBlock {
++                    label: LabelAllocator::new().alloc(),
++                    uniform,
++                    instrs: self.instrs,
++                },
++            );
++            Function {
++                ssa_alloc: self.alloc,
++                phi_alloc: PhiAllocator::new(),
++                blocks: cfg.as_cfg(true),
++            }
++        }
++    }
++
++    fn shader_info() -> ShaderInfo {
++        ShaderInfo {
++            max_warps_per_sm: 0,
++            num_gprs: 0,
++            num_control_barriers: 0,
++            num_instrs: 0,
++            num_static_cycles: 0,
++            num_spills_to_mem: 0,
++            num_fills_from_mem: 0,
++            num_spills_to_reg: 0,
++            num_fills_from_reg: 0,
++            slm_size: 0,
++            max_crs_depth: 0,
++            uses_global_mem: true,
++            writes_global_mem: true,
++            uses_fp64: false,
++            stage: ShaderStageInfo::Compute(ComputeShaderInfo {
++                local_size: [32, 1, 1],
++                smem_size: 0,
++            }),
++            io: ShaderIoInfo::None,
++        }
++    }
++
++    /// Spills @f's GPRs down to @limit with rematerialization
++    fn spill(f: &mut Function, limit: u32) -> ShaderInfo {
++        let mut info = shader_info();
++        f.to_cssa();
++        let num_ugprs = sm120().num_regs(RegFile::UGPR);
++        f.spill_values(RegFile::GPR, limit, &mut info, true, num_ugprs);
++        info
++    }
++
++    /// Runs register allocation (spilling to @gprs GPRs with
++    /// rematerialization) and the rest of the back end through encoding,
++    /// which checks the result with their assertions
++    fn compile(f: Function, gprs: u32) -> ShaderInfo {
++        let sm = sm120();
++        let mut s = Shader {
++            sm: &sm,
++            info: shader_info(),
++            functions: vec![f],
++        };
++        s.assign_regs_target(Some(gprs), true);
++        s.lower_par_copies();
++        s.lower_copy_swap();
++        s.calc_instr_deps();
++        s.gather_info();
++        s.remove_annotations();
++        let code = s.sm.encode_shader(&s);
++        assert!(!code.is_empty());
++        s.info
++    }
++
++    fn instrs(f: &Function) -> impl Iterator<Item = &Instr> {
++        f.blocks.iter().flat_map(|b| b.instrs.iter())
++    }
++
++    /// Single-component constant loads at @offset
++    fn ld_b32_at(f: &Function, offset: i32) -> Vec<&OpLd> {
++        instrs(f)
++            .filter_map(|i| match &i.op {
++                Op::Ld(ld)
++                    if ld.access.mem_type == MemType::B32
++                        && ld.access.order == MemOrder::Constant
++                        && ld.offset == offset =>
++                {
++                    Some(&**ld)
++                }
++                _ => None,
++            })
++            .collect()
++    }
++
++    /// Components of a vector constant load are reloaded one at a time:
++    /// one 32-bit load per component, from a UGPR copy of the address when
++    /// the entry block is uniform, else from the recomputed address.
++    ///
++    /// Register pressure peaks at the last of the 10 other loads: their
++    /// address, the 4 components and 10 loaded values.  With 12 registers,
++    /// components (used last, cheapest to restore) are evicted, not the
++    /// loaded values.
++    fn constant_load_component(uniform: bool) -> Function {
++        let mut p = Prog::new();
++        let addr = p.addr();
++        let v = p.ld(&addr, 0x20, MemType::B128, MemOrder::Constant);
++        let noise = p.noise(&addr, 10);
++        let n = p.sum(&noise);
++        let a = p.iadd(v[0], v[1]);
++        let b = p.iadd(v[2], v[3]);
++        let ab = p.iadd(a, b);
++        let r = p.iadd(n, ab);
++        let out = p.addr();
++        p.st(&out, r);
++        p.function(uniform)
++    }
++
++    #[test]
++    fn test_remat_constant_load_component_ugpr() {
++        let mut f = constant_load_component(true);
++        let info = spill(&mut f, 12);
++        assert_eq!(info.num_spills_to_mem, 0);
++        assert_eq!(info.num_fills_from_mem, 0);
++
++        // Components of the b128 load were evicted and are reloaded alone,
++        // once each, through the pinned UGPR address
++        let mut reloaded = 0;
++        for c in 0..4 {
++            let lds = ld_b32_at(&f, 0x20 + 4 * c);
++            assert!(lds.len() <= 1, "component {c}");
++            for ld in lds {
++                assert!(ld.addr.is_zero());
++                let ua = ld.uniform_addr.src_ref.as_ssa().unwrap();
++                assert_eq!(ua.comps(), 2);
++                assert_eq!(ua.file(), RegFile::UGPR);
++                reloaded += 1;
++            }
++        }
++        assert!(reloaded >= 2);
++
++        // The address is loaded once, at the start of the entry block, and
++        // pinned
++        let entry = &f.blocks[0].instrs;
++        assert!(matches!(&entry[2].op, Op::Pin(_)));
++        let pins = instrs(&f).filter(|i| matches!(&i.op, Op::Pin(_))).count();
++        assert_eq!(pins, 1);
++
++        let info = compile(constant_load_component(true), 14);
++        assert_eq!(info.num_spills_to_mem, 0);
++    }
++
++    #[test]
++    fn test_remat_constant_load_component_gpr() {
++        // Without a uniform entry block, the address is recomputed
++        let mut f = constant_load_component(false);
++        let info = spill(&mut f, 12);
++        assert_eq!(info.num_spills_to_mem, 0);
++        let mut reloaded = 0;
++        for c in 0..4 {
++            let lds = ld_b32_at(&f, 0x20 + 4 * c);
++            assert!(lds.len() <= 1, "component {c}");
++            for ld in lds {
++                assert!(ld.uniform_addr.is_zero());
++                assert_eq!(ld.addr.src_ref.as_ssa().unwrap().comps(), 2);
++                reloaded += 1;
++            }
++        }
++        assert!(reloaded >= 2);
++        assert!(!instrs(&f).any(|i| matches!(&i.op, Op::Pin(_))));
++
++        let info = compile(constant_load_component(false), 14);
++        assert_eq!(info.num_spills_to_mem, 0);
++    }
++
++    /// A value computed from another rematerializable value that is still
++    /// resident at the reload uses that value instead of recomputing it.
++    ///
++    /// w = tid + 0x1234 is used only at the end; tid is used throughout.
++    /// Pressure peaks at the 8th of the 9 loads (address, tid, w, 7 values
++    /// and the new one): with 11 registers, w is evicted.
++    fn chain_with_resident_input() -> Function {
++        let mut p = Prog::new();
++        let addr = p.addr();
++        let tid = p.alloc.alloc(RegFile::GPR);
++        p.push(OpS2R {
++            dst: tid.into(),
++            idx: 0x21, // SR_TID.X
++        });
++        let w = p.iadd(tid, 0x1234_u32);
++        let ys: Vec<SSAValue> = p
++            .noise(&addr, 9)
++            .into_iter()
++            .map(|x| p.iadd(x, tid))
++            .collect();
++        let mut acc = ys[0];
++        for y in &ys[1..] {
++            acc = p.iadd(acc, *y);
++            acc = p.iadd(acc, tid);
++        }
++        let r = p.iadd(acc, w);
++        let r = p.iadd(r, tid);
++        let out = p.addr();
++        p.st(&out, r);
++        p.function(true)
++    }
++
++    #[test]
++    fn test_remat_chain_with_resident_input() {
++        let mut f = chain_with_resident_input();
++        let info = spill(&mut f, 11);
++        assert_eq!(info.num_spills_to_mem, 0);
++
++        let adds: Vec<_> = instrs(&f)
++            .filter_map(|i| match &i.op {
++                Op::IAdd3(op)
++                    if op.srcs[1].src_ref == SrcRef::Imm32(0x1234) =>
++                {
++                    Some(&**op)
++                }
++                _ => None,
++            })
++            .collect();
++        // Only the recomputation at the end is left (the original is dead
++        // once its value was evicted without a store)
++        assert_eq!(adds.len(), 1);
++        let last_noise = instrs(&f)
++            .collect::<Vec<_>>()
++            .iter()
++            .rposition(|i| matches!(&i.op, Op::Ld(_)))
++            .unwrap();
++        let add_pos = instrs(&f)
++            .position(|i| match &i.op {
++                Op::IAdd3(op) => op.srcs[1].src_ref == SrcRef::Imm32(0x1234),
++                _ => false,
++            })
++            .unwrap();
++        assert!(add_pos > last_noise);
++        // It reads the thread ID, which was never recomputed
++        let s2rs: Vec<SSAValue> = instrs(&f)
++            .filter_map(|i| match &i.op {
++                Op::S2R(op) => Some(op.dst.as_ssa().unwrap()[0]),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(s2rs.len(), 1);
++        for op in adds {
++            assert_eq!(op.srcs[0].src_ref.as_ssa().unwrap()[0], s2rs[0]);
++        }
++
++        let info = compile(chain_with_resident_input(), 14);
++        assert_eq!(info.num_spills_to_mem, 0);
++    }
++
++    /// v = u + 7 with a UGPR u: v is rematerializable only if u is live
++    /// wherever v is
++    fn ugpr_input(u_outlives_v: bool) -> (Function, SSAValue) {
++        let mut p = Prog::new();
++        let addr = p.addr();
++        let u = p.copy(RegFile::UGPR, cb(0x40));
++        let v = p.iadd(u, 7_u32);
++        let noise = p.noise(&addr, 4);
++        let n = p.sum(&noise);
++        let r = if u_outlives_v {
++            let r = p.iadd(n, v);
++            p.iadd(r, u)
++        } else {
++            let r = p.iadd(n, u);
++            p.iadd(r, v)
++        };
++        let out = p.addr();
++        p.st(&out, r);
++        (p.function(true), v)
++    }
++
++    #[test]
++    fn test_remat_ugpr_coverage() {
++        let files = RegFileSet::from_iter([RegFile::GPR]);
++        for covered in [true, false] {
++            let (mut f, v) = ugpr_input(covered);
++            let live = NextUseLiveness::for_function(&f, &files);
++            let remat = Remat::for_function(&mut f, &live, 0);
++            assert_eq!(remat.contains(&v), covered);
++        }
++
++        // Spilled hard, the covered value is recomputed from the UGPR where
++        // it is used (after the loads) and the other one goes to memory
++        for covered in [true, false] {
++            let (mut f, _) = ugpr_input(covered);
++            spill(&mut f, 4);
++            let last_ld = instrs(&f)
++                .collect::<Vec<_>>()
++                .iter()
++                .rposition(|i| matches!(&i.op, Op::Ld(_)))
++                .unwrap();
++            let adds: Vec<usize> = instrs(&f)
++                .enumerate()
++                .filter(|(_, i)| match &i.op {
++                    Op::IAdd3(op) => op.srcs[1].src_ref == SrcRef::Imm32(7),
++                    _ => false,
++                })
++                .map(|(ip, _)| ip)
++                .collect();
++            assert_eq!(adds.len(), 1);
++            // v, renamed by SSA repair
++            let v = instrs(&f)
++                .nth(adds[0])
++                .unwrap()
++                .dsts()[0]
++                .as_ssa()
++                .unwrap()[0];
++            let v_to_mem = instrs(&f).any(|i| match &i.op {
++                Op::Copy(op) => {
++                    op.dst.as_ssa().is_some_and(|d| d.file() == RegFile::Mem)
++                        && op.src.src_ref.as_ssa().is_some_and(|s| s[0] == v)
++                }
++                _ => false,
++            });
++            if covered {
++                assert!(adds[0] > last_ld);
++                assert!(!v_to_mem);
++            } else {
++                assert!(adds[0] < last_ld);
++                assert!(v_to_mem);
++            }
++        }
++    }
++}
+diff --git a/src/nouveau/compiler/nak/spill_values.rs b/src/nouveau/compiler/nak/spill_values.rs
+index d211730..fb8005a 100644
+--- a/src/nouveau/compiler/nak/spill_values.rs
++++ b/src/nouveau/compiler/nak/spill_values.rs
+@@ -7,6 +7,7 @@ use crate::ir::*;
+ use crate::liveness::{
+     BlockLiveness, LiveSet, Liveness, NextUseBlockLiveness, NextUseLiveness,
+ };
++use crate::spill_remat::{op_cost, Remat, MEM_FILL_COST};
+ 
+ use compiler::bitset::BitSet;
+ use rustc_hash::{FxHashMap, FxHashSet};
+@@ -288,19 +289,74 @@ struct SpillCache<'a, S: Spill> {
+     alloc: &'a mut SSAValueAllocator,
+     spill: S,
+     const_tracker: ConstTracker,
++    remat: Remat,
+     val_spill: FxHashMap<SSAValue, SSAValue>,
+ }
+ 
+ impl<'a, S: Spill> SpillCache<'a, S> {
+-    fn new(alloc: &'a mut SSAValueAllocator, spill: S) -> SpillCache<'a, S> {
++    fn new(
++        alloc: &'a mut SSAValueAllocator,
++        spill: S,
++        remat: Remat,
++    ) -> SpillCache<'a, S> {
+         SpillCache {
+             alloc: alloc,
+             spill: spill,
+             const_tracker: ConstTracker::new(),
++            remat: remat,
+             val_spill: Default::default(),
+         }
+     }
+ 
++    /// True if @ssa can be restored without a copy in spill space: it is a
++    /// constant or it can be recomputed (see spill_remat)
++    fn is_remat(&self, ssa: &SSAValue) -> bool {
++        self.const_tracker.contains(ssa) || self.remat.contains(ssa)
++    }
++
++    /// Registers needed beyond @ssa's own to restore it
++    fn fill_extra(&self, ssa: &SSAValue) -> u32 {
++        if self.const_tracker.contains(ssa) {
++            0
++        } else {
++            self.remat.get(ssa).map_or(0, |c| c.extra)
++        }
++    }
++
++    /// Estimated cost of evicting @ssa now and restoring it later, in the
++    /// units of spill_remat::RematCost::cost
++    fn evict_cost(&self, ssa: &SSAValue, spilled: bool) -> u32 {
++        if self.const_tracker.contains(ssa) {
++            1
++        } else if let Some(c) = self.remat.get(ssa) {
++            if self.remat.feeds(ssa) {
++                // Evicting it makes the reloads that use it longer
++                max(4 * c.cost, 4)
++            } else {
++                c.cost
++            }
++        } else if spilled {
++            MEM_FILL_COST
++        } else {
++            2 * MEM_FILL_COST
++        }
++    }
++
++    /// Restores @ssa into a register: a constant copy, a recomputation, or
++    /// a fill from spill space.  See Remat::instrs for @resident.
++    fn fill_into(
++        &mut self,
++        ssa: SSAValue,
++        resident: &dyn Fn(&SSAValue) -> bool,
++        out: &mut Vec<Instr>,
++    ) {
++        if self.const_tracker.contains(&ssa) || !self.remat.contains(&ssa) {
++            out.push(self.fill(ssa));
++        } else {
++            self.remat.instrs(ssa, ssa.into(), resident, self.alloc, out);
++        }
++    }
++
+     fn add_copy_if_const(&mut self, op: &OpCopy) {
+         self.const_tracker.add_copy(op);
+     }
+@@ -349,6 +405,21 @@ impl<'a, S: Spill> SpillCache<'a, S> {
+     }
+ }
+ 
++/// Cost information for SpillChooser (NAK_OCC_TARGET): without it, the
++/// value with the furthest next use is evicted (Belady); with it, the value
++/// with the largest next-use distance per unit of restore cost, and values
++/// live through the current loop but not used inside it go first.
++struct SpillCosts<'a> {
++    /// (cost of evicting) per candidate
++    cost: &'a dyn Fn(&SSAValue) -> u32,
++    /// Values used inside the innermost loop containing the block, if any
++    loop_uses: Option<&'a FxHashSet<SSAValue>>,
++}
++
++/// Distance bonus for values not used in the current loop: they are
++/// restored once after the loop instead of on every iteration
++const LOOP_OUT_BIAS: u64 = 1 << 20;
++
+ struct SpillChooser<'a> {
+     bl: &'a NextUseBlockLiveness,
+     pinned: &'a FxHashSet<SSAValue>,
+@@ -356,6 +427,7 @@ struct SpillChooser<'a> {
+     count: usize,
+     spills: BinaryHeap<Reverse<SSANextUse>>,
+     min_next_use: usize,
++    costs: Option<SpillCosts<'a>>,
+ }
+ 
+ struct SpillChoiceIter {
+@@ -376,7 +448,18 @@ impl<'a> SpillChooser<'a> {
+             count: count,
+             spills: BinaryHeap::new(),
+             min_next_use: ip + 1,
++            costs: None,
++        }
++    }
++
++    pub fn with_costs(mut self, costs: Option<SpillCosts<'a>>) -> Self {
++        if costs.is_some() {
++            // Scores are not IPs; values used by the current instruction
++            // are excluded separately in add_candidate.
++            self.min_next_use = 0;
+         }
++        self.costs = costs;
++        self
+     }
+ 
+     pub fn add_candidate(&mut self, ssa: SSAValue) {
+@@ -385,14 +468,31 @@ impl<'a> SpillChooser<'a> {
+             return;
+         }
+ 
++        let next_use = self.bl.next_use_after_or_at_ip(&ssa, self.ip).unwrap();
++        let score = if let Some(c) = &self.costs {
++            // Never evict a source of the current instruction
++            if next_use <= self.ip {
++                return;
++            }
++            let mut dist = u64::try_from(next_use - self.ip).unwrap();
++            if let Some(lu) = c.loop_uses {
++                if !lu.contains(&ssa) {
++                    dist += LOOP_OUT_BIAS;
++                }
++            }
++            let cost = u64::from(max((c.cost)(&ssa), 1));
++            usize::try_from(dist * 64 / cost).unwrap()
++        } else {
++            next_use
++        };
++
+         // Ignore anything used sonner than spill options we've already
+         // rejected.
+-        let next_use = self.bl.next_use_after_or_at_ip(&ssa, self.ip).unwrap();
+-        if next_use < self.min_next_use {
++        if score < self.min_next_use {
+             return;
+         }
+ 
+-        self.spills.push(Reverse(SSANextUse::new(ssa, next_use)));
++        self.spills.push(Reverse(SSANextUse::new(ssa, score)));
+ 
+         if self.spills.len() > self.count {
+             // Because we reversed the heap, pop actually removes the
+@@ -439,14 +539,131 @@ struct SSAState {
+     p: FxHashSet<SSAValue>,
+ }
+ 
++/// Execution weight of a block at loop depth @depth for cost estimates
++pub fn loop_weight(depth: usize) -> u64 {
++    1 << (3 * depth.min(4))
++}
++
++/// What a dry run of the GPR spiller estimates (see
++/// Function::spill_gpr_cost)
++#[derive(Clone, Copy, Debug, Default)]
++pub struct DryCost {
++    /// Loop-weighted cost of the instructions spilling would add (see
++    /// loop_weight and dry_instr_cost)
++    pub cost: u64,
++    /// Memory spills and fills it would add (static count)
++    pub mem_ops: u32,
++    /// Loop-weighted count of those
++    pub mem_weighted: u64,
++    /// Instructions it would add (static count)
++    pub instrs: u32,
++}
++
++impl DryCost {
++    fn add(&mut self, wgt: u64, instrs: &[Instr]) {
++        for instr in instrs {
++            let (cost, mem) = dry_instr_cost(instr);
++            if cost > 0 {
++                self.instrs += 1;
++            }
++            self.cost += wgt * cost;
++            self.mem_ops += mem;
++            self.mem_weighted += wgt * u64::from(mem);
++        }
++    }
++}
++
++/// Cost of an instruction added by spilling, for dry runs, and the number
++/// of memory spills or fills it is: memory spills and fills cost
++/// MEM_FILL_COST, everything else its issue cost
++fn dry_instr_cost(instr: &Instr) -> (u64, u32) {
++    let mem = u64::from(MEM_FILL_COST);
++    match &instr.op {
++        Op::Annotate(_) => (0, 0),
++        Op::Copy(op) => {
++            let to_mem = op.dst.as_ssa().is_some_and(|v| v.file() == RegFile::Mem);
++            let from_mem = op
++                .src
++                .src_ref
++                .as_ssa()
++                .is_some_and(|v| v.file() == RegFile::Mem);
++            if to_mem || from_mem {
++                (mem, 1)
++            } else {
++                (1, 0)
++            }
++        }
++        Op::ParCopy(op) => {
++            let n = u32::try_from(op.dsts_srcs.len()).unwrap();
++            (mem * u64::from(n), n)
++        }
++        op => (u64::from(op_cost(op)), 0),
++    }
++}
++
++/// Sort key for choosing the values resident at the start of a block with
++/// several predecessors: the first use, and with NAK_OCC_TARGET values that
++/// are cheap to restore (constants, rematerializable values) after all
++/// others.
++fn entry_key<S: Spill>(
++    spill: &SpillCache<'_, S>,
++    smart: bool,
++    ssa: &SSAValue,
++    first_use: usize,
++) -> usize {
++    if smart && spill.is_remat(ssa) && !spill.remat.feeds(ssa) {
++        first_use + (1 << 30)
++    } else {
++        first_use
++    }
++}
++
++/// Moves values from @some into @w in order while they fit.  A
++/// rematerializable value that needs temporaries to be restored is only
++/// taken if those fit as well, and keeps room for them (@reserve): it may be
++/// restored on an incoming edge where everything else in @w is live.
++fn fill_w<S: Spill>(
++    w: &mut LiveSet,
++    some: &mut BinaryHeap<Reverse<SSANextUse>>,
++    spill: &SpillCache<'_, S>,
++    file: RegFile,
++    limit: u32,
++    reserve: &mut u32,
++) {
++    while w.count(file) + *reserve < limit {
++        let Some(entry) = some.pop() else {
++            break;
++        };
++        let ssa = entry.0.ssa;
++        assert!(ssa.file() == file);
++        let extra = spill.fill_extra(&ssa);
++        if w.count(file) + 1 + max(*reserve, extra) > limit {
++            continue;
++        }
++        *reserve = max(*reserve, extra);
++        w.insert(ssa);
++    }
++}
++
+ fn spill_values<S: Spill>(
+     func: &mut Function,
+     file: RegFile,
+     limit: u32,
+     spill: S,
++    smart: bool,
++    num_ugprs: u32,
++    dry: Option<&mut DryCost>,
+ ) {
++    let dry_mode = dry.is_some();
++    let mut dry_cost = DryCost::default();
+     let files = RegFileSet::from_iter([file]);
+     let live = NextUseLiveness::for_function(func, &files);
++    // Rematerialization only for GPRs, which spill to memory
++    let remat = if smart && file == RegFile::GPR {
++        Remat::for_function(func, &live, num_ugprs)
++    } else {
++        Remat::none()
++    };
+     let blocks = &mut func.blocks;
+ 
+     // Record the set of SSA values used within each loop
+@@ -498,7 +715,7 @@ fn spill_values<S: Spill>(
+         }
+     }
+ 
+-    let mut spill = SpillCache::new(&mut func.ssa_alloc, spill);
++    let mut spill = SpillCache::new(&mut func.ssa_alloc, spill, remat);
+     let mut spilled_phis: BitSet<Phi> = BitSet::new();
+ 
+     let mut ssa_state_in: Vec<SSAState> = Vec::new();
+@@ -506,6 +723,14 @@ fn spill_values<S: Spill>(
+ 
+     for b_idx in 0..blocks.len() {
+         let bl = live.block_live(b_idx);
++        let cur_loop_uses = if smart {
++            blocks
++                .loop_header_index(b_idx)
++                .and_then(|lh| loop_uses.get(&lh))
++                .map(|u| u.borrow())
++        } else {
++            None
++        };
+ 
+         let preds = blocks.pred_indices(b_idx).to_vec();
+         let w = if preds.is_empty() {
+@@ -555,20 +780,17 @@ fn spill_values<S: Spill>(
+ 
+             let lu = loop_uses.get(&b_idx).unwrap().borrow();
+             let mut w = LiveSet::new();
++            let mut reserve = 0;
+ 
+             let mut some = BinaryHeap::new();
+             for ssa in i_b.iter() {
+                 if lu.contains(ssa) {
+                     let next_use = bl.first_use(ssa).unwrap();
+-                    some.push(Reverse(SSANextUse::new(*ssa, next_use)));
++                    let key = entry_key(&spill, smart, ssa, next_use);
++                    some.push(Reverse(SSANextUse::new(*ssa, key)));
+                 }
+             }
+-            while w.count(file) < limit {
+-                let Some(entry) = some.pop() else {
+-                    break;
+-                };
+-                w.insert(entry.0.ssa);
+-            }
++            fill_w(&mut w, &mut some, &spill, file, limit, &mut reserve);
+ 
+             // If we still have room, consider values which aren't used
+             // inside the loop.
+@@ -577,16 +799,12 @@ fn spill_values<S: Spill>(
+                     debug_assert!(ssa.file() == file);
+                     if !lu.contains(ssa) {
+                         let next_use = bl.first_use(ssa).unwrap();
+-                        some.push(Reverse(SSANextUse::new(*ssa, next_use)));
++                        let key = entry_key(&spill, smart, ssa, next_use);
++                        some.push(Reverse(SSANextUse::new(*ssa, key)));
+                     }
+                 }
+ 
+-                while w.count(file) < limit {
+-                    let Some(entry) = some.pop() else {
+-                        break;
+-                    };
+-                    w.insert(entry.0.ssa);
+-                }
++                fill_w(&mut w, &mut some, &spill, file, limit, &mut reserve);
+             }
+ 
+             w
+@@ -625,18 +843,17 @@ fn spill_values<S: Spill>(
+                 if info.num_preds == preds.len() {
+                     // This one is in all the input sets
+                     w.insert(ssa);
++                } else if smart && spill.remat.contains(&ssa) {
++                    // Cheap to restore where it is used; filling it on the
++                    // edges where it is missing would restore it early on
++                    // paths that may not need it
+                 } else {
+-                    some.push(Reverse(SSANextUse::new(ssa, info.next_use)));
++                    let key = entry_key(&spill, smart, &ssa, info.next_use);
++                    some.push(Reverse(SSANextUse::new(ssa, key)));
+                 }
+             }
+-            while w.count(file) < limit {
+-                let Some(entry) = some.pop() else {
+-                    break;
+-                };
+-                let ssa = entry.0.ssa;
+-                assert!(ssa.file() == file);
+-                w.insert(ssa);
+-            }
++            let mut reserve = 0;
++            fill_w(&mut w, &mut some, &spill, file, limit, &mut reserve);
+ 
+             w
+         };
+@@ -672,7 +889,7 @@ fn spill_values<S: Spill>(
+             // properly spilled when we spill across CF edges.
+             if blocks.is_loop_header(b_idx) {
+                 for ssa in bl.iter_live_in() {
+-                    if !w.contains(ssa) {
++                    if !w.contains(ssa) && !spill.remat.contains(ssa) {
+                         s.insert(*ssa);
+                     }
+                 }
+@@ -691,7 +908,7 @@ fn spill_values<S: Spill>(
+ 
+         for ssa in bl.iter_live_in() {
+             debug_assert!(
+-                w.contains(ssa) || s.contains(ssa) || spill.is_const(ssa)
++                w.contains(ssa) || s.contains(ssa) || spill.is_remat(ssa)
+             );
+         }
+ 
+@@ -700,9 +917,11 @@ fn spill_values<S: Spill>(
+         assert!(ssa_state_in.len() == b_idx);
+         ssa_state_in.push(b.clone());
+ 
++        let blk_wgt = loop_weight(blocks.loop_depth(b_idx));
+         let bb = &mut blocks[b_idx];
+ 
+         let mut instrs = Vec::new();
++        let mut orig = Vec::new();
+         for (ip, mut instr) in bb.instrs.drain(..).enumerate() {
+             if let Op::Copy(op) = &instr.op {
+                 spill.add_copy_if_const(op);
+@@ -720,7 +939,9 @@ fn spill_values<S: Spill>(
+                         if ssa.file() == file && !b.w.contains(ssa) {
+                             spilled_phis.insert(*phi);
+                             b.s.insert(*ssa);
+-                            *dst = spill.get_spill(*ssa).into();
++                            if !dry_mode {
++                                *dst = spill.get_spill(*ssa).into();
++                            }
+                         }
+                     }
+                 }
+@@ -729,6 +950,9 @@ fn spill_values<S: Spill>(
+                 }
+                 Op::ParCopy(pcopy) => {
+                     let mut num_w_dsts = 0_u32;
++                    // Destinations moved to spill space (rewritten to spill
++                    // values, except in a dry run)
++                    let mut mem_dsts: FxHashSet<SSAValue> = Default::default();
+                     for (dst, src) in pcopy.dsts_srcs.iter_mut() {
+                         let dst_vec = dst.as_ssa().unwrap();
+                         debug_assert!(dst_vec.comps() == 1);
+@@ -757,8 +981,11 @@ fn spill_values<S: Spill>(
+                                 instrs.push(spill.spill(*src_ssa));
+                             }
+                             b.s.insert(*dst_ssa);
+-                            *src = spill.get_spill(*src_ssa).into();
+-                            *dst = spill.get_spill(*dst_ssa).into();
++                            mem_dsts.insert(*dst_ssa);
++                            if !dry_mode {
++                                *src = spill.get_spill(*src_ssa).into();
++                                *dst = spill.get_spill(*dst_ssa).into();
++                            }
+                         }
+                     }
+ 
+@@ -786,7 +1013,9 @@ fn spill_values<S: Spill>(
+                         let mut spills = SpillChooser::new(bl, &b.p, ip, count);
+                         for (dst, _) in pcopy.dsts_srcs.iter() {
+                             let dst_ssa = &dst.as_ssa().unwrap()[0];
+-                            if dst_ssa.file() == file {
++                            if dst_ssa.file() == file
++                                && !mem_dsts.contains(dst_ssa)
++                            {
+                                 spills.add_candidate(*dst_ssa);
+                             }
+                         }
+@@ -809,15 +1038,19 @@ fn spill_values<S: Spill>(
+                                     instrs.push(spill.spill(*src_ssa));
+                                 }
+                                 b.s.insert(*dst_ssa);
+-                                *src = spill.get_spill(*src_ssa).into();
+-                                *dst = spill.get_spill(*dst_ssa).into();
++                                mem_dsts.insert(*dst_ssa);
++                                if !dry_mode {
++                                    *src = spill.get_spill(*src_ssa).into();
++                                    *dst = spill.get_spill(*dst_ssa).into();
++                                }
+                             }
+                         }
+                     }
+ 
+                     for (dst, _) in pcopy.dsts_srcs.iter() {
+                         let dst_ssa = &dst.as_ssa().unwrap()[0];
+-                        if dst_ssa.file() == file {
++                        if dst_ssa.file() == file && !mem_dsts.contains(dst_ssa)
++                        {
+                             b.w.insert(*dst_ssa);
+                         }
+                     }
+@@ -874,37 +1107,53 @@ fn spill_values<S: Spill>(
+                     } else {
+                         // First compute fills even though those have to come
+                         // after spills.
+-                        let mut fills = Vec::new();
++                        let mut to_fill = Vec::new();
++                        let mut fill_extra = 0;
+                         instr.for_each_ssa_use(|ssa| {
+                             if ssa.file() == file && !b.w.contains(ssa) {
+                                 debug_assert!(
+-                                    b.s.contains(ssa) || spill.is_const(ssa)
++                                    b.s.contains(ssa) || spill.is_remat(ssa)
+                                 );
+                                 debug_assert!(bb.uniform || !ssa.is_uniform());
+-                                fills.push(spill.fill(*ssa));
++                                fill_extra =
++                                    max(fill_extra, spill.fill_extra(ssa));
++                                to_fill.push(*ssa);
+                                 b.w.insert(*ssa);
+                             }
+                         });
+ 
+                         let rel_pressure =
+                             bl.get_instr_pressure(ip, &instr)[file];
+-                        let abs_pressure =
+-                            b.w.count(file) + u32::from(rel_pressure);
++                        let abs_pressure = max(
++                            b.w.count(file) + u32::from(rel_pressure),
++                            // Temporaries of recomputed values
++                            b.w.count(file) + fill_extra,
++                        );
+ 
+                         if abs_pressure > limit {
+                             let count = abs_pressure - limit;
+                             let count = count.try_into().unwrap();
+ 
++                            let cost_fn = |ssa: &SSAValue| {
++                                spill.evict_cost(ssa, b.s.contains(ssa))
++                            };
++                            let lu_ref = cur_loop_uses.as_ref().map(|r| &**r);
++                            let costs = smart.then(|| SpillCosts {
++                                cost: &cost_fn,
++                                loop_uses: lu_ref,
++                            });
+                             let mut spills =
+-                                SpillChooser::new(bl, &b.p, ip, count);
++                                SpillChooser::new(bl, &b.p, ip, count)
++                                    .with_costs(costs);
+                             for ssa in b.w.iter() {
+                                 spills.add_candidate(*ssa);
+                             }
++                            let spills: Vec<SSAValue> = spills.into_iter().collect();
+ 
+                             for ssa in spills {
+                                 debug_assert!(ssa.file() == file);
+                                 b.w.remove(&ssa);
+-                                if !spill.is_const(&ssa) {
++                                if !spill.is_remat(&ssa) {
+                                     if DEBUG.annotate() {
+                                         instrs.push(Instr::new(OpAnnotate {
+                                             annotation:
+@@ -918,6 +1167,21 @@ fn spill_values<S: Spill>(
+                             }
+                         }
+ 
++                        // Generate the fills now that W holds what stays
++                        // resident: recomputations may use those values.
++                        let mut fills = Vec::new();
++                        {
++                            let filling: FxHashSet<SSAValue> =
++                                to_fill.iter().cloned().collect();
++                            let w = &b.w;
++                            let resident = |c: &SSAValue| {
++                                w.contains(c) && !filling.contains(c)
++                            };
++                            for ssa in &to_fill {
++                                spill.fill_into(*ssa, &resident, &mut fills);
++                            }
++                        }
++
+                         if DEBUG.annotate() {
+                             instrs.push(Instr::new(OpAnnotate {
+                                 annotation: "generated by spill_values".into(),
+@@ -944,9 +1208,18 @@ fn spill_values<S: Spill>(
+                 });
+             }
+ 
+-            instrs.push(instr);
++            if dry_mode {
++                orig.push(instr);
++            } else {
++                instrs.push(instr);
++            }
++        }
++        if dry_mode {
++            dry_cost.add(blk_wgt, &instrs);
++            bb.instrs = orig;
++        } else {
++            bb.instrs = instrs;
+         }
+-        bb.instrs = instrs;
+ 
+         assert!(ssa_state_out.len() == b_idx);
+         ssa_state_out.push(b);
+@@ -965,6 +1238,7 @@ fn spill_values<S: Spill>(
+         }
+         let s_idx = succ[0];
+ 
++        let p_wgt = loop_weight(blocks.loop_depth(p_idx));
+         let pb = &mut blocks[p_idx];
+         let p_out = &ssa_state_out[p_idx];
+         let s_in = &ssa_state_in[s_idx];
+@@ -988,7 +1262,9 @@ fn spill_values<S: Spill>(
+                     if !p_out.s.contains(ssa) {
+                         spills.push(*ssa);
+                     }
+-                    *src = spill.get_spill(*ssa).into();
++                    if !dry_mode {
++                        *src = spill.get_spill(*ssa).into();
++                    }
+                 } else {
+                     if !p_out.w.contains(ssa) {
+                         fills.push(*ssa);
+@@ -1000,6 +1276,7 @@ fn spill_values<S: Spill>(
+         for ssa in s_in.s.iter() {
+             if !p_out.s.contains(ssa) {
+                 assert!(p_out.w.contains(ssa) || spill.is_const(ssa));
++                debug_assert!(!spill.remat.contains(ssa));
+                 spills.push(*ssa);
+             }
+         }
+@@ -1023,12 +1300,16 @@ fn spill_values<S: Spill>(
+         fills.sort_by_key(|ssa| ssa.idx());
+ 
+         let mut instrs = Vec::new();
+-        for ssa in spills {
++        for ssa in spills.iter().cloned() {
+             instrs.push(spill.spill(ssa));
+         }
++        // A value resident on both sides of the edge can be used by
++        // recomputations here
++        let resident =
++            |c: &SSAValue| p_out.w.contains(c) && s_in.w.contains(c);
+         for ssa in fills {
+             debug_assert!(pb.uniform || !ssa.is_uniform());
+-            instrs.push(spill.fill(ssa));
++            spill.fill_into(ssa, &resident, &mut instrs);
+         }
+ 
+         // Insert spills and fills right after the phi (if any)
+@@ -1036,11 +1317,58 @@ fn spill_values<S: Spill>(
+             .phi_srcs_ip()
+             .or_else(|| pb.branch_ip())
+             .unwrap_or(pb.instrs.len());
+-        pb.instrs.splice(ip..ip, instrs.into_iter());
++        if dry_mode {
++            dry_cost.add(p_wgt, &instrs);
++        } else {
++            pb.instrs.splice(ip..ip, instrs.into_iter());
++        }
++    }
++
++    if let Some(d) = dry {
++        *d = dry_cost;
++    } else {
++        let remat = std::mem::replace(&mut spill.remat, Remat::none());
++        drop(spill);
++        remat.insert_ubases(func);
+     }
+ }
+ 
+ impl Function {
++    /// Estimates the cost of spilling GPRs down to @limit with rematerial-
++    /// ization, without changing the function (see DryCost).  Like
++    /// spill_values, this needs CSSA form.
++    pub fn spill_gpr_cost(
++        &mut self,
++        limit: u32,
++        num_ugprs: u32,
++        info: &mut ShaderInfo,
++    ) -> DryCost {
++        let saved = (
++            info.num_spills_to_mem,
++            info.num_fills_from_mem,
++            info.num_spills_to_reg,
++            info.num_fills_from_reg,
++        );
++        let mut cost = DryCost::default();
++        let spill = SpillGPR::new(info);
++        spill_values(
++            self,
++            RegFile::GPR,
++            limit,
++            spill,
++            true,
++            num_ugprs,
++            Some(&mut cost),
++        );
++        (
++            info.num_spills_to_mem,
++            info.num_fills_from_mem,
++            info.num_spills_to_reg,
++            info.num_fills_from_reg,
++        ) = saved;
++        cost
++    }
++
+     /// Spill values from @file to fit within @limit registers
+     ///
+     /// This pass assumes that the function is already in CSSA form.  See
+@@ -1090,32 +1418,40 @@ impl Function {
+     /// just for the sake of a parallel copy.  While this may not be true in
+     /// general, especially not when spilling to memory, the register allocator
+     /// is good at eliding unnecessary copies.
++    ///
++    /// With @smart (NAK_OCC_TARGET), GPR values that are cheap to recompute
++    /// are rematerialized instead of going to memory (see spill_remat), and
++    /// the values to evict are chosen by next-use distance per restore cost,
++    /// values not used in the current loop first.  @num_ugprs is the size of
++    /// the UGPR file, for addresses that rematerialization keeps in UGPRs.
+     pub fn spill_values(
+         &mut self,
+         file: RegFile,
+         limit: u32,
+         info: &mut ShaderInfo,
++        smart: bool,
++        num_ugprs: u32,
+     ) {
+         match file {
+             RegFile::GPR => {
+                 let spill = SpillGPR::new(info);
+-                spill_values(self, file, limit, spill);
++                spill_values(self, file, limit, spill, smart, num_ugprs, None);
+             }
+             RegFile::UGPR => {
+                 let spill = SpillUniform::new(info);
+-                spill_values(self, file, limit, spill);
++                spill_values(self, file, limit, spill, smart, num_ugprs, None);
+             }
+             RegFile::Pred => {
+                 let spill = SpillPred::new(info);
+-                spill_values(self, file, limit, spill);
++                spill_values(self, file, limit, spill, smart, num_ugprs, None);
+             }
+             RegFile::UPred => {
+                 let spill = SpillPred::new(info);
+-                spill_values(self, file, limit, spill);
++                spill_values(self, file, limit, spill, smart, num_ugprs, None);
+             }
+             RegFile::Bar => {
+                 let spill = SpillBar::new(info);
+-                spill_values(self, file, limit, spill);
++                spill_values(self, file, limit, spill, smart, num_ugprs, None);
+             }
+             _ => panic!("Don't know how to spill {} registers", file),
+         }
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index 8d06b67..f5335f7 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -88,11 +88,12 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+    bool no_cbufs = pdev->debug_flags & NVK_DEBUG_NO_CBUF;
+    bool use_edb_buffer_views = nvk_use_edb_buffer_views(pdev);
+    uint64_t nak_flags = nak_debug_flags(pdev->nak);
+-   /* NAK_GPR_CAP*: binaries compiled under another cap are not reused */
++   /* NAK_GPR_CAP*, NAK_OCC_TARGET: binaries compiled under other register
++    * settings are not reused */
+    uint64_t nak_gpr_caps = nak_gpr_cap_key();
+ 
+    assert(nak_flags <= UINT16_MAX);
+-   assert(nak_gpr_caps <= 0xffffff);
++   assert(nak_gpr_caps <= 0x1ffffff);
+ 
+    return (no_cbufs ? 1 << 12 : 0)
+       | (pdev->ubo_desc_cbufs ? 0 : 1 << 15)
+-- 
+2.43.0
+
