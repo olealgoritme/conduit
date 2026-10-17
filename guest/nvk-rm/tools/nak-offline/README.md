@@ -21,8 +21,8 @@ the others differ by a few instructions with the same GPR count.
 
 `nvstats` is also built for the host's own Vulkan driver (or as
 `nvstats.exe` for Windows) to collect a reference driver's register counts
-and binary sizes for the same corpus. Only the statistics a driver reports
-are used.
+and binary sizes for the same corpus, and the machine code it generated for
+those shaders (see "Reference SASS").
 
 ## Files
 
@@ -31,8 +31,13 @@ are used.
 | `build.sh MESA_DIR [BUILD_DIR]` | Configures and builds NVK, the drm-shim, NAK's unit test binary and `nvstats` (meson >= 1.4 via `MESON`, `JOBS` for ninja) |
 | `run.sh BUILD CORPUS OUT_DIR` | Compiles the corpus; writes `compute.txt`, `frag.txt`, `vert.txt`. NAK knobs in the environment apply |
 | `compare.py [--ref REF] NAME=DIR ...` | Per-shader table and totals of several runs, plus the reference driver's GPRs, warps and code size |
-| `nvstats.c` | The pipeline/statistics tool: `nvstats a.spv ...` (compute), `-g fs-pairs.txt` (fragment), `-v vs-pairs.txt` (vertex) |
+| `nvstats.c` | The pipeline/statistics tool: `nvstats a.spv ...` (compute), `-g fs-pairs.txt` (fragment), `-v vs-pairs.txt` (vertex), `-s a.spv ...` (each file alone as a shader object, any stage). `NVSTATS_DUMP=DIR` also writes each pipeline's own pipeline cache data and internal representations |
 | `genvs.py`, `genfs.py` | Make the matching vertex shaders for fragment shaders and fragment shaders for vertex shaders (`spirv-dis`, `glslangValidator`), printing the pair lists |
+| `run-objects.sh BUILD DIR OUT` | Compiles every SPIR-V file of a directory alone (`nvstats -s`), tessellation and geometry included; one line of statistics per shader (`objmerge.py`) |
+| `objcmp.py A B` | Per-stage totals of two `run-objects.sh` runs: instructions, static cycles, memory spills, shaders with more/fewer GPRs or warps |
+| `refsass.py CACHE_DIR OUT` | The machine code of our pipelines from the reference driver's pipeline cache data (`NVSTATS_DUMP`), for `nvdisasm` |
+| `naksass.sh BUILD CORPUS OUT HASH...` | NAK's machine code for corpus shaders (`NAK_DEBUG=print`, `enc2bin.py`), disassembled with `nvdisasm` |
+| `sassdiff.py REF.sass NAK.sass ...` | Instruction counts of two disassemblies by gap pattern (and `--opcodes`) |
 
 ## Corpus layout
 
@@ -56,6 +61,144 @@ $tools/compare.py --ref corpus --top 20 plain=out/plain occ=out/occ
 # NAK's unit tests (hardware tests need a GPU and are skipped)
 $B/src/nouveau/compiler/nak --skip hw_tests:: --skip nvdisasm_tests::
 ```
+
+## Shader objects
+
+`nvstats -s` compiles each SPIR-V file on its own through
+`VK_EXT_shader_object` (no pipeline state, no partner stage), so corpora
+dumped with `MESA_SPIRV_DUMP_PATH` (files `<hash>.<stage>`) need no pair
+lists, and tessellation and geometry shaders compile too.  The entry point
+is the module's own (`OpEntryPoint`).  Fragment shaders compile without
+the pipeline's render state, so a few numbers differ from a pipeline
+build; for before/after comparisons of compiler changes that does not
+matter.  Statistics are NVK's own (`NVK_SHADER_STATS`).
+
+```sh
+$tools/run-objects.sh $B dump/cs2 out/cs2-off.txt     # with NAK_* knobs off
+$tools/run-objects.sh $B dump/cs2 out/cs2.txt
+$tools/objcmp.py out/cs2-off.txt out/cs2.txt
+```
+
+## Reference SASS
+
+To see where NAK's code differs from the reference compiler's, compare
+machine code, black box: the host's NVIDIA driver compiles our corpus
+through the public Vulkan API, `NVSTATS_DUMP=DIR nvstats ...` saves the
+pipeline cache data it returns for each of our pipelines (an empty
+`VkPipelineCache` per pipeline), `refsass.py` takes the code section of
+our shader out of it (the layout it relies on is described there), and
+NVIDIA's public disassembler `nvdisasm` (CUDA 12.8 or newer for SM120, for
+example from the `nvidia-cuda-nvdisasm` pip wheel) disassembles it.
+Nothing of the driver or compiler binaries is read.  `naksass.sh`
+disassembles NAK's code for the same shaders the same way, and
+`sassdiff.py` counts the difference by pattern.
+
+```sh
+# host, NVIDIA driver
+cc -O2 -o nvstats $tools/nvstats.c -lvulkan
+(cd corpus && NVSTATS_DUMP=$PWD/../nvcache ../nvstats -g heavy-pairs.txt)
+python3 $tools/refsass.py nvcache nvbin
+nvdisasm -b SM120 nvbin/a26771cebd846ea0.1.bin > a26771ce.nv.sass
+# NAK
+$tools/naksass.sh $B corpus naksass a26771cebd846ea0
+$tools/sassdiff.py --opcodes a26771ce.nv.sass naksass/a26771cebd846ea0.fragment.sass
+```
+
+## NAK code size (patches-common/0057-0061)
+
+What NAK's code for the heaviest Steel Nomad shaders spends instructions
+on, beyond the reference compiler's code for the same shaders (six
+fragment shaders a26771ce, f5fb978e, a0f662c7, 797434f6, 59e22586,
+b0825e55; `sassdiff.py`, NAK with all knobs off):
+
+| Pattern | Share of NAK's extra instructions |
+|---|---|
+| Uniform values computed in GPRs inside divergent control flow: 64-bit address adds (IADD3 + IADD3.X), constant-buffer addresses reloaded with two LDCs before each LDG, MOV R, UR, descriptor index clamps | ~30% |
+| Register copies at if/else merges (phi copies, swaps) | 19% |
+| BSSY/BSYNC/BRA/NOP around small blocks (the reference predicates ~3400 instructions there, NAK none) | 15% |
+| BMOV.32.CLEAR before every BSSY (the reference's SM120 code uses `.RECONVERGENT` without it) | 7% |
+| PLOP3 next to comparisons instead of the comparison's accumulator | 3% |
+| Immediates copied to a register once per use | 2% (2a040240, compute: 1461 copies of 11 constants) |
+
+The patches, each behind a knob (`docs/WINDOWS-KNOBS.md`):
+
+- **0057 `NAK_IMM_CSE`**: a register copy of an immediate serves the next
+  uses in its block, up to 16 instructions apart.  Compute shaders only by
+  default; in other stages it costs occupancy on some shaders (`=1` for all
+  stages, `=0` off).
+- **0058 `NAK_UADDR_PIN`**: the uniform 64-bit bases of global memory
+  accesses inside a divergent if are computed before it, in UGPRs, and
+  pinned (as the bindless cbuf handles of `nak_nir_lower_non_uniform_ldcx`
+  are); the accesses use `[R.U32 + UR]` / `[RZ + UR]`.  The
+  rematerializer treats loads through such a pair like the
+  `NAK_OCC_TARGET` constant reloads.  Not for divergent loops, where it
+  made the occupancy target keep 88825d04 and a87cb567 at 8 warps.
+- **0059 `NAK_PLOP_FOLD`**: a PLOP3 of a comparison and one other predicate
+  becomes the comparison's accumulator.
+- **0060 `NAK_IF_CONVERT`**: after register allocation, then-blocks of up
+  to 8 instructions (then + else up to 12) are predicated instead of
+  branched around, BSSY/BSYNC pairs of regions left without branches go,
+  and blocks are merged for the post-RA scheduler.  Never changes register
+  counts.  `NAK_NIR_FLATTEN=1` (off by default) also lets NIR flatten small
+  ifs into selects: fewer instructions, but some shaders lose occupancy.
+- **0061 `NAK_BSSY_RECONVERGENT`** (off by default): on SM100+, if/else
+  barriers use `.RECONVERGENT` without the BMOV.CLEAR, as the reference's
+  SM120 code does.  Not yet run on hardware.
+
+Offline, GB202, `NAK_OCC_TARGET` on; knobs off vs the defaults:
+
+| Steel Nomad DX12 | knobs off | 0057 | 0058 | 0059 | 0060 | defaults | ref |
+|---|---|---|---|---|---|---|---|
+| fragment instructions | 143389 | 143389 | 137542 | 142733 | 142322 | 135760 | |
+| fragment static cycles | 2476438 | | 2313175 | 2461795 | 2467251 | 2290796 | |
+| fragment code bytes | 2294224 | | | | | 2172160 | 2029056 |
+| compute instructions | 70416 | 69410 | 69131 | 70244 | 69781 | 67220 | |
+| compute static cycles | 1011099 | 1013407 | 997498 | 1013217 | 999418 | 989936 | |
+| compute code bytes | 1126656 | | | | | 1075520 | 1042560 |
+
+(Each patch column has only that knob on.)  With the defaults, no shader
+has fewer warps than with the knobs off; seven fragment shaders get 2
+memory spills and 1 fill and two compute shaders 4 and 2, none in a loop.
+
+| Heaviest shaders: instructions | reference | knobs off | defaults |
+|---|---|---|---|
+| a26771ce (fragment) | 11512 | 13913 | 13114 |
+| f5fb978e | 11431 | 13741 | 13213 |
+| a0f662c7 | 10450 | 13164 | 12152 |
+| 797434f6 | 10381 | 12901 | 12002 |
+| 59e22586 | 6460 | 7781 | 7257 |
+| b0825e55 | 6361 | 7739 | 7203 |
+| six together | 56595 | 69239 (+22.3%) | 64941 (+14.7%) |
+| 88825d04 (compute) | 2802 | 2470 | 2386 |
+| a87cb567 | 2546 | 2234 | 2172 |
+| 2a040240 | 18600 | 20091 | 19046 |
+
+The reference compiles 88825d04 and a87cb567 into 128 registers with
+local memory spills; NAK uses 168.
+
+| Other corpora (`run-objects.sh`), knobs off -> defaults | instructions | static cycles | occupancy |
+|---|---|---|---|
+| CS2 (D3D11 via DXVK), 861 compute | -17.2% | -16.5% | 44 shaders more warps |
+| CS2, 4245 fragment | -0.6% | -0.5% | unchanged |
+| CS2, 1004 vertex | -0.4% | -0.5% | unchanged |
+| Heaven, 185 fragment, 58 vertex, 6 tess control, 8 tess eval | 0%, 0%, +1.1%, 0% | 0%, 0%, -5.0%, 0% | unchanged |
+| Steel Nomad Vulkan, 114 compute | -4.9% | -2.3% | 1 shader more warps |
+| Steel Nomad Vulkan, 137 fragment | -2.2% | -1.3% | unchanged |
+
+Correctness, offline: every shader of the four corpora compiles on a
+debug-assertion build with the defaults and with every knob on
+(`NAK_IMM_CSE=1 NAK_BSSY_RECONVERGENT=1 NAK_NIR_FLATTEN=1`), each with and
+without `NAK_DEBUG=spill`, and the Steel Nomad DX12 corpus also with
+`NAK_OCC_TARGET=0`.  With every knob at 0, NAK's output is identical to
+NAK without the patches.  NAK's unit tests cover the PLOP3 fold
+(`opt_setp_fold::tests`) and the if-conversion (`opt_if_convert::tests`);
+the 15 host-runnable tests pass.
+
+What is left of the gap in the six fragment shaders (+14.7%): phi copies
+(24%), branch overhead (16%), BMOV.CLEAR (9%, gone with
+`NAK_BSSY_RECONVERGENT=1`), descriptor index arithmetic still in GPRs
+(11%), and integer address arithmetic NAK does in more instructions
+(IADD3 where the reference uses IADD with the `.U32` address forms).
 
 ## Debug-assertion build
 
@@ -155,6 +298,13 @@ Open points:
   shader's outer loop.
 
 ## Next steps
+
+- Hardware A/B of `NAK_BSSY_RECONVERGENT=1`, `NAK_NIR_FLATTEN=1` and
+  `NAK_IMM_CSE=1` (all stages) against the defaults.
+- Register allocation that coalesces phi webs better (the copies and
+  swaps at if/else merges are the biggest remaining pattern).
+- Hoisting uniform descriptor index arithmetic out of divergent ifs too
+  (needs a UGPR budget across the region).
 
 1. Calibrate the gain model with fps A/Bs (`NAK_GPR_CAP_CS`/`NAK_GPR_CAP_FS`
    points against the default): saturation, least gain, how many memory
