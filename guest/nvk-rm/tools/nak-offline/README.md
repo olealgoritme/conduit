@@ -143,7 +143,8 @@ The patches, each behind a knob (`docs/WINDOWS-KNOBS.md`):
   ifs into selects: fewer instructions, but some shaders lose occupancy.
 - **0061 `NAK_BSSY_RECONVERGENT`** (off by default): on SM100+, if/else
   barriers use `.RECONVERGENT` without the BMOV.CLEAR, as the reference's
-  SM120 code does.  Not yet run on hardware.
+  SM120 code does.  On hardware it changes Steel Nomad's frame rate by less
+  than the run-to-run noise, so it stays off.
 
 Offline, GB202, `NAK_OCC_TARGET` on; knobs off vs the defaults:
 
@@ -218,7 +219,7 @@ What is left of the gap in the six fragment shaders (+14.7%): phi copies
   rolled (5409 instructions with 5 backward branches against 2283 with 15);
   with 8, 0x39204a7e gets 1710 instructions and 96 instead of 104 GPRs, and
   CS2's fragment shaders 8% fewer instructions with 41 gaining warps.
-  Static counts favour rolled loops; the default stays until an fps A/B.
+  Static counts favour rolled loops; the default is 32.
 - **0066 `NAK_VEC_CSE`** (on): the copies that make a splat (an image store
   of `vec4(x)`) a register vector serve its later uses in the block.  CS2
   compute 0x7e5de6c5 2672 -> 2363 instructions.
@@ -229,8 +230,9 @@ What is left of the gap in the six fragment shaders (+14.7%): phi copies
   weak (plain `LDG.E`, order field 0), so its loads can hit in L1; NAK's
   strong GPU-scope loads all go to L2.  Barriers keep their CCTL write-back
   and invalidate.  In GPU timing, 2a040240's light path (24 loads, 25 stores
-  per thread) takes 7 times the reference's time; validate with naktest
-  (`wgsync`) and in games before turning it on.
+  per thread) takes 7 times the reference's time.  `NAK_WEAK_MEM=1` passes
+  naktest (`wgsync`) but changes neither that shader's GPU time nor Steel
+  Nomad's frame rate, so it stays off.
 
 What GPU timing showed beyond instruction counts: loop-heavy compute shaders
 (eee8a710, 7bd2b130) spend about 40% of their inner loop on register copies

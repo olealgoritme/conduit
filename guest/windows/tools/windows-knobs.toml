@@ -1327,7 +1327,7 @@ effect = "1 lets NIR flatten small ifs into selects (nir_opt_peephole_select lim
 [env.NAK_BSSY_RECONVERGENT]
 class = "experiment"
 read = "shader compile (once per process)"
-effect = "1 (SM100 and newer) gives the BSSY/BSYNC pairs of if/else regions the .RECONVERGENT mode, as NVIDIA's own SM120 code does, without the BMOV.CLEAR before each BSSY. Barriers used by BREAK keep the plain mode. Off by default until tested on hardware. Part of the shader cache key."
+effect = "1 (SM100 and newer) gives the BSSY/BSYNC pairs of if/else regions the .RECONVERGENT mode, as NVIDIA's own SM120 code does, without the BMOV.CLEAR before each BSSY. Barriers used by BREAK keep the plain mode. Off by default: no measurable frame-rate change in Steel Nomad. Part of the shader cache key."
 
 [env.NAK_PHI_AVOID]
 class = "tuning"
@@ -1357,7 +1357,7 @@ effect = "On by default (unset or 1); 0 turns it off. The register copies that t
 [env.NAK_WEAK_MEM]
 class = "experiment"
 read = "first shader compile (once per process)"
-effect = "1: global, SSBO and image loads and stores that are not coherent, volatile or atomic use the weak memory order (L1-cacheable plain LDG/STG/SULD/SUST, as NVIDIA's own code does) instead of .STRONG.GPU, which sends every load to L2. Barriers keep the needed cache write-backs and invalidations. Off by default until validated in games. Part of the shader cache key."
+effect = "1: global, SSBO and image loads and stores that are not coherent, volatile or atomic use the weak memory order (L1-cacheable plain LDG/STG/SULD/SUST, as NVIDIA's own code does) instead of .STRONG.GPU, which sends every load to L2. Barriers keep the needed cache write-backs and invalidations. Off by default: no measurable change in Steel Nomad, per shader or in frame rate. Part of the shader cache key."
 
 [env.NAK_OCC_TRACE]
 class = "debug"
