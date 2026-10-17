@@ -1,0 +1,117 @@
+From ff5b5183715695aa049dddb21cd68c02e4b2b203 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 16:00:29 +0200
+Subject: [PATCH] nvk: NVK_DIAG_NO_WFI_BARRIER and NVK_DIAG_WFI_COUNT (debug,
+ measurement only)
+
+NVK_DIAG_NO_WFI_BARRIER=1 (unsafe): pipeline barriers with a source stage
+emit no WAIT_FOR_IDLE on the 3D or compute subchannel.  Cache flushes and
+invalidates stay (a shader data flush still idles implicitly).  An upper
+bound for what draining at barriers costs in a game, before any real
+barrier elision; rendering may be wrong.
+
+NVK_DIAG_WFI_COUNT=1 logs once a second (mesa_logi) how many idles
+pipeline barriers recorded per second: explicit WAIT_FOR_IDLE, shader data
+flushes, and the ones NVK_DIAG_NO_WFI_BARRIER skipped.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c | 63 ++++++++++++++++++++++++++++-
+ 1 file changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index b749e64..cdcd992 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -21,6 +21,8 @@
+ #include "vk_pipeline_layout.h"
+ #include "vk_synchronization.h"
+ #include "util/compiler.h"
++#include "util/log.h"
++#include "util/os_time.h"
+ 
+ #include "clb097.h"
+ #include "clb197.h"
+@@ -551,6 +553,60 @@ nvk_mme_membar(void)
+    return v == 2;
+ }
+ 
++/* NVK_DIAG_NO_WFI_BARRIER=1 (debug, unsafe, measurement only): pipeline
++ * barriers with a source stage emit no WAIT_FOR_IDLE on the 3D or compute
++ * subchannel.  Cache flushes and invalidates stay (a shader data flush
++ * still idles implicitly).  An upper bound for what draining at barriers
++ * costs; results may be wrong.
++ */
++static bool
++nvk_diag_no_wfi_barrier(void)
++{
++   static uint32_t state;
++   uint32_t v = p_atomic_read(&state);
++   if (unlikely(v == 0)) {
++      v = debug_get_bool_option("NVK_DIAG_NO_WFI_BARRIER", false) ? 2 : 1;
++      p_atomic_set(&state, v);
++   }
++   return v == 2;
++}
++
++/* NVK_DIAG_WFI_COUNT=1 (debug): counts the idles pipeline barriers record
++ * (explicit WAIT_FOR_IDLE, shader data flushes, and skipped ones under
++ * NVK_DIAG_NO_WFI_BARRIER) and logs the per-second rates through
++ * mesa_logi once a second while recording.
++ */
++static void
++nvk_diag_wfi_count(int kind)
++{
++   static uint32_t state;
++   static uint32_t counts[3];
++   static uint64_t start_ns;
++   uint32_t v = p_atomic_read(&state);
++   if (likely(v == 1))
++      return;
++   if (v == 0) {
++      v = debug_get_bool_option("NVK_DIAG_WFI_COUNT", false) ? 2 : 1;
++      p_atomic_set(&state, v);
++      if (v == 1)
++         return;
++   }
++   p_atomic_inc(&counts[kind]);
++   uint64_t now = os_time_get_nano();
++   uint64_t then = p_atomic_read(&start_ns);
++   if (then == 0) {
++      p_atomic_cmpxchg(&start_ns, 0, now);
++   } else if (now - then >= 1000000000ull &&
++              p_atomic_cmpxchg(&start_ns, then, now) == then) {
++      double secs = (now - then) / 1e9;
++      uint32_t wfi = p_atomic_xchg(&counts[0], 0);
++      uint32_t flush = p_atomic_xchg(&counts[1], 0);
++      uint32_t skipped = p_atomic_xchg(&counts[2], 0);
++      mesa_logi("NVK_DIAG_WFI_COUNT: %.0f WAIT_FOR_IDLE/s, %.0f flush/s, "
++                "%.0f skipped/s", wfi / secs, flush / secs, skipped / secs);
++   }
++}
++
+ enum nvk_barrier {
+    NVK_BARRIER_WFI                        = 1 << 0,
+    NVK_BARRIER_FLUSH_SHADER_DATA          = 1 << 1,
+@@ -716,6 +772,7 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+ 
+    if (barriers & NVK_BARRIER_FLUSH_SHADER_DATA) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++      nvk_diag_wfi_count(1);
+ 
+       /* This is also implicitly a WFI */
+       if (nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NVA097) {
+@@ -735,7 +792,11 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+        * We only need to WFI on a single channel. The others will implicitly get
+        * a WFI from the channel switch.
+        */
+-      switch (nvk_cmd_buffer_last_subchannel(cmd)) {
++      const uint32_t subc = nvk_cmd_buffer_last_subchannel(cmd);
++      const bool skip = (subc == SUBC_NV9097 || subc == SUBC_NV90C0) &&
++                        nvk_diag_no_wfi_barrier();
++      nvk_diag_wfi_count(skip ? 2 : 0);
++      if (!skip) switch (subc) {
+       case SUBC_NV9097: {
+          struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+          P_IMMD(p, NV9097, WAIT_FOR_IDLE, 0);
+-- 
+2.43.0
+

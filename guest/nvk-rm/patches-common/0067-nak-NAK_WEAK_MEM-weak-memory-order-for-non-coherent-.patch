@@ -1,0 +1,160 @@
+From 0b23bf39b28358946e189dabf24ea548c1bba679 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 16:15:47 +0200
+Subject: [PATCH] nak: NAK_WEAK_MEM, weak memory order for non-coherent global
+ and image accesses
+
+NAK gives every global, SSBO and image load and store that is not
+constant the .STRONG.GPU order.  A strong GPU-scope load cannot be served
+from L1, so every such load goes to L2.  The reference compiler's code for
+the same shaders (vkd3d-proton UAVs, no Coherent or Volatile decorations)
+uses the weak order: plain LDG.E, STG.E, SUST (order field 0).  The
+Vulkan memory model only requires coherent, volatile and atomic accesses
+to be strong; availability and visibility of the others come from
+barriers, for which NAK already emits CCTL WBALL (release) and IVALL
+(acquire) along with the MEMBAR.
+
+NAK_WEAK_MEM=1 (default off until validated in games) gives the weak order
+to loads and stores whose access is not ACCESS_COHERENT, ACCESS_VOLATILE
+or ACCESS_ATOMIC.  Atomics stay strong.  Part of nak_knobs_key().
+
+In GPU timing of Steel Nomad's 2a040240 (light path: 24 loads and 25
+stores per thread, all .STRONG.GPU), NAK takes 7x NVIDIA's time.
+---
+ src/nouveau/compiler/nak/from_nir.rs | 28 +++++++++++++++++++++-------
+ src/nouveau/compiler/nak/knobs.rs    | 12 ++++++++++++
+ 2 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index d761de2..cbf92c7 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -392,6 +392,20 @@ struct ShaderFromNir<'a> {
+     nir_instr_printer: Option<NirInstrPrinter>,
+ }
+ 
++/// The order of a load or store that is not constant: weak when the access
++/// is not coherent, volatile or atomic and NAK_WEAK_MEM is on, as the
++/// reference compiler's code does (plain LDG/STG/SULD/SUST: L1-cacheable).
++/// Barriers already write back and invalidate L1 (CCTL WBALL/IVALL) for
++/// release and acquire.
++fn weak_or_strong(access: gl_access_qualifier) -> MemOrder {
++    let strong = ACCESS_COHERENT | ACCESS_VOLATILE | ACCESS_ATOMIC;
++    if crate::knobs::weak_mem() && (access & strong) == 0 {
++        MemOrder::Weak
++    } else {
++        MemOrder::Strong(MemScope::GPU)
++    }
++}
++
+ impl<'a> ShaderFromNir<'a> {
+     fn new(
+         nak: &nak_compiler,
+@@ -2869,7 +2883,7 @@ impl<'a> ShaderFromNir<'a> {
+                 let mem_order = if (intrin.access() & ACCESS_CAN_REORDER) != 0 {
+                     MemOrder::Constant
+                 } else {
+-                    MemOrder::Strong(MemScope::GPU)
++                    weak_or_strong(intrin.access())
+                 };
+                 let cache_op = LdCacheOp::select(
+                     self.sm,
+@@ -2899,7 +2913,7 @@ impl<'a> ShaderFromNir<'a> {
+                 let mem_order = if (intrin.access() & ACCESS_CAN_REORDER) != 0 {
+                     MemOrder::Constant
+                 } else {
+-                    MemOrder::Strong(MemScope::GPU)
++                    weak_or_strong(intrin.access())
+                 };
+ 
+                 let comps = intrin.num_components;
+@@ -2932,7 +2946,7 @@ impl<'a> ShaderFromNir<'a> {
+                 let mem_order = if (intrin.access() & ACCESS_CAN_REORDER) != 0 {
+                     MemOrder::Constant
+                 } else {
+-                    MemOrder::Strong(MemScope::GPU)
++                    weak_or_strong(intrin.access())
+                 };
+ 
+                 let comps = intrin.num_components;
+@@ -2985,7 +2999,7 @@ impl<'a> ShaderFromNir<'a> {
+                 let cache_op = StCacheOp::select(
+                     self.sm,
+                     MemSpace::Global(MemAddrType::A64),
+-                    MemOrder::Strong(MemScope::GPU),
++                    weak_or_strong(intrin.access()),
+                     self.get_eviction_priority(intrin.access()),
+                 );
+ 
+@@ -3015,7 +3029,7 @@ impl<'a> ShaderFromNir<'a> {
+                 b.push_op(OpSuSt {
+                     image_access,
+                     image_dim: dim,
+-                    mem_order: MemOrder::Strong(MemScope::GPU),
++                    mem_order: weak_or_strong(intrin.access()),
+                     mem_eviction_priority: self
+                         .get_eviction_priority(intrin.access()),
+                     handle: handle,
+@@ -3342,7 +3356,7 @@ impl<'a> ShaderFromNir<'a> {
+                 let order = if intrin.access() & ACCESS_CAN_REORDER != 0 {
+                     MemOrder::Constant
+                 } else {
+-                    MemOrder::Strong(MemScope::GPU)
++                    weak_or_strong(intrin.access())
+                 };
+                 let access = MemAccess {
+                     mem_type: MemType::from_size(size_B, false),
+@@ -3882,7 +3896,7 @@ impl<'a> ShaderFromNir<'a> {
+                 let access = MemAccess {
+                     mem_type: MemType::from_size(size_B, false),
+                     space: MemSpace::Global(MemAddrType::A64),
+-                    order: MemOrder::Strong(MemScope::GPU),
++                    order: weak_or_strong(intrin.access()),
+                     eviction_priority: self
+                         .get_eviction_priority(intrin.access()),
+                 };
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index cd5b15b..2475aac 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -33,6 +33,10 @@
+ //! - NAK_VEC_CSE (default on): the copies that make a vector source with
+ //!   repeated components (a splat) serve its later uses in the block
+ //!   (legalizer)
++//! - NAK_WEAK_MEM (default off): global, SSBO and image loads and stores
++//!   that are not coherent, volatile or atomic use the weak memory order
++//!   (L1-cacheable, as in the reference compiler's code) instead of
++//!   .STRONG.GPU (from_nir.rs)
+ //! - NAK_UNROLL_MAX (default 32): most iterations NIR fully unrolls a loop
+ //!   with a known trip count; lower values keep more loops rolled, as the
+ //!   reference compiler does
+@@ -74,6 +78,7 @@ static BAR_SHARE: OnceLock<bool> = OnceLock::new();
+ static LAT_MASK: OnceLock<u32> = OnceLock::new();
+ static UNROLL_MAX: OnceLock<u32> = OnceLock::new();
+ static VEC_CSE: OnceLock<bool> = OnceLock::new();
++static WEAK_MEM: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -157,6 +162,12 @@ pub fn lat_mask() -> u32 {
+     *v
+ }
+ 
++pub fn weak_mem() -> bool {
++    let v = WEAK_MEM
++        .get_or_init(|| parse("NAK_WEAK_MEM", env::var("NAK_WEAK_MEM"), false));
++    *v
++}
++
+ pub fn vec_cse() -> bool {
+     let v = VEC_CSE
+         .get_or_init(|| parse("NAK_VEC_CSE", env::var("NAK_VEC_CSE"), true));
+@@ -221,4 +232,5 @@ pub extern "C" fn nak_knobs_key() -> u32 {
+         | (lat << 2)
+         | (unroll << 9)
+         | (u32::from(vec_cse()) << 12)
++        | (u32::from(weak_mem()) << 13)
+ }
+-- 
+2.43.0
+

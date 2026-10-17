@@ -1,0 +1,304 @@
+From e3d76f9b57e7a8bd4ab4411a9958027fe7ec3cdf Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 14:59:03 +0200
+Subject: [PATCH] nak: a register copy of an immediate serves the next uses in
+ its block (NAK_IMM_CSE)
+
+An FFMA by two constants (x * 34.0 + 1.0, say) needs one of them in a
+register, and the legalizer made a new copy for every such instruction:
+the biggest Steel Nomad compute shader (2a040240) had 1461 copies of 11
+distinct immediates, 632 of them of 1.0.  The reference compiler's code
+for the same shader has 71.
+
+Like the uniform-value copies (NAK_DEBUG=noucse), a copy now serves the
+later uses of the same immediate in its block, as long as the previous
+use is at most 16 instructions back: a constant held across a long
+stretch costs the scheduler a register there.
+
+Even so, in fragment and vertex shaders the longer live ranges cost
+occupancy on some shaders (34 of 4245 CS2 fragment shaders lose warps),
+so by default this is for compute shaders only, where no shader in the
+Steel Nomad and CS2 corpora changed its register count class.
+NAK_IMM_CSE=1 turns it on for every stage, 0 off.
+
+knobs.rs collects the knobs of this series; they go into
+nak_gpr_cap_key() (bits 25 and up) and so into the shader cache keys.
+NVK's check of that key now allows all 32 bits (the key sits in bits
+16-47 of the compiler flags), and the NVK_SHADER_STATS header prints the
+register caps only when one is set.
+
+Offline, GB202: Steel Nomad compute 70416 -> 69410 instructions,
+2a040240 20091 -> 19123; CS2 compute -0.4%.
+---
+ src/nouveau/compiler/nak/gpr_cap.rs  |  3 +-
+ src/nouveau/compiler/nak/knobs.rs    | 44 +++++++++++++++
+ src/nouveau/compiler/nak/legalize.rs | 84 ++++++++++++++++++++++++++++
+ src/nouveau/compiler/nak/lib.rs      |  1 +
+ src/nouveau/vulkan/nvk_shader.c      |  4 +-
+ 5 files changed, 133 insertions(+), 3 deletions(-)
+ create mode 100644 src/nouveau/compiler/nak/knobs.rs
+
+diff --git a/src/nouveau/compiler/nak/gpr_cap.rs b/src/nouveau/compiler/nak/gpr_cap.rs
+index 3c7b035..722dd42 100644
+--- a/src/nouveau/compiler/nak/gpr_cap.rs
++++ b/src/nouveau/compiler/nak/gpr_cap.rs
+@@ -98,7 +98,7 @@ fn gpr_caps() -> GprCaps {
+ 
+ /// The effective caps, packed for driver cache keys: compute in bits 0-7,
+ /// fragment in bits 8-15, every other stage in bits 16-23; 0 is no cap.
+-/// Bit 24 is set with NAK_OCC_TARGET on.
++/// Bit 24 is set with NAK_OCC_TARGET on; bits 25 and up are knobs.rs.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nak_gpr_cap_key() -> u32 {
+     let c = gpr_caps();
+@@ -106,6 +106,7 @@ pub extern "C" fn nak_gpr_cap_key() -> u32 {
+         | (u32::from(c.fragment) << 8)
+         | (u32::from(c.other) << 16)
+         | (u32::from(occ_target_enabled()) << 24)
++        | crate::knobs::cache_key_bits()
+ }
+ 
+ impl Shader<'_> {
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+new file mode 100644
+index 0000000..21c4705
+--- /dev/null
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -0,0 +1,44 @@
++// Copyright © 2026 Conduit contributors
++// SPDX-License-Identifier: MIT
++
++//! Knobs for the code size work that compares NAK's output with the
++//! reference compiler's for the same shaders.  Each is read once from the
++//! environment: 0 turns it off (NAK's previous code generation for that
++//! part), 1 on; unset is the default given below.  They are part of
++//! nak_gpr_cap_key() and so of the driver's shader cache keys.
++//!
++//! - NAK_IMM_CSE: a register copy of an immediate serves the next uses in
++//!   its block (legalizer).  Default: compute shaders only, where it never
++//!   cost occupancy in the corpora tried; 1: every stage
++
++use std::env;
++use std::sync::OnceLock;
++
++static IMM_CSE: OnceLock<Option<bool>> = OnceLock::new();
++
++/// NAK_IMM_CSE for a shader: compute shaders unless set
++pub fn imm_cse(compute: bool) -> bool {
++    let v = IMM_CSE.get_or_init(|| match env::var("NAK_IMM_CSE") {
++        Ok(s) => match s.trim() {
++            "1" => Some(true),
++            "0" => Some(false),
++            _ => None,
++        },
++        Err(_) => None,
++    });
++    v.unwrap_or(compute)
++}
++
++fn imm_cse_key() -> u32 {
++    let _ = imm_cse(false);
++    match IMM_CSE.get().copied().flatten() {
++        None => 0,
++        Some(false) => 1,
++        Some(true) => 2,
++    }
++}
++
++/// The knobs packed for nak_gpr_cap_key(), bits 25 and up
++pub fn cache_key_bits() -> u32 {
++    imm_cse_key() << 30
++}
+diff --git a/src/nouveau/compiler/nak/legalize.rs b/src/nouveau/compiler/nak/legalize.rs
+index 2978c59..47387bb 100644
+--- a/src/nouveau/compiler/nak/legalize.rs
++++ b/src/nouveau/compiler/nak/legalize.rs
+@@ -8,6 +8,10 @@ use crate::liveness::{BlockLiveness, Liveness, SimpleLiveness};
+ 
+ use rustc_hash::{FxHashMap, FxHashSet};
+ 
++/// Most instructions between two uses of one register copy of an immediate
++/// (NAK_IMM_CSE)
++const IMM_COPY_WINDOW: usize = 16;
++
+ pub fn src_is_upred_reg(src: &Src) -> bool {
+     match &src.src_ref {
+         SrcRef::True | SrcRef::False => false,
+@@ -178,6 +182,19 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+     /// Remember that `copy` holds uniform value `ssa` in a GPR.
+     fn note_warp_copy(&mut self, _ssa: SSAValue, _copy: SSAValue) {}
+ 
++    /// A register copy of immediate `imm` in `file` made earlier in this
++    /// block, if any (LegalizeBuilder reuses them; other builders never do).
++    fn cached_imm_copy(
++        &mut self,
++        _file: RegFile,
++        _imm: u32,
++    ) -> Option<SSAValue> {
++        None
++    }
++
++    /// Remember that `copy` holds immediate `imm`.
++    fn note_imm_copy(&mut self, _file: RegFile, _imm: u32, _copy: SSAValue) {}
++
+     fn copy_alu_src(
+         &mut self,
+         src: &mut Src,
+@@ -215,6 +232,31 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+             }
+         }
+ 
++        // The same goes for immediates: an FFMA by two constants (say
++        // x * 34.0 + 1.0) needs one of them in a register, and a shader full
++        // of them would otherwise get a copy of 1.0 before every one.
++        let one_imm = match &src.src_ref {
++            SrcRef::Imm32(u)
++                if matches!(
++                    src_type,
++                    SrcType::GPR
++                        | SrcType::ALU
++                        | SrcType::F32
++                        | SrcType::I32
++                        | SrcType::B32
++                ) =>
++            {
++                Some(*u)
++            }
++            _ => None,
++        };
++        if let Some(u) = one_imm {
++            if let Some(copy) = self.cached_imm_copy(reg_file, u) {
++                src.src_ref = copy.into();
++                return;
++            }
++        }
++
+         let val = match src_type {
+             SrcType::GPR
+             | SrcType::ALU
+@@ -241,6 +283,9 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+             if let Some(u) = one_uniform {
+                 self.note_warp_copy(u, val[0]);
+             }
++            if let Some(u) = one_imm {
++                self.note_imm_copy(reg_file, u, val[0]);
++            }
+         } else {
+             match old_src_ref {
+                 SrcRef::Imm32(u) => {
+@@ -445,6 +490,10 @@ pub struct LegalizeBuilder<'a> {
+     const_tracker: &'a mut ConstTracker,
+     /// GPR copies of uniform values made earlier in this block
+     warp_copies: Option<&'a mut FxHashMap<SSAValue, SSAValue>>,
++    /// Register copies of immediates made earlier in this block
++    imm_copies: Option<&'a mut FxHashMap<(RegFile, u32), (SSAValue, usize)>>,
++    /// Index of the instruction being legalized in its block
++    ip: usize,
+ }
+ 
+ impl<'a> LegalizeBuilder<'a> {
+@@ -457,6 +506,8 @@ impl<'a> LegalizeBuilder<'a> {
+             b: SSAInstrBuilder::new(sm, alloc),
+             const_tracker,
+             warp_copies: None,
++            imm_copies: None,
++            ip: 0,
+         }
+     }
+ 
+@@ -506,6 +557,27 @@ impl LegalizeBuildHelpers for LegalizeBuilder<'_> {
+         self.warp_copies.as_ref().and_then(|m| m.get(ssa).copied())
+     }
+ 
++    fn cached_imm_copy(&mut self, file: RegFile, imm: u32) -> Option<SSAValue> {
++        // Only reuse a copy whose last use is close: a constant held in a
++        // register across a long stretch costs the scheduler a register
++        // there and costs more than the copies it saves.
++        let ip = self.ip;
++        let m = self.imm_copies.as_mut()?;
++        let e = m.get_mut(&(file, imm))?;
++        if ip - e.1 > IMM_COPY_WINDOW {
++            return None;
++        }
++        e.1 = ip;
++        Some(e.0)
++    }
++
++    fn note_imm_copy(&mut self, file: RegFile, imm: u32, copy: SSAValue) {
++        let ip = self.ip;
++        if let Some(m) = self.imm_copies.as_mut() {
++            m.insert((file, imm), (copy, ip));
++        }
++    }
++
+     fn note_warp_copy(&mut self, ssa: SSAValue, copy: SSAValue) {
+         if let Some(m) = self.warp_copies.as_mut() {
+             m.insert(ssa, copy);
+@@ -656,11 +728,19 @@ impl Shader<'_> {
+             let mut const_tracker = ConstTracker::new();
+ 
+             let ucse = !DEBUG.no_ucse();
++            let imm_cse = crate::knobs::imm_cse(matches!(
++                self.info.stage,
++                ShaderStageInfo::Compute(_)
++            ));
+             for (bi, b) in f.blocks.iter_mut().enumerate() {
+                 let bl = live.block_live(bi);
+                 let bu = b.uniform;
+                 let mut warp_copies: FxHashMap<SSAValue, SSAValue> =
+                     Default::default();
++                let mut imm_copies: FxHashMap<
++                    (RegFile, u32),
++                    (SSAValue, usize),
++                > = Default::default();
+ 
+                 let mut instrs = Vec::new();
+                 for (ip, mut instr) in b.instrs.drain(..).enumerate() {
+@@ -684,6 +764,10 @@ impl Shader<'_> {
+                     if ucse {
+                         b.warp_copies = Some(&mut warp_copies);
+                     }
++                    if imm_cse {
++                        b.imm_copies = Some(&mut imm_copies);
++                    }
++                    b.ip = ip;
+                     legalize_instr(sm, &mut b, bl, bu, &pinned, ip, &mut instr);
+                     b.push_instr(instr);
+                     instrs.append(&mut b.into_vec());
+diff --git a/src/nouveau/compiler/nak/lib.rs b/src/nouveau/compiler/nak/lib.rs
+index 4689718..76b305d 100644
+--- a/src/nouveau/compiler/nak/lib.rs
++++ b/src/nouveau/compiler/nak/lib.rs
+@@ -9,6 +9,7 @@ mod const_tracker;
+ mod from_nir;
+ mod gpr_cap;
+ mod ir;
++mod knobs;
+ mod legalize;
+ mod liveness;
+ mod lower_copy_swap;
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index f5335f7..423b451 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -93,7 +93,7 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+    uint64_t nak_gpr_caps = nak_gpr_cap_key();
+ 
+    assert(nak_flags <= UINT16_MAX);
+-   assert(nak_gpr_caps <= 0x1ffffff);
++   assert(nak_gpr_caps <= UINT32_MAX);
+ 
+    return (no_cbufs ? 1 << 12 : 0)
+       | (pdev->ubo_desc_cbufs ? 0 : 1 << 15)
+@@ -746,7 +746,7 @@ nvk_shader_stats_file(void)
+          fprintf(file, "NVK shader stats: stage hash code_B instrs gprs "
+                  "max_warps static_cycles spills_mem fills_mem spills_reg "
+                  "fills_reg slm_B crs_B [stage details]\n");
+-         uint32_t caps = nak_gpr_cap_key();
++         uint32_t caps = nak_gpr_cap_key() & 0xffffff;
+          if (caps != 0) {
+             fprintf(file, "NVK shader stats: NAK_GPR_CAP compute %u "
+                     "fragment %u other %u (0: none)\n", caps & 0xff,
+-- 
+2.43.0
+

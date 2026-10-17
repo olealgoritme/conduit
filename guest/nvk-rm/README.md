@@ -89,6 +89,20 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_RM_RING_YIELD_MS` | 4 | how long a full-ring wait yields before it sleeps |
 | `NVK_RM_HIRES_SLEEP` | 1 | sleeps on a high-resolution waitable timer instead of `os_time_sleep` |
 | `NVK_RM_TIMESLICE_US`, `NVK_RM_INTERLEAVE` | unset (RM defaults) | GR runlist timeslice and interleave level of each context's TSG |
+| **Shader compiler (NAK)** | | all part of the shader cache key; per-shader statistics with `NVK_SHADER_STATS=1` |
+| `NAK_OCC_TARGET` | 1 | rematerialization in the spiller and a per-shader register target that trades a few cheap spills for more warps (common 56) |
+| `NAK_GPR_CAP` | unset (no cap) | caps registers per thread for every stage; spills what does not fit (common 55) |
+| `NAK_IMM_CSE` | compute shaders | one register copy of an immediate serves the next uses in its block; 1 every stage, 0 never (common 57) |
+| `NAK_UADDR_PIN` | 1 | uniform 64-bit address bases in divergent ifs are computed before the if in uniform registers (common 58) |
+| `NAK_PLOP_FOLD` | 1 | a PLOP3 of a comparison and one predicate becomes the comparison's accumulator (common 59) |
+| `NAK_IF_CONVERT`, `NAK_NIR_FLATTEN` | 1, 0 | small then/else blocks predicated after register allocation; NIR flattening of small ifs (common 60) |
+| `NAK_BSSY_RECONVERGENT` | 0 | SM100+ if/else barriers in `.RECONVERGENT` mode without BMOV.CLEAR (common 61) |
+| `NAK_PHI_AVOID` | 1 | new values stay out of the registers the block's phi copies want (common 62) |
+| `NAK_UNROLL_MAX` | 32 | most iterations NIR fully unrolls a loop with a known trip count (common 65) |
+| `NAK_VEC_CSE` | 1 | the copies that make a splat a register vector serve its later uses in the block (common 66) |
+| `NAK_WEAK_MEM` | 0 | weak (L1-cacheable) order for non-coherent global, SSBO and image accesses (common 67) |
+| `NAK_BAR_SHARE`, `NAK_LAT` | 0, 0 | scoreboard sharing and SM120 latency padding, for hardware validation with `tools/naktest` (common 63) |
+| `NVK_DIAG_NO_WFI_BARRIER`, `NVK_DIAG_WFI_COUNT` | 0, 0 | measurement only: pipeline barriers without WAIT_FOR_IDLE (unsafe); count barrier idles per second (common 64) |
 | **Windows presentation** | | |
 | `NVK_HELIOS_WSI` | 1 | Helios zero-copy swapchains; 0 = GDI copy |
 | `NVK_HELIOS_WSI_LINEAR` | 0 | linear instead of block-linear scanout images |
@@ -289,6 +303,19 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0052 | RM: a compute dispatch's root descriptor table (`NVKMD_MEM_GPU_LATENCY`, its own upload stream) can be CPU-mapped VRAM, `NVK_RM_UPLOAD_VRAM=compute` (`1` all upload memory; default `0`, none); NVK's own CPU-mapped VRAM has a 256 MiB budget of its own and no longer needs the application's BAR heap |
 | 0053 | NAK: the legalizer's GPR copy of a uniform value serves every later use in its block (an FFMA by two uniform constants made a copy per FFMA, all in one register: a copy -> FFMA chain at a fraction of the FMA rate); `NAK_DEBUG=noucse` makes a copy per use |
 | 0054 | the command buffer memory of destroyed and trimmed command pools stays in a per-device cache (`NVK_CMD_MEM_CACHE` blocks of each kind, default 64; 0 frees them) for the next pools: a new block is an allocation, a GPU VA and a CPU map, host round trips on RM in a guest, and vkd3d-proton makes a command pool per D3D12 command allocator |
+| 0055 | NAK: `NAK_GPR_CAP`, an opt-in register cap per thread for every stage; the pre-RA scheduler schedules for it and register allocation spills the rest |
+| 0056 | NAK: rematerialization in the GPR spiller (constants, constant-buffer loads, thread IDs and short ALU chains are recomputed at reloads) and a per-shader register target that takes the register count with the best estimated gain in warps per SM, never with spills in a loop (`NAK_OCC_TARGET`, default on) |
+| 0057 | NAK: a register copy of an immediate serves the next uses in its block (`NAK_IMM_CSE`, compute shaders by default) |
+| 0058 | NAK: uniform 64-bit address bases in divergent ifs are computed before the if in uniform registers and pinned, so accesses use `[R.U32 + UR]` / `[RZ + UR]` (`NAK_UADDR_PIN`, default on) |
+| 0059 | NAK: a PLOP3 of a comparison and one other predicate becomes the comparison's accumulator (`NAK_PLOP_FOLD`, default on) |
+| 0060 | NAK: small then/else blocks are predicated after register allocation and dead BSSY/BSYNC pairs removed (`NAK_IF_CONVERT`, default on); `NAK_NIR_FLATTEN=1` also flattens in NIR |
+| 0061 | NAK: SM100+ if/else barriers in `.RECONVERGENT` mode without BMOV.CLEAR (`NAK_BSSY_RECONVERGENT`, opt-in) |
+| 0062 | NAK: a new value without a register preference avoids the registers the block's phi copies want (`NAK_PHI_AVOID`, default on); knobs that do not fit `nak_gpr_cap_key()` go into `nak_knobs_key()`, part of NVK's compiler flags |
+| 0063 | NAK: scoreboard sharing and SM120 latency padding per dependency class (`NAK_BAR_SHARE`, `NAK_LAT`, off; for hardware validation) |
+| 0064 | `NVK_DIAG_NO_WFI_BARRIER` (unsafe) and `NVK_DIAG_WFI_COUNT`: skip or count the WAIT_FOR_IDLE of pipeline barriers, an upper bound of barrier-drain cost |
+| 0065 | NAK: `NAK_UNROLL_MAX`, how many iterations NIR fully unrolls (default 32) |
+| 0066 | NAK: the copies that turn a splat into a register vector serve its later uses in the block (`NAK_VEC_CSE`, default on) |
+| 0067 | NAK: weak memory order for non-coherent global, SSBO and image accesses (`NAK_WEAK_MEM`, opt-in) |
 
 ## Per-draw cost (common 0001-0007)
 

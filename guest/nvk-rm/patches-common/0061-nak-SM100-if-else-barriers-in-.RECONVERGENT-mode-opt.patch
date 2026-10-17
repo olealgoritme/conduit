@@ -1,0 +1,274 @@
+From 96bd474ae38c052ca04ea9117180dcf2de2ac965 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 14:59:04 +0200
+Subject: [PATCH] nak: SM100+ if/else barriers in .RECONVERGENT mode (opt-in
+ NAK_BSSY_RECONVERGENT)
+
+On SM120 the reference compiler's code uses BSSY.RECONVERGENT and
+BSYNC.RECONVERGENT for if/else regions (.RELIABLE for loops with BREAK)
+and never clears the barrier first; NAK uses the plain mode with a
+BMOV.32.CLEAR before every BSSY (155 of them in a26771ce).
+
+With NAK_BSSY_RECONVERGENT=1 on SM100+, a barrier whose value only
+BSYNCs use gets the .RECONVERGENT mode (bit 73) on its BSSY and BSYNC,
+and an undefined barrier input instead of the BMOV.CLEAR.  Barriers used
+by BREAK or phis keep the plain mode.  Off by default until it has run
+on hardware.
+---
+ src/nouveau/compiler/nak/from_nir.rs    | 58 +++++++++++++++++++++++--
+ src/nouveau/compiler/nak/ir.rs          | 26 ++++++++++-
+ src/nouveau/compiler/nak/knobs.rs       | 16 +++++++
+ src/nouveau/compiler/nak/sm70_encode.rs |  8 ++++
+ 4 files changed, 102 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index 99c4e1c..d761de2 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -377,6 +377,10 @@ struct ShaderFromNir<'a> {
+     label_alloc: LabelAllocator,
+     block_label: FxHashMap<u32, Label>,
+     bar_label: FxHashMap<u32, Label>,
++    /// SSA defs with a use other than bar_sync_nv (see bar_only_synced)
++    bar_other_uses: FxHashSet<u32>,
++    /// bar_set_nv defs whose BSSY/BSYNC use the .RECONVERGENT mode
++    bar_reconvergent: FxHashSet<u32>,
+     sync_blocks: FxHashSet<u32>,
+     crs: Vec<(u32, SyncType)>,
+     fs_out_regs: [Option<SSAValue>; 34],
+@@ -404,6 +408,8 @@ impl<'a> ShaderFromNir<'a> {
+             label_alloc: LabelAllocator::new(),
+             block_label: Default::default(),
+             bar_label: Default::default(),
++            bar_other_uses: Default::default(),
++            bar_reconvergent: Default::default(),
+             sync_blocks: Default::default(),
+             crs: Vec::new(),
+             fs_out_regs: [None; 34],
+@@ -2616,10 +2622,26 @@ impl<'a> ShaderFromNir<'a> {
+                 let old = self.bar_label.insert(intrin.def.index, label);
+                 assert!(old.is_none());
+ 
++                // A barrier that only BSYNCs use is an if/else region.  On
++                // SM100+ it can use the .RECONVERGENT mode, which needs no
++                // cleared barrier (NAK_BSSY_RECONVERGENT).
++                let reconvergent = self.sm.sm() >= 100
++                    && crate::knobs::bssy_reconvergent()
++                    && !self.bar_other_uses.contains(&intrin.def.index);
++                if reconvergent {
++                    self.bar_reconvergent.insert(intrin.def.index);
++                }
++
+                 let bar_clear = b.alloc_ssa(RegFile::Bar);
+-                b.push_op(OpBClear {
+-                    dst: bar_clear.into(),
+-                });
++                if reconvergent {
++                    b.push_op(OpUndef {
++                        dst: bar_clear.into(),
++                    });
++                } else {
++                    b.push_op(OpBClear {
++                        dst: bar_clear.into(),
++                    });
++                }
+ 
+                 let bar_out = b.alloc_ssa(RegFile::Bar);
+                 b.push_op(OpBSSy {
+@@ -2627,6 +2649,7 @@ impl<'a> ShaderFromNir<'a> {
+                     bar_in: bar_clear.into(),
+                     cond: SrcRef::True.into(),
+                     target: label,
++                    reconvergent,
+                 });
+ 
+                 self.set_dst(&intrin.def, b.bmov_to_gpr(bar_out.into()).into());
+@@ -2635,12 +2658,13 @@ impl<'a> ShaderFromNir<'a> {
+                 let src = self.get_src(&srcs[0]);
+ 
+                 let bar = b.bmov_to_bar(src);
++                let bar_set_idx = &srcs[1].as_def().index;
+                 b.push_op(OpBSync {
+                     bar: bar.into(),
+                     cond: SrcRef::True.into(),
++                    reconvergent: self.bar_reconvergent.contains(bar_set_idx),
+                 });
+ 
+-                let bar_set_idx = &srcs[1].as_def().index;
+                 if let Some(label) = self.bar_label.get(bar_set_idx) {
+                     b.push_op(OpNop {
+                         label: Some(*label),
+@@ -4315,11 +4339,13 @@ impl<'a> ShaderFromNir<'a> {
+                 bar_in: bar_clear.into(),
+                 cond: SrcRef::True.into(),
+                 target: label,
++                reconvergent: false,
+             });
+ 
+             b.push_op(OpBSync {
+                 bar: bar.into(),
+                 cond: SrcRef::True.into(),
++                reconvergent: false,
+             });
+ 
+             b.push_op(OpNop { label: Some(label) });
+@@ -4616,6 +4642,30 @@ impl<'a> ShaderFromNir<'a> {
+         let mut phi_alloc = PhiAllocator::new();
+         let mut phi_map = PhiAllocMap::new(&mut phi_alloc);
+ 
++        // Every SSA def with a use other than bar_sync_nv: a bar_set_nv
++        // whose value goes anywhere else (a BREAK, a phi) is not a plain
++        // if/else barrier.
++        self.bar_other_uses.clear();
++        for nb in nfi.iter_blocks() {
++            for ni in nb.iter_instr_list() {
++                if let Some(np) = ni.as_phi() {
++                    for ps in np.iter_srcs() {
++                        self.bar_other_uses.insert(ps.src.as_def().index);
++                    }
++                } else if let Some(intrin) = ni.as_intrinsic() {
++                    if intrin.intrinsic != nir_intrinsic_bar_sync_nv {
++                        for src in intrin.srcs_as_slice() {
++                            self.bar_other_uses.insert(src.as_def().index);
++                        }
++                    }
++                } else if let Some(alu) = ni.as_alu() {
++                    for src in alu.srcs_as_slice() {
++                        self.bar_other_uses.insert(src.src.as_def().index);
++                    }
++                }
++            }
++        }
++
+         self.parse_cf_list(&mut ssa_alloc, &mut phi_map, nfi.iter_body());
+ 
+         let cfg = std::mem::take(&mut self.cfg).as_cfg(true);
+diff --git a/src/nouveau/compiler/nak/ir.rs b/src/nouveau/compiler/nak/ir.rs
+index 6ca0594..a66fcde 100644
+--- a/src/nouveau/compiler/nak/ir.rs
++++ b/src/nouveau/compiler/nak/ir.rs
+@@ -7124,11 +7124,25 @@ pub struct OpBSSy {
+     pub cond: Src,
+ 
+     pub target: Label,
++
++    /// SM100+ .RECONVERGENT mode (an if/else region: no BREAK on the
++    /// barrier).  bar_in is then undefined: this mode needs no cleared
++    /// barrier.
++    pub reconvergent: bool,
+ }
+ 
+ impl DisplayOp for OpBSSy {
+     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        write!(f, "bssy {} {} {}", self.bar_in, self.cond, self.target)
++        let mode = if self.reconvergent {
++            ".reconvergent"
++        } else {
++            ""
++        };
++        write!(
++            f,
++            "bssy{} {} {} {}",
++            mode, self.bar_in, self.cond, self.target
++        )
+     }
+ }
+ impl_display_for_op!(OpBSSy);
+@@ -7141,11 +7155,19 @@ pub struct OpBSync {
+ 
+     #[src_type(Pred)]
+     pub cond: Src,
++
++    /// SM100+ .RECONVERGENT mode, matching its OpBSSy
++    pub reconvergent: bool,
+ }
+ 
+ impl DisplayOp for OpBSync {
+     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        write!(f, "bsync {} {}", self.bar, self.cond)
++        let mode = if self.reconvergent {
++            ".reconvergent"
++        } else {
++            ""
++        };
++        write!(f, "bsync{} {} {}", mode, self.bar, self.cond)
+     }
+ }
+ impl_display_for_op!(OpBSync);
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index d0f70ca..9a5ed44 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -20,6 +20,10 @@
+ //!   (nir_opt_peephole_select limit 8, nak_nir.c).  Fewer instructions, but
+ //!   the values of both sides are live at once, which costs occupancy on
+ //!   some shaders
++//! - NAK_BSSY_RECONVERGENT (default off): on SM100+, the BSSY/BSYNC pairs of
++//!   if/else regions (barriers no BREAK uses) use the .RECONVERGENT mode,
++//!   as the reference compiler's SM120 code does, without the BMOV.CLEAR
++//!   before the BSSY.  Off until it has run on hardware
+ 
+ use std::env;
+ use std::sync::OnceLock;
+@@ -48,6 +52,7 @@ static UADDR_PIN: OnceLock<bool> = OnceLock::new();
+ static PLOP_FOLD: OnceLock<bool> = OnceLock::new();
+ static IF_CONVERT: OnceLock<bool> = OnceLock::new();
+ static NIR_FLATTEN: OnceLock<bool> = OnceLock::new();
++static BSSY_RECONVERGENT: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -93,6 +98,16 @@ pub fn nir_flatten() -> bool {
+     })
+ }
+ 
++pub fn bssy_reconvergent() -> bool {
++    *BSSY_RECONVERGENT.get_or_init(|| {
++        parse(
++            "NAK_BSSY_RECONVERGENT",
++            env::var("NAK_BSSY_RECONVERGENT"),
++            false,
++        )
++    })
++}
++
+ /// The knobs packed for nak_gpr_cap_key(), bits 25 and up
+ pub fn cache_key_bits() -> u32 {
+     (imm_cse_key() << 30)
+@@ -100,6 +115,7 @@ pub fn cache_key_bits() -> u32 {
+         | (u32::from(plop_fold()) << 28)
+         | (u32::from(if_convert()) << 29)
+         | (u32::from(nir_flatten()) << 25)
++        | (u32::from(bssy_reconvergent()) << 27)
+ }
+ 
+ #[unsafe(no_mangle)]
+diff --git a/src/nouveau/compiler/nak/sm70_encode.rs b/src/nouveau/compiler/nak/sm70_encode.rs
+index 0be41f9..9f430ca 100644
+--- a/src/nouveau/compiler/nak/sm70_encode.rs
++++ b/src/nouveau/compiler/nak/sm70_encode.rs
+@@ -4173,6 +4173,10 @@ impl SM70Op for OpBSSy {
+         e.set_bar_dst(16..20, &self.bar_out);
+         e.set_rel_offset(34..64, &self.target);
+         e.set_pred_src(87..90, 90, &self.cond);
++        if self.reconvergent {
++            assert!(e.sm >= 100);
++            e.set_bit(73, true); // .RECONVERGENT
++        }
+     }
+ }
+ 
+@@ -4185,6 +4189,10 @@ impl SM70Op for OpBSync {
+         e.set_opcode(0x941);
+         e.set_bar_src(16..20, &self.bar);
+         e.set_pred_src(87..90, 90, &self.cond);
++        if self.reconvergent {
++            assert!(e.sm >= 100);
++            e.set_bit(73, true); // .RECONVERGENT
++        }
+     }
+ }
+ 
+-- 
+2.43.0
+

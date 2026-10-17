@@ -1,0 +1,197 @@
+From 5ecc65851ffbc6d774f675bc3c810ad05bb53b4c Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 16:00:29 +0200
+Subject: [PATCH] nak: NAK_VEC_CSE, the copies that make a splat a vector serve
+ its later uses
+
+A vector source with the same value in several components (an image store
+of vec4(x), say) needs copies before it can be a register vector.  The
+legalizer made them for every instruction, so a run of image stores of the
+same splat to different coordinates copied the value three times per
+store; the reference compiler builds the vector once and reuses it.  The
+copies are now made once per block and reused by later uses of the same
+vector (NAK_VEC_CSE=0 restores a copy per use).  Part of nak_knobs_key().
+
+Offline, GB202: CS2 compute 0x7e5de6c5 2672 -> 2363 instructions,
+0xe4d260f1 1973 -> 1664; Steel Nomad unchanged.
+---
+ src/nouveau/compiler/nak/knobs.rs    | 11 ++++++++
+ src/nouveau/compiler/nak/legalize.rs | 40 ++++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_shader.c      | 10 ++++---
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index c824e7e..cd5b15b 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -30,6 +30,9 @@
+ //! - NAK_LAT (bitmask, default 0): SM120 RAW latency pairs that leave out
+ //!   the blanket +1 (sm120_instr_latencies.rs); 128 leaves it out
+ //!   everywhere, which is unsafe.  For hardware validation
++//! - NAK_VEC_CSE (default on): the copies that make a vector source with
++//!   repeated components (a splat) serve its later uses in the block
++//!   (legalizer)
+ //! - NAK_UNROLL_MAX (default 32): most iterations NIR fully unrolls a loop
+ //!   with a known trip count; lower values keep more loops rolled, as the
+ //!   reference compiler does
+@@ -70,6 +73,7 @@ static PHI_AVOID: OnceLock<bool> = OnceLock::new();
+ static BAR_SHARE: OnceLock<bool> = OnceLock::new();
+ static LAT_MASK: OnceLock<u32> = OnceLock::new();
+ static UNROLL_MAX: OnceLock<u32> = OnceLock::new();
++static VEC_CSE: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -153,6 +157,12 @@ pub fn lat_mask() -> u32 {
+     *v
+ }
+ 
++pub fn vec_cse() -> bool {
++    let v = VEC_CSE
++        .get_or_init(|| parse("NAK_VEC_CSE", env::var("NAK_VEC_CSE"), true));
++    *v
++}
++
+ /// NAK_UNROLL_MAX: most iterations NIR unrolls a loop with a known trip
+ /// count (and at most that times 26 instructions of loop body cost): 0, 1,
+ /// 2, 4, 8, 16, 32 (the default) or 64; other values round down to one of
+@@ -210,4 +220,5 @@ pub extern "C" fn nak_knobs_key() -> u32 {
+         | (u32::from(bar_share()) << 1)
+         | (lat << 2)
+         | (unroll << 9)
++        | (u32::from(vec_cse()) << 12)
+ }
+diff --git a/src/nouveau/compiler/nak/legalize.rs b/src/nouveau/compiler/nak/legalize.rs
+index 47387bb..1f0b164 100644
+--- a/src/nouveau/compiler/nak/legalize.rs
++++ b/src/nouveau/compiler/nak/legalize.rs
+@@ -494,6 +494,9 @@ pub struct LegalizeBuilder<'a> {
+     imm_copies: Option<&'a mut FxHashMap<(RegFile, u32), (SSAValue, usize)>>,
+     /// Index of the instruction being legalized in its block
+     ip: usize,
++    /// Vectors with repeated components, to the copies that made them
++    /// vectors earlier in this block
++    dup_vecs: Option<&'a mut FxHashMap<SSARef, SSARef>>,
+ }
+ 
+ impl<'a> LegalizeBuilder<'a> {
+@@ -508,6 +511,7 @@ impl<'a> LegalizeBuilder<'a> {
+             warp_copies: None,
+             imm_copies: None,
+             ip: 0,
++            dup_vecs: None,
+         }
+     }
+ 
+@@ -515,6 +519,16 @@ impl<'a> LegalizeBuilder<'a> {
+         self.b.into_vec()
+     }
+ 
++    fn cached_dup_vec(&self, vec: &SSARef) -> Option<SSARef> {
++        self.dup_vecs.as_ref().and_then(|m| m.get(vec).cloned())
++    }
++
++    fn note_dup_vec(&mut self, vec: SSARef, fixed: SSARef) {
++        if let Some(m) = self.dup_vecs.as_mut() {
++            m.insert(vec, fixed);
++        }
++    }
++
+     #[allow(dead_code)]
+     pub fn into_mapped_instrs(self) -> MappedInstrs {
+         self.b.into_mapped_instrs()
+@@ -697,6 +711,23 @@ fn legalize_instr(
+                 continue;
+             }
+ 
++            // A vector with the same value in several components (a splat
++            // stored to an image, say) needs copies to be a vector at all.
++            // Make them once per block: later uses of the same vector take
++            // the same copies instead of new ones (NAK_VEC_CSE).
++            let has_dups = (1..usize::from(vec.comps()))
++                .any(|c| vec[..c].contains(&vec[c]));
++            if has_dups {
++                if let Some(fixed) = b.cached_dup_vec(vec) {
++                    if fixed.iter().all(|ssa| !vec_comps.contains(ssa)) {
++                        vec_comps.extend(fixed.iter().cloned());
++                        vec_src_map.insert(vec.clone(), fixed.clone());
++                        src.src_ref = fixed.into();
++                        continue;
++                    }
++                }
++            }
++
+             let mut new_vec = vec.clone();
+             for c in 0..vec.comps() {
+                 let ssa = vec[usize::from(c)];
+@@ -713,6 +744,9 @@ fn legalize_instr(
+                 }
+             }
+ 
++            if has_dups {
++                b.note_dup_vec(vec.clone(), new_vec.clone());
++            }
+             vec_src_map.insert(vec.clone(), new_vec.clone());
+             src.src_ref = new_vec.into();
+         }
+@@ -728,6 +762,7 @@ impl Shader<'_> {
+             let mut const_tracker = ConstTracker::new();
+ 
+             let ucse = !DEBUG.no_ucse();
++            let vec_cse = crate::knobs::vec_cse();
+             let imm_cse = crate::knobs::imm_cse(matches!(
+                 self.info.stage,
+                 ShaderStageInfo::Compute(_)
+@@ -741,6 +776,8 @@ impl Shader<'_> {
+                     (RegFile, u32),
+                     (SSAValue, usize),
+                 > = Default::default();
++                let mut dup_vecs: FxHashMap<SSARef, SSARef> =
++                    Default::default();
+ 
+                 let mut instrs = Vec::new();
+                 for (ip, mut instr) in b.instrs.drain(..).enumerate() {
+@@ -768,6 +805,9 @@ impl Shader<'_> {
+                         b.imm_copies = Some(&mut imm_copies);
+                     }
+                     b.ip = ip;
++                    if vec_cse {
++                        b.dup_vecs = Some(&mut dup_vecs);
++                    }
+                     legalize_instr(sm, &mut b, bl, bu, &pinned, ip, &mut instr);
+                     b.push_instr(instr);
+                     instrs.append(&mut b.into_vec());
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index 1625ebc..05b2e51 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -91,12 +91,13 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+    /* NAK_GPR_CAP*, NAK_OCC_TARGET: binaries compiled under other register
+     * settings are not reused */
+    uint64_t nak_gpr_caps = nak_gpr_cap_key();
+-   /* The NAK_* knobs that do not fit in nak_gpr_cap_key() */
++   /* The NAK_* knobs that do not fit in nak_gpr_cap_key(): bits 0-11 and,
++    * above NAK's 8-bit debug flags, 56-63 */
+    uint64_t nak_knobs = nak_knobs_key();
+ 
+-   assert(nak_flags <= UINT16_MAX);
++   assert(nak_flags <= UINT8_MAX);
+    assert(nak_gpr_caps <= UINT32_MAX);
+-   assert(nak_knobs <= 0xfff);
++   assert(nak_knobs <= 0xfffff);
+ 
+    return (no_cbufs ? 1 << 12 : 0)
+       | (pdev->ubo_desc_cbufs ? 0 : 1 << 15)
+@@ -104,7 +105,8 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+       | (instance->drirc.misc.ssbo_align_4b ? 1 << 14 : 0)
+       | (nak_gpr_caps << 16)
+       | (nak_flags << 48)
+-      | nak_knobs;
++      | (nak_knobs & 0xfff)
++      | ((nak_knobs >> 12) << 56);
+ }
+ 
+ static const nir_shader_compiler_options *
+-- 
+2.43.0
+
