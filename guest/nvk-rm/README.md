@@ -69,7 +69,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | **Memory** | | |
 | `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N MiB caps it (common 30) |
 | `NVK_RM_DESC_TABLE_VRAM` | 0 | descriptor tables/pools in CPU-mapped VRAM (common 26, 52) |
-| `NVK_RM_UPLOAD_VRAM` | 0 | command buffer upload memory in CPU-mapped VRAM: `compute` the compute root descriptor tables, `1` all of it (common 26, 52); off by default: a new command pool's first block costs a VRAM allocation and a BAR1 map, and Steel Nomad (D3D12) ran at a third of its speed with `compute` |
+| `NVK_RM_UPLOAD_VRAM` | `compute` on Windows, 0 elsewhere | command buffer upload memory in CPU-mapped VRAM: `compute` the compute root descriptor tables (a tiny dispatch costs 0.48 us from VRAM, 2.5-3.7 us from system memory), `1` all of it, `0` none (common 26, 52, 73) |
 | `NVK_CMD_MEM_CACHE` | 64 | command buffer memory blocks of each kind a device keeps from destroyed and trimmed command pools for new ones; 0 frees them (common 54) |
 | `NVK_RM_SYSMEM_CACHED` | 1 | host-visible system memory GPU-cacheable in L2 (`=0` off, `=desc`/`=app` one kind only) |
 | `NVK_RM_COMPRESSION` | 1 | compressible VRAM for images in dedicated allocations on GB20x |
@@ -252,7 +252,7 @@ Each patch builds on its own.
 ## `patches-common/`: generic NVK work
 
 Apply on top of both lineages, unchanged. One patch (5) also touches the RM
-backend. Numbers are file numbers (there is no 0016 or 0025).
+backend. Numbers are file numbers (there is no 0016, 0025 or 0072).
 
 | # | what |
 |---|---|
@@ -325,6 +325,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0069 | async compute: a compute + transfer queue family (4 queues) whose channels sit in the first graphics queue's TSG on VEIDs of their own and run next to it (`NVK_RM_ASYNC_COMPUTE`, see "Async compute") |
 | 0070 | NAK: `nir_opt_uniform_atomics` before subgroup lowering: an atomic on an address that is the same in every active lane of a subgroup is done once per subgroup, with a subgroup reduction of the value and an exclusive scan for each lane's result (`NAK_UNIFORM_ATOMICS`, default on; part of the shader cache key) |
 | 0071 | `NVK_DISPATCH_PROFILE`: compute-class timestamps behind a WAIT_FOR_IDLE before and after every launch (direct, indirect, device-generated, internal), keyed by `vk_shader::src_hash` (the SPIR-V's `OpString "<hash>.dxil"` from vkd3d-proton, else FNV-1a 64 of the SPIR-V), code hash and local size; indirect arguments copied by I2M for the grid; per-window table of ms/s, share, calls/s, mean/median/max us, GPRs, warps, grids |
+| 0073 | RM: `NVK_RM_UPLOAD_VRAM` defaults to `compute` on Windows, so compute root descriptor tables are CPU-mapped VRAM (0052); `0` keeps them in system memory |
 
 ## Per-draw cost (common 0001-0007)
 
@@ -849,15 +850,19 @@ the PCIe reads of GPU-cacheable system memory.
 - Only that type lands in the BAR: `nvkmd_info::host_visible_vram_is_pinned`
   makes NVK ask for `NVKMD_MEM_VRAM` for it, while NVK's own
   `LOCAL | CAN_MAP` buffers (push, queries, events, upload) stay in system
-  memory, where the CPU also reads them fast. Opt-in exceptions are NVK's
-  own CPU-mapped VRAM, outside the heap with a 256 MiB budget of its own:
-  the compute root descriptor tables (`NVK_RM_UPLOAD_VRAM=compute`: a
-  dispatch waits for its table, and from system memory each dependent
-  dispatch costs several us more), all upload memory
-  (`NVK_RM_UPLOAD_VRAM=1`), descriptor tables (`NVK_RM_DESC_TABLE_VRAM=1`).
-  Each new command pool's first block of it is a VRAM allocation plus a
-  BAR1 map (host round trips), which costs more than it saves in D3D12
-  games that make many command pools.
+  memory, where the CPU also reads them fast. The exceptions are NVK's own
+  CPU-mapped VRAM, outside the heap with a 256 MiB budget of its own: the
+  compute root descriptor tables (`NVK_RM_UPLOAD_VRAM=compute`, the default
+  on Windows: a dispatch waits for its table; tiny back-to-back dispatches
+  take 0.48 us each with the tables in VRAM, as with NVIDIA's driver, and
+  2.5-3.7 us from system memory, `tests/perf/dispatch-bench`), and opt-in
+  all upload memory (`NVK_RM_UPLOAD_VRAM=1`) and descriptor tables
+  (`NVK_RM_DESC_TABLE_VRAM=1`). A new command pool's first block of it is a
+  VRAM allocation plus a BAR1 map (host round trips); the device's command
+  memory cache (`NVK_CMD_MEM_CACHE`, common 0054) hands the blocks of
+  destroyed pools to new ones, which keeps that cost out of D3D12 games
+  that make command allocators per frame. `NVK_RM_UPLOAD_VRAM=0` keeps the
+  compute root tables in system memory.
 - Host-visible system memory (`NVK_RM_SYSMEM_CACHED`, default on) is mapped
   GPU-cacheable (`NVOS46_FLAGS_GPU_CACHEABLE_YES`) and every submit starts
   with an L2 sysmem invalidate after its semaphore waits; rings, semaphores,
