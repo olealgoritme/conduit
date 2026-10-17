@@ -1,0 +1,1629 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 21:51:50 +0200
+Subject: [PATCH] nvk, nvk/rm: async compute queues next to the graphics queue
+ (NVK_RM_ASYNC_COMPUTE)
+
+A queue family with compute and transfer but no graphics (four queues), as
+NVIDIA's driver places its compute queues: each queue's channel sits in the
+TSG of the first graphics queue, on a VEID of its own, so its work runs on
+the GR engine at the same time as the graphics queue's instead of being
+time-sliced against it.  vkd3d-proton puts D3D12 compute and copy queues
+there.  NVK_RM_ASYNC_COMPUTE=0/1 decides; on by default on GB20x.
+
+Backend (nvkmd_rm_ctx.c): NVKMD_ENGINE_ASYNC asks for a compute-only exec
+context in the device's graphics TSG (struct nvkmd_rm_tsg, refcounted; the
+last context in it frees it): FERMI_CONTEXT_SHARE_A SPECIFIED with the
+lowest free VEID, the GPFIFO channel with NV_CHANNEL_ALLOC_PARAMS.flags
+GROUP_CHANNEL_RUNQUEUE_ONE | GROUP_CHANNEL_THREAD_ONE (GSP-RM refuses the
+compute object on a VEID > 0 channel of runqueue 0), a compute object only
+(no 3D on VEID > 0, no copy object on runqueue 1), and a schedule of the
+channel itself (NVA06F_CTRL_CMD_GPFIFO_SCHEDULE), the TSG being scheduled
+already.  A GPU wait for a value whose latest signal was submitted in the
+same shared TSG does not ask for a TSG switch when it blocks: the switch
+would take the signalling channel off the engine too.
+NVK_RM_ASYNC_WAIT_SWITCH=1 switches on every wait.
+
+Driver: an async compute queue runs a command buffer on its compute-only
+channel when nothing in it needs another engine; the push records which
+subchannels got class methods and whether MME methods were used
+(nv_push::subc_used), and generated commands count as needing everything.
+Other command buffers (copy-engine copies of compressed, depth or YCbCr
+images, rendering clears, MME macros: compute shader invocation queries,
+conditional rendering) run on a second channel of the queue with every
+engine of the family, made on first use, in a TSG of its own.  The queue's
+order passes from one channel to the other through a timeline: the channel
+that had the latest work signals it, the other waits.  Copies, fills and
+updates of buffers and of most images use NVK's compute paths there
+already; query resets use a compute fill or compute report semaphores;
+host methods on subchannel 0 leave the compute subchannel current.
+
+The async family's queues may not copy depth or stencil
+(VK_FORMAT_FEATURE_2_DEPTH/STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR are not
+reported then), so ZCULL storage stays valid for depth images shared
+VK_SHARING_MODE_CONCURRENT between the graphics and compute families,
+which vkd3d-proton makes every image once it has two queue families.
+Graphics queues are created first, so that compute queues find the TSG to
+join; without one a compute queue gets a channel of its own.
+
+The log names how many command buffers each async queue ran on which
+channel when the device goes away.
+---
+ src/nouveau/headers/nv_push.h               |  22 +-
+ src/nouveau/vulkan/nvk_cmd_buffer.c         |  32 +-
+ src/nouveau/vulkan/nvk_cmd_buffer.h         |  44 ++-
+ src/nouveau/vulkan/nvk_cmd_clear.c          |  11 +
+ src/nouveau/vulkan/nvk_cmd_indirect.c       |   6 +
+ src/nouveau/vulkan/nvk_device.c             |  23 +-
+ src/nouveau/vulkan/nvk_image.c              |  49 ++-
+ src/nouveau/vulkan/nvk_physical_device.c    |  13 +
+ src/nouveau/vulkan/nvk_physical_device.h    |   2 +-
+ src/nouveau/vulkan/nvk_query_pool.c         |  37 ++-
+ src/nouveau/vulkan/nvk_queue.c              | 321 ++++++++++++++++----
+ src/nouveau/vulkan/nvk_queue.h              |  40 ++-
+ src/nouveau/vulkan/nvkmd/nvkmd.h            |  12 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  15 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 219 +++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |   5 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |  14 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c |   3 +
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |   8 +
+ 19 files changed, 765 insertions(+), 111 deletions(-)
+
+diff --git a/src/nouveau/headers/nv_push.h b/src/nouveau/headers/nv_push.h
+index 0880725..24cc7b2 100644
+--- a/src/nouveau/headers/nv_push.h
++++ b/src/nouveau/headers/nv_push.h
+@@ -25,6 +25,12 @@ struct nv_push {
+    /* The value in the last method header, used to avoid read-back */
+    uint32_t last_hdr_dw;
+ 
++   /* Subchannels that got a class method (not a host method, which any
++    * subchannel takes), as a mask: which engine objects the push needs.
++    * NV_PUSH_USED_MME: a method of the MME (macro calls, shadow scratch).
++    */
++   uint8_t subc_used;
++
+ #ifndef NDEBUG
+    /* A mask of valid subchannels */
+    uint8_t subc_mask;
+@@ -33,6 +39,9 @@ struct nv_push {
+ 
+ #define SUBC_MASK_ALL 0xff
+ 
++/* nv_push::subc_used bit for MME methods (subchannel 7 is not used) */
++#define NV_PUSH_USED_MME (1u << 7)
++
+ static inline void
+ nv_push_init(struct nv_push *push, uint32_t *start,
+              size_t dw_count, uint8_t subc_mask)
+@@ -42,6 +51,7 @@ nv_push_init(struct nv_push *push, uint32_t *start,
+    push->limit = start + dw_count;
+    push->last_hdr = NULL;
+    push->last_hdr_dw = 0;
++   push->subc_used = 0;
+ 
+ #ifndef NDEBUG
+    push->subc_mask = subc_mask;
+@@ -132,9 +142,19 @@ __push_hdr(struct nv_push *push, uint32_t hdr)
+ {
+    __push_verify(push);
+ 
+-   ASSERTED const uint32_t subc = NVC0_FIFO_SUBC_FROM_PKHDR(hdr);
++   const uint32_t subc = NVC0_FIFO_SUBC_FROM_PKHDR(hdr);
+    assert(push->subc_mask & BITFIELD_BIT(subc));
+ 
++   /* The address field (11:0) is the method >> 2.  Methods below 0x100
++    * are host methods; 0x3400 and up are the MME's (SET_MME_SHADOW_SCRATCH,
++    * CALL_MME_MACRO/DATA) in the 3D and compute classes.
++    */
++   const uint32_t addr = hdr & 0xfff;
++   if (addr >= 0x40)
++      push->subc_used |= BITFIELD_BIT(subc);
++   if (addr >= 0xd00)
++      push->subc_used |= NV_PUSH_USED_MME;
++
+    *push->end = hdr;
+    push->last_hdr_dw = hdr;
+    push->last_hdr = push->end;
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index cdcd992..4097310 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -106,7 +106,11 @@ nvk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    cmd->pushes = UTIL_DYNARRAY_INIT;
+    cmd->copy_memory_indirect_temps = UTIL_DYNARRAY_INIT;
+ 
+-   cmd->prev_subc = ffs(nvk_cmd_buffer_subchannel_mask(cmd)) - 1;
++   const VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
++   cmd->compute_only = (queue_flags & VK_QUEUE_COMPUTE_BIT) &&
++                       !(queue_flags & VK_QUEUE_GRAPHICS_BIT);
++   cmd->prev_subc = cmd->compute_only ? SUBC_NV90C0 :
++                    ffs(nvk_cmd_buffer_subchannel_mask(cmd)) - 1;
+ 
+    *cmd_buffer_out = &cmd->vk;
+ 
+@@ -141,6 +145,10 @@ nvk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+    util_dynarray_clear(&cmd->copy_memory_indirect_temps);
+ 
+    memset(&cmd->state, 0, sizeof(cmd->state));
++
++   cmd->subc_used = 0;
++   cmd->needs_all_engines = false;
++   cmd->gfx_begun = false;
+ }
+ 
+ VkQueueFlags
+@@ -210,6 +218,7 @@ nvk_cmd_buffer_flush_push(struct nvk_cmd_buffer *cmd, bool incomplete)
+       cmd->prev_subc = NVC0_FIFO_SUBC_FROM_PKHDR(cmd->push.last_hdr_dw);
+    }
+ 
++   cmd->subc_used |= cmd->push.subc_used;
+    cmd->push.start = cmd->push.end;
+ }
+ 
+@@ -418,10 +427,17 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+       cmd->state.inherited_pipeline_statistics =
+          pBeginInfo->pInheritanceInfo->pipelineStatistics;
+ 
+-   /* Start with a nop so we have at least something to submit */
++   /* Start with a nop so we have at least something to submit; on the
++    * engine the queue surely has
++    */
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+-   P_MTHD(p, NV90B5, NOP);
+-   P_NV90B5_NOP(p, 0);
++   if (cmd->compute_only) {
++      P_MTHD(p, NVA0C0, NO_OPERATION);
++      P_NVA0C0_NO_OPERATION(p, 0);
++   } else {
++      P_MTHD(p, NV90B5, NOP);
++      P_NV90B5_NOP(p, 0);
++   }
+ 
+    if (queue_flags & VK_QUEUE_COMPUTE_BIT)
+       nvk_cmd_buffer_begin_compute(cmd, pBeginInfo);
+@@ -502,6 +518,8 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+        * do with it is reset it.  vkResetCommandPool() has similar language.
+        */
+       util_dynarray_append_dynarray(&cmd->pushes, &other->pushes);
++      cmd->subc_used |= other->subc_used;
++      cmd->needs_all_engines |= other->needs_all_engines;
+ 
+       cmd->prev_subc = nvk_cmd_buffer_last_subchannel(other);
+       /* The secondary may hold barriers and set any 3D state */
+@@ -926,6 +944,12 @@ nvk_cmd_invalidate_deps(struct nvk_cmd_buffer *cmd,
+    if (!(engines & NVKMD_ENGINE_COMPUTE))
+       barriers &= ~NVK_BARRIER_INVALIDATE_QMD_DATA;
+ 
++   /* No fragment shading rate attachment on the async compute family (and
++    * no 3D engine on its channel)
++    */
++   if (cmd->compute_only)
++      barriers &= ~NVK_BARRIER_INVALIDATE_RASTER_CACHE;
++
+    if (!barriers)
+       return;
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 4141e30..830fedc 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -431,6 +431,23 @@ struct nvk_cmd_buffer {
+    struct util_dynarray pushes;
+ 
+    uint8_t prev_subc;
++
++   /* The pool's queue family is the async compute family: compute without
++    * graphics.  Its queues run a command buffer on a channel with the
++    * compute engine alone when nvk_cmd_buffer_compute_channel_ok() says so.
++    */
++   bool compute_only;
++   /* What the command buffer and its secondaries need of a channel: the
++    * subchannels they gave class methods to (nv_push::subc_used, MME use
++    * included), and anything else that needs every engine (commands the
++    * GPU generates)
++    */
++   uint8_t subc_used;
++   bool needs_all_engines;
++   /* An async compute family command buffer set up the 3D state (for a
++    * clear)
++    */
++   bool gfx_begun;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(nvk_cmd_buffer, vk.base, VkCommandBuffer,
+@@ -568,11 +585,28 @@ nvk_get_descriptor_state_for_stages(struct nvk_cmd_buffer *cmd,
+ static inline uint8_t
+ nvk_cmd_buffer_last_subchannel(const struct nvk_cmd_buffer *cmd)
+ {
+-   if (cmd->push.last_hdr_dw) {
+-      return NVC0_FIFO_SUBC_FROM_PKHDR(cmd->push.last_hdr_dw);
+-   } else {
+-      return cmd->prev_subc;
+-   }
++   const uint8_t subc = cmd->push.last_hdr_dw ?
++                        NVC0_FIFO_SUBC_FROM_PKHDR(cmd->push.last_hdr_dw) :
++                        cmd->prev_subc;
++
++   /* The async compute family works on the compute engine: subchannel 0
++    * here only means host methods, which go on any subchannel
++    */
++   if (cmd->compute_only && subc == SUBC_NV9097)
++      return SUBC_NV90C0;
++
++   return subc;
++}
++
++/* Whether a command buffer recorded for the async compute family can run
++ * on a channel that has the compute engine alone: no 3D, copy, 2D or MME
++ * method, nothing the GPU generates.  Valid once it has ended.
++ */
++static inline bool
++nvk_cmd_buffer_compute_channel_ok(const struct nvk_cmd_buffer *cmd)
++{
++   return !cmd->needs_all_engines &&
++          !(cmd->subc_used & ~BITFIELD_BIT(SUBC_NV90C0));
+ }
+ 
+ VkQueueFlags nvk_cmd_buffer_queue_flags(struct nvk_cmd_buffer *cmd);
+diff --git a/src/nouveau/vulkan/nvk_cmd_clear.c b/src/nouveau/vulkan/nvk_cmd_clear.c
+index 4d66689..2e86884 100644
+--- a/src/nouveau/vulkan/nvk_cmd_clear.c
++++ b/src/nouveau/vulkan/nvk_cmd_clear.c
+@@ -473,6 +473,17 @@ nvk_CmdClearColorImage(VkCommandBuffer commandBuffer,
+ 
+    nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_CLEAR_COLOR_IMAGE, 0);
+    nvk_pass_profile_internal_begin(cmd);
++   /* The clear renders: on the async compute family that takes the 3D
++    * state a graphics command buffer starts with (and the channel with
++    * every engine, nvk_queue.c)
++    */
++   if (cmd->compute_only && !cmd->gfx_begun) {
++      const VkCommandBufferBeginInfo begin = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      };
++      nvk_cmd_buffer_begin_graphics(cmd, &begin);
++      cmd->gfx_begun = true;
++   }
+    clear_image(cmd, image, imageLayout, vk_format,
+                &clear_value, rangeCount, pRanges);
+    nvk_pass_profile_internal_end(cmd);
+diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
+index 0859a22..192da47 100644
+--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
+@@ -1132,6 +1132,12 @@ nvk_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+ 
++   /* The generated commands call MME macros, which only a channel with
++    * every engine has loaded
++    */
++   if (cmd->compute_only)
++      cmd->needs_all_engines = true;
++
+    if (!isPreprocessed) {
+       nvk_cmd_flush_process_state(cmd, info);
+       nvk_cmd_process_cmds(cmd, info, &cmd->state);
+diff --git a/src/nouveau/vulkan/nvk_device.c b/src/nouveau/vulkan/nvk_device.c
+index 634328b..3d409e1 100644
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -401,11 +401,24 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
+             goto fail_slm;
+       }
+ 
+-      for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+-         for (unsigned q = 0; q < pCreateInfo->pQueueCreateInfos[i].queueCount; q++) {
+-            result = nvk_queue_create(dev, &pCreateInfo->pQueueCreateInfos[i], q);
+-            if (result != VK_SUCCESS)
+-               goto fail_queues;
++      /* Graphics queues first: async compute queues share the first one's
++       * TSG (nvk_queue_create)
++       */
++      for (unsigned pass = 0; pass < 2; pass++) {
++         for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
++            const VkDeviceQueueCreateInfo *qci =
++               &pCreateInfo->pQueueCreateInfos[i];
++            const bool graphics =
++               pdev->queue_families[qci->queueFamilyIndex].queue_flags &
++               VK_QUEUE_GRAPHICS_BIT;
++            if (graphics != (pass == 0))
++               continue;
++
++            for (unsigned q = 0; q < qci->queueCount; q++) {
++               result = nvk_queue_create(dev, qci, q);
++               if (result != VK_SUCCESS)
++                  goto fail_queues;
++            }
+          }
+       }
+    }
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 761915b..f473e5b 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -113,14 +113,21 @@ nvk_get_image_plane_format_features(const struct nvk_physical_device *pdev,
+       if (!vk_format_is_depth_or_stencil(vk_format))
+          features |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
+ 
+-      /* The copy engine handles depth and stencil just fine */
++      /* The copy engine handles depth and stencil just fine.  But not on
++       * the async compute family's queues: no queue but a graphics one
++       * may write a depth image, so ZCULL storage stays valid for images
++       * shared with them (VK_SHARING_MODE_CONCURRENT, see below).
++       */
++      const bool compute_copy = !pdev->nvkmd->kmd_info.has_async_compute;
+       if (vk_format_has_depth(vk_format)) {
+-         features |= VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR |
+-                     VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
++         features |= VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
++         if (compute_copy)
++            features |= VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR;
+       }
+       if (vk_format_has_stencil(vk_format)) {
+-         features |= VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR |
+-                     VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
++         features |= VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
++         if (compute_copy)
++            features |= VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR;
+       }
+    }
+ 
+@@ -860,6 +867,36 @@ nvk_image_can_compress(const struct nvk_physical_device *pdev,
+    return true;
+ }
+ 
++/* ZCULL storage of a depth image that transfers may write: a write on
++ * another queue must reach the 3D queue through an ownership transfer, whose
++ * acquire barrier resets ZCULL (nvk_cmd_image_layout_transition()), so the
++ * image is VK_SHARING_MODE_EXCLUSIVE.  Or every queue family that shares it
++ * has graphics or is the async compute family, whose queues may not write
++ * depth or stencil (nvk_get_image_plane_format_features()): vkd3d-proton
++ * makes every image CONCURRENT once it has more than one queue family.
++ */
++static bool
++nvk_zcull_sharing_ok(const struct nvk_physical_device *pdev,
++                     const VkImageCreateInfo *pCreateInfo)
++{
++   if (pCreateInfo->sharingMode == VK_SHARING_MODE_EXCLUSIVE)
++      return true;
++
++   if (!pdev->nvkmd->kmd_info.has_async_compute)
++      return false;
++
++   for (uint32_t i = 0; i < pCreateInfo->queueFamilyIndexCount; i++) {
++      const uint32_t family = pCreateInfo->pQueueFamilyIndices[i];
++      if (family >= pdev->queue_family_count)
++         return false;
++      if (!(pdev->queue_families[family].queue_flags &
++            (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)))
++         return false;
++   }
++
++   return true;
++}
++
+ static VkResult
+ nvk_image_init(struct nvk_device *dev,
+                struct nvk_image *image,
+@@ -1140,7 +1177,7 @@ nvk_image_init(struct nvk_device *dev,
+        (image->vk.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+        !(image->vk.usage & ~ZCULL_COMPATIBLE_IMAGE_USAGE) &&
+        (!(image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
+-        pCreateInfo->sharingMode == VK_SHARING_MODE_EXCLUSIVE) &&
++        nvk_zcull_sharing_ok(pdev, pCreateInfo)) &&
+        !(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
+        image->vk.image_type != VK_IMAGE_TYPE_3D &&
+        image->vk.array_layers == 1 && image->vk.mip_levels == 1 &&
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 74d2e83..3a3f290 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -1795,6 +1795,19 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+                      VK_QUEUE_SPARSE_BINDING_BIT,
+       .queue_count = 1,
+    };
++   /* Async compute (nvkmd_info::has_async_compute): queues of this family
++    * run next to the graphics queue instead of being time-sliced against it.
++    * vkd3d-proton puts D3D12 compute (and copy) queues here.  Four queues,
++    * as many as vkd3d-proton creates of a family.  Copies that need the
++    * copy engine are allowed (TRANSFER), see nvk_queue.c.
++    */
++   if (pdev->nvkmd->kmd_info.has_async_compute) {
++      pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
++         .queue_flags = VK_QUEUE_COMPUTE_BIT |
++                        VK_QUEUE_TRANSFER_BIT,
++         .queue_count = 4,
++      };
++   }
+    if (pdev->info.has_transfer_queue) {
+       pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
+          .queue_flags = VK_QUEUE_TRANSFER_BIT |
+diff --git a/src/nouveau/vulkan/nvk_physical_device.h b/src/nouveau/vulkan/nvk_physical_device.h
+index f2d0790..d631f88 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -67,7 +67,7 @@ struct nvk_physical_device {
+    uint8_t mem_heap_count;
+    uint8_t mem_type_count;
+ 
+-   struct nvk_queue_family queue_families[3];
++   struct nvk_queue_family queue_families[4];
+    uint8_t queue_family_count;
+ };
+ 
+diff --git a/src/nouveau/vulkan/nvk_query_pool.c b/src/nouveau/vulkan/nvk_query_pool.c
+index 38708ef..67cb487 100644
+--- a/src/nouveau/vulkan/nvk_query_pool.c
++++ b/src/nouveau/vulkan/nvk_query_pool.c
+@@ -350,7 +350,42 @@ nvk_CmdResetQueryPool(VkCommandBuffer commandBuffer,
+    const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+ 
+-   if (queryCount > 1 && pool->layout != NVK_QUERY_POOL_LAYOUT_ALIGNED_INTERLEAVED) {
++   if (cmd->compute_only) {
++      /* The async compute family's channel has neither the copy nor the 3D
++       * engine: a compute shader fill, or compute report semaphores
++       */
++      if (queryCount > 1 &&
++          pool->layout != NVK_QUERY_POOL_LAYOUT_ALIGNED_INTERLEAVED) {
++         uint64_t clear_size;
++         if (pool->layout == NVK_QUERY_POOL_LAYOUT_SEPARATE)
++            clear_size = queryCount * sizeof(uint32_t);
++         else if (pool->layout == NVK_QUERY_POOL_LAYOUT_TIMESTAMP_PACKED)
++            clear_size = queryCount * pool->query_stride;
++         else
++            UNREACHABLE("Unsupported query type");
++
++         const VkDeviceAddressRangeKHR range = {
++            .address = nvk_query_available_addr(pool, firstQuery),
++            .size = clear_size,
++         };
++         nvk_CmdFillMemoryKHR(commandBuffer, &range, 0, 0);
++      } else {
++         for (uint32_t i = 0; i < queryCount; i++) {
++            uint64_t addr = nvk_query_available_addr(pool, firstQuery + i);
++
++            struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
++            P_MTHD(p, NV90C0, SET_REPORT_SEMAPHORE_A);
++            P_NV90C0_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
++            P_NV90C0_SET_REPORT_SEMAPHORE_B(p, addr);
++            P_NV90C0_SET_REPORT_SEMAPHORE_C(p, 0);
++            P_NV90C0_SET_REPORT_SEMAPHORE_D(p, {
++               .operation = OPERATION_RELEASE,
++               .structure_size = STRUCTURE_SIZE_ONE_WORD,
++            });
++         }
++      }
++   } else if (queryCount > 1 &&
++              pool->layout != NVK_QUERY_POOL_LAYOUT_ALIGNED_INTERLEAVED) {
+       uint64_t clear_size;
+       if (pool->layout == NVK_QUERY_POOL_LAYOUT_SEPARATE)
+          clear_size = queryCount * sizeof(uint32_t);
+diff --git a/src/nouveau/vulkan/nvk_queue.c b/src/nouveau/vulkan/nvk_queue.c
+index 4d39c63..a529c8d 100644
+--- a/src/nouveau/vulkan/nvk_queue.c
++++ b/src/nouveau/vulkan/nvk_queue.c
+@@ -13,6 +13,12 @@
+ #include "nvk_rust.h"
+ #include "nv_push.h"
+ 
++#include "util/log.h"
++#include "vk_enum_to_str.h"
++#include "vk_sync.h"
++
++#include <inttypes.h>
++
+ #include "nv_push_cl9039.h"
+ #include "nv_push_cl9097.h"
+ #include "nv_push_cl90b5.h"
+@@ -22,7 +28,8 @@
+ #include "nv_push_clc397.h"
+ 
+ static VkResult
+-nvk_queue_push(struct nvk_queue *queue, const struct nv_push *push);
++nvk_queue_push(struct nvk_queue *queue, struct nvk_queue_chan *chan,
++               const struct nv_push *push);
+ 
+ static void
+ nvk_queue_state_init(struct nvk_queue_state *qs)
+@@ -40,8 +47,9 @@ nvk_queue_state_finish(struct nvk_device *dev,
+ 
+ static VkResult
+ nvk_queue_state_update(struct nvk_queue *queue,
+-                       struct nvk_queue_state *qs)
++                       struct nvk_queue_chan *chan)
+ {
++   struct nvk_queue_state *qs = &chan->state;
+    struct nvk_device *dev = nvk_queue_device(queue);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+    struct nvkmd_mem *mem;
+@@ -81,13 +89,13 @@ nvk_queue_state_update(struct nvk_queue *queue,
+    uint32_t push_data[64];
+    struct nv_push push;
+    nv_push_init(&push, push_data, 64,
+-                nvk_queue_subchannels_from_engines(queue->engines));
++                nvk_queue_subchannels_from_engines(chan->engines));
+    struct nv_push *p = &push;
+ 
+    if (qs->images.alloc_count > 0) {
+       const uint64_t tex_pool_addr =
+          nvk_descriptor_table_base_address(&dev->images);
+-      if (queue->engines & NVKMD_ENGINE_COMPUTE) {
++      if (chan->engines & NVKMD_ENGINE_COMPUTE) {
+          P_MTHD(p, NVA0C0, SET_TEX_HEADER_POOL_A);
+          P_NVA0C0_SET_TEX_HEADER_POOL_A(p, tex_pool_addr >> 32);
+          P_NVA0C0_SET_TEX_HEADER_POOL_B(p, tex_pool_addr);
+@@ -97,7 +105,7 @@ nvk_queue_state_update(struct nvk_queue *queue,
+          });
+       }
+ 
+-      if (queue->engines & NVKMD_ENGINE_3D) {
++      if (chan->engines & NVKMD_ENGINE_3D) {
+          P_MTHD(p, NV9097, SET_TEX_HEADER_POOL_A);
+          P_NV9097_SET_TEX_HEADER_POOL_A(p, tex_pool_addr >> 32);
+          P_NV9097_SET_TEX_HEADER_POOL_B(p, tex_pool_addr);
+@@ -111,7 +119,7 @@ nvk_queue_state_update(struct nvk_queue *queue,
+    if (qs->samplers.alloc_count > 0) {
+       const uint64_t sampler_pool_addr =
+          nvk_descriptor_table_base_address(&dev->samplers);
+-      if (queue->engines & NVKMD_ENGINE_COMPUTE) {
++      if (chan->engines & NVKMD_ENGINE_COMPUTE) {
+          P_MTHD(p, NVA0C0, SET_TEX_SAMPLER_POOL_A);
+          P_NVA0C0_SET_TEX_SAMPLER_POOL_A(p, sampler_pool_addr >> 32);
+          P_NVA0C0_SET_TEX_SAMPLER_POOL_B(p, sampler_pool_addr);
+@@ -121,7 +129,7 @@ nvk_queue_state_update(struct nvk_queue *queue,
+          });
+       }
+ 
+-      if (queue->engines & NVKMD_ENGINE_3D) {
++      if (chan->engines & NVKMD_ENGINE_3D) {
+          P_MTHD(p, NV9097, SET_TEX_SAMPLER_POOL_A);
+          P_NV9097_SET_TEX_SAMPLER_POOL_A(p, sampler_pool_addr >> 32);
+          P_NV9097_SET_TEX_SAMPLER_POOL_B(p, sampler_pool_addr);
+@@ -139,7 +147,7 @@ nvk_queue_state_update(struct nvk_queue *queue,
+       const uint64_t slm_per_tpc = qs->slm.bytes_per_tpc;
+       assert(!(slm_per_tpc & 0x7fff));
+ 
+-      if (queue->engines & NVKMD_ENGINE_COMPUTE) {
++      if (chan->engines & NVKMD_ENGINE_COMPUTE) {
+          P_MTHD(p, NVA0C0, SET_SHADER_LOCAL_MEMORY_A);
+          P_NVA0C0_SET_SHADER_LOCAL_MEMORY_A(p, slm_addr >> 32);
+          P_NVA0C0_SET_SHADER_LOCAL_MEMORY_B(p, slm_addr);
+@@ -157,7 +165,7 @@ nvk_queue_state_update(struct nvk_queue *queue,
+          }
+       }
+ 
+-      if (queue->engines & NVKMD_ENGINE_3D) {
++      if (chan->engines & NVKMD_ENGINE_3D) {
+          P_MTHD(p, NV9097, SET_SHADER_LOCAL_MEMORY_A);
+          P_NV9097_SET_SHADER_LOCAL_MEMORY_A(p, slm_addr >> 32);
+          P_NV9097_SET_SHADER_LOCAL_MEMORY_B(p, slm_addr);
+@@ -167,7 +175,7 @@ nvk_queue_state_update(struct nvk_queue *queue,
+       }
+    }
+ 
+-   return nvk_queue_push(queue, p);
++   return nvk_queue_push(queue, chan, p);
+ }
+ 
+ static VkResult
+@@ -207,6 +215,133 @@ nvk_queue_submit_bind(struct nvk_queue *queue,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult nvk_queue_init_context_state(struct nvk_queue *queue,
++                                             struct nvk_queue_chan *chan);
++
++static VkResult
++nvk_queue_chan_init(struct nvk_queue *queue, struct nvk_queue_chan *chan,
++                    enum nvkmd_engines engines)
++{
++   struct nvk_device *dev = nvk_queue_device(queue);
++   VkResult result;
++
++   nvk_queue_state_init(&chan->state);
++   chan->engines = engines;
++
++   result = nvkmd_dev_create_ctx(dev->nvkmd, &dev->vk.base, engines,
++                                 &chan->ctx);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = nvk_mem_stream_init(dev, &chan->push_stream);
++   if (result != VK_SUCCESS)
++      goto fail_ctx;
++
++   return VK_SUCCESS;
++
++fail_ctx:
++   nvkmd_ctx_destroy(chan->ctx);
++   chan->ctx = NULL;
++   return result;
++}
++
++static void
++nvk_queue_chan_finish(struct nvk_queue *queue, struct nvk_queue_chan *chan)
++{
++   struct nvk_device *dev = nvk_queue_device(queue);
++
++   if (chan->ctx == NULL)
++      return;
++
++   nvk_mem_stream_sync(dev, &chan->push_stream, chan->ctx);
++   nvk_mem_stream_finish(dev, &chan->push_stream);
++   nvk_queue_state_finish(dev, &chan->state);
++   nvkmd_ctx_destroy(chan->ctx);
++   chan->ctx = NULL;
++}
++
++/* The channel with every engine of an async compute queue, made the first
++ * time a command buffer needs it
++ */
++static VkResult
++nvk_queue_full_chan_init(struct nvk_queue *queue)
++{
++   struct nvk_device *dev = nvk_queue_device(queue);
++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++   struct nvk_queue_chan *chan = &queue->chans[NVK_QUEUE_CHAN_FULL];
++   VkResult result;
++
++   const struct nvk_queue_family *queue_family =
++      &pdev->queue_families[queue->vk.queue_family_index];
++   result = nvk_queue_chan_init(queue, chan,
++      nvk_queue_engines_from_queue_flags(queue_family->queue_flags));
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = nvk_queue_init_context_state(queue, chan);
++   if (result != VK_SUCCESS) {
++      nvk_queue_chan_finish(queue, chan);
++      return result;
++   }
++
++   return VK_SUCCESS;
++}
++
++/* Moves the queue's work to channel c: what was submitted to the other
++ * channel so far comes first.  Pushes the channel's state for the command
++ * buffers that come next (with_state).
++ */
++static VkResult
++nvk_queue_use_chan(struct nvk_queue *queue, uint8_t c, bool with_state)
++{
++   VkResult result;
++
++   if (c != queue->last_chan) {
++      if (queue->chans[c].ctx == NULL) {
++         assert(c == NVK_QUEUE_CHAN_FULL);
++         result = nvk_queue_full_chan_init(queue);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++
++      const struct vk_sync_signal signal = {
++         .sync = queue->handoff_sync,
++         .stage_mask = ~0,
++         .signal_value = ++queue->handoff_value,
++      };
++      result = nvkmd_ctx_signal(queue->chans[queue->last_chan].ctx,
++                                &queue->vk.base, 1, &signal);
++      if (result != VK_SUCCESS)
++         return result;
++
++      const struct vk_sync_wait wait = {
++         .sync = queue->handoff_sync,
++         .stage_mask = ~0,
++         .wait_value = queue->handoff_value,
++      };
++      result = nvkmd_ctx_wait(queue->chans[c].ctx, &queue->vk.base, 1, &wait);
++      if (result != VK_SUCCESS)
++         return result;
++
++      queue->last_chan = c;
++   }
++
++   if (with_state)
++      return nvk_queue_state_update(queue, &queue->chans[c]);
++
++   return VK_SUCCESS;
++}
++
++/* The channel a command buffer runs on */
++static uint8_t
++nvk_queue_cmd_chan(const struct nvk_queue *queue,
++                   const struct nvk_cmd_buffer *cmd)
++{
++   if (!queue->async || nvk_cmd_buffer_compute_channel_ok(cmd))
++      return NVK_QUEUE_CHAN_MAIN;
++   return NVK_QUEUE_CHAN_FULL;
++}
++
+ static VkResult
+ nvk_queue_submit_exec(struct nvk_queue *queue,
+                       struct vk_queue_submit *submit)
+@@ -214,34 +349,42 @@ nvk_queue_submit_exec(struct nvk_queue *queue,
+    struct nvk_device *dev = nvk_queue_device(queue);
+    VkResult result;
+ 
++   uint64_t upload_time_point = 0;
+    if (submit->command_buffer_count > 0) {
+       nvk_descriptor_table_flush_map(dev, &dev->images);
+       nvk_descriptor_table_flush_map(dev, &dev->samplers);
+       nvk_heap_flush_maps(dev, &dev->shader_heap);
+       assert(dev->event_heap.arena.mem_flags & NVKMD_MEM_COHERENT);
+ 
+-      result = nvk_queue_state_update(queue, &queue->state);
++      struct nvk_cmd_buffer *first =
++         container_of(submit->command_buffers[0], struct nvk_cmd_buffer, vk);
++      result = nvk_queue_use_chan(queue, nvk_queue_cmd_chan(queue, first),
++                                  true);
+       if (result != VK_SUCCESS)
+          return result;
+ 
+-      uint64_t upload_time_point;
+       result = nvk_upload_queue_flush(dev, &dev->upload, &upload_time_point);
+       if (result != VK_SUCCESS)
+          return result;
++   }
+ 
+-      if (upload_time_point > 0) {
+-         struct vk_sync_wait wait = {
+-            .sync = dev->upload.stream.sync,
+-            .stage_mask = ~0,
+-            .wait_value = upload_time_point,
+-         };
+-         result = nvkmd_ctx_wait(queue->exec_ctx, &queue->vk.base, 1, &wait);
+-         if (result != VK_SUCCESS)
+-            return result;
+-      }
++   /* The waits go to the channel the submission starts on; a later channel
++    * comes after it (nvk_queue_use_chan)
++    */
++   struct nvkmd_ctx *ctx = queue->chans[queue->last_chan].ctx;
++
++   if (upload_time_point > 0) {
++      struct vk_sync_wait wait = {
++         .sync = dev->upload.stream.sync,
++         .stage_mask = ~0,
++         .wait_value = upload_time_point,
++      };
++      result = nvkmd_ctx_wait(ctx, &queue->vk.base, 1, &wait);
++      if (result != VK_SUCCESS)
++         return result;
+    }
+ 
+-   result = nvkmd_ctx_wait(queue->exec_ctx, &queue->vk.base,
++   result = nvkmd_ctx_wait(ctx, &queue->vk.base,
+                            submit->wait_count, submit->waits);
+    if (result != VK_SUCCESS)
+       return result;
+@@ -250,6 +393,23 @@ nvk_queue_submit_exec(struct nvk_queue *queue,
+       struct nvk_cmd_buffer *cmd =
+          container_of(submit->command_buffers[i], struct nvk_cmd_buffer, vk);
+ 
++      const uint8_t c = nvk_queue_cmd_chan(queue, cmd);
++      if (queue->async) {
++         if (c == NVK_QUEUE_CHAN_MAIN) {
++            queue->cmds_async++;
++         } else {
++            queue->cmds_full++;
++            /* 0x40: commands the GPU generates */
++            queue->full_subc_used |= cmd->subc_used |
++                                     (cmd->needs_all_engines ? 0x40 : 0);
++         }
++      }
++      if (c != queue->last_chan) {
++         result = nvk_queue_use_chan(queue, c, true);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++
+       const uint32_t max_execs =
+          util_dynarray_num_elements(&cmd->pushes, struct nvk_cmd_push);
+       STACK_ARRAY(struct nvkmd_ctx_exec, execs, max_execs);
+@@ -267,7 +427,7 @@ nvk_queue_submit_exec(struct nvk_queue *queue,
+          };
+       }
+ 
+-      result = nvkmd_ctx_exec(queue->exec_ctx, &queue->vk.base,
++      result = nvkmd_ctx_exec(queue->chans[c].ctx, &queue->vk.base,
+                               exec_count, execs);
+ 
+       STACK_ARRAY_FINISH(execs);
+@@ -276,7 +436,11 @@ nvk_queue_submit_exec(struct nvk_queue *queue,
+          return result;
+    }
+ 
+-   result = nvkmd_ctx_signal(queue->exec_ctx, &queue->vk.base,
++   /* After everything submitted to the queue: the channel that got the
++    * latest work comes after the other one
++    */
++   result = nvkmd_ctx_signal(queue->chans[queue->last_chan].ctx,
++                             &queue->vk.base,
+                              submit->signal_count, submit->signals);
+    if (result != VK_SUCCESS)
+       return result;
+@@ -314,7 +478,8 @@ nvk_queue_submit(struct vk_queue *vk_queue,
+ }
+ 
+ static VkResult
+-nvk_queue_push(struct nvk_queue *queue, const struct nv_push *push)
++nvk_queue_push(struct nvk_queue *queue, struct nvk_queue_chan *chan,
++               const struct nv_push *push)
+ {
+    struct nvk_device *dev = nvk_queue_device(queue);
+ 
+@@ -324,12 +489,13 @@ nvk_queue_push(struct nvk_queue *queue, const struct nv_push *push)
+    if (nv_push_dw_count(push) == 0)
+       return VK_SUCCESS;
+ 
+-   return nvk_mem_stream_push(dev, &queue->push_stream, queue->exec_ctx,
++   return nvk_mem_stream_push(dev, &chan->push_stream, chan->ctx,
+                               push->start, nv_push_dw_count(push), NULL);
+ }
+ 
+ static VkResult
+-nvk_queue_init_context_state(struct nvk_queue *queue)
++nvk_queue_init_context_state(struct nvk_queue *queue,
++                             struct nvk_queue_chan *chan)
+ {
+    struct nvk_device *dev = nvk_queue_device(queue);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+@@ -338,7 +504,7 @@ nvk_queue_init_context_state(struct nvk_queue *queue)
+    uint32_t push_data[4096 + 1024];
+    struct nv_push push;
+    nv_push_init(&push, push_data, ARRAY_SIZE(push_data),
+-                nvk_queue_subchannels_from_engines(queue->engines));
++                nvk_queue_subchannels_from_engines(chan->engines));
+    struct nv_push *p = &push;
+ 
+    /* M2MF state */
+@@ -353,26 +519,26 @@ nvk_queue_init_context_state(struct nvk_queue *queue)
+       });
+    }
+ 
+-   if (queue->engines & NVKMD_ENGINE_3D) {
++   if (chan->engines & NVKMD_ENGINE_3D) {
+       result = nvk_push_draw_state_init(queue, p);
+       if (result != VK_SUCCESS)
+          return result;
+    }
+ 
+-   if (queue->engines & NVKMD_ENGINE_COMPUTE) {
++   if (chan->engines & NVKMD_ENGINE_COMPUTE) {
+       result = nvk_push_dispatch_state_init(queue, p);
+       if (result != VK_SUCCESS)
+          return result;
+    }
+ 
+-   if (queue->engines & NVKMD_ENGINE_VDEC) {
++   if (chan->engines & NVKMD_ENGINE_VDEC) {
+       result = nvk_push_video_decode_state_init(queue, p,
+                                                  pdev->info.cls_vdec);
+       if (result != VK_SUCCESS)
+          return result;
+    }
+ 
+-   return nvk_queue_push(queue, &push);
++   return nvk_queue_push(queue, chan, &push);
+ }
+ 
+ static VkQueueGlobalPriority
+@@ -426,25 +592,56 @@ nvk_queue_create(struct nvk_device *dev,
+    if (result != VK_SUCCESS)
+       goto fail_alloc;
+ 
+-   nvk_queue_state_init(&queue->state);
+-
+-   queue->engines =
++   enum nvkmd_engines engines =
+       nvk_queue_engines_from_queue_flags(queue_family->queue_flags);
+ 
+    if (queue_family->queue_flags & VK_QUEUE_VIDEO_DECODE_BIT_KHR)
+-      queue->engines |= NVKMD_ENGINE_VDEC;
++      engines |= NVKMD_ENGINE_VDEC;
+ 
+-   if (queue->engines) {
+-      result = nvkmd_dev_create_ctx(dev->nvkmd, &dev->vk.base,
+-                                    queue->engines, &queue->exec_ctx);
++   /* The async compute family: the queue's channel has the compute engine
++    * alone and runs next to the graphics queue's (nvkmd_info::
++    * has_async_compute).  Without a graphics queue to share with, or when
++    * the backend refuses it, the queue gets a channel with every engine of
++    * the family, as any other queue.
++    */
++   queue->async = pdev->nvkmd->kmd_info.has_async_compute &&
++                  (queue_family->queue_flags & VK_QUEUE_COMPUTE_BIT) &&
++                  !(queue_family->queue_flags & VK_QUEUE_GRAPHICS_BIT);
++   if (queue->async) {
++      result = nvk_queue_chan_init(queue, &queue->chans[NVK_QUEUE_CHAN_MAIN],
++                                   NVKMD_ENGINE_COMPUTE | NVKMD_ENGINE_ASYNC);
++      if (result != VK_SUCCESS) {
++         mesa_logw("NVK: no async compute channel (%s), compute queue %u "
++                   "runs on a channel of its own", vk_Result_to_str(result),
++                   index_in_family);
++         queue->async = false;
++      } else {
++         const struct vk_sync_type *sync_type = pdev->nvkmd->sync_types[0];
++         assert(sync_type->features & VK_SYNC_FEATURE_TIMELINE);
++         result = vk_sync_create(&dev->vk, sync_type, VK_SYNC_IS_TIMELINE,
++                                 0, &queue->handoff_sync);
++         if (result != VK_SUCCESS)
++            goto fail_chans;
++         if (index_in_family == 0) {
++            mesa_logi("NVK: compute queues run next to the graphics queue "
++                      "(NVK_RM_ASYNC_COMPUTE)");
++         }
++      }
++   }
++
++   if (!queue->async && engines) {
++      result = nvk_queue_chan_init(queue, &queue->chans[NVK_QUEUE_CHAN_MAIN],
++                                   engines);
+       if (result != VK_SUCCESS)
+          goto fail_init;
++   }
+ 
++   if (engines) {
+       result = nvkmd_dev_alloc_mem(dev->nvkmd, &dev->vk.base,
+                                    4096, 0, NVKMD_MEM_LOCAL,
+                                    &queue->draw_cb0);
+       if (result != VK_SUCCESS)
+-         goto fail_exec_ctx;
++         goto fail_chans;
+    }
+ 
+    if (queue_family->queue_flags & VK_QUEUE_SPARSE_BINDING_BIT) {
+@@ -454,32 +651,29 @@ nvk_queue_create(struct nvk_device *dev,
+          goto fail_draw_cb0;
+    }
+ 
+-   result = nvk_mem_stream_init(dev, &queue->push_stream);
+-   if (result != VK_SUCCESS)
+-      goto fail_bind_ctx;
+-
+-   result = nvk_queue_init_context_state(queue);
+-   if (result != VK_SUCCESS)
+-      goto fail_push_stream;
++   if (queue->chans[NVK_QUEUE_CHAN_MAIN].ctx != NULL) {
++      result = nvk_queue_init_context_state(queue,
++                                            &queue->chans[NVK_QUEUE_CHAN_MAIN]);
++      if (result != VK_SUCCESS)
++         goto fail_bind_ctx;
++   }
+ 
++   queue->last_chan = NVK_QUEUE_CHAN_MAIN;
+    queue->vk.driver_submit = nvk_queue_submit;
+ 
+    return VK_SUCCESS;
+ 
+-fail_push_stream:
+-   nvk_mem_stream_sync(dev, &queue->push_stream, queue->exec_ctx);
+-   nvk_mem_stream_finish(dev, &queue->push_stream);
+ fail_bind_ctx:
+    if (queue->bind_ctx != NULL)
+       nvkmd_ctx_destroy(queue->bind_ctx);
+ fail_draw_cb0:
+    if (queue->draw_cb0 != NULL)
+       nvkmd_mem_unref(queue->draw_cb0);
+-fail_exec_ctx:
+-   if (queue->exec_ctx != NULL)
+-      nvkmd_ctx_destroy(queue->exec_ctx);
++fail_chans:
++   nvk_queue_chan_finish(queue, &queue->chans[NVK_QUEUE_CHAN_MAIN]);
++   if (queue->handoff_sync != NULL)
++      vk_sync_destroy(&dev->vk, queue->handoff_sync);
+ fail_init:
+-   nvk_queue_state_finish(dev, &queue->state);
+    vk_queue_finish(&queue->vk);
+ fail_alloc:
+    vk_free(&dev->vk.alloc, queue);
+@@ -490,17 +684,24 @@ fail_alloc:
+ void
+ nvk_queue_destroy(struct nvk_device *dev, struct nvk_queue *queue)
+ {
+-   nvk_mem_stream_sync(dev, &queue->push_stream, queue->exec_ctx);
+-   nvk_mem_stream_finish(dev, &queue->push_stream);
++   if (queue->async) {
++      mesa_logi("NVK: async compute queue %u: %" PRIu64 " command buffers "
++                "on the compute channel, %" PRIu64 " on the full channel "
++                "(subchannel mask 0x%x)", queue->vk.index_in_family,
++                queue->cmds_async, queue->cmds_full, queue->full_subc_used);
++   }
++
++   /* Both channels are idle once their streams are */
++   nvk_queue_chan_finish(queue, &queue->chans[NVK_QUEUE_CHAN_FULL]);
++   nvk_queue_chan_finish(queue, &queue->chans[NVK_QUEUE_CHAN_MAIN]);
++   if (queue->handoff_sync != NULL)
++      vk_sync_destroy(&dev->vk, queue->handoff_sync);
+    if (queue->draw_cb0 != NULL) {
+       nvk_upload_queue_sync(dev, &dev->upload);
+       nvkmd_mem_unref(queue->draw_cb0);
+    }
+-   nvk_queue_state_finish(dev, &queue->state);
+    if (queue->bind_ctx != NULL)
+       nvkmd_ctx_destroy(queue->bind_ctx);
+-   if (queue->exec_ctx != NULL)
+-      nvkmd_ctx_destroy(queue->exec_ctx);
+    vk_queue_finish(&queue->vk);
+    vk_free(&dev->vk.alloc, queue);
+ }
+diff --git a/src/nouveau/vulkan/nvk_queue.h b/src/nouveau/vulkan/nvk_queue.h
+index a90ff19..ecc1f7f 100644
+--- a/src/nouveau/vulkan/nvk_queue.h
++++ b/src/nouveau/vulkan/nvk_queue.h
+@@ -34,13 +34,11 @@ struct nvk_queue_state {
+    } slm;
+ };
+ 
+-struct nvk_queue {
+-   struct vk_queue vk;
+-
++/* A channel of a queue: an nvkmd exec context and the state pushed to it */
++struct nvk_queue_chan {
+    enum nvkmd_engines engines;
+ 
+-   struct nvkmd_ctx *bind_ctx;
+-   struct nvkmd_ctx *exec_ctx;
++   struct nvkmd_ctx *ctx;
+ 
+    /* Memory stream to use for anything we need to push that isn't part of a
+     * command buffer.
+@@ -48,6 +46,38 @@ struct nvk_queue {
+    struct nvk_mem_stream push_stream;
+ 
+    struct nvk_queue_state state;
++};
++
++/* The channel a queue's command buffers run on, and the one an async
++ * compute queue runs those on that need more than the compute engine
++ */
++#define NVK_QUEUE_CHAN_MAIN 0
++#define NVK_QUEUE_CHAN_FULL 1
++
++struct nvk_queue {
++   struct vk_queue vk;
++
++   struct nvkmd_ctx *bind_ctx;
++
++   /* chans[NVK_QUEUE_CHAN_MAIN] runs the queue's work.  On an async compute
++    * queue (async) it has the compute engine alone (NVKMD_ENGINE_ASYNC), and
++    * command buffers that need another engine run on
++    * chans[NVK_QUEUE_CHAN_FULL], a channel with every engine of the family
++    * made when the first one comes (ctx NULL before).  The queue's order
++    * goes from one channel to the other through handoff_sync: the channel
++    * that had the latest work (last_chan) signals the next value, the other
++    * waits for it.
++    */
++   struct nvk_queue_chan chans[2];
++   bool async;
++   uint8_t last_chan;
++   struct vk_sync *handoff_sync;
++   uint64_t handoff_value;
++   /* Async compute: command buffers that ran on each channel, and the
++    * subchannels (nv_push::subc_used) of those on the full one, for the log
++    */
++   uint64_t cmds_async, cmds_full;
++   uint8_t full_subc_used;
+ 
+    /* CB0 for all draw commands on this queue */
+    struct nvkmd_mem *draw_cb0;
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index 56eba08..cb793f4 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -135,6 +135,12 @@ enum nvkmd_engines {
+    NVKMD_ENGINE_COMPUTE = 1 << 4,
+    NVKMD_ENGINE_BIND    = 1 << 5,
+    NVKMD_ENGINE_VDEC    = 1 << 6,
++
++   /** With NVKMD_ENGINE_COMPUTE alone: an async compute context, whose
++    *  channel runs concurrently with the device's first graphics context
++    *  (nvkmd_info::has_async_compute).  It has no 3D or copy engine.
++    */
++   NVKMD_ENGINE_ASYNC   = 1 << 7,
+ };
+ 
+ enum nvkmd_bind_op {
+@@ -190,6 +196,12 @@ struct nvkmd_info {
+     *  backed by BAR-mapped VRAM.
+     */
+    bool host_visible_vram_is_pinned;
++
++   /** Exec contexts may be created with NVKMD_ENGINE_ASYNC: a compute-only
++    *  channel that runs next to the first graphics context's channel on the
++    *  GR engine instead of being time-sliced against it
++    */
++   bool has_async_compute;
+ };
+ 
+ struct nvkmd_pdev_ops {
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 9d4f6bd..68ce1a5 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -26,6 +26,7 @@
+ #define NVKMD_RM_DEFER_MAX_CTXS 16
+ 
+ struct nvkmd_rm_exec_ctx;
++struct nvkmd_rm_tsg;
+ 
+ /*
+  * librmclient, loaded at runtime
+@@ -381,6 +382,14 @@ struct nvkmd_rm_dev {
+ 
+    struct nvkmd_rm_sema_pool sema_pool;
+ 
++   /* The TSG of the first graphics exec context, which async compute
++    * contexts (NVKMD_ENGINE_ASYNC) join, each on a VEID of its own, so that
++    * their channels run next to the graphics channel (nvkmd_rm_ctx.c).
++    * NULL while there is no graphics context.  Under gr_tsg_mutex.
++    */
++   simple_mtx_t gr_tsg_mutex;
++   struct nvkmd_rm_tsg *gr_tsg;
++
+    /* Deferred frees (NVK_RM_DEFER_FREE, nvkmd_rm_ctx.c): memory objects and
+     * VAs whose RM unmap and free wait until every exec context has finished
+     * the work submitted before the free.  Items in FIFO order.
+@@ -901,6 +910,12 @@ struct nvkmd_rm_sync {
+     * on the channel's non-stall interrupts.
+     */
+    uint32_t h_semsurf;
++
++   /* The TSG handle of the exec context that submitted the latest GPU
++    * signal of this sync, 0 if none: a wait in the same TSG does not ask for
++    * a TSG switch when it blocks (nvkmd_rm_ctx.c).  A hint, read racily.
++    */
++   uint32_t signal_tsg;
+ };
+ 
+ struct vk_sync_type nvkmd_rm_sync_get_type(void);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 387666e..8761ab8 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -41,6 +41,25 @@
+  * timeline values in system memory (see nvkmd_rm_sync.c), written into
+  * small per-GPFIFO-entry push slots that belong to this context.  A slot
+  * is reused only when its GPFIFO entry is, i.e. after GP_GET passed it.
++ *
++ * Async compute (NVKMD_ENGINE_ASYNC), the way NVIDIA's driver places a
++ * compute queue: channels of one TSG on different VEIDs (subcontexts) run
++ * on the GR engine at the same time, while TSGs are only time-sliced.  So
++ * the first graphics context's TSG is shared (struct nvkmd_rm_tsg), and an
++ * async compute context adds a channel to it:
++ *
++ *   KEPLER_CHANNEL_GROUP_A of the first graphics context
++ *     FERMI_CONTEXT_SHARE_A SYNC (VEID 0): the graphics channel
++ *     FERMI_CONTEXT_SHARE_A SPECIFIED VEID n (1..63): the async channel,
++ *       NV_CHANNEL_ALLOC_PARAMS.flags GROUP_CHANNEL_RUNQUEUE_ONE |
++ *       GROUP_CHANNEL_THREAD_ONE, a compute object only
++ *
++ * GSP-RM refuses the compute object on a VEID > 0 channel of runqueue 0
++ * (NV_ERR_INVALID_OBJECT), the 3D object on any VEID > 0, and a copy object
++ * on a runqueue 1 channel (NV_ERR_INVALID_STATE).  The async channel is
++ * scheduled on its own (NVA06F_CTRL_CMD_GPFIFO_SCHEDULE), as NVIDIA's
++ * driver schedules every channel, since the TSG already runs.  Conduit
++ * docs/research/async-compute-gb202.md has the measurements.
+  */
+ 
+ /* 4096 (was 1024): NVK_INDIRECT_PUSH makes every indirect draw call two
+@@ -102,12 +121,31 @@ struct nvkmd_rm_sem_op {
+    uint64_t gpu_va;
+    uint64_t value;
+    bool release;
++   /* An acquire that does not let the runlist switch TSGs when it blocks */
++   bool no_switch;
++};
++
++/* A TSG that exec contexts share: the first graphics context's, which
++ * async compute contexts join.  Freed by the last context with a channel in
++ * it.
++ */
++struct nvkmd_rm_tsg {
++   uint32_t h_tsg;
++   /* Contexts with a channel in it, and the VEIDs they hold (bit 0: the
++    * graphics channel); under nvkmd_rm_dev::gr_tsg_mutex
++    */
++   uint32_t refs;
++   uint64_t veids;
+ };
+ 
+ struct nvkmd_rm_exec_ctx {
+    struct nvkmd_ctx base;
+ 
+    uint32_t h_tsg;
++   /* The shared TSG h_tsg belongs to, NULL for a TSG of this context alone */
++   struct nvkmd_rm_tsg *tsg;
++   uint32_t veid;
++   bool async;
+    uint32_t h_ctxshare;
+    uint32_t h_channel;
+    uint32_t h_objects[3];
+@@ -385,8 +423,10 @@ emit_sem_ops(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj,
+          } else {
+             exec = NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _OPERATION,
+                             _ACQ_STRICT_GEQ) |
+-                   NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _ACQUIRE_SWITCH_TSG, _EN) |
+                    NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _PAYLOAD_SIZE, _64BIT);
++            if (!ops[i].no_switch)
++               exec |= NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _ACQUIRE_SWITCH_TSG,
++                                _EN);
+          }
+ 
+          p[dw++] = host_mthd_incr(NVRM_GPFIFO_SEM_ADDR_LO, 5);
+@@ -598,6 +638,39 @@ nvkmd_rm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+    return VK_SUCCESS;
+ }
+ 
++/* NVK_RM_ASYNC_WAIT_SWITCH=1: every GPU wait lets the runlist switch TSGs
++ * when it blocks, as before async compute.
++ */
++static bool
++nvkmd_rm_async_wait_switch(void)
++{
++   static int v = -1;
++   if (unlikely(p_atomic_read(&v) < 0))
++      p_atomic_set(&v, debug_get_bool_option("NVK_RM_ASYNC_WAIT_SWITCH",
++                                             false));
++   return p_atomic_read(&v) == 1;
++}
++
++/* A blocking GPU wait asks for a TSG switch (ACQUIRE_SWITCH_TSG), so that
++ * other TSGs on the runlist run meanwhile.  But in a shared TSG the value
++ * usually comes from another channel of the same TSG (graphics and async
++ * compute waiting for each other), and a switch would take that channel off
++ * the engine too: it runs again only when the TSG is scheduled again.  An
++ * acquire without the switch only stalls its own channel; the async channel
++ * is fed on a runqueue of its own.  So a wait for a value whose latest
++ * signal was submitted in this context's shared TSG does not switch.
++ */
++static bool
++wait_stays_in_tsg(const struct nvkmd_rm_exec_ctx *ctx,
++                  const struct nvkmd_rm_sync *sync)
++{
++   if (ctx->tsg == NULL || p_atomic_read(&ctx->tsg->refs) < 2)
++      return false;
++   if (p_atomic_read(&sync->signal_tsg) != ctx->h_tsg)
++      return false;
++   return !nvkmd_rm_async_wait_switch();
++}
++
+ static VkResult
+ nvkmd_rm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+                        struct vk_object_base *log_obj,
+@@ -640,6 +713,7 @@ nvkmd_rm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+          .gpu_va = sync->gpu_va,
+          .value = value,
+          .release = false,
++         .no_switch = wait_stays_in_tsg(ctx, sync),
+       };
+    }
+ 
+@@ -734,8 +808,9 @@ nvkmd_rm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
+       return result;
+ 
+    for (uint32_t i = 0; i < signal_count; i++) {
+-      nvkmd_rm_sync_mark_pending(nvkmd_rm_sync(signals[i].sync),
+-                                 signals[i].signal_value);
++      struct nvkmd_rm_sync *sync = nvkmd_rm_sync(signals[i].sync);
++      p_atomic_set(&sync->signal_tsg, ctx->h_tsg);
++      nvkmd_rm_sync_mark_pending(sync, signals[i].signal_value);
+    }
+ 
+    return VK_SUCCESS;
+@@ -813,8 +888,32 @@ nvkmd_rm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
+                    &unbind, sizeof(unbind));
+    }
+ 
++   /* A shared TSG goes with the last context in it; until then a context
++    * frees its own channel (and the engine objects under it) and
++    * subcontext.
++    */
++   bool free_tsg = ctx->h_tsg != 0;
++   if (ctx->tsg != NULL) {
++      struct nvkmd_rm_tsg *tsg = ctx->tsg;
++      simple_mtx_lock(&dev->gr_tsg_mutex);
++      tsg->veids &= ~(1ull << ctx->veid);
++      free_tsg = --tsg->refs == 0;
++      if (free_tsg && dev->gr_tsg == tsg)
++         dev->gr_tsg = NULL;
++      simple_mtx_unlock(&dev->gr_tsg_mutex);
++      if (free_tsg)
++         FREE(tsg);
++   }
++
++   if (!free_tsg && ctx->h_tsg != 0) {
++      if (ctx->h_channel != 0)
++         lib->free(dev->client, ctx->h_tsg, ctx->h_channel);
++      if (ctx->h_ctxshare != 0)
++         lib->free(dev->client, ctx->h_tsg, ctx->h_ctxshare);
++   }
++
+    /* Freeing the TSG frees the channel and the engine objects under it */
+-   if (ctx->h_tsg != 0) {
++   if (free_tsg) {
+       NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS sched = { .bEnable = false };
+       lib->control(dev->client, ctx->h_tsg, NVA06C_CTRL_CMD_GPFIFO_SCHEDULE,
+                    &sched, sizeof(sched));
+@@ -926,25 +1025,54 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    const uint32_t engine_type = vdec ? NV2080_ENGINE_TYPE_NVDEC0
+                                      : NV2080_ENGINE_TYPE_GRAPHICS;
+ 
+-   NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS tsg_params = {
+-      .hVASpace = dev->h_vaspace,
+-      .engineType = engine_type,
+-   };
+-   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+-                           lib->alloc(dev->client, dev->h_device, &ctx->h_tsg,
+-                                      KEPLER_CHANNEL_GROUP_A,
+-                                      &tsg_params, sizeof(tsg_params)),
+-                           "alloc KEPLER_CHANNEL_GROUP_A");
+-   if (result != VK_SUCCESS)
+-      goto fail;
++   /* An async compute context: a compute object alone, on a VEID of its own
++    * in the first graphics context's TSG.  Without one there is nothing to
++    * run next to, and the caller makes a context of its own instead.
++    */
++   const bool async = engines & NVKMD_ENGINE_ASYNC;
++   assert(!async || engines == (NVKMD_ENGINE_COMPUTE | NVKMD_ENGINE_ASYNC));
++   ctx->async = async;
++   if (async) {
++      simple_mtx_lock(&dev->gr_tsg_mutex);
++      struct nvkmd_rm_tsg *tsg = dev->gr_tsg;
++      const uint64_t free_veids = tsg != NULL ? ~tsg->veids & ~1ull : 0;
++      if (free_veids != 0) {
++         ctx->veid = ffsll(free_veids) - 1;
++         tsg->veids |= 1ull << ctx->veid;
++         tsg->refs++;
++         ctx->tsg = tsg;
++         ctx->h_tsg = tsg->h_tsg;
++      }
++      simple_mtx_unlock(&dev->gr_tsg_mutex);
++      if (ctx->tsg == NULL) {
++         result = VK_ERROR_FEATURE_NOT_PRESENT;
++         goto fail;
++      }
++   } else {
++      NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS tsg_params = {
++         .hVASpace = dev->h_vaspace,
++         .engineType = engine_type,
++      };
++      result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                              lib->alloc(dev->client, dev->h_device,
++                                         &ctx->h_tsg, KEPLER_CHANNEL_GROUP_A,
++                                         &tsg_params, sizeof(tsg_params)),
++                              "alloc KEPLER_CHANNEL_GROUP_A");
++      if (result != VK_SUCCESS)
++         goto fail;
++   }
+ 
+    /* SYNC: the subcontext with VEID 0, the only one that can run graphics.
+     * GSP-RM refuses the 3D object on an ASYNC (compute-only) subcontext
+-    * with NV_ERR_INVALID_OBJECT.
++    * with NV_ERR_INVALID_OBJECT.  An async context asks for its VEID.
+     */
+    NV_CTXSHARE_ALLOCATION_PARAMETERS ctxshare_params = {
+       .hVASpace = dev->h_vaspace,
+-      .flags = NVRM_DEF(_CTXSHARE, _ALLOCATION_FLAGS, _SUBCONTEXT, _SYNC),
++      .flags = async ? NVRM_DEF(_CTXSHARE, _ALLOCATION_FLAGS, _SUBCONTEXT,
++                                _SPECIFIED)
++                     : NVRM_DEF(_CTXSHARE, _ALLOCATION_FLAGS, _SUBCONTEXT,
++                                _SYNC),
++      .subctxId = async ? ctx->veid : 0,
+    };
+    result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+                            lib->alloc(dev->client, ctx->h_tsg,
+@@ -955,10 +1083,14 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
++   /* A compute object on a VEID > 0 needs the channel on runqueue 1 */
+    NV_CHANNEL_ALLOC_PARAMS chan_params = {
+       .hObjectError = h_ctl,
+       .gpFifoOffset = ctx->gpfifo_va,
+       .gpFifoEntries = ctx->entries,
++      .flags = async ? NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE_ONE |
++                       NVOS04_FLAGS_GROUP_CHANNEL_THREAD_ONE
++                     : 0,
+       .hContextShare = ctx->h_ctxshare,
+       .hUserdMemory = { h_ctl },
+       .userdOffset = { NVKMD_RM_CTL_USERD_OFFSET },
+@@ -1045,12 +1177,23 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+       goto fail;
+    ctx->work_submit_token = token.workSubmitToken;
+ 
++   /* The shared TSG is scheduled already: the async channel is scheduled
++    * by itself
++    */
+    NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS sched = { .bEnable = true };
+-   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+-                           lib->control(dev->client, ctx->h_tsg,
+-                                        NVA06C_CTRL_CMD_GPFIFO_SCHEDULE,
+-                                        &sched, sizeof(sched)),
+-                           "GPFIFO_SCHEDULE");
++   if (async) {
++      result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                              lib->control(dev->client, ctx->h_channel,
++                                           NVA06F_CTRL_CMD_GPFIFO_SCHEDULE,
++                                           &sched, sizeof(sched)),
++                              "channel GPFIFO_SCHEDULE");
++   } else {
++      result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                              lib->control(dev->client, ctx->h_tsg,
++                                           NVA06C_CTRL_CMD_GPFIFO_SCHEDULE,
++                                           &sched, sizeof(sched)),
++                              "GPFIFO_SCHEDULE");
++   }
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
+@@ -1062,7 +1205,7 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+     * refuse).  Unset: RM's defaults.  With NVK_DEBUG=vm the timeslice in
+     * effect is logged (mesa_logi).
+     */
+-   if (!vdec) {
++   if (!vdec && !async) {
+       const int64_t ts_us = debug_get_num_option("NVK_RM_TIMESLICE_US", 0);
+       if (ts_us > 0) {
+          NVA06C_CTRL_TIMESLICE_PARAMS ts = { .timesliceUs = (NvU64)ts_us };
+@@ -1095,6 +1238,32 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+ 
+    ctx->put = ctx->kicked_put = 0;
+ 
++   /* The first graphics context's TSG is the one async compute contexts
++    * join
++    */
++   if ((engines & NVKMD_ENGINE_3D) &&
++       dev->base.pdev->kmd_info.has_async_compute) {
++      struct nvkmd_rm_tsg *tsg = CALLOC_STRUCT(nvkmd_rm_tsg);
++      if (tsg != NULL) {
++         simple_mtx_lock(&dev->gr_tsg_mutex);
++         if (dev->gr_tsg == NULL) {
++            tsg->h_tsg = ctx->h_tsg;
++            tsg->refs = 1;
++            tsg->veids = 1;
++            ctx->tsg = tsg;
++            dev->gr_tsg = tsg;
++            tsg = NULL;
++         }
++         simple_mtx_unlock(&dev->gr_tsg_mutex);
++         FREE(tsg);
++      }
++   }
++
++   if (async && (dev->base.pdev->debug_flags & NVK_DEBUG_VM)) {
++      mesa_logi("NVK: async compute channel on VEID %u of TSG 0x%x",
++                ctx->veid, ctx->h_tsg);
++   }
++
+    defer_register_ctx(dev, ctx);
+ 
+    *ctx_out = &ctx->base;
+@@ -1182,6 +1351,7 @@ nvkmd_rm_bind_ctx_signal(struct nvkmd_ctx *_ctx,
+    for (uint32_t i = 0; i < signal_count; i++) {
+       struct nvkmd_rm_sync *sync = nvkmd_rm_sync(signals[i].sync);
+       nvkmd_rm_sync_mark_pending(sync, signals[i].signal_value);
++      p_atomic_set(&sync->signal_tsg, 0);
+       __atomic_thread_fence(__ATOMIC_SEQ_CST);
+       *sync->value = signals[i].signal_value;
+    }
+@@ -1226,6 +1396,9 @@ nvkmd_rm_create_ctx(struct nvkmd_dev *_dev,
+    assert(!(engines & NVKMD_ENGINE_BIND));
+    if ((engines & NVKMD_ENGINE_VDEC) && !dev->base.pdev->dev_info.has_video)
+       return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++   if ((engines & NVKMD_ENGINE_ASYNC) &&
++       !dev->base.pdev->kmd_info.has_async_compute)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
+ 
+    return nvkmd_rm_create_exec_ctx(dev, log_obj, engines, ctx_out);
+ }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 3408839..8ccfb2d 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -269,6 +269,7 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+                       NVKMD_RM_REPLAY_HEAP_END - NVKMD_RM_REPLAY_HEAP_START);
+ 
+    simple_mtx_init(&dev->sema_pool.mutex, mtx_plain);
++   simple_mtx_init(&dev->gr_tsg_mutex, mtx_plain);
+    nvkmd_rm_defer_init(dev);
+    dev->sema_pool.chunks = UTIL_DYNARRAY_INIT;
+    dev->sema_pool.free_slots = UTIL_DYNARRAY_INIT;
+@@ -337,6 +338,10 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+    util_vma_heap_finish(&dev->replay_heap);
+    simple_mtx_destroy(&dev->heap_mutex);
+ 
++   /* Every exec context is gone, and the last one freed the shared TSG */
++   assert(dev->gr_tsg == NULL);
++   simple_mtx_destroy(&dev->gr_tsg_mutex);
++
+    if (dev->nonstall_fd >= 0 && lib->event_close != NULL)
+       lib->event_close(dev->client, dev->h_nonstall_event, dev->nonstall_fd);
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index ea9e772..3525f77 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -5,7 +5,9 @@
+ 
+ #include "nvkmd_rm.h"
+ 
++#include "clc3c0.h"
+ #include "clcd97.h"
++#include "clcec0.h"
+ 
+ #include "nouveau_device_limits.h"
+ #include "util/cache_ops.h"
+@@ -477,6 +479,18 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+       pdev->base.kmd_info.has_compression &&
+       debug_get_bool_option("NVK_RM_COMPRESS_ZS", true);
+ 
++   /* Async compute (nvkmd_rm_ctx.c): a compute-only channel on a VEID of
++    * its own in the first graphics context's TSG, fed on runqueue 1, runs
++    * next to the graphics channel; NVIDIA's driver places its compute queues
++    * that way.  Measured on GB20x, so on by default there;
++    * NVK_RM_ASYNC_COMPUTE=0/1 decides.
++    */
++   pdev->base.kmd_info.has_async_compute =
++      pdev->base.dev_info.cls_compute >= VOLTA_COMPUTE_A &&
++      debug_get_bool_option("NVK_RM_ASYNC_COMPUTE",
++                            pdev->base.dev_info.cls_compute >=
++                            BLACKWELL_COMPUTE_B);
++
+    /* VRAM is allocated with 64 KiB pages; system memory BOs get their own
+     * 4 KiB bind alignment (nvkmd_mem::bind_align_B).
+     */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+index b190ecc..25d7282 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -8,6 +8,7 @@
+ #include "../../nvk_device.h"
+ 
+ #include "util/os_time.h"
++#include "util/u_atomic.h"
+ #include "vk_sync_binary.h"
+ #include "vk_log.h"
+ 
+@@ -164,6 +165,7 @@ nvkmd_rm_sync_init(struct vk_device *device,
+ 
+    *sync->value = initial_value;
+    sync->pending = initial_value;
++   sync->signal_tsg = 0;
+ 
+    return VK_SUCCESS;
+ }
+@@ -217,6 +219,7 @@ nvkmd_rm_sync_signal(struct vk_device *device, struct vk_sync *_sync,
+       return VK_ERROR_DEVICE_LOST;
+ 
+    nvkmd_rm_sync_mark_pending(sync, value);
++   p_atomic_set(&sync->signal_tsg, 0);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    *sync->value = value;
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index a8d4359..8d1b44f 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -211,6 +211,14 @@ typedef NvU32 NvHandle;
+ #define NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT               1:0
+ #define NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SYNC          (0x00000000)
+ #define NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC         (0x00000001)
++#define NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SPECIFIED     (0x00000002)
++
++/* alloc_channel.h: NV_CHANNEL_ALLOC_PARAMS.flags.  GROUP_CHANNEL_RUNQUEUE
++ * (4:4) is the runqueue a TSG channel is fed on, GROUP_CHANNEL_THREAD
++ * (29:28) its thread in the TSG.
++ */
++#define NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE_ONE               (1u << 4)
++#define NVOS04_FLAGS_GROUP_CHANNEL_THREAD_ONE                 (1u << 28)
+ 
+ /* nvgputypes.h */
+ typedef volatile struct NvNotificationRec {
+-- 
+2.43.0
+

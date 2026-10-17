@@ -104,6 +104,9 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NAK_WEAK_MEM` | 0 | weak (L1-cacheable) order for non-coherent global, SSBO and image accesses (common 67) |
 | `NAK_BAR_SHARE`, `NAK_LAT` | 0, 0 | scoreboard sharing and SM120 latency padding, for hardware validation with `tools/naktest` (common 63) |
 | `NVK_DIAG_NO_WFI_BARRIER`, `NVK_DIAG_WFI_COUNT` | 0, 0 | measurement only: pipeline barriers without WAIT_FOR_IDLE (unsafe); count barrier idles per second (common 64) |
+| **Queues** | | |
+| `NVK_RM_ASYNC_COMPUTE` | 1 on GB20x, 0 elsewhere | a compute queue family whose queues run next to the graphics queue (see "Async compute"); 0 = one queue family (common 69) |
+| `NVK_RM_ASYNC_WAIT_SWITCH` | 0 | 1: every GPU wait asks for a TSG switch when it blocks, also waits between channels of one TSG (common 69) |
 | **Windows presentation** | | |
 | `NVK_HELIOS_WSI` | 1 | Helios zero-copy swapchains; 0 = GDI copy |
 | `NVK_HELIOS_WSI_LINEAR` | 0 | linear instead of block-linear scanout images |
@@ -318,6 +321,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0066 | NAK: the copies that turn a splat into a register vector serve its later uses in the block (`NAK_VEC_CSE`, default on) |
 | 0067 | NAK: weak memory order for non-coherent global, SSBO and image accesses (`NAK_WEAK_MEM`, opt-in) |
 | 0068 | `NVK_RM_COMPRESS_ALL` defaults to on for processes whose Vulkan engine name starts with `vkd3d` (vkd3d-proton) and to off for all others; 0 or 1 in the environment overrides it (`nvk_apply_engine_compression_default`) |
+| 0069 | async compute: a compute + transfer queue family (4 queues) whose channels sit in the first graphics queue's TSG on VEIDs of their own and run next to it (`NVK_RM_ASYNC_COMPUTE`, see "Async compute") |
 
 ## Per-draw cost (common 0001-0007)
 
@@ -1178,6 +1182,62 @@ and tiling rules. An RTX 5090 (GB202, chipset 0x1b2) gets 3D 0xCE97,
 compute 0xCEC0, copy 0xCAB5, GPFIFO 0xCA6F, usermode 0xC761 from this
 backend's class selection.
 
+## Async compute (common 0069)
+
+The GR engine runs channels of one TSG that sit on different VEIDs
+(subcontexts) at the same time; different TSGs are only time-sliced. NVK on
+RM therefore has a second queue family, compute + transfer with four
+queues, when `NVK_RM_ASYNC_COMPUTE` is on (the default on GB20x), and places
+it the way NVIDIA's driver places its compute queues
+(`docs/research/async-compute-gb202.md`):
+
+```
+KEPLER_CHANNEL_GROUP_A of the first graphics queue
+  FERMI_CONTEXT_SHARE_A SYNC (VEID 0)          graphics queue: 3D, compute, copy
+  FERMI_CONTEXT_SHARE_A SPECIFIED (VEID 1..4)  one channel per compute queue:
+                                               flags RUNQUEUE_ONE | THREAD_ONE,
+                                               compute object only
+KEPLER_CHANNEL_GROUP_A per compute queue, made on first use
+  FERMI_CONTEXT_SHARE_A SYNC (VEID 0)          3D, compute, copy
+```
+
+vkd3d-proton puts D3D12 COMPUTE and COPY queues on that family. Graphics
+queues are created first, so that the compute queues find the TSG; a
+compute queue that cannot join it (no graphics queue, RM refuses) gets a
+channel with every engine in a TSG of its own and logs why.
+
+- **Which channel.** A command buffer of the family runs on the compute-only
+  channel unless it needs another engine. Every pushed method header records
+  its subchannel (host methods excepted) and whether it is an MME method
+  (`nv_push::subc_used`); generated commands (`vkCmdExecuteGeneratedCommandsEXT`)
+  count as needing everything. Copies, fills and updates of buffers and of
+  color images, query resets, timestamps and events use the compute engine.
+  The rest run on the queue's second channel, with every engine of the
+  family: copy-engine copies (compressed, depth/stencil, YCbCr images,
+  updates over 2 KiB), `vkCmdClearColorImage` (it renders), compute shader
+  invocation queries and conditional rendering (MME macros). The log line
+  `async compute queue N: ... on the compute channel, ... on the full
+  channel (subchannel mask ...)` at device destruction says how the work
+  split (mask bits: 0x01 3D, 0x10 copy, 0x40 generated commands, 0x80 MME).
+- **Order inside a queue.** When the next command buffer goes to the other
+  channel, the channel that had the latest work signals the queue's handoff
+  timeline and the other waits for it; the submission's waits go to the
+  channel it starts on and its signals to the one it ends on.
+- **Waits between queues.** A GPU wait asks for a TSG switch when it blocks
+  (`ACQUIRE_SWITCH_TSG`), except when the latest signal of the value was
+  submitted in the same shared TSG: a switch would take the signalling
+  channel (graphics or async compute) off the engine too. The async channel
+  is fed on runqueue 1, so its blocked acquire stalls only itself.
+  `NVK_RM_ASYNC_WAIT_SWITCH=1` switches on every wait.
+- **ZCULL.** vkd3d-proton makes every image `VK_SHARING_MODE_CONCURRENT`
+  once it has two queue families. The family's queues may not copy depth or
+  stencil (`DEPTH/STENCIL_COPY_ON_COMPUTE_QUEUE` are not reported then; vkd3d
+  moves such copies to a graphics continuation), so depth images shared only
+  between graphics and compute families keep their ZCULL storage.
+
+With `NVK_RM_ASYNC_COMPUTE=0` there is one queue family and everything runs
+on the graphics queue's channel.
+
 ## What is implemented (and how)
 
 **Enumeration / physical device** (`nvkmd_rm_pdev.c`). One RM client per
@@ -1239,7 +1299,12 @@ channel (4096 entries by default, `NVK_RM_GPFIFO_ENTRIES`; ring and push
 slots in our system pages; error notifier + USERD in RM system memory) →
 `NVA06F_CTRL_CMD_BIND` (GR) → 3D / compute / copy objects without
 parameters → `SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX`, `GET_WORK_SUBMIT_TOKEN` →
-`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE`. Submission has no RM call: GPFIFO entries
+`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE`. An async compute context
+(`NVKMD_ENGINE_ASYNC`) is a channel in the first graphics context's TSG
+instead: `FERMI_CONTEXT_SHARE_A` SPECIFIED on the lowest free VEID, channel
+flags `GROUP_CHANNEL_RUNQUEUE_ONE | GROUP_CHANNEL_THREAD_ONE`, the compute
+object alone, `NVA06F_CTRL_CMD_GPFIFO_SCHEDULE` on the channel; the TSG goes
+with the last context in it. Submission has no RM call: GPFIFO entries
 (`NO_PREFETCH` → `SYNC_WAIT`), GP_PUT in USERD, token to `usermode + 0x90`.
 GP_GET in USERD is not written back while the channel runs (it stays 0), so
 every kick ends with a semaphore release (no WFI) of a sequence number and
@@ -1254,7 +1319,9 @@ channel on the NVDEC0 runlist with the NVDEC object alone on it.
 per-device pool of system memory; `vk_sync_binary` on top, with a `move`
 added (the runtime needs it for binary semaphores in assisted mode). GPU
 signal: `SEM_EXECUTE` release (64-bit, WFI) + `NON_STALL_INTERRUPT`; GPU
-wait: `SEM_EXECUTE ACQ_STRICT_GEQ` with TSG switch. CPU wait: read the value,
+wait: `SEM_EXECUTE ACQ_STRICT_GEQ` with TSG switch, without it when the
+value's latest signal came from the waiter's own shared TSG ("Async
+compute"). CPU wait: read the value,
 spin briefly, then wait on the non-stall event through `crm_event_wait`
 (Linux: `poll()`; bounded at `NVK_RM_WAIT_POLL_MS` per round, so a lost wakeup
 costs at most that) or sleep with backoff without an event. On Windows
