@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 18:25:38 +0200
+Subject: [PATCH] nvk: on Windows the driver build id includes the build's
+ -Dnvk-build-id
+
+Without an ELF build-id note, NVK on Windows identifies its build by the
+Mesa version string and the timestamp of the module file.  That did not
+tell driver packages apart: after a driver rollback, a game loaded
+pipeline binaries another build had compiled from the disk cache, with
+corrupted rendering.
+
+The build id from -Dnvk-build-id (which the Windows build sets to a hash
+of the patch series, the build options and the driver package version)
+now goes into instance->driver_build_sha, so driverUUID, the disk cache's
+driver id and the pipeline cache and shader binary UUIDs (which already
+used NVK_BUILD_ID_OVERRIDE) all change with every build.
+---
+ src/nouveau/vulkan/nvk_instance.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_instance.c b/src/nouveau/vulkan/nvk_instance.c
+index 051aa26..3f24569 100644
+--- a/src/nouveau/vulkan/nvk_instance.c
++++ b/src/nouveau/vulkan/nvk_instance.c
+@@ -190,14 +190,23 @@ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+    STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
+    copy_build_id_to_sha1(instance->driver_build_sha, note);
+ #else
+-   /* No ELF build-id (Windows): the Mesa version plus what the OS says
+-    * about the module this function lives in (its timestamp on Windows).
++   /* No ELF build-id (Windows): the Mesa version, the build id the build
++    * passes in (-Dnvk-build-id, a hash of the patch series, the build
++    * options and the driver package version), and what the OS says about
++    * the module this function lives in (its timestamp on Windows).  The
++    * build id is what keeps two builds from sharing pipeline caches and
++    * disk cache entries: the version string and the file time alone did
++    * not tell driver packages apart.
+     */
+    {
+       static const char mesa_version[] = PACKAGE_VERSION MESA_GIT_SHA1;
+       blake3_hasher blake3_ctx;
+       _mesa_blake3_init(&blake3_ctx);
+       _mesa_blake3_update(&blake3_ctx, mesa_version, strlen(mesa_version));
++#ifdef NVK_BUILD_ID_OVERRIDE
++      _mesa_blake3_update(&blake3_ctx, NVK_BUILD_ID_OVERRIDE,
++                          strlen(NVK_BUILD_ID_OVERRIDE));
++#endif
+       if (!disk_cache_get_function_identifier(nvk_CreateInstance,
+                                               &blake3_ctx)) {
+          result = vk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
+-- 
+2.43.0
+
