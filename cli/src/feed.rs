@@ -62,6 +62,7 @@ pub fn run(name: &str) -> Result<()> {
     let path = units::stats_path(&scope, name);
     let host = hostname();
     let mut nvml: Option<Nvml> = None;
+    let mut last_err: Option<String> = None;
     let mut conn: Option<UnixStream> = None;
     eprintln!("conduit: feeding GPU readings to {}", path.display());
     loop {
@@ -73,7 +74,20 @@ pub fn run(name: &str) -> Result<()> {
             }
         }
         if nvml.is_none() {
-            nvml = Nvml::open();
+            match Nvml::open() {
+                Ok(n) => {
+                    if last_err.take().is_some() {
+                        eprintln!("conduit: NVML is back");
+                    }
+                    nvml = Some(n);
+                }
+                Err(e) => {
+                    if last_err.as_deref() != Some(e.as_str()) {
+                        eprintln!("conduit: NVML is not available: {e}");
+                    }
+                    last_err = Some(e);
+                }
+            }
         }
         if let (Some(n), Some(c)) = (nvml.as_ref(), conn.as_mut()) {
             let ts = SystemTime::now()
@@ -82,6 +96,12 @@ pub fn run(name: &str) -> Result<()> {
             let line = reading(&n.sample(), &n.driver, &host, ts).to_line();
             if c.write_all(line.as_bytes()).is_err() {
                 conn = None;
+            }
+            // Stale handles (GPU reset or lost): open NVML again next round.
+            if let Some(why) = n.take_stale() {
+                eprintln!("conduit: NVML went stale, opening it again: {why}");
+                last_err = Some(why);
+                nvml = None;
             }
         }
         std::thread::sleep(Duration::from_secs(1));

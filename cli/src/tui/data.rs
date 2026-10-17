@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// The longest a virsh call of the sampler may take.
 const VIRSH_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long after NVML failed to open it is tried again.
-const NVML_RETRY: Duration = Duration::from_secs(30);
+/// The longest wait between tries to open NVML again.
+const NVML_RETRY_MAX: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug, Default)]
 pub struct Vm {
@@ -71,6 +71,9 @@ pub struct Snapshot {
     pub gpus: usize,
     /// NVML was let go (the sampler was told to release it).
     pub gpu_released: bool,
+    /// Why there is no GPU reading: the failure NVML reported, while it is
+    /// being opened again.
+    pub gpu_error: Option<String>,
     pub driver: String,
     /// The sampler's last failure (a panic), for a note.
     pub error: Option<String>,
@@ -80,23 +83,75 @@ pub struct Snapshot {
 
 pub type Shared = Arc<Mutex<Snapshot>>;
 
-/// Keep `slot` open while `want`, closed otherwise; a failed open is tried
-/// again after `retry`.
-fn hold<T>(
-    slot: &mut Option<T>,
-    want: bool,
-    failed: &mut Option<Instant>,
-    retry: Duration,
-    open: impl FnOnce() -> Option<T>,
-) {
-    if !want {
-        *slot = None;
-        *failed = None;
-        return;
+/// The wait before the next try after `failures` failures in a row: 1 s,
+/// doubling up to [`NVML_RETRY_MAX`]. NVML can refuse for a moment while a VM starts or stops
+/// on the GPU; a try costs a dlopen and an init, so short waits are cheap.
+fn retry_delay(failures: u32) -> Duration {
+    match failures {
+        0 => Duration::ZERO,
+        n => Duration::from_secs(1)
+            .saturating_mul(1u32 << (n - 1).min(10))
+            .min(NVML_RETRY_MAX),
     }
-    if slot.is_none() && failed.is_none_or(|t| t.elapsed() >= retry) {
-        *slot = open();
-        *failed = slot.is_none().then(Instant::now);
+}
+
+/// A resource (the open NVML) kept while wanted and opened again, with a
+/// growing wait, when opening fails or the open one goes stale.
+struct Holder<T> {
+    slot: Option<T>,
+    /// Failures in a row since the last good reading.
+    failures: u32,
+    retry_at: Option<Instant>,
+    /// The last failure, until a reading works again.
+    error: Option<String>,
+}
+
+impl<T> Holder<T> {
+    fn new() -> Self {
+        Holder {
+            slot: None,
+            failures: 0,
+            retry_at: None,
+            error: None,
+        }
+    }
+
+    /// Open while `want` (when no wait is pending), close otherwise.
+    fn update(&mut self, want: bool, now: Instant, open: impl FnOnce() -> Result<T, String>) {
+        if !want {
+            *self = Self::new();
+            return;
+        }
+        if self.slot.is_some() || self.retry_at.is_some_and(|t| now < t) {
+            return;
+        }
+        match open() {
+            Ok(v) => {
+                self.slot = Some(v);
+                self.retry_at = None;
+            }
+            Err(e) => self.fail(now, e),
+        }
+    }
+
+    /// The open one no longer works (`why`): let go of it, to be opened again
+    /// after the wait.
+    fn stale(&mut self, now: Instant, why: String) {
+        self.slot = None;
+        self.fail(now, why);
+    }
+
+    /// A reading worked: forget the failures.
+    fn healthy(&mut self) {
+        self.failures = 0;
+        self.retry_at = None;
+        self.error = None;
+    }
+
+    fn fail(&mut self, now: Instant, why: String) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(now + retry_delay(self.failures));
+        self.error = Some(why);
     }
 }
 
@@ -116,20 +171,37 @@ pub fn start(gpu_wanted: Arc<AtomicBool>) -> (Shared, std::sync::mpsc::Sender<()
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let out = shared.clone();
     std::thread::spawn(move || {
-        let mut nvml: Option<Nvml> = None;
-        let mut failed = None;
+        let mut nvml: Holder<Nvml> = Holder::new();
         let mut c = Collector::default();
         loop {
             let want = gpu_wanted.load(Ordering::SeqCst);
-            hold(&mut nvml, want, &mut failed, NVML_RETRY, Nvml::open);
-            let r =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.collect(nvml.as_ref())));
+            nvml.update(want, Instant::now(), Nvml::open);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c.collect(nvml.slot.as_ref())
+            }));
+            // Every core read failing means the handles went stale (the GPU
+            // was reset or lost, the driver reloaded): no reading, and NVML
+            // is opened again.
+            let r = r.map(|mut snap| {
+                match nvml.slot.as_ref().map(|n| n.take_stale()) {
+                    Some(Some(why)) => {
+                        nvml.stale(Instant::now(), why);
+                        snap.gpu = None;
+                        snap.gpus = 0;
+                        snap.driver.clear();
+                    }
+                    Some(None) => nvml.healthy(),
+                    None => {}
+                }
+                snap
+            });
             if let Ok(mut s) = out.lock() {
                 let seq = s.seq + 1;
                 *s = match r {
                     Ok(snap) => Snapshot {
                         seq,
                         gpu_released: !want,
+                        gpu_error: nvml.error.clone(),
                         ..snap
                     },
                     Err(p) => {
@@ -144,7 +216,7 @@ pub fn start(gpu_wanted: Arc<AtomicBool>) -> (Shared, std::sync::mpsc::Sender<()
             }
             // After publishing: PCIe throughput samples for ~40 ms and is
             // shown with the next snapshot.
-            if let Some(n) = &nvml {
+            if let Some(n) = &nvml.slot {
                 c.pcie = n.pcie(c.picked);
             }
             if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
@@ -503,6 +575,7 @@ impl Collector {
             gpu,
             gpus,
             gpu_released: false,
+            gpu_error: None,
             error: None,
             seq: 0,
         }
@@ -587,57 +660,93 @@ mod tests {
     }
 
     #[test]
+    fn retries_wait_longer_up_to_a_cap() {
+        let secs: Vec<u64> = (0..7).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [0, 1, 2, 4, 8, 8, 8]);
+        assert_eq!(retry_delay(u32::MAX), NVML_RETRY_MAX);
+    }
+
+    #[test]
     fn nvml_is_held_only_while_wanted() {
-        let mut slot = None;
-        let mut failed = None;
+        let t0 = Instant::now();
+        let mut h = Holder::new();
         let opens = std::cell::Cell::new(0);
         let open = |ok: bool| {
             opens.set(opens.get() + 1);
-            ok.then_some(1)
+            if ok {
+                Ok(1)
+            } else {
+                Err("nvmlInit_v2 failed: Driver Not Loaded (9)".to_string())
+            }
         };
-        hold(
-            &mut slot,
-            true,
-            &mut failed,
-            Duration::from_secs(30),
-            || open(true),
-        );
-        assert_eq!(slot, Some(1));
-        hold(
-            &mut slot,
-            true,
-            &mut failed,
-            Duration::from_secs(30),
-            || open(true),
-        );
+        h.update(true, t0, || open(true));
+        assert_eq!(h.slot, Some(1));
+        h.update(true, t0, || open(true));
         assert_eq!(opens.get(), 1, "kept open, not opened again");
-        // Focus lost: let go of the GPU.
-        hold(
-            &mut slot,
-            false,
-            &mut failed,
-            Duration::from_secs(30),
-            || open(true),
+        // Focus lost: let go of the GPU, and forget any failure.
+        h.stale(t0, "old".into());
+        h.update(false, t0, || open(true));
+        assert!(h.slot.is_none() && h.error.is_none() && h.retry_at.is_none());
+        assert_eq!(opens.get(), 1, "not opened while unwanted");
+        assert_eq!(h.failures, 0);
+    }
+
+    #[test]
+    fn a_failed_open_keeps_its_error_and_is_tried_again_soon() {
+        let t0 = Instant::now();
+        let mut h: Holder<u8> = Holder::new();
+        h.update(true, t0, || {
+            Err("nvmlInit_v2 failed: Unknown Error (999)".into())
+        });
+        assert!(h.slot.is_none());
+        assert_eq!(
+            h.error.as_deref(),
+            Some("nvmlInit_v2 failed: Unknown Error (999)")
         );
-        assert_eq!(slot, None);
-        // A failed open waits before it tries again.
-        hold(
-            &mut slot,
-            true,
-            &mut failed,
-            Duration::from_secs(30),
-            || open(false),
+        // Within the wait: no try.
+        h.update(true, t0 + Duration::from_millis(900), || {
+            panic!("tried too early")
+        });
+        // After 1 s: a try; failing again doubles the wait.
+        h.update(true, t0 + Duration::from_secs(1), || Err("again".into()));
+        assert_eq!(h.error.as_deref(), Some("again"));
+        h.update(true, t0 + Duration::from_secs(2), || {
+            panic!("tried before the 2 s wait")
+        });
+        // Success: open, the error stays until a reading works.
+        h.update(true, t0 + Duration::from_secs(3), || Ok(7));
+        assert_eq!(h.slot, Some(7));
+        h.healthy();
+        assert!(h.error.is_none());
+        assert_eq!(h.failures, 0);
+    }
+
+    #[test]
+    fn a_stale_handle_is_closed_and_opened_again() {
+        let t0 = Instant::now();
+        let mut h = Holder::new();
+        h.update(true, t0, || Ok(1));
+        h.healthy();
+        // The GPU was lost: the handle goes, the error says why.
+        h.stale(t0, "nvmlDeviceGetName failed: GPU is lost (15)".into());
+        assert!(h.slot.is_none());
+        assert_eq!(
+            h.error.as_deref(),
+            Some("nvmlDeviceGetName failed: GPU is lost (15)")
         );
-        hold(
-            &mut slot,
-            true,
-            &mut failed,
-            Duration::from_secs(30),
-            || open(true),
-        );
-        assert_eq!((slot, opens.get()), (None, 2));
-        hold(&mut slot, true, &mut failed, Duration::ZERO, || open(true));
-        assert_eq!((slot, opens.get()), (Some(1), 3));
+        h.update(true, t0, || panic!("tried at once"));
+        h.update(true, t0 + Duration::from_secs(1), || Ok(2));
+        assert_eq!(h.slot, Some(2), "reopened");
+        // Stale again before any good reading: the wait grows.
+        h.stale(t0 + Duration::from_secs(1), "x".into());
+        h.update(true, t0 + Duration::from_secs(2), || panic!("too early"));
+        h.update(true, t0 + Duration::from_secs(3), || Ok(3));
+        assert_eq!(h.slot, Some(3));
+        // A good reading resets the wait.
+        h.healthy();
+        h.stale(t0 + Duration::from_secs(3), "y".into());
+        h.update(true, t0 + Duration::from_secs(4), || Ok(4));
+        assert_eq!(h.slot, Some(4));
     }
 
     #[test]
