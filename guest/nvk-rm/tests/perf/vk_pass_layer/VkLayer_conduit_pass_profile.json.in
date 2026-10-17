@@ -1,0 +1,14 @@
+{
+    "file_format_version": "1.1.2",
+    "layer": {
+        "name": "VK_LAYER_CONDUIT_pass_profile",
+        "type": "GLOBAL",
+        "library_path": "@LIBRARY@",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "GPU time per render pass, operation run and command buffer (NVK_PASS_PROFILE signatures)",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+        }
+    }
+}
