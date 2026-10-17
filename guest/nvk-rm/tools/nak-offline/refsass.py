@@ -12,7 +12,8 @@ for our own shaders; nothing of the driver itself is read.
 
 Layout of that data as observed (it may change between driver versions):
 the cache header is followed by entries whose payload is one zstd frame
-each; a decompressed entry starts with "NVDA" and an 8-byte tag, then a table
+each (with a zstd dictionary stored as an entry of the same blob for some
+pipelines); a decompressed entry starts with "NVDA" and an 8-byte tag, then a table
 of 32-byte section records (type u32, size u32, offset u64 relative to byte
 8); section type 1 is the machine code.  A graphics pipeline has one entry
 per stage.  Writes OUT_DIR/<name>.<entry>.bin for every code section bigger
@@ -33,21 +34,43 @@ except ImportError:
     sys.exit("refsass.py needs the zstandard module (pip install zstandard)")
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+DICT_MAGIC = b"\x37\xa4\x30\xec"
+
+
+def dictionaries(data):
+    """zstd dictionaries stored in `data` (an entry holding one is preceded
+    by its size as a u64); later entries of the same blob may need them"""
+    out, i = [], 0
+    while True:
+        j = data.find(DICT_MAGIC, i)
+        if j < 0:
+            return out
+        if j >= 8:
+            size = struct.unpack_from("<Q", data, j - 8)[0]
+            if 0 < size <= len(data) - j:
+                out.append(zstandard.ZstdCompressionDict(data[j : j + size]))
+        i = j + 4
 
 
 def frames(data):
     """Decompressed zstd frames in `data`, in order"""
+    dicts = [None] + dictionaries(data)
     out, i = [], 0
     while True:
         j = data.find(ZSTD_MAGIC, i)
         if j < 0:
             return out
-        try:
-            d = zstandard.ZstdDecompressor().decompressobj()
-            payload = d.decompress(data[j:])
-            out.append(payload)
-            i = len(data) - len(d.unused_data)
-        except zstandard.ZstdError:
+        for dct in dicts:
+            try:
+                z = zstandard.ZstdDecompressor(dict_data=dct) if dct else zstandard.ZstdDecompressor()
+                d = z.decompressobj()
+                payload = d.decompress(data[j:])
+                out.append(payload)
+                i = len(data) - len(d.unused_data)
+                break
+            except zstandard.ZstdError:
+                continue
+        else:
             i = j + 4
 
 

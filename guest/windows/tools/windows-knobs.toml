@@ -1329,10 +1329,45 @@ class = "experiment"
 read = "shader compile (once per process)"
 effect = "1 (SM100 and newer) gives the BSSY/BSYNC pairs of if/else regions the .RECONVERGENT mode, as NVIDIA's own SM120 code does, without the BMOV.CLEAR before each BSSY. Barriers used by BREAK keep the plain mode. Off by default until tested on hardware. Part of the shader cache key."
 
+[env.NAK_PHI_AVOID]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "On by default (unset or 1); 0 turns it off. Register allocation keeps a new value without a register preference out of the registers that the phi copies at the end of its block want for other values, which saves copies and swaps at if/else merges. Part of the shader cache key."
+
+[env.NAK_BAR_SHARE]
+class = "experiment"
+read = "first shader compile (once per process)"
+effect = "1: when all six scoreboards are in use, a new variable-latency instruction shares the most recently used scoreboard instead of waiting for the oldest one to finish (waiting on a shared scoreboard waits for all its instructions). Off by default until validated on hardware (naktest). Part of the shader cache key."
+
+[env.NAK_LAT]
+class = "experiment"
+read = "first shader compile (once per process)"
+effect = "Bitmask, default 0: SM120 register dependency pairs that wait the SM100 latency instead of one cycle more: 1 FMA-class chains, 2 FMA/ALU cross pairs, 4 predicate guards, 8 coupled carry predicates, 16 uniform datapath, 64 LOP3/PRMT/SHF chains, 128 every pair (unsafe upper bound). For hardware validation with naktest only. Part of the shader cache key."
+
+[env.NAK_UNROLL_MAX]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "Most iterations NIR fully unrolls a loop with a known trip count: 0, 1, 2, 4, 8, 16, 32 (default) or 64; other values round down to one of these. Lower values keep loops rolled as NVIDIA's compiler does (smaller code, sometimes fewer registers, a few instructions of loop overhead per iteration). Part of the shader cache key."
+
+[env.NAK_VEC_CSE]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "On by default (unset or 1); 0 turns it off. The register copies that turn a vector source with repeated components (an image store of vec4(x), say) into a register vector are made once per block and reused by later uses of the same vector. Part of the shader cache key."
+
 [env.NAK_OCC_TRACE]
 class = "debug"
 read = "first shader compile (once per process)"
 effect = "1 prints NAK_OCC_TARGET's estimate for every candidate register count of every shader to stderr (cost, memory spills, gain, rejected or not)."
+
+[env.NVK_DIAG_NO_WFI_BARRIER]
+class = "debug"
+read = "first pipeline barrier recorded (once per process)"
+effect = "1 (unsafe, measurement only): pipeline barriers with a source stage emit no WAIT_FOR_IDLE on the 3D or compute subchannel; cache flushes and invalidates stay (a shader data flush still idles implicitly). Gives an upper bound of what draining at barriers costs; rendering may be wrong."
+
+[env.NVK_DIAG_WFI_COUNT]
+class = "debug"
+read = "first pipeline barrier recorded (once per process)"
+effect = "1 logs once a second (mesa_logi, MESA_LOG_FILE on Windows) how many idles pipeline barriers recorded per second: explicit WAIT_FOR_IDLE, shader data flushes, and the ones NVK_DIAG_NO_WFI_BARRIER skipped."
 
 [env.NVK_BLACKWELL_MME_MEMBAR]
 class = "debug"

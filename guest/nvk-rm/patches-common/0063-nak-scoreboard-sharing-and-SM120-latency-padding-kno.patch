@@ -1,0 +1,336 @@
+From 409a75bb26d6b1398c5aeefe57a4490f870e7494 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 16:00:29 +0200
+Subject: [PATCH] nak: scoreboard sharing and SM120 latency padding knobs for
+ hardware validation (NAK_BAR_SHARE, NAK_LAT)
+
+Both default to off; they exist to be validated on hardware (naktest) and
+measured before any of it is turned on.
+
+NAK_BAR_SHARE=1: when all six scoreboards are in use, a new
+variable-latency instruction joins the scoreboard used most recently
+instead of first waiting for the oldest one to finish.  A scoreboard then
+tracks several instructions, and waiting on it waits for all of them.  In
+the heavy Steel Nomad shaders 215-389 instructions issue with all six
+scoreboards pending.
+
+NAK_LAT (bitmask): leaves out the blanket one extra cycle of the SM120 RAW
+latencies for pairs where the stall counts of NVIDIA's public ptxas
+(-arch=sm_120) on probe PTX use the SM100 latency: 1 FMA-class chains,
+2 FMA/ALU cross pairs, 4 predicate guards, 8 coupled carry predicates,
+16 uniform datapath, 64 LOP3/PRMT/SHF chains, 128 every pair (unsafe upper
+bound).
+
+Both are part of nak_knobs_key().
+---
+ src/nouveau/compiler/nak/calc_instr_deps.rs   | 70 ++++++++++++-----
+ src/nouveau/compiler/nak/knobs.rs             | 36 ++++++++-
+ .../compiler/nak/sm120_instr_latencies.rs     | 77 ++++++++++++++++++-
+ 3 files changed, 161 insertions(+), 22 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/calc_instr_deps.rs b/src/nouveau/compiler/nak/calc_instr_deps.rs
+index c89c335..46c1634 100644
+--- a/src/nouveau/compiler/nak/calc_instr_deps.rs
++++ b/src/nouveau/compiler/nak/calc_instr_deps.rs
+@@ -259,30 +259,30 @@ impl DepGraph {
+ 
+ struct BarAlloc {
+     num_bars: u8,
+-    bar_dep: [usize; 6],
++    // Every dep that signals a barrier; waiting on the barrier waits on all
++    bar_dep: [Vec<usize>; 6],
+ }
+ 
+ impl BarAlloc {
+     pub fn new() -> BarAlloc {
+         BarAlloc {
+             num_bars: 6,
+-            bar_dep: [usize::MAX; 6],
++            bar_dep: Default::default(),
+         }
+     }
+ 
+     pub fn bar_is_free(&self, bar: u8) -> bool {
+         debug_assert!(bar < self.num_bars);
+-        self.bar_dep[usize::from(bar)] == usize::MAX
++        self.bar_dep[usize::from(bar)].is_empty()
+     }
+ 
+     pub fn set_bar_dep(&mut self, bar: u8, dep: usize) {
+-        debug_assert!(self.bar_is_free(bar));
+-        self.bar_dep[usize::from(bar)] = dep;
++        self.bar_dep[usize::from(bar)].push(dep);
+     }
+ 
+     pub fn free_bar(&mut self, bar: u8) {
+         debug_assert!(!self.bar_is_free(bar));
+-        self.bar_dep[usize::from(bar)] = usize::MAX;
++        self.bar_dep[usize::from(bar)].clear();
+     }
+ 
+     pub fn try_find_free_bar(&self) -> Option<u8> {
+@@ -291,9 +291,10 @@ impl BarAlloc {
+ 
+     pub fn free_some_bar(&mut self) -> u8 {
+         // Get the oldest by looking for the one with the smallest dep
++        let key = |b: u8| *self.bar_dep[usize::from(b)].iter().min().unwrap();
+         let mut bar = 0;
+         for b in 1..self.num_bars {
+-            if self.bar_dep[usize::from(b)] < self.bar_dep[usize::from(bar)] {
++            if key(b) < key(bar) {
+                 bar = b;
+             }
+         }
+@@ -301,8 +302,27 @@ impl BarAlloc {
+         bar
+     }
+ 
++    /// NAK_BAR_SHARE: when all six barriers are in use, a new signal joins
++    /// the barrier whose newest dep is the most recent (excluding `not`)
++    /// instead of waiting for the oldest to finish.  Waiting on a shared
++    /// barrier then waits for all of its deps.
++    pub fn share_some_bar(&self, not: Option<u8>) -> u8 {
++        let key = |b: u8| *self.bar_dep[usize::from(b)].iter().max().unwrap();
++        let mut best: Option<u8> = None;
++        for b in 0..self.num_bars {
++            if Some(b) == not {
++                continue;
++            }
++            if best.map_or(true, |c| key(b) > key(c)) {
++                best = Some(b);
++            }
++        }
++        best.unwrap()
++    }
++
+     pub fn get_bar_for_dep(&self, dep: usize) -> Option<u8> {
+-        (0..self.num_bars).find(|&bar| self.bar_dep[usize::from(bar)] == dep)
++        (0..self.num_bars)
++            .find(|&bar| self.bar_dep[usize::from(bar)].contains(&dep))
+     }
+ }
+ 
+@@ -722,21 +742,35 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
+             }
+ 
+             let (rd_dep, wr_dep) = deps.get_instr_deps(bi, ip);
++            let mut my_rd: Option<u8> = None;
+             if deps.dep_is_waited_after(rd_dep, bi, ip) {
+-                let rd_bar = bars.try_find_free_bar().unwrap_or_else(|| {
+-                    let bar = bars.free_some_bar();
+-                    instr.deps.add_wt_bar(bar);
+-                    bar
+-                });
++                let rd_bar = match bars.try_find_free_bar() {
++                    Some(b) => b,
++                    None if crate::knobs::bar_share() => {
++                        bars.share_some_bar(None)
++                    }
++                    None => {
++                        let bar = bars.free_some_bar();
++                        instr.deps.add_wt_bar(bar);
++                        bar
++                    }
++                };
+                 bars.set_bar_dep(rd_bar, rd_dep);
+                 instr.deps.set_rd_bar(rd_bar);
++                my_rd = Some(rd_bar);
+             }
+             if deps.dep_is_waited_after(wr_dep, bi, ip) {
+-                let wr_bar = bars.try_find_free_bar().unwrap_or_else(|| {
+-                    let bar = bars.free_some_bar();
+-                    instr.deps.add_wt_bar(bar);
+-                    bar
+-                });
++                let wr_bar = match bars.try_find_free_bar() {
++                    Some(b) => b,
++                    None if crate::knobs::bar_share() => {
++                        bars.share_some_bar(my_rd)
++                    }
++                    None => {
++                        let bar = bars.free_some_bar();
++                        instr.deps.add_wt_bar(bar);
++                        bar
++                    }
++                };
+                 bars.set_bar_dep(wr_bar, wr_dep);
+                 instr.deps.set_wr_bar(wr_bar);
+             }
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index e498fe3..8c8d775 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -24,6 +24,12 @@
+ //! - NAK_PHI_AVOID (default on): register allocation keeps new values out
+ //!   of the registers that the phi copies at the end of the block want
+ //!   (assign_regs.rs)
++//! - NAK_BAR_SHARE (default off): when all six scoreboards are busy, a new
++//!   variable-latency instruction shares the most recently used one instead
++//!   of waiting for the oldest (calc_instr_deps.rs)
++//! - NAK_LAT (bitmask, default 0): SM120 RAW latency pairs that leave out
++//!   the blanket +1 (sm120_instr_latencies.rs); 128 leaves it out
++//!   everywhere, which is unsafe.  For hardware validation
+ //! - NAK_BSSY_RECONVERGENT (default off): on SM100+, the BSSY/BSYNC pairs of
+ //!   if/else regions (barriers no BREAK uses) use the .RECONVERGENT mode,
+ //!   as the reference compiler's SM120 code does, without the BMOV.CLEAR
+@@ -58,6 +64,8 @@ static IF_CONVERT: OnceLock<bool> = OnceLock::new();
+ static NIR_FLATTEN: OnceLock<bool> = OnceLock::new();
+ static BSSY_RECONVERGENT: OnceLock<bool> = OnceLock::new();
+ static PHI_AVOID: OnceLock<bool> = OnceLock::new();
++static BAR_SHARE: OnceLock<bool> = OnceLock::new();
++static LAT_MASK: OnceLock<u32> = OnceLock::new();
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -118,6 +126,29 @@ pub fn phi_avoid() -> bool {
+         .get_or_init(|| parse("NAK_PHI_AVOID", env::var("NAK_PHI_AVOID"), true))
+ }
+ 
++pub fn bar_share() -> bool {
++    *BAR_SHARE.get_or_init(|| {
++        parse("NAK_BAR_SHARE", env::var("NAK_BAR_SHARE"), false)
++    })
++}
++
++/// NAK_LAT: 1 fma-class pairs, 2 fma/alu cross pairs, 4 predicate guards,
++/// 8 coupled carry predicates, 16 uniform datapath, 64 LOP3/PRMT/SHF
++/// pairs, 128 everything (unsafe)
++pub fn lat_mask() -> u32 {
++    let v = LAT_MASK.get_or_init(|| match env::var("NAK_LAT") {
++        Ok(s) => match s.trim().parse::<u32>() {
++            Ok(v) if v <= 255 => v & 0xdf,
++            _ => {
++                eprintln!("NAK: ignoring NAK_LAT=\"{}\" (not 0-255)", s);
++                0
++            }
++        },
++        Err(_) => 0,
++    });
++    *v
++}
++
+ /// The knobs packed for nak_gpr_cap_key(), bits 25 and up
+ pub fn cache_key_bits() -> u32 {
+     (imm_cse_key() << 30)
+@@ -142,5 +173,8 @@ pub extern "C" fn nak_knob_nir_flatten() -> bool {
+ /// NVK's compiler flags
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nak_knobs_key() -> u32 {
+-    u32::from(phi_avoid())
++    // NAK_LAT's bits 0-4, 6 and 7 go to bits 2-8
++    let lat = lat_mask();
++    let lat = (lat & 0x1f) | ((lat >> 1) & 0x60);
++    u32::from(phi_avoid()) | (u32::from(bar_share()) << 1) | (lat << 2)
+ }
+diff --git a/src/nouveau/compiler/nak/sm120_instr_latencies.rs b/src/nouveau/compiler/nak/sm120_instr_latencies.rs
+index 60bc947..0a17f57 100644
+--- a/src/nouveau/compiler/nak/sm120_instr_latencies.rs
++++ b/src/nouveau/compiler/nak/sm120_instr_latencies.rs
+@@ -397,6 +397,31 @@ fn op_upred_latency(op: &Op) -> UpredLatencySM100 {
+     }
+ }
+ 
++// NAK_LAT (bitmask, default 0): leave out the blanket +1 of the RAW
++// latencies below for pairs where the reference compiler's SM120 code (black
++// box: stall counts in what NVIDIA's public ptxas -arch=sm_120 makes of
++// probe PTX) waits the unpadded SM100 latency.  For hardware validation.
++//  1   fma-class -> fma-class (FFMA/FADD/FMUL/IMAD chains): 4 not 5
++//  2   fma <-> alu/dualalu cross pairs: 5 not 6
++//  4   predicate read as an execution guard (13 not 14)
++//  8   carry predicate coupled -> coupled (4 not 5)
++//  16  uniform datapath udp -> udp / coupled readers
++//  64  LOP3/PRMT/SHF -> LOP3/PRMT/SHF (4 not 5)
++//  128 UNSAFE upper bound: no padding at all
++fn lat_mode() -> u32 {
++    crate::knobs::lat_mask()
++}
++
++fn is_fma(c: &RegLatencySM100) -> bool {
++    matches!(c, RegLatencySM100::Fma | RegLatencySM100::FmaAlu)
++}
++fn is_alu(c: &RegLatencySM100) -> bool {
++    matches!(c, RegLatencySM100::Alu | RegLatencySM100::Dualalu)
++}
++fn is_alu_pipe_a(op: &Op) -> bool {
++    matches!(op, Op::Lop3(_) | Op::Prmt(_) | Op::Shf(_))
++}
++
+ pub struct SM120Latency {}
+ 
+ impl SM120Latency {
+@@ -449,7 +474,29 @@ impl SM120Latency {
+                 {
+                     RegLatencySM100::raw(write_latency, read_latency, false) + 5
+                 } else {
+-                    RegLatencySM100::raw(write_latency, read_latency, false) + 1
++                    let m = lat_mode();
++                    let mut pad = 1;
++                    if m & 128 != 0 {
++                        pad = 0;
++                    } else if m & 1 != 0
++                        && is_fma(&write_latency)
++                        && is_fma(&read_latency)
++                    {
++                        pad = 0;
++                    } else if m & 2 != 0
++                        && ((is_fma(&write_latency) && is_alu(&read_latency))
++                            || (is_alu(&write_latency)
++                                && is_fma(&read_latency)))
++                    {
++                        pad = 0;
++                    } else if m & 64 != 0
++                        && is_alu_pipe_a(write)
++                        && read.map_or(false, is_alu_pipe_a)
++                    {
++                        pad = 0;
++                    }
++                    RegLatencySM100::raw(write_latency, read_latency, false)
++                        + pad
+                 }
+             }
+             RegFile::UGPR => {
+@@ -458,15 +505,39 @@ impl SM120Latency {
+                     Some(op) => op_ureg_latency(op, true, src_idx),
+                     None => UregLatencySM100::Uldc,
+                 };
+-                UregLatencySM100::raw(write_latency, read_latency, false) + 1
++                let m = lat_mode();
++                let pad = if m & 128 != 0
++                    || (m & 16 != 0
++                        && write_latency == UregLatencySM100::Udp
++                        && matches!(
++                            read_latency,
++                            UregLatencySM100::Udp | UregLatencySM100::Coupled
++                        )) {
++                    0
++                } else {
++                    1
++                };
++                UregLatencySM100::raw(write_latency, read_latency, false) + pad
+             }
+             RegFile::Pred => {
+                 let write_latency = op_pred_latency(write);
++                let guard = read.is_none();
+                 let read_latency = match read {
+                     Some(op) => op_pred_latency(op),
+                     None => PredLatencySM100::RedirectedFp64,
+                 };
+-                PredLatencySM100::raw(write_latency, read_latency, false) + 1
++                let m = lat_mode();
++                let pad = if m & 128 != 0
++                    || (m & 4 != 0 && guard)
++                    || (m & 8 != 0
++                        && write_latency == PredLatencySM100::Coupled
++                        && read_latency == PredLatencySM100::Coupled)
++                {
++                    0
++                } else {
++                    1
++                };
++                PredLatencySM100::raw(write_latency, read_latency, false) + pad
+             }
+             RegFile::UPred => {
+                 let write_latency = op_upred_latency(write);
+-- 
+2.43.0
+

@@ -1,6 +1,6 @@
-From 34066422605de1a3c9370441e3f654f468aaf6f1 Mon Sep 17 00:00:00 2001
+From 96bd474ae38c052ca04ea9117180dcf2de2ac965 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 17 Oct 2026 14:17:36 +0200
+Date: Sat, 17 Oct 2026 14:59:04 +0200
 Subject: [PATCH] nak: SM100+ if/else barriers in .RECONVERGENT mode (opt-in
  NAK_BSSY_RECONVERGENT)
 

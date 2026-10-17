@@ -1,6 +1,6 @@
-From f0a78a8c0cac0c3733a87cfe84e77d055b53a788 Mon Sep 17 00:00:00 2001
+From 7a93efd8de4d8a264489f02bb1040de469fdbde1 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 17 Oct 2026 14:17:36 +0200
+Date: Sat, 17 Oct 2026 14:59:03 +0200
 Subject: [PATCH] nak: a PLOP3 of a comparison and a predicate becomes the
  comparison's accumulator (NAK_PLOP_FOLD)
 

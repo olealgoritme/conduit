@@ -1,6 +1,6 @@
-From 31973106108dc0e2689d3bdb05b03938fd57fed3 Mon Sep 17 00:00:00 2001
+From 8afe5dcc5ebcf9f52c7cb981afc0b8eaa3171dac Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 17 Oct 2026 14:17:36 +0200
+Date: Sat, 17 Oct 2026 14:59:03 +0200
 Subject: [PATCH] nak: uniform 64-bit address bases in divergent ifs stay in
  pinned UGPRs (NAK_UADDR_PIN)
 

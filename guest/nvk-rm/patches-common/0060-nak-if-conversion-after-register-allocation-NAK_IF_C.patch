@@ -1,6 +1,6 @@
-From ec2421e2b30efcd4d8cbcfe325ac73ba73eaf5b2 Mon Sep 17 00:00:00 2001
+From c030901e8e1c59620471a3f9b3d70993b6cc6cbd Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 17 Oct 2026 14:17:36 +0200
+Date: Sat, 17 Oct 2026 14:59:03 +0200
 Subject: [PATCH] nak: if-conversion after register allocation (NAK_IF_CONVERT)
 
 A divergent if/else costs NAK a BSSY, a BSYNC, the label NOP after it,

@@ -1,6 +1,6 @@
-From f4c77fec642245d880f319715036793e47e1046c Mon Sep 17 00:00:00 2001
+From e3d76f9b57e7a8bd4ab4411a9958027fe7ec3cdf Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 17 Oct 2026 14:17:36 +0200
+Date: Sat, 17 Oct 2026 14:59:03 +0200
 Subject: [PATCH] nak: a register copy of an immediate serves the next uses in
  its block (NAK_IMM_CSE)
 
@@ -23,6 +23,9 @@ NAK_IMM_CSE=1 turns it on for every stage, 0 off.
 
 knobs.rs collects the knobs of this series; they go into
 nak_gpr_cap_key() (bits 25 and up) and so into the shader cache keys.
+NVK's check of that key now allows all 32 bits (the key sits in bits
+16-47 of the compiler flags), and the NVK_SHADER_STATS header prints the
+register caps only when one is set.
 
 Offline, GB202: Steel Nomad compute 70416 -> 69410 instructions,
 2a040240 20091 -> 19123; CS2 compute -0.4%.
@@ -31,7 +34,8 @@ Offline, GB202: Steel Nomad compute 70416 -> 69410 instructions,
  src/nouveau/compiler/nak/knobs.rs    | 44 +++++++++++++++
  src/nouveau/compiler/nak/legalize.rs | 84 ++++++++++++++++++++++++++++
  src/nouveau/compiler/nak/lib.rs      |  1 +
- 4 files changed, 131 insertions(+), 1 deletion(-)
+ src/nouveau/vulkan/nvk_shader.c      |  4 +-
+ 5 files changed, 133 insertions(+), 3 deletions(-)
  create mode 100644 src/nouveau/compiler/nak/knobs.rs
 
 diff --git a/src/nouveau/compiler/nak/gpr_cap.rs b/src/nouveau/compiler/nak/gpr_cap.rs
@@ -273,6 +277,28 @@ index 4689718..76b305d 100644
  mod legalize;
  mod liveness;
  mod lower_copy_swap;
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index f5335f7..423b451 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -93,7 +93,7 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+    uint64_t nak_gpr_caps = nak_gpr_cap_key();
+ 
+    assert(nak_flags <= UINT16_MAX);
+-   assert(nak_gpr_caps <= 0x1ffffff);
++   assert(nak_gpr_caps <= UINT32_MAX);
+ 
+    return (no_cbufs ? 1 << 12 : 0)
+       | (pdev->ubo_desc_cbufs ? 0 : 1 << 15)
+@@ -746,7 +746,7 @@ nvk_shader_stats_file(void)
+          fprintf(file, "NVK shader stats: stage hash code_B instrs gprs "
+                  "max_warps static_cycles spills_mem fills_mem spills_reg "
+                  "fills_reg slm_B crs_B [stage details]\n");
+-         uint32_t caps = nak_gpr_cap_key();
++         uint32_t caps = nak_gpr_cap_key() & 0xffffff;
+          if (caps != 0) {
+             fprintf(file, "NVK shader stats: NAK_GPR_CAP compute %u "
+                     "fragment %u other %u (0: none)\n", caps & 0xff,
 -- 
 2.43.0
 
