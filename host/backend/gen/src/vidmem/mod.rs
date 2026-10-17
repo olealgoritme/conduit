@@ -35,7 +35,11 @@ pub mod v535_129_03;
 pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
+pub mod v595_58_03;
 pub mod v595_71_05;
+pub mod v595_80_00;
+pub mod v595_84_00;
+pub mod v595_91_07;
 pub mod v595_99_02;
 pub mod v610_43_02;
 pub mod v610_43_03;
@@ -174,7 +178,11 @@ static PROFILES: &[(DriverVersion, &Layout)] = &[
     (DriverVersion::new(535, 129, 3), &v535_129_03::LAYOUT),
     (DriverVersion::new(565, 77, 0), &v565_77_00::LAYOUT),
     (DriverVersion::new(580, 178, 4), &v580_178_04::LAYOUT),
+    (DriverVersion::new(595, 58, 3), &v595_58_03::LAYOUT),
     (DriverVersion::new(595, 71, 5), &v595_71_05::LAYOUT),
+    (DriverVersion::new(595, 80, 0), &v595_80_00::LAYOUT),
+    (DriverVersion::new(595, 84, 0), &v595_84_00::LAYOUT),
+    (DriverVersion::new(595, 91, 7), &v595_91_07::LAYOUT),
     (DriverVersion::new(595, 99, 2), &v595_99_02::LAYOUT),
     (DriverVersion::new(595, 104, 2), &v595_104_02::LAYOUT),
     (DriverVersion::new(610, 43, 2), &v610_43_02::LAYOUT),
@@ -249,14 +257,16 @@ mod tests {
     }
 
     /// HEAP_RECLAIMABLE is the index the fork found moving. Here it arrives
-    /// with 595.99.02, and earlier releases must say it is absent rather
+    /// with 595.80 (0x3c; open-gpu-kernel-modules tags 595.58.03 and
+    /// 595.71.05 do not have it, 595.80, 595.84, 595.91.07, 595.99.02 and
+    /// 595.104.02 do), and earlier releases must say it is absent rather
     /// than leave a clamp to guess. The 610 branch forked before it landed
     /// and does not have it either; it returns with 615.
     #[test]
-    fn heap_reclaimable_is_absent_before_595_99() {
+    fn heap_reclaimable_is_absent_before_595_80() {
         for (v, l) in all() {
             let has = l.index("HEAP_RECLAIMABLE").is_some();
-            let expected = v >= DriverVersion::new(595, 99, 2) && v.major != 610;
+            let expected = v >= DriverVersion::new(595, 80, 0) && v.major != 610;
             assert_eq!(has, expected, "{v}");
         }
     }

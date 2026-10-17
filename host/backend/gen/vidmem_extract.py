@@ -14,7 +14,7 @@ application computes negative free space.
 Nothing is transcribed. Index values, struct sizes, field offsets and the
 attribute bit range are printed by a C probe compiled against the release's
 own headers. The FB_INFO index numbers move between releases
-(HEAP_RECLAIMABLE is 0x3c on 595.99.02, 0x44 on 615.71.09 and absent on
+(HEAP_RECLAIMABLE is 0x3c from 595.80 on, 0x44 on 615.71.09 and absent on
 610), and a table carrying one release's numbers would clamp the wrong
 field of another.
 
