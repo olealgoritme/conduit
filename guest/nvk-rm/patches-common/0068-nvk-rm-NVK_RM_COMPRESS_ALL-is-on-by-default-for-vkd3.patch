@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 20:34:15 +0200
+Subject: [PATCH] nvk/rm: NVK_RM_COMPRESS_ALL is on by default for vkd3d-proton
+
+Compression of every device-local allocation an image may be bound to is
+on for processes whose VkApplicationInfo::pEngineName starts with "vkd3d"
+(vkd3d-proton, D3D12), and off for everything else: D3D11 through DXVK
+("DXVK") draws broken geometry with it, and native Vulkan applications and
+the desktop compositor stay uncompressed.
+
+NVK_RM_COMPRESS_ALL=1 or 0 in the environment overrides the default in both
+directions.  The default does not apply when compression is off
+(NVK_RM_COMPRESSION=0, pre-Blackwell GPUs) or when the compressible memory
+type (NVK_RM_COMPRESS_TYPE=1) is on, which is a separate policy that
+excludes this one.
+
+The backend records whether the environment set the variable
+(nvkmd_info::compress_all_mem_forced); the driver applies the engine default
+when it creates the physical device, where the application info is known.
+---
+ src/nouveau/vulkan/nvk_physical_device.c    | 27 +++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/nvkmd.h            |  5 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |  8 +++++-
+ 3 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 86dcc30..74d2e83 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -1548,6 +1548,31 @@ nvk_get_vram_heap_available(struct nvk_physical_device *pdev)
+    return pdev->info.vram_size_B - used;
+ }
+ 
++/* Compression of every device-local allocation an image may be bound to
++ * (NVK_RM_COMPRESS_ALL) is on for D3D12, which vkd3d-proton reports as
++ * engine "vkd3d", and off for everything else: D3D11 through DXVK draws
++ * broken geometry with it, and native Vulkan applications and the desktop
++ * compositor have not been measured.  NVK_RM_COMPRESS_ALL=0/1 overrides
++ * the default in both directions.  The compressible memory type
++ * (NVK_RM_COMPRESS_TYPE) is a different policy and excludes this one.
++ */
++static void
++nvk_apply_engine_compression_default(const struct nvk_instance *instance,
++                                     struct nvkmd_pdev *nvkmd)
++{
++   struct nvkmd_info *info = &nvkmd->kmd_info;
++   const char *engine = instance->vk.app_info.engine_name;
++
++   if (!info->has_compression || info->compress_all_mem_forced ||
++       info->has_compressed_mem_type)
++      return;
++
++   if (engine != NULL && strncmp(engine, "vkd3d", 5) == 0) {
++      info->compress_all_mem = true;
++      info->has_compressible_mem = true;
++   }
++}
++
+ /* Takes ownership of nvkmd, which is destroyed on failure. */
+ static VkResult
+ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+@@ -1562,6 +1587,8 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+       goto fail_nvkmd;
+    }
+ 
++   nvk_apply_engine_compression_default(instance, nvkmd);
++
+    if (!nvk_is_conformant(&nvkmd->dev_info) &&
+        !debug_get_bool_option("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", false)) {
+ #ifdef NDEBUG
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index ae87421..56eba08 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -170,6 +170,11 @@ struct nvkmd_info {
+     */
+    bool compress_all_mem;
+ 
++   /** The backend's environment sets compress_all_mem explicitly, so the
++    *  driver's per-engine default leaves it alone
++    */
++   bool compress_all_mem_forced;
++
+    /** Policy: NVK exposes a device-local memory type of its own, allocated
+     *  NVKMD_MEM_COMPRESSIBLE, which images and transfer-only buffers may use
+     *  but no other buffer (needs has_compressible_mem)
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 7b9b5b7..ea9e772 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -10,6 +10,7 @@
+ #include "nouveau_device_limits.h"
+ #include "util/cache_ops.h"
+ #include "util/log.h"
++#include "util/os_misc.h"
+ #include "util/u_debug.h"
+ #include "util/u_math.h"
+ #include "vk_log.h"
+@@ -439,8 +440,13 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+    /* GB20x compression is per physical page (GMMU v3 PTEs carry no
+     * comptag line), so device-local memory may be allocated compressible
+     * as a whole and sub-allocated images compressed by their PTE kind
+-    * (nvkmd_rm_mem.c).  Off by default (NVK_RM_COMPRESS_ALL=1 turns it on).
++    * (nvkmd_rm_mem.c).  NVK_RM_COMPRESS_ALL=0/1 decides; unset leaves it
++    * to the driver, which turns it on for vkd3d-proton only
++    * (nvk_physical_device.c).
+     */
++   const char *compress_all = os_get_option("NVK_RM_COMPRESS_ALL");
++   pdev->base.kmd_info.compress_all_mem_forced =
++      compress_all != NULL && compress_all[0] != '\0';
+    pdev->base.kmd_info.compress_all_mem =
+       pdev->base.kmd_info.has_compression &&
+       debug_get_bool_option("NVK_RM_COMPRESS_ALL", false);
+-- 
+2.43.0
+
