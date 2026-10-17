@@ -29,7 +29,7 @@
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
-//! | `UmdThreadedFrontend` | DWORD | `0` (threaded D3D11 front end: 0 = off, 1 = all but dwm.exe, 2 = all; env `HELIOS_D3D11_FRONTEND=0/1`) |
+//! | `UmdThreadedFrontend` | DWORD | `1` (threaded D3D11 front end: 1 = all but dwm.exe, 0 = off, 2 = all; env `HELIOS_D3D11_FRONTEND=0/1`) |
 //! | `UmdFrontendRingKiB` | DWORD | `4096` (its command ring, clamped 256..65536) |
 //! | `UmdFrontendSync` | DWORD | `0` (front-end call classes forced synchronous, a bitmask for A/B runs: 1 maps, 2 updates, 4 destroys, 8 queries, 16 no parked slices, 32 serial, 64 flush) |
 //! | `UmdDdiLevel` | DWORD | `0x10` (D3D11 DDI WDDM1.3; `0x24` adds WDDM2.3) |
@@ -378,9 +378,9 @@ pub(crate) fn umd_deferred_diagnostics() -> bool {
 }
 
 /// `UmdThreadedFrontend`: the D3D11 threaded front end
-/// (`docs/d3d11-threaded-frontend.md`). 0 (default) = off, 1 = on for every
-/// process except dwm.exe, 2 = on including dwm.exe.
-pub(crate) static UMD_THREADED_FRONTEND: DwordKnob = DwordKnob::new(c"UmdThreadedFrontend", 0);
+/// (`docs/d3d11-threaded-frontend.md`). 1 (default) = on for every process
+/// except dwm.exe, 0 = off, 2 = on including dwm.exe.
+pub(crate) static UMD_THREADED_FRONTEND: DwordKnob = DwordKnob::new(c"UmdThreadedFrontend", 1);
 
 /// `UmdFrontendSync`: front-end call classes forced onto the synchronous path
 /// (`helios_umd_common::cmd_record::FrontendSync`). Read once per process.
