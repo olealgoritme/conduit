@@ -1,0 +1,14 @@
+#version 450
+#extension GL_EXT_shader_realtime_clock : require
+layout(local_size_x = 32) in;
+layout(push_constant) uniform PC { uint ticks; } pc;
+layout(std430, binding = 0) buffer B { uint outv[]; };
+void main()
+{
+    uint s = clockRealtime2x32EXT().x;
+    uint n = 0u;
+    while (clockRealtime2x32EXT().x - s < pc.ticks)
+        n++;
+    if (gl_LocalInvocationIndex == 0u)
+        outv[gl_WorkGroupID.x] = n | 1u;
+}

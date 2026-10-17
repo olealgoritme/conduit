@@ -1,0 +1,7 @@
+out-win/
+out-linux/
+verify/emit_snippets.h
+verify/mesa.txt
+verify/probe.txt
+verify/verify_push
+verify/probe_words

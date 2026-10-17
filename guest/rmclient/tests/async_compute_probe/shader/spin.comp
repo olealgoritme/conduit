@@ -1,0 +1,37 @@
+#version 460
+#extension GL_ARB_shader_clock : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Spins for SPIN_CYCLES SM clocks, then invocation 0 of the workgroup stores
+// the elapsed clocks and a marker at OUT + 8 * workgroup id, OUT being
+// OUT_VA_HI:OUT_VA_LO, a literal GPU virtual address that the probe maps
+// itself.  The shader binds no resources (the only constant buffer read is
+// the base workgroup in the root table's first dword, which the probe leaves
+// zero) and the store keeps NAK from dropping the loop.  One workgroup is
+// one warp: a small grid occupies few SMs, so two such kernels can share the
+// GPU if the hardware lets them.
+layout(buffer_reference, std430) buffer Out { uvec2 v[]; };
+layout(local_size_x = 32) in;
+#ifndef SPIN_CYCLES
+#define SPIN_CYCLES 1200000u
+#endif
+// The output address is passed as two 32-bit halves (-DOUT_VA_HI=.. -DOUT_VA_LO=..):
+// glslang cannot parse a 64-bit literal given with -D before the #extension lines.
+#ifndef OUT_VA_HI
+#define OUT_VA_HI 0x30u
+#endif
+#ifndef OUT_VA_LO
+#define OUT_VA_LO 0x0u
+#endif
+void main()
+{
+    uint t0 = clock2x32ARB().x;
+    uint dt;
+    do {
+        dt = clock2x32ARB().x - t0;
+    } while (dt < SPIN_CYCLES);
+    if (gl_LocalInvocationIndex == 0u) {
+        Out o = Out(packUint2x32(uvec2(OUT_VA_LO, OUT_VA_HI)));
+        o.v[gl_WorkGroupID.x] = uvec2(dt, 0xc0de0001u);
+    }
+}
