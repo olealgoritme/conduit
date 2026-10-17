@@ -200,6 +200,43 @@ What is left of the gap in the six fragment shaders (+14.7%): phi copies
 (11%), and integer address arithmetic NAK does in more instructions
 (IADD3 where the reference uses IADD with the `.U32` address forms).
 
+## More knobs (patches-common/0062-0066)
+
+- **0062 `NAK_PHI_AVOID`** (on): a new value without a register preference
+  stays out of the registers the block's phi copies want.  Steel Nomad
+  fragment 135760 -> 134712 instructions, CS2 -0.5%, no register count
+  changes.
+- **0063 `NAK_BAR_SHARE`, `NAK_LAT`** (off): scoreboard sharing when all six
+  are busy, and SM120 latency pairs without the extra cycle (bitmask, see
+  `docs/WINDOWS-KNOBS.md`).  For hardware validation with `naktest`
+  (`guest/nvk-rm/tools/naktest`).
+- **0064 `NVK_DIAG_NO_WFI_BARRIER`, `NVK_DIAG_WFI_COUNT`** (debug): skip or
+  count the WAIT_FOR_IDLE of pipeline barriers.
+- **0065 `NAK_UNROLL_MAX`** (32): how far NIR unrolls loops with a known
+  trip count.  The heaviest CS2 fragment shaders (0x39204a7e and its group)
+  are 2.3 times the reference's code because NAK unrolls loops it keeps
+  rolled (5409 instructions with 5 backward branches against 2283 with 15);
+  with 8, 0x39204a7e gets 1710 instructions and 96 instead of 104 GPRs, and
+  CS2's fragment shaders 8% fewer instructions with 41 gaining warps.
+  Static counts favour rolled loops; the default stays until an fps A/B.
+- **0066 `NAK_VEC_CSE`** (on): the copies that make a splat (an image store
+  of `vec4(x)`) a register vector serve its later uses in the block.  CS2
+  compute 0x7e5de6c5 2672 -> 2363 instructions.
+
+NAK knobs that do not fit in `nak_gpr_cap_key()` are in `nak_knobs_key()`,
+which NVK puts into bits 0-11 and 56-63 of its compiler flags.
+
+### CS2 against the reference
+
+The reference statistics come from pipelines with generated partner stages,
+which lets either compiler drop outputs the partner does not read, so for
+CS2 only per-shader comparisons of the same pipeline are meaningful (the
+`refsass.py` route).  Compute shaders (201 the reference compiles with the
+reconstructed layouts): NAK's code is 1.04 times the reference's (median)
+and 0.5% more in total.  Fragment groups worth a look: the unrolled-loop
+group above, and register copies (phi and splat copies) in the image-store
+compute shaders.
+
 ## Debug-assertion build
 
 For checking compiler invariants, configure a second build directory with
