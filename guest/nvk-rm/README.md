@@ -160,6 +160,53 @@ tests through D3D12, plus root CBVs per draw, so the D3D12 path lines up
 with Vulkan test by test; `guest/windows/tools/gpu-bound-run.sh` runs either
 in the guest with `nvidia-smi dmon` watching the host GPU.
 
+### Dispatch profile (common 0071)
+
+`NVK_DISPATCH_PROFILE=1` times every compute dispatch on the GPU and sums
+the time per compute shader: `vkCmdDispatch`, `vkCmdDispatchBase`,
+`vkCmdDispatchIndirect` (its arguments are read back for the grid), the
+driver's own dispatches (`meta`), and each `vkCmdExecuteGeneratedCommandsEXT`
+of compute commands as a whole (`dgc`). It works alone or together with
+`NVK_PASS_PROFILE`, in the same file (`NVK_PASS_PROFILE_FILE`, else
+`%ProgramData%\Helios\nvk-pass-<pid>.txt`), and on the async compute
+queue. For a D3D12 game, set it in the game's environment, for example in
+Steam's launch options:
+
+```
+NVK_DISPATCH_PROFILE=1 NVK_PASS_PROFILE_FILE=C:\Users\Public\dprof.txt %command%
+```
+
+Every two seconds the file gets a window line and up to 80 shader lines,
+heaviest first (then one line for the rest):
+
+```
+NVK dispatch profile: window 26, 2.03 s, 50604 dispatches (24928.1/s), 646.205 GPU ms/s in dispatches, 39 of 56 shaders active, 0 dropped (0 in all)
+NVK dispatch profile:  144.034 ms/s  22.3%     57.1 calls/s  2522.36 us/call p50  2602.98 max  3006.24 | src 88825d04f9c554c6 code 9b6f3a19 local 8x8x1 gprs 168 warps 12 instrs 2370 cycles 297141 spills 0 slm 0 smem 0 | grid 240x135x1:100% groups 32400..32400 | ind 0/0 dgc 0 meta 0
+```
+
+| Field | Meaning |
+|---|---|
+| `ms/s`, `%` | GPU milliseconds per second in this shader's dispatches, and its share of all dispatch time in the window |
+| `calls/s`, `us/call`, `p50`, `max` | dispatches per second; mean, median (of up to 64 samples per window) and longest GPU time of one dispatch |
+| `src` | vkd3d-proton's hash of the DXIL shader (the name of its `VKD3D_SHADER_DUMP_PATH` file); for other applications a hash of the SPIR-V; zero for the driver's own shaders |
+| `code` | the hash `NVK_SHADER_STATS` prints for the compiled shader |
+| `local` | workgroup size |
+| `gprs`, `warps`, `instrs`, `cycles`, `spills`, `slm`, `smem` | NAK's statistics: registers per thread, warps per SM, instructions, static cycles, spills, local and shared memory |
+| `grid`, `groups` | the three most common grids with their share of calls (`,+` more), the range of workgroup counts |
+| `ind`, `dgc`, `meta` | indirect dispatches (with arguments read back), device-generated, and driver-internal ones |
+
+Every dispatch waits for the GPU to go idle before and after it, so
+dispatches that overlap without the profile run one at a time with it, and
+the frame rate drops. The numbers say which shaders take the time and how
+long one dispatch of each takes alone; they do not add up to a frame time.
+`dropped` counts dispatches not timed because the table of 4096 shaders
+was full.
+
+`tools/dispprof/dispprof.py FILE [--fps N] [--skip N] [--top N]` prints the
+busiest window and a whole-run table per shader (ms per frame and calls per
+frame with `--fps`, the frame rate of the profiled run). `--skip` leaves out
+the first windows (loading and shader compiles).
+
 ## `patches/`: the RM backend
 
 Each patch builds on its own.
