@@ -138,6 +138,7 @@ file per process.
 | `NVK_PASS_PROFILE=3` | adds the ZCULL statistics per pass |
 | `NVK_PASS_PROFILE=4` | adds the 24 most written 3D methods per pass and bind counts |
 | `NVK_PASS_PROFILE=5` | dumps the draws of one render pass matching `NVK_PASS_DUMP`, after `NVK_PASS_DUMP_DELAY_S` (20) s (`nvk-prepass-dump-<pid>.txt`) |
+| `NVK_DISPATCH_PROFILE=1` | GPU time of every dispatch per compute shader (vkd3d-proton DXIL hash, code hash, workgroup size), with grids (indirect arguments read back), GPRs and warps, every two seconds, in the `NVK_PASS_PROFILE` file; alone or with `NVK_PASS_PROFILE`; each dispatch waits for idle before and after it |
 | `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
 | `NVK_WAIT_STATS=1` | CPU wait counts and times per site, woken and timed-out waits, once a second (`nvk-waits-<pid>.txt`) |
 | `NVK_DEBUG=vm` | VA and memory alloc/free/bind lines with times, threads and freeing call stacks (`NVK_VM_LOG`, else `nvk-vm-<pid>.log` in `%TEMP%`) |
@@ -323,6 +324,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0068 | `NVK_RM_COMPRESS_ALL` defaults to on for processes whose Vulkan engine name starts with `vkd3d` (vkd3d-proton) and to off for all others; 0 or 1 in the environment overrides it (`nvk_apply_engine_compression_default`) |
 | 0069 | async compute: a compute + transfer queue family (4 queues) whose channels sit in the first graphics queue's TSG on VEIDs of their own and run next to it (`NVK_RM_ASYNC_COMPUTE`, see "Async compute") |
 | 0070 | NAK: `nir_opt_uniform_atomics` before subgroup lowering: an atomic on an address that is the same in every active lane of a subgroup is done once per subgroup, with a subgroup reduction of the value and an exclusive scan for each lane's result (`NAK_UNIFORM_ATOMICS`, default on; part of the shader cache key) |
+| 0071 | `NVK_DISPATCH_PROFILE`: compute-class timestamps behind a WAIT_FOR_IDLE before and after every launch (direct, indirect, device-generated, internal), keyed by `vk_shader::src_hash` (the SPIR-V's `OpString "<hash>.dxil"` from vkd3d-proton, else FNV-1a 64 of the SPIR-V), code hash and local size; indirect arguments copied by I2M for the grid; per-window table of ms/s, share, calls/s, mean/median/max us, GPRs, warps, grids |
 
 ## Per-draw cost (common 0001-0007)
 

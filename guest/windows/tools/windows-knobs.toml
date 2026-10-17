@@ -1379,6 +1379,11 @@ class = "debug"
 read = "first pipeline barrier recorded (once per process)"
 effect = "1 logs once a second (mesa_logi, MESA_LOG_FILE on Windows) how many idles pipeline barriers recorded per second: explicit WAIT_FOR_IDLE, shader data flushes, and the ones NVK_DIAG_NO_WFI_BARRIER skipped."
 
+[env.NVK_DISPATCH_PROFILE]
+class = "debug"
+read = "device creation"
+effect = "1: GPU time of every dispatch (direct, indirect with its arguments read back, device-generated as a whole, the driver's own), per compute shader: its vkd3d-proton DXIL hash (the VKD3D_SHADER_DUMP_PATH file name; else a hash of the SPIR-V), NVK_SHADER_STATS code hash and workgroup size. Every 2 s a table of GPU ms/s, share, calls/s, mean/median/max us per call, GPRs, warps, grids, written to the NVK_PASS_PROFILE file (NVK_PASS_PROFILE_FILE). Works alone or with NVK_PASS_PROFILE and on the async compute queue. Each dispatch waits for idle before and after it, so frames get slower: for attribution, not frame time."
+
 [env.NVK_BLACKWELL_MME_MEMBAR]
 class = "debug"
 read = "device creation"
@@ -1494,7 +1499,7 @@ effect = "GPU time per render pass and command buffer: 0 off, 1 timings, higher 
 [env.NVK_PASS_PROFILE_FILE]
 class = "debug"
 read = "device creation"
-effect = "Full path the NVK_PASS_PROFILE lines are written to; unset uses a default file under the Helios log directory on Windows."
+effect = "Full path the NVK_PASS_PROFILE and NVK_DISPATCH_PROFILE lines are written to; unset uses a default file under the Helios log directory on Windows."
 
 [env.NVK_RM]
 class = "supported"
