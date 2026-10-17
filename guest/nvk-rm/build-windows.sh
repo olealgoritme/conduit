@@ -153,11 +153,22 @@ else
   gl_opts="-Dgallium-drivers= -Dopengl=false"
   gl_targets=
 fi
+# A per-build id for NVK's cache keys (patches-windows 0064): PE binaries
+# have no build-id note, so without it two driver packages could share
+# pipeline caches and disk cache entries.  It hashes everything the build
+# depends on that the Mesa version does not show: the Mesa base, the patch
+# series, the build options and the driver package version.
+NVK_BUILD_ID=$( { echo "$MESA_BASE $ARCH $BUILDTYPE $VIDEO_CODECS $GL $MESON_ARGS"
+  # shellcheck disable=SC2086
+  cat $series
+  cat "$conduit/guest/windows/kmd_render/driver-version.env" 2>/dev/null || true
+} | sha1sum | cut -c1-40)
+echo "nvk-rm: build id $NVK_BUILD_ID"
 if [ -f "$BUILD_DIR/build.ninja" ]; then
   # Build directories from older versions of this script were debugoptimized
   # shellcheck disable=SC2086
   "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG" \
-    -Dvideo-codecs="$VIDEO_CODECS" $gl_opts
+    -Dvideo-codecs="$VIDEO_CODECS" -Dnvk-build-id="$NVK_BUILD_ID" $gl_opts
 else
   # shellcheck disable=SC2086
   "$MESON" setup "$BUILD_DIR" --cross-file "$cross" \
@@ -170,7 +181,7 @@ else
     -Dshader-cache=enabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled \
     -Dxmlconfig=disabled -Dperfetto=false -Dbuild-tests=false \
     -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG" \
-    $MESON_ARGS
+    -Dnvk-build-id="$NVK_BUILD_ID" $MESON_ARGS
 fi
 # Build directories from before patch 26 have the shader cache off
 if ! grep -q 'ENABLE_SHADER_CACHE' "$BUILD_DIR/build.ninja"; then
