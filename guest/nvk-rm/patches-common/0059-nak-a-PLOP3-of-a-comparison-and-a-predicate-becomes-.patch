@@ -1,0 +1,487 @@
+From f0a78a8c0cac0c3733a87cfe84e77d055b53a788 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 14:17:36 +0200
+Subject: [PATCH] nak: a PLOP3 of a comparison and a predicate becomes the
+ comparison's accumulator (NAK_PLOP_FOLD)
+
+FSETP and ISETP compute (a cmp b) AND/OR/XOR p in one instruction, but
+NAK emitted the comparison and a separate PLOP3 for an iand/ior of a
+comparison with another predicate: 413 PLOP3s in the six heaviest Steel
+Nomad fragment shaders, where the reference compiler's code has 6.
+
+opt_fold_plop3_setp moves a single-use plain comparison down to the
+PLOP3 that combines it with one other predicate (its sources are SSA
+values, so they still hold there) and makes that predicate the
+accumulator; a negated comparison result flips the comparison
+(ordered <-> unordered for floats).  The accumulator must be in the
+comparison's register file.
+
+Offline, GB202: Steel Nomad fragment 143389 -> 142733 instructions,
+CS2 fragment -0.35%.
+---
+ src/nouveau/compiler/nak/api.rs           |   1 +
+ src/nouveau/compiler/nak/knobs.rs         |  12 +-
+ src/nouveau/compiler/nak/lib.rs           |   1 +
+ src/nouveau/compiler/nak/opt_setp_fold.rs | 387 ++++++++++++++++++++++
+ 4 files changed, 400 insertions(+), 1 deletion(-)
+ create mode 100644 src/nouveau/compiler/nak/opt_setp_fold.rs
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index c8a6c91..a69115c 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -535,6 +535,7 @@ fn nak_compile_shader_internal(
+     pass!(s, opt_copy_prop);
+     pass!(s, opt_prmt);
+     pass!(s, opt_lop);
++    pass!(s, opt_fold_plop3_setp);
+     pass!(s, opt_copy_prop);
+     pass!(s, opt_dce);
+     pass!(s, opt_out);
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index f902533..a93e9ba 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -12,6 +12,8 @@
+ //!   cost occupancy in the corpora tried; 1: every stage
+ //! - NAK_UADDR_PIN (default on): 64-bit uniform address bases of global
+ //!   memory accesses in divergent ifs stay in pinned UGPRs (nak_nir.c)
++//! - NAK_PLOP_FOLD (default on): a PLOP3 that combines a comparison with
++//!   another predicate becomes the comparison's accumulator
+ 
+ use std::env;
+ use std::sync::OnceLock;
+@@ -37,6 +39,7 @@ fn parse(
+ 
+ static IMM_CSE: OnceLock<Option<bool>> = OnceLock::new();
+ static UADDR_PIN: OnceLock<bool> = OnceLock::new();
++static PLOP_FOLD: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -65,9 +68,16 @@ pub fn uaddr_pin() -> bool {
+         .get_or_init(|| parse("NAK_UADDR_PIN", env::var("NAK_UADDR_PIN"), true))
+ }
+ 
++pub fn plop_fold() -> bool {
++    *PLOP_FOLD
++        .get_or_init(|| parse("NAK_PLOP_FOLD", env::var("NAK_PLOP_FOLD"), true))
++}
++
+ /// The knobs packed for nak_gpr_cap_key(), bits 25 and up
+ pub fn cache_key_bits() -> u32 {
+-    (imm_cse_key() << 30) | (u32::from(uaddr_pin()) << 26)
++    (imm_cse_key() << 30)
++        | (u32::from(uaddr_pin()) << 26)
++        | (u32::from(plop_fold()) << 28)
+ }
+ 
+ #[unsafe(no_mangle)]
+diff --git a/src/nouveau/compiler/nak/lib.rs b/src/nouveau/compiler/nak/lib.rs
+index 76b305d..f36ce5a 100644
+--- a/src/nouveau/compiler/nak/lib.rs
++++ b/src/nouveau/compiler/nak/lib.rs
+@@ -26,6 +26,7 @@ mod opt_jump_thread;
+ mod opt_lop;
+ mod opt_out;
+ mod opt_prmt;
++mod opt_setp_fold;
+ mod opt_uniform_instrs;
+ mod qmd;
+ mod reg_tracker;
+diff --git a/src/nouveau/compiler/nak/opt_setp_fold.rs b/src/nouveau/compiler/nak/opt_setp_fold.rs
+new file mode 100644
+index 0000000..95f4274
+--- /dev/null
++++ b/src/nouveau/compiler/nak/opt_setp_fold.rs
+@@ -0,0 +1,387 @@
++// Copyright © 2026 Conduit contributors
++// SPDX-License-Identifier: MIT
++
++//! Folds a PLOP3 that combines a comparison with another predicate into the
++//! comparison's accumulator: FSETP/ISETP compute (a cmp b) AND/OR/XOR p in
++//! one instruction, so
++//!
++//!   fsetp.lt p1, a, b
++//!   plop3 p2 = p1 & !p0
++//!
++//! becomes fsetp.lt.and p2, a, b, !p0.  The comparison moves down to the
++//! PLOP3 (its sources are SSA values, so they still hold there) and a
++//! negated comparison result flips the comparison.  NAK_PLOP_FOLD=0 turns it
++//! off.
++
++use crate::ir::*;
++
++use rustc_hash::FxHashMap;
++
++/// Most instructions a comparison moves down to its PLOP3
++const MAX_MOVE: usize = 8;
++
++fn float_cmp_not(op: FloatCmpOp) -> FloatCmpOp {
++    match op {
++        FloatCmpOp::OrdEq => FloatCmpOp::UnordNe,
++        FloatCmpOp::OrdNe => FloatCmpOp::UnordEq,
++        FloatCmpOp::OrdLt => FloatCmpOp::UnordGe,
++        FloatCmpOp::OrdLe => FloatCmpOp::UnordGt,
++        FloatCmpOp::OrdGt => FloatCmpOp::UnordLe,
++        FloatCmpOp::OrdGe => FloatCmpOp::UnordLt,
++        FloatCmpOp::UnordEq => FloatCmpOp::OrdNe,
++        FloatCmpOp::UnordNe => FloatCmpOp::OrdEq,
++        FloatCmpOp::UnordLt => FloatCmpOp::OrdGe,
++        FloatCmpOp::UnordLe => FloatCmpOp::OrdGt,
++        FloatCmpOp::UnordGt => FloatCmpOp::OrdLe,
++        FloatCmpOp::UnordGe => FloatCmpOp::OrdLt,
++        FloatCmpOp::IsNum => FloatCmpOp::IsNan,
++        FloatCmpOp::IsNan => FloatCmpOp::IsNum,
++    }
++}
++
++fn int_cmp_not(op: IntCmpOp) -> IntCmpOp {
++    match op {
++        IntCmpOp::False => IntCmpOp::True,
++        IntCmpOp::True => IntCmpOp::False,
++        IntCmpOp::Eq => IntCmpOp::Ne,
++        IntCmpOp::Ne => IntCmpOp::Eq,
++        IntCmpOp::Lt => IntCmpOp::Ge,
++        IntCmpOp::Le => IntCmpOp::Gt,
++        IntCmpOp::Gt => IntCmpOp::Le,
++        IntCmpOp::Ge => IntCmpOp::Lt,
++    }
++}
++
++/// A comparison whose result is the plain comparison (no accumulator)
++fn is_plain_setp(op: &Op) -> bool {
++    match op {
++        Op::FSetP(op) => op.set_op == PredSetOp::And && op.accum.is_true(),
++        Op::ISetP(op) => {
++            !op.ex
++                && op.set_op == PredSetOp::And
++                && op.accum.is_true()
++                && op.low_cmp.is_true()
++        }
++        _ => false,
++    }
++}
++
++/// If `lut` over (x, y) (sources ix and iy of the PLOP3, the third unused)
++/// is (x ^ nx) OP (y ^ ny), returns (OP, nx, ny)
++fn match_binop(
++    lut: LogicOp3,
++    ix: usize,
++    iy: usize,
++) -> Option<(PredSetOp, bool, bool)> {
++    let eval = |x: bool, y: bool| {
++        let mut s = [false; 3];
++        s[ix] = x;
++        s[iy] = y;
++        let m = |b: bool| if b { 0xff_u8 } else { 0 };
++        lut.eval(m(s[0]), m(s[1]), m(s[2])) & 1 != 0
++    };
++    for op in [PredSetOp::And, PredSetOp::Or, PredSetOp::Xor] {
++        for nx in [false, true] {
++            for ny in [false, true] {
++                let ok = [
++                    (false, false),
++                    (false, true),
++                    (true, false),
++                    (true, true),
++                ]
++                .iter()
++                .all(|&(x, y)| eval(x, y) == op.eval(x ^ nx, y ^ ny));
++                if ok {
++                    return Some((op, nx, ny));
++                }
++            }
++        }
++    }
++    None
++}
++
++impl Function {
++    fn opt_fold_plop3_setp(&mut self) {
++        let mut use_counts: FxHashMap<SSAValue, u32> = Default::default();
++        for b in &self.blocks {
++            for instr in &b.instrs {
++                if let PredRef::SSA(ssa) = instr.pred.pred_ref {
++                    *use_counts.entry(ssa).or_insert(0) += 1;
++                }
++                for src in instr.srcs() {
++                    if let SrcRef::SSA(vec) = &src.src_ref {
++                        for ssa in vec.iter() {
++                            *use_counts.entry(*ssa).or_insert(0) += 1;
++                        }
++                    }
++                }
++            }
++        }
++
++        for b in &mut self.blocks {
++            // Plain comparisons defined so far in this block
++            let mut setps: FxHashMap<SSAValue, usize> = Default::default();
++            let mut dead = Vec::new();
++            for ip in 0..b.instrs.len() {
++                let instr = &b.instrs[ip];
++                if instr.pred.is_true() && is_plain_setp(&instr.op) {
++                    if let Some(Dst::SSA(ssa)) = instr.dsts().first() {
++                        if ssa.comps() == 1 {
++                            setps.insert(ssa[0], ip);
++                        }
++                    }
++                    continue;
++                }
++
++                let Op::PLop3(plop) = &instr.op else {
++                    continue;
++                };
++                if !instr.pred.is_true() || !plop.dsts[1].is_none() {
++                    continue;
++                }
++                let Dst::SSA(pdst) = &plop.dsts[0] else {
++                    continue;
++                };
++                let lut = plop.ops[0];
++                let used: Vec<usize> =
++                    (0..3).filter(|&i| lut.src_used(i)).collect();
++                if used.len() != 2 {
++                    continue;
++                }
++
++                // Prefer the comparison defined last
++                let mut best: Option<(usize, usize, usize)> = None;
++                for (k, &i) in used.iter().enumerate() {
++                    let src = &plop.srcs[i];
++                    if !src.is_unmodified() {
++                        continue;
++                    }
++                    let SrcRef::SSA(vec) = &src.src_ref else {
++                        continue;
++                    };
++                    if vec.comps() != 1
++                        || use_counts.get(&vec[0]).copied() != Some(1)
++                    {
++                        continue;
++                    }
++                    let Some(&sip) = setps.get(&vec[0]) else {
++                        continue;
++                    };
++                    // Moving the comparison down keeps its sources live
++                    // longer: only over a short distance
++                    if ip - sip > MAX_MOVE {
++                        continue;
++                    }
++                    let j = used[1 - k];
++                    if best.is_none_or(|(bip, _, _)| sip > bip) {
++                        best = Some((sip, i, j));
++                    }
++                }
++                let Some((sip, ix, iy)) = best else {
++                    continue;
++                };
++                let Some((set_op, nx, ny)) = match_binop(lut, ix, iy) else {
++                    continue;
++                };
++
++                let setp_dst_file =
++                    b.instrs[sip].dsts()[0].as_ssa().unwrap()[0].file();
++                if setp_dst_file != pdst[0].file() {
++                    continue;
++                }
++                // The accumulator must be in the comparison's own file: a
++                // warp comparison cannot read a uniform predicate there
++                if let SrcRef::SSA(vec) = &plop.srcs[iy].src_ref {
++                    if vec[0].file() != setp_dst_file {
++                        continue;
++                    }
++                }
++
++                let mut accum = plop.srcs[iy].clone();
++                if ny {
++                    accum = accum.bnot();
++                }
++                let dst: Dst = pdst.clone().into();
++
++                let mut new_op = std::mem::replace(
++                    &mut b.instrs[sip].op,
++                    Op::Nop(OpNop { label: None }),
++                );
++                match &mut new_op {
++                    Op::FSetP(op) => {
++                        if nx {
++                            op.cmp_op = float_cmp_not(op.cmp_op);
++                        }
++                        op.set_op = set_op;
++                        op.accum = accum;
++                        op.dst = dst;
++                    }
++                    Op::ISetP(op) => {
++                        if nx {
++                            op.cmp_op = int_cmp_not(op.cmp_op);
++                        }
++                        op.set_op = set_op;
++                        op.accum = accum;
++                        op.dst = dst;
++                    }
++                    _ => unreachable!(),
++                }
++                b.instrs[ip] = Instr::new(new_op);
++                setps.retain(|_, v| *v != sip);
++                dead.push(sip);
++            }
++
++            if !dead.is_empty() {
++                dead.sort_unstable();
++                let mut k = 0;
++                let mut ip = 0;
++                b.instrs.retain(|_| {
++                    let keep = !(k < dead.len() && dead[k] == ip);
++                    if !keep {
++                        k += 1;
++                    }
++                    ip += 1;
++                    keep
++                });
++            }
++        }
++    }
++}
++
++impl Shader<'_> {
++    pub fn opt_fold_plop3_setp(&mut self) {
++        if !crate::knobs::plop_fold() {
++            return;
++        }
++        for f in &mut self.functions {
++            f.opt_fold_plop3_setp();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    use compiler::cfg::CFGBuilder;
++    use rustc_hash::FxBuildHasher;
++
++    fn function(alloc: SSAValueAllocator, instrs: Vec<Instr>) -> Function {
++        let mut cfg = CFGBuilder::<_, _, FxBuildHasher>::new();
++        cfg.add_node(
++            0,
++            BasicBlock {
++                label: LabelAllocator::new().alloc(),
++                uniform: false,
++                instrs,
++            },
++        );
++        Function {
++            ssa_alloc: alloc,
++            phi_alloc: PhiAllocator::new(),
++            blocks: cfg.as_cfg(true),
++        }
++    }
++
++    /// fsetp.lt p1, a, b; isetp p0; plop3 q = lut(p1, p0); sel r = q ? a : b
++    fn fold(lut: LogicOp3) -> Function {
++        let mut alloc = SSAValueAllocator::new();
++        let a = alloc.alloc(RegFile::GPR);
++        let b = alloc.alloc(RegFile::GPR);
++        let p0 = alloc.alloc(RegFile::Pred);
++        let p1 = alloc.alloc(RegFile::Pred);
++        let q = alloc.alloc(RegFile::Pred);
++        let r = alloc.alloc(RegFile::GPR);
++        let instrs = vec![
++            Instr::new(OpISetP {
++                dst: p0.into(),
++                set_op: PredSetOp::And,
++                cmp_op: IntCmpOp::Eq,
++                cmp_type: IntCmpType::U32,
++                ex: false,
++                srcs: [a.into(), Src::ZERO],
++                accum: true.into(),
++                low_cmp: true.into(),
++            }),
++            Instr::new(OpFSetP {
++                dst: p1.into(),
++                set_op: PredSetOp::And,
++                cmp_op: FloatCmpOp::OrdLt,
++                srcs: [a.into(), b.into()],
++                accum: true.into(),
++                ftz: false,
++            }),
++            Instr::new(OpPLop3 {
++                dsts: [q.into(), Dst::None],
++                srcs: [p1.into(), p0.into(), true.into()],
++                ops: [lut, LogicOp3::new_const(false)],
++            }),
++            Instr::new(OpSel {
++                dst: r.into(),
++                cond: q.into(),
++                srcs: [a.into(), b.into()],
++            }),
++        ];
++        let mut f = function(alloc, instrs);
++        f.opt_fold_plop3_setp();
++        f
++    }
++
++    fn the_fsetp(f: &Function) -> &OpFSetP {
++        assert!(!f.blocks[0]
++            .instrs
++            .iter()
++            .any(|i| matches!(&i.op, Op::PLop3(_))));
++        f.blocks[0]
++            .instrs
++            .iter()
++            .find_map(|i| match &i.op {
++                Op::FSetP(op) => Some(op.as_ref()),
++                _ => None,
++            })
++            .unwrap()
++    }
++
++    #[test]
++    fn and_not() {
++        // q = p1 & !p0
++        let f = fold(LogicOp3::new_lut(&|x, y, _| x & !y));
++        let op = the_fsetp(&f);
++        assert!(op.set_op == PredSetOp::And);
++        assert!(op.cmp_op == FloatCmpOp::OrdLt);
++        assert!(op.accum.src_mod.is_bnot());
++        assert_eq!(f.blocks[0].instrs.len(), 3);
++    }
++
++    #[test]
++    fn not_or() {
++        // q = !p1 | p0: the comparison flips to its unordered complement
++        let f = fold(LogicOp3::new_lut(&|x, y, _| !x | y));
++        let op = the_fsetp(&f);
++        assert!(op.set_op == PredSetOp::Or);
++        assert!(op.cmp_op == FloatCmpOp::UnordGe);
++        assert!(op.accum.src_mod.is_none());
++    }
++
++    #[test]
++    fn xnor_folds_as_xor() {
++        // q = !(p1 ^ p0) is XOR with one side negated
++        let f = fold(LogicOp3::new_lut(&|x, y, _| !(x ^ y)));
++        let op = the_fsetp(&f);
++        assert!(op.set_op == PredSetOp::Xor);
++    }
++
++    #[test]
++    fn match_binop_table() {
++        let and = LogicOp3::new_lut(&|x, y, _| x & y);
++        assert!(matches!(
++            match_binop(and, 0, 1),
++            Some((PredSetOp::And, false, false))
++        ));
++        let nor = LogicOp3::new_lut(&|x, y, _| !(x | y));
++        assert!(matches!(
++            match_binop(nor, 0, 1),
++            Some((PredSetOp::And, true, true))
++        ));
++    }
++}
+-- 
+2.43.0
+

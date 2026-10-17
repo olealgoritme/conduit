@@ -1,0 +1,683 @@
+From ec2421e2b30efcd4d8cbcfe325ac73ba73eaf5b2 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 14:17:36 +0200
+Subject: [PATCH] nak: if-conversion after register allocation (NAK_IF_CONVERT)
+
+A divergent if/else costs NAK a BSSY, a BSYNC, the label NOP after it,
+one or two branches and a BMOV.CLEAR around blocks that are often a few
+instructions long, frequently just phi copies.  The reference compiler's
+code for the heaviest Steel Nomad fragment shaders predicates about 3400
+instructions; NAK's predicates none but branches.
+
+opt_if_convert runs after jump threading and predicates a then-block of
+at most 8 instructions, or a then- and else-block of at most 12
+together, instead of branching around them.  After register allocation
+this is exact: a predicated-off lane writes no register, which is all a
+lane that skipped the block relied on.  Control, barrier and
+warp-collective instructions, uniform instructions and blocks that write
+the predicate stay branches.  A region left without branches loses its
+BSSY/BSYNC pair, BMOV.CLEAR and label NOP, and blocks that now just fall
+into each other are merged for the post-RA scheduler.  It cannot change
+register counts.
+
+NAK_NIR_FLATTEN=1 (default off) additionally lets
+nir_opt_peephole_select flatten small ifs into selects (limit 8): fewer
+instructions and static cycles, but the values of both sides are then
+live at once, which costs occupancy on some CS2 shaders.
+
+Offline, GB202: Steel Nomad fragment 143389 -> 142322 instructions,
+compute 70416 -> 69781; CS2 compute -7.2% instructions, -10.5% static
+cycles; no register count changes.
+---
+ src/nouveau/compiler/nak/api.rs             |   1 +
+ src/nouveau/compiler/nak/knobs.rs           |  27 ++
+ src/nouveau/compiler/nak/lib.rs             |   1 +
+ src/nouveau/compiler/nak/opt_if_convert.rs  | 510 ++++++++++++++++++++
+ src/nouveau/compiler/nak/opt_jump_thread.rs |   2 +-
+ src/nouveau/compiler/nak_nir.c              |   3 +-
+ src/nouveau/compiler/nak_private.h          |   1 +
+ 7 files changed, 543 insertions(+), 2 deletions(-)
+ create mode 100644 src/nouveau/compiler/nak/opt_if_convert.rs
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index a69115c..3297110 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -571,6 +571,7 @@ fn nak_compile_shader_internal(
+     pass!(s, lower_copy_swap);
+     if nak.sm >= 70 {
+         pass!(s, opt_jump_thread);
++        pass!(s, opt_if_convert);
+     } else {
+         pass!(s, opt_crs);
+     }
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index a93e9ba..d0f70ca 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -14,6 +14,12 @@
+ //!   memory accesses in divergent ifs stay in pinned UGPRs (nak_nir.c)
+ //! - NAK_PLOP_FOLD (default on): a PLOP3 that combines a comparison with
+ //!   another predicate becomes the comparison's accumulator
++//! - NAK_IF_CONVERT (default on): small then/else blocks are predicated
++//!   after register allocation (opt_if_convert.rs)
++//! - NAK_NIR_FLATTEN (default off): NIR flattens small ifs into selects
++//!   (nir_opt_peephole_select limit 8, nak_nir.c).  Fewer instructions, but
++//!   the values of both sides are live at once, which costs occupancy on
++//!   some shaders
+ 
+ use std::env;
+ use std::sync::OnceLock;
+@@ -40,6 +46,8 @@ fn parse(
+ static IMM_CSE: OnceLock<Option<bool>> = OnceLock::new();
+ static UADDR_PIN: OnceLock<bool> = OnceLock::new();
+ static PLOP_FOLD: OnceLock<bool> = OnceLock::new();
++static IF_CONVERT: OnceLock<bool> = OnceLock::new();
++static NIR_FLATTEN: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -73,14 +81,33 @@ pub fn plop_fold() -> bool {
+         .get_or_init(|| parse("NAK_PLOP_FOLD", env::var("NAK_PLOP_FOLD"), true))
+ }
+ 
++pub fn if_convert() -> bool {
++    *IF_CONVERT.get_or_init(|| {
++        parse("NAK_IF_CONVERT", env::var("NAK_IF_CONVERT"), true)
++    })
++}
++
++pub fn nir_flatten() -> bool {
++    *NIR_FLATTEN.get_or_init(|| {
++        parse("NAK_NIR_FLATTEN", env::var("NAK_NIR_FLATTEN"), false)
++    })
++}
++
+ /// The knobs packed for nak_gpr_cap_key(), bits 25 and up
+ pub fn cache_key_bits() -> u32 {
+     (imm_cse_key() << 30)
+         | (u32::from(uaddr_pin()) << 26)
+         | (u32::from(plop_fold()) << 28)
++        | (u32::from(if_convert()) << 29)
++        | (u32::from(nir_flatten()) << 25)
+ }
+ 
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nak_knob_uaddr_pin() -> bool {
+     uaddr_pin()
+ }
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_knob_nir_flatten() -> bool {
++    nir_flatten()
++}
+diff --git a/src/nouveau/compiler/nak/lib.rs b/src/nouveau/compiler/nak/lib.rs
+index f36ce5a..2bb882a 100644
+--- a/src/nouveau/compiler/nak/lib.rs
++++ b/src/nouveau/compiler/nak/lib.rs
+@@ -19,6 +19,7 @@ mod opt_bar_prop;
+ mod opt_copy_prop;
+ mod opt_crs;
+ mod opt_dce;
++mod opt_if_convert;
+ mod opt_instr_sched_common;
+ mod opt_instr_sched_postpass;
+ mod opt_instr_sched_prepass;
+diff --git a/src/nouveau/compiler/nak/opt_if_convert.rs b/src/nouveau/compiler/nak/opt_if_convert.rs
+new file mode 100644
+index 0000000..8d304ec
+--- /dev/null
++++ b/src/nouveau/compiler/nak/opt_if_convert.rs
+@@ -0,0 +1,510 @@
++// Copyright © 2026 Conduit contributors
++// SPDX-License-Identifier: MIT
++
++//! If-conversion after register allocation
++//!
++//! A divergent if/else costs NAK a BSSY, a BSYNC, the label NOP after it,
++//! one or two branches and, without .RECONVERGENT, a BMOV.CLEAR, around
++//! blocks that are often only a few instructions long (frequently just the
++//! phi copies).  This pass predicates small then/else blocks instead:
++//!
++//!   @p bra else           ->  @!p <then instrs>
++//!   <then instrs>             @p  <else instrs>
++//!   bra merge
++//!   else: <else instrs>
++//!   merge:
++//!
++//! After register allocation this is exact: a predicated-off lane writes no
++//! register, which is all a lane that skipped the block ever relied on.
++//! When an if/else region is left without branches, its BSSY/BSYNC pair (and
++//! the BMOV.CLEAR and label NOP that belong to it) goes too, and blocks that
++//! now simply fall into each other are merged so the post-RA scheduler sees
++//! them as one.  NAK_IF_CONVERT=0 turns it off.
++
++use crate::ir::*;
++use crate::opt_jump_thread::rewrite_cfg;
++
++use rustc_hash::FxHashSet;
++
++/// Most instructions a predicated then-block may have
++const MAX_THEN: usize = 8;
++/// Most instructions a predicated then-block and else-block may have together
++const MAX_IF_ELSE: usize = 12;
++
++fn writes_pred_reg(instr: &Instr, p: &RegRef) -> bool {
++    instr.dsts().iter().any(|dst| match dst {
++        Dst::Reg(reg) => {
++            reg.file() == p.file() && reg.idx_range().contains(&p.base_idx())
++        }
++        _ => false,
++    })
++}
++
++fn can_predicate(instr: &Instr, p: &RegRef) -> bool {
++    if !instr.pred.is_true() || instr.is_uniform() || writes_pred_reg(instr, p)
++    {
++        return false;
++    }
++    !matches!(
++        &instr.op,
++        Op::Bra(_)
++            | Op::Exit(_)
++            | Op::Sync(_)
++            | Op::Brk(_)
++            | Op::Cont(_)
++            | Op::BSSy(_)
++            | Op::BSync(_)
++            | Op::BClear(_)
++            | Op::BMov(_)
++            | Op::Break(_)
++            | Op::Bar(_)
++            | Op::Kill(_)
++            | Op::Nop(_)
++            | Op::WarpSync(_)
++            | Op::Vote(_)
++            | Op::Shfl(_)
++            | Op::Redux(_)
++            | Op::Match(_)
++            | Op::Out(_)
++            | Op::OutFinal(_)
++            | Op::RegOut(_)
++            | Op::SrcBar(_)
++            | Op::Annotate(_)
++            | Op::ParCopy(_)
++            | Op::Swap(_)
++            | Op::Copy(_)
++            | Op::Undef(_)
++            | Op::PhiSrcs(_)
++            | Op::PhiDsts(_)
++            | Op::Pin(_)
++            | Op::Unpin(_)
++    )
++}
++
++/// The block's instructions before its branch, if it ends in one
++fn body(b: &BasicBlock) -> &[Instr] {
++    match b.branch_ip() {
++        Some(ip) => &b.instrs[..ip],
++        None => &b.instrs[..],
++    }
++}
++
++fn body_ok(b: &BasicBlock, p: &RegRef, max: usize) -> bool {
++    let body = body(b);
++    body.len() <= max && body.iter().all(|i| can_predicate(i, p))
++}
++
++/// `@p bra L` at the end of block i: (p, inverted, L)
++fn cond_branch(b: &BasicBlock) -> Option<(RegRef, bool, Label)> {
++    let instr = b.branch()?;
++    let Op::Bra(bra) = &instr.op else {
++        return None;
++    };
++    if !bra.cond.is_true() {
++        return None;
++    }
++    match &instr.pred.pred_ref {
++        PredRef::Reg(reg) if reg.file() == RegFile::Pred => {
++            Some((*reg, instr.pred.pred_inv, bra.target))
++        }
++        _ => None,
++    }
++}
++
++/// The target of the block's unconditional branch, if it ends in one
++fn uncond_target(b: &BasicBlock) -> Option<Label> {
++    let instr = b.branch()?;
++    match &instr.op {
++        Op::Bra(bra) if instr.pred.is_true() && bra.cond.is_true() => {
++            Some(bra.target)
++        }
++        _ => None,
++    }
++}
++
++/// Where control goes after the block's body: its unconditional branch
++/// target, or the next block's label if it falls through
++fn successor(f: &Function, i: usize) -> Option<Label> {
++    let b = &f.blocks[i];
++    match b.branch() {
++        Some(_) => uncond_target(b),
++        None => f.blocks.get(i + 1).map(|n| n.label),
++    }
++}
++
++fn predicate(b: &mut BasicBlock, p: RegRef, inv: bool) {
++    let n = body(b).len();
++    for instr in &mut b.instrs[..n] {
++        instr.pred = Pred {
++            pred_ref: PredRef::Reg(p),
++            pred_inv: inv,
++        };
++    }
++}
++
++fn try_convert(f: &mut Function, i: usize) -> bool {
++    if i + 1 >= f.blocks.len() {
++        return false;
++    }
++    let Some((p, inv, target)) = cond_branch(&f.blocks[i]) else {
++        return false;
++    };
++    let t = i + 1;
++    if f.blocks.pred_indices(t) != [i] {
++        return false;
++    }
++
++    // if/else: the then-block jumps over the else-block, which only the
++    // branch reaches, and both end up at the same place
++    let e = i + 2;
++    if e < f.blocks.len()
++        && f.blocks[e].label == target
++        && f.blocks.pred_indices(e) == [i]
++        && uncond_target(&f.blocks[t]).is_some()
++        && uncond_target(&f.blocks[t]) == successor(f, e)
++        && body(&f.blocks[t]).len() + body(&f.blocks[e]).len() <= MAX_IF_ELSE
++        && body_ok(&f.blocks[t], &p, MAX_IF_ELSE)
++        && body_ok(&f.blocks[e], &p, MAX_IF_ELSE)
++    {
++        predicate(&mut f.blocks[t], p, !inv);
++        predicate(&mut f.blocks[e], p, inv);
++        f.blocks[i].instrs.pop();
++        f.blocks[t].instrs.pop();
++        return true;
++    }
++
++    // then only: the then-block continues where the branch goes
++    if successor(f, t) == Some(target) && body_ok(&f.blocks[t], &p, MAX_THEN) {
++        predicate(&mut f.blocks[t], p, !inv);
++        f.blocks[i].instrs.pop();
++        if f.blocks[t].branch().is_some()
++            && t + 1 < f.blocks.len()
++            && f.blocks[t + 1].label == target
++        {
++            f.blocks[t].instrs.pop();
++        }
++        return true;
++    }
++
++    false
++}
++
++fn referenced_labels(f: &Function) -> FxHashSet<Label> {
++    let mut labels = FxHashSet::default();
++    for b in f.blocks.iter() {
++        for instr in &b.instrs {
++            match &instr.op {
++                Op::Bra(op) => {
++                    labels.insert(op.target);
++                }
++                Op::BSSy(op) => {
++                    labels.insert(op.target);
++                }
++                Op::Sync(op) => {
++                    labels.insert(op.target);
++                }
++                Op::Brk(op) => {
++                    labels.insert(op.target);
++                }
++                Op::Cont(op) => {
++                    labels.insert(op.target);
++                }
++                Op::SSy(op) => {
++                    labels.insert(op.target);
++                }
++                Op::PBk(op) => {
++                    labels.insert(op.target);
++                }
++                Op::PCnt(op) => {
++                    labels.insert(op.target);
++                }
++                _ => (),
++            }
++        }
++    }
++    labels
++}
++
++fn bar_reg(src: &Src) -> Option<RegRef> {
++    src.src_ref.as_reg().copied()
++}
++
++fn uses_bar(instr: &Instr, bar: &RegRef) -> bool {
++    instr.srcs().iter().any(|s| s.src_ref.as_reg() == Some(bar))
++        || instr.dsts().iter().any(|d| d.as_reg() == Some(bar))
++}
++
++/// Removes the BSSY/BSYNC pair (and BMOV.CLEAR and label NOP) of a region
++/// that has no branch left in it.  Returns true on progress.
++fn remove_dead_sync(f: &mut Function) -> bool {
++    for bi in 0..f.blocks.len() {
++        for ip in 0..f.blocks[bi].instrs.len() {
++            let Op::BSSy(bssy) = &f.blocks[bi].instrs[ip].op else {
++                continue;
++            };
++            if !f.blocks[bi].instrs[ip].pred.is_true() {
++                continue;
++            }
++            let Some(bar) = bssy.bar_out.as_reg().copied() else {
++                continue;
++            };
++            let target = bssy.target;
++
++            // Walk forward to the BSYNC on this barrier: no branch, no other
++            // use of the barrier, no entry from elsewhere on the way.
++            let mut found = None;
++            let (mut cb, mut cip) = (bi, ip + 1);
++            'walk: loop {
++                if cip >= f.blocks[cb].instrs.len() {
++                    cb += 1;
++                    cip = 0;
++                    if cb >= f.blocks.len()
++                        || f.blocks.pred_indices(cb) != [cb - 1]
++                    {
++                        break 'walk;
++                    }
++                    continue;
++                }
++                let instr = &f.blocks[cb].instrs[cip];
++                if instr.is_branch() {
++                    break 'walk;
++                }
++                if let Op::BSync(bsync) = &instr.op {
++                    if bar_reg(&bsync.bar) == Some(bar) {
++                        if instr.pred.is_true() {
++                            found = Some((cb, cip));
++                        }
++                        break 'walk;
++                    }
++                }
++                if uses_bar(instr, &bar) {
++                    break 'walk;
++                }
++                cip += 1;
++            }
++            let Some((sb, sip)) = found else {
++                continue;
++            };
++
++            // The BSSY target: the instruction after the BSYNC (a label NOP
++            // or the next block's start)
++            f.blocks[sb].instrs.remove(sip);
++            f.blocks[bi].instrs.remove(ip);
++            // BMOV.CLEAR of this barrier right before, if any
++            let mut k = ip;
++            while k > 0 {
++                k -= 1;
++                let instr = &f.blocks[bi].instrs[k];
++                if let Op::BClear(op) = &instr.op {
++                    if op.dst.as_reg() == Some(&bar) {
++                        f.blocks[bi].instrs.remove(k);
++                    }
++                    break;
++                }
++                if uses_bar(instr, &bar) || instr.is_branch() {
++                    break;
++                }
++            }
++            // The label NOP, unless something else still targets it
++            let refs = referenced_labels(f);
++            if !refs.contains(&target) {
++                for b in f.blocks.iter_mut() {
++                    b.instrs.retain(|i| {
++                        !matches!(&i.op, Op::Nop(nop) if nop.label == Some(target))
++                    });
++                }
++            }
++            return true;
++        }
++    }
++    false
++}
++
++/// Appends a block to its fall-through predecessor when nothing else reaches
++/// it or names its label
++fn merge_blocks(f: &mut Function) {
++    let refs = referenced_labels(f);
++    for i in (1..f.blocks.len()).rev() {
++        // A block that ends in a branch stays: the empty block left behind
++        // falls through, which the last block must not
++        if f.blocks.pred_indices(i) != [i - 1]
++            || f.blocks[i - 1].branch().is_some()
++            || f.blocks[i].branch().is_some()
++            || refs.contains(&f.blocks[i].label)
++            || f.blocks[i].instrs.is_empty()
++        {
++            continue;
++        }
++        let mut instrs = std::mem::take(&mut f.blocks[i].instrs);
++        let uniform = f.blocks[i].uniform;
++        let prev = &mut f.blocks[i - 1];
++        prev.instrs.append(&mut instrs);
++        prev.uniform &= uniform;
++    }
++}
++
++impl Function {
++    pub fn opt_if_convert(&mut self) {
++        let mut progress = false;
++        loop {
++            let mut changed = false;
++            // Inner regions come after their outer branch, so go backwards
++            for i in (0..self.blocks.len()).rev() {
++                if try_convert(self, i) {
++                    changed = true;
++                }
++            }
++            if !changed {
++                break;
++            }
++            progress = true;
++            rewrite_cfg(self);
++            while remove_dead_sync(self) {}
++            rewrite_cfg(self);
++        }
++        if progress {
++            merge_blocks(self);
++            rewrite_cfg(self);
++        }
++    }
++}
++
++impl Shader<'_> {
++    pub fn opt_if_convert(&mut self) {
++        if !crate::knobs::if_convert() {
++            return;
++        }
++        for f in &mut self.functions {
++            f.opt_if_convert();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    use compiler::cfg::CFGBuilder;
++    use rustc_hash::FxBuildHasher;
++
++    fn gpr(i: u32) -> RegRef {
++        RegRef::new(RegFile::GPR, i, 1)
++    }
++
++    fn bra(target: Label, p: Option<(RegRef, bool)>) -> Instr {
++        let mut i = Instr::new(OpBra {
++            target,
++            cond: true.into(),
++        });
++        if let Some((p, inv)) = p {
++            i.pred = Pred {
++                pred_ref: PredRef::Reg(p),
++                pred_inv: inv,
++            };
++        }
++        i
++    }
++
++    /// @p0 bra L2; L1: r0 = r1 + r2 (or p0 = ...); bra L3; L2: r0 = r3;
++    /// L3: exit
++    fn if_else(then_writes_p0: bool) -> Function {
++        let mut labels = LabelAllocator::new();
++        let l: Vec<Label> = (0..4).map(|_| labels.alloc()).collect();
++        let p0 = RegRef::new(RegFile::Pred, 0, 1);
++
++        let then_op: Instr = if then_writes_p0 {
++            Instr::new(OpFSetP {
++                dst: p0.into(),
++                set_op: PredSetOp::And,
++                cmp_op: FloatCmpOp::OrdLt,
++                srcs: [gpr(1).into(), gpr(2).into()],
++                accum: true.into(),
++                ftz: false,
++            })
++        } else {
++            Instr::new(OpFAdd {
++                dst: gpr(0).into(),
++                srcs: [gpr(1).into(), gpr(2).into()],
++                saturate: false,
++                rnd_mode: FRndMode::NearestEven,
++                ftz: false,
++            })
++        };
++        let blocks = vec![
++            vec![bra(l[2], Some((p0, false)))],
++            vec![then_op, bra(l[3], None)],
++            vec![Instr::new(OpMov {
++                dst: gpr(0).into(),
++                src: gpr(3).into(),
++                quad_lanes: 0xf,
++            })],
++            vec![Instr::new(OpExit {})],
++        ];
++
++        let mut cfg = CFGBuilder::<_, _, FxBuildHasher>::new();
++        for (i, instrs) in blocks.into_iter().enumerate() {
++            cfg.add_node(
++                l[i],
++                BasicBlock {
++                    label: l[i],
++                    uniform: false,
++                    instrs,
++                },
++            );
++        }
++        cfg.add_edge(l[0], l[1]);
++        cfg.add_edge(l[0], l[2]);
++        cfg.add_edge(l[1], l[3]);
++        cfg.add_edge(l[2], l[3]);
++        Function {
++            ssa_alloc: SSAValueAllocator::new(),
++            phi_alloc: PhiAllocator::new(),
++            blocks: cfg.as_cfg(true),
++        }
++    }
++
++    fn all_instrs(f: &Function) -> Vec<&Instr> {
++        f.blocks.iter().flat_map(|b| b.instrs.iter()).collect()
++    }
++
++    #[test]
++    fn if_else_is_predicated() {
++        let mut f = if_else(false);
++        f.opt_if_convert();
++        let instrs = all_instrs(&f);
++        assert!(!instrs.iter().any(|i| matches!(&i.op, Op::Bra(_))));
++        let fadd = instrs
++            .iter()
++            .find(|i| matches!(&i.op, Op::FAdd(_)))
++            .unwrap();
++        assert!(fadd.pred.pred_inv);
++        let mov = instrs.iter().find(|i| matches!(&i.op, Op::Mov(_))).unwrap();
++        assert!(!mov.pred.is_true() && !mov.pred.pred_inv);
++        // Then before else, and the exit last
++        let pos = |f: &dyn Fn(&Op) -> bool| {
++            instrs.iter().position(|i| f(&i.op)).unwrap()
++        };
++        assert!(
++            pos(&|op| matches!(op, Op::FAdd(_)))
++                < pos(&|op| matches!(op, Op::Mov(_)))
++        );
++        assert!(matches!(&instrs.last().unwrap().op, Op::Exit(_)));
++    }
++
++    #[test]
++    fn predicate_overwrite_stays() {
++        let mut f = if_else(true);
++        f.opt_if_convert();
++        let instrs = all_instrs(&f);
++        assert_eq!(
++            instrs
++                .iter()
++                .filter(|i| matches!(&i.op, Op::Bra(_)))
++                .count(),
++            2
++        );
++        assert!(instrs
++            .iter()
++            .all(|i| !matches!(&i.op, Op::FSetP(_)) || i.pred.is_true()));
++    }
++}
+diff --git a/src/nouveau/compiler/nak/opt_jump_thread.rs b/src/nouveau/compiler/nak/opt_jump_thread.rs
+index b484fde..82f3058 100644
+--- a/src/nouveau/compiler/nak/opt_jump_thread.rs
++++ b/src/nouveau/compiler/nak/opt_jump_thread.rs
+@@ -109,7 +109,7 @@ fn jump_thread(func: &mut Function) -> bool {
+     progress
+ }
+ 
+-fn rewrite_cfg(func: &mut Function) {
++pub(crate) fn rewrite_cfg(func: &mut Function) {
+     // CFGBuilder takes care of removing dead blocks for us
+     // We use the basic block's label to identify it
+     let mut builder = CFGBuilder::<_, _, FxBuildHasher>::new();
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index 868cd9d..ef67ac5 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -204,7 +204,8 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
+       LOOP_OPT(nir, nir_opt_cse);
+ 
+       nir_opt_peephole_select_options peephole_select_options = {
+-         .limit = 0,
++         /* NAK_NIR_FLATTEN: flatten small ifs into selects */
++         .limit = nak_knob_nir_flatten() ? 8 : 0,
+          .discard_ok = true,
+       };
+       LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_peephole_select,
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index f43fe79..1be8c64 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -17,6 +17,7 @@ extern "C" {
+ bool nak_should_print_nir(void);
+ bool nak_debug_no_ugpr(void);
+ bool nak_knob_uaddr_pin(void);
++bool nak_knob_nir_flatten(void);
+ 
+ struct nak_compiler {
+    uint8_t sm;
+-- 
+2.43.0
+

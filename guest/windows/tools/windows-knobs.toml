@@ -1299,6 +1299,36 @@ class = "tuning"
 read = "device creation (once per process)"
 effect = "On by default (unset or 1); 0 turns it off. Rematerialization in NAK's GPR spiller (cheap values such as constants, constant-buffer and constant-memory loads, thread/CTA IDs and short ALU chains are recomputed at reloads instead of going to local memory; constant-memory loads through a constant-buffer address reload with one LDG from a UGPR copy of the address) and a per-shader register target: after scheduling, NAK estimates the cost of spilling down to each lower register count that gives more warps per SM (workgroup and shared memory limits included) and uses the one with the best estimated gain, never one that needs more than a few memory spills or any inside a loop. A NAK_GPR_CAP for a stage overrides the target of that stage and then spills with rematerialization. Part of the shader cache key."
 
+[env.NAK_IMM_CSE]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "Unset: in compute shaders, a register copy of an immediate (needed when an instruction cannot take two immediates, such as an FFMA by two constants) serves the following uses of that immediate in its block, as long as each is at most 16 instructions after the previous one. 1 does it in every stage (it can cost occupancy in fragment and vertex shaders), 0 never. Part of the shader cache key."
+
+[env.NAK_UADDR_PIN]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "On by default (unset or 1); 0 turns it off. The uniform 64-bit base addresses of global memory accesses inside a divergent if (vkd3d-proton descriptor heaps, root constant buffers) are computed before the if in uniform registers and pinned there, so the accesses use the [R.U32 + UR] and [RZ + UR] address forms instead of computing 64-bit addresses in GPRs. Part of the shader cache key."
+
+[env.NAK_PLOP_FOLD]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "On by default (unset or 1); 0 turns it off. A PLOP3 that combines a comparison with one other predicate becomes the comparison's accumulator (FSETP/ISETP .AND/.OR/.XOR). Part of the shader cache key."
+
+[env.NAK_IF_CONVERT]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "On by default (unset or 1); 0 turns it off. After register allocation, NAK predicates small then/else blocks (8 instructions, or 12 for a then- and an else-block together) instead of branching around them, and drops the BSSY/BSYNC pair of a region left without branches. Does not change register counts. Part of the shader cache key."
+
+[env.NAK_NIR_FLATTEN]
+class = "experiment"
+read = "first shader compile (once per process)"
+effect = "1 lets NIR flatten small ifs into selects (nir_opt_peephole_select limit 8). Fewer instructions, but the values of both sides are live at once, which costs occupancy on some shaders. Off by default. Part of the shader cache key."
+
+[env.NAK_BSSY_RECONVERGENT]
+class = "experiment"
+read = "shader compile (once per process)"
+effect = "1 (SM100 and newer) gives the BSSY/BSYNC pairs of if/else regions the .RECONVERGENT mode, as NVIDIA's own SM120 code does, without the BMOV.CLEAR before each BSSY. Barriers used by BREAK keep the plain mode. Off by default until tested on hardware. Part of the shader cache key."
+
 [env.NAK_OCC_TRACE]
 class = "debug"
 read = "first shader compile (once per process)"
