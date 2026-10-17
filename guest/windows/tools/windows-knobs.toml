@@ -1502,6 +1502,18 @@ class = "debug"
 read = "physical device enumeration"
 effect = "Path of the librmclient library NVK loads; unset uses the library next to the driver."
 
+[env.NVK_RM_ASYNC_COMPUTE]
+class = "tuning"
+read = "physical device enumeration"
+effect = "1 exposes a compute + transfer queue family (4 queues) whose channels sit in the first graphics queue's channel group on VEIDs of their own, so D3D12 compute and copy queues (vkd3d-proton) run next to the graphics queue instead of behind it; 0 keeps one queue family."
+default_note = "on on Blackwell GB20x (compute class 0xcec0 and newer), off on older GPUs"
+see = "[guest/nvk-rm/README.md](../guest/nvk-rm/README.md)"
+
+[env.NVK_RM_ASYNC_WAIT_SWITCH]
+class = "experiment"
+read = "first GPU wait"
+effect = "1 makes every GPU wait that blocks ask for a channel group switch, also a wait for a value another channel of the same group signals; 0 skips the switch for those."
+
 [env.NVK_RM_BAR_MB]
 class = "experiment"
 read = "physical device enumeration"
