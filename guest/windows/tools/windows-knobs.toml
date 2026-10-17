@@ -1513,9 +1513,10 @@ read = "device creation"
 effect = "1 allows compressible VRAM for images on Blackwell (GB20x); 0 turns compression off."
 
 [env.NVK_RM_COMPRESS_ALL]
-class = "experiment"
-read = "device creation"
-effect = "1 makes every device-local allocation an image may be bound to compressible; 0 compresses only dedicated image memory."
+class = "tuning"
+read = "physical device creation"
+effect = "1 makes every device-local allocation an image may be bound to compressible; 0 compresses only dedicated image memory. Unset, it is on for vkd3d-proton (D3D12) processes and off for all others (D3D11 through DXVK, native Vulkan, the desktop compositor), and stays off when compression is off or NVK_RM_COMPRESS_TYPE is on."
+default_note = "unset means on in a process whose Vulkan engine name starts with vkd3d (vkd3d-proton), off in every other"
 
 [env.NVK_RM_COMPRESS_CLEAR]
 class = "debug"

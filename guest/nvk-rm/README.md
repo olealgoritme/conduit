@@ -73,7 +73,8 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_CMD_MEM_CACHE` | 64 | command buffer memory blocks of each kind a device keeps from destroyed and trimmed command pools for new ones; 0 frees them (common 54) |
 | `NVK_RM_SYSMEM_CACHED` | 1 | host-visible system memory GPU-cacheable in L2 (`=0` off, `=desc`/`=app` one kind only) |
 | `NVK_RM_COMPRESSION` | 1 | compressible VRAM for images in dedicated allocations on GB20x |
-| `NVK_RM_COMPRESS_ALL`, `_ZS`, `_TYPE` | 0 | compression outside dedicated allocations, for depth/stencil, and as a memory type (see "Compression") |
+| `NVK_RM_COMPRESS_ALL` | on for vkd3d-proton (D3D12), off otherwise | compression outside dedicated allocations; 0 or 1 overrides the default (see "Compression") |
+| `NVK_RM_COMPRESS_ZS`, `_TYPE` | 1, 0 | compression for depth/stencil, and as a memory type (see "Compression") |
 | `NVK_RM_COMPRESS_CLEAR`, `_UPGRADE`, `_TYPE_SCOPE` | unset | compression diagnostics (common 15) |
 | `NVK_RM_ZCULL` | 1 | ZCULL from `GR_GET_ZCULL_INFO` |
 | `NVK_RM_HUGE_PAGES` | 0 | 2 MiB GPU pages for CPU-unmapped VRAM of 2 MiB or more (common 9) |
@@ -316,6 +317,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0065 | NAK: `NAK_UNROLL_MAX`, how many iterations NIR fully unrolls (default 32) |
 | 0066 | NAK: the copies that turn a splat into a register vector serve its later uses in the block (`NAK_VEC_CSE`, default on) |
 | 0067 | NAK: weak memory order for non-coherent global, SSBO and image accesses (`NAK_WEAK_MEM`, opt-in) |
+| 0068 | `NVK_RM_COMPRESS_ALL` defaults to on for processes whose Vulkan engine name starts with `vkd3d` (vkd3d-proton) and to off for all others; 0 or 1 in the environment overrides it (`nvk_apply_engine_compression_default`) |
 
 ## Per-draw cost (common 0001-0007)
 
@@ -414,9 +416,17 @@ writes PTEs; NVK maps images with 0x8.
 | knob (default) | what it compresses |
 |---|---|
 | `NVK_RM_COMPRESSION` (1) | images in dedicated allocations: the memory is COMPR_ANY (block linear, 32 bpp, as NVKMS does) and mapped with the image's compressible kind; if RM declines, the uncompressed GMK kind (`patches-windows/0028`, `patches/0016`) |
-| `NVK_RM_COMPRESS_ALL` (0) | images in sub-allocated memory (common 0011); vkd3d-proton places every D3D12 resource in a heap, so images are rarely dedicated |
-| `NVK_RM_COMPRESS_ZS` (0) | separate depth/stencil images (common 0012): Blackwell splits D24S8 and D32S8X24 into planes, which `nvk_image_can_compress` otherwise rejects; both planes are compressed and the draw path sets `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION` from `is_compressed` |
+| `NVK_RM_COMPRESS_ALL` (1 for vkd3d-proton, else 0) | images in sub-allocated memory (common 0011, default common 0068); vkd3d-proton places every D3D12 resource in a heap, so images are rarely dedicated |
+| `NVK_RM_COMPRESS_ZS` (1) | separate depth/stencil images (common 0012): Blackwell splits D24S8 and D32S8X24 into planes, which `nvk_image_can_compress` otherwise rejects; both planes are compressed and the draw path sets `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION` from `is_compressed` |
 | `NVK_RM_COMPRESS_TYPE` (0) | images in a second DEVICE_LOCAL memory type (common 0013) |
+
+`NVK_RM_COMPRESS_ALL` is on in processes whose `VkApplicationInfo::pEngineName`
+starts with `vkd3d` (vkd3d-proton, D3D12) and off in every other: D3D11
+through DXVK (engine `DXVK`), native Vulkan applications and the desktop
+compositor stay uncompressed. The driver decides when it creates the physical
+device (`nvk_apply_engine_compression_default`, common 0068). Setting the
+variable to 1 or 0 overrides that in both directions. The default does not
+apply when `NVK_RM_COMPRESSION=0` or `NVK_RM_COMPRESS_TYPE=1`.
 
 `NVK_RM_COMPRESS_ALL`: device-local memory that is neither host-visible,
 shared nor imported is allocated COMPR_ANY (`NVKMD_MEM_COMPRESSIBLE`,
@@ -460,7 +470,7 @@ spec, testing only); `NVK_RM_COMPRESSION=0` turns compression off.
 
 Known issue: Counter-Strike 2 (D3D11 through DXVK) draws a stretched "beam"
 with `NVK_RM_COMPRESS_ALL=1` and one agent model's body black with
-`NVK_RM_COMPRESS_TYPE=1`, so both stay off. Suspects, separable with the
+`NVK_RM_COMPRESS_TYPE=1`, so `ALL` is off for DXVK and `TYPE` is off. Suspects, separable with the
 knobs above: the front end and PBDMA reading indirect arguments from
 compressible memory (`ALL` only), stale compression state on reused pages
 (RM scrubs freed VRAM without a PTE kind), and sub-allocated compressed
