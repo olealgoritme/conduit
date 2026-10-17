@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     }
     if (!load_vk()) { fprintf(stderr, "no Vulkan loader\n"); return 2; }
     const char *knobs[] = { "NAK_LAT", "NAK_BAR_SHARE", "NAK_IF_CONVERT", "NAK_UADDR_PIN", "NAK_PLOP_FOLD", "NAK_IMM_CSE",
-                            "NAK_PHI_AVOID", "NAK_BSSY_RECONVERGENT", "NAK_NIR_FLATTEN", "NAK_OCC_TARGET", "MESA_SHADER_CACHE_DISABLE" };
+                            "NAK_PHI_AVOID", "NAK_WEAK_MEM", "NAK_VEC_CSE", "NAK_UNROLL_MAX", "NAK_BSSY_RECONVERGENT", "NAK_NIR_FLATTEN", "NAK_OCC_TARGET", "MESA_SHADER_CACHE_DISABLE" };
     printf("naktest: %u invocations, %d repeats; environment:", n, repeats);
     for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) { const char *v = getenv(knobs[k]); if (v) printf(" %s=%s", knobs[k], v); }
     printf("\n");

@@ -1354,6 +1354,11 @@ class = "tuning"
 read = "first shader compile (once per process)"
 effect = "On by default (unset or 1); 0 turns it off. The register copies that turn a vector source with repeated components (an image store of vec4(x), say) into a register vector are made once per block and reused by later uses of the same vector. Part of the shader cache key."
 
+[env.NAK_WEAK_MEM]
+class = "experiment"
+read = "first shader compile (once per process)"
+effect = "1: global, SSBO and image loads and stores that are not coherent, volatile or atomic use the weak memory order (L1-cacheable plain LDG/STG/SULD/SUST, as NVIDIA's own code does) instead of .STRONG.GPU, which sends every load to L2. Barriers keep the needed cache write-backs and invalidations. Off by default until validated in games. Part of the shader cache key."
+
 [env.NAK_OCC_TRACE]
 class = "debug"
 read = "first shader compile (once per process)"

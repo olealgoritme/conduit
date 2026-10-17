@@ -18,6 +18,7 @@ predicated code) on the GPU before any of them is turned on by default.
 | `carry0-2` | 64-bit adds and shifts (carry predicates) |
 | `uniform0-2` | a chain on push constants only (uniform datapath) |
 | `loads8..32` | 8 to 32 independent loads in flight, consumed in shuffled order (scoreboards) |
+| `wgsync` | invocations of a workgroup exchange values through the storage buffer around barriers (`NAK_WEAK_MEM`) |
 
 ## Build and run
 
@@ -32,6 +33,7 @@ compiles fresh pipelines; the knobs are part of the shader cache key):
 naktest.exe
 set NAK_LAT=95 & naktest.exe
 set NAK_BAR_SHARE=1 & naktest.exe
+set NAK_WEAK_MEM=1 & naktest.exe
 set NAK_LAT=128 & naktest.exe      rem unsafe upper bound: failures expected
 ```
 
