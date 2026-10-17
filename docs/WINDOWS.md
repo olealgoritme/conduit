@@ -355,8 +355,18 @@ offered), `VpCRf` (the committed rate).
 
 ## Performance
 
-- NVK's knobs and its diagnostics (`NVK_PASS_PROFILE`, `NVK_SHADER_STATS`,
-  `NVK_WAIT_STATS`) are in [guest/nvk-rm/README.md](../guest/nvk-rm/README.md).
+- NVK's knobs and its diagnostics (`NVK_PASS_PROFILE`, `NVK_DISPATCH_PROFILE`,
+  `NVK_SHADER_STATS`, `NVK_WAIT_STATS`) are in
+  [guest/nvk-rm/README.md](../guest/nvk-rm/README.md); every Windows knob with
+  its default is in [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md).
+- GPU measurement tools that run on NVIDIA's driver and on NVK alike:
+  [vk_pass_layer](../guest/nvk-rm/tests/perf/vk_pass_layer/README.md) (GPU
+  time per render pass in `NVK_PASS_PROFILE`'s format, and a comparison
+  script), [dispatch-bench](../guest/nvk-rm/tests/perf/dispatch-bench/README.md)
+  (GPU time per compute dispatch) and
+  [async-compute](../guest/nvk-rm/tests/perf/async-compute/README.md) (RM
+  trace and queue overlap test; findings in
+  [research/async-compute-gb202.md](research/async-compute-gb202.md)).
 - For processes on Venus, fence latency decides the frame rate; see
   [VENUS.md](VENUS.md) "Fence latency" for the virglrenderer patch Venus
   needs on NVIDIA and the latency lines both host processes log.
