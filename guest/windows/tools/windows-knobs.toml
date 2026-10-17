@@ -1344,6 +1344,11 @@ class = "experiment"
 read = "first shader compile (once per process)"
 effect = "Bitmask, default 0: SM120 register dependency pairs that wait the SM100 latency instead of one cycle more: 1 FMA-class chains, 2 FMA/ALU cross pairs, 4 predicate guards, 8 coupled carry predicates, 16 uniform datapath, 64 LOP3/PRMT/SHF chains, 128 every pair (unsafe upper bound). For hardware validation with naktest only. Part of the shader cache key."
 
+[env.NAK_UNIFORM_ATOMICS]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "On by default (unset or 1); 0 turns it off. An atomic whose address is the same in every active lane of a subgroup is done once by one lane, with a subgroup reduction of the value and an exclusive scan giving each lane its result (nir_opt_uniform_atomics), instead of one atomic per lane serialized in L2. Part of the shader cache key."
+
 [env.NAK_UNROLL_MAX]
 class = "tuning"
 read = "first shader compile (once per process)"

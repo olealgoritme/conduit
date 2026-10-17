@@ -322,6 +322,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0067 | NAK: weak memory order for non-coherent global, SSBO and image accesses (`NAK_WEAK_MEM`, opt-in) |
 | 0068 | `NVK_RM_COMPRESS_ALL` defaults to on for processes whose Vulkan engine name starts with `vkd3d` (vkd3d-proton) and to off for all others; 0 or 1 in the environment overrides it (`nvk_apply_engine_compression_default`) |
 | 0069 | async compute: a compute + transfer queue family (4 queues) whose channels sit in the first graphics queue's TSG on VEIDs of their own and run next to it (`NVK_RM_ASYNC_COMPUTE`, see "Async compute") |
+| 0070 | NAK: `nir_opt_uniform_atomics` before subgroup lowering: an atomic on an address that is the same in every active lane of a subgroup is done once per subgroup, with a subgroup reduction of the value and an exclusive scan for each lane's result (`NAK_UNIFORM_ATOMICS`, default on; part of the shader cache key) |
 
 ## Per-draw cost (common 0001-0007)
 
