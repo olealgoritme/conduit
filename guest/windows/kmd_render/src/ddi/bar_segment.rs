@@ -15,35 +15,40 @@ const BAR_SEGMENT_MAX_BYTES: u64 = 1 << 30;
 /// address `0xC0000000..0x100000000`. Venus owns the real host GPU addresses,
 /// but VidMm still validates the decorative ranges it is given.
 pub(super) const VIDMM_MEMORY_BASE: u64 = 1 << 32;
-const VIDMM_VRAM_MIN_MB: u32 = 256;
-const VIDMM_VRAM_MAX_MB: u32 = 64 * 1024;
+const VIDMM_VRAM_MIN_MB: u32 = helios_kmd_logic::vidmm_vram::MIN_MB;
+const VIDMM_VRAM_MAX_MB: u32 = helios_kmd_logic::vidmm_vram::MAX_MB;
 
-/// Resolve an absent `VidMmVramMB` registry value from the exact virtio shared-
-/// memory capability length. QEMU may pad its containing PCI BAR to a power of
-/// two, but the capability retains the requested `hostmem` length, so 6 GiB is
-/// reported as 6 GiB rather than the 8-GiB BAR envelope.
+/// Resolve an absent `VidMmVramMB` registry value (`helios_kmd_logic::vidmm_vram`).
+///
+/// The reported device-memory segment is the host GPU's video memory: the largest device-local
+/// heap the Venus device listed at bring-up. The segment is accounting only (VidMm charges the
+/// tracking allocations of memory the host GPU owns against it), so it is sized by what the card
+/// holds and not by the host-visible window, whose length (QEMU `hostmem`, 8 GiB by default) only
+/// bounds the CPU-visible blobs. When the Venus device could not tell, the exact virtio shared-
+/// memory capability length is used as before (QEMU may pad its containing PCI BAR to a power of
+/// two, but the capability retains the requested length), and failing that the legacy topology.
 pub(super) fn resolve_vidmm_vram_mb(
     knobs: &mut crate::adapter::AdapterKnobs,
+    device_local_bytes: Option<u64>,
     host_visible_bytes: Option<u64>,
 ) {
-    if knobs.vidmm_vram_mb == crate::adapter::VIDMM_VRAM_MB_AUTO {
-        knobs.vidmm_vram_mb = match host_visible_bytes {
-            None => 0,
-            Some(bytes) => {
-                const MIB: u64 = 1 << 20;
-                let mb = bytes / MIB;
-                if bytes % MIB == 0
-                    && mb <= u32::MAX as u64
-                    && (VIDMM_VRAM_MIN_MB..=VIDMM_VRAM_MAX_MB).contains(&(mb as u32))
-                {
-                    mb as u32
-                } else {
-                    crate::diag::record_named_bytes(b"VidVBad", mb.min(u32::MAX as u64) as u32);
-                    0
-                }
-            }
-        };
+    let resolved = helios_kmd_logic::vidmm_vram::resolve(
+        knobs.vidmm_vram_mb,
+        device_local_bytes,
+        host_visible_bytes,
+    );
+    if let Some(bad_mb) = resolved.bad_mb {
+        crate::diag::record_named_bytes(b"VidVBad", bad_mb);
     }
+    if resolved.clamped {
+        crate::diag::record_named_bytes(b"VidVCap", resolved.mb);
+    }
+    knobs.vidmm_vram_mb = resolved.mb;
+    crate::diag::record_named_bytes(b"VidVSrc", resolved.source.code());
+    crate::diag::record_named_bytes(
+        b"VidVHeap",
+        device_local_bytes.map_or(0, |b| (b >> 20).min(u64::from(u32::MAX)) as u32),
+    );
     crate::diag::record_named_bytes(b"VidVram", knobs.vidmm_vram_mb);
 }
 

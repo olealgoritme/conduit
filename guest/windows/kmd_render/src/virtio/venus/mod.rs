@@ -310,6 +310,10 @@ pub struct VenusClient {
     /// Raw VkMemoryPropertyFlags for physical-device memory types.
     memory_type_flags: [u32; VK_MAX_MEMORY_TYPES as usize],
     memory_type_count: u32,
+    /// The host GPU's video memory in bytes: the largest `DEVICE_LOCAL` heap of its
+    /// `vkGetPhysicalDeviceMemoryProperties`, or 0 when the reply listed none (or was malformed).
+    /// Sizes the device-memory segment reported to VidMm (`helios_kmd_logic::vidmm_vram`).
+    device_local_heap_bytes: u64,
     /// Wire fence of the most recent [`Self::submit_prepared_image_copy`].
     ///
     /// The client submits that fence itself, so it is the only thing that
@@ -367,6 +371,11 @@ impl VenusClient {
     /// exact memory type.
     pub fn memory_type_index(&self) -> u32 {
         self.memory_type_index.0
+    }
+
+    /// The host GPU's video memory in bytes, or `None` when bring-up could not read it.
+    pub fn device_local_heap_bytes(&self) -> Option<u64> {
+        (self.device_local_heap_bytes != 0).then_some(self.device_local_heap_bytes)
     }
 
     // ── Stage-1 delegates ────────────────────────────────────────────────────

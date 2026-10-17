@@ -189,7 +189,7 @@ Segments (`ddi/query_adapter_info.rs`, `ddi/bar_segment.rs`, `ddi/segment_table.
 | id | what | flags | backing | CPU access |
 |---|---|---|---|---|
 | 1 | aperture, 1 GiB | Aperture, CacheCoherent | guest system pages | n/a |
-| 2 | "BAR" memory segment, `VidMmVramMB` MiB, local budget group | CacheCoherent, SupportsCpuHostAperture, SupportsCachedCpuHostAperture (`BarSegFlags` 0x1C) | the virtio host-visible window: Venus blobs (host memory), **not VRAM** | `DxgkDdiMapCpuHostAperture` maps the allocation's Venus blob at dxgkrnl's offset |
+| 2 | "BAR" memory segment, `VidMmVramMB` MiB (absent: the host GPU's video memory), local budget group | CacheCoherent, SupportsCpuHostAperture, SupportsCachedCpuHostAperture (`BarSegFlags` 0x1C) | the virtio host-visible window: Venus blobs (host memory), **not VRAM** | `DxgkDdiMapCpuHostAperture` maps the allocation's Venus blob at dxgkrnl's offset |
 
 `DXGK_VIDMMCAPS`: `SectionBackedPrimary`, `CrossAdapterResource` with `CrossAdaptCaps`, GpuMmu bits.
 `PresentationCaps` 0: **no GDI hardware acceleration** (deliberately; `query_adapter_info.rs` explains the
