@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 23:34:46 +0200
+Subject: [PATCH] nvk/rm: compute root descriptors in CPU-mapped VRAM by
+ default on Windows
+
+NVK_RM_UPLOAD_VRAM defaults to compute on Windows: a compute dispatch's
+root descriptor table (NVKMD_MEM_GPU_LATENCY upload memory), which the
+dispatch waits for, lives in CPU-mapped VRAM instead of system memory the
+GPU reads across PCIe and the guest's IOMMU.  Tiny back-to-back dispatches
+take 0.48 us each on an RTX 5090 (NVIDIA's driver: 0.49 us) against
+2.5-3.7 us with the tables in system memory; Steel Nomad (D3D12) runs at
+69.6-71.1 fps against 68.3.
+
+The device's command memory cache keeps the cost of a new command pool's
+first VRAM block (an allocation and a BAR1 map) out of the steady state.
+NVK_RM_UPLOAD_VRAM=0 keeps the tables in system memory; elsewhere the
+default stays 0.
+---
+ src/nouveau/vulkan/nvk_cmd_pool.c          |  3 ++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  7 +++---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 25 ++++++++++++++++------
+ 3 files changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_pool.c b/src/nouveau/vulkan/nvk_cmd_pool.c
+index b6100aa..23b8895 100644
+--- a/src/nouveau/vulkan/nvk_cmd_pool.c
++++ b/src/nouveau/vulkan/nvk_cmd_pool.c
+@@ -98,7 +98,8 @@ nvk_cmd_mem_create(struct nvk_cmd_pool *pool, bool force_gart, bool latency,
+    uint32_t flags = force_gart ? NVKMD_MEM_GART
+                                : NVKMD_MEM_LOCAL | NVKMD_MEM_CPU_WRITE_ONLY;
+    /* Latency-bound upload memory (compute root descriptors): on RM it goes
+-    * to VRAM through BAR1 with NVK_RM_UPLOAD_VRAM=compute.
++    * to VRAM through BAR1 with NVK_RM_UPLOAD_VRAM=compute (the default on
++    * Windows).
+     */
+    if (latency)
+       flags |= NVKMD_MEM_GPU_LATENCY;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 68ce1a5..c765ffc 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -332,15 +332,16 @@ struct nvkmd_rm_dev {
+    bool sysmem_cached_desc;
+    bool sysmem_cached_app;
+    /* NVK_RM_DESC_TABLE_VRAM=1 / NVK_RM_UPLOAD_VRAM=1 (default off: in CS2
+-    * on 405.11 they cost ~10 fps against GPU-cached system memory): descriptor
++    * on 405.11 they cost ~10 fps against GPU-cached system memory; the
++    * compute root tables alone are NVK_RM_UPLOAD_VRAM=compute): descriptor
+     * memory (texture and sampler header tables, descriptor pools) and
+     * command buffer upload memory live in CPU-mapped VRAM (the BAR heap)
+     * instead of system memory the GPU reads across PCIe.
+     */
+    bool desc_vram;
+    /* NVK_RM_UPLOAD_VRAM: which command buffer upload memory is CPU-mapped
+-    * VRAM.  _NONE (0) is the default.  NVKMD_RM_UPLOAD_VRAM_COMPUTE
+-    * ("compute"): only
++    * VRAM.  NVKMD_RM_UPLOAD_VRAM_COMPUTE ("compute", the default on
++    * Windows; _NONE (0) elsewhere): only
+     * latency-bound upload memory (NVKMD_MEM_GPU_LATENCY, a compute
+     * dispatch's root descriptor table, which the dispatch waits for: from
+     * system memory each serial dispatch costs a few us more, 9.6 against
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 8ccfb2d..fc1f45e 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -167,14 +167,27 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    }
+    dev->desc_vram = debug_get_bool_option("NVK_RM_DESC_TABLE_VRAM", false);
+    {
+-      /* NVK_RM_UPLOAD_VRAM=0 (default, none) / compute / 1 (all).  Not on
+-       * by default: Steel Nomad (D3D12) scored 1905 with compute, 5252
+-       * without.  A new command pool's first latency block is a VRAM
+-       * allocation plus a BAR1 map, both host round trips (~1 ms per pool in
+-       * d3d12_gpu_bound's "record new allocators").
++      /* NVK_RM_UPLOAD_VRAM=compute (the default on Windows) / 0 (none, the
++       * default elsewhere) / 1 (all).  With compute, a dispatch's root
++       * descriptor table, which the dispatch waits for, is read from VRAM
++       * instead of across PCIe and the guest's IOMMU: tiny back-to-back
++       * dispatches take 0.48 us each on an RTX 5090, as with NVIDIA's
++       * driver, against 2.5-3.7 us from system memory (Conduit's
++       * guest/nvk-rm/tests/perf/dispatch-bench).  A new command pool's first
++       * latency block is a VRAM allocation plus a BAR1 map, both host round
++       * trips; the device's command memory cache (NVK_CMD_MEM_CACHE) hands
++       * blocks of destroyed pools to new ones, so D3D12 command allocators
++       * created per frame reuse them.
+        */
++#ifdef _WIN32
++      const uint8_t upload_vram_dflt = NVKMD_RM_UPLOAD_VRAM_COMPUTE;
++#else
++      const uint8_t upload_vram_dflt = NVKMD_RM_UPLOAD_VRAM_NONE;
++#endif
+       const char *u = os_get_option("NVK_RM_UPLOAD_VRAM");
+-      if (u != NULL && strcmp(u, "compute") == 0)
++      if (u == NULL || u[0] == '\0')
++         dev->upload_vram = upload_vram_dflt;
++      else if (strcmp(u, "compute") == 0)
+          dev->upload_vram = NVKMD_RM_UPLOAD_VRAM_COMPUTE;
+       else if (debug_get_bool_option("NVK_RM_UPLOAD_VRAM", false))
+          dev->upload_vram = NVKMD_RM_UPLOAD_VRAM_ALL;
+-- 
+2.43.0
+

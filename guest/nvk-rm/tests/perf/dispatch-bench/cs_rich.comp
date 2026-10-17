@@ -1,0 +1,15 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// vkd3d-ish variant: root constants as push constants, UAV/SRV as storage buffers, CBV as uniform buffer.
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint K = 1u;
+layout(push_constant) uniform PC { uvec4 rc0; uvec4 rc1; } pc;
+layout(std430, set = 0, binding = 0) buffer Out { uint v[]; } o;
+layout(std430, set = 0, binding = 1) readonly buffer In { uint v[]; } i;
+layout(std140, set = 0, binding = 2) uniform CB { uvec4 c; } cb;
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        uint idx = (gl_WorkGroupID.x + pc.rc0.x) & 4095u;
+        o.v[idx] = i.v[pc.rc0.y & 1023u] + cb.c.x + pc.rc1.w + K;
+    }
+}

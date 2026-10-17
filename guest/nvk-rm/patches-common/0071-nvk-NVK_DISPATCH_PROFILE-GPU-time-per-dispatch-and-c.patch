@@ -1,0 +1,1136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 22:46:31 +0200
+Subject: [PATCH] nvk: NVK_DISPATCH_PROFILE, GPU time per dispatch and compute
+ shader
+
+NVK_PASS_PROFILE times runs of dispatches outside render passes but cannot
+say which compute shaders take the time.  NVK_DISPATCH_PROFILE=1 (alone or
+with NVK_PASS_PROFILE) puts a compute-class report behind a WAIT_FOR_IDLE
+right before and right after every launch -- vkCmdDispatch,
+vkCmdDispatchBase, vkCmdDispatchIndirect, the driver's own dispatches, and
+each vkCmdExecuteGeneratedCommandsEXT of compute commands as a whole -- in
+the pass profile's ring, harvest thread and file (NVK_PASS_PROFILE_FILE,
+else %ProgramData%\Helios\nvk-pass-<pid>.txt on Windows).
+
+Each sample is keyed by the shader's source hash, its code hash and its
+workgroup size.  The source hash (vk_shader::src_hash, set by the common
+compute pipeline and shader object code) is the 16-digit hash in the
+SPIR-V's OpString "<hash>.dxil", which vkd3d-proton writes into every DXIL
+shader and uses to name its VKD3D_SHADER_DUMP_PATH files, else FNV-1a 64
+of the SPIR-V.  The code hash is the one NVK_SHADER_STATS prints.  Direct
+dispatches record their grid; indirect ones have their arguments copied by
+the compute engine (the I2M copy that patches the QMD) into a mapped buffer
+before they launch.
+
+Every two seconds a table, heaviest first: GPU ms/s, share of all dispatch
+time, calls/s, mean, median and maximum us per call, the shader's GPRs,
+warps per SM, instructions, static cycles, spills, SLM and shared memory,
+the most common grids and the workgroup count range, and the indirect,
+device-generated and meta-operation calls.
+
+The waits serialize the dispatches, so the frame is slower than without
+the profile; the numbers are for attributing time to shaders.  The reports
+use the compute class only, so command buffers of the async compute family
+stay on their compute-only channel; their dispatches are timed there, next
+to the graphics queue's work (NVK_RM_ASYNC_COMPUTE=0 times them on the
+graphics channel alone).
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h   |   2 +
+ src/nouveau/vulkan/nvk_cmd_dispatch.c |  41 ++
+ src/nouveau/vulkan/nvk_cmd_indirect.c |  15 +
+ src/nouveau/vulkan/nvk_device.h       |   4 +-
+ src/nouveau/vulkan/nvk_pass_profile.c | 550 ++++++++++++++++++++++++--
+ src/nouveau/vulkan/nvk_pass_profile.h |  22 ++
+ src/nouveau/vulkan/nvk_shader.h       |   5 +
+ src/vulkan/runtime/vk_pipeline.c      |   8 +
+ src/vulkan/runtime/vk_shader.c        |  54 ++-
+ src/vulkan/runtime/vk_shader.h        |  14 +
+ 10 files changed, 670 insertions(+), 45 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 830fedc..175db22 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -392,6 +392,8 @@ struct nvk_cmd_buffer {
+    bool pass_profile_buffers;
+    bool pass_profile_dump;
+    uint32_t pass_profile_dump_call;
++   /* NVK_DISPATCH_PROFILE: every dispatch is timed (nvk_pass_profile.c) */
++   bool dispatch_profile_on;
+    /* NVK_PASS_PROFILE=4: where the open pass's pushes start */
+    uint32_t pass_profile_hist_sig;
+    uint32_t pass_profile_hist_npushes;
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index 6f2874c..ea2d53a 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -341,6 +341,14 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+       P_INLINE_DATA(p, local_size);
+    }
+ 
++   int32_t prof_slot = -1;
++   if (unlikely(cmd->dispatch_profile_on)) {
++      prof_slot = nvk_dispatch_profile_alloc(cmd, cmd->state.cs.shader,
++                                             NVK_DISPATCH_PROFILE_DIRECT,
++                                             global_size, NULL);
++      nvk_dispatch_profile_begin(cmd, prof_slot);
++   }
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+    P_MTHD(p, NVA0C0, SEND_PCAS_A);
+    P_NVA0C0_SEND_PCAS_A(p, qmd_addr >> 8);
+@@ -354,6 +362,9 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+       P_IMMD(p, NVC6C0, SEND_SIGNALING_PCAS2_B,
+              PCAS_ACTION_INVALIDATE_COPY_SCHEDULE);
+    }
++
++   if (unlikely(prof_slot >= 0))
++      nvk_dispatch_profile_end(cmd, prof_slot);
+ }
+ 
+ void
+@@ -384,6 +395,14 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+                                  shader->info.crs_size);
+    }
+ 
++   int32_t prof_slot = -1;
++   if (unlikely(cmd->dispatch_profile_on) && shader != NULL) {
++      prof_slot = nvk_dispatch_profile_alloc(cmd, shader,
++                                             NVK_DISPATCH_PROFILE_INTERNAL,
++                                             group_count, NULL);
++      nvk_dispatch_profile_begin(cmd, prof_slot);
++   }
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+ 
+    /* Internal shaders don't want conditional rendering */
+@@ -403,6 +422,9 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+    }
+ 
+    P_IMMD(p, NVA0C0, SET_RENDER_ENABLE_OVERRIDE, MODE_USE_RENDER_ENABLE);
++
++   if (unlikely(prof_slot >= 0))
++      nvk_dispatch_profile_end(cmd, prof_slot);
+ }
+ 
+ void
+@@ -551,6 +573,22 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+          sizeof(uint16_t));
+    };
+ 
++   /* NVK_DISPATCH_PROFILE: the arguments copied for the profile the same
++    * way, then the report before the launch
++    */
++   int32_t prof_slot = -1;
++   if (unlikely(cmd->dispatch_profile_on)) {
++      uint64_t args_addr = 0;
++      prof_slot = nvk_dispatch_profile_alloc(cmd, cmd->state.cs.shader,
++                                             NVK_DISPATCH_PROFILE_INDIRECT,
++                                             NULL, &args_addr);
++      if (args_addr != 0) {
++         nvk_cmd_compute_indirect_copy(cmd, args_addr, dispatch_addr,
++                                       sizeof(VkDispatchIndirectCommand));
++      }
++      nvk_dispatch_profile_begin(cmd, prof_slot);
++   }
++
+    /* Finally we schedule the QMD */
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+    P_MTHD(p, NVA0C0, SEND_PCAS_A);
+@@ -564,4 +602,7 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+       P_IMMD(p, NVC6C0, SEND_SIGNALING_PCAS2_B,
+              PCAS_ACTION_INVALIDATE_COPY_SCHEDULE);
+    }
++
++   if (unlikely(prof_slot >= 0))
++      nvk_dispatch_profile_end(cmd, prof_slot);
+ }
+diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
+index 192da47..55d2c67 100644
+--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
+@@ -1214,6 +1214,18 @@ nvk_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
+    uint64_t addr = info->preprocessAddress;
+    uint64_t seq_count = info->maxSequenceCount;
+ 
++   /* NVK_DISPATCH_PROFILE: the generated dispatches timed as one */
++   int32_t prof_slot = -1;
++   if (unlikely(cmd->dispatch_profile_on) &&
++       (layout->stages & VK_SHADER_STAGE_COMPUTE_BIT)) {
++      prof_slot = nvk_dispatch_profile_alloc(cmd,
++                                             layout->set_stages == 0 ?
++                                             cmd->state.cs.shader : NULL,
++                                             NVK_DISPATCH_PROFILE_DGC,
++                                             NULL, NULL);
++      nvk_dispatch_profile_begin(cmd, prof_slot);
++   }
++
+    /* Break it into pices that are a multiple of cmd_seq_stride_B so that, if
+     * the kernel inserts a sync point between two of our pushes, it doesn't
+     * break a single command.
+@@ -1229,6 +1241,9 @@ nvk_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
+       seq_count -= push_seq;
+    }
+ 
++   if (unlikely(prof_slot >= 0))
++      nvk_dispatch_profile_end(cmd, prof_slot);
++
+    if (layout->set_stages != 0) {
+       if (layout->stages & NVK_SHADER_STAGE_GRAPHICS_BITS) {
+          cmd->state.gfx.shaders_dirty |= NVK_SHADER_STAGE_GRAPHICS_BITS;
+diff --git a/src/nouveau/vulkan/nvk_device.h b/src/nouveau/vulkan/nvk_device.h
+index 6dc8337..92d4385 100644
+--- a/src/nouveau/vulkan/nvk_device.h
++++ b/src/nouveau/vulkan/nvk_device.h
+@@ -50,7 +50,9 @@ struct nvk_device {
+ 
+    struct nvkmd_dev *nvkmd;
+ 
+-   /* NVK_PASS_PROFILE=1 (nvk_pass_profile.c), else NULL */
++   /* NVK_PASS_PROFILE or NVK_DISPATCH_PROFILE (nvk_pass_profile.c), else
++    * NULL
++    */
+    struct nvk_pass_profile *pass_profile;
+ 
+    struct nvk_upload_queue upload;
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.c b/src/nouveau/vulkan/nvk_pass_profile.c
+index 218eb14..463e95e 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.c
++++ b/src/nouveau/vulkan/nvk_pass_profile.c
+@@ -53,6 +53,36 @@
+  * The reports cost a little GPU time each (a flush of pending writes or a
+  * wait for idle, and a release); fine for finding a 10x, not for measuring
+  * 1 %.
++ *
++ * NVK_DISPATCH_PROFILE=1 (with or without NVK_PASS_PROFILE) times every
++ * dispatch: vkCmdDispatch, vkCmdDispatchBase and vkCmdDispatchIndirect in
++ * any command buffer on any queue (the async compute queue too), the
++ * dispatches the driver records for meta operations, and each
++ * vkCmdExecuteGeneratedCommandsEXT of compute commands as a whole.  A
++ * compute-class report goes right before the launch and another right
++ * after it, each behind a WAIT_FOR_IDLE, in the same ring and harvest as
++ * the passes.  Each sample is keyed by the compute shader: its source hash
++ * (vk_shader::src_hash, vkd3d-proton's DXIL hash -- the name of its
++ * VKD3D_SHADER_DUMP_PATH files -- else a hash of the SPIR-V), its code hash
++ * (the one NVK_SHADER_STATS prints) and its workgroup size.  A direct
++ * dispatch records its grid; an indirect one has its arguments copied by
++ * the compute engine into a mapped buffer just before it launches, so its
++ * grid is known too.  Every two seconds a table, heaviest first: GPU ms/s,
++ * share of all dispatch time, calls/s, mean, median and maximum us per
++ * call, the shader's registers, warps per SM, instructions, spills and
++ * local and shared memory, the most common grids and the range of
++ * workgroup counts.
++ *
++ * The waits serialize every dispatch: dispatches that would overlap on the
++ * GPU run one after another, each with the machine to itself (no tail of
++ * the previous one), so the frame gets slower and short dispatches look a
++ * little longer than they are.  Right for attributing time to shaders, not
++ * for the frame time.  On the async compute queue the time is the compute
++ * channel's own, with whatever graphics work runs next to it; set
++ * NVK_RM_ASYNC_COMPUTE=0 to time all dispatches on the graphics channel
++ * alone.  A secondary command buffer's dispatches have one slot each per
++ * recording, so a secondary executed several times between two harvests
++ * counts once.
+  */
+ #include "nvk_pass_profile.h"
+ 
+@@ -97,6 +127,11 @@
+ #define PROF_PAYLOAD    0x4e564b50u /* "NVKP" */
+ #define PROF_DUMP_MEM_B (4u << 20)
+ #define PROF_DUMP_PAYLOAD 0x504d5544u /* "DUMP" */
++#define PROF_DISP_SIGS    4096u
++#define PROF_DISP_SAMPLES 64u   /* durations kept per shader and window */
++#define PROF_DISP_GRIDS   4u
++#define PROF_DISP_LOG_TOP 80u
++#define PROF_ARGS_NONE    0xffffffffu
+ 
+ /* One report as the 3D or compute class or the copy engine writes it with a
+  * four-word structure: payload (or a counter's low 32 bits) and timestamp.
+@@ -166,6 +201,39 @@ struct prof_meta {
+    uint32_t sig;   /* index into sigs + 1, 0 = none (yet) */
+    uint32_t stat;  /* index into the stat ring + 1, 0 = none */
+    struct nvk_pass_profile_counts counts;
++   /* NVK_DISPATCH_PROFILE: index into disp_sigs + 1 (0: not a dispatch),
++    * the kind, whether a meta operation recorded it, and the grid of a
++    * direct dispatch
++    */
++   uint32_t disp;
++   uint8_t disp_kind;
++   bool disp_meta;
++   uint32_t grid[3];
++};
++
++/* NVK_DISPATCH_PROFILE: one compute shader (and workgroup size) */
++struct prof_disp_grid {
++   uint32_t g[3];
++   uint64_t count;
++};
++
++struct prof_disp_sig {
++   char key[64];
++   uint64_t src_hash;
++   uint32_t code_hash;
++   uint32_t local[3];
++   uint32_t gprs, warps, instrs, spills, slm, smem;
++   uint64_t cycles;
++   /* The window (harvest thread) */
++   uint64_t gpu_ns, count;
++   uint64_t ind_count, ind_read, dgc_count, meta_count;
++   uint64_t known, groups_min, groups_max;
++   uint64_t max_ns;
++   uint32_t nsamples;
++   uint32_t samples[PROF_DISP_SAMPLES];
++   struct prof_disp_grid grids[PROF_DISP_GRIDS];
++   uint32_t ngrids;
++   uint64_t grids_evicted;
+ };
+ 
+ /* NVK_PASS_PROFILE=4: the methods recorded in a render pass, per
+@@ -292,6 +360,19 @@ struct nvk_pass_profile {
+    } dump_recs[1024];
+    uint32_t dump_rec_count;
+ 
++   /* NVK_DISPATCH_PROFILE: shaders (recording threads, prof->mutex),
++    * indirect arguments per slot (4 words), the reservoir's random state
++    * (harvest thread)
++    */
++   bool dispatch;
++   struct hash_table *disp_ht;
++   struct prof_disp_sig *disp_sigs;   /* PROF_DISP_SIGS */
++   uint32_t disp_sig_count;
++   uint64_t disp_dropped, disp_dropped_window;
++   struct nvkmd_mem *args_mem;
++   uint32_t *args;
++   uint64_t rng;
++
+    /* The harvest thread (every PROF_HARVEST_MS, a log line every
+     * PROF_LOG_NS), independent of submits and frames.
+     */
+@@ -385,6 +466,11 @@ prof_open_file(char *path, size_t size)
+ static void
+ prof_free(struct nvk_pass_profile *prof)
+ {
++   if (prof->args_mem != NULL)
++      nvkmd_mem_unref(prof->args_mem);
++   if (prof->disp_ht != NULL)
++      _mesa_hash_table_destroy(prof->disp_ht, NULL);
++   free(prof->disp_sigs);
+    if (prof->dump_mem != NULL)
+       nvkmd_mem_unref(prof->dump_mem);
+    free(prof->dump_text);
+@@ -407,20 +493,31 @@ void
+ nvk_pass_profile_init(struct nvk_device *dev)
+ {
+    const unsigned level = debug_get_num_option("NVK_PASS_PROFILE", 0);
+-   if (level == 0)
++   const bool dispatch = debug_get_bool_option("NVK_DISPATCH_PROFILE", false);
++   if (level == 0 && !dispatch)
+       return;
+ 
+    struct nvk_pass_profile *prof = calloc(1, sizeof(*prof));
+    if (prof == NULL)
+       return;
+    prof->level = level;
++   prof->dispatch = dispatch;
++   prof->rng = 0x9e3779b97f4a7c15ull;
+    prof->meta = calloc(PROF_SLOTS, sizeof(*prof->meta));
+    prof->sigs = calloc(PROF_SIGS, sizeof(*prof->sigs));
+    prof->sig_ht = _mesa_hash_table_create(NULL, _mesa_hash_string,
+                                           _mesa_key_string_equal);
++   bool disp_ok = true;
++   if (dispatch) {
++      prof->disp_sigs = calloc(PROF_DISP_SIGS, sizeof(*prof->disp_sigs));
++      prof->disp_ht = _mesa_hash_table_create(NULL, _mesa_hash_string,
++                                              _mesa_key_string_equal);
++      disp_ok = prof->disp_sigs != NULL && prof->disp_ht != NULL;
++   }
+ 
+    VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+-   if (prof->meta != NULL && prof->sigs != NULL && prof->sig_ht != NULL) {
++   if (prof->meta != NULL && prof->sigs != NULL && prof->sig_ht != NULL &&
++       disp_ok) {
+       result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
+                                           PROF_SLOTS * sizeof(struct prof_slot_gpu),
+                                           0, NVKMD_MEM_GART,
+@@ -448,6 +545,18 @@ nvk_pass_profile_init(struct nvk_device *dev)
+    }
+    prof->gpu = prof->mem->map;
+    memset(prof->gpu, 0, PROF_SLOTS * sizeof(struct prof_slot_gpu));
++   if (dispatch) {
++      /* Without it indirect dispatches have no grid */
++      if (nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
++                                     PROF_SLOTS * 4 * sizeof(uint32_t),
++                                     0, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,
++                                     &prof->args_mem) != VK_SUCCESS) {
++         prof->args_mem = NULL;
++      } else {
++         prof->args = prof->args_mem->map;
++         memset(prof->args, 0xff, PROF_SLOTS * 4 * sizeof(uint32_t));
++      }
++   }
+    if (level >= 5) {
+       if (nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base, PROF_DUMP_MEM_B,
+                                      0, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,
+@@ -473,10 +582,20 @@ nvk_pass_profile_init(struct nvk_device *dev)
+    char path[512] = "";
+    prof->file = prof_open_file(path, sizeof(path));
+    dev->pass_profile = prof;
+-   prof_log(prof, "NVK pass profile: level %u on for device %p (%u slots, "
+-            "%u signatures%s), file %s", level, (void *)dev, PROF_SLOTS,
+-            PROF_SIGS, prof->stat_mem != NULL ? ", pass counters" : "",
+-            prof->file != NULL ? path : "(none: no writable folder)");
++   if (level > 0) {
++      prof_log(prof, "NVK pass profile: level %u on for device %p (%u slots, "
++               "%u signatures%s), file %s", level, (void *)dev, PROF_SLOTS,
++               PROF_SIGS, prof->stat_mem != NULL ? ", pass counters" : "",
++               prof->file != NULL ? path : "(none: no writable folder)");
++   }
++   if (dispatch) {
++      prof_log(prof, "NVK dispatch profile: on for device %p (%u slots, %u "
++               "shaders, indirect arguments %s), file %s; every dispatch "
++               "waits for idle before and after it", (void *)dev,
++               PROF_SLOTS, PROF_DISP_SIGS,
++               prof->args != NULL ? "read back" : "not read (no memory)",
++               prof->file != NULL ? path : "(none: no writable folder)");
++   }
+    if (prof->file != NULL)
+       fflush(prof->file);
+    if (mtx_init(&prof->stop_mutex, mtx_plain) == thrd_success &&
+@@ -579,21 +698,27 @@ prof_describe_att(char *buf, size_t size, const char *what,
+ /* A timestamped report at addr, on the engine that ran the last method, so
+  * it is written after the preceding work on that engine has finished.
+  */
++static void
++prof_emit_report_compute(struct nvk_cmd_buffer *cmd, uint64_t addr)
++{
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
++   P_IMMD(p, NV90C0, WAIT_FOR_IDLE, 0);
++   P_MTHD(p, NV90C0, SET_REPORT_SEMAPHORE_A);
++   P_NV90C0_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
++   P_NV90C0_SET_REPORT_SEMAPHORE_B(p, addr);
++   P_NV90C0_SET_REPORT_SEMAPHORE_C(p, PROF_PAYLOAD);
++   P_NV90C0_SET_REPORT_SEMAPHORE_D(p, {
++      .operation = OPERATION_RELEASE,
++      .structure_size = STRUCTURE_SIZE_FOUR_WORDS,
++   });
++}
++
+ static void
+ prof_emit_report(struct nvk_cmd_buffer *cmd, uint64_t addr)
+ {
+    const uint8_t subc = nvk_cmd_buffer_last_subchannel(cmd);
+    if (subc == SUBC_NV90C0) {
+-      struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
+-      P_IMMD(p, NV90C0, WAIT_FOR_IDLE, 0);
+-      P_MTHD(p, NV90C0, SET_REPORT_SEMAPHORE_A);
+-      P_NV90C0_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
+-      P_NV90C0_SET_REPORT_SEMAPHORE_B(p, addr);
+-      P_NV90C0_SET_REPORT_SEMAPHORE_C(p, PROF_PAYLOAD);
+-      P_NV90C0_SET_REPORT_SEMAPHORE_D(p, {
+-         .operation = OPERATION_RELEASE,
+-         .structure_size = STRUCTURE_SIZE_FOUR_WORDS,
+-      });
++      prof_emit_report_compute(cmd, addr);
+    } else if (subc == SUBC_NV90B5) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 9);
+       P_MTHD(p, NV90B5, SET_SEMAPHORE_A);
+@@ -650,6 +775,7 @@ prof_begin(struct nvk_cmd_buffer *cmd, const char *name, enum prof_kind kind)
+       prof->next = (prof->next + 1) % PROF_SLOTS;
+       prof->meta[slot].sig = name != NULL ? sig : 0;
+       prof->meta[slot].stat = 0;
++      prof->meta[slot].disp = 0;
+       memset(&prof->meta[slot].counts, 0, sizeof(prof->meta[slot].counts));
+    } else {
+       prof->dropped++;
+@@ -744,8 +870,7 @@ void
+ nvk_pass_profile_op(struct nvk_cmd_buffer *cmd, enum nvk_pass_profile_op op,
+                     uint64_t groups)
+ {
+-   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+-   if (likely(dev->pass_profile == NULL))
++   if (likely(!cmd->pass_profile_on))
+       return;
+    /* Inside a render pass it is the pass's; inside a meta operation the
+     * operation's.  Secondaries are timed as a whole by their primary.
+@@ -768,6 +893,130 @@ nvk_pass_profile_op(struct nvk_cmd_buffer *cmd, enum nvk_pass_profile_op op,
+    cmd->pass_profile_op_slot = prof_begin(cmd, NULL, PROF_KIND_OP);
+ }
+ 
++/* NVK_DISPATCH_PROFILE: with prof->mutex held, the shader's signature + 1,
++ * 0 when the table is full
++ */
++static uint32_t
++prof_disp_sig_locked(struct nvk_pass_profile *prof, const char *key,
++                     const struct nvk_shader *sh, uint64_t src_hash,
++                     uint32_t code_hash)
++{
++   struct hash_entry *he = _mesa_hash_table_search(prof->disp_ht, key);
++   if (he != NULL)
++      return (uint32_t)(uintptr_t)he->data;
++   if (prof->disp_sig_count == PROF_DISP_SIGS)
++      return 0;
++   struct prof_disp_sig *d = &prof->disp_sigs[prof->disp_sig_count];
++   snprintf(d->key, sizeof(d->key), "%s", key);
++   d->src_hash = src_hash;
++   d->code_hash = code_hash;
++   if (sh != NULL) {
++      const struct nak_shader_info *i = &sh->info;
++      for (unsigned c = 0; c < 3; c++)
++         d->local[c] = i->cs.local_size[c];
++      d->gprs = i->num_gprs;
++      d->warps = i->max_warps_per_sm;
++      d->instrs = i->num_instrs;
++      d->cycles = i->num_static_cycles;
++      d->spills = i->num_spills_to_mem + i->num_fills_from_mem;
++      d->slm = i->slm_size;
++      d->smem = i->cs.smem_size;
++   }
++   d->groups_min = UINT64_MAX;
++   /* Published to the harvest thread with the count */
++   p_atomic_set(&prof->disp_sig_count, prof->disp_sig_count + 1);
++   _mesa_hash_table_insert(prof->disp_ht, d->key,
++                           (void *)(uintptr_t)prof->disp_sig_count);
++   return prof->disp_sig_count;
++}
++
++int32_t
++nvk_dispatch_profile_alloc(struct nvk_cmd_buffer *cmd,
++                           struct nvk_shader *shader,
++                           enum nvk_dispatch_profile_kind kind,
++                           const uint32_t *groups,
++                           uint64_t *args_addr_out)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_pass_profile *prof = dev->pass_profile;
++   if (args_addr_out != NULL)
++      *args_addr_out = 0;
++
++   /* The key once per shader: the code hash reads all of its code */
++   uint32_t ds = shader != NULL ? p_atomic_read(&shader->dispatch_profile_sig) : 0;
++   char key[64] = "";
++   uint64_t src_hash = 0;
++   uint32_t code_hash = 0;
++   if (ds == 0) {
++      if (shader != NULL) {
++         src_hash = shader->vk.src_hash;
++         code_hash = shader->code_size > 0 ?
++            _mesa_hash_data(shader->code_ptr, shader->code_size) : 0;
++         snprintf(key, sizeof(key), "%016" PRIx64 " %08x %ux%ux%u", src_hash,
++                  code_hash, shader->info.cs.local_size[0],
++                  shader->info.cs.local_size[1],
++                  shader->info.cs.local_size[2]);
++      } else {
++         snprintf(key, sizeof(key), "execution set");
++      }
++   }
++
++   simple_mtx_lock(&prof->mutex);
++   if (ds == 0)
++      ds = prof_disp_sig_locked(prof, key, shader, src_hash, code_hash);
++   uint32_t slot = 0;
++   if (ds != 0) {
++      slot = prof->next;
++      prof->next = (prof->next + 1) % PROF_SLOTS;
++      struct prof_meta *m = &prof->meta[slot];
++      m->sig = 0;
++      m->stat = 0;
++      m->disp = ds;
++      m->disp_kind = kind;
++      m->disp_meta = cmd->pass_profile_internal > 0;
++      for (unsigned c = 0; c < 3; c++)
++         m->grid[c] = groups != NULL ? groups[c] : 0;
++   } else {
++      prof->disp_dropped++;
++      prof->disp_dropped_window++;
++   }
++   simple_mtx_unlock(&prof->mutex);
++   if (ds == 0)
++      return -1;
++   if (shader != NULL)
++      p_atomic_set(&shader->dispatch_profile_sig, ds);
++
++   if (kind == NVK_DISPATCH_PROFILE_INDIRECT && prof->args != NULL &&
++       args_addr_out != NULL) {
++      uint32_t *a = &prof->args[slot * 4];
++      a[0] = a[1] = a[2] = PROF_ARGS_NONE;
++      *args_addr_out = prof->args_mem->va->addr + slot * 4 * sizeof(uint32_t);
++   }
++   return (int32_t)slot;
++}
++
++/* On the compute class whatever ran last: the launch is a compute method,
++ * and a command buffer of the async compute family stays on the channel
++ * with the compute engine alone.
++ */
++void
++nvk_dispatch_profile_begin(struct nvk_cmd_buffer *cmd, int32_t slot)
++{
++   if (slot < 0)
++      return;
++   struct nvk_pass_profile *prof = nvk_cmd_buffer_device(cmd)->pass_profile;
++   prof_emit_report_compute(cmd, prof_slot_addr(prof, slot, false));
++}
++
++void
++nvk_dispatch_profile_end(struct nvk_cmd_buffer *cmd, int32_t slot)
++{
++   if (slot < 0)
++      return;
++   struct nvk_pass_profile *prof = nvk_cmd_buffer_device(cmd)->pass_profile;
++   prof_emit_report_compute(cmd, prof_slot_addr(prof, slot, true));
++}
++
+ /* The placement of the memory whose own VA holds addr: buffers are bound
+  * at their memory's VA plus an offset (nvk_buffer.c).  0 VRAM, 1 BAR heap,
+  * 2 system memory, 3 not found.
+@@ -1166,7 +1415,7 @@ nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd,
+ {
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    struct nvk_pass_profile *prof = dev->pass_profile;
+-   if (likely(prof == NULL))
++   if (likely(!cmd->pass_profile_on))
+       return;
+ 
+    const struct nvk_rendering_state *render = &cmd->state.gfx.render;
+@@ -1234,8 +1483,7 @@ nvk_pass_profile_begin_pass(struct nvk_cmd_buffer *cmd,
+ void
+ nvk_pass_profile_end_pass(struct nvk_cmd_buffer *cmd)
+ {
+-   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+-   if (likely(dev->pass_profile == NULL))
++   if (likely(!cmd->pass_profile_on))
+       return;
+    if ((cmd->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT) ||
+        cmd->pass_profile_internal > 0 || !cmd->pass_profile_in_pass)
+@@ -1256,12 +1504,14 @@ nvk_pass_profile_end_pass(struct nvk_cmd_buffer *cmd)
+ void
+ nvk_pass_profile_reset_cmd(struct nvk_cmd_buffer *cmd)
+ {
+-   cmd->pass_profile_on = nvk_cmd_buffer_device(cmd)->pass_profile != NULL;
++   const struct nvk_pass_profile *prof =
++      nvk_cmd_buffer_device(cmd)->pass_profile;
++   cmd->pass_profile_on = prof != NULL && prof->level > 0;
++   cmd->dispatch_profile_on = prof != NULL && prof->dispatch;
+    cmd->pass_profile_hist_sig = 0;
+    cmd->pass_profile_hist_start = NULL;
+    cmd->pass_profile_dump = false;
+-   cmd->pass_profile_buffers = cmd->pass_profile_on &&
+-      nvk_cmd_buffer_device(cmd)->pass_profile->level >= 4;
++   cmd->pass_profile_buffers = cmd->pass_profile_on && prof->level >= 4;
+    cmd->pass_profile_slot = -1;
+    cmd->pass_profile_cmd_slot = -1;
+    cmd->pass_profile_op_slot = -1;
+@@ -1282,8 +1532,7 @@ nvk_pass_profile_reset_cmd(struct nvk_cmd_buffer *cmd)
+ void
+ nvk_pass_profile_begin_cmd(struct nvk_cmd_buffer *cmd)
+ {
+-   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+-   if (likely(dev->pass_profile == NULL) ||
++   if (likely(!cmd->pass_profile_on) ||
+        cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
+        !(nvk_cmd_buffer_queue_flags(cmd) & VK_QUEUE_GRAPHICS_BIT))
+       return;
+@@ -1294,8 +1543,7 @@ nvk_pass_profile_begin_cmd(struct nvk_cmd_buffer *cmd)
+ void
+ nvk_pass_profile_end_cmd(struct nvk_cmd_buffer *cmd)
+ {
+-   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+-   if (likely(dev->pass_profile == NULL))
++   if (likely(!cmd->pass_profile_on))
+       return;
+    prof_end_op_run(cmd);
+    prof_end(cmd, cmd->pass_profile_cmd_slot, &cmd->pass_profile_cmd_counts);
+@@ -1312,8 +1560,7 @@ int32_t
+ nvk_pass_profile_begin_secondary(struct nvk_cmd_buffer *cmd,
+                                  const struct nvk_cmd_buffer *other)
+ {
+-   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+-   if (likely(dev->pass_profile == NULL))
++   if (likely(!cmd->pass_profile_on))
+       return -1;
+    prof_end_op_run(cmd);
+    /* Power-of-two draw buckets keep the signature count bounded */
+@@ -1359,8 +1606,7 @@ nvk_pass_profile_end_secondary(struct nvk_cmd_buffer *cmd,
+                                const struct nvk_cmd_buffer *other,
+                                int32_t slot)
+ {
+-   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+-   if (likely(dev->pass_profile == NULL))
++   if (likely(!cmd->pass_profile_on))
+       return;
+    prof_counts_add(&cmd->pass_profile_pass_counts,
+                    &other->pass_profile_cmd_counts);
+@@ -1489,6 +1735,214 @@ prof_log_sig(struct nvk_pass_profile *prof, const struct prof_sig *s,
+    }
+ }
+ 
++/* NVK_DISPATCH_PROFILE: one sample (harvest thread, totals_mutex) */
++static void
++prof_disp_add(struct nvk_pass_profile *prof, const struct prof_meta *m,
++              uint32_t slot, uint64_t ns)
++{
++   const uint32_t ds = m->disp;
++   if (ds > p_atomic_read(&prof->disp_sig_count))
++      return;
++   struct prof_disp_sig *d = &prof->disp_sigs[ds - 1];
++   d->gpu_ns += ns;
++   d->count++;
++   d->max_ns = MAX2(d->max_ns, ns);
++   d->meta_count += m->disp_meta;
++
++   /* Reservoir sample of the durations, for the median */
++   const uint32_t ns32 = (uint32_t)MIN2(ns, UINT32_MAX);
++   if (d->nsamples < PROF_DISP_SAMPLES) {
++      d->samples[d->nsamples++] = ns32;
++   } else {
++      prof->rng ^= prof->rng << 13;
++      prof->rng ^= prof->rng >> 7;
++      prof->rng ^= prof->rng << 17;
++      const uint64_t j = prof->rng % d->count;
++      if (j < PROF_DISP_SAMPLES)
++         d->samples[j] = ns32;
++   }
++
++   uint32_t g[3];
++   bool known = false;
++   switch (m->disp_kind) {
++   case NVK_DISPATCH_PROFILE_DIRECT:
++   case NVK_DISPATCH_PROFILE_INTERNAL:
++      memcpy(g, m->grid, sizeof(g));
++      known = true;
++      break;
++   case NVK_DISPATCH_PROFILE_INDIRECT:
++      d->ind_count++;
++      if (prof->args != NULL) {
++         volatile uint32_t *a = &prof->args[slot * 4];
++         if (a[0] != PROF_ARGS_NONE) {
++            g[0] = a[0];
++            g[1] = a[1];
++            g[2] = a[2];
++            known = true;
++            d->ind_read++;
++         }
++      }
++      break;
++   case NVK_DISPATCH_PROFILE_DGC:
++      d->dgc_count++;
++      break;
++   }
++   if (!known)
++      return;
++
++   const uint64_t groups = (uint64_t)g[0] * g[1] * g[2];
++   d->known++;
++   d->groups_min = MIN2(d->groups_min, groups);
++   d->groups_max = MAX2(d->groups_max, groups);
++   /* The most common grids, approximately: a full table gives its least
++    * common entry's place to the new grid
++    */
++   uint32_t least = 0;
++   for (uint32_t k = 0; k < d->ngrids; k++) {
++      if (memcmp(d->grids[k].g, g, sizeof(g)) == 0) {
++         d->grids[k].count++;
++         return;
++      }
++      if (d->grids[k].count < d->grids[least].count)
++         least = k;
++   }
++   if (d->ngrids < PROF_DISP_GRIDS) {
++      least = d->ngrids++;
++   } else {
++      d->grids_evicted += d->grids[least].count;
++   }
++   memcpy(d->grids[least].g, g, sizeof(g));
++   d->grids[least].count = 1;
++}
++
++static int
++prof_u32_cmp(const void *a, const void *b)
++{
++   const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
++   return x < y ? -1 : x > y ? 1 : 0;
++}
++
++static int
++prof_disp_grid_cmp(const void *a, const void *b)
++{
++   const struct prof_disp_grid *x = a, *y = b;
++   return x->count < y->count ? 1 : x->count > y->count ? -1 : 0;
++}
++
++static const struct prof_disp_sig *prof_disp_sort_base;
++
++static int
++prof_disp_idx_cmp(const void *a, const void *b)
++{
++   const struct prof_disp_sig *x = &prof_disp_sort_base[*(const uint32_t *)a];
++   const struct prof_disp_sig *y = &prof_disp_sort_base[*(const uint32_t *)b];
++   return x->gpu_ns < y->gpu_ns ? 1 : x->gpu_ns > y->gpu_ns ? -1 : 0;
++}
++
++/* NVK_DISPATCH_PROFILE: the window's table, heaviest shader first, then
++ * the window reset (harvest thread, totals_mutex)
++ */
++static void
++prof_disp_log(struct nvk_pass_profile *prof, double window_s, bool final)
++{
++   const uint32_t n = p_atomic_read(&prof->disp_sig_count);
++   uint64_t total_ns = 0, total_n = 0;
++   uint32_t active = 0;
++   for (uint32_t i = 0; i < n; i++) {
++      if (prof->disp_sigs[i].count == 0)
++         continue;
++      active++;
++      total_ns += prof->disp_sigs[i].gpu_ns;
++      total_n += prof->disp_sigs[i].count;
++   }
++   simple_mtx_lock(&prof->mutex);
++   const uint64_t dropped = prof->disp_dropped;
++   const uint64_t dropped_window = prof->disp_dropped_window;
++   prof->disp_dropped_window = 0;
++   simple_mtx_unlock(&prof->mutex);
++
++   prof_log(prof, "NVK dispatch profile: window %" PRIu64 "%s, %.2f s, %"
++            PRIu64 " dispatches (%.1f/s), %.3f GPU ms/s in dispatches, %u "
++            "of %u shaders active, %" PRIu64 " dropped (%" PRIu64 " in all)",
++            prof->windows, final ? " (final)" : "", window_s, total_n,
++            total_n / window_s, total_ns / 1e6 / window_s, active, n,
++            dropped_window, dropped);
++
++   uint32_t *order = active > 0 ? malloc(active * sizeof(*order)) : NULL;
++   if (order != NULL) {
++      uint32_t k = 0;
++      for (uint32_t i = 0; i < n; i++) {
++         if (prof->disp_sigs[i].count > 0)
++            order[k++] = i;
++      }
++      prof_disp_sort_base = prof->disp_sigs;
++      qsort(order, active, sizeof(*order), prof_disp_idx_cmp);
++
++      uint64_t rest_ns = 0, rest_n = 0;
++      for (uint32_t r = 0; r < active; r++) {
++         struct prof_disp_sig *d = &prof->disp_sigs[order[r]];
++         if (r >= PROF_DISP_LOG_TOP) {
++            rest_ns += d->gpu_ns;
++            rest_n += d->count;
++            continue;
++         }
++         qsort(d->samples, d->nsamples, sizeof(d->samples[0]), prof_u32_cmp);
++         const double p50 = d->nsamples > 0 ?
++                            d->samples[d->nsamples / 2] / 1e3 : 0.0;
++
++         char grids[160] = "-";
++         if (d->known > 0) {
++            qsort(d->grids, d->ngrids, sizeof(d->grids[0]), prof_disp_grid_cmp);
++            int len = 0;
++            for (uint32_t g = 0; g < d->ngrids && g < 3 &&
++                                 len < (int)sizeof(grids); g++) {
++               len += snprintf(grids + len, sizeof(grids) - len, "%s%ux%ux%u:%.0f%%",
++                               g > 0 ? "," : "", d->grids[g].g[0],
++                               d->grids[g].g[1], d->grids[g].g[2],
++                               100.0 * d->grids[g].count / d->known);
++            }
++            if ((d->ngrids > 3 || d->grids_evicted > 0) &&
++                len < (int)sizeof(grids))
++               snprintf(grids + len, sizeof(grids) - len, ",+");
++         }
++         char groups[64] = "-";
++         if (d->known > 0)
++            snprintf(groups, sizeof(groups), "%" PRIu64 "..%" PRIu64,
++                     d->groups_min, d->groups_max);
++
++         prof_log(prof, "NVK dispatch profile: %8.3f ms/s %5.1f%% %8.1f calls/s "
++                  "%8.2f us/call p50 %8.2f max %8.2f | src %016" PRIx64
++                  " code %08x local %ux%ux%u gprs %u warps %u instrs %u cycles %"
++                  PRIu64 " spills %u slm %u smem %u | grid %s groups %s | "
++                  "ind %" PRIu64 "/%" PRIu64 " dgc %" PRIu64 " meta %" PRIu64,
++                  d->gpu_ns / 1e6 / window_s,
++                  total_ns > 0 ? 100.0 * d->gpu_ns / total_ns : 0.0,
++                  d->count / window_s, d->gpu_ns / 1e3 / d->count, p50,
++                  d->max_ns / 1e3, d->src_hash, d->code_hash, d->local[0],
++                  d->local[1], d->local[2], d->gprs, d->warps, d->instrs,
++                  d->cycles, d->spills, d->slm, d->smem, grids, groups,
++                  d->ind_count, d->ind_read, d->dgc_count, d->meta_count);
++      }
++      if (rest_n > 0) {
++         prof_log(prof, "NVK dispatch profile: %8.3f ms/s %5.1f%% %8.1f calls/s "
++                  "in the %u other shaders", rest_ns / 1e6 / window_s,
++                  total_ns > 0 ? 100.0 * rest_ns / total_ns : 0.0,
++                  rest_n / window_s, active - PROF_DISP_LOG_TOP);
++      }
++      free(order);
++   }
++
++   for (uint32_t i = 0; i < n; i++) {
++      struct prof_disp_sig *d = &prof->disp_sigs[i];
++      d->gpu_ns = d->count = 0;
++      d->ind_count = d->ind_read = d->dgc_count = d->meta_count = 0;
++      d->known = d->groups_max = d->max_ns = 0;
++      d->groups_min = UINT64_MAX;
++      d->nsamples = d->ngrids = 0;
++      d->grids_evicted = 0;
++   }
++}
++
+ static void
+ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+ {
+@@ -1502,6 +1956,11 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+       s->end.payload = 0;
+       s->begin.payload = 0;
+       const struct prof_meta *m = &prof->meta[i];
++      if (m->disp != 0) {
++         if (end >= begin)
++            prof_disp_add(prof, m, i, end - begin);
++         continue;
++      }
+       const uint32_t sig = m->sig;
+       if (sig == 0 || sig > sig_count || end < begin)
+          continue;
+@@ -1584,17 +2043,19 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+       prof->dropped_window = 0;
+       simple_mtx_unlock(&prof->mutex);
+ 
+-      prof_log(prof, "NVK pass profile: window %" PRIu64 "%s, %.2f s, %u of %u "
+-               "signatures active, %" PRIu64 " dropped (%" PRIu64 " in all)",
+-               prof->windows, final ? " (final)" : "", window_s, active,
+-               sig_count, dropped_window, dropped);
+       const double ms = 1e6 * window_s;
+-      prof_log(prof, "NVK pass profile: summary GPU ms/s: command buffers "
+-               "%.2f = render passes %.2f + operations %.2f + between them "
+-               "%.2f (secondaries %.2f)", cmd_ns / ms, pass_ns / ms,
+-               op_ns / ms,
+-               cmd_ns > pass_ns + op_ns ? (cmd_ns - pass_ns - op_ns) / ms : 0.0,
+-               sec_ns / ms);
++      if (prof->level > 0) {
++         prof_log(prof, "NVK pass profile: window %" PRIu64 "%s, %.2f s, %u of "
++                  "%u signatures active, %" PRIu64 " dropped (%" PRIu64
++                  " in all)", prof->windows, final ? " (final)" : "",
++                  window_s, active, sig_count, dropped_window, dropped);
++         prof_log(prof, "NVK pass profile: summary GPU ms/s: command buffers "
++                  "%.2f = render passes %.2f + operations %.2f + between them "
++                  "%.2f (secondaries %.2f)", cmd_ns / ms, pass_ns / ms,
++                  op_ns / ms,
++                  cmd_ns > pass_ns + op_ns ? (cmd_ns - pass_ns - op_ns) / ms : 0.0,
++                  sec_ns / ms);
++      }
+       char line[640];
+       int len = 0;
+       for (unsigned k = 1; k < NVK_PASS_PROFILE_OP_COUNT; k++) {
+@@ -1607,7 +2068,8 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+       if (len > 0)
+          prof_log(prof, "NVK pass profile: operations GPU ms/s:%s", line);
+ 
+-      struct prof_sig *sorted = malloc(sig_count * sizeof(*sorted));
++      struct prof_sig *sorted = prof->level > 0 && sig_count > 0 ?
++                                malloc(sig_count * sizeof(*sorted)) : NULL;
+       if (sorted != NULL) {
+          memcpy(sorted, prof->sigs, sig_count * sizeof(sorted[0]));
+          qsort(sorted, sig_count, sizeof(sorted[0]), prof_sig_cmp);
+@@ -1618,6 +2080,8 @@ prof_harvest_and_log(struct nvk_pass_profile *prof, bool final)
+          }
+          free(sorted);
+       }
++      if (prof->dispatch)
++         prof_disp_log(prof, window_s, final);
+       simple_mtx_lock(&prof->mutex);
+       for (uint32_t i = 0; i < sig_count; i++) {
+          struct prof_hist *h = prof->sigs[i].hist;
+diff --git a/src/nouveau/vulkan/nvk_pass_profile.h b/src/nouveau/vulkan/nvk_pass_profile.h
+index 48b831f..be1cf7a 100644
+--- a/src/nouveau/vulkan/nvk_pass_profile.h
++++ b/src/nouveau/vulkan/nvk_pass_profile.h
+@@ -12,6 +12,7 @@
+ 
+ struct nvk_cmd_buffer;
+ struct nvk_device;
++struct nvk_shader;
+ 
+ /* What a render pass, a run of operations or a command buffer recorded:
+  * draw calls (one per vkCmdDraw*), the draws they make (a multi-draw or an
+@@ -131,6 +132,27 @@ void nvk_pass_profile_end_secondary(struct nvk_cmd_buffer *cmd,
+                                     const struct nvk_cmd_buffer *other,
+                                     int32_t slot);
+ 
++/* NVK_DISPATCH_PROFILE=1: GPU time per dispatch, per compute shader (see
++ * nvk_pass_profile.c).  begin right before the dispatch's launch, end right
++ * after it; only when cmd->dispatch_profile_on.  groups is the grid of a
++ * direct dispatch, NULL for an indirect one, whose arguments are copied to
++ * *args_addr_out (0: no copy) by the caller before begin's report.  The
++ * shader may be NULL (an execution set of device-generated commands).
++ */
++enum nvk_dispatch_profile_kind {
++   NVK_DISPATCH_PROFILE_DIRECT,
++   NVK_DISPATCH_PROFILE_INDIRECT,
++   NVK_DISPATCH_PROFILE_DGC,      /* vkCmdExecuteGeneratedCommandsEXT */
++   NVK_DISPATCH_PROFILE_INTERNAL, /* the driver's own (nvk_cmd_dispatch_shader) */
++};
++int32_t nvk_dispatch_profile_alloc(struct nvk_cmd_buffer *cmd,
++                                   struct nvk_shader *shader,
++                                   enum nvk_dispatch_profile_kind kind,
++                                   const uint32_t *groups,
++                                   uint64_t *args_addr_out);
++void nvk_dispatch_profile_begin(struct nvk_cmd_buffer *cmd, int32_t slot);
++void nvk_dispatch_profile_end(struct nvk_cmd_buffer *cmd, int32_t slot);
++
+ /* After a submit: harvest and log, only when there is no harvest thread. */
+ void nvk_pass_profile_poll(struct nvk_device *dev);
+ 
+diff --git a/src/nouveau/vulkan/nvk_shader.h b/src/nouveau/vulkan/nvk_shader.h
+index b149d9f..31940a3 100644
+--- a/src/nouveau/vulkan/nvk_shader.h
++++ b/src/nouveau/vulkan/nvk_shader.h
+@@ -150,6 +150,11 @@ struct nvk_shader {
+     */
+    uint16_t fs_tail_dw_start;
+    uint32_t *push_dw;
++
++   /* NVK_DISPATCH_PROFILE: the shader's dispatch signature + 1, found on
++    * its first profiled dispatch (0: not yet)
++    */
++   uint32_t dispatch_profile_sig;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_shader, vk.base, VkShaderEXT,
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index a07f8ca..fbca8c0 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -2772,6 +2772,14 @@ vk_create_compute_pipeline(struct vk_device *device,
+                                                  &cache_hit);
+       if (result != VK_SUCCESS)
+          goto fail_pipeline;
++
++      /* Once per shader: a cache hit shares the shader object */
++      if (stage.shader != NULL && stage.shader->src_hash == 0) {
++         size_t spirv_size = 0;
++         const uint32_t *spirv = vk_stage_spirv(&pCreateInfo->stage,
++                                                &spirv_size);
++         stage.shader->src_hash = vk_spirv_source_hash(spirv, spirv_size);
++      }
+    }
+ 
+    pipeline->stage = vk_pipeline_stage_clone(&stage);
+diff --git a/src/vulkan/runtime/vk_shader.c b/src/vulkan/runtime/vk_shader.c
+index 8feebee..15a1176 100644
+--- a/src/vulkan/runtime/vk_shader.c
++++ b/src/vulkan/runtime/vk_shader.c
+@@ -38,6 +38,8 @@
+ 
+ #include "nir.h"
+ 
++#include <string.h>
++
+ static void
+ vk_shader_init(struct vk_shader *shader,
+                struct vk_device *device,
+@@ -319,6 +321,49 @@ extend_create_flags(VkShaderCreateFlagBitsEXT flags,
+    return flags;
+ }
+ 
++uint64_t
++vk_spirv_source_hash(const uint32_t *spirv, size_t size_B)
++{
++   if (spirv == NULL || size_B < 20)
++      return 0;
++   const size_t words = size_B / 4;
++   if (spirv[0] == 0x07230203) {
++      for (size_t i = 5; i < words;) {
++         const uint32_t op = spirv[i] & 0xffff, wc = spirv[i] >> 16;
++         if (wc == 0 || i + wc > words)
++            break;
++         if (op == 7 /* OpString */ && wc >= 3) {
++            const char *str = (const char *)&spirv[i + 2];
++            const size_t n = strnlen(str, (wc - 2) * 4);
++            if (n == 21 && strcmp(str + 16, ".dxil") == 0) {
++               uint64_t h = 0;
++               size_t d = 0;
++               for (; d < 16; d++) {
++                  const char c = str[d];
++                  const unsigned v = c >= '0' && c <= '9' ? c - '0' :
++                                     c >= 'a' && c <= 'f' ? c - 'a' + 10 : 16;
++                  if (v == 16)
++                     break;
++                  h = (h << 4) | v;
++               }
++               if (d == 16)
++                  return h;
++            }
++         } else if (op == 71 /* OpDecorate */ || op == 54 /* OpFunction */) {
++            break; /* debug strings come before annotations */
++         }
++         i += wc;
++      }
++   }
++   uint64_t h = 0xcbf29ce484222325ull;
++   const uint8_t *b = (const uint8_t *)spirv;
++   for (size_t i = 0; i < size_B; i++) {
++      h ^= b[i];
++      h *= 0x00000100000001b3ull;
++   }
++   return h;
++}
++
+ static void
+ vk_shader_compile_info_init(struct vk_shader_compile_info *info,
+                             struct set_layouts *set_layouts,
+@@ -668,6 +713,8 @@ vk_common_CreateShadersEXT(VkDevice _device,
+             if (result != VK_SUCCESS)
+                break;
+ 
++            shader->src_hash = vk_spirv_source_hash(vk_info->pCode,
++                                                    vk_info->codeSize);
+             pShaders[i] = vk_shader_to_handle(shader);
+          }
+          break;
+@@ -718,8 +765,13 @@ vk_common_CreateShadersEXT(VkDevice _device,
+                                      NULL /* state */, NULL /* features */,
+                                      pAllocator, shaders);
+          if (result == VK_SUCCESS) {
+-            for (uint32_t l = 0; l < linked_count; l++)
++            for (uint32_t l = 0; l < linked_count; l++) {
++               const VkShaderCreateInfoEXT *vk_info =
++                  &pCreateInfos[linked[l].idx];
++               shaders[l]->src_hash =
++                  vk_spirv_source_hash(vk_info->pCode, vk_info->codeSize);
+                pShaders[linked[l].idx] = vk_shader_to_handle(shaders[l]);
++            }
+          }
+       } else {
+          for (uint32_t l = 0; l < linked_count; l++) {
+diff --git a/src/vulkan/runtime/vk_shader.h b/src/vulkan/runtime/vk_shader.h
+index bdf5768..f813fd9 100644
+--- a/src/vulkan/runtime/vk_shader.h
++++ b/src/vulkan/runtime/vk_shader.h
+@@ -129,6 +129,12 @@ struct vk_shader {
+     */
+    uint32_t ray_queries;
+ 
++   /* Where the shader came from, for profiles that name it (0: unknown):
++    * vk_spirv_source_hash() of the SPIR-V it was compiled from, set by the
++    * common pipeline and shader object code.
++    */
++   uint64_t src_hash;
++
+    /* Used for the generic VkPipeline implementation */
+    struct {
+       struct vk_pipeline_cache_object cache_obj;
+@@ -139,6 +145,14 @@ struct vk_shader {
+ VK_DEFINE_NONDISP_HANDLE_CASTS(vk_shader, base, VkShaderEXT,
+                                VK_OBJECT_TYPE_SHADER_EXT);
+ 
++/* A 64-bit name for a SPIR-V module that tools outside the driver use too:
++ * the hash in an OpString "<16 hex digits>.dxil" (vkd3d-proton names every
++ * DXIL shader's SPIR-V so, and VKD3D_SHADER_DUMP_PATH names its files with
++ * the same hash), else the FNV-1a 64 hash of the module's bytes (the hash
++ * the failed-shader ledger in vk_pipeline.c uses).  0 for no SPIR-V.
++ */
++uint64_t vk_spirv_source_hash(const uint32_t *spirv, size_t size_B);
++
+ struct vk_shader_ops {
+    /** Destroy a vk_shader_object */
+    void (*destroy)(struct vk_device *device,
+-- 
+2.43.0
+

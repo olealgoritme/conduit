@@ -1,0 +1,9 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// Trivial compute shader: 64x1x1, thread 0 of each workgroup writes one value.
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint K = 1u;
+layout(std430, set = 0, binding = 0) buffer Out { uint v[]; } o;
+void main() {
+    if (gl_LocalInvocationIndex == 0u) o.v[gl_WorkGroupID.x & 4095u] = K;
+}

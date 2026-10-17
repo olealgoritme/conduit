@@ -69,7 +69,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | **Memory** | | |
 | `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N MiB caps it (common 30) |
 | `NVK_RM_DESC_TABLE_VRAM` | 0 | descriptor tables/pools in CPU-mapped VRAM (common 26, 52) |
-| `NVK_RM_UPLOAD_VRAM` | 0 | command buffer upload memory in CPU-mapped VRAM: `compute` the compute root descriptor tables, `1` all of it (common 26, 52); off by default: a new command pool's first block costs a VRAM allocation and a BAR1 map, and Steel Nomad (D3D12) ran at a third of its speed with `compute` |
+| `NVK_RM_UPLOAD_VRAM` | `compute` on Windows, 0 elsewhere | command buffer upload memory in CPU-mapped VRAM: `compute` the compute root descriptor tables (a tiny dispatch costs 0.48 us from VRAM, 2.5-3.7 us from system memory), `1` all of it, `0` none (common 26, 52, 73) |
 | `NVK_CMD_MEM_CACHE` | 64 | command buffer memory blocks of each kind a device keeps from destroyed and trimmed command pools for new ones; 0 frees them (common 54) |
 | `NVK_RM_SYSMEM_CACHED` | 1 | host-visible system memory GPU-cacheable in L2 (`=0` off, `=desc`/`=app` one kind only) |
 | `NVK_RM_COMPRESSION` | 1 | compressible VRAM for images in dedicated allocations on GB20x |
@@ -138,6 +138,7 @@ file per process.
 | `NVK_PASS_PROFILE=3` | adds the ZCULL statistics per pass |
 | `NVK_PASS_PROFILE=4` | adds the 24 most written 3D methods per pass and bind counts |
 | `NVK_PASS_PROFILE=5` | dumps the draws of one render pass matching `NVK_PASS_DUMP`, after `NVK_PASS_DUMP_DELAY_S` (20) s (`nvk-prepass-dump-<pid>.txt`) |
+| `NVK_DISPATCH_PROFILE=1` | GPU time of every dispatch per compute shader (vkd3d-proton DXIL hash, code hash, workgroup size), with grids (indirect arguments read back), GPRs and warps, every two seconds, in the `NVK_PASS_PROFILE` file; alone or with `NVK_PASS_PROFILE`; each dispatch waits for idle before and after it |
 | `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
 | `NVK_WAIT_STATS=1` | CPU wait counts and times per site, woken and timed-out waits, once a second (`nvk-waits-<pid>.txt`) |
 | `NVK_DEBUG=vm` | VA and memory alloc/free/bind lines with times, threads and freeing call stacks (`NVK_VM_LOG`, else `nvk-vm-<pid>.log` in `%TEMP%`) |
@@ -158,6 +159,53 @@ GPU timestamps. `guest/windows/tools/d3d12_gpu_bound.cpp` runs the same
 tests through D3D12, plus root CBVs per draw, so the D3D12 path lines up
 with Vulkan test by test; `guest/windows/tools/gpu-bound-run.sh` runs either
 in the guest with `nvidia-smi dmon` watching the host GPU.
+
+### Dispatch profile (common 0071)
+
+`NVK_DISPATCH_PROFILE=1` times every compute dispatch on the GPU and sums
+the time per compute shader: `vkCmdDispatch`, `vkCmdDispatchBase`,
+`vkCmdDispatchIndirect` (its arguments are read back for the grid), the
+driver's own dispatches (`meta`), and each `vkCmdExecuteGeneratedCommandsEXT`
+of compute commands as a whole (`dgc`). It works alone or together with
+`NVK_PASS_PROFILE`, in the same file (`NVK_PASS_PROFILE_FILE`, else
+`%ProgramData%\Helios\nvk-pass-<pid>.txt`), and on the async compute
+queue. For a D3D12 game, set it in the game's environment, for example in
+Steam's launch options:
+
+```
+NVK_DISPATCH_PROFILE=1 NVK_PASS_PROFILE_FILE=C:\Users\Public\dprof.txt %command%
+```
+
+Every two seconds the file gets a window line and up to 80 shader lines,
+heaviest first (then one line for the rest):
+
+```
+NVK dispatch profile: window 26, 2.03 s, 50604 dispatches (24928.1/s), 646.205 GPU ms/s in dispatches, 39 of 56 shaders active, 0 dropped (0 in all)
+NVK dispatch profile:  144.034 ms/s  22.3%     57.1 calls/s  2522.36 us/call p50  2602.98 max  3006.24 | src 88825d04f9c554c6 code 9b6f3a19 local 8x8x1 gprs 168 warps 12 instrs 2370 cycles 297141 spills 0 slm 0 smem 0 | grid 240x135x1:100% groups 32400..32400 | ind 0/0 dgc 0 meta 0
+```
+
+| Field | Meaning |
+|---|---|
+| `ms/s`, `%` | GPU milliseconds per second in this shader's dispatches, and its share of all dispatch time in the window |
+| `calls/s`, `us/call`, `p50`, `max` | dispatches per second; mean, median (of up to 64 samples per window) and longest GPU time of one dispatch |
+| `src` | vkd3d-proton's hash of the DXIL shader (the name of its `VKD3D_SHADER_DUMP_PATH` file); for other applications a hash of the SPIR-V; zero for the driver's own shaders |
+| `code` | the hash `NVK_SHADER_STATS` prints for the compiled shader |
+| `local` | workgroup size |
+| `gprs`, `warps`, `instrs`, `cycles`, `spills`, `slm`, `smem` | NAK's statistics: registers per thread, warps per SM, instructions, static cycles, spills, local and shared memory |
+| `grid`, `groups` | the three most common grids with their share of calls (`,+` more), the range of workgroup counts |
+| `ind`, `dgc`, `meta` | indirect dispatches (with arguments read back), device-generated, and driver-internal ones |
+
+Every dispatch waits for the GPU to go idle before and after it, so
+dispatches that overlap without the profile run one at a time with it, and
+the frame rate drops. The numbers say which shaders take the time and how
+long one dispatch of each takes alone; they do not add up to a frame time.
+`dropped` counts dispatches not timed because the table of 4096 shaders
+was full.
+
+`tools/dispprof/dispprof.py FILE [--fps N] [--skip N] [--top N]` prints the
+busiest window and a whole-run table per shader (ms per frame and calls per
+frame with `--fps`, the frame rate of the profiled run). `--skip` leaves out
+the first windows (loading and shader compiles).
 
 ## `patches/`: the RM backend
 
@@ -251,7 +299,7 @@ Each patch builds on its own.
 ## `patches-common/`: generic NVK work
 
 Apply on top of both lineages, unchanged. One patch (5) also touches the RM
-backend. Numbers are file numbers (there is no 0016 or 0025).
+backend. Numbers are file numbers (there is no 0016, 0025 or 0072).
 
 | # | what |
 |---|---|
@@ -322,6 +370,9 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0067 | NAK: weak memory order for non-coherent global, SSBO and image accesses (`NAK_WEAK_MEM`, opt-in) |
 | 0068 | `NVK_RM_COMPRESS_ALL` defaults to on for processes whose Vulkan engine name starts with `vkd3d` (vkd3d-proton) and to off for all others; 0 or 1 in the environment overrides it (`nvk_apply_engine_compression_default`) |
 | 0069 | async compute: a compute + transfer queue family (4 queues) whose channels sit in the first graphics queue's TSG on VEIDs of their own and run next to it (`NVK_RM_ASYNC_COMPUTE`, see "Async compute") |
+| 0070 | NAK: `nir_opt_uniform_atomics` before subgroup lowering: an atomic on an address that is the same in every active lane of a subgroup is done once per subgroup, with a subgroup reduction of the value and an exclusive scan for each lane's result (`NAK_UNIFORM_ATOMICS`, default on; part of the shader cache key) |
+| 0071 | `NVK_DISPATCH_PROFILE`: compute-class timestamps behind a WAIT_FOR_IDLE before and after every launch (direct, indirect, device-generated, internal), keyed by `vk_shader::src_hash` (the SPIR-V's `OpString "<hash>.dxil"` from vkd3d-proton, else FNV-1a 64 of the SPIR-V), code hash and local size; indirect arguments copied by I2M for the grid; per-window table of ms/s, share, calls/s, mean/median/max us, GPRs, warps, grids |
+| 0073 | RM: `NVK_RM_UPLOAD_VRAM` defaults to `compute` on Windows, so compute root descriptor tables are CPU-mapped VRAM (0052); `0` keeps them in system memory |
 
 ## Per-draw cost (common 0001-0007)
 
@@ -846,15 +897,19 @@ the PCIe reads of GPU-cacheable system memory.
 - Only that type lands in the BAR: `nvkmd_info::host_visible_vram_is_pinned`
   makes NVK ask for `NVKMD_MEM_VRAM` for it, while NVK's own
   `LOCAL | CAN_MAP` buffers (push, queries, events, upload) stay in system
-  memory, where the CPU also reads them fast. Opt-in exceptions are NVK's
-  own CPU-mapped VRAM, outside the heap with a 256 MiB budget of its own:
-  the compute root descriptor tables (`NVK_RM_UPLOAD_VRAM=compute`: a
-  dispatch waits for its table, and from system memory each dependent
-  dispatch costs several us more), all upload memory
-  (`NVK_RM_UPLOAD_VRAM=1`), descriptor tables (`NVK_RM_DESC_TABLE_VRAM=1`).
-  Each new command pool's first block of it is a VRAM allocation plus a
-  BAR1 map (host round trips), which costs more than it saves in D3D12
-  games that make many command pools.
+  memory, where the CPU also reads them fast. The exceptions are NVK's own
+  CPU-mapped VRAM, outside the heap with a 256 MiB budget of its own: the
+  compute root descriptor tables (`NVK_RM_UPLOAD_VRAM=compute`, the default
+  on Windows: a dispatch waits for its table; tiny back-to-back dispatches
+  take 0.48 us each with the tables in VRAM, as with NVIDIA's driver, and
+  2.5-3.7 us from system memory, `tests/perf/dispatch-bench`), and opt-in
+  all upload memory (`NVK_RM_UPLOAD_VRAM=1`) and descriptor tables
+  (`NVK_RM_DESC_TABLE_VRAM=1`). A new command pool's first block of it is a
+  VRAM allocation plus a BAR1 map (host round trips); the device's command
+  memory cache (`NVK_CMD_MEM_CACHE`, common 0054) hands the blocks of
+  destroyed pools to new ones, which keeps that cost out of D3D12 games
+  that make command allocators per frame. `NVK_RM_UPLOAD_VRAM=0` keeps the
+  compute root tables in system memory.
 - Host-visible system memory (`NVK_RM_SYSMEM_CACHED`, default on) is mapped
   GPU-cacheable (`NVOS46_FLAGS_GPU_CACHEABLE_YES`) and every submit starts
   with an L2 sysmem invalidate after its semaphore waits; rings, semaphores,
