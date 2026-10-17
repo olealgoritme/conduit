@@ -1,0 +1,6 @@
+librmtrace.so
+vkqtest
+names.h
+shaders.h
+glsl/*.spv
+logs/
