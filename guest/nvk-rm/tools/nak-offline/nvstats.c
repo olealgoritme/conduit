@@ -2,6 +2,11 @@
 // driver's own pipeline statistics (VK_KHR_pipeline_executable_properties): registers, instructions, spills.
 // Black-box: we only read what the driver reports for our shaders.
 //   nvstats file.spv [file.spv ...]
+//   nvstats -s file.spv ...: compile each file alone, any stage, as a VK_EXT_shader_object shader object
+//     (no pipeline state, no partner stage) and print "name stage OK|FAILED"; the statistics come from the
+//     driver itself (NVK_SHADER_STATS=1 NVK_SHADER_STATS_FILE=...), in the same order.
+// NVSTATS_DUMP=DIR also writes, per pipeline, the pipeline cache data the driver returns for that pipeline alone
+// (DIR/<name>.cache, from an empty VkPipelineCache) and any internal representations it reports (DIR/<name>.<stage>.ir).
 #ifdef _WIN32
 #define VK_NO_PROTOTYPES
 #include <windows.h>
@@ -12,7 +17,7 @@
 F(vkCreateInstance) F(vkEnumeratePhysicalDevices) F(vkGetPhysicalDeviceProperties) F(vkGetPhysicalDeviceFeatures2)
 F(vkCreateDevice) F(vkGetDeviceProcAddr) F(vkCreateDescriptorSetLayout) F(vkCreatePipelineLayout) F(vkCreateShaderModule)
 F(vkCreateComputePipelines) F(vkCreateGraphicsPipelines) F(vkDestroyPipeline) F(vkDestroyShaderModule) F(vkDestroyPipelineLayout)
-F(vkDestroyDescriptorSetLayout) F(vkDestroyDevice) F(vkDestroyInstance)
+F(vkDestroyDescriptorSetLayout) F(vkDestroyDevice) F(vkDestroyInstance) F(vkCreatePipelineCache) F(vkGetPipelineCacheData) F(vkDestroyPipelineCache)
 static PFN_vkGetInstanceProcAddr gipa;
 static void load_global(void) { HMODULE m = LoadLibraryA("vulkan-1.dll"); gipa = (PFN_vkGetInstanceProcAddr)GetProcAddress(m, "vkGetInstanceProcAddr");
   vkCreateInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance"); }
@@ -20,7 +25,8 @@ static void load_global(void) { HMODULE m = LoadLibraryA("vulkan-1.dll"); gipa =
 static void load_inst(VkInstance inst) { L(vkEnumeratePhysicalDevices) L(vkGetPhysicalDeviceProperties) L(vkGetPhysicalDeviceFeatures2)
   L(vkCreateDevice) L(vkGetDeviceProcAddr) L(vkCreateDescriptorSetLayout) L(vkCreatePipelineLayout) L(vkCreateShaderModule)
   L(vkCreateComputePipelines) L(vkCreateGraphicsPipelines) L(vkDestroyPipeline) L(vkDestroyShaderModule) L(vkDestroyPipelineLayout)
-  L(vkDestroyDescriptorSetLayout) L(vkDestroyDevice) L(vkDestroyInstance) }
+  L(vkDestroyDescriptorSetLayout) L(vkDestroyDevice) L(vkDestroyInstance) L(vkCreatePipelineCache) L(vkGetPipelineCacheData)
+  L(vkDestroyPipelineCache) }
 #else
 static void load_global(void) {}
 static void load_inst(VkInstance i) { (void)i; }
@@ -34,6 +40,7 @@ static void load_inst(VkInstance i) { (void)i; }
 
 typedef struct { uint32_t op, w[8]; } Ins;
 static uint32_t *spv; static size_t nw;
+static const char *entry_name = "main"; // OpEntryPoint's name (the first entry point)
 
 /* --- tiny SPIR-V reflection: descriptor set/binding -> descriptor types --------------------------------------- */
 #define MAXID (1u << 20)
@@ -51,11 +58,11 @@ struct bind { uint32_t set, binding, count; int ntypes; VkDescriptorType types[8
 
 static int reflect(struct bind *out, int maxb, uint32_t *model, uint32_t ls[3]) {
     memset(hasset, 0, MAXID);
-    int n = 0; ls[0] = ls[1] = ls[2] = 1;
+    int n = 0; ls[0] = ls[1] = ls[2] = 1; entry_name = "main";
     for (size_t i = 5; i < nw;) {
         uint32_t wc = spv[i] >> 16, op = spv[i] & 0xffff; uint32_t *a = &spv[i + 1];
         switch (op) {
-        case 15: *model = a[0]; break;                                  // OpEntryPoint
+        case 15: if (*model == 99) { *model = a[0]; entry_name = (const char *)&a[2]; } break; // OpEntryPoint
         case 16: if (a[1] == 17) { ls[0] = a[2]; ls[1] = a[3]; ls[2] = a[4]; } break; // ExecutionMode LocalSize
         case 71:                                                        // OpDecorate
             if (a[1] == 34) { dset[a[0]] = a[2]; hasset[a[0]] = 1; }
@@ -126,6 +133,9 @@ int main(int argc, char **argv) {
 
     // Enable every feature the driver has (vkd3d's SPIR-V uses descriptor indexing, BDA, 16/64-bit, subgroups...).
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pef = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+    int smode = argc > 1 && !strcmp(argv[1], "-s");
+    VkPhysicalDeviceShaderObjectFeaturesEXT sof = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT };
+    pef.pNext = smode ? &sof : NULL;
     VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mdf = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT, &pef };
     VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &mdf };
     VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13 };
@@ -133,17 +143,21 @@ int main(int argc, char **argv) {
     VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11 };
     vkGetPhysicalDeviceFeatures2(pd, &f2);
     f2.features.robustBufferAccess = VK_FALSE;
-    const char *exts[] = { "VK_KHR_pipeline_executable_properties", "VK_EXT_mutable_descriptor_type" };
+    const char *exts[] = { "VK_KHR_pipeline_executable_properties", "VK_EXT_mutable_descriptor_type", "VK_EXT_shader_object" };
     float prio = 1; VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &prio };
-    VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, 2, exts, NULL };
+    VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, smode ? 3 : 2, exts, NULL };
     VkDevice dev; CHK(vkCreateDevice(pd, &dci, NULL, &dev));
     PFN_vkGetPipelineExecutablePropertiesKHR gep = (void *)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutablePropertiesKHR");
     PFN_vkGetPipelineExecutableStatisticsKHR ges = (void *)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutableStatisticsKHR");
+    PFN_vkGetPipelineExecutableInternalRepresentationsKHR gir = (void *)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutableInternalRepresentationsKHR");
+    const char *dumpdir = getenv("NVSTATS_DUMP");
+    PFN_vkCreateShadersEXT cse = (void *)vkGetDeviceProcAddr(dev, "vkCreateShadersEXT");
+    PFN_vkDestroyShaderEXT dse = (void *)vkGetDeviceProcAddr(dev, "vkDestroyShaderEXT");
 
     int gmode = argc > 2 && (!strcmp(argv[1], "-g") || !strcmp(argv[1], "-v")); int vmode = gmode && !strcmp(argv[1], "-v");
     FILE *gl = gmode ? fopen(argv[2], "r") : NULL;
     char gline[1024], gfs[512], gvs[512], gkinds[64]; int gdepth = 0;
-    for (int fi = gmode ? 3 : 1; gmode ? (fgets(gline, sizeof gline, gl) != NULL) : (fi < argc); fi++) {
+    for (int fi = gmode ? 3 : smode ? 2 : 1; gmode ? (fgets(gline, sizeof gline, gl) != NULL) : (fi < argc); fi++) {
         const char *path = argv[fi < argc ? fi : 0];
         if (vmode) { if (sscanf(gline, "%511s %511s %63s", gfs, gvs, gkinds) != 3) continue; path = gfs; }
         else if (gmode) { if (sscanf(gline, "%511s %511s %63s %d", gfs, gvs, gkinds, &gdepth) != 4) continue; path = gfs; }
@@ -151,7 +165,7 @@ int main(int argc, char **argv) {
         uint32_t model = 99, ls[3];
         struct bind b[64]; int nb = reflect(b, 64, &model, ls);
         const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
-        if (vmode ? model != 0 /* Vertex */ : gmode ? model != 4 /* Fragment */ : model != 5 /* GLCompute */) { free(spv); continue; }
+        if (smode ? model > 5 : vmode ? model != 0 /* Vertex */ : gmode ? model != 4 /* Fragment */ : model != 5 /* GLCompute */) { free(spv); continue; }
         // One set layout per set index used (0..7), mutable where several types alias one binding.
         VkDescriptorSetLayout sl[8] = {0}; uint32_t maxset = 0;
         for (int k = 0; k < nb; k++) if (b[k].set + 1 > maxset) maxset = b[k].set + 1;
@@ -173,9 +187,31 @@ int main(int argc, char **argv) {
         VkPushConstantRange pcr = { VK_SHADER_STAGE_ALL, 0, 256 };
         VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, maxset, sl, 1, &pcr };
         VkPipelineLayout pl = VK_NULL_HANDLE; if (!bad && vkCreatePipelineLayout(dev, &plci, NULL, &pl) != VK_SUCCESS) bad = 2;
+        if (smode) {
+            static const VkShaderStageFlagBits stages[] = { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT };
+            static const VkShaderStageFlags next[] = { VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 0 };
+            static const char *names[] = { "vert", "tesc", "tese", "geom", "frag", "comp" };
+            VkPushConstantRange spcr = { VK_SHADER_STAGE_ALL, 0, 256 };
+            VkShaderCreateInfoEXT sci = { VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, NULL, 0, stages[model], next[model],
+                VK_SHADER_CODE_TYPE_SPIRV_EXT, nw * 4, spv, entry_name, maxset, sl, 1, &spcr, NULL };
+            VkShaderEXT so = VK_NULL_HANDLE;
+            int ok = !bad && cse && cse(dev, 1, &sci, NULL, &so) == VK_SUCCESS;
+            printf("%s %s %s\n", name, names[model], ok ? "OK" : "FAILED");
+            if (so) dse(dev, so, NULL);
+            for (uint32_t s2 = 0; s2 < maxset; s2++) if (sl[s2]) vkDestroyDescriptorSetLayout(dev, sl[s2], NULL);
+            memset(dset, 0, MAXID * 4); memset(dbind, 0, MAXID * 4); memset(ty_op, 0, MAXID * 4); memset(var_ty, 0, MAXID * 4);
+            memset(bufblock, 0, MAXID * 4); memset(blockdec, 0, MAXID * 4);
+            free(spv); fflush(stdout);
+            continue;
+        }
         VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, nw * 4, spv };
         VkShaderModule sm = VK_NULL_HANDLE; if (!bad && vkCreateShaderModule(dev, &smci, NULL, &sm) != VK_SUCCESS) bad = 3;
         VkPipeline pipe = VK_NULL_HANDLE;
+        VkPipelineCache pc = VK_NULL_HANDLE;
+        if (dumpdir) { VkPipelineCacheCreateInfo pcci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO }; vkCreatePipelineCache(dev, &pcci, NULL, &pc); }
+        VkPipelineCreateFlags cflags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (dumpdir ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
         if (!bad && gmode) {
             VkShaderModule vsm = mkmod(dev, gvs);
             VkFormat cf[8]; uint32_t ncf = 0;
@@ -195,8 +231,8 @@ int main(int argc, char **argv) {
                 cf[ncf++] = *k == 'f' ? VK_FORMAT_R32G32B32A32_SFLOAT : *k == 'i' ? VK_FORMAT_R32G32B32A32_SINT : *k == 'u' ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R8G8B8A8_UNORM;
             VkPipelineRenderingCreateInfo rci = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, ncf, cf, VK_FORMAT_D32_SFLOAT, VK_FORMAT_UNDEFINED };
             VkPipelineShaderStageCreateInfo st[2] = {
-                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vmode ? sm : vsm, "main", NULL },
-                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, vmode ? vsm : sm, "main", NULL } };
+                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vmode ? sm : vsm, vmode ? entry_name : "main", NULL },
+                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, vmode ? vsm : sm, vmode ? "main" : entry_name, NULL } };
             VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0, nva ? 1u : 0u, &vb, nva, va };
             VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
             VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL };
@@ -207,15 +243,15 @@ int main(int argc, char **argv) {
             VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, ncf, cba };
             VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
             VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn };
-            VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR,
+            VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, cflags,
                 2, st, &vi, &ia, NULL, &vp, &rs, &ms, &ds, &cb, &dy, pl, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, 0 };
-            if (!vsm || vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, NULL, &pipe) != VK_SUCCESS) bad = 5;
+            if (!vsm || vkCreateGraphicsPipelines(dev, pc, 1, &gp, NULL, &pipe) != VK_SUCCESS) bad = 5;
             if (vsm) vkDestroyShaderModule(dev, vsm, NULL);
         } else if (!bad) {
             VkComputePipelineCreateInfo cpci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL,
-                VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR,
-                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL }, pl, VK_NULL_HANDLE, 0 };
-            if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe) != VK_SUCCESS) bad = 4;
+                cflags,
+                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, entry_name, NULL }, pl, VK_NULL_HANDLE, 0 };
+            if (vkCreateComputePipelines(dev, pc, 1, &cpci, NULL, &pipe) != VK_SUCCESS) bad = 4;
         }
         printf("%s local %ux%ux%u", name, ls[0], ls[1], ls[2]);
         if (bad) { printf(" FAILED(%d)\n", bad); }
@@ -240,10 +276,35 @@ int main(int argc, char **argv) {
                     default: printf("%g", st[i].value.f64);
                     }
                 }
+                if (dumpdir && gir) {
+                    uint32_t nr = 0; gir(dev, &ei, &nr, NULL);
+                    VkPipelineExecutableInternalRepresentationKHR ir[8]; if (nr > 8) nr = 8;
+                    for (uint32_t i = 0; i < nr; i++) ir[i] = (VkPipelineExecutableInternalRepresentationKHR){ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR };
+                    gir(dev, &ei, &nr, ir);
+                    for (uint32_t i = 0; i < nr; i++) ir[i].pData = ir[i].dataSize ? malloc(ir[i].dataSize) : NULL;
+                    gir(dev, &ei, &nr, ir);
+                    for (uint32_t i = 0; i < nr; i++) {
+                        char fn[1024]; snprintf(fn, sizeof fn, "%s/%s.%u.%u.ir", dumpdir, name, e, i);
+                        FILE *f = fopen(fn, "wb");
+                        if (f) { fprintf(f, "# %s: %s (%s)\n", ir[i].name, ir[i].description, ir[i].isText ? "text" : "binary"); if (ir[i].pData) fwrite(ir[i].pData, 1, ir[i].dataSize, f); fclose(f); }
+                        free(ir[i].pData);
+                    }
+                    if (!nr) fprintf(stderr, "%s: executable %u: no internal representations\n", name, e);
+                }
             }
             printf("\n");
+            if (pc) {
+                size_t sz = 0; vkGetPipelineCacheData(dev, pc, &sz, NULL);
+                void *d = malloc(sz ? sz : 1);
+                if (vkGetPipelineCacheData(dev, pc, &sz, d) == VK_SUCCESS) {
+                    char fn[1024]; snprintf(fn, sizeof fn, "%s/%s.cache", dumpdir, name);
+                    FILE *f = fopen(fn, "wb"); if (f) { fwrite(d, 1, sz, f); fclose(f); }
+                }
+                free(d);
+            }
             vkDestroyPipeline(dev, pipe, NULL);
         }
+        if (pc) vkDestroyPipelineCache(dev, pc, NULL);
         if (sm) vkDestroyShaderModule(dev, sm, NULL);
         if (pl) vkDestroyPipelineLayout(dev, pl, NULL);
         for (uint32_t s = 0; s < maxset; s++) if (sl[s]) vkDestroyDescriptorSetLayout(dev, sl[s], NULL);
