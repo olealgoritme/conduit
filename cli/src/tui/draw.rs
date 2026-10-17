@@ -179,6 +179,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
         Some(g) if s.gpus > 1 => format!("{} (GPU {} of {})", g.name, g.index, s.gpus),
         Some(g) => g.name.clone(),
         None if s.gpu_released => "GPU: let go while the dashboard is in the background".into(),
+        None if s.gpu_error.is_some() => "GPU: NVML not available, trying again".into(),
         None => "GPU: NVML not available".into(),
     };
     let running = s.vms.iter().filter(|v| v.up()).count();
@@ -667,11 +668,14 @@ fn gpu_panel(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
     let Some(g) = &app.snap.gpu else {
         let msg = if app.snap.seq == 0 {
-            "  reading the GPU…"
+            "  reading the GPU…".to_string()
         } else {
-            "  NVML (libnvidia-ml.so.1) is not available: is the NVIDIA driver loaded?"
+            match &app.snap.gpu_error {
+                Some(e) => format!("  NVML is not available: {e}. Trying again."),
+                None => "  NVML (libnvidia-ml.so.1) is not available.".to_string(),
+            }
         };
-        f.render_widget(Paragraph::new(msg).fg(DIM), inner);
+        f.render_widget(Paragraph::new(msg).fg(DIM).wrap(Wrap { trim: true }), inner);
         return;
     };
     let [heroes, rest] = Layout::vertical([Constraint::Length(5), Constraint::Min(1)]).areas(inner);

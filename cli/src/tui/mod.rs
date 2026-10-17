@@ -1150,6 +1150,25 @@ mod tests {
     }
 
     #[test]
+    fn the_gpu_panel_shows_why_nvml_is_not_available() {
+        use ratatui::backend::TestBackend;
+        let mut t = Terminal::new(TestBackend::new(170, 46)).unwrap();
+        let mut a = app();
+        a.snap.gpu = None;
+        a.snap.gpu_error = Some("nvmlInit_v2 failed: Driver Not Loaded (9)".into());
+        t.draw(|f| draw::draw(f, &mut a)).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("nvmlInit_v2 failed: Driver Not Loaded (9)"));
+        assert!(text.contains("trying again"));
+    }
+
+    #[test]
     fn draws_every_tab_and_modal_at_any_size() {
         use ratatui::backend::TestBackend;
         for (w, h) in [(20, 8), (80, 24), (120, 40), (240, 70)] {
