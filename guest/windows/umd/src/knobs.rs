@@ -554,6 +554,23 @@ pub(crate) fn nvk_composed_complete() -> bool {
     })
 }
 
+/// `NvkBltFence`: 1 (default) = a blt-model present (DXGI's `Blt` flag, no
+/// `Flip`) is never treated as a frame DWM samples directly, even when DXGI
+/// gives no destination: the KMD's Blt copies the source into the window's
+/// redirection surface, and that copy waits for the frame's RM fence on the
+/// copy engine or the HPD worker, so the frame carries the fence and the
+/// presenting thread does not wait for it (`NvkComposedComplete` keeps its CPU
+/// wait for flip-model buffers). 0 = such presents take the
+/// `NvkComposedComplete` rule too (the CPU wait before every windowed blt-model
+/// present). `HELIOS_NVK_BLT_FENCE` overrides it per process.
+pub(crate) static NVK_BLT_FENCE: BoolKnob = BoolKnob::new(c"NvkBltFence", true);
+
+/// `NvkBltFence`, or `HELIOS_NVK_BLT_FENCE` from the environment.
+pub(crate) fn nvk_blt_fence() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| env_bool("HELIOS_NVK_BLT_FENCE").unwrap_or_else(|| NVK_BLT_FENCE.get()))
+}
+
 /// `NvkRmCopyRecord`: 1 (default) = a composed NVK frame whose WDDM present
 /// carries an RM fence also carries the copy-engine Present record (`'HEF3'`,
 /// the 168-byte `HERF` / 192-byte `HEPR`, docs/rm-copy-engine-present.md 12)

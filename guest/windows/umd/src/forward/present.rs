@@ -1587,8 +1587,9 @@ const HELIOS_ICD_CAP_PRESENT_FENCE_KMD: u32 = 1 << 6;
 /// Heaven frame went without a record ("copy-engine record 0 (without 0,
 /// refused 0)") and the KMD's route fell back on every one (`CeRtRecNone`).
 ///
-/// `dwm_reads_source`: no DXGI destination (a flip-model swap chain presents its
-/// own buffer, which DWM samples directly). Such a frame, unless it is a
+/// `dwm_reads_source`: no DXGI destination and not a blt-model present
+/// ([`nvk_dwm_reads_source`]: a flip-model swap chain presents its own buffer,
+/// which DWM samples directly). Such a frame, unless it is a
 /// primary, is made complete before the WDDM present (`NvkComposedComplete`):
 /// DWM on NVK samples from its own RM channel, which the fence that retires the
 /// present's DMA buffer does not hold.
@@ -1790,6 +1791,22 @@ unsafe fn nvk_present_frame(
         }
     }
     Ok(NvkFrame::default())
+}
+
+/// `DXGI_DDI_PRESENT_FLAGS`: `Blt` (bit 0) and `Flip` (bit 1).
+const DXGI_PRESENT_FLAG_BLT: u32 = 1 << 0;
+const DXGI_PRESENT_FLAG_FLIP: u32 = 1 << 1;
+
+/// Does DWM sample this present's source directly (`nvk_present_frame`'s `dwm_reads_source`)?
+/// Only a present with no DXGI destination can be one, and with `NvkBltFence` not a blt-model
+/// present (`Blt` without `Flip`): its source is read by the KMD's Blt into the window's
+/// redirection surface, a copy that waits for the frame's RM fence; DWM composes that surface,
+/// not the source. A flip-model buffer is DWM's to sample from its own RM channel, which no WDDM
+/// wait holds.
+fn nvk_dwm_reads_source(no_destination: bool, present_flags: u32, blt_fence: bool) -> bool {
+    let blt_model = present_flags & DXGI_PRESENT_FLAG_BLT != 0
+        && present_flags & DXGI_PRESENT_FLAG_FLIP == 0;
+    no_destination && !(blt_fence && blt_model)
 }
 
 /// [`nvk_marker_fence`] for a fence DXVK's submission thread signals after the
@@ -2245,7 +2262,13 @@ unsafe fn nvk_present_impl_timed(
         }
     }
     t.mark(0);
-    let frame = match nvk_present_frame(h, shown, src_h, dst_h.pDrvPrivate.is_null()) {
+    let present_flags = *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32);
+    let dwm_reads_source = nvk_dwm_reads_source(
+        dst_h.pDrvPrivate.is_null(),
+        present_flags,
+        crate::knobs::nvk_blt_fence(),
+    );
+    let frame = match nvk_present_frame(h, shown, src_h, dwm_reads_source) {
         Ok(f) => f,
         Err(hr) => return hr,
     };
@@ -3648,7 +3671,12 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
 
     let mut nvk_correlation = PresentStreamCorrelation::default();
     if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
-        match nvk_present_frame(h, src_h, src_h, dst_h.pDrvPrivate.is_null()) {
+        let dwm_reads_source = nvk_dwm_reads_source(
+            dst_h.pDrvPrivate.is_null(),
+            *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
+            crate::knobs::nvk_blt_fence(),
+        );
+        match nvk_present_frame(h, src_h, src_h, dwm_reads_source) {
             Ok(frame) if !nvk_scanout_compose(frame) => return 0,
             Ok(frame) => {
                 nvk_correlation = frame.correlation;
@@ -3747,6 +3775,26 @@ mod nvk_frame_composes_tests {
         assert!(!nvk_frame_composes(true, None, 0));
         // DWM that does not import NVK surfaces composes nothing.
         assert!(!nvk_frame_composes(false, Some(7), 1));
+    }
+}
+
+#[cfg(test)]
+mod nvk_dwm_reads_source_tests {
+    use super::{nvk_dwm_reads_source, DXGI_PRESENT_FLAG_BLT, DXGI_PRESENT_FLAG_FLIP};
+
+    #[test]
+    fn a_blt_model_present_carries_the_fence() {
+        // Windowed blt model, no DXGI destination: the KMD's Blt reads the source.
+        assert!(!nvk_dwm_reads_source(true, DXGI_PRESENT_FLAG_BLT, true));
+        // `NvkBltFence` 0: the flip-model rule, as before.
+        assert!(nvk_dwm_reads_source(true, DXGI_PRESENT_FLAG_BLT, false));
+        // Flip model: DWM samples the buffer itself.
+        assert!(nvk_dwm_reads_source(true, DXGI_PRESENT_FLAG_FLIP, true));
+        assert!(nvk_dwm_reads_source(true, DXGI_PRESENT_FLAG_FLIP | DXGI_PRESENT_FLAG_BLT, true));
+        assert!(nvk_dwm_reads_source(true, 0, true));
+        // A DXGI destination: the KMD copies out of it, never sampled directly.
+        assert!(!nvk_dwm_reads_source(false, DXGI_PRESENT_FLAG_FLIP, true));
+        assert!(!nvk_dwm_reads_source(false, 0, false));
     }
 }
 

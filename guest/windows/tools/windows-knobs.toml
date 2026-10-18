@@ -686,6 +686,12 @@ class = "tuning"
 read = "once per process"
 effect = "1: a composed NVK present's RM fence takes a value reserved at the Present call and signalled by DXVK's submission thread, so the presenting thread does not wait for DXVK's worker threads; 0 waits for the submission first. HELIOS_NVK_ASYNC_PRESENT_FENCE overrides it per process."
 
+[umd.NvkBltFence]
+class = "tuning"
+read = "once per process"
+effect = "1: a windowed blt-model present (DXGI's Blt flag) carries the frame's RM fence and does not wait for the GPU on the presenting thread, even with no DXGI destination: the KMD's Blt into the window's redirection surface waits for the fence. NvkComposedComplete then applies only to flip-model buffers DWM samples directly. 0: blt-model presents without a DXGI destination take the NvkComposedComplete CPU wait too. HELIOS_NVK_BLT_FENCE overrides it per process."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
 [umd.NvkComposedComplete]
 class = "supported"
 read = "once per process"
@@ -1067,6 +1073,11 @@ see = "[shared-surfaces.md](../guest/windows/docs/shared-surfaces.md)"
 class = "debug"
 read = "once per process"
 effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios NvkAsyncPresentFence for this process."
+
+[env.HELIOS_NVK_BLT_FENCE]
+class = "debug"
+read = "once per process"
+effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios NvkBltFence for this process."
 
 [env.HELIOS_NVK_COMPOSED_COMPLETE]
 class = "debug"
