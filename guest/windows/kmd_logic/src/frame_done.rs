@@ -67,6 +67,9 @@ struct Pending {
 pub struct Table {
     pub entries: [Entry; SLOTS],
     pending: [Pending; PENDING],
+    /// Live records in `pending`: every operation that finds it 0 returns at once, so fences
+    /// of frames nobody tracks (D3D12 `ExecuteCommandLists`, scanout presents) cost one compare.
+    live: u32,
     seq: u64,
     /// Frames not tracked (no slot whose buffer had nothing pending), or whose pending record
     /// had to be dropped (the pending list full: the oldest of the context counted done).
@@ -95,6 +98,7 @@ impl Table {
         Self {
             entries: [Entry { resid: 0, owner: 0, submitted: 0, completed: 0, writing: false }; SLOTS],
             pending: [Pending { live: false, seq: 0, gate: 0, slot: 0, owner: 0, fence: 0 }; PENDING],
+            live: 0,
             seq: 0,
             overflow: 0,
         }
@@ -145,6 +149,7 @@ impl Table {
                 }
             };
             self.pending[free] = Pending { live: true, seq, gate, slot: slot as u8, owner, fence };
+            self.live += 1;
         }
         changed | self.recompute_writing()
     }
@@ -165,9 +170,13 @@ impl Table {
     /// Every pending frame of `gate` (and `owner`) up to `seq` finished.
     fn finish_through(&mut self, gate: u8, owner: u32, seq: u64) -> Changed {
         let mut changed: Changed = 0;
+        if self.live == 0 {
+            return 0;
+        }
         for p in self.pending.iter_mut() {
             if p.live && p.gate == gate && p.owner == owner && p.seq <= seq {
                 p.live = false;
+                self.live -= 1;
                 let e = &mut self.entries[p.slot as usize];
                 if e.completed < p.seq {
                     e.completed = p.seq;
@@ -204,7 +213,7 @@ impl Table {
     /// RM fence `fence` of `owner` fired (or expired, or was cancelled with its gate): its frame
     /// and every earlier frame of the same gate finished. Returns the slots that changed.
     pub fn fire(&mut self, fence: u32, owner: u32) -> Changed {
-        if fence == 0 {
+        if fence == 0 || self.live == 0 {
             return 0;
         }
         let Some(p) = self.pending.iter().find(|p| p.live && p.fence == fence && p.owner == owner).copied()
@@ -216,6 +225,9 @@ impl Table {
 
     /// Gate `gate` of `owner` went (cancelled, purged): its pending frames count finished.
     pub fn finish_gate(&mut self, gate: u8, owner: u32) -> Changed {
+        if self.live == 0 {
+            return 0;
+        }
         self.finish_through(gate, owner, u64::MAX) | self.recompute_writing()
     }
 
@@ -224,6 +236,7 @@ impl Table {
         for p in self.pending.iter_mut() {
             if p.live && p.owner == owner {
                 p.live = false;
+                self.live -= 1;
             }
         }
         let mut changed: Changed = 0;
@@ -238,7 +251,12 @@ impl Table {
 
     /// Frames pending now (diagnostics).
     pub fn pending_count(&self) -> usize {
-        self.pending.iter().filter(|p| p.live).count()
+        self.live as usize
+    }
+
+    /// Nothing pending: a fence fire or a gate purge has nothing to do here.
+    pub const fn quiet(&self) -> bool {
+        self.live == 0
     }
 }
 
@@ -359,6 +377,23 @@ mod tests {
         assert!(t.entries.iter().all(|e| e.resid != 2));
         assert_eq!(t.pending_count(), 0);
         assert_eq!(t.submit(0, O, G, 7, false), 0);
+    }
+
+    #[test]
+    fn the_live_count_follows_the_records_and_a_quiet_table_ignores_fences() {
+        let mut t = Table::new();
+        assert!(t.quiet());
+        assert_eq!(t.fire(5, O), 0);
+        t.submit(1, O, G, 5, false);
+        t.submit(2, O, G, 6, false);
+        assert_eq!(t.pending_count(), 2);
+        t.fire(5, O);
+        assert_eq!(t.pending_count(), 1);
+        t.fire(6, O);
+        assert!(t.quiet());
+        t.submit(3, O, G, 7, false);
+        t.forget_owner(O);
+        assert!(t.quiet());
     }
 
     #[test]

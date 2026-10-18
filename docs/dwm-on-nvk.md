@@ -340,6 +340,7 @@ service key):
 | app (D3D11) | `FlipUpgrade: swap chain #1 upgraded: swap effect 0 -> 4 (FLIP_DISCARD) ...` | the chain is flip-model |
 | app (D3D11) | `FlipLedger: N flip-model presents without a CPU wait; the KMD's frame-done table tracks the buffer ...` | the app does not wait |
 | KMD | `FdSub` (frames recorded), `FdFire` (fences that finished at least one frame; a fence also finishes the earlier frames of its context, so `FdFire` may stay below `FdSub`), `FdPend` (frames pending after the last change), `FdOvf` (frames not tracked) | `FdPend` small (the frames the app is ahead of the GPU, about 1-3), `FdOvf` 0 |
+| KMD | `FdD11` / `FdD12` (presents that named their buffer, per carrier) | a fullscreen app on scanout 0 sends no fence with its present: it adds nothing; with nothing pending a fence fire costs the table one compare |
 | DWM | `DWM on NVK: X presents/s, Y new app flip frames shown/s ...; binds of app flip buffers: newest frame done A, newest done frame chosen B, last frame kept C, bound in flight (nothing to choose) D, not tracked E (in a tracked chain F); R read points ...` (once a second) | X is DWM's composition rate; Y is the app frames DWM put on screen per second: about min(app fps, X) for one window; C grows only while the app is slower than X; D stays near 0 after a chain's first frame; E counts other windows whose apps complete their frames before the present, F should stay near 0 |
 | DWM | `handoff waits: N sleeps ...` | must not appear |
 

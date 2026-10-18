@@ -79,7 +79,8 @@ pub use nvrm_events::{
 
 pub use rm_gates::{
     publish_rm_gate_counters, rm_gates_open, EclVerdict, GateAttached, GateRefusal, ECL_HINT_ESCAPES,
-    ECL_HINT_FIRED, ECL_HINT_LATE, ECL_HINT_REFUSED, ECL_HINT_WHY, RMG_EXPIRE_MS, RMG_REFUSED,
+    ECL_HINT_FIRED, ECL_HINT_LATE, ECL_HINT_REFUSED, ECL_HINT_WHY, FD_FROM_D3D11, FD_FROM_D3D12,
+    RMG_EXPIRE_MS, RMG_REFUSED,
 };
 
 pub use nvrm_tables::{

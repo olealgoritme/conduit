@@ -73,6 +73,10 @@ pub static FD_FIRED: AtomicU32 = AtomicU32::new(0);
 pub static FD_OVERFLOW: AtomicU32 = AtomicU32::new(0);
 /// Frames pending in the frame-done table after its last change (`FdPend`).
 pub static FD_PENDING: AtomicU32 = AtomicU32::new(0);
+/// Presents that named their buffer for the table, per carrier: D3D11 `HERF` (`FdD11`), D3D12
+/// `HEPR` (`FdD12`). A fullscreen app on scanout 0 sends no fence with its present: 0 for it.
+pub static FD_FROM_D3D11: AtomicU32 = AtomicU32::new(0);
+pub static FD_FROM_D3D12: AtomicU32 = AtomicU32::new(0);
 pub static RMG_WHY: AtomicU32 = AtomicU32::new(0);
 pub static RMG_WHY_MASK: AtomicU32 = AtomicU32::new(0);
 /// Completion hints (`HELIOS_ESCAPE_ECL_DONE`, `helios_kmd_logic::ecl_done`): escapes
@@ -134,6 +138,8 @@ pub fn publish_rm_gate_counters() {
     rec(b"FdFire", FD_FIRED.load(Ordering::Relaxed));
     rec(b"FdOvf", FD_OVERFLOW.load(Ordering::Relaxed));
     rec(b"FdPend", FD_PENDING.load(Ordering::Relaxed));
+    rec(b"FdD11", FD_FROM_D3D11.load(Ordering::Relaxed));
+    rec(b"FdD12", FD_FROM_D3D12.load(Ordering::Relaxed));
 }
 
 /// One gate: the process and context it belongs to (context 0: shared by the process's
@@ -498,6 +504,11 @@ impl VirtioGpu {
     /// earlier frame of its gate are finished.
     fn frame_done_fire(&mut self, fence: u32, process: usize) {
         use helios_kmd_logic::frame_done::owner_of;
+        if self.frame_done.quiet() {
+            // No tracked frame pending (an `ExecuteCommandLists` fence, a fullscreen app): one
+            // compare, no publication.
+            return;
+        }
         let changed = self.frame_done.fire(fence, owner_of(process));
         if changed != 0 {
             FD_FIRED.fetch_add(1, Ordering::Relaxed);
@@ -507,6 +518,9 @@ impl VirtioGpu {
 
     /// Copy the changed frame-done slots into the read-ledger page.
     fn frame_done_publish(&self, changed: helios_kmd_logic::frame_done::Changed) {
+        if changed == 0 {
+            return;
+        }
         let mut bits = changed;
         while bits != 0 {
             let i = bits.trailing_zeros() as usize;
@@ -592,7 +606,7 @@ impl VirtioGpu {
     /// many points were pending.
     fn rm_gate_cancel(&mut self, gi: usize) -> u32 {
         let pending = self.rm_gates[gi].gate.pending();
-        {
+        if !self.frame_done.quiet() {
             // Its frames are no longer pending for anyone reading the frame-done table.
             let owner = helios_kmd_logic::frame_done::owner_of(self.rm_gates[gi].process);
             let changed = self.frame_done.finish_gate(gi as u8, owner);

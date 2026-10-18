@@ -2526,6 +2526,9 @@ pub unsafe extern "C" fn dxgkddi_render(
                     if stream_tail_zero {
                         // `source_index`: the presented buffer's resource id on an NVK
                         // flip-model frame (`FlipLedger`), 0 on every other present.
+                        if command.source_index != 0 {
+                            crate::virtio::gpu::FD_FROM_D3D11.fetch_add(1, Ordering::Relaxed);
+                        }
                         let marker = creator
                             .and_then(|process| {
                                 attach_or_take_fence_tail(
@@ -2742,6 +2745,10 @@ pub unsafe extern "C" fn dxgkddi_render(
                                 && private.present_value == 0
                                 && private.present_cookie == 0;
                             if stream_tail_zero {
+                                if private.resource_id != 0 {
+                                    crate::virtio::gpu::FD_FROM_D3D12
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 let marker = creator.and_then(|process| {
                                     attach_or_take_fence_tail(
                                         adapter,
