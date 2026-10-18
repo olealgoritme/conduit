@@ -485,6 +485,89 @@ const SLOT_GENERATION_OFF: usize = offset_of!(HeliosReadLedgerSlot, generation);
 const SLOT_ISSUED_OFF: usize = offset_of!(HeliosReadLedgerSlot, issued);
 const SLOT_RETIRED_OFF: usize = offset_of!(HeliosReadLedgerSlot, retired);
 
+/// One buffer's line of the KMD's frame-done table (`FlipLedger`,
+/// `helios_protocol::HeliosFrameDoneTable`): `completed >= submitted` = no frame of the buffer
+/// in flight on the GPU; a larger `completed` = a newer done frame; `owner` = the presenting
+/// process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameDone {
+    pub(crate) owner: u32,
+    pub(crate) submitted: u64,
+    pub(crate) completed: u64,
+}
+
+impl FrameDone {
+    pub(crate) fn idle(self) -> bool {
+        self.completed >= self.submitted
+    }
+}
+
+const FD_MAGIC_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneTable, magic);
+const FD_VERSION_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneTable, version);
+const FD_SLOT_COUNT_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneTable, slot_count);
+const FD_SLOTS_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneTable, slots);
+const FD_SLOT_SIZE: usize = size_of::<helios_protocol::HeliosFrameDoneSlot>();
+const FD_RESID_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, resid);
+const FD_OWNER_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, owner);
+const FD_SUBMITTED_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, submitted);
+const FD_COMPLETED_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, completed);
+
+/// The frame-done table's address in a live ledger mapping, when the KMD wrote one.
+///
+/// # Safety
+/// `va` is a live mapping of the whole ledger page (the escape maps 4 KiB).
+unsafe fn frame_done_table(va: usize) -> Option<usize> {
+    let base = va + helios_protocol::HELIOS_FRAME_DONE_OFFSET;
+    // SAFETY: inside the mapped page.
+    let ok = unsafe {
+        ledger_load(base, FD_MAGIC_OFF) == helios_protocol::HELIOS_FRAME_DONE_MAGIC
+            && ledger_load(base, FD_VERSION_OFF) == helios_protocol::HELIOS_FRAME_DONE_VERSION
+            && ledger_load(base, FD_SLOT_COUNT_OFF) == helios_protocol::HELIOS_FRAME_DONE_SLOTS as u32
+    };
+    ok.then_some(base)
+}
+
+/// Does the KMD publish the frame-done table (a KMD from 22.22.405.124 on)?
+pub(crate) fn frame_done_available() -> bool {
+    let Ok(reg) = REGISTRY.lock() else {
+        return false;
+    };
+    let Some(va) = reg.iter().find(|e| ledger_live(e)).map(|e| e.ledger_va) else {
+        return false;
+    };
+    // SAFETY: a registered live mapping, held by the registry mutex for the read.
+    unsafe { frame_done_table(va) }.is_some()
+}
+
+/// The frame-done line of buffer `resid`. `None`: no table, or the KMD tracks no frame of it.
+/// Reads `completed` before `submitted`, so a frame submitted meanwhile reads as in flight,
+/// never as done early; the resid is re-checked after the counters.
+pub(crate) fn frame_done_lookup(resid: u32) -> Option<FrameDone> {
+    if resid == 0 {
+        return None;
+    }
+    let reg = REGISTRY.lock().ok()?;
+    let va = reg.iter().find(|e| ledger_live(e)).map(|e| e.ledger_va)?;
+    // SAFETY: a registered live mapping, held by the registry mutex for every read below.
+    unsafe {
+        let base = frame_done_table(va)?;
+        for i in 0..helios_protocol::HELIOS_FRAME_DONE_SLOTS {
+            let slot = base + FD_SLOTS_OFF + i * FD_SLOT_SIZE;
+            if ledger_load(slot, FD_RESID_OFF) != resid {
+                continue;
+            }
+            let owner = ledger_load(slot, FD_OWNER_OFF);
+            let completed = ledger_load_u64(slot, FD_COMPLETED_OFF);
+            let submitted = ledger_load_u64(slot, FD_SUBMITTED_OFF);
+            if ledger_load(slot, FD_RESID_OFF) != resid {
+                return None;
+            }
+            return Some(FrameDone { owner, submitted, completed });
+        }
+    }
+    None
+}
+
 /// Validate a freshly-mapped ledger page's complete v2 header. A mismatch
 /// means a driver skew and the feature must treat the page as absent.
 ///

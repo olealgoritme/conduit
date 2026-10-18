@@ -220,11 +220,6 @@ struct HeliosDxvkDevice {
   void handoff_unregister(std::size_t d3d11_resource_ptr) const noexcept;
   std::int32_t handoff_publish(const std::size_t* resources,
                                std::uint32_t resource_count) const noexcept;
-  // FlipLedger (DWM): the newest point another process published on the
-  // resource's key (an app's flip-model buffer): 0 none, 1 complete, 2
-  // pending; *record = the publishing device's ledger record.
-  std::int32_t handoff_flip_state(std::size_t d3d11_resource_ptr, std::uint32_t* record,
-                                  std::uint64_t* point) const noexcept;
   // FlipLedger: ask the resource's ledger key again (RotateResourceIdentities
   // moved another storage under it). Returns the key, 0 when it has none.
   std::uint32_t handoff_refresh_key(std::size_t d3d11_resource_ptr) const noexcept;

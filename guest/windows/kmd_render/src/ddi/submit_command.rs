@@ -1885,11 +1885,16 @@ impl GateKey {
 /// caller's; `HERF` / `HEPR`: [`take_fence_tail`]).
 /// The table work runs at DISPATCH under `virtio_lock`: scans and fixed-array writes
 /// only. The rest is PASSIVE (`DxgkDdiRender`).
+///
+/// `frame_resid`: the presented buffer's resource id when the present names it (a flip-model
+/// frame DWM composes directly), 0 otherwise; the frame-done table tracks it with the fence
+/// (`helios_kmd_logic::frame_done`).
 fn attach_rm_fence_marker(
     adapter: &AdapterContext,
     process: usize,
     gate_key: GateKey,
     tail: &helios_protocol::HeliosRmFenceTail,
+    frame_resid: u32,
 ) -> Result<crate::adapter::PresentStreamMarker, crate::virtio::gpu::GateRefusal> {
     use crate::virtio::gpu::GateRefusal;
     if !tail.is_fence() {
@@ -1903,6 +1908,7 @@ fn attach_rm_fence_marker(
             gate_key.context,
             gate_key.bound,
             gate_key.may_share,
+            frame_resid,
         )
     }) {
         Ok(Ok(attached)) => attached,
@@ -1972,8 +1978,9 @@ fn attach_or_take_fence_tail(
     process: usize,
     gate_key: GateKey,
     tail: &helios_protocol::HeliosRmFenceTail,
+    frame_resid: u32,
 ) -> Option<crate::adapter::PresentStreamMarker> {
-    match attach_rm_fence_marker(adapter, process, gate_key, tail) {
+    match attach_rm_fence_marker(adapter, process, gate_key, tail, frame_resid) {
         Ok(marker) => Some(marker),
         Err(_) => {
             take_fence_tail(adapter, Some(process), tail);
@@ -2066,7 +2073,7 @@ unsafe fn flush_gate_record(
             .with_virtio(|v| v.flush_stream_marker_boundary(ctx_id, value, cookie, process))
             .ok()
             .flatten(),
-        Carrier::Fence => attach_or_take_fence_tail(adapter, process, GateKey::of(context), &tail)
+        Carrier::Fence => attach_or_take_fence_tail(adapter, process, GateKey::of(context), &tail, 0)
             .map(|marker| marker.rm_boundary)
             .filter(|boundary| *boundary != 0),
     };
@@ -2308,7 +2315,7 @@ pub unsafe extern "C" fn dxgkddi_render(
                     crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
-                let marker = attach_rm_fence_marker(adapter, process, gate_key, &v4.fence).ok()?;
+                let marker = attach_rm_fence_marker(adapter, process, gate_key, &v4.fence, 0).ok()?;
                 (marker.rm_boundary, 0)
             } else {
                 let command = if cmd_len == size_of::<helios_protocol::HeliosD3D12SubmitCmd>() {
@@ -2517,6 +2524,8 @@ pub unsafe extern "C" fn dxgkddi_render(
                     })
                 } else if let Some(tail) = fence_tail {
                     if stream_tail_zero {
+                        // `source_index`: the presented buffer's resource id on an NVK
+                        // flip-model frame (`FlipLedger`), 0 on every other present.
                         let marker = creator
                             .and_then(|process| {
                                 attach_or_take_fence_tail(
@@ -2524,6 +2533,7 @@ pub unsafe extern "C" fn dxgkddi_render(
                                     process,
                                     GateKey::of(context.as_ref()),
                                     &tail,
+                                    command.source_index,
                                 )
                             });
                         if let Some(context) = context.as_ref() {
@@ -2738,6 +2748,7 @@ pub unsafe extern "C" fn dxgkddi_render(
                                         process,
                                         GateKey::of(context.as_ref()),
                                         &tail,
+                                        private.resource_id,
                                     )
                                 });
                                 if let Some(context) = context.as_ref() {

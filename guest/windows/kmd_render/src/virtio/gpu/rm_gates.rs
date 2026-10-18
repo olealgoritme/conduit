@@ -64,6 +64,12 @@ pub static RMG_EXPIRE_MS: AtomicU32 = AtomicU32::new(0);
 /// The last refusal of `rm_gate_attach` (`RmGWhy`: 1 unsupported, 2 not owned, 3 not a fence,
 /// 4 no gate or stream slot free, 5 the process's gate has no point free) and every reason seen
 /// (`RmGWhyMsk`, bit `1 << (code - 1)`).
+/// The frame-done table (`FlipLedger`): frames recorded with their buffer (`FdSub`), fences that
+/// marked a buffer's frame done (`FdFire`), frames not recorded for lack of an idle slot
+/// (`FdOvf`).
+pub static FD_SUBMITTED: AtomicU32 = AtomicU32::new(0);
+pub static FD_FIRED: AtomicU32 = AtomicU32::new(0);
+pub static FD_OVERFLOW: AtomicU32 = AtomicU32::new(0);
 pub static RMG_WHY: AtomicU32 = AtomicU32::new(0);
 pub static RMG_WHY_MASK: AtomicU32 = AtomicU32::new(0);
 /// Completion hints (`HELIOS_ESCAPE_ECL_DONE`, `helios_kmd_logic::ecl_done`): escapes
@@ -121,6 +127,9 @@ pub fn publish_rm_gate_counters() {
     rec(b"RmGShare", RMG_SHARED.load(Ordering::Relaxed));
     rec(b"RmGNoGate", RMG_NO_GATE.load(Ordering::Relaxed));
     rec(b"RmGDeadSub", RMG_DEAD_SUBMIT.load(Ordering::Relaxed));
+    rec(b"FdSub", FD_SUBMITTED.load(Ordering::Relaxed));
+    rec(b"FdFire", FD_FIRED.load(Ordering::Relaxed));
+    rec(b"FdOvf", FD_OVERFLOW.load(Ordering::Relaxed));
 }
 
 /// One gate: the process and context it belongs to (context 0: shared by the process's
@@ -282,6 +291,10 @@ impl VirtioGpu {
     /// rollback exists in the normal flow. The probe and the attach are one
     /// `virtio_lock` hold (this takes `&mut self`), so the attach cannot then refuse;
     /// if it ever did, a gate this call opened is closed again.
+    ///
+    /// `frame_resid` (nonzero): the present names its buffer; the frame-done table tracks the
+    /// buffer's frame with this fence (`helios_kmd_logic::frame_done`), in the same lock hold,
+    /// so a fire can never come before the frame is recorded.
     pub fn rm_gate_attach(
         &mut self,
         fence: u32,
@@ -289,6 +302,7 @@ impl VirtioGpu {
         context: usize,
         bound: u32,
         may_share: bool,
+        frame_resid: u32,
     ) -> Result<GateAttached, GateRefusal> {
         let refuse_code = |why: GateRefusal, code: u32| {
             RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -359,6 +373,9 @@ impl VirtioGpu {
             }
         };
         RMG_ATTACHED.fetch_add(1, Ordering::Relaxed);
+        if frame_resid != 0 {
+            self.frame_done_submit(frame_resid, process, fence, early.is_some());
+        }
         if shared {
             // From now on the gate is the process's: no context's teardown purges it.
             self.rm_gates[gi].context = 0;
@@ -453,7 +470,33 @@ impl VirtioGpu {
             }
             self.rm_gate_sync(gi);
         }
+        self.frame_done_fire(fence, self.rm_gates[gi].process);
         self.fence_want_close(fence);
+    }
+
+    /// `FlipLedger`: a frame of buffer `resid` was submitted with `fence` (fired already:
+    /// `fired`); the frame-done table and its page copy follow.
+    fn frame_done_submit(&mut self, resid: u32, process: usize, fence: u32, fired: bool) {
+        use helios_kmd_logic::frame_done::owner_of;
+        match self.frame_done.submit(resid, owner_of(process), fence, fired) {
+            Some(i) => {
+                FD_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+                crate::adapter::read_ledger::publish_frame_done(i, &self.frame_done.entries[i]);
+            }
+            None => {
+                FD_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                crate::adapter::read_ledger::publish_frame_done_overflow(self.frame_done.overflow);
+            }
+        }
+    }
+
+    /// `FlipLedger`: `fence` of `process` fired, expired or was cancelled.
+    fn frame_done_fire(&mut self, fence: u32, process: usize) {
+        use helios_kmd_logic::frame_done::owner_of;
+        if let Some(i) = self.frame_done.fire(fence, owner_of(process)) {
+            FD_FIRED.fetch_add(1, Ordering::Relaxed);
+            crate::adapter::read_ledger::publish_frame_done(i, &self.frame_done.entries[i]);
+        }
     }
 
     /// A completion hint (`HELIOS_ESCAPE_ECL_DONE`) from process `process` (its
@@ -514,6 +557,7 @@ impl VirtioGpu {
             while let Some(fence) = self.rm_gates[gi].gate.take_expired(now_ms, limit_ms) {
                 RMG_EXPIRED.fetch_add(1, Ordering::Relaxed);
                 RMG_FIRED.fetch_add(1, Ordering::Relaxed);
+                self.frame_done_fire(fence, self.rm_gates[gi].process);
                 self.fence_want_close(fence);
                 any = true;
                 n += 1;
@@ -535,6 +579,8 @@ impl VirtioGpu {
             let Some(fence) = self.rm_gates[gi].gate.take_unfired() else {
                 break;
             };
+            // A cancelled frame is no longer in flight for anyone reading the table.
+            self.frame_done_fire(fence, self.rm_gates[gi].process);
             self.fence_want_close(fence);
         }
         let si = self.rm_gates[gi].stream_index;

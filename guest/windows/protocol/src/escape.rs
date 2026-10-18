@@ -603,6 +603,65 @@ unsafe impl Zeroable for HeliosReadLedgerPage {}
 // implicit padding.
 unsafe impl Pod for HeliosReadLedgerPage {}
 
+// ---------------------------------------------------------------------------
+// The frame-done table (`FlipLedger`, docs/dwm-on-nvk.md 4.5), in the same page
+// ---------------------------------------------------------------------------
+
+/// `"HFDT"` — first word of the frame-done table.
+pub const HELIOS_FRAME_DONE_MAGIC: u32 = 0x5444_4648;
+/// Current frame-done table layout version.
+pub const HELIOS_FRAME_DONE_VERSION: u32 = 1;
+/// Buffers tracked at once (an LRU over buffers with no frame in flight).
+pub const HELIOS_FRAME_DONE_SLOTS: usize = 64;
+/// Byte offset of [`HeliosFrameDoneTable`] inside the page
+/// `HELIOS_ESCAPE_MAP_READ_LEDGER` maps (after [`HeliosReadLedgerPage`], in its
+/// reserved remainder). A reader that maps the ledger page reads it there.
+pub const HELIOS_FRAME_DONE_OFFSET: usize = 2304;
+
+/// One buffer's frames as the KMD saw them. A present whose WDDM marker
+/// carries an RM fence and names the presented buffer's resource id (the
+/// `HERF` `source_index`, the `HEPR` `resource_id`) bumps `submitted` to a
+/// fresh value of one KMD-wide sequence; when the fence fires (or expires, or
+/// its gate is cancelled) `completed` becomes that value. So `completed >=
+/// submitted` means no frame of the buffer is in flight on the GPU, and the
+/// buffer with the larger `completed` holds the newer done frame. `owner`
+/// names the presenting process (a hash of its kernel process handle): buffers
+/// of one swap chain share it.
+///
+/// The KMD writes `resid` 0, then the counters, then `resid` when it gives a
+/// slot to another buffer; a reader matches `resid`, reads `owner`,
+/// `submitted`, `completed`, and re-reads `resid` (Acquire loads throughout).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosFrameDoneSlot {
+    /// KMD resource id of the buffer; 0 = free.
+    pub resid: u32,
+    pub owner: u32,
+    pub submitted: u64,
+    pub completed: u64,
+}
+
+/// The frame-done table at [`HELIOS_FRAME_DONE_OFFSET`] of the ledger page.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HeliosFrameDoneTable {
+    /// == [`HELIOS_FRAME_DONE_MAGIC`] (written last); anything else: no table.
+    pub magic: u32,
+    /// == [`HELIOS_FRAME_DONE_VERSION`].
+    pub version: u32,
+    /// == [`HELIOS_FRAME_DONE_SLOTS`].
+    pub slot_count: u32,
+    /// Frames the KMD could not track (every slot had a frame in flight).
+    pub overflow: u32,
+    pub slots: [HeliosFrameDoneSlot; HELIOS_FRAME_DONE_SLOTS],
+}
+
+const _: () = assert!(core::mem::size_of::<HeliosFrameDoneSlot>() == 24);
+const _: () = assert!(core::mem::size_of::<HeliosFrameDoneTable>() == 16 + 24 * HELIOS_FRAME_DONE_SLOTS);
+const _: () = assert!(HELIOS_FRAME_DONE_OFFSET % 8 == 0);
+const _: () = assert!(HELIOS_FRAME_DONE_OFFSET >= core::mem::size_of::<HeliosReadLedgerPage>());
+const _: () = assert!(HELIOS_FRAME_DONE_OFFSET + core::mem::size_of::<HeliosFrameDoneTable>() <= 4096);
+
 /// op values for [`HeliosEscapeMapReadLedger`] and
 /// [`HeliosEscapeScanoutEvent`]. PROBE follows the fence-event idiom: a
 /// supporting KMD answers `HELIOS_SCANOUT_ACQ_PROBE_ACK`; an old KMD fails

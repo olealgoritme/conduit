@@ -247,16 +247,6 @@ mod ffi {
             resources: *const usize,
             resource_count: u32,
         ) -> i32;
-        /// FlipLedger (DWM): the newest point another process published on
-        /// the resource's ledger key: 0 none, 1 complete, 2 pending;
-        /// `record` = the publishing device's ledger record.
-        /// # Safety: a live `ID3D11Resource*`; both pointers writable.
-        unsafe fn handoff_flip_state(
-            self: &HeliosDxvkDevice,
-            d3d11_resource_ptr: usize,
-            record: *mut u32,
-            point: *mut u64,
-        ) -> i32;
         /// FlipLedger: the resource's ledger key, asked again (after a
         /// rotation of resource identities). 0 = none.
         /// # Safety: a live `ID3D11Resource*`.
@@ -756,6 +746,10 @@ pub(crate) struct PresentStreamCorrelation {
     /// Only with an RM fence; it takes the place of the copy-engine record (the KMD copies
     /// nothing) and never comes with an on-scanout claim.
     pub(crate) window_written: Option<helios_protocol::HeliosWindowWrittenTag>,
+    /// NVK (`FlipLedger`): the presented flip-model buffer's KMD resource id, sent with the RM
+    /// fence in the `HERF` `source_index` so the KMD's frame-done table tracks its frame.
+    /// 0 = not named.
+    pub(crate) frame_resid: u32,
 }
 
 /// The already-on-scanout claim: the KMD's own names for the frame.
@@ -1116,18 +1110,6 @@ impl BridgeDevice {
         };
         // SAFETY: the slice borrows live resource pointers for the call.
         unsafe { d.handoff_publish(resources.as_ptr(), resources.len() as u32) }
-    }
-
-    /// FlipLedger (DWM): `(state, record, point)` of the newest point another process published
-    /// on `res`: state 0 none, 1 complete, 2 pending.
-    pub(crate) fn handoff_flip_state(&self, res: usize) -> (i32, u32, u64) {
-        let Some(d) = self.get() else {
-            return (0, u32::MAX, 0);
-        };
-        let (mut record, mut point) = (u32::MAX, 0u64);
-        // SAFETY: the caller passes a live resource pointer; both outs are locals.
-        let state = unsafe { d.handoff_flip_state(res, &mut record, &mut point) };
-        (state, record, point)
     }
 
     /// FlipLedger: ask `res`'s ledger key again (after RotateResourceIdentities).

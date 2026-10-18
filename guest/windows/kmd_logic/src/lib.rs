@@ -36,6 +36,7 @@ pub mod rm_window;
 pub mod foreign_copy;
 pub mod foreign_errno;
 pub mod flip_completion;
+pub mod frame_done;
 pub mod dwm_restart;
 pub mod flip_flags;
 pub mod vidmm_caps;

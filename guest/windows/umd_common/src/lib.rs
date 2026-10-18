@@ -78,7 +78,6 @@ pub mod cmd_record;
 pub mod flip_upgrade;
 pub mod format;
 pub mod frame_trace;
-pub mod handoff_ledger;
 pub mod hr;
 // Typed ABI adapters are portable; only noop::log_backtrace requires Windows.
 pub mod noop;

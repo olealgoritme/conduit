@@ -818,18 +818,20 @@ impl RuntimeSubmission {
 /// Pre-R828 this literal appeared twice, byte for byte, in two arms of the same
 /// match -- the `Present { private: None }` arm and the `Refresh` arm.
 ///
-/// `source_index`/`destination_index` are RESERVED-ZERO on this path.
-/// `submit_command.rs` validates only the magic and version and reads neither;
-/// the KMD writes its own copy with real `DXGK_PRESENT_*_INDEX` values in
-/// `display.rs`. Populating them here would be a wire-semantics change with no
-/// reader.
+/// `destination_index` is RESERVED-ZERO on this path. `source_index` is 0, or
+/// the presented flip-model buffer's resource id (`FlipLedger`,
+/// `correlation.frame_resid`): `submit_command.rs` reads it only beside an
+/// attached RM fence, for the frame-done table. The KMD writes its own copy with
+/// real `DXGK_PRESENT_*_INDEX` values in `display.rs`.
 pub(crate) fn present_refresh_cmd(
     correlation: PresentStreamCorrelation,
 ) -> HeliosPresentRefreshCmd {
     HeliosPresentRefreshCmd {
         magic: HELIOS_PRESENT_REFRESH_MAGIC,
         version: HELIOS_PRESENT_REFRESH_VERSION,
-        source_index: 0,
+        // `FlipLedger`: the presented flip-model buffer's resource id beside the RM fence (the
+        // KMD's frame-done table tracks it); 0 on every other present.
+        source_index: correlation.frame_resid,
         destination_index: 0,
         present_ctx_id: correlation.ctx_id,
         present_value: correlation.value32,
@@ -1676,19 +1678,35 @@ unsafe fn nvk_present_frame(
     };
     let caps = dev.dxvk.nvk_icd_caps();
     let fences = crate::knobs::nvk_rm_fence() && caps & HELIOS_ICD_CAP_RM_FENCE != 0;
-    // `FlipLedger`: a flip-model buffer DWM samples directly is ordered for DWM by a hand-off
-    // ledger point on its resource id instead of the CPU wait below: DWM's submission of the
-    // command list that samples it waits for the point (DXVK patches 0007/0008), so this thread
-    // does not wait and the present carries the frame's RM fence. Needs the RM fence path (the
-    // marker fence retires the present's packet behind the frame); without it, or when the
-    // ledger refuses, the frame completes as before.
-    let ledger = !scanout
+    // `FlipLedger` 1: a flip-model buffer DWM samples directly needs no CPU wait. The present's
+    // marker carries the frame's RM fence and names the buffer (`frame_resid`, the HERF
+    // `source_index`); the KMD tracks the buffer's frame with the fence in its frame-done table,
+    // and a DWM on NVK composes only buffers whose frame is done there (`forward/bindings.rs`
+    // `dwm_flip_views`), never waiting. Needs the RM fence path, the buffer's resource id and a
+    // KMD that publishes the table; otherwise the frame completes as before.
+    let frame_resid = if !scanout
         && fences
         && dwm_reads_source
         && !crate::knobs::is_dwm_process()
         && crate::knobs::flip_ledger() != 0
         && !nvk_source_is_primary(shown)
-        && nvk_flip_ledger_publish(dev, shown);
+        && crate::scanout_acquire::frame_done_available()
+        && nvk_flip_chain_len(dev, shown) >= 3
+    {
+        nvk_source_resource_id(shown).unwrap_or(0)
+    } else {
+        0
+    };
+    let ledger = frame_resid != 0;
+    if ledger {
+        let n = FLIP_NO_WAIT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 4096 == 0 {
+            log_error!(
+                "FlipLedger: {n} flip-model presents without a CPU wait; the KMD's frame-done table \
+                 tracks the buffer (resource id {frame_resid})"
+            );
+        }
+    }
     // A frame DWM samples directly is complete before DWM can see it (the S3 wait below):
     // nothing on DWM's RM channel waits for a fence in the marker.
     // DWM's own frame too (measured: the transients stayed with only the producers' frames
@@ -1734,6 +1752,7 @@ unsafe fn nvk_present_frame(
                         rm_fence_handle: fence,
                         rm_fence_value: value,
                         rm_copy,
+                        frame_resid,
                         ..PresentStreamCorrelation::default()
                     },
                     on_scanout: false,
@@ -1796,6 +1815,7 @@ unsafe fn nvk_present_frame(
                     rm_fence_handle: fence,
                     rm_fence_value: value,
                     rm_copy,
+                    frame_resid,
                     ..PresentStreamCorrelation::default()
                 },
                 on_scanout: false,
@@ -1853,7 +1873,7 @@ static DWM_RATE_WINDOW: std::sync::Mutex<Option<(std::time::Instant, usize)>> =
 /// and how many read points went out.
 unsafe fn dwm_flip_read_points(dev: &HeliosDevice) {
     let n = DWM_PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
-    if crate::knobs::flip_ledger() == 1 {
+    if crate::knobs::flip_ledger() != 0 {
         let reads = core::mem::take(&mut *lock_ignore_poison(&dev.nvk_flip_reads));
         if !reads.is_empty() {
             match dev.dxvk.handoff_publish(&reads) {
@@ -1875,14 +1895,17 @@ unsafe fn dwm_flip_read_points(dev: &HeliosDevice) {
                 let frames = n - at;
                 log_error!(
                     "DWM on NVK: {:.1} presents/s over {:.2} s; FlipLedger {}: app flip frames \
-                     bound done {}, replaced by the newest done frame {}, bound not done (DXVK \
-                     waits) {}; {} read points on app flip buffers, {} refused (totals)",
+                     bound done {}, replaced by the newest done frame {}, last frame kept {}, \
+                     bound in flight (no done frame to show) {}, not tracked {}; {} read points \
+                     on app flip buffers, {} refused (totals; DWM never waits for app frames)",
                     frames as f64 / elapsed.as_secs_f64(),
                     elapsed.as_secs_f64(),
                     crate::knobs::flip_ledger(),
-                    super::bindings::DWM_FLIP_READY.load(Ordering::Relaxed),
+                    super::bindings::DWM_FLIP_DONE.load(Ordering::Relaxed),
                     super::bindings::DWM_FLIP_SUBSTITUTED.load(Ordering::Relaxed),
-                    super::bindings::DWM_FLIP_UNREADY.load(Ordering::Relaxed),
+                    super::bindings::DWM_FLIP_REPEATED.load(Ordering::Relaxed),
+                    super::bindings::DWM_FLIP_AS_BOUND.load(Ordering::Relaxed),
+                    super::bindings::DWM_FLIP_UNTRACKED.load(Ordering::Relaxed),
                     DWM_READ_POINTS.load(Ordering::Relaxed),
                     DWM_READ_REFUSED.load(Ordering::Relaxed),
                 );
@@ -1892,51 +1915,22 @@ unsafe fn dwm_flip_read_points(dev: &HeliosDevice) {
     }
 }
 
-static FLIP_LEDGER_POINTS: AtomicUsize = AtomicUsize::new(0);
-static FLIP_LEDGER_UNCHANGED: AtomicUsize = AtomicUsize::new(0);
-static FLIP_LEDGER_REFUSED: AtomicUsize = AtomicUsize::new(0);
+static FLIP_NO_WAIT: AtomicUsize = AtomicUsize::new(0);
 
-/// `FlipLedger`: publish a hand-off ledger point of this device on the presented flip-model
-/// buffer `shown` (the frame was flushed by the caller; the point completes when everything
-/// recorded before it has run on the GPU). True when the buffer is covered: a new point, or no
-/// work since the last point (that point covers it). False: no ledger here (the bridge reports
-/// none, the table is full, or the buffer has no resource id), and the caller waits as before.
-unsafe fn nvk_flip_ledger_publish(dev: &HeliosDevice, shown: ddi::D3D10DDI_HRESOURCE) -> bool {
-    if nvk_source_resource_id(shown).map_or(true, |id| id == 0) {
-        FLIP_LEDGER_REFUSED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
+/// How many present buffers of `shown`'s size and format this device holds (`FlipLedger`): a
+/// swap chain of three or more lets DWM show the frame before while this one renders; with two,
+/// the frame before is the buffer the app renders into next, so the frame completes before its
+/// present as without `FlipLedger`.
+unsafe fn nvk_flip_chain_len(dev: &HeliosDevice, shown: ddi::D3D10DDI_HRESOURCE) -> usize {
     let Some(res) = load_resource(shown) else {
-        FLIP_LEDGER_REFUSED.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return 0;
     };
-    let rc = dev.dxvk.handoff_publish(&[res.as_raw() as usize]);
-    let (n, ok) = match rc {
-        1 => (FLIP_LEDGER_POINTS.fetch_add(1, Ordering::Relaxed) + 1, true),
-        0 => {
-            FLIP_LEDGER_UNCHANGED.fetch_add(1, Ordering::Relaxed);
-            (FLIP_LEDGER_POINTS.load(Ordering::Relaxed), true)
-        }
-        _ => {
-            let r = FLIP_LEDGER_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
-            if r <= 8 || r % 4096 == 0 {
-                log_error!(
-                    "FlipLedger: no ledger point for the flip-model buffer (rc {rc}, x{r}); the \
-                     frame completes on the CPU before its present"
-                );
-            }
-            return false;
-        }
+    let raw = res.as_raw() as usize;
+    let flips = lock_ignore_poison(&dev.nvk_flip_buffers);
+    let Some(&(_, _, w, h, f, _)) = flips.iter().find(|e| e.1 == raw) else {
+        return 0;
     };
-    if ok && (n == 1 || n % 4096 == 0) && rc == 1 {
-        log_error!(
-            "FlipLedger: {n} flip-model presents ordered for DWM by ledger points, no CPU wait \
-             ({} with no new work, {} refused)",
-            FLIP_LEDGER_UNCHANGED.load(Ordering::Relaxed),
-            FLIP_LEDGER_REFUSED.load(Ordering::Relaxed),
-        );
-    }
-    ok
+    flips.iter().filter(|e| e.2 == w && e.3 == h && e.4 == f).count()
 }
 
 /// `FlipUpgrade` (`helios_umd_common::flip_upgrade`): install the swap-effect upgrade for this

@@ -488,6 +488,7 @@ unsafe extern "system" fn create_device(
                 nvk_flip_buffers: std::sync::Mutex::new(Vec::new()),
                 nvk_flip_reads: std::sync::Mutex::new(Vec::new()),
                 nvk_flip_views: std::sync::Mutex::new(Vec::new()),
+                nvk_flip_last: std::sync::Mutex::new(Vec::new()),
                 direct_scanout_allocations: std::sync::Mutex::new(Vec::new()),
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),

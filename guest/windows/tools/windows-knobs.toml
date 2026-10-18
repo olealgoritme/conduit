@@ -608,7 +608,7 @@ effect = "The D3D11 feature-level caps profile the UMD reports: 1 the full FL11_
 [umd.FlipLedger]
 class = "supported"
 read = "once per process (DWM reads it when it starts: restart DWM after a change)"
-effect = "How a flip-model buffer of an NVK app that DWM composes directly is ordered for a DWM on NVK. 1 (default): the presenting thread does not wait; the WDDM present carries the frame's RM fence and publishes a hand-off ledger point on the buffer's resource id. DWM composes the newest done frame: a view of an app buffer whose frame is still rendering is replaced by a view of the newest done buffer of the same swap chain (three buffers or more), so DWM never waits for an app frame; only a chain with no done frame yet makes DWM wait. DWM publishes a read point on the app buffers it bound in each frame, and the app's next access of such a buffer waits for that read in its DXVK submission worker (flip-model buffer release). 2: as 1, but DWM binds what it binds and waits for the app's point (DWM can miss vblanks while the app renders faster than the refresh); no read points. 0: the frame is completed on the presenting thread before its present (NvkComposedComplete). D3D11 and Vulkan windows (which present through a D3D11 flip chain) publish from DXVK; D3D12 windows publish from the D3D12 driver (no CPU wait there either; their buffer release is the runtime's admission). HELIOS_FLIP_LEDGER overrides it per process (both drivers)."
+effect = "How a flip-model buffer of an NVK app that DWM composes directly is ordered for a DWM on NVK. 1 (default, any nonzero value): the presenting thread does not wait; the WDDM present carries the frame's RM fence and names the buffer, the KMD records the frame in its frame-done table and marks it done when the fence fires, and DWM composes the newest done buffer of each app swap chain from that table (the last composed one when none is done), never waiting for an app frame. DWM publishes a read point on the app buffers it composed in each frame, and the app's next access of such a buffer waits for that read in its DXVK submission worker (flip-model buffer release). D3D12 frames name their buffer in their marker already. A swap chain of fewer than three buffers, or a KMD without the table (before 22.22.405.124), keeps the frame completed before its present. 0: the frame is completed on the presenting thread before its present (NvkComposedComplete). HELIOS_FLIP_LEDGER overrides it per process."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.FlipUpgrade]
@@ -1046,7 +1046,7 @@ see = "[d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-fronten
 [env.HELIOS_FLIP_LEDGER]
 class = "debug"
 read = "once per process"
-effect = "0, 1 or 2 overrides HKLM\\SOFTWARE\\Helios FlipLedger for this process (the D3D11 UMD, its DXVK bridge and the D3D12 UMD)."
+effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios FlipLedger for this process (the D3D11 UMD and its DXVK bridge)."
 
 [env.HELIOS_FLIP_UPGRADE]
 class = "debug"

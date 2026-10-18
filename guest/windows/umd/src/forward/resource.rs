@@ -871,9 +871,11 @@ unsafe fn note_nvk_keyed_resource(
 }
 
 /// `FlipLedger`: a DXGI present buffer of an NVK device (created here, or opened: DWM opening
-/// an app's flip-model buffer) holds its hand-off ledger key while it lives, so the presenting
-/// app's points (`nvk_flip_ledger_publish`) land in a slot DWM samples, and DWM's DXVK installs
-/// the ledger's reader hooks. The slot is let go at destroy (`forget_nvk_keyed_resource`).
+/// an app's flip-model buffer) holds its hand-off ledger key while it lives: DWM's read points
+/// land in a slot the app's DXVK samples (flip-model buffer release), and both processes install
+/// the ledger's hooks. DWM also keeps the buffer's size, format and resource id to find the
+/// newest done buffer of the swap chain (`forward/bindings.rs` `dwm_flip_views`). The slot is let
+/// go at destroy (`forget_nvk_keyed_resource`).
 unsafe fn note_nvk_flip_buffer(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, created: bool) {
     // An app's own buffers (it publishes on them); DWM's opens of apps' buffers (it reads them).
     // Not DWM's own swap chain, not an app opening another's present buffer.
@@ -904,7 +906,9 @@ unsafe fn note_nvk_flip_buffer(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, 
     let mut list = lock_ignore_poison(&dev.nvk_flip_buffers);
     if !list.iter().any(|f| f.0 == key) {
         dev.dxvk.handoff_register(com);
-        list.push((key, com, width, height, format));
+        // The KMD resource id (the ledger key): the frame-done table's name for the buffer.
+        let resid = dev.dxvk.handoff_refresh_key(com);
+        list.push((key, com, width, height, format, resid));
         if list.len() <= 4 {
             log_error!(
                 "FlipLedger: present buffer hDrv=0x{key:x} ({}) holds its ledger key ({} live)",
@@ -925,7 +929,8 @@ pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D1
         let key = h_resource.pDrvPrivate as usize;
         let mut flips = lock_ignore_poison(&dev.nvk_flip_buffers);
         if let Some(i) = flips.iter().position(|f| f.0 == key) {
-            let (_, com, _, _, _) = flips.swap_remove(i);
+            let (_, com, _, _, _, _) = flips.swap_remove(i);
+            lock_ignore_poison(&dev.nvk_flip_last).retain(|e| e.2 != com);
             drop(flips);
             lock_ignore_poison(&dev.nvk_flip_reads).retain(|&r| r != com);
             // DWM's replacement view of this buffer holds a reference to it: drop it first.

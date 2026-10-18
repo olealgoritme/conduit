@@ -623,17 +623,15 @@ pub(crate) fn flip_upgrade() -> u32 {
 /// `FlipLedger`: how a composed NVK frame that DWM samples directly (a flip-model buffer) is
 /// ordered for a DWM on NVK. Read once per process; DWM reads it at its start.
 ///
-/// * 1 (default): the presenting thread does not wait. The WDDM present carries the frame's RM
-///   fence and publishes a hand-off ledger point on the buffer's resource id (complete when the
-///   frame's GPU work is). DWM composes the newest DONE frame: a bound view of an app buffer
-///   whose newest point is still pending is replaced by a view of the newest done buffer of the
-///   same swap chain (three buffers or more), so DWM never waits for an app frame
-///   (`forward/bindings.rs` `dwm_flip_views`); only a chain with no done frame yet makes DWM's
-///   DXVK wait. DWM publishes a read point on the app buffers it bound in each frame, and the
-///   app's next access of such a buffer waits for that read in its DXVK submission worker
-///   (flip-model buffer release).
-/// * 2: as 1, but DWM binds what it binds and its DXVK waits for the app's point (DWM can miss
-///   vblanks while the app renders faster than the refresh); no read points.
+/// * 1 (default; any nonzero value): the presenting thread does not wait. The WDDM present
+///   carries the frame's RM fence and names the buffer (the `HERF` `source_index`); the KMD
+///   records the frame in its frame-done table when the marker is rendered and marks it done
+///   when the fence fires (`helios_kmd_logic::frame_done`, published in the read-ledger page).
+///   DWM composes the newest done buffer of each app swap chain from that table and never waits
+///   for an app frame (`forward/bindings.rs` `dwm_flip_views`). DWM publishes a read point on
+///   the app buffers it composed in each frame, and the app's next access of such a buffer waits
+///   for that read in its DXVK submission worker (flip-model buffer release). A swap chain of
+///   fewer than three buffers, or a KMD without the table, keeps the `NvkComposedComplete` rule.
 /// * 0: the `NvkComposedComplete` rule (the frame is complete before its present).
 ///
 /// `HELIOS_FLIP_LEDGER` overrides it per process.

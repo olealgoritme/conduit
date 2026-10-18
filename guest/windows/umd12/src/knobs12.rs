@@ -606,24 +606,6 @@ pub(crate) fn foreign_import() -> bool {
 /// DWM imports them) or a DWM on NVK (`DwmIcd=nvk` and its marker event,
 /// `helios_umd_common::knobs::dwm_on_nvk_marker`). The same rule as the D3D11
 /// driver's `nvk_dwm_composes`. Read once per process.
-/// `FlipLedger` (the D3D11 driver's knob, read here too; `docs/dwm-on-nvk.md` 4.5): nonzero = a
-/// composed NVK present publishes a hand-off ledger point on the back buffer's resource id,
-/// marked complete when the frame's work is done, so a DWM on NVK composes the newest done
-/// buffer of the swap chain instead of one still being rendered. Absent = 1;
-/// `HELIOS_FLIP_LEDGER` overrides it per process.
-pub(crate) static FLIP_LEDGER: DwordKnob = DwordKnob::new(c"FlipLedger", 1);
-
-/// `FlipLedger`, or `HELIOS_FLIP_LEDGER` from the environment.
-pub(crate) fn flip_ledger() -> u32 {
-    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("HELIOS_FLIP_LEDGER")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(|| FLIP_LEDGER.get())
-    })
-}
-
 pub(crate) fn dwm_imports_nvk() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| foreign_import() || helios_umd_common::knobs::dwm_on_nvk_marker())

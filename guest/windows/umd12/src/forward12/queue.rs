@@ -3479,23 +3479,6 @@ pub(crate) unsafe fn nvk_present_fence(
     Some((fence, value, copy))
 }
 
-/// `FlipLedger`: the queue's engine queue (a counted reference, so a waiter keeps it alive) and
-/// the last NVK boundary value committed on it: a CPU wait for that value is a wait for every
-/// frame submitted so far. `None` when nothing was committed.
-///
-/// # Safety
-/// As [`queue_state`].
-pub(crate) unsafe fn nvk_completion_target(
-    h: ddi12::D3D12DDI_HCOMMANDQUEUE,
-) -> Option<(ID3D12CommandQueue, u64)> {
-    // SAFETY: forwarded precondition.
-    let queue = unsafe { queue_state(h) }?;
-    let value = queue
-        .nvk_last_value
-        .load(std::sync::atomic::Ordering::Acquire);
-    (value != 0).then(|| (queue.engine_queue.clone(), value))
-}
-
 /// NVK: close an RM fence of this queue's device that no Render took.
 ///
 /// # Safety

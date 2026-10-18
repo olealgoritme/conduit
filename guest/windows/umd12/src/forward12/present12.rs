@@ -912,13 +912,6 @@ unsafe fn present_nvk(
         }
     }
 
-    // `FlipLedger`: a point on the back buffer's resource id, complete when the
-    // frame's work is, so a DWM on NVK composes the newest done buffer.
-    if !scanout && has_id && crate::knobs12::flip_ledger() != 0 {
-        // SAFETY: forwarded precondition (inside pfnPresent).
-        unsafe { flip_ledger_publish(h_queue, identity.venus_res_id) };
-    }
-
     // The frame's identity for the KMD's flush/ledger, as on Venus but with no
     // stream tail; only a buffer with a KMD resource id has one.
     if has_id {
@@ -1001,101 +994,6 @@ unsafe fn present_nvk(
             contexts.hContext = h_context;
             contexts.BroadcastContextCount = 0;
         }
-    }
-}
-
-/// One frame whose ledger point waits for its work.
-struct LedgerJob {
-    queue: windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
-    value: u64,
-    published: helios_umd_common::handoff_ledger::Published,
-}
-
-/// The process's ledger record (one for every D3D12 device of the process).
-fn flip_ledger_record() -> Option<helios_umd_common::handoff_ledger::Record> {
-    static RECORD: std::sync::OnceLock<Option<helios_umd_common::handoff_ledger::Record>> =
-        std::sync::OnceLock::new();
-    *RECORD.get_or_init(|| {
-        let table = helios_umd_common::handoff_ledger::table()?;
-        let (index, gen) =
-            helios_umd_common::handoff_ledger::claim_device(table, std::process::id())?;
-        log_error!("FlipLedger: D3D12 presents publish on ledger record {index} (generation {gen})");
-        Some(helios_umd_common::handoff_ledger::Record { index, gen })
-    })
-}
-
-/// The completer: waits (CPU, its own thread) for each frame's work in order and marks its
-/// point complete; a frame not done after 2 s is marked anyway (a reader never waits forever).
-fn flip_ledger_sender() -> Option<std::sync::mpsc::Sender<LedgerJob>> {
-    static TX: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<LedgerJob>>>> =
-        std::sync::OnceLock::new();
-    let tx = TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<LedgerJob>();
-        std::thread::Builder::new()
-            .name("helios-flip-ledger12".into())
-            .spawn(move || {
-                let Some(table) = helios_umd_common::handoff_ledger::table() else {
-                    return;
-                };
-                for job in rx {
-                    let raw = job.queue.as_raw() as usize;
-                    for _ in 0..40 {
-                        // SAFETY: `job.queue` keeps the engine queue alive for the wait.
-                        match unsafe { crate::bridge12::wait_execution(raw, job.value, 50_000_000) } {
-                            Ok(false) => continue,
-                            _ => break,
-                        }
-                    }
-                    helios_umd_common::handoff_ledger::complete(table, job.published);
-                }
-            })
-            .ok()?;
-        Some(std::sync::Mutex::new(tx))
-    });
-    tx.as_ref().map(|m| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
-}
-
-/// `FlipLedger`: publish a ledger point on `key` (the back buffer's resource id) for the frame
-/// just submitted on `h_queue`, completed by the completer thread when that work is done.
-///
-/// # Safety
-/// The live runtime queue of the `pfnPresent` that called this.
-unsafe fn flip_ledger_publish(h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE, key: u32) {
-    use helios_umd_common::handoff_ledger as ledger;
-    let (Some(table), Some(record)) = (ledger::table(), flip_ledger_record()) else {
-        L8_REFUSALS.nvk_flip_ledger_refused.bump();
-        return;
-    };
-    // SAFETY: forwarded precondition.
-    let Some((queue, value)) = (unsafe { queue::nvk_completion_target(h_queue) }) else {
-        L8_REFUSALS.nvk_flip_ledger_refused.bump();
-        return;
-    };
-    let published = match ledger::publish(table, record, std::process::id(), key) {
-        Ok(p) => p,
-        Err(why) => {
-            L8_REFUSALS.nvk_flip_ledger_refused.bump();
-            if L8_REFUSALS.nvk_flip_ledger_refused.get() <= LOG_BUDGET {
-                log_error!("FlipLedger: no ledger point for resource id {key}: {why:?}");
-            }
-            return;
-        }
-    };
-    let Some(tx) = flip_ledger_sender() else {
-        ledger::complete(table, published);
-        return;
-    };
-    if tx.send(LedgerJob { queue, value, published }).is_err() {
-        ledger::complete(table, published);
-        return;
-    }
-    L8_REFUSALS.nvk_flip_ledger_points.bump();
-    let n = L8_REFUSALS.nvk_flip_ledger_points.get();
-    if n == 1 || n % 4096 == 0 {
-        log_error!(
-            "FlipLedger: {n} D3D12 presents published ledger points ({} refused)",
-            L8_REFUSALS.nvk_flip_ledger_refused.get()
-        );
     }
 }
 
@@ -1249,11 +1147,6 @@ struct L8Refusals {
     /// Copy-engine records the ICD gave that break a rule the KMD applies (not
     /// sent; the fence goes alone).
     nvk_copy_record_refused: RefusalCounter,
-    /// `FlipLedger`: composed presents that published a ledger point.
-    nvk_flip_ledger_points: RefusalCounter,
-    /// `FlipLedger`: composed presents that could not (no ledger, no committed
-    /// work on the queue, a full table).
-    nvk_flip_ledger_refused: RefusalCounter,
 }
 
 static L8_REFUSALS: L8Refusals = L8Refusals {
@@ -1283,8 +1176,6 @@ static L8_REFUSALS: L8Refusals = L8Refusals {
     nvk_composed_fenced: RefusalCounter::new("Nvk12ComposedFenced"),
     nvk_composed_unfenced: RefusalCounter::new("Nvk12ComposedUnfenced"),
     nvk_copy_record_refused: RefusalCounter::new("Nvk12CopyRecordRefused"),
-    nvk_flip_ledger_points: RefusalCounter::new("Nvk12FlipLedgerPoints"),
-    nvk_flip_ledger_refused: RefusalCounter::new("Nvk12FlipLedgerRefused"),
 };
 
 /// L8's refusal counters, printed by `crate::log_refusal_summary` at this lane's
@@ -1333,6 +1224,4 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L8_REFUSALS.nvk_composed_fenced,
     &L8_REFUSALS.nvk_composed_unfenced,
     &L8_REFUSALS.nvk_copy_record_refused,
-    &L8_REFUSALS.nvk_flip_ledger_points,
-    &L8_REFUSALS.nvk_flip_ledger_refused,
 ];

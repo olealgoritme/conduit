@@ -28,7 +28,7 @@ pub(crate) mod kobj;
 mod locks;
 pub(crate) use locks::ControlSpaceWaiter;
 pub(crate) mod producer;
-mod read_ledger;
+pub(crate) mod read_ledger;
 mod scanout;
 mod segments;
 mod tracking;

@@ -480,29 +480,37 @@ pub(crate) unsafe fn set_shader_resources_common(
     }
 }
 /// `FlipLedger` 1, dwm.exe: what DWM's binds of app flip-model buffers became (since start).
-pub(crate) static DWM_FLIP_READY: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static DWM_FLIP_DONE: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static DWM_FLIP_UNTRACKED: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DWM_FLIP_SUBSTITUTED: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static DWM_FLIP_UNREADY: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static DWM_FLIP_REPEATED: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static DWM_FLIP_AS_BOUND: AtomicUsize = AtomicUsize::new(0);
 
-/// `FlipLedger` 1, dwm.exe, at each shader-resource bind: DWM composes the newest READY frame
-/// of an app's flip-model swap chain and never waits for one that is not done.
+/// `FlipLedger` 1, dwm.exe, at each shader-resource bind: DWM composes the newest DONE frame of
+/// an app's flip-model swap chain and never waits for one.
 ///
-/// * A bound view of an opened app present buffer whose newest ledger point (the app publishes
-///   one per present) is complete stays.
-/// * One whose point is pending is replaced by a view of the buffer of the same swap chain (same
-///   publishing device, same size and format, at least three buffers) whose newest point is the
-///   newest complete one: the frame before. dxgkrnl released that buffer to the app when DWM
-///   took the newer one, so DWM's read of it is published as a read point at DWM's present and
-///   the app's next access waits for it (`forward/present.rs` `dwm_flip_read_points`). With three
-///   buffers the app renders into the oldest one meanwhile, not this one.
-/// * With no complete frame (the chain's first frames) the view stays and DWM's DXVK waits for
-///   the point (the ledger wait, bounded).
+/// Whether a buffer's frame is done is the KMD's frame-done table
+/// (`helios_protocol::HeliosFrameDoneTable`, read through the ledger mapping): the KMD records
+/// each frame with its RM fence when the present's marker is rendered and marks it done when the
+/// fence fires, so the table is never behind the GPU by more than the fence's interrupt.
+///
+/// * A bound app buffer the table does not track (an app that completed its frame before the
+///   present, an older KMD) or whose frame is done stays.
+/// * One whose frame is in flight is replaced by a view of the buffer of the same swap chain
+///   (the same presenting process, size and format; three buffers or more) whose done frame is
+///   the newest; when none is done, by the buffer DWM composed for that chain last time (the
+///   window keeps its last frame). With three buffers the app renders into the oldest meanwhile;
+///   DWM's read of the replacement is published at DWM's present (`dwm_flip_read_points`) and
+///   the app's next access of that buffer waits for it.
+/// * A chain DWM cannot replace in (fewer than three buffers seen, its first frame) is bound as
+///   it is; DWM still does not wait (the app publishes no points on its buffers).
 ///
 /// Every app buffer DWM ends up binding is noted as read this frame. `None`: nothing replaced.
 pub(crate) unsafe fn dwm_flip_views(
     h: Hdevice,
     views: &[Option<ID3D11ShaderResourceView>],
 ) -> Option<Vec<Option<ID3D11ShaderResourceView>>> {
+    use crate::scanout_acquire::frame_done_lookup;
     let dev = helios_device(h)?;
     let flips = lock_ignore_poison(&dev.nvk_flip_buffers).clone();
     if flips.is_empty() {
@@ -518,43 +526,57 @@ pub(crate) unsafe fn dwm_flip_views(
             continue;
         };
         let raw = resource.as_raw() as usize;
-        let Some(&(_, _, width, height, format)) = flips.iter().find(|f| f.1 == raw) else {
+        let Some(&(_, _, width, height, format, resid)) = flips.iter().find(|f| f.1 == raw) else {
             continue;
         };
-        let (state, record, point) = dev.dxvk.handoff_flip_state(raw);
-        if state != 2 {
-            DWM_FLIP_READY.fetch_add(1, Ordering::Relaxed);
-            reads.push(raw);
-            continue;
-        }
-        // The same swap chain: the same publishing device, size and format.
-        let chain: Vec<usize> = flips
+        let state = frame_done_lookup(resid);
+        let bound = match state {
+            None => {
+                DWM_FLIP_UNTRACKED.fetch_add(1, Ordering::Relaxed);
+                reads.push(raw);
+                continue;
+            }
+            Some(s) if s.idle() => {
+                DWM_FLIP_DONE.fetch_add(1, Ordering::Relaxed);
+                reads.push(raw);
+                dwm_flip_note_last(dev, s.owner, (width, height, format), raw);
+                continue;
+            }
+            Some(s) => s,
+        };
+        // The same swap chain: the same presenting process, size and format.
+        let chain: Vec<(usize, Option<crate::scanout_acquire::FrameDone>)> = flips
             .iter()
-            .filter(|f| f.2 == width && f.3 == height && f.4 == format)
-            .map(|f| f.1)
-            .filter(|&c| c == raw || dev.dxvk.handoff_flip_state(c).1 == record)
+            .filter(|f| f.1 != raw && f.2 == width && f.3 == height && f.4 == format)
+            .map(|f| (f.1, frame_done_lookup(f.5)))
+            .filter(|(_, d)| d.is_some_and(|d| d.owner == bound.owner))
             .collect();
-        let mut best: Option<(usize, u64)> = None;
-        if chain.len() >= 3 {
-            for &c in chain.iter().filter(|&&c| c != raw) {
-                let (st, rec, pt) = dev.dxvk.handoff_flip_state(c);
-                if st == 1 && rec == record && pt < point && best.map_or(true, |(_, b)| pt > b) {
-                    best = Some((c, pt));
-                }
+        let mut substitute = None;
+        let mut repeated = false;
+        if chain.len() + 1 >= 3 {
+            substitute = chain
+                .iter()
+                .filter_map(|&(c, d)| d.filter(|d| d.idle()).map(|d| (c, d.completed)))
+                .max_by_key(|&(_, completed)| completed)
+                .map(|(c, _)| c);
+            if substitute.is_none() {
+                substitute = dwm_flip_last(dev, bound.owner, (width, height, format)).filter(|&c| c != raw);
+                repeated = substitute.is_some();
             }
         }
-        let Some((substitute, _)) = best else {
-            DWM_FLIP_UNREADY.fetch_add(1, Ordering::Relaxed);
+        let made = substitute.and_then(|c| dwm_flip_view_for(dev, view, c).map(|v| (c, v)));
+        let Some((sub, sub_view)) = made else {
+            DWM_FLIP_AS_BOUND.fetch_add(1, Ordering::Relaxed);
             reads.push(raw);
             continue;
         };
-        let Some(sub_view) = dwm_flip_view_for(dev, view, substitute) else {
-            DWM_FLIP_UNREADY.fetch_add(1, Ordering::Relaxed);
-            reads.push(raw);
-            continue;
-        };
-        DWM_FLIP_SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
-        reads.push(substitute);
+        if repeated {
+            DWM_FLIP_REPEATED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DWM_FLIP_SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
+            dwm_flip_note_last(dev, bound.owner, (width, height, format), sub);
+        }
+        reads.push(sub);
         out.get_or_insert_with(|| views.to_vec())[i] = Some(sub_view);
     }
     if !reads.is_empty() {
@@ -566,6 +588,27 @@ pub(crate) unsafe fn dwm_flip_views(
         }
     }
     out
+}
+
+/// The buffer DWM last composed for the swap chain `(owner, size and format)`.
+fn dwm_flip_last(dev: &crate::device_funcs::HeliosDevice, owner: u32, dims: (u32, u32, u32)) -> Option<usize> {
+    lock_ignore_poison(&dev.nvk_flip_last)
+        .iter()
+        .find(|e| e.0 == owner && e.1 == dims)
+        .map(|e| e.2)
+}
+
+fn dwm_flip_note_last(dev: &crate::device_funcs::HeliosDevice, owner: u32, dims: (u32, u32, u32), com: usize) {
+    let mut last = lock_ignore_poison(&dev.nvk_flip_last);
+    match last.iter_mut().find(|e| e.0 == owner && e.1 == dims) {
+        Some(e) => e.2 = com,
+        None => {
+            if last.len() >= 64 {
+                last.remove(0);
+            }
+            last.push((owner, dims, com));
+        }
+    }
 }
 
 /// A shader-resource view of the opened app buffer `resource` shaped like `like` (DWM's view

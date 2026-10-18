@@ -680,10 +680,10 @@ namespace helios_handoff {
   }
 
   // HKLM\SOFTWARE\Helios!FlipLedger (REG_DWORD, absent 1), or
-  // HELIOS_FLIP_LEDGER (umd/src/knobs.rs FLIP_LEDGER has the modes): nonzero
-  // turns the ledger on in every process (the app publishes a point per
-  // flip-model present; DWM samples them). Read once per process, like the
-  // Rust knob.
+  // HELIOS_FLIP_LEDGER (umd/src/knobs.rs FLIP_LEDGER): nonzero turns the ledger
+  // on in every process: DWM publishes read points on the app flip-model
+  // buffers it composed and the app's DXVK waits for them before it writes such
+  // a buffer again. Read once per process, like the Rust knob.
   std::uint32_t flip_ledger_mode() {
     static const std::uint32_t mode = []() -> std::uint32_t {
       if (const char* v = std::getenv("HELIOS_FLIP_LEDGER"))
@@ -997,33 +997,6 @@ namespace helios_handoff {
   std::uint64_t sample(std::uint32_t key) {
     std::uint64_t point = 0;
     return sample_all(key, &point, 1) ? point : 0;
-  }
-
-  // FlipLedger (DWM): the newest point another process published on `key`
-  // (an app's flip-model present buffer) and whether it is complete. 0 no
-  // such point, 1 complete, 2 pending. *record names the publishing device
-  // (an app's swap-chain buffers share it).
-  std::int32_t flip_state(Table* t, std::uint32_t key, std::uint32_t* record, std::uint64_t* point) {
-    Slot* s = find(t, key);
-    if (!s)
-      return 0;
-    const std::uint32_t me = GetCurrentProcessId();
-    std::uint64_t best = 0;
-    for (auto& e : s->points) {
-      const std::uint64_t packed = e.load(std::memory_order_acquire);
-      if (!packed)
-        continue;
-      const std::uint32_t d = std::uint32_t(packed >> 52);
-      if (d >= kDevices || t->devices[d].pid.load(std::memory_order_relaxed) == me)
-        continue;
-      if ((packed & kPointMask) > (best & kPointMask))
-        best = packed;
-    }
-    if (!best)
-      return 0;
-    *record = std::uint32_t(best >> 52);
-    *point = best & kPointMask;
-    return entry_done(t, best) ? 1 : 2;
   }
 
   // Own hand-off points published (application thread) whose signal the
@@ -1340,20 +1313,6 @@ namespace {
 std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
                                                std::uint32_t resource_count) const noexcept {
   return handoff_publish_common(impl.get(), resources, resource_count);
-}
-
-std::int32_t HeliosDxvkDevice::handoff_flip_state(std::size_t d3d11_resource_ptr,
-                                                  std::uint32_t* record,
-                                                  std::uint64_t* point) const noexcept {
-  *record = UINT32_MAX;
-  *point = 0;
-  return bridge_guard("handoff_flip_state", std::int32_t(0), [&]() -> std::int32_t {
-    if (!impl || !helios_handoff::enabled())
-      return 0;
-    auto* t = helios_handoff::table();
-    const std::uint32_t key = handoff_key(*impl, d3d11_resource_ptr);
-    return t && key ? helios_handoff::flip_state(t, key, record, point) : 0;
-  });
 }
 
 std::uint32_t HeliosDxvkDevice::handoff_refresh_key(std::size_t d3d11_resource_ptr) const noexcept {
