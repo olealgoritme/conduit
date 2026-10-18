@@ -304,19 +304,22 @@ on the presenting thread instead, which serialises the app's CPU and GPU work). 
    (`forward/present.rs`, `frame_resid`), a D3D12 `HEPR` has it already. Vulkan windows present
    through a D3D11 flip chain (NVK's WSI) and take the D3D11 path. A swap chain of fewer than
    three buffers, or a KMD without the table below, keeps the old rule.
-2. **The KMD knows when each buffer's frame is done.** When it attaches the fence to its RM gate
-   (at Render, before dxgkrnl can hand the frame to DWM) it records the frame in its frame-done
-   table, and when the fence fires (its `EventReady` DPC; also an expiry or a cancelled gate) it
-   marks the frame done (`kmd_logic/src/frame_done.rs`, `virtio/gpu/rm_gates.rs`). The table is
-   published in the read-ledger page every UMD device maps already
-   (`helios_protocol::HeliosFrameDoneTable` at `HELIOS_FRAME_DONE_OFFSET`;
-   `adapter/read_ledger.rs`).
-3. **DWM composes the newest done frame and never waits for an app frame.** At every
+2. **The KMD knows which frames are finished.** When it attaches the fence to the RM gate of the
+   presenting WDDM context (at Render, before dxgkrnl can hand the frame to DWM) it records the
+   frame as pending; when the fence fires (its `EventReady` DPC; also an expiry or a cancelled
+   gate) that frame and every earlier pending frame of the same context are finished (a context's
+   frames finish in order). Per buffer the table keeps the newest finished frame in it
+   (`completed`, the content it holds, even while its next frame is queued) and whether the GPU
+   may be writing it now (`writing`: its pending frame is the oldest of its context)
+   (`kmd_logic/src/frame_done.rs`, `virtio/gpu/rm_gates.rs`). The table is published in the
+   read-ledger page every UMD device maps already (`helios_protocol::HeliosFrameDoneTable` at
+   `HELIOS_FRAME_DONE_OFFSET`, version 2; `adapter/read_ledger.rs`).
+3. **DWM composes the newest finished frame and never waits for an app frame.** At every
    shader-resource bind DWM's UMD reads the table for each app present buffer it binds
    (`forward/bindings.rs` `dwm_flip_views`, `scanout_acquire.rs` `frame_done_lookup`). A buffer
-   whose frame is done, or that the table does not track, stays. One whose frame is in flight is
-   replaced by the buffer of the same swap chain (the same presenting process, size and format;
-   three buffers or more) with the newest done frame, or, when none is done, by the buffer DWM
+   with nothing pending, or that the table does not track, stays. Otherwise DWM binds the buffer
+   of the same swap chain (the same presenting process, size and format; three buffers or more)
+   that holds the newest finished frame and is not being written, or, when none is, the buffer it
    composed for that chain last time: the window keeps its last frame. The app publishes nothing
    DWM's DXVK could wait for, so DWM never waits.
 4. **Buffer release.** dxgkrnl's wait for DWM to release a buffer holds the app's WDDM context,
@@ -336,8 +339,8 @@ service key):
 |---|---|---|
 | app (D3D11) | `FlipUpgrade: swap chain #1 upgraded: swap effect 0 -> 4 (FLIP_DISCARD) ...` | the chain is flip-model |
 | app (D3D11) | `FlipLedger: N flip-model presents without a CPU wait; the KMD's frame-done table tracks the buffer ...` | the app does not wait |
-| KMD | `FdSub` (frames recorded), `FdFire` (frames marked done), `FdOvf` (frames not recorded: every slot busy) | `FdFire` follows `FdSub`; `FdOvf` 0 |
-| DWM | `DWM on NVK: X presents/s ...; FlipLedger 1: app flip frames bound done A, replaced by the newest done frame B, last frame kept C, bound in flight (no done frame to show) D, not tracked E; R read points ...` (once a second) | X is DWM's composition rate (the refresh rate while the window changes every frame); D stays near 0 after a chain's first frame |
+| KMD | `FdSub` (frames recorded), `FdFire` (fences that finished at least one frame; a fence also finishes the earlier frames of its context, so `FdFire` may stay below `FdSub`), `FdPend` (frames pending after the last change), `FdOvf` (frames not tracked) | `FdPend` small (the frames the app is ahead of the GPU, about 1-3), `FdOvf` 0 |
+| DWM | `DWM on NVK: X presents/s, Y new app flip frames shown/s ...; binds of app flip buffers: newest frame done A, newest done frame chosen B, last frame kept C, bound in flight (nothing to choose) D, not tracked E (in a tracked chain F); R read points ...` (once a second) | X is DWM's composition rate; Y is the app frames DWM put on screen per second: about min(app fps, X) for one window; C grows only while the app is slower than X; D stays near 0 after a chain's first frame; E counts other windows whose apps complete their frames before the present, F should stay near 0 |
 | DWM | `handoff waits: N sleeps ...` | must not appear |
 
 **Not covered yet.**
