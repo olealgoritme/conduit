@@ -247,6 +247,10 @@ mod ffi {
             resources: *const usize,
             resource_count: u32,
         ) -> i32;
+        /// FlipLedger: the resource's ledger key, asked again (after a
+        /// rotation of resource identities). 0 = none.
+        /// # Safety: a live `ID3D11Resource*`.
+        unsafe fn handoff_refresh_key(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> u32;
         unsafe fn flush_gate_point(
             self: &HeliosDxvkDevice,
             mode: u32,
@@ -736,6 +740,16 @@ pub(crate) struct PresentStreamCorrelation {
     /// fence and no on-scanout claim; already checked against the fence and
     /// every rule the KMD applies (`helios_protocol::producer_record`).
     pub(crate) rm_copy: Option<helios_protocol::HeliosRmFenceTailV3>,
+    /// NVK (`NvkBltGpuCopy`): the frame's queue already copied it into the window's redirection
+    /// surface, ordered before the RM fence: the `HERF` marker carries the `HOWW` tag
+    /// (`protocol/src/window_copy.rs`) beside the fence so the KMD completes the Blt with no copy.
+    /// Only with an RM fence; it takes the place of the copy-engine record (the KMD copies
+    /// nothing) and never comes with an on-scanout claim.
+    pub(crate) window_written: Option<helios_protocol::HeliosWindowWrittenTag>,
+    /// NVK (`FlipLedger`): the presented flip-model buffer's KMD resource id, sent with the RM
+    /// fence in the `HERF` `source_index` so the KMD's frame-done table tracks its frame.
+    /// 0 = not named.
+    pub(crate) frame_resid: u32,
 }
 
 /// The already-on-scanout claim: the KMD's own names for the frame.
@@ -1096,6 +1110,15 @@ impl BridgeDevice {
         };
         // SAFETY: the slice borrows live resource pointers for the call.
         unsafe { d.handoff_publish(resources.as_ptr(), resources.len() as u32) }
+    }
+
+    /// FlipLedger: ask `res`'s ledger key again (after RotateResourceIdentities).
+    pub(crate) fn handoff_refresh_key(&self, res: usize) -> u32 {
+        match self.get() {
+            // SAFETY: the caller passes a live resource pointer.
+            Some(d) => unsafe { d.handoff_refresh_key(res) },
+            None => 0,
+        }
     }
 
     /// Flush gate: flush and get what the HEFL packet carries (see

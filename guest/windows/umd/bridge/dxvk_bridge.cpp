@@ -670,13 +670,40 @@ namespace helios_handoff {
     return s_table;
   }
 
+  DWORD helios_reg_dword(const char* name, DWORD fallback) {
+    DWORD value = 0, size = sizeof(value);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", name,
+                     RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, &value,
+                     &size) == ERROR_SUCCESS)
+      return value;
+    return fallback;
+  }
+
+  // HKLM\SOFTWARE\Helios!FlipLedger (REG_DWORD, absent 1), or
+  // HELIOS_FLIP_LEDGER (umd/src/knobs.rs FLIP_LEDGER): nonzero turns the ledger
+  // on in every process: DWM publishes read points on the app flip-model
+  // buffers it composed and the app's DXVK waits for them before it writes such
+  // a buffer again. Read once per process, like the Rust knob.
+  std::uint32_t flip_ledger_mode() {
+    static const std::uint32_t mode = []() -> std::uint32_t {
+      if (const char* v = std::getenv("HELIOS_FLIP_LEDGER"))
+        return std::uint32_t(std::strtoul(v, nullptr, 10));
+      return helios_reg_dword("FlipLedger", 1);
+    }();
+    return mode;
+  }
+
+  bool flip_ledger() { return flip_ledger_mode() != 0; }
+
   // Opt-in (HELIOS_HANDOFF_LEDGER=1, in every sharing process) until the
   // cross-process table is verified; the default is the releaser CPU wait
-  // (forward/transfer.rs).
+  // (forward/transfer.rs). FlipLedger enables the table too: the keyed-mutex
+  // hand-offs still publish only with HELIOS_HANDOFF_LEDGER (the Rust side
+  // decides that), so it adds readers' samples, which find nothing pending.
   bool enabled() {
     static const bool on = []() {
       const char* v = std::getenv("HELIOS_HANDOFF_LEDGER");
-      return v && v[0] == '1';
+      return (v && v[0] == '1') || flip_ledger();
     }();
     return on;
   }
@@ -1213,7 +1240,12 @@ namespace {
       return 0;
     auto image = texture->GetImage();
     std::uint32_t key = image->heliosHandoffKey();
-    if (key || !d.icd.memory_res_id || d.device == nullptr)
+    // An import keeps the id it was opened with. Our own image is asked again
+    // (the ICD caches the id per memory): RotateResourceIdentities moves
+    // storages between a flip-model chain's images, so an id cached on the
+    // image names the buffer it held first, not the one it holds now.
+    const bool own = image->info().sharing.mode != dxvk::DxvkSharedHandleMode::Import;
+    if ((key && !own) || !d.icd.memory_res_id || d.device == nullptr)
       return key;
     VkImage vkImage = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -1273,8 +1305,27 @@ void HeliosDxvkDevice::handoff_unregister(std::size_t d3d11_resource_ptr) const 
   });
 }
 
+namespace {
+  std::int32_t handoff_publish_common(HeliosDxvkDeviceImpl* impl, const std::size_t* resources,
+                                      std::uint32_t resource_count);
+}
+
 std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
                                                std::uint32_t resource_count) const noexcept {
+  return handoff_publish_common(impl.get(), resources, resource_count);
+}
+
+std::uint32_t HeliosDxvkDevice::handoff_refresh_key(std::size_t d3d11_resource_ptr) const noexcept {
+  return bridge_guard("handoff_refresh_key", std::uint32_t(0), [&]() -> std::uint32_t {
+    if (!impl || !helios_handoff::enabled())
+      return 0;
+    return handoff_key(*impl, d3d11_resource_ptr);
+  });
+}
+
+namespace {
+std::int32_t handoff_publish_common(HeliosDxvkDeviceImpl* impl, const std::size_t* resources,
+                                    std::uint32_t resource_count) {
   if (!impl || !impl->context || impl->device == nullptr || !helios_handoff::enabled())
     return -1;
   return bridge_guard("handoff_publish", std::int32_t(-2), [&]() -> std::int32_t {
@@ -1365,6 +1416,7 @@ std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
     return overflow ? -1 : 1;
   });
 }
+}  // namespace
 
 
 bool HeliosDxvkDevice::get_resource_foreign_identity(

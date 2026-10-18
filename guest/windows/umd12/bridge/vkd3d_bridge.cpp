@@ -954,6 +954,58 @@ std::int32_t HeliosVkd3dDevice::nvk_scanout_present_fenced(std::size_t resource,
   });
 }
 
+std::int32_t HeliosVkd3dDevice::nvk_present_fence_v3(std::size_t resource, std::size_t queue,
+                                                     std::uint64_t value, std::uint32_t* out_fence,
+                                                     std::uint8_t* out_copy,
+                                                     std::size_t copy_len) const noexcept {
+  return helios_bridge::bridge_guard("nvk_present_fence_v3_12", std::int32_t(-1),
+      [&]() -> std::int32_t {
+    if (!out_fence || !out_copy || copy_len != sizeof(helios_icd_rm_copy))
+      return -1;
+    *out_fence = 0;
+    std::memset(out_copy, 0, copy_len);
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm || !impl->vk_device ||
+        !(impl->icd.caps & HELIOS_ICD_CAP_RM_FENCE) || !queue || !value)
+      return -1;
+    const helios_icd_api& icd = impl->icd;
+    const bool has_v3 = icd.version >= 8 &&
+        icd.size >= offsetof(helios_icd_api, ecl_fence_create_v3) + sizeof(icd.ecl_fence_create_v3) &&
+        icd.ecl_fence_create_v3 != nullptr;
+    std::uint64_t vk_memory = 0, memory_offset = 0, memory_size = 0, vk_image = 0, buffer_offset = 0;
+    std::uint32_t memory_type = 0;
+    auto* res = reinterpret_cast<ID3D12Resource*>(resource);
+    const bool described = resource && impl->interop &&
+        engine_resource_memory(impl.get(), resource, &vk_memory, &memory_offset, &memory_size,
+                               &memory_type) == HELIOS_VKD3D_IDENTITY_RESOLVED &&
+        memory_offset == 0 &&
+        SUCCEEDED(impl->interop->GetVulkanResourceInfo(res, &vk_image, &buffer_offset)) && vk_image;
+    if (has_v3 && described) {
+      // The queue's ECL timeline key: vkd3d keys it with its d3d12_command_queue,
+      // whose ID3D12CommandQueue interface is the first member, so the interface
+      // pointer is the key (helios_vkd3d_create_ecl_fence uses the same value).
+      const std::uint64_t key = static_cast<std::uint64_t>(queue);
+      helios_icd_rm_copy rc{};
+      std::uint32_t fence = 0;
+      const VkResult vr = icd.ecl_fence_create_v3((VkDevice)impl->vk_device, key, value,
+          (VkDeviceMemory)vk_memory, (VkImage)vk_image, &fence, &rc);
+      if (vr >= 0 && fence) {
+        *out_fence = fence;
+        if (vr != VK_SUCCESS)
+          return 1;
+        std::memcpy(out_copy, &rc, sizeof(rc));
+        return 0;
+      }
+    }
+    // No record: the fence alone, as a fenced scanout present makes it.
+    std::uint32_t fence = 0;
+    if (FAILED(helios_vkd3d_create_ecl_fence(reinterpret_cast<ID3D12CommandQueue*>(queue), value,
+                                             &fence)) || !fence)
+      return -2;
+    *out_fence = fence;
+    return 1;
+  });
+}
+
 void HeliosVkd3dDevice::nvk_scanout_release() const noexcept {
   helios_bridge::bridge_guard("nvk_scanout_release12", false, [&]() -> bool {
     if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm && impl->icd.scanout_release &&

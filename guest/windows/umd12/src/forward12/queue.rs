@@ -2893,9 +2893,9 @@ unsafe fn submit_wddm_render_now<T: Copy>(
 /// `h_queue` must be a handle [`create_command_queue`] returned `S_OK` for.
 /// ⛔ The caller must be inside `pfnPresent` on the thread that entered it —
 /// [`submit_wddm_render`]'s obligations 1 and 2, forwarded unchanged.
-pub(crate) unsafe fn submit_present_identity(
+pub(crate) unsafe fn submit_present_identity<T: Copy>(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
-    record: &helios_protocol::HeliosPresentRenderCmd,
+    record: &T,
 ) -> WddmSubmit {
     // SAFETY: forwarded to `queue_state`'s identical precondition; the borrow ends
     // inside this function.
@@ -3442,6 +3442,52 @@ pub(crate) unsafe fn nvk_scanout_present_fenced(h: ddi12::D3D12DDI_HCOMMANDQUEUE
         dev.engine
             .nvk_scanout_present_fenced(resource, queue.engine_queue.as_raw() as usize, value)
     })
+}
+
+/// NVK: the RM fence a composed present of `resource` carries in its `HEPR`
+/// marker -- a fence for the last ECL fence value committed on this queue, so it
+/// fires when the frame's work is done -- with the copy-engine record of
+/// `resource` when the ICD could describe it. `None` when this queue has no ECL
+/// fence value, the ICD serves no ECL fences or the KMD takes no fences in
+/// present markers. Returns `(fence, value, record bytes)`; the fence is the
+/// caller's until a Render takes it.
+///
+/// # Safety
+/// As [`queue_state`]; `resource` is a live engine resource of this device.
+pub(crate) unsafe fn nvk_present_fence(
+    h: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    resource: usize,
+) -> Option<(u32, u64, Option<[u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES]>)> {
+    // SAFETY: forwarded precondition.
+    let queue = unsafe { queue_state(h) }?;
+    let value = queue
+        .nvk_last_ecl_fence
+        .load(std::sync::atomic::Ordering::Acquire);
+    if value == 0 {
+        return None;
+    }
+    // SAFETY: a live queue implies its live device; the engine queue lives with it.
+    let dev = unsafe { device12::device(queue.h_device) }?;
+    if !dev.engine.nvk_ecl_fences() {
+        return None;
+    }
+    // SAFETY: forwarded preconditions; the engine queue is this queue's own.
+    let (fence, copy) = unsafe {
+        dev.engine
+            .nvk_present_fence_v3(resource, queue.engine_queue.as_raw() as usize, value)
+    }?;
+    Some((fence, value, copy))
+}
+
+/// NVK: close an RM fence of this queue's device that no Render took.
+///
+/// # Safety
+/// As [`queue_state`].
+pub(crate) unsafe fn nvk_close_fence(h: ddi12::D3D12DDI_HCOMMANDQUEUE, fence: u32) {
+    // SAFETY: forwarded precondition.
+    if let Some(dev) = unsafe { queue_state(h) }.and_then(|q| unsafe { device12::device(q.h_device) }) {
+        dev.engine.nvk_rm_fence_close(fence);
+    }
 }
 
 /// S5: wait on the CPU until every NVK boundary committed on this queue

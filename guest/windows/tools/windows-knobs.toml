@@ -234,6 +234,11 @@ read = "StartDevice"
 effect = "1: while VidMm keeps a standard Present buffer in system memory, the Blt copy writes its pages through a virtio-gpu guest blob and skips the CPU mirror. Needs the host's guest-blob support (`conduit config venus.guest_blobs true`); without it nothing changes."
 see = "[zero-copy-present.md](../guest/windows/docs/zero-copy-present.md)"
 
+[kmd.HpdHiResWait]
+class = "tuning"
+read = "StartDevice"
+effect = "1: the HPD worker's timed waits shorter than one default clock tick (the copy-engine route's 0.5 ms poll for its copies, the control poll, the foreign-scanout waits) are woken by a high-resolution timer at their due time instead of on the next 15.6 ms clock tick, so a finished copy retires its Present without waiting a tick. 0: the plain timed wait only."
+
 [kmd.HwCursor]
 class = "supported"
 read = "AddAdapter and StartDevice"
@@ -600,6 +605,36 @@ class = "debug"
 read = "once per process"
 effect = "The D3D11 feature-level caps profile the UMD reports: 1 the full FL11_0 profile (pipeline 11_0, real MSAA, unmasked format bits); 0 the FL10_0 profile; 2 a diagnostic mix (pipeline 11_0 with the FL10 MSAA and format caps)."
 
+[umd.FlipLedger]
+class = "supported"
+read = "once per process (DWM reads it when it starts: restart DWM after a change)"
+effect = "How a flip-model buffer of an NVK app that DWM composes directly is ordered for a DWM on NVK. 1 (default, any nonzero value): the presenting thread does not wait; the WDDM present carries the frame's RM fence and names the buffer, the KMD records the frame in its frame-done table and marks it done when the fence fires, and DWM composes the newest done buffer of each app swap chain from that table (the last composed one when none is done), never waiting for an app frame. DWM publishes a read point on the app buffers it composed in each frame, and the app's next access of such a buffer waits for that read in its DXVK submission worker (flip-model buffer release). D3D12 frames name their buffer in their marker already. A swap chain of fewer than three buffers, or a KMD without the table (before 22.22.405.124), keeps the frame completed before its present. 0: the frame is completed on the presenting thread before its present (NvkComposedComplete). HELIOS_FLIP_LEDGER overrides it per process."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.FlipUpgrade]
+class = "supported"
+read = "once per process (at its first D3D11 device on NVK)"
+effect = "1 (default): in an NVK process under a DWM that imports NVK surfaces (not dwm.exe), a windowed blt-model D3D11 swap chain (DISCARD, one sample, R8G8B8A8 or B8G8R8A8 UNORM, no flag but ALLOW_MODE_SWITCH) is created FLIP_DISCARD: DWM composes the app's own buffers by resource id instead of a copy into the window's redirection surface (PresentMon: Composed: Flip instead of Composed: Copy with GPU GDI). The app keeps its description (GetDesc), its render targets after Present, and its unthrottled interval-0 presents. An app that draws GDI into its D3D window loses that content: name such programs out with FlipUpgradeList or set 0. 0: swap chains as the app asks. HELIOS_FLIP_UPGRADE overrides it per process."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.FlipUpgradeBuffers]
+class = "experiment"
+read = "once per process"
+effect = "Buffers of a FlipUpgrade chain (2 to 16; an app that asks for more keeps its count)."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.FlipUpgradeList]
+class = "experiment"
+read = "once per process"
+effect = "REG_SZ, executable names separated by ';': FlipUpgrade applies only to these programs. Absent or empty: every eligible program."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.FlipUpgradeTearing]
+class = "experiment"
+read = "once per process"
+effect = "1 (default): a FlipUpgrade chain is created with ALLOW_TEARING when DXGI allows it, and its interval-0 presents in a window add DXGI_PRESENT_ALLOW_TEARING, so they stay unthrottled when the window is promoted to independent flip. 0: neither."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
 [umd.ForeignImport]
 class = "experiment"
 read = "once per process"
@@ -658,7 +693,7 @@ effect = "How the D3D12 runtime's context is ordered behind NVK work: 2 an RM fe
 [umd.Nvk12Present]
 class = "supported"
 read = "once per process"
-effect = "How a D3D12 NVK swap chain presents: 0 automatic (DWM composes it when it can import NVK surfaces, else scanout 0); 1 always scanout 0 (zero-copy flip, the desktop hidden while the app presents); 2 always the WDDM present (DWM composes). HELIOS_NVK_PRESENT overrides it per process."
+effect = "How a D3D12 NVK swap chain presents: 0 automatic (a window is composed by DWM when DWM imports NVK surfaces, i.e. DWM runs on NVK or ForeignImport=1; a back buffer that covers the output (a primary, or at least the desktop's size) takes scanout 0, as does every buffer when DWM cannot import NVK surfaces); 1 always scanout 0 (zero-copy flip, the desktop hidden while the app presents); 2 always the WDDM present (DWM composes). HELIOS_NVK_PRESENT overrides it per process."
 
 [umd.Nvk12ScanoutFence]
 class = "tuning"
@@ -680,6 +715,18 @@ see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 class = "tuning"
 read = "once per process"
 effect = "1: a composed NVK present's RM fence takes a value reserved at the Present call and signalled by DXVK's submission thread, so the presenting thread does not wait for DXVK's worker threads; 0 waits for the submission first. HELIOS_NVK_ASYNC_PRESENT_FENCE overrides it per process."
+
+[umd.NvkBltFence]
+class = "tuning"
+read = "once per process"
+effect = "0: a windowed blt-model present (DXGI's Blt flag) without a DXGI destination waits for the frame on the presenting thread before the WDDM present (the NvkComposedComplete CPU wait), so the present retires at once. 1: it carries the frame's RM fence and does not wait; the KMD's Blt into the window's redirection surface waits for the fence, but the present retires only after the KMD sees the copy done and dxgkrnl throttles the app (stutter). HELIOS_NVK_BLT_FENCE overrides it per process."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.NvkBltGpuCopy]
+class = "tuning"
+read = "once per process"
+effect = "1: a windowed blt-model present without a DXGI destination copies the frame into the window's redirection surface on the app's own NVK queue right after the frame (the KMD names the surface, the app imports it by resource id) and carries the frame's RM fence plus the HOWW tag; the KMD completes the Blt with no copy and no read-ledger claim, and the present retires when the fence fires. No CPU wait on the presenting thread. Needs a VRAM redirection surface (the KMD's GdiAccel=1 with RedirVram=1); with GdiAccel=0 the surface is a CPU-visible standard buffer and the KMD keeps copying (logged once). A present the path cannot take (no surface recorded yet, a failed import, an unsupported format pair, no RM fence) is copied by the KMD as with 0. HELIOS_NVK_BLT_GPU_COPY overrides it per process."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.NvkComposedComplete]
 class = "supported"
@@ -996,6 +1043,16 @@ effect = "Pause instructions the D3D11 threaded front end's worker spends betwee
 default_note = "unset = 32 (DEFAULT_POLL_PAUSES)"
 see = "[d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md)"
 
+[env.HELIOS_FLIP_LEDGER]
+class = "debug"
+read = "once per process"
+effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios FlipLedger for this process (the D3D11 UMD and its DXVK bridge)."
+
+[env.HELIOS_FLIP_UPGRADE]
+class = "debug"
+read = "once per process"
+effect = "A number overrides HKLM\\SOFTWARE\\Helios FlipUpgrade for this process."
+
 [env.HELIOS_FLUSH_GATE_CPU_WAIT]
 class = "debug"
 read = "once per process"
@@ -1062,6 +1119,16 @@ see = "[shared-surfaces.md](../guest/windows/docs/shared-surfaces.md)"
 class = "debug"
 read = "once per process"
 effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios NvkAsyncPresentFence for this process."
+
+[env.HELIOS_NVK_BLT_GPU_COPY]
+class = "debug"
+read = "once per process"
+effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios NvkBltGpuCopy for this process."
+
+[env.HELIOS_NVK_BLT_FENCE]
+class = "debug"
+read = "once per process"
+effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios NvkBltFence for this process."
 
 [env.HELIOS_NVK_COMPOSED_COMPLETE]
 class = "debug"

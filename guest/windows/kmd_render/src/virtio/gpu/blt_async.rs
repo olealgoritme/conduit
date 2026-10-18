@@ -420,6 +420,12 @@ impl VirtioGpu {
         Some((index[pos], pos))
     }
 
+    /// Whether the worker's next take would find a request to dispatch now ([`Self::blt_pick_ready`]
+    /// finds one). Spinlock only.
+    pub(crate) fn windowed_blt_dispatchable(&self) -> bool {
+        self.blt_pick_ready().is_some()
+    }
+
     /// Hand `resource_id` back to its readers if the KMD owns it as a writer, and do nothing (no
     /// reject counted) if it does not.
     pub(super) fn blt_async_release_writer(&mut self, resource_id: u32) {

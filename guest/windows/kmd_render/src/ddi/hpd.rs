@@ -265,11 +265,23 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // The healthy resting place: a stall dump that finds `HpdSite` here with a recent
         // `HpdSiteT` or `HpdLoopT` has a worker that is asleep, not stuck.
         stall_diag::hpd_enter(site::WAIT);
+        // `HpdHiResWait`: a timeout shorter than one default clock tick would end on the next
+        // tick (15.6 ms at the default resolution), not at `due`: the copy-engine route's 0.5 ms
+        // poll left a finished copy, its Present's DMA fence and the source's read-ledger claim
+        // waiting a whole tick. The high-resolution timer ends the wait at `due` instead; the
+        // plain timeout stays as the bound.
+        let hires = hpd_wake::hires_due(stall_diag::hpd_hires_wait(), due)
+            .is_some_and(|d| adapter.arm_hpd_hr_wake(d));
         // SAFETY: wait on the initialized event; NULL timeout means sleep until
         // config change, scanout dirty, completion, or StopDevice.
         let wait_status = unsafe {
             KeWaitForSingleObject(adapter.hpd_event.get() as PVOID, 0, 0, 0, timeout_ptr)
         };
+        // The timer's wake is this wait's timeout for everything below (the control poll, the
+        // message-interrupt safety net, `HpdWkTmo`).
+        let hr_fired = hires && adapter.end_hpd_hr_wake();
+        stall_diag::note_hires_wait(hires, hr_fired);
+        let wait_status = if hr_fired { STATUS_TIMEOUT } else { wait_status };
         if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
             stall_diag::hpd_enter(site::EXITED);
             // Publish "worker exited" BEFORE terminating, so stop_hpd's join
@@ -378,8 +390,16 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // `RedirVram`: the first clear of VRAM surfaces nothing has mapped yet (one relaxed load
         // with none alive).
         crate::virtio::rm_client::ce_vram::clear_pending(passive, adapter);
-        crate::ddi::display::service_windowed_blt(passive, adapter);
+        let dispatched = crate::ddi::display::service_windowed_blt(passive, adapter);
         crate::ddi::ce_present_route::settle_after_dispatch(passive, adapter);
+        // A pass dispatches one request. Two readiness edges that arrived before this pass (two
+        // producers' fences, an admission and a fence) set the synchronization event once, so a
+        // second ready request would wait for an unrelated wake (with nothing in flight: an
+        // infinite wait), holding its Present's DMA fence and so the app's present queue: look
+        // again at once while one can go now.
+        if dispatched && crate::ddi::display::windowed_blt_dispatchable(adapter) {
+            adapter.signal_hpd_for(hpd_wake::cause::BLT);
+        }
         // `GdiAccel` (one relaxed load otherwise): execute the admitted GDI jobs.
         let _ = crate::ddi::gdi_exec::service(passive, adapter, false);
 

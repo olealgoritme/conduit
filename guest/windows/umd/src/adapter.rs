@@ -485,6 +485,10 @@ unsafe extern "system" fn create_device(
                 // identity path is `direct_scanout_allocations` plus
                 // `presented_primary_private`, and it is now the only one.
                 nvk_keyed_resources: std::sync::Mutex::new(Vec::new()),
+                nvk_flip_buffers: std::sync::Mutex::new(Vec::new()),
+                nvk_flip_reads: std::sync::Mutex::new(Vec::new()),
+                nvk_flip_views: std::sync::Mutex::new(Vec::new()),
+                nvk_flip_last: std::sync::Mutex::new(Vec::new()),
                 direct_scanout_allocations: std::sync::Mutex::new(Vec::new()),
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),
@@ -629,6 +633,13 @@ unsafe extern "system" fn create_device(
             // only after the bridge (and with it the DXVK signaler) is gone.
             dev.dxvk.set_scanout_acquire_event(event);
         }
+    }
+
+    // `FlipUpgrade`: windowed blt-model swap chains of an NVK process are created flip-model
+    // (once per process; nothing happens with the knob at 0).
+    unsafe {
+        let dev = &*(create.hDrvDevice.pDrvPrivate as *const device_funcs::HeliosDevice);
+        forward::maybe_install_flip_upgrade(dev);
     }
 
     if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {

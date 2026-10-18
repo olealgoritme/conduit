@@ -404,6 +404,52 @@ pub(crate) fn windowed_snapshot_idle(dev: &HeliosDevice, resource_id: u32) -> bo
     hr == 0 && payload.out_state == HELIOS_SNAPSHOT_IDLE
 }
 
+/// `HELIOS_ESCAPE_BLT_TARGET` (`NvkBltGpuCopy`): where the KMD's windowed Blt of the back buffer
+/// `source_resource_id` lands for this process: the KMD's answer, whatever its `out_state`.
+/// `None` when the KMD does not know the verb (an older KMD: asked once, then never again) or the
+/// escape fails. One escape on this device's callback, no wait in the KMD.
+pub(crate) fn blt_target(
+    dev: &HeliosDevice,
+    source_resource_id: u32,
+) -> Option<helios_protocol::HeliosBltTargetQuery> {
+    // 0 unknown, 1 served, 2 refused once (an older KMD): never asked again.
+    static SERVED: AtomicU32 = AtomicU32::new(0);
+    if source_resource_id == 0 || SERVED.load(Ordering::Relaxed) == 2 {
+        return None;
+    }
+    let context = dev.context.as_ref()?;
+    let rt_adapter = dev.rt_adapter;
+    if rt_adapter == 0 || dev.kt_callbacks.is_null() {
+        return None;
+    }
+    let mut payload = helios_protocol::HeliosBltTargetQuery::new(source_resource_id);
+    // SAFETY: device/context and callback table outlive this DDI; payload is a writable stack
+    // struct with the exact advertised size.
+    let hr = unsafe {
+        call_escape(
+            dev.kt_callbacks,
+            rt_adapter,
+            dev.h_rt_device as usize,
+            context.handle.as_ptr() as usize,
+            (&mut payload as *mut helios_protocol::HeliosBltTargetQuery).cast(),
+            size_of::<helios_protocol::HeliosBltTargetQuery>() as u32,
+        )
+    };
+    if hr != 0 {
+        if SERVED.load(Ordering::Relaxed) == 0 {
+            SERVED.store(2, Ordering::Relaxed);
+            log_error!(
+                "NvkBltGpuCopy: HELIOS_ESCAPE_BLT_TARGET refused hr=0x{:08x}: the KMD copies \
+                 windowed blt-model frames",
+                hr as u32
+            );
+        }
+        return None;
+    }
+    SERVED.store(1, Ordering::Relaxed);
+    Some(payload)
+}
+
 /// Acquire-load one `u32` field of the mapped ledger page.
 ///
 /// # Safety
@@ -438,6 +484,101 @@ const SLOT_RESID_OFF: usize = offset_of!(HeliosReadLedgerSlot, resid);
 const SLOT_GENERATION_OFF: usize = offset_of!(HeliosReadLedgerSlot, generation);
 const SLOT_ISSUED_OFF: usize = offset_of!(HeliosReadLedgerSlot, issued);
 const SLOT_RETIRED_OFF: usize = offset_of!(HeliosReadLedgerSlot, retired);
+
+/// One buffer's line of the KMD's frame-done table (`FlipLedger`,
+/// `helios_protocol::HeliosFrameDoneTable`): `completed >= submitted` = no frame of the buffer
+/// in flight on the GPU; a larger `completed` = a newer done frame; `owner` = the presenting
+/// process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameDone {
+    pub(crate) owner: u32,
+    pub(crate) submitted: u64,
+    /// The newest finished frame in the buffer (0 = none): the content it holds.
+    pub(crate) completed: u64,
+    /// The GPU may be writing the buffer now (its pending frame is the oldest of its context).
+    pub(crate) writing: bool,
+}
+
+impl FrameDone {
+    /// No frame of the buffer pending.
+    pub(crate) fn idle(self) -> bool {
+        self.completed >= self.submitted
+    }
+
+    /// The buffer holds a finished frame nothing is writing: DWM may sample it.
+    pub(crate) fn readable(self) -> bool {
+        self.completed != 0 && !self.writing
+    }
+}
+
+const FD_MAGIC_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneTable, magic);
+const FD_VERSION_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneTable, version);
+const FD_SLOT_COUNT_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneTable, slot_count);
+const FD_SLOTS_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneTable, slots);
+const FD_SLOT_SIZE: usize = size_of::<helios_protocol::HeliosFrameDoneSlot>();
+const FD_RESID_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, resid);
+const FD_OWNER_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, owner);
+const FD_SUBMITTED_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, submitted);
+const FD_COMPLETED_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, completed);
+const FD_WRITING_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, writing);
+
+/// The frame-done table's address in a live ledger mapping, when the KMD wrote one.
+///
+/// # Safety
+/// `va` is a live mapping of the whole ledger page (the escape maps 4 KiB).
+unsafe fn frame_done_table(va: usize) -> Option<usize> {
+    let base = va + helios_protocol::HELIOS_FRAME_DONE_OFFSET;
+    // SAFETY: inside the mapped page.
+    let ok = unsafe {
+        ledger_load(base, FD_MAGIC_OFF) == helios_protocol::HELIOS_FRAME_DONE_MAGIC
+            && ledger_load(base, FD_VERSION_OFF) == helios_protocol::HELIOS_FRAME_DONE_VERSION
+            && ledger_load(base, FD_SLOT_COUNT_OFF) == helios_protocol::HELIOS_FRAME_DONE_SLOTS as u32
+    };
+    ok.then_some(base)
+}
+
+/// Does the KMD publish the frame-done table (version 2: a KMD from 22.22.405.125 on)?
+pub(crate) fn frame_done_available() -> bool {
+    let Ok(reg) = REGISTRY.lock() else {
+        return false;
+    };
+    let Some(va) = reg.iter().find(|e| ledger_live(e)).map(|e| e.ledger_va) else {
+        return false;
+    };
+    // SAFETY: a registered live mapping, held by the registry mutex for the read.
+    unsafe { frame_done_table(va) }.is_some()
+}
+
+/// The frame-done line of buffer `resid`. `None`: no table, or the KMD tracks no frame of it.
+/// Reads `completed`, `writing`, `submitted` in that order (the KMD writes them in the reverse
+/// order), so a race reads a buffer as busy, never as readable too early; the resid is re-checked
+/// after the fields.
+pub(crate) fn frame_done_lookup(resid: u32) -> Option<FrameDone> {
+    if resid == 0 {
+        return None;
+    }
+    let reg = REGISTRY.lock().ok()?;
+    let va = reg.iter().find(|e| ledger_live(e)).map(|e| e.ledger_va)?;
+    // SAFETY: a registered live mapping, held by the registry mutex for every read below.
+    unsafe {
+        let base = frame_done_table(va)?;
+        for i in 0..helios_protocol::HELIOS_FRAME_DONE_SLOTS {
+            let slot = base + FD_SLOTS_OFF + i * FD_SLOT_SIZE;
+            if ledger_load(slot, FD_RESID_OFF) != resid {
+                continue;
+            }
+            let owner = ledger_load(slot, FD_OWNER_OFF);
+            let completed = ledger_load_u64(slot, FD_COMPLETED_OFF);
+            let writing = ledger_load(slot, FD_WRITING_OFF) != 0;
+            let submitted = ledger_load_u64(slot, FD_SUBMITTED_OFF);
+            if ledger_load(slot, FD_RESID_OFF) != resid {
+                return None;
+            }
+            return Some(FrameDone { owner, submitted, completed, writing });
+        }
+    }
+    None
+}
 
 /// Validate a freshly-mapped ledger page's complete v2 header. A mismatch
 /// means a driver skew and the feature must treat the page as absent.

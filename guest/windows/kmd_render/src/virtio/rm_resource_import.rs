@@ -105,8 +105,11 @@ pub fn rm_resource_import(
         UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
         return Err(RiError::Local(Verdict::Unsupported));
     }
+    // `NvkBltGpuCopy`: a process may import the window surface its own windowed Blts land in
+    // (`ddi/window_copy.rs`). Read before the device lock (the record has its own leaf lock).
+    let granted = process != 0 && crate::ddi::window_copy::import_granted(process, resource_id);
     let begin = adapter
-        .with_virtio(|v| v.rm_resource_import_begin(owner, process, rm_handle, resource_id))
+        .with_virtio(|v| v.rm_resource_import_begin(owner, process, granted, rm_handle, resource_id))
         .map_err(|_| RiError::NoTransport)?;
     let epoch = match begin {
         Ok(epoch) => epoch,

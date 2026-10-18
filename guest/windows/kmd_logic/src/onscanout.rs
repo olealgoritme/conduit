@@ -128,7 +128,9 @@ pub fn parse(tail: &[u8]) -> Parsed {
         return Parsed::Absent;
     }
     let magic = u32_at(tail, 0);
-    if magic == 0 {
+    // Zero, or the window-written tag that shares this slot (`crate::window_copy`, its own
+    // parser answers for it).
+    if magic == 0 || magic == crate::window_copy::MAGIC {
         return Parsed::Absent;
     }
     if magic != MAGIC {

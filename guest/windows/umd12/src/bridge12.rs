@@ -201,6 +201,23 @@ mod ffi {
             value: u64,
         ) -> i32;
 
+        /// NVK only: an RM fence for ECL fence value `value` of `queue` and
+        /// the copy-engine record of `resource` (80 bytes at `out_copy`).
+        /// 0 = fence and record, 1 = fence alone, negative = no fence.
+        ///
+        /// # Safety
+        /// `resource` and `queue` are borrowed live engine objects of this
+        /// device; `out_fence` and `copy_len` bytes at `out_copy` are writable.
+        unsafe fn nvk_present_fence_v3(
+            self: &HeliosVkd3dDevice,
+            resource: usize,
+            queue: usize,
+            value: u64,
+            out_fence: *mut u32,
+            out_copy: *mut u8,
+            copy_len: usize,
+        ) -> i32;
+
         /// S5, NVK only: wait for the queue's execution stream to reach `value`.
         ///
         /// # Safety
@@ -718,6 +735,34 @@ impl BridgeDevice12 {
         // SAFETY: forwarded precondition.
         self.get()
             .is_some_and(|d| unsafe { d.nvk_scanout_present_fenced(resource, queue, value) } == 0)
+    }
+
+    /// NVK only: the RM fence of a composed present of `resource`, for ECL
+    /// fence value `value` of `queue`, and the copy-engine record (the ICD's
+    /// `helios_icd_rm_copy` bytes) when the ICD could describe `resource`.
+    /// `None`: no fence. The fence is the caller's.
+    ///
+    /// # Safety
+    /// `resource` and `queue` are borrowed live engine objects of this device.
+    pub(crate) unsafe fn nvk_present_fence_v3(
+        &self,
+        resource: usize,
+        queue: usize,
+        value: u64,
+    ) -> Option<(u32, Option<[u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES]>)> {
+        let d = self.get()?;
+        let mut fence = 0u32;
+        let mut copy = [0u8; helios_protocol::HELIOS_ICD_RM_COPY_BYTES];
+        // SAFETY: forwarded precondition; both out-pointers address live locals
+        // of the stated sizes.
+        let rc = unsafe {
+            d.nvk_present_fence_v3(resource, queue, value, &mut fence, copy.as_mut_ptr(), copy.len())
+        };
+        match rc {
+            0 if fence != 0 => Some((fence, Some(copy))),
+            1 if fence != 0 => Some((fence, None)),
+            _ => None,
+        }
     }
 
     /// NVK only: close an RM fence this process still owns.

@@ -215,6 +215,27 @@ pub fn authorize(
     }
 }
 
+/// [`authorize`] with one more route for a user-mode caller: `granted`, the KMD's own record
+/// that the caller's process presented into this resource (a window's redirection surface the
+/// process's windowed Blts land in, `crate::window_copy::Table::granted`), so it may import it to
+/// write its frames there itself (`NvkBltGpuCopy`). Only a `NotPermitted` refusal is lifted: the
+/// handle, existence and destruction rules stay.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_or_granted(
+    table: &ForeignTable,
+    handle_device_type: Option<u32>,
+    owner: u64,
+    process: u64,
+    rm_handle: u32,
+    resource_id: u32,
+    granted: bool,
+) -> Result<(), Refusal> {
+    match authorize(table, handle_device_type, owner, process, rm_handle, resource_id) {
+        Err(Refusal::NotPermitted) if granted => Ok(()),
+        other => other,
+    }
+}
+
 /// The KMD's OWN import of `resource_id` into a DRM file of its own client (`RedirVram`: a GDI
 /// command whose source is an NVK image, `docs/vram-redirection.md` 8). The kernel names no
 /// process; it may import any live, not destroyed foreign resource, into its own DRI node only.
@@ -276,6 +297,25 @@ mod tests {
         assert_eq!(authorize_kmd(&t, Some(0), 9, RES), Err(Refusal::HandleNotOwned));
         assert_eq!(authorize_kmd(&t, None, 9, RES), Err(Refusal::HandleNotOwned));
         assert_eq!(authorize_kmd(&t, dri, 0, RES), Err(Refusal::BadRequest));
+    }
+
+    #[test]
+    fn a_grant_lifts_only_the_opener_rule() {
+        let t = adopted();
+        // Adopted: no creator, no open by PB: refused, unless the record grants it.
+        assert_eq!(authorize(&t, DRM, B, PB, 9, RES), Err(Refusal::NotPermitted));
+        assert_eq!(authorize_or_granted(&t, DRM, B, PB, 9, RES, false), Err(Refusal::NotPermitted));
+        assert_eq!(authorize_or_granted(&t, DRM, B, PB, 9, RES, true), Ok(()));
+        // The other rules stay.
+        assert_eq!(
+            authorize_or_granted(&t, None, B, PB, 9, RES, true),
+            Err(Refusal::HandleNotOwned)
+        );
+        assert_eq!(
+            authorize_or_granted(&t, DRM, B, PB, 9, 4242, true),
+            Err(Refusal::NoSuchResource)
+        );
+        assert_eq!(authorize_or_granted(&t, DRM, B, PB, 0, RES, true), Err(Refusal::BadRequest));
     }
 
     /// Resource 100 imported by device A: the creator's state.

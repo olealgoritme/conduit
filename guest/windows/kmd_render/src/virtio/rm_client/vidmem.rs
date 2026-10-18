@@ -757,6 +757,7 @@ pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource
     // No copy names it from here: the route drops its destination record, the channel's mapping
     // goes stale (given back by the next pass that holds the channel's I/O).
     crate::ddi::vram_redirect::destination_gone(resource_id);
+    crate::ddi::window_copy::destination_gone(resource_id);
     super::ce_vram::object_gone(resource_id);
     let epoch_now = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
     let mut freed = true;

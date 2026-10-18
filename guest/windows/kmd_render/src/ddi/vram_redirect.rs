@@ -304,7 +304,7 @@ pub(crate) fn destination_gone(resource_id: u32) {
 }
 
 /// `SrcRect` and `DstRect` of the Present, as pixel rectangles of equal size inside both surfaces.
-fn rects(
+pub(crate) fn rects(
     args: &DXGKARG_PRESENT,
     src: &PresentAllocInfo,
     dst: &PresentAllocInfo,
@@ -618,6 +618,38 @@ unsafe fn foreign_arm(
     src_rect: Rect,
     dst_rect: Rect,
 ) -> Option<Outcome> {
+    // Where this source's frames land, for a producer that writes them itself (`NvkBltGpuCopy`,
+    // `ddi/window_copy.rs`): the same import facts an open of the surface hands DWM.
+    {
+        let (pitch, modifier, offset, fourcc) = match destination.foreign {
+            Some(l) => (l.stride, l.modifier, l.offset, l.fourcc),
+            None => (dst.pitch, helios_kmd_logic::foreign_resource::MOD_LINEAR, 0, dst.fourcc),
+        };
+        crate::ddi::window_copy::note_blt(
+            context,
+            source,
+            destination,
+            helios_kmd_logic::window_copy::Surface {
+                width: dst.width,
+                height: dst.height,
+                pitch,
+                dxgi_format: destination_dxgi,
+                bind_flags: destination.bind_flags,
+                memory_type_index: destination.memory_type_index,
+                alloc_size: if destination.venus_alloc_size != 0 {
+                    destination.venus_alloc_size
+                } else {
+                    dst.size
+                },
+                modifier,
+                offset,
+                fourcc,
+            },
+            src_rect,
+            dst_rect,
+            true,
+        );
+    }
     // The route is the default; `RvOff` 0x1000 takes the synchronous copy instead.
     if vidmem::off(helios_kmd_logic::rm_vidmem::off::ROUTE_OFF) {
         return sync_or_skip(passive, adapter, source, destination, &dst, src_rect, dst_rect);
@@ -672,9 +704,10 @@ unsafe fn foreign_arm(
     ) else {
         return skip(Why::Rect);
     };
-    // Retire the route's finished copies now, at this Present: the HPD worker polls them only at
-    // its timer-quantum waits (about 15.6 ms), and every Present whose copy is not retired holds
-    // the app's frame-latency budget (382.1: 89 fps).
+    // Retire the route's finished copies now, at this Present: between its passes the HPD worker
+    // polls them only at its timed waits (0.5 ms on the high-resolution timer, a 15.6 ms clock
+    // tick with `HpdHiResWait` 0), and every Present whose copy is not retired holds the app's
+    // frame-latency budget (382.1: 89 fps).
     crate::ddi::ce_present_route::settle_from_present(passive, adapter);
     let t_rt = crate::ddi::blt_async::now_100ns();
     // SAFETY: the caller's contract.

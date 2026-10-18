@@ -554,6 +554,100 @@ pub(crate) fn nvk_composed_complete() -> bool {
     })
 }
 
+/// `NvkBltFence`: 0 (default) = a blt-model present (DXGI's `Blt` flag, no
+/// `Flip`) without a DXGI destination takes the `NvkComposedComplete` rule: the
+/// presenting thread waits for the frame on the CPU before the WDDM present, so
+/// dxgkrnl retires the present at once and does not throttle the app. 1 = such
+/// a present carries the frame's RM fence and does not wait: the KMD's Blt into
+/// the window's redirection surface waits for the fence on the copy engine or
+/// the HPD worker, but the present retires only after the KMD's worker sees the
+/// copy done, and dxgkrnl throttles the app on those late retirements (visible
+/// stutter). `HELIOS_NVK_BLT_FENCE` overrides it per process.
+pub(crate) static NVK_BLT_FENCE: BoolKnob = BoolKnob::new(c"NvkBltFence", false);
+
+/// `NvkBltFence`, or `HELIOS_NVK_BLT_FENCE` from the environment.
+pub(crate) fn nvk_blt_fence() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| env_bool("HELIOS_NVK_BLT_FENCE").unwrap_or_else(|| NVK_BLT_FENCE.get()))
+}
+
+/// `NvkBltGpuCopy`: 0 (default) = a windowed blt-model present without a DXGI destination is
+/// copied into the window's redirection surface by the KMD (its copy engine, behind the frame).
+/// 1 = the UMD copies the frame into that surface itself, on the app's own NVK queue right after
+/// the frame (the KMD names the surface, `HELIOS_ESCAPE_BLT_TARGET`, and the app imports it by
+/// resource id), and the present carries the frame's RM fence plus the `HOWW` tag: the KMD
+/// completes the Blt with no copy and no read-ledger claim, and the present retires when the
+/// fence fires. No CPU wait for the frame on the presenting thread. Any step that cannot be taken
+/// (no surface recorded yet, an import that fails, a format pair it does not cover, no RM fence)
+/// leaves that present to the KMD's copy as with 0. `HELIOS_NVK_BLT_GPU_COPY` overrides it per
+/// process.
+pub(crate) static NVK_BLT_GPU_COPY: BoolKnob = BoolKnob::new(c"NvkBltGpuCopy", false);
+
+/// `NvkBltGpuCopy`, or `HELIOS_NVK_BLT_GPU_COPY` from the environment.
+pub(crate) fn nvk_blt_gpu_copy() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_BLT_GPU_COPY").unwrap_or_else(|| NVK_BLT_GPU_COPY.get())
+    })
+}
+
+/// `FlipUpgrade`: 1 (default) = in an NVK process under a DWM that imports NVK surfaces (not
+/// dwm.exe itself), a windowed blt-model D3D11 swap chain (`DISCARD`, one sample, R8G8B8A8 /
+/// B8G8R8A8 UNORM, no flag but `ALLOW_MODE_SWITCH`) is created `FLIP_DISCARD` with
+/// `FlipUpgradeBuffers` buffers: DWM composes the app's own buffers (no copy into the window's
+/// redirection surface), and the app sees its own description
+/// (`helios_umd_common::flip_upgrade`). `FlipUpgradeList` (REG_SZ, `;`-separated executable
+/// names) limits it to those programs. 0 = swap chains as the app asks. `HELIOS_FLIP_UPGRADE`
+/// overrides it per process.
+pub(crate) static FLIP_UPGRADE: DwordKnob = DwordKnob::new(c"FlipUpgrade", 1);
+
+/// `FlipUpgradeBuffers`: buffers of an upgraded chain (default 3, clamped to 2..=16).
+pub(crate) static FLIP_UPGRADE_BUFFERS: DwordKnob = DwordKnob::new(c"FlipUpgradeBuffers", 3);
+
+/// `FlipUpgradeTearing`: 1 (default) = an upgraded chain is created with `ALLOW_TEARING` (when
+/// DXGI allows it) and its interval-0 presents add `DXGI_PRESENT_ALLOW_TEARING`, so they stay
+/// unthrottled when the window is promoted to independent flip. 0 = neither.
+pub(crate) static FLIP_UPGRADE_TEARING: BoolKnob = BoolKnob::new(c"FlipUpgradeTearing", true);
+
+/// `FlipUpgrade`, or `HELIOS_FLIP_UPGRADE` from the environment.
+pub(crate) fn flip_upgrade() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_FLIP_UPGRADE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| FLIP_UPGRADE.get())
+    })
+}
+
+/// `FlipLedger`: how a composed NVK frame that DWM samples directly (a flip-model buffer) is
+/// ordered for a DWM on NVK. Read once per process; DWM reads it at its start.
+///
+/// * 1 (default; any nonzero value): the presenting thread does not wait. The WDDM present
+///   carries the frame's RM fence and names the buffer (the `HERF` `source_index`); the KMD
+///   records the frame in its frame-done table when the marker is rendered and marks it done
+///   when the fence fires (`helios_kmd_logic::frame_done`, published in the read-ledger page).
+///   DWM composes the newest done buffer of each app swap chain from that table and never waits
+///   for an app frame (`forward/bindings.rs` `dwm_flip_views`). DWM publishes a read point on
+///   the app buffers it composed in each frame, and the app's next access of such a buffer waits
+///   for that read in its DXVK submission worker (flip-model buffer release). A swap chain of
+///   fewer than three buffers, or a KMD without the table, keeps the `NvkComposedComplete` rule.
+/// * 0: the `NvkComposedComplete` rule (the frame is complete before its present).
+///
+/// `HELIOS_FLIP_LEDGER` overrides it per process.
+pub(crate) static FLIP_LEDGER: DwordKnob = DwordKnob::new(c"FlipLedger", 1);
+
+/// `FlipLedger`, or `HELIOS_FLIP_LEDGER` from the environment.
+pub(crate) fn flip_ledger() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_FLIP_LEDGER")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| FLIP_LEDGER.get())
+    })
+}
+
 /// `NvkRmCopyRecord`: 1 (default) = a composed NVK frame whose WDDM present
 /// carries an RM fence also carries the copy-engine Present record (`'HEF3'`,
 /// the 168-byte `HERF` / 192-byte `HEPR`, docs/rm-copy-engine-present.md 12)

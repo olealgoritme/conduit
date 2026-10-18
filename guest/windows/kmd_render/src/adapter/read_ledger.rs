@@ -47,8 +47,85 @@ use wdk_sys::ntddk::{KeSetEvent, MmAllocateContiguousMemory, ObDereferenceObject
 use wdk_sys::{KEVENT, PHYSICAL_ADDRESS, PVOID};
 
 /// The mapping the escape hands out is the whole page, not just the struct at
-/// its head — the remainder is zero and reserved.
+/// its head — the remainder is zero and reserved, except the frame-done table
+/// at `HELIOS_FRAME_DONE_OFFSET` ([`publish_frame_done`]).
 pub(crate) const LEDGER_PAGE_BYTES: usize = 4096;
+
+/// Kernel VA of the frame-done table (`helios_protocol::HeliosFrameDoneTable`) inside the
+/// ledger page, 0 until `init_page` wrote its header. The page lives until `AdapterContext::drop`,
+/// and nothing writes the table after that (the virtio transport that drives it is gone first).
+static FRAME_DONE_VA: AtomicUsize = AtomicUsize::new(0);
+
+const FRAME_DONE_SLOT_BYTES: usize = core::mem::size_of::<helios_protocol::HeliosFrameDoneSlot>();
+const FD_SLOTS_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneTable, slots);
+const FD_OVERFLOW_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneTable, overflow);
+const FD_RESID_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, resid);
+const FD_OWNER_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, owner);
+const FD_SUBMITTED_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, submitted);
+const FD_COMPLETED_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, completed);
+const FD_WRITING_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, writing);
+const _: () = assert!(helios_kmd_logic::frame_done::SLOTS == helios_protocol::HELIOS_FRAME_DONE_SLOTS);
+
+/// Write frame-done slot `i` into the page (`virtio_lock`, any IRQL: plain atomic stores to
+/// nonpaged memory). A slot given to another buffer is written resid 0 first, its fields, then
+/// the resid, so a reader that re-checks the resid never pairs one buffer's counters with
+/// another's id.
+pub(crate) fn publish_frame_done(i: usize, e: &helios_kmd_logic::frame_done::Entry) {
+    let base = FRAME_DONE_VA.load(Ordering::Acquire);
+    if base == 0 || i >= helios_protocol::HELIOS_FRAME_DONE_SLOTS {
+        return;
+    }
+    let slot = base + FD_SLOTS_OFF + i * FRAME_DONE_SLOT_BYTES;
+    // SAFETY: `slot` lies inside the live, naturally aligned table of the ledger page
+    // (asserted layout); every field is accessed through an atomic of its own size.
+    unsafe {
+        let resid = &*((slot + FD_RESID_OFF) as *const AtomicU32);
+        let owner = &*((slot + FD_OWNER_OFF) as *const AtomicU32);
+        let submitted = &*((slot + FD_SUBMITTED_OFF) as *const AtomicU64);
+        let completed = &*((slot + FD_COMPLETED_OFF) as *const AtomicU64);
+        let writing = &*((slot + FD_WRITING_OFF) as *const AtomicU32);
+        let moved = resid.load(Ordering::Relaxed) != e.resid;
+        if moved {
+            resid.store(0, Ordering::Release);
+        }
+        owner.store(e.owner, Ordering::Release);
+        // `writing` before `submitted` and `completed` after both: a reader (completed,
+        // writing, submitted) can see a buffer as busy too early, never as readable too early.
+        writing.store(e.writing as u32, Ordering::Release);
+        submitted.store(e.submitted, Ordering::Release);
+        completed.store(e.completed, Ordering::Release);
+        if moved {
+            resid.store(e.resid, Ordering::Release);
+        }
+    }
+}
+
+/// The table's overflow counter (frames not tracked), for readers.
+pub(crate) fn publish_frame_done_overflow(n: u32) {
+    let base = FRAME_DONE_VA.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    // SAFETY: as `publish_frame_done`.
+    unsafe { (*((base + FD_OVERFLOW_OFF) as *const AtomicU32)).store(n, Ordering::Release) };
+}
+
+/// Write the frame-done table's header (magic last) into a zeroed page at `va`.
+fn init_frame_done(va: usize) {
+    let base = va + helios_protocol::HELIOS_FRAME_DONE_OFFSET;
+    // SAFETY: inside the freshly zeroed ledger page; the header words are u32s at their
+    // asserted offsets.
+    unsafe {
+        let word = |off: usize| &*((base + off) as *const AtomicU32);
+        word(core::mem::offset_of!(helios_protocol::HeliosFrameDoneTable, version))
+            .store(helios_protocol::HELIOS_FRAME_DONE_VERSION, Ordering::Release);
+        word(core::mem::offset_of!(helios_protocol::HeliosFrameDoneTable, slot_count))
+            .store(helios_protocol::HELIOS_FRAME_DONE_SLOTS as u32, Ordering::Release);
+        word(core::mem::offset_of!(helios_protocol::HeliosFrameDoneTable, magic))
+            .store(helios_protocol::HELIOS_FRAME_DONE_MAGIC, Ordering::Release);
+    }
+    FRAME_DONE_VA.store(base, Ordering::Release);
+}
 
 // Retirement-event registrations per adapter (`scanout_events::EVENT_TABLE_LEN`):
 // one auto-reset event per DxvkDevice, at most `EVENTS_PER_OWNER` per device.
@@ -319,6 +396,7 @@ impl ReadLedger {
         // written before the Release publication of the VA below.
         let page = unsafe { &*(va.as_ptr() as *const LedgerSharedPage) };
         Self::write_header(page);
+        init_frame_done(va.as_ptr() as usize);
         self.page_va.store(va.as_ptr() as usize, Ordering::Release);
         crate::diag::record_named_bytes(b"RdPgF", 0);
     }
@@ -326,6 +404,7 @@ impl ReadLedger {
     /// Reclaim the page VA for freeing. `AdapterContext::drop` only — by then
     /// every device is destroyed, so no user mapping and no token remains.
     pub(crate) fn take_page_va(&self) -> usize {
+        FRAME_DONE_VA.store(0, Ordering::Release);
         self.page_va.swap(0, Ordering::AcqRel)
     }
 

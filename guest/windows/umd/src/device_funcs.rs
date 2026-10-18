@@ -177,6 +177,17 @@ pub struct RuntimeContext {
     pub patches: core::cell::Cell<Option<Window<ddi::D3DDDI_PATCHLOCATIONLIST>>>,
 }
 
+/// `NvkBltGpuCopy`: a window's redirection surface imported by resource id, the destination of
+/// this device's own copy of its windowed blt-model frames (`forward::present`). `resource` is
+/// `None` for an import that failed: the surface is not asked for again while it is the target.
+pub struct WindowTarget {
+    pub destination: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dxgi_format: u32,
+    pub resource: Option<windows::Win32::Graphics::Direct3D11::ID3D11Resource>,
+}
+
 /// Every COM object this device holds that came OUT of the bridge.
 ///
 /// `HeliosDevice` used to state an ownership rule — "declared before `dxvk` so
@@ -206,6 +217,9 @@ pub struct BridgeOwned {
     /// Snapshot rings, keyed by geometry and purpose. Same
     /// immediate-path-only RefCell contract as `present_src_cache`.
     pub snapshot_rings: core::cell::RefCell<SnapshotRingCache>,
+    /// `NvkBltGpuCopy` window surfaces (at most a few, newest last). Same immediate-path-only
+    /// RefCell contract as `present_src_cache`.
+    pub window_targets: core::cell::RefCell<Vec<WindowTarget>>,
     /// Device-global shader/layout caches for lazy `ID3D11InputLayout`
     /// creation. The d3d10umddi `CreateElementLayout` DDI does NOT pass the
     /// vertex-shader input-signature bytecode that
@@ -234,6 +248,7 @@ impl BridgeOwned {
         Self {
             present_src_cache: core::cell::RefCell::new(Vec::new()),
             snapshot_rings: core::cell::RefCell::new(SnapshotRingCache::default()),
+            window_targets: core::cell::RefCell::new(Vec::new()),
             caches: std::sync::Mutex::new(ShaderCaches::default()),
             ia_gen: core::sync::atomic::AtomicU64::new(0),
             bindings: CtxBindings::default(),
@@ -263,6 +278,7 @@ impl BridgeOwned {
     pub fn release(&mut self) -> (usize, usize) {
         // Release the remaining presentation resources while DXVK is alive.
         self.present_src_cache.get_mut().clear();
+        self.window_targets.get_mut().clear();
         *self.snapshot_rings.get_mut() = SnapshotRingCache::default();
         self.bindings.bound_vs_com.store(0, Ordering::Relaxed);
         self.bindings.bound_il_com.store(0, Ordering::Relaxed);
@@ -400,6 +416,24 @@ pub struct HeliosDevice {
     /// the keyed mutex itself is invisible at the DDI.
     /// `(pDrvPrivate, created here)`; an opened resource has `false`.
     pub nvk_keyed_resources: std::sync::Mutex<Vec<(usize, bool)>>,
+    /// NVK, `FlipLedger`: DXGI present buffers this device created or opened
+    /// that hold their hand-off ledger key, as `(pDrvPrivate, ID3D11Resource*,
+    /// width, height, DXGI format, KMD resource id)` (`forward::resource::note_nvk_flip_buffer`).
+    pub nvk_flip_buffers: std::sync::Mutex<Vec<(usize, usize, u32, u32, u32, u32)>>,
+    /// NVK, `FlipLedger` 1, dwm.exe: the buffer DWM composed last per app swap chain and the
+    /// finished frame it held, `(presenting process, (width, height, format), ID3D11Resource*,
+    /// frame)`.
+    pub nvk_flip_last: std::sync::Mutex<Vec<(u32, (u32, u32, u32), usize, u64)>>,
+    /// NVK, `FlipLedger` 1, dwm.exe: DWM's replacement views of opened app
+    /// present buffers, `(ID3D11Resource*, view)` (`forward::bindings::dwm_flip_views`).
+    pub nvk_flip_views: std::sync::Mutex<
+        Vec<(usize, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView)>,
+    >,
+    /// NVK, `FlipLedger` 1, dwm.exe: the opened app present buffers
+    /// (`ID3D11Resource*`) bound as shader resources since DWM's last present;
+    /// DWM's present publishes a read point on them
+    /// (`forward::bindings::dwm_flip_views`).
+    pub nvk_flip_reads: std::sync::Mutex<Vec<usize>>,
     pub direct_scanout_allocations:
         std::sync::Mutex<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning

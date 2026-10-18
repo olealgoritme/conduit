@@ -491,6 +491,19 @@ unsafe fn dxgkddi_escape_inner(
             }
             None => refuse_no_device(),
         },
+        // The GPU-ordered window copy (`NvkBltGpuCopy`): the record is per process, so the escape
+        // needs the device whose `hKmdProcess` names it.
+        helios_protocol::HELIOS_ESCAPE_BLT_TARGET => match owner {
+            Some(_) => {
+                // SAFETY: the runtime supplies our live DeviceContext (non-null: `owner` is
+                // Some) for this Escape.
+                let process = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+                    .map(|d| d.creator_process())
+                    .unwrap_or(0);
+                escape_blt_target(buf, &hdr, process)
+            }
+            None => refuse_no_device(),
+        },
         HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf, &hdr),
         HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf, &hdr),
         HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE => escape_query_scanout_timeline(buf, &hdr),
@@ -942,6 +955,59 @@ fn escape_snapshot_status(
         Ok(false) => HELIOS_SNAPSHOT_BUSY,
         Err(error) => return escape_device_gone(error),
     };
+    wire.write_back(&out);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_ESCAPE_BLT_TARGET` (`NvkBltGpuCopy`, `ddi/window_copy.rs`): where the KMD's windowed
+/// Blt of `source_resource_id` lands for `process`, from the record of the last such Blt. Never
+/// fails a well-formed request: `out_state` says whether there is a record. No device lock, no
+/// wait: one leaf-lock lookup.
+#[inline(never)]
+fn escape_blt_target(buf: &mut [u8], hdr: &HeliosEscapeHeader, process: usize) -> NTSTATUS {
+    let mut wire = match EscapeBuf::<helios_protocol::HeliosBltTargetQuery>::new(buf, hdr) {
+        Ok(wire) => wire,
+        Err(status) => return status,
+    };
+    let req = wire.read();
+    let Some(source) = req.valid_source() else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if process == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut out = helios_protocol::HeliosBltTargetQuery::new(source);
+    match crate::ddi::window_copy::query(process, source) {
+        Some(t) if !t.writable => {
+            // A destination no producer can write: say so (the extent for the log), nothing else.
+            out.out_state = helios_protocol::HELIOS_BLT_TARGET_UNWRITABLE;
+            out.out_destination_resource_id = t.destination;
+            out.out_width = t.surface.width;
+            out.out_height = t.surface.height;
+        }
+        Some(t) => {
+            out.out_state = helios_protocol::HELIOS_BLT_TARGET_FOUND;
+            out.out_destination_resource_id = t.destination;
+            out.out_ticket = t.ticket;
+            out.out_width = t.surface.width;
+            out.out_height = t.surface.height;
+            out.out_pitch = t.surface.pitch;
+            out.out_dxgi_format = t.surface.dxgi_format;
+            out.out_bind_flags = t.surface.bind_flags;
+            out.out_memory_type_index = t.surface.memory_type_index;
+            out.out_alloc_size = t.surface.alloc_size;
+            out.out_modifier = t.surface.modifier;
+            out.out_offset = t.surface.offset;
+            out.out_fourcc = t.surface.fourcc;
+            out.out_src_left = t.src.left;
+            out.out_src_top = t.src.top;
+            out.out_dst_left = t.dst.left;
+            out.out_dst_top = t.dst.top;
+            out.out_copy_width = t.src.right - t.src.left;
+            out.out_copy_height = t.src.bottom - t.src.top;
+        }
+        None => out.out_state = helios_protocol::HELIOS_BLT_TARGET_NONE,
+    }
     wire.write_back(&out);
     STATUS_SUCCESS
 }

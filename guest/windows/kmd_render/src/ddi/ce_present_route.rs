@@ -1019,7 +1019,8 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     }
     // With copies in flight, spin briefly (`SETTLE_SPIN_US`) for them: a pass woken by a
     // producer's fence event otherwise looks once, before the copy behind that acquire has run,
-    // and the next look is the timed wait's (a timer quantum, about 15.6 ms). Until a copy is
+    // and the next look is the timed wait's (`POLL_DUE_100NS`, on the high-resolution timer with
+    // `HpdHiResWait`; a whole 15.6 ms clock tick without it). Until a copy is
     // retired, the app's next command list that touches the Blt source waits on the GPU for its
     // read-ledger claim, and DXGI's frame-latency wait blocks Present, where
     // `settle_from_present` would run (383.1, `RvOff` 0x1000: 85 fps, MsGPUBusy 11.8).

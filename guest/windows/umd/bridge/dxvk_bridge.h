@@ -220,6 +220,9 @@ struct HeliosDxvkDevice {
   void handoff_unregister(std::size_t d3d11_resource_ptr) const noexcept;
   std::int32_t handoff_publish(const std::size_t* resources,
                                std::uint32_t resource_count) const noexcept;
+  // FlipLedger: ask the resource's ledger key again (RotateResourceIdentities
+  // moved another storage under it). Returns the key, 0 when it has none.
+  std::uint32_t handoff_refresh_key(std::size_t d3d11_resource_ptr) const noexcept;
 
   // kFlushGateStream also publishes the point on every resource in
   // `resources` (ID3D11Resource* as size_t) that has an allocation producer

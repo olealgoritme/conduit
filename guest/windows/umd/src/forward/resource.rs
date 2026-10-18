@@ -845,10 +845,11 @@ unsafe fn note_nvk_keyed_resource(
     bind: u32,
     created: bool,
 ) {
-    if misc & DDI_MISC_SHARED_FLAG == 0
-        || bind & DDI_BIND_PRESENT_FLAG != 0
-        || load_resource(h_resource).is_none()
-    {
+    if bind & DDI_BIND_PRESENT_FLAG != 0 {
+        note_nvk_flip_buffer(h, h_resource, created);
+        return;
+    }
+    if misc & DDI_MISC_SHARED_FLAG == 0 || load_resource(h_resource).is_none() {
         return;
     }
     let Some(dev) = helios_device(h) else {
@@ -869,12 +870,81 @@ unsafe fn note_nvk_keyed_resource(
     }
 }
 
+/// `FlipLedger`: a DXGI present buffer of an NVK device (created here, or opened: DWM opening
+/// an app's flip-model buffer) holds its hand-off ledger key while it lives: DWM's read points
+/// land in a slot the app's DXVK samples (flip-model buffer release), and both processes install
+/// the ledger's hooks. DWM also keeps the buffer's size, format and resource id to find the
+/// newest done buffer of the swap chain (`forward/bindings.rs` `dwm_flip_views`). The slot is let
+/// go at destroy (`forget_nvk_keyed_resource`).
+unsafe fn note_nvk_flip_buffer(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, created: bool) {
+    // An app's own buffers (it publishes on them); DWM's opens of apps' buffers (it reads them).
+    // Not DWM's own swap chain, not an app opening another's present buffer.
+    if crate::knobs::flip_ledger() == 0 || crate::knobs::is_dwm_process() == created {
+        return;
+    }
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if !dev.dxvk.is_nvk() {
+        return;
+    }
+    let Some(res) = load_resource(h_resource) else {
+        return;
+    };
+    let key = h_resource.pDrvPrivate as usize;
+    let com = res.as_raw() as usize;
+    // Size and format: DWM groups an app's swap-chain buffers by them (with the publishing
+    // device) when it replaces a frame that is not done (`forward/bindings.rs` `dwm_flip_views`).
+    let (width, height, format) = match res.cast::<ID3D11Texture2D>() {
+        Ok(texture) => {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut desc);
+            (desc.Width, desc.Height, desc.Format.0 as u32)
+        }
+        Err(_) => (0, 0, 0),
+    };
+    let mut list = lock_ignore_poison(&dev.nvk_flip_buffers);
+    if !list.iter().any(|f| f.0 == key) {
+        dev.dxvk.handoff_register(com);
+        // The KMD resource id (the ledger key): the frame-done table's name for the buffer.
+        let resid = dev.dxvk.handoff_refresh_key(com);
+        list.push((key, com, width, height, format, resid));
+        if list.len() <= 4 {
+            log_error!(
+                "FlipLedger: present buffer hDrv=0x{key:x} ({}) holds its ledger key ({} live)",
+                if created { "created" } else { "opened" },
+                list.len()
+            );
+        }
+    }
+}
+
 /// Forget a resource `note_nvk_keyed_resource` remembered (any resource may be
 /// passed).
 pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE) {
     let Some(dev) = helios_device(h) else {
         return;
     };
+    {
+        let key = h_resource.pDrvPrivate as usize;
+        let mut flips = lock_ignore_poison(&dev.nvk_flip_buffers);
+        if let Some(i) = flips.iter().position(|f| f.0 == key) {
+            let (_, com, _, _, _, _) = flips.swap_remove(i);
+            lock_ignore_poison(&dev.nvk_flip_last).retain(|e| e.2 != com);
+            drop(flips);
+            lock_ignore_poison(&dev.nvk_flip_reads).retain(|&r| r != com);
+            // DWM's replacement view of this buffer holds a reference to it: drop it first.
+            let view = {
+                let mut views = lock_ignore_poison(&dev.nvk_flip_views);
+                views.iter().position(|e| e.0 == com).map(|j| views.swap_remove(j))
+            };
+            drop(view);
+            if let Some(res) = load_resource(h_resource) {
+                dev.dxvk.handoff_unregister(res.as_raw() as usize);
+            }
+            return;
+        }
+    }
     let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
     if list.is_empty() {
         return;

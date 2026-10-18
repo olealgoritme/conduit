@@ -79,7 +79,8 @@ pub use nvrm_events::{
 
 pub use rm_gates::{
     publish_rm_gate_counters, rm_gates_open, EclVerdict, GateAttached, GateRefusal, ECL_HINT_ESCAPES,
-    ECL_HINT_FIRED, ECL_HINT_LATE, ECL_HINT_REFUSED, ECL_HINT_WHY, RMG_EXPIRE_MS, RMG_REFUSED,
+    ECL_HINT_FIRED, ECL_HINT_LATE, ECL_HINT_REFUSED, ECL_HINT_WHY, FD_FROM_D3D11, FD_FROM_D3D12,
+    RMG_EXPIRE_MS, RMG_REFUSED,
 };
 
 pub use nvrm_tables::{
@@ -2667,6 +2668,9 @@ pub struct VirtioGpu {
     /// Stream handles of the gates cancelled most recently (`rm_gates.rs`,
     /// `rm_gate_latch_dead_submit`).
     rm_gates_cancelled: helios_kmd_logic::rm_fence_present::CancelledGates,
+    /// `FlipLedger`: which presented buffers have a frame in flight, from the RM fences of
+    /// their presents (`rm_gates.rs`, published in the read-ledger page).
+    frame_done: helios_kmd_logic::frame_done::Table,
     producer_adapter: usize,
     producer_generation: u32,
     /// Dedicated standard-buffer ownership table. Fixed-length heap storage keeps all
@@ -3336,6 +3340,7 @@ impl VirtioGpu {
             present_streams,
             rm_gates,
             rm_gates_cancelled: helios_kmd_logic::rm_fence_present::CancelledGates::new(),
+            frame_done: helios_kmd_logic::frame_done::Table::new(),
             producer_adapter: 0,
             producer_generation: 0,
             present_buffer_syncs,

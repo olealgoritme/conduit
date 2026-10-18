@@ -373,10 +373,12 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 25] {
 pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 2);
 
 /// `Nvk12Present` (or `HELIOS_NVK_PRESENT` in the process environment): 0 =
-/// automatic (DWM composes the back buffer from its NVK resource id when the
-/// Venus side imports foreign surfaces, `ForeignImport=1`, else scanout 0),
-/// 1 = always scanout 0 (zero-copy flip; the desktop is hidden while the app
-/// presents), 2 = always the WDDM present (DWM composes).
+/// automatic (`helios_umd_common::nvk_present::route`: DWM composes a window's
+/// back buffer from its NVK resource id when DWM imports NVK surfaces, a DWM on
+/// NVK or `ForeignImport=1`; scanout 0 for a buffer that covers the output, or
+/// when DWM cannot import it), 1 = always scanout 0 (zero-copy flip; the
+/// desktop is hidden while the app presents), 2 = always the WDDM present (DWM
+/// composes).
 pub(crate) static NVK12_PRESENT: DwordKnob = DwordKnob::new(c"Nvk12Present", 0);
 
 /// `Nvk12EclSpinUs`: how long, in microseconds, the CPU-wait arm of
@@ -598,6 +600,15 @@ pub(crate) fn foreign_import() -> bool {
     *CELL.get_or_init(|| {
         helios_umd_common::knobs::reg_dword(c"ForeignImport").is_some_and(|v| v != 0)
     })
+}
+
+/// Does DWM compose NVK surfaces by resource id? `ForeignImport=1` (a Venus
+/// DWM imports them) or a DWM on NVK (`DwmIcd=nvk` and its marker event,
+/// `helios_umd_common::knobs::dwm_on_nvk_marker`). The same rule as the D3D11
+/// driver's `nvk_dwm_composes`. Read once per process.
+pub(crate) fn dwm_imports_nvk() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| foreign_import() || helios_umd_common::knobs::dwm_on_nvk_marker())
 }
 
 /// `Umd12PipelineLibrary`: the six pipeline-library DDI slots forward to the

@@ -34,6 +34,7 @@ pub mod rm_fence;
 pub mod rm_fence_v3;
 pub mod virtio_gpu;
 pub mod wddm;
+pub mod window_copy;
 
 pub use ecl_done::*;
 pub use escape::*;
@@ -49,3 +50,4 @@ pub use rm_fence::*;
 pub use rm_fence_v3::*;
 pub use virtio_gpu::*;
 pub use wddm::*;
+pub use window_copy::*;

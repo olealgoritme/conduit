@@ -139,7 +139,7 @@ restart-device and stress pass is clean.
 | Finding | Consequence |
 |---|---|
 | `BltNoMirror=1` leaves the window stale: DWM reads the CPU view of a CPU-visible redirection surface | do not use it; GPU-only surfaces (`RedirVram`) are the way around the CPU view |
-| Flip-model upgrade of windowed apps via per-app `HKCU\...\DirectX\UserGpuPreferences` is gated by DXGI's game classification (`REASON_NONGAME`) | not a route for windowed apps |
+| Windows' flip-model upgrade of windowed apps (`HKCU\...\DirectX\UserGpuPreferences`) is gated by DXGI's game classification (`REASON_NONGAME`) | the driver upgrades blt-model chains itself (`FlipUpgrade`, [dwm-on-nvk.md](dwm-on-nvk.md) 4.5) |
 | NVK UBO-descriptor promotion costs GPU time per draw on Windows | off on Windows (Mesa patch 0051) |
 | Most KMD knobs are read at StartDevice | restart the device (or reboot, per the Read column of [WINDOWS-KNOBS.md](WINDOWS-KNOBS.md)) for every A/B row; a reading without it is not a result |
 | zsh does not word-split `"label K=V"` | loops that split arguments live in bash scripts |

@@ -135,7 +135,13 @@ while DWM runs on NVK, every D3D11 process goes to NVK as well:
   `DesktopFollowsDwm=0` (REG_DWORD) turns it off. D3D12 is unchanged (already NVK by default).
 * NVK apps' presents go to DWM (composed by resource id) rather than straight to scanout 0 while
   the marker is there, as with `ForeignImport=1`; otherwise an NVK app took the whole screen and
-  DWM's own flips showed through about once a second.
+  DWM's own flips showed through about once a second. This holds for D3D11 and D3D12 swap chains.
+  A D3D12 back buffer that covers the output (a primary, or at least the desktop's size) still
+  takes scanout 0 (`Nvk12Present` 0, `umd_common/src/nvk_present.rs`). A composed D3D12 frame's
+  present marker carries an RM fence for the frame's last ExecuteCommandLists and the
+  copy-engine record of the presented buffer, as a D3D11 blt-model frame's does. A window DWM
+  does not flip (DXGI copies the frame with the D3D12 `pfnBlt` into a GDI-compatible buffer of
+  the window's size and presents that) reaches the window through the KMD's Blt of that buffer.
 
 The choice is made once per process: processes that started before DWM moved (the shell after a
 `restart-device`) keep Venus until they restart.
@@ -240,6 +246,121 @@ resource. Whether the host shows that is part of experiment T2.
 * **Present path in the UMD**: on NVK, DWM never uses NVK's own scanout source (`nvk_present_frame`
   forces the WDDM flip for `dwm.exe`; done on this branch). Otherwise most frames would bypass
   dxgkrnl.
+
+### 4.5 Windowed apps without a copy (`FlipUpgrade`, `FlipLedger`)
+
+A windowed blt-model swap chain (Heaven: `DISCARD`, one buffer, interval 0; PresentMon
+"Composed: Copy with GPU GDI") reaches DWM only through the window's redirection surface: dxgkrnl
+turns each present into a Blt into that surface, and DWM never opens the app's buffer. Here the
+surface is a CPU-visible standard buffer (`vram-redirection.md` 0), so the Blt is a copy the app
+waits for. Only a flip-model chain is shared with DWM ("In the flip model, all back buffers are
+shared with the Desktop Window Manager (DWM). Therefore, the DWM can compose straight from those
+back buffers without any additional copy operations", win32 `direct3ddxgi/dxgi-flip-model.md`).
+
+**Why the driver upgrades the chain itself.** Windows' own upgrade ("optimizations for windowed
+games", `SwapEffectUpgradeEnable=1;`) is applied only to processes DXGI classifies as games: its
+`DXGI_ETW_SWAPCHAIN_CREATE` event for Heaven carries `WINDOWEDSWAPEFFECTUPGRADE_REASON_NONGAME`
+(`guest/windows/docs/independent-flip.md` 11.5). Microsoft's descriptions of the feature (the
+DirectX blog "Updates in Graphics and Gaming", the support article "Optimizations for windowed
+games in Windows 11") name DX10/DX11 windowed games and no driver capability, and the driver
+already reports what windowed flip promotion needs (`SupportDirectFlip`, `FlipIndependent |
+DdiPresentForIFlip`: `kmd_render/src/ddi/query_adapter_info.rs`, `kmd_logic/src/independent_flip.rs`;
+the UMD's `CheckDirectFlipSupport`). There is no cap left that would make DXGI upgrade a non-game.
+
+**`FlipUpgrade`** (`HKLM\SOFTWARE\Helios`, REG_DWORD, default 1; `helios_umd_common::flip_upgrade`).
+In an NVK process under a DWM that imports NVK surfaces (not `dwm.exe`; optionally only the programs
+`FlipUpgradeList` names), the D3D11 UMD hooks DXGI's swap-chain creation in the process
+(`IDXGIFactory::CreateSwapChain`, `IDXGIFactory2::CreateSwapChainForHwnd`). A windowed `DISCARD`
+chain with one sample, an R8G8B8A8 or B8G8R8A8 UNORM buffer and no flag but `ALLOW_MODE_SWITCH` is
+created `FLIP_DISCARD` with `FlipUpgradeBuffers` buffers (default 3). The flip model's documented
+extra requirements (`direct3ddxgi/for-best-performance--use-dxgi-flip-model.md`, "What do I have
+to do to use the flip model?") are met for the app:
+
+| requirement | how |
+|---|---|
+| at least 2 buffers | `FlipUpgradeBuffers`; `ResizeBuffers` keeps the count |
+| the back buffer is re-bound after `Present` | the hooked `Present` / `Present1` binds the immediate context's render targets and depth view again after the real call, as a blt-model present leaves them |
+| `ResizeBuffers` after `SetFullscreenState` | only windowed chains are upgraded; exclusive fullscreen keeps its scanout path |
+| no MSAA buffers | multisampled chains are not upgraded |
+
+`GetDesc` / `GetDesc1` report what the app asked for. Interval-0 presents stay unthrottled when
+DWM promotes the window to independent flip: the chain is created with `ALLOW_TEARING` when DXGI
+allows it and such presents add `DXGI_PRESENT_ALLOW_TEARING` (`FlipUpgradeTearing`, default 1;
+the conditions are `direct3ddxgi/dxgi-present.md`). `GDI_COMPATIBLE`, sRGB, 10-bit and fp16 chains
+are left alone (GDI content in a flip window is not shown, `dxgi-flip-model.md`; NVK mints
+resource ids for the 8-bit formats). The UMD is pinned in memory once the hooks are in.
+
+Once the chain is flip-model, DWM opens its buffers by resource id at creation (as for any NVK
+flip-model chain) and composes the presented buffer.
+
+**`FlipLedger`** (REG_DWORD, default 1; DWM reads it when it starts; 0 turns it off). The problem
+it solves: DWM on NVK samples an app's buffer from its own RM channel, which neither dxgkrnl's
+waits nor the RM fence that retires the app's present hold, so without help it can compose a frame
+the GPU is still drawing (`NvkComposedComplete`, the rule with `FlipLedger=0`, completes the frame
+on the presenting thread instead, which serialises the app's CPU and GPU work). With 1:
+
+1. **The app never waits.** A flip-model present's WDDM marker carries the frame's RM fence and
+   names the presented buffer: the D3D11 UMD puts its resource id into the `HERF` `source_index`
+   (`forward/present.rs`, `frame_resid`), a D3D12 `HEPR` has it already. Vulkan windows present
+   through a D3D11 flip chain (NVK's WSI) and take the D3D11 path. A swap chain of fewer than
+   three buffers, or a KMD without the table below, keeps the old rule.
+2. **The KMD knows which frames are finished.** When it attaches the fence to the RM gate of the
+   presenting WDDM context (at Render, before dxgkrnl can hand the frame to DWM) it records the
+   frame as pending; when the fence fires (its `EventReady` DPC; also an expiry or a cancelled
+   gate) that frame and every earlier pending frame of the same context are finished (a context's
+   frames finish in order). Per buffer the table keeps the newest finished frame in it
+   (`completed`, the content it holds, even while its next frame is queued) and whether the GPU
+   may be writing it now (`writing`: its pending frame is the oldest of its context)
+   (`kmd_logic/src/frame_done.rs`, `virtio/gpu/rm_gates.rs`). The table is published in the
+   read-ledger page every UMD device maps already (`helios_protocol::HeliosFrameDoneTable` at
+   `HELIOS_FRAME_DONE_OFFSET`, version 2; `adapter/read_ledger.rs`).
+3. **DWM composes the newest finished frame and never waits for an app frame.** At every
+   shader-resource bind DWM's UMD reads the table for each app present buffer it binds
+   (`forward/bindings.rs` `dwm_flip_views`, `scanout_acquire.rs` `frame_done_lookup`). A buffer
+   with nothing pending, or that the table does not track, stays. Otherwise DWM binds the buffer
+   of the same swap chain (the same presenting process, size and format; three buffers or more)
+   that holds the newest finished frame and is not being written, or, when none is, the buffer it
+   composed for that chain last time: the window keeps its last frame. The app publishes nothing
+   DWM's DXVK could wait for, so DWM never waits.
+4. **Buffer release.** dxgkrnl's wait for DWM to release a buffer holds the app's WDDM context,
+   which NVK's submissions bypass. DWM therefore publishes, at each of its presents, a hand-off
+   ledger point on the app buffers it composed in that frame (`forward/present.rs`
+   `dwm_flip_read_points`), and the D3D11 app's DXVK, at its next access of such a buffer, waits
+   for DWM's read in its submission worker (DXVK patches 0007/0008; nothing waits on the app's
+   thread, and only while DWM is still reading that very buffer). The key DXVK samples follows
+   `RotateResourceIdentities` (`dxvk_bridge.cpp` `handoff_key`, `forward/present.rs`
+   `rotate_ring`). A D3D12 app's buffer waits come through the runtime's admission of every ECL
+   (`forward12/queue.rs`).
+
+Counters and log lines (UMD logs, `C:\ProgramData\Helios\umd-<pid>.log`; KMD values in the
+service key):
+
+| where | line / value | reading |
+|---|---|---|
+| app (D3D11) | `FlipUpgrade: swap chain #1 upgraded: swap effect 0 -> 4 (FLIP_DISCARD) ...` | the chain is flip-model |
+| app (D3D11) | `FlipLedger: N flip-model presents without a CPU wait; the KMD's frame-done table tracks the buffer ...` | the app does not wait |
+| KMD | `FdSub` (frames recorded), `FdFire` (fences that finished at least one frame; a fence also finishes the earlier frames of its context, so `FdFire` may stay below `FdSub`), `FdPend` (frames pending after the last change), `FdOvf` (frames not tracked) | `FdPend` small (the frames the app is ahead of the GPU, about 1-3), `FdOvf` 0 |
+| KMD | `FdD11` / `FdD12` (presents that named their buffer, per carrier) | a fullscreen app on scanout 0 sends no fence with its present: it adds nothing; with nothing pending a fence fire costs the table one compare |
+| DWM | `DWM on NVK: X presents/s, Y new app flip frames shown/s ...; binds of app flip buffers: newest frame done A, newest done frame chosen B, last frame kept C, bound in flight (nothing to choose) D, not tracked E (in a tracked chain F); R read points ...` (once a second) | X is DWM's composition rate; Y is the app frames DWM put on screen per second: about min(app fps, X) for one window; C grows only while the app is slower than X; D stays near 0 after a chain's first frame; E counts other windows whose apps complete their frames before the present, F should stay near 0 |
+| DWM | `handoff waits: N sleeps ...` | must not appear |
+
+**Not covered yet.**
+
+* DWM's read point goes out at its present, after its draws; an app write recorded between DWM's
+  bind and that present is not ordered behind the read. With three buffers the app writes the
+  replaced buffer two presents after showing it, so this needs a DWM frame that takes longer than
+  two app frames between bind and present.
+* A D3D12 app does not sample DWM's read points (vkd3d has no ledger hooks); its release rides
+  the runtime's admission, which knows about the buffer DWM latched, not about an older one DWM
+  composed instead (the same two-present margin).
+* A D3D12 swap chain of two buffers is not replaced in (the frame before is the buffer the app
+  renders into next) and a D3D12 frame does not wait before its present, so DWM can sample such a
+  frame while it is drawn, as before `FlipLedger`.
+* A blt-model window DWM never flips (a child window, or `FlipUpgrade` 0) is still copied into the
+  redirection surface. The KMD's legacy Blt copies whole images only: a foreign source whose extent
+  differs from the destination (`PBCpy` 0xE3, `PrFgWhy` 6) is skipped and the window keeps its old
+  content. A child window presenting into its parent's redirection surface would look like that
+  (GPU-Z's gray render-test window is the case to check with those two counters).
 
 ## 5. Test sequence
 

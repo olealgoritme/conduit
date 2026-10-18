@@ -151,6 +151,37 @@ impl AdapterContext {
         unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
     }
 
+    /// The HPD worker's wait is about to begin with the relative, negative 100 ns timeout
+    /// `due`: arm the high-resolution timer for it (`HpdHiResWait`), whose callback ends the
+    /// wait at `due` instead of the next default clock tick. `false`: no timer this adapter
+    /// lifetime (the plain timeout alone bounds the wait). The worker only (PASSIVE); a timer
+    /// still pending from an earlier wait is replaced.
+    pub(crate) fn arm_hpd_hr_wake(&self, due: i64) -> bool {
+        use core::sync::atomic::Ordering;
+        debug_assert!(due < 0);
+        let timer = self.hpd_hr_timer.load(Ordering::Acquire);
+        if timer == 0 || due >= 0 {
+            return false;
+        }
+        self.hpd_hr_fired.store(0, Ordering::Release);
+        // SAFETY: a valid system timer for the adapter lifetime (deleted only at RemoveDevice,
+        // after the worker was joined); a high-resolution timer takes a relative due time.
+        unsafe { ExSetTimer(timer as ExTimer, due, 0, core::ptr::null_mut()) };
+        true
+    }
+
+    /// The worker's wait returned: cancel the high-resolution wake if it is still pending (an
+    /// event ended the wait first) and say whether it fired. PASSIVE.
+    pub(crate) fn end_hpd_hr_wake(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        let timer = self.hpd_hr_timer.load(Ordering::Acquire);
+        if timer != 0 {
+            // SAFETY: as in `arm_hpd_hr_wake`; the WDK requires NULL parameters.
+            unsafe { ExCancelTimer(timer as ExTimer, core::ptr::null_mut()) };
+        }
+        self.hpd_hr_fired.swap(0, Ordering::AcqRel) != 0
+    }
+
     /// Stop + join the HPD worker before teardown (StopDevice / Drop). Idempotent.
     /// PASSIVE_LEVEL — it blocks on the worker's exit.
     pub fn stop_hpd(&self) {
@@ -172,6 +203,7 @@ impl AdapterContext {
         if h == 0 {
             return;
         }
+        let _ = self.end_hpd_hr_wake();
         self.hpd_stop.store(1, Ordering::Release);
         // SAFETY: initialized event; wake the worker so it observes hpd_stop.
         unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
@@ -361,8 +393,22 @@ impl AdapterContext {
         // arm a DPC inside a context about to be freed (the heartbeat).
         let wd_timer = self.vsync_wd_timer.load(Ordering::Acquire);
         let ex_timer = self.vsync_ex_timer.load(Ordering::Acquire);
-        if wd_timer == 0 && ex_timer == 0 {
+        let hr_timer = self.hpd_hr_timer.load(Ordering::Acquire);
+        if wd_timer == 0 && ex_timer == 0 && hr_timer == 0 {
             return;
+        }
+        if hr_timer != 0 {
+            // SAFETY: as below. The worker is joined (StopDevice) before RemoveDevice; cancel+wait
+            // drains a callback in flight, which only touches `hpd_hr_fired` and `hpd_event`.
+            unsafe {
+                ExDeleteTimer(
+                    hr_timer as ExTimer,
+                    BOOLEAN_TRUE,
+                    BOOLEAN_TRUE,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.hpd_hr_timer.store(0, Ordering::Release);
         }
         // A callback blocked in `DxgkCbSynchronizeExecution` hangs the waits below: `StopSub`
         // names this step (`VsCbIn` above `VsCbOut` says why).
@@ -839,6 +885,20 @@ impl AdapterContext {
             self.vsync_wd_timer
                 .store(wd_timer as usize, core::sync::atomic::Ordering::Release);
         }
+        // The HPD worker's high-resolution wake (`HpdHiResWait`): its own callback, the same
+        // immutable context. NULL = the worker keeps its plain timed waits this adapter lifetime.
+        // SAFETY: as above.
+        let hr_timer = unsafe {
+            ExAllocateTimer(
+                Some(hpd_hr_timer_callback),
+                self as *const _ as PVOID,
+                EX_TIMER_HIGH_RESOLUTION,
+            )
+        };
+        if !hr_timer.is_null() {
+            self.hpd_hr_timer
+                .store(hr_timer as usize, core::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -1108,6 +1168,24 @@ unsafe extern "system" fn vsync_ex_timer_callback(_timer: ExTimer, context: PVOI
         crate::adapter::foreign_scanout::now_100ns().saturating_sub(entered),
     );
     crate::ddi::stall_diag::cb_leave();
+}
+
+/// `EXT_CALLBACK` of the HPD worker's high-resolution wake (DISPATCH_LEVEL): mark the wake as the
+/// timer's (the worker treats it as its timeout) and signal the worker's event. Same context rule
+/// as [`vsync_ex_timer_callback`].
+unsafe extern "system" fn hpd_hr_timer_callback(_timer: ExTimer, context: PVOID) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the final adapter address, live until `ExDeleteTimer(wait=TRUE)` has drained this
+    // callback at RemoveDevice.
+    let adapter = unsafe { &*(context as *const AdapterContext) };
+    adapter
+        .hpd_hr_fired
+        .store(1, core::sync::atomic::Ordering::Release);
+    // SAFETY: hpd_event was initialized in place before the timer could be armed; Wait = FALSE
+    // is legal at DISPATCH_LEVEL.
+    unsafe { KeSetEvent(adapter.hpd_event.get(), 0, 0) };
 }
 
 /// `EXT_CALLBACK` of the independent watchdog timer (DISPATCH_LEVEL). Same context rule as
